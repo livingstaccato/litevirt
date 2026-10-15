@@ -20,8 +20,10 @@ package fleet
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -146,6 +148,9 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		go p.Start(ctx)
 
 		coord := failover.NewCoordinator(n.Name, n.DB)
+		if c.opts.ClockSeam {
+			coord.Now = n.Now // a stepped node's coordinator reads its own clock
+		}
 		name := n.Name
 		coord.SetFencer(func(_ context.Context, h fence.HostConfig) fence.Result {
 			s.mu.Lock()
@@ -564,6 +569,104 @@ func TestFleet_PartitionSettle_DualRunSettlesToTheCertifiedCopy(t *testing.T) {
 		rows, err := owner.DB.Query(ctx, `SELECT detail FROM audit_log WHERE action = 'partition.settle' AND target = 'pp-dual'`)
 		return err == nil && len(rows) > 0
 	})
+}
+
+// TestFleet_PartitionSettle_DerivedVoterSetLeavesAPausedDuplicate is lab 1's
+// W1 drill (2026-10-15): no voter generation is adopted (the derived voter
+// set), so recovery claims are not enforced and the majority's proof carries
+// no certificate. The owner pauses, the majority recovers pp-derived, and the
+// network heals fully. Settle is certificate-only (partition-pause.md §6, F9):
+// the owner's copy stays PAUSED, never runs again and is not destroyed, and
+// the owner raises vm_settle_declined with reason class proof_uncertified, a
+// remedy that does not send the operator to a claim that was never decided.
+//
+// Mutation: list only certified proofs for VM settle again — the class is
+// no_certificate and the condition check goes red. Dropping the uncertified
+// clause in settleDecide alone stays green here, because the real verifier
+// rejects the empty certificate with the same phrase and it maps to the same
+// class; TestSettle_AnUncertifiedCompletedProofIsDeclinedAsSuch pins the clause.
+func TestFleet_PartitionSettle_DerivedVoterSetLeavesAPausedDuplicate(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 5, IndependentReplicas: true, Relays: 5, RealGossip: true})
+	owner := c.Nodes[0]
+	insertVMPolicy(t, owner, "pp-derived", owner.Name, "restart-any")
+	if err := corrosion.GraduateVMOwnerEpoch(ctx, owner.DB, "pp-derived"); err != nil {
+		t.Fatalf("graduate pp-derived: %v", err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	owner.Virt.SetState("pp-derived", libvirtfake.StateRunning)
+	if err := owner.Virt.SetDomainOwnerEpoch("pp-derived", 1, true); err != nil {
+		t.Fatal(err)
+	}
+	// No genesis and no enableRecoveryClaims: the derived voter set.
+
+	newPPStack(t, c, ppOpts{latched: true, coordinators: map[string]bool{c.Nodes[2].Name: true}})
+	rs := sampleRunning(t, c, "pp-derived")
+	minority, majority := c.Nodes[:2], c.Nodes[2:]
+	c.SplitGossip(minority, majority)
+
+	var dest *Node
+	eventually(t, ppRecoverBound, "the majority to start pp-derived's replacement", func() bool {
+		for _, n := range majority {
+			if st, ok := n.Virt.RawState("pp-derived"); ok && st == libvirtfake.StateRunning {
+				dest = n
+				return true
+			}
+		}
+		return false
+	})
+	if st, _ := owner.Virt.RawState("pp-derived"); st != libvirtfake.StatePaused {
+		t.Fatalf("setup: %s's copy is %s, want paused", owner.Name, st)
+	}
+	// The scenario is the uncertified one: the proof that moved it has no
+	// certificate.
+	rows, err := dest.DB.Query(ctx, `SELECT id FROM runtime_action_proofs
+		WHERE target_name = 'pp-derived' AND claim_certificate != ''`)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("setup: %d certified proofs for pp-derived (%v); a derived voter set decides no claim", len(rows), err)
+	}
+
+	rs.markNow()
+	c.HealGossip()
+	c.WaitGossip(t, remergeBound, "the halves to merge", c.GossipConverged)
+	var ev struct {
+		ReasonClass string `json:"reason_class"`
+		Reason      string `json:"reason"`
+		Remedy      string `json:"remedy"`
+	}
+	eventually(t, ppRecoverBound, "vm_settle_declined (proof_uncertified) on "+owner.Name, func() bool {
+		cond, ok, err := corrosion.GetHealthCondition(ctx, owner.DB, corrosion.PartitionPauseEvaluator,
+			corrosion.CondVMSettleDeclined, "vm", "pp-derived@"+owner.Name)
+		if err != nil || !ok || cond.Lifecycle != corrosion.ConditionConfirmed {
+			return false
+		}
+		return json.Unmarshal([]byte(cond.Evidence), &ev) == nil && ev.ReasonClass == "proof_uncertified"
+	})
+	if strings.Contains(ev.Remedy, "lv cluster claim") {
+		t.Fatalf("the remedy points at a claim a derived voter set never decided: %s", ev.Remedy)
+	}
+	// Held over several more reconcile passes (300 ms each), not one instant.
+	for end := time.Now().Add(3 * time.Second); time.Now().Before(end); time.Sleep(100 * time.Millisecond) {
+		if st, _ := owner.Virt.RawState("pp-derived"); st != libvirtfake.StatePaused {
+			t.Fatalf("%s's copy is %s after the heal, want still paused (settle is certificate-only)", owner.Name, st)
+		}
+		if _, ok := firstEvent(owner, "destroy", "pp-derived"); ok {
+			t.Fatalf("%s destroyed pp-derived without a certificate", owner.Name)
+		}
+	}
+	rs.mu.Lock()
+	at, ran := rs.since[owner.Name]
+	maxRun := rs.max
+	rs.mu.Unlock()
+	if ran {
+		t.Fatalf("%s ran pp-derived again at %s after the heal", owner.Name, at.Format("15:04:05.000"))
+	}
+	if maxRun > 1 {
+		t.Fatalf("pp-derived ran on more than one host at once")
+	}
+	if got := runningOn(c, "pp-derived"); len(got) != 1 || got[0] != dest.Name {
+		t.Fatalf("pp-derived runs on %v after the heal, want only %s", got, dest.Name)
+	}
 }
 
 // TestFleet_PartitionPause_FleetWideBlipPausesThenResumesEverything: every

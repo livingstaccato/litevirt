@@ -26,6 +26,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -42,6 +43,11 @@ type auditVirt struct {
 func (v auditVirt) ConsolePTYPath(string) (string, error) { return v.pty, nil }
 func (v auditVirt) GetVMVNCPort(string) (int, error)      { return v.vnc, nil }
 func (v auditVirt) GetVMSpicePort(string) (int, error)    { return v.spice, nil }
+
+// StateReader and SecureStateReader are none: the console reads go to the
+// overrides above, not to the embedded fake's own readers.
+func (v auditVirt) StateReader() *libvirt.StateReader       { return nil }
+func (v auditVirt) SecureStateReader() *libvirt.StateReader { return nil }
 func (v auditVirt) ConsolePassword(_, kind string) (string, error) {
 	if kind == "spice" {
 		return v.spicePass, nil

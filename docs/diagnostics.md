@@ -1296,16 +1296,20 @@ failover lease holder. A host's recoverable workloads stay paused, and nothing
 recovers them, because observers outside the voter majority still see the host
 answer: a host that reaches both halves of a split of the voters (a witness,
 or a host in maintenance) relays the minority's view. Nothing runs twice. It
-is raised in one of two forms:
+is raised in one of three forms:
 
 - **At the deadline.** The host was fenced relying on its partition pause, the
   wait passed, and its workloads were not recovered because observers had
   seen it answer since the fence. On a derived voter set (no generation
   adopted) any such observer holds the recovery; on an adopted generation it
-  is held while the host has not reported its pause. A store error reading
-  that report is not a bridge and raises nothing; the
-  `host.recovery.stalled` notification names it. The deadline is re-checked
-  every cycle; the condition resolves when it goes ahead, or when the refusal
+  is held while the host has not reported its pause during this outage. A
+  report stamped more than 5 s before the voters first lost the host counts
+  as an earlier outage's, so a host whose clock runs that far behind is held
+  for as long as the bridge lasts, though it paused; once no observer sees it
+  answer, the deadline recovers it. A store error reading that report is not
+  a bridge and raises nothing; the `host.recovery.stalled` notification names
+  it. The deadline is re-checked every cycle while a quorum of voters fails
+  the host (while fewer do, the notification says so); the condition resolves when it goes ahead, or when the refusal
   is no longer a bridge (a voter majority sees the host answer), and
   workloads its limit leaves on the host are named by the
   `host.recovery.stalled` notification instead.
@@ -1314,6 +1318,12 @@ is raised in one of two forms:
   the observers that see it answer leave too few voters failing it for a
   quorum. This is a witness bridge on a derived voter set, where the witness
   votes. Nothing is fenced or recovered.
+- **After a failed fence.** The host's fence failed (an `ipmi` or `redfish`
+  BMC that did not answer, say), and its retry is refused on every cycle
+  because observers saw the host answer after the attempt. Those observers
+  hold no voter majority, and the host has `partition_paused` open, so its
+  workloads are paused and held by the bridge rather than coming back. The
+  `host.recovery.stalled` notification names the refused retry too.
 
 The evidence names the paused `workloads`, the `observers` that see the host
 answer, whether the cluster is on a `derived_voter_set`, and the `remedy`:
@@ -1766,6 +1776,15 @@ holder writes.
   not fall back to the domain UUID, because a live restore or a renamed
   promote gives a new incarnation an earlier one's UUID.
 
+  `proof_uncertified` means the recovery completed on the destination, but
+  its proof carries no certificate: it was minted while recovery claims were
+  not enforced, as on a derived voter set. It is reported only for a live
+  proof at an owner epoch at least the local copy's, and only when no
+  certified proof gave a reason of its own. Settle acts only on a certificate,
+  so a paused copy stays paused. There is no claim for `lv cluster claim` to
+  show. Confirm with `virsh domstate <vm>` on the destination that it runs
+  there, then stop the copy on this host with `virsh destroy <vm>`, as below.
+
   The row naming another host is not proof on its own: a converged-wrong
   `host_name` looks exactly the same. Before stopping anything, confirm which
   copy is current. `lv cluster claim vm/<vm>` shows the decided claim and its
@@ -1838,6 +1857,28 @@ naming the prefix and the tree; the daemon log says the same at start.
 | Raised when | Clears when |
 |---|---|
 | The daemon starts with such a prefix configured. | The daemon starts with no such prefix (the prefix moved to a filesystem of its own, or removed). |
+
+### Operation not reapable (`operation_unreapable`)
+
+Every node runs the operation reaper hourly. It tombstones each finished
+operation, and its steps, once the last step is older than
+`tombstone_gc_retention_hours` (default 24) and no VM barrier names it. A node
+raises `operation_unreapable` (warning) about **itself** when a pass could not
+reap one or more of those operations. The reaper goes on to the next operation,
+so one failure does not hold the others. Each failure is logged once per pass as
+`operation reaper: could not reap an operation`, with `operation_id` and
+`error`, for up to 20 operations; past that, one line,
+`operation reaper: could not reap more operations`, carries `more` and `total`.
+The evidence carries `count`, `operations` (up to 20, each with `id`
+and `error`) and `remedy`.
+
+| Raised when | Clears when |
+|---|---|
+| A reaper pass could not read an operation's steps or write its tombstone. | A complete pass has no failures. A pass that ends early never clears it: WAL quarantine, shutdown, or a failure of the pass's opening reads. A pass that ends early after failures raises it with only the operations reached, so `count` can be low until the next complete pass. |
+
+**If it does not clear,** the `error` of each listed operation says why its
+steps could not be read or its tombstone could not be written. Fix that cause;
+the next pass retries every listed operation.
 
 ### Observer stalled (`observer_stalled`)
 
@@ -2361,7 +2402,7 @@ old copy it found at a failover start records it the same way. `lv inspect
 
 | Raised when | Clears when |
 |---|---|
-| A failover restarts the VM elsewhere and leaves a host-local disk on the failed host, or a host sets a copy of the VM's disk aside. | Nothing is left to keep: every copy was removed (`--remove`) or restored (`--restore`), or the VM was deleted. A record for a host removed from the cluster clears once the VM is deleted. |
+| A failover restarts the VM elsewhere and leaves a host-local disk on the failed host, or a host sets a copy of the VM's disk aside. | Nothing is left to keep: every copy was removed (`--remove`) or restored (`--restore`), or the VM was deleted. After a delete the host clears it once it has set aside the disk still at its path, or left a disk the delete kept (`--keep-disks`, `delete_with_vm=false`, or a record that does not say what the delete decided) where it is. It waits while a domain of the VM's name runs there, or while the path is missing and its directory is absent, empty or cannot be listed (as a volume not mounted yet reads). A path missing from a directory that lists other files is gone, and does not hold the record open. A record for a host removed from the cluster clears once the VM is deleted. |
 
 Every copy is kept while the VM exists. To run the VM on its real disk again,
 or to give the data up, see the commands in

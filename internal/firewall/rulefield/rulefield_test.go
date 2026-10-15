@@ -50,14 +50,15 @@ func TestGrammar(t *testing.T) {
 				"2001:db8::/32", "fd00::1", "::ffff:10.0.0.1"},
 			[]string{"10.0.0.0/8 }", "10.0.0.0/8\n", "10.0.0.0/8;", "10.0.0.0/8 accept", "10.0.0.0/33",
 				"10.0.0.0/8,192.168.0.0/16", "10.0.0.9-10.0.0.1", "  ", "1.2.3",
-				"@", "@1abc", "@a b", "@a\n", "@a;", "{ @office }",
+				"@", "@1abc", "@a b", "@a\n", "@a;", "{ @office }", "@lv_gw4", "!= @lv_nic_devs",
 				"2001:db8::/300", "fd00::1\n", " fd00::1", "!=fd00::1", "fe80::1%eth0", "not-an-address:"}},
 		{Comment, "comment",
 			[]string{"", "admin ssh", "a # b", "it's", "a } b {", "a; b", "héllo", "a\\b", "a\nb", long, long[:121], long[:127]},
 			[]string{`say "hi"`, `x"; ip saddr 0.0.0.0/0 accept; #`, long + "a", strings.Repeat("\n", 65)}},
 		{SetName, "ipset name",
 			[]string{"abc", "A_B9", "a-b", "a/b", "a.b", "_x", ".x", strings.Repeat("a", 255)},
-			[]string{"", "1abc", "-a", "a b", "a\n", "a;", "a{", "a}", `a"`, "@a", strings.Repeat("a", 256)}},
+			[]string{"", "1abc", "-a", "a b", "a\n", "a;", "a{", "a}", `a"`, "@a", strings.Repeat("a", 256), "drop", "ip", "tcp",
+				"lv_gw4", "lv_nic_devs", "lv_lb_src4", "lv_office"}},
 		{SetElement, "ipset element",
 			[]string{"10.0.0.0/8", "10.0.0.1", " 10.0.0.1", "10.0.0.1-10.0.0.5", "gw.example.com", "fd00::/8", "2001:db8::1",
 				"10.0.0.1,10.0.0.2", "10.0.0.1,, 10.0.0.5", "10.0.0.1, 10.0.0.5,", "10.0.0.1, fd00::1",
@@ -131,9 +132,6 @@ func TestSyntax(t *testing.T) {
 		if err := RenderCIDR(v); err == nil {
 			t.Errorf("RenderCIDR(%q) accepted", v)
 		}
-	}
-	if err := RenderSetName("1abc"); err != nil {
-		t.Errorf("RenderSetName(1abc): %v", err)
 	}
 	for _, v := range []string{"a b", "a\n", "a;", "a{", "@a"} {
 		if err := RenderSetName(v); err == nil {
@@ -232,5 +230,96 @@ func TestFieldError_Bounded(t *testing.T) {
 	err := Port("tcp", strings.Repeat("9", 1<<20))
 	if err == nil || len(err.Error()) > 200 {
 		t.Fatalf("error is %d bytes", len(err.Error()))
+	}
+}
+
+// TestRenderSetName_WhatNftReads (fw-grammar re-review 3 m-c): the renderer
+// leaves out a set whose name nft cannot read, since `set 1office {` makes
+// every host refuse its whole table. Every value was loaded as a set name,
+// declared and referenced, with `nft -c` (nftables 1.1.6).
+//
+// Mutation: drop the first-character, length, keyword or ':' check from
+// RenderSetName — the matching refused names are accepted, red.
+func TestRenderSetName_WhatNftReads(t *testing.T) {
+	for _, v := range []string{"office", "_a", ".a", "a/b", "a.b-c", "last", "filter", "saddr", "dport", "DROP", "Accept",
+		"x_v6", "_", "..", "a:b", "ab:cd", "abc:def", "dead:beef", "fe:80", "1:2", "a:b:c:d:e:f", "aa:bb:cc:dd:ee:ff",
+		"a::b", "fe80::1", "::1", "1:2:3:4:5:6:7:8", strings.Repeat("a", 255),
+		// nft reads a dotted quad as one token (review m-1).
+		"1.2.3.4", "999.1.1.1", "01.2.3.4", "255.255.255.255"} {
+		if err := RenderSetName(v); err != nil {
+			t.Errorf("RenderSetName(%q): %v", shown(v), err)
+		}
+	}
+	for _, v := range []string{"1a", "1abc", "-a", "/a", ":a", "9office", strings.Repeat("a", 256), strings.Repeat("a", 300),
+		"drop", "accept", "ip", "ip6", "tcp", "set", "elements", "auto-merge", "type", ".",
+		// Scanner-only operator words (review I-1): "syntax error, unexpected !=".
+		"ne", "gt", "ge", "xor", "lshift", "rshift",
+		// Digits first but not a dotted quad (review m-1).
+		"1.2.3", "1.2.3.4.5", "1.2.3.4a",
+		"office:prod", "x:y", "a:g", "ab:cd:ef", "dead:beefcafe", "a.b:c"} {
+		if err := RenderSetName(v); err == nil {
+			t.Errorf("RenderSetName(%q) accepted", shown(v))
+		}
+	}
+}
+
+// TestIPSet_CompanionNameFits: a set with IPv6 elements renders them as
+// <name>_v6, which nft refuses past 255 bytes.
+//
+// Mutation: drop the length check from IPSet — red.
+func TestIPSet_CompanionNameFits(t *testing.T) {
+	if err := IPSet(strings.Repeat("a", 253), []string{"fd00::/8"}); err == nil {
+		t.Error("a 253-byte name with an IPv6 element accepted: its companion is 256 bytes")
+	}
+	if err := IPSet(strings.Repeat("a", 252), []string{"fd00::/8"}); err != nil {
+		t.Errorf("a 252-byte name with an IPv6 element: %v", err)
+	}
+	if err := IPSet(strings.Repeat("a", 255), []string{"10.0.0.0/8"}); err != nil {
+		t.Errorf("a 255-byte IPv4 set: %v", err)
+	}
+}
+
+// TestCompanionClash (fw-grammar re-review 3 N-2): a set named <x>_v6 beside
+// a set x holding IPv6 elements, in either order of writing.
+//
+// Mutation: drop either branch of CompanionClash — red.
+func TestCompanionClash(t *testing.T) {
+	sets := map[string][]string{"x": {"fd00::/8"}, "x_v6": {"10.0.0.1"}, "y": {"10.0.0.0/8"}, "y_v6": {"10.0.0.2"}}
+	for _, name := range []string{"x", "x_v6"} {
+		var fe *FieldError
+		if err := CompanionClash(sets, name); !errors.As(err, &fe) || fe.Field != "ipset name" {
+			t.Errorf("CompanionClash(%s) = %v, want an ipset name refusal", name, err)
+		}
+	}
+	// y holds no IPv6 element, so y_v6 is an ordinary name, as it always was.
+	for _, name := range []string{"y", "y_v6", "z"} {
+		if err := CompanionClash(sets, name); err != nil {
+			t.Errorf("CompanionClash(%s): %v", name, err)
+		}
+	}
+}
+
+// TestSetName_ReservedPrefix (fw-set-freeze round 0b): litevirt's internal
+// sets are named lv_*. A user set of such a name either freezes the bridge
+// table (lv_nic_devs: another type) or merges into the internal set
+// (lv_gw4: widens guest DHCP/DNS reach), so every writer refuses it and
+// says why.
+//
+// Mutation: drop the reserved-prefix check from SetName — red.
+func TestSetName_ReservedPrefix(t *testing.T) {
+	for _, name := range []string{"lv_gw4", "lv_gw6", "lv_lb_src4", "lv_nic_devs", "lv_vlan_ok", "lv_dhcp_srv", "lv_lb4", "lv_office"} {
+		err := SetName(name)
+		if err == nil || !strings.Contains(err.Error(), `"lv_"`) || !strings.Contains(err.Error(), "choose another name") {
+			t.Errorf("SetName(%s) = %v, want a refusal naming the reserved prefix and the remedy", name, err)
+		}
+	}
+	for _, name := range []string{"lv", "lvx_a", "LV_gw4", "office_lv_"} {
+		if err := SetName(name); err != nil {
+			t.Errorf("SetName(%s): %v", name, err)
+		}
+	}
+	// The renderer's own internal names still pass the nft-level check.
+	if err := RenderSetName("lv_gw4"); err != nil {
+		t.Errorf("RenderSetName(lv_gw4): %v", err)
 	}
 }

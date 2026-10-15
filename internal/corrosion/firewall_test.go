@@ -126,7 +126,7 @@ func TestDeleteStackFirewall(t *testing.T) {
 	if err := InsertSGRule(ctx, c, SGRule{ID: "r1", SGID: "sg1", Direction: "ingress", Proto: "tcp", PortRange: "80", Action: "accept"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := InsertIPSet(ctx, c, IPSet{ID: "ip1", Name: "set", CIDRs: []string{"10.0.0.0/8"}, StackName: stack}); err != nil {
+	if err := InsertIPSet(ctx, c, IPSet{ID: "ip1", Name: "office", CIDRs: []string{"10.0.0.0/8"}, StackName: stack}); err != nil {
 		t.Fatal(err)
 	}
 	if err := InsertClusterFirewallRule(ctx, c, FirewallRule{ID: "cr1", Direction: "ingress", Action: "accept", StackName: stack}); err != nil {

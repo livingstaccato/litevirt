@@ -61,10 +61,21 @@ const (
 // more (the lab's 23 ms `virsh -r domstate` used it).
 const readOnlySocket = "/var/run/libvirt/libvirt-sock-ro"
 
-// StateConn is one connection's domain-state calls.
+// StateConn is one connection's read calls: the domain states, and the other
+// reads a caller makes of a domain while libvirt may hang on another (the
+// domain list, whether a domain is active, its VNC port and console
+// password). Every one but ConsolePassword is allowed on a read-only
+// connection; ConsolePassword reads the domain's secure XML, which libvirt
+// refuses one (a reader for it dials the read-write socket,
+// Client.SecureStateReader).
 type StateConn interface {
 	DomainState(name string) (string, error)
 	DomainStateReason(name string) (DomainStatus, error)
+	DomainIsActive(name string) (bool, error)
+	ListDomains() ([]string, error)
+	VNCPort(name string) (int, error)
+	ConsolePassword(name, kind string) (string, error)
+	DumpXML(name string) (string, error)
 	Close() error
 }
 
@@ -72,7 +83,9 @@ type StateConn interface {
 // of its own: the caller may ask on its usual connection instead.
 var ErrStateConnUnavailable = errors.New("no state-read connection to libvirtd")
 
-var errStateReaderClosed = errors.New("state reader closed")
+// ErrStateReaderClosed is a call on a reader that is closed (its client is
+// closing): libvirt was not asked.
+var ErrStateReaderClosed = errors.New("state reader closed")
 
 type readConn struct {
 	conn   StateConn
@@ -136,6 +149,65 @@ func (r *StateReader) DomainStateReason(name string) (DomainStatus, error) {
 		return e
 	})
 	return st, err
+}
+
+// DomainIsActive is Client.DomainIsActive, asked on the reader's connection.
+func (r *StateReader) DomainIsActive(name string) (bool, error) {
+	var active bool
+	err := r.do(func(c StateConn) error {
+		var e error
+		active, e = c.DomainIsActive(name)
+		return e
+	})
+	return active, err
+}
+
+// ListDomains is Client.ListDomains, asked on the reader's connection.
+// libvirt answers it only once it can look at every domain, so a domain it
+// hangs on holds it too.
+func (r *StateReader) ListDomains() ([]string, error) {
+	var names []string
+	err := r.do(func(c StateConn) error {
+		var e error
+		names, e = c.ListDomains()
+		return e
+	})
+	return names, err
+}
+
+// VNCPort is Client.GetVMVNCPort, asked on the reader's connection.
+func (r *StateReader) VNCPort(name string) (int, error) {
+	port := -1
+	err := r.do(func(c StateConn) error {
+		var e error
+		port, e = c.VNCPort(name)
+		return e
+	})
+	return port, err
+}
+
+// ConsolePassword is Client.ConsolePassword, asked on the reader's
+// connection, which must be a read-write one (Client.SecureStateReader).
+func (r *StateReader) ConsolePassword(name, kind string) (string, error) {
+	var pw string
+	err := r.do(func(c StateConn) error {
+		var e error
+		pw, e = c.ConsolePassword(name, kind)
+		return e
+	})
+	return pw, err
+}
+
+// DumpXML is Client.DumpXML (the live XML, without secrets), asked on the
+// reader's connection.
+func (r *StateReader) DumpXML(name string) (string, error) {
+	var x string
+	err := r.do(func(c StateConn) error {
+		var e error
+		x, e = c.DumpXML(name)
+		return e
+	})
+	return x, err
 }
 
 // Dials is how many connections the reader has dialled.
@@ -244,7 +316,7 @@ func (r *StateReader) acquire() (*readConn, uint64, error) {
 	for {
 		if r.closed {
 			r.mu.Unlock()
-			return nil, 0, errStateReaderClosed
+			return nil, 0, ErrStateReaderClosed
 		}
 		if c := r.cur; c != nil {
 			if r.takes(c) {
@@ -284,7 +356,7 @@ func (r *StateReader) acquire() (*readConn, uint64, error) {
 		if r.closed {
 			r.mu.Unlock()
 			go conn.Close() //nolint:errcheck // best effort
-			return nil, 0, errStateReaderClosed
+			return nil, 0, ErrStateReaderClosed
 		}
 		r.cur = &readConn{conn: conn, calls: map[uint64]time.Time{}}
 	}
@@ -330,7 +402,29 @@ func (c virtStateConn) DomainStateReason(name string) (DomainStatus, error) {
 	return domainStateReason(c.virt, name)
 }
 
+func (c virtStateConn) DomainIsActive(name string) (bool, error) {
+	return domainIsActive(c.virt, name)
+}
+
+func (c virtStateConn) ListDomains() ([]string, error) { return listDomains(c.virt) }
+
+func (c virtStateConn) VNCPort(name string) (int, error) { return vncPort(c.virt, name) }
+
+func (c virtStateConn) ConsolePassword(name, kind string) (string, error) {
+	return consolePassword(c.virt, name, kind)
+}
+
+func (c virtStateConn) DumpXML(name string) (string, error) { return dumpXML(c.virt, name) }
+
 func (c virtStateConn) Close() error { return c.virt.Disconnect() }
+
+// closedStateReader is a reader whose every call fails: what a client hands
+// out once it is closed, so nothing dials a connection Close will not close.
+func closedStateReader() *StateReader {
+	r := NewStateReader(func() (StateConn, error) { return nil, ErrStateReaderClosed }, 0)
+	r.Close() //nolint:errcheck // it has no connection
+	return r
+}
 
 // dialLibvirtBounded is dialLibvirt on socket, with the dial and the
 // handshake bounded by timeout. go-libvirt puts no deadline on the handshake,
@@ -361,6 +455,9 @@ func dialLibvirtBounded(socket string, timeout time.Duration) (*golibvirt.Libvir
 func (c *Client) StateReader() *StateReader {
 	c.stateReaderMu.Lock()
 	defer c.stateReaderMu.Unlock()
+	if c.closed {
+		return closedStateReader()
+	}
 	if c.stateReader == nil {
 		c.stateReader = NewStateReader(func() (StateConn, error) {
 			v, err := dialLibvirtBounded(readOnlySocket, stateDialTimeout)
@@ -374,4 +471,26 @@ func (c *Client) StateReader() *StateReader {
 		}, 0)
 	}
 	return c.stateReader
+}
+
+// SecureStateReader is StateReader on the read-write socket only, for the
+// reads libvirt refuses a read-only connection: a console's password, read
+// from the domain's secure XML (ConsolePassword). Made on first use and
+// closed by Close.
+func (c *Client) SecureStateReader() *StateReader {
+	c.stateReaderMu.Lock()
+	defer c.stateReaderMu.Unlock()
+	if c.closed {
+		return closedStateReader()
+	}
+	if c.secureReader == nil {
+		c.secureReader = NewStateReader(func() (StateConn, error) {
+			v, err := dialLibvirtBounded(defaultSocket, stateDialTimeout)
+			if err != nil {
+				return nil, err
+			}
+			return virtStateConn{virt: v}, nil
+		}, 0)
+	}
+	return c.secureReader
 }

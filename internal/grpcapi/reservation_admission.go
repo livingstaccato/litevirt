@@ -134,6 +134,11 @@ const releaseTimeout = 10 * time.Second
 type reservationLease struct {
 	s  *Server
 	id string
+	// ownerEpoch is the epoch of the operation header id names. The release
+	// step goes there: a terminal at any other epoch leaves the reservation
+	// counting. Zero for every capacity lease; a resize's lease is the VM's
+	// workload operation, whose header is at the VM's owner epoch.
+	ownerEpoch int64
 	// hostHolder is the daemon holding the HOST half when it is not this node —
 	// a destination-owned migration lease (acquireDestinationHostLease). The
 	// operation row lives in the DESTINATION's database, so release must travel
@@ -249,7 +254,7 @@ func (l *reservationLease) release(ctx context.Context) {
 		return
 	}
 	if err := corrosion.AppendOperationStep(rctx, l.s.db, corrosion.OperationStepRecord{
-		OperationID: id, StepName: corrosion.OpStepCompleted,
+		OperationID: id, OwnerEpoch: l.ownerEpoch, StepName: corrosion.OpStepCompleted,
 	}); err != nil {
 		// A failed release leaks the reservation until the sweep ages it out. Log
 		// it as well as counting it: noteStateWriteFail only feeds a metric, and a
@@ -393,11 +398,11 @@ func (s *Server) reserveWithoutCheckFor(
 	if err := corrosion.InsertOperation(ctx, s.db, op); err != nil {
 		return nil, status.Errorf(codes.Internal, "reserve capacity: %v", err)
 	}
-	lease := &reservationLease{s: s, id: op.ID}
+	lease := &reservationLease{s: s, id: op.ID, ownerEpoch: op.VMOwnerEpoch}
 	// Same reason admitReserved stamps: an unattributed reservation is not counted
 	// by capacity aggregation once the project has an authority epoch, so the lease
 	// would hold nothing and the draw would stay invisible after all.
-	if err := s.stampReservationAuthority(ctx, op.ID, project); err != nil {
+	if err := s.stampReservationAuthority(ctx, op.ID, op.VMOwnerEpoch, project); err != nil {
 		lease.release(ctx)
 		return nil, err
 	}
@@ -551,12 +556,16 @@ func (s *Server) decideReservation(ctx context.Context, op corrosion.OperationRe
 	if err := corrosion.InsertOperation(ctx, s.db, op); err != nil {
 		return nil, status.Errorf(codes.Internal, "%s: %v", what, err)
 	}
-	lease := &reservationLease{s: s, id: op.ID}
+	// Every step of the claim — reserved, admitted, and the release's terminal —
+	// is written at the header's owner epoch, because aggregation reduces an
+	// operation by (id, header epoch). Zero for a capacity lease; the VM's epoch
+	// for a resize, whose lease is the workload operation itself.
+	lease := &reservationLease{s: s, id: op.ID, ownerEpoch: op.VMOwnerEpoch}
 	// Attribute the reservation to the project's CURRENT authority. Capacity
 	// aggregation refuses to count a reservation it cannot attribute once an epoch
 	// exists, so skipping this would make the lease consume nothing — the same
 	// headroom handed to the next admission while this one is still holding it.
-	if err := s.stampReservationAuthority(ctx, op.ID, project); err != nil {
+	if err := s.stampReservationAuthority(ctx, op.ID, op.VMOwnerEpoch, project); err != nil {
 		lease.release(ctx)
 		return nil, err
 	}
@@ -567,7 +576,7 @@ func (s *Server) decideReservation(ctx context.Context, op corrosion.OperationRe
 	if h := s.admissionVerifiedHook; h != nil {
 		h(op.ID)
 	}
-	if err := corrosion.MarkReservationAdmitted(ctx, s.db, op.ID); err != nil {
+	if err := corrosion.MarkReservationAdmitted(ctx, s.db, op.ID, op.VMOwnerEpoch); err != nil {
 		// Unmarked, the claim would hold nothing against a smaller id arriving
 		// later. Refuse rather than admit on a claim the others cannot see won.
 		lease.release(ctx)

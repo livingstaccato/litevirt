@@ -233,7 +233,11 @@ func (s *Server) derivedProjectHolder(ctx context.Context, project string) strin
 // its headroom handed to the next admission. The caller releases the provisional
 // operation and refuses the admission; nothing is admitted on an unreadable
 // authority ledger.
-func (s *Server) stampReservationAuthority(ctx context.Context, opID, project string) error {
+//
+// ownerEpoch is the epoch of opID's header: aggregation reads the facts from
+// the `reserved` step at (opID, header epoch), so a step at any other epoch
+// attributes nothing.
+func (s *Server) stampReservationAuthority(ctx context.Context, opID string, ownerEpoch int64, project string) error {
 	cur, ok, err := corrosion.CurrentProjectAuthority(ctx, s.db, project)
 	if err != nil {
 		return status.Errorf(codes.Unavailable,
@@ -243,7 +247,7 @@ func (s *Server) stampReservationAuthority(ctx context.Context, opID, project st
 	if ok {
 		facts = corrosion.ReservationFactsFor(project, cur.Epoch, cur.Holder)
 	}
-	if err := corrosion.AppendReservationFacts(ctx, s.db, opID, 0, project, facts); err != nil {
+	if err := corrosion.AppendReservationFacts(ctx, s.db, opID, ownerEpoch, project, facts); err != nil {
 		return status.Errorf(codes.Internal, "record reservation authority: %v", err)
 	}
 	return nil

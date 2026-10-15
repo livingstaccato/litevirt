@@ -222,12 +222,25 @@ const localInventoryTTL = 10 * time.Second
 
 func (s *Server) localInventoryCached(ctx context.Context) runtimeInventory {
 	s.invCacheMu.Lock()
-	defer s.invCacheMu.Unlock()
 	if !s.invCacheAt.IsZero() && time.Since(s.invCacheAt) < localInventoryTTL {
-		return s.invCache
+		inv := s.invCache
+		s.invCacheMu.Unlock()
+		return inv
 	}
+	gen := s.invCacheGen
+	s.invCacheMu.Unlock()
+	// Not under invCacheMu: the collect can wait for libvirt (up to the
+	// caller's own deadline), and every concurrent admission would queue
+	// behind it (re-review 2, I-2). Concurrent collects share the
+	// inventory's single flight.
 	inv := s.collectRuntimeInventory(ctx)
-	s.invCache, s.invCacheAt = inv, time.Now()
+	s.invCacheMu.Lock()
+	// Not cached when invalidated meanwhile, or when this caller's own
+	// deadline cut it short: the next admission collects afresh.
+	if s.invCacheGen == gen && ctx.Err() == nil {
+		s.invCache, s.invCacheAt = inv, time.Now()
+	}
+	s.invCacheMu.Unlock()
 	if !inv.Complete {
 		slog.Warn("admission gate: local runtime inventory incomplete", "errors", inv.Errors)
 	}
@@ -240,6 +253,7 @@ func (s *Server) invalidateInventoryCache() {
 	s.invCacheMu.Lock()
 	defer s.invCacheMu.Unlock()
 	s.invCacheAt = time.Time{}
+	s.invCacheGen++
 }
 
 // InvalidateInventoryCache is the exported form, for harnesses outside this

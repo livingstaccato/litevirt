@@ -202,6 +202,9 @@ func (r *Reconciler) cleanupRekeyLeftovers(ctx context.Context) {
 			}
 			continue
 		}
+		if !r.domainAnswers(name) {
+			continue // looked at again next pass
+		}
 		if r.virt.DomainExists(name) {
 			if st, serr := r.virt.DomainState(name); serr != nil || st == "running" {
 				continue

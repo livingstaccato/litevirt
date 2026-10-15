@@ -1087,8 +1087,10 @@ func (s *Server) finalizeMigrationOwnership(ctx context.Context, vm *corrosion.V
 func (s *Server) cleanupPostMigration(vmName string) {
 	// Always clean up cloud-init ISO — target regenerates from stored spec if needed.
 	isoPath := filepath.Join(s.dataDir, "cloudinit", vmName+".iso")
-	if err := os.Remove(isoPath); err == nil {
-		slog.Info("post-migration: removed cloud-init ISO", "vm", vmName, "path", isoPath)
+	if _, err := os.Stat(isoPath); err == nil {
+		if err := cloudinit.RemoveSeed(isoPath); err == nil {
+			slog.Info("post-migration: removed cloud-init ISO", "vm", vmName, "path", isoPath)
+		}
 	}
 }
 
@@ -1182,33 +1184,41 @@ func (s *Server) sendReattachVFs(ctx context.Context, client pb.LiteVirtClient, 
 	}
 }
 
-// EnsureCloudInit generates a cloud-init ISO on this host if it doesn't already exist.
-// Called by the source host before migration so the target has the ISO ready.
+// EnsureCloudInit generates a cloud-init ISO on this host unless the one here
+// is already this VM's. Called by the source host before migration so the
+// target has the ISO ready. A seed here of another VM of the name — one
+// deleted while this host kept its seed — is written again
+// (cloudinit/seed_owner.go).
 func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitRequest) (*emptypb.Empty, error) {
-	if _, err := s.authorizeMigrationHelper(ctx, req.VmName); err != nil {
+	vm, err := s.authorizeMigrationHelper(ctx, req.VmName)
+	if err != nil {
 		return nil, err
 	}
 	isoPath, err := lv.SafeCloudInitISOPath(s.dataDir, req.VmName)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	if _, err := os.Stat(isoPath); err == nil {
-		return &emptypb.Empty{}, nil // already exists
+	owner := cloudinit.SpecUUID(vm.Spec)
+	if cloudinit.SeedIsFor(isoPath, owner) {
+		return &emptypb.Empty{}, nil // already this VM's
 	}
+	// A file already at the path is written over, but it was not created
+	// for this migration: a failed migration's cleanup leaves the path alone,
+	// as it does a seed that was this VM's.
+	_, statErr := os.Lstat(isoPath)
+	existed := statErr == nil
 
 	userData := req.Userdata
 	if userData == "" {
 		userData = "#cloud-config\n{}\n"
 	}
-	// The vendor-data follows the VM's spec, read here: the request does not
-	// say whether its network-config is litevirt's or the spec's own. A spec
+	// The vendor-data follows the VM's spec: the request does not say
+	// whether its network-config is litevirt's or the spec's own. A spec
 	// that cannot be read gets none.
 	vendorData := ""
-	if rec, gErr := corrosion.GetVM(ctx, s.db, req.VmName); gErr == nil && rec != nil {
-		var spec pb.VMSpec
-		if json.Unmarshal([]byte(rec.Spec), &spec) == nil {
-			vendorData = cloudinit.SeedVendorData(&spec)
-		}
+	var spec pb.VMSpec
+	if json.Unmarshal([]byte(vm.Spec), &spec) == nil {
+		vendorData = cloudinit.SeedVendorData(&spec)
 	}
 	if err := cloudinit.GenerateISO(cloudinit.Config{
 		InstanceID:    req.VmName,
@@ -1219,8 +1229,14 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 	}, isoPath); err != nil {
 		return nil, status.Errorf(codes.Internal, "generate cloud-init ISO: %v", err)
 	}
-	s.migrationISOs.add(req.VmName, isoPath)
-	slog.Info("cloud-init ISO generated for migration", "vm", req.VmName, "path", isoPath)
+	if err := cloudinit.StampSeed(isoPath, owner); err != nil {
+		slog.Warn("cloud-init ISO for migration: could not stamp it with its VM; a later start writes it again",
+			"vm", req.VmName, "error", err)
+	}
+	if !existed {
+		s.migrationISOs.add(req.VmName, isoPath)
+	}
+	slog.Info("cloud-init ISO generated for migration", "vm", req.VmName, "path", isoPath, "replaced", existed)
 	return &emptypb.Empty{}, nil
 }
 
@@ -1973,7 +1989,7 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 		} else if vmLivesHere || !s.migrationISOs.owns(req.VmName, iso) {
 			slog.Warn("cleanup migration artifacts: leaving a cloud-init ISO this host did not create for the migration",
 				"vm", req.VmName, "path", iso, "vm_lives_here", vmLivesHere)
-		} else if err := os.Remove(iso); err != nil && !os.IsNotExist(err) {
+		} else if err := cloudinit.RemoveSeed(iso); err != nil {
 			slog.Warn("cleanup migration artifacts: remove cloud-init iso", "vm", req.VmName, "path", iso, "error", err)
 		} else {
 			s.migrationISOs.forget(iso)

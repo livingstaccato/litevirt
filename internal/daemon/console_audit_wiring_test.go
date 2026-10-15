@@ -140,6 +140,7 @@ func TestStopServing_MarksThenStopsThenFlushes(t *testing.T) {
 // no behavioural test reaches it.)
 //
 // Mutation: Run without stopServing, or closing the database before it — red.
+// Closing libvirt before the database — red.
 func TestRunStopsServingBeforeTheDatabaseCloses(t *testing.T) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "daemon.go", nil, 0)
@@ -206,6 +207,12 @@ func TestRunStopsServingBeforeTheDatabaseCloses(t *testing.T) {
 	}
 	if !(idx["stopServing"] < idx["repl.Stop"] && idx["repl.Stop"] < idx["db.Close"]) {
 		t.Fatalf("shutdown order: stopServing %d, repl.Stop %d, db.Close %d", idx["stopServing"], idx["repl.Stop"], idx["db.Close"])
+	}
+	// The database closes before libvirt (mainconn review I-2): closing
+	// libvirt fails the calls waiting on it, and their error paths must not
+	// write what that failure is not.
+	if v, ok := idx["virt.Close"]; !ok || v < idx["db.Close"] {
+		t.Fatalf("shutdown order: db.Close %d, virt.Close %d (present %v), want the database closed first", idx["db.Close"], v, ok)
 	}
 }
 

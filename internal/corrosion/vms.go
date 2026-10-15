@@ -671,12 +671,19 @@ func GetSoftDeletedVMDisks(ctx context.Context, c *Client, vmName string) ([]Sof
 // — the incarnation a delete removed — or "" when there is none (no row, or a
 // live one).
 func GetTombstonedVMCreatedAt(ctx context.Context, c *Client, name string) (string, error) {
+	createdAt, _, err := GetTombstonedVM(ctx, c, name)
+	return createdAt, err
+}
+
+// GetTombstonedVM returns the created_at and the spec of name's TOMBSTONED
+// vms row; both "" when it has none.
+func GetTombstonedVM(ctx context.Context, c *Client, name string) (createdAt, spec string, err error) {
 	rows, err := c.Query(ctx,
-		`SELECT created_at FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, name)
+		`SELECT created_at, spec FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, name)
 	if err != nil || len(rows) == 0 {
-		return "", err
+		return "", "", err
 	}
-	return rows[0].String("created_at"), nil
+	return rows[0].String("created_at"), rows[0].String("spec"), nil
 }
 
 // GetVMDisks returns all disks for a VM.
@@ -875,7 +882,8 @@ func LiveVMDiskUsesWithPathPrefix(ctx context.Context, c *Client, prefix string)
 // recreate has just deleted held.
 func VMIncarnationDisks(ctx context.Context, c *Client, name, createdAt string) ([]DiskRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT d.vm_name, d.disk_name, d.host_name, d.path
+		`SELECT d.vm_name, d.disk_name, d.host_name, d.path,
+			COALESCE(d.delete_with_vm, 1) AS delete_with_vm
 		 FROM vm_disks d JOIN vms v ON v.name = d.vm_name
 		 WHERE v.name = ? AND v.created_at = ?`, name, createdAt)
 	if err != nil {
@@ -884,7 +892,8 @@ func VMIncarnationDisks(ctx context.Context, c *Client, name, createdAt string) 
 	out := make([]DiskRecord, len(rows))
 	for i, r := range rows {
 		out[i] = DiskRecord{VMName: r.String("vm_name"), DiskName: r.String("disk_name"),
-			HostName: r.String("host_name"), Path: r.String("path")}
+			HostName: r.String("host_name"), Path: r.String("path"),
+			DeleteWithVM: r.Int("delete_with_vm") == 1}
 	}
 	return out, nil
 }

@@ -334,6 +334,11 @@ func (s *Server) CreateIpSet(ctx context.Context, req *pb.CreateIpSetRequest) (*
 	// `--cidr 10.0.0.1,10.0.0.2` is two elements (rulefield.NormaliseSetElements).
 	row := corrosion.IPSet{ID: randid.New(), Name: req.Name, CIDRs: rulefield.NormaliseSetElements(req.Cidrs)}
 	need, invalid := ipSetRowFeatures(row.Name, row.CIDRs)
+	if invalid == nil {
+		// Before any gate is asked: a set named as another's IPv6 companion
+		// would make every host refuse its ruleset.
+		invalid = corrosion.IPSetCompanionClash(ctx, s.db, "", []corrosion.IPSet{row})
+	}
 	if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
 		return corrosion.InsertIPSetWithGrant(ctx, s.db, g.IPv6, row)
 	}); err != nil {

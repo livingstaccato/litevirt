@@ -310,7 +310,11 @@ answers again. litevirt keeps that from holding anything else:
   ("libvirt has not answered the start"). The start is not cancelled: it
   keeps the VM's lock and start lease, the VM's row says `starting` (on every
   host), and its outcome (`running`, or the row put back) is recorded and
-  shown in `lv events` when libvirt answers. Meanwhile `lv stop` and
+  shown in `lv events` when libvirt answers. If the daemon restarts first,
+  the reconciler records the VM `running`, and the start in `lv events`,
+  once libvirt has started the domain; while the domain does not run, the
+  start lease stands until it runs out (10 minutes), and the reconciler then
+  starts the VM itself. Meanwhile `lv stop` and
   `lv restart` answer `Unavailable` at once; `lv stop --force` cancels the
   start (the VM is recorded stopped now, and a domain libvirt starts for it
   is destroyed when it answers; the cancel is kept in
@@ -328,7 +332,16 @@ answers again. litevirt keeps that from holding anything else:
   `cancelled-starts.json` that cannot be read raises
   `cancelled_starts_unreadable` (see [diagnostics.md](diagnostics.md)). Other calls on the VM, `lv rm` among them,
   wait for the start. `lv ls` and `lv inspect` on that host report a VM
-  libvirt does not answer for as `VM_UNKNOWN` within a few seconds.
+  libvirt does not answer for as `VM_UNKNOWN` within a few seconds, and the
+  other VMs there as usual. `lv inspect` of a running VM whose VNC console
+  libvirt does not answer for says so (`vnc_unknown`, which `lv vnc` prints)
+  rather than reporting no console or no password. The host's background
+  passes (the reconcile walk and its sweeps, the restart-policy pass) skip a
+  VM libvirt does not answer for, deciding and changing nothing about it
+  until it answers, and reconcile the other VMs; a sweep over all of the
+  host's domains (self-fence, ownership repair, orphan report) is skipped
+  while libvirt does not answer the domain list, which a domain it hangs on
+  holds.
 - **The reconcile pass.** One pass on a host serves all of its VMs, so no
   look it makes at a disk file waits on the server. The check that each disk
   of a VM it starts is there, the set-aside of an old copy at a host-local

@@ -2,6 +2,7 @@ package failover
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +24,21 @@ func operatorConfirms(t *testing.T, db *corrosion.Client, ctx context.Context, h
 		Detail: "operator confirmation via FenceHost(confirm_manual_only)",
 	}); err != nil {
 		t.Fatalf("InsertFenceLog: %v", err)
+	}
+}
+
+// poweredOff is the operator powering down off before confirming it: an
+// observer that saw it answer (a bridge) now fails it, its run begun 10 s ago.
+// A confirmation is spent only while nobody has seen the host answer since it
+// (confirmationStands), so a bridge still answering would refuse it.
+func poweredOff(t *testing.T, db *corrosion.Client, observer string) {
+	t.Helper()
+	now := time.Now()
+	if err := db.Execute(context.Background(),
+		`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+		 VALUES (?, 'down', 'suspect', ?, ?, ?)`, observer, offlineThreshold,
+		now.Add(-10*time.Second).UTC().Format(time.RFC3339Nano), now.UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -490,5 +506,171 @@ func seedFenceRow(t *testing.T, db *corrosion.Client, ctx context.Context, id, r
 		`INSERT INTO fencing_log (id, host_name, method, result, timestamp, detail) VALUES (?, ?, ?, ?, ?, ?)`,
 		id, "down", "manual", result, time.Now().Add(-age).UTC().Format(time.RFC3339), "seeded"); err != nil {
 		t.Fatalf("seed %s: %v", id, err)
+	}
+}
+
+// confirmedLastOutage seeds down's first outage, as a coordinator that took
+// the lease since (or restarted) finds it: the cluster's fence attempt and an
+// operator's confirmation of it, attemptAge and confirmAge ago. v4's path to
+// down never healed, so its failing run reaches back an hour; coordinator and
+// alive saw down answer after the confirmation, and fail it again in the
+// outage in progress, their runs begun 30 s ago.
+func confirmedLastOutage(t *testing.T, attemptAge, confirmAge time.Duration) (*corrosion.Client, context.Context) {
+	t.Helper()
+	db, ctx := seedDownHost(t, "manual", nil)
+	now := time.Now()
+	ensureVoter(t, db, "v4")
+	failingSince(t, db, "v4", now.Add(-time.Hour), now)
+	for _, o := range []string{"coordinator", "alive"} {
+		failingSince(t, db, o, now.Add(-30*time.Second), now)
+	}
+	seedFenceRow(t, db, ctx, "outage1-attempt", "partial", attemptAge)
+	confirmAgo(t, db, ctx, confirmAge)
+	return db, ctx
+}
+
+// Re-review 2 (R2-C1): a confirmation of an earlier outage is not spent in
+// the next one. The attempt reads as this outage's — inside
+// recentFenceWindow, or on v4's unbroken run — and the confirmation is newer
+// than it, but coordinator and alive saw down answer after the confirmation:
+// their failing runs began after it. A coordinator that has not spent the
+// confirmation (the lease moved, or it restarted) must not resume on it;
+// down is running whatever it ran before. The refusal is the host's hold,
+// with the remedy.
+//
+// Mutation: drop the check that the confirmation still stands from
+// confirmationResume — the VM moves in both subtests.
+func TestConfirmationResume_AConfirmationSomeoneSawTheHostAnswerSinceIsNotResumed(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		attemptAge, confirmAge time.Duration
+	}{
+		{"attempt inside the fence window", 3 * time.Minute, 2 * time.Minute},
+		{"attempt on one observer's spanning run", 20 * time.Minute, 15 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, ctx := confirmedLastOutage(t, tc.attemptAge, tc.confirmAge)
+			c := newTestCoordinator("coordinator", db)
+			c.SetFencer(manualFencer())
+
+			c.run(ctx)
+			c.run(ctx)
+
+			if got := vmHost(t, db, ctx); got != "down" {
+				t.Fatalf("VM moved to %q on a confirmation the observers saw down answer after", got)
+			}
+			hold := c.holdReason["down"]
+			if !strings.Contains(hold, "lv host fence-confirm down") || !strings.Contains(hold, "alive") {
+				t.Errorf("the refusal is not the host's hold with the remedy and the observers that saw it answer: %q", hold)
+			}
+		})
+	}
+}
+
+// The remedy works: confirming again in the outage in progress resumes the
+// recovery, although the attempt is the earlier outage's — the new
+// confirmation is the operator's word that down is off now, and nobody has
+// seen it answer since.
+//
+// Mutation: judge the confirmation's standing at the attempt instead of at
+// the confirmation — coordinator's and alive's runs began after the attempt,
+// so the fresh confirmation is refused too and the VM never moves.
+func TestConfirmationResume_ConfirmingAgainInThisOutageResumes(t *testing.T) {
+	db, ctx := confirmedLastOutage(t, 20*time.Minute, 15*time.Minute)
+	c := newTestCoordinator("coordinator", db)
+	c.SetFencer(manualFencer())
+	c.run(ctx)
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Fatalf("setup: VM moved to %q on the earlier outage's confirmation", got)
+	}
+
+	seedFenceRow(t, db, ctx, "operator-again", "manual-confirmed", 0)
+	c.run(ctx)
+
+	if got := vmHost(t, db, ctx); got != "alive" {
+		t.Errorf("VM still on %q after the operator confirmed down off again in this outage", got)
+	}
+}
+
+// This node's own healthy probe of the host since the confirmation is an
+// answer since it too, read on this node's clock.
+//
+// Mutation: drop the LastContact check from confirmationResume — the VM
+// moves although this node reached down after the confirmation.
+func TestConfirmationResume_AProbeAnswerSinceTheConfirmationIsNotResumed(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		contact time.Duration // before now
+		want    string
+	}{
+		{"probed healthy before the confirmation", 2 * time.Minute, "alive"},
+		{"probed healthy since the confirmation", 0, "down"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, ctx := seedDownHost(t, "manual", nil)
+			now := time.Now()
+			for _, o := range []string{"coordinator", "alive"} {
+				failingSince(t, db, o, now.Add(-5*time.Minute), now)
+			}
+			seedFenceRow(t, db, ctx, "attempt", "partial", time.Minute)
+			confirmAgo(t, db, ctx, 30*time.Second)
+			c := newTestCoordinator("coordinator", db)
+			c.SetFencer(manualFencer())
+			contact := now.Add(-tc.contact)
+			c.LastContact = func(string) (time.Time, bool) { return contact, true }
+
+			c.run(ctx)
+
+			if got := vmHost(t, db, ctx); got != tc.want {
+				t.Fatalf("VM on %q, want %q", got, tc.want)
+			}
+			if tc.want == "down" && !strings.Contains(c.holdReason["down"], "lv host fence-confirm down") {
+				t.Errorf("the refusal is not the host's hold with the remedy: %q", c.holdReason["down"])
+			}
+		})
+	}
+}
+
+// The same rule holds where a confirmation fences afresh: a confirmation
+// written before any fence of the earlier outage, which ended before the
+// coordinator fenced, does not fence down in the next outage on v4's
+// spanning run — the manual fence it would start accepts that same recent
+// confirmation, and the VM would move beside down's copy. Confirming again
+// fences afresh and recovers.
+//
+// Mutation: judge the confirmation by observerStreakSpans alone in
+// confirmationFencesAfresh — the coordinator fences and the VM moves.
+func TestConfirmationFencesAfresh_AConfirmationSomeoneSawTheHostAnswerSinceFencesNothing(t *testing.T) {
+	db, ctx := seedDownHost(t, "manual", nil)
+	now := time.Now()
+	ensureVoter(t, db, "v4")
+	failingSince(t, db, "v4", now.Add(-time.Hour), now)
+	for _, o := range []string{"coordinator", "alive"} {
+		failingSince(t, db, o, now.Add(-30*time.Second), now)
+	}
+	confirmAgo(t, db, ctx, 2*time.Minute) // no fence attempt on record
+	c := newTestCoordinator("coordinator", db)
+	fences := 0
+	c.SetFencer(func(ctx context.Context, h fence.HostConfig) fence.Result {
+		fences++
+		return manualFencer()(ctx, h)
+	})
+
+	c.run(ctx)
+	c.run(ctx)
+
+	if fences != 0 || vmHost(t, db, ctx) != "down" {
+		t.Fatalf("%d fences and the VM on %q, on a confirmation the observers saw down answer after", fences, vmHost(t, db, ctx))
+	}
+	if hold := c.holdReason["down"]; !strings.Contains(hold, "lv host fence-confirm down") {
+		t.Errorf("the refusal is not the host's hold with the remedy: %q", hold)
+	}
+
+	seedFenceRow(t, db, ctx, "operator-again", "manual-confirmed", 0)
+	c.run(ctx)
+	c.run(ctx)
+
+	if fences != 1 || vmHost(t, db, ctx) != "alive" {
+		t.Errorf("%d fences and the VM on %q after confirming again; want one fresh fence and the VM recovered", fences, vmHost(t, db, ctx))
 	}
 }

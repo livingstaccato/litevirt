@@ -869,6 +869,13 @@ func (f *Fake) UndefineDomainPreservingState(name string) error {
 // DomainIsActive mirrors libvirt's activity question. StateRunning and
 // StatePaused are both ACTIVE; only an undefined or shut-off domain is not.
 func (f *Fake) DomainIsActive(name string) (bool, error) {
+	var active bool
+	var err error
+	_ = f.mainConn().callAs(false, "", name, func() { active, err = f.domainIsActive(name) })
+	return active, err
+}
+
+func (f *Fake) domainIsActive(name string) (bool, error) {
 	if f.FailDomainState != nil {
 		if err := f.FailDomainState(name); err != nil {
 			return false, err
@@ -927,9 +934,12 @@ func (f *Fake) SetPaused(name string) {
 }
 
 func (f *Fake) DomainExists(name string) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	_, ok := f.domains[name]
+	var ok bool
+	_ = f.mainConn().callAs(false, "", name, func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		_, ok = f.domains[name]
+	})
 	return ok
 }
 
@@ -1016,6 +1026,13 @@ func (f *Fake) domainStateReason(name string) (libvirt.DomainStatus, error) {
 }
 
 func (f *Fake) ListDomains() ([]string, error) {
+	var names []string
+	var err error
+	_ = f.mainConn().callAs(false, "", "", func() { names, err = f.listDomains() })
+	return names, err
+}
+
+func (f *Fake) listDomains() ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.FailListDomains != nil {
@@ -1027,6 +1044,7 @@ func (f *Fake) ListDomains() ([]string, error) {
 	for n := range f.domains {
 		out = append(out, n)
 	}
+	sort.Strings(out) // a test can tell which domain a list reaches last
 	return out, nil
 }
 
@@ -1036,6 +1054,13 @@ func (f *Fake) ListDomains() ([]string, error) {
 // diverges them). Disk hotplug's live view is tracked separately (diskSources) and
 // never touches activeXML, so this default is unaffected by disk attach/detach.
 func (f *Fake) DumpXML(name string) (string, error) {
+	var x string
+	var err error
+	_ = f.mainConn().callAs(false, "", name, func() { x, err = f.dumpXML(name) })
+	return x, err
+}
+
+func (f *Fake) dumpXML(name string) (string, error) {
 	if f.FailDumpXML != nil {
 		if err := f.FailDumpXML(name); err != nil {
 			return "", err
@@ -1152,6 +1177,13 @@ func (f *Fake) WaitForShutdown(name string, timeout time.Duration) bool {
 // VNC / SPICE / console — return deterministic placeholders.
 
 func (f *Fake) GetVMVNCPort(name string) (int, error) {
+	port := -1
+	var err error
+	_ = f.mainConn().callAs(false, CallVNCPort, name, func() { port, err = f.vncPort(name) })
+	return port, err
+}
+
+func (f *Fake) vncPort(name string) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if p, ok := f.vncPorts[name]; ok {
@@ -1260,6 +1292,13 @@ func (f *Fake) stripConsoleForBackstop(name string, cause error) bool {
 // running guest started with, else its definition's. A domain the fake has
 // never heard of has none (its console placeholders answer for any name).
 func (f *Fake) ConsolePassword(name, kind string) (string, error) {
+	var pw string
+	var err error
+	_ = f.mainConn().callAs(false, CallConsolePassword, name, func() { pw, err = f.consolePassword(name, kind) })
+	return pw, err
+}
+
+func (f *Fake) consolePassword(name, kind string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if pw, ok := f.liveConsolePw[name]; ok {
@@ -2674,7 +2713,20 @@ func (f *Fake) FireEvent(domainName string, event libvirt.DomainEventType, detai
 	cb(domainName, event, detail)
 }
 
-func (f *Fake) Close() error { return nil }
+// Close marks the Fake closed (Closing); its calls go on answering.
+func (f *Fake) Close() error {
+	f.conns.mu.Lock()
+	f.conns.closing = true
+	f.conns.mu.Unlock()
+	return nil
+}
+
+// Closing mirrors libvirt.Client.Closing: whether Close has been called.
+func (f *Fake) Closing() bool {
+	f.conns.mu.Lock()
+	defer f.conns.mu.Unlock()
+	return f.conns.closing
+}
 
 // SetDomainOwnerEpoch / GetDomainOwnerEpoch mirror the Phase 4 runtime marker
 // stored in domain metadata. The fake records them per domain so fleet and

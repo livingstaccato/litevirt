@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -542,7 +541,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	cleanupDisks := func() {
 		if createdSeed != "" {
 			if fi, err := os.Stat(createdSeed); err == nil && os.SameFile(fi, createdSeedFile) {
-				if rmErr := os.Remove(createdSeed); rmErr != nil && !os.IsNotExist(rmErr) {
+				if rmErr := cloudinit.RemoveSeed(createdSeed); rmErr != nil {
 					slog.Warn("cleanup: failed to remove cloud-init seed", "path", createdSeed, "error", rmErr)
 				}
 			}
@@ -581,9 +580,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	}
 
 	// Clean up any orphaned disk files / cloud-init ISO left from a previous
-	// incomplete delete, even if the libvirt domain is already gone.
-	s.sweepVMDiskDebris(ctx, spec.Name)
-	os.Remove(lv.CloudInitISOPath(s.dataDir, spec.Name))
+	// incomplete delete, even if the libvirt domain is already gone. A disk
+	// a deleted VM of this name was kept with, or that a failover left here,
+	// is moved off its path first (clearDiskDebrisBeforeCreate).
+	if err := s.clearDiskDebrisBeforeCreate(ctx, spec.Name, time.Now()); err != nil {
+		return nil, status.Errorf(codes.Unavailable, "create %s refused on %s: %v; nothing was created", spec.Name, s.hostName, err)
+	}
+	_ = cloudinit.RemoveSeed(lv.CloudInitISOPath(s.dataDir, spec.Name))
 
 	// Auto-pull image from a peer if not available locally.
 	if spec.Image != "" && !s.images.ImageExists(spec.Image) {
@@ -1134,6 +1137,15 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		} else {
 			cloudInitISO = isoPath
 			recordSeed(isoPath)
+		}
+	}
+
+	// The seed is this VM's (cloudinit/seed_owner.go): a host that later finds
+	// it reuses it for this VM only.
+	if cloudInitISO != "" {
+		if err := cloudinit.StampSeed(cloudInitISO, spec.Uuid); err != nil {
+			slog.Warn("create: could not stamp the cloud-init seed with its VM; a later start writes it again",
+				"vm", spec.Name, "error", err)
 		}
 	}
 
@@ -3102,7 +3114,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// node keeps scheduling around. A failure is logged and every NIC named
 		// for the orphan sweep, never swallowed.
 		s.releaseNICLeasesBestEffort(ctx, vm, "delete-stale-record")
-		deleted, err := corrosion.DeleteVMReporting(ctx, s.db, req.Name)
+		deleted, err := s.tombstoneDeletedVM(ctx, req.Name, req.KeepDisks)
 		if err != nil {
 			// A declined delete means the stale row is still live cluster-wide;
 			// claiming OK here would hide it. Idempotent — retry.
@@ -3301,7 +3313,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		s.removeOwnDiskLayers(ctx, req.Name, layers)
 		s.removeVMSnapshotRAMImages(ctx, req.Name)
 		// Remove cloud-init ISO
-		os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
+		_ = cloudinit.RemoveSeed(lv.CloudInitISOPath(s.dataDir, req.Name))
 		// Firmware state (G1): wipe nvram (name-keyed) + swtpm (uuid-keyed). With
 		// --keep-disks we deliberately KEEP it too — else a retained BitLocker disk
 		// would be unbootable (the swtpm tree at the stable uuid stays for restore).
@@ -3427,7 +3439,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// row every node keeps serving, scheduling around and failing over — the
 	// exact stale-live state the mandatory tombstone exists to kill. The domain
 	// teardown above is idempotent, so the caller can simply retry.
-	deleted, err := corrosion.DeleteVMReporting(ctx, s.db, req.Name)
+	deleted, err := s.tombstoneDeletedVM(ctx, req.Name, req.KeepDisks)
 	if err != nil {
 		s.audit(ctx, "vm.delete", req.Name, "project="+tenancy.NormalizeProject(vm.Project), "error")
 		return nil, status.Errorf(codes.Internal, "delete: tombstone cluster row: %v", err)
@@ -3495,7 +3507,8 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	// graceful shutdown where libvirt still reports "running" briefly.
 	// The live state, as `lv ls` reads it (readVMState); the record's
 	// detail unless the read has its own.
-	state, stateDetail := s.readVMState(vm, s.newLiveStateBudget())
+	budget := s.newLiveStateBudget()
+	state, stateDetail := s.readVMState(vm, budget)
 	if stateDetail == "" {
 		stateDetail = vm.StateDetail
 	}
@@ -3620,14 +3633,7 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 
 	// VNC address — only available for running VMs on this host
 	if vm.HostName == s.hostName && state == "running" && s.virt != nil {
-		if port, err := s.virt.GetVMVNCPort(name); err == nil && port >= 0 {
-			if host, err := corrosion.GetHost(ctx, s.db, s.hostName); err == nil && host != nil {
-				pbVM.VncAddress = fmt.Sprintf("vnc://%s", net.JoinHostPort(host.Address, strconv.Itoa(port)))
-			}
-			// Whether that listener asks for a password (docs/ui.md "Console
-			// passwords"); never the password itself.
-			pbVM.VncPasswordRequired = s.vmHasVNCPassword(name)
-		}
+		s.fillVNC(ctx, pbVM, name, budget)
 	}
 
 	// Project the authoritative device tables into the spec's device
@@ -4386,7 +4392,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// Wipe the old firmware state — rebuild recreates with a FRESH identity, so the
 	// old name-keyed NVRAM + old-UUID swtpm tree would otherwise be orphaned (G1).
 	lv.WipeFirmwareState(s.dataDir, req.Name, spec.Uuid)
-	os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
+	_ = cloudinit.RemoveSeed(lv.CloudInitISOPath(s.dataDir, req.Name))
 	// The rebuilt VM gets a fresh uuid: the ISO record of the old one goes.
 	s.forgetVMISOIdentity(req.Name, vm.Spec)
 

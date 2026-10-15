@@ -245,6 +245,16 @@ const (
 	LiteVirt_DeleteIpSet_FullMethodName                = "/litevirt.v1.LiteVirt/DeleteIpSet"
 	LiteVirt_SetFirewallDefault_FullMethodName         = "/litevirt.v1.LiteVirt/SetFirewallDefault"
 	LiteVirt_ListFirewallDefaults_FullMethodName       = "/litevirt.v1.LiteVirt/ListFirewallDefaults"
+	LiteVirt_GetFirewallSynflood_FullMethodName        = "/litevirt.v1.LiteVirt/GetFirewallSynflood"
+	LiteVirt_SetFirewallSynflood_FullMethodName        = "/litevirt.v1.LiteVirt/SetFirewallSynflood"
+	LiteVirt_GetFirewallLogPolicy_FullMethodName       = "/litevirt.v1.LiteVirt/GetFirewallLogPolicy"
+	LiteVirt_SetFirewallLogPolicy_FullMethodName       = "/litevirt.v1.LiteVirt/SetFirewallLogPolicy"
+	LiteVirt_ListFirewallLog_FullMethodName            = "/litevirt.v1.LiteVirt/ListFirewallLog"
+	LiteVirt_ListFirewallTagGroups_FullMethodName      = "/litevirt.v1.LiteVirt/ListFirewallTagGroups"
+	LiteVirt_SetFirewallTagGroup_FullMethodName        = "/litevirt.v1.LiteVirt/SetFirewallTagGroup"
+	LiteVirt_DeleteFirewallTagGroup_FullMethodName     = "/litevirt.v1.LiteVirt/DeleteFirewallTagGroup"
+	LiteVirt_ListFirewallTags_FullMethodName           = "/litevirt.v1.LiteVirt/ListFirewallTags"
+	LiteVirt_SetFirewallTags_FullMethodName            = "/litevirt.v1.LiteVirt/SetFirewallTags"
 	LiteVirt_CreateSecurityGroup_FullMethodName        = "/litevirt.v1.LiteVirt/CreateSecurityGroup"
 	LiteVirt_DeleteSecurityGroup_FullMethodName        = "/litevirt.v1.LiteVirt/DeleteSecurityGroup"
 	LiteVirt_AddSecurityGroupRule_FullMethodName       = "/litevirt.v1.LiteVirt/AddSecurityGroupRule"
@@ -731,6 +741,17 @@ type LiteVirtClient interface {
 	DeleteIpSet(ctx context.Context, in *DeleteIpSetRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	SetFirewallDefault(ctx context.Context, in *SetFirewallDefaultRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	ListFirewallDefaults(ctx context.Context, in *ListFirewallDefaultsRequest, opts ...grpc.CallOption) (*ListFirewallDefaultsResponse, error)
+	// ── Firewall extras: SYN-flood protection, logging, tag groups ──
+	GetFirewallSynflood(ctx context.Context, in *GetFirewallSynfloodRequest, opts ...grpc.CallOption) (*GetFirewallSynfloodResponse, error)
+	SetFirewallSynflood(ctx context.Context, in *SetFirewallSynfloodRequest, opts ...grpc.CallOption) (*FirewallSynfloodPolicy, error)
+	GetFirewallLogPolicy(ctx context.Context, in *GetFirewallLogPolicyRequest, opts ...grpc.CallOption) (*GetFirewallLogPolicyResponse, error)
+	SetFirewallLogPolicy(ctx context.Context, in *SetFirewallLogPolicyRequest, opts ...grpc.CallOption) (*FirewallLogPolicy, error)
+	ListFirewallLog(ctx context.Context, in *ListFirewallLogRequest, opts ...grpc.CallOption) (*ListFirewallLogResponse, error)
+	ListFirewallTagGroups(ctx context.Context, in *ListFirewallTagGroupsRequest, opts ...grpc.CallOption) (*ListFirewallTagGroupsResponse, error)
+	SetFirewallTagGroup(ctx context.Context, in *SetFirewallTagGroupRequest, opts ...grpc.CallOption) (*FirewallTagGroup, error)
+	DeleteFirewallTagGroup(ctx context.Context, in *DeleteFirewallTagGroupRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	ListFirewallTags(ctx context.Context, in *ListFirewallTagsRequest, opts ...grpc.CallOption) (*ListFirewallTagsResponse, error)
+	SetFirewallTags(ctx context.Context, in *SetFirewallTagsRequest, opts ...grpc.CallOption) (*FirewallTags, error)
 	// ── Security groups: the per-NIC tier ──
 	CreateSecurityGroup(ctx context.Context, in *CreateSecurityGroupRequest, opts ...grpc.CallOption) (*SecurityGroup, error)
 	DeleteSecurityGroup(ctx context.Context, in *DeleteSecurityGroupRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -3569,6 +3590,106 @@ func (c *liteVirtClient) ListFirewallDefaults(ctx context.Context, in *ListFirew
 	return out, nil
 }
 
+func (c *liteVirtClient) GetFirewallSynflood(ctx context.Context, in *GetFirewallSynfloodRequest, opts ...grpc.CallOption) (*GetFirewallSynfloodResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetFirewallSynfloodResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_GetFirewallSynflood_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) SetFirewallSynflood(ctx context.Context, in *SetFirewallSynfloodRequest, opts ...grpc.CallOption) (*FirewallSynfloodPolicy, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FirewallSynfloodPolicy)
+	err := c.cc.Invoke(ctx, LiteVirt_SetFirewallSynflood_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) GetFirewallLogPolicy(ctx context.Context, in *GetFirewallLogPolicyRequest, opts ...grpc.CallOption) (*GetFirewallLogPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetFirewallLogPolicyResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_GetFirewallLogPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) SetFirewallLogPolicy(ctx context.Context, in *SetFirewallLogPolicyRequest, opts ...grpc.CallOption) (*FirewallLogPolicy, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FirewallLogPolicy)
+	err := c.cc.Invoke(ctx, LiteVirt_SetFirewallLogPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ListFirewallLog(ctx context.Context, in *ListFirewallLogRequest, opts ...grpc.CallOption) (*ListFirewallLogResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListFirewallLogResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListFirewallLog_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ListFirewallTagGroups(ctx context.Context, in *ListFirewallTagGroupsRequest, opts ...grpc.CallOption) (*ListFirewallTagGroupsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListFirewallTagGroupsResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListFirewallTagGroups_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) SetFirewallTagGroup(ctx context.Context, in *SetFirewallTagGroupRequest, opts ...grpc.CallOption) (*FirewallTagGroup, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FirewallTagGroup)
+	err := c.cc.Invoke(ctx, LiteVirt_SetFirewallTagGroup_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) DeleteFirewallTagGroup(ctx context.Context, in *DeleteFirewallTagGroupRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_DeleteFirewallTagGroup_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ListFirewallTags(ctx context.Context, in *ListFirewallTagsRequest, opts ...grpc.CallOption) (*ListFirewallTagsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListFirewallTagsResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListFirewallTags_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) SetFirewallTags(ctx context.Context, in *SetFirewallTagsRequest, opts ...grpc.CallOption) (*FirewallTags, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FirewallTags)
+	err := c.cc.Invoke(ctx, LiteVirt_SetFirewallTags_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) CreateSecurityGroup(ctx context.Context, in *CreateSecurityGroupRequest, opts ...grpc.CallOption) (*SecurityGroup, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SecurityGroup)
@@ -5118,6 +5239,17 @@ type LiteVirtServer interface {
 	DeleteIpSet(context.Context, *DeleteIpSetRequest) (*emptypb.Empty, error)
 	SetFirewallDefault(context.Context, *SetFirewallDefaultRequest) (*emptypb.Empty, error)
 	ListFirewallDefaults(context.Context, *ListFirewallDefaultsRequest) (*ListFirewallDefaultsResponse, error)
+	// ── Firewall extras: SYN-flood protection, logging, tag groups ──
+	GetFirewallSynflood(context.Context, *GetFirewallSynfloodRequest) (*GetFirewallSynfloodResponse, error)
+	SetFirewallSynflood(context.Context, *SetFirewallSynfloodRequest) (*FirewallSynfloodPolicy, error)
+	GetFirewallLogPolicy(context.Context, *GetFirewallLogPolicyRequest) (*GetFirewallLogPolicyResponse, error)
+	SetFirewallLogPolicy(context.Context, *SetFirewallLogPolicyRequest) (*FirewallLogPolicy, error)
+	ListFirewallLog(context.Context, *ListFirewallLogRequest) (*ListFirewallLogResponse, error)
+	ListFirewallTagGroups(context.Context, *ListFirewallTagGroupsRequest) (*ListFirewallTagGroupsResponse, error)
+	SetFirewallTagGroup(context.Context, *SetFirewallTagGroupRequest) (*FirewallTagGroup, error)
+	DeleteFirewallTagGroup(context.Context, *DeleteFirewallTagGroupRequest) (*emptypb.Empty, error)
+	ListFirewallTags(context.Context, *ListFirewallTagsRequest) (*ListFirewallTagsResponse, error)
+	SetFirewallTags(context.Context, *SetFirewallTagsRequest) (*FirewallTags, error)
 	// ── Security groups: the per-NIC tier ──
 	CreateSecurityGroup(context.Context, *CreateSecurityGroupRequest) (*SecurityGroup, error)
 	DeleteSecurityGroup(context.Context, *DeleteSecurityGroupRequest) (*emptypb.Empty, error)
@@ -6155,6 +6287,36 @@ func (UnimplementedLiteVirtServer) SetFirewallDefault(context.Context, *SetFirew
 }
 func (UnimplementedLiteVirtServer) ListFirewallDefaults(context.Context, *ListFirewallDefaultsRequest) (*ListFirewallDefaultsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListFirewallDefaults not implemented")
+}
+func (UnimplementedLiteVirtServer) GetFirewallSynflood(context.Context, *GetFirewallSynfloodRequest) (*GetFirewallSynfloodResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetFirewallSynflood not implemented")
+}
+func (UnimplementedLiteVirtServer) SetFirewallSynflood(context.Context, *SetFirewallSynfloodRequest) (*FirewallSynfloodPolicy, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetFirewallSynflood not implemented")
+}
+func (UnimplementedLiteVirtServer) GetFirewallLogPolicy(context.Context, *GetFirewallLogPolicyRequest) (*GetFirewallLogPolicyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetFirewallLogPolicy not implemented")
+}
+func (UnimplementedLiteVirtServer) SetFirewallLogPolicy(context.Context, *SetFirewallLogPolicyRequest) (*FirewallLogPolicy, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetFirewallLogPolicy not implemented")
+}
+func (UnimplementedLiteVirtServer) ListFirewallLog(context.Context, *ListFirewallLogRequest) (*ListFirewallLogResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListFirewallLog not implemented")
+}
+func (UnimplementedLiteVirtServer) ListFirewallTagGroups(context.Context, *ListFirewallTagGroupsRequest) (*ListFirewallTagGroupsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListFirewallTagGroups not implemented")
+}
+func (UnimplementedLiteVirtServer) SetFirewallTagGroup(context.Context, *SetFirewallTagGroupRequest) (*FirewallTagGroup, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetFirewallTagGroup not implemented")
+}
+func (UnimplementedLiteVirtServer) DeleteFirewallTagGroup(context.Context, *DeleteFirewallTagGroupRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteFirewallTagGroup not implemented")
+}
+func (UnimplementedLiteVirtServer) ListFirewallTags(context.Context, *ListFirewallTagsRequest) (*ListFirewallTagsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListFirewallTags not implemented")
+}
+func (UnimplementedLiteVirtServer) SetFirewallTags(context.Context, *SetFirewallTagsRequest) (*FirewallTags, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetFirewallTags not implemented")
 }
 func (UnimplementedLiteVirtServer) CreateSecurityGroup(context.Context, *CreateSecurityGroupRequest) (*SecurityGroup, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateSecurityGroup not implemented")
@@ -10298,6 +10460,186 @@ func _LiteVirt_ListFirewallDefaults_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_GetFirewallSynflood_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetFirewallSynfloodRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetFirewallSynflood(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetFirewallSynflood_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetFirewallSynflood(ctx, req.(*GetFirewallSynfloodRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SetFirewallSynflood_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetFirewallSynfloodRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SetFirewallSynflood(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SetFirewallSynflood_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SetFirewallSynflood(ctx, req.(*SetFirewallSynfloodRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_GetFirewallLogPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetFirewallLogPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetFirewallLogPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetFirewallLogPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetFirewallLogPolicy(ctx, req.(*GetFirewallLogPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SetFirewallLogPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetFirewallLogPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SetFirewallLogPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SetFirewallLogPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SetFirewallLogPolicy(ctx, req.(*SetFirewallLogPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ListFirewallLog_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListFirewallLogRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListFirewallLog(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListFirewallLog_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListFirewallLog(ctx, req.(*ListFirewallLogRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ListFirewallTagGroups_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListFirewallTagGroupsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListFirewallTagGroups(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListFirewallTagGroups_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListFirewallTagGroups(ctx, req.(*ListFirewallTagGroupsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SetFirewallTagGroup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetFirewallTagGroupRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SetFirewallTagGroup(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SetFirewallTagGroup_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SetFirewallTagGroup(ctx, req.(*SetFirewallTagGroupRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_DeleteFirewallTagGroup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteFirewallTagGroupRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).DeleteFirewallTagGroup(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_DeleteFirewallTagGroup_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).DeleteFirewallTagGroup(ctx, req.(*DeleteFirewallTagGroupRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ListFirewallTags_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListFirewallTagsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListFirewallTags(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListFirewallTags_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListFirewallTags(ctx, req.(*ListFirewallTagsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SetFirewallTags_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetFirewallTagsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SetFirewallTags(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SetFirewallTags_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SetFirewallTags(ctx, req.(*SetFirewallTagsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_CreateSecurityGroup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CreateSecurityGroupRequest)
 	if err := dec(in); err != nil {
@@ -12917,6 +13259,46 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListFirewallDefaults",
 			Handler:    _LiteVirt_ListFirewallDefaults_Handler,
+		},
+		{
+			MethodName: "GetFirewallSynflood",
+			Handler:    _LiteVirt_GetFirewallSynflood_Handler,
+		},
+		{
+			MethodName: "SetFirewallSynflood",
+			Handler:    _LiteVirt_SetFirewallSynflood_Handler,
+		},
+		{
+			MethodName: "GetFirewallLogPolicy",
+			Handler:    _LiteVirt_GetFirewallLogPolicy_Handler,
+		},
+		{
+			MethodName: "SetFirewallLogPolicy",
+			Handler:    _LiteVirt_SetFirewallLogPolicy_Handler,
+		},
+		{
+			MethodName: "ListFirewallLog",
+			Handler:    _LiteVirt_ListFirewallLog_Handler,
+		},
+		{
+			MethodName: "ListFirewallTagGroups",
+			Handler:    _LiteVirt_ListFirewallTagGroups_Handler,
+		},
+		{
+			MethodName: "SetFirewallTagGroup",
+			Handler:    _LiteVirt_SetFirewallTagGroup_Handler,
+		},
+		{
+			MethodName: "DeleteFirewallTagGroup",
+			Handler:    _LiteVirt_DeleteFirewallTagGroup_Handler,
+		},
+		{
+			MethodName: "ListFirewallTags",
+			Handler:    _LiteVirt_ListFirewallTags_Handler,
+		},
+		{
+			MethodName: "SetFirewallTags",
+			Handler:    _LiteVirt_SetFirewallTags_Handler,
 		},
 		{
 			MethodName: "CreateSecurityGroup",

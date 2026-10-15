@@ -1425,6 +1425,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Remember the clock skews this host sees past their rows' retention: the
 	// margin lv image prune keeps a deleted image's file within reads them.
 	go svc.RunImageSkewRecorder(ctx)
+	// Record a release feature's use found in replicated data with none
+	// recorded (one written through a daemon that predates the gate), on the
+	// failover lease holder, so a later rollback below the release still
+	// quarantines.
+	go svc.RunReleaseUseSweep(ctx)
 	// Autostart onboot VMs once, in startup_order (#10). Runs only for VMs not
 	// already running in libvirt, so a daemon restart (qemu kept alive by
 	// KillMode=process) is a no-op while a host reboot brings them up in order;

@@ -91,6 +91,29 @@ func (s *Server) discoverNICAddressOnBridge(mac, bridge string) string {
 	return lv.DiscoverIPForMACOnBridge(mac, bridge)
 }
 
+// discoverNICAddressWithPeers is discoverNICAddress for a NIC whose lease may
+// be held by another host: a vxlan network's dnsmasq runs on one host of the
+// network (its elected gateway), so a VM on any other host has no lease on its
+// own host, and its address was known only once that host's ARP table learned
+// it (lab 1: over 60 s, once over 9 min). The lease is the authoritative
+// answer, so it is asked for before ARP: this host's lease, then the
+// network's other hosts' leases, then this host's ARP table.
+//
+// It asks peers, so only the IP scanner and the single-VM read use it; a list
+// does not fan out per NIC.
+func (s *Server) discoverNICAddressWithPeers(ctx context.Context, mac, networkName string) string {
+	bridge := network.LeaseBridge(ctx, s.db, networkName)
+	if s.nicIPDiscovery != nil {
+		if ip := s.nicIPDiscovery(mac, bridge); ip != "" {
+			return ip
+		}
+		return s.peerLeaseIP(ctx, mac, networkName)
+	}
+	return lv.DiscoverIPForMACOnBridgeWithPeers(mac, bridge, func() string {
+		return s.peerLeaseIP(ctx, mac, networkName)
+	})
+}
+
 // SetNICIPDiscovery replaces the ARP / dnsmasq-lease lookup behind
 // discoverNICAddress.
 //

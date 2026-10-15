@@ -32973,8 +32973,14 @@ type GetVMIPRequest struct {
 	// owner_kind selects how the peer resolves the address: "" or "vm" (default,
 	// back-compatible) → MAC-based ARP/DHCP lookup; "ct" → resolve owner_name as a
 	// container (lxc-info / its interface row). owner_name is the container name.
-	OwnerKind     string `protobuf:"bytes,3,opt,name=owner_kind,json=ownerKind,proto3" json:"owner_kind,omitempty"`
-	OwnerName     string `protobuf:"bytes,4,opt,name=owner_name,json=ownerName,proto3" json:"owner_name,omitempty"`
+	OwnerKind string `protobuf:"bytes,3,opt,name=owner_kind,json=ownerKind,proto3" json:"owner_kind,omitempty"`
+	OwnerName string `protobuf:"bytes,4,opt,name=owner_name,json=ownerName,proto3" json:"owner_name,omitempty"`
+	// lease_only (owner_kind "" or "vm"): answer only from THIS host's dnsmasq
+	// lease for mac on network_name's bridge, never from ARP, and set
+	// GetVMIPResponse.lease. A VM's host asks the other hosts of a vxlan
+	// network, whose DHCP server may run on any of them. A peer on an earlier
+	// build ignores it and never sets lease, so its answer is not taken.
+	LeaseOnly     bool `protobuf:"varint,5,opt,name=lease_only,json=leaseOnly,proto3" json:"lease_only,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -33037,9 +33043,20 @@ func (x *GetVMIPRequest) GetOwnerName() string {
 	return ""
 }
 
+func (x *GetVMIPRequest) GetLeaseOnly() bool {
+	if x != nil {
+		return x.LeaseOnly
+	}
+	return false
+}
+
 type GetVMIPResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Ip            string                 `protobuf:"bytes,1,opt,name=ip,proto3" json:"ip,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Ip    string                 `protobuf:"bytes,1,opt,name=ip,proto3" json:"ip,omitempty"`
+	// lease: ip is this host's dnsmasq lease for the MAC (lease_only).
+	Lease bool `protobuf:"varint,2,opt,name=lease,proto3" json:"lease,omitempty"`
+	// lease_expiry: that lease's expiry in Unix seconds; 0 = infinite.
+	LeaseExpiry   int64 `protobuf:"varint,3,opt,name=lease_expiry,json=leaseExpiry,proto3" json:"lease_expiry,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -33079,6 +33096,20 @@ func (x *GetVMIPResponse) GetIp() string {
 		return x.Ip
 	}
 	return ""
+}
+
+func (x *GetVMIPResponse) GetLease() bool {
+	if x != nil {
+		return x.Lease
+	}
+	return false
+}
+
+func (x *GetVMIPResponse) GetLeaseExpiry() int64 {
+	if x != nil {
+		return x.LeaseExpiry
+	}
+	return 0
 }
 
 type RefreshLBRequest struct {
@@ -45363,16 +45394,20 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0fSyncVTEPRequest\x12!\n" +
 	"\fnetwork_name\x18\x01 \x01(\tR\vnetworkName\x12\x17\n" +
 	"\avtep_ip\x18\x02 \x01(\tR\x06vtepIp\x12\x10\n" +
-	"\x03vni\x18\x03 \x01(\x05R\x03vni\"\x83\x01\n" +
+	"\x03vni\x18\x03 \x01(\x05R\x03vni\"\xa2\x01\n" +
 	"\x0eGetVMIPRequest\x12\x10\n" +
 	"\x03mac\x18\x01 \x01(\tR\x03mac\x12!\n" +
 	"\fnetwork_name\x18\x02 \x01(\tR\vnetworkName\x12\x1d\n" +
 	"\n" +
 	"owner_kind\x18\x03 \x01(\tR\townerKind\x12\x1d\n" +
 	"\n" +
-	"owner_name\x18\x04 \x01(\tR\townerName\"!\n" +
+	"owner_name\x18\x04 \x01(\tR\townerName\x12\x1d\n" +
+	"\n" +
+	"lease_only\x18\x05 \x01(\bR\tleaseOnly\"Z\n" +
 	"\x0fGetVMIPResponse\x12\x0e\n" +
-	"\x02ip\x18\x01 \x01(\tR\x02ip\"1\n" +
+	"\x02ip\x18\x01 \x01(\tR\x02ip\x12\x14\n" +
+	"\x05lease\x18\x02 \x01(\bR\x05lease\x12!\n" +
+	"\flease_expiry\x18\x03 \x01(\x03R\vleaseExpiry\"1\n" +
 	"\x10RefreshLBRequest\x12\x1d\n" +
 	"\n" +
 	"stack_name\x18\x01 \x01(\tR\tstackName\"v\n" +

@@ -72,7 +72,7 @@ func (s *IPScanner) scanVMs(ctx context.Context) {
 			if iface.IP != "" {
 				continue
 			}
-			ip := s.server.discoverNICAddress(ctx, iface.MAC, iface.NetworkName)
+			ip := s.server.discoverNICAddressWithPeers(ctx, iface.MAC, iface.NetworkName)
 			if ip == "" {
 				continue
 			}

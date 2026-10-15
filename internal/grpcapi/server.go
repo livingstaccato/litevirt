@@ -157,6 +157,11 @@ type Server struct {
 	// see SetNICIPDiscovery.
 	nicIPDiscovery func(mac, bridge string) string
 
+	// dhcpLeaseLookup replaces the read of this host's dnsmasq lease for a
+	// MAC on a bridge (lv.LeaseOnBridge) that GetVMIPRemote's lease_only
+	// answer comes from. Test-only seam, nil in production.
+	dhcpLeaseLookup func(mac, bridge string) (string, int64)
+
 	// nbSweepUnreachable / nbUnreachableStreak carry the orphan sweep's
 	// consecutive-blocked-pass state for the NetBox health evaluator, which
 	// cannot read a Prometheus counter in-process. Written only by the sweep,

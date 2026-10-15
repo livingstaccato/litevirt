@@ -3528,7 +3528,7 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	for _, iface := range ifaces {
 		ip := iface.IP
 		if ip == "" && vm.HostName == s.hostName {
-			ip = s.discoverNICAddress(ctx, iface.MAC, iface.NetworkName)
+			ip = s.discoverNICAddressWithPeers(ctx, iface.MAC, iface.NetworkName)
 		}
 		// If we discovered a new IP, persist it — through the same gate ListVMs
 		// uses, and for the same reason (netbox_discovery.go): on a bound network

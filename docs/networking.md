@@ -39,24 +39,47 @@ networks:
 ```
 
 litevirt manages VTEP and forwarding-database (FDB) state itself — there is no
-BGP or EVPN control plane, and no routing daemon to install. When a host
-provisions the network it records its VTEP address in the replicated cluster
-database, then reads that table back and installs an all-zeros
-`00:00:00:00:00:00` flood entry for each peer VTEP already listed, so BUM
-traffic is head-end replicated to the peers it knows about; a peer that
-provisions later can also push its VTEP straight to this host, which adds the
-entry on the spot. Those kernel flood entries are only ever added — an
-individual entry is never withdrawn when a host leaves the network (they go away
-only with the local VXLAN device), and nothing re-derives the set from the
-database outside a provisioning pass. A newly-joined host gets into an existing
-peer's entries through that push, which it makes when its network reconcile
-pass provisions the network (see [Where a network is set up](#where-a-network-is-set-up));
-if the push is lost, it stays absent until that peer next provisions, which a
-daemon restart does. Unicast MAC→VTEP entries are programmed explicitly rather than
-learned: when a VM's address is discovered, and again when that VM migrates or
-is deleted, its host fans a `bridge fdb` add/delete out to every peer over the
-cluster's mTLS gRPC, so remote hosts point the MAC at whichever host now owns
-it. Setting `subnet:` also gives every host the same anycast gateway — the first
+BGP or EVPN control plane, and no routing daemon to install.
+
+A host's VTEP address is its cluster address — `advertise_address` when set,
+otherwise the source address of its default route — once every host runs a
+release that knows it (the release token has latched;
+`lv cluster upgrade-status`). Until then each host keeps the tunnel earlier releases built:
+the default-route source address over `underlay:` or the default-route
+interface. At the latch, each host's next network reconcile pass sets the
+network up again on the new address; a VXLAN device with a different local
+address or underlay is recreated in place, and the VNI bridge and the guests on
+it stay.
+
+Without `underlay:`, the tunnel runs over the interface that holds the host
+address, or over the default-route interface when that is a loopback or dummy
+device (a host address on `lo`, as in a routed-to-the-host fabric). With
+`underlay:`, the tunnel's local address is an address that device holds — the
+host address if it is one of them — rather than the host address. A host
+refuses to set up the tunnel, and leaves any existing device alone, when its
+address is not held by any interface or the named underlay holds no IPv4
+address; it publishes a `network.vtep_refused` event naming the network and
+the device.
+
+When a host provisions the network it records its VTEP address in the
+replicated cluster database, then reads that table back and appends each peer
+VTEP already listed to the device's all-zeros `00:00:00:00:00:00` flood entry
+(`bridge fdb append`: the kernel keeps one flood entry with a list of
+destinations), so BUM traffic is head-end replicated to every peer it knows
+about; a peer that
+provisions later can also push its VTEP straight to this host. Unicast
+MAC→VTEP entries are programmed explicitly rather than learned: one for every
+NIC on the network on another host, pointing the NIC's MAC at that host's VTEP.
+The same sync prunes: a flood entry for an address that is neither a listed
+VTEP nor a cluster host's address, a unicast entry pointing at an address that
+is no VTEP of the network, and any entry that points at one of this host's own
+addresses — such an entry is never installed. The sync runs when the network is
+provisioned, on each push, and on every network reconcile pass, so a recreated
+device gets its entries back and a peer whose VTEP moved is repointed. When a
+VM's address is discovered, migrates or is deleted, its host also fans a
+`bridge fdb` add/delete out to every peer over the cluster's mTLS gRPC.
+Deleting the network tombstones its VTEP rows once the release token has
+latched. Setting `subnet:` also gives every host the same anycast gateway — the first
 usable address in the subnet — on the VNI bridge, so a VM's default route is
 host-local.
 

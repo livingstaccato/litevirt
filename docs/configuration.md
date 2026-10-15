@@ -82,7 +82,8 @@ gossip_port: 7946
 # Address peers reach this host on. Sets BOTH the gossip advertise address and
 # the host record this daemon self-registers — they must agree, or peers dial an
 # address the host certificate does not cover and every replication push fails
-# the TLS hostname check.
+# the TLS hostname check. It is also this host's VXLAN tunnel endpoint (VTEP)
+# once every host runs a release that knows it (docs/networking.md, VXLAN).
 #
 # Empty (default) auto-detects, which is only safe on an unambiguously
 # single-homed host: the host record takes the source IP toward the DEFAULT

@@ -203,14 +203,20 @@ func (c *Coordinator) noteHAHeldRecovery(host string) {
 }
 
 // resumeHAHeldRecovery takes up a recovery a hold interrupted after its
-// fence, and reports whether it handled the host. Called from the fence loop
-// only once haHold has passed for the host. The fence it stood on may be
-// hours old: it is judged as every resume from a recorded fence is
+// fence, and reports whether it handled the host this cycle. Called from the
+// fence loop only once haHold has passed for the host. The fence it stood on
+// may be hours old: it is judged as every resume from a recorded fence is
 // (resumeActionFor) — resumed while it still stands and is fresh, fenced
 // again when a verified fence has aged, declined when it no longer stands.
 // Without a recorded successful fence (an operator's confirmation, a
 // best-effort fence that proceeded) it resumes only while the newest fence
 // attempt still stands.
+//
+// The held mark is dropped only on a final outcome: a resume, a re-fence that
+// ran (its success recovers, its failure is the operator's), or a decline
+// judged on rows that were read. A re-fence that did not run (a local stall,
+// the lease floor, a new hold at the fence site) and every read error keep it,
+// so the host is judged again next cycle rather than left cached in c.fenced.
 func (c *Coordinator) resumeHAHeldRecovery(ctx context.Context, host string, observers int) bool {
 	if !c.ha.heldRecovery[host] {
 		return false
@@ -219,35 +225,68 @@ func (c *Coordinator) resumeHAHeldRecovery(ctx context.Context, host string, obs
 		// A pause wait is still owed: it runs first, and recovers from there.
 		return false
 	}
-	delete(c.ha.heldRecovery, host)
 	h, err := corrosion.GetHost(ctx, c.db, host)
-	if err != nil || h == nil {
+	if err != nil {
+		return true
+	}
+	if h == nil {
+		delete(c.ha.heldRecovery, host)
+		return true
+	}
+	// The health rows every judgement below rests on must be readable.
+	if c.readHostHealth(ctx, host).err != nil {
+		c.noteHold(host, "recovery held by an HA disarm; its host's health rows could not be read, retrying")
 		return true
 	}
 	if rec, at, ok := c.recordedFence(ctx, h); ok {
 		switch act, why := c.resumeActionFor(ctx, host, rec, at); act {
 		case resumeFromRecord:
+			delete(c.ha.heldRecovery, host)
 			slog.Info("failover: HA armed again; resuming the recovery it held", "host", host, "fence_id", rec.ID)
+			c.mAttempt(PhaseRecovery, ResultOK, ErrRecoveryResumed)
+			c.noteFencedOn(host, rec.ID)
 			c.recoverFenced(ctx, h, fence.Result{Success: true, Method: rec.Method, Detail: rec.Detail}, "", c.fenceStateLatched(ctx))
 		case resumeAfterRefence:
 			slog.Info("failover: HA armed again; the fence the held recovery stood on has aged, fencing again", "host", host, "fence_id", rec.ID)
+			before := c.lastFenceAt[host]
+			delete(c.ha.heldRecovery, host)
 			c.refence(ctx, h, rec, observers)
+			if c.lastFenceAt[host].Equal(before) {
+				// No fence ran: judged again next cycle.
+				c.noteHAHeldRecovery(host)
+			}
 		default:
+			if c.readHostHealth(ctx, host).err != nil {
+				return true
+			}
+			delete(c.ha.heldRecovery, host)
 			c.noteResumeDeclined(host, rec, why)
 			c.noteHold(host, "recovery held by an HA disarm, and its fence no longer stands: "+why)
 		}
 		return true
 	}
-	_, at, ok := c.newestFenceAttempt(ctx, host)
+	_, at, ok, err := c.readNewestFenceAttempt(ctx, host)
+	if err != nil {
+		c.noteHold(host, "recovery held by an HA disarm; the fence log could not be read, retrying")
+		return true
+	}
 	if !ok {
+		delete(c.ha.heldRecovery, host)
 		c.noteHold(host, "recovery held by an HA disarm, and no fence of the host is on record")
 		return true
 	}
-	if why, stands := c.fenceStillStands(ctx, host, at); !stands {
+	hr := c.readHostHealth(ctx, host)
+	if hr.err != nil {
+		return true
+	}
+	if why, _, stands := c.fenceStillStandsIn(hr, host, at); !stands {
+		delete(c.ha.heldRecovery, host)
 		c.noteHold(host, "recovery held by an HA disarm, and its fence no longer stands: "+why)
 		return true
 	}
+	delete(c.ha.heldRecovery, host)
 	slog.Info("failover: HA armed again; resuming the recovery it held", "host", host)
+	c.mAttempt(PhaseRecovery, ResultOK, ErrRecoveryResumed)
 	c.recoverWorkloads(ctx, h)
 	return true
 }

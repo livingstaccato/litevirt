@@ -134,10 +134,16 @@ func TestHADisarm_HeldWorkIsKeptAndRunsAfterArm(t *testing.T) {
 	delete(c.claimRetry, "down")
 	delete(c.pauseWaits, "down")
 
+	fm := newFakeMetrics()
+	c.Metrics = fm
 	setHA(t, db, corrosion.HAArmed)
 	c.run(ctx)
 	if got := vmHost(t, db, ctx); got != "alive" || fences != 1 {
 		t.Fatalf("armed again: VM on %q after %d fences, want recovered without a second fence", got, fences)
+	}
+	// Re-review 1 m-2: counted and bound like the successor's resume.
+	if fm.attempts[foKey(PhaseRecovery, ResultOK, ErrRecoveryResumed)] != 1 || c.fencedOn["down"] == "" {
+		t.Fatalf("resume bookkeeping: attempts %v, fencedOn %q", fm.attempts, c.fencedOn["down"])
 	}
 }
 
@@ -719,6 +725,117 @@ func TestHADisarm_HeldRecoveryIsRefencedWhenItsFenceAged(t *testing.T) {
 	}
 	if got := vmHost(t, db, ctx); got != "alive" {
 		t.Fatalf("after the re-fence the VM is on %q, want alive", got)
+	}
+}
+
+// Re-review 1 I-1: a re-fence of a held recovery that does not run (here, a
+// local stall on the first armed cycle) keeps the held mark, so the next
+// cycle fences again and recovers instead of leaving the host cached.
+//
+// Mutation: drop the held mark before the outcome is known — the second
+// armed cycle does nothing and this goes red.
+func TestHADisarm_HeldRecoveryDeferredRefenceIsRetried(t *testing.T) {
+	db, ctx := seedDownHost(t, "ipmi", nil)
+	c := newTestCoordinator("coordinator", db)
+	fences := 0
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		fences++
+		return fence.Result{Method: "ipmi", Detail: "verified off", Success: true}
+	})
+	c.ha.beforeHold = func(site string) {
+		if site == haSiteRecovery {
+			setHA(t, db, corrosion.HADisarmed)
+			c.ha.beforeHold = nil
+		}
+	}
+	c.run(ctx)
+	ageFenceRows(t, db, ctx, recentFenceWindow+time.Minute)
+	lengthenStreak(t, db, ctx, recentFenceWindow+2*time.Minute)
+	setHA(t, db, corrosion.HAArmed)
+	stalled := true
+	c.LocalStall = func() bool { return stalled }
+	c.run(ctx)
+	if fences != 1 || vmHost(t, db, ctx) != "down" || !c.ha.heldRecovery["down"] {
+		t.Fatalf("stalled armed cycle: %d fences, VM on %q, held=%v; want no fence and the mark kept",
+			fences, vmHost(t, db, ctx), c.ha.heldRecovery)
+	}
+	stalled = false
+	c.run(ctx)
+	if fences != 2 || vmHost(t, db, ctx) != "alive" {
+		t.Fatalf("next armed cycle: %d fences, VM on %q; want the re-fence and the recovery", fences, vmHost(t, db, ctx))
+	}
+}
+
+// Re-review 1 I-1: a read error while judging a held recovery keeps the mark;
+// the next cycle, with the rows readable, recovers.
+func TestHADisarm_HeldRecoveryReadErrorIsRetried(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", nil)
+	c := newTestCoordinator("coordinator", db)
+	c.SetFencer(countingFencer(new(int), sshFence))
+	c.ha.beforeHold = func(site string) {
+		if site == haSiteRecovery {
+			setHA(t, db, corrosion.HADisarmed)
+			c.ha.beforeHold = nil
+		}
+	}
+	c.run(ctx)
+	setHA(t, db, corrosion.HAArmed)
+	if _, err := db.DB().ExecContext(ctx, `ALTER TABLE fencing_log RENAME TO fencing_log_gone`); err != nil {
+		t.Fatal(err)
+	}
+	c.run(ctx)
+	if vmHost(t, db, ctx) != "down" || !c.ha.heldRecovery["down"] {
+		t.Fatalf("fence log unreadable: VM on %q, held=%v; want nothing moved and the mark kept", vmHost(t, db, ctx), c.ha.heldRecovery)
+	}
+	if _, err := db.DB().ExecContext(ctx, `ALTER TABLE fencing_log_gone RENAME TO fencing_log`); err != nil {
+		t.Fatal(err)
+	}
+	c.run(ctx)
+	if got := vmHost(t, db, ctx); got != "alive" {
+		t.Fatalf("fence log readable again: VM on %q, want alive", got)
+	}
+}
+
+// Re-review 1 m-1: after the arm, a held recovery whose unverified (SSH)
+// fence no longer stands — the host was seen answering after it — moves
+// nothing and fences nothing; the decline is final. (A verified fence that no
+// longer stands is fenced again instead: TestHADisarm_HeldRecoveryIsRefenced.)
+//
+// Mutation: resume the held recovery directly — the VM moves and this goes
+// red.
+func TestHADisarm_HeldRecoveryOnAFenceThatNoLongerStandsMovesNothing(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", nil)
+	c := newTestCoordinator("coordinator", db)
+	fences := 0
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		fences++
+		return sshFence
+	})
+	c.ha.beforeHold = func(site string) {
+		if site == haSiteRecovery {
+			setHA(t, db, corrosion.HADisarmed)
+			c.ha.beforeHold = nil
+		}
+	}
+	c.run(ctx)
+	ageFenceRows(t, db, ctx, time.Minute)
+	lengthenStreak(t, db, ctx, 5*time.Minute)
+	// Someone saw the host answer after the fence: it was powered on again.
+	if err := db.Execute(ctx, `INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+		 VALUES ('outsider', 'down', 'unready', 1, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`); err != nil {
+		t.Fatal(err)
+	}
+	setHA(t, db, corrosion.HAArmed)
+	c.run(ctx)
+	c.run(ctx)
+	if fences != 1 || vmHost(t, db, ctx) != "down" {
+		t.Fatalf("after the arm: %d fences, VM on %q; want no second fence and nothing moved", fences, vmHost(t, db, ctx))
+	}
+	if c.ha.heldRecovery["down"] {
+		t.Fatal("a decline on readable rows left the held mark")
+	}
+	if !strings.Contains(c.holdReason["down"], "no longer stands") {
+		t.Fatalf("hold reason %q", c.holdReason["down"])
 	}
 }
 

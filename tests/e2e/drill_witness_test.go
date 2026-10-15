@@ -1024,7 +1024,7 @@ func (l *lab) w5HolderBack(w witnessTopology, used []string) string {
 			// found in the history rather than in the proof's term.
 			fresh := minted.Holder == h && !minted.At.Before(lostAt.Add(-clockSlack))
 			if !w.lt.TenureStrict {
-				fresh = retookBetween(lw.history(), h, lostAt.Add(-clockSlack), mintTime(created, h, h, stepAt, w.hlc).Add(clockSlack))
+				fresh = freshTenureAt(lw.history(), h, lostAt, mintTime(created, h, h, stepAt, w.hlc))
 			}
 			if !fresh {
 				t.Errorf("%s minted %s at term %d after losing the lease at %s, under no tenure taken since", h, p.ID, p.LeaseTerm, lostAt.UTC().Format("15:04:05"))

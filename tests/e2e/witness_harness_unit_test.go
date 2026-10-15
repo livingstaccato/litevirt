@@ -1,7 +1,9 @@
 package e2e
 
 import (
+	"fmt"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -210,7 +212,8 @@ func TestLeaseTermModeOf(t *testing.T) {
 	}{
 		{"default: flag off, not latched", []leaseTermPosture{p("node-1", false, false), p("node-6", false, false)}, leaseTermOff},
 		{"latched, then every flag turned off", []leaseTermPosture{p("node-1", false, true), p("node-6", false, true)}, leaseTermOff},
-		{"flag on everywhere, not latched yet", []leaseTermPosture{p("node-1", true, false), p("node-6", true, false)}, leaseTermOff},
+		{"flag on everywhere, not latched yet", []leaseTermPosture{p("node-1", true, false), p("node-6", true, false)}, leaseTermPending},
+		{"one host still latching among enforcing ones", []leaseTermPosture{p("node-1", true, true), p("node-6", true, false)}, leaseTermPending},
 		{"flag on and latched everywhere", []leaseTermPosture{p("node-1", true, true), p("node-6", true, true)}, leaseTermOn},
 		{"the witness alone has its flag off", []leaseTermPosture{p("node-1", true, true), p("node-6", false, true)}, leaseTermMixed},
 	} {
@@ -272,21 +275,96 @@ func TestW4aVerdict(t *testing.T) {
 	}
 }
 
-// TestRetookBetween finds a tenure the holder took inside a window.
-func TestRetookBetween(t *testing.T) {
+// TestFreshTenureAt requires the tenure in force at the mint to be the
+// holder's and taken since the loss; a re-take it lost again before the mint
+// does not count.
+func TestFreshTenureAt(t *testing.T) {
 	t0 := time.Date(2026, 10, 15, 10, 0, 0, 0, time.UTC)
 	h := []leaseChange{
 		{At: t0, Holder: "node-2", Term: 7},
 		{At: t0.Add(40 * time.Second), Holder: "node-3", Term: 8},
 		{At: t0.Add(100 * time.Second), Holder: "node-2", Term: 9},
+		{At: t0.Add(200 * time.Second), Holder: "node-4", Term: 10},
 	}
-	if !retookBetween(h, "node-2", t0.Add(30*time.Second), t0.Add(2*time.Minute)) {
-		t.Errorf("node-2's term 9 inside the window was missed")
+	if !freshTenureAt(h, "node-2", t0.Add(30*time.Second), t0.Add(150*time.Second)) {
+		t.Errorf("node-2's term 9, in force at the mint, was missed")
 	}
-	if retookBetween(h, "node-2", t0.Add(30*time.Second), t0.Add(90*time.Second)) {
-		t.Errorf("node-2's term 7, before the window, counted")
+	if freshTenureAt(h, "node-2", t0.Add(30*time.Second), t0.Add(250*time.Second)) {
+		t.Errorf("node-2's term 9, lost to node-4 before the mint, counted")
 	}
-	if retookBetween(h, "node-4", t0, t0.Add(time.Hour)) {
-		t.Errorf("a host that never held the lease counted")
+	if freshTenureAt(h, "node-2", t0.Add(30*time.Second), t0.Add(20*time.Second)) {
+		t.Errorf("node-2's term 7, taken before the loss, counted")
+	}
+	if !freshTenureAt(h, "node-2", t0.Add(30*time.Second), t0.Add(199*time.Second)) {
+		t.Errorf("a mint a second before a sampled takeover was refused")
+	}
+}
+
+// TestLeaseTermRefusalPattern pins the off-mode refusal pattern against every
+// message with which the product refuses on a lease term only while enforcing
+// (health/reconciler.go, failover/coordinator.go), and against a line that is
+// no refusal.
+func TestLeaseTermRefusalPattern(t *testing.T) {
+	re := regexp.MustCompile(leaseTermRefusalPattern)
+	for _, msg := range []string{
+		"reconciler: pending proof refused by the lease-term gate",
+		"reconciler: this host has already acted at this lease term for another coordinator — refusing start",
+		"failover: this coordinator holds no usable lease term — refusing to stamp (never acquired one, or holdLease cleared it on a loss path)",
+		"failover: this coordinator's lease term is superseded — refusing to stamp",
+		"failover: refusing to stamp an action proof — this coordinator's lease term is unusable, so the workload is ABANDONED (a fenced host is processed only once)",
+	} {
+		if !re.MatchString(`time=2026-10-15T10:00:00Z level=WARN msg="` + msg + `" vm=e2e-w4a-1`) {
+			t.Errorf("not matched: %s", msg)
+		}
+	}
+	if re.MatchString(`level=INFO msg="failover: lease acquired" term=9`) {
+		t.Errorf("a line that is no refusal matched")
+	}
+}
+
+// TestInertJournalVerdict: with lease_term off, a refusal line or an unread
+// journal fails; an empty read passes.
+func TestInertJournalVerdict(t *testing.T) {
+	if v := inertJournalVerdict("node-9", "", fmt.Errorf("ssh: no route to host")); !strings.Contains(v, "could not read") {
+		t.Errorf("an unread journal passed: %q", v)
+	}
+	if v := inertJournalVerdict("node-2", "reconciler: pending proof refused by the lease-term gate\n", nil); !strings.Contains(v, "refused on a lease term") {
+		t.Errorf("a refusal line passed: %q", v)
+	}
+	if v := inertJournalVerdict("node-2", "\n", nil); v != "" {
+		t.Errorf("a clean journal failed: %q", v)
+	}
+}
+
+// TestRefusalVerdict reads the refused-actions counter and judges its change:
+// lease_term_unconfirmed rising fails, stale_lease_term is noted, and a
+// restart or a reset is not compared.
+func TestRefusalVerdict(t *testing.T) {
+	snap := func(pid string, unconf, stale int) refusalSnap {
+		return parseRefusalSnap(fmt.Sprintf("PID=%s\n"+
+			`litevirt_runtime_action_refused_total{action="reschedule",reason="lease_term_unconfirmed"} %d`+"\n"+
+			`litevirt_runtime_action_refused_total{action="promote",reason="stale_lease_term"} %d`+"\n"+
+			`litevirt_runtime_action_refused_total{action="reschedule",reason="stale_lease_term"} 1`+"\n", pid, unconf, stale))
+	}
+	if s := snap("42", 2, 3); s.Err != "" || s.ByReason["lease_term_unconfirmed"] != 2 || s.ByReason["stale_lease_term"] != 4 {
+		t.Fatalf("parse: %+v", s)
+	}
+	if f, _ := refusalVerdict(snap("42", 0, 0), snap("42", 1, 0)); !strings.Contains(f, "lease_term_unconfirmed") {
+		t.Errorf("a rise in lease_term_unconfirmed passed: %q", f)
+	}
+	if f, n := refusalVerdict(snap("42", 0, 0), snap("42", 0, 2)); f != "" || !strings.Contains(n, "stale_lease_term +2") {
+		t.Errorf("stale_lease_term: fail %q note %q, want a note only", f, n)
+	}
+	if f, n := refusalVerdict(snap("42", 3, 0), snap("43", 5, 0)); f != "" || !strings.Contains(n, "restarted") {
+		t.Errorf("a restart: fail %q note %q", f, n)
+	}
+	if f, n := refusalVerdict(snap("42", 3, 0), snap("42", 1, 0)); f != "" || !strings.Contains(n, "reset") {
+		t.Errorf("a reset: fail %q note %q", f, n)
+	}
+	if f, _ := refusalVerdict(snap("42", 0, 0), refusalSnap{Err: "ssh: timeout"}); f == "" {
+		t.Errorf("an unread counter after the drill passed")
+	}
+	if s := parseRefusalSnap("PID=0\n"); s.Err == "" {
+		t.Errorf("a stopped daemon read as a snapshot")
 	}
 }

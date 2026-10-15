@@ -188,9 +188,11 @@ The witness drills run with `enforcement.lease_term` off (the default) and on.
 Each reads the mode from every host's own `litevirt_enforcement_config_enabled`
 and `litevirt_enforcement_latched` gauges for `lease_term_v1` (enforcing is
 both), records it in the timeline and `lease-term-mode.txt`, and skips when the
-hosts disagree. Both modes assert the same safety: sampling, never twice, one
-proof, the pause bounds. Off, no host may log a lease-term refusal during the
-drill, W4a's stranded value cannot be the lease-term gate, and W5a logs rather
+hosts disagree or while a host has the flag on and no latch yet; a mode that
+changes during the drill fails it. Both modes assert the same safety:
+sampling, never twice, one proof, the pause bounds. Off, no host may log a
+lease-term refusal during the drill or raise
+`litevirt_runtime_action_refused_total{reason="lease_term_unconfirmed"}`, W4a's stranded value cannot be the lease-term gate, and W5a logs rather
 than fails a proof whose term is not its coordinator's tenure. To run the on
 mode, set `enforcement.lease_term: true` on every host, restart each, and wait
 for `lease_term_v1` in `lv cluster upgrade-status`; the latch stays, and

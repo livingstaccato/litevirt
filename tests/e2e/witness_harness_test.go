@@ -15,6 +15,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/tests/e2e/latchparse"
 )
 
@@ -1243,6 +1244,10 @@ const (
 	leaseTermOff   leaseTermMode = "off"
 	leaseTermOn    leaseTermMode = "on"
 	leaseTermMixed leaseTermMode = "mixed"
+	// leaseTermPending: some host has the flag on and no latch yet. The
+	// latch can form mid-drill (the HA monitor drives activation every
+	// cycle), so the drill cannot vouch for either mode.
+	leaseTermPending leaseTermMode = "pending"
 )
 
 // leaseTermPosture is one host's own report of lease_term_v1, read from its
@@ -1261,13 +1266,14 @@ type leaseTermPosture struct {
 // AND the latch (grpcapi leaseTermEnforced, failover leaseTermEnforced).
 func (p leaseTermPosture) enforcing() bool { return p.Config && p.Latched }
 
-// leaseTermModeOf is on when every host enforces lease terms, off when none
-// does, and mixed otherwise. It fails when a host could not be read.
+// leaseTermModeOf is pending when some host has the flag on and no latch yet,
+// on when every host enforces lease terms, off when none does, and mixed
+// otherwise. It fails when a host could not be read.
 func leaseTermModeOf(ps []leaseTermPosture) (leaseTermMode, error) {
 	if len(ps) == 0 {
 		return "", fmt.Errorf("no host to read")
 	}
-	on := 0
+	on, pending := 0, false
 	for _, p := range ps {
 		if p.Err != "" {
 			return "", fmt.Errorf("%s: %s", p.Host, p.Err)
@@ -1275,6 +1281,10 @@ func leaseTermModeOf(ps []leaseTermPosture) (leaseTermMode, error) {
 		if p.enforcing() {
 			on++
 		}
+		pending = pending || (p.Config && !p.Latched)
+	}
+	if pending {
+		return leaseTermPending, nil
 	}
 	switch on {
 	case 0:
@@ -1330,12 +1340,18 @@ func leaseTermExpectFor(m leaseTermMode) leaseTermExpect {
 	return leaseTermExpect{Mode: m}
 }
 
-// leaseTermRefusalPattern matches every journal line with which a host
-// refuses on a lease term: the destination's reconciler gate
-// (health/reconciler.go) and the coordinator's stamp precheck and its
-// abandonment (failover/coordinator.go leaseTermStampAllowed,
-// noteLeaseTermRefusal).
-const leaseTermRefusalPattern = "refused by the lease-term gate|lease term is superseded|holds no usable lease term|refusing to stamp an action proof"
+// leaseTermRefusalPattern (grep -E) matches every journal line with which a
+// host refuses on a lease term only while it enforces them: the destination's
+// reconciler gate and its claimant fence (health/reconciler.go), and the
+// coordinator's stamp precheck and its abandonment
+// (failover/coordinator.go leaseTermStampAllowed, noteLeaseTermRefusal).
+// TestLeaseTermRefusalPattern pins it against the product's messages.
+//
+// One of them is not enforcement-only: the DR promote path logs "refusing to
+// stamp an action proof" on a plain holder change (coordinator.go,
+// !stillOurTenure). The witness drills have no DR VM, so it cannot fire
+// here; a promote drill joining this harness would read it as a refusal.
+const leaseTermRefusalPattern = "refused by the lease-term gate|already acted at this lease term|lease term is superseded|holds no usable lease term|refusing to stamp an action proof"
 
 // leaseTermPostures reads every host's lease_term_v1 posture.
 func (l *lab) leaseTermPostures(hosts []string) []leaseTermPosture {
@@ -1356,39 +1372,165 @@ func (l *lab) leaseTermPostures(hosts []string) []leaseTermPosture {
 }
 
 // requireLeaseTermMode reads the cluster's lease-term mode, records it, and
-// skips on a cluster that disagrees with itself. With lease_term off it
-// registers a check, run however the drill ends, that no host refused on a
-// lease term from now on.
+// skips on a cluster that disagrees with itself or is still latching. It
+// registers, to run inside restore once every host is back on (onRestore), a
+// re-read that fails the drill if the mode changed under it, and with
+// lease_term off a check that no host refused on a lease term from now on:
+// by journal, from each host's own clock, and by the
+// litevirt_runtime_action_refused_total counter.
 func (l *lab) requireLeaseTermMode(via string) leaseTermExpect {
 	l.t.Helper()
 	hosts := l.allBut()
 	ps := l.leaseTermPostures(hosts)
+	m, err := leaseTermModeOf(ps)
+	report := leaseTermReport(ps, m, err)
+	l.saveEvidence("lease-term-mode.txt", report)
+	if err != nil {
+		l.t.Skipf("cannot read the lease_term posture of every host: %v", err)
+	}
+	switch m {
+	case leaseTermMixed:
+		l.t.Skipf("lease_term is enforced on some hosts and not on others (lease-term-mode.txt):\n%sthe drills expect one mode on every executor and every possible lease holder; set enforcement.lease_term alike everywhere", report)
+	case leaseTermPending:
+		l.t.Skipf("lease_term is pending: enforcement.lease_term is on where lease_term_v1 has not latched (lease-term-mode.txt):\n%sthe latch can form mid-drill; wait for lease_term_v1 on every host, or set the flag off everywhere", report)
+	}
+	e := leaseTermExpectFor(m)
+	l.mark("lease_term mode: %s (flag AND latch, read from each host's own gauges)", m)
+	t := l.t
+	var since map[string]string
+	var before map[string]refusalSnap
+	if e.Inert {
+		since, before = map[string]string{}, map[string]refusalSnap{}
+		for _, h := range hosts {
+			since[h] = l.nodeNow(h)
+			before[h] = l.refusalSnap(h)
+			if before[h].Err != "" {
+				t.Skipf("cannot read %s's litevirt_runtime_action_refused_total: %s", h, before[h].Err)
+			}
+		}
+	}
+	l.onRestore(func() {
+		ps2 := l.leaseTermPostures(hosts)
+		m2, err2 := leaseTermModeOf(ps2)
+		if err2 != nil || m2 != m {
+			t.Errorf("lease_term mode changed during the drill: %s at the start, %s (%v) after it:\n%s", m, m2, err2, leaseTermReport(ps2, m2, err2))
+		}
+		if !e.Inert {
+			return
+		}
+		var ev strings.Builder
+		for _, h := range hosts {
+			out, err := l.ssh(h, time.Minute, journalGrepCmd(since[h], leaseTermRefusalPattern))
+			if msg := inertJournalVerdict(h, out, err); msg != "" {
+				t.Error(msg)
+			}
+			after := l.refusalSnap(h)
+			fail, note := refusalVerdict(before[h], after)
+			if fail != "" {
+				t.Errorf("lease_term off: %s: %s", h, fail)
+			}
+			fmt.Fprintf(&ev, "%s before=%+v after=%+v %s\n", h, before[h], after, note)
+		}
+		l.saveEvidence("lease-term-refusals.txt", ev.String())
+	})
+	return e
+}
+
+// leaseTermReport is the per-host posture table recorded as evidence.
+func leaseTermReport(ps []leaseTermPosture, m leaseTermMode, err error) string {
 	var b strings.Builder
 	for _, p := range ps {
 		fmt.Fprintf(&b, "%s config=%v latched=%v enforcing=%v %s\n", p.Host, p.Config, p.Latched, p.enforcing(), p.Err)
 	}
-	m, err := leaseTermModeOf(ps)
 	fmt.Fprintf(&b, "mode=%s err=%v\n", m, err)
-	l.saveEvidence("lease-term-mode.txt", b.String())
+	return b.String()
+}
+
+// journalGrepCmd prints the litevirt journal lines since since (a node's own
+// UTC time) matching pattern. Unlike journalSince it fails when the journal
+// cannot be read, so an unread host is never a clean one.
+func journalGrepCmd(since, pattern string) string {
+	return fmt.Sprintf("out=$(journalctl -u litevirt --since %s --no-pager -o cat) || exit 3; printf '%%s\\n' \"$out\" | grep -E %s || true",
+		shellQuote(strings.ReplaceAll(strings.TrimSuffix(since, "Z"), "T", " ")+" UTC"), shellQuote(pattern))
+}
+
+// inertJournalVerdict judges one host's lease-term refusal grep with lease_term
+// off: a line, or a journal that could not be read, fails.
+func inertJournalVerdict(host, out string, err error) string {
 	if err != nil {
-		l.t.Skipf("cannot read the lease_term posture of every host: %v", err)
+		return fmt.Sprintf("lease_term off: could not read %s's journal for lease-term refusals: %v", host, err)
 	}
-	if m == leaseTermMixed {
-		l.t.Skipf("lease_term is enforced on some hosts and not on others (lease-term-mode.txt):\n%sthe drills expect one mode on every executor and every possible lease holder; set enforcement.lease_term alike everywhere", b.String())
+	if j := strings.TrimSpace(out); j != "" {
+		return fmt.Sprintf("lease_term is off, yet %s refused on a lease term (the gate must be inert):\n%s", host, j)
 	}
-	e := leaseTermExpectFor(m)
-	l.mark("lease_term mode: %s (flag AND latch, read from each host's own gauges)", m)
-	if e.Inert {
-		t, since := l.t, l.nodeNow(via)
-		t.Cleanup(func() {
-			for _, h := range hosts {
-				if j := strings.TrimSpace(l.journalSince(h, since, leaseTermRefusalPattern)); j != "" {
-					t.Errorf("lease_term is off, yet %s refused on a lease term (the gate must be inert):\n%s", h, j)
-				}
+	return ""
+}
+
+// refusalSnap is one host's litevirt_runtime_action_refused_total, summed per
+// reason over actions, with the daemon's PID to tell a restart.
+type refusalSnap struct {
+	PID      string
+	ByReason map[string]float64
+	Err      string
+}
+
+func (l *lab) refusalSnap(host string) refusalSnap {
+	out, err := l.ssh(host, 30*time.Second, "m=$(curl -sf --max-time 10 http://127.0.0.1:7444/metrics) || exit 3; echo PID=$(systemctl show -p MainPID --value litevirt); printf '%s\\n' \"$m\" | grep '^litevirt_runtime_action_refused_total{' || true")
+	if err != nil {
+		return refusalSnap{Err: err.Error()}
+	}
+	return parseRefusalSnap(out)
+}
+
+// parseRefusalSnap reads refusalSnap's scrape: a PID= line, then the counter's
+// series.
+func parseRefusalSnap(out string) refusalSnap {
+	s := refusalSnap{ByReason: map[string]float64{}}
+	re := regexp.MustCompile(`^litevirt_runtime_action_refused_total\{.*reason="([^"]*)".*\}\s+(\S+)$`)
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if v, ok := strings.CutPrefix(line, "PID="); ok {
+			s.PID = v
+		} else if m := re.FindStringSubmatch(line); m != nil {
+			if v, err := strconv.ParseFloat(m[2], 64); err == nil {
+				s.ByReason[m[1]] += v
 			}
-		})
+		}
 	}
-	return e
+	if s.PID == "" || s.PID == "0" {
+		s.Err = "no running litevirt (MainPID " + strconv.Quote(s.PID) + ")"
+	}
+	return s
+}
+
+// refusalVerdict compares a host's refusal counters across a lease_term-off
+// drill. A rise in lease_term_unconfirmed fails: only the enforcement-gated
+// judgment counts it. stale_lease_term is also counted on a plain holder
+// change (skip_stopped.go rekeyStoppedVM), so its rise is only noted. A
+// restarted daemon (another PID, or a counter that went down) cannot be
+// compared; the journal check covers it.
+func refusalVerdict(before, after refusalSnap) (fail, note string) {
+	if after.Err != "" {
+		return "could not read litevirt_runtime_action_refused_total after the drill: " + after.Err, ""
+	}
+	if before.Err != "" {
+		return "", "no reading before the drill"
+	}
+	if before.PID != after.PID {
+		return "", "daemon restarted (pid " + before.PID + " → " + after.PID + "); journal only"
+	}
+	for r, v := range before.ByReason {
+		if after.ByReason[r] < v {
+			return "", "counter " + r + " went down: reset; journal only"
+		}
+	}
+	if d := after.ByReason[health.ReasonLeaseTermUnconfirmed] - before.ByReason[health.ReasonLeaseTermUnconfirmed]; d > 0 {
+		return fmt.Sprintf("litevirt_runtime_action_refused_total{reason=%q} rose by %v although lease_term is not enforced", health.ReasonLeaseTermUnconfirmed, d), ""
+	}
+	if d := after.ByReason[health.ReasonStaleLeaseTerm] - before.ByReason[health.ReasonStaleLeaseTerm]; d > 0 {
+		return "", fmt.Sprintf("%s +%v (also counted on a plain holder change; not a failure)", health.ReasonStaleLeaseTerm, d)
+	}
+	return "", ""
 }
 
 // w4aOutcome is W4a's judgment of the second outage: the outcome's name and,
@@ -1418,13 +1560,23 @@ func w4aVerdict(e leaseTermExpect, recovered, decided bool, dp, p1 string, gateR
 	return w4aOutcome{Name: "not recovered", Fail: "not recovered; decided proof " + strconv.Quote(dp)}
 }
 
-// retookBetween reports whether holder took the lease, by the sampled history,
-// at an instant inside [from, to].
-func retookBetween(history []leaseChange, holder string, from, to time.Time) bool {
+// freshTenureAt reports whether, by the sampled history, the tenure in force
+// at at (as tenureAt reads it, clockSlack either side, but ignoring the term)
+// is holder's and was taken no earlier than clockSlack before from.
+func freshTenureAt(history []leaseChange, holder string, from, at time.Time) bool {
+	var cands []leaseChange
 	for _, c := range history {
-		if c.Holder == holder && !c.At.Before(from) && !c.At.After(to) {
-			return true
+		if !c.At.After(at.Add(clockSlack)) {
+			cands = append(cands, c)
 		}
 	}
-	return false
+	ok := func(c leaseChange) bool { return c.Holder == holder && !c.At.Before(from.Add(-clockSlack)) }
+	if len(cands) == 0 {
+		return false
+	}
+	last := cands[len(cands)-1]
+	if ok(last) {
+		return true
+	}
+	return len(cands) > 1 && last.At.After(at.Add(-clockSlack)) && ok(cands[len(cands)-2])
 }

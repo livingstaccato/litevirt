@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -154,5 +155,76 @@ func TestStall_AnEpisodeReportsItsLongestPause(t *testing.T) {
 	until, _ := time.Parse(time.RFC3339, ev.GraceUntil)
 	if until.Before(now.Add(StallGrace - 2*time.Second)) {
 		t.Fatalf("grace_until=%v must extend to the later stall's window (now+%v)", ev.GraceUntil, StallGrace)
+	}
+}
+
+// stallTick's reporter state (loaded, open, reported) must hold up to two
+// ticks at once. The daemon runs one heartbeat per checker, but nothing in the
+// type enforced that: a fleet harness drove a Start()ed checker's heartbeat a
+// second time, and the race detector caught both writing the episode state.
+func TestStall_ConcurrentTicksAreSafe(t *testing.T) {
+	ctx := context.Background()
+	db := testCheckerDB(t)
+	c := NewChecker("host-a", t.TempDir(), db)
+	start := time.Now()
+	c.clock = func() time.Time { return start }
+	c.beat(start)
+	resumed := start.Add(34 * time.Second) // the process was not running for 34s
+	c.clock = func() time.Time { return resumed }
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				c.stallTick(ctx)
+			}
+		}()
+	}
+	wg.Wait()
+
+	row, ok := stallCondition(t, db, "host-a")
+	if !ok || row.Lifecycle == corrosion.ConditionResolved {
+		t.Fatalf("concurrent ticks across a 34s stall left no open observer_stalled row: ok=%v row=%+v", ok, row)
+	}
+	if row.ObserveCount != 1 {
+		t.Fatalf("one stall was reported %d times; ticks of the same epoch must report it once", row.ObserveCount)
+	}
+}
+
+// A checker runs at most one heartbeat. A second one started on the same
+// checker (Start called twice, or a test seam beside Start) returns at once
+// rather than beating, and reporting, beside the first.
+func TestStall_ASecondHeartbeatOnOneCheckerReturns(t *testing.T) {
+	db := testCheckerDB(t)
+	c := NewChecker("host-a", t.TempDir(), db)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	first := make(chan struct{})
+	go func() { defer close(first); c.runStallHeartbeat(ctx) }()
+	t.Cleanup(func() { cancel(); <-first })
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c.stall.mu.Lock()
+		beating := !c.stall.lastBeat.IsZero()
+		c.stall.mu.Unlock()
+		if beating {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the first heartbeat never beat")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	second := make(chan struct{})
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	go func() { defer close(second); c.runStallHeartbeat(ctx2) }()
+	t.Cleanup(func() { cancel2(); <-second })
+	select {
+	case <-second:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a second heartbeat on a checker whose heartbeat is running did not return")
 	}
 }

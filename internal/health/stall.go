@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -73,7 +74,12 @@ type stallState struct {
 	epoch    uint64        // incremented once per stall
 	gap      time.Duration // length of the most recent stall
 
-	// reporter state, touched only by the heartbeat goroutine (stallTick).
+	// running is set while a heartbeat loop runs; a second loop on the same
+	// checker returns at once (runStallHeartbeat).
+	running atomic.Bool
+
+	// reporter state, touched only by stallTick and under tickMu.
+	tickMu   sync.Mutex
 	loaded   bool                       // the store was read for a row an earlier process left open
 	open     *corrosion.HealthCondition // this node's unresolved observer_stalled row, or nil
 	reported uint64                     // the stall epoch the open row describes
@@ -136,11 +142,17 @@ func (c *Checker) InStallGrace() bool {
 // (tests/fleet) that drive a real Checker's gate with seeded probe results:
 // without the heartbeat the checker beats only when it is read, so an idle
 // spell longer than stallThreshold between two reads looks like a stall.
-// Production never calls it.
+// Production never calls it. On a checker whose heartbeat already runs (Start
+// was called), it returns at once.
 func (c *Checker) RunStallHeartbeatForTests(ctx context.Context) { c.runStallHeartbeat(ctx) }
 
 // runStallHeartbeat beats until ctx ends. Started by Start, before probing.
+// A checker runs one heartbeat: while one runs, another returns at once.
 func (c *Checker) runStallHeartbeat(ctx context.Context) {
+	if !c.stall.running.CompareAndSwap(false, true) {
+		return
+	}
+	defer c.stall.running.Store(false)
 	t := time.NewTicker(stallBeat)
 	defer t.Stop()
 	c.stallTick(ctx)

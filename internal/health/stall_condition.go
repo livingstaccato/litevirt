@@ -40,12 +40,14 @@ type stallEvidence struct {
 }
 
 // stallTick is one heartbeat: beat, then bring the condition in line with it.
-// Only the heartbeat goroutine calls it, so the reporter fields need no lock
-// beyond the one beat already takes; it writes only on a transition.
+// The reporter fields are held under stall.tickMu for the whole tick, so two
+// ticks at once report a stall once; it writes only on a transition.
 func (c *Checker) stallTick(ctx context.Context) {
+	s := &c.stall
+	s.tickMu.Lock()
+	defer s.tickMu.Unlock()
 	now := c.now()
 	stallAt, epoch := c.beat(now)
-	s := &c.stall
 
 	if !s.loaded {
 		row, ok, err := corrosion.GetHealthCondition(ctx, c.db, stallEvaluator, CondObserverStalled, "host", c.hostName)

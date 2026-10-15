@@ -77,12 +77,16 @@ func (f *NetProvFake) SetDHCPConflicts(on bool) {
 // Provision records the network as set up here. A vxlan network also
 // registers this node's VTEP in network_vteps, as the real Provision does, so
 // the rows replicate and a scenario can see which address each node chose.
+// A bridge network with no interface is refused as the real one refuses it.
 func (f *NetProvFake) Provision(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, localIP, hostName string) (string, error) {
 	dev := network.BridgeName(name, def)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.failWith[name]; err != nil {
 		return "", err
+	}
+	if (def.Type == "" || def.Type == "bridge") && def.Interface == "" {
+		return "", fmt.Errorf("bridge network requires interface name")
 	}
 	if def.Type == "vxlan" && def.VNI != 0 && db != nil {
 		if err := network.UpsertVTEP(ctx, db, name, hostName, localIP, def.VNI); err != nil {

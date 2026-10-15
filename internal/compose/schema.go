@@ -733,6 +733,21 @@ func ScopedNetworkName(stackName, netName string) string {
 	return stackName + "_" + netName
 }
 
+// DefaultNetworkInterfaces gives every network f declares (and does not mark
+// external) with no interface its own name, as written in the file, as its
+// interface. A deploy calls it once, before anything provisions or persists
+// a network, so the entry node, every peer and the network row name the same
+// device.
+func (f *File) DefaultNetworkInterfaces() {
+	for name, nd := range f.Networks {
+		if nd.External || nd.Interface != "" {
+			continue
+		}
+		nd.Interface = name
+		f.Networks[name] = nd
+	}
+}
+
 // ResolveNetworkName returns the cluster network record a workload NIC
 // naming raw refers to. A network this file declares (and does not mark
 // external) belongs to the stack and is stored as "<stack>_<raw>". Any other

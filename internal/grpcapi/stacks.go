@@ -766,6 +766,7 @@ func (s *Server) deployCreatePlanned(ctx context.Context, action planner.VMActio
 // provisionPlannedNetworks provisions networks only on hosts where VMs are placed,
 // instead of broadcasting to all cluster hosts.
 func (s *Server) provisionPlannedNetworks(ctx context.Context, f *compose.File, plan *planner.ResolvedPlan, stream grpc.ServerStreamingServer[pb.DeployProgress]) error {
+	f.DefaultNetworkInterfaces()
 	// Build the set of hosts that actually need network provisioning.
 	targetHosts := map[string]bool{}
 	for _, na := range plan.Networks {
@@ -2611,9 +2612,6 @@ func (s *Server) provisionComposeNetworks(ctx context.Context, f *compose.File) 
 			errs = append(errs, msg)
 			continue
 		}
-		if netDef.Interface == "" {
-			netDef.Interface = name
-		}
 		scopedName := compose.ScopedNetworkName(f.Name, name)
 		// Stack networks remain GLOBAL/shared ("") — preserving pre-v37 behavior;
 		// project-scoping stack-defined networks is a separate follow-up.
@@ -2624,42 +2622,4 @@ func (s *Server) provisionComposeNetworks(ctx context.Context, f *compose.File) 
 		}
 	}
 	return errs
-}
-
-// forwardProvisionNetworks sends ProvisionNetwork RPCs to all remote hosts
-// so that networks are ready before VMs are placed there.
-func (s *Server) forwardProvisionNetworks(ctx context.Context, f *compose.File) {
-	hosts, err := corrosion.ListHosts(ctx, s.db)
-	if err != nil {
-		return
-	}
-
-	for _, h := range hosts {
-		if h.Name == s.hostName {
-			continue
-		}
-		for name, netDef := range f.Networks {
-			if netDef.External {
-				continue
-			}
-			if netDef.Interface == "" {
-				netDef.Interface = name
-			}
-			cfgJSON, _ := json.Marshal(netDef)
-			client, conn, err := s.peerClient(ctx, h.Name)
-			if err != nil {
-				slog.Warn("forwardProvisionNetworks: cannot reach host", "host", h.Name, "error", err)
-				break // skip remaining networks for this host
-			}
-			ntype := netDef.Type
-			if ntype == "" {
-				ntype = "bridge"
-			}
-			scopedName := compose.ScopedNetworkName(f.Name, name)
-			if _, err := client.ProvisionNetwork(ctx, provisionNetworkRequest(scopedName, string(cfgJSON), ntype, f.Name)); err != nil {
-				slog.Warn("forwardProvisionNetworks: provision failed", "host", h.Name, "network", scopedName, "error", err)
-			}
-			conn.Close()
-		}
-	}
 }

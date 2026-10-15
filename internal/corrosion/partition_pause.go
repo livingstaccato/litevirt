@@ -242,9 +242,24 @@ func AutoPromoteEnrolled(ctx context.Context, c *Client) (map[string]bool, error
 // which is all Layer 3 reads it for. It verifies nothing: Layer 3 verifies each
 // certificate before it acts on one (docs/design/partition-pause.md §6).
 func CertifiedTransferProofs(ctx context.Context, c *Client, kind, name string) ([]ProofRecord, error) {
-	rows, err := c.Query(ctx, `SELECT id FROM runtime_action_proofs
-		WHERE target_kind = ? AND target_name = ? AND claim_certificate != ''
-		ORDER BY id`, kind, name)
+	return transferProofs(ctx, c, kind, name, true)
+}
+
+// TransferProofs is CertifiedTransferProofs with the uncertified proofs too:
+// those minted while recovery claims were not enforced (a derived voter set).
+// VM settle reads it so a decline can say that the move completed without a
+// certificate, rather than that no proof exists; it acts on none of them.
+func TransferProofs(ctx context.Context, c *Client, kind, name string) ([]ProofRecord, error) {
+	return transferProofs(ctx, c, kind, name, false)
+}
+
+func transferProofs(ctx context.Context, c *Client, kind, name string, certified bool) ([]ProofRecord, error) {
+	q := `SELECT id FROM runtime_action_proofs WHERE target_kind = ? AND target_name = ?
+		AND action IN ('` + ActionReschedule + `', '` + ActionPromote + `', '` + ActionRelocate + `')`
+	if certified {
+		q += ` AND claim_certificate != ''`
+	}
+	rows, err := c.Query(ctx, q+` ORDER BY id`, kind, name)
 	if err != nil {
 		return nil, err
 	}
@@ -254,7 +269,7 @@ func CertifiedTransferProofs(ctx context.Context, c *Client, kind, name string) 
 		if err != nil {
 			return nil, err
 		}
-		if ok && pr.ClaimCertificate != "" && ClaimGatedAction(pr.Action) {
+		if ok && (!certified || pr.ClaimCertificate != "") && ClaimGatedAction(pr.Action) {
 			out = append(out, pr)
 		}
 	}

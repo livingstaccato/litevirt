@@ -1766,6 +1766,15 @@ holder writes.
   not fall back to the domain UUID, because a live restore or a renamed
   promote gives a new incarnation an earlier one's UUID.
 
+  `proof_uncertified` means the recovery completed on the destination, but
+  its proof carries no certificate: it was minted while recovery claims were
+  not enforced, as on a derived voter set. It is reported only for a live
+  proof at an owner epoch at least the local copy's, and only when no
+  certified proof gave a reason of its own. Settle acts only on a certificate,
+  so a paused copy stays paused. There is no claim for `lv cluster claim` to
+  show. Confirm with `virsh domstate <vm>` on the destination that it runs
+  there, then stop the copy on this host with `virsh destroy <vm>`, as below.
+
   The row naming another host is not proof on its own: a converged-wrong
   `host_name` looks exactly the same. Before stopping anything, confirm which
   copy is current. `lv cluster claim vm/<vm>` shows the decided claim and its

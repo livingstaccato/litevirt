@@ -13,6 +13,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/image"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // TestServerOpts is the minimal set of fields the in-process fleet
@@ -90,6 +91,7 @@ func NewServerForTests(opts TestServerOpts) *Server {
 		ShutdownCh:     make(chan struct{}, 1),
 		fetchBinarySem: make(chan struct{}, fetchBinaryMaxConcurrent),
 		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
+		fwStore:        lv.NewFirmwareStore(opts.DataDir),
 	}
 	s.wireCertificateVerifier()
 	s.wireReplicationReleaseGates()

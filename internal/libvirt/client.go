@@ -53,6 +53,10 @@ type Client struct {
 	guardNeeds func(name string) bool // RequireStartGuard's scope; nil = every start
 	readyOnce  sync.Once
 
+	// fwGuard is the firmware move guard (firmware_move_guard.go), asked
+	// before every start, resume, stop, define and undefine.
+	fwGuard FirmwareMoveGuard
+
 	// consolePolicy decides whether DefineDomain gives a domain's consoles
 	// passwords (SetConsolePasswordPolicy, console_password.go).
 	consolePolicy atomic.Pointer[func() ConsolePolicy]

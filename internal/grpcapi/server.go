@@ -524,8 +524,9 @@ type Server struct {
 
 	// fwStore is this host's firmware state (NVRAM and swtpm trees). The
 	// daemon injects the one it shares with the reconciler; NewServer and
-	// NewServerForTests start from the production layout under dataDir. Read
-	// it through fw().
+	// NewServerForTests start from the production layout under dataDir, and a
+	// struct-literal Server gets that layout through fw(). Read it through
+	// fw().
 	fwStore *lv.FirmwareStore
 
 	// lbApplyOverride is a test seam for LB provisioning: when non-nil it
@@ -2457,8 +2458,19 @@ func (s *Server) reconcileFirewallRequired(ctx context.Context) error {
 func (s *Server) SetFirmwarePaths(fp lv.FirmwarePaths) { s.firmware = fp }
 
 // SetFirmwareStore injects this host's firmware store, the one the daemon
-// shares with its reconciler (and the fleet harness gives each node).
-func (s *Server) SetFirmwareStore(fw *lv.FirmwareStore) { s.fwStore = fw }
+// shares with its reconciler (and the fleet harness gives each node). nil is
+// ignored. A store whose DataDir is not the server's panics: the domain XML
+// names the NVRAM under the server's data dir, so the store must be the one
+// that holds it.
+func (s *Server) SetFirmwareStore(fw *lv.FirmwareStore) {
+	if fw == nil {
+		return
+	}
+	if fw.DataDir != s.dataDir {
+		panic(fmt.Sprintf("grpcapi: firmware store data dir %q is not the server's %q", fw.DataDir, s.dataDir))
+	}
+	s.fwStore = fw
+}
 
 // FirmwareStore is this host's firmware store.
 func (s *Server) FirmwareStore() *lv.FirmwareStore { return s.fw() }

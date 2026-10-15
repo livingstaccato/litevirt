@@ -34,6 +34,7 @@ import (
 	"github.com/litevirt/litevirt/internal/failover"
 	"github.com/litevirt/litevirt/internal/filerestore"
 	"github.com/litevirt/litevirt/internal/firewall"
+	"github.com/litevirt/litevirt/internal/fwmig"
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hlc"
@@ -73,9 +74,13 @@ type Daemon struct {
 	auditWired     chan struct{}
 	auditWiredDone sync.Once
 
-	cfg     *Config
-	db      *corrosion.Client
-	virt    *libvirt.Client
+	cfg  *Config
+	db   *corrosion.Client
+	virt *libvirt.Client
+	// fwStore is the host's one firmware store, guarded by the firmware move
+	// guard from the moment libvirt is connected, and shared by the server and
+	// the reconciler.
+	fwStore *libvirt.FirmwareStore
 	images  *image.Store
 	grpcSrv *grpc.Server
 	svc     *grpcapi.Server // gRPC service handler; held so background loops can refresh it
@@ -191,6 +196,10 @@ func New(cfg *Config) (*Daemon, error) {
 	if err != nil {
 		return nil, fmt.Errorf("libvirt: %w", err)
 	}
+	// The firmware move guard (fwmig) is in force before anything can start,
+	// stop or redefine a domain, and is asked ahead of the start guard below.
+	fwStore := libvirt.NewFirmwareStore(cfg.DataDir)
+	fwmig.Wire(virt, fwStore)
 	// No guarded VM starts before the per-NIC firewall is wired (re-review
 	// R2-I2): after a host boots its nft tables are empty, and an onboot,
 	// self-heal or restart-policy start would run its guest unguarded. Such a
@@ -210,10 +219,11 @@ func New(cfg *Config) (*Daemon, error) {
 	}
 
 	return &Daemon{
-		cfg:    cfg,
-		db:     db,
-		virt:   virt,
-		images: store,
+		cfg:     cfg,
+		db:      db,
+		virt:    virt,
+		fwStore: fwStore,
+		images:  store,
 	}, nil
 }
 
@@ -1022,10 +1032,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetFirmwarePaths(firmwarePaths)
 	reconciler.SetFirmwarePaths(firmwarePaths)
 	// One firmware store (NVRAM under the data dir, swtpm under libvirt's
-	// root) for the host, shared by the server and the reconciler.
-	fwStore := libvirt.NewFirmwareStore(d.cfg.DataDir)
-	svc.SetFirmwareStore(fwStore)
-	reconciler.SetFirmwareStore(fwStore)
+	// root) for the host, the guarded one New built, shared by the server and
+	// the reconciler.
+	svc.SetFirmwareStore(d.fwStore)
+	reconciler.SetFirmwareStore(d.fwStore)
 	svc.SetSessionTimeouts(parseDurationOr(d.cfg.Auth.SessionIdleTimeout, 0), parseDurationOr(d.cfg.Auth.SessionHardExpiry, 0))
 	svc.SetStrictMTLSIdentity(d.cfg.Auth.StrictMTLSIdentity)
 	svc.SetTrustRotatedPeerCerts(d.cfg.Auth.TrustRotatedPeerCerts)

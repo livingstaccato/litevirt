@@ -401,7 +401,19 @@ func (r *Reconciler) SetFirmwarePaths(fp lv.FirmwarePaths) { r.firmware = fp }
 // SetFirmwareStore injects this host's firmware store, the one the daemon
 // shares with its gRPC server. NewReconciler starts from the production
 // layout under dataDir.
-func (r *Reconciler) SetFirmwareStore(fw *lv.FirmwareStore) { r.fwStore = fw }
+//
+// nil is ignored, as the server does. A store whose DataDir is not the
+// reconciler's panics: the domain XML names the NVRAM under the reconciler's
+// data dir, so the store must be the one that holds it.
+func (r *Reconciler) SetFirmwareStore(fw *lv.FirmwareStore) {
+	if fw == nil {
+		return
+	}
+	if fw.DataDir != r.dataDir {
+		panic(fmt.Sprintf("health: firmware store data dir %q is not the reconciler's %q", fw.DataDir, r.dataDir))
+	}
+	r.fwStore = fw
+}
 
 // FirmwareStore is this host's firmware store.
 func (r *Reconciler) FirmwareStore() *lv.FirmwareStore { return r.fwStore }

@@ -221,7 +221,7 @@ func TestRevert_ConsolePasswordKeptAndKillSwitchApplies(t *testing.T) {
 			v := keepConsoleSnapshotAPI{m, c}
 			if live {
 				save := m.memorySnapshot("m1")
-				if err := revertToLiveSnapshot(v, "vm", "m1", save, nil, nil, StartGuard{}); err != nil {
+				if err := revertToLiveSnapshot(v, "vm", "m1", save, nil, nil, StartGuard{}, FirmwareMoveGuard{}); err != nil {
 					t.Fatal(err)
 				}
 			} else {

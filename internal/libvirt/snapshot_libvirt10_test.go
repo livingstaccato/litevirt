@@ -42,7 +42,7 @@ func (m *libvirt10) revert(name string) {
 
 func (m *libvirt10) revertLive(name, save string) {
 	m.t.Helper()
-	if err := revertToLiveSnapshot(m, "vm", name, save, nil, nil, StartGuard{}); err != nil {
+	if err := revertToLiveSnapshot(m, "vm", name, save, nil, nil, StartGuard{}, FirmwareMoveGuard{}); err != nil {
 		m.t.Fatalf("revert (memory) %s: %v", name, err)
 	}
 }
@@ -433,7 +433,7 @@ func TestRevert_ARefusedCurrentIsReported(t *testing.T) {
 		m.write(markA, 1)
 		save := m.memorySnapshot("m1")
 		m.write(markB, 2)
-		check(t, revertToLiveSnapshot(m, "vm", "m1", save, nil, nil, StartGuard{}))
+		check(t, revertToLiveSnapshot(m, "vm", "m1", save, nil, nil, StartGuard{}, FirmwareMoveGuard{}))
 		m.rm("m1")
 		m.requireWhole(map[byte]bool{markA: true, markB: false})
 	})
@@ -972,7 +972,7 @@ func TestRevert_ABadBaseFailsBeforeTeardown(t *testing.T) {
 				before := fileSum(t, ov)
 				var err error
 				if memory {
-					err = revertToLiveSnapshot(m, "vm", "s1", save, nil, nil, StartGuard{})
+					err = revertToLiveSnapshot(m, "vm", "s1", save, nil, nil, StartGuard{}, FirmwareMoveGuard{})
 				} else {
 					err = revertToSnapshot(m, "vm", "s1", nil, StartGuard{})
 				}

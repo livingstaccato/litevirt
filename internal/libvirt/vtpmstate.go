@@ -4,12 +4,16 @@ import (
 	"archive/tar"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
+	"syscall"
 
 	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -39,6 +43,21 @@ const (
 type FirmwareStore struct {
 	DataDir   string // the daemon's data directory; NVRAM lives in DataDir/nvram
 	SwtpmBase string // libvirt's swtpm root; DefaultSwtpmBase on a real host
+
+	// guard is the firmware move guard (spec §5.1): every write and wipe of
+	// the state asks it first. Installed by fwmig.Wire; none = allow.
+	guard atomic.Pointer[FirmwareMoveGuard]
+}
+
+// SetFirmwareMoveGuard installs the firmware move guard every state write
+// and wipe of this store asks (fwmig.Wire).
+func (f *FirmwareStore) SetFirmwareMoveGuard(g FirmwareMoveGuard) { f.guard.Store(&g) }
+
+func (f *FirmwareStore) moveGuard() FirmwareMoveGuard {
+	if g := f.guard.Load(); g != nil {
+		return *g
+	}
+	return FirmwareMoveGuard{}
 }
 
 // NewFirmwareStore is the store of a host whose daemon keeps its data in
@@ -59,14 +78,24 @@ func (f *FirmwareStore) HasNvram(vmName string) bool {
 	return err == nil && fi.Size() > 0
 }
 
-// RemoveNvram removes the VM's UEFI vars file. The error is os.Remove's.
+// RemoveNvram removes the VM's UEFI vars file. The error is os.Remove's, or
+// the firmware move guard's refusal (OpWriteState).
 func (f *FirmwareStore) RemoveNvram(vmName string) error {
+	if err := f.moveGuard().check(FirmwareCall{Op: OpWriteState, Name: vmName}); err != nil {
+		return fmt.Errorf("remove nvram of %s: %w", vmName, err)
+	}
 	return os.Remove(f.NvramPath(vmName))
 }
 
 // RenameNvram moves the UEFI vars file of from to the name to. The error is
-// os.Rename's.
+// os.Rename's, or the firmware move guard's refusal (OpWriteState) for
+// either name.
 func (f *FirmwareStore) RenameNvram(from, to string) error {
+	for _, n := range []string{from, to} {
+		if err := f.moveGuard().check(FirmwareCall{Op: OpWriteState, Name: n}); err != nil {
+			return fmt.Errorf("rename nvram %s to %s: %w", from, to, err)
+		}
+	}
 	return os.Rename(f.NvramPath(from), f.NvramPath(to))
 }
 
@@ -210,7 +239,16 @@ func (f *FirmwareStore) WriteFirmwareBundle(vmName, uuid string, w io.Writer) (b
 // Slip-safe: rejects ../absolute paths and symlink/hardlink/device members (a
 // backup-repo bundle is untrusted); restored modes are clamped (files 0600, dirs
 // 0700), never trusting tar header modes.
+//
+// The firmware move guard is asked first (OpWriteState).
 func (f *FirmwareStore) ReadFirmwareBundle(r io.Reader, vmName, uuid string) error {
+	if err := f.moveGuard().check(FirmwareCall{Op: OpWriteState, Name: vmName, UUID: uuid}); err != nil {
+		return fmt.Errorf("restore firmware state of %s: %w", vmName, err)
+	}
+	return f.readFirmwareBundle(r, vmName, uuid)
+}
+
+func (f *FirmwareStore) readFirmwareBundle(r io.Reader, vmName, uuid string) error {
 	if uuid != "" {
 		if _, ok := f.swtpmDir(uuid); !ok {
 			return fmt.Errorf("firmware bundle: invalid swtpm uuid %q", uuid)
@@ -378,10 +416,23 @@ func (f *FirmwareStore) ReadFirmwareBundle(r io.Reader, vmName, uuid string) err
 	return nil
 }
 
-// WipeFirmwareState removes a VM's firmware state (true delete). Best-effort.
+// WipeFirmwareState removes a VM's firmware state (true delete). Best-effort:
+// a firmware move guard refusal (OpWipe) leaves the state and is logged.
 func (f *FirmwareStore) WipeFirmwareState(vmName, uuid string) {
-	f.WipeNameKeyedFirmwareState(vmName)
-	f.WipeFirmwareStateByUUID(uuid)
+	if f.wipeRefused(FirmwareCall{Op: OpWipe, Name: vmName, UUID: uuid}) {
+		return
+	}
+	f.wipeNameKeyed(vmName)
+	f.wipeByUUID(uuid)
+}
+
+// wipeRefused asks the guard about a best-effort wipe and logs a refusal.
+func (f *FirmwareStore) wipeRefused(c FirmwareCall) bool {
+	err := f.moveGuard().check(c)
+	if err != nil {
+		slog.Warn("firmware state wipe refused", "vm", c.Name, "uuid", c.UUID, "error", err)
+	}
+	return err != nil
 }
 
 // WipeNameKeyedFirmwareState removes only the artifacts keyed by the VM's NAME.
@@ -390,17 +441,191 @@ func (f *FirmwareStore) WipeFirmwareState(vmName, uuid string) {
 // longer owns the name — a delayed cutover cleanup, say — would otherwise delete
 // the vars file of whatever VM holds it now. Callers that cannot prove the name
 // is still theirs must skip this and take WipeFirmwareStateByUUID alone.
+//
+// Best-effort: a firmware move guard refusal (OpWipe) leaves the state.
 func (f *FirmwareStore) WipeNameKeyedFirmwareState(vmName string) {
+	if f.wipeRefused(FirmwareCall{Op: OpWipe, Name: vmName}) {
+		return
+	}
+	f.wipeNameKeyed(vmName)
+}
+
+func (f *FirmwareStore) wipeNameKeyed(vmName string) {
 	_ = os.Remove(f.NvramPath(vmName))
 	_ = os.Remove(f.retainedMarkerPath(vmName))
 }
 
 // WipeFirmwareStateByUUID removes the swtpm tree, which is keyed by the VM's
-// UUID and therefore cannot belong to anything else.
+// UUID and therefore cannot belong to anything else. Best-effort: a firmware
+// move guard refusal (OpWipe; a record that names the uuid under any VM name)
+// leaves the tree.
 func (f *FirmwareStore) WipeFirmwareStateByUUID(uuid string) {
+	if f.wipeRefused(FirmwareCall{Op: OpWipe, UUID: uuid}) {
+		return
+	}
+	f.wipeByUUID(uuid)
+}
+
+func (f *FirmwareStore) wipeByUUID(uuid string) {
 	if dir, ok := f.swtpmDir(uuid); ok {
 		_ = os.RemoveAll(dir)
 	}
+}
+
+// ── Exempt entry points of a live firmware move (spec §5.1, I5) ──
+
+// WipeFirmwareMoveSource wipes a moved VM's source state (spec §6.7 step 4):
+// the marker is the attempt's, in phase cleaning, with its retained bundle on
+// disk.
+func (f *FirmwareStore) WipeFirmwareMoveSource(vmName, uuid, attempt string) error {
+	if err := f.moveGuard().check(FirmwareCall{Op: OpWipe, Name: vmName, UUID: uuid, Attempt: attempt, Via: ViaWipeFirmwareMoveSource}); err != nil {
+		return fmt.Errorf("wipe source firmware state of %s: %w", vmName, err)
+	}
+	f.wipeNameKeyed(vmName)
+	f.wipeByUUID(uuid)
+	return nil
+}
+
+// MaterialiseFirmwareMoveNvram writes the target's NVRAM in Prepare (spec
+// §6.2 item 7): the hold is the attempt's, in state prepared.
+func (f *FirmwareStore) MaterialiseFirmwareMoveNvram(vmName, uuid, attempt string, nvram []byte) error {
+	return f.writeMoveNvram(FirmwareCall{Op: OpWriteState, Name: vmName, UUID: uuid, Attempt: attempt, Via: ViaMaterialiseFirmwareMoveNvram}, nvram)
+}
+
+// PushFirmwareMoveNvram writes the source's final NVRAM to a held target
+// found shut off (spec §7 H1): the hold is the attempt's, verified or
+// resuming.
+func (f *FirmwareStore) PushFirmwareMoveNvram(vmName, uuid, attempt string, nvram []byte) error {
+	return f.writeMoveNvram(FirmwareCall{Op: OpWriteState, Name: vmName, UUID: uuid, Attempt: attempt, Via: ViaPushFirmwareMoveNvram}, nvram)
+}
+
+// writeMoveNvram replaces the VM's NVRAM with nvram durably: staged file,
+// fsync, rename, directory fsync.
+func (f *FirmwareStore) writeMoveNvram(c FirmwareCall, nvram []byte) error {
+	if err := f.moveGuard().check(c); err != nil {
+		return fmt.Errorf("write nvram of %s: %w", c.Name, err)
+	}
+	if err := safename.ValidateVMName(c.Name); err != nil {
+		return fmt.Errorf("write nvram: %w", err)
+	}
+	dst := f.NvramPath(c.Name)
+	if err := diskmode.MkdirAll(filepath.Dir(dst)); err != nil {
+		return err
+	}
+	staged := dst + ".staged"
+	if err := os.WriteFile(staged, nvram, 0o600); err != nil {
+		return err
+	}
+	if err := fsyncPath(staged); err != nil {
+		_ = os.Remove(staged)
+		return err
+	}
+	if err := os.Rename(staged, dst); err != nil {
+		_ = os.Remove(staged)
+		return err
+	}
+	return fsyncPath(filepath.Dir(dst))
+}
+
+// RemoveFirmwareMoveTargetState is Abort's rule D (spec §6.8): it deletes
+// the target's materialised NVRAM (nvram) and the swtpm tree (swtpm). The hold
+// is the attempt's, in state prepared. Absent files are not an error.
+func (f *FirmwareStore) RemoveFirmwareMoveTargetState(vmName, uuid, attempt string, nvram, swtpm bool) error {
+	if err := f.moveGuard().check(FirmwareCall{Op: OpWipe, Name: vmName, UUID: uuid, Attempt: attempt, Via: ViaRemoveFirmwareMoveTargetState}); err != nil {
+		return fmt.Errorf("remove target firmware state of %s: %w", vmName, err)
+	}
+	if nvram {
+		if err := os.Remove(f.NvramPath(vmName)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	if swtpm {
+		dir, ok := f.swtpmDir(uuid)
+		if !ok {
+			return fmt.Errorf("remove target firmware state of %s: invalid swtpm uuid %q", vmName, uuid)
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// QuarantineFirmwareMoveTargetState is rule Q (spec §6.8): it moves the
+// target's NVRAM to dir/nvram and its swtpm tree to dir/swtpm, deleting
+// nothing. The hold is the attempt's, in a state whose guest is held
+// (prepared, verified, resuming, mismatch). dir is created 0700. A part that
+// is absent is skipped; one already in dir is not overwritten.
+func (f *FirmwareStore) QuarantineFirmwareMoveTargetState(vmName, uuid, attempt, dir string) error {
+	if err := f.moveGuard().check(FirmwareCall{Op: OpWipe, Name: vmName, UUID: uuid, Attempt: attempt, Via: ViaQuarantineFirmwareMoveTargetState}); err != nil {
+		return fmt.Errorf("quarantine target firmware state of %s: %w", vmName, err)
+	}
+	swtpm, ok := f.swtpmDir(uuid)
+	if !ok {
+		return fmt.Errorf("quarantine target firmware state of %s: invalid swtpm uuid %q", vmName, uuid)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	for _, mv := range []struct{ from, to string }{
+		{f.NvramPath(vmName), filepath.Join(dir, "nvram")},
+		{swtpm, filepath.Join(dir, "swtpm")},
+	} {
+		if err := moveIntoQuarantine(mv.from, mv.to); err != nil {
+			return fmt.Errorf("quarantine %s: %w", mv.from, err)
+		}
+	}
+	return fsyncPath(dir)
+}
+
+// moveIntoQuarantine renames from to to, or, across filesystems, copies it
+// (files 0600, dirs 0700, each file fsynced) and then removes from.
+func moveIntoQuarantine(from, to string) error {
+	if _, err := os.Lstat(from); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	if _, err := os.Lstat(to); err == nil {
+		return fmt.Errorf("%s already exists", to)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	err := os.Rename(from, to)
+	if err == nil || !errors.Is(err, syscall.EXDEV) {
+		return err
+	}
+	if err := copyQuarantine(from, to); err != nil {
+		_ = os.RemoveAll(to)
+		return err
+	}
+	return os.RemoveAll(from)
+}
+
+func copyQuarantine(from, to string) error {
+	return filepath.WalkDir(from, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(from, p)
+		if err != nil {
+			return err
+		}
+		dst := filepath.Join(to, rel)
+		switch {
+		case d.IsDir():
+			return os.MkdirAll(dst, 0o700)
+		case d.Type().IsRegular():
+			src, err := os.Open(p)
+			if err != nil {
+				return err
+			}
+			defer src.Close()
+			return writeFileFromTar(src, dst)
+		default:
+			return fmt.Errorf("unexpected firmware state entry %q (type %v)", p, d.Type())
+		}
+	})
 }
 
 // Retained-firmware marker (G1): `delete --keep-disks` keeps the firmware state

@@ -282,7 +282,9 @@ func (d *Daemon) writeBootState(ctx context.Context, cpus, memMiB, diskGiB int, 
 		applied, err := corrosion.UpdateHostStartupFrom(ctx, d.db, d.cfg.HostName, boot.From, boot.State, d.cfg.Version, cpus, memMiB, diskGiB, hasResources)
 		switch {
 		case err != nil:
+			// Reported once this daemon serves, retried until it lands.
 			slog.Warn("failed to write host startup state", "error", err)
+			confirm = reportOnServing(boot.State)
 		case !applied:
 			slog.Warn("boot: this host's recorded state changed after the boot read it; leaving it, and reporting this boot once the daemon serves",
 				"read", boot.From)

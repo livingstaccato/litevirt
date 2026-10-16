@@ -773,3 +773,40 @@ func TestBootWithoutALocalClientIsNotActiveBeforeItServes(t *testing.T) {
 		}
 	}
 }
+
+// TestBootThatCannotRecordItselfWritesNothingUntilItServes: a crash boot whose
+// data dir cannot take its unclean-boot history (a full or read-only disk)
+// could not bound a crash loop. It used to record the host 'active' at once;
+// it now writes nothing until this daemon serves, and then records it active
+// with its boot report, through the guard.
+//
+// Mutation: return 'active' for a failed history in hostboot (the rule
+// before) — the host's row is rewritten at the boot.
+func TestBootThatCannotRecordItselfWritesNothingUntilItServes(t *testing.T) {
+	old := pingPollInterval
+	pingPollInterval = time.Millisecond
+	defer func() { pingPollInterval = old }()
+	var checks bootChecks
+	defer checks.wait(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d, host := bootTestDaemon(t, ctx)
+	d.cfg.DataDir = filepath.Join(t.TempDir(), "missing")
+	h0 := host()
+	serving := make(chan struct{})
+	d.selfPinger = checks.pinger(&gatedPinger{open: serving})
+	d.writeBootState(ctx, 2, 3, 4, true)
+	time.Sleep(50 * time.Millisecond)
+	if h := host(); h.State != "active" || h.UpdatedAt != h0.UpdatedAt || h.Version == "v-boot" {
+		t.Fatalf("the boot that cannot record itself wrote its host before serving: %+v (was at %s)", h, h0.UpdatedAt)
+	}
+	close(serving)
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if h := host(); h.State == "active" && h.Version == "v-boot" && h.CPUTotal == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("this daemon serves, and the host is %+v, want active with its boot report", host())
+		}
+	}
+}

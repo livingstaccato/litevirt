@@ -1117,14 +1117,22 @@ and resources are then written once the daemon serves, leaving that state.
 - A daemon that cannot build its own local gRPC client keeps retrying and
   does not record the host `active` until it can confirm it serves; past 2
   minutes `upgrading` it raises `upgrading_unconfirmed`.
+- A boot without the marker that cannot write `boot-unclean-history` or
+  `boot-awaiting-serving` (a full or read-only disk) could not bound a crash
+  loop, and one that cannot read the host's record (read twice) could not
+  judge it: each makes no write, and records the host `active`, with its
+  version and resources, once the daemon serves, only while the host is
+  still recorded as it is then. A host recorded `upgrading` by then is
+  recorded `active` too.
+- A report that fails once the daemon serves is retried until it lands.
 
 Each of these boots `active`, as before:
 
-- a host recorded anything other than `active` or `upgrading`. A fenced,
-  offline or maintenance host keeps that state through the SIGTERM, and a
-  draining one is recorded `upgrading` for the restart, as before;
-- a boot that cannot bound a crash loop: no `data_dir`, or one where
-  `boot-unclean-history` cannot be written, or a host record it cannot read.
+- a host recorded anything other than `active` or `upgrading`, by a boot that
+  can record itself. A fenced, offline or maintenance host keeps that state
+  through the SIGTERM, and a draining one is recorded `upgrading` for the
+  restart, as before;
+- a boot with no `data_dir`.
 
 Recording the host `active` once it serves changes only an `upgrading` host
 (after a boot that made no write, only a host still recorded as that boot

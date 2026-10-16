@@ -171,8 +171,8 @@ func TestUncleanBootByRecordedState(t *testing.T) {
 	if b := BootState(ctx, db, "h", "", false, time.Now()); b.State != "active" || b.AwaitServing {
 		t.Fatalf("boot with no data dir = %+v, want active", b)
 	}
-	if b := BootState(ctx, db, "nobody", t.TempDir(), false, time.Now()); b.State != "active" || b.AwaitServing {
-		t.Fatalf("boot of a host with no record = %+v, want active", b)
+	if b := BootState(ctx, db, "nobody", t.TempDir(), false, time.Now()); b.State != "" || !b.Deferred {
+		t.Fatalf("boot of a host with no record = %+v, want no boot write", b)
 	}
 	// A post-upgrade boot is 'upgrading', confirmed by the upgrade watchdog.
 	if b := BootState(ctx, db, "h", t.TempDir(), true, time.Now()); b.State != "upgrading" || b.AwaitServing {
@@ -180,18 +180,63 @@ func TestUncleanBootByRecordedState(t *testing.T) {
 	}
 }
 
-// A boot whose note cannot be written could not bound a crash loop, so it is
-// 'active' as before.
+// A boot that could not bound a crash loop — its unclean-boot history or its
+// awaiting-serving note cannot be written — or cannot read the host's record
+// makes no boot write (Deferred), keeping the recorded state, rather than
+// recording the host 'active' before it serves; it is confirmed through the
+// guard once it serves. After a graceful stop the marker bounds it, so a
+// failed note still writes 'upgrading'.
 //
-// Mutation: ignore the write error — the boot is 'upgrading'.
-func TestUncleanBootThatCannotNoteIsActive(t *testing.T) {
-	db, ctx := hostIn(t, "active")
-	// A data dir that is not there: no note to find, and none can be
-	// written.
-	dir := filepath.Join(t.TempDir(), "missing")
-	if b := BootState(ctx, db, "h", dir, false, time.Now()); b.State != "active" || b.AwaitServing {
-		t.Fatalf("boot that cannot note it awaits serving = %+v, want active", b)
+// Mutations: return 'active' for a failed history (the rule before) — the
+// missing-dir case fails; return 'active' for a failed note — the note case
+// fails; ignore the bound — the graceful case is deferred; return 'active' for
+// an unreadable record — the cancelled-read case fails.
+func TestBootThatCannotBoundOrReadDefers(t *testing.T) {
+	for _, st := range []string{"active", "upgrading", "fenced"} {
+		db, ctx := hostIn(t, st)
+		// A data dir that is not there: no history and no note can be
+		// written.
+		dir := filepath.Join(t.TempDir(), "missing")
+		if b := BootState(ctx, db, "h", dir, false, time.Now()); b.State != st || !b.AwaitServing || !b.Deferred {
+			t.Fatalf("boot of a %s host that cannot record its unclean boot = %+v, want %s kept, no boot write", st, b, st)
+		}
 	}
+
+	failNote := func(t *testing.T) {
+		old := writeAwaitingFile
+		writeAwaitingFile = func(string, []byte, os.FileMode) error { return errors.New("no space left on device") }
+		t.Cleanup(func() { writeAwaitingFile = old })
+	}
+	t.Run("note", func(t *testing.T) {
+		failNote(t)
+		db, ctx := hostIn(t, "active")
+		if b := BootState(ctx, db, "h", t.TempDir(), false, time.Now()); b.State != "active" || !b.AwaitServing || !b.Deferred {
+			t.Fatalf("unclean boot that cannot note it awaits serving = %+v, want active kept, no boot write", b)
+		}
+	})
+	t.Run("graceful", func(t *testing.T) {
+		failNote(t)
+		db, ctx := hostIn(t, "active")
+		dir := t.TempDir()
+		now := time.Now()
+		if err := MarkRestarting(ctx, db, "h", dir, now); err != nil {
+			t.Fatal(err)
+		}
+		if b := BootState(ctx, db, "h", dir, false, now.Add(time.Second)); b.State != "upgrading" || !b.AwaitServing || b.Deferred || b.From != "upgrading" {
+			t.Fatalf("graceful boot that cannot note it awaits serving = %+v, want upgrading written from upgrading", b)
+		}
+	})
+	t.Run("unreadable", func(t *testing.T) {
+		db, ctx := hostIn(t, "active")
+		cctx, cancel := context.WithCancel(ctx)
+		cancel()
+		if b := BootState(cctx, db, "h", t.TempDir(), false, time.Now()); b.State != "" || !b.AwaitServing || !b.Deferred {
+			t.Fatalf("boot that cannot read its record = %+v, want no boot write, the record read once it serves", b)
+		}
+		if b := BootState(ctx, db, "nobody", t.TempDir(), false, time.Now()); b.State != "" || !b.Deferred {
+			t.Fatalf("boot of a host with no record = %+v, want no boot write", b)
+		}
+	})
 }
 
 // A graceful stop older than the upgrading timeout (or dated after the boot)
@@ -458,8 +503,8 @@ func TestBootWithoutServingEvidenceByRecordedState(t *testing.T) {
 			t.Fatalf("boot after a never-served one, host %s = %+v, want active as before", st, b)
 		}
 	}
-	if b := BootState(ctx, db, "nobody", noted(t), false, time.Now()); b.State != "active" || b.AwaitServing || b.Deferred {
-		t.Fatalf("boot after a never-served one, no record = %+v, want active", b)
+	if b := BootState(ctx, db, "nobody", noted(t), false, time.Now()); b.State != "" || !b.Deferred {
+		t.Fatalf("boot after a never-served one, no record = %+v, want no boot write", b)
 	}
 }
 
@@ -521,5 +566,38 @@ func TestConfirmServingReport(t *testing.T) {
 	flipped, state, err := ConfirmServingReport(ctx, db, "h", "upgrading", r)
 	if !errors.Is(err, ErrMovedOn) || flipped || state != "fenced" || stateOf(t, db) != "fenced" {
 		t.Fatalf("report with a fence landing meanwhile: flipped=%v state=%q err=%v record=%q, want the fence kept", flipped, state, err, stateOf(t, db))
+	}
+}
+
+// ConfirmServingReport after a deferred boot: a host recorded 'upgrading'
+// since the boot read it (m5) is confirmed, not left unplaceable while it
+// serves; a boot that could not read the record (from "") confirms from
+// what it is when it serves, and one with no record writes nothing; a
+// moved-on report that fails is an error to retry, not ErrMovedOn (m4).
+//
+// Mutations: leave the 'upgrading' arm out — the host stays 'upgrading';
+// drop the from "" arm — the unread boot errors with no record ever
+// confirmed; wrap the failed report in ErrMovedOn (round 1) — the
+// quarantined report is not retried.
+func TestConfirmServingReportAfterADeferredBoot(t *testing.T) {
+	r := Report{Version: "v-new"}
+	db, ctx := hostIn(t, "upgrading")
+	if flipped, state, err := ConfirmServingReport(ctx, db, "h", "active", r); err != nil || !flipped || state != "active" || stateOf(t, db) != "active" {
+		t.Fatalf("deferred 'active' boot of a host now upgrading: flipped=%v state=%q err=%v record=%q, want active", flipped, state, err, stateOf(t, db))
+	}
+	for _, st := range []string{"active", "fenced"} {
+		db, ctx := hostIn(t, st)
+		if flipped, state, err := ConfirmServingReport(ctx, db, "h", "", r); err != nil || !flipped || state != "active" || stateOf(t, db) != "active" {
+			t.Fatalf("unread boot of a %s host: flipped=%v state=%q err=%v record=%q, want active once serving", st, flipped, state, err, stateOf(t, db))
+		}
+	}
+	if _, _, err := ConfirmServingReport(ctx, db, "nobody", "", r); !errors.Is(err, ErrMovedOn) {
+		t.Fatalf("unread boot with no record: err=%v, want ErrMovedOn (nothing to write)", err)
+	}
+	db, ctx = hostIn(t, "draining")
+	db.SetWriteQuarantine(func() string { return "test" })
+	_, state, err := ConfirmServingReport(ctx, db, "h", "upgrading", r)
+	if err == nil || errors.Is(err, ErrMovedOn) || state != "draining" {
+		t.Fatalf("failed moved-on report: state=%q err=%v, want an error to retry, not ErrMovedOn", state, err)
 	}
 }

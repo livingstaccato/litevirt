@@ -40,6 +40,15 @@ func (f *tagGroupFixture) relocationProofAt(id, name, dest, coordinator, token, 
 		id, ActionRelocate, name, dest, coordinator, token, status, createdAt, createdAt, del)
 }
 
+// claimProof records that executor claimed proof id at startedAt and, when
+// completedAt is set, completed it then (ClaimActionProof and
+// CompleteActionProof, both on the executor's clock).
+func (f *tagGroupFixture) claimProof(id, executor, startedAt, completedAt string) {
+	f.t.Helper()
+	mustExec(f.t, f.c, `UPDATE runtime_action_proofs SET executor_host = ?, started_at = ?, completed_at = ? WHERE id = ?`,
+		executor, startedAt, completedAt, id)
+}
+
 func sharedNames(m *TagGroupMembership) []string {
 	var out []string
 	for _, w := range m.SharedFWID {
@@ -150,11 +159,15 @@ func TestTagGroupMembers_APairsDirectionIsUnambiguous(t *testing.T) {
 	f.moveCT("node-2", "back", tgID(1), "stopped", "operator-stop", "tok-1")
 	f.relocationProofAt("p1", "back", "node-2", "node-1", "tok-1", "completed", true, "2026-10-01T00:00:00Z")
 	f.relocationProofAt("p2", "back", "node-1", "node-2", "tok-2", "completed", false, "2026-10-14T00:00:00Z")
+	f.claimProof("p1", "node-2", "2026-10-01T00:01:00Z", "2026-10-01T00:02:00Z")
+	f.claimProof("p2", "node-1", "2026-10-14T00:01:00Z", "2026-10-14T00:02:00Z")
 	// A failover relocation A -> B coordinated by C, then a migrate B -> C.
 	f.moveCT("node-3", "fo", tgID(2), "running", "", "tok-m")
 	f.moveCT("node-2", "fo", tgID(2), "stopped", "operator-stop", "tok-r")
 	f.relocationProofAt("pr", "fo", "node-2", "node-3", "tok-r", "completed", false, "2026-10-01T00:00:00Z")
 	f.relocationProofAt("pm", "fo", "node-3", "node-2", "tok-m", "in_progress", false, "2026-10-14T00:00:00Z")
+	f.claimProof("pr", "node-2", "2026-10-01T00:01:00Z", "2026-10-01T00:02:00Z")
+	f.claimProof("pm", "node-3", "2026-10-14T00:01:00Z", "")
 	// Both directions bound by proofs minted at the same moment: held.
 	f.moveCT("node-1", "tie", tgID(3), "stopped", "", "tok-b")
 	f.moveCT("node-2", "tie", tgID(3), "stopped", "", "tok-a")
@@ -299,32 +312,62 @@ func TestMintFirewallID_AMarkerBeatsAReverseProofAndAFailedProofIsNotLanded(t *t
 	}
 }
 
-// Re-review 2 m-1 and m-2: the members query.
-//   - Two wall-clock proofs within the replication skew limit do not say
-//     which is newer: held.
+// Re-review 2 m-1 and m-2, re-review 3 N3-I1: the members query.
+//   - Two wall-clock proofs are ordered by same-host comparisons: the earlier
+//     move's executor is the later move's coordinator, so its claim of the
+//     earlier proof precedes its mint of the later one, and the mirror holds
+//     on the other host. Cross-host skew does not enter. With that data
+//     missing, contradictory, or from another host, the order is not known:
+//     held.
 //   - A running row is never the side left out: after there-and-back with
 //     the source started again, both are held, and so are a pair that both
 //     run.
 //   - A marker beats an older reverse proof (m-3): its target is the member.
 //
-// Mutation: drop the skew window — "skew" is resolved: red. Leave out a
-// running row — "restarted" is resolved: red.
+// Mutation: order by created_at alone (lwwOrder) — "skew" resolves to the
+// wrong target and the rest resolve: red. Hold every wall-clock pair within
+// the skew (round 3) — "skew" is held: red. Leave out a running row —
+// "restarted" is resolved: red.
 func TestTagGroupMembers_SkewAndRunningRowsAreHeld(t *testing.T) {
 	f := newTagGroupFixture(t)
 	f.group("web", FirewallTagGroupDef{Match: map[string]string{"role": "web"}})
-	for i := 1; i <= 4; i++ {
+	for i := 1; i <= 7; i++ {
 		f.tags(TagMemberCT, tgID(i), `{"tags":{"role":"web"}}`)
 	}
-	f.moveCT("node-1", "skew", tgID(1), "stopped", "", "tok-2")
-	f.moveCT("node-2", "skew", tgID(1), "stopped", "operator-stop", "tok-1")
-	f.relocationProofAt("s1", "skew", "node-2", "node-1", "tok-1", ProofCompleted, true, "2026-10-15T10:00:00Z")
-	f.relocationProofAt("s2", "skew", "node-1", "node-2", "tok-2", ProofCompleted, false, "2026-10-15T10:01:00Z")
+	// node-1 -> node-2, then node-2 -> node-1, on a cluster whose node-2
+	// clock runs two minutes behind node-1's: by created_at alone the
+	// second proof is older. Each host's own clock orders them: node-2
+	// claimed s1 before it minted s2, and node-1 minted s1 before it
+	// claimed s2. The target on node-1 is the member.
+	twoWay := func(name string, fwID string) {
+		f.moveCT("node-1", name, fwID, "stopped", "", name+"-2")
+		f.moveCT("node-2", name, fwID, "stopped", "operator-stop", name+"-1")
+		f.relocationProofAt(name+"-s1", name, "node-2", "node-1", name+"-1", ProofCompleted, true, "2026-10-15T10:01:00Z")
+		f.relocationProofAt(name+"-s2", name, "node-1", "node-2", name+"-2", ProofCompleted, false, "2026-10-15T10:00:00Z")
+	}
+	twoWay("skew", tgID(1))
+	f.claimProof("skew-s1", "node-2", "2026-10-15T09:59:30Z", "2026-10-15T09:59:40Z")
+	f.claimProof("skew-s2", "node-1", "2026-10-15T10:02:00Z", "2026-10-15T10:02:10Z")
+	// The same with no claim data: the order is not known, so held.
+	twoWay("noclaim", tgID(5))
+	// The same with node-2's clock saying s2 was minted before it claimed
+	// s1 while node-1's says s1 came first: contradictory, so held.
+	twoWay("contra", tgID(6))
+	f.claimProof("contra-s1", "node-2", "2026-10-15T10:00:30Z", "")
+	f.claimProof("contra-s2", "node-1", "2026-10-15T10:02:00Z", "")
+	// Claims by a host that is not the other move's coordinator say
+	// nothing about its clock: held.
+	twoWay("foreign", tgID(7))
+	f.claimProof("foreign-s1", "node-3", "2026-10-15T09:59:30Z", "")
+	f.claimProof("foreign-s2", "node-3", "2026-10-15T10:02:00Z", "")
 	// There and back, the parked source on node-2 started again; the
 	// target on node-1 is stopped.
 	f.moveCT("node-1", "restarted", tgID(2), "stopped", "", "tok-b")
 	f.moveCT("node-2", "restarted", tgID(2), "running", "", "tok-a")
 	f.relocationProofAt("ra", "restarted", "node-2", "node-1", "tok-a", ProofCompleted, true, "2026-10-01T00:00:00Z")
 	f.relocationProofAt("rb", "restarted", "node-1", "node-2", "tok-b", ProofCompleted, false, "2026-10-14T00:00:00Z")
+	f.claimProof("ra", "node-2", "2026-10-01T00:01:00Z", "2026-10-01T00:02:00Z")
+	f.claimProof("rb", "node-1", "2026-10-14T00:01:00Z", "2026-10-14T00:02:00Z")
 	// Both run.
 	f.moveCT("node-1", "both", tgID(3), "running", "", "")
 	f.moveCT("node-2", "both", tgID(3), "running", "", "tok-x")
@@ -335,11 +378,57 @@ func TestTagGroupMembers_SkewAndRunningRowsAreHeld(t *testing.T) {
 	f.relocationProofAt("p-old", "fo", "node-1", "node-2", "tok-old", ProofCompleted, true, "2026-10-01T00:00:00Z")
 
 	m := f.members()
-	want := []string{"node-1/both", "node-1/restarted", "node-1/skew", "node-2/both", "node-2/restarted", "node-2/skew"}
+	want := []string{"node-1/both", "node-1/contra", "node-1/foreign", "node-1/noclaim", "node-1/restarted",
+		"node-2/both", "node-2/contra", "node-2/foreign", "node-2/noclaim", "node-2/restarted"}
 	if got := sharedNames(m); !slices.Equal(got, want) {
 		t.Fatalf("held at drop: %v, want %v", got, want)
 	}
-	if got := m.viewFor(t, "web").memberNames(); !slices.Equal(got, []string{"ct:node-2:fo"}) {
-		t.Fatalf("members %v, want the relocation's target", got)
+	if got := m.viewFor(t, "web").memberNames(); !slices.Equal(got, []string{"ct:node-1:skew", "ct:node-2:fo"}) {
+		t.Fatalf("members %v, want the skewed migrate's target and the relocation's target", got)
+	}
+}
+
+// Re-review 3 m3-1: the holder carries a token from an old migrate that a
+// third host coordinated and that completed, beside a copy. No record will
+// ever arrive to bind the two, so the refusal leads with the stale copy's
+// remedy, not a retry for records in flight.
+//
+// Mutation: drop the settled-records branch — the refusal leads with
+// "move records not yet replicated": red.
+func TestMintFirewallID_ASettledTokenBesideACopyLeadsWithTheRemedy(t *testing.T) {
+	f := newTagGroupFixture(t)
+	f.c.SetRepointReady(func(context.Context) bool { return true })
+	f.moveCT("node-1", "old", tgID(1), "running", "", "")
+	f.moveCT("node-2", "old", tgID(1), "running", "", "tok-x")
+	f.relocationProof("p-x", "old", "node-2", "node-3", "tok-x", ProofCompleted, true)
+	_, _, err := MintFirewallID(context.Background(), f.c, mintGrant(t), TagMemberCT, "node-2", "old")
+	if !errors.Is(err, ErrFirewallIDMoveOpen) || !strings.Contains(err.Error(), "remove the stale container old on node-1, then retry") ||
+		strings.Contains(err.Error(), "not yet replicated") {
+		t.Fatalf("mint beside a copy with a settled token: %v, want the stale copy named first", err)
+	}
+}
+
+// Re-review 3 m3-2: when both directions bind and their order is not known,
+// the refusal names the row that does not own the container's leases.
+//
+// Mutation: do not read the leases — "remove the stale one" is all it says:
+// red.
+func TestMintFirewallID_AnAmbiguousPairNamesTheRowWithoutTheLeases(t *testing.T) {
+	f := newTagGroupFixture(t)
+	f.c.SetRepointReady(func(context.Context) bool { return true })
+	for i, name := range []string{"amb", "nolease"} {
+		f.moveCT("node-1", name, tgID(i+1), "stopped", "", name+"-2")
+		f.moveCT("node-2", name, tgID(i+1), "stopped", "operator-stop", name+"-1")
+		f.relocationProofAt(name+"-s1", name, "node-2", "node-1", name+"-1", ProofCompleted, true, "2026-10-15T10:00:00Z")
+		f.relocationProofAt(name+"-s2", name, "node-1", "node-2", name+"-2", ProofCompleted, false, "2026-10-15T10:01:00Z")
+	}
+	f.lease("lan", "10.0.0.5", "02:00:00:00:00:05", TagMemberCT, "node-1", "amb")
+	_, _, err := MintFirewallID(context.Background(), f.c, mintGrant(t), TagMemberCT, "node-1", "amb")
+	if !errors.Is(err, ErrFirewallIDMoveOpen) || !strings.Contains(err.Error(), "remove the stale container amb on node-2") {
+		t.Fatalf("mint over an ambiguous pair: %v, want the row without the leases named", err)
+	}
+	_, _, err = MintFirewallID(context.Background(), f.c, mintGrant(t), TagMemberCT, "node-1", "nolease")
+	if !errors.Is(err, ErrFirewallIDMoveOpen) || !strings.Contains(err.Error(), "remove the stale one") {
+		t.Fatalf("mint over an ambiguous pair with no leases: %v, want the generic remedy", err)
 	}
 }

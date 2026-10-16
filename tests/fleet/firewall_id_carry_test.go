@@ -633,13 +633,15 @@ func TestFirewallIDCarry_AComposeInlineRecreateKeepsItAndACreateGetsNone(t *test
 
 // D2b re-review N-1: a container migrated A -> B, then back B -> A, where the
 // way back parks its source on B. Both proofs bind a direction between the
-// two live rows (the first one A -> B, the second B -> A). Only a known
-// order may decide, and then the live target on A is the member; here it is
-// not known (wall-clock stamps within the skew), so both are held. Never
-// "in no group and not held".
+// two live rows (the first one A -> B, the second B -> A). Their wall-clock
+// stamps are seconds apart, and each host's own clock orders them (B claimed
+// the first before it minted the second; A minted the first before it
+// claimed the second), so the live target on A is the only member and
+// nothing is held (re-review 3 N3-I1).
 //
 // Mutation: take the first direction that matches — red when the target's
-// row is scanned first.
+// row is scanned first. Hold every wall-clock pair within the skew (round 3)
+// — both held: red.
 func TestFirewallIDCarry_AMigrateThereAndBackParkedKeepsTheTargetTheMember(t *testing.T) {
 	c := gatedMigrateCluster(t)
 	a, b := c.Nodes[0], c.Nodes[1]
@@ -674,23 +676,12 @@ func TestFirewallIDCarry_AMigrateThereAndBackParkedKeepsTheTargetTheMember(t *te
 			members = append(members, mb.Host+"/"+mb.Name)
 		}
 	}
-	// The two proofs are wall-clock stamps seconds apart, inside the clock
-	// skew the cluster tolerates, so they do not say which move came last
-	// (re-review 2 m-1): both rows are held. Were their order known, the
-	// target on A would be the only member. Never: a row in no group and
-	// not held.
 	var held []string
 	for _, w := range m.SharedFWID {
 		held = append(held, w.Host+"/"+w.Name)
 	}
-	slices.Sort(held)
-	target := []string{a.Name + "/" + name}
-	both := []string{a.Name + "/" + name, b.Name + "/" + name}
-	switch {
-	case slices.Equal(members, target) && len(held) == 0:
-	case len(members) == 0 && slices.Equal(held, both):
-	default:
-		t.Fatalf("members %v, held %v; want the target on %s the only member, or both held", members, held, a.Name)
+	if want := []string{a.Name + "/" + name}; !slices.Equal(members, want) || len(held) != 0 {
+		t.Fatalf("members %v, held %v; want the target on %s the only member and nothing held", members, held, a.Name)
 	}
 }
 

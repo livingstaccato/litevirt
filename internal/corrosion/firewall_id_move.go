@@ -36,10 +36,15 @@ type containerMove struct {
 	state, detail, token string
 }
 
-// relocationProof is the part of a relocation proof that binds a move.
+// relocationProof is the part of a relocation proof that binds a move and
+// orders it against another. createdAt is the mint, on the coordinator's
+// clock; startedAt and completedAt are the claim and the completion, on the
+// executor's.
 type relocationProof struct {
 	targetName, destHost, coordinator string
 	status, createdAt                 string
+	executor, startedAt, completedAt  string
+	reaped                            bool
 }
 
 // readRelocationProofs reads the container relocation proofs bound to
@@ -57,7 +62,9 @@ func readRelocationProofs(ctx context.Context, c *Client, tokens map[string]bool
 		return out, nil
 	}
 	rows, err := c.Query(ctx,
-		`SELECT relocation_token, target_name, dest_host, coordinator, status, created_at FROM runtime_action_proofs
+		`SELECT relocation_token, target_name, dest_host, coordinator, status, created_at,
+		        executor_host, started_at, completed_at, COALESCE(deleted_at, '') AS deleted_at
+		   FROM runtime_action_proofs
 		  WHERE action = ? AND target_kind = 'container' AND relocation_token != ''`, ActionRelocate)
 	if err != nil {
 		return nil, err
@@ -70,6 +77,8 @@ func readRelocationProofs(ctx context.Context, c *Client, tokens map[string]bool
 		out[tok] = append(out[tok], relocationProof{
 			targetName: r.String("target_name"), destHost: r.String("dest_host"), coordinator: r.String("coordinator"),
 			status: r.String("status"), createdAt: r.String("created_at"),
+			executor: r.String("executor_host"), startedAt: r.String("started_at"), completedAt: r.String("completed_at"),
+			reaped: r.String("deleted_at") != "",
 		})
 	}
 	return out, nil
@@ -80,8 +89,8 @@ func readRelocationProofs(ctx context.Context, c *Client, tokens map[string]bool
 // carries and which names dst's container, dst's host and src's host.
 type moveMatch struct {
 	ok, marker bool
-	createdAt  string // the newest binding proof's
-	landed     bool   // that proof completed: the target landed
+	proof      relocationProof // the newest binding proof
+	landed     bool            // that proof completed: the target landed
 }
 
 // matchMove reports what binds src -> dst, from the records alone.
@@ -97,32 +106,87 @@ func matchMove(src, dst containerMove, proofs map[string][]relocationProof) move
 		if p.targetName != dst.name || p.destHost != dst.host || p.coordinator != src.host {
 			continue
 		}
-		if !m.ok || lwwOrder(p.createdAt, m.createdAt) > 0 {
+		// Every proof here was minted by src.host: one clock.
+		if !m.ok || lwwOrder(p.createdAt, m.proof.createdAt) > 0 {
 			// A failed proof is not a landed move.
-			m = moveMatch{ok: true, createdAt: p.createdAt, landed: p.status == ProofCompleted}
+			m = moveMatch{ok: true, proof: p, landed: p.status == ProofCompleted}
 		}
 	}
 	return m
 }
 
-// newerProof orders two proofs' created_at: 1 when a is newer, -1 when b is,
-// and 0 when that is not known. Two HLC stamps are causally ordered. A
-// wall-clock stamp (hlc_lww off) is two hosts' clocks: within the clock skew
-// the cluster tolerates (hlc.MaxSkewMS), they do not say which came first.
-func newerProof(a, b string) int {
-	ord := lwwOrder(a, b)
-	if ord == 0 || (hlc.IsHLC(a) && hlc.IsHLC(b)) {
-		return ord
+// newerProof orders the proofs of the two directions of one pair: ab moved
+// the container from host A (its coordinator) to host B (its executor), ba
+// from B to A. It returns 1 when ab is the later move, -1 when ba is, and 0
+// when that is not known.
+//
+// Two HLC stamps are causally ordered. Otherwise each stamp is one host's
+// wall clock, and two hosts' clocks are not compared: the earlier move's
+// executor is the later move's coordinator, so on that host its claim (and
+// completion) of the earlier proof precedes its mint of the later one, and
+// the mirror holds on the other host. Each comparison that applies — the
+// claiming host is the other proof's coordinator — and is strict says which
+// came later. The order is known when at least one does and none
+// contradicts it; missing claims or a contradiction (a host whose clock
+// stepped back) leave it unknown, and the pair is held.
+//
+// A destination that received the proof before the coordinator's row
+// replicated to it seeds the row (WriteActionProofValidated) with its own
+// created_at, so one comparison may then span two clocks; the seed is still
+// causally after the mint and before the claim, and a contradiction holds
+// the pair.
+func newerProof(ab, ba relocationProof) int {
+	if hlc.IsHLC(ab.createdAt) && hlc.IsHLC(ba.createdAt) {
+		return lwwOrder(ab.createdAt, ba.createdAt)
 	}
-	ia, aok := tsInstant(a)
-	ib, bok := tsInstant(b)
-	if !aok || !bok {
+	later, earlier := false, false
+	vote := func(ord int) {
+		later = later || ord > 0
+		earlier = earlier || ord < 0
+	}
+	// On A: ab minted after A executed ba means ab is the later move.
+	for _, t := range ba.executedOn(ab.coordinator) {
+		vote(sameHostOrder(ab.createdAt, t))
+	}
+	// On B: B executed ab after it minted ba means ab is the later move.
+	for _, t := range ab.executedOn(ba.coordinator) {
+		vote(sameHostOrder(t, ba.createdAt))
+	}
+	switch {
+	case later && !earlier:
+		return 1
+	case earlier && !later:
+		return -1
+	}
+	return 0
+}
+
+// executedOn returns the stamps host wrote executing p: its claim, and its
+// completion when p completed (a failure may be recorded by another host).
+func (p relocationProof) executedOn(host string) []string {
+	if host == "" || p.executor != host {
+		return nil
+	}
+	var out []string
+	if p.startedAt != "" {
+		out = append(out, p.startedAt)
+	}
+	if p.status == ProofCompleted && p.completedAt != "" {
+		out = append(out, p.completedAt)
+	}
+	return out
+}
+
+// sameHostOrder compares two stamps one host wrote: 0 when either is not a
+// timestamp.
+func sameHostOrder(a, b string) int {
+	if _, ok := tsInstant(a); !ok {
 		return 0
 	}
-	if d := ia.Sub(ib); d <= skewCutoff && d >= -skewCutoff {
+	if _, ok := tsInstant(b); !ok {
 		return 0
 	}
-	return ord
+	return lwwOrder(a, b)
 }
 
 // resolvePair decides which of a and b is an open move's source, from the
@@ -144,7 +208,7 @@ func resolvePair(a, b containerMove, proofs map[string][]relocationProof) (src, 
 	case ba.ok && !ab.ok:
 		return b, a, ba, true, false
 	case ab.ok && ba.ok && !ab.marker && !ba.marker:
-		switch newerProof(ab.createdAt, ba.createdAt) {
+		switch newerProof(ab.proof, ba.proof) {
 		case 1:
 			return a, b, ab, true, false
 		case -1:
@@ -261,8 +325,16 @@ func containerMoveOpen(ctx context.Context, c *Client, host, name, fwID string) 
 			return describeMove(src, dst, m), nil
 		}
 		if ambiguous {
+			stale, err := leaselessHolder(ctx, c, name, host, o.host)
+			if err != nil {
+				return "", err
+			}
+			remedy := "remove the stale one"
+			if stale != "" {
+				remedy = "remove the stale container " + name + " on " + stale + " (it holds none of the container's leases)"
+			}
 			return fmt.Sprintf("container %s on %s and on %s hold one firewall identity and their move records do not say "+
-				"which is the source: remove the stale one, then retry", name, host, o.host), nil
+				"which is the source: %s, then retry", name, host, o.host, remedy), nil
 		}
 		if _, _, marked := RelocateRestoreMarker(o.state, o.detail); marked {
 			return fmt.Sprintf("container %s on %s holds the same firewall identity and is relocating; its move records "+
@@ -283,10 +355,53 @@ func containerMoveOpen(ctx context.Context, c *Client, host, name, fwID string) 
 			default:
 				stale = "the stale one of container " + name + " on " + host + " and on " + o.host
 			}
+			if movesSettled(proofs, self.token, o.token) {
+				return fmt.Sprintf("container %s on %s and on %s hold one firewall identity, and the moves recorded for "+
+					"their tokens have finished without binding the two: remove %s, then retry", name, host, o.host, stale), nil
+			}
 			return fmt.Sprintf("container %s on %s and on %s hold one firewall identity, carry move tokens, and no move record "+
 				"visible here binds them (move records not yet replicated?): retry; if no move is open, remove %s",
 				name, host, o.host, stale), nil
 		}
 	}
 	return "", nil
+}
+
+// movesSettled reports whether every token carried has visible proofs and
+// all of them are completed or reaped: no record that could still bind the
+// pair is on its way.
+func movesSettled(proofs map[string][]relocationProof, tokens ...string) bool {
+	for _, tok := range tokens {
+		if tok == "" {
+			continue
+		}
+		if len(proofs[tok]) == 0 {
+			return false
+		}
+		for _, p := range proofs[tok] {
+			if p.status != ProofCompleted && !p.reaped {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// leaselessHolder names which of hosts a and b holds none of container
+// name's IPAM leases while the other holds some, or "" when that does not
+// single one out.
+func leaselessHolder(ctx context.Context, c *Client, name, a, b string) (string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT DISTINCT owner_host FROM ip_allocations
+		  WHERE owner_kind = 'ct' AND vm_name = ? AND owner_host IN (?, ?) AND deleted_at IS NULL`, name, a, b)
+	if err != nil {
+		return "", err
+	}
+	if len(rows) != 1 {
+		return "", nil
+	}
+	if rows[0].String("owner_host") == a {
+		return b, nil
+	}
+	return a, nil
 }

@@ -26,6 +26,19 @@ import (
 // as before, and replication resolves it against anything the owner wrote
 // meanwhile (corrosion/spec_conflict.go).
 
+// forwardedByPeer reports whether the call came from another cluster host:
+// a forward. A forwarded edit is made where it lands and never forwarded
+// again, so two hosts whose replicas each name the other as the owner (an
+// ownership move half replicated) do not pass it back and forth. A call
+// over this host's own certificate (its local CLI) is not a forward.
+func (s *Server) forwardedByPeer(ctx context.Context) bool {
+	if callerPrincipalKind(ctx) != principalKindPeer {
+		return false
+	}
+	cn := callerMTLSCommonName(ctx)
+	return cn != "" && cn != s.hostName
+}
+
 // ownerForwardTimeout bounds asking a VM's owner to make a spec edit. A
 // partitioned owner can leave the call hanging; past this the edit is made
 // on this host.
@@ -34,7 +47,15 @@ const ownerForwardTimeout = 10 * time.Second
 // ownerUnreachable reports whether err, from an edit forwarded to a VM's
 // owner, means the owner was not reached, so the edit may be made here. The
 // caller's own context ending is not that: the edit is abandoned.
-// Unimplemented is an owner on a build without the RPC.
+// Unimplemented is an owner on a build without the RPC. Unavailable also
+// covers an owner that refused because its replica is stale or cannot see
+// the forwarded identity; the edit is made here then too.
+//
+// Unavailable and DeadlineExceeded can arrive after the owner committed the
+// edit (a slow lock, a lost reply). The edit made here is then a second one
+// at the same generation, usually with the same content, which the spec
+// conflict resolution settles without dropping anything. That is the price
+// of never refusing an edit main allowed.
 func ownerUnreachable(parent context.Context, err error) bool {
 	if err == nil || parent.Err() != nil {
 		return false

@@ -34,7 +34,7 @@ func (s *Server) SetVMLabels(ctx context.Context, req *pb.SetVMLabelsRequest) (*
 
 	// Made on the VM's owner, which serialises its spec edits; here when this
 	// host is the owner or the owner cannot be reached (spec_owner.go).
-	if vm.HostName != "" && vm.HostName != s.hostName {
+	if vm.HostName != "" && vm.HostName != s.hostName && !s.forwardedByPeer(ctx) {
 		out, done, ferr := forwardSpecEdit(ctx, s, req.Name, vm.HostName, func(fctx context.Context, c pb.LiteVirtClient) (*pb.VM, error) {
 			return c.SetVMLabels(fctx, req)
 		})

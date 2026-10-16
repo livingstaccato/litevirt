@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -143,4 +144,32 @@ func TestFleet_ADeployPatchesHereWhenTheOwnerLacksPatchVMSpec(t *testing.T) {
 	eventually(t, convergeTimeout, "the label to reach the owner", func() bool {
 		return specHas(t, n0, "web", `"tier":"front"`)
 	})
+}
+
+// Two hosts whose replicas each name the other as the VM's owner — an
+// ownership move half replicated. The label edit entered on node-0 goes to
+// node-1, which makes it there: a forwarded edit is never forwarded again.
+//
+// Red on 58f7754f: node-1 forwards it back, and the two pass it to and fro
+// until the 10 s bound runs out and node-0 makes it itself.
+func TestFleet_TwoHostsNamingEachOtherAsOwnerDoNotPassTheEditBack(t *testing.T) {
+	c := New(t, Options{Nodes: 2, IndependentReplicas: true})
+	n0, n1 := c.Nodes[0], c.Nodes[1]
+	c.SetLinkFaultBoth(n0, n1, LinkFault{Block: true})
+	insertVM(t, n0, "vm-own", n1.Name)
+	insertVM(t, n1, "vm-own", n0.Name)
+
+	start := time.Now()
+	if _, err := c.SelfClient(n0).SetVMLabels(context.Background(), &pb.SetVMLabelsRequest{Name: "vm-own", Labels: map[string]string{"tier": "front"}}); err != nil {
+		t.Fatalf("SetVMLabels via %s: %v", n0.Name, err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("the edit took %s: it was passed back and forth", took)
+	}
+	if !specHas(t, n1, "vm-own", `"tier":"front"`) {
+		t.Errorf("%s, the owner node-0 forwarded to, did not make the edit: %s", n1.Name, vmOn(t, n1, "vm-own").Spec)
+	}
+	if specHas(t, n0, "vm-own", `"tier":"front"`) {
+		t.Errorf("%s made the edit itself after forwarding it", n0.Name)
+	}
 }

@@ -5946,6 +5946,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		// Hostdevs are populated here — the fields the old inline redefine builder
 		// dropped, collapsing the balloon ceiling and detaching passthrough).
 		vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, hostdevs)
+		// The seed and installer CD-ROMs are in neither the spec nor vm_disks.
+		priorXML, _ := s.virt.DumpXMLInactive(req.Name)
+		s.keepCDROMs(&vmCfg, req.Name, spec.Uuid, priorXML)
 		usb, uerr := s.resolveUSBHostdevs(ctx, spec)
 		if uerr != nil {
 			return nil, uerr

@@ -387,6 +387,23 @@ func (s *Server) domainInstallerISOs(vmName, domXML string) []string {
 // domainInstallerISOsErr is domainInstallerISOs, reporting a definition that
 // does not parse.
 func (s *Server) domainInstallerISOsErr(vmName, domXML string) ([]string, error) {
+	files, err := domainCDROMFiles(domXML)
+	if err != nil {
+		return nil, err
+	}
+	seed := filepath.Join(s.dataDir, "cloudinit", vmName+".iso")
+	var out []string
+	for _, f := range files {
+		if f != seed {
+			out = append(out, f)
+		}
+	}
+	return out, nil
+}
+
+// domainCDROMFiles returns the file sources of the CD-ROMs in a domain
+// definition, in definition order; an empty (ejected) CD-ROM has none.
+func domainCDROMFiles(domXML string) ([]string, error) {
 	var dom struct {
 		Disks []struct {
 			Device string `xml:"device,attr"`
@@ -398,13 +415,11 @@ func (s *Server) domainInstallerISOsErr(vmName, domXML string) ([]string, error)
 	if err := xml.Unmarshal([]byte(domXML), &dom); err != nil {
 		return nil, err
 	}
-	seed := filepath.Join(s.dataDir, "cloudinit", vmName+".iso")
 	var out []string
 	for _, d := range dom.Disks {
-		if d.Device != "cdrom" || d.Source.File == "" || d.Source.File == seed {
-			continue
+		if d.Device == "cdrom" && d.Source.File != "" {
+			out = append(out, d.Source.File)
 		}
-		out = append(out, d.Source.File)
 	}
 	return out, nil
 }

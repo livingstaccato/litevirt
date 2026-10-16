@@ -1085,27 +1085,42 @@ failed, as every write of a WAL-quarantined daemon does) does the same for a
 host recorded `active`, or recorded `upgrading` less than 2 minutes ago: it
 records the host `upgrading` and turns it `active` once it answers its own
 Ping. Such a boot leaves a `boot-awaiting-serving` file in its `data_dir`
-until a daemon serves. Each of these boots `active`, as before:
+until a daemon serves.
 
-- a boot without the marker that finds `boot-awaiting-serving`: the daemon
-  before it never served, so a daemon that crash-loops before serving is
-  `upgrading` once and is then fenced on its failure count. A post-upgrade
-  boot leaves the file too;
-- a boot without the marker that follows 3 others within 10 minutes, counted
-  in `boot-unclean-history` in its `data_dir`: a daemon that serves and crashes
-  again and again is fenced on its failure count, as before;
+A boot without the marker that finds `boot-awaiting-serving` (the daemon
+before it never served; a post-upgrade boot leaves the file too), or that
+follows 3 others within 10 minutes, counted in `boot-unclean-history` in its
+`data_dir`, has no evidence that a daemon served. It never records the host
+`active` before it serves:
+
+- recorded `upgrading`, at any age, or recorded `active` after 3 unclean boots
+  within 10 minutes: the boot makes no write. The host keeps its recorded
+  state, so a daemon that crash-loops is `upgrading` once and is fenced 2
+  minutes after that write, and a flapping one recorded `active` is judged on
+  its failure count. Once the daemon serves, its version and resources are
+  written with `active`, only while the host is still recorded as the boot
+  found it;
+- recorded `active` after a boot that never served (that boot's `upgrading`
+  write did not land, as with a WAL-quarantined daemon): it records the host
+  `upgrading` until it serves;
+- recorded anything else: `active`, as below.
+
+Each of these boots `active`, as before:
+
 - a host that was not `active` when it was stopped. A fenced, offline or
   maintenance host keeps that state through the SIGTERM, and a draining one is
   recorded `upgrading` for the restart, as before;
-- a stop, or an `upgrading` state without the marker, 2 minutes old or more.
-  A WAL-quarantined daemon writes nothing, so after a quarantine that lasted
-  longer than that, the next boot records the host `active` and can be
-  fenced before it serves;
+- a stop, or an `upgrading` state without the marker, 2 minutes old or more,
+  at a boot after a daemon that served. A WAL-quarantined daemon writes
+  nothing, so after a quarantined daemon that served and ran longer than
+  that, the next boot records the host `active` and can be fenced before it
+  serves;
 - a host recorded as something other than `upgrading` by the time it boots
   (without the marker: other than `active` or `upgrading`).
 
-Recording the host `active` once it serves changes only an `upgrading` host,
-and never its isolation.
+Recording the host `active` once it serves changes only an `upgrading` host
+(after a boot that made no write, only a host still recorded as that boot
+found it), and never its isolation.
 
 A host the coordinator has already fenced that then records itself
 `upgrading` (it rebooted, and its boot write was made from a replica that still

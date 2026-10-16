@@ -140,7 +140,10 @@ func (d *Daemon) confirmUpgradeHealthy(binaryPath string) {
 // host is LEFT 'upgrading', and the failover coordinator fences it once
 // hostboot.UpgradingTimeout has passed since the boot write: a daemon that
 // cannot serve is a failed host.
-func (d *Daemon) awaitServingThenActivate(ctx context.Context) {
+//
+// confirm records the host active once it serves; nil is ConfirmServing (or
+// the test hook), a deferred boot's is ConfirmServingReport.
+func (d *Daemon) awaitServingThenActivate(ctx context.Context, confirm confirmFunc) {
 	deadline := time.Duration(d.cfg.UpgradeHealthDeadlineSec) * time.Second
 	if deadline <= 0 {
 		deadline = 120 * time.Second
@@ -152,12 +155,16 @@ func (d *Daemon) awaitServingThenActivate(ctx context.Context) {
 		slog.Warn("restart: cannot build the local gRPC client to confirm serving; recording the host active now", "error", err)
 		// The awaiting-serving note stays: nothing showed this daemon serves,
 		// so the next crash boots 'active', as before this check existed.
-		d.confirmActive(ctx, &unconfirmed{}, false)
+		d.confirmActiveWith(ctx, &unconfirmed{}, false, confirm)
 		return
 	}
 	defer closeFn()
-	d.activateOnceServing(ctx, client, deadline)
+	d.activateOnceServingWith(ctx, client, deadline, confirm)
 }
+
+// confirmFunc records the host active once this daemon serves:
+// hostboot.ConfirmServing, or a deferred boot's ConfirmServingReport.
+type confirmFunc func(ctx context.Context) (bool, string, error)
 
 // awaitServingThenNote is the boot that follows one that never served, and is
 // recorded active at once (hostboot.BootState): once this daemon answers its
@@ -204,6 +211,12 @@ func (d *Daemon) dialSelf() (pinger, func(), error) {
 // host raises upgrading_unconfirmed about itself (noteUnconfirmed), so that
 // case is visible.
 func (d *Daemon) activateOnceServing(ctx context.Context, client pinger, deadline time.Duration) {
+	d.activateOnceServingWith(ctx, client, deadline, nil)
+}
+
+// activateOnceServingWith is activateOnceServing recording the host active
+// with confirm (nil: ConfirmServing).
+func (d *Daemon) activateOnceServingWith(ctx context.Context, client pinger, deadline time.Duration, confirm confirmFunc) {
 	start := time.Now()
 	checked := start
 	var u unconfirmed
@@ -238,7 +251,7 @@ func (d *Daemon) activateOnceServing(ctx context.Context, client pinger, deadlin
 	if logged {
 		slog.Info("restart: this daemon answered its own Ping after the deadline", "deadline", deadline)
 	}
-	d.confirmActive(ctx, &u, true)
+	d.confirmActiveWith(ctx, &u, true, confirm)
 }
 
 // unconfirmedCheckEvery is how often a ping loop that is not answered reads
@@ -272,7 +285,15 @@ var unconfirmedAfter = hostboot.UpgradingTimeout
 // did, because a WAL-quarantined daemon's write is refused on every attempt
 // and must not make the boot after it 'active'.
 func (d *Daemon) confirmActive(ctx context.Context, u *unconfirmed, served bool) {
-	confirm := d.confirmServing
+	d.confirmActiveWith(ctx, u, served, nil)
+}
+
+// confirmActiveWith is confirmActive recording the host active with confirm:
+// nil is the confirmServing test hook, or else hostboot.ConfirmServing.
+func (d *Daemon) confirmActiveWith(ctx context.Context, u *unconfirmed, served bool, confirm confirmFunc) {
+	if confirm == nil {
+		confirm = d.confirmServing
+	}
 	if confirm == nil {
 		confirm = func(ctx context.Context) (bool, string, error) {
 			return hostboot.ConfirmServing(ctx, d.db, d.cfg.HostName)
@@ -287,7 +308,7 @@ func (d *Daemon) confirmActive(ctx context.Context, u *unconfirmed, served bool)
 			hostboot.Served(d.cfg.DataDir)
 		}
 		switch {
-		case errors.Is(err, hostboot.ErrNotUpgrading):
+		case errors.Is(err, hostboot.ErrNotUpgrading), errors.Is(err, hostboot.ErrMovedOn):
 			slog.Info("restart: serving; host is recorded as something other than upgrading, leaving it", "state", state)
 			d.clearUnconfirmed(u)
 			return

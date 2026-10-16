@@ -248,17 +248,29 @@ const localMaxRecvMsgSize = 256 << 20
 // served checks too, so that once this daemon serves the next crash awaits
 // serving again (hostboot.Served).
 //
+// A deferred boot (hostboot.Boot.Deferred: no evidence this daemon served
+// since an earlier boot awaited it) makes no write at boot: the host keeps the
+// state the cluster records, and the boot report is written with 'active'
+// once this daemon serves (hostboot.ConfirmServingReport).
+//
 // On a WAL-quarantined daemon both writes are refused by the replicated write
 // path, as every write is: the host stays as the cluster recorded it.
 func (d *Daemon) writeBootState(ctx context.Context, cpus, memMiB, diskGiB int, hasResources bool) {
 	boot := hostboot.BootState(ctx, d.db, d.cfg.HostName, d.cfg.DataDir, d.upgradePending, time.Now())
-	slog.Info("boot state", "state", boot.State, "await_serving", boot.AwaitServing, "reason", boot.Reason)
+	slog.Info("boot state", "state", boot.State, "await_serving", boot.AwaitServing, "deferred", boot.Deferred, "reason", boot.Reason)
+	if boot.Deferred {
+		r := hostboot.Report{Version: d.cfg.Version, CPUs: cpus, MemMiB: memMiB, DiskGiB: diskGiB, HasResources: hasResources}
+		go d.awaitServingThenActivate(ctx, func(ctx context.Context) (bool, string, error) {
+			return hostboot.ConfirmServingReport(ctx, d.db, d.cfg.HostName, boot.State, r)
+		})
+		return
+	}
 	if err := corrosion.UpdateHostStartup(ctx, d.db, d.cfg.HostName, boot.State, d.cfg.Version, cpus, memMiB, diskGiB, hasResources); err != nil {
 		slog.Warn("failed to write host startup state", "error", err)
 	}
 	switch {
 	case boot.AwaitServing:
-		go d.awaitServingThenActivate(ctx)
+		go d.awaitServingThenActivate(ctx, nil)
 	case d.cfg.DataDir != "":
 		if _, err := os.Lstat(hostboot.AwaitingPath(d.cfg.DataDir)); err == nil {
 			go d.awaitServingThenNote(ctx)

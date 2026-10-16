@@ -109,6 +109,11 @@ type quarantine struct {
 	emptySets map[string]bool // missing sets rendered empty
 	degraded  map[string]bool // sets rendered without some of their elements
 	invalid   []InvalidRow
+	// ownRef is the tag group set the row being judged names because the
+	// tag pass rewrote its tag:<g> (tagPass.rule), "" for any other row. Only
+	// that reference is exempt from userSetName: a row written as @lv_tg_<g>
+	// is a user set reference and is left out (D5a fix I-1).
+	ownRef string
 
 	now       time.Time
 	emptyPrev map[string]time.Time // rows rendered against a missing set, since
@@ -230,7 +235,7 @@ func (q *quarantine) unreadable(r Rule, action string) string {
 		if !rulefield.SetRefOpOK(op) {
 			reasons = append(reasons, fmt.Sprintf("cidr %q compares a set with %s, which nft refuses", r.CIDR, op))
 		}
-		if err := userSetName(name); err != nil {
+		if err := userSetName(name); err != nil && (q.ownRef == "" || name != q.ownRef) {
 			reasons = append(reasons, err.Error())
 		} else if base, isComp := strings.CutSuffix(name, ipv6SetSuffix); isComp && q.v6Sets[base] && !q.knownSets[name] {
 			reasons = append(reasons, fmt.Sprintf("cidr %q names the IPv6 companion of set %q; reference the set itself", r.CIDR, base))

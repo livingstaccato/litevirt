@@ -647,17 +647,14 @@ func TestTagGroupLoader_AnUnreadableGroupNeverReadHoldsEveryTaggedWorkload(t *te
 
 // A deny on a tag group that lives in ANOTHER host's host tier still widens
 // the unreadable-tags hold here: that host's chains match this workload's
-// address too (D4 review I-2). So does a direct, positive @lv_tg_<g> deny
-// (I-3).
+// address too (D4 review I-2). (A direct @lv_tg_<g> reference is a user set
+// reference, left out: TestTagGroupLoader_ADirectReferenceIsLeftOut.)
 //
-// Mutations: read only this host's host rules — red; no denyRef from a
-// direct reference — red.
+// Mutation: read only this host's host rules — red.
 func TestTagGroupLoader_AnyHostsDenyOrADirectReferenceWidensTheHold(t *testing.T) {
 	for _, tc := range []struct{ name, sql string }{
 		{"another host's host rule", `INSERT INTO host_firewall_rules (id, host_name, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)
 			VALUES ('h1', 'host-b', 'ingress', 'tcp', '22', 'tag:web', 'drop', 100, '', '', 't', 't')`},
-		{"a direct set reference", `INSERT INTO cluster_firewall_rules (id, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)
-			VALUES ('c1', 'ingress', 'tcp', '22', '@lv_tg_web', 'drop', 100, '', '', 't', 't')`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			l := newTGLab(t)
@@ -675,25 +672,83 @@ func TestTagGroupLoader_AnyHostsDenyOrADirectReferenceWidensTheHold(t *testing.T
 	}
 }
 
-// A negated accept against a group's set (!= @lv_tg_<g>) would admit every
-// workload whose membership cannot be proven: it is left out and reported
-// (D4 review I-3).
+// A rule written as a direct reference to a group's set, positive or
+// negated, accept or deny, is a reference to a user set with litevirt's
+// reserved prefix (userSetName): it is left out and reported, as integration's
+// set-freeze leaves out every such reference. Only the tag pass's own
+// rewriting of tag:<g> names the set (D5a fix I-1).
 //
-// Mutation: render it — red.
-func TestTagGroupLoader_ANegatedAcceptOnAGroupsSetIsLeftOut(t *testing.T) {
+// Mutation: exempt every reference to a rendered group's set from
+// userSetName (by name, not by row) — the direct references render, red.
+func TestTagGroupLoader_ADirectReferenceIsLeftOut(t *testing.T) {
 	l := newTGLab(t)
 	l.group("web", webGroup)
 	l.clusterRule("c1", "tcp", "80", "!= @lv_tg_web", "accept")
 	l.clusterRule("c2", "tcp", "81", "!= @lv_tg_web", "drop")
+	l.clusterRule("c3", "tcp", "82", "@lv_tg_web", "drop")
+	l.clusterRule("c4", "tcp", "83", "@lv_tg_web", "accept")
 	plan, script := l.load(l.loader("host-a", nil))
-	if strings.Contains(script, "dport 80") {
-		t.Errorf("the negated accept was rendered:\n%s", script)
+	for _, port := range []string{"dport 80", "dport 81", "dport 82", "dport 83"} {
+		if strings.Contains(script, port) {
+			t.Errorf("a direct reference (%s) was rendered:\n%s", port, script)
+		}
 	}
-	if !strings.Contains(script, "tcp dport 81 ip saddr != @lv_tg_web drop") {
-		t.Errorf("a negated drop was not kept:\n%s", script)
+	var ids []string
+	for _, r := range plan.InvalidRows {
+		if !strings.Contains(r.Reason, `"lv_"`) {
+			t.Errorf("%s: reason %q, want the reserved prefix", r.ID, r.Reason)
+		}
+		ids = append(ids, r.ID)
 	}
-	if len(plan.InvalidRows) != 1 || plan.InvalidRows[0].ID != "c1" {
-		t.Errorf("invalid rows %+v, want c1", plan.InvalidRows)
+	if slices.Sort(ids); !slices.Equal(ids, []string{"c1", "c2", "c3", "c4"}) {
+		t.Errorf("invalid rows %+v, want c1-c4", plan.InvalidRows)
+	}
+}
+
+// D5a fix I-1: on the merged tree the loader's reserved-name check
+// (userSetName) refuses a reference to lv_tg_*, and the tag pass rewrites
+// tag:<g> to exactly such a reference. Its own rewriting is exempt — the
+// tag: accept and deny render against the group's set in every tier, are not
+// reported, and a kept-last rendering of a tag: row stays renderable —
+// while a direct @lv_tg_<g> in the same plan is still left out.
+//
+// Mutations: no exemption — the tag: drop is left out (fail open), red;
+// exempt by set name rather than by row — the direct reference renders, red.
+func TestTagGroupLoader_TagRewriteIsExemptFromTheReservedName(t *testing.T) {
+	l := newTGLab(t)
+	l.group("web", webGroup)
+	l.vm("web-1", "host-a", tgFWID(1))
+	l.nic("web-1", "prod", "52:54:00:00:00:01", "tap1", "10.0.0.5")
+	l.tags("vm", tgFWID(1), `{"tags":{"role":"web"}}`)
+	l.vm("db", "host-a", "")
+	l.nic("db", "prod", "52:54:00:00:00:09", "tap9", "10.0.0.9", "db")
+	l.sg("sg-db", "db", [4]string{"tcp", "22", "tag:web", "drop"})
+	l.clusterRule("c-acc", "tcp", "443", "tag:web", "accept")
+	l.clusterRule("c-drop", "tcp", "25", "tag:web", "drop")
+	l.clusterRule("c-direct", "tcp", "26", "@lv_tg_web", "drop")
+	load := l.loader("host-a", nil)
+	plan, script := l.load(load)
+	mustContainAll(t, script,
+		"oifname tap9 tcp dport 22 ip saddr @lv_tg_web counter",
+		"tcp dport 443 ip saddr @lv_tg_web accept",
+		"tcp dport 25 ip saddr @lv_tg_web drop",
+	)
+	if strings.Contains(script, "dport 26") {
+		t.Errorf("the direct reference rendered:\n%s", script)
+	}
+	if len(plan.InvalidRows) != 1 || plan.InvalidRows[0].ID != "c-direct" {
+		t.Errorf("invalid rows %+v, want only c-direct", plan.InvalidRows)
+	}
+
+	// The tag: drop's row turns unreadable: its last rendering, which names
+	// the group's set, is kept.
+	rawRow(t, l.db, `UPDATE cluster_firewall_rules SET proto = 'tcp;x' WHERE id = 'c-drop'`)
+	plan, script = l.load(load)
+	if !strings.Contains(script, "tcp dport 25 ip saddr @lv_tg_web drop") {
+		t.Errorf("the kept-last tag: drop was not rendered:\n%s", script)
+	}
+	if r, ok := invalidRow(plan, "cluster_firewall_rules", "c-drop"); !ok || r.Handling != HandlingKeptLast {
+		t.Errorf("c-drop: %+v, %v; want kept last", r, ok)
 	}
 }
 

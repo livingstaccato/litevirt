@@ -114,6 +114,12 @@ func TestKernelChild_TagGroupsHoldOnTheWire(t *testing.T) {
 		return plan
 	}
 	plan := apply()
+	// The tag: drop is rendered against the group's set, not left out by
+	// the loader's reserved-name check (D5a fix I-1): left out, the member
+	// would reach gb.
+	if r, left := invalidRow(plan, "sg_rules", "r1"); left {
+		t.Fatalf("tag:web drop was left out: %+v", r)
+	}
 	if len(plan.TagGroups.SharedIdentity) != 1 || len(plan.InvalidRows) != 0 {
 		t.Fatalf("premise: report %+v, invalid rows %+v", plan.TagGroups, plan.InvalidRows)
 	}
@@ -130,7 +136,7 @@ func TestKernelChild_TagGroupsHoldOnTheWire(t *testing.T) {
 		from, to string
 		want     bool
 	}{
-		{"a member, into a NIC that drops the group", "ga", "10.20.0.2", false},
+		{"a member, into a NIC whose tag:web drop names the group (I-1)", "ga", "10.20.0.2", false},
 		{"no member, into that NIC", "gc", "10.20.0.2", true},
 		{"into a NIC held for a shared identity", "gc", "10.20.0.5", false},
 		{"a member, elsewhere", "ga", "10.20.0.3", true},

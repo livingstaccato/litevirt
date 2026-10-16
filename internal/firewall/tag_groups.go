@@ -333,8 +333,14 @@ func cutPrefixFold(s, prefix string) (string, bool) {
 // rule is quarantine.rule for one stored row, with its tag-group reference
 // resolved first, and false when the row is left out.
 func (t *tagPass) rule(q *quarantine, table, id, direction, proto, port, cidr, action, comment string) (Rule, bool) {
+	ownRef := ""
 	if name, ok, valid := tagRef(cidr); ok {
 		set := TagGroupSetPrefix + name
+		if valid {
+			// This row's renderings, this pass's and any kept from an
+			// earlier one, name the group's set because it says tag:<name>.
+			ownRef = set
+		}
 		switch {
 		case valid && t.readable[name]:
 			cidr = "@" + set
@@ -369,7 +375,9 @@ func (t *tagPass) rule(q *quarantine, table, id, direction, proto, port, cidr, a
 			cidr = ""
 		}
 	}
+	q.ownRef = ownRef
 	r, ok := q.rule(table, id, direction, proto, port, cidr, action, comment)
+	q.ownRef = ""
 	if !ok {
 		return r, false
 	}

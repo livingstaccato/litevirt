@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"maps"
 	"slices"
@@ -26,8 +27,9 @@ import (
 // tag set or rm mints the identity first (corrosion.MintFirewallID), on the
 // workload's OWNER: the mint keeps the identity the row holds unless another
 // live row holds the same one (a copy), and then mints a fresh one and
-// abandons the copied id, whose tags row is cleared here so the copy, now its
-// only holder, inherits nothing. The write needs sg.write at the cluster root
+// abandons the copied id, whose tags row is cleared here first so the copy,
+// now its only holder, inherits nothing; the answer names the identity
+// replaced and the tags dropped. The write needs sg.write at the cluster root
 // (fwTagAuthority) and waits for the firewall_tag_groups release latch.
 
 // fwTagKind maps the request's kind onto the store's.
@@ -119,6 +121,9 @@ func (s *Server) SetFirewallTags(ctx context.Context, req *pb.SetFirewallTagsReq
 			return nil, status.Errorf(codes.InvalidArgument, "tag key %q: want [a-z0-9][a-z0-9_.-]{0,62}", k)
 		}
 	}
+	if len(req.GetSet()) > corrosion.MaxFirewallTags {
+		return nil, status.Errorf(codes.InvalidArgument, "%d tags: a workload holds at most %d", len(req.GetSet()), corrosion.MaxFirewallTags)
+	}
 	if err := s.ReleaseFeatureRefusal(ctx, capabilities.FeatureFirewallTagGroups); err != nil {
 		return nil, err
 	}
@@ -157,25 +162,52 @@ func (s *Server) SetFirewallTags(ctx context.Context, req *pb.SetFirewallTagsReq
 		return c.SetFirewallTags(metadata.AppendToOutgoingContext(ctx, repairActorMDKey, actor), fwd)
 	}
 
+	// One tag set of a workload at a time on its owner: each reads the row,
+	// merges, and writes it whole, so two at once would lose one (D3 review
+	// m-2).
+	defer s.lockFirewallTags(kind, host, name)()
+
 	action := "firewall.tag.rm"
 	if len(req.GetSet()) > 0 {
 		action = "firewall.tag.set"
 	}
-	var id, abandoned, before string
-	var after map[string]string
+	var id, replaced, before string
+	var after, dropped map[string]string
 	err = s.WithReleaseFeature(ctx, capabilities.FeatureFirewallTagGroups, func(ctx context.Context, g capabilities.FeatureGrant) error {
-		var err error
+		// A copied identity (another live workload holds it too) is replaced
+		// by the mint, and its tags must go with neither holder. They are
+		// cleared BEFORE the mint (D3 review I-1): a failed clear then leaves
+		// both holders sharing the identity (held at drop), and a retry finds
+		// the copy again; cleared after a committed mint, the other holder
+		// would keep them for good.
+		copied, err := corrosion.CopiedFirewallID(ctx, s.db, kind, host, name)
+		if err != nil {
+			return fwTagMintError(err)
+		}
+		if copied != "" {
+			if dropped, err = s.clearCopiedFirewallTags(ctx, g, kind, copied); err != nil {
+				return status.Errorf(codes.Internal,
+					"%s %q holds firewall identity %s, which another live %s holds too (a copy); clearing that identity's tags "+
+						"failed, and nothing was changed: retry: %v", pbFWTagKind(kind), name, copied, pbFWTagKind(kind), err)
+			}
+		}
+		var abandoned string
 		id, abandoned, err = corrosion.MintFirewallID(ctx, s.db, g, kind, host, name)
 		if err != nil {
 			return fwTagMintError(err)
 		}
-		if abandoned != "" {
-			// The copied id stays with the other holder: its tags must not.
-			if err := corrosion.ClearFirewallTags(ctx, s.db, g, kind, abandoned); err != nil {
+		replaced = abandoned
+		if abandoned != "" && abandoned != copied {
+			// The copy appeared between the check and the mint: the mint has
+			// committed, so this clear must not be cut short by the caller.
+			more, err := s.clearCopiedFirewallTags(context.WithoutCancel(ctx), g, kind, abandoned)
+			if err != nil {
 				return status.Errorf(codes.Internal,
 					"%s %q held a copied firewall identity %s, now replaced by %s; clearing the copied identity's tags failed, "+
-						"so the other holder keeps them until the orphan sweep: %v", pbFWTagKind(kind), name, abandoned, id, err)
+						"so the other %s holding it keeps them: remove them there with lv firewall tag rm: %v",
+					pbFWTagKind(kind), name, abandoned, id, pbFWTagKind(kind), err)
 			}
+			dropped = more
 		}
 		cur, _, err := corrosion.ResolveFirewallTags(ctx, s.db, kind, id)
 		if err != nil {
@@ -195,6 +227,13 @@ func (s *Server) SetFirewallTags(ctx context.Context, req *pb.SetFirewallTagsReq
 		for _, k := range req.GetRemove() {
 			delete(after, k)
 		}
+		if len(after) > corrosion.MaxFirewallTags {
+			return status.Errorf(codes.InvalidArgument, "%s %q would hold %d firewall tags; a workload holds at most %d",
+				pbFWTagKind(kind), name, len(after), corrosion.MaxFirewallTags)
+		}
+		if s.testFirewallTagsBeforeWrite != nil {
+			s.testFirewallTagsBeforeWrite()
+		}
 		if err := corrosion.SetFirewallTags(ctx, s.db, g, auth, kind, id, after, name, host, actor); err != nil {
 			if errors.Is(err, corrosion.ErrClusterPolicyGateClosed) {
 				return status.Errorf(codes.FailedPrecondition, "%v", err)
@@ -207,16 +246,45 @@ func (s *Server) SetFirewallTags(ctx context.Context, req *pb.SetFirewallTagsReq
 		return nil, err
 	}
 	detail := "fw_id=" + id
-	if abandoned != "" {
-		detail += " replaced_copied_fw_id=" + abandoned
+	if replaced != "" {
+		detail += " replaced_copied_fw_id=" + replaced
+	}
+	if dropped != nil {
+		detail += " dropped=" + fwTagsText(dropped)
 	}
 	s.auditAs(ctx, actor, action, fwTagTarget(kind, host, name), detail+" "+corrosion.AuditChange(before, fwTagsText(after)), "ok")
 	s.reconcileLocal(ctx)
-	out := &pb.FirewallTags{Kind: pbFWTagKind(kind), Workload: name, Host: host, FwId: id, Tags: after, SetBy: actor}
+	out := &pb.FirewallTags{Kind: pbFWTagKind(kind), Workload: name, Host: host, FwId: id, Tags: after, SetBy: actor,
+		ReplacedFwId: replaced, DroppedTags: dropped}
 	if rec, ok, err := corrosion.ResolveFirewallTags(ctx, s.db, kind, id); err == nil && ok {
 		out.UpdatedAt = rec.UpdatedAt
 	}
 	return out, nil
+}
+
+// lockFirewallTags takes the tag-set lock of one workload and returns its
+// release. Workloads share a lock by hash, which only serializes more.
+func (s *Server) lockFirewallTags(kind, host, name string) func() {
+	h := fnv.New32a()
+	h.Write([]byte(kind + "/" + host + "/" + name))
+	mu := &s.fwTagLocks[h.Sum32()%uint32(len(s.fwTagLocks))]
+	mu.Lock()
+	return mu.Unlock
+}
+
+// clearCopiedFirewallTags clears the tags row of a copied identity a tag set
+// replaces, and returns the tags it held (none when it was unreadable).
+func (s *Server) clearCopiedFirewallTags(ctx context.Context, g capabilities.FeatureGrant, kind, fwID string) (map[string]string, error) {
+	var held map[string]string
+	if rec, ok, err := corrosion.ResolveFirewallTags(ctx, s.db, kind, fwID); err != nil {
+		return nil, err
+	} else if ok && !rec.Unreadable {
+		held = rec.Tags
+	}
+	if err := s.clearFirewallTagsHook(ctx, g, kind, fwID); err != nil {
+		return nil, err
+	}
+	return held, nil
 }
 
 // hasRepairActor reports whether ctx carries a forwarding entry node's actor.
@@ -331,12 +399,17 @@ func (s *Server) ListFirewallTags(ctx context.Context, req *pb.ListFirewallTagsR
 const fwTagClearGateTimeout = 10 * time.Second
 
 // clearDeletedFirewallTags clears the tags row of a workload a plain delete
-// removed (spec §4.3): unconditionally once firewall_tag_groups is recorded
-// used here — whatever this replica holds for the row, which may lag the
-// write — and never before (no row can exist anywhere then, and a clear must
-// not be a first use). A failure is logged; the delete stands, and the orphan
-// sweep clears the row within its grace. Moves and re-creates never call it.
-func (s *Server) clearDeletedFirewallTags(ctx context.Context, kind, name, fwID string) {
+// removed (a VM: name; a container: host and name; spec §4.3) once
+// firewall_tag_groups is recorded used here — whatever this replica holds for
+// the row, which may lag the write — and never before (no row can exist
+// anywhere then, and a clear must not be a first use). It skips the clear
+// when another live row of the kind holds the identity here (the other side
+// of a move pair, or a copy: controller ruling "delete clear vs a shared
+// identity"): that workload keeps its tags, and the orphan sweep clears the
+// row once no live row holds it. A failure is logged; the delete stands, and
+// the orphan sweep clears the row within its grace. Moves and re-creates
+// never call it.
+func (s *Server) clearDeletedFirewallTags(ctx context.Context, kind, host, name, fwID string) {
 	if fwID == "" {
 		return
 	}
@@ -345,6 +418,16 @@ func (s *Server) clearDeletedFirewallTags(ctx context.Context, kind, name, fwID 
 		if err != nil {
 			slog.Warn("delete: could not read whether firewall tags are in use; the orphan sweep clears the deleted workload's tags",
 				"kind", kind, "name", name, "fw_id", fwID, "error", err)
+		}
+		return
+	}
+	if held, err := corrosion.FirewallIDHeldByAnother(ctx, s.db, kind, host, name, fwID); err != nil || held {
+		if err != nil {
+			slog.Warn("delete: could not read whether another workload holds the deleted one's firewall identity; "+
+				"its tags are left to the orphan sweep", "kind", kind, "host", host, "name", name, "fw_id", fwID, "error", err)
+		} else {
+			slog.Info("delete: another live workload holds the deleted one's firewall identity; its tags stay",
+				"kind", kind, "host", host, "name", name, "fw_id", fwID)
 		}
 		return
 	}

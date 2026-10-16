@@ -2815,7 +2815,7 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	if err == nil {
 		// A deleted VM's partial-recovery marker goes with it (review N5).
 		s.clearPromotedPartial(ctx, req.Name)
-		s.clearDeletedFirewallTags(ctx, corrosion.TagMemberVM, req.Name, fwID)
+		s.clearDeletedFirewallTags(ctx, corrosion.TagMemberVM, "", req.Name, fwID)
 	}
 	if err == nil && len(luns) > 0 && !s.lunPlainDeleteRecordable(ctx) &&
 		s.ReleaseFeatureAvailable(capabilities.FeatureISCSILUNClaim) {

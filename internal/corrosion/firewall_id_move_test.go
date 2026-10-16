@@ -440,3 +440,54 @@ func TestMintFirewallID_AnAmbiguousPairNamesTheRowWithoutTheLeases(t *testing.T)
 		t.Fatalf("mint over an ambiguous pair with no leases: %v, want the generic remedy", err)
 	}
 }
+
+// CopiedFirewallID names the identity a tag set's mint would replace as a
+// copy, writing nothing, and refuses as the mint does, so a caller clearing
+// that identity's tags first never clears an open move pair's (D3 review
+// I-1): a copy (no move columns) is named; a unique id, or none, is not; a
+// moving container, a busy row and a container with no create spec are
+// refused.
+//
+// Mutations: drop the move check — the moving pair is named as a copy: red;
+// name the id whoever holds it — the unique one is named: red.
+func TestCopiedFirewallID(t *testing.T) {
+	f := newTagGroupFixture(t)
+	ctx := context.Background()
+	f.moveCT("node-1", "copy", tgID(1), "running", "", "")
+	f.moveCT("node-2", "copy", tgID(1), "running", "", "")
+	f.moveCT("node-1", "mig", tgID(2), "stopped", "operator-stop", "")
+	f.moveCT("node-2", "mig", tgID(2), "running", "", "tok-m")
+	f.relocationProof("p-m", "mig", "node-2", "node-1", "tok-m", "in_progress", false)
+	f.moveCT("node-1", "own", tgID(3), "running", "", "")
+	if got, err := CopiedFirewallID(ctx, f.c, TagMemberCT, "node-2", "copy"); err != nil || got != tgID(1) {
+		t.Errorf("a copy: (%q, %v), want %s", got, err, tgID(1))
+	}
+	if got, err := CopiedFirewallID(ctx, f.c, TagMemberCT, "node-1", "own"); err != nil || got != "" {
+		t.Errorf("a unique id: (%q, %v), want none", got, err)
+	}
+	if got, err := CopiedFirewallID(ctx, f.c, TagMemberCT, "node-2", "mig"); !errors.Is(err, ErrFirewallIDMoveOpen) || got != "" {
+		t.Errorf("an open move's target: (%q, %v), want ErrFirewallIDMoveOpen", got, err)
+	}
+	mustExec(t, f.c, `INSERT INTO containers (host_name, name, state, created_at, updated_at) VALUES ('node-1', 'old', 'running', 't', 't')`)
+	if _, err := CopiedFirewallID(ctx, f.c, TagMemberCT, "node-1", "old"); !errors.Is(err, ErrFirewallIDNoCreateSpec) {
+		t.Errorf("no create spec: %v", err)
+	}
+	mustExec(t, f.c, `UPDATE containers SET active_operation_id = 'op-1' WHERE host_name = 'node-1' AND name = 'copy'`)
+	if _, err := CopiedFirewallID(ctx, f.c, TagMemberCT, "node-1", "copy"); !errors.Is(err, ErrFirewallIDNotMinted) {
+		t.Errorf("a busy container: %v", err)
+	}
+	for _, n := range []string{"web", "twin", "solo", "bare"} {
+		spec := fmt.Sprintf(`{"name":%q,"firewall_id":%q}`, n, tgID(4))
+		if n == "solo" {
+			spec = fmt.Sprintf(`{"name":"solo","firewall_id":%q}`, tgID(5))
+		} else if n == "bare" {
+			spec = `{"name":"bare"}`
+		}
+		mustExec(t, f.c, `INSERT INTO vms (name, host_name, state, spec, created_at, updated_at) VALUES (?, 'node-1', 'running', ?, 't', 't')`, n, spec)
+	}
+	for name, want := range map[string]string{"web": tgID(4), "solo": "", "bare": ""} {
+		if got, err := CopiedFirewallID(ctx, f.c, TagMemberVM, "", name); err != nil || got != want {
+			t.Errorf("VM %s: (%q, %v), want %q", name, got, err, want)
+		}
+	}
+}

@@ -47,12 +47,14 @@ type mockClient struct {
 
 	// Firewall tags (firewall_tag_test.go): fwTags answers ListFirewallTags
 	// (nil: Unimplemented, an older daemon), fwTagsSetReq records the last
-	// SetFirewallTags, fwTagsLeft is the cutover's tags-left header.
-	fwTags       []*pb.FirewallTags
-	fwTagsErr    error
-	fwTagsSetReq *pb.SetFirewallTagsRequest
-	fwTagsLsReq  *pb.ListFirewallTagsRequest
-	fwTagsLeft   string
+	// SetFirewallTags, fwTagsLeft is the cutover's tags-left header, and
+	// fwTagsSetExtra is merged into SetFirewallTags' answer.
+	fwTags         []*pb.FirewallTags
+	fwTagsErr      error
+	fwTagsSetReq   *pb.SetFirewallTagsRequest
+	fwTagsLsReq    *pb.ListFirewallTagsRequest
+	fwTagsLeft     string
+	fwTagsSetExtra *pb.FirewallTags
 
 	// Canned responses
 	vms          []*pb.VM

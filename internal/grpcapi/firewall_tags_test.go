@@ -3,9 +3,11 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -175,12 +177,103 @@ func TestSetFirewallTags_MintsOnEveryCallAndClearsACopiedID(t *testing.T) {
 	if v, _ := tagsRowValue(t, s, corrosion.TagMemberVM, fwA); v != "" {
 		t.Fatalf("the copied identity's tags row still holds %q", v)
 	}
-	wantAudit(t, s, "firewall.tag.set", "admin", "web", "fw_id="+id+" replaced_copied_fw_id="+fwA+" before=none after={role=web}")
+	if out.GetReplacedFwId() != fwA || !maps.Equal(out.GetDroppedTags(), map[string]string{"role": "db"}) {
+		t.Fatalf("the answer does not name the copied identity and its tags (D3 review m-6): replaced %q dropped %v",
+			out.GetReplacedFwId(), out.GetDroppedTags())
+	}
+	wantAudit(t, s, "firewall.tag.set", "admin", "web", "fw_id="+id+" replaced_copied_fw_id="+fwA+" dropped={role=db} before=none after={role=web}")
 	if _, err := s.SetFirewallTags(adminCtx(), &pb.SetFirewallTagsRequest{Kind: "vm", Workload: "web", Set: map[string]string{"env": "prod"}}); err != nil {
 		t.Fatal(err)
 	}
 	if again := vmFWID(t, s, "web"); again != id {
 		t.Fatalf("a second tag set changed the identity %q -> %q", id, again)
+	}
+}
+
+// The copied identity's tags are cleared BEFORE the mint (D3 review I-1): when
+// that clear fails, the request fails and nothing changes (the VM keeps the
+// copied id, the row its tags), so a retry finds the copy again, clears, and
+// mints.
+//
+// Mutation: mint first, then clear — the failed request has already
+// replaced the identity, and the retry no longer sees the copy: red.
+func TestSetFirewallTags_AFailedCopiedClearChangesNothingAndARetryCompletes(t *testing.T) {
+	s, _ := tagsServer(t)
+	for _, n := range []string{"web", "copy"} {
+		insertTestVM(t, adminCtx(), s.db, n, s.hostName, "running")
+		setVMSpec(t, s, n, `{"name":"`+n+`","firewall_id":"`+fwA+`"}`)
+	}
+	seedTagsFor(t, s, corrosion.TagMemberVM, fwA, map[string]string{"role": "db"}, "copy", "")
+	s.testClearFirewallTags = func(context.Context, string, string) error { return errors.New("client went away") }
+	_, err := s.SetFirewallTags(adminCtx(), &pb.SetFirewallTagsRequest{Kind: "vm", Workload: "web", Set: map[string]string{"role": "web"}})
+	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "nothing was changed: retry") {
+		t.Fatalf("a failed copied clear: %v", err)
+	}
+	if id := vmFWID(t, s, "web"); id != fwA {
+		t.Fatalf("a failed copied clear still minted: %q", id)
+	}
+	if v, _ := tagsRowValue(t, s, corrosion.TagMemberVM, fwA); !strings.Contains(v, `"role":"db"`) {
+		t.Fatalf("premise: the failed clear wrote %q", v)
+	}
+
+	s.testClearFirewallTags = nil
+	out, err := s.SetFirewallTags(adminCtx(), &pb.SetFirewallTagsRequest{Kind: "vm", Workload: "web", Set: map[string]string{"role": "web"}})
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if id := vmFWID(t, s, "web"); id == fwA || id != out.GetFwId() || out.GetReplacedFwId() != fwA {
+		t.Fatalf("retry: identity %q, answer %+v", id, out)
+	}
+	if v, _ := tagsRowValue(t, s, corrosion.TagMemberVM, fwA); v != "" {
+		t.Fatalf("after the retry the copied identity's row holds %q", v)
+	}
+}
+
+// Two tag sets of one workload at once keep both updates (D3 review m-2): the
+// second waits while the first holds the row between its read and its write.
+//
+// Mutation: drop the per-workload lock — the second writes from the same
+// read, and the first then overwrites it: red.
+func TestSetFirewallTags_ConcurrentSetsLoseNothing(t *testing.T) {
+	s, _ := tagsServer(t)
+	insertTestVM(t, adminCtx(), s.db, "web", s.hostName, "running")
+	set := func(k, v string) error {
+		_, err := s.SetFirewallTags(adminCtx(), &pb.SetFirewallTagsRequest{Kind: "vm", Workload: "web", Set: map[string]string{k: v}})
+		return err
+	}
+	if err := set("x", "1"); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	inWindow, release := make(chan struct{}), make(chan struct{})
+	s.testFirewallTagsBeforeWrite = func() {
+		if calls.Add(1) == 1 {
+			close(inWindow)
+			<-release
+		}
+	}
+	errs := make(chan error, 2)
+	go func() { errs <- set("a", "1") }()
+	<-inWindow
+	go func() { errs <- set("b", "2") }()
+	// Give the second call time to finish if nothing holds it back.
+	select {
+	case err := <-errs:
+		errs <- err
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec, _, err := corrosion.ResolveFirewallTags(context.Background(), s.db, corrosion.TagMemberVM, vmFWID(t, s, "web"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := map[string]string{"x": "1", "a": "1", "b": "2"}; !maps.Equal(rec.Tags, want) {
+		t.Fatalf("after two concurrent tag sets the row holds %v, want %v", rec.Tags, want)
 	}
 }
 
@@ -292,8 +385,40 @@ func TestSetFirewallTags_RejectsBadRequests(t *testing.T) {
 	if _, err := s.SetFirewallTags(adminCtx(), &pb.SetFirewallTagsRequest{Kind: "vm", Workload: "nope", Set: map[string]string{"a": "b"}}); status.Code(err) != codes.NotFound {
 		t.Errorf("unknown VM: %v", err)
 	}
+	many := map[string]string{}
+	for i := 0; i <= corrosion.MaxFirewallTags; i++ {
+		many[fmt.Sprintf("k%d", i)] = "v"
+	}
+	if _, err := s.SetFirewallTags(adminCtx(), &pb.SetFirewallTagsRequest{Kind: "vm", Workload: "web", Set: many}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("%d tags: %v, want InvalidArgument", len(many), err)
+	}
 	if id := vmFWID(t, s, "web"); id != "" {
 		t.Fatalf("a refused request minted %q", id)
+	}
+}
+
+// A tag set that would take a workload past MaxFirewallTags is refused as
+// the caller's error, and the row keeps what it held.
+//
+// Mutation: drop the RPC's cap on the merged set — the store refuses it as
+// Internal: red.
+func TestSetFirewallTags_CapsTheMergedSet(t *testing.T) {
+	s, _ := tagsServer(t)
+	insertTestVM(t, adminCtx(), s.db, "web", s.hostName, "running")
+	full := map[string]string{}
+	for i := 0; i < corrosion.MaxFirewallTags; i++ {
+		full[fmt.Sprintf("k%d", i)] = "v"
+	}
+	if _, err := s.SetFirewallTags(adminCtx(), &pb.SetFirewallTagsRequest{Kind: "vm", Workload: "web", Set: full}); err != nil {
+		t.Fatalf("%d tags: %v", len(full), err)
+	}
+	_, err := s.SetFirewallTags(adminCtx(), &pb.SetFirewallTagsRequest{Kind: "vm", Workload: "web", Set: map[string]string{"extra": "v"}})
+	if status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "at most 64") {
+		t.Fatalf("one tag past the cap: %v, want InvalidArgument", err)
+	}
+	rec, _, _ := corrosion.ResolveFirewallTags(context.Background(), s.db, corrosion.TagMemberVM, vmFWID(t, s, "web"))
+	if !maps.Equal(rec.Tags, full) {
+		t.Fatalf("a refused tag set changed the row to %d tags", len(rec.Tags))
 	}
 }
 
@@ -426,6 +551,83 @@ func TestDeleteVM_ARecreatesDeleteKeepsTheTags(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The entry's "I clear" marker is honoured only from a peer host (or local
+// root): an operator's bearer, or a user's client certificate, carrying it
+// still gets the clear (D3 review m-1).
+//
+// Mutation: drop requirePeerCert from forwardedByEntry — red.
+func TestDeleteVM_AClientsEntryMarkerIsIgnored(t *testing.T) {
+	for what, mk := range map[string]func() context.Context{
+		"bearer": adminCtx,
+		"client certificate": func() context.Context {
+			ctx := context.WithValue(adminCtx(), ctxKeyAuthMethod, authMethodMTLS)
+			ctx = context.WithValue(ctx, ctxKeyMTLSCommonName, "admin")
+			return context.WithValue(ctx, ctxKeyPrincipalKind, principalKindClient)
+		},
+	} {
+		t.Run(what, func(t *testing.T) {
+			s, id := deleteSeededVM(t, true)
+			seedTagsFor(t, s, corrosion.TagMemberVM, id, map[string]string{"role": "web"}, "vm1", "")
+			ctx := metadata.NewIncomingContext(mk(), metadata.Pairs(entryClearsFirewallTagsMD, "1"))
+			if _, err := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: "vm1", Force: true}); err != nil {
+				t.Fatalf("DeleteVM: %v", err)
+			}
+			if v, ok := tagsRowValue(t, s, corrosion.TagMemberVM, id); !ok || v != "" {
+				t.Fatalf("a %s carrying the entry marker kept the tags: %q", what, v)
+			}
+		})
+	}
+}
+
+// A plain delete leaves the tags of an identity another live row still holds
+// (controller ruling "delete clear vs a shared identity"; D3 review I-2): the
+// stale container of a move pair that `lv ct rm --host` removes on the
+// remedy containerMoveOpen gives, and one of two VMs holding a copied id.
+// The row is the orphan sweep's once no live row holds it.
+//
+// Mutation: clear whatever other row holds the identity — red.
+func TestDelete_KeepsTheTagsAnotherLiveHolderHolds(t *testing.T) {
+	t.Run("container", func(t *testing.T) {
+		s, _ := tagsServer(t)
+		markTagsUsed(t, s)
+		s.SetContainerRuntime(&fakeCTRuntime{})
+		ctx := context.Background()
+		// Stored as a copy or a move leaves them: the writers never take an
+		// identity from their input.
+		for _, h := range []string{s.hostName, "other-host"} {
+			if err := s.db.Execute(ctx, `INSERT INTO containers (host_name, name, state, create_spec, created_at, updated_at)
+				VALUES (?, 'x', 'stopped', ?, 't', 't')`, h, `{"template":"debian","fw_id":"`+fwA+`"}`); err != nil {
+				t.Fatal(err)
+			}
+		}
+		seedTagsFor(t, s, corrosion.TagMemberCT, fwA, map[string]string{"role": "db"}, "x", "other-host")
+		if ct, _ := corrosion.GetContainer(ctx, s.db, s.hostName, "x"); ct == nil || corrosion.FirewallIDOf(corrosion.TagMemberCT, ct.CreateSpec) != fwA {
+			t.Fatal("premise: the stale container holds no identity")
+		}
+		if _, err := s.DeleteContainer(adminCtx(), &pb.DeleteContainerRequest{Name: "x", HostName: s.hostName, Force: true}); err != nil {
+			t.Fatalf("DeleteContainer: %v", err)
+		}
+		if ct, _ := corrosion.GetContainer(ctx, s.db, s.hostName, "x"); ct != nil {
+			t.Fatal("premise: the stale container is still there")
+		}
+		if v, _ := tagsRowValue(t, s, corrosion.TagMemberCT, fwA); !strings.Contains(v, `"role":"db"`) {
+			t.Fatalf("deleting the stale container cleared the live one's tags: %q", v)
+		}
+	})
+	t.Run("vm", func(t *testing.T) {
+		s, id := deleteSeededVM(t, true)
+		insertTestVM(t, adminCtx(), s.db, "copy", "other-host", "running")
+		setVMSpec(t, s, "copy", `{"name":"copy","firewall_id":"`+id+`"}`)
+		seedTagsFor(t, s, corrosion.TagMemberVM, id, map[string]string{"role": "db"}, "copy", "")
+		if _, err := s.DeleteVM(adminCtx(), &pb.DeleteVMRequest{Name: "vm1", Force: true}); err != nil {
+			t.Fatalf("DeleteVM: %v", err)
+		}
+		if v, _ := tagsRowValue(t, s, corrosion.TagMemberVM, id); !strings.Contains(v, `"role":"db"`) {
+			t.Fatalf("deleting one holder of a copied identity cleared the other's tags: %q", v)
+		}
+	})
 }
 
 // fwDeletePeer records the metadata of a forwarded DeleteVM.

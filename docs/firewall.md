@@ -819,18 +819,25 @@ firewall tag; copy one over with `lv firewall tag set`.
   most 64 tags.
 - Tags belong to the workload's firewall identity (`fw_id`), which the first
   `tag set` gives it on its host. The identity, and with it the tags, follows
-  the workload through a migrate, a relocation, a rebuild, a stack's rolling
-  update or recreate, and a same-name replica promotion. A clone, an import, a
-  template instance, and a restore under a new name or into a freed name are
-  new workloads with none.
+  the workload through a migrate, a relocation, a rebuild, a VM's rolling
+  update or recreate in a stack, and a same-name replica promotion. A
+  container a stack recreates, the green VM of a blue-green update, a clone,
+  an import, a template instance, and a restore under a new name or into a
+  freed name are new workloads with none; the delete of the container
+  replaced, or of the blue VM, clears its tags.
+- When another live workload holds the same identity (a copy), `tag set` and
+  `tag rm` give the workload its own identity and clear the copied
+  identity's tags from both; the output names the identity replaced and the
+  tags cleared.
 - A restore into a freed name, and a rebuild or recreate that fails after
   tearing the VM down, print the tags the deleted incarnation left and the
   `lv firewall tag set` command that sets them again.
 - `lv cutover` gives the name to the `-next` VM, which keeps its own tags.
   The replaced VM's tags stay with it, and the cutover prints them with the
   command that sets them on the VM now named so.
-- Deleting a workload clears its tags. A row whose identity no live workload
-  holds is cleared by the failover lease holder 24 hours after the last
+- Deleting a workload clears its tags, unless another live workload holds
+  the same identity (the other side of a move, or a copy), which keeps them.
+  A row whose identity no live workload holds is cleared by the failover lease holder 24 hours after the last
   record of that identity, so a move or re-create in flight keeps its tags.
 - A container created by a build before the container create spec existed
   (its row has none) cannot be tagged until it is created again.

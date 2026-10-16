@@ -20,8 +20,12 @@ func (m *mockClient) SetFirewallTags(_ context.Context, in *pb.SetFirewallTagsRe
 		return nil, m.fwTagsErr
 	}
 	tags := maps.Clone(in.GetSet())
-	return &pb.FirewallTags{Kind: in.GetKind(), Workload: in.GetWorkload(), Host: in.GetHost(),
-		FwId: "0123456789abcdef0123456789abcdef", Tags: tags}, nil
+	out := &pb.FirewallTags{Kind: in.GetKind(), Workload: in.GetWorkload(), Host: in.GetHost(),
+		FwId: "0123456789abcdef0123456789abcdef", Tags: tags}
+	if x := m.fwTagsSetExtra; x != nil {
+		out.ReplacedFwId, out.DroppedTags = x.GetReplacedFwId(), x.GetDroppedTags()
+	}
+	return out, nil
 }
 
 func (m *mockClient) ListFirewallTags(_ context.Context, in *pb.ListFirewallTagsRequest, _ ...grpc.CallOption) (*pb.ListFirewallTagsResponse, error) {
@@ -62,6 +66,26 @@ func TestFirewallTagCLI_SetAndRm(t *testing.T) {
 	}
 	if r := m.fwTagsSetReq; r.GetKind() != "vm" || len(r.GetSet()) != 0 || !slices.Equal(r.GetRemove(), []string{"env"}) {
 		t.Fatalf("tag rm request = %+v", r)
+	}
+}
+
+// A tag set that replaced a copied identity says so, naming the identity and
+// the tags cleared from both holders (D3 review m-6); one that did not says
+// nothing more.
+//
+// Mutation: drop the note — red.
+func TestFirewallTagCLI_SetNamesTheTagsACopyDropped(t *testing.T) {
+	m := &mockClient{fwTagsSetExtra: &pb.FirewallTags{ReplacedFwId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		DroppedTags: map[string]string{"role": "db", "env": "prod"}}}
+	out, _, err := runCmd(t, m, "firewall", "tag", "set", "web-1", "role=web")
+	if err != nil {
+		t.Fatalf("tag set: %v", err)
+	}
+	assertContains(t, out, "note: VM web-1 held firewall identity aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, which another workload holds too")
+	assertContains(t, out, "were cleared from both: env=prod role=db.")
+	plain, _, err := runCmd(t, &mockClient{}, "firewall", "tag", "set", "web-1", "role=web")
+	if err != nil || strings.Contains(plain, "note:") {
+		t.Fatalf("a plain tag set printed %q (%v)", plain, err)
 	}
 }
 

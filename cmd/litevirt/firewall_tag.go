@@ -155,6 +155,14 @@ func fwTagWho(t *pb.FirewallTags) string {
 
 func printFirewallTagsResult(w io.Writer, t *pb.FirewallTags) {
 	fmt.Fprintf(w, "Firewall tags of %s (fw_id %s): %s\n", fwTagWho(t), t.GetFwId(), tagPairs(t.GetTags()))
+	if t.GetReplacedFwId() != "" {
+		fmt.Fprintf(w, "note: %s held firewall identity %s, which another workload holds too (a copy); it now has its own "+
+			"identity, and the tags of %s were cleared from both: %s. Set them again with lv firewall tag set where they belong.\n",
+			fwTagWho(t), t.GetReplacedFwId(), t.GetReplacedFwId(), tagPairs(t.GetDroppedTags()))
+	} else if len(t.GetDroppedTags()) > 0 {
+		fmt.Fprintf(w, "note: %s shared its firewall identity with another workload (a copy); the identity's tags were cleared: %s. "+
+			"Set them again with lv firewall tag set where they belong.\n", fwTagWho(t), tagPairs(t.GetDroppedTags()))
+	}
 }
 
 func printFirewallTagsList(w io.Writer, tags []*pb.FirewallTags) error {

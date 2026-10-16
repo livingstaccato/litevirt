@@ -598,6 +598,11 @@ message FirewallTags {
     // orphan: no live workload holds fw_id; the row an earlier incarnation of
     // this name left, not applied (only listed when a workload is named).
     bool                orphan     = 8;
+    // Set only in a tag set's answer when the workload's identity was a copy
+    // (another live workload held it too): the identity replaced, and the
+    // tags its row held, now cleared from both workloads.
+    string              replaced_fw_id = 9;
+    map<string, string> dropped_tags   = 10;
 }
 
 message PCIDevice {

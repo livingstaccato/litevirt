@@ -293,8 +293,8 @@ func newFirewallID() string {
 // row holds unless another LIVE row of the kind holds the same one: such an id
 // was copied, not minted (a value stored verbatim before the writers kept the
 // identity). Then it mints a fresh one and returns the id it abandoned, whose
-// tags row the caller clears, so the copy, now its sole holder, never inherits
-// that membership. A tombstone holding the id (the workload's own move,
+// tags row the caller has cleared first (CopiedFirewallID), so the copy, now
+// its sole holder, never inherits that membership. A tombstone holding the id (the workload's own move,
 // re-key or cutover) is no conflict. With no identity on the row, it mints
 // one and abandons nothing.
 //
@@ -338,24 +338,100 @@ func uniqueFirewallID(ctx context.Context, c *Client, kind, host, name, cur stri
 	if cur == "" {
 		return newFirewallID(), "", nil
 	}
-	var rows []Row
-	var err error
-	if kind == TagMemberVM {
-		rows, err = c.Query(ctx, `SELECT '' AS host_name, name, spec AS doc FROM vms WHERE name != ? AND deleted_at IS NULL`, name)
-	} else {
-		rows, err = c.Query(ctx,
-			`SELECT host_name, name, COALESCE(create_spec, '') AS doc FROM containers
-			 WHERE NOT (host_name = ? AND name = ?) AND deleted_at IS NULL`, host, name)
-	}
+	held, err := FirewallIDHeldByAnother(ctx, c, kind, host, name, cur)
 	if err != nil {
 		return "", "", err
 	}
-	for _, r := range rows {
-		if firewallIDOf(kind, r.String("doc")) == cur {
-			return newFirewallID(), cur, nil
-		}
+	if held {
+		return newFirewallID(), cur, nil
 	}
 	return cur, "", nil
+}
+
+// FirewallIDHeldByAnother reports whether a live row of kind other than the
+// workload (a VM: name; a container: host and name) holds identity id on
+// this replica: a copy, or the other side of a move pair.
+func FirewallIDHeldByAnother(ctx context.Context, c *Client, kind, host, name, id string) (bool, error) {
+	if id == "" {
+		return false, nil
+	}
+	var rows []Row
+	var err error
+	switch kind {
+	case TagMemberVM:
+		rows, err = c.Query(ctx, `SELECT '' AS host_name, name, spec AS doc FROM vms WHERE name != ? AND deleted_at IS NULL`, name)
+	case TagMemberCT:
+		rows, err = c.Query(ctx,
+			`SELECT host_name, name, COALESCE(create_spec, '') AS doc FROM containers
+			 WHERE NOT (host_name = ? AND name = ?) AND deleted_at IS NULL`, host, name)
+	default:
+		return false, fmt.Errorf("corrosion: unknown firewall identity kind %q", kind)
+	}
+	if err != nil {
+		return false, err
+	}
+	for _, r := range rows {
+		if firewallIDOf(kind, r.String("doc")) == id {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// CopiedFirewallID returns the identity the live workload holds when
+// MintFirewallID would replace it as a copy (another live row of the kind
+// holds it, and no open move explains that), and "" otherwise. It writes
+// nothing, so a caller clears the copied identity's tags row BEFORE the mint:
+// a mint that commits and a clear that then fails would leave the other
+// holder, now the identity's only holder, with those tags for good, and a
+// retry would no longer see the copy. It refuses as the mint would: a VM or
+// container an operation holds (ErrFirewallIDNotMinted), a container with no
+// create spec (ErrFirewallIDNoCreateSpec), or a moving one
+// (ErrFirewallIDMoveOpen), so no move pair's tags are cleared.
+func CopiedFirewallID(ctx context.Context, c *Client, kind, host, name string) (string, error) {
+	var cur string
+	switch kind {
+	case TagMemberVM:
+		rows, err := c.Query(ctx,
+			`SELECT spec, COALESCE(active_operation_id, '') AS active_operation_id FROM vms WHERE name = ? AND deleted_at IS NULL`, name)
+		if err != nil {
+			return "", err
+		}
+		if len(rows) == 0 || rows[0].String("active_operation_id") != "" {
+			return "", ErrFirewallIDNotMinted
+		}
+		cur = firewallIDOf(kind, rows[0].String("spec"))
+	case TagMemberCT:
+		rows, err := c.Query(ctx,
+			`SELECT COALESCE(create_spec, '') AS create_spec, COALESCE(active_operation_id, '') AS active_operation_id
+			 FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`, host, name)
+		if err != nil {
+			return "", err
+		}
+		if len(rows) == 0 || rows[0].String("active_operation_id") != "" {
+			return "", ErrFirewallIDNotMinted
+		}
+		spec := rows[0].String("create_spec")
+		if spec == "" {
+			return "", ErrFirewallIDNoCreateSpec
+		}
+		cur = firewallIDOf(kind, spec)
+		if why, err := containerMoveOpen(ctx, c, host, name, cur); err != nil {
+			return "", err
+		} else if why != "" {
+			return "", fmt.Errorf("%w: %s", ErrFirewallIDMoveOpen, why)
+		}
+	default:
+		return "", fmt.Errorf("corrosion: unknown firewall identity kind %q", kind)
+	}
+	if cur == "" {
+		return "", nil
+	}
+	held, err := FirewallIDHeldByAnother(ctx, c, kind, host, name, cur)
+	if err != nil || !held {
+		return "", err
+	}
+	return cur, nil
 }
 
 // mintContainerFirewallID is MintFirewallID for a container: the

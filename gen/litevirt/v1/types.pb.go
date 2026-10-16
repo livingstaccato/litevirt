@@ -3964,7 +3964,12 @@ type FirewallTags struct {
 	UpdatedAt string                 `protobuf:"bytes,7,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
 	// orphan: no live workload holds fw_id; the row an earlier incarnation of
 	// this name left, not applied (only listed when a workload is named).
-	Orphan        bool `protobuf:"varint,8,opt,name=orphan,proto3" json:"orphan,omitempty"`
+	Orphan bool `protobuf:"varint,8,opt,name=orphan,proto3" json:"orphan,omitempty"`
+	// Set only in a tag set's answer when the workload's identity was a copy
+	// (another live workload held it too): the identity replaced, and the
+	// tags its row held, now cleared from both workloads.
+	ReplacedFwId  string            `protobuf:"bytes,9,opt,name=replaced_fw_id,json=replacedFwId,proto3" json:"replaced_fw_id,omitempty"`
+	DroppedTags   map[string]string `protobuf:"bytes,10,rep,name=dropped_tags,json=droppedTags,proto3" json:"dropped_tags,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4053,6 +4058,20 @@ func (x *FirewallTags) GetOrphan() bool {
 		return x.Orphan
 	}
 	return false
+}
+
+func (x *FirewallTags) GetReplacedFwId() string {
+	if x != nil {
+		return x.ReplacedFwId
+	}
+	return ""
+}
+
+func (x *FirewallTags) GetDroppedTags() map[string]string {
+	if x != nil {
+		return x.DroppedTags
+	}
+	return nil
 }
 
 type PCIDevice struct {
@@ -7386,7 +7405,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\bworkload\x18\x02 \x01(\tR\bworkload\x12\x12\n" +
 	"\x04host\x18\x03 \x01(\tR\x04host\x12\x1c\n" +
 	"\taddresses\x18\x04 \x03(\tR\taddresses\x12!\n" +
-	"\faddress_note\x18\x05 \x01(\tR\vaddressNote\"\xa7\x02\n" +
+	"\faddress_note\x18\x05 \x01(\tR\vaddressNote\"\xdc\x03\n" +
 	"\fFirewallTags\x12\x12\n" +
 	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x1a\n" +
 	"\bworkload\x18\x02 \x01(\tR\bworkload\x12\x12\n" +
@@ -7396,8 +7415,14 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x06set_by\x18\x06 \x01(\tR\x05setBy\x12\x1d\n" +
 	"\n" +
 	"updated_at\x18\a \x01(\tR\tupdatedAt\x12\x16\n" +
-	"\x06orphan\x18\b \x01(\bR\x06orphan\x1a7\n" +
+	"\x06orphan\x18\b \x01(\bR\x06orphan\x12$\n" +
+	"\x0ereplaced_fw_id\x18\t \x01(\tR\freplacedFwId\x12M\n" +
+	"\fdropped_tags\x18\n" +
+	" \x03(\v2*.litevirt.v1.FirewallTags.DroppedTagsEntryR\vdroppedTags\x1a7\n" +
 	"\tTagsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a>\n" +
+	"\x10DroppedTagsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xbb\x04\n" +
 	"\tPCIDevice\x12\x1b\n" +
@@ -7769,7 +7794,7 @@ func file_litevirt_v1_types_proto_rawDescGZIP() []byte {
 }
 
 var file_litevirt_v1_types_proto_enumTypes = make([]protoimpl.EnumInfo, 6)
-var file_litevirt_v1_types_proto_msgTypes = make([]protoimpl.MessageInfo, 71)
+var file_litevirt_v1_types_proto_msgTypes = make([]protoimpl.MessageInfo, 72)
 var file_litevirt_v1_types_proto_goTypes = []any{
 	(VMState)(0),                   // 0: litevirt.v1.VMState
 	(HostState)(0),                 // 1: litevirt.v1.HostState
@@ -7847,8 +7872,9 @@ var file_litevirt_v1_types_proto_goTypes = []any{
 	nil,                            // 73: litevirt.v1.PlacementSpec.PreferEntry
 	nil,                            // 74: litevirt.v1.FirewallTagGroup.MatchEntry
 	nil,                            // 75: litevirt.v1.FirewallTags.TagsEntry
-	nil,                            // 76: litevirt.v1.Host.LabelsEntry
-	(*timestamppb.Timestamp)(nil),  // 77: google.protobuf.Timestamp
+	nil,                            // 76: litevirt.v1.FirewallTags.DroppedTagsEntry
+	nil,                            // 77: litevirt.v1.Host.LabelsEntry
+	(*timestamppb.Timestamp)(nil),  // 78: google.protobuf.Timestamp
 }
 var file_litevirt_v1_types_proto_depIdxs = []int32{
 	8,  // 0: litevirt.v1.VMSpec.disks:type_name -> litevirt.v1.DiskSpec
@@ -7880,43 +7906,44 @@ var file_litevirt_v1_types_proto_depIdxs = []int32{
 	74, // 26: litevirt.v1.FirewallTagGroup.match:type_name -> litevirt.v1.FirewallTagGroup.MatchEntry
 	40, // 27: litevirt.v1.FirewallTagGroup.members:type_name -> litevirt.v1.FirewallTagMember
 	75, // 28: litevirt.v1.FirewallTags.tags:type_name -> litevirt.v1.FirewallTags.TagsEntry
-	8,  // 29: litevirt.v1.AttachDeviceRequest.disk:type_name -> litevirt.v1.DiskSpec
-	10, // 30: litevirt.v1.AttachDeviceRequest.nic:type_name -> litevirt.v1.NetworkAttachment
-	26, // 31: litevirt.v1.AttachDeviceRequest.pci_device:type_name -> litevirt.v1.DeviceSpec
-	6,  // 32: litevirt.v1.VM.spec:type_name -> litevirt.v1.VMSpec
-	0,  // 33: litevirt.v1.VM.state:type_name -> litevirt.v1.VMState
-	47, // 34: litevirt.v1.VM.interfaces:type_name -> litevirt.v1.VMInterface
-	48, // 35: litevirt.v1.VM.disks:type_name -> litevirt.v1.VMDisk
-	77, // 36: litevirt.v1.VM.created_at:type_name -> google.protobuf.Timestamp
-	77, // 37: litevirt.v1.VM.updated_at:type_name -> google.protobuf.Timestamp
-	46, // 38: litevirt.v1.VM.stranded_disks:type_name -> litevirt.v1.VMStrandedDisk
-	50, // 39: litevirt.v1.HardwareDevice.disk:type_name -> litevirt.v1.HardwareDisk
-	51, // 40: litevirt.v1.HardwareDevice.nic:type_name -> litevirt.v1.HardwareNIC
-	53, // 41: litevirt.v1.HardwareDevice.pci:type_name -> litevirt.v1.HardwarePCI
-	26, // 42: litevirt.v1.HardwarePCI.desired:type_name -> litevirt.v1.DeviceSpec
-	52, // 43: litevirt.v1.HardwarePCI.members:type_name -> litevirt.v1.HardwarePCIMember
-	1,  // 44: litevirt.v1.Host.state:type_name -> litevirt.v1.HostState
-	76, // 45: litevirt.v1.Host.labels:type_name -> litevirt.v1.Host.LabelsEntry
-	77, // 46: litevirt.v1.Host.created_at:type_name -> google.protobuf.Timestamp
-	77, // 47: litevirt.v1.Host.updated_at:type_name -> google.protobuf.Timestamp
-	42, // 48: litevirt.v1.Host.pci_devices:type_name -> litevirt.v1.PCIDevice
-	70, // 49: litevirt.v1.Host.storage_pools:type_name -> litevirt.v1.StoragePool
-	77, // 50: litevirt.v1.Image.created_at:type_name -> google.protobuf.Timestamp
-	77, // 51: litevirt.v1.Snapshot.created_at:type_name -> google.protobuf.Timestamp
-	77, // 52: litevirt.v1.User.created_at:type_name -> google.protobuf.Timestamp
-	77, // 53: litevirt.v1.Token.expires_at:type_name -> google.protobuf.Timestamp
-	77, // 54: litevirt.v1.Token.created_at:type_name -> google.protobuf.Timestamp
-	60, // 55: litevirt.v1.LoadBalancer.backends:type_name -> litevirt.v1.LBBackend
-	22, // 56: litevirt.v1.LoadBalancer.ports:type_name -> litevirt.v1.LBPort
-	63, // 57: litevirt.v1.LBStatsResponse.frontends:type_name -> litevirt.v1.LBFrontendStats
-	62, // 58: litevirt.v1.LBStatsResponse.backends:type_name -> litevirt.v1.LBBackendStats
-	67, // 59: litevirt.v1.HostResourceStats.vm_stats:type_name -> litevirt.v1.VMStats
-	77, // 60: litevirt.v1.ClusterEvent.timestamp:type_name -> google.protobuf.Timestamp
-	61, // [61:61] is the sub-list for method output_type
-	61, // [61:61] is the sub-list for method input_type
-	61, // [61:61] is the sub-list for extension type_name
-	61, // [61:61] is the sub-list for extension extendee
-	0,  // [0:61] is the sub-list for field type_name
+	76, // 29: litevirt.v1.FirewallTags.dropped_tags:type_name -> litevirt.v1.FirewallTags.DroppedTagsEntry
+	8,  // 30: litevirt.v1.AttachDeviceRequest.disk:type_name -> litevirt.v1.DiskSpec
+	10, // 31: litevirt.v1.AttachDeviceRequest.nic:type_name -> litevirt.v1.NetworkAttachment
+	26, // 32: litevirt.v1.AttachDeviceRequest.pci_device:type_name -> litevirt.v1.DeviceSpec
+	6,  // 33: litevirt.v1.VM.spec:type_name -> litevirt.v1.VMSpec
+	0,  // 34: litevirt.v1.VM.state:type_name -> litevirt.v1.VMState
+	47, // 35: litevirt.v1.VM.interfaces:type_name -> litevirt.v1.VMInterface
+	48, // 36: litevirt.v1.VM.disks:type_name -> litevirt.v1.VMDisk
+	78, // 37: litevirt.v1.VM.created_at:type_name -> google.protobuf.Timestamp
+	78, // 38: litevirt.v1.VM.updated_at:type_name -> google.protobuf.Timestamp
+	46, // 39: litevirt.v1.VM.stranded_disks:type_name -> litevirt.v1.VMStrandedDisk
+	50, // 40: litevirt.v1.HardwareDevice.disk:type_name -> litevirt.v1.HardwareDisk
+	51, // 41: litevirt.v1.HardwareDevice.nic:type_name -> litevirt.v1.HardwareNIC
+	53, // 42: litevirt.v1.HardwareDevice.pci:type_name -> litevirt.v1.HardwarePCI
+	26, // 43: litevirt.v1.HardwarePCI.desired:type_name -> litevirt.v1.DeviceSpec
+	52, // 44: litevirt.v1.HardwarePCI.members:type_name -> litevirt.v1.HardwarePCIMember
+	1,  // 45: litevirt.v1.Host.state:type_name -> litevirt.v1.HostState
+	77, // 46: litevirt.v1.Host.labels:type_name -> litevirt.v1.Host.LabelsEntry
+	78, // 47: litevirt.v1.Host.created_at:type_name -> google.protobuf.Timestamp
+	78, // 48: litevirt.v1.Host.updated_at:type_name -> google.protobuf.Timestamp
+	42, // 49: litevirt.v1.Host.pci_devices:type_name -> litevirt.v1.PCIDevice
+	70, // 50: litevirt.v1.Host.storage_pools:type_name -> litevirt.v1.StoragePool
+	78, // 51: litevirt.v1.Image.created_at:type_name -> google.protobuf.Timestamp
+	78, // 52: litevirt.v1.Snapshot.created_at:type_name -> google.protobuf.Timestamp
+	78, // 53: litevirt.v1.User.created_at:type_name -> google.protobuf.Timestamp
+	78, // 54: litevirt.v1.Token.expires_at:type_name -> google.protobuf.Timestamp
+	78, // 55: litevirt.v1.Token.created_at:type_name -> google.protobuf.Timestamp
+	60, // 56: litevirt.v1.LoadBalancer.backends:type_name -> litevirt.v1.LBBackend
+	22, // 57: litevirt.v1.LoadBalancer.ports:type_name -> litevirt.v1.LBPort
+	63, // 58: litevirt.v1.LBStatsResponse.frontends:type_name -> litevirt.v1.LBFrontendStats
+	62, // 59: litevirt.v1.LBStatsResponse.backends:type_name -> litevirt.v1.LBBackendStats
+	67, // 60: litevirt.v1.HostResourceStats.vm_stats:type_name -> litevirt.v1.VMStats
+	78, // 61: litevirt.v1.ClusterEvent.timestamp:type_name -> google.protobuf.Timestamp
+	62, // [62:62] is the sub-list for method output_type
+	62, // [62:62] is the sub-list for method input_type
+	62, // [62:62] is the sub-list for extension type_name
+	62, // [62:62] is the sub-list for extension extendee
+	0,  // [0:62] is the sub-list for field type_name
 }
 
 func init() { file_litevirt_v1_types_proto_init() }
@@ -7935,7 +7962,7 @@ func file_litevirt_v1_types_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_litevirt_v1_types_proto_rawDesc), len(file_litevirt_v1_types_proto_rawDesc)),
 			NumEnums:      6,
-			NumMessages:   71,
+			NumMessages:   72,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

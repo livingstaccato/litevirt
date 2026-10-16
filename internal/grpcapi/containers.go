@@ -635,7 +635,7 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	} else if removed {
 		out, err := s.deleteContainerOnRemovedHost(ctx, targetHost, req.Name, project)
 		if err == nil {
-			s.clearDeletedFirewallTags(ctx, corrosion.TagMemberCT, req.Name, fwID)
+			s.clearDeletedFirewallTags(ctx, corrosion.TagMemberCT, targetHost, req.Name, fwID)
 		}
 		return out, err
 	}
@@ -654,7 +654,7 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 			// Report the delete once this node no longer lists the row (see
 			// awaitForwardedContainer).
 			s.awaitForwardedContainer(ctx, targetHost, req.Name, "deleted", containerRowGone)
-			s.clearDeletedFirewallTags(ctx, corrosion.TagMemberCT, req.Name, fwID)
+			s.clearDeletedFirewallTags(ctx, corrosion.TagMemberCT, targetHost, req.Name, fwID)
 		}
 		return forwarded, err
 	}
@@ -742,7 +742,7 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "error")
 		return nil, status.Errorf(codes.Internal, "delete: release managed NICs: %v", nicErr)
 	}
-	s.clearDeletedFirewallTags(ctx, corrosion.TagMemberCT, req.Name, fwID)
+	s.clearDeletedFirewallTags(ctx, corrosion.TagMemberCT, targetHost, req.Name, fwID)
 	if errors.Is(derr, corrosion.ErrNoRowsAffected) {
 		// Idempotent: the row was already gone. Audited distinctly, not a silent "ok".
 		s.audit(ctx, "ct.delete", req.Name, "project="+project+" already-absent", "ok")

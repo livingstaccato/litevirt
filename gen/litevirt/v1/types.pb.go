@@ -7130,7 +7130,7 @@ type FirmwareRuntime struct {
 	Qemu                string                 `protobuf:"bytes,2,opt,name=qemu,proto3" json:"qemu,omitempty"`
 	Swtpm               string                 `protobuf:"bytes,3,opt,name=swtpm,proto3" json:"swtpm,omitempty"`
 	Libtpms             string                 `protobuf:"bytes,4,opt,name=libtpms,proto3" json:"libtpms,omitempty"`
-	OvmfFingerprint     string                 `protobuf:"bytes,5,opt,name=ovmf_fingerprint,json=ovmfFingerprint,proto3" json:"ovmf_fingerprint,omitempty"`                // the OVMF CODE file's content fingerprint
+	OvmfFingerprint     string                 `protobuf:"bytes,5,opt,name=ovmf_fingerprint,json=ovmfFingerprint,proto3" json:"ovmf_fingerprint,omitempty"`                // "layout:<hex> ovmf:<hex>": the firmware layout (dataDir and OVMF paths) and the OVMF files' content
 	LiveFirmwareEnabled bool                   `protobuf:"varint,6,opt,name=live_firmware_enabled,json=liveFirmwareEnabled,proto3" json:"live_firmware_enabled,omitempty"` // migration.live_firmware on this host
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache

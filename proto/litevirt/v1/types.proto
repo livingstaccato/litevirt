@@ -992,7 +992,7 @@ message FirmwareRuntime {
     string qemu                  = 2;
     string swtpm                 = 3;
     string libtpms               = 4;
-    string ovmf_fingerprint      = 5;  // the OVMF CODE file's content fingerprint
+    string ovmf_fingerprint      = 5;  // "layout:<hex> ovmf:<hex>": the firmware layout (dataDir and OVMF paths) and the OVMF files' content
     bool   live_firmware_enabled = 6;  // migration.live_firmware on this host
 }
 

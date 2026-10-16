@@ -14,6 +14,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cli"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/gitops"
 )
 
@@ -57,6 +58,12 @@ func newGitopsCmd() *cobra.Command {
 					return fmt.Errorf("dial daemon: %w", err)
 				}
 				defer closer()
+				// A file that does not parse is the daemon's to refuse.
+				if f, perr := compose.ParseNamed(path, []byte(body)); perr == nil {
+					if err := requireTagGroupSupport(ctx, client, composeRuleCIDRs(f)...); err != nil {
+						return err
+					}
+				}
 				stream, err := client.DeployStack(ctx, &pb.DeployStackRequest{
 					ComposeYaml: body,
 				})

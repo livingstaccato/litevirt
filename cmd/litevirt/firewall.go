@@ -38,6 +38,7 @@ func newFirewallCmd() *cobra.Command {
 		newFirewallNICGuardCmd(),
 		newFirewallEnforceCmd(),
 		newFirewallTagCmd(),
+		newFirewallTagGroupCmd(),
 	)
 	return cmd
 }
@@ -169,6 +170,9 @@ func newFirewallClusterRuleCmd() *cobra.Command {
 				}, func(id string) string { return fmt.Sprintf("Added cluster rule %s\n", id) })
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if err := requireTagGroupSupport(ctx, c, rf.cidr); err != nil {
+					return err
+				}
 				r, err := c.CreateClusterFirewallRule(ctx, &pb.CreateClusterFirewallRuleRequest{Rule: rf.pb()})
 				if err != nil {
 					return err
@@ -242,6 +246,9 @@ func newFirewallHostRuleCmd() *cobra.Command {
 				}, func(id string) string { return fmt.Sprintf("Added host rule %s on %s\n", id, host) })
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if err := requireTagGroupSupport(ctx, c, rf.cidr); err != nil {
+					return err
+				}
 				rule := rf.pb()
 				rule.HostName = host
 				r, err := c.CreateHostFirewallRule(ctx, &pb.CreateHostFirewallRuleRequest{Rule: rule})
@@ -455,6 +462,9 @@ func runMacroAdd(
 		return err
 	}
 	return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+		if err := requireTagGroupSupport(ctx, c, cidr); err != nil {
+			return err
+		}
 		var ids []string
 		for i, row := range rows {
 			id, err := add(ctx, c, m.Name, row)

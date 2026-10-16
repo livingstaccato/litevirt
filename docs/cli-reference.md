@@ -1425,6 +1425,17 @@ lv firewall tag set <vm> <key>=<value>...                          # adds or rep
 lv firewall tag set <ct> --container [--host <host>] <key>=<value>...
 lv firewall tag rm <vm> <key>...                                   # --container [--host <host>] for a container
 lv firewall tag ls [<workload>] [--container [--host <host>]]      # every tagged workload, or one
+
+# Tag groups: selectors over firewall tags; reference one from a rule with --cidr tag:<group>
+# (sg.write to change; audited; refused until the cluster upgrade has finished).
+lv firewall tag-group set <name> --match <k>=<v> [--match <k>] [--sg <sg>] [--network <net>]   # upsert; matches are ANDed
+lv firewall tag-group ls [--members]   # --members: each member's allocated addresses, or "no allocated address"
+lv firewall tag-group rm <name> [--force]
+  # rm is refused while a rule references tag:<name> or the group binds security groups to a
+  # member's NICs; --force overrides accept rules and the binding, never a drop or reject rule.
+  # set is refused for a name ending in _v6, beside a group <name>_v6, and over an ip set named
+  # lv_tg_<name> or lv_tg_<name>_v6. lv asks the daemon before sending a tag: cidr (a rule or a
+  # compose file) and refuses against a daemon that predates tag groups.
 ```
 
 See `docs/firewall.md` for the three-tier model, where each tier is enforced

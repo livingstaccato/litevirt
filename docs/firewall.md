@@ -999,6 +999,11 @@ lv firewall tag set cache-1 --container --host node-2 role=web
 lv firewall tag rm web-1 env
 lv firewall tag ls [web-1]
 
+# Tag groups: rules reference one with --cidr tag:<name>
+lv firewall tag-group set web --match role=web [--match env=prod] [--network prod] [--sg web-in]
+lv firewall tag-group ls [--members]
+lv firewall tag-group rm web [--force]
+
 # Inspect the live rulesets on this host (litevirt-fw and litevirt-nic) / force a reconcile now
 lv firewall show
 lv firewall reload
@@ -1054,6 +1059,7 @@ the row names the user the session belongs to.
 | `nic.guard.set` | VM name, or `ct:<host>/<name>` | `lv firewall nic-guard set` |
 | `firewall.enforcement` | `cluster` | `lv firewall enforce on/off` |
 | `firewall.tag.set` / `.rm` | VM name, or `<host>/<name>` for a container | `lv firewall tag set/rm` |
+| `firewall.tag_group.set` / `.rm` | group name | `lv firewall tag-group set/rm` |
 
 The row's user is the authenticated caller. Its detail records the policy
 before and after the change, in the form `before=<state> after=<state>`:

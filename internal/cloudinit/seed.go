@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -25,11 +26,11 @@ import (
 // gone, an attached one is there. A network-config the spec names wins, as at
 // create.
 //
-// The NICs are written in ordinal order, MAC breaking a tie, and named
-// eth<position> in that order: a NIC attached after a detach can share its
-// ordinal with one that stayed. For a VM no NIC was attached to or detached
-// from, position is ordinal is spec index, so the document is the one create
-// wrote.
+// The NICs are written in ordinal order, MAC breaking a tie. Each keeps the
+// guest name it was given (see names): prior, the seed being replaced, says
+// which names the guest has; with no prior (nil) the names are derived from
+// the records alone, the same names. For a VM no NIC was attached to or
+// detached from, the document is the one create wrote.
 func SeedNetworkConfig(ctx context.Context, db *corrosion.Client, vmName string, spec *pb.VMSpec, prior *Prior) (string, error) {
 	if spec == nil {
 		return "", nil
@@ -105,25 +106,105 @@ func SeedNetworkConfig(ctx context.Context, db *corrosion.Client, vmName string,
 		if entryOf[k] >= 0 {
 			n = spec.Network[entryOf[k]]
 		}
-		def, err := NetworkDef(ctx, db, r.NetworkName)
+		nic, err := seedNIC(ctx, db, r, n)
 		if err != nil {
 			return "", err
 		}
-		bound := false
-		if b, err := corrosion.GetBindingByNetwork(ctx, db, r.NetworkName); err != nil {
-			return "", fmt.Errorf("read binding of %q: %w", r.NetworkName, err)
-		} else if b != nil {
-			bound = true
+		nic.Ordinal = k
+		nics = append(nics, nic)
+	}
+	created, err := createdNames(ctx, db, vmName, spec, rows, entryOf)
+	if err != nil {
+		return "", err
+	}
+	prior.names(nics, rows, entryOf, created)
+	return NetworkConfig(nics), nil
+}
+
+// seedNIC is NIC row r, whose spec entry is n (empty for a NIC with none), as
+// its seed's network-config is derived from it.
+func seedNIC(ctx context.Context, db *corrosion.Client, r corrosion.NICRecord, n *pb.NetworkAttachment) (NIC, error) {
+	def, err := NetworkDef(ctx, db, r.NetworkName)
+	if err != nil {
+		return NIC{}, err
+	}
+	bound := false
+	if b, err := corrosion.GetBindingByNetwork(ctx, db, r.NetworkName); err != nil {
+		return NIC{}, fmt.Errorf("read binding of %q: %w", r.NetworkName, err)
+	} else if b != nil {
+		bound = true
+	}
+	return NIC{
+		Ordinal: r.Ordinal, MAC: r.MAC,
+		IP: n.GetIp(), Gateway: n.GetGateway(), IPv6: n.GetIpv6(), IPv6Gateway: n.GetIpv6Gateway(),
+		RecordedIP: r.IP,
+		Net:        def, Bound: bound,
+	}, nil
+}
+
+// createdNames is the guest name the seed vm was created with gives each of
+// its spec's NIC entries, by entry index: "" for an entry it named none
+// (a one-NIC VM with no static address has no network-config; a NIC with
+// nothing to configure is not listed). Create wrote one NIC per entry, in
+// spec order, from the entry and its NIC row, so the document is derived
+// again from the same facts: the live row each entry has (entryOf), else the
+// row a detach left (a tombstone), else the entry alone.
+func createdNames(ctx context.Context, db *corrosion.Client, vmName string, spec *pb.VMSpec, rows []corrosion.NICRecord, entryOf []int) (map[int]string, error) {
+	rowOf := make(map[int]corrosion.NICRecord, len(spec.Network))
+	for k, i := range entryOf {
+		if i >= 0 {
+			rowOf[i] = rows[k]
 		}
-		nics = append(nics, NIC{
-			Ordinal: k, MAC: r.MAC,
-			IP: n.GetIp(), Gateway: n.GetGateway(), IPv6: n.GetIpv6(), IPv6Gateway: n.GetIpv6Gateway(),
-			RecordedIP: r.IP,
-			Net:        def, Bound: bound,
+	}
+	var gone []corrosion.NICRecord
+	if len(rowOf) < len(spec.Network) {
+		for _, table := range []string{"vm_nics", "vm_interfaces"} {
+			raw, err := corrosion.GetVMNICsRaw(ctx, db, table, vmName)
+			if err != nil {
+				return nil, fmt.Errorf("read NICs of %q: %w", vmName, err)
+			}
+			gone = append(gone, raw...)
+		}
+		sort.SliceStable(gone, func(a, b int) bool {
+			return strings.ToLower(gone[a].MAC) < strings.ToLower(gone[b].MAC)
 		})
 	}
-	prior.name(nics)
-	return NetworkConfig(nics), nil
+	nics := make([]NIC, len(spec.Network))
+	macs := make([]string, len(spec.Network))
+	for i, n := range spec.Network {
+		r, ok := rowOf[i]
+		if !ok {
+			mac := strings.ToLower(strings.TrimSpace(n.GetMac()))
+			for _, g := range gone {
+				if mac != "" && strings.ToLower(g.MAC) == mac ||
+					mac == "" && g.Ordinal == i && g.NetworkName == n.GetName() && (n.GetIp() == "" || sameAddr(g.IP, n.GetIp())) {
+					r, ok = g, true
+					break
+				}
+			}
+		}
+		if !ok {
+			r = corrosion.NICRecord{NetworkName: n.GetName(), MAC: n.GetMac(), Ordinal: i}
+		}
+		if strings.TrimSpace(r.MAC) == "" {
+			// An entry whose NIC left no record: only whether it was
+			// configured counts here, and a MAC no NIC of the VM has stands
+			// in for its own.
+			r.MAC = fmt.Sprintf("00:00:00:00:%02x:%02x", i>>8&0xff, i&0xff)
+		}
+		nic, err := seedNIC(ctx, db, r, n)
+		if err != nil {
+			return nil, err
+		}
+		nic.Ordinal = i
+		nics[i], macs[i] = nic, strings.ToLower(r.MAC)
+	}
+	listed := PriorFrom(NetworkConfig(nics)).Names
+	out := make(map[int]string, len(spec.Network))
+	for i := range spec.Network {
+		out[i] = listed[macs[i]]
+	}
+	return out, nil
 }
 
 // sameAddr reports whether a and b name the same IP address, ignoring a
@@ -190,6 +271,11 @@ type Prior struct {
 	Names map[string]string
 	// Added are the folded MACs of NICs attached since that seed was written.
 	Added map[string]bool
+	// Stale: the seed may predate NICs attached since (a copy a host kept
+	// while the VM ran elsewhere), so a NIC it does not list, or lists by a
+	// name, that has no spec entry is named as with no seed. Without it a NIC
+	// the seed does not list was never named.
+	Stale bool
 }
 
 // PriorFrom reads the guest names of networkConfig, a seed's network-config
@@ -231,42 +317,72 @@ func PriorFrom(networkConfig string, added ...string) *Prior {
 	return p
 }
 
-// name gives nics, in position order, the guest names p says they have. A NIC
-// the prior seed names keeps its name; one it matched by MAC alone, or did
-// not list and was not attached since, stays unnamed — matched by MAC, under
-// whatever name the guest gave it. A NIC attached since takes the lowest
-// eth<n> no other NIC holds and above eth<N-1>, N the NICs that were there, so
-// a guest that names its NICs eth<n> itself (net.ifnames=0) has no clash with
-// an unnamed one. A name a detached NIC held is free again. With no prior
-// (nil) the NICs are named by position, as create names them.
-func (p *Prior) name(nics []NIC) {
-	if p == nil {
-		return
-	}
+// names gives nics (in position order; rows[k] is nics[k]'s row, entryOf[k]
+// its spec entry or -1) their guest names, so that a NIC's name is a function
+// of what the cluster records, the same on every host, with or without a seed:
+//
+//   - a NIC with a spec entry has the name the VM's create gave it (created),
+//     or none: matched by MAC alone, under the name the guest's kernel gave
+//     it;
+//   - a NIC attached since has eth<its ordinal>. attach gives a NIC an
+//     ordinal no NIC of the VM ever had and above every spec position
+//     (nextNICOrdinal), so the name is free, never a detached NIC's and never
+//     the kernel name eth<n> of a NIC the seed leaves unnamed (a guest booted
+//     with net.ifnames=0 numbers them eth0..). One an earlier build attached
+//     can share an ordinal: it takes the lowest eth<n> no other NIC holds,
+//     counting each NIC that is not new as holding one of eth0..eth<N-1>.
+//
+// p, the seed being replaced, wins where it knows: a NIC it lists keeps its
+// listing, one it marks attached since is new, and — unless p is Stale — one it
+// does not list stays unnamed (a NIC an earlier build attached, or one a seed
+// from before litevirt named NICs left to the kernel).
+func (p *Prior) names(nics []NIC, rows []corrosion.NICRecord, entryOf []int, created map[int]string) {
 	used := map[string]bool{}
 	kept := 0
+	keep := func(k int, name string) {
+		if name == "" {
+			nics[k].Unnamed = true
+		} else {
+			nics[k].Name, used[name] = name, true
+		}
+		kept++
+	}
 	var added []int
 	for k := range nics {
 		mac := strings.ToLower(nics[k].MAC)
-		name, listed := p.Names[mac]
-		switch {
-		case listed && name != "":
-			nics[k].Name = name
-			used[name] = true
-			kept++
-		case !listed && p.Added[mac]:
+		inSpec := entryOf[k] >= 0
+		if p != nil {
+			name, listed := p.Names[mac]
+			switch {
+			case listed && (name == "" || inSpec || !p.Stale):
+				keep(k, name)
+				continue
+			case p.Added[mac]:
+				added = append(added, k)
+				continue
+			case !listed && (inSpec || !p.Stale):
+				keep(k, "")
+				continue
+			}
+		}
+		if inSpec {
+			keep(k, created[entryOf[k]])
+		} else {
 			added = append(added, k)
-		default:
-			nics[k].Unnamed = true
-			kept++
 		}
 	}
-	// A guest that numbers its NICs itself (net.ifnames=0) calls the NICs
-	// that were there eth0..eth(kept-1): an unnamed one holds one of those.
 	for i := 0; i < kept; i++ {
 		used[fmt.Sprintf("eth%d", i)] = true
 	}
+	var clash []int
 	for _, k := range added {
+		if n := fmt.Sprintf("eth%d", rows[k].Ordinal); rows[k].Ordinal >= 0 && !used[n] {
+			nics[k].Name, used[n] = n, true
+			continue
+		}
+		clash = append(clash, k)
+	}
+	for _, k := range clash {
 		for i := 0; ; i++ {
 			if n := fmt.Sprintf("eth%d", i); !used[n] {
 				nics[k].Name, used[n] = n, true

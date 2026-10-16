@@ -2382,11 +2382,13 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		if userData == "" {
 			userData = "#cloud-config\n{}\n"
 		}
-		// The NICs' guest names come from a seed already here, whoever's: a
-		// name is only taken for a MAC this VM has.
+		// The NICs' guest names: those the VM's own seed here gives, which a
+		// copy kept while the VM ran elsewhere may predate (Stale); with no
+		// seed of the VM's, those its NIC records give (cloudinit.Prior).
 		var prior *cloudinit.Prior
-		if cur, err := cloudinit.ReadSeed(isoPath); err == nil {
-			prior = cloudinit.PriorFrom(cur.NetworkConfig)
+		if own, ok, _ := cloudinit.OwnSeed(isoPath, r.seedClaim(vm, spec)); ok {
+			prior = cloudinit.PriorFrom(own.NetworkConfig)
+			prior.Stale = true
 		}
 		netCfg, ncErr := cloudinit.SeedNetworkConfig(ctx, r.db, vm.Name, spec, prior)
 		vendorData := cloudinit.SeedVendorData(spec, netCfg)

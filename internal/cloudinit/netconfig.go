@@ -147,16 +147,22 @@ type GuestNIC struct {
 // Two shapes are kept byte for byte as they have always been written:
 //
 //   - no NIC is static and the VM has at most one NIC: no network-config, so
-//     cloud-init's own fallback brings up DHCP on that NIC;
+//     cloud-init's own fallback brings up DHCP on that NIC — unless a rebuild
+//     names it (the one NIC a detach left of several keeps its name);
 //   - every configured NIC is static: the V1 document of BuildV1.
 //
 // Any other VM — a DHCP NIC and any other NIC — gets a V2 document naming
-// every NIC by MAC (guestNetworkConfigV2).
+// every NIC by MAC (guestNetworkConfigV2). Only a NIC the document configures
+// counts: one with nothing to configure is not written.
 func GuestNetworkConfig(nics []GuestNIC) string {
 	var statics []StaticIface
-	dhcp, unnamed := 0, false
+	dhcp, unnamed, named := 0, false, false
 	for _, n := range nics {
+		if n.Static == nil && !n.DHCP {
+			continue
+		}
 		unnamed = unnamed || n.Unnamed
+		named = named || n.Name != ""
 		switch {
 		case n.Static != nil:
 			statics = append(statics, *n.Static)
@@ -168,7 +174,7 @@ func GuestNetworkConfig(nics []GuestNIC) string {
 	if dhcp == 0 && !unnamed {
 		return BuildV1(statics)
 	}
-	if len(statics) == 0 && len(nics) <= 1 {
+	if len(statics) == 0 && len(nics) <= 1 && !named {
 		return ""
 	}
 	return guestNetworkConfigV2(nics)

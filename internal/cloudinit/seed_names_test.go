@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
 // entry is the V2 entry of a NIC the document names.
@@ -46,9 +48,8 @@ func TestSeedNetworkConfig_DetachMiddleKeepsTheOthersNames(t *testing.T) {
 // Review I-1: a one-NIC VM's seed has no network-config, so cloud-init's
 // fallback named its NIC by the kernel's name (enp1s0). Its first hot attach
 // must not rename it: it is written matched by MAC alone, with no set-name,
-// and the attached NIC takes the lowest eth<n> not held — counting the
-// unnamed NIC as holding eth0, which a guest booted with net.ifnames=0 calls
-// it.
+// and the attached NIC takes eth<its ordinal>, eth2 — never eth0, which a
+// guest booted with net.ifnames=0 calls the unnamed NIC.
 //
 // Mutation: give the kept NIC a set-name — red; start the new NIC at eth0 —
 // red; name the kept NIC by an entry key the guest has no device for, with no
@@ -56,7 +57,8 @@ func TestSeedNetworkConfig_DetachMiddleKeepsTheOthersNames(t *testing.T) {
 func TestSeedNetworkConfig_FirstAttachToAOneNICVMRenamesNothing(t *testing.T) {
 	db, spec := hotplugSeedDB(t)
 	ctx := context.Background()
-	hotDetachRows(t, db, true, "52:54:00:00:0a:0a") // leaves B alone: one DHCP NIC
+	hotDetachRows(t, db, true, "52:54:00:00:0a:0a")
+	spec = &pb.VMSpec{Name: "hp", Network: spec.Network[1:]} // created with B alone: one DHCP NIC
 	one, err := SeedNetworkConfig(ctx, db, "hp", spec, nil)
 	if err != nil || one != "" {
 		t.Fatalf("setup: a one-DHCP-NIC VM has no network-config: %q, %v", one, err)
@@ -81,8 +83,8 @@ func TestSeedNetworkConfig_FirstAttachToAOneNICVMRenamesNothing(t *testing.T) {
 	if strings.Contains(bEntry, "set-name") {
 		t.Errorf("the one NIC the VM had is renamed:\n%s", got)
 	}
-	if !strings.Contains(got, namedEntry("eth1", "52:54:00:00:0c:0c")) {
-		t.Errorf("the attached NIC is not eth1:\n%s", got)
+	if !strings.Contains(got, namedEntry("eth2", "52:54:00:00:0c:0c")) {
+		t.Errorf("the attached NIC is not eth2:\n%s", got)
 	}
 	if !strings.Contains(got, "dhcp4: true") || strings.Count(got, "macaddress:") != 2 {
 		t.Errorf("want both NICs on DHCP:\n%s", got)

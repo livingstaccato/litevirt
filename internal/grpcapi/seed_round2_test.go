@@ -193,9 +193,10 @@ func TestNICHotplug_AmbiguousNICsLeaveTheSeedAlone(t *testing.T) {
 
 // Review I-1: the first hot attach to a one-NIC VM (no network-config: the
 // guest named its NIC itself) renames nothing — the kept NIC is matched by
-// MAC alone — and the attached NIC is eth1.
+// MAC alone — and the attached NIC is eth1, its ordinal.
 //
-// Mutation: rebuild with no prior seed — the kept NIC gets set-name eth0.
+// Mutation: name a kept NIC the prior seed does not list by its create name
+// — the kept NIC gets set-name eth0.
 func TestNICHotplug_FirstAttachToAOneNICVMRenamesNothing(t *testing.T) {
 	needGenisoimage(t)
 	s := hotplugDiskServer(t)

@@ -92,9 +92,12 @@ func hotDetachRows(t *testing.T, db *corrosion.Client, latched bool, mac string)
 // maintain on both kinds of cluster: exactly the VM's live NICs, each
 // detached NIC's address gone with it.
 //
+// Each NIC keeps its name with no seed to read it from: B the eth1 create
+// gave it, C eth2, its ordinal (T2 concern 2).
+//
 // Mutation: read the NIC set from the live vm_interfaces rows again — the
 // latched case names A and 10.5.0.50 and misses C; name each entry by its
-// row's ordinal — both cases name C eth2.
+// position — B eth0, C eth1.
 func TestSeedNetworkConfig_FollowsHotplug(t *testing.T) {
 	for _, latched := range []bool{true, false} {
 		name := "unlatched"
@@ -118,8 +121,8 @@ func TestSeedNetworkConfig_FollowsHotplug(t *testing.T) {
 				}
 			}
 			for _, want := range []string{
-				"  eth0:\n    match:\n      macaddress: \"52:54:00:00:0b:0b\"\n    set-name: eth0\n    dhcp4: true\n",
-				"  eth1:\n    match:\n      macaddress: \"52:54:00:00:0c:0c\"\n    set-name: eth1\n    dhcp4: true\n",
+				"  eth1:\n    match:\n      macaddress: \"52:54:00:00:0b:0b\"\n    set-name: eth1\n    dhcp4: true\n",
+				"  eth2:\n    match:\n      macaddress: \"52:54:00:00:0c:0c\"\n    set-name: eth2\n    dhcp4: true\n",
 			} {
 				if !strings.Contains(got, want) {
 					t.Errorf("want\n%s\nin the seed:\n%s", want, got)
@@ -135,10 +138,11 @@ func TestSeedNetworkConfig_FollowsHotplug(t *testing.T) {
 // A NIC attached by an earlier build can share its ordinal with a NIC that
 // stayed (attach numbered by the count of NICs left after a detach). Without a
 // prior seed (a rebuild where none is readable) every live NIC still gets its
-// own name, in ordinal order, MAC breaking a tie, so no two entries rename to
-// the same eth<n>.
+// own name: B the eth1 create gave it, and C, whose eth<ordinal> B holds, the
+// lowest eth<n> free above the NICs that were there.
 //
-// Mutation: name each entry by its row's ordinal — eth1 twice.
+// Mutation: name an attached NIC by its ordinal whether or not it is free —
+// eth1 twice.
 func TestSeedNetworkConfig_SharedOrdinalGetsItsOwnName(t *testing.T) {
 	db, spec := hotplugSeedDB(t)
 	ctx := context.Background()
@@ -149,8 +153,8 @@ func TestSeedNetworkConfig_SharedOrdinalGetsItsOwnName(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"  eth0:\n    match:\n      macaddress: \"52:54:00:00:0b:0b\"\n    set-name: eth0\n",
-		"  eth1:\n    match:\n      macaddress: \"52:54:00:00:0c:0c\"\n    set-name: eth1\n",
+		"  eth1:\n    match:\n      macaddress: \"52:54:00:00:0b:0b\"\n    set-name: eth1\n",
+		"  eth2:\n    match:\n      macaddress: \"52:54:00:00:0c:0c\"\n    set-name: eth2\n",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("want\n%s\nin:\n%s", want, got)

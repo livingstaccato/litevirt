@@ -72,7 +72,7 @@ func TestSeedNetworkConfig_HotAttachedNICIsNotTheDetachedOne(t *testing.T) {
 	if strings.Contains(got, "10.1.0.50") || strings.Contains(got, "52:54:00:00:0a:0a") {
 		t.Errorf("the hot-attached NIC was matched to the detached NIC's entry, or A is still there:\n%s", got)
 	}
-	if !strings.Contains(got, "macaddress: \"52:54:00:00:0c:0c\"\n    set-name: eth1\n    dhcp4: true\n") {
+	if !strings.Contains(got, "macaddress: \"52:54:00:00:0c:0c\"\n    set-name: eth2\n    dhcp4: true\n") {
 		t.Errorf("the hot-attached NIC is not written as asking DHCP:\n%s", got)
 	}
 }

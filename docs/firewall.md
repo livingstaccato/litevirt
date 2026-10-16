@@ -943,13 +943,13 @@ lv firewall tag-group rm web
 - A rule references the group as `cidr: tag:<name>` (an `lv sg rule-add`, a
   cluster or host rule, a compose security group or `firewall.cluster-rules`
   entry). It is stored as written and rendered as `@lv_tg_<name>`; it applies
-  to both families, negated or not. Writing a rule for a group that does not
+  to both families. Writing a rule for a group that does not
   exist is refused.
 - `--sg` and `--network` bind security groups: every NIC of every member is
   also bound to the listed security groups, on the listed networks (every
   network when none is listed), merged with the NIC's own.
-- `rm` is refused while a rule references `tag:<name>` or the group binds
-  security groups to a member's NICs. `--force` overrides accept rules and
+- `rm` is refused while a rule references `tag:<name>`, the group binds
+  security groups to a member's NICs, or the group's row cannot be read. `--force` overrides accept rules and
   the binding, never a drop or reject rule. It also asks `--force` while a
   workload whose tags cannot be read sits on a network the group binds.
 - Writing a group, or a rule that references one, is refused until the
@@ -960,8 +960,7 @@ lv firewall tag-group rm web
 **Propagation.** A host reflects a tag or group change made at `t0` by
 `t0 + L + T + pass`: `L` is that host's replication lag, `T` the 30 second
 reconcile tick and `pass` one reconcile. The host that takes the write
-reconciles at once. Hosts may disagree inside that window, and no host relies
-on another's view:
+reconciles at once. Hosts may disagree inside that window:
 
 | Change | A host that has not yet seen it |
 |---|---|
@@ -975,8 +974,8 @@ litevirt does not flush conntrack when a member leaves a group, so a
 connection that was accepted keeps passing. To cut one at once, delete it on
 the host that carries it: `conntrack -D -s <address>`.
 
-**Fail closed.** Where membership cannot be proven, the firewall holds back
-rather than allow, and the host raises a condition:
+**Fail closed.** Where membership cannot be proven, the host raises a
+condition:
 
 - A workload whose tags row cannot be read is a member of no group, and its
   NICs are held at drop on the networks a tag group binds security groups

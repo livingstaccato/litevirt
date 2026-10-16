@@ -1428,11 +1428,11 @@ lv firewall tag ls [<workload>] [--container [--host <host>]]      # every tagge
 
 # Tag groups: selectors over firewall tags; reference one from a rule with --cidr tag:<group>
 # (sg.write to change; audited; refused until the cluster upgrade has finished).
-lv firewall tag-group set <name> --match <k>=<v> [--match <k>] [--sg <sg>] [--network <net>]   # upsert; matches are ANDed; --match <k> = holds the key; name [a-z][a-z0-9_]{0,30}
+lv firewall tag-group set <name> --match <k>=<v> [--match <k>] [--sg <sg>] [--network <net>]   # upsert; matches are ANDed
 lv firewall tag-group ls [--members]   # --members: each member's allocated addresses, or "no allocated address"
 lv firewall tag-group rm <name> [--force]
-  # rm is refused while a rule references tag:<name> or the group binds security groups to a
-  # member's NICs; --force overrides accept rules and the binding, never a drop or reject rule.
+  # rm is refused while a rule references tag:<name>, the group binds security groups to a
+  # member's NICs, or its row cannot be read; --force overrides accept rules and the binding, never a drop or reject rule.
   # set is refused for a name ending in _v6, beside a group <name>_v6, over an ip set named
   # lv_tg_<name> or lv_tg_<name>_v6, for an --sg or --network that does not exist (or an --sg name
   # two groups hold), and for --match k= or a key matched twice. rm also asks --force while a

@@ -234,3 +234,23 @@ func (s *Server) SetImagePushUnmarkedForTest(unmarked bool) {
 func (s *Server) AutoPullFromPeerForTest(ctx context.Context, name, source string) error {
 	return s.pullImageFromPeer(ctx, name, source)
 }
+
+// SetClearFirewallTagsForTest replaces every firewall-tags clear this server
+// makes (a delete's, a copied identity's) with fn, so a fleet scenario can
+// make the clear fail; nil restores ClearFirewallTags.
+func (s *Server) SetClearFirewallTagsForTest(fn func(ctx context.Context, kind, fwID string) error) {
+	s.testClearFirewallTags = fn
+}
+
+// SweepReleaseUsesForTest runs one release use sweep pass on this server, as
+// the lease holder's ticker does every releaseUseSweepInterval.
+func (s *Server) SweepReleaseUsesForTest(ctx context.Context) {
+	s.sweepReleaseUses(ctx, releaseUseProbes)
+}
+
+// SweepFirewallTagOrphansForTest runs one firewall-tags orphan sweep pass on
+// this server with its clock at now (a fake clock: the grace is judged
+// against it).
+func (s *Server) SweepFirewallTagOrphansForTest(ctx context.Context, now time.Time) {
+	s.sweepFirewallTagOrphans(ctx, now)
+}

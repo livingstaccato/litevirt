@@ -34,6 +34,13 @@ type NetProvFake struct {
 	// another device leaves the old one serving until something tears it
 	// down, as on a host.
 	devSubnets map[string]string
+	// devAddrs is the subnets whose gateway addresses each device carries
+	// here, keyed by DEVICE. It is not devSubnets: a host-isolated bridge
+	// litevirt made, and a vxlan network's IRB, get the gateway address with
+	// no dnsmasq behind it, as the real Provision gives them. A device holds
+	// one address per network provisioned on it, as the kernel's does, and a
+	// teardown removes only its own network's.
+	devAddrs map[string]map[string]bool
 	// created are the bridges Provision made here (litevirt's own, as the
 	// real EnsureBridge records them), minus those torn down or swept;
 	// operator bridges a scenario named (SetOperatorBridge) are never in it.
@@ -63,6 +70,7 @@ func NewNetProvFake() *NetProvFake {
 		deprovisions: map[string]int{},
 		flat:         map[string]bool{},
 		devSubnets:   map[string]string{},
+		devAddrs:     map[string]map[string]bool{},
 		created:      map[string]bool{},
 		operator:     map[string]bool{},
 		sweeps:       map[string]int{},
@@ -135,6 +143,12 @@ func (f *NetProvFake) Provision(ctx context.Context, db *corrosion.Client, name 
 	if (def.Type == "" || def.Type == "bridge" || def.Type == "isolated") && !f.operator[dev] {
 		f.created[dev] = true
 	}
+	if def.Subnet != "" && fakeGatewayAddr(def, f.created[dev]) {
+		if f.devAddrs[dev] == nil {
+			f.devAddrs[dev] = map[string]bool{}
+		}
+		f.devAddrs[dev][def.Subnet] = true
+	}
 	f.provisions[name]++
 	return dev, nil
 }
@@ -152,6 +166,7 @@ func (f *NetProvFake) Deprovision(ctx context.Context, db *corrosion.Client, nam
 	}
 	delete(f.up, name)
 	delete(f.devSubnets, dev)
+	delete(f.devAddrs[dev], def.Subnet)
 	delete(f.created, dev)
 	f.deprovisions[name]++
 	return nil
@@ -164,6 +179,7 @@ func (f *NetProvFake) RetireDevice(_ context.Context, _ *corrosion.Client, name 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.devSubnets, dev)
+	delete(f.devAddrs[dev], def.Subnet)
 	delete(f.created, dev)
 	if f.retires == nil {
 		f.retires = map[string]int{}
@@ -176,7 +192,9 @@ func (f *NetProvFake) RetireDevice(_ context.Context, _ *corrosion.Client, name 
 func (f *NetProvFake) ReleaseDeviceServices(name string, def compose.NetworkDef) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	delete(f.devSubnets, network.BridgeName(name, def))
+	dev := network.BridgeName(name, def)
+	delete(f.devSubnets, dev)
+	delete(f.devAddrs[dev], def.Subnet)
 }
 
 // ServingGateway reports whether def's device serves a subnet here.
@@ -197,6 +215,22 @@ func (f *NetProvFake) WouldServeGateway(_ context.Context, _ *corrosion.Client, 
 // a vxlan network's gateway host (the fleet's nodes all are).
 func fakeServes(def compose.NetworkDef) bool {
 	return network.DHCPWouldServe(def, network.DHCPHostFacts{IsGatewayHost: true})
+}
+
+// fakeGatewayAddr reports whether the real Provision puts def's gateway
+// address on its device: wherever dnsmasq serves (it adds the address), on a
+// host-isolated bridge litevirt made with no VLAN (no dnsmasq, but the host
+// routes for the guests), and on every vxlan network's IRB.
+func fakeGatewayAddr(def compose.NetworkDef, createdHere bool) bool {
+	switch {
+	case fakeServes(def):
+		return true
+	case def.Type == "vxlan":
+		return def.VNI != 0
+	case def.Type == "" || def.Type == "bridge":
+		return def.HostIsolation && def.VLAN == 0 && createdHere
+	}
+	return false
 }
 
 // fakeRecordIntent writes the intent the real Provision writes for def.
@@ -247,6 +281,7 @@ func (f *NetProvFake) RemoveOrphanedBridge(name string) (bool, error) {
 	}
 	delete(f.created, name)
 	delete(f.devSubnets, name)
+	delete(f.devAddrs, name)
 	f.sweeps[name]++
 	return true, nil
 }
@@ -302,6 +337,7 @@ func (f *NetProvFake) Lose(network string) {
 	defer f.mu.Unlock()
 	if dev, ok := f.up[network]; ok {
 		delete(f.devSubnets, dev)
+		delete(f.devAddrs, dev)
 	}
 	delete(f.up, network)
 }
@@ -380,18 +416,26 @@ func (f *NetProvFake) HasDevice(dev string) bool {
 	return false
 }
 
-// Addrs is the gateway address the device dev serves here (its subnet's first
-// host), as the real provisioner gives a bridge it made. A device keeps
-// serving after its network moved off it, until something tears it down.
+// Addrs is the gateway addresses device dev carries here (each subnet's first
+// host), as the real provisioner gives them (fakeGatewayAddr) — with or without
+// dnsmasq serving behind it. A device keeps them after its networks moved
+// off it, until something tears them down.
 func (f *NetProvFake) Addrs(dev string) []netip.Prefix {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	p, err := netip.ParsePrefix(f.devSubnets[dev])
-	if err != nil {
-		return nil
+	subs := make([]string, 0, len(f.devAddrs[dev]))
+	for sub := range f.devAddrs[dev] {
+		subs = append(subs, sub)
 	}
-	p = p.Masked()
-	return []netip.Prefix{netip.PrefixFrom(p.Addr().Next(), p.Bits())}
+	sort.Strings(subs)
+	var out []netip.Prefix
+	for _, sub := range subs {
+		if p, err := netip.ParsePrefix(sub); err == nil {
+			p = p.Masked()
+			out = append(out, netip.PrefixFrom(p.Addr().Next(), p.Bits()))
+		}
+	}
+	return out
 }
 
 // Provisions and Deprovisions count calls for network on this node.

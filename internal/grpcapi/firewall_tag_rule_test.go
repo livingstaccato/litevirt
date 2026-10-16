@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -307,11 +308,12 @@ func (g *firstUseWatch) WithFeature(ctx context.Context, f capabilities.Feature,
 // acks) leaves every old row, default-deny included, as it was; one that
 // completes is taken while the old rows are still there.
 //
-// Mutation: the preflight takes no first use (the per-row write takes it,
-// after the teardown) — red.
+// Mutations: the preflight takes no first use (the per-row write takes it,
+// after the teardown) — red; the default-deny written ahead of the first use
+// — red for an old stack without one (review m-4).
 func TestStackFirewall_TagFirstUseBeforeTeardown(t *testing.T) {
 	bg := context.Background()
-	parse := func(sgCIDR, clusterCIDR string) *compose.File {
+	parse := func(sgCIDR, clusterCIDR string, deny bool) *compose.File {
 		t.Helper()
 		f, err := compose.ParseStored([]byte(`
 name: dd
@@ -321,7 +323,7 @@ security-groups:
       - {direction: ingress, proto: tcp, port: "80", cidr: "10.0.0.0/8", action: accept}
       - {direction: ingress, proto: tcp, port: "443", cidr: "` + sgCIDR + `", action: drop}
 firewall:
-  default-deny: true
+  default-deny: ` + strconv.FormatBool(deny) + `
   cluster-rules:
     - {direction: ingress, proto: tcp, port: "22", cidr: "` + clusterCIDR + `", action: accept}
 `))
@@ -330,15 +332,19 @@ firewall:
 		}
 		return f
 	}
-	for _, c := range []struct{ name, sgCIDR, clusterCIDR string }{
-		{"in a security-group rule", "tag:web", "10.0.0.0/8"},
-		{"in a cluster rule", "10.1.0.0/16", "tag:web"},
+	for _, c := range []struct {
+		name, sgCIDR, clusterCIDR string
+		oldDeny                   bool
+	}{
+		{"in a security-group rule", "tag:web", "10.0.0.0/8", true},
+		{"in a cluster rule", "10.1.0.0/16", "tag:web", true},
+		{"over a stack without default-deny", "tag:web", "10.0.0.0/8", false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			s, g, _, _ := tagRuleServer(t)
 			g.open = true
 			setTagGroup(t, s, "web")
-			if err := s.persistStackFirewall(bg, parse("10.1.0.0/16", "10.0.0.0/8")); err != nil {
+			if err := s.persistStackFirewall(bg, parse("10.1.0.0/16", "10.0.0.0/8", c.oldDeny)); err != nil {
 				t.Fatal(err)
 			}
 			oldSG, _ := corrosion.ListSecurityGroups(bg, s.db, "dd")
@@ -350,7 +356,7 @@ firewall:
 				sgs, _ := corrosion.ListSecurityGroups(bg, s.db, "dd")
 				rules, _ := corrosion.ListClusterFirewallRules(bg, s.db)
 				def, err := corrosion.GetFirewallDefault(bg, s.db, "cluster")
-				if err != nil || def == nil || !def.DefaultDeny {
+				if err != nil || (def != nil && def.DefaultDeny) != c.oldDeny {
 					return false
 				}
 				if len(sgs) != 1 || sgs[0].ID != oldSG[0].ID || len(rules) != 1 || rules[0].ID != oldRules[0].ID {
@@ -361,8 +367,9 @@ firewall:
 			}
 
 			g.refuseFirstUse, g.refuseCode = true, codes.Unavailable
-			if err := s.persistStackFirewall(bg, parse(c.sgCIDR, c.clusterCIDR)); err == nil {
-				t.Fatal("a redeploy whose tag-group first use was refused reported success")
+			err := s.persistStackFirewall(bg, parse(c.sgCIDR, c.clusterCIDR, true))
+			if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), fwReleaseRefusal(capabilities.FeatureFirewallTagGroups)) {
+				t.Fatalf("a redeploy whose tag-group first use was refused: %v, want Unavailable with the tag-group release text", err)
 			}
 			if !unchanged() {
 				t.Error("a redeploy whose tag-group first use was refused changed the stack's rows or its default-deny")
@@ -381,7 +388,7 @@ firewall:
 					}
 				}
 			}})
-			if err := s.persistStackFirewall(bg, parse(c.sgCIDR, c.clusterCIDR)); err != nil {
+			if err := s.persistStackFirewall(bg, parse(c.sgCIDR, c.clusterCIDR, c.oldDeny)); err != nil {
 				t.Fatalf("the redeploy once the first use completes: %v", err)
 			}
 			if !taken || !slices.Contains(g.used, capabilities.FeatureFirewallTagGroups) {

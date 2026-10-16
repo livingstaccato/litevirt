@@ -312,6 +312,16 @@ iptables):
   Connections the host opened onto a host-isolated bridge before an upgrade
   to this rule carry no mark, so their replies are dropped once: a long-lived
   connection (an HAProxy keep-alive to a backend) reconnects.
+- **Guest VRRP** — VRRP (IP protocol 112) a guest sends the host itself is
+  dropped, in enforce and observe mode alike: the bridge table's `input` chain
+  marks a guest NIC's VRRP (`meta l4proto 112 meta mark set meta mark |
+  0x40000000`), and a `guest_vrrp` chain on the inet `input` hook drops what is
+  marked, so a guest cannot answer a load balancer's VRRP and take its VIP.
+  VRRP between guests is untouched, on one bridge or routed between networks,
+  and so is VRRP from a bridge port that is not a guest NIC (a peer LB host's,
+  over the uplink). Rendered while the per-NIC table is in force and not in
+  guards-only mode. Bit 30 of the packet mark is litevirt's, beside bits 28
+  and 29.
 - **Isolated networks** — an `isolated_forward` chain on the `forward` hook
   drops anything routed off or onto an `isolated` network's bridge: per live
   isolated network's bridge (`iifname "<bridge>" oifname != "<bridge>" drop`

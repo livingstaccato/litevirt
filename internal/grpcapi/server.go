@@ -343,6 +343,10 @@ type Server struct {
 	// host gives the consoles of each domain it defines a password, once
 	// console_password_v1 has latched (ConsolePasswordPolicy).
 	enfConsolePassword atomic.Bool
+	// enfVRRPUnicast is enforcement.vrrp_unicast (default on): this host's
+	// LBs send unicast VRRP over the host network once vrrp_unicast_v1 has
+	// durably latched (vrrpUnicastActive). Off withholds the token.
+	enfVRRPUnicast atomic.Bool
 	// allowPlaintextStorageMigration is this node's
 	// migration.allow_unencrypted_storage. A storage-copying migration sends RAM
 	// and disk blocks over a direct, unencrypted QEMU stream, so MigrateVM refuses
@@ -617,6 +621,16 @@ type Server struct {
 	// lbKeepalivedOverride is a test seam for the VIP-health (degraded) check:
 	// when non-nil it reports whether this host's keepalived for an LB is running.
 	lbKeepalivedOverride func(name string) bool
+
+	// lbRenderedUnicastOverride is a test seam for the reconciler's read of
+	// the VRRP transport an LB's keepalived config on disk renders (lb.Manager
+	// KeepalivedUnicast); lbIfaceForIPOverride for the device holding an
+	// address (lb.DetectInterfaceForIP). Nil in production.
+	lbRenderedUnicastOverride func(name string) (unicast, ok bool)
+	lbIfaceForIPOverride      func(ip string) string
+	// lbMgr is the LB manager the keepalived reads (running, transport) go
+	// to. Nil: lb.NewManager(), the production paths. Test-only (SetLBManager).
+	lbMgr *lb.Manager
 
 	// migrateRestoreOverride is a test seam for container cold migration + failover
 	// relocation: when non-nil it replaces the real "dial the target peer + drive
@@ -1404,6 +1418,13 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfPartitionPause.Load() {
 		caps = withoutCapability(caps, capabilities.PartitionPauseV1)
 	}
+	// vrrp_unicast_v1 is withheld while enforcement.vrrp_unicast is off: an
+	// LB host and its peers hear each other only on the same VRRP transport,
+	// so each relies on the others rendering what it does, and the latch has
+	// to mean every host has the flag on. See TestAdvertise_VRRPUnicastWithheldWhileOff.
+	if !s.enfVRRPUnicast.Load() {
+		caps = withoutCapability(caps, capabilities.VRRPUnicastV1)
+	}
 	return caps
 }
 
@@ -1558,6 +1579,19 @@ func (s *Server) SetLinkAddrs(fn func(name string) []netip.Prefix) { s.linkAddrs
 // host (lbApplyOverride). Test-only seam, nil in production.
 func (s *Server) SetLBApply(fn func(context.Context, lb.Config) error) { s.lbApplyOverride = fn }
 
+// SetLBManager points this host's reads of its LBs' keepalived — whether it
+// runs, which VRRP transport its config renders — at m instead of the
+// production paths. Test-only seam, nil in production.
+func (s *Server) SetLBManager(m *lb.Manager) { s.lbMgr = m }
+
+// lbManager is the manager the keepalived reads go to (SetLBManager).
+func (s *Server) lbManager() *lb.Manager {
+	if s.lbMgr != nil {
+		return s.lbMgr
+	}
+	return lb.NewManager()
+}
+
 // SetBridgeHasUplink injects the "does this bridge carry anything off the host"
 // seam (see bridgeUplink). It is the fact that tells an operator's
 // infrastructure bridge from one litevirt auto-created for a placement, and it
@@ -1661,6 +1695,10 @@ func (s *Server) SetLiveResize(on bool) { s.enfLiveResize.Store(on) }
 // gives the consoles of each domain it defines a password (once
 // console_password_v1 has latched).
 func (s *Server) SetConsolePassword(on bool) { s.enfConsolePassword.Store(on) }
+
+// SetVRRPUnicast sets enforcement.vrrp_unicast: whether this host advertises
+// vrrp_unicast_v1 and, once it has latched, renders its LBs' VRRP as unicast.
+func (s *Server) SetVRRPUnicast(on bool) { s.enfVRRPUnicast.Store(on) }
 
 // ConsolePasswordPolicy is what this host's defines do to a domain's console
 // passwords. Until console_password_v1 has latched, nothing (PolicyLeave):
@@ -1941,6 +1979,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfRecoveryClaim.Load()
 	case capabilities.PartitionPauseV1:
 		return s.enfPartitionPause.Load()
+	case capabilities.VRRPUnicastV1:
+		return s.enfVRRPUnicast.Load()
 	case capabilities.IsolationEpochV1:
 		return s.enfIsolationEpoch.Load()
 	case capabilities.NetBoxIPAMV1:

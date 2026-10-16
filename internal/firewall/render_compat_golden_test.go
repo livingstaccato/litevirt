@@ -139,6 +139,17 @@ func TestRenderCompatGolden(t *testing.T) {
 				got = strings.Replace(got, piece, "", 1)
 			}
 		}
+		// And the drop of a guest's VRRP to the host: a mark at the bridge
+		// input hook and a chain on the inet input hook.
+		var vrrp strings.Builder
+		renderGuestVRRPInput(&vrrp)
+		for _, piece := range []string{vrrp.String(),
+			fmt.Sprintf("        meta l4proto 112 meta mark set meta mark | %#x\n", guestVRRPMark)} {
+			if !strings.Contains(got, piece) {
+				t.Fatalf("%s: %q is missing", mode, piece)
+			}
+			got = strings.Replace(got, piece, "", 1)
+		}
 		golden.Assert(t, "testdata/render_compat_"+mode+".golden", got)
 	}
 }

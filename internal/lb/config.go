@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"text/template"
@@ -29,7 +30,7 @@ type Config struct {
 	Name      string // e.g. "app-server"
 	VIP       string // e.g. "10.0.100.100"
 	VIPPrefix int    // CIDR prefix length
-	Interface string // network interface for VRRP (e.g. "eth0")
+	Interface string // the device the VIP goes on (and, unless VRRPUnicast, VRRP's)
 	VRID      int    // VRRP virtual router ID (1–255, unique per VIP)
 	Priority  int    // 100 = master, 50 = backup
 	Backends  []Backend
@@ -37,6 +38,21 @@ type Config struct {
 	Algorithm string        // roundrobin | leastconn | source
 	Health    *HealthConfig // backend health check (nil = default tcp-check)
 	Sticky    bool          // keep a client on one backend by its source address
+
+	// VRRPUnicast sends this LB's VRRP adverts as unicast from UnicastSrc to
+	// UnicastPeers over VRRPInterface, the device holding this host's own
+	// address, and accepts adverts only from those peers. The VIP still goes
+	// on Interface, named on its line, and Interface is tracked, so nothing
+	// VRRP is sent on, or taken from, the segment the VIP's guests are on.
+	// Off: adverts are multicast on Interface with a PASS password, as every
+	// LB was before vrrp_unicast_v1, which guests on that segment can read and
+	// answer.
+	VRRPUnicast   bool
+	VRRPInterface string
+	UnicastSrc    string
+	// UnicastPeers are the other LB hosts' addresses. None: a sole host,
+	// which names itself (see the template).
+	UnicastPeers []string
 
 	// SNAT fields — set when LB provides outbound NAT for host-isolated VMs.
 	SNATEnabled bool   // enable SNAT + conntrackd
@@ -155,6 +171,12 @@ backend {{$.Name}}-{{.Listen}}-be
 {{- end}}
 `
 
+// keepalivedTmpl renders one vrrp_instance. With VRRPUnicast and no peers (a
+// sole LB host) it names the host itself as its peer, with a TTL range no
+// packet is in: keepalived cannot run unicast with no peers (it falls back to
+// multicast on the interface), and this way its adverts go only to itself over
+// loopback and are discarded, nothing is accepted from anyone, and it becomes
+// master on its own.
 var keepalivedTmpl = template.Must(template.New("keepalived").Parse(`
 global_defs {
     enable_script_security
@@ -171,6 +193,32 @@ vrrp_script chk_haproxy {
 
 vrrp_instance {{.Name}} {
     state {{if eq .Priority 100}}MASTER{{else}}BACKUP{{end}}
+{{- if .VRRPUnicast}}
+    interface {{.VRRPInterface}}
+    virtual_router_id {{.VRID}}
+    priority {{.Priority}}
+    advert_int 1
+
+    unicast_src_ip {{.UnicastSrc}}
+    unicast_peer {
+{{- range .UnicastPeers}}
+        {{.}}
+{{- else}}
+        {{.UnicastSrc}} min_ttl 0 max_ttl 0
+{{- end}}
+    }
+    check_unicast_src
+{{- if ne .Interface .VRRPInterface}}
+
+    track_interface {
+        {{.Interface}}
+    }
+{{- end}}
+
+    virtual_ipaddress {
+        {{.VIP}}/{{.VIPPrefix}} dev {{.Interface}}
+    }
+{{- else}}
     interface {{.Interface}}
     virtual_router_id {{.VRID}}
     priority {{.Priority}}
@@ -184,6 +232,7 @@ vrrp_instance {{.Name}} {
     virtual_ipaddress {
         {{.VIP}}/{{.VIPPrefix}}
     }
+{{- end}}
 
     track_script {
         chk_haproxy
@@ -239,6 +288,10 @@ func RenderKeepalived(cfg Config) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// One order whatever order the hosts came in, so the same peers render the
+	// same config (and keepalived is not restarted over a reorder).
+	cfg.UnicastPeers = append([]string(nil), cfg.UnicastPeers...)
+	sort.Strings(cfg.UnicastPeers)
 	var buf bytes.Buffer
 	// Augment cfg with a derived, per-LB VRRP auth password (F6).
 	data := struct {

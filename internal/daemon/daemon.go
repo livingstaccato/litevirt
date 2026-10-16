@@ -1109,6 +1109,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// reconciler's, which share d.virt) applies svc.ConsolePasswordActive —
 	// this flag AND the console_password_v1 latch. NewServer wired the hook.
 	svc.SetConsolePassword(d.cfg.Enforcement.ConsolePassword)
+	// vrrp_unicast_v1: advertised only with enforcement.vrrp_unicast on; an
+	// LB renders unicast VRRP only with this flag AND the durable latch.
+	svc.SetVRRPUnicast(d.cfg.Enforcement.VRRPUnicast)
 	svc.SetAllowUnencryptedStorageMigration(d.cfg.Migration.AllowUnencryptedStorage)
 	svc.SetMigrationNetwork(d.cfg.Migration.Network)
 	svc.SetMigrationAddress(d.cfg.Migration.Address)

@@ -1418,6 +1418,32 @@ A FIPS-mode host (whose QEMU has no DES for VNC authentication) sets no VNC
 passwords, takes incoming live migrations without them, and reports
 `console_password_v1` in `not_enforcing`; it never fails a start over one.
 
+### Load balancer VRRP moves off the guest network after the roll
+
+On earlier releases, each load balancer host multicasts its keepalived VRRP
+adverts on the bridge its VIP is on, with a password derived from the LB's
+name, so any guest on that bridge can read the password and answer with a
+higher priority, which takes the VIP off its holder. This release sends them
+as unicast between the LB hosts' recorded addresses, over the host network
+([compose.md](compose.md#load-balancer)). A host on the old transport and a
+host on the new one do not hear each other and would both hold the VIP, so no
+host switches until the `vrrp_unicast_v1` capability token has latched. It
+latches on its own once every host the cluster replicates to, including one
+parked in `maintenance`, runs this release with `enforcement.vrrp_unicast` on
+(the default). Each LB host's reconciler then re-renders its running LBs
+within about 30 seconds; an LB may be held by both its hosts for a few seconds
+while they switch. Hosts must pass IP protocol 112 between their recorded
+addresses.
+
+`enforcement.vrrp_unicast: false` is the stand-down, for a network that does
+not pass IP protocol 112 between hosts: set it on every host and restart each
+daemon, and each LB goes back to the multicast transport. A host with the flag
+off withholds the token, so it also holds the latch off, and once latched it
+is reported in `not_enforcing`. A flag off on one host only leaves each LB it
+shares with an enforcing host on two transports. A binary rolled back below
+the latched token enters WAL quarantine, as below every latched token, and
+renders the multicast transport its peers have left. Roll forward.
+
 ### SPICE through the daemon
 
 `lv spice --launch` and `--listen` now carry the SPICE console through the

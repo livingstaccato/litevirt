@@ -448,7 +448,7 @@ func (s *Server) lbKeepalivedRunning(name string) bool {
 	if s.lbKeepalivedOverride != nil {
 		return s.lbKeepalivedOverride(name)
 	}
-	return lb.NewManager().KeepalivedRunning(name)
+	return s.lbManager().KeepalivedRunning(name)
 }
 
 func (s *Server) DisableBackend(ctx context.Context, req *pb.DisableBackendRequest) (*pb.LoadBalancer, error) {
@@ -751,7 +751,7 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 				Ports:     ports,
 				Algorithm: algorithm,
 			}
-			if err := s.applyLBLocal(ctx, cfg); err != nil {
+			if err := s.applyLBLocal(ctx, cfg, targetHosts); err != nil {
 				// Provisioning failed on this host (bad backend address, VIP
 				// conflict, invalid config, …). Roll back the persisted config so
 				// `lv lb ls` doesn't show a phantom "active" LB that isn't
@@ -811,10 +811,12 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 	return s.InspectLoadBalancer(ctx, &pb.InspectLBRequest{Name: req.Name})
 }
 
-// applyLBLocal provisions the LB on this host (haproxy + keepalived). The
-// lbApplyDisabled test seam lets unit tests exercise CreateLoadBalancer's
-// persistence + rollback logic without root privileges or a haproxy binary.
-func (s *Server) applyLBLocal(ctx context.Context, cfg lb.Config) error {
+// applyLBLocal provisions the LB on this host (haproxy + keepalived). lbHosts
+// is every host the LB runs on, this one included: its VRRP peers once the
+// unicast transport is on (lbVRRPTransport). The lbApplyOverride test seam
+// lets unit tests exercise CreateLoadBalancer's persistence + rollback logic
+// without root privileges or a haproxy binary.
+func (s *Server) applyLBLocal(ctx context.Context, cfg lb.Config, lbHosts []string) error {
 	// Split-brain gate (Phase 1): claiming/serving a VIP requires local quorum,
 	// enforced at this single chokepoint so BOTH the ApplyLB RPC and the
 	// event-triggered refresh path (refreshLBLocal → applyLBFromSpec) are covered —
@@ -842,6 +844,10 @@ func (s *Server) applyLBLocal(ctx context.Context, cfg lb.Config) error {
 		slog.Error("lb: "+detail, "lb", cfg.Name)
 		s.publish("lb.name_refused", cfg.Name, detail)
 		return status.Error(codes.InvalidArgument, detail)
+	}
+	if err := s.lbVRRPTransport(ctx, &cfg, lbHosts); err != nil {
+		slog.Error("lb: not applied: its VRRP peers cannot be named", "lb", cfg.Name, "error", err)
+		return status.Errorf(codes.FailedPrecondition, "load balancer %q: %v", cfg.Name, err)
 	}
 	var err error
 	if s.lbApplyOverride != nil {
@@ -1807,7 +1813,7 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 			}
 			if ierr != nil {
 				slog.Warn("UpdateLoadBalancer: local apply refused", "error", ierr)
-			} else if err := s.applyLBLocal(ctx, cfg); err != nil {
+			} else if err := s.applyLBLocal(ctx, cfg, lbHosts); err != nil {
 				slog.Warn("UpdateLoadBalancer: local apply failed", "error", err)
 			} else {
 				// Refresh firewall intent so a changed VIP/ports updates the
@@ -2466,7 +2472,7 @@ func (s *Server) ApplyLB(ctx context.Context, req *pb.ApplyLBRequest) (*emptypb.
 		s.lbSNATSync(ctx, &cfg, place, req.Hosts)
 	}
 
-	if err := s.applyLBLocal(ctx, cfg); err != nil {
+	if err := s.applyLBLocal(ctx, cfg, req.Hosts); err != nil {
 		return nil, status.Errorf(codes.Internal, "apply LB: %v", err)
 	}
 
@@ -2764,7 +2770,10 @@ func (s *Server) RunLBReconciler(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// reconcileDeadLBs re-applies this host's enabled LBs whose keepalived isn't running. The
+// reconcileDeadLBs re-applies this host's enabled LBs whose keepalived isn't running, and
+// those whose keepalived config renders the other VRRP transport from the one this host
+// now renders (lbVRRPStale: vrrp_unicast_v1 latched, or enforcement.vrrp_unicast turned
+// off, since the LB was last applied). The
 // re-apply path (refreshLBLocal / reapplyExplicitLB -> applyLBLocal) is split-brain-gated, so
 // it no-ops during warmup/upgrading and succeeds once local quorum returns.
 func (s *Server) reconcileDeadLBs(ctx context.Context) {
@@ -2782,7 +2791,11 @@ func (s *Server) reconcileDeadLBs(ctx context.Context) {
 		// legacy hosts=[] LB acquire its durable holder once the cluster settles.
 		// No-op (no probe) unless the row is an unowned explicit LB.
 		cfg = s.repairLegacyLBHolder(ctx, cfg)
-		if !s.lbRunsOnHost(ctx, cfg) || s.lbKeepalivedRunning(cfg.Name) {
+		if !s.lbRunsOnHost(ctx, cfg) {
+			continue
+		}
+		stale := s.lbVRRPStale(cfg.Name)
+		if !stale && s.lbKeepalivedRunning(cfg.Name) {
 			continue
 		}
 		if cfg.StackName != "" {
@@ -2790,7 +2803,12 @@ func (s *Server) reconcileDeadLBs(ctx context.Context) {
 		} else {
 			s.reapplyExplicitLB(ctx, cfg)
 		}
-		slog.Info("LB reconciler: re-applied a stopped LB", "lb", cfg.Name)
+		if stale {
+			slog.Info("LB reconciler: re-applied an LB onto this host's VRRP transport",
+				"lb", cfg.Name, "unicast", s.vrrpUnicastActive())
+		} else {
+			slog.Info("LB reconciler: re-applied a stopped LB", "lb", cfg.Name)
+		}
 	}
 }
 
@@ -2853,7 +2871,7 @@ func (s *Server) reapplyExplicitLB(ctx context.Context, cfg corrosion.LBConfigRe
 		Name: cfg.Name, VIP: vipIP, VIPPrefix: vipPrefix,
 		Interface: lbIface, VRID: s.allocVRID(ctx, cfg.Name),
 		Priority: priority, Backends: backends, Ports: ports, Algorithm: cfg.Algorithm,
-	}); err != nil {
+	}, hosts); err != nil {
 		slog.Warn("reapplyExplicitLB: apply failed", "lb", cfg.Name, "error", err)
 	} else if snat, serr := s.lbSNAT(ctx, cfg.Name, cfg.StackName, cfg.Generation); serr != nil {
 		// Its firewall intent stays as it is until a read succeeds.
@@ -3100,7 +3118,7 @@ func (s *Server) applyLBForStack(ctx context.Context, lbName, vip string, settin
 		s.lbSNATSync(ctx, &cfg, place, lbHosts)
 	}
 
-	if err := s.applyLBLocal(ctx, cfg); err != nil {
+	if err := s.applyLBLocal(ctx, cfg, lbHosts); err != nil {
 		return err
 	}
 

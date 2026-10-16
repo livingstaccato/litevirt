@@ -928,6 +928,19 @@ Requirements:
 - The network's bridge carries the VMs' gateway (see [Host isolation](#host-isolation)): a `vxlan` network, or a `bridge` network on a bridge litevirt created, with no `vlan`
 - It does not apply to an `isolated` network: nothing is routed off its bridge
 
+**VRRP transport**: once every host runs a release with `vrrp_unicast_v1` and has
+`enforcement.vrrp_unicast` on (the default; `lv cluster upgrade-status` shows the
+token latched), each LB host sends its VRRP adverts as unicast from its recorded
+address to the other LB hosts' recorded addresses, over the device that holds its
+own, and accepts adverts only from them. The VIP stays on its network's bridge;
+nothing VRRP is sent on that bridge, and there is no password for a guest to read.
+Hosts must pass IP protocol 112 between their recorded addresses. Before the latch,
+the adverts are multicast on the VIP's bridge with a password derived from the LB's
+name, as on earlier releases: any guest on that bridge can read them. When the
+latch forms, each LB host's reconciler re-renders its running LBs within about 30
+seconds, so an LB may be held by both of its hosts for a few seconds while they
+switch. A guest's VRRP to the host is dropped either way ([firewall.md](firewall.md)).
+
 **Conntrackd for failover**: When `snat: true` is set and the LB has two or more `hosts`, litevirt automatically runs `conntrackd` alongside keepalived to replicate conntrack state between VRRP peers, over the hosts' recorded addresses. Each LB host syncs with the first other host in `hosts`. On failover, the new MASTER imports synced entries so existing SNAT'd connections survive. This is managed automatically — no additional configuration is needed.
 
 ## Health checks

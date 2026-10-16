@@ -638,8 +638,8 @@ type AuthConfig struct {
 // capability tokens. Each is `flag && capability` (the strict-mTLS pattern): the
 // flag is authoritative for enforcement AND recovery, so false disables the
 // behavior regardless of the durable latch. All default false except
-// AuditSignature, PartitionPause, RecoveryClaim and ConsolePassword, which LoadConfig defaults to
-// true. DigestV2 (not a capability token) also defaults to true.
+// AuditSignature, PartitionPause, RecoveryClaim, ConsolePassword and VRRPUnicast, which LoadConfig
+// defaults to true. DigestV2 (not a capability token) also defaults to true.
 type EnforcementConfig struct {
 	// SafeFenceDefault: a best-effort (unconfirmable) fence must carry an operator
 	// proof-of-power-off before the coordinator reschedules/promotes off the host
@@ -703,6 +703,19 @@ type EnforcementConfig struct {
 	// relies on a peer setting them. An explicit false is the kill switch:
 	// this host's next define of each domain drops its passwords.
 	ConsolePassword bool `yaml:"console_password,omitempty"`
+	// VRRPUnicast: once vrrp_unicast_v1 has latched, this host's load
+	// balancers send their keepalived VRRP as unicast between the LB hosts'
+	// recorded addresses, over the host network, instead of multicasting it
+	// with a plaintext password on the bridge the VIP's guests are on
+	// (capabilities.VRRPUnicastV1). Hosts must pass IP protocol 112 between
+	// their recorded addresses.
+	//
+	// DEFAULT TRUE (LoadConfig sets it before parsing; an explicit
+	// `vrrp_unicast: false` wins). The token is withheld while it is off: an
+	// LB host's peers rely on it rendering the same transport. An explicit
+	// false is the stand-down, and must be set on every host: each LB then
+	// re-renders the multicast transport on its next apply.
+	VRRPUnicast bool `yaml:"vrrp_unicast,omitempty"`
 	// DigestV2: emit the order-invariant anti-entropy row digest (digest_v2) so
 	// column-order-only differences (fresh CREATE vs ALTER ADD COLUMN) stop showing as
 	// row-content divergence + perpetual no-op merges. Negotiated PAIRWISE by wire-field
@@ -999,10 +1012,10 @@ func LoadConfig() (*Config, error) {
 		PCI: PCIConfig{SparePCIeRootPorts: 4},
 
 		// The enforcement flags that default ON — see EnforcementConfig.
-		// AuditSignature, PartitionPause, RecoveryClaim, ConsolePassword and DigestV2. An
-		// explicit false still wins (TestLoadConfig_RecoveryClaimDefaultsOn and
-		// its siblings pin both halves).
-		Enforcement: EnforcementConfig{AuditSignature: true, PartitionPause: true, RecoveryClaim: true, DigestV2: true, ConsolePassword: true},
+		// AuditSignature, PartitionPause, RecoveryClaim, ConsolePassword, VRRPUnicast
+		// and DigestV2. An explicit false still wins
+		// (TestLoadConfig_RecoveryClaimDefaultsOn and its siblings pin both halves).
+		Enforcement: EnforcementConfig{AuditSignature: true, PartitionPause: true, RecoveryClaim: true, DigestV2: true, ConsolePassword: true, VRRPUnicast: true},
 	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {

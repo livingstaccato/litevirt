@@ -797,6 +797,22 @@ func (m *Manager) startOrReloadKeepalived(cfgPath, pidFile string) error {
 	return nil
 }
 
+// KeepalivedUnicast reports whether this LB's keepalived config on disk sends
+// its VRRP as unicast (Config.VRRPUnicast); ok=false when there is no
+// readable config.
+func (m *Manager) KeepalivedUnicast(name string) (unicast, ok bool) {
+	data, err := os.ReadFile(filepath.Join(m.configDir, name+"-keepalived.conf"))
+	if err != nil {
+		return false, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "unicast_src_ip ") {
+			return true, true
+		}
+	}
+	return false, true
+}
+
 // KeepalivedRunning reports whether this LB's keepalived process is alive — the
 // real signal that its VIP is assigned. HAProxy binds the VIP non-locally even
 // when keepalived is down, so "haproxy is up" is NOT evidence the VIP works.

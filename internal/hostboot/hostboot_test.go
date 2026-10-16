@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -73,18 +74,111 @@ func TestSIGTERMRestartBootsUpgradingOnce(t *testing.T) {
 	}
 }
 
-// No graceful stop (a crash, a power cut): the boot is 'active' as before.
-// A post-upgrade boot is 'upgrading', confirmed by the upgrade watchdog.
-func TestBootWithoutMarker(t *testing.T) {
+// No graceful stop (a crash, a kill, a stop that could not be recorded): the
+// boot of a host recorded active is 'upgrading' until this daemon serves, as
+// after a graceful stop. Recorded 'active', it would be an active host that
+// answers nothing for as long as startup takes, and its peers fence it once
+// that passes their failure threshold (lab 1, 2026-10-14: ssh power-off 19 s
+// after the boot, about 4 s before it would have served).
+//
+// The boot notes that it awaits serving (AwaitingPath); the next boot, if this
+// daemon never served (Served), is 'active', so a daemon that crash-loops
+// before serving cannot keep re-arming the coordinator's upgrading timeout.
+//
+// Mutations: return 'active' for a boot without the marker (the boot before
+// this change) — the first boot is 'active'; drop the AwaitingPath check — the
+// second boot is 'upgrading' again; drop the write of AwaitingPath — likewise;
+// leave Served a no-op — the boot after a served one is 'active'.
+func TestUncleanBootAwaitsServingOnce(t *testing.T) {
 	db, ctx := hostIn(t, "active")
-	if b := BootState(ctx, db, "h", t.TempDir(), false, time.Now()); b.State != "active" || b.AwaitServing {
-		t.Fatalf("boot without a marker = %+v, want active", b)
+	dir := t.TempDir()
+	now := time.Now()
+	b := BootState(ctx, db, "h", dir, false, now)
+	if b.State != "upgrading" || !b.AwaitServing {
+		t.Fatalf("boot of an active host without a graceful stop = %+v, want upgrading until serving", b)
 	}
+	if _, err := os.Stat(AwaitingPath(dir)); err != nil {
+		t.Fatalf("the boot did not note that it awaits serving: %v", err)
+	}
+	if err := corrosion.UpdateHostState(ctx, db, "h", b.State); err != nil {
+		t.Fatal(err)
+	}
+	// The daemon dies before serving; systemd starts it again.
+	if b := BootState(ctx, db, "h", dir, false, now.Add(5*time.Second)); b.State != "active" || b.AwaitServing {
+		t.Fatalf("boot after a daemon that never served = %+v, want active", b)
+	}
+	if err := corrosion.UpdateHostState(ctx, db, "h", "active"); err != nil {
+		t.Fatal(err)
+	}
+	// That one serves; a later crash awaits serving again.
+	Served(dir)
+	if _, err := os.Stat(AwaitingPath(dir)); !os.IsNotExist(err) {
+		t.Fatalf("Served left the note in place: %v", err)
+	}
+	if b := BootState(ctx, db, "h", dir, false, now.Add(time.Minute)); b.State != "upgrading" || !b.AwaitServing {
+		t.Fatalf("unclean boot after a daemon that served = %+v, want upgrading until serving", b)
+	}
+}
+
+// A boot without the marker of a host recorded 'upgrading' — a graceful stop
+// whose next boot never wrote (a WAL-quarantined one), or a draining host's
+// SIGTERM — keeps it 'upgrading' while that state is younger than the
+// coordinator's timeout, and is 'active' once it is older: the coordinator may
+// be fencing it already. Any other state boots 'active' as before, and so does
+// a boot with no data dir, which could not bound a crash loop.
+//
+// Mutations: drop the age check — the stale 'upgrading' boots 'upgrading';
+// accept any state — the fenced, offline, maintenance, draining and joining
+// hosts boot 'upgrading'.
+func TestUncleanBootByRecordedState(t *testing.T) {
+	db, ctx := hostIn(t, "upgrading")
+	since, ok, err := corrosion.HostStateSince(ctx, db, "h")
+	if err != nil || !ok {
+		t.Fatalf("fixture: HostStateSince ok=%v err=%v", ok, err)
+	}
+	if b := BootState(ctx, db, "h", t.TempDir(), false, since.Add(UpgradingTimeout/2)); b.State != "upgrading" || !b.AwaitServing {
+		t.Fatalf("unclean boot of a host 'upgrading' for %s = %+v, want upgrading until serving", UpgradingTimeout/2, b)
+	}
+	if b := BootState(ctx, db, "h", t.TempDir(), false, since.Add(UpgradingTimeout+time.Second)); b.State != "active" || b.AwaitServing {
+		t.Fatalf("unclean boot of a host 'upgrading' past the timeout = %+v, want active", b)
+	}
+	if b := BootState(ctx, db, "h", t.TempDir(), false, since.Add(-time.Minute)); b.State != "active" || b.AwaitServing {
+		t.Fatalf("unclean boot dated before the 'upgrading' write = %+v, want active", b)
+	}
+	for _, st := range []string{"fenced", "offline", "maintenance", "draining", corrosion.HostStateJoining} {
+		db, ctx := hostIn(t, st)
+		dir := t.TempDir()
+		if b := BootState(ctx, db, "h", dir, false, time.Now()); b.State != "active" || b.AwaitServing {
+			t.Fatalf("unclean boot of a host recorded %s = %+v, want active", st, b)
+		}
+		if _, err := os.Stat(AwaitingPath(dir)); !os.IsNotExist(err) {
+			t.Fatalf("an active boot of a %s host noted that it awaits serving: %v", st, err)
+		}
+	}
+	db, ctx = hostIn(t, "active")
+	if b := BootState(ctx, db, "h", "", false, time.Now()); b.State != "active" || b.AwaitServing {
+		t.Fatalf("boot with no data dir = %+v, want active", b)
+	}
+	if b := BootState(ctx, db, "nobody", t.TempDir(), false, time.Now()); b.State != "active" || b.AwaitServing {
+		t.Fatalf("boot of a host with no record = %+v, want active", b)
+	}
+	// A post-upgrade boot is 'upgrading', confirmed by the upgrade watchdog.
 	if b := BootState(ctx, db, "h", t.TempDir(), true, time.Now()); b.State != "upgrading" || b.AwaitServing {
 		t.Fatalf("post-upgrade boot = %+v, want upgrading, confirmed by the upgrade watchdog", b)
 	}
-	if b := BootState(ctx, db, "h", "", false, time.Now()); b.State != "active" {
-		t.Fatalf("boot with no data dir = %+v, want active", b)
+}
+
+// A boot whose note cannot be written could not bound a crash loop, so it is
+// 'active' as before.
+//
+// Mutation: ignore the write error — the boot is 'upgrading'.
+func TestUncleanBootThatCannotNoteIsActive(t *testing.T) {
+	db, ctx := hostIn(t, "active")
+	// A data dir that is not there: no note to find, and none can be
+	// written.
+	dir := filepath.Join(t.TempDir(), "missing")
+	if b := BootState(ctx, db, "h", dir, false, time.Now()); b.State != "active" || b.AwaitServing {
+		t.Fatalf("boot that cannot note it awaits serving = %+v, want active", b)
 	}
 }
 
@@ -188,6 +282,51 @@ func TestConfirmServing(t *testing.T) {
 		if !errors.Is(err, ErrNotUpgrading) || flipped || got != st || stateOf(t, db) != st {
 			t.Fatalf("confirm of a %s host: flipped=%v state=%q err=%v record=%q", st, flipped, got, err, stateOf(t, db))
 		}
+	}
+}
+
+// A daemon that serves briefly and crashes again clears the awaiting note
+// each time; after FlapLimit unclean boots within FlapWindow the next one is
+// 'active', so a flapping daemon is fenced on its failure count as before.
+// Boots outside the window do not count.
+//
+// Mutation: drop the FlapLimit check — the fourth boot is 'upgrading'.
+func TestUncleanBootsThatFlapBootActive(t *testing.T) {
+	db, ctx := hostIn(t, "active")
+	dir := t.TempDir()
+	now := time.Now()
+	for i := 0; i < FlapLimit; i++ {
+		at := now.Add(time.Duration(i) * time.Minute)
+		if b := BootState(ctx, db, "h", dir, false, at); b.State != "upgrading" || !b.AwaitServing {
+			t.Fatalf("unclean boot %d = %+v, want upgrading until serving", i+1, b)
+		}
+		Served(dir) // it serves, then crashes again
+	}
+	if b := BootState(ctx, db, "h", dir, false, now.Add(FlapLimit*time.Minute)); b.State != "active" || b.AwaitServing {
+		t.Fatalf("unclean boot %d within %s = %+v, want active", FlapLimit+1, FlapWindow, b)
+	}
+	if _, err := os.Stat(AwaitingPath(dir)); !os.IsNotExist(err) {
+		t.Fatalf("an active boot noted that it awaits serving: %v", err)
+	}
+	// Quiet for longer than the window: the next crash awaits serving again.
+	if b := BootState(ctx, db, "h", dir, false, now.Add(FlapLimit*time.Minute+FlapWindow)); b.State != "upgrading" || !b.AwaitServing {
+		t.Fatalf("unclean boot after a quiet %s = %+v, want upgrading until serving", FlapWindow, b)
+	}
+}
+
+// A post-upgrade boot notes that it awaits serving like any other, so a crash
+// of it before it serves boots 'active', not 'upgrading' with a fresh timeout.
+//
+// Mutation: drop writeAwaiting from the upgrade branch — the crash after it
+// boots 'upgrading'.
+func TestUpgradeBootNotesAwaitingServing(t *testing.T) {
+	db, ctx := hostIn(t, "upgrading")
+	dir := t.TempDir()
+	if b := BootState(ctx, db, "h", dir, true, time.Now()); b.State != "upgrading" || b.AwaitServing {
+		t.Fatalf("post-upgrade boot = %+v, want upgrading, confirmed by the upgrade watchdog", b)
+	}
+	if b := BootState(ctx, db, "h", dir, false, time.Now()); b.State != "active" || b.AwaitServing {
+		t.Fatalf("crash of a post-upgrade boot that never served = %+v, want active", b)
 	}
 }
 

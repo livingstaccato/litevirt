@@ -205,6 +205,8 @@ var dataDirOwned = []string{
 	"host-updates.json",         // grpcapi/host_updates.go hostUpdateCountsPath
 	"file-restore",              // daemon.go fileRestoreCacheDir/fileRestoreRunDir (a non-root daemon only)
 	"restart-pending",           // hostboot/hostboot.go MarkerName: a graceful stop's time, for the next boot
+	"boot-awaiting-serving",     // hostboot/hostboot.go AwaitingName: a boot that awaits serving, until a daemon serves
+	"boot-unclean-history",      // hostboot/hostboot.go UncleanHistoryName: the last unclean boots' times
 	"nowts.hwm",                 // corrosion/hwm.go (and nowts.hwm.lock)
 	"split_brain_activated",     // health/capability.go ActivationMarkerBase (markers are .<token>)
 	"ceph-trash-purges.json",    // storage/ceph_trash.go cephPurgeStateFile (ResumeCephPurges(dir): set aside as .unreadable-<time>, dataDirOwnedPrefixes)

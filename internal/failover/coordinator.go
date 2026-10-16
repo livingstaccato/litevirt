@@ -203,6 +203,9 @@ type Coordinator struct {
 	// fencing tracks hosts that have already been fenced in this session
 	// to avoid double-fencing on repeated poll cycles.
 	fenced map[string]bool
+	// handledAt is, per host in fenced, when its recorded state was written
+	// as it was marked handled (markHandled, upgradingSinceHandled).
+	handledAt map[string]handledMark
 	// fenceRelocated records, for hosts THIS coordinator fenced, whether the
 	// fence actually relocated any VMs. Presence of a key means "fenced by me
 	// this session"; the value is "did VMs move". A spuriously-fenced host that
@@ -1009,7 +1012,7 @@ func (c *Coordinator) run(ctx context.Context) {
 			default:
 				continue
 			}
-			delete(c.fenced, target)
+			c.unmarkHandled(target)
 			// The fence path decides afresh; neither a refused wait nor a
 			// claim retry owed to the older fence outlives it.
 			delete(c.pauseWaits, target)
@@ -1133,7 +1136,7 @@ func (c *Coordinator) run(ctx context.Context) {
 			// 'offline' host with no such fence, have no resume path at all,
 			// so for those the cached skip is still the right answer.
 			if h.State != "fenced" && !recorded {
-				c.fenced[target] = true
+				c.markHandled(ctx, target)
 			}
 			c.mAttempt(PhaseSkip, ResultSkipped, ErrTerminalState)
 			continue
@@ -1385,6 +1388,7 @@ func (c *Coordinator) loseLease() {
 // re-derives any pause wait, recovery limit and claim retry from them.
 func (c *Coordinator) forgetEpisodes() {
 	c.fenced = make(map[string]bool)
+	c.handledAt = nil
 	c.fenceRelocated = make(map[string]bool)
 	c.confirmResumed = make(map[string]string)
 	c.afreshConfirm = nil
@@ -1548,26 +1552,35 @@ func (c *Coordinator) recoverHosts(ctx context.Context, q quorumView) {
 		slog.Info("failover: host healthy again, marking active",
 			"host", h.Name, "from", h.State, "healthy_observers", len(fresh), "quorum", quorum)
 		c.mAttempt(PhaseRecovery, ResultRecovered, errClassNone)
-		delete(c.fenced, h.Name)
+		c.unmarkHandled(h.Name)
 		delete(c.fenceRelocated, h.Name)
 		c.forgetHost(h.Name)
 	}
 }
 
-// clearRecoveredFromFenced drops hosts that are back to "active" from the
-// in-memory fenced set. The set is meant to mean "already handled this
-// down-episode"; it is set both by an actual fence AND by the terminal-state
-// skip in run(). Because it was never cleared on recovery, a host that went
+// clearRecoveredFromFenced drops hosts that are back to "active", or that
+// recorded themselves 'upgrading' since they were handled
+// (upgradingSinceHandled), from the in-memory fenced set. The set is meant to
+// mean "already handled this down-episode"; it is set both by an actual fence
+// AND by the terminal-state skip in run(). Because it was never cleared on recovery, a host that went
 // down, recovered, then failed again was silently skipped forever (until the
 // coordinator process restarted). Clearing recovered hosts each cycle restores
 // re-fencing.
 func (c *Coordinator) clearRecoveredFromFenced(ctx context.Context) {
 	for host := range c.fenced {
-		if h, err := corrosion.GetHost(ctx, c.db, host); err == nil && h != nil && h.State == "active" {
-			delete(c.fenced, host)
-			delete(c.fenceRelocated, host)
-			c.forgetHost(host)
+		h, err := corrosion.GetHost(ctx, c.db, host)
+		if err != nil || h == nil {
+			continue
 		}
+		if h.State == "upgrading" && c.upgradingSinceHandled(ctx, h) {
+			slog.Info("failover: a handled host recorded itself 'upgrading' since; judging it afresh, fenced if it does not serve within the upgrading timeout",
+				"host", host)
+		} else if h.State != "active" {
+			continue
+		}
+		c.unmarkHandled(host)
+		delete(c.fenceRelocated, host)
+		c.forgetHost(host)
 	}
 }
 
@@ -3106,7 +3119,7 @@ func (c *Coordinator) resumeFromConfirmation(ctx context.Context, target string)
 	slog.Info("failover: operator confirmed a host whose recovery was refused, resuming",
 		"host", target, "confirmation", rec.ID, "confirmed_at", rec.TS)
 	c.mAttempt(PhaseRecovery, ResultOK, ErrConfirmationResumed)
-	c.fenced[target] = true
+	c.markHandled(ctx, target)
 	c.confirmResumed[target] = rec.ID
 	c.unlimitRecovery(target) // an operator confirmed the host off
 	delete(c.pauseWaits, target)
@@ -3649,7 +3662,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// coordinator fenced the host and knows whether VMs moved", and a resuming
 	// leader knows neither — leaving it unset keeps recoverHosts' auto-recovery
 	// off a host somebody else's fence relocated VMs away from.
-	c.fenced[h.Name] = true
+	c.markHandled(ctx, h.Name)
 
 	// Step 2b: a fence that did not record the host "fenced" leaves it
 	// "offline" — a weaker claim, and the one the split-brain guards below

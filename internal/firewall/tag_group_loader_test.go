@@ -322,12 +322,15 @@ func refIDs(refs []TagGroupRef) []string {
 // unreadable here: no members, its accepts left out, its denies without the
 // address.
 //
-// Mutation: no shadow rule — Render refuses the plan (set declared twice):
-// red.
+// Its bindings, which need no set, are rendered.
+//
+// Mutations: no shadow rule — Render refuses the plan (set declared twice):
+// red; drop the shadowed group's bindings — red.
 func TestTagGroupLoader_AGroupNamedLikeAnotherGroupsV6Companion(t *testing.T) {
 	l := newTGLab(t)
+	l.sg("sg-v6", "v6-in")
 	l.group("web", webGroup)
-	l.group("web_v6", webGroup)
+	l.group("web_v6", `{"match":{"role":"web"},"networks":[],"security_groups":["v6-in"]}`)
 	l.vm("web-1", "host-a", tgFWID(1))
 	l.nic("web-1", "prod", "52:54:00:00:00:01", "tap1", "10.0.0.5")
 	l.lease("prod6", "fd00:1::5", "52:54:00:00:00:06", "vm", "", "web-1")
@@ -343,6 +346,10 @@ func TestTagGroupLoader_AGroupNamedLikeAnotherGroupsV6Companion(t *testing.T) {
 	mustContainAll(t, script, "set lv_tg_web_v6 {", "elements = { fd00:1::5 }", "tcp dport 22 drop")
 	if got := refIDs(plan.TagGroups.Unreadable); !slices.Equal(got, []string{"web_v6:", "web_v6:c1", "web_v6:c2"}) {
 		t.Errorf("unreadable %v", got)
+	}
+	// Its bindings still apply (controller ruling 2026-10-16).
+	if got := planNIC(t, plan, "tap1").SecurityGroups; !slices.Equal(got, []string{"v6-in"}) {
+		t.Errorf("tap1 = %v: the shadowed group's binding was dropped", got)
 	}
 }
 
@@ -560,5 +567,128 @@ func TestTagGroupLoader_AKeptDenyLosesItsAddressWithItsGroup(t *testing.T) {
 	}
 	if len(plan.InvalidRows) != 1 || plan.InvalidRows[0].Handling != HandlingKeptLast {
 		t.Errorf("premise: the row is kept as last rendered: %+v", plan.InvalidRows)
+	}
+}
+
+// A group whose row turns unreadable is rendered from the last definition
+// this loader read (controller ruling 2026-10-16): its set, its bindings and
+// its rules stay, and the report says "kept as last read".
+//
+// Mutation: forget the last readable definition — the binding and the set
+// go: red.
+func TestTagGroupLoader_AnUnreadableGroupKeepsItsLastReadableDefinition(t *testing.T) {
+	l := newTGLab(t)
+	l.sg("sg-web", "web-in")
+	l.group("web", `{"match":{"role":"web"},"networks":["prod"],"security_groups":["web-in"]}`)
+	l.vm("u", "host-a", tgFWID(1))
+	l.nic("u", "prod", "52:54:00:00:00:01", "tap1", "10.0.0.5")
+	l.tags("vm", tgFWID(1), `{"tags":{"role":"web"}}`)
+	l.clusterRule("c1", "tcp", "22", "tag:web", "drop")
+	load := l.loader("host-a", nil)
+	l.load(load)
+
+	rawRow(t, l.db, `UPDATE cluster_policies SET value = '{"match":' WHERE key = ?`, corrosion.FirewallTagGroupKeyPrefix+"web")
+	plan, script := l.load(load)
+	if got := planNIC(t, plan, "tap1").SecurityGroups; !slices.Equal(got, []string{"web-in"}) {
+		t.Errorf("tap1 = %v: the unreadable group's binding was dropped", got)
+	}
+	if got := setElems(plan, "lv_tg_web"); !slices.Equal(got, []string{"10.0.0.5"}) {
+		t.Errorf("lv_tg_web = %v", got)
+	}
+	mustContainAll(t, script, "tcp dport 22 ip saddr @lv_tg_web drop")
+	if got := plan.TagGroups.Unreadable; len(got) != 1 || got[0].Group != "web" || got[0].Handling != TagHandlingKeptLastRead {
+		t.Errorf("report %+v, want web kept as last read", got)
+	}
+}
+
+// A group that cannot be read and was never read by this loader (a fresh
+// daemon) holds at drop, on every network, every NIC of every workload here
+// with non-empty tags — neither its selector nor its networks are known —
+// until it reads again. Untagged workloads are untouched.
+//
+// Mutation: no hold — red.
+func TestTagGroupLoader_AnUnreadableGroupNeverReadHoldsEveryTaggedWorkload(t *testing.T) {
+	l := newTGLab(t)
+	l.group("web", `{"match":`)
+	l.vm("t1", "host-a", tgFWID(1))
+	l.nic("t1", "prod", "52:54:00:00:00:01", "tap1", "10.0.0.5")
+	rawRow(t, l.db, `INSERT INTO vm_nics (vm_name, id, network_name, mac, ordinal, ip, updated_at) VALUES ('t1', 'n2', 'dev', '52:54:00:00:00:02', 1, '', 't')`)
+	l.run["t1"]["52:54:00:00:00:02"] = "tap2"
+	l.tags("vm", tgFWID(1), `{"tags":{"env":"x"}}`)
+	l.vm("n1", "host-a", "")
+	l.nic("n1", "prod", "52:54:00:00:00:03", "tap3", "10.0.0.6")
+	load := l.loader("host-a", nil)
+
+	plan, _ := l.load(load)
+	for _, dev := range []string{"tap1", "tap2"} {
+		if !heldAtDrop(planNIC(t, plan, dev)) {
+			t.Errorf("%s of a tagged workload is not held", dev)
+		}
+	}
+	if heldAtDrop(planNIC(t, plan, "tap3")) {
+		t.Error("an untagged workload is held")
+	}
+	rep := plan.TagGroups
+	if len(rep.Unreadable) != 1 || rep.Unreadable[0].Handling != TagHandlingHeldTagged ||
+		len(rep.UnreadableHolds) != 1 || !slices.Equal(rep.UnreadableHolds[0].NICs, []string{"tap1", "tap2"}) {
+		t.Errorf("report %+v", rep)
+	}
+
+	rawRow(t, l.db, `UPDATE cluster_policies SET value = ? WHERE key = ?`, webGroup, corrosion.FirewallTagGroupKeyPrefix+"web")
+	plan, _ = l.load(load)
+	if heldAtDrop(planNIC(t, plan, "tap1")) {
+		t.Error("still held once the group reads again")
+	}
+}
+
+// A deny on a tag group that lives in ANOTHER host's host tier still widens
+// the unreadable-tags hold here: that host's chains match this workload's
+// address too (D4 review I-2). So does a direct, positive @lv_tg_<g> deny
+// (I-3).
+//
+// Mutations: read only this host's host rules — red; no denyRef from a
+// direct reference — red.
+func TestTagGroupLoader_AnyHostsDenyOrADirectReferenceWidensTheHold(t *testing.T) {
+	for _, tc := range []struct{ name, sql string }{
+		{"another host's host rule", `INSERT INTO host_firewall_rules (id, host_name, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)
+			VALUES ('h1', 'host-b', 'ingress', 'tcp', '22', 'tag:web', 'drop', 100, '', '', 't', 't')`},
+		{"a direct set reference", `INSERT INTO cluster_firewall_rules (id, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)
+			VALUES ('c1', 'ingress', 'tcp', '22', '@lv_tg_web', 'drop', 100, '', '', 't', 't')`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newTGLab(t)
+			l.group("web", webGroup)
+			l.vm("u", "host-a", tgFWID(1))
+			rawRow(t, l.db, `INSERT INTO vm_nics (vm_name, id, network_name, mac, ordinal, ip, updated_at) VALUES ('u', 'n2', 'dev', '52:54:00:00:00:02', 0, '', 't')`)
+			l.run["u"] = map[string]string{"52:54:00:00:00:02": "tap2"}
+			l.tags("vm", tgFWID(1), `{"tags":{"role":null}}`)
+			rawRow(t, l.db, tc.sql)
+			plan, _ := l.load(l.loader("host-a", nil))
+			if !heldAtDrop(planNIC(t, plan, "tap2")) {
+				t.Error("the unreadable workload's NIC is not held")
+			}
+		})
+	}
+}
+
+// A negated accept against a group's set (!= @lv_tg_<g>) would admit every
+// workload whose membership cannot be proven: it is left out and reported
+// (D4 review I-3).
+//
+// Mutation: render it — red.
+func TestTagGroupLoader_ANegatedAcceptOnAGroupsSetIsLeftOut(t *testing.T) {
+	l := newTGLab(t)
+	l.group("web", webGroup)
+	l.clusterRule("c1", "tcp", "80", "!= @lv_tg_web", "accept")
+	l.clusterRule("c2", "tcp", "81", "!= @lv_tg_web", "drop")
+	plan, script := l.load(l.loader("host-a", nil))
+	if strings.Contains(script, "dport 80") {
+		t.Errorf("the negated accept was rendered:\n%s", script)
+	}
+	if !strings.Contains(script, "tcp dport 81 ip saddr != @lv_tg_web drop") {
+		t.Errorf("a negated drop was not kept:\n%s", script)
+	}
+	if len(plan.InvalidRows) != 1 || plan.InvalidRows[0].ID != "c1" {
+		t.Errorf("invalid rows %+v, want c1", plan.InvalidRows)
 	}
 }

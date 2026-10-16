@@ -52,6 +52,12 @@ const (
 	// IPv6 companion, or no group name at all), so the accept is left out:
 	// it matches nothing either way.
 	TagHandlingLeftOut = "an accept: left out, so it matches nothing"
+
+	// Handlings of an unreadable or shadowed group (controller ruling
+	// 2026-10-16, amending spec §4.6).
+	TagHandlingKeptLastRead = "kept as last read: rendered from the last definition this host read"
+	TagHandlingHeldTagged   = "never read on this host: every NIC of every workload here with tags is held at drop until it reads"
+	TagHandlingShadowed     = "its bindings are rendered; its set cannot be declared, so its accepts match nothing and its denies lose their address"
 )
 
 // TagWorkloadHold is one workload, on this host, a pass reports.
@@ -85,26 +91,36 @@ type TagGroupReport struct {
 	// name an orphaned, non-empty tags row still names
 	// (firewall.tag_group.identity_lost; corrosion IdentityLost).
 	IdentityLost []TagWorkloadHold
+	// UnreadableHolds are this host's workloads with tags, held at drop on
+	// every network because a group could not be read and was never read
+	// here (TagHandlingHeldTagged).
+	UnreadableHolds []TagWorkloadHold
 }
 
 // tagMemory is what a loader remembers between passes: since when each rule
 // has named a missing group, so the condition waits out emptySetGrace.
 // Passes may overlap (Reconcile is not serialized), hence the lock.
+//
+// defs is each group's last readable definition, which a group whose row
+// turns unreadable is rendered from (controller ruling 2026-10-16). It lives
+// as long as the loader: after a restart, a group unreadable from the start
+// has none.
 type tagMemory struct {
 	mu    sync.Mutex
 	since map[string]time.Time
+	defs  map[string]corrosion.FirewallTagGroupDef
 }
 
-func (m *tagMemory) snapshot() map[string]time.Time {
+func (m *tagMemory) snapshot() (map[string]time.Time, map[string]corrosion.FirewallTagGroupDef) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.since
+	return m.since, m.defs
 }
 
-func (m *tagMemory) store(since map[string]time.Time) {
+func (m *tagMemory) store(since map[string]time.Time, defs map[string]corrosion.FirewallTagGroupDef) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.since = since
+	m.since, m.defs = since, defs
 }
 
 // tagPass is one loader pass's view of the tag groups.
@@ -118,6 +134,14 @@ type tagPass struct {
 	readable map[string]bool   // groups rendered as their set
 	whyNot   map[string]string // the others this replica holds: why not
 	members  *corrosion.TagGroupMembership
+	// binds are the definitions whose bindings render: the readable groups,
+	// those kept as last read, and the shadowed ones.
+	binds map[string]corrosion.FirewallTagGroupDef
+	defs  map[string]corrosion.FirewallTagGroupDef // this pass's readable definitions, for the memory
+	// holdAll: a group cannot be read and was never read here, so every
+	// tagged workload's membership is unknown.
+	holdAll bool
+	tagged  map[string]bool // kind|host|name of every workload with tags
 
 	empty    map[string]bool // sets declared empty for an accept on a group not rendered
 	denyRef  bool            // a deny rule matches a rendered group's set
@@ -133,14 +157,21 @@ type tagPass struct {
 
 // loadTagGroups reads every group and its members (one query set, none
 // beyond the groups when there are none).
-func loadTagGroups(ctx context.Context, db *corrosion.Client, host string, now time.Time, mem *tagMemory) (*tagPass, error) {
-	m, err := corrosion.ListTagGroupMembers(ctx, db)
+//
+// hostRules are every host's host-tier rules: a deny on a tag group in any
+// host's tier matches this host's workloads' addresses there (denyRef).
+func loadTagGroups(ctx context.Context, db *corrosion.Client, host string, now time.Time, mem *tagMemory,
+	hostRules []corrosion.FirewallRule) (*tagPass, error) {
+	sincePrev, kept := mem.snapshot()
+	m, err := corrosion.ListTagGroupMembersKeeping(ctx, db, kept)
 	if err != nil {
 		return nil, err
 	}
-	t := &tagPass{host: host, now: now, mem: mem, sincePrev: mem.snapshot(), members: m,
+	t := &tagPass{host: host, now: now, mem: mem, sincePrev: sincePrev, members: m,
 		groups: map[string]corrosion.FirewallTagGroup{}, readable: map[string]bool{}, whyNot: map[string]string{},
-		empty: map[string]bool{}, since: map[string]time.Time{}, reported: map[string]bool{},
+		binds: map[string]corrosion.FirewallTagGroupDef{}, defs: map[string]corrosion.FirewallTagGroupDef{},
+		tagged: map[string]bool{},
+		empty:  map[string]bool{}, since: map[string]time.Time{}, reported: map[string]bool{},
 		bindings: map[string][]string{}, shared: map[string][]string{}, tagsBad: map[string]bool{},
 		held: map[string]map[string]bool{}}
 	t.report.Members = map[string]int{}
@@ -151,27 +182,45 @@ func loadTagGroups(ctx context.Context, db *corrosion.Client, host string, now t
 		g := v.Group
 		switch {
 		case g.Unreadable:
+			// Never read here: neither its selector nor its networks are
+			// known, so every tagged workload is held (hold).
 			t.whyNot[g.Name] = "its row cannot be read"
+			t.holdAll = true
+			t.report.Members[g.Name] = 0
+			t.report.Unreadable = append(t.report.Unreadable, TagGroupRef{Group: g.Name, Reason: t.whyNot[g.Name], Handling: TagHandlingHeldTagged})
+			continue
 		case t.shadows(g.Name):
 			// lv_tg_<x>_v6 is group x's IPv6 companion: declaring it for
-			// this group too would make nft refuse the whole ruleset.
+			// this group too would make nft refuse the whole ruleset. Its
+			// bindings need no set and are rendered.
 			t.whyNot[g.Name] = fmt.Sprintf("its set would be the IPv6 companion of group %q's", strings.TrimSuffix(g.Name, ipv6SetSuffix))
+			t.report.Members[g.Name] = 0
+			t.report.Unreadable = append(t.report.Unreadable, TagGroupRef{Group: g.Name, Reason: t.whyNot[g.Name], Handling: TagHandlingShadowed})
+		case v.Kept:
+			t.readable[g.Name] = true
+			t.report.Members[g.Name] = len(v.Members)
+			t.report.Unreadable = append(t.report.Unreadable, TagGroupRef{Group: g.Name, Reason: "its row cannot be read", Handling: TagHandlingKeptLastRead})
 		default:
 			t.readable[g.Name] = true
 			t.report.Members[g.Name] = len(v.Members)
-			for _, mb := range v.Members {
-				if len(g.Def.SecurityGroups) == 0 {
-					continue
-				}
-				for _, n := range mb.Bound {
-					k := tagKey(mb.Kind, mb.Host, mb.Name) + "|" + n
-					t.bindings[k] = append(t.bindings[k], g.Def.SecurityGroups...)
-				}
-			}
-			continue
 		}
-		t.report.Members[g.Name] = 0
-		t.report.Unreadable = append(t.report.Unreadable, TagGroupRef{Group: g.Name, Reason: t.whyNot[g.Name]})
+		t.defs[g.Name] = g.Def
+		t.binds[g.Name] = g.Def
+		for _, mb := range v.Members {
+			if len(g.Def.SecurityGroups) == 0 {
+				continue
+			}
+			for _, n := range mb.Bound {
+				k := tagKey(mb.Kind, mb.Host, mb.Name) + "|" + n
+				t.bindings[k] = append(t.bindings[k], g.Def.SecurityGroups...)
+			}
+		}
+	}
+	for _, w := range m.Tagged {
+		t.tagged[tagKey(w.Kind, w.Host, w.Name)] = true
+	}
+	for _, r := range hostRules {
+		t.noteDeny(r.CIDR, r.Action)
 	}
 	for k, sgs := range t.bindings {
 		slices.Sort(sgs)
@@ -194,6 +243,22 @@ func loadTagGroups(ctx context.Context, db *corrosion.Client, host string, now t
 
 // shadows reports whether name is another group's IPv6 companion: x_v6 while
 // a group x exists.
+// noteDeny records that a deny matches a rendered group's set, through
+// tag:<g> or a positive @lv_tg_<g> (denyRef).
+func (t *tagPass) noteDeny(cidr, action string) {
+	if isAccept(action) {
+		return
+	}
+	if name, ok, valid := tagRef(cidr); ok && valid && t.readable[name] {
+		t.denyRef = true
+	}
+	if set, ok := rulefield.SetRef(cidr); ok && !rulefield.NegatedSetRef(cidr) {
+		if g, isTag := strings.CutPrefix(set, TagGroupSetPrefix); isTag && t.readable[g] {
+			t.denyRef = true
+		}
+	}
+}
+
 func (t *tagPass) shadows(name string) bool {
 	base, ok := strings.CutSuffix(name, ipv6SetSuffix)
 	_, exists := t.groups[base]
@@ -290,9 +355,7 @@ func (t *tagPass) rule(q *quarantine, table, id, direction, proto, port, cidr, a
 		switch {
 		case valid && t.readable[name]:
 			cidr = "@" + set
-			if !isAccept(action) {
-				t.denyRef = true
-			}
+			t.noteDeny(cidr, action)
 		case !isAccept(action):
 			// A deny keeps everything but the address (I-6).
 			t.refer(table, id, name, action, TagHandlingNoAddress)
@@ -318,6 +381,18 @@ func (t *tagPass) rule(q *quarantine, table, id, direction, proto, port, cidr, a
 	if !ok {
 		return r, false
 	}
+	if set, isRef := rulefield.SetRef(r.CIDR); isRef && strings.HasPrefix(set, TagGroupSetPrefix) && rulefield.NegatedSetRef(r.CIDR) &&
+		(r.Action == Accept || r.Action == "") {
+		// "Not a member" accepted would admit every workload whose
+		// membership cannot be proven (D4 review I-3): left out, which
+		// matches nothing.
+		delete(q.next, table+"/"+id)
+		q.invalid = append(q.invalid, InvalidRow{Table: table, ID: id, Action: action,
+			Reason:   fmt.Sprintf("cidr %q accepts what is not in a tag group's set, which would admit a workload whose membership cannot be proven", r.CIDR),
+			Handling: HandlingLeftOut})
+		return Rule{}, false
+	}
+	t.noteDeny(r.CIDR, string(r.Action))
 	// A rendering this host kept from an earlier pass (the row turned
 	// unreadable) may name a group's set this pass does not render: a deny
 	// on it then loses the address, as above.
@@ -378,6 +453,10 @@ func (t *tagPass) hold(kind, host, name, network, dev string) string {
 	case t.shared[k] != nil:
 		// Its membership is unknown on every network.
 		why = "firewall identity shared: held at drop"
+	case t.holdAll && (t.tagged[k] || t.tagsBad[k]):
+		// A group could not be read and never was here: whether this
+		// workload is one of its members is unknown, on any network.
+		why = "tag group unreadable: held at drop"
 	case t.tagsBad[k] && t.covers(network):
 		why = "firewall tags unreadable: held at drop"
 	}
@@ -397,8 +476,8 @@ func (t *tagPass) covers(network string) bool {
 	if t.denyRef {
 		return true
 	}
-	for name, g := range t.groups {
-		if t.readable[name] && len(g.Def.SecurityGroups) > 0 && g.BindsNetwork(network) {
+	for _, def := range t.binds {
+		if len(def.SecurityGroups) > 0 && (len(def.Networks) == 0 || slices.Contains(def.Networks, network)) {
 			return true
 		}
 	}
@@ -408,7 +487,7 @@ func (t *tagPass) covers(network string) bool {
 // finish completes the report: this host's workloads, the holds and the
 // rules still naming a missing group, sorted.
 func (t *tagPass) finish() TagGroupReport {
-	t.mem.store(t.since)
+	t.mem.store(t.since, t.defs)
 	here := func(w corrosion.TagWorkload) bool { return w.On == t.host }
 	hold := func(w corrosion.TagWorkload) TagWorkloadHold {
 		h := TagWorkloadHold{Kind: w.Kind, Name: w.Name, Host: w.Host, FWID: w.FWID}
@@ -430,6 +509,13 @@ func (t *tagPass) finish() TagGroupReport {
 	for _, w := range t.members.IdentityLost {
 		if here(w) {
 			t.report.IdentityLost = append(t.report.IdentityLost, hold(w))
+		}
+	}
+	if t.holdAll {
+		for _, w := range t.members.Tagged {
+			if here(w) {
+				t.report.UnreadableHolds = append(t.report.UnreadableHolds, hold(w))
+			}
 		}
 	}
 	for _, refs := range [][]TagGroupRef{t.report.Missing, t.report.Unreadable} {

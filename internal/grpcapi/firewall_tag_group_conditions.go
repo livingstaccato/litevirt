@@ -35,8 +35,11 @@ const conditionListMax = 10
 func (s *Server) recordTagGroupState(ctx context.Context, r firewall.TagGroupReport) {
 	s.setFirewallCondition(ctx, CondFirewallTagGroupMissing, len(r.Missing) > 0, corrosion.SeverityCritical,
 		tagRefsText("rules name a tag group this host's replica does not hold", r.Missing))
-	s.setFirewallCondition(ctx, CondFirewallTagGroupUnreadable, len(r.Unreadable) > 0, corrosion.SeverityCritical,
-		tagRefsText("tag groups this host cannot read have no members and bind nothing", r.Unreadable))
+	unreadable := tagRefsText("tag groups this host cannot read or cannot declare a set for", r.Unreadable)
+	if len(r.UnreadableHolds) > 0 {
+		unreadable += ". " + tagHoldsText("held at drop on every network until the group reads", r.UnreadableHolds)
+	}
+	s.setFirewallCondition(ctx, CondFirewallTagGroupUnreadable, len(r.Unreadable) > 0, corrosion.SeverityCritical, unreadable)
 	s.setFirewallCondition(ctx, CondFirewallTagsUnreadable, len(r.TagsUnreadable) > 0, corrosion.SeverityCritical,
 		tagHoldsText("firewall-tags rows that cannot be read grant no membership; the workload's NICs are held at drop "+
 			"on the networks a tag group binds security groups on (all of them while a drop or reject rule names a tag group). "+
@@ -61,7 +64,7 @@ func tagRefsText(lead string, refs []firewall.TagGroupRef) string {
 			break
 		}
 		if r.ID == "" {
-			parts = append(parts, fmt.Sprintf("group %s: %s", r.Group, r.Reason))
+			parts = append(parts, fmt.Sprintf("group %s: %s; %s", r.Group, r.Reason, r.Handling))
 			continue
 		}
 		row := firewall.InvalidRow{Table: r.Table, ID: r.ID}

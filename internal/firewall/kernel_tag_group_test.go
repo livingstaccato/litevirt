@@ -28,6 +28,7 @@ func TestKernelChild_TagGroupsHoldOnTheWire(t *testing.T) {
 		"gb": "10.20.0.2", // drops anything from web
 		"gc": "10.20.0.3", // no member
 		"ge": "10.20.0.5", // shares its firewall identity: held at drop
+		"gd": "10.20.0.6", // drops icmp from a missing group: from anyone
 	})
 	ctx := context.Background()
 	db := corrosion.NewTestClientT(t)
@@ -60,6 +61,7 @@ func TestKernelChild_TagGroupsHoldOnTheWire(t *testing.T) {
 	vm("gb", "", "52:54:00:20:00:02", "10.20.0.2", `["no-web"]`)
 	vm("gc", "", "52:54:00:20:00:03", "10.20.0.3", `[]`)
 	vm("ge", idShared, "52:54:00:20:00:05", "10.20.0.5", `[]`)
+	vm("gd", "", "52:54:00:20:00:06", "10.20.0.6", `["gone-drop"]`)
 	// ga's second NIC holds an IPv6 lease: the set gets its _v6 companion.
 	row(`INSERT INTO vm_nics (vm_name, id, network_name, mac, ordinal, ip, updated_at) VALUES ('ga', 'n6', 'lan6', '52:54:00:20:00:61', 1, '', 't')`)
 	row(`INSERT INTO ip_allocations (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
@@ -76,6 +78,11 @@ func TestKernelChild_TagGroupsHoldOnTheWire(t *testing.T) {
 	row(`INSERT INTO security_groups (id, name, created_at, updated_at) VALUES ('sg-1', 'no-web', 't', 't')`)
 	row(`INSERT INTO sg_rules (id, sg_id, direction, proto, port_range, cidr, action, created_at, updated_at)
 		VALUES ('r1', 'sg-1', 'ingress', 'all', '', 'tag:web', 'drop', 't', 't')`)
+	// A drop on a group that does not exist loses its address: it drops
+	// icmp into gd from everyone.
+	row(`INSERT INTO security_groups (id, name, created_at, updated_at) VALUES ('sg-2', 'gone-drop', 't', 't')`)
+	row(`INSERT INTO sg_rules (id, sg_id, direction, proto, port_range, cidr, action, created_at, updated_at)
+		VALUES ('r2', 'sg-2', 'ingress', 'icmp', '', 'tag:gone3', 'drop', 't', 't')`)
 	cluster := func(id, proto, port, cidr, action string) {
 		row(`INSERT INTO cluster_firewall_rules (id, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)
 			VALUES (?, 'ingress', ?, ?, ?, ?, 100, '', '', 't', 't')`, id, proto, port, cidr, action)
@@ -104,10 +111,12 @@ func TestKernelChild_TagGroupsHoldOnTheWire(t *testing.T) {
 	if len(plan.TagGroups.SharedIdentity) != 1 || len(plan.InvalidRows) != 0 {
 		t.Fatalf("premise: report %+v, invalid rows %+v", plan.TagGroups, plan.InvalidRows)
 	}
-	listed := sh(t, "nft", "list", "table", "bridge", NICTableName)
-	for _, want := range []string{"set lv_tg_web ", "set lv_tg_web_v6 ", "set lv_tg_gone2 ", "10.20.0.1", "fd00:20::1"} {
-		if !strings.Contains(listed, want) {
-			t.Errorf("the loaded bridge table lacks %q:\n%s", want, listed)
+	for _, table := range [][2]string{{"bridge", NICTableName}, {"inet", TableName}} {
+		listed := sh(t, "nft", "list", "table", table[0], table[1])
+		for _, want := range []string{"set lv_tg_web ", "set lv_tg_web_v6 ", "set lv_tg_gone2 ", "10.20.0.1", "fd00:20::1"} {
+			if !strings.Contains(listed, want) {
+				t.Errorf("the loaded %s table lacks %q:\n%s", table[0], want, listed)
+			}
 		}
 	}
 	for _, c := range []struct {
@@ -119,6 +128,8 @@ func TestKernelChild_TagGroupsHoldOnTheWire(t *testing.T) {
 		{"no member, into that NIC", "gc", "10.20.0.2", true},
 		{"into a NIC held for a shared identity", "gc", "10.20.0.5", false},
 		{"a member, elsewhere", "ga", "10.20.0.3", true},
+		{"no member, into a NIC whose drop names a missing group", "gc", "10.20.0.6", false},
+		{"a member, into that NIC", "ga", "10.20.0.6", false},
 	} {
 		if got := l.ping(c.from, c.to); got != c.want {
 			t.Errorf("%s (%s -> %s): reached=%v, want %v", c.name, c.from, c.to, got, c.want)

@@ -293,6 +293,9 @@ type TagGroupMember struct {
 type TagGroupView struct {
 	Group   FirewallTagGroup
 	Members []TagGroupMember
+	// Kept: the row cannot be read here, and Group.Def is the definition
+	// the caller kept from an earlier read (ListTagGroupMembersKeeping).
+	Kept bool
 }
 
 // TagWorkload names a live workload the membership read could not admit.
@@ -332,6 +335,10 @@ type TagGroupMembership struct {
 	// landed without its identity (D2b review M-7) or a restore into a freed
 	// name. For display only; nothing matches on the name for membership.
 	IdentityLost []TagWorkload
+	// Tagged are the live workloads with a unique identity (or an open
+	// move's target) and non-empty, readable tags: every workload a group
+	// could match.
+	Tagged []TagWorkload
 }
 
 type tagWorkloadKey struct{ kind, host, name string }
@@ -357,9 +364,25 @@ type tagsRow struct {
 // ListTagGroupMembers resolves every group on this replica to its members.
 // It reads nothing beyond the groups when no group exists.
 func ListTagGroupMembers(ctx context.Context, c *Client) (*TagGroupMembership, error) {
+	return ListTagGroupMembersKeeping(ctx, c, nil)
+}
+
+// ListTagGroupMembersKeeping is ListTagGroupMembers where a group whose row
+// cannot be read is evaluated from kept[name], a definition the caller kept
+// from an earlier read, when there is one (the view is then Kept).
+func ListTagGroupMembersKeeping(ctx context.Context, c *Client, kept map[string]FirewallTagGroupDef) (*TagGroupMembership, error) {
 	groups, err := ListFirewallTagGroups(ctx, c)
 	if err != nil {
 		return nil, err
+	}
+	keptGroup := map[string]bool{}
+	for i, g := range groups {
+		if def, ok := kept[g.Name]; ok && g.Unreadable {
+			if norm, err := normaliseTagGroupDef(def); err == nil {
+				groups[i].Def, groups[i].Unreadable = norm, false
+				keptGroup[g.Name] = true
+			}
+		}
 	}
 	out := &TagGroupMembership{}
 	if len(groups) == 0 {
@@ -430,6 +453,7 @@ func ListTagGroupMembers(ctx context.Context, c *Client) (*TagGroupMembership, e
 		cd := &candidate{w: w, tags: row.tags}
 		byKey[w.tagWorkloadKey] = cd
 		cands = append(cands, cd)
+		out.Tagged = append(out.Tagged, w.public())
 	}
 
 	// Each candidate's addresses: its own leases on a live NIC of its own.
@@ -455,7 +479,7 @@ func ListTagGroupMembers(ctx context.Context, c *Client) (*TagGroupMembership, e
 	}
 
 	for _, g := range groups {
-		v := TagGroupView{Group: g}
+		v := TagGroupView{Group: g, Kept: keptGroup[g.Name]}
 		for _, cd := range cands {
 			if !g.Matches(cd.tags) {
 				continue

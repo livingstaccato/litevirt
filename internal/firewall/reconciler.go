@@ -475,7 +475,13 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		// Tag groups (tag_groups.go): their sets are declared beside the
 		// user's, and a rule's tag:<name> is resolved before it is judged.
 		passNow := now()
-		tg, err := loadTagGroups(ctx, db, hostName, passNow, tagMem)
+		// Every host's host tier: a deny on a tag group there matches this
+		// host's workloads too (tagPass.noteDeny).
+		allHostRules, err := corrosion.ListHostFirewallRules(ctx, db, "")
+		if err != nil {
+			return plan, err
+		}
+		tg, err := loadTagGroups(ctx, db, hostName, passNow, tagMem, allHostRules)
 		if err != nil {
 			return plan, err
 		}
@@ -494,9 +500,11 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		}
 		plan.ClusterRules = toFWRules(q, tg, clusterRules, "cluster_firewall_rules")
 
-		hostRules, err := corrosion.ListHostFirewallRules(ctx, db, hostName)
-		if err != nil {
-			return plan, err
+		var hostRules []corrosion.FirewallRule
+		for _, r := range allHostRules {
+			if r.HostName == hostName {
+				hostRules = append(hostRules, r)
+			}
 		}
 		plan.HostRules = toFWRules(q, tg, hostRules, "host_firewall_rules")
 

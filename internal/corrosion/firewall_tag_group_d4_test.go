@@ -82,3 +82,41 @@ func TestTagGroupMembers_IdentityLostNamesAnOrphanRowOfTheName(t *testing.T) {
 		t.Errorf("a name matched a tags row into membership: %v", v.memberNames())
 	}
 }
+
+// A group that cannot be read here is evaluated from the definition the
+// caller kept from an earlier read (the loader's last readable one), and
+// marked Kept; without one it stays unreadable. Tagged lists every live
+// workload with a unique identity and non-empty readable tags, which the
+// loader holds when a group has no definition at all.
+//
+// Mutations: ignore the kept definition — red; leave Tagged empty — red.
+func TestTagGroupMembers_KeptDefinitionAndTagged(t *testing.T) {
+	f := newTagGroupFixture(t)
+	f.policy("firewall_tag_group/web", `{"match":`)
+	f.policy("firewall_tag_group/bad", `{"match":`)
+	f.vm("vm-a", tgID(1), "running")
+	f.tags("vm", tgID(1), `{"tags":{"role":"web"}}`)
+	f.ct("node-1", "ct-b", tgID(2), "running")
+	f.tags("ct", tgID(2), `{"tags":{"env":"x"}}`)
+	f.vm("vm-none", tgID(3), "running")
+	f.tags("vm", tgID(3), "")
+
+	m, err := ListTagGroupMembersKeeping(f.ctx, f.c, map[string]FirewallTagGroupDef{"web": {Match: map[string]string{"role": "web"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	web := m.viewFor(t, "web")
+	if !web.Kept || web.Group.Unreadable || !slices.Equal(web.memberNames(), []string{"vm:vm-a"}) {
+		t.Errorf("web = kept %v unreadable %v members %v, want kept with vm-a", web.Kept, web.Group.Unreadable, web.memberNames())
+	}
+	if bad := m.viewFor(t, "bad"); bad.Kept || !bad.Group.Unreadable || len(bad.Members) != 0 {
+		t.Errorf("bad = %+v, want unreadable with no members", bad)
+	}
+	var tagged []string
+	for _, w := range m.Tagged {
+		tagged = append(tagged, w.Kind+":"+w.Name+"@"+w.On)
+	}
+	if want := []string{"vm:vm-a@node-0", "ct:ct-b@node-1"}; !slices.Equal(tagged, want) {
+		t.Errorf("tagged %v, want %v", tagged, want)
+	}
+}

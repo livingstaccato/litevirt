@@ -1854,6 +1854,12 @@ holder writes.
   host while the host's own rows, written after those failures began, still
   mark a majority healthy. That is a one-way partition, in which the host may
   never pause. Nothing is recovered differently; find the asymmetric link.
+  The lease holder resolves it once the quorum reaches the host again or the
+  host no longer counts a majority, whichever holder raised it (a row
+  another holder raised stands for one lease, 45 s, first). It is not
+  raised for a host restarting (`upgrading`) within its allowance. A host
+  booting back from a fence comes up `fenced` or `offline`, not `upgrading`,
+  and can still raise it for the 15-25 s before its gRPC server serves.
 - `vm_settled` / `ct_settled` (`<name>@<host>`, warning): a host came back
   holding a copy of a workload that a decided recovery claim, whose
   certificate verifies, gave to another host at the same incarnation and an
@@ -2033,6 +2039,14 @@ and never blocks admission.
 | Raised when | Clears when |
 |---|---|
 | The health checker's heartbeat (every 250 ms) sees a gap longer than one probe interval (2 s), on either the monotonic or the wall clock. Confirmed at once: it is a measurement of the node's own scheduling, not an inference from a scan. **Warning** severity. The evidence carries `gap_seconds` and `grace_until`. A further stall inside the window extends the same episode, and `gap_seconds` keeps its longest pause: a long pause is often followed by a short one as the node catches up. | The grace window closes: 5 probe intervals (10 s) after the stall, the time a normal fence verdict takes to build. A condition left open by a previous daemon process is resolved on start. |
+
+After the window, the evidence may also carry `silent_runs`: for each peer
+whose first failing run after the stall began without the node having seen
+the peer answer since it stopped, the run's start (`run_start`, as its
+`host_health` verdict carries it) and `silent_since`, when the node stopped.
+Failover reads a failing run that began after a fence as the observer having
+seen the host answer, and refuses the recovery; a run recorded here is not
+read that way.
 
 **What you see.** A host that died while its observers were stalled is fenced
 up to one grace window later than usual. `lv doctor fence` lists the stalled

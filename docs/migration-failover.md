@@ -993,7 +993,12 @@ answered after its fence and then failed again has had the verdict that it
 answered overwritten, and only the failing runs' start shows the return: a run
 that began more than 5 seconds after the fence counts as an answer. An observer
 that restarted, or began probing the host only after the fence, starts such a
-run too, and the fence then no longer stands.
+run too, and the fence then no longer stands. An observer whose own process
+was stopped (frozen, suspended) across the fence starts one as well, once it
+resumes. If it has not seen the host answer since it stopped, it records that
+run in its `observer_stalled` condition (`silent_runs` in the evidence), and
+the run does not count as an answer when the stall began more than 5 seconds
+before the fence.
 
 **When a failing run started** is read from the verdict: an observer's failing
 `host_health` row carries the time of its run's first failed probe in

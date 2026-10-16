@@ -75,7 +75,7 @@ func newStallCluster(t *testing.T, names ...string) *stallCluster {
 			t.Fatalf("InsertHost %s: %v", name, err)
 		}
 		n := &stallNode{name: name, checker: health.NewChecker(name, t.TempDir(), db), clock: &stallClock{}}
-		n.checker.SetClockForTest(n.clock.Now)
+		n.checker.SetClockForTests(n.clock.Now)
 		observer := n
 		n.checker.SetPeerReadiness(func(ctx context.Context, host, _ string) (bool, string, error) {
 			return sc.probe(observer, host)

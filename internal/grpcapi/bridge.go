@@ -22,6 +22,13 @@ func (s *Server) ensureBridge(name string) error {
 // It is a seam because the answer decides a refusal. A unit test that let the
 // real host answer would pass or fail on which interfaces the test machine
 // happens to carry, and the interesting cases are exactly the two answers.
+func (s *Server) bridgeExistsHere(name string) bool {
+	if s.bridgeExists != nil {
+		return s.bridgeExists(name)
+	}
+	return network.BridgeExists(name)
+}
+
 // isBridgeHere reports whether name is a bridge on this host: a link that
 // exists and is a bridge, not a NIC, bond or VLAN of that name.
 func (s *Server) isBridgeHere(name string) bool {
@@ -29,13 +36,6 @@ func (s *Server) isBridgeHere(name string) bool {
 		return s.isBridge(name)
 	}
 	return network.IsBridge(name)
-}
-
-func (s *Server) bridgeExistsHere(name string) bool {
-	if s.bridgeExists != nil {
-		return s.bridgeExists(name)
-	}
-	return network.BridgeExists(name)
 }
 
 // bridgeHasUplinkHere answers the second host-local fact the DHCP finding needs:

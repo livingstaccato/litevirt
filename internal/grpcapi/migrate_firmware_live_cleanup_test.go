@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -302,11 +303,13 @@ func TestCleanupSource_StateChangedSinceCutoverStops(t *testing.T) {
 	}
 }
 
-// A marker in released (the cleanup never began, e.g. the cleaning write
-// failed) is cleaned up by the retry too.
+// Review I-2 (ruling): the retry takes only cleaning markers. A released
+// marker is left to restart recovery (D2-13), which re-sends Release or checks
+// the target first (§8.1, §17 D-5 released + target fenced): its source state
+// and definition stay whole.
 //
-// Mutation: retry only cleaning markers — red.
-func TestCleanupSource_RetryTakesReleasedMarker(t *testing.T) {
+// Mutation: retry released markers too — red.
+func TestCleanupSource_RetryLeavesReleasedMarker(t *testing.T) {
 	r := newFwlRig(t, fwlOpts{})
 	old := liveFirmwareSourceCleanup
 	liveFirmwareSourceCleanup = nil
@@ -316,7 +319,14 @@ func TestCleanupSource_RetryTakesReleasedMarker(t *testing.T) {
 	}
 	requireMarker(t, r, fwmig.PhaseReleased, "")
 	r.src.RetryLiveFirmwareCleanupsOnce(context.Background())
-	r.requireCleanedUp("after the retry of a released marker")
+	requireMarker(t, r, fwmig.PhaseReleased, "")
+	r.requireSourceIntact("after a retry pass over a released marker")
+	if st, ok := r.srcFake.RawState(fwlVM); !ok || st != libvirtfake.StateShutdown {
+		t.Errorf("source domain %q (defined %v), want defined and shut off", st, ok)
+	}
+	if ents, _ := os.ReadDir(filepath.Join(r.src.dataDir, fwmig.RetainedDir)); len(ents) != 0 {
+		t.Errorf("the cleanup began on a released marker: retained %v", ents)
+	}
 }
 
 // The retry leaves every other phase alone: a parked move is not cleaned up.
@@ -581,5 +591,262 @@ func TestAdoptedFirmwareMigration_M1pResumedGuestGetsItsVFs(t *testing.T) {
 	}
 	if !guestHasHostdev(t, r.src, fwlVM, vf) {
 		t.Fatal("the resumed guest runs without its VF")
+	}
+}
+
+// ── Fix round 1 ──
+
+// stoppedAtUndefine runs a move whose cleanup stops at the undefine (S1), the
+// bundle written; the injected failure is then cleared.
+func (r *fwlRig) stoppedAtUndefine() fwmig.Marker {
+	r.t.Helper()
+	r.srcFake.FailUndefinePreserv = func(string) error { return errors.New("injected undefine failure") }
+	if err := r.migrate(); err != nil {
+		r.t.Fatalf("the move landed, but reported %v", err)
+	}
+	m := requireMarker(r.t, r, fwmig.PhaseCleaning, "")
+	r.srcFake.FailUndefinePreserv = nil
+	return m
+}
+
+// cleanupCondition is the open cleanup condition of os1 on r's source.
+func (r *fwlRig) cleanupCondition() (corrosion.HealthCondition, bool) {
+	r.t.Helper()
+	c, found, err := corrosion.GetHealthCondition(context.Background(), r.src.db, firmwareMigrationEvaluator, condFwmigCleanupFailed, "vm", fwlVM)
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return c, found && c.Lifecycle != corrosion.ConditionResolved
+}
+
+// Review I-1: the retained bundle's 24 h start at the wipe, not at its write.
+// A cleanup that stopped for three days after writing the bundle, then
+// finished, leaves a bundle the sweep keeps for 24 h after the wipe.
+//
+// Mutation: drop the touch after the wipe — red.
+func TestCleanupSource_RetainedWindowStartsAtTheWipe(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	m := r.stoppedAtUndefine()
+	p := r.retained(m.Attempt)
+	long := time.Now().Add(-72 * time.Hour)
+	if err := os.Chtimes(p, long, long); err != nil {
+		t.Fatal(err)
+	}
+	r.src.RetryLiveFirmwareCleanupsOnce(context.Background())
+	r.requireCleanedUp("after the resumed cleanup")
+	wiped := time.Now()
+	r.src.FirmwareRetainedSweepOnce(context.Background(), wiped)
+	if !fwtExists(p) {
+		t.Fatal("the bundle was removed at the wipe: its 24 h ran from its write")
+	}
+	r.src.FirmwareRetainedSweepOnce(context.Background(), wiped.Add(23*time.Hour))
+	if !fwtExists(p) {
+		t.Fatal("the bundle was removed 23 h after the wipe")
+	}
+	r.src.FirmwareRetainedSweepOnce(context.Background(), wiped.Add(25*time.Hour))
+	if fwtExists(p) {
+		t.Fatal("the bundle was kept 25 h after the wipe")
+	}
+}
+
+// Review m-8: a resumed cleanup checks the bundle already there against the
+// marker's hashes, not its size: one that does not hold the cutover's state
+// stops the cleanup with nothing undefined or wiped.
+//
+// Mutation: accept any regular non-empty bundle — red.
+func TestCleanupSource_ResumeRefusesBundleNotMatchingTheMarker(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	m := r.stoppedAtUndefine()
+	other := &lv.FirmwareStore{DataDir: t.TempDir(), SwtpmBase: t.TempDir()}
+	r.write(other.NvramPath(fwlVM), []byte("some other VM's vars"))
+	r.write(filepath.Join(other.SwtpmDir(fwLiveUUID), "tpm2", "tpm2-00.permall"), fwlPermall)
+	f, err := os.Create(r.retained(m.Attempt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.WriteFirmwareBundle(fwlVM, fwLiveUUID, f); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	r.src.RetryLiveFirmwareCleanupsOnce(context.Background())
+	r.requireCleanupStopped("with a bundle that does not hold the cutover's state")
+	r.requireSourceIntact("with a bundle that does not hold the cutover's state")
+	if st, ok := r.srcFake.RawState(fwlVM); !ok || st != libvirtfake.StateShutdown {
+		t.Errorf("source domain %q (defined %v), want defined and shut off", st, ok)
+	}
+}
+
+// Review m-5: the TPM half of step 2's check. A permall that changed since
+// the cutover stops the cleanup with nothing written or removed.
+//
+// Mutation: drop the permall hash check — red.
+func TestCleanupSource_TPMStateChangedSinceCutoverStops(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	changed := []byte("TPM state written after the cutover")
+	r.src.fwLive.stepHook = func(step string) {
+		r.log.add(step)
+		if step == "cleanup" {
+			r.write(r.srcPermallPath(), changed)
+		}
+	}
+	if err := r.migrate(); err != nil {
+		t.Fatalf("the move landed, but reported %v", err)
+	}
+	r.requireCleanupStopped("after the source TPM state changed")
+	if b, _ := os.ReadFile(r.srcPermallPath()); !bytes.Equal(b, changed) {
+		t.Errorf("source permall %q, want the changed one kept", b)
+	}
+	m, _ := r.marker()
+	if fwtExists(r.retained(m.Attempt)) {
+		t.Error("a bundle was written from a state the cutover did not record")
+	}
+}
+
+// Review m-6: a source state that changed after the cutover never heals by
+// itself; the condition says so and names the operator's step, not "retried
+// once the cause is fixed".
+//
+// Mutation: give the hash mismatch the generic action — red.
+func TestCleanupSource_StateChangedConditionNamesTheOperatorStep(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	r.src.fwLive.stepHook = func(step string) {
+		r.log.add(step)
+		if step == "cleanup" {
+			r.write(r.srcStore.NvramPath(fwlVM), []byte("an NVRAM written after the cutover"))
+		}
+	}
+	if err := r.migrate(); err != nil {
+		t.Fatalf("the move landed, but reported %v", err)
+	}
+	c, open := r.cleanupCondition()
+	if !open {
+		t.Fatal("no cleanup condition")
+	}
+	for _, w := range []string{"changed after the cutover", "an operator", "D-5"} {
+		if !strings.Contains(c.Evidence, w) {
+			t.Errorf("evidence %s lacks %q", c.Evidence, w)
+		}
+	}
+	if strings.Contains(c.Evidence, "once the cause is fixed") {
+		t.Errorf("evidence %s promises a retry that cannot heal it", c.Evidence)
+	}
+}
+
+// Review m-1: a cleanup stuck on the same cause writes its condition once,
+// not on every pass; a new cause writes it again.
+//
+// Mutations: raise on every pass; never rewrite on a new cause — red.
+func TestCleanupSource_StoppedConditionWrittenOnChangeOnly(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	r.srcFake.FailUndefinePreserv = func(string) error { return errors.New("injected undefine failure") }
+	if err := r.migrate(); err != nil {
+		t.Fatalf("the move landed, but reported %v", err)
+	}
+	first, open := r.cleanupCondition()
+	if !open {
+		t.Fatal("no cleanup condition")
+	}
+	for i := 0; i < 3; i++ {
+		r.src.RetryLiveFirmwareCleanupsOnce(context.Background())
+	}
+	again, _ := r.cleanupCondition()
+	if again.ObserveCount != first.ObserveCount {
+		t.Fatalf("the same cause was written %d more times", again.ObserveCount-first.ObserveCount)
+	}
+	r.srcFake.FailUndefinePreserv = func(string) error { return errors.New("another undefine failure") }
+	r.src.RetryLiveFirmwareCleanupsOnce(context.Background())
+	changed, _ := r.cleanupCondition()
+	if changed.ObserveCount == first.ObserveCount || !strings.Contains(changed.Evidence, "another undefine failure") {
+		t.Fatalf("a new cause was not written: %+v", changed)
+	}
+}
+
+// Review m-2: a cleanup condition left open for a VM with no marker (a crash
+// after the marker went) is resolved by the next retry pass.
+//
+// Mutation: leave such a condition — red.
+func TestCleanupSource_RetryResolvesConditionWithoutMarker(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	if err := r.src.raiseFirmwareMigrationCondition(context.Background(), fwmigCondition{
+		Code: condFwmigCleanupFailed, VM: fwlVM, Attempt: rsAttemptA, Source: "src-host", Target: "dst-host", Detail: "left by a crash"}); err != nil {
+		t.Fatal(err)
+	}
+	r.src.RetryLiveFirmwareCleanupsOnce(context.Background())
+	if _, open := r.cleanupCondition(); open {
+		t.Fatal("the cleanup condition of a VM with no marker is still open")
+	}
+}
+
+// Review m-2, the order: the condition is resolved before the marker goes, so
+// a crash in between leaves a marker (and the retry) rather than an open
+// critical condition with nothing to resolve it.
+//
+// Mutation: resolve after the marker removal — red.
+func TestCleanupSource_ResolvesBeforeUnmark(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	r.stoppedAtUndefine()
+	var atRemoval struct {
+		open bool
+		seen bool
+	}
+	cleanupRemoveMarkerHook = func() {
+		_, atRemoval.open = r.cleanupCondition()
+		atRemoval.seen = true
+	}
+	t.Cleanup(func() { cleanupRemoveMarkerHook = nil })
+	r.src.RetryLiveFirmwareCleanupsOnce(context.Background())
+	if !atRemoval.seen {
+		t.Fatal("the marker removal was not reached")
+	}
+	if atRemoval.open {
+		t.Fatal("the condition was still open when the marker was removed")
+	}
+	r.requireCleanedUp("after the resumed cleanup")
+}
+
+// Review m-4: one marker that cannot be read does not stop the retry pass
+// over the others. The guard still refuses the undefine and the wipe while
+// any record on the host cannot be read (its uuid scan reads them all, D2-6),
+// so os1's cleanup is retried and stops at the guard, with the condition
+// naming the unreadable record; once it is repaired the next pass finishes.
+//
+// Mutation: give up the pass on the unreadable marker — red.
+func TestCleanupSource_RetryReachesOthersPastUnreadableMarker(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	r.stoppedAtUndefine()
+	bad := filepath.Join(r.src.dataDir, fwmig.InflightDir, "aaa.json")
+	r.write(bad, []byte("{"))
+	r.src.RetryLiveFirmwareCleanupsOnce(context.Background())
+	c, open := r.cleanupCondition()
+	if !open || !strings.Contains(c.Evidence, "aaa.json") {
+		t.Fatalf("os1's cleanup was not retried past the unreadable marker: %+v", c)
+	}
+	requireMarker(t, r, fwmig.PhaseCleaning, "")
+	r.requireSourceIntact("while a record cannot be read")
+	if err := os.Remove(bad); err != nil {
+		t.Fatal(err)
+	}
+	r.src.RetryLiveFirmwareCleanupsOnce(context.Background())
+	r.requireCleanedUp("once the record was repaired")
+}
+
+// Review m-5: an owed-DISCARD record that cannot be read may name any
+// attempt: the sweep removes nothing while one exists.
+//
+// Mutation: skip the unreadable owed-discard record — red.
+func TestRetainedSweep_UnreadableOwedDiscardKeepsAll(t *testing.T) {
+	s := testServerWithLocks(t)
+	p := rsRetained(t, s, "os1", rsAttemptA)
+	rsFile(t, p, 72*time.Hour)
+	bad := filepath.Join(s.dataDir, fwmig.DiscardOwedDir, "os9-"+rsAttemptB+".json")
+	if err := os.MkdirAll(filepath.Dir(bad), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bad, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.FirmwareRetainedSweepOnce(context.Background(), time.Now())
+	if !fwtExists(p) {
+		t.Fatal("a bundle was removed while an owed-discard record could not be read")
 	}
 }

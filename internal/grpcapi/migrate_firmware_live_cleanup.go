@@ -16,16 +16,23 @@ package grpcapi
 // DISCARD names its attempt. It never reads fwmig-quarantine/.
 
 import (
+	"archive/tar"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fwmig"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
@@ -38,6 +45,10 @@ var (
 	// often a stopped cleanup is retried (§7 S1).
 	firmwareRetainedSweepInterval = time.Minute
 )
+
+// cleanupRemoveMarkerHook, when set, runs just before the cleanup removes the
+// marker. Test-only.
+var cleanupRemoveMarkerHook func()
 
 func init() { liveFirmwareSourceCleanup = liveFirmwareCleanupAfterRelease }
 
@@ -52,15 +63,17 @@ func liveFirmwareCleanupAfterRelease(s *Server, ctx context.Context, m fwmig.Mar
 }
 
 // fwmigCleanupSource is §6.7, from a released marker or, resumed at its first
-// undone step, a cleaning one. The caller holds the VM's lock.
+// undone step, a cleaning one. The caller holds lockVM(m.VM) and passes the
+// marker it read under that lock.
 //
 //  1. Marker cleaning.
 //  2. The retained bundle, written durably from the state the cutover
 //     recorded; skipped when the attempt's bundle is already there.
 //  3. UndefineFirmwareMoveLeftover (state kept); skipped when no domain of
 //     the name is defined.
-//  4. WipeFirmwareMoveSource (the guard requires the bundle).
-//  5. The marker removed.
+//  4. WipeFirmwareMoveSource (the guard requires the bundle); the bundle's
+//     mtime is then set to now, so its 24 h run from the wipe.
+//  5. The cleanup condition resolved, then the marker removed.
 //
 // A failed step raises firmware_migration_cleanup_failed and returns its
 // error; no later step is taken (§7 S1).
@@ -85,11 +98,25 @@ func (s *Server) fwmigCleanupSource(ctx context.Context, m fwmig.Marker) error {
 	if err := s.fw().WipeFirmwareMoveSource(m.VM, m.UUID, m.Attempt); err != nil {
 		return s.liveFirmwareCleanupStopped(ctx, m, "wipe the source state", err)
 	}
+	// The bundle is now the only copy of the source's state: its 24 h start
+	// here, however long ago it was written (a cleanup that stopped after
+	// step 2 and resumed days later).
+	retained, err := s.fwRecords().RetainedPath(m.VM, m.Attempt)
+	if err == nil {
+		err = touchRetainedBundle(retained, time.Now())
+	}
+	if err != nil {
+		return s.liveFirmwareCleanupStopped(ctx, m, "start the retained bundle's 24 h", err)
+	}
+	// Resolved before the marker goes: a crash in between leaves the marker,
+	// which the retry finishes, never an open condition with no marker.
+	_ = s.resolveFirmwareMigrationCondition(ctx, condFwmigCleanupFailed, m.VM)
+	if h := cleanupRemoveMarkerHook; h != nil {
+		h()
+	}
 	if err := s.fwRecords().RemoveMarker(m.VM); err != nil {
 		return s.liveFirmwareCleanupStopped(ctx, m, "remove the marker", err)
 	}
-	_ = s.resolveFirmwareMigrationCondition(ctx, condFwmigCleanupFailed, m.VM)
-	retained, _ := s.fwRecords().RetainedPath(m.VM, m.Attempt)
 	slog.Info("live firmware move: source cleaned up; its firmware state is retained for 24 h",
 		"vm", m.VM, "attempt", m.Attempt, "target", m.Target, "retained", retained)
 	s.recordVMEvent(ctx, m.VM, "vm.migrate.firmware", "ok", fmt.Sprintf(
@@ -99,29 +126,70 @@ func (s *Server) fwmigCleanupSource(ctx context.Context, m fwmig.Marker) error {
 
 // liveFirmwareCleanupStopped is §7 S1: the condition raised, the source state
 // kept, the marker as it is (cleaning), retried by the next pass.
+//
+// The condition is written only when it is not open with this detail already,
+// so a cleanup stuck on one cause writes it once, not every pass; the Error log
+// follows it, and a repeat logs at Debug.
 func (s *Server) liveFirmwareCleanupStopped(ctx context.Context, m fwmig.Marker, step string, cause error) error {
 	retained, _ := s.fwRecords().RetainedPath(m.VM, m.Attempt)
 	detail := fmt.Sprintf("the source cleanup could not %s: %v", step, cause)
+	err := fmt.Errorf("VM %q: live firmware migration %s: %s", m.VM, m.Attempt, detail)
+	action := "the VM runs on the target; the source's firmware state is kept, and the cleanup is retried each minute once the cause is fixed"
+	if errors.Is(cause, errFirmwareCleanupStateChanged) {
+		action = "the VM runs on the target from the verified copy; the source's firmware state changed after the cutover, " +
+			"so it is kept and never wiped automatically, and a retry cannot heal it: an operator saves the state at the paths named " +
+			"and resolves the move with the D-5 firmware-move doctor (task D2-18); until then the marker keeps the state and vetoes its use"
+	}
+	if s.cleanupConditionOpenWith(ctx, m.VM, detail) {
+		slog.Debug("live firmware move: the source cleanup is still stopped", "vm", m.VM, "attempt", m.Attempt, "step", step, "error", cause)
+		return err
+	}
 	if cerr := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{
 		Code: condFwmigCleanupFailed, VM: m.VM, Attempt: m.Attempt, Source: s.hostName, Target: m.Target,
 		Hashes: map[string]string{"src_permall_sha256": m.SrcPermallSHA256, "src_nvram_sha256": m.SrcNvramSHA256},
 		Paths:  []string{retained, s.fw().SwtpmDir(m.UUID), s.fw().NvramPath(m.VM)},
 		Detail: detail,
-		Action: "the VM runs on the target; the source's firmware state is kept, and the cleanup is retried each minute once the cause is fixed",
+		Action: action,
 	}); cerr != nil {
 		slog.Warn("live firmware move: raise the condition", "vm", m.VM, "code", condFwmigCleanupFailed, "error", cerr)
 	}
 	slog.Error("live firmware move: the source cleanup stopped; the source state is kept", "vm", m.VM, "attempt", m.Attempt, "step", step, "error", cause)
-	return fmt.Errorf("VM %q: live firmware migration %s: %s", m.VM, m.Attempt, detail)
+	return err
 }
+
+// cleanupConditionOpenWith reports whether vm's cleanup condition is open
+// with detail as its evidence's detail. Anything unreadable is "no": the
+// condition is written.
+func (s *Server) cleanupConditionOpenWith(ctx context.Context, vm, detail string) bool {
+	if s.db == nil {
+		return false
+	}
+	c, found, err := corrosion.GetHealthCondition(ctx, s.db, firmwareMigrationEvaluator, condFwmigCleanupFailed, "vm", vm)
+	if err != nil || !found || c.Lifecycle == corrosion.ConditionResolved {
+		return false
+	}
+	var ev struct {
+		Detail string `json:"detail"`
+	}
+	return json.Unmarshal([]byte(c.Evidence), &ev) == nil && ev.Detail == detail
+}
+
+// errFirmwareCleanupStateChanged: the source state, or the bundle already
+// there, is not what the cutover recorded. No retry heals it.
+var errFirmwareCleanupStateChanged = errors.New("changed after the cutover")
 
 // writeRetainedFirmwareBundle is §6.7 step 2. A bundle of the attempt already
 // there is the one an earlier pass wrote (it is renamed into place only once
-// synced) and is kept as it is: what is left of the source state may be
-// partly wiped. Otherwise the source state must still be what the cutover
-// recorded — a state that changed since may hold the only copy of the change,
-// so nothing is written and the cleanup stops — and is written temp → fsync →
+// synced) and is kept as it is, never rewritten from what is left of the
+// source state (it may be partly wiped); it must still hold the state the
+// cutover recorded (its entries' hashes), or the cleanup stops. Otherwise the
+// source state must still be what the cutover recorded — a state that changed
+// since may hold the only copy of the change, so nothing is written and the
+// cleanup stops — and is written temp → fsync → checked against the marker →
 // rename → directory fsync, mode 0600.
+//
+// fwmig-retained/ is created, read and followed as found; a symlink in its
+// place needs root on the data directory, which is trusted (review m-7).
 func (s *Server) writeRetainedFirmwareBundle(m fwmig.Marker) error {
 	path, err := s.fwRecords().RetainedPath(m.VM, m.Attempt)
 	if err != nil {
@@ -129,7 +197,7 @@ func (s *Server) writeRetainedFirmwareBundle(m fwmig.Marker) error {
 	}
 	switch fi, err := os.Lstat(path); {
 	case err == nil && fi.Mode().IsRegular() && fi.Size() > 0:
-		return nil
+		return retainedBundleMatches(path, m)
 	case err == nil:
 		return fmt.Errorf("%s is there and is not a bundle (mode %v, %d bytes)", path, fi.Mode(), fi.Size())
 	case !errors.Is(err, os.ErrNotExist):
@@ -142,7 +210,7 @@ func (s *Server) writeRetainedFirmwareBundle(m fwmig.Marker) error {
 			return fmt.Errorf("read the source TPM state: %w", err)
 		}
 		if got != m.SrcPermallSHA256 {
-			return fmt.Errorf("the source TPM state is %s, not the %s recorded at cutover", got, m.SrcPermallSHA256)
+			return fmt.Errorf("%w: the source TPM state is %s, not the %s recorded at cutover", errFirmwareCleanupStateChanged, got, m.SrcPermallSHA256)
 		}
 	}
 	if m.UEFI {
@@ -151,7 +219,7 @@ func (s *Server) writeRetainedFirmwareBundle(m fwmig.Marker) error {
 			return fmt.Errorf("read the source NVRAM: %w", err)
 		}
 		if got != m.SrcNvramSHA256 {
-			return fmt.Errorf("the source NVRAM is %s, not the %s recorded at cutover", got, m.SrcNvramSHA256)
+			return fmt.Errorf("%w: the source NVRAM is %s, not the %s recorded at cutover", errFirmwareCleanupStateChanged, got, m.SrcNvramSHA256)
 		}
 	}
 	dir := filepath.Dir(path)
@@ -184,6 +252,11 @@ func (s *Server) writeRetainedFirmwareBundle(m fwmig.Marker) error {
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
+	if err == nil {
+		// What was written is what the cutover recorded (nothing may write
+		// the state between the hash above and the copy, but this is exact).
+		err = retainedBundleMatches(tmp.Name(), m)
+	}
 	if err != nil {
 		return err
 	}
@@ -192,6 +265,67 @@ func (s *Server) writeRetainedFirmwareBundle(m fwmig.Marker) error {
 	}
 	renamed = true
 	return syncDirPath(dir)
+}
+
+// retainedBundleMatches checks that the bundle at path holds the state the
+// marker recorded at cutover: its NVRAM entry for a UEFI VM, its permall entry
+// for a TPM VM, each with the marker's hash.
+func retainedBundleMatches(path string, m fwmig.Marker) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	const nvramEntry, permallEntry = "nvram", "swtpm/tpm2/tpm2-00.permall"
+	got := map[string]string{}
+	tr := tar.NewReader(f)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("read the retained bundle %s: %w", path, err)
+		}
+		name := filepath.ToSlash(filepath.Clean(hdr.Name))
+		if name != nvramEntry && name != permallEntry {
+			continue
+		}
+		h := sha256.New()
+		if _, err := io.Copy(h, tr); err != nil {
+			return fmt.Errorf("read the retained bundle %s: %w", path, err)
+		}
+		got[name] = hex.EncodeToString(h.Sum(nil))
+	}
+	if m.UEFI && got[nvramEntry] != m.SrcNvramSHA256 {
+		return fmt.Errorf("%w: the retained bundle %s holds NVRAM %q, not the %s recorded at cutover",
+			errFirmwareCleanupStateChanged, path, got[nvramEntry], m.SrcNvramSHA256)
+	}
+	if m.TPM && got[permallEntry] != m.SrcPermallSHA256 {
+		return fmt.Errorf("%w: the retained bundle %s holds TPM state %q, not the %s recorded at cutover",
+			errFirmwareCleanupStateChanged, path, got[permallEntry], m.SrcPermallSHA256)
+	}
+	return nil
+}
+
+// touchRetainedBundle sets the bundle's times to now, durably: the sweep
+// counts its 24 h from them.
+func touchRetainedBundle(path string, now time.Time) error {
+	if err := os.Chtimes(path, now, now); err != nil {
+		return err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	return syncDirPath(filepath.Dir(path))
 }
 
 // undefineLiveFirmwareLeftover is §6.7 step 3: the leftover definition goes,
@@ -233,28 +367,67 @@ func (s *Server) RunFirmwareRetainedSweep(ctx context.Context) {
 	}
 }
 
-// RetryLiveFirmwareCleanupsOnce runs the cleanup of each marker in released or
-// cleaning (§7 S1: a cleanup that stopped, or one that never began). A VM
-// whose lock is held (its move, or anything else, still runs) waits for the
-// next pass; the marker is re-read under the lock.
+// RetryLiveFirmwareCleanupsOnce resumes the cleanup of each marker in
+// cleaning (§7 S1). A released marker is not taken: restart recovery re-sends
+// Release or checks the target first (§8.1, §17 D-5), and the in-process move
+// cleans up right after it writes released. Each marker is read on its own, so
+// one that cannot be read (firmware_migration_record_unreadable names it)
+// does not hold up the others. A VM whose lock is held waits for the next
+// pass; the marker is re-read under the lock. A cleanup condition this host
+// raised for a VM that has no marker any more is resolved.
 func (s *Server) RetryLiveFirmwareCleanupsOnce(ctx context.Context) {
-	markers, err := s.fwRecords().ListMarkers()
-	if err != nil {
-		// firmware_migration_record_unreadable names the file.
-		slog.Warn("live firmware move: the markers cannot be read; no cleanup is retried", "error", err)
+	dir := filepath.Join(s.fw().DataDir, fwmig.InflightDir)
+	ents, err := os.ReadDir(dir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Warn("live firmware move: the markers cannot be listed; no cleanup is retried", "dir", dir, "error", err)
 		return
 	}
-	for _, m := range markers {
-		if m.Phase != fwmig.PhaseReleased && m.Phase != fwmig.PhaseCleaning {
+	for _, e := range ents {
+		vm, ok := strings.CutSuffix(e.Name(), ".json")
+		if !ok || !e.Type().IsRegular() {
 			continue
 		}
-		unlock, ok := s.tryLockVM(m.VM)
+		m, found, err := s.fwRecords().GetMarker(vm)
+		if err != nil {
+			slog.Warn("live firmware move: a marker cannot be read; its cleanup is not retried", "vm", vm, "error", err)
+			continue
+		}
+		if !found || m.Phase != fwmig.PhaseCleaning {
+			continue
+		}
+		unlock, ok := s.tryLockVM(vm)
 		if !ok {
 			continue
 		}
-		cur, found, err := s.fwRecords().GetMarker(m.VM)
-		if err == nil && found && cur.Attempt == m.Attempt && (cur.Phase == fwmig.PhaseReleased || cur.Phase == fwmig.PhaseCleaning) {
+		cur, found, err := s.fwRecords().GetMarker(vm)
+		if err == nil && found && cur.Attempt == m.Attempt && cur.Phase == fwmig.PhaseCleaning {
 			_ = s.fwmigCleanupSource(ctx, cur)
+		}
+		unlock()
+	}
+	s.resolveCleanupConditionsWithoutMarker(ctx)
+}
+
+// resolveCleanupConditionsWithoutMarker resolves each open cleanup condition
+// this host raised whose VM has no marker here (a crash after the marker went).
+func (s *Server) resolveCleanupConditionsWithoutMarker(ctx context.Context) {
+	if s.db == nil {
+		return
+	}
+	conds, err := corrosion.ListOpenHealthConditionsByCode(ctx, s.db, firmwareMigrationEvaluator, condFwmigCleanupFailed)
+	if err != nil {
+		return
+	}
+	for _, c := range conds {
+		if c.SubjectKind != "vm" || !slices.Contains(c.Hosts, s.hostName) {
+			continue
+		}
+		unlock, ok := s.tryLockVM(c.SubjectID)
+		if !ok {
+			continue
+		}
+		if _, found, err := s.fwRecords().GetMarker(c.SubjectID); err == nil && !found {
+			_ = s.resolveFirmwareMigrationCondition(ctx, condFwmigCleanupFailed, c.SubjectID)
 		}
 		unlock()
 	}

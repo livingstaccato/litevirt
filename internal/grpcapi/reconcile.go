@@ -244,6 +244,8 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 		newXML = patched
 	} else {
 		vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, hostdevConfigs)
+		// The seed and installer CD-ROMs are in no table read above.
+		s.keepCDROMs(&vmCfg, vm.Name, spec.Uuid, priorXML)
 		usb, uerr := s.resolveUSBHostdevs(ctx, spec)
 		if uerr != nil {
 			return uerr

@@ -599,6 +599,8 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 			LocalHostname: req.Target,
 			UserData:      userData,
 			NetworkConfig: netCfg,
+			// The clone's network-config is always litevirt's (above).
+			VendorData: cloudinit.SeedVendorData(nil, netCfg),
 		}, isoPath); err != nil {
 			cleanup()
 			return nil, status.Errorf(codes.Internal, "generate cloud-init ISO: %v", err)

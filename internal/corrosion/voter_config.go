@@ -31,6 +31,14 @@ type VoterConfig struct {
 	VoterConfigValue
 	MembersHash string
 	Certificate string // JSON ClaimCertificate; "" only in a hand-built test row
+	// UpdatedAt is the row's stamp, on the clock of the node whose row won
+	// the merge (voterConfigMergeKeepLocalRow: the greater certificate,
+	// then updated_at, wins whole). It is not this node's write: another
+	// writer's stamp, earlier than this node first held the row, can replace
+	// it. It is no earlier than that writer's own write of the decision.
+	// CreatedAt is the proposal's, carried in the claim value: a value
+	// another proposer completed keeps it, however late it is written.
+	UpdatedAt string
 }
 
 // Explicit reports whether the generation has members. A reset generation has
@@ -150,10 +158,11 @@ func scanVoterConfig(r Row) (*VoterConfig, error) {
 		},
 		MembersHash: r.String("members_hash"),
 		Certificate: r.String("certificate"),
+		UpdatedAt:   r.String("updated_at"),
 	}, nil
 }
 
-const voterConfigCols = `generation, members_json, members_hash, change, certificate, created_by, created_at`
+const voterConfigCols = `generation, members_json, members_hash, change, certificate, created_by, created_at, updated_at`
 
 // GetVoterConfig reads one generation's row; nil when absent.
 func GetVoterConfig(ctx context.Context, c *Client, generation int64) (*VoterConfig, error) {

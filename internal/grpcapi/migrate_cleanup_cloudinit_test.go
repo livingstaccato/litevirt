@@ -77,7 +77,7 @@ func TestCleanupMigrationArtifacts_KeepsTheCloudInitISOOfAVMThatLivesHere(t *tes
 		insertTestVM(t, adminCtx(), s.db, "home", s.hostName, "running")
 		// This host generated it — as a migration target that then became the
 		// VM's home — so only the vm-lives-here rule can keep it.
-		if _, err := s.EnsureCloudInit(adminCtx(), &pb.EnsureCloudInitRequest{VmName: "home"}); err != nil {
+		if _, err := s.EnsureCloudInit(diskPeerCtx(t, s), &pb.EnsureCloudInitRequest{VmName: "home"}); err != nil {
 			t.Fatalf("EnsureCloudInit: %v", err)
 		}
 		iso := lv.CloudInitISOPath(s.dataDir, "home")
@@ -92,7 +92,7 @@ func TestCleanupMigrationArtifacts_KeepsTheCloudInitISOOfAVMThatLivesHere(t *tes
 		// The row still names the source (the cut-over has not committed),
 		// but the guest is running here.
 		insertTestVM(t, adminCtx(), s.db, "landed", "src-host", "running")
-		if _, err := s.EnsureCloudInit(adminCtx(), &pb.EnsureCloudInitRequest{VmName: "landed"}); err != nil {
+		if _, err := s.EnsureCloudInit(diskPeerCtx(t, s), &pb.EnsureCloudInitRequest{VmName: "landed"}); err != nil {
 			t.Fatalf("EnsureCloudInit: %v", err)
 		}
 		fake.SetState("landed", "running")
@@ -121,7 +121,7 @@ func TestCleanupMigrationArtifacts_KeepsACloudInitISOItDidNotCreate(t *testing.T
 	}
 
 	// The migration asks for it; it is already there, so nothing is created.
-	if _, err := s.EnsureCloudInit(adminCtx(), &pb.EnsureCloudInitRequest{VmName: "mig"}); err != nil {
+	if _, err := s.EnsureCloudInit(diskPeerCtx(t, s), &pb.EnsureCloudInitRequest{VmName: "mig"}); err != nil {
 		t.Fatalf("EnsureCloudInit: %v", err)
 	}
 	cleanupISO(t, s, "mig")
@@ -140,7 +140,7 @@ func TestCleanupMigrationArtifacts_RemovesTheCloudInitISOItCreated(t *testing.T)
 	s := testServer(t)
 	s.dataDir = t.TempDir()
 	insertTestVM(t, adminCtx(), s.db, "mig", "src-host", "running")
-	if _, err := s.EnsureCloudInit(adminCtx(), &pb.EnsureCloudInitRequest{VmName: "mig"}); err != nil {
+	if _, err := s.EnsureCloudInit(diskPeerCtx(t, s), &pb.EnsureCloudInitRequest{VmName: "mig"}); err != nil {
 		t.Fatalf("EnsureCloudInit: %v", err)
 	}
 	iso := lv.CloudInitISOPath(s.dataDir, "mig")

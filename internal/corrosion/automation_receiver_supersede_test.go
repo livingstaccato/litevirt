@@ -242,7 +242,11 @@ func TestReceiverRestartSupersedeAfterReattestation(t *testing.T) {
 	receiverProcessValue(t, dir, "supersede-old-content", receiverTransferPage{oldContentRequest, oldContent})
 	child := func(mode string) {
 		t.Helper()
-		cmd := exec.Command(os.Args[0], "-test.run=^TestReceiverRestartSupersedeProcess$", "-test.timeout=90s")
+		binary := os.Args[0]
+		if mode == "initial" && os.Getenv("RECEIVER_PREMERGE_BINARY") != "" {
+			binary = os.Getenv("RECEIVER_PREMERGE_BINARY")
+		}
+		cmd := exec.Command(binary, "-test.run=^TestReceiverRestartSupersedeProcess$", "-test.timeout=90s")
 		cmd.Env = append(os.Environ(), "RECEIVER_SUPERSEDE_DIR="+dir, "RECEIVER_SUPERSEDE_PKI="+r.dir, "RECEIVER_SUPERSEDE_MODE="+mode)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -251,9 +255,10 @@ func TestReceiverRestartSupersedeAfterReattestation(t *testing.T) {
 		if cmd.ProcessState == nil || !cmd.ProcessState.Success() {
 			t.Fatal("child not terminal")
 		}
-		t.Logf("actual receiver child %d %s exited successfully", cmd.ProcessState.Pid(), mode)
+		t.Logf("actual receiver child %d %s binary=%s exited successfully", cmd.ProcessState.Pid(), mode, binary)
 	}
 	child("initial")
+	child("retry-old")
 	var oldID string
 	receiverReadProcessValue(t, dir, "supersede-old-id", &oldID)
 	if len(oldID) != 64 {
@@ -323,6 +328,20 @@ func TestReceiverRestartSupersedeProcess(t *testing.T) {
 			t.Fatal(e)
 		}
 		receiverProcessValue(t, dir, "supersede-old-id", a.id)
+		return
+	}
+	if os.Getenv("RECEIVER_SUPERSEDE_MODE") == "retry-old" {
+		before := receiverAllStored(t, c)
+		a, e := r.Begin(ctx, old.Request.Intent, nil)
+		if e != nil {
+			t.Fatal("premerge persisted binding exact retry", e)
+		}
+		if _, e = r.Stage(ctx, a, "a", old.Request, old.Page); e != nil {
+			t.Fatal("premerge persisted page exact retry", e)
+		}
+		if before != receiverAllStored(t, c) {
+			t.Fatal("exact old retry changed retained evidence")
+		}
 		return
 	}
 	var oldID, pins, active string

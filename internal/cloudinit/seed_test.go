@@ -3,6 +3,7 @@ package cloudinit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -15,8 +16,9 @@ import (
 // spec [A(n1, ip X), B(n2)]. A is hot-detached (its row goes) and C is
 // attached on n1 (it takes ordinal 1, len([B]), and the n1 row). A rebuilt
 // seed must not give C A's address: C's row is at another position than A's
-// spec entry, so A is unresolved and the seed carries no network-config.
-// Before the detach, the same spec resolves by position and gives A X.
+// spec entry, so C has no entry and asks DHCP, and A, whose position holds no
+// live row, is left out. Before the detach, the same spec resolves by
+// position and gives A X.
 //
 // Mutation: match a MAC-less NIC to the one row on its network (the removed
 // by-network fallback) — C is written with X; drop the position match — the
@@ -50,7 +52,7 @@ func TestSeedNetworkConfig_HotAttachedNICIsNotTheDetachedOne(t *testing.T) {
 	insert("old", []corrosion.InterfaceRecord{
 		{VMName: "old", NetworkName: "n1", Ordinal: 0, MAC: "52:54:00:00:0a:0a", IP: "10.1.0.50"},
 		{VMName: "old", NetworkName: "n2", Ordinal: 1, MAC: "52:54:00:00:0b:0b"}})
-	got, err := SeedNetworkConfig(ctx, db, "old", spec)
+	got, err := SeedNetworkConfig(ctx, db, "old", spec, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,12 +65,15 @@ func TestSeedNetworkConfig_HotAttachedNICIsNotTheDetachedOne(t *testing.T) {
 		{VMName: "old2", NetworkName: "n2", Ordinal: 1, MAC: "52:54:00:00:0b:0c"},
 		{VMName: "old2", NetworkName: "n1", Ordinal: 1, MAC: "52:54:00:00:0c:0c"}})
 	spec.Name = "old2"
-	got, err = SeedNetworkConfig(ctx, db, "old2", spec)
+	got, err = SeedNetworkConfig(ctx, db, "old2", spec, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "" {
-		t.Errorf("the hot-attached NIC was matched to the detached NIC's entry; want no network-config, got:\n%s", got)
+	if strings.Contains(got, "10.1.0.50") || strings.Contains(got, "52:54:00:00:0a:0a") {
+		t.Errorf("the hot-attached NIC was matched to the detached NIC's entry, or A is still there:\n%s", got)
+	}
+	if !strings.Contains(got, "macaddress: \"52:54:00:00:0c:0c\"\n    set-name: lv525400000c0c\n    dhcp4: true\n") {
+		t.Errorf("the hot-attached NIC is not written as asking DHCP:\n%s", got)
 	}
 }
 
@@ -76,7 +81,9 @@ func TestSeedNetworkConfig_HotAttachedNICIsNotTheDetachedOne(t *testing.T) {
 // attached on n1, which takes ordinal 1 (len of what is left) and the (vm, n1)
 // row: its position is A's. C's row records its own lease Y, or no address, and
 // is not A's: the entry names an ip:, so the position match needs the row to
-// record X. Without it C is written with A's address.
+// record X. Without it C is written with A's address. Which NIC the entry is
+// cannot be told, and the result is ErrNICsAmbiguous, never "" (review C-1: a
+// rebuild took "" for "no network-config" and stripped the seed).
 //
 // Mutation: drop the address condition on the position match — the two
 // detached cases write C with X; make it always fail — the control and the
@@ -96,7 +103,7 @@ func TestSeedNetworkConfig_PositionMatchNeedsTheSpecIP(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	run := func(vm, specIP, rowIP string) string {
+	runErr := func(vm, specIP, rowIP string) (string, error) {
 		t.Helper()
 		rows := []corrosion.InterfaceRecord{
 			{VMName: vm, NetworkName: "n2", Ordinal: 0, MAC: "52:54:00:00:0b:0b"},
@@ -105,16 +112,21 @@ func TestSeedNetworkConfig_PositionMatchNeedsTheSpecIP(t *testing.T) {
 			t.Fatal(err)
 		}
 		spec := &pb.VMSpec{Name: vm, Network: []*pb.NetworkAttachment{{Name: "n2"}, {Name: "n1", Ip: specIP}}}
-		got, err := SeedNetworkConfig(ctx, db, vm, spec)
+		return SeedNetworkConfig(ctx, db, vm, spec, nil)
+	}
+	run := func(vm, specIP, rowIP string) string {
+		t.Helper()
+		got, err := runErr(vm, specIP, rowIP)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return got
 	}
-	// C's row: its own lease, or no address.
+	// C's row: its own lease, or no address. Which NIC the entry is cannot
+	// be told: the result says so (ErrNICsAmbiguous) rather than "".
 	for vm, rowIP := range map[string]string{"c-lease": "10.1.0.77", "c-none": ""} {
-		if got := run(vm, "10.1.0.50", rowIP); got != "" {
-			t.Errorf("%s: the attached NIC was given the detached NIC's entry; want no network-config, got:\n%s", vm, got)
+		if _, err := runErr(vm, "10.1.0.50", rowIP); !errors.Is(err, ErrNICsAmbiguous) {
+			t.Errorf("%s: want ErrNICsAmbiguous, got %v", vm, err)
 		}
 	}
 	// Control: the row records X, as every create wrote it.

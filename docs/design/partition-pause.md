@@ -538,16 +538,83 @@ All of this is in the failover coordinator (`internal/failover`).
      no latest verdict being an answer, no observer's failing run began after
      the wait started and this node has not probed the host healthy since;
      otherwise the host's own condition, dated to this outage, decides as
-     for an answer (a refusal on these alone is not reported as a bridge). A
-     derived one, or a newer generation that is a
+     for an answer (a refusal on these alone is not reported as a bridge).
+     Neither of those two holds the deadline when this node can prove that
+     the host has not held a majority since the fence by its own count:
+     over every voter set the host may be counting over, `n−q+1` voters
+     other than the host have failing runs that span the fence, so the
+     answer was a bridge's, and the deadline is quiet. The proof rests on
+     the host's replica having held every change of a member's voting
+     state decided more than 30 s before the outage began; a change stamped
+     within those 30 s, or since, or that cannot be dated, is one the host
+     may lack. The configuration must then be pinned, or the rule stands:
+     at most one generation, and no reset, decided within that window (none
+     at all on a derived set). A generation is dated by the later of its
+     proposal's stamp and its row's, since a value another proposer
+     completes keeps its proposal's stamp. The row's stamp is that of
+     whichever writer's row won the merge (the greater certificate wins),
+     which can be earlier than this node first held it: it shows that some
+     node wrote the generation then, not that the host held it, which only
+     the host's report below shows. The sets counted are the adopted
+     generation, each newer one, and the one before the adopted one, all
+     from one read of the voter configurations; when this node has adopted
+     a generation since the cycle read its voter set, the deadline holds for
+     that cycle and is counted again on the next. The
+     host must have reported, in a Ping (`voter_generation`) this node
+     received before the outage began, that it had adopted the oldest of
+     these or a later one that this node holds; with no such report (an
+     older build, a host whose adoption is stuck, a restart of this node,
+     which keeps the reports in memory) the rule stands. The proof also
+     rests on this node's replica holding every generation the host may be
+     counting over. The rule stands when this node does not hold every
+     generation from the oldest counted one to the newest, and when a voter
+     of a counted set has reported, in any Ping this node received, a
+     generation newer than the newest this node holds. A report of 0 after
+     an earlier one (a restart of the host before its first adoption pass,
+     or a host re-provisioned under the same name) forgets the earlier
+     ones. A report's receipt is dated on this node's wall clock, as the
+     outage's start is: a backward step of this node's own clock during the
+     outage can date a report received since as received before, the same
+     residual as a clock that steps within the hour a skew is kept. A stamp is the
+     writer's clock, moved later by the largest skew of any host, the fenced
+     one and deleted ones included. A run spans only when it began
+     `fenceSkewMargin` plus its observer's clock skew from this node before
+     the fence. A skew is this node's own measurement, kept in memory for an
+     hour (a clock that steps within that hour is not seen), or any
+     `clock_skew` row naming the peer, the largest of these; a row paired
+     with the fenced host counts for the fenced host alone. One measured
+     nowhere is taken as 30 s. This node's own run is left out once it has
+     probed the host since the wait began.
+     A derived one, or a newer generation that is a
      reset, is read from each node's own replica of host state, and then
      any observer that has seen the host answer since the fence refuses
-     (`fenceStillStands`). So does any observer once the pause can no longer
+     (`fenceStillStands`), except that a failing run begun after the fence
+     does not refuse under the same proof, counted over the derived set as
+     the host's replica held it when the outage began: the host itself,
+     though it is fenced here; a host whose voting state changed since, or
+     within 30 s before, or cannot be dated, or reads `unknown`, in the set
+     but not counted as spanning; and the explicit generation a reset
+     replaced. A read error keeps the rule. So does
+     any observer once the pause can no longer
      be relied on (§4.3: the host has since reported
      `partition_pause_failed`), since a host that answered was never
      stopped. When one of these deadlines passes quiet while this
      coordinator already keeps the host to a list, it keeps to the list as
      above.
+
+     The proof fails open, and the deadline can go ahead while the host
+     holds a majority, in these cases:
+     - a peer's clock steps within the hour this node keeps its measured
+       skew;
+     - a peer measured nowhere is skewed by more than the 30 s assumed for
+       it;
+     - this node's wall clock steps back during the outage;
+     - on the derived set, the host's replica lacks a change of a member's
+       voting state decided more than 30 s before the outage began;
+     - a host's row was purged outright, so its skew is left out of the
+       largest skew a stamp is moved by;
+     - this node's replica lacks a generation newer than the newest it holds,
+       and no voter of a counted set has reported it.
 
    If the host is no longer `fenced` or `offline`, the wait is dropped and
    nothing is recovered. The host came back, it will resume itself (§3.5), and

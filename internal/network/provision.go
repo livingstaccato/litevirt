@@ -2,8 +2,6 @@ package network
 
 import (
 	"context"
-	"crypto/sha1"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -37,12 +35,7 @@ func IsolatedBridgeName(networkName string) string {
 // of failing the VM create or the leftover-bridge cleanup forever. Every site
 // that creates or removes a flat bridge MUST use this so the names agree.
 func FlatBridgeName(networkName string) string {
-	if len(networkName) <= maxIfaceName {
-		return networkName
-	}
-	const prefix = "lvf-"
-	sum := sha1.Sum([]byte(networkName))
-	return prefix + hex.EncodeToString(sum[:])[:maxIfaceName-len(prefix)]
+	return compose.FlatBridgeName(networkName)
 }
 
 // ValidateBridgeNetworkName refuses a plain bridge network whose bridge name

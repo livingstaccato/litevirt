@@ -113,6 +113,21 @@ type peerState struct {
 	// It restarts wherever `failures` restarts at 1, so it is the start of
 	// exactly the run the published count describes.
 	runStart time.Time
+	// trackedSince is when this entry was created (local clock), and
+	// lastAnswerAt when the peer last answered a probe, ready or unready
+	// (local clock; zero if never). An answer that came back on a probe
+	// straddling a stall counts at the moment it was observed, after the
+	// stall: it may have arrived at any point of it.
+	trackedSince time.Time
+	lastAnswerAt time.Time
+	// silentFrom is the start of the EARLIEST stall since which the peer has
+	// not answered, among stalls this entry was tracking the peer before
+	// (zero: none). It is kept across later stalls — a long stop is commonly
+	// followed by a short catch-up one — and cleared by any answer.
+	silentFrom time.Time
+	// silentSince, while non-zero, is silentFrom for the current run, not yet
+	// recorded in the observer_stalled condition (noteSilentRun).
+	silentSince time.Time
 }
 
 // Checker performs periodic health checks on peer hosts.
@@ -129,6 +144,13 @@ type Checker struct {
 	mu     sync.Mutex
 	peers  map[string]*peerState // target hostname → cached state
 	crlVer int64                 // last published CRL version
+
+	// skewSeen is each peer's last measured clock skew from this node and
+	// when it was measured (checkClockSkew), whatever its size: the
+	// clock_skew table records only skews above a second, so a missing row
+	// cannot tell "measured and small" from "never measured"
+	// (MeasuredClockSkew).
+	skewSeen map[string]skewSample
 
 	// Warmup / quorum-timing anchors (local monotonic; reset on restart).
 	startedAt  time.Time // when Start began; bounds the Unknown warmup window
@@ -251,6 +273,7 @@ func NewChecker(hostName, pkiDir string, db *corrosion.Client) *Checker {
 		pkiDir:              pkiDir,
 		db:                  db,
 		peers:               make(map[string]*peerState),
+		skewSeen:            make(map[string]skewSample),
 		peerCaps:            make(map[string]peerCapEntry),
 		capActiveNeg:        make(map[string]capNegEntry),
 		capActivePos:        make(map[string]time.Time),
@@ -525,6 +548,24 @@ func shouldPersistHealth(changed, healthy, answeredUnready, recoveryPending bool
 	return answeredUnready || (healthy && recoveryPending)
 }
 
+// A run silent through a stall.
+//
+// A failing run starts at its first counted probe, StallGrace after the
+// observer resumes from a stall, and that start is what its verdicts publish
+// (last_seen). But failover reads a run that began after a fence as an answer
+// after the fence (restartedSinceObserversIn), and an observer frozen across a
+// fence then refused that fence's recovery for good (lab 1 Drill2,
+// 2026-10-16). So when the observer was already tracking the peer before the
+// stall and has not seen it answer since (peerState.silentFrom), the checker
+// records the run, with that stall's start, in its observer_stalled condition
+// (noteSilentRun), and failover excuses exactly that run.
+//
+// last_seen is not moved back to the stall's start. Failover also reads it as
+// the start of an unbroken watch (observerStreakSpans), and an observer that
+// was not running did not watch: a host can answer, and fail again, while it
+// is stopped. An answer of any kind since the stall began, including one on
+// a probe that straddled it, means the run is not silent through it.
+
 // The two host_health verdict shapes checkHost publishes. Every release since
 // v1.3.0 emits both, unchanged.
 const (
@@ -575,10 +616,21 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		// The cost is bounded and correct: after a restart a node must re-earn
 		// suspectThreshold consecutive failures — about 6 s at checkInterval —
 		// before it votes to fence again.
-		prev = &peerState{status: "", failures: 0, stallEpoch: stallEpoch}
+		prev = &peerState{status: "", failures: 0, stallEpoch: stallEpoch, trackedSince: observedAt}
 		c.peers[host.Name] = prev
 	}
+	if result != probeUnreachable {
+		prev.lastAnswerAt = observedAt
+		prev.silentFrom = time.Time{}
+	}
 	if prev.stallEpoch != stallEpoch {
+		// The first stall since this entry last probed the peer: silent
+		// through it when the entry was tracking the peer, and had its last
+		// answer, before it began. An earlier silence carries on.
+		if from := c.firstStallAfter(prev.stallEpoch); prev.silentFrom.IsZero() && !from.IsZero() &&
+			!prev.trackedSince.After(from) && !prev.lastAnswerAt.After(from) {
+			prev.silentFrom = from
+		}
 		prev.failures = 0
 		prev.stallEpoch = stallEpoch
 	}
@@ -643,8 +695,13 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	switch {
 	case result != probeUnreachable:
 		prev.runStart = time.Time{} // an answer, healthy or unready, ends the run
+		prev.silentSince = time.Time{}
 	case newFailures == 1 || prev.runStart.IsZero():
 		prev.runStart = observedAt
+		prev.silentSince = time.Time{}
+		if !prev.silentFrom.IsZero() && prev.silentFrom.Before(observedAt) {
+			prev.silentSince = prev.silentFrom
+		}
 	}
 
 	// An unchanged unready verdict is not a change. Its count is pinned, so it
@@ -669,8 +726,18 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		sinceWrite = HeartbeatInterval // never written: the first probe publishes
 	}
 	write := shouldPersistHealth(changed, healthy, result == probeNotReady, recoveryPending(host.State), sinceWrite)
-	runStart := prev.runStart
+	runStart, silentSince := prev.runStart, prev.silentSince
 	c.mu.Unlock()
+
+	// Before the verdict, so a replica that holds the verdict has normally
+	// received the record too; one that has not refuses until it does.
+	if !silentSince.IsZero() && c.noteSilentRun(ctx, host.Name, runStart, silentSince) {
+		c.mu.Lock()
+		if prev.runStart.Equal(runStart) {
+			prev.silentSince = time.Time{}
+		}
+		c.mu.Unlock()
+	}
 
 	if !write {
 		return
@@ -765,6 +832,14 @@ func (c *Checker) checkClockSkew(ctx context.Context, peerName string, peerTimes
 	}
 	mid := reqStart.Add(reqEnd.Sub(reqStart) / 2)
 	skew := peerTimestamp.Sub(mid).Abs()
+	c.mu.Lock()
+	for p, old := range c.skewSeen {
+		if time.Since(old.at) > skewMemory {
+			delete(c.skewSeen, p) // a removed host's entry does not stay
+		}
+	}
+	c.skewSeen[peerName] = skewSample{skew: skew, at: time.Now()}
+	c.mu.Unlock()
 	if skew > time.Second {
 		slog.Warn("clock skew detected — LWW conflict resolution may be unreliable",
 			"peer", peerName, "skew", skew, "fix", "Check NTP on "+peerName)
@@ -778,4 +853,26 @@ func (c *Checker) checkClockSkew(ctx context.Context, peerName string, peerTimes
 			c.hostName, peerName, skew.Seconds(), time.Now().UTC().Format(time.RFC3339),
 		)
 	}
+}
+
+// skewSample is one clock skew measurement of a peer (Checker.skewSeen).
+type skewSample struct {
+	skew time.Duration
+	at   time.Time
+}
+
+// skewMemory is how long a skew measurement stands for the peer's clock, as
+// long as the clock_skew table keeps a row.
+const skewMemory = time.Hour
+
+// MeasuredClockSkew reports peer's clock skew from this node as this run last
+// measured it, within skewMemory; ok is false when it has not measured it.
+func (c *Checker) MeasuredClockSkew(peer string) (time.Duration, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s, ok := c.skewSeen[peer]
+	if !ok || time.Since(s.at) > skewMemory {
+		return 0, false
+	}
+	return s.skew, true
 }

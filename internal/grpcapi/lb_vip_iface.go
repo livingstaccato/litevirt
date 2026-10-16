@@ -132,11 +132,11 @@ func (s *Server) lbNetworks(ctx context.Context) ([]lbNetwork, error) {
 }
 
 // splitNamed reports whether n is a stack's `bridge` network that hosts may
-// have provisioned under either of two names: a deploy's target host
-// provisions it on its short name (provisionComposeNetworks sets the
-// interface to it), while a peer target is sent the definition without one
-// and provisions it on the scoped name, and the row holds whichever write
-// replicated last. It returns the scoped and the short name.
+// have provisioned under either of two names: an older build's deploy put it
+// on its short name on the deploy's target host and on the scoped name on a
+// peer target, and the row holds whichever write replicated last (a deploy
+// now names the scoped device everywhere, defaultStackNetworkDevices). It
+// returns the scoped and the short name.
 func splitNamed(n lbNetwork) (scoped, short string, ok bool) {
 	if n.def.Type != "" && n.def.Type != "bridge" || n.stack == "" {
 		return "", "", false

@@ -361,6 +361,29 @@ func waitVMGone(t *testing.T, name string, timeout time.Duration) {
 	t.Errorf("VM %s still in ls after %v", name, timeout)
 }
 
+// removeVMVerified registers a cleanup that force-removes the VM and waits
+// until it is gone from `lv ls`, retrying the removal. It never calls
+// t.Fatal/t.Skip, so the removal always runs, and a VM that cannot be removed
+// is reported rather than silently leaked.
+func removeVMVerified(t *testing.T, name string) {
+	t.Helper()
+	t.Cleanup(func() {
+		deadline := time.Now().Add(3 * time.Minute)
+		for {
+			lvErr(t, "rm", name, "--force")
+			out, err := lvErr(t, "ls")
+			if err == nil && !strings.Contains(out, name) {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("cleanup: VM %s still present after 3m", name)
+				return
+			}
+			time.Sleep(3 * time.Second)
+		}
+	})
+}
+
 // requireHosts ensures we have at least n hosts discovered.
 func requireHosts(t *testing.T, n int) {
 	t.Helper()
@@ -1598,11 +1621,15 @@ func TestREST_AuthBadToken(t *testing.T) {
 
 func TestREST_VMLifecycle(t *testing.T) {
 	requireImage(t)
+	// Skip before creating anything: restReq skips on a missing URL or token,
+	// and a skip after the CLI create leaves the VM behind.
+	if restURL == "" || restToken == "" {
+		t.Skip("REST API URL or E2E_REST_TOKEN not set")
+	}
 	name := uniqueName("rv")
-	cleanup(t, func() {
-		restDELETE(t, "/api/v1/vms/"+name)
-		lvErr(t, "rm", name, "--force")
-	})
+	// The cleanup uses only the CLI: restReq calls t.Fatalf/t.Skip, which end
+	// the cleanup goroutine before the `lv rm` line would run.
+	removeVMVerified(t, name)
 
 	// Create via CLI.
 	lv(t, "run", "--name", name, "--image", testImage,

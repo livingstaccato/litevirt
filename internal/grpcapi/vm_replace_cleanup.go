@@ -604,6 +604,13 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 			} else if os.IsNotExist(e) {
 				_ = os.Remove(cloudinit.SeedOwnerPath(newSeed))
 			}
+			// So does its stale mark, best effort: a mark lost only has a
+			// NIC the seed does not list left unnamed there.
+			if _, e := os.Stat(cloudinit.SeedStalePath(oldSeed)); e == nil {
+				_ = os.Rename(cloudinit.SeedStalePath(oldSeed), cloudinit.SeedStalePath(newSeed))
+			} else if os.IsNotExist(e) {
+				_ = os.Remove(cloudinit.SeedStalePath(newSeed))
+			}
 		}
 		if e := s.virt.DefineDomain(xml); e != nil {
 			return failed("redefine", e)
@@ -665,6 +672,9 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 		if e := s.verifyVMISOForStart(ctx, rec); e != nil {
 			return failed("start", e)
 		}
+		// This start runs outside the start hook: a stale seed is rebuilt
+		// here as there, never refusing it.
+		s.retryStaleSeedForStart(ctx, rec)
 	}
 	releaseGuard, gerr := s.guardSharedDiskStart(ctx, m.ReplacedVM, "")
 	if gerr != nil {

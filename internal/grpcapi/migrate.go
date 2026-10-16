@@ -1191,12 +1191,26 @@ func (s *Server) sendReattachVFs(ctx context.Context, client pb.LiteVirtClient, 
 	}
 }
 
-// EnsureCloudInit generates a cloud-init ISO on this host unless the one here
-// is already this VM's. Called by the source host before migration so the
-// target has the ISO ready. A seed here of another VM of the name — one
-// deleted while this host kept its seed — is written again
-// (cloudinit/seed_owner.go).
+// EnsureCloudInit generates a cloud-init ISO on this host for a VM migrating
+// in. Called by the source host before migration so the target has the ISO
+// ready. A seed here of another VM of the name — one deleted while this host
+// kept its seed — is written again (cloudinit/seed_owner.go). A seed here that
+// is already this VM's is a copy from an earlier stay, which NICs attached or
+// detached since are not in, and the guest applies a seed's network-config
+// on every boot: its network-config and vendor-data are replaced by the
+// source's, and its meta-data and user-data are kept byte for byte. A source
+// from before it sent vendor-data derives its network-config another way, and
+// the seed is then kept as it is.
+//
+// It writes a seed — user-data and vendor-data the guest runs as root — and
+// stamps it as the VM's, so it is the target half of a migration a source
+// daemon drives, as EnsureFirmwareState is: a peer call (every source calls it
+// through its peer client), and vm.migrate on the VM for the identity the peer
+// forwards.
 func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitRequest) (*emptypb.Empty, error) {
+	if err := s.requirePeerCert(ctx); err != nil {
+		return nil, err
+	}
 	vm, err := s.authorizeMigrationHelper(ctx, req.VmName)
 	if err != nil {
 		return nil, err
@@ -1207,7 +1221,23 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 	}
 	owner := cloudinit.SpecUUID(vm.Spec)
 	if cloudinit.SeedIsFor(isoPath, owner) {
-		return &emptypb.Empty{}, nil // already this VM's
+		if req.Vendordata == nil {
+			return &emptypb.Empty{}, nil
+		}
+		changed, err := cloudinit.RebuildISO(isoPath, req.Networkconfig, *req.Vendordata)
+		if err != nil {
+			detail := fmt.Sprintf("the VM's seed at %s on %s could not take the migration source's network-config: %v; the VM arrives on it as it is, so a NIC attached or detached since the seed was written may lose its configuration in the guest at its next boot; the next start or NIC attach or detach of the VM on %s tries again", isoPath, s.hostName, err, s.hostName)
+			slog.Warn("cloud-init ISO for migration: "+detail, "vm", req.VmName)
+			if merr := cloudinit.MarkSeedStale(isoPath); merr != nil {
+				slog.Warn("cloud-init ISO for migration: could not mark the seed stale", "vm", req.VmName, "error", merr)
+			}
+			s.recordVMEventSeverity(ctx, req.VmName, "seed.rebuild_failed", "error", "warning", detail)
+			return nil, status.Errorf(codes.Internal, "rewrite the network-config of the VM's cloud-init ISO: %v", err)
+		}
+		if changed {
+			slog.Info("cloud-init ISO for migration: the VM's seed here takes the source's network-config", "vm", req.VmName, "path", isoPath)
+		}
+		return &emptypb.Empty{}, nil
 	}
 	// A file already at the path is written over, but it was not created
 	// for this migration: a failed migration's cleanup leaves the path alone,
@@ -1219,11 +1249,24 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 	if userData == "" {
 		userData = "#cloud-config\n{}\n"
 	}
+	// The vendor-data the source decided. A source from before the field
+	// sends none, and the target derives it from the VM's spec; a spec that
+	// cannot be read gets none.
+	vendorData := ""
+	if req.Vendordata != nil {
+		vendorData = *req.Vendordata
+	} else {
+		var spec pb.VMSpec
+		if json.Unmarshal([]byte(vm.Spec), &spec) == nil {
+			vendorData = cloudinit.SeedVendorData(&spec, req.Networkconfig)
+		}
+	}
 	if err := cloudinit.GenerateISO(cloudinit.Config{
 		InstanceID:    req.VmName,
 		LocalHostname: req.VmName,
 		UserData:      userData,
 		NetworkConfig: req.Networkconfig,
+		VendorData:    vendorData,
 	}, isoPath); err != nil {
 		return nil, status.Errorf(codes.Internal, "generate cloud-init ISO: %v", err)
 	}
@@ -2554,12 +2597,41 @@ func (s *Server) ensureCloudInitRequest(ctx context.Context, vm *corrosion.VMRec
 	if spec.CloudInit != nil {
 		req.Userdata = spec.CloudInit.Userdata
 	}
-	nc, err := cloudinit.SeedNetworkConfig(ctx, s.db, vm.Name, &spec)
-	if err != nil {
+	// The seed the VM runs on here: its NICs' guest names, and what is sent
+	// when the network-config cannot be derived. Whose it is is the hotplug
+	// rebuild's rule (cloudinit.OwnSeed).
+	iso := lv.CloudInitISOPath(s.dataDir, vm.Name)
+	own, ours, _ := cloudinit.OwnSeed(iso, s.seedClaim(vm, &spec))
+	var prior *cloudinit.Prior
+	if ours {
+		prior = cloudinit.PriorFrom(own.NetworkConfig)
+		prior.Stale = cloudinit.SeedMarkedStale(iso)
+	}
+	nc, err := cloudinit.SeedNetworkConfig(ctx, s.db, vm.Name, &spec, prior)
+	switch {
+	case errors.Is(err, cloudinit.ErrNICsAmbiguous):
+		// Which NIC is which cannot be told: the target gets this host's seed's
+		// network-config and vendor-data as they are, or — with no seed of the
+		// VM's here — a seed that has cloud-init leave the guest's network as
+		// it is; never a seed without network-config that update events the
+		// guest recorded would re-render as cloud-init's fallback.
+		var vd, detail string
+		if ours {
+			nc, vd = own.NetworkConfig, own.VendorData
+			detail = fmt.Sprintf("the migration target's seed takes this host's network-config as it is: %v (the spec of a VM created before it recorded NIC MACs)", err)
+		} else {
+			nc, vd = cloudinit.NetworkConfigDisabled, cloudinit.NetworkUpdatesOffVendorData
+			detail = fmt.Sprintf("the migration target's seed has cloud-init leave the guest's network as it is, as this host holds no seed of the VM's: %v (the spec of a VM created before it recorded NIC MACs); configure the VM's NICs in the guest", err)
+		}
+		s.recordVMEventSeverity(ctx, vm.Name, "seed.not_rebuilt", "ok", "warning", detail)
+		req.Networkconfig, req.Vendordata = nc, &vd
+		return req
+	case err != nil:
 		slog.Warn("ensureCloudInitOnTarget: network-config could not be derived; no seed sent", "vm", vm.Name, "error", err)
 		return nil
 	}
-	req.Networkconfig = nc
+	vd := cloudinit.SeedVendorData(&spec, nc)
+	req.Networkconfig, req.Vendordata = nc, &vd
 	return req
 }
 

@@ -3,7 +3,6 @@ package cloudinit
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -17,36 +16,48 @@ type Config struct {
 	LocalHostname string
 	UserData      string // #cloud-config YAML
 	NetworkConfig string // optional netplan config
+	VendorData    string // optional; see SeedVendorData
 }
 
 // GenerateISO creates a NoCloud cloud-init ISO at the given path.
 // Uses genisoimage to create a CDROM with label "cidata".
 func GenerateISO(cfg Config, outputPath string) error {
+	userData := cfg.UserData
+	if userData == "" {
+		userData = "#cloud-config\n{}\n"
+	}
+	return writeISO(Seed{
+		MetaData:      fmt.Sprintf("instance-id: %s\nlocal-hostname: %s\n", cfg.InstanceID, cfg.LocalHostname),
+		UserData:      userData,
+		NetworkConfig: cfg.NetworkConfig,
+		VendorData:    cfg.VendorData,
+	}, outputPath)
+}
+
+// writeISO writes seed's files as a NoCloud seed at outputPath, replacing
+// any file there. A seed with no network-config or vendor-data carries no
+// such file.
+func writeISO(seed Seed, outputPath string) error {
 	tmpDir, err := os.MkdirTemp("", "litevirt-cloudinit-")
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// meta-data
-	metaData := fmt.Sprintf("instance-id: %s\nlocal-hostname: %s\n", cfg.InstanceID, cfg.LocalHostname)
-	if err := os.WriteFile(filepath.Join(tmpDir, "meta-data"), []byte(metaData), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmpDir, "meta-data"), []byte(seed.MetaData), 0644); err != nil {
 		return fmt.Errorf("write meta-data: %w", err)
 	}
-
-	// user-data
-	userData := cfg.UserData
-	if userData == "" {
-		userData = "#cloud-config\n{}\n"
-	}
-	if err := os.WriteFile(filepath.Join(tmpDir, "user-data"), []byte(userData), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmpDir, "user-data"), []byte(seed.UserData), 0644); err != nil {
 		return fmt.Errorf("write user-data: %w", err)
 	}
-
-	// network-config (optional)
-	if cfg.NetworkConfig != "" {
-		if err := os.WriteFile(filepath.Join(tmpDir, "network-config"), []byte(cfg.NetworkConfig), 0644); err != nil {
+	if seed.NetworkConfig != "" {
+		if err := os.WriteFile(filepath.Join(tmpDir, "network-config"), []byte(seed.NetworkConfig), 0644); err != nil {
 			return fmt.Errorf("write network-config: %w", err)
+		}
+	}
+	if seed.VendorData != "" {
+		if err := os.WriteFile(filepath.Join(tmpDir, "vendor-data"), []byte(seed.VendorData), 0644); err != nil {
+			return fmt.Errorf("write vendor-data: %w", err)
 		}
 	}
 
@@ -66,23 +77,14 @@ func GenerateISO(cfg Config, outputPath string) error {
 	}
 	defer os.Remove(tmp) // gone after the rename
 
-	// Generate ISO
-	args := []string{
-		"-output", tmp,
-		"-volid", "cidata",
-		"-joliet",
-		"-rock",
-		tmpDir,
-	}
-
-	cmd := exec.Command("genisoimage", args...)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("genisoimage: %s: %w", string(output), err)
+	if err := buildISO(tmpDir, tmp); err != nil {
+		return err
 	}
 	diskmode.NarrowBestEffort(tmp)
 	if err := os.Rename(tmp, outputPath); err != nil {
 		return fmt.Errorf("place seed: %w", err)
 	}
+	clearSeedStale(outputPath)
 	return nil
 }
 

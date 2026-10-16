@@ -1,6 +1,7 @@
 package cloudinit
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -60,17 +61,64 @@ func StampSeed(iso, owner string) error {
 	return nil
 }
 
-// RemoveSeed removes the seed at iso and its stamp.
+// RemoveSeed removes the seed at iso, its stamp and its stale mark.
 func RemoveSeed(iso string) error {
 	err := os.Remove(iso)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if serr := os.Remove(SeedOwnerPath(iso)); serr != nil && !os.IsNotExist(serr) {
-		return serr
+	for _, p := range []string{SeedOwnerPath(iso), SeedStalePath(iso)} {
+		if serr := os.Remove(p); serr != nil && !os.IsNotExist(serr) {
+			return serr
+		}
 	}
 	return nil
 }
+
+// seedStaleSuffix names the stale mark beside a seed.
+const seedStaleSuffix = ".stale"
+
+// SeedStalePath is where the stale mark of the seed at iso is.
+func SeedStalePath(iso string) string { return iso + seedStaleSuffix }
+
+// MarkSeedStale records that the seed at iso could not be brought up to date
+// with the VM's NICs (a failed rebuild after an attach or detach, before a
+// start, or for a migration), so it may not list NICs the VM has, although
+// the domain beside it does. A later rebuild that succeeds (RebuildISO, or
+// the seed written again) removes the mark. Until then the seed's names are
+// read as possibly stale (Prior.Stale): a NIC it does not list may have been
+// named elsewhere.
+func MarkSeedStale(iso string) error {
+	return os.WriteFile(SeedStalePath(iso), nil, 0o600)
+}
+
+// SeedMarkedStale reports whether the seed at iso carries a stale mark.
+func SeedMarkedStale(iso string) bool {
+	_, err := os.Lstat(SeedStalePath(iso))
+	return err == nil
+}
+
+// seedTriedKey marks a context whose start has already tried the VM's seed.
+type seedTriedKey struct{}
+
+// WithSeedTriedForStart returns ctx marked as a start whose caller has already
+// tried to bring the VM's seed on this host up to date for it (the
+// reconciler, which rewrites the VM's own seed before it defines the domain).
+// The start hook (grpcapi's PrepareHardwareForStart) then does not try a stale
+// seed again, so one failed rebuild is one warning.
+func WithSeedTriedForStart(ctx context.Context) context.Context {
+	return context.WithValue(ctx, seedTriedKey{}, true)
+}
+
+// SeedTriedForStart reports whether ctx is marked by WithSeedTriedForStart.
+func SeedTriedForStart(ctx context.Context) bool {
+	tried, _ := ctx.Value(seedTriedKey{}).(bool)
+	return tried
+}
+
+// clearSeedStale removes the stale mark of the seed at iso. Best effort: a
+// mark left behind only has the seed's names read as possibly stale.
+func clearSeedStale(iso string) { _ = os.Remove(SeedStalePath(iso)) }
 
 // SeedOwner returns the stamp of the seed at iso: ok=false when it has none.
 func SeedOwner(iso string) (owner string, ok bool, err error) {

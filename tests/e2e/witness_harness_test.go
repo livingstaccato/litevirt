@@ -2011,15 +2011,52 @@ func refusalVerdict(before, after refusalSnap) (fail, note string) {
 // when it fails, why.
 type w4aOutcome struct{ Name, Fail string }
 
+// w4aFresh is what outage 2 left behind when the claim view, read at the
+// owner's epoch after the recovery, shows no decided attempt: the recovery
+// proofs minted since the owner lost power, outage 1's lease term, and the
+// host the VM recovered on.
+type w4aFresh struct {
+	Proofs []proof
+	T1     int
+	Dest   string
+}
+
+// problem names what keeps the proofs from being the stale-term sweep's
+// path, or "": the decided value (outage 1's, at the earlier term) was
+// abandoned, and one fresh claim at the new term decided a proof that
+// completed on the host the VM runs on. The claim that decided it is at the
+// owner's earlier epoch, which the recovery itself moved on.
+func (f w4aFresh) problem(p1 string) string {
+	if len(f.Proofs) != 1 {
+		return fmt.Sprintf("%d recovery proofs were minted since the power-off, want 1", len(f.Proofs))
+	}
+	p := f.Proofs[0]
+	switch {
+	case p.ID == p1:
+		return "the one proof is outage 1's " + p1
+	case p.Status != "completed":
+		return fmt.Sprintf("proof %s is %q, not completed", p.ID, p.Status)
+	case p.LeaseTerm <= f.T1:
+		return fmt.Sprintf("proof %s carries lease term %d, not above outage 1's %d", p.ID, p.LeaseTerm, f.T1)
+	case p.Dest != f.Dest:
+		return fmt.Sprintf("proof %s names %s, but the VM recovered on %s", p.ID, p.Dest, f.Dest)
+	}
+	return ""
+}
+
 // w4aVerdict judges W4a's second outage. dp is the decided proof (decided
-// tells whether any attempt is), p1 outage 1's accepted value, and gateRefused
-// whether the decided destination logged a lease-term refusal of p1.
-func w4aVerdict(e leaseTermExpect, recovered, decided bool, dp, p1 string, gateRefused bool) w4aOutcome {
+// tells whether any attempt is), p1 outage 1's accepted value, gateRefused
+// whether the decided destination logged a lease-term refusal of p1, and
+// fresh what outage 2 minted, read when no attempt reads decided.
+func w4aVerdict(e leaseTermExpect, recovered, decided bool, dp, p1 string, gateRefused bool, fresh w4aFresh) w4aOutcome {
 	switch {
 	case recovered && dp == p1:
 		return w4aOutcome{Name: "A"}
 	case recovered && !decided:
-		return w4aOutcome{Name: "B", Fail: "recovered, but no attempt reads decided"}
+		if why := fresh.problem(p1); why != "" {
+			return w4aOutcome{Name: "B", Fail: "recovered, but no attempt reads decided, and " + why}
+		}
+		return w4aOutcome{Name: "B-fresh"}
 	case recovered:
 		return w4aOutcome{Name: "B"}
 	case decided && dp == p1 && gateRefused && e.Inert:

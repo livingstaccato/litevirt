@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -480,6 +481,15 @@ type Coordinator struct {
 	// (health.Checker.LastContact), the second anchor of the pause deadline.
 	// nil anchors on the decision alone.
 	LastContact func(host string) (time.Time, bool)
+	// PeerClockSkew reports a peer's clock skew from this node as this run
+	// last measured it (health.Checker.MeasuredClockSkew). nil, or a peer it
+	// has not measured, leaves the skew unknown (observerSkews).
+	PeerClockSkew func(peer string) (time.Duration, bool)
+	// PeerVoterGeneration reports the highest voter generation peer said it
+	// had adopted in a Ping this node received before `before`
+	// (grpcapi.Server.PeerVoterGeneration). nil, or no such report, is no
+	// evidence (regainCandidates).
+	PeerVoterGeneration func(peer string, before time.Time) (int64, bool)
 	// pauseWaits holds recoveries waiting out a host's partition pause, or
 	// re-checking a deadline that refused (partition_pause.go). In memory: a successor re-derives the wait from
 	// the self-pause fence record, anchored at its own first sight of it.
@@ -575,6 +585,18 @@ func (c *Coordinator) upgradingGrace(ctx context.Context, h *corrosion.HostRecor
 		upd, ok = since, true
 	}
 	return upd, !ok || c.now().Sub(upd) < c.upgradingTimeout()
+}
+
+// restartingWithinAllowance reports whether host is recorded 'upgrading' and
+// still within upgradingTimeout: the fence path's skip (run). A host that
+// cannot be read is not.
+func (c *Coordinator) restartingWithinAllowance(ctx context.Context, host string) bool {
+	h, err := corrosion.GetHost(ctx, c.db, host)
+	if err != nil || h == nil || h.State != "upgrading" {
+		return false
+	}
+	_, within := c.upgradingGrace(ctx, h)
+	return within
 }
 
 // upgradingTimeout is how long a host recorded 'upgrading' is skipped.
@@ -932,6 +954,10 @@ func (c *Coordinator) run(ctx context.Context) {
 	}
 	c.evaluateRelayHealth(ctx, voters, fenceCandidates)
 
+	// Which hosts partition_one_way is open for, from the replicated rows:
+	// whoever raised one, this holder resolves it once its case is gone.
+	c.syncOneWay(ctx)
+
 	for _, cand := range candidates {
 		// Re-validate lease before each destructive action: long fence runs
 		// (IPMI verify up to 15 s) can outlast the lease without renewal.
@@ -952,9 +978,18 @@ func (c *Coordinator) run(ctx context.Context) {
 
 		target := cand.Target
 		// One-way partitions are made visible, never acted on differently
-		// (docs/design/partition-pause.md §7 F4).
-		if failing, healthy, oneWay := c.detectOneWay(ctx, target); oneWay || c.oneWay[target] {
-			c.noteOneWay(ctx, target, failing, healthy, oneWay)
+		// (docs/design/partition-pause.md §7 F4). Not for a host still
+		// restarting within its allowance, which the fence path below skips
+		// too: its daemon writes healthy rows about its peers before its own
+		// gRPC server serves, so it has exactly the one-way shape for the
+		// 15-25 s a graceful restart takes (lab 1, 2026-10-16). It is neither
+		// raised nor resolved for it until then. A host booting back from a
+		// fence is recorded 'fenced' or 'offline' (hostboot), not 'upgrading',
+		// and is not skipped: it can still raise the condition for that window.
+		if !c.restartingWithinAllowance(ctx, target) {
+			if failing, healthy, oneWay := c.detectOneWay(ctx, target); oneWay || c.oneWay[target] {
+				c.noteOneWay(ctx, target, failing, healthy, oneWay)
+			}
 		}
 		// HA disarmed, here or on a live voter: no fence, no resume of a
 		// recorded fence, no claim retry or pause wait. All of it is kept,
@@ -2526,6 +2561,15 @@ func (c *Coordinator) fenceStillStandsIn(hr healthRead, host string, at time.Tim
 // observer counts and a stale row counts too: this only ever refuses. An
 // observer that restarted its own daemon, or began probing the host only
 // after at, also starts a run after at and refuses, for an operator.
+//
+// An observer whose own process stopped across at (frozen, suspended) also
+// starts its run after at, once it resumes. That run says nothing about the
+// host, and is not counted when the observer recorded it as silent through
+// its stall — it has seen no answer from the host since before the stall —
+// and the stall began more than fenceSkewMargin before at (silentThroughStall).
+// Without that, an observer frozen across a fence refused the recovery for
+// good (lab 1 Drill2, 2026-10-16). Only this check excuses it: the run is
+// still no unbroken watch (observerStreakSpans).
 func restartedSinceObserversIn(hr healthRead, host string, at time.Time) []string {
 	var out []string
 	for _, r := range hr.rows {
@@ -2543,12 +2587,28 @@ func restartedSinceObserversIn(hr healthRead, host string, at time.Time) []strin
 		if !ok || started.After(upd) {
 			continue
 		}
-		if started.After(at.Add(fenceSkewMargin)) {
+		if started.After(at.Add(fenceSkewMargin)) && !hr.silentThroughStall(r.String("observer"), host, r.String("last_seen"), at) {
 			out = append(out, r.String("observer"))
 		}
 	}
 	sort.Strings(out)
 	return out
+}
+
+// silentThroughStall reports whether observer recorded its failing run about
+// host that began at lastSeen as silent through a stall of its own that
+// began more than fenceSkewMargin before at: it has not seen host answer
+// since before at (health.SilentSince). The record and the verdict replicate
+// separately; a verdict that arrives first refuses until the record does.
+//
+// silent_since is the observer's clock and at the fence leader's, compared
+// with the margin given to the safe side as the run-start check above is: an
+// observer whose clock runs more than fenceSkewMargin behind can be excused
+// for a stall that began just after at, the same exposure that check has
+// (the clock-skew alert fires first).
+func (hr healthRead) silentThroughStall(observer, host, lastSeen string, at time.Time) bool {
+	since, ok := health.SilentSince(hr.stalls.evidence(observer), host, lastSeen)
+	return ok && since.Before(at.Add(-fenceSkewMargin))
 }
 
 // whyRestarted is the refusal reason naming the observers whose failing run
@@ -2565,14 +2625,62 @@ func whyRestarted(observers []string) string {
 type healthRead struct {
 	rows []corrosion.Row
 	err  error
+	// stalls is each observer's observer_stalled evidence (silentThroughStall),
+	// read only if some run needs it. Unreadable, it is empty: nothing is
+	// excused.
+	stalls *stallRead
+}
+
+// stallRead is the observer_stalled evidence of every observer, read once,
+// on first use, for one healthRead.
+type stallRead struct {
+	once sync.Once
+	load func() map[string]string
+	m    map[string]string
+}
+
+// evidence is observer's own observer_stalled evidence ("" when none).
+func (s *stallRead) evidence(observer string) string {
+	if s == nil {
+		return ""
+	}
+	s.once.Do(func() { s.m = s.load() })
+	return s.m[observer]
 }
 
 // readHostHealth reads every observer's latest verdict about host: observer,
-// status, consecutive_failures, last_seen and updated_at.
+// status, consecutive_failures, last_seen and updated_at; and every
+// observer's observer_stalled evidence.
 func (c *Coordinator) readHostHealth(ctx context.Context, host string) healthRead {
 	rows, err := c.db.Query(ctx,
 		`SELECT observer, status, consecutive_failures, last_seen, updated_at FROM host_health WHERE target = ?`, host)
-	return healthRead{rows: rows, err: err}
+	hr := healthRead{rows: rows, err: err}
+	if err != nil {
+		return hr
+	}
+	hr.stalls = &stallRead{load: func() map[string]string { return c.readStallEvidence(ctx, host) }}
+	return hr
+}
+
+// readStallEvidence reads every host's observer_stalled evidence, by host.
+// Only a host's own row counts: it is the only writer of it, and another
+// host's row about it must not excuse its run. A read error yields none.
+func (c *Coordinator) readStallEvidence(ctx context.Context, host string) map[string]string {
+	stalled, err := c.db.Query(ctx,
+		`SELECT subject_id, reporter, evidence FROM health_conditions
+		 WHERE evaluator = ? AND code = ? AND subject_kind = 'host' AND deleted_at IS NULL`,
+		health.StallEvaluator, health.CondObserverStalled)
+	if err != nil {
+		slog.Warn("failover: observer_stalled read failed; no observer's stall excuses its failing run", "host", host, "error", err)
+		return nil
+	}
+	out := make(map[string]string, len(stalled))
+	for _, r := range stalled {
+		if id := r.String("subject_id"); r.String("reporter") == id {
+			out[id] = r.String("evidence")
+		}
+	}
+	return out
 }
 
 // answeredSinceObserversIn names the observers whose latest verdict about

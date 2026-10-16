@@ -78,3 +78,40 @@ func TestResolve_InPlacePlansARepairAndALiveChange(t *testing.T) {
 		}
 	}
 }
+
+// F2 (lab 2): a changed migrate.on-host-failure on an existing VM is planned as
+// an in-place "migrate" change — also for a VM whose stored migrate block
+// already matches the file but whose top-level on_host_failure, the one the
+// failover coordinator reads, does not (left so by an earlier in-place update
+// that stored only the block).
+func TestResolve_InPlacePlansAMigratePolicyChange(t *testing.T) {
+	def := compose.VMDef{Image: "ubuntu", CPU: 1, Memory: 512,
+		Migrate: &compose.MigrateDef{OnHostFailure: "restart-any"}, Update: &compose.UpdateDef{Strategy: "in-place"}}
+	for _, c := range []struct{ name, stored string }{
+		{"created with none", `{"image":"ubuntu","cpu":1,"memory_mib":512,"guest_agent":true,"on_host_failure":"none","migrate":{"on_host_failure":2}}`},
+		{"block updated, policy not", `{"image":"ubuntu","cpu":1,"memory_mib":512,"guest_agent":true,"on_host_failure":"none","migrate":{}}`},
+	} {
+		f := makeFile("mystack", map[string]compose.VMDef{"web": def})
+		state := makeState([]corrosion.HostRecord{makeHost("h1", 16, 32768)}, []corrosion.VMRecord{{
+			Name: "web", StackName: "mystack", HostName: "h1", State: "running", Spec: c.stored, CPUActual: 1, MemActual: 512,
+		}}, nil)
+		state.RecordedDisks = map[string]int{"web": 1}
+		plan, err := Resolve(context.Background(), f, state)
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		if len(plan.VMs) != 1 || plan.VMs[0].Kind != OpUpdate || plan.VMs[0].Apply != compose.ActionLive {
+			t.Errorf("%s: planned %+v, want a live update", c.name, plan.VMs)
+			continue
+		}
+		found := false
+		for _, d := range plan.VMs[0].Plan.MetadataChanges {
+			found = found || d.Field == "migrate"
+		}
+		if !found || plan.VMs[0].Spec.GetOnHostFailure() != "restart-any" {
+			t.Errorf("%s: plan %+v / desired on_host_failure %q, want a migrate change to restart-any",
+				c.name, plan.VMs[0].Plan.MetadataChanges, plan.VMs[0].Spec.GetOnHostFailure())
+		}
+	}
+}

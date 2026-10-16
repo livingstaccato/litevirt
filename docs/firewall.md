@@ -846,8 +846,34 @@ firewall tag; copy one over with `lv firewall tag set`.
   (its row has none) cannot be tagged until it is created again.
 - `lv inspect` (on stderr, beside the JSON) and `lv ct inspect` print a
   `Firewall tags:` line: the tags, `none`, `none (no firewall identity yet)`,
-  or `none (a row for an earlier incarnation of this name exists, fw_id <id>,
-  not applied)`. The web UI's VM page shows them read-only.
+  `none (a row for an earlier incarnation of this name exists, fw_id <id>,
+  not applied)`, or `unreadable` for a row that cannot be read. The web UI's
+  VM page shows them read-only, and `lv firewall tag ls` lists unreadable
+  rows too.
+- Where membership cannot be proven, the firewall fails closed and the host
+  raises a condition:
+  - a workload whose tags row cannot be read is a member of no group, and its
+    NICs are held at drop on the networks a tag group binds security groups
+    on, or on every network while a drop or reject rule names a tag group
+    (`firewall.tag_group.tags_unreadable`, critical);
+  - a workload whose identity another live workload holds too (a copy) is a
+    member of no group, and every NIC of each is held at drop; an open move's
+    own source and target are not held (`firewall.tag_group.identity_shared`,
+    critical);
+  - a workload with no identity, while a row of an earlier incarnation of its
+    name remains (a relocation or restore that did not carry the identity),
+    is named with the `lv firewall tag set` command that sets its tags again
+    (`firewall.tag_group.identity_lost`, warning).
+
+  The hold is the per-NIC chain's own rules, after the cluster and host
+  tiers, and observe mode counts it instead of dropping.
+- A rule naming a tag group this host does not hold matches nothing when it
+  accepts, and loses its address match when it drops or rejects
+  (`firewall.tag_group.missing`, critical, named once it has lasted a
+  minute); a group whose row cannot be read is handled the same
+  (`firewall.tag_group.unreadable`, critical). A user ip set named `lv_tg_*`
+  is left out. `litevirt_firewall_tag_group_members{group}` counts each
+  group's members in this host's view.
 
 ## CLI
 

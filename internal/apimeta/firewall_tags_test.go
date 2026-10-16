@@ -6,10 +6,11 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
-// The four forms of the Firewall tags line (spec §4.2, m-3).
+// The forms of the Firewall tags line (spec §4.2, m-3), and unreadable (D3
+// review m-3).
 //
 // Mutations: skip the orphan note — red; read the first entry as the
-// workload whatever it is — red.
+// workload whatever it is — red; show an unreadable row as none — red.
 func TestFirewallTagsLine(t *testing.T) {
 	live := func(id string, tags map[string]string) *pb.FirewallTags {
 		return &pb.FirewallTags{Kind: "vm", Workload: "web", FwId: id, Tags: tags}
@@ -24,6 +25,7 @@ func TestFirewallTagsLine(t *testing.T) {
 		{[]*pb.FirewallTags{live("", nil)}, "none (no firewall identity yet)"},
 		{[]*pb.FirewallTags{orphan, live("", nil)}, "none (a row for an earlier incarnation of this name exists, fw_id bb, not applied)"},
 		{[]*pb.FirewallTags{live("aa", map[string]string{"role": "db"}), orphan}, "role=db"},
+		{[]*pb.FirewallTags{{Kind: "vm", Workload: "web", FwId: "aa", Unreadable: true}, orphan}, FirewallTagsUnreadable},
 		{nil, ""},
 	} {
 		if got := FirewallTagsLine(tc.in); got != tc.want {

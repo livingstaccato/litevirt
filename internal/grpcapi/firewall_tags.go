@@ -283,9 +283,10 @@ func (s *Server) SetFirewallTags(ctx context.Context, req *pb.SetFirewallTagsReq
 		detail += " dropped=" + fwTagsText(dropped)
 	}
 	if err != nil {
-		if dropped != nil {
-			// A copied identity's tags were cleared, then this failed: the
-			// clear has its own row; this one says the set did not follow.
+		if dropped != nil || replaced != "" {
+			// A copied identity's tags were cleared, or the mint replaced a
+			// copied identity, then this failed: the identity changed (and a
+			// clear has its own row); this one says the set did not follow.
 			s.auditAs(context.WithoutCancel(ctx), actor, action, target, detail+" error="+status.Convert(err).Message(), "error")
 		}
 		return nil, err
@@ -342,7 +343,7 @@ type fwTagWorkload struct {
 
 // ListFirewallTags lists firewall tags as this host's replica holds them.
 // Needs sg.read at the cluster root. With no workload named: every live
-// workload with tags. With one named: each live workload of that name (its
+// workload with tags, or with a tags row that cannot be read (unreadable). With one named: each live workload of that name (its
 // identity and tags, none included), then each tags row whose display name is
 // that name and whose identity no live workload holds (orphan: an earlier
 // incarnation's, not applied).
@@ -398,10 +399,10 @@ func (s *Server) ListFirewallTags(ctx context.Context, req *pb.ListFirewallTagsR
 		e := &pb.FirewallTags{Kind: pbFWTagKind(w.kind), Workload: w.name, Host: w.host, FwId: w.fwID}
 		if w.fwID != "" {
 			if r, ok := byID[w.kind+"/"+w.fwID]; ok {
-				e.Tags, e.SetBy, e.UpdatedAt = r.Tags, r.SetBy, r.UpdatedAt
+				e.Tags, e.SetBy, e.UpdatedAt, e.Unreadable = r.Tags, r.SetBy, r.UpdatedAt, r.Unreadable
 			}
 		}
-		if !named && len(e.Tags) == 0 {
+		if !named && len(e.Tags) == 0 && !e.Unreadable {
 			continue
 		}
 		out.Tags = append(out.Tags, e)

@@ -269,6 +269,7 @@ func TestProtoNumbers_FirewallExtras(t *testing.T) {
 		{&pb.FirewallTags{}, 8, "orphan"},
 		{&pb.FirewallTags{}, 9, "replaced_fw_id"},
 		{&pb.FirewallTags{}, 10, "dropped_tags"},
+		{&pb.FirewallTags{}, 11, "unreadable"},
 
 		{&pb.SetFirewallTagsRequest{}, 1, "kind"},
 		{&pb.SetFirewallTagsRequest{}, 2, "workload"},

@@ -121,6 +121,7 @@ func TestFirewallTagCLI_Ls(t *testing.T) {
 		{Kind: "vm", Workload: "web-1", FwId: "aa", Tags: map[string]string{"role": "web"}},
 		{Kind: "container", Workload: "cache-1", Host: "node-2", FwId: "bb", Tags: map[string]string{"env": "prod"}},
 		{Kind: "vm", Workload: "web-1", FwId: "cc", Tags: map[string]string{"role": "db"}, Orphan: true},
+		{Kind: "vm", Workload: "broken", FwId: "dd", Unreadable: true},
 	}}
 	out, _, err := runCmd(t, m, "firewall", "tag", "ls", "web-1")
 	if err != nil {
@@ -129,7 +130,8 @@ func TestFirewallTagCLI_Ls(t *testing.T) {
 	if m.fwTagsLsReq.GetWorkload() != "web-1" || m.fwTagsLsReq.GetKind() != "" {
 		t.Fatalf("ls request = %+v", m.fwTagsLsReq)
 	}
-	for _, want := range []string{"KIND", "web-1", "role=web", "node-2", "cache-1", "env=prod", "role=db (an earlier incarnation's row, not applied)"} {
+	for _, want := range []string{"KIND", "web-1", "role=web", "node-2", "cache-1", "env=prod", "role=db (an earlier incarnation's row, not applied)",
+		"unreadable (a member of no tag group)"} {
 		assertContains(t, out, want)
 	}
 	if _, _, err := runCmd(t, m, "firewall", "tag", "ls", "--container", "--host", "node-2"); err != nil {

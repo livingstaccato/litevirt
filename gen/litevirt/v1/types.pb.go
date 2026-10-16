@@ -3968,8 +3968,12 @@ type FirewallTags struct {
 	// Set only in a tag set's answer when the workload's identity was a copy
 	// (another live workload held it too): the identity replaced, and the
 	// tags its row held, now cleared from both workloads.
-	ReplacedFwId  string            `protobuf:"bytes,9,opt,name=replaced_fw_id,json=replacedFwId,proto3" json:"replaced_fw_id,omitempty"`
-	DroppedTags   map[string]string `protobuf:"bytes,10,rep,name=dropped_tags,json=droppedTags,proto3" json:"dropped_tags,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	ReplacedFwId string            `protobuf:"bytes,9,opt,name=replaced_fw_id,json=replacedFwId,proto3" json:"replaced_fw_id,omitempty"`
+	DroppedTags  map[string]string `protobuf:"bytes,10,rep,name=dropped_tags,json=droppedTags,proto3" json:"dropped_tags,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// unreadable: the workload's tags row cannot be read (malformed). It
+	// grants no membership, and its NICs are held at drop where a tag group
+	// binds security groups (tags shows none).
+	Unreadable    bool `protobuf:"varint,11,opt,name=unreadable,proto3" json:"unreadable,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4072,6 +4076,13 @@ func (x *FirewallTags) GetDroppedTags() map[string]string {
 		return x.DroppedTags
 	}
 	return nil
+}
+
+func (x *FirewallTags) GetUnreadable() bool {
+	if x != nil {
+		return x.Unreadable
+	}
+	return false
 }
 
 type PCIDevice struct {
@@ -7405,7 +7416,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\bworkload\x18\x02 \x01(\tR\bworkload\x12\x12\n" +
 	"\x04host\x18\x03 \x01(\tR\x04host\x12\x1c\n" +
 	"\taddresses\x18\x04 \x03(\tR\taddresses\x12!\n" +
-	"\faddress_note\x18\x05 \x01(\tR\vaddressNote\"\xdc\x03\n" +
+	"\faddress_note\x18\x05 \x01(\tR\vaddressNote\"\xfc\x03\n" +
 	"\fFirewallTags\x12\x12\n" +
 	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x1a\n" +
 	"\bworkload\x18\x02 \x01(\tR\bworkload\x12\x12\n" +
@@ -7418,7 +7429,10 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x06orphan\x18\b \x01(\bR\x06orphan\x12$\n" +
 	"\x0ereplaced_fw_id\x18\t \x01(\tR\freplacedFwId\x12M\n" +
 	"\fdropped_tags\x18\n" +
-	" \x03(\v2*.litevirt.v1.FirewallTags.DroppedTagsEntryR\vdroppedTags\x1a7\n" +
+	" \x03(\v2*.litevirt.v1.FirewallTags.DroppedTagsEntryR\vdroppedTags\x12\x1e\n" +
+	"\n" +
+	"unreadable\x18\v \x01(\bR\n" +
+	"unreadable\x1a7\n" +
 	"\tTagsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a>\n" +

@@ -174,6 +174,9 @@ func printFirewallTagsList(w io.Writer, tags []*pb.FirewallTags) error {
 			id = "-"
 		}
 		tagText := tagPairs(t.GetTags())
+		if t.GetUnreadable() {
+			tagText = "unreadable (a member of no tag group)"
+		}
 		if t.GetOrphan() {
 			tagText += " (an earlier incarnation's row, not applied)"
 		}

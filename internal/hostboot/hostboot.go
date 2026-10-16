@@ -158,8 +158,25 @@ func ConfirmServing(ctx context.Context, db *corrosion.Client, host string) (boo
 	if h.State != "upgrading" {
 		return false, h.State, ErrNotUpgrading
 	}
-	if err := corrosion.UpdateHostState(ctx, db, host, "active"); err != nil {
+	if beforeConfirmWrite != nil {
+		beforeConfirmWrite()
+	}
+	// Only from 'upgrading', checked in the write's own transaction: a fence
+	// or drain recorded since the read above keeps its state.
+	applied, err := corrosion.UpdateHostStateFrom(ctx, db, host, "upgrading", "active")
+	if err != nil {
 		return false, h.State, err
+	}
+	if !applied {
+		now, err := corrosion.GetHost(ctx, db, host)
+		if err != nil || now == nil {
+			return false, "", ErrNotUpgrading
+		}
+		return false, now.State, ErrNotUpgrading
 	}
 	return true, "active", nil
 }
+
+// beforeConfirmWrite, when set, runs between ConfirmServing's read and its
+// write. Tests only.
+var beforeConfirmWrite func()

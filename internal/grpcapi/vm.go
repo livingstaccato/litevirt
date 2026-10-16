@@ -5940,7 +5940,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// up after the define; a patched one keeps the ones it had.
 	regenerated := domXML == ""
 	if domXML == "" {
-		priorXML, _ := s.virt.DumpXMLInactive(req.Name)
+		priorXML, derr := s.virt.DumpXMLInactive(req.Name)
+		if derr != nil && !lv.IsNoDomain(derr) {
+			slog.Warn("UpdateVM: the current definition could not be read; regenerating without what only it holds",
+				"vm", req.Name, "error", derr)
+		}
 		hostdevs := ownedHostdevConfigs(liveDevs, priorXML)
 		// Regenerate domain XML from the shared builder (MinMemoryMiB/MaxMemoryMiB +
 		// Hostdevs are populated here — the fields the old inline redefine builder

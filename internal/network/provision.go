@@ -6,10 +6,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"github.com/litevirt/litevirt/internal/netutil"
 	"log/slog"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,18 +23,10 @@ import (
 // ones (risking collisions).
 const maxIfaceName = 15
 
-// IsolatedBridgeName returns the host bridge name for an isolated network.
-// It is "br-iso-<name>" when that fits IFNAMSIZ, otherwise a stable hashed
-// form "br-iso-<8 hex>" (exactly 15 chars) so long network names don't fail
-// bridge creation. Every site that creates, deletes, or resolves an isolated
-// bridge MUST use this so the names always agree.
+// IsolatedBridgeName returns the host bridge name for an isolated network
+// (compose.IsolatedBridgeName, which the firewall shares).
 func IsolatedBridgeName(networkName string) string {
-	const prefix = "br-iso-"
-	if len(prefix)+len(networkName) <= maxIfaceName {
-		return prefix + networkName
-	}
-	sum := sha1.Sum([]byte(networkName))
-	return prefix + hex.EncodeToString(sum[:])[:maxIfaceName-len(prefix)]
+	return compose.IsolatedBridgeName(networkName)
 }
 
 // FlatBridgeName returns the host bridge a NIC on a network with no record
@@ -105,6 +97,14 @@ func BridgeName(networkName string, def compose.NetworkDef) string {
 	return FlatBridgeName(networkName)
 }
 
+// bridgePreExistedFor is whether bridge counts as one litevirt found already
+// there for def, the fact the DHCP gate reads (see Provision). One predicate,
+// so WouldServeGateway answers as Provision acts.
+func bridgePreExistedFor(def compose.NetworkDef, bridge string) bool {
+	return BridgeExists(bridge) &&
+		(def.NetBoxPrefixID != 0 || !litevirtServedDHCP(dnsmasqPidFile(bridge)))
+}
+
 // VTEPRecord holds a host's VTEP information for a network.
 type VTEPRecord struct {
 	NetworkName string
@@ -139,8 +139,7 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 		// to the plain fact: its refusal below must read the same host state
 		// on every attempt.
 		pidFile := dnsmasqPidFile(bridge)
-		bridgePreExisted := BridgeExists(bridge) &&
-			(def.NetBoxPrefixID != 0 || !litevirtServedDHCP(pidFile))
+		bridgePreExisted := bridgePreExistedFor(def, bridge)
 
 		// REFUSE BEFORE CREATING ANYTHING, and this ordering is the whole of
 		// whether the refusal survives a retry.
@@ -165,6 +164,17 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 
 		if err := EnsureBridge(bridge); err != nil {
 			return "", err
+		}
+		// A bridge litevirt made (its record says so), with no VLAN and no
+		// uplink, gets the network's MAC, the same on every host
+		// (BridgeMAC). An operator's bridge, and a bridge that shares
+		// one L2 with the other hosts' (a VLAN, an uplink), keep their own.
+		if def.VLAN == 0 && bridgeRecorded(bridge) {
+			if BridgeHasUplink(bridge) {
+				warnSharedMACOnUplink(networkName, bridge)
+			} else {
+				ensureNetworkBridgeMAC(networkName, bridge, def.Subnet)
+			}
 		}
 
 		// If a VLAN ID is specified, create a VLAN sub-interface on the
@@ -191,6 +201,18 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 				ScopeKey: scope, Bridge: bridge, Isolate: true,
 			}); err != nil {
 				return "", fmt.Errorf("record host-isolation intent for %s: %w", bridge, err)
+			}
+			// The guests' gateway, on a bridge litevirt made: the host routes
+			// for them (an LB's SNAT), as a vxlan network's IRB gateway does,
+			// and the isolation drop keeps every guest off the address itself.
+			// A bridge litevirt did not make, or one on a physical VLAN, has
+			// its router upstream, which this address would collide with.
+			if def.Subnet != "" && !onPhysicalVLAN && bridgeCreatedHere(bridge) {
+				if gw, _, _, _, err := SubnetRange(def.Subnet); err == nil && gw != "" {
+					if out, err := execCommand("ip", "addr", "add", gw, "dev", bridge); err != nil && !isAlreadyExists(out) {
+						return "", fmt.Errorf("ip addr add %s dev %s: %w: %s", gw, bridge, err, out)
+					}
+				}
 			}
 		} else if !onPhysicalVLAN {
 			// Start DHCP only on a litevirt-managed bridge — a pre-existing
@@ -240,6 +262,9 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 		if vni == 0 {
 			return "", fmt.Errorf("vxlan network requires vni")
 		}
+		if localIP == "" {
+			return "", &VTEPRefusal{Network: networkName, Reason: "no tunnel local address was resolved for this host"}
+		}
 		underlay := def.Underlay
 		if underlay == "" {
 			underlay = defaultRouteInterface()
@@ -253,7 +278,14 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 			return "", fmt.Errorf("ensure vxlan vni %d: %w", vni, err)
 		}
 
-		// Register this host's VTEP under the logical network name.
+		// Register this host's VTEP under the logical network name — unless
+		// the network was deleted while this pass ran: the upsert clears
+		// deleted_at, and would bring a tombstoned row back to life.
+		if deleted, err := networkTombstoned(ctx, db, networkName); err != nil {
+			return "", fmt.Errorf("read network %q: %w", networkName, err)
+		} else if deleted {
+			return "", fmt.Errorf("vxlan network %q was deleted; not registering this host's VTEP", networkName)
+		}
 		if err := UpsertVTEP(ctx, db, networkName, hostName, localIP, vni); err != nil {
 			return "", fmt.Errorf("upsert vtep: %w", err)
 		}
@@ -316,9 +348,19 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 		if err != nil && !isFileExists(out) {
 			return "", fmt.Errorf("ip link add isolated bridge: %w: %s", err, out)
 		}
+		// The interface group is what the firewall holds the bridge to the
+		// host by (compose.IsolatedBridgeGroup), set before the bridge is up.
+		// Every network is provisioned again on a daemon's first pass, which
+		// marks a bridge an earlier build made.
+		if out, err := execCommand("ip", "link", "set", bridge, "group", strconv.Itoa(compose.IsolatedBridgeGroup)); err != nil {
+			return "", fmt.Errorf("ip link set %s group %d: %w: %s", bridge, compose.IsolatedBridgeGroup, err, out)
+		}
 		out, err = execCommand("ip", "link", "set", bridge, "up")
 		if err != nil && !isFileExists(out) {
 			return "", fmt.Errorf("ip link set %s up: %w: %s", bridge, err, out)
+		}
+		if !BridgeHasUplink(bridge) {
+			ensureNetworkBridgeMAC(networkName, bridge, def.Subnet)
 		}
 
 		scope := fwScopeNet(networkName)
@@ -390,6 +432,16 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 	if db != nil {
 		_ = corrosion.DeleteHostFWIntent(ctx, db, hostName, fwScopeNet(networkName))
 	}
+	return RetireDevice(ctx, db, networkName, def, hostName)
+}
+
+// RetireDevice tears down what def's device carries for networkName on this
+// host — its dnsmasq, gateway address, the legacy NAT, SNAT, isolation and
+// proxy-ARP rules of that device, its VLAN sub-interface, and the bridge when
+// litevirt created it and nothing uses it — and nothing keyed by the network
+// itself: the network's firewall intent stays. It is the teardown of a device
+// a network has moved off, whose intent now describes the new device.
+func RetireDevice(ctx context.Context, db *corrosion.Client, networkName string, def compose.NetworkDef, hostName string) error {
 	switch def.Type {
 	case "", "bridge":
 		bridge := def.Interface
@@ -663,6 +715,18 @@ func isNoSuchDevice(out []byte) bool {
 	return strings.Contains(s, "Cannot find device") || strings.Contains(s, "No such device")
 }
 
+// networkTombstoned reports whether networkName has a deleted record and no
+// live one. A network with no record at all is not.
+func networkTombstoned(ctx context.Context, db *corrosion.Client, networkName string) (bool, error) {
+	rows, err := db.Query(ctx,
+		`SELECT COUNT(*) AS n, COALESCE(SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END), 0) AS live
+		 FROM networks WHERE name = ?`, networkName)
+	if err != nil || len(rows) == 0 {
+		return false, err
+	}
+	return rows[0].Int("n") > 0 && rows[0].Int("live") == 0, nil
+}
+
 // UpsertVTEP writes this host's VTEP into network_vteps.
 func UpsertVTEP(ctx context.Context, db *corrosion.Client, networkName, hostName, vtepIP string, vni int) error {
 	now := db.NowTS()
@@ -712,46 +776,17 @@ func isGatewayHost(ctx context.Context, db *corrosion.Client, networkName, hostN
 	return vteps[0].HostName == hostName
 }
 
-// SyncFloodEntries reads all VTEPs for vni from DB and calls FloodEntry for each peer != hostName.
-func SyncFloodEntries(ctx context.Context, db *corrosion.Client, networkName, hostName string, vni int) error {
-	vteps, err := GetVTEPs(ctx, db, networkName)
-	if err != nil {
-		return fmt.Errorf("get vteps: %w", err)
-	}
-
-	for _, v := range vteps {
-		if v.HostName == hostName {
-			continue
-		}
-		if err := FloodEntry(vni, v.VTEPAddr); err != nil {
-			return fmt.Errorf("flood entry %s: %w", v.VTEPAddr, err)
-		}
-	}
-	return nil
-}
-
-// LocalIP returns the outbound IP of this host by dialing a UDP socket.
-func LocalIP() string {
-	if ip := netutil.OutboundIP(); ip != "" {
-		return ip
-	}
-	return "127.0.0.1"
-}
-
 // ProvisionFunc provisions one network on this host and returns the device a
 // NIC attaches to. SafeProvision is the production one.
 type ProvisionFunc func(ctx context.Context, db *corrosion.Client, networkName string, def compose.NetworkDef, localIP, hostName string) (string, error)
 
-// ProvisionForVM looks up a network definition from corrosion and calls Provision
-// to ensure all infrastructure (bridge, DHCP, NAT, VXLAN, IRB) exists on this host.
-// Returns the bridge name, or "" if no provisioning is needed (flat bridge mode).
-// Shared by grpcapi.CreateVM and health.Reconciler.
-func ProvisionForVM(ctx context.Context, db *corrosion.Client, networkName, hostName string) (string, error) {
-	return ProvisionForVMWith(ctx, db, networkName, hostName, SafeProvision)
-}
-
-// ProvisionForVMWith is ProvisionForVM with the provisioning step supplied, so
-// a caller holding a provisioner seam uses the same record lookup.
+// ProvisionForVMWith looks up a network definition from corrosion and calls
+// provision to ensure all infrastructure (bridge, DHCP, NAT, VXLAN, IRB)
+// exists on this host. Returns the bridge name, or "" if no provisioning is
+// needed (flat bridge mode). It hands provision no VTEP address (""): the
+// provisioner resolves the tunnel endpoint itself
+// (grpcapi.Server.ProvisionNetworkHere), and network.Provision refuses a
+// vxlan network without one.
 func ProvisionForVMWith(ctx context.Context, db *corrosion.Client, networkName, hostName string, provision ProvisionFunc) (string, error) {
 	rows, err := db.Query(ctx,
 		`SELECT type, config FROM networks WHERE name = ? AND deleted_at IS NULL`,
@@ -772,8 +807,7 @@ func ProvisionForVMWith(ctx context.Context, db *corrosion.Client, networkName, 
 		def.Interface = networkName
 	}
 
-	localIP := LocalIP()
-	bridge, err := provision(ctx, db, networkName, def, localIP, hostName)
+	bridge, err := provision(ctx, db, networkName, def, "", hostName)
 	if err != nil {
 		return "", err
 	}

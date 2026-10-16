@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/hostboot"
 	"github.com/litevirt/litevirt/internal/upgrade"
 )
 
@@ -114,6 +116,49 @@ func TestConfirmUpgradeHealthy(t *testing.T) {
 	}
 	if h.State != "active" {
 		t.Fatalf("host state = %q after confirm, want active", h.State)
+	}
+}
+
+// TestConfirmUpgradeHealthy_KeepsAFenceRecordedMeanwhile proves the confirm
+// never overwrites a state another writer recorded while the host was
+// upgrading: a host fenced (or drained) before its new binary answered stays
+// fenced. The binary is healthy, so the sentinel is still cleared.
+func TestConfirmUpgradeHealthy_KeepsAFenceRecordedMeanwhile(t *testing.T) {
+	for _, recorded := range []string{"fenced", "draining", "offline"} {
+		t.Run(recorded, func(t *testing.T) {
+			ctx := context.Background()
+			db, err := corrosion.NewTestClient()
+			if err != nil {
+				t.Fatalf("NewTestClient: %v", err)
+			}
+			t.Cleanup(func() { db.Close() })
+			if err := corrosion.InitSchema(ctx, db); err != nil {
+				t.Fatalf("InitSchema: %v", err)
+			}
+			if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+				Name: "h", Address: "127.0.0.1", SSHUser: "root", CertSerial: "s", State: recorded,
+			}); err != nil {
+				t.Fatalf("InsertHost: %v", err)
+			}
+			bin := filepath.Join(t.TempDir(), "litevirt")
+			if err := upgrade.Arm(bin, "v-old"); err != nil {
+				t.Fatalf("Arm: %v", err)
+			}
+
+			d := &Daemon{cfg: &Config{HostName: "h"}, db: db}
+			d.confirmUpgradeHealthy(bin)
+
+			h, err := corrosion.GetHost(ctx, db, "h")
+			if err != nil || h == nil {
+				t.Fatalf("GetHost: %v", err)
+			}
+			if h.State != recorded {
+				t.Fatalf("host state = %q after confirm, want %q kept", h.State, recorded)
+			}
+			if _, ok := upgrade.Read(bin); ok {
+				t.Fatal("sentinel must be cleared: the new binary answered")
+			}
+		})
 	}
 }
 
@@ -279,6 +324,8 @@ func TestGracefulRestartWiring(t *testing.T) {
 	old := pingPollInterval
 	pingPollInterval = time.Millisecond
 	defer func() { pingPollInterval = old }()
+	var checks bootChecks
+	defer checks.wait(t) // after cancel, before the restore
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	db := corrosion.NewTestClientT(t)
@@ -308,7 +355,7 @@ func TestGracefulRestartWiring(t *testing.T) {
 	// then the host must stay 'upgrading'.
 	serving := make(chan struct{})
 	p := &gatedPinger{open: serving}
-	d.selfPinger = func() (pinger, func(), error) { return p, func() {}, nil }
+	d.selfPinger = checks.pinger(p)
 	d.writeBootState(ctx, 0, 0, 0, false)
 	time.Sleep(50 * time.Millisecond)
 	if got := stateOf(); got != "upgrading" {
@@ -323,24 +370,191 @@ func TestGracefulRestartWiring(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// A boot with no graceful stop before it is 'active' at once, and starts
-	// no check.
-	if err := corrosion.UpdateHostState(ctx, db, "h", "upgrading"); err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(hostboot.AwaitingPath(d.cfg.DataDir)); !os.IsNotExist(err) {
+		t.Fatalf("this daemon serves, and the boot's awaiting-serving note is still there: %v", err)
 	}
-	d.selfPinger = func() (pinger, func(), error) {
-		t.Error("a boot with no graceful stop started the serving check")
-		return p, func() {}, nil
+}
+
+// TestUncleanBootWiring: a boot with no graceful stop before it (a crash, a
+// kill) keeps an active host 'upgrading' until this daemon serves. If that
+// daemon never serves, the next boot is 'active' at once, and still notes
+// once it serves that a daemon served, so the next crash awaits serving again.
+//
+// Mutations: start no check in writeBootState for a boot that does not await
+// serving — the note stays and the last boot is 'active'; drop
+// hostboot.Served from activateOnceServing — the note stays after the first
+// boot serves, and the crash after it boots 'active'.
+func TestUncleanBootWiring(t *testing.T) {
+	old := pingPollInterval
+	pingPollInterval = time.Millisecond
+	defer func() { pingPollInterval = old }()
+	var checks bootChecks
+	defer checks.wait(t) // after cancel, before the restore
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
 	}
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "h", Address: "127.0.0.1", SSHUser: "root", CertSerial: "s", State: "active",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	stateOf := func() string {
+		h, err := corrosion.GetHost(ctx, db, "h")
+		if err != nil || h == nil {
+			t.Fatalf("GetHost: %v", err)
+		}
+		return h.State
+	}
+	waitFor := func(what string, cond func() bool) {
+		t.Helper()
+		for deadline := time.Now().Add(3 * time.Second); !cond(); time.Sleep(10 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s (host %q)", what, stateOf())
+			}
+		}
+	}
+	dir := t.TempDir()
+	note := func() bool {
+		_, err := os.Stat(hostboot.AwaitingPath(dir))
+		return err == nil
+	}
+	d := &Daemon{cfg: &Config{HostName: "h", DataDir: dir}, db: db}
+
+	// A crash: no markRestarting. This boot serves once `serving` closes.
+	serving := make(chan struct{})
+	d.selfPinger = checks.pinger(&gatedPinger{open: serving})
+	bctx, bcancel := context.WithCancel(ctx)
+	d.writeBootState(bctx, 0, 0, 0, false)
+	time.Sleep(50 * time.Millisecond)
+	if got := stateOf(); got != "upgrading" {
+		t.Fatalf("before this daemon serves after a crash the host is %q, want upgrading", got)
+	}
+	close(serving)
+	waitFor("the crashed host to turn active once it serves", func() bool { return stateOf() == "active" && !note() })
+	bcancel()
+
+	// Another crash, and this daemon never serves.
+	never := make(chan struct{})
+	d.selfPinger = checks.pinger(&gatedPinger{open: never})
+	bctx, bcancel = context.WithCancel(ctx)
+	d.writeBootState(bctx, 0, 0, 0, false)
+	time.Sleep(50 * time.Millisecond)
+	if got := stateOf(); got != "upgrading" || !note() {
+		t.Fatalf("after the second crash the host is %q (note=%v), want upgrading, noted", got, note())
+	}
+	bcancel() // it dies
+
+	// The next boot follows a daemon that never served: 'active' at once.
+	serving = make(chan struct{})
+	d.selfPinger = checks.pinger(&gatedPinger{open: serving})
 	d.writeBootState(ctx, 0, 0, 0, false)
 	if got := stateOf(); got != "active" {
-		t.Fatalf("a boot with no graceful stop recorded %q, want active", got)
+		t.Fatalf("the boot after a daemon that never served recorded %q, want active", got)
 	}
 	time.Sleep(50 * time.Millisecond)
+	if !note() {
+		t.Fatal("the note went before this daemon served")
+	}
+	close(serving)
+	waitFor("the note to go once this daemon serves", func() bool { return !note() })
+	if got := stateOf(); got != "active" {
+		t.Fatalf("host is %q after serving, want active", got)
+	}
+}
+
+// TestQuarantinedBootWritesNothing: a WAL-quarantined daemon's boot after a
+// crash decides 'upgrading' like any other, but writes nothing — neither the
+// boot state nor 'active' once it serves. The host stays as the cluster
+// recorded it.
+//
+// Mutation: drop the quarantine refusal from corrosion's replicated write
+// path — the host is recorded 'upgrading', then 'active'.
+func TestQuarantinedBootWritesNothing(t *testing.T) {
+	old := pingPollInterval
+	pingPollInterval = time.Millisecond
+	defer func() { pingPollInterval = old }()
+	var checks bootChecks
+	defer checks.wait(t) // after cancel, before the restore
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "h", Address: "127.0.0.1", SSHUser: "root", CertSerial: "s", State: "active",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	h0, err := corrosion.GetHost(ctx, db, "h")
+	if err != nil || h0 == nil {
+		t.Fatalf("GetHost: %v", err)
+	}
+	db.SetWriteQuarantine(func() string { return "rolled back below latched token(s): test" })
+	if !db.WALQuarantined() {
+		t.Fatal("fixture: not quarantined")
+	}
+	d := &Daemon{cfg: &Config{HostName: "h", DataDir: t.TempDir()}, db: db}
+	served := make(chan struct{})
+	var once sync.Once
+	d.selfPinger = checks.pinger(pingerFunc(func() error { once.Do(func() { close(served) }); return nil }))
+	d.writeBootState(ctx, 0, 0, 0, false)
+	select {
+	case <-served:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the quarantined boot started no serving check")
+	}
+	time.Sleep(50 * time.Millisecond)
+	h, err := corrosion.GetHost(ctx, db, "h")
+	if err != nil || h == nil {
+		t.Fatalf("GetHost: %v", err)
+	}
+	if h.State != "active" || h.UpdatedAt != h0.UpdatedAt {
+		t.Fatalf("a quarantined boot wrote its host: %q at %s, was %q at %s", h.State, h.UpdatedAt, h0.State, h0.UpdatedAt)
+	}
+}
+
+// pingerFunc answers every Ping with fn's error.
+type pingerFunc func() error
+
+func (f pingerFunc) Ping(context.Context, *pb.PingRequest, ...grpc.CallOption) (*pb.PingResponse, error) {
+	if err := f(); err != nil {
+		return nil, err
+	}
+	return &pb.PingResponse{}, nil
 }
 
 // gatedPinger fails every Ping until open is closed.
 type gatedPinger struct{ open chan struct{} }
+
+// bootChecks counts the serving checks a test's boots start, so the test can
+// wait for them to end before it restores the package timings they read: a
+// check that outlives its test races that restore, and the next test's.
+type bootChecks struct{ wg sync.WaitGroup }
+
+// pinger is the selfPinger for one boot. The boot's check is counted from
+// here until it closes its client.
+func (b *bootChecks) pinger(p pinger) func() (pinger, func(), error) {
+	b.wg.Add(1)
+	var once sync.Once
+	return func() (pinger, func(), error) { return p, func() { once.Do(b.wg.Done) }, nil }
+}
+
+// wait waits, bounded, for every counted check to end. Cancel their contexts
+// first.
+func (b *bootChecks) wait(t *testing.T) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { b.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Error("a boot's serving check did not end once its context was cancelled")
+	}
+}
 
 func (g *gatedPinger) Ping(ctx context.Context, _ *pb.PingRequest, _ ...grpc.CallOption) (*pb.PingResponse, error) {
 	select {

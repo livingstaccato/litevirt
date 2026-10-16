@@ -82,6 +82,10 @@ type Daemon struct {
 	checker *health.Checker
 	metrics *metrics.Server
 
+	// buildServer replaces grpcapi.NewServer in newServer (tests, which have
+	// no libvirt); nil in a daemon.
+	buildServer func() *grpcapi.Server
+
 	// certWatch reports on the certificates this node serves (cert_watch.go).
 	certWatch *certWatch
 
@@ -121,6 +125,9 @@ type Daemon struct {
 	// selfPinger, when set, replaces the local mTLS client the restart check
 	// pings this daemon through (awaitServingThenActivate). Tests only.
 	selfPinger func() (pinger, func(), error)
+	// confirmServing, when set, replaces hostboot.ConfirmServing in the
+	// restart's serving check (confirmActive). Tests only.
+	confirmServing func(ctx context.Context) (bool, string, error)
 
 	// rolledBackTokens names capability tokens this node already latched that this
 	// binary has never heard of — i.e. this binary is a rollback below them. Set at
@@ -235,16 +242,27 @@ func New(cfg *Config) (*Daemon, error) {
 const localMaxRecvMsgSize = 256 << 20
 
 // writeBootState is the boot write: the state hostboot decides, with this
-// build's version and resources, and — after a graceful stop — the check that
-// records the host active once this daemon serves.
+// build's version and resources, and — after a graceful stop or a crash of an
+// active host — the check that records the host active once this daemon
+// serves. A boot that does not await serving but follows one that never
+// served checks too, so that once this daemon serves the next crash awaits
+// serving again (hostboot.Served).
+//
+// On a WAL-quarantined daemon both writes are refused by the replicated write
+// path, as every write is: the host stays as the cluster recorded it.
 func (d *Daemon) writeBootState(ctx context.Context, cpus, memMiB, diskGiB int, hasResources bool) {
 	boot := hostboot.BootState(ctx, d.db, d.cfg.HostName, d.cfg.DataDir, d.upgradePending, time.Now())
 	slog.Info("boot state", "state", boot.State, "await_serving", boot.AwaitServing, "reason", boot.Reason)
 	if err := corrosion.UpdateHostStartup(ctx, d.db, d.cfg.HostName, boot.State, d.cfg.Version, cpus, memMiB, diskGiB, hasResources); err != nil {
 		slog.Warn("failed to write host startup state", "error", err)
 	}
-	if boot.AwaitServing {
+	switch {
+	case boot.AwaitServing:
 		go d.awaitServingThenActivate(ctx)
+	case d.cfg.DataDir != "":
+		if _, err := os.Lstat(hostboot.AwaitingPath(d.cfg.DataDir)); err == nil {
+			go d.awaitServingThenNote(ctx)
+		}
 	}
 }
 
@@ -571,8 +589,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// On an upgrade boot, stay "upgrading" until the watchdog confirms local gRPC
 	// is healthy (it flips to "active"); version + resources are still written
 	// here either way so the new version propagates immediately. After a
-	// graceful stop (SIGTERM) the host likewise stays "upgrading" until this
-	// daemon answers its own Ping (awaitServingThenActivate): recorded active
+	// graceful stop (SIGTERM), or a crash of an active host, the host likewise
+	// stays "upgrading" until this daemon answers its own Ping
+	// (awaitServingThenActivate): recorded active
 	// before its gRPC server listened, it was fenced on the failure count its
 	// observers carried through the restart (hostboot).
 	d.writeBootState(ctx, cpus, memMiB, diskGiB, niErr == nil)
@@ -928,7 +947,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return fmt.Errorf("TLS config: %w", err)
 	}
 
-	svc := grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
+	svc := d.newServer() // host address and release gate: before the first network pass
 	// A guarded VM recovers only onto a host that enforces NIC guards until
 	// every host does (re-review m8).
 	fc.SetNICGuardPlacement(svc.GuardHostNeeded)
@@ -968,9 +987,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	rc.SetCapacityPolicy(capacity)
 	rc.QuorumLost = svc.LeaseQuorumLost
 	go rc.Start(ctx)
-	// Release features (capabilities.Feature) open through the checker's
-	// WithFeature: the release token's latch plus the replicated used bit.
-	svc.SetReleaseFeatureGate(d.checker)
 	d.checker.SetReleaseUseConfirmer(svc.PeerHoldsReleaseFeatureUse)
 	// A peer advertising a release token this build does not know is, almost
 	// always, a forward roll: a non-blocking look at its used records, never a
@@ -1199,6 +1215,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
 	svc.SetDualRunMetrics(metrics.NewDualRunMetrics())
 	svc.SetSMARTMetrics(metrics.NewSMARTMetrics())
+	svc.SetReservationMetrics(metrics.NewReservationMetrics())
 	svc.SetStoragePoolsByName(d.storagePoolRefs())
 	// The ceph pools' libvirt secrets (ephemeral: gone after a libvirtd
 	// restart): defined now, then kept in line with the pools and keyrings.
@@ -1240,12 +1257,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// adoption-gate + PCI-start-preflight. A strict no-op until hardware_v2 latches, so
 	// this changes nothing on a fleet where the feature is off.
 	vmChecker.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
+	// A health restart moves a stopped VM's NICs onto the devices their
+	// networks are on now, as a start through the Server does.
+	vmChecker.SetNetworkFollower(svc.FollowNetworkDevices)
 	vmChecker.SetCancelledStartProbe(svc.HasCancelledStart) // cancelled_starts.go: neither healed to running nor restarted
 
 	// Wire reconciler callbacks now that gRPC server exists.
 	reconciler.SetOnVMStarted(svc.RefreshLBForStack)
 	reconciler.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
 	reconciler.SetCancelledStartProbe(svc.HasCancelledStart) // cancelled_starts.go: an error row's late-started domain is the sweep's
+	// A held start whose daemon restarted before libvirt answered it: its
+	// lease is taken over once the domain runs, and its outcome recorded
+	// (health/held_start_orphan.go).
+	reconciler.SetHeldStartProbe(svc.HasStartInFlight)
+	reconciler.SetVMEventRecorder(svc.RecordVMEvent)
 	// A start whose ceph key must be proven, late in a walk with no time left
 	// for it, is left untouched for the next pass rather than half-started.
 	reconciler.SetStartDeferral(svc.CephStartDeferral)
@@ -1313,6 +1338,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.RecoverResourceOperations(ctx)
 	go svc.RunResourceOperationRecovery(ctx)
 
+	// Release host reservations whose operation provably stopped running (one
+	// finished past its header's owner epoch, or whose VM is gone), after the
+	// recovery above has finished what it could.
+	svc.SweepReservationsOnce(ctx)
+	go svc.RunReservationRecovery(ctx)
+
 	// F1 hardware-operation recovery: resume any locally-owned VM wedged on a
 	// nonterminal device_attach/device_detach operation (a hot-plug that crashed
 	// with the mutation barrier held) — roll an incomplete attach BACK and a detach
@@ -1370,7 +1401,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	bridgeCT := firewall.BridgeConntrackAvailable(ctx, true)
 	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
 		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs,
-			OnTagGroupMembers: fwMetrics.SetTagGroupMembers, BridgeConntrack: func() bool { return bridgeCT }, Arming: fwArming})
+			OnTagGroupMembers:    fwMetrics.SetTagGroupMembers,
+			OnDuplicateAddresses: firewall.NewDuplicateAddressReporter(d.db, d.cfg.HostName).Report,
+			BridgeConntrack:      func() bool { return bridgeCT }, Arming: fwArming})
 	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
 	d.fwReconciler.SetArming(fwArming)
 	// Every domain start — an API start, a restart policy, a failover
@@ -1590,6 +1623,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// The runtime-inventory collector reads owner-epoch markers from the same
 	// root the container checker converges them into.
 	svc.SetContainersRoot(filepath.Join(d.cfg.DataDir, "containers"))
+	// An LB's TLS files are read as root; never from litevirt's own keys.
+	lb.SetProtectedDirs(d.cfg.PKIDir, d.cfg.DataDir)
 
 	// Advertise the host's capabilities as labels so placement puts a workload
 	// only on a host that can run it:
@@ -2045,8 +2080,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.snapScheduler.Stop()
 		}
 		repl.Stop()
-		d.virt.Close()
+		// The database closes first: closing libvirt fails the calls still
+		// waiting on it, and their error paths would otherwise write what
+		// that failure is not (a held start recorded failed over a domain
+		// libvirtd goes on to start).
 		d.db.Close()
+		d.virt.Close()
 		close(shutdownDone)
 	}()
 
@@ -2723,18 +2762,42 @@ func fileBasedPoolDriver(driver string) bool {
 // host certificate does not cover. Falling back to getOutboundIP only reports
 // the source IP toward the default route, which is the wrong answer on a
 // multi-homed host whose cluster network is not the default one.
+//
+// It is also this host's VXLAN tunnel endpoint (newServer): one rule,
+// netutil.HostAddress, for all three.
 func (d *Daemon) hostAddress() string {
-	if d.cfg.AdvertiseAddress != "" {
-		return d.cfg.AdvertiseAddress
-	}
-	return getOutboundIP()
+	return netutil.HostAddress(d.cfg.AdvertiseAddress)
 }
 
 func getOutboundIP() string {
-	if ip := netutil.OutboundIP(); ip != "" {
-		return ip
+	return netutil.HostAddress("")
+}
+
+// newServer builds the gRPC server with what its first network pass needs
+// already wired. The daemon runs that pass (ReconcileNetworksOnce) a few steps
+// later, at startup, and a vxlan network provisioned there takes its tunnel
+// endpoint from both: this host's address, and the release gate, whose latch
+// decides whether that address is in use yet (network.ResolveVTEP). Wired any
+// later, the pass would find neither, and the server refuses a vxlan network
+// with no address rather than guess one.
+func (d *Daemon) newServer() *grpcapi.Server {
+	var svc *grpcapi.Server
+	if d.buildServer != nil {
+		svc = d.buildServer()
+	} else {
+		svc = grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
 	}
-	return "127.0.0.1"
+	d.wireServer(svc)
+	return svc
+}
+
+// wireServer is newServer's wiring, on a server already built.
+func (d *Daemon) wireServer(svc *grpcapi.Server) {
+	svc.SetHostAddress(d.hostAddress())
+	svc.SetNetworkDeviceStatePath(grpcapi.DefaultNetworkDeviceStatePath)
+	// Release features (capabilities.Feature) open through the checker's
+	// WithFeature: the release token's latch plus the replicated used bit.
+	svc.SetReleaseFeatureGate(d.checker)
 }
 
 // runPCIScan performs the initial PCI device scan and stores results in the DB.
@@ -3296,11 +3359,7 @@ func (d *Daemon) runSupersededGC(ctx context.Context, m *metrics.GCMetrics) {
 		// no VM barrier still references them. Replicated monotone tombstone —
 		// tombstone-dominance in the immutable merge keeps a delayed copy from
 		// resurrecting a reaped operation.
-		if reaped, perr := corrosion.ReapTerminalOperations(ctx, d.db, core); perr != nil {
-			slog.Warn("operation reaper", "error", perr)
-		} else if reaped > 0 {
-			slog.Info("operation reaper", "reaped", reaped)
-		}
+		d.reapTerminalOperations(ctx, core)
 		// Authority still held by projects that no longer exist. Retiring on delete
 		// is forward-only, so anything deleted before that landed keeps live
 		// authority forever — nothing else collects it, because an authority row

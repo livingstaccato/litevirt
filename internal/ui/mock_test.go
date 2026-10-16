@@ -211,6 +211,8 @@ type mockGRPC struct {
 	getProjectQuotaErr   error
 	getProjectUsageResp  *pb.ProjectUsage
 	setProjectQuotaErr   error
+	createLBReq          *pb.CreateLBRequest
+	createLBErr          error
 	lastSetQuotaReq      *pb.SetProjectQuotaRequest
 	// Audit chain
 	verifyAuditResp *pb.VerifyAuditChainResponse
@@ -1028,7 +1030,13 @@ func (m *mockGRPC) PushMutations(context.Context, *pb.ReplicateRequest, ...grpc.
 func (m *mockGRPC) AckMutations(context.Context, *pb.AckRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil
 }
-func (m *mockGRPC) CreateLoadBalancer(context.Context, *pb.CreateLBRequest, ...grpc.CallOption) (*pb.LoadBalancer, error) {
+func (m *mockGRPC) CreateLoadBalancer(_ context.Context, in *pb.CreateLBRequest, _ ...grpc.CallOption) (*pb.LoadBalancer, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.createLBReq = in
+	if m.createLBErr != nil {
+		return nil, m.createLBErr
+	}
 	return nil, nil
 }
 func (m *mockGRPC) UpdateLoadBalancer(context.Context, *pb.UpdateLBRequest, ...grpc.CallOption) (*pb.LoadBalancer, error) {

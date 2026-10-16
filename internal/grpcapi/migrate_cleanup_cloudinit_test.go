@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/cloudinit"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
@@ -113,8 +114,11 @@ func TestCleanupMigrationArtifacts_KeepsACloudInitISOItDidNotCreate(t *testing.T
 	stageGenisoimage(t)
 	s := testServer(t)
 	s.dataDir = t.TempDir()
-	insertTestVM(t, adminCtx(), s.db, "mig", "src-host", "running")
+	insertTestVMWithSpec(t, adminCtx(), s.db, "mig", "src-host", "running", `{"name":"mig","uuid":"mig-1"}`)
 	iso, body := liveISO(t, s, "mig")
+	if err := cloudinit.StampSeed(iso, "mig-1"); err != nil { // the VM's own
+		t.Fatal(err)
+	}
 
 	// The migration asks for it; it is already there, so nothing is created.
 	if _, err := s.EnsureCloudInit(adminCtx(), &pb.EnsureCloudInitRequest{VmName: "mig"}); err != nil {

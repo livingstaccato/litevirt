@@ -199,8 +199,12 @@ func SoftDeleteLBBackends(ctx context.Context, c *Client, lbName string) error {
 // LB that the DB-render reapply would later act on. Used by the create/recreate
 // path (full replace).
 func PersistLBFull(ctx context.Context, c *Client, cfg LBConfigRecord, backends []LBBackendRecord) error {
-	now := c.NowTS()
-	stmts := make([]Statement, 0, 2+len(backends))
+	return c.ExecuteBatch(ctx, lbFullStmts(cfg, backends, c.NowTS()))
+}
+
+// lbFullStmts is PersistLBFull's batch.
+func lbFullStmts(cfg LBConfigRecord, backends []LBBackendRecord, now string) []Statement {
+	stmts := make([]Statement, 0, 3+len(backends))
 	// Clear all locally-known live backends first; a re-added name (also in
 	// backends) is un-tombstoned by its upsert below (later stmt wins in-tx).
 	stmts = append(stmts, Statement{
@@ -213,7 +217,7 @@ func PersistLBFull(ctx context.Context, c *Client, cfg LBConfigRecord, backends 
 		b.Generation = cfg.Generation
 		stmts = append(stmts, lbBackendUpsertStmt(b, now))
 	}
-	return c.ExecuteBatch(ctx, stmts)
+	return stmts
 }
 
 // PersistLBIncremental writes a config edit plus explicit backend upserts and
@@ -222,8 +226,12 @@ func PersistLBFull(ctx context.Context, c *Client, cfg LBConfigRecord, backends 
 // PRESERVED existing generation so already-stored backends keep matching). Used
 // by the update path (add/remove specific backends, never a full replace).
 func PersistLBIncremental(ctx context.Context, c *Client, cfg LBConfigRecord, upserts []LBBackendRecord, tombstones []string) error {
-	now := c.NowTS()
-	stmts := make([]Statement, 0, 1+len(upserts)+len(tombstones))
+	return c.ExecuteBatch(ctx, lbIncrementalStmts(cfg, upserts, tombstones, c.NowTS()))
+}
+
+// lbIncrementalStmts is PersistLBIncremental's batch.
+func lbIncrementalStmts(cfg LBConfigRecord, upserts []LBBackendRecord, tombstones []string, now string) []Statement {
+	stmts := make([]Statement, 0, 2+len(upserts)+len(tombstones))
 	for _, name := range tombstones {
 		stmts = append(stmts, lbBackendTombstoneStmt(cfg.Name, name, now))
 	}
@@ -233,7 +241,7 @@ func PersistLBIncremental(ctx context.Context, c *Client, cfg LBConfigRecord, up
 		b.Generation = cfg.Generation
 		stmts = append(stmts, lbBackendUpsertStmt(b, now))
 	}
-	return c.ExecuteBatch(ctx, stmts)
+	return stmts
 }
 
 // ListLBBackends returns the live backends for an LB's CURRENT incarnation. A

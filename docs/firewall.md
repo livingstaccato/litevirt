@@ -297,12 +297,29 @@ iptables):
 
 - **Masquerade** — a `postrouting` nat chain SNATs managed-subnet guest egress
   out the host's uplink (`ip saddr <subnet> oifname != <bridge> masquerade`).
-- **SNAT** — a load balancer on a host-isolated network rewrites guest egress to
-  its VIP (`oifname <uplink> ip saddr <subnet> snat to <vip>`), emitted before
+- **SNAT** — a load balancer on a host-isolated network with `snat: true` (or
+  `lv lb create --snat`) rewrites guest egress to its VIP
+  (`oifname <uplink> ip saddr <subnet> snat to <vip>`), emitted before
   masquerade.
 - **Host isolation** — an `input` chain drops guest→host traffic per isolated
-  bridge (`iifname <bridge> drop`), punching through VRRP + declared LB VIP ports
-  first so guests can still reach an HAProxy VIP.
+  bridge (`iifname <bridge> drop`), punching through VRRP and declared LB VIP
+  ports first so guests can still reach an HAProxy VIP, and replies to
+  connections the host opened onto that bridge (so HAProxy reaches backends
+  there): an `isolation_output` chain marks each connection the host opens out
+  of the bridge with a per-bridge ct mark, and the input chain accepts only
+  reply-direction packets carrying it. Bits 16-27 of the ct mark are
+  litevirt's; each host-isolated bridge on a host gets a distinct value there.
+  Connections the host opened onto a host-isolated bridge before an upgrade
+  to this rule carry no mark, so their replies are dropped once: a long-lived
+  connection (an HAProxy keep-alive to a backend) reconnects.
+- **Isolated networks** — an `isolated_forward` chain on the `forward` hook
+  drops anything routed off or onto an `isolated` network's bridge: per live
+  isolated network's bridge (`iifname "<bridge>" oifname != "<bridge>" drop`
+  and the reverse), and for every device in interface group 27766, which
+  litevirt gives each bridge it creates for an isolated network, whether or not
+  a network row names it (`iifgroup 27766 oifgroup != 27766 drop` and the
+  reverse). No device is matched by name. The chain is in every ruleset. Guests on one isolated bridge still reach each other and the
+  host's `dnsmasq` on it.
 
 These decisions are made by network provisioning and the LB apply path and
 recorded per host in `host_fw_intent`; the reconciler reads that table and
@@ -363,7 +380,14 @@ lv firewall ipset add admins --cidr 10.0.0.0/8 --cidr 2001:db8:1::/48
   nothing a guest sends.
 - nftables sets are typed, so a set holding both families renders as the IPv4
   set `<name>` plus an IPv6 companion `<name>_v6`, and a rule referencing
-  `@<name>` matches either. Do not name another set `<name>_v6`.
+  `@<name>` matches either. A set named `<name>_v6` beside a set `<name>`
+  with IPv6 elements is refused; one an older build stored is left out (see
+  below).
+- A set with no IPv6 elements has no companion, so a rule referencing it does
+  not match IPv6 at all: `!= @<name> drop` on an IPv4-only set lets every IPv6
+  address through. Adding the set's first IPv6 element makes the same rule
+  drop every IPv6 address not in the set; removing its last one lets every
+  IPv6 address through again.
 - A rule without a CIDR on `tcp`, `udp` or `all` matches both families, as it
   always did.
 - Neighbour discovery, router solicitation and advertisement, MLD and the
@@ -697,7 +721,22 @@ this host's own `failover_scope_v1` latch cannot form, the create fails. A
 container whose guards cannot be written for any other reason is not created. A record is retired (tombstoned) when its
 VM or container is deleted, and a record written for another incarnation of the
 same VM name guards nothing; a re-create carries only the guard state of the
-incarnation it replaces.
+incarnation it replaces. A NIC's record is also retired when `lv detach-nic`
+removes the NIC, once it is gone from the domain, and when an `lv attach-nic`
+that wrote it fails and its NIC is verified gone. A record an earlier build
+left for a NIC the VM no longer has is not demanded in force once the NIC's row
+is tombstoned, and the VM's owner retires it at the VM's next `lv attach-nic`,
+`lv migrate` or `lv start`, when no NIC row and neither definition of the
+domain on that host has its MAC. The owner judges from its own replica, so it
+can retire the record of a NIC whose row has not reached it yet. A retired
+record of the running incarnation still guards, with the default guard, a NIC
+whose row is live, unless its network cannot enforce a guard; `lv firewall
+nic-guard ls` and the compose plan name such a NIC, and `lv firewall nic-guard
+set` replaces its guard. A target judges a migration from its own replica, so
+a NIC attached moments before the move can arrive before its record. A guard
+write behind a stored write for that NIC stamped more than 5 minutes ahead of
+this host's clock is refused, naming the stamp; check NTP on the host that
+wrote it.
 
 **Neighbour discovery.** A guarded NIC's solicitations and advertisements are
 held to the header and one 8-byte option (the link-layer address, or a
@@ -757,10 +796,10 @@ file, the problem names the rule's place in the file.
 
 | Field | Accepted |
 |---|---|
-| `proto` | `all`, a protocol name (`tcp`, `esp`, `ipv6-icmp`, any case) or number 0-255 |
-| `port` (tcp, udp) | a port 0-65535 (decimal or `0x16`), a range `8000-9000` or `ssh - http`, a service name (`ssh`) |
+| `proto` | `all`, a protocol name (any case) that nft knows itself (`tcp`, `udp`, `udplite`, `esp`, `ah`, `icmp`, `igmp`, `icmpv6`, `gre`, `comp`, `dccp`, `sctp`) or that is listed in lower case in the host's `/etc/protocols` (`ospf`, `ipv6-icmp`), or a number 0-255 (`0x6`; octal after a leading zero, so `08` is not a number) |
+| `port` (tcp, udp) | a port 0-65535 (decimal, `0x16`, or octal after a leading zero: nft reads `010` as 8), a range `8000-9000` or `ssh - http` that does not run backwards, a service name listed in the host's `/etc/services` for tcp, udp, sctp, dccp or udplite (`ssh`; not `rtmp`, which is listed for ddp only) |
 | `cidr` | an IPv4 address, prefix, range `10.0.0.1-10.0.0.9` or DNS name; one IPv6 address or prefix; `@<ipset>`; `tag:<group>`, naming a tag group that exists |
-| ip set name | a letter, `_` or `.`, then letters, digits, `_`, `.`, `-` or `/`; at most 255 bytes; not starting with `lv_`, which is reserved for litevirt's internal sets |
+| ip set name | a letter, `_` or `.`, then letters, digits, `_`, `.`, `-` or `/`; at most 255 bytes, 252 for a set with IPv6 elements; not an nft keyword (`drop`, `ip`, `tcp`, `set`, ...); not starting with `lv_`, which is reserved for litevirt's internal sets |
 | ip set element | an IPv4 address, prefix, range or DNS name; an IPv6 address or prefix. `--cidr 10.0.0.1,10.0.0.2` is stored as two elements |
 | `action` | `accept`, `drop`, `reject` |
 | `comment` | at most 128 bytes, no double quote |
@@ -773,9 +812,17 @@ trailing comma is fine, a leading one is not). A set reference is `@name`,
 braces or behind a mask. It never names an `lv_` set: a tag group is
 referenced only as `tag:<group>`. A rule on a set with IPv6 elements applies to both
 families, negated or not. A bare comma list (`80,443`) is
-refused: nft rejects it, so it never applied — brace it. Anything else — a
+refused: nft rejects it, so it never applied — brace it. `<`, `>`, `<=`,
+`>=` (`lt`, `gt`, `le`, `ge`) take a single value only, not a braced list, a
+range or a prefix, which nft refuses. Anything else — a
 second word, a newline, `;`, `#`, a stray brace or quote — is refused, because
 it would add nft syntax of its own to every host's ruleset.
+
+A port name resolves against the host's `/etc/services`, and a protocol name
+against its `/etc/protocols`, on the host that writes the rule and again on
+each host that renders it. Only those files are read: a name nft could resolve
+through another NSS source (an `nss_db` database, sss, ldap) is refused at
+write and left out at render.
 
 `proto`, `port` and `action` are stored in lower case (`SSH` is stored as
 `ssh`): nft resolves a service name only in lower case. A port an older build
@@ -797,7 +844,26 @@ before, and nothing is rendered that the row did not ask for:
   the addresses the set lists), so it is held like an unreadable rule: as this
   host last rendered it while that rendering's set is present and whole,
   otherwise left out;
-- an ip set is rendered without the elements it cannot render.
+- a rule whose port or protocol this host's nft cannot resolve (a name
+  missing from its `/etc/services` or `/etc/protocols`, a port past 65535 or
+  protocol past 255, a range nft reads backwards), whose `<`, `>`, `<=` or
+  `>=` stands before a list, range or prefix, or whose IPv4 cidr nft cannot
+  read (an octet past 255, a prefix past `/32`, a range that runs backwards)
+  is held like an unreadable rule;
+- an ip set is rendered without the elements it cannot render (the same
+  IPv4 forms), and without its IPv6 elements when its companion's name would
+  pass 255 bytes;
+- an ip set whose name nft cannot read (a digit or `-` first other than a
+  dotted quad such as `1.2.3.4`, longer than 255 bytes, an nft keyword), whose
+  name is one of litevirt's internal sets (`lv_gw4`, `lv_nic_devs`, ...) or
+  starts with `lv_tg_`, or named `<name>_v6` beside a set `<name>` with IPv6
+  elements, is left out, and a rule referencing it is held like an unreadable
+  rule. Any other `lv_` set an earlier build stored keeps rendering, with the
+  rules on it.
+
+Elements of one set that overlap (`10.0.0.0/8` with `10.0.0.1-10.0.0.5`, or
+two ranges that share an address, in one row or across rows of the same name)
+are rendered merged into one element; nft refuses overlapping elements.
 
 The host raises the critical condition `firewall.rule.invalid`, which names
 each row, its stored action and the command that removes it
@@ -943,6 +1009,27 @@ reconciler picks them up on its next poll (or immediately via
 `network[].security-groups` or `lv sg bind --network`; the cluster-tier
 rules, host-tier rules, ipsets, and default-deny policy are also persisted in
 cluster state and loaded by the reconciler's `CorrosionPlanLoader`.
+
+## Rule macros
+
+`--macro <name>` on `lv sg rule-add`, `lv firewall cluster-rule add` and
+`lv firewall host-rule add` adds one ordinary rule per row of a named macro.
+`lv firewall macros` lists the catalog. Names are case-insensitive. A macro row
+is a tcp or udp destination port; there is no ICMP macro.
+
+- `--macro` cannot be combined with `--proto` or `--port`.
+- `--direction`, `--cidr`, `--action` and `--priority` apply to every row.
+- The CLI expands the macro and makes one call per row, printing every rule id.
+  Nothing records the macro name on the stored rule. If a call fails, the rows
+  already created are removed.
+- Cluster and host rows carry the comment `macro <NAME>` unless `--comment` is
+  given. Security-group rules have no comment column.
+
+```
+lv sg rule-add web --macro SSH --cidr @admins
+lv firewall cluster-rule add --macro DNS --direction egress
+lv firewall host-rule add --host node-1 --macro HTTPS
+```
 
 ## Audit trail
 

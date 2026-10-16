@@ -118,6 +118,10 @@ func SetVNCHandshakeTimeoutForTests(d time.Duration) func() {
 	return func() { vncHandshakeTimeout = old }
 }
 
+// HoldVMLockForTest takes this server's per-VM lock on name, as a request in
+// flight for that VM holds it, and returns its release.
+func (s *Server) HoldVMLockForTest(name string) (release func()) { return s.lockVM(name) }
+
 // NotEnforcingTokensForTests is what this server would report in
 // PingResponse.not_enforcing, for a fleet scenario to assert on.
 func (s *Server) NotEnforcingTokensForTests() []string { return s.notEnforcingTokens() }
@@ -137,12 +141,17 @@ func (s *Server) SetDependsOnWaitTimeoutForTests(d time.Duration) {
 }
 
 // ForgetNetworkReconcileForTests drops everything ReconcileNetworksOnce
-// remembers about this host, as a daemon restart does: the next pass
+// remembers about this host, and the device each network was provisioned on
+// here as far as this process holds it in memory (a state file set with
+// SetNetworkDeviceStatePath is read again), as a daemon restart does: the next pass
 // provisions every live network and tears down every tombstoned one again.
 func (s *Server) ForgetNetworkReconcileForTests() {
 	s.netReconcile.mu.Lock()
 	defer s.netReconcile.mu.Unlock()
 	s.netReconcile.applied, s.netReconcile.torn, s.netReconcile.lastErr = nil, nil, nil
+	s.netDevs.mu.Lock()
+	s.netDevs.defs, s.netDevs.pending, s.netDevs.loaded = nil, nil, false
+	s.netDevs.mu.Unlock()
 }
 
 // RecreateVMForTest runs the rolling engine's recreate of name to desired

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -71,6 +73,13 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// is pulled, provisioned or registered.
 	if err := s.authorizeComposeHostPaths(ctx, f); err != nil {
 		return err
+	}
+	// An LB's TLS files are read as root on every LB host: outside
+	// lb.CertDir, naming one needs the admin role (requireAdminForLBTLS).
+	for _, name := range slices.Sorted(maps.Keys(f.VMs)) {
+		if err := requireAdminForLBTLS(ctx, compose.BuildLBSpec(f.VMs[name].LoadBalancer)); err != nil {
+			return err
+		}
 	}
 
 	// Auto-pull images defined in the compose images: section that are missing locally.
@@ -404,6 +413,13 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 	if w == nil {
 		w = &stackFirewallWrites{}
 	}
+	// A rule that still names a macro (the parser expands them; a File built
+	// another way may not) is expanded first: refuse-form, then the write
+	// grammar, then the release features below, all before any gate is asked
+	// or anything is torn down. A macro that does not expand writes no row.
+	if err := compose.ExpandMacros(f); err != nil {
+		return err
+	}
 	hasFirewall := len(f.SecurityGroups) > 0 || len(f.IPSets) > 0 || f.FirewallDefaults != nil
 	if !hasFirewall {
 		// Still clear any rows a previous deploy of this stack left behind, in
@@ -443,6 +459,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 			}
 		}
 	}
+	var stackSets []corrosion.IPSet
 	for name, set := range f.IPSets {
 		need, err := ipSetRowFeatures(name, rulefield.NormaliseSetElements(set.CIDRs))
 		if err != nil {
@@ -451,6 +468,11 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 		for _, nf := range need {
 			needed[nf] = true
 		}
+		stackSets = append(stackSets, corrosion.IPSet{Name: name, CIDRs: rulefield.NormaliseSetElements(set.CIDRs)})
+	}
+	// Against every live set but this stack's own, which the deploy replaces.
+	if err := corrosion.IPSetCompanionClash(ctx, s.db, f.Name, stackSets); err != nil {
+		return fmt.Errorf("ipset: %w", err)
 	}
 	if fd := f.FirewallDefaults; fd != nil {
 		for _, r := range fd.ClusterRules {
@@ -540,7 +562,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 			// arbitrarily and could drop traffic an earlier rule meant to allow.
 			row := corrosion.SGRule{
 				ID: randid.New(), SGID: sgID, Direction: r.Direction, Proto: r.Proto,
-				PortRange: r.Port, CIDR: r.CIDR, Action: r.Action, Priority: (i + 1) * 10,
+				PortRange: r.Port, CIDR: r.CIDR, Action: r.Action, Priority: rulePriority(r, i),
 			}
 			row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
 			need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, "")
@@ -569,7 +591,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 		for i, r := range fd.ClusterRules {
 			row := corrosion.FirewallRule{
 				ID: randid.New(), Direction: r.Direction, Proto: r.Proto, PortRange: r.Port,
-				CIDR: r.CIDR, Action: r.Action, Comment: r.Comment, StackName: f.Name, Priority: (i + 1) * 10,
+				CIDR: r.CIDR, Action: r.Action, Comment: r.Comment, StackName: f.Name, Priority: rulePriority(r, i),
 			}
 			row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
 			need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, row.Comment)
@@ -587,6 +609,15 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 		}
 	}
 	return nil
+}
+
+// rulePriority is the priority of the rule at position i: the one macro
+// expansion set (every row of a macro shares it), else (i+1)*10.
+func rulePriority(r compose.FirewallRuleDef, i int) int {
+	if r.Priority != 0 {
+		return r.Priority
+	}
+	return (i + 1) * 10
 }
 
 // streamResolvedPlan sends the full resolved plan over the deploy progress stream.
@@ -763,6 +794,7 @@ func (s *Server) deployCreatePlanned(ctx context.Context, action planner.VMActio
 // provisionPlannedNetworks provisions networks only on hosts where VMs are placed,
 // instead of broadcasting to all cluster hosts.
 func (s *Server) provisionPlannedNetworks(ctx context.Context, f *compose.File, plan *planner.ResolvedPlan, stream grpc.ServerStreamingServer[pb.DeployProgress]) error {
+	f.DefaultNetworkInterfaces()
 	// Build the set of hosts that actually need network provisioning.
 	targetHosts := map[string]bool{}
 	for _, na := range plan.Networks {
@@ -971,33 +1003,21 @@ func (s *Server) applyLBActions(ctx context.Context, f *compose.File, plan *plan
 			Detail: fmt.Sprintf("applying %s", la.Detail),
 		})
 
-		// Build a stub VMSpec with LB config for the existing apply logic.
+		// The LB's spec comes from its compose definition through the same
+		// conversion a VM's spec uses, so the apply carries everything the
+		// file asked for (sticky sessions, health, TLS, redirects, snat), not
+		// a subset that each deploy would re-apply over the LB.
 		// applyLBFromSpecWithRetry reads spec.Loadbalancer and spec.StackName.
-		for _, vmDef := range f.VMs {
-			if vmDef.LoadBalancer == nil || !vmDef.LoadBalancer.Enabled {
-				continue
-			}
-			var ports []*pb.LBPort
-			for _, p := range la.Ports {
-				ports = append(ports, &pb.LBPort{
-					Listen:   int32(p.Listen),
-					Target:   int32(p.Target),
-					Protocol: p.Protocol,
-				})
-			}
-			stubSpec := &pb.VMSpec{
-				StackName: f.Name,
-				Loadbalancer: &pb.LBSpec{
-					Enabled:   true,
-					Vip:       la.VIP,
-					Algorithm: la.Algorithm,
-					Ports:     ports,
-					Hosts:     la.TargetHosts,
-				},
-			}
-			s.applyLBFromSpecWithRetry(ctx, stubSpec)
-			break
+		vmDef, ok := f.VMs[la.VMName]
+		if !ok {
+			continue
 		}
+		lbSpec := compose.BuildLBSpec(vmDef.LoadBalancer)
+		if lbSpec == nil {
+			continue
+		}
+		lbSpec.Hosts = la.TargetHosts
+		s.applyLBFromSpecWithRetry(ctx, &pb.VMSpec{StackName: f.Name, Loadbalancer: lbSpec})
 	}
 }
 
@@ -2608,9 +2628,6 @@ func (s *Server) provisionComposeNetworks(ctx context.Context, f *compose.File) 
 			errs = append(errs, msg)
 			continue
 		}
-		if netDef.Interface == "" {
-			netDef.Interface = name
-		}
 		scopedName := compose.ScopedNetworkName(f.Name, name)
 		// Stack networks remain GLOBAL/shared ("") — preserving pre-v37 behavior;
 		// project-scoping stack-defined networks is a separate follow-up.
@@ -2621,42 +2638,4 @@ func (s *Server) provisionComposeNetworks(ctx context.Context, f *compose.File) 
 		}
 	}
 	return errs
-}
-
-// forwardProvisionNetworks sends ProvisionNetwork RPCs to all remote hosts
-// so that networks are ready before VMs are placed there.
-func (s *Server) forwardProvisionNetworks(ctx context.Context, f *compose.File) {
-	hosts, err := corrosion.ListHosts(ctx, s.db)
-	if err != nil {
-		return
-	}
-
-	for _, h := range hosts {
-		if h.Name == s.hostName {
-			continue
-		}
-		for name, netDef := range f.Networks {
-			if netDef.External {
-				continue
-			}
-			if netDef.Interface == "" {
-				netDef.Interface = name
-			}
-			cfgJSON, _ := json.Marshal(netDef)
-			client, conn, err := s.peerClient(ctx, h.Name)
-			if err != nil {
-				slog.Warn("forwardProvisionNetworks: cannot reach host", "host", h.Name, "error", err)
-				break // skip remaining networks for this host
-			}
-			ntype := netDef.Type
-			if ntype == "" {
-				ntype = "bridge"
-			}
-			scopedName := compose.ScopedNetworkName(f.Name, name)
-			if _, err := client.ProvisionNetwork(ctx, provisionNetworkRequest(scopedName, string(cfgJSON), ntype, f.Name)); err != nil {
-				slog.Warn("forwardProvisionNetworks: provision failed", "host", h.Name, "network", scopedName, "error", err)
-			}
-			conn.Close()
-		}
-	}
 }

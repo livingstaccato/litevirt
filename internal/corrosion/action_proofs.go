@@ -98,6 +98,9 @@ type ProofRecord struct {
 	ResultCode   string
 	ResultDetail string
 	ExecutorHost string
+	// Tombstoned: ReapSpentProofs has tombstoned the proof (read only by the
+	// listings that include tombstoned proofs).
+	Tombstoned bool
 }
 
 // Terminal reports whether the proof has reached a terminal state.
@@ -115,6 +118,23 @@ func (p ProofRecord) Terminal() bool {
 // host, and the next migration of that VM cut over and then failed its
 // ownership commit (pp3 on the kvm003 lab, main-b3368d7c).
 func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmName, destHost string) error {
+	return writeVMRescheduleProof(ctx, c, p, vmName, destHost, "")
+}
+
+// ReplaceVMRescheduleProof is WriteVMRescheduleProof for a VM row still
+// pending on the proof replacing: it applies only while the row's
+// pending_action_id is replacing and its state is pending, and otherwise
+// returns ErrNoRowsAffected. The failover coordinator moves a pending
+// reschedule whose proof its destination abandoned onto the proof decided
+// in its place (sweepStaleTermProofs).
+func ReplaceVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmName, destHost, replacing string) error {
+	if replacing == "" {
+		return fmt.Errorf("replace a pending reschedule of %s: no proof to replace", vmName)
+	}
+	return writeVMRescheduleProof(ctx, c, p, vmName, destHost, replacing)
+}
+
+func writeVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmName, destHost, replacing string) error {
 	if err := proofStampEmittable(c, p); err != nil {
 		return err
 	}
@@ -167,9 +187,11 @@ func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmNam
 	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		var currentOwnerEpoch int64
 		var startable bool
-		if err := tx.QueryRow(`SELECT vm_owner_epoch, NOT `+vmStoppedByIntentSQL+` FROM vms WHERE name = ? AND deleted_at IS NULL`,
+		var pendingID, state string
+		if err := tx.QueryRow(`SELECT vm_owner_epoch, NOT `+vmStoppedByIntentSQL+`, COALESCE(pending_action_id, ''), COALESCE(state, '')
+			FROM vms WHERE name = ? AND deleted_at IS NULL`,
 			append(vmStoppedByIntentArgs(), vmName)...).
-			Scan(&currentOwnerEpoch, &startable); err != nil {
+			Scan(&currentOwnerEpoch, &startable, &pendingID, &state); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return false, nil
 			}
@@ -177,6 +199,9 @@ func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmNam
 		}
 		if !startable {
 			return false, ErrWorkloadStopped
+		}
+		if replacing != "" && (pendingID != replacing || state != "pending") {
+			return false, nil
 		}
 		if p.OwnerEpoch != "" {
 			expectedOwnerEpoch, err := strconv.ParseInt(p.OwnerEpoch, 10, 64)
@@ -527,7 +552,8 @@ func getActionProof(ctx context.Context, c *Client, id string, tombstoned bool) 
 		`SELECT id, action, target_kind, target_name, dest_host, coordinator,
 		        lease_holder, lease_expires_at, quorum_live, quorum_needed,
 		        owner_epoch, fence_epoch, relocation_token, lease_term, lease_key, claim_certificate,
-		        status, step_state, result_code, result_detail, executor_host
+		        status, step_state, result_code, result_detail, executor_host,
+		        COALESCE(deleted_at, '') AS deleted_at
 		   FROM runtime_action_proofs WHERE id = ?`+live, id)
 	if err != nil {
 		return ProofRecord{}, false, err
@@ -549,7 +575,7 @@ func getActionProof(ctx context.Context, c *Client, id string, tombstoned bool) 
 		},
 		Status: r.String("status"), StepState: r.String("step_state"),
 		ResultCode: r.String("result_code"), ResultDetail: r.String("result_detail"),
-		ExecutorHost: r.String("executor_host"),
+		ExecutorHost: r.String("executor_host"), Tombstoned: r.String("deleted_at") != "",
 	}, true, nil
 }
 

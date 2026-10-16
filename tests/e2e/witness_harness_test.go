@@ -614,6 +614,7 @@ type leaseChange struct {
 	At     time.Time
 	Holder string
 	Term   int
+	Reader string // the replica that was read ("" for the merged history)
 }
 
 // leaseWatch samples the failover lease (holder and newest term) every second.
@@ -623,15 +624,29 @@ type leaseWatch struct {
 	readers []string
 	avoided map[string]bool
 	changes []leaseChange
-	stop    chan struct{}
-	done    chan struct{}
+	incoh   map[string]*incoherenceTracker
+	// every incoherent sample, and the holder each term was first seen with
+	incohSamples []leaseIncoherent
+	termHolder   map[int]string
+	fail         func(format string, args ...any)
+	logf         func(format string, args ...any)
+	summed       sync.Once
+	selfClaim    selfClaimTracker
+	unknownRun   map[string]int // consecutive failed reads per reader
+	unknownTotal map[string]int // all failed reads per reader
+	ticks        int            // ticks sampled
+	all          []leaseChange  // every reader's tenures, tagged by reader
+	lastBy       map[string]leaseChange
+	maxTerm      map[string]int
+	stop         chan struct{}
+	done         chan struct{}
 }
 
 // watchLease samples leader_election and leader_lease_terms every second from
 // the first of readers that is not avoided and answers (a frozen or stopped
 // node's replica stops applying, so the drill avoids it while it is out).
 func (l *lab) watchLease(readers []string) *leaseWatch {
-	w := &leaseWatch{l: l, readers: readers, avoided: map[string]bool{}, stop: make(chan struct{}), done: make(chan struct{})}
+	w := &leaseWatch{l: l, readers: readers, avoided: map[string]bool{}, incoh: map[string]*incoherenceTracker{}, termHolder: map[int]string{}, lastBy: map[string]leaseChange{}, maxTerm: map[string]int{}, fail: l.t.Errorf, logf: func(f string, a ...any) { l.mark(f, a...) }, stop: make(chan struct{}), done: make(chan struct{})}
 	go func() {
 		defer close(w.done)
 		tick := time.NewTicker(time.Second)
@@ -658,24 +673,470 @@ func (w *leaseWatch) sampleOnce() {
 		}
 	}
 	w.mu.Unlock()
-	for _, r := range rs {
-		rows, err := w.l.sql(r, "SELECT COALESCE((SELECT holder FROM leader_election WHERE key='failover'),''), (SELECT COALESCE(MAX(term),0) FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL)")
-		if err != nil || len(rows) == 0 || len(rows[0]) < 2 {
+	var samples []readerSample
+	for _, r := range rs { // every reader every tick: a later one can be the incoherent one
+		rows, err := w.l.sql(r, "SELECT COALESCE((SELECT holder FROM leader_election WHERE key='failover'),''), (SELECT COALESCE(MAX(term),0) FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL), COALESCE((SELECT holder FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL ORDER BY term DESC LIMIT 1),''), COALESCE((SELECT group_concat(term || ':' || holder, ',') FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL),''), COALESCE((SELECT expires_at FROM leader_election WHERE key='failover'),''), strftime('%Y-%m-%dT%H:%M:%SZ','now')")
+		if err != nil || len(rows) == 0 || len(rows[0]) < 6 {
+			samples = append(samples, readerSample{Reader: r, Failed: true})
 			continue
 		}
 		term, _ := strconv.Atoi(rows[0][1])
-		c := leaseChange{At: time.Now(), Holder: rows[0][0], Term: term}
-		w.mu.Lock()
-		n := len(w.changes)
-		if n == 0 || w.changes[n-1].Holder != c.Holder || w.changes[n-1].Term != c.Term {
-			w.changes = append(w.changes, c)
+		samples = append(samples, readerSample{Reader: r, S: leaseSample{Election: rows[0][0], Term: term, Ledger: rows[0][2], Terms: parseTermHolders(rows[0][3]), Expires: parseLeaseTime(rows[0][4]), Now: parseLeaseTime(rows[0][5])}})
+	}
+	w.sampleTick(time.Now(), samples)
+}
+
+// readerSample is one reader's answer in a tick; Failed is a sql read that
+// gave nothing (the reader's state is unknown, not absent).
+type readerSample struct {
+	Reader string
+	S      leaseSample
+	Failed bool
+}
+
+// recorderOf picks the reader whose sample feeds the change history this
+// tick: the usable (not lagging, not unexplained) sample with the highest
+// ledger term, the first of those on a tie; "" when none is usable. A stale
+// self-consistent replica therefore never stands in for the newest tenure.
+func recorderOf(samples []readerSample) string {
+	best, bestTerm := "", -1
+	for _, rs := range samples {
+		if rs.Failed {
+			continue
+		}
+		if k := classifyLease(rs.S); k == leaseLag || k == leaseUnexplained || (k == leaseNeutral && rs.S.Election != "") {
+			continue
+		}
+		if rs.S.Term > bestTerm {
+			best, bestTerm = rs.Reader, rs.S.Term
+		}
+	}
+	return best
+}
+
+// selfClaims reports whether the sample is a claim to count at once: the
+// replica names its own node holder, is not lag-classified and the lease it
+// names is unexpired by that replica's own clock. A lagging replica holding
+// its own old election row is catching up, and an expired row is a tenure that
+// ended: neither is a holder.
+func selfClaims(r string, s leaseSample) bool {
+	return s.Election == r && classifyLease(s) != leaseLag && !s.expired()
+}
+
+// sampleTick takes every reader's answer for one tick.
+func (w *leaseWatch) sampleTick(now time.Time, samples []readerSample) {
+	rec := recorderOf(samples)
+	claims := map[string]string{}
+	var unknown []string
+	for _, rs := range samples {
+		if rs.Failed {
+			unknown = append(unknown, rs.Reader)
+			continue
+		}
+		w.observe(rs.Reader, now, rs.S, rs.Reader == rec)
+		if selfClaims(rs.Reader, rs.S) {
+			claims[rs.Reader] = rs.S.Election // the node's own replica names the node itself
+		}
+	}
+	w.observeTick(now, claims, unknown)
+}
+
+// selfClaimGrace is how long two nodes may each name themselves the holder in
+// their own replicas (a handover seen from both ends) before it is a dual holder.
+const (
+	selfClaimGrace     = 5 * time.Second
+	selfClaimGraceTick = 2
+)
+
+// selfClaimTracker follows consecutive ticks with two self-claimants.
+type selfClaimTracker struct {
+	held     bool            // a run is being held across an unreadable claimant
+	last     map[string]bool // who claimed on the previous tick (or was carried)
+	n        int
+	since    time.Time
+	reported bool
+}
+
+// observeTick takes the tick's self-claims (reader → itself) and fails when two
+// different nodes have each been named holder by their OWN replica for 2
+// consecutive ticks or selfClaimGrace. A stale replica of someone else's
+// tenure is lag, not a claim, and never enters here.
+func (w *leaseWatch) observeTick(now time.Time, claims map[string]string, unknown []string) {
+	w.mu.Lock()
+	c := &w.selfClaim
+	persistent := w.noteUnknown(unknown)
+	// A failed read of a node that claimed last tick is unknown: it neither
+	// resets nor extends the run, so intermittent sql errors cannot evade it.
+	carried := 0
+	last := map[string]bool{}
+	for r := range claims {
+		last[r] = true
+	}
+	for _, u := range unknown {
+		if c.last[u] {
+			carried++
+			last[u] = true
+		}
+	}
+	if len(claims) < 2 {
+		if len(claims)+carried >= 2 {
+			// Bound the hold: a claimant unreadable for good is unverifiable.
+			var gone []string
+			for _, u := range unknown {
+				if c.last[u] && w.unknownRun[u] > unknownPersistent+unknownHeldExtra {
+					gone = append(gone, u)
+				}
+			}
+			if len(gone) > 0 {
+				k := w.unknownRun[gone[0]]
+				*c = selfClaimTracker{}
+				w.mu.Unlock()
+				w.reportUnknown(persistent)
+				w.fail("lease: dual claim unverifiable: %v claimed beside another holder, then unreadable %d ticks", gone, k)
+				return
+			}
+			enter := !c.held
+			c.held = true
+			c.last = last
 			w.mu.Unlock()
-			w.l.mark("lease: failover held by %s, term %d (read on %s)", c.Holder, c.Term, r)
+			w.reportUnknown(persistent)
+			if enter {
+				w.logf("lease: self-claim run held across an unreadable replica (%v)", unknown)
+			}
 			return
 		}
+		*c = selfClaimTracker{}
 		w.mu.Unlock()
+		w.reportUnknown(persistent)
 		return
 	}
+	c.last = last
+	c.held = false
+	if c.n == 0 {
+		c.since = now
+	}
+	c.n++
+	fail := !c.reported && (c.n >= selfClaimGraceTick || now.Sub(c.since) >= selfClaimGrace)
+	if fail {
+		c.reported = true
+	}
+	n := c.n
+	w.mu.Unlock()
+	w.reportUnknown(persistent)
+	names := make([]string, 0, len(claims))
+	for r := range claims {
+		names = append(names, r)
+	}
+	sort.Strings(names)
+	w.logf("lease: SELF-CLAIMS by %v at the same tick (tick %d)", names, n)
+	if fail {
+		w.fail("lease: dual holder: %v each hold the lease in their own replica for %d consecutive ticks", names, n)
+	}
+}
+
+// neverReadable lists readers whose sql failed on every sampled tick.
+func (w *leaseWatch) neverReadable() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var out []string
+	if w.ticks < unknownPersistent+unknownHeldExtra {
+		return nil
+	}
+	for r, n := range w.unknownTotal {
+		if n == w.ticks {
+			out = append(out, r)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// unknownPersistent is how many consecutive failed reads of one replica make
+// it worth a log line.
+const unknownPersistent = 3
+
+// unknownHeldExtra is how many ticks past unknownPersistent a held run waits
+// for its unreadable claimant before the drill fails.
+const unknownHeldExtra = 3
+
+// noteUnknown counts consecutive failed reads per reader (w.mu held) and
+// returns the readers that just reached unknownPersistent.
+func (w *leaseWatch) noteUnknown(unknown []string) []string {
+	if w.unknownRun == nil {
+		w.unknownRun = map[string]int{}
+		w.unknownTotal = map[string]int{}
+	}
+	w.ticks++
+	failed := map[string]bool{}
+	var hit []string
+	for _, u := range unknown {
+		failed[u] = true
+		w.unknownRun[u]++
+		w.unknownTotal[u]++
+		if w.unknownRun[u] == unknownPersistent {
+			hit = append(hit, u)
+		}
+	}
+	for r := range w.unknownRun {
+		if !failed[r] {
+			w.unknownRun[r] = 0
+		}
+	}
+	return hit
+}
+
+func (w *leaseWatch) reportUnknown(hit []string) {
+	for _, r := range hit {
+		w.logf("lease: %s's replica could not be read for %d consecutive ticks; its self-claims are unknown", r, unknownPersistent)
+	}
+}
+
+// leaseSample is one replica's view of the lease: its election row, the newest
+// ledger term and that term's holder, and every term's holder.
+type leaseSample struct {
+	Election string
+	Term     int
+	Ledger   string
+	Terms    map[int]string
+	// Expires is the election row's expires_at and Now the reader's clock at
+	// the read (the node's own sqlite). Zero means unknown, which counts as
+	// unexpired: an unreadable expiry never excuses a claim.
+	Expires time.Time
+	Now     time.Time
+}
+
+// A drill that steps a watched reader's clock forward must account for this.
+// leaseSkewMargin is how far past expires_at the reader's clock must be before
+// the row counts as expired: clocks across nodes may differ by this much.
+const leaseSkewMargin = clockSlack
+
+// parseLeaseTime reads an RFC3339 lease timestamp; "" or garbage is the zero time.
+func parseLeaseTime(v string) time.Time {
+	t, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// expired reports whether the election row's lease had clearly ended by the
+// reader's own clock, beyond the skew margin. Unknown is not expired.
+func (s leaseSample) expired() bool {
+	if s.Expires.IsZero() || s.Now.IsZero() {
+		return false
+	}
+	return s.Now.After(s.Expires.Add(leaseSkewMargin))
+}
+
+// parseTermHolders reads "50:node-2,51:node-4".
+func parseTermHolders(s string) map[int]string {
+	m := map[int]string{}
+	for _, kv := range strings.Split(s, ",") {
+		t, h, ok := strings.Cut(kv, ":")
+		if n, err := strconv.Atoi(t); ok && err == nil {
+			m[n] = h
+		}
+	}
+	return m
+}
+
+type leaseSampleKind int
+
+const (
+	leaseCoherent    leaseSampleKind = iota
+	leaseNeutral                     // election empty, or an expired row, beside a held ledger term: between tenures
+	leaseLag                         // election holds an OLDER term: the replica is behind
+	leaseUnexplained                 // election holder holds no earlier term either
+)
+
+// classifyLease sorts a sample. A lagging replica holds its own old election
+// row beside a newer ledger term; pairing the two would report a second
+// holder at a term that had one.
+func classifyLease(s leaseSample) leaseSampleKind {
+	switch {
+	case s.Ledger == "" || s.Election == s.Ledger:
+		return leaseCoherent
+	case s.Election == "":
+		return leaseNeutral
+	}
+	for t, h := range s.Terms {
+		if t < s.Term && h == s.Election {
+			return leaseLag
+		}
+	}
+	if s.expired() {
+		return leaseNeutral // a tenure that ended, nobody holds it
+	}
+	return leaseUnexplained
+}
+
+// observe takes one sample from reader r and reports whether it was recorded
+// as a lease change (only when record is set and the sample is usable).
+// Nothing is dropped silently: every incoherent sample is kept for the Stop
+// summary and logged; two holders for one term fail at once; an incoherence
+// that persists on one reader fails after incoherenceBound.
+func (w *leaseWatch) observe(r string, now time.Time, s leaseSample, record bool) bool {
+	w.mu.Lock()
+	// The ledger must have one holder per term, across readers and over time.
+	var conflicts []string
+	if w.maxTerm != nil && s.Term < w.maxTerm[r] {
+		// The reader's ledger went backwards: a lease reset (or a replaced
+		// replica) reuses term numbers, so earlier term holders no longer apply.
+		w.termHolder = map[int]string{}
+		defer w.logf("lease: %s's newest term fell from %d to %d; term holders forgotten", r, w.maxTerm[r], s.Term)
+	}
+	if w.maxTerm != nil {
+		w.maxTerm[r] = s.Term
+	}
+	for t, h := range s.Terms {
+		if prev, ok := w.termHolder[t]; ok && prev != h {
+			conflicts = append(conflicts, fmt.Sprintf("term %d held by %q and by %q (read on %s)", t, prev, h, r))
+		} else if !ok {
+			w.termHolder[t] = h
+		}
+	}
+	kind := classifyLease(s)
+	tr := w.incoh[r]
+	if tr == nil {
+		tr = &incoherenceTracker{}
+		w.incoh[r] = tr
+	}
+	var persistent bool
+	switch kind {
+	case leaseCoherent:
+		tr.observe(now, true)
+	case leaseNeutral:
+		// neither resets nor extends a run
+	case leaseLag:
+		// A replica behind the ledger with an EXPIRED row is a restarted node's
+		// leftover (leader_election is not carried by anti-entropy): recorded,
+		// never failed. An unexpired or unknown one is a lease someone may still
+		// be renewing beside a newer term, and counts toward the window.
+		if !s.expired() {
+			persistent = tr.observe(now, false)
+		}
+		w.incohSamples = append(w.incohSamples, leaseIncoherent{At: now, Reader: r, Sample: s, Kind: kind})
+	default:
+		persistent = tr.observe(now, false)
+		w.incohSamples = append(w.incohSamples, leaseIncoherent{At: now, Reader: r, Sample: s, Kind: kind})
+	}
+	streak := tr.n
+	w.mu.Unlock()
+	for _, c := range conflicts {
+		w.fail("lease: two holders for one term: %s", c)
+	}
+	if kind == leaseLag || kind == leaseUnexplained {
+		w.logf("lease: INCOHERENT sample on %s: election holder %q, ledger term %d held by %q (%s, streak %d, expires %s, reader clock %s)", r, s.Election, s.Term, s.Ledger, [...]string{"", "", "lagging", "unexplained"}[kind], streak, s.Expires.Format(time.RFC3339), s.Now.Format(time.RFC3339))
+	}
+	if persistent {
+		w.fail("lease: %s's replica has shown election holder %q beside ledger term %d held by %q for %d samples over %v: an unexpired election row that disagrees with the ledger (%s)", r, s.Election, s.Term, s.Ledger, streak, incoherenceBound, [...]string{"", "", "behind the ledger: a lease still being renewed beside a newer term", "no ledger term explains it"}[kind])
+	}
+	if kind == leaseLag || kind == leaseUnexplained || (kind == leaseNeutral && s.Election != "") {
+		return false // not a tenure: an expired non-empty row names nobody who holds
+	}
+	c := leaseChange{At: now, Holder: s.Election, Term: s.Term, Reader: r}
+	w.mu.Lock()
+	if w.lastBy != nil {
+		if p, ok := w.lastBy[r]; !ok || p.Holder != c.Holder || p.Term != c.Term {
+			w.lastBy[r] = c
+			w.all = append(w.all, c)
+		}
+	}
+	if !record {
+		w.mu.Unlock()
+		return false
+	}
+	n := len(w.changes)
+	if n == 0 || w.changes[n-1].Holder != c.Holder || w.changes[n-1].Term != c.Term {
+		w.changes = append(w.changes, c)
+		w.mu.Unlock()
+		w.logf("lease: failover held by %s, term %d (read on %s)", c.Holder, c.Term, r)
+		return true
+	}
+	w.mu.Unlock()
+	return true
+}
+
+// leaseIncoherent is one kept incoherent sample.
+type leaseIncoherent struct {
+	At     time.Time
+	Reader string
+	Sample leaseSample
+	Kind   leaseSampleKind
+}
+
+// summary is the end-of-drill account of every incoherent sample.
+func (w *leaseWatch) summary() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var b strings.Builder
+	if len(w.incohSamples) == 0 {
+		b.WriteString("lease: no incoherent samples")
+	} else {
+		fmt.Fprintf(&b, "lease: %d incoherent sample(s):", len(w.incohSamples))
+		for _, o := range w.incohSamples {
+			fmt.Fprintf(&b, "\n  %s on %s: election %q, ledger term %d held by %q (kind %d, expires %s, reader clock %s)", o.At.Format("15:04:05"), o.Reader, o.Sample.Election, o.Sample.Term, o.Sample.Ledger, o.Kind, o.Sample.Expires.Format(time.RFC3339), o.Sample.Now.Format(time.RFC3339))
+		}
+	}
+	var names []string
+	for r, n := range w.unknownTotal {
+		if n > 0 {
+			names = append(names, r)
+		}
+	}
+	sort.Strings(names)
+	for _, r := range names {
+		fmt.Fprintf(&b, "\nlease: %s unreadable on %d of %d tick(s) (its claims were unknown)", r, w.unknownTotal[r], w.ticks)
+	}
+	return b.String()
+}
+
+// incoherenceBound is the window in which one replica may show incoherenceMax
+// election holders that disagree with its ledger before the drill fails.
+const incoherenceBound = 10 * time.Second
+
+// incoherenceTracker follows one reader's incoherent samples over a sliding
+// window: a flapping election row cannot evade it by alternating.
+type incoherenceTracker struct {
+	times    []time.Time
+	n        int // incoherent samples in the window
+	reported bool
+}
+
+// incoherenceMax is how many incoherent samples one reader may show within
+// incoherenceBound.
+const incoherenceMax = 3
+
+// observe records a sample and reports, once per episode, that incoherenceMax
+// incoherent samples fell within incoherenceBound. Coherent samples do not
+// clear the window; they only let it drain.
+func (c *incoherenceTracker) observe(now time.Time, coherent bool) bool {
+	keep := c.times[:0]
+	for _, t := range c.times {
+		if now.Sub(t) < incoherenceBound {
+			keep = append(keep, t)
+		}
+	}
+	c.times = keep
+	if !coherent {
+		c.times = append(c.times, now)
+	}
+	c.n = len(c.times)
+	if c.n == 0 {
+		c.reported = false
+	}
+	if c.reported || c.n < incoherenceMax {
+		return false
+	}
+	c.reported = true
+	return true
+}
+
+// allHistory is every reader's tenures, tagged by reader, in sampling order.
+func (w *leaseWatch) allHistory() []leaseChange {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]leaseChange(nil), w.all...)
 }
 
 func (w *leaseWatch) Stop() {
@@ -685,11 +1146,18 @@ func (w *leaseWatch) Stop() {
 		close(w.stop)
 	}
 	<-w.done
+	w.summed.Do(func() {
+		w.logf("%s", w.summary())
+		for _, r := range w.neverReadable() {
+			w.fail("lease: W3 inconclusive: %s's replica was unreadable on every one of %d sampled ticks", r, w.ticks)
+		}
+	})
 }
 
 func (w *leaseWatch) avoid(h string, on bool) {
 	w.mu.Lock()
 	w.avoided[h] = on
+	delete(w.incoh, h) // a replica returning from an outage starts a new run
 	w.mu.Unlock()
 }
 
@@ -772,7 +1240,9 @@ func (l *lab) handoverByStop(via, holder string, lw *leaseWatch) (leaseChange, b
 	if _, err := l.ssh(holder, time.Minute, "systemctl start litevirt"); err != nil {
 		l.t.Errorf("start litevirt on %s: %v", holder, err)
 	}
-	if err := l.waitDaemon(holder, 3*time.Minute); err != nil {
+	// Keep the holder avoided until it serves: its replica holds its own old
+	// leader_election row for a moment after the restart.
+	if err := l.waitServing(holder, 3*time.Minute); err != nil {
 		l.t.Errorf("%v", err)
 	}
 	l.mark("handover: started litevirt on %s again (new holder %q, moved=%v)", holder, next.Holder, ok)
@@ -794,6 +1264,10 @@ func (l *lab) handoverByFreeze(via, holder string, lw *leaseWatch) (leaseChange,
 	time.Sleep(time.Until(frozen.Add(holderFreeze)))
 	if err := thaw(); err != nil {
 		l.t.Errorf("thaw %s: %v", holder, err)
+	}
+	// Stay avoided until the thawed replica has caught up and serves.
+	if err := l.waitServing(holder, 3*time.Minute); err != nil {
+		l.t.Errorf("%v", err)
 	}
 	return next, ok
 }
@@ -1579,4 +2053,48 @@ func freshTenureAt(history []leaseChange, holder string, from, at time.Time) boo
 		return true
 	}
 	return len(cands) > 1 && last.At.After(at.Add(-clockSlack)) && ok(cands[len(cands)-2])
+}
+
+// settleDeclinedEv is vm_settle_declined's evidence (health/settle_declined.go).
+type settleDeclinedEv struct {
+	ReasonClass string `json:"reason_class"`
+	Reason      string `json:"reason"`
+	RowHost     string `json:"row_host"`
+	Remedy      string `json:"remedy"`
+}
+
+// vmSettleDeclined reads host's vm_settle_declined about vm in via's replica.
+func (l *lab) vmSettleDeclined(via, vm, host string) (string, settleDeclinedEv, string, bool) {
+	rows, err := l.sql(via, fmt.Sprintf(
+		"SELECT lifecycle, hex(evidence) FROM health_conditions WHERE evaluator='%s' AND code='%s' AND subject_kind='vm' AND subject_id='%s@%s' AND deleted_at IS NULL",
+		corrosion.PartitionPauseEvaluator, corrosion.CondVMSettleDeclined, vm, host))
+	if err != nil || len(rows) == 0 || len(rows[0]) < 2 {
+		return "", settleDeclinedEv{}, "", false
+	}
+	var ev settleDeclinedEv
+	b, err := hex.DecodeString(rows[0][1])
+	if err == nil {
+		_ = json.Unmarshal(b, &ev)
+	}
+	return rows[0][0], ev, string(b), true
+}
+
+// uncertifiedDeclineVerdict is nil when ev declines vm's copy because its move
+// to dest completed on a proof with no certificate, and its remedy checks the
+// replacement by dest's runtime and stops the copy with virsh — never through
+// `lv cluster claim`, which has no claim to show on a derived voter set.
+func uncertifiedDeclineVerdict(ev settleDeclinedEv, vm, dest string) error {
+	switch {
+	case ev.ReasonClass != "proof_uncertified":
+		return fmt.Errorf("reason class %q, want proof_uncertified (reason %q)", ev.ReasonClass, ev.Reason)
+	case ev.RowHost != dest:
+		return fmt.Errorf("row host %q, want the replacement's host %q", ev.RowHost, dest)
+	case strings.Contains(ev.Remedy, "lv cluster claim"):
+		return fmt.Errorf("the remedy points at a claim a derived voter set never decided: %s", ev.Remedy)
+	case !strings.Contains(ev.Remedy, "virsh domstate "+vm):
+		return fmt.Errorf("the remedy does not confirm the replacement by its runtime (virsh domstate %s): %s", vm, ev.Remedy)
+	case !strings.Contains(ev.Remedy, "virsh destroy "+vm):
+		return fmt.Errorf("the remedy does not name the stop (virsh destroy %s): %s", vm, ev.Remedy)
+	}
+	return nil
 }

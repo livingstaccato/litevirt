@@ -73,6 +73,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -166,6 +167,10 @@ type Options struct {
 	// peers — a partition that heals, a re-join — which a seeded view cannot
 	// reach. Incompatible with SharedCRDT.
 	RealGossip bool
+	// ClockSeam gives every node a wall clock Node.StepClock can move, for its
+	// row stamps and its HLC (corrosion.Client.SetWallClockForTests). A
+	// scenario's coordinator reads it through Node.Now.
+	ClockSeam bool
 	// GossipKey, with RealGossip, runs every node at
 	// enforcement.gossip_encryption enforced under this one key. Nil is
 	// plaintext gossip.
@@ -259,6 +264,10 @@ type Node struct {
 	// cluster is the fleet this node belongs to, so a node-scoped helper can
 	// reach cluster-wide state (the self client, the reachability overlay).
 	cluster *Cluster
+
+	// clockOffset is how far StepClock moved this node's wall clock
+	// (Options.ClockSeam), in nanoseconds.
+	clockOffset atomic.Int64
 
 	// repl is the node's Replicator (wired into the server for PushMutations;
 	// background loop not started — see buildServer).
@@ -725,6 +734,9 @@ func (c *Cluster) openDB(n *Node, shared bool) {
 	if err != nil {
 		c.t.Fatalf("open DB for %s: %v", n.Name, err)
 	}
+	if c.opts.ClockSeam {
+		db.SetWallClockForTests(n.Now)
+	}
 	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		c.t.Fatalf("InitSchema for %s: %v", n.Name, err)
 	}
@@ -893,6 +905,7 @@ func (c *Cluster) buildServer(n *Node) {
 	// (bridgeEnsure) is left alone; see NetProvFake.EnsureBridge.
 	n.Net = NewNetProvFake()
 	n.Server.SetNetworkProvisioner(n.Net)
+	n.Server.SetVTEPResolver(n.Net.ResolveVTEP)
 
 	// External IPAM: a REAL netbox.Client (token file and all) pointed at the
 	// scenario's fake server, plus the config kill-switch that lets this node
@@ -1139,6 +1152,14 @@ func regionFor(by []string, i int) string {
 	}
 	return "default"
 }
+
+// Now is n's wall clock: real time plus whatever StepClock added.
+func (n *Node) Now() time.Time { return time.Now().Add(time.Duration(n.clockOffset.Load())) }
+
+// StepClock moves n's wall clock by d from where it is (Options.ClockSeam
+// carries it to the node's row stamps and HLC; a coordinator must be given
+// Node.Now itself).
+func (n *Node) StepClock(d time.Duration) { n.clockOffset.Add(int64(d)) }
 
 // HLCClock returns a node's HLC. Used by scenarios that need to
 // fabricate mutation entries with deterministic timestamps.

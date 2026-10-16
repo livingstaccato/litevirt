@@ -157,6 +157,7 @@ const (
 	LiteVirt_NormalizeRoleBindings_FullMethodName      = "/litevirt.v1.LiteVirt/NormalizeRoleBindings"
 	LiteVirt_GetVMOperation_FullMethodName             = "/litevirt.v1.LiteVirt/GetVMOperation"
 	LiteVirt_AbortVMOperation_FullMethodName           = "/litevirt.v1.LiteVirt/AbortVMOperation"
+	LiteVirt_ReleaseHostReservation_FullMethodName     = "/litevirt.v1.LiteVirt/ReleaseHostReservation"
 	LiteVirt_BeginWebAuthnRegistration_FullMethodName  = "/litevirt.v1.LiteVirt/BeginWebAuthnRegistration"
 	LiteVirt_FinishWebAuthnRegistration_FullMethodName = "/litevirt.v1.LiteVirt/FinishWebAuthnRegistration"
 	LiteVirt_BeginWebAuthnLogin_FullMethodName         = "/litevirt.v1.LiteVirt/BeginWebAuthnLogin"
@@ -284,6 +285,7 @@ const (
 	LiteVirt_CleanupMigrationArtifacts_FullMethodName  = "/litevirt.v1.LiteVirt/CleanupMigrationArtifacts"
 	LiteVirt_ReceiveMigrationDisk_FullMethodName       = "/litevirt.v1.LiteVirt/ReceiveMigrationDisk"
 	LiteVirt_CheckCPUCompatibility_FullMethodName      = "/litevirt.v1.LiteVirt/CheckCPUCompatibility"
+	LiteVirt_AnnounceMigratedGuest_FullMethodName      = "/litevirt.v1.LiteVirt/AnnounceMigratedGuest"
 	LiteVirt_GetStateDigest_FullMethodName             = "/litevirt.v1.LiteVirt/GetStateDigest"
 	LiteVirt_AcknowledgeLeaseTermTie_FullMethodName    = "/litevirt.v1.LiteVirt/AcknowledgeLeaseTermTie"
 	LiteVirt_GetLeaseTermHighWater_FullMethodName      = "/litevirt.v1.LiteVirt/GetLeaseTermHighWater"
@@ -607,6 +609,7 @@ type LiteVirtClient interface {
 	NormalizeRoleBindings(ctx context.Context, in *NormalizeRoleBindingsRequest, opts ...grpc.CallOption) (*NormalizeRoleBindingsResponse, error)
 	GetVMOperation(ctx context.Context, in *GetVMOperationRequest, opts ...grpc.CallOption) (*GetVMOperationResponse, error)
 	AbortVMOperation(ctx context.Context, in *AbortVMOperationRequest, opts ...grpc.CallOption) (*AbortVMOperationResponse, error)
+	ReleaseHostReservation(ctx context.Context, in *ReleaseHostReservationRequest, opts ...grpc.CallOption) (*ReleaseHostReservationResponse, error)
 	BeginWebAuthnRegistration(ctx context.Context, in *BeginWebAuthnRegistrationRequest, opts ...grpc.CallOption) (*BeginWebAuthnRegistrationResponse, error)
 	FinishWebAuthnRegistration(ctx context.Context, in *FinishWebAuthnRegistrationRequest, opts ...grpc.CallOption) (*FinishWebAuthnRegistrationResponse, error)
 	BeginWebAuthnLogin(ctx context.Context, in *BeginWebAuthnLoginRequest, opts ...grpc.CallOption) (*BeginWebAuthnLoginResponse, error)
@@ -805,6 +808,9 @@ type LiteVirtClient interface {
 	// being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
 	ReceiveMigrationDisk(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse], error)
 	CheckCPUCompatibility(ctx context.Context, in *CheckCPUCompatibilityRequest, opts ...grpc.CallOption) (*CheckCPUCompatibilityResponse, error)
+	// Peer only: a live migration of vm_name to this host has completed;
+	// announce the gateway of each of its networks from this host's bridge.
+	AnnounceMigratedGuest(ctx context.Context, in *AnnounceMigratedGuestRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// ── Internal: State Sync ──
 	GetStateDigest(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDigestResponse, error)
 	// AcknowledgeLeaseTermTie records that an operator has seen a contested
@@ -2632,6 +2638,16 @@ func (c *liteVirtClient) AbortVMOperation(ctx context.Context, in *AbortVMOperat
 	return out, nil
 }
 
+func (c *liteVirtClient) ReleaseHostReservation(ctx context.Context, in *ReleaseHostReservationRequest, opts ...grpc.CallOption) (*ReleaseHostReservationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseHostReservationResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ReleaseHostReservation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) BeginWebAuthnRegistration(ctx context.Context, in *BeginWebAuthnRegistrationRequest, opts ...grpc.CallOption) (*BeginWebAuthnRegistrationResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(BeginWebAuthnRegistrationResponse)
@@ -3998,6 +4014,16 @@ func (c *liteVirtClient) CheckCPUCompatibility(ctx context.Context, in *CheckCPU
 	return out, nil
 }
 
+func (c *liteVirtClient) AnnounceMigratedGuest(ctx context.Context, in *AnnounceMigratedGuestRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_AnnounceMigratedGuest_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) GetStateDigest(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDigestResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StateDigestResponse)
@@ -5105,6 +5131,7 @@ type LiteVirtServer interface {
 	NormalizeRoleBindings(context.Context, *NormalizeRoleBindingsRequest) (*NormalizeRoleBindingsResponse, error)
 	GetVMOperation(context.Context, *GetVMOperationRequest) (*GetVMOperationResponse, error)
 	AbortVMOperation(context.Context, *AbortVMOperationRequest) (*AbortVMOperationResponse, error)
+	ReleaseHostReservation(context.Context, *ReleaseHostReservationRequest) (*ReleaseHostReservationResponse, error)
 	BeginWebAuthnRegistration(context.Context, *BeginWebAuthnRegistrationRequest) (*BeginWebAuthnRegistrationResponse, error)
 	FinishWebAuthnRegistration(context.Context, *FinishWebAuthnRegistrationRequest) (*FinishWebAuthnRegistrationResponse, error)
 	BeginWebAuthnLogin(context.Context, *BeginWebAuthnLoginRequest) (*BeginWebAuthnLoginResponse, error)
@@ -5303,6 +5330,9 @@ type LiteVirtServer interface {
 	// being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
 	ReceiveMigrationDisk(grpc.ClientStreamingServer[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse]) error
 	CheckCPUCompatibility(context.Context, *CheckCPUCompatibilityRequest) (*CheckCPUCompatibilityResponse, error)
+	// Peer only: a live migration of vm_name to this host has completed;
+	// announce the gateway of each of its networks from this host's bridge.
+	AnnounceMigratedGuest(context.Context, *AnnounceMigratedGuestRequest) (*emptypb.Empty, error)
 	// ── Internal: State Sync ──
 	GetStateDigest(context.Context, *emptypb.Empty) (*StateDigestResponse, error)
 	// AcknowledgeLeaseTermTie records that an operator has seen a contested
@@ -6024,6 +6054,9 @@ func (UnimplementedLiteVirtServer) GetVMOperation(context.Context, *GetVMOperati
 func (UnimplementedLiteVirtServer) AbortVMOperation(context.Context, *AbortVMOperationRequest) (*AbortVMOperationResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AbortVMOperation not implemented")
 }
+func (UnimplementedLiteVirtServer) ReleaseHostReservation(context.Context, *ReleaseHostReservationRequest) (*ReleaseHostReservationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseHostReservation not implemented")
+}
 func (UnimplementedLiteVirtServer) BeginWebAuthnRegistration(context.Context, *BeginWebAuthnRegistrationRequest) (*BeginWebAuthnRegistrationResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method BeginWebAuthnRegistration not implemented")
 }
@@ -6404,6 +6437,9 @@ func (UnimplementedLiteVirtServer) ReceiveMigrationDisk(grpc.ClientStreamingServ
 }
 func (UnimplementedLiteVirtServer) CheckCPUCompatibility(context.Context, *CheckCPUCompatibilityRequest) (*CheckCPUCompatibilityResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckCPUCompatibility not implemented")
+}
+func (UnimplementedLiteVirtServer) AnnounceMigratedGuest(context.Context, *AnnounceMigratedGuestRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method AnnounceMigratedGuest not implemented")
 }
 func (UnimplementedLiteVirtServer) GetStateDigest(context.Context, *emptypb.Empty) (*StateDigestResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetStateDigest not implemented")
@@ -8954,6 +8990,24 @@ func _LiteVirt_AbortVMOperation_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_ReleaseHostReservation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseHostReservationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReleaseHostReservation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReleaseHostReservation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReleaseHostReservation(ctx, req.(*ReleaseHostReservationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_BeginWebAuthnRegistration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(BeginWebAuthnRegistrationRequest)
 	if err := dec(in); err != nil {
@@ -11122,6 +11176,24 @@ func _LiteVirt_CheckCPUCompatibility_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_AnnounceMigratedGuest_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AnnounceMigratedGuestRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).AnnounceMigratedGuest(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_AnnounceMigratedGuest_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).AnnounceMigratedGuest(ctx, req.(*AnnounceMigratedGuestRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_GetStateDigest_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(emptypb.Empty)
 	if err := dec(in); err != nil {
@@ -12949,6 +13021,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_AbortVMOperation_Handler,
 		},
 		{
+			MethodName: "ReleaseHostReservation",
+			Handler:    _LiteVirt_ReleaseHostReservation_Handler,
+		},
+		{
 			MethodName: "BeginWebAuthnRegistration",
 			Handler:    _LiteVirt_BeginWebAuthnRegistration_Handler,
 		},
@@ -13399,6 +13475,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CheckCPUCompatibility",
 			Handler:    _LiteVirt_CheckCPUCompatibility_Handler,
+		},
+		{
+			MethodName: "AnnounceMigratedGuest",
+			Handler:    _LiteVirt_AnnounceMigratedGuest_Handler,
 		},
 		{
 			MethodName: "GetStateDigest",

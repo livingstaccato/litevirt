@@ -17,8 +17,11 @@
 //     text that can add or break nft syntax: anything but the value's own
 //     words (letters, digits and . _ : / - @), an optional relational operator
 //     in front, a braced list, and a range with spaces around its dash. It
-//     does not judge a word: whether `ssh` is a service or a name resolves is
-//     nft's business, exactly as before.
+//     judges a word only where nft would refuse the whole ruleset over it
+//     without asking the network: a set name nft cannot read
+//     (RenderSetName), and a port it cannot resolve from the host's services
+//     database (PortUnresolvable). Whether a DNS name resolves stays nft's
+//     business, as before.
 //
 //   - Grammar (Rule, Direction, Proto, Port, CIDR, Action, Comment, IPSet) is
 //     what every writer checks before a row is stored (corrosion's rule and
@@ -208,15 +211,90 @@ func RenderCIDR(s string) error {
 	return nil
 }
 
-// RenderSetName refuses a set name that is not one nft word.
+// RenderSetName refuses a set name nft cannot read, which would make it refuse
+// the whole ruleset: anything but one nft identifier — a letter, '_' or '.'
+// first, then letters, digits and . _ - /, at most 255 bytes, and not an nft
+// keyword (`drop`, `ip`, `tcp`: nftKeywords) — or a word with ':' that nft
+// reads as an address (`dead:beef`, `a:b:c:d:e:f`, `fe80::1`). Each refusal
+// was checked with `nft -c` (nftables 1.1.6): `1a`, `-a`, `/a`, `:a`,
+// `office:prod`, `1.2.3` and a 256-byte name fail, as does every keyword;
+// `1.2.3.4` loads.
 func RenderSetName(s string) error {
 	if s == "" {
 		return refuse("ipset name", s, "a set name cannot be empty")
 	}
+	if len(s) > maxNameLen {
+		return refuse("ipset name", s, "longer than %d bytes", maxNameLen)
+	}
 	if !isWord(s) || strings.Contains(s, "@") {
 		return refuse("ipset name", s, "a set name is one word of letters, digits and . _ - /")
 	}
+	if strings.Contains(s, ":") {
+		if !addressShaped(s) {
+			return refuse("ipset name", s, "nft reads a set name holding ':' only when it is shaped like an address")
+		}
+		return nil
+	}
+	if r := rune(s[0]); !isLetter(r) && r != '_' && r != '.' && !dottedQuadShaped(s) {
+		return refuse("ipset name", s, "a set name starts with a letter, '_' or '.'")
+	}
+	if nftKeywords[s] {
+		return refuse("ipset name", s, "%q is an nft keyword, which nft does not read as a set name", s)
+	}
 	return nil
+}
+
+// ReservedSetPrefix starts the names of litevirt's own sets (the bridge
+// table's lv_gw4, lv_nic_devs, ...). A user set of such a name would merge its
+// elements into litevirt's set of that name (lv_gw4: guests may reach those
+// addresses for DHCP and DNS) or, typed differently, make nft refuse the
+// table.
+const ReservedSetPrefix = "lv_"
+
+func reservedSetName(s string) error {
+	if strings.HasPrefix(s, ReservedSetPrefix) {
+		return refuse("ipset name", s, "the prefix %q is reserved for litevirt's internal sets; choose another name", ReservedSetPrefix)
+	}
+	return nil
+}
+
+// dottedQuadShaped is four dot-separated runs of one to three digits, which
+// nft's scanner reads as one address-like token, so as a name (`1.2.3.4`,
+// `999.1.1.1`); `1.2.3` and `1.2.3.4.5` it does not.
+func dottedQuadShaped(s string) bool {
+	parts := strings.Split(s, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, p := range parts {
+		if p == "" || len(p) > 3 || strings.Trim(p, "0123456789") != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// addressShaped is a word nft's scanner reads as one address-like token, so
+// as a name: hex digits and colons, as a class id (hhhh:hhhh), a MAC address
+// or an IPv6 address.
+func addressShaped(s string) bool {
+	if strings.Trim(s, "0123456789abcdefABCDEF:") != "" {
+		return false
+	}
+	groups := strings.Split(s, ":")
+	hexes := func(max int) bool {
+		for _, g := range groups {
+			if g == "" || len(g) > max {
+				return false
+			}
+		}
+		return true
+	}
+	if len(groups) == 2 && hexes(4) || len(groups) == 6 && hexes(2) {
+		return true
+	}
+	a, err := netip.ParseAddr(s)
+	return err == nil && a.Is6()
 }
 
 // RenderSetElement refuses a set element that is not nft words or ranges
@@ -424,6 +502,11 @@ func Proto(s string) error {
 	if why := grammar(strings.ToLower(s), protoElem); why != "" {
 		return refuse("proto", s, "%s", why)
 	}
+	for _, why := range []string{RelationalMisuse("proto", s), ProtoUnresolvable(s)} {
+		if why != "" {
+			return refuse("proto", s, "%s", why)
+		}
+	}
 	return nil
 }
 
@@ -445,7 +528,8 @@ func protoElem(e string) string {
 
 // Port accepts, for tcp and udp, "" or a port match: a number 0-65535, a range
 // N-M (N <= M; M may be a service name), a service name, or a braced list of
-// them, after an optional relational operator. For any other protocol the
+// them, after an optional relational operator; every name in this host's
+// services database and every number as nft reads it (PortUnresolvable). For any other protocol the
 // port is never written into a script, and only text that could never be a
 // word is refused.
 func Port(proto, s string) error {
@@ -463,6 +547,11 @@ func Port(proto, s string) error {
 	}
 	if why := grammar(s, portElem); why != "" {
 		return refuse("port", s, "%s", why)
+	}
+	for _, why := range []string{RelationalMisuse("port", s), PortUnresolvable(proto, s)} {
+		if why != "" {
+			return refuse("port", s, "%s", why)
+		}
 	}
 	return nil
 }
@@ -517,15 +606,11 @@ func isPortNum(s string) bool {
 	return isDigits(s)
 }
 
-// portVal is a port number's value: hex after 0x, otherwise decimal (nft
-// reads a leading zero as decimal).
-func portVal(s string) int64 {
-	if h, ok := strings.CutPrefix(strings.ToLower(s), "0x"); ok {
-		n, _ := strconv.ParseInt(h, 16, 64)
-		return n
-	}
-	n, _ := strconv.ParseInt(s, 10, 64)
-	return n
+// portVal is a port number's value as nft reads it (nftPortVal): hex after
+// 0x, octal after a leading zero when every digit is octal, otherwise decimal.
+func portVal(s string) uint64 {
+	v, _, _ := nftPortVal(s)
+	return v
 }
 
 func portNum(s string) string {
@@ -578,7 +663,102 @@ func CIDR(s string) error {
 	if why := grammar(s, v4Elem); why != "" {
 		return refuse("cidr", s, "%s", why)
 	}
+	if why := RelationalMisuse("cidr", s); why != "" {
+		return refuse("cidr", s, "%s", why)
+	}
 	return nil
+}
+
+// CIDRUnloadable is why nft refuses an IPv4 cidr the renderer writes, judged
+// without the network, or "": an address with an octet past 255 (nft: "Could
+// not resolve hostname"), a prefix length past 32 ("Prefix length 33 is
+// invalid"), or a range that runs backwards ("Range negative size"). A word
+// with a letter (a DNS name) or a leading zero (`010.0.0.1`, which nft reads)
+// is nft's to judge, as before.
+func CIDRUnloadable(s string) string {
+	if s == "" || strings.HasPrefix(trimBlank(s), "@") || strings.Contains(s, ":") {
+		return ""
+	}
+	mask, v := stripMask(trimBlank(blanks(s)))
+	if mask != "" {
+		if why := v4ValueUnloadable(mask); why != "" {
+			return why
+		}
+	}
+	v = stripOp(v)
+	if strings.HasPrefix(v, "@") {
+		return ""
+	}
+	elems := []string{v}
+	if strings.HasPrefix(v, "{") {
+		elems = strings.Split(strings.TrimSuffix(trimBlank(v[1:]), "}"), ",")
+	}
+	for _, e := range elems {
+		if why := v4ValueUnloadable(trimBlank(e)); why != "" {
+			return why
+		}
+	}
+	return ""
+}
+
+// SetElementUnloadable is CIDRUnloadable for a stored ip-set element, which
+// may hold several, comma separated.
+func SetElementUnloadable(s string) string {
+	for _, piece := range strings.Split(blanks(s), ",") {
+		if piece = trimBlank(piece); piece != "" && !strings.Contains(piece, ":") {
+			if why := v4ValueUnloadable(piece); why != "" {
+				return why
+			}
+		}
+	}
+	return ""
+}
+
+func v4ValueUnloadable(e string) string {
+	lo, hi, isRange := cutRange(e)
+	if !isRange && strings.Count(e, "-") == 1 && looksV4Range(e) {
+		lo, hi, _ = strings.Cut(e, "-")
+		isRange = true
+	}
+	for _, w := range []string{lo, hi} {
+		if why := v4WordUnloadable(w); why != "" {
+			return why
+		}
+		if !isRange {
+			break
+		}
+	}
+	if isRange {
+		a, err1 := netip.ParseAddr(lo)
+		b, err2 := netip.ParseAddr(hi)
+		if err1 == nil && err2 == nil && a.Is4() && b.Is4() && b.Less(a) {
+			return fmt.Sprintf("range %s runs backwards (nft: \"Range negative size\")", e)
+		}
+	}
+	return ""
+}
+
+func v4WordUnloadable(w string) string {
+	addr, bits, hasBits := strings.Cut(w, "/")
+	if !dottedQuadShaped(addr) {
+		return ""
+	}
+	for _, o := range strings.Split(addr, ".") {
+		if len(o) > 1 && o[0] == '0' {
+			return "" // nft reads it some other way; its call
+		}
+	}
+	for _, o := range strings.Split(addr, ".") {
+		if n, _ := strconv.Atoi(o); n > 255 {
+			return fmt.Sprintf("address %s has an octet past 255 (nft: \"Could not resolve hostname\")", addr)
+		}
+	}
+	if hasBits && bits != "" && strings.Trim(bits, "0123456789") == "" && bits[0] != '0' {
+		if n, _ := strconv.Atoi(bits); n > 32 || len(bits) > 3 {
+			return fmt.Sprintf("prefix length %s is past 32 (nft: \"Prefix length %s is invalid\")", bits, bits)
+		}
+	}
+	return ""
 }
 
 func v4Elem(e string) string {
@@ -624,20 +804,6 @@ func isDotted(s string) bool {
 	return true
 }
 
-// ReservedSetPrefix starts the names of litevirt's own sets (the bridge
-// table's lv_gw4, lv_nic_devs, ...). A user set of such a name would merge its
-// elements into litevirt's set of that name (lv_gw4: guests may reach those
-// addresses for DHCP and DNS) or, typed differently, make nft refuse the
-// table.
-const ReservedSetPrefix = "lv_"
-
-func reservedSetName(s string) error {
-	if strings.HasPrefix(s, ReservedSetPrefix) {
-		return refuse("ipset name", s, "the prefix %q is reserved for litevirt's internal sets; choose another name", ReservedSetPrefix)
-	}
-	return nil
-}
-
 // tagGroupSetPrefix starts a tag group's set (lv_tg_<name>, and its
 // lv_tg_<name>_v6 companion).
 const tagGroupSetPrefix = ReservedSetPrefix + "tg_"
@@ -656,8 +822,8 @@ func setRef(cidr, name string) error {
 }
 
 // SetName accepts an nft set name: a letter, '_' or '.', then letters,
-// digits, '_', '.', '-' or '/', at most 255 bytes, and not starting with
-// ReservedSetPrefix.
+// digits, '_', '.', '-' or '/', at most 255 bytes, not an nft keyword, and
+// not starting with ReservedSetPrefix.
 func SetName(s string) error {
 	if s == "" {
 		return refuse("ipset name", s, "a set name cannot be empty")
@@ -671,6 +837,9 @@ func SetName(s string) error {
 		if !ok {
 			return refuse("ipset name", s, "want a letter, '_' or '.' first, then letters, digits, '_', '.', '-' or '/'")
 		}
+	}
+	if nftKeywords[s] {
+		return refuse("ipset name", s, "%q is an nft keyword, which nft does not read as a set name", s)
 	}
 	return reservedSetName(s)
 }
@@ -702,14 +871,51 @@ func SetElement(s string) error {
 	return nil
 }
 
+// IPv6SetSuffix names a set's IPv6 companion: a set holding IPv6 elements
+// renders them as the set <name>_v6.
+const IPv6SetSuffix = "_v6"
+
 // IPSet checks a set's name and every element, returning the first refusal.
+// A set with an IPv6 element needs a name its companion's name fits after.
 func IPSet(name string, elems []string) error {
 	if err := SetName(name); err != nil {
 		return err
 	}
+	v6 := false
 	for _, e := range elems {
 		if err := SetElement(e); err != nil {
 			return err
+		}
+		v6 = v6 || strings.Contains(e, ":")
+	}
+	if v6 && len(name)+len(IPv6SetSuffix) > maxNameLen {
+		return refuse("ipset name", name, "a set with IPv6 elements renders them as %s%s, which is longer than %d bytes",
+			shown(name), IPv6SetSuffix, maxNameLen)
+	}
+	return nil
+}
+
+// CompanionClash refuses a set that would make nft refuse the ruleset beside
+// the others: a set named <x>_v6 while x holds IPv6 elements (or the reverse),
+// since x's IPv6 companion is the set <x>_v6 ("set exists"). sets is every
+// live set's elements by name, name's included; only clashes involving name
+// are reported.
+func CompanionClash(sets map[string][]string, name string) error {
+	hasV6 := func(n string) bool {
+		for _, e := range sets[n] {
+			if strings.Contains(e, ":") {
+				return true
+			}
+		}
+		return false
+	}
+	if _, taken := sets[name+IPv6SetSuffix]; taken && hasV6(name) {
+		return refuse("ipset name", name, "its IPv6 elements render as the set %s%s, which another ip set is named; rename one",
+			shown(name), IPv6SetSuffix)
+	}
+	if base, ok := strings.CutSuffix(name, IPv6SetSuffix); ok && hasV6(base) {
+		if _, live := sets[base]; live {
+			return refuse("ipset name", name, "it is the name of the IPv6 companion of ip set %q, which holds IPv6 elements; rename one", base)
 		}
 	}
 	return nil

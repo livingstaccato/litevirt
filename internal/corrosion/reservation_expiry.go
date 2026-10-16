@@ -39,6 +39,10 @@ var transferLeaseMethods = map[string]bool{
 	"DrainHost":        true,
 }
 
+// IsTransferLeaseMethod reports whether a capacity lease made by method spans a
+// whole data transfer (and ages against TransferCapacityLeaseMaxAge).
+func IsTransferLeaseMethod(method string) bool { return transferLeaseMethods[method] }
+
 // ExpireStaleCapacityReservations cancels admission leases older than maxAge.
 //
 // Reserve-then-verify made a crash between "reserve" and "release" leak capacity

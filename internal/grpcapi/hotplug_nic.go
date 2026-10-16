@@ -327,6 +327,7 @@ type nicAttachRollback struct {
 	attached         bool // live AttachNIC succeeded
 	nicRowWritten    bool // vm_nics UpsertNIC succeeded
 	legacyRowWritten bool // vm_interfaces InsertInterface succeeded
+	guardRecorded    bool // this execution wrote (or may have written) the NIC's guard record
 	// claims holds the external-IPAM address this attach took, if any. A NetBox
 	// claim is a synchronous REMOTE side effect and cannot join the local row
 	// writes, so — exactly as in CreateVM — compensation is explicit.
@@ -352,8 +353,7 @@ func (s *Server) ensureNICNetworkProvisioned(ctx context.Context, networkName st
 	if def.Interface == "" {
 		def.Interface = networkName
 	}
-	localIP := getLocalIP()
-	if _, perr := s.networkProvisioner().Provision(ctx, s.db, networkName, def, localIP, s.hostName); perr != nil {
+	if _, _, perr := s.provisionHere(ctx, networkName, def); perr != nil {
 		slog.Warn("nic attach: failed to provision network locally", "network", networkName, "error", perr)
 		return bridge, nil
 	}
@@ -489,6 +489,7 @@ func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, s
 		networkName: spec.Name, running: running, dualWrite: !latched, claims: &claimSet{srv: s}}
 
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceAttach, corrosion.OpStepReserved)
+	s.retireOrphanNICGuards(ctx, vm.Name, opID)
 
 	bridge, perr := s.ensureNICNetworkProvisioned(ctx, spec.Name)
 	if perr != nil {
@@ -557,6 +558,10 @@ func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, s
 	// network's bridge name is its PF, with no direct: prefix).
 	if !strings.HasPrefix(bridge, "direct:") && guardUnenforcedOnNetwork(ctx, s.db, spec.Name) == "" {
 		if rec := dec.record(vm.Name, specUUID(vm.Spec), ordinal, mac, spec); rec != nil {
+			// Marked before the write: a write that failed may still have
+			// landed, and a rollback retires a record that is not there as
+			// a no-op.
+			rb.guardRecorded = true
 			if err := s.writeNewNICGuards(ctx, []corrosion.NICGuardRecord{*rec}); err != nil {
 				code, cause := gateFailure(err)
 				return s.failNICAttach(ctx, rb, code, cause)
@@ -583,11 +588,11 @@ func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, s
 		}
 		rb.attached = true
 		if err := s.writeNICAttachRows(ctx, rb, vm.Name, spec, model, mac, nicID, sgsJSON, nicIP, ordinal); err != nil {
-			return s.failNICAttach(ctx, rb, codes.Internal, err)
+			return s.failNICAttach(ctx, rb, nicRowWriteCode(err), err)
 		}
 	} else {
 		if err := s.writeNICAttachRows(ctx, rb, vm.Name, spec, model, mac, nicID, sgsJSON, nicIP, ordinal); err != nil {
-			return s.failNICAttach(ctx, rb, codes.Internal, err)
+			return s.failNICAttach(ctx, rb, nicRowWriteCode(err), err)
 		}
 		if err := s.reconcileDomainDefinition(ctx, vm, nil); err != nil {
 			return s.failNICAttach(ctx, rb, codes.Internal, fmt.Errorf("reconcile definition: %w", err))
@@ -629,6 +634,16 @@ func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, s
 	return s.vmToProto(ctx, vm.Name)
 }
 
+// nicRowWriteCode is the code a failed NIC row write answers with: a write
+// behind a stored write for the NIC stamped too far ahead is a precondition
+// the operator can fix (its error names how), anything else Internal.
+func nicRowWriteCode(err error) codes.Code {
+	if errors.Is(err, corrosion.ErrNICStampSkewed) {
+		return codes.FailedPrecondition
+	}
+	return codes.Internal
+}
+
 // failNICAttach compensates a failed attach by rolling BACK (§8): inverse
 // live-detach the just-attached NIC, tombstone/soft-delete exactly the rows THIS
 // execution wrote (nicRowWritten/legacyRowWritten — never more), and restore the
@@ -662,6 +677,30 @@ func (s *Server) failNICAttach(ctx context.Context, rb *nicAttachRollback, code 
 		if err := s.reconcileDomainDefinition(ctx, rb.vm, nil); err != nil {
 			slog.Error("nic attach rollback: re-reconcile to drop nic failed", "vm", rb.vm.Name, "error", err)
 			rolledBack = false
+		}
+	}
+
+	// Retire the guard record this attach wrote, once the NIC is verified gone
+	// from the domain: a record left live names a NIC no host can render, and
+	// every later arm of the VM would demand it in force. A NIC that may still
+	// be live keeps its record, and the operation stays recoverable.
+	if rolledBack && rb.guardRecorded {
+		rec, err := corrosion.GetNICGuard(ctx, s.db, rb.vm.Name, strings.ToLower(rb.mac))
+		switch {
+		case err != nil:
+			slog.Error("nic attach rollback: read the guard record failed", "vm", rb.vm.Name, "mac", rb.mac, "error", err)
+			rolledBack = false
+		case rec == nil:
+			// The attach failed before its record was written, or guards
+			// could not be recorded: nothing to retire.
+		default:
+			if err := s.verifyNICDetached(ctx, rb.vm.Name, rb.mac, rb.running); err != nil {
+				slog.Error("nic attach rollback: NIC absence unverifiable; its guard record is kept", "vm", rb.vm.Name, "mac", rb.mac, "error", err)
+				rolledBack = false
+			} else if err := s.retireNICGuard(ctx, rb.vm.Name, rb.mac); err != nil {
+				slog.Error("nic attach rollback: retire the guard record failed", "vm", rb.vm.Name, "mac", rb.mac, "error", err)
+				rolledBack = false
+			}
 		}
 	}
 
@@ -1017,6 +1056,20 @@ func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, n
 	if err := s.verifyNICDetached(ctx, vm.Name, mac, running); err != nil {
 		slog.Error("nic detach: absence unverifiable — left recoverable", "vm", vm.Name, "op", opID, "error", err)
 		return nil, status.Errorf(codes.Internal, "nic detach for %q could not be verified; left recoverable: %v", vm.Name, err)
+	}
+	// The NIC is gone from the domain and its row: retire its guard record
+	// with it, never before (a live NIC is never left without its guard).
+	// A record left live names a NIC no host can render, which every later
+	// arm of the VM would demand in force (lab 2, C3).
+	if err := s.retireNICGuard(ctx, vm.Name, mac); err != nil {
+		slog.Error("nic detach: guard record not retired — left recoverable", "vm", vm.Name, "op", opID, "mac", mac, "error", err)
+		detail := fmt.Sprintf("nic %s detached, but its NIC guard record could not be retired; left recoverable: %v", mac, err)
+		s.recordVMEventSeverity(ctx, vm.Name, "device.detached", "error", "warning", detail)
+		code := codes.Internal
+		if errors.Is(err, corrosion.ErrNICStampSkewed) {
+			code = codes.FailedPrecondition
+		}
+		return nil, status.Errorf(code, "nic detach for %q applied but its NIC guard record could not be retired; left recoverable: %v", vm.Name, err)
 	}
 
 	applied, cerr := s.db.CompleteVMOperation(ctx, vm.Name, opID, epoch, newGen)

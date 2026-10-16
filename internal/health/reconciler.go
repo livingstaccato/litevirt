@@ -115,6 +115,14 @@ type Reconciler struct {
 	dataDir          string
 	db               *corrosion.Client
 	virt             LibvirtBackend
+	// heldStartLive / recordVMEvent: a held start whose daemon restarted
+	// before libvirt answered it (held_start_orphan.go).
+	heldStartLive func(name string) bool
+	recordVMEvent func(ctx context.Context, vm, typ, result, detail string)
+	// virtWait bounds the walk's and the sweeps' reads of libvirt: a domain
+	// libvirt has not answered for is skipped, never decided on
+	// (domain_gate.go).
+	virtWait virtWait
 	// settleVerify / settleProofs are Layer 3 of partition pause (settle.go):
 	// the certificate check and the proof source. nil verifier settles nothing.
 	settleVerify SettleVerifier
@@ -134,7 +142,8 @@ type Reconciler struct {
 	// pitHeldReported: the holds already reported when no reporter is wired
 	// (reportPITHeld).
 	pitHeldReported sync.Map
-	settleProofs    func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
+	// settleProofs replaces corrosion.TransferProofs (tests).
+	settleProofs func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
 	// settleDeclines rate-limits the decline report (settle_declined.go).
 	settleDeclines   settleDeclineTracker
 	onVMStarted      func(ctx context.Context, stackName string)       // optional: called after VM starts (LB refresh)
@@ -594,8 +603,11 @@ func (r *Reconciler) StartOnbootVMs(ctx context.Context) {
 		if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil || !spec.Onboot {
 			continue
 		}
-		// Already running (e.g. survived a daemon restart) → leave it.
-		if r.virt.DomainExists(vm.Name) {
+		// Already running (e.g. survived a daemon restart) → leave it. A
+		// domain libvirt has not answered for is not known to run: it is
+		// owed its start, which startPendingVM leaves until libvirt answers
+		// (the onboot retry asks again each pass).
+		if r.domainAnswers(vm.Name) && r.virt.DomainExists(vm.Name) {
 			if st, sErr := r.virt.DomainState(vm.Name); sErr == nil && st == "running" {
 				continue
 			}
@@ -749,6 +761,9 @@ func (r *Reconciler) retryOnbootPending(ctx context.Context, only func(name stri
 	}
 	sort.SliceStable(names, func(i, j int) bool { return rank(names[i]) < rank(names[j]) })
 	for _, name := range names {
+		if r.virt != nil && !r.domainAnswers(name) {
+			continue // the duty is kept; asked again next pass
+		}
 		if r.virt != nil && r.virt.DomainExists(name) {
 			if st, err := r.virt.DomainState(name); err == nil && st == "running" {
 				r.clearOnbootPending(name) // already up — duty discharged
@@ -804,6 +819,12 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 		return
 	}
 
+	live := make(map[string]bool, len(vms))
+	for _, vm := range vms {
+		live[vm.Name] = true
+	}
+	r.virtWait.prune(live)
+
 	r.resolveDiskMissing(ctx)
 	r.tendStrandedDisks(ctx)
 	r.cleanupRekeyLeftovers(ctx)
@@ -817,6 +838,12 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 	r.retryOnbootPending(ctx, func(name string) bool { rk, ok := deferred[name]; return ok && rk == rankTime }, deferred)
 
 	for _, vm := range vms {
+		// A domain libvirt has not answered for is skipped this pass:
+		// every case below asks libvirt about it, and decides from the
+		// answer (domain_gate.go).
+		if r.virt != nil && !r.domainAnswers(vm.Name) {
+			continue
+		}
 		switch vm.State {
 		case "pending":
 			r.startPendingVM(ctx, vm)
@@ -1212,9 +1239,11 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 		return
 	}
 
-	localDomains, err := r.virt.ListDomains()
+	localDomains, err := r.listDomainsBounded("reconciler: self-fence")
 	if err != nil {
-		slog.Error("reconciler: list local domains", "error", err)
+		if !errors.Is(err, errLibvirtNoAnswer) {
+			slog.Error("reconciler: list local domains", "error", err)
+		}
 		return
 	}
 
@@ -1439,12 +1468,18 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	if r.deferredBeforeWork(ctx, vm) {
 		return
 	}
+	// A domain libvirt has not answered for is not started, nor anything
+	// else decided about it (domain_gate.go): the walk skips it already;
+	// this holds for the onboot start too.
+	if r.virt != nil && !r.domainAnswers(vm.Name) {
+		return
+	}
 	// Take a per-VM startup lease before doing anything destructive.
 	// Without this, two reconcilers on different hosts that both briefly
 	// see vm.HostName=self in CRDT-stale state would both call libvirt.Start
 	// on the same VM UUID — the same physical disk gets two QEMU writers
 	// → guaranteed corruption.
-	if !r.acquireVMLock(ctx, vm.Name) {
+	if !r.acquireVMLock(ctx, vm.Name) && !r.takeOverOrphanedHeldStart(ctx, vm) {
 		slog.Info("reconciler: VM lock held by another host, skipping",
 			"vm", vm.Name)
 		return
@@ -1676,6 +1711,9 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 				return
 			}
 			if errors.Is(err, corrosion.ErrProofAbandoned) {
+				if r.awaitingStaleTermRepoint(ctx, vm.Name, proofID) {
+					return
+				}
 				// Terminal, not transient: this host has promised never to run
 				// the proof, and no later tick can change that. Fail the proof
 				// so the row leaves pending instead of retrying every tick.
@@ -1725,6 +1763,11 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			}); err != nil {
 				LogPublishRefusal("reconciler: already-present running-state write failed", vm.Name, err)
 				r.noteStateWriteFail(corrosion.OpVMState, err)
+			} else if fresh.State == "starting" {
+				// A held start whose daemon restarted before libvirt
+				// answered it: its outcome, recorded once, with this move
+				// from starting (held_start_orphan.go).
+				r.recordHeldStartRan(ctx, vm.Name, fresh.StateDetail)
 			}
 			r.clearOnbootPending(vm.Name) // onboot duty discharged
 			return
@@ -2302,31 +2345,55 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		slog.Error("reconciler: invalid vm name for cloud-init path", "vm", vm.Name, "error", isoErr)
 		return "", false, fmt.Sprintf("invalid name: %v", isoErr) // non-retryable
 	}
-	if _, err := os.Stat(isoPath); err == nil {
+	// A seed here is reused only when it is this VM's: one left by a deleted
+	// VM of the name would boot its user-data (cloudinit/seed_owner.go).
+	seedOwner := cloudinit.SpecUUID(vm.Spec)
+	if cloudinit.SeedIsFor(isoPath, seedOwner) {
 		cloudInitISO = isoPath
-	} else if spec.CloudInit != nil {
-		// Regenerate cloud-init ISO from spec.
-		userData := spec.CloudInit.Userdata
+	} else if spec.CloudInit != nil || spec.Image != "" {
+		// Regenerate the seed the VM was created with: its user-data, and
+		// the network-config derived from the spec, its NIC rows and its
+		// networks exactly as CreateVM derived it (a cloud image with no
+		// cloud-init in its spec got the empty user-data). A read that fails
+		// writes no seed — one written without its network-config would be
+		// kept by every later pass — and the start is retried.
+		userData := ""
+		if spec.CloudInit != nil {
+			userData = spec.CloudInit.Userdata
+		}
 		if userData == "" {
 			userData = "#cloud-config\n{}\n"
+		}
+		netCfg, ncErr := cloudinit.SeedNetworkConfig(ctx, r.db, vm.Name, spec)
+		if ncErr != nil {
+			slog.Warn("reconciler: cloud-init network-config could not be derived", "vm", vm.Name, "error", ncErr)
+			return "", true, fmt.Sprintf("derive cloud-init network-config: %v", ncErr) // transient DB
 		}
 		if genErr := cloudinit.GenerateISO(cloudinit.Config{
 			InstanceID:    vm.Name,
 			LocalHostname: vm.Name,
 			UserData:      userData,
-			NetworkConfig: spec.CloudInit.Networkconfig,
+			NetworkConfig: netCfg,
 		}, isoPath); genErr != nil {
 			slog.Warn("reconciler: cloud-init ISO generation failed", "vm", vm.Name, "error", genErr)
 		} else {
 			cloudInitISO = isoPath
 		}
 	}
+	if cloudInitISO != "" {
+		if err := cloudinit.StampSeed(cloudInitISO, seedOwner); err != nil {
+			slog.Warn("reconciler: could not stamp the cloud-init seed with its VM", "vm", vm.Name, "error", err)
+		}
+	}
 
-	// Provision networks and build network configs from stored interfaces.
+	// Provision networks and build network configs from the VM's live NICs:
+	// the vm_nics/vm_interfaces overlay, which carries a hot-attached NIC and
+	// drops a detached one on every cluster (a hardware_v2 cluster writes both
+	// to vm_nics alone).
 	// A query failure must NOT be swallowed: starting the VM with zero NICs
 	// brings it up headless (no network) after a failover. Fail it instead,
 	// matching the ListDisks error handling above.
-	ifaces, err := corrosion.GetVMInterfaces(ctx, r.db, vm.Name)
+	ifaces, err := corrosion.MergedVMNICs(ctx, r.db, vm.Name)
 	if err != nil {
 		slog.Error("reconciler: get VM interfaces", "vm", vm.Name, "error", err)
 		return "", true, fmt.Sprintf("get interfaces: %v", err) // transient DB
@@ -2545,6 +2612,38 @@ func (r *Reconciler) deferPendingStart(ctx context.Context, vmName, proofID, det
 		slog.Error("reconciler: re-arm pending write failed", "vm", vmName, "error", err)
 		r.noteStateWriteFail(corrosion.OpVMState, err)
 	}
+}
+
+// staleTermRepointGrace is how long a destination leaves a row pending on a
+// proof it abandoned at the lease holder's request because the proof's lease
+// stamp was superseded (corrosion.AbandonReasonLeaseOutran). The holder
+// re-points the row at the proof decided in its place right after the
+// abandonment: one claim (failover's claimTimeout, 5 s) and replication. Twice
+// one claim and one reconcile tick (reconcileInterval) bounds that; past it the row fails
+// as for any abandoned proof, so a holder that never re-points still ends
+// visibly.
+const staleTermRepointGrace = 2 * (5*time.Second + reconcileInterval)
+
+// awaitingStaleTermRepoint reports whether the pending start of vmName on
+// proofID, which this host abandoned, is left for the lease holder to
+// re-point instead of failed now: the abandonment was the holder's lease-term
+// one, it is younger than staleTermRepointGrace, and the row still names the
+// proof. Any other abandonment (an operator's claim-release) fails at once.
+func (r *Reconciler) awaitingStaleTermRepoint(ctx context.Context, vmName, proofID string) bool {
+	reason, at, ok, err := r.db.ProofAbandonment(ctx, proofID)
+	if err != nil || !ok || !strings.HasPrefix(reason, corrosion.AbandonReasonLeaseOutran) {
+		return false
+	}
+	if age := time.Since(at); age < 0 || age >= staleTermRepointGrace {
+		return false
+	}
+	fresh, err := corrosion.GetVM(ctx, r.db, vmName)
+	if err != nil || fresh == nil || fresh.PendingActionID != proofID {
+		return false
+	}
+	slog.Info("reconciler: this host abandoned the pending proof for the lease holder, which re-points the row; "+
+		"waiting for it", "vm", vmName, "proof", proofID, "abandoned_at", at, "grace", staleTermRepointGrace)
+	return true
 }
 
 // failPendingStart records a local start failure inside startPendingVM, honoring the

@@ -16,9 +16,9 @@ import (
 // Outside this package the unrestricted DiscoverIPForMAC is banned too: a
 // caller passes the NIC's network.LeaseBridge ("" only when it is unknown), or
 // a MAC with leases on two bridges resolves to whichever is newest. In
-// internal/grpcapi every lookup goes through Server.discoverNICAddress, the
-// one place that derives the bridge from the NIC's network and the seam tests
-// drive discovery through.
+// internal/grpcapi every lookup goes through Server.discoverNICAddress (or
+// discoverNICAddressesWithPeers beside it), the one place that derives the
+// bridge from the NIC's network and the seam tests drive discovery through.
 func TestMACDiscoveryHasOneEntryPoint(t *testing.T) {
 	root := filepath.Join("..", "..")
 	banned := []string{"GetIPFromARP(", "GetIPFromDHCPLeases(", "/proc/net/arp", "DiscoverIPForMAC("}
@@ -50,7 +50,7 @@ func TestMACDiscoveryHasOneEntryPoint(t *testing.T) {
 			}
 		}
 		if filepath.Dir(filepath.Clean(path)) == grpcapiDir && filepath.Clean(path) != grpcapiEntry &&
-			strings.Contains(string(src), "DiscoverIPForMACOnBridge(") {
+			(strings.Contains(string(src), "DiscoverIPForMACOnBridge(") || strings.Contains(string(src), "DiscoverIPForMACOnBridgeWithPeers(")) {
 			t.Errorf("%s calls DiscoverIPForMACOnBridge directly; use Server.discoverNICAddress(ctx, mac, networkName)", path)
 		}
 		return nil

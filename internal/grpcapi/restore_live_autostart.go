@@ -76,6 +76,15 @@ func (s *Server) autoDefineRestoredVM(
 	if err != nil {
 		return "", "", err
 	}
+	// A caller's spec or a manifest's is untrusted, as a create's is: its
+	// stack name and load balancer pass CreateVM's checks, and an LB TLS file
+	// outside lb.CertDir needs the admin role, as at CreateVM. Only the
+	// --from-existing spec, this cluster's own row, already passed them.
+	if req.Spec != nil || manifest.VMSpecJSON != "" {
+		if err := validateRestoredLB(ctx, spec); err != nil {
+			return "", "", err
+		}
+	}
 	// The spec is a manifest's or a caller's, never a validated create: its
 	// disk/NIC tuning is dropped before the gate opens and validated after.
 	ioR, rerr := s.restrictRestoredTuning(ctx, spec)

@@ -24,6 +24,9 @@ import (
 // not know the named fields then requires admin and purges nothing.
 const SupersededNamedOnlySec = 9_000_000_000
 
+// keptHeld is a .kept- file's held reason in a SupersededDisks answer.
+const keptHeld = "a disk a deleted VM was kept with; only an operator removes it, by hand"
+
 // SetSupersededDiskRetentionDays records superseded_disk_retention_days, which
 // a SupersededDisks answer reports (the sweep itself runs in the daemon).
 func (s *Server) SetSupersededDiskRetentionDays(days int) { s.supersededRetentionDays = days }
@@ -121,6 +124,22 @@ func (s *Server) SupersededDisks(ctx context.Context, req *pb.SupersededDisksReq
 			Path: c.Path, DiskPath: c.DiskPath, SetAsideAt: c.SetAsideAt.UTC().Format(time.RFC3339),
 			SizeBytes: c.SizeBytes, VmName: c.VM, VmState: c.VMState, Held: c.Held, Removed: removed[c.Path],
 			Retained: c.Retained,
+		})
+	}
+	// The disks deleted VMs were kept with, which a create moved to .kept-
+	// names: listed only. Held, for a client that predates kept: no named
+	// removal takes one.
+	kept, err := health.ListKeptDisks(ctx, s.db, s.dataDir)
+	if err != nil {
+		if !req.Purge && !named {
+			return nil, status.Errorf(codes.Internal, "list kept disks: %v", err)
+		}
+		slog.Warn("superseded disks: the kept disks could not be listed; the answer has none", "error", err)
+	}
+	for _, k := range kept {
+		resp.Disks = append(resp.Disks, &pb.SupersededDisk{
+			Path: k.Path, DiskPath: k.DiskPath, SetAsideAt: k.MovedAt.UTC().Format(time.RFC3339), SizeBytes: k.SizeBytes,
+			Held: keptHeld, Kept: true,
 		})
 	}
 	return resp, nil

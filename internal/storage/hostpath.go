@@ -171,6 +171,7 @@ var dataDirOwned = []string{
 	"oci-owners",                // grpcapi/container_paths.go ociOwnersDir
 	"ct-idmap-ledger",           // grpcapi/container_security.go idmapLedgerFile (and its .tmp)
 	"recreate-failed",           // grpcapi/vm_recreate_replaces.go: specs of failed recreates
+	"kept-disks",                // health/kept_disks.go: disks a --keep-disks delete kept, per VM
 	"iscsi-lun-holds",           // grpcapi/vm_lun_hold.go lunHoldDirName: moved iSCSI LUN holds
 	"containers",                // daemon.go: the LXC container root
 	"ct-snapshots",              // snapshot_container.go containerSnapshotDir
@@ -204,6 +205,8 @@ var dataDirOwned = []string{
 	"host-updates.json",         // grpcapi/host_updates.go hostUpdateCountsPath
 	"file-restore",              // daemon.go fileRestoreCacheDir/fileRestoreRunDir (a non-root daemon only)
 	"restart-pending",           // hostboot/hostboot.go MarkerName: a graceful stop's time, for the next boot
+	"boot-awaiting-serving",     // hostboot/hostboot.go AwaitingName: a boot that awaits serving, until a daemon serves
+	"boot-unclean-history",      // hostboot/hostboot.go UncleanHistoryName: the last unclean boots' times
 	"nowts.hwm",                 // corrosion/hwm.go (and nowts.hwm.lock)
 	"split_brain_activated",     // health/capability.go ActivationMarkerBase (markers are .<token>)
 	"ceph-trash-purges.json",    // storage/ceph_trash.go cephPurgeStateFile (ResumeCephPurges(dir): set aside as .unreadable-<time>, dataDirOwnedPrefixes)

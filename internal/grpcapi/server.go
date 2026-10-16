@@ -81,8 +81,11 @@ type Server struct {
 	invCacheMu sync.Mutex
 	invCache   runtimeInventory
 	invCacheAt time.Time
-	pkiDir     string
-	db         *corrosion.Client
+	// invCacheGen counts invalidations: a collect that began before one is
+	// not cached.
+	invCacheGen uint64
+	pkiDir      string
+	db          *corrosion.Client
 
 	// dependsOnWaitTimeout, when > 0, overrides waitForCondition's timeout.
 	// Test seam only (SetDependsOnWaitTimeoutForTests); zero in production.
@@ -156,6 +159,11 @@ type Server struct {
 	// path uses to find the address a MAC is answering on. nil in production;
 	// see SetNICIPDiscovery.
 	nicIPDiscovery func(mac, bridge string) string
+
+	// dhcpLeaseLookup replaces the read of this host's dnsmasq lease for a
+	// MAC on a bridge (lv.LeaseOnBridge) that GetVMIPRemote's lease_only
+	// answer comes from. Test-only seam, nil in production.
+	dhcpLeaseLookup func(mac, bridge string) (string, int64)
 
 	// nbSweepUnreachable / nbUnreachableStreak carry the orphan sweep's
 	// consecutive-blocked-pass state for the NetBox health evaluator, which
@@ -541,11 +549,31 @@ type Server struct {
 	// haproxy). Production leaves it nil so apply failures surface + roll back.
 	lbApplyOverride func(context.Context, lb.Config) error
 
+	// lbListSNATOverride is a test seam for the snat lookup ListLoadBalancers
+	// makes per LB. Nil in production.
+	lbListSNATOverride func(ctx context.Context, name, stackName, generation string) (bool, error)
+
 	// netProvisioner is the host network provisioner seam (see
 	// NetworkProvisioner). Production leaves it nil: package network directly.
 	netProvisioner NetworkProvisioner
+	// hostAddr is this host's cluster address (SetHostAddress), its VXLAN
+	// tunnel endpoint once the release token latches. '' = unwired: a vxlan
+	// network is refused.
+	hostAddr string
+	// vtepResolver resolves a vxlan tunnel endpoint (SetVTEPResolver); nil =
+	// network.ResolveVTEP.
+	vtepResolver VTEPResolver
+	// vtepRefused is the last refusal published per network (resolveVTEP).
+	vtepRefusedMu sync.Mutex
+	vtepRefused   map[string]string
 	// netReconcile is what ReconcileNetworksOnce has done on this host.
 	netReconcile netReconcileState
+	// netDevs is the definition each network was last provisioned with here
+	// (provisionDevice).
+	netDevs provisionedDevices
+	// gatewayAnnouncer announces a gateway after a live migration lands here
+	// (SetGatewayAnnouncer); nil = network.AnnounceGateway.
+	gatewayAnnouncer GatewayAnnouncer
 
 	// leftoverBridgeWarned holds the bridge names whose leftover-removal failure
 	// was already logged, so the 30s reconcile pass does not repeat it.
@@ -559,6 +587,11 @@ type Server struct {
 	// bridgeExists is a test seam for "does this bridge already exist on this
 	// host". Production leaves it nil, preserving network.BridgeExists.
 	bridgeExists func(name string) bool
+
+	// linkAddrs replaces the read of a device's IP addresses (lbVIPInterface
+	// tells whose bridge a shared short name is by them). Test-only seam,
+	// nil in production.
+	linkAddrs func(name string) []netip.Prefix
 
 	// bridgeUplink is a test seam for "does this bridge carry anything off this
 	// host". Production leaves it nil, preserving network.BridgeHasUplink. Like
@@ -706,6 +739,14 @@ type Server struct {
 	smartMetrics     *metrics.SMARTMetrics
 	smartRunner      smart.Runner // test seam; nil = real smartctl
 
+	// reservationMetrics and resSweep belong to the reservation sweep
+	// (reservation_recovery.go).
+	reservationMetrics *metrics.ReservationMetrics
+	resSweep           reservationSweepState
+	// resRelease belongs to the manual reservation release
+	// (reservation_release_admin.go).
+	resRelease reservationReleaseState
+
 	// gatherRuntimeOverride is a test seam for the dual-run detector's per-host runtime
 	// gather (self-local + peer GetRuntimeInventory): when non-nil it replaces the real probes,
 	// returning the snapshot per successfully-gathered host, the hosts that could not be
@@ -844,6 +885,9 @@ type Server struct {
 	startFlightsMu  sync.Mutex
 	startFlights    map[string]*startFlight
 	startDomainWait time.Duration
+	// invFlights is the runtime inventory's libvirt single flight
+	// (runtime_inventory.go).
+	invFlights inventoryFlights
 	// liveStateCalls holds each live-state read of a local domain libvirt
 	// has not answered yet (vm_live_state.go); liveStateWait is how long a
 	// read waits for one (zero: defaultLiveStateWait).
@@ -952,6 +996,13 @@ type Server struct {
 	// (nic_identity.go): network → address → reservation.
 	dhcpResMu   sync.Mutex
 	dhcpPending map[string]map[string]dhcpPendingRes
+	// Addresses given to NICs on host-isolated networks whose rows are not
+	// written yet (hostIsolatedAddress): network → address → when. Under
+	// dhcpResMu.
+	isoPending map[string]map[string]time.Time
+	// isoOffset, when set (tests), replaces where a host-isolated address
+	// scan starts (isoScanOffset).
+	isoOffset func(netName string) uint64
 	// Host-local DHCP facts a reservation depends on; nil = the real host
 	// (network.DHCPServedHere, network.BridgeHasUplink, network.AddDHCPHost).
 	// Test seams: SetDHCPReservationBackend.
@@ -1512,6 +1563,14 @@ func (s *Server) SetDHCPReservationBackend(served, uplink func(bridge string) bo
 // reads, so a test that exercises that refusal must fix it rather than inherit
 // whatever interfaces the machine running the test happens to have.
 func (s *Server) SetBridgeExists(fn func(name string) bool) { s.bridgeExists = fn }
+
+// SetLinkAddrs replaces the read of a device's addresses (linkAddrs).
+// Test-only seam, nil in production.
+func (s *Server) SetLinkAddrs(fn func(name string) []netip.Prefix) { s.linkAddrs = fn }
+
+// SetLBApply replaces the haproxy/keepalived apply of a load balancer on this
+// host (lbApplyOverride). Test-only seam, nil in production.
+func (s *Server) SetLBApply(fn func(context.Context, lb.Config) error) { s.lbApplyOverride = fn }
 
 // SetBridgeHasUplink injects the "does this bridge carry anything off the host"
 // seam (see bridgeUplink). It is the fact that tells an operator's

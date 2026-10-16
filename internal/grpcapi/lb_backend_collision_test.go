@@ -43,6 +43,7 @@ func TestCreateLoadBalancer_RejectsDuplicateBackendNames(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := testServerCov(t)
+			s.db.SetClusterPolicyGate(func() bool { return true }) // failover_scope_v1 latched: the LB's snat is recordable
 			ctx := adminCtx()
 			createLBTable(t, ctx, s.db)
 			insertLBBackendCollisionVM(t, ctx, s, "web-1", "10.0.1.20")

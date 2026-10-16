@@ -1549,7 +1549,7 @@ it to impersonate a user.
 > (`GetRuntimeInventory`/`CheckVIPParticipant`/`CheckLBPresent`),
 > `FetchBinary`, `GetVMIPRemote`, proof-bearing `PromoteReplica`/`ApplyLB`, and the
 > peer-gated `ProvisionNetwork`/`SyncVTEP`/`UpdateFDB`/`RefreshLB`/
-> `PushReplicaIncrement`. Not enforced today. (`ListReplicas`, `PruneReplicas`
+> `AnnounceMigratedGuest`/`PushReplicaIncrement`. Not enforced today. (`ListReplicas`, `PruneReplicas`
 > and `PushReplica` ARE peer-only, enforced: a replica's record is written and
 > read only by cluster hosts. `UploadStoragePoolContent` refuses a header with
 > any field the receiver does not know, so no replica rides on an upload.)

@@ -76,6 +76,9 @@ func InsertIPSetWithGrant(ctx context.Context, c *Client, g capabilities.Feature
 	if err := rulefield.IPSet(s.Name, s.CIDRs); err != nil {
 		return err
 	}
+	if err := IPSetCompanionClash(ctx, c, "", []IPSet{s}); err != nil {
+		return err
+	}
 	v6, err := ipSetFamily(s.CIDRs)
 	if err != nil {
 		return err
@@ -95,6 +98,32 @@ func InsertIPSetWithGrant(ctx context.Context, c *Client, g capabilities.Feature
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		s.ID, s.Name, cidrs, s.StackName, nowRFC3339(), now,
 	)
+}
+
+// IPSetCompanionClash refuses sets that, beside the live ones, would make
+// every host refuse its ruleset: a set named <x>_v6 while a set x holds IPv6
+// elements, or the reverse (rulefield.CompanionClash). The live rows of stack
+// (when not "") are left out of the comparison: a deploy replaces them.
+func IPSetCompanionClash(ctx context.Context, c *Client, stack string, sets []IPSet) error {
+	live, err := ListIPSets(ctx, c)
+	if err != nil {
+		return err
+	}
+	byName := map[string][]string{}
+	for _, l := range live {
+		if stack == "" || l.StackName != stack {
+			byName[l.Name] = append(byName[l.Name], l.CIDRs...)
+		}
+	}
+	for _, s := range sets {
+		byName[s.Name] = append(byName[s.Name], s.CIDRs...)
+	}
+	for _, s := range sets {
+		if err := rulefield.CompanionClash(byName, s.Name); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ListIPSets returns every live ip set (cluster-wide — the renderer scopes

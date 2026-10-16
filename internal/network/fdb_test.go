@@ -68,7 +68,9 @@ func TestFloodEntry(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 call, got %d", len(calls))
 	}
-	exp := []string{"bridge", "fdb", "add", "00:00:00:00:00:00", "dev", "vxlan300", "dst", "172.16.0.1"}
+	// append, not add: the kernel keeps one flood entry per device with a
+	// list of destinations, and refuses a second add ("File exists").
+	exp := []string{"bridge", "fdb", "append", "00:00:00:00:00:00", "dev", "vxlan300", "dst", "172.16.0.1"}
 	for i, a := range exp {
 		if calls[0][i] != a {
 			t.Errorf("arg %d: expected %q, got %q", i, a, calls[0][i])

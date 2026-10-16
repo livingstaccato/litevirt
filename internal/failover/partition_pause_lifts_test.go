@@ -71,6 +71,7 @@ func TestRecoveryLimit_LiftsWhenTheHostIsBackInService(t *testing.T) {
 // Mutation: drop unlimitRecovery from resumeFromConfirmation — vm2 stays.
 func TestRecoveryLimit_LiftsOnAnOperatorConfirmation(t *testing.T) {
 	c, db, ctx, _ := limitedEpisode(t)
+	poweredOff(t, db, "bridge")
 	operatorConfirms(t, db, ctx, "down")
 	c.run(ctx)
 	if got := vm2Host(t, db); got != "alive" {

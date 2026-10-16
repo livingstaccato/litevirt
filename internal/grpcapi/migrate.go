@@ -26,7 +26,6 @@ import (
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/hooks"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
-	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -569,6 +568,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	var targetCgroup string
 	// stripVNC: the target cannot do VNC passwords (MigrateParams.StripVNCPassword).
 	var stripVNC bool
+	// targetNetDevs: the device the target serves each of the VM's managed
+	// networks on, when it said (MigrateParams.NICBridges).
+	var targetNetDevs map[string]string
 	useTLS := false
 	// route is where the migration's data goes: the cluster address, or the
 	// target's address in migration.network (migration_network.go).
@@ -582,7 +584,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			return err
 		}
 		createdStubs, dstTLS, cdromSources, targetCgroup = ens.created, ens.tlsReady, ens.remap, ens.cgroupMode
-		stripVNC = ens.vncPasswordUnavailable
+		stripVNC, targetNetDevs = ens.vncPasswordUnavailable, ens.netDevices
 		abort.createdStubs = createdStubs
 		useTLS = srcTLS && dstTLS
 		kind := routeStorage
@@ -609,7 +611,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			return eerr
 		}
 		cdromSources, targetCgroup = ens.remap, ens.cgroupMode
-		stripVNC = ens.vncPasswordUnavailable
+		stripVNC, targetNetDevs = ens.vncPasswordUnavailable, ens.netDevices
 		if fwVM || coldStopped {
 			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeCold, true)
 		} else {
@@ -673,7 +675,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// The target puts the guest's NIC firewall — its guards above all — in
 	// force before the guest arrives, under the tap names its MACs fix
 	// (re-review I-10). Before anything is written, so a refusal changes
-	// nothing.
+	// nothing. A guard record an earlier build left for a NIC the VM no
+	// longer has is retired first: no target could put it in force.
+	s.retireOrphanNICGuards(ctx, vm.Name, "")
 	armed, aerr := s.armMigrationTarget(ctx, targetHost, vm.Name)
 	if aerr != nil {
 		return aerr
@@ -768,6 +772,8 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			// The destination definition carries each rbd disk's monitors as
 			// its pool resolves them now (a re-addressed cluster's).
 			RBDLocators: s.rbdLocatorsOf(ctx, vm.Name),
+			// Each NIC lands on the device the target serves its network on.
+			NICBridges: s.migrationNICBridges(ctx, vm.Name, targetNetDevs),
 		}
 		armed.apply(&params)
 		logVNCPasswordStrip(vm.Name, req.TargetHost, params.StripVNCPassword)
@@ -1087,8 +1093,10 @@ func (s *Server) finalizeMigrationOwnership(ctx context.Context, vm *corrosion.V
 func (s *Server) cleanupPostMigration(vmName string) {
 	// Always clean up cloud-init ISO — target regenerates from stored spec if needed.
 	isoPath := filepath.Join(s.dataDir, "cloudinit", vmName+".iso")
-	if err := os.Remove(isoPath); err == nil {
-		slog.Info("post-migration: removed cloud-init ISO", "vm", vmName, "path", isoPath)
+	if _, err := os.Stat(isoPath); err == nil {
+		if err := cloudinit.RemoveSeed(isoPath); err == nil {
+			slog.Info("post-migration: removed cloud-init ISO", "vm", vmName, "path", isoPath)
+		}
 	}
 }
 
@@ -1182,19 +1190,29 @@ func (s *Server) sendReattachVFs(ctx context.Context, client pb.LiteVirtClient, 
 	}
 }
 
-// EnsureCloudInit generates a cloud-init ISO on this host if it doesn't already exist.
-// Called by the source host before migration so the target has the ISO ready.
+// EnsureCloudInit generates a cloud-init ISO on this host unless the one here
+// is already this VM's. Called by the source host before migration so the
+// target has the ISO ready. A seed here of another VM of the name — one
+// deleted while this host kept its seed — is written again
+// (cloudinit/seed_owner.go).
 func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitRequest) (*emptypb.Empty, error) {
-	if _, err := s.authorizeMigrationHelper(ctx, req.VmName); err != nil {
+	vm, err := s.authorizeMigrationHelper(ctx, req.VmName)
+	if err != nil {
 		return nil, err
 	}
 	isoPath, err := lv.SafeCloudInitISOPath(s.dataDir, req.VmName)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	if _, err := os.Stat(isoPath); err == nil {
-		return &emptypb.Empty{}, nil // already exists
+	owner := cloudinit.SpecUUID(vm.Spec)
+	if cloudinit.SeedIsFor(isoPath, owner) {
+		return &emptypb.Empty{}, nil // already this VM's
 	}
+	// A file already at the path is written over, but it was not created
+	// for this migration: a failed migration's cleanup leaves the path alone,
+	// as it does a seed that was this VM's.
+	_, statErr := os.Lstat(isoPath)
+	existed := statErr == nil
 
 	userData := req.Userdata
 	if userData == "" {
@@ -1208,8 +1226,14 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 	}, isoPath); err != nil {
 		return nil, status.Errorf(codes.Internal, "generate cloud-init ISO: %v", err)
 	}
-	s.migrationISOs.add(req.VmName, isoPath)
-	slog.Info("cloud-init ISO generated for migration", "vm", req.VmName, "path", isoPath)
+	if err := cloudinit.StampSeed(isoPath, owner); err != nil {
+		slog.Warn("cloud-init ISO for migration: could not stamp it with its VM; a later start writes it again",
+			"vm", req.VmName, "error", err)
+	}
+	if !existed {
+		s.migrationISOs.add(req.VmName, isoPath)
+	}
+	slog.Info("cloud-init ISO generated for migration", "vm", req.VmName, "path", isoPath, "replaced", existed)
 	return &emptypb.Empty{}, nil
 }
 
@@ -1286,6 +1310,9 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		// A live migration onto this host moves a guest without its VNC
 		// password when this QEMU cannot do one (docs/ui.md "Console passwords").
 		VncPasswordUnavailable: s.vncPasswordUnavailableForMigration() != ""}
+	if req.GetWantNetworkDevices() {
+		resp.NetworkDevices = s.servedNetworkDevices(ctx, req.GetVmName())
+	}
 	var made []string // created by this call: removed again if a later one fails
 	undo := func() {
 		for _, p := range made {
@@ -1962,7 +1989,7 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 		} else if vmLivesHere || !s.migrationISOs.owns(req.VmName, iso) {
 			slog.Warn("cleanup migration artifacts: leaving a cloud-init ISO this host did not create for the migration",
 				"vm", req.VmName, "path", iso, "vm_lives_here", vmLivesHere)
-		} else if err := os.Remove(iso); err != nil && !os.IsNotExist(err) {
+		} else if err := cloudinit.RemoveSeed(iso); err != nil {
 			slog.Warn("cleanup migration artifacts: remove cloud-init iso", "vm", req.VmName, "path", iso, "error", err)
 		} else {
 			s.migrationISOs.forget(iso)
@@ -2189,6 +2216,10 @@ type ensureOutcome struct {
 	// authentication (FIPS), so a live migration strips the guest's VNC
 	// password (MigrateParams.StripVNCPassword). False when it did not say.
 	vncPasswordUnavailable bool
+	// netDevices: the device the target serves each of the VM's managed
+	// networks on (EnsureDisksResponse.network_devices); nil when it did not
+	// say (an older target, or no call was made).
+	netDevices map[string]string
 }
 
 // ensureDisksOnTargetNet is ensureDisksOnTargetISO that also asks for the
@@ -2215,7 +2246,10 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 	if err != nil {
 		return ensureOutcome{}, err
 	}
-	shareOnly := runtime && (s.vmSharesWeight(ctx, vmName) > 0 || hasVNCPassword) && len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 &&
+	// A runtime move of a VM with a NIC on a managed network asks which device
+	// the target serves each such network on. Best effort, like the cgroup ask.
+	wantNetDevs := runtime && s.vmHasManagedNIC(ctx, vmName)
+	shareOnly := runtime && (s.vmSharesWeight(ctx, vmName) > 0 || hasVNCPassword || wantNetDevs) && len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 &&
 		s.migrationNetwork == "" && !hasRBD && len(mtus) == 0
 	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 && s.migrationNetwork == "" && !shareOnly && !hasRBD && len(mtus) == 0 {
 		return ensureOutcome{}, nil
@@ -2236,9 +2270,10 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 		InstallerIsoSha256: s.judgedISOSHA256(ctx, vmName, isoPaths),
 		MigrationNetwork:   s.migrationNetwork,
 		NicMtu:             mtus,
+		WantNetworkDevices: wantNetDevs,
 	})
 	if err != nil && shareOnly {
-		slog.Warn("migration: the target did not report its cgroup version; cpu-shares move as defined",
+		slog.Warn("migration: the target did not answer the migration preflight; cpu-shares, VNC password and NICs move as defined",
 			"vm", vmName, "target", targetHost, "error", err)
 		return ensureOutcome{}, nil
 	}
@@ -2277,7 +2312,7 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 			slog.Info("migration: the target opens the installer ISO at its own file", "vm", vmName, "target", targetHost, "here", from, "there", to)
 		}
 	}
-	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode(), vncPasswordUnavailable: resp.GetVncPasswordUnavailable()}, nil
+	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode(), vncPasswordUnavailable: resp.GetVncPasswordUnavailable(), netDevices: resp.GetNetworkDevices()}, nil
 }
 
 // olderTargetISORemap points, for a move to an older target, the CD-ROM that
@@ -2415,14 +2450,28 @@ func (s *Server) judgedISOSHA256(ctx context.Context, vmName string, isoPaths []
 // moved a cloud-init VM live (lab2c-report.md, bug 2). A failed attempt takes
 // back the ISO with cleanupFailedMigrationTarget.
 func (s *Server) prepareMigrationTarget(ctx context.Context, vm *corrosion.VMRecord, target string) {
-	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
-	for _, iface := range ifaces {
-		if iface.NetworkName == "" {
+	s.provisionVMNetworksOnRemote(ctx, vm.Name, target)
+	s.ensureCloudInitOnTarget(ctx, target, vm)
+}
+
+// provisionVMNetworksOnRemote sets up on target the network of each of
+// vmName's live NICs (MergedVMNICs): a NIC hot-attached on a hardware_v2
+// cluster has a vm_nics row alone, and a detached one keeps its vm_interfaces
+// row there. Best effort, as each provisionNetworkOnRemote is.
+func (s *Server) provisionVMNetworksOnRemote(ctx context.Context, vmName, target string) {
+	nics, err := corrosion.MergedVMNICs(ctx, s.db, vmName)
+	if err != nil {
+		slog.Warn("could not read the NICs of a VM to set up its networks on the target", "vm", vmName, "target", target, "error", err)
+		return
+	}
+	done := map[string]bool{}
+	for _, n := range nics {
+		if n.NetworkName == "" || done[n.NetworkName] {
 			continue
 		}
-		s.provisionNetworkOnRemote(ctx, target, iface.NetworkName)
+		done[n.NetworkName] = true
+		s.provisionNetworkOnRemote(ctx, target, n.NetworkName)
 	}
-	s.ensureCloudInitOnTarget(ctx, target, vm)
 }
 
 // migrationTuning is what a VM's stored migration policy asks of a runtime
@@ -2465,25 +2514,40 @@ func migrationTuningFor(vm *corrosion.VMRecord, live bool) migrationTuning {
 	return t
 }
 
-// ensureCloudInitOnTarget calls the target host to generate the cloud-init ISO
-// before migration starts, so libvirt can find the file when the domain arrives.
-func (s *Server) ensureCloudInitOnTarget(ctx context.Context, targetHost string, vm *corrosion.VMRecord) {
-	// Parse spec to extract cloud-init data.
+// ensureCloudInitRequest is the seed ensureCloudInitOnTarget sends for vm:
+// its user-data and the network-config it was created with — the spec's, or
+// the one derived from its NIC rows and networks as CreateVM derived it. nil
+// sends none: a spec that cannot be parsed, or a network-config read that
+// failed (the target would keep a seed written without it — the outcome of a
+// target this host cannot reach).
+func (s *Server) ensureCloudInitRequest(ctx context.Context, vm *corrosion.VMRecord) *pb.EnsureCloudInitRequest {
 	var spec pb.VMSpec
 	if vm.Spec == "" {
-		return
+		return nil
 	}
 	if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil {
 		slog.Warn("ensureCloudInitOnTarget: parse spec", "vm", vm.Name, "error", err)
-		return
+		return nil
 	}
-
-	// Build the request — send cloud-init data if present, otherwise send
-	// minimal data so the target generates a basic ISO.
 	req := &pb.EnsureCloudInitRequest{VmName: vm.Name}
 	if spec.CloudInit != nil {
 		req.Userdata = spec.CloudInit.Userdata
-		req.Networkconfig = spec.CloudInit.Networkconfig
+	}
+	nc, err := cloudinit.SeedNetworkConfig(ctx, s.db, vm.Name, &spec)
+	if err != nil {
+		slog.Warn("ensureCloudInitOnTarget: network-config could not be derived; no seed sent", "vm", vm.Name, "error", err)
+		return nil
+	}
+	req.Networkconfig = nc
+	return req
+}
+
+// ensureCloudInitOnTarget calls the target host to generate the cloud-init ISO
+// before migration starts, so libvirt can find the file when the domain arrives.
+func (s *Server) ensureCloudInitOnTarget(ctx context.Context, targetHost string, vm *corrosion.VMRecord) {
+	req := s.ensureCloudInitRequest(ctx, vm)
+	if req == nil {
+		return
 	}
 
 	// Check if the cloud-init ISO exists locally — if not, the VM was created
@@ -2603,13 +2667,10 @@ func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRe
 		s.reattachVFsOnTarget(ctx, target, f.target.Address, f.target.GRPCPort, vm.Name, f.detachedVFs)
 	}
 
-	// Send gratuitous ARP for each VM interface to update switch MAC tables.
+	// The target announces each network's gateway to the guest from its own
+	// bridge, so the guest's cached gateway entry moves with it.
+	go s.announceOnTarget(ctx, f.target, vm.Name)
 	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
-	for _, iface := range ifaces {
-		if iface.IP != "" {
-			go network.SendGARPBestEffort(iface.NetworkName, iface.IP)
-		}
-	}
 
 	// Update DNS records so VM names resolve correctly after migration.
 	if s.dnsDomain != "" {

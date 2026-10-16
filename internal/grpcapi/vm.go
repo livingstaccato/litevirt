@@ -6,10 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/litevirt/litevirt/internal/netutil"
 	"io/fs"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -74,7 +72,14 @@ func validateSpecNames(spec *pb.VMSpec) error {
 			return fmt.Errorf("disk %q: %w", d.Name, err)
 		}
 	}
-	return nil
+	// The stack name names the stack's LB, whose root-owned config files and
+	// notify script are named after it.
+	if spec.StackName != "" {
+		if err := safename.ValidateStackName(spec.StackName); err != nil {
+			return err
+		}
+	}
+	return validateLBSpec(spec.Loadbalancer)
 }
 
 func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM, error) {
@@ -203,6 +208,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			return nil, status.Error(codes.PermissionDenied,
 				"defining VM lifecycle hooks requires the admin role (hooks execute as root on the target host)")
 		}
+	}
+	if err := requireAdminForLBTLS(ctx, spec.Loadbalancer); err != nil {
+		return nil, err
 	}
 
 	// Check if VM already exists. A rebuild or recreate whose replica here has
@@ -543,7 +551,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	cleanupDisks := func() {
 		if createdSeed != "" {
 			if fi, err := os.Stat(createdSeed); err == nil && os.SameFile(fi, createdSeedFile) {
-				if rmErr := os.Remove(createdSeed); rmErr != nil && !os.IsNotExist(rmErr) {
+				if rmErr := cloudinit.RemoveSeed(createdSeed); rmErr != nil {
 					slog.Warn("cleanup: failed to remove cloud-init seed", "path", createdSeed, "error", rmErr)
 				}
 			}
@@ -582,9 +590,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	}
 
 	// Clean up any orphaned disk files / cloud-init ISO left from a previous
-	// incomplete delete, even if the libvirt domain is already gone.
-	s.sweepVMDiskDebris(ctx, spec.Name)
-	os.Remove(lv.CloudInitISOPath(s.dataDir, spec.Name))
+	// incomplete delete, even if the libvirt domain is already gone. A disk
+	// a deleted VM of this name was kept with, or that a failover left here,
+	// is moved off its path first (clearDiskDebrisBeforeCreate).
+	if err := s.clearDiskDebrisBeforeCreate(ctx, spec.Name, time.Now()); err != nil {
+		return nil, status.Errorf(codes.Unavailable, "create %s refused on %s: %v; nothing was created", spec.Name, s.hostName, err)
+	}
+	_ = cloudinit.RemoveSeed(lv.CloudInitISOPath(s.dataDir, spec.Name))
 
 	// Auto-pull image from a peer if not available locally.
 	if spec.Image != "" && !s.images.ImageExists(spec.Image) {
@@ -820,7 +832,26 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	var ifaceRecords []corrosion.InterfaceRecord
 	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
 	var guardRecords []corrosion.NICGuardRecord
-	dhcpReserved := map[int]bool{} // NIC index → address is a DHCP reservation, not a static one
+	boundNIC := map[int]bool{} // NIC index → address is a NetBox claim
+	// Host-isolated picks of this create: in flight until it returns, by
+	// which time its rows hold them or it failed (review m-4).
+	var isoPicks []isoPick
+	defer func() { s.releaseHostIsolatedPicks(isoPicks) }()
+	// The VIPs this VM's own load balancer and its stack's will take
+	// (review I-2, R1-m2): their LB rows are written after the stack's VMs.
+	// Read only for a create that makes a host-isolated pick.
+	var specVIPs []string
+	specVIPsRead := false
+	pickVIPs := func() []string {
+		if !specVIPsRead {
+			specVIPsRead = true
+			specVIPs = s.stackVIPs(ctx, spec.GetStackName())
+			if lb := spec.GetLoadbalancer(); lb != nil && lb.GetVip() != "" {
+				specVIPs = append(specVIPs, lb.GetVip())
+			}
+		}
+		return specVIPs
+	}
 
 	// External-IPAM claims taken for this create. A NetBox claim is a synchronous
 	// REMOTE side-effect: it cannot join the local atomic write, so every failure
@@ -967,6 +998,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				return nil, status.Errorf(codes.FailedPrecondition, "claim address from NetBox: %v", cerr)
 			}
 			nicIP = res.IP
+			boundNIC[i] = true
 			claims.add(claimedAddr{
 				Network: n.Name, IP: res.IP, MAC: mac,
 				OwnerKind: "vm", OwnerHost: "", Name: spec.Name,
@@ -990,8 +1022,23 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				cleanupDisks()
 				return nil, status.Errorf(codes.ResourceExhausted, "reserve a DHCP address on %q: %v", n.Name, rerr)
 			default:
+				// A reservation, not a static address: the NIC still asks
+				// DHCP (cloudinit.NetworkConfig reads a recorded address as
+				// static only on a bound or host-isolated network).
 				nicIP = ip
-				dhcpReserved[i] = true
+			}
+		} else if def, _ := lookupNetworkDef(ctx, s.db, n.Name); n.Ip == "" && cloudinit.HostIsolatedAddressable(def) {
+			// A host-isolated network runs no DHCP server, so the address is
+			// litevirt's to give: recorded on the NIC row here, delivered to
+			// the guest by the seed's network-config below (docs/compose.md,
+			// "Host isolation"). A NIC that cannot be given one is created as
+			// it always was, with no address, rather than refused.
+			if ip, ierr := s.hostIsolatedAddress(ctx, n.Name, def, pickVIPs()); ierr != nil {
+				slog.Warn("host-isolated network: no address for the NIC; the guest gets none",
+					"vm", spec.Name, "network", n.Name, "error", ierr)
+			} else {
+				nicIP = ip
+				isoPicks = append(isoPicks, isoPick{network: n.Name, ip: ip})
 			}
 		}
 
@@ -1042,69 +1089,21 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return nil, err
 	}
 
-	// Build cloud-init network-config for interfaces with static IPs.
-	// Applies to any network type (bridge, vxlan, isolated) where the compose
-	// specifies an explicit IP. Uses V1 format for distro-agnostic MAC matching.
-	var staticNetCfg string
-	var staticIfaces []isolatedIface
+	// Build the seed's cloud-init network-config from the facts every later
+	// rebuild of the seed reads too (cloudinit.SeedNetworkConfig): the spec's
+	// NIC entries, the address each NIC row records, its network.
+	nicInputs := make([]cloudinit.NIC, 0, len(spec.Network))
 	for i, n := range spec.Network {
 		netDef, _ := lookupNetworkDef(ctx, s.db, n.Name)
-		ip := n.Ip
-		if ip == "" && i < len(ifaceRecords) && !dhcpReserved[i] {
-			ip = ifaceRecords[i].IP
-		}
-
-		// Skip interfaces without a static IP unless host-isolated (which
-		// always needs cloud-init config to avoid DHCP).
-		if ip == "" {
-			continue
-		}
-		needsConfig := ip != "" // explicit static IP in compose
-		if netDef != nil && netDef.HostIsolation {
-			needsConfig = true
-		}
-		if !needsConfig {
-			continue
-		}
-
-		// Determine subnet prefix and gateway from network def or attachment.
-		address, gateway := staticIfaceGatewayAddress(ip, n.Gateway, netDef)
-		var dnsServers []string
-		if netDef != nil {
-			dnsServers = netDef.DNS
-		}
-		if len(dnsServers) == 0 {
-			dnsServers = []string{"1.1.1.1", "8.8.8.8"}
-		}
-		mac := ""
+		in := cloudinit.NIC{Ordinal: i, Net: netDef, Bound: boundNIC[i],
+			IP: n.Ip, Gateway: n.Gateway, IPv6: n.Ipv6, IPv6Gateway: n.Ipv6Gateway}
 		if i < len(ifaceRecords) {
-			mac = ifaceRecords[i].MAC
+			in.MAC = ifaceRecords[i].MAC
+			in.RecordedIP = ifaceRecords[i].IP
 		}
-
-		// IPv6 handling: a NIC can carry an explicit `ipv6:` (with
-		// optional `ipv6-gateway:`); when omitted we fall through to
-		// SLAAC / RA, which dnsmasq emits when the network's subnet
-		// is IPv6. Static v6 assignment is rare but useful for
-		// well-known endpoints (DNS, mail) where SLAAC's privacy
-		// extensions are inconvenient.
-		address6 := n.Ipv6
-		gateway6 := n.Ipv6Gateway
-		if address6 != "" && !strings.Contains(address6, "/") {
-			address6 = address6 + "/64"
-		}
-
-		staticIfaces = append(staticIfaces, isolatedIface{
-			MAC:      mac,
-			Address:  address,
-			Gateway:  gateway,
-			DNS:      dnsServers,
-			Address6: address6,
-			Gateway6: gateway6,
-		})
+		nicInputs = append(nicInputs, in)
 	}
-	if len(staticIfaces) > 0 {
-		staticNetCfg = buildIsolatedNetworkConfig(staticIfaces)
-	}
+	staticNetCfg := cloudinit.NetworkConfig(nicInputs)
 
 	// Generate cloud-init ISO if this is a cloud image
 	var cloudInitISO string
@@ -1146,6 +1145,15 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		} else {
 			cloudInitISO = isoPath
 			recordSeed(isoPath)
+		}
+	}
+
+	// The seed is this VM's (cloudinit/seed_owner.go): a host that later finds
+	// it reuses it for this VM only.
+	if cloudInitISO != "" {
+		if err := cloudinit.StampSeed(cloudInitISO, spec.Uuid); err != nil {
+			slog.Warn("create: could not stamp the cloud-init seed with its VM; a later start writes it again",
+				"vm", spec.Name, "error", err)
 		}
 	}
 
@@ -1881,6 +1889,9 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	}
 	// The reservation must outlive startVMLocked's state write.
 	held.hold(func() { lease.release(ctx) })
+	// A guard record an earlier build left for a NIC the VM no longer has
+	// would refuse the start guard: retire it under the lock first.
+	s.retireOrphanNICGuards(ctx, vm.Name, "")
 	if rearmed, err := s.restartCancelledStartLocked(ctx, vm); err != nil {
 		return nil, err
 	} else if rearmed {
@@ -2229,6 +2240,9 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 	if err := s.rejudgeSharedDisksForStart(ctx, vm); err != nil {
 		return nil, err
 	}
+	// A NIC whose network moved to another device since the domain was
+	// defined starts on the network's device now.
+	s.followNetworkDevices(ctx, vm.Name)
 	// Adoption gate + PCI start-preflight (shared with the automated restart paths).
 	// No-op pre-latch, so every start behaves byte-for-behavior as before until
 	// hardware_v2 latches.
@@ -3132,7 +3146,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// node keeps scheduling around. A failure is logged and every NIC named
 		// for the orphan sweep, never swallowed.
 		s.releaseNICLeasesBestEffort(ctx, vm, "delete-stale-record")
-		deleted, err := corrosion.DeleteVMReporting(ctx, s.db, req.Name)
+		deleted, err := s.tombstoneDeletedVM(ctx, req.Name, req.KeepDisks)
 		if err != nil {
 			// A declined delete means the stale row is still live cluster-wide;
 			// claiming OK here would hide it. Idempotent — retry.
@@ -3331,7 +3345,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		s.removeOwnDiskLayers(ctx, req.Name, layers)
 		s.removeVMSnapshotRAMImages(ctx, req.Name)
 		// Remove cloud-init ISO
-		os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
+		_ = cloudinit.RemoveSeed(lv.CloudInitISOPath(s.dataDir, req.Name))
 		// Firmware state (G1): wipe nvram (name-keyed) + swtpm (uuid-keyed). With
 		// --keep-disks we deliberately KEEP it too — else a retained BitLocker disk
 		// would be unbootable (the swtpm tree at the stable uuid stays for restore).
@@ -3457,7 +3471,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// row every node keeps serving, scheduling around and failing over — the
 	// exact stale-live state the mandatory tombstone exists to kill. The domain
 	// teardown above is idempotent, so the caller can simply retry.
-	deleted, err := corrosion.DeleteVMReporting(ctx, s.db, req.Name)
+	deleted, err := s.tombstoneDeletedVM(ctx, req.Name, req.KeepDisks)
 	if err != nil {
 		s.audit(ctx, "vm.delete", req.Name, "project="+tenancy.NormalizeProject(vm.Project), "error")
 		return nil, status.Errorf(codes.Internal, "delete: tombstone cluster row: %v", err)
@@ -3525,7 +3539,8 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	// graceful shutdown where libvirt still reports "running" briefly.
 	// The live state, as `lv ls` reads it (readVMState); the record's
 	// detail unless the read has its own.
-	state, stateDetail := s.readVMState(vm, s.newLiveStateBudget())
+	budget := s.newLiveStateBudget()
+	state, stateDetail := s.readVMState(vm, budget)
 	if stateDetail == "" {
 		stateDetail = vm.StateDetail
 	}
@@ -3555,12 +3570,29 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	// not proven off.
 	pbVM.SharedDiskWithheld = s.sharedDiskWithheldReason(ctx, vm.Name)
 
-	// Interfaces — run IP discovery fallback if IP is unknown.
+	// Interfaces — run IP discovery fallback if IP is unknown, every such NIC
+	// in one batch, so the wait on peers is bounded once for the VM.
 	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, name)
-	for _, iface := range ifaces {
+	discovered := map[int]string{}
+	if vm.HostName == s.hostName {
+		var idx []int
+		var queries []nicQuery
+		for i, iface := range ifaces {
+			if iface.IP == "" {
+				idx = append(idx, i)
+				queries = append(queries, nicQuery{mac: iface.MAC, network: iface.NetworkName})
+			}
+		}
+		if len(queries) > 0 {
+			for j, ip := range s.discoverNICAddressesWithPeers(ctx, queries, inspectPeerLeaseBudget) {
+				discovered[idx[j]] = ip
+			}
+		}
+	}
+	for i, iface := range ifaces {
 		ip := iface.IP
-		if ip == "" && vm.HostName == s.hostName {
-			ip = s.discoverNICAddress(ctx, iface.MAC, iface.NetworkName)
+		if ip == "" {
+			ip = discovered[i]
 		}
 		// If we discovered a new IP, persist it — through the same gate ListVMs
 		// uses, and for the same reason (netbox_discovery.go): on a bound network
@@ -3650,14 +3682,7 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 
 	// VNC address — only available for running VMs on this host
 	if vm.HostName == s.hostName && state == "running" && s.virt != nil {
-		if port, err := s.virt.GetVMVNCPort(name); err == nil && port >= 0 {
-			if host, err := corrosion.GetHost(ctx, s.db, s.hostName); err == nil && host != nil {
-				pbVM.VncAddress = fmt.Sprintf("vnc://%s", net.JoinHostPort(host.Address, strconv.Itoa(port)))
-			}
-			// Whether that listener asks for a password (docs/ui.md "Console
-			// passwords"); never the password itself.
-			pbVM.VncPasswordRequired = s.vmHasVNCPassword(name)
-		}
+		s.fillVNC(ctx, pbVM, name, budget)
 	}
 
 	// Project the authoritative device tables into the spec's device
@@ -4043,12 +4068,6 @@ func GenerateMAC() string {
 	return fmt.Sprintf("52:54:00:%02x:%02x:%02x", buf[0], buf[1], buf[2])
 }
 
-// provisionNetworkForVM delegates to network.ProvisionForVM.
-// Kept as a local wrapper for backward compatibility within this file.
-func provisionNetworkForVM(ctx context.Context, db *corrosion.Client, networkName, hostName string) (string, error) {
-	return network.ProvisionForVM(ctx, db, networkName, hostName)
-}
-
 // resolveBridge maps a compose network name to the actual host bridge interface.
 // Falls back to networkName itself if no network record exists (flat bridge mode).
 func resolveBridge(ctx context.Context, db *corrosion.Client, networkName string) string {
@@ -4097,87 +4116,15 @@ func lookupNetworkDef(ctx context.Context, db *corrosion.Client, networkName str
 	return &def, nil
 }
 
-// buildIsolatedNetworkConfig generates a cloud-init V1 network-config YAML
-// for VMs on host-isolated networks. Uses MAC matching for distro-agnostic
-// interface binding (works on Ubuntu, CentOS, Arch, Debian, Alpine, etc.).
-//
-// IPv6: when iface.Address6 is set we emit a second `static6` subnet on
-// the same interface (cloud-init's V1 schema accepts dual-stack via
-// repeated `subnets:` entries with type `static` for v4 and `static6`
-// for v6).
-func buildIsolatedNetworkConfig(ifaces []isolatedIface) string {
-	if len(ifaces) == 0 {
-		return ""
-	}
-	cfg := "version: 1\nconfig:\n"
-	for i, iface := range ifaces {
-		cfg += fmt.Sprintf("  - type: physical\n    name: eth%d\n    mac_address: %q\n    subnets:\n", i, iface.MAC)
-		if iface.Address != "" {
-			cfg += fmt.Sprintf("      - type: static\n        address: %s\n", iface.Address)
-			if iface.Gateway != "" {
-				cfg += fmt.Sprintf("        gateway: %s\n", iface.Gateway)
-			}
-			if len(iface.DNS) > 0 {
-				cfg += "        dns_nameservers:\n"
-				for _, ns := range iface.DNS {
-					cfg += fmt.Sprintf("          - %s\n", ns)
-				}
-			}
-		}
-		if iface.Address6 != "" {
-			cfg += fmt.Sprintf("      - type: static6\n        address: %s\n", iface.Address6)
-			if iface.Gateway6 != "" {
-				cfg += fmt.Sprintf("        gateway: %s\n", iface.Gateway6)
-			}
-		}
-	}
-	return cfg
-}
+// isolatedIface, buildIsolatedNetworkConfig and staticIfaceGatewayAddress
+// are the seed's network-config pieces, shared with the reconciler and the
+// migration path in package cloudinit.
+type isolatedIface = cloudinit.StaticIface
 
-type isolatedIface struct {
-	MAC      string
-	Address  string // IPv4 CIDR, e.g. "10.100.0.10/24"
-	Gateway  string
-	DNS      []string
-	Address6 string // IPv6 CIDR, e.g. "2001:db8::10/64"; empty = no static v6 (SLAAC/RA)
-	Gateway6 string
-}
+func buildIsolatedNetworkConfig(ifaces []isolatedIface) string { return cloudinit.BuildV1(ifaces) }
 
-// staticIfaceGatewayAddress derives the cloud-init network-config address (with
-// CIDR prefix) and the gateway for a NIC's static IP. An explicit gateway wins;
-// when the network has a subnet, the gateway defaults to the subnet's first host
-// as a BARE address — SubnetRange returns it with a prefix, which netplan/ENI
-// reject — and the address takes the subnet's prefix, but only when the caller
-// did NOT already supply one, so a submitted "10.0.1.50/24" is preserved rather
-// than doubled to "10.0.1.50/24/24". With no subnet def, a bare address gets a
-// family default (/64 for IPv6, /24 for IPv4).
 func staticIfaceGatewayAddress(ip, gateway string, netDef *compose.NetworkDef) (string, string) {
-	address := ip
-	if netDef != nil && netDef.Subnet != "" {
-		gw, _, _, _, err := network.SubnetRange(netDef.Subnet)
-		if err == nil {
-			if gateway == "" {
-				// SubnetRange returns the gateway WITH a prefix (10.0.1.1/24);
-				// the network-config gateway must be a bare host address, else
-				// netplan/ENI/sysconfig reject it and static addressing fails.
-				gateway = splitCIDR(gw)[0]
-			}
-			parts := splitCIDR(netDef.Subnet)
-			if parts[1] != "" && !strings.Contains(ip, "/") {
-				address = ip + "/" + parts[1]
-			}
-		}
-	} else if !strings.Contains(address, "/") {
-		// No subnet in network def — pick a sensible default based on address
-		// family. /24 for v4, /64 for v6 (the standard host prefix for end-user
-		// assignments).
-		if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
-			address = ip + "/64"
-		} else {
-			address = ip + "/24"
-		}
-	}
-	return address, gateway
+	return cloudinit.StaticAddress(ip, gateway, netDef)
 }
 
 // splitCIDR splits "10.0.0.0/24" into ["10.0.0.0", "24"].
@@ -4189,14 +4136,6 @@ func splitCIDR(cidr string) [2]string {
 		}
 	}
 	return [2]string{cidr, ""}
-}
-
-// getLocalIP returns the outbound IP of this host.
-func getLocalIP() string {
-	if ip := netutil.OutboundIP(); ip != "" {
-		return ip
-	}
-	return "127.0.0.1"
 }
 
 // SetVMIP updates the IP address of a VM interface in the state store.
@@ -4502,7 +4441,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// Wipe the old firmware state — rebuild recreates with a FRESH identity, so the
 	// old name-keyed NVRAM + old-UUID swtpm tree would otherwise be orphaned (G1).
 	lv.WipeFirmwareState(s.dataDir, req.Name, spec.Uuid)
-	os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
+	_ = cloudinit.RemoveSeed(lv.CloudInitISOPath(s.dataDir, req.Name))
 	// The rebuilt VM gets a fresh uuid: the ISO record of the old one goes.
 	s.forgetVMISOIdentity(req.Name, vm.Spec)
 
@@ -5941,8 +5880,13 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		})
 	}
 
-	// Build network configs from stored interfaces.
-	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, req.Name)
+	// Build network configs from the VM's live NICs (the vm_nics/vm_interfaces
+	// overlay): a NIC hot-attached or detached on a hardware_v2 cluster is
+	// recorded in vm_nics alone.
+	ifaces, err := liveVMInterfaces(ctx, s.db, req.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read NICs for %q: %v", req.Name, err)
+	}
 	var netConfigs []lv.NetworkConfig
 	for _, iface := range ifaces {
 		bridge := resolveBridge(ctx, s.db, iface.NetworkName)

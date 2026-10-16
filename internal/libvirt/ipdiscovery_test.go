@@ -164,3 +164,65 @@ func TestDiscoverIPForMACOnBridge_IgnoresOtherBridges(t *testing.T) {
 		t.Fatalf("DiscoverIPForMACOnBridge with no bridge = %q, want the newest lease anywhere (10.0.1.5)", got)
 	}
 }
+
+// LeaseOnBridge answers from the bridge's own lease file alone — never ARP,
+// never another bridge's file — with the expiry dnsmasq wrote (0 = infinite),
+// so a host asking for the lease a peer holds can tell the newest one.
+//
+// Mutation: fall back to ARP in LeaseOnBridge, or report the internal
+// MaxInt64 for an infinite lease — red.
+func TestLeaseOnBridge_LeaseFileOnlyWithExpiry(t *testing.T) {
+	withARPTable(t, "IP address       HW type     Flags       HW address            Mask     Device\n"+
+		"10.0.9.9         0x1         0x2         52:54:00:aa:bb:01     *        br-b\n")
+	withLeaseClock(t, 2_000_000_000)
+	withLeaseDir(t, "")
+	writeLeaseFile(t, dhcpLeaseDir, "litevirt-br-a.leases", "2000007200 52:54:00:aa:bb:01 10.0.1.5 web *\n")
+	writeLeaseFile(t, dhcpLeaseDir, "litevirt-br-b.leases", "2000003600 52:54:00:aa:bb:01 10.0.2.5 web *\n")
+	if ip, exp := LeaseOnBridge("52:54:00:aa:bb:01", "br-b"); ip != "10.0.2.5" || exp != 2000003600 {
+		t.Errorf("LeaseOnBridge(br-b) = %q, %d; want 10.0.2.5, 2000003600", ip, exp)
+	}
+	if ip, _ := LeaseOnBridge("52:54:00:aa:bb:01", "br-c"); ip != "" {
+		t.Errorf("LeaseOnBridge(br-c) = %q, want \"\" (no lease file; ARP is not a lease)", ip)
+	}
+	if ip, _ := LeaseOnBridge("52:54:00:aa:bb:01", ""); ip != "" {
+		t.Errorf("LeaseOnBridge with no bridge = %q, want \"\"", ip)
+	}
+	writeLeaseFile(t, dhcpLeaseDir, "litevirt-br-d.leases", "0 52:54:00:aa:bb:01 10.0.4.5 web *\n")
+	if ip, exp := LeaseOnBridge("52:54:00:aa:bb:01", "br-d"); ip != "10.0.4.5" || exp != 0 {
+		t.Errorf("LeaseOnBridge(br-d) = %q, %d; want the infinite lease 10.0.4.5, 0", ip, exp)
+	}
+}
+
+// With peers, a lease is preferred to this host's ARP table — a peer's lease
+// is authoritative, an ARP entry here may be stale — and of this host's lease
+// and the peers', the one granted most recently wins: an old gateway's lease
+// file can outlive its dnsmasq.
+//
+// Mutation: ask ARP before peerLease, or let this host's lease win
+// regardless of expiry — red.
+func TestDiscoverIPForMACOnBridgeWithPeers_Order(t *testing.T) {
+	withARPTable(t, "IP address       HW type     Flags       HW address            Mask     Device\n"+
+		"10.0.9.9         0x1         0x2         52:54:00:aa:bb:01     *        br-b\n")
+	withLeaseClock(t, 2_000_000_000)
+	withLeaseDir(t, "")
+	peer := func(ip string, exp int64) func() (string, int64) { return func() (string, int64) { return ip, exp } }
+	if got := DiscoverIPForMACOnBridgeWithPeers("52:54:00:aa:bb:01", "br-b", peer("10.0.2.7", 2000007200)); got != "10.0.2.7" {
+		t.Errorf("no lease here: %q, want the peer's lease 10.0.2.7 over ARP's 10.0.9.9", got)
+	}
+	if got := DiscoverIPForMACOnBridgeWithPeers("52:54:00:aa:bb:01", "br-b", peer("", 0)); got != "10.0.9.9" {
+		t.Errorf("no lease anywhere: %q, want ARP's 10.0.9.9", got)
+	}
+	writeLeaseFile(t, dhcpLeaseDir, "litevirt-br-b.leases", "2000003600 52:54:00:aa:bb:01 10.0.2.5 web *\n")
+	if got := DiscoverIPForMACOnBridgeWithPeers("52:54:00:aa:bb:01", "br-b", peer("10.0.2.7", 2000007200)); got != "10.0.2.7" {
+		t.Errorf("an older lease here, a newer one on a peer: %q, want the peer's 10.0.2.7", got)
+	}
+	if got := DiscoverIPForMACOnBridgeWithPeers("52:54:00:aa:bb:01", "br-b", peer("10.0.2.7", 2000001800)); got != "10.0.2.5" {
+		t.Errorf("a newer lease here: %q, want this host's 10.0.2.5", got)
+	}
+	if got := DiscoverIPForMACOnBridgeWithPeers("52:54:00:aa:bb:01", "br-b", peer("10.0.2.7", 0)); got != "10.0.2.7" {
+		t.Errorf("an infinite lease on a peer: %q, want the peer's 10.0.2.7", got)
+	}
+	if got := DiscoverIPForMACOnBridgeWithPeers("52:54:00:aa:bb:01", "br-b", nil); got != "10.0.2.5" {
+		t.Errorf("nobody asked: %q, want this host's 10.0.2.5", got)
+	}
+}

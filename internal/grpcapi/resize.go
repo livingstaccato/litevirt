@@ -218,7 +218,7 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 	opID := corrosion.DeterministicOperationID("ResizeVMLive", principal, vm.Project, vm.Name, idemKey)
 
 	lease, aerr := s.admitResizeReservation(
-		ctx, opID, "ResizeVMLive", principal, vm, cpuDelta, memDelta,
+		ctx, opID, "ResizeVMLive", principal, idemKey, vm, cpuDelta, memDelta,
 		int(target.Cpu), int(target.MemoryMib))
 	if aerr != nil {
 		return aerr
@@ -254,27 +254,13 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 		return status.Errorf(codes.Internal, "marshal spec: %v", err)
 	}
 
-	op := corrosion.OperationRecord{
-		ID:              opID,
-		Method:          "ResizeVMLive",
-		Principal:       principal,
-		Project:         vm.Project,
-		ResourceKind:    "vm",
-		ResourceID:      vm.Name,
-		OperationKind:   string(corrosion.OpResourceUpdateRunning),
-		RequestHash:     resizeRequestHash(vm.Name, target.Cpu, target.MemoryMib),
-		IdempotencyKey:  idemKey,
-		ReservationJSON: resJSON,
-	}
+	op := resizeOperationRecord(opID, "ResizeVMLive", principal, idemKey, vm, target.Cpu, target.MemoryMib, resJSON)
 	// FENCE before BeginVMOperation commits the desired spec; see CreateVM.
 	if ferr := lease.allowCommit(ctx); ferr != nil {
 		return ferr
 	}
 	applied, err := s.db.BeginVMOperation(ctx, op, string(targetJSON), vm.OwnerEpoch, vm.SpecGeneration)
 	if err != nil {
-		if errors.Is(err, corrosion.ErrOperationHashConflict) {
-			return status.Errorf(codes.AlreadyExists, "idempotency key reused with a different resize for %q", vm.Name)
-		}
 		return status.Errorf(codes.Internal, "begin operation: %v", err)
 	}
 	if !applied {
@@ -293,8 +279,14 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 // BeginVMOperation claims the VM, the same id becomes the authoritative
 // persistence record and drives recovery. Marking the operation as a transient
 // CAPACITY lease would let stale-lease expiry free real in-flight reservations.
+//
+// The header written here is the one BeginVMOperation keeps (INSERT OR IGNORE),
+// so it is written as that header: at the VM's owner epoch, with the request
+// hash and idempotency key. The epoch is what lets the operation's own terminal
+// (CompleteVMOperation, FailVMOperation, recovery — all at the VM's epoch)
+// release the reservation; aggregation reduces by (id, header epoch).
 func (s *Server) admitResizeReservation(
-	ctx context.Context, opID, method, principal string, vm *corrosion.VMRecord, cpuDelta, memDelta, wantCPU, wantMem int,
+	ctx context.Context, opID, method, principal, idemKey string, vm *corrosion.VMRecord, cpuDelta, memDelta, wantCPU, wantMem int,
 ) (*reservationLease, error) {
 	// The same host-safety gate as the equivalent UpdateVM grow
 	// (admitGrowWithReservation → admitReserved → checkHostSafety): a resize is
@@ -334,16 +326,7 @@ func (s *Server) admitResizeReservation(
 		return nil, status.Errorf(codes.Internal, "encode reservation: %v", err)
 	}
 
-	op := corrosion.OperationRecord{
-		ID:              opID,
-		Method:          method,
-		Principal:       principal,
-		Project:         vm.Project,
-		ResourceKind:    "vm",
-		ResourceID:      vm.Name,
-		OperationKind:   string(corrosion.OpResourceUpdateRunning),
-		ReservationJSON: resJSON,
-	}
+	op := resizeOperationRecord(opID, method, principal, idemKey, vm, int32(wantCPU), int32(wantMem), resJSON)
 	extra := s.runtimeLoad(ctx, vm.HostName) // outside admissionMu: see checkHostCapacityBefore
 	lease, err := s.decideReservation(ctx, op, vm.Project, "reserve capacity", func(id string) error {
 		if err := s.checkHostCapacityBefore(ctx, vm.HostName, cpuDelta, memDelta, id, extra); err != nil {
@@ -653,6 +636,27 @@ func (s *Server) RunResourceOperationRecovery(ctx context.Context) {
 		case <-t.C:
 			s.RecoverResourceOperations(ctx)
 		}
+	}
+}
+
+// resizeOperationRecord is the header of a live resize's workload operation.
+// admitResizeReservation writes it (for a grow) and BeginVMOperation writes it
+// otherwise, keeping whichever came first (INSERT OR IGNORE), so both build it
+// here: its owner epoch, request hash and idempotency key must be the same
+// whichever writes it.
+func resizeOperationRecord(opID, method, principal, idemKey string, vm *corrosion.VMRecord, wantCPU, wantMem int32, resJSON string) corrosion.OperationRecord {
+	return corrosion.OperationRecord{
+		ID:              opID,
+		Method:          method,
+		Principal:       principal,
+		Project:         vm.Project,
+		ResourceKind:    "vm",
+		ResourceID:      vm.Name,
+		OperationKind:   string(corrosion.OpResourceUpdateRunning),
+		RequestHash:     resizeRequestHash(vm.Name, wantCPU, wantMem),
+		IdempotencyKey:  idemKey,
+		ReservationJSON: resJSON,
+		VMOwnerEpoch:    vm.OwnerEpoch,
 	}
 }
 

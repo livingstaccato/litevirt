@@ -287,9 +287,126 @@ func TestSettleReasonClass_EveryReasonHasAClass(t *testing.T) {
 		"proof p1's certificate decides another incarnation":                                          "certificate_other_incarnation",
 		"proof p1's certificate decides owner epoch 2, older than the local copy's 3":                 "certificate_older_epoch",
 		"proof p1: too few valid accepts":                                                             "certificate_invalid",
+		"proof p1 completed on node-b but carries no recovery-claim certificate (minted while recovery claims were not enforced, as on a derived voter set)": "proof_uncertified",
 	} {
 		if got := settleReasonClass(reason); got != want {
 			t.Errorf("settleReasonClass(%q) = %q, want %q", reason, got, want)
 		}
+	}
+}
+
+// W1 drill on lab 1 (2026-10-15): the recovery ran on a DERIVED voter set, so
+// its proof completed on its destination with no certificate at all. Settle
+// stays certificate-only and leaves the paused copy alone, but the decline
+// must say which case this is: a completed, uncertified proof is not "no
+// proof", and the remedy must not send the operator to `lv cluster claim`,
+// which has no claim to show when none was decided.
+//
+// The fixture's verifier accepts anything, so a settle that verified an empty
+// certificate instead of declining would stop the copy and go red here.
+//
+// Mutations: drop the uncertified clause in settleDecide — the copy is
+// destroyed (or, with a strict verifier, the class is certificate_invalid);
+// drop the class — the class check goes red; reuse the claim remedy — the
+// remedy check goes red.
+func TestSettle_AnUncertifiedCompletedProofIsDeclinedAsSuch(t *testing.T) {
+	f := newSettleFixture(t)
+	f.proof.ClaimCertificate = ""
+	verified := 0
+	f.r.SetSettleVerifier(func(context.Context, corrosion.ActionProof) (corrosion.ClaimCertificate, error) {
+		verified++
+		return f.cert, nil
+	})
+	for i := 0; i < settleDeclineSightingsToReport; i++ {
+		if st := f.run(); st != libvirtfake.StatePaused {
+			t.Fatalf("vm-a is %s; settle needs a certificate, so the paused copy must stay paused", st)
+		}
+	}
+	if verified != 0 {
+		t.Fatalf("settle verified an empty certificate %d times; there is nothing to verify", verified)
+	}
+	_, ev, ok := settleDeclinedCondition(t, f)
+	if !ok {
+		t.Fatal("vm_settle_declined not raised for a paused copy settle cannot stop")
+	}
+	if ev.ReasonClass != "proof_uncertified" || !strings.Contains(ev.Reason, "proof-1") {
+		t.Fatalf("decline = class %q reason %q, want proof_uncertified naming proof-1", ev.ReasonClass, ev.Reason)
+	}
+	if strings.Contains(ev.Remedy, "lv cluster claim") {
+		t.Fatalf("remedy sends the operator to a claim that was never decided: %s", ev.Remedy)
+	}
+	for _, want := range []string{"derived voter set", "virsh domstate vm-a", "virsh destroy vm-a", "disks are kept"} {
+		if !strings.Contains(ev.Remedy, want) {
+			t.Fatalf("remedy lacks %q: %s", want, ev.Remedy)
+		}
+	}
+}
+
+// An uncertified proof earns the proof_uncertified reason, whose remedy tells
+// the operator to destroy the local copy, only when it can be about THIS copy's
+// move: live (not tombstoned), completed by its destination, at an owner epoch
+// at least the local copy's. A stale one (an older move of the name, since
+// undone) or a reaped one leaves the generic reason and its "confirm which copy
+// is current" remedy. And a certified proof's own failure is never masked by an
+// uncertified proof's reason.
+//
+// Mutations: drop the epoch check, or the tombstone check — the stale or
+// reaped case reads proof_uncertified; let the uncertified reason win over a
+// certified proof's — the mixed case reads proof_uncertified; let an
+// uncertified prepared proof set the reason — that case reads
+// proof_not_completed.
+func TestSettle_OnlyAProofForThisCopyIsDeclinedAsUncertified(t *testing.T) {
+	uncert := func(f *settleFixture) corrosion.ProofRecord {
+		p := f.proof
+		p.ID, p.ClaimCertificate = "proof-u", ""
+		return p
+	}
+	for _, tc := range []struct {
+		name   string
+		proofs func(f *settleFixture) []corrosion.ProofRecord
+		class  string
+	}{
+		{"stale epoch", func(f *settleFixture) []corrosion.ProofRecord {
+			p := uncert(f)
+			p.OwnerEpoch = "2" // the local copy is at 3
+			return []corrosion.ProofRecord{p}
+		}, "no_certificate"},
+		{"tombstoned", func(f *settleFixture) []corrosion.ProofRecord {
+			p := uncert(f)
+			p.Tombstoned = true
+			return []corrosion.ProofRecord{p}
+		}, "no_certificate"},
+		{"uncertified and prepared", func(f *settleFixture) []corrosion.ProofRecord {
+			p := uncert(f)
+			p.Status = corrosion.ProofPrepared
+			return []corrosion.ProofRecord{p}
+		}, "no_certificate"},
+		{"a certified proof's failure wins", func(f *settleFixture) []corrosion.ProofRecord {
+			f.certErr = errors.New("too few valid accepts")
+			return []corrosion.ProofRecord{f.proof, uncert(f)}
+		}, "certificate_invalid"},
+		{"a current uncertified proof", func(f *settleFixture) []corrosion.ProofRecord {
+			return []corrosion.ProofRecord{uncert(f)}
+		}, "proof_uncertified"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSettleFixture(t)
+			proofs := tc.proofs(f)
+			f.r.settleProofs = func(context.Context, *corrosion.Client, string, string) ([]corrosion.ProofRecord, error) {
+				return proofs, nil
+			}
+			for i := 0; i < settleDeclineSightingsToReport; i++ {
+				if st := f.run(); st != libvirtfake.StatePaused {
+					t.Fatalf("vm-a is %s, want still paused", st)
+				}
+			}
+			_, ev, ok := settleDeclinedCondition(t, f)
+			if !ok || ev.ReasonClass != tc.class {
+				t.Fatalf("decline class %q (raised %v), want %q: %s", ev.ReasonClass, ok, tc.class, ev.Reason)
+			}
+			if tc.class != "proof_uncertified" && !strings.Contains(ev.Remedy, "lv cluster claim") {
+				t.Fatalf("a %s decline lost the confirm-first remedy: %s", tc.name, ev.Remedy)
+			}
+		})
 	}
 }

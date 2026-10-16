@@ -19,6 +19,13 @@ litevirt uses QEMU's pre-copy memory migration:
 
 Progress is streamed to the CLI in real-time.
 
+Once a live migration completes, the target host sends gratuitous ARPs for the
+gateway of each network the VM has a NIC on (the first address of the
+network's IPv4 subnet), out of the bridge it serves that network on (after a
+network move it refused, the previous one) and from that bridge's MAC, when it
+holds that address there, the network is not on a VLAN and the bridge has
+no uplink. It needs no `arping`.
+
 ### Requirements
 
 - VM must be in `running` state
@@ -978,12 +985,15 @@ What happens next depends on the fence:
   progress.
 
 **A fence still stands** when some observer has probed the host and failed
-without a break since before the fence, and no observer's latest verdict shows
-the host answering (healthy or unready) since. The first holds however recent
-the fence is. A genuine fence follows a quorum of failing runs, so it always has
-one. A host that answered after its fence and then failed again has had the
-verdict that it answered overwritten, and only the failing runs' start shows the
-return.
+without a break since before the fence, no observer's latest verdict shows
+the host answering (healthy or unready) since, and no observer's failing run
+began after the fence. The first holds however recent the fence is. A genuine
+fence follows a quorum of failing runs, so it always has one. A host that
+answered after its fence and then failed again has had the verdict that it
+answered overwritten, and only the failing runs' start shows the return: a run
+that began more than 5 seconds after the fence counts as an answer. An observer
+that restarted, or began probing the host only after the fence, starts such a
+run too, and the fence then no longer stands.
 
 **When a failing run started** is read from the verdict: an observer's failing
 `host_health` row carries the time of its run's first failed probe in
@@ -997,7 +1007,12 @@ outage until an observer on the current build reports the host.
 **Clock skew.** The fence's time is the leader's clock and each observation is
 its observer's, so both comparisons give 5 seconds, the clock-skew alert
 threshold, to the safe side. A failing run must have begun at least 5 seconds
-before the fence, and an answer counts from 5 seconds before it. Greater skew
+before the fence, an answer counts from 5 seconds before it, and a run begun
+more than 5 seconds after it counts as an answer. The last has no slack beyond the
+threshold: a run reported by an observer whose clock runs behind by up to 5
+seconds is missed when it began within 5 seconds plus that skew after the
+fence, so a host that answered for less than that and failed again is seen
+only by an observer's latest verdict or the coordinator's own probes. Greater skew
 makes the checks refuse more, except in one direction: an observer whose clock
 runs more than 5 seconds **behind** the leader's can make a run look older than
 it is. Keep `litevirt_cluster_clock_skew_seconds` under 5 (see
@@ -1060,17 +1075,43 @@ after its boot write. Its boot can come up to 2 minutes after the SIGTERM and
 still keep the host `upgrading`, so the longest such a host is held unfenced
 is about 4 minutes from the SIGTERM. A daemon that serves late, past
 `upgrade_health_deadline_sec`, logs an error at the deadline and keeps
-checking, and is recorded `active` once it answers. Each of these boots `active`, as before:
+checking, and is recorded `active` once it answers. A write that records it
+`active` and fails is retried until it lands. A host still `upgrading` 2
+minutes on while its daemon runs raises `upgrading_unconfirmed`
+([diagnostics.md](diagnostics.md)): peers that reach it never fence it.
 
-- a crash, or a daemon that dies before serving (the marker is consumed);
+A boot with no marker (a crash, a kill, or a stop whose `upgrading` write
+failed, as every write of a WAL-quarantined daemon does) does the same for a
+host recorded `active`, or recorded `upgrading` less than 2 minutes ago: it
+records the host `upgrading` and turns it `active` once it answers its own
+Ping. Such a boot leaves a `boot-awaiting-serving` file in its `data_dir`
+until a daemon serves. Each of these boots `active`, as before:
+
+- a boot without the marker that finds `boot-awaiting-serving`: the daemon
+  before it never served, so a daemon that crash-loops before serving is
+  `upgrading` once and is then fenced on its failure count. A post-upgrade
+  boot leaves the file too;
+- a boot without the marker that follows 3 others within 10 minutes, counted
+  in `boot-unclean-history` in its `data_dir`: a daemon that serves and crashes
+  again and again is fenced on its failure count, as before;
 - a host that was not `active` when it was stopped. A fenced, offline or
   maintenance host keeps that state through the SIGTERM, and a draining one is
   recorded `upgrading` for the restart, as before;
-- a stop more than 2 minutes old;
-- a host recorded as something other than `upgrading` by the time it boots.
+- a stop, or an `upgrading` state without the marker, 2 minutes old or more.
+  A WAL-quarantined daemon writes nothing, so after a quarantine that lasted
+  longer than that, the next boot records the host `active` and can be
+  fenced before it serves;
+- a host recorded as something other than `upgrading` by the time it boots
+  (without the marker: other than `active` or `upgrading`).
 
 Recording the host `active` once it serves changes only an `upgrading` host,
 and never its isolation.
+
+A host the coordinator has already fenced that then records itself
+`upgrading` (it rebooted, and its boot write was made from a replica that still
+read it `active`) is judged afresh from that write, as an `active` boot write
+is: it is skipped for 2 minutes and fenced again if it has not served. A fence
+row older than the host's own `upgrading` write does not hold that fence back.
 
 The same holds for the proof-grade fence `lv host rm --dead` rests on, which
 counts at any age, and for the one a lost voter's removal, a superseded claim
@@ -1097,7 +1138,7 @@ A recovery refused for want of a confirmation — a `manual` fence, a
 `litevirt.fence_requires_confirmation` — resumes once an operator runs
 `lv host fence-confirm <host>`.
 
-The resume requires four things, not the confirmation alone:
+The resume requires five things, not the confirmation alone:
 
 1. **The cluster itself fenced the host** — a `fencing_log` row with result
    `fenced` or `partial`, which only a fence that ran writes.
@@ -1111,6 +1152,22 @@ The resume requires four things, not the confirmation alone:
 4. **The host is still down now** — a fresh quorum observes it failing. A host
    that has come back, or that an operator has put into `maintenance`, is never
    resumed.
+5. **Nobody has seen the host answer since the confirmation.** Some observer
+   has failed it without a break since at least 5 seconds before the
+   confirmation. No observer's latest verdict is an answer newer than 5
+   seconds before it, and no observer's failing run began more than 5 seconds
+   after it. The coordinator's own node has not probed the host healthy since
+   5 seconds before it. Otherwise the coordinator logs "the operator
+   confirmation does not stand for this outage, NOT acting on it" once per
+   confirmation (`phase=recovery, error_class=manual_unconfirmed`).
+   The host's stall reason names the confirmation and the remedy. Power the
+   host off, then run `lv host fence-confirm <host>` again. A confirmation
+   typed before the power-off, while a bridge still sees the host, is refused
+   the same way. A failing run begun after the confirmation is named in the
+   reason as "it saw the host answer, or its own daemon restarted": a
+   restart of that observer's daemon, the coordinator's own included, also
+   refuses. A refusal on the coordinator's own probe answer does not clear by
+   itself; confirm again.
 
 An observer's unbroken run of failed probes restarts when that observer's
 daemon restarts, so after every observer has restarted a genuine confirmation
@@ -1119,7 +1176,7 @@ then fences the host for the outage in progress, refuses for want of a
 confirmation, and resumes once you confirm again.
 
 `fence-confirm` has no precondition and runs no fence, so on its own a mistyped
-hostname could otherwise authorise a recovery. With all three required, a
+hostname could otherwise authorise a recovery. With all of these required, a
 mistype can only reach a host the cluster already fenced and still sees down.
 
 **A confirmation before any fence of this outage fences the host afresh.**
@@ -1136,7 +1193,9 @@ fence them first. Now, when all of these hold:
 - no fence attempt is at or after the confirmation, and no earlier attempt
   belongs to this outage;
 - the confirmation belongs to this outage: some observer has probed the host
-  and failed without a break since at least 5 seconds before it,
+  and failed without a break since at least 5 seconds before it, and nobody
+  has seen the host answer since it (item 5 above; a refusal is logged and
+  held the same way),
 
 the coordinator fences the host itself, as it would an `active` one, and logs
 "an operator confirmed this host off during the outage in progress, and no
@@ -1145,7 +1204,8 @@ error_class=confirmation_fence`). The confirmation authorises that fence, not
 the recovery: the recovery follows from the fresh fence under every gate a
 fence applies, and where one of them needs a confirmation (`manual`,
 `best-effort` under the safe-fence policy, the confirmation label) it accepts
-one under 5 minutes old. An older one leaves the host `offline` after the fence
+one under 5 minutes old that still stands (item 5) and was written since the
+host last turned active. An older one leaves the host `offline` after the fence
 with the usual refusal in the log; confirm again and the recovery resumes from
 it. A confirmation older than the outage, of a host that has answered since,
 still authorises nothing, and the coordinator logs "the newest fence attempt
@@ -1410,6 +1470,37 @@ The restart is not silent, and the real disk is not lost:
   running there or holds a saved state.
 - An old copy that a restart sets aside, as above, is recorded the same way on
   the host that holds it.
+- When the VM is deleted (`lv rm`, with or without `--keep-disks`), the host
+  that holds its disk clears the record on its next pass, or once it is back
+  if it was down then. After `lv rm`, a disk still at its path is renamed to
+  `<disk path>.superseded-<time>` first, so it is kept like any other copy;
+  this waits while a domain of the VM's name runs on that host. After
+  `lv rm --keep-disks`, and for a disk recorded `delete_with_vm=false`, the
+  disk stays at its path. It also stays there when the record does not say
+  what the delete decided: a delete by an earlier release, or one whose mark
+  on the record was lost to a later write of it. The host also removes the
+  VM's cloud-init seed there (`cloudinit/<vm>.iso`) if this release wrote it;
+  a seed from an earlier release stays.
+- A VM of the same name created on that host before then clears
+  `<data_dir>/disks/<vm>-<disk>.qcow2` files the earlier VM left. Of those, a
+  disk that a failover left at its path is first renamed to
+  `<disk path>.superseded-<time>`. One the delete kept is first renamed to
+  `<disk path>.kept-<time>`, which no sweep removes. A file that another VM
+  uses, as its disk or as the base of a linked clone, stays where it is.
+  Each rename is a `vm.disk.set_aside` or `vm.disk.kept` event of the VM.
+  The create is refused, and nothing is created, while that host's replica
+  has not caught up with the cluster and such a file is there, while what is
+  at one of those paths cannot be read, or when a rename fails. The message
+  names the path and the cause. Retry once the replica has caught up or the
+  storage answers, or place the VM on another host. A path that does not
+  exist does not refuse the create. When the record lists a path that does
+  not exist and its directory is absent, empty or cannot be listed, as a
+  volume not mounted yet reads, the create goes ahead, the record stays open,
+  and a `vm.disk.path_missing` event of the VM names the path.
+
+A cloud-init seed is used only by the VM it was written for: a host that
+holds the seed of a deleted VM writes a new one from the VM's own settings
+when another VM of that name starts there, fails over to it or migrates to it.
 
 A copy is retained while the VM it came from exists, in any state: the host
 never removes it on its own. While that VM is in `error`, `pending` or
@@ -1423,7 +1514,8 @@ rebuilt disk the only copy of its data from before the failover was deleted.
 
 To see the copies on a host, with the VM each came from, when it was set aside
 and whether it is retained or held, run `lv host superseded-disks <host>`.
-These need the admin role and are audited:
+It also lists each `.kept-` file there, marked `kept`, which none of the
+options below takes. The options need the admin role and are audited:
 
 - `--purge` removes every copy that is neither retained nor held, whatever its
   age; `--older-than <duration>` narrows it (`host.superseded_disks.purge`).

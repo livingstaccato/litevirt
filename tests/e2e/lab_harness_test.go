@@ -710,13 +710,63 @@ func (l *lab) waitDaemon(host string, timeout time.Duration) error {
 	return fmt.Errorf("%s: daemon not ready within %v: %v", host, timeout, last)
 }
 
-// restartDaemon restarts litevirt on host and waits for it.
-func (l *lab) restartDaemon(host string) error {
+// restartOpt adjusts restartDaemon.
+type restartOpt int
+
+// anyState: the caller does not expect the host to come back HOST_ACTIVE
+// (maintenance, fenced, still joining), so only the daemon answering is awaited.
+const anyState restartOpt = 1
+
+// restartDaemon restarts litevirt on host and waits until it is serving
+// (HOST_ACTIVE in its own `host ls`), unless the anyState option says the
+// caller expects another state.
+func (l *lab) restartDaemon(host string, opts ...restartOpt) error {
 	if _, err := l.ssh(host, time.Minute, "systemctl restart litevirt"); err != nil {
 		return err
 	}
 	l.mark("daemon: restarted on %s", host)
-	return l.waitDaemon(host, 3*time.Minute)
+	for _, o := range opts {
+		if o == anyState {
+			return l.waitDaemon(host, 3*time.Minute)
+		}
+	}
+	return l.waitServing(host, 3*time.Minute)
+}
+
+// waitServing is waitDaemon plus: the host's own view lists it HOST_ACTIVE. A
+// restarted daemon answers its CLI while still recording HOST_DRAINING (the
+// "upgrading, serving after ~28 s" boot state), and a test that returns then
+// makes the next test's baseline fail. A host its own `host ls` does not list
+// at all (not yet a member) is not held to this. The whole wait, including each
+// lv call, ends by timeout.
+func (l *lab) waitServing(host string, timeout time.Duration) error {
+	start := time.Now()
+	end := start.Add(timeout)
+	if err := l.waitDaemon(host, timeout); err != nil {
+		return err
+	}
+	state, seen := "", "no host ls answered"
+	for {
+		left := time.Until(end)
+		if left <= 0 {
+			break
+		}
+		if left > 30*time.Second {
+			left = 30 * time.Second
+		}
+		if out, err := l.lvTimeout(host, left, "host", "ls"); err == nil {
+			state = parseHostStates(out)[host]
+			seen = fmt.Sprintf("last seen state %q", state)
+			if state == "" || state == "HOST_ACTIVE" {
+				l.mark("daemon: %s serving (%q) %v after the restart", host, state, time.Since(start).Round(time.Second))
+				return nil
+			}
+		} else {
+			seen = "last host ls error: " + err.Error()
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return fmt.Errorf("%s: daemon answers but is not HOST_ACTIVE %v after the restart (%s)", host, timeout, seen)
 }
 
 // freezeDaemon SIGSTOPs host's litevirt daemon and returns the thaw. The
@@ -765,12 +815,16 @@ awk -v l="${ind}%[2]s: %[3]s" '/^enforcement:/{f=1;next} f && /^[^ #]/{f=0} f &&
 
 // setEnforcement sets enforcement.<key> on host and restarts its daemon. The
 // original config is kept beside it and put back by restoreConfig.
-func (l *lab) setEnforcement(host, key, value string) error {
+//
+// The callers (drill_recovery, drill_witness) set it on hosts the baseline has
+// just required HOST_ACTIVE, so it waits for HOST_ACTIVE; pass anyState for a
+// host that may be in maintenance or fenced.
+func (l *lab) setEnforcement(host, key, value string, opts ...restartOpt) error {
 	if _, err := l.ssh(host, 30*time.Second, enforcementEditScript("/etc/litevirt/config.yaml", key, value)); err != nil {
 		return err
 	}
 	l.mark("config: %s enforcement.%s=%s", host, key, value)
-	return l.restartDaemon(host)
+	return l.restartDaemon(host, opts...)
 }
 
 // restoreConfig puts host's original config back and restarts its daemon, if
@@ -781,7 +835,8 @@ func (l *lab) restoreConfig(host string) (bool, error) {
 		return false, err
 	}
 	l.mark("config: %s restored", host)
-	return true, l.restartDaemon(host)
+	// Restore runs after drills that may leave the host fenced or in maintenance.
+	return true, l.restartDaemon(host, anyState)
 }
 
 // ─── Cluster state ──────────────────────────────────────────────────────────
@@ -794,6 +849,11 @@ func (l *lab) hostStates(via string) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseHostStates(out), nil
+}
+
+// parseHostStates is host name → HOST_* state from `lv host ls` output.
+func parseHostStates(out string) map[string]string {
 	m := map[string]string{}
 	for _, line := range strings.Split(out, "\n") {
 		f := strings.Fields(line)
@@ -801,7 +861,7 @@ func (l *lab) hostStates(via string) (map[string]string, error) {
 			m[f[0]] = f[2]
 		}
 	}
-	return m, nil
+	return m
 }
 
 // voterSet parses `lv cluster voter ls` on via: generation and members.
@@ -1096,6 +1156,16 @@ func (l *lab) putFile(host, path, content string) {
 	l.onRestore(func() { l.ssh(host, 30*time.Second, "rm -f "+shellQuote(path)) })
 }
 
+// firmwareLineFor is the compose line that boots the small drill image under
+// BIOS: a 128 MiB cirros under the default UEFI firmware never boots ("can't
+// allocate kernel"). Any other image keeps the default firmware.
+func firmwareLineFor(image string) string {
+	if image == drillImage() {
+		return "    firmware: bios\n"
+	}
+	return ""
+}
+
 // createStackOf is createStack with an image and memory of its own.
 func (l *lab) createStackOf(via, prefix string, roomOnly bool, image, memory string, hosts ...string) map[string]string {
 	l.t.Helper()
@@ -1106,7 +1176,7 @@ func (l *lab) createStackOf(via, prefix string, roomOnly bool, image, memory str
 	for i, h := range hosts {
 		n := fmt.Sprintf("%s-%d", stack, i+1)
 		names[h] = n
-		fmt.Fprintf(&b, "  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    placement:\n      host: %s\n    migrate:\n      on-host-failure: restart-any\n", n, image, memory, h)
+		fmt.Fprintf(&b, "  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n%s    placement:\n      host: %s\n    migrate:\n      on-host-failure: restart-any\n", n, image, memory, firmwareLineFor(image), h)
 	}
 	file := "/tmp/" + stack + ".yaml"
 	l.putFile(via, file, b.String())

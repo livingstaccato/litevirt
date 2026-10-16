@@ -412,6 +412,13 @@ type LoaderOptions struct {
 	// (litevirt_firewall_tag_group_members).
 	OnTagGroupMembers func(membersByGroup map[string]int)
 
+	// OnDuplicateAddresses, when set, receives after every pass the
+	// addresses on host-isolated networks that live NIC rows of more than one
+	// workload hold (corrosion.HostIsolatedDuplicateAddrs); nil or empty
+	// means none. A failure to read them is logged and does not fail the
+	// pass. The daemon reports them with DuplicateAddressReporter.
+	OnDuplicateAddresses func(ctx context.Context, dups []corrosion.DuplicateAddress)
+
 	// Arming, when set, names VMs rendered here whatever host their row
 	// names and NICs whose rows are not written yet (see Arming).
 	Arming *Arming
@@ -485,11 +492,11 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		if err != nil {
 			return plan, err
 		}
-		ipsets, reservedSets := leaveOutReserved(ipsets)
+		// A user set named for one of litevirt's own, a tag group's lv_tg_*
+		// included, is left out there (userSetName).
 		var badSets []InvalidRow
 		var degraded map[string]bool
 		plan.IPSets, badSets, degraded = quarantineIPSets(ipsets)
-		badSets = append(reservedSets, badSets...)
 		plan.IPSets = append(plan.IPSets, tg.sets()...)
 		prevRules, emptySince := memory.snapshot()
 		q := newQuarantine(plan.IPSets, degraded, prevRules, emptySince, passNow)
@@ -622,9 +629,15 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		// NIC guards. A read failure fails the pass like any other, keeping
 		// the applied ruleset: dropping the guards instead would unguard every
 		// NIC on the host while the database is unreadable.
-		guards, err := corrosion.ListNICGuards(ctx, db)
+		allGuards, err := corrosion.ListNICGuardsWithDeleted(ctx, db)
 		if err != nil {
 			return plan, err
+		}
+		guards := make(map[string]corrosion.NICGuardRecord, len(allGuards))
+		for k, r := range allGuards {
+			if !r.Deleted {
+				guards[k] = r
+			}
 		}
 		nets, err := corrosion.NetworkGuardInfos(ctx, db)
 		if err != nil {
@@ -633,6 +646,13 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		assigned, err := corrosion.NetworkAssignedAddrs(ctx, db)
 		if err != nil {
 			return plan, err
+		}
+		if opts.OnDuplicateAddresses != nil {
+			if dups, derr := corrosion.HostIsolatedDuplicateAddrs(ctx, db); derr != nil {
+				slog.Warn("firewall: could not check host-isolated networks for duplicate addresses", "error", derr)
+			} else {
+				opts.OnDuplicateAddresses(ctx, dups)
+			}
 		}
 		// The trunk VLANs recorded at upgrade (re-review R3-I1): once the
 		// recording has run, a trunk carries only what its network allows,
@@ -657,9 +677,18 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		// recordOf is the NIC's guard record — only one written for the
 		// incarnation that runs now: a record an earlier VM of the same name
 		// and MAC left guards nothing (re-review m1).
+		//
+		// A NIC rendered here has a live row (or is pending): a retired
+		// record of its incarnation over it is a write order this replica
+		// saw out of order, and guards it by default
+		// (corrosion.RetiredGuardOver).
 		recordOf := func(ifc corrosion.HostVMNIC) (corrosion.NICGuardRecord, bool) {
-			rec, ok := guards[corrosion.NICGuardKey(ifc.VMName, ifc.MAC)]
-			if ok && rec.VMUUID != "" && ifc.VMUUID != "" && rec.VMUUID != ifc.VMUUID {
+			key := corrosion.NICGuardKey(ifc.VMName, ifc.MAC)
+			rec, ok := guards[key]
+			if !ok {
+				return corrosion.RetiredGuardOver(allGuards[key], ifc.VMUUID, nets[ifc.NetworkName].Type, ifc.NetworkName)
+			}
+			if rec.VMUUID != "" && ifc.VMUUID != "" && rec.VMUUID != ifc.VMUUID {
 				return corrosion.NICGuardRecord{}, false
 			}
 			return rec, ok
@@ -808,6 +837,22 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			}
 		}
 		sort.Strings(plan.Gateways)
+		// Every live isolated network's bridge: forwarding off it is dropped
+		// (renderIsolatedForward), as it is for every bridge in the group.
+		isolated := map[string]bool{}
+		for _, info := range nets {
+			if info.IsolatedBridge != "" {
+				isolated[info.IsolatedBridge] = true
+			}
+		}
+		plan.IsolatedBridges = plan.IsolatedBridges[:0:0]
+		for br := range isolated {
+			// The group lines still hold a name the renderer would refuse.
+			if safeIfName(br) {
+				plan.IsolatedBridges = append(plan.IsolatedBridges, br)
+			}
+		}
+		sort.Strings(plan.IsolatedBridges)
 		var lbHosts map[string]bool
 		if plan.LBBackends, plan.LBSources, lbHosts, err = loadLBBackends(ctx, db); err != nil {
 			return plan, err

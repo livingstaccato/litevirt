@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -139,8 +140,24 @@ func settleDecide(self string, row *corrosion.VMRecord, local localCopyID, proof
 		return none, corrosion.ClaimCertificate{}, "no destination runtime check"
 	}
 	why := fmt.Sprintf("no verified recovery-claim certificate gives this incarnation to %s at owner epoch >= %d", row.HostName, local.Epoch)
+	initial, uncertified := why, ""
 	for _, p := range proofs {
 		if p.TargetKind != corrosion.ClaimKindVM || p.TargetName != row.Name || p.DestHost != row.HostName || p.DestHost == self {
+			continue
+		}
+		// Minted while recovery claims were not enforced (a derived voter
+		// set): no majority certified it, and settle acts on nothing weaker
+		// (F9). It is named as such — a remedy that stops the local copy —
+		// only when it can be THIS copy's move: live, completed by its
+		// destination, at an owner epoch at least the local copy's. Any other
+		// uncertified proof is no evidence either way and says nothing.
+		if p.ClaimCertificate == "" {
+			if e, err := strconv.ParseInt(p.OwnerEpoch, 10, 64); err == nil && e >= local.Epoch && !p.Tombstoned {
+				if _, ok := proofExecutedByDest(p); ok {
+					uncertified = fmt.Sprintf("proof %s completed on %s but carries no recovery-claim certificate "+
+						"(minted while recovery claims were not enforced, as on a derived voter set)", p.ID, p.DestHost)
+				}
+			}
 			continue
 		}
 		// A decided claim is not yet a running replacement: the proof must
@@ -175,6 +192,11 @@ func settleDecide(self string, row *corrosion.VMRecord, local localCopyID, proof
 			continue
 		}
 		return p, cert, ""
+	}
+	// Only when no certified proof gave a reason of its own: a certified
+	// proof's failure is the one an operator must see.
+	if why == initial && uncertified != "" {
+		why = uncertified
 	}
 	return none, corrosion.ClaimCertificate{}, why
 }
@@ -222,7 +244,7 @@ func (r *Reconciler) settleCertifiedMove(ctx context.Context, domName string, vm
 	}
 	lister := r.settleProofs
 	if lister == nil {
-		lister = corrosion.CertifiedTransferProofs
+		lister = corrosion.TransferProofs
 	}
 	proofs, err := lister(ctx, r.db, corrosion.ClaimKindVM, domName)
 	if err != nil {

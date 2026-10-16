@@ -73,7 +73,7 @@ func isoVMWith(l *lab, via, host, extra string) string {
 	l.t.Helper()
 	stack := uniqueName("isomv")
 	name := stack + "-1"
-	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    iso: %s/x.iso\n%s    placement:\n      host: %s\n",
+	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    firmware: bios\n    iso: %s/x.iso\n%s    placement:\n      host: %s\n",
 		stack, name, drillImage(), drillMemory(), isoLinkDir, extra, host)
 	file := "/tmp/" + stack + ".yaml"
 	l.putFile(via, file, yaml)

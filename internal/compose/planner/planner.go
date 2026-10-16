@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -106,8 +108,11 @@ type NetworkAction struct {
 
 // LBAction describes load balancer setup or teardown.
 type LBAction struct {
-	Kind        OpKind
-	Name        string
+	Kind   OpKind
+	Name   string
+	VMName string // the compose VM whose loadbalancer this is (compose.BuildLBSpec)
+	// VIP, Algorithm and Ports are for display (Detail, the plan). The apply
+	// builds the LB from its definition, which carries more than these.
 	VIP         string
 	Algorithm   string
 	Ports       []lb.Port
@@ -790,7 +795,10 @@ func resolveNetworkTargets(plan *ResolvedPlan, f *compose.File, vmHostMap map[st
 func resolveLBs(f *compose.File, vmHostMap map[string]string, state *ClusterState) []LBAction {
 	var actions []LBAction
 
-	for baseName, vmDef := range f.VMs {
+	// Sorted: one LB per stack, so with two definitions the same one is
+	// planned on every deploy.
+	for _, baseName := range slices.Sorted(maps.Keys(f.VMs)) {
+		vmDef := f.VMs[baseName]
 		if vmDef.LoadBalancer == nil || !vmDef.LoadBalancer.Enabled {
 			continue
 		}
@@ -843,6 +851,7 @@ func resolveLBs(f *compose.File, vmHostMap map[string]string, state *ClusterStat
 		actions = append(actions, LBAction{
 			Kind:        kind,
 			Name:        lbName,
+			VMName:      baseName,
 			VIP:         lbDef.VIP,
 			Algorithm:   lbDef.Algorithm,
 			Ports:       ports,

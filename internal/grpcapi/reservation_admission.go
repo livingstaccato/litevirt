@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -134,6 +135,11 @@ const releaseTimeout = 10 * time.Second
 type reservationLease struct {
 	s  *Server
 	id string
+	// ownerEpoch is the epoch of the operation header id names. The release
+	// step goes there: a terminal at any other epoch leaves the reservation
+	// counting. Zero for every capacity lease; a resize's lease is the VM's
+	// workload operation, whose header is at the VM's owner epoch.
+	ownerEpoch int64
 	// hostHolder is the daemon holding the HOST half when it is not this node —
 	// a destination-owned migration lease (acquireDestinationHostLease). The
 	// operation row lives in the DESTINATION's database, so release must travel
@@ -249,7 +255,7 @@ func (l *reservationLease) release(ctx context.Context) {
 		return
 	}
 	if err := corrosion.AppendOperationStep(rctx, l.s.db, corrosion.OperationStepRecord{
-		OperationID: id, StepName: corrosion.OpStepCompleted,
+		OperationID: id, OwnerEpoch: l.ownerEpoch, StepName: corrosion.OpStepCompleted,
 	}); err != nil {
 		// A failed release leaks the reservation until the sweep ages it out. Log
 		// it as well as counting it: noteStateWriteFail only feeds a metric, and a
@@ -300,11 +306,15 @@ func (s *Server) admitGrowWithReservation(
 		cpuDelta, memDelta, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta}, true, intentResourceGrow)
 }
 
-// admitWithReservationID is admitWithReservation with an explicit operation ID.
+// admitWithReservationID is admitWithReservation with an explicit operation ID,
+// for tests that need claims with chosen ids to order them.
 //
-// This exists for paths where the operation identity is already known (for
-// example, ResizeVMLive derives a deterministic ID from an idempotency key and
-// then needs admission/verification to participate in the same winner election).
+// It writes a CAPACITY lease: a capacity-kind header at owner epoch 0, which the
+// stale-lease sweep expires. Never pass it a workload operation's id. A
+// workload operation's reservation must be written as that operation's header,
+// at the VM's owner epoch (admitResizeReservation); a capacity lease under its
+// id would be expired from under it, and its terminal steps — at the VM's
+// epoch — would never release one at epoch 0.
 func (s *Server) admitWithReservationID(
 	ctx context.Context, opID, method, host, project, resourceID string, cpuDelta, memDelta int, intent admissionIntent,
 ) (*reservationLease, error) {
@@ -393,11 +403,11 @@ func (s *Server) reserveWithoutCheckFor(
 	if err := corrosion.InsertOperation(ctx, s.db, op); err != nil {
 		return nil, status.Errorf(codes.Internal, "reserve capacity: %v", err)
 	}
-	lease := &reservationLease{s: s, id: op.ID}
+	lease := &reservationLease{s: s, id: op.ID, ownerEpoch: op.VMOwnerEpoch}
 	// Same reason admitReserved stamps: an unattributed reservation is not counted
 	// by capacity aggregation once the project has an authority epoch, so the lease
 	// would hold nothing and the draw would stay invisible after all.
-	if err := s.stampReservationAuthority(ctx, op.ID, project); err != nil {
+	if err := s.stampReservationAuthority(ctx, op.ID, op.VMOwnerEpoch, project); err != nil {
 		lease.release(ctx)
 		return nil, err
 	}
@@ -548,15 +558,41 @@ func (s *Server) decideReservation(ctx context.Context, op corrosion.OperationRe
 	verify func(opID string) error) (*reservationLease, error) {
 	s.admissionMu.Lock()
 	defer s.admissionMu.Unlock()
-	if err := corrosion.InsertOperation(ctx, s.db, op); err != nil {
+	// A deterministic id (a resize's, from its idempotency key) can already have
+	// a header from an earlier attempt. That attempt's claim is its own: it is
+	// neither re-decided nor released here, and the retry is refused.
+	existing, created, err := corrosion.ClaimOrFindOperation(ctx, s.db, op)
+	if errors.Is(err, corrosion.ErrOperationHashConflict) {
+		return nil, status.Errorf(codes.AlreadyExists,
+			"%s: idempotency key already used for a different request (operation %s)", what, op.ID)
+	}
+	if err != nil {
+		// A reaped (tombstoned) header still holds its id, so the insert fails on
+		// the primary key; the earlier request finished long ago.
+		if rows, qerr := s.db.Query(ctx,
+			`SELECT 1 FROM operations WHERE id = ? AND deleted_at IS NOT NULL`, op.ID); qerr == nil && len(rows) != 0 {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"%s: an earlier request with the same idempotency key used operation %s, which has since been "+
+					"removed, so its outcome is unknown; check the current size before resubmitting with a new "+
+					"idempotency key", what, op.ID)
+		}
 		return nil, status.Errorf(codes.Internal, "%s: %v", what, err)
 	}
-	lease := &reservationLease{s: s, id: op.ID}
+	if !created {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%s: an earlier request with the same idempotency key already decided operation %s (%s); "+
+				"retry with a new idempotency key", what, op.ID, operationStateAt(ctx, s.db, existing))
+	}
+	// Every step of the claim — reserved, admitted, and the release's terminal —
+	// is written at the header's owner epoch, because aggregation reduces an
+	// operation by (id, header epoch). Zero for a capacity lease; the VM's epoch
+	// for a resize, whose lease is the workload operation itself.
+	lease := &reservationLease{s: s, id: op.ID, ownerEpoch: op.VMOwnerEpoch}
 	// Attribute the reservation to the project's CURRENT authority. Capacity
 	// aggregation refuses to count a reservation it cannot attribute once an epoch
 	// exists, so skipping this would make the lease consume nothing — the same
 	// headroom handed to the next admission while this one is still holding it.
-	if err := s.stampReservationAuthority(ctx, op.ID, project); err != nil {
+	if err := s.stampReservationAuthority(ctx, op.ID, op.VMOwnerEpoch, project); err != nil {
 		lease.release(ctx)
 		return nil, err
 	}
@@ -567,7 +603,7 @@ func (s *Server) decideReservation(ctx context.Context, op corrosion.OperationRe
 	if h := s.admissionVerifiedHook; h != nil {
 		h(op.ID)
 	}
-	if err := corrosion.MarkReservationAdmitted(ctx, s.db, op.ID); err != nil {
+	if err := corrosion.MarkReservationAdmitted(ctx, s.db, op.ID, op.VMOwnerEpoch); err != nil {
 		// Unmarked, the claim would hold nothing against a smaller id arriving
 		// later. Refuse rather than admit on a claim the others cannot see won.
 		lease.release(ctx)
@@ -737,4 +773,22 @@ func (s *Server) admitQuotaWithReservation(
 	return s.decideReservation(ctx, op, project, "reserve project quota", func(id string) error {
 		return s.checkProjectQuotaBefore(ctx, project, delta, id)
 	})
+}
+
+// operationStateAt describes an operation's state at its header's owner epoch,
+// for a refusal message.
+func operationStateAt(ctx context.Context, db *corrosion.Client, op *corrosion.OperationRecord) string {
+	steps, err := corrosion.ListOperationSteps(ctx, db, op.ID, op.VMOwnerEpoch)
+	if err != nil {
+		return "state unreadable"
+	}
+	names := make([]string, len(steps))
+	for i, st := range steps {
+		names[i] = st.StepName
+	}
+	state, _ := corrosion.ReduceOperationState(corrosion.OperationKind(op.OperationKind), names)
+	if state == "" {
+		state = "no steps"
+	}
+	return "state " + state
 }

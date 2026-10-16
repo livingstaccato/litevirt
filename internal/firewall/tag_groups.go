@@ -306,24 +306,6 @@ func (t *tagPass) emptySets() []IPSet {
 	return out
 }
 
-// leaveOutReserved removes the user ip sets named with the tag-group prefix:
-// such a set would be merged into a group's (widening who its rules match)
-// or declared twice.
-func leaveOutReserved(sets []corrosion.IPSet) ([]corrosion.IPSet, []InvalidRow) {
-	var out []corrosion.IPSet
-	var inv []InvalidRow
-	for _, s := range sets {
-		if strings.HasPrefix(s.Name, TagGroupSetPrefix) {
-			inv = append(inv, InvalidRow{Table: "ip_sets", ID: s.ID,
-				Reason:   fmt.Sprintf("ip set %q: the prefix %q names tag groups' sets", s.Name, TagGroupSetPrefix),
-				Handling: HandlingSetLeftOut})
-			continue
-		}
-		out = append(out, s)
-	}
-	return out, inv
-}
-
 // isAccept reports whether a stored action accepts ("" is accept); any other
 // action is handled as a deny, which fails closed.
 func isAccept(action string) bool {

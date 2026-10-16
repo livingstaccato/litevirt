@@ -1478,11 +1478,34 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	var netCfg []lv.NetworkConfig
 	var ifaceRecords []corrosion.InterfaceRecord
 	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics); only persisted on the renamed (new-row) path below
-	for i, n := range spec.Network {
-		mac := n.Mac
-		if renamed || mac == "" {
-			mac = lv.GenerateMAC()
+	// A takeover keeps the VM's NIC rows and guard records, so its domain
+	// carries exactly its live NICs (MergedVMNICs): the spec still lists a
+	// detached NIC, whose guard record is retired, and lacks a hot-attached one.
+	var takeoverNICs []corrosion.NICRecord
+	if !renamed {
+		var nerr error
+		if takeoverNICs, nerr = corrosion.MergedVMNICs(ctx, s.db, vm.Name); nerr != nil {
+			removeLive()
+			return status.Errorf(codes.Internal, "read the NICs of %q: %v", vm.Name, nerr)
 		}
+	}
+	for _, n := range takeoverNICs {
+		bridge := network.FlatBridgeName(n.NetworkName)
+		if err := s.ensureBridge(bridge); err != nil {
+			removeLive()
+			return status.Errorf(codes.FailedPrecondition, "network bridge %q unavailable on %q: %v", bridge, s.hostName, err)
+		}
+		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: n.MAC, SpecOrdinal: n.Ordinal + 1,
+			RateMBps: compose.NICRate(&spec, n.Ordinal, n.NetworkName)})
+	}
+	// A renamed promotion is a second VM: its NICs are the spec's, with fresh
+	// MACs.
+	var renamedNICs []*pb.NetworkAttachment
+	if renamed {
+		renamedNICs = spec.Network
+	}
+	for i, n := range renamedNICs {
+		mac := lv.GenerateMAC()
 		// The spec records the NIC's real MAC (as a clone does), so its queues
 		// are matched at every later redefine, not lost to the source's MAC.
 		n.Mac = mac
@@ -1550,7 +1573,11 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// Define + start — skipped on a resume where the domain was already started by
 	// this proof (guarded above at the destroy step); persist below is idempotent.
 	compose.ApplyDiskTuning(diskCfg, &spec)
-	compose.ApplyNICTuningByPosition(netCfg, &spec)
+	if renamed {
+		compose.ApplyNICTuningByPosition(netCfg, &spec)
+	} else {
+		compose.ApplyNICTuning(netCfg, &spec)
+	}
 	if !started {
 		if replaceDomain {
 			// Force takeover, now that nothing is left to refuse: the domain

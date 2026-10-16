@@ -63,6 +63,15 @@ func (s *IPScanner) scanVMs(ctx context.Context) {
 		return
 	}
 
+	// Every running VM's NICs with no recorded address, looked up as one
+	// batch: the peers a vxlan lease may be on are asked once per pass, within
+	// scanPeerLeaseBudget, however many NICs wait (discoverNICAddressesWithPeers).
+	type pendingNIC struct {
+		vm    corrosion.VMRecord
+		iface corrosion.InterfaceRecord
+	}
+	var pending []pendingNIC
+	var queries []nicQuery
 	for _, vm := range vms {
 		if vm.State != "running" {
 			continue
@@ -72,50 +81,56 @@ func (s *IPScanner) scanVMs(ctx context.Context) {
 			if iface.IP != "" {
 				continue
 			}
-			ip := s.server.discoverNICAddress(ctx, iface.MAC, iface.NetworkName)
-			if ip == "" {
-				continue
-			}
+			pending = append(pending, pendingNIC{vm: vm, iface: iface})
+			queries = append(queries, nicQuery{mac: iface.MAC, network: iface.NetworkName})
+		}
+	}
+	ips := s.server.discoverNICAddressesWithPeers(ctx, queries, scanPeerLeaseBudget)
+	for i, p := range pending {
+		vm, iface := p.vm, p.iface
+		ip := ips[i]
+		if ip == "" {
+			continue
+		}
 
-			// GATED, not written directly. On a NetBox-bound network the address
-			// is recorded only once NetBox has granted it to this NIC; on an
-			// unbound one this is the write it always was. See
-			// netbox_discovery.go — this tick is the pass that DOES claim, which
-			// is why the read RPCs can leave it to us.
-			recorded := s.server.claimAndRecordDiscoveredVMIP(ctx, &vm, iface.NetworkName, iface.MAC, ip)
-			slog.Debug("ip_scanner: discovered IP",
-				"vm", vm.Name, "network", iface.NetworkName, "ip", ip, "recorded", recorded)
+		// GATED, not written directly. On a NetBox-bound network the address
+		// is recorded only once NetBox has granted it to this NIC; on an
+		// unbound one this is the write it always was. See
+		// netbox_discovery.go — this tick is the pass that DOES claim, which
+		// is why the read RPCs can leave it to us.
+		recorded := s.server.claimAndRecordDiscoveredVMIP(ctx, &vm, iface.NetworkName, iface.MAC, ip)
+		slog.Debug("ip_scanner: discovered IP",
+			"vm", vm.Name, "network", iface.NetworkName, "ip", ip, "recorded", recorded)
 
-			// The FDB entry is deliberately OUTSIDE that gate, below: it maps a
-			// MAC to a VTEP and carries no address at all, so it is L2
-			// reachability for a guest that exists either way. Suppressing it
-			// would black-hole a running VM over an address bookkeeping dispute.
+		// The FDB entry is deliberately OUTSIDE that gate, below: it maps a
+		// MAC to a VTEP and carries no address at all, so it is L2
+		// reachability for a guest that exists either way. Suppressing it
+		// would black-hole a running VM over an address bookkeeping dispute.
 
-			// Update DNS record so VM is reachable by name — but only for an
-			// address litevirt actually recorded. A DNS record asserts the same
-			// address to a second reader, so publishing one the NIC row was not
-			// allowed to carry would put the two records into exactly the
-			// disagreement the gate exists to prevent.
-			if domain := s.server.dnsDomain; recorded && domain != "" {
-				dnsName := dns.VMRecordName(vm.Name, vm.StackName, domain)
-				if err := dns.UpsertRecord(ctx, s.db, dnsName, ip); err != nil {
-					slog.Warn("ip_scanner: DNS upsert failed", "vm", vm.Name, "error", err)
-				}
+		// Update DNS record so VM is reachable by name — but only for an
+		// address litevirt actually recorded. A DNS record asserts the same
+		// address to a second reader, so publishing one the NIC row was not
+		// allowed to carry would put the two records into exactly the
+		// disagreement the gate exists to prevent.
+		if domain := s.server.dnsDomain; recorded && domain != "" {
+			dnsName := dns.VMRecordName(vm.Name, vm.StackName, domain)
+			if err := dns.UpsertRecord(ctx, s.db, dnsName, ip); err != nil {
+				slog.Warn("ip_scanner: DNS upsert failed", "vm", vm.Name, "error", err)
 			}
+		}
 
-			// Broadcast unicast FDB entry for VXLAN networks.
-			nr, err := corrosion.GetNetwork(ctx, s.db, iface.NetworkName)
-			if err != nil || nr == nil || nr.Type != "vxlan" {
-				continue
-			}
-			var def compose.NetworkDef
-			if err := json.Unmarshal([]byte(nr.Config), &def); err != nil || def.VNI == 0 {
-				continue
-			}
-			localVTEP := s.server.getHostVTEP(ctx, iface.NetworkName, s.hostName)
-			if localVTEP != "" {
-				s.server.broadcastFDBUpdate(ctx, iface.NetworkName, def.VNI, iface.MAC, "", localVTEP)
-			}
+		// Broadcast unicast FDB entry for VXLAN networks.
+		nr, err := corrosion.GetNetwork(ctx, s.db, iface.NetworkName)
+		if err != nil || nr == nil || nr.Type != "vxlan" {
+			continue
+		}
+		var def compose.NetworkDef
+		if err := json.Unmarshal([]byte(nr.Config), &def); err != nil || def.VNI == 0 {
+			continue
+		}
+		localVTEP := s.server.getHostVTEP(ctx, iface.NetworkName, s.hostName)
+		if localVTEP != "" {
+			s.server.broadcastFDBUpdate(ctx, iface.NetworkName, def.VNI, iface.MAC, "", localVTEP)
 		}
 	}
 }

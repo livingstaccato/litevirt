@@ -287,7 +287,7 @@ func (r *Reconciler) reportOrphanRuntimes(ctx context.Context) {
 		slog.Debug("orphan-runtime: replica not caught up; not scanning", "cause", why)
 		return
 	}
-	domains, err := r.virt.ListDomains()
+	domains, err := r.listDomainsBounded("orphan-runtime: report")
 	if err != nil {
 		return
 	}
@@ -434,7 +434,7 @@ func (r *Reconciler) adoptManagedDomains(ctx context.Context) {
 		slog.Debug("orphan-runtime: replica not caught up; not adopting domains", "cause", why)
 		return
 	}
-	domains, err := r.virt.ListDomains()
+	domains, err := r.listDomainsBounded("orphan-runtime: adopt")
 	if err != nil {
 		return
 	}

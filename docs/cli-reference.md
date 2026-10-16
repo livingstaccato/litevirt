@@ -116,7 +116,7 @@ lv host init --local --name <name>        # Bootstrap on localhost (standalone)
 lv host add <user@host> --name <name>     # Add host to cluster
 lv host ls                                # List hosts (UPDATES column: pending OS package updates, see upgrades.md)
 lv host ls --names                        # Print only host names, one per line (for scripts)
-lv host inspect <host>                    # Host details
+lv host inspect <host>                    # Host details, with the capacity reservations counted against it (see diagnostics.md)
 lv host drain <host> [--parallel 2]       # Evacuate VMs off host
 lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (honors stop-delay)
 lv host undrain <host> [--failback]       # Return host to scheduling (--failback: wait for the failback it started and print results)
@@ -147,7 +147,8 @@ lv host fence-confirm <host>              # Confirm an already-powered-off manua
                                           #   refused while the host still answers health probes
 lv host rescan [host]                     # Rescan PCI devices
 lv host devices <host> [--type gpu|network|nvme|infiniband]   # List PCI devices
-lv host superseded-disks <host>           # List the disk copies a failover set aside
+lv host superseded-disks <host>           # List the disk copies a failover set aside, and the
+                                          #   .kept- files a create made (marked kept, list only)
   [--purge] [--older-than 72h]            #   remove the ones neither retained nor held (admin)
   [--remove <copy>]...                    #   remove exactly these copies, even retained (admin)
   [--restore <copy>]                      #   put a copy back as its stopped VM's disk (admin)
@@ -218,6 +219,19 @@ lv exec <vm> <cmd> [args...]              # Run command via guest agent
 lv ssh <vm> [-u root] [-i key] [-- cmd]   # SSH into VM
 lv logs <vm> [-f] [-n 50]                 # VM logs (-f to follow)
 ```
+
+**A kept disk and a create of the same name.** After `lv rm --keep-disks
+<vm>`, the VM's disks stay where they were. A VM of the same name created later
+on the same host would take `<data_dir>/disks/<vm>-<disk>.qcow2`, so the create
+first renames a kept disk there to `<path>.kept-<time>`. Nothing removes that
+file; the rename is recorded as a `vm.disk.kept` event of the VM. A disk
+recorded `delete_with_vm=false` is handled the same way. The host that holds
+kept disks lists them in `<data_dir>/kept-disks/<vm>.json` until a create
+renames them. `lv host superseded-disks <host>` lists each `.kept-` file there
+as `kept`; `--purge`, `--remove` and `--restore` never take one, so only an
+operator removes it, by hand. A `--keep-disks` delete whose
+`<data_dir>/kept-disks/<vm>.json` cannot be read is refused, naming the file,
+with nothing deleted: repair or remove that file, then retry.
 
 **Delete keeps its handle on failure.** `lv rm` removes the VM's record only once
 its libvirt domain is gone. If the running (or paused) domain cannot be stopped,
@@ -1200,7 +1214,9 @@ lv lb create <name> --vip <cidr> --port <l:t/proto> --backend <name=addr>
   --algorithm roundrobin     # roundrobin | leastconn | source
   --host <name>              # Hosts to run LB on (repeatable)
   --vm-backend <vm-name>     # Use VM IP as backend (repeatable)
+  --snat                     # SNAT a host-isolated network's outbound guest traffic to the VIP (default off)
 lv lb update <name> [flags]                       # Update config (zero-downtime)
+lv lb update <name> --snat=false                  # Turn an explicit LB's outbound SNAT off (--snat turns it on)
 lv lb delete <name>
 lv lb stats <name>                                # Live backend metrics
 lv lb drain <name> --backend <vm>                 # Graceful drain
@@ -1347,6 +1363,8 @@ lv sg ls
 lv sg rm <id>
 lv sg rule-add <sg-id-or-name> --direction ingress|egress --proto tcp \
     --port <p> --cidr <c> [--action accept|drop|reject] [--priority N]
+lv sg rule-add <sg-id-or-name> --macro <name> [--cidr <c>] [--direction ingress|egress] \
+    [--action accept|drop|reject] [--priority N]    # one rule per macro row; prints every id
 lv sg rule-ls <sg-id-or-name>
 lv sg rule-rm <rule-id>       # Takes the RULE id from rule-ls, not the group id
 lv sg bind <vm> --network <name> --sg <name> [--sg <name>...]   # Bind SGs to a VM NIC
@@ -1363,18 +1381,21 @@ lv sg bind <vm> --network <name> --sg <name> [--sg <name>...]   # Bind SGs to a 
   # `lv sg rule-ls` warn, and the firewall reconciler logs it once per rule.
   # Deleting either group removes them (the sg.rm audit row records them).
 
+lv firewall macros            # List the rule macros and their rows
 lv firewall show              # Render the live nft ruleset for this host
 lv firewall reload            # Force the reconciler to re-read state and apply now
 
 # Cluster-tier rules (apply to every NIC on every host):
 lv firewall cluster-rule add --direction ingress|egress --proto tcp \
     --port <p> --cidr <c> [--action accept|drop|reject] [--comment <s>] [--priority N]
+lv firewall cluster-rule add --macro <name> [--direction ...] [--cidr <c>] [--action ...] [--comment <s>]
 lv firewall cluster-rule ls
 lv firewall cluster-rule rm <id>
 
 # Host-tier rules (apply to every NIC on one host):
 lv firewall host-rule add --host <name> --direction ingress|egress --proto tcp \
     --port <p> --cidr <c> [--action accept|drop|reject] [--comment <s>] [--priority N]
+lv firewall host-rule add --host <name> --macro <name> [--direction ...] [--cidr <c>] [--action ...] [--comment <s>]
 lv firewall host-rule ls [--host <name>]
 lv firewall host-rule rm <id>
 

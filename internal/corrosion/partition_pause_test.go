@@ -8,7 +8,8 @@ import (
 // CertifiedTransferProofs lists TOMBSTONED proofs too: ReapSpentProofs
 // tombstones a spent proof after a day, and a host that comes back later still
 // needs its certificate to settle (docs/design/partition-pause.md §6). It lists
-// only transfer actions with a certificate.
+// only transfer actions with a certificate; TransferProofs lists them with or
+// without one.
 //
 // Mutation: restore the deleted_at filter (in the list or in the read) — the
 // reaped proof is missing and this goes red.
@@ -36,6 +37,19 @@ func TestCertifiedTransferProofs_IncludesReapedProofs(t *testing.T) {
 	ins("reaped", ActionReschedule, "{}", true)
 	ins("uncertified", ActionReschedule, "", false)
 	ins("not-a-transfer", "lb_apply", "{}", false)
+	all, err := TransferProofs(ctx, c, ClaimKindVM, "vm-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var allIDs []string
+	for _, p := range all {
+		allIDs = append(allIDs, p.ID)
+	}
+	// TransferProofs (the VM settle's source) keeps the uncertified one, so a
+	// decline can say a completed proof exists but carries no certificate.
+	if len(allIDs) != 3 || allIDs[0] != "live" || allIDs[1] != "reaped" || allIDs[2] != "uncertified" {
+		t.Fatalf("TransferProofs = %v, want [live reaped uncertified]", allIDs)
+	}
 	got, err := CertifiedTransferProofs(ctx, c, ClaimKindVM, "vm-a")
 	if err != nil {
 		t.Fatal(err)
@@ -46,6 +60,9 @@ func TestCertifiedTransferProofs_IncludesReapedProofs(t *testing.T) {
 	}
 	if len(ids) != 2 || ids[0] != "live" || ids[1] != "reaped" {
 		t.Fatalf("CertifiedTransferProofs = %v, want [live reaped]", ids)
+	}
+	if all[0].Tombstoned || !all[1].Tombstoned {
+		t.Fatalf("TransferProofs Tombstoned = [%v %v], want [false true]", all[0].Tombstoned, all[1].Tombstoned)
 	}
 	if got[1].Status != ProofCompleted || got[1].ExecutorHost != "node-b" {
 		t.Fatalf("the reaped proof lost its execution record: %+v", got[1])

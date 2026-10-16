@@ -34,7 +34,7 @@ func TestDrill_RestartSameHostLocalVMWaitsForItsHost(t *testing.T) {
 	victim := l.leastLoaded(q, l.except(q))
 	stack := uniqueName("hrs")
 	vm := stack + "-1"
-	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    disks:\n      root:\n        size: \"1G\"\n      data:\n        size: \"64M\"\n    placement:\n      host: %s\n    migrate:\n      on-host-failure: restart-same\n",
+	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    firmware: bios\n    disks:\n      root:\n        size: \"1G\"\n      data:\n        size: \"64M\"\n    placement:\n      host: %s\n    migrate:\n      on-host-failure: restart-same\n",
 		stack, vm, drillImage(), drillMemory(), victim)
 	file := "/tmp/" + stack + ".yaml"
 	l.putFile(q, file, yaml)

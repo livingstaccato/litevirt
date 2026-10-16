@@ -19,7 +19,7 @@ func newOperationCmd() *cobra.Command {
 		Use:   "operation",
 		Short: "Inspect and recover in-flight VM operations",
 	}
-	cmd.AddCommand(newOperationShowCmd(), newOperationAbortCmd())
+	cmd.AddCommand(newOperationShowCmd(), newOperationAbortCmd(), newOperationReleaseReservationCmd())
 	return cmd
 }
 
@@ -88,5 +88,50 @@ or superseded operation can't clear a newer one). Requires --force.`,
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "Confirm the destructive abort")
+	return cmd
+}
+
+// errReleaseReservationNeedsForce is the client-side refusal without --force.
+var errReleaseReservationNeedsForce = fmt.Errorf("--force is required: check the reservation first with lv host inspect <host>")
+
+func newOperationReleaseReservationCmd() *cobra.Command {
+	var force bool
+	cmd := &cobra.Command{
+		Use:   "release-reservation <operation-id>",
+		Short: "Release a host capacity reservation whose operation is no longer running (admin)",
+		Long: `Release the host capacity reservation an operation holds when that operation
+is no longer running, so admission stops counting it against its host.
+lv host inspect <host> lists a host's reservations with their operation ids and
+states; this is for a "stale" or "release-blocked" one, or a "releasable" one
+before the sweep reaches it.
+
+The release is decided on the reservation's target host, under the workload's
+lock there. It is refused while the operation still runs or holds its VM's or
+container's mutation barrier, while it may still be admitting, and for an
+admission lease or a vm_replace or drain_cold_move journal.
+
+Requires the host.reservation.release permission (Admin) and --force. Every
+request, released or refused, is audited as operation.reservation.release.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !force {
+				return errReleaseReservationNeedsForce
+			}
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				resp, err := c.ReleaseHostReservation(ctx, &pb.ReleaseHostReservationRequest{OperationId: args[0], Force: true})
+				if err != nil {
+					return fmt.Errorf("release reservation: %w", err)
+				}
+				if !resp.Released {
+					fmt.Printf("%s: %s\n", args[0], resp.Detail)
+					return nil
+				}
+				fmt.Printf("released %d vCPU/%d MiB on %s held by operation %s\n",
+					resp.Vcpu, resp.MemoryMib, resp.Host, args[0])
+				return nil
+			})
+		},
+	}
+	cmd.Flags().BoolVar(&force, "force", false, "Confirm the release")
 	return cmd
 }

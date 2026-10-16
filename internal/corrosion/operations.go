@@ -359,13 +359,20 @@ func (c *Client) CompleteVMOperation(ctx context.Context, vmName, operationID st
 // the WAL/AE repair horizon so no in-flight step can still arrive. Local-
 // deterministic (safe to run on every node); the replicated tombstone converges.
 // Returns the number of operations reaped.
-func ReapTerminalOperations(ctx context.Context, c *Client, retention time.Duration) (int, error) {
+//
+// An operation that cannot be reaped (its steps cannot be read or its tombstone
+// cannot be written) does not stop the pass: it is returned in failures and the
+// pass goes on to the next operation, so one bad row cannot hold every later
+// operation, and the reservation it carries, forever. err is reserved for the
+// pass itself: the opening reads failed, the context ended, or this node's
+// writes are quarantined.
+func ReapTerminalOperations(ctx context.Context, c *Client, retention time.Duration) (reaped int, failures []OperationReapFailure, err error) {
 	cutoff := time.Now().Add(-retention)
 
 	arows, err := c.Query(ctx,
 		`SELECT DISTINCT active_operation_id FROM vms WHERE active_operation_id != '' AND deleted_at IS NULL`)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	active := make(map[string]bool, len(arows))
 	for _, r := range arows {
@@ -375,9 +382,21 @@ func ReapTerminalOperations(ctx context.Context, c *Client, retention time.Durat
 	orows, err := c.Query(ctx,
 		`SELECT id, operation_kind FROM operations WHERE deleted_at IS NULL`)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
-	reaped := 0
+	// fail records one operation's failure and reports whether the pass can go
+	// on: a cancelled context or a quarantined node fails every operation after
+	// this one too, so that ends the pass instead of being blamed on each.
+	fail := func(id string, ferr error) error {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		if reason := c.quarantineReason(); reason != "" {
+			return errQuarantined(reason)
+		}
+		failures = append(failures, OperationReapFailure{OperationID: id, Err: ferr})
+		return nil
+	}
 	for _, r := range orows {
 		id := r.String("id")
 		if active[id] {
@@ -388,7 +407,10 @@ func ReapTerminalOperations(ctx context.Context, c *Client, retention time.Durat
 		srows, err := c.Query(ctx,
 			`SELECT step_name, updated_at FROM operation_steps WHERE operation_id = ? AND deleted_at IS NULL`, id)
 		if err != nil {
-			return reaped, err
+			if perr := fail(id, fmt.Errorf("read steps: %w", err)); perr != nil {
+				return reaped, failures, perr
+			}
+			continue
 		}
 		names := make([]string, 0, len(srows))
 		var last time.Time
@@ -409,11 +431,21 @@ func ReapTerminalOperations(ctx context.Context, c *Client, retention time.Durat
 			{SQL: `UPDATE operation_steps SET deleted_at = ?, updated_at = ? WHERE operation_id = ? AND deleted_at IS NULL`,
 				Params: []interface{}{marker, now, id}},
 		}); err != nil {
-			return reaped, err
+			if perr := fail(id, fmt.Errorf("write tombstone: %w", err)); perr != nil {
+				return reaped, failures, perr
+			}
+			continue
 		}
 		reaped++
 	}
-	return reaped, nil
+	return reaped, failures, nil
+}
+
+// OperationReapFailure is one operation ReapTerminalOperations was due to reap
+// and could not, with why.
+type OperationReapFailure struct {
+	OperationID string
+	Err         error
 }
 
 // VMOperationView is a VM's active-operation snapshot for admin inspection.

@@ -215,6 +215,7 @@ message SupersededDisk {
     string held         = 7;  // why it is kept even from a named removal; "" when not held
     bool   removed      = 8;  // removed by this request
     string retained     = 9;  // why the sweep and a bare purge keep it (its VM exists); "" when not retained
+    bool   kept         = 10; // a disk a deleted VM was kept with, moved off its path by a create (<path>.kept-<time>): listed only, never purged, removed or restored
 }
 message SupersededDisksResponse {
     string                  host           = 1;
@@ -1043,6 +1044,19 @@ message ApplyLBRequest {
     // nil pre-activation. The LB host validates it (dest==self, action==lb_apply) and
     // claims it single-use before applying.
     RuntimeActionProof proof = 7;
+    // snat: whether this LB rewrites its network's guest egress to the VIP
+    // (compose `snat:`). Absent — a caller on an earlier build — applies
+    // SNAT, as every ApplyLB did before the field existed.
+    optional bool snat = 8;
+    // stack_name: the stack whose LB this is ("" for an explicit LB), so the
+    // VIP goes on that stack's network when the LB's row has not replicated
+    // here yet.
+    string stack_name = 9;
+    // A stack LB's health check and sticky sessions, which a forwarded apply
+    // serves as the coordinator's own apply does (TLS and redirects travel in
+    // ports). Absent — a caller on an earlier build — none, as before.
+    LBHealthSpec health          = 10;
+    bool         sticky_sessions = 11;
 }
 
 // RemoveLBRequest tells a host to tear down a local LB instance.
@@ -1058,6 +1072,9 @@ message CreateLBRequest {
     repeated string             hosts        = 5;  // hosts to run HAProxy+keepalived on
     repeated LBBackendAddress   backends     = 6;  // explicit backend addresses
     repeated string             vm_backends  = 7;  // VM names to resolve to IPs
+    // snat: rewrite the guest egress of the host-isolated network the VIP is
+    // placed on to the VIP (compose `snat:`). Default false: no outbound NAT.
+    bool                        snat         = 8;
 }
 
 message UpdateLBRequest {
@@ -1070,6 +1087,9 @@ message UpdateLBRequest {
     repeated string             remove_backends   = 7;  // by name
     repeated string             add_vm_backends   = 8;
     repeated string             remove_vm_backends = 9;
+    // snat: set the explicit LB's outbound NAT (CreateLBRequest.snat).
+    // Absent = no change. A stack LB's comes from its compose file.
+    optional bool               snat              = 10;
 }
 
 message DeleteLBRequest {
@@ -2350,6 +2370,21 @@ message AbortVMOperationResponse {
     string detail                = 3;
 }
 
+// ReleaseHostReservation releases a host capacity reservation whose operation
+// is no longer running (admin; see docs/diagnostics.md, "Host reservations").
+message ReleaseHostReservationRequest {
+    string operation_id = 1;
+    bool   force        = 2; // required — a release is never implicit
+}
+message ReleaseHostReservationResponse {
+    bool   released   = 1; // false with detail "already released" is idempotent success
+    string host       = 2; // the target host that released it
+    string vm         = 3; // empty when the caller may not vm.read it
+    int32  vcpu       = 4;
+    int32  memory_mib = 5;
+    string detail     = 6;
+}
+
 // Live restore from backup. The handler:
 //
 //   1. Opens the manifest's chunk reader.
@@ -3552,6 +3587,10 @@ message ProvisionNetworkRequest {
 }
 
 // ── Internal: Migration helpers ──
+message AnnounceMigratedGuestRequest {
+    string vm_name = 1;
+}
+
 message EnsureCloudInitRequest {
     string vm_name       = 1;
     string userdata      = 2;
@@ -3589,6 +3628,10 @@ message EnsureDisksRequest {
     // The target answers nic_mtu_problem for any NIC whose bridge there has a
     // different MTU.
     repeated NICMTUExpectation nic_mtu = 9;
+    // want_network_devices asks for network_devices in the response: a live
+    // migration of a VM with a NIC on a managed network lands each such NIC on
+    // the device this host serves the network on.
+    bool want_network_devices = 10;
 }
 
 // NICMTUExpectation is one NIC's resolved MTU on the source and the network
@@ -3646,6 +3689,12 @@ message EnsureDisksResponse {
     // nic_mtu_problem names the NICs of the request's nic_mtu whose bridge on
     // this host has a different MTU. Empty when every one matches.
     string nic_mtu_problem = 8;
+    // network_devices: for want_network_devices, each managed network the
+    // VM has a NIC on → the device this host serves it on now (the one it
+    // was last provisioned on here; for a network whose move this host has
+    // refused, still the previous one). An older target never sets it, and
+    // the source then migrates the domain's NICs as they are.
+    map<string, string> network_devices = 9;
 }
 
 // EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle
@@ -3800,9 +3849,19 @@ message GetVMIPRequest {
     // container (lxc-info / its interface row). owner_name is the container name.
     string owner_kind = 3;
     string owner_name = 4;
+    // lease_only (owner_kind "" or "vm"): answer only from THIS host's dnsmasq
+    // lease for mac on network_name's bridge, never from ARP, and set
+    // GetVMIPResponse.lease. A VM's host asks the other hosts of a vxlan
+    // network, whose DHCP server may run on any of them. A peer on an earlier
+    // build ignores it and never sets lease, so its answer is not taken.
+    bool lease_only = 5;
 }
 message GetVMIPResponse {
     string ip = 1;
+    // lease: ip is this host's dnsmasq lease for the MAC (lease_only).
+    bool lease = 2;
+    // lease_expiry: that lease's expiry in Unix seconds; 0 = infinite.
+    int64 lease_expiry = 3;
 }
 
 message RefreshLBRequest {
@@ -4480,6 +4539,7 @@ service LiteVirt {
     rpc NormalizeRoleBindings(NormalizeRoleBindingsRequest) returns (NormalizeRoleBindingsResponse);
     rpc GetVMOperation(GetVMOperationRequest) returns (GetVMOperationResponse);
     rpc AbortVMOperation(AbortVMOperationRequest) returns (AbortVMOperationResponse);
+    rpc ReleaseHostReservation(ReleaseHostReservationRequest) returns (ReleaseHostReservationResponse);
     rpc BeginWebAuthnRegistration(BeginWebAuthnRegistrationRequest)   returns (BeginWebAuthnRegistrationResponse);
     rpc FinishWebAuthnRegistration(FinishWebAuthnRegistrationRequest) returns (FinishWebAuthnRegistrationResponse);
     rpc BeginWebAuthnLogin(BeginWebAuthnLoginRequest)                 returns (BeginWebAuthnLoginResponse);
@@ -4696,6 +4756,9 @@ service LiteVirt {
     // being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
     rpc ReceiveMigrationDisk(stream ReceiveMigrationDiskRequest) returns (ReceiveMigrationDiskResponse);
     rpc CheckCPUCompatibility(CheckCPUCompatibilityRequest) returns (CheckCPUCompatibilityResponse);
+    // Peer only: a live migration of vm_name to this host has completed;
+    // announce the gateway of each of its networks from this host's bridge.
+    rpc AnnounceMigratedGuest(AnnounceMigratedGuestRequest) returns (google.protobuf.Empty);
 
     // ── Internal: State Sync ──
     rpc GetStateDigest(google.protobuf.Empty)      returns (StateDigestResponse);

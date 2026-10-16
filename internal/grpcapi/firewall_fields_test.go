@@ -38,6 +38,10 @@ func TestFirewallWriters_RefuseUngrammaticalFields(t *testing.T) {
 		{"bare port list", "port", "80,443", &pb.FirewallRule{Direction: "ingress", Proto: "tcp", Port: "80,443"}},
 		{"port out of range", "port", "70000", &pb.FirewallRule{Direction: "ingress", Proto: "tcp", Port: "70000"}},
 		{"set compared with <", "cidr", "< @office", &pb.FirewallRule{Direction: "ingress", Cidr: "< @office"}},
+		// fw-0.4 review I-3: nft cannot resolve these, and refuses every
+		// host's ruleset over one.
+		{"unknown service", "port", "nosuchservice-lv", &pb.FirewallRule{Direction: "ingress", Proto: "tcp", Port: "nosuchservice-lv"}},
+		{"range nft reads backwards", "port", "9-010", &pb.FirewallRule{Direction: "ingress", Proto: "udp", Port: "9-010"}},
 	}
 	wantRefused := func(t *testing.T, err error, field, value string) {
 		t.Helper()
@@ -68,6 +72,7 @@ func TestFirewallWriters_RefuseUngrammaticalFields(t *testing.T) {
 	for name, req := range map[string]*pb.CreateIpSetRequest{
 		"set name":    {Name: "s {\n}", Cidrs: []string{"10.0.0.0/8"}},
 		"set element": {Name: "s", Cidrs: []string{"10.0.0.0/8 }\nx"}},
+		"keyword":     {Name: "drop", Cidrs: []string{"10.0.0.0/8"}},
 	} {
 		_, err := s.CreateIpSet(ctx, req)
 		if status.Code(err) != codes.InvalidArgument {
@@ -176,5 +181,109 @@ func TestRecordFirewallState_InvalidRows(t *testing.T) {
 	row, _, _ = corrosion.GetHealthCondition(ctx, s.db, FirewallEvaluator, CondFirewallInvalidRows, "host", s.hostName)
 	if row.Lifecycle != corrosion.ConditionResolved {
 		t.Errorf("condition not resolved once the rows are gone: %+v", row)
+	}
+}
+
+// TestIpSet_CompanionClashRefusedBeforeAnyGate (fw-grammar re-review 3 N-2):
+// CreateIpSet and a stack deploy refuse a set named <x>_v6 beside a set x
+// with IPv6 elements as InvalidArgument, before the release gate is asked and,
+// for a stack, before its rows are torn down.
+//
+// Mutation: drop the IPSetCompanionClash check from CreateIpSet (the writer
+// still refuses, but after the gate: calls != 0) or from the stack preflight
+// (the stack's earlier set is torn down) — red.
+func TestIpSet_CompanionClashRefusedBeforeAnyGate(t *testing.T) {
+	s := testServer(t)
+	g := &relGate{t: t, open: true}
+	s.SetReleaseFeatureGate(g)
+	ctx := adminCtxWithEngine(t, s)
+	if _, err := s.CreateIpSet(ctx, &pb.CreateIpSetRequest{Name: "office", Cidrs: []string{"10.0.0.0/8", "fd00::/8"}}); err != nil {
+		t.Fatal(err)
+	}
+	calls := g.calls
+	_, err := s.CreateIpSet(ctx, &pb.CreateIpSetRequest{Name: "office_v6", Cidrs: []string{"2001:db8::/32"}})
+	if status.Code(err) != codes.InvalidArgument || !strings.Contains(status.Convert(err).Message(), "office_v6") {
+		t.Errorf("office_v6 beside office: %v, want InvalidArgument naming it", err)
+	}
+	if g.calls != calls {
+		t.Errorf("the release gate was asked for a refused set (%d calls)", g.calls-calls)
+	}
+
+	parse := func(body string) *compose.File {
+		t.Helper()
+		f, err := compose.ParseStored([]byte("name: st\nipsets:\n" + body))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		return f
+	}
+	if err := s.persistStackFirewall(ctx, parse("  lab:\n    cidrs: [\"10.5.0.0/16\"]\n")); err != nil {
+		t.Fatal(err)
+	}
+	// The redeploy's own lab is replaced, so a lab_v6 beside the new lab
+	// (IPv6) is judged against the new config, and office_v6 against the live
+	// office.
+	for _, body := range []string{
+		"  lab:\n    cidrs: [\"fd00::/8\"]\n  lab_v6:\n    cidrs: [\"10.6.0.0/16\"]\n",
+		"  office_v6:\n    cidrs: [\"10.7.0.0/16\"]\n",
+	} {
+		err := s.persistStackFirewall(ctx, parse(body))
+		if err == nil || !strings.Contains(err.Error(), "_v6") {
+			t.Errorf("stack %q: %v, want refused", body, err)
+		}
+		sets, _ := corrosion.ListIPSets(context.Background(), s.db)
+		var names []string
+		for _, set := range sets {
+			names = append(names, set.Name)
+		}
+		if strings.Join(names, ",") != "lab,office" {
+			t.Errorf("a refused deploy changed the sets: %v", names)
+		}
+	}
+	// The stack's own earlier lab_v6 does not clash with its redeploy.
+	if err := s.persistStackFirewall(ctx, parse("  lab_v6:\n    cidrs: [\"10.6.0.0/16\"]\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.persistStackFirewall(ctx, parse("  lab:\n    cidrs: [\"fd00::/8\"]\n")); err != nil {
+		t.Errorf("a redeploy replacing the stack's own lab_v6: %v", err)
+	}
+}
+
+// TestIpSet_ReservedPrefixRefusedBeforeAnyGate (fw-set-freeze round 0b):
+// CreateIpSet and a stack deploy refuse an lv_* set as InvalidArgument naming
+// the reserved prefix, before the release gate is asked and, for a stack,
+// before its rows are torn down.
+//
+// Mutation: drop the reserved-prefix check from rulefield.SetName — red.
+func TestIpSet_ReservedPrefixRefusedBeforeAnyGate(t *testing.T) {
+	s := testServer(t)
+	g := &relGate{t: t, open: true}
+	s.SetReleaseFeatureGate(g)
+	ctx := adminCtxWithEngine(t, s)
+	for _, name := range []string{"lv_gw4", "lv_nic_devs"} {
+		_, err := s.CreateIpSet(ctx, &pb.CreateIpSetRequest{Name: name, Cidrs: []string{"2001:db8::/32"}})
+		if status.Code(err) != codes.InvalidArgument || !strings.Contains(status.Convert(err).Message(), `"lv_"`) {
+			t.Errorf("%s: %v, want InvalidArgument naming the reserved prefix", name, err)
+		}
+	}
+	if g.calls != 0 {
+		t.Errorf("the release gate was asked for a refused set (%d calls)", g.calls)
+	}
+	f, err := compose.ParseStored([]byte("name: st\nipsets:\n  lab:\n    cidrs: [\"10.5.0.0/16\"]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.persistStackFirewall(ctx, f); err != nil {
+		t.Fatal(err)
+	}
+	f, err = compose.ParseStored([]byte("name: st\nipsets:\n  lv_gw4:\n    cidrs: [\"10.6.0.0/16\"]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.persistStackFirewall(ctx, f); err == nil || !strings.Contains(err.Error(), `"lv_"`) {
+		t.Errorf("stack with lv_gw4: %v, want refused", err)
+	}
+	if sets, _ := corrosion.ListIPSets(context.Background(), s.db); len(sets) != 1 || sets[0].Name != "lab" {
+		t.Errorf("a refused deploy changed the sets: %+v", sets)
 	}
 }

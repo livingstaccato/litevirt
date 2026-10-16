@@ -46,6 +46,9 @@ type CTFake struct {
 	// cpu.max a real container would get and the runtime-inventory collector
 	// reads the limits the way it reads a real config. Absent = uncapped.
 	cgroup map[string]string
+	// links is the bridge each container NIC is linked to, by ordinal: what
+	// a real create writes as lxc.net.<N>.link.
+	links map[string]map[int]string
 
 	// Call counters/records. Read them with the accessors, never directly —
 	// the handlers write these from other goroutines.
@@ -63,6 +66,7 @@ type CTFake struct {
 	exportErr error
 	importErr error
 	deleteErr error
+	listErr   error
 
 	// onExport runs INSIDE ExportContainer, i.e. during a migrate's archive
 	// phase — after the source's preflight has passed but before the IPAM
@@ -216,6 +220,14 @@ func (f *CTFake) FailStart(err error) {
 	f.startErr = err
 }
 
+// FailList makes ListContainers fail with err: a host without the lxc-*
+// tooling fails every list at the binary lookup.
+func (f *CTFake) FailList(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listErr = err
+}
+
 // FailExport makes ExportContainer fail with err — the archive-phase failure
 // that must roll the source back untouched.
 func (f *CTFake) FailExport(err error) {
@@ -302,7 +314,36 @@ func (f *CTFake) CreateContainer(_ context.Context, opts grpcapi.CreateContainer
 		f.cgroup = map[string]string{}
 	}
 	f.cgroup[opts.Name] = lxc.ResourceConfig(opts.CPULimit, opts.MemoryMiB)
+	if f.links == nil {
+		f.links = map[string]map[int]string{}
+	}
+	f.links[opts.Name] = map[int]string{}
+	for i, n := range opts.Networks {
+		f.links[opts.Name][i] = n.Bridge
+	}
 	return &grpcapi.ContainerInfo{Name: opts.Name, State: "stopped"}, nil
+}
+
+// ContainerNICLinks reports the bridge each NIC of name links to.
+func (f *CTFake) ContainerNICLinks(_ context.Context, name string) (map[int]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[int]string{}
+	for i, b := range f.links[name] {
+		out[i] = b
+	}
+	return out, nil
+}
+
+// SetContainerNICLink relinks NIC ordinal of name to bridge.
+func (f *CTFake) SetContainerNICLink(_ context.Context, name string, ordinal int, bridge string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.links[name][ordinal]; !ok {
+		return fmt.Errorf("container %s has no NIC %d", name, ordinal)
+	}
+	f.links[name][ordinal] = bridge
+	return nil
 }
 
 // ContainerLimits reports the limits recorded at create; a container seeded
@@ -369,6 +410,7 @@ func (f *CTFake) DeleteContainer(_ context.Context, name string) error {
 	}
 	delete(f.state, name)
 	delete(f.ips, name)
+	delete(f.links, name)
 	return os.RemoveAll(f.dir(name))
 }
 
@@ -400,6 +442,9 @@ func (f *CTFake) IPContainer(_ context.Context, name string) (string, error) {
 func (f *CTFake) ListContainers(_ context.Context) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	out := make([]string, 0, len(f.state))
 	for n := range f.state {
 		out = append(out, n)

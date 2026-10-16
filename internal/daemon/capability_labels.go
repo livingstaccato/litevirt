@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -129,12 +127,6 @@ func reassertCapabilityLabels(ctx context.Context, db *corrosion.Client, host st
 	return set, nil
 }
 
-// fwLiveFloors are the installed versions a live firmware move needs (spec
-// §3.1): libvirt, QEMU, swtpm and libtpms.
-var fwLiveFloors = struct{ libvirt, qemu, swtpm, libtpms string }{
-	libvirt: "10.0.0", qemu: "8.2.2", swtpm: "0.7.3", libtpms: "0.9.3",
-}
-
 // fwLiveInputs are what litevirt.fw_live_migrate is computed from.
 type fwLiveInputs struct {
 	enabled    bool // migration.live_firmware
@@ -155,48 +147,11 @@ func fwLiveMigrateCapable(ctx context.Context, in fwLiveInputs) bool {
 	if err != nil {
 		return false
 	}
-	for _, c := range []struct{ have, floor string }{
-		{code.Runtime.Libvirt, fwLiveFloors.libvirt},
-		{code.Runtime.QEMU, fwLiveFloors.qemu},
-		{code.Runtime.Swtpm, fwLiveFloors.swtpm},
-		{code.Runtime.Libtpms, fwLiveFloors.libtpms},
-	} {
-		if !versionAtLeast(c.have, c.floor) {
-			return false
-		}
-	}
-	return in.guests(ctx) == nil
-}
-
-// versionAtLeast compares X.Y.Z numerically; anything else is false.
-func versionAtLeast(have, floor string) bool {
-	h, ok1 := parseXYZ(have)
-	f, ok2 := parseXYZ(floor)
-	if !ok1 || !ok2 {
+	// The installed-version floors (spec §3.1), shared with stage A.
+	if libvirt.FirmwareFloorsMet(code.Runtime) != nil {
 		return false
 	}
-	for i := range h {
-		if h[i] != f[i] {
-			return h[i] > f[i]
-		}
-	}
-	return true
-}
-
-func parseXYZ(v string) ([3]int, bool) {
-	var out [3]int
-	parts := strings.Split(v, ".")
-	if len(parts) != 3 {
-		return out, false
-	}
-	for i, p := range parts {
-		n, err := strconv.Atoi(p)
-		if err != nil || n < 0 {
-			return out, false
-		}
-		out[i] = n
-	}
-	return out, true
+	return in.guests(ctx) == nil
 }
 
 // fwLiveProbeTimeout bounds the whole label probe, and the libvirt version

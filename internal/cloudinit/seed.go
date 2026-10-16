@@ -347,7 +347,9 @@ func PriorFrom(networkConfig string, added ...string) *Prior {
 //     (or two attaches racing) can have an ordinal another NIC of the VM ever
 //     had, live or detached, or a spec position (shared): it takes
 //     lv<its MAC's hex digits>, a name no other NIC has, a detached one
-//     included, and that no later attach changes.
+//     included, and that no later attach changes. Which of two NICs on one
+//     ordinal came first is not recorded (no creation time; updated_at moves
+//     with every row change), so both take it.
 //
 // p, the seed being replaced, wins where it knows: a NIC it lists keeps its
 // listing, one it marks attached since is new, and — unless p is Stale — one it

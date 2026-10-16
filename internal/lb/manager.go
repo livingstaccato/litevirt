@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -797,6 +798,95 @@ func (m *Manager) startOrReloadKeepalived(cfgPath, pidFile string) error {
 	return nil
 }
 
+// Transport is the VRRP transport a keepalived config renders.
+type Transport struct {
+	Unicast bool
+	Iface   string   // the vrrp_instance's interface
+	Src     string   // unicast_src_ip
+	Peers   []string // unicast_peer, sorted, without a sole host's self entry
+	// VIPDev is the VIP's device (the virtual_ipaddress line's dev). It is
+	// not part of the transport: Equal ignores it.
+	VIPDev string
+}
+
+// Equal reports whether t and o render the same transport (VIPDev aside).
+func (t Transport) Equal(o Transport) bool {
+	if t.Unicast != o.Unicast {
+		return false
+	}
+	if !t.Unicast {
+		return true
+	}
+	if t.Iface != o.Iface || t.Src != o.Src || len(t.Peers) != len(o.Peers) {
+		return false
+	}
+	a, b := append([]string(nil), t.Peers...), append([]string(nil), o.Peers...)
+	sort.Strings(a)
+	sort.Strings(b)
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TransportOf is the transport of cfg as RenderKeepalived renders it.
+func TransportOf(cfg Config) Transport {
+	if !cfg.VRRPUnicast {
+		return Transport{}
+	}
+	return Transport{Unicast: true, Iface: cfg.VRRPInterface, Src: cfg.UnicastSrc, Peers: cfg.UnicastPeers, VIPDev: cfg.Interface}
+}
+
+// KeepalivedTransport reads the VRRP transport of this LB's keepalived config
+// on disk; ok=false when there is no readable config.
+func (m *Manager) KeepalivedTransport(name string) (t Transport, ok bool) {
+	data, err := os.ReadFile(filepath.Join(m.configDir, name+"-keepalived.conf"))
+	if err != nil {
+		return Transport{}, false
+	}
+	return parseTransport(string(data)), true
+}
+
+// parseTransport reads a rendered config's transport. A sole host's self
+// entry (rendered with max_ttl 0) is not a peer.
+func parseTransport(conf string) Transport {
+	var t Transport
+	inPeers, inVIP := false, false
+	for _, line := range strings.Split(conf, "\n") {
+		f := strings.Fields(line)
+		switch {
+		case len(f) == 0:
+		case (inPeers || inVIP) && f[0] == "}":
+			inPeers, inVIP = false, false
+		case inPeers:
+			if !strings.Contains(line, "max_ttl 0") {
+				t.Peers = append(t.Peers, f[0])
+			}
+		case inVIP:
+			for i := 1; i+1 < len(f); i++ {
+				if f[i] == "dev" {
+					t.VIPDev = f[i+1]
+				}
+			}
+		case f[0] == "virtual_ipaddress":
+			inVIP = true
+		case f[0] == "interface" && len(f) == 2:
+			t.Iface = f[1]
+		case f[0] == "unicast_src_ip" && len(f) == 2:
+			t.Unicast, t.Src = true, f[1]
+		case f[0] == "unicast_peer":
+			inPeers = true
+		}
+	}
+	if !t.Unicast {
+		return Transport{}
+	}
+	sort.Strings(t.Peers)
+	return t
+}
+
 // KeepalivedRunning reports whether this LB's keepalived process is alive — the
 // real signal that its VIP is assigned. HAProxy binds the VIP non-locally even
 // when keepalived is down, so "haproxy is up" is NOT evidence the VIP works.
@@ -957,6 +1047,48 @@ func DetectInterfaceForIP(targetIP string) string {
 	}
 
 	return DetectInterface()
+}
+
+// InterfaceHoldingIP is the up, non-loopback device that holds ip as one of
+// its own addresses, or "" when none does. Unlike DetectInterfaceForIP it never
+// guesses: VRRP sent from an address the host does not own is never answered.
+func InterfaceHoldingIP(ip string) string {
+	want := net.ParseIP(ip)
+	if want == nil {
+		return ""
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		// A loopback device sends nothing off the host, and a down one
+		// sends nothing at all: the address is not held for VRRP's purpose.
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.Equal(want) {
+				return iface.Name
+			}
+		}
+	}
+	return ""
+}
+
+// InterfaceUpRunning reports whether dev exists, is up and has carrier
+// (IFF_RUNNING), as keepalived's track_interface requires: without it
+// keepalived enters FAULT and releases the VIP.
+func InterfaceUpRunning(dev string) bool {
+	iface, err := net.InterfaceByName(dev)
+	if err != nil {
+		return false
+	}
+	return iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagRunning != 0
 }
 
 // VRIDFromString converts a string to a stable VRID (helper for tests).

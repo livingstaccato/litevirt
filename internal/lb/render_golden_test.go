@@ -89,6 +89,19 @@ func TestLBRenderGolden(t *testing.T) {
 		}
 		golden.Assert(t, "testdata/keepalived_snat.golden", got)
 	})
+	t.Run("keepalived_unicast", func(t *testing.T) {
+		u := tcp
+		u.Interface = "br-app"
+		u.VRRPUnicast = true
+		u.VRRPInterface = "eth0"
+		u.UnicastSrc = "192.168.1.10"
+		u.UnicastPeers = []string{"192.168.1.11"}
+		got, err := RenderKeepalived(u)
+		if err != nil {
+			t.Fatalf("RenderKeepalived: %v", err)
+		}
+		golden.Assert(t, "testdata/keepalived_unicast.golden", got)
+	})
 	t.Run("conntrackd_snat", func(t *testing.T) {
 		got, err := RenderConntrackd(snat)
 		if err != nil {

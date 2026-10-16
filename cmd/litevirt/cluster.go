@@ -27,6 +27,7 @@ func newClusterCmd() *cobra.Command {
 		newClusterConvergeCmd(),
 		newClusterAckLeaseTermCmd(),
 		newClusterFailoverScopeCmd(),
+		newClusterVRRPTransportCmd(),
 		newClusterRelayRestoreCmd(),
 		newClusterFailbackCmd(),
 		newClusterHACmd(),
@@ -224,6 +225,65 @@ the drain_failback feature of the release token (lv cluster upgrade-status).`,
 				}
 				if !st.GetSettable() {
 					fmt.Println("Changeable: no — the cluster upgrade has not finished (failover_scope_v1 and the release token must latch on every host)")
+				}
+				return nil
+			})
+		},
+	}
+}
+
+// lv cluster vrrp-transport [unicast|multicast] — show or set the load
+// balancers' VRRP transport, cluster-wide (docs/compose.md "VRRP transport").
+func newClusterVRRPTransportCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "vrrp-transport [unicast|multicast]",
+		Short: "Show or set how load balancer hosts exchange VRRP",
+		Long: `With no argument, show the VRRP transport the connected host renders and the
+cluster policy behind it.
+
+  unicast    each LB host sends its VRRP adverts from its recorded address to
+             the other LB hosts' recorded addresses, over the host network, and
+             accepts them only from those addresses. Nothing VRRP is on the
+             bridge the VIP's guests are on. The default once vrrp_unicast_v1
+             has latched.
+  multicast  the adverts are multicast on the VIP's bridge with a password
+             derived from the LB's name, as before vrrp_unicast_v1: any guest
+             on that bridge can read it. The stand-down for a network that does
+             not pass IP protocol 112 between hosts' recorded addresses, or
+             while a host on an earlier build is back in the cluster.
+
+The policy is replicated and cluster-wide: every LB host renders it, whatever
+its own enforcement.vrrp_unicast says, and re-applies its LBs within a few
+seconds of receiving it. Changing it needs the admin role, refuses until
+failover_scope_v1 has latched (unicast: until vrrp_unicast_v1 has), and refuses
+while any voter is unreachable from the host you are connected to.`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				var st *pb.VRRPTransportStatus
+				var err error
+				if len(args) == 1 {
+					if args[0] != "unicast" && args[0] != "multicast" {
+						return fmt.Errorf("VRRP transport is unicast or multicast, not %q", args[0])
+					}
+					if st, err = c.SetVRRPTransport(ctx, &pb.SetVRRPTransportRequest{Transport: args[0]}); err != nil {
+						return fmt.Errorf("set VRRP transport: %w", err)
+					}
+				} else if st, err = c.GetVRRPTransport(ctx, &emptypb.Empty{}); err != nil {
+					return fmt.Errorf("get VRRP transport: %w", err)
+				}
+				fmt.Fprintf(os.Stdout, "VRRP transport: %s\n", st.GetTransport())
+				policy := st.GetPolicy()
+				if policy == "" {
+					policy = "(not set: unicast once vrrp_unicast_v1 has latched)"
+				}
+				fmt.Fprintf(os.Stdout, "Policy:         %s\n", policy)
+				if st.GetSetBy() != "" {
+					fmt.Fprintf(os.Stdout, "Set by:         %s at %s\n", st.GetSetBy(), st.GetUpdatedAt())
+				}
+				fmt.Fprintf(os.Stdout, "Latched:        %v\n", st.GetLatched())
+				if !st.GetSettable() {
+					fmt.Fprintln(os.Stdout, "Changeable:     no — failover_scope_v1 has not latched on every host yet")
 				}
 				return nil
 			})

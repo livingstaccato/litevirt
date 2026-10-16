@@ -167,6 +167,24 @@ func TestRelayHealthV1Registered(t *testing.T) {
 	}
 }
 
+// TestVRRPUnicastV1Registered: advertised (the grpcapi filter withholds it
+// while enforcement.vrrp_unicast is off), known, flag-gated rather than
+// mandatory, and confirmed against every replication recipient.
+func TestVRRPUnicastV1Registered(t *testing.T) {
+	if VRRPUnicastV1 != "vrrp_unicast_v1" {
+		t.Fatalf("VRRPUnicastV1 = %q, want %q", VRRPUnicastV1, "vrrp_unicast_v1")
+	}
+	if !slices.Contains(Supported(), VRRPUnicastV1) || !slices.Contains(All(), VRRPUnicastV1) {
+		t.Fatalf("vrrp_unicast_v1 missing from Supported() or All()")
+	}
+	if Mandatory(VRRPUnicastV1) {
+		t.Fatal("vrrp_unicast_v1 has a kill switch (enforcement.vrrp_unicast); it is not mandatory")
+	}
+	if !ReplicationGated(VRRPUnicastV1) {
+		t.Fatal("vrrp_unicast_v1 must wait for every replication recipient: a maintenance host may run an LB")
+	}
+}
+
 // TestReleaseTokenRegistered pins the release token's registration. Every one
 // of these sets matters: Supported is what peers latch on, All is what the
 // checker loads markers for and what the rollback preflight treats as known,

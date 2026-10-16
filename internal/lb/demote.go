@@ -258,8 +258,9 @@ func addrShowHasVIP(out, vip string) bool {
 }
 
 // parseKeepalivedVIP extracts the exact tuple keepalived is configured to assign from
-// a rendered keepalived.conf: the vrrp_instance `interface <iface>` directive and the
-// `<ip>/<prefix>` inside its virtual_ipaddress block. ok=false if either is missing.
+// a rendered keepalived.conf: the `<ip>/<prefix>` inside its virtual_ipaddress block and
+// the device it goes on — that line's `dev <iface>` when it names one (a unicast render),
+// else the vrrp_instance `interface <iface>` directive. ok=false if either is missing.
 //
 // Single-VIP assumption: this returns the LAST address parsed from the (single)
 // virtual_ipaddress block, which is exact only because RenderKeepalived emits exactly
@@ -269,6 +270,7 @@ func addrShowHasVIP(out, vip string) bool {
 func parseKeepalivedVIP(config string) (vip string, prefix int, iface string, ok bool) {
 	sc := bufio.NewScanner(strings.NewReader(config))
 	inVIP := false
+	vipDev := ""
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		switch {
@@ -279,15 +281,43 @@ func parseKeepalivedVIP(config string) (vip string, prefix int, iface string, ok
 		case inVIP && strings.HasPrefix(line, "}"):
 			inVIP = false
 		case inVIP && strings.Contains(line, "/"):
-			ipCidr := strings.Fields(line)[0] // "<ip>/<prefix>" (ignore any trailing tokens)
+			f := strings.Fields(line)
+			ipCidr := f[0] // "<ip>/<prefix>"
 			if slash := strings.LastIndex(ipCidr, "/"); slash > 0 {
 				if p, perr := strconv.Atoi(ipCidr[slash+1:]); perr == nil {
 					vip, prefix = ipCidr[:slash], p
 				}
 			}
+			// A unicast render names the VIP's device here: its `interface`
+			// is the device holding the host's own address, where VRRP goes.
+			for i := 1; i+1 < len(f); i++ {
+				if f[i] == "dev" {
+					vipDev = f[i+1]
+				}
+			}
 		}
 	}
+	if vipDev != "" {
+		iface = vipDev
+	}
 	return vip, prefix, iface, vip != "" && iface != ""
+}
+
+// DemoteByName demotes one LB by its rendered keepalived config: Demote with
+// the VIP and device that config assigns. No config is nothing to demote.
+func (m *Manager) DemoteByName(name string, keepalivedStopTimeout time.Duration) error {
+	data, err := os.ReadFile(filepath.Join(m.configDir, name+"-keepalived.conf"))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read keepalived config for %s: %w", name, err)
+	}
+	vip, prefix, iface, ok := parseKeepalivedVIP(string(data))
+	if !ok {
+		return fmt.Errorf("cannot parse the VIP of %s's keepalived config", name)
+	}
+	return m.Demote(Config{Name: name, VIP: vip, VIPPrefix: prefix, Interface: iface}, keepalivedStopTimeout)
 }
 
 // Demote drops this host's VIP for LB `name` when the host has lost quorum (Phase 2

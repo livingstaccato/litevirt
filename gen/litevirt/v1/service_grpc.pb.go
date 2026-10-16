@@ -329,6 +329,8 @@ const (
 	LiteVirt_CrossRegionMigrate_FullMethodName         = "/litevirt.v1.LiteVirt/CrossRegionMigrate"
 	LiteVirt_GetFailoverScope_FullMethodName           = "/litevirt.v1.LiteVirt/GetFailoverScope"
 	LiteVirt_SetFailoverScope_FullMethodName           = "/litevirt.v1.LiteVirt/SetFailoverScope"
+	LiteVirt_GetVRRPTransport_FullMethodName           = "/litevirt.v1.LiteVirt/GetVRRPTransport"
+	LiteVirt_SetVRRPTransport_FullMethodName           = "/litevirt.v1.LiteVirt/SetVRRPTransport"
 	LiteVirt_GetHAPolicy_FullMethodName                = "/litevirt.v1.LiteVirt/GetHAPolicy"
 	LiteVirt_SetHAPolicy_FullMethodName                = "/litevirt.v1.LiteVirt/SetHAPolicy"
 	LiteVirt_RestoreRelay_FullMethodName               = "/litevirt.v1.LiteVirt/RestoreRelay"
@@ -959,6 +961,14 @@ type LiteVirtClient interface {
 	// and while any voter is unreachable from the answering host.
 	GetFailoverScope(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*FailoverScopeStatus, error)
 	SetFailoverScope(ctx context.Context, in *SetFailoverScopeRequest, opts ...grpc.CallOption) (*FailoverScopeStatus, error)
+	// GetVRRPTransport reports the load balancers' VRRP transport as the
+	// answering host renders it, and the cluster-wide policy behind it.
+	// SetVRRPTransport records the operator's choice (admin), "unicast" or
+	// "multicast", which every host then renders. It refuses until
+	// failover_scope_v1 has durably latched, "unicast" refuses until
+	// vrrp_unicast_v1 has, and both refuse while any voter is unreachable.
+	GetVRRPTransport(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*VRRPTransportStatus, error)
+	SetVRRPTransport(ctx context.Context, in *SetVRRPTransportRequest, opts ...grpc.CallOption) (*VRRPTransportStatus, error)
 	// GetHAPolicy reports the cluster HA policy (armed or disarmed) and its
 	// confirmation; SetHAPolicy changes it (admin). While disarmed, no host is
 	// fenced and no workload is recovered automatically.
@@ -4520,6 +4530,26 @@ func (c *liteVirtClient) SetFailoverScope(ctx context.Context, in *SetFailoverSc
 	return out, nil
 }
 
+func (c *liteVirtClient) GetVRRPTransport(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*VRRPTransportStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VRRPTransportStatus)
+	err := c.cc.Invoke(ctx, LiteVirt_GetVRRPTransport_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) SetVRRPTransport(ctx context.Context, in *SetVRRPTransportRequest, opts ...grpc.CallOption) (*VRRPTransportStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VRRPTransportStatus)
+	err := c.cc.Invoke(ctx, LiteVirt_SetVRRPTransport_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) GetHAPolicy(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*HAPolicyStatus, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(HAPolicyStatus)
@@ -5481,6 +5511,14 @@ type LiteVirtServer interface {
 	// and while any voter is unreachable from the answering host.
 	GetFailoverScope(context.Context, *emptypb.Empty) (*FailoverScopeStatus, error)
 	SetFailoverScope(context.Context, *SetFailoverScopeRequest) (*FailoverScopeStatus, error)
+	// GetVRRPTransport reports the load balancers' VRRP transport as the
+	// answering host renders it, and the cluster-wide policy behind it.
+	// SetVRRPTransport records the operator's choice (admin), "unicast" or
+	// "multicast", which every host then renders. It refuses until
+	// failover_scope_v1 has durably latched, "unicast" refuses until
+	// vrrp_unicast_v1 has, and both refuse while any voter is unreachable.
+	GetVRRPTransport(context.Context, *emptypb.Empty) (*VRRPTransportStatus, error)
+	SetVRRPTransport(context.Context, *SetVRRPTransportRequest) (*VRRPTransportStatus, error)
 	// GetHAPolicy reports the cluster HA policy (armed or disarmed) and its
 	// confirmation; SetHAPolicy changes it (admin). While disarmed, no host is
 	// fenced and no workload is recovered automatically.
@@ -6569,6 +6607,12 @@ func (UnimplementedLiteVirtServer) GetFailoverScope(context.Context, *emptypb.Em
 }
 func (UnimplementedLiteVirtServer) SetFailoverScope(context.Context, *SetFailoverScopeRequest) (*FailoverScopeStatus, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetFailoverScope not implemented")
+}
+func (UnimplementedLiteVirtServer) GetVRRPTransport(context.Context, *emptypb.Empty) (*VRRPTransportStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetVRRPTransport not implemented")
+}
+func (UnimplementedLiteVirtServer) SetVRRPTransport(context.Context, *SetVRRPTransportRequest) (*VRRPTransportStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetVRRPTransport not implemented")
 }
 func (UnimplementedLiteVirtServer) GetHAPolicy(context.Context, *emptypb.Empty) (*HAPolicyStatus, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetHAPolicy not implemented")
@@ -11908,6 +11952,42 @@ func _LiteVirt_SetFailoverScope_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_GetVRRPTransport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetVRRPTransport(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetVRRPTransport_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetVRRPTransport(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SetVRRPTransport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetVRRPTransportRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SetVRRPTransport(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SetVRRPTransport_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SetVRRPTransport(ctx, req.(*SetVRRPTransportRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_GetHAPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(emptypb.Empty)
 	if err := dec(in); err != nil {
@@ -13619,6 +13699,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetFailoverScope",
 			Handler:    _LiteVirt_SetFailoverScope_Handler,
+		},
+		{
+			MethodName: "GetVRRPTransport",
+			Handler:    _LiteVirt_GetVRRPTransport_Handler,
+		},
+		{
+			MethodName: "SetVRRPTransport",
+			Handler:    _LiteVirt_SetVRRPTransport_Handler,
 		},
 		{
 			MethodName: "GetHAPolicy",

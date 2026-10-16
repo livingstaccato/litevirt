@@ -210,7 +210,7 @@ func TestApplyLBLocal_RefusedNameIsLoud(t *testing.T) {
 	defer cancel()
 	called := false
 	s.lbApplyOverride = func(context.Context, lb.Config) error { called = true; return nil }
-	if err := s.applyLBLocal(context.Background(), lb.Config{Name: "shop:blue-lb"}); err == nil {
+	if err := s.applyLBLocal(context.Background(), lb.Config{Name: "shop:blue-lb"}, nil); err == nil {
 		t.Error("applied")
 	}
 	if called {

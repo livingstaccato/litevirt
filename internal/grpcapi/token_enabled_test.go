@@ -43,6 +43,7 @@ func TestTokenEnabledCoversEverySupportedToken(t *testing.T) {
 	s.enfRecoveryClaim.Store(true)
 	s.enfPartitionPause.Store(true)
 	s.enfVMReplace.Store(true)
+	s.enfVRRPUnicast.Store(true)
 	s.hwV2Ready.Store(true)
 
 	for _, tok := range capabilities.Supported() {

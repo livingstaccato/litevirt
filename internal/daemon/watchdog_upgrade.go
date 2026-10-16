@@ -152,7 +152,7 @@ func (d *Daemon) awaitServingThenActivate(ctx context.Context) {
 		slog.Warn("restart: cannot build the local gRPC client to confirm serving; recording the host active now", "error", err)
 		// The awaiting-serving note stays: nothing showed this daemon serves,
 		// so the next crash boots 'active', as before this check existed.
-		d.activateAfterRestart()
+		d.confirmActive(ctx, &unconfirmed{}, false)
 		return
 	}
 	defer closeFn()
@@ -188,9 +188,8 @@ func (d *Daemon) dialSelf() (pinger, func(), error) {
 }
 
 // activateOnceServing pings this daemon until it answers, and then records the
-// host active. Until it answers the host stays 'upgrading' — there is no
-// previous binary to roll back to — and the coordinator fences it once its
-// upgrading timeout has passed.
+// host active (confirmActive). Until it answers the host stays 'upgrading' —
+// there is no previous binary to roll back to.
 //
 // The deadline only times the error log. Pinging goes on past it, until the
 // daemon answers or shuts down: a daemon that comes up late is a healthy host,
@@ -198,43 +197,156 @@ func (d *Daemon) dialSelf() (pinger, func(), error) {
 // only offline and fenced hosts), so stopping at the deadline left it
 // 'upgrading' — unplaceable, shown draining — until an operator undrained it.
 // ConfirmServing still refuses a host fenced or otherwise moved on meanwhile.
+//
+// Whether the cluster fences such a host depends on its peers, not on this
+// check: one they cannot reach either is fenced once its upgrading timeout
+// passes; one they reach is not, and stays 'upgrading'. Past that timeout the
+// host raises upgrading_unconfirmed about itself (noteUnconfirmed), so that
+// case is visible.
 func (d *Daemon) activateOnceServing(ctx context.Context, client pinger, deadline time.Duration) {
-	dctx, cancel := context.WithTimeout(ctx, deadline)
-	answered := pingUntil(dctx, client)
-	cancel()
-	if !answered {
+	start := time.Now()
+	checked := start
+	var u unconfirmed
+	logged := false
+	for {
+		pctx, pcancel := context.WithTimeout(ctx, 2*time.Second)
+		_, err := client.Ping(pctx, &pb.PingRequest{})
+		pcancel()
+		if err == nil {
+			break
+		}
 		if ctx.Err() != nil {
 			return // shutting down
 		}
-		slog.Error("restart: this daemon has not answered its own Ping; the host stays 'upgrading', and the cluster fences it once its upgrading timeout passes. Still checking.",
-			"deadline", deadline, "timeout", hostboot.UpgradingTimeout)
-		if !pingUntil(ctx, client) {
-			return // shutting down
+		if !logged && time.Since(start) >= deadline {
+			slog.Error("restart: this daemon has not answered its own Ping; the host stays 'upgrading'. "+
+				"Peers that cannot reach it either fence it once its upgrading timeout passes; peers that reach it do not, "+
+				"and it stays unplaceable (shown draining) until this daemon answers or an operator runs 'lv host undrain'. Still checking.",
+				"deadline", deadline, "timeout", hostboot.UpgradingTimeout, "error", err)
+			logged = true
 		}
+		if time.Since(checked) >= unconfirmedCheckEvery {
+			d.noteUnconfirmed(ctx, &u, "this daemon has not answered its own Ping: "+err.Error())
+			checked = time.Now()
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(pingPollInterval):
+		}
+	}
+	if logged {
 		slog.Info("restart: this daemon answered its own Ping after the deadline", "deadline", deadline)
 	}
-	d.activateAfterRestart()
-	// After the confirm, so a crash between the two leaves the note and the
-	// next boot is 'active'. Whatever the confirm did: a daemon that answers
-	// has served, and a WAL-quarantined one, whose confirm is refused, must
-	// not make the boot after it 'active'.
-	hostboot.Served(d.cfg.DataDir)
+	d.confirmActive(ctx, &u, true)
 }
 
-// activateAfterRestart records the host active after a graceful restart, if it
-// is still recorded 'upgrading'.
-func (d *Daemon) activateAfterRestart() {
+// unconfirmedCheckEvery is how often a ping loop that is not answered reads
+// whether the host is past its upgrading window (noteUnconfirmed), rather than
+// on every poll; a var so tests can shrink it.
+var unconfirmedCheckEvery = 5 * time.Second
+
+// confirmRetryFirst is the first backoff between attempts to record the host
+// active; a var so tests can shrink it.
+var confirmRetryFirst = time.Second
+
+// confirmRetryMax caps the backoff between attempts to record the host active
+// once this daemon serves; a var so tests can shrink it.
+var confirmRetryMax = time.Minute
+
+// unconfirmedAfter is how long the host may be recorded 'upgrading' before a
+// daemon that runs raises upgrading_unconfirmed: the coordinator's upgrading
+// timeout. A var so tests can shrink it.
+var unconfirmedAfter = hostboot.UpgradingTimeout
+
+// confirmActive records the host active after a restart, if it is still
+// recorded 'upgrading', retrying a failed write with backoff (1 s doubling to
+// confirmRetryMax, each attempt bounded to 5 s) until it lands, the host is
+// recorded as something else, or the daemon shuts down. A write that fails is
+// logged on every attempt and, past the upgrading timeout, raises
+// upgrading_unconfirmed.
+//
+// served says this daemon answered its own Ping: the awaiting-serving note is
+// cleared after the first attempt, whatever it did — after it, so a crash
+// between the two leaves the note and the next boot is 'active'; whatever it
+// did, because a WAL-quarantined daemon's write is refused on every attempt
+// and must not make the boot after it 'active'.
+func (d *Daemon) confirmActive(ctx context.Context, u *unconfirmed, served bool) {
+	confirm := d.confirmServing
+	if confirm == nil {
+		confirm = func(ctx context.Context) (bool, string, error) {
+			return hostboot.ConfirmServing(ctx, d.db, d.cfg.HostName)
+		}
+	}
+	backoff := confirmRetryFirst
+	for first := true; ; first = false {
+		mctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, state, err := confirm(mctx)
+		cancel()
+		if first && served {
+			hostboot.Served(d.cfg.DataDir)
+		}
+		switch {
+		case errors.Is(err, hostboot.ErrNotUpgrading):
+			slog.Info("restart: serving; host is recorded as something other than upgrading, leaving it", "state", state)
+			d.clearUnconfirmed(u)
+			return
+		case err == nil:
+			slog.Info("restart: serving; host recorded active")
+			d.clearUnconfirmed(u)
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		slog.Warn("restart: recording the host active failed; it stays 'upgrading' until a retry lands",
+			"error", err, "retry_in", backoff)
+		d.noteUnconfirmed(ctx, u, "recording the host active failed: "+err.Error())
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > confirmRetryMax {
+			backoff = confirmRetryMax
+		}
+	}
+}
+
+// unconfirmed is one serving check's upgrading_unconfirmed state.
+type unconfirmed struct{ raised bool }
+
+// noteUnconfirmed raises upgrading_unconfirmed, and sets its metric, once the
+// host has been recorded 'upgrading' for unconfirmedAfter while this check
+// still has not recorded it active. cause names why.
+func (d *Daemon) noteUnconfirmed(ctx context.Context, u *unconfirmed, cause string) {
+	since, ok := hostboot.UpgradingSince(ctx, d.db, d.cfg.HostName)
+	if !ok || time.Since(since) < unconfirmedAfter {
+		return
+	}
+	metrics.SetUpgradingUnconfirmed(true)
+	if !u.raised {
+		slog.Error("restart: this host has been 'upgrading' past its upgrading window while its daemon runs; peers that reach it do not fence it, and it stays unplaceable",
+			"since", since.UTC().Format(time.RFC3339), "cause", cause, "remedy", hostboot.UnconfirmedRemedy)
+	}
+	if err := hostboot.RaiseUpgradingUnconfirmed(ctx, d.db, d.cfg.HostName, cause, since, time.Now()); err != nil {
+		slog.Warn("restart: could not record the upgrading_unconfirmed condition (retried)", "error", err)
+		return
+	}
+	u.raised = true
+}
+
+// clearUnconfirmed resolves upgrading_unconfirmed, including one an earlier
+// process left, and clears its metric.
+func (d *Daemon) clearUnconfirmed(u *unconfirmed) {
+	metrics.SetUpgradingUnconfirmed(false)
 	mctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, state, err := hostboot.ConfirmServing(mctx, d.db, d.cfg.HostName)
-	switch {
-	case errors.Is(err, hostboot.ErrNotUpgrading):
-		slog.Info("restart: serving; host is recorded as something other than upgrading, leaving it", "state", state)
-	case err != nil:
-		slog.Error("restart: serving, but recording the host active failed; it stays 'upgrading'", "error", err)
-	default:
-		slog.Info("restart: serving; host recorded active")
+	if err := hostboot.ResolveUpgradingUnconfirmed(mctx, d.db, d.cfg.HostName, time.Now()); err != nil {
+		slog.Warn("restart: could not resolve the upgrading_unconfirmed condition", "error", err)
+		return
 	}
+	u.raised = false
 }
 
 // rollbackToOld restores <binary>.old over the running binary path and exits

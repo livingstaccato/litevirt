@@ -1068,7 +1068,10 @@ after its boot write. Its boot can come up to 2 minutes after the SIGTERM and
 still keep the host `upgrading`, so the longest such a host is held unfenced
 is about 4 minutes from the SIGTERM. A daemon that serves late, past
 `upgrade_health_deadline_sec`, logs an error at the deadline and keeps
-checking, and is recorded `active` once it answers.
+checking, and is recorded `active` once it answers. A write that records it
+`active` and fails is retried until it lands. A host still `upgrading` 2
+minutes on while its daemon runs raises `upgrading_unconfirmed`
+([diagnostics.md](diagnostics.md)): peers that reach it never fence it.
 
 A boot with no marker (a crash, a kill, or a stop whose `upgrading` write
 failed, as every write of a WAL-quarantined daemon does) does the same for a

@@ -125,6 +125,9 @@ type Daemon struct {
 	// selfPinger, when set, replaces the local mTLS client the restart check
 	// pings this daemon through (awaitServingThenActivate). Tests only.
 	selfPinger func() (pinger, func(), error)
+	// confirmServing, when set, replaces hostboot.ConfirmServing in the
+	// restart's serving check (confirmActive). Tests only.
+	confirmServing func(ctx context.Context) (bool, string, error)
 
 	// rolledBackTokens names capability tokens this node already latched that this
 	// binary has never heard of — i.e. this binary is a rollback below them. Set at

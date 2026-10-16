@@ -471,7 +471,8 @@ func TestSyncFloodEntries(t *testing.T) {
 }
 
 // TestProvision_IsolatedDHCPOffersNoRouter: Provision asks for a DHCP server
-// with no router on an isolated network, and with one on a bridge or VXLAN
+// that withholds the router from the NICs its hosts file tags on an isolated
+// network, and for one that offers it to every NIC on a bridge or VXLAN
 // network, whose bridge address is the guests' gateway.
 func TestProvision_IsolatedDHCPOffersNoRouter(t *testing.T) {
 	cases := []struct {

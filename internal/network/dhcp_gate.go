@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
+	"strings"
 
 	"github.com/litevirt/litevirt/internal/compose"
 )
@@ -312,6 +314,17 @@ func BoundNetworkAutoBridgeFinding(def compose.NetworkDef, bridgeExists, bridgeH
 		bridge, hostName)
 }
 
+// NoRouterNetwork reports whether def is a network with no router whose
+// dnsmasq withholds the bridge from the NICs its hosts file tags NoRouterTag:
+// an isolated network with an IPv4 subnet (a host-isolated one runs no DHCP).
+func NoRouterNetwork(def compose.NetworkDef) bool {
+	if def.Type != "isolated" || def.HostIsolation {
+		return false
+	}
+	p, err := netip.ParsePrefix(strings.TrimSpace(def.Subnet))
+	return err == nil && p.Addr().Is4()
+}
+
 // startDHCPFor is the ONLY place Provision starts a DHCP server, and the second
 // half of the refusal: the half that covers the hosts a bind could not speak
 // for.
@@ -337,8 +350,9 @@ func startDHCPFor(def compose.NetworkDef, f DHCPHostFacts, networkName, bridge, 
 	if err != nil {
 		return fmt.Errorf("derive DHCP range: %w", err)
 	}
-	// An isolated network has no router: its DHCP server offers none.
-	if err := startDHCPFunc(bridge, gw, rangeStart, rangeEnd, mask, pidFile, def.Type == "isolated"); err != nil {
+	// An isolated network has no router: its DHCP server withholds the bridge
+	// from the NICs its hosts file tags (NoRouterTag).
+	if err := startDHCPFunc(bridge, gw, rangeStart, rangeEnd, mask, pidFile, NoRouterNetwork(def)); err != nil {
 		return fmt.Errorf("start DHCP on %s: %w", bridge, err)
 	}
 	return nil

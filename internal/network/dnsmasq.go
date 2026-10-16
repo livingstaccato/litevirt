@@ -45,7 +45,8 @@ var startDHCPFunc = StartDHCP
 //   - Bridges get the gateway address with `ip -6 addr add`, automatic.
 //
 // noRouter: the network has no router (an isolated network), so the bridge is
-// not offered to guests as their gateway (see dnsmasqArgs).
+// not offered as a gateway to a NIC its hosts file tags NoRouterTag (see
+// dnsmasqArgs).
 //
 // dnsmasqArgs builds the dnsmasq command line for a per-bridge DHCP+DNS
 // instance. Pure function so the argument set is unit-testable without
@@ -117,18 +118,15 @@ func dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile string, no
 	if isIPv6Gateway(gateway) {
 		args = append(args, "--enable-ra", "--dhcp-authoritative")
 	}
-	// A network with no router (an isolated network): the bridge address is
-	// not a way out, so it is not offered as one. DHCPv4 sends no router
-	// option, and router advertisements carry a router lifetime of 0 (the
-	// prefix is still announced). A guest then takes no default route through
-	// the bridge whatever its DHCP client does with the seed's use-routes,
-	// which cloud-init's sysconfig and NetworkManager renderers drop.
-	if noRouter {
-		if isIPv6Gateway(gateway) {
-			args = append(args, "--ra-param="+bridge+",0,0")
-		} else {
-			args = append(args, "--dhcp-option=option:router")
-		}
+	// A network with no router (an isolated network): a NIC the hosts file
+	// tags NoRouterTag — one of a VM that has another NIC — is offered no
+	// router, so it takes no default route through the bridge whatever its
+	// DHCP client does with the seed's use-routes (cloud-init's sysconfig and
+	// NetworkManager renderers drop it). Every other client is offered the
+	// bridge as before. IPv4 only: router advertisements cannot be withheld
+	// from one guest.
+	if noRouter && !isIPv6Gateway(gateway) {
+		args = append(args, "--dhcp-option=tag:"+NoRouterTag+",option:router")
 	}
 	// Domain-specific forward to the embedded DNS: guests get dnsmasq (the gateway)
 	// as their resolver, and dnsmasq forwards ONLY <localDomain> queries to the

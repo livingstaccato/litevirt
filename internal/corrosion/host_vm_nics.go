@@ -95,6 +95,16 @@ func ListHostVMNICs(ctx context.Context, c *Client, hostName string, extraVMs ..
 			args = append(args, vm)
 		}
 	}
+	return listVMNICs(ctx, c, where, args)
+}
+
+// ListAllVMNICs is ListHostVMNICs for every live VM, whatever host its row
+// names.
+func ListAllVMNICs(ctx context.Context, c *Client) ([]HostVMNIC, error) {
+	return listVMNICs(ctx, c, "1 = 1", nil)
+}
+
+func listVMNICs(ctx context.Context, c *Client, where string, args []interface{}) ([]HostVMNIC, error) {
 	nicRows, err := c.Query(ctx,
 		`SELECT n.vm_name, n.id, n.network_name, n.model, n.mac, n.ordinal,
 		        COALESCE(n.security_groups, '') AS security_groups, COALESCE(n.ip, '') AS ip,

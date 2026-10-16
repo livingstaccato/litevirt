@@ -203,33 +203,34 @@ func TestDnsmasqArgs_V6EnablesRA(t *testing.T) {
 }
 
 // TestDnsmasqArgs_NoRouter pins what dnsmasq offers on a network with no
-// router (an isolated network): no DHCPv4 router option, and IPv6 router
-// advertisements with a router lifetime of 0, so no guest takes a default
-// route through the host's bridge — whatever its DHCP client or cloud-init
-// renderer does with the seed's use-routes. Every other network still offers
-// the bridge as its router.
+// router (an isolated network): no DHCPv4 router option to a client its hosts
+// file tags lv-norouter, the bridge to every other client, and router
+// advertisements as on any network (they cannot be withheld from one guest).
+// A network with a router offers it to everyone.
 func TestDnsmasqArgs_NoRouter(t *testing.T) {
-	const noRouterV4, noRouterV6 = "--dhcp-option=option:router", "--ra-param=br-x,0,0"
+	const tagged = "--dhcp-option=tag:lv-norouter,option:router"
 	cases := []struct {
 		name             string
 		start, end, mask string
 		gateway          string
 		noRouter         bool
-		wantV4, wantV6   bool
+		want             bool
 	}{
-		{"v4 isolated", "10.0.0.2", "10.0.0.254", "255.255.255.0", "10.0.0.1/24", true, true, false},
-		{"v4 routed", "10.0.0.2", "10.0.0.254", "255.255.255.0", "10.0.0.1/24", false, false, false},
-		{"v6 isolated", "2001:db8::2", "2001:db8::ffff", "64", "2001:db8::1/64", true, false, true},
-		{"v6 routed", "2001:db8::2", "2001:db8::ffff", "64", "2001:db8::1/64", false, false, false},
+		{"v4 isolated", "10.0.0.2", "10.0.0.254", "255.255.255.0", "10.0.0.1/24", true, true},
+		{"v4 routed", "10.0.0.2", "10.0.0.254", "255.255.255.0", "10.0.0.1/24", false, false},
+		{"v6 isolated", "2001:db8::2", "2001:db8::ffff", "64", "2001:db8::1/64", true, false},
+		{"v6 routed", "2001:db8::2", "2001:db8::ffff", "64", "2001:db8::1/64", false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			args := dnsmasqArgs("br-x", tc.start, tc.end, tc.mask, tc.gateway, "/run/lv-br-x.pid", tc.noRouter, nil, "", 0)
-			if got := hasArg(args, noRouterV4); got != tc.wantV4 {
-				t.Errorf("%s present = %v, want %v\nargs: %s", noRouterV4, got, tc.wantV4, strings.Join(args, " "))
+			if got := hasArg(args, tagged); got != tc.want {
+				t.Errorf("%s present = %v, want %v\nargs: %s", tagged, got, tc.want, strings.Join(args, " "))
 			}
-			if got := hasArg(args, noRouterV6); got != tc.wantV6 {
-				t.Errorf("%s present = %v, want %v\nargs: %s", noRouterV6, got, tc.wantV6, strings.Join(args, " "))
+			for _, a := range args {
+				if a == "--dhcp-option=option:router" || strings.HasPrefix(a, "--ra-param") {
+					t.Errorf("router withheld from every client: %q\nargs: %s", a, strings.Join(args, " "))
+				}
 			}
 		})
 	}

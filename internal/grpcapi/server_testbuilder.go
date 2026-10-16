@@ -78,18 +78,19 @@ func NewServerForTests(opts TestServerOpts) *Server {
 	imgs := image.NewStore(opts.DataDir)
 	_ = imgs.Init()
 	s := &Server{
-		hostName:       opts.HostName,
-		dataDir:        opts.DataDir,
-		pkiDir:         opts.PKIDir,
-		db:             opts.DB,
-		virt:           opts.Virt,
-		images:         imgs,
-		events:         events.NewBus(),
-		vmLocks:        make(map[string]*sync.Mutex),
-		ReExecCh:       make(chan struct{}, 1),
-		ShutdownCh:     make(chan struct{}, 1),
-		fetchBinarySem: make(chan struct{}, fetchBinaryMaxConcurrent),
-		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
+		hostName:            opts.HostName,
+		dataDir:             opts.DataDir,
+		pkiDir:              opts.PKIDir,
+		db:                  opts.DB,
+		virt:                opts.Virt,
+		images:              imgs,
+		events:              events.NewBus(),
+		vmLocks:             make(map[string]*sync.Mutex),
+		ReExecCh:            make(chan struct{}, 1),
+		ShutdownCh:          make(chan struct{}, 1),
+		fetchBinarySem:      make(chan struct{}, fetchBinaryMaxConcurrent),
+		pushBackupSem:       make(chan struct{}, pushBackupMaxConcurrent),
+		automationExportSem: make(chan struct{}, automationExportConcurrent),
 	}
 	s.wireCertificateVerifier()
 	s.wireReplicationReleaseGates()

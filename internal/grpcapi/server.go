@@ -38,10 +38,11 @@ import (
 
 // Server implements the LiteVirt gRPC service.
 type Server struct {
-	automationMu     sync.Mutex
-	automationSource *corrosion.AutomationSourcePreparer
-	automationEngine *automation.Engine
-	networkEffects   NetworkEffects
+	automationMu        sync.Mutex
+	automationSource    *corrosion.AutomationSourcePreparer
+	automationExportSem chan struct{}
+	automationEngine    *automation.Engine
+	networkEffects      NetworkEffects
 	// reseeding admits one local reseed at a time; see reseed_singleflight.go.
 	reseeding reseedInFlight
 	pb.UnimplementedLiteVirtServer
@@ -2371,20 +2372,21 @@ type StoragePoolRef struct {
 // NewServer creates a new gRPC service handler.
 func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt LibvirtBackend, images *image.Store) *Server {
 	s := &Server{
-		startedAt:      time.Now(),
-		hostName:       hostName,
-		dataDir:        dataDir,
-		pkiDir:         pkiDir,
-		db:             db,
-		virt:           virt,
-		images:         images,
-		events:         events.NewBus(),
-		vmLocks:        make(map[string]*sync.Mutex),
-		loginThrottle:  newLoginThrottle(),
-		ReExecCh:       make(chan struct{}, 1),
-		ShutdownCh:     make(chan struct{}, 1),
-		fetchBinarySem: make(chan struct{}, fetchBinaryMaxConcurrent),
-		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
+		startedAt:           time.Now(),
+		hostName:            hostName,
+		dataDir:             dataDir,
+		pkiDir:              pkiDir,
+		db:                  db,
+		virt:                virt,
+		images:              images,
+		events:              events.NewBus(),
+		vmLocks:             make(map[string]*sync.Mutex),
+		loginThrottle:       newLoginThrottle(),
+		ReExecCh:            make(chan struct{}, 1),
+		ShutdownCh:          make(chan struct{}, 1),
+		fetchBinarySem:      make(chan struct{}, fetchBinaryMaxConcurrent),
+		pushBackupSem:       make(chan struct{}, pushBackupMaxConcurrent),
+		automationExportSem: make(chan struct{}, automationExportConcurrent),
 	}
 	s.wireCertificateVerifier()
 	s.wireReplicationReleaseGates()

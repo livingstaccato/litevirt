@@ -25,6 +25,10 @@ func sourcePreparationFixture(t *testing.T) (*AutomationSourcePreparer, Automati
 	return sourcePreparationFixtureAt(t, "")
 }
 func sourcePreparationFixtureAt(t *testing.T, dataDir string) (*AutomationSourcePreparer, AutomationSourceRequest) {
+	p, r, _ := sourcePreparationFixtureWithPeer(t, dataDir)
+	return p, r
+}
+func sourcePreparationFixtureWithPeer(t *testing.T, dataDir string) (*AutomationSourcePreparer, AutomationSourceRequest, *claimTestVoter) {
 	t.Helper()
 	ctx := context.Background()
 	ca := newClaimTestCA(t)
@@ -105,7 +109,7 @@ func sourcePreparationFixtureAt(t *testing.T, dataDir string) (*AutomationSource
 	if err := InsertHost(ctx, a.c, HostRecord{Name: "a", Address: "127.0.0.1", SSHUser: "test", GRPCPort: 50051, CertSerial: leaf.SerialNumber.Text(16), State: "active"}); err != nil {
 		t.Fatal(err)
 	}
-	return NewAutomationSourcePreparer(a.c, a.pki), AutomationSourceRequest{Generation: 1, Target: "a", Job: "owned", Revision: 1, Sources: first.Members}
+	return NewAutomationSourcePreparer(a.c, a.pki), AutomationSourceRequest{Generation: 1, Target: "a", Job: "owned", Revision: 1, Sources: first.Members}, b
 }
 
 func TestSourcePreparationBindings(t *testing.T) {

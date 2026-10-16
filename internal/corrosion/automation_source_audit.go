@@ -178,7 +178,9 @@ type sourceDiscovery struct {
 // auditSourceTx consumes genuine locally retained ordinary adoption/value
 // lineage. It does not reinterpret a replica row, seal, or imported_from as a
 // certificate. Destructive reseed and forced ancestry are explicitly unavailable.
-func (c *Client) auditSourceTx(ctx context.Context, tx *LocalTx, r AutomationSourceRequest) (sourceDiscovery, error) {
+// sourceLineageTx is the shared actual normal adoption/membership authority.
+// Export retains this bounded indexed lineage walk without repeating cut scans.
+func (c *Client) sourceLineageTx(ctx context.Context, tx *LocalTx, r AutomationSourceRequest) (sourceDiscovery, error) {
 	var out sourceDiscovery
 	rows, err := tx.Query(ctx, `SELECT incarnation FROM local_voter_incarnation WHERE id=1 AND length(CAST(incarnation AS BLOB)) BETWEEN 1 AND 128`)
 	if err != nil {
@@ -238,7 +240,15 @@ func (c *Client) auditSourceTx(ctx context.Context, tx *LocalTx, r AutomationSou
 	if err := ValidateVoterChange(out.old, out.next.VoterConfigValue); err != nil {
 		return out, err
 	}
-	rows, err = tx.Query(ctx, `SELECT id,metadata,root,generation,incarnation FROM local_automation_cuts WHERE generation=? AND incarnation=? AND length(CAST(metadata AS BLOB))<=? AND length(id)=32 AND length(root)=64 LIMIT 1`, r.Generation, out.incarnation, maxAutomationCutMetadataBytes)
+	return out, nil
+}
+
+func (c *Client) auditSourceTx(ctx context.Context, tx *LocalTx, r AutomationSourceRequest) (sourceDiscovery, error) {
+	out, err := c.sourceLineageTx(ctx, tx, r)
+	if err != nil {
+		return out, err
+	}
+	rows, err := tx.Query(ctx, `SELECT id,metadata,root,generation,incarnation FROM local_automation_cuts WHERE generation=? AND incarnation=? AND length(CAST(metadata AS BLOB))<=? AND length(id)=32 AND length(root)=64 LIMIT 1`, r.Generation, out.incarnation, maxAutomationCutMetadataBytes)
 	if err != nil {
 		return out, err
 	}

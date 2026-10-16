@@ -174,7 +174,9 @@ func TestAutomationCutRetainsLosingAcceptance(t *testing.T) {
 	}
 }
 
-func TestAutomationCutManyLargeRecords(t *testing.T) {
+func TestAutomationCutManyLargeRecords(t *testing.T) { largeAutomationCutFixture(t) }
+func largeAutomationCutFixture(t *testing.T) (*AutomationFixture, *corrosion.VoterConfig, string) {
+	t.Helper()
 	f := NewAutomationFixture(t, 3)
 	n := f.cluster.Nodes[0]
 	for seq := 2; seq <= 34; seq++ {
@@ -215,6 +217,12 @@ func TestAutomationCutManyLargeRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	for i := 0; i < 100; i++ {
+		result, e := n.DB.ClaimPrepare(f.ctx, corrosion.ClaimKey{TargetKind: corrosion.ClaimKindVM, TargetName: fmt.Sprintf("export-promise-%03d", i), OwnerEpoch: 1}, corrosion.Ballot{Round: 100, Coordinator: n.Name, Nonce: []byte("export-many")}, cfg.Generation)
+		if e != nil || !result.Promised {
+			t.Fatal("actual promise fixture", result, e)
+		}
+	}
 	if err = n.DB.SealVoterGeneration(f.ctx, cfg.Generation, "test"); err != nil {
 		t.Fatal(err)
 	}
@@ -227,4 +235,5 @@ func TestAutomationCutManyLargeRecords(t *testing.T) {
 		t.Fatal("large multi-record history was not preserved", rows, err)
 	}
 	t.Logf("history records=%d maximum=%d total=%d; production scans hold one indexed LIMIT 1 record", rows[0].Int64("n"), rows[0].Int64("biggest"), rows[0].Int64("total"))
+	return f, cfg, id
 }

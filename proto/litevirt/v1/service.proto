@@ -4785,6 +4785,7 @@ service LiteVirt {
     // Single-decree Paxos per claim key. Peer-only: the caller must present a
     // known host certificate, and a ballot must name its sender. A voter
     // replies only after the state its reply depends on is committed.
+    rpc ExportAutomationSource(AutomationSourceExportRequest) returns (stream AutomationSourceExportResponse);
     rpc GetAutomationDecision(GetAutomationDecisionRequest) returns (GetAutomationDecisionResponse);
     rpc InstallAutomationDecision(InstallAutomationDecisionRequest) returns (InstallAutomationDecisionResponse);
     rpc PrepareRecoveryClaim(PrepareRecoveryClaimRequest) returns (PrepareRecoveryClaimResponse);
@@ -6006,4 +6007,35 @@ message PreflightRecreateVMRequest {
 // Complete internal recovery decision; not a public command admission RPC.
 message AutomationClaimValue {
     bytes envelope = 1;
+}
+
+// Internal immutable source export. Each call returns exactly one bounded page.
+message AutomationSourceExportRequest {
+    uint32 version = 1;
+    string purpose = 2;
+    string stream = 3;
+    int64 generation = 4;
+    string target = 5;
+    string job = 6;
+    int64 revision = 7;
+    repeated ClaimVoterMember sources = 8;
+    string publication_id = 9;
+    // 0 artifact, 1 binary trust, 2 membership, 3..11 content sections.
+    uint32 component = 10;
+    string cursor = 11;
+    uint32 max_records = 12;
+    uint32 max_bytes = 13;
+}
+message AutomationSourceExportResponse {
+    uint32 version = 1;
+    string publication_id = 2;
+    uint32 component = 3;
+    bytes metadata = 4;
+    repeated bytes records = 5;
+    bytes chunk = 6;
+    string cursor = 7;
+    bool terminal = 8;
+    int64 terminal_records = 9;
+    int64 terminal_bytes = 10;
+    string terminal_digest = 11;
 }

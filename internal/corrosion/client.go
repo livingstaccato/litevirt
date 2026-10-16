@@ -119,6 +119,7 @@ type Client struct {
 	automationPublicationDir     string
 	automationPublicationReady   bool
 	automationPublicationSeams   *localCommitSeams
+	automationExportBeforeRead   func()
 	automationSourceMu           sync.Mutex
 	automationSourceClosed       bool
 	automationSourcePreparations map[*AutomationSourcePreparation]bool

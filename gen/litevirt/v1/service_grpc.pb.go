@@ -297,6 +297,7 @@ const (
 	LiteVirt_StreamSensitiveTableRows_FullMethodName   = "/litevirt.v1.LiteVirt/StreamSensitiveTableRows"
 	LiteVirt_TriggerAntiEntropy_FullMethodName         = "/litevirt.v1.LiteVirt/TriggerAntiEntropy"
 	LiteVirt_GetClusterStateDigest_FullMethodName      = "/litevirt.v1.LiteVirt/GetClusterStateDigest"
+	LiteVirt_ExportAutomationSource_FullMethodName     = "/litevirt.v1.LiteVirt/ExportAutomationSource"
 	LiteVirt_GetAutomationDecision_FullMethodName      = "/litevirt.v1.LiteVirt/GetAutomationDecision"
 	LiteVirt_InstallAutomationDecision_FullMethodName  = "/litevirt.v1.LiteVirt/InstallAutomationDecision"
 	LiteVirt_PrepareRecoveryClaim_FullMethodName       = "/litevirt.v1.LiteVirt/PrepareRecoveryClaim"
@@ -863,6 +864,7 @@ type LiteVirtClient interface {
 	// Single-decree Paxos per claim key. Peer-only: the caller must present a
 	// known host certificate, and a ballot must name its sender. A voter
 	// replies only after the state its reply depends on is committed.
+	ExportAutomationSource(ctx context.Context, in *AutomationSourceExportRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[AutomationSourceExportResponse], error)
 	GetAutomationDecision(ctx context.Context, in *GetAutomationDecisionRequest, opts ...grpc.CallOption) (*GetAutomationDecisionResponse, error)
 	InstallAutomationDecision(ctx context.Context, in *InstallAutomationDecisionRequest, opts ...grpc.CallOption) (*InstallAutomationDecisionResponse, error)
 	PrepareRecoveryClaim(ctx context.Context, in *PrepareRecoveryClaimRequest, opts ...grpc.CallOption) (*PrepareRecoveryClaimResponse, error)
@@ -4177,6 +4179,25 @@ func (c *liteVirtClient) GetClusterStateDigest(ctx context.Context, in *emptypb.
 	return out, nil
 }
 
+func (c *liteVirtClient) ExportAutomationSource(ctx context.Context, in *AutomationSourceExportRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[AutomationSourceExportResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[40], LiteVirt_ExportAutomationSource_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[AutomationSourceExportRequest, AutomationSourceExportResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_ExportAutomationSourceClient = grpc.ServerStreamingClient[AutomationSourceExportResponse]
+
 func (c *liteVirtClient) GetAutomationDecision(ctx context.Context, in *GetAutomationDecisionRequest, opts ...grpc.CallOption) (*GetAutomationDecisionResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetAutomationDecisionResponse)
@@ -4229,7 +4250,7 @@ func (c *liteVirtClient) GetRecoveryClaim(ctx context.Context, in *GetRecoveryCl
 
 func (c *liteVirtClient) ListRecoveryClaims(ctx context.Context, in *ListRecoveryClaimsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RecoveryClaimState], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[40], LiteVirt_ListRecoveryClaims_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[41], LiteVirt_ListRecoveryClaims_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4438,7 +4459,7 @@ func (c *liteVirtClient) GetSpiceInfo(ctx context.Context, in *GetSpiceInfoReque
 
 func (c *liteVirtClient) ProxySpice(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SpiceData, SpiceData], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[41], LiteVirt_ProxySpice_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[42], LiteVirt_ProxySpice_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4481,7 +4502,7 @@ func (c *liteVirtClient) RegionStatus(ctx context.Context, in *RegionStatusReque
 
 func (c *liteVirtClient) CrossRegionMigrate(ctx context.Context, in *CrossRegionMigrateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MigrateProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[42], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[43], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4670,7 +4691,7 @@ func (c *liteVirtClient) DeleteReplicationSchedule(ctx context.Context, in *Dele
 
 func (c *liteVirtClient) PromoteReplica(ctx context.Context, in *PromoteReplicaRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PromoteReplicaProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[43], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[44], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -5383,6 +5404,7 @@ type LiteVirtServer interface {
 	// Single-decree Paxos per claim key. Peer-only: the caller must present a
 	// known host certificate, and a ballot must name its sender. A voter
 	// replies only after the state its reply depends on is committed.
+	ExportAutomationSource(*AutomationSourceExportRequest, grpc.ServerStreamingServer[AutomationSourceExportResponse]) error
 	GetAutomationDecision(context.Context, *GetAutomationDecisionRequest) (*GetAutomationDecisionResponse, error)
 	InstallAutomationDecision(context.Context, *InstallAutomationDecisionRequest) (*InstallAutomationDecisionResponse, error)
 	PrepareRecoveryClaim(context.Context, *PrepareRecoveryClaimRequest) (*PrepareRecoveryClaimResponse, error)
@@ -6469,6 +6491,9 @@ func (UnimplementedLiteVirtServer) TriggerAntiEntropy(context.Context, *TriggerA
 }
 func (UnimplementedLiteVirtServer) GetClusterStateDigest(context.Context, *emptypb.Empty) (*ClusterStateDigestResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetClusterStateDigest not implemented")
+}
+func (UnimplementedLiteVirtServer) ExportAutomationSource(*AutomationSourceExportRequest, grpc.ServerStreamingServer[AutomationSourceExportResponse]) error {
+	return status.Error(codes.Unimplemented, "method ExportAutomationSource not implemented")
 }
 func (UnimplementedLiteVirtServer) GetAutomationDecision(context.Context, *GetAutomationDecisionRequest) (*GetAutomationDecisionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetAutomationDecision not implemented")
@@ -11353,6 +11378,17 @@ func _LiteVirt_GetClusterStateDigest_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_ExportAutomationSource_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(AutomationSourceExportRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(LiteVirtServer).ExportAutomationSource(m, &grpc.GenericServerStream[AutomationSourceExportRequest, AutomationSourceExportResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_ExportAutomationSourceServer = grpc.ServerStreamingServer[AutomationSourceExportResponse]
+
 func _LiteVirt_GetAutomationDecision_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetAutomationDecisionRequest)
 	if err := dec(in); err != nil {
@@ -13959,6 +13995,11 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "StreamSensitiveTableRows",
 			Handler:       _LiteVirt_StreamSensitiveTableRows_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "ExportAutomationSource",
+			Handler:       _LiteVirt_ExportAutomationSource_Handler,
 			ServerStreams: true,
 		},
 		{

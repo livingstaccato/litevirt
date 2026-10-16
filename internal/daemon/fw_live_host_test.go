@@ -174,3 +174,43 @@ func TestFwLiveTarget_WiredInDaemon(t *testing.T) {
 		}
 	}
 }
+
+// Review D2-13 N-7 / m-2: the start-up firmware move recovery takes its locks
+// right after the device leases are recovered and before any runtime loop
+// starts, and is wired before its per-minute pass starts (N-1).
+//
+// Mutation: move RecoverFirmwareMoves below the loops, or MarkStartupWired
+// after the pass starts — red.
+func TestFwLiveRecovery_StartupOrder(t *testing.T) {
+	src, err := os.ReadFile("daemon.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := func(want string) int {
+		t.Helper()
+		off := 0
+		for _, l := range strings.SplitAfter(string(src), "\n") {
+			if tr := strings.TrimSpace(l); !strings.HasPrefix(tr, "//") && strings.Contains(tr, want) {
+				return off
+			}
+			off += len(l)
+		}
+		t.Fatalf("daemon.go does not call %s", want)
+		return -1
+	}
+	order := []string{
+		"svc.RecoverDeviceLeases(ctx)",
+		"svc.RecoverFirmwareMoves(ctx)",
+		"svc.RecoverResourceOperationsAtStart(ctx)",
+		"svc.RecoverHardwareOperationsAtStart(ctx)",
+		"go svc.RunDrainColdMoveRecovery(ctx)",
+		"svc.MarkStartupWired()",
+		"go svc.RunFirmwareMoveRecovery(ctx)",
+		"pb.RegisterLiteVirtServer(d.grpcSrv, svc)",
+	}
+	for i := 1; i < len(order); i++ {
+		if code(order[i-1]) >= code(order[i]) {
+			t.Errorf("daemon.go calls %s after %s", order[i-1], order[i])
+		}
+	}
+}

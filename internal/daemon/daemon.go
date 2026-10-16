@@ -1331,7 +1331,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// failure never wedges active_operation_id. Uses replicated operation state (not the
 	// host-local journal), so it runs regardless of the journal above. A reconciler pass
 	// retries stragglers.
-	svc.RecoverResourceOperations(ctx)
+	// At start a VM whose lock is held (a firmware move's recovery holds it
+	// until the start is wired, below) is skipped; the loop takes it later.
+	svc.RecoverResourceOperationsAtStart(ctx)
 	go svc.RunResourceOperationRecovery(ctx)
 
 	// F1 hardware-operation recovery: resume any locally-owned VM wedged on a
@@ -1340,7 +1342,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// FORWARD to a single consistent state, clearing the barrier. Runs synchronously
 	// after DB + libvirt + journal init (uses the host-local journal artifacts), and
 	// a reconciler pass retries stragglers.
-	svc.RecoverHardwareOperations(ctx)
+	svc.RecoverHardwareOperationsAtStart(ctx)
 
 	// Release PCI devices a VM owns but provably does not hold, once the
 	// recoveries above have settled every lease and operation that could
@@ -1956,9 +1958,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	grpcOpts = append(grpcOpts, obs.ServerOptions()...)
 	d.grpcSrv = grpc.NewServer(grpcOpts...)
 
-	// The firmware move recovery's pass (spec §8.1): every minute, a parked
-	// move's blocked call is retried, fence resolution tried, and each owed
-	// DISCARD sent.
+	// Every setter has run: the firmware moves locked at the journal barrier
+	// are recovered from here (review D2-13 N-1). Then, every minute, a
+	// parked move's blocked call is retried, fence resolution tried, and
+	// each owed DISCARD sent (spec §8.1).
+	svc.MarkStartupWired()
 	go svc.RunFirmwareMoveRecovery(ctx)
 
 	pb.RegisterLiteVirtServer(d.grpcSrv, svc)

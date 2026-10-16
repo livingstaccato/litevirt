@@ -50,7 +50,10 @@ const (
 	condFwmigCleanupFailed = "firmware_migration_cleanup_failed"
 	// condFwmigVFMissing: the guest runs (on the source after a failed move,
 	// or on the target after its release) without SR-IOV VFs the move
-	// detached from it (review D2-13 I-1).
+	// detached from it (review D2-13 I-1). Each host's recovery pass resolves
+	// it for a VM its row names here once the guest runs with as many VFs it
+	// owns here, or is stopped; any host resolves it once the VM is deleted
+	// or has moved off the host it named (ResolveFirmwareVFMissingOnce).
 	condFwmigVFMissing = "firmware_migration_vf_missing"
 )
 
@@ -82,6 +85,12 @@ type fwmigCondition struct {
 	Paths    []string          // the records, quarantine or state it names
 	Detail   string
 	Action   string // what resolves it, when an operator must
+	// RunsOn and VFs, when set, are where the guest runs and the VFs it
+	// misses (firmware_migration_vf_missing).
+	RunsOn string
+	VFs    []string
+	// VFsWanted is how many VFs the guest had before the move.
+	VFsWanted int
 }
 
 // raiseFirmwareMigrationCondition raises c (or refreshes it), from this host.
@@ -117,10 +126,14 @@ func (s *Server) raiseFirmwareMigrationCondition(ctx context.Context, c fwmigCon
 	}
 	row.ObserveCount++
 	row.CleanCount = 0
-	ev, err := json.Marshal(map[string]any{
+	evm := map[string]any{
 		"vm": c.VM, "attempt": c.Attempt, "source": c.Source, "target": c.Target, "host": s.hostName,
 		"hashes": c.Hashes, "paths": c.Paths, "detail": c.Detail, "action": c.Action,
-	})
+	}
+	if c.RunsOn != "" {
+		evm["runs_on"], evm["vfs"], evm["vfs_wanted"] = c.RunsOn, c.VFs, c.VFsWanted
+	}
+	ev, err := json.Marshal(evm)
 	if err != nil {
 		return err
 	}

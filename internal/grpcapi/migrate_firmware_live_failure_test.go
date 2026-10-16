@@ -993,6 +993,7 @@ func TestFenceResolution_PreCutoverParkResolves(t *testing.T) {
 // Mutation: reattach before the M1p resume — red.
 func TestM1p_ResumedGuestGetsItsVFs(t *testing.T) {
 	r := newFwlRig(t, fwlOpts{})
+	r.withLeaseJournal() // a live firmware move detaches VFs only under a lease (review D2-13 N-6)
 	fs := newPCIUnbindRecordingFS()
 	t.Cleanup(vfio.SetFS(fs))
 	const vf = "0000:41:10.0"

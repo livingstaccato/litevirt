@@ -18,6 +18,7 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -97,6 +98,12 @@ func (s *Server) startLockedFirmwareRecoveries(ctx context.Context, locked []pen
 		go func(p pendingFirmwareRecovery) {
 			defer s.fwLive.recovering.Done()
 			defer p.unlock()
+			// Locked from the journal barrier, recovered only once every
+			// setter has run (review D2-13 N-1): the finish reads what they
+			// set.
+			if !s.waitStartupWired(ctx) {
+				return
+			}
 			if !s.takeRecoverySlot(ctx, true) {
 				return
 			}
@@ -113,10 +120,42 @@ func (s *Server) startLockedFirmwareRecoveries(ctx context.Context, locked []pen
 	s.fwLive.recovering.Add(1)
 	go func() {
 		defer s.fwLive.recovering.Done()
-		if s.waitReplicaCaughtUp(ctx, firmwareRecoveryCatchUpWait) {
+		if s.waitStartupWired(ctx) && s.waitReplicaCaughtUp(ctx, firmwareRecoveryCatchUpWait) {
 			s.sendOwedFirmwareDiscards(ctx)
 		}
 	}()
+}
+
+// MarkStartupWired is called by the daemon once every late setter has run:
+// the start-up recovery, locked earlier, then goes on.
+func (s *Server) MarkStartupWired() {
+	ch := s.startupWiredCh()
+	s.fwLive.recoveryMu.Lock()
+	defer s.fwLive.recoveryMu.Unlock()
+	select {
+	case <-ch:
+	default:
+		close(ch)
+	}
+}
+
+func (s *Server) startupWiredCh() chan struct{} {
+	s.fwLive.recoveryMu.Lock()
+	defer s.fwLive.recoveryMu.Unlock()
+	if s.fwLive.wired == nil {
+		s.fwLive.wired = make(chan struct{})
+	}
+	return s.fwLive.wired
+}
+
+// waitStartupWired waits for MarkStartupWired, or ctx.
+func (s *Server) waitStartupWired(ctx context.Context) bool {
+	select {
+	case <-s.startupWiredCh():
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // FirmwareMoveRecoveryOnce is one recovery pass, waited for.
@@ -160,6 +199,94 @@ func (s *Server) startFirmwareMoveRecoveryPass(ctx context.Context) {
 		defer s.fwLive.recovering.Done()
 		s.sendOwedFirmwareDiscards(ctx)
 	}()
+	s.ResolveFirmwareVFMissingOnce(ctx)
+}
+
+// ResolveFirmwareVFMissingOnce judges each open firmware_migration_vf_missing
+// condition (review D2-13 N-3), on the host the VM's row names, as the guest
+// is now: resolved when the VM is deleted, has moved off the host the
+// condition named, is not running, or runs with at least as many VFs it owns
+// here in the guest as were missing. Anything unreadable leaves it.
+func (s *Server) ResolveFirmwareVFMissingOnce(ctx context.Context) {
+	if s.db == nil {
+		return
+	}
+	conds, err := corrosion.ListOpenHealthConditionsByCode(ctx, s.db, firmwareMigrationEvaluator, condFwmigVFMissing)
+	if err != nil {
+		return
+	}
+	for _, c := range conds {
+		if c.SubjectKind != "vm" {
+			continue
+		}
+		var ev struct {
+			RunsOn    string   `json:"runs_on"`
+			VFs       []string `json:"vfs"`
+			VFsWanted int      `json:"vfs_wanted"`
+		}
+		if json.Unmarshal([]byte(c.Evidence), &ev) != nil {
+			continue
+		}
+		vm := c.SubjectID
+		row, err := corrosion.GetVM(ctx, s.db, vm)
+		if err != nil {
+			continue
+		}
+		why := ""
+		switch {
+		case row == nil:
+			why = "the VM was deleted"
+		case ev.RunsOn != "" && row.HostName != ev.RunsOn:
+			why = "the VM moved to " + row.HostName
+		case row.HostName != s.hostName:
+			continue // its host judges it
+		default:
+			want := ev.VFsWanted
+			if want < len(ev.VFs) {
+				want = len(ev.VFs)
+			}
+			why = s.firmwareVFsBack(ctx, vm, want)
+		}
+		if why == "" {
+			continue
+		}
+		if err := s.resolveFirmwareMigrationCondition(ctx, condFwmigVFMissing, vm); err == nil {
+			slog.Info("live firmware move: the VF-missing condition is resolved", "vm", vm, "why", why)
+		}
+	}
+}
+
+// firmwareVFsBack says why vm, whose row names this host, no longer misses
+// VFs: it is not running, or runs with at least want of the VFs it owns here
+// in the guest. "" is still missing, or unknown.
+func (s *Server) firmwareVFsBack(ctx context.Context, vm string, want int) string {
+	if s.virt == nil {
+		return ""
+	}
+	st, err := s.sourceDomainState(vm)
+	if err != nil {
+		return ""
+	}
+	if st != "running" {
+		return "the VM is " + st
+	}
+	devs, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
+	if err != nil {
+		return ""
+	}
+	in := 0
+	for _, d := range devs {
+		if d.VMName != vm {
+			continue
+		}
+		if ok, err := s.liveHostdevPresent(vm, d.Address); err == nil && ok {
+			in++
+		}
+	}
+	if in < want {
+		return ""
+	}
+	return fmt.Sprintf("the guest runs with %d VF(s) it owns here", in)
 }
 
 // sendOwedFirmwareDiscards is RetryOwedFirmwareDiscardsOnce, one at a time.
@@ -281,6 +408,10 @@ func (s *Server) recoverFirmwareMoveLocked(ctx context.Context, vm string, start
 			r.parked = m
 			r.marker.Phase, r.marker.ParkedFrom, r.marker.Detail = m.ParkedFrom, "", ""
 		}
+		if s.opJournal == nil {
+			r.parkAction = "both copies of the firmware state are kept, and the guest is not run: this host's operation journal did not open (see the daemon log), " +
+				"so the VFs the move detached cannot be known; repair <data_dir>/opjournal and restart the daemon, and the move is retried each minute"
+		}
 		_ = s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseSourceStateMissing,
 			fmt.Sprintf("the SR-IOV VFs detached for the move cannot be read on %s: %v", s.hostName, verr))
 		if m.Phase.Parked() {
@@ -297,7 +428,10 @@ func (s *Server) recoverFirmwareMoveLocked(ctx context.Context, vm string, start
 		return
 	}
 	slog.Info("live firmware move recovery: resuming", "vm", vm, "attempt", m.Attempt, "target", m.Target, "phase", m.Phase, "vfs", len(vfs))
-	s.recoverFirmwareMoveFrom(ctx, r, m.Phase, startup)
+	// An unparked marker with its lock free was left by a process that died:
+	// a committed one redoes the whole finish, the target's VF attach with it
+	// (review D2-13 N-4).
+	s.recoverFirmwareMoveFrom(ctx, r, m.Phase, true)
 }
 
 // noRetryPark reports a park that takes no further step (§8.1 amendment
@@ -389,20 +523,22 @@ func (s *Server) noteSourceVFs(ctx context.Context, r *liveFirmwareRun) {
 			missing = append(missing, vf.Address)
 		}
 	}
-	s.noteFirmwareMoveVFsMissing(ctx, r.marker, s.hostName, missing)
+	s.noteFirmwareMoveVFsMissing(ctx, r.marker, s.hostName, missing, len(r.vfs))
 }
 
 // noteFirmwareMoveVFsMissing raises (missing set) or resolves the condition
 // that m's guest runs on host without VFs it owns.
-func (s *Server) noteFirmwareMoveVFsMissing(ctx context.Context, m fwmig.Marker, host string, missing []string) {
+func (s *Server) noteFirmwareMoveVFsMissing(ctx context.Context, m fwmig.Marker, host string, missing []string, wanted int) {
 	if len(missing) == 0 {
 		_ = s.resolveFirmwareMigrationCondition(ctx, condFwmigVFMissing, m.VM)
 		return
 	}
 	if err := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{
 		Code: condFwmigVFMissing, VM: m.VM, Attempt: m.Attempt, Source: s.hostName, Target: m.Target,
+		RunsOn: host, VFs: missing, VFsWanted: wanted,
 		Detail: fmt.Sprintf("the guest runs on %s without the SR-IOV VFs %s it had before live firmware migration %s", host, strings.Join(missing, ", "), m.Attempt),
-		Action: "attach the VFs to the guest again, or restart it so its devices are allocated again",
+		Action: fmt.Sprintf("attach %d SR-IOV VF(s) to the guest on %s again, or restart it there so its devices are allocated again; "+
+			"the condition clears on its own once the guest runs there with all %d of its VFs, or is stopped, deleted or moved", len(missing), host, wanted),
 	}); err != nil {
 		slog.Warn("live firmware move: raise the condition", "vm", m.VM, "code", condFwmigVFMissing, "error", err)
 	}
@@ -476,7 +612,7 @@ func (s *Server) reraiseParkedCondition(ctx context.Context, m fwmig.Marker) {
 	if !ok || s.fwmigConditionOpenWith(ctx, code, m.VM, m.Detail) {
 		return
 	}
-	s.raiseParkCondition(ctx, m, m.Phase, m.Detail)
+	s.raiseParkCondition(ctx, m, m.Phase, m.Detail, "")
 }
 
 // settleRetriedPark resolves the condition of the park orig once a retry

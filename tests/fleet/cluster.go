@@ -952,6 +952,7 @@ func (c *Cluster) buildServer(n *Node) {
 	// The firmware move recovery, as the daemon runs it: at start, then
 	// every interval.
 	n.Server.RecoverFirmwareMoves(loops)
+	n.Server.MarkStartupWired()
 	go n.Server.RunFirmwareMoveRecovery(loops)
 
 	// Wire a real Replicator so the server's PushMutations handler + write-notify

@@ -46,6 +46,9 @@ type liveFirmwareRun struct {
 	// that park (D2-10 m-7), and one that ends in it again with the same
 	// detail writes nothing (spec §8.1).
 	parked fwmig.Marker
+	// parkAction, when set, is the Action of the next park's condition, in
+	// place of the generic one.
+	parkAction string
 	// oneAttempt makes each call to the target one attempt, not a retry for
 	// fwLiveRetryFor: the recovery's next pass is its backoff, and the VM's
 	// lock is not held between attempts (review D2-13 m-1).
@@ -63,8 +66,10 @@ type fwLiveSourceState struct {
 	// recovering counts the goroutines the recovery started, so a test can
 	// wait for them.
 	recovering sync.WaitGroup
-	// recoveryMu guards owedRunning.
+	// recoveryMu guards owedRunning and wired.
 	recoveryMu sync.Mutex
+	// wired is closed by MarkStartupWired.
+	wired chan struct{}
 	// owedRunning is set while a pass sends the owed DISCARDs.
 	owedRunning bool
 	// recoverySlots bounds how many moves the recovery takes at once.
@@ -174,7 +179,8 @@ func (s *Server) parkLiveFirmwareMove(ctx context.Context, r *liveFirmwareRun, p
 			r.parked = fwmig.Marker{}
 		}
 	}
-	s.raiseParkCondition(ctx, m, p, detail)
+	s.raiseParkCondition(ctx, m, p, detail, r.parkAction)
+	r.parkAction = ""
 	slog.Error("live firmware move parked", "vm", m.VM, "attempt", m.Attempt, "target", m.Target, "phase", p, "detail", detail)
 	s.recordVMEvent(ctx, m.VM, "vm.migrate.firmware", "error", fmt.Sprintf("live firmware migration %s to %s parked as %s: %s", m.Attempt, m.Target, p, detail))
 	return status.Errorf(codes.FailedPrecondition,
@@ -183,17 +189,20 @@ func (s *Server) parkLiveFirmwareMove(ctx context.Context, r *liveFirmwareRun, p
 }
 
 // raiseParkCondition raises the condition of m's move parked as p.
-func (s *Server) raiseParkCondition(ctx context.Context, m fwmig.Marker, p fwmig.Phase, detail string) {
+func (s *Server) raiseParkCondition(ctx context.Context, m fwmig.Marker, p fwmig.Phase, detail, action string) {
 	code, ok := fwmigConditionFor[p]
 	if !ok {
 		return
+	}
+	if action == "" {
+		action = "both copies of the firmware state are kept, and nothing is deleted until the move is resolved"
 	}
 	if cerr := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{
 		Code: code, VM: m.VM, Attempt: m.Attempt, Source: s.hostName, Target: m.Target,
 		Hashes: map[string]string{"src_permall_sha256": m.SrcPermallSHA256, "src_nvram_sha256": m.SrcNvramSHA256},
 		Paths:  []string{s.fw().SwtpmDir(m.UUID), s.fw().NvramPath(m.VM)},
 		Detail: detail,
-		Action: "both copies of the firmware state are kept, and nothing is deleted until the move is resolved",
+		Action: action,
 	}); cerr != nil {
 		slog.Warn("live firmware move: raise the condition", "vm", m.VM, "code", code, "error", cerr)
 	}
@@ -334,9 +343,16 @@ func (s *Server) sendLiveFirmwareAbort(ctx context.Context, target, vm string, b
 func (s *Server) abortLiveFirmwareBeforeCutover(ctx context.Context, r *liveFirmwareRun, guestMayBeThere bool) (fwmig.Phase, string) {
 	m := r.marker
 	resp, err := s.sendLiveFirmwareAbort(ctx, r.target.Name, m.VM, m.Binding, pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_PRE_CUTOVER, m.CreatedStubs)
-	if abortTargetPredatesRPC(err) {
+	switch {
+	case abortTargetPredatesRPC(err) && !guestMayBeThere:
+		// libvirt never had the guest: a target without the RPC holds no
+		// domain of the attempt, only stubs (§7 P1).
 		slog.Warn("live firmware move: the target's build has no abort; it holds nothing of the attempt", "vm", m.VM, "attempt", m.Attempt, "target", r.target.Name)
 		return "", ""
+	case abortTargetPredatesRPC(err):
+		// After the migration call the incoming domain may be defined there,
+		// and a build without the RPCs cannot say (review D2-13 N-2).
+		return fwmig.PhaseTargetUnreachable, fmt.Sprintf("%s: %s", r.target.Name, errTargetRolledBack)
 	}
 	if err != nil {
 		return fwmig.PhaseTargetUnreachable, fmt.Sprintf("the abort before cutover was not answered by %s: %v", r.target.Name, err)
@@ -366,11 +382,18 @@ func (s *Server) abortLiveFirmwareBeforeCutover(ctx context.Context, r *liveFirm
 }
 
 // abortTargetPredatesRPC reports an Abort a target answered Unimplemented: its
-// build predates the live firmware RPCs, so it holds nothing of any attempt
-// (§7 P1, review D2-13 m-9).
+// build predates the live firmware RPCs. Before the migration call it holds
+// nothing of the attempt (§7 P1, review D2-13 m-9); after it, its domain
+// cannot be seen (N-2).
 func abortTargetPredatesRPC(err error) bool {
 	return err != nil && status.Code(err) == codes.Unimplemented
 }
+
+// errTargetRolledBack is the detail of a move whose target's build no longer
+// has the live firmware RPCs after the migration call. Both copies are kept;
+// the target's paused domain, if any, is the move's and is not to be run.
+const errTargetRolledBack = "its build no longer has the live firmware RPCs (rolled back?), so whether it holds a paused copy of the guest cannot be seen; " +
+	"both copies are kept and neither is run: upgrade the target again, and the move is retried each minute"
 
 func orNone(s string) string {
 	if s == "" {
@@ -455,10 +478,13 @@ func (s *Server) liveFirmwareMigrateFailed(ctx context.Context, r *liveFirmwareR
 func (s *Server) liveFirmwareSourcePaused(ctx context.Context, r *liveFirmwareRun, migrateErr error) (func(), bool) {
 	m := r.marker
 	resp, err := s.sendLiveFirmwareAbort(ctx, r.target.Name, m.VM, m.Binding, pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_PRE_CUTOVER, m.CreatedStubs)
-	if abortTargetPredatesRPC(err) {
-		resp, err = &pb.AbortLiveFirmwareTargetResponse{}, nil
-	}
 	switch {
+	case abortTargetPredatesRPC(err):
+		// The target may hold the paused incoming copy and cannot say: the
+		// source guest stays paused (review D2-13 N-2).
+		_ = s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseSourcePaused, fmt.Sprintf(
+			"the migration failed (%v) and left the source guest paused; %s: %s", migrateErr, r.target.Name, errTargetRolledBack))
+		return nil, true
 	case err != nil:
 		_ = s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseTargetUnreachable, fmt.Sprintf(
 			"the migration failed (%v) and left the source guest paused; the abort before cutover was not answered by %s: %v", migrateErr, r.target.Name, err))

@@ -2547,6 +2547,14 @@ func (s *Server) lockVM(vmName string) func() {
 
 // tryLockVM is lockVM without the wait: it returns the unlock function and
 // true when it took the lock, or nil and false when someone else holds it.
+// lockVMOrSkip is lockVM when wait is set, else tryLockVM.
+func (s *Server) lockVMOrSkip(vmName string, wait bool) (func(), bool) {
+	if wait {
+		return s.lockVM(vmName), true
+	}
+	return s.tryLockVM(vmName)
+}
+
 func (s *Server) tryLockVM(vmName string) (func(), bool) {
 	s.vmLocksMu.Lock()
 	if s.vmLocks == nil {

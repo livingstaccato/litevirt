@@ -209,6 +209,10 @@ func (s *Server) markDeviceLeaseRollbackIncomplete(vmName string, addrs []string
 //   - the VM exists with any other stage (Stage "bound" — a completed allocation whose
 //     finish() didn't run before the crash) → the entry is just cleared, WITHOUT releasing.
 //
+// A lease of a VM with a live firmware move marker (or one that cannot be read) is
+// left to the firmware move recovery, whatever its stage and before the VM's row is
+// read (RecoverFirmwareMoves).
+//
 // Runs at daemon startup, before serving. Best-effort — a transient error leaves the
 // entry for next time.
 func (s *Server) RecoverDeviceLeases(ctx context.Context) {
@@ -228,6 +232,15 @@ func (s *Server) RecoverDeviceLeases(ctx context.Context) {
 			continue // operation entries are handled by the operation-recovery barrier
 		}
 		addrs := splitCSVNonEmpty(e.Artifacts["addresses"])
+		// A live firmware move's device lease is its recovery's
+		// (RecoverFirmwareMoves): one owner, which knows whether the guest
+		// runs here, there, or nowhere yet. A marker that cannot be read is
+		// one too. Checked before anything else, the VM's row included: a
+		// replica not yet caught up can read it as gone (review D2-13 N-5).
+		if s.firmwareMoveMarked(e.ResourceID) {
+			slog.Info("device-lease recovery: a live firmware move's lease — left to its recovery", "vm", e.ResourceID, "stage", e.Stage, "devices", addrs)
+			continue
+		}
 		vm, err := corrosion.GetVM(ctx, s.db, e.ResourceID)
 		if err != nil {
 			slog.Warn("device-lease recovery: lookup vm", "vm", e.ResourceID, "error", err)
@@ -249,14 +262,6 @@ func (s *Server) RecoverDeviceLeases(ctx context.Context) {
 				continue // do NOT remove the entry; a later pass retries
 			}
 		} else if e.Stage == deviceLeaseStageMigrationDetached {
-			// A live firmware move's VFs are its recovery's
-			// (RecoverFirmwareMoves): one owner, which knows whether the
-			// guest runs here, there, or nowhere yet. A marker that cannot
-			// be read is one too.
-			if _, marked, merr := s.fwRecords().GetMarker(e.ResourceID); marked || merr != nil {
-				slog.Info("device-lease recovery: a live firmware move's VFs — left to its recovery", "vm", e.ResourceID, "devices", addrs)
-				continue
-			}
 			// MigrateVM died with VFs out of the guest: reattach if the guest
 			// stayed, release if it left (recoverMigrationVFLease).
 			if !s.recoverMigrationVFLease(ctx, vm, addrs) {
@@ -308,4 +313,14 @@ func splitCSVNonEmpty(s string) []string {
 		return nil
 	}
 	return strings.Split(s, ",")
+}
+
+// firmwareMoveMarked reports whether vm has a live firmware move marker here,
+// or one that cannot be read. With no data directory there are no records.
+func (s *Server) firmwareMoveMarked(vm string) bool {
+	if s.fw().DataDir == "" {
+		return false
+	}
+	_, marked, err := s.fwRecords().GetMarker(vm)
+	return marked || err != nil
 }

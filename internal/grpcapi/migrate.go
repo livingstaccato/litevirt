@@ -468,6 +468,14 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 				req.VmName, d.Address, d.Type)
 		}
 	}
+	// A live firmware move detaches its VFs only under a durable lease, which
+	// its restart recovery rebuilds them from: with no operation journal there
+	// is none, so it is refused before anything is detached or asked of the
+	// target (review D2-13 N-6). Main never live-moved a firmware VM.
+	if fwLive && len(detachedVFs) > 0 && s.opJournal == nil {
+		return liveFirmwareRefusal(req.VmName, req.TargetHost,
+			"it has SR-IOV VFs, and this host's operation journal did not open, so their detach could not be recorded; repair <data_dir>/opjournal (see the daemon log) and restart the daemon")
+	}
 
 	// PCI pre-flight: verify target host has compatible devices for any PCI
 	// devices the VM spec requires (covers both VF reattach and cold migration).
@@ -2796,7 +2804,7 @@ func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRe
 		if f.fwLive != nil && len(failed) > 0 {
 			// Release still runs the guest: its NIC firewall is what the
 			// move holds it for; the missing VF is named, not silent.
-			s.noteFirmwareMoveVFsMissing(ctx, f.fwLive.marker, target, failed)
+			s.noteFirmwareMoveVFsMissing(ctx, f.fwLive.marker, target, failed, len(f.detachedVFs))
 		}
 	}
 

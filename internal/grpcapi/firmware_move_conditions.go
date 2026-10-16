@@ -28,6 +28,10 @@ const (
 	condFwmigNvramUnconfirmed   = "firmware_migration_nvram_unconfirmed"
 	condFwmigHeld               = "firmware_migration_held"
 	condFwmigQuarantine         = "firmware_migration_quarantine"
+	// condFwmigCleanupFailed is §7 S1: the source cleanup stopped (its
+	// retained bundle, undefine or wipe failed). The guest runs on the
+	// target; the source state is kept and the cleanup retried.
+	condFwmigCleanupFailed = "firmware_migration_cleanup_failed"
 )
 
 // firmwareMigrationConditionSeverity is each code's default severity.
@@ -42,6 +46,7 @@ var firmwareMigrationConditionSeverity = map[string]string{
 	condFwmigNvramUnconfirmed:   corrosion.SeverityCritical,
 	condFwmigHeld:               corrosion.SeverityWarning,
 	condFwmigQuarantine:         corrosion.SeverityWarning,
+	condFwmigCleanupFailed:      corrosion.SeverityCritical,
 }
 
 // fwmigCondition is one raise of a firmware move condition.

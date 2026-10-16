@@ -946,6 +946,9 @@ func (c *Cluster) buildServer(n *Node) {
 	go n.Server.RunLUNHoldResolver(loops, 10*time.Second)
 	// The live firmware hold sweep, as the daemon starts it.
 	go n.Server.RunFirmwareHoldSweep(loops)
+	// The source cleanup retry and the retained bundle sweep, as the daemon
+	// starts them.
+	go n.Server.RunFirmwareRetainedSweep(loops)
 
 	// Wire a real Replicator so the server's PushMutations handler + write-notify
 	// path are exercised. By default its background push loop is NOT started, so

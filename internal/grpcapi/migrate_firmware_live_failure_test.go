@@ -598,9 +598,7 @@ func TestR1_ReleaseRefusedThenRetried(t *testing.T) {
 	if n < 2 {
 		t.Fatalf("Release sent %d times, want a retry", n)
 	}
-	if m, ok := r.marker(); !ok || m.Phase != fwmig.PhaseReleased {
-		t.Fatalf("marker %+v, want released", m)
-	}
+	r.requireCleanedUp("after a retried Release")
 }
 
 // §7 R1 then V3: Release refused for as long as the retries last parks
@@ -637,12 +635,17 @@ func TestH1_HeldShutOffPushesNvramAndReleases(t *testing.T) {
 	if r.log.has("target-running") {
 		t.Fatal("the held guest was booted")
 	}
-	if m, ok := r.marker(); !ok || m.Phase != fwmig.PhaseReleased {
-		t.Fatalf("marker %+v, want released", m)
-	}
 	if !r.log.has("cleanup") {
 		t.Error("cleanup not called")
 	}
+	// The source cleanup ran: the source copy is in the retained bundle.
+	if m, ok := r.marker(); ok {
+		t.Errorf("marker left %+v", m)
+	}
+	if fwtExists(r.srcPermallPath()) || fwtExists(r.srcStore.NvramPath(fwlVM)) {
+		t.Error("the source's firmware state was not wiped")
+	}
+	requireBundleHoldsSourceState(t, r.retained(r.retainedAttempt()), true)
 	if b, _ := os.ReadFile(r.dstStore.NvramPath(fwlVM)); string(b) != string(fwlNvram) {
 		t.Errorf("target NVRAM %q, want the source's final", b)
 	}

@@ -218,6 +218,16 @@ type fwlCaptureVirt struct {
 	after *func()
 	// onResumeSource, when set, runs as the source guest is resumed (§7 M1p).
 	onResumeSource *func()
+	// onUndefineLeftover, when set, runs as the source cleanup undefines the
+	// moved VM's leftover definition (§6.7 step 3).
+	onUndefineLeftover *func()
+}
+
+func (v fwlCaptureVirt) UndefineFirmwareMoveLeftover(name, uuid, attempt string) error {
+	if v.onUndefineLeftover != nil && *v.onUndefineLeftover != nil {
+		(*v.onUndefineLeftover)()
+	}
+	return v.Fake.UndefineFirmwareMoveLeftover(name, uuid, attempt)
 }
 
 func (v fwlCaptureVirt) ResumeFirmwareMoveSource(name, uuid, attempt string) error {
@@ -257,9 +267,11 @@ type fwlRig struct {
 	afterMigrate func()
 	// onResumeSource runs as the source guest is resumed (§7 M1p).
 	onResumeSource func()
-	sbOnly         bool
-	storage        bool
-	spec           map[string]any
+	// onUndefineLeftover runs as the source cleanup undefines the leftover.
+	onUndefineLeftover func()
+	sbOnly             bool
+	storage            bool
+	spec               map[string]any
 }
 
 type fwlOpts struct {
@@ -283,7 +295,8 @@ func newFwlRig(t *testing.T, o fwlOpts) *fwlRig {
 	r.srcFake = libvirtfake.New()
 	r.srcFake.SetFirmwareStore(r.srcStore)
 	fwmig.Wire(r.srcFake, r.srcStore)
-	r.src.virt = fwlCaptureVirt{Fake: r.srcFake, mu: &r.paramsMu, got: &r.params, after: &r.afterMigrate, onResumeSource: &r.onResumeSource}
+	r.src.virt = fwlCaptureVirt{Fake: r.srcFake, mu: &r.paramsMu, got: &r.params, after: &r.afterMigrate, onResumeSource: &r.onResumeSource,
+		onUndefineLeftover: &r.onUndefineLeftover}
 	setFWTestFirmwarePaths(t, r.src)
 	r.src.SetFirmwareLayoutDirForTest(layout)
 	r.src.SetLiveFirmwareHost(&stubFWCode{installed: lv.InstalledFirmwareCode{Runtime: fwFloorRuntime}, running: fwFloorRuntime})
@@ -389,6 +402,19 @@ func (r *fwlRig) marker() (fwmig.Marker, bool) {
 		r.t.Fatalf("GetMarker: %v", err)
 	}
 	return m, ok
+}
+
+// markerAtCleanup records the marker as it is when the source cleanup is
+// called: the cleanup removes it.
+func (r *fwlRig) markerAtCleanup() *fwmig.Marker {
+	var at fwmig.Marker
+	r.src.fwLive.stepHook = func(step string) {
+		r.log.add(step)
+		if step == "cleanup" {
+			at, _ = r.marker()
+		}
+	}
+	return &at
 }
 
 func (r *fwlRig) hold() (fwmig.Hold, bool) {
@@ -513,9 +539,8 @@ func TestMigrateVM_FirmwareLive_HappyPathOrder(t *testing.T) {
 	if vm := r.row(); vm.HostName != "dst-host" || vm.State != "running" {
 		t.Errorf("row %s on %s, want running on dst-host", vm.State, vm.HostName)
 	}
-	if st, _ := r.srcFake.RawState(fwlVM); st != libvirtfake.StateShutdown {
-		t.Errorf("source domain %q, want defined and shut off (its state is the source cleanup's)", st)
-	}
+	// The source cleanup ran (§6.7, T-22 pins its order).
+	r.requireCleanedUp("after the happy flow")
 }
 
 // T-3b: a live firmware move hands libvirt FirmwareLive and Paused, though
@@ -553,6 +578,7 @@ func TestMigrateVM_FirmwareLive_TakesLivePath(t *testing.T) {
 	}
 	r := newFwlRig(t, fwlOpts{storage: true, cpuMode: "host-passthrough",
 		liveXMLExtra: `<disk type='file' device='cdrom'><source file='` + iso + `'/><target dev='sdc'/></disk>`})
+	at := r.markerAtCleanup()
 	if err := r.migrate(); err != nil {
 		t.Fatalf("live firmware move with storage: %v (steps %v)", err, r.log.get())
 	}
@@ -570,7 +596,7 @@ func TestMigrateVM_FirmwareLive_TakesLivePath(t *testing.T) {
 	if len(ps) != 1 || !ps[0].WithStorage || !ps[0].Live || !ps[0].FirmwareLive {
 		t.Fatalf("params %+v: want one live firmware migrate with storage", ps)
 	}
-	if m, _ := r.marker(); m.Route != fwmig.RouteStorageCopy || len(m.CreatedStubs) != 1 {
+	if m := *at; m.Route != fwmig.RouteStorageCopy || len(m.CreatedStubs) != 1 {
 		t.Errorf("marker route %s, stubs %v: want storage_copy and the stub EnsureDisks created", m.Route, m.CreatedStubs)
 	}
 }
@@ -585,6 +611,7 @@ func TestMigrateVM_FirmwareLive_TakesLivePathMemoryOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := newFwlRig(t, fwlOpts{liveXMLExtra: `<disk type='file' device='cdrom'><source file='` + iso + `'/><target dev='sdc'/></disk>`})
+	at := r.markerAtCleanup()
 	if err := r.migrate(); err != nil {
 		t.Fatalf("live firmware move: %v (steps %v)", err, r.log.get())
 	}
@@ -592,7 +619,7 @@ func TestMigrateVM_FirmwareLive_TakesLivePathMemoryOnly(t *testing.T) {
 	if len(p.ensures) == 0 || !p.ensures[0].GetInstallerIsoRuntime() || len(p.ensures[0].GetDisks()) != 0 {
 		t.Errorf("EnsureDisks %v: want the running domain's installer ISO and no stub", p.ensures)
 	}
-	if m, _ := r.marker(); m.Route != fwmig.RouteTunnelled {
+	if m := *at; m.Route != fwmig.RouteTunnelled {
 		t.Errorf("marker route %s, want tunnelled", m.Route)
 	}
 }

@@ -41,6 +41,10 @@ type LibvirtBackend interface {
 	// firmware move that failed paused before cutover runs again (§7 M1p,
 	// I5): only with the attempt's marker before cutover.
 	ResumeFirmwareMoveSource(name, uuid, attempt string) error
+	// UndefineFirmwareMoveLeftover is the one way a moved VM's source
+	// definition goes (spec §6.7 step 3, I5): marker cleaning, domain shut
+	// off, its NVRAM and TPM state kept for the wipe that follows.
+	UndefineFirmwareMoveLeftover(name, uuid, attempt string) error
 	DomainState(name string) (string, error)
 	// AbortMigration aborts the domain's running migration job. MigrateToTarget
 	// takes no context, so this is the only way to stop one.

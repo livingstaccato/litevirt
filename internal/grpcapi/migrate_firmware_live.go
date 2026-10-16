@@ -56,8 +56,9 @@ func (s *Server) fwLiveStep(step string) {
 }
 
 // liveFirmwareSourceCleanup is the source cleanup (spec §6.7, marker
-// released → cleaning → removed). nil leaves the marker released, its start
-// veto in force, until restart recovery runs the cleanup.
+// released → cleaning → removed), set in migrate_firmware_live_cleanup.go.
+// nil leaves the marker released, its start veto in force, for the cleanup
+// retry (RetryLiveFirmwareCleanupsOnce).
 var liveFirmwareSourceCleanup func(s *Server, ctx context.Context, m fwmig.Marker) error
 
 // Timing of the source half; vars so tests can shorten them.

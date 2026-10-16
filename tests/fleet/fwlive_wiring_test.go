@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fwmig"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -71,7 +73,8 @@ func fwwCluster(t *testing.T) (*Cluster, *Node, *Node) {
 
 // A live firmware move runs end to end over real gRPC: the guest lands paused,
 // verifies, commits and is released running on dst with the source's final
-// NVRAM, and the source keeps its state for the source cleanup.
+// NVRAM; the source cleanup then keeps the source's state in its retained
+// bundle, undefines the leftover and wipes the state (spec §6.7).
 //
 // Mutations: drop SetLiveFirmwareHost from buildServer — refused at stage A,
 // red.
@@ -93,12 +96,36 @@ func TestFleet_LiveFirmwareMoveWired(t *testing.T) {
 	if _, ok, err := fwmig.New(dst.FW.DataDir).GetHold(fwwVM); ok || err != nil {
 		t.Errorf("the target still holds the move (%v)", err)
 	}
-	m, ok, err := fwmig.New(src.FW.DataDir).GetMarker(fwwVM)
-	if err != nil || !ok || m.Phase != fwmig.PhaseReleased {
-		t.Errorf("source marker %+v (present %v, %v), want released, awaiting the source cleanup", m.Phase, ok, err)
+	if m, ok, err := fwmig.New(src.FW.DataDir).GetMarker(fwwVM); ok || err != nil {
+		t.Errorf("source marker %+v left (%v), want it removed by the source cleanup", m.Phase, err)
 	}
-	if got := hlRead(t, filepath.Join(src.FW.SwtpmDir(fwwUUID), "tpm2", "tpm2-00.permall")); !bytes.Equal(got, fwwPermall) {
-		t.Errorf("source permall %q, want it kept", got)
+	if st, ok := src.Virt.RawState(fwwVM); ok {
+		t.Errorf("the source domain is still defined (%s)", st)
+	}
+	for _, p := range []string{filepath.Join(src.FW.SwtpmDir(fwwUUID), "tpm2", "tpm2-00.permall"), src.FW.NvramPath(fwwVM)} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("source state %s not wiped (%v)", p, err)
+		}
+	}
+	// The retained bundle holds the source's state (24 h, DECISION 4-E).
+	tars, _ := filepath.Glob(filepath.Join(src.FW.DataDir, fwmig.RetainedDir, fwwVM+"-*.tar"))
+	if len(tars) != 1 {
+		t.Fatalf("retained bundles %v, want one", tars)
+	}
+	f, err := os.Open(tars[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	fresh := &lv.FirmwareStore{DataDir: t.TempDir(), SwtpmBase: t.TempDir()}
+	if err := fresh.ReadFirmwareBundle(f, fwwVM, fwwUUID); err != nil {
+		t.Fatalf("the retained bundle does not restore: %v", err)
+	}
+	if got := hlRead(t, filepath.Join(fresh.SwtpmDir(fwwUUID), "tpm2", "tpm2-00.permall")); !bytes.Equal(got, fwwPermall) {
+		t.Errorf("retained permall %q, want the source's", got)
+	}
+	if got := hlRead(t, fresh.NvramPath(fwwVM)); !bytes.Equal(got, fwwNvram) {
+		t.Errorf("retained NVRAM %q, want the source's", got)
 	}
 }
 

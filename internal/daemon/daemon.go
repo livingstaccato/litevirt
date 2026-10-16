@@ -1440,6 +1440,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Quarantine a live firmware move's target hold whose move was abandoned,
 	// and name a hold held too long.
 	go svc.RunFirmwareHoldSweep(ctx)
+	// Retry a live firmware move's source cleanup that stopped, and remove its
+	// retained firmware bundle 24 h on, never while a record names it.
+	go svc.RunFirmwareRetainedSweep(ctx)
 	// Remember the clock skews this host sees past their rows' retention: the
 	// margin lv image prune keeps a deleted image's file within reads them.
 	go svc.RunImageSkewRecorder(ctx)

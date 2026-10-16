@@ -147,9 +147,9 @@ func TestFwLiveHostCheck_CheckBounded(t *testing.T) {
 }
 
 // The daemon installs the Prepare check, from its own config, and starts the
-// hold sweep (comments do not count).
+// hold sweep and the retained bundle sweep (comments do not count).
 //
-// Mutation: remove or comment out either line in daemon.go — red.
+// Mutation: remove or comment out any of the lines in daemon.go — red.
 func TestFwLiveTarget_WiredInDaemon(t *testing.T) {
 	src, err := os.ReadFile("daemon.go")
 	if err != nil {
@@ -158,6 +158,7 @@ func TestFwLiveTarget_WiredInDaemon(t *testing.T) {
 	for _, want := range []string{
 		"svc.SetLiveFirmwareHost(newFwLiveHostCheck(d.cfg.Migration,",
 		"go svc.RunFirmwareHoldSweep(ctx)",
+		"go svc.RunFirmwareRetainedSweep(ctx)",
 	} {
 		found := false
 		for _, l := range strings.Split(string(src), "\n") {

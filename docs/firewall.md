@@ -306,7 +306,11 @@ iptables):
   connections the host opened onto that bridge (so HAProxy reaches backends
   there): an `isolation_output` chain marks each connection the host opens out
   of the bridge with a per-bridge ct mark, and the input chain accepts only
-  reply-direction packets carrying it.
+  reply-direction packets carrying it. Bits 16-27 of the ct mark are
+  litevirt's; each host-isolated bridge on a host gets a distinct value there.
+  Connections the host opened onto a host-isolated bridge before an upgrade
+  to this rule carry no mark, so their replies are dropped once: a long-lived
+  connection (an HAProxy keep-alive to a backend) reconnects.
 - **Isolated networks** — an `isolated_forward` chain on the `forward` hook
   drops anything routed off or onto an `isolated` network's bridge: per live
   isolated network's bridge (`iifname "<bridge>" oifname != "<bridge>" drop`

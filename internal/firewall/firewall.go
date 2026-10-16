@@ -520,13 +520,35 @@ func renderNAT(b *strings.Builder, rules []NATRule) {
 // litevirt rule uses ct mark.
 const isolationMarkMask = 0x0fff0000
 
-// isolationMark is bridge's value in isolationMarkMask: a stable 12-bit hash
-// of its name, never zero. Two bridges that hash alike share a value, which
-// lets a reply to a connection onto one in from the other — no further.
+// isolationMark is bridge's preferred value in isolationMarkMask: a stable
+// 12-bit hash of its name, never zero.
 func isolationMark(bridge string) uint32 {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(bridge))
 	return (h.Sum32()%0xfff + 1) << 16
+}
+
+// isolationMarks gives each bridge its own value in isolationMarkMask: its
+// isolationMark, or, when a bridge earlier by name already holds that value,
+// the next free one. A shared value would let a guest on one bridge forge
+// replies into the host's connections onto the other. A bridge's value
+// changes only when a bridge whose hash collides with it comes or goes, which
+// drops the replies of the host's connections onto it that were open then.
+func isolationMarks(sortedBridges []string) map[string]uint32 {
+	out := make(map[string]uint32, len(sortedBridges))
+	used := map[uint32]bool{}
+	for _, br := range sortedBridges {
+		if _, done := out[br]; done {
+			continue
+		}
+		v := isolationMark(br) >> 16
+		for i := 0; i < 0xfff && used[v]; i++ {
+			v = v%0xfff + 1
+		}
+		used[v] = true
+		out[br] = v << 16
+	}
+	return out
 }
 
 // renderHostIsolation emits a single `input` filter chain that drops guest→host
@@ -547,12 +569,17 @@ func renderHostIsolation(b *strings.Builder, chains []IsolationChain) {
 	sorted := make([]IsolationChain, len(chains))
 	copy(sorted, chains)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Bridge < sorted[j].Bridge })
+	names := make([]string, len(sorted))
+	for i, c := range sorted {
+		names[i] = c.Bridge
+	}
+	marks := isolationMarks(names)
 
 	fmt.Fprintf(b, "    chain input {\n")
 	fmt.Fprintf(b, "        type filter hook input priority filter; policy accept;\n")
 	for _, c := range sorted {
 		fmt.Fprintf(b, "        iifname %s ct direction reply ct mark and %#x == %#x ct state established,related accept\n",
-			c.Bridge, isolationMarkMask, isolationMark(c.Bridge))
+			c.Bridge, isolationMarkMask, marks[c.Bridge])
 		if len(c.Exceptions) > 0 {
 			// VRRP (keepalived) once per bridge, then each VIP:port.
 			fmt.Fprintf(b, "        iifname %s ip protocol 112 accept\n", c.Bridge)
@@ -570,7 +597,7 @@ func renderHostIsolation(b *strings.Builder, chains []IsolationChain) {
 	fmt.Fprintf(b, "        type filter hook output priority filter; policy accept;\n")
 	for _, c := range sorted {
 		fmt.Fprintf(b, "        oifname %s ct state new ct mark set ct mark and %#x or %#x\n",
-			c.Bridge, ^uint32(isolationMarkMask), isolationMark(c.Bridge))
+			c.Bridge, ^uint32(isolationMarkMask), marks[c.Bridge])
 	}
 	fmt.Fprintf(b, "    }\n\n")
 }

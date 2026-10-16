@@ -28,13 +28,16 @@ import (
 // A VIP in no network's subnet (an address on the host's own LAN) goes where
 // it always did: on the device whose subnet holds it, else the default-route
 // device (lb.DetectInterfaceForIP).
-func (s *Server) lbVIPInterface(ctx context.Context, lbName, vip string) (string, error) {
+//
+// stack names the LB's stack when the caller knows it (a peer apply carries
+// it, since the LB's row may not have replicated here yet); "" reads it from
+// the LB's row.
+func (s *Server) lbVIPInterface(ctx context.Context, lbName, stack, vip string) (string, error) {
 	addr, err := netip.ParseAddr(strings.TrimSpace(vip))
 	if err != nil {
 		return "", fmt.Errorf("VIP %q is not an address: %w", vip, err)
 	}
-	stack := ""
-	if lbName != "" {
+	if stack == "" && lbName != "" {
 		lrows, err := s.db.Query(ctx, `SELECT COALESCE(stack_name, '') AS stack_name FROM lb_configs WHERE name = ? AND deleted_at IS NULL`, lbName)
 		if err != nil {
 			return "", fmt.Errorf("read load balancer %q to place VIP %s: %w", lbName, vip, err)
@@ -48,9 +51,10 @@ func (s *Server) lbVIPInterface(ctx context.Context, lbName, vip string) (string
 		return "", fmt.Errorf("read networks to place VIP %s: %w", vip, err)
 	}
 	type match struct {
-		name, bridge string
-		bits         int
-		ownStack     bool
+		name     string
+		bridges  []string // the devices the network may be on here, preferred first
+		bits     int
+		ownStack bool
 	}
 	var matches []match
 	for _, r := range rows {
@@ -68,8 +72,8 @@ func (s *Server) lbVIPInterface(ctx context.Context, lbName, vip string) (string
 		if err != nil || !p.Masked().Contains(addr) {
 			continue
 		}
-		matches = append(matches, match{name: r.String("name"), bridge: network.BridgeName(r.String("name"), def), bits: p.Bits(),
-			ownStack: stack != "" && r.String("stack_name") == stack})
+		matches = append(matches, match{name: r.String("name"), bridges: lbBridgeCandidates(r.String("name"), r.String("stack_name"), def),
+			bits: p.Bits(), ownStack: stack != "" && r.String("stack_name") == stack})
 	}
 	if len(matches) == 0 {
 		return lb.DetectInterfaceForIP(vip), nil
@@ -84,9 +88,33 @@ func (s *Server) lbVIPInterface(ctx context.Context, lbName, vip string) (string
 		return matches[i].name < matches[j].name
 	})
 	m := matches[0]
-	if !s.bridgeExistsHere(m.bridge) {
-		return "", fmt.Errorf("VIP %s is in network %q, whose bridge %s is not on %s: the VIP goes on its network's bridge and nowhere else",
-			vip, m.name, m.bridge, s.hostName)
+	for _, br := range m.bridges {
+		if s.bridgeExistsHere(br) {
+			return br, nil
+		}
 	}
-	return m.bridge, nil
+	return "", fmt.Errorf("VIP %s is in network %q, whose bridge %s is not on %s: the VIP goes on its network's bridge and nowhere else",
+		vip, m.name, strings.Join(m.bridges, " or "), s.hostName)
+}
+
+// lbBridgeCandidates is the device a network is provisioned on
+// (network.BridgeName), and, for a stack's `bridge` network whose row names
+// no interface, the other name a host may have provisioned it under: a
+// deploy's target host provisions a stack network on its short name
+// (provisionComposeNetworks), while a peer target is sent the definition
+// without it and provisions it on the scoped name, and the row holds
+// whichever write replicated last.
+func lbBridgeCandidates(name, stackName string, def compose.NetworkDef) []string {
+	out := []string{network.BridgeName(name, def)}
+	if (def.Type == "" || def.Type == "bridge") && def.Interface == "" && stackName != "" {
+		if short := strings.TrimPrefix(name, stackName+"_"); short != name && short != out[0] {
+			out = append(out, short)
+		}
+	}
+	if (def.Type == "" || def.Type == "bridge") && def.Interface != "" && stackName != "" {
+		if flat := network.FlatBridgeName(name); flat != out[0] {
+			out = append(out, flat)
+		}
+	}
+	return out
 }

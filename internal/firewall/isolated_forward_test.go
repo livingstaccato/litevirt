@@ -135,7 +135,7 @@ func TestRender_HostIsolationAcceptsReplies(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, br := range []string{"hinet", "hinet2"} {
-		m := isolationMark(br)
+		m := isolationMarks([]string{"hinet", "hinet2"})[br]
 		acc := fmt.Sprintf("iifname %s ct direction reply ct mark and 0xfff0000 == %#x ct state established,related accept", br, m)
 		set := fmt.Sprintf("oifname %s ct state new ct mark set ct mark and 0xf000ffff or %#x", br, m)
 		i, j := strings.Index(out, acc), strings.Index(out, "iifname "+br+" drop")
@@ -151,5 +151,38 @@ func TestRender_HostIsolationAcceptsReplies(t *testing.T) {
 	}
 	if isolationMark("hinet") == isolationMark("hinet2") {
 		t.Error("two bridges share a mark")
+	}
+}
+
+// TestRender_HostIsolationMarksAreDistinct: two host-isolated bridges whose
+// names hash to the same mark still get different marks, so a guest on one
+// cannot forge replies into the host's connections onto the other.
+//
+// Mutation: render isolationMark directly — red.
+func TestRender_HostIsolationMarksAreDistinct(t *testing.T) {
+	seen := map[uint32]string{}
+	var a, b string
+	for i := 0; a == ""; i++ {
+		n := fmt.Sprintf("hi%d", i)
+		m := isolationMark(n)
+		if o, ok := seen[m]; ok {
+			a, b = o, n
+		}
+		seen[m] = n
+	}
+	out, err := Render(Plan{HostIsolation: []IsolationChain{{Bridge: a}, {Bridge: b}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marks := isolationMarks([]string{a, b})
+	if marks[a] == marks[b] || marks[a]&isolationMarkMask != marks[a] || marks[b]&isolationMarkMask != marks[b] || marks[b] == 0 {
+		t.Fatalf("%s and %s (same hash) got marks %#x and %#x", a, b, marks[a], marks[b])
+	}
+	for _, br := range []string{a, b} {
+		acc := fmt.Sprintf("iifname %s ct direction reply ct mark and 0xfff0000 == %#x ", br, marks[br])
+		set := fmt.Sprintf("oifname %s ct state new ct mark set ct mark and 0xf000ffff or %#x\n", br, marks[br])
+		if !strings.Contains(out, acc) || !strings.Contains(out, set) {
+			t.Errorf("%s's rules do not use its mark %#x:\n%s", br, marks[br], out)
+		}
 	}
 }

@@ -128,7 +128,7 @@ func TestRenderCompatGolden(t *testing.T) {
 		// So does a host-isolated bridge's accept of replies to connections
 		// the host opened onto it, and the output chain that marks those.
 		for _, c := range p.HostIsolation {
-			m := isolationMark(c.Bridge)
+			m := isolationMarks([]string{c.Bridge})[c.Bridge]
 			acc := fmt.Sprintf("        iifname %s ct direction reply ct mark and 0xfff0000 == %#x ct state established,related accept\n", c.Bridge, m)
 			out := fmt.Sprintf("    chain isolation_output {\n        type filter hook output priority filter; policy accept;\n"+
 				"        oifname %s ct state new ct mark set ct mark and 0xf000ffff or %#x\n    }\n\n", c.Bridge, m)

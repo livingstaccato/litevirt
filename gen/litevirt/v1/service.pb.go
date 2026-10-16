@@ -10297,7 +10297,15 @@ type ApplyLBRequest struct {
 	// proof authorizes a gated LB apply / VIP takeover (split-brain hardening, v38);
 	// nil pre-activation. The LB host validates it (dest==self, action==lb_apply) and
 	// claims it single-use before applying.
-	Proof         *RuntimeActionProof `protobuf:"bytes,7,opt,name=proof,proto3" json:"proof,omitempty"`
+	Proof *RuntimeActionProof `protobuf:"bytes,7,opt,name=proof,proto3" json:"proof,omitempty"`
+	// snat: whether this LB rewrites its network's guest egress to the VIP
+	// (compose `snat:`). Absent — a caller on an earlier build — applies
+	// SNAT, as every ApplyLB did before the field existed.
+	Snat *bool `protobuf:"varint,8,opt,name=snat,proto3,oneof" json:"snat,omitempty"`
+	// stack_name: the stack whose LB this is ("" for an explicit LB), so the
+	// VIP goes on that stack's network when the LB's row has not replicated
+	// here yet.
+	StackName     string `protobuf:"bytes,9,opt,name=stack_name,json=stackName,proto3" json:"stack_name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -10379,6 +10387,20 @@ func (x *ApplyLBRequest) GetProof() *RuntimeActionProof {
 		return x.Proof
 	}
 	return nil
+}
+
+func (x *ApplyLBRequest) GetSnat() bool {
+	if x != nil && x.Snat != nil {
+		return *x.Snat
+	}
+	return false
+}
+
+func (x *ApplyLBRequest) GetStackName() string {
+	if x != nil {
+		return x.StackName
+	}
+	return ""
 }
 
 // RemoveLBRequest tells a host to tear down a local LB instance.
@@ -43557,7 +43579,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\abackend\x18\x02 \x01(\tR\abackend\"I\n" +
 	"\x14EnableBackendRequest\x12\x17\n" +
 	"\alb_name\x18\x01 \x01(\tR\x06lbName\x12\x18\n" +
-	"\abackend\x18\x02 \x01(\tR\abackend\"\x85\x02\n" +
+	"\abackend\x18\x02 \x01(\tR\abackend\"\xc6\x02\n" +
 	"\x0eApplyLBRequest\x12\x17\n" +
 	"\alb_name\x18\x01 \x01(\tR\x06lbName\x12\x10\n" +
 	"\x03vip\x18\x02 \x01(\tR\x03vip\x12\x1c\n" +
@@ -43565,7 +43587,11 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\bbackends\x18\x04 \x03(\v2\x16.litevirt.v1.LBBackendR\bbackends\x12)\n" +
 	"\x05ports\x18\x05 \x03(\v2\x13.litevirt.v1.LBPortR\x05ports\x12\x14\n" +
 	"\x05hosts\x18\x06 \x03(\tR\x05hosts\x125\n" +
-	"\x05proof\x18\a \x01(\v2\x1f.litevirt.v1.RuntimeActionProofR\x05proof\"*\n" +
+	"\x05proof\x18\a \x01(\v2\x1f.litevirt.v1.RuntimeActionProofR\x05proof\x12\x17\n" +
+	"\x04snat\x18\b \x01(\bH\x00R\x04snat\x88\x01\x01\x12\x1d\n" +
+	"\n" +
+	"stack_name\x18\t \x01(\tR\tstackNameB\a\n" +
+	"\x05_snat\"*\n" +
 	"\x0fRemoveLBRequest\x12\x17\n" +
 	"\alb_name\x18\x01 \x01(\tR\x06lbName\"\xf2\x01\n" +
 	"\x0fCreateLBRequest\x12\x12\n" +
@@ -48150,6 +48176,7 @@ func file_litevirt_v1_service_proto_init() {
 	file_litevirt_v1_types_proto_init()
 	file_litevirt_v1_service_proto_msgTypes[35].OneofWrappers = []any{}
 	file_litevirt_v1_service_proto_msgTypes[73].OneofWrappers = []any{}
+	file_litevirt_v1_service_proto_msgTypes[138].OneofWrappers = []any{}
 	file_litevirt_v1_service_proto_msgTypes[160].OneofWrappers = []any{}
 	file_litevirt_v1_service_proto_msgTypes[177].OneofWrappers = []any{
 		(*PushBackupFrame_Header)(nil),

@@ -420,6 +420,28 @@ func IsOperatorPromoteValue(p ActionProof) bool {
 	return p.Action == ActionPromote && p.Coordinator == OperatorClaimPrefix+p.DestHost
 }
 
+// AbandonReasonLeaseOutran begins the reason of an abandonment the failover
+// lease holder asks for when a pending reschedule's lease stamp is below its
+// own term (failover's sweepStaleTermProofs). The holder re-points the row at
+// the proof decided in its place right after, so the destination's
+// reconciler waits a bounded grace before it fails the row on such an
+// abandonment (health.staleTermRepointGrace).
+const AbandonReasonLeaseOutran = "the lease moved on before the destination claimed it"
+
+// ProofAbandonment reads this node's abandonment of proofID: its reason and
+// when it was recorded. ok is false when there is none.
+func (c *Client) ProofAbandonment(ctx context.Context, proofID string) (reason string, at time.Time, ok bool, err error) {
+	rows, err := c.Query(ctx, `SELECT reason, abandoned_at FROM local_abandoned_proofs WHERE proof_id = ?`, proofID)
+	if err != nil || len(rows) == 0 {
+		return "", time.Time{}, false, err
+	}
+	at, err = time.Parse(time.RFC3339Nano, rows[0].String("abandoned_at"))
+	if err != nil {
+		return "", time.Time{}, false, fmt.Errorf("abandonment of %s: abandoned_at %q: %w", proofID, rows[0].String("abandoned_at"), err)
+	}
+	return rows[0].String("reason"), at, true, nil
+}
+
 // ProofAbandoned reports whether this node abandoned proofID.
 func (c *Client) ProofAbandoned(ctx context.Context, proofID string) (bool, error) {
 	rows, err := c.Query(ctx, `SELECT 1 AS one FROM local_abandoned_proofs WHERE proof_id = ?`, proofID)

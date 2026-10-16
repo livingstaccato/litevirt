@@ -59,7 +59,7 @@ var nonPublishingWriters = map[string]string{
 // parameter fails the build, which is the edit that would otherwise quietly make
 // one of these a publisher.
 var literalNonRunningWriters = map[string]string{
-	"WriteVMRescheduleProof": "state = 'pending'",
+	"writeVMRescheduleProof": "state = 'pending'",
 	"FailActionProof":        "state = 'error'",
 	"BeginVMCreateOperation": "INSERT ... VALUES (..., 'creating', ...)",
 }

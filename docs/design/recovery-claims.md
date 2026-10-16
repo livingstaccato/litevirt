@@ -2403,3 +2403,24 @@ where it described the mechanism; this list records what changed and why.
       written within the last hour or with a start recorded. That is best
       effort, as a replica can lag.
     - No schema, statement shape, protobuf or capability change.
+44. **A decided value at a superseded lease term moves on** (§3.12, §3.14).
+    While this coordinator enforces lease terms, a decided value stamped
+    below its own term, or with no term, is one every executor enforcing
+    `lease_term_v1` refuses as stale. The coordinator asks its destination
+    for the signed abandonment and moves the claim to the next attempt, as
+    for a destination that cannot take the workload (item 39):
+    - when it adopts such a value at a mint site, whatever the value's
+      destination and action. An operator's promotion is not judged here;
+    - when a certified pending VM reschedule is stamped below the lease
+      holder's term because the lease moved before its destination claimed
+      it. Each cycle the holder asks the destination to abandon it, claims
+      the next attempt with the same move under its own stamp, and re-points
+      the row, still pending on the abandoned proof, at the decided proof
+      (`sweepStaleTermProofs`). A destination that has claimed the proof
+      refuses, and the proof runs. A proof `certifyUncertified` or
+      `recertifyReplaced` has just certified goes the same way. A step that
+      cannot complete (no abandonment, no decided replacement, or one this
+      sweep does not write) records a `vm.failover.stale_term_held` event on
+      the VM naming the remedy, once per step, and is retried every cycle.
+    - A coordinator with `enforcement.lease_term` off judges nothing here.
+    - No schema, statement shape, protobuf or capability change.

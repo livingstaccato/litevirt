@@ -398,6 +398,13 @@ func TestLiveFirmwareEligibility(t *testing.T) {
 			if status.Code(err) != codes.Unavailable {
 				t.Fatalf("a Prepare error became %v", err)
 			}
+			// It says what the target said, and names the cold move (merge
+			// review m-2).
+			for _, w := range []string{"connection refused", "--cold"} {
+				if !strings.Contains(err.Error(), w) {
+					t.Fatalf("a Prepare error %q does not say %q", err, w)
+				}
+			}
 		})
 		t.Run("no_runtime", func(t *testing.T) {
 			r := ok()
@@ -449,7 +456,7 @@ func TestLiveFirmwareEligibility(t *testing.T) {
 			{"storage_over_mignet", true, migrationRoute{addr: "10.20.0.2", onNetwork: true}, true, true, "", "cluster address 192.168.1.2"},
 			{"tunnelled", false, cluster, false, false, fwmig.RouteTunnelled, ""},
 			{"tunnelled_elsewhere", false, migrationRoute{addr: "10.20.0.2"}, false, false, "", "cluster address 192.168.1.2"},
-			{"mignet_while_off", false, mignet, true, false, "", "not yet allowed"},
+			{"mignet_while_off", false, mignet, true, false, "", "not yet allowed"}, // and names no internal test id (m-3)
 			{"mignet_when_on", false, mignet, true, true, fwmig.RouteMigrationNetwork, ""},
 			{"mignet_without_tls", false, mignet, false, true, "", "TLS on both hosts"},
 			{"direct_off_network", false, migrationRoute{addr: "192.168.1.2", direct: true}, true, true, "", "migration network"},
@@ -459,6 +466,9 @@ func TestLiveFirmwareEligibility(t *testing.T) {
 				got, err := liveFirmwareStageC("os1", target, c.storage, c.r, c.bothTLS)
 				if c.refuse != "" {
 					requireRefusal(t, err, c.refuse)
+					if strings.Contains(err.Error(), "E-9") {
+						t.Fatalf("refusal %q names an internal test id", err)
+					}
 					return
 				}
 				if err != nil || got != c.want {
@@ -722,7 +732,7 @@ func TestChooseLiveFirmwareRoute(t *testing.T) {
 		name string
 		kind routeKind
 		why  string
-	}{{"storage", routeStorage, "does not copy storage"}, {"memory", routeMemory, "E-9"}} {
+	}{{"storage", routeStorage, "does not copy storage"}, {"memory", routeMemory, "until its stream is verified"}} {
 		t.Run(c.name, func(t *testing.T) {
 			s := testServer(t)
 			s.migrationNetwork = "10.20.0.0/24"

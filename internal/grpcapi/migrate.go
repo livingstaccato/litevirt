@@ -213,35 +213,34 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	}
 	// Secure Boot / vTPM firmware-state travel (G1). A firmware VM's NVRAM + swtpm
 	// are host-local and bind BitLocker, so they need a CONSISTENT capture:
-	//   - LIVE is refused: libvirt's native swtpm/NVRAM carry is not yet validated
-	//     on this build, and we must not wipe the source copy on an unverified
-	//     carry (a fresh-TPM target would brick BitLocker). Use cold migration.
-	//   - COLD requires the VM STOPPED: its firmware can't be captured at a single
-	//     instant while the guest keeps mutating TPM state, so we copy it quiescent.
+	//   - LIVE (fwLive) is the live firmware move (migrate_firmware_live.go): the
+	//     target guest arrives paused, and runs only once its TPM state verified
+	//     against the source's final state and the commit landed; the source's
+	//     copy is kept until then. Stage A below decides whether this VM may.
+	//   - COLD (fwCold) requires the VM STOPPED: its firmware can't be captured at
+	//     a single instant while the guest keeps mutating TPM state, so we copy it
+	//     quiescent.
 	fwSpec := parseFirmwareSpec(vm.Spec)
 	fwVM := fwSpec.SecureBoot || fwSpec.Tpm
+	fwLive := fwVM && req.Strategy != pb.MigrateStrategy_MIGRATE_COLD
+	fwCold := fwVM && !fwLive
 	// coldStopped: a STOPPED VM migrated cold. Nothing runs, so there is nothing
 	// for libvirt to migrate: the VM is moved as the firmware VM is
 	// (coldMigrateStoppedVM) — its host-local disks streamed to the target, its
 	// domain defined there, and its ownership handed over in one transaction.
 	coldStopped := req.Strategy == pb.MigrateStrategy_MIGRATE_COLD && vm.State == "stopped"
-	if fwVM {
-		if req.Strategy != pb.MigrateStrategy_MIGRATE_COLD {
-			if vm.State == "stopped" {
-				return status.Errorf(codes.FailedPrecondition,
-					"Secure Boot / vTPM VM %q must be migrated cold: live firmware carry is not yet a validated path — "+
-						"`lv migrate %s %s --cold`", req.VmName, req.VmName, req.TargetHost)
-			}
-			return status.Errorf(codes.FailedPrecondition,
-				"Secure Boot / vTPM VM %q must be migrated cold (--cold), and stopped: live firmware carry is not yet a validated path — "+
-					"stop it (`lv stop %s`), then `lv migrate %s %s --cold`", req.VmName, req.VmName, req.VmName, req.TargetHost)
-		}
-		if vm.State != "stopped" {
-			return status.Errorf(codes.FailedPrecondition,
-				"stop Secure Boot / vTPM VM %q before migrating it — its firmware state can't be captured consistently while running: "+
-					"`lv stop %s`, then `lv migrate %s %s --cold`", req.VmName, req.VmName, req.VmName, req.TargetHost)
-		}
-	} else if !coldStopped && vm.State != "running" {
+	switch {
+	case fwLive && vm.State == "stopped":
+		return status.Errorf(codes.FailedPrecondition,
+			"Secure Boot / vTPM VM %q is stopped; a live migration needs it running — "+
+				"`lv migrate %s %s --cold`", req.VmName, req.VmName, req.TargetHost)
+	case fwLive && vm.State != "running":
+		return liveFirmwareRefusal(req.VmName, req.TargetHost, "it is %s, not running", vm.State)
+	case fwCold && vm.State != "stopped":
+		return status.Errorf(codes.FailedPrecondition,
+			"stop Secure Boot / vTPM VM %q before migrating it — its firmware state can't be captured consistently while running: "+
+				"`lv stop %s`, then `lv migrate %s %s --cold`", req.VmName, req.VmName, req.VmName, req.TargetHost)
+	case !fwVM && !coldStopped && vm.State != "running":
 		if vm.State == "stopped" {
 			return status.Errorf(codes.FailedPrecondition,
 				"VM %q is stopped; live migration needs a running VM — migrate it with --cold", req.VmName)
@@ -273,7 +272,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// is running on now is not a requirement there, and asking it refused moves
 	// between different CPU generations for nothing. A target that cannot run
 	// the guest's machine type still refuses, at the define.
-	if !coldStopped && !fwVM {
+	if !coldStopped && !fwCold {
 		if err := s.preflightTargetCPU(ctx, vm, req.TargetHost); err != nil {
 			return err
 		}
@@ -324,8 +323,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 
 	// Gate the explicit target on the matching host capability (mirrors what
 	// placement does for auto placement) — a firmware VM that lands on a
-	// non-capable host can't define.
-	if fwVM {
+	// non-capable host can't define. A live firmware move's stage A checks them
+	// with its own refusal text.
+	if fwCold {
 		if fwSpec.Tpm && targetHost.Labels[corrosion.LabelTPMCapable] != "true" {
 			return status.Errorf(codes.FailedPrecondition,
 				"target host %q is not vTPM-capable (no swtpm); cannot migrate vTPM VM %q there", req.TargetHost, req.VmName)
@@ -368,13 +368,22 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			req.VmName, len(snaps), req.VmName)
 	}
 
+	// A live firmware move: stage A (spec §3.2 items 1–7), source-local and
+	// writing nothing; a refusal names the cold move.
+	var fwElig *liveFirmwareEligible
+	if fwLive {
+		if fwElig, err = s.liveFirmwareStageA(ctx, liveFirmwareMove{vm: vm, target: targetHost, withStorage: req.WithStorage, disks: disks}); err != nil {
+			return err
+		}
+	}
+
 	// Moving a RUNNING VM with a local disk needs --with-storage, cold or live:
 	// libvirt moves the guest, and without a storage copy the target has no disk
 	// for it. A stopped VM's cold move streams its host-local disks itself, so
 	// --with-storage (a libvirt storage copy of a running guest) does not apply
-	// to it; neither does it to a firmware VM, which moves stopped.
-	withStorage := req.WithStorage && !coldStopped && !fwVM
-	if !coldStopped && !fwVM && hasLocal && !withStorage {
+	// to it; neither does it to a firmware VM moved cold, which moves stopped.
+	withStorage := req.WithStorage && !coldStopped && !fwCold
+	if !coldStopped && !fwCold && hasLocal && !withStorage {
 		return status.Errorf(codes.FailedPrecondition,
 			"VM %q has a local disk — use --with-storage to migrate it running, or stop it and migrate it with --cold", req.VmName)
 	}
@@ -546,11 +555,30 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// branch and the adopter own the outcome from then) and for the firmware
 	// cold move, which owns its own.
 	abort := &migrationAbort{armed: true}
+	// fwl is the live firmware move once the target may hold it: an exit
+	// before libvirt has the guest aborts it there first (§7 P2), and drops
+	// its marker once the target answered.
+	var fwl *liveFirmwareRun
 	defer func() {
 		if abort.armed {
+			var answered bool
+			var why string
+			if fwl != nil {
+				answered, why = s.abortLiveFirmwareBeforeCutover(ctx, fwl)
+			}
 			s.undoMigrationAttempt(ctx, vm.Name, req.TargetHost, abort)
+			if fwl != nil {
+				s.settleLiveFirmwareAbort(ctx, fwl, answered, why)
+			}
 		}
 	}()
+
+	// §6.1 steps 2 and 3: the marker, the target's hold (Prepare), stage B.
+	if fwLive {
+		if fwl, err = s.beginLiveFirmwareMove(ctx, vm, targetHost, fwElig); err != nil {
+			return err
+		}
+	}
 
 	// The VM's networks and its cloud-init ISO on the target, before anything
 	// else is asked of it (prepareMigrationTarget).
@@ -576,7 +604,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	if withStorage {
 		var dstTLS bool
 		var ens ensureOutcome
-		if ens, err = s.ensureDisksOnTargetNet(ctx, req.TargetHost, vm.Name, diskStubs, srcTLS, !(fwVM || coldStopped)); err != nil {
+		if ens, err = s.ensureDisksOnTargetNet(ctx, req.TargetHost, vm.Name, diskStubs, srcTLS, !(fwCold || coldStopped)); err != nil {
 			// EnsureDisks removed whatever it had created; the cloud-init ISO
 			// pre-created above is the only leftover, and the abort removes it.
 			return err
@@ -586,10 +614,14 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		abort.createdStubs = createdStubs
 		useTLS = srcTLS && dstTLS
 		kind := routeStorage
-		if fwVM || coldStopped {
+		if fwCold || coldStopped {
 			kind = routeCold
 		}
-		route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, kind, useTLS)
+		if fwl != nil {
+			route = s.chooseLiveFirmwareRoute(ctx, vm.Name, *targetHost, ens.migAddr, kind, useTLS)
+		} else {
+			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, kind, useTLS)
+		}
 		if !useTLS && !s.allowPlaintextStorageMigration {
 			// This host could encrypt; the target cannot (no credentials, or an
 			// older build that never answers). The abort undoes the stubs.
@@ -604,16 +636,31 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		// No disks to stub, but the target's qemu opens the installer ISO from
 		// its own filesystem: the target judges that file before the migration
 		// (EnsureDisks with no stubs does only that).
-		ens, eerr := s.ensureDisksOnTargetNet(ctx, req.TargetHost, vm.Name, nil, srcTLS, !(fwVM || coldStopped))
+		ens, eerr := s.ensureDisksOnTargetNet(ctx, req.TargetHost, vm.Name, nil, srcTLS, !(fwCold || coldStopped))
 		if eerr != nil {
 			return eerr
 		}
 		cdromSources, targetCgroup = ens.remap, ens.cgroupMode
 		stripVNC = ens.vncPasswordUnavailable
-		if fwVM || coldStopped {
+		switch {
+		case fwCold || coldStopped:
 			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeCold, true)
-		} else {
+		case fwl != nil:
+			useTLS = srcTLS && ens.tlsReady
+			route = s.chooseLiveFirmwareRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeMemory, useTLS)
+		default:
 			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeMemory, srcTLS && ens.tlsReady)
+		}
+	}
+	if fwl != nil {
+		// Stage C (spec §3.2 item 11): the resolved route and both hosts'
+		// TLS; then the marker records it, with the stubs the target made.
+		fwRoute, cerr := liveFirmwareStageC(vm.Name, *targetHost, withStorage, route, useTLS)
+		if cerr != nil {
+			return cerr
+		}
+		if err := s.recordLiveFirmwareRoute(fwl, fwRoute, createdStubs); err != nil {
+			return err
 		}
 	}
 	if route.onNetwork {
@@ -631,7 +678,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// runtime-migration machinery below is for running VMs only. The abort stays
 	// armed until the handoff commits, so a failure before it removes what this
 	// attempt left on the target (the copied disks and the cloud-init ISO).
-	if fwVM || coldStopped {
+	if fwCold || coldStopped {
 		return s.coldMigrateStoppedVM(ctx, vm, targetHost, fwSpec, abort, send)
 	}
 
@@ -726,6 +773,12 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	if err := corrosion.UpdateVMState(ctx, s.db, vm.Name, "migrating", fmt.Sprintf("→ %s", req.TargetHost)); err != nil {
 		s.noteStateWriteFail(corrosion.OpVMState, err)
 	}
+	// §6.1 step 5: the marker migrating, last before libvirt has the guest.
+	if fwl != nil {
+		if err := s.startLiveFirmwareMigration(fwl); err != nil {
+			return err
+		}
+	}
 	migrationStart := time.Now()
 	sharesWeight := s.vmSharesWeight(ctx, vm.Name)
 
@@ -768,6 +821,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			// The destination definition carries each rbd disk's monitors as
 			// its pool resolves them now (a re-addressed cluster's).
 			RBDLocators: s.rbdLocatorsOf(ctx, vm.Name),
+			// A live firmware move: the guest arrives paused, and the source
+			// stays defined with its state (spec §6.3).
+			FirmwareLive: fwl != nil,
 		}
 		armed.apply(&params)
 		logVNCPasswordStrip(vm.Name, req.TargetHost, params.StripVNCPassword)
@@ -791,13 +847,21 @@ poll:
 			s.adoptAbandonedMigration(context.WithoutCancel(ctx), vm, req.TargetHost,
 				withStorage, disks, done, unlock, migrationFinish{
 					target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec, armed: armed,
-					createdStubs: createdStubs,
+					createdStubs: createdStubs, fwLive: fwl,
 				})
 			return status.Errorf(codes.DeadlineExceeded,
 				"stopped waiting for the migration of %q to %s (%v); it is still running in "+
 					"libvirt and will be completed in the background — watch `lv events %s`",
 				vm.Name, req.TargetHost, migrateCtx.Err(), vm.Name)
 		case migrateErr := <-done:
+			if migrateErr != nil && fwl != nil && s.liveFirmwareSourceInactive(vm.Name) {
+				// The source domain is shut off: the guest left it (a failure
+				// after the target took it, §7 M1b). The move goes on to
+				// cutover, where Verify decides.
+				slog.Warn("migrate: the migration call failed, but the source domain is inactive; verifying the target",
+					"vm", vm.Name, "target", req.TargetHost, "error", migrateErr)
+				break poll
+			}
 			if migrateErr != nil {
 				// Migration failed — VM is still on the source host.
 				// Check if the domain is still alive; if so, restore to "running"
@@ -810,6 +874,9 @@ poll:
 				defer fcancel()
 				// The VFs go back before the row says running: the guest stayed.
 				s.reattachVFsOnSource(fctx, vm.Name, detachedVFs, len(detachedVFs) > 0)
+				if fwl != nil {
+					s.liveFirmwareMigrateFailed(fctx, fwl, migrateErr)
+				}
 				if s.restoreSourceStateAfterFailedMigration(fctx, vm.Name,
 					fmt.Sprintf("migration to %s failed: %v", req.TargetHost, migrateErr), migrateErr.Error()) {
 					slog.Warn("migration failed but VM still running on source",
@@ -834,18 +901,37 @@ poll:
 	send(pb.MigratePhase_MIGRATE_CUTOVER, 100, 0)    //nolint:errcheck
 	send(pb.MigratePhase_MIGRATE_COMPLETING, 100, 0) //nolint:errcheck
 
+	// A live firmware move commits only once the target's paused guest
+	// verified against the source's final state (§6.1 steps 7 and 8); any
+	// other outcome parks it, both copies kept.
+	if fwl != nil {
+		if err := s.liveFirmwareCutover(ctx, fwl); err != nil {
+			s.recordMigrationMetrics(strategyLabel, "failure", time.Since(migrationStart), 0, 0)
+			return err
+		}
+	}
+
 	// The libvirt cutover has happened and cannot be rolled back. Commit the
 	// VM+disk ownership move to the target atomically BEFORE any destructive
 	// source cleanup or success signal — a failed commit is loud divergence, never
 	// silent success. `disks` is the pre-cutover snapshot captured above.
 	if err := s.finalizeMigrationOwnership(ctx, vm, req.TargetHost, withStorage, disks); err != nil {
-		armed.uncommitted(ctx)
+		if fwl == nil {
+			// A firmware move's target keeps its verified guest paused under
+			// its hold; the marker stays verified, and recovery commits it.
+			armed.uncommitted(ctx)
+		}
 		s.recordMigrationMetrics(strategyLabel, "failure", time.Since(migrationStart), 0, 0)
 		s.recordVMEvent(context.WithoutCancel(ctx), vm.Name, "vm.migrated", "error",
 			"cut over to "+req.TargetHost+" but ownership commit failed: "+err.Error())
 		s.audit(context.WithoutCancel(ctx), "vm.migrate", vm.Name, "from="+s.hostName+" to="+req.TargetHost, "error")
 		return status.Errorf(codes.Internal,
 			"VM %q cut over to %s but committing ownership failed: %v", vm.Name, req.TargetHost, err)
+	}
+	if fwl != nil {
+		if err := s.liveFirmwareCommitted(fwl); err != nil {
+			return err
+		}
 	}
 	s.releaseSourceVFsAfterCutover(context.WithoutCancel(ctx), vm.Name, detachedVFs)
 
@@ -855,10 +941,10 @@ poll:
 	s.recordVMEvent(context.WithoutCancel(ctx), vm.Name, "vm.migrated", "ok", "from="+s.hostName+" to="+req.TargetHost)
 	s.audit(context.WithoutCancel(ctx), "vm.migrate", vm.Name, "from="+s.hostName+" to="+req.TargetHost, "ok")
 
-	// (Firmware-state cleanup is handled in coldMigrateStoppedVM, which firmware
-	// VMs take instead of this runtime-migration path — see the early return above.)
+	// A cold firmware move's state is handled in coldMigrateStoppedVM (the early
+	// return above); a live one's is released and cleaned up by the finish.
 	if err := s.finishMigrationOnTarget(ctx, vm, migrationFinish{
-		target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec, armed: armed,
+		target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec, armed: armed, fwLive: fwl,
 	}); err != nil {
 		return status.Errorf(codes.FailedPrecondition, "VM %q migrated to %s, but is %v", vm.Name, req.TargetHost, err)
 	}
@@ -930,6 +1016,12 @@ func (s *Server) adoptAbandonedMigration(
 			}
 			err = <-done
 		}
+		if err != nil && finish.fwLive != nil && s.liveFirmwareSourceInactive(vm.Name) {
+			// The guest left the source (§7 M1b): Verify decides, below.
+			slog.Warn("migrate: adopted firmware migration failed with the source domain inactive; verifying the target",
+				"vm", vm.Name, "target", targetHost, "error", err)
+			err = nil
+		}
 		if err != nil {
 			// The migration failed after we stopped watching; the guest is still
 			// on the source. Anything but `migrating` — that is the state nothing
@@ -937,6 +1029,9 @@ func (s *Server) adoptAbandonedMigration(
 			// The guest stayed, so it gets back the VFs detached for the move,
 			// as a watched failure does.
 			s.reattachVFsOnSource(ctx, vm.Name, finish.detachedVFs, len(finish.detachedVFs) > 0)
+			if finish.fwLive != nil {
+				s.liveFirmwareMigrateFailed(ctx, finish.fwLive, err)
+			}
 			state, detail := "error", fmt.Sprintf("migration to %s failed after the request was abandoned: %v", targetHost, err)
 			if st, sErr := s.virt.DomainState(vm.Name); sErr == nil && st == "running" {
 				state, detail = "running", fmt.Sprintf("migration to %s failed after the request was abandoned; VM still running on %s: %v", targetHost, s.hostName, err)
@@ -957,17 +1052,32 @@ func (s *Server) adoptAbandonedMigration(
 			return
 		}
 
+		// A live firmware move commits only on Verify's MATCH, adopted or not.
+		if finish.fwLive != nil {
+			if cerr := s.liveFirmwareCutover(ctx, finish.fwLive); cerr != nil {
+				s.recordVMEvent(ctx, vm.Name, "vm.migrated", "error", "abandoned request; "+cerr.Error())
+				return
+			}
+		}
 		// libvirt cut over. The commit is the only thing that makes the cluster
 		// agree with reality, and it cannot be skipped just because nobody is
 		// listening any more.
 		if ferr := s.finalizeMigrationOwnership(ctx, vm, targetHost, withStorage, disks); ferr != nil {
-			finish.armed.uncommitted(ctx)
+			if finish.fwLive == nil {
+				finish.armed.uncommitted(ctx)
+			}
 			slog.Error("migrate: adopted migration cut over but ownership commit FAILED — "+
 				"the guest is on the target and the cluster does not know",
 				"vm", vm.Name, "target", targetHost, "error", ferr)
 			s.recordVMEvent(ctx, vm.Name, "vm.migrated", "error",
 				"abandoned request; cut over to "+targetHost+" but ownership commit failed: "+ferr.Error())
 			return
+		}
+		if finish.fwLive != nil {
+			if cerr := s.liveFirmwareCommitted(finish.fwLive); cerr != nil {
+				slog.Error("migrate: adopted firmware migration committed, but its marker could not record it", "vm", vm.Name, "error", cerr)
+				return
+			}
 		}
 		s.releaseSourceVFsAfterCutover(ctx, vm.Name, finish.detachedVFs)
 		slog.Info("migrate: adopted migration completed", "vm", vm.Name, "target", targetHost)
@@ -2232,7 +2342,7 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 && s.migrationNetwork == "" && !shareOnly && !hasRBD && len(mtus) == 0 {
 		return ensureOutcome{}, nil
 	}
-	client, conn, err := s.peerClient(ctx, targetHost)
+	client, closer, err := s.dialPeer(ctx, targetHost)
 	if err != nil {
 		if shareOnly {
 			return ensureOutcome{}, nil
@@ -2240,7 +2350,7 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 		return ensureOutcome{}, status.Errorf(codes.Unavailable,
 			"cannot reach %s to prepare the disks of VM %q for the copy: %v", targetHost, vmName, err)
 	}
-	defer conn.Close()
+	defer closer()
 
 	resp, err := client.EnsureDisks(ctx, &pb.EnsureDisksRequest{
 		VmName: vmName, Disks: stubs, WantMigrationTls: wantTLS,
@@ -2567,6 +2677,9 @@ type migrationFinish struct {
 	// armed lets a guest handed over paused run once its NIC guards are in
 	// force on the target (armedMigration.finish).
 	armed *armedMigration
+	// fwLive is a live firmware move: Release on the target lets its guest
+	// run, in place of armed.finish (spec §6.1 step 10).
+	fwLive *liveFirmwareRun
 }
 
 // adoptedMigrationCeiling bounds how long an adopted migration may run before
@@ -2658,6 +2771,16 @@ func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRe
 	// files for --with-storage migrations where copies now live on target).
 	go s.cleanupPostMigration(vm.Name)
 
+	// A live firmware move's guest runs only through Release, which puts its
+	// NIC firewall in force first; then its NVRAM is confirmed and the source
+	// cleaned up.
+	if f.fwLive != nil {
+		if err := s.releaseLiveFirmwareMove(ctx, f.fwLive); err != nil {
+			s.recordVMEvent(ctx, vm.Name, "vm.held", "error", err.Error())
+			return err
+		}
+		return nil
+	}
 	// Last, so a slow target holds up none of the above: a guest handed over
 	// paused (a guarded NIC with no tap name of its own) runs once its guards
 	// are in force under the taps it got there; the source retries until
@@ -2885,9 +3008,8 @@ func (s *Server) sourceDomainState(vmName string) (string, error) {
 // and removing every disk path by name deleted it (drill D1). A target too old
 // to report what it created reports nothing, and its stub is left in place.
 func (s *Server) cleanupFailedMigrationTarget(ctx context.Context, vmName, target string, stubPaths []string) {
-	// (Firmware VMs never reach this runtime-migration path — they take the
-	// stopped cold-move in coldMigrateStoppedVM — so no firmware cleanup is
-	// needed here.)
+	// A live firmware move's target keeps its hold's state: CleanupMigrationArtifacts
+	// leaves a held VM's firmware alone, and Abort disposes of it.
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer cancel()
 	s.cleanupMigrationArtifactsOnTarget(cleanupCtx, target, vmName, stubPaths, "")

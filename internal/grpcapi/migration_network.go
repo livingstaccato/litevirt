@@ -397,7 +397,7 @@ func (s *Server) chooseLiveFirmwareRoute(ctx context.Context, vmName string, tar
 	if o != r {
 		why := "a live firmware move does not copy storage over it (not probed)"
 		if kind == routeMemory {
-			why = "a live firmware move uses it only once lab e2e E-9 has shown its stream on that network; until then it rides libvirt's tunnel"
+			why = "a live firmware move does not use it until its stream is verified to stay on that network; until then it rides libvirt's tunnel"
 		}
 		msg := fmt.Sprintf("migration.network %s is not used for the live firmware move of %s to %s: %s; "+
 			"its data goes to %s, the address the host is dialed on",

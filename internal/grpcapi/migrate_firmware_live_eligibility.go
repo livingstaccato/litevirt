@@ -97,7 +97,12 @@ type liveFirmwareEligible struct {
 // liveFirmwareRefusal is a refusal of the live move of vm to target: the
 // reason, then the cold move that remains.
 func liveFirmwareRefusal(vm, target, format string, args ...any) error {
-	return status.Errorf(codes.FailedPrecondition,
+	return liveFirmwareRefusalCode(codes.FailedPrecondition, vm, target, format, args...)
+}
+
+// liveFirmwareRefusalCode is liveFirmwareRefusal with another status code.
+func liveFirmwareRefusalCode(code codes.Code, vm, target, format string, args ...any) error {
+	return status.Errorf(code,
 		"live migration of Secure Boot / vTPM VM %q refused: %s — migrate it cold instead: `lv stop %s`, then `lv migrate %s %s --cold`",
 		vm, fmt.Sprintf(format, args...), vm, vm, target)
 }
@@ -317,14 +322,15 @@ func firmwareLiveUnimplementedText(vm, target string) string {
 
 // liveFirmwareStageB is stage B (spec §3.2 items 8–10): the target's answer
 // to PrepareLiveFirmwareTarget. A target without the RPC is refused with the
-// cold-only text; any other Prepare error is returned as the target gave it.
+// cold-only text; any other Prepare error keeps its code and says what the
+// target said, with the cold move.
 func liveFirmwareStageB(vm, target string, a *liveFirmwareEligible, resp *pb.PrepareLiveFirmwareTargetResponse, callErr error) error {
 	// Item 8.
 	if callErr != nil {
 		if status.Code(callErr) == codes.Unimplemented {
 			return status.Error(codes.FailedPrecondition, firmwareLiveUnimplementedText(vm, target))
 		}
-		return callErr
+		return liveFirmwareRefusalCode(status.Code(callErr), vm, target, "target %s did not prepare it: %s", target, status.Convert(callErr).Message())
 	}
 	if resp == nil || resp.GetDstRuntime() == nil || resp.GetDstApplicability() == nil {
 		return liveFirmwareRefusal(vm, target, "target %s answered Prepare without its runtime or the VM's applicability", target)
@@ -416,7 +422,7 @@ func liveFirmwareStageC(vm string, target corrosion.HostRecord, storage bool, r 
 		return fwmig.RouteTunnelled, nil
 	}
 	if !liveFirmwareMignetRoute {
-		return "", liveFirmwareRefusal(vm, target.Name, "a memory-only move over migration.network is not yet allowed for firmware VMs (lab e2e E-9)")
+		return "", liveFirmwareRefusal(vm, target.Name, "a memory-only move over migration.network is not yet allowed for firmware VMs: its traffic path there is not yet verified")
 	}
 	if !r.onNetwork || !bothTLS {
 		return "", liveFirmwareRefusal(vm, target.Name, "a direct memory-only move needs the migration network and TLS on both hosts")

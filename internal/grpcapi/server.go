@@ -829,6 +829,8 @@ type Server struct {
 	// (stage A) and as its target (Prepare): the one host check both read
 	// (SetLiveFirmwareHost).
 	fwTarget fwTargetState
+	// fwLive is the source half's test seams (migrate_firmware_live.go).
+	fwLive fwLiveSourceState
 
 	// vmLocks provides per-VM mutual exclusion for operations that must not
 	// run concurrently (e.g. snapshot + migration, backup + delete).

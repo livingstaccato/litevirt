@@ -28,9 +28,10 @@ func insertFirmwareVM(t *testing.T, ctx context.Context, s *Server, name, state 
 	}
 }
 
-// A firmware VM migrated without --cold is told the command that works: a
-// running one to stop first, a stopped one only to add --cold — not to stop a
-// VM that is already stopped.
+// A firmware VM migrated without --cold, and refused, is told the command that
+// works: a running one (refused here by stage A: this host has no live
+// firmware check) to stop first, a stopped one only to add --cold — not to
+// stop a VM that is already stopped.
 //
 // Mutation: give the stopped VM the running VM's message — it names
 // `lv stop fw` and goes red.
@@ -42,6 +43,7 @@ func TestMigrateVM_FirmwareNotColdNamesTheCommandThatWorks(t *testing.T) {
 		s := testServerWithLocks(t)
 		ctx := adminCtx()
 		insertFirmwareVM(t, ctx, s, "fw", tc.state)
+		insertTestHost(t, ctx, s.db, "t1", "active")
 		err := s.MigrateVM(&pb.MigrateVMRequest{VmName: "fw", TargetHost: "t1"}, &mockMigrateStream{ctx: ctx})
 		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "`lv migrate fw t1 --cold`") {
 			t.Errorf("%s firmware VM migrated live = %v, want FailedPrecondition naming `lv migrate fw t1 --cold`", tc.state, err)
@@ -53,12 +55,14 @@ func TestMigrateVM_FirmwareNotColdNamesTheCommandThatWorks(t *testing.T) {
 	}
 }
 
-// Live migration of an SB/vTPM VM is refused (carry unvalidated; source must not
-// be wiped on an unverified carry) — cold only.
+// Live migration of an SB/vTPM VM on a host that cannot check its own live
+// firmware runtime (no LiveFirmwareHost) is refused, and steered to the cold
+// move.
 func TestMigrateVM_FirmwareLiveRefused(t *testing.T) {
 	s := testServerWithLocks(t)
 	ctx := adminCtx()
 	insertFirmwareVM(t, ctx, s, "fw", "running")
+	insertTestHost(t, ctx, s.db, "t1", "active")
 	err := s.MigrateVM(&pb.MigrateVMRequest{VmName: "fw", TargetHost: "t1"}, &mockMigrateStream{ctx: ctx}) // default strategy = live
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition refusing live firmware migration, got %v", err)

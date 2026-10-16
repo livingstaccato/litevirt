@@ -1,12 +1,14 @@
 package hostboot
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -126,11 +128,14 @@ func TestReturningBootOnlyForReturningStates(t *testing.T) {
 }
 
 // The returning write is made once per return: a crash of that boot before it
-// serves finds the host 'upgrading', which the returning rule leaves to the
-// restart rules, so a crash loop cannot re-arm the timeout through it.
+// serves finds the host 'upgrading' and its awaiting-serving note, which the
+// returning rule leaves to the restart rules. The second full boot makes no
+// write (Deferred: the 'upgrading' the returning boot wrote keeps its
+// timeout), so a crash loop cannot re-arm the timeout through it.
 //
-// Mutation: treat 'upgrading' as a returning state — the second boot is
-// taken by the rule.
+// Mutations: treat 'upgrading' as a returning state — the second boot is
+// taken by the rule and writes again; drop the note from returningBoot — the
+// second boot writes a fresh 'upgrading'.
 func TestReturningBootIsOncePerReturn(t *testing.T) {
 	db, ctx := hostIn(t, "fenced")
 	dir := t.TempDir()
@@ -145,6 +150,66 @@ func TestReturningBootIsOncePerReturn(t *testing.T) {
 	// It dies before serving and is started again.
 	if b2, ok := returningBoot(ctx, db, "h", dir, false, now.Add(5*time.Second)); ok {
 		t.Fatalf("the boot after the returning boot was taken by the returning rule again: %+v", b2)
+	}
+	if b2 := BootState(ctx, db, "h", dir, false, now.Add(5*time.Second)); b2.Returning || !b2.Deferred || b2.State != "upgrading" {
+		t.Fatalf("the second full boot after a returning boot that never served = %+v, want no write (Deferred), the host kept 'upgrading'", b2)
+	}
+}
+
+// A returning boot's write is the returning_boot release feature's: it needs
+// the gate's grant for that feature, and with it the guarded write is applied
+// in the normal case — the state hostboot read is the one the guard checks
+// (both the membership row) — and records the host 'upgrading' with its
+// report. A fence recorded since the read refuses it. Until the feature
+// opens, the boot falls back to 'active' at once, still guarded.
+//
+// Mutations: drop the grant check — the ungranted write lands; read the state
+// from the hosts column (stale after the membership split) — the guarded
+// write is refused in the normal case.
+func TestWriteReturningBoot(t *testing.T) {
+	db, ctx := hostIn(t, "maintenance")
+	b := BootState(ctx, db, "h", t.TempDir(), false, time.Now())
+	if !b.Returning || b.From != "maintenance" || b.State != "upgrading" {
+		t.Fatalf("fixture: boot of a maintenance host = %+v", b)
+	}
+	r := Report{Version: "v-ret", CPUs: 4, MemMiB: 4096, DiskGiB: 20, HasResources: true}
+	if applied, err := WriteReturningBoot(ctx, db, "h", capabilities.FeatureGrant{}, b.From, r); err == nil || applied {
+		t.Fatalf("a returning write without a grant: applied=%v err=%v, want refused", applied, err)
+	}
+	if applied, err := WriteReturningBoot(ctx, db, "h", capabilities.GrantForTest(t, capabilities.FeatureHADisarm), b.From, r); err == nil || applied {
+		t.Fatalf("a returning write with another feature's grant: applied=%v err=%v, want refused", applied, err)
+	}
+	if got := stateOf(t, db); got != "maintenance" {
+		t.Fatalf("a refused returning write moved the host to %q", got)
+	}
+	applied, err := WriteReturningBoot(ctx, db, "h", capabilities.GrantForTest(t, capabilities.FeatureReturningBoot), b.From, r)
+	if err != nil || !applied {
+		t.Fatalf("the returning write in the normal case: applied=%v err=%v, want applied", applied, err)
+	}
+	if h, _ := corrosion.GetHost(ctx, db, "h"); h == nil || h.State != "upgrading" || h.Version != "v-ret" || h.CPUTotal != 4 {
+		t.Fatalf("after the returning write the host is %+v, want upgrading with its report", h)
+	}
+
+	// A fence recorded between the read and the write is kept.
+	db, ctx = hostIn(t, "offline")
+	b = BootState(ctx, db, "h", t.TempDir(), false, time.Now())
+	if err := corrosion.UpdateHostState(ctx, db, "h", "fenced"); err != nil {
+		t.Fatal(err)
+	}
+	if applied, err := WriteReturningBoot(ctx, db, "h", capabilities.GrantForTest(t, capabilities.FeatureReturningBoot), b.From, r); err != nil || applied {
+		t.Fatalf("a returning write over a fence recorded since the read: applied=%v err=%v, want not applied", applied, err)
+	}
+	if got := stateOf(t, db); got != "fenced" {
+		t.Fatalf("the fence recorded since the read became %q", got)
+	}
+
+	// Before the feature opens: 'active' at once, guarded on the state read.
+	fb := b.Fallback("not latched")
+	if fb.State != "active" || fb.AwaitServing || fb.Returning || fb.From != "offline" {
+		t.Fatalf("fallback of a returning boot = %+v, want active at once from offline", fb)
+	}
+	if other := (Boot{State: "upgrading", From: "active"}); other.Fallback("x") != other {
+		t.Fatal("Fallback changed a boot that is not a returning one")
 	}
 }
 
@@ -182,5 +247,34 @@ func writeMarker(t *testing.T, dir string, at time.Time) {
 	t.Helper()
 	if err := os.WriteFile(MarkerPath(dir), []byte(at.UTC().Format(time.RFC3339Nano)), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A fresh joiner's replica holds nothing of the cluster at its first boot:
+// the daemon registers its own row 'active' (corrosion.RegisterHost) before
+// the boot decides, so the boot reads 'active' and takes the restart rules
+// ('upgrading' from 'active'), not the returning rule. The 'joining' arm is
+// reached only when the node's own replica already holds 'joining' at boot:
+// a re-admission (`lv host add` of a name whose data dir survived) that
+// reached the running daemon before it restarted.
+//
+// Mutation: none in returningBoot — this pins which rule a fresh joiner's
+// first boot takes, so a change to registration that left 'joining' in place
+// is seen.
+func TestFreshJoinerFirstBootTakesTheRestartRules(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	db.SetHostMembershipGate(func() bool { return true })
+	if err := corrosion.RegisterHost(ctx, db, corrosion.HostRecord{
+		Name: "h", Address: "10.0.0.9", SSHUser: "root", CertSerial: "s", State: "active",
+	}); err != nil {
+		t.Fatalf("RegisterHost: %v", err)
+	}
+	b := BootState(ctx, db, "h", t.TempDir(), false, time.Now())
+	if b.Returning || b.State != "upgrading" || b.From != "active" || !b.AwaitServing {
+		t.Fatalf("first boot of a fresh joiner = %+v, want upgrading from active by the restart rules", b)
 	}
 }

@@ -38,8 +38,9 @@
 //     before it serves;
 //   - a host recorded fenced, offline, maintenance, draining or joining is
 //     returning to service, and boots 'upgrading' until it serves too
-//     (returningBoot): once per return, since its own daemon never writes
-//     those states;
+//     (returningBoot), once the returning_boot release feature is open, and
+//     'active' as before until then: once per return, since its own daemon
+//     never writes those states;
 //   - ConfirmServing moves the host from 'upgrading' to 'active' and from
 //     nothing else, and leaves its isolation as it is.
 //
@@ -89,6 +90,10 @@ type Boot struct {
 	// UpdateHostStartupFrom), so a fence, drain or offline recorded between
 	// the read and the write is kept.
 	From string
+	// Returning: the host was recorded in a returning state (From), and its
+	// 'upgrading' write is the returning_boot release feature's
+	// (WriteReturningBoot). Until the feature opens, the boot is Fallback().
+	Returning bool
 	// Reason says why, for the boot log.
 	Reason string
 }

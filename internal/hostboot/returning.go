@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -21,7 +22,9 @@ func returning(state string) bool {
 
 // returningBoot is the boot of a host recorded in a returning state: it
 // records the host 'upgrading' until its daemon serves (ConfirmServing), not
-// 'active' at once. An 'active' boot write starts the host's new life
+// 'active' at once, once the returning_boot release feature is open
+// (Boot.Returning, WriteReturningBoot); until then the daemon writes
+// Fallback, 'active' at once. An 'active' boot write starts the host's new life
 // (corrosion.HostsActiveSince), and once a whole failing run has passed since
 // it, the coordinator fences on the failures its observers counted while the
 // daemon was still starting; 'upgrading' is skipped for UpgradingTimeout from
@@ -57,6 +60,32 @@ func returningBoot(ctx context.Context, db *corrosion.Client, host, dataDir stri
 	}
 	// Bounded by the returning state itself, so written whether or not the
 	// note can be left.
-	return noteAwaiting(dataDir, Boot{State: "upgrading", AwaitServing: true, From: h.State,
+	return noteAwaiting(dataDir, Boot{State: "upgrading", AwaitServing: true, From: h.State, Returning: true,
 		Reason: "recorded " + h.State + "; returning to service, active once this daemon serves"}, now, true), true
+}
+
+// WriteReturningBoot is a returning boot's write (Boot.Returning): host
+// 'upgrading', with the boot report, only while it is still recorded from,
+// checked in the write's own transaction. It is the returning_boot release
+// feature's data: a failover leader on the previous release clears a fenced
+// host from its handled cache only once the host is 'active', so until every
+// host runs this release, an 'upgrading' over a returning state could leave a
+// host that never serves unfenced and its parked recovery dropped. g is the
+// release gate's grant (health.Checker.WithFeature).
+func WriteReturningBoot(ctx context.Context, db *corrosion.Client, host string, g capabilities.FeatureGrant, from string, r Report) (bool, error) {
+	if err := g.Check(capabilities.FeatureReturningBoot); err != nil {
+		return false, err
+	}
+	return corrosion.UpdateHostStartupFrom(ctx, db, host, from, "upgrading", r.Version, r.CPUs, r.MemMiB, r.DiskGiB, r.HasResources)
+}
+
+// Fallback is a returning boot whose returning_boot feature is not open: the
+// boot write records the host 'active' at once, as before this release, still
+// guarded on the state it read. Any other boot is returned unchanged.
+func (b Boot) Fallback(why string) Boot {
+	if !b.Returning {
+		return b
+	}
+	return Boot{State: "active", From: b.From,
+		Reason: "recorded " + b.From + "; returning to service, active at once as before (" + why + ")"}
 }

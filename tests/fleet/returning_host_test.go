@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/failover"
 	"github.com/litevirt/litevirt/internal/fence"
@@ -46,10 +47,27 @@ func (f *restartFleet) fenceAndReturn(t *testing.T, want, dataDir string) (hostb
 	time.Sleep(3 * time.Second)
 	b := hostboot.BootState(ctx, f.d.DB, f.d.Name, dataDir, false, time.Now())
 	booted := time.Now()
+	f.returningWrite(t, b)
+	return b, booted
+}
+
+// returningWrite is d's boot write for b with returning_boot open: a
+// returning boot through hostboot.WriteReturningBoot (the grant the gate
+// would hand it), any other boot as written before.
+func (f *restartFleet) returningWrite(t *testing.T, b hostboot.Boot) {
+	t.Helper()
+	ctx := context.Background()
+	if b.Returning {
+		applied, err := hostboot.WriteReturningBoot(ctx, f.d.DB, f.d.Name,
+			capabilities.GrantForTest(t, capabilities.FeatureReturningBoot), b.From, hostboot.Report{})
+		if err != nil || !applied {
+			t.Fatalf("returning boot write: applied=%v err=%v", applied, err)
+		}
+		return
+	}
 	if err := corrosion.UpdateHostStartup(ctx, f.d.DB, f.d.Name, b.State, "", 0, 0, 0, false); err != nil {
 		t.Fatalf("boot write: %v", err)
 	}
-	return b, booted
 }
 
 // TestFleet_FencedHostReturningIsUpgradingUntilItServes: d stops answering
@@ -163,6 +181,11 @@ func TestFleet_FencedHostReturningThatNeverServesIsFencedAgain(t *testing.T) {
 // TestFleet_OutOfServiceHostReturningIsUpgradingUntilItServes: d is recorded
 // in maintenance, draining or joining; its daemon stops and starts again at
 // once, and 30 s pass between its boot write and its gRPC server answering.
+// The joining case is a re-admission that reached d's running daemon (a peer
+// records it 'joining', d's replica receives it) before d restarted: a fresh
+// joiner's first boot reads the 'active' its own registration inserts, and
+// takes the unclean-restart rule (TestFleet_UncleanRestartIsUpgradingUntilItServes,
+// hostboot TestFreshJoinerFirstBootTakesTheRestartRules).
 // d is 'upgrading' throughout and is not fenced; once it serves it is recorded
 // active and still not fenced.
 //
@@ -197,9 +220,7 @@ func TestFleet_OutOfServiceHostReturningIsUpgradingUntilItServes(t *testing.T) {
 			dir := t.TempDir()
 			b := hostboot.BootState(ctx, f.d.DB, f.d.Name, dir, false, time.Now())
 			booted := time.Now()
-			if err := corrosion.UpdateHostStartup(ctx, f.d.DB, f.d.Name, b.State, "", 0, 0, 0, false); err != nil {
-				t.Fatalf("boot write: %v", err)
-			}
+			f.returningWrite(t, b)
 			if b.State != "upgrading" || !b.AwaitServing {
 				t.Errorf("boot of d recorded %s decided %+v, want 'upgrading' until it serves", tc.state, b)
 			}

@@ -128,6 +128,9 @@ type Daemon struct {
 	// confirmServing, when set, replaces hostboot.ConfirmServing in the
 	// restart's serving check (confirmActive). Tests only.
 	confirmServing func(ctx context.Context) (bool, string, error)
+	// returningGate, when set, replaces the release-feature gate a returning
+	// boot's write goes through (returningBootGate). Tests only.
+	returningGate releaseGate
 
 	// rolledBackTokens names capability tokens this node already latched that this
 	// binary has never heard of — i.e. this binary is a rollback below them. Set at
@@ -278,7 +281,28 @@ func (d *Daemon) writeBootState(ctx context.Context, cpus, memMiB, diskGiB int, 
 		beforeBootWrite()
 	}
 	var confirm confirmFunc
-	if boot.From != "" {
+	returned := false
+	if boot.Returning {
+		var applied bool
+		var err error
+		if returned, applied, err = d.writeReturningBoot(ctx, boot, r); !returned {
+			boot = boot.Fallback(err.Error())
+			slog.Info("boot state", "state", boot.State, "from", boot.From, "reason", boot.Reason)
+		} else {
+			switch {
+			case err != nil:
+				slog.Warn("failed to write host startup state", "error", err)
+				confirm = reportOnServing(boot.State)
+			case !applied:
+				slog.Warn("boot: this host's recorded state changed after the boot read it; leaving it, and reporting this boot once the daemon serves",
+					"read", boot.From)
+				confirm = reportOnServing(boot.State)
+			}
+		}
+	}
+	if returned {
+		// Written through the release gate above.
+	} else if boot.From != "" {
 		applied, err := corrosion.UpdateHostStartupFrom(ctx, d.db, d.cfg.HostName, boot.From, boot.State, d.cfg.Version, cpus, memMiB, diskGiB, hasResources)
 		switch {
 		case err != nil:
@@ -635,6 +659,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// (awaitServingThenActivate): recorded active
 	// before its gRPC server listened, it was fenced on the failure count its
 	// observers carried through the restart (hostboot).
+	//
+	// The checker, with its durable latches loaded, exists before the boot
+	// write: a returning host's 'upgrading' write goes through its release
+	// gate (returning_boot).
+	d.checker = health.NewChecker(d.cfg.HostName, d.cfg.PKIDir, d.db)
+	d.wireActivationMarker()
 	d.writeBootState(ctx, cpus, memMiB, diskGiB, niErr == nil)
 	// Record version on the corrosion client so it goes into Crescent
 	// peer handshakes (used by skew detection).
@@ -658,16 +688,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// are observed too.
 	d.db.SetSyncMetrics(metrics.NewAntiEntropyMetrics())
 
-	// Create the host health checker BEFORE the replicator so the proof-table WAL
-	// gate is installed before any replication goroutine runs (a nil gate fails
-	// closed, but wiring it up front means no reliance on that). Load the durable
-	// split-brain activation latch here too, before any runtime work is wired, so a
-	// previously-enforced node that restarts (including mid-partition) gates onboot
-	// VM starts / LB (re)apply instead of running them ungated. (Peer capability is
-	// wired later via SetPeerPinger; until then PeerSupports fails closed, so proof
-	// WAL entries defer rather than leak — never a schema-version guess.)
-	d.checker = health.NewChecker(d.cfg.HostName, d.cfg.PKIDir, d.db)
-	d.wireActivationMarker()
+	// The host health checker was created (above, before the boot write) BEFORE
+	// the replicator so the proof-table WAL gate is installed before any
+	// replication goroutine runs (a nil gate fails closed, but wiring it up front
+	// means no reliance on that), with the durable split-brain activation latch
+	// loaded before any runtime work is wired, so a previously-enforced node that
+	// restarts (including mid-partition) gates onboot VM starts / LB (re)apply
+	// instead of running them ungated. (Peer capability is wired later via
+	// SetPeerPinger; until then PeerSupports fails closed, so proof WAL entries
+	// defer rather than leak — never a schema-version guess.)
 	gateMetrics := metrics.NewRuntimeGateMetrics()      // shared by all gate observers
 	stateWriteMetrics := metrics.NewStateWriteMetrics() // shared by all state-write observers
 
@@ -1905,6 +1934,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.wireFenceCandidates(svc)
 	d.startHAPolicyCache(ctx, svc)
 	d.startHADisarmPreRecord(ctx, fc)
+	d.startReturningBootPreRecord(ctx, fc)
 	go fc.Start(ctx)
 	// Adopt each decided voter generation once its certificate verifies,
 	// importing claim state first where this node is a member of it (§4.4).

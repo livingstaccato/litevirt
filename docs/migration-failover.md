@@ -1056,10 +1056,11 @@ turned active is counted down afresh, and a host `lv host add` admitted is not
 probed at all until its daemon's first boot write ends `joining`. A newer
 observation counts only if its failing run began after the activation, or once
 the host has been failing for a whole run since it: 5 probes (8 s) plus the 5 s
-clock-skew margin. Observers keep counting through a restart, and a daemon's
-boot write records it `active` a few seconds before it answers probes, so
-without this a host that restarted (recorded `upgrading` while it was down) was
-fenced the moment its boot write landed, on the count from its restart.
+clock-skew margin. Observers keep counting through a restart, and where a
+daemon's boot write records it `active` (the boots listed below that still
+do), it does so a few seconds before it answers probes, so without this a host
+that restarted (recorded `upgrading` while it was down) was fenced the moment
+its boot write landed, on the count from its restart.
 The rule is the failover leader's: until the leader runs a build with it, a
 restarted host can still be fenced in that gap.
 

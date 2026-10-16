@@ -833,6 +833,8 @@ func TestReturningBootOfAFencedHostNeedsNoHistory(t *testing.T) {
 	if err := corrosion.UpdateHostState(ctx, d.db, "h", "fenced"); err != nil {
 		t.Fatal(err)
 	}
+	calls := 0
+	d.returningGate = openGate(t, &calls)
 	d.cfg.DataDir = filepath.Join(t.TempDir(), "missing")
 	served := make(chan struct{})
 	var once sync.Once
@@ -842,6 +844,9 @@ func TestReturningBootOfAFencedHostNeedsNoHistory(t *testing.T) {
 	case <-served:
 	case <-time.After(3 * time.Second):
 		t.Fatal("the boot started no serving check")
+	}
+	if calls != 1 {
+		t.Fatalf("the returning boot went through the release gate %d times, want once", calls)
 	}
 	for deadline := time.Now().Add(3 * time.Second); host().State != "active"; time.Sleep(10 * time.Millisecond) {
 		if time.Now().After(deadline) {

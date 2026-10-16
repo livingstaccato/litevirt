@@ -17,6 +17,7 @@ import (
 	"github.com/litevirt/litevirt/internal/fwmig"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/vfio"
 )
 
 // The source's failure matrix of a live firmware move (spec §7), driven
@@ -918,5 +919,170 @@ func TestAdoptedFirmwareMigration_SourceStillActiveIsM1(t *testing.T) {
 	requireAbortModes(t, r, modePre, modeDiscard)
 	if r.log.has("verify") || r.log.has("commit") {
 		t.Fatalf("steps %v", r.log.get())
+	}
+}
+
+// ── Fix round 1 ──
+
+// Review I-1 (spec amendment 2026-10-16): a move whose Verify went
+// unanswered after the source stopped with a reason other than migrated (here
+// M1b: the migration call failed, the source domain crashed) is not resolved
+// by fence: the source's TPM state may be stale (I6), so neither copy is
+// declared current and no DISCARD is owed.
+//
+// Mutation: resolve whatever the stop reason — red.
+func TestFenceResolution_SourceStopReasonNotMigratedStaysParked(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	land := r.srcFake.OnMigrateToTarget
+	r.srcFake.OnMigrateToTarget = func(name, uri string, p lv.MigrateParams) error {
+		if err := land(name, uri, p); err != nil {
+			return err
+		}
+		r.srcFake.SetState(fwlVM, libvirtfake.StateShutdown)
+		r.srcFake.SetStateReason(fwlVM, "crashed")
+		return errors.New("injected failure; the source domain crashed")
+	}
+	r.parkUnreachableAtVerify()
+	m, _ := r.marker()
+	if m.SrcStopReason != "crashed" {
+		t.Fatalf("marker stop reason %q, want crashed (the scenario needs it)", m.SrcStopReason)
+	}
+	r.fenceTarget()
+	if ok, err := r.src.ResolveLiveFirmwareMoveByFence(context.Background(), fwlVM); err != nil || ok {
+		t.Fatalf("resolved %v (%v) after the source stopped with reason crashed", ok, err)
+	}
+	requireMarker(t, r, fwmig.PhaseTargetUnreachable, fwmig.PhaseCutover)
+	if owed, _ := r.src.fwRecords().ListOwedDiscards(); len(owed) != 0 {
+		t.Errorf("owed discards written: %+v", owed)
+	}
+	if vm := r.row(); vm.State != "migrating" {
+		t.Errorf("row %s, want migrating", vm.State)
+	}
+}
+
+// Review I-1, the other side: a park from before cutover is resolved by
+// fence (the source never stopped, its copy is current).
+//
+// Mutation: refuse every park without reason migrated — red.
+func TestFenceResolution_PreCutoverParkResolves(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	r.confirmPhaseFailure(libvirtfake.StateRunning)
+	r.peerC.abortAnswer = func(req *pb.AbortLiveFirmwareTargetRequest) (*pb.AbortLiveFirmwareTargetResponse, error) {
+		if req.GetMode() == modeDiscard {
+			return nil, status.Error(codes.Unavailable, "connection refused")
+		}
+		return r.dst.AbortLiveFirmwareTarget(r.peer, req)
+	}
+	_ = r.migrate()
+	requireMarker(t, r, fwmig.PhaseTargetUnreachable, fwmig.PhaseMigrating)
+	r.fenceTarget()
+	if ok, err := r.src.ResolveLiveFirmwareMoveByFence(context.Background(), fwlVM); err != nil || !ok {
+		t.Fatalf("resolve: %v %v", ok, err)
+	}
+	if vm := r.row(); vm.State != "running" {
+		t.Errorf("row %s, want running (the source guest runs)", vm.State)
+	}
+}
+
+// Review I-2: M1p's VFs go back into the guest once it is resumed — not
+// while it is paused, which leaves them reserved and out of the guest.
+//
+// Mutation: reattach before the M1p resume — red.
+func TestM1p_ResumedGuestGetsItsVFs(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	fs := newPCIUnbindRecordingFS()
+	t.Cleanup(vfio.SetFS(fs))
+	const vf = "0000:41:10.0"
+	if err := corrosion.UpsertPCIDevice(adminCtx(), r.src.db, corrosion.PCIDeviceRecord{
+		HostName: "src-host", Address: vf, Type: "net", VendorID: "8086", VMName: fwlVM}); err != nil {
+		t.Fatal(err)
+	}
+	fs.setVF(vf)
+	fs.setBound(vf)
+	if err := r.srcFake.AttachHostdev(fwlVM, vf); err != nil {
+		t.Fatal(err)
+	}
+	r.srcFake.FailMigrateToTarget = func(string, string) error {
+		if guestHasHostdev(t, r.src, fwlVM, vf) {
+			t.Error("the VF is still in the guest at the migration")
+		}
+		r.srcFake.SetState(fwlVM, libvirtfake.StatePaused)
+		return errors.New("injected failure that left the guest paused")
+	}
+	if err := r.migrate(); err == nil {
+		t.Fatal("the move succeeded; the scenario needs libvirt to fail it")
+	}
+	if st, _ := r.srcFake.RawState(fwlVM); st != libvirtfake.StateRunning {
+		t.Fatalf("source domain %q, want resumed", st)
+	}
+	if !guestHasHostdev(t, r.src, fwlVM, vf) {
+		t.Fatal("the resumed guest runs without its VF")
+	}
+	if _, ok := r.marker(); ok {
+		t.Error("marker left")
+	}
+}
+
+// Review m-1: a parked M1 keeps everything on the target, its stubs included
+// (CleanupMigrationArtifacts is not asked).
+//
+// Mutation: clean the target up after a park — red.
+func TestM1_ParkKeepsTargetStubs(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{storage: true})
+	r.confirmPhaseFailure(libvirtfake.StateRunning)
+	r.peerC.abortAnswer = func(req *pb.AbortLiveFirmwareTargetRequest) (*pb.AbortLiveFirmwareTargetResponse, error) {
+		if req.GetMode() == modeDiscard {
+			return &pb.AbortLiveFirmwareTargetResponse{Refused: true, TargetDomain: &pb.TargetDomain{Present: true, State: "running"}}, nil
+		}
+		return r.dst.AbortLiveFirmwareTarget(r.peer, req)
+	}
+	_ = r.migrate()
+	requireMarker(t, r, fwmig.PhaseTargetRan, fwmig.PhaseMigrating)
+	if r.peerC.cleanups != 0 {
+		t.Fatalf("the target was asked to clean up %d times after a park", r.peerC.cleanups)
+	}
+}
+
+// Review m-2: the source domain is active but its state (running or paused)
+// cannot be read: a paused guest must not lose its marker unresumed, so the
+// move parks source_paused and the row stays migrating.
+//
+// Mutation: take the M1 path on an unreadable state — red.
+func TestM1_UnreadableActiveStateParks(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	r.srcFake.FailMigrateToTarget = func(string, string) error {
+		r.srcFake.FailDomainStateReason = func(name string) error {
+			if name == fwlVM {
+				return errors.New("libvirt: connection reset")
+			}
+			return nil
+		}
+		return errors.New("injected migration failure")
+	}
+	_ = r.migrate()
+	requireMarker(t, r, fwmig.PhaseSourcePaused, fwmig.PhaseMigrating)
+	if vm := r.row(); vm.State != "migrating" {
+		t.Errorf("row %s, want migrating", vm.State)
+	}
+}
+
+// Review m-3: an owed DISCARD answered with a domain of the VM still defined
+// on the target, while the row names the source, keeps its record and raises
+// discard_owed as critical.
+//
+// Mutation: drop the record on any answer that is not a refusal — red.
+func TestFenceResolution_OwedDiscardWithDomainLeftKept(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	m := r.resolvedByFence()
+	r.peerC.abortAnswer = func(*pb.AbortLiveFirmwareTargetRequest) (*pb.AbortLiveFirmwareTargetResponse, error) {
+		return &pb.AbortLiveFirmwareTargetResponse{TargetDomain: &pb.TargetDomain{Present: true, State: "shutoff"}}, nil
+	}
+	r.src.RetryOwedFirmwareDiscardsOnce(context.Background())
+	if _, ok, _ := r.src.fwRecords().GetOwedDiscardFor(fwlVM, m.Binding); !ok {
+		t.Fatal("the owed-discard record was dropped with a domain left on the target")
+	}
+	c, found, err := corrosion.GetHealthCondition(context.Background(), r.src.db, firmwareMigrationEvaluator, condFwmigDiscardOwed, "vm", fwlVM)
+	if err != nil || !found || c.Severity != corrosion.SeverityCritical {
+		t.Fatalf("condition %+v found=%v err=%v, want discard_owed critical", c, found, err)
 	}
 }

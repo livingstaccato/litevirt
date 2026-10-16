@@ -843,16 +843,18 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		// `migrating`, which nothing else heals.
 		fctx, fcancel := detachedMigrateCleanupCtx(ctx)
 		defer fcancel()
-		// The VFs go back before the row says running: the guest stayed.
-		s.reattachVFsOnSource(fctx, vm.Name, detachedVFs, len(detachedVFs) > 0)
-		// A live firmware move is aborted (or parked) on the target first;
-		// its marker goes only after the row is restored (§7 M1, M1p). A
-		// park whose source guest is not running keeps the row migrating.
+		// A live firmware move is aborted (or parked) on the target first,
+		// and a paused source guest resumed (§7 M1, M1p), so the VFs below
+		// go into a guest that runs; its marker goes only after the row is
+		// restored. A park whose source guest is not running keeps the row
+		// migrating.
 		var unmark func()
 		keepRow := false
 		if fwl != nil {
 			unmark, keepRow = s.liveFirmwareMigrateFailed(fctx, fwl, migrateErr)
 		}
+		// The VFs go back before the row says running: the guest stayed.
+		s.reattachVFsOnSource(fctx, vm.Name, detachedVFs, len(detachedVFs) > 0)
 		if !keepRow && s.restoreSourceStateAfterFailedMigration(fctx, vm.Name,
 			fmt.Sprintf("migration to %s failed: %v", req.TargetHost, migrateErr), migrateErr.Error()) {
 			slog.Warn("migration failed but VM still running on source",
@@ -861,7 +863,11 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		if unmark != nil {
 			unmark()
 		}
-		s.cleanupFailedMigrationTarget(fctx, vm.Name, req.TargetHost, createdStubs)
+		// A parked firmware move keeps everything on the target ("kept":
+		// nothing deleted anywhere), its stubs included.
+		if fwl == nil || unmark != nil {
+			s.cleanupFailedMigrationTarget(fctx, vm.Name, req.TargetHost, createdStubs)
+		}
 		send(pb.MigratePhase_MIGRATE_FAILED, 0, 0) //nolint:errcheck
 		s.recordMigrationMetrics(strategyLabel, "failure", time.Since(migrationStart), 0, 0)
 		return status.Errorf(codes.Internal, "migration failed: %v", migrateErr)
@@ -1061,13 +1067,14 @@ func (s *Server) adoptAbandonedMigration(
 			// on the source. Anything but `migrating` — that is the state nothing
 			// heals.
 			// The guest stayed, so it gets back the VFs detached for the move,
-			// as a watched failure does.
-			s.reattachVFsOnSource(ctx, vm.Name, finish.detachedVFs, len(finish.detachedVFs) > 0)
+			// as a watched failure does: after a live firmware move's abort
+			// (and a paused source guest's resume, §7 M1p).
 			var unmark func()
 			keepRow := false
 			if finish.fwLive != nil {
 				unmark, keepRow = s.liveFirmwareMigrateFailed(ctx, finish.fwLive, err)
 			}
+			s.reattachVFsOnSource(ctx, vm.Name, finish.detachedVFs, len(finish.detachedVFs) > 0)
 			state, detail := "error", fmt.Sprintf("migration to %s failed after the request was abandoned: %v", targetHost, err)
 			if st, sErr := s.virt.DomainState(vm.Name); sErr == nil && st == "running" {
 				state, detail = "running", fmt.Sprintf("migration to %s failed after the request was abandoned; VM still running on %s: %v", targetHost, s.hostName, err)
@@ -1088,7 +1095,9 @@ func (s *Server) adoptAbandonedMigration(
 			if unmark != nil {
 				unmark()
 			}
-			s.cleanupFailedMigrationTarget(ctx, vm.Name, targetHost, finish.createdStubs)
+			if finish.fwLive == nil || unmark != nil {
+				s.cleanupFailedMigrationTarget(ctx, vm.Name, targetHost, finish.createdStubs)
+			}
 			slog.Warn("migrate: adopted migration failed", "vm", vm.Name, "target", targetHost, "error", err)
 			s.recordVMEvent(ctx, vm.Name, "vm.migrated", "error", "abandoned request; migration failed: "+err.Error())
 		}

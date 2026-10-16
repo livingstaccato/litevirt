@@ -292,7 +292,7 @@ func (s *Server) abortLiveFirmwareBeforeCutover(ctx context.Context, r *liveFirm
 		r.target.Name, orNone(resp.GetHoldState()), domainWord(td), resp.GetRefused(), resp.GetDetail())
 	if !guestMayBeThere || !resp.GetRefused() || !td.GetPresent() ||
 		(td.GetState() != "paused" && td.GetState() != "shutoff") || resp.GetHoldState() != string(fwmig.HoldPrepared) {
-		return fwmig.PhaseTargetRan, seen + "; a domain or hold there this attempt cannot discard before cutover"
+		return fwmig.PhaseTargetRan, seen + "; the target holds a domain or hold this attempt cannot account for or discard before cutover (not necessarily a guest that ran)"
 	}
 	d, err := s.sendLiveFirmwareAbort(ctx, r.target.Name, m.VM, m.Binding, pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_DISCARD_UNVERIFIED, m.CreatedStubs)
 	switch {
@@ -367,7 +367,16 @@ var errLiveFirmwareSourceActive = errors.New("the migration returned, and the so
 //     automatic DISCARD of a target's paused copy under a prepared hold.
 func (s *Server) liveFirmwareMigrateFailed(ctx context.Context, r *liveFirmwareRun, migrateErr error) (unmark func(), keepRow bool) {
 	ctx = context.WithoutCancel(ctx)
-	if st, err := s.virt.DomainStateReason(r.marker.VM); err == nil && st.Reason == "paused" {
+	st, err := s.virt.DomainStateReason(r.marker.VM)
+	if err != nil {
+		// Active, but whether it runs or is paused cannot be read: a paused
+		// guest must not lose its marker unresumed, so the move parks with
+		// both copies kept (an operator's --accept-source resumes it).
+		_ = s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseSourcePaused, fmt.Sprintf(
+			"the migration failed (%v), and the active source domain's state cannot be read: %v", migrateErr, err))
+		return nil, true
+	}
+	if st.Reason == "paused" {
 		return s.liveFirmwareSourcePaused(ctx, r, migrateErr)
 	}
 	if phase, why := s.abortLiveFirmwareBeforeCutover(ctx, r, true); phase != "" {
@@ -695,6 +704,14 @@ func (s *Server) ResolveLiveFirmwareMoveByFence(ctx context.Context, vm string) 
 	if m.Phase != fwmig.PhaseTargetUnreachable && m.Phase != fwmig.PhaseDiscardPending {
 		return false, nil
 	}
+	if !m.BeforeCutover() && m.SrcStopReason != fwmig.StopReasonMigrated {
+		// After cutover, a source that did not stop as a completed migration
+		// stops it may hold stale TPM state (I6): neither copy is declared
+		// current, and no DISCARD is owed (spec amendment 2026-10-16).
+		slog.Warn("live firmware move: the target is proved off, but the source stopped with a reason other than migrated; the park stays for an operator",
+			"vm", vm, "attempt", m.Attempt, "target", m.Target, "src_stop_reason", m.SrcStopReason)
+		return false, nil
+	}
 	off, err := corrosion.HostProvedOff(ctx, s.db, m.Target)
 	if err != nil || !off {
 		return false, err
@@ -776,10 +793,29 @@ func (s *Server) RetryOwedFirmwareDiscardsOnce(ctx context.Context) {
 			}); cerr != nil {
 				slog.Warn("live firmware move: raise the condition", "vm", o.VM, "code", condFwmigDiscardOwed, "error", cerr)
 			}
+		case resp.GetTargetDomain().GetPresent() && s.owedDiscardRowNamesSource(ctx, o):
+			// Answered, but a domain of the VM is still defined there and no
+			// hold of the attempt accounted for it: the record stays.
+			if cerr := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{
+				Code: condFwmigDiscardOwed, VM: o.VM, Attempt: o.Attempt, Source: s.hostName, Target: o.Target,
+				Severity: corrosion.SeverityCritical,
+				Detail:   fmt.Sprintf("%s answered the owed discard, but a domain of the VM is still defined there (%s)", o.Target, domainWord(resp.GetTargetDomain())),
+				Action:   "an operator removes the target's definition; the DISCARD is retried each interval",
+			}); cerr != nil {
+				slog.Warn("live firmware move: raise the condition", "vm", o.VM, "code", condFwmigDiscardOwed, "error", cerr)
+			}
 		default:
 			s.dropOwedDiscard(ctx, o, "the target discarded its copy")
 		}
 	}
+}
+
+// owedDiscardRowNamesSource reports whether the VM's row still names this
+// host (or cannot be read): the owed DISCARD's domain on the target is then
+// not the VM's current home.
+func (s *Server) owedDiscardRowNamesSource(ctx context.Context, o fwmig.OwedDiscard) bool {
+	row, err := corrosion.GetVM(ctx, s.db, o.VM)
+	return err != nil || row == nil || row.HostName != o.Target
 }
 
 func (s *Server) dropOwedDiscard(ctx context.Context, o fwmig.OwedDiscard, why string) {

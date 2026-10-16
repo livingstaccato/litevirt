@@ -389,7 +389,8 @@ not `active`. A VM moved by a drain is started on its target, which is
 
 ### Failback after maintenance
 
-`lv host undrain` returns a host to scheduling and moves nothing back. Failback
+`lv host undrain` returns a host to scheduling (draining, maintenance, and also
+fenced or offline, which ends the fence) and moves nothing back. Failback
 is the opt-in that does, as Proxmox's HA failback property does: after the
 undrain, the VMs the drain moved away return by live migration, at a bounded
 rate.
@@ -1140,7 +1141,9 @@ A host recorded `fenced`, `offline`, `maintenance`, `draining` or `joining`
 when it boots, with or without the marker, whatever its earlier boots, is
 returning to service. The one exception is a fenced or offline host whose boot
 cannot write `boot-unclean-history`: it keeps the fence, makes no write and
-is not recorded `active` once it serves, until `lv host undrain`. Once the `returning_boot` feature of
+is not recorded `active` once it serves, until `lv host undrain`. It logs that
+at warning level and raises `boot_kept_fence`
+([diagnostics.md](diagnostics.md)). Once the `returning_boot` feature of
 `release_2026_11_v1` is in use ([upgrades.md](upgrades.md)), its boot write
 records it `upgrading`, only while it is still recorded as the boot read it,
 and the daemon records it `active` once it serves, so it is not fenced before

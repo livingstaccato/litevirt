@@ -204,7 +204,7 @@ func TestBootThatCannotBoundOrReadDefers(t *testing.T) {
 	for _, st := range []string{"fenced", "offline"} {
 		db, ctx := hostIn(t, st)
 		dir := filepath.Join(t.TempDir(), "missing")
-		if b := BootState(ctx, db, "h", dir, false, time.Now()); b.State != st || !b.AwaitServing || !b.Deferred || b.Returning {
+		if b := BootState(ctx, db, "h", dir, false, time.Now()); b.State != st || !b.AwaitServing || !b.Deferred || b.Returning || !b.KeptFence || b.Cause == "" {
 			t.Fatalf("boot of a %s host that cannot record its unclean boot = %+v, want %s kept, no boot write", st, b, st)
 		}
 	}

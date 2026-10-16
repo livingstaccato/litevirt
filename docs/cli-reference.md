@@ -119,7 +119,7 @@ lv host ls --names                        # Print only host names, one per line 
 lv host inspect <host>                    # Host details, with the capacity reservations counted against it (see diagnostics.md)
 lv host drain <host> [--parallel 2]       # Evacuate VMs off host
 lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (honors stop-delay)
-lv host undrain <host> [--failback]       # Return host to scheduling (--failback: wait for the failback it started and print results)
+lv host undrain <host> [--failback]       # Return a draining, maintenance, fenced or offline host to scheduling (--failback: wait for the failback it started and print results)
 lv host failback <host> [--all] [--dry-run] [--follow]   # Live-migrate VMs a drain moved away back to the host
 lv host rm <host> [--force]               # Remove host (--force with running VMs); revokes its cert
 lv host rm --dead <host> [--dry-run]      # Remove a host fenced proof-grade and gone for good: checks the

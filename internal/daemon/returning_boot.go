@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
@@ -100,4 +101,45 @@ func (d *Daemon) startReturningBootPreRecord(ctx context.Context, fc *failover.C
 		},
 	}
 	go p.Run(ctx)
+}
+
+// fenceKeptPoll is how often watchKeptFence reads this host's state while a
+// boot_kept_fence condition is open. A var so tests can shrink it.
+var fenceKeptPoll = 10 * time.Second
+
+// watchKeptFence makes a boot that kept the fence visible
+// (hostboot.Boot.KeptFence): it logs at warning level and raises
+// boot_kept_fence about this host, naming the cause and the remedy. Every
+// boot then resolves the condition, one an earlier process left included, once
+// the host is recorded as anything but fenced or offline (`lv host undrain`).
+func (d *Daemon) watchKeptFence(ctx context.Context, boot hostboot.Boot) {
+	host := d.cfg.HostName
+	if boot.KeptFence {
+		slog.Warn("boot: this host could not record its unclean-boot history, so it keeps the fence the cluster recorded: it serves, but is not returned to service",
+			"host", host, "state", boot.State, "cause", boot.Cause, "remedy", hostboot.FenceKeptRemedy(host))
+		if err := hostboot.RaiseFenceKept(ctx, d.db, host, boot.State, boot.Cause, time.Now()); err != nil {
+			slog.Warn("boot: could not raise boot_kept_fence", "error", err)
+		}
+	} else if open, err := hostboot.FenceKeptOpen(ctx, d.db, host); err != nil || !open {
+		return
+	}
+	go d.resolveKeptFenceOnReturn(ctx)
+}
+
+// resolveKeptFenceOnReturn resolves this host's boot_kept_fence once it is
+// recorded as anything but fenced or offline.
+func (d *Daemon) resolveKeptFenceOnReturn(ctx context.Context) {
+	host := d.cfg.HostName
+	for {
+		if h, err := corrosion.GetHost(ctx, d.db, host); err == nil && h != nil && h.State != "fenced" && h.State != "offline" {
+			if err := hostboot.ResolveFenceKept(ctx, d.db, host, time.Now()); err == nil {
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(fenceKeptPoll):
+		}
+	}
 }

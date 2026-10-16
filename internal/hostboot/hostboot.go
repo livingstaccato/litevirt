@@ -94,6 +94,11 @@ type Boot struct {
 	// 'upgrading' write is the returning_boot release feature's
 	// (WriteReturningBoot). Until the feature opens, the boot is Fallback().
 	Returning bool
+	// KeptFence: a deferred boot of a host recorded fenced or offline that
+	// could not record its unclean-boot history, which keeps the fence
+	// (CondFenceKeptOnBoot); Cause is why.
+	KeptFence bool
+	Cause     string
 	// Reason says why, for the boot log.
 	Reason string
 }

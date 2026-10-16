@@ -62,7 +62,7 @@ func returningBoot(ctx context.Context, db *corrosion.Client, host, dataDir stri
 			// (ConfirmServingReport keeps fenced and offline). An operator
 			// returns it (`lv host undrain`). Whether or not returning_boot
 			// is open.
-			return Boot{State: h.State, AwaitServing: true, Deferred: true,
+			return Boot{State: h.State, AwaitServing: true, Deferred: true, KeptFence: true, Cause: herr.Error(),
 				Reason: "recorded " + h.State + ", and recording this unclean boot failed (" + herr.Error() + "); the fence is kept until an operator returns this host"}, true
 		}
 	}

@@ -278,3 +278,34 @@ func TestFreshJoinerFirstBootTakesTheRestartRules(t *testing.T) {
 		t.Fatalf("first boot of a fresh joiner = %+v, want upgrading from active by the restart rules", b)
 	}
 }
+
+// boot_kept_fence is raised with the state kept, the cause and the remedy,
+// warning severity, and resolved; a resolve with none open writes nothing.
+//
+// Mutation: drop the remedy from the evidence — the remedy check fails.
+func TestFenceKeptCondition(t *testing.T) {
+	db, ctx := hostIn(t, "fenced")
+	if err := ResolveFenceKept(ctx, db, "h", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := corrosion.GetHealthCondition(ctx, db, BootEvaluator, CondFenceKeptOnBoot, "host", "h"); err != nil || ok {
+		t.Fatalf("a resolve with none open wrote a row: ok=%v err=%v", ok, err)
+	}
+	if err := RaiseFenceKept(ctx, db, "h", "fenced", "open boot-unclean-history: read-only file system", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	row, ok, err := corrosion.GetHealthCondition(ctx, db, BootEvaluator, CondFenceKeptOnBoot, "host", "h")
+	if err != nil || !ok || row.Severity != corrosion.SeverityWarning || row.Lifecycle != corrosion.ConditionConfirmed ||
+		!strings.Contains(row.Evidence, "read-only file system") || !strings.Contains(row.Evidence, "lv host undrain h") {
+		t.Fatalf("boot_kept_fence: ok=%v err=%v %+v", ok, err, row)
+	}
+	if open, err := FenceKeptOpen(ctx, db, "h"); err != nil || !open {
+		t.Fatalf("FenceKeptOpen after the raise = %v %v", open, err)
+	}
+	if err := ResolveFenceKept(ctx, db, "h", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if open, err := FenceKeptOpen(ctx, db, "h"); err != nil || open {
+		t.Fatalf("FenceKeptOpen after the resolve = %v %v", open, err)
+	}
+}

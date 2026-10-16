@@ -273,6 +273,7 @@ func (d *Daemon) writeBootState(ctx context.Context, cpus, memMiB, diskGiB int, 
 			return hostboot.ConfirmServingReport(ctx, d.db, d.cfg.HostName, from, r)
 		}
 	}
+	d.watchKeptFence(ctx, boot)
 	if boot.Deferred {
 		go d.awaitServingThenActivate(ctx, reportOnServing(boot.State))
 		return

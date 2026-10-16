@@ -51,18 +51,20 @@ func RaiseUpgradingUnconfirmed(ctx context.Context, db *corrosion.Client, host, 
 		UpgradingSince string `json:"upgrading_since"`
 		Remedy         string `json:"remedy"`
 	}{cause, since.UTC().Format(time.RFC3339), UnconfirmedRemedy})
-	return writeUnconfirmed(ctx, db, host, string(b), now, false)
+	return writeHostCondition(ctx, db, CondUpgradingUnconfirmed, host, string(b), now, false)
 }
 
 // ResolveUpgradingUnconfirmed resolves host's upgrading_unconfirmed condition
 // if one is open, including one an earlier process left.
 func ResolveUpgradingUnconfirmed(ctx context.Context, db *corrosion.Client, host string, now time.Time) error {
-	return writeUnconfirmed(ctx, db, host, "", now, true)
+	return writeHostCondition(ctx, db, CondUpgradingUnconfirmed, host, "", now, true)
 }
 
-func writeUnconfirmed(ctx context.Context, db *corrosion.Client, host, evidence string, now time.Time, resolve bool) error {
+// writeHostCondition raises (resolve=false) or resolves host's host_boot
+// condition code about itself.
+func writeHostCondition(ctx context.Context, db *corrosion.Client, code, host, evidence string, now time.Time, resolve bool) error {
 	ts := now.UTC().Format(time.RFC3339)
-	row, ok, err := corrosion.GetHealthCondition(ctx, db, BootEvaluator, CondUpgradingUnconfirmed, "host", host)
+	row, ok, err := corrosion.GetHealthCondition(ctx, db, BootEvaluator, code, "host", host)
 	if err != nil {
 		return err
 	}
@@ -70,7 +72,7 @@ func writeUnconfirmed(ctx context.Context, db *corrosion.Client, host, evidence 
 		if resolve {
 			return nil
 		}
-		row = corrosion.HealthCondition{Evaluator: BootEvaluator, Code: CondUpgradingUnconfirmed,
+		row = corrosion.HealthCondition{Evaluator: BootEvaluator, Code: code,
 			SubjectKind: "host", SubjectID: host, FirstSeen: ts}
 	}
 	if resolve {

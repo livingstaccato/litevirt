@@ -690,8 +690,8 @@ func TrunkVLANsRecorded(ctx context.Context, c *Client) (map[string][]int, bool,
 // check the sg.write authority and the grammar (firewall_tags.go,
 // firewall_tag_group.go).
 func SetClusterPolicy(ctx context.Context, c *Client, key, value, setBy string) error {
-	if strings.HasPrefix(key, FirewallTagsKeyPrefix) || strings.HasPrefix(key, FirewallTagGroupKeyPrefix) {
-		return fmt.Errorf("%w: %s", ErrReservedClusterPolicyKey, key)
+	if err := refuseReservedPolicyKey(key); err != nil {
+		return err
 	}
 	if !c.MayWriteClusterPolicy() {
 		return ErrClusterPolicyGateClosed

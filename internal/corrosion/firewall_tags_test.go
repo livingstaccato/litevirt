@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"slices"
 	"strings"
@@ -246,5 +247,80 @@ func TestSetClusterPolicy_RefusesTheFirewallTagPrefixes(t *testing.T) {
 	}
 	if err := SetClusterPolicy(f.ctx, f.c, TrunkVLANsRecordedKey, "{}", "x"); err != nil {
 		t.Errorf("an ordinary key: %v", err)
+	}
+}
+
+// Every writer of a caller-chosen cluster_policies key refuses the reserved
+// prefixes, not only SetClusterPolicy (D2c review I-1): SetPoolRecord and
+// WriteNetworkVLANsCAS too, writing nothing.
+//
+// Mutation: drop the refusal from either writer — red.
+func TestReservedPrefixesRefusedByEveryArbitraryKeyWriter(t *testing.T) {
+	f := newTagGroupFixture(t)
+	for _, key := range []string{FirewallTagsKeyPrefix + "vm/" + tgID(1), FirewallTagGroupKeyPrefix + "web"} {
+		if err := SetPoolRecord(f.ctx, f.c, key, `{"tags":{"role":"web"}}`, "x"); !errors.Is(err, ErrReservedClusterPolicyKey) {
+			t.Errorf("SetPoolRecord(%s): %v, want ErrReservedClusterPolicyKey", key, err)
+		}
+		applied, err := WriteNetworkVLANsCAS(f.ctx, f.c, VLANSnapshot{Keys: map[string]PolicyValue{}}, nil,
+			map[string]string{key: `{"tags":{"role":"web"}}`}, "x")
+		if applied || !errors.Is(err, ErrReservedClusterPolicyKey) {
+			t.Errorf("WriteNetworkVLANsCAS(%s): applied=%v err=%v, want ErrReservedClusterPolicyKey", key, applied, err)
+		}
+		rows, _ := f.c.Query(f.ctx, `SELECT 1 AS one FROM cluster_policies WHERE key = ?`, key)
+		if len(rows) != 0 {
+			t.Errorf("%s was written", key)
+		}
+	}
+	if err := SetPoolRecord(f.ctx, f.c, PoolUploadKeyPrefix+"x", "{}", "x"); err != nil {
+		t.Errorf("an ordinary pool record: %v", err)
+	}
+}
+
+// A tags row is bounded (D2c review M-5): at most MaxFirewallTags tags; the
+// display name and host are each at most 253 bytes of printable,
+// non-space characters (a name is required).
+//
+// Mutations: drop the tag cap — red; drop the name check — red.
+func TestSetFirewallTags_BoundsTheRow(t *testing.T) {
+	f := newTagGroupFixture(t)
+	many := map[string]string{}
+	for i := 0; i <= MaxFirewallTags; i++ {
+		many[fmt.Sprintf("k%d", i)] = "v"
+	}
+	if err := SetFirewallTags(f.ctx, f.c, tagGroupGrant(t), tagsAuthority(t), TagMemberVM, tgID(1), many, "w", "", "x"); err == nil {
+		t.Errorf("%d tags accepted", len(many))
+	}
+	delete(many, "k0")
+	if err := SetFirewallTags(f.ctx, f.c, tagGroupGrant(t), tagsAuthority(t), TagMemberVM, tgID(1), many, "w", "", "x"); err != nil {
+		t.Errorf("%d tags refused: %v", len(many), err)
+	}
+	for what, nh := range map[string][2]string{
+		"no name":    {"", ""},
+		"long name":  {strings.Repeat("a", 254), ""},
+		"name space": {"a b", ""},
+		"name ctl":   {"a\x01", ""},
+		"long host":  {"w", strings.Repeat("h", 254)},
+		"host space": {"w", "h h"},
+	} {
+		if err := SetFirewallTags(f.ctx, f.c, tagGroupGrant(t), tagsAuthority(t), TagMemberCT, tgID(2), map[string]string{"a": "b"}, nh[0], nh[1], "x"); err == nil {
+			t.Errorf("%s: accepted", what)
+		}
+	}
+}
+
+// The member query and the store's listing agree: a key whose identity is
+// not well formed is dropped by both (D2c review M-7).
+//
+// Mutation: keep malformed identities in the member query's read — red.
+func TestReadFirewallTagsRows_DropsAMalformedIdentity(t *testing.T) {
+	f := newTagGroupFixture(t)
+	f.tags(TagMemberVM, "not-an-id", `{"tags":{"role":"web"}}`)
+	f.tags(TagMemberVM, tgID(1), `{"tags":{"role":"web"}}`)
+	rows, err := readFirewallTagsRows(f.ctx, f.c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := rows["vm/not-an-id"]; ok || len(rows) != 1 {
+		t.Fatalf("member read kept %v", rows)
 	}
 }

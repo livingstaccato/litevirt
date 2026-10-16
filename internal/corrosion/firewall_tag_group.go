@@ -507,9 +507,8 @@ func (w *tagWorkload) public() TagWorkload {
 }
 
 // readFirewallTagsRows reads every firewall-tags row, keyed "<kind>/<fw_id>".
-// A row whose key names no kind is ignored (one whose id is not well formed
-// matches no workload, which readTagWorkloads gives none); a removed row ("")
-// has no tags.
+// A row whose key names no kind, or no well-formed identity, is ignored, as
+// ListFirewallTagsRows ignores it; a removed row ("") has no tags.
 func readFirewallTagsRows(ctx context.Context, c *Client) (map[string]tagsRow, error) {
 	lo, hi := keyRange(FirewallTagsKeyPrefix)
 	rows, err := c.Query(ctx,
@@ -520,7 +519,7 @@ func readFirewallTagsRows(ctx context.Context, c *Client) (map[string]tagsRow, e
 	out := make(map[string]tagsRow, len(rows))
 	for _, r := range rows {
 		kind, id, ok := strings.Cut(strings.TrimPrefix(r.String("key"), FirewallTagsKeyPrefix), "/")
-		if !ok || (kind != TagMemberVM && kind != TagMemberCT) {
+		if !ok || (kind != TagMemberVM && kind != TagMemberCT) || !ValidFirewallID(id) {
 			continue
 		}
 		// One decoder for every reader (decodeFirewallTags): name and host

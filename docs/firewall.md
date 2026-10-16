@@ -815,7 +815,8 @@ firewall tag; copy one over with `lv firewall tag set`.
   (Admin or NetworkAdmin; Operator holds only `sg.read`), are refused until
   the cluster upgrade has finished (`firewall_tag_groups`), and leave a
   `firewall.tag.set` / `.rm` audit row with the tags before and after. A key
-  and a value are each `[a-z0-9][a-z0-9_.-]{0,62}`.
+  and a value are each `[a-z0-9][a-z0-9_.-]{0,62}`, and a workload holds at
+  most 64 tags.
 - Tags belong to the workload's firewall identity (`fw_id`), which the first
   `tag set` gives it on its host. The identity, and with it the tags, follows
   the workload through a migrate, a relocation, a rebuild, a stack's rolling

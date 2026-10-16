@@ -28,7 +28,6 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
-	"testing"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
@@ -60,14 +59,52 @@ func ClaimFWTagAuthorityMinter() func() FWTagAuthority {
 		panic("corrosion: the firewall-tags authority minter is already claimed (by internal/grpcapi); " +
 			"a firewall-tags write must go through its sg.write check")
 	}
-	return func() FWTagAuthority { return FWTagAuthority{minted: true} }
+	return newFWTagAuthority
 }
+
+// newFWTagAuthority is the only builder of a non-zero FWTagAuthority (the
+// authority guard flags any other non-zero literal).
+func newFWTagAuthority() FWTagAuthority { return FWTagAuthority{minted: true} }
 
 // FWTagAuthorityForTest mints an authority for a test. Test code only: the
 // authority guard fails the build on any non-test caller.
-func FWTagAuthorityForTest(t testing.TB) FWTagAuthority {
+func FWTagAuthorityForTest(t TestingT) FWTagAuthority {
 	t.Helper()
-	return FWTagAuthority{minted: true}
+	return newFWTagAuthority()
+}
+
+// refuseReservedPolicyKey refuses a cluster_policies key under
+// firewall_tags/ or firewall_tag_group/ for every writer that takes a key
+// its caller chooses (SetClusterPolicy, SetPoolRecord, WriteNetworkVLANsCAS):
+// those rows have their own writers, which check the sg.write authority, the
+// grant and the grammar.
+func refuseReservedPolicyKey(key string) error {
+	if strings.HasPrefix(key, FirewallTagsKeyPrefix) || strings.HasPrefix(key, FirewallTagGroupKeyPrefix) {
+		return fmt.Errorf("%w: %s", ErrReservedClusterPolicyKey, key)
+	}
+	return nil
+}
+
+// MaxFirewallTags is the most tags one workload may hold, and
+// maxFirewallTagsLabel the longest display name or host a tags row keeps:
+// together they bound every replica's row.
+const (
+	MaxFirewallTags      = 64
+	maxFirewallTagsLabel = 253
+)
+
+// validTagsLabel reports whether s is a display name or host a tags row may
+// keep: at most maxFirewallTagsLabel bytes of printable, non-space ASCII.
+func validTagsLabel(s string) bool {
+	if len(s) > maxFirewallTagsLabel {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] <= ' ' || s[i] >= 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // FirewallTagsRecord is one firewall-tags row as this replica holds it.
@@ -120,6 +157,13 @@ func SetFirewallTags(ctx context.Context, c *Client, g capabilities.FeatureGrant
 	key, err := firewallTagsKey(kind, fwID)
 	if err != nil {
 		return err
+	}
+	if len(tags) > MaxFirewallTags {
+		return fmt.Errorf("%d firewall tags: a workload holds at most %d", len(tags), MaxFirewallTags)
+	}
+	if name == "" || !validTagsLabel(name) || !validTagsLabel(host) {
+		return fmt.Errorf("firewall tags of %q on %q: the name (required) and the host are each at most %d printable, non-space characters",
+			name, host, maxFirewallTagsLabel)
 	}
 	for k, v := range tags {
 		if !ValidFirewallTagWord(k) {

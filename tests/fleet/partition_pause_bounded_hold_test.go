@@ -243,8 +243,12 @@ func failoverLog(out string) string {
 // may hold its majority there, so two generations decided since the outage
 // began keep the hold.
 //
-// Mutation: allow two generations since the outage in regainCandidates —
-// n3 recovers pp-vm once it adopts generation 4.
+// Mutation: allow two generations since the outage in regainCandidates is
+// no longer red here: n0 reported generation 2, below the floor (3) the
+// waiver would count from, so the evidence gate (hostReportedAdopting) holds
+// first. The unit arm "add v6 10 s before the outage, rm down since"
+// (TestSelfPauseExplicit_AGenerationJustBeforeTheOutageIsNotSettled) kills
+// it.
 func TestFleet_PartitionPause_TwoVoterChangesSinceTheOutageHold(t *testing.T) {
 	ctx := context.Background()
 	c, s, _ := bridgeFleet(t, ppOpts{coordinators: map[string]bool{"node-3": true}})

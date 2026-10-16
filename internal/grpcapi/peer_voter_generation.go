@@ -25,17 +25,21 @@ type peerVoterGens struct {
 }
 
 // notePeerVoterGeneration records that peer reported generation gen in a Ping
-// this node received at at. 0 is no report: an older build, or a node that
-// has run no adoption pass since it started. A generation lower than the last
-// reported one means the peer's adoption state was replaced (a reseed, a
-// re-added host), so the earlier reports no longer stand.
+// this node received at at. 0 is no report: an older build, a node that has
+// run no adoption pass since it started, or a host re-provisioned under the
+// same name, whose adoption state starts empty. These cannot be told apart
+// here, so a 0 forgets the peer's earlier reports, which fails closed: the
+// bounded hold waits for a report again. A generation lower than the last
+// reported one means the peer's adoption state was replaced (a re-added
+// host), so the earlier reports no longer stand either.
 func (s *Server) notePeerVoterGeneration(peer string, gen int64, at time.Time) {
-	if gen <= 0 {
-		return
-	}
 	g := &s.peerVoterGens
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if gen <= 0 {
+		delete(g.seen, peer)
+		return
+	}
 	if g.seen == nil {
 		g.seen = map[string][]peerVoterGenReport{}
 	}

@@ -550,14 +550,27 @@ All of this is in the failover coordinator (`internal/failover`).
      may lack. The configuration must then be pinned, or the rule stands:
      at most one generation, and no reset, decided within that window (none
      at all on a derived set). A generation is dated by the later of its
-     proposal's stamp and this node's row's, since a value another proposer
-     completes keeps its proposal's stamp. The sets counted are the adopted
-     generation, each newer one, and the one before the adopted one. The
+     proposal's stamp and its row's, since a value another proposer
+     completes keeps its proposal's stamp. The row's stamp is that of
+     whichever writer's row won the merge (the greater certificate wins),
+     which can be earlier than this node first held it: it shows that some
+     node wrote the generation then, not that the host held it, which only
+     the host's report below shows. The sets counted are the adopted
+     generation, each newer one, and the one before the adopted one, all
+     from one read of the voter configurations; when this node has adopted
+     a generation since the cycle read its voter set, the deadline holds for
+     that cycle and is counted again on the next. The
      host must have reported, in a Ping (`voter_generation`) this node
      received before the outage began, that it had adopted the oldest of
      these or a later one that this node holds; with no such report (an
      older build, a host whose adoption is stuck, a restart of this node,
-     which keeps the reports in memory) the rule stands. A stamp is the
+     which keeps the reports in memory) the rule stands. A report of 0 after
+     an earlier one (a restart of the host before its first adoption pass,
+     or a host re-provisioned under the same name) forgets the earlier
+     ones. A report's receipt is dated on this node's wall clock, as the
+     outage's start is: a backward step of this node's own clock during the
+     outage can date a report received since as received before, the same
+     residual as a clock that steps within the hour a skew is kept. A stamp is the
      writer's clock, moved later by the largest skew of any host, the fenced
      one and deleted ones included. A run spans only when it began
      `fenceSkewMargin` plus its observer's clock skew from this node before

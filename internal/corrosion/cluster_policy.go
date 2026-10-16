@@ -156,13 +156,18 @@ type VoterRegionSets struct {
 	// count live (VoterSetWithUncounted), from the SAME read of host state
 	// as Voters.
 	Uncounted map[string]bool
+	// Generation is the adopted voter generation Voters was read from, 0
+	// when none is adopted. A reader that counts over the voter
+	// configurations again compares its own read of the adopted generation
+	// with it: adoption runs on its own ticker and may land in between.
+	Generation int64
 }
 
 // VoterRegions reads VoterSet and every host's region. It depends on
 // VoterSet's contract alone — a set of names — so it keeps working when that
 // set becomes an explicit voter configuration (colonelpanik/litevirt#251).
 func VoterRegions(ctx context.Context, c *Client) (VoterRegionSets, error) {
-	voters, uncounted, err := VoterSetWithUncounted(ctx, c)
+	voters, uncounted, gen, err := voterSetRead(ctx, c)
 	if err != nil {
 		return VoterRegionSets{}, err
 	}
@@ -174,7 +179,7 @@ func VoterRegions(ctx context.Context, c *Client) (VoterRegionSets, error) {
 	for _, r := range rows {
 		regionOf[r.String("name")] = regionOrDefault(r.String("region"))
 	}
-	return VoterRegionSets{Voters: voters, RegionOf: regionOf, Uncounted: uncounted}, nil
+	return VoterRegionSets{Voters: voters, RegionOf: regionOf, Uncounted: uncounted, Generation: gen}, nil
 }
 
 // Region returns h's region, "default" for a host this set does not know.

@@ -31,10 +31,13 @@ type VoterConfig struct {
 	VoterConfigValue
 	MembersHash string
 	Certificate string // JSON ClaimCertificate; "" only in a hand-built test row
-	// UpdatedAt is the row's own stamp, set by the node that wrote it, no
-	// earlier than the decision was first written. CreatedAt is the
-	// proposal's, carried in the claim value: a value another proposer
-	// completed keeps it, however late it is written.
+	// UpdatedAt is the row's stamp, on the clock of the node whose row won
+	// the merge (voterConfigMergeKeepLocalRow: the greater certificate,
+	// then updated_at, wins whole). It is not this node's write: another
+	// writer's stamp, earlier than this node first held the row, can replace
+	// it. It is no earlier than that writer's own write of the decision.
+	// CreatedAt is the proposal's, carried in the claim value: a value
+	// another proposer completed keeps it, however late it is written.
 	UpdatedAt string
 }
 

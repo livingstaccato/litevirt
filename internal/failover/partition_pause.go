@@ -3,6 +3,7 @@ package failover
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -239,6 +240,14 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 // refusal's kind (pauseVerdict.key) rather than on every re-check.
 func (c *Coordinator) refusePauseWait(ctx context.Context, h *corrosion.HostRecord, w pauseWait, v pauseVerdict) {
 	host := h.Name
+	if v.key == keyVoterSetMoved {
+		// Counted again next cycle, on the generation it reads: the
+		// standing refusal, and its alert, are left as they are.
+		c.pauseWaits[host] = w
+		slog.Info("failover: partition-pause deadline passed while this node adopted a voter generation; recovering nothing, re-checking next cycle",
+			"host", host)
+		return
+	}
 	level := slog.LevelWarn
 	switch {
 	case w.refused == v.key:
@@ -290,6 +299,11 @@ const (
 	keyRestarted     = "observers' failing runs began after the fence"
 	keyContacted     = "this node probed the host healthy since the wait began"
 )
+
+// keyVoterSetMoved is the key, and the reason, of a refusal because this
+// node adopted a voter generation after the cycle read its voter set
+// (voterSnapshot): the deadline is counted again on the next cycle.
+const keyVoterSetMoved = "this node adopted a voter generation since the cycle read its voter set"
 
 // whyContacted is the reason a deadline is not quiet when this node has
 // probed the host healthy since the wait began (LastContact).
@@ -364,6 +378,9 @@ func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.Hos
 		return v
 	}
 	sets, explicit, err := c.pauseVoterSets(ctx, h.Name)
+	if errors.Is(err, errVoterSetMoved) {
+		return refused(keyVoterSetMoved)
+	}
 	if err != nil {
 		slog.Warn("failover: voter set read for a partition-pause deadline failed", "host", h.Name, "error", err)
 		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
@@ -609,7 +626,9 @@ type regainCandidate struct {
 // proposal and its row (decidedBefore), each moved later by stampSkew, and
 // one that cannot be dated was decided since.
 //
-// The sets, every one of which must be spanned:
+// The sets, every one of which must be spanned, all from one voterSnapshot
+// (ok is false when this node adopted a generation since the cycle read its
+// voter set):
 //
 //   - explicit: the adopted generation and each newer one (pauseVoterSets),
 //     and the one before the adopted one, which a host partitioned before it
@@ -621,11 +640,7 @@ type regainCandidate struct {
 //     a reset, or no generation before the adopted one), the derived set as
 //     its replica held it (derivedRegainCandidate).
 func (c *Coordinator) regainCandidates(ctx context.Context, host string, explicit bool, since time.Time, skew func(string) time.Duration) ([]regainCandidate, bool) {
-	adopted, err := corrosion.AdoptedVoterConfig(ctx, c.db)
-	if err != nil {
-		return nil, false
-	}
-	cfgs, err := corrosion.ListVoterConfigs(ctx, c.db)
+	adopted, cfgs, err := c.voterSnapshot(ctx)
 	if err != nil {
 		return nil, false
 	}
@@ -688,8 +703,8 @@ func (c *Coordinator) regainCandidates(ctx context.Context, host string, explici
 		cands = append(cands, regainCandidate{set: c.regionMembers(cfg, host)})
 	}
 	if explicit {
-		sets, ok, err := c.pauseVoterSets(ctx, host)
-		if err != nil || !ok {
+		sets, ok := c.pauseVoterSetsFrom(host, adopted, cfgs)
+		if !ok {
 			return nil, false
 		}
 		for _, set := range sets {
@@ -795,11 +810,14 @@ func (c *Coordinator) derivedRegainCandidate(ctx context.Context, host string, s
 	return cand, true
 }
 
-// decidedBefore reports whether cfg was decided, and first written, before
+// decidedBefore reports whether cfg was decided, and written, before
 // cutoff: both its proposal's stamp (created_at, which a value another
-// proposer completed keeps) and its row's (updated_at, no earlier than the
-// first write), moved later by stampSkew, precede it. A stamp that cannot be
-// read dates nothing.
+// proposer completed keeps) and its row's (updated_at, the stamp of
+// whichever writer's row won the merge, no earlier than that writer's
+// write), moved later by stampSkew, precede it. A row stamped before the
+// cutoff proves only that some node wrote it then, not that the fenced
+// host's replica held it: that is hostReportedAdopting's evidence. A stamp
+// that cannot be read dates nothing.
 func decidedBefore(cfg *corrosion.VoterConfig, cutoff time.Time, stampSkew time.Duration) bool {
 	for _, ts := range []string{cfg.CreatedAt, cfg.UpdatedAt} {
 		at, ok := corrosion.ParseUpdatedAt(ts)
@@ -814,9 +832,9 @@ func decidedBefore(cfg *corrosion.VoterConfig, cutoff time.Time, stampSkew time.
 // updated_at, a membership change) may read early: the largest skew of any
 // host this node holds a row for, deleted ones and the fenced host included.
 // The writer is not named (created_by is "<user> via <host>" or "automatic
-// genesis by <host>", the row's updated_at is whichever node wrote it, and a
-// membership row records no writer), so any of them may have stamped it. ok
-// is false when the hosts cannot be read.
+// genesis by <host>", the row's updated_at is whichever writer's row won the
+// merge, and a membership row records no writer), so any of them may have
+// stamped it. ok is false when the hosts cannot be read.
 func (c *Coordinator) stampSkew(ctx context.Context, skew func(string) time.Duration) (time.Duration, bool) {
 	stamps, err := corrosion.HostMembershipStamps(ctx, c.db)
 	if err != nil {
@@ -1069,20 +1087,68 @@ func (c *Coordinator) answeredByAVoterMajorityIn(hr healthRead, host string, set
 	return "", true
 }
 
+// errVoterSetMoved is voterSnapshot's error when this node adopted a voter
+// generation after the cycle read its voter set (keyVoterSetMoved).
+var errVoterSetMoved = errors.New(keyVoterSetMoved)
+
+// voterSnapshot is the voter configurations every voter set a deadline
+// counts over is taken from: every generation this node holds, and the one
+// it has adopted, which is the generation the cycle read its voter set on
+// (c.scope). Adoption runs on its own ticker, so it can land between that
+// read and this one; a generation adopted in between would then be counted
+// by nobody (neither the cycle's set nor "newer than the adopted one"), and
+// errVoterSetMoved holds the deadline for the cycle. The generations are read
+// before the adopted one, which only rises: when it still equals the
+// cycle's, it was the adopted one throughout, and its row is among them.
+func (c *Coordinator) voterSnapshot(ctx context.Context) (adopted *corrosion.VoterConfig, cfgs []*corrosion.VoterConfig, err error) {
+	cfgs, err = corrosion.ListVoterConfigs(ctx, c.db)
+	if err != nil {
+		return nil, nil, err
+	}
+	adopted, err = corrosion.AdoptedVoterConfig(ctx, c.db)
+	if err != nil {
+		return nil, nil, err
+	}
+	var gen int64
+	if adopted != nil {
+		gen = adopted.Generation
+	}
+	if gen != c.scope.vr.Generation {
+		return nil, nil, errVoterSetMoved
+	}
+	if adopted != nil {
+		held := false
+		for _, cfg := range cfgs {
+			held = held || (cfg != nil && cfg.Generation == gen)
+		}
+		if !held {
+			return nil, nil, errVoterSetMoved
+		}
+	}
+	return adopted, cfgs, nil
+}
+
 // pauseVoterSets is every voter set host's pauser may be counting its
 // majority over, as far as this node's replica knows: the set this cycle
-// decides on (c.scope.voters, host's region's under region scope) and each
-// newer generation this node has not adopted yet. explicit is false while
-// the voter set is derived, or when a newer generation is a reset (which a
-// host that adopted it counts over its own derived set).
+// decides on (c.scope.voters, host's region's under region scope, which is
+// the adopted generation's: voterSnapshot) and each newer generation this
+// node has not adopted yet. explicit is false while the voter set is
+// derived, or when a newer generation is a reset (which a host that adopted
+// it counts over its own derived set). err is errVoterSetMoved when this
+// node adopted a generation since the cycle read its voter set.
 func (c *Coordinator) pauseVoterSets(ctx context.Context, host string) (sets []map[string]bool, explicit bool, err error) {
-	adopted, err := corrosion.AdoptedVoterConfig(ctx, c.db)
-	if err != nil || !adopted.Explicit() {
-		return nil, false, err
-	}
-	cfgs, err := corrosion.ListVoterConfigs(ctx, c.db)
+	adopted, cfgs, err := c.voterSnapshot(ctx)
 	if err != nil {
 		return nil, false, err
+	}
+	sets, explicit = c.pauseVoterSetsFrom(host, adopted, cfgs)
+	return sets, explicit, nil
+}
+
+// pauseVoterSetsFrom is pauseVoterSets over one voterSnapshot.
+func (c *Coordinator) pauseVoterSetsFrom(host string, adopted *corrosion.VoterConfig, cfgs []*corrosion.VoterConfig) (sets []map[string]bool, explicit bool) {
+	if !adopted.Explicit() {
+		return nil, false
 	}
 	sets = []map[string]bool{c.scope.voters(host)}
 	for _, cfg := range cfgs {
@@ -1090,17 +1156,11 @@ func (c *Coordinator) pauseVoterSets(ctx context.Context, host string) (sets []m
 			continue
 		}
 		if !cfg.Explicit() {
-			return nil, false, nil
+			return nil, false
 		}
-		set := map[string]bool{}
-		for _, m := range cfg.Members {
-			if !c.scope.region || c.scope.regionOf(m.Name) == c.scope.regionOf(host) {
-				set[m.Name] = true
-			}
-		}
-		sets = append(sets, set)
+		sets = append(sets, c.regionMembers(cfg, host))
 	}
-	return sets, true, nil
+	return sets, true
 }
 
 // ── one-way partitions (docs/design/partition-pause.md §7 F4) ──────────────

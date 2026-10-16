@@ -391,9 +391,19 @@ func VoterSet(ctx context.Context, c *Client) (map[string]bool, error) {
 // the only source of the uncounted set: every quorum count takes it from here
 // or from VoterRegions, which calls it.
 func VoterSetWithUncounted(ctx context.Context, c *Client) (voters, uncounted map[string]bool, err error) {
+	voters, uncounted, _, err = voterSetRead(ctx, c)
+	return voters, uncounted, err
+}
+
+// voterSetRead is VoterSetWithUncounted, with the adopted voter generation
+// the set was read from (0 when none is adopted).
+func voterSetRead(ctx context.Context, c *Client) (voters, uncounted map[string]bool, gen int64, err error) {
 	cfg, err := AdoptedVoterConfig(ctx, c)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
+	}
+	if cfg != nil {
+		gen = cfg.Generation
 	}
 	uncounted = map[string]bool{}
 	if cfg.Explicit() {
@@ -401,11 +411,11 @@ func VoterSetWithUncounted(ctx context.Context, c *Client) (voters, uncounted ma
 		for _, m := range cfg.Members {
 			voters[m.Name] = true
 		}
-		return voters, uncounted, nil
+		return voters, uncounted, gen, nil
 	}
 	states, err := resolvedHostStates(ctx, c)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	voters = make(map[string]bool, len(states))
 	for name, state := range states {
@@ -416,7 +426,7 @@ func VoterSetWithUncounted(ctx context.Context, c *Client) (voters, uncounted ma
 			uncounted[name] = true
 		}
 	}
-	return voters, uncounted, nil
+	return voters, uncounted, gen, nil
 }
 
 // DerivedVoterSet is the voter set as it was before any explicit generation:

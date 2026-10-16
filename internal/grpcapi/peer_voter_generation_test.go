@@ -9,12 +9,14 @@ import (
 // the time this node received the report (the bounded partition-pause hold,
 // docs/design/partition-pause.md §4.2 step 3). Only a report received before
 // the asked moment counts; 0 is no report (an older build, or no adoption
-// pass yet); a lower generation than the last means the peer's adoption state
-// was replaced, and the earlier reports no longer stand.
+// pass yet), and after a report it is a reset; a lower generation than the
+// last means the peer's adoption state was replaced. After a reset or a lower
+// report the earlier reports no longer stand.
 //
 // Mutations: return the latest report whatever its time — "before the
-// second report" reads 3; record 0 — "after a zero report" loses 3; keep
-// earlier reports past a lower one — "after a lower report" reads 3.
+// second report" reads 3; ignore a 0 after a report — "after a zero report"
+// reads 3; keep earlier reports past a lower one — "after a lower report,
+// before it" reads 3.
 func TestPeerVoterGeneration_OnlyReportsReceivedBeforeCount(t *testing.T) {
 	t0 := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
 	s := &Server{}
@@ -45,14 +47,23 @@ func TestPeerVoterGeneration_OnlyReportsReceivedBeforeCount(t *testing.T) {
 	if _, ok := s.PeerVoterGeneration("q", t0.Add(time.Hour)); ok {
 		t.Error("another peer's report counts for q")
 	}
-	// A restarted peer reports 0 until its first adoption pass; what it
-	// adopted is still in its database.
+	// A 0 after a report is a reset: a host re-provisioned under the same
+	// name (its adoption state starts empty), an older build, or a restart
+	// before its first adoption pass. None of them can be told apart from
+	// here, so the earlier reports no longer stand.
 	s.notePeerVoterGeneration("p", 0, t0.Add(15*time.Minute))
-	if g, ok := s.PeerVoterGeneration("p", t0.Add(16*time.Minute)); g != 3 || !ok {
-		t.Errorf("after a zero report: %d %v, want 3", g, ok)
+	if g, ok := s.PeerVoterGeneration("p", t0.Add(16*time.Minute)); ok {
+		t.Errorf("after a zero report: %d, want no evidence", g)
+	}
+	if g, ok := s.PeerVoterGeneration("p", t0.Add(11*time.Minute)); ok {
+		t.Errorf("after a zero report, before it: %d, want no evidence", g)
+	}
+	s.notePeerVoterGeneration("p", 3, t0.Add(17*time.Minute))
+	if g, ok := s.PeerVoterGeneration("p", t0.Add(18*time.Minute)); g != 3 || !ok {
+		t.Errorf("a report after the reset: %d %v, want 3", g, ok)
 	}
 	s.notePeerVoterGeneration("p", 1, t0.Add(20*time.Minute))
-	if g, ok := s.PeerVoterGeneration("p", t0.Add(15*time.Minute)); ok {
+	if g, ok := s.PeerVoterGeneration("p", t0.Add(19*time.Minute)); ok {
 		t.Errorf("after a lower report, before it: %d, want no evidence", g)
 	}
 	if g, ok := s.PeerVoterGeneration("p", t0.Add(time.Hour)); g != 1 || !ok {

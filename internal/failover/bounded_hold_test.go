@@ -202,8 +202,11 @@ func TestSelfPauseExplicit_ThePreviousGenerationMustBeSpannedToo(t *testing.T) {
 // counts over; the deadline's generation 3 and the generation 2 before it
 // are both spanned by v4, v5 and v6.
 //
-// Mutation: allow two generations since the outage in regainCandidates —
-// "rm down, then add v6" goes ahead.
+// Mutation: allow two generations since the outage in regainCandidates is
+// not red here: down reported generation 1, below the floor (2) the waiver
+// would count from, so the evidence gate (hostReportedAdopting) holds first.
+// TestSelfPauseExplicit_AGenerationJustBeforeTheOutageIsNotSettled's "add v6
+// 10 s before the outage, rm down since" kills it.
 func TestSelfPauseExplicit_TheVoterConfigurationMustBePinned(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -615,6 +618,91 @@ func TestSelfPauseExplicit_TheHostMustHaveReportedItsGeneration(t *testing.T) {
 			v := c.selfPauseStillStands(ctx, h, at, time.Now())
 			if v.ok != tc.wantOK || (!v.ok && !strings.HasPrefix(v.key, keyRestarted)) {
 				t.Fatalf("deadline: %+v; want ok=%v (refused under %q)", v, tc.wantOK, keyRestarted)
+			}
+		})
+	}
+}
+
+// The voter set the cycle read at its top (c.scope) and the generation this
+// node has adopted when the deadline counts must be one configuration. Here
+// generation 2 is down, coordinator, alive and v4 (q = 3), and generation 3
+// adds v6 (q = 3 of 5); both were decided long before the outage, and down
+// reported 3. The deadline's cycle read its scope on generation 2, and this
+// node's adoption tick lands 3 before the deadline counts. alive and v4 span
+// generation 2 (n−q+1 = 2) but are only two of generation 3's three: down,
+// coordinator and v6 are a majority of it, on which down may have resumed.
+// Neither generation may go uncounted, so the deadline holds this cycle; the
+// next cycle reads its scope on generation 3 and counts it.
+//
+// Mutations: drop the generation comparison from voterSnapshot — both
+// "mid-cycle" arms go ahead; have regainCandidates read the configurations
+// itself rather than through voterSnapshot — the no-regain proof stands in
+// both "mid-cycle" arms.
+func TestSelfPauseExplicit_AGenerationAdoptedMidCycleIsCounted(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		midCycle bool // adopt 3 after the cycle read its scope
+		spanning []string
+		restart  []string
+		wantOK   bool
+		wantKey  string
+	}{
+		{"adopted 3 mid-cycle, only 2 spanned", true, []string{"alive", "v4"}, []string{"coordinator", "v6"}, false, keyVoterSetMoved},
+		{"adopted 3 mid-cycle, both spanned", true, []string{"alive", "v4", "v6"}, []string{"coordinator"}, false, keyVoterSetMoved},
+		{"adopted 3 before the cycle, only 2 spanned", false, []string{"alive", "v4"}, []string{"coordinator", "v6"}, false, keyRestarted},
+		{"adopted 3 before the cycle, both spanned", false, []string{"alive", "v4", "v6"}, []string{"coordinator"}, true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, db, ctx, _ := explicitPause(t)
+			ensureVoter(t, db, "v6")
+			c.run(ctx)
+			h, err := corrosion.GetHost(ctx, db, "down")
+			if err != nil || h == nil {
+				t.Fatal(err)
+			}
+			writeGen(t, db, 2, "coordinator", "alive", "down", "v4")
+			writeGen(t, db, 3, "coordinator", "alive", "down", "v4", "v6")
+			at := time.Now().Add(-time.Minute)
+			backdateHistory(t, db, at.Add(-time.Hour))
+			if err := corrosion.RecordVoterAdoption(ctx, db, 2); err != nil {
+				t.Fatal(err)
+			}
+			adopt3 := func() {
+				if err := corrosion.RecordVoterAdoption(ctx, db, 3); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !tc.midCycle {
+				adopt3()
+			}
+			c.PeerClockSkew = func(string) (time.Duration, bool) { return 0, true }
+			reportedGeneration(c, 3, time.Time{})
+			deadlineScope(t, c, db)
+			if tc.midCycle {
+				if v := c.scope.voters("down"); len(v) != 4 {
+					t.Fatalf("setup: the cycle reads %v, not generation 2", v)
+				}
+				adopt3()
+			}
+			pausedCondition(t, db, at.Add(-time.Hour))
+			for _, o := range []string{"coordinator", "alive", "v4", "v6"} {
+				healthRow(t, db, o, "healthy", 0, at.Add(-time.Hour))
+			}
+			for _, o := range tc.spanning {
+				failingSince(t, db, o, at.Add(-time.Minute), time.Now())
+			}
+			for _, o := range tc.restart {
+				failingSince(t, db, o, at.Add(20*time.Second), time.Now())
+			}
+			v := c.selfPauseStillStands(ctx, h, at, time.Now())
+			if v.ok != tc.wantOK || (!v.ok && !strings.HasPrefix(v.key, tc.wantKey)) {
+				t.Fatalf("deadline: %+v; want ok=%v (refused under %q)", v, tc.wantOK, tc.wantKey)
+			}
+			// The proof itself holds too, whoever asks it mid-cycle.
+			if tc.midCycle {
+				if c.noRegainSinceIn(ctx, c.readHostHealth(ctx, "down"), "down", at, time.Time{}, true) {
+					t.Fatal("the no-regain proof stands on a voter set this node no longer counts over")
+				}
 			}
 		})
 	}

@@ -734,16 +734,29 @@ func ScopedNetworkName(stackName, netName string) string {
 }
 
 // DefaultNetworkInterfaces gives every network f declares (and does not mark
-// external) with no interface its own name, as written in the file, as its
-// interface. A deploy calls it once, before anything provisions or persists
-// a network, so the entry node, every peer and the network row name the same
-// device.
-func (f *File) DefaultNetworkInterfaces() {
+// external) with no interface a device: kept[name] when the caller keeps one
+// (the device a deployed network is recorded on, so a default never moves it,
+// or a host bridge the network is named after). Otherwise a bridge network
+// (no type, or "bridge") gets its stack-scoped flat bridge name,
+// FlatBridgeName(ScopedNetworkName(f.Name, name)), and any other type its own
+// name as written in the file (for "direct" that is the host NIC macvtap
+// attaches to). A deploy calls it once, before anything provisions or
+// persists a network, so the entry node, every peer and the network row name
+// the same device, and two stacks that each declare a bridge network of the
+// same name are never on one bridge by default.
+func (f *File) DefaultNetworkInterfaces(kept map[string]string) {
 	for name, nd := range f.Networks {
 		if nd.External || nd.Interface != "" {
 			continue
 		}
-		nd.Interface = name
+		switch {
+		case kept[name] != "":
+			nd.Interface = kept[name]
+		case nd.Type == "" || nd.Type == "bridge":
+			nd.Interface = FlatBridgeName(ScopedNetworkName(f.Name, name))
+		default:
+			nd.Interface = name
+		}
 		f.Networks[name] = nd
 	}
 }

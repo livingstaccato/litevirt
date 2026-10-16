@@ -574,6 +574,10 @@ type Server struct {
 	// host". Production leaves it nil, preserving network.BridgeExists.
 	bridgeExists func(name string) bool
 
+	// isBridge is a test seam for "is this link a bridge on this host" (not a
+	// NIC, bond or VLAN). Production leaves it nil, preserving network.IsBridge.
+	isBridge func(name string) bool
+
 	// linkAddrs replaces the read of a device's IP addresses (lbVIPInterface
 	// tells whose bridge a shared short name is by them). Test-only seam,
 	// nil in production.
@@ -1549,6 +1553,11 @@ func (s *Server) SetDHCPReservationBackend(served, uplink func(bridge string) bo
 // reads, so a test that exercises that refusal must fix it rather than inherit
 // whatever interfaces the machine running the test happens to have.
 func (s *Server) SetBridgeExists(fn func(name string) bool) { s.bridgeExists = fn }
+
+// SetIsBridge injects the "is this link a bridge here" seam (see isBridge).
+// A deploy puts a stack network named after a host bridge on it, so a test
+// must fix the answer rather than inherit the test machine's links.
+func (s *Server) SetIsBridge(fn func(name string) bool) { s.isBridge = fn }
 
 // SetLinkAddrs replaces the read of a device's addresses (linkAddrs).
 // Test-only seam, nil in production.

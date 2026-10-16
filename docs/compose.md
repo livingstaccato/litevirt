@@ -1275,6 +1275,24 @@ networks:
     external: true          # Use pre-existing network, don't create/destroy
 ```
 
+A stack `bridge` network with no `interface` is on its scoped bridge
+`<stack>_<name>` (the hashed `lvf-<11 hex>` form when that is over 15
+characters), the same on every host, so two stacks that each declare a bridge
+network of one name are never on one bridge. A network already deployed keeps
+the bridge its record names. A network named after a bridge the deploying host
+already has, which litevirt did not create and no stack network is on, is put
+on that bridge; to attach to a host bridge in any other case, name it with
+`interface:`. A NIC, bond or VLAN of the network's name is not a bridge and is
+not used. A host bridge a stack network (of another stack or of this one) is
+already on is not shared by name: the network gets its scoped bridge and the
+deploy warns, naming what is on it (event `network.host_bridge_not_shared`); to
+share it, set `interface:` to it and redeploy. A `direct` network with no `interface` uses the host NIC of its
+own name. When a stack's bridge network is on the same bridge as another
+stack's network, the deploy warns, naming both stacks and the bridge (the entry
+host also publishes a `network.bridge_shared` event); if that is not intended,
+set `interface:` to the scoped name and redeploy to move the network to its own
+bridge.
+
 ### `netbox-prefix-id` is parsed and refused
 
 `netbox-prefix-id` is a real key on a compose network definition — the parser

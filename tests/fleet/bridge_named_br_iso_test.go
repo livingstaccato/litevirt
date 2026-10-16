@@ -9,8 +9,9 @@ import (
 	"github.com/litevirt/litevirt/internal/firewall"
 )
 
-// A stack whose `bridge` network is named br-iso-web — main accepted that,
-// and its guests routed out with NAT.
+// A stack whose `bridge` network is on a bridge named br-iso-web — main
+// accepted that, and its guests routed out with NAT. The interface is named:
+// a stack network with none is on its scoped bridge, not on br-iso-web.
 const composeBridgeNamedBrIso = `name: brisoweb
 
 images:
@@ -20,6 +21,7 @@ images:
 networks:
   br-iso-web:
     type: bridge
+    interface: br-iso-web
     subnet: 10.60.0.0/24
     dhcp: true
 

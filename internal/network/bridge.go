@@ -18,6 +18,12 @@ func BridgeExists(name string) bool {
 	return err == nil
 }
 
+// IsBridge reports whether name is a bridge on this host: a link with
+// /sys/class/net/<name>/bridge, not a NIC, bond or VLAN of that name.
+func IsBridge(name string) bool {
+	return validLinkName(name) == nil && isBridgeIface(name)
+}
+
 // BridgeHasUplink reports whether bridge has anything enslaved that could carry
 // traffic OFF this host.
 //

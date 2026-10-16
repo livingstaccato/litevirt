@@ -17,7 +17,8 @@ import (
 
 // Re-review N2: a VM's seed written before seeds were stamped (every VM of a
 // released cluster) is the VM's own when its domain attaches it as its cdrom
-// (re-review 2 N4) and its instance-id is one the VM's create wrote. An attach rebuilds it keeping meta-data and user-data byte for
+// (re-review 2 N4), its instance-id is one the VM's create wrote and its
+// user-data is its spec's (re-review 3 N5). An attach rebuilds it keeping meta-data and user-data byte for
 // byte — a replaced VM keeps its <name>-next instance-id, so no guest runs
 // first boot again — and stamps it.
 //
@@ -31,7 +32,7 @@ func TestNICHotplug_UnstampedOwnSeedIsRebuiltInPlace(t *testing.T) {
 			s := hotplugDiskServer(t)
 			enableHardwareV2(t, s)
 			spec := &pb.VMSpec{Name: "x", Uuid: "uuid-x", Image: "ubuntu", Cpu: 2, MemoryMib: 4096,
-				CloudInit: &pb.CloudInitSpec{Userdata: "#cloud-config\npassword: spec\n"},
+				CloudInit: &pb.CloudInitSpec{Userdata: "#cloud-config\npassword: seed\n"},
 				Network:   []*pb.NetworkAttachment{{Name: "lan", Mac: "52:54:00:6e:00:01"}, {Name: "lan3", Mac: "52:54:00:6e:00:03"}}}
 			iso := r2VM(t, s, spec, []corrosion.InterfaceRecord{
 				{VMName: "x", NetworkName: "lan", MAC: "52:54:00:6e:00:01"},
@@ -72,7 +73,7 @@ func TestNICHotplug_UnstampedForeignSeedIsLeftAlone(t *testing.T) {
 	iso := r2VM(t, s, spec, []corrosion.InterfaceRecord{
 		{VMName: "x", NetworkName: "lan", MAC: "52:54:00:6f:00:01"},
 		{VMName: "x", NetworkName: "lan3", Ordinal: 1, MAC: "52:54:00:6f:00:03"}}, "running",
-		cloudinit.Config{InstanceID: "other", LocalHostname: "other", UserData: "#cloud-config\n"}, "")
+		cloudinit.Config{InstanceID: "other", LocalHostname: "other", UserData: "#cloud-config\n{}\n"}, "")
 	attachSeedCDROM(t, s, "x", iso)
 	before, _ := os.ReadFile(iso)
 	if _, err := s.AttachDevice(adminCtx(), &pb.AttachDeviceRequest{VmName: "x", Nic: &pb.NetworkAttachment{Name: "lan2", Mac: "52:54:00:6f:00:02"}}); err != nil {

@@ -223,6 +223,9 @@ type SeedClaim struct {
 	UUID string
 	// CloudInit is whether the VM's spec has cloud-init (SpecHasCloudInit).
 	CloudInit bool
+	// UserData is the user-data the VM's spec yields (SpecUserData), as
+	// every writer of the VM's seed writes it.
+	UserData string
 	// DomainXML returns the VM's current domain definition on this host,
 	// read from libvirt: "" when the host has none or it could not be read.
 	// It is called only for an unstamped seed; nil reads as none.
@@ -236,6 +239,21 @@ func SpecHasCloudInit(spec *pb.VMSpec) bool {
 	return spec.GetImage() != "" || spec.GetCloudInit() != nil
 }
 
+// emptyUserData is the user-data every seed writer puts in a seed whose VM's
+// spec names none (GenerateISO's default).
+const emptyUserData = "#cloud-config\n{}\n"
+
+// SpecUserData is the user-data a seed written for a VM with spec carries:
+// the spec's cloud-init user-data, or an empty cloud-config when it names
+// none, byte for byte as create, clone, the reconciler and a migration
+// target write it.
+func SpecUserData(spec *pb.VMSpec) string {
+	if u := spec.GetCloudInit().GetUserdata(); u != "" {
+		return u
+	}
+	return emptyUserData
+}
+
 // OwnSeed reads the seed at iso and reports whether it is the seed of the VM
 // c describes. Only a VM whose spec has cloud-init owns a seed. Then:
 //   - a seed stamped (StampSeed) for the VM's uuid is its own; one stamped for
@@ -246,9 +264,12 @@ func SpecHasCloudInit(spec *pb.VMSpec) bool {
 //     domain is not another VM's (its uuid, when both are known), and its
 //     instance-id is one the VM's create wrote: its name, or <name>-next, the
 //     name a replacement is created under before a cutover gives it the name
-//     (vm_replace). The instance-id is the VM's name, so it cannot tell a
-//     deleted VM of the name from this one: an unstamped seed such a VM left
-//     on this host is never this VM's on that ground alone.
+//     (vm_replace), and its user-data is byte for byte the user-data the VM's
+//     spec yields (SpecUserData), as every writer of the VM's seed wrote it.
+//     The instance-id is the VM's name, so it cannot tell a deleted VM of the
+//     name from this one, and an earlier release's start attached any file at
+//     the path, so the cdrom cannot either: an unstamped seed such a VM left
+//     on this host is never this VM's on those grounds alone.
 //
 // The error is fs.ErrNotExist for no seed, or the read's.
 func OwnSeed(iso string, c SeedClaim) (Seed, bool, error) {
@@ -274,6 +295,9 @@ func OwnSeed(iso string, c SeedClaim) (Seed, bool, error) {
 		return seed, false, nil
 	}
 	if dom := lv.UUIDFromXML(domXML); c.UUID != "" && dom != "" && !strings.EqualFold(dom, c.UUID) {
+		return seed, false, nil
+	}
+	if seed.UserData != c.UserData {
 		return seed, false, nil
 	}
 	id := seed.InstanceID()

@@ -132,3 +132,41 @@ func TestEnsureCloudInit_AmbiguousSourceDoesNotSendAnUnattachedSeed(t *testing.T
 		t.Fatalf("request = %+v", req)
 	}
 }
+
+// Re-review 3 N5: an earlier release's start attached any file at the path,
+// so a deleted VM x's unstamped seed (instance-id x, its user-data) can be
+// the cdrom of the new x's domain, uuid and all. Its user-data is not the one
+// the new x's spec yields, which every writer of x's own seed wrote: it is
+// not x's own — not rebuilt, not stamped (a stamp would keep it for every
+// later start, where the next start otherwise writes x's own), not reloaded,
+// and the event names the file.
+//
+// Mutation: OwnSeed without the user-data check — the seed is rebuilt and
+// stamped.
+func TestNICHotplug_AnAttachedResidueOfAnotherUserDataIsNotTaken(t *testing.T) {
+	needGenisoimage(t)
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	spec := &pb.VMSpec{Name: "x", Uuid: "uuid-new", Image: "ubuntu", Cpu: 2, MemoryMib: 4096,
+		CloudInit: &pb.CloudInitSpec{Userdata: "#cloud-config\npassword: mine\n"},
+		Network:   []*pb.NetworkAttachment{{Name: "lan", Mac: "52:54:00:76:00:01"}}}
+	iso := r2VM(t, s, spec, []corrosion.InterfaceRecord{{VMName: "x", NetworkName: "lan", MAC: "52:54:00:76:00:01"}}, "running",
+		cloudinit.Config{InstanceID: "x", LocalHostname: "x", UserData: "#cloud-config\npassword: theirs\n"}, "")
+	attachSeedCDROM(t, s, "x", iso)
+	before, _ := os.ReadFile(iso)
+	if _, err := s.AttachDevice(adminCtx(), &pb.AttachDeviceRequest{VmName: "x", Nic: &pb.NetworkAttachment{Name: "lan2", Mac: "52:54:00:76:00:02"}}); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	if after, _ := os.ReadFile(iso); !bytes.Equal(before, after) {
+		t.Error("a seed of another user-data was rewritten")
+	}
+	if seedStamped(t, iso) {
+		t.Error("a seed of another user-data was stamped as the VM's")
+	}
+	if n := cdromReloads(s, "x"); n != 0 {
+		t.Errorf("reloaded %d times", n)
+	}
+	if evs := vmEventsOf(t, s, "x", "seed.not_rebuilt"); len(evs) != 1 || !strings.Contains(evs[0].Detail, iso) {
+		t.Errorf("want one seed.not_rebuilt event naming %s: %+v", iso, evs)
+	}
+}

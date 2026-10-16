@@ -2333,7 +2333,7 @@ func (r *Reconciler) reportPITHeld(ctx context.Context, vm, disk, detail string)
 // that cannot be read attaches nothing.
 func (r *Reconciler) seedClaim(vm corrosion.VMRecord, spec *pb.VMSpec) cloudinit.SeedClaim {
 	return cloudinit.SeedClaim{VMName: vm.Name, UUID: cloudinit.SpecUUID(vm.Spec),
-		CloudInit: cloudinit.SpecHasCloudInit(spec), DomainXML: func() string {
+		CloudInit: cloudinit.SpecHasCloudInit(spec), UserData: cloudinit.SpecUserData(spec), DomainXML: func() string {
 			if !r.virt.DomainExists(vm.Name) {
 				return ""
 			}

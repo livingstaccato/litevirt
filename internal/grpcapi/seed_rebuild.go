@@ -122,7 +122,7 @@ func (s *Server) rebuildSeedNetworkConfig(ctx context.Context, vm *corrosion.VMR
 // definition that cannot be read attaches nothing.
 func (s *Server) seedClaim(vm *corrosion.VMRecord, spec *pb.VMSpec) cloudinit.SeedClaim {
 	return cloudinit.SeedClaim{VMName: vm.Name, UUID: cloudinit.SpecUUID(vm.Spec),
-		CloudInit: cloudinit.SpecHasCloudInit(spec), DomainXML: func() string {
+		CloudInit: cloudinit.SpecHasCloudInit(spec), UserData: cloudinit.SpecUserData(spec), DomainXML: func() string {
 			x, err := s.virt.DumpXMLInactive(vm.Name)
 			if err != nil {
 				return ""

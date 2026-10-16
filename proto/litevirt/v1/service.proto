@@ -1051,6 +1051,11 @@ message ApplyLBRequest {
     // VIP goes on that stack's network when the LB's row has not replicated
     // here yet.
     string stack_name = 9;
+    // A stack LB's health check and sticky sessions, which a forwarded apply
+    // serves as the coordinator's own apply does (TLS and redirects travel in
+    // ports). Absent — a caller on an earlier build — none, as before.
+    LBHealthSpec health          = 10;
+    bool         sticky_sessions = 11;
 }
 
 // RemoveLBRequest tells a host to tear down a local LB instance.

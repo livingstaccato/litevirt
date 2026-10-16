@@ -46,6 +46,11 @@ type Config struct {
 	// SyncInterface is the device holding LocalIP, which conntrackd syncs
 	// over. Empty: Interface.
 	SyncInterface string
+	// KeepSNAT leaves this LB's SNAT side as the last apply that set it left
+	// it: conntrackd and its files untouched, and keepalived's notify hooks
+	// rendered exactly when the notify script is there. For an apply that
+	// does not know the LB's snat (a peer on an earlier build).
+	KeepSNAT bool
 
 	// ConfigDir is the directory the manager writes this LB's files to, which
 	// the rendered configs name (TLS PEMs, the notify script, conntrackd's

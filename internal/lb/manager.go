@@ -48,10 +48,13 @@ func lbLock(name string) *sync.Mutex {
 
 // NewManager returns a Manager.
 func NewManager() *Manager {
-	return &Manager{
-		configDir: "/etc/litevirt/lb",
-		runDir:    "/run/litevirt/lb",
-	}
+	return NewManagerAt(DefaultConfigDir, "/run/litevirt/lb")
+}
+
+// NewManagerAt returns a Manager writing configs to configDir and pidfiles to
+// runDir (tests that run the real apply against stand-in binaries).
+func NewManagerAt(configDir, runDir string) *Manager {
+	return &Manager{configDir: configDir, runDir: runDir}
 }
 
 // applyMarkerPath is the "an Apply started and did not finish" marker for an LB.
@@ -99,6 +102,11 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 	lk := lbLock(cfg.Name)
 	lk.Lock()
 	defer lk.Unlock()
+	notifyPath := filepath.Join(m.configDir, cfg.Name+"-notify.sh")
+	if cfg.KeepSNAT {
+		_, err := os.Stat(notifyPath)
+		cfg.SNATEnabled = err == nil
+	}
 
 	if err := os.MkdirAll(m.configDir, 0750); err != nil {
 		return fmt.Errorf("create lb config dir: %w", err)
@@ -178,9 +186,11 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 	// (re)started below only when its config changed or it is not running:
 	// a restart drops the state it has synced from its peer.
 	ctPath := filepath.Join(m.configDir, cfg.Name+"-conntrackd.conf")
-	notifyPath := filepath.Join(m.configDir, cfg.Name+"-notify.sh")
 	startCT := false
-	if cfg.SNATEnabled {
+	switch {
+	case cfg.KeepSNAT:
+		// Leave conntrackd, its config and the notify script as they are.
+	case cfg.SNATEnabled:
 		conntrackdCfg, err := RenderConntrackd(cfg)
 		if err != nil {
 			slog.Warn("conntrackd config render failed (SNAT failover may not work)", "lb", cfg.Name, "error", err)
@@ -202,7 +212,7 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 				slog.Warn("write notify script failed", "error", err)
 			}
 		}
-	} else {
+	default:
 		// No SNAT (or no longer): this LB runs no conntrackd.
 		killProcByConfig("conntrackd", ctPath)
 		os.Remove(ctPath)     //nolint:errcheck

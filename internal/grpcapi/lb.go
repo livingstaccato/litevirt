@@ -758,7 +758,7 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 			}
 			if _, aerr := client.ApplyLB(fctx, &pb.ApplyLBRequest{
 				LbName: req.Name, Vip: req.Vip, Algorithm: algorithm,
-				Backends: pbBackends, Ports: req.Ports, Hosts: req.Hosts, Proof: proof,
+				Backends: pbBackends, Ports: standaloneProtocols(req.Ports), Hosts: req.Hosts, Proof: proof,
 				Snat: proto.Bool(true), // an explicit LB SNATs, as it does locally
 			}); aerr != nil {
 				slog.Warn("CreateLoadBalancer: remote apply failed", "host", host, "lb", req.Name, "error", aerr)
@@ -1726,6 +1726,11 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 				Interface: lbIface, VRID: s.allocVRID(ctx, req.Name),
 				Priority: priority, Backends: lbBackends, Ports: ports, Algorithm: algorithm,
 			}
+			// A stack LB with snat keeps the conntrackd its refreshes give it,
+			// so this apply renders the same keepalived (no restart).
+			if st := r.String("stack_name"); ierr == nil && st != "" && s.stackLBSNAT(ctx, st) {
+				s.lbSNATSync(ctx, &cfg, lbHosts)
+			}
 			if ierr != nil {
 				slog.Warn("UpdateLoadBalancer: local apply refused", "error", ierr)
 			} else if err := s.applyLBLocal(ctx, cfg); err != nil {
@@ -1776,7 +1781,7 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 			// on the read path below), relocated to the peer fan-out.
 			if _, aerr := client.ApplyLB(fctx, &pb.ApplyLBRequest{
 				LbName: req.Name, Vip: vipForWire(vip), Algorithm: algorithm,
-				Backends: pbBackends, Ports: parsedPorts, Hosts: lbHosts, Proof: proof,
+				Backends: pbBackends, Ports: standaloneProtocols(parsedPorts), Hosts: lbHosts, Proof: proof,
 				Snat: proto.Bool(s.stackLBSNAT(fctx, r.String("stack_name"))), StackName: r.String("stack_name"),
 			}); aerr != nil {
 				// Error, not Warn. A holder that did not receive the config is
@@ -2253,15 +2258,6 @@ func (s *Server) forwardLBApply(ctx context.Context, hostName string, spec *pb.V
 		})
 	}
 
-	var pbPorts []*pb.LBPort
-	for _, p := range lbSpec.Ports {
-		pbPorts = append(pbPorts, &pb.LBPort{
-			Listen:   p.Listen,
-			Target:   p.Target,
-			Protocol: p.Protocol,
-		})
-	}
-
 	lbName := spec.StackName + "-lb"
 	proof := s.mintLBProof(ctx, lbName, hostName)
 	if s.gateActive(ctx) && proof == nil {
@@ -2282,11 +2278,15 @@ func (s *Server) forwardLBApply(ctx context.Context, hostName string, spec *pb.V
 		Vip:       vipForWire(lbSpec.Vip),
 		Algorithm: lbSpec.Algorithm,
 		Backends:  pbBackends,
-		Ports:     pbPorts,
-		Hosts:     resolvedHosts,
-		Proof:     proof,
-		Snat:      proto.Bool(lbSpec.Snat),
-		StackName: spec.StackName,
+		// The whole LB, as this host's own apply serves it: ports with their
+		// TLS and redirects, health, sticky sessions and snat.
+		Ports:          lbSpec.Ports,
+		Health:         lbSpec.Health,
+		StickySessions: lbSpec.StickySessions,
+		Hosts:          resolvedHosts,
+		Proof:          proof,
+		Snat:           proto.Bool(lbSpec.Snat),
+		StackName:      spec.StackName,
 	}); err != nil {
 		slog.Warn("forwardLBApply: remote apply failed", "host", hostName, "error", err)
 	} else {
@@ -2330,10 +2330,7 @@ func (s *Server) ApplyLB(ctx context.Context, req *pb.ApplyLBRequest) (*emptypb.
 		return nil, status.Error(codes.FailedPrecondition, s.gateRefusal(ctx, "lb apply", reason, returnToServiceHint))
 	}
 
-	algorithm := req.Algorithm
-	if algorithm == "" {
-		algorithm = "roundrobin"
-	}
+	settings := lb.SettingsFromPB(req.Algorithm, req.Ports, req.Health, req.StickySessions)
 
 	vipIP, vipPrefix, err := lb.ParseVIP(req.Vip)
 	if err != nil {
@@ -2351,14 +2348,7 @@ func (s *Server) ApplyLB(ctx context.Context, req *pb.ApplyLBRequest) (*emptypb.
 		return nil, status.Errorf(codes.FailedPrecondition, "apply LB: %v", err)
 	}
 
-	var ports []lb.Port
-	for _, p := range req.Ports {
-		ports = append(ports, lb.Port{
-			Listen:   int(p.Listen),
-			Target:   int(p.Target),
-			Protocol: p.Protocol,
-		})
-	}
+	ports := s.servableLBPorts(req.LbName, settings.Ports)
 
 	// Derive backend port from the first port mapping's target.
 	backendPort := 80
@@ -2384,7 +2374,21 @@ func (s *Server) ApplyLB(ctx context.Context, req *pb.ApplyLBRequest) (*emptypb.
 		Priority:  priority,
 		Backends:  backends,
 		Ports:     ports,
-		Algorithm: algorithm,
+		Algorithm: settings.Algorithm,
+		Health:    settings.Health,
+		Sticky:    settings.Sticky,
+	}
+	switch {
+	case req.Snat == nil:
+		// A caller on an earlier build says nothing about snat: this host's
+		// conntrackd and keepalived notify hooks stay as they are, so its
+		// apply cannot tear down what this host's own full apply set up
+		// (nor restart keepalived over it).
+		cfg.KeepSNAT = true
+	case req.GetSnat() && req.GetStackName() != "":
+		// A stack LB with snat: what applyLBForStack gives it, so this host
+		// renders the same keepalived whichever path applies it.
+		s.lbSNATSync(ctx, &cfg, req.Hosts)
 	}
 
 	if err := s.applyLBLocal(ctx, cfg); err != nil {
@@ -3078,8 +3082,9 @@ func requireAdminForLBTLS(ctx context.Context, spec *pb.LBSpec) error {
 	return nil
 }
 
-// standaloneProtocols is ports with only what a standalone LB renders of
-// them (listen, target, protocol), for checking.
+// standaloneProtocols is ports with only what a Create/UpdateLoadBalancer
+// apply renders of them (listen, target, protocol): for checking, and for
+// their fan-out, so a peer serves what the local apply serves.
 func standaloneProtocols(ports []*pb.LBPort) []*pb.LBPort {
 	out := make([]*pb.LBPort, 0, len(ports))
 	for _, p := range ports {

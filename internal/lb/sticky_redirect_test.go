@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func stickyRedirectConfig() Config {
@@ -214,5 +215,70 @@ func TestApply_SNATWithoutConntrackd(t *testing.T) {
 	}
 	if looks != 1 {
 		t.Errorf("conntrackd looked up %d times over two applies, want once", looks)
+	}
+}
+
+// TestApply_KeepSNATLeavesTheSNATSideAlone: an apply that does not know the
+// LB's snat (KeepSNAT) after one that set SNAT up leaves conntrackd's config
+// and the notify script in place, starts no conntrackd and renders the same
+// keepalived (hooks included); on an LB without SNAT it renders no hooks.
+//
+// Mutations (each red): drop the KeepSNAT case in Apply (the SNAT-off
+// teardown runs); drop the notify-script stat (keepalived loses its hooks).
+func TestApply_KeepSNATLeavesTheSNATSideAlone(t *testing.T) {
+	bin := fakeLBBinaries(t)
+	m := testManager(t)
+	ctx := context.Background()
+	cfg := Config{
+		Name: "keep-lb", VIP: "10.0.1.200", VIPPrefix: 24, Interface: "br0", VRID: 22, Priority: 100,
+		Backends:    []Backend{{Name: "b1", IP: "10.0.1.10", Port: 8080}},
+		Ports:       []Port{{Listen: 80, Target: 8080, Protocol: "tcp"}},
+		SNATEnabled: true, LocalIP: "192.0.2.11", PeerIP: "192.0.2.12", Subnet: "10.0.1.0/24",
+	}
+	if err := m.Apply(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	kaPath := filepath.Join(m.configDir, "keep-lb-keepalived.conf")
+	before, _ := os.ReadFile(kaPath)
+	os.Remove(filepath.Join(bin, "conntrackd.calls"))
+	// Backdate the SNAT files: an apply that leaves them alone leaves these.
+	old := time.Unix(1_000_000_000, 0)
+	for _, f := range []string{"keep-lb-conntrackd.conf", "keep-lb-notify.sh"} {
+		if err := os.Chtimes(filepath.Join(m.configDir, f), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	older := Config{
+		Name: cfg.Name, VIP: cfg.VIP, VIPPrefix: 24, Interface: "br0", VRID: 22, Priority: 100,
+		Backends: cfg.Backends, Ports: cfg.Ports, KeepSNAT: true,
+	}
+	if err := m.Apply(ctx, older); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.ReadFile(kaPath)
+	if string(after) != string(before) || !strings.Contains(string(after), "notify_master") {
+		t.Errorf("keepalived changed under KeepSNAT:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	for _, f := range []string{"keep-lb-conntrackd.conf", "keep-lb-notify.sh"} {
+		fi, err := os.Stat(filepath.Join(m.configDir, f))
+		if err != nil {
+			t.Errorf("%s gone under KeepSNAT: %v", f, err)
+		} else if !fi.ModTime().Equal(old) {
+			t.Errorf("%s rewritten under KeepSNAT", f)
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(bin, "conntrackd.calls")); err == nil {
+		t.Errorf("conntrackd started under KeepSNAT: %q", b)
+	}
+
+	// An LB that never had SNAT: KeepSNAT renders no hooks.
+	plain := older
+	plain.Name = "plain-lb"
+	if err := m.Apply(ctx, plain); err != nil {
+		t.Fatal(err)
+	}
+	if ka, _ := os.ReadFile(filepath.Join(m.configDir, "plain-lb-keepalived.conf")); strings.Contains(string(ka), "notify_master") {
+		t.Errorf("KeepSNAT on an LB without SNAT rendered hooks:\n%s", ka)
 	}
 }

@@ -134,9 +134,7 @@ func TestFirewall_TagGroupAdmitsMembersOnly(t *testing.T) {
 	cleanup(t, func() { lvErr(t, "firewall", "tag-group", "rm", group) })
 
 	netName := uniqueName("tgn")
-	bridge := fmt.Sprintf("e2etg%d", pid)
-	lv(t, "network", "create", netName, "--type", "isolated", "--interface", bridge,
-		"--subnet", "10.207.0.0/24", "--dhcp")
+	lv(t, "network", "create", netName, "--type", "isolated", "--subnet", "10.207.0.0/24", "--dhcp")
 	cleanup(t, func() { lvErr(t, "network", "rm", netName, "--force") })
 
 	stack := uniqueName("tgs")

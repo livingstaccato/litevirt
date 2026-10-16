@@ -5846,18 +5846,20 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// Build network configs from the VM's live NICs (the vm_nics/vm_interfaces
 	// overlay): a NIC hot-attached or detached on a hardware_v2 cluster is
 	// recorded in vm_nics alone.
-	ifaces, err := liveVMInterfaces(ctx, s.db, req.Name)
+	nicRows, err := corrosion.MergedVMNICs(ctx, s.db, req.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read NICs for %q: %v", req.Name, err)
 	}
+	ifaces := nicInterfaceRecords(nicRows)
 	var netConfigs []lv.NetworkConfig
-	for _, iface := range ifaces {
+	for _, iface := range nicRows {
 		bridge := resolveBridge(ctx, s.db, iface.NetworkName)
 		rate := compose.NICRate(spec, iface.Ordinal, iface.NetworkName)
+		model := recordedNICModel(spec, iface)
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
 				Direct:      strings.TrimPrefix(bridge, "direct:"),
-				Model:       "virtio",
+				Model:       model,
 				MAC:         iface.MAC,
 				SpecOrdinal: iface.Ordinal + 1,
 				RateMBps:    rate,
@@ -5866,7 +5868,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		}
 		netConfigs = append(netConfigs, lv.NetworkConfig{
 			Bridge:      bridge,
-			Model:       "virtio",
+			Model:       model,
 			MAC:         iface.MAC,
 			SpecOrdinal: iface.Ordinal + 1,
 			RateMBps:    rate,

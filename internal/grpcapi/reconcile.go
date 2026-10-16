@@ -327,12 +327,5 @@ func liveVMInterfaces(ctx context.Context, db *corrosion.Client, vmName string) 
 	if err != nil {
 		return nil, err
 	}
-	out := make([]corrosion.InterfaceRecord, 0, len(nics))
-	for _, n := range nics {
-		out = append(out, corrosion.InterfaceRecord{
-			VMName: n.VMName, NetworkName: n.NetworkName, Ordinal: n.Ordinal,
-			MAC: n.MAC, IP: n.IP, TapDevice: n.TapDevice,
-		})
-	}
-	return out, nil
+	return nicInterfaceRecords(nics), nil
 }

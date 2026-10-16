@@ -3,7 +3,6 @@ package cloudinit
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -78,18 +77,8 @@ func writeISO(seed Seed, outputPath string) error {
 	}
 	defer os.Remove(tmp) // gone after the rename
 
-	// Generate ISO
-	args := []string{
-		"-output", tmp,
-		"-volid", "cidata",
-		"-joliet",
-		"-rock",
-		tmpDir,
-	}
-
-	cmd := exec.Command("genisoimage", args...)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("genisoimage: %s: %w", string(output), err)
+	if err := buildISO(tmpDir, tmp); err != nil {
+		return err
 	}
 	diskmode.NarrowBestEffort(tmp)
 	if err := os.Rename(tmp, outputPath); err != nil {

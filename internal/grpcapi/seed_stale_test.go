@@ -19,7 +19,7 @@ import (
 // Mutation: keep the early return for the VM's own seed (the round-5 code) —
 // red.
 func TestEnsureCloudInit_RewritesTheVMsStaleSeed(t *testing.T) {
-	needGenisoimage(t)
+	useSeedISOWriter(t)
 	s := testServer(t)
 	s.dataDir = t.TempDir()
 	insertTestVMWithSpec(t, adminCtx(), s.db, "st", "elsewhere", "running", `{"name":"st","uuid":"st-1","image":"ubuntu"}`)

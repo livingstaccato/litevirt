@@ -3,7 +3,6 @@ package cloudinit
 import (
 	"errors"
 	"io/fs"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -31,9 +30,7 @@ import (
 // goes red; ignore the stamp — "stamped-other" goes red; skip the user-data
 // check — "another user-data" goes red.
 func TestOwnSeed(t *testing.T) {
-	if _, err := exec.LookPath("genisoimage"); err != nil {
-		t.Skip("genisoimage not installed")
-	}
+	UseGoISOWithoutGenisoimage()
 	dir := t.TempDir()
 	write := func(name, instanceID, stamp string) string {
 		t.Helper()

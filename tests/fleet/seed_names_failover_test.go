@@ -11,7 +11,6 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -29,9 +28,7 @@ import (
 // cluster, the seed path of each node, and each node's gate.
 func seededVMCluster(t *testing.T, latched bool, name string, nets map[string]compose.NetworkDef, spec *pb.VMSpec) (*Cluster, map[string]string, map[string]*health.Checker) {
 	t.Helper()
-	if _, err := exec.LookPath("genisoimage"); err != nil {
-		t.Skip("genisoimage not installed: the scenario reads the seeds back")
-	}
+	cloudinit.UseGoISOWithoutGenisoimage()
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
 	t.Cleanup(c.Stop)

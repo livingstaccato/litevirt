@@ -16,7 +16,6 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -39,9 +38,7 @@ import (
 // goes red; drop the vendor-data from EnsureCloudInit — the target's seed
 // goes red.
 func TestFleet_SeedFollowsNICHotplug(t *testing.T) {
-	if _, err := exec.LookPath("genisoimage"); err != nil {
-		t.Skip("genisoimage not installed: the scenario reads the seeds back")
-	}
+	cloudinit.UseGoISOWithoutGenisoimage()
 	for _, latched := range []bool{true, false} {
 		name := "unlatched"
 		if latched {

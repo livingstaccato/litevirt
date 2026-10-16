@@ -26,7 +26,7 @@ import (
 // (no attached NIC in it, no stamp); regenerate it from the spec — the
 // instance-id becomes the VM's name.
 func TestNICHotplug_UnstampedOwnSeedIsRebuiltInPlace(t *testing.T) {
-	needGenisoimage(t)
+	useSeedISOWriter(t)
 	for _, instanceID := range []string{"x", "x-next"} {
 		t.Run(instanceID, func(t *testing.T) {
 			s := hotplugDiskServer(t)
@@ -65,7 +65,7 @@ func TestNICHotplug_UnstampedOwnSeedIsRebuiltInPlace(t *testing.T) {
 //
 // Mutation: take every unstamped seed as the VM's — it is rewritten.
 func TestNICHotplug_UnstampedForeignSeedIsLeftAlone(t *testing.T) {
-	needGenisoimage(t)
+	useSeedISOWriter(t)
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
 	spec := &pb.VMSpec{Name: "x", Uuid: "uuid-x", Image: "ubuntu", Cpu: 2, MemoryMib: 4096,
@@ -96,7 +96,7 @@ func TestNICHotplug_UnstampedForeignSeedIsLeftAlone(t *testing.T) {
 // Mutation: treat an unstamped seed as not the VM's and write it again with
 // no network-config — the seed loses X's static address.
 func TestNICHotplug_LegacyUnstampedSeedSurvivesAmbiguity(t *testing.T) {
-	needGenisoimage(t)
+	useSeedISOWriter(t)
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
 	ctx := adminCtx()
@@ -165,7 +165,7 @@ func TestEnsureCloudInit_IsAPeerCall(t *testing.T) {
 // Mutation: treat the unstamped seed as not the VM's and write it again with
 // no network-config — X's static address is gone from the seed.
 func TestNICHotplug_UnstampedAmbiguousSeedIsKept(t *testing.T) {
-	needGenisoimage(t)
+	useSeedISOWriter(t)
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
 	const macX, macA = "52:54:00:71:00:01", "52:54:00:71:00:02"
@@ -198,7 +198,7 @@ func TestNICHotplug_UnstampedAmbiguousSeedIsKept(t *testing.T) {
 // Mutation: send "" — red; take the foreign seed as the VM's — its
 // network-config is sent.
 func TestEnsureCloudInit_AmbiguousSourceWithoutItsSeedDisablesRendering(t *testing.T) {
-	needGenisoimage(t)
+	useSeedISOWriter(t)
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
 	r2VM(t, s, legacySpec(), []corrosion.InterfaceRecord{

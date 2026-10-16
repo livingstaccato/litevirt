@@ -3,7 +3,6 @@ package grpcapi
 import (
 	"bytes"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,11 +14,11 @@ import (
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
-func needGenisoimage(t *testing.T) {
+// useSeedISOWriter lets the test write and read back real seeds on a host
+// without genisoimage (cloudinit.UseGoISOWithoutGenisoimage).
+func useSeedISOWriter(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("genisoimage"); err != nil {
-		t.Skip("genisoimage not installed")
-	}
+	cloudinit.UseGoISOWithoutGenisoimage()
 }
 
 // r2VM inserts VM name with spec and NIC rows (both tables, as a create and,
@@ -110,7 +109,7 @@ func legacySpec() *pb.VMSpec {
 // treat the ambiguous result as "" — the seed loses its network-config and
 // X its address.
 func TestNICHotplug_LegacySpecDetachAttachKeepsTheStaticNIC(t *testing.T) {
-	needGenisoimage(t)
+	useSeedISOWriter(t)
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
 	ctx := adminCtx()
@@ -155,7 +154,7 @@ func TestNICHotplug_LegacySpecDetachAttachKeepsTheStaticNIC(t *testing.T) {
 // Mutation: treat the ambiguous result as "" — the network-config goes and
 // vendor-data is added; drop the event — red.
 func TestNICHotplug_AmbiguousNICsLeaveTheSeedAlone(t *testing.T) {
-	needGenisoimage(t)
+	useSeedISOWriter(t)
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
 	ctx := adminCtx()
@@ -198,7 +197,7 @@ func TestNICHotplug_AmbiguousNICsLeaveTheSeedAlone(t *testing.T) {
 // Mutation: name a kept NIC the prior seed does not list by its create name
 // — the kept NIC gets set-name eth0.
 func TestNICHotplug_FirstAttachToAOneNICVMRenamesNothing(t *testing.T) {
-	needGenisoimage(t)
+	useSeedISOWriter(t)
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
 	ctx := adminCtx()
@@ -227,7 +226,7 @@ func TestNICHotplug_FirstAttachToAOneNICVMRenamesNothing(t *testing.T) {
 // Mutation: take every seed at the path as the VM's — the leftover is
 // rewritten with its user-data kept, and reloaded.
 func TestNICHotplug_ALeftoverSeedIsNotRebuiltFrom(t *testing.T) {
-	needGenisoimage(t)
+	useSeedISOWriter(t)
 	leftover := cloudinit.Config{InstanceID: "x", LocalHostname: "x", UserData: "#cloud-config\npassword: theirs\n",
 		NetworkConfig: "version: 1\nconfig: []\n"}
 
@@ -287,7 +286,7 @@ func TestNICHotplug_ALeftoverSeedIsNotRebuiltFrom(t *testing.T) {
 //
 // Mutation: only log the failure — red.
 func TestNICHotplug_AFailedRebuildIsReported(t *testing.T) {
-	needGenisoimage(t)
+	useSeedISOWriter(t)
 	if os.Geteuid() == 0 {
 		t.Skip("root writes into a read-only directory")
 	}
@@ -313,7 +312,7 @@ func TestNICHotplug_AFailedRebuildIsReported(t *testing.T) {
 //
 // Mutation: reload only a domain libvirt calls running — no reload.
 func TestNICHotplug_PausedVMSeedIsReloaded(t *testing.T) {
-	needGenisoimage(t)
+	useSeedISOWriter(t)
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
 	hpSeededVM(t, s, "running")
@@ -333,7 +332,7 @@ func TestNICHotplug_PausedVMSeedIsReloaded(t *testing.T) {
 // Mutation: send "" for an ambiguous network-config — red; let the target
 // derive the vendor-data when the source sent it — red.
 func TestEnsureCloudInit_AmbiguousSourceSendsItsSeed(t *testing.T) {
-	needGenisoimage(t)
+	useSeedISOWriter(t)
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
 	const macX, macA = "52:54:00:6d:00:01", "52:54:00:6d:00:02"

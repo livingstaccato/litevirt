@@ -42,7 +42,7 @@ func seedStamped(t *testing.T, iso string) bool {
 // Mutation: OwnSeed without the cloud-init check — both cases go red; without
 // the cdrom check — "not attached" goes red.
 func TestNICHotplug_ANoCloudInitVMNeverTakesALeftoverSeed(t *testing.T) {
-	needGenisoimage(t)
+	useSeedISOWriter(t)
 	for _, attached := range []bool{false, true} {
 		name := "not attached"
 		if attached {
@@ -85,7 +85,7 @@ func TestNICHotplug_ANoCloudInitVMNeverTakesALeftoverSeed(t *testing.T) {
 //
 // Mutation: OwnSeed without the cdrom check — the seed is rebuilt and stamped.
 func TestNICHotplug_AnUnattachedUnstampedSeedIsLeftAlone(t *testing.T) {
-	needGenisoimage(t)
+	useSeedISOWriter(t)
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
 	spec := &pb.VMSpec{Name: "x", Uuid: "uuid-new", Image: "ubuntu", Cpu: 2, MemoryMib: 4096,
@@ -116,7 +116,7 @@ func TestNICHotplug_AnUnattachedUnstampedSeedIsLeftAlone(t *testing.T) {
 // Mutation: OwnSeed without the cdrom check — the seed's network-config is
 // sent.
 func TestEnsureCloudInit_AmbiguousSourceDoesNotSendAnUnattachedSeed(t *testing.T) {
-	needGenisoimage(t)
+	useSeedISOWriter(t)
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
 	r2VM(t, s, legacySpec(), []corrosion.InterfaceRecord{
@@ -144,7 +144,7 @@ func TestEnsureCloudInit_AmbiguousSourceDoesNotSendAnUnattachedSeed(t *testing.T
 // Mutation: OwnSeed without the user-data check — the seed is rebuilt and
 // stamped.
 func TestNICHotplug_AnAttachedResidueOfAnotherUserDataIsNotTaken(t *testing.T) {
-	needGenisoimage(t)
+	useSeedISOWriter(t)
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
 	spec := &pb.VMSpec{Name: "x", Uuid: "uuid-new", Image: "ubuntu", Cpu: 2, MemoryMib: 4096,

@@ -11,6 +11,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hostboot"
 )
 
@@ -144,5 +145,46 @@ func TestReturningHostBootBeforeTheFeatureOpens(t *testing.T) {
 				t.Fatalf("the boot of a fenced host before the feature opens recorded %q (version %q), want active at once with its report", h.State, h.Version)
 			}
 		})
+	}
+}
+
+// TestReturningBootThroughTheRealGate: the boot of a fenced host on a cluster
+// where release_2026_11_v1 has latched (its marker, and failover_scope_v1's,
+// on disk) and returning_boot's use is recorded and acknowledged goes through
+// the daemon's own health checker and release gate — no injected gate, no
+// test grant — and records the host 'upgrading'. The gate re-records the use
+// in cluster_policies before it grants, so the cluster-policy write gate must
+// be wired before the boot write.
+//
+// Mutation: wire the cluster-policy gate after the boot write (drop it from
+// checkerThenBootWrite) — the gate refuses and the host is recorded 'active'.
+func TestReturningBootThroughTheRealGate(t *testing.T) {
+	old := pingPollInterval
+	pingPollInterval = time.Millisecond
+	defer func() { pingPollInterval = old }()
+	var checks bootChecks
+	defer checks.wait(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d, host := returningDaemon(t, ctx, "fenced")
+	for _, tok := range []string{capabilities.Release202611V1, capabilities.FailoverScopeV1} {
+		if err := os.WriteFile(health.ActivationMarkerPath(d.cfg.DataDir, tok), capabilities.MarkerContent(tok), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	info, ok := capabilities.LookupFeature(capabilities.FeatureReturningBoot)
+	if !ok {
+		t.Fatal("returning_boot is not declared")
+	}
+	d.db.SetClusterPolicyGate(func() bool { return true })
+	if err := corrosion.RecordReleaseFeatureUse(ctx, d.db, info.Token, string(capabilities.FeatureReturningBoot), "leader", true); err != nil {
+		t.Fatalf("seed the acknowledged use: %v", err)
+	}
+	// As at daemon start: nothing has opened the policy gate yet.
+	d.db.SetClusterPolicyGate(func() bool { return false })
+	d.selfPinger = checks.pinger(&gatedPinger{open: make(chan struct{})})
+	d.checkerThenBootWrite(ctx, 2, 2048, 10, true)
+	if h := host(); h.State != "upgrading" || h.Version != "v-boot" {
+		t.Fatalf("the boot of a fenced host through the real gate recorded %q (version %q), want upgrading with its report", h.State, h.Version)
 	}
 }

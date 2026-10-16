@@ -659,13 +659,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// (awaitServingThenActivate): recorded active
 	// before its gRPC server listened, it was fenced on the failure count its
 	// observers carried through the restart (hostboot).
-	//
-	// The checker, with its durable latches loaded, exists before the boot
-	// write: a returning host's 'upgrading' write goes through its release
-	// gate (returning_boot).
-	d.checker = health.NewChecker(d.cfg.HostName, d.cfg.PKIDir, d.db)
-	d.wireActivationMarker()
-	d.writeBootState(ctx, cpus, memMiB, diskGiB, niErr == nil)
+	d.checkerThenBootWrite(ctx, cpus, memMiB, diskGiB, niErr == nil)
 	// Record version on the corrosion client so it goes into Crescent
 	// peer handshakes (used by skew detection).
 	d.db.SetLocalVersion(d.cfg.Version)

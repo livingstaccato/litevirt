@@ -1121,11 +1121,15 @@ and resources are then written once the daemon serves, leaving that state.
 - A boot without the marker that cannot write `boot-unclean-history` or
   `boot-awaiting-serving` (a full or read-only disk) could not bound a crash
   loop, and one that cannot read the host's record (read twice) could not
-  judge it: each makes no write. Once the daemon serves it records a host
-  recorded `active` or `upgrading` `active`, with its version and resources,
-  only while it is still recorded so; a fenced or offline host keeps that
-  state and gets nothing, and a draining or maintenance one keeps its state
-  and gets its version and resources. A graceful boot that cannot read the
+  judge it: each makes no write. This covers a host recorded `active` or
+  `upgrading` at boot, one whose record was unreadable, and one recorded
+  `fenced` or `offline` that cannot write `boot-unclean-history`; a host
+  recorded `maintenance`, `draining` or `joining` at boot is returning (below)
+  and is written. Once the daemon serves it records a host recorded `active`
+  or `upgrading` `active`, with its version and resources, only while it is
+  still recorded so; a fenced or offline host keeps that state and gets
+  nothing, and a draining or maintenance one (found so once it serves) keeps
+  its state and gets its version and resources. A graceful boot that cannot read the
   record still leaves `boot-awaiting-serving`; if that cannot be written
   either, a crash before it serves leaves the next boot nothing to show it
   never served, and that boot may write one fresh `upgrading` (bounded by the
@@ -1134,7 +1138,9 @@ and resources are then written once the daemon serves, leaving that state.
 
 A host recorded `fenced`, `offline`, `maintenance`, `draining` or `joining`
 when it boots, with or without the marker, whatever its earlier boots, is
-returning to service. Once the `returning_boot` feature of
+returning to service. The one exception is a fenced or offline host whose boot
+cannot write `boot-unclean-history`: it keeps the fence, makes no write and
+is not recorded `active` once it serves, until `lv host undrain`. Once the `returning_boot` feature of
 `release_2026_11_v1` is in use ([upgrades.md](upgrades.md)), its boot write
 records it `upgrading`, only while it is still recorded as the boot read it,
 and the daemon records it `active` once it serves, so it is not fenced before

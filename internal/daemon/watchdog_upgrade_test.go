@@ -811,17 +811,16 @@ func TestBootThatCannotRecordItselfWritesNothingUntilItServes(t *testing.T) {
 	}
 }
 
-// TestReturningBootOfAFencedHostNeedsNoHistory: a crash boot of a host
-// recorded fenced whose data dir cannot take its unclean-boot history is
-// still returning to service (hostboot.returningBoot): that write is bounded
-// by the fenced state, not by the history, so it is not deferred. It records
-// the host 'upgrading', guarded on 'fenced', and 'active' once this daemon
-// serves, as main's boot returned it. (A deferred boot of a host found
-// fenced only once it serves still keeps the fence: ConfirmServingReport.)
+// TestDeferredBootOfAFencedHostKeepsTheFence: a crash boot of a host recorded
+// fenced whose data dir cannot take its unclean-boot history writes nothing,
+// and once this daemon serves it is not recorded active over the fence —
+// whether or not returning_boot is open (here it is): a host that cannot
+// record its own boot history needs an operator.
 //
-// Mutation: skip returningBoot — the boot is deferred and the fence is kept,
-// so the host never returns.
-func TestReturningBootOfAFencedHostNeedsNoHistory(t *testing.T) {
+// Mutations: confirm a deferred boot from any recorded state in hostboot — the
+// fenced host turns active once it serves; drop the history check from
+// returningBoot — the boot goes through the gate and the host returns.
+func TestDeferredBootOfAFencedHostKeepsTheFence(t *testing.T) {
 	old := pingPollInterval
 	pingPollInterval = time.Millisecond
 	defer func() { pingPollInterval = old }()
@@ -845,12 +844,11 @@ func TestReturningBootOfAFencedHostNeedsNoHistory(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("the boot started no serving check")
 	}
-	if calls != 1 {
-		t.Fatalf("the returning boot went through the release gate %d times, want once", calls)
+	if calls != 0 {
+		t.Fatalf("the boot of a fenced host that cannot record its history went through the release gate %d times, want none", calls)
 	}
-	for deadline := time.Now().Add(3 * time.Second); host().State != "active"; time.Sleep(10 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatalf("a returning boot of a fenced host left it %q once serving, want active", host().State)
-		}
+	time.Sleep(100 * time.Millisecond)
+	if got := host().State; got != "fenced" {
+		t.Fatalf("a deferred boot of a fenced host recorded it %q once serving, want the fence kept", got)
 	}
 }

@@ -46,7 +46,8 @@ func returning(state string) bool {
 // when it exists), so a fence, undrain or drain recorded between the read and
 // the write is kept, and nothing else refuses it. ok=false, and the boot is
 // decided as before, for any other state and for a record this boot cannot
-// read.
+// read. A fenced or offline host whose boot cannot record its unclean-boot
+// history keeps the fence instead (Deferred, no write).
 func returningBoot(ctx context.Context, db *corrosion.Client, host, dataDir string, marked bool, now time.Time) (Boot, bool) {
 	h, err := readHost(ctx, db, host)
 	if err != nil || h == nil || !returning(h.State) {
@@ -54,9 +55,16 @@ func returningBoot(ctx context.Context, db *corrosion.Client, host, dataDir stri
 	}
 	if !marked && dataDir != "" {
 		// Counted like any boot without the marker, so a crash loop that
-		// follows is judged on its whole history. Best effort: this boot's
-		// decision does not depend on it.
-		_, _ = recordUncleanBoot(dataDir, now)
+		// follows is judged on its whole history.
+		if _, herr := recordUncleanBoot(dataDir, now); herr != nil && (h.State == "fenced" || h.State == "offline") {
+			// A host that cannot record its own boot history keeps a fence
+			// the cluster recorded: no boot write, and none once it serves
+			// (ConfirmServingReport keeps fenced and offline). An operator
+			// returns it (`lv host undrain`). Whether or not returning_boot
+			// is open.
+			return Boot{State: h.State, AwaitServing: true, Deferred: true,
+				Reason: "recorded " + h.State + ", and recording this unclean boot failed (" + herr.Error() + "); the fence is kept until an operator returns this host"}, true
+		}
 	}
 	// Bounded by the returning state itself, so written whether or not the
 	// note can be left.

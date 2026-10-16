@@ -199,13 +199,22 @@ func TestBootThatCannotBoundOrReadDefers(t *testing.T) {
 			t.Fatalf("boot of a %s host that cannot record its unclean boot = %+v, want %s kept, no boot write", st, b, st)
 		}
 	}
-	// A returning host's write is bounded by its recorded state, not by the
-	// history: it is not deferred (returningBoot).
-	{
-		db, ctx := hostIn(t, "fenced")
+	// A fenced or offline host that cannot record its own boot history keeps
+	// the fence: no boot write, as for any boot that cannot bound itself.
+	for _, st := range []string{"fenced", "offline"} {
+		db, ctx := hostIn(t, st)
 		dir := filepath.Join(t.TempDir(), "missing")
-		if b := BootState(ctx, db, "h", dir, false, time.Now()); b.State != "upgrading" || !b.AwaitServing || b.Deferred || b.From != "fenced" {
-			t.Fatalf("boot of a fenced host that cannot record its unclean boot = %+v, want upgrading from fenced", b)
+		if b := BootState(ctx, db, "h", dir, false, time.Now()); b.State != st || !b.AwaitServing || !b.Deferred || b.Returning {
+			t.Fatalf("boot of a %s host that cannot record its unclean boot = %+v, want %s kept, no boot write", st, b, st)
+		}
+	}
+	// Any other returning state's write is bounded by its recorded state, not
+	// by the history: it is not deferred (returningBoot).
+	for _, st := range []string{"maintenance", "draining", corrosion.HostStateJoining} {
+		db, ctx := hostIn(t, st)
+		dir := filepath.Join(t.TempDir(), "missing")
+		if b := BootState(ctx, db, "h", dir, false, time.Now()); b.State != "upgrading" || !b.AwaitServing || b.Deferred || b.From != st {
+			t.Fatalf("boot of a %s host that cannot record its unclean boot = %+v, want upgrading from %s", st, b, st)
 		}
 	}
 

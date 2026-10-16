@@ -8,8 +8,24 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/failover"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hostboot"
 )
+
+// checkerThenBootWrite creates the health checker, with its durable latches
+// loaded, and the cluster-policy write gate, then makes the boot write
+// (writeBootState). A returning host's 'upgrading' write goes through the
+// checker's release gate (returning_boot), and that gate re-records the
+// feature's use in cluster_policies before it hands out the grant: with the
+// policy gate still closed it refuses, and every returning boot would fall
+// back to 'active'. wireCorrosionGates wires the same gate again later, which
+// is harmless.
+func (d *Daemon) checkerThenBootWrite(ctx context.Context, cpus, memMiB, diskGiB int, hasResources bool) {
+	d.checker = health.NewChecker(d.cfg.HostName, d.cfg.PKIDir, d.db)
+	d.wireActivationMarker()
+	d.wireClusterPolicyGate()
+	d.writeBootState(ctx, cpus, memMiB, diskGiB, hasResources)
+}
 
 // releaseGate is health.Checker.WithFeature's shape.
 type releaseGate func(ctx context.Context, feature capabilities.Feature,

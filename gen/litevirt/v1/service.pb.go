@@ -2421,12 +2421,14 @@ type ClusterHealth struct {
 	// DEGRADED: warning-level conditions, or coverage/staleness gaps.
 	// CRITICAL: any active critical condition.
 	// UNKNOWN: no evaluator has ever completed a scan.
-	Overall       string                    `protobuf:"bytes,1,opt,name=overall,proto3" json:"overall,omitempty"`
-	Conditions    []*HealthCondition        `protobuf:"bytes,2,rep,name=conditions,proto3" json:"conditions,omitempty"`
-	Evaluators    []*HealthEvaluatorStatus  `protobuf:"bytes,3,rep,name=evaluators,proto3" json:"evaluators,omitempty"`
-	Connectivity  []*ConnectivityEdge       `protobuf:"bytes,4,rep,name=connectivity,proto3" json:"connectivity,omitempty"`
-	Capacity      []*HostCapacityAssessment `protobuf:"bytes,5,rep,name=capacity,proto3" json:"capacity,omitempty"`
-	GeneratedAt   string                    `protobuf:"bytes,6,opt,name=generated_at,json=generatedAt,proto3" json:"generated_at,omitempty"` // RFC3339
+	Overall      string                    `protobuf:"bytes,1,opt,name=overall,proto3" json:"overall,omitempty"`
+	Conditions   []*HealthCondition        `protobuf:"bytes,2,rep,name=conditions,proto3" json:"conditions,omitempty"`
+	Evaluators   []*HealthEvaluatorStatus  `protobuf:"bytes,3,rep,name=evaluators,proto3" json:"evaluators,omitempty"`
+	Connectivity []*ConnectivityEdge       `protobuf:"bytes,4,rep,name=connectivity,proto3" json:"connectivity,omitempty"`
+	Capacity     []*HostCapacityAssessment `protobuf:"bytes,5,rep,name=capacity,proto3" json:"capacity,omitempty"`
+	GeneratedAt  string                    `protobuf:"bytes,6,opt,name=generated_at,json=generatedAt,proto3" json:"generated_at,omitempty"` // RFC3339
+	// Why overall is not HEALTHY: one line per cause, empty when it is.
+	Reasons       []string `protobuf:"bytes,7,rep,name=reasons,proto3" json:"reasons,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2501,6 +2503,13 @@ func (x *ClusterHealth) GetGeneratedAt() string {
 		return x.GeneratedAt
 	}
 	return ""
+}
+
+func (x *ClusterHealth) GetReasons() []string {
+	if x != nil {
+		return x.Reasons
+	}
+	return nil
 }
 
 type RescanHostRequest struct {
@@ -43166,7 +43175,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"sampled_at\x18\n" +
 	" \x01(\tR\tsampledAt\x12!\n" +
 	"\rdb_ct_mem_mib\x18\v \x01(\x05R\n" +
-	"dbCtMemMib\"\xd2\x02\n" +
+	"dbCtMemMib\"\xec\x02\n" +
 	"\rClusterHealth\x12\x18\n" +
 	"\aoverall\x18\x01 \x01(\tR\aoverall\x12<\n" +
 	"\n" +
@@ -43177,7 +43186,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"evaluators\x12A\n" +
 	"\fconnectivity\x18\x04 \x03(\v2\x1d.litevirt.v1.ConnectivityEdgeR\fconnectivity\x12?\n" +
 	"\bcapacity\x18\x05 \x03(\v2#.litevirt.v1.HostCapacityAssessmentR\bcapacity\x12!\n" +
-	"\fgenerated_at\x18\x06 \x01(\tR\vgeneratedAt\"'\n" +
+	"\fgenerated_at\x18\x06 \x01(\tR\vgeneratedAt\x12\x18\n" +
+	"\areasons\x18\a \x03(\tR\areasons\"'\n" +
 	"\x11RescanHostRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"\x8c\x01\n" +
 	"\x12RescanHostResponse\x12\x14\n" +

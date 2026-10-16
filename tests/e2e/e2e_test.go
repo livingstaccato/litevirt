@@ -546,6 +546,39 @@ func TestCluster_Version(t *testing.T) {
 // after it was not there before the run.
 var suiteStart = time.Now()
 
+// healthReasons returns the "  - <reason>" lines `lv health` prints under its
+// overall line.
+func healthReasons(out string) []string {
+	var reasons []string
+	lines := strings.Split(out, "\n")
+	for i, line := range lines {
+		if i == 0 {
+			continue
+		}
+		r, ok := strings.CutPrefix(line, "  - ")
+		if !ok {
+			break
+		}
+		reasons = append(reasons, r)
+	}
+	return reasons
+}
+
+// staleEvaluatorScan reads the last-scan time out of a stale-evaluator reason
+// (`evaluator X is stale: last scan "<RFC3339>" by ...`).
+func staleEvaluatorScan(reason string) (time.Time, bool) {
+	_, rest, ok := strings.Cut(reason, " is stale: last scan \"")
+	if !ok {
+		return time.Time{}, false
+	}
+	ts, _, ok := strings.Cut(rest, "\"")
+	if !ok {
+		return time.Time{}, false
+	}
+	at, err := time.Parse(time.RFC3339, ts)
+	return at, err == nil
+}
+
 // conditionsSince returns the condition rows of `lv health` output whose SINCE
 // (the last column; RFC3339 or "2006-01-02 15:04:05") is at or after t, or
 // cannot be read: an unreadable time is treated as new, never as old.
@@ -625,6 +658,22 @@ func TestCluster_Health(t *testing.T) {
 		if fresh := conditionsSince(out, suiteStart); len(fresh) > 0 {
 			t.Fatalf("the cluster is DEGRADED by conditions first seen since this run began (%s) or with an unreadable SINCE:\n%s",
 				suiteStart.UTC().Format(time.RFC3339), strings.Join(fresh, "\n"))
+		}
+		// A DEGRADED report must say why. lab 3 sat at DEGRADED with no
+		// condition and nothing else listed, because the shared_lun scan had
+		// stopped; the report now names each cause under the overall line.
+		reasons := healthReasons(out)
+		if len(reasons) == 0 && !strings.Contains(out, "\nconditions:") {
+			t.Fatalf("the cluster is DEGRADED and the report names no reason and no condition:\n%s", out)
+		}
+		// An evaluator that was already stale when this run began stopped
+		// scanning before anything here could have caused it — on lab 3, a
+		// lease no node could take over. One that went stale during the run
+		// may be a scenario's partition, so it is only logged.
+		for _, r := range reasons {
+			if at, ok := staleEvaluatorScan(r); ok && at.Before(suiteStart.Add(-5*time.Minute)) {
+				t.Fatalf("a health evaluator stopped scanning before this run began: %s\n%s", r, out)
+			}
 		}
 		t.Logf("cluster is DEGRADED (exit 1) by older conditions only; checking the report still names the hosts:\n%s", out)
 	}

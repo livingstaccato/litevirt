@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -88,8 +89,10 @@ func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthR
 		})
 	}
 
+	overall, reasons := rollUpHealth(conditions, evaluators, capacity, mesh, time.Now().UTC())
 	resp := &pb.ClusterHealth{
-		Overall:     overallHealth(conditions, evaluators, capacity, mesh, time.Now().UTC()),
+		Overall:     overall,
+		Reasons:     reasons,
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 	for _, h := range conditions {
@@ -243,16 +246,30 @@ const evaluatorScanTTL = 5 * time.Minute
 // trade than a loudly-degraded health state; an operator who wants a hard stop
 // on a blind cluster has the DEGRADED/UNKNOWN exit codes to wire it from.
 func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosion.HealthEvaluatorStatus, capacity []corrosion.HostCapacityObservation, mesh []connectivityEdge, now time.Time) string {
+	state, _ := rollUpHealth(conditions, evaluators, capacity, mesh, now)
+	return state
+}
+
+// rollUpHealth is overallHealth with its reasons: one line per cause of a
+// state other than HEALTHY, so an operator can see WHY. A stale evaluator, an
+// incomplete capacity sample or a bad edge degrades the cluster without any
+// condition row, and the state alone left `lv health` at DEGRADED with nothing
+// listed to explain it. Every path to a non-HEALTHY state records a reason:
+// DEGRADED is derived from the reasons, not from a separate flag that could
+// be set without one.
+func rollUpHealth(conditions []corrosion.HealthCondition, evaluators []corrosion.HealthEvaluatorStatus, capacity []corrosion.HostCapacityObservation, mesh []connectivityEdge, now time.Time) (string, []string) {
 	if len(evaluators) == 0 {
-		return HealthUnknown
+		return HealthUnknown, []string{"no health evaluator has reported a scan yet"}
 	}
-	degraded := false
+	var reasons, critical []string
 	for _, h := range conditions {
 		if h.Lifecycle == corrosion.ConditionResolved {
 			continue
 		}
+		what := fmt.Sprintf("condition %s on %s/%s (%s, %s)", h.Code, h.SubjectKind, h.SubjectID, h.Severity, h.Lifecycle)
 		if h.Severity == corrosion.SeverityCritical {
-			return HealthCritical
+			critical = append(critical, what)
+			continue
 		}
 		if h.Severity == corrosion.SeverityInfo {
 			// AN INFO CONDITION IS AN ADVISORY, NOT A FAULT, and the severity
@@ -279,7 +296,10 @@ func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosio
 			// warning or critical, and both still degrade below.
 			continue
 		}
-		degraded = true
+		reasons = append(reasons, what)
+	}
+	if len(critical) > 0 {
+		return HealthCritical, append(critical, reasons...)
 	}
 	allStale := true
 	for _, e := range evaluators {
@@ -295,16 +315,20 @@ func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosio
 				allStale = false
 			}
 		}
-		if stale || e.Coverage != corrosion.CoverageComplete {
-			degraded = true
+		if stale {
+			reasons = append(reasons, fmt.Sprintf("evaluator %s is stale: last scan %q by %s is not within the last %s "+
+				"(its scan has stopped, or no node holds its lease)", e.Evaluator, e.LastScan, e.Reporter, evaluatorScanTTL))
+		}
+		if e.Coverage != corrosion.CoverageComplete {
+			reasons = append(reasons, fmt.Sprintf("evaluator %s coverage is %s: %s", e.Evaluator, e.Coverage, e.Detail))
 		}
 	}
 	if allStale {
-		return HealthUnknown
+		return HealthUnknown, reasons
 	}
 	for _, c := range capacity {
 		if !c.Complete {
-			degraded = true
+			reasons = append(reasons, fmt.Sprintf("capacity observation for %s is incomplete: %s", c.HostName, c.Detail))
 		}
 	}
 	// A peer-probe mesh full of failing links used to roll up as HEALTHY: the
@@ -321,13 +345,13 @@ func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosio
 			continue
 		}
 		if connectivityDegrades(e.Status) {
-			degraded = true
+			reasons = append(reasons, fmt.Sprintf("connectivity %s -> %s is %s", e.Observer, e.Target, e.Status))
 		}
 	}
-	if degraded {
-		return HealthDegraded
+	if len(reasons) > 0 {
+		return HealthDegraded, reasons
 	}
-	return HealthHealthy
+	return HealthHealthy, nil
 }
 
 func healthConditionToPB(h corrosion.HealthCondition) *pb.HealthCondition {

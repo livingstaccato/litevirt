@@ -776,8 +776,8 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	// Leader-lease terms, one series per key. This is the signal
 	// docs/operating-model.md tells operators to alert on: the docs named term
 	// growth before any metric exposed it, leaving raw SQL as the only access
-	// path. The key label is bounded by the rows that exist, and only three keys
-	// are ever written (failover, the rebalancer's, dual_run_detector).
+	// path. The key label is bounded by the rows that exist, and only the keys in
+	// corrosion's closed lease-key set are ever written.
 	//
 	// NO deleted_at filter, matching nextLeaseTerm. The allocator computes
 	// MAX(term) over every row because a tombstoned tenure still consumed its

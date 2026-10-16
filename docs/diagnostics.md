@@ -1261,7 +1261,12 @@ observed → confirmed → resolved lifecycle:
 `lv health` prints the overall state (HEALTHY / DEGRADED / CRITICAL /
 UNKNOWN), every active condition with its involved hosts, evaluator
 coverage, peer connectivity, and per-host effective capacity — and exits
-0 / 1 / 2 so scripts can gate on it.
+0 / 1 / 2 so scripts can gate on it. Under any state but HEALTHY it lists
+each cause on its own `- ` line beneath the overall state, including the ones
+that are not conditions: an evaluator whose last scan is more than 5 minutes
+old (stale: its scan has stopped, or no node holds its lease), an evaluator
+with incomplete coverage, an incomplete capacity sample, and a link not
+proven good.
 
 Peer connectivity counts toward that state: a link the checker cannot prove
 good is a coverage gap, so a `suspect` or `failing` edge reads DEGRADED
@@ -2149,7 +2154,10 @@ the LUN; the involved hosts are the hosts those VMs are on.
 | A scan of the replica's `vm_disks` finds two or more live disks of live VMs whose recorded paths are one LUN (the target compared case-insensitively, the portal ignored), or such a disk and an older linked clone layered on it. Observed (warning) on the first such scan, confirmed (critical) on the second. | Two consecutive scans find no such use, under a valid decision gate. |
 
 It runs once a minute on whichever node holds its own lease
-(`shared_lun_detector`). It is detection only: the voter-majority LUN claim
+(`shared_lun_detector`). A survivor takes that lease over once a quorum of
+voters runs a build that answers for the key; until then the scan stops when
+its holder does, and `lv health` lists `shared_lun` as stale after 5 minutes.
+It is detection only: the voter-majority LUN claim
 at create time is the prevention ([storage.md](storage.md#iscsi-one-lun-one-disk)).
 It **changes nothing**: no disk is touched, and it is not an ownership code, so
 admission — starting either VM included — does not read it. Refusing the start

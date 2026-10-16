@@ -125,7 +125,7 @@ func (s *Server) findSharedLUNs(ctx context.Context) (map[string]sharedLUNFindin
 }
 
 // sharedLUNLeaseKey is the shared_lun scan's lease.
-const sharedLUNLeaseKey = "shared_lun_detector"
+const sharedLUNLeaseKey = corrosion.LeaseKeySharedLUN
 
 // RunSharedLUNDetector runs the shared_lun scan every interval, on whichever
 // node holds its lease.

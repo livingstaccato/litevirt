@@ -515,6 +515,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 	// the ISO is ejected); otherwise the first non-ISO disk boots.
 	bootFromCDROM := cfg.Boot == "cdrom"
 	diskBootAssigned := false
+	usedTarget := map[string]bool{}
 	for i, d := range cfg.Disks {
 		targetDev := d.TargetDev
 		if targetDev == "" {
@@ -562,6 +563,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 				diskBootAssigned = true
 			}
 		}
+		usedTarget[disk.Target.Dev] = true
 		dev.Disks = append(dev.Disks, disk)
 	}
 
@@ -569,12 +571,19 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 	// target can't collide with an installer-ISO cdrom (which derives its dev
 	// from its disk index). With a single root disk this is still "sdb".
 	if cfg.CloudInitISO != "" {
+		// Past any disk that keeps a recorded target in this slot (one
+		// hot-plugged since the create): two disks on one target is a domain
+		// libvirt refuses.
+		seedSlot := len(cfg.Disks)
+		for usedTarget[fmt.Sprintf("sd%c", 'a'+seedSlot)] {
+			seedSlot++
+		}
 		dev.Disks = append(dev.Disks, diskDevice{
 			Type:     "file",
 			Device:   "cdrom",
 			Driver:   diskDriver{Name: "qemu", Type: "raw"},
 			Source:   diskSource{File: cfg.CloudInitISO},
-			Target:   diskTarget{Dev: fmt.Sprintf("sd%c", 'a'+len(cfg.Disks)), Bus: "sata"},
+			Target:   diskTarget{Dev: fmt.Sprintf("sd%c", 'a'+seedSlot), Bus: "sata"},
 			Readonly: &struct{}{},
 		})
 	}

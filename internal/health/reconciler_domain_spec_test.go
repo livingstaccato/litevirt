@@ -256,3 +256,64 @@ func TestStartPendingVM_KeepsDiskBusControllerAndOrder(t *testing.T) {
 		t.Errorf("failover SCSI controller model = %q, want lsilogic\n%s", scsi, x)
 	}
 }
+
+// A spec that lists no disks boots its root after a failover start, with a
+// sata disk hot-plugged on sda beside it: boot order 1 is on the root.
+//
+// Mutation: sort every row of such a spec by target alone — the boot order
+// lands on the data disk and the test goes red.
+func TestStartPendingVM_NoSpecDisksBootsTheRoot(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	root, data := filepath.Join(dir, "root.img"), filepath.Join(dir, "data.img")
+	for _, p := range []string{root, data} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := corrosion.InsertVM(ctx, db,
+		corrosion.VMRecord{Name: "nd", HostName: "node-a", Spec: `{"name":"nd","cpu":1,"memory_mib":512}`, State: "running", CPUActual: 1, MemActual: 512},
+		nil,
+		[]corrosion.DiskRecord{
+			{VMName: "nd", DiskName: "root", HostName: "node-a", Path: root, StorageType: "local", SizeBytes: 1 << 30, TargetDev: "vda"},
+			{VMName: "nd", DiskName: "data", HostName: "node-a", Path: data, StorageType: "local", SizeBytes: 1 << 30, TargetDev: "sda", Bus: "sata"},
+		},
+	); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	r, fake, _ := sharedDiskReconciler(t, db)
+	fresh, _ := corrosion.GetVM(ctx, db, "nd")
+	r.startPendingVM(ctx, *fresh)
+	x := fake.DefinedXML("nd")
+	if x == "" {
+		t.Fatal("the VM was not defined")
+	}
+	if got := bootDisk(t, x); got != root {
+		t.Fatalf("boot order 1 is on %q, want the root %q\n%s", got, root, x)
+	}
+}
+
+// bootDisk is the source file of the disk with boot order 1.
+func bootDisk(t *testing.T, domXML string) string {
+	t.Helper()
+	var d struct {
+		Disks []struct {
+			Source struct {
+				File string `xml:"file,attr"`
+			} `xml:"source"`
+			Boot *struct {
+				Order string `xml:"order,attr"`
+			} `xml:"boot"`
+		} `xml:"devices>disk"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, dk := range d.Disks {
+		if dk.Boot != nil && dk.Boot.Order == "1" {
+			return dk.Source.File
+		}
+	}
+	return ""
+}

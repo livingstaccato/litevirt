@@ -2,8 +2,11 @@ package fleet
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"regexp"
 	"testing"
 
@@ -115,5 +118,67 @@ func migrateColdTo(ctx context.Context, c *Cluster, at *Node, vm, target string)
 		} else if rerr != nil {
 			return rerr
 		}
+	}
+}
+
+// A VM whose spec lists no disks (created before the disk-tuning latch) fails
+// over with a sata data disk hot-plugged on sda beside its root on vda, and
+// the survivor boots the root: boot order 1 is on it, not on the data disk
+// that sorts first by target.
+//
+// Mutation: sort every disk row of such a spec by target alone — boot order 1
+// lands on the data disk and the test goes red.
+func TestFleet_FailoverBootsTheRootOfASpecWithNoDisks(t *testing.T) {
+	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	ctx := context.Background()
+	coord, home, other := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	dir := t.TempDir()
+	root, data := filepath.Join(dir, "nd-root.qcow2"), filepath.Join(dir, "nd-data.qcow2")
+	for _, p := range []string{root, data} {
+		if err := os.WriteFile(p, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := corrosion.InsertVM(ctx, coord.DB, corrosion.VMRecord{
+		Name: "nd", HostName: home.Name, State: "running", CPUActual: 1, MemActual: 256,
+		Spec: `{"name":"nd","cpu":1,"memory_mib":256,"on_host_failure":"restart-any"}`,
+	}, nil, []corrosion.DiskRecord{
+		{VMName: "nd", DiskName: "root", HostName: home.Name, Path: root, StorageType: "nfs", StorageVolume: "shared", SizeBytes: 1 << 30, TargetDev: "vda"},
+		{VMName: "nd", DiskName: "data", HostName: home.Name, Path: data, StorageType: "nfs", StorageVolume: "shared", SizeBytes: 1 << 30, TargetDev: "sda", Bus: "sata"},
+	}); err != nil {
+		t.Fatalf("InsertVM nd: %v", err)
+	}
+	pinTo(t, coord, "nd", other.Name)
+	if got := fenceVictim(t, c, coord, home, other, coord); got != 1 {
+		t.Fatalf("fencer fired %d times, want 1", got)
+	}
+	rec := health.NewReconciler(other.Name, t.TempDir(), other.DB, other.Virt)
+	rec.SetNetworkProvision(other.Net.Provision)
+	rec.ReconcileOnce(ctx)
+	if vm, _ := corrosion.GetVM(ctx, coord.DB, "nd"); vm == nil || vm.HostName != other.Name || vm.State != "running" {
+		t.Fatalf("nd after the failover = %+v, want it running on %s", vm, other.Name)
+	}
+	var d struct {
+		Disks []struct {
+			Source struct {
+				File string `xml:"file,attr"`
+			} `xml:"source"`
+			Boot *struct {
+				Order string `xml:"order,attr"`
+			} `xml:"boot"`
+		} `xml:"devices>disk"`
+	}
+	x := other.Virt.DefinedXML("nd")
+	if err := xml.Unmarshal([]byte(x), &d); err != nil {
+		t.Fatalf("parse nd's domain: %v\n%s", err, x)
+	}
+	boot := ""
+	for _, dk := range d.Disks {
+		if dk.Boot != nil && dk.Boot.Order == "1" {
+			boot = dk.Source.File
+		}
+	}
+	if boot != root {
+		t.Fatalf("nd on %s boots %q, want its root %q\n%s", other.Name, boot, root, x)
 	}
 }

@@ -5,15 +5,15 @@ import (
 	"github.com/litevirt/litevirt/internal/libvirt"
 )
 
-// DomainConfig assembles every libvirt VMConfig field derived from a stored
-// VMSpec. Every path that renders a domain from a spec routes through here —
-// CreateVM, a full-regeneration redefine and the reconciler's failover start —
-// so a setting the VM was created with is rendered the same wherever it is
-// (re)defined.
+// DomainConfig assembles the libvirt VMConfig fields derived from a stored
+// VMSpec. CreateVM, a full-regeneration redefine and the reconciler's start
+// (failover, onboot, self-heal) build their domain from it, so those
+// scalar settings (CPU, memory, consoles, machine, firmware choice,
+// resources, disk and NIC tuning) come out the same on each.
 //
-// Disks, networks and hostdevs are passed in because their sourcing differs
-// per path. Firmware/nvram/TPM, the cloud-init seed and USB devices are
-// applied by the caller.
+// Disks, networks and hostdevs are passed in, and each path sources them its
+// own way, so they can still differ between paths. Firmware/nvram/TPM, the
+// cloud-init seed and USB devices are applied by the caller.
 func DomainConfig(spec *pb.VMSpec, disks []libvirt.DiskConfig, nets []libvirt.NetworkConfig, hostdevs []libvirt.HostdevConfig) libvirt.VMConfig {
 	cfg := libvirt.VMConfig{
 		Name:         spec.Name,

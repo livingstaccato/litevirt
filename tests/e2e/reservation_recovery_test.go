@@ -16,6 +16,7 @@ import (
 type inspectedReservations struct {
 	Reservations []struct {
 		OperationID string `json:"operationId"`
+		VM          string `json:"vm"`
 		Vcpu        int    `json:"vcpu"`
 		MemoryMib   int    `json:"memoryMib"`
 		State       string `json:"state"`
@@ -56,8 +57,8 @@ func TestReservations_InspectSumsMatch(t *testing.T) {
 	}
 }
 
-// A VM grown live and then deleted leaves no releasable reservation on its
-// host for longer than the sweep's interval plus replication.
+// A VM grown live and then deleted leaves no releasable reservation of its own
+// on its host for longer than the sweep's interval plus replication.
 func TestReservations_GrowThenDeleteLeavesNothingReleasable(t *testing.T) {
 	requireImage(t)
 	name := uniqueName("resrec")
@@ -81,7 +82,9 @@ func TestReservations_GrowThenDeleteLeavesNothingReleasable(t *testing.T) {
 	for {
 		var releasable []string
 		for _, r := range inspectReservations(t, host).Reservations {
-			if r.State == "releasable" {
+			// Only this test's own VM: a releasable row another VM left on
+			// the host is not this test's to judge.
+			if r.State == "releasable" && r.VM == name {
 				releasable = append(releasable, r.OperationID+" ("+r.Detail+")")
 			}
 		}
@@ -89,8 +92,8 @@ func TestReservations_GrowThenDeleteLeavesNothingReleasable(t *testing.T) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%s still holds releasable reservations after the sweep's budget: %s",
-				host, strings.Join(releasable, "; "))
+			t.Fatalf("%s still holds releasable reservations of %s after the sweep's budget: %s",
+				host, name, strings.Join(releasable, "; "))
 		}
 		time.Sleep(10 * time.Second)
 	}

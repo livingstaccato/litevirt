@@ -850,3 +850,92 @@ func TestRetainedSweep_UnreadableOwedDiscardKeepsAll(t *testing.T) {
 		t.Fatal("a bundle was removed while an owed-discard record could not be read")
 	}
 }
+
+// Review n-1: a cleanup that stops before it can record the cleaning phase
+// leaves its marker released, which the cleanup retry does not take. Its
+// condition must not promise the minute's retry; it says the move is finished
+// on the target and when the cleanup resumes.
+//
+// Mutation: give a released stop the generic action — red.
+func TestCleanupSource_ReleasedStopDoesNotPromiseMinuteRetry(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	old := liveFirmwareSourceCleanup
+	liveFirmwareSourceCleanup = nil
+	t.Cleanup(func() { liveFirmwareSourceCleanup = old })
+	if err := r.migrate(); err != nil {
+		t.Fatalf("live firmware move: %v", err)
+	}
+	m := requireMarker(t, r, fwmig.PhaseReleased, "")
+	// A marker that cannot be written (it does not validate): the cleaning
+	// phase is never recorded.
+	bad := m
+	bad.Since = time.Time{}
+	if err := r.src.fwmigCleanupSource(context.Background(), bad); err == nil {
+		t.Fatal("the cleanup went on without recording the cleaning phase")
+	}
+	requireMarker(t, r, fwmig.PhaseReleased, "")
+	r.requireSourceIntact("after a stop at the cleaning phase")
+	c, open := r.cleanupCondition()
+	if !open {
+		t.Fatal("no cleanup condition")
+	}
+	if strings.Contains(c.Evidence, "each minute") || !strings.Contains(c.Evidence, "released") {
+		t.Fatalf("the condition of a released stop promises the minute's retry, or does not say the marker stays released: %s", c.Evidence)
+	}
+}
+
+// Review n-2: a cause whose text names the bundle's temp file (a write or
+// sync of a fresh os.CreateTemp file each pass) is the same cause on every
+// pass: the condition is written once.
+//
+// Mutation: keep the random temp name in the detail — red.
+func TestCleanupSource_StoppedConditionIgnoresTempName(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	m := r.stoppedAtUndefine()
+	tmp := r.retained(m.Attempt) + ".tmp-"
+	ctx := context.Background()
+	_ = r.src.liveFirmwareCleanupStopped(ctx, m, "write the retained bundle", &os.PathError{Op: "write", Path: tmp + "1234567", Err: errors.New("no space left on device")})
+	first, open := r.cleanupCondition()
+	if !open {
+		t.Fatal("no cleanup condition")
+	}
+	for _, n := range []string{"7654321", "99"} {
+		_ = r.src.liveFirmwareCleanupStopped(ctx, m, "write the retained bundle", &os.PathError{Op: "write", Path: tmp + n, Err: errors.New("no space left on device")})
+	}
+	again, _ := r.cleanupCondition()
+	if again.ObserveCount != first.ObserveCount {
+		t.Fatalf("the same cause on a fresh temp file was written %d more times: %s", again.ObserveCount-first.ObserveCount, again.Evidence)
+	}
+	if !strings.Contains(again.Evidence, ".tar.tmp-*") || !strings.Contains(again.Evidence, "no space left on device") {
+		t.Errorf("the detail lost the cause or the temp file's pattern: %s", again.Evidence)
+	}
+}
+
+// Review n-3: the touch at the wipe never moves the bundle's time back. A
+// clock behind at the touch keeps the later time already there; a clock that
+// is right moves an older time to now.
+//
+// Mutation: set now whatever the file has — red.
+func TestTouchRetainedBundle_NeverMovesBack(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "os1-"+rsAttemptA+".tar")
+	now := time.Now()
+	rsFile(t, p, -48*time.Hour) // written 48 h "ahead" of a clock that is behind
+	want := now.Add(48 * time.Hour)
+	if err := touchRetainedBundle(p, now); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := fi.ModTime().Sub(want); d < -time.Second || d > time.Second {
+		t.Fatalf("mtime %v after a touch at %v, want the later %v kept", fi.ModTime(), now, want)
+	}
+	rsFile(t, p, 72*time.Hour)
+	if err := touchRetainedBundle(p, now); err != nil {
+		t.Fatal(err)
+	}
+	if fi, _ = os.Stat(p); !fi.ModTime().Equal(now) && fi.ModTime().Sub(now).Abs() > time.Second {
+		t.Fatalf("mtime %v after a touch at %v of a 72 h old bundle, want now", fi.ModTime(), now)
+	}
+}

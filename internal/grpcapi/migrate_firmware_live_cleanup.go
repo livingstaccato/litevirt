@@ -12,7 +12,7 @@ package grpcapi
 // resumes at the first undone step.
 //
 // The retained bundle is the recovery copy. The sweep removes it 24 h after
-// it was written, and never while a marker (in progress or parked) or an owed
+// the wipe, and never while a marker (in progress or parked) or an owed
 // DISCARD names its attempt. It never reads fwmig-quarantine/.
 
 import (
@@ -81,10 +81,14 @@ func (s *Server) fwmigCleanupSource(ctx context.Context, m fwmig.Marker) error {
 	ctx = context.WithoutCancel(ctx)
 	switch m.Phase {
 	case fwmig.PhaseReleased:
-		m.Phase = fwmig.PhaseCleaning
-		if err := s.fwRecords().PutMarker(m); err != nil {
+		c := m
+		c.Phase = fwmig.PhaseCleaning
+		if err := s.fwRecords().PutMarker(c); err != nil {
+			// The marker stays released, which the cleanup retry does not take
+			// (review n-1): the stop says so.
 			return s.liveFirmwareCleanupStopped(ctx, m, "record the cleaning phase", err)
 		}
+		m = c
 	case fwmig.PhaseCleaning:
 	default:
 		return fmt.Errorf("VM %q: the source cleanup of live firmware migration %s runs from released or cleaning, not %s", m.VM, m.Attempt, m.Phase)
@@ -125,17 +129,25 @@ func (s *Server) fwmigCleanupSource(ctx context.Context, m fwmig.Marker) error {
 }
 
 // liveFirmwareCleanupStopped is §7 S1: the condition raised, the source state
-// kept, the marker as it is (cleaning), retried by the next pass.
+// kept, the marker as it is (cleaning, or released when the cleaning phase
+// could not be recorded), retried by the next pass.
 //
 // The condition is written only when it is not open with this detail already,
 // so a cleanup stuck on one cause writes it once, not every pass; the Error log
-// follows it, and a repeat logs at Debug.
+// follows it, and a repeat logs at Debug. The detail names a temp file by its
+// pattern, not its random name, so a cause that recurs on a fresh temp file is
+// the same cause (review n-2).
 func (s *Server) liveFirmwareCleanupStopped(ctx context.Context, m fwmig.Marker, step string, cause error) error {
 	retained, _ := s.fwRecords().RetainedPath(m.VM, m.Attempt)
-	detail := fmt.Sprintf("the source cleanup could not %s: %v", step, cause)
-	err := fmt.Errorf("VM %q: live firmware migration %s: %s", m.VM, m.Attempt, detail)
+	detail := fmt.Sprintf("the source cleanup could not %s: %s", step, retainedTempNameRe.ReplaceAllString(cause.Error(), "${1}*"))
+	err := fmt.Errorf("VM %q: live firmware migration %s: the source cleanup could not %s: %w", m.VM, m.Attempt, step, cause)
 	action := "the VM runs on the target; the source's firmware state is kept, and the cleanup is retried each minute once the cause is fixed"
-	if errors.Is(cause, errFirmwareCleanupStateChanged) {
+	switch {
+	case m.Phase == fwmig.PhaseReleased:
+		// Review n-1: the cleanup retry takes only cleaning markers.
+		action = "the VM runs on the target, and the move is finished there; the source's firmware state is kept and its marker stays released, " +
+			"which the cleanup retry does not take: the source cleanup resumes when the daemon restarts and its firmware move recovery checks the target again"
+	case errors.Is(cause, errFirmwareCleanupStateChanged):
 		action = "the VM runs on the target from the verified copy; the source's firmware state changed after the cutover, " +
 			"so it is kept and never wiped automatically, and a retry cannot heal it: an operator saves the state at the paths named " +
 			"and resolves the move with the D-5 firmware-move doctor (task D2-18); until then the marker keeps the state and vetoes its use"
@@ -173,6 +185,10 @@ func (s *Server) cleanupConditionOpenWith(ctx context.Context, vm, detail string
 	}
 	return json.Unmarshal([]byte(c.Evidence), &ev) == nil && ev.Detail == detail
 }
+
+// retainedTempNameRe is the random part of a retained bundle's temp file name
+// (os.CreateTemp's suffix); group 1 keeps the rest.
+var retainedTempNameRe = regexp.MustCompile(`(\.tar\.tmp-)[0-9]+`)
 
 // errFirmwareCleanupStateChanged: the source state, or the bundle already
 // there, is not what the cutover recorded. No retry heals it.
@@ -309,8 +325,18 @@ func retainedBundleMatches(path string, m fwmig.Marker) error {
 }
 
 // touchRetainedBundle sets the bundle's times to now, durably: the sweep
-// counts its 24 h from them.
+// counts its 24 h from them. It never moves them back: a clock behind at the
+// touch (a boot before NTP steps it) leaves the window starting at the later
+// time already there, so a clock stepped forward afterwards cannot make the
+// bundle look 24 h old minutes after the wipe (review n-3).
 func touchRetainedBundle(path string, now time.Time) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if mt := fi.ModTime(); mt.After(now) {
+		now = mt
+	}
 	if err := os.Chtimes(path, now, now); err != nil {
 		return err
 	}
@@ -487,7 +513,7 @@ func (s *Server) FirmwareRetainedSweepOnce(ctx context.Context, now time.Time) {
 		}
 		_ = syncDirPath(dir)
 		slog.Info("retained firmware sweep: removed a retained firmware bundle past its 24 h", "vm", vm, "attempt", attempt, "path", path,
-			"written", fi.ModTime().UTC().Format(time.RFC3339))
+			"since", fi.ModTime().UTC().Format(time.RFC3339))
 	}
 }
 

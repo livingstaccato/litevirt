@@ -206,3 +206,52 @@ func ListHostVMNICs(ctx context.Context, c *Client, hostName string, extraVMs ..
 	})
 	return out, nil
 }
+
+// VMNICsTouching returns every live NIC (VM, network, MAC) of every live VM
+// that has a live or tombstoned NIC row on one of networks, whatever host its
+// row names, read through the MergedVMNICs overlay. It reads only the NIC
+// tables' identity columns: no spec, no security groups.
+func VMNICsTouching(ctx context.Context, c *Client, networks []string) ([]NICRecord, error) {
+	if len(networks) == 0 {
+		return nil, nil
+	}
+	in := "?" + strings.Repeat(", ?", len(networks)-1)
+	args := make([]interface{}, 0, 2*len(networks))
+	for _, n := range networks {
+		args = append(args, n)
+	}
+	for _, n := range networks {
+		args = append(args, n)
+	}
+	vms := `SELECT v.name FROM vms v WHERE v.deleted_at IS NULL AND v.name IN (
+	            SELECT vm_name FROM vm_nics WHERE network_name IN (` + in + `)
+	            UNION SELECT vm_name FROM vm_interfaces WHERE network_name IN (` + in + `))`
+	read := func(table string) ([]NICRecord, error) {
+		rows, err := c.Query(ctx,
+			`SELECT vm_name, network_name, mac, updated_at, COALESCE(deleted_at, '') AS deleted_at
+			 FROM `+table+` WHERE vm_name IN (`+vms+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]NICRecord, len(rows))
+		for i, r := range rows {
+			out[i] = NICRecord{
+				VMName:      r.String("vm_name"),
+				NetworkName: r.String("network_name"),
+				MAC:         r.String("mac"),
+				UpdatedAt:   r.String("updated_at"),
+				DeletedAt:   r.String("deleted_at"),
+			}
+		}
+		return out, nil
+	}
+	nics, err := read("vm_nics")
+	if err != nil {
+		return nil, err
+	}
+	ifaces, err := read("vm_interfaces")
+	if err != nil {
+		return nil, err
+	}
+	return mergeNICRows(ifaces, nics), nil
+}

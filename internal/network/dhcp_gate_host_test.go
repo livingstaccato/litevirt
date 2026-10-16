@@ -72,7 +72,7 @@ var boundBridgeDef = compose.NetworkDef{
 // TestProvisionRefusalNamesTheHost.
 func TestProvisionRefusalNamesTheHost(t *testing.T) {
 	recordingExec(t)
-	startDHCPFunc = func(_, _, _, _, _, _ string) error { return nil }
+	startDHCPFunc = func(_, _, _, _, _, _ string, _ bool) error { return nil }
 	t.Cleanup(func() { startDHCPFunc = StartDHCP })
 
 	_, err := Provision(context.Background(), boundBridgeTestDB(t),
@@ -101,7 +101,7 @@ func TestProvisionRefusalNamesTheHost(t *testing.T) {
 // addresses, silently, which is exactly what the refusal exists to avoid.
 func TestARefusedProvisionCreatesNoBridgeSoARetryRefusesToo(t *testing.T) {
 	ran := recordingExec(t)
-	startDHCPFunc = func(_, _, _, _, _, _ string) error { return nil }
+	startDHCPFunc = func(_, _, _, _, _, _ string, _ bool) error { return nil }
 	t.Cleanup(func() { startDHCPFunc = StartDHCP })
 
 	db := boundBridgeTestDB(t)

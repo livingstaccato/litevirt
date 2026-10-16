@@ -2216,6 +2216,45 @@ runcmd:
   - cd /tmp/www && nohup python3 -m http.server 8080 &>/dev/null &
 `
 
+// guestReady is waitCloudInit without the failure: whether vmName runs
+// netCloudInit's user-data (its /tmp/www/index.html answers lv exec) within
+// timeout.
+func guestReady(t *testing.T, vmName string, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := lvErr(t, "exec", vmName, "test", "-f", "/tmp/www/index.html"); err == nil {
+			return true
+		}
+		time.Sleep(15 * time.Second)
+	}
+	return false
+}
+
+// rhelFamilyImageOn is the first image `lv image ls` lists on host whose
+// name names a RHEL-family distribution (Rocky, Alma, RHEL, CentOS, Oracle,
+// Fedora), or "".
+func rhelFamilyImageOn(t *testing.T, host string) string {
+	t.Helper()
+	re := regexp.MustCompile(`(?i)rocky|alma|rhel|centos|oracle|fedora`)
+	for _, line := range strings.Split(lv(t, "image", "ls"), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 || f[0] == "NAME" || !re.MatchString(f[0]) {
+			continue
+		}
+		i := strings.Index(line, "[")
+		if i < 0 {
+			continue
+		}
+		for _, h := range strings.Fields(strings.Trim(line[i:], "[] ")) {
+			if h == host {
+				return f[0]
+			}
+		}
+	}
+	return ""
+}
+
 // execRetry runs lv exec with retries for guest-agent readiness.
 func execRetry(t *testing.T, vmName string, cmd ...string) (string, error) {
 	t.Helper()
@@ -2525,6 +2564,29 @@ vms:
 		vm2Name, testImage, hostNames[1], strings.ReplaceAll(netCloudInit, "\n", "\n        "),
 		vm3Name, testImage, hostNames[0], strings.ReplaceAll(netCloudInit, "\n", "\n        "))
 
+	// A RHEL-family guest on vxnet + isonet, when such an image is on the
+	// host: the one whose cloud-init renderers drop use-routes, so the only
+	// guest on which Isolated/DefaultRoute tells the fix from main.
+	vm4Name, rhelImage := "", rhelFamilyImageOn(t, hostNames[0])
+	if rhelImage != "" {
+		vm4Name = uniqueName("nv4")
+		compose += fmt.Sprintf(`
+  %s:
+    image: %s
+    cpu: 1
+    memory: `+vmMemory()+`
+    disks:
+      root: 10G
+    network:
+      - name: vxnet
+      - name: isonet
+    placement:
+      host: %s
+    cloud-init:
+      userdata: |
+        %s`, vm4Name, rhelImage, hostNames[0], strings.ReplaceAll(netCloudInit, "\n", "\n        "))
+	}
+
 	filePath := writeComposeFile(t, stackName, compose)
 	cleanup(t, func() { composeDown(t, stackName) })
 
@@ -2535,6 +2597,13 @@ vms:
 	waitCloudInit(t, vm1Name, 3*time.Minute)
 	waitCloudInit(t, vm2Name, 3*time.Minute)
 	waitCloudInit(t, vm3Name, 3*time.Minute)
+	// vm4 is extra: one that never becomes ready (no guest agent in the
+	// image, a boot that fails) is left out of Isolated/DefaultRoute, logged,
+	// rather than failing the stack.
+	if vm4Name != "" && !guestReady(t, vm4Name, 8*time.Minute) {
+		t.Logf("RHEL-family guest %s (%s) did not become ready; Isolated/DefaultRoute checks it not", vm4Name, rhelImage)
+		vm4Name = ""
+	}
 
 	t.Run("VXLAN/InterVMPing", func(t *testing.T) {
 		vm2IP := getVMIP(t, vm2Name, stackName, "vxnet")
@@ -2588,6 +2657,45 @@ vms:
 			t.Fatalf("lv exec ping from %s failed without a ping result, so cross-host unreachability is unproven: %v\n%s", vm1Name, err, out)
 		case reached:
 			t.Errorf("ping from %s (%s) to %s (%s) on the isolated net succeeded across hosts; an isolated network does not span hosts: %s", vm1Name, hostNames[0], vm2Name, vm2IP, out)
+		}
+	})
+
+	// The isolated network's dnsmasq offers no router to a NIC of a VM that
+	// also has a NIC on a routed network: vm1 (and vm4) on vxnet + isonet
+	// take no default route through the isolated NIC. A VM whose NICs are all
+	// isolated is offered the bridge as before: vm3 keeps its default route
+	// through it. vm1's assertion holds on main too for a netplan guest
+	// (Debian, Ubuntu: the seed's use-routes: false); it tells the fix from
+	// main only on a RHEL-family guest, which vm4 is when such an image is on
+	// the host.
+	t.Run("Isolated/DefaultRoute", func(t *testing.T) {
+		defaultVia := func(vm string) (iface string, has bool, all string) {
+			iface = getVMIfaceForSubnet(t, vm, "10.201.0.")
+			out, err := execRetry(t, vm, "ip", "-4", "route", "show", "default")
+			if err != nil {
+				t.Fatalf("ip route on %s failed: %v\n%s", vm, err, out)
+			}
+			for _, line := range strings.Split(out, "\n") {
+				if strings.Contains(" "+line+" ", " dev "+iface+" ") {
+					has = true
+				}
+			}
+			return iface, has, out
+		}
+		routed := map[string]string{vm1Name: testImage}
+		if vm4Name != "" {
+			routed[vm4Name] = rhelImage
+			t.Logf("RHEL-family guest %s runs %s", vm4Name, rhelImage)
+		} else {
+			t.Logf("no RHEL-family image on %s; only %s (%s) is checked, which does not tell the fix from main on a netplan guest", hostNames[0], vm1Name, testImage)
+		}
+		for vm, img := range routed {
+			if iface, has, all := defaultVia(vm); has {
+				t.Errorf("%s (%s, vxnet + isonet) has a default route through its isolated interface %s:\n%s", vm, img, iface, all)
+			}
+		}
+		if iface, has, all := defaultVia(vm3Name); !has {
+			t.Errorf("%s (only an isolated NIC) has no default route through %s; a VM whose NICs are all isolated keeps the bridge as router:\n%s", vm3Name, iface, all)
 		}
 	})
 

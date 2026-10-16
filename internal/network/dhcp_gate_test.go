@@ -90,7 +90,7 @@ func TestDHCPWouldServeMatchesProvisioning(t *testing.T) {
 			execCommand = func(name string, args ...string) ([]byte, error) { return nil, nil }
 			defer func() { execCommand = defaultExec }()
 			started := false
-			startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string) error {
+			startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string, noRouter bool) error {
 				started = true
 				return nil
 			}
@@ -263,7 +263,7 @@ func TestProvisionRefusesDHCPOverABoundPrefix(t *testing.T) {
 	execCommand = func(name string, args ...string) ([]byte, error) { return nil, nil }
 	defer func() { execCommand = defaultExec }()
 	started := false
-	startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string) error {
+	startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string, noRouter bool) error {
 		started = true
 		return nil
 	}
@@ -299,7 +299,7 @@ func TestProvisionServesDHCPOnAnUnboundNetwork(t *testing.T) {
 	execCommand = func(name string, args ...string) ([]byte, error) { return nil, nil }
 	defer func() { execCommand = defaultExec }()
 	started := false
-	startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string) error {
+	startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string, noRouter bool) error {
 		started = true
 		return nil
 	}

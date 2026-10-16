@@ -1007,6 +1007,16 @@ type Server struct {
 	dhcpServedHere  func(bridge string) bool
 	bridgeHasUplink func(bridge string) bool
 	addDHCPHost     func(bridge, mac, ip string) error
+	// syncDHCPHosts, when set (tests), replaces network.SyncDHCPHosts.
+	syncDHCPHosts func(bridge string, hosts map[string]network.DHCPHost) (bool, error)
+	// noRouterPending: NICs of VMs whose rows are not written yet
+	// (pendingNICs), vm → MAC → network, which SyncDHCPReservations counts
+	// with the rows. Under dhcpResMu.
+	noRouterPending map[string]map[string]noRouterPendingNIC
+	// dhcpSyncMu serialises SyncDHCPReservations, so a pass that read the
+	// state before a NIC was registered never writes after one that read it
+	// after.
+	dhcpSyncMu sync.Mutex
 
 	// antiEntropy is the daemon's anti-entropy loop. TriggerAntiEntropy calls RunOnce on
 	// it so `lv cluster converge` kicks an immediate (debounced) pass instead of waiting
@@ -1560,6 +1570,12 @@ func (s *Server) SetBridgeEnsure(fn func(name string) error) { s.bridgeEnsure = 
 // write itself. A nil argument keeps the real host's answer.
 func (s *Server) SetDHCPReservationBackend(served, uplink func(bridge string) bool, add func(bridge, mac, ip string) error) {
 	s.dhcpServedHere, s.bridgeHasUplink, s.addDHCPHost = served, uplink, add
+}
+
+// SetDHCPHostsSync replaces the write of a bridge's DHCP hosts file
+// (network.SyncDHCPHosts) — a test seam.
+func (s *Server) SetDHCPHostsSync(fn func(bridge string, hosts map[string]network.DHCPHost) (bool, error)) {
+	s.syncDHCPHosts = fn
 }
 
 // SetBridgeExists injects the "does this bridge already exist here" seam (see

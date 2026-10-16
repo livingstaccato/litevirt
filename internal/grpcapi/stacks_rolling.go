@@ -634,7 +634,12 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 		}
 		if !tornDown {
 			// This delete tore nothing down (NotFound): the incarnation was
-			// ended by another, and its firewall identity with it.
+			// ended by another, and its firewall identity with it. Today
+			// deleted.snap is never set when the delete failed (a sink is
+			// filled only by a delete that answered OK:
+			// TestDeleteVM_AFailedForwardedDeleteFillsNoSink), so the branch
+			// above has already dropped it; this keeps that true if the sink
+			// ever is.
 			createCtx = withoutReplacedFirewallID(createCtx, cur.Name)
 		}
 		createCtx = s.withReplacedLUNs(createCtx, cur)

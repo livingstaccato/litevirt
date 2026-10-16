@@ -229,3 +229,117 @@ func TestMintFirewallID_AParkedPairNamesTheRemedy(t *testing.T) {
 		t.Fatalf("mint over a parked migrate: %v, want refused naming the source to remove", err)
 	}
 }
+
+// Re-review 2 N2-I1: a failover relocation whose proof and target row have
+// replicated here but whose coordinator's marker has not. The proof (its
+// coordinator is C, neither holder) explains the target's token for no pair,
+// so the source, live and unmarked, is no copy to re-mint over: the mint
+// refuses on both rows, naming the stale copy as the remedy if no relocation
+// is open, and both identities stay as they are.
+//
+// Mutation: let any visible proof explain a token — red.
+func TestMintFirewallID_ACoordinatedRelocationInFlightIsRefused(t *testing.T) {
+	f := newTagGroupFixture(t)
+	ctx := context.Background()
+	f.c.SetRepointReady(func(context.Context) bool { return true })
+	f.moveCT("node-1", "rel", tgID(1), "running", "", "")
+	f.moveCT("node-2", "rel", tgID(1), "stopped", "", "tok-r")
+	f.relocationProof("p-r", "rel", "node-2", "node-3", "tok-r", ProofCompleted, false)
+	for _, host := range []string{"node-1", "node-2"} {
+		_, _, err := MintFirewallID(ctx, f.c, mintGrant(t), TagMemberCT, host, "rel")
+		if !errors.Is(err, ErrFirewallIDMoveOpen) || !strings.Contains(err.Error(), "remove the stale container rel on node-1") {
+			t.Fatalf("mint on %s mid-relocation: %v, want refused naming the stale copy on node-1", host, err)
+		}
+	}
+	for _, host := range []string{"node-1", "node-2"} {
+		if got := firewallIDOf(TagMemberCT, storedCreateSpec(t, f.c, host, "rel")); got != tgID(1) {
+			t.Fatalf("a refused mint changed %s's identity to %q", host, got)
+		}
+	}
+}
+
+// Re-review 2 m-4: a token no proof will ever explain (a pre-gate
+// relocation) beside a copy: the refusal names the real remedy, not a retry
+// alone.
+func TestMintFirewallID_AProoflessTokenNamesTheRemedy(t *testing.T) {
+	f := newTagGroupFixture(t)
+	f.c.SetRepointReady(func(context.Context) bool { return true })
+	f.moveCT("node-1", "old", tgID(1), "running", "", "")
+	f.moveCT("node-2", "old", tgID(1), "running", "", "tok-pregate")
+	_, _, err := MintFirewallID(context.Background(), f.c, mintGrant(t), TagMemberCT, "node-2", "old")
+	if !errors.Is(err, ErrFirewallIDMoveOpen) || !strings.Contains(err.Error(), "if no move is open, remove the stale container old on node-1") {
+		t.Fatalf("mint beside a proofless token: %v, want the stale copy named", err)
+	}
+}
+
+// Re-review 2 m-3 and m-5: a relocation marker wins over an older proof in
+// the other direction (the container's earlier migrate), so the mint says
+// "retry after it completes", not "remove a row"; and a failed proof is not
+// a landed move.
+func TestMintFirewallID_AMarkerBeatsAReverseProofAndAFailedProofIsNotLanded(t *testing.T) {
+	f := newTagGroupFixture(t)
+	ctx := context.Background()
+	f.c.SetRepointReady(func(context.Context) bool { return true })
+	// Earlier: migrated node-2 -> node-1 (A carries tok-old). Now: node-1
+	// fails, and C relocates it back to node-2 under tok-new.
+	f.moveCT("node-1", "fo", tgID(1), "relocating", RelocateRestoreDetail("node-2", "tok-new"), "tok-old")
+	f.moveCT("node-2", "fo", tgID(1), "stopped", "", "tok-new")
+	f.relocationProof("p-old", "fo", "node-1", "node-2", "tok-old", ProofCompleted, true)
+	_, _, err := MintFirewallID(ctx, f.c, mintGrant(t), TagMemberCT, "node-2", "fo")
+	if !errors.Is(err, ErrFirewallIDMoveOpen) || !strings.Contains(err.Error(), "relocation of container fo from node-1 to node-2") ||
+		!strings.Contains(err.Error(), "retry after it completes") || strings.Contains(err.Error(), "remove") {
+		t.Fatalf("mint mid-relocation over an older reverse proof: %v", err)
+	}
+	f.moveCT("node-1", "bad", tgID(2), "stopped", "operator-stop", "")
+	f.moveCT("node-2", "bad", tgID(2), "running", "", "tok-f")
+	f.relocationProof("p-f", "bad", "node-2", "node-1", "tok-f", ProofFailed, false)
+	_, _, err = MintFirewallID(ctx, f.c, mintGrant(t), TagMemberCT, "node-2", "bad")
+	if !errors.Is(err, ErrFirewallIDMoveOpen) || strings.Contains(err.Error(), "landed") {
+		t.Fatalf("mint over a failed move: %v, want refused without calling it landed", err)
+	}
+}
+
+// Re-review 2 m-1 and m-2: the members query.
+//   - Two wall-clock proofs within the replication skew limit do not say
+//     which is newer: held.
+//   - A running row is never the side left out: after there-and-back with
+//     the source started again, both are held, and so are a pair that both
+//     run.
+//   - A marker beats an older reverse proof (m-3): its target is the member.
+//
+// Mutation: drop the skew window — "skew" is resolved: red. Leave out a
+// running row — "restarted" is resolved: red.
+func TestTagGroupMembers_SkewAndRunningRowsAreHeld(t *testing.T) {
+	f := newTagGroupFixture(t)
+	f.group("web", FirewallTagGroupDef{Match: map[string]string{"role": "web"}})
+	for i := 1; i <= 4; i++ {
+		f.tags(TagMemberCT, tgID(i), `{"tags":{"role":"web"}}`)
+	}
+	f.moveCT("node-1", "skew", tgID(1), "stopped", "", "tok-2")
+	f.moveCT("node-2", "skew", tgID(1), "stopped", "operator-stop", "tok-1")
+	f.relocationProofAt("s1", "skew", "node-2", "node-1", "tok-1", ProofCompleted, true, "2026-10-15T10:00:00Z")
+	f.relocationProofAt("s2", "skew", "node-1", "node-2", "tok-2", ProofCompleted, false, "2026-10-15T10:01:00Z")
+	// There and back, the parked source on node-2 started again; the
+	// target on node-1 is stopped.
+	f.moveCT("node-1", "restarted", tgID(2), "stopped", "", "tok-b")
+	f.moveCT("node-2", "restarted", tgID(2), "running", "", "tok-a")
+	f.relocationProofAt("ra", "restarted", "node-2", "node-1", "tok-a", ProofCompleted, true, "2026-10-01T00:00:00Z")
+	f.relocationProofAt("rb", "restarted", "node-1", "node-2", "tok-b", ProofCompleted, false, "2026-10-14T00:00:00Z")
+	// Both run.
+	f.moveCT("node-1", "both", tgID(3), "running", "", "")
+	f.moveCT("node-2", "both", tgID(3), "running", "", "tok-x")
+	f.relocationProof("px", "both", "node-2", "node-1", "tok-x", ProofCompleted, false)
+	// A relocation marker over an older reverse proof.
+	f.moveCT("node-1", "fo", tgID(4), "relocating", RelocateRestoreDetail("node-2", "tok-new"), "tok-old")
+	f.moveCT("node-2", "fo", tgID(4), "stopped", "", "tok-new")
+	f.relocationProofAt("p-old", "fo", "node-1", "node-2", "tok-old", ProofCompleted, true, "2026-10-01T00:00:00Z")
+
+	m := f.members()
+	want := []string{"node-1/both", "node-1/restarted", "node-1/skew", "node-2/both", "node-2/restarted", "node-2/skew"}
+	if got := sharedNames(m); !slices.Equal(got, want) {
+		t.Fatalf("held at drop: %v, want %v", got, want)
+	}
+	if got := m.viewFor(t, "web").memberNames(); !slices.Equal(got, []string{"ct:node-2:fo"}) {
+		t.Fatalf("members %v, want the relocation's target", got)
+	}
+}

@@ -264,7 +264,7 @@ func (s *Server) DeleteNetwork(ctx context.Context, req *pb.DeleteNetworkRequest
 			what = "unknown: " + err.Error()
 		}
 		auditDetail = fmt.Sprintf("teardown on %s waits until nothing there uses it (in use by %s)", s.hostName, what)
-	} else if err := s.networkProvisioner().Deprovision(ctx, s.db, req.Name, def, s.hostName); err != nil {
+	} else if err := s.deprovisionDevice(ctx, req.Name, def); err != nil {
 		slog.Warn("network deprovision failed", "network", req.Name, "error", err)
 	}
 	s.reconcileFirewall(ctx) // drop this network's NAT/isolation from the ruleset now
@@ -469,7 +469,7 @@ func (s *Server) deprovisionNetworkByName(ctx context.Context, name string) erro
 	if what, err := s.networkUseHere(ctx, name, network.BridgeName(name, def)); err != nil || what != "" {
 		slog.Warn("stack network deleted; its teardown on this host waits until nothing here uses it",
 			"network", name, "in_use_by", what, "error", err)
-	} else if err := s.networkProvisioner().Deprovision(ctx, s.db, name, def, s.hostName); err != nil {
+	} else if err := s.deprovisionDevice(ctx, name, def); err != nil {
 		return err
 	}
 	s.reconcileFirewall(ctx) // drop this network's NAT/isolation from the ruleset now

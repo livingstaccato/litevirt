@@ -209,6 +209,10 @@ func TestStep0Gates_PeerOnly(t *testing.T) {
 		_, err := s.SyncVTEP(ctx, &pb.SyncVTEPRequest{Vni: 100, VtepIp: "10.0.0.9"})
 		return err
 	})
+	deniedForNonPeer(t, "AnnounceMigratedGuest", func(ctx context.Context) error {
+		_, err := s.AnnounceMigratedGuest(ctx, &pb.AnnounceMigratedGuestRequest{VmName: "x"})
+		return err
+	})
 	deniedForNonPeer(t, "UpdateFDB", func(ctx context.Context) error {
 		_, err := s.UpdateFDB(ctx, &pb.UpdateFDBRequest{Vni: 100})
 		return err

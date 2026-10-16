@@ -3561,6 +3561,10 @@ message ProvisionNetworkRequest {
 }
 
 // ── Internal: Migration helpers ──
+message AnnounceMigratedGuestRequest {
+    string vm_name = 1;
+}
+
 message EnsureCloudInitRequest {
     string vm_name       = 1;
     string userdata      = 2;
@@ -3598,6 +3602,10 @@ message EnsureDisksRequest {
     // The target answers nic_mtu_problem for any NIC whose bridge there has a
     // different MTU.
     repeated NICMTUExpectation nic_mtu = 9;
+    // want_network_devices asks for network_devices in the response: a live
+    // migration of a VM with a NIC on a managed network lands each such NIC on
+    // the device this host serves the network on.
+    bool want_network_devices = 10;
 }
 
 // NICMTUExpectation is one NIC's resolved MTU on the source and the network
@@ -3655,6 +3663,12 @@ message EnsureDisksResponse {
     // nic_mtu_problem names the NICs of the request's nic_mtu whose bridge on
     // this host has a different MTU. Empty when every one matches.
     string nic_mtu_problem = 8;
+    // network_devices: for want_network_devices, each managed network the
+    // VM has a NIC on → the device this host serves it on now (the one it
+    // was last provisioned on here; for a network whose move this host has
+    // refused, still the previous one). An older target never sets it, and
+    // the source then migrates the domain's NICs as they are.
+    map<string, string> network_devices = 9;
 }
 
 // EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle
@@ -4715,6 +4729,9 @@ service LiteVirt {
     // being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
     rpc ReceiveMigrationDisk(stream ReceiveMigrationDiskRequest) returns (ReceiveMigrationDiskResponse);
     rpc CheckCPUCompatibility(CheckCPUCompatibilityRequest) returns (CheckCPUCompatibilityResponse);
+    // Peer only: a live migration of vm_name to this host has completed;
+    // announce the gateway of each of its networks from this host's bridge.
+    rpc AnnounceMigratedGuest(AnnounceMigratedGuestRequest) returns (google.protobuf.Empty);
 
     // ── Internal: State Sync ──
     rpc GetStateDigest(google.protobuf.Empty)      returns (StateDigestResponse);

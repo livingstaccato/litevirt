@@ -550,6 +550,12 @@ type Server struct {
 	vtepRefused   map[string]string
 	// netReconcile is what ReconcileNetworksOnce has done on this host.
 	netReconcile netReconcileState
+	// netDevs is the definition each network was last provisioned with here
+	// (provisionDevice).
+	netDevs provisionedDevices
+	// gatewayAnnouncer announces a gateway after a live migration lands here
+	// (SetGatewayAnnouncer); nil = network.AnnounceGateway.
+	gatewayAnnouncer GatewayAnnouncer
 
 	// leftoverBridgeWarned holds the bridge names whose leftover-removal failure
 	// was already logged, so the 30s reconcile pass does not repeat it.

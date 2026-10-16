@@ -246,3 +246,22 @@ action: restart
 		t.Errorf("Action = %q", h.Action)
 	}
 }
+
+// A declared network with no interface takes its own name as written; one
+// with an interface keeps it, and an external network is not touched.
+//
+// Mutation: default to ScopedNetworkName(f.Name, name) — "lan" goes red.
+func TestDefaultNetworkInterfaces(t *testing.T) {
+	f := &File{Name: "st", Networks: map[string]NetworkDef{
+		"lan": {Type: "bridge"},
+		"iso": {Type: "isolated"},
+		"set": {Type: "bridge", Interface: "br7"},
+		"ext": {External: true},
+	}}
+	f.DefaultNetworkInterfaces()
+	for name, want := range map[string]string{"lan": "lan", "iso": "iso", "set": "br7", "ext": ""} {
+		if got := f.Networks[name].Interface; got != want {
+			t.Errorf("network %s: interface %q, want %q", name, got, want)
+		}
+	}
+}

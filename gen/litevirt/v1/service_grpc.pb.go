@@ -284,6 +284,7 @@ const (
 	LiteVirt_CleanupMigrationArtifacts_FullMethodName  = "/litevirt.v1.LiteVirt/CleanupMigrationArtifacts"
 	LiteVirt_ReceiveMigrationDisk_FullMethodName       = "/litevirt.v1.LiteVirt/ReceiveMigrationDisk"
 	LiteVirt_CheckCPUCompatibility_FullMethodName      = "/litevirt.v1.LiteVirt/CheckCPUCompatibility"
+	LiteVirt_AnnounceMigratedGuest_FullMethodName      = "/litevirt.v1.LiteVirt/AnnounceMigratedGuest"
 	LiteVirt_GetStateDigest_FullMethodName             = "/litevirt.v1.LiteVirt/GetStateDigest"
 	LiteVirt_AcknowledgeLeaseTermTie_FullMethodName    = "/litevirt.v1.LiteVirt/AcknowledgeLeaseTermTie"
 	LiteVirt_GetLeaseTermHighWater_FullMethodName      = "/litevirt.v1.LiteVirt/GetLeaseTermHighWater"
@@ -805,6 +806,9 @@ type LiteVirtClient interface {
 	// being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
 	ReceiveMigrationDisk(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse], error)
 	CheckCPUCompatibility(ctx context.Context, in *CheckCPUCompatibilityRequest, opts ...grpc.CallOption) (*CheckCPUCompatibilityResponse, error)
+	// Peer only: a live migration of vm_name to this host has completed;
+	// announce the gateway of each of its networks from this host's bridge.
+	AnnounceMigratedGuest(ctx context.Context, in *AnnounceMigratedGuestRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// ── Internal: State Sync ──
 	GetStateDigest(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDigestResponse, error)
 	// AcknowledgeLeaseTermTie records that an operator has seen a contested
@@ -3998,6 +4002,16 @@ func (c *liteVirtClient) CheckCPUCompatibility(ctx context.Context, in *CheckCPU
 	return out, nil
 }
 
+func (c *liteVirtClient) AnnounceMigratedGuest(ctx context.Context, in *AnnounceMigratedGuestRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_AnnounceMigratedGuest_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) GetStateDigest(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDigestResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StateDigestResponse)
@@ -5303,6 +5317,9 @@ type LiteVirtServer interface {
 	// being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
 	ReceiveMigrationDisk(grpc.ClientStreamingServer[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse]) error
 	CheckCPUCompatibility(context.Context, *CheckCPUCompatibilityRequest) (*CheckCPUCompatibilityResponse, error)
+	// Peer only: a live migration of vm_name to this host has completed;
+	// announce the gateway of each of its networks from this host's bridge.
+	AnnounceMigratedGuest(context.Context, *AnnounceMigratedGuestRequest) (*emptypb.Empty, error)
 	// ── Internal: State Sync ──
 	GetStateDigest(context.Context, *emptypb.Empty) (*StateDigestResponse, error)
 	// AcknowledgeLeaseTermTie records that an operator has seen a contested
@@ -6404,6 +6421,9 @@ func (UnimplementedLiteVirtServer) ReceiveMigrationDisk(grpc.ClientStreamingServ
 }
 func (UnimplementedLiteVirtServer) CheckCPUCompatibility(context.Context, *CheckCPUCompatibilityRequest) (*CheckCPUCompatibilityResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckCPUCompatibility not implemented")
+}
+func (UnimplementedLiteVirtServer) AnnounceMigratedGuest(context.Context, *AnnounceMigratedGuestRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method AnnounceMigratedGuest not implemented")
 }
 func (UnimplementedLiteVirtServer) GetStateDigest(context.Context, *emptypb.Empty) (*StateDigestResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetStateDigest not implemented")
@@ -11122,6 +11142,24 @@ func _LiteVirt_CheckCPUCompatibility_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_AnnounceMigratedGuest_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AnnounceMigratedGuestRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).AnnounceMigratedGuest(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_AnnounceMigratedGuest_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).AnnounceMigratedGuest(ctx, req.(*AnnounceMigratedGuestRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_GetStateDigest_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(emptypb.Empty)
 	if err := dec(in); err != nil {
@@ -13399,6 +13437,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CheckCPUCompatibility",
 			Handler:    _LiteVirt_CheckCPUCompatibility_Handler,
+		},
+		{
+			MethodName: "AnnounceMigratedGuest",
+			Handler:    _LiteVirt_AnnounceMigratedGuest_Handler,
 		},
 		{
 			MethodName: "GetStateDigest",

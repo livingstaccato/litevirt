@@ -1632,6 +1632,19 @@ func (f *Fake) SetNICBridge(domainName, mac, bridge string) error {
 	return nil
 }
 
+// SetNICBridgeConfig retargets the NIC in the persistent definition only.
+func (f *Fake) SetNICBridgeConfig(domainName, mac, bridge string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	x, ok := libvirt.RetargetDomainXML(f.xml[domainName], mac, bridge)
+	if !ok {
+		return fmt.Errorf("domain %s has no bridge interface with MAC %s", domainName, mac)
+	}
+	f.xml[domainName] = x
+	f.record("set-nic-bridge-config", domainName, fmt.Sprintf("mac=%s bridge=%s", mac, bridge))
+	return nil
+}
+
 // nicMacInDomainXML reports whether a domain XML carries an <interface> with the
 // given MAC address (case-insensitive — real libvirt normalizes MAC case, and
 // callers may supply either). Mirrors grpcapi.nicMacInXML — the substring the
@@ -1976,14 +1989,22 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 		sort.Strings(names)
 		note += " rbd=" + strings.Join(names, ",")
 	}
+	if len(p.NICBridges) > 0 {
+		var pairs []string
+		for mac, b := range p.NICBridges {
+			pairs = append(pairs, mac+"->"+b)
+		}
+		sort.Strings(pairs)
+		note += " nic_bridges=" + strings.Join(pairs, ",")
+	}
 	f.record("migrate", name, note)
 	// The destination and persistent definitions libvirt.Client.MigrateToTarget
 	// would hand libvirt (from the secure migratable XML), so a hook can land
 	// exactly those. Empty: libvirt carries the domain as it is. Only for a
-	// move that strips the VNC password: the other rewrites resolve against
-	// the host (rbd monitors, the cgroup scale).
-	if p.DestXML == "" && p.StripVNCPassword {
-		dest, persist, err := libvirt.MigrationDefinitionsFor(libvirt.MigrateParams{StripVNCPassword: true},
+	// move that strips the VNC password or moves NICs: the other rewrites
+	// resolve against the host (rbd monitors, the cgroup scale).
+	if p.DestXML == "" && (p.StripVNCPassword || len(p.NICBridges) > 0) {
+		dest, persist, err := libvirt.MigrationDefinitionsFor(libvirt.MigrateParams{StripVNCPassword: p.StripVNCPassword, NICBridges: p.NICBridges},
 			f.liveXMLLocked(name), f.xml[name])
 		if err != nil {
 			return err

@@ -95,6 +95,8 @@ func TestProtoNumbers_OpsBundle(t *testing.T) {
 		{&pb.NICMTUExpectation{}, 2, "mtu"},
 		{&pb.NICMTUExpectation{}, 3, "ordinal"},
 		{&pb.EnsureDisksResponse{}, 8, "nic_mtu_problem"},
+		{&pb.EnsureDisksRequest{}, 10, "want_network_devices"},
+		{&pb.EnsureDisksResponse{}, 9, "network_devices"},
 		{&pb.SetHAPolicyRequest{}, 1, "state"},
 		{&pb.SetHAPolicyRequest{}, 2, "reason"},
 		{&pb.SetHAPolicyRequest{}, 3, "fence_down_hosts"},

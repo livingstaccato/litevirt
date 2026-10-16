@@ -1256,6 +1256,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// adoption-gate + PCI-start-preflight. A strict no-op until hardware_v2 latches, so
 	// this changes nothing on a fleet where the feature is off.
 	vmChecker.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
+	// A health restart moves a stopped VM's NICs onto the devices their
+	// networks are on now, as a start through the Server does.
+	vmChecker.SetNetworkFollower(svc.FollowNetworkDevices)
 	vmChecker.SetCancelledStartProbe(svc.HasCancelledStart) // cancelled_starts.go: neither healed to running nor restarted
 
 	// Wire reconciler callbacks now that gRPC server exists.
@@ -2781,6 +2784,7 @@ func (d *Daemon) newServer() *grpcapi.Server {
 // wireServer is newServer's wiring, on a server already built.
 func (d *Daemon) wireServer(svc *grpcapi.Server) {
 	svc.SetHostAddress(d.hostAddress())
+	svc.SetNetworkDeviceStatePath(grpcapi.DefaultNetworkDeviceStatePath)
 	// Release features (capabilities.Feature) open through the checker's
 	// WithFeature: the release token's latch plus the replicated used bit.
 	svc.SetReleaseFeatureGate(d.checker)

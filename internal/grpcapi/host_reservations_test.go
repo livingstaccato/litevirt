@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/encoding/protojson"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -292,38 +294,109 @@ func TestInspectHost_RedactsUnreadableVM(t *testing.T) {
 	}
 }
 
-// A reservation that cannot be read does not take the rest of the host with
-// it: InspectHost returns the host, and reservations_error names the operation
-// and why, in place of totals that would read as zero.
+// seedUnreadableReservations adds two reservations that cannot be read: op-bad,
+// whose vector does not decode (so its target is unknown), and op-mismatch, a
+// test-host reservation whose vector names project "beta" under an operation
+// of project "alpha"; and op-mismatch-far, the same shape targeting another
+// host.
+func seedUnreadableReservations(t *testing.T, s *Server) {
+	t.Helper()
+	ctx := context.Background()
+	steps := map[int64][]string{1: {corrosion.OpStepReserved}}
+	resOp(t, s, "op-bad", corrosion.OpResourceUpdateRunning, "vm", "vm-leak", "ResizeVMLive", 1,
+		corrosion.ReservationVector{TargetHost: s.hostName, TargetMemMiB: 8}, resAgo(time.Hour), steps)
+	resOp(t, s, "op-mismatch", corrosion.OpResourceUpdateRunning, "vm", "vm-leak", "ResizeVMLive", 1,
+		corrosion.ReservationVector{TargetHost: s.hostName, TargetMemMiB: 8, Project: "beta"}, resAgo(time.Hour), steps)
+	resOp(t, s, "op-mismatch-far", corrosion.OpResourceUpdateRunning, "vm", "vm-leak", "ResizeVMLive", 1,
+		corrosion.ReservationVector{TargetHost: "other-host", TargetMemMiB: 8, Project: "beta"}, resAgo(time.Hour), steps)
+	for _, q := range []string{
+		`UPDATE operations SET reservation_json = '{not json' WHERE id = 'op-bad'`,
+		`UPDATE operations SET project = 'alpha' WHERE id IN ('op-mismatch', 'op-mismatch-far')`,
+	} {
+		if err := s.db.Execute(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A reservation that cannot be read does not take the rest of the host, or the
+// other reservations, with it: InspectHost lists every readable reservation,
+// names the unreadable ones in reservations_error, and marks the totals
+// partial.
 func TestInspectHost_UnreadableReservationReturnsTheHost(t *testing.T) {
 	s := testServer(t)
 	seedHostReservations(t, s)
-	resOp(t, s, "op-bad", corrosion.OpResourceUpdateRunning, "vm", "vm-leak", "ResizeVMLive", 1,
-		corrosion.ReservationVector{TargetHost: "other-host", TargetMemMiB: 8}, resAgo(time.Hour),
-		map[int64][]string{1: {corrosion.OpStepReserved}})
-	if err := s.db.Execute(context.Background(),
-		`UPDATE operations SET reservation_json = '{not json' WHERE id = 'op-bad'`); err != nil {
-		t.Fatal(err)
-	}
+	seedUnreadableReservations(t, s)
 	if err := s.db.Execute(context.Background(),
 		`UPDATE hosts SET fence_strategy = 'ipmi' WHERE name = ?`, s.hostName); err != nil {
 		t.Fatal(err)
 	}
+	if _, _, err := corrosion.HostReserved(context.Background(), s.db, s.hostName); err == nil {
+		t.Fatal("seed: HostReserved accepted the unreadable reservations; admission must still refuse them")
+	}
 
 	h, err := s.InspectHost(adminCtx(), &pb.InspectHostRequest{Name: s.hostName})
 	if err != nil {
-		t.Fatalf("InspectHost with one unreadable reservation: %v, want the host", err)
+		t.Fatalf("InspectHost with unreadable reservations: %v, want the host", err)
 	}
 	if h.GetName() != s.hostName || h.GetFenceStrategy() != "ipmi" || h.GetCpuTotal() != 8 {
 		t.Fatalf("host facts missing: name %q fence %q cpu_total %d", h.GetName(), h.GetFenceStrategy(), h.GetCpuTotal())
 	}
 	e := h.GetReservationsError()
-	if !strings.Contains(e, "op-bad") || !strings.Contains(e, "invalid character") {
-		t.Fatalf("reservations_error = %q, want the operation id and the decode error", e)
+	for _, want := range []string{"op-bad", "invalid character", "op-mismatch", "does not match"} {
+		if !strings.Contains(e, want) {
+			t.Fatalf("reservations_error = %q, want %q (a cluster-wide reader sees the detail)", e, want)
+		}
 	}
-	if len(h.GetReservations()) != 0 || h.GetReservedCpu() != 0 || h.GetReservedMemMib() != 0 {
-		t.Fatalf("with reservations_error set, rows %d totals %d/%d, want none",
-			len(h.GetReservations()), h.GetReservedCpu(), h.GetReservedMemMib())
+	if strings.Contains(e, "op-mismatch-far") {
+		t.Fatalf("reservations_error = %q names a reservation targeting another host", e)
+	}
+	if !h.GetReservationsPartial() {
+		t.Fatal("reservations_partial = false with reservations_error set")
+	}
+	got := reservationsByOp(h)
+	if len(got) != 11 || got["op-bad"] != nil || got["op-mismatch"] != nil {
+		t.Fatalf("listed %d rows %v, want the 11 readable ones and no unreadable one", len(got), got)
+	}
+	var cpu, mem int32
+	for _, r := range h.GetReservations() {
+		cpu += r.GetVcpu()
+		mem += r.GetMemoryMib()
+	}
+	if cpu == 0 || cpu != h.GetReservedCpu() || mem != h.GetReservedMemMib() {
+		t.Fatalf("partial totals %d/%d, readable rows sum to %d/%d", h.GetReservedCpu(), h.GetReservedMemMib(), cpu, mem)
+	}
+}
+
+// reservations_error never names a project to a caller who may not read it:
+// such a caller sees each unreadable operation's id and a fixed reason.
+func TestInspectHost_UnreadableReservationNamesNoProject(t *testing.T) {
+	s := testServer(t)
+	seedHostReservations(t, s)
+	seedUnreadableReservations(t, s)
+	other := boundAtCtx(t, s, "vic", "viewer", "Viewer", "/projects/other")
+
+	h, err := s.InspectHost(other, &pb.InspectHostRequest{Name: s.hostName})
+	if err != nil {
+		t.Fatalf("InspectHost: %v", err)
+	}
+	b, err := protojson.Marshal(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leak := range []string{"alpha", "beta", "acme", "invalid character"} {
+		if strings.Contains(string(b), leak) {
+			t.Errorf("viewer at /projects/other: response names %q: %s", leak, h.GetReservationsError())
+		}
+	}
+	e := h.GetReservationsError()
+	for _, want := range []string{"op-bad", "op-mismatch", "reservation data unreadable"} {
+		if !strings.Contains(e, want) {
+			t.Errorf("reservations_error = %q, want %q", e, want)
+		}
+	}
+	if !h.GetReservationsPartial() {
+		t.Error("reservations_partial = false with reservations_error set")
 	}
 }
 

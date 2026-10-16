@@ -120,6 +120,7 @@ func (s *Server) InspectHost(ctx context.Context, req *pb.InspectHostRequest) (*
 		ReservedCpu:         reservedCPU,
 		ReservedMemMib:      reservedMem,
 		ReservationsError:   reservationsErr,
+		ReservationsPartial: reservationsErr != "",
 	}, nil
 }
 

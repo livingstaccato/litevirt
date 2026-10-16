@@ -527,3 +527,52 @@ func TestHostReservations_OrdersByInstant(t *testing.T) {
 		t.Fatalf("HostReservations order = %v, want [c-sec b-nano a-bad]", got)
 	}
 }
+
+// HostReservationsPartial lists around reservations whose data cannot be read
+// and names them, while admission's scan (HostReserved) and HostReservations
+// still refuse them.
+func TestHostReservationsPartial_ListsAroundUnreadableRows(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	invVM(t, c, "vm1", 1, agoNano(48*time.Hour), "")
+	invOp(t, c, "good", OpResourceUpdateRunning, "vm", "vm1", "ResizeVMLive", 0, leakVector, ago(time.Hour), leakSteps())
+	steps := map[int64][]string{1: {OpStepReserved}}
+	invOp(t, c, "undecodable", OpResourceUpdateRunning, "vm", "vm1", "ResizeVMLive", 1,
+		ReservationVector{TargetHost: "h1", TargetMemMiB: 8}, ago(time.Hour), steps)
+	invOp(t, c, "mismatch-h1", OpResourceUpdateRunning, "vm", "vm1", "ResizeVMLive", 1,
+		ReservationVector{TargetHost: "h1", TargetMemMiB: 8, Project: "beta"}, ago(time.Hour), steps)
+	invOp(t, c, "mismatch-h2", OpResourceUpdateRunning, "vm", "vm1", "ResizeVMLive", 1,
+		ReservationVector{TargetHost: "h2", TargetMemMiB: 8, Project: "beta"}, ago(time.Hour), steps)
+	for _, q := range []string{
+		`UPDATE operations SET reservation_json = '{not json' WHERE id = 'undecodable'`,
+		`UPDATE operations SET project = 'alpha' WHERE id IN ('mismatch-h1', 'mismatch-h2')`,
+	} {
+		if err := c.Execute(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, _, err := HostReserved(ctx, c, "h1"); err == nil {
+		t.Fatal("HostReserved accepted unreadable reservations; admission must refuse them")
+	}
+	if _, err := HostReservations(ctx, c, "h1"); err == nil {
+		t.Fatal("HostReservations accepted unreadable reservations")
+	}
+	views, bad, err := HostReservationsPartial(ctx, c, "h1")
+	if err != nil {
+		t.Fatalf("HostReservationsPartial: %v", err)
+	}
+	if len(views) != 1 || views[0].Op.ID != "good" {
+		t.Fatalf("partial views = %d, want only the readable reservation", len(views))
+	}
+	var ids []string
+	for _, b := range bad {
+		ids = append(ids, b.OperationID)
+		if b.Err == nil || !strings.Contains(b.Err.Error(), b.OperationID) {
+			t.Errorf("unreadable %s: err %v, want one naming the operation", b.OperationID, b.Err)
+		}
+	}
+	if strings.Join(ids, ",") != "mismatch-h1,undecodable" {
+		t.Fatalf("unreadable on h1 = %v, want [mismatch-h1 undecodable] (an undecodable target is reported everywhere; mismatch-h2 targets h2)", ids)
+	}
+}

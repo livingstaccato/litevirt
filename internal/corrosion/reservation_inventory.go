@@ -117,10 +117,30 @@ var reservationManifestKinds = map[OperationKind]bool{
 // scan behind HostReserved and admission — so the listed vectors sum to what
 // admission subtracts.
 func HostReservations(ctx context.Context, c *Client, host string) ([]HostReservationView, error) {
-	byID, admitted, err := nonterminalReservationsByID(ctx, c)
+	views, _, err := hostReservations(ctx, c, host, false)
+	return views, err
+}
+
+// HostReservationsPartial is HostReservations for a reader that must not lose
+// every row to one bad one: an operation whose reservation data cannot be read
+// is left out of the views and returned in unreadable, when it targets host or
+// its target cannot be decoded. A query error still fails it.
+func HostReservationsPartial(ctx context.Context, c *Client, host string) ([]HostReservationView, []UnreadableReservation, error) {
+	return hostReservations(ctx, c, host, true)
+}
+
+func hostReservations(ctx context.Context, c *Client, host string, tolerate bool) ([]HostReservationView, []UnreadableReservation, error) {
+	byID, admitted, bad, err := nonterminalReservationsScan(ctx, c, tolerate)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	var unreadable []UnreadableReservation
+	for _, b := range bad {
+		if host == "" || b.TargetHost == "" || b.TargetHost == host {
+			unreadable = append(unreadable, b)
+		}
+	}
+	sort.Slice(unreadable, func(i, j int) bool { return unreadable[i].OperationID < unreadable[j].OperationID })
 	now := time.Now()
 	out := make([]HostReservationView, 0, len(byID))
 	for id, rv := range byID {
@@ -129,7 +149,7 @@ func HostReservations(ctx context.Context, c *Client, host string) ([]HostReserv
 		}
 		v, err := loadReservationView(ctx, c, id, rv, admitted[id], now)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if v != nil {
 			out = append(out, *v)
@@ -149,7 +169,7 @@ func HostReservations(ctx context.Context, c *Client, host string) ([]HostReserv
 		}
 		return out[i].Op.ID < out[j].Op.ID
 	})
-	return out, nil
+	return out, unreadable, nil
 }
 
 // ClassifyReservation classifies one operation's reservation. It returns nil

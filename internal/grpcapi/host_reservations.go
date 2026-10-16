@@ -24,13 +24,34 @@ const redactedVMName = `"<redacted>"`
 // the caller may vm.read that workload; the amounts, operation id and state
 // are always shown, so the rows add up to the totals for any viewer.
 //
-// When the reservations cannot be listed it returns no rows and a non-empty
-// errText naming why, and the caller still returns the rest of the host.
+// A reservation whose data cannot be read is left out and named in errText,
+// and the totals then cover only the listed rows; when nothing can be listed,
+// errText says so and there are no rows. Either way the caller still returns
+// the rest of the host. errText carries an error's own words only for a
+// caller who may vm.read cluster-wide, since they can name projects; anyone
+// else sees the operation ids and a fixed reason, and the daemon log has the
+// detail.
 func (s *Server) hostReservations(ctx context.Context, host string) (rows []*pb.HostReservation, cpu, mem int32, errText string) {
-	views, err := corrosion.HostReservations(ctx, s.db, host)
+	detailed := s.RequirePerm(ctx, "/", "vm.read", "viewer") == nil
+	views, unreadable, err := corrosion.HostReservationsPartial(ctx, s.db, host)
 	if err != nil {
 		slog.Error("list host reservations", "host", host, "err", err)
-		return nil, 0, 0, err.Error()
+		if detailed {
+			return nil, 0, 0, "reservations could not be listed: " + err.Error()
+		}
+		return nil, 0, 0, "reservations could not be listed; see the daemon log"
+	}
+	if len(unreadable) != 0 {
+		parts := make([]string, 0, len(unreadable))
+		for _, u := range unreadable {
+			slog.Warn("host reservation unreadable", "host", host, "op", u.OperationID, "err", u.Err)
+			if detailed {
+				parts = append(parts, u.Err.Error())
+			} else {
+				parts = append(parts, "reservation "+u.OperationID+": reservation data unreadable")
+			}
+		}
+		errText = fmt.Sprintf("%d reservation(s) could not be read: %s", len(unreadable), strings.Join(parts, "; "))
 	}
 	var sumCPU, sumMem int64
 	for i := range views {
@@ -71,7 +92,7 @@ func (s *Server) hostReservations(ctx context.Context, host string) (rows []*pb.
 		}
 		out = append(out, r)
 	}
-	return out, int32(sumCPU), int32(sumMem), ""
+	return out, int32(sumCPU), int32(sumMem), errText
 }
 
 // hostReservationState is the state `lv host inspect` shows for a reservation

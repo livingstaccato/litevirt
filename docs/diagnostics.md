@@ -31,10 +31,13 @@ capacity until it is released.
 
 `lv host inspect <host>` lists them under `reservations`, and reports their sum
 as `reservedCpu` and `reservedMemMib`: the figures admission subtracts from the
-host's free capacity. When they cannot be listed, the rest of the host is still
-shown, `reservationsError` names the operation whose reservation could not be
-read and why, and `lv host inspect` prints it as a warning on stderr; the
-reserved figures are then unknown, not zero. Each row carries the operation id, the RPC that made it
+host's free capacity. A reservation whose data cannot be read is left out of
+the list and named in `reservationsError`, and `reservationsPartial` is then
+true: the reserved figures count only the listed reservations. `lv host inspect`
+prints it as a warning on stderr, and the rest of the host is still shown.
+`reservationsError` gives the reason only to a caller who may `vm.read` across
+the cluster; anyone else sees the operation ids, and the daemon log has the
+reason. Each row carries the operation id, the RPC that made it
 (`method`), `kind`, the vCPU and MiB it holds, its age, its header owner epoch,
 a `state` and a one-sentence `detail`. The `vm` and `project` fields, and the
 workload name in `detail`, are shown only to a caller who may `vm.read` that

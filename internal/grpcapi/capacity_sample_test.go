@@ -1,6 +1,8 @@
 package grpcapi
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -125,5 +127,173 @@ func TestCapacityObservation_ContainerChargesMemoryOnly(t *testing.T) {
 	}
 	if obs.EffectiveCPU != 0 || obs.EffectiveMemMiB != 768 {
 		t.Fatalf("effective = %dc/%dMiB, want 0c/768MiB", obs.EffectiveCPU, obs.EffectiveMemMiB)
+	}
+}
+
+// A VM the database records as "starting" is already charged by placement
+// (countsAgainstHost) and by admission (SumVMResourcesByHost). Its qemu is
+// often running before the row says "running" (a restart, a reconciler start),
+// and the sample charged that qemu again as runtime-only load, on top of the
+// database's charge, until the next sample.
+func TestCapacityObservation_StartingVMIsNotChargedTwice(t *testing.T) {
+	inv := obsInv(true,
+		runtimeWorkload{Kind: corrosion.WorkloadVM, Name: "booting", State: health.RuntimeRunning, CPU: 1, MemoryMiB: 1024},
+	)
+	vms := []corrosion.VMRecord{{Name: "booting", State: "starting", CPUActual: 1, MemActual: 1024}}
+	obs := computeCapacityObservation("h1", inv, vms, nil)
+	if obs.ExtraCPU != 0 || obs.ExtraMemMiB != 0 {
+		t.Fatalf("extra = %d/%d for a starting VM the database already charges; want 0/0 (%s)",
+			obs.ExtraCPU, obs.ExtraMemMiB, obs.Detail)
+	}
+	if obs.DBCPU != 1 || obs.DBMemMiB != 1024 {
+		t.Fatalf("db charge = %d/%d, want the starting VM's 1/1024", obs.DBCPU, obs.DBMemMiB)
+	}
+}
+
+// The other side of the same rule: a VM in a state neither placement nor
+// admission charges ("migrating", "creating", "stopped") whose qemu runs here
+// is real load the database does not count, and stays runtime-only.
+func TestCapacityObservation_UncountedStatesWithALiveQemuStayRuntimeOnly(t *testing.T) {
+	for _, st := range []string{"migrating", "creating", "stopped", "pending"} {
+		inv := obsInv(true,
+			runtimeWorkload{Kind: corrosion.WorkloadVM, Name: "mover", State: health.RuntimeRunning, CPU: 1, MemoryMiB: 1024},
+		)
+		vms := []corrosion.VMRecord{{Name: "mover", State: st, CPUActual: 1, MemActual: 1024}}
+		obs := computeCapacityObservation("h1", inv, vms, nil)
+		if obs.ExtraCPU != 1 || obs.ExtraMemMiB != 1024 {
+			t.Errorf("state %q: extra = %d/%d, want the live qemu's 1/1024", st, obs.ExtraCPU, obs.ExtraMemMiB)
+		}
+	}
+}
+
+// fakeSampling scripts capacitySampler's two inputs.
+type fakeSampling struct {
+	fp        string
+	fpErr     error
+	obs       corrosion.HostCapacityObservation
+	sampleErr error
+	samples   int
+}
+
+func (f *fakeSampling) sampler() *capacitySampler {
+	return &capacitySampler{
+		fingerprint: func(context.Context) (string, error) { return f.fp, f.fpErr },
+		sample: func(context.Context) (corrosion.HostCapacityObservation, error) {
+			f.samples++
+			return f.obs, f.sampleErr
+		},
+	}
+}
+
+var cleanObs = corrosion.HostCapacityObservation{HostName: "h1", Complete: true}
+
+// The lab 2 failure (ac2139ed): a sample taken while a VM migrated away charged
+// its qemu as runtime-only load, and placement kept subtracting it for the rest
+// of the 60 s interval, after the VM had left. A change to the database's record
+// of this host's workloads now samples again at the next check.
+func TestCapacitySampler_ResamplesWhenTheHostsWorkloadsChange(t *testing.T) {
+	ctx := context.Background()
+	f := &fakeSampling{fp: "with-mover", obs: cleanObs}
+	cs := f.sampler()
+	cs.take(ctx, false)
+	cs.poll(ctx)
+	if f.samples != 1 {
+		t.Fatalf("samples = %d after a check with nothing changed; want 1 (the first)", f.samples)
+	}
+	f.fp = "mover-gone"
+	cs.poll(ctx)
+	if f.samples != 2 {
+		t.Fatalf("samples = %d after the host's workloads changed; want 2", f.samples)
+	}
+	cs.poll(ctx)
+	if f.samples != 2 {
+		t.Fatalf("samples = %d after a second check with nothing new; want still 2", f.samples)
+	}
+}
+
+// A sample can pair a runtime read that began before the change with the
+// database after it (concurrent inventory reads share one libvirt scan), and
+// then charge a workload that has already gone. A change-triggered sample that
+// charges any runtime-only load, or cannot account for the host, is confirmed
+// once at the next check; one that charges nothing is not.
+func TestCapacitySampler_ConfirmsAChangeTriggeredSampleThatChargedRuntimeLoad(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name    string
+		obs     corrosion.HostCapacityObservation
+		confirm bool
+	}{
+		{"clean", cleanObs, false},
+		{"runtime-only memory", corrosion.HostCapacityObservation{Complete: true, ExtraMemMiB: 1024}, true},
+		{"runtime-only cpu", corrosion.HostCapacityObservation{Complete: true, ExtraCPU: 1}, true},
+		{"incomplete", corrosion.HostCapacityObservation{Complete: false}, true},
+	} {
+		f := &fakeSampling{fp: "a", obs: cleanObs}
+		cs := f.sampler()
+		cs.take(ctx, false)
+		f.fp, f.obs = "b", tc.obs
+		cs.poll(ctx) // the change
+		cs.poll(ctx) // the confirmation, if any
+		cs.poll(ctx) // never a second one
+		want := 2
+		if tc.confirm {
+			want = 3
+		}
+		if f.samples != want {
+			t.Errorf("%s: samples = %d, want %d", tc.name, f.samples, want)
+		}
+	}
+	// A sample taken on the interval is not confirmed, whatever it charged: a
+	// real rogue would otherwise be re-read on every check.
+	f := &fakeSampling{fp: "a", obs: corrosion.HostCapacityObservation{Complete: true, ExtraMemMiB: 1024}}
+	cs := f.sampler()
+	cs.take(ctx, false)
+	cs.poll(ctx)
+	if f.samples != 1 {
+		t.Fatalf("samples = %d; an interval sample must not be confirmed", f.samples)
+	}
+}
+
+// A check that cannot read the database samples nothing (the interval still
+// does), and a sample whose fingerprint could not be read is retried at the
+// next check that can.
+func TestCapacitySampler_FingerprintErrors(t *testing.T) {
+	ctx := context.Background()
+	f := &fakeSampling{fp: "a", obs: cleanObs}
+	cs := f.sampler()
+	cs.take(ctx, false)
+	f.fpErr = errors.New("database is locked")
+	cs.poll(ctx)
+	if f.samples != 1 {
+		t.Fatalf("samples = %d after a check that could not read the database; want 1", f.samples)
+	}
+
+	f = &fakeSampling{fp: "a", fpErr: errors.New("database is locked"), obs: cleanObs}
+	cs = f.sampler()
+	cs.take(ctx, false)
+	f.fpErr = nil
+	cs.poll(ctx)
+	if f.samples != 2 {
+		t.Fatalf("samples = %d; a sample with no fingerprint must be retaken at the next good check", f.samples)
+	}
+}
+
+// A sample that failed published nothing, so the change it was taken for is
+// sampled again at the next check.
+func TestCapacitySampler_AFailedSampleIsRetakenAtTheNextCheck(t *testing.T) {
+	ctx := context.Background()
+	f := &fakeSampling{fp: "a", obs: cleanObs}
+	cs := f.sampler()
+	cs.take(ctx, false)
+	f.fp, f.sampleErr = "b", errors.New("upsert: database is locked")
+	cs.poll(ctx)
+	f.sampleErr = nil
+	cs.poll(ctx)
+	if f.samples != 3 {
+		t.Fatalf("samples = %d; the change whose sample failed must be sampled again", f.samples)
+	}
+	cs.poll(ctx)
+	if f.samples != 3 {
+		t.Fatalf("samples = %d after the retake succeeded; want no more", f.samples)
 	}
 }

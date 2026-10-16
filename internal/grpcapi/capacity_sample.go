@@ -37,39 +37,114 @@ import (
 // SampleHostCapacity computes and publishes this host's effective capacity
 // observation. Called by the daemon's capacity sampler loop.
 func (s *Server) SampleHostCapacity(ctx context.Context) error {
+	_, err := s.sampleHostCapacity(ctx)
+	return err
+}
+
+// sampleHostCapacity is SampleHostCapacity returning what it published.
+func (s *Server) sampleHostCapacity(ctx context.Context) (corrosion.HostCapacityObservation, error) {
 	inv := s.collectRuntimeInventory(ctx)
 	vms, err := corrosion.ListVMs(ctx, s.db, "", s.hostName)
 	if err != nil {
-		return fmt.Errorf("list VMs: %w", err)
+		return corrosion.HostCapacityObservation{}, fmt.Errorf("list VMs: %w", err)
 	}
 	cts, err := corrosion.ListContainers(ctx, s.db, s.hostName)
 	if err != nil {
-		return fmt.Errorf("list containers: %w", err)
+		return corrosion.HostCapacityObservation{}, fmt.Errorf("list containers: %w", err)
 	}
 	obs := computeCapacityObservation(s.hostName, inv, vms, cts)
-	return corrosion.UpsertHostCapacityObservation(ctx, s.db, obs)
+	return obs, corrosion.UpsertHostCapacityObservation(ctx, s.db, obs)
 }
 
-// RunCapacitySampler publishes this host's observation on a fixed interval.
+// defaultCapacityResampleCheck is how often the sampler looks for a change to
+// the database's record of this host's workloads (capacitySampler.poll).
+const defaultCapacityResampleCheck = 2 * time.Second
+
+// SetCapacityResampleCheckForTest sets how often RunCapacitySampler checks for
+// a change to this host's workloads. Zero is the default.
+func (s *Server) SetCapacityResampleCheckForTest(d time.Duration) { s.capacityResampleCheck = d }
+
+// RunCapacitySampler publishes this host's observation on a fixed interval,
+// and again whenever the database's record of this host's workloads changes
+// (capacitySampler).
 func (s *Server) RunCapacitySampler(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 60 * time.Second
 	}
-	sample := func() {
-		if err := s.SampleHostCapacity(ctx); err != nil {
-			slog.Warn("capacity sampler", "error", err)
-		}
+	check := s.capacityResampleCheck
+	if check <= 0 {
+		check = defaultCapacityResampleCheck
 	}
-	sample()
-	t := time.NewTicker(interval)
-	defer t.Stop()
+	cs := &capacitySampler{
+		fingerprint: func(ctx context.Context) (string, error) {
+			return corrosion.HostWorkloadFingerprint(ctx, s.db, s.hostName)
+		},
+		sample: s.sampleHostCapacity,
+	}
+	cs.take(ctx, false)
+	full := time.NewTicker(interval)
+	defer full.Stop()
+	poll := time.NewTicker(check)
+	defer poll.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
-			sample()
+		case <-full.C:
+			cs.take(ctx, false)
+		case <-poll.C:
+			cs.poll(ctx)
 		}
+	}
+}
+
+// capacitySampler decides when this host samples its capacity.
+type capacitySampler struct {
+	fingerprint func(context.Context) (string, error)
+	sample      func(context.Context) (corrosion.HostCapacityObservation, error)
+
+	// last is the workload fingerprint read before the last good sample;
+	// known is false until there is one.
+	last  string
+	known bool
+	// confirm asks the next poll to sample again.
+	confirm bool
+}
+
+// take samples now. changed marks a sample taken because the workloads changed.
+//
+// The fingerprint is read BEFORE the sample, so a change that lands while the
+// sample runs differs from it and is sampled again at the next check.
+func (c *capacitySampler) take(ctx context.Context, changed bool) {
+	fp, ferr := c.fingerprint(ctx)
+	obs, err := c.sample(ctx)
+	c.confirm = false
+	if err != nil {
+		slog.Warn("capacity sampler", "error", err)
+		return
+	}
+	c.last, c.known = fp, ferr == nil
+	// A sample's runtime read can begin before the change it was taken for
+	// (concurrent inventory reads share one libvirt scan) and so still charge
+	// a workload that has gone. Only load that a sample charges outside the
+	// database can be stale that way, so only then is it confirmed, once.
+	c.confirm = changed && (obs.ExtraCPU != 0 || obs.ExtraMemMiB != 0 || !obs.Complete)
+}
+
+// poll samples when the database's record of this host's workloads has changed
+// since the last sample, and confirms a change-triggered sample (take). A check
+// that cannot read the database samples nothing: the interval still does.
+func (c *capacitySampler) poll(ctx context.Context) {
+	if c.confirm {
+		c.take(ctx, false)
+		return
+	}
+	fp, err := c.fingerprint(ctx)
+	if err != nil {
+		return
+	}
+	if !c.known || fp != c.last {
+		c.take(ctx, true)
 	}
 }
 
@@ -157,10 +232,16 @@ func computeCapacityObservation(
 	return obs
 }
 
-// dbVMCharge is what the database says a VM holds on its host: a running VM
-// at its recorded actuals. ok=false for a VM that holds nothing.
+// dbVMCharge is what the database says a VM holds on its host: a running or
+// starting VM at its recorded actuals. ok=false for a VM that holds nothing.
+//
+// Those are the states every reader of the observation already charges from
+// the database: placement (countsAgainstHost: running, starting, creating) and
+// admission (corrosion.SumVMResourcesByHost: running, starting). A qemu running
+// for a VM in any other state is runtime-only load here, so no reader counts it
+// twice and none counts it not at all.
 func dbVMCharge(vm corrosion.VMRecord) (cpu, mem int, ok bool) {
-	if vm.State != "running" {
+	if vm.State != "running" && vm.State != "starting" {
 		return 0, 0, false
 	}
 	return vm.CPUActual, vm.MemActual, true

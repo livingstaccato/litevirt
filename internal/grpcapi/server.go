@@ -77,6 +77,10 @@ type Server struct {
 	// defaultReplacedTombstoneWait.
 	replacedTombstoneWait time.Duration
 
+	// capacityResampleCheck is how often RunCapacitySampler checks this host's
+	// workloads for a change. Zero is defaultCapacityResampleCheck.
+	capacityResampleCheck time.Duration
+
 	// Admission-gate local-inventory cache (see localInventoryCached).
 	invCacheMu sync.Mutex
 	invCache   runtimeInventory

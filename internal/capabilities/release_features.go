@@ -122,6 +122,8 @@ var releaseFeatures = map[Feature]FeatureInfo{
 		Writers: []string{"internal/corrosion.SetHAPolicy"}},
 	FeatureNICMTU:          {Token: Release202611V1, Description: "Per-NIC MTU", Writers: []string{"internal/corrosion.InsertVMWithReleaseFeatures", "internal/corrosion.MutateDesiredSpecWithReleaseFeatures"}},
 	FeatureReplicationRate: {Token: Release202611V1, Description: "Per-schedule replication bandwidth limits", Writers: []string{"internal/corrosion.SetReplicationRate"}},
+	FeatureReturningBoot: {Token: Release202611V1, Description: "A host booting from fenced, offline, maintenance, draining or joining is recorded upgrading until its daemon serves (used by default once the release latches)",
+		Writers: []string{"internal/hostboot.WriteReturningBoot"}},
 
 	// The firewall extras.
 	FeatureFirewallSynflood: {Token: Release202611V1, Description: "SYN-flood protection on guest NICs: the cluster and per-host policy (recorded on for a cluster founded by this release)",
@@ -188,6 +190,7 @@ const (
 	FeatureHADisarm             Feature = "ha_disarm"
 	FeatureNICMTU               Feature = "nic_mtu"
 	FeatureReplicationRate      Feature = "replication_rate"
+	FeatureReturningBoot        Feature = "returning_boot"
 
 	FeatureFirewallSynflood  Feature = "firewall_synflood"
 	FeatureFirewallLog       Feature = "firewall_log"

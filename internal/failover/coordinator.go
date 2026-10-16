@@ -1079,7 +1079,8 @@ func (c *Coordinator) run(ctx context.Context) {
 		// (no placement targets it), so there is nothing to fence it for, and
 		// fencing it powers the machine off part-way through its setup — the
 		// add then hangs (kvm003 drill 6, finding B6). Its first boot records
-		// it 'active', and from then on it is fenced like any host. Not cached:
+		// it 'upgrading' until its daemon serves, then 'active' (hostboot),
+		// and from then on it is fenced like any host. Not cached:
 		// the boot write can land on any cycle.
 		if h.State == corrosion.HostStateJoining {
 			slog.Info("failover: target is still joining (its daemon has not started), skipping fence", "host", target)

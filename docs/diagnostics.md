@@ -1807,6 +1807,23 @@ network heals. It logs what came back and what did not, but raises no condition.
 See [Gossip membership heals itself after a
 partition](operating-model.md#gossip-membership-heals-itself-after-a-partition).
 
+### A host whose boot kept its fence (`boot_kept_fence`)
+
+A host recorded `fenced` or `offline` returns to service on its own when its
+daemon boots ([migration-failover.md](migration-failover.md), "A graceful
+restart stays `upgrading` until it serves"), except when that boot cannot
+write `boot-unclean-history` in its `data_dir` (a full or read-only disk). It
+then keeps the fence: its daemon runs and serves, and the host stays `fenced` or
+`offline`, unplaceable. Evaluator `host_boot`; the host writes the row about
+**itself**, and logs the same at warning level.
+
+| Raised when | Clears when |
+|---|---|
+| The boot of a host recorded `fenced` or `offline` could not record its unclean-boot history and kept the fence. **Warning** severity. The evidence names the state kept, the cause and the remedy. | The host is recorded as anything but `fenced` or `offline` (`lv host undrain <host>`). One left open by an earlier daemon process is resolved by the next boot once that holds. |
+
+Fix what the cause names, confirm the host should run workloads again, then
+run `lv host undrain <host>`.
+
 ### A host stuck `upgrading` while its daemon runs (`upgrading_unconfirmed`)
 
 After a restart the host stays `upgrading` until its daemon answers its own
@@ -2589,7 +2606,7 @@ down host that no other host runs.
 
 | Raised when | Clears when |
 |---|---|
-| Failover leaves a restart-same VM with a host-local disk on its failed host. | The host is back and the VM runs there again (a host that boots again turns `active` on its own, after `upgrading` if it booted into a pending upgrade; one that answered again without restarting and stays `fenced` or `offline` needs `lv host undrain <host>` first), or, once the host is back, the VM is on another host or deleted. A record for a host removed from the cluster clears once the VM is deleted or on another host. |
+| Failover leaves a restart-same VM with a host-local disk on its failed host. | The host is back and the VM runs there again (a host that boots again turns `active` on its own, after `upgrading` until its daemon serves; one that answered again without restarting and stays `fenced` or `offline` needs `lv host undrain <host>` first), or, once the host is back, the VM is on another host or deleted. A record for a host removed from the cluster clears once the VM is deleted or on another host. |
 
 ### A start an operator cancelled (`vm_start_cancelled`)
 

@@ -1746,13 +1746,79 @@ func RenameVM(ctx context.Context, c *Client, oldName, newName string) error {
 	return execVMRekey(ctx, c, c.NowTS(), vmRekeyPass{oldName: oldName, newName: newName})
 }
 
-// UpdateVMInterfaceIP sets the IP of a VM interface.
-func UpdateVMInterfaceIP(ctx context.Context, c *Client, vmName, networkName, ip string) error {
-	now := c.NowTS()
-	return c.Execute(ctx,
+// UpdateVMInterfaceIP records ip on the live NIC of vmName that it is for,
+// and reports whether it wrote.
+//
+// mac names that NIC. Empty means the caller knows only the network (SetVMIP):
+// the network's one live NIC, or, with several, the one its legacy row names —
+// where the old unfiltered UPDATE landed. No live NIC that fits writes nothing.
+//
+// It writes the legacy vm_interfaces row only, with the statement it always
+// used, and only while that row is live and names the target NIC's MAC. The
+// row is keyed by (vm, network) and a detach after the hardware_v2 latch
+// tombstones only vm_nics, so it can belong to a detached NIC, or be the
+// tombstone of a NIC since re-attached under the same MAC: an unfiltered
+// UPDATE revived the first and hid the second, and the hardware bridge then
+// made either permanent. The filter is applied by reading both tables first,
+// because a filtered UPDATE would be a new statement shape and stall this
+// node's stream to every peer on the previous release.
+//
+// vm_nics is never written. A vm_nics row is rewritten whole (UpsertNIC), and
+// BindSecurityGroups and nic_retarget rewrite it from any node unlocked, so an
+// IP write there could lose a security-group bind made elsewhere. A NIC that
+// exists only in vm_nics therefore gets no address here, as before.
+//
+// Mixed versions: a node on an older build still issues the unfiltered UPDATE
+// and still revives a NIC detached after the latch, or bumps a legacy
+// tombstone over a re-attached NIC, until every node runs this. The latch
+// proves a build at least as new as hardware_v2, not this one.
+func UpdateVMInterfaceIP(ctx context.Context, c *Client, vmName, networkName, mac, ip string) (bool, error) {
+	nics, err := GetVMNICsRaw(ctx, c, "vm_nics", vmName)
+	if err != nil {
+		return false, err
+	}
+	ifaces, err := GetVMNICsRaw(ctx, c, "vm_interfaces", vmName)
+	if err != nil {
+		return false, err
+	}
+
+	var legacy *NICRecord // the (vm, network) row; the PK allows one
+	for i := range ifaces {
+		if ifaces[i].NetworkName == networkName {
+			legacy = &ifaces[i]
+		}
+	}
+	if legacy == nil || legacy.DeletedAt != "" {
+		return false, nil
+	}
+
+	var candidates []NICRecord
+	for _, w := range nicRowWinners(ifaces, nics) {
+		if w.DeletedAt == "" && w.NetworkName == networkName && (mac == "" || strings.EqualFold(w.MAC, mac)) {
+			candidates = append(candidates, w)
+		}
+	}
+	var target *NICRecord
+	switch {
+	case len(candidates) == 1:
+		target = &candidates[0]
+	case len(candidates) > 1:
+		for i := range candidates {
+			if strings.EqualFold(candidates[i].MAC, legacy.MAC) {
+				target = &candidates[i]
+			}
+		}
+	}
+	if target == nil || !strings.EqualFold(legacy.MAC, target.MAC) {
+		return false, nil
+	}
+	if err := c.Execute(ctx,
 		`UPDATE vm_interfaces SET ip = ?, updated_at = ? WHERE vm_name = ? AND network_name = ?`,
-		ip, now, vmName, networkName,
-	)
+		ip, c.NowTS(), vmName, networkName,
+	); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // diskRowSQL writes one whole vm_disks row. It is InsertDisk's statement, and

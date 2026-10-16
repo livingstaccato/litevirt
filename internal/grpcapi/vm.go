@@ -4344,8 +4344,17 @@ func (s *Server) SetVMIP(ctx context.Context, req *pb.SetVMIPRequest) (*pb.VM, e
 			networkName, binding.PrefixID)
 	}
 
-	if err := corrosion.UpdateVMInterfaceIP(ctx, s.db, req.Name, networkName, req.Ip); err != nil {
+	// The request names a network, not a NIC, so the write is resolved to the
+	// network's live NIC (UpdateVMInterfaceIP). No live NIC there records
+	// nothing, as the unfiltered UPDATE this replaced recorded nothing visible;
+	// it is reported, not refused.
+	written, err := corrosion.UpdateVMInterfaceIP(ctx, s.db, req.Name, networkName, "", req.Ip)
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "update VM interface IP: %v", err)
+	}
+	if !written {
+		slog.Warn("SetVMIP: no single live NIC of the VM is on this network; no interface row records the address",
+			"vm", req.Name, "network", networkName, "ip", req.Ip)
 	}
 
 	// Update DNS record so VM is reachable by name.

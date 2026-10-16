@@ -151,20 +151,20 @@ func TestApply_RefusesUnsafeNameBeforeWriting(t *testing.T) {
 	}
 }
 
-// TestReadTLSFile_RefusesNonOperatorFiles: the TLS reader refuses a device,
-// a FIFO (without hanging), a symlink, a file over the size cap, litevirt's
-// own keys (directly and through a symlinked directory) and the LB config
-// dir; it reads a plain file.
+// TestReadTLSFile_ChecksTheFileActuallyRead: the TLS reader follows a
+// symlink (a Let's Encrypt live/ -> archive/ name reads) and applies every
+// check to the file it opens: it refuses a device, a FIFO (without hanging),
+// a file over the size cap, litevirt's own keys whether named, linked to or
+// reached through a symlinked directory, the LB config dir, and a path
+// swapped to point into the PKI dir between resolving and opening.
 //
-// Mutations (each red): drop O_NOFOLLOW; drop the regular-file check; drop
-// the size cap; drop the protected-dir check.
-func TestReadTLSFile_RefusesNonOperatorFiles(t *testing.T) {
+// Mutations (each red): drop the opened-name comparison; drop the
+// protected-dir check on the opened name; drop the regular-file check; drop
+// the size cap.
+func TestReadTLSFile_ChecksTheFileActuallyRead(t *testing.T) {
 	m := testManager(t)
 	dir := t.TempDir()
 	pki := filepath.Join(dir, "pki")
-	if err := os.MkdirAll(pki, 0o700); err != nil {
-		t.Fatal(err)
-	}
 	old := append([]string(nil), protectedDirs...)
 	SetProtectedDirs(pki)
 	t.Cleanup(func() { SetProtectedDirs(old...) })
@@ -178,29 +178,38 @@ func TestReadTLSFile_RefusesNonOperatorFiles(t *testing.T) {
 		}
 		return p
 	}
+	link := func(target, name string) string {
+		if err := os.MkdirAll(filepath.Dir(name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, name); err != nil {
+			t.Fatal(err)
+		}
+		return name
+	}
 	good := write(filepath.Join(dir, "certs", "a.crt"), []byte("CERT"))
 	hostKey := write(filepath.Join(pki, "host.key"), []byte("SECRET"))
+	write(filepath.Join(pki, "a.crt"), []byte("PKI"))
 	big := write(filepath.Join(dir, "certs", "big.crt"), make([]byte, maxTLSFile+1))
 	inLBDir := write(filepath.Join(m.configDir, "other-lb-443.pem"), []byte("OTHER"))
-	link := filepath.Join(dir, "certs", "link.crt")
-	if err := os.Symlink(good, link); err != nil {
-		t.Fatal(err)
-	}
-	pkiLink := filepath.Join(dir, "pkilink")
-	if err := os.Symlink(pki, pkiLink); err != nil {
-		t.Fatal(err)
-	}
+	// Let's Encrypt's shape: live/<name>/fullchain.pem -> ../../archive/<name>/fullchain1.pem
+	write(filepath.Join(dir, "le", "archive", "web", "fullchain1.pem"), []byte("LE"))
+	le := link("../../archive/web/fullchain1.pem", filepath.Join(dir, "le", "live", "web", "fullchain.pem"))
+	toPKI := link(hostKey, filepath.Join(dir, "certs", "sneaky.key"))
+	pkiDirLink := link(pki, filepath.Join(dir, "pkilink"))
 	fifo := filepath.Join(dir, "certs", "fifo")
 	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	if b, err := m.readTLSFile(good); err != nil || string(b) != "CERT" {
-		t.Fatalf("plain file: %q, %v", b, err)
+	for name, p := range map[string]string{"plain file": good, "Let's Encrypt live/ symlink": le} {
+		if _, err := m.readTLSFile(p); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
 	for name, p := range map[string]string{
-		"/dev/zero": "/dev/zero", "fifo": fifo, "symlink": link, "oversize": big,
-		"pki/host.key": hostKey, "pki via a symlinked dir": filepath.Join(pkiLink, "host.key"),
+		"/dev/zero": "/dev/zero", "fifo": fifo, "oversize": big,
+		"pki/host.key": hostKey, "symlink into pki": toPKI, "pki via a symlinked dir": filepath.Join(pkiDirLink, "host.key"),
 		"LB config dir": inLBDir, "relative": "certs/a.crt",
 	} {
 		done := make(chan error, 1)
@@ -213,6 +222,85 @@ func TestReadTLSFile_RefusesNonOperatorFiles(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatalf("%s: read hung", name)
 		}
+	}
+
+	// Swapped between resolving and opening: certs/ becomes a symlink to the
+	// PKI dir, so opening the resolved path would read pki/a.crt.
+	certs := filepath.Join(dir, "certs")
+	beforeTLSOpen = func() {
+		if err := os.Rename(certs, certs+".old"); err != nil {
+			t.Error(err)
+		}
+		if err := os.Symlink(pki, certs); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { beforeTLSOpen = func() {} })
+	if b, err := m.readTLSFile(good); err == nil {
+		t.Errorf("swapped path read %q", b)
+	}
+
+	// Swapped to somewhere unprotected: still not the file that was
+	// resolved and checked, so refused.
+	other := filepath.Join(dir, "other")
+	write(filepath.Join(other, "a.crt"), []byte("OTHER"))
+	good2 := write(filepath.Join(dir, "certs2", "a.crt"), []byte("CERT"))
+	certs2 := filepath.Dir(good2)
+	beforeTLSOpen = func() {
+		if err := os.Rename(certs2, certs2+".old"); err != nil {
+			t.Error(err)
+		}
+		if err := os.Symlink(other, certs2); err != nil {
+			t.Error(err)
+		}
+	}
+	if b, err := m.readTLSFile(good2); err == nil {
+		t.Errorf("path swapped to another file read %q", b)
+	}
+}
+
+// TestReadTLSFile_CertDirMustBeTrusted: a path inside CertDir is read only
+// while CertDir is a real directory owned by the daemon's user and writable
+// by no one else: what it holds, links included, was put there by root.
+//
+// Mutation: drop the checkCertDir call — red.
+func TestReadTLSFile_CertDirMustBeTrusted(t *testing.T) {
+	m := testManager(t)
+	root := t.TempDir()
+	cd := filepath.Join(root, "lb-certs")
+	if err := os.Mkdir(cd, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	f := filepath.Join(cd, "a.crt")
+	if err := os.WriteFile(f, []byte("CERT"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := certDir
+	certDir = cd
+	t.Cleanup(func() { certDir = old })
+
+	if _, err := m.readTLSFile(f); err != nil {
+		t.Fatalf("trusted cert dir: %v", err)
+	}
+	if err := os.Chmod(cd, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.readTLSFile(f); err == nil {
+		t.Error("read from a world-writable cert dir")
+	}
+	if err := os.Chmod(cd, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	// A cert dir that is itself a symlink is not trusted either.
+	real := filepath.Join(root, "elsewhere")
+	if err := os.Rename(cd, real); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, cd); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.readTLSFile(f); err == nil {
+		t.Error("read through a symlinked cert dir")
 	}
 }
 

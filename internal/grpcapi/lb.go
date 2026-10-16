@@ -24,6 +24,7 @@ import (
 	"github.com/litevirt/litevirt/internal/lb"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/randid"
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 func (s *Server) ListLoadBalancers(ctx context.Context, _ *emptypb.Empty) (*pb.ListLBResponse, error) {
@@ -3100,6 +3101,20 @@ func requireAdminForLBTLS(ctx context.Context, spec *pb.LBSpec) error {
 		}
 	}
 	return nil
+}
+
+// validateRestoredLB holds a restored VM's spec to CreateVM's rules for its
+// stack name and load balancer, including the TLS cert-dir/admin rule.
+func validateRestoredLB(ctx context.Context, spec *pb.VMSpec) error {
+	if spec.StackName != "" {
+		if err := safename.ValidateStackName(spec.StackName); err != nil {
+			return status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+	}
+	if err := validateLBSpec(spec.Loadbalancer); err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	return requireAdminForLBTLS(ctx, spec.Loadbalancer)
 }
 
 // standaloneProtocols is ports with only what a Create/UpdateLoadBalancer

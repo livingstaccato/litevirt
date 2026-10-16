@@ -46,42 +46,43 @@ func TestDetachedNICMACs_AReapedDetachStillMarksTheMAC(t *testing.T) {
 
 // DetachedNICMACs relies on operation headers never being removed: a
 // hard delete of a reaped NIC-detach header would make a NIC attached again
-// under that MAC render the detached NIC's model. No Go source in the module
-// may delete from operations.
+// under that MAC render the detached NIC's model. No Go source under the
+// module's internal/ or cmd/ may delete from operations. Only those two are
+// walked: the module root of a checkout can hold other trees (worktrees of
+// other branches under .claude/), whose statements are not this one's.
 //
-// Mutation: add a `DELETE FROM operations` statement anywhere — red.
+// Mutation: add a `DELETE FROM operations` statement in internal/ or cmd/ —
+// red.
 func TestOperationHeadersAreNeverHardDeleted(t *testing.T) {
-	root, err := filepath.Abs(filepath.Join("..", ".."))
-	if err != nil {
-		t.Fatal(err)
-	}
 	del := regexp.MustCompile("(?is)DELETE\\s+FROM\\s+[\"`]?operations[\"`]?(\\s|$|;|`)")
 	var hits []string
-	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	for _, dir := range []string{"internal", "cmd"} {
+		root, err := filepath.Abs(filepath.Join("..", "..", dir))
 		if err != nil {
-			return err
+			t.Fatal(err)
 		}
-		if d.IsDir() {
-			switch d.Name() {
-			case ".git", "vendor", "node_modules", "gen":
-				return filepath.SkipDir
+		err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			if !strings.HasSuffix(p, ".go") || strings.HasSuffix(p, "_test.go") {
+				return nil
+			}
+			b, rerr := os.ReadFile(p)
+			if rerr != nil {
+				return rerr
+			}
+			if del.Match(b) {
+				hits = append(hits, p)
 			}
 			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
 		}
-		if !strings.HasSuffix(p, ".go") || strings.HasSuffix(p, "_test.go") {
-			return nil
-		}
-		b, rerr := os.ReadFile(p)
-		if rerr != nil {
-			return rerr
-		}
-		if del.Match(b) {
-			hits = append(hits, p)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
 	if len(hits) > 0 {
 		t.Fatalf("operation headers are hard-deleted in %v; DetachedNICMACs needs them kept (soft-delete only)", hits)

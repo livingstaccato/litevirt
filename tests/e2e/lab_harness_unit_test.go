@@ -253,21 +253,33 @@ func TestLeaseWatchObserve(t *testing.T) {
 	if len(w.history()) != 1 || w.history()[0].Holder != "node-4" {
 		t.Fatalf("a lagging sample was recorded as a lease change: %+v", w.history())
 	}
-	// Lag never fails, however long it lasts or how it flaps.
+	// Expired lag never fails, however long it lasts or how it flaps.
+	expLag := lag
+	expLag.Expires, expLag.Now = t0, t0.Add(time.Minute)
 	w = newW()
 	for i := 0; i < 30; i++ {
-		s := lag
+		s := expLag
 		if i%2 == 1 {
 			s = ok
 		}
 		w.observe("a", at(i), s, true)
-		w.observe("b", at(i), lag, false)
+		w.observe("b", at(i), expLag, false)
 	}
 	if len(fails) != 0 {
-		t.Fatalf("lag failed the drill: %v", fails)
+		t.Fatalf("expired lag failed the drill: %v", fails)
 	}
-	// A persistent unexplained live holder fails, per reader: another reader's
-	// coherent samples and neutral samples must not reset it.
+	// Persistent lag (unknown or unexpired expiry) fails, per reader: another
+	// reader's coherent samples and neutral samples must not reset it.
+	w = newW()
+	for i := 0; i < 5; i++ {
+		w.observe("a", at(i), lag, true)
+		w.observe("b", at(i), ok, false)
+		w.observe("a", at(i), neutral, false)
+	}
+	if len(fails) != 1 || !strings.Contains(fails[0], "a's replica") {
+		t.Fatalf("persistent lag on reader a: fails=%v", fails)
+	}
+	// A persistent unexplained live holder fails too.
 	unexp := leaseSample{Election: "node-9", Term: 51, Ledger: "node-4", Terms: terms}
 	w = newW()
 	for i := 0; i < 5; i++ {
@@ -482,12 +494,20 @@ func TestSampleTick(t *testing.T) {
 	if len(fails) != 0 {
 		t.Fatalf("a lagging self-claim failed at 2 ticks: %v", fails)
 	}
-	// Lag is recorded however long it persists, and never fails.
-	for i := 2; i < 12; i++ {
-		w.sampleTick(t0.Add(time.Duration(i)*time.Second), []readerSample{{Reader: "node-2", S: lagging}, {Reader: "node-4", S: fresh}})
+	// The window tracker still catches unexpired lag when it persists.
+	w.sampleTick(t0.Add(2*time.Second), []readerSample{{Reader: "node-2", S: lagging}, {Reader: "node-4", S: fresh}})
+	if len(fails) != 1 || !strings.Contains(fails[0], "node-2's replica") {
+		t.Fatalf("persistent lag self-claim: %v", fails)
+	}
+	// An expired lagging row never fails.
+	expired := lagging
+	expired.Expires, expired.Now = t0.Add(-time.Minute), t0
+	w = newW()
+	for i := 0; i < 12; i++ {
+		w.sampleTick(t0.Add(time.Duration(i)*time.Second), []readerSample{{Reader: "node-2", S: expired}, {Reader: "node-4", S: fresh}})
 	}
 	if len(fails) != 0 {
-		t.Fatalf("persistent lag self-claim failed: %v", fails)
+		t.Fatalf("expired lag failed: %v", fails)
 	}
 	// A caught-up replica self-claiming beside a newer holder still fails at 2 ticks.
 	selfConsistent := stale
@@ -601,11 +621,11 @@ func TestLeaseSampleExpiry(t *testing.T) {
 	}
 }
 
-// TestLagNeverFails: the W3 replay. node-2 restarted and its replica still
+// TestExpiredLagNeverFails: the W3 replay (row ~82 s old against a 45 s lease). node-2 restarted and its replica still
 // shows its own expired term-71 row while node-6 holds term 72: three lag
 // samples, no failure, no self-claim. Two live self-claimants still fail; an
 // expired self-claim beside a live one does not.
-func TestLagNeverFails(t *testing.T) {
+func TestExpiredLagNeverFails(t *testing.T) {
 	var fails []string
 	w := &leaseWatch{incoh: map[string]*incoherenceTracker{}, termHolder: map[int]string{}, lastBy: map[string]leaseChange{}, maxTerm: map[string]int{},
 		fail: func(f string, a ...any) { fails = append(fails, fmt.Sprintf(f, a...)) }, logf: func(string, ...any) {}}
@@ -619,13 +639,15 @@ func TestLagNeverFails(t *testing.T) {
 	if len(fails) != 0 {
 		t.Fatalf("W3 replay failed the drill: %v", fails)
 	}
-	// Even an unexpired lag row (a real self-claim on a lagging replica) is not failed on.
+	// An unexpired lag row persisting beside a newer term (a lease being
+	// renewed by a stale holder) fails.
+	fails = nil
 	stale.Expires = t0.Add(time.Hour)
 	for i := 3; i < 20; i++ {
 		w.sampleTick(t0.Add(time.Duration(i)*time.Second), []readerSample{{Reader: "node-2", S: stale}, {Reader: "node-6", S: leaseSample{Election: "node-6", Term: 72, Ledger: "node-6", Terms: terms, Expires: t0.Add(time.Hour), Now: t0}}})
 	}
-	if len(fails) != 0 {
-		t.Fatalf("unexpired lag failed the drill: %v", fails)
+	if len(fails) == 0 {
+		t.Fatal("unexpired lag persisting beside a newer term passed the drill")
 	}
 	// Two live self-claims on coherent-looking replicas: a real dual holder.
 	w = &leaseWatch{incoh: map[string]*incoherenceTracker{}, termHolder: map[int]string{}, lastBy: map[string]leaseChange{}, maxTerm: map[string]int{},
@@ -649,5 +671,33 @@ func TestLagNeverFails(t *testing.T) {
 	}
 	if len(fails) != 0 {
 		t.Fatalf("an expired self-claim failed: %v", fails)
+	}
+}
+
+// TestExpiredUnexplainedIsNoTenure: an expired row naming a holder the ledger
+// does not explain is neutral, and is never recorded as a lease change nor
+// picked to feed the history, even as the first reader on a term tie.
+func TestExpiredUnexplainedIsNoTenure(t *testing.T) {
+	w := &leaseWatch{incoh: map[string]*incoherenceTracker{}, termHolder: map[int]string{}, lastBy: map[string]leaseChange{}, maxTerm: map[string]int{},
+		fail: func(string, ...any) {}, logf: func(string, ...any) {}}
+	t0 := time.Unix(7000, 0)
+	terms := map[int]string{72: "node-6"}
+	ghost := leaseSample{Election: "node-9", Term: 72, Ledger: "node-6", Terms: terms, Expires: t0.Add(-time.Minute), Now: t0}
+	good := leaseSample{Election: "node-6", Term: 72, Ledger: "node-6", Terms: terms, Expires: t0.Add(time.Hour), Now: t0}
+	if k := classifyLease(ghost); k != leaseNeutral {
+		t.Fatalf("ghost kind %v", k)
+	}
+	rs := []readerSample{{Reader: "node-1", S: ghost}, {Reader: "node-6", S: good}}
+	if got := recorderOf(rs); got != "node-6" {
+		t.Fatalf("recorderOf picked %q", got)
+	}
+	w.sampleTick(t0, rs)
+	for _, c := range append(w.history(), w.allHistory()...) {
+		if c.Holder == "node-9" {
+			t.Fatalf("an expired unexplained row became a tenure: %+v", c)
+		}
+	}
+	if h := w.history(); len(h) != 1 || h[0].Holder != "node-6" {
+		t.Fatalf("history %+v", h)
 	}
 }

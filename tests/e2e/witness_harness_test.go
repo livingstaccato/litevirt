@@ -704,7 +704,7 @@ func recorderOf(samples []readerSample) string {
 		if rs.Failed {
 			continue
 		}
-		if k := classifyLease(rs.S); k == leaseLag || k == leaseUnexplained {
+		if k := classifyLease(rs.S); k == leaseLag || k == leaseUnexplained || (k == leaseNeutral && rs.S.Election != "") {
 			continue
 		}
 		if rs.S.Term > bestTerm {
@@ -905,9 +905,10 @@ type leaseSample struct {
 	Now     time.Time
 }
 
+// A drill that steps a watched reader's clock forward must account for this.
 // leaseSkewMargin is how far past expires_at the reader's clock must be before
 // the row counts as expired: clocks across nodes may differ by this much.
-const leaseSkewMargin = 2 * time.Second
+const leaseSkewMargin = clockSlack
 
 // parseLeaseTime reads an RFC3339 lease timestamp; "" or garbage is the zero time.
 func parseLeaseTime(v string) time.Time {
@@ -1007,8 +1008,13 @@ func (w *leaseWatch) observe(r string, now time.Time, s leaseSample, record bool
 	case leaseNeutral:
 		// neither resets nor extends a run
 	case leaseLag:
-		// A replica behind the ledger is recorded, never failed: leader_election
-		// is not carried by anti-entropy, so a restarted replica keeps its old row.
+		// A replica behind the ledger with an EXPIRED row is a restarted node's
+		// leftover (leader_election is not carried by anti-entropy): recorded,
+		// never failed. An unexpired or unknown one is a lease someone may still
+		// be renewing beside a newer term, and counts toward the window.
+		if !s.expired() {
+			persistent = tr.observe(now, false)
+		}
 		w.incohSamples = append(w.incohSamples, leaseIncoherent{At: now, Reader: r, Sample: s, Kind: kind})
 	default:
 		persistent = tr.observe(now, false)
@@ -1020,13 +1026,13 @@ func (w *leaseWatch) observe(r string, now time.Time, s leaseSample, record bool
 		w.fail("lease: two holders for one term: %s", c)
 	}
 	if kind == leaseLag || kind == leaseUnexplained {
-		w.logf("lease: INCOHERENT sample on %s: election holder %q, ledger term %d held by %q (%s, streak %d)", r, s.Election, s.Term, s.Ledger, [...]string{"", "", "lagging", "unexplained"}[kind], streak)
+		w.logf("lease: INCOHERENT sample on %s: election holder %q, ledger term %d held by %q (%s, streak %d, expires %s, reader clock %s)", r, s.Election, s.Term, s.Ledger, [...]string{"", "", "lagging", "unexplained"}[kind], streak, s.Expires.Format(time.RFC3339), s.Now.Format(time.RFC3339))
 	}
 	if persistent {
-		w.fail("lease: %s's replica has shown election holder %q beside ledger term %d held by %q for %d samples over %v: an unexpired holder that no ledger term explains", r, s.Election, s.Term, s.Ledger, streak, incoherenceBound)
+		w.fail("lease: %s's replica has shown election holder %q beside ledger term %d held by %q for %d samples over %v: an unexpired election row that disagrees with the ledger (%s)", r, s.Election, s.Term, s.Ledger, streak, incoherenceBound, [...]string{"", "", "behind the ledger: a lease still being renewed beside a newer term", "no ledger term explains it"}[kind])
 	}
-	if kind == leaseLag || kind == leaseUnexplained {
-		return false
+	if kind == leaseLag || kind == leaseUnexplained || (kind == leaseNeutral && s.Election != "") {
+		return false // not a tenure: an expired non-empty row names nobody who holds
 	}
 	c := leaseChange{At: now, Holder: s.Election, Term: s.Term, Reader: r}
 	w.mu.Lock()
@@ -1069,7 +1075,7 @@ func (w *leaseWatch) summary() string {
 	} else {
 		fmt.Fprintf(&b, "lease: %d incoherent sample(s):", len(w.incohSamples))
 		for _, o := range w.incohSamples {
-			fmt.Fprintf(&b, "\n  %s on %s: election %q, ledger term %d held by %q (kind %d)", o.At.Format("15:04:05"), o.Reader, o.Sample.Election, o.Sample.Term, o.Sample.Ledger, o.Kind)
+			fmt.Fprintf(&b, "\n  %s on %s: election %q, ledger term %d held by %q (kind %d, expires %s, reader clock %s)", o.At.Format("15:04:05"), o.Reader, o.Sample.Election, o.Sample.Term, o.Sample.Ledger, o.Kind, o.Sample.Expires.Format(time.RFC3339), o.Sample.Now.Format(time.RFC3339))
 		}
 	}
 	var names []string

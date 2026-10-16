@@ -74,7 +74,10 @@ func TestFleet_UncleanRestartIsUpgradingUntilItServes(t *testing.T) {
 		}
 	}
 	served := time.Now()
-	eventually(t, convergeTimeout, "every observer to see d answer, and d active", func() bool {
+	// Generous: under -race on a loaded host the observers' next probes and
+	// the confirm's replication have taken longer than convergeTimeout. What
+	// is asserted is that d is never fenced, not how fast it settles.
+	eventually(t, time.Minute, "every observer to see d answer, and d active", func() bool {
 		for _, n := range f.observers {
 			if got, at, ok := observedFailures(n, f.d.Name); !ok || got != 0 || !at.After(served) {
 				return false

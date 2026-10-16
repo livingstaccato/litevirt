@@ -133,7 +133,8 @@ func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthR
 }
 
 // hostDBCapacity is what the database says one host holds: cpu and memory
-// over running VMs and containers, with the containers' memory share apart.
+// over running and starting VMs and running containers (dbVMCharge,
+// dbContainerCharge), with the containers' memory share apart.
 type hostDBCapacity struct{ cpu, mem, ctMem int }
 
 // dbCapacityByHost reads the capacity section's DB column from the database

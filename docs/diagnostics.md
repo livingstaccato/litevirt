@@ -1288,11 +1288,15 @@ and exactly equal to the DB epoch being superseded — missing, corrupt,
 unreadable, or unequal evidence refuses with a distinct reason.
 
 Effective capacity: every host samples the union of its database and
-runtime workloads each minute into `host_capacity_observations` — a rogue
+runtime workloads each minute into `host_capacity_observations`, and again
+within a few seconds of any change to the database's record of the host's
+workloads (one arriving, leaving, changing state or being resized) — a rogue
 runtime the database does not know about still consumes headroom in
 placement, and an uncapped rogue container makes the host's capacity
 explicitly *incomplete*, which disqualifies it as a placement target until
-resolved.
+resolved. A VM that is migrating is charged by neither placement nor
+admission, so its qemu counts in EXTRA on the host it runs on until the move
+commits.
 
 The `capacity:` table in `lv health` has one row per host that has sampled:
 
@@ -1303,8 +1307,9 @@ capacity:
 ```
 
 - **DB** is what the database holds on the host now, read at request time
-  with the rules placement charges by: running VMs at their recorded vCPU and
-  memory, then (`+… ct`) the memory of running containers. A container is
+  with the rules both placement and admission charge by: running and
+  starting VMs at their recorded vCPU and memory (placement also charges a
+  VM still `creating`, which is not shown here), then (`+… ct`) the memory of running containers. A container is
   charged its memory and nothing else — its cpu is a cap in cores, not a
   reservation — and carries no qemu overhead.
 - **EXTRA** is the sampler's finding: runtime usage beyond the database (a

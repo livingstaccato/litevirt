@@ -13,7 +13,7 @@ import (
 // The real engine reducer must audit already-applied receipts and every anchor,
 // not just resume beyond an apparently up-to-date prefix counter.
 func TestAutomationCutAuditsSource(t *testing.T) {
-	for _, mode := range []string{"complete", "prefix-loss", "history-gap", "anchor-gap", "anchor-bit", "anchor-signature", "receipt-drift", "request-drift", "pending", "unsupported", "missing-prefix-parent"} {
+	for _, mode := range []string{"complete", "prefix-loss", "request-loss", "history-gap", "anchor-gap", "anchor-bit", "anchor-signature", "anchor-target", "anchor-incarnation", "receipt-drift", "request-drift", "pending", "unsupported", "missing-prefix-parent"} {
 		t.Run(mode, func(t *testing.T) {
 			f := NewAutomationFixture(t, 3)
 			if _, err := f.Engine(0).Submit(f.ctx, f.Barrier(0, "cut-barrier")); err != nil {
@@ -26,19 +26,28 @@ func TestAutomationCutAuditsSource(t *testing.T) {
 			switch mode {
 			case "prefix-loss":
 				query = `DELETE FROM local_automation_prefix`
+			case "request-loss":
+				query = `DELETE FROM local_automation_requests`
 			case "history-gap":
 				query = `DELETE FROM local_automation_history WHERE sequence=1`
 			case "anchor-gap":
 				query = `DELETE FROM local_automation_anchors WHERE sequence=1`
 			case "anchor-bit":
 				query = `UPDATE local_automation_anchors SET digest='corrupt' WHERE sequence=1`
-			case "anchor-signature":
+			case "anchor-signature", "anchor-target", "anchor-incarnation":
 				r, ok, err := db.AutomationRecord(f.ctx, 1)
 				if err != nil || !ok {
 					t.Fatal(err)
 				}
 				for i := range r.Certificate.Accepts {
-					r.Certificate.Accepts[i].Signature = []byte{1}
+					switch mode {
+					case "anchor-signature":
+						r.Certificate.Accepts[i].Signature = []byte{1}
+					case "anchor-target":
+						r.Certificate.ValueDigest = strings.Repeat("f", 64)
+					case "anchor-incarnation":
+						r.Certificate.Accepts[i].VoterIncarnation = "wrong-incarnation"
+					}
 				}
 				cert, err := r.Certificate.Encode()
 				if err != nil {
@@ -101,7 +110,7 @@ func TestAutomationCutAuditsSource(t *testing.T) {
 			}
 			before := f.Head(t, 0)
 			id, err := f.Engine(0).FreezeMembershipCut(f.ctx, cfg.Generation)
-			if mode == "complete" || mode == "prefix-loss" {
+			if mode == "complete" || mode == "prefix-loss" || mode == "request-loss" {
 				if err != nil || id == "" {
 					t.Fatalf("complete source refused: %v", err)
 				}

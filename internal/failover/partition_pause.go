@@ -597,11 +597,16 @@ type regainCandidate struct {
 // once the voter configuration is pinned; ok is false when it is not, or a
 // set cannot be known.
 //
-// Pinned: no reset was decided since the outage began (`since`), and at most
-// one generation was; on the derived voter set none at all. A generation's
-// created_at is its decider's clock, so it is moved later by the decider's
-// skew (observerSkews), or by the largest of every other host's when
-// created_by names no host, and one that cannot be dated was decided since.
+// Pinned: no reset was decided since the outage began, and at most one
+// generation was; on the derived voter set none at all. "Since" reaches
+// healthFreshness back from `since`, the window membership changes use: a
+// generation decided just before the cut may not have reached, or been
+// adopted by, the host (its claim round, replication, the adoption tick).
+// So the host is at least on the last generation decided before that window,
+// which is the adopted one when none was decided since, and the one before
+// the adopted one when one was. A generation's created_at is its decider's
+// clock, moved later by stampSkew, and one that cannot be dated was decided
+// since.
 //
 // The sets, every one of which must be spanned:
 //
@@ -623,27 +628,14 @@ func (c *Coordinator) regainCandidates(ctx context.Context, host string, explici
 	if err != nil {
 		return nil, false
 	}
-	// A generation's decider is a host, but created_by may name the operator
-	// who asked for it: then any host but this one may have stamped it.
-	deciderSkew := func(by string) time.Duration {
-		if _, isHost := c.scope.vr.RegionOf[by]; isHost {
-			return skew(by)
-		}
-		var most time.Duration
-		for h := range c.scope.vr.RegionOf {
-			if h != host {
-				most = max(most, skew(h))
-			}
-		}
-		return most
-	}
+	stampSkew := c.stampSkew(host, skew)
 	decided := 0
 	for _, cfg := range cfgs {
 		if cfg == nil {
 			continue
 		}
 		created, ok := corrosion.ParseUpdatedAt(cfg.CreatedAt)
-		if ok && created.Add(deciderSkew(cfg.CreatedBy)).Before(since) {
+		if ok && created.Add(stampSkew).Before(since.Add(-healthFreshness)) {
 			continue
 		}
 		if !cfg.Explicit() || !explicit {
@@ -705,7 +697,7 @@ func (c *Coordinator) regainCandidates(ctx context.Context, host string, explici
 		}
 	}
 	if derived {
-		d, ok := c.derivedRegainCandidate(ctx, host, since)
+		d, ok := c.derivedRegainCandidate(ctx, host, since, stampSkew)
 		if !ok {
 			return nil, false
 		}
@@ -733,8 +725,9 @@ func (c *Coordinator) regionMembers(cfg *corrosion.VoterConfig, host string) map
 // in the set iff it is voting-eligible here, and its run counts unless its
 // state is unknown here. One that changed since then, or whose change cannot
 // be dated, is in the denominator and its run does not count: the host's
-// replica may or may not hold it.
-func (c *Coordinator) derivedRegainCandidate(ctx context.Context, host string, since time.Time) (regainCandidate, bool) {
+// replica may or may not hold it. A change is stamped on its writer's clock,
+// moved later by stampSkew.
+func (c *Coordinator) derivedRegainCandidate(ctx context.Context, host string, since time.Time, stampSkew time.Duration) (regainCandidate, bool) {
 	stamps, err := corrosion.HostMembershipStamps(ctx, c.db)
 	if err != nil {
 		return regainCandidate{}, false
@@ -746,14 +739,14 @@ func (c *Coordinator) derivedRegainCandidate(ctx context.Context, host string, s
 			continue
 		}
 		if st.DeletedAt != "" {
-			if del, ok := corrosion.ParseUpdatedAt(st.DeletedAt); ok && del.Before(cutoff) {
+			if del, ok := corrosion.ParseUpdatedAt(st.DeletedAt); ok && del.Add(stampSkew).Before(cutoff) {
 				continue // deleted before the outage: not in the host's set either
 			}
 			cand.set[st.Name] = true
 			continue
 		}
 		changed, ok := corrosion.ParseUpdatedAt(st.Changed)
-		unchanged := ok && changed.Before(cutoff)
+		unchanged := ok && changed.Add(stampSkew).Before(cutoff)
 		switch {
 		case unchanged && corrosion.VotingEligible(st.State):
 			cand.set[st.Name] = true
@@ -765,6 +758,23 @@ func (c *Coordinator) derivedRegainCandidate(ctx context.Context, host string, s
 		}
 	}
 	return cand, true
+}
+
+// stampSkew is how far a cluster stamp (a generation's created_at, a
+// membership change) may read early: the largest skew of any host but host.
+// The writer is not named (created_by is "<user> via <host>" or "automatic
+// genesis by <host>", and a membership row records no writer), so any host may
+// have stamped it. host itself is left out: what host stamped, host's own
+// replica holds, and a generation it decided is one it adopted, so its stamp
+// can date nothing host may lack.
+func (c *Coordinator) stampSkew(host string, skew func(string) time.Duration) time.Duration {
+	var most time.Duration
+	for h := range c.scope.vr.RegionOf {
+		if h != host {
+			most = max(most, skew(h))
+		}
+	}
+	return most
 }
 
 // unknownSkew is the clock skew assumed for a peer whose skew from this node

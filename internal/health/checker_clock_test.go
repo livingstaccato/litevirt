@@ -206,3 +206,23 @@ func TestMeasuredClockSkew_RemembersSmallSkews(t *testing.T) {
 		}
 	}
 }
+
+// A measurement older than skewMemory stands for nothing and is pruned on the
+// next measurement, so a removed host's entry does not stay.
+//
+// Mutation: drop the prune — host-old stays in skewSeen.
+func TestMeasuredClockSkew_PrunesOldMeasurements(t *testing.T) {
+	c := NewChecker("host-a", "/etc/litevirt/pki", testCheckerDB(t))
+	c.skewSeen["host-old"] = skewSample{skew: time.Second, at: time.Now().Add(-2 * skewMemory)}
+	if _, ok := c.MeasuredClockSkew("host-old"); ok {
+		t.Fatal("a measurement older than skewMemory reads as measured")
+	}
+	now := time.Now()
+	c.checkClockSkew(context.Background(), "host-b", now, now, now)
+	c.mu.Lock()
+	_, kept := c.skewSeen["host-old"]
+	c.mu.Unlock()
+	if kept {
+		t.Fatal("an expired measurement was not pruned")
+	}
+}

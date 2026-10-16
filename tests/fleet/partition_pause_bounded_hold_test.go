@@ -320,9 +320,9 @@ func measureSkews(t *testing.T, c *Cluster, s *ppStack) {
 }
 
 // settleVoterHistory waits until the setup's voter generations are older than
-// any outage the scenario starts by more than the deadline's dating margin
-// (fenceSkewMargin plus a measured skew): a generation decided since the
-// outage began is one the host may not have adopted.
+// any outage the scenario starts by more than the deadline's window
+// (healthFreshness plus fenceSkewMargin and a measured skew): a generation
+// decided within it is one the host may not have adopted.
 func settleVoterHistory(t *testing.T, c *Cluster) {
 	t.Helper()
 	cfgs, err := corrosion.ListVoterConfigs(context.Background(), c.Nodes[1].DB)
@@ -331,7 +331,7 @@ func settleVoterHistory(t *testing.T, c *Cluster) {
 	}
 	for _, cfg := range cfgs {
 		if at, ok := corrosion.ParseUpdatedAt(cfg.CreatedAt); ok {
-			if d := time.Until(at.Add(10 * time.Second)); d > 0 {
+			if d := time.Until(at.Add(45 * time.Second)); d > 0 {
 				time.Sleep(d)
 			}
 		}

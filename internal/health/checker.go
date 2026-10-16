@@ -774,6 +774,11 @@ func (c *Checker) checkClockSkew(ctx context.Context, peerName string, peerTimes
 	mid := reqStart.Add(reqEnd.Sub(reqStart) / 2)
 	skew := peerTimestamp.Sub(mid).Abs()
 	c.mu.Lock()
+	for p, old := range c.skewSeen {
+		if time.Since(old.at) > skewMemory {
+			delete(c.skewSeen, p) // a removed host's entry does not stay
+		}
+	}
 	c.skewSeen[peerName] = skewSample{skew: skew, at: time.Now()}
 	c.mu.Unlock()
 	if skew > time.Second {

@@ -277,7 +277,8 @@ func TestSelfPauseExplicit_TheVoterConfigurationMustBePinned(t *testing.T) {
 // whose state changed since the outage began — "a third fenced since" goes
 // ahead; count a voter whose state reads unknown — "a third reads unknown"
 // goes ahead; date a change against the outage start alone — "a third changed
-// just before" goes ahead; allow a generation since the outage on the
+// just before" goes ahead; date a change by this node's clock alone — "a
+// third changed 45 s before, a host never measured" goes ahead; allow a generation since the outage on the
 // derived set — "an explicit generation since" goes ahead; leave out the
 // generation a reset replaced — "a reset replaced generation 1" goes ahead;
 // read an unmeasured observer's skew as 0 — "a voter never measured" goes
@@ -321,6 +322,19 @@ func TestSelfPauseDerived_SpanningVotersBoundARestartedRun(t *testing.T) {
 					}
 				}
 				e.c.PeerClockSkew = func(string) (time.Duration, bool) { return 0, true }
+			}},
+		// v5's change is 45 s before the outage, outside healthFreshness by
+		// this node's clock, but alive was never measured: the change may be
+		// stamped by a writer 30 s behind, so it is not settled.
+		{name: "a third changed 45 s before, a host never measured", spanning: []string{"coordinator", "v4", "v5"}, restart: []string{"alive"}, wantKey: keyRestarted,
+			setup: func(t *testing.T, e env) {
+				ts := e.at.Add(-time.Minute - 5*time.Second - 45*time.Second).UTC().Format(time.RFC3339Nano)
+				for _, q := range []string{`UPDATE host_membership SET updated_at = ? WHERE host_name = 'v5'`, `UPDATE hosts SET updated_at = ? WHERE name = 'v5'`} {
+					if err := e.db.Execute(e.ctx, q, ts); err != nil {
+						t.Fatal(err)
+					}
+				}
+				e.c.PeerClockSkew = func(p string) (time.Duration, bool) { return 0, p != "alive" }
 			}},
 		// v5 has no membership row and this node's hosts copy is frozen:
 		// it reads unknown here, which down's replica need not share.
@@ -419,6 +433,76 @@ func TestSelfPauseDerived_SpanningVotersBoundARestartedRun(t *testing.T) {
 			}
 			if v.ok || v.key != tc.wantKey {
 				t.Fatalf("deadline: %+v; want refused under %q", v, tc.wantKey)
+			}
+		})
+	}
+}
+
+// A generation decided just before the outage began is not settled: down may
+// not have adopted it (its claim round, replication, the adoption tick). On
+// generation 1 = down, coordinator, alive, v4, v5, `voter add v6` (2) is
+// decided shortly before the cut, and `voter rm down` (3) since. down, still
+// on 1 with coordinator and alive, may hold a majority there, which neither 2
+// nor 3 shows: v4, v5 and v6 span both. So a generation stamped within
+// healthFreshness of the outage counts as decided since, and two since keep
+// the hold. The stamps name the operator, so they are moved by the largest
+// skew of any host but down: one host never measured moves them 30 s.
+//
+// Every voter's skew is measured as none (alive's too, but in the last arm),
+// so the outage is dated a minute before the fence less 5 s, and the window
+// reaches 30 s further back.
+//
+// Mutations: date a generation against the outage start alone, without the
+// window — "add v6 10 s before the outage" goes ahead; move an operator's
+// stamp by no skew — "add v6 40 s before, alive never measured" goes ahead.
+func TestSelfPauseExplicit_AGenerationJustBeforeTheOutageIsNotSettled(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		addBefore  time.Duration // how long before the outage began v6 was added
+		unmeasured string
+		wantOK     bool
+	}{
+		{"add v6 10 s before the outage, rm down since", 10 * time.Second, "", false},
+		{"add v6 40 s before the outage, rm down since", 40 * time.Second, "", true},
+		{"add v6 40 s before, alive never measured", 40 * time.Second, "alive", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, db, ctx, _ := explicitPause(t)
+			ensureVoter(t, db, "v6")
+			c.run(ctx)
+			h, err := corrosion.GetHost(ctx, db, "down")
+			if err != nil || h == nil {
+				t.Fatal(err)
+			}
+			at := time.Now().Add(-time.Minute)
+			backdateHistory(t, db, at.Add(-time.Hour))
+			outage := at.Add(-time.Minute - 5*time.Second)
+			writeGen(t, db, 2, "coordinator", "alive", "down", "v4", "v5", "v6")
+			writeGen(t, db, 3, "coordinator", "alive", "v4", "v5", "v6")
+			for g, ts := range map[int64]time.Time{2: outage.Add(-tc.addBefore), 3: time.Now()} {
+				if err := db.Execute(ctx, `UPDATE voter_configs SET created_at = ?, created_by = ? WHERE generation = ?`,
+					ts.UTC().Format(time.RFC3339Nano), "admin via coordinator", g); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := corrosion.RecordVoterAdoption(ctx, db, 3); err != nil {
+				t.Fatal(err)
+			}
+			c.PeerClockSkew = func(p string) (time.Duration, bool) { return 0, p != tc.unmeasured }
+			deadlineScope(t, c, db)
+			pausedCondition(t, db, at.Add(-time.Hour))
+			for _, o := range []string{"coordinator", "alive", "v4", "v5", "v6"} {
+				healthRow(t, db, o, "healthy", 0, at.Add(-time.Hour))
+			}
+			for _, o := range []string{"v4", "v5", "v6"} {
+				failingSince(t, db, o, at.Add(-time.Minute), time.Now())
+			}
+			for _, o := range []string{"coordinator", "alive"} {
+				failingSince(t, db, o, at.Add(20*time.Second), time.Now())
+			}
+			v := c.selfPauseStillStands(ctx, h, at, time.Now())
+			if v.ok != tc.wantOK || (!v.ok && !strings.HasPrefix(v.key, keyRestarted)) {
+				t.Fatalf("deadline: %+v; want ok=%v (refused under %q)", v, tc.wantOK, keyRestarted)
 			}
 		})
 	}

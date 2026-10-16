@@ -544,18 +544,23 @@ All of this is in the failover coordinator (`internal/failover`).
      over every voter set the host may be counting over, `n−q+1` voters
      other than the host have failing runs that span the fence, so the
      answer was a bridge's, and the deadline is quiet. The proof rests on
-     two premises, and without either the rule stands. The voter
-     configuration is pinned: at most one generation, and no reset, was
-     decided since the outage began (none at all on a derived set), and
-     the host had adopted the generation current when it began, or the one
-     before; the sets are then the adopted generation, each newer one and
-     the one before it. And the host's replica held every change of a
-     member's voting state made more than 30 s before the outage began. A
-     run spans only when it began `fenceSkewMargin` plus its observer's
-     clock skew from this node before the fence; an observer whose skew is
-     unknown (neither measured by this run nor recorded in `clock_skew`)
-     is taken as 30 s off. This node's own run is left out once it has
-     probed the host since the wait began.
+     two premises: the host adopted every voter generation, and its replica
+     held every change of a member's voting state, decided more than 30 s
+     before the outage began. A generation or change stamped within those
+     30 s, or since, or that cannot be dated, is one the host may lack. The
+     configuration must then be pinned, or the rule stands: at most one
+     generation, and no reset, decided within that window (none at all on a
+     derived set). The sets counted are the adopted generation, each newer
+     one, and the one before the adopted one, which covers the host's last
+     generation decided before the window whether or not one was decided
+     since. A stamp is the writer's clock, moved later by the largest skew
+     of any host but the fenced one. A run spans only when it began
+     `fenceSkewMargin` plus its observer's clock skew from this node before
+     the fence. A skew is this node's own measurement, kept in memory for an
+     hour (a clock that steps within that hour is not seen), or any
+     `clock_skew` row naming the host; one measured nowhere is taken as
+     30 s. This node's own run is left out once it has probed the host
+     since the wait began.
      A derived one, or a newer generation that is a
      reset, is read from each node's own replica of host state, and then
      any observer that has seen the host answer since the fence refuses

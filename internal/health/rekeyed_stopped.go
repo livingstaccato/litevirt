@@ -8,7 +8,6 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -119,7 +118,7 @@ func (r *Reconciler) defineRekeyedStoppedVM(ctx context.Context, vm corrosion.VM
 	for _, w := range withheld {
 		withheldDisk[w.Disk.DiskName] = true
 	}
-	var diskConfigs []lv.DiskConfig
+	var attach []corrosion.DiskRecord
 	for _, d := range disks {
 		if withheldDisk[d.DiskName] {
 			continue
@@ -138,15 +137,9 @@ func (r *Reconciler) defineRekeyedStoppedVM(ctx context.Context, vm corrosion.VM
 				return
 			}
 		}
-		bus := "virtio"
-		for _, sd := range spec.Disks {
-			if sd.Name == d.DiskName && sd.Bus != "" {
-				bus = sd.Bus
-				break
-			}
-		}
-		diskConfigs = append(diskConfigs, lv.DiskConfig{Name: d.DiskName, Path: d.Path, Bus: bus})
+		attach = append(attach, d)
 	}
+	diskConfigs := failoverDiskConfigs(spec, attach)
 	domXML, _, failure := r.domainXMLFor(ctx, *fresh, spec, diskConfigs)
 	if failure != "" {
 		r.noteRekeyOnce(vm.Name, "its domain cannot be built: "+failure)

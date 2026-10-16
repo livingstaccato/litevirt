@@ -1886,7 +1886,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		return
 	}
 
-	var diskConfigs []lv.DiskConfig
+	var attach []corrosion.DiskRecord
 	for _, d := range diskRecords {
 		if transfer {
 			if _, err := r.setAsideSupersededDisk(ctx, vm.Name, proofID, d); err != nil {
@@ -1991,21 +1991,9 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			// the start, as on main), but not attached.
 			continue
 		}
-		bus := "virtio"
-		if len(spec.Disks) > 0 {
-			for _, sd := range spec.Disks {
-				if sd.Name == d.DiskName && sd.Bus != "" {
-					bus = sd.Bus
-					break
-				}
-			}
-		}
-		diskConfigs = append(diskConfigs, lv.DiskConfig{
-			Name: d.DiskName,
-			Path: d.Path,
-			Bus:  bus,
-		})
+		attach = append(attach, d)
 	}
+	diskConfigs := failoverDiskConfigs(spec, attach)
 	// Every disk is in place: a parked transfer has done its rebuilding.
 	r.deferredTransfers.drop(vm.Name)
 
@@ -2585,10 +2573,16 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		} else if provBridge != "" {
 			bridge = provBridge
 		}
+		// The NIC's own model: a NIC attached as e1000 stays e1000, its
+		// guest driver is bound to it.
+		model := iface.Model
+		if model == "" {
+			model = "virtio"
+		}
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
 				Direct:      strings.TrimPrefix(bridge, "direct:"),
-				Model:       "virtio",
+				Model:       model,
 				MAC:         iface.MAC,
 				SpecOrdinal: iface.Ordinal + 1,
 				RateMBps:    rate,
@@ -2596,6 +2590,7 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		} else {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
 				Bridge:      bridge,
+				Model:       model,
 				MAC:         iface.MAC,
 				SpecOrdinal: iface.Ordinal + 1,
 				RateMBps:    rate,
@@ -2603,26 +2598,17 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		}
 	}
 
-	// The stored spec's disk tuning (discard, throttle) and NIC queues: a VM
-	// started on this host after a failover keeps what it had.
-	compose.ApplyDiskTuning(diskConfigs, spec)
-	compose.ApplyNICTuning(netConfigs, spec)
-
-	// Build libvirt domain config.
-	vmCfg := lv.VMConfig{
-		Name:         vm.Name,
-		CPU:          vm.CPUActual,
-		MemoryMiB:    vm.MemActual,
-		Machine:      spec.Machine,
-		Firmware:     spec.Firmware,
-		GuestAgent:   spec.GuestAgent,
-		Disks:        diskConfigs,
-		Networks:     netConfigs,
-		CloudInitISO: cloudInitISO,
-		Boot:         spec.Boot,
-		CPULimit:     spec.CpuLimit,
-		CPUShares:    int(spec.CpuShares),
-	}
+	// Build the libvirt domain config with the builder CreateVM and a redefine
+	// use, so the VM boots on this host with the hardware it was created with:
+	// its CPU mode and model, vCPU ceiling, balloon, consoles, disk and NIC
+	// tuning, resources. The vCPU and memory are the VM's current ones. A spec
+	// with no cpu_mode (stored before the create-time default) renders as it
+	// does on every other path, with no <cpu>: a boot here must not change the
+	// CPU the guest sees (lv doctor cpu-mode, lv update --cpu-mode).
+	vmCfg := compose.DomainConfig(spec, diskConfigs, netConfigs, nil)
+	vmCfg.Name = vm.Name
+	vmCfg.CPU = vm.CPUActual
+	vmCfg.CloudInitISO = cloudInitISO
 	if vmCfg.Machine == "" {
 		vmCfg.Machine = "q35"
 	}
@@ -2633,17 +2619,14 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 	// created with, plugged to its desired memory, so a set-memory after the
 	// recovery plugs instead of finding no region. (USB devices are added by
 	// the start hook every start path runs, PrepareHardwareForStart.)
-	if spec.MemoryHotplugMaxMib > 0 {
-		vmCfg.HotplugBaseMiB = int(spec.MemoryHotplugBaseMib)
-		vmCfg.HotplugMaxMiB = int(spec.MemoryHotplugMaxMib)
-		vmCfg.MemoryMiB = int(spec.MemoryMib)
+	if spec.MemoryHotplugMaxMib == 0 {
+		vmCfg.MemoryMiB = vm.MemActual
 	}
 	// Secure Boot + vTPM (G1): stable UUID makes the swtpm state path
 	// (/var/lib/libvirt/swtpm/<uuid>/) deterministic; render the same firmware
 	// CreateVM did. A vTPM VM whose state isn't present on this host can't be
 	// rebuilt faithfully — fail clearly (state=error) rather than booting with a
 	// fresh TPM and silently breaking BitLocker.
-	vmCfg.UUID = spec.Uuid
 	r.firmware.ApplyTo(&vmCfg, r.dataDir, vm.Name, spec.SecureBoot, spec.Tpm)
 	if spec.Tpm && !lv.HasTPMState(spec.Uuid) {
 		slog.Error("reconciler: vTPM VM has no local TPM state; refusing to start with a fresh TPM", "vm", vm.Name)
@@ -2657,20 +2640,6 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		slog.Error("reconciler: firmware VM has no local UEFI NVRAM; refusing to start with fresh vars", "vm", vm.Name)
 		return "", false, "UEFI NVRAM missing on this host (would lose Secure Boot keys)" // non-retryable
 	}
-	if r := spec.Resources; r != nil {
-		vmCfg.HugePages = r.Hugepages
-		vmCfg.IOThreads = int(r.IoThreads)
-		for _, pin := range r.CpuPinning {
-			vmCfg.CPUPinning = append(vmCfg.CPUPinning, int(pin))
-		}
-		if np := r.NumaPolicy; np != nil {
-			vmCfg.NUMAPolicy = &lv.NUMAPolicy{
-				PreferredNode: int(np.PreferredNode),
-				Strict:        np.Strict,
-			}
-		}
-	}
-
 	// NIC MTUs resolve against this host's bridges, provisioned above.
 	if br, ok := r.virt.(lv.BridgeMTUReader); ok {
 		vmCfg.BridgeMTU = br.BridgeMTU

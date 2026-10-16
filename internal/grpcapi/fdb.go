@@ -58,10 +58,10 @@ func (s *Server) broadcastFDBUpdate(ctx context.Context, networkName string, vni
 		if v.HostName == s.hostName {
 			// Local update.
 			if oldVTEP != "" {
-				network.DeleteFDBEntry(vni, mac, oldVTEP)
+				s.hostNetworkEffects().DeleteFDBEntry(vni, mac, oldVTEP)
 			}
 			if newVTEP != "" {
-				if err := network.AddFDBEntry(vni, mac, newVTEP); err != nil {
+				if err := s.hostNetworkEffects().AddFDBEntry(vni, mac, newVTEP); err != nil {
 					slog.Warn("broadcastFDBUpdate: local add", "mac", mac, "vtep", newVTEP, "error", err)
 				}
 			}

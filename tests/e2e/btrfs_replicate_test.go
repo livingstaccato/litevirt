@@ -58,7 +58,7 @@ func TestLab_BtrfsNativeReplicate(t *testing.T) {
 
 	stack := uniqueName("btrrep")
 	vm := stack + "-1"
-	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    disks:\n      root:\n        size: \"1G\"\n        storage: %q\n      data:\n        size: \"64M\"\n        storage: %q\n    placement:\n      host: %s\n",
+	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    firmware: bios\n    disks:\n      root:\n        size: \"1G\"\n        storage: %q\n      data:\n        size: \"64M\"\n        storage: %q\n    placement:\n      host: %s\n",
 		stack, vm, drillImage(), drillMemory(), srcPool, srcPool, h)
 	file := "/tmp/" + stack + ".yaml"
 	l.putFile(h, file, yaml)

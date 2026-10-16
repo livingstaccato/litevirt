@@ -45,6 +45,16 @@ func SyncPeerVTEP(ctx context.Context, db *corrosion.Client, networkName, hostNa
 	return syncFDB(ctx, db, hostFDB(), networkName, hostName, vni, peer, peerAddr)
 }
 
+// SyncPeerVTEPWith preserves the peer's pushed-address override while running
+// the existing sync algorithm against an explicit host model, like SyncFDBWith.
+func SyncPeerVTEPWith(ctx context.Context, db *corrosion.Client, networkName, hostName string, vni int, peer, peerAddr string, exec ExecFunc, local []string) error {
+	o := fdbOps{exec: exec, local: localAddrs{}}
+	for _, a := range local {
+		o.local[a] = ""
+	}
+	return syncFDB(ctx, db, o, networkName, hostName, vni, peer, peerAddr)
+}
+
 // SyncFDB is SyncFloodEntries for a provisioned network's definition: a no-op
 // for anything but a vxlan network.
 func SyncFDB(ctx context.Context, db *corrosion.Client, networkName string, def compose.NetworkDef, hostName string) error {

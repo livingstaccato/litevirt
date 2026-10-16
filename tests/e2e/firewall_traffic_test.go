@@ -20,6 +20,7 @@ import (
 	"io"
 	"net"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -121,8 +122,37 @@ func (l *lab) guestIP(host, vm string, timeout time.Duration) string {
 		}
 		time.Sleep(10 * time.Second)
 	}
+	if v := guestBootVerdict(l.domStats(host, vm)); v != "" {
+		l.t.Fatalf("%s (%s) on %s: %s", vm, mac, host, v)
+	}
 	l.t.Fatalf("%s (%s) never took a DHCP lease on %s", vm, mac, host)
 	return ""
+}
+
+// domStats is virsh's per-interface counters for vm, or "" when they cannot be
+// read.
+func (l *lab) domStats(host, vm string) string {
+	out, _ := l.ssh(host, 20*time.Second, "virsh -c qemu:///system domstats --interface "+shellQuote(vm)+" 2>/dev/null")
+	return out
+}
+
+var netTxPkts = regexp.MustCompile(`(?m)^\s*net\.\d+\.tx\.pkts=(\d+)`)
+
+// guestBootVerdict reads `virsh domstats --interface` output: when every NIC
+// shows zero transmitted packets the guest never sent a frame (not even a DHCP
+// discover), so it never booted and the missing lease says nothing about
+// DHCP. It returns "" when the counters are unreadable or show traffic.
+func guestBootVerdict(domstats string) string {
+	m := netTxPkts.FindAllStringSubmatch(domstats, -1)
+	if len(m) == 0 {
+		return ""
+	}
+	for _, x := range m {
+		if x[1] != "0" {
+			return ""
+		}
+	}
+	return "guest never booted: no frames sent from any NIC (check its firmware and memory; a small cirros needs BIOS), so it never asked for a DHCP lease"
 }
 
 // guestTap is the host device of vm's (only) NIC.
@@ -225,36 +255,42 @@ vms:
     image: %[2]s
     cpu: 1
     memory: %[3]s
+    firmware: bios
     network: [{name: fwt}]
     placement: {host: %[4]s}
   b:
     image: %[2]s
     cpu: 1
     memory: %[3]s
+    firmware: bios
     network: [{name: fwt, security-groups: [noicmp]}]
     placement: {host: %[4]s}
   c:
     image: %[2]s
     cpu: 1
     memory: %[3]s
+    firmware: bios
     network: [{name: fwt, security-groups: [sshonly]}]
     placement: {host: %[4]s}
   d:
     image: %[2]s
     cpu: 1
     memory: %[3]s
+    firmware: bios
     network: [{name: fwt}]
     placement: {host: %[4]s}
   e:
     image: %[2]s
     cpu: 1
     memory: %[3]s
+    firmware: bios
     network: [{name: fwt, security-groups: [silent]}]
     placement: {host: %[4]s}
   t:
     image: %[2]s
     cpu: 1
     memory: %[3]s
+    firmware: bios
     network: [{name: fwt}, {name: fwt2, trunk: [100, 101]}]
     placement: {host: %[4]s}
 `, stack, drillImage(), drillMemory(), host)

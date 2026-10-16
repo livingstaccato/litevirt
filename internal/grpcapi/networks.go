@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"strings"
 
@@ -625,7 +626,7 @@ func (s *Server) SyncVTEP(ctx context.Context, req *pb.SyncVTEPRequest) (*emptyp
 	}
 	// The sender is the peer the certificate names (requirePeerCert bound it
 	// to a live host row): its pushed VTEP stands in for its row here.
-	if err := syncPeerVTEP(ctx, s.db, req.NetworkName, s.hostName, int(req.Vni),
+	if err := s.hostNetworkEffects().SyncPeerVTEP(ctx, s.db, req.NetworkName, s.hostName, int(req.Vni),
 		callerMTLSCommonName(ctx), req.VtepIp); err != nil {
 		return nil, status.Errorf(codes.Internal, "add flood entry: %v", err)
 	}
@@ -670,6 +671,24 @@ func (s *Server) GetVMIPRemote(ctx context.Context, req *pb.GetVMIPRequest) (*pb
 		}
 		return &pb.GetVMIPResponse{Ip: ip}, nil
 	}
+	if req.LeaseOnly {
+		// This host's dnsmasq lease for the MAC on the network's bridge, and
+		// nothing else: a peer asks because the lease is authoritative, and an
+		// ARP entry here is not (discoverNICAddressesWithPeers). No network
+		// record, no bridge: no lease file to read.
+		if _, err := net.ParseMAC(req.Mac); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "mac %q: %v", req.Mac, err)
+		}
+		bridge := network.LeaseBridge(ctx, s.db, req.NetworkName)
+		if bridge == "" {
+			return &pb.GetVMIPResponse{}, nil
+		}
+		ip, expiry := s.localLease(req.Mac, bridge)
+		if ip == "" {
+			return &pb.GetVMIPResponse{}, nil
+		}
+		return &pb.GetVMIPResponse{Ip: ip, Lease: true, LeaseExpiry: expiry}, nil
+	}
 	return &pb.GetVMIPResponse{Ip: s.discoverNICAddress(ctx, req.Mac, req.NetworkName)}, nil
 }
 
@@ -680,10 +699,10 @@ func (s *Server) UpdateFDB(ctx context.Context, req *pb.UpdateFDBRequest) (*empt
 		return nil, err
 	}
 	if req.OldVtepIp != "" {
-		network.DeleteFDBEntry(int(req.Vni), req.Mac, req.OldVtepIp)
+		s.hostNetworkEffects().DeleteFDBEntry(int(req.Vni), req.Mac, req.OldVtepIp)
 	}
 	if req.NewVtepIp != "" {
-		if err := network.AddFDBEntry(int(req.Vni), req.Mac, req.NewVtepIp); err != nil {
+		if err := s.hostNetworkEffects().AddFDBEntry(int(req.Vni), req.Mac, req.NewVtepIp); err != nil {
 			return nil, status.Errorf(codes.Internal, "add FDB: %v", err)
 		}
 	}

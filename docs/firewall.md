@@ -301,8 +301,24 @@ iptables):
   its VIP (`oifname <uplink> ip saddr <subnet> snat to <vip>`), emitted before
   masquerade.
 - **Host isolation** — an `input` chain drops guest→host traffic per isolated
-  bridge (`iifname <bridge> drop`), punching through VRRP + declared LB VIP ports
-  first so guests can still reach an HAProxy VIP.
+  bridge (`iifname <bridge> drop`), punching through VRRP and declared LB VIP
+  ports first so guests can still reach an HAProxy VIP, and replies to
+  connections the host opened onto that bridge (so HAProxy reaches backends
+  there): an `isolation_output` chain marks each connection the host opens out
+  of the bridge with a per-bridge ct mark, and the input chain accepts only
+  reply-direction packets carrying it. Bits 16-27 of the ct mark are
+  litevirt's; each host-isolated bridge on a host gets a distinct value there.
+  Connections the host opened onto a host-isolated bridge before an upgrade
+  to this rule carry no mark, so their replies are dropped once: a long-lived
+  connection (an HAProxy keep-alive to a backend) reconnects.
+- **Isolated networks** — an `isolated_forward` chain on the `forward` hook
+  drops anything routed off or onto an `isolated` network's bridge: per live
+  isolated network's bridge (`iifname "<bridge>" oifname != "<bridge>" drop`
+  and the reverse), and for every device in interface group 27766, which
+  litevirt gives each bridge it creates for an isolated network, whether or not
+  a network row names it (`iifgroup 27766 oifgroup != 27766 drop` and the
+  reverse). No device is matched by name. The chain is in every ruleset. Guests on one isolated bridge still reach each other and the
+  host's `dnsmasq` on it.
 
 These decisions are made by network provisioning and the LB apply path and
 recorded per host in `host_fw_intent`; the reconciler reads that table and
@@ -704,7 +720,22 @@ this host's own `failover_scope_v1` latch cannot form, the create fails. A
 container whose guards cannot be written for any other reason is not created. A record is retired (tombstoned) when its
 VM or container is deleted, and a record written for another incarnation of the
 same VM name guards nothing; a re-create carries only the guard state of the
-incarnation it replaces.
+incarnation it replaces. A NIC's record is also retired when `lv detach-nic`
+removes the NIC, once it is gone from the domain, and when an `lv attach-nic`
+that wrote it fails and its NIC is verified gone. A record an earlier build
+left for a NIC the VM no longer has is not demanded in force once the NIC's row
+is tombstoned, and the VM's owner retires it at the VM's next `lv attach-nic`,
+`lv migrate` or `lv start`, when no NIC row and neither definition of the
+domain on that host has its MAC. The owner judges from its own replica, so it
+can retire the record of a NIC whose row has not reached it yet. A retired
+record of the running incarnation still guards, with the default guard, a NIC
+whose row is live, unless its network cannot enforce a guard; `lv firewall
+nic-guard ls` and the compose plan name such a NIC, and `lv firewall nic-guard
+set` replaces its guard. A target judges a migration from its own replica, so
+a NIC attached moments before the move can arrive before its record. A guard
+write behind a stored write for that NIC stamped more than 5 minutes ahead of
+this host's clock is refused, naming the stamp; check NTP on the host that
+wrote it.
 
 **Neighbour discovery.** A guarded NIC's solicitations and advertisements are
 held to the header and one 8-byte option (the link-layer address, or a

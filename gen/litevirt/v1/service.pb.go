@@ -10305,7 +10305,15 @@ type ApplyLBRequest struct {
 	// proof authorizes a gated LB apply / VIP takeover (split-brain hardening, v38);
 	// nil pre-activation. The LB host validates it (dest==self, action==lb_apply) and
 	// claims it single-use before applying.
-	Proof         *RuntimeActionProof `protobuf:"bytes,7,opt,name=proof,proto3" json:"proof,omitempty"`
+	Proof *RuntimeActionProof `protobuf:"bytes,7,opt,name=proof,proto3" json:"proof,omitempty"`
+	// snat: whether this LB rewrites its network's guest egress to the VIP
+	// (compose `snat:`). Absent — a caller on an earlier build — applies
+	// SNAT, as every ApplyLB did before the field existed.
+	Snat *bool `protobuf:"varint,8,opt,name=snat,proto3,oneof" json:"snat,omitempty"`
+	// stack_name: the stack whose LB this is ("" for an explicit LB), so the
+	// VIP goes on that stack's network when the LB's row has not replicated
+	// here yet.
+	StackName     string `protobuf:"bytes,9,opt,name=stack_name,json=stackName,proto3" json:"stack_name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -10387,6 +10395,20 @@ func (x *ApplyLBRequest) GetProof() *RuntimeActionProof {
 		return x.Proof
 	}
 	return nil
+}
+
+func (x *ApplyLBRequest) GetSnat() bool {
+	if x != nil && x.Snat != nil {
+		return *x.Snat
+	}
+	return false
+}
+
+func (x *ApplyLBRequest) GetStackName() string {
+	if x != nil {
+		return x.StackName
+	}
+	return ""
 }
 
 // RemoveLBRequest tells a host to tear down a local LB instance.
@@ -33206,8 +33228,14 @@ type GetVMIPRequest struct {
 	// owner_kind selects how the peer resolves the address: "" or "vm" (default,
 	// back-compatible) → MAC-based ARP/DHCP lookup; "ct" → resolve owner_name as a
 	// container (lxc-info / its interface row). owner_name is the container name.
-	OwnerKind     string `protobuf:"bytes,3,opt,name=owner_kind,json=ownerKind,proto3" json:"owner_kind,omitempty"`
-	OwnerName     string `protobuf:"bytes,4,opt,name=owner_name,json=ownerName,proto3" json:"owner_name,omitempty"`
+	OwnerKind string `protobuf:"bytes,3,opt,name=owner_kind,json=ownerKind,proto3" json:"owner_kind,omitempty"`
+	OwnerName string `protobuf:"bytes,4,opt,name=owner_name,json=ownerName,proto3" json:"owner_name,omitempty"`
+	// lease_only (owner_kind "" or "vm"): answer only from THIS host's dnsmasq
+	// lease for mac on network_name's bridge, never from ARP, and set
+	// GetVMIPResponse.lease. A VM's host asks the other hosts of a vxlan
+	// network, whose DHCP server may run on any of them. A peer on an earlier
+	// build ignores it and never sets lease, so its answer is not taken.
+	LeaseOnly     bool `protobuf:"varint,5,opt,name=lease_only,json=leaseOnly,proto3" json:"lease_only,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -33270,9 +33298,20 @@ func (x *GetVMIPRequest) GetOwnerName() string {
 	return ""
 }
 
+func (x *GetVMIPRequest) GetLeaseOnly() bool {
+	if x != nil {
+		return x.LeaseOnly
+	}
+	return false
+}
+
 type GetVMIPResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Ip            string                 `protobuf:"bytes,1,opt,name=ip,proto3" json:"ip,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Ip    string                 `protobuf:"bytes,1,opt,name=ip,proto3" json:"ip,omitempty"`
+	// lease: ip is this host's dnsmasq lease for the MAC (lease_only).
+	Lease bool `protobuf:"varint,2,opt,name=lease,proto3" json:"lease,omitempty"`
+	// lease_expiry: that lease's expiry in Unix seconds; 0 = infinite.
+	LeaseExpiry   int64 `protobuf:"varint,3,opt,name=lease_expiry,json=leaseExpiry,proto3" json:"lease_expiry,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -33312,6 +33351,20 @@ func (x *GetVMIPResponse) GetIp() string {
 		return x.Ip
 	}
 	return ""
+}
+
+func (x *GetVMIPResponse) GetLease() bool {
+	if x != nil {
+		return x.Lease
+	}
+	return false
+}
+
+func (x *GetVMIPResponse) GetLeaseExpiry() int64 {
+	if x != nil {
+		return x.LeaseExpiry
+	}
+	return 0
 }
 
 type RefreshLBRequest struct {
@@ -43806,7 +43859,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\abackend\x18\x02 \x01(\tR\abackend\"I\n" +
 	"\x14EnableBackendRequest\x12\x17\n" +
 	"\alb_name\x18\x01 \x01(\tR\x06lbName\x12\x18\n" +
-	"\abackend\x18\x02 \x01(\tR\abackend\"\x85\x02\n" +
+	"\abackend\x18\x02 \x01(\tR\abackend\"\xc6\x02\n" +
 	"\x0eApplyLBRequest\x12\x17\n" +
 	"\alb_name\x18\x01 \x01(\tR\x06lbName\x12\x10\n" +
 	"\x03vip\x18\x02 \x01(\tR\x03vip\x12\x1c\n" +
@@ -43814,7 +43867,11 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\bbackends\x18\x04 \x03(\v2\x16.litevirt.v1.LBBackendR\bbackends\x12)\n" +
 	"\x05ports\x18\x05 \x03(\v2\x13.litevirt.v1.LBPortR\x05ports\x12\x14\n" +
 	"\x05hosts\x18\x06 \x03(\tR\x05hosts\x125\n" +
-	"\x05proof\x18\a \x01(\v2\x1f.litevirt.v1.RuntimeActionProofR\x05proof\"*\n" +
+	"\x05proof\x18\a \x01(\v2\x1f.litevirt.v1.RuntimeActionProofR\x05proof\x12\x17\n" +
+	"\x04snat\x18\b \x01(\bH\x00R\x04snat\x88\x01\x01\x12\x1d\n" +
+	"\n" +
+	"stack_name\x18\t \x01(\tR\tstackNameB\a\n" +
+	"\x05_snat\"*\n" +
 	"\x0fRemoveLBRequest\x12\x17\n" +
 	"\alb_name\x18\x01 \x01(\tR\x06lbName\"\xf2\x01\n" +
 	"\x0fCreateLBRequest\x12\x12\n" +
@@ -45662,16 +45719,20 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0fSyncVTEPRequest\x12!\n" +
 	"\fnetwork_name\x18\x01 \x01(\tR\vnetworkName\x12\x17\n" +
 	"\avtep_ip\x18\x02 \x01(\tR\x06vtepIp\x12\x10\n" +
-	"\x03vni\x18\x03 \x01(\x05R\x03vni\"\x83\x01\n" +
+	"\x03vni\x18\x03 \x01(\x05R\x03vni\"\xa2\x01\n" +
 	"\x0eGetVMIPRequest\x12\x10\n" +
 	"\x03mac\x18\x01 \x01(\tR\x03mac\x12!\n" +
 	"\fnetwork_name\x18\x02 \x01(\tR\vnetworkName\x12\x1d\n" +
 	"\n" +
 	"owner_kind\x18\x03 \x01(\tR\townerKind\x12\x1d\n" +
 	"\n" +
-	"owner_name\x18\x04 \x01(\tR\townerName\"!\n" +
+	"owner_name\x18\x04 \x01(\tR\townerName\x12\x1d\n" +
+	"\n" +
+	"lease_only\x18\x05 \x01(\bR\tleaseOnly\"Z\n" +
 	"\x0fGetVMIPResponse\x12\x0e\n" +
-	"\x02ip\x18\x01 \x01(\tR\x02ip\"1\n" +
+	"\x02ip\x18\x01 \x01(\tR\x02ip\x12\x14\n" +
+	"\x05lease\x18\x02 \x01(\bR\x05lease\x12!\n" +
+	"\flease_expiry\x18\x03 \x01(\x03R\vleaseExpiry\"1\n" +
 	"\x10RefreshLBRequest\x12\x1d\n" +
 	"\n" +
 	"stack_name\x18\x01 \x01(\tR\tstackName\"v\n" +
@@ -48428,6 +48489,7 @@ func file_litevirt_v1_service_proto_init() {
 	file_litevirt_v1_types_proto_init()
 	file_litevirt_v1_service_proto_msgTypes[35].OneofWrappers = []any{}
 	file_litevirt_v1_service_proto_msgTypes[73].OneofWrappers = []any{}
+	file_litevirt_v1_service_proto_msgTypes[138].OneofWrappers = []any{}
 	file_litevirt_v1_service_proto_msgTypes[160].OneofWrappers = []any{}
 	file_litevirt_v1_service_proto_msgTypes[177].OneofWrappers = []any{
 		(*PushBackupFrame_Header)(nil),

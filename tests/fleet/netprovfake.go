@@ -40,6 +40,66 @@ type NetProvFake struct {
 	fdbSyncs      map[string]int    // network → SyncFDB calls
 	kernel        *fdbfake.Kernel   // this node's vxlan forwarding table (SyncFDB)
 	vnis          map[string]int    // network → VNI, from SyncFDB
+	garps         map[string]int    // bridge + IP → gratuitous ARP sends
+}
+
+func (f *NetProvFake) GARPCount(bridge, ip string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.garps[bridge+"\x00"+ip]
+}
+
+func (f *NetProvFake) FDBDestinations(vni int, mac string) []string {
+	f.mu.Lock()
+	k := f.kernel
+	f.mu.Unlock()
+	if k == nil {
+		return nil
+	}
+	return k.Dsts(fmt.Sprintf("vxlan%d", vni), mac)
+}
+
+func (f *NetProvFake) fdbKernel() (*fdbfake.Kernel, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.kernel == nil {
+		f.kernel = fdbfake.New()
+	}
+	local := make([]string, 0, len(f.vteps))
+	for _, addr := range f.vteps {
+		local = append(local, addr)
+	}
+	return f.kernel, local
+}
+
+func (f *NetProvFake) AddFDBEntry(vni int, mac, remoteVTEP string) error {
+	k, local := f.fdbKernel()
+	return network.AddFDBEntryWith(vni, mac, remoteVTEP, k.Exec, local)
+}
+
+func (f *NetProvFake) DeleteFDBEntry(vni int, mac, remoteVTEP string) error {
+	k, _ := f.fdbKernel()
+	return network.DeleteFDBEntryWith(vni, mac, remoteVTEP, k.Exec)
+}
+
+func (f *NetProvFake) SyncPeerVTEP(ctx context.Context, db *corrosion.Client, networkName, hostName string, vni int, peer, peerAddr string) error {
+	k, local := f.fdbKernel()
+	return network.SyncPeerVTEPWith(ctx, db, networkName, hostName, vni, peer, peerAddr, k.Exec, local)
+}
+
+func (f *NetProvFake) SendGARP(bridge, ip string) error {
+	return network.SendGARPWith(bridge, ip, func(name string, args ...string) ([]byte, error) {
+		if name != "arping" || len(args) != 6 || args[0] != "-A" || args[1] != "-c" || args[2] != "3" || args[3] != "-I" {
+			return nil, fmt.Errorf("unexpected GARP command: %s %v", name, args)
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.garps == nil {
+			f.garps = map[string]int{}
+		}
+		f.garps[args[4]+"\x00"+args[5]]++
+		return nil, nil
+	})
 }
 
 func NewNetProvFake() *NetProvFake {
@@ -192,6 +252,41 @@ func (f *NetProvFake) Up(network string) (string, bool) {
 	defer f.mu.Unlock()
 	dev, ok := f.up[network]
 	return dev, ok
+}
+
+// HasDevice reports whether a provisioned network, or a flat bridge
+// EnsureBridge made, is on dev here.
+func (f *NetProvFake) HasDevice(dev string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.flat[dev] {
+		return true
+	}
+	for _, d := range f.up {
+		if d == dev {
+			return true
+		}
+	}
+	return false
+}
+
+// Addrs is the gateway address each network provisioned here on dev with a
+// subnet carries (its first host), as the real provisioner gives a bridge it
+// made.
+func (f *NetProvFake) Addrs(dev string) []netip.Prefix {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []netip.Prefix
+	for n, d := range f.up {
+		if d != dev {
+			continue
+		}
+		if p, err := netip.ParsePrefix(f.subnets[n]); err == nil {
+			p = p.Masked()
+			out = append(out, netip.PrefixFrom(p.Addr().Next(), p.Bits()))
+		}
+	}
+	return out
 }
 
 // Provisions and Deprovisions count calls for network on this node.

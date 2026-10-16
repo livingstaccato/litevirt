@@ -8,13 +8,18 @@ import (
 // SendGARP sends a gratuitous ARP on the given bridge for the specified IP.
 // This updates switch MAC tables after a VM migration. Uses arping(8).
 func SendGARP(bridge, ip string) error {
+	return SendGARPWith(bridge, ip, execCommand)
+}
+
+// SendGARPWith uses the same command construction with a supplied executor.
+func SendGARPWith(bridge, ip string, exec ExecFunc) error {
 	if bridge == "" || ip == "" {
 		return nil
 	}
 	// arping -A: ARP reply mode (gratuitous)
 	// -c 3: send 3 packets
 	// -I <bridge>: send on this interface
-	out, err := execCommand("arping", "-A", "-c", "3", "-I", bridge, ip)
+	out, err := exec("arping", "-A", "-c", "3", "-I", bridge, ip)
 	if err != nil {
 		return fmt.Errorf("arping on %s for %s: %w: %s", bridge, ip, err, out)
 	}

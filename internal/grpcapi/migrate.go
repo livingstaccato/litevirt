@@ -26,7 +26,6 @@ import (
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/hooks"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
-	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -673,7 +672,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// The target puts the guest's NIC firewall — its guards above all — in
 	// force before the guest arrives, under the tap names its MACs fix
 	// (re-review I-10). Before anything is written, so a refusal changes
-	// nothing.
+	// nothing. A guard record an earlier build left for a NIC the VM no
+	// longer has is retired first: no target could put it in force.
+	s.retireOrphanNICGuards(ctx, vm.Name, "")
 	armed, aerr := s.armMigrationTarget(ctx, targetHost, vm.Name)
 	if aerr != nil {
 		return aerr
@@ -2640,7 +2641,7 @@ func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRe
 	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
 	for _, iface := range ifaces {
 		if iface.IP != "" {
-			go network.SendGARPBestEffort(iface.NetworkName, iface.IP)
+			go s.sendGARPBestEffort(iface.NetworkName, iface.IP)
 		}
 	}
 

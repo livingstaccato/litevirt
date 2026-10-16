@@ -1044,6 +1044,14 @@ message ApplyLBRequest {
     // nil pre-activation. The LB host validates it (dest==self, action==lb_apply) and
     // claims it single-use before applying.
     RuntimeActionProof proof = 7;
+    // snat: whether this LB rewrites its network's guest egress to the VIP
+    // (compose `snat:`). Absent — a caller on an earlier build — applies
+    // SNAT, as every ApplyLB did before the field existed.
+    optional bool snat = 8;
+    // stack_name: the stack whose LB this is ("" for an explicit LB), so the
+    // VIP goes on that stack's network when the LB's row has not replicated
+    // here yet.
+    string stack_name = 9;
 }
 
 // RemoveLBRequest tells a host to tear down a local LB instance.
@@ -3812,9 +3820,19 @@ message GetVMIPRequest {
     // container (lxc-info / its interface row). owner_name is the container name.
     string owner_kind = 3;
     string owner_name = 4;
+    // lease_only (owner_kind "" or "vm"): answer only from THIS host's dnsmasq
+    // lease for mac on network_name's bridge, never from ARP, and set
+    // GetVMIPResponse.lease. A VM's host asks the other hosts of a vxlan
+    // network, whose DHCP server may run on any of them. A peer on an earlier
+    // build ignores it and never sets lease, so its answer is not taken.
+    bool lease_only = 5;
 }
 message GetVMIPResponse {
     string ip = 1;
+    // lease: ip is this host's dnsmasq lease for the MAC (lease_only).
+    bool lease = 2;
+    // lease_expiry: that lease's expiry in Unix seconds; 0 = infinite.
+    int64 lease_expiry = 3;
 }
 
 message RefreshLBRequest {

@@ -118,6 +118,14 @@ An isolated network does not span hosts. Every host gets its own copy: its own
 leasing the same range. VMs on different hosts cannot reach each other over it,
 and two VMs on different hosts can be leased the same address.
 
+The firewall drops everything the host would route off an isolated bridge or
+onto it, including to another isolated network on the same host, so a guest
+there has no path out even on a host that forwards and whose uplink NATs any
+source. litevirt puts every isolated bridge it creates in an interface group
+the firewall matches, so the drop also covers one whose network row is gone;
+a daemon marks bridges an earlier build made when it provisions them again
+on its first pass (see [firewall.md](firewall.md#nat-snat-and-host-isolation)).
+
 ### SR-IOV
 
 Passes a virtual function (VF) from an SR-IOV-capable NIC directly to the VM for near-native network performance.
@@ -679,7 +687,14 @@ one wins; and every lookup — the IP scanner, the load-balancer render, `lv ls`
 `lv inspect`, a peer's backend lookup and the VM healthcheck — reads only the
 lease file of the bridge the NIC's network uses, so a lease another network
 holds for the same MAC is not taken for its address. Only a NIC whose network
-has no record to derive a bridge from is looked up across every bridge. Deleting a network removes its dnsmasq
+has no record to derive a bridge from is looked up across every bridge. A
+lease is preferred to the ARP cache. On a vxlan network litevirt serves DHCP
+for, the dnsmasq runs on one host of the network, so a VM on any other host has
+no lease on its own host: when the IP scanner and `lv inspect` find none there,
+they ask the network's other hosts for the lease they hold for the MAC (the
+latest-expiring one wins, and only an address in the subnet counts), and fall
+back to the ARP cache after that. The IP scanner records it on its next pass,
+within 30 seconds of the lease. Deleting a network removes its dnsmasq
 lease file along with the dnsmasq. On an unbound network that
 discovery is simply recorded, and that is how every DHCP guest's address reaches
 the inventory.

@@ -57,6 +57,16 @@ func AddFDBEntry(vni int, mac, remoteVTEP string) error {
 	return hostFDB().addUnicast(vni, mac, remoteVTEP)
 }
 
+// AddFDBEntryWith runs the same host command and local-address guard against
+// an explicitly supplied executor and address inventory, like SyncFDBWith.
+func AddFDBEntryWith(vni int, mac, remoteVTEP string, exec ExecFunc, local []string) error {
+	o := fdbOps{exec: exec, local: localAddrs{}}
+	for _, a := range local {
+		o.local[a] = ""
+	}
+	return o.addUnicast(vni, mac, remoteVTEP)
+}
+
 // addUnicast creates a MAC's entry (`bridge fdb add`): one destination per
 // MAC. An entry the MAC already has is left as it is ("File exists").
 func (o fdbOps) addUnicast(vni int, mac, remoteVTEP string) error {
@@ -101,6 +111,12 @@ func (o fdbOps) del(vni int, mac, remoteVTEP string) error {
 // DeleteFDBEntry removes a unicast FDB entry: bridge fdb del <mac> dev vxlan<VNI> dst <remoteVTEP>
 func DeleteFDBEntry(vni int, mac, remoteVTEP string) error {
 	return fdbOps{exec: execCommand}.del(vni, mac, remoteVTEP)
+}
+
+// DeleteFDBEntryWith uses the existing deletion semantics with an explicit
+// executor; it never falls back to the host's executor.
+func DeleteFDBEntryWith(vni int, mac, remoteVTEP string, exec ExecFunc) error {
+	return fdbOps{exec: exec}.del(vni, mac, remoteVTEP)
 }
 
 // FloodEntry adds a BUM flood destination: bridge fdb append 00:00:00:00:00:00 dev vxlan<VNI> dst <remoteVTEP>

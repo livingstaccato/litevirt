@@ -873,6 +873,9 @@ func (c *Cluster) buildServer(n *Node) {
 	// The fake's libvirt acts on the same files (probe (g), the live
 	// firmware migrate model).
 	n.Virt.SetFirmwareStore(n.FW)
+	// The live firmware host check stage A and Prepare read, as the daemon
+	// installs it (daemon.go SetLiveFirmwareHost).
+	n.Server.SetLiveFirmwareHost(fleetLiveFirmwareHost{})
 
 	// Domain lifecycle events: the daemon registers this same handler on its
 	// libvirt client (internal/daemon.Run). Wiring it here lets a scenario call
@@ -941,6 +944,8 @@ func (c *Cluster) buildServer(n *Node) {
 	loops, stop := context.WithCancel(c.ctx)
 	n.stopServerLoops = stop
 	go n.Server.RunLUNHoldResolver(loops, 10*time.Second)
+	// The live firmware hold sweep, as the daemon starts it.
+	go n.Server.RunFirmwareHoldSweep(loops)
 
 	// Wire a real Replicator so the server's PushMutations handler + write-notify
 	// path are exercised. By default its background push loop is NOT started, so

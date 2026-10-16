@@ -88,3 +88,31 @@ func TestAttachDevice_DiskTargetUnreadableDefinitionRefuses(t *testing.T) {
 		t.Fatalf("a refused attach left the barrier set: %q", vm.ActiveOperationID)
 	}
 }
+
+// A running VM's live definition holds what was hot-plugged and not yet in
+// the persistent one; a live read that fails refuses the attach the same way.
+//
+// Mutation: tolerate any error on the live view in domainDiskTargets — the
+// attach succeeds.
+func TestAttachDevice_DiskTargetUnreadableLiveDefinitionRefuses(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetInactiveXML("vm1", seedCDROMDomain)
+	fake.FailDumpXML = func(string) error { return errors.New("connection reset by peer") }
+
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", Disk: &pb.DiskSpec{Name: "data", Size: "1G", Bus: "sata"},
+	}); err == nil {
+		t.Fatal("an attach whose live definition could not be read must refuse")
+	}
+	disks, _ := corrosion.GetVMDisks(ctx, s.db, "vm1")
+	if hasDiskName(disks, "data") {
+		t.Fatalf("a refused attach wrote a row: %+v", disks)
+	}
+	if vm := mustGetVM(t, s, "vm1"); vm.ActiveOperationID != "" {
+		t.Fatalf("a refused attach left the barrier set: %q", vm.ActiveOperationID)
+	}
+}

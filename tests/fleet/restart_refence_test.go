@@ -358,3 +358,121 @@ func restartSetupFailureChild(t *testing.T, marker string) {
 	}
 	t.Fatal("intentional partial setup failure")
 }
+
+// The child deliberately fails with a held heartbeat. Its cleanup must wait
+// for the actual child, including the delayed-entry schedule where running is
+// still false. This exercises real testing.T.Fatal cleanup, not SIGKILL.
+func TestRestartFleetHeartbeatStopsBeforeDependencies(t *testing.T) {
+	if marker := os.Getenv("LITEVIRT_RESTART_HEARTBEAT_FAILURE"); marker != "" {
+		restartHeldHeartbeat(t, os.Getenv("LITEVIRT_RESTART_HEARTBEAT_SCHEDULE"), marker)
+		t.Fatal("intentional held-heartbeat setup failure")
+	}
+	for _, schedule := range []string{"delayed-entry", "in-flight-tick"} {
+		t.Run(schedule, func(t *testing.T) {
+			t.Run("early-return", func(t *testing.T) { restartHeldHeartbeat(t, schedule, "") })
+			t.Run("fatal-setup-exit", func(t *testing.T) {
+				marker := filepath.Join(t.TempDir(), "closed-dependencies")
+				exe, err := os.Executable()
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, exe, "-test.run=^TestRestartFleetHeartbeatStopsBeforeDependencies$", "-test.v")
+				cmd.Env = append(os.Environ(), "LITEVIRT_RESTART_HEARTBEAT_FAILURE="+marker, "LITEVIRT_RESTART_HEARTBEAT_SCHEDULE="+schedule)
+				output, err := cmd.CombinedOutput()
+				t.Logf("expected held-heartbeat setup-failure child output:\n%s", output)
+				failure, ok := err.(*exec.ExitError)
+				if !ok || failure.ExitCode() != 1 || !bytes.Contains(output, []byte("intentional held-heartbeat setup failure")) || bytes.Contains(output, []byte("before held heartbeat exit")) || bytes.Contains(output, []byte("before actual heartbeat exit")) || bytes.Contains(output, []byte("failed to join")) {
+					t.Fatalf("held-heartbeat child: err=%v output=%s", err, output)
+				}
+				closed, err := os.ReadFile(marker)
+				if err != nil || string(closed) != "node-0\nnode-1\nnode-2\nnode-3\n" {
+					t.Fatalf("held-heartbeat teardown: %q err=%v", closed, err)
+				}
+			})
+		})
+	}
+}
+
+func restartHeldHeartbeat(t *testing.T, schedule, marker string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	c := New(t, Options{Nodes: 4, IndependentReplicas: true, FaultSeed: 3415})
+	f := &restartFleet{c: c}
+	held, release, exited, controllerDone := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	// Registered before ownWorkers: its cancel/join runs first, while the
+	// controller releases the held child only after checking completion blocked.
+	t.Cleanup(func() {
+		cancel()
+		unblock()
+		select {
+		case <-controllerDone:
+		case <-time.After(5 * time.Second):
+			t.Error("heartbeat controller failed to join")
+		}
+	})
+	f.ownWorkers(t, cancel)
+	// This partial-setup checker stays in TLS retry: no peer probe can reach
+	// its clock before the heartbeat, so the in-flight hold has one caller.
+	ch := health.NewChecker(c.Nodes[0].Name, t.TempDir(), c.Nodes[0].DB)
+	hold := func() { close(held); <-release }
+	ch.SetStallHeartbeatHooksForTests(func() {
+		if schedule == "delayed-entry" {
+			hold()
+		}
+	}, func() { close(exited) })
+	var clockHeld atomic.Bool
+	if schedule == "in-flight-tick" {
+		ch.SetClockForTests(func() time.Time {
+			if clockHeld.CompareAndSwap(false, true) {
+				hold()
+			}
+			return time.Now()
+		})
+	}
+	f.startWorker(func() { ch.Start(ctx) })
+	go func() {
+		defer close(controllerDone)
+		<-ctx.Done()
+		select {
+		case <-f.workers[0]:
+			t.Error("checker returned before held heartbeat exit")
+		case <-time.After(200 * time.Millisecond):
+		}
+		unblock()
+		select {
+		case <-exited:
+		case <-time.After(5 * time.Second):
+			t.Error("actual heartbeat failed to join")
+		}
+	}()
+	c.beforeDependencyClose = func(n *Node) {
+		select {
+		case <-exited:
+		default:
+			t.Errorf("%s dependency closed before actual heartbeat exit", n.Name)
+			return
+		}
+		if marker != "" {
+			file, err := os.OpenFile(marker, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			_, err = file.WriteString(n.Name + "\n")
+			closeErr := file.Close()
+			if err != nil || closeErr != nil {
+				t.Errorf("recording heartbeat teardown: %v %v", err, closeErr)
+			}
+		}
+	}
+	select {
+	case <-held:
+	case <-time.After(10 * time.Second):
+		t.Fatal("actual heartbeat did not reach fixture hold")
+	}
+}

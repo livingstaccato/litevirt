@@ -342,8 +342,16 @@ func TestChecker_TLSLoadFailureAnchorsWarmup(t *testing.T) {
 	gateHost(t, db, "host-c", "active", "worker")
 	c := NewChecker("host-a", "/nonexistent/litevirt/pki", db) // PeerTLSConfig fails → retry loop
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go c.Start(ctx)
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("checker did not join before database cleanup")
+		}
+	})
+	go func() { defer close(done); c.Start(ctx) }()
 	var st QuorumState
 	for i := 0; i < 200; i++ {
 		if st, _, _ = c.QuorumProof(context.Background()); st == QuorumUnknown {

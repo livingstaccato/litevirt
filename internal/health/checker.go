@@ -206,6 +206,9 @@ type Checker struct {
 	// without sleeping.
 	clock func() time.Time
 
+	// Test-only lifecycle observations, installed before Start.
+	stallHeartbeatBefore, stallHeartbeatAfter func()
+
 	// stall is the local liveness heartbeat's record (stall.go): failed probes
 	// observed across, or shortly after, a gap in this process's own execution
 	// are not evidence against the peer.
@@ -282,7 +285,9 @@ func NewChecker(hostName, pkiDir string, db *corrosion.Client) *Checker {
 	}
 }
 
-// Start begins periodic health checking. Blocks until context is cancelled.
+// Start begins periodic health checking. It blocks until context is cancelled
+// and its heartbeat and current peer-probe batch have exited. Callers must join
+// Start before closing dependencies; a blocked test clock must be released too.
 func (c *Checker) Start(ctx context.Context) {
 	// Anchor the warmup clock FIRST. A transient PeerTLSConfig failure below must not leave
 	// startedAt==0 — that makes QuorumProof skip warmup and report a permanent false QuorumNo
@@ -294,7 +299,22 @@ func (c *Checker) Start(ctx context.Context) {
 
 	// The heartbeat first: a probe must never run without it, or every failure
 	// after a quiet spell would read as observed across a stall.
-	go c.runStallHeartbeat(ctx)
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
+	heartbeatDone := make(chan struct{})
+	defer func() {
+		cancelHeartbeat()
+		<-heartbeatDone
+	}()
+	go func() {
+		defer close(heartbeatDone)
+		if c.stallHeartbeatBefore != nil {
+			c.stallHeartbeatBefore()
+		}
+		if c.stallHeartbeatAfter != nil {
+			defer c.stallHeartbeatAfter()
+		}
+		c.runStallHeartbeat(heartbeatCtx)
+	}()
 
 	// Load TLS config for peer connections; RETRY a transient failure (e.g. a PKI-setup race
 	// at boot) rather than giving up — a checker that never loads TLS never probes peers, so

@@ -200,3 +200,12 @@ func (c *Checker) runStallHeartbeat(ctx context.Context) {
 		}
 	}
 }
+
+// SetStallHeartbeatHooksForTests brackets Start's actual heartbeat child. The
+// before hook runs before heartbeat entry; after runs only after it exits.
+// Scenario tests use these observations to hold a delayed child and assert its
+// exit before closing dependencies. Set before Start; nil hooks do nothing.
+// Production never calls it.
+func (c *Checker) SetStallHeartbeatHooksForTests(before, after func()) {
+	c.stallHeartbeatBefore, c.stallHeartbeatAfter = before, after
+}

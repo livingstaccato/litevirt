@@ -17,8 +17,16 @@ import (
 func TestStart_RunsTheStallHeartbeat(t *testing.T) {
 	c := NewChecker("host-a", t.TempDir(), testCheckerDB(t)) // no PKI: Start parks in its TLS retry loop
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	go c.Start(ctx)
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("checker did not join before database cleanup")
+		}
+	})
+	go func() { defer close(done); c.Start(ctx) }()
 
 	lastBeat := func() time.Time {
 		c.stall.mu.Lock()

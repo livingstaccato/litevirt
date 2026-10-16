@@ -588,11 +588,11 @@ func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, s
 		}
 		rb.attached = true
 		if err := s.writeNICAttachRows(ctx, rb, vm.Name, spec, model, mac, nicID, sgsJSON, nicIP, ordinal); err != nil {
-			return s.failNICAttach(ctx, rb, codes.Internal, err)
+			return s.failNICAttach(ctx, rb, nicRowWriteCode(err), err)
 		}
 	} else {
 		if err := s.writeNICAttachRows(ctx, rb, vm.Name, spec, model, mac, nicID, sgsJSON, nicIP, ordinal); err != nil {
-			return s.failNICAttach(ctx, rb, codes.Internal, err)
+			return s.failNICAttach(ctx, rb, nicRowWriteCode(err), err)
 		}
 		if err := s.reconcileDomainDefinition(ctx, vm, nil); err != nil {
 			return s.failNICAttach(ctx, rb, codes.Internal, fmt.Errorf("reconcile definition: %w", err))
@@ -632,6 +632,16 @@ func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, s
 	s.recordVMEvent(ctx, vm.Name, "device.attached", "ok", "nic "+mac)
 	s.publish("device.attached", vm.Name, "nic:"+mac)
 	return s.vmToProto(ctx, vm.Name)
+}
+
+// nicRowWriteCode is the code a failed NIC row write answers with: a write
+// behind a stored write for the NIC stamped too far ahead is a precondition
+// the operator can fix (its error names how), anything else Internal.
+func nicRowWriteCode(err error) codes.Code {
+	if errors.Is(err, corrosion.ErrNICStampSkewed) {
+		return codes.FailedPrecondition
+	}
+	return codes.Internal
 }
 
 // failNICAttach compensates a failed attach by rolling BACK (§8): inverse

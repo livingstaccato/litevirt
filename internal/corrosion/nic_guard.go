@@ -238,14 +238,18 @@ func nicGuardStamp(ctx context.Context, c *Client, owner, mac string) (string, e
 }
 
 // nicStampAfter is stampAfter for a write of owner's NIC mac whose newest
-// stored write is floor (what names it). A floor stamped beyond the skew
-// limit is refused as what it is, with the remedy (ErrNICStampSkewed).
+// stored write is floor (what names it), after this host's clock has observed
+// floor. A floor stamped beyond the skew limit is refused as what it is, with
+// the remedy (ErrNICStampSkewed).
 func (c *Client) nicStampAfter(owner, mac, floor, what string) (string, error) {
-	ts, err := c.stampAfter(floor, c.now())
-	if errors.Is(err, ErrHAStampSkewed) {
+	if floor != "" && tsFutureSkewed(floor, c.now()) {
 		return "", nicStampSkewed(owner, mac, floor, what)
 	}
-	return ts, err
+	// This host's clock moves past the stored write, as the replicator's does
+	// for a write it applies (ObserveStamp): this stamp, and every later one
+	// this host takes — a detach right after a re-attach — orders after it.
+	ObserveStamp(c, floor)
+	return c.stampAfter(floor, c.now())
 }
 
 // nicStampSkewed is ErrNICStampSkewed for owner's NIC mac behind its stored

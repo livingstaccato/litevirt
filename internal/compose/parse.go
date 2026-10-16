@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"
 
 	lbpkg "github.com/litevirt/litevirt/internal/lb"
@@ -648,12 +649,17 @@ func (v *validator) validate(f *File) {
 			v.ps.add(p+".replicas", "replicas must be >= 0", "")
 		}
 	}
-	// A stack has one LB (<stack>-lb): two definitions would each be applied
-	// over the other.
-	if len(lbVMs) > 1 {
-		sort.Strings(lbVMs)
-		v.ps.add(v.vm(lbVMs[1])+".loadbalancer", fmt.Sprintf("a stack has one load balancer; %s already defines it", strings.Join(lbVMs[:1], "")),
-			"keep one loadbalancer section; every VM of the stack is its backend")
+	// A stack has one LB (<stack>-lb). Copies of one definition (a base it
+	// extends, a YAML anchor) are that one LB; two different definitions
+	// would each be applied over the other.
+	sort.Strings(lbVMs)
+	for _, name := range lbVMs[min(1, len(lbVMs)):] {
+		first := BuildLBSpec(f.VMs[lbVMs[0]].LoadBalancer)
+		if !proto.Equal(first, BuildLBSpec(f.VMs[name].LoadBalancer)) {
+			v.ps.add(v.vm(name)+".loadbalancer",
+				fmt.Sprintf("a stack has one load balancer, and this definition differs from %s's", lbVMs[0]),
+				"keep one loadbalancer definition (a base the VMs extend may carry it); every VM of the stack is its backend")
+		}
 	}
 
 	// Validate depends-on: targets must exist and no cycles.

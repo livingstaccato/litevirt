@@ -843,7 +843,7 @@ Standalone load balancers (not tied to a stack) can also be created with `lv lb 
         interval-ms: 2000               # Check interval in milliseconds
 ```
 
-A stack has at most one `loadbalancer` section. The stack's `name` must use only letters, digits, `_`, `.` and `-`.
+A stack has one load balancer. Copies of one definition, from a base the VMs `extends` or a YAML anchor, are that one load balancer; two different definitions are refused. The stack's `name` must use only letters, digits, `_`, `.` and `-`.
 
 Values are checked before anything is deployed:
 
@@ -852,7 +852,7 @@ Values are checked before anything is deployed:
 - `health.path` is one absolute path of visible ASCII, without spaces, quotes, `#`, `\` or braces, at most 512 characters.
 - `redirect-https` needs `protocol: http`, no `tls` on the same port, and a `tls` port on the same load balancer to redirect to. A spec stored before this check with any other redirect is served without that redirect, and a `lb.redirect_ignored` event says so.
 
-**TLS files** are read as root on every LB host, from `/etc/litevirt/lb-certs/`. Naming a file anywhere else needs the admin role. A symlink is followed (Let's Encrypt's `live/` names work, for example a symlink in `/etc/litevirt/lb-certs/` to them), and every check applies to the file it reaches: a regular file of at most 1 MiB, never under the PKI directory, the data directory or `/etc/litevirt/lb`. A path in `/etc/litevirt/lb-certs/` is read only while that directory is owned by root and writable by no one else. An LB stored before this rule with files elsewhere keeps working, and each apply raises a `lb.tls_outside_cert_dir` event that names the file.
+**TLS files** are read as root on every LB host, from `/etc/litevirt/lb-certs/`. Naming a file anywhere else needs the admin role. A symlink is followed (Let's Encrypt's `live/` names work, for example a symlink in `/etc/litevirt/lb-certs/` to them), and every check applies to the file it reaches: a regular file of at most 1 MiB, never under the PKI directory, the data directory or `/etc/litevirt/lb`. A path in `/etc/litevirt/lb-certs/` is read only while that directory, and every directory below it on the way to the file, is a real directory owned by root and writable by no one else. A file that is not a regular file is refused before it is opened. An LB stored before this rule with files elsewhere keeps working, and each apply raises a `lb.tls_outside_cert_dir` event that names the file.
 
 **Where the VIP goes**: a VIP inside a network's subnet is put on that network's
 bridge on each LB host (a stack LB considers only its own stack's networks and

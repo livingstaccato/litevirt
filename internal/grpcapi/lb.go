@@ -796,6 +796,15 @@ func (s *Server) applyLBLocal(ctx context.Context, cfg lb.Config) error {
 	// master). The orchestration gate runs BEFORE this apply is reached (locally or
 	// via a forwarded ApplyLB), so this chokepoint only enforces the Phase-1 quorum
 	// gate above.
+	// An LB named after a stack whose name this build refuses (a name an
+	// earlier build accepted) is not applied: say so loudly, since nothing
+	// else will (ReconcileLBs would otherwise skip it quietly).
+	if err := lb.ValidateName(cfg.Name); err != nil {
+		detail := fmt.Sprintf("load balancer %q is not applied: %v; rename its stack (or LB) and redeploy", cfg.Name, err)
+		slog.Error("lb: "+detail, "lb", cfg.Name)
+		s.publish("lb.name_refused", cfg.Name, detail)
+		return status.Error(codes.InvalidArgument, detail)
+	}
 	var err error
 	if s.lbApplyOverride != nil {
 		err = s.lbApplyOverride(ctx, cfg)
@@ -3140,8 +3149,21 @@ func validLBAlgorithm(a string) error {
 // connections across a VRRP failover. It needs what SNAT itself needs, the
 // VIP placed on a host-isolated network with a subnet (updateIsolationForLB),
 // and a peer to sync with: the first other host in lbHosts.
+//
+// A read it cannot complete leaves the LB's SNAT side as it is (KeepSNAT)
+// for this apply, rather than reading as "no SNAT" and tearing conntrackd
+// and keepalived's hooks down.
 func (s *Server) lbSNATSync(ctx context.Context, cfg *lb.Config, place lbPlacement, lbHosts []string) {
-	subnet := s.isolatedSubnet(ctx, place)
+	keep := func(err error) {
+		slog.Warn("lb: SNAT sync undecided this apply; its conntrackd and keepalived hooks are left as they are",
+			"lb", cfg.Name, "error", err)
+		cfg.KeepSNAT = true
+	}
+	subnet, err := s.isolatedSubnet(ctx, place)
+	if err != nil {
+		keep(err)
+		return
+	}
 	if subnet == "" {
 		return
 	}
@@ -3155,7 +3177,16 @@ func (s *Server) lbSNATSync(ctx context.Context, cfg *lb.Config, place lbPlaceme
 	if peer == "" {
 		return // one LB host: no failover, nothing to sync
 	}
-	localIP, peerIP := s.hostIPv4(ctx, s.hostName), s.hostIPv4(ctx, peer)
+	localIP, err := s.hostIPv4(ctx, s.hostName)
+	if err != nil {
+		keep(err)
+		return
+	}
+	peerIP, err := s.hostIPv4(ctx, peer)
+	if err != nil {
+		keep(err)
+		return
+	}
 	if localIP == "" || peerIP == "" {
 		slog.Warn("lb: no IPv4 address for conntrackd sync; SNAT'd connections will not survive a failover",
 			"lb", cfg.Name, "host", s.hostName, "local", localIP, "peer", peer, "peer_ip", peerIP)
@@ -3171,31 +3202,37 @@ func (s *Server) lbSNATSync(ctx context.Context, cfg *lb.Config, place lbPlaceme
 // isolatedSubnet is the subnet of the network an LB's VIP was placed on when
 // that network is host-isolated, else "": where updateIsolationForLB records
 // SNAT for the LB.
-func (s *Server) isolatedSubnet(ctx context.Context, place lbPlacement) string {
+func (s *Server) isolatedSubnet(ctx context.Context, place lbPlacement) (string, error) {
 	if place.network == "" {
-		return ""
+		return "", nil
 	}
 	nr, err := corrosion.GetNetwork(ctx, s.db, place.network)
-	if err != nil || nr == nil {
-		return ""
+	if err != nil {
+		return "", fmt.Errorf("read network %q: %w", place.network, err)
+	}
+	if nr == nil {
+		return "", nil
 	}
 	var def compose.NetworkDef
 	if json.Unmarshal([]byte(nr.Config), &def) != nil || !def.HostIsolation {
-		return ""
+		return "", nil
 	}
-	return def.Subnet
+	return def.Subnet, nil
 }
 
 // hostIPv4 is a host's recorded address when it is an IPv4 literal, else "".
-func (s *Server) hostIPv4(ctx context.Context, name string) string {
+func (s *Server) hostIPv4(ctx context.Context, name string) (string, error) {
 	h, err := corrosion.GetHost(ctx, s.db, name)
-	if err != nil || h == nil {
-		return ""
+	if err != nil {
+		return "", fmt.Errorf("read host %q: %w", name, err)
+	}
+	if h == nil {
+		return "", nil
 	}
 	if ip := net.ParseIP(h.Address); ip != nil && ip.To4() != nil {
-		return ip.String()
+		return ip.String(), nil
 	}
-	return ""
+	return "", nil
 }
 
 // stackLBSNAT is a stack LB's `snat:` as the paths that re-apply an LB

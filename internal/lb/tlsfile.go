@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -56,16 +57,18 @@ var beforeTLSOpen = func() {}
 //     dir (other LBs' combined PEMs);
 //   - it is a regular file of at most maxTLSFile bytes, read non-blocking,
 //     so a device or FIFO cannot exhaust or hang the apply;
-//   - a path named inside CertDir needs CertDir itself to be a real directory
-//     owned by this daemon's user and writable by no one else: what a
-//     non-admin may name there, and what any symlink there points at, was
-//     put there by root.
+//   - it is a regular file before it is opened (opening a device can act),
+//     and the descriptor is one after;
+//   - a path named inside CertDir needs CertDir and every directory below it
+//     on the way to the file to be a real directory owned by this daemon's
+//     user and writable by no one else: what a non-admin may name there, and
+//     what any symlink there points at, was put there by root.
 func (m *Manager) readTLSFile(path string) ([]byte, error) {
 	if err := checkTLSPath(path); err != nil {
 		return nil, err
 	}
 	if safename.Contains(certDir, path) {
-		if err := checkCertDir(certDir); err != nil {
+		if err := checkCertDirs(certDir, filepath.Dir(path)); err != nil {
 			return nil, err
 		}
 	}
@@ -75,6 +78,13 @@ func (m *Manager) readTLSFile(path string) ([]byte, error) {
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return nil, err
+	}
+	// Never open what is not a regular file: opening some devices does
+	// something (a watchdog arms). The descriptor is checked again below.
+	if fi, err := os.Stat(resolved); err != nil {
+		return nil, err
+	} else if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s: %s is not a regular file", path, resolved)
 	}
 	beforeTLSOpen()
 	f, err := os.OpenFile(resolved, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
@@ -132,8 +142,31 @@ func (m *Manager) checkNotProtected(path, real string) error {
 	return nil
 }
 
-// checkCertDir: CertDir is trusted only while it is a real directory owned
-// by this daemon's user and not writable by group or others.
+// checkCertDirs checks root and every directory below it down to dir (a
+// directory inside root) with checkCertDir.
+func checkCertDirs(root, dir string) error {
+	rel, err := filepath.Rel(root, dir)
+	if err != nil {
+		return err
+	}
+	cur := root
+	if err := checkCertDir(cur); err != nil {
+		return err
+	}
+	if rel == "." {
+		return nil
+	}
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		cur = filepath.Join(cur, part)
+		if err := checkCertDir(cur); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkCertDir: a directory of CertDir is trusted only while it is a real
+// directory owned by this daemon's user and not writable by group or others.
 func checkCertDir(dir string) error {
 	fi, err := os.Lstat(dir)
 	if err != nil {

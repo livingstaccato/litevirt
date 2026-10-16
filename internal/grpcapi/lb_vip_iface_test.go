@@ -350,8 +350,9 @@ func TestStackLBSNAT_OneRule(t *testing.T) {
 		}
 		storeFile(t, s, name, yaml)
 	}
-	// One LB per stack: a file declaring two no longer parses (compose
-	// validation); one stored before that falls back to the VMs' specs.
+	// One LB per stack: a file declaring two different ones no longer parses
+	// (compose validation); one stored before that falls back to the VMs'
+	// specs. Identical copies parse, and the file decides.
 	const oneLB = `name: st
 images:
   test:
@@ -408,8 +409,15 @@ vms:
 			stackFile(t, s, "st", fmt.Sprintf(oneLB, "false"))
 			lbVM(t, s, "st-a", "st", true)
 		}, false},
-		{"a stored file with two LBs (no longer parses): VM specs decide, any true wins", func(t *testing.T, s *Server) {
-			storeFile(t, s, "st", fmt.Sprintf(twoLBs, "false", "false"))
+		{"file with two identical LB copies says true", func(t *testing.T, s *Server) {
+			stackFile(t, s, "st", fmt.Sprintf(twoLBs, "true", "true"))
+		}, true},
+		{"file with two identical LB copies says false, a stale VM spec says true: the file wins", func(t *testing.T, s *Server) {
+			stackFile(t, s, "st", fmt.Sprintf(twoLBs, "false", "false"))
+			lbVM(t, s, "st-a", "st", true)
+		}, false},
+		{"a stored file with two different LBs (no longer parses): VM specs decide, any true wins", func(t *testing.T, s *Server) {
+			storeFile(t, s, "st", fmt.Sprintf(twoLBs, "false", "true"))
 			lbVM(t, s, "st-a", "st", false)
 			lbVM(t, s, "st-b", "st", true)
 		}, true},

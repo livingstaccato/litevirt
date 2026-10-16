@@ -304,6 +304,76 @@ func TestReadTLSFile_CertDirMustBeTrusted(t *testing.T) {
 	}
 }
 
+// TestReadTLSFile_CertDirSubdirsMustBeTrusted (M-R2): every directory between
+// CertDir and the file is trust-checked too, so a subdirectory handed to
+// another user cannot plant a link to another service's key.
+//
+// Mutation: check only CertDir itself (checkCertDir(certDir)) — red.
+func TestReadTLSFile_CertDirSubdirsMustBeTrusted(t *testing.T) {
+	m := testManager(t)
+	cd := filepath.Join(t.TempDir(), "lb-certs")
+	sub := filepath.Join(cd, "acme", "web")
+	if err := os.MkdirAll(sub, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	f := filepath.Join(sub, "a.crt")
+	if err := os.WriteFile(f, []byte("CERT"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := certDir
+	certDir = cd
+	t.Cleanup(func() { certDir = old })
+
+	if _, err := m.readTLSFile(f); err != nil {
+		t.Fatalf("trusted subdirectories: %v", err)
+	}
+	acme := filepath.Join(cd, "acme")
+	if err := os.Chmod(acme, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.readTLSFile(f); err == nil {
+		t.Error("read under a group-writable subdirectory")
+	}
+	if err := os.Chmod(acme, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	// A subdirectory that is a symlink (to somewhere its owner controls).
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.Rename(acme, elsewhere); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, acme); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.readTLSFile(f); err == nil {
+		t.Error("read through a symlinked subdirectory")
+	}
+}
+
+// TestReadTLSFile_NeverOpensANonRegularFile (M-R3): a device or FIFO is
+// refused before it is opened (opening a device can act, as a watchdog's
+// does).
+//
+// Mutation: drop the stat before the open — red (the open is reached).
+func TestReadTLSFile_NeverOpensANonRegularFile(t *testing.T) {
+	m := testManager(t)
+	fifo := filepath.Join(t.TempDir(), "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opens := 0
+	beforeTLSOpen = func() { opens++ }
+	t.Cleanup(func() { beforeTLSOpen = func() {} })
+	for _, p := range []string{"/dev/null", "/dev/zero", fifo} {
+		if _, err := m.readTLSFile(p); err == nil {
+			t.Errorf("%s read", p)
+		}
+	}
+	if opens != 0 {
+		t.Errorf("%d non-regular files reached the open", opens)
+	}
+}
+
 // TestApply_TLSRefusedWritesNothing: a refused TLS file fails the apply
 // before any config is written.
 func TestApply_TLSRefusedWritesNothing(t *testing.T) {

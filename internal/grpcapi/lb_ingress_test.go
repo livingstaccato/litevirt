@@ -184,3 +184,44 @@ vms:
             cert: /etc/litevirt/lb-certs/a.crt
             key: KEY
 `
+
+// TestLBSNATSync_ReadErrorKeepsSNAT (M-R1): a read lbSNATSync cannot
+// complete leaves the SNAT side as it is (KeepSNAT), not "no SNAT".
+//
+// Mutation: return without KeepSNAT on the read error — red.
+func TestLBSNATSync_ReadErrorKeepsSNAT(t *testing.T) {
+	s := testServer(t)
+	_ = s.db.Close()
+	cfg := lb.Config{Name: "x-lb", Interface: "hinet"}
+	s.lbSNATSync(context.Background(), &cfg, lbPlacement{iface: "hinet", network: "lbr_hinet"}, []string{s.hostName, "peer-host"})
+	if !cfg.KeepSNAT || cfg.SNATEnabled {
+		t.Errorf("unreadable database: keep=%v enabled=%v, want keep", cfg.KeepSNAT, cfg.SNATEnabled)
+	}
+}
+
+// TestApplyLBLocal_RefusedNameIsLoud (M-R4): an LB whose name this build
+// refuses (a stack name an earlier build accepted) is not applied, with an
+// error log and an lb.name_refused event naming it.
+//
+// Mutation: drop the name check in applyLBLocal — red (no event).
+func TestApplyLBLocal_RefusedNameIsLoud(t *testing.T) {
+	s := testServer(t)
+	ch, cancel := s.events.Subscribe()
+	defer cancel()
+	called := false
+	s.lbApplyOverride = func(context.Context, lb.Config) error { called = true; return nil }
+	if err := s.applyLBLocal(context.Background(), lb.Config{Name: "shop:blue-lb"}); err == nil {
+		t.Error("applied")
+	}
+	if called {
+		t.Error("the manager was reached")
+	}
+	select {
+	case e := <-ch:
+		if e.Action != "lb.name_refused" || !strings.Contains(e.Detail, "shop:blue-lb") {
+			t.Errorf("event %+v", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("no lb.name_refused event")
+	}
+}

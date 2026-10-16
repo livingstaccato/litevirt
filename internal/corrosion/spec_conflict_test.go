@@ -256,3 +256,78 @@ func TestResolveSpecEdit(t *testing.T) {
 		}
 	}
 }
+
+func mergeFrom(t *testing.T, into, from *specPeer) {
+	t.Helper()
+	if err := into.c.MergeStateBytesLWW(from.c.DumpStateBytes()); err != nil {
+		t.Fatalf("merge %s into %s: %v", from.name, into.name, err)
+	}
+}
+
+// Anti-entropy alone: the owner's operation has claimed vm1 at generation 1
+// and a cut-off replica edited it at 1, later. Anti-entropy keeps the claim on
+// both sides, as the WAL does — it used to copy the later edit onto the
+// owner, clearing the barrier of the operation in flight.
+func TestSpecConflictAE_AnOutOfBandEditNeverOverwritesABarrier(t *testing.T) {
+	peers := newSpecPeers(t, true, "a", "b")
+	a, b := peers[0], peers[1]
+	seedEverywhere(t, peers)
+	op := OperationRecord{ID: "op-1", Method: "UpdateVM", ResourceKind: "vm", ResourceID: "vm1",
+		OperationKind: string(OpResourceUpdateRunning), RequestHash: "h"}
+	if ok, err := a.c.BeginVMOperation(context.Background(), op, `{"cpu":4}`, 0, 0); err != nil || !ok {
+		t.Fatalf("BeginVMOperation: %v %v", ok, err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	setSpec(t, b, `{"cpu":2,"labels":{"tier":"front"}}`)
+
+	mergeFrom(t, a, b)
+	mergeFrom(t, b, a)
+	for _, p := range peers {
+		if got := vmSpecOn(t, p); got.Spec != `{"cpu":4}` || got.ActiveOperationID != "op-1" {
+			t.Errorf("%s after anti-entropy: %s, barrier %q; want the claim under op-1", p.name, got.Spec, got.ActiveOperationID)
+		}
+	}
+	if ok, err := a.c.CompleteVMOperation(context.Background(), "vm1", "op-1", 0, 1); err != nil || !ok {
+		t.Errorf("the owner cannot complete op-1 after anti-entropy: %v %v", ok, err)
+	}
+}
+
+// The barrier rule holds only while the operation is in flight. b holds op-1's
+// claim, heard by the WAL; c, on the previous release's resolution, kept its
+// own later edit at the same generation and has heard op-1 complete. Once a
+// side records op-1's terminal step the barrier no longer stands, and the
+// clocks decide: c's later edit replaces the finished claim on b.
+func TestSpecConflictAE_AFinishedOperationsBarrierNoLongerStands(t *testing.T) {
+	peers := newSpecPeers(t, true, "a", "b")
+	a, b := peers[0], peers[1]
+	c := newSpecPeers(t, false, "c")[0]
+	seedVM(t, a.c, "vm1", `{"cpu":2}`)
+	seed := a.news(t)
+	applyWAL(t, b.r, seed)
+	applyWAL(t, c.r, seed)
+	ctx := context.Background()
+	op := OperationRecord{ID: "op-1", Method: "UpdateVM", ResourceKind: "vm", ResourceID: "vm1",
+		OperationKind: string(OpResourceUpdateRunning), RequestHash: "h"}
+	if ok, err := a.c.BeginVMOperation(ctx, op, `{"cpu":4}`, 0, 0); err != nil || !ok {
+		t.Fatalf("BeginVMOperation: %v %v", ok, err)
+	}
+	begin := a.news(t)
+	applyWAL(t, b.r, begin)
+	time.Sleep(5 * time.Millisecond)
+	setSpec(t, c, `{"cpu":2,"labels":{"tier":"front"}}`)
+	if ok, err := a.c.CompleteVMOperation(ctx, "vm1", "op-1", 0, 1); err != nil || !ok {
+		t.Fatalf("CompleteVMOperation: %v %v", ok, err)
+	}
+	applyWAL(t, c.r, begin)
+	applyWAL(t, c.r, a.news(t))
+	if got := vmSpecOn(t, b); got.ActiveOperationID != "op-1" {
+		t.Fatalf("premise: b holds %s with barrier %q, want op-1's claim", got.Spec, got.ActiveOperationID)
+	}
+	if got := vmSpecOn(t, c); got.ActiveOperationID != "" || !strings.Contains(got.Spec, "tier") {
+		t.Fatalf("premise: c holds %s with barrier %q, want its own edit", got.Spec, got.ActiveOperationID)
+	}
+	mergeFrom(t, b, c)
+	if got := vmSpecOn(t, b); got.ActiveOperationID != "" || !strings.Contains(got.Spec, "tier") {
+		t.Errorf("b after anti-entropy: %s, barrier %q; want c's later edit over the finished claim", got.Spec, got.ActiveOperationID)
+	}
+}

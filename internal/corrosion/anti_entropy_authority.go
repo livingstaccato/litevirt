@@ -31,6 +31,12 @@ type workloadMergeAuthority struct {
 	// terminal for it at ANY authority.
 	createdAt      string
 	deleted, valid bool
+	// spec and updatedAt are the row's desired spec and clock (VMs only), and
+	// finishedOps the operations the same payload records a terminal step
+	// for: what an equal-generation spec conflict is resolved on
+	// (spec_conflict_ae.go).
+	spec, updatedAt string
+	finishedOps     map[string]bool
 }
 
 type operationMergeAuthority struct {
@@ -90,6 +96,13 @@ func buildMergeAuthorityManifest(payload *syncPayload) *mergeAuthorityManifest {
 		containers: make(map[string]workloadMergeAuthority),
 		operations: make(map[string]operationMergeAuthority),
 	}
+	finished := finishedOperationsInPayload(payload)
+	defer func() {
+		for k, a := range m.vms {
+			a.finishedOps = finished
+			m.vms[k] = a
+		}
+	}()
 	for _, table := range payload.Tables {
 		for _, row := range table.Rows {
 			if len(row) != len(table.Columns) {
@@ -147,8 +160,13 @@ func vmAuthorityFromDump(cols []string, row []interface{}) (workloadMergeAuthori
 	}
 	ownerEpoch, ownerOK := coerceInt64OK(row[idx["vm_owner_epoch"]])
 	generation, generationOK := coerceInt64OK(row[idx["spec_generation"]])
+	updatedAt := ""
+	if i := indexOf(cols, "updated_at"); i >= 0 {
+		updatedAt = coerceString(row[i])
+	}
 	return workloadMergeAuthority{
 		kind: "vm", name: vm.Name, host: vm.HostName,
+		spec: vm.Spec, updatedAt: updatedAt,
 		project:           projectOrDefault(vm.Project),
 		state:             coerceString(row[idx["state"]]),
 		activeOperationID: coerceString(row[idx["active_operation_id"]]),
@@ -418,6 +436,12 @@ func (c *Client) workloadParentAuthorityDecision(tx *sql.Tx, incoming workloadMe
 		}
 	}
 
+	if incoming.kind == "vm" && !localIsDeleted && !incoming.deleted &&
+		localGeneration == incoming.generation && c.SpecConflictOn() {
+		if decision, decided, serr := c.specConflictAEDecision(tx, incoming, localOwner, localActiveOp); serr != nil || decided {
+			return decision, serr
+		}
+	}
 	switch {
 	case localOwner == incoming.ownerEpoch && localGeneration == incoming.generation:
 		if localIsDeleted && !incoming.deleted {

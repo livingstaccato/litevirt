@@ -83,3 +83,95 @@ func TestUpdateVM_RegenerateKeepsTheNICModel(t *testing.T) {
 		}
 	}
 }
+
+// nicModelVM inserts a stopped VM with spec, then each NIC: a vm_nics row
+// (when rowModel is set) and, after it, a vm_interfaces row (when legacy),
+// which is then the newer row and wins the merge: a pre-latch hot-plug
+// writes both in that order.
+func nicModelVM(t *testing.T, s *Server, name string, spec *pb.VMSpec, nics []struct {
+	mac, network string
+	ordinal      int
+	rowModel     string
+	legacy       bool
+}) {
+	t.Helper()
+	ctx := adminCtx()
+	insertTestVMWithSpec(t, ctx, s.db, name, "test-host", "stopped", seedSpecJSON(t, spec))
+	for _, n := range nics {
+		if n.rowModel != "" {
+			if err := corrosion.UpsertNIC(ctx, s.db, corrosion.NICRecord{VMName: name,
+				ID: corrosion.DeterministicNICID(name, n.mac), NetworkName: n.network, Model: n.rowModel,
+				MAC: n.mac, Ordinal: n.ordinal}); err != nil {
+				t.Fatalf("UpsertNIC: %v", err)
+			}
+		}
+		if n.legacy {
+			if err := corrosion.InsertInterface(ctx, s.db, corrosion.InterfaceRecord{VMName: name,
+				NetworkName: n.network, Ordinal: n.ordinal, MAC: n.mac}); err != nil {
+				t.Fatalf("InsertInterface: %v", err)
+			}
+		}
+	}
+}
+
+// The regenerate paths take each NIC's model from the spec NIC with its MAC,
+// else its vm_nics row, else a MAC-less legacy spec NIC at its ordinal — so
+// a NIC whose newer vm_interfaces row wins the merge (and reads as virtio)
+// keeps the model its vm_nics row records, and a NIC hot-plugged at an
+// ordinal a detached NIC left in a legacy spec keeps its own model.
+//
+// Mutations: take the merged row's model alone in reconcileDomainDefinition
+// — its "legacy row wins" case goes red; let the legacy spec's ordinal entry
+// beat the vm_nics row — the "reused ordinal" case goes red in UpdateVM.
+func TestRegenerate_NICModelSources(t *testing.T) {
+	type nicRow = struct {
+		mac, network string
+		ordinal      int
+		rowModel     string
+		legacy       bool
+	}
+	cases := []struct {
+		name string
+		spec []*pb.NetworkAttachment
+		nics []nicRow
+		want map[string]string
+	}{
+		{"legacy row wins the merge",
+			nil,
+			[]nicRow{{"52:54:00:00:00:0a", "lan", 0, "e1000", true}},
+			map[string]string{"52:54:00:00:00:0a": "e1000"}},
+		{"reused ordinal",
+			[]*pb.NetworkAttachment{{Name: "lan", Model: "e1000"}, {Name: "lan", Model: "e1000"}},
+			[]nicRow{
+				{"52:54:00:00:00:01", "lan", 0, "", true},
+				{"52:54:00:00:00:09", "lan", 1, "virtio", false},
+			},
+			map[string]string{"52:54:00:00:00:01": "e1000", "52:54:00:00:00:09": "virtio"}},
+	}
+	for _, tc := range cases {
+		for _, path := range []string{"UpdateVM", "reconcile"} {
+			t.Run(path+"/"+tc.name, func(t *testing.T) {
+				s := reconfigServer(t)
+				ctx := adminCtx()
+				nicModelVM(t, s, "nm", &pb.VMSpec{Name: "nm", Cpu: 1, MemoryMib: 512, Machine: "pc", Network: tc.spec}, tc.nics)
+				if path == "UpdateVM" {
+					if _, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "nm", Machine: "q35"}); err != nil {
+						t.Fatalf("UpdateVM: %v", err)
+					}
+				} else if err := s.reconcileDomainDefinition(ctx, mustGetVM(t, s, "nm"), nil); err != nil {
+					t.Fatalf("reconcileDomainDefinition: %v", err)
+				}
+				domXML, err := s.virt.DumpXMLInactive("nm")
+				if err != nil {
+					t.Fatalf("DumpXMLInactive: %v", err)
+				}
+				got := nicModelsByMAC(t, domXML)
+				for mac, want := range tc.want {
+					if got[mac] != want {
+						t.Errorf("NIC %s: model %q, want %q (all %v)", mac, got[mac], want, got)
+					}
+				}
+			})
+		}
+	}
+}

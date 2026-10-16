@@ -5851,11 +5851,16 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		return nil, status.Errorf(codes.Internal, "read NICs for %q: %v", req.Name, err)
 	}
 	ifaces := nicInterfaceRecords(nicRows)
+	rowModels, err := corrosion.VMNICRowModels(ctx, s.db, req.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read NIC models for %q: %v", req.Name, err)
+	}
+	nicModels := compose.NewNICModels(spec, rowModels)
 	var netConfigs []lv.NetworkConfig
 	for _, iface := range nicRows {
 		bridge := resolveBridge(ctx, s.db, iface.NetworkName)
 		rate := compose.NICRate(spec, iface.Ordinal, iface.NetworkName)
-		model := recordedNICModel(spec, iface)
+		model := nicModels.Model(iface.MAC, iface.NetworkName, iface.Ordinal, iface.Model)
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
 				Direct:      strings.TrimPrefix(bridge, "direct:"),

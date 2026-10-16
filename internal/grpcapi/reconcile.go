@@ -104,13 +104,15 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 	if err != nil {
 		return status.Errorf(codes.Internal, "read NICs for %q: %v", vm.Name, err)
 	}
+	rowModels, err := corrosion.VMNICRowModels(ctx, s.db, vm.Name)
+	if err != nil {
+		return status.Errorf(codes.Internal, "read NIC models for %q: %v", vm.Name, err)
+	}
+	nicModels := compose.NewNICModels(spec, rowModels)
 	var netConfigs []lv.NetworkConfig
 	var wantNICs []lv.WantNIC
 	for _, n := range nics {
-		model := n.Model
-		if model == "" {
-			model = "virtio"
-		}
+		model := nicModels.Model(n.MAC, n.NetworkName, n.Ordinal, n.Model)
 		bridge := resolveBridge(ctx, s.db, n.NetworkName)
 		if strings.HasPrefix(bridge, "direct:") {
 			direct := strings.TrimPrefix(bridge, "direct:")

@@ -2526,6 +2526,15 @@ func (c *Coordinator) fenceStillStandsIn(hr healthRead, host string, at time.Tim
 // observer counts and a stale row counts too: this only ever refuses. An
 // observer that restarted its own daemon, or began probing the host only
 // after at, also starts a run after at and refuses, for an operator.
+//
+// An observer whose own process stopped across at (frozen, suspended) also
+// starts its run after at, once it resumes. That run says nothing about the
+// host, and is not counted when the observer recorded it as silent through
+// its stall — it has seen no answer from the host since before the stall —
+// and the stall began more than fenceSkewMargin before at (silentThroughStall).
+// Without that, an observer frozen across a fence refused the recovery for
+// good (lab 1 Drill2, 2026-10-16). Only this check excuses it: the run is
+// still no unbroken watch (observerStreakSpans).
 func restartedSinceObserversIn(hr healthRead, host string, at time.Time) []string {
 	var out []string
 	for _, r := range hr.rows {
@@ -2543,12 +2552,22 @@ func restartedSinceObserversIn(hr healthRead, host string, at time.Time) []strin
 		if !ok || started.After(upd) {
 			continue
 		}
-		if started.After(at.Add(fenceSkewMargin)) {
+		if started.After(at.Add(fenceSkewMargin)) && !hr.silentThroughStall(r.String("observer"), host, r.String("last_seen"), at) {
 			out = append(out, r.String("observer"))
 		}
 	}
 	sort.Strings(out)
 	return out
+}
+
+// silentThroughStall reports whether observer recorded its failing run about
+// host that began at lastSeen as silent through a stall of its own that
+// began more than fenceSkewMargin before at: it has not seen host answer
+// since before at (health.SilentSince). The record and the verdict replicate
+// separately; a verdict that arrives first refuses until the record does.
+func (hr healthRead) silentThroughStall(observer, host, lastSeen string, at time.Time) bool {
+	since, ok := health.SilentSince(hr.stalls[observer], host, lastSeen)
+	return ok && since.Before(at.Add(-fenceSkewMargin))
 }
 
 // whyRestarted is the refusal reason naming the observers whose failing run
@@ -2565,14 +2584,34 @@ func whyRestarted(observers []string) string {
 type healthRead struct {
 	rows []corrosion.Row
 	err  error
+	// stalls is each observer's observer_stalled evidence, by observer
+	// (silentThroughStall). Unreadable, it is empty: nothing is excused.
+	stalls map[string]string
 }
 
 // readHostHealth reads every observer's latest verdict about host: observer,
-// status, consecutive_failures, last_seen and updated_at.
+// status, consecutive_failures, last_seen and updated_at; and every
+// observer's observer_stalled evidence.
 func (c *Coordinator) readHostHealth(ctx context.Context, host string) healthRead {
 	rows, err := c.db.Query(ctx,
 		`SELECT observer, status, consecutive_failures, last_seen, updated_at FROM host_health WHERE target = ?`, host)
-	return healthRead{rows: rows, err: err}
+	hr := healthRead{rows: rows, err: err}
+	if err != nil {
+		return hr
+	}
+	stalled, serr := c.db.Query(ctx,
+		`SELECT subject_id, evidence FROM health_conditions
+		 WHERE evaluator = ? AND code = ? AND subject_kind = 'host' AND deleted_at IS NULL`,
+		health.StallEvaluator, health.CondObserverStalled)
+	if serr != nil {
+		slog.Warn("failover: observer_stalled read failed; no observer's stall excuses its failing run", "host", host, "error", serr)
+		return hr
+	}
+	hr.stalls = make(map[string]string, len(stalled))
+	for _, r := range stalled {
+		hr.stalls[r.String("subject_id")] = r.String("evidence")
+	}
+	return hr
 }
 
 // answeredSinceObserversIn names the observers whose latest verdict about

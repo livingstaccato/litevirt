@@ -2034,6 +2034,14 @@ and never blocks admission.
 |---|---|
 | The health checker's heartbeat (every 250 ms) sees a gap longer than one probe interval (2 s), on either the monotonic or the wall clock. Confirmed at once: it is a measurement of the node's own scheduling, not an inference from a scan. **Warning** severity. The evidence carries `gap_seconds` and `grace_until`. A further stall inside the window extends the same episode, and `gap_seconds` keeps its longest pause: a long pause is often followed by a short one as the node catches up. | The grace window closes: 5 probe intervals (10 s) after the stall, the time a normal fence verdict takes to build. A condition left open by a previous daemon process is resolved on start. |
 
+After the window, the evidence may also carry `silent_runs`: for each peer
+whose first failing run after the stall began without the node having seen
+the peer answer since it stopped, the run's start (`run_start`, as its
+`host_health` verdict carries it) and `silent_since`, when the node stopped.
+Failover reads a failing run that began after a fence as the observer having
+seen the host answer, and refuses the recovery; a run recorded here is not
+read that way.
+
 **What you see.** A host that died while its observers were stalled is fenced
 up to one grace window later than usual. `lv doctor fence` lists the stalled
 nodes under `stalled observers (fence votes withheld)` with the pause length

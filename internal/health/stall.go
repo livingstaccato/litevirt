@@ -71,6 +71,7 @@ type stallState struct {
 	mu       sync.Mutex
 	lastBeat time.Time     // local clock at the previous beat; zero before the first
 	stallAt  time.Time     // local clock when the most recent stall was noticed
+	from     time.Time     // local clock at the last beat before the most recent stall
 	epoch    uint64        // incremented once per stall
 	gap      time.Duration // length of the most recent stall
 
@@ -106,6 +107,7 @@ func (c *Checker) beat(now time.Time) (stallAt time.Time, epoch uint64) {
 	if !s.lastBeat.IsZero() {
 		if g := stallGap(s.lastBeat, now); g > stallThreshold {
 			gap = g
+			s.from = s.lastBeat
 			s.stallAt = now
 			s.epoch++
 			s.gap = g
@@ -121,6 +123,20 @@ func (c *Checker) beat(now time.Time) (stallAt time.Time, epoch uint64) {
 			"gap", gap.Round(time.Millisecond), "grace", StallGrace)
 	}
 	return stallAt, epoch
+}
+
+// stalledFrom is the last beat before stall epoch's stall: the latest moment
+// this process can have been running before it stopped, and so the latest at
+// which it can have processed a probe's answer (every processed probe beats).
+// Zero when epoch is not the most recent stall.
+func (c *Checker) stalledFrom(epoch uint64) time.Time {
+	s := &c.stall
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if epoch == 0 || epoch != s.epoch {
+		return time.Time{}
+	}
+	return s.from
 }
 
 // inGrace reports whether now falls inside the grace window of stallAt.
@@ -145,6 +161,13 @@ func (c *Checker) InStallGrace() bool {
 // Production never calls it. On a checker whose heartbeat already runs (Start
 // was called), it returns at once.
 func (c *Checker) RunStallHeartbeatForTests(ctx context.Context) { c.runStallHeartbeat(ctx) }
+
+// SetClockForTests replaces the checker's local clock (nil restores
+// time.Now). Test seam: tests/fleet models a node that stops running — a
+// frozen or suspended process — with a clock that blocks while the node is
+// stopped, so every path of the checker halts at its next reading and sees
+// the gap on resume. It must be set before Start. Production never calls it.
+func (c *Checker) SetClockForTests(fn func() time.Time) { c.clock = fn }
 
 // runStallHeartbeat beats until ctx ends. Started by Start, before probing.
 // A checker runs one heartbeat: while one runs, another returns at once.

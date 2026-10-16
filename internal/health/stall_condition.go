@@ -27,7 +27,9 @@ import (
 // process's own scheduling, and the window it reports is already over by the
 // time a second pass could confirm it.
 const (
-	stallEvaluator = "stall"
+	// StallEvaluator is observer_stalled's evaluator.
+	StallEvaluator = "stall"
+	stallEvaluator = StallEvaluator
 	// CondObserverStalled is the condition code for a node that was not
 	// running long enough to have its fence votes withheld.
 	CondObserverStalled = "observer_stalled"
@@ -37,6 +39,93 @@ type stallEvidence struct {
 	Detail     string  `json:"detail"`
 	GapSeconds float64 `json:"gap_seconds"`
 	GraceUntil string  `json:"grace_until"`
+	// SilentRuns are this node's failing runs, by target, that are silent
+	// through the stall (silentThroughStall). Written as each begins, so it
+	// may be added after the condition resolved.
+	SilentRuns map[string]SilentRun `json:"silent_runs,omitempty"`
+}
+
+// SilentRun is a failing run an observer recorded as silent through its
+// stall: it began at RunStart, exactly as the run's verdicts publish
+// last_seen, and the observer has not seen the target answer since
+// SilentSince, the last moment it ran before the stall (its own clock, as
+// last_seen is).
+type SilentRun struct {
+	RunStart    string `json:"run_start"`
+	SilentSince string `json:"silent_since"`
+}
+
+// SilentSince reads an observer_stalled condition's evidence for target's
+// failing run that began at runStart (the verdict's last_seen, as stored):
+// since when, by the observer's clock, it has not seen target answer, when it
+// recorded that very run as silent through its stall. A run that began after
+// an answer has another start and is not found.
+func SilentSince(evidence, target, runStart string) (time.Time, bool) {
+	if runStart == "" {
+		return time.Time{}, false
+	}
+	var ev stallEvidence
+	if json.Unmarshal([]byte(evidence), &ev) != nil {
+		return time.Time{}, false
+	}
+	run, ok := ev.SilentRuns[target]
+	if !ok || run.RunStart != runStart {
+		return time.Time{}, false
+	}
+	since, err := time.Parse(time.RFC3339Nano, run.SilentSince)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return since, true
+}
+
+// noteSilentRun records target's failing run, begun at runStart, as silent
+// through the stall that began at silentSince, in this node's observer_stalled
+// condition: the open one, or the one in the store once it has resolved (a
+// silent run's first counted probe comes at the end of the grace window).
+// Reports whether it was written; a run that was not is tried again on its
+// next probe. Without the record failover refuses the recovery of a host this
+// observer was frozen across the fence of, as it did before the record
+// existed (restartedSinceObserversIn).
+func (c *Checker) noteSilentRun(ctx context.Context, target string, runStart, silentSince time.Time) bool {
+	s := &c.stall
+	s.tickMu.Lock()
+	defer s.tickMu.Unlock()
+	var row corrosion.HealthCondition
+	if s.open != nil {
+		row = *s.open
+	} else {
+		stored, ok, err := corrosion.GetHealthCondition(ctx, c.db, stallEvaluator, CondObserverStalled, "host", c.hostName)
+		if err != nil || !ok {
+			slog.Warn("health checker: no observer_stalled condition to record a run silent through the stall in",
+				"target", target, "error", err)
+			return false
+		}
+		row = stored
+	}
+	var ev stallEvidence
+	_ = json.Unmarshal([]byte(row.Evidence), &ev) // an unreadable one is rebuilt with the run
+	if ev.SilentRuns == nil {
+		ev.SilentRuns = map[string]SilentRun{}
+	}
+	ev.SilentRuns[target] = SilentRun{
+		RunStart:    runStart.UTC().Format(time.RFC3339Nano),
+		SilentSince: silentSince.UTC().Format(time.RFC3339Nano),
+	}
+	b, err := json.Marshal(ev)
+	if err != nil {
+		return false
+	}
+	row.Evidence = string(b)
+	row.Reporter = c.hostName
+	if err := corrosion.UpsertHealthCondition(ctx, c.db, row); err != nil {
+		slog.Error("health checker: could not record a run silent through the stall", "target", target, "error", err)
+		return false
+	}
+	if s.open != nil {
+		s.open = &row
+	}
+	return true
 }
 
 // stallTick is one heartbeat: beat, then bring the condition in line with it.

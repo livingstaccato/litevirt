@@ -113,6 +113,17 @@ type peerState struct {
 	// It restarts wherever `failures` restarts at 1, so it is the start of
 	// exactly the run the published count describes.
 	runStart time.Time
+	// trackedSince is when this entry was created (local clock), and
+	// lastAnswerAt when the peer last answered a probe, ready or unready
+	// (local clock; zero if never). An answer that came back on a probe
+	// straddling a stall counts at the moment it was observed, after the
+	// stall: it may have arrived at any point of it.
+	trackedSince time.Time
+	lastAnswerAt time.Time
+	// silentSince, while non-zero, is the start of the stall this run is
+	// silent through and the run is not yet recorded as such in the
+	// observer_stalled condition (silentThroughStall, noteSilentRun).
+	silentSince time.Time
 }
 
 // Checker performs periodic health checks on peer hosts.
@@ -525,6 +536,30 @@ func shouldPersistHealth(changed, healthy, answeredUnready, recoveryPending bool
 	return answeredUnready || (healthy && recoveryPending)
 }
 
+// silentThroughStall reports whether a run of unanswered probes whose first
+// counted probe was observed at observedAt, by an observer whose most recent
+// stall began at stalledFrom (zero: none), is silent through that stall: the
+// observer was already tracking the peer when it stopped, and has not seen it
+// answer since — so the peer's last answer it saw predates the stall.
+//
+// Such a run starts, like any, at its first counted probe, StallGrace after
+// the resume, and that start is what its verdicts publish (last_seen). But
+// failover reads a run that began after a fence as an answer after the fence
+// (restartedSinceObserversIn), and an observer frozen across a fence then
+// refused that fence's recovery for good (lab 1 Drill2, 2026-10-16). So the
+// checker records the run, with the stall's start, in its observer_stalled
+// condition (noteSilentRun), and failover excuses exactly that run.
+//
+// last_seen is not moved back to the stall's start. Failover also reads it as
+// the start of an unbroken watch (observerStreakSpans), and an observer that
+// was not running did not watch: a host can answer, and fail again, while it
+// is stopped. An answer of any kind since the stall began, including one on
+// a probe that straddled it, means the run is not silent through it.
+func silentThroughStall(prev *peerState, stalledFrom, observedAt time.Time) bool {
+	return !stalledFrom.IsZero() && stalledFrom.Before(observedAt) &&
+		!prev.trackedSince.After(stalledFrom) && !prev.lastAnswerAt.After(stalledFrom)
+}
+
 // The two host_health verdict shapes checkHost publishes. Every release since
 // v1.3.0 emits both, unchanged.
 const (
@@ -549,6 +584,7 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	// resumes, possibly before the heartbeat goroutine is scheduled.
 	observedAt := c.now()
 	stallAt, stallEpoch := c.beat(observedAt)
+	stalledFrom := c.stalledFrom(stallEpoch)
 	// Withheld entirely — no state change, no write:
 	//   - any result of a probe that STRADDLED a stall. It proves nothing about
 	//     the peer after the stall: a timeout ran out while this process was
@@ -575,8 +611,11 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		// The cost is bounded and correct: after a restart a node must re-earn
 		// suspectThreshold consecutive failures — about 6 s at checkInterval —
 		// before it votes to fence again.
-		prev = &peerState{status: "", failures: 0, stallEpoch: stallEpoch}
+		prev = &peerState{status: "", failures: 0, stallEpoch: stallEpoch, trackedSince: observedAt}
 		c.peers[host.Name] = prev
+	}
+	if result != probeUnreachable {
+		prev.lastAnswerAt = observedAt
 	}
 	if prev.stallEpoch != stallEpoch {
 		prev.failures = 0
@@ -643,8 +682,13 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	switch {
 	case result != probeUnreachable:
 		prev.runStart = time.Time{} // an answer, healthy or unready, ends the run
+		prev.silentSince = time.Time{}
 	case newFailures == 1 || prev.runStart.IsZero():
 		prev.runStart = observedAt
+		prev.silentSince = time.Time{}
+		if silentThroughStall(prev, stalledFrom, observedAt) {
+			prev.silentSince = stalledFrom
+		}
 	}
 
 	// An unchanged unready verdict is not a change. Its count is pinned, so it
@@ -669,8 +713,18 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		sinceWrite = HeartbeatInterval // never written: the first probe publishes
 	}
 	write := shouldPersistHealth(changed, healthy, result == probeNotReady, recoveryPending(host.State), sinceWrite)
-	runStart := prev.runStart
+	runStart, silentSince := prev.runStart, prev.silentSince
 	c.mu.Unlock()
+
+	// Before the verdict, so a replica that holds the verdict has normally
+	// received the record too; one that has not refuses until it does.
+	if !silentSince.IsZero() && c.noteSilentRun(ctx, host.Name, runStart, silentSince) {
+		c.mu.Lock()
+		if prev.runStart.Equal(runStart) {
+			prev.silentSince = time.Time{}
+		}
+		c.mu.Unlock()
+	}
 
 	if !write {
 		return

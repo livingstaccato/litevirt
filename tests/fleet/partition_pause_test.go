@@ -123,6 +123,9 @@ type ppOpts struct {
 	// lateCoordinators names nodes whose coordinator is built but not
 	// started; the scenario starts it with startCoordinator.
 	lateCoordinators map[string]bool
+	// clocks replaces a node's health-checker clock, before it starts
+	// (frozenClock).
+	clocks map[string]func() time.Time
 }
 
 func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
@@ -134,6 +137,9 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		dataDir := filepath.Join(t.TempDir(), n.Name)
 		chk := health.NewChecker(n.Name, n.PKIDir, n.DB)
 		chk.SetPeerReadiness(n.Server.PeerReady)
+		if clk := o.clocks[n.Name]; clk != nil {
+			chk.SetClockForTests(clk)
+		}
 		go chk.Start(ctx)
 
 		on := &atomic.Bool{}

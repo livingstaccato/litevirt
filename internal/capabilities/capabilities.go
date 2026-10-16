@@ -419,6 +419,35 @@ const (
 	// proves the shape decodes.
 	RelayHealthV1 = "relay_health_v1"
 
+	// SpecConflictV1 gates how a VM's desired-spec edits are replicated
+	// (corrosion/spec_conflict.go). Every edit is a compare-and-swap on
+	// spec_generation, and two made from the same generation on two hosts —
+	// one on each side of a partition — used to leave every replica holding
+	// whichever reached it first: the losing statement applied as a silent
+	// zero-row no-op, and anti-entropy later kept the newer row by timestamp,
+	// even over an operation's barrier. Once latched:
+	//
+	//   - an out-of-band spec edit carries the owner epoch it was made at, a
+	//     statement shape a previous-release peer has no ledger entry for;
+	//   - the WAL resolves an edit that meets another at its generation as
+	//     anti-entropy does: the higher owner epoch, then an operation's
+	//     barrier over an out-of-band edit, then the later edit;
+	//   - neither path overwrites a row whose operation is in flight with an
+	//     out-of-band edit at the same generation;
+	//   - an edit dropped by either path is recorded (a vm_events row and
+	//     litevirt_merge_apply_rejected_total{reason="spec_edit_dropped"}).
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build decodes the epoch-carrying shape and resolves
+	// a conflict this way. Every replica must resolve one conflict the same
+	// way, so a flag would make one node keep a different version of a spec
+	// from its peers.
+	//
+	// ReplicationGated: the epoch-carrying shape must be decodable by every
+	// host still receiving replication, a maintenance host on the previous
+	// build included, and every such host must resolve as the rest do.
+	SpecConflictV1 = "spec_conflict_v1"
+
 	// RecoveryClaimV1 gates ENFORCEMENT of single-winner recovery claims
 	// (docs/design/recovery-claims.md §3, §5.1–§5.2,
 	// colonelpanik/litevirt#250): a failover coordinator collects a majority
@@ -1051,6 +1080,13 @@ const ReleaseToken = Release202611V1
 //     binary rolled back below it enters WAL quarantine, as below every
 //     latched token.
 //
+//   - spec_conflict_v1 has no flag either, and no stand-down of its own: it
+//     changes how replication resolves two edits of one spec made at one
+//     generation, and every replica must resolve them alike. A conflict it
+//     resolved is recorded as a vm.spec_edit_dropped event, from which the
+//     dropped edit can be made again. A binary rolled back below it enters
+//     WAL quarantine, as below every latched token.
+//
 //   - release_2026_11_v1 (the release token) has no flag and no stand-down of
 //     its own, and needs none: latching it changes nothing until a feature is
 //     USED, and every feature is opened through WithFeature, which records
@@ -1177,6 +1213,10 @@ var supported = []string{
 	// RelayHealthV1 is advertised UNCONDITIONALLY: it says "this build reads
 	// the relay_demoted rows when it elects relays", a fact about the binary.
 	RelayHealthV1,
+	// SpecConflictV1 is advertised UNCONDITIONALLY: it says "this build
+	// decodes the epoch-carrying spec edit and resolves a conflict at one
+	// generation as anti-entropy does", a fact about the binary.
+	SpecConflictV1,
 	// RecoveryClaimV1 is advertised CONDITIONALLY: enforcement.recovery_claim
 	// (default on) on AND this node ready (split_brain_gate_v1 latched, voter_config_v1
 	// ready). Withheld while the flag is off because every flag-on node relies
@@ -1215,7 +1255,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, Release202611V1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, Release202611V1, SpecConflictV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -1298,6 +1338,10 @@ var replicationGated = map[string]bool{
 	// relays from what it receives, so each must read the demotion rows. See
 	// RelayHealthV1.
 	RelayHealthV1: true,
+	// Confirmed against every replication recipient: each must decode the
+	// epoch-carrying spec edit and resolve a conflict as the rest do. See
+	// SpecConflictV1.
+	SpecConflictV1: true,
 	// Confirmed against every replication recipient: the claim_certificate
 	// column's statement shapes on runtime_action_proofs must be decodable by
 	// every host we stream to. Not mandatory: the flag is the opt-in.
@@ -1378,6 +1422,10 @@ var mandatory = map[string]bool{
 	// elects relays), and every node relies on every other electing the same
 	// set. See RelayHealthV1.
 	RelayHealthV1: true,
+	// A fact about the binary (it decodes the epoch-carrying spec edit and
+	// resolves a conflict at one generation as every replica does). See
+	// SpecConflictV1.
+	SpecConflictV1: true,
 	// A fact about the binary (it decodes, keeps and honours its release's
 	// fields and shapes). Nothing changes until a feature is used, and every
 	// use is recorded first. See Release202611V1.

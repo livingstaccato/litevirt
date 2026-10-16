@@ -1389,6 +1389,26 @@ the lease holder from demoting the host again until the hold runs out. A
 binary rolled back below the latched token enters WAL quarantine, as below
 every latched token. Roll forward.
 
+### Concurrent spec edits are resolved after the roll
+
+Two edits of one VM's spec made from the same generation, one on each side of
+a partition, used to leave each host holding whichever reached it first until
+anti-entropy kept the newer one. A spec edit entering on a host that does not
+own the VM is now made on the owner, which serialises them; an owner that
+cannot be reached still takes the edit where it entered. Once the
+`spec_conflict_v1` capability token has latched — on its own, once every host
+the cluster replicates to, including one parked in `maintenance`, runs this
+release — an edit also carries the owner epoch it was made at, a statement a
+host on the previous release cannot decode, and every host resolves two edits
+at one generation the same way (see
+[operating-model.md](operating-model.md#replication)). Until then edits are
+replicated exactly as before.
+
+`spec_conflict_v1` is mandatory and replication-gated, with no flag: every
+host must resolve one conflict the same way. A binary rolled back below the
+latched token enters WAL quarantine, as below every latched token. Roll
+forward.
+
 ### Console passwords start after the roll
 
 This release gives each VM's VNC and SPICE consoles a per-VM password

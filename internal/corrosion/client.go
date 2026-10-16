@@ -447,6 +447,11 @@ type Client struct {
 	// CLOSED when unset: a previous-release peer ignores the key and would
 	// elect a different relay set. See relay_health.go.
 	relayHealthGate atomic.Pointer[func() bool]
+	// specConflictGate, when non-nil and returning true, says spec_conflict_v1
+	// has durably latched: spec edits carry their owner epoch and a conflict
+	// at one generation is resolved (spec_conflict.go). Unset reads false,
+	// the previous release's behaviour.
+	specConflictGate atomic.Pointer[func() bool]
 	// voterConfigGate, when set and returning true, permits WRITING
 	// voter_configs. Injected via SetVoterConfigGate, wired to the durable
 	// voter_config_v1 latch. Fails CLOSED when unset: that table's shapes
@@ -646,6 +651,8 @@ func (c *Client) capabilityActive(name string) bool {
 		return c.canonicalIdentityOn()
 	case capabilities.VMReplaceV1:
 		return c.vmReplaceAcceptOn()
+	case capabilities.SpecConflictV1:
+		return c.SpecConflictOn()
 	default:
 		return false
 	}

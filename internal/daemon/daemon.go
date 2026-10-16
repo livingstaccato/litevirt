@@ -3717,6 +3717,20 @@ func (d *Daemon) wireCorrosionGates() {
 	d.wireClusterPolicyGate()
 	d.wireVoterConfigGate()
 	d.wireRecoveryClaimGate()
+	d.wireSpecConflictGate()
+}
+
+// wireSpecConflictGate tells corrosion when spec_conflict_v1 has DURABLY
+// latched: spec edits then carry their owner epoch, a shape a
+// previous-release peer cannot decode, and a conflict at one generation is
+// resolved alike on every replica (corrosion/spec_conflict.go). Durable, so
+// a restart does not return a node to the previous release's resolution
+// while its peers keep the new one. Mandatory, no config flag; unwired, the
+// gate reads false and the node behaves as the previous release.
+func (d *Daemon) wireSpecConflictGate() {
+	d.db.SetSpecConflictGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.SpecConflictV1)
+	})
 }
 
 // wireLeaseMintClearance makes every new lease term wait for the quorum

@@ -37,7 +37,7 @@ var ErrSpecMutateContention = errors.New("corrosion: MutateDesiredSpec exceeded 
 func MutateDesiredSpec(ctx context.Context, c *Client, name string, fn func(oldSpec string) (string, error)) (applied bool, newGen int64, err error) {
 	for attempt := 0; attempt < specMutateMaxRetries; attempt++ {
 		rows, qerr := c.Query(ctx,
-			`SELECT spec, spec_generation, active_operation_id FROM vms WHERE name = ? AND deleted_at IS NULL`, name)
+			`SELECT spec, spec_generation, vm_owner_epoch, active_operation_id FROM vms WHERE name = ? AND deleted_at IS NULL`, name)
 		if qerr != nil {
 			return false, 0, qerr
 		}
@@ -59,10 +59,17 @@ func MutateDesiredSpec(ctx context.Context, c *Client, name string, fn func(oldS
 		// CAS: apply only if the generation is still specGen AND no operation has
 		// since claimed the barrier. A miss means a concurrent writer moved the row;
 		// re-read and retry (bounded).
-		n, uerr := c.ExecuteRowsStrict(ctx,
-			`UPDATE vms SET spec = ?, spec_generation = spec_generation + 1, updated_at = ?
-			 WHERE name = ? AND spec_generation = ? AND active_operation_id = '' AND deleted_at IS NULL`,
-			newSpec, c.NowTS(), name, specGen)
+		// Once spec_conflict_v1 has latched the edit also names the owner
+		// epoch it was made at, so a receiver can resolve it against another
+		// edit at this generation (spec_conflict.go).
+		var n int64
+		var uerr error
+		if c.SpecConflictOn() {
+			n, uerr = c.ExecuteRowsStrict(ctx, vmSpecMutateAtEpochSQL,
+				newSpec, c.NowTS(), name, rows[0].Int64("vm_owner_epoch"), specGen)
+		} else {
+			n, uerr = c.ExecuteRowsStrict(ctx, vmSpecMutateSQL, newSpec, c.NowTS(), name, specGen)
+		}
 		if uerr != nil {
 			return false, specGen, uerr
 		}

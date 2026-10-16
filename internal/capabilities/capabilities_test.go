@@ -167,6 +167,28 @@ func TestRelayHealthV1Registered(t *testing.T) {
 	}
 }
 
+// TestSpecConflictV1Registered pins spec_conflict_v1: advertised, known,
+// mandatory (a fact about the binary — how it resolves two edits of one spec
+// at one generation) and replication-gated (every recipient decodes the
+// epoch-carrying edit and resolves as the rest do).
+func TestSpecConflictV1Registered(t *testing.T) {
+	if SpecConflictV1 != "spec_conflict_v1" {
+		t.Fatalf("SpecConflictV1 = %q, want %q", SpecConflictV1, "spec_conflict_v1")
+	}
+	if !slices.Contains(Supported(), SpecConflictV1) {
+		t.Fatalf("Supported() = %v, want it to contain %q", Supported(), SpecConflictV1)
+	}
+	if !slices.Contains(All(), SpecConflictV1) {
+		t.Fatalf("All() = %v, want it to contain %q", All(), SpecConflictV1)
+	}
+	if !Mandatory(SpecConflictV1) {
+		t.Fatal("spec_conflict_v1 must be mandatory: a flag would let one node keep a different version of a spec")
+	}
+	if !ReplicationGated(SpecConflictV1) {
+		t.Fatal("spec_conflict_v1 must be replication-gated: every recipient decodes the epoch-carrying edit")
+	}
+}
+
 // TestReleaseTokenRegistered pins the release token's registration. Every one
 // of these sets matters: Supported is what peers latch on, All is what the
 // checker loads markers for and what the rollback preflight treats as known,

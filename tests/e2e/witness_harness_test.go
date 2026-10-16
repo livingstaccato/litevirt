@@ -675,13 +675,13 @@ func (w *leaseWatch) sampleOnce() {
 	w.mu.Unlock()
 	var samples []readerSample
 	for _, r := range rs { // every reader every tick: a later one can be the incoherent one
-		rows, err := w.l.sql(r, "SELECT COALESCE((SELECT holder FROM leader_election WHERE key='failover'),''), (SELECT COALESCE(MAX(term),0) FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL), COALESCE((SELECT holder FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL ORDER BY term DESC LIMIT 1),''), COALESCE((SELECT group_concat(term || ':' || holder, ',') FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL),'')")
-		if err != nil || len(rows) == 0 || len(rows[0]) < 4 {
+		rows, err := w.l.sql(r, "SELECT COALESCE((SELECT holder FROM leader_election WHERE key='failover'),''), (SELECT COALESCE(MAX(term),0) FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL), COALESCE((SELECT holder FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL ORDER BY term DESC LIMIT 1),''), COALESCE((SELECT group_concat(term || ':' || holder, ',') FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL),''), COALESCE((SELECT expires_at FROM leader_election WHERE key='failover'),''), strftime('%Y-%m-%dT%H:%M:%SZ','now')")
+		if err != nil || len(rows) == 0 || len(rows[0]) < 6 {
 			samples = append(samples, readerSample{Reader: r, Failed: true})
 			continue
 		}
 		term, _ := strconv.Atoi(rows[0][1])
-		samples = append(samples, readerSample{Reader: r, S: leaseSample{Election: rows[0][0], Term: term, Ledger: rows[0][2], Terms: parseTermHolders(rows[0][3])}})
+		samples = append(samples, readerSample{Reader: r, S: leaseSample{Election: rows[0][0], Term: term, Ledger: rows[0][2], Terms: parseTermHolders(rows[0][3]), Expires: parseLeaseTime(rows[0][4]), Now: parseLeaseTime(rows[0][5])}})
 	}
 	w.sampleTick(time.Now(), samples)
 }
@@ -715,11 +715,12 @@ func recorderOf(samples []readerSample) string {
 }
 
 // selfClaims reports whether the sample is a claim to count at once: the
-// replica names its own node holder and is not lag-classified. A lagging
-// replica holding its own old election row is catching up, and is counted by
-// the window tracker (observe) instead.
+// replica names its own node holder, is not lag-classified and the lease it
+// names is unexpired by that replica's own clock. A lagging replica holding
+// its own old election row is catching up, and an expired row is a tenure that
+// ended: neither is a holder.
 func selfClaims(r string, s leaseSample) bool {
-	return s.Election == r && classifyLease(s) != leaseLag
+	return s.Election == r && classifyLease(s) != leaseLag && !s.expired()
 }
 
 // sampleTick takes every reader's answer for one tick.
@@ -897,6 +898,33 @@ type leaseSample struct {
 	Term     int
 	Ledger   string
 	Terms    map[int]string
+	// Expires is the election row's expires_at and Now the reader's clock at
+	// the read (the node's own sqlite). Zero means unknown, which counts as
+	// unexpired: an unreadable expiry never excuses a claim.
+	Expires time.Time
+	Now     time.Time
+}
+
+// leaseSkewMargin is how far past expires_at the reader's clock must be before
+// the row counts as expired: clocks across nodes may differ by this much.
+const leaseSkewMargin = 2 * time.Second
+
+// parseLeaseTime reads an RFC3339 lease timestamp; "" or garbage is the zero time.
+func parseLeaseTime(v string) time.Time {
+	t, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// expired reports whether the election row's lease had clearly ended by the
+// reader's own clock, beyond the skew margin. Unknown is not expired.
+func (s leaseSample) expired() bool {
+	if s.Expires.IsZero() || s.Now.IsZero() {
+		return false
+	}
+	return s.Now.After(s.Expires.Add(leaseSkewMargin))
 }
 
 // parseTermHolders reads "50:node-2,51:node-4".
@@ -915,7 +943,7 @@ type leaseSampleKind int
 
 const (
 	leaseCoherent    leaseSampleKind = iota
-	leaseNeutral                     // election empty beside a held ledger term: between tenures
+	leaseNeutral                     // election empty, or an expired row, beside a held ledger term: between tenures
 	leaseLag                         // election holds an OLDER term: the replica is behind
 	leaseUnexplained                 // election holder holds no earlier term either
 )
@@ -934,6 +962,9 @@ func classifyLease(s leaseSample) leaseSampleKind {
 		if t < s.Term && h == s.Election {
 			return leaseLag
 		}
+	}
+	if s.expired() {
+		return leaseNeutral // a tenure that ended, nobody holds it
 	}
 	return leaseUnexplained
 }
@@ -975,6 +1006,10 @@ func (w *leaseWatch) observe(r string, now time.Time, s leaseSample, record bool
 		tr.observe(now, true)
 	case leaseNeutral:
 		// neither resets nor extends a run
+	case leaseLag:
+		// A replica behind the ledger is recorded, never failed: leader_election
+		// is not carried by anti-entropy, so a restarted replica keeps its old row.
+		w.incohSamples = append(w.incohSamples, leaseIncoherent{At: now, Reader: r, Sample: s, Kind: kind})
 	default:
 		persistent = tr.observe(now, false)
 		w.incohSamples = append(w.incohSamples, leaseIncoherent{At: now, Reader: r, Sample: s, Kind: kind})
@@ -988,7 +1023,7 @@ func (w *leaseWatch) observe(r string, now time.Time, s leaseSample, record bool
 		w.logf("lease: INCOHERENT sample on %s: election holder %q, ledger term %d held by %q (%s, streak %d)", r, s.Election, s.Term, s.Ledger, [...]string{"", "", "lagging", "unexplained"}[kind], streak)
 	}
 	if persistent {
-		w.fail("lease: %s's replica has shown election holder %q beside ledger term %d held by %q for %d samples over %v: a second holder at one term, not a catching-up replica", r, s.Election, s.Term, s.Ledger, streak, incoherenceBound)
+		w.fail("lease: %s's replica has shown election holder %q beside ledger term %d held by %q for %d samples over %v: an unexpired holder that no ledger term explains", r, s.Election, s.Term, s.Ledger, streak, incoherenceBound)
 	}
 	if kind == leaseLag || kind == leaseUnexplained {
 		return false

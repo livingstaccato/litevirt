@@ -253,21 +253,35 @@ func TestLeaseWatchObserve(t *testing.T) {
 	if len(w.history()) != 1 || w.history()[0].Holder != "node-4" {
 		t.Fatalf("a lagging sample was recorded as a lease change: %+v", w.history())
 	}
-	// Persistent lag fails, per reader: another reader's coherent samples and
-	// neutral samples must not reset it.
+	// Lag never fails, however long it lasts or how it flaps.
+	w = newW()
+	for i := 0; i < 30; i++ {
+		s := lag
+		if i%2 == 1 {
+			s = ok
+		}
+		w.observe("a", at(i), s, true)
+		w.observe("b", at(i), lag, false)
+	}
+	if len(fails) != 0 {
+		t.Fatalf("lag failed the drill: %v", fails)
+	}
+	// A persistent unexplained live holder fails, per reader: another reader's
+	// coherent samples and neutral samples must not reset it.
+	unexp := leaseSample{Election: "node-9", Term: 51, Ledger: "node-4", Terms: terms}
 	w = newW()
 	for i := 0; i < 5; i++ {
-		w.observe("a", at(i), lag, true)
+		w.observe("a", at(i), unexp, true)
 		w.observe("b", at(i), ok, false)
 		w.observe("a", at(i), neutral, false)
 	}
 	if len(fails) != 1 || !strings.Contains(fails[0], "a's replica") {
 		t.Fatalf("persistent lag on reader a: fails=%v", fails)
 	}
-	// A flapping row fails.
+	// A flapping unexplained row fails.
 	w = newW()
 	for i := 0; i < 6; i++ {
-		s := lag
+		s := unexp
 		if i%2 == 1 {
 			s = ok
 		}
@@ -468,10 +482,12 @@ func TestSampleTick(t *testing.T) {
 	if len(fails) != 0 {
 		t.Fatalf("a lagging self-claim failed at 2 ticks: %v", fails)
 	}
-	// The window tracker still catches it when it persists.
-	w.sampleTick(t0.Add(2*time.Second), []readerSample{{Reader: "node-2", S: lagging}, {Reader: "node-4", S: fresh}})
-	if len(fails) != 1 || !strings.Contains(fails[0], "node-2's replica") {
-		t.Fatalf("persistent lag self-claim: %v", fails)
+	// Lag is recorded however long it persists, and never fails.
+	for i := 2; i < 12; i++ {
+		w.sampleTick(t0.Add(time.Duration(i)*time.Second), []readerSample{{Reader: "node-2", S: lagging}, {Reader: "node-4", S: fresh}})
+	}
+	if len(fails) != 0 {
+		t.Fatalf("persistent lag self-claim failed: %v", fails)
 	}
 	// A caught-up replica self-claiming beside a newer holder still fails at 2 ticks.
 	selfConsistent := stale
@@ -542,5 +558,96 @@ func TestGuestBootVerdict(t *testing.T) {
 		if got := guestBootVerdict(c.in) != ""; got != c.boot {
 			t.Errorf("%s: never-booted = %v, want %v", c.name, got, c.boot)
 		}
+	}
+}
+
+// TestLeaseSampleExpiry: an election row is expired only when the reader's own
+// clock is past expires_at plus the skew margin; unknown times are not expired.
+func TestLeaseSampleExpiry(t *testing.T) {
+	exp := time.Unix(1000, 0)
+	terms := map[int]string{50: "node-2", 51: "node-4"}
+	for _, c := range []struct {
+		name         string
+		expires, now time.Time
+		want         bool
+	}{
+		{"unknown expiry", time.Time{}, exp.Add(time.Hour), false},
+		{"unknown clock", exp, time.Time{}, false},
+		{"live", exp, exp.Add(-time.Second), false},
+		{"inside skew margin", exp, exp.Add(leaseSkewMargin), false},
+		{"expired", exp, exp.Add(leaseSkewMargin + time.Second), true},
+	} {
+		s := leaseSample{Election: "node-2", Term: 51, Ledger: "node-4", Terms: terms, Expires: c.expires, Now: c.now}
+		if got := s.expired(); got != c.want {
+			t.Errorf("%s: expired=%v, want %v", c.name, got, c.want)
+		}
+	}
+	// A holder no earlier term explains: live is unexplained, expired is neutral.
+	live := leaseSample{Election: "node-9", Term: 51, Ledger: "node-4", Terms: terms, Expires: exp, Now: exp}
+	if k := classifyLease(live); k != leaseUnexplained {
+		t.Errorf("live unexplained = %v", k)
+	}
+	live.Now = exp.Add(time.Minute)
+	if k := classifyLease(live); k != leaseNeutral {
+		t.Errorf("expired unexplained = %v, want neutral", k)
+	}
+	// Lag stays lag whether or not the row expired: it is always recorded.
+	lag := leaseSample{Election: "node-2", Term: 51, Ledger: "node-4", Terms: terms, Expires: exp, Now: exp.Add(time.Minute)}
+	if k := classifyLease(lag); k != leaseLag {
+		t.Errorf("expired lag = %v, want lag", k)
+	}
+	if got := parseLeaseTime("2026-10-14T21:04:45Z"); got.IsZero() || !parseLeaseTime("").IsZero() || !parseLeaseTime("x").IsZero() {
+		t.Errorf("parseLeaseTime: %v", got)
+	}
+}
+
+// TestLagNeverFails: the W3 replay. node-2 restarted and its replica still
+// shows its own expired term-71 row while node-6 holds term 72: three lag
+// samples, no failure, no self-claim. Two live self-claimants still fail; an
+// expired self-claim beside a live one does not.
+func TestLagNeverFails(t *testing.T) {
+	var fails []string
+	w := &leaseWatch{incoh: map[string]*incoherenceTracker{}, termHolder: map[int]string{}, lastBy: map[string]leaseChange{}, maxTerm: map[string]int{},
+		fail: func(f string, a ...any) { fails = append(fails, fmt.Sprintf(f, a...)) }, logf: func(string, ...any) {}}
+	t0 := time.Unix(5000, 0)
+	terms := map[int]string{71: "node-2", 72: "node-6"}
+	stale := leaseSample{Election: "node-2", Term: 72, Ledger: "node-6", Terms: terms, Expires: t0.Add(-80 * time.Second), Now: t0}
+	for i := 0; i < 3; i++ {
+		now := t0.Add(time.Duration(i) * time.Second)
+		w.sampleTick(now, []readerSample{{Reader: "node-2", S: stale}, {Reader: "node-6", S: leaseSample{Election: "node-6", Term: 72, Ledger: "node-6", Terms: terms, Expires: t0.Add(30 * time.Second), Now: t0}}})
+	}
+	if len(fails) != 0 {
+		t.Fatalf("W3 replay failed the drill: %v", fails)
+	}
+	// Even an unexpired lag row (a real self-claim on a lagging replica) is not failed on.
+	stale.Expires = t0.Add(time.Hour)
+	for i := 3; i < 20; i++ {
+		w.sampleTick(t0.Add(time.Duration(i)*time.Second), []readerSample{{Reader: "node-2", S: stale}, {Reader: "node-6", S: leaseSample{Election: "node-6", Term: 72, Ledger: "node-6", Terms: terms, Expires: t0.Add(time.Hour), Now: t0}}})
+	}
+	if len(fails) != 0 {
+		t.Fatalf("unexpired lag failed the drill: %v", fails)
+	}
+	// Two live self-claims on coherent-looking replicas: a real dual holder.
+	w = &leaseWatch{incoh: map[string]*incoherenceTracker{}, termHolder: map[int]string{}, lastBy: map[string]leaseChange{}, maxTerm: map[string]int{},
+		fail: func(f string, a ...any) { fails = append(fails, fmt.Sprintf(f, a...)) }, logf: func(string, ...any) {}}
+	live := func(h string) leaseSample {
+		return leaseSample{Election: h, Term: 72, Ledger: h, Terms: map[int]string{72: h}, Expires: t0.Add(time.Hour), Now: t0}
+	}
+	for i := 0; i < 2; i++ {
+		w.sampleTick(t0.Add(time.Duration(i)*time.Second), []readerSample{{Reader: "node-2", S: live("node-2")}, {Reader: "node-6", S: live("node-6")}})
+	}
+	if len(fails) == 0 || !strings.Contains(fails[len(fails)-1], "dual holder") {
+		t.Fatalf("two live holders: %v", fails)
+	}
+	// An expired self-claim is not a holder.
+	fails = nil
+	w = &leaseWatch{incoh: map[string]*incoherenceTracker{}, termHolder: map[int]string{}, lastBy: map[string]leaseChange{}, maxTerm: map[string]int{},
+		fail: func(f string, a ...any) { fails = append(fails, fmt.Sprintf(f, a...)) }, logf: func(string, ...any) {}}
+	dead := leaseSample{Election: "node-2", Term: 71, Ledger: "node-2", Terms: map[int]string{71: "node-2"}, Expires: t0.Add(-time.Minute), Now: t0}
+	for i := 0; i < 4; i++ {
+		w.sampleTick(t0.Add(time.Duration(i)*time.Second), []readerSample{{Reader: "node-2", S: dead}, {Reader: "node-6", S: leaseSample{Election: "node-6", Term: 72, Ledger: "node-6", Terms: map[int]string{71: "node-2", 72: "node-6"}, Expires: t0.Add(time.Hour), Now: t0}}})
+	}
+	if len(fails) != 0 {
+		t.Fatalf("an expired self-claim failed: %v", fails)
 	}
 }

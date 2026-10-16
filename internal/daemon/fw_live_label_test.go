@@ -194,10 +194,11 @@ func TestFwLiveLabelProbe(t *testing.T) {
 }
 
 // A wedged libvirtd (its version call never returns) makes the host not
-// capable, within the bound, and the next probe does not pile up behind it.
+// capable, within the bound, and the next probe does not pile up behind it:
+// it waits on the same call, within its own bound.
 //
 // Mutations: call fn directly in boundedVersion - the test hangs and goes red;
-// drop the in-flight guard - the second-call row goes red; return a stale
+// start a new call for every caller - the calls row goes red; return a stale
 // success on timeout - the first row goes red.
 func TestBoundedVersion_WedgedLibvirtIsNotCapable(t *testing.T) {
 	release := make(chan struct{})
@@ -219,8 +220,8 @@ func TestBoundedVersion_WedgedLibvirtIsNotCapable(t *testing.T) {
 		t.Fatalf("the wedged call was not bounded: %v", time.Since(start))
 	}
 	start = time.Now()
-	if _, err := bv(); err == nil || time.Since(start) > 40*time.Millisecond {
-		t.Fatalf("second call while the first is blocked: err %v after %v, want an immediate error", err, time.Since(start))
+	if _, err := bv(); err == nil || time.Since(start) > 5*time.Second {
+		t.Fatalf("second call while the first is blocked: err %v after %v, want an error within the bound", err, time.Since(start))
 	}
 	mu.Lock()
 	if calls != 1 {
@@ -237,6 +238,64 @@ func TestBoundedVersion_WedgedLibvirtIsNotCapable(t *testing.T) {
 			t.Fatal("bounded version never recovered after libvirtd answered")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// Two live firmware moves on one host (or one host the source of one and the
+// target of another) read the version at once: both get the answer of one
+// call, and neither is refused because the other's call is in flight (merge
+// review m-1).
+//
+// Mutation: refuse a caller while a call is in flight (the old in-flight
+// flag) - red.
+func TestBoundedVersion_ConcurrentCallersShareOneCall(t *testing.T) {
+	release := make(chan struct{})
+	var mu sync.Mutex
+	calls := 0
+	bv := boundedVersion(5*time.Second, func() (uint64, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		<-release
+		return 10000000, nil
+	})
+	type res struct {
+		v   uint64
+		err error
+	}
+	out := make(chan res, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			v, err := bv()
+			out <- res{v, err}
+		}()
+	}
+	// Both callers are in before the call returns.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		c := calls
+		mu.Unlock()
+		if c >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no version call started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	for i := 0; i < 2; i++ {
+		r := <-out
+		if r.err != nil || r.v != 10000000 {
+			t.Fatalf("caller %d: %v, %v; want the shared answer", i, r.v, r.err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("fn called %d times for two concurrent callers, want 1", calls)
 	}
 }
 

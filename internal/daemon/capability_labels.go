@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -253,28 +253,38 @@ func newFwLiveHostCheck(cfg MigrationConfig, store *libvirt.FirmwareStore, fp li
 }
 
 // boundedVersion calls fn with a deadline. A call that does not return in
-// time is an error (the host counts as not capable), and while it is still
-// blocked a later call fails at once rather than piling up another goroutine
-// behind a wedged libvirtd.
+// time is an error (the host counts as not capable). Callers that arrive
+// while a call is in flight share it: each waits for its answer within its
+// own bound, so two live firmware moves on one host (stage A, Prepare, the
+// label) never refuse each other, and a wedged libvirtd never has more than
+// one goroutine blocked in it. A caller after the answer starts a new call.
 func boundedVersion(timeout time.Duration, fn func() (uint64, error)) func() (uint64, error) {
-	var inflight atomic.Bool
+	type call struct {
+		done chan struct{}
+		v    uint64
+		err  error
+	}
+	var mu sync.Mutex
+	var cur *call
 	return func() (uint64, error) {
-		if !inflight.CompareAndSwap(false, true) {
-			return 0, errors.New("libvirt version: an earlier call has not returned")
+		mu.Lock()
+		c := cur
+		if c == nil {
+			c = &call{done: make(chan struct{})}
+			cur = c
+			go func() {
+				v, err := fn()
+				mu.Lock()
+				c.v, c.err = v, err
+				cur = nil
+				mu.Unlock()
+				close(c.done)
+			}()
 		}
-		type res struct {
-			v   uint64
-			err error
-		}
-		ch := make(chan res, 1)
-		go func() {
-			defer inflight.Store(false)
-			v, err := fn()
-			ch <- res{v, err}
-		}()
+		mu.Unlock()
 		select {
-		case r := <-ch:
-			return r.v, r.err
+		case <-c.done:
+			return c.v, c.err
 		case <-time.After(timeout):
 			return 0, errors.New("libvirt version: timed out")
 		}

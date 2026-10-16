@@ -2075,7 +2075,9 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// unchanged). A refusal is NON-FATAL: a blocked VM / unacquirable device (FailedPrecondition)
 	// is a non-retryable operator-repair condition → terminalize the proof + set the VM error;
 	// a transient read/DB failure (Internal/Unavailable) re-arms for the next reconcile tick.
-	releaseHW, hwErr := r.hwPrepareStart(ctx, fresh)
+	// domainXMLFor above has tried the VM's own seed for this start: the
+	// hook does not try it again (one failure, one warning).
+	releaseHW, hwErr := r.hwPrepareStart(cloudinit.WithSeedTriedForStart(ctx), fresh)
 	if hwErr != nil && errors.Is(hwErr, ErrStartDeferred) {
 		// Not a failure: storage did not answer, or there was no time left
 		// to ask it. Re-driven next pass — never parked in error.

@@ -529,7 +529,10 @@ func (s *Server) applyLiveMetadata(ctx context.Context, name string, desired *pb
 			case "placement":
 				fresh.Placement = desired.Placement
 			case "migrate":
+				// With its top-level mirror, which is all the failover
+				// coordinator reads (compose.BuildVMSpec; a create stores both).
 				fresh.Migrate = desired.Migrate
+				fresh.OnHostFailure = desired.OnHostFailure
 			case "healthcheck":
 				fresh.Healthcheck = desired.Healthcheck
 			case "hooks":

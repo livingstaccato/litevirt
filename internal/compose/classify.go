@@ -299,7 +299,18 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 	metaIf(desired.StopDelaySec != stored.StopDelaySec, "stop_delay", fmt.Sprintf("%d", stored.StopDelaySec), fmt.Sprintf("%d", desired.StopDelaySec))
 	metaIf(len(desired.Labels) > 0 && !maps.Equal(desired.Labels, stored.Labels), "labels", "", "")
 	metaIf(desired.Placement != nil && !placementEqual(desired.Placement, stored.Placement), "placement", "", "")
-	metaIf(desired.Migrate != nil && !proto.Equal(desired.Migrate, stored.Migrate), "migrate", "", "")
+	// The migrate block and the top-level on_host_failure mirror of its policy
+	// are one change: the failover coordinator reads only the mirror (an enum
+	// RESTART_ANY = 0 does not survive the spec JSON), so a stored spec whose
+	// block matches but whose mirror does not still needs the patch.
+	if desired.Migrate != nil {
+		oldPolicy, newPolicy := hostFailurePolicy(stored.OnHostFailure), hostFailurePolicy(desired.OnHostFailure)
+		if oldPolicy != newPolicy {
+			metaIf(true, "migrate", oldPolicy, newPolicy)
+		} else {
+			metaIf(!proto.Equal(desired.Migrate, stored.Migrate), "migrate", "", "")
+		}
+	}
 	// Read from the stored spec when they are used — by the owner's health
 	// checker, at each start/stop/migrate, at each stop — never baked into the
 	// domain, so a spec patch is the whole change.
@@ -333,6 +344,15 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 		p.Delegated = append(p.Delegated, "update-strategy")
 	}
 
+	return p
+}
+
+// hostFailurePolicy reads a spec's top-level on_host_failure as the failover
+// coordinator does: unset is "none".
+func hostFailurePolicy(p string) string {
+	if p == "" {
+		return "none"
+	}
 	return p
 }
 

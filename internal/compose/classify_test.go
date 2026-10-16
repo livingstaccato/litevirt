@@ -381,3 +381,61 @@ func TestClassify_LimitChangesAreLive(t *testing.T) {
 		t.Errorf("rate change plans %v", p.Max())
 	}
 }
+
+// F2 (lab 2): migrate.on-host-failure changed on an existing VM. The failover
+// coordinator reads the spec's top-level on_host_failure, not the migrate
+// block, so the plan must carry the change as the "migrate" metadata delta
+// whenever either differs — including a stored spec whose migrate block
+// already matches the file but whose top-level policy does not (one an
+// earlier in-place update left with only the block changed). An unchanged
+// policy is no change, and "" (an older spec) reads as "none".
+//
+// Mutation: drop the on_host_failure comparison from the "migrate" delta —
+// "block matches, policy does not" goes red (planned as no change).
+func TestClassify_MigrateOnHostFailure(t *testing.T) {
+	f := baseFile("s", nil)
+	build := func(policy string) *pb.VMSpec {
+		vm := &VMDef{Image: "ubuntu-24.04", CPU: 2, Memory: 2048, Migrate: &MigrateDef{OnHostFailure: policy}}
+		return mustBuildVMSpec(t, "vm", "vm", vm, f)
+	}
+	with := func(s *pb.VMSpec, policy string) *pb.VMSpec {
+		s = proto.Clone(s).(*pb.VMSpec)
+		s.OnHostFailure = policy
+		return s
+	}
+	for _, c := range []struct {
+		name             string
+		desired, stored  *pb.VMSpec
+		change           bool
+		wantOld, wantNew string
+	}{
+		{"none to restart-any", build("restart-any"), build("none"), true, "none", "restart-any"},
+		{"restart-any to none", build("none"), build("restart-any"), true, "restart-any", "none"},
+		{"restart-same to restart-any", build("restart-any"), build("restart-same"), true, "restart-same", "restart-any"},
+		{"block matches, policy does not", build("restart-any"), with(build("restart-any"), "none"), true, "none", "restart-any"},
+		{"block matches, policy missing", build("restart-any"), with(build("restart-any"), ""), true, "none", "restart-any"},
+		{"unchanged", build("restart-any"), build("restart-any"), false, "", ""},
+		{"unchanged none, stored empty", build("none"), with(build("none"), ""), false, "", ""},
+	} {
+		p := Classify(c.desired, c.stored, StoredDisksFromSpec(c.stored))
+		var got *Delta
+		for i := range p.MetadataChanges {
+			if p.MetadataChanges[i].Field == "migrate" {
+				got = &p.MetadataChanges[i]
+			}
+		}
+		if !c.change {
+			if p.Max() != ActionNoChange || got != nil {
+				t.Errorf("%s: Max()=%v migrate=%+v, want no change", c.name, p.Max(), got)
+			}
+			continue
+		}
+		if p.Max() != ActionLive || got == nil {
+			t.Errorf("%s: Max()=%v migrate=%+v (%s), want a live migrate change", c.name, p.Max(), got, p.Reasons())
+			continue
+		}
+		if got.Old != c.wantOld || got.New != c.wantNew {
+			t.Errorf("%s: migrate delta %q→%q, want %q→%q", c.name, got.Old, got.New, c.wantOld, c.wantNew)
+		}
+	}
+}

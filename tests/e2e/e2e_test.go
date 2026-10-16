@@ -2964,11 +2964,41 @@ vms:
 		if !ok {
 			t.Skip("nft inspection unavailable off-cluster")
 		}
-		if n := strings.Count(inet, "hook forward"); n != 1 {
-			t.Errorf("forward chain appears %d times in inet litevirt-fw, want 1 (atomic-replace regression):\n%s", n, inet)
+		// The renderer emits two forward-hook chains on every host: the main
+		// `forward` chain and `isolated_forward` (net isolation). Each must
+		// appear exactly once; a missing or duplicated one is the
+		// atomic-replace regression.
+		hooks := forwardHookChains(inet)
+		for _, name := range []string{"forward", "isolated_forward"} {
+			if n := hooks[name]; n != 1 {
+				t.Errorf("chain %q with a forward hook appears %d times in inet litevirt-fw, want 1 (atomic-replace regression):\n%s", name, n, inet)
+			}
+		}
+		for name := range hooks {
+			if name != "forward" && name != "isolated_forward" {
+				t.Errorf("unexpected forward-hook chain %q in inet litevirt-fw:\n%s", name, inet)
+			}
 		}
 		t.Logf("bridge litevirt-nic on %s rendered the web SG correctly (observe=%v: 8080 accept, DHCP accept, drop or would-drop counter; single inet forward chain)", host, observe)
 	})
+}
+
+// forwardHookChains counts, by chain name, the chains of an `nft list table`
+// dump that declare a forward hook.
+func forwardHookChains(dump string) map[string]int {
+	out := map[string]int{}
+	cur := ""
+	for _, line := range strings.Split(dump, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 3 && f[0] == "chain" && f[len(f)-1] == "{" {
+			cur = f[1]
+			continue
+		}
+		if cur != "" && strings.Contains(line, "hook forward") {
+			out[cur]++
+		}
+	}
+	return out
 }
 
 // nicEnforcementMode parses the mode out of `lv firewall enforce status`
@@ -3036,7 +3066,7 @@ func sgChainOrdered(chain string, observe bool) error {
 
 // pureTests are the tests that touch no cluster and no lv, and so are the only
 // ones LITEVIRT_E2E_UNIT=1 may run.
-var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed", "TestEnforcementEditScript", "TestJoinMajority", "TestUsbHostdevPattern", "TestInspectFenceStrategy", "TestKnownAuditFork", "TestMinorityCopyStopped", "TestConditionsSince", "TestEnforcementEditScriptRefusesAnInlineBlock", "TestParseClaimView", "TestParseLogLines", "TestMailpitMatches", "TestCutPlan", "TestHoldersBetween", "TestTenureAt", "TestMintTime", "TestParseEnforcementGauges", "TestLeaseTermModeOf", "TestLeaseTermExpectFor", "TestW4aVerdict", "TestFreshTenureAt", "TestLeaseTermRefusalPattern", "TestInertJournalVerdict", "TestRefusalVerdict", "TestInspectNICIP", "TestPollFor", "TestHostStateInLs", "TestClassifyLease", "TestLeaseSampleExpiry", "TestExpiredLagNeverFails", "TestExpiredUnexplainedIsNoTenure", "TestLeaseWatchObserve", "TestObserveTick", "TestObserveTickUnknown", "TestSampleTick", "TestHoldersIn", "TestIncoherenceTracker", "TestPingVerdict", "TestUncertifiedDeclineVerdict", "TestGuestBootVerdict"}
+var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed", "TestEnforcementEditScript", "TestJoinMajority", "TestUsbHostdevPattern", "TestInspectFenceStrategy", "TestKnownAuditFork", "TestMinorityCopyStopped", "TestConditionsSince", "TestEnforcementEditScriptRefusesAnInlineBlock", "TestParseClaimView", "TestParseLogLines", "TestMailpitMatches", "TestCutPlan", "TestHoldersBetween", "TestTenureAt", "TestMintTime", "TestParseEnforcementGauges", "TestLeaseTermModeOf", "TestLeaseTermExpectFor", "TestW4aVerdict", "TestFreshTenureAt", "TestLeaseTermRefusalPattern", "TestInertJournalVerdict", "TestRefusalVerdict", "TestInspectNICIP", "TestPollFor", "TestHostStateInLs", "TestClassifyLease", "TestLeaseSampleExpiry", "TestExpiredLagNeverFails", "TestExpiredUnexplainedIsNoTenure", "TestLeaseWatchObserve", "TestObserveTick", "TestObserveTickUnknown", "TestSampleTick", "TestHoldersIn", "TestIncoherenceTracker", "TestPingVerdict", "TestUncertifiedDeclineVerdict", "TestGuestBootVerdict", "TestForwardHookChains"}
 
 // unitRunAllowed reports whether a -test.run pattern selects only pureTests:
 // the exact form ^(A|B)$ or ^A$, with every name pure.

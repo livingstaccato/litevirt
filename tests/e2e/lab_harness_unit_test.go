@@ -701,3 +701,17 @@ func TestExpiredUnexplainedIsNoTenure(t *testing.T) {
 		t.Fatalf("history %+v", h)
 	}
 }
+
+// TestForwardHookChains pins how the firewall e2e names the forward-hook chains
+// of an nft dump: by chain, so a missing or duplicated one is visible.
+// Run with LITEVIRT_E2E_UNIT=1 (it needs no cluster).
+func TestForwardHookChains(t *testing.T) {
+	dump := "table inet litevirt-fw {\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy accept;\n\t}\n\n\tchain input {\n\t\ttype filter hook input priority filter; policy accept;\n\t}\n\n\tchain isolated_forward {\n\t\ttype filter hook forward priority filter; policy accept;\n\t}\n}\n"
+	want := map[string]int{"forward": 1, "isolated_forward": 1}
+	if got := forwardHookChains(dump); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	if got := forwardHookChains(dump + dump); got["forward"] != 2 {
+		t.Fatalf("a duplicated forward chain must count 2, got %v", got)
+	}
+}

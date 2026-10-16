@@ -199,11 +199,13 @@ func (c *Cluster) isJoiner(n *Node) bool {
 // Cluster is the assembled fleet. Use Stop in a t.Cleanup; nothing
 // shuts down on its own.
 type Cluster struct {
-	t       *testing.T
-	Nodes   []*Node
-	caCert  string
-	caKey   string
-	tmpRoot string
+	networkCalls          networkCalls
+	beforeDependencyClose func(*Node)
+	t                     *testing.T
+	Nodes                 []*Node
+	caCert                string
+	caKey                 string
+	tmpRoot               string
 	// opts is the bootstrap request, kept so per-node wiring (buildServer) can
 	// read options the harness applies after the nodes exist.
 	opts Options
@@ -589,27 +591,44 @@ func (c *Cluster) Stop() {
 			n.replStarted = false
 		}
 	}
-	c.waitLBWork()
 	for _, n := range c.Nodes {
 		if n.stopServerLoops != nil {
 			n.stopServerLoops()
 		}
-		n.Server.WaitNetworkWork()
+	}
+	// Finish selected admitted handlers and their children while every peer still
+	// serves. A client timeout does not end an admitted handler's ownership.
+	c.waitLBWork()
+	// All transports/handlers stop before any node's dependent DB or files close.
+	var transports sync.WaitGroup
+	for _, n := range c.Nodes {
+		if n.GRPCSrv != nil {
+			transports.Add(1)
+			go func(n *Node) {
+				defer transports.Done()
+				n.GRPCSrv.GracefulStop()
+				if n.serveDone != nil {
+					<-n.serveDone
+				}
+			}(n)
+		}
+	}
+	transports.Wait()
+	c.waitLBWork()
+	for _, n := range c.Nodes {
+		n.Server.WaitGatewayAnnouncements()
+	}
+	for _, n := range c.Nodes {
 		if n.selfConn != nil {
 			_ = n.selfConn.Close()
-		}
-		if n.GRPCSrv != nil {
-			n.GRPCSrv.GracefulStop()
-			if n.serveDone != nil {
-				<-n.serveDone
-			}
-			n.Server.WaitGatewayAnnouncements()
-			n.Server.WaitNetworkWork()
 		}
 		if n.Listener != nil {
 			_ = n.Listener.Close()
 		}
 		if n.DB != nil {
+			if c.beforeDependencyClose != nil {
+				c.beforeDependencyClose(n)
+			}
 			n.DB.Close()
 		}
 	}
@@ -628,6 +647,7 @@ func (c *Cluster) SelfClient(n *Node) pb.LiteVirtClient {
 		cc, err := grpc.NewClient(
 			fmt.Sprintf("%s:%d", n.Address, n.Port),
 			grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
+			grpc.WithChainUnaryInterceptor(c.networkRPCClient()),
 		)
 		if err != nil {
 			c.t.Fatalf("dial self %s: %v", n.Name, err)
@@ -649,6 +669,7 @@ func (c *Cluster) PeerClient(source, target *Node) pb.LiteVirtClient {
 	cc, err := grpc.NewClient(
 		fmt.Sprintf("%s:%d", target.Address, target.Port),
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
+		grpc.WithChainUnaryInterceptor(c.networkRPCClient()),
 	)
 	if err != nil {
 		c.t.Fatalf("dial %s from %s: %v", target.Name, source.Name, err)
@@ -669,6 +690,7 @@ func (c *Cluster) bearerClient(n *Node, token string) pb.LiteVirtClient {
 	cc, err := grpc.NewClient(
 		fmt.Sprintf("%s:%d", n.Address, n.Port),
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
+		grpc.WithChainUnaryInterceptor(c.networkRPCClient()),
 		grpc.WithPerRPCCredentials(staticBearer{token}),
 	)
 	if err != nil {
@@ -880,6 +902,7 @@ func (c *Cluster) buildServer(n *Node) {
 	// A running VM's replica or copy is point-in-time through the external
 	// snapshot layer, as the daemon wires it from its libvirt client
 	// (grpcapi/pit_copy.go). The fleet has no backup sessions.
+	n.Server.SetPeerUnaryInterceptor(c.networkRPCClient())
 	n.Server.SetPointInTimeSnapshotter(n.Virt)
 
 	// Domain lifecycle events: the daemon registers this same handler on its
@@ -993,7 +1016,7 @@ func (c *Cluster) buildServer(n *Node) {
 	}
 	srv := grpc.NewServer(append(trackOpts,
 		grpc.Creds(creds),
-		grpc.ChainUnaryInterceptor(n.peerAddrUnaryInterceptor, n.partitionUnaryInterceptor, n.aeMeterUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor, n.hookUnaryInterceptor),
+		grpc.ChainUnaryInterceptor(n.peerAddrUnaryInterceptor, n.partitionUnaryInterceptor, n.aeMeterUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor, n.hookUnaryInterceptor, c.networkRPCServer(n)),
 		grpc.ChainStreamInterceptor(n.peerAddrStreamInterceptor, n.partitionStreamInterceptor, n.aeMeterStreamInterceptor, n.Server.StreamAuthInterceptor, n.hookStreamInterceptor),
 	)...)
 	pb.RegisterLiteVirtServer(srv, n.Server)

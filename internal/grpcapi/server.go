@@ -536,6 +536,10 @@ type Server struct {
 	// label was derived from.
 	firmware lv.FirmwarePaths
 
+	// peerUnaryMu protects interceptor snapshots for new peer connections.
+	peerUnaryMu          sync.RWMutex
+	peerUnaryInterceptor grpc.UnaryClientInterceptor
+
 	// lbApplyOverride is a test seam for LB provisioning: when non-nil it
 	// replaces the real haproxy/keepalived Apply (unit tests have no root / no
 	// haproxy). Production leaves it nil so apply failures surface + roll back.
@@ -2795,7 +2799,21 @@ func peerTarget(addr string, port int) string {
 // the outbound call — a no-op when tracing is off — for every PeerDial caller,
 // not just this one; a new call site can no longer silently drop trace
 // propagation by forgetting to pass obs.ClientDialOptions() explicitly.
+// SetPeerUnaryInterceptor supplies an optional per-server transport observer.
+// Swaps are synchronized; each new connection captures one snapshot. Production
+// leaves it nil. Existing connections retain their captured interceptor.
+func (s *Server) SetPeerUnaryInterceptor(interceptor grpc.UnaryClientInterceptor) {
+	s.peerUnaryMu.Lock()
+	s.peerUnaryInterceptor = interceptor
+	s.peerUnaryMu.Unlock()
+}
 func (s *Server) dialPeerAddr(target string) (*grpc.ClientConn, error) {
+	s.peerUnaryMu.RLock()
+	interceptor := s.peerUnaryInterceptor
+	s.peerUnaryMu.RUnlock()
+	if interceptor != nil {
+		return pki.PeerDial(s.pkiDir, target, grpc.WithChainUnaryInterceptor(interceptor))
+	}
 	return pki.PeerDial(s.pkiDir, target)
 }
 

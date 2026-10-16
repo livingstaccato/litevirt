@@ -16,10 +16,14 @@ func (f *NetProvFake) EnableIPForwarding() error {
 func (f *NetProvFake) InterfaceForIP(string) string { return "fleet-uplink" }
 
 // waitLBWork requires the scenario to finish its producer requests first.
+// Every selected RPC is owned until client and admitted handler return, or its
+// admission is atomically sealed. Handlers register causal children before return.
 // Peer requests can still register new work on an earlier node in the scan.
+// External/untracked producers must be quiescent; this is not a daemon-wide join.
 func (c *Cluster) waitLBWork() { c.waitLBWorkObserved(nil) }
 func (c *Cluster) waitLBWorkObserved(observe func(*Node)) {
 	previous := make([]uint64, len(c.Nodes))
+	var previousRPC uint64
 	havePrevious := false
 	for {
 		stable := havePrevious
@@ -33,6 +37,11 @@ func (c *Cluster) waitLBWorkObserved(observe func(*Node)) {
 				observe(n)
 			}
 		}
+		rpcGeneration := c.networkCalls.wait()
+		if !havePrevious || rpcGeneration != previousRPC {
+			stable = false
+		}
+		previousRPC = rpcGeneration
 		if stable {
 			return
 		}

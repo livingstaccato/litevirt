@@ -1609,7 +1609,7 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 		requestPorts := standaloneProtocols(req.Ports)
 		if r.String("stack_name") != "" {
 			requestPorts = req.Ports
-			if err := requireAdminForLBTLS(ctx, &pb.LBSpec{Ports: requestPorts}); err != nil {
+			if err := requireAdminForLBTLS(ctx, &pb.LBSpec{Enabled: true, Ports: requestPorts}); err != nil {
 				return nil, err
 			}
 		}

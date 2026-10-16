@@ -137,7 +137,7 @@ func testPrivateStackLB(t *testing.T, update bool) {
 		})
 	}
 
-	t.Cleanup(func() { c.waitLBWork(); dependenciesClosed.Store(true); c.Stop() })
+	t.Cleanup(func() { c.Stop(); dependenciesClosed.Store(true) })
 	for _, p := range deployCollect(t, ctx, c.SelfClient(c.Nodes[0]), yaml) {
 		if p.Phase == "error" {
 			t.Fatalf("deploy: %s: %s", p.VmName, p.Error)

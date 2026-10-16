@@ -1489,13 +1489,26 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			return status.Errorf(codes.Internal, "read the NICs of %q: %v", vm.Name, nerr)
 		}
 	}
+	// Each NIC's model is the one it was recorded with, as every other
+	// builder takes it (compose.NICModels): the merged row reads virtio for a
+	// VM created before v42, whose vm_nics row the backfill wrote as virtio.
+	var takeoverModels *compose.NICModels
+	if len(takeoverNICs) > 0 {
+		rowModels, reattached, merr := corrosion.NICModelSources(ctx, s.db, vm.Name, takeoverNICs, compose.SpecNICModelsByMAC(&spec))
+		if merr != nil {
+			removeLive()
+			return status.Errorf(codes.Internal, "read the NIC models of %q: %v", vm.Name, merr)
+		}
+		takeoverModels = compose.NewNICModels(&spec, rowModels, reattached)
+	}
 	for _, n := range takeoverNICs {
 		bridge := network.FlatBridgeName(n.NetworkName)
 		if err := s.ensureBridge(bridge); err != nil {
 			removeLive()
 			return status.Errorf(codes.FailedPrecondition, "network bridge %q unavailable on %q: %v", bridge, s.hostName, err)
 		}
-		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: n.MAC, SpecOrdinal: n.Ordinal + 1,
+		model := takeoverModels.Model(n.MAC, n.NetworkName, n.Ordinal, n.Model)
+		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: model, MAC: n.MAC, SpecOrdinal: n.Ordinal + 1,
 			RateMBps: compose.NICRate(&spec, n.Ordinal, n.NetworkName)})
 	}
 	// A renamed promotion is a second VM: its NICs are the spec's, with fresh

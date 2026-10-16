@@ -707,3 +707,139 @@ func TestSelfPauseExplicit_AGenerationAdoptedMidCycleIsCounted(t *testing.T) {
 		})
 	}
 }
+
+// Every generation down may be counting over must be one this node holds.
+// Generations 2 and 3 are down, coordinator, alive and v4 (q = 3); 4 adds v6
+// and 5 swaps v6 for v7 (q = 3 of 5). This node adopted 3, and down reported
+// 4. alive, v4 and v7 span 2, 3 and 5, but are only two of generation 4's
+// three: down, coordinator and v6 are a majority of it. When this node holds
+// 5 but not 4 (the rows arrived out of order), 4 is counted by nobody, so a
+// gap between the floor and the newest generation holds.
+//
+// Mutation: drop the heldThrough check from regainCandidates — "holds 3 and
+// 5, not 4" goes ahead.
+func TestSelfPauseExplicit_AGapInTheGenerationsHolds(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		hold4    bool
+		spanning []string
+		restart  []string
+		wantOK   bool
+	}{
+		{"holds 3 and 5, not 4", false, []string{"alive", "v4", "v7"}, []string{"coordinator", "v6"}, false},
+		{"holds 3 and 5, not 4, every voter spanning", false, []string{"alive", "v4", "v6", "v7"}, []string{"coordinator"}, false},
+		{"holds 3, 4 and 5, 4 not spanned", true, []string{"alive", "v4", "v7"}, []string{"coordinator", "v6"}, false},
+		{"holds 3, 4 and 5, every voter spanning", true, []string{"alive", "v4", "v6", "v7"}, []string{"coordinator"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, db, ctx, _ := explicitPause(t)
+			for _, v := range []string{"v6", "v7"} {
+				ensureVoter(t, db, v)
+			}
+			c.run(ctx)
+			h, err := corrosion.GetHost(ctx, db, "down")
+			if err != nil || h == nil {
+				t.Fatal(err)
+			}
+			writeGen(t, db, 2, "coordinator", "alive", "down", "v4")
+			writeGen(t, db, 3, "coordinator", "alive", "down", "v4")
+			if tc.hold4 {
+				writeGen(t, db, 4, "coordinator", "alive", "down", "v4", "v6")
+			}
+			writeGen(t, db, 5, "coordinator", "alive", "down", "v4", "v7")
+			for _, g := range []int64{2, 3} {
+				if err := corrosion.RecordVoterAdoption(ctx, db, g); err != nil {
+					t.Fatal(err)
+				}
+			}
+			at := time.Now().Add(-time.Minute)
+			backdateHistory(t, db, at.Add(-time.Hour))
+			c.PeerClockSkew = func(string) (time.Duration, bool) { return 0, true }
+			reportedGeneration(c, 4, time.Time{})
+			deadlineScope(t, c, db)
+			if v := c.scope.voters("down"); len(v) != 4 {
+				t.Fatalf("setup: the cycle reads %v, not generation 3", v)
+			}
+			pausedCondition(t, db, at.Add(-time.Hour))
+			for _, o := range []string{"coordinator", "alive", "v4", "v6", "v7"} {
+				healthRow(t, db, o, "healthy", 0, at.Add(-time.Hour))
+			}
+			for _, o := range tc.spanning {
+				failingSince(t, db, o, at.Add(-time.Minute), time.Now())
+			}
+			for _, o := range tc.restart {
+				failingSince(t, db, o, at.Add(20*time.Second), time.Now())
+			}
+			v := c.selfPauseStillStands(ctx, h, at, time.Now())
+			if v.ok != tc.wantOK || (!v.ok && !strings.HasPrefix(v.key, keyRestarted)) {
+				t.Fatalf("deadline: %+v; want ok=%v (refused under %q)", v, tc.wantOK, keyRestarted)
+			}
+		})
+	}
+}
+
+// A generation this node has not received is counted by nobody, but a voter
+// of a counted set that adopted it says so in its Ping. Generations 1, 2 (adds
+// v6) and 3 (the same members) were decided long ago, this node adopted 3,
+// down reported 3, and alive, v4, v5 and v6 span all of them. A member of a
+// counted set that reported a generation newer than 3, in any Ping this node
+// received, holds the deadline.
+//
+// Mutations: drop the aVoterReportedNewer check from regainCandidates — both
+// "v4 reported 4" arms go ahead; count only reports received before a
+// moment within the outage — "v4 reported 4, only since the outage began"
+// goes ahead.
+func TestSelfPauseExplicit_AVoterReportingANewerGenerationHolds(t *testing.T) {
+	long := time.Now().Add(-2 * time.Hour)
+	for _, tc := range []struct {
+		name   string
+		v4Gen  int64
+		v4At   time.Time
+		wantOK bool
+	}{
+		{name: "no voter reported a newer generation", wantOK: true},
+		{name: "v4 reported 3", v4Gen: 3, v4At: long, wantOK: true},
+		{name: "v4 reported 4 before the outage", v4Gen: 4, v4At: long},
+		{name: "v4 reported 4, only since the outage began", v4Gen: 4, v4At: time.Now()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, db, ctx, _ := explicitPause(t)
+			ensureVoter(t, db, "v6")
+			c.run(ctx)
+			h, err := corrosion.GetHost(ctx, db, "down")
+			if err != nil || h == nil {
+				t.Fatal(err)
+			}
+			writeGen(t, db, 2, "coordinator", "alive", "down", "v4", "v5", "v6")
+			writeGen(t, db, 3, "coordinator", "alive", "down", "v4", "v5", "v6")
+			if err := corrosion.RecordVoterAdoption(ctx, db, 3); err != nil {
+				t.Fatal(err)
+			}
+			at := time.Now().Add(-time.Minute)
+			backdateHistory(t, db, at.Add(-time.Hour))
+			c.PeerClockSkew = func(string) (time.Duration, bool) { return 0, true }
+			c.PeerVoterGeneration = func(peer string, before time.Time) (int64, bool) {
+				switch {
+				case peer == "down" && long.Before(before):
+					return 3, true
+				case peer == "v4" && tc.v4Gen > 0 && tc.v4At.Before(before):
+					return tc.v4Gen, true
+				}
+				return 0, false
+			}
+			deadlineScope(t, c, db)
+			pausedCondition(t, db, at.Add(-time.Hour))
+			for _, o := range []string{"coordinator", "alive", "v4", "v5", "v6"} {
+				healthRow(t, db, o, "healthy", 0, at.Add(-time.Hour))
+			}
+			for _, o := range []string{"alive", "v4", "v5", "v6"} {
+				failingSince(t, db, o, at.Add(-time.Minute), time.Now())
+			}
+			failingSince(t, db, "coordinator", at.Add(20*time.Second), time.Now())
+			v := c.selfPauseStillStands(ctx, h, at, time.Now())
+			if v.ok != tc.wantOK || (!v.ok && !strings.HasPrefix(v.key, keyRestarted)) {
+				t.Fatalf("deadline: %+v; want ok=%v (refused under %q)", v, tc.wantOK, keyRestarted)
+			}
+		})
+	}
+}

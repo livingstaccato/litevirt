@@ -639,6 +639,12 @@ type regainCandidate struct {
 //   - wherever host may be counting over a derived set (the derived branch,
 //     a reset, or no generation before the adopted one), the derived set as
 //     its replica held it (derivedRegainCandidate).
+//
+// ok is also false when this node does not hold every generation from the
+// oldest counted one to the newest (heldThrough), or a member of a counted
+// set reported adopting a generation newer than the newest it holds
+// (aVoterReportedNewer): either is a set host may be counting over that this
+// node cannot count.
 func (c *Coordinator) regainCandidates(ctx context.Context, host string, explicit bool, since time.Time, skew func(string) time.Duration) ([]regainCandidate, bool) {
 	adopted, cfgs, err := c.voterSnapshot(ctx)
 	if err != nil {
@@ -734,7 +740,52 @@ func (c *Coordinator) regainCandidates(ctx context.Context, host string, explici
 	if !c.hostReportedAdopting(host, since, floor, newest) {
 		return nil, false
 	}
+	if !heldThrough(cfgs, max(floor, 1), newest) {
+		return nil, false
+	}
+	if c.aVoterReportedNewer(cands, newest) {
+		return nil, false
+	}
 	return cands, true
+}
+
+// heldThrough reports whether cfgs holds every generation from `from` to
+// `to`. A generation missing from this node's replica in between is one host
+// may be counting over that no set counts.
+func heldThrough(cfgs []*corrosion.VoterConfig, from, to int64) bool {
+	held := map[int64]bool{}
+	for _, cfg := range cfgs {
+		if cfg != nil {
+			held[cfg.Generation] = true
+		}
+	}
+	for g := from; g <= to; g++ {
+		if !held[g] {
+			return false
+		}
+	}
+	return true
+}
+
+// everyReport is the bound under which PeerVoterGeneration returns the
+// highest generation a peer reported in any Ping this node received.
+var everyReport = time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// aVoterReportedNewer reports whether a member of any of cands' sets said, in
+// any Ping this node received, that it had adopted a generation newer than
+// newest: one this node does not hold, which no set counts.
+func (c *Coordinator) aVoterReportedNewer(cands []regainCandidate, newest int64) bool {
+	if c.PeerVoterGeneration == nil {
+		return false
+	}
+	for _, cand := range cands {
+		for v := range cand.set {
+			if g, ok := c.PeerVoterGeneration(v, everyReport); ok && g > newest {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // hostReportedAdopting reports whether host said, in a Ping this node

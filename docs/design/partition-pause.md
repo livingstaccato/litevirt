@@ -564,7 +564,12 @@ All of this is in the failover coordinator (`internal/failover`).
      received before the outage began, that it had adopted the oldest of
      these or a later one that this node holds; with no such report (an
      older build, a host whose adoption is stuck, a restart of this node,
-     which keeps the reports in memory) the rule stands. A report of 0 after
+     which keeps the reports in memory) the rule stands. The proof also
+     rests on this node's replica holding every generation the host may be
+     counting over. The rule stands when this node does not hold every
+     generation from the oldest counted one to the newest, and when a voter
+     of a counted set has reported, in any Ping this node received, a
+     generation newer than the newest this node holds. A report of 0 after
      an earlier one (a restart of the host before its first adoption pass,
      or a host re-provisioned under the same name) forgets the earlier
      ones. A report's receipt is dated on this node's wall clock, as the
@@ -596,6 +601,20 @@ All of this is in the failover coordinator (`internal/failover`).
      stopped. When one of these deadlines passes quiet while this
      coordinator already keeps the host to a list, it keeps to the list as
      above.
+
+     The proof fails open, and the deadline can go ahead while the host
+     holds a majority, in these cases:
+     - a peer's clock steps within the hour this node keeps its measured
+       skew;
+     - a peer measured nowhere is skewed by more than the 30 s assumed for
+       it;
+     - this node's wall clock steps back during the outage;
+     - on the derived set, the host's replica lacks a change of a member's
+       voting state decided more than 30 s before the outage began;
+     - a host's row was purged outright, so its skew is left out of the
+       largest skew a stamp is moved by;
+     - this node's replica lacks a generation newer than the newest it holds,
+       and no voter of a counted set has reported it.
 
    If the host is no longer `fenced` or `offline`, the wait is dropped and
    nothing is recovered. The host came back, it will resume itself (§3.5), and

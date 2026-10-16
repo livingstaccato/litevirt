@@ -16,8 +16,8 @@ import (
 )
 
 // The prior boot really raises the condition and leaves its awaiting note.
-// Removing cleanup from the active fallback boot leaves that same row open,
-// both before and after the next daemon answers its own Ping.
+// A deferred successor keeps that same row open until Ping, then retries real
+// persisted resolution without renewing the successful active transition.
 func TestActiveFallbackBootResolvesPersistedUnconfirmed(t *testing.T) {
 	d, db, ctx := upgradingHost(t)
 	metrics.SetUpgradingUnconfirmed(false)
@@ -28,7 +28,7 @@ func TestActiveFallbackBootResolvesPersistedUnconfirmed(t *testing.T) {
 	bctx, cancel := context.WithCancel(ctx)
 	d.selfPinger = checks.pinger(&gatedPinger{open: make(chan struct{})})
 	t.Cleanup(func() { cancel(); checks.wait(t) })
-	d.writeBootState(bctx, 0, 0, 0, false)
+	checks.start(d, bctx, 0, 0, 0, false)
 	waitLifecycle(t, "the prior boot's real open condition", func() bool {
 		r, ok := unconfirmedRow(t, ctx, db)
 		return ok && r.Lifecycle == corrosion.ConditionConfirmed
@@ -51,22 +51,69 @@ func TestActiveFallbackBootResolvesPersistedUnconfirmed(t *testing.T) {
 	next := &Daemon{cfg: d.cfg, db: db, selfPinger: checks.pinger(&gatedPinger{open: serving})}
 	nctx, ncancel := context.WithCancel(ctx)
 	t.Cleanup(func() { ncancel(); checks.wait(t) })
-	next.writeBootState(nctx, 0, 0, 0, false)
-	if got := hostState(t, ctx, db); got != "active" {
-		t.Fatalf("fallback boot recorded %q, want active", got)
+	since, known, err := corrosion.HostStateSince(ctx, db, "h")
+	if err != nil || !known {
+		t.Fatalf("upgrading state time: %v %v", known, err)
+	}
+	beforeReport, err := corrosion.GetHost(ctx, db, "h")
+	if err != nil || beforeReport == nil {
+		t.Fatalf("before deferred report: %+v err=%v", beforeReport, err)
+	}
+	next.cfg.Version = "v-deferred"
+	checks.start(next, nctx, 2, 3, 4, true)
+	if got := hostState(t, ctx, db); got != "upgrading" {
+		t.Fatalf("deferred boot recorded %q before serving, want upgrading", got)
+	}
+	if at, ok, err := corrosion.HostStateSince(ctx, db, "h"); err != nil || !ok || !at.Equal(since) {
+		t.Fatalf("deferred boot renewed upgrading: at=%s was=%s ok=%v err=%v", at, since, ok, err)
 	}
 	if got, err := os.ReadFile(hostboot.AwaitingPath(d.cfg.DataDir)); err != nil || string(got) != string(note) {
 		t.Fatalf("fallback lost the prior awaiting note before Ping: %q (%v)", got, err)
 	}
-	// The documented policy resolves a non-upgrading host even before Ping.
-	if !awaitLifecycle(time.Second, func() bool {
-		r, ok := unconfirmedRow(t, ctx, db)
-		return ok && r.Lifecycle == corrosion.ConditionResolved && unconfirmedGauge(t) == 0
-	}) {
-		t.Error("prior persisted condition did not resolve for the active fallback before Ping")
+	if h, err := corrosion.GetHost(ctx, db, "h"); err != nil || h == nil || h.Version != beforeReport.Version || h.CPUTotal != beforeReport.CPUTotal || h.MemTotal != beforeReport.MemTotal || h.DiskTotal != beforeReport.DiskTotal || h.UpdatedAt != beforeReport.UpdatedAt {
+		t.Fatalf("deferred boot wrote report fields before Ping: %+v err=%v", h, err)
 	}
+	// An unchanged cause must retain the same open row and gauge before Ping.
+	time.Sleep(20 * time.Millisecond)
+	if row, ok := unconfirmedRow(t, ctx, db); !ok || row.Lifecycle != corrosion.ConditionConfirmed || row.FirstSeen != prior.FirstSeen || row.Evidence != prior.Evidence || unconfirmedGauge(t) != 1 {
+		t.Fatalf("deferred boot changed its open diagnostic before serving: %+v ok=%v gauge=%v", row, ok, unconfirmedGauge(t))
+	}
+	// Refuse only actual condition resolution after activation. The report
+	// must commit, and cleanup must retry without rewriting that activation.
+	if _, err := db.DB().ExecContext(ctx, `CREATE TRIGGER refuse_deferred_resolution BEFORE INSERT ON health_conditions
+		WHEN NEW.evaluator = 'host_boot' AND NEW.code = 'upgrading_unconfirmed' AND NEW.lifecycle = 'resolved'
+		BEGIN SELECT RAISE(ABORT, 'deferred resolution retry'); END`); err != nil {
+		t.Fatal(err)
+	}
+	failed := make(chan struct{}, 1)
+	oldLogger := slog.Default()
+	oldOutput, oldFlags := log.Writer(), log.Flags()
+	slog.SetDefault(slog.New(&resolutionErrorHandler{Handler: slog.NewTextHandler(os.Stderr, nil), failed: failed, marker: "deferred resolution retry"}))
+	t.Cleanup(func() { slog.SetDefault(oldLogger); log.SetOutput(oldOutput); log.SetFlags(oldFlags) })
 	close(serving)
+	select {
+	case <-failed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("deferred boot never attempted real condition resolution")
+	}
+	h, err := corrosion.GetHost(ctx, db, "h")
+	if err != nil || h == nil || h.State != "active" || h.Version != "v-deferred" || h.CPUTotal != 2 || h.MemTotal != 3 || h.DiskTotal != 4 {
+		t.Fatalf("serving deferred report: %+v err=%v", h, err)
+	}
+	activeSince, _, err := corrosion.HostStateSince(ctx, db, "h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row, ok := unconfirmedRow(t, ctx, db); !ok || row.Lifecycle != corrosion.ConditionConfirmed || unconfirmedGauge(t) != 1 {
+		t.Fatalf("failed resolution lost open row/gauge: %+v %v", row, ok)
+	}
+	if _, err := db.DB().ExecContext(ctx, "DROP TRIGGER refuse_deferred_resolution"); err != nil {
+		t.Fatal(err)
+	}
 	checks.wait(t)
+	if at, ok, err := corrosion.HostStateSince(ctx, db, "h"); err != nil || !ok || !at.Equal(activeSince) {
+		t.Fatalf("resolution retry renewed activation: at=%s was=%s ok=%v err=%v", at, activeSince, ok, err)
+	}
 	if _, err := os.Stat(hostboot.AwaitingPath(d.cfg.DataDir)); !os.IsNotExist(err) {
 		t.Fatalf("successful own Ping left the awaiting note: %v", err)
 	}

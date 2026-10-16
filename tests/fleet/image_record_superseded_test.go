@@ -160,6 +160,15 @@ func TestFleet_ImagePull_RacingACopyLeavesThePullsChecksum(t *testing.T) {
 	if len(rows) != 1 || rows[0].String("status") != "ready" {
 		t.Fatalf("node-0's record of the pull: %v, want ready", rows)
 	}
+	// Before the release token latches, node-0's record of its copy is the
+	// plain INSERT OR REPLACE: here it resets progress_pct, while a peer
+	// applies it column-preserving and keeps the pull's 100. Both rows carry
+	// one updated_at, and only anti-entropy's tie resolution settles them. It
+	// does so only once the record has reached the peer: a pass run before
+	// then finds node-0's row newer and leaves the split to the next pass.
+	eventually(t, convergeTimeout, "node-0's record of its copy to reach every host", func() bool {
+		return imageHostRowEverywhere(ctx, c, "imgp", n0)
+	})
 	antiEntropyEverywhere(t, c)
 	c.WaitConverged(t, convergeTimeout)
 	antiEntropyEverywhere(t, c)
@@ -257,6 +266,23 @@ func TestFleet_ImageAutoPull_OvertakenByARefreshPullIsNotReady(t *testing.T) {
 	if img, _ := corrosion.GetImage(ctx, n1.DB, "imgo"); img == nil || img.Checksum != newChecksum {
 		t.Fatalf("node-1's catalog row of imgo: %+v, want the pull's", img)
 	}
+}
+
+// imageHostRowEverywhere reports whether every node holds holder's image_hosts
+// row of image at the updated_at holder's own replica has.
+func imageHostRowEverywhere(ctx context.Context, c *Cluster, image string, holder *Node) bool {
+	const q = `SELECT updated_at FROM image_hosts WHERE image_name = ? AND host_name = ?`
+	own, err := holder.DB.Query(ctx, q, image, holder.Name)
+	if err != nil || len(own) != 1 {
+		return false
+	}
+	for _, n := range c.Nodes {
+		rows, err := n.DB.Query(ctx, q, image, holder.Name)
+		if err != nil || len(rows) != 1 || rows[0].String("updated_at") != own[0].String("updated_at") {
+			return false
+		}
+	}
+	return true
 }
 
 func fileExists(p string) bool {

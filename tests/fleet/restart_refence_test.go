@@ -23,7 +23,11 @@
 package fleet
 
 import (
+	"bytes"
 	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -49,6 +53,7 @@ type restartFleet struct {
 	fencedAt []time.Time
 	// fenceAs, when set, is what the fencer reports for d.
 	fenceAs *fence.Result
+	workers []<-chan struct{}
 }
 
 func newRestartFleet(t *testing.T, seed int64, tune ...func(*failover.Coordinator)) *restartFleet {
@@ -57,6 +62,7 @@ func newRestartFleet(t *testing.T, seed int64, tune ...func(*failover.Coordinato
 	t.Cleanup(cancel)
 	c := New(t, Options{Nodes: 4, IndependentReplicas: true, FaultSeed: seed})
 	f := &restartFleet{c: c, a: c.Nodes[0], d: c.Nodes[3], observers: []*Node{c.Nodes[0], c.Nodes[1], c.Nodes[2]}}
+	f.ownWorkers(t, cancel) // after New registers Stop, including partial setup
 	c.WaitConverged(t, convergeTimeout)
 	// host_membership_split_v1 is mandatory and latched on any current
 	// cluster, lab 1 included: every node reads host_membership, which is
@@ -75,7 +81,7 @@ func newRestartFleet(t *testing.T, seed int64, tune ...func(*failover.Coordinato
 			}
 			return true, "", nil
 		})
-		go ch.Start(ctx)
+		f.startWorker(func() { ch.Start(ctx) })
 	}
 	coord := failover.NewCoordinator(f.a.Name, f.a.DB)
 	for _, fn := range tune {
@@ -93,7 +99,7 @@ func newRestartFleet(t *testing.T, seed int64, tune ...func(*failover.Coordinato
 		}
 		return fence.Result{Method: "fleet-test", Success: true}
 	})
-	go func() {
+	f.startWorker(func() {
 		tk := time.NewTicker(250 * time.Millisecond)
 		defer tk.Stop()
 		for {
@@ -104,8 +110,33 @@ func newRestartFleet(t *testing.T, seed int64, tune ...func(*failover.Coordinato
 				coord.RunOnce(ctx)
 			}
 		}
-	}()
+	})
 	return f
+}
+
+// Register after Cluster.New's Stop cleanup, before starting any worker. LIFO
+// cleanup then cancels and joins these owners before DB/transport teardown.
+func (f *restartFleet) ownWorkers(t *testing.T, cancel context.CancelFunc) {
+	t.Helper()
+	t.Cleanup(func() {
+		cancel()
+		deadline := time.NewTimer(10 * time.Second)
+		defer deadline.Stop()
+		for _, done := range f.workers {
+			select {
+			case <-done:
+			case <-deadline.C:
+				t.Error("restartFleet worker failed to join before dependency teardown")
+				return
+			}
+		}
+	})
+}
+
+func (f *restartFleet) startWorker(run func()) {
+	done := make(chan struct{})
+	f.workers = append(f.workers, done)
+	go func() { defer close(done); run() }()
 }
 
 func (f *restartFleet) fences() []time.Time {
@@ -205,4 +236,125 @@ func TestFleet_RestartedHostThatNeverServesIsFenced(t *testing.T) {
 		t.Fatalf("d was fenced %s after its boot write, inside the %s its observers need to count it down afresh",
 			first.Sub(booted).Round(time.Millisecond), grace)
 	}
+}
+
+// Exercise the same cleanup registration with zero, partially started and
+// complete real checker sets. Early returns model assertion/setup exits;
+// actual checker completion must precede Cluster.Stop's DB-close callback.
+func TestRestartFleetWorkersStopBeforeDependencies(t *testing.T) {
+	if marker := os.Getenv("LITEVIRT_RESTART_SETUP_FAILURE"); marker != "" {
+		restartSetupFailureChild(t, marker)
+		return
+	}
+	t.Run("actual-fatal-setup-exit", func(t *testing.T) {
+		marker := filepath.Join(t.TempDir(), "closed-dependencies")
+		exe, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, exe, "-test.run=^TestRestartFleetWorkersStopBeforeDependencies$", "-test.v")
+		cmd.Env = append(os.Environ(), "LITEVIRT_RESTART_SETUP_FAILURE="+marker)
+		output, err := cmd.CombinedOutput()
+		t.Logf("expected setup-failure child output:\n%s", output)
+		failure, ok := err.(*exec.ExitError)
+		if !ok || failure.ExitCode() != 1 || !bytes.Contains(output, []byte("intentional partial setup failure")) || bytes.Contains(output, []byte("before actual worker exit")) || bytes.Contains(output, []byte("failed to join")) {
+			t.Fatalf("setup-failure child: err=%v output=%s", err, output)
+		}
+		closed, err := os.ReadFile(marker)
+		if err != nil || string(closed) != "node-0\nnode-1\nnode-2\nnode-3\n" {
+			t.Fatalf("setup-failure dependency teardown: %q err=%v", closed, err)
+		}
+	})
+	t.Run("complete-with-coordinator", func(t *testing.T) {
+		f := newRestartFleet(t, 3413)
+		if len(f.workers) != 4 {
+			t.Fatalf("actual worker count = %d, want 3 checkers and coordinator", len(f.workers))
+		}
+		f.c.beforeDependencyClose = func(n *Node) {
+			for _, done := range f.workers {
+				select {
+				case <-done:
+				default:
+					t.Errorf("%s dependency closed before actual worker exit", n.Name)
+				}
+			}
+		}
+	})
+	for _, count := range []int{0, 1, 3} {
+		t.Run(map[int]string{0: "before-workers", 1: "partial-setup", 3: "complete"}[count], func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel) // covers failure inside New, before any workers exist
+			c := New(t, Options{Nodes: 4, IndependentReplicas: true, FaultSeed: 3412})
+			f := &restartFleet{c: c}
+			f.ownWorkers(t, cancel)
+			c.beforeDependencyClose = func(n *Node) {
+				for _, done := range f.workers {
+					select {
+					case <-done:
+					default:
+						t.Errorf("%s dependency closed before actual checker exit", n.Name)
+					}
+				}
+			}
+			started := make(chan struct{}, count)
+			for _, n := range c.Nodes[:count] {
+				ch := health.NewChecker(n.Name, n.PKIDir, n.DB)
+				ch.SetPeerReadiness(func(context.Context, string, string) (bool, string, error) { return true, "", nil })
+				f.startWorker(func() { started <- struct{}{}; ch.Start(ctx) })
+			}
+			for range count {
+				<-started
+			}
+			// Return while workers still own the real open databases. t.Cleanup
+			// must handle both full and partial setup, without a success sleep.
+		})
+	}
+}
+
+// This child really fails setup via testing.T.Fatal after its actual checker
+// has probed. The parent requires its expected failure and all four dependency
+// callbacks after a successful worker join, rather than accepting a timeout.
+func restartSetupFailureChild(t *testing.T, marker string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	c := New(t, Options{Nodes: 4, IndependentReplicas: true, FaultSeed: 3414})
+	f := &restartFleet{c: c}
+	f.ownWorkers(t, cancel)
+	c.beforeDependencyClose = func(n *Node) {
+		for _, done := range f.workers {
+			select {
+			case <-done:
+			default:
+				t.Errorf("%s dependency closed before actual worker exit", n.Name)
+				return
+			}
+		}
+		file, err := os.OpenFile(marker, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_, err = file.WriteString(n.Name + "\n")
+		closeErr := file.Close()
+		if err != nil || closeErr != nil {
+			t.Errorf("recording teardown: %v %v", err, closeErr)
+		}
+	}
+	ch := health.NewChecker(c.Nodes[0].Name, c.Nodes[0].PKIDir, c.Nodes[0].DB)
+	probed := make(chan struct{})
+	var once sync.Once
+	ch.SetPeerReadiness(func(context.Context, string, string) (bool, string, error) {
+		once.Do(func() { close(probed) })
+		return true, "", nil
+	})
+	f.startWorker(func() { ch.Start(ctx) })
+	select {
+	case <-probed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("actual checker never probed during partial setup")
+	}
+	t.Fatal("intentional partial setup failure")
 }

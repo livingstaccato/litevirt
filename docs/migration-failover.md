@@ -1076,9 +1076,9 @@ the marker and records the host `upgrading` again, and the daemon records it
 The coordinator skips an `upgrading` host for 2 minutes, counted from the
 state write itself and not from the host's version or resource reports, and
 fences it after that. A daemon that never serves is therefore fenced 2 minutes
-after its boot write. Its boot can come up to 2 minutes after the SIGTERM and
-still keep the host `upgrading`, so the longest such a host is held unfenced
-is about 4 minutes from the SIGTERM. A daemon that serves late, past
+after its boot write, which re-arms that window once: a host held unfenced
+by a SIGTERM is fenced 2 minutes after its next boot write if it has not
+served by then. A daemon that serves late, past
 `upgrade_health_deadline_sec`, logs an error at the deadline and keeps
 checking, and is recorded `active` once it answers. A write that records it
 `active` and fails is retried until it lands. A host still `upgrading` 2
@@ -1087,30 +1087,69 @@ minutes on while its daemon runs raises `upgrading_unconfirmed`
 
 A boot with no marker (a crash, a kill, or a stop whose `upgrading` write
 failed, as every write of a WAL-quarantined daemon does) does the same for a
-host recorded `active`, or recorded `upgrading` less than 2 minutes ago: it
-records the host `upgrading` and turns it `active` once it answers its own
-Ping. Such a boot leaves a `boot-awaiting-serving` file in its `data_dir`
-until a daemon serves. Each of these boots `active`, as before:
+host recorded `active` or `upgrading`: it records the host `upgrading` and
+turns it `active` once it answers its own Ping. Such a boot leaves a
+`boot-awaiting-serving` file in its `data_dir` until a daemon serves.
 
-- a boot without the marker that finds `boot-awaiting-serving`: the daemon
-  before it never served, so a daemon that crash-loops before serving is
-  `upgrading` once and is then fenced on its failure count. A post-upgrade
-  boot leaves the file too;
-- a boot without the marker that follows 3 others within 10 minutes, counted
-  in `boot-unclean-history` in its `data_dir`: a daemon that serves and crashes
-  again and again is fenced on its failure count, as before;
-- a host that was not `active` when it was stopped. A fenced, offline or
-  maintenance host keeps that state through the SIGTERM, and a draining one is
-  recorded `upgrading` for the restart, as before;
-- a stop, or an `upgrading` state without the marker, 2 minutes old or more.
-  A WAL-quarantined daemon writes nothing, so after a quarantine that lasted
-  longer than that, the next boot records the host `active` and can be
-  fenced before it serves;
-- a host recorded as something other than `upgrading` by the time it boots
-  (without the marker: other than `active` or `upgrading`).
+No boot of a host recorded `active` or `upgrading` records it `active` before
+its daemon serves. A boot's `upgrading` write is made only while the host is
+still recorded as the boot read it, checked in the write's own transaction,
+so a fence, drain or offline recorded in between is kept; the boot's version
+and resources are then written once the daemon serves, leaving that state.
 
-Recording the host `active` once it serves changes only an `upgrading` host,
-and never its isolation.
+- A host recorded `upgrading` for 2 minutes or more (with or without the
+  marker), which the coordinator would treat as stuck and fence on its
+  failure count before it serves, gets a fresh `upgrading` write, once per
+  boot. A fence the coordinator records after that write is kept; one it
+  recorded before it, that this node had not received, is judged afresh from
+  the write, as below.
+- A boot without the marker that finds `boot-awaiting-serving` (the daemon
+  before it never served; a post-upgrade boot leaves the file too) of a host
+  recorded `upgrading` less than 2 minutes ago makes no write. The host keeps
+  its recorded state, so a daemon that crash-loops is `upgrading` once and is
+  fenced 2 minutes after that write.
+- A boot without the marker that follows 3 others within 10 minutes, counted
+  in `boot-unclean-history` in its `data_dir`, makes no write either for a
+  host recorded `upgrading`, or `active` when the daemon before it served: a
+  flapping daemon is judged on its failure count. Recorded `active` after a
+  daemon that never served (its `upgrading` write did not land, as with a
+  WAL-quarantined daemon), it records the host `upgrading` until it serves.
+- After a boot that made no write, the daemon records `active` with its
+  version and resources once it serves, only while the host is still
+  recorded as the boot found it. A host undrained, drained or put in
+  maintenance meanwhile keeps that state and still gets the version and
+  resources; a fenced or offline one gets nothing.
+- A daemon that cannot build its own local gRPC client keeps retrying and
+  does not record the host `active` until it can confirm it serves; past 2
+  minutes `upgrading` it raises `upgrading_unconfirmed`.
+- A boot without the marker that cannot write `boot-unclean-history` or
+  `boot-awaiting-serving` (a full or read-only disk) could not bound a crash
+  loop, and one that cannot read the host's record (read twice) could not
+  judge it: each makes no write. Once the daemon serves it records a host
+  recorded `active` or `upgrading` `active`, with its version and resources,
+  only while it is still recorded so; a fenced or offline host keeps that
+  state and gets nothing, and a draining or maintenance one keeps its state
+  and gets its version and resources. A graceful boot that cannot read the
+  record still leaves `boot-awaiting-serving`; if that cannot be written
+  either, a crash before it serves leaves the next boot nothing to show it
+  never served, and that boot may write one fresh `upgrading` (bounded by the
+  3-in-10-minutes count).
+- A report that fails once the daemon serves is retried until it lands.
+
+Each of these boots `active`, as before:
+
+- a host recorded anything other than `active` or `upgrading`, by a boot that
+  can record itself. A fenced, offline or maintenance host keeps that state
+  through the SIGTERM, and a draining one is recorded `upgrading` for the
+  restart, as before;
+- a boot with no `data_dir`;
+- the first start of a host with no record yet, or one re-admitted under its
+  name: registering it inserts it `active` before its daemon serves. Its
+  boot write then follows the rules above.
+
+Recording the host `active` once it serves changes only an `upgrading` host
+(after a boot that made no write, only a host still recorded as that boot
+found it), and never its isolation.
 
 A host the coordinator has already fenced that then records itself
 `upgrading` (it rebooted, and its boot write was made from a replica that still

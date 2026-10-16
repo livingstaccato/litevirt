@@ -23,17 +23,49 @@ import (
 )
 
 // uncleanBoot is the boot write of d's daemon started again after a crash:
-// what hostboot decides for dataDir, written at once, while d does not
-// answer. It returns the decision and the write's time.
+// what hostboot decides for dataDir, written at once (unless the decision
+// defers it until d serves), while d does not answer. It returns the decision
+// and the boot's time.
 func (f *restartFleet) uncleanBoot(t *testing.T, dataDir string) (hostboot.Boot, time.Time) {
 	t.Helper()
+	return f.uncleanBootAt(t, dataDir, time.Now())
+}
+
+// uncleanBootAt is uncleanBoot with hostboot judging the boot at now. The
+// write, guarded as the daemon's is when the decision read a state, is made
+// at once.
+func (f *restartFleet) uncleanBootAt(t *testing.T, dataDir string, now time.Time) (hostboot.Boot, time.Time) {
+	t.Helper()
 	ctx := context.Background()
-	b := hostboot.BootState(ctx, f.d.DB, f.d.Name, dataDir, false, time.Now())
+	b := hostboot.BootState(ctx, f.d.DB, f.d.Name, dataDir, false, now)
 	booted := time.Now()
-	if err := corrosion.UpdateHostStartup(ctx, f.d.DB, f.d.Name, b.State, "", 0, 0, 0, false); err != nil {
-		t.Fatalf("boot write: %v", err)
+	switch {
+	case b.Deferred:
+	case b.From != "":
+		if applied, err := corrosion.UpdateHostStartupFrom(ctx, f.d.DB, f.d.Name, b.From, b.State, "", 0, 0, 0, false); err != nil || !applied {
+			t.Fatalf("boot write from %q: applied=%v err=%v", b.From, applied, err)
+		}
+	default:
+		if err := corrosion.UpdateHostStartup(ctx, f.d.DB, f.d.Name, b.State, "", 0, 0, 0, false); err != nil {
+			t.Fatalf("boot write: %v", err)
+		}
 	}
 	return b, booted
+}
+
+// Force observers' first healthy transition to precede confirmation. The
+// caller anchors time before enabling answers; unchanged healthy rows need
+// not be rewritten after confirmation.
+func (f *restartFleet) waitForAnswers(t *testing.T) {
+	t.Helper()
+	eventually(t, time.Minute, "every observer to hear the serving daemon before confirmation", func() bool {
+		for _, n := range f.observers {
+			if got, _, ok := observedFailures(n, f.d.Name); !ok || got != 0 {
+				return false
+			}
+		}
+		return true
+	})
 }
 
 // TestFleet_UncleanRestartIsUpgradingUntilItServes: d's daemon crashes while d
@@ -131,30 +163,194 @@ func TestFleet_UncleanRestartThatNeverServesIsFencedAfterTheTimeout(t *testing.T
 
 // TestFleet_UncleanCrashLoopIsUpgradingOnce: d crashes, boots 'upgrading',
 // dies before serving and is started again. That boot follows one that never
-// served and records d 'active', so the coordinator fences d on its failure
-// count, long before the upgrading timeout the first boot started: a daemon
-// that crash-loops cannot keep re-arming it.
+// served and writes nothing: d stays 'upgrading' from the first boot write,
+// is not recorded 'active' while it does not answer, and is fenced once the
+// coordinator's timeout has passed since that first write. A daemon that
+// crash-loops cannot keep re-arming it.
 //
-// Mutation: drop the AwaitingPath check from hostboot's unclean boot — the
-// second boot is 'upgrading' again and d is not fenced inside the window.
+// Mutations: drop the AwaitingPath check from hostboot's unclean boot — the
+// second boot writes 'upgrading' again and re-arms the timeout; return
+// 'active' for it (the rule before) — the coordinator reads d 'active'.
 func TestFleet_UncleanCrashLoopIsUpgradingOnce(t *testing.T) {
-	f := newRestartFleet(t, 3408)
+	const timeout = 40 * time.Second
+	f := newRestartFleet(t, 3408, func(c *failover.Coordinator) { c.UpgradingTimeout = timeout })
+	ctx := context.Background()
 	dir := t.TempDir()
 	f.down.Store(true)
-	if b, _ := f.uncleanBoot(t, dir); b.State != "upgrading" {
-		t.Fatalf("first boot after a crash decided %+v, want 'upgrading'", b)
+	b, first := f.uncleanBoot(t, dir)
+	if b.State != "upgrading" || b.Deferred {
+		t.Fatalf("first boot after a crash decided %+v, want 'upgrading' written", b)
 	}
-	time.Sleep(5 * time.Second) // it dies before serving; systemd starts it again
-	b, booted := f.uncleanBoot(t, dir)
-	if b.State != "active" || b.AwaitServing {
-		t.Errorf("boot after a daemon that never served decided %+v, want 'active'", b)
+	var since time.Time
+	eventually(t, convergeTimeout, "the first boot write to reach the coordinator", func() bool {
+		at, ok, err := corrosion.HostStateSince(ctx, f.a.DB, f.d.Name)
+		h, herr := corrosion.GetHost(ctx, f.a.DB, f.d.Name)
+		since = at
+		return err == nil && ok && herr == nil && h != nil && h.State == "upgrading"
+	})
+	time.Sleep(20 * time.Second) // it dies before serving; systemd starts it again
+	b, second := f.uncleanBoot(t, dir)
+	if b.State != "upgrading" || !b.AwaitServing || !b.Deferred {
+		t.Errorf("boot after a daemon that never served decided %+v, want the recorded 'upgrading' kept, no boot write", b)
 	}
-	// Well inside the 2-minute upgrading timeout the first boot started.
-	eventually(t, 45*time.Second, "the coordinator to fence the crash-looping d on its failure count", func() bool {
+	time.Sleep(2 * time.Second) // anything it wrote has replicated by now
+	h, err := corrosion.GetHost(ctx, f.a.DB, f.d.Name)
+	at, ok, serr := corrosion.HostStateSince(ctx, f.a.DB, f.d.Name)
+	if err != nil || h == nil || h.State != "upgrading" || serr != nil || !ok || !at.Equal(since) {
+		t.Fatalf("after the second boot the coordinator reads d %+v (err %v), 'upgrading' since %s (ok=%v err=%v); want 'upgrading' since the first write, %s",
+			h, err, at, ok, serr, since)
+	}
+	// The re-arm itself is pinned above (the coordinator's 'upgrading' since
+	// is still the first write's). What follows only needs the fence to
+	// come after the first write's timeout and before the second boot's
+	// would end — 20 s of slack under -race on a loaded host.
+	eventually(t, timeout+convergeTimeout, "the coordinator to fence d, 'upgrading' past the first boot's timeout", func() bool {
 		return len(f.fences()) > 0
 	})
-	if first := f.fences()[0]; first.Sub(booted) > 45*time.Second {
-		t.Fatalf("d was fenced %s after its second boot", first.Sub(booted).Round(time.Millisecond))
+	fenced := f.fences()[0]
+	if fenced.Sub(first) < timeout {
+		t.Fatalf("d was fenced %s after its first boot write, inside the %s it may be 'upgrading'",
+			fenced.Sub(first).Round(time.Millisecond), timeout)
+	}
+	if fenced.Sub(second) >= timeout {
+		t.Fatalf("d was fenced %s after its second boot: that boot re-armed the timeout", fenced.Sub(second).Round(time.Millisecond))
+	}
+}
+
+// TestFleet_UncleanBootOfAStaleUpgradingHostIsNotFencedBeforeItServes: d is
+// stuck 'upgrading' past the coordinator's timeout while it answers (its
+// serving check never recorded it active, so it raised
+// upgrading_unconfirmed), and peers that reach it do not fence it. Its daemon
+// then crashes and starts again: the boot has serving evidence, and the host
+// has been 'upgrading' for longer than hostboot's window.
+//
+// That boot used to record d 'active' 22 s before it serves, and its peers
+// fenced it on the failure count they kept through the crash; making no write
+// is worse, since the coordinator fences a host stuck 'upgrading' as soon as
+// its failures reach quorum. It writes a fresh 'upgrading' once, guarded on
+// the 'upgrading' it read, and d is not fenced before or after it serves.
+//
+// hostboot's window is the coordinator's 2 minutes in production; here the
+// coordinator's is 30 s, and hostboot judges the boot 2 minutes on.
+//
+// Mutations: return 'active' for the stale 'upgrading' (the rule before) — d
+// is fenced on its failure count inside the gap; make no write (Deferred) —
+// d is fenced as a stuck host inside the gap.
+func TestFleet_UncleanBootOfAStaleUpgradingHostIsNotFencedBeforeItServes(t *testing.T) {
+	const timeout = 30 * time.Second
+	f := newRestartFleet(t, 3411, func(c *failover.Coordinator) { c.UpgradingTimeout = timeout })
+	ctx := context.Background()
+	if err := corrosion.UpdateHostState(ctx, f.d.DB, f.d.Name, "upgrading"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, convergeTimeout, "d's 'upgrading' to reach the coordinator", func() bool {
+		h, err := corrosion.GetHost(ctx, f.a.DB, f.d.Name)
+		return err == nil && h != nil && h.State == "upgrading"
+	})
+	time.Sleep(timeout + 2*time.Second) // stuck past the coordinator's timeout, answering
+	if fs := f.fences(); len(fs) != 0 {
+		t.Fatalf("fixture: d was fenced while it answered: %d fences", len(fs))
+	}
+
+	f.down.Store(true) // the crash; it starts again at once
+	b, booted := f.uncleanBootAt(t, t.TempDir(), time.Now().Add(hostboot.UpgradingTimeout))
+	if b.State != "upgrading" || !b.AwaitServing || b.Deferred || b.From != "upgrading" {
+		t.Errorf("unclean boot of a host stuck 'upgrading' decided %+v, want a fresh 'upgrading' written from upgrading", b)
+	}
+	for deadline := booted.Add(22 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		if fs := f.fences(); len(fs) != 0 {
+			t.Fatalf("d was fenced %s after its boot, before it served: %+v", fs[0].Sub(booted).Round(time.Millisecond), b)
+		}
+	}
+	past := 5 + 2
+	for _, n := range f.observers {
+		if got, _, ok := observedFailures(n, f.d.Name); !ok || got < past {
+			t.Fatalf("fixture: %s counted d failing %d times (ok=%v), want past the fence threshold", n.Name, got, ok)
+		}
+	}
+	served := time.Now()
+	f.down.Store(false)
+	f.waitForAnswers(t)
+	if flipped, state, err := hostboot.ConfirmServing(ctx, f.d.DB, f.d.Name); err != nil || !flipped {
+		t.Fatalf("confirm serving: flipped=%v state=%q err=%v", flipped, state, err)
+	}
+	eventually(t, time.Minute, "every observer to see d answer, and d active", func() bool {
+		for _, n := range f.observers {
+			if got, at, ok := observedFailures(n, f.d.Name); !ok || got != 0 || !at.After(served) {
+				return false
+			}
+		}
+		h, err := corrosion.GetHost(ctx, f.a.DB, f.d.Name)
+		return err == nil && h != nil && h.State == "active"
+	})
+	time.Sleep(time.Second)
+	if fs := f.fences(); len(fs) != 0 {
+		t.Fatalf("d was fenced %s after its boot (%d fences)", fs[0].Sub(booted).Round(time.Millisecond), len(fs))
+	}
+}
+
+// TestFleet_BootAfterAQuarantinedStopIsNotFencedBeforeItServes is lab 1's
+// ReleaseTokenRollbackRule cleanup (2026-10-16, build cab27191, 3 of 3 runs):
+// d boots after a crash, records itself 'upgrading' and is stopped before it
+// serves; its next boot is WAL-quarantined, so neither that boot nor its
+// SIGTERM writes anything; then it is upgraded again and boots unquarantined.
+// That boot followed a daemon that never served and recorded node-5 'active'
+// 0.1 s in; it listened 23 s later, and node-2 SSH-fenced it after 16 s.
+//
+// Here the last boot keeps d 'upgrading', and d is not fenced through a 30 s
+// gap before it serves, nor after it serves and is recorded active with its
+// boot report.
+//
+// Mutation: return 'active' for a boot that follows a never-served one
+// (hostboot's rule before this change) — d is fenced inside the gap.
+func TestFleet_BootAfterAQuarantinedStopIsNotFencedBeforeItServes(t *testing.T) {
+	f := newRestartFleet(t, 3410)
+	ctx := context.Background()
+	dir := t.TempDir()
+	f.down.Store(true)
+	if b, _ := f.uncleanBoot(t, dir); b.State != "upgrading" || b.Deferred {
+		t.Fatalf("fixture: the crash boot decided %+v, want 'upgrading' written", b)
+	}
+	// The quarantined boot decides like any other and writes nothing; its
+	// SIGTERM writes nothing either.
+	_ = hostboot.BootState(ctx, f.d.DB, f.d.Name, dir, false, time.Now())
+	b, booted := f.uncleanBoot(t, dir)
+	if b.State != "upgrading" || !b.AwaitServing || !b.Deferred {
+		t.Errorf("the boot after a quarantined stop decided %+v, want the recorded 'upgrading' kept until it serves", b)
+	}
+	for deadline := booted.Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		if fs := f.fences(); len(fs) != 0 {
+			t.Fatalf("d was fenced %s after its boot, before it served: %+v", fs[0].Sub(booted).Round(time.Millisecond), b)
+		}
+	}
+	past := 5 + 2
+	for _, n := range f.observers {
+		if got, _, ok := observedFailures(n, f.d.Name); !ok || got < past {
+			t.Fatalf("fixture: %s counted d failing %d times (ok=%v), want past the fence threshold", n.Name, got, ok)
+		}
+	}
+	served := time.Now()
+	f.down.Store(false)
+	f.waitForAnswers(t)
+	hostboot.Served(dir)
+	if b.Deferred {
+		flipped, state, err := hostboot.ConfirmServingReport(ctx, f.d.DB, f.d.Name, b.State, hostboot.Report{Version: "v-up"})
+		if err != nil || !flipped {
+			t.Fatalf("confirm serving: flipped=%v state=%q err=%v", flipped, state, err)
+		}
+	}
+	eventually(t, time.Minute, "every observer to see d answer, and d active with its boot report", func() bool {
+		for _, n := range f.observers {
+			if got, at, ok := observedFailures(n, f.d.Name); !ok || got != 0 || !at.After(served) {
+				return false
+			}
+		}
+		h, err := corrosion.GetHost(ctx, f.a.DB, f.d.Name)
+		return err == nil && h != nil && h.State == "active" && h.Version == "v-up"
+	})
+	time.Sleep(time.Second)
+	if fs := f.fences(); len(fs) != 0 {
+		t.Fatalf("d was fenced %s after its boot (%d fences)", fs[0].Sub(booted).Round(time.Millisecond), len(fs))
 	}
 }
 

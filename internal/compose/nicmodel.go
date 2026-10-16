@@ -88,3 +88,50 @@ func (m *NICModels) Model(mac, network string, ordinal int, mergedModel string) 
 	}
 	return "virtio"
 }
+
+// RewriteSpecNICForAttach makes every spec NIC carrying mac describe the NIC
+// being attached under it with model. A NIC attach and detach write only the
+// NIC rows, so a spec entry with the MAC is a detached NIC's (the attach
+// refuses a MAC a live NIC holds): left as it was, its model and tuning
+// would be applied to the new NIC at every later define. Tuning the new model
+// cannot take is dropped — an MTU or a queue count other than 1 on a NIC that
+// is not virtio, which a define refuses. Reports whether spec changed.
+func RewriteSpecNICForAttach(spec *pb.VMSpec, mac, model string) bool {
+	if spec == nil || mac == "" {
+		return false
+	}
+	if model == "" {
+		model = "virtio"
+	}
+	changed := false
+	for _, a := range spec.Network {
+		if a == nil || a.Mac == "" || !strings.EqualFold(a.Mac, mac) {
+			continue
+		}
+		if a.Model != model {
+			a.Model = model
+			changed = true
+		}
+		if a.Mtu != 0 && ValidateNICMTU(model, a.Mtu) != nil {
+			a.Mtu = 0
+			changed = true
+		}
+		if a.Queues > 1 && model != "virtio" {
+			a.Queues = 0
+			changed = true
+		}
+	}
+	return changed
+}
+
+// SpecNICModelsByMAC is the model of each spec NIC that records a MAC, keyed
+// by the lower-cased MAC (corrosion.NICModelSources).
+func SpecNICModelsByMAC(spec *pb.VMSpec) map[string]string {
+	out := map[string]string{}
+	for _, a := range spec.GetNetwork() {
+		if a != nil && a.Mac != "" && a.Model != "" {
+			out[strings.ToLower(a.Mac)] = a.Model
+		}
+	}
+	return out
+}

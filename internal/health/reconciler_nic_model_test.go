@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -116,5 +117,37 @@ func TestDomainXMLFor_AReattachedMACTakesItsNewModel(t *testing.T) {
 				t.Fatalf("want model %s:\n%s", tc.want, x)
 			}
 		})
+	}
+}
+
+// A failover render of a NIC swapped under its MAC from a virtio NIC with an
+// MTU to an e1000 one: the attach rewrote the spec entry
+// (compose.RewriteSpecNICForAttach), so the domain is defined with e1000 and
+// no MTU instead of being refused as non-retryable.
+//
+// Mutation: drop the MTU rewrite in RewriteSpecNICForAttach — the render
+// fails ("an MTU needs the virtio model").
+func TestDomainXMLFor_ASwappedNICDefinesWithoutTheOldMTU(t *testing.T) {
+	const mac = "52:54:00:aa:bb:31"
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	r, fake, _ := sharedDiskReconciler(t, db)
+	fake.SetBridgeMTU("br0", 9000)
+	vm := corrosion.VMRecord{Name: "vm1", HostName: "node-a", Spec: "{}", State: "running", CPUActual: 1, MemActual: 512}
+	if err := corrosion.InsertVMWithHardware(ctx, db, vm,
+		[]corrosion.InterfaceRecord{{VMName: "vm1", NetworkName: "br0", Ordinal: 0, MAC: mac}}, nil,
+		[]corrosion.NICRecord{{VMName: "vm1", ID: corrosion.DeterministicNICID("vm1", mac),
+			NetworkName: "br0", Model: "e1000", MAC: mac, Ordinal: 0}}, nil, false); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	spec := &pb.VMSpec{Name: "vm1", Cpu: 1, MemoryMib: 512,
+		Network: []*pb.NetworkAttachment{{Name: "br0", Model: "virtio", Mac: mac, Mtu: 9000, Queues: 4}}}
+	compose.RewriteSpecNICForAttach(spec, mac, "e1000")
+	x, _, failure := r.domainXMLFor(ctx, vm, spec, nil)
+	if failure != "" {
+		t.Fatalf("domainXMLFor: %s", failure)
+	}
+	if !strings.Contains(x, `"e1000"`) || strings.Contains(x, "<mtu") {
+		t.Fatalf("want an e1000 NIC with no MTU:\n%s", x)
 	}
 }

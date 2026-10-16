@@ -83,3 +83,35 @@ func TestNICModels(t *testing.T) {
 		})
 	}
 }
+
+// An attach under a MAC a spec entry carries rewrites that entry to the new
+// NIC's model and drops the tuning the model cannot take; an entry for
+// another MAC, and tuning the model can take, are left alone.
+//
+// Mutations: skip the model rewrite — "virtio -> e1000" goes red; keep the
+// MTU — its mtu check goes red; keep the queues — its queues check goes red.
+func TestRewriteSpecNICForAttach(t *testing.T) {
+	const x, y = "52:54:00:00:00:01", "52:54:00:00:00:02"
+	spec := &pb.VMSpec{Network: []*pb.NetworkAttachment{
+		{Name: "lan", Model: "virtio", Mac: x, Mtu: 9000, Queues: 4},
+		{Name: "lan2", Model: "virtio", Mac: y, Mtu: 9000, Queues: 4},
+	}}
+	if !RewriteSpecNICForAttach(spec, "52:54:00:00:00:01", "e1000") {
+		t.Fatal("virtio -> e1000 reported no change")
+	}
+	if a := spec.Network[0]; a.Model != "e1000" || a.Mtu != 0 || a.Queues != 0 {
+		t.Errorf("virtio -> e1000: entry %+v, want e1000 with no mtu and no queues", a)
+	}
+	if b := spec.Network[1]; b.Model != "virtio" || b.Mtu != 9000 || b.Queues != 4 {
+		t.Errorf("another MAC's entry changed: %+v", b)
+	}
+
+	back := &pb.VMSpec{Network: []*pb.NetworkAttachment{{Name: "lan", Model: "e1000", Mac: x}}}
+	if !RewriteSpecNICForAttach(back, x, "virtio") || back.Network[0].Model != "virtio" {
+		t.Errorf("e1000 -> virtio: entry %+v", back.Network[0])
+	}
+	same := &pb.VMSpec{Network: []*pb.NetworkAttachment{{Name: "lan", Model: "virtio", Mac: x, Mtu: 9000, Queues: 4}}}
+	if RewriteSpecNICForAttach(same, x, "virtio") || same.Network[0].Mtu != 9000 || same.Network[0].Queues != 4 {
+		t.Errorf("virtio -> virtio changed the entry: %+v", same.Network[0])
+	}
+}

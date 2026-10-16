@@ -577,6 +577,18 @@ func (c *Coordinator) upgradingGrace(ctx context.Context, h *corrosion.HostRecor
 	return upd, !ok || c.now().Sub(upd) < c.upgradingTimeout()
 }
 
+// restartingWithinAllowance reports whether host is recorded 'upgrading' and
+// still within upgradingTimeout: the fence path's skip (run). A host that
+// cannot be read is not.
+func (c *Coordinator) restartingWithinAllowance(ctx context.Context, host string) bool {
+	h, err := corrosion.GetHost(ctx, c.db, host)
+	if err != nil || h == nil || h.State != "upgrading" {
+		return false
+	}
+	_, within := c.upgradingGrace(ctx, h)
+	return within
+}
+
 // upgradingTimeout is how long a host recorded 'upgrading' is skipped.
 func (c *Coordinator) upgradingTimeout() time.Duration {
 	if c.UpgradingTimeout > 0 {
@@ -956,9 +968,16 @@ func (c *Coordinator) run(ctx context.Context) {
 
 		target := cand.Target
 		// One-way partitions are made visible, never acted on differently
-		// (docs/design/partition-pause.md §7 F4).
-		if failing, healthy, oneWay := c.detectOneWay(ctx, target); oneWay || c.oneWay[target] {
-			c.noteOneWay(ctx, target, failing, healthy, oneWay)
+		// (docs/design/partition-pause.md §7 F4). Not for a host still
+		// restarting within its allowance, which the fence path below skips
+		// too: its daemon writes healthy rows about its peers before its own
+		// gRPC server serves, so it has exactly the one-way shape for the
+		// 15-25 s every reboot takes (lab 1, 2026-10-16). It is neither raised
+		// nor resolved for it until then.
+		if !c.restartingWithinAllowance(ctx, target) {
+			if failing, healthy, oneWay := c.detectOneWay(ctx, target); oneWay || c.oneWay[target] {
+				c.noteOneWay(ctx, target, failing, healthy, oneWay)
+			}
 		}
 		// HA disarmed, here or on a live voter: no fence, no resume of a
 		// recorded fence, no claim retry or pause wait. All of it is kept,

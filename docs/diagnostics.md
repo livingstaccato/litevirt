@@ -1855,7 +1855,8 @@ holder writes.
   mark a majority healthy. That is a one-way partition, in which the host may
   never pause. Nothing is recovered differently; find the asymmetric link.
   The lease holder resolves it once the quorum reaches the host again or the
-  host no longer counts a majority, whichever holder raised it.
+  host no longer counts a majority, whichever holder raised it. It is not
+  raised for a host restarting (`upgrading`) within its allowance.
 - `vm_settled` / `ct_settled` (`<name>@<host>`, warning): a host came back
   holding a copy of a workload that a decided recovery claim, whose
   certificate verifies, gave to another host at the same incarnation and an

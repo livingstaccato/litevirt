@@ -5940,10 +5940,8 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// up after the define; a patched one keeps the ones it had.
 	regenerated := domXML == ""
 	if domXML == "" {
-		var hostdevs []lv.HostdevConfig
-		for _, addr := range liveDevs {
-			hostdevs = append(hostdevs, lv.HostdevConfig{Address: addr})
-		}
+		priorXML, _ := s.virt.DumpXMLInactive(req.Name)
+		hostdevs := ownedHostdevConfigs(liveDevs, priorXML)
 		// Regenerate domain XML from the shared builder (MinMemoryMiB/MaxMemoryMiB +
 		// Hostdevs are populated here — the fields the old inline redefine builder
 		// dropped, collapsing the balloon ceiling and detaching passthrough).

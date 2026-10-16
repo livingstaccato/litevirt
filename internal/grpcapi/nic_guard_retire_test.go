@@ -307,3 +307,24 @@ func TestNICGuard_FutureSkewRefusalIsFailedPreconditionWithItsRemedy(t *testing.
 		t.Errorf("no event of the VM carries the refusal and its remedy: %+v", evs)
 	}
 }
+
+// TestAttachNIC_RowStampSkewIsFailedPrecondition (re-review r3): an attach
+// on a network that writes no guard record, behind a NIC row for that MAC
+// stamped far ahead, answers FailedPrecondition with the remedy.
+func TestAttachNIC_RowStampSkewIsFailedPrecondition(t *testing.T) {
+	s, _ := guardHotplugServer(t, "running")
+	ctx := adminCtx()
+	const vfMAC = "52:54:00:ab:10:0f"
+	if err := corrosion.UpsertNIC(ctx, s.db, corrosion.NICRecord{VMName: "vm1", ID: corrosion.DeterministicNICID("vm1", vfMAC),
+		NetworkName: "vf", MAC: vfMAC, Ordinal: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Execute(ctx, `UPDATE vm_nics SET deleted_at = ?, updated_at = ? WHERE vm_name = 'vm1' AND mac = ?`,
+		"2099-01-01T00:00:00Z", "2099-01-01T00:00:00.000000000Z", vfMAC); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{VmName: "vm1", Nic: &pb.NetworkAttachment{Name: "vf", Mac: vfMAC}})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "NTP") {
+		t.Errorf("attach behind a future-stamped row: %v, want FailedPrecondition naming the remedy", err)
+	}
+}

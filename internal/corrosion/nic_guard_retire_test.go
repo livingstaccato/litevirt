@@ -10,6 +10,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/compose"
 )
 
 const (
@@ -398,5 +399,55 @@ func TestUpsertNIC_FastClockReattachOfAnUnguardedNIC(t *testing.T) {
 	shipWALRange(t, b, c, before, lastWALSeq(t, b))
 	if nics, _ := MergedVMNICs(ctx, c, retireVM); len(nics) != 1 {
 		t.Errorf("A's earlier row tombstone shadows B's later row on C: %+v", nics)
+	}
+}
+
+// TestLiveNICSecurity_RetiredRecordOverALiveRow (re-review r4): the compose
+// plan's view of a NIC whose incarnation's record is retired while its row is
+// live is the fail-closed default guard, marked; another incarnation's
+// retired record, or one on a network that cannot enforce a guard, gives no
+// guard.
+func TestLiveNICSecurity_RetiredRecordOverALiveRow(t *testing.T) {
+	ctx := context.Background()
+	c := retireFixture(t)
+	if err := UpsertNetwork(ctx, c, NetworkRecord{Name: "vf", Type: "sriov", Config: `{"type":"sriov"}`}); err != nil {
+		t.Fatal(err)
+	}
+	const vfMAC, oldMAC = "52:54:00:00:00:0f", "52:54:00:00:00:10"
+	grant := capabilities.GrantForTest(t, capabilities.FeatureNICGuards)
+	for _, n := range []struct {
+		mac, network, uuid string
+	}{{vfMAC, "vf", retireUUID}, {oldMAC, "lan", "u-old"}} {
+		if err := UpsertNIC(ctx, c, NICRecord{VMName: retireVM, ID: DeterministicNICID(retireVM, n.mac), NetworkName: n.network, MAC: n.mac, Ordinal: 3}); err != nil {
+			t.Fatal(err)
+		}
+		if err := PutNICGuard(ctx, c, grant, NICGuardRecord{VMName: retireVM, MAC: n.mac, Mode: NICGuardOn, VMUUID: n.uuid}, "t"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, mac := range []string{goneMAC, vfMAC, oldMAC} {
+		if err := RetireNICGuard(ctx, c, retireVM, mac, "t"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	live, err := LiveNICSecurity(ctx, c, retireVM, retireUUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	by := map[string]*compose.LiveGuard{}
+	for _, n := range live {
+		by[n.MAC] = n.Guard
+	}
+	if g := by[goneMAC]; g == nil || g.Mode != NICGuardOn || !strings.Contains(g.FailClosed, "fail-closed default guard") {
+		t.Errorf("a retired record over a live row: %+v, want the marked default guard", g)
+	}
+	if g := by[vfMAC]; g != nil {
+		t.Errorf("on an SR-IOV network: %+v, want no guard", g)
+	}
+	if g := by[oldMAC]; g != nil {
+		t.Errorf("another incarnation's retired record: %+v, want no guard", g)
+	}
+	if g := by[liveMAC]; g == nil || g.FailClosed != "" {
+		t.Errorf("a live record: %+v, want its guard, unmarked", g)
 	}
 }

@@ -854,10 +854,7 @@ New VMs default to `host-model` (see `vm.default_cpu_mode` in
 [configuration](configuration.md)). VMs listed here were created before that
 default existed. Their stored spec is honored verbatim and deliberately not
 rewritten: changing the CPU a running guest sees is not something an upgrade
-should do behind the operator's back. A domain the reconciler renders from the
-stored spec — a failover start, an onboot or self-heal start — boots on the
-`vm.default_cpu_mode` default rather than `qemu64`; the spec is still not
-rewritten, so the VM stays listed here.
+should do behind the operator's back.
 
 To move one forward, with the VM **stopped**:
 

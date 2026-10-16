@@ -151,7 +151,6 @@ type Reconciler struct {
 	autoPullImage    func(ctx context.Context, imageName string) error // optional: auto-pull image from peer
 	backupInProgress func(vmName string) bool                          // optional: is a backup actively running locally?
 	firmware         lv.FirmwarePaths                                  // resolved OVMF paths (G1); set via SetFirmwarePaths
-	defaultCPUMode   string                                            // vm.default_cpu_mode; set via SetDefaultCPUMode
 
 	// recreateOverlay rebuilds a missing disk as an overlay of its image
 	// (SetRecreateOverlay); nil builds it in a store of its own, unheld.
@@ -406,11 +405,6 @@ func (r *Reconciler) noteGateRefused(action, reason string) {
 // SetFirmwarePaths injects the host's resolved OVMF firmware paths (G1) so the
 // reconciler renders the same firmware as CreateVM when it rebuilds a domain.
 func (r *Reconciler) SetFirmwarePaths(fp lv.FirmwarePaths) { r.firmware = fp }
-
-// SetDefaultCPUMode sets `vm.default_cpu_mode`, the cpu_mode a create on this
-// node stamps onto a spec that names none. A domain this reconciler renders
-// for a spec with no cpu_mode gets it too. Empty means lv.DefaultCPUMode.
-func (r *Reconciler) SetDefaultCPUMode(mode string) { r.defaultCPUMode = mode }
 
 // SetSparePCIeRootPorts sets `pci.spare_pcie_root_ports` — see
 // daemon.PCIConfig.SparePCIeRootPorts.
@@ -2436,7 +2430,10 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 	// Build the libvirt domain config with the builder CreateVM and a redefine
 	// use, so the VM boots on this host with the hardware it was created with:
 	// its CPU mode and model, vCPU ceiling, balloon, consoles, disk and NIC
-	// tuning, resources. The vCPU and memory are the VM's current ones.
+	// tuning, resources. The vCPU and memory are the VM's current ones. A spec
+	// with no cpu_mode (stored before the create-time default) renders as it
+	// does on every other path, with no <cpu>: a boot here must not change the
+	// CPU the guest sees (lv doctor cpu-mode, lv update --cpu-mode).
 	vmCfg := compose.DomainConfig(spec, diskConfigs, netConfigs, nil)
 	vmCfg.Name = vm.Name
 	vmCfg.CPU = vm.CPUActual
@@ -2446,15 +2443,6 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 	}
 	if vmCfg.Firmware == "" {
 		vmCfg.Firmware = "uefi"
-	}
-	// A spec stored before the create-time CPU default existed names no CPU
-	// mode; it gets the default a create on this node stamps today, never
-	// QEMU's qemu64 (which a guest built for x86-64-v2 cannot boot on).
-	if vmCfg.CPUMode == "" && vmCfg.CPUModel == "" {
-		vmCfg.CPUMode = r.defaultCPUMode
-		if vmCfg.CPUMode == "" {
-			vmCfg.CPUMode = lv.DefaultCPUMode
-		}
 	}
 	// Memory hot-add: the same NUMA cell and virtio-mem region the VM was
 	// created with, plugged to its desired memory, so a set-memory after the

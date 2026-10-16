@@ -28,7 +28,8 @@ import (
 //     (RendersTheSpecsCPU, MatchesTheCreateBuilder);
 //   - the vCPU ceiling, balloon ceiling and VNC console cleared after the
 //     builder (MatchesTheCreateBuilder);
-//   - no default for a spec with no cpu_mode (NoCPUModeGetsTheCreateDefault);
+//   - a default filled in for a spec with no cpu_mode
+//     (NoCPUModeRendersAsTheCreatePath);
 //   - the reconciler's NICs take no model (KeepsTheNICModel);
 //   - failoverDiskConfigs takes the bus from the spec only and drops the
 //     controller model, cache and stored target (KeepsDiskBusControllerAndOrder).
@@ -74,26 +75,18 @@ func TestDomainXMLFor_RendersTheSpecsCPU(t *testing.T) {
 }
 
 // A spec with no cpu_mode (one stored before the create-time default existed)
-// is rendered with the default a create stamps today, never qemu64.
-func TestDomainXMLFor_NoCPUModeGetsTheCreateDefault(t *testing.T) {
+// renders exactly as the create and redefine paths render it: with no <cpu>
+// element. A boot on this host never changes the CPU the guest sees.
+func TestDomainXMLFor_NoCPUModeRendersAsTheCreatePath(t *testing.T) {
 	r := NewReconciler("node-a", t.TempDir(), testLogicDB(t), libvirtfake.New())
 	spec := &pb.VMSpec{Name: "old", Cpu: 1, MemoryMib: 512}
-	render := func() string {
-		x, _, failure := r.domainXMLFor(context.Background(),
-			corrosion.VMRecord{Name: "old", CPUActual: 1, MemActual: 512}, spec, nil)
-		if failure != "" {
-			t.Fatalf("domainXMLFor: %s", failure)
-		}
-		return cpuElement(x)
+	x, _, failure := r.domainXMLFor(context.Background(),
+		corrosion.VMRecord{Name: "old", CPUActual: 1, MemActual: 512}, spec, nil)
+	if failure != "" {
+		t.Fatalf("domainXMLFor: %s", failure)
 	}
-	want := cpuElement(createRender(t, &pb.VMSpec{Name: "old", Cpu: 1, MemoryMib: 512, CpuMode: lv.DefaultCPUMode}))
-	if got := render(); got == "" || got != want {
-		t.Fatalf("no cpu_mode: failover <cpu> = %q, want the built-in default's %q", got, want)
-	}
-	r.SetDefaultCPUMode(lv.CPUModeHostPassthrough)
-	want = cpuElement(createRender(t, &pb.VMSpec{Name: "old", Cpu: 1, MemoryMib: 512, CpuMode: lv.CPUModeHostPassthrough}))
-	if got := render(); got != want {
-		t.Fatalf("no cpu_mode, vm.default_cpu_mode host-passthrough: failover <cpu> = %q, want %q", got, want)
+	if got, want := cpuElement(x), cpuElement(createRender(t, spec)); got != want || got != "" {
+		t.Fatalf("no cpu_mode: failover <cpu> = %q, want the create path's %q (none)", got, want)
 	}
 }
 

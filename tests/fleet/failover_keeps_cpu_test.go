@@ -24,7 +24,8 @@ func domainCPU(domXML string) string { return domainCPURE.FindString(domXML) }
 // qemu64: a Rocky 9 guest (x86-64-v2) spun at 100% CPU in early boot with no
 // console output, and a cold migration carried the broken domain on (lab 2,
 // F3). A VM whose stored spec names no cpu_mode (created before the
-// create-time default) gets that default, not qemu64.
+// create-time default) renders as every other path renders it, with no <cpu>:
+// a failover never changes the CPU a guest sees.
 //
 // Multi-node by construction: CreateVM renders the domain on one host, a
 // second host's coordinator fails it over, a third host's reconciler defines
@@ -33,8 +34,8 @@ func domainCPU(domXML string) string { return domainCPURE.FindString(domXML) }
 //
 // Mutation: domainXMLFor builds its VMConfig by hand again, without
 // CPUMode/CPUModel — every VM's <cpu> is gone on the survivor and after the
-// cold migration; drop the default for a spec with no cpu_mode — the legacy
-// VM's is.
+// cold migration; fill a default in for a spec with no cpu_mode — the legacy
+// VM gains one.
 func TestFleet_FailoverAndColdMigrationKeepTheCPU(t *testing.T) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
 	ctx := context.Background()
@@ -63,7 +64,8 @@ func TestFleet_FailoverAndColdMigrationKeepTheCPU(t *testing.T) {
 	}, nil, nil); err != nil {
 		t.Fatalf("InsertVM cpu-legacy: %v", err)
 	}
-	want["cpu-legacy"] = `<cpu mode="` + lv.DefaultCPUMode + `"></cpu>`
+	// The create and redefine paths render it with no <cpu> element.
+	want["cpu-legacy"] = ""
 
 	for name := range want {
 		pinTo(t, coord, name, other.Name)

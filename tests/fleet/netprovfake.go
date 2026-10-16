@@ -210,6 +210,25 @@ func (f *NetProvFake) HasDevice(dev string) bool {
 	return false
 }
 
+// Addrs is the gateway address each network provisioned here on dev with a
+// subnet carries (its first host), as the real provisioner gives a bridge it
+// made.
+func (f *NetProvFake) Addrs(dev string) []netip.Prefix {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []netip.Prefix
+	for n, d := range f.up {
+		if d != dev {
+			continue
+		}
+		if p, err := netip.ParsePrefix(f.subnets[n]); err == nil {
+			p = p.Masked()
+			out = append(out, netip.PrefixFrom(p.Addr().Next(), p.Bits()))
+		}
+	}
+	return out
+}
+
 // Provisions and Deprovisions count calls for network on this node.
 func (f *NetProvFake) Provisions(network string) int {
 	f.mu.Lock()

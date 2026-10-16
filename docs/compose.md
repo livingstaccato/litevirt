@@ -855,11 +855,16 @@ Values are checked before anything is deployed:
 **TLS files** are read as root on every LB host, from `/etc/litevirt/lb-certs/`. Naming a file anywhere else needs the admin role. Each file must be a regular file of at most 1 MiB, named directly (not through a symlink, so point at Let's Encrypt's `archive/` copy or copy the files in, rather than naming `live/`). A file under the PKI directory, the data directory or `/etc/litevirt/lb` is always refused. An LB stored before this rule with files elsewhere keeps working, and each apply raises a `lb.tls_outside_cert_dir` event that names the file.
 
 **Where the VIP goes**: a VIP inside a network's subnet is put on that network's
-bridge on each LB host (when several networks' subnets hold it: a network of
-the LB's own stack first, then the most specific subnet), whether
-or not the bridge carries an address in the subnet, as a host-isolated network's
-bridge does not. If that bridge is not on the host, the LB is refused there with
-the network and bridge named. A VIP in no network's subnet goes on the host device
+bridge on each LB host (a stack LB considers only its own stack's networks and
+networks of no stack; when several subnets hold it: its own stack's network
+first, then the most specific subnet), whether
+or not the bridge carries an address in the subnet. A stack's `bridge` network
+may be on its scoped name (`<stack>_<name>`) or on its own name on a given host;
+the scoped name is tried first, and the own name is taken only when no other
+network may be on it, or when it carries an address in the network's subnet.
+If that bridge is not on the host, or which network a shared name belongs to
+cannot be told, the LB is refused there with the network and bridge named. The
+LB's VIP ports and SNAT are recorded for that same network. A VIP in no network's subnet goes on the host device
 whose subnet holds it, else on the default-route device.
 
 All VMs in the stack automatically become backends. Backend IPs are discovered via

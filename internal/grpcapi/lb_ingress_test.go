@@ -144,7 +144,7 @@ func TestLBSNATSync_NotOnANonIsolatedBridge(t *testing.T) {
 		}
 	}
 	cfg := lb.Config{Name: "x-lb", Interface: "plain"}
-	s.lbSNATSync(context.Background(), &cfg, []string{s.hostName, "peer-host"})
+	s.lbSNATSync(context.Background(), &cfg, lbPlacement{iface: "plain", network: "lbr_plain"}, []string{s.hostName, "peer-host"})
 	if cfg.SNATEnabled {
 		t.Error("conntrackd enabled for an LB on a bridge that is not host-isolated")
 	}

@@ -218,3 +218,116 @@ func TestFleet_LBSNATHoldsOnEveryLBHost(t *testing.T) {
 		})
 	}
 }
+
+// composeBackendStack is a stack with a host-isolated `backend` network and
+// an LB with snat: true; %[1]s the stack, %[2]s its subnet's third octet.
+const composeBackendStack = `name: %[1]s
+
+images:
+  test:
+    source: file:///dev/null
+
+networks:
+  backend:
+    type: bridge
+    subnet: 10.%[2]s.0.0/24
+    dhcp: true
+    host-isolation: true
+
+vms:
+  %[1]s1:
+    image: test
+    cpu: 1
+    memory: 512
+    placement:
+      host: node-0
+    network:
+      - name: backend
+    loadbalancer:
+      enabled: true
+      vip: 10.%[2]s.0.250/24
+      ports:
+        - listen: 80
+          target: 8080
+          protocol: tcp
+      hosts:
+        - node-0
+      snat: true
+`
+
+// TestFleet_TwoStacksSharingABackendNameStayApart: stacks sa and sb each have
+// a host-isolated `backend` network, on different subnets, with an LB on
+// node-0. sa is deployed from node-1, so node-0 provisions its network as a
+// peer target on the scoped sa_backend (the row names no interface); sb is
+// deployed from node-0, which provisions its network on the short `backend`.
+// Both short names are `backend`: each LB's VIP and SNAT intent must land on
+// its own stack's network only. Matched by device name, sb's intent took sa's
+// row (it claims `backend` too) and NATed sa's subnet as sb's VIP.
+//
+// Mutation: look the intent's network up by device name again — red.
+func TestFleet_TwoStacksSharingABackendNameStayApart(t *testing.T) {
+	c := New(t, Options{Nodes: 2, IndependentReplicas: true})
+	ctx := context.Background()
+	var mu sync.Mutex
+	applied := map[string]string{} // LB → device, on node-0
+	for _, n := range c.Nodes {
+		n := n
+		if err := corrosion.InsertImage(ctx, n.DB, corrosion.ImageRecord{Name: "test", Format: "qcow2", SourceURL: "file:///dev/null", Checksum: "deadbeef", SizeBytes: 1024}); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeEmptyImageFile(n.Server.ImagePathForTests("test")); err != nil {
+			t.Fatal(err)
+		}
+		n.Server.SetBridgeEnsure(n.Net.EnsureBridge)
+		n.Server.SetBridgeExists(n.Net.HasDevice)
+		n.Server.SetLinkAddrs(n.Net.Addrs)
+		n.Server.SetLBApply(func(_ context.Context, cfg lb.Config) error {
+			mu.Lock()
+			defer mu.Unlock()
+			if n == c.Nodes[0] {
+				applied[cfg.Name] = cfg.Interface
+			}
+			return nil
+		})
+	}
+	for _, d := range []struct {
+		from         *Node
+		stack, octet string
+	}{{c.Nodes[1], "sa", "1"}, {c.Nodes[0], "sb", "2"}} {
+		msgs := deployCollect(t, ctx, c.SelfClient(d.from), fmt.Sprintf(composeBackendStack, d.stack, d.octet))
+		for _, p := range msgs {
+			if p.Phase == "error" {
+				t.Fatalf("deploy %s: %s: %s", d.stack, p.VmName, p.Error)
+			}
+		}
+	}
+	n0 := c.Nodes[0]
+	for _, w := range []struct{ lbName, dev, subnet string }{
+		{"sa-lb", "sa_backend", "10.1.0.0/24"},
+		{"sb-lb", "backend", "10.2.0.0/24"},
+	} {
+		w := w
+		var in corrosion.HostFWIntent
+		eventually(t, 20*time.Second, w.lbName+"'s isolation intent on node-0", func() bool {
+			intents, err := corrosion.ListHostFWIntent(ctx, n0.DB, n0.Name)
+			if err != nil {
+				return false
+			}
+			for _, x := range intents {
+				if x.ScopeKey == "lb:"+w.lbName {
+					in = x
+					return in.SNATSubnet != ""
+				}
+			}
+			return false
+		})
+		if in.Bridge != w.dev || in.SNATSubnet != w.subnet {
+			t.Errorf("%s: intent on %s NATing %s, want %s NATing only %s", w.lbName, in.Bridge, in.SNATSubnet, w.dev, w.subnet)
+		}
+		mu.Lock()
+		if got := applied[w.lbName]; got != w.dev {
+			t.Errorf("%s: VIP placed on %q, want its own stack's %s", w.lbName, got, w.dev)
+		}
+		mu.Unlock()
+	}
+}

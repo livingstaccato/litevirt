@@ -561,6 +561,11 @@ type Server struct {
 	// host". Production leaves it nil, preserving network.BridgeExists.
 	bridgeExists func(name string) bool
 
+	// linkAddrs replaces the read of a device's IP addresses (lbVIPInterface
+	// tells whose bridge a shared short name is by them). Test-only seam,
+	// nil in production.
+	linkAddrs func(name string) []netip.Prefix
+
 	// bridgeUplink is a test seam for "does this bridge carry anything off this
 	// host". Production leaves it nil, preserving network.BridgeHasUplink. Like
 	// bridgeExists it decides a health finding, so a test that let the real host
@@ -1520,6 +1525,10 @@ func (s *Server) SetDHCPReservationBackend(served, uplink func(bridge string) bo
 // reads, so a test that exercises that refusal must fix it rather than inherit
 // whatever interfaces the machine running the test happens to have.
 func (s *Server) SetBridgeExists(fn func(name string) bool) { s.bridgeExists = fn }
+
+// SetLinkAddrs replaces the read of a device's addresses (linkAddrs).
+// Test-only seam, nil in production.
+func (s *Server) SetLinkAddrs(fn func(name string) []netip.Prefix) { s.linkAddrs = fn }
 
 // SetLBApply replaces the haproxy/keepalived apply of a load balancer on this
 // host (lbApplyOverride). Test-only seam, nil in production.

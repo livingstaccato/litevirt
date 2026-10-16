@@ -146,9 +146,9 @@ func (s *Server) vmGuarded(ctx context.Context, vm string) (bool, error) {
 
 // guardedMACs is the MACs of owner's NICs whose guard is on
 // (corrosion.GuardedMACsOf) — of the incarnation a create on this host is
-// bringing up, while one is (creatingIncarnation).
+// bringing up, while one is (CreatingIncarnation).
 func (s *Server) guardedMACs(ctx context.Context, owner string) ([]string, error) {
-	return corrosion.GuardedMACsOfIncarnation(ctx, s.db, owner, s.creatingIncarnation(owner))
+	return corrosion.GuardedMACsOfIncarnation(ctx, s.db, owner, s.CreatingIncarnation(owner))
 }
 
 // noteCreatingIncarnation records that a create on this host is bringing VM
@@ -165,9 +165,9 @@ func (s *Server) noteCreatingIncarnation(vm, uuid string) func() {
 	return func() { s.creatingIncarnations.CompareAndDelete(vm, uuid) }
 }
 
-// creatingIncarnation is the uuid a create on this host is bringing VM vm up
+// CreatingIncarnation is the uuid a create on this host is bringing VM vm up
 // as, or "" when none is.
-func (s *Server) creatingIncarnation(vm string) string {
+func (s *Server) CreatingIncarnation(vm string) string {
 	if v, ok := s.creatingIncarnations.Load(vm); ok {
 		u, _ := v.(string)
 		return u

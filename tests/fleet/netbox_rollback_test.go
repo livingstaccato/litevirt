@@ -10,8 +10,12 @@ package fleet
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -143,7 +147,7 @@ func TestNetBoxDeleteSkippedWhenTombstoneFails(t *testing.T) {
 // unreclaimable by the sweeper, because the identity still resolves.
 //
 // Two networks rather than two NICs on one: a VM is created with at most one
-// NIC per network (see TestTwoNICsOnOneNetworkAbortsAndReleasesBoth). The
+// NIC per network (see TestTwoNICsOnOneNetworkRefusedBeforeAnyClaim). The
 // per-NIC detach variant belongs with NIC hotplug.
 func TestEveryNICLeaseIsReleasedOnDelete(t *testing.T) {
 	nb := NewNetBoxFake()
@@ -180,16 +184,13 @@ func TestEveryNICLeaseIsReleasedOnDelete(t *testing.T) {
 	}
 }
 
-// TestTwoNICsOnOneNetworkAbortsAndReleasesBoth: a create with two NICs on one
-// bound network is refused before anything is claimed or created.
+// TestTwoNICsOnOneNetworkRefusedBeforeAnyClaim: a create with two NICs on one
+// bound network is refused as invalid before anything is claimed or created.
 // vm_interfaces is keyed (vm_name, network_name), so the second NIC's row
 // would collide with the first's after both addresses were claimed and the
-// domain was running.
-//
-// Before the persistence-failure abort, that create returned an error while
-// leaving a running, row-less VM holding two NetBox addresses: the precise
-// state the sweeper would later reclaim out from under a live guest.
-func TestTwoNICsOnOneNetworkAbortsAndReleasesBoth(t *testing.T) {
+// domain was running. The release of claims a failed create took is
+// TestCreateAbortsWhenRowPersistFailsAfterClaim's.
+func TestTwoNICsOnOneNetworkRefusedBeforeAnyClaim(t *testing.T) {
 	nb := NewNetBoxFake()
 	t.Cleanup(nb.Close)
 	nb.AddPrefix(7, "10.0.5.0/24", 3, true)
@@ -201,17 +202,54 @@ func TestTwoNICsOnOneNetworkAbortsAndReleasesBoth(t *testing.T) {
 	n := c.Nodes[0]
 	mustCreateBoundNetwork(t, c, n, "bound", "10.0.5.0/24", 7)
 
-	if _, err := createVMWithNICs(c, n, "vm-1", "bound", "bound"); err == nil {
-		t.Fatal("two NICs on one network cannot persist — the create must fail")
+	if _, err := createVMWithNICs(c, n, "vm-1", "bound", "bound"); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("two NICs on one network: got %v, want InvalidArgument", err)
 	}
 	if n.Virt.DomainExists("vm-1") {
-		t.Fatal("the domain must be torn down, not left running without a row")
+		t.Fatal("a domain was defined for the refused create")
 	}
 	if ids := nb.Identities(); len(ids) != 0 {
-		t.Fatalf("both claims must be released, still held: %v", ids)
+		t.Fatalf("the refused create claimed addresses: %v", ids)
 	}
 	if got := leaseCount(t, n, "bound"); got != 0 {
-		t.Fatalf("both local leases must be tombstoned, %d still live", got)
+		t.Fatalf("the refused create took %d lease(s)", got)
+	}
+}
+
+// TestCreateThatCannotStopItsDomainKeepsClaimsAndDisks (review M5): a failed
+// create whose domain cannot be stopped leaves the guest's address claimed
+// and its disks in place — the guest still runs on them.
+func TestCreateThatCannotStopItsDomainKeepsClaimsAndDisks(t *testing.T) {
+	nb := NewNetBoxFake()
+	t.Cleanup(nb.Close)
+	nb.AddPrefix(7, "10.0.5.0/24", 3, true)
+
+	c := NewClusterWithNetBox(t, 1, nb)
+	gates := gateAll(t, c)
+	latchNetBoxIPAM(t, c, gates)
+
+	n := c.Nodes[0]
+	mustCreateBoundNetwork(t, c, n, "bound", "10.0.5.0/24", 7)
+	n.FailVMRowWrites(t)
+	n.Virt.FailDestroyDomain = func(string) error { return errors.New("induced destroy failure") }
+
+	_, err := c.SelfClient(n).CreateVM(context.Background(), &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "vm-1", Cpu: 1, MemoryMib: 512,
+		Placement: &pb.PlacementSpec{Host: n.Name},
+		Disks:     []*pb.DiskSpec{{Name: "data", Size: "64M"}},
+		Network:   []*pb.NetworkAttachment{{Name: "bound"}},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "could not be stopped") {
+		t.Fatalf("got %v, want the domain left running named", err)
+	}
+	if !n.Virt.DomainExists("vm-1") {
+		t.Fatal("the running domain was undefined")
+	}
+	if files := diskFilesOf(t, n, "vm-1"); len(files) == 0 {
+		t.Error("the disks of the still-running guest were removed")
+	}
+	if ids := nb.Identities(); len(ids) != 1 {
+		t.Errorf("the still-running guest's address claim: %v, want it kept", ids)
 	}
 }
 

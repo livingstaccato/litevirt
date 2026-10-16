@@ -9,11 +9,13 @@ package fleet
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -212,5 +214,95 @@ func TestFleet_CreateVM_StaleGuardRecordsDoNotBlockTheName(t *testing.T) {
 	}
 	if left := liveGuardsOf(t, n, "web"); len(left) != 0 {
 		t.Errorf("live guard records of web after its delete: %v", left)
+	}
+}
+
+// TestFleet_CreateVM_AFailureAfterTheCommitKeepsTheVM (review I1): once the
+// VM row has committed the create has happened. A step after it failing, or
+// the client giving up, retires nothing and tears nothing down: the VM runs,
+// its row stays, its guard records stay live.
+func TestFleet_CreateVM_AFailureAfterTheCommitKeepsTheVM(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hook func(cancel context.CancelFunc) func(string) error
+	}{
+		{"later step fails", func(context.CancelFunc) func(string) error {
+			return func(string) error { return status.Error(codes.Internal, "induced post-commit failure") }
+		}},
+		{"client gives up", func(cancel context.CancelFunc) func(string) error {
+			return func(string) error { cancel(); return nil }
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, n := guardedCreateNode(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			n.Server.SetCreateCommittedHook(tc.hook(cancel))
+			n.Server.SetCreateReturnedHook(func(name string, _ error) {
+				if name == "web" {
+					close(done)
+				}
+			})
+			_, _ = c.SelfClient(n).CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+				Name: "web", Cpu: 1, MemoryMib: 256,
+				Placement: &pb.PlacementSpec{Host: n.Name},
+				Network:   []*pb.NetworkAttachment{{Name: "lan"}},
+			}})
+			select {
+			case <-done:
+			case <-time.After(30 * time.Second):
+				t.Fatal("the create did not return on the server")
+			}
+			bg := context.Background()
+			if vm, err := corrosion.GetVM(bg, n.DB, "web"); err != nil || vm == nil {
+				t.Fatalf("the committed VM's row is gone: %v, %v", vm, err)
+			}
+			if st, _ := n.Virt.DomainState("web"); st != "running" {
+				t.Errorf("the committed VM is %q, want running", st)
+			}
+			if macs := liveGuardsOf(t, n, "web"); len(macs) != 1 {
+				t.Errorf("live guard records of the committed VM: %v, want its one", macs)
+			}
+		})
+	}
+}
+
+// TestFleet_RebuildOfTwoNICsOnOneNetworkRefusedBeforeTeardown: a VM whose
+// stored spec has two NICs on one network (a second one attached once
+// hardware_v2 was active) is not rebuilt: the rebuild's preflight refuses the
+// re-create before the VM is torn down, and the VM is left as it was.
+func TestFleet_RebuildOfTwoNICsOnOneNetworkRefusedBeforeTeardown(t *testing.T) {
+	c, n := guardedCreateNode(t)
+	ctx := context.Background()
+	if _, err := createWithDisk(c, n, "rb", "lan"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	vm, err := corrosion.GetVM(ctx, n.DB, "rb")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM: %v, %v", vm, err)
+	}
+	spec := &pb.VMSpec{}
+	if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
+		t.Fatal(err)
+	}
+	spec.Network = append(spec.Network, &pb.NetworkAttachment{Name: "lan", Mac: "52:54:00:ee:00:02"})
+	b, _ := json.Marshal(spec)
+	if err := localExec(ctx, n.DB, `UPDATE vms SET spec = ? WHERE name = ?`, string(b), "rb"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = c.SelfClient(n).RebuildVM(ctx, &pb.RebuildVMRequest{Name: "rb"})
+	if status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "nothing was changed") {
+		t.Fatalf("rebuild: got %v, want InvalidArgument saying nothing was changed", err)
+	}
+	if st, _ := n.Virt.DomainState("rb"); st != "running" {
+		t.Errorf("the VM is %q after the refused rebuild, want running", st)
+	}
+	if files := diskFilesOf(t, n, "rb"); len(files) != 1 {
+		t.Errorf("disk files after the refused rebuild: %v", files)
+	}
+	if vm, err := corrosion.GetVM(ctx, n.DB, "rb"); err != nil || vm == nil {
+		t.Errorf("the VM row after the refused rebuild: %v, %v", vm, err)
 	}
 }

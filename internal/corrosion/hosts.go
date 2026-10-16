@@ -327,7 +327,8 @@ func ListHosts(ctx context.Context, c *Client) ([]HostRecord, error) {
 
 // HostStateJoining is the state `lv host add` admits a host in (AdmitHost):
 // its identity is recorded, its daemon has not yet started. The daemon's boot
-// write (UpdateHostStartup) records it 'active'. Until then it is not a fence
+// write (UpdateHostStartup) records it 'upgrading', and 'active' once the
+// daemon serves (hostboot). Until then it is not a fence
 // candidate, so a coordinator does not power off a machine part-way through its
 // setup, and like every state but 'active' it is no placement target.
 //

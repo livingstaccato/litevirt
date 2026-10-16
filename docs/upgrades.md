@@ -566,13 +566,13 @@ data, yet it advertises the token, counts toward its latch and is accepted as a
 sender: the first use would not be refused, and every such host would
 acknowledge it and then quarantine itself. So a feature added after a release
 ships — in a patch release too — is declared under the next release token,
-never a shipped one, and a test pins every release token's list. All nineteen
+never a shipped one, and a test pins every release token's list. All twenty
 features of `release_2026_11_v1` are declared in this release (`lv cluster
 upgrade-status` lists them): `vm_limits`, `vm_disk_nic_io`,
 `email_target_secret`, `login_policy`, `drain_failback`, `firewall_ipv6`,
 `nic_guards`, `usb_mounts_memory`, `backup_zstd`, `container_replication`,
 `iscsi_lun_claim`, `pit_overlay`, `redfish_fence`, `ha_disarm`, `nic_mtu`,
-`replication_rate`, `firewall_synflood`, `firewall_log` and
+`replication_rate`, `returning_boot`, `firewall_synflood`, `firewall_log` and
 `firewall_tag_groups`.
 
 One feature is one used bit: the first write of any of its data marks it used,
@@ -604,6 +604,14 @@ coordinator, armed or not, decides no fence and no recovery for a scope (the
 cluster, or the host's region) in which it counts fewer than a majority of the
 voters live, and the skip is counted as `error_class="no_quorum"`
 ([migration-failover.md](migration-failover.md#disarming-ha-for-planned-maintenance)).
+`returning_boot` is used by default the same way: once the release token has
+latched, the failover lease holder records its use with no data write. From
+then on a host that boots while recorded `fenced`, `offline`, `maintenance`,
+`draining` or `joining` is recorded `upgrading` until its daemon serves, not
+`active` at once; until then it boots `active`, as on the previous release,
+whose failover leader clears a fenced host it has handled only once the host
+is `active`
+([migration-failover.md](migration-failover.md#resuming-a-recovery-from-a-recorded-fence)).
 
 **What this does not change.** A binary built before `release_2026_11_v1`
 understands no rollback rule. Rolled back below any token it does not know —

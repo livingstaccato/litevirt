@@ -326,6 +326,7 @@ var frozenReleaseFeatures = map[string][]Feature{
 		"pit_overlay",
 		"redfish_fence",
 		"replication_rate",
+		"returning_boot",
 		"usb_mounts_memory",
 		"vm_disk_nic_io",
 		"vm_limits",

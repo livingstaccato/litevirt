@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -813,14 +814,26 @@ func TestBootThatCannotRecordItselfWritesNothingUntilItServes(t *testing.T) {
 
 // TestDeferredBootOfAFencedHostKeepsTheFence: a crash boot of a host recorded
 // fenced whose data dir cannot take its unclean-boot history writes nothing,
-// and once this daemon serves it is not recorded active over the fence.
+// and once this daemon serves it is not recorded active over the fence —
+// whether or not returning_boot is open (here it is): a host that cannot
+// record its own boot history needs an operator.
 //
-// Mutation: confirm a deferred boot from any recorded state in hostboot — the
-// fenced host turns active once it serves.
+// The kept fence is visible: the host raises boot_kept_fence about itself,
+// naming the cause and `lv host undrain <host>`, and resolves it once it is
+// recorded as anything but fenced or offline.
+//
+// Mutations: confirm a deferred boot from any recorded state in hostboot — the
+// fenced host turns active once it serves; drop the history check from
+// returningBoot — the boot goes through the gate and the host returns; raise
+// no condition — the condition check fails; never resolve it — the undrain
+// leaves it open.
 func TestDeferredBootOfAFencedHostKeepsTheFence(t *testing.T) {
 	old := pingPollInterval
 	pingPollInterval = time.Millisecond
 	defer func() { pingPollInterval = old }()
+	oldPoll := fenceKeptPoll
+	fenceKeptPoll = 10 * time.Millisecond
+	defer func() { fenceKeptPoll = oldPoll }()
 	var checks bootChecks
 	defer checks.wait(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -829,6 +842,8 @@ func TestDeferredBootOfAFencedHostKeepsTheFence(t *testing.T) {
 	if err := corrosion.UpdateHostState(ctx, d.db, "h", "fenced"); err != nil {
 		t.Fatal(err)
 	}
+	calls := 0
+	d.returningGate = openGate(t, &calls)
 	d.cfg.DataDir = filepath.Join(t.TempDir(), "missing")
 	served := make(chan struct{})
 	var once sync.Once
@@ -839,8 +854,62 @@ func TestDeferredBootOfAFencedHostKeepsTheFence(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("the boot started no serving check")
 	}
+	if calls != 0 {
+		t.Fatalf("the boot of a fenced host that cannot record its history went through the release gate %d times, want none", calls)
+	}
 	time.Sleep(100 * time.Millisecond)
 	if got := host().State; got != "fenced" {
 		t.Fatalf("a deferred boot of a fenced host recorded it %q once serving, want the fence kept", got)
+	}
+	row, ok, err := corrosion.GetHealthCondition(ctx, d.db, hostboot.BootEvaluator, hostboot.CondFenceKeptOnBoot, "host", "h")
+	if err != nil || !ok || row.Lifecycle != corrosion.ConditionConfirmed || row.Severity != corrosion.SeverityWarning ||
+		!strings.Contains(row.Evidence, "lv host undrain h") || !strings.Contains(row.Evidence, `"state":"fenced"`) || !strings.Contains(row.Evidence, "cause") {
+		t.Fatalf("the kept fence raised no boot_kept_fence naming the state, cause and remedy: ok=%v err=%v %+v", ok, err, row)
+	}
+	// The operator returns it.
+	if err := corrosion.UpdateHostState(ctx, d.db, "h", "active"); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if open, err := hostboot.FenceKeptOpen(ctx, d.db, "h"); err == nil && !open {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the host was undrained, and boot_kept_fence is still open")
+		}
+	}
+}
+
+// TestBootResolvesAKeptFenceLeftByAnEarlierProcess: a boot_kept_fence an
+// earlier daemon process raised is resolved by the next boot once the host is
+// recorded as anything but fenced or offline; an ordinary boot raises none.
+//
+// Mutation: resolve only in the boot that raised it — the leftover stays open.
+func TestBootResolvesAKeptFenceLeftByAnEarlierProcess(t *testing.T) {
+	old := pingPollInterval
+	pingPollInterval = time.Millisecond
+	defer func() { pingPollInterval = old }()
+	var checks bootChecks
+	defer checks.wait(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d, _ := bootTestDaemon(t, ctx)
+	d.selfPinger = checks.pinger(&gatedPinger{open: make(chan struct{})})
+	d.writeBootState(ctx, 0, 0, 0, false) // an ordinary boot of an active host
+	if open, err := hostboot.FenceKeptOpen(ctx, d.db, "h"); err != nil || open {
+		t.Fatalf("an ordinary boot raised boot_kept_fence: open=%v err=%v", open, err)
+	}
+	if err := hostboot.RaiseFenceKept(ctx, d.db, "h", "offline", "disk full", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	d.selfPinger = checks.pinger(&gatedPinger{open: make(chan struct{})})
+	d.writeBootState(ctx, 0, 0, 0, false)
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if open, err := hostboot.FenceKeptOpen(ctx, d.db, "h"); err == nil && !open {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a boot of a host no longer fenced left an earlier boot_kept_fence open")
+		}
 	}
 }

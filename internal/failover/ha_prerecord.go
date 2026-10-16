@@ -21,6 +21,9 @@ func HADisarmPreRecord(ctx context.Context, with func(context.Context, capabilit
 // HAPreRecorder pays the first use of ha_disarm on the lease holder, in its own
 // goroutine, never inside a coordinator cycle.
 type HAPreRecorder struct {
+	// Name is the feature, for the log ("ha_disarm" when empty). The same
+	// recorder pays other features used by default (returning_boot).
+	Name string
 	// HoldsLease, Latched (release_2026_11_v1 durably latched here) and Paid
 	// (the used record is present and acknowledged) decide whether to try.
 	HoldsLease func() bool
@@ -60,10 +63,14 @@ func (p *HAPreRecorder) Run(ctx context.Context) {
 			err := p.Record(actx)
 			cancel()
 			if err == nil {
-				slog.Info("ha-disarm: the first use is recorded; a disarm no longer needs every host reachable")
+				if p.Name == "" || p.Name == string(capabilities.FeatureHADisarm) {
+					slog.Info("ha-disarm: the first use is recorded; a disarm no longer needs every host reachable")
+				} else {
+					slog.Info("release feature: the first use is recorded", "feature", p.Name)
+				}
 				return
 			}
-			slog.Info("ha-disarm: could not record the first use yet; retrying", "error", err, "retry_in", delay)
+			slog.Info("release feature: could not record the first use yet; retrying", "feature", p.featureName(), "error", err, "retry_in", delay)
 			wait = delay
 			if delay *= 2; delay > maxBackoff {
 				delay = maxBackoff
@@ -77,4 +84,12 @@ func (p *HAPreRecorder) Run(ctx context.Context) {
 		case <-time.After(wait):
 		}
 	}
+}
+
+// featureName is the feature the recorder pays, for the log.
+func (p *HAPreRecorder) featureName() string {
+	if p.Name == "" {
+		return string(capabilities.FeatureHADisarm)
+	}
+	return p.Name
 }

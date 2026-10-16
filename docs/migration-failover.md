@@ -389,7 +389,8 @@ not `active`. A VM moved by a drain is started on its target, which is
 
 ### Failback after maintenance
 
-`lv host undrain` returns a host to scheduling and moves nothing back. Failback
+`lv host undrain` returns a host to scheduling (draining, maintenance, and also
+fenced or offline, which ends the fence) and moves nothing back. Failback
 is the opt-in that does, as Proxmox's HA failback property does: after the
 undrain, the VMs the drain moved away return by live migration, at a bounded
 rate.
@@ -922,9 +923,9 @@ an unverified fence may never have powered off, or one cut off by a partition.
 A host whose daemon starts again — the machine booting after a power-off, or
 its daemon restarted — turns `active` on its own, whatever the cluster
 recorded for it, and needs no `lv host undrain` ([upgrades](upgrades.md) says
-the same). Its boot write records it `active`, or `upgrading` first when it
-booted into a pending upgrade or a graceful restart, and then `active` once
-it serves. It does not run the workloads that
+the same). Its boot write records it `upgrading`, and the daemon records it
+`active` once it serves, as after a graceful restart. It does not run the
+workloads that
 moved off it: they are recorded on their new hosts, and the copies of their
 disks it still holds are set aside as superseded (`lv host superseded-disks`).
 
@@ -1058,13 +1059,14 @@ than the host's last activation still counts, which is the race the window
 exists for. Likewise, a health observation older than the
 moment a host turned active does not count toward fencing it: a host that just
 turned active is counted down afresh, and a host `lv host add` admitted is not
-probed at all until its daemon's first boot records it `active`. A newer
+probed at all until its daemon's first boot write ends `joining`. A newer
 observation counts only if its failing run began after the activation, or once
 the host has been failing for a whole run since it: 5 probes (8 s) plus the 5 s
-clock-skew margin. Observers keep counting through a restart, and a daemon's
-boot write records it `active` a few seconds before it answers probes, so
-without this a host that restarted (recorded `upgrading` while it was down) was
-fenced the moment its boot write landed, on the count from its restart.
+clock-skew margin. Observers keep counting through a restart, and where a
+daemon's boot write records it `active` (the boots listed below that still
+do), it does so a few seconds before it answers probes, so without this a host
+that restarted (recorded `upgrading` while it was down) was fenced the moment
+its boot write landed, on the count from its restart.
 The rule is the failover leader's: until the leader runs a build with it, a
 restarted host can still be fenced in that gap.
 
@@ -1125,23 +1127,42 @@ and resources are then written once the daemon serves, leaving that state.
 - A boot without the marker that cannot write `boot-unclean-history` or
   `boot-awaiting-serving` (a full or read-only disk) could not bound a crash
   loop, and one that cannot read the host's record (read twice) could not
-  judge it: each makes no write. Once the daemon serves it records a host
-  recorded `active` or `upgrading` `active`, with its version and resources,
-  only while it is still recorded so; a fenced or offline host keeps that
-  state and gets nothing, and a draining or maintenance one keeps its state
-  and gets its version and resources. A graceful boot that cannot read the
+  judge it: each makes no write. This covers a host recorded `active` or
+  `upgrading` at boot, one whose record was unreadable, and one recorded
+  `fenced` or `offline` that cannot write `boot-unclean-history`; a host
+  recorded `maintenance`, `draining` or `joining` at boot is returning (below)
+  and is written. Once the daemon serves it records a host recorded `active`
+  or `upgrading` `active`, with its version and resources, only while it is
+  still recorded so; a fenced or offline host keeps that state and gets
+  nothing, and a draining or maintenance one (found so once it serves) keeps
+  its state and gets its version and resources. A graceful boot that cannot read the
   record still leaves `boot-awaiting-serving`; if that cannot be written
   either, a crash before it serves leaves the next boot nothing to show it
   never served, and that boot may write one fresh `upgrading` (bounded by the
   3-in-10-minutes count).
 - A report that fails once the daemon serves is retried until it lands.
 
+A host recorded `fenced`, `offline`, `maintenance`, `draining` or `joining`
+when it boots, with or without the marker, whatever its earlier boots, is
+returning to service. The one exception is a fenced or offline host whose boot
+cannot write `boot-unclean-history`: it keeps the fence, makes no write and
+is not recorded `active` once it serves, until `lv host undrain`. It logs that
+at warning level and raises `boot_kept_fence`
+([diagnostics.md](diagnostics.md)). Once the `returning_boot` feature of
+`release_2026_11_v1` is in use ([upgrades.md](upgrades.md)), its boot write
+records it `upgrading`, only while it is still recorded as the boot read it,
+and the daemon records it `active` once it serves, so it is not fenced before
+it serves on failures counted since its boot write. Until then, or when the
+boot cannot use the feature, its boot write records it `active`, as before:
+a failover leader on the previous release clears a fenced host from what it
+has handled only once the host is `active`. Either write ends the recorded
+state and keeps the host's isolation. The `upgrading` write is made once per
+return: a crash of that boot finds the host `upgrading`. A fenced, offline or
+maintenance host keeps that state through a SIGTERM, and a draining one is
+recorded `upgrading` for the restart, as before.
+
 Each of these boots `active`, as before:
 
-- a host recorded anything other than `active` or `upgrading`, by a boot that
-  can record itself. A fenced, offline or maintenance host keeps that state
-  through the SIGTERM, and a draining one is recorded `upgrading` for the
-  restart, as before;
 - a boot with no `data_dir`;
 - the first start of a host with no record yet, or one re-admitted under its
   name: registering it inserts it `active` before its daemon serves. Its
@@ -1571,7 +1592,7 @@ options below takes. The options need the admin role and are audited:
 
 To run a VM on the real disk a failover left on a host, once that host is
 back and `active` — a host that booted again turns `active` on its own
-(after `upgrading`, if it booted into a pending upgrade); one that
+(after `upgrading`, once its daemon serves); one that
 answered again without restarting stays `fenced` or `offline` until
 `lv host undrain <host>`, and a migration onto it needs it active:
 
@@ -1644,7 +1665,7 @@ one of these happens:
 
 - the host comes back. A host whose daemon starts again — it boots after the
   fence powered it off, or its daemon is restarted — turns `active` on its
-  own (after `upgrading`, if it booted into a pending upgrade), with no
+  own (after `upgrading`, once its daemon serves), with no
   `lv host undrain`. One that answers again without having restarted
   stays `fenced` or `offline` if failover moved anything off it, and
   `lv host undrain <host>` makes it active again;

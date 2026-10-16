@@ -380,8 +380,8 @@ func (c *Checker) checkAllPeers(ctx context.Context) bool {
 		// fence threshold over a long setup, and the boot write that recorded
 		// it 'active' then met a fence quorum at once (kvm003 drill 6,
 		// main-b3368d7c: node-4 fenced 2 s after `lv host add` returned). Its
-		// count starts from zero once it is active, as for a host this checker
-		// has never probed.
+		// count starts from zero once its boot write ends 'joining', as for a
+		// host this checker has never probed.
 		if host.State == corrosion.HostStateJoining {
 			continue
 		}

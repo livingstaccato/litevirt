@@ -715,3 +715,28 @@ func TestForwardHookChains(t *testing.T) {
 		t.Fatalf("a duplicated forward chain must count 2, got %v", got)
 	}
 }
+
+func TestParseLabPrefix(t *testing.T) {
+	for _, c := range []struct {
+		in, want string
+		bad      bool
+	}{
+		{"", "10.77.0", false},
+		{"10.78.0", "10.78.0", false},
+		{"10.79.0", "10.79.0", false},
+		{"10.78", "", true},
+		{"10.78.0.", "", true},
+		{"10.78.0.1", "", true},
+		{"10.78.300", "", true},
+		{"fd00::1", "", true},
+		{"lab2", "", true},
+	} {
+		got, err := parseLabPrefix(c.in)
+		if (err != nil) != c.bad || got != c.want {
+			t.Errorf("parseLabPrefix(%q) = %q, %v; want %q, bad=%v", c.in, got, err, c.want, c.bad)
+		}
+	}
+	if got := labNodeIP("10.78.0", 3); got != "10.78.0.13" {
+		t.Errorf("labNodeIP = %q", got)
+	}
+}

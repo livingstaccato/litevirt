@@ -608,6 +608,7 @@ func TestConditionsSince(t *testing.T) {
 }
 
 func TestCluster_Health(t *testing.T) {
+	ensureTopology(t) // hostNames: run alone, TestSetup has not
 	// `lv health` exits 1 when the overall state is DEGRADED (and 2 when
 	// CRITICAL): the report is still printed in full. This test pins that the
 	// report names the cluster's hosts, so a DEGRADED cluster, whose old
@@ -3093,7 +3094,7 @@ func sgChainOrdered(chain string, observe bool) error {
 
 // pureTests are the tests that touch no cluster and no lv, and so are the only
 // ones LITEVIRT_E2E_UNIT=1 may run.
-var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed", "TestEnforcementEditScript", "TestJoinMajority", "TestUsbHostdevPattern", "TestInspectFenceStrategy", "TestKnownAuditFork", "TestMinorityCopyStopped", "TestConditionsSince", "TestEnforcementEditScriptRefusesAnInlineBlock", "TestParseClaimView", "TestParseLogLines", "TestMailpitMatches", "TestCutPlan", "TestHoldersBetween", "TestTenureAt", "TestMintTime", "TestParseEnforcementGauges", "TestLeaseTermModeOf", "TestLeaseTermExpectFor", "TestW4aVerdict", "TestFreshTenureAt", "TestLeaseTermRefusalPattern", "TestInertJournalVerdict", "TestRefusalVerdict", "TestInspectNICIP", "TestPollFor", "TestHostStateInLs", "TestClassifyLease", "TestLeaseSampleExpiry", "TestExpiredLagNeverFails", "TestExpiredUnexplainedIsNoTenure", "TestLeaseWatchObserve", "TestObserveTick", "TestObserveTickUnknown", "TestSampleTick", "TestHoldersIn", "TestIncoherenceTracker", "TestPingVerdict", "TestUncertifiedDeclineVerdict", "TestGuestBootVerdict", "TestForwardHookChains"}
+var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed", "TestEnforcementEditScript", "TestJoinMajority", "TestUsbHostdevPattern", "TestInspectFenceStrategy", "TestKnownAuditFork", "TestMinorityCopyStopped", "TestConditionsSince", "TestEnforcementEditScriptRefusesAnInlineBlock", "TestParseClaimView", "TestParseLogLines", "TestMailpitMatches", "TestCutPlan", "TestHoldersBetween", "TestTenureAt", "TestMintTime", "TestParseEnforcementGauges", "TestLeaseTermModeOf", "TestLeaseTermExpectFor", "TestW4aVerdict", "TestFreshTenureAt", "TestLeaseTermRefusalPattern", "TestInertJournalVerdict", "TestRefusalVerdict", "TestInspectNICIP", "TestPollFor", "TestHostStateInLs", "TestClassifyLease", "TestLeaseSampleExpiry", "TestExpiredLagNeverFails", "TestExpiredUnexplainedIsNoTenure", "TestLeaseWatchObserve", "TestObserveTick", "TestObserveTickUnknown", "TestSampleTick", "TestHoldersIn", "TestIncoherenceTracker", "TestPingVerdict", "TestUncertifiedDeclineVerdict", "TestGuestBootVerdict", "TestForwardHookChains", "TestParseLabPrefix"}
 
 // unitRunAllowed reports whether a -test.run pattern selects only pureTests:
 // the exact form ^(A|B)$ or ^A$, with every name pure.

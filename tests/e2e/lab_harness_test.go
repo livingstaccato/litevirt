@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +33,7 @@ import (
 //
 //	E2E_LAB_DIR        the lab checkout (lab.sh, cluster_key). Enables lab mode.
 //	E2E_LAB_NODES      node count (default 5): nodes are node-1..node-N.
+//	E2E_LAB_PREFIX     first three octets of the lab /24 (default 10.77.0); node N is <prefix>.(10+N).
 //	E2E_LAB_PORT_BASE  node N's SSH is 127.0.0.1:(base+N) (default 2230).
 //	E2E_LAB_EXCLUDE    comma-separated node numbers the harness leaves alone
 //	                   (e.g. 3): never baselined, restored, powered on or picked.
@@ -47,6 +49,35 @@ var (
 	labMode      = labDir != ""
 	evidenceRoot = os.Getenv("E2E_EVIDENCE_DIR")
 )
+
+// defaultLabPrefix is lab 1's /24: node N is <prefix>.(10+N).
+const defaultLabPrefix = "10.77.0"
+
+// parseLabPrefix validates E2E_LAB_PREFIX: the first three octets of the lab's
+// IPv4 /24 ("10.78.0" for lab 2). Empty selects lab 1's.
+func parseLabPrefix(v string) (string, error) {
+	if v == "" {
+		return defaultLabPrefix, nil
+	}
+	ip := net.ParseIP(v + ".0")
+	if ip == nil || ip.To4() == nil {
+		return "", fmt.Errorf("E2E_LAB_PREFIX=%q: need the first three octets of an IPv4 /24, like %q", v, defaultLabPrefix)
+	}
+	return v, nil
+}
+
+// labNodeIP is node n's address under prefix.
+func labNodeIP(prefix string, n int) string { return fmt.Sprintf("%s.%d", prefix, 10+n) }
+
+// labPrefix reads E2E_LAB_PREFIX, failing t on a malformed value.
+func labPrefix(t *testing.T) string {
+	t.Helper()
+	p, err := parseLabPrefix(os.Getenv("E2E_LAB_PREFIX"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
 
 // ─── Timing, tied to docs/design/partition-pause.md §4.1 ────────────────────
 //
@@ -120,6 +151,7 @@ type lab struct {
 	dir      string
 	key      string
 	portBase int
+	prefix   string            // E2E_LAB_PREFIX
 	hosts    []string          // node-1..node-N, less E2E_LAB_EXCLUDE
 	total    int               // N, counting excluded nodes
 	excluded map[string]bool   // nodes E2E_LAB_EXCLUDE leaves alone
@@ -229,10 +261,11 @@ func newLab(t *testing.T) *lab {
 		total: n, excluded: excluded, cut: map[string]map[string]bool{},
 	}
 	l.logT.Store(t)
+	l.prefix = labPrefix(t)
 	for i := 1; i <= n; i++ {
 		h := fmt.Sprintf("node-%d", i)
 		l.num[h] = i
-		l.ip[h] = fmt.Sprintf("10.77.0.%d", 10+i)
+		l.ip[h] = labNodeIP(l.prefix, i)
 		if !excluded[h] {
 			l.hosts = append(l.hosts, h)
 		}
@@ -543,7 +576,7 @@ func (l *lab) outsiderHosts() []string {
 		l.num[h] = n
 		l.ip[h] = addr[h]
 		if l.ip[h] == "" {
-			l.ip[h] = fmt.Sprintf("10.77.0.%d", 10+n)
+			l.ip[h] = labNodeIP(l.prefix, n)
 		}
 		l.outsiders = append(l.outsiders, h)
 		l.mark("partition: witness %s is outside E2E_LAB_NODES=%d; it is cut with the split", h, l.total)

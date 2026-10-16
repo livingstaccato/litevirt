@@ -844,11 +844,16 @@ Standalone load balancers (not tied to a stack) can also be created with `lv lb 
 ```
 
 **Where the VIP goes**: a VIP inside a network's subnet is put on that network's
-bridge on each LB host (when several networks' subnets hold it: a network of
-the LB's own stack first, then the most specific subnet), whether
-or not the bridge carries an address in the subnet, as a host-isolated network's
-bridge does not. If that bridge is not on the host, the LB is refused there with
-the network and bridge named. A VIP in no network's subnet goes on the host device
+bridge on each LB host (a stack LB considers only its own stack's networks and
+networks of no stack; when several subnets hold it: its own stack's network
+first, then the most specific subnet), whether
+or not the bridge carries an address in the subnet. A stack's `bridge` network
+may be on its scoped name (`<stack>_<name>`) or on its own name on a given host;
+the scoped name is tried first, and the own name is taken only when no other
+network may be on it, or when it carries an address in the network's subnet.
+If that bridge is not on the host, or which network a shared name belongs to
+cannot be told, the LB is refused there with the network and bridge named. The
+LB's VIP ports and SNAT are recorded for that same network. A VIP in no network's subnet goes on the host device
 whose subnet holds it, else on the default-route device.
 
 All VMs in the stack automatically become backends. Backend IPs are discovered via

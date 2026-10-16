@@ -640,6 +640,18 @@ type Server struct {
 	vrrpMu         sync.Mutex
 	vrrpLastEvent  map[string]string
 	vrrpRefusedLBs map[string]string
+	// vrrpServing is checkVRRPServing's last answer per refused LB: another
+	// LB host serves it on unicast. vrrpLatchErr is the last latch-row write
+	// error (noteVRRPLatch logs a change of it only).
+	vrrpServing map[string]bool
+	// vrrpRefusedHosts is each refused LB's hosts, as its last apply had them.
+	vrrpRefusedHosts map[string][]string
+	vrrpLatchErr     string
+	// vrrpAskKick asks checkVRRPServing for a pass now.
+	vrrpAskKick chan struct{}
+	// lbServingOverride is a test seam for asking a peer whether it serves an
+	// LB on unicast (CheckLBPresent). Nil in production.
+	lbServingOverride func(ctx context.Context, host, lbName string) bool
 	// lbKick asks the LB reconciler for a pass now (kickLBReconcile).
 	lbKick chan struct{}
 	// vrrpRowLatched: vrrp_unicast_v1 has latched on some host (its latch
@@ -2445,6 +2457,7 @@ type StoragePoolRef struct {
 func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt LibvirtBackend, images *image.Store) *Server {
 	s := &Server{
 		lbKick:         make(chan struct{}, 1),
+		vrrpAskKick:    make(chan struct{}, 1),
 		startedAt:      time.Now(),
 		hostName:       hostName,
 		dataDir:        dataDir,

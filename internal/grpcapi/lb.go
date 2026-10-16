@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -846,8 +847,22 @@ func (s *Server) applyLBLocal(ctx context.Context, cfg lb.Config, lbHosts []stri
 		return status.Error(codes.InvalidArgument, detail)
 	}
 	if err := s.lbVRRPTransport(ctx, &cfg, lbHosts); err != nil {
-		return s.vrrpRefused(ctx, cfg.Name, lbHosts, err)
+		if errors.Is(err, errVRRPUnrenderable) {
+			return s.vrrpRefused(ctx, cfg, lbHosts, err)
+		}
+		// A failed read: keep what runs, and the reconciler retries.
+		slog.Warn("lb: VRRP transport undecided this apply; left as it runs", "lb", cfg.Name, "error", err)
+		return status.Errorf(codes.Unavailable, "load balancer %q: %v", cfg.Name, err)
 	}
+	if err := s.applyLBConfig(ctx, cfg); err != nil {
+		return err
+	}
+	s.vrrpApplied(ctx, cfg.Name)
+	return nil
+}
+
+// applyLBConfig hands cfg to the LB manager (lbApplyOverride in tests).
+func (s *Server) applyLBConfig(ctx context.Context, cfg lb.Config) error {
 	var err error
 	if s.lbApplyOverride != nil {
 		err = s.lbApplyOverride(ctx, cfg)
@@ -855,7 +870,6 @@ func (s *Server) applyLBLocal(ctx context.Context, cfg lb.Config, lbHosts []stri
 		err = lb.NewManager().Apply(ctx, cfg)
 	}
 	if err == nil {
-		s.vrrpApplied(ctx, cfg.Name)
 		s.recordLBKeepalived(cfg.Name) // publish whether the VIP came up
 	}
 	return err
@@ -941,7 +955,10 @@ func (s *Server) CheckLBPresent(ctx context.Context, req *pb.CheckLBPresentReque
 	if req.LbName == "" {
 		return nil, status.Error(codes.InvalidArgument, "lb_name required")
 	}
-	return &pb.CheckLBPresentResponse{Present: lb.NewManager().HasLB(req.LbName)}, nil
+	return &pb.CheckLBPresentResponse{
+		Present:            lb.NewManager().HasLB(req.LbName),
+		VrrpUnicastServing: s.vrrpUnicastServing(req.LbName),
+	}, nil
 }
 
 // holderStatus is one configured LB holder's reclaim-relevant state (fresh-probed via
@@ -2805,6 +2822,8 @@ func (s *Server) reconcileDeadLBs(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	local := map[string]bool{}
+	defer func() { s.pruneVRRPState(ctx, local) }()
 	for _, cfg := range configs {
 		if !cfg.Enabled {
 			continue
@@ -2818,6 +2837,7 @@ func (s *Server) reconcileDeadLBs(ctx context.Context) {
 		if !s.lbRunsOnHost(ctx, cfg) {
 			continue
 		}
+		local[cfg.Name] = true
 		stale := s.lbVRRPStale(ctx, cfg)
 		if !stale && s.lbKeepalivedRunning(cfg.Name) {
 			continue

@@ -4198,10 +4198,15 @@ func (x *CheckLBPresentRequest) GetLbName() string {
 }
 
 type CheckLBPresentResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Present       bool                   `protobuf:"varint,1,opt,name=present,proto3" json:"present,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Present bool                   `protobuf:"varint,1,opt,name=present,proto3" json:"present,omitempty"`
+	// vrrp_unicast_serving: the answering host runs keepalived for this LB
+	// from a unicast VRRP config and has not refused the LB's unicast
+	// transport. An earlier build leaves it false. A host that cannot render
+	// the transport stops its own keepalived only when a peer reports this.
+	VrrpUnicastServing bool `protobuf:"varint,2,opt,name=vrrp_unicast_serving,json=vrrpUnicastServing,proto3" json:"vrrp_unicast_serving,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *CheckLBPresentResponse) Reset() {
@@ -4237,6 +4242,13 @@ func (*CheckLBPresentResponse) Descriptor() ([]byte, []int) {
 func (x *CheckLBPresentResponse) GetPresent() bool {
 	if x != nil {
 		return x.Present
+	}
+	return false
+}
+
+func (x *CheckLBPresentResponse) GetVrrpUnicastServing() bool {
+	if x != nil {
+		return x.VrrpUnicastServing
 	}
 	return false
 }
@@ -43429,9 +43441,10 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	" RelayCheckVIPParticipantResponse\x123\n" +
 	"\x06result\x18\x01 \x01(\x0e2\x1b.litevirt.v1.RelayVIPResultR\x06result\"0\n" +
 	"\x15CheckLBPresentRequest\x12\x17\n" +
-	"\alb_name\x18\x01 \x01(\tR\x06lbName\"2\n" +
+	"\alb_name\x18\x01 \x01(\tR\x06lbName\"d\n" +
 	"\x16CheckLBPresentResponse\x12\x18\n" +
-	"\apresent\x18\x01 \x01(\bR\apresent\"m\n" +
+	"\apresent\x18\x01 \x01(\bR\apresent\x120\n" +
+	"\x14vrrp_unicast_serving\x18\x02 \x01(\bR\x12vrrpUnicastServing\"m\n" +
 	"\x1aGetRuntimeInventoryRequest\x12\x12\n" +
 	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12'\n" +

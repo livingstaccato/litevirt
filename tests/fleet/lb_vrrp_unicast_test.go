@@ -303,3 +303,120 @@ func TestFleet_VRRPUnicast_StandDownAndRemovedPeer(t *testing.T) {
 	})
 	eventually(t, 15*time.Second, "node-0's keepalived started again", func() bool { return countLines(calls, "-f ") > before })
 }
+
+// TestFleet_VRRPUnicast_RefusedHost: a host whose recorded address no up,
+// non-loopback device holds cannot render the cluster's unicast transport.
+// The fleet's hosts are all recorded at 127.0.0.1, held only by loopback, so
+// a host whose device lookup is left real is exactly that host; the other is
+// given a device.
+//
+//   - One refused: the other serves the LB on unicast and says so
+//     (CheckLBPresent), so the refused host stops its keepalived for the LB:
+//     exactly one holder, and the refused host raises the critical
+//     lb.vrrp.transport_refused.
+//   - Both refused: neither is serving, so neither stops; both run the LB on
+//     multicast (where VRRP elects one master between them) and both raise
+//     the condition.
+//
+// Mutations (each red): demote on a peer that advertises the token rather
+// than one that reports serving (both refused: no holder); never demote (one
+// refused: two holders).
+func TestFleet_VRRPUnicast_RefusedHost(t *testing.T) {
+	for _, both := range []bool{false, true} {
+		name := "one refused"
+		if both {
+			name = "both refused"
+		}
+		t.Run(name, func(t *testing.T) {
+			bin := lbStandIns(t)
+			// Demote removes the VIP with `ip addr del`; the stand-in succeeds.
+			if err := os.WriteFile(filepath.Join(bin, "ip"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			c := New(t, Options{Nodes: 2, SharedCRDT: true})
+			a, b := c.Nodes[0], c.Nodes[1]
+			confDir, mgr := map[string]string{}, map[string]*lb.Manager{}
+			for _, n := range c.Nodes {
+				n.Server.SetVRRPUnicast(true)
+				n.Server.SetBridgeExists(func(string) bool { return true })
+				root := t.TempDir()
+				confDir[n.Name] = filepath.Join(root, "config")
+				m := lb.NewManagerAt(confDir[n.Name], filepath.Join(root, "run"))
+				mgr[n.Name] = m
+				n.Server.SetLBManager(m)
+				n.Server.SetLBApply(m.Apply)
+				n.DB.SetClusterPolicyGate(func() bool { return true })
+			}
+			if !both {
+				b.Server.SetLBIfaceForIPForTests(func(string) string { return "fleet0" })
+			}
+			gates := gateAll(t, c)
+			for _, n := range c.Nodes {
+				peers := map[string]bool{}
+				for _, o := range c.Nodes {
+					if o != n {
+						peers[o.Name] = true
+					}
+				}
+				gates[n.Name].SeedPeersForTests(peers)
+			}
+			for _, tok := range []string{capabilities.SplitBrainGateV1, capabilities.FailoverScopeV1} {
+				if !gates[a.Name].Enforced(ctx, tok) {
+					t.Fatalf("fixture: %s did not latch", tok)
+				}
+			}
+			if _, err := c.SelfClient(a).CreateLoadBalancer(ctx, &pb.CreateLBRequest{
+				Name: "web", Vip: "10.207.0.250/24", Hosts: []string{a.Name, b.Name},
+				Ports:    []*pb.LBPort{{Listen: 80, Target: 8080, Protocol: "tcp"}},
+				Backends: []*pb.LBBackendAddress{{Name: "b1", Address: "10.207.0.10"}},
+			}); err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			conf := func(n *Node) string {
+				data, _ := os.ReadFile(filepath.Join(confDir[n.Name], "web-keepalived.conf"))
+				return string(data)
+			}
+			for _, n := range c.Nodes {
+				n := n
+				eventually(t, 20*time.Second, "the LB's keepalived config on "+n.Name, func() bool { return conf(n) != "" })
+			}
+			rctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			for _, n := range c.Nodes {
+				go n.Server.RunLBReconciler(rctx, 200*time.Millisecond)
+			}
+			if !gates[a.Name].Enforced(ctx, capabilities.VRRPUnicastV1) {
+				t.Fatal("vrrp_unicast_v1 did not latch on node-0")
+			}
+			refused := func(n *Node) bool {
+				row, ok, err := corrosion.GetHealthCondition(ctx, n.DB, "lb", "lb.vrrp.transport_refused", "host", n.Name)
+				return err == nil && ok && row.Lifecycle != corrosion.ConditionResolved && row.Severity == corrosion.SeverityCritical
+			}
+			running := func(n *Node) bool { return mgr[n.Name].KeepalivedRunning("web") }
+			isUnicast := func(n *Node) bool { _, _, uni := unicastPeers(conf(n)); return uni }
+
+			if !both {
+				eventually(t, 20*time.Second, "node-1 serves on unicast and node-0 stops: one holder", func() bool {
+					return isUnicast(b) && running(b) && !running(a) && refused(a)
+				})
+				// Many passes: it stays that way.
+				for end := time.Now().Add(4 * time.Second); time.Now().Before(end); time.Sleep(100 * time.Millisecond) {
+					if !running(b) || running(a) || refused(b) {
+						t.Fatalf("node-0 running=%v, node-1 running=%v refused=%v; want node-1 alone", running(a), running(b), refused(b))
+					}
+				}
+				return
+			}
+			eventually(t, 20*time.Second, "both refuse, and both run the LB on multicast", func() bool {
+				return refused(a) && refused(b) && running(a) && running(b) && !isUnicast(a) && !isUnicast(b)
+			})
+			// Many serving checks and reconcile passes: neither ever stops.
+			for end := time.Now().Add(4 * time.Second); time.Now().Before(end); time.Sleep(100 * time.Millisecond) {
+				if !running(a) || !running(b) {
+					t.Fatalf("node-0 running=%v, node-1 running=%v: a refused host stopped though no peer serves the LB", running(a), running(b))
+				}
+			}
+		})
+	}
+}

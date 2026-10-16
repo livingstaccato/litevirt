@@ -393,7 +393,14 @@ message RelayCheckVIPParticipantResponse { RelayVIPResult result = 1; }
 // CheckVIPParticipant but keyed by LB NAME (used to resolve the true participant set for
 // implicit/legacy hosts=[] LBs before a move). Peer-only (mTLS).
 message CheckLBPresentRequest  { string lb_name = 1; }
-message CheckLBPresentResponse { bool present = 1; }
+message CheckLBPresentResponse {
+    bool present = 1;
+    // vrrp_unicast_serving: the answering host runs keepalived for this LB
+    // from a unicast VRRP config and has not refused the LB's unicast
+    // transport. An earlier build leaves it false. A host that cannot render
+    // the transport stops its own keepalived only when a peer reports this.
+    bool vrrp_unicast_serving = 2;
+}
 
 // CheckContainerRuntime is the container analogue of CheckVMRuntime: it reports
 // the responding host's LOCAL LXC view of a container ({absent, defined_stopped,

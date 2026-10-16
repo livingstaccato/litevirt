@@ -98,8 +98,24 @@ func (s *Server) noteVRRPLatch(ctx context.Context) {
 	if g == nil || !g.DurablyLatched(capabilities.VRRPUnicastV1) || !s.db.MayWriteClusterPolicy() {
 		return
 	}
-	if err := corrosion.MarkVRRPUnicastLatched(ctx, s.db, s.hostName); err != nil {
-		slog.Warn("lb: could not record the vrrp_unicast_v1 latch", "error", err)
+	err = corrosion.MarkVRRPUnicastLatched(ctx, s.db, s.hostName)
+	// Said once per failure (WARN), repeated at DEBUG, and its end at INFO:
+	// this runs every 2 s.
+	s.vrrpMu.Lock()
+	prev := s.vrrpLatchErr
+	if err != nil {
+		s.vrrpLatchErr = err.Error()
+	} else {
+		s.vrrpLatchErr = ""
+	}
+	s.vrrpMu.Unlock()
+	switch {
+	case err != nil && prev == "":
+		slog.Warn("lb: could not record the vrrp_unicast_v1 latch; retrying", "error", err)
+	case err != nil:
+		slog.Debug("lb: could not record the vrrp_unicast_v1 latch", "error", err)
+	case prev != "":
+		slog.Info("lb: recorded the vrrp_unicast_v1 latch after earlier failures")
 	}
 }
 
@@ -121,9 +137,11 @@ type vrrpWant struct {
 // A host in lbHosts with no recorded IPv4 address — removed from the cluster,
 // or never known — is left out of the peers: it cannot be a VRRP peer, and the
 // hosts still serving must keep the VIP. With no peer left the LB renders the
-// sole-host form and becomes master on its own. What it refuses: a failed
-// read, and a host whose own recorded address no local, up, non-loopback
-// device holds (its adverts would go out from an address nothing answers).
+// sole-host form and becomes master on its own. It returns errVRRPUnrenderable
+// when this host cannot render unicast at all — no recorded address, or no
+// local, up, non-loopback device holding it (its adverts would go out from an
+// address nothing answers) — and a plain error on a failed read, which callers
+// treat as transient: what runs is kept and retried.
 func (s *Server) desiredVRRPTransport(ctx context.Context, lbHosts []string) (vrrpWant, error) {
 	unicast, err := s.vrrpUnicastActive(ctx)
 	if err != nil {
@@ -137,11 +155,11 @@ func (s *Server) desiredVRRPTransport(ctx context.Context, lbHosts []string) (vr
 		return vrrpWant{}, fmt.Errorf("vrrp: %w", err)
 	}
 	if local == "" {
-		return vrrpWant{}, fmt.Errorf("vrrp: host %s has no IPv4 address recorded to send VRRP from", s.hostName)
+		return vrrpWant{}, fmt.Errorf("%w: host %s has no IPv4 address recorded to send VRRP from", errVRRPUnrenderable, s.hostName)
 	}
 	dev := s.lbIfaceForIP(local)
 	if dev == "" {
-		return vrrpWant{}, fmt.Errorf("vrrp: no up, non-loopback device on %s holds its recorded address %s, so VRRP sent from it would never be answered", s.hostName, local)
+		return vrrpWant{}, fmt.Errorf("%w: no up, non-loopback device on %s holds its recorded address %s, so VRRP sent from it would never be answered", errVRRPUnrenderable, s.hostName, local)
 	}
 	w := vrrpWant{unicast: true, dev: dev, src: local}
 	seen := map[string]bool{s.hostName: true}
@@ -203,40 +221,64 @@ func (s *Server) vrrpEventOnce(name, kind, value string) bool {
 	return true
 }
 
-// vrrpRefused handles an apply whose VRRP transport cannot be rendered. The
-// cluster's transport is one value, so the other LB hosts render it: this
-// host's keepalived, still on the old transport, would hold the VIP beside
-// them. When another LB host answers as one that renders it, this host stops
-// its keepalived for the LB (that host is then the sole master); either way it
-// raises the critical CondLBVRRPRefused naming the LB, the reason and the
-// remedy. vrrpApplied resolves it.
-func (s *Server) vrrpRefused(ctx context.Context, name string, lbHosts []string, cause error) error {
-	detail := fmt.Sprintf("load balancer %q is not applied on %s: its VRRP transport cannot be rendered: %v. "+
-		"Fix the host's recorded address (advertise_address) or the device holding it; where it cannot be on a local device (1:1 NAT), run `lv cluster vrrp-transport multicast`",
-		name, s.hostName, cause)
-	slog.Error("lb: "+detail, "lb", name)
-	if s.vrrpEventOnce(name, "refused", cause.Error()) {
-		s.publish("lb.vrrp_transport_refused", name, detail)
+// errVRRPUnrenderable marks the two definitive refusals of the unicast
+// transport (desiredVRRPTransport). Only these stop or re-render an LB.
+var errVRRPUnrenderable = errors.New("vrrp: this host cannot render the cluster's unicast transport")
+
+// vrrpRefused handles an apply whose unicast transport this host definitively
+// cannot render; cfg is the LB's multicast render. The refusal is recorded
+// first, so a peer asking at the same moment never sees this host as serving,
+// and it raises the critical CondLBVRRPRefused naming the LB, the reason and
+// the remedy. Then, by the last answer of the LB's other hosts
+// (checkVRRPServing, off this path):
+//
+//   - one of them serves the LB on unicast: this host stops its keepalived
+//     for the LB, so that host is the sole master;
+//   - none does: this host runs the LB on multicast (availability first: it
+//     is then a holder, alone or with another refused host, which elects one
+//     master with it), until a peer serves it.
+//
+// vrrpApplied resolves it once the transport renders again.
+func (s *Server) vrrpRefused(ctx context.Context, cfg lb.Config, lbHosts []string, cause error) error {
+	name := cfg.Name
+	s.vrrpMu.Lock()
+	if s.vrrpRefusedHosts == nil {
+		s.vrrpRefusedHosts = map[string][]string{}
 	}
-	if s.otherLBHostRenders(ctx, lbHosts) {
+	s.vrrpRefusedHosts[name] = append([]string(nil), lbHosts...)
+	s.vrrpMu.Unlock()
+	base := fmt.Sprintf("load balancer %q cannot run the cluster's unicast VRRP on %s: %v. "+
+		"Fix the host's recorded address (advertise_address) or the device holding it; where it cannot be on a local device (1:1 NAT, an address routed to lo), run `lv cluster vrrp-transport multicast`",
+		name, s.hostName, cause)
+	slog.Error("lb: "+base, "lb", name)
+	s.vrrpMu.Lock()
+	_, known := s.vrrpRefusedLBs[name]
+	s.vrrpMu.Unlock()
+	if !known {
+		s.setVRRPRefused(ctx, name, base)
+		s.kickVRRPServing()
+	}
+	if s.vrrpEventOnce(name, "refused", cause.Error()) {
+		s.publish("lb.vrrp_transport_refused", name, base)
+	}
+	if s.vrrpPeerServing(name) {
+		detail := base
 		if err := s.lbDemote(name); err != nil {
 			slog.Error("lb: could not stop the keepalived of a load balancer this host cannot render", "lb", name, "error", err)
+			detail += ". Its keepalived here could not be confirmed stopped: " + err.Error()
 		} else {
-			detail += ". Its keepalived here is stopped; another LB host holds the VIP"
+			detail += ". Its keepalived here is stopped; another LB host serves the VIP on unicast"
 		}
+		s.setVRRPRefused(ctx, name, detail)
+		return status.Error(codes.FailedPrecondition, detail)
 	}
-	s.setVRRPRefused(ctx, name, detail)
-	return status.Error(codes.FailedPrecondition, detail)
+	s.setVRRPRefused(ctx, name, base+". No other LB host serves it on unicast, so it runs here on multicast meanwhile")
+	return s.applyLBConfig(ctx, cfg)
 }
 
 // vrrpApplied resolves this LB's part of CondLBVRRPRefused.
 func (s *Server) vrrpApplied(ctx context.Context, name string) {
-	s.vrrpMu.Lock()
-	_, had := s.vrrpRefusedLBs[name]
-	s.vrrpMu.Unlock()
-	if had {
-		s.setVRRPRefused(ctx, name, "")
-	}
+	s.setVRRPRefused(ctx, name, "")
 	s.vrrpEventOnce(name, "refused", "")
 }
 
@@ -249,9 +291,19 @@ func (s *Server) setVRRPRefused(ctx context.Context, name, detail string) {
 	}
 	if detail == "" {
 		delete(s.vrrpRefusedLBs, name)
+		delete(s.vrrpRefusedHosts, name)
 	} else {
 		s.vrrpRefusedLBs[name] = detail
 	}
+	s.vrrpMu.Unlock()
+	s.refreshVRRPRefusedCondition(ctx)
+}
+
+// refreshVRRPRefusedCondition raises or resolves CondLBVRRPRefused from the
+// refusals recorded in this process (none after a restart, until a re-apply
+// records them again).
+func (s *Server) refreshVRRPRefusedCondition(ctx context.Context) {
+	s.vrrpMu.Lock()
 	var all []string
 	for _, d := range s.vrrpRefusedLBs {
 		all = append(all, d)
@@ -261,31 +313,147 @@ func (s *Server) setVRRPRefused(ctx context.Context, name, detail string) {
 	s.setHostCondition(ctx, LBEvaluator, CondLBVRRPRefused, len(all) > 0, corrosion.SeverityCritical, strings.Join(all, "; "))
 }
 
-// otherLBHostRenders reports whether some other host of the LB answers a
-// Ping as a host that renders the cluster's transport: it advertises
-// vrrp_unicast_v1 and is not WAL-quarantined. Asked in parallel, bounded.
-func (s *Server) otherLBHostRenders(ctx context.Context, lbHosts []string) bool {
-	ctx, cancel := context.WithTimeout(ctx, vrrpPeerAskTimeout)
+// pruneVRRPState forgets the refusals, served answers and event memory of
+// LBs this host no longer runs (deleted, disabled, moved), and re-evaluates
+// CondLBVRRPRefused: after a restart that resolves a condition no current
+// refusal backs.
+func (s *Server) pruneVRRPState(ctx context.Context, local map[string]bool) {
+	s.vrrpMu.Lock()
+	for name := range s.vrrpRefusedLBs {
+		if !local[name] {
+			delete(s.vrrpRefusedLBs, name)
+		}
+	}
+	for name := range s.vrrpServing {
+		if !local[name] {
+			delete(s.vrrpServing, name)
+		}
+	}
+	for name := range s.vrrpRefusedHosts {
+		if !local[name] {
+			delete(s.vrrpRefusedHosts, name)
+		}
+	}
+	for k := range s.vrrpLastEvent {
+		if !local[strings.SplitN(k, "\x00", 2)[0]] {
+			delete(s.vrrpLastEvent, k)
+		}
+	}
+	s.vrrpMu.Unlock()
+	s.refreshVRRPRefusedCondition(ctx)
+}
+
+// vrrpRefusedHere reports whether this host has refused the LB's unicast
+// transport.
+func (s *Server) vrrpRefusedHere(name string) bool {
+	s.vrrpMu.Lock()
+	defer s.vrrpMu.Unlock()
+	_, ok := s.vrrpRefusedLBs[name]
+	return ok
+}
+
+// vrrpPeerServing is the last answer of checkVRRPServing for the LB: another
+// LB host reported serving it on unicast. No answer yet is no.
+func (s *Server) vrrpPeerServing(name string) bool {
+	s.vrrpMu.Lock()
+	defer s.vrrpMu.Unlock()
+	return s.vrrpServing[name]
+}
+
+// kickVRRPServing asks checkVRRPServing for a pass now (never blocks).
+func (s *Server) kickVRRPServing() {
+	select {
+	case s.vrrpAskKick <- struct{}{}:
+	default:
+	}
+}
+
+// vrrpUnicastServing reports whether this host serves the LB on unicast:
+// keepalived running from a unicast config, and not refused here. It is
+// what CheckLBPresent answers as vrrp_unicast_serving.
+func (s *Server) vrrpUnicastServing(name string) bool {
+	if s.vrrpRefusedHere(name) || !s.lbKeepalivedRunning(name) {
+		return false
+	}
+	var t lb.Transport
+	var ok bool
+	if s.lbRenderedTransportOverride != nil {
+		t, ok = s.lbRenderedTransportOverride(name)
+	} else {
+		t, ok = s.lbManager().KeepalivedTransport(name)
+	}
+	return ok && t.Unicast
+}
+
+// checkVRRPServing asks, for each LB this host has refused, its other hosts
+// whether one serves it on unicast (CheckLBPresent's vrrp_unicast_serving), in
+// parallel under one deadline, off the reconciler's loop. When an answer
+// changes it asks the reconciler for a pass, which stops or restarts this
+// host's keepalived for the LB (vrrpRefused). An unreachable host is not
+// serving.
+func (s *Server) checkVRRPServing(ctx context.Context) {
+	s.vrrpMu.Lock()
+	var refused []string
+	hostsOf := map[string][]string{}
+	for name := range s.vrrpRefusedLBs {
+		refused = append(refused, name)
+		hostsOf[name] = s.vrrpRefusedHosts[name]
+	}
+	s.vrrpMu.Unlock()
+	if len(refused) == 0 {
+		return
+	}
+	actx, cancel := context.WithTimeout(ctx, vrrpPeerAskTimeout)
 	defer cancel()
+	answers := map[string]bool{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	found := false
-	for _, h := range lbHosts {
-		if h == s.hostName {
-			continue
-		}
-		wg.Add(1)
-		go func(h string) {
-			defer wg.Done()
-			if s.peerVRRPState(ctx, h) == peerRenders {
-				mu.Lock()
-				found = true
-				mu.Unlock()
+	for _, name := range refused {
+		for _, h := range hostsOf[name] {
+			if h == s.hostName {
+				continue
 			}
-		}(h)
+			wg.Add(1)
+			go func(name, h string) {
+				defer wg.Done()
+				if s.peerServesLB(actx, h, name) {
+					mu.Lock()
+					answers[name] = true
+					mu.Unlock()
+				}
+			}(name, h)
+		}
 	}
 	wg.Wait()
-	return found
+	changed := false
+	s.vrrpMu.Lock()
+	if s.vrrpServing == nil {
+		s.vrrpServing = map[string]bool{}
+	}
+	for _, name := range refused {
+		if s.vrrpServing[name] != answers[name] {
+			changed = true
+		}
+		s.vrrpServing[name] = answers[name]
+	}
+	s.vrrpMu.Unlock()
+	if changed {
+		s.kickLBReconcile()
+	}
+}
+
+// peerServesLB asks host whether it serves lbName on unicast.
+func (s *Server) peerServesLB(ctx context.Context, host, lbName string) bool {
+	if s.lbServingOverride != nil {
+		return s.lbServingOverride(ctx, host, lbName)
+	}
+	c, closeConn, err := s.dialPeer(ctx, host)
+	if err != nil {
+		return false
+	}
+	defer closeConn()
+	resp, err := c.CheckLBPresent(ctx, &pb.CheckLBPresentRequest{LbName: lbName})
+	return err == nil && resp.GetVrrpUnicastServing()
 }
 
 // lbDemote stops this host's keepalived for an LB and removes its VIP.
@@ -383,16 +551,24 @@ func (s *Server) lbVRRPStale(ctx context.Context, rec corrosion.LBConfigRecord) 
 	return !have.Equal(want)
 }
 
-// runVRRPSplitCheck runs checkVRRPSplit every interval until ctx ends.
+// runVRRPSplitCheck runs checkVRRPSplit every interval, and checkVRRPServing
+// every vrrpWatchInterval (or interval, if shorter) and on a new refusal,
+// until ctx ends. Both Ping peers, so neither runs in the reconciler's loop.
 func (s *Server) runVRRPSplitCheck(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	serve := time.NewTicker(min(interval, vrrpWatchInterval))
+	defer serve.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 			s.checkVRRPSplit(ctx)
+		case <-serve.C:
+			s.checkVRRPServing(ctx)
+		case <-s.vrrpAskKick:
+			s.checkVRRPServing(ctx)
 		}
 	}
 }

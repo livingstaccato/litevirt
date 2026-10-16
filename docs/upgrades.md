@@ -1437,8 +1437,8 @@ Every LB host then re-applies its LBs within 2 seconds of that record reaching
 it, whatever its own flag says: an LB is held by both its hosts for about the
 replication delay between them plus 2 seconds. A host that cannot render unicast
 (its recorded address is on no up, non-loopback local device) raises
-`lb.vrrp.transport_refused` and stops its keepalived for each LB another host
-serves.
+`lb.vrrp.transport_refused`, stops its keepalived for each LB another host serves
+on unicast, and runs on multicast each LB no other host serves.
 Hosts must pass IP protocol 112 between their recorded addresses.
 
 The stand-down is cluster-wide: `lv cluster vrrp-transport multicast` (admin),

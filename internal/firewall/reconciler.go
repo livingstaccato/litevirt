@@ -591,9 +591,15 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		// NIC guards. A read failure fails the pass like any other, keeping
 		// the applied ruleset: dropping the guards instead would unguard every
 		// NIC on the host while the database is unreadable.
-		guards, err := corrosion.ListNICGuards(ctx, db)
+		allGuards, err := corrosion.ListNICGuardsWithDeleted(ctx, db)
 		if err != nil {
 			return plan, err
+		}
+		guards := make(map[string]corrosion.NICGuardRecord, len(allGuards))
+		for k, r := range allGuards {
+			if !r.Deleted {
+				guards[k] = r
+			}
 		}
 		nets, err := corrosion.NetworkGuardInfos(ctx, db)
 		if err != nil {
@@ -633,9 +639,18 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		// recordOf is the NIC's guard record — only one written for the
 		// incarnation that runs now: a record an earlier VM of the same name
 		// and MAC left guards nothing (re-review m1).
+		//
+		// A NIC rendered here has a live row (or is pending): a retired
+		// record of its incarnation over it is a write order this replica
+		// saw out of order, and guards it by default
+		// (corrosion.RetiredGuardOver).
 		recordOf := func(ifc corrosion.HostVMNIC) (corrosion.NICGuardRecord, bool) {
-			rec, ok := guards[corrosion.NICGuardKey(ifc.VMName, ifc.MAC)]
-			if ok && rec.VMUUID != "" && ifc.VMUUID != "" && rec.VMUUID != ifc.VMUUID {
+			key := corrosion.NICGuardKey(ifc.VMName, ifc.MAC)
+			rec, ok := guards[key]
+			if !ok {
+				return corrosion.RetiredGuardOver(allGuards[key], ifc.VMUUID, nets[ifc.NetworkName].Type, ifc.NetworkName)
+			}
+			if rec.VMUUID != "" && ifc.VMUUID != "" && rec.VMUUID != ifc.VMUUID {
 				return corrosion.NICGuardRecord{}, false
 			}
 			return rec, ok

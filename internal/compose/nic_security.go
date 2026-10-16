@@ -62,6 +62,10 @@ type LiveGuard struct {
 	AllowDHCPServer   bool
 	AllowRouterAdvert bool
 	AllowVLANTags     bool
+	// FailClosed, when set, says the NIC runs under the default guard a
+	// retired record of its VM imposes over its live row, and why
+	// (corrosion.RetiredGuardOver); the plan notes it.
+	FailClosed string
 }
 
 // LiveNIC is one NIC of a VM as its rows have it now. Guard is nil when the
@@ -457,18 +461,24 @@ func InvalidDeclaredGuard(att *pb.NetworkAttachment) string {
 // VM's NICs as enforced now (nil: only the stored spec is known); stored is
 // the overlaid stored spec Classify compared with.
 func ApplyNICSecurityGate(vm string, p *ChangePlan, desired, stored *pb.VMSpec, live []LiveNIC, gate NICSecurityGate) []string {
-	if len(p.NICSecurity) == 0 {
-		return nil
+	var failClosed []string
+	for _, n := range live {
+		if n.Guard != nil && n.Guard.FailClosed != "" {
+			failClosed = append(failClosed, fmt.Sprintf("nic %d (%s) runs under the %s", n.Ordinal, n.Network, n.Guard.FailClosed))
+		}
 	}
+	if len(p.NICSecurity) == 0 {
+		return failClosed
+	}
+	warnings := failClosed
 	if p.Max() == ActionRecreate || len(p.NotReconfigurable) > 0 {
 		// The recreate makes the NICs from the file, as it always has.
 		var out []string
 		for _, w := range p.Weakens() {
 			out = append(out, "the recreate applies the file's NIC security, which "+w)
 		}
-		return out
+		return append(failClosed, out...)
 	}
-	var warnings []string
 	withheld := map[string]bool{}
 	notEnforced := func(c NICSecurityChange, why string) {
 		withheld[c.Field] = true

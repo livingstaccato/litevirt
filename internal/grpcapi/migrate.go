@@ -673,7 +673,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// The target puts the guest's NIC firewall — its guards above all — in
 	// force before the guest arrives, under the tap names its MACs fix
 	// (re-review I-10). Before anything is written, so a refusal changes
-	// nothing.
+	// nothing. A guard record an earlier build left for a NIC the VM no
+	// longer has is retired first: no target could put it in force.
+	s.retireOrphanNICGuards(ctx, vm.Name, "")
 	armed, aerr := s.armMigrationTarget(ctx, targetHost, vm.Name)
 	if aerr != nil {
 		return aerr

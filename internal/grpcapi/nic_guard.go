@@ -675,6 +675,9 @@ func gateFailure(err error) (codes.Code, error) {
 	if st, ok := status.FromError(err); ok && st.Code() != codes.Unknown {
 		return st.Code(), errors.New(st.Message())
 	}
+	if errors.Is(err, corrosion.ErrNICStampSkewed) {
+		return codes.FailedPrecondition, err
+	}
 	return codes.Internal, err
 }
 
@@ -837,7 +840,7 @@ func (s *Server) putNICGuard(ctx context.Context, tgt guardTarget, mode string, 
 			return nil, st.Err() // the release gate's refusal, unchanged
 		}
 		switch {
-		case errors.Is(err, corrosion.ErrClusterPolicyGateClosed):
+		case errors.Is(err, corrosion.ErrClusterPolicyGateClosed), errors.Is(err, corrosion.ErrNICStampSkewed):
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
 		default:
 			return nil, status.Errorf(codes.InvalidArgument, "set NIC guard: %v", err)
@@ -957,9 +960,15 @@ func (s *Server) ListNICGuards(ctx context.Context, req *pb.ListNICGuardsRequest
 			}
 		}
 	}
-	guards, err := corrosion.ListNICGuards(ctx, s.db)
+	all, err := corrosion.ListNICGuardsWithDeleted(ctx, s.db)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "read NIC guards: %v", err)
+	}
+	guards := make(map[string]corrosion.NICGuardRecord, len(all))
+	for k, r := range all {
+		if !r.Deleted {
+			guards[k] = r
+		}
 	}
 	nets, err := corrosion.NetworkGuardInfos(ctx, s.db)
 	if err != nil {
@@ -973,11 +982,20 @@ func (s *Server) ListNICGuards(ctx context.Context, req *pb.ListNICGuardsRequest
 		}
 		sort.Slice(nics, func(i, j int) bool { return nics[i].Ordinal < nics[j].Ordinal })
 		for _, n := range nics {
-			var rec *corrosion.NICGuardRecord
-			if r, ok := guards[corrosion.NICGuardKey(vm.Name, n.MAC)]; ok {
-				rec = &r
+			key := corrosion.NICGuardKey(vm.Name, n.MAC)
+			if r, ok := guards[key]; ok {
+				out.Guards = append(out.Guards, nicGuardToPb(vm.Name, n, &r, nets))
+				continue
 			}
-			out.Guards = append(out.Guards, nicGuardToPb(vm.Name, n, rec, nets))
+			// The default guard the firewall renders over a retired record
+			// (corrosion.RetiredGuardOver), marked as such.
+			if r, ok := corrosion.RetiredGuardOver(all[key], specUUID(vm.Spec), nets[n.NetworkName].Type, n.NetworkName); ok {
+				g := nicGuardToPb(vm.Name, n, &r, nets)
+				g.Note = corrosion.RetiredGuardNote(vm.Name, n.MAC)
+				out.Guards = append(out.Guards, g)
+				continue
+			}
+			out.Guards = append(out.Guards, nicGuardToPb(vm.Name, n, nil, nets))
 		}
 	}
 	if req.GetVmName() != "" {

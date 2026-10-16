@@ -195,7 +195,9 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	// The epoch-carrying out-of-band spec edit. Only emitted once
 	// spec_conflict_v1 has latched, and only this build knows it.
 	{SQL: vmSpecMutateAtEpochSQL, Disposition: DispSpecGeneration},
-	{SQL: vmOperationClearSQL, Disposition: DispLiveRowUpdate},
+	// Likewise the clear: once spec_conflict_v1 is active its guard, not the
+	// row's clock, orders it (spec_conflict_apply.go).
+	{SQL: vmOperationClearSQL, Disposition: DispLiveRowUpdate, RequiresCapability: capabilities.SpecConflictV1, DispositionAfter: DispSpecGeneration},
 	// Host re-admission over a tombstone: applied through its reset form on
 	// the origin and every receiver, so the new machine inherits no per-host
 	// setting of the one removed under its name. The wire shape is unchanged

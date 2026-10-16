@@ -58,14 +58,13 @@ func (c *Client) SpecConflictOn() bool {
 
 // specEditDrop is one desired-spec edit a conflict resolution dropped.
 type specEditDrop struct {
-	vm, host   string
-	epoch, gen int64 // the kept version's owner epoch and generation
-	reason     string
-	path       resolveTiePath
-	keptAt     string // updated_at of the version kept
-	droppedAt  string // updated_at of the edit dropped
-	// droppedSpec is the dropped edit's whole spec, so it can be made again.
-	droppedSpec string
+	vm, host string
+	gen      int64 // the generation the dropped edit wrote
+	reason   string
+	path     resolveTiePath
+	// droppedSpec is the dropped edit's whole spec, so it can be made again;
+	// keptSpec the version kept in its place.
+	droppedSpec, keptSpec string
 }
 
 // SpecEditDroppedEvent is the vm_events type that records a dropped spec edit.
@@ -73,10 +72,11 @@ const SpecEditDroppedEvent = "vm.spec_edit_dropped"
 
 // specDropReasonText says what each reason means, for the event's detail.
 var specDropReasonText = map[string]string{
-	specDropStaleEpoch: "it was made under an owner the VM has since moved from",
-	specDropOperation:  "an operation on the VM held its barrier at that generation",
-	specDropLaterEdit:  "a later edit was made from the same generation",
-	specDropTie:        "another edit was made from the same generation at the same instant; the one on each host stands until one is made again",
+	specDropStaleEpoch:   "it was made under an owner the VM has since moved from",
+	specDropOperation:    "an operation on the VM held its barrier at that generation",
+	specDropLaterEdit:    "a later edit was made from the same generation",
+	specDropContentOrder: "another edit was made from the same generation with no later stamp; the one whose content orders higher was kept",
+	specDropNewerGen:     "an edit made from another version of the spec has since reached a later generation",
 }
 
 // specDropDetailMax bounds the dropped spec quoted in an event's detail.
@@ -89,8 +89,8 @@ const specDropDetailMax = 4096
 func (c *Client) noteSpecEditDropped(tx *sql.Tx, d specEditDrop) {
 	c.deferAfterCommit(tx, func() {
 		slog.Warn("replication: a concurrent edit of a VM's spec was dropped",
-			"vm", d.vm, "generation", d.gen, "owner_epoch", d.epoch, "reason", d.reason, "path", string(d.path),
-			"kept_updated_at", d.keptAt, "dropped_updated_at", d.droppedAt)
+			"vm", d.vm, "generation", d.gen, "reason", d.reason, "path", string(d.path),
+			"dropped_edit_at", specMetaOf(d.droppedSpec).At, "kept_edit_at", specMetaOf(d.keptSpec).At)
 		c.observeMergeRejected("vms", string(d.path), "spec_edit_dropped")
 		// Not here: the deferred effects run under the client's lock, which
 		// the event's own replicated write takes.
@@ -98,21 +98,25 @@ func (c *Client) noteSpecEditDropped(tx *sql.Tx, d specEditDrop) {
 	})
 }
 
-// specEditDroppedRecord is d's event. Every host that drops the same edit —
-// on either lane — derives the same record, so the replicated rows collapse
-// into one (vm_events is INSERT OR IGNORE on its id).
+// specEditDroppedRecord is d's event. It is keyed on the dropped edit alone —
+// the VM, the generation it wrote and its content — so every host that drops
+// it, on either lane and for whichever reason, derives the same id and the
+// replicated rows collapse into one (vm_events is INSERT OR IGNORE on its id).
 func specEditDroppedRecord(d specEditDrop) VMEventRecord {
 	sum := sha256.Sum256([]byte(strings.Join([]string{
-		SpecEditDroppedEvent, d.vm, strconv.FormatInt(d.gen, 10), d.droppedAt, d.droppedSpec,
+		SpecEditDroppedEvent, d.vm, strconv.FormatInt(d.gen, 10), specContentHash(d.droppedSpec),
 	}, "\x00")))
+	dropped, kept := specMetaOf(d.droppedSpec).At, specMetaOf(d.keptSpec).At
 	ts := ""
-	if t, ok := parseInstant(d.keptAt); ok {
-		if dt, dok := parseInstant(d.droppedAt); dok && dt.After(t) {
-			t = dt
+	for _, at := range []string{dropped, kept} {
+		if t, ok := parseInstant(at); ok && (ts == "" || t.UTC().Format(nowTSLayout) > ts) {
+			ts = t.UTC().Format(nowTSLayout)
 		}
-		ts = t.UTC().Format(nowTSLayout)
 	}
-	spec := d.droppedSpec
+	if dropped == "" {
+		dropped = "an unrecorded time"
+	}
+	spec := string(specCanonical(d.droppedSpec))
 	if len(spec) > specDropDetailMax {
 		spec = spec[:specDropDetailMax] + "…"
 	}
@@ -127,8 +131,8 @@ func specEditDroppedRecord(d specEditDrop) VMEventRecord {
 		Type:     SpecEditDroppedEvent,
 		Result:   "error",
 		Severity: "warn",
-		Detail: fmt.Sprintf("an edit of the spec made at %s was dropped at generation %d: %s; the version made at %s was kept. "+
-			"Make the edit again if it is still wanted. Dropped spec: %s", d.droppedAt, d.gen, why, d.keptAt, spec),
+		Detail: fmt.Sprintf("an edit of the spec made at %s was dropped at generation %d: %s. "+
+			"Make the edit again if it is still wanted. Dropped spec: %s", dropped, d.gen, why, spec),
 		TS: ts,
 	}
 }

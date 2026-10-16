@@ -1399,8 +1399,9 @@ cannot be reached still takes the edit where it entered. Once the
 `spec_conflict_v1` capability token has latched — on its own, once every host
 the cluster replicates to, including one parked in `maintenance`, runs this
 release — an edit also carries the owner epoch it was made at, a statement a
-host on the previous release cannot decode, and every host resolves two edits
-at one generation the same way (see
+host on the previous release cannot decode, records in the spec (`spec_edit`)
+when it was made and the content it was made from, and every host resolves
+two edits at one generation the same way (see
 [operating-model.md](operating-model.md#replication)). Until then edits are
 replicated exactly as before.
 

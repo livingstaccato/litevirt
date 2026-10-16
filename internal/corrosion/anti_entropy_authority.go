@@ -307,7 +307,13 @@ func (c *Client) antiEntropyAuthorityDecision(tx *sql.Tx, table syncTable, row [
 		if !a.valid {
 			return mergeAuthorityKeepLocal, nil
 		}
-		return c.workloadParentAuthorityDecision(tx, a)
+		decision, err := c.workloadParentAuthorityDecision(tx, a)
+		if err != nil || !c.SpecConflictOn() {
+			return decision, err
+		}
+		// Two versions of the spec are ordered as on the WAL, not by the
+		// row's clock (spec_conflict_ae.go).
+		return c.specConflictAE(tx, table, row, a, decision)
 	case table.Name == "containers":
 		hostIdx, nameIdx := indexOf(table.Columns, "host_name"), indexOf(table.Columns, "name")
 		if hostIdx < 0 || nameIdx < 0 {
@@ -436,12 +442,6 @@ func (c *Client) workloadParentAuthorityDecision(tx *sql.Tx, incoming workloadMe
 		}
 	}
 
-	if incoming.kind == "vm" && !localIsDeleted && !incoming.deleted &&
-		localGeneration == incoming.generation && c.SpecConflictOn() {
-		if decision, decided, serr := c.specConflictAEDecision(tx, incoming, localOwner, localActiveOp); serr != nil || decided {
-			return decision, serr
-		}
-	}
 	switch {
 	case localOwner == incoming.ownerEpoch && localGeneration == incoming.generation:
 		if localIsDeleted && !incoming.deleted {

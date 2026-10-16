@@ -149,7 +149,7 @@ func TestSpecConflict_SiblingEditsConvergeOnTheLaterEdit(t *testing.T) {
 	want := vmSpecOn(t, b)
 	for _, p := range peers {
 		got := vmSpecOn(t, p)
-		if got.Spec != `{"cpu":2,"labels":{"tier":"front"}}` || got.SpecGeneration != 1 || got.UpdatedAt != want.UpdatedAt {
+		if content(got.Spec) != `{"cpu":2,"labels":{"tier":"front"}}` || got.SpecGeneration != 1 || got.UpdatedAt != want.UpdatedAt {
 			t.Errorf("%s holds %s@%d (%s), want b's later edit at 1 (%s)", p.name, got.Spec, got.SpecGeneration, got.UpdatedAt, want.UpdatedAt)
 		}
 	}
@@ -182,7 +182,7 @@ func TestSpecConflict_AnOperationsClaimBeatsAnOutOfBandEditAtItsGeneration(t *te
 	applyWAL(t, c.r, eb)
 	applyWAL(t, c.r, ea)
 	for _, p := range peers {
-		if got := vmSpecOn(t, p); got.Spec != `{"cpu":4}` || got.ActiveOperationID != "op-1" {
+		if got := vmSpecOn(t, p); content(got.Spec) != `{"cpu":4}` || got.ActiveOperationID != "op-1" {
 			t.Errorf("%s holds %s with barrier %q mid-operation, want the claim's spec under op-1", p.name, got.Spec, got.ActiveOperationID)
 		}
 	}
@@ -194,7 +194,7 @@ func TestSpecConflict_AnOperationsClaimBeatsAnOutOfBandEditAtItsGeneration(t *te
 	applyWAL(t, b.r, ec)
 	applyWAL(t, c.r, ec)
 	for _, p := range peers {
-		if got := vmSpecOn(t, p); got.Spec != `{"cpu":4}` || got.ActiveOperationID != "" {
+		if got := vmSpecOn(t, p); content(got.Spec) != `{"cpu":4}` || got.ActiveOperationID != "" {
 			t.Errorf("%s after completion: %s, barrier %q", p.name, got.Spec, got.ActiveOperationID)
 		}
 	}
@@ -218,37 +218,53 @@ func TestSpecConflict_BeforeTheLatchAClaimMeetingAnEditMissesAsBefore(t *testing
 	}
 }
 
+func content(spec string) string { return string(specCanonical(spec)) }
+
 func TestResolveSpecEdit(t *testing.T) {
 	const t1, t2 = "2026-10-16T10:00:00.000000001Z", "2026-10-16T10:00:00.000000002Z"
-	row := func(epoch, gen int64, op, spec, ts string) specRow {
-		return specRow{epoch: epoch, gen: gen, activeOp: op, spec: spec, updatedAt: ts}
+	const base = `{"cpu":2}`
+	at := func(spec, ts string) string { return stampSpec(spec, base, ts) }
+	A, B := at(`{"cpu":4}`, t1), at(`{"cpu":6}`, t2)
+	row := func(epoch, gen int64, op, spec string) specRow {
+		return specRow{epoch: epoch, gen: gen, activeOp: op, spec: spec}
 	}
-	edit := func(epoch, from int64, op, spec, ts string) specEdit {
-		return specEdit{epoch: epoch, fromGen: from, opID: op, spec: spec, updatedAt: ts}
+	edit := func(epoch, from int64, op, spec string) specEdit {
+		return specEdit{epoch: epoch, fromGen: from, opID: op, spec: spec}
+	}
+	none := func(string) bool { return false }
+	all := func(string) bool { return true }
+	hi, lo := `{"cpu":8}`, `{"cpu":9}` // unstamped: ordered by content hash alone
+	if specContentHash(hi) < specContentHash(lo) {
+		hi, lo = lo, hi
 	}
 	cases := []struct {
 		name     string
 		local    specRow
 		in       specEdit
-		finished bool
+		finished func(string) bool
 		want     specDecision
 	}{
-		{"no sibling", row(1, 3, "", "A", t1), edit(1, 3, "", "B", t2), false, specDecision{verdict: specApplyAsBefore}},
-		{"no sibling, superseded owner", row(2, 3, "", "A", t1), edit(1, 3, "", "B", t2), false, specDecision{specKeepLocal, specDropStaleEpoch}},
-		{"row ahead by two", row(1, 5, "", "A", t1), edit(1, 3, "", "B", t2), false, specDecision{verdict: specApplyAsBefore}},
-		{"row behind", row(1, 2, "", "A", t1), edit(1, 3, "", "B", t2), false, specDecision{verdict: specApplyAsBefore}},
-		{"this edit, already here", row(1, 4, "", "B", t2), edit(1, 3, "", "B", t2), false, specDecision{verdict: specKeepLocal}},
-		{"sibling from a superseded owner", row(2, 4, "", "A", t1), edit(1, 3, "", "B", t2), false, specDecision{specKeepLocal, specDropStaleEpoch}},
-		{"sibling from a newer owner", row(1, 4, "", "A", t2), edit(2, 3, "", "B", t1), false, specDecision{verdict: specApplyAsBefore}},
-		{"later edit wins", row(1, 4, "", "A", t1), edit(1, 3, "", "B", t2), false, specDecision{specTakeEdit, specDropLaterEdit}},
-		{"earlier edit loses", row(1, 4, "", "A", t2), edit(1, 3, "", "B", t1), false, specDecision{specKeepLocal, specDropLaterEdit}},
-		{"exact tie keeps local", row(1, 4, "", "A", t1), edit(1, 3, "", "B", t1), false, specDecision{specKeepLocal, specDropTie}},
-		{"same spec drops nothing", row(1, 4, "", "B", t1), edit(1, 3, "", "B", t2), false, specDecision{verdict: specTakeEdit}},
-		{"barrier beats a later edit", row(1, 4, "op", "A", t1), edit(1, 3, "", "B", t2), false, specDecision{specKeepLocal, specDropOperation}},
-		{"claim beats a later edit", row(1, 4, "", "A", t2), edit(1, 3, "op", "B", t1), false, specDecision{specTakeEdit, specDropOperation}},
-		{"a finished claim changes nothing", row(1, 4, "", "B", t2), edit(1, 3, "op", "B", t1), true, specDecision{verdict: specKeepLocal}},
-		{"its own claim", row(1, 4, "op", "B", t2), edit(1, 3, "op", "B", t1), false, specDecision{verdict: specKeepLocal}},
-		{"another operation's barrier", row(1, 4, "op2", "A", t1), edit(1, 3, "op", "B", t2), false, specDecision{specKeepLocal, specDropOperation}},
+		{"no sibling", row(1, 3, "", base), edit(1, 3, "", A), none, specDecision{verdict: specApplyByGeneration}},
+		{"no sibling, another lineage", row(1, 3, "", lo), edit(1, 3, "", A), none, specDecision{specApplyByGeneration, specDropNewerGen}},
+		{"no sibling, superseded owner", row(2, 3, "", base), edit(1, 3, "", A), none, specDecision{specKeepLocal, specDropStaleEpoch}},
+		{"row ahead, descends from the edit", row(1, 5, "", stampSpec(`{"cpu":7}`, A, t2)), edit(1, 3, "", A), none, specDecision{verdict: specKeepLocal}},
+		{"row ahead on another lineage", row(1, 5, "", stampSpec(`{"cpu":7}`, B, t2)), edit(1, 3, "", A), none, specDecision{specKeepLocal, specDropNewerGen}},
+		{"row ahead, lineage unknown", row(1, 5, "", `{"cpu":7}`), edit(1, 3, "", A), none, specDecision{verdict: specKeepLocal}},
+		{"row behind", row(1, 2, "", base), edit(1, 3, "", A), none, specDecision{verdict: specApplyByGeneration}},
+		{"this edit, already here", row(1, 4, "", B), edit(1, 3, "", B), none, specDecision{verdict: specKeepLocal}},
+		{"sibling from a superseded owner", row(2, 4, "", A), edit(1, 3, "", B), none, specDecision{specKeepLocal, specDropStaleEpoch}},
+		{"sibling from a newer owner", row(1, 4, "", B), edit(2, 3, "", A), none, specDecision{verdict: specApplyByGeneration}},
+		{"later edit stamp wins", row(1, 4, "", A), edit(1, 3, "", B), none, specDecision{specTakeEdit, specDropLaterEdit}},
+		{"earlier edit stamp loses", row(1, 4, "", B), edit(1, 3, "", A), none, specDecision{specKeepLocal, specDropLaterEdit}},
+		{"a stamp beats none", row(1, 4, "", hi), edit(1, 3, "", A), none, specDecision{specTakeEdit, specDropLaterEdit}},
+		{"no stamps: the greater content wins", row(1, 4, "", lo), edit(1, 3, "", hi), none, specDecision{specTakeEdit, specDropContentOrder}},
+		{"no stamps: the lesser content loses", row(1, 4, "", hi), edit(1, 3, "", lo), none, specDecision{specKeepLocal, specDropContentOrder}},
+		{"barrier beats a later edit", row(1, 4, "op", A), edit(1, 3, "", B), none, specDecision{specKeepLocal, specDropOperation}},
+		{"barrier beats the same content", row(1, 4, "op", A), edit(1, 3, "", at(`{"cpu":4}`, t2)), none, specDecision{verdict: specKeepLocal}},
+		{"a finished barrier does not stand", row(1, 4, "op", A), edit(1, 3, "", B), all, specDecision{specTakeEdit, specDropLaterEdit}},
+		{"claim beats a later edit", row(1, 4, "", B), edit(1, 3, "op", A), none, specDecision{specTakeEdit, specDropOperation}},
+		{"its own claim", row(1, 4, "op", A), edit(1, 3, "op", A), none, specDecision{verdict: specKeepLocal}},
+		{"another operation's barrier, later edit", row(1, 4, "op2", A), edit(1, 3, "op", B), none, specDecision{specTakeEdit, specDropLaterEdit}},
 	}
 	for _, tc := range cases {
 		if got := resolveSpecEdit(tc.local, tc.in, tc.finished); got != tc.want {
@@ -283,7 +299,7 @@ func TestSpecConflictAE_AnOutOfBandEditNeverOverwritesABarrier(t *testing.T) {
 	mergeFrom(t, a, b)
 	mergeFrom(t, b, a)
 	for _, p := range peers {
-		if got := vmSpecOn(t, p); got.Spec != `{"cpu":4}` || got.ActiveOperationID != "op-1" {
+		if got := vmSpecOn(t, p); content(got.Spec) != `{"cpu":4}` || got.ActiveOperationID != "op-1" {
 			t.Errorf("%s after anti-entropy: %s, barrier %q; want the claim under op-1", p.name, got.Spec, got.ActiveOperationID)
 		}
 	}
@@ -295,8 +311,9 @@ func TestSpecConflictAE_AnOutOfBandEditNeverOverwritesABarrier(t *testing.T) {
 // The barrier rule holds only while the operation is in flight. b holds op-1's
 // claim, heard by the WAL; c, on the previous release's resolution, kept its
 // own later edit at the same generation and has heard op-1 complete. Once a
-// side records op-1's terminal step the barrier no longer stands, and the
-// clocks decide: c's later edit replaces the finished claim on b.
+// side records op-1's terminal step the barrier no longer stands: the stamps
+// decide — c's edit, made before the latch, has none and orders first — and
+// the finished operation's barrier is released, not carried on.
 func TestSpecConflictAE_AFinishedOperationsBarrierNoLongerStands(t *testing.T) {
 	peers := newSpecPeers(t, true, "a", "b")
 	a, b := peers[0], peers[1]
@@ -327,8 +344,8 @@ func TestSpecConflictAE_AFinishedOperationsBarrierNoLongerStands(t *testing.T) {
 		t.Fatalf("premise: c holds %s with barrier %q, want its own edit", got.Spec, got.ActiveOperationID)
 	}
 	mergeFrom(t, b, c)
-	if got := vmSpecOn(t, b); got.ActiveOperationID != "" || !strings.Contains(got.Spec, "tier") {
-		t.Errorf("b after anti-entropy: %s, barrier %q; want c's later edit over the finished claim", got.Spec, got.ActiveOperationID)
+	if got := vmSpecOn(t, b); got.ActiveOperationID != "" || content(got.Spec) != `{"cpu":4}` {
+		t.Errorf("b after anti-entropy: %s, barrier %q; want the finished claim's spec with its barrier released", got.Spec, got.ActiveOperationID)
 	}
 }
 

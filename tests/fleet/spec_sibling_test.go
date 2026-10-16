@@ -267,3 +267,43 @@ func waitWritesApplied(t *testing.T, c *Cluster, timeout time.Duration) {
 		}
 	}
 }
+
+// The review's C1 across a real partition: the owner edits, node-1 (cut off)
+// edits later, and the owner then writes the VM's state, which moves the row
+// clock past node-1's edit. The replicas agree over the WAL on node-1's later
+// edit, and the owner's cpu edit is the only one recorded as dropped.
+//
+// Red on 58f7754f: the owner keeps its edit on the strength of the state
+// write's clock, node-1 keeps its own, and anti-entropy leaves the tie.
+func TestFleet_AStateWriteBetweenTheEditsDoesNotSplitTheSpec(t *testing.T) {
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
+	latchSpecConflict(t, c, nil, nil)
+	a, b := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	insertVM(t, a, "vm-sib", a.Name)
+	c.WaitConverged(t, convergeTimeout)
+	cutOffFully(c, b)
+	ownerCPU4(t)(ctx, a)
+	time.Sleep(20 * time.Millisecond)
+	if _, err := c.SelfClient(b).SetVMLabels(ctx, &pb.SetVMLabelsRequest{Name: "vm-sib", Labels: map[string]string{"tier": "front"}}); err != nil {
+		t.Fatalf("SetVMLabels via %s: %v", b.Name, err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if err := corrosion.UpdateVMState(ctx, a.DB, "vm-sib", "stopped", ""); err != nil {
+		t.Fatalf("the owner's state write: %v", err)
+	}
+	c.ClearLinkFaults()
+	c.WaitConverged(t, convergeTimeout)
+	for _, n := range c.Nodes {
+		if vm := vmOn(t, n, "vm-sib"); !strings.Contains(vm.Spec, `"tier":"front"`) || vm.State != "stopped" {
+			t.Errorf("%s holds %s (%s), want node-1's later edit and the owner's state", n.Name, vm.Spec, vm.State)
+		}
+	}
+	for _, n := range c.Nodes {
+		n := n
+		eventually(t, convergeTimeout, n.Name+" to record the owner's dropped cpu edit, and only it", func() bool {
+			evs := droppedEventsOn(t, n, "vm-sib")
+			return len(evs) == 1 && strings.Contains(evs[0].Detail, `"cpu":4`) && !strings.Contains(evs[0].Detail, "tier")
+		})
+	}
+}

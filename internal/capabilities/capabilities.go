@@ -431,7 +431,11 @@ const (
 	//     statement shape a previous-release peer has no ledger entry for;
 	//   - the WAL resolves an edit that meets another at its generation as
 	//     anti-entropy does: the higher owner epoch, then an operation's
-	//     barrier over an out-of-band edit, then the later edit;
+	//     barrier over an out-of-band edit, then the later edit by the edit
+	//     time stamped inside the spec, then the greater content hash;
+	//   - every spec edit stamps that time, and the content it was made from,
+	//     into the spec document, so a version lost to a longer line of edits
+	//     on the other side is recognised and recorded too;
 	//   - neither path overwrites a row whose operation is in flight with an
 	//     out-of-band edit at the same generation;
 	//   - an edit dropped by either path is recorded (a vm_events row and

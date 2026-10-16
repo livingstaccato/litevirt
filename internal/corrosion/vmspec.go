@@ -62,11 +62,18 @@ func MutateDesiredSpec(ctx context.Context, c *Client, name string, fn func(oldS
 		// Once spec_conflict_v1 has latched the edit also names the owner
 		// epoch it was made at, so a receiver can resolve it against another
 		// edit at this generation (spec_conflict.go).
+		// It also stamps the spec with when it was edited and the content it
+		// was made from (spec_stamp.go); an edit that changes nothing but the
+		// stamp is a no-op.
 		var n int64
 		var uerr error
 		if c.SpecConflictOn() {
+			if specContentHash(newSpec) == specContentHash(oldSpec) {
+				return true, specGen, nil
+			}
+			now := c.NowTS()
 			n, uerr = c.ExecuteRowsStrict(ctx, vmSpecMutateAtEpochSQL,
-				newSpec, c.NowTS(), name, rows[0].Int64("vm_owner_epoch"), specGen)
+				stampSpec(newSpec, oldSpec, now), now, name, rows[0].Int64("vm_owner_epoch"), specGen)
 		} else {
 			n, uerr = c.ExecuteRowsStrict(ctx, vmSpecMutateSQL, newSpec, c.NowTS(), name, specGen)
 		}

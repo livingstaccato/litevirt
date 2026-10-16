@@ -253,6 +253,18 @@ func (c *Client) BeginVMOperation(ctx context.Context, op OperationRecord, desir
 		return false, err
 	}
 	now := c.NowTS()
+	if c.SpecConflictOn() {
+		// The claim stamps the spec with when it was edited and the content
+		// it was made from (spec_stamp.go). Read here, outside the guard: a
+		// row that moved meanwhile fails the guard's generation check.
+		rows, err := c.Query(ctx, `SELECT spec FROM vms WHERE name = ? AND deleted_at IS NULL`, op.ResourceID)
+		if err != nil {
+			return false, err
+		}
+		if len(rows) > 0 {
+			desiredSpec = stampSpec(desiredSpec, rows[0].String("spec"), now)
+		}
+	}
 	guard := func(tx *sql.Tx) (bool, error) {
 		var ownerEpoch, specGen int64
 		var activeOp string

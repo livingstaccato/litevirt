@@ -4,36 +4,35 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"time"
 )
 
-// Resolving a desired-spec edit that meets another at its generation, on the
-// WAL lane (spec_conflict.go explains the conflict).
+// Resolving desired-spec edits on the WAL lane once spec_conflict_v1 is
+// active (spec_conflict.go explains the conflict, spec_stamp.go the stamp).
 //
-// A received edit E→E+1 whose row here is already at E+1 meets a sibling: an
-// edit made from the same generation somewhere else. Before spec_conflict_v1
-// its compare-and-swap missed and it applied as a zero-row no-op, so each
-// replica kept whichever sibling reached it first. Now it is resolved the way
-// anti-entropy resolves the two rows (workloadParentAuthorityDecision), so the
-// WAL converges every replica on the version anti-entropy would keep:
+// The generation is the order of spec edits, so an edit, an operation's claim
+// and its clear apply by their generation guard, not by the row's clock: an
+// unrelated state write that reached the row first no longer makes a replica
+// skip an edit every other replica applied. A received edit E→E+1 whose row
+// is already at E+1 meets a sibling, and the two are ordered as anti-entropy
+// orders them (specOrder), so every replica keeps the same version whatever
+// order it hears them in:
 //
-//  1. the higher owner epoch. An edit made under a superseded owner loses. An
-//     edit from a newer owner than this replica knows is left to anti-entropy,
-//     which carries the newer owner's whole row; the statement alone cannot.
-//  2. an operation's barrier. An out-of-band edit never overwrites a row whose
-//     operation is in flight, and an operation's claim overwrites an
-//     out-of-band edit at its generation. A claim whose operation has already
-//     finished here changes nothing: the row is past it.
-//  3. the later edit, by updated_at. An exact tie keeps the local version, as
-//     the tie resolver does for a differing spec (an unresolved tie).
+//  1. the higher owner epoch. An edit from an owner newer than this replica
+//     knows is left to anti-entropy, which carries that owner's whole row;
+//  2. an operation's barrier, while the operation has not finished: it is
+//     never overwritten by an out-of-band edit, and a claim replaces one;
+//  3. the later edit stamp (when the spec was edited — never the row clock);
+//  4. the greater content hash, so no two versions are left unresolved.
 //
-// The losing edit is recorded (noteSpecEditDropped). Everything else — an edit
-// that meets its own generation, a row ahead by more than one, a tombstone, a
-// row that has not arrived — applies exactly as DispLiveRowUpdate does.
+// An edit that loses is recorded (noteSpecEditDropped), and so is an edit
+// that disappears because the other side's line of edits reached a later
+// generation: an edit arriving behind the row, and the version an edit from
+// another lineage replaces (both judged from the stamp's lineage).
 
 var (
 	fpSpecMutateAtEpoch = mustFingerprint(vmSpecMutateAtEpochSQL)
 	fpOperationBegin    = mustFingerprint(vmOperationBeginSQL)
+	fpOperationClear    = mustFingerprint(vmOperationClearSQL)
 )
 
 func mustFingerprint(sql string) string {
@@ -44,16 +43,13 @@ func mustFingerprint(sql string) string {
 	return fp
 }
 
-// The forms a receiver applies when the received edit wins against a sibling:
-// the edit's own assignments without the generation bump, guarded on the
-// sibling's generation. Local only — never logged or relayed; the received
-// statement is what travels on.
-const (
-	specSiblingTakeEditSQL = `UPDATE vms SET spec = ?, updated_at = ?
-		WHERE name = ? AND vm_owner_epoch = ? AND spec_generation = ? AND active_operation_id = '' AND deleted_at IS NULL`
-	specSiblingTakeClaimSQL = `UPDATE vms SET spec = ?, active_operation_id = ?, updated_at = ?
-		WHERE name = ? AND vm_owner_epoch = ? AND spec_generation = ? AND active_operation_id = '' AND deleted_at IS NULL`
-)
+// specSiblingTakeSQL is what a receiver applies when the received edit wins
+// against the local sibling at its generation: the edit's spec, the barrier
+// it leaves, and the later of the two row clocks, guarded on the sibling it
+// replaces. Local only — never logged or relayed; the received statement is
+// what travels on.
+const specSiblingTakeSQL = `UPDATE vms SET spec = ?, active_operation_id = ?, updated_at = ?
+	WHERE name = ? AND vm_owner_epoch = ? AND spec_generation = ? AND active_operation_id = ? AND deleted_at IS NULL`
 
 // specEdit is a received desired-spec edit.
 type specEdit struct {
@@ -61,12 +57,13 @@ type specEdit struct {
 	epoch     int64 // the owner epoch it was made at
 	fromGen   int64 // the generation it was made from; it writes fromGen+1
 	spec      string
-	updatedAt string
+	updatedAt string // the statement's row clock; only ever clamped, never compared
 	opID      string // the operation claiming the barrier; "" for an out-of-band edit
 }
 
 // specRow is the local row an edit meets.
 type specRow struct {
+	name            string
 	epoch, gen      int64
 	activeOp        string
 	spec, updatedAt string
@@ -74,104 +71,136 @@ type specRow struct {
 	deleted         bool
 }
 
+// specVersion is one version of a spec at a generation, as specOrder sees it.
+type specVersion struct {
+	epoch int64
+	op    string // its barrier, "" for none
+	spec  string
+}
+
+// Why an edit was dropped. Bounded: they label a log line and an event.
+const (
+	specDropStaleEpoch   = "stale_owner_epoch"
+	specDropOperation    = "operation_in_progress"
+	specDropLaterEdit    = "later_edit"
+	specDropContentOrder = "content_order"
+	specDropNewerGen     = "newer_generation"
+)
+
+// specOrder orders two versions of a spec at one generation, the same way on
+// both lanes: inWins reports whether in is kept over local, and reason why
+// the other is dropped — "" when nothing of it is lost (the same content).
+// finished reports whether an operation has finished; a finished
+// operation's barrier no longer stands.
+func specOrder(local, in specVersion, finished func(op string) bool) (inWins bool, reason string) {
+	same := specContentHash(local.spec) == specContentHash(in.spec)
+	why := func(r string) string {
+		if same {
+			return ""
+		}
+		return r
+	}
+	switch {
+	case in.epoch > local.epoch:
+		return true, why(specDropStaleEpoch)
+	case in.epoch < local.epoch:
+		return false, why(specDropStaleEpoch)
+	}
+	localBarrier := local.op != "" && !finished(local.op)
+	inBarrier := in.op != "" && !finished(in.op)
+	switch {
+	case localBarrier && !inBarrier:
+		return false, why(specDropOperation)
+	case inBarrier && !localBarrier:
+		return true, why(specDropOperation)
+	}
+	switch ord := specStampOrder(local.spec, in.spec); {
+	case ord < 0:
+		return true, why(specDropLaterEdit)
+	case ord > 0:
+		return false, why(specDropLaterEdit)
+	}
+	if !same {
+		return specContentHash(in.spec) > specContentHash(local.spec), specDropContentOrder
+	}
+	// The same content at the same stamp, written differently: still one
+	// agreed version, so every replica holds the same bytes.
+	return in.spec > local.spec, ""
+}
+
 type specVerdict uint8
 
 const (
-	// specApplyAsBefore: no sibling to resolve; apply as DispLiveRowUpdate.
-	specApplyAsBefore specVerdict = iota
-	// specKeepLocal: the local version stands; the received edit changes nothing.
+	// specApplyByGeneration: apply the statement under its own guard,
+	// clamping the row clock; record reason (the local version) if it lands.
+	specApplyByGeneration specVerdict = iota
+	// specKeepLocal: the local version stands; record reason (the received
+	// edit) if set.
 	specKeepLocal
-	// specTakeEdit: the received edit replaces the local sibling.
+	// specTakeEdit: the received edit replaces the local sibling; record
+	// reason (the local version) if set.
 	specTakeEdit
-)
-
-// Why an edit was dropped. Bounded: they label a metric.
-const (
-	specDropStaleEpoch = "stale_owner_epoch"
-	specDropOperation  = "operation_in_progress"
-	specDropLaterEdit  = "later_edit"
-	specDropTie        = "unresolved_tie"
 )
 
 type specDecision struct {
 	verdict specVerdict
-	// reason is set when an edit is dropped: the received one under
-	// specKeepLocal, the local one under specTakeEdit.
-	reason string
+	reason  string
 }
 
 // resolveSpecEdit decides a received edit against the live local row.
-// opFinished reports whether the received claim's operation has already
-// finished here; it is consulted only for a claim.
-func resolveSpecEdit(local specRow, in specEdit, opFinished bool) specDecision {
-	keep := func(reason string) specDecision {
-		if local.spec == in.spec {
-			reason = "" // nothing of the edit is lost
-		}
-		return specDecision{verdict: specKeepLocal, reason: reason}
-	}
-	take := func(reason string) specDecision {
-		if local.spec == in.spec {
-			reason = ""
-		}
-		return specDecision{verdict: specTakeEdit, reason: reason}
-	}
+func resolveSpecEdit(local specRow, in specEdit, finished func(op string) bool) specDecision {
+	inHash, localHash := specContentHash(in.spec), specContentHash(local.spec)
 	switch {
 	case local.gen == in.fromGen:
-		// No sibling. An edit from a superseded owner still applies nowhere:
-		// its epoch guard misses, as anti-entropy keeps the newer owner's row.
 		if in.epoch < local.epoch {
-			return keep(specDropStaleEpoch)
+			// Its epoch guard misses, as anti-entropy keeps the newer owner's row.
+			if inHash == localHash {
+				return specDecision{verdict: specKeepLocal}
+			}
+			return specDecision{verdict: specKeepLocal, reason: specDropStaleEpoch}
 		}
-		return specDecision{verdict: specApplyAsBefore}
+		// The edit replaces the local version. If it was made from another
+		// version, the local one is gone with it.
+		if is, known := specAncestorAt(in.spec, 1, localHash); known && !is && inHash != localHash {
+			return specDecision{verdict: specApplyByGeneration, reason: specDropNewerGen}
+		}
+		return specDecision{verdict: specApplyByGeneration}
+	case local.gen > in.fromGen+1:
+		// The row is past this edit. It survives only if the local line of
+		// edits descends from it.
+		if is, known := specAncestorAt(local.spec, local.gen-in.fromGen-1, inHash); known && !is && inHash != localHash {
+			return specDecision{verdict: specKeepLocal, reason: specDropNewerGen}
+		}
+		return specDecision{verdict: specKeepLocal}
 	case local.gen != in.fromGen+1:
-		return specDecision{verdict: specApplyAsBefore}
+		// The row is behind: the edits between have not arrived.
+		return specDecision{verdict: specApplyByGeneration}
 	}
 	// A sibling at the generation the edit writes.
-	if local.spec == in.spec && local.updatedAt == in.updatedAt && local.activeOp == in.opID {
+	if inHash == localHash && specMetaOf(in.spec).At == specMetaOf(local.spec).At && local.activeOp == in.opID {
 		return specDecision{verdict: specKeepLocal} // this very edit, already here
 	}
-	switch {
-	case in.epoch < local.epoch:
-		return keep(specDropStaleEpoch)
-	case in.epoch > local.epoch:
+	if in.epoch > local.epoch {
 		// The edit's owner is newer than this replica knows. Its whole row —
 		// owner, host and all — comes by anti-entropy, which applies it over
-		// the local sibling (and records the drop); this statement cannot.
-		return specDecision{verdict: specApplyAsBefore}
+		// the local sibling and records the drop; this statement cannot.
+		return specDecision{verdict: specApplyByGeneration}
 	}
-	if in.opID != "" {
-		switch {
-		case local.activeOp == in.opID:
-			return specDecision{verdict: specKeepLocal}
-		case local.activeOp != "":
-			return keep(specDropOperation)
-		case opFinished:
-			// The operation already finished here: the row is past its claim.
-			return specDecision{verdict: specKeepLocal}
-		default:
-			return take(specDropOperation)
-		}
+	inWins, reason := specOrder(
+		specVersion{epoch: local.epoch, op: local.activeOp, spec: local.spec},
+		specVersion{epoch: in.epoch, op: in.opID, spec: in.spec}, finished)
+	if inWins {
+		return specDecision{verdict: specTakeEdit, reason: reason}
 	}
-	if local.activeOp != "" {
-		return keep(specDropOperation)
-	}
-	switch ord := lwwOrder(local.updatedAt, in.updatedAt); {
-	case ord < 0:
-		return take(specDropLaterEdit)
-	case ord > 0:
-		return keep(specDropLaterEdit)
-	default:
-		return keep(specDropTie)
-	}
+	return specDecision{verdict: specKeepLocal, reason: reason}
 }
 
-// specEditFrom reads a DispSpecGeneration statement's edit from its params.
-// The fingerprint fixes the parameter order.
-func specEditFrom(s Statement, sh StmtShape) (specEdit, bool) {
+// specEditFrom reads a DispSpecGeneration edit's parameters. The fingerprint
+// fixes their order.
+func specEditFrom(s Statement, fp string) (specEdit, bool) {
 	str := func(i int) string { return coerceString(s.Params[i]) }
 	num := func(i int) (int64, bool) { return coerceInt64OK(s.Params[i]) }
-	switch stmtFingerprint(sh) {
+	switch fp {
 	case fpSpecMutateAtEpoch: // spec, updated_at, name, epoch, generation
 		if len(s.Params) != 5 {
 			return specEdit{}, false
@@ -204,6 +233,7 @@ func readSpecRow(ctx context.Context, tx *sql.Tx, name string) (specRow, bool, e
 		return specRow{}, false, err
 	}
 	r.deleted = deleted.Valid && deleted.String != ""
+	r.name = name
 	return r, true, nil
 }
 
@@ -220,6 +250,27 @@ func operationFinished(ctx context.Context, tx *sql.Tx, id string) (bool, error)
 	return err == nil, err
 }
 
+// finishedHere is operationFinished as a predicate, remembering the first
+// read error for the caller.
+func finishedHere(ctx context.Context, tx *sql.Tx, errp *error) func(string) bool {
+	return func(op string) bool {
+		done, err := operationFinished(ctx, tx, op)
+		if err != nil && *errp == nil {
+			*errp = err
+		}
+		return done
+	}
+}
+
+// laterClock is the later of two row clocks: an edit applied by its
+// generation never moves the row's clock back.
+func laterClock(a, b string) string {
+	if a == "" || (b != "" && lwwOrder(a, b) < 0) {
+		return b
+	}
+	return a
+}
+
 // applySpecGeneration applies a DispSpecGeneration statement.
 func (r *Replicator) applySpecGeneration(ctx context.Context, tx *sql.Tx, s Statement, sh StmtShape, tableName string, pkCols []string, incomingHLC string) error {
 	asBefore := func() error {
@@ -231,7 +282,41 @@ func (r *Replicator) applySpecGeneration(ctx context.Context, tx *sql.Tx, s Stat
 		}
 		return nil
 	}
-	in, ok := specEditFrom(s, sh)
+	// byGeneration applies the statement under its own guard, with the
+	// row's clock kept at the later of the two.
+	byGeneration := func() (bool, error) {
+		clamped, err := retainSemanticMaxUpdatedAt(ctx, tx, appliedForm(s), sh, tableName, pkCols)
+		if err != nil {
+			return false, err
+		}
+		res, err := tx.ExecContext(ctx, clamped.SQL, clamped.Params...)
+		if err != nil {
+			return false, err
+		}
+		return rowsChanged(res), nil
+	}
+	fp := stmtFingerprint(sh)
+	if fp == fpOperationClear {
+		// The clear's guard — this operation's barrier at its epoch and
+		// generation — is its order, as the claim's is.
+		pk, ok := pkValuesFromShape(sh, s)
+		if !ok || len(pk) != 1 {
+			return invalidf("operation clear without its VM")
+		}
+		local, found, err := readSpecRow(ctx, tx, coerceString(pk[0]))
+		if err != nil {
+			return err
+		}
+		if !found || local.deleted {
+			return asBefore()
+		}
+		changed, err := byGeneration()
+		if err != nil || changed {
+			return err
+		}
+		return keepClock(ctx, tx, local, clearClock(s))
+	}
+	in, ok := specEditFrom(s, fp)
 	if !ok {
 		return invalidf("spec edit statement carries unreadable parameters")
 	}
@@ -242,54 +327,88 @@ func (r *Replicator) applySpecGeneration(ctx context.Context, tx *sql.Tx, s Stat
 	if !found || local.deleted {
 		return asBefore()
 	}
-	finished := false
-	if in.opID != "" && local.gen == in.fromGen+1 && local.activeOp == "" {
-		if finished, err = operationFinished(ctx, tx, in.opID); err != nil {
-			return err
-		}
-	}
+	var ferr error
+	finished := finishedHere(ctx, tx, &ferr)
 	d := resolveSpecEdit(local, in, finished)
+	if ferr != nil {
+		return ferr
+	}
+	dropIncoming := specEditDrop{vm: in.name, host: local.host, gen: in.fromGen + 1, reason: d.reason, path: pathWAL,
+		droppedSpec: in.spec, keptSpec: local.spec}
+	dropLocal := specEditDrop{vm: in.name, host: local.host, gen: local.gen, reason: d.reason, path: pathWAL,
+		droppedSpec: local.spec, keptSpec: in.spec}
 	switch d.verdict {
-	case specApplyAsBefore:
-		return asBefore()
 	case specKeepLocal:
 		if d.reason != "" {
-			r.client.noteSpecEditDropped(tx, specEditDrop{
-				vm: in.name, host: local.host, epoch: local.epoch, gen: local.gen, reason: d.reason, path: pathWAL,
-				keptAt: local.updatedAt, droppedAt: in.updatedAt, droppedSpec: in.spec,
-			})
+			r.client.noteSpecEditDropped(tx, dropIncoming)
+		}
+		return keepClock(ctx, tx, local, in.updatedAt)
+	case specApplyByGeneration:
+		changed, err := byGeneration()
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return keepClock(ctx, tx, local, in.updatedAt)
+		}
+		if d.reason != "" {
+			r.client.noteSpecEditDropped(tx, dropLocal)
 		}
 		return nil
 	}
-	// specTakeEdit: the received edit replaces the local sibling — unless its
-	// clock is quarantined as future-skewed, which every other apply refuses.
-	if r.client.skewQuarantinesIncoming(r.client.hlcSkewGuardOn(), local.updatedAt, in.updatedAt, time.Now()) {
-		return nil
+	// specTakeEdit. A claim whose operation has already finished here leaves
+	// no barrier behind.
+	op := in.opID
+	if op != "" && finished(op) {
+		op = ""
 	}
-	changed, err := takeSiblingSpecEdit(ctx, tx, in, local)
+	if ferr != nil {
+		return ferr
+	}
+	changed, err := takeSiblingSpecEdit(ctx, tx, in, op, local)
 	if err != nil {
 		return err
 	}
-	if changed && d.reason != "" {
-		r.client.noteSpecEditDropped(tx, specEditDrop{
-			vm: in.name, host: local.host, epoch: local.epoch, gen: local.gen, reason: d.reason, path: pathWAL,
-			keptAt: in.updatedAt, droppedAt: local.updatedAt, droppedSpec: local.spec,
-		})
+	if !changed {
+		return keepClock(ctx, tx, local, in.updatedAt)
+	}
+	if d.reason != "" {
+		r.client.noteSpecEditDropped(tx, dropLocal)
 	}
 	return nil
 }
 
-// takeSiblingSpecEdit applies a received edit over the local sibling at its
-// generation, carrying the edit's own updated_at as every WAL apply does, so
-// the row is the one its origin holds. It reports whether the row changed.
-func takeSiblingSpecEdit(ctx context.Context, tx *sql.Tx, in specEdit, local specRow) (bool, error) {
-	var res sql.Result
-	var err error
-	if in.opID != "" {
-		res, err = tx.ExecContext(ctx, specSiblingTakeClaimSQL, in.spec, in.opID, in.updatedAt, in.name, local.epoch, local.gen)
-	} else {
-		res, err = tx.ExecContext(ctx, specSiblingTakeEditSQL, in.spec, in.updatedAt, in.name, local.epoch, local.gen)
+// clearClock is an operation clear's row clock (its first parameter).
+func clearClock(s Statement) string {
+	if len(s.Params) == 0 {
+		return ""
 	}
+	return coerceString(s.Params[0])
+}
+
+// keepClock advances the live row's clock to the later of its own and a
+// received edit's that changed nothing here. Every replica's row clock is
+// then the latest of every write to the row, whichever ones each kept, so
+// replicas that keep the same version also hold the same row; and a write
+// older than a dropped edit is skipped everywhere alike. The clock orders no
+// spec — the stamp does (spec_stamp.go).
+func keepClock(ctx context.Context, tx *sql.Tx, local specRow, incoming string) error {
+	later := laterClock(local.updatedAt, incoming)
+	if later == local.updatedAt {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE vms SET updated_at = ? WHERE name = ? AND deleted_at IS NULL`, later, local.name)
+	return err
+}
+
+// takeSiblingSpecEdit applies a received edit over the local sibling at its
+// generation, leaving barrier op. The row's clock is the later of the edit's
+// and the row's, as every generation-ordered apply keeps it — the edit's own
+// stamp, stamped by NowTS on its origin, is inside the spec. It reports
+// whether the row changed.
+func takeSiblingSpecEdit(ctx context.Context, tx *sql.Tx, in specEdit, op string, local specRow) (bool, error) {
+	res, err := tx.ExecContext(ctx, specSiblingTakeSQL, in.spec, op, laterClock(local.updatedAt, in.updatedAt),
+		in.name, local.epoch, local.gen, local.activeOp)
 	if err != nil {
 		return false, err
 	}

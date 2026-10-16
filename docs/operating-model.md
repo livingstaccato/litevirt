@@ -482,13 +482,18 @@ of acting — it says nothing about whether the resulting rows have replicated.
   a partition then conflict, and once `spec_conflict_v1` has latched every host
   keeps the same one ([upgrades.md](upgrades.md#concurrent-spec-edits-are-resolved-after-the-roll)):
   the one made under the newer owner; else an operation's (an operation's
-  barrier is never overwritten by an out-of-band edit); else the later one. The
-  other is not lost silently: each host that drops it records a
-  `vm.spec_edit_dropped` event on the VM (`lv events <vm>`) quoting the dropped
-  spec, so the edit can be made again, and counts it in
+  barrier is never overwritten by an out-of-band edit while the operation
+  runs); else the one edited later, by the edit time each edit records in the
+  spec itself (not the row's clock, which state writes move); else the one
+  whose content orders higher. When one side made more edits, its longer line
+  wins. The edit that loses is not lost silently: each host that drops it
+  records a `vm.spec_edit_dropped` event on the VM (`lv events <vm>`) quoting
+  the dropped spec, so the edit can be made again, and counts it in
   `litevirt_merge_apply_rejected_total{table="vms",reason="spec_edit_dropped"}`.
-  Two edits at the same instant stay apart, one on each host, until either is
-  made again.
+  Once an operation has finished, an out-of-band edit made from its
+  generation is ordered like any other, so it can replace the operation's
+  desired spec while the VM keeps what the operation applied — recorded the
+  same way.
 
 ### Leader-lease terms, and what enforcing on them does and does not buy
 

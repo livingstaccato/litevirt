@@ -113,11 +113,12 @@ func TestReplicatedUpdatedAtUsesNowTS(t *testing.T) {
 			if fn.Name.Name == "HistoricalShapes" {
 				continue
 			}
-			// takeSiblingSpecEdit is a WAL apply: it writes the RECEIVED edit's
-			// own updated_at, stamped by NowTS on its origin, as every apply of a
-			// replicated statement does. A fresh local stamp would make the
-			// replica's row differ from the origin's.
-			if fn.Name.Name == "takeSiblingSpecEdit" {
+			// takeSiblingSpecEdit and keepClock are WAL applies: they write a
+			// RECEIVED edit's own updated_at (stamped by NowTS on its origin),
+			// or keep the local one, as every apply of a replicated statement
+			// does. A fresh local stamp would make the replica's row differ
+			// from the origin's.
+			if fn.Name.Name == "takeSiblingSpecEdit" || fn.Name.Name == "keepClock" {
 				continue
 			}
 			body := string(src[fset.Position(fn.Pos()).Offset:fset.Position(fn.End()).Offset])

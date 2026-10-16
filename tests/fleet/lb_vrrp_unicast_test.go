@@ -71,6 +71,8 @@ func TestFleet_VRRPUnicast_LBHostsSwitchTogether(t *testing.T) {
 				m := lb.NewManagerAt(confDir[n.Name], filepath.Join(root, "run"))
 				n.Server.SetLBManager(m)
 				n.Server.SetLBApply(m.Apply)
+				// The fleet's hosts are all recorded at 127.0.0.1, on loopback.
+				n.Server.SetLBIfaceForIPForTests(func(string) string { return "fleet0" })
 				// failover_scope_v1 latched: the LB's snat setting can be recorded.
 				n.DB.SetClusterPolicyGate(func() bool { return true })
 			}
@@ -208,6 +210,8 @@ func TestFleet_VRRPUnicast_StandDownAndRemovedPeer(t *testing.T) {
 		m := lb.NewManagerAt(confDir[n.Name], runDir[n.Name])
 		n.Server.SetLBManager(m)
 		n.Server.SetLBApply(m.Apply)
+		// The fleet's hosts are all recorded at 127.0.0.1, on loopback.
+		n.Server.SetLBIfaceForIPForTests(func(string) string { return "fleet0" })
 		n.DB.SetClusterPolicyGate(func() bool { return true })
 	}
 	gates := gateAll(t, c)

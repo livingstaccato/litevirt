@@ -846,10 +846,7 @@ func (s *Server) applyLBLocal(ctx context.Context, cfg lb.Config, lbHosts []stri
 		return status.Error(codes.InvalidArgument, detail)
 	}
 	if err := s.lbVRRPTransport(ctx, &cfg, lbHosts); err != nil {
-		detail := fmt.Sprintf("load balancer %q is not applied: its VRRP transport cannot be rendered: %v", cfg.Name, err)
-		slog.Error("lb: "+detail, "lb", cfg.Name)
-		s.publish("lb.vrrp_transport_refused", cfg.Name, detail)
-		return status.Error(codes.FailedPrecondition, detail)
+		return s.vrrpRefused(ctx, cfg.Name, lbHosts, err)
 	}
 	var err error
 	if s.lbApplyOverride != nil {
@@ -858,6 +855,7 @@ func (s *Server) applyLBLocal(ctx context.Context, cfg lb.Config, lbHosts []stri
 		err = lb.NewManager().Apply(ctx, cfg)
 	}
 	if err == nil {
+		s.vrrpApplied(ctx, cfg.Name)
 		s.recordLBKeepalived(cfg.Name) // publish whether the VIP came up
 	}
 	return err
@@ -2768,6 +2766,10 @@ func (s *Server) RunLBReconciler(ctx context.Context, interval time.Duration) {
 	defer t.Stop()
 	watch := time.NewTicker(min(interval, vrrpWatchInterval))
 	defer watch.Stop()
+	// The transport-split check Pings LB peers, so it runs on its own
+	// ticker: a powered-off peer's dial timeout never delays the watch.
+	go s.runVRRPSplitCheck(ctx, interval)
+	s.noteVRRPLatch(ctx)
 	last, lastErr := s.vrrpUnicastActive(ctx)
 	for {
 		select {
@@ -2778,6 +2780,7 @@ func (s *Server) RunLBReconciler(ctx context.Context, interval time.Duration) {
 		case <-s.lbKick:
 			s.reconcileDeadLBs(ctx)
 		case <-watch.C:
+			s.noteVRRPLatch(ctx)
 			now, err := s.vrrpUnicastActive(ctx)
 			if err != nil || (lastErr == nil && now == last) {
 				continue
@@ -2794,8 +2797,7 @@ const vrrpWatchInterval = 2 * time.Second
 
 // reconcileDeadLBs re-applies this host's enabled LBs whose keepalived isn't running, and
 // those whose keepalived config renders another VRRP transport from the one this host
-// would render now — mode, device, source or peers (lbVRRPStale) — and then reports an
-// LB host on an earlier build (noteVRRPSplit). The
+// would render now — mode, device, source or peers (lbVRRPStale). The
 // re-apply path (refreshLBLocal / reapplyExplicitLB -> applyLBLocal) is split-brain-gated, so
 // it no-ops during warmup/upgrading and succeeds once local quorum returns.
 func (s *Server) reconcileDeadLBs(ctx context.Context) {
@@ -2803,8 +2805,6 @@ func (s *Server) reconcileDeadLBs(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	var local []corrosion.LBConfigRecord
-	defer func() { s.noteVRRPSplit(ctx, local) }()
 	for _, cfg := range configs {
 		if !cfg.Enabled {
 			continue
@@ -2818,7 +2818,6 @@ func (s *Server) reconcileDeadLBs(ctx context.Context) {
 		if !s.lbRunsOnHost(ctx, cfg) {
 			continue
 		}
-		local = append(local, cfg)
 		stale := s.lbVRRPStale(ctx, cfg)
 		if !stale && s.lbKeepalivedRunning(cfg.Name) {
 			continue

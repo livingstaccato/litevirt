@@ -219,3 +219,13 @@ func TestRenderKeepalived_UnicastChecksSourceOnEveryVersion(t *testing.T) {
 		t.Errorf("multicast render carries a source check:\n%s", got)
 	}
 }
+
+// TestInterfaceHoldingIP_NotLoopback: an address held only on loopback is not
+// held for VRRP's purpose (keepalived bound there sends nothing off the host).
+//
+// Mutation: drop the loopback filter — red.
+func TestInterfaceHoldingIP_NotLoopback(t *testing.T) {
+	if dev := InterfaceHoldingIP("127.0.0.1"); dev != "" {
+		t.Fatalf("127.0.0.1 is held by %q for VRRP, want none", dev)
+	}
+}

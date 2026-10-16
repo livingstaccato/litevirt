@@ -303,6 +303,23 @@ func parseKeepalivedVIP(config string) (vip string, prefix int, iface string, ok
 	return vip, prefix, iface, vip != "" && iface != ""
 }
 
+// DemoteByName demotes one LB by its rendered keepalived config: Demote with
+// the VIP and device that config assigns. No config is nothing to demote.
+func (m *Manager) DemoteByName(name string, keepalivedStopTimeout time.Duration) error {
+	data, err := os.ReadFile(filepath.Join(m.configDir, name+"-keepalived.conf"))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read keepalived config for %s: %w", name, err)
+	}
+	vip, prefix, iface, ok := parseKeepalivedVIP(string(data))
+	if !ok {
+		return fmt.Errorf("cannot parse the VIP of %s's keepalived config", name)
+	}
+	return m.Demote(Config{Name: name, VIP: vip, VIPPrefix: prefix, Interface: iface}, keepalivedStopTimeout)
+}
+
 // Demote drops this host's VIP for LB `name` when the host has lost quorum (Phase 2
 // minority self-demotion). Order is load-bearing:
 //

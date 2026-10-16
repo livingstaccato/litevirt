@@ -1038,8 +1038,8 @@ func DetectInterfaceForIP(targetIP string) string {
 	return DetectInterface()
 }
 
-// InterfaceHoldingIP is the device that holds ip as one of its own
-// addresses, or "" when none does. Unlike DetectInterfaceForIP it never
+// InterfaceHoldingIP is the up, non-loopback device that holds ip as one of
+// its own addresses, or "" when none does. Unlike DetectInterfaceForIP it never
 // guesses: VRRP sent from an address the host does not own is never answered.
 func InterfaceHoldingIP(ip string) string {
 	want := net.ParseIP(ip)
@@ -1051,6 +1051,11 @@ func InterfaceHoldingIP(ip string) string {
 		return ""
 	}
 	for _, iface := range ifaces {
+		// A loopback device sends nothing off the host, and a down one
+		// sends nothing at all: the address is not held for VRRP's purpose.
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
 		addrs, err := iface.Addrs()
 		if err != nil {
 			continue

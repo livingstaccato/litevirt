@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -23,93 +24,127 @@ import (
 //
 // The transport is ONE value for the whole cluster, read by every host from
 // its own replica (corrosion.GetVRRPTransport), so an LB's hosts render the
-// same one whatever their own config says:
+// same one whatever their own config or latch schedule:
 //
 //   - the operator's choice (`lv cluster vrrp-transport`), when recorded;
-//   - else unicast once any host's vrrp_unicast_v1 latch has become durable:
-//     that host records it (the latch row), and every host renders unicast from
-//     the moment the row reaches it;
-//   - else unicast once this host's own latch is durable (before its row has
-//     been written or replicated);
+//   - else unicast once the latch row is: the first host whose
+//     vrrp_unicast_v1 latch is durable writes it (noteVRRPLatch), which needs
+//     cluster_policies writable (failover_scope_v1 latched there too);
 //   - else multicast, as every earlier build renders.
 //
-// enforcement.vrrp_unicast decides only whether this host advertises the
-// token while it has not latched; it never decides what is rendered.
+// A host's own latch never decides the render: until the row exists every
+// host stays multicast, uniform rather than early. enforcement.vrrp_unicast
+// decides only whether this host advertises the token before the latch.
 
-// LB health condition (evaluator "lb", subject this host).
+// LB health conditions (evaluator "lb", subject this host).
 const (
 	LBEvaluator = "lb"
 	// CondLBVRRPSplit: this host renders unicast VRRP for an LB one of whose
-	// hosts does not advertise vrrp_unicast_v1 — an earlier build back in the
-	// cluster after the latch, which renders multicast: both hold the VIP.
+	// hosts is on an earlier build (it answers a Ping without
+	// vrrp_unicast_v1, or reports WAL quarantine) and renders multicast: both
+	// hold the VIP.
 	CondLBVRRPSplit = "lb.vrrp.transport_split"
+	// CondLBVRRPRefused: the cluster's transport is unicast and this host
+	// cannot render it for an LB, so it has stopped that LB's keepalived
+	// (when another LB host serves) rather than hold the VIP beside it.
+	CondLBVRRPRefused = "lb.vrrp.transport_refused"
 )
 
-// vrrpUnicastActive reports whether this host renders its LBs' VRRP as
-// unicast (see the package comment above). An error is a failed read of the
-// policy; callers keep what is rendered.
-func (s *Server) vrrpUnicastActive(ctx context.Context) (bool, error) {
+// vrrpPolicy reads the transport rows and refreshes vrrpRowLatched: the
+// latch formed somewhere (the row) or durably here. It writes nothing.
+func (s *Server) vrrpPolicy(ctx context.Context) (corrosion.VRRPTransportPolicy, error) {
 	if s.db == nil {
-		return false, nil
+		return corrosion.VRRPTransportPolicy{}, nil
 	}
 	p, err := corrosion.GetVRRPTransport(ctx, s.db)
 	if err != nil {
-		return false, err
-	}
-	if p.Unknown != "" {
-		slog.Warn("lb: the recorded VRRP transport is unknown to this build; ignoring it", "value", p.Unknown)
+		return p, err
 	}
 	g := s.gateV()
 	own := g != nil && g.DurablyLatched(capabilities.VRRPUnicastV1)
-	if own && !p.Latched && s.db.MayWriteClusterPolicy() {
-		// The first host to latch tells every other one, so they switch with
-		// replication rather than at their own latch.
-		if err := corrosion.MarkVRRPUnicastLatched(ctx, s.db, s.hostName); err != nil {
-			slog.Warn("lb: could not record the vrrp_unicast_v1 latch", "error", err)
-		}
-	}
 	s.vrrpRowLatched.Store(p.Latched || own)
+	return p, nil
+}
+
+// vrrpUnicastActive reports whether this host renders its LBs' VRRP as
+// unicast: the cluster's rows only (see above). It writes nothing. An error
+// is a failed read of the policy; callers keep what is rendered.
+func (s *Server) vrrpUnicastActive(ctx context.Context) (bool, error) {
+	p, err := s.vrrpPolicy(ctx)
+	if err != nil {
+		return false, err
+	}
 	switch p.Operator {
 	case corrosion.VRRPTransportMulticast:
 		return false, nil
 	case corrosion.VRRPTransportUnicast:
 		return true, nil
 	}
-	return p.Latched || own, nil
+	return p.Latched, nil
 }
 
-// lbVRRPTransport sets the VRRP transport of cfg, an LB this host runs with
-// the other hosts in lbHosts. On the multicast transport it leaves cfg as it
-// is. On unicast the adverts go from this host's recorded address, over the
-// device that holds it, to each other LB host's recorded address.
+// noteVRRPLatch writes the latch row once this host's vrrp_unicast_v1 latch
+// is durable and cluster_policies is writable here; until then nothing
+// switches anywhere. Called from the LB reconciler's watch only.
+func (s *Server) noteVRRPLatch(ctx context.Context) {
+	if s.db == nil {
+		return
+	}
+	p, err := s.vrrpPolicy(ctx)
+	if err != nil || p.Latched {
+		return
+	}
+	g := s.gateV()
+	if g == nil || !g.DurablyLatched(capabilities.VRRPUnicastV1) || !s.db.MayWriteClusterPolicy() {
+		return
+	}
+	if err := corrosion.MarkVRRPUnicastLatched(ctx, s.db, s.hostName); err != nil {
+		slog.Warn("lb: could not record the vrrp_unicast_v1 latch", "error", err)
+	}
+}
+
+// vrrpWant is the transport this host renders for one LB, and the LB hosts
+// left out of its peers for want of a recorded address.
+type vrrpWant struct {
+	unicast bool
+	dev     string
+	src     string
+	peers   []string
+	dropped []string
+}
+
+// desiredVRRPTransport computes, without side effects, the VRRP transport of
+// an LB this host runs with the other hosts in lbHosts. On unicast the
+// adverts go from this host's recorded address, over the device that holds
+// it, to each other LB host's recorded address.
 //
 // A host in lbHosts with no recorded IPv4 address — removed from the cluster,
 // or never known — is left out of the peers: it cannot be a VRRP peer, and the
 // hosts still serving must keep the VIP. With no peer left the LB renders the
 // sole-host form and becomes master on its own. What it refuses: a failed
-// read, and a host whose own recorded address no local device holds (its
-// adverts would go out from an address nothing answers).
-func (s *Server) lbVRRPTransport(ctx context.Context, cfg *lb.Config, lbHosts []string) error {
+// read, and a host whose own recorded address no local, up, non-loopback
+// device holds (its adverts would go out from an address nothing answers).
+func (s *Server) desiredVRRPTransport(ctx context.Context, lbHosts []string) (vrrpWant, error) {
 	unicast, err := s.vrrpUnicastActive(ctx)
 	if err != nil {
-		return fmt.Errorf("vrrp: read the VRRP transport: %w", err)
+		return vrrpWant{}, fmt.Errorf("vrrp: read the VRRP transport: %w", err)
 	}
 	if !unicast {
-		return nil
+		return vrrpWant{}, nil
 	}
 	local, err := s.hostIPv4(ctx, s.hostName)
 	if err != nil {
-		return fmt.Errorf("vrrp: %w", err)
+		return vrrpWant{}, fmt.Errorf("vrrp: %w", err)
 	}
 	if local == "" {
-		return fmt.Errorf("vrrp: host %s has no IPv4 address recorded to send VRRP from", s.hostName)
+		return vrrpWant{}, fmt.Errorf("vrrp: host %s has no IPv4 address recorded to send VRRP from", s.hostName)
 	}
 	dev := s.lbIfaceForIP(local)
 	if dev == "" {
-		return fmt.Errorf("vrrp: no device on %s holds its recorded address %s, so VRRP sent from it would never be answered: correct advertise_address", s.hostName, local)
+		return vrrpWant{}, fmt.Errorf("vrrp: no up, non-loopback device on %s holds its recorded address %s, so VRRP sent from it would never be answered", s.hostName, local)
 	}
+	w := vrrpWant{unicast: true, dev: dev, src: local}
 	seen := map[string]bool{s.hostName: true}
-	var peers, dropped []string
 	for _, h := range lbHosts {
 		if seen[h] {
 			continue
@@ -117,28 +152,199 @@ func (s *Server) lbVRRPTransport(ctx context.Context, cfg *lb.Config, lbHosts []
 		seen[h] = true
 		ip, err := s.hostIPv4(ctx, h)
 		if err != nil {
-			return fmt.Errorf("vrrp: %w", err)
+			return vrrpWant{}, fmt.Errorf("vrrp: %w", err)
 		}
 		if ip == "" {
-			dropped = append(dropped, h)
+			w.dropped = append(w.dropped, h)
 			continue
 		}
-		peers = append(peers, ip)
+		w.peers = append(w.peers, ip)
 	}
-	if len(dropped) > 0 {
+	return w, nil
+}
+
+// lbVRRPTransport sets the VRRP transport of cfg (desiredVRRPTransport), and
+// says once per change which LB hosts it left out.
+func (s *Server) lbVRRPTransport(ctx context.Context, cfg *lb.Config, lbHosts []string) error {
+	w, err := s.desiredVRRPTransport(ctx, lbHosts)
+	if err != nil {
+		return err
+	}
+	if s.vrrpEventOnce(cfg.Name, "dropped", strings.Join(w.dropped, ",")) && len(w.dropped) > 0 {
 		detail := fmt.Sprintf("load balancer %s lists %s, which has no recorded address (removed?): not a VRRP peer; correct its hosts with `lv lb update %s --host <host>` for each host it should run on",
-			cfg.Name, strings.Join(dropped, ", "), cfg.Name)
+			cfg.Name, strings.Join(w.dropped, ", "), cfg.Name)
 		slog.Warn("lb: "+detail, "lb", cfg.Name)
 		s.publish("lb.vrrp_peer_dropped", cfg.Name, detail)
 	}
+	if !w.unicast {
+		return nil
+	}
 	cfg.VRRPUnicast = true
-	cfg.VRRPInterface = dev
-	cfg.UnicastSrc = local
-	cfg.UnicastPeers = peers
+	cfg.VRRPInterface = w.dev
+	cfg.UnicastSrc = w.src
+	cfg.UnicastPeers = w.peers
 	return nil
 }
 
-// lbIfaceForIP is the device holding ip, exactly ("" when none does).
+// vrrpEventOnce reports whether value is new for this LB's kind of event, and
+// records it: each event is published when what it says changes, not on every
+// apply.
+func (s *Server) vrrpEventOnce(name, kind, value string) bool {
+	s.vrrpMu.Lock()
+	defer s.vrrpMu.Unlock()
+	if s.vrrpLastEvent == nil {
+		s.vrrpLastEvent = map[string]string{}
+	}
+	k := name + "\x00" + kind
+	if prev, ok := s.vrrpLastEvent[k]; ok && prev == value {
+		return false
+	}
+	s.vrrpLastEvent[k] = value
+	return true
+}
+
+// vrrpRefused handles an apply whose VRRP transport cannot be rendered. The
+// cluster's transport is one value, so the other LB hosts render it: this
+// host's keepalived, still on the old transport, would hold the VIP beside
+// them. When another LB host answers as one that renders it, this host stops
+// its keepalived for the LB (that host is then the sole master); either way it
+// raises the critical CondLBVRRPRefused naming the LB, the reason and the
+// remedy. vrrpApplied resolves it.
+func (s *Server) vrrpRefused(ctx context.Context, name string, lbHosts []string, cause error) error {
+	detail := fmt.Sprintf("load balancer %q is not applied on %s: its VRRP transport cannot be rendered: %v. "+
+		"Fix the host's recorded address (advertise_address) or the device holding it; where it cannot be on a local device (1:1 NAT), run `lv cluster vrrp-transport multicast`",
+		name, s.hostName, cause)
+	slog.Error("lb: "+detail, "lb", name)
+	if s.vrrpEventOnce(name, "refused", cause.Error()) {
+		s.publish("lb.vrrp_transport_refused", name, detail)
+	}
+	if s.otherLBHostRenders(ctx, lbHosts) {
+		if err := s.lbDemote(name); err != nil {
+			slog.Error("lb: could not stop the keepalived of a load balancer this host cannot render", "lb", name, "error", err)
+		} else {
+			detail += ". Its keepalived here is stopped; another LB host holds the VIP"
+		}
+	}
+	s.setVRRPRefused(ctx, name, detail)
+	return status.Error(codes.FailedPrecondition, detail)
+}
+
+// vrrpApplied resolves this LB's part of CondLBVRRPRefused.
+func (s *Server) vrrpApplied(ctx context.Context, name string) {
+	s.vrrpMu.Lock()
+	_, had := s.vrrpRefusedLBs[name]
+	s.vrrpMu.Unlock()
+	if had {
+		s.setVRRPRefused(ctx, name, "")
+	}
+	s.vrrpEventOnce(name, "refused", "")
+}
+
+// setVRRPRefused records (detail != "") or clears an LB's refusal and raises
+// or resolves CondLBVRRPRefused over all of them.
+func (s *Server) setVRRPRefused(ctx context.Context, name, detail string) {
+	s.vrrpMu.Lock()
+	if s.vrrpRefusedLBs == nil {
+		s.vrrpRefusedLBs = map[string]string{}
+	}
+	if detail == "" {
+		delete(s.vrrpRefusedLBs, name)
+	} else {
+		s.vrrpRefusedLBs[name] = detail
+	}
+	var all []string
+	for _, d := range s.vrrpRefusedLBs {
+		all = append(all, d)
+	}
+	s.vrrpMu.Unlock()
+	sort.Strings(all)
+	s.setHostCondition(ctx, LBEvaluator, CondLBVRRPRefused, len(all) > 0, corrosion.SeverityCritical, strings.Join(all, "; "))
+}
+
+// otherLBHostRenders reports whether some other host of the LB answers a
+// Ping as a host that renders the cluster's transport: it advertises
+// vrrp_unicast_v1 and is not WAL-quarantined. Asked in parallel, bounded.
+func (s *Server) otherLBHostRenders(ctx context.Context, lbHosts []string) bool {
+	ctx, cancel := context.WithTimeout(ctx, vrrpPeerAskTimeout)
+	defer cancel()
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	found := false
+	for _, h := range lbHosts {
+		if h == s.hostName {
+			continue
+		}
+		wg.Add(1)
+		go func(h string) {
+			defer wg.Done()
+			if s.peerVRRPState(ctx, h) == peerRenders {
+				mu.Lock()
+				found = true
+				mu.Unlock()
+			}
+		}(h)
+	}
+	wg.Wait()
+	return found
+}
+
+// lbDemote stops this host's keepalived for an LB and removes its VIP.
+func (s *Server) lbDemote(name string) error {
+	if s.lbDemoteOverride != nil {
+		return s.lbDemoteOverride(name)
+	}
+	return s.lbManager().DemoteByName(name, 3*time.Second)
+}
+
+// What a peer's Ping says about its VRRP transport.
+type peerVRRP int
+
+const (
+	peerUnknown peerVRRP = iota // unreachable, or answered with no capabilities (self-fenced)
+	peerRenders                 // advertises vrrp_unicast_v1, not quarantined
+	peerEarlier                 // an earlier build, or WAL-quarantined (rolled back): multicast
+)
+
+// vrrpPeerAskTimeout bounds one round of peer Pings.
+const vrrpPeerAskTimeout = 3 * time.Second
+
+func (s *Server) peerVRRPState(ctx context.Context, h string) peerVRRP {
+	var caps []string
+	var quarantined bool
+	var err error
+	if s.vrrpPeerCapsOverride != nil {
+		caps, quarantined, err = s.vrrpPeerCapsOverride(ctx, h)
+	} else {
+		caps, _, err = s.PeerCapabilities(ctx, h)
+		if err == nil {
+			quarantined = s.peerWALQuarantinedNow(h)
+		}
+	}
+	switch {
+	case err != nil:
+		return peerUnknown
+	case quarantined:
+		return peerEarlier
+	case len(caps) == 0:
+		// A self-fenced host answers with no capabilities; it is not an
+		// earlier build.
+		return peerUnknown
+	case capabilities.Has(caps, capabilities.VRRPUnicastV1):
+		return peerRenders
+	}
+	return peerEarlier
+}
+
+// peerWALQuarantinedNow is the last Ping answer's wal_quarantined for h.
+func (s *Server) peerWALQuarantinedNow(h string) bool {
+	s.peerWALQMu.Lock()
+	defer s.peerWALQMu.Unlock()
+	a, ok := s.peerWALQ[h]
+	return ok && a.quarantined
+}
+
+// lbIfaceForIP is the up, non-loopback device holding ip, exactly ("" when
+// none does).
 func (s *Server) lbIfaceForIP(ip string) string {
 	if s.lbIfaceForIPOverride != nil {
 		return s.lbIfaceForIPOverride(ip)
@@ -150,7 +356,7 @@ func (s *Server) lbIfaceForIP(ip string) string {
 // another transport from the one this host would render now: another mode,
 // device, source or set of peers (the policy changed, a peer was added or
 // removed, a host's address changed, an apply was missed). No readable config
-// is not stale: there is nothing to switch.
+// is not stale: there is nothing to switch. It has no side effects.
 func (s *Server) lbVRRPStale(ctx context.Context, rec corrosion.LBConfigRecord) bool {
 	var have lb.Transport
 	var ok bool
@@ -163,20 +369,53 @@ func (s *Server) lbVRRPStale(ctx context.Context, rec corrosion.LBConfigRecord) 
 		return false
 	}
 	hosts, _ := parseHostsJSON(rec.Hosts)
-	want := lb.Config{Name: rec.Name}
-	if err := s.lbVRRPTransport(ctx, &want, hosts); err != nil {
-		// The apply will refuse the same way and say so; re-apply only when
-		// the mode itself is wrong, which is what the refusal must surface.
+	w, err := s.desiredVRRPTransport(ctx, hosts)
+	if err != nil {
+		// The apply will refuse the same way and handle it (vrrpRefused);
+		// re-apply only when the mode itself is wrong.
 		unicast, rerr := s.vrrpUnicastActive(ctx)
 		return rerr == nil && unicast != have.Unicast
 	}
-	return !have.Equal(lb.TransportOf(want))
+	want := lb.Transport{}
+	if w.unicast {
+		want = lb.Transport{Unicast: true, Iface: w.dev, Src: w.src, Peers: w.peers}
+	}
+	return !have.Equal(want)
+}
+
+// runVRRPSplitCheck runs checkVRRPSplit every interval until ctx ends.
+func (s *Server) runVRRPSplitCheck(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.checkVRRPSplit(ctx)
+		}
+	}
+}
+
+// checkVRRPSplit runs noteVRRPSplit over the LBs this host runs.
+func (s *Server) checkVRRPSplit(ctx context.Context) {
+	configs, err := corrosion.ListLBConfigs(ctx, s.db)
+	if err != nil {
+		return
+	}
+	var local []corrosion.LBConfigRecord
+	for _, cfg := range configs {
+		if cfg.Enabled && s.lbRunsOnHost(ctx, cfg) {
+			local = append(local, cfg)
+		}
+	}
+	s.noteVRRPSplit(ctx, local)
 }
 
 // noteVRRPSplit raises CondLBVRRPSplit while this host renders unicast for an
-// LB one of whose hosts answers a Ping without vrrp_unicast_v1 (an earlier
-// build), and resolves it otherwise. An unreachable host is not counted: it is
-// down, not on another transport.
+// LB one of whose hosts is on an earlier build (peerEarlier), and resolves it
+// otherwise. An unreachable or self-fenced host is not counted. The peers are
+// asked in parallel under one deadline.
 func (s *Server) noteVRRPSplit(ctx context.Context, lbs []corrosion.LBConfigRecord) {
 	unicast, err := s.vrrpUnicastActive(ctx)
 	if err != nil {
@@ -184,28 +423,36 @@ func (s *Server) noteVRRPSplit(ctx context.Context, lbs []corrosion.LBConfigReco
 	}
 	var split []string
 	if unicast {
-		lacks := map[string]bool{}
-		asked := map[string]bool{}
+		peers := map[string]bool{}
 		for _, rec := range lbs {
 			hosts, _ := parseHostsJSON(rec.Hosts)
 			for _, h := range hosts {
-				if h == s.hostName {
-					continue
+				if h != s.hostName {
+					peers[h] = true
 				}
-				if !asked[h] {
-					asked[h] = true
-					pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-					var caps []string
-					var perr error
-					if s.vrrpPeerCapsOverride != nil {
-						caps, perr = s.vrrpPeerCapsOverride(pctx, h)
-					} else {
-						caps, _, perr = s.PeerCapabilities(pctx, h)
-					}
-					cancel()
-					lacks[h] = perr == nil && !capabilities.Has(caps, capabilities.VRRPUnicastV1)
+			}
+		}
+		earlier := map[string]bool{}
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		actx, cancel := context.WithTimeout(ctx, vrrpPeerAskTimeout)
+		for h := range peers {
+			wg.Add(1)
+			go func(h string) {
+				defer wg.Done()
+				if s.peerVRRPState(actx, h) == peerEarlier {
+					mu.Lock()
+					earlier[h] = true
+					mu.Unlock()
 				}
-				if lacks[h] {
+			}(h)
+		}
+		wg.Wait()
+		cancel()
+		for _, rec := range lbs {
+			hosts, _ := parseHostsJSON(rec.Hosts)
+			for _, h := range hosts {
+				if earlier[h] {
 					split = append(split, fmt.Sprintf("%s (with %s)", rec.Name, h))
 				}
 			}
@@ -214,7 +461,7 @@ func (s *Server) noteVRRPSplit(ctx context.Context, lbs []corrosion.LBConfigReco
 	sort.Strings(split)
 	detail := ""
 	if len(split) > 0 {
-		detail = "load balancers whose VRRP is unicast here but multicast on a host on an earlier build, so both hold the VIP: " +
+		detail = "load balancers whose VRRP is unicast here but multicast on a host on an earlier build (or rolled back), so both hold the VIP: " +
 			strings.Join(split, ", ") + ". Upgrade those hosts, or run `lv cluster vrrp-transport multicast` until they are"
 	}
 	s.setHostCondition(ctx, LBEvaluator, CondLBVRRPSplit, len(split) > 0, corrosion.SeverityCritical, detail)
@@ -302,6 +549,11 @@ func (s *Server) vrrpTransportStatus(ctx context.Context) (*pb.VRRPTransportStat
 	}
 	return out, nil
 }
+
+// SetLBIfaceForIPForTests replaces the lookup of the device holding this
+// host's recorded address (the fleet's hosts share 127.0.0.1, on loopback).
+// Test-only.
+func (s *Server) SetLBIfaceForIPForTests(fn func(ip string) string) { s.lbIfaceForIPOverride = fn }
 
 // KickLBReconcileForTests asks the LB reconciler for a pass now. Test-only.
 func (s *Server) KickLBReconcileForTests() { s.kickLBReconcile() }

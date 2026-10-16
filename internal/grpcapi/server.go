@@ -630,7 +630,16 @@ type Server struct {
 	lbIfaceForIPOverride        func(ip string) string
 	// vrrpPeerCapsOverride is a test seam for noteVRRPSplit's Ping of an LB
 	// peer (PeerCapabilities). Nil in production.
-	vrrpPeerCapsOverride func(ctx context.Context, host string) ([]string, error)
+	vrrpPeerCapsOverride func(ctx context.Context, host string) (caps []string, walQuarantined bool, err error)
+	// lbDemoteOverride is a test seam for stopping an LB's keepalived here
+	// (lb.Manager.DemoteByName). Nil in production.
+	lbDemoteOverride func(name string) error
+	// vrrpMu guards vrrpLastEvent (the last value each LB's VRRP events said,
+	// so each is published on a change only) and vrrpRefusedLBs (the LBs
+	// whose transport this host cannot render, for CondLBVRRPRefused).
+	vrrpMu         sync.Mutex
+	vrrpLastEvent  map[string]string
+	vrrpRefusedLBs map[string]string
 	// lbKick asks the LB reconciler for a pass now (kickLBReconcile).
 	lbKick chan struct{}
 	// vrrpRowLatched: vrrp_unicast_v1 has latched on some host (its latch

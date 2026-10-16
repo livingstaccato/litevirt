@@ -936,32 +936,40 @@ bridge, and there is no password for a guest to read. Before that, the adverts a
 multicast on the VIP's bridge with a password derived from the LB's name, as on
 earlier releases, and any guest on that bridge can read them.
 
-The transport is one value for the whole cluster, which every LB host renders
-whatever its own configuration: unicast from the moment the first host's
-`vrrp_unicast_v1` latch becomes durable (that host records it in the replicated
-`cluster_policies` table, and each host re-applies its LBs within 2 seconds of the
-record reaching it), or what an admin sets with `lv cluster vrrp-transport unicast`
-or `lv cluster vrrp-transport multicast`. So when the transport changes, an LB is
-held by both its hosts for about as long as the record takes to replicate between
-them plus 2 seconds — seconds on a healthy cluster, and longer only while
-replication to one of them is lagging. `lv cluster vrrp-transport` with no argument
-shows what the connected host renders.
+The transport is one value for the whole cluster, read by every LB host from the
+replicated `cluster_policies` table, whatever its own configuration or latch: what an
+admin sets with `lv cluster vrrp-transport unicast` or
+`lv cluster vrrp-transport multicast`, else unicast once the latch has been
+recorded there, else multicast. The first host whose `vrrp_unicast_v1` latch is
+durable records it, which also needs `failover_scope_v1` latched on that host
+(the table is not writable before), so on an upgrade the switch waits for both
+tokens. Until the record exists every host stays multicast. Each host re-applies
+its LBs within 2 seconds of the record (or an admin's change) reaching it, so an
+LB is held by both its hosts for about as long as the record takes to replicate
+between them plus 2 seconds — seconds on a healthy cluster, longer only while
+replication to one of them is lagging. `lv cluster vrrp-transport` with no
+argument shows what the connected host renders.
 
 Requirements and edges of the unicast transport:
 
 - Hosts must pass IP protocol 112 between their recorded addresses. Where something
   between them does not, run `lv cluster vrrp-transport multicast`.
-- A host must hold its recorded address (`advertise_address`) on a local device.
-  Otherwise its LBs are not applied, and the event `lb.vrrp_transport_refused` says
-  why.
+- A host must hold its recorded address (`advertise_address`) on a local device
+  that is up and is not loopback. Otherwise it cannot render unicast for its LBs:
+  it raises the critical health condition `lb.vrrp.transport_refused` naming each
+  LB, and (when another LB host renders the transport) stops its own keepalived for
+  the LB, so that host holds the VIP alone. Fix the address or the device; where the
+  address cannot be on a local device — 1:1 NAT, an address routed to `lo` — run
+  `lv cluster vrrp-transport multicast`.
 - A host in an LB's `hosts` that has no recorded address (it was removed with
   `lv host rm`) is not a VRRP peer, and the event `lb.vrrp_peer_dropped` names it.
   With no peer left the remaining host serves the VIP alone. Correct the list with
   `lv lb update <name> --host <host>` (repeated for each host).
-- An LB host on an earlier build that comes back after the latch renders
-  multicast, and both hold the VIP. Each LB host that renders unicast raises the
-  critical health condition `lb.vrrp.transport_split`, naming the LB and the host.
-  Upgrade that host, or run `lv cluster vrrp-transport multicast` until it is.
+- An LB host on an earlier build (or rolled back) that is back in the cluster
+  renders multicast, and both hold the VIP. Each LB host that renders unicast
+  raises the critical health condition `lb.vrrp.transport_split`, naming the LB and
+  the host. Upgrade that host, or run `lv cluster vrrp-transport multicast` until
+  it is.
 - keepalived 2.1 or later. On 2.0 the instance's source check and a single LB
   host's TTL range are ignored (litevirt also renders the global
   `vrrp_check_unicast_src`, which 2.0 honours).

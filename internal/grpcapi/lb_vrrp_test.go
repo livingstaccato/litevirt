@@ -63,15 +63,15 @@ func peerApply(t *testing.T, s *Server, hosts []string) ([]lb.Config, error) {
 }
 
 // TestApplyLB_VRRPTransportIsClusterWide: the transport an LB host renders is
-// the cluster's, never its own flag's. Unicast once vrrp_unicast_v1 is
-// durably latched here OR any host's latch row has reached this replica; the
-// operator's policy overrides both; enforcement.vrrp_unicast plays no part.
+// the cluster's rows only. Unicast once a latch row has reached this replica,
+// never on this host's own latch alone (another host may not have latched);
+// the operator's policy overrides; enforcement.vrrp_unicast plays no part.
 // Unicast goes from this host's recorded address, over the device holding it,
 // to every other LB host's.
 //
-// Mutations (each red): decide on the flag; on Latched rather than
-// DurablyLatched; ignore the latch row; ignore the operator's multicast; leave
-// a peer out; send from the VIP's bridge.
+// Mutations (each red): decide on the flag; render on the own latch; ignore
+// the latch row; ignore the operator's multicast; leave a peer out; send from
+// the VIP's bridge.
 func TestApplyLB_VRRPTransportIsClusterWide(t *testing.T) {
 	hosts := []string{"peer-1", "self", "peer-2"}
 	for _, tc := range []struct {
@@ -81,12 +81,12 @@ func TestApplyLB_VRRPTransportIsClusterWide(t *testing.T) {
 		policy                 string // the operator's choice
 		unicast                bool
 	}{
-		{"durably latched", true, true, true, false, "", true},
-		{"durably latched, flag off", false, true, true, false, "", true},
-		{"latched in memory only", true, true, false, false, "", false},
+		{"durably latched, no row yet", true, true, true, false, "", false},
+		{"latch row", true, true, true, true, "", true},
+		{"latch row, flag off", false, true, true, true, "", true},
 		{"not latched", true, false, false, false, "", false},
 		{"not latched here, latch row replicated", false, false, false, true, "", true},
-		{"durably latched, operator chose multicast", true, true, true, false, "multicast", false},
+		{"latch row, operator chose multicast", true, true, true, true, "multicast", false},
 		{"latch row, operator chose unicast", false, false, false, true, "unicast", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -131,20 +131,42 @@ func TestApplyLB_VRRPTransportIsClusterWide(t *testing.T) {
 	}
 }
 
-// TestVRRPUnicastActive_FirstLatchTellsEveryHost: the host whose latch becomes
-// durable records it, so a host that has not latched yet renders unicast as
-// soon as the row reaches it.
+// TestNoteVRRPLatch_TheRowSwitchesEveryHost: a host's durable latch switches
+// nothing by itself; the watch writes the latch row, and the row switches
+// every host. A host whose cluster_policies is not writable yet
+// (failover_scope_v1 not latched) writes nothing, so every host stays
+// multicast: uniform rather than early. Read paths never write it.
 //
-// Mutation: do not write the latch row — red.
-func TestVRRPUnicastActive_FirstLatchTellsEveryHost(t *testing.T) {
-	s := vrrpServer(t, true, true, true)
+// Mutations: write the row from vrrpUnicastActive — the read-only case goes
+// red; write it with the gate closed — red; render on the own latch — red.
+func TestNoteVRRPLatch_TheRowSwitchesEveryHost(t *testing.T) {
 	ctx := context.Background()
-	if on, err := s.vrrpUnicastActive(ctx); err != nil || !on {
-		t.Fatalf("vrrpUnicastActive = %v, %v", on, err)
+	s := vrrpServer(t, true, true, true)
+	s.db.SetClusterPolicyGate(func() bool { return false })
+	if on, err := s.vrrpUnicastActive(ctx); err != nil || on {
+		t.Fatalf("own latch alone: unicast=%v err=%v, want multicast", on, err)
 	}
+	if _, err := s.GetVRRPTransport(adminCtx(), nil); err != nil {
+		t.Fatal(err)
+	}
+	s.noteVRRPLatch(ctx)
+	if p, _ := corrosion.GetVRRPTransport(ctx, s.db); p.Latched {
+		t.Fatal("the latch row was written with cluster_policies not writable")
+	}
+	if applied, err := peerApply(t, s, []string{"self", "peer-1"}); err != nil || applied[0].VRRPUnicast {
+		t.Fatalf("gate closed: applied %+v (%v), want multicast", applied, err)
+	}
+	s.db.SetClusterPolicyGate(func() bool { return true })
+	if on, _ := s.vrrpUnicastActive(ctx); on {
+		t.Fatal("a read path wrote the latch row")
+	}
+	s.noteVRRPLatch(ctx)
 	p, err := corrosion.GetVRRPTransport(ctx, s.db)
 	if err != nil || !p.Latched || p.LatchedBy != s.hostName {
 		t.Fatalf("latch row = %+v (%v), want written by %s", p, err, s.hostName)
+	}
+	if on, _ := s.vrrpUnicastActive(ctx); !on {
+		t.Fatal("the latch row does not switch this host")
 	}
 }
 
@@ -158,6 +180,7 @@ func TestVRRPUnicastActive_FirstLatchTellsEveryHost(t *testing.T) {
 func TestApplyLB_VRRPUnicastDropsAPeerWithNoAddress(t *testing.T) {
 	ctx := context.Background()
 	s := vrrpServer(t, true, true, true)
+	markLatched(t, s)
 	if err := corrosion.DeleteHost(ctx, s.db, "peer-2"); err != nil { // lv host rm
 		t.Fatal(err)
 	}
@@ -177,16 +200,91 @@ func TestApplyLB_VRRPUnicastDropsAPeerWithNoAddress(t *testing.T) {
 	}
 }
 
-// TestApplyLB_VRRPUnicastRefusesAnAddressNoDeviceHolds: VRRP sent from an
-// address this host does not own is never answered, so the apply is refused
-// rather than guessing the default-route device.
+// markLatched writes the latch row, as the first latching host does.
+func markLatched(t *testing.T, s *Server) {
+	t.Helper()
+	if err := corrosion.MarkVRRPUnicastLatched(context.Background(), s.db, "peer-2"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestApplyLB_VRRPRefusalStopsThisHostAndIsCritical: a host whose recorded
+// address no up, non-loopback device holds cannot render unicast. Its
+// keepalived, still on multicast, would hold the VIP beside the LB hosts that
+// switched, so when another LB host answers as one that renders the
+// transport it is stopped, and a critical condition names the LB, the reason
+// and the remedy (lv cluster vrrp-transport multicast). With no other host
+// rendering it, nothing is stopped (the LB keeps a holder). A successful apply
+// resolves the condition. The refusal event is published once per reason.
 //
-// Mutation: fall back to some device — red.
-func TestApplyLB_VRRPUnicastRefusesAnAddressNoDeviceHolds(t *testing.T) {
+// Mutations (each red): never stop keepalived; stop it with no other host
+// rendering; no condition; no resolve; publish on every refusal.
+func TestApplyLB_VRRPRefusalStopsThisHostAndIsCritical(t *testing.T) {
+	ctx := context.Background()
 	s := vrrpServer(t, true, true, true)
-	s.lbIfaceForIPOverride = func(string) string { return "" }
+	markLatched(t, s)
+	held := true
+	s.lbIfaceForIPOverride = func(ip string) string {
+		if !held && ip == "192.0.2.11" {
+			return "eth-host"
+		}
+		return ""
+	}
+	renders := false
+	s.vrrpPeerCapsOverride = func(context.Context, string) ([]string, bool, error) {
+		if renders {
+			return []string{capabilities.VRRPUnicastV1}, false, nil
+		}
+		return nil, false, errors.New("unreachable")
+	}
+	var stopped []string
+	s.lbDemoteOverride = func(name string) error { stopped = append(stopped, name); return nil }
+	cond := func() (bool, string) {
+		row, ok, err := corrosion.GetHealthCondition(ctx, s.db, LBEvaluator, CondLBVRRPRefused, "host", s.hostName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok && row.Lifecycle != corrosion.ConditionResolved && row.Severity == corrosion.SeverityCritical, row.Evidence
+	}
+	ch, unsub := s.events.Subscribe()
+	defer unsub()
+
 	if applied, err := peerApply(t, s, []string{"self", "peer-1"}); err == nil || len(applied) != 0 {
 		t.Fatalf("applied %d configs (err %v), want the apply refused", len(applied), err)
+	}
+	if len(stopped) != 0 {
+		t.Fatalf("stopped %v with no other LB host rendering the transport", stopped)
+	}
+	if on, detail := cond(); !on || !strings.Contains(detail, "lbr-lb") || !strings.Contains(detail, "lv cluster vrrp-transport multicast") {
+		t.Fatalf("condition active=%v detail=%q, want critical, naming the LB and the remedy", on, detail)
+	}
+	renders = true
+	if _, err := peerApply(t, s, []string{"self", "peer-1"}); err == nil {
+		t.Fatal("applied")
+	}
+	if len(stopped) != 1 || stopped[0] != "lbr-lb" {
+		t.Fatalf("stopped %v, want lbr-lb once another LB host renders the transport", stopped)
+	}
+	refusals := 0
+	for done := false; !done; {
+		select {
+		case e := <-ch:
+			if e.Action == "lb.vrrp_transport_refused" {
+				refusals++
+			}
+		default:
+			done = true
+		}
+	}
+	if refusals != 1 {
+		t.Errorf("published %d refusal events for one reason, want 1", refusals)
+	}
+	held = false
+	if applied, err := peerApply(t, s, []string{"self", "peer-1"}); err != nil || len(applied) != 1 || !applied[0].VRRPUnicast {
+		t.Fatalf("apply once the address is held: %v (%d)", err, len(applied))
+	}
+	if on, _ := cond(); on {
+		t.Fatal("the condition is still active after a successful apply")
 	}
 }
 
@@ -222,6 +320,7 @@ func TestReconcileDeadLBs_ReappliesOnAnyTransportChange(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := vrrpServer(t, true, true, true)
+			markLatched(t, s)
 			ctx := context.Background()
 			hosts, _ := json.Marshal([]string{"self", "peer-1"})
 			if err := corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
@@ -235,7 +334,7 @@ func TestReconcileDeadLBs_ReappliesOnAnyTransportChange(t *testing.T) {
 			}
 			s.lbKeepalivedOverride = func(string) bool { return true }
 			s.lbRenderedTransportOverride = func(string) (lb.Transport, bool) { return tc.have, true }
-			s.vrrpPeerCapsOverride = func(context.Context, string) ([]string, error) { return nil, errors.New("down") }
+			s.vrrpPeerCapsOverride = func(context.Context, string) ([]string, bool, error) { return nil, false, errors.New("down") }
 			var applied []lb.Config
 			s.lbApplyOverride = func(_ context.Context, c lb.Config) error { applied = append(applied, c); return nil }
 
@@ -248,24 +347,27 @@ func TestReconcileDeadLBs_ReappliesOnAnyTransportChange(t *testing.T) {
 	}
 }
 
-// TestNoteVRRPSplit_AnEarlierBuildPeerIsReported: after the latch, an LB host
-// that answers a Ping without vrrp_unicast_v1 is on an earlier build and
-// renders multicast while this host renders unicast — both hold the VIP. A
-// critical condition names the LB, the host and the remedy, and resolves once
-// the host advertises it. An unreachable host is not reported.
+// TestNoteVRRPSplit_AnEarlierBuildPeerIsReported: after the switch, an LB
+// host that answers a Ping without vrrp_unicast_v1, or reports WAL quarantine
+// (rolled back), renders multicast while this host renders unicast — both
+// hold the VIP. A critical condition names the LB, the host and the remedy,
+// and resolves once the host advertises it. An unreachable host, and a
+// self-fenced one (it answers with no capabilities), are not reported.
 //
-// Mutation: count an unreachable host — red; never raise — red.
+// Mutations: count an unreachable or self-fenced host — red; ignore WAL
+// quarantine — red; never raise — red.
 func TestNoteVRRPSplit_AnEarlierBuildPeerIsReported(t *testing.T) {
 	s := vrrpServer(t, true, true, true)
+	markLatched(t, s)
 	ctx := context.Background()
-	hosts, _ := json.Marshal([]string{"self", "peer-1", "peer-2"})
+	hosts, _ := json.Marshal([]string{"self", "peer-1", "peer-2", "fenced", "rolledback"})
 	recs := []corrosion.LBConfigRecord{{Name: "web", Hosts: string(hosts)}}
-	caps := map[string][]string{"peer-1": {capabilities.SplitBrainGateV1}}
-	s.vrrpPeerCapsOverride = func(_ context.Context, h string) ([]string, error) {
+	caps := map[string][]string{"peer-1": {capabilities.SplitBrainGateV1}, "fenced": {}, "rolledback": {capabilities.VRRPUnicastV1}}
+	s.vrrpPeerCapsOverride = func(_ context.Context, h string) ([]string, bool, error) {
 		if c, ok := caps[h]; ok {
-			return c, nil
+			return c, h == "rolledback", nil
 		}
-		return nil, errors.New("unreachable")
+		return nil, false, errors.New("unreachable")
 	}
 	active := func() (bool, string) {
 		row, ok, err := corrosion.GetHealthCondition(ctx, s.db, LBEvaluator, CondLBVRRPSplit, "host", s.hostName)
@@ -276,10 +378,12 @@ func TestNoteVRRPSplit_AnEarlierBuildPeerIsReported(t *testing.T) {
 	}
 	s.noteVRRPSplit(ctx, recs)
 	on, detail := active()
-	if !on || !strings.Contains(detail, "web (with peer-1)") || strings.Contains(detail, "peer-2") || !strings.Contains(detail, "lv cluster vrrp-transport multicast") {
-		t.Fatalf("condition active=%v detail=%q, want web with peer-1 only, and the remedy", on, detail)
+	if !on || !strings.Contains(detail, "web (with peer-1)") || !strings.Contains(detail, "web (with rolledback)") ||
+		strings.Contains(detail, "peer-2") || strings.Contains(detail, "fenced") || !strings.Contains(detail, "lv cluster vrrp-transport multicast") {
+		t.Fatalf("condition active=%v detail=%q, want peer-1 and rolledback only, and the remedy", on, detail)
 	}
 	caps["peer-1"] = []string{capabilities.VRRPUnicastV1}
+	delete(caps, "rolledback")
 	s.noteVRRPSplit(ctx, recs)
 	if on, _ := active(); on {
 		t.Fatal("condition still active once every LB host advertises vrrp_unicast_v1")

@@ -67,6 +67,8 @@ lv cluster converge [--all]        # Kick an immediate anti-entropy pass + repor
                                    #   (`lv cluster sync` is a deprecated alias)
 lv cluster failover-scope [cluster|region]  # Show or set whether failover quorum is cluster-wide or
                                    #   per region (see federation.md → Regions and failure)
+lv cluster vrrp-transport [unicast|multicast]  # Show or set how load balancer hosts exchange VRRP,
+                                   #   cluster-wide (admin to set; see compose.md → Load balancer)
 lv cluster relay-restore            # List relay-health demotions and operator holds (since, until, reason)
 lv cluster relay-restore <host> [--hold 1h]  # Clear a relay-health demotion now; --hold keeps the lease
                                    #   holder from demoting it again (admin, audited; see operating-model.md → Replication)

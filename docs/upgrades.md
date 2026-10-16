@@ -1431,9 +1431,14 @@ nothing switches until the `vrrp_unicast_v1` capability token has latched. It
 latches once every host the cluster replicates to, including one parked in
 `maintenance`, runs this release; a host with `enforcement.vrrp_unicast: false`
 withholds it, so it holds the switch off. The first host whose latch is durable
-records it cluster-wide, and every LB host then re-applies its LBs within 2
-seconds of that record reaching it, whatever its own flag says: an LB is held
-by both its hosts for about the replication delay between them plus 2 seconds.
+records it cluster-wide, once `failover_scope_v1` has latched there too (the
+record lives in `cluster_policies`), and until then every host stays multicast.
+Every LB host then re-applies its LBs within 2 seconds of that record reaching
+it, whatever its own flag says: an LB is held by both its hosts for about the
+replication delay between them plus 2 seconds. A host that cannot render unicast
+(its recorded address is on no up, non-loopback local device) raises
+`lb.vrrp.transport_refused` and stops its keepalived for each LB another host
+serves.
 Hosts must pass IP protocol 112 between their recorded addresses.
 
 The stand-down is cluster-wide: `lv cluster vrrp-transport multicast` (admin),

@@ -151,6 +151,14 @@ func normaliseTagGroupDef(def FirewallTagGroupDef) (FirewallTagGroupDef, error) 
 	return FirewallTagGroupDef{Match: match, Networks: nets, SecurityGroups: sgs}, nil
 }
 
+// ValidateFirewallTagGroupDef refuses a definition SetFirewallTagGroup would
+// refuse: no match, or a key, value, network or security group outside the
+// grammar.
+func ValidateFirewallTagGroupDef(def FirewallTagGroupDef) error {
+	_, err := normaliseTagGroupDef(def)
+	return err
+}
+
 // SetFirewallTagGroup writes group name's definition; a nil def removes the
 // group (the row's value becomes ""). It takes the firewall_tag_groups grant,
 // refuses a name or definition outside the grammar, and refuses with

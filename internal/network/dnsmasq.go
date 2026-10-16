@@ -44,6 +44,9 @@ var startDHCPFunc = StartDHCP
 //   - dhcp-range still works for stateful DHCPv6 leases.
 //   - Bridges get the gateway address with `ip -6 addr add`, automatic.
 //
+// noRouter: the network has no router (an isolated network), so the bridge is
+// not offered to guests as their gateway (see dnsmasqArgs).
+//
 // dnsmasqArgs builds the dnsmasq command line for a per-bridge DHCP+DNS
 // instance. Pure function so the argument set is unit-testable without
 // spawning dnsmasq.
@@ -94,7 +97,7 @@ func dnsmasqPidFileVNI(vni int) string {
 	return dnsmasqPidFile(fmt.Sprintf("vni%d", vni))
 }
 
-func dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile string, upstreamDNS []string, localDomain string, localPort int) []string {
+func dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile string, noRouter bool, upstreamDNS []string, localDomain string, localPort int) []string {
 	args := []string{
 		"--interface=" + bridge,
 		"--except-interface=lo",
@@ -113,6 +116,19 @@ func dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile string, up
 	// route and dnsmasq's DHCPv6 server is announced.
 	if isIPv6Gateway(gateway) {
 		args = append(args, "--enable-ra", "--dhcp-authoritative")
+	}
+	// A network with no router (an isolated network): the bridge address is
+	// not a way out, so it is not offered as one. DHCPv4 sends no router
+	// option, and router advertisements carry a router lifetime of 0 (the
+	// prefix is still announced). A guest then takes no default route through
+	// the bridge whatever its DHCP client does with the seed's use-routes,
+	// which cloud-init's sysconfig and NetworkManager renderers drop.
+	if noRouter {
+		if isIPv6Gateway(gateway) {
+			args = append(args, "--ra-param="+bridge+",0,0")
+		} else {
+			args = append(args, "--dhcp-option=option:router")
+		}
 	}
 	// Domain-specific forward to the embedded DNS: guests get dnsmasq (the gateway)
 	// as their resolver, and dnsmasq forwards ONLY <localDomain> queries to the
@@ -135,7 +151,7 @@ func dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile string, up
 	return args
 }
 
-func StartDHCP(bridge, gateway, rangeStart, rangeEnd, mask, pidFile string) error {
+func StartDHCP(bridge, gateway, rangeStart, rangeEnd, mask, pidFile string, noRouter bool) error {
 	// Assign gateway IP to the bridge (idempotent — ignore "already assigned").
 	out, err := execCommand("ip", "addr", "add", gateway, "dev", bridge)
 	if err != nil && !isAlreadyExists(out) {
@@ -146,7 +162,7 @@ func StartDHCP(bridge, gateway, rangeStart, rangeEnd, mask, pidFile string) erro
 	// arg set we'd launch with NOW. Computed before the already-running check so we
 	// can detect config drift against the live process.
 	upstreamDNS := resolveUpstreamDNS()
-	desiredArgs := dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile, upstreamDNS, localResolverDomain, localResolverPort)
+	desiredArgs := dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile, noRouter, upstreamDNS, localResolverDomain, localResolverPort)
 
 	// If dnsmasq is already running for this bridge, leave it alone — UNLESS its
 	// live command line has drifted from what we'd launch now. Re-provisioning

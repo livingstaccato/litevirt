@@ -2541,6 +2541,25 @@ vms:
 		}
 	})
 
+	// The isolated network's dnsmasq offers no router, so no guest takes a
+	// default route through it: not vm1, whose seed says use-routes: false
+	// (which RHEL-family cloud-init drops), and not vm3, whose only NIC is
+	// on it and which gets no network-config at all.
+	t.Run("Isolated/NoDefaultRoute", func(t *testing.T) {
+		for _, vm := range []string{vm1Name, vm3Name} {
+			iface := getVMIfaceForSubnet(t, vm, "10.201.0.")
+			out, err := execRetry(t, vm, "ip", "-4", "route", "show", "default")
+			if err != nil {
+				t.Fatalf("ip route on %s failed: %v\n%s", vm, err, out)
+			}
+			for _, line := range strings.Split(out, "\n") {
+				if strings.Contains(" "+line+" ", " dev "+iface+" ") {
+					t.Errorf("%s has a default route through its isolated interface %s: %q\nall default routes:\n%s", vm, iface, line, out)
+				}
+			}
+		}
+	})
+
 	t.Run("Isolated/NoInternet", func(t *testing.T) {
 		iface := getVMIfaceForSubnet(t, vm1Name, "10.201.0.")
 		t.Logf("isolated interface on %s: %s", vm1Name, iface)

@@ -73,7 +73,7 @@ func TestProvision_Bridge_PreExistingNAT_NoDHCP(t *testing.T) {
 	execCommand = func(name string, args ...string) ([]byte, error) { return nil, nil }
 	defer func() { execCommand = defaultExec }()
 	dhcpStarted := false
-	startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string) error {
+	startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string, noRouter bool) error {
 		dhcpStarted = true
 		return nil
 	}
@@ -167,7 +167,7 @@ func TestProvision_DnsmasqPidFilePaths(t *testing.T) {
 			execCommand = func(name string, args ...string) ([]byte, error) { return nil, nil }
 			defer func() { execCommand = defaultExec }()
 			var started []string
-			startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string) error {
+			startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string, noRouter bool) error {
 				started = append(started, pidFile)
 				return nil
 			}
@@ -258,7 +258,7 @@ func TestProvision_WithSubnet(t *testing.T) {
 		return nil, nil
 	}
 	defer func() { execCommand = defaultExec }()
-	startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string) error {
+	startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string, noRouter bool) error {
 		return nil
 	}
 	defer func() { startDHCPFunc = StartDHCP }()
@@ -467,5 +467,46 @@ func TestSyncFloodEntries(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected flood entry for 10.10.0.2; calls: %v", calls)
+	}
+}
+
+// TestProvision_IsolatedDHCPOffersNoRouter: Provision asks for a DHCP server
+// with no router on an isolated network, and with one on a bridge or VXLAN
+// network, whose bridge address is the guests' gateway.
+func TestProvision_IsolatedDHCPOffersNoRouter(t *testing.T) {
+	cases := []struct {
+		name string
+		def  compose.NetworkDef
+		want bool
+	}{
+		{"bridge", compose.NetworkDef{Type: "bridge", Interface: "lv-nr-br0", Subnet: "10.88.0.0/24"}, false},
+		{"vxlan", compose.NetworkDef{Type: "vxlan", VNI: 4243, Underlay: "eth0", Subnet: "10.89.0.0/24"}, false},
+		{"isolated", compose.NetworkDef{Type: "isolated", Subnet: "10.90.0.0/24"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := corrosion.NewTestClientT(t)
+			if err := corrosion.InitSchema(context.Background(), db); err != nil {
+				t.Fatalf("InitSchema: %v", err)
+			}
+			execCommand = func(name string, args ...string) ([]byte, error) { return nil, nil }
+			defer func() { execCommand = defaultExec }()
+			var got []bool
+			startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string, noRouter bool) error {
+				got = append(got, noRouter)
+				return nil
+			}
+			defer func() { startDHCPFunc = StartDHCP }()
+
+			if _, err := Provision(context.Background(), db, "nrnet", tc.def, "10.0.0.1", "host1"); err != nil {
+				t.Fatalf("Provision: %v", err)
+			}
+			if len(got) != 1 {
+				t.Fatalf("expected exactly 1 DHCP start, got %d", len(got))
+			}
+			if got[0] != tc.want {
+				t.Errorf("Provision started DHCP with noRouter=%v, want %v", got[0], tc.want)
+			}
+		})
 	}
 }

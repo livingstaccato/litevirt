@@ -337,7 +337,8 @@ func startDHCPFor(def compose.NetworkDef, f DHCPHostFacts, networkName, bridge, 
 	if err != nil {
 		return fmt.Errorf("derive DHCP range: %w", err)
 	}
-	if err := startDHCPFunc(bridge, gw, rangeStart, rangeEnd, mask, pidFile); err != nil {
+	// An isolated network has no router: its DHCP server offers none.
+	if err := startDHCPFunc(bridge, gw, rangeStart, rangeEnd, mask, pidFile, def.Type == "isolated"); err != nil {
 		return fmt.Errorf("start DHCP on %s: %w", bridge, err)
 	}
 	return nil

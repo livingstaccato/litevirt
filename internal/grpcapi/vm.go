@@ -4148,16 +4148,6 @@ func (s *Server) SetVMIP(ctx context.Context, req *pb.SetVMIPRequest) (*pb.VM, e
 		return nil, err
 	}
 
-	// Served by the VM's owner whenever it answers: there the write runs under
-	// the VM lock, after any detach of the NIC, against the owner's own rows.
-	// An owner that cannot be reached leaves it to this node, which writes the
-	// legacy row only (recordSetVMIP).
-	if vm.HostName != "" && vm.HostName != s.hostName {
-		if out, ferr, served := s.forwardSetVMIP(ctx, vm.HostName, req); served {
-			return out, ferr
-		}
-	}
-
 	networkName := req.NetworkName
 	if networkName == "" {
 		networkName = "production"
@@ -4212,9 +4202,9 @@ func (s *Server) SetVMIP(ctx context.Context, req *pb.SetVMIPRequest) (*pb.VM, e
 	// network's live NIC (UpdateVMInterfaceIP). No live NIC there records
 	// nothing, as the unfiltered UPDATE this replaced recorded nothing visible;
 	// it is reported, not refused.
-	written, err := s.recordSetVMIP(ctx, req.Name, networkName, req.Ip)
+	written, err := corrosion.UpdateVMInterfaceIP(ctx, s.db, req.Name, networkName, "", req.Ip)
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.Internal, "update VM interface IP: %v", err)
 	}
 	if !written {
 		slog.Warn("SetVMIP: no single live NIC of the VM is on this network; no interface row records the address",
@@ -4232,62 +4222,6 @@ func (s *Server) SetVMIP(ctx context.Context, req *pb.SetVMIPRequest) (*pb.VM, e
 	slog.Info("VM interface IP updated", "vm", req.Name, "network", networkName, "ip", req.Ip)
 	s.recordVMEvent(ctx, req.Name, "vm.ip-changed", "ok", networkName+"="+req.Ip)
 	return s.vmToProto(ctx, req.Name)
-}
-
-// setVMIPForwardTimeout bounds SetVMIP's forward to the VM's owner. Past it
-// the owner counts as unreachable and the call is served here.
-const setVMIPForwardTimeout = 10 * time.Second
-
-// forwardSetVMIP sends req to the VM's owner. served is false when the owner
-// could not be reached (no dial target, or the call failed Unavailable or ran
-// out of its own deadline), and the caller then serves the request itself;
-// any other answer, success or refusal, is the owner's and is returned.
-func (s *Server) forwardSetVMIP(ctx context.Context, owner string, req *pb.SetVMIPRequest) (out *pb.VM, err error, served bool) {
-	client, conn, derr := s.peerClient(ctx, owner)
-	if derr != nil {
-		slog.Warn("SetVMIP: owner unreachable; recording the address here", "vm", req.Name, "owner", owner, "error", derr)
-		return nil, nil, false
-	}
-	defer conn.Close()
-	fctx, cancel := context.WithTimeout(ctx, setVMIPForwardTimeout)
-	defer cancel()
-	out, err = client.SetVMIP(fctx, req)
-	if err == nil {
-		return out, nil, true
-	}
-	code := status.Code(err)
-	if code == codes.Unavailable || (code == codes.DeadlineExceeded && ctx.Err() == nil) {
-		slog.Warn("SetVMIP: owner unreachable; recording the address here", "vm", req.Name, "owner", owner, "error", err)
-		return nil, nil, false
-	}
-	return nil, err, true
-}
-
-// recordSetVMIP writes SetVMIP's address. On the VM's owner, under the VM
-// lock with the owner re-read, both tables are written
-// (UpdateVMInterfaceIPOwned). Anywhere else, or when a start held past its
-// wait keeps the lock, only the legacy row is (UpdateVMInterfaceIP): a
-// vm_nics rewrite there could revive a NIC detached on the owner, or replace
-// a field changed there, that has not replicated here yet.
-func (s *Server) recordSetVMIP(ctx context.Context, vmName, networkName, ip string) (bool, error) {
-	write := corrosion.UpdateVMInterfaceIP
-	if vm, _ := corrosion.GetVM(ctx, s.db, vmName); vm != nil && vm.HostName == s.hostName {
-		unlock, held, lerr := s.lockVMUnlessStartHeld(ctx, vmName)
-		if lerr != nil {
-			return false, lerr
-		}
-		if held == nil {
-			defer unlock()
-			if vm, _ := corrosion.GetVM(ctx, s.db, vmName); vm != nil && vm.HostName == s.hostName {
-				write = corrosion.UpdateVMInterfaceIPOwned
-			}
-		}
-	}
-	written, err := write(ctx, s.db, vmName, networkName, "", ip)
-	if err != nil {
-		return false, status.Errorf(codes.Internal, "update VM interface IP: %v", err)
-	}
-	return written, nil
 }
 
 // SetBootOrder updates the boot order of a VM by modifying its libvirt domain XML.

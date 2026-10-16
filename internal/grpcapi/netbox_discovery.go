@@ -300,17 +300,7 @@ func (s *Server) recordDiscoveredVMIP(ctx context.Context, vm *corrosion.VMRecor
 // that holds the lease, and only while that NIC is live. A report for a NIC
 // that has since been detached records nothing (UpdateVMInterfaceIP).
 func (s *Server) persistDiscoveredVMIP(ctx context.Context, vmName, netName, mac, ip string) bool {
-	// Both tables only on the owner holding the VM lock; the lock is tried,
-	// never waited for, so a read RPC or the scanner never queues behind an
-	// operation. Otherwise the legacy row only (UpdateVMInterfaceIP).
-	write := corrosion.UpdateVMInterfaceIP
-	if unlock, ok := s.tryLockVM(vmName); ok {
-		defer unlock()
-		if vm, _ := corrosion.GetVM(ctx, s.db, vmName); vm != nil && vm.HostName == s.hostName {
-			write = corrosion.UpdateVMInterfaceIPOwned
-		}
-	}
-	written, err := write(ctx, s.db, vmName, netName, mac, ip)
+	written, err := corrosion.UpdateVMInterfaceIP(ctx, s.db, vmName, netName, mac, ip)
 	if err != nil {
 		slog.Warn("could not record a discovered VM address; it will be re-discovered",
 			"vm", vmName, "network", netName, "ip", ip, "error", err)

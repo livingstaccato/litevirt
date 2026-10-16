@@ -843,6 +843,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler.SetGateRefusedObserver(gateMetrics.Refused)
 	reconciler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	reconciler.SetSharedStorageFenceEnforce(d.cfg.Enforcement.SharedStorageFence) // shared-disk transfer fence kill-switch
+	// A domain the reconciler renders for a spec with no cpu_mode gets the
+	// default a create on this node stamps.
+	reconciler.SetDefaultCPUMode(d.cfg.VM.DefaultCPUMode)
 
 	// Daily prune of this host's vm_events rows so the operational event store
 	// stays bounded (see config vm_event_*).

@@ -957,7 +957,7 @@ worth chasing even though the daemon survives it.
 ## VM defaults
 
 Cluster-wide defaults stamped onto a VM at **create** time. They shape new specs
-only — nothing here reinterprets a spec that is already stored, so changing one
+only — nothing here rewrites a spec that is already stored, so changing one
 can never move a running guest's hardware underneath it.
 
 ```yaml
@@ -991,7 +991,9 @@ For a deliberately heterogeneous fleet, hold one baseline per VM instead:
 because a cluster-wide default cannot supply the per-VM model it requires.
 
 A VM with an empty `cpu_mode` (one created before this default existed) keeps
-it, and the default does not change how it renders. List them with `lv doctor cpu-mode` and move one
+it in its spec, and `lv update` and migrations render it as before. A domain the
+reconciler renders from the stored spec — a failover start, an onboot or
+self-heal start — gets this default instead of `qemu64`. List them with `lv doctor cpu-mode` and move one
 forward, while it is stopped, with `lv update <vm> --cpu-mode host-model`.
 
 ## Migration

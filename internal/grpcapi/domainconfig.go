@@ -7,11 +7,11 @@ import (
 )
 
 // baseDomainConfig assembles the libvirt VMConfig fields that MUST be identical
-// between CreateVM and a full-regeneration redefine — every field derived from the
-// VMSpec. Both paths route through here so they can't diverge again: the old inline
-// redefine builder dropped MinMemoryMiB/MaxMemoryMiB (collapsing the balloon ceiling
-// to the current memory) and Hostdevs (silently detaching PCI passthrough on any
-// `lv update` of a stopped VM).
+// between CreateVM, a full-regeneration redefine and the reconciler's failover
+// start — every field derived from the VMSpec (compose.DomainConfig). The old
+// inline redefine builder dropped MinMemoryMiB/MaxMemoryMiB (collapsing the
+// balloon ceiling to the current memory) and Hostdevs (silently detaching PCI
+// passthrough on any `lv update` of a stopped VM).
 //
 // Disks, networks, and hostdevs are passed in because their SOURCING differs:
 // CreateVM allocates brand-new devices, while a redefine rebuilds them from the
@@ -19,47 +19,5 @@ import (
 // cloud-init ISO are applied by the caller (create host-resolves firmware paths and
 // refuses to adopt orphaned state; redefine reuses the existing state).
 func baseDomainConfig(spec *pb.VMSpec, disks []lv.DiskConfig, nets []lv.NetworkConfig, hostdevs []lv.HostdevConfig) lv.VMConfig {
-	cfg := lv.VMConfig{
-		Name:         spec.Name,
-		UUID:         spec.Uuid,
-		CPU:          int(spec.Cpu),
-		MaxCPU:       int(spec.MaxCpu),
-		CPUMode:      spec.CpuMode,
-		CPUModel:     spec.CpuModel,
-		MemoryMiB:    int(spec.MemoryMib),
-		MinMemoryMiB: int(spec.MinMemoryMib),
-		MaxMemoryMiB: int(spec.MaxMemoryMib),
-		// Memory hot-add (virtio-mem): the boot cell and the ceiling.
-		HotplugBaseMiB: int(spec.MemoryHotplugBaseMib),
-		HotplugMaxMiB:  int(spec.MemoryHotplugMaxMib),
-		Machine:        spec.Machine,
-		Firmware:       spec.Firmware,
-		GuestAgent:     spec.GuestAgent,
-		EnableVNC:      !spec.DisableVnc,
-		EnableSPICE:    spec.EnableSpice,
-		Disks:          disks,
-		Networks:       nets,
-		Hostdevs:       hostdevs,
-		Boot:           spec.Boot,
-		CPULimit:       spec.CpuLimit,
-		CPUShares:      int(spec.CpuShares),
-	}
-	// Disk discard / detect_zeroes / I/O throttle and NIC queues ride in the
-	// stored spec, so every render of the domain carries them.
-	compose.ApplyDiskTuning(cfg.Disks, spec)
-	compose.ApplyNICTuning(cfg.Networks, spec)
-	if r := spec.Resources; r != nil {
-		cfg.HugePages = r.Hugepages
-		cfg.IOThreads = int(r.IoThreads)
-		for _, pin := range r.CpuPinning {
-			cfg.CPUPinning = append(cfg.CPUPinning, int(pin))
-		}
-		if np := r.NumaPolicy; np != nil {
-			cfg.NUMAPolicy = &lv.NUMAPolicy{
-				PreferredNode: int(np.PreferredNode),
-				Strict:        np.Strict,
-			}
-		}
-	}
-	return cfg
+	return compose.DomainConfig(spec, disks, nets, hostdevs)
 }

@@ -1300,8 +1300,10 @@ func (c *Config) ImagePullBlockedPrefixes() ([]netip.Prefix, error) {
 // Zero/unset fields fall back to the built-in defaults
 // (corrosion.DefaultCapacityPolicy).
 // VMDefaultsConfig holds cluster-wide defaults stamped onto a VM at CREATE
-// time. They shape new specs only — nothing here reinterprets a spec that is
-// already stored, so changing one can never move a running guest.
+// time. They shape new specs only — nothing here rewrites a spec that is
+// already stored, so changing one can never move a running guest. (A domain
+// the reconciler renders for a spec with no cpu_mode, for a fresh boot, gets
+// DefaultCPUMode.)
 type VMDefaultsConfig struct {
 	// DefaultCPUMode is the cpu_mode a create stamps onto a spec that named
 	// none: host-passthrough | host-model | custom. Empty = host-model.

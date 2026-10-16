@@ -60,7 +60,9 @@ mid-rolling-upgrade that does not have the check yet, or one whose libvirt is
 briefly unhappy — is treated as *unverified*, not as incompatible, and the
 migration proceeds to libvirt's own check at cutover. A VM with an empty
 `cpu_mode` (QEMU's `qemu64`, identical on every host — see
-[`lv doctor cpu-mode`](diagnostics.md)) is not checked at all.
+[`lv doctor cpu-mode`](diagnostics.md)) is not checked at all, including one
+whose domain a failover or onboot start rendered with the `vm.default_cpu_mode`
+default; libvirt's own check at cutover still applies to it.
 
 A **cold** move is not checked either: a stopped VM migrated with `--cold`, a
 Secure Boot / vTPM VM, and a running VM that `lv host drain` moves cold (it has a

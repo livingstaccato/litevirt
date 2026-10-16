@@ -43,8 +43,11 @@ const (
 //
 // This default is applied at CREATE time, into the stored spec — never in the
 // renderer. A VM already persisted with an empty cpu_mode keeps rendering
-// exactly as it did, so a rolling upgrade cannot change a running guest's CPU
-// underneath it (and cannot break its in-flight migratability). Use
+// exactly as it did on a redefine, so a rolling upgrade cannot change a running
+// guest's CPU underneath it (and cannot break its in-flight migratability). The
+// one exception is a domain the reconciler renders from the stored spec for a
+// fresh boot (a failover, onboot or self-heal start), which gets this default
+// rather than qemu64 (health.Reconciler.domainXMLFor). Use
 // `lv update <vm> --cpu-mode host-model` on a stopped VM to move an existing
 // one forward, and `lv doctor cpu-mode` to find them.
 const DefaultCPUMode = CPUModeHostModel

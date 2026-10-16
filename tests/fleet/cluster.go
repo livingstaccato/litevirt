@@ -949,6 +949,10 @@ func (c *Cluster) buildServer(n *Node) {
 	// The source cleanup retry and the retained bundle sweep, as the daemon
 	// starts them.
 	go n.Server.RunFirmwareRetainedSweep(loops)
+	// The firmware move recovery, as the daemon runs it: at start, then
+	// every interval.
+	n.Server.RecoverFirmwareMoves(loops)
+	go n.Server.RunFirmwareMoveRecovery(loops)
 
 	// Wire a real Replicator so the server's PushMutations handler + write-notify
 	// path are exercised. By default its background push loop is NOT started, so

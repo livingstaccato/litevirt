@@ -195,6 +195,9 @@ type Fake struct {
 	// recorded, with the parameters libvirt was given; a scenario uses it to
 	// land the domain on the target's fake.
 	OnMigrateToTarget func(name, dconnuri string, p libvirt.MigrateParams) error
+	// JobActive, when set, answers DomainJobActive (a migration job a test
+	// has running on the domain). Set it under no lock the test holds.
+	JobActive func(name string) (bool, error)
 	// IgnoreShutdown makes ShutdownDomain a guest that ignores the ACPI
 	// request when it returns true: the call succeeds, the domain keeps
 	// running, and WaitForShutdown times out.
@@ -2259,6 +2262,18 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 
 func (f *Fake) DomainJobProgress(name string) (memPct, diskPct float32) {
 	return 100, 100
+}
+
+// DomainJobActive answers JobActive when it is set, else no job: the fake's
+// MigrateToTarget returns before anything could ask.
+func (f *Fake) DomainJobActive(name string) (bool, error) {
+	f.mu.Lock()
+	job := f.JobActive
+	f.mu.Unlock()
+	if job != nil {
+		return job(name)
+	}
+	return false, nil
 }
 
 // Snapshots.

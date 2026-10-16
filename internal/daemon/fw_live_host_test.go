@@ -147,7 +147,8 @@ func TestFwLiveHostCheck_CheckBounded(t *testing.T) {
 }
 
 // The daemon installs the Prepare check, from its own config, and starts the
-// hold sweep and the retained bundle sweep (comments do not count).
+// hold sweep, the retained bundle sweep and the firmware move recovery (at
+// start and every interval; comments do not count).
 //
 // Mutation: remove or comment out any of the lines in daemon.go — red.
 func TestFwLiveTarget_WiredInDaemon(t *testing.T) {
@@ -159,6 +160,8 @@ func TestFwLiveTarget_WiredInDaemon(t *testing.T) {
 		"svc.SetLiveFirmwareHost(newFwLiveHostCheck(d.cfg.Migration,",
 		"go svc.RunFirmwareHoldSweep(ctx)",
 		"go svc.RunFirmwareRetainedSweep(ctx)",
+		"svc.RecoverFirmwareMoves(ctx)",
+		"go svc.RunFirmwareMoveRecovery(ctx)",
 	} {
 		found := false
 		for _, l := range strings.Split(string(src), "\n") {

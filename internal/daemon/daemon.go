@@ -1950,6 +1950,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	grpcOpts = append(grpcOpts, obs.ServerOptions()...)
 	d.grpcSrv = grpc.NewServer(grpcOpts...)
 
+	// Resume, park or abort each live firmware move this host is the source
+	// of (spec §8.1). Unconditional, outside the operation journal's
+	// recovery, after every setter above and before the server serves: each
+	// move's VM lock is taken here, and released once its move is resolved
+	// or parked. Then, every minute, a parked move's blocked call is retried,
+	// fence resolution tried, and each owed DISCARD sent.
+	svc.RecoverFirmwareMoves(ctx)
+	go svc.RunFirmwareMoveRecovery(ctx)
+
 	pb.RegisterLiteVirtServer(d.grpcSrv, svc)
 
 	lis, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", d.cfg.GRPCPort))

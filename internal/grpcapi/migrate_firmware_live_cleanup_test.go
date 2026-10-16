@@ -853,8 +853,9 @@ func TestRetainedSweep_UnreadableOwedDiscardKeepsAll(t *testing.T) {
 
 // Review n-1: a cleanup that stops before it can record the cleaning phase
 // leaves its marker released, which the cleanup retry does not take. Its
-// condition must not promise the minute's retry; it says the move is finished
-// on the target and when the cleanup resumes.
+// condition must not promise the cleanup retry; it says the move is finished
+// on the target and that the firmware move recovery, which checks the target
+// first, resumes the cleanup.
 //
 // Mutation: give a released stop the generic action — red.
 func TestCleanupSource_ReleasedStopDoesNotPromiseMinuteRetry(t *testing.T) {
@@ -879,8 +880,9 @@ func TestCleanupSource_ReleasedStopDoesNotPromiseMinuteRetry(t *testing.T) {
 	if !open {
 		t.Fatal("no cleanup condition")
 	}
-	if strings.Contains(c.Evidence, "each minute") || !strings.Contains(c.Evidence, "released") {
-		t.Fatalf("the condition of a released stop promises the minute's retry, or does not say the marker stays released: %s", c.Evidence)
+	if strings.Contains(c.Evidence, "the cleanup is retried each minute") || !strings.Contains(c.Evidence, "stays released") ||
+		!strings.Contains(c.Evidence, "recovery checks the target") {
+		t.Fatalf("the condition of a released stop promises the cleanup retry, or does not say the marker stays released and the recovery takes it: %s", c.Evidence)
 	}
 }
 

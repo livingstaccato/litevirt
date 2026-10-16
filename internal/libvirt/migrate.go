@@ -268,6 +268,22 @@ func migrationFlagsAndParams(p MigrateParams) (golibvirt.DomainMigrateFlags, []g
 	return flags, params, nil
 }
 
+// DomainJobActive reports whether name has a job running (an outgoing
+// migration among them): libvirt's job type is bounded or unbounded. Unlike
+// DomainJobProgress, which reads -1 for both, an unreadable answer is an
+// error, never "no job".
+func (c *Client) DomainJobActive(name string) (bool, error) {
+	dom, err := c.virt.DomainLookupByName(name)
+	if err != nil {
+		return false, fmt.Errorf("lookup domain %q: %w", name, err)
+	}
+	typ, _, _, _, _, _, _, _, _, _, _, _, err := c.virt.DomainGetJobInfo(dom)
+	if err != nil {
+		return false, fmt.Errorf("domain %q: read its job: %w", name, err)
+	}
+	return typ == int32(golibvirt.DomainJobBounded) || typ == int32(golibvirt.DomainJobUnbounded), nil
+}
+
 // DomainJobProgress returns the memory and disk migration progress (0–100)
 // for a running migration, or -1 if no migration job is active.
 func (c *Client) DomainJobProgress(name string) (memPct, diskPct float32) {

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -40,6 +41,11 @@ type liveFirmwareRun struct {
 	prepared time.Time
 	// vfs are the SR-IOV VFs detached from the guest for the move.
 	vfs []corrosion.PCIDeviceRecord
+	// parked is the parked marker a recovery retry took the move from, while
+	// no later phase has been written: a retry that ends unanswered keeps
+	// that park (D2-10 m-7), and one that ends in it again with the same
+	// detail writes nothing (spec §8.1).
+	parked fwmig.Marker
 }
 
 // fwLiveSourceState is the Server's test seams for the source half.
@@ -47,6 +53,9 @@ type fwLiveSourceState struct {
 	// stepHook, when set, is called with each source step as it is reached
 	// ("commit", "cleanup"). Test-only.
 	stepHook func(step string)
+	// recovering counts the goroutines RecoverFirmwareMoves started, so a
+	// test can wait for them.
+	recovering sync.WaitGroup
 }
 
 func (s *Server) fwLiveStep(step string) {
@@ -57,8 +66,8 @@ func (s *Server) fwLiveStep(step string) {
 
 // liveFirmwareSourceCleanup is the source cleanup (spec §6.7, marker
 // released → cleaning → removed), set in migrate_firmware_live_cleanup.go.
-// nil leaves the marker released, its start veto in force, for the cleanup
-// retry (RetryLiveFirmwareCleanupsOnce).
+// nil leaves the marker released, its start veto in force, for the firmware
+// move recovery (FirmwareMoveRecoveryOnce), which checks the target first.
 var liveFirmwareSourceCleanup func(s *Server, ctx context.Context, m fwmig.Marker) error
 
 // Timing of the source half; vars so tests can shorten them.
@@ -102,6 +111,7 @@ func (s *Server) putLiveFirmwareMarker(r *liveFirmwareRun, p fwmig.Phase) error 
 		return status.Errorf(codes.Internal, "VM %q: record live firmware migration %s as %s: %v", m.VM, m.Attempt, p, err)
 	}
 	r.marker = m
+	r.parked = fwmig.Marker{}
 	return nil
 }
 
@@ -110,11 +120,25 @@ func (s *Server) putLiveFirmwareMarker(r *liveFirmwareRun, p fwmig.Phase) error 
 // is what the caller returns.
 func (s *Server) parkLiveFirmwareMove(ctx context.Context, r *liveFirmwareRun, p fwmig.Phase, detail string) error {
 	ctx = context.WithoutCancel(ctx)
-	if p == fwmig.PhaseTargetUnreachable && r.marker.Phase.Parked() {
+	if p == fwmig.PhaseTargetUnreachable {
 		// A retry of a parked move's blocked call that went unanswered (or was
 		// refused for the state the park recorded, D2-10 m-7) learns nothing
 		// new: the park stands, with its own condition.
-		p = r.marker.Phase
+		switch {
+		case r.marker.Phase.Parked():
+			p = r.marker.Phase
+		case r.parked.Phase.Parked():
+			p = r.parked.Phase
+		}
+	}
+	if pk := r.parked; pk.Phase == p && pk.Detail == detail && s.fwmigConditionOpenWith(ctx, fwmigConditionFor[p], pk.VM, detail) {
+		// A retry that ends where it was parked, for the same reason: the
+		// park, its condition and its event stand as written (§8.1).
+		r.marker = pk
+		slog.Debug("live firmware move: still parked", "vm", pk.VM, "attempt", pk.Attempt, "phase", p, "detail", detail)
+		return status.Errorf(codes.FailedPrecondition,
+			"VM %q: live firmware migration %s to %s is parked as %s: %s; both copies of its firmware state are kept",
+			pk.VM, pk.Attempt, pk.Target, p, detail)
 	}
 	m, err := r.marker.Park(p)
 	if err != nil {
@@ -127,24 +151,32 @@ func (s *Server) parkLiveFirmwareMove(ctx context.Context, r *liveFirmwareRun, p
 			slog.Error("live firmware move: cannot record the park; the marker on disk is kept", "vm", m.VM, "phase", p, "error", perr)
 		} else {
 			r.marker = m
+			r.parked = fwmig.Marker{}
 		}
 	}
-	if code, ok := fwmigConditionFor[p]; ok {
-		if cerr := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{
-			Code: code, VM: m.VM, Attempt: m.Attempt, Source: s.hostName, Target: m.Target,
-			Hashes: map[string]string{"src_permall_sha256": m.SrcPermallSHA256, "src_nvram_sha256": m.SrcNvramSHA256},
-			Paths:  []string{s.fw().SwtpmDir(m.UUID), s.fw().NvramPath(m.VM)},
-			Detail: detail,
-			Action: "both copies of the firmware state are kept, and nothing is deleted until the move is resolved",
-		}); cerr != nil {
-			slog.Warn("live firmware move: raise the condition", "vm", m.VM, "code", code, "error", cerr)
-		}
-	}
+	s.raiseParkCondition(ctx, m, p, detail)
 	slog.Error("live firmware move parked", "vm", m.VM, "attempt", m.Attempt, "target", m.Target, "phase", p, "detail", detail)
 	s.recordVMEvent(ctx, m.VM, "vm.migrate.firmware", "error", fmt.Sprintf("live firmware migration %s to %s parked as %s: %s", m.Attempt, m.Target, p, detail))
 	return status.Errorf(codes.FailedPrecondition,
 		"VM %q: live firmware migration %s to %s is parked as %s: %s; both copies of its firmware state are kept",
 		m.VM, m.Attempt, m.Target, p, detail)
+}
+
+// raiseParkCondition raises the condition of m's move parked as p.
+func (s *Server) raiseParkCondition(ctx context.Context, m fwmig.Marker, p fwmig.Phase, detail string) {
+	code, ok := fwmigConditionFor[p]
+	if !ok {
+		return
+	}
+	if cerr := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{
+		Code: code, VM: m.VM, Attempt: m.Attempt, Source: s.hostName, Target: m.Target,
+		Hashes: map[string]string{"src_permall_sha256": m.SrcPermallSHA256, "src_nvram_sha256": m.SrcNvramSHA256},
+		Paths:  []string{s.fw().SwtpmDir(m.UUID), s.fw().NvramPath(m.VM)},
+		Detail: detail,
+		Action: "both copies of the firmware state are kept, and nothing is deleted until the move is resolved",
+	}); cerr != nil {
+		slog.Warn("live firmware move: raise the condition", "vm", m.VM, "code", code, "error", cerr)
+	}
 }
 
 // liveFirmwarePeer dials the move's target.
@@ -702,8 +734,21 @@ func (s *Server) ResolveLiveFirmwareMoveByFence(ctx context.Context, vm string) 
 	if err != nil || !ok {
 		return false, err
 	}
+	return s.resolveLiveFirmwareMoveByFenceLocked(ctx, m)
+}
+
+// resolveLiveFirmwareMoveByFenceLocked is ResolveLiveFirmwareMoveByFence for
+// the marker m, read under lockVM(m.VM), which the caller holds.
+func (s *Server) resolveLiveFirmwareMoveByFenceLocked(ctx context.Context, m fwmig.Marker) (bool, error) {
+	vm := m.VM
 	if m.Phase != fwmig.PhaseTargetUnreachable && m.Phase != fwmig.PhaseDiscardPending {
 		return false, nil
+	}
+	// The target proved off first: the recovery asks every interval, and
+	// only a proved-off target makes the rest worth saying.
+	off, err := corrosion.HostProvedOff(ctx, s.db, m.Target)
+	if err != nil || !off {
+		return false, err
 	}
 	if !m.BeforeCutover() && m.SrcStopReason != fwmig.StopReasonMigrated {
 		// After cutover, a source that did not stop as a completed migration
@@ -712,10 +757,6 @@ func (s *Server) ResolveLiveFirmwareMoveByFence(ctx context.Context, vm string) 
 		slog.Warn("live firmware move: the target is proved off, but the source stopped with a reason other than migrated; the park stays for an operator",
 			"vm", vm, "attempt", m.Attempt, "target", m.Target, "src_stop_reason", m.SrcStopReason)
 		return false, nil
-	}
-	off, err := corrosion.HostProvedOff(ctx, s.db, m.Target)
-	if err != nil || !off {
-		return false, err
 	}
 	row, err := corrosion.GetVM(ctx, s.db, vm)
 	if err != nil || row == nil {

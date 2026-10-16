@@ -15,6 +15,22 @@ import (
 // otherwise: discard_owed and quarantine are warnings (a refused owed DISCARD
 // raises discard_owed as critical, by Severity), and so is held, which a long
 // storage copy reaches in a move that is going well.
+//
+// discard_owed is raised from the owed-discard record (there is no marker left
+// to park on) on two occasions:
+//   - at the fence resolution itself, as a warning: the target is proved off,
+//     the VM is stopped on the source with its firmware state there current,
+//     and the DISCARD of the target's copy is owed (D2-12b review m-6; the
+//     spec names only the refused DISCARD);
+//   - by the recovery's retry of the DISCARD each interval, as critical, while
+//     the target refuses it (its domain runs) or answers with a domain of the
+//     VM still defined there; an operator resolves that on the target (D-5).
+//     A raise that fails is made again on the next interval (D2-12b m-C).
+//
+// It is resolved when the DISCARD lands or the target host is removed. A move
+// parked discard_pending (V1) and resolved by fence raises discard_owed, never
+// unverified: the copy that did not verify is the target's, and it is
+// quarantined when the owed DISCARD lands.
 const (
 	firmwareMigrationEvaluator = "firmware_migration"
 

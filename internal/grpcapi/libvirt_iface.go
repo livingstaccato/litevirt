@@ -110,6 +110,9 @@ type LibvirtBackend interface {
 	// Migration.
 	MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) error
 	DomainJobProgress(name string) (memPct, diskPct float32)
+	// DomainJobActive reports whether the domain has a job running (an
+	// outgoing migration among them); an unreadable answer is an error.
+	DomainJobActive(name string) (bool, error)
 
 	// Block-pull (live-restore localize): flatten an NBD-backed overlay's
 	// backing chain into the overlay, polling BlockJobStatus to completion.

@@ -144,9 +144,10 @@ func (s *Server) liveFirmwareCleanupStopped(ctx context.Context, m fwmig.Marker,
 	action := "the VM runs on the target; the source's firmware state is kept, and the cleanup is retried each minute once the cause is fixed"
 	switch {
 	case m.Phase == fwmig.PhaseReleased:
-		// Review n-1: the cleanup retry takes only cleaning markers.
-		action = "the VM runs on the target, and the move is finished there; the source's firmware state is kept and its marker stays released, " +
-			"which the cleanup retry does not take: the source cleanup resumes when the daemon restarts and its firmware move recovery checks the target again"
+		// Review n-1: the cleanup retry takes only cleaning markers; the
+		// firmware move recovery takes a released one, target check first.
+		action = "the VM runs on the target, and the move is finished there; the source's firmware state is kept and its marker stays released: " +
+			"each minute, and at daemon start, the firmware move recovery checks the target again and resumes the cleanup once the cause is fixed"
 	case errors.Is(cause, errFirmwareCleanupStateChanged):
 		action = "the VM runs on the target from the verified copy; the source's firmware state changed after the cutover, " +
 			"so it is kept and never wiped automatically, and a retry cannot heal it: an operator saves the state at the paths named " +
@@ -170,13 +171,19 @@ func (s *Server) liveFirmwareCleanupStopped(ctx context.Context, m fwmig.Marker,
 }
 
 // cleanupConditionOpenWith reports whether vm's cleanup condition is open
-// with detail as its evidence's detail. Anything unreadable is "no": the
-// condition is written.
+// with detail as its evidence's detail.
 func (s *Server) cleanupConditionOpenWith(ctx context.Context, vm, detail string) bool {
-	if s.db == nil {
+	return s.fwmigConditionOpenWith(ctx, condFwmigCleanupFailed, vm, detail)
+}
+
+// fwmigConditionOpenWith reports whether vm's condition code is open with
+// detail as its evidence's detail. Anything unreadable is "no": the
+// condition is written.
+func (s *Server) fwmigConditionOpenWith(ctx context.Context, code, vm, detail string) bool {
+	if s.db == nil || code == "" {
 		return false
 	}
-	c, found, err := corrosion.GetHealthCondition(ctx, s.db, firmwareMigrationEvaluator, condFwmigCleanupFailed, "vm", vm)
+	c, found, err := corrosion.GetHealthCondition(ctx, s.db, firmwareMigrationEvaluator, code, "vm", vm)
 	if err != nil || !found || c.Lifecycle == corrosion.ConditionResolved {
 		return false
 	}
@@ -394,8 +401,9 @@ func (s *Server) RunFirmwareRetainedSweep(ctx context.Context) {
 }
 
 // RetryLiveFirmwareCleanupsOnce resumes the cleanup of each marker in
-// cleaning (§7 S1). A released marker is not taken: restart recovery re-sends
-// Release or checks the target first (§8.1, §17 D-5), and the in-process move
+// cleaning (§7 S1). A released marker is not taken: the firmware move
+// recovery (RecoverFirmwareMoves, FirmwareMoveRecoveryOnce) re-sends Release
+// and checks the target first (§8.1, §17 D-5), and the in-process move
 // cleans up right after it writes released. Each marker is read on its own, so
 // one that cannot be read (firmware_migration_record_unreadable names it)
 // does not hold up the others. A VM whose lock is held waits for the next

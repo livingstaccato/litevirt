@@ -188,16 +188,22 @@ func (s *Server) applyNICMTURequest(ctx context.Context, spec *pb.VMSpec, req *p
 	if err != nil {
 		return status.Errorf(codes.Internal, "read NIC models of %q: %v", req.GetName(), err)
 	}
-	// The model each live NIC renders with, by ordinal: an MTU is judged
-	// against it as well as against the spec entry, which on a VM of a stack
-	// can be a detached NIC's (a NIC attached again under its MAC with another
-	// model leaves the entry as the compose file wrote it).
-	rendered := make(map[int]string, len(nics))
+	// The model each live NIC renders with: an MTU is judged against it as
+	// well as against the spec entry, which on a VM of a stack can be a
+	// detached NIC's (a NIC attached again under its MAC with another model
+	// leaves the entry as the compose file wrote it). An entry finds its NIC
+	// by its MAC; only an entry that recorded none, by its ordinal. A NIC's
+	// ordinal is not its entry's index once a NIC was detached: an attach
+	// can take a new ordinal while its MAC's entry keeps its place.
+	renderedByMAC := make(map[string]string, len(nics))
+	renderedByOrdinal := make(map[int]string, len(nics))
 	nicModels := compose.NewNICModels(spec, rowModels, reattached)
 	byOrdinal := make(map[int]corrosion.NICRecord, len(nics))
 	for _, ic := range nics {
 		byOrdinal[ic.Ordinal] = ic
-		rendered[ic.Ordinal] = nicModels.Model(ic.MAC, ic.NetworkName, ic.Ordinal, ic.Model)
+		m := nicModels.Model(ic.MAC, ic.NetworkName, ic.Ordinal, ic.Model)
+		renderedByMAC[strings.ToLower(ic.MAC)] = m
+		renderedByOrdinal[ic.Ordinal] = m
 	}
 	seen := map[int]bool{}
 	for _, u := range req.GetNicMtu() {
@@ -229,7 +235,11 @@ func (s *Server) applyNICMTURequest(ctx context.Context, spec *pb.VMSpec, req *p
 		if err := compose.ValidateNICMTU(n.GetModel(), u.GetMtu()); err != nil {
 			return status.Errorf(codes.InvalidArgument, "NIC %d: %v", o, err)
 		}
-		if m, ok := rendered[o]; ok {
+		m, ok := renderedByOrdinal[o]
+		if n.GetMac() != "" {
+			m, ok = renderedByMAC[strings.ToLower(n.GetMac())]
+		}
+		if ok {
 			if err := compose.ValidateNICMTU(m, u.GetMtu()); err != nil {
 				return status.Errorf(codes.InvalidArgument, "NIC %d: %v", o, err)
 			}

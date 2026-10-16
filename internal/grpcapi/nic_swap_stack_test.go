@@ -118,3 +118,43 @@ vms:
 		t.Fatalf("an MTU on the stack VM's e1000 NIC: err %v, want InvalidArgument naming e1000", err)
 	}
 }
+
+// The MTU check on a stack VM's swapped NIC finds the NIC by its spec
+// entry's MAC, not by the entry's index read as an ordinal. A build that
+// never reuses a NIC ordinal gives the re-attached NIC ordinal 1 while its
+// MAC's entry stays at index 0; looked up by ordinal, no live NIC was found
+// at 0, the e1000 check was skipped, and `lv update --nic-mtu 0=9000` was
+// accepted on the e1000 NIC. Here the NIC rows are written as such a build
+// leaves them.
+//
+// Mutation: look the rendered model up by the entry's index — red.
+func TestNICMTU_AStackVMsSwappedNICIsFoundByItsMAC(t *testing.T) {
+	const mac = "52:54:00:aa:00:42"
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	s.SetReleaseFeatureGate(newMTUGate(t, true))
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetBridgeMTU("lan", 9000)
+	ctx := adminCtx()
+	spec := &pb.VMSpec{Name: "app", Cpu: 1, MemoryMib: 512, Machine: "pc",
+		Network: []*pb.NetworkAttachment{{Name: "lan", Model: "virtio", Mac: mac, Mtu: 9000}}}
+	vm := corrosion.VMRecord{Name: "app", StackName: "web", HostName: "test-host", State: "stopped",
+		CPUActual: 1, MemActual: 512, Spec: seedSpecJSON(t, spec)}
+	// The NIC attached again under the MAC as e1000, at a fresh ordinal.
+	if err := corrosion.InsertVMWithHardware(ctx, s.db, vm, nil, nil,
+		[]corrosion.NICRecord{{VMName: "app", ID: corrosion.DeterministicNICID("app", mac),
+			NetworkName: "lan", Model: "e1000", MAC: mac, Ordinal: 1}}, nil, false); err != nil {
+		t.Fatalf("insert VM: %v", err)
+	}
+	if err := corrosion.InsertOperation(ctx, s.db, corrosion.OperationRecord{ID: "op-detach",
+		Method: "DetachDevice", ResourceKind: "vm", ResourceID: "app",
+		OperationKind: string(corrosion.OpDeviceDetach),
+		RequestHash:   corrosion.NICDetachRequestHash("app", mac)}); err != nil {
+		t.Fatalf("InsertOperation: %v", err)
+	}
+
+	_, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "app", NicMtu: []*pb.NICMTUUpdate{{Ordinal: 0, Mtu: 9000}}})
+	if status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "this NIC is e1000") {
+		t.Fatalf("an MTU on the stack VM's e1000 NIC at ordinal 1: err %v, want InvalidArgument naming e1000", err)
+	}
+}

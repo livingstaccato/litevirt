@@ -16,11 +16,7 @@ const MaxAutomationRecordBytes = 3 << 20
 var errAutomationAuthority = errors.New("automation authority unavailable")
 
 // AutomationPrefix is certified AND transactionally applied progress.
-type AutomationPrefix struct {
-	ClusterUID string
-	Sequence   uint64
-	Digest     string
-}
+type AutomationPrefix = contract.Prefix
 
 // AutomationRecord transports one bounded complete decision and its certificate.
 // Membership and trust roots are always selected locally, never by this record.
@@ -28,26 +24,9 @@ type AutomationRecord struct {
 	Value       ClaimValue
 	Certificate ClaimCertificate
 }
-type AutomationRequest struct {
-	Identity []byte
-	Receipt  contract.Receipt
-}
-type AutomationProjection struct {
-	Head      AutomationPrefix
-	Existing  *AutomationRequest
-	Operation *contract.Receipt
-	// ReplayOriginal distinguishes rebuilding the original admission from a
-	// later duplicate. Semantic owners must reset/stage their derived tables
-	// from certified history before replay, never read retained future state.
-	ReplayOriginal bool
-}
-type AutomationReduction struct {
-	ClusterUID  string
-	Scope       string
-	Identity    []byte
-	Receipt     contract.Receipt
-	SaveRequest bool
-}
+type AutomationRequest = contract.Request
+type AutomationProjection = contract.Projection
+type AutomationReduction = contract.Reduction
 type AutomationReducer func(AutomationProjection, contract.Decision) (AutomationReduction, error)
 
 const automationHeadSQL = `SELECT cluster_uid, sequence, digest FROM local_automation_prefix WHERE id=1`
@@ -58,7 +37,7 @@ func automationHeadTx(ctx context.Context, tx *LocalTx) (AutomationPrefix, error
 		return AutomationPrefix{}, e
 	}
 	r := rows[0]
-	return AutomationPrefix{r.String("cluster_uid"), uint64(r.Int64("sequence")), r.String("digest")}, nil
+	return AutomationPrefix{ClusterUID: r.String("cluster_uid"), Sequence: uint64(r.Int64("sequence")), Digest: r.String("digest")}, nil
 }
 func (c *Client) AutomationHead(ctx context.Context) (h AutomationPrefix, e error) {
 	e = c.ExecuteLocal(ctx, func(tx *LocalTx) error { var err error; h, err = automationHeadTx(ctx, tx); return err })
@@ -124,16 +103,7 @@ func (c *Client) AutomationRecord(ctx context.Context, seq uint64) (out Automati
 	})
 	return
 }
-func AutomationScope(d contract.Decision) string {
-	if d.Command.Kind == "initialize_cluster" {
-		return "internal:bootstrap"
-	}
-	if d.Command.Kind == "read_barrier" {
-		return "internal:barrier"
-	}
-	b, _ := json.Marshal([]string{d.Command.ClusterUID, d.Command.ProjectUID, d.Command.OwnerID})
-	return string(b)
-}
+func AutomationScope(d contract.Decision) string { return contract.Scope(d) }
 func automationRequestTx(ctx context.Context, tx *LocalTx, scope, request string) (*AutomationRequest, error) {
 	rs, e := tx.Query(ctx, `SELECT identity,receipt_json FROM local_automation_requests WHERE scope=? AND request_id=? LIMIT 1`, scope, request)
 	if e != nil || len(rs) == 0 {
@@ -253,15 +223,51 @@ func automationApplyTx(ctx context.Context, tx *LocalTx, r AutomationRecord, d c
 		err = json.Unmarshal([]byte(rows[0].String("receipt_json")), &out)
 		return out, err
 	}
-	if d.Sequence != head.Sequence+1 || d.ParentDigest != head.Digest {
-		return out, fmt.Errorf("automation predecessor unavailable")
+	if err := validateAutomationPredecessor(head, d); err != nil {
+		return out, err
 	}
 	projection, err := automationProjectionTx(ctx, tx, head, d)
 	if err != nil {
 		return out, err
 	}
-	result, err := reduce(projection, d)
+	// The compatibility callback may refuse, but only the concrete evaluator
+	// supplies the reduction used for persistence.
+	if reduce == nil {
+		return out, fmt.Errorf("automation reducer unavailable")
+	}
+	callbackProjection := projection
+	if projection.Existing != nil {
+		existing := *projection.Existing
+		existing.Identity = append([]byte(nil), existing.Identity...)
+		callbackProjection.Existing = &existing
+	}
+	if projection.Operation != nil {
+		operation := *projection.Operation
+		callbackProjection.Operation = &operation
+	}
+	callback, err := reduce(callbackProjection, d)
 	if err != nil {
+		return out, err
+	}
+	var expected *contract.Receipt
+	if source.kind == automationAnchoredReplay {
+		rows, err := tx.Query(ctx, `SELECT receipt_json FROM local_automation_history WHERE sequence=? AND digest=? LIMIT 1`, d.Sequence, digest)
+		if err != nil {
+			return out, err
+		}
+		if len(rows) != 1 {
+			return out, fmt.Errorf("automation replay result missing")
+		}
+		expected = new(contract.Receipt)
+		if err = json.Unmarshal([]byte(rows[0].String("receipt_json")), expected); err != nil {
+			return out, err
+		}
+	}
+	result, next, err := evaluateAutomationHistory(automationHistoryInput{Projection: projection, Value: r.Value, Digest: digest, Expected: expected})
+	if err != nil {
+		return out, err
+	}
+	if err = validateAutomationCallback(result, callback); err != nil {
 		return out, err
 	}
 	out = result.Receipt
@@ -290,21 +296,6 @@ func automationApplyTx(ctx context.Context, tx *LocalTx, r AutomationRecord, d c
 			return out, err
 		}
 
-	} else {
-		rows, err := tx.Query(ctx, `SELECT receipt_json FROM local_automation_history WHERE sequence=? AND digest=? LIMIT 1`, d.Sequence, digest)
-		if err != nil {
-			return out, err
-		}
-		if len(rows) != 1 {
-			return out, fmt.Errorf("automation replay result missing")
-		}
-		var expected contract.Receipt
-		if err = json.Unmarshal([]byte(rows[0].String("receipt_json")), &expected); err != nil {
-			return out, err
-		}
-		if expected != out {
-			return out, fmt.Errorf("automation replay receipt drift")
-		}
 	}
 
 	if result.SaveRequest {
@@ -312,7 +303,7 @@ func automationApplyTx(ctx context.Context, tx *LocalTx, r AutomationRecord, d c
 			return out, err
 		}
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO local_automation_prefix (id,cluster_uid,sequence,digest) VALUES (1,?,?,?) ON CONFLICT(id) DO UPDATE SET cluster_uid=excluded.cluster_uid,sequence=excluded.sequence,digest=excluded.digest`, result.ClusterUID, d.Sequence, digest)
+	_, err = tx.Exec(ctx, `INSERT INTO local_automation_prefix (id,cluster_uid,sequence,digest) VALUES (1,?,?,?) ON CONFLICT(id) DO UPDATE SET cluster_uid=excluded.cluster_uid,sequence=excluded.sequence,digest=excluded.digest`, next.ClusterUID, next.Sequence, next.Digest)
 	return out, err
 }
 
@@ -407,20 +398,13 @@ func automationTrustedDigestTx(ctx context.Context, tx *LocalTx, sequence uint64
 	}
 	row := rows[0]
 	digest := row.String("digest")
-	if digest != row.String("anchor_digest") {
-		return "", false, fmt.Errorf("automation parent anchor mismatch")
-	}
 	var value ClaimValue
 	key, _ := AutomationClaimKey(sequence)
 	if err := decodeClaimValue(key, row.String("value_json"), &value); err != nil {
 		return "", false, err
 	}
-	if err := validateAutomationValue(key, value); err != nil {
+	if err := validateAutomationTrustedValue(sequence, value, digest, row.String("anchor_digest")); err != nil {
 		return "", false, err
-	}
-	actual, err := value.Digest()
-	if err != nil || actual != digest {
-		return "", false, fmt.Errorf("automation parent digest mismatch")
 	}
 	return digest, true, nil
 }

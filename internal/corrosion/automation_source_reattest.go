@@ -42,7 +42,7 @@ func (p *AutomationSourcePreparer) reattestSourceTransition(ctx context.Context,
 				continue
 			}
 			digest, e := st.Value.Digest()
-			if e != nil || digest != st.ValueDigest || auditAutomationCutAccept(*st.Accept, cert.Key, st.Accepted, d.old.Generation, digest) != nil {
+			if e != nil || digest != st.ValueDigest || validateRetainedAutomationAccept(*st.Accept, cert.Key, st.Accepted, d.old.Generation, digest) != nil {
 				continue
 			}
 			renewed, e := signer.Sign(cert.Key, d.old.Generation, st.Accepted, digest, d.incarnation)

@@ -344,7 +344,7 @@ func (c *Client) auditFrozenSourceTx(ctx context.Context, tx *LocalTx, d sourceD
 					if err := ValidateVoterChange(d.old, *st.Value.Config); err != nil {
 						return err
 					}
-					if err := auditAutomationCutAccept(*st.Accept, key, st.Accepted, d.cut.Generation, digest); err != nil {
+					if err := validateRetainedAutomationAccept(*st.Accept, key, st.Accepted, d.cut.Generation, digest); err != nil {
 						return err
 					}
 					sealed = true

@@ -1,9 +1,7 @@
 package corrosion
 
 import (
-	"bytes"
 	"context"
-	"crypto/ecdsa"
 	"encoding/json"
 	"fmt"
 
@@ -128,16 +126,21 @@ func auditAutomationCutAnchorTx(ctx context.Context, tx *LocalTx, row Row) error
 	if err != nil {
 		return err
 	}
-	key, _ := AutomationClaimKey(uint64(anchorSeq))
-	if cert.Key != key || cert.ConfigGeneration != anchor.Int64("generation") || cert.Ballot.IsZero() || len(cert.Accepts) == 0 {
-		return fmt.Errorf("source anchor certificate mismatch")
-	}
-	rows, err = tx.Query(ctx, `SELECT digest FROM local_automation_history WHERE sequence=? LIMIT 1`, anchorSeq)
+	rows, err = tx.Query(ctx, `SELECT digest,value_json FROM local_automation_history WHERE sequence=? AND length(CAST(value_json AS BLOB))<=? LIMIT 1`, anchorSeq, MaxAutomationClaimBytes)
 	if err != nil {
 		return err
 	}
-	if len(rows) != 1 || cert.ValueDigest != rows[0].String("digest") {
+	if len(rows) != 1 {
 		return fmt.Errorf("source anchor target missing")
+	}
+	targetDigest := rows[0].String("digest")
+	var target ClaimValue
+	key, err := AutomationClaimKey(uint64(anchorSeq))
+	if err != nil {
+		return err
+	}
+	if err = decodeClaimValue(key, rows[0].String("value_json"), &target); err != nil {
+		return err
 	}
 
 	rows, err = tx.Query(ctx, `SELECT `+voterConfigCols+` FROM voter_configs WHERE generation=? AND deleted_at IS NULL AND length(CAST(members_json AS BLOB))<=? AND length(CAST(certificate AS BLOB))<=? LIMIT 1`, anchor.Int64("generation"), maxAutomationCutMetadataBytes, MaxAutomationRecordBytes)
@@ -151,27 +154,7 @@ func auditAutomationCutAnchorTx(ctx context.Context, tx *LocalTx, row Row) error
 	if err != nil {
 		return err
 	}
-	if cfg.MembersHash != anchor.String("members_hash") || cfg.MembersHash != MembersHash(cfg.Members) || automationElectorateBudget(cfg.Members) != nil {
-		return fmt.Errorf("source anchor membership mismatch")
-	}
-	counted := map[string]bool{}
-	incarnations := map[string]bool{}
-	for _, a := range cert.Accepts {
-		member, ok := cfg.Member(a.Voter)
-		if !ok || member.Incarnation != a.VoterIncarnation || counted[a.Voter] || incarnations[a.VoterIncarnation] {
-			continue
-		}
-		if auditAutomationCutAccept(a, cert.Key, cert.Ballot, cert.ConfigGeneration, cert.ValueDigest) != nil {
-			continue
-		}
-		counted[a.Voter] = true
-		incarnations[a.VoterIncarnation] = true
-	}
-	if len(counted) < MajorityOf(len(cfg.Members)) {
-		return fmt.Errorf("corrupt retained anchor signatures")
-	}
-
-	return nil
+	return validateAutomationAnchor(automationAnchorInput{Sequence: seq, AnchorSequence: anchorSeq, Digest: row.String("digest"), AnchorDigest: anchor.String("digest"), Generation: anchor.Int64("generation"), MembersHash: anchor.String("members_hash"), Certificate: cert, Target: target, TargetDigest: targetDigest, Membership: cfg})
 }
 
 func auditAutomationCutRequestTx(ctx context.Context, tx *LocalTx, row Row, head AutomationPrefix) error {
@@ -195,15 +178,11 @@ func auditAutomationCutRequestTx(ctx context.Context, tx *LocalTx, row Row, head
 	if err != nil {
 		return err
 	}
-	identity, err := contract.CanonicalCommand(d.Command)
-	if err != nil {
-		return err
-	}
 	var original contract.Receipt
-	if json.Unmarshal([]byte(rows[0].String("receipt_json")), &original) != nil || original != receipt || row.String("request_id") != d.Command.RequestID || row.String("scope") != AutomationScope(d) || row.String("operation_id") != receipt.OperationID || !bytes.Equal(identity, row.Bytes("identity")) {
+	if err = json.Unmarshal([]byte(rows[0].String("receipt_json")), &original); err != nil {
 		return fmt.Errorf("source immutable request drift")
 	}
-	return nil
+	return validateAutomationRequest(row.String("scope"), row.String("request_id"), row.String("operation_id"), row.Bytes("identity"), receipt, original, d)
 }
 
 func auditAutomationCutClaimTx(ctx context.Context, tx *LocalTx, row Row, head AutomationPrefix) error {
@@ -215,85 +194,23 @@ func auditAutomationCutClaimTx(ctx context.Context, tx *LocalTx, row Row, head A
 	if err != nil {
 		return err
 	}
-	if validateAutomationBallot(st.Promised, true) != nil || validateAutomationBallot(st.Accepted, true) != nil || CompareBallots(st.Promised, st.Accepted) < 0 || st.ConfigGeneration < 0 {
-		return fmt.Errorf("corrupt source claim ballots")
+	if err := validateRetainedClaimState(st); err != nil {
+		return err
 	}
-	if st.Accepted.IsZero() {
-		if st.Value != nil || st.ValueDigest != "" || st.Accept != nil {
-			return fmt.Errorf("source value without acceptance")
-		}
-		return nil
-	}
-	if st.Value == nil {
-		return fmt.Errorf("source accepted value missing")
-	}
-
-	if st.Accept != nil {
-		// Legacy ImportClaimsAndAdopt can advance a row's promised generation
-		// while preserving its authentic older acceptance. Verify the original
-		// signed domain unchanged; automation's stricter generation equality is
-		// already enforced by scanClaimRow/ValidateAutomationState.
-		if st.Accept.ConfigGeneration < 0 || st.Accept.ConfigGeneration > st.ConfigGeneration {
-			return fmt.Errorf("invalid retained accept generation")
-		}
-		if err := auditAutomationCutAccept(*st.Accept, st.Key, st.Accepted, st.Accept.ConfigGeneration, st.ValueDigest); err != nil {
-			return err
-		}
-	}
-	digest, err := st.Value.Digest()
-	if err != nil || digest != st.ValueDigest {
-		return fmt.Errorf("source accepted digest mismatch")
-	}
-	if key.IsVoterConfig() {
-		if st.Value.Config == nil || st.Value.Config.Generation != key.OwnerEpoch+1 {
-			return fmt.Errorf("invalid retained membership acceptance")
-		}
-	} else if refusal, _ := validateGenerationClaimValue(key, st.Value); refusal != "" {
-		return fmt.Errorf("invalid source accepted value")
-	}
-	if key.IsAutomation() {
+	if key.IsAutomation() && !st.Accepted.IsZero() {
 		d, err := automationDecision(*st.Value)
 		if err != nil {
 			return err
 		}
-		if contract.ValidateSupportedDecision(d) != nil {
-			return fmt.Errorf("unsupported source accepted schema or secret coverage")
-		}
-		if d.Sequence > head.Sequence+1 {
-			return fmt.Errorf("source accepted predecessor missing")
-		}
+		var parent string
+		var found bool
 		if d.Sequence > 1 {
-			parent, found, err := automationTrustedDigestTx(ctx, tx, d.Sequence-1)
+			parent, found, err = automationTrustedDigestTx(ctx, tx, d.Sequence-1)
 			if err != nil {
 				return err
 			}
-			if !found || parent != d.ParentDigest || d.Command.ClusterUID != head.ClusterUID {
-				return fmt.Errorf("source accepted parent mismatch")
-			}
-		} else if d.ParentDigest != "" {
-			return fmt.Errorf("source accepted genesis parent mismatch")
 		}
-		// A lower-ballot losing acceptance at an already chosen slot is legitimate.
-		// Its own value need not equal history at that slot; its parent must exist.
-	}
-	return nil
-}
-
-// This is a corruption check on an ALREADY owned durable anchor/accept, not a
-// verifier for incoming authority. It neither accepts a new root nor supplies
-// a time/CRL bypass to ClaimVerifier. Publication must authenticate the current
-// source separately; only its original local anchored provenance permits reuse.
-func auditAutomationCutAccept(a ClaimAccept, key ClaimKey, ballot Ballot, generation int64, digest string) error {
-	if a.Key != key || !a.Ballot.Equal(ballot) || a.ConfigGeneration != generation || a.ValueDigest != digest || len(a.CertPEM) > 64<<10 || len(a.Signature) > 256 || a.Voter == "" || a.VoterIncarnation == "" {
-		return fmt.Errorf("corrupt retained accept binding")
-	}
-	cert, err := parseCertPEM([]byte(a.CertPEM))
-	if err != nil || cert.Subject.CommonName != a.Voter {
-		return fmt.Errorf("corrupt retained signer")
-	}
-	pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
-	if !ok || !ecdsa.VerifyASN1(pub, acceptPayload(key, generation, ballot, digest, a.Voter, a.VoterIncarnation), a.Signature) {
-		return fmt.Errorf("corrupt retained accept signature")
+		return validateRetainedAutomationParent(d, head, parent, found)
 	}
 	return nil
 }

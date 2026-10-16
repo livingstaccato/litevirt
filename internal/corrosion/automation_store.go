@@ -2,7 +2,6 @@ package corrosion
 
 import (
 	"context"
-	"crypto/ecdsa"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -168,51 +167,6 @@ func requireAutomationFull(ctx context.Context, tx *LocalTx) error {
 	}
 	if len(rows) != 1 || len(rows[0].Values) != 1 || rows[0].Values[0] != int64(SynchronousFull) && rows[0].Values[0] != int64(3) {
 		return fmt.Errorf("automation requires synchronous FULL on its transaction")
-	}
-	return nil
-}
-
-// ValidateAutomationState validates recovery data without live admission checks.
-// Historical imports preserve accepted decisions even when activation changed.
-func ValidateAutomationState(st ClaimVoterState) error {
-	if !st.Key.IsAutomation() {
-		if st.Value != nil && st.Value.Automation != nil {
-			return fmt.Errorf("automation state at another kind")
-		}
-		return nil
-	}
-	bad := func() error { return fmt.Errorf("corrupt automation claim state") }
-	if st.Key.Validate() != nil || st.ConfigGeneration < 0 || validateAutomationBallot(st.Promised, true) != nil || validateAutomationBallot(st.Accepted, true) != nil {
-		return bad()
-	}
-	if CompareBallots(st.Promised, st.Accepted) < 0 {
-		return bad()
-	}
-	if st.Accepted.IsZero() {
-		if st.Value != nil || st.ValueDigest != "" || st.Accept != nil {
-			return bad()
-		}
-		return nil
-	}
-	if st.Value == nil || validateAutomationValue(st.Key, *st.Value) != nil {
-		return bad()
-	}
-	d, err := st.Value.Digest()
-	if err != nil || d != st.ValueDigest {
-		return bad()
-	}
-	if a := st.Accept; a != nil {
-		if a.Key != st.Key || !a.Ballot.Equal(st.Accepted) || a.ValueDigest != d || a.ConfigGeneration != st.ConfigGeneration || len(a.Voter) > contract.MaxStringBytes || len(a.VoterIncarnation) > contract.MaxStringBytes || len(a.CertPEM) > 64<<10 || len(a.Signature) > 256 {
-			return bad()
-		}
-		cert, err := parseCertPEM([]byte(a.CertPEM))
-		if err != nil || cert.Subject.CommonName != a.Voter {
-			return bad()
-		}
-		pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
-		if !ok || !ecdsa.VerifyASN1(pub, acceptPayload(a.Key, a.ConfigGeneration, a.Ballot, a.ValueDigest, a.Voter, a.VoterIncarnation), a.Signature) {
-			return bad()
-		}
 	}
 	return nil
 }

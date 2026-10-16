@@ -1442,6 +1442,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	bridgeCT := firewall.BridgeConntrackAvailable(ctx, true)
 	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
 		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs,
+			OnTagGroupMembers:    fwMetrics.SetTagGroupMembers,
 			OnDuplicateAddresses: firewall.NewDuplicateAddressReporter(d.db, d.cfg.HostName).Report,
 			BridgeConntrack:      func() bool { return bridgeCT }, Arming: fwArming})
 	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)

@@ -108,7 +108,7 @@ func legacyRelocationStmts(t *testing.T, c *Client, host, name, toHost string) (
 	rec.RelocateToken = "tok-legacy"
 	var target Statement
 	if old.OwnerEpoch == 0 && old.SpecGeneration == 0 && old.ActiveOperationID == "" {
-		if target, err = upsertContainerStmt(c, rec); err != nil {
+		if target, err = upsertContainerStmt(c, rec, firewallIDOf(TagMemberCT, old.CreateSpec)); err != nil {
 			t.Fatal(err)
 		}
 	} else {

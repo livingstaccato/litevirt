@@ -200,6 +200,9 @@ func (s *Server) AddSecurityGroupRule(ctx context.Context, req *pb.AddSecurityGr
 	row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
 	need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, "")
 	if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
+		if err := s.refuseUnknownTagGroup(ctx, row.CIDR); err != nil {
+			return err
+		}
 		return corrosion.InsertSGRuleWithGrant(ctx, s.db, g.IPv6, g.Log, g.Tag, row)
 	}); err != nil {
 		return nil, firewallWriteErr(err, codes.InvalidArgument, "add security group rule")

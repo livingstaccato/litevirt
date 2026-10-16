@@ -80,10 +80,12 @@ type replacedVM struct {
 	// that hold stands.
 	holdToken string
 	holdHost  string
-	// rowOnly: the create names this row only so that its existence check
-	// does not refuse it (withReplacedRow) — it is not a re-create of the
-	// incarnation in any other way: replacedVMFor does not return it, so its
-	// NIC guards are admitted and its LUNs claimed as a new VM's.
+	// rowOnly: the create names this row so that its existence check does
+	// not refuse it (withReplacedRow), and keeps the row's firewall identity
+	// (replacedFirewallCarry: a stack's recreate of the same workload, spec
+	// §4.3). It is not a re-create of the incarnation in any other way:
+	// replacedVMFor does not return it, so its NIC guards are admitted and its
+	// LUNs claimed as a new VM's.
 	rowOnly bool
 }
 
@@ -97,10 +99,11 @@ func withReplacedVM(ctx context.Context, vm *corrosion.VMRecord) context.Context
 }
 
 // withReplacedRow returns ctx carrying vm's row into the create that
-// re-creates it, for its existence check only (replacedVM.rowOnly): an inline
-// compose re-create, which creates from the file as a new VM, deletes the VM
-// on its owner and then creates on a host whose replica may still hold the
-// row (lab 1, 2026-10-13, F1). Call it only once vm's delete has torn it down.
+// re-creates it, for its existence check and its firewall identity only
+// (replacedVM.rowOnly): an inline compose re-create, which creates from the
+// file as a new VM, deletes the VM on its owner and then creates on a host
+// whose replica may still hold the row (lab 1, 2026-10-13, F1). Call it only
+// once vm's delete has torn it down.
 func withReplacedRow(ctx context.Context, vm *corrosion.VMRecord) context.Context {
 	if vm == nil || vm.Name == "" || vm.CreatedAt == "" {
 		return ctx
@@ -120,7 +123,8 @@ func withReplacedRowSnapshot(ctx context.Context, name string, snap corrosion.VM
 }
 
 // replacedVMFor returns the replaced VM ctx carries when it is named name,
-// and the create re-creates it (not a row named for its existence check only).
+// and the create re-creates it (not a row named for its existence check and
+// firewall identity only).
 func replacedVMFor(ctx context.Context, name string) (replacedVM, bool) {
 	r, ok := replacedRowFor(ctx, name)
 	if !ok || r.rowOnly {
@@ -130,13 +134,41 @@ func replacedVMFor(ctx context.Context, name string) (replacedVM, bool) {
 }
 
 // replacedRowFor returns the replaced VM ctx carries when it is named name,
-// of either kind: what the create's existence check settles.
+// of either kind: what the create's existence check settles, and whose
+// firewall identity the create keeps.
 func replacedRowFor(ctx context.Context, name string) (replacedVM, bool) {
 	r, ok := ctx.Value(replacedVMKey{}).(replacedVM)
 	if !ok || name == "" || r.name != name || r.snap.CreatedAt == "" {
 		return replacedVM{}, false
 	}
 	return r, true
+}
+
+// replacedFirewallCarry is the firewall identity a create of name keeps
+// (spec §4.3): the one the row its own operation's delete tombstoned held, as
+// the replaced VM ctx carries records it. That value is set in-process only
+// once the delete has been committed (withReplacedVM, withReplacedSnapshot,
+// withReplacedRow), or from a peer host's metadata (acceptReplacedVMMD, which
+// ignores it from anyone else) — never from a request field. Every other
+// create keeps none: the insert strips any identity its spec carries.
+func replacedFirewallCarry(ctx context.Context, name string) corrosion.FirewallIDCarry {
+	r, ok := replacedRowFor(ctx, name)
+	if !ok {
+		return corrosion.FirewallIDCarry{}
+	}
+	return corrosion.CarryFirewallIDOf(corrosion.TagMemberVM, r.snap.FirewallID)
+}
+
+// withoutReplacedFirewallID returns ctx with the replaced VM it carries for
+// name naming no firewall identity: a re-create whose delete found no row to
+// tombstone (another delete ended the incarnation first) carries none.
+func withoutReplacedFirewallID(ctx context.Context, name string) context.Context {
+	r, ok := replacedRowFor(ctx, name)
+	if !ok || r.snap.FirewallID == "" {
+		return ctx
+	}
+	r.snap.FirewallID = ""
+	return context.WithValue(ctx, replacedVMKey{}, r)
 }
 
 // withReplacedSnapshot returns ctx carrying the VM name as snap describes it
@@ -162,6 +194,14 @@ func withReplacedSnapshot(ctx context.Context, name string, snap corrosion.VMDel
 func isRecreateDelete(ctx context.Context) bool {
 	sink, ok := ctx.Value(deletedVMSinkKey{}).(*deletedVMSink)
 	return ok && !sink.reportOnly
+}
+
+// hasDeletedVMSink reports whether ctx carries a deleted-VM sink of either
+// kind: the delete is a rebuild's or a recreate's (rolling or inline), whose
+// VM is re-created with the same firewall identity, so its tags are kept.
+func hasDeletedVMSink(ctx context.Context) bool {
+	_, ok := ctx.Value(deletedVMSinkKey{}).(*deletedVMSink)
+	return ok
 }
 
 // deletedVMSinkKey carries a *deletedVMSink in a context.
@@ -217,6 +257,7 @@ func (s *Server) reportDeletedVM(ctx context.Context, row *corrosion.VMRecord) {
 	b, err := json.Marshal(replacedVMWire{
 		Name: row.Name, CreatedAt: snap.CreatedAt, HostName: snap.HostName,
 		OwnerEpoch: snap.OwnerEpoch, SpecGeneration: snap.SpecGeneration, IdentityHash: snap.IdentityHash,
+		FirewallID: snap.FirewallID,
 	})
 	if err != nil {
 		return
@@ -242,7 +283,7 @@ func acceptDeletedVMHeader(ctx context.Context, name string, hdr metadata.MD) {
 	}
 	sink.snap = &corrosion.VMDeleteSnapshot{
 		CreatedAt: w.CreatedAt, HostName: w.HostName, OwnerEpoch: w.OwnerEpoch,
-		SpecGeneration: w.SpecGeneration, IdentityHash: w.IdentityHash,
+		SpecGeneration: w.SpecGeneration, IdentityHash: w.IdentityHash, FirewallID: w.FirewallID,
 	}
 }
 
@@ -305,6 +346,11 @@ type replacedVMWire struct {
 	Image          string            `json:"image,omitempty"`
 	HoldToken      string            `json:"hold_token,omitempty"`
 	HoldHost       string            `json:"hold_host,omitempty"`
+	// FirewallID is the firewall identity of the row the delete tombstoned
+	// (VMDeleteSnapshot.FirewallID), which the re-create keeps
+	// (replacedFirewallCarry). An older build sends none: the re-created VM
+	// then has no identity, which fails closed.
+	FirewallID string `json:"firewall_id,omitempty"`
 }
 
 // withReplacedVMMD returns ctx with the replaced VM ctx holds for name added
@@ -318,6 +364,7 @@ func withReplacedVMMD(ctx context.Context, name string) context.Context {
 		b, err := json.Marshal(replacedVMWire{
 			Name: r.name, CreatedAt: r.snap.CreatedAt, HostName: r.snap.HostName,
 			OwnerEpoch: r.snap.OwnerEpoch, SpecGeneration: r.snap.SpecGeneration, IdentityHash: r.snap.IdentityHash,
+			FirewallID: r.snap.FirewallID,
 		})
 		if err != nil {
 			return ctx
@@ -328,7 +375,7 @@ func withReplacedVMMD(ctx context.Context, name string) context.Context {
 		Name: r.name, CreatedAt: r.snap.CreatedAt, HostName: r.snap.HostName,
 		OwnerEpoch: r.snap.OwnerEpoch, SpecGeneration: r.snap.SpecGeneration, IdentityHash: r.snap.IdentityHash,
 		UUID: r.uuid, LUNs: r.luns, Claimed: r.claimed, Image: r.image,
-		HoldToken: r.holdToken, HoldHost: r.holdHost,
+		HoldToken: r.holdToken, HoldHost: r.holdHost, FirewallID: r.snap.FirewallID,
 	})
 	if err != nil {
 		return ctx
@@ -364,12 +411,12 @@ func (s *Server) acceptReplacedVMMD(ctx context.Context) context.Context {
 	if rowOnly {
 		return context.WithValue(ctx, replacedVMKey{}, replacedVM{name: w.Name, snap: corrosion.VMDeleteSnapshot{
 			CreatedAt: w.CreatedAt, HostName: w.HostName, OwnerEpoch: w.OwnerEpoch,
-			SpecGeneration: w.SpecGeneration, IdentityHash: w.IdentityHash,
+			SpecGeneration: w.SpecGeneration, IdentityHash: w.IdentityHash, FirewallID: w.FirewallID,
 		}, rowOnly: true})
 	}
 	return context.WithValue(ctx, replacedVMKey{}, replacedVM{name: w.Name, snap: corrosion.VMDeleteSnapshot{
 		CreatedAt: w.CreatedAt, HostName: w.HostName, OwnerEpoch: w.OwnerEpoch,
-		SpecGeneration: w.SpecGeneration, IdentityHash: w.IdentityHash,
+		SpecGeneration: w.SpecGeneration, IdentityHash: w.IdentityHash, FirewallID: w.FirewallID,
 	}, uuid: w.UUID, luns: w.LUNs, claimed: w.Claimed, image: w.Image, holdToken: w.HoldToken, holdHost: w.HoldHost})
 }
 
@@ -471,6 +518,11 @@ func (s *Server) recreateFailedAfterTeardown(ctx context.Context, op, name, wher
 	}
 	slog.Error(op+": the VM was torn down and its re-create failed",
 		"vm", name, "torn_down_on", where, "spec_kept_at", kept, "error", cause)
+	// Its firewall tags stay on the torn-down incarnation's row: a VM created
+	// again by hand is a new one (D2b review M-5).
+	if left := s.recreateFirewallTagsLeft(context.WithoutCancel(ctx), name); left != "" {
+		kept += " " + left
+	}
 	st := status.Convert(cause)
 	return status.Errorf(st.Code(), "%s %q: the VM was torn down on %s (its domain, disks and record are gone) and "+
 		"re-creating it failed: %s. %s", op, name, where, st.Message(), kept)

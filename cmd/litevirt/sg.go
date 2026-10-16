@@ -308,6 +308,9 @@ func newSGRuleAddCmd() *cobra.Command {
 				}, func(id string) string { return fmt.Sprintf("Added rule %s\n", id) })
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if err := requireTagGroupSupport(ctx, c, cidr); err != nil {
+					return err
+				}
 				rule, err := c.AddSecurityGroupRule(ctx, &pb.AddSecurityGroupRuleRequest{Rule: &pb.SecurityGroupRule{
 					SgId: args[0], Direction: direction, Proto: proto, Port: port,
 					Cidr: cidr, Action: action, Priority: int32(priority),

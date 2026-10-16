@@ -24,7 +24,7 @@ var sanctionedSpecWriters = map[string]string{
 	"CommitVMCreateOperation":   "commits the provisional row's desired/observed fields under operation+owner+generation fencing",
 	"execVMRekey":               "structural rename — changes the primary key, can't use a name-keyed CAS",
 	"BeginVMOperation":          "F1 op-start: sets desired spec + bumps generation + claims the barrier atomically",
-	"MutateDesiredSpec":         "THE sanctioned desired-spec writer",
+	"mutateDesiredSpec":         "THE sanctioned desired-spec writer (MutateDesiredSpec, MintFirewallID)",
 	"UpdateObservedActuals":     "THE sanctioned cpu_actual/mem_actual writer",
 	"migrateVMSpecNetworkNames": "one-time schema migration, runs before serving (no barrier to honor)",
 	"isGuardedTransitionSQL":    "fingerprints audited transition constants; it does not execute a write",

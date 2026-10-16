@@ -102,8 +102,14 @@ func ReadVLANSnapshot(ctx context.Context, c *Client, network string, keys ...st
 // snap read them. applied=false (no error) when something changed between:
 // the caller reads again. The statements are the tables' ordinary upserts
 // (networkUpsertSQL, clusterPolicyUpsertSQL), so nothing new crosses the
-// wire; a key write needs the cluster_policies gate open.
+// wire; a key write needs the cluster_policies gate open, and a firewall-tags
+// or tag-group key is refused (refuseReservedPolicyKey).
 func WriteNetworkVLANsCAS(ctx context.Context, c *Client, snap VLANSnapshot, row *NetworkRecord, keys map[string]string, setBy string) (bool, error) {
+	for k := range keys {
+		if err := refuseReservedPolicyKey(k); err != nil {
+			return false, err
+		}
+	}
 	if len(keys) > 0 && !c.MayWriteClusterPolicy() {
 		return false, ErrClusterPolicyGateClosed
 	}

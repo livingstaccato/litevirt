@@ -79,6 +79,8 @@ var uiInternalCallPolicy = map[string]func(callee string) bool{
 	// ClientAddress and PeerTrusted read a request's peer and forwarding header; they hold no
 	// state and touches nothing else in the auth package.
 	"auth": allowOnly("ClientAddress", "PeerTrusted"),
+	// FirewallTagsLine formats a ListFirewallTags answer; it reads nothing.
+	"apimeta": allowOnly("FirewallTagsLine"),
 	// Pure helpers with no state of their own.
 	"randid":      func(string) bool { return true },
 	"auditexport": func(string) bool { return true },

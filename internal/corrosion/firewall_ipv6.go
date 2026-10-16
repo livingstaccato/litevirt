@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"net/netip"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 )
 
 // ErrFirewallIPv6GateClosed is returned by a write of an IPv6 rule or ip-set
@@ -25,16 +27,32 @@ import (
 var ErrFirewallIPv6GateClosed = errors.New("IPv6 firewall rules are written only through the release feature firewall_ipv6 " +
 	"(the cluster upgrade must finish first: a host on an older build cannot render them and would stop applying its firewall)")
 
+// looksIPv6CIDR reports whether a rule's cidr is to be judged as IPv6: one
+// that parses as an IPv6 address or prefix, or any other holding ':' except a
+// set reference and a tag-group cidr ("tag:<name>", in any case: its own form,
+// never an address; m-9).
 func looksIPv6CIDR(cidr string) bool {
 	cidr = strings.TrimSpace(cidr)
-	return isIPv6CIDR(cidr) || (strings.Contains(cidr, ":") && !strings.HasPrefix(cidr, "@"))
+	return isIPv6CIDR(cidr) || (strings.Contains(cidr, ":") && !strings.HasPrefix(cidr, "@") && !hasTagCIDRPrefix(cidr))
+}
+
+// hasTagCIDRPrefix reports whether cidr starts with the tag-group prefix in
+// any case, after blanks.
+func hasTagCIDRPrefix(cidr string) bool {
+	cidr = strings.TrimSpace(cidr)
+	p := rulefield.TagCIDRPrefix
+	return len(cidr) >= len(p) && strings.EqualFold(cidr[:len(p)], p)
 }
 
 // FirewallRuleFamily validates a rule naming cidr and proto as its writer
-// does (firewallRuleFamily) and reports whether it is an IPv6 rule, whose
+// does (firewallRowFeatures) and reports whether it is an IPv6 rule, whose
 // write is the release feature firewall_ipv6: a caller refuses a malformed
-// rule before it asks the release gate for anything.
+// rule before it asks the release gate for anything. A tag-group cidr is not
+// IPv6; one that starts tag: but is not in that form is refused.
 func FirewallRuleFamily(cidr, proto string) (v6 bool, err error) {
+	if hasTagCIDRPrefix(cidr) {
+		return false, malformedTagCIDR(cidr)
+	}
 	return firewallRuleFamily(cidr, proto)
 }
 

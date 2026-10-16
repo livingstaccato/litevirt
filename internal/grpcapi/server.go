@@ -485,6 +485,23 @@ type Server struct {
 	// recreateTornDown is a test seam: it runs in a rebuild and a rolling
 	// recreate once the old VM is torn down, before it is created again.
 	recreateTornDown func(name string)
+	// testClearFirewallTags is a test seam: when set, a firewall-tags clear (a
+	// delete's, or a tag set's of a copied identity) calls it instead of
+	// corrosion.ClearFirewallTags.
+	testClearFirewallTags func(ctx context.Context, kind, fwID string) error
+	// testClearFirewallTagsLive is the same seam for a hook set on a running
+	// server (SetClearFirewallTagsForTest), read by concurrent deletes.
+	testClearFirewallTagsLive atomic.Pointer[func(ctx context.Context, kind, fwID string) error]
+	// fwTagLocks serializes tag sets of one workload on its owner, so two
+	// concurrent read-merge-writes of its tags row do not lose one
+	// (lockFirewallTags).
+	fwTagLocks [32]sync.Mutex
+	// testFirewallTagsBeforeWrite is a test seam: a tag set calls it between
+	// reading the workload's tags and writing them.
+	testFirewallTagsBeforeWrite func()
+	// testFirewallTagsBeforeMint is a test seam: a tag set calls it between
+	// its copied-identity check (and clear) and the mint.
+	testFirewallTagsBeforeMint func()
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that

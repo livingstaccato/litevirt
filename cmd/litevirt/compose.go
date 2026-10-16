@@ -58,6 +58,9 @@ func newUpCmd() *cobra.Command {
 				return err
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if err := requireTagGroupSupport(ctx, c, composeRuleCIDRs(f)...); err != nil {
+					return err
+				}
 				// Dry-run via DeployStack to get the plan from the server.
 				dryStream, err := c.DeployStack(ctx, &pb.DeployStackRequest{
 					ComposeYaml: string(yamlData),

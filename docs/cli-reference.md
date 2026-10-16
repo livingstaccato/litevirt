@@ -1419,6 +1419,27 @@ lv firewall nic-guard resume <vm> # let a VM held paused for its guards run, gua
 lv firewall enforce status          # mode per host + would-drop totals per workload, NIC and rule, since <time>
 lv firewall enforce on              # enforce (admin, audited); off = observe
 lv firewall enforce reset-counters  # restart every host's would-drop totals from now (admin, audited)
+
+# Firewall tags: per-workload key/value pairs, kept apart from labels (sg.write to change; audited).
+lv firewall tag set <vm> <key>=<value>...                          # adds or replaces keys
+lv firewall tag set <ct> --container [--host <host>] <key>=<value>...
+lv firewall tag rm <vm> <key>...                                   # --container [--host <host>] for a container
+lv firewall tag ls [<workload>] [--container [--host <host>]]      # every tagged workload, or one
+
+# Tag groups: selectors over firewall tags; reference one from a rule with --cidr tag:<group>
+# (sg.write to change; audited; refused until the cluster upgrade has finished).
+lv firewall tag-group set <name> --match <k>=<v> [--match <k>] [--sg <sg>] [--network <net>]   # upsert; matches are ANDed
+lv firewall tag-group ls [--members]   # --members: each member's allocated addresses, or "no allocated address"
+lv firewall tag-group rm <name> [--force]
+  # rm is refused while a rule references tag:<name>, the group binds security groups to a
+  # member's NICs, or its row cannot be read; --force overrides accept rules and the binding, never a drop or reject rule.
+  # set is refused for a name ending in _v6, beside a group <name>_v6, over an ip set named
+  # lv_tg_<name> or lv_tg_<name>_v6, for an --sg or --network that does not exist (or an --sg name
+  # two groups hold), and for --match k= or a key matched twice. rm also asks --force while a
+  # workload whose tags cannot be read sits on a network the group binds. lv asks the daemon
+  # before sending a tag: cidr (a rule, a compose file, or a gitops file that may hold one) and
+  # refuses unless the daemon shows it knows tag groups.
+  # A member leaving a group does not cut its open connections (docs/firewall.md, "Tag groups").
 ```
 
 See `docs/firewall.md` for the three-tier model, where each tier is enforced

@@ -801,7 +801,7 @@ file, the problem names the rule's place in the file.
 |---|---|
 | `proto` | `all`, a protocol name (any case) that nft knows itself (`tcp`, `udp`, `udplite`, `esp`, `ah`, `icmp`, `igmp`, `icmpv6`, `gre`, `comp`, `dccp`, `sctp`) or that is listed in lower case in the host's `/etc/protocols` (`ospf`, `ipv6-icmp`), or a number 0-255 (`0x6`; octal after a leading zero, so `08` is not a number) |
 | `port` (tcp, udp) | a port 0-65535 (decimal, `0x16`, or octal after a leading zero: nft reads `010` as 8), a range `8000-9000` or `ssh - http` that does not run backwards, a service name listed in the host's `/etc/services` for tcp, udp, sctp, dccp or udplite (`ssh`; not `rtmp`, which is listed for ddp only) |
-| `cidr` | an IPv4 address, prefix, range `10.0.0.1-10.0.0.9` or DNS name; one IPv6 address or prefix; `@<ipset>` |
+| `cidr` | an IPv4 address, prefix, range `10.0.0.1-10.0.0.9` or DNS name; one IPv6 address or prefix; `@<ipset>`; `tag:<group>`, naming a tag group that exists |
 | ip set name | a letter, `_` or `.`, then letters, digits, `_`, `.`, `-` or `/`; at most 255 bytes, 252 for a set with IPv6 elements; not an nft keyword (`drop`, `ip`, `tcp`, `set`, ...); not starting with `lv_`, which is reserved for litevirt's internal sets |
 | ip set element | an IPv4 address, prefix, range or DNS name; an IPv6 address or prefix. `--cidr 10.0.0.1,10.0.0.2` is stored as two elements |
 | `action` | `accept`, `drop`, `reject` |
@@ -812,7 +812,8 @@ file, the problem names the rule's place in the file.
 (`& 255.0.0.0 == 10.0.0.0`) and a braced list (`{ 80, 443 }`; a double or
 trailing comma is fine, a leading one is not). A set reference is `@name`,
 `!= @name` or `== @name` (`ne`, `eq`) only: nft refuses `< @name`, a set in
-braces or behind a mask. A rule on a set with IPv6 elements applies to both
+braces or behind a mask. It never names an `lv_` set: a tag group is
+referenced only as `tag:<group>`. A rule on a set with IPv6 elements applies to both
 families, negated or not. A bare comma list (`80,443`) is
 refused: nft rejects it, so it never applied — brace it. `<`, `>`, `<=`,
 `>=` (`lt`, `gt`, `le`, `ge`) take a single value only, not a braced list, a
@@ -874,6 +875,147 @@ rendered against an empty set is named only once that has lasted a minute, so
 a rule that replicates just before its set, or a stack redeploy, raises
 nothing.
 
+## Firewall tags
+
+A workload's firewall tags are key/value pairs kept apart from its labels.
+Labels can be edited by any holder of `vm.update` and are copied by clone,
+restore and import, so a label (`fw.`-prefixed or not) never counts as a
+firewall tag; copy one over with `lv firewall tag set`.
+
+- `lv firewall tag set` and `lv firewall tag rm` need `sg.write` at `/`
+  (Admin or NetworkAdmin; Operator holds only `sg.read`), are refused until
+  the cluster upgrade has finished (`firewall_tag_groups`), and leave a
+  `firewall.tag.set` / `.rm` audit row with the tags before and after. A key
+  and a value are each `[a-z0-9][a-z0-9_.-]{0,62}`, and a workload holds at
+  most 64 tags.
+- Tags belong to the workload's firewall identity (`fw_id`), which the first
+  `tag set` gives it on its host. The identity, and with it the tags, follows
+  the workload through a migrate, a relocation, a rebuild, a VM's rolling
+  update or recreate in a stack, and a same-name replica promotion. A
+  container a stack recreates, the green VM of a blue-green update, a clone,
+  an import, a template instance, and a restore under a new name or into a
+  freed name are new workloads with none; the delete of the container
+  replaced, or of the blue VM, clears its tags.
+- When another live workload holds the same identity (a copy), `tag set` and
+  `tag rm` give the workload its own identity and clear the copied
+  identity's tags from both; the output names the identity replaced and the
+  tags cleared, and the clear leaves its own `firewall.tag.rm` audit row.
+- Two tag sets of one workload sent to two hosts during a move's handover,
+  when each host still believes it owns the workload, keep the last write;
+  both are audited.
+- A restore into a freed name, and a rebuild or recreate that fails after
+  tearing the VM down, print the tags the deleted incarnation left and the
+  `lv firewall tag set` command that sets them again.
+- `lv cutover` gives the name to the `-next` VM, which keeps its own tags.
+  The replaced VM's tags stay with it, and the cutover prints them with the
+  command that sets them on the VM now named so.
+- Deleting a workload clears its tags, unless another live workload holds
+  the same identity (the other side of a move, or a copy), which keeps them.
+  A row whose identity no live workload holds is cleared by the failover lease holder 24 hours after the last
+  record of that identity, so a move or re-create in flight keeps its tags.
+- A container created by a build before the container create spec existed
+  (its row has none) cannot be tagged until it is created again.
+- `lv inspect` (on stderr, beside the JSON) and `lv ct inspect` print a
+  `Firewall tags:` line: the tags, `none`, `none (no firewall identity yet)`,
+  `none (a row for an earlier incarnation of this name exists, fw_id <id>,
+  not applied)`, or `unreadable` for a row that cannot be read. The web UI's
+  VM page shows them read-only, and `lv firewall tag ls` lists unreadable
+  rows too.
+
+## Tag groups
+
+A tag group selects workloads by their firewall tags and gives the cluster
+one nft set, `lv_tg_<name>`, holding their addresses.
+
+```
+lv firewall tag-group set web --match role=web --match env=prod --network prod --sg web-in
+lv firewall tag-group ls --members
+lv firewall tag-group rm web
+```
+
+- A group name is `[a-z][a-z0-9_]{0,30}`. A name ending in `_v6` is refused,
+  because `lv_tg_<name>_v6` is the IPv6 companion of another group's set.
+- `--match k=v` needs the tag `k` to hold `v`, and `--match k` needs only
+  that the workload holds `k`. Every match must hold. `--match k=` and a key
+  matched twice are refused.
+- A member's addresses are its allocated leases, IPv4 in `lv_tg_<name>`
+  and IPv6 in `lv_tg_<name>_v6`. A member with no allocated address is in no
+  set; `lv firewall tag-group ls --members` shows it as `no allocated
+  address`. A change to a VM's recorded address does not change the set; the
+  lease does.
+- A rule references the group as `cidr: tag:<name>` (an `lv sg rule-add`, a
+  cluster or host rule, a compose security group or `firewall.cluster-rules`
+  entry). It is stored as written and rendered as `@lv_tg_<name>`; it applies
+  to both families. Writing a rule for a group that does not
+  exist is refused.
+- `--sg` and `--network` bind security groups: every NIC of every member is
+  also bound to the listed security groups, on the listed networks (every
+  network when none is listed), merged with the NIC's own.
+- `rm` is refused while a rule references `tag:<name>`, the group binds
+  security groups to a member's NICs, or the group's row cannot be read. `--force` overrides accept rules and
+  the binding, never a drop or reject rule. It also asks `--force` while a
+  workload whose tags cannot be read sits on a network the group binds.
+- Writing a group, or a rule that references one, is refused until the
+  cluster upgrade has finished (`firewall_tag_groups`). `lv` asks the daemon
+  before it sends a `tag:` cidr, from a rule, a compose file or a gitops file
+  that may hold one, and refuses unless the daemon shows it knows tag groups.
+
+**Propagation.** A host reflects a tag or group change made at `t0` by
+`t0 + L + T + pass`: `L` is that host's replication lag, `T` the 30 second
+reconcile tick and `pass` one reconcile. The host that takes the write
+reconciles at once. Hosts may disagree inside that window:
+
+| Change | A host that has not yet seen it |
+|---|---|
+| A tag is added | The member's accepts apply later; drops on it apply later |
+| A tag is removed, or a lease released | The member is still allowed |
+| A lease is reallocated to a non-member | Treated as a removal |
+
+**Established connections survive removal.** `ct state established,related
+accept` comes before every rule (see "Stateful conntrack baked in"), and
+litevirt does not flush conntrack when a member leaves a group, so a
+connection that was accepted keeps passing. To cut one at once, delete it on
+the host that carries it: `conntrack -D -s <address>`.
+
+**Fail closed.** Where membership cannot be proven, the host raises a
+condition:
+
+- A workload whose tags row cannot be read is a member of no group, and its
+  NICs are held at drop on the networks a tag group binds security groups
+  on, or on every network while a drop or reject rule names a tag group
+  (`firewall.tag_group.tags_unreadable`, critical).
+- A workload whose identity another live workload holds too (a copy) is a
+  member of no group, and every NIC of each is held at drop; an open move's
+  own source and target are not held (`firewall.tag_group.identity_shared`,
+  critical).
+- A workload with no identity, while a row of an earlier incarnation of its
+  name remains (a relocation or restore that did not carry the identity),
+  is named with the `lv firewall tag set` command that sets its tags again
+  (`firewall.tag_group.identity_lost`, warning).
+
+  The first two holds are partial. They are the per-NIC chain's own rules, so
+  they come after the cluster and host tiers: traffic those tiers accept
+  still passes. Observe mode counts the hold instead of dropping.
+- A rule naming a tag group this host does not hold matches nothing when it
+  accepts, and loses its address match when it drops or rejects
+  (`firewall.tag_group.missing`, critical, named once it has lasted a
+  minute).
+- A group whose row cannot be read is rendered from the last definition this
+  host read: its set, its bindings and its rules stay. When this host never
+  read it (the daemon started since), every NIC here of every workload with
+  tags is held at drop on every network until it reads again. A group named
+  `<x>_v6` while a group `<x>` exists keeps its bindings, but its set cannot
+  be declared, so its accepts match nothing and its drops lose their address.
+  Each raises `firewall.tag_group.unreadable` (critical).
+- A rule stored as a reference to a group's set (`@lv_tg_<name>`,
+  `!= @lv_tg_<name>`) is left out, like any reference to one of litevirt's
+  own sets, except that a negated drop or reject on a group this host does
+  not render denies everyone it names. A user ip set named `lv_tg_*` is left
+  out.
+- `litevirt_firewall_tag_group_members{group}` counts each group's members
+  in this host's view (0 for a group this host cannot read), and
+  `lv firewall tag-group ls --members` lists them.
+
 ## CLI
 
 The CLI lives at `lv sg …` and `lv firewall …`:
@@ -912,6 +1054,17 @@ lv firewall nic-guard resume <vm>   # a VM held paused for its guards (see "Held
 
 # Observe or enforce the per-NIC rules (see "Observe and enforce")
 lv firewall enforce status
+
+# Per-workload firewall tags (see "Firewall tags")
+lv firewall tag set web-1 role=web env=prod
+lv firewall tag set cache-1 --container --host node-2 role=web
+lv firewall tag rm web-1 env
+lv firewall tag ls [web-1]
+
+# Tag groups: rules reference one with --cidr tag:<name>
+lv firewall tag-group set web --match role=web [--match env=prod] [--network prod] [--sg web-in]
+lv firewall tag-group ls [--members]
+lv firewall tag-group rm web [--force]
 
 # Inspect the live rulesets on this host (litevirt-fw and litevirt-nic) / force a reconcile now
 lv firewall show
@@ -967,6 +1120,8 @@ the row names the user the session belongs to.
 | `sg.rule.add` / `sg.rule.rm` | group id (add) / rule id (rm) | `lv sg rule-add/rule-rm`, UI |
 | `nic.guard.set` | VM name, or `ct:<host>/<name>` | `lv firewall nic-guard set` |
 | `firewall.enforcement` | `cluster` | `lv firewall enforce on/off` |
+| `firewall.tag.set` / `.rm` | VM name, or `<host>/<name>` for a container | `lv firewall tag set/rm` |
+| `firewall.tag_group.set` / `.rm` | group name | `lv firewall tag-group set/rm` |
 
 The row's user is the authenticated caller. Its detail records the policy
 before and after the change, in the form `before=<state> after=<state>`:

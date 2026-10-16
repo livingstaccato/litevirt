@@ -153,6 +153,10 @@ type ContainerRecord struct {
 	ActiveOperationID string
 	CreatedAt         string
 	UpdatedAt         string
+	// FirewallCarry lets a row-INSERT keep the firewall identity of the
+	// container it re-creates (CarryFirewallID). Zero, the insert stores no
+	// identity, whatever CreateSpec holds. Never read back.
+	FirewallCarry FirewallIDCarry
 }
 
 // ContainerCreateSpec captures a container's create-time intent so host-loss
@@ -260,6 +264,11 @@ func MintContainerPlacementSpec(ctx context.Context, c *Client, host, name, curr
 		return "", false, nil
 	}
 	next, _ := WithNewPlacement(current)
+	// A new placement of the same container: it keeps its identity.
+	next, err := keepFirewallID(TagMemberCT, next, firewallIDOf(TagMemberCT, current))
+	if err != nil {
+		return "", false, err
+	}
 	n, err := c.ExecuteRowsStrict(ctx, containerPlacementMintSQL,
 		next, c.NowTS(), host, name, current)
 	if errors.Is(err, ErrNoRowsAffected) {
@@ -329,18 +338,91 @@ func DecodeCreateSpec(raw string) ContainerCreateSpec {
 // UpsertContainer creates or updates the cluster row for a container.
 // Atomic: the (host_name, name) primary key plus a soft-delete-aware
 // UPDATE keeps us from racing with concurrent List queries.
+//
+// The row keeps the firewall identity the LIVE row at (host, name) holds,
+// whatever r.CreateSpec says; with no live row it stores none. Its statement
+// keeps the stored create_spec when r.CreateSpec is "", and its conflict arm
+// revives a tombstone, so an empty r.CreateSpec over a tombstone holding an
+// identity is replaced by that create_spec without the identity: a delete
+// ends an identity.
 func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
-	stmt, err := upsertContainerStmt(c, r)
-	if err != nil {
-		return err
+	if r.FirewallCarry != (FirewallIDCarry{}) {
+		return ErrFirewallIDCarryRefused
 	}
-	return c.ExecuteBatch(ctx, []Statement{stmt})
+	// The identity kept is read before the write, so the write re-checks it
+	// inside its transaction: a row deleted, or deleted and re-created, in
+	// between must not receive the identity read from the old one.
+	type seen struct {
+		exists, live bool
+		id           string
+	}
+	read := func(rows []Row) seen {
+		if len(rows) == 0 {
+			return seen{}
+		}
+		return seen{exists: true, live: rows[0].Int("live") != 0, id: firewallIDOf(TagMemberCT, rows[0].String("create_spec"))}
+	}
+	const rowSQL = `SELECT COALESCE(create_spec, '') AS create_spec, deleted_at IS NULL AS live
+		 FROM containers WHERE host_name = ? AND name = ?`
+	for attempt := 0; attempt < specMutateMaxRetries; attempt++ {
+		rows, err := c.Query(ctx, rowSQL, r.HostName, r.Name)
+		if err != nil {
+			return err
+		}
+		before := read(rows)
+		w := r
+		keep := ""
+		if before.live {
+			keep = before.id
+		} else if before.exists && w.CreateSpec == "" {
+			w.CreateSpec = rows[0].String("create_spec")
+		}
+		stmt, err := upsertContainerStmt(c, w, keep)
+		if err != nil {
+			return err
+		}
+		if upsertContainerInterleaveHook != nil {
+			upsertContainerInterleaveHook()
+		}
+		applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+			var cs string
+			var live int
+			err := tx.QueryRowContext(ctx, rowSQL, r.HostName, r.Name).Scan(&cs, &live)
+			now := seen{}
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+			case err != nil:
+				return false, err
+			default:
+				now = seen{exists: true, live: live != 0, id: firewallIDOf(TagMemberCT, cs)}
+			}
+			return now == before, nil
+		}, []Statement{stmt})
+		if err != nil || applied {
+			return err
+		}
+	}
+	return fmt.Errorf("upsert container %s/%s: the row kept changing under the write", r.HostName, r.Name)
 }
+
+// upsertContainerInterleaveHook is a TEST-ONLY seam between UpsertContainer's
+// read of the row and its write. Production leaves it nil.
+var upsertContainerInterleaveHook func()
 
 // upsertContainerStmt builds the container UPSERT as a Statement so it can be
 // written in the SAME ExecuteBatch as the interface rows + IPAM leases (atomic
 // create — a crash can't leave a tracked container with missing NIC/IPAM state).
-func upsertContainerStmt(c *Client, r ContainerRecord) (Statement, error) {
+// The create spec it writes holds exactly the firewall identity keepID (none
+// when ""); an empty create spec stays empty, which the statement reads as
+// "keep the stored one".
+func upsertContainerStmt(c *Client, r ContainerRecord, keepID string) (Statement, error) {
+	if r.CreateSpec != "" {
+		cs, err := keepFirewallID(TagMemberCT, r.CreateSpec, keepID)
+		if err != nil {
+			return Statement{}, err
+		}
+		r.CreateSpec = cs
+	}
 	now := c.NowTS()
 	if r.CreatedAt == "" {
 		// created_at is wall/display, never the HLC key. Nano precision so a
@@ -391,7 +473,9 @@ func CreateContainerAtomic(ctx context.Context, c *Client, rec ContainerRecord, 
 		SQL:    `DELETE FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NOT NULL`, // full-state-delete-ok
 		Params: []interface{}{rec.HostName, rec.Name},
 	})
-	cs, err := upsertContainerStmt(c, rec)
+	// A new container has no firewall identity unless the caller carries the
+	// one of the container it re-creates.
+	cs, err := upsertContainerStmt(c, rec, rec.FirewallCarry.idFor(TagMemberCT))
 	if err != nil {
 		return err
 	}
@@ -871,12 +955,17 @@ func rekeyContainerStmt(c *Client, src ContainerRecord, toHost, now string) (Sta
 	if createdAt == "" {
 		createdAt = nowRFC3339() // created_at is wall/display, never the HLC key
 	}
+	// The re-keyed row is the source container: it keeps the source's identity.
+	createSpec, err := keepFirewallID(TagMemberCT, src.CreateSpec, firewallIDOf(TagMemberCT, src.CreateSpec))
+	if err != nil {
+		return Statement{}, err
+	}
 	return Statement{
 		SQL: containerRekeyInsertSQL,
 		Params: []interface{}{
 			toHost, src.Name, src.Image, src.CPULimit, src.MemMiB, labelsJSON,
 			src.RestartPolicy, ContainerRuntimeRekeyDetail, src.Project, boolToInt(src.IsTemplate),
-			src.OnHostFailure, src.CreateSpec, src.RelocateToken,
+			src.OnHostFailure, createSpec, src.RelocateToken,
 			src.OwnerEpoch, src.SpecGeneration, src.ActiveOperationID, createdAt, now,
 		},
 	}, nil
@@ -895,12 +984,17 @@ func legacyRekeyContainerStmt(src ContainerRecord, toHost, now string) (Statemen
 	if createdAt == "" {
 		createdAt = nowRFC3339()
 	}
+	// The re-keyed row is the source container: it keeps the source's identity.
+	createSpec, err := keepFirewallID(TagMemberCT, src.CreateSpec, firewallIDOf(TagMemberCT, src.CreateSpec))
+	if err != nil {
+		return Statement{}, err
+	}
 	return Statement{
 		SQL: legacyContainerRekeySQL,
 		Params: []interface{}{
 			toHost, src.Name, src.Image, src.CPULimit, src.MemMiB, labelsJSON,
 			src.RestartPolicy, ContainerRuntimeRekeyDetail, src.Project, boolToInt(src.IsTemplate),
-			src.OnHostFailure, src.CreateSpec, src.RelocateToken, createdAt, now,
+			src.OnHostFailure, createSpec, src.RelocateToken, createdAt, now,
 		},
 	}, nil
 }
@@ -1011,8 +1105,13 @@ func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, n
 	rec.State = "pending"
 	rec.StateDetail = ContainerRelocateRecreateDetail
 	rec.RelocateToken = token
-	// A new placement, whatever created_at keeps (below).
+	// A new placement, whatever created_at keeps (below). The relocated row is
+	// the source container: it keeps the source's firewall identity.
 	rec.CreateSpec, _ = WithNewPlacement(rec.CreateSpec)
+	keepID := firewallIDOf(TagMemberCT, old.CreateSpec)
+	if rec.CreateSpec, err = keepFirewallID(TagMemberCT, rec.CreateSpec, keepID); err != nil {
+		return err
+	}
 	// created_at is PRESERVED, as RekeyContainerOwnerGuarded preserves it: a
 	// relocation moves one incarnation of the container, it does not make a
 	// new one. A recovery claim is keyed by created_at
@@ -1047,7 +1146,7 @@ func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, n
 	var target Statement
 	preEpoch := old.OwnerEpoch == 0 && old.SpecGeneration == 0 && old.ActiveOperationID == ""
 	if preEpoch && !c.ClaimIncarnationLatched() {
-		ts, terr := upsertContainerStmt(c, rec)
+		ts, terr := upsertContainerStmt(c, rec, keepID)
 		if terr != nil {
 			return terr
 		}

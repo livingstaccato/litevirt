@@ -241,6 +241,10 @@ type mockGRPC struct {
 	lastDeleteReplReq     *pb.DeleteReplicationScheduleRequest
 	lastPromoteReq        *pb.PromoteReplicaRequest
 	promoteErr            error
+
+	// listFirewallTagsResp answers ListFirewallTags (nil: Unimplemented, an
+	// older daemon).
+	listFirewallTagsResp *pb.ListFirewallTagsResponse
 }
 
 // ── Core RPCs ────────────────────────────────────────────────────────────────

@@ -60,6 +60,7 @@
       </div>
     </div>
   </div>
+  {{with .FirewallTags}}<div class="fw-tags-row" title="Firewall tags (lv firewall tag set): kept apart from labels; read-only here"><span style="color:var(--muted)">Firewall tags:</span> {{.}}</div>{{end}}
   {{with .InspectStale}}<div class="alert alert-warn">{{.}}</div>{{end}}
 
   {{if eq .VM.State.String "VM_RUNNING"}}

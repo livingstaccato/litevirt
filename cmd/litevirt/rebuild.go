@@ -5,8 +5,11 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/apimeta"
 )
 
 func newRebuildCmd() *cobra.Command {
@@ -50,11 +53,18 @@ original's name and started again.`,
 					fmt.Printf("%s is running; it will be stopped and restarted as %s "+
 						"(libvirt cannot rename a live domain).\n", next, args[0])
 				}
-				vm, err := c.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: args[0]})
+				var hdr metadata.MD
+				vm, err := c.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: args[0]}, grpc.Header(&hdr))
 				if err != nil {
 					return fmt.Errorf("cutover: %w", err)
 				}
 				fmt.Printf("Cutover complete: VM %s is now running on %s\n", vm.Name, vm.HostName)
+				// The replaced VM's firewall tags stay with it (they do not
+				// follow the name); the daemon says which, and how to set
+				// them on the VM now named so.
+				for _, note := range hdr.Get(apimeta.FirewallTagsLeftHeader) {
+					fmt.Printf("Note: %s\n", note)
+				}
 				return nil
 			})
 		},

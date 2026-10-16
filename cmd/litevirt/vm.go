@@ -206,7 +206,15 @@ func newInspectCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				return cli.PrintVMInspect(ctx, c, args[0])
+				if err := cli.PrintVMInspect(ctx, c, args[0]); err != nil {
+					return err
+				}
+				// On stderr, beside the inspect's other notes, so the JSON
+				// stays parseable.
+				if line := firewallTagsLine(ctx, c, "vm", args[0], ""); line != "" {
+					fmt.Fprintf(os.Stderr, "Firewall tags: %s\n", line)
+				}
+				return nil
 			})
 		},
 	}

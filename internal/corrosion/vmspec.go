@@ -34,7 +34,20 @@ var ErrSpecMutateContention = errors.New("corrosion: MutateDesiredSpec exceeded 
 // newGen is the VM's spec_generation after the call (the bumped value, or the
 // unchanged value for a no-op / deferral) — thread it into a later
 // UpdateObservedActuals so the observation records against the spec it applied to.
+//
+// The new spec keeps the firewall identity the current spec holds, whatever fn
+// returns (keepFirewallID): a spec writer can neither set nor drop it.
 func MutateDesiredSpec(ctx context.Context, c *Client, name string, fn func(oldSpec string) (string, error)) (applied bool, newGen int64, err error) {
+	return mutateDesiredSpec(ctx, c, name, fn, func(old string) (string, error) {
+		return firewallIDOf(TagMemberVM, old), nil
+	})
+}
+
+// mutateDesiredSpec is MutateDesiredSpec storing the firewall identity keepFor
+// returns for the spec it read. Only MutateDesiredSpec (the current identity)
+// and MintFirewallID call it.
+func mutateDesiredSpec(ctx context.Context, c *Client, name string, fn func(oldSpec string) (string, error),
+	keepFor func(oldSpec string) (string, error)) (applied bool, newGen int64, err error) {
 	for attempt := 0; attempt < specMutateMaxRetries; attempt++ {
 		rows, qerr := c.Query(ctx,
 			`SELECT spec, spec_generation, active_operation_id FROM vms WHERE name = ? AND deleted_at IS NULL`, name)
@@ -51,6 +64,13 @@ func MutateDesiredSpec(ctx context.Context, c *Client, name string, fn func(oldS
 		}
 		newSpec, ferr := fn(oldSpec)
 		if ferr != nil {
+			return false, specGen, ferr
+		}
+		keep, kerr := keepFor(oldSpec)
+		if kerr != nil {
+			return false, specGen, kerr
+		}
+		if newSpec, ferr = keepFirewallID(TagMemberVM, newSpec, keep); ferr != nil {
 			return false, specGen, ferr
 		}
 		if newSpec == oldSpec {

@@ -41,15 +41,21 @@ are unknown.`,
 				if err != nil {
 					return fmt.Errorf("inspect container: %w", err)
 				}
+				tags := firewallTagsLine(ctx, c, "container", d.GetContainer().GetName(), d.GetContainer().GetHostName())
 				if output == "json" {
 					b, merr := protojson.MarshalOptions{Multiline: true, Indent: "  "}.Marshal(d)
 					if merr != nil {
 						return merr
 					}
-					_, err := os.Stdout.Write(append(b, '\n'))
-					return err
+					if _, err := os.Stdout.Write(append(b, '\n')); err != nil {
+						return err
+					}
+					if tags != "" {
+						fmt.Fprintf(os.Stderr, "Firewall tags: %s\n", tags)
+					}
+					return nil
 				}
-				return printContainerDetail(d)
+				return printContainerDetail(d, tags)
 			})
 		},
 	}
@@ -59,7 +65,9 @@ are unknown.`,
 	return cmd
 }
 
-func printContainerDetail(d *pb.ContainerDetail) error {
+// printContainerDetail prints d; tags is its "Firewall tags:" line ("" when
+// the daemon could not say).
+func printContainerDetail(d *pb.ContainerDetail, tags string) error {
 	c := d.GetContainer()
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 	field := func(k, v string) { fmt.Fprintf(w, "%s\t%s\n", k+":", v) }
@@ -107,6 +115,9 @@ func printContainerDetail(d *pb.ContainerDetail) error {
 		rootfs += " (" + formatBytes(d.GetRootfsBytes()) + ")"
 	}
 	field("Rootfs", rootfs)
+	if tags != "" {
+		field("Firewall tags", tags)
+	}
 	field("Created", orDash(c.GetCreatedAt()))
 	field("Updated", orDash(c.GetUpdatedAt()))
 	if err := w.Flush(); err != nil {

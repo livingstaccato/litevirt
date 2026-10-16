@@ -257,3 +257,112 @@ func TestFleet_RedeployKeepsARecordedSharedDeviceAndWarns(t *testing.T) {
 		t.Errorf("sa_backend's row names %q after the redeploy, want backend", got)
 	}
 }
+
+const composeDirectNoInterface = `name: dn
+
+networks:
+  eth1:
+    type: direct
+
+vms:
+  da:
+    image: test
+    cpu: 1
+    memory: 256
+    placement:
+      host: node-0
+    network:
+      - name: eth1
+  db:
+    image: test
+    cpu: 1
+    memory: 256
+    placement:
+      host: node-1
+    network:
+      - name: eth1
+`
+
+// A direct network with no interface attaches macvtap to the host NIC named
+// after it, as on main, on the entry host and the peer alike: the scoped
+// default is for bridges only.
+//
+// Mutation: give direct networks the scoped default — red.
+func TestFleet_DirectNetworkWithoutInterfaceUsesTheHostNIC(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	ctx := context.Background()
+	seedTestImageEverywhere(t, c)
+	msgs, err := deployStream(t, ctx, c.SelfClient(c.Nodes[0]), composeDirectNoInterface)
+	if err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	for _, p := range msgs {
+		if p.Phase == "error" {
+			t.Fatalf("deploy failed: %s: %s", p.VmName, p.Error)
+		}
+	}
+	for _, n := range c.Nodes {
+		if dev, ok := n.Net.Up("dn_eth1"); !ok || dev != "direct:eth1" {
+			t.Errorf("%s: dn_eth1 up=%v on %q, want direct:eth1", n.Name, ok, dev)
+		}
+	}
+	if got := rowInterface(t, c.Nodes[0].DB, "dn_eth1"); got != "eth1" {
+		t.Errorf("dn_eth1's row names %q, want eth1", got)
+	}
+}
+
+const composeHostBridge = `name: hb
+
+networks:
+  br0:
+    type: bridge
+
+vms:
+  ha:
+    image: test
+    cpu: 1
+    memory: 256
+    placement:
+      host: node-0
+    network:
+      - name: br0
+  hb:
+    image: test
+    cpu: 1
+    memory: 256
+    placement:
+      host: node-1
+    network:
+      - name: br0
+`
+
+// A new stack network named after a bridge the entry host already has (an
+// operator's, which no stack network is on) is put on that bridge, as on
+// main; the entry host decides once and every peer gets the same device.
+//
+// Mutation: drop the host-bridge rule — the network goes to hb_br0, red.
+func TestFleet_StackNetworkNamedAfterAHostBridgeUsesIt(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	ctx := context.Background()
+	seedTestImageEverywhere(t, c)
+	entry := c.Nodes[0]
+	entry.Net.SetOperatorBridge("br0")
+	entry.Server.SetBridgeExists(func(dev string) bool { return dev == "br0" || entry.Net.HasDevice(dev) })
+	msgs, err := deployStream(t, ctx, c.SelfClient(entry), composeHostBridge)
+	if err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	for _, p := range msgs {
+		if p.Phase == "error" {
+			t.Fatalf("deploy failed: %s: %s", p.VmName, p.Error)
+		}
+	}
+	for _, n := range c.Nodes {
+		if dev, ok := n.Net.Up("hb_br0"); !ok || dev != "br0" {
+			t.Errorf("%s: hb_br0 up=%v on %q, want the host bridge br0", n.Name, ok, dev)
+		}
+	}
+	if got := rowInterface(t, c.Nodes[0].DB, "hb_br0"); got != "br0" {
+		t.Errorf("hb_br0's row names %q, want br0", got)
+	}
+}

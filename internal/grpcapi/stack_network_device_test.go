@@ -115,7 +115,7 @@ func TestDefaultStackNetworkDevices_SharedDeviceWarns(t *testing.T) {
 	if len(w) != 1 {
 		t.Fatalf("warnings %v, want exactly one", w)
 	}
-	for _, want := range []string{`"sa"`, `"sb"`, "sb_backend", `"backend"`, "interface: sa_backend"} {
+	for _, want := range []string{`"sa"`, `"sb"`, "sb_backend", `"backend"`, "interface: sa_backend", "If that is not intended"} {
 		if !strings.Contains(w[0], want) {
 			t.Errorf("warning %q does not name %s", w[0], want)
 		}
@@ -124,5 +124,122 @@ func TestDefaultStackNetworkDevices_SharedDeviceWarns(t *testing.T) {
 	sb := backendFile("sb", compose.NetworkDef{Type: "bridge", Subnet: "10.2.0.0/24"})
 	if w, _ := s.defaultStackNetworkDevices(ctx, sb); len(w) != 1 || !strings.Contains(w[0], "sa_backend") {
 		t.Errorf("sb's redeploy warnings %v, want one naming sa_backend", w)
+	}
+}
+
+// A direct network's interface is the host NIC macvtap attaches to: with none
+// given it is the network's own name, as on main, never a scoped name no NIC
+// carries.
+//
+// Mutation: give direct the scoped default — red.
+func TestDefaultStackNetworkDevices_DirectNetworkKeepsItsShortName(t *testing.T) {
+	s := testServer(t)
+	f := &compose.File{Name: "st", Networks: map[string]compose.NetworkDef{"eth1": {Type: "direct"}}}
+	if _, err := s.defaultStackNetworkDevices(context.Background(), f); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.Networks["eth1"].Interface; got != "eth1" {
+		t.Errorf("direct eth1 on %q, want the host NIC eth1", got)
+	}
+}
+
+// A row whose config does not parse records no device: the deploy goes on, as
+// on main (which wrote the row over), and the network gets the default.
+func TestDefaultStackNetworkDevices_UnparseableRowRecordsNoDevice(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{
+		Name: "st_backend", StackName: "st", Type: "bridge", Config: "{not json",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f := backendFile("st", compose.NetworkDef{Type: "bridge"})
+	if _, err := s.defaultStackNetworkDevices(ctx, f); err != nil {
+		t.Fatalf("an unparseable row refused the deploy: %v", err)
+	}
+	if got := f.Networks["backend"].Interface; got != "st_backend" {
+		t.Errorf("backend on %q, want st_backend", got)
+	}
+}
+
+// A new stack network named after a bridge that already exists on the entry
+// host, which no stack network is recorded on and litevirt did not make, is
+// put on that bridge, as on main: naming a host bridge attaches to it.
+//
+// Mutation: drop the host-bridge rule — red.
+func TestDefaultStackNetworkDevices_ExistingHostBridgeIsUsed(t *testing.T) {
+	s := testServer(t)
+	s.bridgeExists = func(dev string) bool { return dev == "br0" }
+	f := &compose.File{Name: "st", Networks: map[string]compose.NetworkDef{
+		"br0": {Type: "bridge"},
+		"lan": {Type: "bridge"},
+	}}
+	w, err := s.defaultStackNetworkDevices(context.Background(), f)
+	if err != nil || len(w) != 0 {
+		t.Fatalf("warnings=%v err=%v", w, err)
+	}
+	if got := f.Networks["br0"].Interface; got != "br0" {
+		t.Errorf("br0 on %q, want the host's br0", got)
+	}
+	if got := f.Networks["lan"].Interface; got != "st_lan" {
+		t.Errorf("lan on %q, want st_lan", got)
+	}
+}
+
+// A bridge another stack's network is recorded on is not a host bridge to
+// attach to: the new stack gets its scoped name.
+//
+// Mutation: drop the recorded-by-a-stack check — red.
+func TestDefaultStackNetworkDevices_BridgeRecordedByAStackIsNotTaken(t *testing.T) {
+	s := testServer(t)
+	s.bridgeExists = func(dev string) bool { return dev == "backend" }
+	seedStackNetworkRow(t, s, "sa", "backend", compose.NetworkDef{Type: "bridge", Interface: "backend"})
+	sb := backendFile("sb", compose.NetworkDef{Type: "bridge"})
+	if _, err := s.defaultStackNetworkDevices(context.Background(), sb); err != nil {
+		t.Fatal(err)
+	}
+	if got := sb.Networks["backend"].Interface; got != "sb_backend" {
+		t.Errorf("sb backend on %q, want sb_backend", got)
+	}
+}
+
+type createdBridgesProv struct {
+	hostNetworkProvisioner
+	created []string
+}
+
+func (p createdBridgesProv) CreatedBridges() ([]string, error) { return p.created, nil }
+
+// A bridge litevirt made here (a legacy stack network's, whose row no longer
+// names it) is not an operator's host bridge either.
+//
+// Mutation: drop the created-bridge check — red.
+func TestDefaultStackNetworkDevices_LitevirtMadeBridgeIsNotAHostBridge(t *testing.T) {
+	s := testServer(t)
+	s.bridgeExists = func(dev string) bool { return dev == "backend" }
+	s.SetNetworkProvisioner(createdBridgesProv{created: []string{"backend"}})
+	f := backendFile("sc", compose.NetworkDef{Type: "bridge"})
+	if _, err := s.defaultStackNetworkDevices(context.Background(), f); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.Networks["backend"].Interface; got != "sc_backend" {
+		t.Errorf("sc backend on %q, want sc_backend", got)
+	}
+}
+
+// The other direction: a new stack's scoped default that another stack names
+// as its interface is shared too, and warned about.
+//
+// Mutation: check only recorded devices — red.
+func TestDefaultStackNetworkDevices_ScopedDefaultOnAnotherStacksDeviceWarns(t *testing.T) {
+	s := testServer(t)
+	seedStackNetworkRow(t, s, "x", "lan", compose.NetworkDef{Type: "bridge", Interface: "sa_backend"})
+	sa := backendFile("sa", compose.NetworkDef{Type: "bridge"})
+	w, err := s.defaultStackNetworkDevices(context.Background(), sa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w) != 1 || !strings.Contains(w[0], "x_lan") || !strings.Contains(w[0], `"x"`) {
+		t.Errorf("warnings %v, want one naming x_lan of stack x", w)
 	}
 }

@@ -248,12 +248,14 @@ action: restart
 	}
 }
 
-// A declared network with no interface takes its stack-scoped flat bridge
-// name (the same on every host, and distinct from another stack's network of
-// the same short name); one with an interface keeps it, and an external
-// network is not touched.
+// A declared bridge network with no interface takes its stack-scoped flat
+// bridge name (the same on every host, and distinct from another stack's
+// network of the same short name); one with an interface keeps it, and an
+// external network is not touched. Any other type keeps its short name: for
+// `direct` that is the host NIC macvtap attaches to, as on main.
 //
 // Mutation: default to the short name — "lan" goes red.
+// Mutation: give every type the scoped default — "mgmt" and "iso" go red.
 func TestDefaultNetworkInterfaces(t *testing.T) {
 	f := &File{Name: "st", Networks: map[string]NetworkDef{
 		"lan":            {Type: "bridge"},
@@ -261,10 +263,14 @@ func TestDefaultNetworkInterfaces(t *testing.T) {
 		"set":            {Type: "bridge", Interface: "br7"},
 		"ext":            {External: true},
 		"a-long-backend": {Type: "bridge"},
+		"untyped":        {},
+		"mgmt":           {Type: "direct"},
+		"vx":             {Type: "vxlan", VNI: 7},
 	}}
 	f.DefaultNetworkInterfaces(nil)
 	for name, want := range map[string]string{
-		"lan": "st_lan", "iso": "st_iso", "set": "br7", "ext": "",
+		"lan": "st_lan", "iso": "iso", "set": "br7", "ext": "",
+		"untyped": "st_untyped", "mgmt": "mgmt", "vx": "vx",
 		"a-long-backend": FlatBridgeName("st_a-long-backend"),
 	} {
 		if got := f.Networks[name].Interface; got != want {

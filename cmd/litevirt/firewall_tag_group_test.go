@@ -246,38 +246,56 @@ func TestTagGroupSet_MatchRefusesEmptyAndRepeated(t *testing.T) {
 }
 
 // gitops sends no compose that holds, or may hold, a tag: cidr to a daemon
-// that answers Unimplemented: judged by its rules when lv parses it, and by
-// its raw text when it does not, since an older daemon validates less than
-// lv (review I-1). A file with no tag: deploys.
+// that answers Unimplemented: judged by its rules when lv parses it, and
+// probed whatever its text holds when lv does not, since an older daemon
+// validates less than lv (review I-1) and an escaped YAML scalar
+// ("\x74ag:web") spells tag: with no literal tag: in the file (D6 re-review
+// n-1). A file that parses with no tag: deploys unprobed; an unparseable one
+// deploys once the daemon proves it knows tag groups.
 //
-// Mutations: probe only on a parse — the unparseable case deploys: red;
-// never probe — red; probe every file — the plain unparseable case is
-// refused: red.
+// Mutations: probe only on a parse — the unparseable cases deploy: red;
+// never probe — red; probe an unparseable file only on a raw "tag:" scan —
+// the escaped case deploys: red; probe every file — the plain parseable case
+// probes: red.
 func TestGitopsDeploy_ProbesForTag(t *testing.T) {
 	unimpl := status.Error(codes.Unimplemented, "unknown method")
 	parses := "name: dd\nsecurity-groups:\n  web:\n    rules:\n      - {direction: ingress, proto: tcp, port: \"443\", cidr: \"tag:web\", action: accept}\n"
 	for _, c := range []struct {
 		name, body string
+		probeErr   error
+		probe      bool
 		deploy     bool
 	}{
-		{"parses, holds tag:", parses, false},
-		{"does not parse, holds TAG :", "name: dd\nbogus-field: 1\nsecurity-groups:\n  web:\n    rules:\n      - {cidr: \"TAG : web\", port: \"99999\"}\n", false},
-		{"does not parse, no tag", "name: dd\nbogus-field: 1\n", true},
-		{"parses, no tag", "name: dd\nsecurity-groups:\n  web:\n    rules:\n      - {direction: ingress, proto: tcp, port: \"443\", cidr: \"10.0.0.0/8\", action: accept}\n", true},
+		{"parses, holds tag:", parses, unimpl, true, false},
+		{"does not parse, holds TAG :", "name: dd\nbogus-field: 1\nsecurity-groups:\n  web:\n    rules:\n      - {cidr: \"TAG : web\", port: \"99999\"}\n", unimpl, true, false},
+		{"does not parse, escaped tag:", "name: dd\nbogus-field: 1\nsecurity-groups:\n  web:\n    rules:\n      - {cidr: \"\\x74ag:web\"}\n", unimpl, true, false},
+		{"does not parse, no tag", "name: dd\nbogus-field: 1\n", unimpl, true, false},
+		{"does not parse, no tag, a daemon that knows tag groups", "name: dd\nbogus-field: 1\n", nil, true, true},
+		{"parses, no tag", "name: dd\nsecurity-groups:\n  web:\n    rules:\n      - {direction: ingress, proto: tcp, port: \"443\", cidr: \"10.0.0.0/8\", action: accept}\n", unimpl, false, true},
 	} {
 		if _, perr := compose.ParseNamed("stack.yaml", []byte(c.body)); (perr == nil) != strings.HasPrefix(c.name, "parses") {
 			t.Fatalf("%s: the fixture's parse = %v", c.name, perr)
 		}
-		spy := &tagProbeSpy{probeErr: unimpl}
+		if strings.Contains(c.name, "escaped") && strings.Contains(strings.ToLower(c.body), "tag:") {
+			t.Fatalf("%s: the fixture holds a literal tag:", c.name)
+		}
+		spy := &tagProbeSpy{probeErr: c.probeErr}
 		err := gitopsDeploy(context.Background(), spy, "stack.yaml", c.body)
+		wantProbes := 0
+		if c.probe {
+			wantProbes = 1
+		}
+		if spy.probes != wantProbes {
+			t.Errorf("%s: probes=%d, want %d", c.name, spy.probes, wantProbes)
+		}
 		if c.deploy {
-			if spy.deploys != 1 || spy.probes != 0 {
-				t.Errorf("%s: deploys=%d probes=%d err=%v, want the deploy and no probe", c.name, spy.deploys, spy.probes, err)
+			if spy.deploys != 1 {
+				t.Errorf("%s: deploys=%d err=%v, want the deploy", c.name, spy.deploys, err)
 			}
 			continue
 		}
-		if spy.deploys != 0 || spy.probes != 1 || err == nil || !strings.Contains(err.Error(), "upgrade litevirtd") {
-			t.Errorf("%s: deploys=%d probes=%d err=%v, want the upgrade refusal and no deploy", c.name, spy.deploys, spy.probes, err)
+		if spy.deploys != 0 || err == nil || !strings.Contains(err.Error(), "upgrade litevirtd") {
+			t.Errorf("%s: deploys=%d err=%v, want the upgrade refusal and no deploy", c.name, spy.deploys, err)
 		}
 	}
 }

@@ -500,3 +500,19 @@ func TestListFirewallTagGroups_Members(t *testing.T) {
 		t.Fatalf("ls without --members = %+v", resp.GetGroups())
 	}
 }
+
+// tag-group rm --force judges a reference as the renderer does: a bare
+// "+log" names no verdict and is a deny, so --force cannot remove a group it
+// references (D6 re-review n-2).
+//
+// Mutation: judge by the verdict with the suffix cut and "" an accept (the
+// earlier acceptsAction) — "+log" is an accept: red.
+func TestAcceptsAction_ABareLogSuffixIsADeny(t *testing.T) {
+	for action, want := range map[string]bool{
+		"": true, "accept": true, "accept+log": true, "drop": false, "drop+log": false, "+log": false,
+	} {
+		if got := acceptsAction(action); got != want {
+			t.Errorf("acceptsAction(%q) = %v, want %v", action, got, want)
+		}
+	}
+}

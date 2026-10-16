@@ -260,12 +260,10 @@ func refersToTagGroup(cidr, group string) bool {
 	return false
 }
 
-// acceptsAction reports whether a stored action accepts ("" is accept; a
-// logged accept is an accept). Anything else is handled as a deny.
-func acceptsAction(action string) bool {
-	verdict, _ := rulefield.LogActionVerdict(action)
-	return verdict == "" || verdict == "accept"
-}
+// acceptsAction reports whether a stored action accepts, as the renderer
+// judges it ("" is accept; a logged accept is an accept; a bare "+log" is
+// not). Anything else is handled as a deny.
+func acceptsAction(action string) bool { return firewall.AcceptsAction(action) }
 
 // tagGroupRefs lists every live rule, in every tier and on every host, that
 // references group.

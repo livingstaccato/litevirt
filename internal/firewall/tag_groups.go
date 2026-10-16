@@ -313,11 +313,19 @@ func (t *tagPass) emptySets() []IPSet {
 
 // isAccept reports whether a stored action accepts ("" is accept, and so is
 // a logged accept, "accept+log"); any other action is handled as a deny,
-// which fails closed. tag-group rm --force judges references the same way.
+// which fails closed. A bare "+log" names no verdict, so it is a deny too.
+// tag-group rm --force judges references the same way.
 func isAccept(action string) bool {
-	a, _ := rulefield.LogActionVerdict(action)
+	a, logged := rulefield.LogActionVerdict(action)
+	if logged {
+		return a == string(Accept)
+	}
 	return a == "" || a == string(Accept)
 }
+
+// AcceptsAction is isAccept for tag-group rm, so a reference is judged as
+// the renderer judges it.
+func AcceptsAction(action string) bool { return isAccept(action) }
 
 // tagRef returns the group a stored cidr names: ok when it is a tag-group
 // reference at all, valid when it is one in the exact form (tag:<name>).

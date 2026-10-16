@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"os/exec"
 	"os/signal"
-	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -189,23 +188,18 @@ func formatCommitStatus(s gitops.CommitStatus) string {
 	return b.String()
 }
 
-// gitopsBodyMayHoldTag matches "tag" then ":" in any case and spacing: a
-// conservative scan of a compose file the client could not parse. Over-matching
-// costs one probe.
-var gitopsBodyMayHoldTag = regexp.MustCompile(`(?i)tag\s*:`)
-
 // gitopsDeploy applies one compose file by streaming DeployStack to its end
 // and reporting every failure (see gitops.DrainDeploy for why it must never
 // stop reading early). A file that holds, or may hold, a tag: cidr is sent
 // only to a daemon that knows tag groups (spec 4.8, I-1): one that parses
-// is judged by its rule cidrs, and one that does not by its raw text, since
-// an older daemon validates less than this client and stores tag: verbatim.
+// is judged by its rule cidrs, and one that does not is probed whatever its
+// text holds, since an older daemon validates less than this client and
+// stores tag: verbatim, and an escaped scalar can spell tag: with no literal
+// "tag:" in the file.
 func gitopsDeploy(ctx context.Context, client pb.LiteVirtClient, path, body string) error {
-	var cidrs []string
+	cidrs := []string{rulefield.TagCIDRPrefix}
 	if f, err := compose.ParseNamed(path, []byte(body)); err == nil {
 		cidrs = composeRuleCIDRs(f)
-	} else if gitopsBodyMayHoldTag.MatchString(body) {
-		cidrs = []string{rulefield.TagCIDRPrefix}
 	}
 	if err := requireTagGroupSupport(ctx, client, cidrs...); err != nil {
 		return fmt.Errorf("%s: %w", path, err)

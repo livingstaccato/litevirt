@@ -38,7 +38,11 @@ const (
 // still on disk). It resolves the condition once every file reads.
 func (s *Server) judgeFirmwareMoveRecords(ctx context.Context) {
 	fw := s.fw()
-	refused := fw.TakeRefusedWipes()
+	refused, dropped := fw.TakeRefusedWipes()
+	if dropped > 0 {
+		slog.Warn("firmware state wipes refused for an unreadable firmware move record were dropped past the store's bound; "+
+			"each was logged when refused", "dropped", dropped)
+	}
 	for _, w := range refused {
 		detail := fmt.Sprintf("the firmware state of %s (uuid %s) was not removed: %v; it is still on disk, and %s names it",
 			w.VM, w.UUID, w.Err, condFirmwareRecordUnreadable)
@@ -51,7 +55,7 @@ func (s *Server) judgeFirmwareMoveRecords(ctx context.Context) {
 
 	s.fwRecordsMu.Lock()
 	s.fwWipesRefused = append(s.fwWipesRefused, refused...)
-	s.fwWipesRefusedTotal += len(refused)
+	s.fwWipesRefusedTotal += len(refused) + dropped
 	if n := len(s.fwWipesRefused); n > maxFirmwareWipesNamed {
 		s.fwWipesRefused = append([]lv.RefusedWipe(nil), s.fwWipesRefused[n-maxFirmwareWipesNamed:]...)
 	}

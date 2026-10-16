@@ -1370,7 +1370,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	bridgeCT := firewall.BridgeConntrackAvailable(ctx, true)
 	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
 		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs,
-			BridgeConntrack: func() bool { return bridgeCT }, Arming: fwArming})
+			OnTagGroupMembers: fwMetrics.SetTagGroupMembers, BridgeConntrack: func() bool { return bridgeCT }, Arming: fwArming})
 	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
 	d.fwReconciler.SetArming(fwArming)
 	// Every domain start — an API start, a restart policy, a failover

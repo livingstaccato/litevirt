@@ -3539,12 +3539,29 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	// not proven off.
 	pbVM.SharedDiskWithheld = s.sharedDiskWithheldReason(ctx, vm.Name)
 
-	// Interfaces — run IP discovery fallback if IP is unknown.
+	// Interfaces — run IP discovery fallback if IP is unknown, every such NIC
+	// in one batch, so the wait on peers is bounded once for the VM.
 	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, name)
-	for _, iface := range ifaces {
+	discovered := map[int]string{}
+	if vm.HostName == s.hostName {
+		var idx []int
+		var queries []nicQuery
+		for i, iface := range ifaces {
+			if iface.IP == "" {
+				idx = append(idx, i)
+				queries = append(queries, nicQuery{mac: iface.MAC, network: iface.NetworkName})
+			}
+		}
+		if len(queries) > 0 {
+			for j, ip := range s.discoverNICAddressesWithPeers(ctx, queries, inspectPeerLeaseBudget) {
+				discovered[idx[j]] = ip
+			}
+		}
+	}
+	for i, iface := range ifaces {
 		ip := iface.IP
-		if ip == "" && vm.HostName == s.hostName {
-			ip = s.discoverNICAddress(ctx, iface.MAC, iface.NetworkName)
+		if ip == "" {
+			ip = discovered[i]
 		}
 		// If we discovered a new IP, persist it — through the same gate ListVMs
 		// uses, and for the same reason (netbox_discovery.go): on a bound network

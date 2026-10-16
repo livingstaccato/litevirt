@@ -843,6 +843,19 @@ Standalone load balancers (not tied to a stack) can also be created with `lv lb 
         interval-ms: 2000               # Check interval in milliseconds
 ```
 
+**Where the VIP goes**: a VIP inside a network's subnet is put on that network's
+bridge on each LB host (a stack LB considers only its own stack's networks and
+networks of no stack; when several subnets hold it: its own stack's network
+first, then the most specific subnet), whether
+or not the bridge carries an address in the subnet. A stack's `bridge` network
+may be on its scoped name (`<stack>_<name>`) or on its own name on a given host;
+the scoped name is tried first, and the own name is taken only when no other
+network may be on it, or when it carries an address in the network's subnet.
+If that bridge is not on the host, or which network a shared name belongs to
+cannot be told, the LB is refused there with the network and bridge named. The
+LB's VIP ports and SNAT are recorded for that same network. A VIP in no network's subnet goes on the host device
+whose subnet holds it, else on the default-route device.
+
 All VMs in the stack automatically become backends. Backend IPs are discovered via
 ARP/DHCP after boot and persisted in the cluster database. **Containers in the stack
 are backends too** — a single LB can front a mix of VMs and containers; give a
@@ -897,9 +910,11 @@ How it works:
 
 Requirements:
 
+- `snat:` applies on every LB host; with it unset or `false`, no LB host rewrites the network's egress
 - The VIP must be routable from the upstream network
 - IP forwarding is enabled automatically
-- The IRB gateway on the bridge is set up by the VXLAN provisioner
+- The network's bridge carries the VMs' gateway (see [Host isolation](#host-isolation)): a `vxlan` network, or a `bridge` network on a bridge litevirt created, with no `vlan`
+- It does not apply to an `isolated` network: nothing is routed off its bridge
 
 **Conntrackd for failover**: When `snat: true` is set, litevirt automatically runs `conntrackd` alongside keepalived to replicate conntrack state between VRRP peers. On failover, the new MASTER imports synced entries so existing SNAT'd connections survive. This is managed automatically — no additional configuration is needed.
 
@@ -1282,7 +1297,7 @@ This follows the cloud provider model (AWS, DigitalOcean, GCP): the hypervisor i
 - **No dnsmasq** — DHCP/DNS does not run on the bridge. No host process listens.
 - **Static IPs via cloud-init** — IPAM still allocates IPs, but they are delivered via cloud-init network-config (MAC-matched, distro-agnostic: works on Ubuntu, CentOS, Debian, Arch, Alpine). A VM NIC that names no `ip:` is given a free address in the network's IPv4 subnet; never the gateway, a `reserved-addresses` entry, a live load balancer's VIP, or a VIP named by the VM's own `loadbalancer:` or by a VM of its stack created before it. A VIP named by a VM of the stack that is created later is not known yet: list it in `reserved-addresses`. The address is recorded on the NIC (`lv inspect`). Each host starts its search at a different point of the subnet. Two VMs created on two hosts at the same instant can still be given the same address; each host then records a `network.duplicate_address` event on its VMs that hold it (`lv events`). Name `ip:` explicitly where that matters. A network without a subnet, or with an IPv6 one, gives no address: name one with `ip:`.
 - **DNS from config** — resolvers come from the `dns` field (defaults to `["1.1.1.1", "8.8.8.8"]`).
-- **IRB gateway stays** — the host keeps a gateway IP on the bridge for routing (FORWARD). VMs still have a default route. But no host *services* are reachable (INPUT is dropped).
+- **Gateway stays** — the host keeps the subnet's first address on the bridge as the VMs' gateway, for routing (FORWARD): always on a `vxlan` network (its IRB anycast gateway), and on a `bridge` network when litevirt created the bridge on that host and the network has no `vlan`. A bridge litevirt did not create, a VLAN bridge, and a host-isolated `isolated` network get no gateway address; so does a bridge an earlier build created (litevirt keeps no record of it), until the bridge is created again, for example at a reboot. Either way no host *services* are reachable (INPUT is dropped), the gateway address included. Forwarding through the gateway to the host's other networks is not blocked: host isolation keeps guests off the host, not off other networks.
 - **No implicit NAT** — outbound internet access requires explicit `snat: true` on a load balancer (see below).
 
 Under the hood, litevirt creates a per-bridge nftables chain on the `input` hook that drops all traffic from the bridge interface. VM-to-VM traffic uses the `forward` hook and is unaffected. VXLAN underlay (UDP 4789) arrives on the physical NIC, not the bridge, so it is also unaffected.
@@ -1306,7 +1321,7 @@ When a load balancer VIP lives on an isolated network, litevirt automatically ad
 - **VRRP** (IP protocol 112) — keepalived peer communication
 - **VIP ports** — only the declared listener ports on the VIP address
 
-All other traffic from VMs to the host remains blocked. These exceptions are managed automatically when LBs are applied or removed.
+Replies to connections the host opens onto the bridge (HAProxy's health checks and proxied connections to backends there) are accepted too; a reply to any other connection of the host's is not. All other traffic from VMs to the host remains blocked. These exceptions are managed automatically when LBs are applied or removed.
 
 ### External networks
 

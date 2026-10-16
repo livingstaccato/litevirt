@@ -794,6 +794,22 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			}
 		}
 		sort.Strings(plan.Gateways)
+		// Every live isolated network's bridge: forwarding off it is dropped
+		// (renderIsolatedForward), as it is for every bridge in the group.
+		isolated := map[string]bool{}
+		for _, info := range nets {
+			if info.IsolatedBridge != "" {
+				isolated[info.IsolatedBridge] = true
+			}
+		}
+		plan.IsolatedBridges = plan.IsolatedBridges[:0:0]
+		for br := range isolated {
+			// The group lines still hold a name the renderer would refuse.
+			if safeIfName(br) {
+				plan.IsolatedBridges = append(plan.IsolatedBridges, br)
+			}
+		}
+		sort.Strings(plan.IsolatedBridges)
 		var lbHosts map[string]bool
 		if plan.LBBackends, plan.LBSources, lbHosts, err = loadLBBackends(ctx, db); err != nil {
 			return plan, err

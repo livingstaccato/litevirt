@@ -108,6 +108,20 @@ func recordCreatedBridge(name string) {
 	}
 }
 
+// bridgeCreatedHere reports whether bridge name is the device EnsureBridge
+// made on this host: its record names the bridge's current ifindex. A
+// variable so a test can answer it.
+var bridgeCreatedHere = defaultBridgeCreatedHere
+
+func defaultBridgeCreatedHere(name string) bool {
+	rec, err := os.ReadFile(createdBridgeRecord(name))
+	if err != nil {
+		return false
+	}
+	idx, err := bridgeIfindex(name)
+	return err == nil && strings.TrimSpace(string(rec)) == idx
+}
+
 // forgetCreatedBridge drops name's record, if any.
 func forgetCreatedBridge(name string) {
 	if err := os.Remove(createdBridgeRecord(name)); err != nil && !errors.Is(err, fs.ErrNotExist) {

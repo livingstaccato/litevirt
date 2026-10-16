@@ -34,11 +34,13 @@ package firewall
 import (
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"net"
 	"net/netip"
 	"sort"
 	"strings"
 
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 )
 
@@ -288,6 +290,12 @@ type Plan struct {
 	NAT           []NATRule
 	HostIsolation []IsolationChain
 
+	// IsolatedBridges are the host bridges of the live `isolated` networks.
+	// Forwarded traffic between one and any other device is dropped
+	// (renderIsolatedForward); with or without any listed, every device in
+	// compose.IsolatedBridgeGroup is held to the host the same way.
+	IsolatedBridges []string
+
 	// NICMode is how per-NIC rules are applied: NICModeEnforce,
 	// NICModeObserve (count what would be dropped, drop nothing) or
 	// NICModeGuardsOnly (bridge conntrack is unavailable: only the guards and
@@ -475,6 +483,7 @@ func RenderParts(p Plan, nicActive bool) (inet, nic string, err error) {
 	// removing the last rule drops the whole chain on the next atomic replace).
 	renderNAT(&b, p.NAT)
 	renderHostIsolation(&b, p.HostIsolation)
+	renderIsolatedForward(&b, p.IsolatedBridges)
 	b.WriteString("}\n")
 	inet = b.String()
 
@@ -550,10 +559,59 @@ func renderNAT(b *strings.Builder, rules []NATRule) {
 	fmt.Fprintf(b, "    }\n\n")
 }
 
+// isolationMarkMask is the part of a connection's ct mark that names the
+// host-isolated bridge the host opened it onto (isolationMark). No other
+// litevirt rule uses ct mark.
+const isolationMarkMask = 0x0fff0000
+
+// isolationMark is bridge's preferred value in isolationMarkMask: a stable
+// 12-bit hash of its name, never zero.
+func isolationMark(bridge string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(bridge))
+	return (h.Sum32()%0xfff + 1) << 16
+}
+
+// isolationMarks gives each bridge its own value in isolationMarkMask: its
+// isolationMark, or, when a bridge earlier by name already holds that value,
+// the next free one (linear probing). A shared value would let a guest on one
+// bridge forge replies into the host's connections onto the other.
+//
+// A bridge's value can move when the set of host-isolated bridges on the host
+// changes: when a bridge whose hash collides with it comes or goes, or when
+// one earlier by name probes into its slot. The host's connections onto it
+// that are open then lose their replies, and its old value may now be another
+// bridge's: until those connections close, that bridge's guests can forge
+// replies into them. Both need a 12-bit collision among one host's
+// host-isolated bridges, and last only as long as the connections.
+func isolationMarks(sortedBridges []string) map[string]uint32 {
+	out := make(map[string]uint32, len(sortedBridges))
+	used := map[uint32]bool{}
+	for _, br := range sortedBridges {
+		if _, done := out[br]; done {
+			continue
+		}
+		v := isolationMark(br) >> 16
+		for i := 0; i < 0xfff && used[v]; i++ {
+			v = v%0xfff + 1
+		}
+		used[v] = true
+		out[br] = v << 16
+	}
+	return out
+}
+
 // renderHostIsolation emits a single `input` filter chain that drops guest→host
 // traffic per isolated bridge, punching through VRRP + declared LB VIP ports
 // first. Policy is accept — only the explicit iifname-<bridge> drops bite, so
 // non-isolated bridges and host-local traffic are untouched.
+//
+// Replies to connections the host opened onto the bridge (haproxy to a
+// backend there) pass too: an `output` chain marks every connection the host
+// opens out of the bridge with the bridge's isolationMark, and the input chain
+// accepts only reply-direction packets of a connection carrying it. A guest
+// cannot open anything, and cannot ride a connection the host has with
+// anything else (a peer's gossip, a resolver) by forging its source.
 func renderHostIsolation(b *strings.Builder, chains []IsolationChain) {
 	if len(chains) == 0 {
 		return
@@ -561,10 +619,17 @@ func renderHostIsolation(b *strings.Builder, chains []IsolationChain) {
 	sorted := make([]IsolationChain, len(chains))
 	copy(sorted, chains)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Bridge < sorted[j].Bridge })
+	names := make([]string, len(sorted))
+	for i, c := range sorted {
+		names[i] = c.Bridge
+	}
+	marks := isolationMarks(names)
 
 	fmt.Fprintf(b, "    chain input {\n")
 	fmt.Fprintf(b, "        type filter hook input priority filter; policy accept;\n")
 	for _, c := range sorted {
+		fmt.Fprintf(b, "        iifname %s ct direction reply ct mark and %#x == %#x ct state established,related accept\n",
+			c.Bridge, isolationMarkMask, marks[c.Bridge])
 		if len(c.Exceptions) > 0 {
 			// VRRP (keepalived) once per bridge, then each VIP:port.
 			fmt.Fprintf(b, "        iifname %s ip protocol 112 accept\n", c.Bridge)
@@ -576,6 +641,46 @@ func renderHostIsolation(b *strings.Builder, chains []IsolationChain) {
 		}
 		fmt.Fprintf(b, "        iifname %s drop\n", c.Bridge)
 	}
+	fmt.Fprintf(b, "    }\n\n")
+
+	fmt.Fprintf(b, "    chain isolation_output {\n")
+	fmt.Fprintf(b, "        type filter hook output priority filter; policy accept;\n")
+	for _, c := range sorted {
+		fmt.Fprintf(b, "        oifname %s ct state new ct mark set ct mark and %#x or %#x\n",
+			c.Bridge, ^uint32(isolationMarkMask), marks[c.Bridge])
+	}
+	fmt.Fprintf(b, "    }\n\n")
+}
+
+// renderIsolatedForward emits the forward-hook chain that keeps an isolated
+// network on its host: nothing is routed from its bridge to any other device,
+// or from any other device to it. Guests on one bridge still reach each other
+// (bridged traffic stays on the bridge, and the input and output hooks — the
+// host's dnsmasq — are not touched).
+//
+// It is rendered on every host whatever the plan says. The group lines hold
+// every device in compose.IsolatedBridgeGroup — the group litevirt gives the
+// bridges it creates for isolated networks — from the first pass, including a
+// bridge no network row names any more. A listed bridge also gets its own
+// pair: that holds it before its group is set, and keeps it from routing to
+// another isolated bridge (the group lines cannot tell them apart). A bridge
+// is never matched by its name alone, so a `bridge` network whose bridge is
+// named br-iso-* routes as it always did.
+func renderIsolatedForward(b *strings.Builder, bridges []string) {
+	sorted := append([]string(nil), bridges...)
+	sort.Strings(sorted)
+	fmt.Fprintf(b, "    chain isolated_forward {\n")
+	fmt.Fprintf(b, "        type filter hook forward priority filter; policy accept;\n")
+	for i, br := range sorted {
+		if i > 0 && br == sorted[i-1] {
+			continue
+		}
+		fmt.Fprintf(b, "        iifname %q oifname != %q drop\n", br, br)
+		fmt.Fprintf(b, "        oifname %q iifname != %q drop\n", br, br)
+	}
+	g := compose.IsolatedBridgeGroup
+	fmt.Fprintf(b, "        iifgroup %d oifgroup != %d drop\n", g, g)
+	fmt.Fprintf(b, "        oifgroup %d iifgroup != %d drop\n", g, g)
 	fmt.Fprintf(b, "    }\n\n")
 }
 
@@ -1114,6 +1219,11 @@ func validate(p Plan) error {
 			}
 		} else if !safeIfName(r.Bridge) {
 			return fmt.Errorf("nat rule %d: masquerade needs a bridge (got %q)", i, r.Bridge)
+		}
+	}
+	for _, br := range p.IsolatedBridges {
+		if !safeIfName(br) {
+			return fmt.Errorf("isolated bridge %q is not a safe interface name", br)
 		}
 	}
 	for i, c := range p.HostIsolation {

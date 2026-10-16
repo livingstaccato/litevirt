@@ -24,6 +24,12 @@ table inet litevirt-fw {
     chain host_overrides {
     }
 
+    chain isolated_forward {
+        type filter hook forward priority filter; policy accept;
+        iifgroup 27766 oifgroup != 27766 drop
+        oifgroup 27766 iifgroup != 27766 drop
+    }
+
 }
 
 table bridge litevirt-nic {

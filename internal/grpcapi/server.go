@@ -160,6 +160,11 @@ type Server struct {
 	// see SetNICIPDiscovery.
 	nicIPDiscovery func(mac, bridge string) string
 
+	// dhcpLeaseLookup replaces the read of this host's dnsmasq lease for a
+	// MAC on a bridge (lv.LeaseOnBridge) that GetVMIPRemote's lease_only
+	// answer comes from. Test-only seam, nil in production.
+	dhcpLeaseLookup func(mac, bridge string) (string, int64)
+
 	// nbSweepUnreachable / nbUnreachableStreak carry the orphan sweep's
 	// consecutive-blocked-pass state for the NetBox health evaluator, which
 	// cannot read a Prometheus counter in-process. Written only by the sweep,
@@ -558,6 +563,11 @@ type Server struct {
 	// bridgeExists is a test seam for "does this bridge already exist on this
 	// host". Production leaves it nil, preserving network.BridgeExists.
 	bridgeExists func(name string) bool
+
+	// linkAddrs replaces the read of a device's IP addresses (lbVIPInterface
+	// tells whose bridge a shared short name is by them). Test-only seam,
+	// nil in production.
+	linkAddrs func(name string) []netip.Prefix
 
 	// bridgeUplink is a test seam for "does this bridge carry anything off this
 	// host". Production leaves it nil, preserving network.BridgeHasUplink. Like
@@ -1521,6 +1531,14 @@ func (s *Server) SetDHCPReservationBackend(served, uplink func(bridge string) bo
 // reads, so a test that exercises that refusal must fix it rather than inherit
 // whatever interfaces the machine running the test happens to have.
 func (s *Server) SetBridgeExists(fn func(name string) bool) { s.bridgeExists = fn }
+
+// SetLinkAddrs replaces the read of a device's addresses (linkAddrs).
+// Test-only seam, nil in production.
+func (s *Server) SetLinkAddrs(fn func(name string) []netip.Prefix) { s.linkAddrs = fn }
+
+// SetLBApply replaces the haproxy/keepalived apply of a load balancer on this
+// host (lbApplyOverride). Test-only seam, nil in production.
+func (s *Server) SetLBApply(fn func(context.Context, lb.Config) error) { s.lbApplyOverride = fn }
 
 // SetBridgeHasUplink injects the "does this bridge carry anything off the host"
 // seam (see bridgeUplink). It is the fact that tells an operator's

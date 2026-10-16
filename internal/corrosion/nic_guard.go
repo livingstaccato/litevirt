@@ -557,6 +557,9 @@ type NetworkGuardInfo struct {
 	// NICGateways are the gateways live VMs' NIC specs on the network route
 	// through, each with the VM and its project.
 	NICGateways []NICGatewayDecl
+	// IsolatedBridge is the host bridge of an `isolated` network
+	// (compose.IsolatedBridgeName), else "".
+	IsolatedBridge string
 }
 
 // NICGatewayDecl is one gateway a VM's NIC routes through.
@@ -607,6 +610,9 @@ func NetworkGuardInfos(ctx context.Context, c *Client) (map[string]NetworkGuardI
 			typ = def.Type
 		}
 		info := NetworkGuardInfo{Subnet: def.Subnet, LitevirtGateway: def.LitevirtGateway(), AllowedVLANs: def.AllowedVLANs, Type: typ}
+		if typ == "isolated" {
+			info.IsolatedBridge = compose.IsolatedBridgeName(r.String("name"))
+		}
 		for _, a := range append([]string{def.Gateway}, def.ReservedAddresses...) {
 			if ca := canonIP(a); ca != "" {
 				info.Reserved = append(info.Reserved, ca)

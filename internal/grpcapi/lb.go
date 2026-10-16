@@ -13,6 +13,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -686,11 +687,20 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 			if targetHosts[0] == s.hostName {
 				priority = 100
 			}
+			place, ierr := s.lbVIPInterface(ctx, req.Name, "", vipIP)
+			lbIface := place.iface
+			if ierr != nil {
+				corrosion.SoftDeleteLBBackends(ctx, s.db, req.Name)
+				corrosion.SoftDeleteLBConfig(ctx, s.db, req.Name)
+				s.audit(ctx, "lb.create", req.Name, req.Vip, "error: "+ierr.Error())
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"load balancer %q provisioning failed on %s: %v", req.Name, s.hostName, ierr)
+			}
 			cfg := lb.Config{
 				Name:      req.Name,
 				VIP:       vipIP,
 				VIPPrefix: vipPrefix,
-				Interface: lb.DetectInterfaceForIP(vipIP),
+				Interface: lbIface,
 				VRID:      s.allocVRID(ctx, req.Name),
 				Priority:  priority,
 				Backends:  lbBackends,
@@ -712,7 +722,7 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 			// Record firewall intent when the VIP is on a host-isolated network
 			// (VIP:port exceptions + SNAT), same as the stack/peer paths. No-op for
 			// non-isolated networks. snat defaults true (matches the peer ApplyLB path).
-			s.updateIsolationForLB(ctx, req.Name, cfg.Interface, vipIP, ports, true)
+			s.updateIsolationForLB(ctx, req.Name, place, vipIP, ports, true)
 			break
 		}
 	}
@@ -745,6 +755,7 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 			if _, aerr := client.ApplyLB(fctx, &pb.ApplyLBRequest{
 				LbName: req.Name, Vip: req.Vip, Algorithm: algorithm,
 				Backends: pbBackends, Ports: req.Ports, Hosts: req.Hosts, Proof: proof,
+				Snat: proto.Bool(true), // an explicit LB SNATs, as it does locally
 			}); aerr != nil {
 				slog.Warn("CreateLoadBalancer: remote apply failed", "host", host, "lb", req.Name, "error", aerr)
 			}
@@ -1619,6 +1630,12 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"load balancer %q has no established holder (legacy row): retry once its VIP host is reachable, or re-create it", req.Name)
 	}
+	// The LB's `snat:`, decided before anything changes: a failed read leaves
+	// the LB as it is applied everywhere.
+	snat, err := s.stackLBSNAT(ctx, r.String("stack_name"))
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "load balancer %q: %v", req.Name, err)
+	}
 
 	// Persist updated config + backend changes atomically (generation preserved).
 	if err := corrosion.PersistLBIncremental(ctx, s.db, corrosion.LBConfigRecord{
@@ -1699,18 +1716,22 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 			if len(lbHosts) == 0 || lbHosts[0] == s.hostName {
 				priority = 100
 			}
+			place, ierr := s.lbVIPInterface(ctx, req.Name, "", vipIP)
+			lbIface := place.iface
 			cfg := lb.Config{
 				Name: req.Name, VIP: vipIP, VIPPrefix: vipPrefix,
-				Interface: lb.DetectInterfaceForIP(vipIP), VRID: s.allocVRID(ctx, req.Name),
+				Interface: lbIface, VRID: s.allocVRID(ctx, req.Name),
 				Priority: priority, Backends: lbBackends, Ports: ports, Algorithm: algorithm,
 			}
-			if err := s.applyLBLocal(ctx, cfg); err != nil {
+			if ierr != nil {
+				slog.Warn("UpdateLoadBalancer: local apply refused", "error", ierr)
+			} else if err := s.applyLBLocal(ctx, cfg); err != nil {
 				slog.Warn("UpdateLoadBalancer: local apply failed", "error", err)
 			} else {
 				// Refresh firewall intent so a changed VIP/ports updates the
 				// exceptions/SNAT (an upsert on lb:<name>), not leaving the old
 				// holes behind. No-op off host-isolated networks.
-				s.updateIsolationForLB(ctx, req.Name, cfg.Interface, vipIP, ports, true)
+				s.updateIsolationForLB(ctx, req.Name, place, vipIP, ports, snat)
 			}
 			break
 		}
@@ -1753,6 +1774,7 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 			if _, aerr := client.ApplyLB(fctx, &pb.ApplyLBRequest{
 				LbName: req.Name, Vip: vipForWire(vip), Algorithm: algorithm,
 				Backends: pbBackends, Ports: parsedPorts, Hosts: lbHosts, Proof: proof,
+				Snat: proto.Bool(snat), StackName: r.String("stack_name"),
 			}); aerr != nil {
 				// Error, not Warn. A holder that did not receive the config is
 				// not participating in VRRP for this VIP, so the LB is one host
@@ -2284,6 +2306,8 @@ func (s *Server) forwardLBApply(ctx context.Context, hostName string, spec *pb.V
 		Ports:     pbPorts,
 		Hosts:     resolvedHosts,
 		Proof:     proof,
+		Snat:      proto.Bool(lbSpec.Snat),
+		StackName: spec.StackName,
 	}); err != nil {
 		slog.Warn("forwardLBApply: remote apply failed", "host", hostName, "error", err)
 	} else {
@@ -2343,7 +2367,11 @@ func (s *Server) ApplyLB(ctx context.Context, req *pb.ApplyLBRequest) (*emptypb.
 		priority = 100
 	}
 
-	lbIface := lb.DetectInterfaceForIP(vipIP)
+	place, err := s.lbVIPInterface(ctx, req.LbName, req.GetStackName(), vipIP)
+	lbIface := place.iface
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "apply LB: %v", err)
+	}
 
 	var ports []lb.Port
 	for _, p := range req.Ports {
@@ -2385,9 +2413,14 @@ func (s *Server) ApplyLB(ctx context.Context, req *pb.ApplyLBRequest) (*emptypb.
 		return nil, status.Errorf(codes.Internal, "apply LB: %v", err)
 	}
 
-	// Update host-isolation rules if the LB interface is on an isolated bridge.
-	// Internal ApplyLB RPC doesn't carry snat flag; default to true (previous behaviour).
-	s.updateIsolationForLB(ctx, req.LbName, lbIface, vipIP, ports, true)
+	// Update host-isolation rules if the LB interface is on an isolated bridge,
+	// with the LB's own `snat:`. A caller on an earlier build sends none, and
+	// gets SNAT, as every ApplyLB did before the field.
+	snat := true
+	if req.Snat != nil {
+		snat = req.GetSnat()
+	}
+	s.updateIsolationForLB(ctx, req.LbName, place, vipIP, ports, snat)
 
 	if lbProofID != "" {
 		if err := corrosion.CompleteActionProof(ctx, s.db, lbProofID, s.hostName); err != nil {
@@ -2548,6 +2581,15 @@ func (s *Server) refreshLBLocal(ctx context.Context, stackName string) *pb.VMSpe
 			continue
 		}
 		if spec.Loadbalancer != nil && spec.Loadbalancer.Enabled {
+			// The stack's `snat:` (stackLBSNAT), not whichever VM's spec
+			// came first. A failed read applies nothing: what is applied
+			// stays, and the next refresh retries.
+			snat, err := s.stackLBSNAT(ctx, stackName)
+			if err != nil {
+				slog.Warn("refreshLBLocal: not re-applying the load balancer this pass", "stack", stackName, "error", err)
+				return nil
+			}
+			spec.Loadbalancer.Snat = snat
 			s.applyLBFromSpec(ctx, spec)
 			return spec
 		}
@@ -2737,15 +2779,21 @@ func (s *Server) reapplyExplicitLB(ctx context.Context, cfg corrosion.LBConfigRe
 			}
 		}
 	}
+	place, err := s.lbVIPInterface(ctx, cfg.Name, cfg.StackName, vipIP)
+	lbIface := place.iface
+	if err != nil {
+		slog.Warn("reapplyExplicitLB: apply refused", "lb", cfg.Name, "error", err)
+		return
+	}
 	if err := s.applyLBLocal(ctx, lb.Config{
 		Name: cfg.Name, VIP: vipIP, VIPPrefix: vipPrefix,
-		Interface: lb.DetectInterfaceForIP(vipIP), VRID: s.allocVRID(ctx, cfg.Name),
+		Interface: lbIface, VRID: s.allocVRID(ctx, cfg.Name),
 		Priority: priority, Backends: backends, Ports: ports, Algorithm: cfg.Algorithm,
 	}); err != nil {
 		slog.Warn("reapplyExplicitLB: apply failed", "lb", cfg.Name, "error", err)
 	} else {
 		// Re-record firewall intent for an isolated-network VIP (exceptions + SNAT).
-		s.updateIsolationForLB(ctx, cfg.Name, lb.DetectInterfaceForIP(vipIP), vipIP, ports, true)
+		s.updateIsolationForLB(ctx, cfg.Name, place, vipIP, ports, true)
 		slog.Info("LB reconciled", "lb", cfg.Name)
 	}
 }
@@ -2962,10 +3010,13 @@ func (s *Server) applyLBForStack(ctx context.Context, lbName, vip, algorithm str
 		priority = 100
 	}
 
-	// Determine the interface for VRRP. The VIP should be on the same L2
-	// segment as the backends (the bridge). Find the interface whose subnet
-	// contains the VIP; fall back to default route interface.
-	lbIface := lb.DetectInterfaceForIP(vipIP)
+	// Determine the interface for VRRP: the VIP's network's bridge, the same
+	// L2 segment as the backends (lbVIPInterface).
+	place, err := s.lbVIPInterface(ctx, lbName, "", vipIP)
+	lbIface := place.iface
+	if err != nil {
+		return err
+	}
 
 	cfg := lb.Config{
 		Name:      lbName,
@@ -2985,22 +3036,93 @@ func (s *Server) applyLBForStack(ctx context.Context, lbName, vip, algorithm str
 	}
 
 	// Update host-isolation rules if the LB interface is on an isolated bridge.
-	s.updateIsolationForLB(ctx, lbName, lbIface, vipIP, ports, snat)
+	s.updateIsolationForLB(ctx, lbName, place, vipIP, ports, snat)
 
 	s.publish("lb.applied", lbName, fmt.Sprintf("vip=%s backends=%d", vip, len(backends)))
 	return nil
 }
 
-// updateIsolationForLB records this LB's firewall intent when its bridge belongs
-// to a host-isolated network: VIP:port holes punched through the isolation drop
-// so VMs can reach the VIP, plus SNAT to the VIP when enabled. The canonical
-// nftables reconciler renders it, merged with the network's base isolation intent.
-func (s *Server) updateIsolationForLB(ctx context.Context, lbName, bridge, vip string, ports []lb.Port, snat bool) {
-	// Find a network whose bridge matches this interface and has host-isolation.
-	netDef, subnet := s.findIsolatedNetworkForBridge(ctx, bridge)
-	if netDef == nil {
+// stackLBSNAT is a stack LB's `snat:` as the paths that re-apply an LB
+// outside a deploy read it (refreshLBLocal, UpdateLoadBalancer and its
+// fan-out). One stack has one LB (<stack>-lb), declared by any VM of the stack
+// that has `loadbalancer:`; when they disagree, any `snat: true` wins. The
+// stack-level value is the stack's stored compose file; a stack with no
+// stored file, or one that does not parse or declares no enabled LB, falls
+// back to its VMs' stored specs. An explicit LB (no stack) has no setting and
+// SNATs, as every LB apply did before `snat:` reached the peers.
+//
+// A read error is returned, never folded into false: callers leave what is
+// applied unchanged and retry on their next pass, rather than turn SNAT off
+// on every LB host because the database could not be read.
+func (s *Server) stackLBSNAT(ctx context.Context, stackName string) (bool, error) {
+	if stackName == "" {
+		return true, nil
+	}
+	st, err := corrosion.GetStack(ctx, s.db, stackName)
+	if err != nil {
+		return false, fmt.Errorf("read stack %q: %w", stackName, err)
+	}
+	if st != nil && st.ComposeYAML != "" {
+		if f, perr := compose.ParseBytes([]byte(st.ComposeYAML)); perr == nil {
+			if snat, declared := composeLBSNAT(f); declared {
+				return snat, nil
+			}
+		}
+	}
+	vms, err := corrosion.ListVMs(ctx, s.db, stackName, "")
+	if err != nil {
+		return false, fmt.Errorf("read stack %q's VMs: %w", stackName, err)
+	}
+	for _, vm := range vms {
+		spec := &pb.VMSpec{}
+		if vm.Spec == "" || json.Unmarshal([]byte(vm.Spec), spec) != nil {
+			continue
+		}
+		if l := spec.Loadbalancer; l != nil && l.Enabled && l.Snat {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// composeLBSNAT is a compose file's LB `snat:` under stackLBSNAT's rule (any
+// true wins), and whether the file declares an enabled load balancer at all.
+func composeLBSNAT(f *compose.File) (snat, declared bool) {
+	for _, m := range []map[string]compose.VMDef{f.VMs, f.Workloads} {
+		for _, vm := range m {
+			if vm.LoadBalancer == nil || !vm.LoadBalancer.Enabled {
+				continue
+			}
+			declared = true
+			if vm.LoadBalancer.SNAT {
+				snat = true
+			}
+		}
+	}
+	return snat, declared
+}
+
+// updateIsolationForLB records this LB's firewall intent when the network its
+// VIP was placed on (lbVIPInterface) is host-isolated: VIP:port holes punched
+// through the isolation drop so VMs can reach the VIP, plus SNAT of that
+// network's subnet to the VIP when enabled. The network is the one the VIP
+// was placed by, never looked up again by device name: two stacks' networks
+// can share a short bridge name. The canonical nftables reconciler renders
+// it, merged with the network's base isolation intent.
+func (s *Server) updateIsolationForLB(ctx context.Context, lbName string, place lbPlacement, vip string, ports []lb.Port, snat bool) {
+	if place.network == "" {
 		return
 	}
+	nr, err := corrosion.GetNetwork(ctx, s.db, place.network)
+	if err != nil || nr == nil {
+		return
+	}
+	var def compose.NetworkDef
+	if json.Unmarshal([]byte(nr.Config), &def) != nil || !def.HostIsolation {
+		return
+	}
+	subnet := def.Subnet
+	bridge := place.iface
 
 	var listenPorts []int
 	for _, p := range ports {
@@ -3033,42 +3155,4 @@ func (s *Server) updateIsolationForLB(ctx context.Context, lbName, bridge, vip s
 	}
 	// Apply the VIP exceptions / SNAT now rather than waiting for the next tick.
 	s.reconcileFirewall(ctx)
-}
-
-// findIsolatedNetworkForBridge looks up all networks in Corrosion and returns the
-// first one whose provisioned bridge name matches the given interface and has
-// host-isolation enabled. Returns (nil, "") if not found.
-func (s *Server) findIsolatedNetworkForBridge(ctx context.Context, bridge string) (*compose.NetworkDef, string) {
-	rows, err := s.db.Query(ctx,
-		`SELECT name, type, config FROM networks WHERE deleted_at IS NULL`)
-	if err != nil {
-		return nil, ""
-	}
-	for _, r := range rows {
-		var def compose.NetworkDef
-		if err := json.Unmarshal([]byte(r.String("config")), &def); err != nil {
-			continue
-		}
-		def.Type = r.String("type")
-		if !def.HostIsolation {
-			continue
-		}
-		// Determine what bridge name this network would produce.
-		netBridge := def.Interface
-		if netBridge == "" {
-			netBridge = r.String("name")
-		}
-		switch def.Type {
-		case "vxlan":
-			if def.VNI > 0 {
-				netBridge = fmt.Sprintf("br-vni%d", def.VNI)
-			}
-		case "isolated":
-			netBridge = network.IsolatedBridgeName(r.String("name"))
-		}
-		if netBridge == bridge {
-			return &def, def.Subnet
-		}
-	}
-	return nil, ""
 }

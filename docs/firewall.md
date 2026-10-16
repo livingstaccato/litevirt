@@ -301,8 +301,24 @@ iptables):
   its VIP (`oifname <uplink> ip saddr <subnet> snat to <vip>`), emitted before
   masquerade.
 - **Host isolation** — an `input` chain drops guest→host traffic per isolated
-  bridge (`iifname <bridge> drop`), punching through VRRP + declared LB VIP ports
-  first so guests can still reach an HAProxy VIP.
+  bridge (`iifname <bridge> drop`), punching through VRRP and declared LB VIP
+  ports first so guests can still reach an HAProxy VIP, and replies to
+  connections the host opened onto that bridge (so HAProxy reaches backends
+  there): an `isolation_output` chain marks each connection the host opens out
+  of the bridge with a per-bridge ct mark, and the input chain accepts only
+  reply-direction packets carrying it. Bits 16-27 of the ct mark are
+  litevirt's; each host-isolated bridge on a host gets a distinct value there.
+  Connections the host opened onto a host-isolated bridge before an upgrade
+  to this rule carry no mark, so their replies are dropped once: a long-lived
+  connection (an HAProxy keep-alive to a backend) reconnects.
+- **Isolated networks** — an `isolated_forward` chain on the `forward` hook
+  drops anything routed off or onto an `isolated` network's bridge: per live
+  isolated network's bridge (`iifname "<bridge>" oifname != "<bridge>" drop`
+  and the reverse), and for every device in interface group 27766, which
+  litevirt gives each bridge it creates for an isolated network, whether or not
+  a network row names it (`iifgroup 27766 oifgroup != 27766 drop` and the
+  reverse). No device is matched by name. The chain is in every ruleset. Guests on one isolated bridge still reach each other and the
+  host's `dnsmasq` on it.
 
 These decisions are made by network provisioning and the LB apply path and
 recorded per host in `host_fw_intent`; the reconciler reads that table and

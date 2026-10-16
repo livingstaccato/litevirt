@@ -89,16 +89,71 @@ func DiscoverIPForMAC(mac string) string {
 // that has since moved — and none of those is where the NIC is now. An empty
 // bridge reads every file, as DiscoverIPForMAC does.
 func DiscoverIPForMACOnBridge(mac, bridge string) string {
-	var ip string
-	if bridge == "" {
-		ip = GetIPFromDHCPLeases(dhcpLeaseDir, mac)
-	} else {
-		ip = leaseIPFromFiles([]string{DHCPLeaseFile(dhcpLeaseDir, bridge)}, mac)
+	return DiscoverIPForMACOnBridgeWithPeers(mac, bridge, nil)
+}
+
+// DiscoverIPForMACOnBridgeWithPeers is DiscoverIPForMACOnBridge for a NIC
+// whose lease another host may hold (a vxlan network's dnsmasq runs on one of
+// its hosts): peerLease answers with the newest lease those hosts hold for
+// the MAC and its expiry (dnsmasq's, 0 = infinite). A lease — this host's or
+// a peer's — is preferred to this host's ARP table, and of the two leases the
+// one granted most recently wins: this host can still hold an older,
+// unexpired lease from when it was the network's DHCP host. A nil peerLease
+// asks nobody, and with no bridge no peer is asked.
+func DiscoverIPForMACOnBridgeWithPeers(mac, bridge string, peerLease func() (string, int64)) string {
+	if bridge == "" || peerLease == nil {
+		if ip := LeaseIPForMACOnBridge(mac, bridge); ip != "" {
+			return ip
+		}
+		return GetIPFromARP(mac)
 	}
-	if ip != "" {
-		return ip
+	lip, lexp := LeaseOnBridge(mac, bridge)
+	pip, pexp := peerLease()
+	switch {
+	case lip != "" && pip != "":
+		if newerLease(pexp, lexp) {
+			return pip
+		}
+		return lip
+	case lip != "":
+		return lip
+	case pip != "":
+		return pip
 	}
 	return GetIPFromARP(mac)
+}
+
+// newerLease reports whether a dnsmasq expiry a is strictly later than b
+// (0 = infinite, later than any date).
+func newerLease(a, b int64) bool {
+	if a == 0 {
+		a = math.MaxInt64
+	}
+	if b == 0 {
+		b = math.MaxInt64
+	}
+	return a > b
+}
+
+// LeaseIPForMACOnBridge is the lease half of DiscoverIPForMACOnBridge: this
+// host's dnsmasq lease for mac, from bridge's lease file (every file when
+// bridge is ""), or "".
+func LeaseIPForMACOnBridge(mac, bridge string) string {
+	if bridge == "" {
+		return GetIPFromDHCPLeases(dhcpLeaseDir, mac)
+	}
+	ip, _ := LeaseOnBridge(mac, bridge)
+	return ip
+}
+
+// LeaseOnBridge is this host's dnsmasq lease for mac on bridge: its address
+// and dnsmasq's expiry (Unix seconds, 0 = infinite), or "" when bridge's
+// lease file holds no unexpired lease for it. It reads bridge's file alone.
+func LeaseOnBridge(mac, bridge string) (string, int64) {
+	if bridge == "" {
+		return "", 0
+	}
+	return leaseFromFiles([]string{DHCPLeaseFile(dhcpLeaseDir, bridge)}, mac)
 }
 
 // DHCPLeaseFile is the lease file litevirt's dnsmasq for bridge writes under
@@ -130,6 +185,13 @@ func GetIPFromDHCPLeases(leaseDir, mac string) string {
 // "<expiry> <mac> <ip> <hostname> <clientid>", where expiry is a Unix epoch and
 // 0 means an infinite lease.
 func leaseIPFromFiles(files []string, mac string) string {
+	ip, _ := leaseFromFiles(files, mac)
+	return ip
+}
+
+// leaseFromFiles is leaseIPFromFiles with the chosen lease's expiry as dnsmasq
+// wrote it (0 = infinite).
+func leaseFromFiles(files []string, mac string) (string, int64) {
 	mac = strings.ToLower(mac)
 	now := leaseNow().Unix()
 	var best string
@@ -160,5 +222,11 @@ func leaseIPFromFiles(files []string, mac string) string {
 		}
 		f.Close()
 	}
-	return best
+	switch {
+	case best == "":
+		return "", 0
+	case bestExpiry == math.MaxInt64:
+		return best, 0
+	}
+	return best, bestExpiry
 }

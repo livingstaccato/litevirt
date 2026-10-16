@@ -13,6 +13,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -325,5 +326,53 @@ func TestDeleteVMTombstonesLeaseWhenBindingSuspended(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("the deferred NetBox object must be queued as an orphan check for %q, queue = %+v", ids[0], items)
+	}
+}
+
+// TestCreateAbortedAfterTheClientGaveUpReleasesItsClaim (re-review N2): a
+// create the client stopped waiting for, which then fails after its claim,
+// gives the address back all the same — the release does not run on the
+// caller's dead context.
+func TestCreateAbortedAfterTheClientGaveUpReleasesItsClaim(t *testing.T) {
+	nb := NewNetBoxFake()
+	t.Cleanup(nb.Close)
+	nb.AddPrefix(7, "10.0.5.0/24", 3, true)
+
+	c := NewClusterWithNetBox(t, 1, nb)
+	gates := gateAll(t, c)
+	latchNetBoxIPAM(t, c, gates)
+
+	n := c.Nodes[0]
+	mustCreateBoundNetwork(t, c, n, "bound", "10.0.5.0/24", 7)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	n.Virt.FailStartDomain = func(string) error {
+		cancel()
+		// Let the cancellation reach the server's handler context.
+		time.Sleep(500 * time.Millisecond)
+		return errors.New("induced start failure")
+	}
+	done := make(chan struct{})
+	n.Server.SetCreateReturnedHook(func(name string, _ error) {
+		if name == "vm-1" {
+			close(done)
+		}
+	})
+	_, _ = c.SelfClient(n).CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "vm-1", Cpu: 1, MemoryMib: 512,
+		Placement: &pb.PlacementSpec{Host: n.Name},
+		Network:   []*pb.NetworkAttachment{{Name: "bound"}},
+	}})
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the create did not return on the server")
+	}
+	if ids := nb.Identities(); len(ids) != 0 {
+		t.Errorf("the failed create's NetBox address is still held: %v", ids)
+	}
+	if got := leaseCount(t, n, "bound"); got != 0 {
+		t.Errorf("the failed create's lease is still live: %d", got)
 	}
 }

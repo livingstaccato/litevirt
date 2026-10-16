@@ -304,9 +304,10 @@ written, is undone: the domain is stopped and undefined, the disks, cloud-init
 seed and firmware state it made are removed, its address claims are released,
 and its NIC guard records are retired. UEFI vars and the retained-firmware
 marker a `delete --keep-disks` left under the name are kept. The client gets
-the error. If the domain cannot be stopped, or the domain of that name is no
-longer the one the create defined, it is left as it is with its disks and the
-error says so; the next create of the same name removes a leftover domain.
+the error. If the domain cannot be stopped, is gone, or is no longer the one
+the create defined, the disks are left as they are, and so is any such domain,
+and the error says so; the next create of the same name removes a leftover
+domain.
 Once the VM record is written the VM exists: a later failure, or a client that
 stops waiting, undoes nothing.
 

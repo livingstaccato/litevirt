@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -37,6 +38,9 @@ type claimedAddr struct {
 	NetBoxID  int
 }
 
+// claimReleaseTimeout bounds a claimSet's compensating release.
+const claimReleaseTimeout = 30 * time.Second
+
 // claimSet accumulates the claims one create has taken.
 //
 // A NetBox claim is a synchronous remote side-effect and cannot join the local
@@ -52,7 +56,15 @@ func (c *claimSet) empty() bool       { return len(c.items) == 0 }
 // releaseAll compensates every claim. A release that itself fails leaves an
 // address nothing references, so it is enqueued for the sweeper rather than
 // dropped — otherwise it is stranded until a human notices.
+//
+// It runs detached from ctx, bounded: it is cleanup after a failure, and the
+// caller's context may be what failed (a client that stopped waiting).
 func (c *claimSet) releaseAll(ctx context.Context) {
+	if len(c.items) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claimReleaseTimeout)
+	defer cancel()
 	for _, a := range c.items {
 		// The LOCAL lease goes first, and a failure to tombstone it stops the
 		// remote delete — the same order and the same reason as

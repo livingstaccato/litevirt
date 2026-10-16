@@ -190,3 +190,51 @@ func TestConfirmServing(t *testing.T) {
 		}
 	}
 }
+
+// A fence that lands between ConfirmServing's read of 'upgrading' and its
+// write is not overwritten with 'active': the write is conditional on the
+// state it read, inside its own transaction.
+//
+// Mutation: write with corrosion.UpdateHostState (unconditional) — the
+// fenced host turns active.
+func TestConfirmServingDoesNotOverwriteAFenceThatLandsMeanwhile(t *testing.T) {
+	db, ctx := hostIn(t, "upgrading")
+	beforeConfirmWrite = func() {
+		if err := corrosion.UpdateHostState(ctx, db, "h", "fenced"); err != nil {
+			t.Errorf("the fence: %v", err)
+		}
+	}
+	t.Cleanup(func() { beforeConfirmWrite = nil })
+	flipped, state, err := ConfirmServing(ctx, db, "h")
+	if !errors.Is(err, ErrNotUpgrading) || flipped || state != "fenced" {
+		t.Fatalf("confirm with a fence landing meanwhile: flipped=%v state=%q err=%v, want ErrNotUpgrading, fenced", flipped, state, err)
+	}
+	if got := stateOf(t, db); got != "fenced" {
+		t.Fatalf("the host is %q after the confirm, want the fence kept", got)
+	}
+}
+
+// A cancelled state reread is an observation failure, so the upgrade watchdog
+// must retain its retry sentinel instead of treating it as a known state change.
+func TestConfirmServingDeclinedReadPropagatesError(t *testing.T) {
+	db, original := hostIn(t, "upgrading")
+	ctx, cancel := context.WithCancel(original)
+	defer cancel()
+	beforeConfirmWrite = func() {
+		if err := corrosion.UpdateHostState(original, db, "h", "fenced"); err != nil {
+			t.Fatalf("record fence: %v", err)
+		}
+	}
+	afterConfirmDeclined = cancel
+	t.Cleanup(func() {
+		beforeConfirmWrite = nil
+		afterConfirmDeclined = nil
+	})
+	flipped, state, err := ConfirmServing(ctx, db, "h")
+	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrNotUpgrading) || flipped || state != "" {
+		t.Fatalf("declined confirmation reread: flipped=%v state=%q err=%v, want context.Canceled", flipped, state, err)
+	}
+	if got := stateOf(t, db); got != "fenced" {
+		t.Fatalf("host state = %q, want fenced", got)
+	}
+}

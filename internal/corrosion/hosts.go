@@ -2,7 +2,9 @@ package corrosion
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -589,33 +591,79 @@ func decodeLabels(raw string) map[string]string {
 // longer shares a clock with the host's own reports.
 func UpdateHostState(ctx context.Context, c *Client, name, state string) error {
 	return c.withMembershipWrite(ctx, func(live bool) error {
-		uts := c.NowTS()
-		if !live {
-			return c.Execute(ctx, updateHostStateSQL, state, uts, name)
-		}
-		missing, err := membershipRowMissingFrozen(ctx, c, name)
+		stmts, err := hostStateStatements(ctx, c, name, state, live)
 		if err != nil {
 			return err
 		}
-		if missing {
-			return c.ExecuteBatch(ctx, []Statement{
-				{SQL: hostMembershipStateOnlySQL, Params: []interface{}{state, uts, name}},
-			})
-		}
-		epoch, reason, err := currentIsolation(ctx, c, name)
-		if err != nil {
-			return err
-		}
-		if c.hostsCopyRetired(live) {
-			return c.ExecuteBatch(ctx, []Statement{
-				{SQL: hostMembershipStateSQL, Params: []interface{}{name, state, epoch, reason, uts}},
-			})
-		}
-		return c.ExecuteBatch(ctx, []Statement{
-			{SQL: updateHostStateSQL, Params: []interface{}{state, uts, name}},
-			{SQL: hostMembershipStateSQL, Params: []interface{}{name, state, epoch, reason, uts}},
-		})
+		return c.ExecuteBatch(ctx, stmts)
 	})
+}
+
+// UpdateHostStateFrom is UpdateHostState only while host is recorded `from`,
+// checked inside the write's transaction (ExecuteBatchGuarded): a state
+// another writer recorded between a caller's read and this write — a fence
+// landing on a host that is turning active — is not overwritten. The
+// statements are UpdateHostState's; the guard is local only. applied=false,
+// with no error, when the host is recorded as something else (or absent).
+func UpdateHostStateFrom(ctx context.Context, c *Client, name, from, to string) (bool, error) {
+	var applied bool
+	err := c.withMembershipWrite(ctx, func(live bool) error {
+		stmts, err := hostStateStatements(ctx, c, name, to, live)
+		if err != nil {
+			return err
+		}
+		frozen := c.hostsCopyFrozen()
+		applied, err = c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+			var hState string
+			var mKey, mState sql.NullString
+			err := tx.QueryRowContext(ctx, `SELECT h.state, m.host_name, m.state FROM hosts h`+membershipJoins+
+				` WHERE h.name = ? AND h.deleted_at IS NULL`, name).Scan(&hState, &mKey, &mState)
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+			if err != nil {
+				return false, err
+			}
+			// As membershipRow.resolve: the membership row when it exists.
+			cur := hState
+			switch {
+			case mKey.Valid && mKey.String != "":
+				cur = mState.String
+			case frozen:
+				cur = HostStateUnknown
+			}
+			return cur == from, nil
+		}, stmts)
+		return err
+	})
+	return applied, err
+}
+
+// hostStateStatements is the batch that records host `state`: the hosts
+// column and, after the membership split, the host_membership row.
+func hostStateStatements(ctx context.Context, c *Client, name, state string, live bool) ([]Statement, error) {
+	uts := c.NowTS()
+	if !live {
+		return []Statement{{SQL: updateHostStateSQL, Params: []interface{}{state, uts, name}}}, nil
+	}
+	missing, err := membershipRowMissingFrozen(ctx, c, name)
+	if err != nil {
+		return nil, err
+	}
+	if missing {
+		return []Statement{{SQL: hostMembershipStateOnlySQL, Params: []interface{}{state, uts, name}}}, nil
+	}
+	epoch, reason, err := currentIsolation(ctx, c, name)
+	if err != nil {
+		return nil, err
+	}
+	if c.hostsCopyRetired(live) {
+		return []Statement{{SQL: hostMembershipStateSQL, Params: []interface{}{name, state, epoch, reason, uts}}}, nil
+	}
+	return []Statement{
+		{SQL: updateHostStateSQL, Params: []interface{}{state, uts, name}},
+		{SQL: hostMembershipStateSQL, Params: []interface{}{name, state, epoch, reason, uts}},
+	}, nil
 }
 
 const updateHostStateSQL = `UPDATE hosts SET state = ?, updated_at = ? WHERE name = ?`

@@ -1122,6 +1122,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			LocalHostname: spec.Name,
 			UserData:      userData,
 			NetworkConfig: netCfg,
+			VendorData:    cloudinit.SeedVendorData(spec, netCfg),
 		}, isoPath)
 		if err != nil {
 			claims.releaseAll(ctx)
@@ -1138,6 +1139,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			LocalHostname: spec.Name,
 			UserData:      "#cloud-config\n{}\n",
 			NetworkConfig: staticNetCfg,
+			VendorData:    cloudinit.SeedVendorData(nil, staticNetCfg),
 		}, isoPath)
 		if err != nil {
 			slog.Warn("failed to generate cloud-init ISO", "error", err)
@@ -2104,7 +2106,8 @@ func (s *Server) hardwareAdoptionRefused(ctx context.Context, vmName string) err
 // whatever the latch, a start whose cutover runtime handoff is still owed on this host
 // (VMReplaceHandoffPending, one DB read) is refused as retryable Unavailable, and the
 // start checks below the hardware ones (installer ISO, disk chains and image bases,
-// USB passthrough, iSCSI sessions, NFS mounts) run.
+// USB passthrough, iSCSI sessions, NFS mounts) run, and a stale cloud-init seed here is
+// rebuilt again (retryStaleSeedForStart), never refusing the start.
 //
 // When latched it (1) applies the adoption gate — a "blocked" VM (hardware failed its
 // per-VM compatibility audit on this host) must not (re)start until the operator repairs
@@ -2212,6 +2215,11 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 			releasePreflight = release
 		}
 	}
+	// A seed here whose last rebuild failed (its stale mark) is tried again
+	// before the domain boots on it, on every start path, once nothing above
+	// refuses the start. Never a refusal: a rebuild that fails again leaves
+	// the seed as it is and warns again, and the VM starts on it.
+	s.retryStaleSeedForStart(ctx, vm)
 	return releasePreflight, nil
 }
 

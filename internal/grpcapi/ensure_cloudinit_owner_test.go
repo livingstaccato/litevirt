@@ -23,11 +23,12 @@ func TestEnsureCloudInit_WritesAgainASeedOfAnotherVM(t *testing.T) {
 	s.dataDir = t.TempDir()
 	insertTestVMWithSpec(t, adminCtx(), s.db, "sx", "elsewhere", "running", `{"name":"sx","uuid":"sx-2"}`)
 
+	peer := diskPeerCtx(t, s)
 	iso, _ := liveISO(t, s, "sx")
 	if err := cloudinit.StampSeed(iso, "sx-1"); err != nil { // the deleted sx's
 		t.Fatal(err)
 	}
-	if _, err := s.EnsureCloudInit(adminCtx(), &pb.EnsureCloudInitRequest{VmName: "sx"}); err != nil {
+	if _, err := s.EnsureCloudInit(peer, &pb.EnsureCloudInitRequest{VmName: "sx"}); err != nil {
 		t.Fatalf("EnsureCloudInit: %v", err)
 	}
 	if b, _ := os.ReadFile(iso); string(b) != "made" {
@@ -43,7 +44,7 @@ func TestEnsureCloudInit_WritesAgainASeedOfAnotherVM(t *testing.T) {
 	if err := os.WriteFile(iso, []byte("sx-2's seed"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.EnsureCloudInit(adminCtx(), &pb.EnsureCloudInitRequest{VmName: "sx"}); err != nil {
+	if _, err := s.EnsureCloudInit(peer, &pb.EnsureCloudInitRequest{VmName: "sx"}); err != nil {
 		t.Fatalf("EnsureCloudInit: %v", err)
 	}
 	if b, _ := os.ReadFile(iso); string(b) != "sx-2's seed" {

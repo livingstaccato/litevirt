@@ -3595,6 +3595,9 @@ message EnsureCloudInitRequest {
     string vm_name       = 1;
     string userdata      = 2;
     string networkconfig = 3;
+    // The seed's vendor-data, as the source decided it. Unset (a source from
+    // before this field) leaves the target to derive it from the VM's spec.
+    optional string vendordata = 4;
 }
 
 message EnsureDisksRequest {

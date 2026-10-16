@@ -281,7 +281,10 @@ func (s *Server) attachNICOwner(ctx context.Context, req *pb.AttachDeviceRequest
 			}
 		}
 	}
-	ordinal := len(existing)
+	ordinal, err := s.nextNICOrdinal(ctx, vm)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list NICs for %q: %v", vmName, err)
+	}
 	nicID := corrosion.DeterministicNICID(vmName, mac)
 
 	op := corrosion.OperationRecord{
@@ -627,6 +630,7 @@ func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, s
 			slog.Warn("nic attach: clear journal entry", "vm", vm.Name, "op", opID, "error", err)
 		}
 	}
+	s.rebuildSeedNetworkConfig(ctx, vm, mac)
 	s.reconcileLocal(ctx)
 	slog.Info("nic attached", "vm", vm.Name, "network", spec.Name, "mac", mac)
 	s.recordVMEvent(ctx, vm.Name, "device.attached", "ok", "nic "+mac)
@@ -642,6 +646,34 @@ func nicRowWriteCode(err error) codes.Code {
 		return codes.FailedPrecondition
 	}
 	return codes.Internal
+}
+
+// nextNICOrdinal is the ordinal a NIC attached to vm takes: one past every
+// ordinal any NIC of the VM ever had (tombstoned rows included) and every
+// position of its spec's NIC entries. An ordinal is never reused, so a new NIC
+// never stands at a detached NIC's position — where a spec entry that records
+// no MAC would be matched to it (seed network-config, NIC rate) — nor shares
+// one with a kept NIC.
+func (s *Server) nextNICOrdinal(ctx context.Context, vm *corrosion.VMRecord) (int, error) {
+	next := 0
+	var spec struct {
+		Network []json.RawMessage `json:"network"`
+	}
+	if json.Unmarshal([]byte(vm.Spec), &spec) == nil {
+		next = len(spec.Network)
+	}
+	for _, table := range []string{"vm_nics", "vm_interfaces"} {
+		rows, err := corrosion.GetVMNICsRaw(ctx, s.db, table, vm.Name)
+		if err != nil {
+			return 0, err
+		}
+		for _, r := range rows {
+			if r.Ordinal >= next {
+				next = r.Ordinal + 1
+			}
+		}
+	}
+	return next, nil
 }
 
 // failNICAttach compensates a failed attach by rolling BACK (§8): inverse
@@ -1082,6 +1114,7 @@ func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, n
 			slog.Warn("nic detach: clear journal entry", "vm", vm.Name, "op", opID, "error", err)
 		}
 	}
+	s.rebuildSeedNetworkConfig(ctx, vm, "")
 	slog.Info("nic detached", "vm", vm.Name, "mac", mac)
 	s.recordVMEvent(ctx, vm.Name, "device.detached", "ok", "nic "+mac)
 	s.publish("device.detached", vm.Name, "nic:"+mac)

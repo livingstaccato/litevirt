@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -288,6 +289,10 @@ type Reconciler struct {
 	// exactly as before. nil in tests / when unwired → treated as a no-op. The returned
 	// release func is invoked ONLY if the subsequent StartDomain fails.
 	prepareHardwareForStart func(ctx context.Context, vm *corrosion.VMRecord) (func(), error)
+
+	// seedRefreshRaced, set only by tests, runs in refreshOwnSeed between the
+	// derivation of the network-config and the rewrite.
+	seedRefreshRaced func()
 
 	// orphans / onOrphans: the orphan-runtime report (orphan_runtime.go) — the
 	// sighting counts between passes, and the metric observer (nil-safe).
@@ -2077,7 +2082,9 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// unchanged). A refusal is NON-FATAL: a blocked VM / unacquirable device (FailedPrecondition)
 	// is a non-retryable operator-repair condition → terminalize the proof + set the VM error;
 	// a transient read/DB failure (Internal/Unavailable) re-arms for the next reconcile tick.
-	releaseHW, hwErr := r.hwPrepareStart(ctx, fresh)
+	// domainXMLFor above has tried the VM's own seed for this start: the
+	// hook does not try it again (one failure, one warning).
+	releaseHW, hwErr := r.hwPrepareStart(cloudinit.WithSeedTriedForStart(ctx), fresh)
 	if hwErr != nil && errors.Is(hwErr, ErrStartDeferred) {
 		// Not a failure: storage did not answer, or there was no time left
 		// to ask it. Re-driven next pass — never parked in error.
@@ -2331,6 +2338,134 @@ func (r *Reconciler) reportPITHeld(ctx context.Context, vm, disk, detail string)
 	})
 }
 
+// seedClaim is what this host knows of vm for cloudinit.OwnSeed: its spec
+// and the domain definition of its name here, if any, read-only. A definition
+// that cannot be read attaches nothing.
+func (r *Reconciler) seedClaim(vm corrosion.VMRecord, spec *pb.VMSpec) cloudinit.SeedClaim {
+	return cloudinit.SeedClaim{VMName: vm.Name, UUID: cloudinit.SpecUUID(vm.Spec),
+		CloudInit: cloudinit.SpecHasCloudInit(spec), UserData: cloudinit.SpecUserData(spec), DomainXML: func() string {
+			if !r.virt.DomainExists(vm.Name) {
+				return ""
+			}
+			x, err := r.virt.DumpXMLInactive(vm.Name)
+			if err != nil {
+				return ""
+			}
+			return x
+		}}
+}
+
+// refreshOwnSeed brings the VM's own seed at iso up to date before a start
+// here. It may be a copy this host kept while the VM ran elsewhere (a
+// failover leaves it, and nothing removes it when the host rejoins), which
+// NICs attached or detached since are not in, and a guest applies a seed's
+// network-config on every boot: its network-config and vendor-data are
+// derived again from the VM's NICs, each NIC keeping its name, and its
+// meta-data (the instance-id) and user-data are kept byte for byte. Where the
+// VM's NICs cannot be told from its spec the seed is kept as it is. The VM
+// starts on the seed whatever happens here: a seed that cannot be read, or
+// whose network-config cannot be derived or rewritten, is used as it is, with
+// a seed.rebuild_failed warning naming it and the seed marked stale
+// (cloudinit.MarkSeedStale) until a rebuild succeeds.
+func (r *Reconciler) refreshOwnSeed(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, iso string) {
+	warn := func(cause error) {
+		if merr := cloudinit.MarkSeedStale(iso); merr != nil {
+			slog.Warn("reconciler: could not mark the VM's cloud-init seed stale", "vm", vm.Name, "seed", iso, "error", merr)
+		}
+		detail := fmt.Sprintf("the VM's seed at %s on %s could not be brought up to date with its NICs: %v; the VM starts on it as it is, so a NIC attached or detached since the seed was written may lose its configuration in the guest at this boot; the next start or NIC attach or detach of the VM on %s tries again", iso, r.hostName, cause, r.hostName)
+		slog.Warn("reconciler: "+detail, "vm", vm.Name)
+		_ = corrosion.InsertVMEvent(ctx, r.db, corrosion.VMEventRecord{
+			ID: randid.New(), VMName: vm.Name, HostName: r.hostName, Type: "seed.rebuild_failed",
+			Result: "error", Severity: "warning", Detail: detail, Username: "reconciler",
+		})
+	}
+	cur, err := cloudinit.ReadSeed(iso)
+	if err == nil && cur.InstanceID() == "" {
+		err = errors.New("the seed names no instance-id")
+	}
+	if err != nil {
+		warn(fmt.Errorf("read it: %w", err))
+		return
+	}
+	prior := cloudinit.PriorFrom(cur.NetworkConfig)
+	prior.Stale = !r.seedIsCurrent(ctx, vm.Name, iso)
+	nc, err := cloudinit.SeedNetworkConfig(ctx, r.db, vm.Name, spec, prior)
+	if errors.Is(err, cloudinit.ErrNICsAmbiguous) {
+		detail := fmt.Sprintf("the seed on %s keeps its network-config as it is: %v (the spec of a VM created before it recorded NIC MACs); configure changed NICs in the guest", r.hostName, err)
+		slog.Warn("reconciler: "+detail, "vm", vm.Name)
+		_ = corrosion.InsertVMEvent(ctx, r.db, corrosion.VMEventRecord{
+			ID: randid.New(), VMName: vm.Name, HostName: r.hostName, Type: "seed.not_rebuilt",
+			Result: "ok", Severity: "warning", Detail: detail, Username: "reconciler",
+		})
+		return
+	}
+	changed := false
+	if err == nil {
+		if r.seedRefreshRaced != nil {
+			r.seedRefreshRaced()
+		}
+		changed, err = cloudinit.RebuildISO(iso, nc, cloudinit.SeedVendorData(spec, nc))
+	}
+	if err != nil {
+		warn(err)
+		return
+	}
+	// The start holds its lease, not the VM lock an attach or detach holds:
+	// one can commit while this refresh runs, and this rewrite can land after
+	// its own. Derived again, a NIC set that moved keeps the seed marked
+	// stale, so the next start or attach or detach rewrites it.
+	if again, aerr := cloudinit.SeedNetworkConfig(ctx, r.db, vm.Name, spec, prior); aerr != nil || again != nc {
+		if merr := cloudinit.MarkSeedStale(iso); merr != nil {
+			slog.Warn("reconciler: could not mark the VM's cloud-init seed stale", "vm", vm.Name, "seed", iso, "error", merr)
+		}
+	}
+	if changed {
+		slog.Info("reconciler: the VM's cloud-init seed here takes its current NICs", "vm", vm.Name, "seed", iso)
+	}
+}
+
+// seedIsCurrent reports whether the VM's seed at iso on this host is the one
+// it runs on here, not a copy kept from an earlier stay: the VM's domain
+// definition here attaches it and has exactly the VM's live NICs (an attach
+// or detach on this host changes both, and rebuilds the seed with them), and
+// no rebuild of it has failed since the last that succeeded (a failed one
+// leaves the domain with NICs the seed does not list: MarkSeedStale). A
+// current seed's names are complete: a NIC it does not list was never named,
+// such as one an earlier release attached.
+func (r *Reconciler) seedIsCurrent(ctx context.Context, vmName, iso string) bool {
+	if r.virt == nil || cloudinit.SeedMarkedStale(iso) || !r.virt.DomainExists(vmName) {
+		return false
+	}
+	x, err := r.virt.DumpXMLInactive(vmName)
+	if err != nil || !lv.DomainAttachesCDROM(x, iso) {
+		return false
+	}
+	rows, err := corrosion.MergedVMNICs(ctx, r.db, vmName)
+	if err != nil {
+		return false
+	}
+	var d struct {
+		Interfaces []struct {
+			MAC struct {
+				Address string `xml:"address,attr"`
+			} `xml:"mac"`
+		} `xml:"devices>interface"`
+	}
+	if xml.Unmarshal([]byte(x), &d) != nil || len(d.Interfaces) != len(rows) {
+		return false
+	}
+	have := map[string]bool{}
+	for _, i := range d.Interfaces {
+		have[strings.ToLower(strings.TrimSpace(i.MAC.Address))] = true
+	}
+	for _, row := range rows {
+		if !have[strings.ToLower(row.MAC)] {
+			return false
+		}
+	}
+	return true
+}
+
 // domainXMLFor builds vm's domain XML on this host from its stored spec and
 // the disk configs the caller resolved: the cloud-init ISO, the networks
 // (provisioned here), firmware and resources. On failure it returns "" with
@@ -2346,11 +2481,16 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		return "", false, fmt.Sprintf("invalid name: %v", isoErr) // non-retryable
 	}
 	// A seed here is reused only when it is this VM's: one left by a deleted
-	// VM of the name would boot its user-data (cloudinit/seed_owner.go).
+	// VM of the name would boot its user-data (cloudinit/seed_owner.go). A VM
+	// whose spec has no cloud-init gets no seed at all, stamped or not: no
+	// create or clone writes one for it, so any file at its path is another
+	// VM's, or a copy a migration made of one.
 	seedOwner := cloudinit.SpecUUID(vm.Spec)
-	if cloudinit.SeedIsFor(isoPath, seedOwner) {
+	hasCloudInit := cloudinit.SpecHasCloudInit(spec)
+	if hasCloudInit && cloudinit.SeedIsFor(isoPath, seedOwner) {
+		r.refreshOwnSeed(ctx, vm, spec, isoPath)
 		cloudInitISO = isoPath
-	} else if spec.CloudInit != nil || spec.Image != "" {
+	} else if hasCloudInit {
 		// Regenerate the seed the VM was created with: its user-data, and
 		// the network-config derived from the spec, its NIC rows and its
 		// networks exactly as CreateVM derived it (a cloud image with no
@@ -2364,7 +2504,37 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		if userData == "" {
 			userData = "#cloud-config\n{}\n"
 		}
-		netCfg, ncErr := cloudinit.SeedNetworkConfig(ctx, r.db, vm.Name, spec)
+		// The NICs' guest names: those the VM's own seed here gives, which a
+		// copy kept while the VM ran elsewhere may predate (Stale); with no
+		// seed of the VM's, those its NIC records give (cloudinit.Prior).
+		var prior *cloudinit.Prior
+		if own, ok, _ := cloudinit.OwnSeed(isoPath, r.seedClaim(vm, spec)); ok {
+			prior = cloudinit.PriorFrom(own.NetworkConfig)
+			prior.Stale = !r.seedIsCurrent(ctx, vm.Name, isoPath)
+		}
+		netCfg, ncErr := cloudinit.SeedNetworkConfig(ctx, r.db, vm.Name, spec, prior)
+		vendorData := cloudinit.SeedVendorData(spec, netCfg)
+		if errors.Is(ncErr, cloudinit.ErrNICsAmbiguous) {
+			// No network-config litevirt can derive. The VM's own seed here
+			// keeps its network-config and vendor-data; with none, the seed
+			// disables network rendering and turns the per-boot re-render off,
+			// so a guest that recorded the update events earlier keeps the
+			// network it has rather than rendering cloud-init's fallback.
+			var detail string
+			if own, ok, _ := cloudinit.OwnSeed(isoPath, r.seedClaim(vm, spec)); ok {
+				netCfg, vendorData = own.NetworkConfig, own.VendorData
+				detail = fmt.Sprintf("the seed written on %s keeps the network-config of the VM's seed there: %v (the spec of a VM created before it recorded NIC MACs); configure changed NICs in the guest", r.hostName, ncErr)
+			} else {
+				netCfg, vendorData = cloudinit.NetworkConfigDisabled, cloudinit.NetworkUpdatesOffVendorData
+				detail = fmt.Sprintf("the seed written on %s has cloud-init leave the guest's network as it is: %v (the spec of a VM created before it recorded NIC MACs); configure the VM's NICs in the guest", r.hostName, ncErr)
+			}
+			slog.Warn("reconciler: "+detail, "vm", vm.Name)
+			_ = corrosion.InsertVMEvent(ctx, r.db, corrosion.VMEventRecord{
+				ID: randid.New(), VMName: vm.Name, HostName: r.hostName, Type: "seed.not_rebuilt",
+				Result: "ok", Severity: "warning", Detail: detail, Username: "reconciler",
+			})
+			ncErr = nil
+		}
 		if ncErr != nil {
 			slog.Warn("reconciler: cloud-init network-config could not be derived", "vm", vm.Name, "error", ncErr)
 			return "", true, fmt.Sprintf("derive cloud-init network-config: %v", ncErr) // transient DB
@@ -2374,6 +2544,7 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 			LocalHostname: vm.Name,
 			UserData:      userData,
 			NetworkConfig: netCfg,
+			VendorData:    vendorData,
 		}, isoPath); genErr != nil {
 			slog.Warn("reconciler: cloud-init ISO generation failed", "vm", vm.Name, "error", genErr)
 		} else {

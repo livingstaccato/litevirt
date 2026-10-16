@@ -4,7 +4,6 @@ package cloudinit
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"syscall"
@@ -14,14 +13,13 @@ import (
 // The NoCloud seed carries the VM's user-data — passwords, keys, tokens — and
 // is attached to the guest as a disk, so it is owner-only like one: made 0600
 // before genisoimage writes into it. Its directory, when made here, is 0711
-// (qemu opens the seed through it after libvirt's label). Needs genisoimage.
+// (qemu opens the seed through it after libvirt's label). Without genisoimage
+// the Go writer stands in, which writes into the same pre-made file.
 //
 // Mutations: drop the 0600 create before genisoimage — the seed goes red; the
 // output MkdirAll at 0755 — the directory goes red.
 func TestGenerateISO_TheSeedIsOwnerOnly(t *testing.T) {
-	if _, err := exec.LookPath("genisoimage"); err != nil {
-		t.Skip("genisoimage not installed")
-	}
+	UseGoISOWithoutGenisoimage(t)
 	old := syscall.Umask(0o022)
 	t.Cleanup(func() { syscall.Umask(old) })
 	out := filepath.Join(t.TempDir(), "cloudinit", "vm1.iso")

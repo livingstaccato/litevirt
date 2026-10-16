@@ -32059,6 +32059,9 @@ type EnsureCloudInitRequest struct {
 	VmName        string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
 	Userdata      string                 `protobuf:"bytes,2,opt,name=userdata,proto3" json:"userdata,omitempty"`
 	Networkconfig string                 `protobuf:"bytes,3,opt,name=networkconfig,proto3" json:"networkconfig,omitempty"`
+	// The seed's vendor-data, as the source decided it. Unset (a source from
+	// before this field) leaves the target to derive it from the VM's spec.
+	Vendordata    *string `protobuf:"bytes,4,opt,name=vendordata,proto3,oneof" json:"vendordata,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -32110,6 +32113,13 @@ func (x *EnsureCloudInitRequest) GetUserdata() string {
 func (x *EnsureCloudInitRequest) GetNetworkconfig() string {
 	if x != nil {
 		return x.Networkconfig
+	}
+	return ""
+}
+
+func (x *EnsureCloudInitRequest) GetVendordata() string {
+	if x != nil && x.Vendordata != nil {
+		return *x.Vendordata
 	}
 	return ""
 }
@@ -45603,11 +45613,15 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"stack_name\x18\x04 \x01(\tR\tstackName\"7\n" +
 	"\x1cAnnounceMigratedGuestRequest\x12\x17\n" +
-	"\avm_name\x18\x01 \x01(\tR\x06vmName\"s\n" +
+	"\avm_name\x18\x01 \x01(\tR\x06vmName\"\xa7\x01\n" +
 	"\x16EnsureCloudInitRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1a\n" +
 	"\buserdata\x18\x02 \x01(\tR\buserdata\x12$\n" +
-	"\rnetworkconfig\x18\x03 \x01(\tR\rnetworkconfig\"\xe8\x04\n" +
+	"\rnetworkconfig\x18\x03 \x01(\tR\rnetworkconfig\x12#\n" +
+	"\n" +
+	"vendordata\x18\x04 \x01(\tH\x00R\n" +
+	"vendordata\x88\x01\x01B\r\n" +
+	"\v_vendordata\"\xe8\x04\n" +
 	"\x12EnsureDisksRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12+\n" +
 	"\x05disks\x18\x02 \x03(\v2\x15.litevirt.v1.DiskStubR\x05disks\x12,\n" +
@@ -48478,6 +48492,7 @@ func file_litevirt_v1_service_proto_init() {
 		(*PushBackupFrame_Chunk)(nil),
 		(*PushBackupFrame_Manifest)(nil),
 	}
+	file_litevirt_v1_service_proto_msgTypes[455].OneofWrappers = []any{}
 	file_litevirt_v1_service_proto_msgTypes[569].OneofWrappers = []any{}
 	file_litevirt_v1_service_proto_msgTypes[574].OneofWrappers = []any{}
 	type x struct{}

@@ -1403,6 +1403,11 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 	// RollbackFirmwareState cannot wipe the firmware materialized below.
 	s.firmwareTargets.op.Lock()
 	defer s.firmwareTargets.op.Unlock()
+	// A live firmware move's record of the VM here (spec §6.9): its state is
+	// that move's, and only the move writes or removes it.
+	if err := s.firmwareMoveRecordRefusal("materialise firmware state", req.VmName, req.Uuid); err != nil {
+		return nil, err
+	}
 	if s.virt != nil && s.virt.DomainExists(req.VmName) {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"refusing to materialize firmware over already-defined domain %q", req.VmName)
@@ -1975,6 +1980,13 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 	// firmware we erased (G1).
 	// A VM whose row names this host owns the domain here; it is never a
 	// migration leftover, so neither it nor its firmware is touched.
+	// A live firmware move's record of the VM here (spec §6.9): the domain
+	// and firmware are that move's, and only its own steps remove them.
+	if held := s.firmwareMoveRecordRefusal("cleanup of migration artifacts", req.VmName, req.FirmwareUuid); held != nil {
+		slog.Warn("cleanup migration artifacts: leaving the domain and firmware of a live firmware move",
+			"vm", req.VmName, "detail", status.Convert(held).Message())
+		return &emptypb.Empty{}, nil
+	}
 	if req.UndefineDomain && rowNamesHere {
 		slog.Warn("cleanup migration artifacts: VM lives on this host; leaving its domain and firmware",
 			"vm", req.VmName)

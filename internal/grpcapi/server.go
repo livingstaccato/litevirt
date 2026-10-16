@@ -825,6 +825,9 @@ type Server struct {
 	// RollbackFirmwareState removes (migrate_firmware_rollback.go). Zero value
 	// ready.
 	firmwareTargets firmwareTargetLedger
+	// fwTarget is this host's side of a live firmware move as its target
+	// (migrate_firmware_live_target.go).
+	fwTarget fwTargetState
 
 	// vmLocks provides per-VM mutual exclusion for operations that must not
 	// run concurrently (e.g. snapshot + migration, backup + delete).

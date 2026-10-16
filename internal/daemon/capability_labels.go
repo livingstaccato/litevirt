@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/libvirt"
 )
 
@@ -146,26 +148,42 @@ type fwLiveInputs struct {
 
 // fwLiveMigrateCapable is true only when every condition holds. An unreadable
 // version, or one that is not X.Y.Z, is "not capable". The label is advisory:
-// stage A and Prepare re-check each condition live.
+// stage A and Prepare re-check each condition live (fwLiveMigrateCheck).
 func fwLiveMigrateCapable(ctx context.Context, in fwLiveInputs) bool {
-	if !in.enabled || !in.tpm() || !in.secureBoot() {
-		return false
+	_, err := fwLiveMigrateCheck(ctx, in)
+	return err == nil
+}
+
+// fwLiveMigrateCheck is the label's condition list with its reason: the
+// host's installed firmware runtime when every condition holds, else the
+// first that fails.
+func fwLiveMigrateCheck(ctx context.Context, in fwLiveInputs) (libvirt.FirmwareRuntime, error) {
+	switch {
+	case !in.enabled:
+		return libvirt.FirmwareRuntime{}, errors.New("migration.live_firmware is off")
+	case !in.tpm():
+		return libvirt.FirmwareRuntime{}, errors.New("no vTPM support (swtpm and swtpm_setup)")
+	case !in.secureBoot():
+		return libvirt.FirmwareRuntime{}, errors.New("no Secure Boot firmware")
 	}
 	code, err := in.installed(ctx)
 	if err != nil {
-		return false
+		return libvirt.FirmwareRuntime{}, fmt.Errorf("installed firmware code: %w", err)
 	}
-	for _, c := range []struct{ have, floor string }{
-		{code.Runtime.Libvirt, fwLiveFloors.libvirt},
-		{code.Runtime.QEMU, fwLiveFloors.qemu},
-		{code.Runtime.Swtpm, fwLiveFloors.swtpm},
-		{code.Runtime.Libtpms, fwLiveFloors.libtpms},
+	for _, c := range []struct{ name, have, floor string }{
+		{"libvirt", code.Runtime.Libvirt, fwLiveFloors.libvirt},
+		{"qemu", code.Runtime.QEMU, fwLiveFloors.qemu},
+		{"swtpm", code.Runtime.Swtpm, fwLiveFloors.swtpm},
+		{"libtpms", code.Runtime.Libtpms, fwLiveFloors.libtpms},
 	} {
 		if !versionAtLeast(c.have, c.floor) {
-			return false
+			return libvirt.FirmwareRuntime{}, fmt.Errorf("%s %q is below the floor %s", c.name, c.have, c.floor)
 		}
 	}
-	return in.guests(ctx) == nil
+	if err := in.guests(ctx); err != nil {
+		return libvirt.FirmwareRuntime{}, fmt.Errorf("libvirt-guests: %w", err)
+	}
+	return code.Runtime, nil
 }
 
 // versionAtLeast compares X.Y.Z numerically; anything else is false.
@@ -228,11 +246,40 @@ func fwLiveLabelProbe(cfg MigrationConfig, h fwLiveHost) func() bool {
 // read with the libvirt version call bounded, and the live D-9 check.
 func newFwLiveLabel(cfg MigrationConfig, store *libvirt.FirmwareStore, fp libvirt.FirmwarePaths,
 	libvirtVersion func() (uint64, error), tpm func() bool) func() bool {
+	return fwLiveLabelProbe(cfg, newFwLiveHost(store, fp, libvirtVersion, tpm))
+}
+
+// newFwLiveHost is this host's probes behind the label and the target's
+// Prepare check: its installed firmware code (the libvirt version call
+// bounded) and the live D-9 check. Each caller gets probes of its own, so the
+// label loop never holds up a Prepare behind its in-flight version call.
+func newFwLiveHost(store *libvirt.FirmwareStore, fp libvirt.FirmwarePaths,
+	libvirtVersion func() (uint64, error), tpm func() bool) fwLiveHost {
 	probe := libvirt.NewFirmwareCodeProbe(store, fp, boundedVersion(fwLiveProbeTimeout, libvirtVersion))
-	return fwLiveLabelProbe(cfg, fwLiveHost{
+	return fwLiveHost{
 		tpm: tpm, secureBoot: fp.SecureBootAvailable,
 		installed: probe.Installed, guests: CheckLibvirtGuests,
-	})
+	}
+}
+
+// fwLiveHostCheck is the check a live firmware move's target runs in Prepare
+// (spec §6.2 item 1): the label's conditions, each read now, with the reason
+// of the first that fails, bounded in time.
+func fwLiveHostCheck(cfg MigrationConfig, h fwLiveHost) grpcapi.LiveFirmwareHostCheck {
+	return func(ctx context.Context) (libvirt.FirmwareRuntime, error) {
+		ctx, cancel := context.WithTimeout(ctx, fwLiveProbeTimeout)
+		defer cancel()
+		return fwLiveMigrateCheck(ctx, fwLiveInputs{
+			enabled: cfg.LiveFirmwareEnabled(), tpm: h.tpm, secureBoot: h.secureBoot,
+			installed: h.installed, guests: h.guests,
+		})
+	}
+}
+
+// newFwLiveHostCheck is the production Prepare check.
+func newFwLiveHostCheck(cfg MigrationConfig, store *libvirt.FirmwareStore, fp libvirt.FirmwarePaths,
+	libvirtVersion func() (uint64, error), tpm func() bool) grpcapi.LiveFirmwareHostCheck {
+	return fwLiveHostCheck(cfg, newFwLiveHost(store, fp, libvirtVersion, tpm))
 }
 
 // boundedVersion calls fn with a deadline. A call that does not return in

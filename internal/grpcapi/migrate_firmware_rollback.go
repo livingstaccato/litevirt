@@ -108,6 +108,11 @@ func (s *Server) RollbackFirmwareState(ctx context.Context, req *pb.RollbackFirm
 
 	s.firmwareTargets.op.Lock()
 	defer s.firmwareTargets.op.Unlock()
+	// A live firmware move's record of the VM here (spec §6.9): the domain
+	// and firmware are that move's, not a cold attempt's.
+	if err := s.firmwareMoveRecordRefusal("firmware state rollback", req.VmName, req.Uuid); err != nil {
+		return nil, err
+	}
 	if !s.firmwareTargets.owns(req.VmName, req.AttemptId, req.Uuid) {
 		slog.Info("rollback firmware state: this host holds nothing of that attempt; leaving the domain",
 			"vm", req.VmName, "attempt", req.AttemptId)

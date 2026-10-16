@@ -1437,6 +1437,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Remove the owner-epoch markers of VMs deleted while this host was not
 	// asked (in maintenance, unreachable), each time it becomes active.
 	go svc.RunDeletedVMMarkerSweep(ctx)
+	// Quarantine a live firmware move's target hold whose move was abandoned,
+	// and name a hold held too long.
+	go svc.RunFirmwareHoldSweep(ctx)
 	// Remember the clock skews this host sees past their rows' retention: the
 	// margin lv image prune keeps a deleted image's file within reads them.
 	go svc.RunImageSkewRecorder(ctx)
@@ -1628,6 +1631,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		{key: corrosion.LabelSecureBootCapable, capable: firmwarePaths.SecureBootAvailable},
 		{key: corrosion.LabelFwLiveMigrate, capable: newFwLiveLabel(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmAvailable)},
 	}
+	// A live firmware move's target re-checks the label's conditions itself,
+	// live, in Prepare.
+	svc.SetLiveFirmwareHost(newFwLiveHostCheck(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmAvailable))
 	asserted, err := assertCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels)
 	if err != nil {
 		slog.Warn("set capability host labels failed; retrying in the background", "labels", asserted, "error", err)

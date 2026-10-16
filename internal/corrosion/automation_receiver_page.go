@@ -20,6 +20,9 @@ const receiverStateBytes = 2048
 var receiverMetadataLimits = [3]int64{maxSourceArtifactBytes, pki.MaxHostTrustEvidenceBytes, maxSourceMembershipEvidenceBytes}
 
 func receiverDigest(raw string) bool {
+	if len(raw) != 64 {
+		return false
+	}
 	b, e := hex.DecodeString(raw)
 	return e == nil && len(b) == 32 && hex.EncodeToString(b) == raw
 }
@@ -389,7 +392,7 @@ func receiverVerifyRows(ctx context.Context, tx *LocalTx, attempt, source string
 		return errors.New("receiver invalid retained ordinal")
 	}
 	for {
-		rows, err := tx.Query(ctx, `SELECT ordinal,length(record) AS size FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component=? AND ordinal>? ORDER BY ordinal LIMIT 1`, attempt, source, component, ordinal)
+		rows, err := tx.Query(ctx, `SELECT ordinal,length(CAST(record AS BLOB)) AS size FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component=? AND ordinal>? ORDER BY ordinal LIMIT 1`, attempt, source, component, ordinal)
 		if err != nil {
 			return err
 		}
@@ -405,7 +408,7 @@ func receiverVerifyRows(ctx context.Context, tx *LocalTx, attempt, source string
 			return errors.New("receiver retained inventory length/order differs")
 		}
 		ordinal++
-		rows, err = tx.Query(ctx, `SELECT record FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component=? AND ordinal=? AND length(record)=? LIMIT 1`, attempt, source, component, ordinal, n)
+		rows, err = tx.Query(ctx, `SELECT record FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component=? AND ordinal=? AND length(CAST(record AS BLOB))=? LIMIT 1`, attempt, source, component, ordinal, n)
 		if err != nil || len(rows) != 1 {
 			return errors.New("receiver retained record missing")
 		}

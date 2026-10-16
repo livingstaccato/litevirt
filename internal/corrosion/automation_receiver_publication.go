@@ -47,7 +47,7 @@ func (r *AutomationReceiver) metadata(ctx context.Context, a *AutomationReceiver
 	raw := make([]byte, 0, int(total))
 	var ordinal int64
 	for {
-		rows, err = r.client.sourceExportQuery(ctx, `SELECT ordinal,length(record) AS size FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component=? AND ordinal>? ORDER BY ordinal LIMIT 1`, a.id, source, component, ordinal)
+		rows, err = r.client.sourceExportQuery(ctx, `SELECT ordinal,length(CAST(record AS BLOB)) AS size FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component=? AND ordinal>? ORDER BY ordinal LIMIT 1`, a.id, source, component, ordinal)
 		if err != nil {
 			return nil, err
 		}
@@ -59,7 +59,7 @@ func (r *AutomationReceiver) metadata(ctx context.Context, a *AutomationReceiver
 			return nil, errors.New("receiver metadata retained chunk exceeds bound")
 		}
 		ordinal++
-		rows, err = r.client.sourceExportQuery(ctx, `SELECT record FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component=? AND ordinal=? AND length(record)=? LIMIT 1`, a.id, source, component, ordinal, n)
+		rows, err = r.client.sourceExportQuery(ctx, `SELECT record FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component=? AND ordinal=? AND length(CAST(record AS BLOB))=? LIMIT 1`, a.id, source, component, ordinal, n)
 		if err != nil || len(rows) != 1 {
 			return nil, errors.New("receiver metadata retained chunk missing")
 		}

@@ -25,6 +25,7 @@ type AutomationReceiver struct {
 	// Only tests pause the real transaction, never supply authorization results.
 	seams                   *localCommitSeams
 	afterMembershipLearning func() // test-only pause; never supplies facts or trust
+	afterCurrentObservation func() // test-only pause after reading the actual predecessor
 }
 
 // AutomationReceiverAttempt is process-local. Its identity alone cannot revive
@@ -188,13 +189,7 @@ func (r *AutomationReceiver) factsTx(ctx context.Context, tx *LocalTx, intent Au
 }
 func receiverBinding(intent AutomationSourceRequest, f receiverFacts, view *pki.HostTrust) []byte {
 	root := view.RootDigest()
-	b, _ := json.Marshal(struct {
-		Version int
-		Stream  string
-		Intent  AutomationSourceRequest
-		Facts   receiverFacts
-		Root    string
-	}{1, "automation", intent, f, hex.EncodeToString(root[:])})
+	b, _ := json.Marshal(receiverAttemptBinding{1, "automation", intent, f, hex.EncodeToString(root[:])})
 	return b
 }
 func sameReceiverFacts(a, b receiverFacts) bool {
@@ -208,6 +203,9 @@ func sameReceiverFacts(a, b receiverFacts) bool {
 // greater revision, even for another job name; numeric source revisions do not
 // select a receiver. Superseded rows are retained permanently and stay inert.
 func (r *AutomationReceiver) Begin(ctx context.Context, intent AutomationSourceRequest, previous *AutomationReceiverAttempt) (*AutomationReceiverAttempt, error) {
+	return r.begin(ctx, intent, previous, false)
+}
+func (r *AutomationReceiver) begin(ctx context.Context, intent AutomationSourceRequest, previous *AutomationReceiverAttempt, replace bool) (*AutomationReceiverAttempt, error) {
 	if err := r.lock(ctx); err != nil {
 		return nil, err
 	}
@@ -222,6 +220,16 @@ func (r *AutomationReceiver) Begin(ctx context.Context, intent AutomationSourceR
 	}
 	if previous != nil && (previous.self != previous || previous.owner != r) {
 		return nil, errors.New("foreign receiver predecessor")
+	}
+	var predecessor *receiverPredecessor
+	if replace {
+		predecessor, err = r.observePredecessor(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if r.afterCurrentObservation != nil {
+			r.afterCurrentObservation()
+		}
 	}
 	// Learn CA-issued renewals before snapshot capture, without any held SQL/PKI
 	// lock inversion. No membership assertion is inferred from these certificates.
@@ -274,6 +282,12 @@ func (r *AutomationReceiver) Begin(ctx context.Context, intent AutomationSourceR
 	if len(binding) > 2*maxSourceCertificateBytes+3*maxSourceConfigBytes {
 		return nil, errors.New("receiver binding exceeds bound")
 	}
+	if predecessor != nil {
+		root := view.RootDigest()
+		if err = predecessor.compatible(intent, facts, hex.EncodeToString(root[:])); err != nil {
+			return nil, err
+		}
+	}
 	id := sourceDigest([]byte("litevirt/receiver-attempt/v1"), binding)
 	a := &AutomationReceiverAttempt{owner: r, id: id, request: intent, facts: facts, binding: binding, view: view, pair: pair, at: time.Now(), notBefore: before, notAfter: after, publications: map[string]receiverPublication{}}
 	a.self = a
@@ -296,7 +310,12 @@ func (r *AutomationReceiver) Begin(ctx context.Context, intent AutomationSourceR
 		if err != nil {
 			return err
 		}
-		if len(rows) == 0 {
+		if predecessor != nil {
+			observed, e := receiverReadPredecessor(ctx, tx)
+			if e != nil || observed.id != predecessor.id || !bytes.Equal(observed.binding, predecessor.binding) {
+				return errors.New("receiver observed predecessor changed")
+			}
+		} else if len(rows) == 0 {
 			// A corrupt/over-bound head cannot masquerade as no current selection.
 			count, e := tx.Query(ctx, `SELECT COUNT(*) AS n FROM local_automation_receiver_current`)
 			if e != nil || len(count) != 1 || count[0].Int64("n") != 0 {
@@ -333,6 +352,20 @@ func (r *AutomationReceiver) Begin(ctx context.Context, intent AutomationSourceR
 		digest := view.EvidenceDigest()
 		if _, err = tx.Exec(ctx, `INSERT OR IGNORE INTO local_automation_receiver_validations(attempt,digest,evidence) VALUES(?,?,?)`, id, hex.EncodeToString(digest[:]), evidence); err != nil {
 			return err
+		}
+		if predecessor != nil {
+			result, e := tx.Exec(ctx, `UPDATE local_automation_receiver_current SET attempt=? WHERE id=1 AND attempt=?`, id, predecessor.id)
+			if e != nil {
+				return e
+			}
+			n, e := result.RowsAffected()
+			if e != nil {
+				return e
+			}
+			if n != 1 {
+				return errors.New("receiver current compare-and-swap lost")
+			}
+			return nil
 		}
 		_, err = tx.Exec(ctx, `INSERT INTO local_automation_receiver_current(id,attempt) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET attempt=excluded.attempt`, id)
 		return err
@@ -416,4 +449,10 @@ func (r *AutomationReceiver) transaction(ctx context.Context, a *AutomationRecei
 		r.seams.afterCommit()
 	}
 	return nil
+}
+
+// Supersede deliberately selects a replacement under freshly verified local
+// authority. The durable predecessor is owned by this receiver, never a caller ID.
+func (r *AutomationReceiver) Supersede(ctx context.Context, intent AutomationSourceRequest) (*AutomationReceiverAttempt, error) {
+	return r.begin(ctx, intent, nil, true)
 }

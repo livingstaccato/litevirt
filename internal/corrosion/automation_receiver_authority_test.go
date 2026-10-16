@@ -115,36 +115,7 @@ func TestReceiverWholeOldElectorateRoster(t *testing.T) {
 func TestReceiverRenewedSourcePublication(t *testing.T) {
 	p, r, q, exportCtx, _ := receiverFixture(t)
 	ctx := context.Background()
-	if _, _, err := pki.RenewLocal(filepath.Join(p.dir, "ca.crt"), filepath.Join(p.dir, "ca.key"), p.dir, "a"); err != nil {
-		t.Fatal(err)
-	}
-	signer, err := LoadClaimSigner(p.dir, "a")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Normal re-attestation of exact retained votes supplies the required current
-	// certified predecessor chain. No historical expiry/pin relaxation is used.
-	for g := int64(1); g <= 2; g++ {
-		key := ClaimKey{TargetKind: ClaimKindVoterConfig, OwnerEpoch: g - 1}
-		st, found, err := p.client.ClaimState(ctx, key)
-		if err != nil || !found || st.Accept == nil {
-			t.Fatal(err)
-		}
-		accept, err := signer.Sign(key, g-1, st.Accepted, st.ValueDigest, st.Accept.VoterIncarnation)
-		if err != nil {
-			t.Fatal(err)
-		}
-		cert := ClaimCertificate{Key: key, ConfigGeneration: g - 1, Ballot: st.Accepted, ValueDigest: st.ValueDigest, Accepts: []ClaimAccept{accept}}
-		// Fixture installs current re-attested certificate bytes for the identical
-		// decided value. WriteVoterConfig deliberately ignores an existing row.
-		raw, err := cert.Encode()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err = r.client.db.Exec(`UPDATE voter_configs SET certificate=? WHERE generation=?`, raw, g); err != nil {
-			t.Fatal(err)
-		}
-	}
+	receiverRenewMembership(t, p, r)
 	q.Intent.Revision++
 	candidate, err := p.Prepare(ctx, q.Intent)
 	if err != nil {
@@ -210,5 +181,40 @@ func TestReceiverMembershipChangesDuringTrustLearning(t *testing.T) {
 	r.afterMembershipLearning = nil
 	if _, err = r.Begin(ctx, q.Intent, nil); err != nil {
 		t.Fatal("fresh normal reauthorization after race did not progress", err)
+	}
+}
+
+func receiverRenewMembership(t *testing.T, p *AutomationSourcePreparer, r *AutomationReceiver) {
+	t.Helper()
+	ctx := context.Background()
+	if _, _, err := pki.RenewLocal(filepath.Join(p.dir, "ca.crt"), filepath.Join(p.dir, "ca.key"), p.dir, "a"); err != nil {
+		t.Fatal(err)
+	}
+	signer, err := LoadClaimSigner(p.dir, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Normal re-attestation of exact retained votes supplies the required current
+	// certified predecessor chain. No historical expiry/pin relaxation is used.
+	for g := int64(1); g <= 2; g++ {
+		key := ClaimKey{TargetKind: ClaimKindVoterConfig, OwnerEpoch: g - 1}
+		st, found, err := p.client.ClaimState(ctx, key)
+		if err != nil || !found || st.Accept == nil {
+			t.Fatal(err)
+		}
+		accept, err := signer.Sign(key, g-1, st.Accepted, st.ValueDigest, st.Accept.VoterIncarnation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cert := ClaimCertificate{Key: key, ConfigGeneration: g - 1, Ballot: st.Accepted, ValueDigest: st.ValueDigest, Accepts: []ClaimAccept{accept}}
+		// Fixture installs current re-attested certificate bytes for the identical
+		// decided value. WriteVoterConfig deliberately ignores an existing row.
+		raw, err := cert.Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = r.client.db.Exec(`UPDATE voter_configs SET certificate=? WHERE generation=?`, raw, g); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

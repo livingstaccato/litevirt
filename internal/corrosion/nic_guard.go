@@ -729,6 +729,17 @@ func VMSpecOfIncarnation(ctx context.Context, c *Client, name, createdAt string)
 // with no row at all, or newer than its row's tombstone (a re-attach whose
 // row has not landed here), is still demanded.
 func GuardedMACsOf(ctx context.Context, c *Client, owner string) ([]string, error) {
+	return GuardedMACsOfIncarnation(ctx, c, owner, "")
+}
+
+// GuardedMACsOfIncarnation is GuardedMACsOf for a VM that a create on this
+// host is bringing up as the incarnation creating (its spec uuid): that
+// create's incarnation is the one that runs, whatever VM row of the name this
+// replica holds (none yet, or the one it replaces). A record another
+// incarnation of the name left live — a create that failed on an earlier
+// build — guards nothing the firewall renders for this one, so it is not
+// demanded. creating "" is GuardedMACsOf.
+func GuardedMACsOfIncarnation(ctx context.Context, c *Client, owner, creating string) ([]string, error) {
 	lo, hi := keyRange(nicGuardKeyPrefix + owner + "/")
 	rows, err := c.Query(ctx,
 		`SELECT key, value, set_by, updated_at FROM cluster_policies
@@ -757,6 +768,9 @@ func GuardedMACsOf(ctx context.Context, c *Client, owner string) ([]string, erro
 		_ = json.Unmarshal([]byte(vm.Spec), &sp)
 		uuid = sp.UUID
 		inFlight = vm.ActiveOperationID != ""
+	}
+	if creating != "" {
+		uuid = creating
 	}
 	live, removed, err := nicRowStatesOf(ctx, c, owner)
 	if err != nil {
@@ -913,6 +927,32 @@ func RetireNICGuard(ctx context.Context, c *Client, owner, mac, setBy string) er
 		return err
 	}
 	return c.Execute(ctx, clusterPolicyUpsertSQL, NICGuardKey(r.VMName, r.MAC), string(b), setBy, ts)
+}
+
+// RetireNICGuardsOfIncarnation retires the live guard records of owner's
+// NICs macs that the incarnation uuid wrote, and nothing else: a record of
+// that MAC another incarnation wrote since is left as it is. It is how a
+// create that failed takes back the records it wrote before it failed. A
+// MAC with no live record of that incarnation is skipped. It returns the
+// first error and goes on with the other MACs.
+func RetireNICGuardsOfIncarnation(ctx context.Context, c *Client, owner, uuid string, macs []string, setBy string) error {
+	if uuid == "" {
+		return nil
+	}
+	var first error
+	for _, mac := range macs {
+		r, err := GetNICGuard(ctx, c, owner, strings.ToLower(mac))
+		if err == nil && (r == nil || r.Deleted || r.VMUUID != uuid) {
+			continue
+		}
+		if err == nil {
+			err = RetireNICGuard(ctx, c, owner, mac, setBy)
+		}
+		if err != nil && first == nil {
+			first = fmt.Errorf("retire the guard record of NIC %s of %s: %w", strings.ToLower(mac), owner, err)
+		}
+	}
+	return first
 }
 
 // RetiredGuardOver is what a retired record of the VM incarnation vmUUID

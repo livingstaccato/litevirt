@@ -294,6 +294,23 @@ Multiple networks can be attached to a single VM:
         ip: "172.16.0.10"
 ```
 
+A VM is created with at most one NIC per network. A create, a rebuild or a
+stack update whose spec has two NICs on one network is refused before anything
+is created (`NICs 0 and 1 are both on network "lan"`). Once `hardware_v2` is
+active, `lv attach-nic` adds a further NIC on a network the VM already has.
+
+A create that fails after its domain is defined, and before its VM record is
+written, is undone: the domain is stopped and undefined, the disks, cloud-init
+seed and firmware state it made are removed, its address claims are released,
+and its NIC guard records are retired. UEFI vars and the retained-firmware
+marker a `delete --keep-disks` left under the name are kept. The client gets
+the error. If the domain cannot be stopped, is gone, or is no longer the one
+the create defined, the disks are left as they are, and so is any such domain,
+and the error says so; the next create of the same name removes a leftover
+domain.
+Once the VM record is written the VM exists: a later failure, or a client that
+stops waiting, undoes nothing.
+
 ### Per-NIC MTU
 
 A VM NIC can carry a guest MTU: `mtu:` on its network entry in compose, or

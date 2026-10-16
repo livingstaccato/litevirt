@@ -145,9 +145,34 @@ func (s *Server) vmGuarded(ctx context.Context, vm string) (bool, error) {
 }
 
 // guardedMACs is the MACs of owner's NICs whose guard is on
-// (corrosion.GuardedMACsOf).
+// (corrosion.GuardedMACsOf) — of the incarnation a create on this host is
+// bringing up, while one is (CreatingIncarnation).
 func (s *Server) guardedMACs(ctx context.Context, owner string) ([]string, error) {
-	return corrosion.GuardedMACsOf(ctx, s.db, owner)
+	return corrosion.GuardedMACsOfIncarnation(ctx, s.db, owner, s.CreatingIncarnation(owner))
+}
+
+// noteCreatingIncarnation records that a create on this host is bringing VM
+// vm up as the incarnation uuid, until the returned func runs: a start of vm
+// meanwhile is that create's, and demands its guards only. A second create of
+// the name on this host does not take the note over from the first.
+func (s *Server) noteCreatingIncarnation(vm, uuid string) func() {
+	if vm == "" || uuid == "" {
+		return func() {}
+	}
+	if _, taken := s.creatingIncarnations.LoadOrStore(vm, uuid); taken {
+		return func() {}
+	}
+	return func() { s.creatingIncarnations.CompareAndDelete(vm, uuid) }
+}
+
+// CreatingIncarnation is the uuid a create on this host is bringing VM vm up
+// as, or "" when none is.
+func (s *Server) CreatingIncarnation(vm string) string {
+	if v, ok := s.creatingIncarnations.Load(vm); ok {
+		u, _ := v.(string)
+		return u
+	}
+	return ""
 }
 
 // needsPausedStart reports whether vm has a guarded NIC whose definition names

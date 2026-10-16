@@ -75,7 +75,7 @@ func TestStartWaitPredicate(t *testing.T) {
 		Mode: corrosion.NICGuardOn, VMUUID: "u-guarded"}, "t"); err != nil {
 		t.Fatal(err)
 	}
-	wait := startWaitNeeded(db)
+	wait := startWaitNeeded(db, func(string) string { return "" })
 	if wait("plain") {
 		t.Error("an unguarded VM's start waits for the start guard")
 	}
@@ -120,5 +120,31 @@ func TestRun_LabelHookBeforeTheBootPass(t *testing.T) {
 	boot, ok2 := first["bootFirewallPass"]
 	if !ok1 || !ok2 || hook >= boot {
 		t.Errorf("SetPassHook (%v) must be wired before bootFirewallPass (%v)", ok1, ok2)
+	}
+}
+
+// TestStartWaitPredicate_CreatingIncarnation (lab 2, F-B): a start a create
+// is making waits only for that create's own guards. A guard record another
+// incarnation of the name left live, with no VM row, makes it wait only
+// while no create names its incarnation.
+func TestStartWaitPredicate_CreatingIncarnation(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	db.SetClusterPolicyGate(func() bool { return true })
+	if err := corrosion.PutNICGuard(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: "fc", MAC: "52:54:00:00:05:0a",
+		Mode: corrosion.NICGuardOn, VMUUID: "u-old"}, "t"); err != nil {
+		t.Fatal(err)
+	}
+	creating := ""
+	wait := startWaitNeeded(db, func(string) string { return creating })
+	if !wait("fc") {
+		t.Error("with no create in flight, a stale record of the name is not waited for")
+	}
+	creating = "u-new"
+	if wait("fc") {
+		t.Error("a create's start waits for a record another incarnation left")
 	}
 }

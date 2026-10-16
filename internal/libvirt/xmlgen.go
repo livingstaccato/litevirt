@@ -817,6 +817,22 @@ func NvramPath(dataDir, vmName string) string {
 	return filepath.Join(dataDir, "nvram", vmName+"_VARS.fd")
 }
 
+// NvramPathFromXML is the UEFI vars file a domain definition names
+// (<os><nvram>), or "" when it names none or does not parse.
+func NvramPathFromXML(domainXML string) string {
+	var d struct {
+		OS struct {
+			Nvram struct {
+				Value string `xml:",chardata"`
+			} `xml:"nvram"`
+		} `xml:"os"`
+	}
+	if xml.Unmarshal([]byte(domainXML), &d) != nil {
+		return ""
+	}
+	return strings.TrimSpace(d.OS.Nvram.Value)
+}
+
 // SafeNvramPath is NvramPath with the VM name validated.
 func SafeNvramPath(dataDir, vmName string) (string, error) {
 	if err := safename.ValidateVMName(vmName); err != nil {

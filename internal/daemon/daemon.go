@@ -82,6 +82,10 @@ type Daemon struct {
 	checker *health.Checker
 	metrics *metrics.Server
 
+	// startWaitSvc is svc for the libvirt start-guard wait, which is wired
+	// before svc exists and asks it which incarnation a create is starting.
+	startWaitSvc *atomic.Pointer[grpcapi.Server]
+
 	// buildServer replaces grpcapi.NewServer in newServer (tests, which have
 	// no libvirt); nil in a daemon.
 	buildServer func() *grpcapi.Server
@@ -204,7 +208,13 @@ func New(cfg *Config) (*Daemon, error) {
 	// start waits for SetStartGuard (Run), and refuses if it never comes. A
 	// VM with no NIC guard does not wait (m3): it starts as it did before
 	// guards. One whose guards cannot be read waits.
-	virt.RequireStartGuard(5*time.Minute, startWaitNeeded(db))
+	startWaitSvc := &atomic.Pointer[grpcapi.Server]{}
+	virt.RequireStartGuard(5*time.Minute, startWaitNeeded(db, func(name string) string {
+		if svc := startWaitSvc.Load(); svc != nil {
+			return svc.CreatingIncarnation(name)
+		}
+		return ""
+	}))
 
 	// An earlier build left the backup session directories 0777; narrow them
 	// now rather than at the first backup (best effort, logged).
@@ -221,6 +231,8 @@ func New(cfg *Config) (*Daemon, error) {
 		db:     db,
 		virt:   virt,
 		images: store,
+
+		startWaitSvc: startWaitSvc,
 	}, nil
 }
 
@@ -993,6 +1005,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// every host does (re-review m8).
 	fc.SetNICGuardPlacement(svc.GuardHostNeeded)
 	d.svc = svc
+	if d.startWaitSvc != nil {
+		d.startWaitSvc.Store(svc)
+	}
 	svc.SetSupersededDiskRetentionDays(d.cfg.SupersededDiskRetentionDays)
 	{
 		iv := d.cfg.HostUpdates.IntervalMinutes
@@ -3806,12 +3821,14 @@ func (d *Daemon) wireLeaseTermLedgerGate() {
 // startWaitNeeded is the predicate RequireStartGuard waits on (re-review
 // m3): a start waits for the start guard only when its VM has a NIC guard
 // on, or whether it has one cannot be read. A VM with none starts as it did
-// before guards.
-func startWaitNeeded(db *corrosion.Client) func(name string) bool {
+// before guards. creating names the incarnation a create on this host is
+// starting (grpcapi.Server.CreatingIncarnation): such a start waits only for
+// that incarnation's guards.
+func startWaitNeeded(db *corrosion.Client, creating func(name string) string) func(name string) bool {
 	return func(name string) bool {
 		gctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		macs, err := corrosion.GuardedMACsOf(gctx, db, name)
+		macs, err := corrosion.GuardedMACsOfIncarnation(gctx, db, name, creating(name))
 		return err != nil || len(macs) > 0
 	}
 }

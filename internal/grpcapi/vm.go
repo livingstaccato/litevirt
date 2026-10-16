@@ -5851,7 +5851,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		return nil, status.Errorf(codes.Internal, "read NICs for %q: %v", req.Name, err)
 	}
 	ifaces := nicInterfaceRecords(nicRows)
-	rowModels, reattached, err := corrosion.NICModelSources(ctx, s.db, req.Name, nicRows)
+	rowModels, reattached, err := corrosion.NICModelSources(ctx, s.db, req.Name, nicRows, compose.SpecNICModelsByMAC(spec))
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read NIC models for %q: %v", req.Name, err)
 	}

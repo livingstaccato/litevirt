@@ -2398,7 +2398,7 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		slog.Error("reconciler: get VM interfaces", "vm", vm.Name, "error", err)
 		return "", true, fmt.Sprintf("get interfaces: %v", err) // transient DB
 	}
-	rowModels, reattached, err := corrosion.NICModelSources(ctx, r.db, vm.Name, ifaces)
+	rowModels, reattached, err := corrosion.NICModelSources(ctx, r.db, vm.Name, ifaces, compose.SpecNICModelsByMAC(spec))
 	if err != nil {
 		slog.Error("reconciler: get VM NIC models", "vm", vm.Name, "error", err)
 		return "", true, fmt.Sprintf("get NIC models: %v", err) // transient DB

@@ -36,7 +36,8 @@ func NICDetachRequestHash(vmName, mac string) string {
 // on vmName, keyed by lower-cased MAC. A live NIC with such a MAC was
 // attached again after that detach, so it is not the NIC the create recorded
 // under the MAC. Operation headers are soft-deleted when reaped, never
-// removed, so a reaped detach still counts.
+// removed, so a reaped detach still counts: nothing may hard-delete them
+// (TestOperationHeadersAreNeverHardDeleted).
 func DetachedNICMACs(ctx context.Context, c *Client, vmName string, macs []string) (map[string]bool, error) {
 	rows, err := c.Query(ctx,
 		`SELECT request_hash FROM operations WHERE resource_kind = 'vm' AND resource_id = ? AND operation_kind = ?`,
@@ -60,13 +61,24 @@ func DetachedNICMACs(ctx context.Context, c *Client, vmName string, macs []strin
 // NICModelSources reads what a domain builder needs to give each of vmName's
 // live NICs its recorded model (compose.NICModels): the vm_nics models and
 // which NICs were detached and attached again under the same MAC.
-func NICModelSources(ctx context.Context, c *Client, vmName string, nics []NICRecord) (rowModels map[string]string, reattached map[string]bool, err error) {
+// specModels is the spec's model per MAC (compose.SpecNICModelsByMAC). The
+// operations are read only for a NIC whose row and spec entry disagree on
+// its model — the only case the answer changes — so a render of an ordinary
+// VM reads no operations at all.
+func NICModelSources(ctx context.Context, c *Client, vmName string, nics []NICRecord, specModels map[string]string) (rowModels map[string]string, reattached map[string]bool, err error) {
 	if rowModels, err = VMNICRowModels(ctx, c, vmName); err != nil {
 		return nil, nil, err
 	}
-	macs := make([]string, 0, len(nics))
+	var macs []string
 	for _, n := range nics {
-		macs = append(macs, n.MAC)
+		k := strings.ToLower(n.MAC)
+		sm, rm := specModels[k], rowModels[k]
+		if sm != "" && rm != "" && !strings.EqualFold(sm, rm) {
+			macs = append(macs, n.MAC)
+		}
+	}
+	if len(macs) == 0 {
+		return rowModels, map[string]bool{}, nil
 	}
 	if reattached, err = DetachedNICMACs(ctx, c, vmName, macs); err != nil {
 		return nil, nil, err

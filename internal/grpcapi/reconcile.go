@@ -104,7 +104,7 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 	if err != nil {
 		return status.Errorf(codes.Internal, "read NICs for %q: %v", vm.Name, err)
 	}
-	rowModels, reattached, err := corrosion.NICModelSources(ctx, s.db, vm.Name, nics)
+	rowModels, reattached, err := corrosion.NICModelSources(ctx, s.db, vm.Name, nics, compose.SpecNICModelsByMAC(spec))
 	if err != nil {
 		return status.Errorf(codes.Internal, "read NIC models for %q: %v", vm.Name, err)
 	}

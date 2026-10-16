@@ -336,6 +336,10 @@ func (c *Client) CompleteVMOperation(ctx context.Context, vmName, operationID st
 // operation, and the reservation it carries, forever. err is reserved for the
 // pass itself: the opening reads failed, the context ended, or this node's
 // writes are quarantined.
+//
+// Reaping soft-deletes and never removes a header: DetachedNICMACs reads
+// reaped NIC-detach headers to tell a NIC attached again under a MAC from the
+// one the spec recorded (TestOperationHeadersAreNeverHardDeleted).
 func ReapTerminalOperations(ctx context.Context, c *Client, retention time.Duration) (reaped int, failures []OperationReapFailure, err error) {
 	cutoff := time.Now().Add(-retention)
 

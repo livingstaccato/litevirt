@@ -226,7 +226,7 @@ func (c *Client) parkableUpdate(s Statement) (StmtShape, []string, []interface{}
 	if entry.RequiresCapability != "" && entry.DispositionAfter != "" && c.capabilityActive(entry.RequiresCapability) {
 		disp = entry.DispositionAfter
 	}
-	if disp != DispFullPKUpdate && disp != DispLiveRowUpdate && disp != DispHostReadmit {
+	if disp != DispFullPKUpdate && disp != DispLiveRowUpdate && disp != DispHostReadmit && disp != DispSpecGeneration {
 		return StmtShape{}, nil, nil, false
 	}
 	pk, ok := pkValuesFromShape(sh, s)

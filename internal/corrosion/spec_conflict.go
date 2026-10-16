@@ -1,5 +1,10 @@
 package corrosion
 
+import (
+	"database/sql"
+	"log/slog"
+)
+
 // Two edits of one VM's desired spec made from the same spec_generation.
 //
 // Every out-of-band edit (MutateDesiredSpec) and every operation's claim
@@ -42,4 +47,26 @@ func (c *Client) SetSpecConflictGate(fn func() bool) {
 func (c *Client) SpecConflictOn() bool {
 	fn := c.specConflictGate.Load()
 	return fn != nil && (*fn)()
+}
+
+// specEditDrop is one desired-spec edit a conflict resolution dropped.
+type specEditDrop struct {
+	vm, host   string
+	epoch, gen int64 // the kept version's owner epoch and generation
+	reason     string
+	path       resolveTiePath
+	keptAt     string // updated_at of the version kept
+	droppedAt  string // updated_at of the edit dropped
+	// droppedSpec is the dropped edit's whole spec, so it can be made again.
+	droppedSpec string
+}
+
+// noteSpecEditDropped records d once tx commits: a rolled-back resolution
+// dropped nothing.
+func (c *Client) noteSpecEditDropped(tx *sql.Tx, d specEditDrop) {
+	c.deferAfterCommit(tx, func() {
+		slog.Warn("replication: a concurrent edit of a VM's spec was dropped",
+			"vm", d.vm, "generation", d.gen, "owner_epoch", d.epoch, "reason", d.reason, "path", string(d.path),
+			"kept_updated_at", d.keptAt, "dropped_updated_at", d.droppedAt)
+	})
 }

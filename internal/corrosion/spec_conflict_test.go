@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
 func decodeStmts(t *testing.T, raw string) []Statement {
@@ -59,6 +62,197 @@ func TestMutateDesiredSpec_CarriesTheOwnerEpochOnlyOnceLatched(t *testing.T) {
 		}
 		if _, ok := LedgerLookup(want); !ok {
 			t.Errorf("latched=%v: the emitted shape is not in the ledger", latched)
+		}
+	}
+}
+
+// specPeer is one replica: its client, its replicator, and how many of its own
+// mutations have been handed out.
+type specPeer struct {
+	name string
+	c    *Client
+	r    *Replicator
+	sent int
+}
+
+func newSpecPeers(t *testing.T, latched bool, names ...string) []*specPeer {
+	t.Helper()
+	out := make([]*specPeer, len(names))
+	for i, n := range names {
+		c := testClient(t)
+		if latched {
+			specConflictOn(c)
+		}
+		out[i] = &specPeer{name: n, c: c, r: NewReplicator(c, "", RelayConfig{})}
+	}
+	return out
+}
+
+// news returns p's mutations not yet handed out.
+func (p *specPeer) news(t *testing.T) []*pb.MutationEntry {
+	t.Helper()
+	all := walEntries(t, p.c, p.name)
+	out := all[p.sent:]
+	p.sent = len(all)
+	return out
+}
+
+func vmSpecOn(t *testing.T, p *specPeer) *VMRecord {
+	t.Helper()
+	vm, err := GetVM(context.Background(), p.c, "vm1")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM vm1 on %s: %v %v", p.name, vm, err)
+	}
+	return vm
+}
+
+// seedEverywhere creates vm1 on peers[0] and replicates it to the rest.
+func seedEverywhere(t *testing.T, peers []*specPeer) {
+	t.Helper()
+	seedVM(t, peers[0].c, "vm1", `{"cpu":2}`)
+	e := peers[0].news(t)
+	for _, p := range peers[1:] {
+		applyWAL(t, p.r, e)
+	}
+}
+
+func setSpec(t *testing.T, p *specPeer, spec string) {
+	t.Helper()
+	if applied, _, err := MutateDesiredSpec(context.Background(), p.c, "vm1", func(string) (string, error) { return spec, nil }); err != nil || !applied {
+		t.Fatalf("edit on %s: applied=%v err=%v", p.name, applied, err)
+	}
+}
+
+// Two out-of-band edits from one generation, one on each side of a cut. Every
+// replica, in whichever order it hears them, keeps the later one — the version
+// anti-entropy keeps — rather than whichever came first.
+//
+// Red before the resolution: a and b each keep their own, c and d whichever
+// came first.
+func TestSpecConflict_SiblingEditsConvergeOnTheLaterEdit(t *testing.T) {
+	peers := newSpecPeers(t, true, "a", "b", "c", "d")
+	a, b, c, d := peers[0], peers[1], peers[2], peers[3]
+	seedEverywhere(t, peers)
+
+	setSpec(t, a, `{"cpu":4}`)
+	time.Sleep(5 * time.Millisecond)
+	setSpec(t, b, `{"cpu":2,"labels":{"tier":"front"}}`)
+	ea, eb := a.news(t), b.news(t)
+
+	applyWAL(t, a.r, eb)
+	applyWAL(t, b.r, ea)
+	applyWAL(t, c.r, ea)
+	applyWAL(t, c.r, eb)
+	applyWAL(t, d.r, eb)
+	applyWAL(t, d.r, ea)
+
+	want := vmSpecOn(t, b)
+	for _, p := range peers {
+		got := vmSpecOn(t, p)
+		if got.Spec != `{"cpu":2,"labels":{"tier":"front"}}` || got.SpecGeneration != 1 || got.UpdatedAt != want.UpdatedAt {
+			t.Errorf("%s holds %s@%d (%s), want b's later edit at 1 (%s)", p.name, got.Spec, got.SpecGeneration, got.UpdatedAt, want.UpdatedAt)
+		}
+	}
+}
+
+// The owner claims vm1 for an operation while a cut-off replica edits it at
+// the same generation, later. The claim wins on every replica: the owner keeps
+// its barrier, the replica takes the claim, and the owner's completion then
+// clears it everywhere.
+//
+// Red before the resolution: b keeps its edit, so the barrier and the
+// operation's spec never reach it and the completion's CAS misses there.
+func TestSpecConflict_AnOperationsClaimBeatsAnOutOfBandEditAtItsGeneration(t *testing.T) {
+	peers := newSpecPeers(t, true, "a", "b", "c")
+	a, b, c := peers[0], peers[1], peers[2]
+	seedEverywhere(t, peers)
+	ctx := context.Background()
+
+	op := OperationRecord{ID: "op-1", Method: "UpdateVM", ResourceKind: "vm", ResourceID: "vm1",
+		OperationKind: string(OpResourceUpdateRunning), RequestHash: "h"}
+	if ok, err := a.c.BeginVMOperation(ctx, op, `{"cpu":4}`, 0, 0); err != nil || !ok {
+		t.Fatalf("BeginVMOperation: %v %v", ok, err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	setSpec(t, b, `{"cpu":2,"labels":{"tier":"front"}}`)
+	ea, eb := a.news(t), b.news(t)
+
+	applyWAL(t, a.r, eb)
+	applyWAL(t, b.r, ea)
+	applyWAL(t, c.r, eb)
+	applyWAL(t, c.r, ea)
+	for _, p := range peers {
+		if got := vmSpecOn(t, p); got.Spec != `{"cpu":4}` || got.ActiveOperationID != "op-1" {
+			t.Errorf("%s holds %s with barrier %q mid-operation, want the claim's spec under op-1", p.name, got.Spec, got.ActiveOperationID)
+		}
+	}
+
+	if ok, err := a.c.CompleteVMOperation(ctx, "vm1", "op-1", 0, 1); err != nil || !ok {
+		t.Fatalf("the owner cannot complete op-1: %v %v", ok, err)
+	}
+	ec := a.news(t)
+	applyWAL(t, b.r, ec)
+	applyWAL(t, c.r, ec)
+	for _, p := range peers {
+		if got := vmSpecOn(t, p); got.Spec != `{"cpu":4}` || got.ActiveOperationID != "" {
+			t.Errorf("%s after completion: %s, barrier %q", p.name, got.Spec, got.ActiveOperationID)
+		}
+	}
+}
+
+// Until spec_conflict_v1 has latched nothing changes: an operation's claim
+// meeting an edit at its generation misses its CAS as before.
+func TestSpecConflict_BeforeTheLatchAClaimMeetingAnEditMissesAsBefore(t *testing.T) {
+	peers := newSpecPeers(t, false, "a", "b")
+	a, b := peers[0], peers[1]
+	seedEverywhere(t, peers)
+	op := OperationRecord{ID: "op-1", Method: "UpdateVM", ResourceKind: "vm", ResourceID: "vm1",
+		OperationKind: string(OpResourceUpdateRunning), RequestHash: "h"}
+	if ok, err := a.c.BeginVMOperation(context.Background(), op, `{"cpu":4}`, 0, 0); err != nil || !ok {
+		t.Fatalf("BeginVMOperation: %v %v", ok, err)
+	}
+	setSpec(t, b, `{"cpu":2,"labels":{"tier":"front"}}`)
+	applyWAL(t, b.r, a.news(t))
+	if got := vmSpecOn(t, b); got.ActiveOperationID != "" || got.Spec != `{"cpu":2,"labels":{"tier":"front"}}` {
+		t.Errorf("before the latch b resolved the claim: %s, barrier %q", got.Spec, got.ActiveOperationID)
+	}
+}
+
+func TestResolveSpecEdit(t *testing.T) {
+	const t1, t2 = "2026-10-16T10:00:00.000000001Z", "2026-10-16T10:00:00.000000002Z"
+	row := func(epoch, gen int64, op, spec, ts string) specRow {
+		return specRow{epoch: epoch, gen: gen, activeOp: op, spec: spec, updatedAt: ts}
+	}
+	edit := func(epoch, from int64, op, spec, ts string) specEdit {
+		return specEdit{epoch: epoch, fromGen: from, opID: op, spec: spec, updatedAt: ts}
+	}
+	cases := []struct {
+		name     string
+		local    specRow
+		in       specEdit
+		finished bool
+		want     specDecision
+	}{
+		{"no sibling", row(1, 3, "", "A", t1), edit(1, 3, "", "B", t2), false, specDecision{verdict: specApplyAsBefore}},
+		{"no sibling, superseded owner", row(2, 3, "", "A", t1), edit(1, 3, "", "B", t2), false, specDecision{specKeepLocal, specDropStaleEpoch}},
+		{"row ahead by two", row(1, 5, "", "A", t1), edit(1, 3, "", "B", t2), false, specDecision{verdict: specApplyAsBefore}},
+		{"row behind", row(1, 2, "", "A", t1), edit(1, 3, "", "B", t2), false, specDecision{verdict: specApplyAsBefore}},
+		{"this edit, already here", row(1, 4, "", "B", t2), edit(1, 3, "", "B", t2), false, specDecision{verdict: specKeepLocal}},
+		{"sibling from a superseded owner", row(2, 4, "", "A", t1), edit(1, 3, "", "B", t2), false, specDecision{specKeepLocal, specDropStaleEpoch}},
+		{"sibling from a newer owner", row(1, 4, "", "A", t2), edit(2, 3, "", "B", t1), false, specDecision{verdict: specApplyAsBefore}},
+		{"later edit wins", row(1, 4, "", "A", t1), edit(1, 3, "", "B", t2), false, specDecision{specTakeEdit, specDropLaterEdit}},
+		{"earlier edit loses", row(1, 4, "", "A", t2), edit(1, 3, "", "B", t1), false, specDecision{specKeepLocal, specDropLaterEdit}},
+		{"exact tie keeps local", row(1, 4, "", "A", t1), edit(1, 3, "", "B", t1), false, specDecision{specKeepLocal, specDropTie}},
+		{"same spec drops nothing", row(1, 4, "", "B", t1), edit(1, 3, "", "B", t2), false, specDecision{verdict: specTakeEdit}},
+		{"barrier beats a later edit", row(1, 4, "op", "A", t1), edit(1, 3, "", "B", t2), false, specDecision{specKeepLocal, specDropOperation}},
+		{"claim beats a later edit", row(1, 4, "", "A", t2), edit(1, 3, "op", "B", t1), false, specDecision{specTakeEdit, specDropOperation}},
+		{"a finished claim changes nothing", row(1, 4, "", "B", t2), edit(1, 3, "op", "B", t1), true, specDecision{verdict: specKeepLocal}},
+		{"its own claim", row(1, 4, "op", "B", t2), edit(1, 3, "op", "B", t1), false, specDecision{verdict: specKeepLocal}},
+		{"another operation's barrier", row(1, 4, "op2", "A", t1), edit(1, 3, "op", "B", t2), false, specDecision{specKeepLocal, specDropOperation}},
+	}
+	for _, tc := range cases {
+		if got := resolveSpecEdit(tc.local, tc.in, tc.finished); got != tc.want {
+			t.Errorf("%s: got %+v, want %+v", tc.name, got, tc.want)
 		}
 	}
 }

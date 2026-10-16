@@ -828,7 +828,10 @@ firewall tag; copy one over with `lv firewall tag set`.
 - When another live workload holds the same identity (a copy), `tag set` and
   `tag rm` give the workload its own identity and clear the copied
   identity's tags from both; the output names the identity replaced and the
-  tags cleared.
+  tags cleared, and the clear leaves its own `firewall.tag.rm` audit row.
+- Two tag sets of one workload sent to two hosts during a move's handover,
+  when each host still believes it owns the workload, keep the last write;
+  both are audited.
 - A restore into a freed name, and a rebuild or recreate that fails after
   tearing the VM down, print the tags the deleted incarnation left and the
   `lv firewall tag set` command that sets them again.

@@ -229,6 +229,141 @@ func TestSetFirewallTags_AFailedCopiedClearChangesNothingAndARetryCompletes(t *t
 	}
 }
 
+// copiedPair is two running VMs, web and copy, holding identity fwA, whose
+// tags row holds role=db.
+func copiedPair(t *testing.T) *Server {
+	t.Helper()
+	s, _ := tagsServer(t)
+	for _, n := range []string{"web", "copy"} {
+		insertTestVM(t, adminCtx(), s.db, n, s.hostName, "running")
+		setVMSpec(t, s, n, `{"name":"`+n+`","firewall_id":"`+fwA+`"}`)
+	}
+	seedTagsFor(t, s, corrosion.TagMemberVM, fwA, map[string]string{"role": "db"}, "copy", "")
+	return s
+}
+
+// Once the copied identity's clear has committed, a tag set that then fails
+// still leaves the clear's own audit row naming the tags dropped, and an
+// error row for the set (re-review I-A).
+//
+// Mutations: drop the clear's audit row — red; drop the error-exit audit —
+// red.
+func TestSetFirewallTags_ACommittedCopiedClearIsAuditedWhenTheSetFails(t *testing.T) {
+	s := copiedPair(t)
+	s.testFirewallTagsBeforeMint = func() {
+		if err := s.db.Execute(context.Background(), `UPDATE vms SET active_operation_id = 'op-1' WHERE name = 'web'`); err != nil {
+			t.Error(err)
+		}
+	}
+	_, err := s.SetFirewallTags(adminCtx(), &pb.SetFirewallTagsRequest{Kind: "vm", Workload: "web", Set: map[string]string{"role": "web"}})
+	if status.Code(err) != codes.Aborted {
+		t.Fatalf("a mint refused after the clear: %v, want Aborted", err)
+	}
+	if v, _ := tagsRowValue(t, s, corrosion.TagMemberVM, fwA); v != "" {
+		t.Fatalf("premise: the copied identity's row holds %q", v)
+	}
+	wantAudit(t, s, "firewall.tag.rm", "admin", "web", "fw_id="+fwA+" copied_identity_cleared before={role=db} after=none")
+	got := lastAuditRow(t, s, "firewall.tag.set")
+	if !got.found || got.result != "error" || !strings.Contains(got.detail, "dropped={role=db}") {
+		t.Fatalf("the failed set's audit row: %+v", got)
+	}
+}
+
+// A caller that goes away once the copied identity's clear has committed
+// does not cut the tag set short: it completes and is audited (re-review
+// I-A).
+//
+// Mutation: run the steps after the clear on the request's context — the
+// mint fails on the cancelled context: red.
+func TestSetFirewallTags_ACancelAfterTheCopiedClearStillCompletes(t *testing.T) {
+	s := copiedPair(t)
+	ctx, cancel := context.WithCancel(adminCtx())
+	defer cancel()
+	s.testFirewallTagsBeforeMint = cancel
+	out, err := s.SetFirewallTags(ctx, &pb.SetFirewallTagsRequest{Kind: "vm", Workload: "web", Set: map[string]string{"role": "web"}})
+	if err != nil {
+		t.Fatalf("a cancel after the clear: %v", err)
+	}
+	if id := vmFWID(t, s, "web"); id == fwA || id != out.GetFwId() {
+		t.Fatalf("identity %q, answer %q", id, out.GetFwId())
+	}
+	wantAudit(t, s, "firewall.tag.set", "admin", "web",
+		"fw_id="+out.GetFwId()+" replaced_copied_fw_id="+fwA+" dropped={role=db} before=none after={role=web}")
+}
+
+// A copy that appears between the copied-identity check and the mint is
+// cleared after the mint (re-review m-A): the answer names it and the tags
+// dropped; when that clear fails, the error says the workload now has its
+// own identity with no tags.
+//
+// Mutations: skip the post-mint clear — the other holder keeps the tags:
+// red; drop "with no tags" from its error — red.
+func TestSetFirewallTags_ACopyThatAppearsBeforeTheMint(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("clear fails %v", fail), func(t *testing.T) {
+			s, _ := tagsServer(t)
+			insertTestVM(t, adminCtx(), s.db, "web", s.hostName, "running")
+			insertTestVM(t, adminCtx(), s.db, "copy", s.hostName, "running")
+			first, err := s.SetFirewallTags(adminCtx(), &pb.SetFirewallTagsRequest{Kind: "vm", Workload: "web", Set: map[string]string{"role": "web"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			f := first.GetFwId()
+			s.testFirewallTagsBeforeMint = func() { setVMSpec(t, s, "copy", `{"name":"copy","firewall_id":"`+f+`"}`) }
+			if fail {
+				s.testClearFirewallTags = func(context.Context, string, string) error { return errors.New("disk full") }
+			}
+			out, err := s.SetFirewallTags(adminCtx(), &pb.SetFirewallTagsRequest{Kind: "vm", Workload: "web", Set: map[string]string{"env": "prod"}})
+			id := vmFWID(t, s, "web")
+			if id == f {
+				t.Fatalf("premise: the copy was not replaced")
+			}
+			if fail {
+				if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "now has its own, "+id+", with no tags") {
+					t.Fatalf("a failed post-mint clear: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if out.GetReplacedFwId() != f || !maps.Equal(out.GetDroppedTags(), map[string]string{"role": "web"}) {
+				t.Fatalf("answer %+v", out)
+			}
+			if v, _ := tagsRowValue(t, s, corrosion.TagMemberVM, f); v != "" {
+				t.Fatalf("the other holder keeps %q", v)
+			}
+		})
+	}
+}
+
+// A write that lands on the tags row between a tag set's read and its write
+// (one replicated from another host that also believes it owns the
+// workload) is not overwritten: the set is refused with a retry
+// (re-review m-B).
+//
+// Mutation: drop the re-read check — the set overwrites it: red.
+func TestSetFirewallTags_ARowChangedMeanwhileIsNotOverwritten(t *testing.T) {
+	s, _ := tagsServer(t)
+	insertTestVM(t, adminCtx(), s.db, "web", s.hostName, "running")
+	first, err := s.SetFirewallTags(adminCtx(), &pb.SetFirewallTagsRequest{Kind: "vm", Workload: "web", Set: map[string]string{"x": "1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.testFirewallTagsBeforeWrite = func() {
+		time.Sleep(5 * time.Millisecond)
+		seedTagsFor(t, s, corrosion.TagMemberVM, first.GetFwId(), map[string]string{"x": "1", "b": "2"}, "web", "")
+	}
+	_, err = s.SetFirewallTags(adminCtx(), &pb.SetFirewallTagsRequest{Kind: "vm", Workload: "web", Set: map[string]string{"a": "1"}})
+	if status.Code(err) != codes.Aborted || !strings.Contains(err.Error(), "changed meanwhile; retry") {
+		t.Fatalf("a row changed meanwhile: %v, want Aborted", err)
+	}
+	rec, _, _ := corrosion.ResolveFirewallTags(context.Background(), s.db, corrosion.TagMemberVM, first.GetFwId())
+	if !maps.Equal(rec.Tags, map[string]string{"x": "1", "b": "2"}) {
+		t.Fatalf("the row holds %v, want the other write's", rec.Tags)
+	}
+}
+
 // Two tag sets of one workload at once keep both updates (D3 review m-2): the
 // second waits while the first holds the row between its read and its write.
 //

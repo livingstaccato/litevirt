@@ -484,6 +484,9 @@ type Server struct {
 	// testFirewallTagsBeforeWrite is a test seam: a tag set calls it between
 	// reading the workload's tags and writing them.
 	testFirewallTagsBeforeWrite func()
+	// testFirewallTagsBeforeMint is a test seam: a tag set calls it between
+	// its copied-identity check (and clear) and the mint.
+	testFirewallTagsBeforeMint func()
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that

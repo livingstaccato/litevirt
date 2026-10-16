@@ -141,11 +141,11 @@ func TestSeedNetworkConfig_FollowsHotplug(t *testing.T) {
 // A NIC attached by an earlier build can share its ordinal with a NIC that
 // stayed (attach numbered by the count of NICs left after a detach). Without a
 // prior seed (a rebuild where none is readable) every live NIC still gets its
-// own name: B the eth1 create gave it, and C, whose eth<ordinal> B holds, the
-// lowest eth<n> free above the NICs that were there.
+// own name: B the eth1 create gave it, and C, whose ordinal B has, a name
+// from its MAC (T2 review m4: never a detached NIC's eth<n>).
 //
-// Mutation: name an attached NIC by its ordinal whether or not it is free —
-// eth1 twice.
+// Mutation: name an attached NIC by its ordinal whether or not another NIC
+// has it — eth1 twice.
 func TestSeedNetworkConfig_SharedOrdinalGetsItsOwnName(t *testing.T) {
 	db, spec := hotplugSeedDB(t)
 	ctx := context.Background()
@@ -157,7 +157,7 @@ func TestSeedNetworkConfig_SharedOrdinalGetsItsOwnName(t *testing.T) {
 	}
 	for _, want := range []string{
 		"  eth1:\n    match:\n      macaddress: \"52:54:00:00:0b:0b\"\n    set-name: eth1\n",
-		"  eth2:\n    match:\n      macaddress: \"52:54:00:00:0c:0c\"\n    set-name: eth2\n",
+		"  lv525400000c0c:\n    match:\n      macaddress: \"52:54:00:00:0c:0c\"\n    set-name: lv525400000c0c\n",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("want\n%s\nin:\n%s", want, got)

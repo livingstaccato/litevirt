@@ -113,11 +113,36 @@ func SeedNetworkConfig(ctx context.Context, db *corrosion.Client, vmName string,
 		nic.Ordinal = k
 		nics = append(nics, nic)
 	}
-	created, err := createdNames(ctx, db, vmName, spec, rows, entryOf)
+	// Every row the VM's NICs ever had, a detach's tombstone included.
+	var all []corrosion.NICRecord
+	for _, table := range []string{"vm_nics", "vm_interfaces"} {
+		raw, err := corrosion.GetVMNICsRaw(ctx, db, table, vmName)
+		if err != nil {
+			return "", fmt.Errorf("read NICs of %q: %w", vmName, err)
+		}
+		all = append(all, raw...)
+	}
+	sort.SliceStable(all, func(a, b int) bool {
+		return strings.ToLower(all[a].MAC) < strings.ToLower(all[b].MAC)
+	})
+	created, err := createdNames(ctx, db, spec, rows, entryOf, all)
 	if err != nil {
 		return "", err
 	}
-	prior.names(nics, rows, entryOf, created)
+	// An ordinal another NIC of the VM ever had, or a spec position: only an
+	// earlier build's attach (or two attaches racing) gives a NIC one.
+	shared := map[int]bool{}
+	macsAt := map[int]map[string]bool{}
+	for _, r := range all {
+		if macsAt[r.Ordinal] == nil {
+			macsAt[r.Ordinal] = map[string]bool{}
+		}
+		macsAt[r.Ordinal][strings.ToLower(r.MAC)] = true
+	}
+	for o, m := range macsAt {
+		shared[o] = len(m) > 1 || o < len(spec.Network)
+	}
+	prior.names(nics, rows, entryOf, created, shared)
 	return NetworkConfig(nics), nil
 }
 
@@ -148,26 +173,16 @@ func seedNIC(ctx context.Context, db *corrosion.Client, r corrosion.NICRecord, n
 // nothing to configure is not listed). Create wrote one NIC per entry, in
 // spec order, from the entry and its NIC row, so the document is derived
 // again from the same facts: the live row each entry has (entryOf), else the
-// row a detach left (a tombstone), else the entry alone.
-func createdNames(ctx context.Context, db *corrosion.Client, vmName string, spec *pb.VMSpec, rows []corrosion.NICRecord, entryOf []int) (map[int]string, error) {
+// row a detach left (a tombstone, among gone: every row, sorted by MAC), else
+// the entry alone. The facts include each network's definition as it is now:
+// a network whose definition changed since create in a way that changes what
+// its NICs are configured with can change these names.
+func createdNames(ctx context.Context, db *corrosion.Client, spec *pb.VMSpec, rows []corrosion.NICRecord, entryOf []int, gone []corrosion.NICRecord) (map[int]string, error) {
 	rowOf := make(map[int]corrosion.NICRecord, len(spec.Network))
 	for k, i := range entryOf {
 		if i >= 0 {
 			rowOf[i] = rows[k]
 		}
-	}
-	var gone []corrosion.NICRecord
-	if len(rowOf) < len(spec.Network) {
-		for _, table := range []string{"vm_nics", "vm_interfaces"} {
-			raw, err := corrosion.GetVMNICsRaw(ctx, db, table, vmName)
-			if err != nil {
-				return nil, fmt.Errorf("read NICs of %q: %w", vmName, err)
-			}
-			gone = append(gone, raw...)
-		}
-		sort.SliceStable(gone, func(a, b int) bool {
-			return strings.ToLower(gone[a].MAC) < strings.ToLower(gone[b].MAC)
-		})
 	}
 	nics := make([]NIC, len(spec.Network))
 	macs := make([]string, len(spec.Network))
@@ -329,14 +344,16 @@ func PriorFrom(networkConfig string, added ...string) *Prior {
 //     (nextNICOrdinal), so the name is free, never a detached NIC's and never
 //     the kernel name eth<n> of a NIC the seed leaves unnamed (a guest booted
 //     with net.ifnames=0 numbers them eth0..). One an earlier build attached
-//     can share an ordinal: it takes the lowest eth<n> no other NIC holds,
-//     counting each NIC that is not new as holding one of eth0..eth<N-1>.
+//     (or two attaches racing) can have an ordinal another NIC of the VM ever
+//     had, live or detached, or a spec position (shared): it takes
+//     lv<its MAC's hex digits>, a name no other NIC has, a detached one
+//     included, and that no later attach changes.
 //
 // p, the seed being replaced, wins where it knows: a NIC it lists keeps its
 // listing, one it marks attached since is new, and — unless p is Stale — one it
 // does not list stays unnamed (a NIC an earlier build attached, or one a seed
 // from before litevirt named NICs left to the kernel).
-func (p *Prior) names(nics []NIC, rows []corrosion.NICRecord, entryOf []int, created map[int]string) {
+func (p *Prior) names(nics []NIC, rows []corrosion.NICRecord, entryOf []int, created map[int]string, shared map[int]bool) {
 	used := map[string]bool{}
 	kept := 0
 	keep := func(k int, name string) {
@@ -374,20 +391,13 @@ func (p *Prior) names(nics []NIC, rows []corrosion.NICRecord, entryOf []int, cre
 	for i := 0; i < kept; i++ {
 		used[fmt.Sprintf("eth%d", i)] = true
 	}
-	var clash []int
 	for _, k := range added {
-		if n := fmt.Sprintf("eth%d", rows[k].Ordinal); rows[k].Ordinal >= 0 && !used[n] {
-			nics[k].Name, used[n] = n, true
-			continue
+		n := fmt.Sprintf("eth%d", rows[k].Ordinal)
+		if rows[k].Ordinal < 0 || shared[rows[k].Ordinal] || used[n] {
+			// Not an ordinal this NIC alone ever had: a name from its MAC,
+			// which no other NIC has, and which no later attach changes.
+			n = "lv" + strings.ReplaceAll(strings.ToLower(nics[k].MAC), ":", "")
 		}
-		clash = append(clash, k)
-	}
-	for _, k := range clash {
-		for i := 0; ; i++ {
-			if n := fmt.Sprintf("eth%d", i); !used[n] {
-				nics[k].Name, used[n] = n, true
-				break
-			}
-		}
+		nics[k].Name, used[n] = n, true
 	}
 }

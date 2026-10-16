@@ -94,7 +94,7 @@ func TestSeedNetworkConfig_FirstAttachToAOneNICVMRenamesNothing(t *testing.T) {
 // Review I-1: an attach whose NIC shares an ordinal with a kept NIC (an
 // earlier build's attach) renames nothing, and the new NIC's name does not
 // depend on how the MACs sort: the kept NICs keep their names and the new one
-// takes the lowest eth<n> free.
+// takes lv<its MAC> (its ordinal is B's).
 //
 // Mutation: ignore the prior names — whichever MAC sorts first takes eth1.
 func TestSeedNetworkConfig_SharedOrdinalAttachIsDeterministic(t *testing.T) {
@@ -112,8 +112,8 @@ func TestSeedNetworkConfig_SharedOrdinalAttachIsDeterministic(t *testing.T) {
 		}
 		if !strings.Contains(got, "macaddress: \"52:54:00:00:0a:0a\"\n    set-name: eth0\n") ||
 			!strings.Contains(got, namedEntry("eth1", "52:54:00:00:0b:0b")) ||
-			!strings.Contains(got, namedEntry("eth2", newMAC)) {
-			t.Errorf("new NIC %s: want A eth0, B eth1, new eth2:\n%s", newMAC, got)
+			!strings.Contains(got, namedEntry("lv"+strings.ReplaceAll(newMAC, ":", ""), newMAC)) {
+			t.Errorf("new NIC %s: want A eth0, B eth1, new lv<MAC>:\n%s", newMAC, got)
 		}
 	}
 }
@@ -178,5 +178,39 @@ func TestSeedNetworkConfig_AttachedNameSkipsUnnamedKernelNames(t *testing.T) {
 	}
 	if !strings.Contains(got, namedEntry("eth2", "52:54:00:00:0c:0c")) {
 		t.Errorf("want Z eth2 (eth1 is the unnamed B's kernel name):\n%s", got)
+	}
+}
+
+// T2 review m4: a NIC whose ordinal another NIC has (an earlier build's
+// attach after a detach) never takes a detached NIC's name. X, attached and
+// named eth2, is detached; Y is then attached at B's ordinal. The lowest free
+// eth<n> was eth2, X's; Y takes lv<its MAC>, with a seed or without, and keeps
+// it after a later attach.
+//
+// Mutation: fall back to the lowest free eth<n> — Y is eth2.
+func TestSeedNetworkConfig_ASharedOrdinalNeverTakesADetachedNICsName(t *testing.T) {
+	db, spec := hotplugSeedDB(t)
+	ctx := context.Background()
+	const macX, macY, macZ = "52:54:00:00:0d:0d", "52:54:00:00:0e:0e", "52:54:00:00:0f:0f"
+	hotAttachRows(t, db, true, "dnet", macX, 2)
+	withX, err := SeedNetworkConfig(ctx, db, "hp", spec, nil)
+	if err != nil || !strings.Contains(withX, namedEntry("eth2", macX)) {
+		t.Fatalf("setup: X is not eth2: %v\n%s", err, withX)
+	}
+	hotDetachRows(t, db, true, macX)
+	hotAttachRows(t, db, true, "dnet", macY, 1)
+	for name, prior := range map[string]*Prior{"no seed": nil, "the seed of the attach": PriorFrom(withX, macY)} {
+		got, err := SeedNetworkConfig(ctx, db, "hp", spec, prior)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(got, "eth2") || !strings.Contains(got, namedEntry("lv525400000e0e", macY)) {
+			t.Errorf("%s: want Y lv525400000e0e, and no eth2:\n%s", name, got)
+		}
+	}
+	hotAttachRows(t, db, true, "dnet", macZ, 3)
+	if got, err := SeedNetworkConfig(ctx, db, "hp", spec, nil); err != nil ||
+		!strings.Contains(got, namedEntry("lv525400000e0e", macY)) || !strings.Contains(got, namedEntry("eth3", macZ)) {
+		t.Errorf("after a later attach, want Y unchanged and Z eth3: %v\n%s", err, got)
 	}
 }

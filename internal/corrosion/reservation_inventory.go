@@ -175,10 +175,20 @@ func hostReservations(ctx context.Context, c *Client, host string, tolerate bool
 // ClassifyReservation classifies one operation's reservation. It returns nil
 // when the operation holds no counted reservation (absent, reaped, terminal at
 // its header epoch, or not attributable to its project's current authority).
+//
+// Another operation whose reservation data cannot be read does not stop it.
+// When opID's own data cannot be read, it fails closed with
+// ErrReservationUnreadable: nothing may release a reservation it could not
+// classify.
 func ClassifyReservation(ctx context.Context, c *Client, opID string) (*HostReservationView, error) {
-	byID, admitted, err := nonterminalReservationsByID(ctx, c)
+	byID, admitted, bad, err := nonterminalReservationsScan(ctx, c, true)
 	if err != nil {
 		return nil, err
+	}
+	for _, b := range bad {
+		if b.OperationID == opID {
+			return nil, fmt.Errorf("%w: %w", ErrReservationUnreadable, b.Err)
+		}
 	}
 	rv, ok := byID[opID]
 	if !ok {
@@ -338,6 +348,10 @@ var (
 	// tombstoned release row holds the key the release would be written at, so
 	// it cannot be released by a written terminal.
 	ErrReservationReleaseBlocked = errors.New("reservation release blocked")
+	// ErrReservationUnreadable: the operation's reservation data (its vector,
+	// project binding or authority facts) cannot be read, so it is neither
+	// classified nor released.
+	ErrReservationUnreadable = errors.New("reservation data cannot be read")
 )
 
 // ReleaseReservation writes the row that releases opID's reservation: a

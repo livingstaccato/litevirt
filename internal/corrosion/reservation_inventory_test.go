@@ -669,3 +669,36 @@ func TestReleaseBlockedReservation_Refusals(t *testing.T) {
 		t.Fatalf("both tombstoned: already=%v err=%v, want ErrReservationReleaseBlocked naming the failed row", already, err)
 	}
 }
+
+// ClassifyReservation classifies one operation around other operations whose
+// reservation data cannot be read, and fails closed — ErrReservationUnreadable,
+// naming the operation — for an operation whose own data cannot be read.
+func TestClassifyReservation_ToleratesOtherUnreadableRows(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	invVM(t, c, "vm1", 1, agoNano(48*time.Hour), "")
+	invOp(t, c, "good", OpResourceUpdateRunning, "vm", "vm1", "ResizeVMLive", 0, leakVector, ago(time.Hour), leakSteps())
+	steps := map[int64][]string{1: {OpStepReserved}}
+	invOp(t, c, "undecodable", OpResourceUpdateRunning, "vm", "vm1", "ResizeVMLive", 1,
+		ReservationVector{TargetHost: "h1", TargetMemMiB: 8}, ago(time.Hour), steps)
+	invOp(t, c, "mismatch", OpResourceUpdateRunning, "vm", "vm1", "ResizeVMLive", 1,
+		ReservationVector{TargetHost: "h2", TargetMemMiB: 8, Project: "beta"}, ago(time.Hour), steps)
+	for _, q := range []string{
+		`UPDATE operations SET reservation_json = '{not json' WHERE id = 'undecodable'`,
+		`UPDATE operations SET project = 'alpha' WHERE id = 'mismatch'`,
+	} {
+		if err := c.Execute(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if v := mustClassify(t, c, "good"); v.Class != ReservationTerminalPastHeader {
+		t.Fatalf("good: class %q, want terminal_past_header", v.Class)
+	}
+	for _, id := range []string{"undecodable", "mismatch"} {
+		v, err := ClassifyReservation(ctx, c, id)
+		if v != nil || !errors.Is(err, ErrReservationUnreadable) || !strings.Contains(err.Error(), id) {
+			t.Fatalf("%s: view %+v err %v, want ErrReservationUnreadable naming it", id, v, err)
+		}
+	}
+}

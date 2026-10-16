@@ -145,6 +145,12 @@ func BootState(ctx context.Context, db *corrosion.Client, host, dataDir string, 
 	}
 	h, err := readHost(ctx, db, host)
 	if err != nil || h == nil {
+		// Noted, best effort, so a crash of this boot before it serves
+		// leaves the next one its never-served signal. If the note cannot
+		// be written either, that next boot reads as after a daemon that
+		// served: for a host still 'upgrading' it may write one fresh
+		// 'upgrading', the bounded re-arm of any unclean boot (FlapLimit).
+		_ = writeAwaiting(dataDir, now)
 		return unreadable("graceful stop recorded", err)
 	}
 	switch h.State {
@@ -449,15 +455,18 @@ func ConfirmServingReport(ctx context.Context, db *corrosion.Client, host, from 
 		return false, "", err
 	}
 	if h == nil {
-		if from == "" {
-			return false, "", ErrMovedOn // no record to write
-		}
-		return false, "", fmt.Errorf("host %q has no record", host)
+		return false, "", ErrMovedOn // no record to write: the host is gone
 	}
-	switch {
-	case from == "":
+	if from == "" {
 		// The boot could not read the record: confirm from what it is now.
 		from = h.State
+	}
+	switch {
+	case from != "upgrading" && from != "active":
+		// A deferred boot of a host recorded fenced, offline, maintenance,
+		// draining or joining wrote nothing: serving does not record it
+		// active over that state. It gets its report as any moved-on host.
+		return false, h.State, reportKeepingState(ctx, db, host, h.State, r)
 	case h.State == "upgrading":
 		// Recorded 'upgrading' since the boot: confirmed as ConfirmServing
 		// would, rather than left unplaceable while it serves.

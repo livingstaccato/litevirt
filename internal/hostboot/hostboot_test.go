@@ -190,7 +190,8 @@ func TestUncleanBootByRecordedState(t *testing.T) {
 // Mutations: return 'active' for a failed history (the rule before) — the
 // missing-dir case fails; return 'active' for a failed note — the note case
 // fails; ignore the bound — the graceful case is deferred; return 'active' for
-// an unreadable record — the cancelled-read case fails.
+// an unreadable record — the cancelled-read case fails; leave no note on the
+// graceful unreadable boot — its note check fails.
 func TestBootThatCannotBoundOrReadDefers(t *testing.T) {
 	for _, st := range []string{"active", "upgrading", "fenced"} {
 		db, ctx := hostIn(t, st)
@@ -235,6 +236,19 @@ func TestBootThatCannotBoundOrReadDefers(t *testing.T) {
 		}
 		if b := BootState(ctx, db, "nobody", t.TempDir(), false, time.Now()); b.State != "" || !b.Deferred {
 			t.Fatalf("boot of a host with no record = %+v, want no boot write", b)
+		}
+		// After a graceful stop, too, and the boot still leaves its note,
+		// so a crash before it serves keeps the never-served signal (m-d).
+		dir := t.TempDir()
+		now := time.Now()
+		if err := MarkRestarting(ctx, db, "h", dir, now); err != nil {
+			t.Fatal(err)
+		}
+		if b := BootState(cctx, db, "h", dir, false, now.Add(time.Second)); b.State != "" || !b.Deferred {
+			t.Fatalf("graceful boot that cannot read its record = %+v, want no boot write", b)
+		}
+		if _, err := os.Stat(AwaitingPath(dir)); err != nil {
+			t.Fatalf("the graceful boot that cannot read its record left no awaiting-serving note: %v", err)
 		}
 	})
 }
@@ -578,21 +592,34 @@ func TestConfirmServingReport(t *testing.T) {
 // Mutations: leave the 'upgrading' arm out — the host stays 'upgrading';
 // drop the from "" arm — the unread boot errors with no record ever
 // confirmed; wrap the failed report in ErrMovedOn (round 1) — the
-// quarantined report is not retried.
+// quarantined report is not retried; confirm from any state — the fenced
+// and offline hosts turn active; error on a missing record — retried.
 func TestConfirmServingReportAfterADeferredBoot(t *testing.T) {
 	r := Report{Version: "v-new"}
 	db, ctx := hostIn(t, "upgrading")
 	if flipped, state, err := ConfirmServingReport(ctx, db, "h", "active", r); err != nil || !flipped || state != "active" || stateOf(t, db) != "active" {
 		t.Fatalf("deferred 'active' boot of a host now upgrading: flipped=%v state=%q err=%v record=%q, want active", flipped, state, err, stateOf(t, db))
 	}
-	for _, st := range []string{"active", "fenced"} {
-		db, ctx := hostIn(t, st)
-		if flipped, state, err := ConfirmServingReport(ctx, db, "h", "", r); err != nil || !flipped || state != "active" || stateOf(t, db) != "active" {
-			t.Fatalf("unread boot of a %s host: flipped=%v state=%q err=%v record=%q, want active once serving", st, flipped, state, err, stateOf(t, db))
+	db2, ctx2 := hostIn(t, "active")
+	if flipped, state, err := ConfirmServingReport(ctx2, db2, "h", "", r); err != nil || !flipped || state != "active" || stateOf(t, db2) != "active" {
+		t.Fatalf("unread boot of an active host: flipped=%v state=%q err=%v record=%q, want active once serving", flipped, state, err, stateOf(t, db2))
+	}
+	// A fenced or offline host keeps that state: a deferred boot that read
+	// it (its history or note could not be written), or could not read it,
+	// is not recorded active over it once serving (m-b).
+	for _, st := range []string{"fenced", "offline"} {
+		for _, from := range []string{"", st} {
+			db, ctx := hostIn(t, st)
+			flipped, state, err := ConfirmServingReport(ctx, db, "h", from, r)
+			if !errors.Is(err, ErrMovedOn) || flipped || state != st || stateOf(t, db) != st {
+				t.Fatalf("deferred boot (from %q) of a %s host: flipped=%v state=%q err=%v record=%q, want %s kept", from, st, flipped, state, err, stateOf(t, db), st)
+			}
 		}
 	}
-	if _, _, err := ConfirmServingReport(ctx, db, "nobody", "", r); !errors.Is(err, ErrMovedOn) {
-		t.Fatalf("unread boot with no record: err=%v, want ErrMovedOn (nothing to write)", err)
+	for _, from := range []string{"", "upgrading", "active"} {
+		if _, _, err := ConfirmServingReport(ctx, db, "nobody", from, r); !errors.Is(err, ErrMovedOn) {
+			t.Fatalf("deferred boot (from %q) with no record: err=%v, want ErrMovedOn (nothing to write, no retry)", from, err)
+		}
 	}
 	db, ctx = hostIn(t, "draining")
 	db.SetWriteQuarantine(func() string { return "test" })

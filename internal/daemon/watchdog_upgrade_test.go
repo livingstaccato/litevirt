@@ -810,3 +810,37 @@ func TestBootThatCannotRecordItselfWritesNothingUntilItServes(t *testing.T) {
 		}
 	}
 }
+
+// TestDeferredBootOfAFencedHostKeepsTheFence: a crash boot of a host recorded
+// fenced whose data dir cannot take its unclean-boot history writes nothing,
+// and once this daemon serves it is not recorded active over the fence.
+//
+// Mutation: confirm a deferred boot from any recorded state in hostboot — the
+// fenced host turns active once it serves.
+func TestDeferredBootOfAFencedHostKeepsTheFence(t *testing.T) {
+	old := pingPollInterval
+	pingPollInterval = time.Millisecond
+	defer func() { pingPollInterval = old }()
+	var checks bootChecks
+	defer checks.wait(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d, host := bootTestDaemon(t, ctx)
+	if err := corrosion.UpdateHostState(ctx, d.db, "h", "fenced"); err != nil {
+		t.Fatal(err)
+	}
+	d.cfg.DataDir = filepath.Join(t.TempDir(), "missing")
+	served := make(chan struct{})
+	var once sync.Once
+	d.selfPinger = checks.pinger(pingerFunc(func() error { once.Do(func() { close(served) }); return nil }))
+	d.writeBootState(ctx, 0, 0, 0, false)
+	select {
+	case <-served:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the boot started no serving check")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := host().State; got != "fenced" {
+		t.Fatalf("a deferred boot of a fenced host recorded it %q once serving, want the fence kept", got)
+	}
+}

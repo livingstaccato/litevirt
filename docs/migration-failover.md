@@ -1120,10 +1120,15 @@ and resources are then written once the daemon serves, leaving that state.
 - A boot without the marker that cannot write `boot-unclean-history` or
   `boot-awaiting-serving` (a full or read-only disk) could not bound a crash
   loop, and one that cannot read the host's record (read twice) could not
-  judge it: each makes no write, and records the host `active`, with its
-  version and resources, once the daemon serves, only while the host is
-  still recorded as it is then. A host recorded `upgrading` by then is
-  recorded `active` too.
+  judge it: each makes no write. Once the daemon serves it records a host
+  recorded `active` or `upgrading` `active`, with its version and resources,
+  only while it is still recorded so; a fenced or offline host keeps that
+  state and gets nothing, and a draining or maintenance one keeps its state
+  and gets its version and resources. A graceful boot that cannot read the
+  record still leaves `boot-awaiting-serving`; if that cannot be written
+  either, a crash before it serves leaves the next boot nothing to show it
+  never served, and that boot may write one fresh `upgrading` (bounded by the
+  3-in-10-minutes count).
 - A report that fails once the daemon serves is retried until it lands.
 
 Each of these boots `active`, as before:
@@ -1132,7 +1137,10 @@ Each of these boots `active`, as before:
   can record itself. A fenced, offline or maintenance host keeps that state
   through the SIGTERM, and a draining one is recorded `upgrading` for the
   restart, as before;
-- a boot with no `data_dir`.
+- a boot with no `data_dir`;
+- the first start of a host with no record yet, or one re-admitted under its
+  name: registering it inserts it `active` before its daemon serves. Its
+  boot write then follows the rules above.
 
 Recording the host `active` once it serves changes only an `upgrading` host
 (after a boot that made no write, only a host still recorded as that boot

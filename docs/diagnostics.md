@@ -1729,7 +1729,7 @@ Evaluator `host_boot`; the host writes the row about **itself**.
 
 | Raised when | Clears when |
 |---|---|
-| The host has been recorded `upgrading` for 2 minutes or more, and its daemon's serving check still has not recorded it `active`: its own Ping does not answer, or the write that records it `active` fails (that write is retried with backoff, 1 s doubling to 1 min, until it lands). **Warning** severity. The evidence names the cause, the time the host turned `upgrading` and the remedy. | The check records the host `active`, or finds it recorded as something else (fenced, drained, undrained). One left open by an earlier daemon process is resolved too. |
+| The host has been recorded `upgrading` for 2 minutes or more, and its daemon's serving check still has not recorded it `active`: its own Ping does not answer, or the write that records it `active` fails (that write is retried with backoff, 1 s doubling to 1 min, until it lands). **Warning** severity. The evidence names the cause, the time the host turned `upgrading` and the remedy. | The check records the host `active`, or finds it recorded as something else (fenced, drained, undrained), whether or not its own Ping answers yet. One left open by an earlier daemon process is resolved too. While it stays open its row is written again only when the cause changes, and otherwise every 10 minutes. |
 
 While it is open the host also exports `litevirt_host_upgrading_unconfirmed 1`,
 and logs the cause and the remedy at error level. Fix what the cause names:

@@ -24,19 +24,22 @@ const UnconfirmedRemedy = "fix what the cause names (the daemon's own mTLS clien
 	"or the write); once this daemon confirms it serves it records the host active by itself. " +
 	"Or run 'lv host undrain <host>' to record it active now"
 
-// UpgradingSince reports whether host is recorded 'upgrading' in db and, if
-// so, since when (corrosion.HostStateSince). ok=false when it is not, or the
-// time is unreadable.
-func UpgradingSince(ctx context.Context, db *corrosion.Client, host string) (time.Time, bool) {
+// UpgradingState reports whether host is recorded 'upgrading' in db and, if
+// so, since when (corrosion.HostStateSince; zero when unreadable). err is a
+// read error, which decides nothing.
+func UpgradingState(ctx context.Context, db *corrosion.Client, host string) (since time.Time, upgrading bool, err error) {
 	h, err := corrosion.GetHost(ctx, db, host)
-	if err != nil || h == nil || h.State != "upgrading" {
-		return time.Time{}, false
+	if err != nil {
+		return time.Time{}, false, err
 	}
-	since, ok, err := corrosion.HostStateSince(ctx, db, host)
+	if h == nil || h.State != "upgrading" {
+		return time.Time{}, false, nil
+	}
+	at, ok, err := corrosion.HostStateSince(ctx, db, host)
 	if err != nil || !ok {
-		return time.Time{}, false
+		return time.Time{}, true, nil
 	}
-	return since, true
+	return at, true, nil
 }
 
 // RaiseUpgradingUnconfirmed raises (or refreshes) host's

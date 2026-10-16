@@ -13,6 +13,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/hostboot"
+	"github.com/litevirt/litevirt/internal/metrics"
 )
 
 // upgradingHost is a daemon whose host "h" is recorded 'upgrading', read from
@@ -71,7 +72,8 @@ func hostState(t *testing.T, ctx context.Context, db *corrosion.Client) string {
 // Mutations: return after the first failed attempt (the check before this
 // change) — the host stays 'upgrading'; drop noteUnconfirmed from the retry
 // loop — no condition is raised; drop clearUnconfirmed from the success path
-// — the condition stays open.
+// — the condition stays open; write the condition on every attempt — it is
+// written more than once.
 func TestConfirmActiveRetriesAndShowsAnUnconfirmedHost(t *testing.T) {
 	d, db, ctx := upgradingHost(t)
 	var attempts atomic.Int32
@@ -91,7 +93,7 @@ func TestConfirmActiveRetriesAndShowsAnUnconfirmedHost(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		row, ok := unconfirmedRow(t, ctx, db)
-		if ok && row.Lifecycle == corrosion.ConditionConfirmed && attempts.Load() >= 3 {
+		if ok && row.Lifecycle == corrosion.ConditionConfirmed && attempts.Load() >= 5 {
 			var ev struct{ Cause, Remedy string }
 			if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil ||
 				!strings.Contains(ev.Cause, "write refused") || !strings.Contains(ev.Remedy, "lv host undrain") {
@@ -99,6 +101,12 @@ func TestConfirmActiveRetriesAndShowsAnUnconfirmedHost(t *testing.T) {
 			}
 			if row.Severity != corrosion.SeverityWarning {
 				t.Fatalf("severity %q, want warning", row.Severity)
+			}
+			// One replicated write for one unchanged cause, however many
+			// attempts fail.
+			if row.ObserveCount != 1 {
+				t.Fatalf("upgrading_unconfirmed written %d times for one cause over %d attempts, want once",
+					row.ObserveCount, attempts.Load())
 			}
 			break
 		}
@@ -165,4 +173,144 @@ func unconfirmedGauge(t *testing.T) float64 {
 	}
 	t.Fatal("litevirt_host_upgrading_unconfirmed is not registered")
 	return 0
+}
+
+// Nothing is raised before the host has been 'upgrading' for the upgrading
+// window, however many attempts fail.
+//
+// Mutation: drop the unconfirmedAfter check from noteUnconfirmed — the
+// condition is raised at once.
+func TestUnconfirmedWaitsForTheUpgradingWindow(t *testing.T) {
+	d, db, ctx := upgradingHost(t)
+	unconfirmedAfter = time.Hour
+	metrics.SetUpgradingUnconfirmed(false)
+	confirmRetryFirst, confirmRetryMax = 20*time.Millisecond, 20*time.Millisecond
+	var attempts atomic.Int32
+	d.confirmServing = func(context.Context) (bool, string, error) {
+		attempts.Add(1)
+		return false, "upgrading", errors.New("write refused")
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { d.confirmActive(cctx, &unconfirmed{}, true); close(done) }()
+	for deadline := time.Now().Add(3 * time.Second); attempts.Load() < 5; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d attempts", attempts.Load())
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelling the daemon's context did not end the retry loop")
+	}
+	if row, ok := unconfirmedRow(t, ctx, db); ok {
+		t.Fatalf("upgrading_unconfirmed raised inside the upgrading window: %+v", row)
+	}
+	if g := unconfirmedGauge(t); g != 0 {
+		t.Fatalf("litevirt_host_upgrading_unconfirmed = %v inside the window, want 0", g)
+	}
+}
+
+// A host recorded as something other than 'upgrading' ends the retry loop
+// (ErrNotUpgrading), and the condition it raised is resolved.
+//
+// Mutation: treat ErrNotUpgrading as a failure to retry — the loop does not
+// end.
+func TestConfirmActiveStopsOnceTheHostIsNotUpgrading(t *testing.T) {
+	d, db, ctx := upgradingHost(t)
+	var attempts atomic.Int32
+	d.confirmServing = func(context.Context) (bool, string, error) {
+		if attempts.Add(1) <= 3 {
+			return false, "upgrading", errors.New("write refused")
+		}
+		return false, "fenced", hostboot.ErrNotUpgrading
+	}
+	done := make(chan struct{})
+	go func() { d.confirmActive(ctx, &unconfirmed{}, true); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("the retry loop went on after the host was recorded as something else (%d attempts)", attempts.Load())
+	}
+	if row, ok := unconfirmedRow(t, ctx, db); !ok || row.Lifecycle != corrosion.ConditionResolved {
+		t.Fatalf("upgrading_unconfirmed after ErrNotUpgrading = %+v ok=%v, want raised then resolved", row, ok)
+	}
+	if g := unconfirmedGauge(t); g != 0 {
+		t.Fatalf("litevirt_host_upgrading_unconfirmed = %v, want 0", g)
+	}
+}
+
+// A host that stops being 'upgrading' (an operator undrained it) while its
+// daemon's own Ping still fails has nothing to show: the condition the ping
+// loop raised is resolved and the metric cleared, without waiting for the
+// Ping.
+//
+// Mutation: return from noteUnconfirmed without clearing when the host is not
+// 'upgrading' — the condition stays open for an active host.
+func TestUnconfirmedClearsWhenTheHostIsNoLongerUpgrading(t *testing.T) {
+	d, db, ctx := upgradingHost(t)
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { d.activateOnceServing(cctx, &fakePinger{failN: 1 << 30}, 10*time.Millisecond); close(done) }()
+	waitRow := func(what string, cond func(corrosion.HealthCondition, bool) bool) {
+		t.Helper()
+		for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+			row, ok := unconfirmedRow(t, ctx, db)
+			if cond(row, ok) {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s: %+v ok=%v", what, row, ok)
+			}
+		}
+	}
+	waitRow("the condition", func(r corrosion.HealthCondition, ok bool) bool {
+		return ok && r.Lifecycle == corrosion.ConditionConfirmed
+	})
+	if err := corrosion.UpdateHostState(ctx, db, "h", "active"); err != nil { // lv host undrain
+		t.Fatal(err)
+	}
+	waitRow("the condition to resolve", func(r corrosion.HealthCondition, ok bool) bool {
+		return ok && r.Lifecycle == corrosion.ConditionResolved
+	})
+	if g := unconfirmedGauge(t); g != 0 {
+		t.Fatalf("litevirt_host_upgrading_unconfirmed = %v for an active host, want 0", g)
+	}
+	cancel()
+	<-done
+}
+
+// Cancelling the daemon's context (shutdown) ends the retry loop while it
+// waits out its backoff, not after it.
+//
+// Mutation: drop the ctx.Done arm from confirmActive's backoff — the loop
+// sleeps out the hour.
+func TestShutdownEndsTheConfirmBackoff(t *testing.T) {
+	d, _, ctx := upgradingHost(t)
+	confirmRetryFirst, confirmRetryMax = time.Hour, time.Hour
+	var attempts atomic.Int32
+	d.confirmServing = func(context.Context) (bool, string, error) {
+		attempts.Add(1)
+		return false, "upgrading", errors.New("write refused")
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { d.confirmActive(cctx, &unconfirmed{}, true); close(done) }()
+	for deadline := time.Now().Add(3 * time.Second); attempts.Load() < 1; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("no attempt")
+		}
+	}
+	time.Sleep(20 * time.Millisecond) // into the backoff
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelling the daemon's context did not end the retry backoff")
+	}
+	if n := attempts.Load(); n != 1 {
+		t.Fatalf("%d attempts, want 1", n)
+	}
 }

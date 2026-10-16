@@ -314,18 +314,43 @@ func (d *Daemon) confirmActive(ctx context.Context, u *unconfirmed, served bool)
 }
 
 // unconfirmed is one serving check's upgrading_unconfirmed state.
-type unconfirmed struct{ raised bool }
+type unconfirmed struct {
+	raised  bool
+	cause   string    // the cause the open condition carries
+	wroteAt time.Time // when it was last written
+	cleared bool      // a leftover from an earlier process was looked for
+}
+
+// unconfirmedRefresh is how often an open upgrading_unconfirmed whose cause has
+// not changed is written again (its last_seen); a var so tests can shrink it.
+var unconfirmedRefresh = 10 * time.Minute
 
 // noteUnconfirmed raises upgrading_unconfirmed, and sets its metric, once the
 // host has been recorded 'upgrading' for unconfirmedAfter while this check
-// still has not recorded it active. cause names why.
+// still has not recorded it active. cause names why. The condition is a
+// replicated write, so it is written again only when the cause changes or
+// unconfirmedRefresh has passed. A host no longer recorded 'upgrading' (an
+// operator undrained it, it was fenced) has nothing to show: an open
+// condition is resolved and the metric cleared.
 func (d *Daemon) noteUnconfirmed(ctx context.Context, u *unconfirmed, cause string) {
-	since, ok := hostboot.UpgradingSince(ctx, d.db, d.cfg.HostName)
-	if !ok || time.Since(since) < unconfirmedAfter {
+	since, upgrading, err := hostboot.UpgradingState(ctx, d.db, d.cfg.HostName)
+	if err != nil {
+		return
+	}
+	if !upgrading {
+		if u.raised || !u.cleared {
+			d.clearUnconfirmed(u)
+		}
+		return
+	}
+	if since.IsZero() || time.Since(since) < unconfirmedAfter {
 		return
 	}
 	metrics.SetUpgradingUnconfirmed(true)
-	if !u.raised {
+	if u.raised && cause == u.cause && time.Since(u.wroteAt) < unconfirmedRefresh {
+		return
+	}
+	if !u.raised || cause != u.cause {
 		slog.Error("restart: this host has been 'upgrading' past its upgrading window while its daemon runs; peers that reach it do not fence it, and it stays unplaceable",
 			"since", since.UTC().Format(time.RFC3339), "cause", cause, "remedy", hostboot.UnconfirmedRemedy)
 	}
@@ -333,7 +358,7 @@ func (d *Daemon) noteUnconfirmed(ctx context.Context, u *unconfirmed, cause stri
 		slog.Warn("restart: could not record the upgrading_unconfirmed condition (retried)", "error", err)
 		return
 	}
-	u.raised = true
+	u.raised, u.cause, u.wroteAt = true, cause, time.Now()
 }
 
 // clearUnconfirmed resolves upgrading_unconfirmed, including one an earlier
@@ -346,7 +371,7 @@ func (d *Daemon) clearUnconfirmed(u *unconfirmed) {
 		slog.Warn("restart: could not resolve the upgrading_unconfirmed condition", "error", err)
 		return
 	}
-	u.raised = false
+	u.raised, u.cause, u.cleared = false, "", true
 }
 
 // rollbackToOld restores <binary>.old over the running binary path and exits

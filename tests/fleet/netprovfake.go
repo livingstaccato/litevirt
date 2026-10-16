@@ -380,23 +380,18 @@ func (f *NetProvFake) HasDevice(dev string) bool {
 	return false
 }
 
-// Addrs is the gateway address each network provisioned here on dev with a
-// subnet carries (its first host), as the real provisioner gives a bridge it
-// made.
+// Addrs is the gateway address the device dev serves here (its subnet's first
+// host), as the real provisioner gives a bridge it made. A device keeps
+// serving after its network moved off it, until something tears it down.
 func (f *NetProvFake) Addrs(dev string) []netip.Prefix {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var out []netip.Prefix
-	for n, d := range f.up {
-		if d != dev {
-			continue
-		}
-		if p, err := netip.ParsePrefix(f.subnets[n]); err == nil {
-			p = p.Masked()
-			out = append(out, netip.PrefixFrom(p.Addr().Next(), p.Bits()))
-		}
+	p, err := netip.ParsePrefix(f.devSubnets[dev])
+	if err != nil {
+		return nil
 	}
-	return out
+	p = p.Masked()
+	return []netip.Prefix{netip.PrefixFrom(p.Addr().Next(), p.Bits())}
 }
 
 // Provisions and Deprovisions count calls for network on this node.

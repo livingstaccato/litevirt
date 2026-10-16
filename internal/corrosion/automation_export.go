@@ -374,9 +374,23 @@ func sourceExportCheckPin(ctx context.Context, tx *LocalTx, p sourcePublication)
 	if !bytes.Equal(x, y) || rows[0].String("root") != m.Root {
 		return errors.New("published cut binding differs")
 	}
-	rows, err = tx.Query(ctx, `SELECT section FROM local_automation_cut_records WHERE cut_id=? AND (section<0 OR section>=9 OR ordinal<=0) LIMIT 1`, m.Cut.ID)
-	if err != nil || len(rows) != 0 {
-		return fmt.Errorf("invalid published cut section: %v", err)
+	// Each lookup must constrain the next column in (cut_id,section,ordinal).
+	// An OR with ordinal<=0 and no fixed section scans the entire retained cut
+	// when no malformed row exists, even with LIMIT 1.
+	for _, query := range []string{
+		`SELECT section FROM local_automation_cut_records WHERE cut_id=? AND section<0 LIMIT 1`,
+		`SELECT section FROM local_automation_cut_records WHERE cut_id=? AND section>=9 LIMIT 1`,
+	} {
+		rows, err = tx.Query(ctx, query, m.Cut.ID)
+		if err != nil || len(rows) != 0 {
+			return fmt.Errorf("invalid published cut section: %v", err)
+		}
+	}
+	for section := range automationCutSections {
+		rows, err = tx.Query(ctx, `SELECT section FROM local_automation_cut_records WHERE cut_id=? AND section=? AND ordinal<=0 LIMIT 1`, m.Cut.ID, section)
+		if err != nil || len(rows) != 0 {
+			return fmt.Errorf("invalid published cut ordinal: %v", err)
+		}
 	}
 	return nil
 }

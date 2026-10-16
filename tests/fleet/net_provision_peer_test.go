@@ -348,7 +348,7 @@ func TestFleet_StackNetworkNamedAfterAHostBridgeUsesIt(t *testing.T) {
 	seedTestImageEverywhere(t, c)
 	entry := c.Nodes[0]
 	entry.Net.SetOperatorBridge("br0")
-	entry.Server.SetBridgeExists(func(dev string) bool { return dev == "br0" || entry.Net.HasDevice(dev) })
+	entry.Server.SetIsBridge(func(dev string) bool { return dev == "br0" })
 	msgs, err := deployStream(t, ctx, c.SelfClient(entry), composeHostBridge)
 	if err != nil {
 		t.Fatalf("deploy: %v", err)

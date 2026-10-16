@@ -37,35 +37,37 @@ const (
 //   - its own name, when that is a bridge already on this (the entry) host
 //     that litevirt did not make and no stack network is recorded on: naming
 //     a host bridge attaches to it. Decided here once, so every peer gets the
-//     same device. When another stack's network is on that host bridge it is
-//     not shared (sharing across stacks takes an explicit interface): the
-//     network gets its scoped name and a warning says how to share;
+//     same device. A NIC, bond or VLAN of that name is not a bridge and is
+//     never taken. When a stack network (another stack's, or another of this
+//     stack's) is on that host bridge it is not shared by name (sharing takes
+//     an explicit interface): the network gets its scoped name and a warning
+//     says how to share;
 //   - else its stack-scoped name.
 //
 // Every bridge network whose device was defaulted and is also another stack's
 // network's device shares one L2 segment with it on every host. It is not
 // moved; each such pair comes back as a warning naming both stacks, the device
-// and the remedy if the sharing is not intended. Network rows that cannot be
-// read fail the deploy: guessing would move a deployed network.
+// and the remedy if the sharing is not intended. A failed read of the network
+// rows fails the deploy.
 func (s *Server) defaultStackNetworkDevices(ctx context.Context, f *compose.File) ([]stackNetWarning, error) {
 	rows, err := corrosion.ListNetworks(ctx, s.db)
 	if err != nil {
 		return nil, fmt.Errorf("read network rows: %w", err)
 	}
 	byName := make(map[string]corrosion.NetworkRecord, len(rows))
-	stackDevices := map[string]map[string]bool{} // device → stacks with a network recorded on it
+	stackDevices := map[string][]corrosion.NetworkRecord{} // device → the stack networks recorded on it
 	for _, r := range rows {
 		byName[r.Name] = r
 		if r.StackName == "" {
 			continue
 		}
-		if def, err := networkRowDef(networkRow{name: r.Name, typ: r.Type, config: r.Config}); err == nil {
-			dev := network.BridgeName(r.Name, def)
-			if stackDevices[dev] == nil {
-				stackDevices[dev] = map[string]bool{}
-			}
-			stackDevices[dev][r.StackName] = true
+		def, err := networkRowDef(networkRow{name: r.Name, typ: r.Type, config: r.Config})
+		if err != nil {
+			slog.Warn("deploy: a stack network row's config does not parse; its device is not known", "network", r.Name, "stack", r.StackName, "error", err)
+			continue
 		}
+		dev := network.BridgeName(r.Name, def)
+		stackDevices[dev] = append(stackDevices[dev], r)
 	}
 	// The bridges litevirt made here: read once, only when a host bridge is a
 	// candidate. createdOK is false when they could not be read.
@@ -90,7 +92,7 @@ func (s *Server) defaultStackNetworkDevices(ctx context.Context, f *compose.File
 				continue
 			}
 		}
-		if !s.bridgeExistsHere(name) {
+		if !s.isBridgeHere(name) {
 			continue
 		}
 		if !createdRead {
@@ -101,20 +103,28 @@ func (s *Server) defaultStackNetworkDevices(ctx context.Context, f *compose.File
 			continue
 		}
 		// A host bridge: taken by name only when no stack network is on it.
-		// Another stack on it means sharing it, which must be explicit.
+		// A stack network on it means sharing it, which must be explicit.
 		if users := stackDevices[name]; len(users) > 0 {
-			var others []string
-			for st := range users {
-				if st != f.Name {
-					others = append(others, fmt.Sprintf("%q", st))
+			otherStacks, ownNets := map[string]bool{}, map[string]bool{}
+			for _, u := range users {
+				if u.StackName != f.Name {
+					otherStacks[fmt.Sprintf("%q", u.StackName)] = true
+				} else if u.Name != scoped {
+					ownNets[fmt.Sprintf("%q", u.Name)] = true
 				}
 			}
-			if len(others) > 0 {
-				sort.Strings(others)
+			var held string
+			switch {
+			case len(otherStacks) > 0:
+				held = "which stack " + strings.Join(sortedKeys(otherStacks), ", ") + " is already on"
+			case len(ownNets) > 0:
+				held = "which network " + strings.Join(sortedKeys(ownNets), ", ") + " of this stack is already on"
+			}
+			if held != "" {
 				warnings = append(warnings, stackNetWarning{Event: eventHostBridgeNotShared, Detail: fmt.Sprintf(
-					"network %q of stack %q is named after host bridge %q, which stack %s is already on, so it is put on its own bridge %q instead; "+
+					"network %q of stack %q is named after host bridge %q, %s, so it is put on its own bridge %q instead; "+
 						"to share it, set \"interface: %s\" and redeploy",
-					scoped, f.Name, name, strings.Join(others, ", "), compose.FlatBridgeName(scoped), name)})
+					scoped, f.Name, name, held, compose.FlatBridgeName(scoped), name)})
 			}
 			continue
 		}
@@ -149,14 +159,14 @@ func (s *Server) defaultStackNetworkDevices(ctx context.Context, f *compose.File
 }
 
 // bridgesLitevirtMadeHere is the set of bridges litevirt recorded creating on
-// this host. When it cannot be read every existing bridge counts as
-// litevirt's (ok false), so a stack network is never put on one by its name
-// alone.
+// this host. When it cannot be read, or the provisioner keeps no such list,
+// every existing bridge counts as litevirt's (ok false), so a stack network is
+// never put on one by its name alone.
 func (s *Server) bridgesLitevirtMadeHere() (map[string]bool, bool) {
 	out := map[string]bool{}
 	sw, ok := s.networkProvisioner().(orphanBridgeSweeper)
 	if !ok {
-		return out, true
+		return nil, false
 	}
 	names, err := sw.CreatedBridges()
 	if err != nil {
@@ -169,6 +179,6 @@ func (s *Server) bridgesLitevirtMadeHere() (map[string]bool, bool) {
 	return out, true
 }
 
-// eventHostBridgeNotShared: the network is named after a host bridge another
-// stack's network is on, and was given its own scoped bridge instead.
+// eventHostBridgeNotShared: the network is named after a host bridge a stack
+// network is already on, and was given its own scoped bridge instead.
 const eventHostBridgeNotShared = "network.host_bridge_not_shared"

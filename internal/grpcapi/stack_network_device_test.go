@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -169,7 +170,7 @@ func TestDefaultStackNetworkDevices_UnparseableRowRecordsNoDevice(t *testing.T) 
 // Mutation: drop the host-bridge rule — red.
 func TestDefaultStackNetworkDevices_ExistingHostBridgeIsUsed(t *testing.T) {
 	s := testServer(t)
-	s.bridgeExists = func(dev string) bool { return dev == "br0" }
+	s.isBridge = func(dev string) bool { return dev == "br0" }
 	f := &compose.File{Name: "st", Networks: map[string]compose.NetworkDef{
 		"br0": {Type: "bridge"},
 		"lan": {Type: "bridge"},
@@ -192,7 +193,7 @@ func TestDefaultStackNetworkDevices_ExistingHostBridgeIsUsed(t *testing.T) {
 // Mutation: drop the recorded-by-a-stack check — red.
 func TestDefaultStackNetworkDevices_BridgeRecordedByAStackIsNotTaken(t *testing.T) {
 	s := testServer(t)
-	s.bridgeExists = func(dev string) bool { return dev == "backend" }
+	s.isBridge = func(dev string) bool { return dev == "backend" }
 	seedStackNetworkRow(t, s, "sa", "backend", compose.NetworkDef{Type: "bridge", Interface: "backend"})
 	sb := backendFile("sb", compose.NetworkDef{Type: "bridge"})
 	if _, err := s.defaultStackNetworkDevices(context.Background(), sb); err != nil {
@@ -216,7 +217,7 @@ func (p createdBridgesProv) CreatedBridges() ([]string, error) { return p.create
 // Mutation: drop the created-bridge check — red.
 func TestDefaultStackNetworkDevices_LitevirtMadeBridgeIsNotAHostBridge(t *testing.T) {
 	s := testServer(t)
-	s.bridgeExists = func(dev string) bool { return dev == "backend" }
+	s.isBridge = func(dev string) bool { return dev == "backend" }
 	s.SetNetworkProvisioner(createdBridgesProv{created: []string{"backend"}})
 	f := backendFile("sc", compose.NetworkDef{Type: "bridge"})
 	if _, err := s.defaultStackNetworkDevices(context.Background(), f); err != nil {
@@ -254,7 +255,7 @@ func TestDefaultStackNetworkDevices_ScopedDefaultOnAnotherStacksDeviceWarns(t *t
 func TestDefaultStackNetworkDevices_HostBridgeOfAnotherStackWarns(t *testing.T) {
 	s := testServer(t)
 	ctx := context.Background()
-	s.bridgeExists = func(dev string) bool { return dev == "br0" || dev == "backend" }
+	s.isBridge = func(dev string) bool { return dev == "br0" || dev == "backend" }
 	s.SetNetworkProvisioner(createdBridgesProv{created: []string{"backend"}})
 	seedStackNetworkRow(t, s, "sa", "br0", compose.NetworkDef{Type: "bridge", Interface: "br0"})
 	seedStackNetworkRow(t, s, "sc", "up", compose.NetworkDef{Type: "bridge", Interface: "br0"})
@@ -281,5 +282,83 @@ func TestDefaultStackNetworkDevices_HostBridgeOfAnotherStackWarns(t *testing.T) 
 	sd := backendFile("sd", compose.NetworkDef{Type: "bridge"})
 	if w, err := s.defaultStackNetworkDevices(ctx, sd); err != nil || len(w) != 0 {
 		t.Errorf("made bridge: warnings %+v err %v, want none", w, err)
+	}
+}
+
+// A NIC, bond or VLAN that has the network's name is not a host bridge: the
+// bridge network stays on its scoped name.
+//
+// Mutation: take any existing link (bridgeExistsHere) — red.
+func TestDefaultStackNetworkDevices_ExistingNonBridgeLinkIsNotTaken(t *testing.T) {
+	s := testServer(t)
+	s.bridgeExists = func(dev string) bool { return dev == "eth1" }
+	s.isBridge = func(string) bool { return false }
+	f := &compose.File{Name: "st", Networks: map[string]compose.NetworkDef{"eth1": {Type: "bridge"}}}
+	w, err := s.defaultStackNetworkDevices(context.Background(), f)
+	if err != nil || len(w) != 0 {
+		t.Fatalf("warnings=%+v err=%v", w, err)
+	}
+	if got := f.Networks["eth1"].Interface; got != "st_eth1" {
+		t.Errorf("eth1 on %q, want st_eth1 (eth1 here is a NIC, not a bridge)", got)
+	}
+}
+
+// When the only network on the host bridge is another network of the
+// deploying stack, the new one gets its scoped name too, and is told so.
+//
+// Mutation: warn only about other stacks — red.
+func TestDefaultStackNetworkDevices_HostBridgeOfThisStackWarns(t *testing.T) {
+	s := testServer(t)
+	s.isBridge = func(dev string) bool { return dev == "br0" }
+	seedStackNetworkRow(t, s, "sa", "lan", compose.NetworkDef{Type: "bridge", Interface: "br0"})
+	sa := &compose.File{Name: "sa", Networks: map[string]compose.NetworkDef{
+		"lan": {Type: "bridge", Interface: "br0"},
+		"br0": {Type: "bridge"},
+	}}
+	w, err := s.defaultStackNetworkDevices(context.Background(), sa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sa.Networks["br0"].Interface; got != "sa_br0" {
+		t.Errorf("sa br0 on %q, want sa_br0", got)
+	}
+	if len(w) != 1 || w[0].Event != eventHostBridgeNotShared {
+		t.Fatalf("warnings %+v, want one %s", w, eventHostBridgeNotShared)
+	}
+	for _, want := range []string{`"sa_lan"`, "this stack", `"br0"`, "sa_br0"} {
+		if !strings.Contains(w[0].Detail, want) {
+			t.Errorf("warning %q does not name %s", w[0].Detail, want)
+		}
+	}
+}
+
+type failingCreatedBridgesProv struct{ hostNetworkProvisioner }
+
+func (failingCreatedBridgesProv) CreatedBridges() ([]string, error) {
+	return nil, errors.New("read /run/litevirt/bridges: permission denied")
+}
+
+type noSweepProv struct{ NetworkProvisioner }
+
+// When the bridges litevirt made here cannot be told (the list fails to read,
+// or the provisioner keeps none), no bridge is taken by its name alone.
+//
+// Mutation: take the host bridge when the list cannot be read — red.
+// Mutation: a provisioner without the list counts as "made none" — red.
+func TestDefaultStackNetworkDevices_UnknownMadeBridgesTakeNoHostBridge(t *testing.T) {
+	for name, prov := range map[string]NetworkProvisioner{
+		"list fails": failingCreatedBridgesProv{},
+		"no list":    noSweepProv{hostNetworkProvisioner{}},
+	} {
+		s := testServer(t)
+		s.isBridge = func(dev string) bool { return dev == "br0" }
+		s.SetNetworkProvisioner(prov)
+		f := &compose.File{Name: "st", Networks: map[string]compose.NetworkDef{"br0": {Type: "bridge"}}}
+		if _, err := s.defaultStackNetworkDevices(context.Background(), f); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got := f.Networks["br0"].Interface; got != "st_br0" {
+			t.Errorf("%s: br0 on %q, want st_br0", name, got)
+		}
 	}
 }

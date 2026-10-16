@@ -906,6 +906,9 @@ func (c *Cluster) buildServer(n *Node) {
 	n.Net = NewNetProvFake()
 	n.Server.SetNetworkProvisioner(n.Net)
 	n.Server.SetVTEPResolver(n.Net.ResolveVTEP)
+	// The node has no host bridges of its own unless a scenario gives it one
+	// (SetIsBridge), whatever links the machine running the test has.
+	n.Server.SetIsBridge(func(string) bool { return false })
 
 	// External IPAM: a REAL netbox.Client (token file and all) pointed at the
 	// scenario's fake server, plus the config kill-switch that lets this node

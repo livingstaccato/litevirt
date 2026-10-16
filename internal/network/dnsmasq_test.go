@@ -114,7 +114,7 @@ func hasArg(args []string, want string) bool {
 // serves guest DNS via the bridge gateway IP, so loopback must be excluded.
 func TestDnsmasqArgs_ExcludesLoopback(t *testing.T) {
 	args := dnsmasqArgs("br-test", "10.0.0.2", "10.0.0.254", "255.255.255.0", "10.0.0.1/24",
-		"/var/run/litevirt-dnsmasq-br-test.pid", []string{"8.8.8.8"}, "litevirt.local", 5354)
+		"/var/run/litevirt-dnsmasq-br-test.pid", false, []string{"8.8.8.8"}, "litevirt.local", 5354)
 
 	for _, want := range []string{
 		"--interface=br-test",
@@ -147,7 +147,7 @@ func TestDnsmasqArgs_ExcludesLoopback(t *testing.T) {
 // --server= forward added on upgrade).
 func TestCmdlineMatchesArgs(t *testing.T) {
 	want := dnsmasqArgs("br0", "10.0.0.2", "10.0.0.254", "255.255.255.0", "10.0.0.1/24",
-		"/run/lv-br0.pid", []string{"8.8.8.8"}, "litevirt.local", 5354)
+		"/run/lv-br0.pid", false, []string{"8.8.8.8"}, "litevirt.local", 5354)
 
 	// A cmdline built from exactly these args (argv[0] + args, NUL-joined, any
 	// order) is considered current — no restart.
@@ -166,7 +166,7 @@ func TestCmdlineMatchesArgs(t *testing.T) {
 	// The load-bearing case: a dnsmasq started BEFORE the local resolver was
 	// configured lacks the --server=/domain/ forward → must be flagged stale.
 	stale := dnsmasqArgs("br0", "10.0.0.2", "10.0.0.254", "255.255.255.0", "10.0.0.1/24",
-		"/run/lv-br0.pid", []string{"8.8.8.8"}, "", 0)
+		"/run/lv-br0.pid", false, []string{"8.8.8.8"}, "", 0)
 	if cmdlineMatchesArgs(blob("dnsmasq", stale), want) {
 		t.Error("a cmdline missing the embedded-DNS forward must be flagged stale")
 	}
@@ -183,7 +183,7 @@ func TestCmdlineMatchesArgs(t *testing.T) {
 // advertisements (and still excludes loopback).
 func TestDnsmasqArgs_V6EnablesRA(t *testing.T) {
 	args := dnsmasqArgs("br-v6", "2001:db8::2", "2001:db8::ffff", "64", "2001:db8::1/64",
-		"/var/run/litevirt-dnsmasq-br-v6.pid", nil, "", 0)
+		"/var/run/litevirt-dnsmasq-br-v6.pid", false, nil, "", 0)
 	if !hasArg(args, "--enable-ra") {
 		t.Error("--enable-ra not set for IPv6 gateway")
 	}
@@ -199,5 +199,54 @@ func TestDnsmasqArgs_V6EnablesRA(t *testing.T) {
 		if strings.HasPrefix(a, "--server=/") {
 			t.Errorf("unexpected domain-specific --server with no local resolver: %q", a)
 		}
+	}
+}
+
+// TestDnsmasqArgs_NoRouter pins what dnsmasq offers on a network with no
+// router (an isolated network): no DHCPv4 router option to a client its hosts
+// file tags lv-norouter, the bridge to every other client, and router
+// advertisements as on any network (they cannot be withheld from one guest).
+// A network with a router offers it to everyone.
+func TestDnsmasqArgs_NoRouter(t *testing.T) {
+	const tagged = "--dhcp-option=tag:lv-norouter,option:router"
+	cases := []struct {
+		name             string
+		start, end, mask string
+		gateway          string
+		noRouter         bool
+		want             bool
+	}{
+		{"v4 isolated", "10.0.0.2", "10.0.0.254", "255.255.255.0", "10.0.0.1/24", true, true},
+		{"v4 routed", "10.0.0.2", "10.0.0.254", "255.255.255.0", "10.0.0.1/24", false, false},
+		{"v6 isolated", "2001:db8::2", "2001:db8::ffff", "64", "2001:db8::1/64", true, false},
+		{"v6 routed", "2001:db8::2", "2001:db8::ffff", "64", "2001:db8::1/64", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := dnsmasqArgs("br-x", tc.start, tc.end, tc.mask, tc.gateway, "/run/lv-br-x.pid", tc.noRouter, nil, "", 0)
+			if got := hasArg(args, tagged); got != tc.want {
+				t.Errorf("%s present = %v, want %v\nargs: %s", tagged, got, tc.want, strings.Join(args, " "))
+			}
+			for _, a := range args {
+				if a == "--dhcp-option=option:router" || strings.HasPrefix(a, "--ra-param") {
+					t.Errorf("router withheld from every client: %q\nargs: %s", a, strings.Join(args, " "))
+				}
+			}
+		})
+	}
+}
+
+// TestCmdlineMatchesArgs_NoRouterIsDrift: a dnsmasq an earlier build started
+// on an isolated network offers the bridge as router; the next provision
+// must see that as drift and restart it, or a running host keeps handing out
+// the default route until its next reboot.
+func TestCmdlineMatchesArgs_NoRouterIsDrift(t *testing.T) {
+	want := dnsmasqArgs("br-iso-x", "10.0.0.2", "10.0.0.254", "255.255.255.0", "10.0.0.1/24",
+		"/run/lv-br-iso-x.pid", true, []string{"8.8.8.8"}, "litevirt.local", 5354)
+	old := dnsmasqArgs("br-iso-x", "10.0.0.2", "10.0.0.254", "255.255.255.0", "10.0.0.1/24",
+		"/run/lv-br-iso-x.pid", false, []string{"8.8.8.8"}, "litevirt.local", 5354)
+	blob := []byte(strings.Join(append([]string{"dnsmasq"}, old...), "\x00"))
+	if cmdlineMatchesArgs(blob, want) {
+		t.Error("a dnsmasq offering a router on an isolated network must be flagged stale")
 	}
 }

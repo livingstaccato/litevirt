@@ -18,7 +18,7 @@ import (
 func TestBridgeName_AgreesWithProvision(t *testing.T) {
 	execCommand = func(name string, args ...string) ([]byte, error) { return nil, nil }
 	defer func() { execCommand = defaultExec }()
-	startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string) error { return nil }
+	startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string, noRouter bool) error { return nil }
 	defer func() { startDHCPFunc = StartDHCP }()
 
 	db := corrosion.NewTestClientT(t)

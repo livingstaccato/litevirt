@@ -24,7 +24,7 @@ func installFakeDnsmasq(t *testing.T, stale ...string) *fakeDnsmasq {
 	origState, origRemove, origStart, origExec := dnsmasqState, removePidFile, startDHCPFunc, execCommand
 	dnsmasqState = func(p string) (bool, bool) { return f.present[p], f.alive[p] }
 	removePidFile = func(p string) error { delete(f.present, p); delete(f.alive, p); return nil }
-	startDHCPFunc = func(_, _, _, _, _, pidFile string) error {
+	startDHCPFunc = func(_, _, _, _, _, pidFile string, _ bool) error {
 		f.starts++
 		f.present[pidFile], f.alive[pidFile] = true, true
 		return nil

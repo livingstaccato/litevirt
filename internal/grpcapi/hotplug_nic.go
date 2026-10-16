@@ -631,6 +631,7 @@ func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, s
 		}
 	}
 	s.rebuildSeedNetworkConfig(ctx, vm, mac)
+	s.resyncDHCPHosts()
 	s.reconcileLocal(ctx)
 	slog.Info("nic attached", "vm", vm.Name, "network", spec.Name, "mac", mac)
 	s.recordVMEvent(ctx, vm.Name, "device.attached", "ok", "nic "+mac)
@@ -1115,6 +1116,7 @@ func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, n
 		}
 	}
 	s.rebuildSeedNetworkConfig(ctx, vm, "")
+	s.resyncDHCPHosts()
 	slog.Info("nic detached", "vm", vm.Name, "mac", mac)
 	s.recordVMEvent(ctx, vm.Name, "device.detached", "ok", "nic "+mac)
 	s.publish("device.detached", vm.Name, "nic:"+mac)

@@ -2541,6 +2541,33 @@ vms:
 		}
 	})
 
+	// The isolated network's dnsmasq offers no router to a NIC of a VM that
+	// has another NIC: vm1 (vxnet + isonet) takes no default route through
+	// its isolated NIC, whatever its cloud-init renderer does with the seed's
+	// use-routes: false. A VM whose only NIC is isolated is offered the
+	// bridge as before: vm3 keeps its default route through it.
+	t.Run("Isolated/DefaultRoute", func(t *testing.T) {
+		defaultVia := func(vm string) (iface string, has bool, all string) {
+			iface = getVMIfaceForSubnet(t, vm, "10.201.0.")
+			out, err := execRetry(t, vm, "ip", "-4", "route", "show", "default")
+			if err != nil {
+				t.Fatalf("ip route on %s failed: %v\n%s", vm, err, out)
+			}
+			for _, line := range strings.Split(out, "\n") {
+				if strings.Contains(" "+line+" ", " dev "+iface+" ") {
+					has = true
+				}
+			}
+			return iface, has, out
+		}
+		if iface, has, all := defaultVia(vm1Name); has {
+			t.Errorf("%s (two NICs) has a default route through its isolated interface %s:\n%s", vm1Name, iface, all)
+		}
+		if iface, has, all := defaultVia(vm3Name); !has {
+			t.Errorf("%s (only an isolated NIC) has no default route through %s; a VM whose only NIC is isolated keeps the bridge as router:\n%s", vm3Name, iface, all)
+		}
+	})
+
 	t.Run("Isolated/NoInternet", func(t *testing.T) {
 		iface := getVMIfaceForSubnet(t, vm1Name, "10.201.0.")
 		t.Logf("isolated interface on %s: %s", vm1Name, iface)

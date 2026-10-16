@@ -3,7 +3,8 @@ package network
 // DHCP host reservations: the exact address litevirt reserved for a guarded
 // NIC on a network it serves DHCP for, handed to dnsmasq as `mac,ip` lines in
 // a per-bridge --dhcp-hostsfile. A NIC's guard then allows exactly that
-// address, not the whole subnet.
+// address, not the whole subnet. The same file tags the NICs an isolated
+// network's dnsmasq offers no router (`mac,set:lv-norouter[,ip]`).
 
 import (
 	"bufio"
@@ -29,11 +30,22 @@ func DHCPHostsFile(bridge string) string {
 
 var hostsMu sync.Mutex
 
-// SyncDHCPHosts makes bridge's reservations exactly hosts (mac → ip) and asks
-// its dnsmasq to re-read them when they changed. A bridge with no hosts file
-// has no dnsmasq of litevirt's on this host, and is left alone. It reports
-// whether the file changed.
-func SyncDHCPHosts(bridge string, hosts map[string]string) (bool, error) {
+// NoRouterTag is the dnsmasq tag of a NIC that is offered no router: a NIC on
+// an isolated network of a VM that has another NIC (dnsmasqArgs).
+const NoRouterTag = "lv-norouter"
+
+// DHCPHost is one MAC's line in a hosts file: its reserved address ("" for
+// none) and whether it is offered no router.
+type DHCPHost struct {
+	IP       string
+	NoRouter bool
+}
+
+// SyncDHCPHosts makes bridge's hosts file exactly hosts (by MAC) and asks its
+// dnsmasq to re-read it when it changed. A bridge with no hosts file has no
+// dnsmasq of litevirt's on this host, and is left alone. It reports whether
+// the file changed.
+func SyncDHCPHosts(bridge string, hosts map[string]DHCPHost) (bool, error) {
 	hostsMu.Lock()
 	defer hostsMu.Unlock()
 	path := DHCPHostsFile(bridge)
@@ -82,19 +94,23 @@ func AddDHCPHost(bridge, mac, ip string) error {
 	mac = strings.ToLower(mac)
 	// One address, one MAC: a line another MAC still holds for ip — left by
 	// a host that was down when the network was deleted — would make dnsmasq
-	// refuse this one (re-review 5, L1).
-	for m, a := range hosts {
-		if a == ip && m != mac {
-			delete(hosts, m)
+	// refuse this one (re-review 5, L1). Its tag stays.
+	for m, h := range hosts {
+		if h.IP == ip && m != mac {
+			if h.NoRouter {
+				hosts[m] = DHCPHost{NoRouter: true}
+			} else {
+				delete(hosts, m)
+			}
 		}
 	}
-	hosts[mac] = ip
+	hosts[mac] = DHCPHost{IP: ip, NoRouter: hosts[mac].NoRouter}
 	hostsMu.Unlock()
 	_, err = SyncDHCPHosts(bridge, hosts)
 	return err
 }
 
-func renderDHCPHosts(hosts map[string]string) []byte {
+func renderDHCPHosts(hosts map[string]DHCPHost) []byte {
 	macs := make([]string, 0, len(hosts))
 	for m := range hosts {
 		macs = append(macs, m)
@@ -102,21 +118,40 @@ func renderDHCPHosts(hosts map[string]string) []byte {
 	sort.Strings(macs)
 	var b bytes.Buffer
 	for _, m := range macs {
-		if a, err := netip.ParseAddr(hosts[m]); err == nil && a.Is4() {
-			fmt.Fprintf(&b, "%s,%s\n", strings.ToLower(m), a)
+		h := hosts[m]
+		ip := ""
+		if a, err := netip.ParseAddr(h.IP); err == nil && a.Is4() {
+			ip = a.String()
+		}
+		switch {
+		case h.NoRouter && ip != "":
+			fmt.Fprintf(&b, "%s,set:%s,%s\n", strings.ToLower(m), NoRouterTag, ip)
+		case h.NoRouter:
+			fmt.Fprintf(&b, "%s,set:%s\n", strings.ToLower(m), NoRouterTag)
+		case ip != "":
+			fmt.Fprintf(&b, "%s,%s\n", strings.ToLower(m), ip)
 		}
 	}
 	return b.Bytes()
 }
 
-func parseDHCPHosts(data []byte) map[string]string {
-	out := map[string]string{}
+func parseDHCPHosts(data []byte) map[string]DHCPHost {
+	out := map[string]DHCPHost{}
 	sc := bufio.NewScanner(bytes.NewReader(data))
 	for sc.Scan() {
 		f := strings.Split(strings.TrimSpace(sc.Text()), ",")
-		if len(f) == 2 {
-			out[strings.ToLower(f[0])] = f[1]
+		if len(f) < 2 || f[0] == "" {
+			continue
 		}
+		var h DHCPHost
+		for _, v := range f[1:] {
+			if v == "set:"+NoRouterTag {
+				h.NoRouter = true
+			} else if !strings.Contains(v, ":") {
+				h.IP = v
+			}
+		}
+		out[strings.ToLower(f[0])] = h
 	}
 	return out
 }

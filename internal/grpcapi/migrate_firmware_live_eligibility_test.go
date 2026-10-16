@@ -28,18 +28,20 @@ const (
 	fwLiveAttempt2 = "a7000000-0000-4000-8000-000000000002"
 )
 
-// stubFWCode is a host's firmware code as stage A reads it.
+// stubFWCode is a host's LiveFirmwareHost, as stage A and Prepare read it.
 type stubFWCode struct {
-	installed    lv.InstalledFirmwareCode
-	installedErr error
-	running      lv.FirmwareRuntime
-	runningErr   error
-	gotXML       string // the live XML RunningFirmwareCode was given
+	installed  lv.InstalledFirmwareCode
+	checkErr   error // the first condition of Check that fails
+	checks     int   // Check calls
+	running    lv.FirmwareRuntime
+	runningErr error
+	gotXML     string // the live XML RunningFirmwareCode was given
 }
 
-func (c *stubFWCode) Installed(context.Context) (lv.InstalledFirmwareCode, error) {
-	if c.installedErr != nil {
-		return lv.InstalledFirmwareCode{}, c.installedErr
+func (c *stubFWCode) Check(context.Context) (lv.InstalledFirmwareCode, error) {
+	c.checks++
+	if c.checkErr != nil {
+		return lv.InstalledFirmwareCode{}, c.checkErr
 	}
 	return c.installed, nil
 }
@@ -60,13 +62,12 @@ var fwFloorRuntime = lv.FirmwareRuntime{Libvirt: "10.0.0", QEMU: "8.2.2", Swtpm:
 // one host-local disk, eligible for a live move to dst-host with
 // --with-storage. Each stage A row breaks exactly one thing.
 type fwLiveFixture struct {
-	s         *Server
-	virt      *libvirtfake.Fake
-	code      *stubFWCode
-	guestsErr error
-	tls       bool
-	spec      map[string]any
-	m         liveFirmwareMove
+	s    *Server
+	virt *libvirtfake.Fake
+	code *stubFWCode
+	tls  bool
+	spec map[string]any
+	m    liveFirmwareMove
 }
 
 func setFWTestFirmwarePaths(t *testing.T, s *Server) {
@@ -114,8 +115,7 @@ func newFWLiveFixture(t *testing.T) *fwLiveFixture {
 	f.s.virt = f.virt
 	f.setXML(fwLiveDomainXML(fwLiveUUID, f.s.firmware.SecbootCode, f.s.fw().NvramPath("os1"), true, "yes"))
 	f.code = &stubFWCode{installed: lv.InstalledFirmwareCode{Runtime: fwFloorRuntime}, running: fwFloorRuntime}
-	f.s.SetLiveFirmware(true, func(context.Context) error { return f.guestsErr })
-	f.s.setLiveFirmwareCodeForTest(f.code)
+	f.s.SetLiveFirmwareHost(f.code)
 	f.s.SetMigrationTLS(func() (bool, error) { return f.tls, nil })
 	f.spec = map[string]any{"name": "os1", "secure_boot": true, "tpm": true, "firmware": "uefi", "uuid": fwLiveUUID}
 	f.m = liveFirmwareMove{
@@ -220,15 +220,22 @@ func TestLiveFirmwareEligibility(t *testing.T) {
 			want   []string
 		}{
 			// Item 1.
-			{"config_off", func(f *fwLiveFixture) { f.s.liveFW.enabled = false }, []string{"migration.live_firmware is off on src-host"}},
-			{"installed_unreadable", func(f *fwLiveFixture) { f.code.installedErr = errors.New("swtpm --version: exit 1") },
-				[]string{"installed firmware code", "swtpm --version"}},
+			// Item 1: the host check (its conditions are the daemon's,
+			// internal/daemon fw_live_host_test.go); each reason reaches
+			// the refusal.
+			{"config_off", func(f *fwLiveFixture) { f.code.checkErr = errors.New("migration.live_firmware is off") },
+				[]string{"src-host cannot take part: migration.live_firmware is off"}},
+			{"installed_unreadable", func(f *fwLiveFixture) {
+				f.code.checkErr = errors.New("installed firmware code: swtpm --version: exit 1")
+			}, []string{"installed firmware code", "swtpm --version"}},
 			{"floor_unmet", func(f *fwLiveFixture) {
-				f.code.installed.Runtime.QEMU, f.code.running.QEMU = "8.2.1", "8.2.1"
+				rt := fwFloorRuntime
+				rt.QEMU = "8.2.1"
+				f.code.checkErr = lv.FirmwareFloorsMet(rt)
 			}, []string{"qemu 8.2.1 is below"}},
-			{"libvirt_guests", func(f *fwLiveFixture) { f.guestsErr = errors.New("libvirt-guests: ON_SHUTDOWN=suspend") },
+			{"libvirt_guests", func(f *fwLiveFixture) { f.code.checkErr = errors.New("libvirt-guests: ON_SHUTDOWN=suspend") },
 				[]string{"ON_SHUTDOWN=suspend"}},
-			{"libvirt_guests_unwired", func(f *fwLiveFixture) { f.s.liveFW.guests = nil }, []string{"cannot check libvirt-guests"}},
+			{"host_unwired", func(f *fwLiveFixture) { f.s.SetLiveFirmwareHost(nil) }, []string{"cannot check its own live firmware runtime"}},
 			// Item 2.
 			{"source_paused", func(f *fwLiveFixture) { f.virt.SetPaused("os1") }, []string{"paused"}},
 			{"source_shut_off", func(f *fwLiveFixture) { f.virt.SetState("os1", libvirtfake.StateShutdown) }, []string{"not running"}},
@@ -401,6 +408,11 @@ func TestLiveFirmwareEligibility(t *testing.T) {
 			r := ok()
 			r.DstApplicability = nil
 			requireRefusal(t, liveFirmwareStageB("os1", "dst-host", a, r, nil), "applicability")
+		})
+		t.Run("runtime_differs", func(t *testing.T) {
+			r := ok()
+			r.DstRuntime.Qemu = "8.2.3"
+			requireRefusal(t, liveFirmwareStageB("os1", "dst-host", a, r, nil), "qemu differs")
 		})
 		t.Run("target_live_firmware_off", func(t *testing.T) {
 			r := ok()
@@ -613,39 +625,29 @@ func TestLiveFirmwareFingerprint(t *testing.T) {
 	}
 }
 
-// TestInstalledFirmwareRuntime: a host's installed runtime in RPC form carries
-// its live firmware fingerprint and migration.live_firmware, and an
-// unreadable install is an error.
+// TestPbFirmwareRuntime: the runtime a live firmware move sends carries the
+// host's live firmware fingerprint in place of the probe's own OVMF one (which
+// is over the host's own dataDir, not the layout's), with
+// live_firmware_enabled; an unreadable OVMF file is an error.
 //
 // Mutation: send the probe's own OVMF fingerprint; drop live_firmware_enabled — red.
-func TestInstalledFirmwareRuntime(t *testing.T) {
+func TestPbFirmwareRuntime(t *testing.T) {
 	f := newFWLiveFixture(t)
-	rt, err := f.s.installedFirmwareRuntime(context.Background())
+	f.s.SetFirmwareLayoutDirForTest(t.TempDir())
+	rt, err := f.s.pbFirmwareRuntime(probeRuntime(t, f.s))
 	if err != nil {
 		t.Fatal(err)
 	}
 	want, _ := f.s.liveFirmwareFingerprint()
 	if rt.Qemu != "8.2.2" || rt.OvmfFingerprint != want || !rt.LiveFirmwareEnabled {
-		t.Fatalf("installed runtime %+v, want fingerprint %q and live_firmware_enabled", rt, want)
+		t.Fatalf("runtime %+v, want fingerprint %q and live_firmware_enabled", rt, want)
 	}
-	f.s.liveFW.enabled = false
-	if rt, _ = f.s.installedFirmwareRuntime(context.Background()); rt.LiveFirmwareEnabled {
-		t.Fatal("live_firmware_enabled with migration.live_firmware off")
+	if err := os.Remove(f.s.firmware.MsVars); err != nil {
+		t.Fatal(err)
 	}
-	f.code.installedErr = errors.New("unreadable")
-	if _, err := f.s.installedFirmwareRuntime(context.Background()); err == nil {
-		t.Fatal("an unreadable install gave a runtime")
+	if _, err := f.s.pbFirmwareRuntime(fwFloorRuntime); err == nil {
+		t.Fatal("an unreadable OVMF file gave a runtime")
 	}
-}
-
-// TestLiveFirmwareCode_NoVersionRefuses: without an injected probe, a backend
-// that cannot report libvirt's version leaves the production probe without
-// one, and stage A refuses rather than passing on nothing.
-func TestLiveFirmwareCode_NoVersionRefuses(t *testing.T) {
-	f := newFWLiveFixture(t)
-	f.s.liveFW.code = nil
-	_, err := f.stageA(t)
-	requireRefusal(t, err, "installed firmware code", "libvirt version")
 }
 
 // TestFirmwareRouteOverride is T-37 (spec §6.0): a live firmware move's

@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/libvirt"
 )
@@ -49,7 +50,8 @@ func TestFwLiveHostCheck_Reasons(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			h := okHost()
 			c.set(&h)
-			rt, err := fwLiveHostCheck(c.cfg, h)(context.Background())
+			code, err := fwLiveHostCheck{cfg: c.cfg, h: h}.Check(context.Background())
+			rt := code.Runtime
 			if c.want == "" {
 				want, _ := okInstalled()
 				if err != nil || rt != want.Runtime {
@@ -71,9 +73,9 @@ func TestFwLiveHostCheck_LibvirtGuestsReadEachTime(t *testing.T) {
 	h := okHost()
 	calls := 0
 	h.guests = func(context.Context) error { calls++; return nil }
-	check := fwLiveHostCheck(MigrationConfig{}, h)
+	check := fwLiveHostCheck{cfg: MigrationConfig{}, h: h}
 	for i := 0; i < 3; i++ {
-		if _, err := check(context.Background()); err != nil {
+		if _, err := check.Check(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -82,15 +84,65 @@ func TestFwLiveHostCheck_LibvirtGuestsReadEachTime(t *testing.T) {
 	}
 }
 
-// The production probes behind the label and the Prepare check read
-// libvirt-guests with CheckLibvirtGuests.
+// The production probes behind the label and the host check read
+// libvirt-guests with CheckLibvirtGuests, and the installed and running code
+// from one probe.
 //
-// Mutation: hand newFwLiveHost another guests check — red.
+// Mutations: hand newFwLiveHost another guests check, or leave running unset
+// — red.
 func TestNewFwLiveHost_ReadsLibvirtGuests(t *testing.T) {
 	h := newFwLiveHost(libvirt.NewFirmwareStore(t.TempDir()), libvirt.FirmwarePaths{},
 		func() (uint64, error) { return 10000000, nil }, func() bool { return true })
 	if reflect.ValueOf(h.guests).Pointer() != reflect.ValueOf(CheckLibvirtGuests).Pointer() {
 		t.Fatal("newFwLiveHost does not read libvirt-guests with CheckLibvirtGuests")
+	}
+	if h.installed == nil || h.running == nil {
+		t.Fatal("newFwLiveHost has no installed or running code probe")
+	}
+}
+
+// RunningFirmwareCode is the probe's, given the live XML, under a deadline
+// of fwLiveProbeTimeout; its error is passed on.
+//
+// Mutations: call it without the deadline, or drop the XML — red.
+func TestFwLiveHostCheck_RunningFirmwareCodeBounded(t *testing.T) {
+	h := okHost()
+	var gotXML string
+	var deadline time.Time
+	var hasDeadline bool
+	h.running = func(ctx context.Context, x string) (libvirt.FirmwareRuntime, error) {
+		gotXML = x
+		deadline, hasDeadline = ctx.Deadline()
+		return libvirt.FirmwareRuntime{QEMU: "8.2.2"}, nil
+	}
+	start := time.Now()
+	rt, err := fwLiveHostCheck{h: h}.RunningFirmwareCode(context.Background(), "<domain/>")
+	if err != nil || rt.QEMU != "8.2.2" || gotXML != "<domain/>" {
+		t.Fatalf("running = %+v, %v (xml %q)", rt, err, gotXML)
+	}
+	if !hasDeadline || deadline.Sub(start) > fwLiveProbeTimeout+time.Second {
+		t.Fatalf("running code read without the %s bound (deadline %v, set %v)", fwLiveProbeTimeout, deadline.Sub(start), hasDeadline)
+	}
+	h.running = func(context.Context, string) (libvirt.FirmwareRuntime, error) {
+		return libvirt.FirmwareRuntime{}, errors.New("qemu exe (deleted)")
+	}
+	if _, err := (fwLiveHostCheck{h: h}).RunningFirmwareCode(context.Background(), "<domain/>"); err == nil || !strings.Contains(err.Error(), "deleted") {
+		t.Fatalf("running error = %v", err)
+	}
+}
+
+// Check runs under a deadline of fwLiveProbeTimeout.
+//
+// Mutation: drop the deadline from Check — red.
+func TestFwLiveHostCheck_CheckBounded(t *testing.T) {
+	h := okHost()
+	var hasDeadline bool
+	h.installed = func(ctx context.Context) (libvirt.InstalledFirmwareCode, error) {
+		_, hasDeadline = ctx.Deadline()
+		return okInstalled()
+	}
+	if _, err := (fwLiveHostCheck{h: h}).Check(context.Background()); err != nil || !hasDeadline {
+		t.Fatalf("check = %v, deadline set %v", err, hasDeadline)
 	}
 }
 

@@ -30,6 +30,8 @@ const (
 	fwtSrc  = "src"
 )
 
+// fwtRuntime is the target's installed runtime as its probe reads it (the
+// probe's own OVMF fingerprint, which the RPC form replaces).
 var fwtRuntime = lv.FirmwareRuntime{Libvirt: "10.0.0", QEMU: "8.2.2", Swtpm: "0.7.3", Libtpms: "0.9.3",
 	OVMFFingerprint: strings.Repeat("ab", 32)}
 
@@ -59,12 +61,14 @@ func newFwtFixture(t *testing.T, spec string) *fwtFixture {
 	fake.SetFirmwareStore(store)
 	s.virt = fake
 	fwmig.Wire(fake, store)
+	setFWTestFirmwarePaths(t, s)
+	s.db.MarkReplicaCaughtUpForTests("test")
 	insertTestVMWithSpec(t, adminCtx(), s.db, fwtVM, fwtSrc, "migrating", spec)
 	row, err := corrosion.GetVM(context.Background(), s.db, fwtVM)
 	if err != nil || row == nil {
 		t.Fatalf("GetVM: %v", err)
 	}
-	s.SetLiveFirmwareHost(func(context.Context) (lv.FirmwareRuntime, error) { return fwtRuntime, nil })
+	s.SetLiveFirmwareHost(&stubFWCode{installed: lv.InstalledFirmwareCode{Runtime: fwtRuntime}})
 	peer := context.WithValue(peerCtxFor(t, s, fwtSrc), ctxKeyUsername, "admin")
 	peer = context.WithValue(peer, ctxKeyRole, "admin")
 	return &fwtFixture{t: t, s: s, fake: fake, store: store, recs: fwmig.New(s.dataDir), row: row, peer: peer}
@@ -72,14 +76,25 @@ func newFwtFixture(t *testing.T, spec string) *fwtFixture {
 
 var fwtNvram = []byte("source-nvram-T0")
 
+// srcRuntime is what a source with this host's firmware code sends: the same
+// builder, pbFirmwareRuntime.
+func (f *fwtFixture) srcRuntime() *pb.FirmwareRuntime {
+	f.t.Helper()
+	rt, err := f.s.pbFirmwareRuntime(fwtRuntime)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return rt
+}
+
 func (f *fwtFixture) prepareReq(attempt string, active bool) *pb.PrepareLiveFirmwareTargetRequest {
-	tpm, uefi := firmwareApplicability(f.row.Spec)
+	app := liveFirmwareApplicability(parseFirmwareSpec(f.row.Spec))
 	req := &pb.PrepareLiveFirmwareTargetRequest{
 		VmName: fwtVM, Uuid: fwtUUID, CreatedAt: f.row.CreatedAt, AttemptId: attempt, ProtocolVersion: 1,
-		SrcRuntime: runtimeToProto(fwtRuntime, true), SrcApplicability: &pb.FirmwareApplicability{Tpm: tpm, Uefi: uefi},
+		SrcRuntime: f.srcRuntime(), SrcApplicability: app,
 		SourceDomainActive: active,
 	}
-	if uefi {
+	if app.Uefi {
 		req.Nvram = fwtNvram
 	}
 	return req
@@ -194,9 +209,7 @@ func TestPrepareLiveFirmwareTarget_Refusals(t *testing.T) {
 		text  string
 	}{
 		{"1 host check fails (config off)", func(f *fwtFixture, _ *pb.PrepareLiveFirmwareTargetRequest) context.Context {
-			f.s.SetLiveFirmwareHost(func(context.Context) (lv.FirmwareRuntime, error) {
-				return lv.FirmwareRuntime{}, errors.New("migration.live_firmware is off")
-			})
+			f.s.SetLiveFirmwareHost(&stubFWCode{checkErr: errors.New("migration.live_firmware is off")})
 			return f.peer
 		}, codes.FailedPrecondition, "migration.live_firmware is off"},
 		{"1 no host check", func(f *fwtFixture, _ *pb.PrepareLiveFirmwareTargetRequest) context.Context {
@@ -206,11 +219,21 @@ func TestPrepareLiveFirmwareTarget_Refusals(t *testing.T) {
 		{"1 runtime differs (qemu)", func(f *fwtFixture, req *pb.PrepareLiveFirmwareTargetRequest) context.Context {
 			req.SrcRuntime.Qemu = "8.2.1"
 			return f.peer
-		}, codes.FailedPrecondition, `qemu: source "8.2.1", target "8.2.2"`},
+		}, codes.FailedPrecondition, "qemu differs: source runs 8.2.1, target has 8.2.2"},
 		{"1 runtime differs (ovmf)", func(f *fwtFixture, req *pb.PrepareLiveFirmwareTargetRequest) context.Context {
-			req.SrcRuntime.OvmfFingerprint = strings.Repeat("cd", 32)
+			l, _, _ := splitLiveFirmwareFingerprint(req.SrcRuntime.OvmfFingerprint)
+			req.SrcRuntime.OvmfFingerprint = liveFWLayoutPrefix + l + " " + liveFWOVMFPrefix + strings.Repeat("cd", 32)
 			return f.peer
-		}, codes.FailedPrecondition, "ovmf_fingerprint"},
+		}, codes.FailedPrecondition, "ovmf_fingerprint (OVMF content) differs"},
+		{"1 runtime differs (layout)", func(f *fwtFixture, req *pb.PrepareLiveFirmwareTargetRequest) context.Context {
+			_, o, _ := splitLiveFirmwareFingerprint(req.SrcRuntime.OvmfFingerprint)
+			req.SrcRuntime.OvmfFingerprint = liveFWLayoutPrefix + strings.Repeat("cd", 32) + " " + liveFWOVMFPrefix + o
+			return f.peer
+		}, codes.FailedPrecondition, "firmware layout (dataDir and OVMF paths) differs"},
+		{"1 runtime in the probe's raw format", func(f *fwtFixture, req *pb.PrepareLiveFirmwareTargetRequest) context.Context {
+			req.SrcRuntime.OvmfFingerprint = fwtRuntime.OVMFFingerprint
+			return f.peer
+		}, codes.FailedPrecondition, "not readable"},
 		{"1 runtime not sent", func(f *fwtFixture, req *pb.PrepareLiveFirmwareTargetRequest) context.Context {
 			req.SrcRuntime = nil
 			return f.peer
@@ -291,6 +314,10 @@ func TestPrepareLiveFirmwareTarget_HoldsThenMaterialises(t *testing.T) {
 		resp.DstRuntime.GetQemu() != "8.2.2" || !resp.DstRuntime.GetLiveFirmwareEnabled() {
 		t.Fatalf("response %+v", resp)
 	}
+	// The answer is built as stage A builds src_runtime (pbFirmwareRuntime).
+	if want, _ := f.s.liveFirmwareFingerprint(); resp.DstRuntime.GetOvmfFingerprint() != want {
+		t.Fatalf("dst_runtime fingerprint %q, want the live firmware fingerprint %q", resp.DstRuntime.GetOvmfFingerprint(), want)
+	}
 	h, ok, err := f.recs.GetHoldFor(fwtVM, f.binding(fwtA1))
 	if err != nil || !ok {
 		t.Fatalf("hold: %v %v", ok, err)
@@ -334,14 +361,11 @@ func TestPrepareLiveFirmwareTarget_BIOSTPMNoNvram(t *testing.T) {
 // Mutation: skip the host check (read the label instead) — red.
 func TestPrepare_LibvirtGuestsRefused(t *testing.T) {
 	f := newFwtFixture(t, fwtSpecSBTPM)
-	calls := 0
-	f.s.SetLiveFirmwareHost(func(context.Context) (lv.FirmwareRuntime, error) {
-		calls++
-		return lv.FirmwareRuntime{}, errors.New("libvirt-guests: ON_SHUTDOWN=suspend saves guests")
-	})
+	host := &stubFWCode{checkErr: errors.New("libvirt-guests: ON_SHUTDOWN=suspend saves guests")}
+	f.s.SetLiveFirmwareHost(host)
 	_, err := f.s.PrepareLiveFirmwareTarget(f.peer, f.prepareReq(fwtA1, true))
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "libvirt-guests") || calls != 1 {
-		t.Fatalf("Prepare = %v (checks %d)", err, calls)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "libvirt-guests") || host.checks != 1 {
+		t.Fatalf("Prepare = %v (checks %d)", err, host.checks)
 	}
 	if _, ok, _ := f.recs.GetHold(fwtVM); ok || fwtExists(f.store.NvramPath(fwtVM)) {
 		t.Fatal("a refused Prepare wrote")
@@ -857,5 +881,77 @@ func TestFirmwareMigrationConditions_EveryCode(t *testing.T) {
 	}
 	if err := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{Code: "firmware_migration_bogus", VM: "v1"}); err == nil {
 		t.Fatal("an unknown code was raised")
+	}
+}
+
+// The sweep judges a stale hold's row only from a replica that has caught up
+// with a peer, as DeletedVMMarkerSweepTick does: after a long outage every
+// hold is stale on the first pass while the replica is at its stalest. A hold
+// with a domain still raises firmware_migration_held from a stale replica.
+//
+// Mutation: drop the ReplicaCaughtUp gate — the stale-replica pass
+// quarantines, red.
+func TestHoldSweep_WaitsForReplicaCatchUp(t *testing.T) {
+	f := newFwtFixture(t, fwtSpecSBTPM)
+	if err := f.s.db.Execute(context.Background(), `DELETE FROM vms WHERE name = ?`, fwtVM); err != nil {
+		t.Fatal(err)
+	}
+	f.putHold(fwmig.Hold{Binding: f.binding(fwtA1), State: fwmig.HoldPrepared, Since: time.Now().Add(-3 * time.Hour)}, []byte("t0"), []byte("tpm"))
+	f.s.db.MarkReplicaStale("test: no peer exchange yet")
+	f.s.FirmwareHoldSweepOnce(context.Background(), time.Now())
+	if _, ok, _ := f.recs.GetHold(fwtVM); !ok || fwtExists(f.quarantine(fwtA1)) {
+		t.Fatal("the sweep disposed of a hold from a replica that has not caught up")
+	}
+	f.s.db.MarkReplicaCaughtUpForTests("test")
+	f.s.FirmwareHoldSweepOnce(context.Background(), time.Now())
+	if _, ok, _ := f.recs.GetHold(fwtVM); ok || string(fwtRead(filepath.Join(f.quarantine(fwtA1), "nvram"))) != "t0" {
+		t.Fatal("the caught-up sweep did not quarantine the abandoned hold")
+	}
+}
+
+// DISCARD refuses once the commit has landed — the row names this host, for
+// the hold's incarnation — so a stray DISCARD never takes the owner's held
+// domain away; the hold, the domain and the state stay.
+//
+// Mutation: drop the row check before DiscardFirmwareMoveTarget — red.
+func TestAbort_Discard_RefusesAfterCommit(t *testing.T) {
+	for _, st := range []fwmig.HoldState{fwmig.HoldVerified, fwmig.HoldResuming} {
+		t.Run(string(st), func(t *testing.T) {
+			f := newFwtFixture(t, fwtSpecSBTPM)
+			f.defineDomain(libvirtfake.StatePaused)
+			f.putHold(fwmig.Hold{Binding: f.binding(fwtA1), State: st}, []byte("t0"), []byte("tpm"))
+			f.setRow("running", "dst")
+			resp, err := f.abort(f.peer, fwtA1, discard, false, f.binding(fwtA1))
+			if err != nil || !resp.Refused || !strings.Contains(resp.Detail, "names dst") {
+				t.Fatalf("DISCARD after the commit = %+v, %v", resp, err)
+			}
+			if !f.fake.DomainExists(fwtVM) {
+				t.Fatal("the owner's held domain was discarded")
+			}
+			if _, ok, _ := f.recs.GetHold(fwtVM); !ok || fwtExists(f.quarantine(fwtA1)) || string(fwtRead(f.store.NvramPath(fwtVM))) != "t0" {
+				t.Fatal("a refused discard disposed of the hold")
+			}
+		})
+	}
+}
+
+// The DISCARD refusal is bound to the hold's incarnation: a row that names
+// this host for ANOTHER incarnation (the VM was recreated here) is not this
+// attempt's commit, and an owed DISCARD of the old attempt with no domain
+// left still quarantines its hold.
+//
+// Mutation: refuse whenever the row names this host — red.
+func TestAbort_Discard_OtherIncarnationHereStillLands(t *testing.T) {
+	f := newFwtFixture(t, fwtSpecSBTPM)
+	b := f.binding(fwtA1)
+	b.CreatedAt = "2001-01-01T00:00:00Z"
+	f.putHold(fwmig.Hold{Binding: b, State: fwmig.HoldMismatch}, []byte("t0"), []byte("tpm"))
+	f.setRow("running", "dst")
+	resp, err := f.abort(f.peer, fwtA1, discard, false, b)
+	if err != nil || resp.Refused {
+		t.Fatalf("DISCARD of another incarnation's hold = %+v, %v", resp, err)
+	}
+	if _, ok, _ := f.recs.GetHold(fwtVM); ok || string(fwtRead(filepath.Join(f.quarantine(fwtA1), "nvram"))) != "t0" {
+		t.Fatal("the old attempt's hold was not quarantined")
 	}
 }

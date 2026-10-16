@@ -39,27 +39,33 @@ import (
 // liveFirmwareProtocolVersion is the Prepare protocol this build speaks.
 const liveFirmwareProtocolVersion = 1
 
-// LiveFirmwareHostCheck is this host's live check for a live firmware move
-// (spec §6.2 item 1): migration.live_firmware on, the installed versions at
-// their floors, the vTPM and Secure Boot probes true, and libvirt-guests not
-// set to save or restore guests (D-9), each read now. It returns the host's
-// installed firmware runtime, or why the host cannot take part. The daemon
-// builds it (internal/daemon); a Server without one refuses every Prepare.
-type LiveFirmwareHostCheck func(ctx context.Context) (lv.FirmwareRuntime, error)
-
-// fwTargetState is the Server's live firmware target state.
+// fwTargetState is the Server's live firmware host check.
 type fwTargetState struct {
-	host atomic.Pointer[LiveFirmwareHostCheck]
+	host atomic.Pointer[liveFirmwareHostBox]
 }
 
-// SetLiveFirmwareHost installs the host check Prepare runs (the daemon passes
-// the one it builds from its config and probes). nil removes it.
-func (s *Server) SetLiveFirmwareHost(fn LiveFirmwareHostCheck) {
-	if fn == nil {
+// liveFirmwareHostBox holds a LiveFirmwareHost for the atomic pointer.
+type liveFirmwareHostBox struct{ LiveFirmwareHost }
+
+// SetLiveFirmwareHost installs this host's live firmware check, which stage A
+// (as a move's source) and Prepare (as its target) both read; the daemon
+// passes the one it builds from its config and probes. The RPC server may
+// already be serving, so it is held in an atomic. nil removes it, and a
+// Server without one refuses every live firmware move.
+func (s *Server) SetLiveFirmwareHost(h LiveFirmwareHost) {
+	if h == nil {
 		s.fwTarget.host.Store(nil)
 		return
 	}
-	s.fwTarget.host.Store(&fn)
+	s.fwTarget.host.Store(&liveFirmwareHostBox{h})
+}
+
+// liveFirmwareHost is the installed check, or nil.
+func (s *Server) liveFirmwareHost() LiveFirmwareHost {
+	if b := s.fwTarget.host.Load(); b != nil {
+		return b.LiveFirmwareHost
+	}
+	return nil
 }
 
 // fwRecords is this host's firmware move records, beside its firmware store.
@@ -112,42 +118,6 @@ func (s *Server) targetDomain(name string) (*pb.TargetDomain, error) {
 	return td, nil
 }
 
-// ── Applicability and runtime ──
-
-// firmwareApplicability is which firmware state the VM carries, from this
-// host's own row (spec §4): tpm = spec tpm; uefi = an NVRAM-keeping firmware
-// AND (secure_boot OR tpm).
-func firmwareApplicability(spec string) (tpm, uefi bool) {
-	fs := parseFirmwareSpec(spec)
-	return fs.Tpm, fwmig.UEFI(fs.hasNvram(), fs.SecureBoot, fs.Tpm)
-}
-
-func runtimeToProto(r lv.FirmwareRuntime, enabled bool) *pb.FirmwareRuntime {
-	return &pb.FirmwareRuntime{Libvirt: r.Libvirt, Qemu: r.QEMU, Swtpm: r.Swtpm, Libtpms: r.Libtpms,
-		OvmfFingerprint: r.OVMFFingerprint, LiveFirmwareEnabled: enabled}
-}
-
-// firmwareRuntimeDiff names the first field in which src differs from dst,
-// with both values; "" when they are equal. A field the source left empty
-// differs (an empty value is never a version).
-func firmwareRuntimeDiff(src *pb.FirmwareRuntime, dst lv.FirmwareRuntime) string {
-	if src == nil {
-		return "src_runtime: not sent"
-	}
-	for _, f := range []struct{ name, src, dst string }{
-		{"libvirt", src.Libvirt, dst.Libvirt},
-		{"qemu", src.Qemu, dst.QEMU},
-		{"swtpm", src.Swtpm, dst.Swtpm},
-		{"libtpms", src.Libtpms, dst.Libtpms},
-		{"ovmf_fingerprint", src.OvmfFingerprint, dst.OVMFFingerprint},
-	} {
-		if f.src == "" || f.src != f.dst {
-			return fmt.Sprintf("%s: source %q, target %q", f.name, f.src, f.dst)
-		}
-	}
-	return ""
-}
-
 // ── Prepare (spec §6.2) ──
 
 // PrepareLiveFirmwareTarget holds this host as the target of a live firmware
@@ -185,7 +155,8 @@ func (s *Server) PrepareLiveFirmwareTarget(ctx context.Context, req *pb.PrepareL
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"VM %q: the source names incarnation %q, this host's replica holds %q", vm.Name, req.CreatedAt, vm.CreatedAt)
 	}
-	tpm, uefi := firmwareApplicability(vm.Spec)
+	app := liveFirmwareApplicability(fs)
+	tpm, uefi := app.Tpm, app.Uefi
 	planned := fwmig.Hold{
 		VM: vm.Name, Binding: fwmig.Binding{UUID: strings.ToLower(req.Uuid), CreatedAt: req.CreatedAt, Attempt: req.AttemptId},
 		Source: src, Since: time.Now().UTC(), State: fwmig.HoldPrepared, TPM: tpm, UEFI: uefi,
@@ -205,18 +176,27 @@ func (s *Server) PrepareLiveFirmwareTarget(ctx context.Context, req *pb.PrepareL
 	s.firmwareTargets.op.Lock()
 	defer s.firmwareTargets.op.Unlock()
 
-	// 1. This host, read now, and the source's runtime and applicability.
-	host := s.fwTarget.host.Load()
+	// 1. This host, read now, and the source's runtime and applicability,
+	// compared as stage B compares them (compareFirmwareRuntimes) with the
+	// runtime this host answers.
+	host := s.liveFirmwareHost()
 	if host == nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "%s cannot check its own live firmware runtime", s.hostName)
 	}
-	dst, err := (*host)(ctx)
+	installed, err := host.Check(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "%s cannot take a live firmware move: %v", s.hostName, err)
 	}
-	if d := firmwareRuntimeDiff(req.SrcRuntime, dst); d != "" {
+	own, err := s.pbFirmwareRuntime(installed.Runtime)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "%s cannot take a live firmware move: %v", s.hostName, err)
+	}
+	if req.SrcRuntime == nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "VM %q: the source sent no src_runtime", vm.Name)
+	}
+	if err := compareFirmwareRuntimes(req.SrcRuntime, own); err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"VM %q: the firmware runtimes of %s and %s differ (%s); a live firmware move needs equal runtimes", vm.Name, src, s.hostName, d)
+			"VM %q: the firmware runtimes of %s and %s differ: %v", vm.Name, src, s.hostName, err)
 	}
 	if a := req.SrcApplicability; a == nil || a.Tpm != tpm || a.Uefi != uefi {
 		return nil, status.Errorf(codes.FailedPrecondition,
@@ -275,8 +255,8 @@ func (s *Server) PrepareLiveFirmwareTarget(ctx context.Context, req *pb.PrepareL
 	}
 	slog.Info("live firmware move: target held", "vm", vm.Name, "attempt", planned.Attempt, "source", src, "tpm", tpm, "uefi", uefi)
 	return &pb.PrepareLiveFirmwareTargetResponse{
-		DstRuntime:       runtimeToProto(dst, true),
-		DstApplicability: &pb.FirmwareApplicability{Tpm: tpm, Uefi: uefi},
+		DstRuntime:       own,
+		DstApplicability: app,
 		SwtpmAbsent:      planned.SwtpmAbsentAtPrepare,
 		TargetDomain:     td,
 	}, nil
@@ -505,6 +485,18 @@ func (s *Server) AbortLiveFirmwareTarget(ctx context.Context, req *pb.AbortLiveF
 		if td.Present && td.State != "paused" && td.State != "shutoff" {
 			return refuse(fmt.Sprintf("its domain is %s here; a discard never stops a guest that may run", td.State))
 		}
+		// A commit that landed made the held guest the owner: the row names
+		// this host for the hold's incarnation. The source sends a DISCARD
+		// only before the commit, or with the row naming it, so one that
+		// finds this is stray. A row that cannot be read decides nothing.
+		row, rerr := corrosion.GetVM(ctx, s.db, h.VM)
+		if rerr != nil {
+			return nil, status.Errorf(codes.Unavailable, "VM %q: its row cannot be read: %v", h.VM, rerr)
+		}
+		if row != nil && row.HostName == s.hostName &&
+			h.Binding.SameIncarnation(fwmig.Binding{UUID: parseFirmwareSpec(row.Spec).UUID, CreatedAt: row.CreatedAt}) {
+			return refuse(fmt.Sprintf("the VM's row names %s for this incarnation: the move committed, and the held guest is its owner", s.hostName))
+		}
 		// The domain goes first (destroy if paused, undefine keeping its
 		// state), so the state is never moved from under a defined domain.
 		if s.virt == nil {
@@ -640,6 +632,13 @@ func (s *Server) sweepFirmwareHold(ctx context.Context, vmName string, now time.
 		return true
 	}
 	if now.Sub(h.Since) < heldStaleAfter {
+		return false
+	}
+	// The row is judged only from a replica that has caught up with a peer,
+	// as DeletedVMMarkerSweepTick does: after an outage longer than
+	// heldStaleAfter every hold is stale on the first pass, while the replica
+	// is at its stalest. A later pass decides.
+	if ok, _ := s.db.ReplicaCaughtUp(); !ok {
 		return false
 	}
 	row, err := corrosion.GetVM(ctx, s.db, h.VM)

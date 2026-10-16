@@ -132,6 +132,9 @@ func FirmwareFloorsMet(rt FirmwareRuntime) error {
 		{"swtpm", rt.Swtpm, LiveFirmwareFloors.Swtpm},
 		{"libtpms", rt.Libtpms, LiveFirmwareFloors.Libtpms},
 	} {
+		if _, ok := parseXYZ(c.have); !ok {
+			return fmt.Errorf("%s %q is not an X.Y.Z release, so it cannot meet the live firmware migration floor %s", c.what, c.have, c.floor)
+		}
 		if !versionAtLeast(c.have, c.floor) {
 			return fmt.Errorf("%s %s is below the live firmware migration floor %s", c.what, c.have, c.floor)
 		}

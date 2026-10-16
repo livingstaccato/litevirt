@@ -29,51 +29,31 @@ import (
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
-// liveFirmwareCode reads a host's firmware code: what is installed, and what a
-// running domain's processes run (lv.FirmwareCodeProbe).
-type liveFirmwareCode interface {
-	Installed(ctx context.Context) (lv.InstalledFirmwareCode, error)
+// LiveFirmwareHost is this host's side of a live firmware move, read live on
+// each attempt by stage A (as the move's source) and by Prepare (as its
+// target). The daemon builds it (internal/daemon) over one firmware code
+// probe; every call is bounded in time there, so a wedged libvirtd or a hung
+// `--version` refuses the move rather than blocking it.
+type LiveFirmwareHost interface {
+	// Check is the host's live check (spec §3.2 item 1, §6.2 item 1):
+	// migration.live_firmware on, the vTPM and Secure Boot probes true, the
+	// installed versions at their floors (lv.FirmwareFloorsMet), and
+	// libvirt-guests neither saving nor restoring guests (D-9), each read
+	// now. It returns the host's installed firmware code, or the first
+	// condition that fails.
+	Check(ctx context.Context) (lv.InstalledFirmwareCode, error)
+	// RunningFirmwareCode is what the processes of the running domain whose
+	// LIVE definition is liveXML run (spec §3.5), proven against the same
+	// probe's installed code.
 	RunningFirmwareCode(ctx context.Context, liveXML string) (lv.FirmwareRuntime, error)
 }
 
-// liveFirmwareHost is what a live firmware move reads of this host.
-type liveFirmwareHost struct {
-	// enabled is migration.live_firmware.
-	enabled bool
-	// guests is the live D-9 check (daemon.CheckLibvirtGuests): nil when
-	// libvirt-guests neither saves nor restores guests. Unset refuses.
-	guests func(ctx context.Context) error
-	// code replaces the production probe (tests).
-	code liveFirmwareCode
-}
-
-// SetLiveFirmware wires migration.live_firmware and the live libvirt-guests
-// check (D-9) a live firmware move re-reads on each attempt. A host that never
-// calls it refuses every live firmware move.
-func (s *Server) SetLiveFirmware(enabled bool, guests func(ctx context.Context) error) {
-	s.liveFW.enabled, s.liveFW.guests = enabled, guests
-}
-
-// setLiveFirmwareCodeForTest replaces this host's firmware code probe.
-func (s *Server) setLiveFirmwareCodeForTest(c liveFirmwareCode) { s.liveFW.code = c }
-
-// liveFirmwareCode is this host's firmware code probe: the injected one, or
-// the production probe of this host's firmware store and OVMF files, asking
-// libvirt for its version. A backend that cannot say its version leaves the
-// probe without one, and every read refuses.
-func (s *Server) liveFirmwareCode() liveFirmwareCode {
-	if s.liveFW.code != nil {
-		return s.liveFW.code
-	}
-	var version func() (uint64, error)
-	if v, ok := s.virt.(interface{ LibvirtVersion() (uint64, error) }); ok {
-		version = v.LibvirtVersion
-	}
-	return lv.NewFirmwareCodeProbe(s.fw(), s.firmware, version)
-}
-
-// pbFirmwareRuntime is rt as the RPCs carry it, with this host's live firmware
-// fingerprint (liveFirmwareFingerprint) in place of the probe's OVMF one.
+// pbFirmwareRuntime is rt as the RPCs carry it, with this host's live
+// firmware fingerprint (liveFirmwareFingerprint) in place of the probe's OVMF
+// one. It is the only builder of a FirmwareRuntime a live firmware move
+// sends: stage A's src_runtime and Prepare's dst_runtime. It is built only
+// after LiveFirmwareHost.Check passed, which includes migration.live_firmware,
+// so live_firmware_enabled is true.
 func (s *Server) pbFirmwareRuntime(rt lv.FirmwareRuntime) (*pb.FirmwareRuntime, error) {
 	fp, err := s.liveFirmwareFingerprint()
 	if err != nil {
@@ -81,19 +61,8 @@ func (s *Server) pbFirmwareRuntime(rt lv.FirmwareRuntime) (*pb.FirmwareRuntime, 
 	}
 	return &pb.FirmwareRuntime{
 		Libvirt: rt.Libvirt, Qemu: rt.QEMU, Swtpm: rt.Swtpm, Libtpms: rt.Libtpms,
-		OvmfFingerprint: fp, LiveFirmwareEnabled: s.liveFW.enabled,
+		OvmfFingerprint: fp, LiveFirmwareEnabled: true,
 	}, nil
-}
-
-// installedFirmwareRuntime is this host's INSTALLED firmware runtime in the
-// form a live firmware move compares: what a target answers Prepare with
-// (dst_runtime), since its incoming QEMU and swtpm are exec'd from it.
-func (s *Server) installedFirmwareRuntime(ctx context.Context) (*pb.FirmwareRuntime, error) {
-	in, err := s.liveFirmwareCode().Installed(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return s.pbFirmwareRuntime(in.Runtime)
 }
 
 // liveFirmwareApplicability is which firmware state the VM carries, derived
@@ -172,23 +141,15 @@ func (s *Server) liveFirmwareStageA(ctx context.Context, m liveFirmwareMove) (*l
 	spec := parseFirmwareSpec(m.vm.Spec)
 	refuse := func(format string, args ...any) error { return liveFirmwareRefusal(vm, target, format, args...) }
 
-	// Item 1: the setting, the installed floors and D-9, all on this host.
-	if !s.liveFW.enabled {
-		return nil, refuse("migration.live_firmware is off on %s", s.hostName)
+	// Item 1: the setting, the probes, the installed floors and D-9, all on
+	// this host and read now (LiveFirmwareHost.Check).
+	host := s.liveFirmwareHost()
+	if host == nil {
+		return nil, refuse("%s cannot check its own live firmware runtime", s.hostName)
 	}
-	code := s.liveFirmwareCode()
-	installed, err := code.Installed(ctx)
+	installed, err := host.Check(ctx)
 	if err != nil {
-		return nil, refuse("the installed firmware code on %s cannot be read: %v", s.hostName, err)
-	}
-	if err := lv.FirmwareFloorsMet(installed.Runtime); err != nil {
-		return nil, refuse("%s: %v", s.hostName, err)
-	}
-	if s.liveFW.guests == nil {
-		return nil, refuse("%s cannot check libvirt-guests (D-9)", s.hostName)
-	}
-	if err := s.liveFW.guests(ctx); err != nil {
-		return nil, refuse("%s: %v; a guest libvirt-guests saves or restores runs outside litevirt's firmware move guard", s.hostName, err)
+		return nil, refuse("%s cannot take part: %v", s.hostName, err)
 	}
 
 	// Item 2: the source domain runs (not paused), its running definition is
@@ -236,7 +197,7 @@ func (s *Server) liveFirmwareStageA(ctx context.Context, m liveFirmwareMove) (*l
 	} else if dom.nvram != "" {
 		return nil, refuse("the VM's spec says it keeps no UEFI vars, but its running definition has an NVRAM at %s", dom.nvram)
 	}
-	running, err := code.RunningFirmwareCode(ctx, liveXML)
+	running, err := host.RunningFirmwareCode(ctx, liveXML)
 	if err != nil {
 		return nil, refuse("%v", err)
 	}

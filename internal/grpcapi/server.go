@@ -535,10 +535,6 @@ type Server struct {
 	fwRecordsMu         sync.Mutex
 	fwWipesRefused      []lv.RefusedWipe
 	fwWipesRefusedTotal int
-	// liveFW is what a live firmware move reads of this host: the
-	// migration.live_firmware setting, the live libvirt-guests check and its
-	// firmware code (migrate_firmware_live_eligibility.go).
-	liveFW liveFirmwareHost
 
 	// lbApplyOverride is a test seam for LB provisioning: when non-nil it
 	// replaces the real haproxy/keepalived Apply (unit tests have no root / no
@@ -829,8 +825,9 @@ type Server struct {
 	// RollbackFirmwareState removes (migrate_firmware_rollback.go). Zero value
 	// ready.
 	firmwareTargets firmwareTargetLedger
-	// fwTarget is this host's side of a live firmware move as its target
-	// (migrate_firmware_live_target.go).
+	// fwTarget is this host's side of a live firmware move, as its source
+	// (stage A) and as its target (Prepare): the one host check both read
+	// (SetLiveFirmwareHost).
 	fwTarget fwTargetState
 
 	// vmLocks provides per-VM mutual exclusion for operations that must not

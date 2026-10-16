@@ -33,9 +33,9 @@ func TestFirmwareFloorsMet(t *testing.T) {
 		{"qemu", func(r *FirmwareRuntime) { r.QEMU = "8.2.1" }, "qemu 8.2.1"},
 		{"swtpm", func(r *FirmwareRuntime) { r.Swtpm = "0.7.2" }, "swtpm 0.7.2"},
 		{"libtpms", func(r *FirmwareRuntime) { r.Libtpms = "0.9.2" }, "libtpms 0.9.2"},
-		{"empty", func(r *FirmwareRuntime) { r.QEMU = "" }, "qemu"},
-		{"not_xyz", func(r *FirmwareRuntime) { r.Swtpm = "0.7" }, "swtpm"},
-		{"garbage", func(r *FirmwareRuntime) { r.Libtpms = "0.9.x" }, "libtpms"},
+		{"empty", func(r *FirmwareRuntime) { r.QEMU = "" }, `qemu "" is not an X.Y.Z release`},
+		{"not_xyz", func(r *FirmwareRuntime) { r.Swtpm = "0.7" }, `swtpm "0.7" is not an X.Y.Z release`},
+		{"garbage", func(r *FirmwareRuntime) { r.Libtpms = "0.9.x" }, `libtpms "0.9.x" is not an X.Y.Z release`},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			rt := floor

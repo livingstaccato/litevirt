@@ -329,3 +329,26 @@ func TestUpgradeBootNotesAwaitingServing(t *testing.T) {
 		t.Fatalf("crash of a post-upgrade boot that never served = %+v, want active", b)
 	}
 }
+
+// A fence that lands between ConfirmServing's read of 'upgrading' and its
+// write is not overwritten with 'active': the write is conditional on the
+// state it read, inside its own transaction.
+//
+// Mutation: write with corrosion.UpdateHostState (unconditional) — the
+// fenced host turns active.
+func TestConfirmServingDoesNotOverwriteAFenceThatLandsMeanwhile(t *testing.T) {
+	db, ctx := hostIn(t, "upgrading")
+	beforeConfirmWrite = func() {
+		if err := corrosion.UpdateHostState(ctx, db, "h", "fenced"); err != nil {
+			t.Errorf("the fence: %v", err)
+		}
+	}
+	t.Cleanup(func() { beforeConfirmWrite = nil })
+	flipped, state, err := ConfirmServing(ctx, db, "h")
+	if !errors.Is(err, ErrNotUpgrading) || flipped || state != "fenced" {
+		t.Fatalf("confirm with a fence landing meanwhile: flipped=%v state=%q err=%v, want ErrNotUpgrading, fenced", flipped, state, err)
+	}
+	if got := stateOf(t, db); got != "fenced" {
+		t.Fatalf("the host is %q after the confirm, want the fence kept", got)
+	}
+}

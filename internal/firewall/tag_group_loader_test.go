@@ -498,7 +498,8 @@ func TestTagGroupLoader_SharedIdentityHoldsEveryNICButAMovePair(t *testing.T) {
 // A workload on this host with no identity whose name a non-empty tags row
 // still names, while no live workload holds that row's identity, is reported
 // (a relocation that landed without its identity: D2b review M-7). Only on
-// the host it runs on; nothing is held for it.
+// the host it runs on. No group here binds security groups and no deny names
+// one, so nothing is held.
 //
 // Mutation: report it on every host — red.
 func TestTagGroupLoader_ReportsAnIdentityLostOnItsHost(t *testing.T) {
@@ -514,11 +515,72 @@ func TestTagGroupLoader_ReportsAnIdentityLostOnItsHost(t *testing.T) {
 		t.Fatalf("identity lost %+v", got)
 	}
 	if heldAtDrop(planNIC(t, plan, "veth1")) {
-		t.Error("a workload whose identity was lost is held")
+		t.Error("a workload whose identity was lost is held where no binding covers it and no deny names a group")
 	}
 	plan, _ = l.load(l.loader("host-a", nil))
 	if got := plan.TagGroups.IdentityLost; len(got) != 0 {
 		t.Errorf("host-a reports another host's workload: %+v", got)
+	}
+}
+
+// A workload whose identity was lost is held as an unreadable tags row is
+// (Track D final review I-1): its NICs on the networks a group binds security
+// groups on, and on every network while a deny names a tag group, or while a
+// group cannot be read and never was here. The report names the NICs held.
+// Its membership is unknown, and a deny on the group, or the bound group's
+// drops, must not silently stop applying to it.
+//
+// Mutations: no hold for a lost identity — red; hold it on every network
+// regardless — red; leave it out of the unreadable-group hold — red.
+func TestTagGroupLoader_ALostIdentityIsHeldLikeUnreadableTags(t *testing.T) {
+	l := newTGLab(t)
+	l.sg("sg-web", "web-in")
+	l.group("web", `{"match":{"role":"web"},"networks":["prod"],"security_groups":["web-in"]}`)
+	l.vm("app-1", "host-a", "")
+	l.nic("app-1", "prod", "52:54:00:00:00:01", "tap1", "10.0.0.5")
+	rawRow(t, l.db, `INSERT INTO vm_nics (vm_name, id, network_name, mac, ordinal, ip, updated_at) VALUES ('app-1', 'n2', 'dev', '52:54:00:00:00:02', 1, '', 't')`)
+	l.run["app-1"]["52:54:00:00:00:02"] = "tap2"
+	l.tags("vm", tgFWID(7), `{"tags":{"role":"web"},"name":"app-1"}`)
+	l.vm("ok", "host-a", tgFWID(2))
+	l.nic("ok", "prod", "52:54:00:00:00:03", "tap3", "10.0.0.6")
+	l.tags("vm", tgFWID(2), `{"tags":{"role":"web"}}`)
+	load := l.loader("host-a", nil)
+
+	plan, _ := l.load(load)
+	if n := planNIC(t, plan, "tap1"); !heldAtDrop(n) || len(n.ExtraRules) == 0 || !strings.Contains(n.ExtraRules[0].Comment, "firewall identity lost") {
+		t.Errorf("the lost identity's NIC on a covered network is not held, or does not say why: %+v", n)
+	}
+	if heldAtDrop(planNIC(t, plan, "tap2")) {
+		t.Error("its NIC on a network no binding covers is held")
+	}
+	if n := planNIC(t, plan, "tap3"); heldAtDrop(n) || !slices.Equal(n.SecurityGroups, []string{"web-in"}) {
+		t.Errorf("another workload is affected: %+v", n)
+	}
+	if got := plan.TagGroups.IdentityLost; len(got) != 1 || got[0].Name != "app-1" || !slices.Equal(got[0].NICs, []string{"tap1"}) {
+		t.Errorf("report %+v, want app-1 with tap1 held", got)
+	}
+
+	l.clusterRule("c1", "tcp", "22", "tag:web", "drop")
+	plan, _ = l.load(load)
+	if !heldAtDrop(planNIC(t, plan, "tap2")) {
+		t.Error("with a drop on a tag group, the lost identity's NIC on another network is not held")
+	}
+}
+
+// A group that cannot be read and never was here holds every workload whose
+// membership is unknown on every network, a lost identity included.
+//
+// Mutation: leave the lost identity out of the unreadable-group hold — red.
+func TestTagGroupLoader_AnUnreadableGroupHoldsALostIdentity(t *testing.T) {
+	l := newTGLab(t)
+	l.group("bad", `{"match":`)
+	l.vm("app-1", "host-a", "")
+	l.nic("app-1", "dev", "52:54:00:00:00:01", "tap1", "10.1.0.5")
+	l.tags("vm", tgFWID(7), `{"tags":{"role":"web"},"name":"app-1"}`)
+
+	plan, _ := l.load(l.loader("host-a", nil))
+	if !heldAtDrop(planNIC(t, plan, "tap1")) {
+		t.Error("a lost identity is not held while a group cannot be read")
 	}
 }
 

@@ -23,7 +23,8 @@ const (
 	CondFirewallTagIdentityShared = "firewall.tag_group.identity_shared"
 	// A workload has no firewall identity while a tags row of an earlier
 	// incarnation of its name remains: its membership did not follow it
-	// (D2b review M-7).
+	// (D2b review M-7), and its NICs are held at drop as for an unreadable
+	// tags row (Track D final review I-1).
 	CondFirewallTagIdentityLost = "firewall.tag_group.identity_lost"
 )
 
@@ -48,7 +49,7 @@ func (s *Server) recordTagGroupState(ctx context.Context, r firewall.TagGroupRep
 	s.setFirewallCondition(ctx, CondFirewallTagIdentityShared, len(r.SharedIdentity) > 0, corrosion.SeverityCritical,
 		tagHoldsText("workloads share a firewall identity with another live workload (a copy): neither is a member of any tag group, "+
 			"and every NIC of each is held at drop. lv firewall tag set on one of them gives it its own identity", r.SharedIdentity))
-	s.setFirewallCondition(ctx, CondFirewallTagIdentityLost, len(r.IdentityLost) > 0, corrosion.SeverityWarning,
+	s.setFirewallCondition(ctx, CondFirewallTagIdentityLost, len(r.IdentityLost) > 0, corrosion.SeverityCritical,
 		s.identityLostText(ctx, r.IdentityLost))
 }
 
@@ -119,10 +120,19 @@ func (s *Server) identityLostText(ctx context.Context, lost []firewall.TagWorklo
 		if note == "" {
 			note = fmt.Sprintf("%s has no firewall identity; a row of identity %s names it", fwTagWhoText(w.Kind, w.Host, w.Name), w.FWID)
 		}
+		if len(w.NICs) > 0 {
+			note += " (NICs held at drop here: " + strings.Join(w.NICs, " ") + ")"
+		} else {
+			note += " (no NIC held here)"
+		}
 		parts = append(parts, note)
 	}
 	return "workloads that are members of no tag group although a tags row of an earlier incarnation of their name remains " +
-		"(a relocation or restore that did not carry the identity; the row is cleared by the orphan sweep): " + strings.Join(parts, "; ")
+		"(a relocation, a restore or a spec write that did not carry the identity). Their NICs are held at drop on the networks " +
+		"a tag group binds security groups on (all of them while a drop or reject rule names a tag group, or every network while " +
+		"a tag group cannot be read), and the row is kept until the identity is restored. lv firewall tag set on the workload " +
+		"gives it a new identity and releases the hold; lv firewall tag rm does too, leaving it a member of no group: " +
+		strings.Join(parts, "; ")
 }
 
 // fwTagWhoText names a workload in a condition.

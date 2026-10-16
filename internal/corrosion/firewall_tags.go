@@ -287,6 +287,12 @@ func FirewallIDOf(kind, doc string) string { return firewallIDOf(kind, doc) }
 // last written more than grace ago. The grace covers a move or re-create in
 // flight, which leaves no live row for a moment. A timestamp that does not
 // parse keeps the row.
+//
+// A row is kept at any age while its display name matches a live workload of
+// its kind that has no identity (TagGroupMembership.IdentityLost: the loader
+// holds that workload while the row remains), or a workload of its kind with
+// a relocation or move still in flight (a live container marked relocating,
+// or an open relocation, reschedule or promote proof naming it).
 func FirewallTagsOrphans(ctx context.Context, c *Client, now time.Time, grace time.Duration) ([]FirewallTagsRecord, error) {
 	rows, err := ListFirewallTagsRows(ctx, c)
 	if err != nil {
@@ -309,6 +315,9 @@ func FirewallTagsOrphans(ctx context.Context, c *Client, now time.Time, grace ti
 		newest time.Time
 		ok     bool
 	}
+	// spared are kind/name of each live workload with no identity, and of
+	// each workload with a move in flight.
+	spared := map[string]bool{}
 	read := func(kind, q string) (map[string]*holders, error) {
 		rs, err := c.Query(ctx, q)
 		if err != nil {
@@ -317,6 +326,12 @@ func FirewallTagsOrphans(ctx context.Context, c *Client, now time.Time, grace ti
 		out := map[string]*holders{}
 		for _, r := range rs {
 			id := firewallIDOf(kind, r.String("doc"))
+			if r.String("deleted_at") == "" {
+				_, _, relocating := RelocateRestoreMarker(r.String("state"), r.String("state_detail"))
+				if id == "" || relocating {
+					spared[kind+"/"+r.String("name")] = true
+				}
+			}
 			if id == "" {
 				continue
 			}
@@ -344,18 +359,35 @@ func FirewallTagsOrphans(ctx context.Context, c *Client, now time.Time, grace ti
 	}
 	byKind := map[string]map[string]*holders{}
 	if byKind[TagMemberVM], err = read(TagMemberVM,
-		`SELECT spec AS doc, COALESCE(deleted_at, '') AS deleted_at FROM vms`); err != nil {
+		`SELECT name, spec AS doc, '' AS state, '' AS state_detail, COALESCE(deleted_at, '') AS deleted_at FROM vms`); err != nil {
 		return nil, err
 	}
 	if byKind[TagMemberCT], err = read(TagMemberCT,
-		`SELECT COALESCE(create_spec, '') AS doc, COALESCE(deleted_at, '') AS deleted_at FROM containers`); err != nil {
+		`SELECT name, COALESCE(create_spec, '') AS doc, COALESCE(state, '') AS state, COALESCE(state_detail, '') AS state_detail,
+		        COALESCE(deleted_at, '') AS deleted_at FROM containers`); err != nil {
 		return nil, err
+	}
+	open, err := c.Query(ctx,
+		`SELECT target_kind, target_name FROM runtime_action_proofs
+		  WHERE action IN (?, ?, ?) AND status IN (?, ?) AND deleted_at IS NULL`,
+		ActionRelocate, ActionReschedule, ActionPromote, ProofPrepared, ProofInProgress)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range open {
+		switch r.String("target_kind") {
+		case "vm":
+			spared[TagMemberVM+"/"+r.String("target_name")] = true
+		case "container":
+			spared[TagMemberCT+"/"+r.String("target_name")] = true
+		}
 	}
 	var out []FirewallTagsRecord
 	for _, r := range pending {
 		h := byKind[r.Kind][r.FWID]
 		switch {
 		case h != nil && h.live:
+		case r.Name != "" && spared[r.Kind+"/"+r.Name]:
 		case h != nil && h.tombstones > 0:
 			if h.ok && now.Sub(h.newest) > grace {
 				out = append(out, r)

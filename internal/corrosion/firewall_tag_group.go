@@ -342,8 +342,11 @@ type TagGroupMembership struct {
 	// non-empty, readable tags row of their kind still names while no live
 	// workload holds that row's identity (FWID is the row's): their
 	// membership was most likely lost on the way here, by a relocation that
-	// landed without its identity (D2b review M-7) or a restore into a freed
-	// name. For display only; nothing matches on the name for membership.
+	// landed without its identity (D2b review M-7), a restore into a freed
+	// name, or a spec write from a replica that had not seen the mint. They
+	// are members of nothing; nothing matches on the name for membership.
+	// The renderer holds them at drop as it holds TagsUnreadable (Track D
+	// final review I-1), and the orphan sweep keeps the row meanwhile.
 	IdentityLost []TagWorkload
 	// Tagged are the live workloads with a unique identity (or an open
 	// move's target) and non-empty, readable tags: every workload a group

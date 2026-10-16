@@ -19,7 +19,8 @@ import (
 // reports nothing.
 //
 // Mutations: drop the shared-identity condition — red; name no holder —
-// red; raise the lost identity without the re-apply command — red.
+// red; raise the lost identity without the re-apply command, or as a
+// warning — red.
 func TestRecordFirewallState_TagGroupConditions(t *testing.T) {
 	s, _ := tagsServer(t)
 	ctx := context.Background()
@@ -37,7 +38,7 @@ func TestRecordFirewallState_TagGroupConditions(t *testing.T) {
 		UnreadableHolds: []firewall.TagWorkloadHold{{Kind: "vm", Name: "t1", FWID: fwB, NICs: []string{"tap7"}}},
 		SharedIdentity: []firewall.TagWorkloadHold{{Kind: "vm", Name: "a", FWID: fwA, Holders: []string{"VM a", "VM b"},
 			NICs: []string{"tap1", "tap2"}}},
-		IdentityLost: []firewall.TagWorkloadHold{{Kind: "ct", Name: "web", Host: s.hostName, FWID: fwB}},
+		IdentityLost: []firewall.TagWorkloadHold{{Kind: "ct", Name: "web", Host: s.hostName, FWID: fwB, NICs: []string{"veth9"}}},
 	}})
 	for _, c := range []struct {
 		code, severity string
@@ -53,9 +54,10 @@ func TestRecordFirewallState_TagGroupConditions(t *testing.T) {
 				"every network while a tag group cannot be read"}},
 		{CondFirewallTagIdentityShared, corrosion.SeverityCritical,
 			[]string{"VM a (fw_id " + fwA, "held by VM a, VM b", "tap1 tap2"}},
-		{CondFirewallTagIdentityLost, corrosion.SeverityWarning,
+		{CondFirewallTagIdentityLost, corrosion.SeverityCritical,
 			[]string{"container " + s.hostName + "/web has no firewall identity", fwB,
-				"lv firewall tag set web --container --host " + s.hostName + " role=web"}},
+				"lv firewall tag set web --container --host " + s.hostName + " role=web",
+				"NICs held at drop here: veth9", "gives it a new identity and releases the hold"}},
 	} {
 		row, active := cond(c.code)
 		if !active {

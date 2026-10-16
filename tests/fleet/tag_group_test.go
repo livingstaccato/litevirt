@@ -33,6 +33,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/firewall"
+	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/network"
@@ -290,6 +291,94 @@ func TestTagGroup_ALaggingSpecWriteDoesNotReAdmitARemovedMember(t *testing.T) {
 		}
 		if set := tgSet(t, n, "web"); slices.Contains(set, ip) {
 			t.Errorf("%s's plan holds app-1's %s in lv_tg_web again (%v)", n.Name, ip, set)
+		}
+	}
+}
+
+// Track D final review I-1: app-1 has no identity yet and node-1 is cut off.
+// A tag set on node-0 (the owner) mints the identity into the spec; node-1,
+// which never saw that write, runs SetVMLabels over its own view. Once
+// replication resumes, anti-entropy settles the row by its clock and node-1's
+// later spec wins, so the identity is gone cluster-wide. app-1 is then held at drop on the network its group binds
+// security groups on, the identity_lost condition is critical, and the
+// orphan sweep keeps its tags row past the 24 h grace.
+//
+// Mutations: no hold for a lost identity (tagPass.hold) — red; raise
+// identity_lost as a warning — red; sweep a row whose name a live workload
+// with no identity holds — red at +25 h.
+func TestTagGroup_ALabelEditThroughALaggingNodeHoldsTheVMWhoseIdentityItErased(t *testing.T) {
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
+	c.WaitConverged(t, convergeTimeout)
+	for _, n := range c.Nodes {
+		n.Server.SetBridgeEnsure(n.Net.EnsureBridge)
+	}
+	latchRelease(t, c)
+	a, b, sw := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	ctx := context.Background()
+	tgSeedNetwork(t, c, a)
+	mustCreateSG(t, c, a, "web-in", "8443")
+	c.WaitConverged(t, convergeTimeout)
+	tgGroup(t, c, a, "web", "web-in")
+	const mac = "52:54:00:7a:00:0e"
+	tgVM(t, c, a, "app-1", mac)
+	tap := mustTap(t, a, "app-1", mac)
+	tgHoldFailoverLease(t, sw)
+	c.WaitConverged(t, convergeTimeout)
+
+	c.Isolate(b)
+	id := tagViaCutOff(t, c, a, "vm", "app-1", "")
+	if vm, _ := corrosion.GetVM(ctx, b.DB, "app-1"); vm == nil || corrosion.FirewallIDOf(corrosion.TagMemberVM, vm.Spec) != "" {
+		t.Fatalf("premise: %s, cut off, has not seen the mint: %+v", b.Name, vm)
+	}
+	if _, err := c.SelfClient(b).SetVMLabels(ctx, &pb.SetVMLabelsRequest{Name: "app-1", Labels: map[string]string{"tier": "front"}}); err != nil {
+		t.Fatalf("SetVMLabels via %s: %v", b.Name, err)
+	}
+	c.ClearLinkFaults()
+	time.Sleep(2 * time.Second)
+	// The WAL lane applies neither edit over the other (each is guarded by the
+	// generation it was made at); anti-entropy settles the row by its clock,
+	// and node-1's edit is the later one.
+	for _, n := range c.Nodes {
+		corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(ctx)
+	}
+	for _, n := range c.Nodes {
+		eventually(t, convergeTimeout, n.Name+" to hold node-1's spec, with no identity", func() bool {
+			vm, _ := corrosion.GetVM(ctx, n.DB, "app-1")
+			return vm != nil && strings.Contains(vm.Spec, `"tier"`) && corrosion.FirewallIDOf(corrosion.TagMemberVM, vm.Spec) == ""
+		})
+	}
+	if rec, ok := tagsRowOn(t, a, corrosion.TagMemberVM, id); !ok || !maps.Equal(rec.Tags, webTags) {
+		t.Fatalf("premise: the erased identity's tags row holds %v: %+v (present %v)", webTags, rec, ok)
+	}
+
+	plan := nodePlan(t, a)
+	held := false
+	for _, nb := range plan.NICs {
+		if nb.NICDev == tap {
+			held = len(nb.SecurityGroups) == 0 && len(nb.ExtraRules) == 2 &&
+				nb.ExtraRules[0].Action == firewall.Drop && strings.Contains(nb.ExtraRules[0].Comment, "firewall identity lost")
+		}
+	}
+	if !held {
+		t.Errorf("app-1's NIC %s on %s is not held at drop", tap, a.Name)
+	}
+	if chain := nicChain(renderPlan(t, plan), tap); strings.Contains(chain, "tcp dport 8443 accept") {
+		t.Errorf("app-1's chain on %s carries the bound group's rule:\n%s", a.Name, chain)
+	}
+	if got := plan.TagGroups.IdentityLost; len(got) != 1 || got[0].Name != "app-1" || got[0].FWID != id || !slices.Equal(got[0].NICs, []string{tap}) {
+		t.Errorf("%s reports %+v, want app-1 (fw_id %s) with %s held", a.Name, got, id, tap)
+	}
+	a.Server.RecordFirewallState(ctx, firewall.AppliedState{TagGroups: plan.TagGroups})
+	cond, ok, err := corrosion.GetHealthCondition(ctx, a.DB, grpcapi.FirewallEvaluator, grpcapi.CondFirewallTagIdentityLost, "host", a.Name)
+	if err != nil || !ok || cond.Lifecycle == corrosion.ConditionResolved || cond.Severity != corrosion.SeverityCritical {
+		t.Errorf("identity_lost on %s = %+v (present %v, %v), want it raised critical", a.Name, cond, ok, err)
+	}
+
+	sw.Server.SweepFirewallTagOrphansForTest(ctx, time.Now().Add(25*time.Hour))
+	c.WaitConverged(t, convergeTimeout)
+	for _, n := range c.Nodes {
+		if rec, ok := tagsRowOn(t, n, corrosion.TagMemberVM, id); !ok || !maps.Equal(rec.Tags, webTags) {
+			t.Errorf("the erased identity's tags row on %s = %+v (present %v) at +25 h, want %v kept", n.Name, rec, ok, webTags)
 		}
 	}
 }

@@ -71,3 +71,75 @@ func TestFirewallTagsOrphans(t *testing.T) {
 		t.Fatalf("orphans = %v, want %v", ids, want)
 	}
 }
+
+// The sweep never clears, at any age, a tags row whose display name matches
+// a live workload of the row's kind that has no identity (its membership was
+// lost, and the row is the evidence the loader holds it on: Track D final
+// review I-1), nor one whose name matches a workload of its kind with a
+// relocation or move still in flight (m-4). A name on a workload of the other
+// kind, or on one that has an identity of its own, spares nothing.
+//
+// Mutations: drop the no-identity spare — red; drop the in-flight spare —
+// red; match the name across kinds — red.
+func TestFirewallTagsOrphans_SparesALostIdentityAndAMoveInFlight(t *testing.T) {
+	f := newTagGroupFixture(t)
+	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	ancient := now.Add(-30 * 24 * time.Hour).Format(time.RFC3339Nano)
+	row := func(kind, id, name string) {
+		mustExec(t, f.c, `INSERT INTO cluster_policies (key, value, set_by, updated_at) VALUES (?, ?, 'x', ?)`,
+			FirewallTagsKeyPrefix+kind+"/"+id, `{"tags":{"role":"web"},"name":"`+name+`"}`, ancient)
+	}
+	proof := func(id, kind, name, status, deleted string) {
+		mustExec(t, f.c, `INSERT INTO runtime_action_proofs (id, action, target_kind, target_name, dest_host, coordinator,
+			relocation_token, status, created_at, updated_at, deleted_at) VALUES (?, ?, ?, ?, 'node-2', 'node-1', 'tok-'||?, ?, 't', 't', NULLIF(?, ''))`,
+			id, ActionRelocate, kind, name, id, status, deleted)
+	}
+
+	// lost-vm: a live VM of the name with no identity: kept.
+	f.vm("lost-vm", "", "running")
+	row(TagMemberVM, tgID(1), "lost-vm")
+	// lost-ct: a live container of the name with no identity: kept.
+	f.ct("node-1", "lost-ct", "", "stopped")
+	row(TagMemberCT, tgID(2), "lost-ct")
+	// other-kind: only a VM of the name has no identity; the row is a
+	// container's: cleared.
+	f.vm("other-kind", "", "running")
+	row(TagMemberCT, tgID(3), "other-kind")
+	// has-own: the VM of the name has an identity of its own: cleared.
+	f.vm("has-own", tgID(4), "running")
+	row(TagMemberVM, tgID(5), "has-own")
+	// relocating: the container of the name is marked relocating (and holds
+	// an identity of its own): kept.
+	mustExec(t, f.c, `INSERT INTO containers (host_name, name, state, state_detail, create_spec, created_at, updated_at) VALUES ('node-1', 'relocating', 'relocating', ?, ?, 't', 't')`,
+		RelocateRestoreDetail("node-2", "tok"), `{"fw_id":"`+tgID(6)+`"}`)
+	row(TagMemberCT, tgID(7), "relocating")
+	// proof-open: no live row of the name, an open relocation proof names
+	// it: kept.
+	proof("p1", "container", "proof-open", ProofInProgress, "")
+	row(TagMemberCT, tgID(8), "proof-open")
+	// proof-done: the proofs naming it completed, failed or were reaped:
+	// cleared.
+	proof("p2", "container", "proof-done", ProofCompleted, "")
+	proof("p3", "container", "proof-done", ProofFailed, "")
+	proof("p4", "container", "proof-done", ProofPrepared, ancient)
+	row(TagMemberCT, tgID(9), "proof-done")
+	// proof-vm: an open proof for a VM of the name keeps a VM row only.
+	proof("p5", "vm", "proof-vm", ProofPrepared, "")
+	row(TagMemberVM, tgID(10), "proof-vm")
+	row(TagMemberCT, tgID(11), "proof-vm")
+
+	got, err := FirewallTagsOrphans(f.ctx, f.c, now, 24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, r := range got {
+		ids = append(ids, r.Kind+"/"+r.FWID)
+	}
+	slices.Sort(ids)
+	want := []string{"ct/" + tgID(11), "ct/" + tgID(3), "ct/" + tgID(9), "vm/" + tgID(5)}
+	slices.Sort(want)
+	if !slices.Equal(ids, want) {
+		t.Fatalf("orphans = %v, want %v", ids, want)
+	}
+}

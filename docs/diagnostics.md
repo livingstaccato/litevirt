@@ -1714,7 +1714,7 @@ no longer finds the cause. Each names the rules, groups or workloads involved
 | `firewall.tag_group.unreadable` | critical | a group's row cannot be read here, or its set cannot be declared (`<x>_v6` beside `<x>`) |
 | `firewall.tag_group.tags_unreadable` | critical | a workload's tags row cannot be read: its NICs are held at drop |
 | `firewall.tag_group.identity_shared` | critical | two live workloads hold one firewall identity (a copy): every NIC of each is held at drop |
-| `firewall.tag_group.identity_lost` | warning | a workload has no firewall identity while a tags row of an earlier incarnation of its name remains; the evidence gives the `lv firewall tag set` command |
+| `firewall.tag_group.identity_lost` | critical | a workload has no firewall identity while a tags row of an earlier incarnation of its name remains: its NICs are held at drop as for an unreadable tags row; the evidence gives the `lv firewall tag set` command |
 
 `litevirt_firewall_tag_group_members{group}` is a gauge of each group's members
 in this host's view, 0 for a group this host cannot read. Hosts can differ for

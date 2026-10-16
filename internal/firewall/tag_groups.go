@@ -10,8 +10,8 @@ package firewall
 // ambiguous-name check. Wherever membership cannot be proven the pass fails
 // closed: a rule naming a group this replica cannot render matches nothing
 // when it accepts, and loses its address match when it denies; a workload
-// whose tags row cannot be read, or whose identity another live workload
-// holds too, has its NICs held at drop.
+// whose tags row cannot be read, whose identity another live workload holds
+// too, or whose identity was lost, has its NICs held at drop.
 
 import (
 	"context"
@@ -88,8 +88,9 @@ type TagGroupReport struct {
 	// live workload holds too (firewall.tag_group.identity_shared).
 	SharedIdentity []TagWorkloadHold
 	// IdentityLost are this host's workloads with no firewall identity whose
-	// name an orphaned, non-empty tags row still names
-	// (firewall.tag_group.identity_lost; corrosion IdentityLost).
+	// name an orphaned, non-empty tags row still names, held at drop as an
+	// unreadable tags row is (firewall.tag_group.identity_lost; corrosion
+	// IdentityLost).
 	IdentityLost []TagWorkloadHold
 	// UnreadableHolds are this host's workloads with tags, held at drop on
 	// every network because a group could not be read and was never read
@@ -152,6 +153,7 @@ type tagPass struct {
 	bindings map[string][]string        // kind|host|name|network -> bound security groups
 	shared   map[string][]string        // kind|host|name -> every holder of its identity
 	tagsBad  map[string]bool            // kind|host|name -> its tags row is unreadable
+	lost     map[string]bool            // kind|host|name -> its identity was lost (IdentityLost)
 	held     map[string]map[string]bool // kind|host|name -> devices held
 }
 
@@ -173,7 +175,7 @@ func loadTagGroups(ctx context.Context, db *corrosion.Client, host string, now t
 		tagged: map[string]bool{},
 		empty:  map[string]bool{}, since: map[string]time.Time{}, reported: map[string]bool{},
 		bindings: map[string][]string{}, shared: map[string][]string{}, tagsBad: map[string]bool{},
-		held: map[string]map[string]bool{}}
+		lost: map[string]bool{}, held: map[string]map[string]bool{}}
 	t.report.Members = map[string]int{}
 	for _, v := range m.Groups {
 		t.groups[v.Group.Name] = v.Group
@@ -238,6 +240,9 @@ func loadTagGroups(ctx context.Context, db *corrosion.Client, host string, now t
 	}
 	for _, w := range m.TagsUnreadable {
 		t.tagsBad[tagKey(w.Kind, w.Host, w.Name)] = true
+	}
+	for _, w := range m.IdentityLost {
+		t.lost[tagKey(w.Kind, w.Host, w.Name)] = true
 	}
 	return t, nil
 }
@@ -476,12 +481,17 @@ func (t *tagPass) hold(kind, host, name, network, dev string) string {
 	case t.shared[k] != nil:
 		// Its membership is unknown on every network.
 		why = "firewall identity shared: held at drop"
-	case t.holdAll && (t.tagged[k] || t.tagsBad[k]):
+	case t.holdAll && (t.tagged[k] || t.tagsBad[k] || t.lost[k]):
 		// A group could not be read and never was here: whether this
 		// workload is one of its members is unknown, on any network.
 		why = "tag group unreadable: held at drop"
 	case t.tagsBad[k] && t.covers(network):
 		why = "firewall tags unreadable: held at drop"
+	case t.lost[k] && t.covers(network):
+		// Its identity, and with it its membership, was lost on the way
+		// here (Track D final review I-1): held as an unreadable tags row
+		// is, until tag set gives it an identity again.
+		why = "firewall identity lost: held at drop"
 	}
 	if why != "" {
 		if t.held[k] == nil {

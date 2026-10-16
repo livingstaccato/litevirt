@@ -723,6 +723,12 @@ func TestRelease_H1(t *testing.T) {
 			f.writeFile(f.store.NvramPath(fwtVM), fwvFinal)
 		}, verdictTargetRan, "it ran"},
 		"DomainAbsent": {fwmig.HoldVerified, true, nil, verdictNotRunning, "held_domain_absent"},
+		// The final NVRAM beside a stopped row H1 did not write: not H1's
+		// retry, so it ran.
+		"NvramIsFinalRowStoppedOtherDetail": {fwmig.HoldVerified, true, func(f *fwtFixture, _ *pb.ReleaseLiveFirmwareTargetRequest) {
+			f.setRowDetail("dst", "stopped", "operator-stop")
+			f.writeFile(f.store.NvramPath(fwtVM), fwvFinal)
+		}, verdictTargetRan, "it ran"},
 		// Reached through step 2b (resuming): step 3 already refuses a
 		// verified hold whose row is not here.
 		"RowNotTarget": {fwmig.HoldResuming, false, nil, verdictTargetRan, "row names src"},
@@ -799,15 +805,42 @@ func TestRelease_H1(t *testing.T) {
 // held-guest sweep and ResumeHeldVM refuses, naming the move, and the guest
 // stays paused. Mutation: remove one check (one sub-test each).
 
-func TestHeldFirmwareGuest_NoNICResumePath(t *testing.T) {
-	want := "held for firmware verification of attempt " + fwtA1 + " from " + fwtSrc
-	putNICRecord := func(f *fwtFixture) {
-		if err := f.s.putHeld(heldGuest{VM: fwtVM, UUID: fwtUUID, CreatedAt: f.row.CreatedAt, Source: fwtSrc,
-			Since: time.Now().UTC().Format(time.RFC3339)}); err != nil {
-			f.t.Fatal(err)
-		}
+// fwvHeldText is what every NIC path says of a guest live firmware move holds.
+const fwvHeldText = "held for firmware verification of attempt " + fwtA1 + " from " + fwtSrc
+
+// fwvPutNICRecord writes a NIC hand-over record for fw1, since `since`.
+func fwvPutNICRecord(f *fwtFixture, since time.Time) {
+	f.t.Helper()
+	if err := f.s.putHeld(heldGuest{VM: fwtVM, UUID: fwtUUID, CreatedAt: f.row.CreatedAt, Source: fwtSrc,
+		Since: since.UTC().Format(time.RFC3339)}); err != nil {
+		f.t.Fatal(err)
 	}
-	paths := map[string]func(t *testing.T, f *fwtFixture) string{
+}
+
+// fwvSweepReport runs the NIC held-guest sweep and returns firewall.nic.held's
+// text, failing the test when it reports nothing or drops fw1's record.
+func fwvSweepReport(t *testing.T, f *fwtFixture) string {
+	t.Helper()
+	ctx := context.Background()
+	f.s.ResumeHeldGuestsOnce(ctx)
+	if _, ok, _ := f.s.getHeld(fwtVM); !ok {
+		t.Error("the sweep dropped the NIC hand-over record")
+	}
+	row, ok, err := corrosion.GetHealthCondition(ctx, f.s.db, FirewallEvaluator, CondFirewallHeld, "host", f.s.hostName)
+	if err != nil || !ok || row.Lifecycle == corrosion.ConditionResolved {
+		t.Errorf("the sweep reported nothing: %+v %v %v", row, ok, err)
+	}
+	if strings.Contains(row.Evidence, "resumes by itself") || strings.Contains(row.Evidence, "repair-owner") {
+		t.Errorf("the report tells the operator the held guest resumes by itself or to repair its owner: %q", row.Evidence)
+	}
+	return row.Evidence
+}
+
+// fwvNICResumePaths is every NIC path that could resume fw1, each returning
+// what it said.
+func fwvNICResumePaths() map[string]func(t *testing.T, f *fwtFixture) string {
+	putNICRecord := func(f *fwtFixture) { fwvPutNICRecord(f, time.Now()) }
+	return map[string]func(t *testing.T, f *fwtFixture) string{
 		"ArmNICFirewall held branch": func(t *testing.T, f *fwtFixture) string {
 			putNICRecord(f)
 			_, err := f.s.ArmNICFirewall(f.peer, &pb.ArmNICFirewallRequest{VmName: fwtVM, Resume: true})
@@ -828,16 +861,7 @@ func TestHeldFirmwareGuest_NoNICResumePath(t *testing.T) {
 		},
 		"sweep": func(t *testing.T, f *fwtFixture) string {
 			putNICRecord(f)
-			ctx := context.Background()
-			f.s.ResumeHeldGuestsOnce(ctx)
-			if _, ok, _ := f.s.getHeld(fwtVM); !ok {
-				t.Error("the sweep dropped the NIC hand-over record")
-			}
-			row, ok, err := corrosion.GetHealthCondition(ctx, f.s.db, FirewallEvaluator, CondFirewallHeld, "host", f.s.hostName)
-			if err != nil || !ok || row.Lifecycle == corrosion.ConditionResolved {
-				t.Errorf("the sweep reported nothing: %+v %v %v", row, ok, err)
-			}
-			return row.Evidence
+			return fwvSweepReport(t, f)
 		},
 		"ResumeHeldVM": func(t *testing.T, f *fwtFixture) string {
 			_, err := f.s.ResumeHeldVM(adminCtx(), &pb.ResumeHeldVMRequest{VmName: fwtVM})
@@ -847,8 +871,12 @@ func TestHeldFirmwareGuest_NoNICResumePath(t *testing.T) {
 			return errText(err)
 		},
 	}
+}
+
+func TestHeldFirmwareGuest_NoNICResumePath(t *testing.T) {
+	want := fwvHeldText
 	for _, st := range []fwmig.HoldState{fwmig.HoldVerified, fwmig.HoldResuming, fwmig.HoldReleasedUnconfirmed} {
-		for name, path := range paths {
+		for name, path := range fwvNICResumePaths() {
 			t.Run(string(st)+"/"+name, func(t *testing.T) {
 				f := newFwvFixture(t, st, libvirtfake.StatePaused, true)
 				text := path(t, f)
@@ -873,17 +901,67 @@ func errText(err error) string {
 	return err.Error()
 }
 
-// A hold that cannot be read holds: no NIC path resumes the guest.
+// A hold that cannot be read holds: no NIC path resumes the guest
+// (ArmNICFirewall{resume} both branches, the sweep, ResumeHeldVM).
 //
 // Mutation: let an unreadable hold through firmwareMoveHeld - red.
 func TestHeldFirmwareGuest_UnreadableHoldRefuses(t *testing.T) {
-	f := newFwvFixture(t, fwmig.HoldVerified, libvirtfake.StatePaused, true)
-	f.writeFile(filepath.Join(f.s.dataDir, fwmig.HoldDir, fwtVM+".json"), []byte("{not json"))
-	_, err := f.s.ArmNICFirewall(f.peer, &pb.ArmNICFirewallRequest{VmName: fwtVM, Resume: true})
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(errText(err), "held for firmware verification") {
-		t.Errorf("%v, want FailedPrecondition naming the firmware hold", err)
+	for name, path := range fwvNICResumePaths() {
+		t.Run(name, func(t *testing.T) {
+			f := newFwvFixture(t, fwmig.HoldVerified, libvirtfake.StatePaused, true)
+			f.writeFile(filepath.Join(f.s.dataDir, fwmig.HoldDir, fwtVM+".json"), []byte("{not json"))
+			if text := path(t, f); !strings.Contains(text, "held for firmware verification") || !strings.Contains(text, "cannot be read") {
+				t.Errorf("%q does not refuse for the unreadable firmware hold", text)
+			}
+			if f.domState() != libvirtfake.StatePaused {
+				t.Errorf("guest %s, want paused", f.domState())
+			}
+		})
 	}
-	if f.domState() != libvirtfake.StatePaused {
-		t.Errorf("guest %s, want paused", f.domState())
+}
+
+// I-1: a move parked before its commit (row still names the source,
+// migrating) whose guest arrived here paused with a NIC hand-over record,
+// stale: the sweep reports the firmware hold, keeps the record, and never
+// sends the operator to write ownership here before Verify and the commit.
+//
+// Mutation: drop the hold check in the sweep's not-owned branch - red.
+func TestHeldFirmwareGuest_SweepUncommittedStaleHold(t *testing.T) {
+	for _, st := range []fwmig.HoldState{fwmig.HoldPrepared, fwmig.HoldMismatch, fwmig.HoldVerified} {
+		t.Run(string(st), func(t *testing.T) {
+			f := newFwvFixture(t, st, libvirtfake.StatePaused, false)
+			fwvPutNICRecord(f, time.Now().Add(-3*time.Hour))
+			if text := fwvSweepReport(t, f); !strings.Contains(text, fwvHeldText) {
+				t.Errorf("%q does not say %q", text, fwvHeldText)
+			}
+			if f.domState() != libvirtfake.StatePaused || f.holdState() != st {
+				t.Errorf("guest %s hold %s, want paused and %s", f.domState(), f.holdState(), st)
+			}
+			if row := f.getRow(); row.HostName != fwtSrc {
+				t.Errorf("row moved to %s", row.HostName)
+			}
+		})
+	}
+}
+
+// m-1: a running domain under a UEFI hold whose NVRAM materialisation never
+// completed is TARGET_RAN (the guard failed), not a Prepare error.
+//
+// Mutation: check the materialisation before the domain - red.
+func TestVerify_UnmaterialisedRunningIsTargetRan(t *testing.T) {
+	f := newFwvFixture(t, fwmig.HoldPrepared, libvirtfake.StateRunning, false)
+	h, _ := f.hold()
+	h.NvramMaterialised = fwmig.NvramPending
+	if err := f.recs.PutHold(h); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := f.verify(fwtSHA(fwvPermall))
+	if err != nil || resp.Verdict != verdictTargetRan {
+		t.Errorf("%v %v, want TARGET_RAN", resp.GetVerdict(), err)
+	}
+	// Paused, it is still the Prepare that never completed.
+	f.fake.SetState(fwtVM, libvirtfake.StatePaused)
+	if _, err := f.verify(fwtSHA(fwvPermall)); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("paused under an unmaterialised hold: %v, want FailedPrecondition", err)
 	}
 }

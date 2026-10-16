@@ -367,24 +367,39 @@ func (s *Server) ResumeHeldGuestsOnce(ctx context.Context) {
 			"the records of guests held paused for their NIC guards cannot be read: "+err.Error())
 		return
 	}
-	var held []string
+	var held, fwHeld []string
 	for _, g := range gs {
-		if why := s.resumeHeldGuest(ctx, g); why != "" {
+		why, firmware := s.resumeHeldGuest(ctx, g)
+		switch {
+		case why == "":
+		case firmware:
+			fwHeld = append(fwHeld, why)
+		default:
 			held = append(held, why)
 		}
 	}
-	text := ""
+	var parts []string
 	if len(held) > 0 {
-		text = "guests held paused because their NIC guards are not in force here: " + strings.Join(held, "; ") +
-			". Each resumes by itself once its guards are in force here"
+		parts = append(parts, "guests held paused because their NIC guards are not in force here: "+strings.Join(held, "; ")+
+			". Each resumes by itself once its guards are in force here")
 	}
-	s.setFirewallCondition(ctx, CondFirewallHeld, len(held) > 0, corrosion.SeverityCritical, text)
+	if len(fwHeld) > 0 {
+		parts = append(parts, "guests a live firmware move holds paused here: "+strings.Join(fwHeld, "; ")+
+			". Each resumes only when its move releases it")
+	}
+	s.setFirewallCondition(ctx, CondFirewallHeld, len(parts) > 0, corrosion.SeverityCritical, strings.Join(parts, ". "))
 }
 
 // resumeHeldGuest handles one record, returning why its guest stays held
-// ("" when it does not). A record whose guest is paused here is reported for
-// as long as it is (re-review m4), whatever stops this host resuming it.
-func (s *Server) resumeHeldGuest(ctx context.Context, g heldGuest) string {
+// ("" when it does not), and whether a live firmware move is what holds it.
+// A record whose guest is paused here is reported for as long as it is
+// (re-review m4), whatever stops this host resuming it.
+func (s *Server) resumeHeldGuest(ctx context.Context, g heldGuest) (why string, firmware bool) {
+	why = s.resumeHeldGuestWhy(ctx, g, &firmware)
+	return why, firmware
+}
+
+func (s *Server) resumeHeldGuestWhy(ctx context.Context, g heldGuest, firmware *bool) string {
 	stale := func() bool {
 		t, err := time.Parse(time.RFC3339, g.Since)
 		return err != nil || time.Since(t) > heldStaleAfter
@@ -435,6 +450,13 @@ func (s *Server) resumeHeldGuest(ctx context.Context, g heldGuest) string {
 		if why == "" && !g.Uncommitted && vm.State == "migrating" && !stale() {
 			return "" // the move is still under way
 		}
+		if ferr := s.firmwareMoveHeld(g.VM); ferr != nil {
+			// A live firmware move holds it: its source decides from Verify
+			// whether it commits here. Writing its owner here first is
+			// never the way out.
+			*firmware = true
+			return fmt.Sprintf("%s (since %s: %v)", g.VM, g.Since, ferr)
+		}
 		if why == "" {
 			why = fmt.Sprintf("it arrived here paused, but its move's ownership commit is not recorded (the VM's row names %s), "+
 				"so this host does not resume it: `lv doctor repair-owner %s %s` records it here", vm.HostName, g.VM, s.hostName)
@@ -459,6 +481,7 @@ func (s *Server) resumeHeldGuest(ctx context.Context, g heldGuest) string {
 		if errors.Is(err, errFirmwareMoveHeld) {
 			// Its guards are not what holds it: the record stays for the
 			// move's release to drop.
+			*firmware = true
 			return fmt.Sprintf("%s (since %s: %v)", g.VM, g.Since, err)
 		}
 		return held(err.Error())

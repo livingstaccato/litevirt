@@ -91,10 +91,6 @@ func (s *Server) VerifyLiveFirmwareTarget(ctx context.Context, req *pb.VerifyLiv
 	if req.SrcPermallSha256 != "" && !sha256HexRe.MatchString(req.SrcPermallSha256) {
 		return answer(verdictBadRequest, fmt.Sprintf("src_permall_sha256 %q is not a sha256", req.SrcPermallSha256))
 	}
-	if h.UEFI && h.NvramMaterialised != fwmig.NvramDone {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"VM %q: the hold of attempt %s never finished materialising the NVRAM (%s); its Prepare did not complete", h.VM, h.Attempt, h.NvramMaterialised)
-	}
 	switch h.State {
 	case fwmig.HoldPrepared, fwmig.HoldVerified, fwmig.HoldMismatch:
 	default:
@@ -102,15 +98,22 @@ func (s *Server) VerifyLiveFirmwareTarget(ctx context.Context, req *pb.VerifyLiv
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"VM %q: the hold of attempt %s is %s: it was verified and released; Verify does not judge it again", h.VM, h.Attempt, h.State)
 	}
+	// A guest that ran is TARGET_RAN whatever else is wrong with its hold:
+	// that is the guard failing, and the source must hear it as such.
 	switch {
-	case !td.Present || td.State == "shutoff":
-		return answer(verdictNotRunning, fmt.Sprintf("its domain is %s here", domainWord(td)))
 	case td.State == "running":
 		return answer(verdictTargetRan, "its domain is running here: the guest ran before its state was verified")
-	case td.State != "paused":
+	case td.Present && td.State != "shutoff" && td.State != "paused":
 		// Active, neither running nor paused (pm-suspended, crashed): only a
 		// guest that ran gets there.
 		return answer(verdictTargetRan, fmt.Sprintf("its domain is %s here, which only a guest that ran reaches", td.State))
+	}
+	if h.UEFI && h.NvramMaterialised != fwmig.NvramDone {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"VM %q: the hold of attempt %s never finished materialising the NVRAM (%s); its Prepare did not complete", h.VM, h.Attempt, h.NvramMaterialised)
+	}
+	if !td.Present || td.State == "shutoff" {
+		return answer(verdictNotRunning, fmt.Sprintf("its domain is %s here", domainWord(td)))
 	}
 	if !strings.EqualFold(td.Uuid, h.UUID) {
 		return nil, status.Errorf(codes.FailedPrecondition,

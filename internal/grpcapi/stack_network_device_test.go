@@ -116,13 +116,13 @@ func TestDefaultStackNetworkDevices_SharedDeviceWarns(t *testing.T) {
 		t.Fatalf("warnings %v, want exactly one", w)
 	}
 	for _, want := range []string{`"sa"`, `"sb"`, "sb_backend", `"backend"`, "interface: sa_backend", "If that is not intended"} {
-		if !strings.Contains(w[0], want) {
-			t.Errorf("warning %q does not name %s", w[0], want)
+		if !strings.Contains(w[0].Detail, want) {
+			t.Errorf("warning %q does not name %s", w[0].Detail, want)
 		}
 	}
 	// The other stack's own redeploy is told the same.
 	sb := backendFile("sb", compose.NetworkDef{Type: "bridge", Subnet: "10.2.0.0/24"})
-	if w, _ := s.defaultStackNetworkDevices(ctx, sb); len(w) != 1 || !strings.Contains(w[0], "sa_backend") {
+	if w, _ := s.defaultStackNetworkDevices(ctx, sb); len(w) != 1 || !strings.Contains(w[0].Detail, "sa_backend") {
 		t.Errorf("sb's redeploy warnings %v, want one naming sa_backend", w)
 	}
 }
@@ -239,7 +239,47 @@ func TestDefaultStackNetworkDevices_ScopedDefaultOnAnotherStacksDeviceWarns(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(w) != 1 || !strings.Contains(w[0], "x_lan") || !strings.Contains(w[0], `"x"`) {
+	if len(w) != 1 || !strings.Contains(w[0].Detail, "x_lan") || !strings.Contains(w[0].Detail, `"x"`) || w[0].Event != eventBridgeShared {
 		t.Errorf("warnings %v, want one naming x_lan of stack x", w)
+	}
+}
+
+// A bridge network with no interface whose name is an operator's host bridge
+// that another stack's network is already recorded on gets its scoped name
+// (sharing across stacks must be explicit), and the deploy says so: the
+// stack, the host bridge, the stacks on it and how to share it.
+//
+// Mutation: no host-bridge warning — red.
+// Mutation: warn on a bridge litevirt made — the "made" case goes red.
+func TestDefaultStackNetworkDevices_HostBridgeOfAnotherStackWarns(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	s.bridgeExists = func(dev string) bool { return dev == "br0" || dev == "backend" }
+	s.SetNetworkProvisioner(createdBridgesProv{created: []string{"backend"}})
+	seedStackNetworkRow(t, s, "sa", "br0", compose.NetworkDef{Type: "bridge", Interface: "br0"})
+	seedStackNetworkRow(t, s, "sc", "up", compose.NetworkDef{Type: "bridge", Interface: "br0"})
+	sb := &compose.File{Name: "sb", Networks: map[string]compose.NetworkDef{"br0": {Type: "bridge"}}}
+	w, err := s.defaultStackNetworkDevices(ctx, sb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sb.Networks["br0"].Interface; got != "sb_br0" {
+		t.Errorf("sb br0 on %q, want sb_br0", got)
+	}
+	if len(w) != 1 || w[0].Event != eventHostBridgeNotShared {
+		t.Fatalf("warnings %+v, want one %s", w, eventHostBridgeNotShared)
+	}
+	for _, want := range []string{`"sb"`, `"br0"`, `"sa"`, `"sc"`, "sb_br0", "to share it, set \"interface: br0\" and redeploy"} {
+		if !strings.Contains(w[0].Detail, want) {
+			t.Errorf("warning %q does not name %s", w[0].Detail, want)
+		}
+	}
+
+	// A bridge litevirt made (a stack's own, recorded by sa) is not a host
+	// bridge: no such warning.
+	seedStackNetworkRow(t, s, "sa", "backend", compose.NetworkDef{Type: "bridge", Interface: "backend"})
+	sd := backendFile("sd", compose.NetworkDef{Type: "bridge"})
+	if w, err := s.defaultStackNetworkDevices(ctx, sd); err != nil || len(w) != 0 {
+		t.Errorf("made bridge: warnings %+v err %v, want none", w, err)
 	}
 }

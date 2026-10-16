@@ -772,12 +772,12 @@ func (s *Server) provisionPlannedNetworks(ctx context.Context, f *compose.File, 
 		return status.Errorf(codes.Unavailable, "network provisioning: %v", err)
 	}
 	for _, w := range shared {
-		slog.Warn("deploy: stack network shares its bridge with another stack's network", "stack", f.Name, "detail", w)
+		slog.Warn("deploy: stack network device", "stack", f.Name, "event", w.Event, "detail", w.Detail)
 		if s.events != nil {
-			s.events.Publish(events.Event{Action: "network.bridge_shared", Target: f.Name, Detail: w})
+			s.events.Publish(events.Event{Action: w.Event, Target: f.Name, Detail: w.Detail})
 		}
 		if stream != nil {
-			if err := stream.Send(&pb.DeployProgress{Phase: "warning", Detail: w}); err != nil {
+			if err := stream.Send(&pb.DeployProgress{Phase: "warning", Detail: w.Detail}); err != nil {
 				return err
 			}
 		}

@@ -341,6 +341,7 @@ vms:
 // main; the entry host decides once and every peer gets the same device.
 //
 // Mutation: drop the host-bridge rule — the network goes to hb_br0, red.
+// Mutation: no host-bridge warning for the second stack — red.
 func TestFleet_StackNetworkNamedAfterAHostBridgeUsesIt(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
 	ctx := context.Background()
@@ -364,5 +365,29 @@ func TestFleet_StackNetworkNamedAfterAHostBridgeUsesIt(t *testing.T) {
 	}
 	if got := rowInterface(t, c.Nodes[0].DB, "hb_br0"); got != "br0" {
 		t.Errorf("hb_br0's row names %q, want br0", got)
+	}
+
+	// A second stack naming the same host bridge does not share it silently:
+	// it gets its scoped bridge, and the deploy says how to share.
+	msgs, err = deployStream(t, ctx, c.SelfClient(entry), strings.NewReplacer("name: hb", "name: hc", "  ha:", "  hca:", "  hb:", "  hcb:").Replace(composeHostBridge))
+	if err != nil {
+		t.Fatalf("deploy hc: %v", err)
+	}
+	warned := false
+	for _, p := range msgs {
+		if p.Phase == "error" {
+			t.Fatalf("deploy hc failed: %s: %s", p.VmName, p.Error)
+		}
+		if p.Phase == "warning" && strings.Contains(p.Detail, `"hb"`) && strings.Contains(p.Detail, `to share it, set "interface: br0" and redeploy`) {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("hc's deploy did not warn that br0 is hb's and how to share it; progress: %v", msgs)
+	}
+	for _, n := range c.Nodes {
+		if dev, ok := n.Net.Up("hc_br0"); !ok || dev != "hc_br0" {
+			t.Errorf("%s: hc_br0 up=%v on %q, want its own hc_br0", n.Name, ok, dev)
+		}
 	}
 }

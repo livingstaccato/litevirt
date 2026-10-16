@@ -1270,7 +1270,10 @@ network of one name are never on one bridge. A network already deployed keeps
 the bridge its record names. A network named after a bridge the deploying host
 already has, which litevirt did not create and no stack network is on, is put
 on that bridge; to attach to a host bridge in any other case, name it with
-`interface:`. A `direct` network with no `interface` uses the host NIC of its
+`interface:`. A host bridge another stack's network is already on is not shared
+by name: the network gets its scoped bridge and the deploy warns, naming the
+stacks on it (event `network.host_bridge_not_shared`); to share it, set
+`interface:` to it and redeploy. A `direct` network with no `interface` uses the host NIC of its
 own name. When a stack's bridge network is on the same bridge as another
 stack's network, the deploy warns, naming both stacks and the bridge (the entry
 host also publishes a `network.bridge_shared` event); if that is not intended,

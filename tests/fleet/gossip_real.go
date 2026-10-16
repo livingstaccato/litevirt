@@ -288,6 +288,18 @@ func (c *Cluster) SplitGossip(left, right []*Node) {
 	}
 }
 
+// HealGossipBetween undoes SplitGossip between left and right only: gossip
+// and every RPC flow again between each pair, and every other cut stays.
+func (c *Cluster) HealGossipBetween(left, right []*Node) {
+	for _, a := range left {
+		for _, b := range right {
+			c.gossip.set(a.Name, b.Name, false)
+			c.gossip.set(b.Name, a.Name, false)
+			c.SetLinkFaultBoth(a, b, LinkFault{})
+		}
+	}
+}
+
 // SplitAll cuts every node off from every other, as a fleet-wide blip does.
 func (c *Cluster) SplitAll() {
 	for i, a := range c.Nodes {

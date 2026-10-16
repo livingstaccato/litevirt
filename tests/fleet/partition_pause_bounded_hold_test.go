@@ -21,6 +21,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/failover"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
 // TestFleet_PartitionPause_DerivedSetBridgeCutRecovers: W1 P2. On the
@@ -127,4 +128,93 @@ func TestFleet_PartitionPause_ExplicitSetSkewedPauserBridgeCutRecovers(t *testin
 			assertRecoveredOnce(t, c, s, rs, dest, minority)
 		})
 	}
+}
+
+// TestFleet_PartitionPause_DerivedSetRegainedMajorityHolds: the bound must
+// count as the host counts. Five nodes on the derived voter set n0..n4, pp-vm
+// on n0, n3 the only coordinator. n0 is cut from the rest, paused and fenced.
+// Then, for a while, it reaches n1 and n2 again: with them it is three of five by its own
+// replica's count, which still holds it active, so it may resume. Then it is
+// cut from them too. At the deadline n3 and n4 have failed n0 since before
+// the fence, and n1's and n2's runs began after it. Two spanning runs are
+// n−q+1 of the four voters n3's derived set holds once n0 is fenced, but not
+// of n0's five: n0 may hold its majority again, and the deadline must not go
+// ahead on the restarted runs (H1).
+//
+// Mutation: count over this node's derived set in noRegainSinceIn (drop the
+// host from derivedRegainCandidate) — n3 recovers pp-vm while n0 may run it.
+func TestFleet_PartitionPause_DerivedSetRegainedMajorityHolds(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 5, IndependentReplicas: true, Relays: 5, RealGossip: true})
+	owner, n1, n2, n3 := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3]
+	insertVMPolicy(t, owner, "pp-vm", owner.Name, "restart-any")
+	c.WaitConverged(t, convergeTimeout)
+	owner.Virt.SetState("pp-vm", libvirtfake.StateRunning)
+	eventually(t, 30*time.Second, "every node's derived voter set to be n0..n4", func() bool {
+		for _, n := range c.Nodes {
+			cfg, err := corrosion.AdoptedVoterConfig(ctx, n.DB)
+			if err != nil || cfg.Explicit() {
+				return false
+			}
+			v, err := corrosion.VoterSet(ctx, n.DB)
+			if err != nil || len(v) != 5 {
+				return false
+			}
+		}
+		return true
+	})
+	s := newPPStack(t, c, ppOpts{latched: true, coordinators: map[string]bool{n3.Name: true}})
+	eventually(t, time.Minute, "the owner's pauser to be healed before the split", func() bool {
+		return s.node(owner).pauser.HealedForTests()
+	})
+	logs := captureLogs(t)
+
+	c.SplitGossip([]*Node{owner}, c.Nodes[1:])
+	eventually(t, ppRecoverBound, "node-3 to fence node-0", func() bool {
+		h, err := corrosion.GetHost(ctx, n3.DB, owner.Name)
+		return err == nil && h != nil && (h.State == "fenced" || h.State == "offline")
+	})
+	fencedAt := time.Now()
+
+	// n0 reaches n1 and n2 again: three of five by its own count. It stays
+	// reachable long enough that their next failing runs begin well after
+	// the fence (past fenceSkewMargin), as a restarted run must.
+	c.HealGossipBetween([]*Node{owner}, []*Node{n1, n2})
+	late := fencedAt.Add(10 * time.Second)
+	eventually(t, ppRecoverBound, "node-3 to hold node-1's and node-2's answers from node-0, 10 s after the fence", func() bool {
+		return answered(ctx, n3, owner.Name, n1.Name, late) && answered(ctx, n3, owner.Name, n2.Name, late)
+	})
+	c.SplitGossip([]*Node{owner}, []*Node{n1, n2})
+	noStart := func() {
+		for _, n := range c.Nodes[1:] {
+			if _, ok := firstEvent(n, "start", "pp-vm"); ok {
+				var lines []string
+				for _, l := range strings.Split(logs.String(), "\n") {
+					if strings.Contains(l, "msg=\"failover:") || strings.Contains(l, "msg=\"partition-pause:") {
+						lines = append(lines, l)
+					}
+				}
+				t.Fatalf("%s started pp-vm while node-0 may hold its majority again; the failover log:\n%s",
+					n.Name, strings.Join(lines, "\n"))
+			}
+		}
+	}
+	eventually(t, ppRecoverBound, "node-3 to hold the deadline on a restarted run", func() bool {
+		noStart()
+		return strings.Contains(logs.String(), "began after the fence")
+	})
+	// Several coordinator cycles more on the restarted runs.
+	time.Sleep(20 * time.Second)
+	noStart()
+}
+
+// answered reports whether n holds observer's latest verdict about target as
+// an answer written after since.
+func answered(ctx context.Context, n *Node, target, observer string, since time.Time) bool {
+	rows, err := n.DB.Query(ctx, `SELECT consecutive_failures, updated_at FROM host_health WHERE observer = ? AND target = ?`, observer, target)
+	if err != nil || len(rows) != 1 || rows[0].Int("consecutive_failures") != 0 {
+		return false
+	}
+	upd, ok := corrosion.ParseUpdatedAt(rows[0].String("updated_at"))
+	return ok && upd.After(since)
 }

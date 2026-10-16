@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -369,8 +370,7 @@ func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.Hos
 		return refused("voter set unreadable")
 	}
 	if !explicit {
-		return c.quietFallback(ctx, hr, h.Name, at,
-			c.noRegainSinceIn(hr, h.Name, at, mono, []map[string]bool{c.scope.voters(h.Name)}))
+		return c.quietFallback(ctx, hr, h.Name, at, c.noRegainSinceIn(ctx, hr, h.Name, at, mono, false))
 	}
 	if hr.err != nil {
 		slog.Warn("failover: host_health read for a partition-pause deadline failed", "host", h.Name, "error", hr.err)
@@ -389,7 +389,7 @@ func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.Hos
 	}
 	answered, observers, quiet := c.answeredSinceIn(hr, h.Name, at)
 	key, bridged := keyAnswered, true
-	if quiet && !c.noRegainSinceIn(hr, h.Name, at, mono, sets) {
+	if quiet && !c.noRegainSinceIn(ctx, hr, h.Name, at, mono, true) {
 		if r := restartedSinceObserversIn(hr, h.Name, at); len(r) > 0 {
 			answered, observers, quiet = whyRestarted(r), nil, false
 			key, bridged = keyRestarted, false
@@ -466,18 +466,22 @@ func (c *Coordinator) quietFallback(ctx context.Context, hr healthRead, host str
 }
 
 // noRegainSinceIn reports whether host cannot have held a voter majority at
-// any moment since the fence at `at`: over every voter set in sets, enough
-// voters other than host have failed it without a break since before the
-// fence (outageStartIn's n−q+1 spanning runs) that the rest, host included,
-// are fewer than a majority. An answer since the fence that the rows have
-// overwritten (restartedSinceObserversIn), or this node's own probe answer
-// (LastContact), can then only be a bridge's, as the fence quorum and the
-// pause wait already assume reachability to be symmetric. When this node has
-// probed the host healthy since mono, its own row is not counted: a probe
-// answer can run ahead of the row that records it. A read error reports
-// false.
-func (c *Coordinator) noRegainSinceIn(hr healthRead, host string, at, mono time.Time, sets []map[string]bool) bool {
-	if hr.err != nil || len(sets) == 0 {
+// any moment since the fence at `at`, by its own count: over every voter set
+// its pauser may be counting over (regainCandidates), enough voters other
+// than host have failed it without a break since before the fence that the
+// rest, host included, are fewer than a majority. An answer since the fence
+// that the rows have overwritten (restartedSinceObserversIn), or this node's
+// own probe answer (LastContact), can then only be a bridge's, as the fence
+// quorum and the pause wait already assume reachability to be symmetric.
+//
+// A run counts as spanning only when it began at least fenceSkewMargin plus
+// its observer's recorded clock skew from this node (clockSkews) before the
+// fence: an observer whose clock runs behind dates its run early. When this
+// node has probed the host healthy since mono, its own row is not counted: a
+// probe answer can run ahead of the row that records it. Any read error, or a
+// voter set it cannot know, reports false.
+func (c *Coordinator) noRegainSinceIn(ctx context.Context, hr healthRead, host string, at, mono time.Time, explicit bool) bool {
+	if hr.err != nil {
 		return false
 	}
 	if !mono.IsZero() && c.contactedSince(host, mono) {
@@ -489,8 +493,217 @@ func (c *Coordinator) noRegainSinceIn(hr healthRead, host string, at, mono time.
 		}
 		hr = healthRead{rows: rows}
 	}
-	_, ok, err := c.outageStartIn(hr, host, at, sets)
-	return err == nil && ok
+	skews, err := c.clockSkews(ctx)
+	if err != nil {
+		slog.Warn("failover: clock_skew read for a partition-pause deadline failed", "host", host, "error", err)
+		return false
+	}
+	cands, ok := c.regainCandidates(ctx, hr, host, explicit, skews)
+	if !ok || len(cands) == 0 {
+		return false
+	}
+	freshCutoff := c.now().Add(-healthFreshness)
+	spanning := map[string]bool{}
+	for _, r := range hr.rows {
+		obs := r.String("observer")
+		if obs == host || r.String("status") == health.StatusUnready {
+			continue
+		}
+		n := r.Int("consecutive_failures")
+		if n < offlineThreshold {
+			continue
+		}
+		upd, ok := corrosion.ParseUpdatedAt(r.String("updated_at"))
+		if !ok || !upd.After(freshCutoff) {
+			continue
+		}
+		if !observerRunStart(n, r.String("last_seen"), upd).Add(skews[obs]).After(at.Add(-fenceSkewMargin)) {
+			spanning[obs] = true
+		}
+	}
+	for _, cand := range cands {
+		if len(cand.set) == 0 {
+			return false
+		}
+		need := len(cand.set) - (len(cand.set)/2 + 1) + 1
+		have := 0
+		for v := range cand.set {
+			if v != host && spanning[v] && (cand.countable == nil || cand.countable[v]) {
+				have++
+			}
+		}
+		if have < need {
+			return false
+		}
+	}
+	return true
+}
+
+// regainCandidate is a voter set host's pauser may be counting its majority
+// over, for noRegainSinceIn. set is the denominator. countable, when not nil,
+// names the members whose spanning run counts: the others may not be in the
+// host's set at all, so they are counted only against the claim. A set that
+// may hold more or fewer members is checked at its worst: every member that
+// may be in it, and only the runs of those that surely are.
+type regainCandidate struct {
+	set       map[string]bool
+	countable map[string]bool
+}
+
+// regainCandidates is every voter set host's pauser may be counting over, as
+// far as this replica can tell; ok is false when one cannot be known.
+//
+//   - Explicit (pauseVoterSets: the adopted generation and each newer one):
+//     those sets, plus the generation before the adopted one, which a host
+//     partitioned before it adopted the current one still counts over. Before
+//     the first generation that is the derived set.
+//   - Derived: the derived set as the host's replica held it when the outage
+//     began (derivedRegainCandidate), plus every explicit generation this
+//     node has not adopted.
+func (c *Coordinator) regainCandidates(ctx context.Context, hr healthRead, host string, explicit bool, skews map[string]time.Duration) ([]regainCandidate, bool) {
+	adopted, err := corrosion.AdoptedVoterConfig(ctx, c.db)
+	if err != nil {
+		return nil, false
+	}
+	cfgs, err := corrosion.ListVoterConfigs(ctx, c.db)
+	if err != nil {
+		return nil, false
+	}
+	var adoptedGen int64
+	if adopted != nil {
+		adoptedGen = adopted.Generation
+	}
+	var cands []regainCandidate
+	if explicit {
+		sets, ok, err := c.pauseVoterSets(ctx, host)
+		if err != nil || !ok {
+			return nil, false
+		}
+		for _, set := range sets {
+			cands = append(cands, regainCandidate{set: set})
+		}
+		var prev *corrosion.VoterConfig
+		for _, cfg := range cfgs {
+			if cfg != nil && cfg.Generation < adoptedGen {
+				prev = cfg
+			}
+		}
+		if prev != nil && prev.Explicit() {
+			cands = append(cands, regainCandidate{set: c.regionMembers(prev, host)})
+			return cands, true
+		}
+	} else {
+		for _, cfg := range cfgs {
+			if cfg != nil && cfg.Generation > adoptedGen && cfg.Explicit() {
+				cands = append(cands, regainCandidate{set: c.regionMembers(cfg, host)})
+			}
+		}
+	}
+	d, ok := c.derivedRegainCandidate(ctx, hr, host, skews)
+	if !ok {
+		return nil, false
+	}
+	return append(cands, d), true
+}
+
+// regionMembers is cfg's members, host's region's under region scope.
+func (c *Coordinator) regionMembers(cfg *corrosion.VoterConfig, host string) map[string]bool {
+	set := map[string]bool{}
+	for _, m := range cfg.Members {
+		if !c.scope.region || c.scope.regionOf(m.Name) == c.scope.regionOf(host) {
+			set[m.Name] = true
+		}
+	}
+	return set
+}
+
+// derivedRegainCandidate is the derived voter set host's pauser counts over,
+// from the state its replica held when the outage began: host itself, which
+// the majority has fenced since, and every host whose voting state may have
+// changed since then. The outage began no later than the earliest fresh
+// failing run about host, less its observer's skew and fenceSkewMargin. A
+// host whose membership is unchanged since then is in the set iff it is
+// voting-eligible here, and its run counts. One that changed since, or whose
+// change cannot be dated, is in the denominator and its run does not count:
+// the host's replica may or may not hold it. ok is false when nothing dates
+// the outage.
+func (c *Coordinator) derivedRegainCandidate(ctx context.Context, hr healthRead, host string, skews map[string]time.Duration) (regainCandidate, bool) {
+	var since time.Time
+	for _, r := range hr.rows {
+		if r.String("observer") == host || r.String("status") == health.StatusUnready {
+			continue
+		}
+		n := r.Int("consecutive_failures")
+		if n <= 0 {
+			continue
+		}
+		upd, ok := corrosion.ParseUpdatedAt(r.String("updated_at"))
+		if !ok || !upd.After(c.now().Add(-healthFreshness)) {
+			continue
+		}
+		run := observerRunStart(n, r.String("last_seen"), upd).Add(-skews[r.String("observer")])
+		if since.IsZero() || run.Before(since) {
+			since = run
+		}
+	}
+	if since.IsZero() {
+		return regainCandidate{}, false
+	}
+	since = since.Add(-fenceSkewMargin)
+	stamps, err := corrosion.HostMembershipStamps(ctx, c.db)
+	if err != nil {
+		return regainCandidate{}, false
+	}
+	cand := regainCandidate{set: map[string]bool{host: true}, countable: map[string]bool{}}
+	for _, st := range stamps {
+		if st.Name == host || (c.scope.region && c.scope.regionOf(st.Name) != c.scope.regionOf(host)) {
+			continue
+		}
+		if st.DeletedAt != "" {
+			if del, ok := corrosion.ParseUpdatedAt(st.DeletedAt); ok && del.Before(since) {
+				continue // deleted before the outage: not in the host's set either
+			}
+			cand.set[st.Name] = true
+			continue
+		}
+		changed, ok := corrosion.ParseUpdatedAt(st.Changed)
+		unchanged := ok && changed.Before(since)
+		switch {
+		case unchanged && corrosion.VotingEligible(st.State):
+			cand.set[st.Name] = true
+			cand.countable[st.Name] = true
+		case !unchanged:
+			cand.set[st.Name] = true
+		}
+	}
+	return cand, true
+}
+
+// clockSkews is each peer's recorded clock skew from this node (clock_skew,
+// either direction, the larger). Only observers' runs are shifted by it, so
+// a skewed host itself dates nothing here (W5c). The checker records a skew only above a second, which
+// fenceSkewMargin already covers, so a peer with no row adds nothing.
+func (c *Coordinator) clockSkews(ctx context.Context) (map[string]time.Duration, error) {
+	rows, err := c.db.Query(ctx,
+		`SELECT observer, target, skew_seconds FROM clock_skew WHERE observer = ? OR target = ?`, c.hostName, c.hostName)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]time.Duration{}
+	for _, r := range rows {
+		peer := r.String("target")
+		if peer == c.hostName {
+			peer = r.String("observer")
+		}
+		if peer == c.hostName {
+			continue
+		}
+		d := time.Duration(math.Abs(r.Float("skew_seconds")) * float64(time.Second))
+		if d > out[peer] {
+			out[peer] = d
+		}
+	}
+	return out, nil
 }
 
 // pausedThisOutage is the limit for a deadline at which no observer has seen

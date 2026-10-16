@@ -512,7 +512,7 @@ func TestRenderNotifyScript_NameInPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(out, "conntrackd-my-special-lb.ctl") {
+	if !strings.Contains(out, "/etc/litevirt/lb/my-special-lb-conntrackd.conf") {
 		t.Errorf("notify script should reference lb name:\n%s", out)
 	}
 	if !strings.Contains(out, "#!/bin/bash") {
@@ -529,20 +529,27 @@ func TestRenderNotifyScript_ContainsMasterAndBackupCases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(out, "MASTER)") {
-		t.Error("missing MASTER case")
+	// conntrackd's -C takes its config file. MASTER commits the external
+	// cache to the kernel, flushes, resyncs and sends a bulk update; BACKUP
+	// shortens the kernel timers and asks for a resync; FAULT shortens them.
+	for _, want := range []string{
+		"MASTER)\n" +
+			"        conntrackd -C \"$CONF\" -c\n" +
+			"        conntrackd -C \"$CONF\" -f\n" +
+			"        conntrackd -C \"$CONF\" -R\n" +
+			"        conntrackd -C \"$CONF\" -B\n",
+		"BACKUP)\n" +
+			"        conntrackd -C \"$CONF\" -t\n" +
+			"        conntrackd -C \"$CONF\" -n\n",
+		"FAULT)\n" +
+			"        conntrackd -C \"$CONF\" -t\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("notify script missing\n%s\nin:\n%s", want, out)
+		}
 	}
-	if !strings.Contains(out, "BACKUP|FAULT)") {
-		t.Error("missing BACKUP|FAULT case")
-	}
-	if !strings.Contains(out, "commit") {
-		t.Error("MASTER case should commit")
-	}
-	if !strings.Contains(out, "f internal") {
-		t.Error("MASTER case should flush internal")
-	}
-	if !strings.Contains(out, "f external") {
-		t.Error("BACKUP/FAULT case should flush external")
+	if strings.Contains(out, ".ctl") {
+		t.Errorf("notify script passes the control socket where conntrackd takes its config:\n%s", out)
 	}
 }
 

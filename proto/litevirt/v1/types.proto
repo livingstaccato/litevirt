@@ -922,6 +922,7 @@ message LoadBalancer {
     string            state       = 7;
     string            stack_name  = 8;  // empty for standalone LBs
     repeated LBPort   ports       = 9;  // port mappings
+    optional bool     snat        = 10; // rewrites its network's guest egress to the VIP; absent = unknown (the lookup failed)
 }
 
 message LBBackend {

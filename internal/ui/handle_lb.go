@@ -7,8 +7,23 @@ import (
 	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
+
+// snatLabel is an LB's outbound NAT as on/off, or "unknown" when the daemon
+// could not read it (the LB may be SNATting).
+func snatLabel(lb *pb.LoadBalancer) string {
+	switch {
+	case lb.Snat == nil:
+		return "unknown"
+	case lb.GetSnat():
+		return "on"
+	}
+	return "off"
+}
 
 func (s *Server) handleLB(w http.ResponseWriter, r *http.Request) {
 	ctx := s.uiBearerCtx(r)
@@ -134,9 +149,16 @@ func (s *Server) handleCreateLB(w http.ResponseWriter, r *http.Request) {
 		Ports:     ports,
 		Hosts:     selectedHosts,
 		Backends:  backends,
+		Snat:      r.FormValue("snat") == "true",
 	})
 	if err != nil {
 		slog.Error("UI: create LB failed", "error", err)
+		if status.Code(err) == codes.FailedPrecondition && strings.Contains(err.Error(), corrosion.ErrLBSNATGateClosed.Error()) {
+			// The server's wording names the CLI's --snat; say it in the form's terms.
+			sendToast(w, "Create LB failed: until the cluster finishes upgrading, a load balancer can only be created with SNAT (outbound NAT via the VIP) ticked. Tick it, or wait until the upgrade is done.", "error")
+			w.WriteHeader(httpStatusFor(err))
+			return
+		}
 		rpcWriteFailed(w, "Create LB", err)
 		return
 	}

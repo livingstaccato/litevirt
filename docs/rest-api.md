@@ -229,11 +229,14 @@ Create request body:
   "algorithm": "roundrobin",
   "ports": [{"listen": 80, "target": 8080, "protocol": "http"}],
   "hosts": ["host-a", "host-b"],
-  "vm_backends": ["web-0", "web-1"]
+  "vm_backends": ["web-0", "web-1"],
+  "snat": false
 }
 ```
 
-Update request body (all fields optional, empty = no change):
+`snat` (default `false`) SNATs a host-isolated network's outbound guest traffic to the VIP, as `lv lb create --snat` does. List and inspect responses carry each load balancer's `snat` setting.
+
+Update request body (all fields optional, empty = no change; `snat` absent = no change):
 
 ```json
 {

@@ -1214,7 +1214,9 @@ lv lb create <name> --vip <cidr> --port <l:t/proto> --backend <name=addr>
   --algorithm roundrobin     # roundrobin | leastconn | source
   --host <name>              # Hosts to run LB on (repeatable)
   --vm-backend <vm-name>     # Use VM IP as backend (repeatable)
+  --snat                     # SNAT a host-isolated network's outbound guest traffic to the VIP (default off)
 lv lb update <name> [flags]                       # Update config (zero-downtime)
+lv lb update <name> --snat=false                  # Turn an explicit LB's outbound SNAT off (--snat turns it on)
 lv lb delete <name>
 lv lb stats <name>                                # Live backend metrics
 lv lb drain <name> --backend <vm>                 # Graceful drain

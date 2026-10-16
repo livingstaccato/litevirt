@@ -535,6 +535,10 @@ type Server struct {
 	// haproxy). Production leaves it nil so apply failures surface + roll back.
 	lbApplyOverride func(context.Context, lb.Config) error
 
+	// lbListSNATOverride is a test seam for the snat lookup ListLoadBalancers
+	// makes per LB. Nil in production.
+	lbListSNATOverride func(ctx context.Context, name, stackName, generation string) (bool, error)
+
 	// netProvisioner is the host network provisioner seam (see
 	// NetworkProvisioner). Production leaves it nil: package network directly.
 	netProvisioner NetworkProvisioner

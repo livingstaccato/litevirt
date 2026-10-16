@@ -100,8 +100,8 @@ func TestApplyLBForStack_VIPOnTheNetworksBridge(t *testing.T) {
 	var applied []lb.Config
 	s.lbApplyOverride = func(_ context.Context, c lb.Config) error { applied = append(applied, c); return nil }
 	ctx := context.Background()
-	if err := s.applyLBForStack(ctx, "lbr-lb", "10.202.0.250/24", "", []lb.Port{{Listen: 80, Target: 8080, Protocol: "tcp"}},
-		[]lb.Backend{{Name: "lbr1", IP: "10.202.0.72", Port: 8080}}, []string{s.hostName}, nil, true); err != nil {
+	if err := s.applyLBForStack(ctx, "lbr-lb", "10.202.0.250/24", lb.Settings{Ports: []lb.Port{{Listen: 80, Target: 8080, Protocol: "tcp"}}},
+		[]lb.Backend{{Name: "lbr1", IP: "10.202.0.72", Port: 8080}}, []string{s.hostName}, true); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 	if len(applied) != 1 || applied[0].Interface != "hinet" {
@@ -295,7 +295,7 @@ func TestLB_TwoStacksSharingAShortNameStayApart(t *testing.T) {
 			{"b-lb", "10.2.0.250/24", "backend", "10.2.0.0/24"},
 			{"a-lb", "10.1.0.250/24", "a_backend", "10.1.0.0/24"},
 		} {
-			if err := s.applyLBForStack(ctx, c.lb, c.vip, "", ports, nil, []string{s.hostName}, nil, true); err != nil {
+			if err := s.applyLBForStack(ctx, c.lb, c.vip, lb.Settings{Ports: ports}, nil, []string{s.hostName}, true); err != nil {
 				t.Fatalf("%s: %v", c.lb, err)
 			}
 			in := intent(t, s, c.lb)
@@ -306,7 +306,7 @@ func TestLB_TwoStacksSharingAShortNameStayApart(t *testing.T) {
 	})
 	t.Run("a's LB on a host that has only b's backend", func(t *testing.T) {
 		s := setup(t, map[string]string{"backend": "10.2.0.1/24"})
-		if err := s.applyLBForStack(ctx, "a-lb", "10.1.0.250/24", "", ports, nil, []string{s.hostName}, nil, true); err == nil {
+		if err := s.applyLBForStack(ctx, "a-lb", "10.1.0.250/24", lb.Settings{Ports: ports}, nil, []string{s.hostName}, true); err == nil {
 			t.Error("a's VIP was placed on b's bridge")
 		}
 		if in := intent(t, s, "a-lb"); in != nil {
@@ -315,7 +315,7 @@ func TestLB_TwoStacksSharingAShortNameStayApart(t *testing.T) {
 	})
 	t.Run("a shared short name with no address to tell", func(t *testing.T) {
 		s := setup(t, map[string]string{"backend": ""})
-		if err := s.applyLBForStack(ctx, "b-lb", "10.2.0.250/24", "", ports, nil, []string{s.hostName}, nil, true); err == nil {
+		if err := s.applyLBForStack(ctx, "b-lb", "10.2.0.250/24", lb.Settings{Ports: ports}, nil, []string{s.hostName}, true); err == nil {
 			t.Error("b's VIP was placed on a device either stack could own")
 		}
 	})
@@ -337,15 +337,41 @@ func TestStackLBSNAT_OneRule(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	storeFile := func(t *testing.T, s *Server, name, yaml string) {
+		t.Helper()
+		if err := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{Name: name, ComposeHash: "h", ComposeYAML: yaml}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	stackFile := func(t *testing.T, s *Server, name, yaml string) {
 		t.Helper()
 		if _, err := compose.ParseBytes([]byte(yaml)); err != nil {
 			t.Fatalf("precondition: the stored file must parse: %v", err)
 		}
-		if err := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{Name: name, ComposeHash: "h", ComposeYAML: yaml}); err != nil {
-			t.Fatal(err)
-		}
+		storeFile(t, s, name, yaml)
 	}
+	// One LB per stack: a file declaring two different ones no longer parses
+	// (compose validation); one stored before that falls back to the VMs'
+	// specs. Identical copies parse, and the file decides.
+	const oneLB = `name: st
+images:
+  test:
+    source: file:///dev/null
+vms:
+  a:
+    image: test
+    cpu: 1
+    memory: 512
+    loadbalancer:
+      enabled: true
+      vip: 10.2.0.250/24
+      ports: [{listen: 80, target: 8080, protocol: tcp}]
+      snat: %s
+  b:
+    image: test
+    cpu: 1
+    memory: 512
+`
 	const twoLBs = `name: st
 images:
   test:
@@ -376,13 +402,25 @@ vms:
 		want bool
 	}{
 		{"explicit LB", func(*testing.T, *Server) {}, true},
-		{"file: VMs disagree, any true wins", func(t *testing.T, s *Server) {
-			stackFile(t, s, "st", fmt.Sprintf(twoLBs, "false", "true"))
+		{"file says true", func(t *testing.T, s *Server) {
+			stackFile(t, s, "st", fmt.Sprintf(oneLB, "true"))
 		}, true},
 		{"file says false, a stale VM spec says true: the file wins", func(t *testing.T, s *Server) {
+			stackFile(t, s, "st", fmt.Sprintf(oneLB, "false"))
+			lbVM(t, s, "st-a", "st", true)
+		}, false},
+		{"file with two identical LB copies says true", func(t *testing.T, s *Server) {
+			stackFile(t, s, "st", fmt.Sprintf(twoLBs, "true", "true"))
+		}, true},
+		{"file with two identical LB copies says false, a stale VM spec says true: the file wins", func(t *testing.T, s *Server) {
 			stackFile(t, s, "st", fmt.Sprintf(twoLBs, "false", "false"))
 			lbVM(t, s, "st-a", "st", true)
 		}, false},
+		{"a stored file with two different LBs (no longer parses): VM specs decide, any true wins", func(t *testing.T, s *Server) {
+			storeFile(t, s, "st", fmt.Sprintf(twoLBs, "false", "true"))
+			lbVM(t, s, "st-a", "st", false)
+			lbVM(t, s, "st-b", "st", true)
+		}, true},
 		{"no file: VM specs disagree, any true wins", func(t *testing.T, s *Server) {
 			lbVM(t, s, "st-a", "st", false)
 			lbVM(t, s, "st-b", "st", true)

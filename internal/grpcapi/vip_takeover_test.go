@@ -349,6 +349,7 @@ func TestUpdateLoadBalancer_VIPOnlyChangeImplicitLBNotTornDown(t *testing.T) {
 // and the row is NOT persisted.
 func TestCreateLoadBalancer_RefusedWhenVIPHeldElsewhere(t *testing.T) {
 	s := testServerR2(t)
+	s.db.SetClusterPolicyGate(func() bool { return true }) // failover_scope_v1 latched: the LB's snat is recordable
 	ctx := adminCtx()
 	s.vipGateFlipped = func() bool { return true }
 	s.enfVIPProofReclaim.Store(true)
@@ -403,6 +404,7 @@ func TestUpdateLoadBalancer_VIPChangeRequiresClaimProof(t *testing.T) {
 // With the VIP provably free cluster-wide, the create proceeds past the gate.
 func TestCreateLoadBalancer_AllowedWhenVIPFree(t *testing.T) {
 	s := testServerR2(t)
+	s.db.SetClusterPolicyGate(func() bool { return true }) // failover_scope_v1 latched: the LB's snat is recordable
 	ctx := adminCtx()
 	s.vipGateFlipped = func() bool { return true }
 	s.enfVIPProofReclaim.Store(true)

@@ -297,8 +297,9 @@ iptables):
 
 - **Masquerade** — a `postrouting` nat chain SNATs managed-subnet guest egress
   out the host's uplink (`ip saddr <subnet> oifname != <bridge> masquerade`).
-- **SNAT** — a load balancer on a host-isolated network rewrites guest egress to
-  its VIP (`oifname <uplink> ip saddr <subnet> snat to <vip>`), emitted before
+- **SNAT** — a load balancer on a host-isolated network with `snat: true` (or
+  `lv lb create --snat`) rewrites guest egress to its VIP
+  (`oifname <uplink> ip saddr <subnet> snat to <vip>`), emitted before
   masquerade.
 - **Host isolation** — an `input` chain drops guest→host traffic per isolated
   bridge (`iifname <bridge> drop`), punching through VRRP and declared LB VIP

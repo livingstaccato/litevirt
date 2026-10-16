@@ -1,11 +1,17 @@
 #!/bin/bash
-CTL="/var/run/conntrackd-egress.ctl"
+CONF="/etc/litevirt/lb/egress-conntrackd.conf"
 case "$1" in
     MASTER)
-        conntrackd -C "$CTL" -c -C commit
-        conntrackd -C "$CTL" -c -f internal
+        conntrackd -C "$CONF" -c
+        conntrackd -C "$CONF" -f
+        conntrackd -C "$CONF" -R
+        conntrackd -C "$CONF" -B
         ;;
-    BACKUP|FAULT)
-        conntrackd -C "$CTL" -c -f external
+    BACKUP)
+        conntrackd -C "$CONF" -t
+        conntrackd -C "$CONF" -n
+        ;;
+    FAULT)
+        conntrackd -C "$CONF" -t
         ;;
 esac

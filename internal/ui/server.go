@@ -112,6 +112,7 @@ func (s *Server) SetBackupRepos(repos map[string]string) { s.backupRepos = repos
 func NewServer(client pb.LiteVirtClient, clusterName string) (*Server, error) {
 	funcMap := template.FuncMap{
 		"vmStateBadge":   vmStateBadge,
+		"snatLabel":      snatLabel,
 		"hostStateBadge": hostStateBadge,
 		"firstIP":        firstIP,
 		"nicSettings":    nicSettings,

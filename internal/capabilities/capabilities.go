@@ -806,23 +806,21 @@ const (
 	// which takes the VIP off its holder. Once latched, each LB host sends
 	// them as unicast from its recorded address to the other LB hosts'
 	// recorded addresses, over the device holding its own, and accepts them
-	// only from those addresses (lb.Config.VRRPUnicast). Nothing VRRP is on
-	// the guest segment.
+	// only from those addresses (lb.Config.VRRPUnicast).
 	//
 	// A host on the old transport and a host on the new one do not hear each
-	// other, and both hold the VIP, so no host switches until every host may
-	// be an LB peer of it: the latch is that proof, and a host renders the
-	// new transport only once the latch is durable. The LB reconciler then
-	// re-renders each LB still on the old transport, which is a one-time,
-	// seconds-long overlap per LB while its hosts switch.
+	// other, and both hold the VIP, so no host switches before the latch. The
+	// transport is then ONE cluster-wide value, never a host's own config: the
+	// first host whose latch is durable records it in cluster_policies, and
+	// every host renders unicast once that row reaches it, or once its own
+	// latch is durable; an operator's `lv cluster vrrp-transport` overrides
+	// both and is the stand-down (corrosion.GetVRRPTransport).
 	//
-	// Advertised CONDITIONALLY on enforcement.vrrp_unicast (DEFAULT ON): a
-	// host's peers rely on it rendering the same transport, so a flag-off
-	// host withholds it and the latch means every host has the flag on. The
-	// flag is the stand-down for a network that does not pass IP protocol
-	// 112 between hosts' recorded addresses: set false on EVERY host and each
-	// LB re-renders the old transport on its next apply (a flag off on one
-	// host only splits each LB it shares with an enforcing host).
+	// Advertised CONDITIONALLY on enforcement.vrrp_unicast (DEFAULT ON) until
+	// it has latched: before the latch a host's peers rely on it rendering the
+	// same transport, so the latch must mean every host opted in. After it the
+	// flag decides nothing and the host advertises it: one that does not is an
+	// earlier build back in the cluster (grpcapi CondLBVRRPSplit).
 	//
 	// ReplicationGated: a host parked in maintenance on an older build may
 	// still run an LB, and is an LB peer once it returns, so the latch waits
@@ -1237,9 +1235,9 @@ var supported = []string{
 	// peer setting them. See ConsolePasswordV1.
 	ConsolePasswordV1,
 	// VRRPUnicastV1 is advertised CONDITIONALLY on enforcement.vrrp_unicast
-	// (default on): each LB host relies on its peers rendering the same VRRP
-	// transport, so the latch must mean every host has the flag on. See
-	// VRRPUnicastV1.
+	// (default on) until it has latched: each LB host relies on its peers
+	// rendering the same VRRP transport, so the latch must mean every host
+	// opted in. See VRRPUnicastV1.
 	VRRPUnicastV1,
 	// Release202611V1 is advertised UNCONDITIONALLY: it says "this build
 	// decodes, keeps and honours every field and shape of its release", a fact

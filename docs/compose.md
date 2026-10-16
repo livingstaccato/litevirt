@@ -928,18 +928,45 @@ Requirements:
 - The network's bridge carries the VMs' gateway (see [Host isolation](#host-isolation)): a `vxlan` network, or a `bridge` network on a bridge litevirt created, with no `vlan`
 - It does not apply to an `isolated` network: nothing is routed off its bridge
 
-**VRRP transport**: once every host runs a release with `vrrp_unicast_v1` and has
-`enforcement.vrrp_unicast` on (the default; `lv cluster upgrade-status` shows the
-token latched), each LB host sends its VRRP adverts as unicast from its recorded
-address to the other LB hosts' recorded addresses, over the device that holds its
-own, and accepts adverts only from them. The VIP stays on its network's bridge;
-nothing VRRP is sent on that bridge, and there is no password for a guest to read.
-Hosts must pass IP protocol 112 between their recorded addresses. Before the latch,
-the adverts are multicast on the VIP's bridge with a password derived from the LB's
-name, as on earlier releases: any guest on that bridge can read them. When the
-latch forms, each LB host's reconciler re-renders its running LBs within about 30
-seconds, so an LB may be held by both of its hosts for a few seconds while they
-switch. A guest's VRRP to the host is dropped either way ([firewall.md](firewall.md)).
+**VRRP transport**: once every host runs a release with `vrrp_unicast_v1`, each LB
+host sends its VRRP adverts as unicast from its recorded address to the other LB
+hosts' recorded addresses, over the device that holds its own, and accepts adverts
+only from them. The VIP stays on its network's bridge; nothing VRRP is sent on that
+bridge, and there is no password for a guest to read. Before that, the adverts are
+multicast on the VIP's bridge with a password derived from the LB's name, as on
+earlier releases, and any guest on that bridge can read them.
+
+The transport is one value for the whole cluster, which every LB host renders
+whatever its own configuration: unicast from the moment the first host's
+`vrrp_unicast_v1` latch becomes durable (that host records it in the replicated
+`cluster_policies` table, and each host re-applies its LBs within 2 seconds of the
+record reaching it), or what an admin sets with `lv cluster vrrp-transport unicast`
+or `lv cluster vrrp-transport multicast`. So when the transport changes, an LB is
+held by both its hosts for about as long as the record takes to replicate between
+them plus 2 seconds — seconds on a healthy cluster, and longer only while
+replication to one of them is lagging. `lv cluster vrrp-transport` with no argument
+shows what the connected host renders.
+
+Requirements and edges of the unicast transport:
+
+- Hosts must pass IP protocol 112 between their recorded addresses. Where something
+  between them does not, run `lv cluster vrrp-transport multicast`.
+- A host must hold its recorded address (`advertise_address`) on a local device.
+  Otherwise its LBs are not applied, and the event `lb.vrrp_transport_refused` says
+  why.
+- A host in an LB's `hosts` that has no recorded address (it was removed with
+  `lv host rm`) is not a VRRP peer, and the event `lb.vrrp_peer_dropped` names it.
+  With no peer left the remaining host serves the VIP alone. Correct the list with
+  `lv lb update <name> --host <host>` (repeated for each host).
+- An LB host on an earlier build that comes back after the latch renders
+  multicast, and both hold the VIP. Each LB host that renders unicast raises the
+  critical health condition `lb.vrrp.transport_split`, naming the LB and the host.
+  Upgrade that host, or run `lv cluster vrrp-transport multicast` until it is.
+- keepalived 2.1 or later. On 2.0 the instance's source check and a single LB
+  host's TTL range are ignored (litevirt also renders the global
+  `vrrp_check_unicast_src`, which 2.0 honours).
+
+A guest's VRRP to its own host is dropped either way ([firewall.md](firewall.md)).
 
 **Conntrackd for failover**: When `snat: true` is set and the LB has two or more `hosts`, litevirt automatically runs `conntrackd` alongside keepalived to replicate conntrack state between VRRP peers, over the hosts' recorded addresses. Each LB host syncs with the first other host in `hosts`. On failover, the new MASTER imports synced entries so existing SNAT'd connections survive. This is managed automatically — no additional configuration is needed.
 

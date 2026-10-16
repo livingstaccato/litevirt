@@ -846,8 +846,10 @@ func (s *Server) applyLBLocal(ctx context.Context, cfg lb.Config, lbHosts []stri
 		return status.Error(codes.InvalidArgument, detail)
 	}
 	if err := s.lbVRRPTransport(ctx, &cfg, lbHosts); err != nil {
-		slog.Error("lb: not applied: its VRRP peers cannot be named", "lb", cfg.Name, "error", err)
-		return status.Errorf(codes.FailedPrecondition, "load balancer %q: %v", cfg.Name, err)
+		detail := fmt.Sprintf("load balancer %q is not applied: its VRRP transport cannot be rendered: %v", cfg.Name, err)
+		slog.Error("lb: "+detail, "lb", cfg.Name)
+		s.publish("lb.vrrp_transport_refused", cfg.Name, detail)
+		return status.Error(codes.FailedPrecondition, detail)
 	}
 	var err error
 	if s.lbApplyOverride != nil {
@@ -2757,23 +2759,43 @@ func (s *Server) repairLegacyLBHolder(ctx context.Context, cfg corrosion.LBConfi
 // holder would stay down and VRRP redundancy would silently vanish. This loop retries until
 // local quorum lets the gated apply through, and only touches DEAD LBs so a healthy holder is
 // never churned. It also recovers a Phase-2 self-demoted VIP once quorum heals.
+//
+// It also watches the VRRP transport (vrrpUnicastActive) every vrrpWatchInterval and
+// reconciles at once when it changes — the latch reached this host, or the operator's
+// `lv cluster vrrp-transport` did — and whenever kickLBReconcile asks.
 func (s *Server) RunLBReconciler(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	watch := time.NewTicker(min(interval, vrrpWatchInterval))
+	defer watch.Stop()
+	last, lastErr := s.vrrpUnicastActive(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 			s.reconcileDeadLBs(ctx)
+		case <-s.lbKick:
+			s.reconcileDeadLBs(ctx)
+		case <-watch.C:
+			now, err := s.vrrpUnicastActive(ctx)
+			if err != nil || (lastErr == nil && now == last) {
+				continue
+			}
+			last, lastErr = now, nil
+			slog.Info("LB reconciler: the VRRP transport changed; re-applying now", "unicast", now)
+			s.reconcileDeadLBs(ctx)
 		}
 	}
 }
 
+// vrrpWatchInterval is how often the LB reconciler reads the VRRP transport.
+const vrrpWatchInterval = 2 * time.Second
+
 // reconcileDeadLBs re-applies this host's enabled LBs whose keepalived isn't running, and
-// those whose keepalived config renders the other VRRP transport from the one this host
-// now renders (lbVRRPStale: vrrp_unicast_v1 latched, or enforcement.vrrp_unicast turned
-// off, since the LB was last applied). The
+// those whose keepalived config renders another VRRP transport from the one this host
+// would render now — mode, device, source or peers (lbVRRPStale) — and then reports an
+// LB host on an earlier build (noteVRRPSplit). The
 // re-apply path (refreshLBLocal / reapplyExplicitLB -> applyLBLocal) is split-brain-gated, so
 // it no-ops during warmup/upgrading and succeeds once local quorum returns.
 func (s *Server) reconcileDeadLBs(ctx context.Context) {
@@ -2781,6 +2803,8 @@ func (s *Server) reconcileDeadLBs(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	var local []corrosion.LBConfigRecord
+	defer func() { s.noteVRRPSplit(ctx, local) }()
 	for _, cfg := range configs {
 		if !cfg.Enabled {
 			continue
@@ -2794,7 +2818,8 @@ func (s *Server) reconcileDeadLBs(ctx context.Context) {
 		if !s.lbRunsOnHost(ctx, cfg) {
 			continue
 		}
-		stale := s.lbVRRPStale(cfg.Name)
+		local = append(local, cfg)
+		stale := s.lbVRRPStale(ctx, cfg)
 		if !stale && s.lbKeepalivedRunning(cfg.Name) {
 			continue
 		}
@@ -2804,8 +2829,7 @@ func (s *Server) reconcileDeadLBs(ctx context.Context) {
 			s.reapplyExplicitLB(ctx, cfg)
 		}
 		if stale {
-			slog.Info("LB reconciler: re-applied an LB onto this host's VRRP transport",
-				"lb", cfg.Name, "unicast", s.vrrpUnicastActive())
+			slog.Info("LB reconciler: re-applied an LB whose VRRP transport changed", "lb", cfg.Name)
 		} else {
 			slog.Info("LB reconciler: re-applied a stopped LB", "lb", cfg.Name)
 		}

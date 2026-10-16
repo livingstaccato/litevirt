@@ -269,7 +269,7 @@ func (s *Server) withheldStandDowns(advertised []string) []string {
 		return nil
 	}
 	var out []string
-	for _, tok := range []string{capabilities.RecoveryClaimV1, capabilities.PartitionPauseV1, capabilities.VRRPUnicastV1} {
+	for _, tok := range []string{capabilities.RecoveryClaimV1, capabilities.PartitionPauseV1} {
 		if !s.tokenEnabled(tok) && !slices.Contains(advertised, tok) && gt.Latched(tok) {
 			out = append(out, tok)
 		}

@@ -171,7 +171,10 @@ backend {{$.Name}}-{{.Listen}}-be
 {{- end}}
 `
 
-// keepalivedTmpl renders one vrrp_instance. With VRRPUnicast and no peers (a
+// keepalivedTmpl renders one vrrp_instance. With VRRPUnicast, the source check
+// is rendered twice: check_unicast_src in the instance (keepalived 2.1 on) and
+// vrrp_check_unicast_src in global_defs, which 2.0 also honours (it has no
+// instance keyword). With VRRPUnicast and no peers (a
 // sole LB host) it names the host itself as its peer, with a TTL range no
 // packet is in: keepalived cannot run unicast with no peers (it falls back to
 // multicast on the interface), and this way its adverts go only to itself over
@@ -181,6 +184,9 @@ var keepalivedTmpl = template.Must(template.New("keepalived").Parse(`
 global_defs {
     enable_script_security
     script_user root
+{{- if .VRRPUnicast}}
+    vrrp_check_unicast_src
+{{- end}}
 }
 
 vrrp_script chk_haproxy {

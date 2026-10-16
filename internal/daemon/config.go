@@ -703,18 +703,16 @@ type EnforcementConfig struct {
 	// relies on a peer setting them. An explicit false is the kill switch:
 	// this host's next define of each domain drops its passwords.
 	ConsolePassword bool `yaml:"console_password,omitempty"`
-	// VRRPUnicast: once vrrp_unicast_v1 has latched, this host's load
-	// balancers send their keepalived VRRP as unicast between the LB hosts'
-	// recorded addresses, over the host network, instead of multicasting it
-	// with a plaintext password on the bridge the VIP's guests are on
-	// (capabilities.VRRPUnicastV1). Hosts must pass IP protocol 112 between
-	// their recorded addresses.
+	// VRRPUnicast: whether this host advertises vrrp_unicast_v1 before it
+	// has latched (capabilities.VRRPUnicastV1). The token moves the load
+	// balancers' VRRP from multicast with a plaintext password on the bridge
+	// the VIP's guests are on to unicast between the LB hosts' recorded
+	// addresses; a host with this off holds that off for the whole cluster.
+	// Once latched it decides nothing: the transport is cluster-wide, with
+	// `lv cluster vrrp-transport` as its stand-down.
 	//
 	// DEFAULT TRUE (LoadConfig sets it before parsing; an explicit
-	// `vrrp_unicast: false` wins). The token is withheld while it is off: an
-	// LB host's peers rely on it rendering the same transport. An explicit
-	// false is the stand-down, and must be set on every host: each LB then
-	// re-renders the multicast transport on its next apply.
+	// `vrrp_unicast: false` wins).
 	VRRPUnicast bool `yaml:"vrrp_unicast,omitempty"`
 	// DigestV2: emit the order-invariant anti-entropy row digest (digest_v2) so
 	// column-order-only differences (fresh CREATE vs ALTER ADD COLUMN) stop showing as

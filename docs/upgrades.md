@@ -1426,23 +1426,25 @@ name, so any guest on that bridge can read the password and answer with a
 higher priority, which takes the VIP off its holder. This release sends them
 as unicast between the LB hosts' recorded addresses, over the host network
 ([compose.md](compose.md#load-balancer)). A host on the old transport and a
-host on the new one do not hear each other and would both hold the VIP, so no
-host switches until the `vrrp_unicast_v1` capability token has latched. It
-latches on its own once every host the cluster replicates to, including one
-parked in `maintenance`, runs this release with `enforcement.vrrp_unicast` on
-(the default). Each LB host's reconciler then re-renders its running LBs
-within about 30 seconds; an LB may be held by both its hosts for a few seconds
-while they switch. Hosts must pass IP protocol 112 between their recorded
-addresses.
+host on the new one do not hear each other and would both hold the VIP, so
+nothing switches until the `vrrp_unicast_v1` capability token has latched. It
+latches once every host the cluster replicates to, including one parked in
+`maintenance`, runs this release; a host with `enforcement.vrrp_unicast: false`
+withholds it, so it holds the switch off. The first host whose latch is durable
+records it cluster-wide, and every LB host then re-applies its LBs within 2
+seconds of that record reaching it, whatever its own flag says: an LB is held
+by both its hosts for about the replication delay between them plus 2 seconds.
+Hosts must pass IP protocol 112 between their recorded addresses.
 
-`enforcement.vrrp_unicast: false` is the stand-down, for a network that does
-not pass IP protocol 112 between hosts: set it on every host and restart each
-daemon, and each LB goes back to the multicast transport. A host with the flag
-off withholds the token, so it also holds the latch off, and once latched it
-is reported in `not_enforcing`. A flag off on one host only leaves each LB it
-shares with an enforcing host on two transports. A binary rolled back below
-the latched token enters WAL quarantine, as below every latched token, and
-renders the multicast transport its peers have left. Roll forward.
+The stand-down is cluster-wide: `lv cluster vrrp-transport multicast` (admin),
+which every host renders within 2 seconds of receiving it, and
+`lv cluster vrrp-transport unicast` undoes it. It can be set before the latch
+too, to keep the old transport. A host on an earlier build that comes back
+after the latch renders multicast while its LB peers render unicast; they raise
+`lb.vrrp.transport_split` naming it. A binary rolled back below the latched
+token enters WAL quarantine, as below every latched token, and renders the
+multicast transport its peers have left: roll forward, or set
+`lv cluster vrrp-transport multicast` first.
 
 ### SPICE through the daemon
 

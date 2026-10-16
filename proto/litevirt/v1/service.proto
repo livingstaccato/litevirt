@@ -4919,6 +4919,15 @@ service LiteVirt {
     rpc GetFailoverScope(google.protobuf.Empty)       returns (FailoverScopeStatus);
     rpc SetFailoverScope(SetFailoverScopeRequest)     returns (FailoverScopeStatus);
 
+    // GetVRRPTransport reports the load balancers' VRRP transport as the
+    // answering host renders it, and the cluster-wide policy behind it.
+    // SetVRRPTransport records the operator's choice (admin), "unicast" or
+    // "multicast", which every host then renders. It refuses until
+    // failover_scope_v1 has durably latched, "unicast" refuses until
+    // vrrp_unicast_v1 has, and both refuse while any voter is unreachable.
+    rpc GetVRRPTransport(google.protobuf.Empty)       returns (VRRPTransportStatus);
+    rpc SetVRRPTransport(SetVRRPTransportRequest)     returns (VRRPTransportStatus);
+
     // GetHAPolicy reports the cluster HA policy (armed or disarmed) and its
     // confirmation; SetHAPolicy changes it (admin). While disarmed, no host is
     // fenced and no workload is recovered automatically.
@@ -5252,6 +5261,25 @@ message HARegionConfirmation {
 
 message SetFailoverScopeRequest {
     string scope = 1;  // "cluster" | "region"
+}
+
+// VRRPTransportStatus is the load balancers' VRRP transport as the answering
+// host renders it, and the cluster-wide policy it follows.
+message VRRPTransportStatus {
+    string transport  = 1;  // "unicast" | "multicast": what this host renders
+    string policy     = 2;  // the operator's choice; "" when never set
+    string set_by     = 3;  // principal of the last change; "" when never set
+    string updated_at = 4;  // "" when never set
+    // latched: vrrp_unicast_v1 has latched on some host (its latch row) or
+    // durably on the answering host.
+    bool   latched    = 5;
+    // settable is false until failover_scope_v1 has durably latched on the
+    // answering host.
+    bool   settable   = 6;
+}
+
+message SetVRRPTransportRequest {
+    string transport = 1;  // "unicast" | "multicast"
 }
 
 message RestoreRelayRequest {

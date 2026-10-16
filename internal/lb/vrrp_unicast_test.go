@@ -153,12 +153,16 @@ func TestParseKeepalivedVIP_UnicastNamesTheVIPDevice(t *testing.T) {
 	}
 }
 
-// TestManager_KeepalivedUnicast reads the transport of the config on disk, so
-// the reconciler can find an LB still rendered for the old transport.
-func TestManager_KeepalivedUnicast(t *testing.T) {
+// TestManager_KeepalivedTransport reads the whole transport of the config on
+// disk — mode, device, source and peers — so the reconciler can find an LB
+// rendered for another transport, another peer set or another address. A
+// sole host's self entry is not a peer.
+//
+// Mutation: parse the peers as empty, or count the self entry — red.
+func TestManager_KeepalivedTransport(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManagerAt(dir, t.TempDir())
-	if _, ok := m.KeepalivedUnicast("app"); ok {
+	if _, ok := m.KeepalivedTransport("app"); ok {
 		t.Fatal("no config on disk, yet a transport was read")
 	}
 	write := func(cfg Config) {
@@ -173,11 +177,45 @@ func TestManager_KeepalivedUnicast(t *testing.T) {
 	legacy := unicastCfg()
 	legacy.VRRPUnicast = false
 	write(legacy)
-	if u, ok := m.KeepalivedUnicast("app"); !ok || u {
-		t.Fatalf("legacy config read as unicast=%v ok=%v", u, ok)
+	if tr, ok := m.KeepalivedTransport("app"); !ok || tr.Unicast {
+		t.Fatalf("legacy config read as %+v ok=%v", tr, ok)
 	}
-	write(unicastCfg("192.168.1.11"))
-	if u, ok := m.KeepalivedUnicast("app"); !ok || !u {
-		t.Fatalf("unicast config read as unicast=%v ok=%v", u, ok)
+	for _, cfg := range []Config{unicastCfg("192.168.1.12", "192.168.1.11"), unicastCfg()} {
+		write(cfg)
+		tr, ok := m.KeepalivedTransport("app")
+		if !ok || !tr.Equal(TransportOf(cfg)) {
+			t.Fatalf("read %+v ok=%v, want %+v", tr, ok, TransportOf(cfg))
+		}
+	}
+	a := TransportOf(unicastCfg("192.168.1.11"))
+	for name, b := range map[string]Transport{
+		"another peer":   TransportOf(unicastCfg("192.168.1.13")),
+		"a peer more":    TransportOf(unicastCfg("192.168.1.11", "192.168.1.13")),
+		"no peer":        TransportOf(unicastCfg()),
+		"another source": {Unicast: true, Iface: "eth0", Src: "192.168.1.20", Peers: []string{"192.168.1.11"}},
+		"another device": {Unicast: true, Iface: "eth1", Src: "192.168.1.10", Peers: []string{"192.168.1.11"}},
+		"multicast":      {},
+	} {
+		if a.Equal(b) {
+			t.Errorf("%s: compares equal", name)
+		}
+	}
+}
+
+// TestRenderKeepalived_UnicastChecksSourceOnEveryVersion: the instance's
+// check_unicast_src exists from keepalived 2.1; 2.0 knows only the global
+// vrrp_check_unicast_src, so both are rendered. A multicast render has neither.
+func TestRenderKeepalived_UnicastChecksSourceOnEveryVersion(t *testing.T) {
+	got, err := RenderKeepalived(unicastCfg("192.168.1.11"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "global_defs {\n    enable_script_security\n    script_user root\n    vrrp_check_unicast_src\n}") {
+		t.Errorf("unicast render lacks the global source check:\n%s", got)
+	}
+	legacy := unicastCfg()
+	legacy.VRRPUnicast = false
+	if got, _ := RenderKeepalived(legacy); strings.Contains(got, "unicast_src") {
+		t.Errorf("multicast render carries a source check:\n%s", got)
 	}
 }

@@ -343,9 +343,9 @@ type Server struct {
 	// host gives the consoles of each domain it defines a password, once
 	// console_password_v1 has latched (ConsolePasswordPolicy).
 	enfConsolePassword atomic.Bool
-	// enfVRRPUnicast is enforcement.vrrp_unicast (default on): this host's
-	// LBs send unicast VRRP over the host network once vrrp_unicast_v1 has
-	// durably latched (vrrpUnicastActive). Off withholds the token.
+	// enfVRRPUnicast is enforcement.vrrp_unicast (default on). Off withholds
+	// vrrp_unicast_v1 until it has latched; it never decides the transport an
+	// LB renders, which is cluster-wide (vrrpUnicastActive).
 	enfVRRPUnicast atomic.Bool
 	// allowPlaintextStorageMigration is this node's
 	// migration.allow_unencrypted_storage. A storage-copying migration sends RAM
@@ -622,12 +622,20 @@ type Server struct {
 	// when non-nil it reports whether this host's keepalived for an LB is running.
 	lbKeepalivedOverride func(name string) bool
 
-	// lbRenderedUnicastOverride is a test seam for the reconciler's read of
+	// lbRenderedTransportOverride is a test seam for the reconciler's read of
 	// the VRRP transport an LB's keepalived config on disk renders (lb.Manager
-	// KeepalivedUnicast); lbIfaceForIPOverride for the device holding an
-	// address (lb.DetectInterfaceForIP). Nil in production.
-	lbRenderedUnicastOverride func(name string) (unicast, ok bool)
-	lbIfaceForIPOverride      func(ip string) string
+	// KeepalivedTransport); lbIfaceForIPOverride for the device holding an
+	// address (lb.InterfaceHoldingIP). Nil in production.
+	lbRenderedTransportOverride func(name string) (lb.Transport, bool)
+	lbIfaceForIPOverride        func(ip string) string
+	// vrrpPeerCapsOverride is a test seam for noteVRRPSplit's Ping of an LB
+	// peer (PeerCapabilities). Nil in production.
+	vrrpPeerCapsOverride func(ctx context.Context, host string) ([]string, error)
+	// lbKick asks the LB reconciler for a pass now (kickLBReconcile).
+	lbKick chan struct{}
+	// vrrpRowLatched: vrrp_unicast_v1 has latched on some host (its latch
+	// row) or durably here, as vrrpUnicastActive last read it.
+	vrrpRowLatched atomic.Bool
 	// lbMgr is the LB manager the keepalived reads (running, transport) go
 	// to. Nil: lb.NewManager(), the production paths. Test-only (SetLBManager).
 	lbMgr *lb.Manager
@@ -1418,11 +1426,14 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfPartitionPause.Load() {
 		caps = withoutCapability(caps, capabilities.PartitionPauseV1)
 	}
-	// vrrp_unicast_v1 is withheld while enforcement.vrrp_unicast is off: an
-	// LB host and its peers hear each other only on the same VRRP transport,
-	// so each relies on the others rendering what it does, and the latch has
-	// to mean every host has the flag on. See TestAdvertise_VRRPUnicastWithheldWhileOff.
-	if !s.enfVRRPUnicast.Load() {
+	// vrrp_unicast_v1 is withheld while enforcement.vrrp_unicast is off and
+	// it has not latched: before the latch an LB host and its peers hear each
+	// other only on the same VRRP transport, so the latch has to mean every
+	// host opted in. After it the transport is cluster-wide, whatever the
+	// flag, and this host renders unicast too, so it says so: a host that does
+	// not advertise it is one on an earlier build (CondLBVRRPSplit). See
+	// TestAdvertise_VRRPUnicastWithheldWhileOff.
+	if !s.enfVRRPUnicast.Load() && !s.vrrpRowLatched.Load() {
 		caps = withoutCapability(caps, capabilities.VRRPUnicastV1)
 	}
 	return caps
@@ -1697,7 +1708,7 @@ func (s *Server) SetLiveResize(on bool) { s.enfLiveResize.Store(on) }
 func (s *Server) SetConsolePassword(on bool) { s.enfConsolePassword.Store(on) }
 
 // SetVRRPUnicast sets enforcement.vrrp_unicast: whether this host advertises
-// vrrp_unicast_v1 and, once it has latched, renders its LBs' VRRP as unicast.
+// vrrp_unicast_v1 before it has latched.
 func (s *Server) SetVRRPUnicast(on bool) { s.enfVRRPUnicast.Store(on) }
 
 // ConsolePasswordPolicy is what this host's defines do to a domain's console
@@ -2424,6 +2435,7 @@ type StoragePoolRef struct {
 // NewServer creates a new gRPC service handler.
 func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt LibvirtBackend, images *image.Store) *Server {
 	s := &Server{
+		lbKick:         make(chan struct{}, 1),
 		startedAt:      time.Now(),
 		hostName:       hostName,
 		dataDir:        dataDir,

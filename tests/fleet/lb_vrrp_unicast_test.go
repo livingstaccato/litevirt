@@ -4,8 +4,10 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -179,4 +181,121 @@ func TestFleet_VRRPUnicast_LBHostsSwitchTogether(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestFleet_VRRPUnicast_StandDownAndRemovedPeer: the transport is the
+// cluster's, not a host's. With vrrp_unicast_v1 latched on only one LB host,
+// both render unicast (the latch row replicates); `lv cluster vrrp-transport
+// multicast` takes both back, and `unicast` forward again, each within the
+// watcher's interval and without waiting for the reconcile tick. Then one LB
+// host is removed (`lv host rm`): the other stops naming it, renders the
+// sole-host form, and comes back up in that form after its keepalived dies.
+//
+// Mutations (each red): ignore the latch row (only node-0 switches); ignore
+// the operator's policy (the stand-down does nothing); refuse the apply over
+// the removed peer (node-0 stays on the pair form, and is not restarted).
+func TestFleet_VRRPUnicast_StandDownAndRemovedPeer(t *testing.T) {
+	bin := lbStandIns(t)
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	a, b := c.Nodes[0], c.Nodes[1]
+	confDir, runDir := map[string]string{}, map[string]string{}
+	for _, n := range c.Nodes {
+		n.Server.SetVRRPUnicast(true)
+		n.Server.SetBridgeExists(func(string) bool { return true })
+		root := t.TempDir()
+		confDir[n.Name], runDir[n.Name] = filepath.Join(root, "config"), filepath.Join(root, "run")
+		m := lb.NewManagerAt(confDir[n.Name], runDir[n.Name])
+		n.Server.SetLBManager(m)
+		n.Server.SetLBApply(m.Apply)
+		n.DB.SetClusterPolicyGate(func() bool { return true })
+	}
+	gates := gateAll(t, c)
+	for _, n := range c.Nodes {
+		peers := map[string]bool{}
+		for _, o := range c.Nodes {
+			if o != n {
+				peers[o.Name] = true
+			}
+		}
+		gates[n.Name].SeedPeersForTests(peers)
+	}
+	if !gates[a.Name].Enforced(ctx, capabilities.SplitBrainGateV1) {
+		t.Fatal("fixture: split_brain_gate_v1 did not latch")
+	}
+	if !gates[a.Name].Enforced(ctx, capabilities.FailoverScopeV1) {
+		t.Fatal("fixture: failover_scope_v1 did not latch")
+	}
+	if _, err := c.SelfClient(a).CreateLoadBalancer(ctx, &pb.CreateLBRequest{
+		Name: "web", Vip: "10.207.0.250/24", Hosts: []string{a.Name, b.Name},
+		Ports:    []*pb.LBPort{{Listen: 80, Target: 8080, Protocol: "tcp"}},
+		Backends: []*pb.LBBackendAddress{{Name: "b1", Address: "10.207.0.10"}},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	conf := func(n *Node) string {
+		data, _ := os.ReadFile(filepath.Join(confDir[n.Name], "web-keepalived.conf"))
+		return string(data)
+	}
+	isUnicast := func(n *Node) bool { _, _, uni := unicastPeers(conf(n)); return uni }
+	for _, n := range c.Nodes {
+		n := n
+		eventually(t, 20*time.Second, "the LB's keepalived config on "+n.Name, func() bool { return conf(n) != "" })
+	}
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	for _, n := range c.Nodes {
+		// A reconcile tick far longer than the test: every switch below is
+		// the transport watcher's.
+		go n.Server.RunLBReconciler(rctx, time.Hour)
+	}
+
+	// Only node-0 latches; node-1 follows its latch row.
+	if !gates[a.Name].Enforced(ctx, capabilities.VRRPUnicastV1) || !gates[a.Name].DurablyLatched(capabilities.VRRPUnicastV1) {
+		t.Fatal("vrrp_unicast_v1 did not latch on node-0")
+	}
+	if gates[b.Name].Latched(capabilities.VRRPUnicastV1) {
+		t.Fatal("fixture: node-1 latched too")
+	}
+	for _, n := range c.Nodes {
+		n := n
+		eventually(t, 15*time.Second, n.Name+" renders unicast", func() bool { return isUnicast(n) })
+	}
+
+	for _, step := range []struct {
+		transport string
+		unicast   bool
+	}{{"multicast", false}, {"unicast", true}} {
+		if _, err := c.SelfClient(a).SetVRRPTransport(ctx, &pb.SetVRRPTransportRequest{Transport: step.transport}); err != nil {
+			t.Fatalf("lv cluster vrrp-transport %s: %v", step.transport, err)
+		}
+		for _, n := range c.Nodes {
+			n := n
+			eventually(t, 15*time.Second, n.Name+" renders "+step.transport, func() bool { return isUnicast(n) == step.unicast })
+		}
+	}
+
+	// lv host rm node-1: node-0 serves the VIP alone.
+	if err := corrosion.DeleteHost(ctx, a.DB, b.Name); err != nil {
+		t.Fatal(err)
+	}
+	pidFile := filepath.Join(runDir[a.Name], "web-keepalived.pid")
+	if data, err := os.ReadFile(pidFile); err == nil {
+		if pid, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+	calls := filepath.Join(bin, "keepalived.calls")
+	before := countLines(calls, "-f ")
+	go func() {
+		for i := 0; i < 50 && rctx.Err() == nil; i++ {
+			a.Server.KickLBReconcileForTests()
+			time.Sleep(200 * time.Millisecond)
+		}
+	}()
+	eventually(t, 15*time.Second, "node-0 renders the sole-host form", func() bool {
+		src, peers, uni := unicastPeers(conf(a))
+		return uni && len(peers) == 1 && peers[0] == src && strings.Contains(conf(a), "max_ttl 0")
+	})
+	eventually(t, 15*time.Second, "node-0's keepalived started again", func() bool { return countLines(calls, "-f ") > before })
 }

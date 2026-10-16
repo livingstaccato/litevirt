@@ -90,6 +90,7 @@ func NewServerForTests(opts TestServerOpts) *Server {
 		ShutdownCh:     make(chan struct{}, 1),
 		fetchBinarySem: make(chan struct{}, fetchBinaryMaxConcurrent),
 		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
+		lbKick:         make(chan struct{}, 1),
 	}
 	s.wireCertificateVerifier()
 	s.wireReplicationReleaseGates()

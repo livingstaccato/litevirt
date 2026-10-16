@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -797,20 +798,82 @@ func (m *Manager) startOrReloadKeepalived(cfgPath, pidFile string) error {
 	return nil
 }
 
-// KeepalivedUnicast reports whether this LB's keepalived config on disk sends
-// its VRRP as unicast (Config.VRRPUnicast); ok=false when there is no
-// readable config.
-func (m *Manager) KeepalivedUnicast(name string) (unicast, ok bool) {
-	data, err := os.ReadFile(filepath.Join(m.configDir, name+"-keepalived.conf"))
-	if err != nil {
-		return false, false
+// Transport is the VRRP transport a keepalived config renders.
+type Transport struct {
+	Unicast bool
+	Iface   string   // the vrrp_instance's interface
+	Src     string   // unicast_src_ip
+	Peers   []string // unicast_peer, sorted, without a sole host's self entry
+}
+
+// Equal reports whether t and o render the same transport.
+func (t Transport) Equal(o Transport) bool {
+	if t.Unicast != o.Unicast {
+		return false
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "unicast_src_ip ") {
-			return true, true
+	if !t.Unicast {
+		return true
+	}
+	if t.Iface != o.Iface || t.Src != o.Src || len(t.Peers) != len(o.Peers) {
+		return false
+	}
+	a, b := append([]string(nil), t.Peers...), append([]string(nil), o.Peers...)
+	sort.Strings(a)
+	sort.Strings(b)
+	for i := range a {
+		if a[i] != b[i] {
+			return false
 		}
 	}
-	return false, true
+	return true
+}
+
+// TransportOf is the transport of cfg as RenderKeepalived renders it.
+func TransportOf(cfg Config) Transport {
+	if !cfg.VRRPUnicast {
+		return Transport{}
+	}
+	return Transport{Unicast: true, Iface: cfg.VRRPInterface, Src: cfg.UnicastSrc, Peers: cfg.UnicastPeers}
+}
+
+// KeepalivedTransport reads the VRRP transport of this LB's keepalived config
+// on disk; ok=false when there is no readable config.
+func (m *Manager) KeepalivedTransport(name string) (t Transport, ok bool) {
+	data, err := os.ReadFile(filepath.Join(m.configDir, name+"-keepalived.conf"))
+	if err != nil {
+		return Transport{}, false
+	}
+	return parseTransport(string(data)), true
+}
+
+// parseTransport reads a rendered config's transport. A sole host's self
+// entry (rendered with max_ttl 0) is not a peer.
+func parseTransport(conf string) Transport {
+	var t Transport
+	inPeers := false
+	for _, line := range strings.Split(conf, "\n") {
+		f := strings.Fields(line)
+		switch {
+		case len(f) == 0:
+		case inPeers && f[0] == "}":
+			inPeers = false
+		case inPeers:
+			if !strings.Contains(line, "max_ttl 0") {
+				t.Peers = append(t.Peers, f[0])
+			}
+		case f[0] == "interface" && len(f) == 2:
+			t.Iface = f[1]
+		case f[0] == "unicast_src_ip" && len(f) == 2:
+			t.Unicast, t.Src = true, f[1]
+		case f[0] == "unicast_peer":
+			inPeers = true
+		}
+	}
+	if !t.Unicast {
+		return Transport{}
+	}
+	sort.Strings(t.Peers)
+	return t
 }
 
 // KeepalivedRunning reports whether this LB's keepalived process is alive — the
@@ -973,6 +1036,32 @@ func DetectInterfaceForIP(targetIP string) string {
 	}
 
 	return DetectInterface()
+}
+
+// InterfaceHoldingIP is the device that holds ip as one of its own
+// addresses, or "" when none does. Unlike DetectInterfaceForIP it never
+// guesses: VRRP sent from an address the host does not own is never answered.
+func InterfaceHoldingIP(ip string) string {
+	want := net.ParseIP(ip)
+	if want == nil {
+		return ""
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.Equal(want) {
+				return iface.Name
+			}
+		}
+	}
+	return ""
 }
 
 // VRIDFromString converts a string to a stable VRID (helper for tests).

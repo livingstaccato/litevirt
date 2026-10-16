@@ -259,7 +259,9 @@ per-NIC rule is installed, but each drop is a counter instead (named
 `lv-wd <device> <in|out|vlan> <rule>`) and nothing is dropped; the inet table's
 routed filtering stays exactly as it was. Every host with guest NICs raises the
 health condition `firewall.nic.observe` and sends a notification. NIC guards on
-new NICs enforce in either mode — they protect new NICs only.
+new NICs enforce in either mode — they protect new NICs only — and so does the
+drop of a guest's VRRP to its host (see Guest VRRP below), the one drop
+observe mode makes outside the guards.
 
 ```
 lv firewall enforce status          # per host: the mode in force, and what would have been dropped since <time>
@@ -312,16 +314,21 @@ iptables):
   Connections the host opened onto a host-isolated bridge before an upgrade
   to this rule carry no mark, so their replies are dropped once: a long-lived
   connection (an HAProxy keep-alive to a backend) reconnects.
-- **Guest VRRP** — VRRP (IP protocol 112) a guest sends the host itself is
-  dropped, in enforce and observe mode alike: the bridge table's `input` chain
-  marks a guest NIC's VRRP (`meta l4proto 112 meta mark set meta mark |
-  0x40000000`), and a `guest_vrrp` chain on the inet `input` hook drops what is
-  marked, so a guest cannot answer a load balancer's VRRP and take its VIP.
-  VRRP between guests is untouched, on one bridge or routed between networks,
-  and so is VRRP from a bridge port that is not a guest NIC (a peer LB host's,
-  over the uplink). Rendered while the per-NIC table is in force and not in
-  guards-only mode. Bit 30 of the packet mark is litevirt's, beside bits 28
-  and 29.
+- **Guest VRRP** — VRRP (IP protocol 112) a guest on this host sends the host
+  itself is dropped, in enforce and observe mode alike: the bridge table's
+  `input` chain marks a guest NIC's VRRP (`meta l4proto 112 meta mark set meta
+  mark | 0x40000000`), and a `guest_vrrp` chain on the inet `input` hook drops
+  what is marked. VRRP between guests is untouched, on one bridge or routed
+  between networks, and so is VRRP from a bridge port that is not a guest NIC
+  (a peer LB host's, over the uplink). That last path is also how a guest on
+  another host's side of a shared network reaches this host, so the drop alone
+  does not stop a guest answering a load balancer's VRRP: the unicast VRRP
+  transport does, once `vrrp_unicast_v1` has latched
+  ([compose.md](compose.md#load-balancer)). Rendered while the per-NIC table is
+  in force and not in guards-only mode. In guards-only mode a guest's VRRP to
+  the host is not dropped; after the latch it needs a forged peer source, which
+  the NIC guard's source-address check drops for a guarded NIC. Bit 30 of the
+  packet mark is litevirt's, beside bits 28 and 29.
 - **Isolated networks** — an `isolated_forward` chain on the `forward` hook
   drops anything routed off or onto an `isolated` network's bridge: per live
   isolated network's bridge (`iifname "<bridge>" oifname != "<bridge>" drop`

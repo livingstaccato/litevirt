@@ -567,12 +567,12 @@ func TestQuietFallback_ARestartedRunIsNotABridge(t *testing.T) {
 	failingSince(t, db, "v4", at.Add(-time.Minute), time.Now())
 	failingSince(t, db, "coordinator", at.Add(-time.Minute), time.Now())
 	failingSince(t, db, "alive", at.Add(20*time.Second), time.Now())
-	v := c.quietFallback(ctx, c.readHostHealth(ctx, "down"), "down", at)
+	v := c.quietFallback(ctx, c.readHostHealth(ctx, "down"), "down", at, false)
 	if v.ok || v.key != keyRestarted || v.bridged || len(v.observers) != 0 {
 		t.Fatalf("refusal on a restarted run: %+v; want key %q, not bridged, naming no bridge observers", v, keyRestarted)
 	}
 	healthRow(t, db, "bridge", "healthy", 0, time.Now())
-	v = c.quietFallback(ctx, c.readHostHealth(ctx, "down"), "down", at)
+	v = c.quietFallback(ctx, c.readHostHealth(ctx, "down"), "down", at, false)
 	if v.ok || v.key != keyAnswered || !v.bridged {
 		t.Fatalf("refusal on an answer: %+v; want key %q, bridged", v, keyAnswered)
 	}

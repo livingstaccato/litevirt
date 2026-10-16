@@ -31,8 +31,15 @@ import (
 // [n2 n3 n4]; n5 stays connected to both.
 func bridgeFleet(t *testing.T, o ppOpts) (c *Cluster, s *ppStack, rs *runSampler) {
 	t.Helper()
+	return bridgeFleetWith(t, o, Options{})
+}
+
+// bridgeFleetWith is bridgeFleet over the six-node real-gossip cluster with
+// extra, the cluster options a scenario adds (ClockSeam).
+func bridgeFleetWith(t *testing.T, o ppOpts, extra Options) (c *Cluster, s *ppStack, rs *runSampler) {
+	t.Helper()
 	ctx := context.Background()
-	c = New(t, Options{Nodes: 6, IndependentReplicas: true, Relays: 6, RealGossip: true})
+	c = New(t, Options{Nodes: 6, IndependentReplicas: true, Relays: 6, RealGossip: true, ClockSeam: extra.ClockSeam})
 	owner := c.Nodes[0]
 	insertVMPolicy(t, owner, "pp-vm", owner.Name, "restart-any")
 	c.WaitConverged(t, convergeTimeout)
@@ -241,21 +248,13 @@ func TestFleet_LeaseHeldInTheMinority_MajorityTakesOverPastANonVoter(t *testing.
 	}
 }
 
-// TestFleet_PartitionPause_DerivedSetBridgeStallsVisibly: the same split with
-// NO voter generation adopted, so the voter set is derived. n5 is in
-// maintenance: up, outside the voter set, and in neither half, so it still
-// reaches both. On a derived set the deadline keeps the conservative rule —
-// any observer that sees the host answer holds its recovery — so the
-// majority waits, fences, and then recovers nothing for as long as the split
-// lasts. That stall is safe, and must be visible: ha.recovery.bridged names
-// the host, its workload, the observers, the derived set and the way out,
-// and ha.voter.genesis_pending says a split can stall failover. After the
-// heal everything converges to the one original copy.
-//
-// Mutations: drop the noteBridgedStall call in retryPauseWait — the
-// condition wait goes red; drop resolveBridgedSettled — the resolve wait
-// after the heal goes red.
-func TestFleet_PartitionPause_DerivedSetBridgeStallsVisibly(t *testing.T) {
+// derivedBridgeHeld is the derived-set bridge scenario up to its hold: six
+// nodes with NO voter generation adopted and n5 in maintenance (up, outside
+// the derived voter set n0..n4, and in neither half), pp-vm on n0, n2 the
+// only coordinator. It splits [n0 n1] from [n2 n3 n4] and returns once n2
+// has fenced n0, waited, and raised ha.recovery.bridged for it.
+func derivedBridgeHeld(t *testing.T) (*Cluster, *ppStack, *runSampler) {
+	t.Helper()
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 6, IndependentReplicas: true, Relays: 6, RealGossip: true})
 	owner, n2, n5 := c.Nodes[0], c.Nodes[2], c.Nodes[5]
@@ -284,8 +283,7 @@ func TestFleet_PartitionPause_DerivedSetBridgeStallsVisibly(t *testing.T) {
 		return s.node(owner).pauser.HealedForTests()
 	})
 
-	minority, majority := c.Nodes[:2], c.Nodes[2:5]
-	c.SplitGossip(minority, majority)
+	c.SplitGossip(c.Nodes[:2], c.Nodes[2:5])
 
 	// The minority pauses; the majority fences, waits, and holds.
 	eventually(t, ppRecoverBound, "ha.recovery.bridged for node-0 on node-2", func() bool {
@@ -293,6 +291,28 @@ func TestFleet_PartitionPause_DerivedSetBridgeStallsVisibly(t *testing.T) {
 			failover.CondRecoveryBridged, "host", owner.Name)
 		return err == nil && ok && row.Lifecycle == corrosion.ConditionConfirmed
 	})
+	return c, s, rs
+}
+
+// TestFleet_PartitionPause_DerivedSetBridgeStallsVisibly: the same split with
+// NO voter generation adopted, so the voter set is derived. n5 is in
+// maintenance: up, outside the voter set, and in neither half, so it still
+// reaches both. On a derived set the deadline keeps the conservative rule —
+// any observer that sees the host answer holds its recovery — so the
+// majority waits, fences, and then recovers nothing for as long as the split
+// lasts. That stall is safe, and must be visible: ha.recovery.bridged names
+// the host, its workload, the observers, the derived set and the way out,
+// and ha.voter.genesis_pending says a split can stall failover. After the
+// heal everything converges to the one original copy.
+//
+// Mutations: drop the noteBridgedStall call in retryPauseWait — the
+// condition wait goes red; drop resolveBridgedSettled — the resolve wait
+// after the heal goes red.
+func TestFleet_PartitionPause_DerivedSetBridgeStallsVisibly(t *testing.T) {
+	ctx := context.Background()
+	c, s, rs := derivedBridgeHeld(t)
+	owner, n2, n5 := c.Nodes[0], c.Nodes[2], c.Nodes[5]
+	minority := c.Nodes[:2]
 	if _, ok := firstEvent(owner, "suspend", "pp-vm"); !ok {
 		t.Fatalf("%s never suspended pp-vm", owner.Name)
 	}

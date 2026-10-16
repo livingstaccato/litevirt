@@ -347,10 +347,18 @@ const whyContacted = "this node probed the host healthy since the wait began"
 // healthy since mono, the wait's start on its monotonic clock (LastContact;
 // a zero mono skips that). Either is an answer since the fence overwritten or
 // unseen by the rows, and the host's own word, dated to this outage, decides.
+//
+// Neither holds the deadline when enough voters have failed the host without
+// a break since before the fence that it cannot have held a majority since
+// (noRegainSinceIn): such an answer can only have come from a bridge, and the
+// host, with no majority at any moment since, cannot have resumed. On the
+// derived voter set the restarted-run rule of quietFallback gives way to the
+// same evidence. Answers that are still the latest verdict (a bridge that
+// still stands) are not affected.
 func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.HostRecord, at, mono time.Time) pauseVerdict {
 	hr := c.readHostHealth(ctx, h.Name)
 	if !c.relyOnPartitionPause(ctx, h) {
-		v := c.quietFallback(ctx, hr, h.Name, at)
+		v := c.quietFallback(ctx, hr, h.Name, at, false)
 		v.bridged, v.observers = false, nil
 		return v
 	}
@@ -361,7 +369,8 @@ func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.Hos
 		return refused("voter set unreadable")
 	}
 	if !explicit {
-		return c.quietFallback(ctx, hr, h.Name, at)
+		return c.quietFallback(ctx, hr, h.Name, at,
+			c.noRegainSinceIn(hr, h.Name, at, mono, []map[string]bool{c.scope.voters(h.Name)}))
 	}
 	if hr.err != nil {
 		slog.Warn("failover: host_health read for a partition-pause deadline failed", "host", h.Name, "error", hr.err)
@@ -380,7 +389,7 @@ func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.Hos
 	}
 	answered, observers, quiet := c.answeredSinceIn(hr, h.Name, at)
 	key, bridged := keyAnswered, true
-	if quiet {
+	if quiet && !c.noRegainSinceIn(hr, h.Name, at, mono, sets) {
 		if r := restartedSinceObserversIn(hr, h.Name, at); len(r) > 0 {
 			answered, observers, quiet = whyRestarted(r), nil, false
 			key, bridged = keyRestarted, false
@@ -409,16 +418,32 @@ func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.Hos
 }
 
 // quietFallback is fenceStillStands, for a deadline that keeps its rule
-// (selfPauseStillStands), over host_health rows already read. When it holds
-// and this coordinator already limits the host's recovery from earlier in the
-// down-episode, the host's own word still bounds what moves:
+// (selfPauseStillStands), over host_health rows already read. With noRegain
+// (noRegainSinceIn held, on a pause still relied on) a failing run begun
+// after the fence does not refuse: only a latest verdict that is an answer
+// does. When it holds and this coordinator already limits the host's
+// recovery from earlier in the down-episode, the host's own word still
+// bounds what moves:
 // pausedThisOutage, dating the outage over the voter set this cycle decides
 // on. A refusal on observers whose latest verdict is an answer since the
 // fence is reported bridged: the form selfPauseStillStands raises on a
 // derived voter set. One on failing runs begun after the fence alone, or a
 // read error, is not.
-func (c *Coordinator) quietFallback(ctx context.Context, hr healthRead, host string, at time.Time) pauseVerdict {
-	why, observers, ok := c.fenceStillStandsIn(hr, host, at)
+func (c *Coordinator) quietFallback(ctx context.Context, hr healthRead, host string, at time.Time, noRegain bool) pauseVerdict {
+	var (
+		why       string
+		observers []string
+		ok        bool
+	)
+	if noRegain {
+		// fenceStillStandsIn without its restarted-run rule.
+		why = whyNoStreakSpans
+		if c.streakSpansIn(hr, host, at) {
+			why, observers, ok = c.answeredSinceIn(hr, host, at)
+		}
+	} else {
+		why, observers, ok = c.fenceStillStandsIn(hr, host, at)
+	}
 	if !ok {
 		switch {
 		case len(observers) > 0 && len(answeredSinceObserversIn(hr, host, at)) > 0:
@@ -438,6 +463,34 @@ func (c *Coordinator) quietFallback(ctx context.Context, hr healthRead, host str
 		return refused(why)
 	}
 	return pauseVerdict{ok: true, only: only}
+}
+
+// noRegainSinceIn reports whether host cannot have held a voter majority at
+// any moment since the fence at `at`: over every voter set in sets, enough
+// voters other than host have failed it without a break since before the
+// fence (outageStartIn's n−q+1 spanning runs) that the rest, host included,
+// are fewer than a majority. An answer since the fence that the rows have
+// overwritten (restartedSinceObserversIn), or this node's own probe answer
+// (LastContact), can then only be a bridge's, as the fence quorum and the
+// pause wait already assume reachability to be symmetric. When this node has
+// probed the host healthy since mono, its own row is not counted: a probe
+// answer can run ahead of the row that records it. A read error reports
+// false.
+func (c *Coordinator) noRegainSinceIn(hr healthRead, host string, at, mono time.Time, sets []map[string]bool) bool {
+	if hr.err != nil || len(sets) == 0 {
+		return false
+	}
+	if !mono.IsZero() && c.contactedSince(host, mono) {
+		rows := make([]corrosion.Row, 0, len(hr.rows))
+		for _, r := range hr.rows {
+			if r.String("observer") != c.hostName {
+				rows = append(rows, r)
+			}
+		}
+		hr = healthRead{rows: rows}
+	}
+	_, ok, err := c.outageStartIn(hr, host, at, sets)
+	return err == nil && ok
 }
 
 // pausedThisOutage is the limit for a deadline at which no observer has seen

@@ -538,11 +538,18 @@ All of this is in the failover coordinator (`internal/failover`).
      no latest verdict being an answer, no observer's failing run began after
      the wait started and this node has not probed the host healthy since;
      otherwise the host's own condition, dated to this outage, decides as
-     for an answer (a refusal on these alone is not reported as a bridge). A
+     for an answer (a refusal on these alone is not reported as a bridge).
+     Neither of those two holds the deadline when, over every voter set,
+     `n−q+1` voters other than the host have failing runs that span the
+     fence (this node's own run is left out once it has probed the host
+     since the wait began): the host cannot then have held a majority at any
+     moment since, so the answer was a bridge's, and the deadline is quiet. A
      derived one, or a newer generation that is a
      reset, is read from each node's own replica of host state, and then
      any observer that has seen the host answer since the fence refuses
-     (`fenceStillStands`). So does any observer once the pause can no longer
+     (`fenceStillStands`), except that a failing run begun after the fence
+     does not refuse under the same `n−q+1` spanning runs over the derived
+     set. So does any observer once the pause can no longer
      be relied on (§4.3: the host has since reported
      `partition_pause_failed`), since a host that answered was never
      stopped. When one of these deadlines passes quiet while this

@@ -32,3 +32,19 @@ func IsolatedBridgeName(networkName string) string {
 	sum := sha1.Sum([]byte(networkName))
 	return IsolatedBridgePrefix + hex.EncodeToString(sum[:])[:maxIfaceName-len(IsolatedBridgePrefix)]
 }
+
+// FlatBridgeName returns the host bridge a NIC on a network with no record
+// attaches to (flat-bridge mode), and the default device of a stack network
+// (DefaultNetworkInterfaces). It is the network name itself when that fits
+// IFNAMSIZ, so every bridge that exists today keeps its name across a rolling
+// upgrade. A longer name could never be created, so it maps to the stable
+// hashed form "lvf-<11 hex>" (exactly 15 chars) instead. Every site that
+// creates or removes a flat bridge MUST use this so the names agree.
+func FlatBridgeName(networkName string) string {
+	if len(networkName) <= maxIfaceName {
+		return networkName
+	}
+	const prefix = "lvf-"
+	sum := sha1.Sum([]byte(networkName))
+	return prefix + hex.EncodeToString(sum[:])[:maxIfaceName-len(prefix)]
+}

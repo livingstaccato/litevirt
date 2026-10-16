@@ -1,6 +1,7 @@
 package compose
 
 import (
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -247,21 +248,72 @@ action: restart
 	}
 }
 
-// A declared network with no interface takes its own name as written; one
-// with an interface keeps it, and an external network is not touched.
+// A declared network with no interface takes its stack-scoped flat bridge
+// name (the same on every host, and distinct from another stack's network of
+// the same short name); one with an interface keeps it, and an external
+// network is not touched.
 //
-// Mutation: default to ScopedNetworkName(f.Name, name) — "lan" goes red.
+// Mutation: default to the short name — "lan" goes red.
 func TestDefaultNetworkInterfaces(t *testing.T) {
 	f := &File{Name: "st", Networks: map[string]NetworkDef{
-		"lan": {Type: "bridge"},
-		"iso": {Type: "isolated"},
-		"set": {Type: "bridge", Interface: "br7"},
-		"ext": {External: true},
+		"lan":            {Type: "bridge"},
+		"iso":            {Type: "isolated"},
+		"set":            {Type: "bridge", Interface: "br7"},
+		"ext":            {External: true},
+		"a-long-backend": {Type: "bridge"},
 	}}
-	f.DefaultNetworkInterfaces()
-	for name, want := range map[string]string{"lan": "lan", "iso": "iso", "set": "br7", "ext": ""} {
+	f.DefaultNetworkInterfaces(nil)
+	for name, want := range map[string]string{
+		"lan": "st_lan", "iso": "st_iso", "set": "br7", "ext": "",
+		"a-long-backend": FlatBridgeName("st_a-long-backend"),
+	} {
 		if got := f.Networks[name].Interface; got != want {
 			t.Errorf("network %s: interface %q, want %q", name, got, want)
 		}
+	}
+	if got := f.Networks["a-long-backend"].Interface; len(got) > 15 || !strings.HasPrefix(got, "lvf-") {
+		t.Errorf("long network: interface %q, want the hashed lvf- form within 15 bytes", got)
+	}
+}
+
+// Two stacks that each name a network `backend` get different devices.
+func TestDefaultNetworkInterfaces_SameShortNameTwoStacks(t *testing.T) {
+	sa := &File{Name: "sa", Networks: map[string]NetworkDef{"backend": {Type: "bridge"}}}
+	sb := &File{Name: "sb", Networks: map[string]NetworkDef{"backend": {Type: "bridge"}}}
+	sa.DefaultNetworkInterfaces(nil)
+	sb.DefaultNetworkInterfaces(nil)
+	if a, b := sa.Networks["backend"].Interface, sb.Networks["backend"].Interface; a == b {
+		t.Fatalf("both stacks' backend default to %q", a)
+	}
+}
+
+// A network whose row already records a device keeps it (a deployed network
+// is never moved by the default); an interface the file names wins over the
+// record, and a network with no record gets the scoped default.
+//
+// Mutation: ignore recorded — "old" goes red.
+func TestDefaultNetworkInterfaces_RecordedDeviceKept(t *testing.T) {
+	f := &File{Name: "st", Networks: map[string]NetworkDef{
+		"old": {Type: "bridge"},
+		"new": {Type: "bridge"},
+		"set": {Type: "bridge", Interface: "br7"},
+	}}
+	f.DefaultNetworkInterfaces(map[string]string{"old": "old", "set": "br9"})
+	for name, want := range map[string]string{"old": "old", "new": "st_new", "set": "br7"} {
+		if got := f.Networks[name].Interface; got != want {
+			t.Errorf("network %s: interface %q, want %q", name, got, want)
+		}
+	}
+}
+
+// FlatBridgeName is the network name when it fits IFNAMSIZ and the stable
+// hashed lvf- form otherwise.
+func TestFlatBridgeName(t *testing.T) {
+	if got := FlatBridgeName("sa_backend"); got != "sa_backend" {
+		t.Errorf("short: %q", got)
+	}
+	got := FlatBridgeName("averylongstack_backend")
+	if len(got) != 15 || got != FlatBridgeName("averylongstack_backend") || got == FlatBridgeName("averylongstack_backenc") {
+		t.Errorf("long: %q", got)
 	}
 }

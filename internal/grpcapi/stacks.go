@@ -23,6 +23,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose/planner"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
+	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/image"
@@ -766,7 +767,21 @@ func (s *Server) deployCreatePlanned(ctx context.Context, action planner.VMActio
 // provisionPlannedNetworks provisions networks only on hosts where VMs are placed,
 // instead of broadcasting to all cluster hosts.
 func (s *Server) provisionPlannedNetworks(ctx context.Context, f *compose.File, plan *planner.ResolvedPlan, stream grpc.ServerStreamingServer[pb.DeployProgress]) error {
-	f.DefaultNetworkInterfaces()
+	shared, err := s.defaultStackNetworkDevices(ctx, f)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "network provisioning: %v", err)
+	}
+	for _, w := range shared {
+		slog.Warn("deploy: stack network shares its bridge with another stack's network", "stack", f.Name, "detail", w)
+		if s.events != nil {
+			s.events.Publish(events.Event{Action: "network.bridge_shared", Target: f.Name, Detail: w})
+		}
+		if stream != nil {
+			if err := stream.Send(&pb.DeployProgress{Phase: "warning", Detail: w}); err != nil {
+				return err
+			}
+		}
+	}
 	// Build the set of hosts that actually need network provisioning.
 	targetHosts := map[string]bool{}
 	for _, na := range plan.Networks {

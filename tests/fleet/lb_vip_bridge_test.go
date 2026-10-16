@@ -258,13 +258,16 @@ vms:
 // TestFleet_TwoStacksSharingABackendNameStayApart: stacks sa and sb each have
 // a host-isolated `backend` network, on different subnets, with an LB on
 // node-0. sa is deployed from node-1, so node-0 provisions its network as a
-// peer target on the scoped sa_backend (the row names no interface); sb is
-// deployed from node-0, which provisions its network on the short `backend`.
-// Both short names are `backend`: each LB's VIP and SNAT intent must land on
-// its own stack's network only. Matched by device name, sb's intent took sa's
-// row (it claims `backend` too) and NATed sa's subnet as sb's VIP.
+// peer target; sb is deployed from node-0, which provisions its own. A stack
+// network with no interface is on its scoped name on every host, so the two
+// are on sa_backend and sb_backend, never one shared `backend` bridge. Each
+// LB's VIP and SNAT intent must land on its own stack's network only.
+// Matched by device name, sb's intent took sa's row (it claims `backend` too)
+// and NATed sa's subnet as sb's VIP.
 //
 // Mutation: look the intent's network up by device name again — red.
+// Mutation: default a stack network's interface to its short name — red (the
+// two stacks share one device on node-0).
 func TestFleet_TwoStacksSharingABackendNameStayApart(t *testing.T) {
 	c := New(t, Options{Nodes: 2, IndependentReplicas: true})
 	ctx := context.Background()
@@ -304,7 +307,7 @@ func TestFleet_TwoStacksSharingABackendNameStayApart(t *testing.T) {
 	n0 := c.Nodes[0]
 	for _, w := range []struct{ lbName, dev, subnet string }{
 		{"sa-lb", "sa_backend", "10.1.0.0/24"},
-		{"sb-lb", "backend", "10.2.0.0/24"},
+		{"sb-lb", "sb_backend", "10.2.0.0/24"},
 	} {
 		w := w
 		var in corrosion.HostFWIntent
@@ -329,5 +332,16 @@ func TestFleet_TwoStacksSharingABackendNameStayApart(t *testing.T) {
 			t.Errorf("%s: VIP placed on %q, want its own stack's %s", w.lbName, got, w.dev)
 		}
 		mu.Unlock()
+	}
+	// The two stacks are never on one device, on any node; node-0 has both.
+	for _, n := range c.Nodes {
+		da, okA := n.Net.Up("sa_backend")
+		db, okB := n.Net.Up("sb_backend")
+		if n == n0 && (!okA || !okB) {
+			t.Errorf("node-0: sa_backend up=%v, sb_backend up=%v, want both", okA, okB)
+		}
+		if okA && okB && da == db {
+			t.Errorf("%s: sa_backend and sb_backend share device %q", n.Name, da)
+		}
 	}
 }

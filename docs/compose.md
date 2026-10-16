@@ -1263,6 +1263,15 @@ networks:
     external: true          # Use pre-existing network, don't create/destroy
 ```
 
+A stack network with no `interface` is on its scoped bridge `<stack>_<name>`
+(the hashed `lvf-<11 hex>` form when that is over 15 characters), the same on
+every host, so two stacks that each declare a network of one name are never on
+one bridge. A network already deployed keeps the bridge its record names.
+When that bridge is also another stack's network's bridge, the deploy warns,
+naming both stacks and the bridge (the entry host also publishes a
+`network.bridge_shared` event); set `interface:` to the scoped name and
+redeploy to move the network to its own bridge.
+
 ### `netbox-prefix-id` is parsed and refused
 
 `netbox-prefix-id` is a real key on a compose network definition — the parser

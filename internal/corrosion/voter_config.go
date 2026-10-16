@@ -31,6 +31,11 @@ type VoterConfig struct {
 	VoterConfigValue
 	MembersHash string
 	Certificate string // JSON ClaimCertificate; "" only in a hand-built test row
+	// UpdatedAt is the row's own stamp, set by the node that wrote it, no
+	// earlier than the decision was first written. CreatedAt is the
+	// proposal's, carried in the claim value: a value another proposer
+	// completed keeps it, however late it is written.
+	UpdatedAt string
 }
 
 // Explicit reports whether the generation has members. A reset generation has
@@ -150,10 +155,11 @@ func scanVoterConfig(r Row) (*VoterConfig, error) {
 		},
 		MembersHash: r.String("members_hash"),
 		Certificate: r.String("certificate"),
+		UpdatedAt:   r.String("updated_at"),
 	}, nil
 }
 
-const voterConfigCols = `generation, members_json, members_hash, change, certificate, created_by, created_at`
+const voterConfigCols = `generation, members_json, members_hash, change, certificate, created_by, created_at, updated_at`
 
 // GetVoterConfig reads one generation's row; nil when absent.
 func GetVoterConfig(ctx context.Context, c *Client, generation int64) (*VoterConfig, error) {

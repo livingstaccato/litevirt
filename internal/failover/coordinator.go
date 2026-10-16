@@ -481,6 +481,11 @@ type Coordinator struct {
 	// last measured it (health.Checker.MeasuredClockSkew). nil, or a peer it
 	// has not measured, leaves the skew unknown (observerSkews).
 	PeerClockSkew func(peer string) (time.Duration, bool)
+	// PeerVoterGeneration reports the highest voter generation peer said it
+	// had adopted in a Ping this node received before `before`
+	// (grpcapi.Server.PeerVoterGeneration). nil, or no such report, is no
+	// evidence (regainCandidates).
+	PeerVoterGeneration func(peer string, before time.Time) (int64, bool)
 	// pauseWaits holds recoveries waiting out a host's partition pause, or
 	// re-checking a deadline that refused (partition_pause.go). In memory: a successor re-derives the wait from
 	// the self-pause fence record, anchored at its own first sight of it.

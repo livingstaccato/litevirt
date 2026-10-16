@@ -179,6 +179,7 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		coord.PauseWaitFor = ppWait
 		coord.LastContact = chk.LastContact
 		coord.PeerClockSkew = chk.MeasuredClockSkew
+		coord.PeerVoterGeneration = n.Server.PeerVoterGeneration
 		// As the daemon wires them: the checker's probes ask each peer's
 		// Ready, whose answer carries the peer's own flag, and the pinger
 		// fills the Ping cache that nothing here may rely on.

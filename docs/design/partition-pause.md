@@ -544,23 +544,29 @@ All of this is in the failover coordinator (`internal/failover`).
      over every voter set the host may be counting over, `n−q+1` voters
      other than the host have failing runs that span the fence, so the
      answer was a bridge's, and the deadline is quiet. The proof rests on
-     two premises: the host adopted every voter generation, and its replica
-     held every change of a member's voting state, decided more than 30 s
-     before the outage began. A generation or change stamped within those
-     30 s, or since, or that cannot be dated, is one the host may lack. The
-     configuration must then be pinned, or the rule stands: at most one
-     generation, and no reset, decided within that window (none at all on a
-     derived set). The sets counted are the adopted generation, each newer
-     one, and the one before the adopted one, which covers the host's last
-     generation decided before the window whether or not one was decided
-     since. A stamp is the writer's clock, moved later by the largest skew
-     of any host but the fenced one. A run spans only when it began
+     the host's replica having held every change of a member's voting
+     state decided more than 30 s before the outage began; a change stamped
+     within those 30 s, or since, or that cannot be dated, is one the host
+     may lack. The configuration must then be pinned, or the rule stands:
+     at most one generation, and no reset, decided within that window (none
+     at all on a derived set). A generation is dated by the later of its
+     proposal's stamp and this node's row's, since a value another proposer
+     completes keeps its proposal's stamp. The sets counted are the adopted
+     generation, each newer one, and the one before the adopted one. The
+     host must have reported, in a Ping (`voter_generation`) this node
+     received before the outage began, that it had adopted the oldest of
+     these or a later one that this node holds; with no such report (an
+     older build, a host whose adoption is stuck, a restart of this node,
+     which keeps the reports in memory) the rule stands. A stamp is the
+     writer's clock, moved later by the largest skew of any host, the fenced
+     one and deleted ones included. A run spans only when it began
      `fenceSkewMargin` plus its observer's clock skew from this node before
      the fence. A skew is this node's own measurement, kept in memory for an
      hour (a clock that steps within that hour is not seen), or any
-     `clock_skew` row naming the host; one measured nowhere is taken as
-     30 s. This node's own run is left out once it has probed the host
-     since the wait began.
+     `clock_skew` row naming the peer, the largest of these; a row paired
+     with the fenced host counts for the fenced host alone. One measured
+     nowhere is taken as 30 s. This node's own run is left out once it has
+     probed the host since the wait began.
      A derived one, or a newer generation that is a
      reset, is read from each node's own replica of host state, and then
      any observer that has seen the host answer since the fence refuses

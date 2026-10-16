@@ -31368,9 +31368,12 @@ type PingResponse struct {
 	// probation compares it with its own: a peer that reports a newer one shows
 	// that the voter set this node is counting is stale, so it adopts the newer
 	// generation (which its probation pull has just merged) and counts against
-	// that instead. Read only for that; a generation is adopted only once its
-	// certificate verifies, never because a peer reports it. (Tag 10: 9 is taken
-	// on another branch too, see the merge checklist.)
+	// that instead. A failover coordinator also keeps each peer's reports as
+	// evidence of the generation the peer counts its majority over, for the
+	// bounded partition-pause hold (docs/design/partition-pause.md §4.2). Read
+	// only for those; a generation is adopted only once its certificate
+	// verifies, never because a peer reports it. (Tag 10: 9 is taken on another
+	// branch too, see the merge checklist.)
 	VoterGeneration int64 `protobuf:"varint,10,opt,name=voter_generation,json=voterGeneration,proto3" json:"voter_generation,omitempty"`
 	// migrate_preconditions: this build checks MigrateVMRequest's expect_*
 	// preconditions before it moves a VM. An older owner ignores them and moves the

@@ -1083,7 +1083,10 @@ type Server struct {
 	// adoptedVoterGen is the voter generation AdoptVoterConfigs last found
 	// adopted, which Ping reports (PingResponse.voter_generation).
 	adoptedVoterGen atomic.Int64
-	onGateRefused   func(action, reason string)
+	// peerVoterGens is each peer's reported voter_generation
+	// (PeerVoterGeneration), from PeerCapabilities' Pings.
+	peerVoterGens peerVoterGens
+	onGateRefused func(action, reason string)
 	// vmStartObserver is told of every guest start (SetVMStartObserver).
 	vmStartObserver VMStartObserver
 

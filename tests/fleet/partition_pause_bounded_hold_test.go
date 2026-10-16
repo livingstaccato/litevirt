@@ -87,7 +87,9 @@ func TestFleet_PartitionPause_ExplicitSetSkewedPauserBridgeCutRecovers(t *testin
 			c, s, rs := bridgeFleetWith(t, ppOpts{coordinators: map[string]bool{"node-2": true}, pauserOnNodeClock: true}, Options{ClockSeam: true})
 			owner, n2, n5 := c.Nodes[0], c.Nodes[2], c.Nodes[5]
 			measureSkews(t, c, s)
-			settleVoterHistory(t, c)
+			// The step makes node-0's skew 60 s, and every stamp may be
+			// node-0's.
+			settleVoterHistory(t, c, 45*time.Second+map[bool]time.Duration{true: 70 * time.Second}[skewed])
 			if skewed {
 				owner.StepClock(-60 * time.Second)
 			}
@@ -248,7 +250,7 @@ func TestFleet_PartitionPause_TwoVoterChangesSinceTheOutageHold(t *testing.T) {
 	c, s, _ := bridgeFleet(t, ppOpts{coordinators: map[string]bool{"node-3": true}})
 	owner, n1, n2, n3, n5 := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3], c.Nodes[5]
 	measureSkews(t, c, s)
-	settleVoterHistory(t, c)
+	settleVoterHistory(t, c, 45*time.Second)
 	logs := captureLogs(t)
 	noStart := func() {
 		for _, n := range c.Nodes[1:] {
@@ -294,13 +296,15 @@ func TestFleet_PartitionPause_TwoVoterChangesSinceTheOutageHold(t *testing.T) {
 }
 
 // measureSkews has every node's checker Ping every peer, as the daemon's
-// capability sweeps do, until each has measured every peer's clock skew: a
+// capability sweeps do, until each has measured every peer's clock skew and
+// holds its report of the voter generation the peer has adopted: a
 // coordinator reads an unmeasured observer's skew as unknown, and its run
-// then spans only well before the fence.
+// then spans only well before the fence, and it counts no generation the
+// host did not report.
 func measureSkews(t *testing.T, c *Cluster, s *ppStack) {
 	t.Helper()
 	ctx := context.Background()
-	eventually(t, time.Minute, "every node to measure every peer's clock skew", func() bool {
+	eventually(t, time.Minute, "every node to measure every peer's clock skew and voter generation", func() bool {
 		all := true
 		for _, n := range c.Nodes {
 			chk := s.node(n).chk
@@ -308,10 +312,18 @@ func measureSkews(t *testing.T, c *Cluster, s *ppStack) {
 				if p == n {
 					continue
 				}
-				if _, ok := chk.MeasuredClockSkew(p.Name); !ok {
+				adopted, err := corrosion.AdoptedVoterGeneration(ctx, p.DB)
+				if err != nil {
+					return false
+				}
+				reported := func() bool {
+					g, ok := n.Server.PeerVoterGeneration(p.Name, time.Now().Add(time.Second))
+					return adopted == 0 || (ok && g >= adopted)
+				}
+				if _, ok := chk.MeasuredClockSkew(p.Name); !ok || !reported() {
 					chk.PeerSupportsFresh(ctx, p.Name, capabilities.SplitBrainGateV1)
 					_, ok = chk.MeasuredClockSkew(p.Name)
-					all = all && ok
+					all = all && ok && reported()
 				}
 			}
 		}
@@ -319,20 +331,25 @@ func measureSkews(t *testing.T, c *Cluster, s *ppStack) {
 	})
 }
 
-// settleVoterHistory waits until the setup's voter generations are older than
-// any outage the scenario starts by more than the deadline's window
-// (healthFreshness plus fenceSkewMargin and a measured skew): a generation
-// decided within it is one the host may not have adopted.
-func settleVoterHistory(t *testing.T, c *Cluster) {
+// settleVoterHistory waits until the setup's voter generations, proposed and
+// written, are older than any outage the scenario starts by more than the
+// deadline's window (healthFreshness plus fenceSkewMargin and the largest
+// skew of any host, which a host stepped later adds to): a generation decided
+// within it is one the host may not have adopted.
+func settleVoterHistory(t *testing.T, c *Cluster, age time.Duration) {
 	t.Helper()
-	cfgs, err := corrosion.ListVoterConfigs(context.Background(), c.Nodes[1].DB)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, cfg := range cfgs {
-		if at, ok := corrosion.ParseUpdatedAt(cfg.CreatedAt); ok {
-			if d := time.Until(at.Add(45 * time.Second)); d > 0 {
-				time.Sleep(d)
+	for _, n := range c.Nodes {
+		cfgs, err := corrosion.ListVoterConfigs(context.Background(), n.DB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, cfg := range cfgs {
+			for _, ts := range []string{cfg.CreatedAt, cfg.UpdatedAt} {
+				if at, ok := corrosion.ParseUpdatedAt(ts); ok {
+					if d := time.Until(at.Add(age)); d > 0 {
+						time.Sleep(d)
+					}
+				}
 			}
 		}
 	}

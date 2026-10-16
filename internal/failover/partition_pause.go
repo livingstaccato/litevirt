@@ -480,8 +480,9 @@ func (c *Coordinator) quietFallback(ctx context.Context, hr healthRead, host str
 //
 //   - the voter configuration host may be using is pinned: at most one
 //     generation was decided since the outage began, and no reset (on the
-//     derived voter set, none at all), and host had adopted the one current
-//     when it began, or the one before;
+//     derived voter set, none at all), and host reported, before the outage
+//     began, that it had adopted the oldest generation counted or a later one
+//     (hostReportedAdopting);
 //   - host's replica held every change of a member's voting state made more
 //     than healthFreshness before the outage began.
 //
@@ -604,9 +605,9 @@ type regainCandidate struct {
 // adopted by, the host (its claim round, replication, the adoption tick).
 // So the host is at least on the last generation decided before that window,
 // which is the adopted one when none was decided since, and the one before
-// the adopted one when one was. A generation's created_at is its decider's
-// clock, moved later by stampSkew, and one that cannot be dated was decided
-// since.
+// the adopted one when one was. A generation is dated by the later of its
+// proposal and its row (decidedBefore), each moved later by stampSkew, and
+// one that cannot be dated was decided since.
 //
 // The sets, every one of which must be spanned:
 //
@@ -628,14 +629,16 @@ func (c *Coordinator) regainCandidates(ctx context.Context, host string, explici
 	if err != nil {
 		return nil, false
 	}
-	stampSkew := c.stampSkew(host, skew)
+	stampSkew, ok := c.stampSkew(ctx, skew)
+	if !ok {
+		return nil, false
+	}
 	decided := 0
 	for _, cfg := range cfgs {
 		if cfg == nil {
 			continue
 		}
-		created, ok := corrosion.ParseUpdatedAt(cfg.CreatedAt)
-		if ok && created.Add(stampSkew).Before(since.Add(-healthFreshness)) {
+		if decidedBefore(cfg, since.Add(-healthFreshness), stampSkew) {
 			continue
 		}
 		if !cfg.Explicit() || !explicit {
@@ -657,6 +660,18 @@ func (c *Coordinator) regainCandidates(ctx context.Context, host string, explici
 	}
 	var cands []regainCandidate
 	derived := !explicit
+	var adoptedGen, newest int64
+	if adopted != nil {
+		adoptedGen = adopted.Generation
+	}
+	for _, cfg := range cfgs {
+		if cfg != nil {
+			newest = max(newest, cfg.Generation)
+		}
+	}
+	// floor is the oldest generation counted: host must have said it adopted
+	// that one or a later one. 0 when every generation, and none, is counted.
+	floor := adoptedGen
 	// counted adds cfg's set; a reset, or none, means the derived set and the
 	// explicit generation it replaced.
 	counted := func(cfg *corrosion.VoterConfig) {
@@ -666,13 +681,11 @@ func (c *Coordinator) regainCandidates(ctx context.Context, host string, explici
 		}
 		if cfg == nil {
 			derived = true
+			floor = 0
 			return
 		}
+		floor = min(floor, cfg.Generation)
 		cands = append(cands, regainCandidate{set: c.regionMembers(cfg, host)})
-	}
-	var adoptedGen int64
-	if adopted != nil {
-		adoptedGen = adopted.Generation
 	}
 	if explicit {
 		sets, ok, err := c.pauseVoterSets(ctx, host)
@@ -703,7 +716,29 @@ func (c *Coordinator) regainCandidates(ctx context.Context, host string, explici
 		}
 		cands = append(cands, d)
 	}
+	if !c.hostReportedAdopting(host, since, floor, newest) {
+		return nil, false
+	}
 	return cands, true
+}
+
+// hostReportedAdopting reports whether host said, in a Ping this node
+// received before `since`, that it had adopted generation floor or a later
+// one this node holds (newest at most). Adoption only moves forward, so host
+// counted over that generation or a later one when the outage began; without
+// such a report it may be counting over an older generation (its adoption
+// stuck behind a sealed-majority import, or an older build that reports
+// none). floor 0 needs no report; a report of a generation newer than newest
+// names a set this node cannot count.
+func (c *Coordinator) hostReportedAdopting(host string, since time.Time, floor, newest int64) bool {
+	if c.PeerVoterGeneration == nil {
+		return floor == 0
+	}
+	g, ok := c.PeerVoterGeneration(host, since)
+	if !ok {
+		return floor == 0
+	}
+	return g >= floor && g <= newest
 }
 
 // regionMembers is cfg's members, host's region's under region scope.
@@ -760,21 +795,38 @@ func (c *Coordinator) derivedRegainCandidate(ctx context.Context, host string, s
 	return cand, true
 }
 
-// stampSkew is how far a cluster stamp (a generation's created_at, a
-// membership change) may read early: the largest skew of any host but host.
-// The writer is not named (created_by is "<user> via <host>" or "automatic
-// genesis by <host>", and a membership row records no writer), so any host may
-// have stamped it. host itself is left out: what host stamped, host's own
-// replica holds, and a generation it decided is one it adopted, so its stamp
-// can date nothing host may lack.
-func (c *Coordinator) stampSkew(host string, skew func(string) time.Duration) time.Duration {
-	var most time.Duration
-	for h := range c.scope.vr.RegionOf {
-		if h != host {
-			most = max(most, skew(h))
+// decidedBefore reports whether cfg was decided, and first written, before
+// cutoff: both its proposal's stamp (created_at, which a value another
+// proposer completed keeps) and its row's (updated_at, no earlier than the
+// first write), moved later by stampSkew, precede it. A stamp that cannot be
+// read dates nothing.
+func decidedBefore(cfg *corrosion.VoterConfig, cutoff time.Time, stampSkew time.Duration) bool {
+	for _, ts := range []string{cfg.CreatedAt, cfg.UpdatedAt} {
+		at, ok := corrosion.ParseUpdatedAt(ts)
+		if !ok || !at.Add(stampSkew).Before(cutoff) {
+			return false
 		}
 	}
-	return most
+	return true
+}
+
+// stampSkew is how far a cluster stamp (a generation's created_at or
+// updated_at, a membership change) may read early: the largest skew of any
+// host this node holds a row for, deleted ones and the fenced host included.
+// The writer is not named (created_by is "<user> via <host>" or "automatic
+// genesis by <host>", the row's updated_at is whichever node wrote it, and a
+// membership row records no writer), so any of them may have stamped it. ok
+// is false when the hosts cannot be read.
+func (c *Coordinator) stampSkew(ctx context.Context, skew func(string) time.Duration) (time.Duration, bool) {
+	stamps, err := corrosion.HostMembershipStamps(ctx, c.db)
+	if err != nil {
+		return 0, false
+	}
+	var most time.Duration
+	for _, st := range stamps {
+		most = max(most, skew(st.Name))
+	}
+	return most, true
 }
 
 // unknownSkew is the clock skew assumed for a peer whose skew from this node
@@ -787,9 +839,10 @@ const unknownSkew = 30 * time.Second
 // observerSkews returns each peer's clock skew from this node, for dating
 // its stamps against this node's clock: the largest of this run's own
 // measurement (PeerClockSkew) and every clock_skew row naming the peer, as
-// observer or target, except rows paired with host (a skewed host would
-// otherwise shift every observer, and host's own stamps date nothing here).
-// A peer measured nowhere is unknownSkew; this node is 0.
+// observer or target. A row paired with host counts for host alone: a skewed
+// host would otherwise shift every observer, but its own skew dates the
+// stamps it may have written (stampSkew). A peer measured nowhere is
+// unknownSkew; this node is 0.
 func (c *Coordinator) observerSkews(ctx context.Context, host string) (func(string) time.Duration, error) {
 	rows, err := c.db.Query(ctx, `SELECT observer, target, skew_seconds FROM clock_skew`)
 	if err != nil {
@@ -798,10 +851,11 @@ func (c *Coordinator) observerSkews(ctx context.Context, host string) (func(stri
 	recorded := map[string]time.Duration{}
 	for _, r := range rows {
 		o, t := r.String("observer"), r.String("target")
+		d := time.Duration(math.Abs(r.Float("skew_seconds")) * float64(time.Second))
 		if o == host || t == host {
+			recorded[host] = max(recorded[host], d)
 			continue
 		}
-		d := time.Duration(math.Abs(r.Float("skew_seconds")) * float64(time.Second))
 		for _, p := range []string{o, t} {
 			if d > recorded[p] {
 				recorded[p] = d

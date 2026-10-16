@@ -1808,6 +1808,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	fc.LastContact = d.checker.LastContact
 	fc.PeerClockSkew = d.checker.MeasuredClockSkew
+	fc.PeerVoterGeneration = svc.PeerVoterGeneration
 	fc.PeerPausesOnLoss = svc.PeerPausesOnLoss
 	// Once pit_overlay is used, no VM recovery onto a peer whose Ping says it
 	// is WAL-quarantined, or that does not answer (it may be a build that

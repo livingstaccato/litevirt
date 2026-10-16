@@ -155,6 +155,9 @@ type Fake struct {
 	FailHostCPUXML   func() error
 	FailDefineDomain func(xml string) error
 	FailStartDomain  func(name string) error
+	// FillDefine, when set, rewrites a definition as DefineDomain stores it:
+	// what libvirt fills in at define, such as the vars path of a UEFI domain.
+	FillDefine func(xml string) string
 	// startGuard mirrors libvirt.Client.SetStartGuard; guardReady and
 	// guardWait mirror RequireStartGuard.
 	startGuard libvirt.StartGuard
@@ -494,6 +497,9 @@ func (f *Fake) DefineDomain(xmlConfig string) error {
 		// A new persistent definition of an inactive domain is what its next
 		// start opens: it stays on an overlay only if it names it.
 		f.dropPITLocked(name, xmlConfig)
+	}
+	if f.FillDefine != nil {
+		xmlConfig = f.FillDefine(xmlConfig)
 	}
 	f.domains[name] = StateDefined
 	f.xml[name] = xmlConfig

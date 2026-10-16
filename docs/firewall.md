@@ -719,8 +719,11 @@ and the other guard settings, `on` included), and one a re-create carries from
 the incarnation it replaces, are never dropped: if the gate refuses them, or
 this host's own `failover_scope_v1` latch cannot form, the create fails. A
 container whose guards cannot be written for any other reason is not created. A record is retired (tombstoned) when its
-VM or container is deleted, and a record written for another incarnation of the
-same VM name guards nothing; a re-create carries only the guard state of the
+VM or container is deleted, and when the VM create that wrote it fails. A
+record written for another incarnation of the same VM name guards nothing, and
+a create does not wait for it to be in force: records an earlier build's failed
+create left live do not block a later create of the name, and the next delete
+of that name retires them. A re-create carries only the guard state of the
 incarnation it replaces. A NIC's record is also retired when `lv detach-nic`
 removes the NIC, once it is gone from the domain, and when an `lv attach-nic`
 that wrote it fails and its NIC is verified gone. A record an earlier build

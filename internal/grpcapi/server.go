@@ -394,6 +394,10 @@ type Server struct {
 	enfProjectAuthority atomic.Bool
 	// commitFenceHook is a test-only seam; see SetCommitFenceHook.
 	commitFenceHook func(op string)
+	// createCommittedHook is a test-only seam; see SetCreateCommittedHook.
+	createCommittedHook func(name string) error
+	// createReturnedHook is a test-only seam; see SetCreateReturnedHook.
+	createReturnedHook func(name string, err error)
 	// stackMemberDeleteHook is a test-only seam: DeleteStack calls it with
 	// each member's name right before deleting it, where a test re-creates
 	// the VM as another incarnation.
@@ -1160,6 +1164,9 @@ type Server struct {
 	// hwAuditDeferred names the VMs whose hardware audit the backfill left
 	// for their owed cutover handoff to complete (auditAfterVMReplaceHandoff).
 	hwAuditDeferred sync.Map // vm name -> true
+	// creatingIncarnations names the VMs a create on this host is bringing
+	// up, with the uuid of the incarnation it creates (noteCreatingIncarnation).
+	creatingIncarnations sync.Map // vm name -> uuid
 
 	// readyRead is Ready's one local read; nil means the real hosts-table
 	// query. A seam so a test can stand in for a read blocked on the client
@@ -1796,6 +1803,17 @@ func (s *Server) SetProjectAuthorityEnforce(on bool) { s.enfProjectAuthority.Sto
 // cannot fail. Production never calls this; the hook must be set before the
 // operation starts and cleared after.
 func (s *Server) SetCommitFenceHook(h func(op string)) { s.commitFenceHook = h }
+
+// SetCreateCommittedHook is a test-only seam: CreateVM calls h with the VM's
+// name right after its row has committed, and fails with the error h returns
+// — a step after the commit failing, or (h cancelling the caller's context) a
+// client that stopped waiting. Production never calls this.
+func (s *Server) SetCreateCommittedHook(h func(name string) error) { s.createCommittedHook = h }
+
+// SetCreateReturnedHook is a test-only seam: CreateVM calls h with the VM's
+// name and its result once everything it defers has run. Production never
+// calls this.
+func (s *Server) SetCreateReturnedHook(h func(name string, err error)) { s.createReturnedHook = h }
 
 // SetRestoreClaimedHook is a test-only seam: RestoreContainer calls h with the
 // container's name right after it has claimed a carried relocation proof, and

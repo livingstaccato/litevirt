@@ -150,6 +150,8 @@ func (d *Daemon) awaitServingThenActivate(ctx context.Context) {
 		// Environmental, and it would never let the host turn active: record
 		// it active now, as the boot write did before.
 		slog.Warn("restart: cannot build the local gRPC client to confirm serving; recording the host active now", "error", err)
+		// The awaiting-serving note stays: nothing showed this daemon serves,
+		// so the next crash boots 'active', as before this check existed.
 		d.activateAfterRestart()
 		return
 	}
@@ -211,8 +213,12 @@ func (d *Daemon) activateOnceServing(ctx context.Context, client pinger, deadlin
 		}
 		slog.Info("restart: this daemon answered its own Ping after the deadline", "deadline", deadline)
 	}
-	hostboot.Served(d.cfg.DataDir)
 	d.activateAfterRestart()
+	// After the confirm, so a crash between the two leaves the note and the
+	// next boot is 'active'. Whatever the confirm did: a daemon that answers
+	// has served, and a WAL-quarantined one, whose confirm is refused, must
+	// not make the boot after it 'active'.
+	hostboot.Served(d.cfg.DataDir)
 }
 
 // activateAfterRestart records the host active after a graceful restart, if it

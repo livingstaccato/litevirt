@@ -111,6 +111,10 @@ func MarkRestarting(ctx context.Context, db *corrosion.Client, host, dataDir str
 func BootState(ctx context.Context, db *corrosion.Client, host, dataDir string, upgradePending bool, now time.Time) Boot {
 	at, marked := takeMarker(dataDir)
 	if upgradePending {
+		// Noted like any boot that awaits serving, so a crash of this boot
+		// before it serves is not 'upgrading' again with a fresh timeout. Best
+		// effort: the watchdog, not the note, confirms this boot.
+		_ = writeAwaiting(dataDir, now)
 		return Boot{State: "upgrading", Reason: "post-upgrade boot; the upgrade watchdog confirms it"}
 	}
 	if !marked {
@@ -140,6 +144,10 @@ func BootState(ctx context.Context, db *corrosion.Client, host, dataDir string, 
 //     'upgrading' once, not on every boot, so it cannot keep re-arming the
 //     coordinator's timeout;
 //   - one with no data dir, which could not tell that;
+//   - one that follows FlapLimit unclean boots within FlapWindow
+//     (UncleanHistoryName): a daemon that serves briefly and crashes again
+//     clears the note each time, and would otherwise be 'upgrading' after
+//     every crash and never fenced;
 //   - a host recorded 'upgrading' for UpgradingTimeout or longer: the
 //     coordinator may be fencing it;
 //   - a host recorded anything else (fenced, offline, maintenance, draining,
@@ -147,6 +155,13 @@ func BootState(ctx context.Context, db *corrosion.Client, host, dataDir string, 
 func uncleanBoot(ctx context.Context, db *corrosion.Client, host, dataDir string, now time.Time) Boot {
 	if dataDir == "" {
 		return Boot{State: "active", Reason: "no graceful stop recorded, and no data dir to bound a crash loop"}
+	}
+	prior, err := recordUncleanBoot(dataDir, now)
+	if err != nil {
+		return Boot{State: "active", Reason: "no graceful stop recorded, and recording this unclean boot failed (" + err.Error() + ")"}
+	}
+	if prior >= FlapLimit {
+		return Boot{State: "active", Reason: fmt.Sprintf("no graceful stop recorded, and this is unclean boot %d within %s; a flapping daemon boots active", prior+1, FlapWindow)}
 	}
 	if _, err := os.Lstat(AwaitingPath(dataDir)); !os.IsNotExist(err) {
 		return Boot{State: "active", Reason: "no graceful stop recorded, and the last boot never served"}
@@ -186,14 +201,63 @@ func noteAwaiting(dataDir string, b Boot, now time.Time) Boot {
 	if !b.AwaitServing {
 		return b
 	}
-	p := AwaitingPath(dataDir)
-	if _, err := os.Lstat(p); err == nil {
-		return b
-	}
-	if err := os.WriteFile(p, []byte(now.UTC().Format(time.RFC3339Nano)), 0o600); err != nil {
+	if err := writeAwaiting(dataDir, now); err != nil {
 		return Boot{State: "active", Reason: b.Reason + "; but noting that it awaits serving failed (" + err.Error() + "), so active now"}
 	}
 	return b
+}
+
+// writeAwaiting leaves AwaitingPath, keeping one an earlier boot left.
+func writeAwaiting(dataDir string, now time.Time) error {
+	if dataDir == "" {
+		return errors.New("no data dir")
+	}
+	p := AwaitingPath(dataDir)
+	if _, err := os.Lstat(p); err == nil {
+		return nil
+	}
+	return os.WriteFile(p, []byte(now.UTC().Format(time.RFC3339Nano)), 0o600)
+}
+
+// FlapLimit unclean boots within FlapWindow make the next one 'active'.
+const (
+	FlapLimit  = 3
+	FlapWindow = 10 * time.Minute
+)
+
+// UncleanHistoryName is the file, in the daemon's data directory, that lists
+// the times of the last unclean boots (boots without the graceful-stop
+// marker), one RFC 3339 time per line.
+const UncleanHistoryName = "boot-unclean-history"
+
+// recordUncleanBoot adds now to UncleanHistoryName and returns how many
+// unclean boots it already held within FlapWindow of now, either side (a clock
+// that went back keeps counting them). It keeps only those, at most FlapLimit.
+func recordUncleanBoot(dataDir string, now time.Time) (int, error) {
+	p := filepath.Join(dataDir, UncleanHistoryName)
+	b, err := os.ReadFile(p)
+	if err != nil && !os.IsNotExist(err) {
+		return 0, err
+	}
+	var recent []string
+	for _, line := range strings.Split(string(b), "\n") {
+		at, perr := time.Parse(time.RFC3339Nano, strings.TrimSpace(line))
+		if perr != nil {
+			continue
+		}
+		if d := now.Sub(at); d > -FlapWindow && d < FlapWindow {
+			recent = append(recent, at.UTC().Format(time.RFC3339Nano))
+		}
+	}
+	prior := len(recent)
+	recent = append(recent, now.UTC().Format(time.RFC3339Nano))
+	if len(recent) > FlapLimit {
+		recent = recent[len(recent)-FlapLimit:]
+	}
+	if err := os.WriteFile(p, []byte(strings.Join(recent, "\n")+"\n"), 0o600); err != nil {
+		return prior, err
+	}
+	return prior, nil
 }
 
 // Served records that this daemon answers its own Ping: the next boot is no

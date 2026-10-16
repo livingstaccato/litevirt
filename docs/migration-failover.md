@@ -1079,16 +1079,29 @@ until a daemon serves. Each of these boots `active`, as before:
 
 - a boot without the marker that finds `boot-awaiting-serving`: the daemon
   before it never served, so a daemon that crash-loops before serving is
-  `upgrading` once and is then fenced on its failure count;
+  `upgrading` once and is then fenced on its failure count. A post-upgrade
+  boot leaves the file too;
+- a boot without the marker that follows 3 others within 10 minutes, counted
+  in `boot-unclean-history` in its `data_dir`: a daemon that serves and crashes
+  again and again is fenced on its failure count, as before;
 - a host that was not `active` when it was stopped. A fenced, offline or
   maintenance host keeps that state through the SIGTERM, and a draining one is
   recorded `upgrading` for the restart, as before;
-- a stop, or an `upgrading` state without the marker, 2 minutes old or more;
+- a stop, or an `upgrading` state without the marker, 2 minutes old or more.
+  A WAL-quarantined daemon writes nothing, so after a quarantine that lasted
+  longer than that, the next boot records the host `active` and can be
+  fenced before it serves;
 - a host recorded as something other than `upgrading` by the time it boots
   (without the marker: other than `active` or `upgrading`).
 
 Recording the host `active` once it serves changes only an `upgrading` host,
 and never its isolation.
+
+A host the coordinator has already fenced that then records itself
+`upgrading` (it rebooted, and its boot write was made from a replica that still
+read it `active`) is judged afresh from that write, as an `active` boot write
+is: it is skipped for 2 minutes and fenced again if it has not served. A fence
+row older than the host's own `upgrading` write does not hold that fence back.
 
 The same holds for the proof-grade fence `lv host rm --dead` rests on, which
 counts at any age, and for the one a lost voter's removal, a superseded claim

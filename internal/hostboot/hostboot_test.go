@@ -284,3 +284,48 @@ func TestConfirmServing(t *testing.T) {
 		}
 	}
 }
+
+// A daemon that serves briefly and crashes again clears the awaiting note
+// each time; after FlapLimit unclean boots within FlapWindow the next one is
+// 'active', so a flapping daemon is fenced on its failure count as before.
+// Boots outside the window do not count.
+//
+// Mutation: drop the FlapLimit check — the fourth boot is 'upgrading'.
+func TestUncleanBootsThatFlapBootActive(t *testing.T) {
+	db, ctx := hostIn(t, "active")
+	dir := t.TempDir()
+	now := time.Now()
+	for i := 0; i < FlapLimit; i++ {
+		at := now.Add(time.Duration(i) * time.Minute)
+		if b := BootState(ctx, db, "h", dir, false, at); b.State != "upgrading" || !b.AwaitServing {
+			t.Fatalf("unclean boot %d = %+v, want upgrading until serving", i+1, b)
+		}
+		Served(dir) // it serves, then crashes again
+	}
+	if b := BootState(ctx, db, "h", dir, false, now.Add(FlapLimit*time.Minute)); b.State != "active" || b.AwaitServing {
+		t.Fatalf("unclean boot %d within %s = %+v, want active", FlapLimit+1, FlapWindow, b)
+	}
+	if _, err := os.Stat(AwaitingPath(dir)); !os.IsNotExist(err) {
+		t.Fatalf("an active boot noted that it awaits serving: %v", err)
+	}
+	// Quiet for longer than the window: the next crash awaits serving again.
+	if b := BootState(ctx, db, "h", dir, false, now.Add(FlapLimit*time.Minute+FlapWindow)); b.State != "upgrading" || !b.AwaitServing {
+		t.Fatalf("unclean boot after a quiet %s = %+v, want upgrading until serving", FlapWindow, b)
+	}
+}
+
+// A post-upgrade boot notes that it awaits serving like any other, so a crash
+// of it before it serves boots 'active', not 'upgrading' with a fresh timeout.
+//
+// Mutation: drop writeAwaiting from the upgrade branch — the crash after it
+// boots 'upgrading'.
+func TestUpgradeBootNotesAwaitingServing(t *testing.T) {
+	db, ctx := hostIn(t, "upgrading")
+	dir := t.TempDir()
+	if b := BootState(ctx, db, "h", dir, true, time.Now()); b.State != "upgrading" || b.AwaitServing {
+		t.Fatalf("post-upgrade boot = %+v, want upgrading, confirmed by the upgrade watchdog", b)
+	}
+	if b := BootState(ctx, db, "h", dir, false, time.Now()); b.State != "active" || b.AwaitServing {
+		t.Fatalf("crash of a post-upgrade boot that never served = %+v, want active", b)
+	}
+}

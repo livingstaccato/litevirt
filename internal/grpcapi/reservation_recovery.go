@@ -37,12 +37,25 @@ const (
 const (
 	remedyNoRunningOperation = "no running operation holds this reservation, and the sweep releases only one " +
 		"whose operation finished or whose VM is gone: check with lv operation show <vm> that nothing is running, " +
-		"then release it with the manual reservation release, by its operation id (admin, audited)"
+		"then release it with lv operation release-reservation <operation-id> --force (admin, audited)"
+	remedyNoRunningContainerOperation = "no running operation holds this reservation, and the sweep releases only " +
+		"a VM's: check with lv ct inspect <container> that nothing is running on the container, " +
+		"then release it with lv operation release-reservation <operation-id> --force (admin, audited)"
 	remedyReleaseBlocked = "its release row (cancelled at the header's owner epoch) is tombstoned and cannot be " +
-		"written again, so neither the sweep nor a manual release can release it"
+		"written again, so the sweep cannot release it: release it with lv operation release-reservation " +
+		"<operation-id> --force (admin, audited), which writes a failed step at the header's owner epoch instead"
 	remedyReleaseFailed = "the sweep could not write its release row and retries every pass; the daemon log " +
 		"names the error (reservation sweep: could not release a reservation)"
 )
+
+// noRunningOperationRemedy is the reservation_stale remedy of a reservation no
+// running operation holds, worded for its workload kind.
+func noRunningOperationRemedy(v *corrosion.HostReservationView) string {
+	if v.Op.ResourceKind == "container" {
+		return remedyNoRunningContainerOperation
+	}
+	return remedyNoRunningOperation
+}
 
 // reservationSweepState is the sweep's in-memory state.
 type reservationSweepState struct {
@@ -337,7 +350,7 @@ func (s *Server) publishReservationHealth(ctx context.Context, views []corrosion
 		remedy := ""
 		switch {
 		case v.Class == corrosion.ReservationNoRunningOperation:
-			remedy = remedyNoRunningOperation
+			remedy = noRunningOperationRemedy(v)
 		case faults[v.Op.ID] != "":
 			remedy = faults[v.Op.ID]
 		case v.ReleaseBlocked && sweepReleasableClass(v.Class):

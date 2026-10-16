@@ -706,6 +706,9 @@ type Server struct {
 	// (reservation_recovery.go).
 	reservationMetrics *metrics.ReservationMetrics
 	resSweep           reservationSweepState
+	// resRelease belongs to the manual reservation release
+	// (reservation_release_admin.go).
+	resRelease reservationReleaseState
 
 	// gatherRuntimeOverride is a test seam for the dual-run detector's per-host runtime
 	// gather (self-local + peer GetRuntimeInventory): when non-nil it replaces the real probes,

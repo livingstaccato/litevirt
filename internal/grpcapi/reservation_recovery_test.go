@@ -416,7 +416,8 @@ func TestReservationSweep_StaleCondition(t *testing.T) {
 	}
 	e := ev.Reservations[0]
 	if e.OperationID != "stuck" || e.VM != "c1" || e.MemoryMiB != 256 ||
-		!strings.Contains(e.Remedy, "manual reservation release") || !strings.Contains(e.Remedy, "lv operation show") {
+		!strings.Contains(e.Remedy, "lv operation release-reservation <operation-id> --force") ||
+		!strings.Contains(e.Remedy, "lv operation show <vm>") {
 		t.Errorf("evidence entry: %+v", e)
 	}
 	if v := metricValue(t, reg, "litevirt_host_reservation_oldest_seconds", nil); v < 3500 || v > 3700 {
@@ -627,5 +628,22 @@ func TestReservationSweep_StaleConditionListsOldestFirst(t *testing.T) {
 	_, ev, open := staleCondition(t, s)
 	if !open || len(ev.Reservations) != 2 || ev.Reservations[0].OperationID != "z-old" {
 		t.Fatalf("reservation_stale: open=%v evidence=%+v, want z-old listed first", open, ev)
+	}
+}
+
+// A container's stale reservation names the container check, not the VM-only
+// lv operation show, and the same manual release.
+func TestReservationSweep_StaleConditionContainerRemedy(t *testing.T) {
+	s := testServer(t)
+	seedStuckContainer(t, s, "ct-op", "ct1", "")
+	s.SweepReservationsOnce(context.Background())
+	_, ev, open := staleCondition(t, s)
+	if !open || ev.Count != 1 {
+		t.Fatalf("reservation_stale: open=%v %+v, want the container reservation", open, ev)
+	}
+	r := ev.Reservations[0].Remedy
+	if !strings.Contains(r, "lv ct inspect <container>") || strings.Contains(r, "lv operation show") ||
+		!strings.Contains(r, "lv operation release-reservation <operation-id> --force") {
+		t.Fatalf("container remedy %q, want the container check and the manual release", r)
 	}
 }

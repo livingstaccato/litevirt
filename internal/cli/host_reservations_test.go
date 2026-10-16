@@ -18,3 +18,25 @@ func TestHostReservationsNote(t *testing.T) {
 		}
 	}
 }
+
+// The stale note is keyed on state "stale" (and "release-blocked"): it counts
+// those rows and names the manual release; any other state prints nothing.
+func TestHostStaleReservationsNote(t *testing.T) {
+	quiet := &pb.Host{Name: "node-1", Reservations: []*pb.HostReservation{
+		{State: "in-flight"}, {State: "releasable"}, {State: "admitting"}, {State: "auto-expires"}, {State: "journal"},
+	}}
+	if n := hostStaleReservationsNote(quiet); n != "" {
+		t.Fatalf("note for a host with no stale reservation: %q, want none", n)
+	}
+	n := hostStaleReservationsNote(&pb.Host{Name: "node-1", Reservations: []*pb.HostReservation{
+		{State: "stale"}, {State: "in-flight"}, {State: "stale"},
+	}})
+	want := "note: 2 reservation(s) on node-1 belong to no running operation; release one with lv operation release-reservation <operation-id> --force"
+	if n != want {
+		t.Fatalf("stale note %q, want %q", n, want)
+	}
+	n = hostStaleReservationsNote(&pb.Host{Name: "node-1", Reservations: []*pb.HostReservation{{State: "release-blocked"}}})
+	if !strings.Contains(n, "1 reservation(s) on node-1 are release-blocked") || !strings.Contains(n, "lv operation release-reservation") {
+		t.Fatalf("release-blocked note %q", n)
+	}
+}

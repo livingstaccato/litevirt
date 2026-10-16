@@ -246,20 +246,21 @@ func TestTagGroupSet_MatchRefusesEmptyAndRepeated(t *testing.T) {
 }
 
 // gitops sends no compose that holds, or may hold, a tag: cidr to a daemon
-// that answers Unimplemented: judged by its rules when lv parses it, and
-// probed whatever its text holds when lv does not, since an older daemon
-// validates less than lv (review I-1) and an escaped YAML scalar
-// ("\x74ag:web") spells tag: with no literal tag: in the file (D6 re-review
-// n-1). A file that parses with no tag: deploys unprobed; an unparseable one
-// deploys once the daemon proves it knows tag groups.
+// that answers Unimplemented (review I-1): judged by its rules when lv parses
+// it; by every decoded string of its YAML when lv does not, so an escaped
+// scalar ("\x74ag:web"), a key or a later document cannot hide one (D6
+// re-review n-1); probed when it is not YAML at all. An unparseable file
+// whose YAML holds no tag: is sent unprobed, as before (D7 round 1). A file
+// that parses with no tag: deploys unprobed.
 //
-// Mutations: probe only on a parse — the unparseable cases deploy: red;
-// never probe — red; probe an unparseable file only on a raw "tag:" scan —
-// the escaped case deploys: red; probe every file — the plain parseable case
-// probes: red.
+// Mutations: probe only on a parse — the unparseable tag cases deploy: red;
+// match the raw text instead of the decoded YAML — the escaped cases deploy:
+// red; probe every unparseable file — the tag-free one is probed and refused:
+// red; read only the first document — the second-document case deploys: red.
 func TestGitopsDeploy_ProbesForTag(t *testing.T) {
 	unimpl := status.Error(codes.Unimplemented, "unknown method")
 	parses := "name: dd\nsecurity-groups:\n  web:\n    rules:\n      - {direction: ingress, proto: tcp, port: \"443\", cidr: \"tag:web\", action: accept}\n"
+	notYAML := "name: dd\nsecurity-groups: [unclosed\n"
 	for _, c := range []struct {
 		name, body string
 		probeErr   error
@@ -269,8 +270,11 @@ func TestGitopsDeploy_ProbesForTag(t *testing.T) {
 		{"parses, holds tag:", parses, unimpl, true, false},
 		{"does not parse, holds TAG :", "name: dd\nbogus-field: 1\nsecurity-groups:\n  web:\n    rules:\n      - {cidr: \"TAG : web\", port: \"99999\"}\n", unimpl, true, false},
 		{"does not parse, escaped tag:", "name: dd\nbogus-field: 1\nsecurity-groups:\n  web:\n    rules:\n      - {cidr: \"\\x74ag:web\"}\n", unimpl, true, false},
-		{"does not parse, no tag", "name: dd\nbogus-field: 1\n", unimpl, true, false},
-		{"does not parse, no tag, a daemon that knows tag groups", "name: dd\nbogus-field: 1\n", nil, true, true},
+		{"does not parse, escaped tag: in a key", "name: dd\nbogus-field: 1\n\"\\x74ag:x\": 1\n", unimpl, true, false},
+		{"does not parse, escaped tag: in a second document", "name: dd\nbogus-field: 1\n---\ncidr: \"\\x74ag:web\"\n", unimpl, true, false},
+		{"does not parse, no tag", "name: dd\nbogus-field: 1\n", unimpl, false, true},
+		{"does not parse, not YAML", notYAML, unimpl, true, false},
+		{"does not parse, not YAML, a daemon that knows tag groups", notYAML, nil, true, true},
 		{"parses, no tag", "name: dd\nsecurity-groups:\n  web:\n    rules:\n      - {direction: ingress, proto: tcp, port: \"443\", cidr: \"10.0.0.0/8\", action: accept}\n", unimpl, false, true},
 	} {
 		if _, perr := compose.ParseNamed("stack.yaml", []byte(c.body)); (perr == nil) != strings.HasPrefix(c.name, "parses") {
@@ -278,6 +282,9 @@ func TestGitopsDeploy_ProbesForTag(t *testing.T) {
 		}
 		if strings.Contains(c.name, "escaped") && strings.Contains(strings.ToLower(c.body), "tag:") {
 			t.Fatalf("%s: the fixture holds a literal tag:", c.name)
+		}
+		if _, ok := gitopsYAMLMayHoldTag(c.body); ok == strings.Contains(c.name, "not YAML") {
+			t.Fatalf("%s: the fixture's YAML validity = %v", c.name, ok)
 		}
 		spy := &tagProbeSpy{probeErr: c.probeErr}
 		err := gitopsDeploy(context.Background(), spy, "stack.yaml", c.body)

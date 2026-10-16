@@ -42,6 +42,35 @@ import (
 // already happened; what fails is reported as a VM event naming the remedy.
 // The work outlives the request.
 func (s *Server) rebuildSeedNetworkConfig(ctx context.Context, vm *corrosion.VMRecord, added string) {
+	s.rebuildOwnSeed(ctx, vm, added, false)
+}
+
+// retryStaleSeedForStart tries again, before a start of vm on this host, the
+// rebuild of its seed here that last failed (its stale mark,
+// cloudinit.MarkSeedStale): an attach or detach whose rebuild failed, a
+// migration here whose rewrite failed, or a start whose refresh failed. It
+// does as rebuildSeedNetworkConfig does, the domain being inactive, and the
+// mark goes when it succeeds. The start goes ahead whatever happens: a
+// rebuild that fails again leaves the seed and its mark as they are and
+// records the seed.rebuild_failed warning again. A seed not marked, not the
+// VM's, or one the start's caller has already tried for this start
+// (cloudinit.WithSeedTriedForStart) is left alone.
+func (s *Server) retryStaleSeedForStart(ctx context.Context, vm *corrosion.VMRecord) {
+	if cloudinit.SeedTriedForStart(ctx) {
+		return
+	}
+	iso, err := lv.SafeCloudInitISOPath(s.dataDir, vm.Name)
+	if err != nil || !cloudinit.SeedMarkedStale(iso) {
+		return
+	}
+	s.rebuildOwnSeed(ctx, vm, "", true)
+}
+
+// rebuildOwnSeed is rebuildSeedNetworkConfig, after an attach or detach, or,
+// forStart, before a start of the domain (retryStaleSeedForStart): a seed not
+// the VM's is then left alone unreported, as a start of it always has, and
+// the domain is not running, so there is no cdrom to reload.
+func (s *Server) rebuildOwnSeed(ctx context.Context, vm *corrosion.VMRecord, added string, forStart bool) {
 	ctx = context.WithoutCancel(ctx)
 	iso, err := lv.SafeCloudInitISOPath(s.dataDir, vm.Name)
 	if err != nil {
@@ -51,7 +80,13 @@ func (s *Server) rebuildSeedNetworkConfig(ctx context.Context, vm *corrosion.VMR
 		if merr := cloudinit.MarkSeedStale(iso); merr != nil {
 			slog.Warn("seed rebuild: could not mark the seed stale", "vm", vm.Name, "seed", iso, "error", merr)
 		}
-		detail := fmt.Sprintf("the seed at %s on %s keeps its previous network-config, so a reboot of the guest does not reflect this change: %v; the next NIC attach or detach of this VM tries again", iso, s.hostName, cause)
+		if forStart {
+			detail := fmt.Sprintf("the VM's seed at %s on %s, which an earlier rebuild here failed for, could not be brought up to date with its NICs before this start: %v; the VM starts on it as it is, so a NIC attached or detached since the seed was written may lose its configuration in the guest at this boot; the next start or NIC attach or detach of the VM on %s tries again", iso, s.hostName, cause, s.hostName)
+			slog.Warn("seed rebuild before a start failed", "vm", vm.Name, "seed", iso, "error", cause)
+			s.recordVMEventSeverity(ctx, vm.Name, "seed.rebuild_failed", "error", "warning", detail)
+			return
+		}
+		detail := fmt.Sprintf("the seed at %s on %s keeps its previous network-config, so a reboot of the guest does not reflect this change: %v; the next start or NIC attach or detach of the VM on %s tries again", iso, s.hostName, cause, s.hostName)
 		slog.Warn("seed rebuild failed", "vm", vm.Name, "seed", iso, "error", cause)
 		s.recordVMEvent(ctx, vm.Name, "seed.rebuild_failed", "error", detail)
 	}
@@ -67,6 +102,8 @@ func (s *Server) rebuildSeedNetworkConfig(ctx context.Context, vm *corrosion.VMR
 		return
 	case specErr != nil:
 		failed(fmt.Errorf("parse the VM's spec: %w", specErr))
+		return
+	case !own && forStart:
 		return
 	case !own:
 		detail := fmt.Sprintf("the seed at %s on %s is not proven this VM's: %s (a VM of the same name may have left it); it is left as it is, and not changed under the running guest; the VM's next start on %s writes its own, or none for a VM without cloud-init; or, with the VM stopped, remove the file and its .owner file", iso, s.hostName, why, s.hostName)
@@ -108,7 +145,10 @@ func (s *Server) rebuildSeedNetworkConfig(ctx context.Context, vm *corrosion.VMR
 		return
 	}
 	stamp()
-	if !changed {
+	if !changed || forStart {
+		if changed {
+			slog.Info("seed rebuilt for the VM's NICs before its start", "vm", vm.Name, "seed", iso)
+		}
 		return
 	}
 	slog.Info("seed rebuilt for the VM's NICs", "vm", vm.Name, "seed", iso)

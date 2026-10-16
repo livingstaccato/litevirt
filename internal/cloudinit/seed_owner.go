@@ -1,6 +1,7 @@
 package cloudinit
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -95,6 +96,24 @@ func MarkSeedStale(iso string) error {
 func SeedMarkedStale(iso string) bool {
 	_, err := os.Lstat(SeedStalePath(iso))
 	return err == nil
+}
+
+// seedTriedKey marks a context whose start has already tried the VM's seed.
+type seedTriedKey struct{}
+
+// WithSeedTriedForStart returns ctx marked as a start whose caller has already
+// tried to bring the VM's seed on this host up to date for it (the
+// reconciler, which rewrites the VM's own seed before it defines the domain).
+// The start hook (grpcapi's PrepareHardwareForStart) then does not try a stale
+// seed again, so one failed rebuild is one warning.
+func WithSeedTriedForStart(ctx context.Context) context.Context {
+	return context.WithValue(ctx, seedTriedKey{}, true)
+}
+
+// SeedTriedForStart reports whether ctx is marked by WithSeedTriedForStart.
+func SeedTriedForStart(ctx context.Context) bool {
+	tried, _ := ctx.Value(seedTriedKey{}).(bool)
+	return tried
 }
 
 // clearSeedStale removes the stale mark of the seed at iso. Best effort: a

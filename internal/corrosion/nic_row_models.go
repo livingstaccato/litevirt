@@ -1,9 +1,16 @@
 package corrosion
 
-import "context"
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"strings"
+)
 
 // VMNICRowModels is the model of each live vm_nics row of vmName, keyed by
-// its MAC. vm_interfaces rows are not read: they have no model column.
+// its lower-cased MAC. vm_interfaces rows are not read: they have no model
+// column.
 func VMNICRowModels(ctx context.Context, c *Client, vmName string) (map[string]string, error) {
 	rows, err := GetVMNICsRaw(ctx, c, "vm_nics", vmName)
 	if err != nil {
@@ -12,8 +19,57 @@ func VMNICRowModels(ctx context.Context, c *Client, vmName string) (map[string]s
 	out := make(map[string]string, len(rows))
 	for _, r := range rows {
 		if r.DeletedAt == "" {
-			out[r.MAC] = r.Model
+			out[strings.ToLower(r.MAC)] = r.Model
 		}
 	}
 	return out, nil
+}
+
+// NICDetachRequestHash is the request hash a NIC detach of mac from vmName
+// records on its operation: the mac alone names the NIC.
+func NICDetachRequestHash(vmName, mac string) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("detach-nic|%s|%s", vmName, strings.ToLower(mac))))
+	return hex.EncodeToString(sum[:])
+}
+
+// DetachedNICMACs reports which of macs a NIC detach was ever recorded for
+// on vmName, keyed by lower-cased MAC. A live NIC with such a MAC was
+// attached again after that detach, so it is not the NIC the create recorded
+// under the MAC. Operation headers are soft-deleted when reaped, never
+// removed, so a reaped detach still counts.
+func DetachedNICMACs(ctx context.Context, c *Client, vmName string, macs []string) (map[string]bool, error) {
+	rows, err := c.Query(ctx,
+		`SELECT request_hash FROM operations WHERE resource_kind = 'vm' AND resource_id = ? AND operation_kind = ?`,
+		vmName, string(OpDeviceDetach))
+	if err != nil {
+		return nil, err
+	}
+	hashes := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		hashes[r.String("request_hash")] = true
+	}
+	out := map[string]bool{}
+	for _, mac := range macs {
+		if hashes[NICDetachRequestHash(vmName, mac)] {
+			out[strings.ToLower(mac)] = true
+		}
+	}
+	return out, nil
+}
+
+// NICModelSources reads what a domain builder needs to give each of vmName's
+// live NICs its recorded model (compose.NICModels): the vm_nics models and
+// which NICs were detached and attached again under the same MAC.
+func NICModelSources(ctx context.Context, c *Client, vmName string, nics []NICRecord) (rowModels map[string]string, reattached map[string]bool, err error) {
+	if rowModels, err = VMNICRowModels(ctx, c, vmName); err != nil {
+		return nil, nil, err
+	}
+	macs := make([]string, 0, len(nics))
+	for _, n := range nics {
+		macs = append(macs, n.MAC)
+	}
+	if reattached, err = DetachedNICMACs(ctx, c, vmName, macs); err != nil {
+		return nil, nil, err
+	}
+	return rowModels, reattached, nil
 }

@@ -5851,11 +5851,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		return nil, status.Errorf(codes.Internal, "read NICs for %q: %v", req.Name, err)
 	}
 	ifaces := nicInterfaceRecords(nicRows)
-	rowModels, err := corrosion.VMNICRowModels(ctx, s.db, req.Name)
+	rowModels, reattached, err := corrosion.NICModelSources(ctx, s.db, req.Name, nicRows)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read NIC models for %q: %v", req.Name, err)
 	}
-	nicModels := compose.NewNICModels(spec, rowModels)
+	nicModels := compose.NewNICModels(spec, rowModels, reattached)
 	var netConfigs []lv.NetworkConfig
 	for _, iface := range nicRows {
 		bridge := resolveBridge(ctx, s.db, iface.NetworkName)

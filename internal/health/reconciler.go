@@ -2398,12 +2398,12 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		slog.Error("reconciler: get VM interfaces", "vm", vm.Name, "error", err)
 		return "", true, fmt.Sprintf("get interfaces: %v", err) // transient DB
 	}
-	rowModels, err := corrosion.VMNICRowModels(ctx, r.db, vm.Name)
+	rowModels, reattached, err := corrosion.NICModelSources(ctx, r.db, vm.Name, ifaces)
 	if err != nil {
 		slog.Error("reconciler: get VM NIC models", "vm", vm.Name, "error", err)
 		return "", true, fmt.Sprintf("get NIC models: %v", err) // transient DB
 	}
-	nicModels := compose.NewNICModels(spec, rowModels)
+	nicModels := compose.NewNICModels(spec, rowModels, reattached)
 	var netConfigs []lv.NetworkConfig
 	for _, iface := range ifaces {
 		bridge := network.FlatBridgeName(iface.NetworkName)

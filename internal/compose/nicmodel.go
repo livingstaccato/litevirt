@@ -11,7 +11,11 @@ import (
 // per NIC, in ordinal order: a spec NIC is matched to one live NIC at most.
 //
 // The sources, strongest first:
-//   - the spec NIC with the NIC's MAC: the create recorded it;
+//   - the spec NIC with the NIC's MAC: the create recorded it. Not when the
+//     NIC under that MAC was detached and a NIC attached again with it (a
+//     driver swap that keeps the MAC's lease): the spec entry is the old
+//     NIC's and the attach recorded the new one only in its vm_nics row,
+//     which then decides;
 //   - the NIC's vm_nics row: a hot-plug records only there;
 //   - the spec NIC at the NIC's ordinal on its network, for a spec from
 //     before MACs were recorded in it. Weaker than the row: a NIC detached
@@ -22,20 +26,26 @@ import (
 // The merged row alone is not enough: a vm_interfaces row has no model
 // column and reads as virtio, and it wins the overlay when it is newer.
 type NICModels struct {
-	stored []*pb.NetworkAttachment
-	used   []bool
-	rows   map[string]string
+	stored     []*pb.NetworkAttachment
+	used       []bool
+	rows       map[string]string
+	reattached map[string]bool
 }
 
-// NewNICModels builds the resolver from the stored spec and the models of
-// the VM's live vm_nics rows, keyed by MAC (any case).
-func NewNICModels(spec *pb.VMSpec, vmNICRowModels map[string]string) *NICModels {
+// NewNICModels builds the resolver from the stored spec, the models of the
+// VM's live vm_nics rows and the MACs a NIC was detached under and attached
+// again (both keyed by MAC, any case).
+func NewNICModels(spec *pb.VMSpec, vmNICRowModels map[string]string, reattached map[string]bool) *NICModels {
 	stored := spec.GetNetwork()
 	rows := make(map[string]string, len(vmNICRowModels))
 	for mac, m := range vmNICRowModels {
 		rows[strings.ToLower(mac)] = m
 	}
-	return &NICModels{stored: stored, used: make([]bool, len(stored)), rows: rows}
+	again := make(map[string]bool, len(reattached))
+	for mac, r := range reattached {
+		again[strings.ToLower(mac)] = r
+	}
+	return &NICModels{stored: stored, used: make([]bool, len(stored)), rows: rows, reattached: again}
 }
 
 // Model is the model of the live NIC with mac on network at ordinal, whose
@@ -55,6 +65,9 @@ func (m *NICModels) Model(mac, network string, ordinal int, mergedModel string) 
 	}
 	if byMAC >= 0 {
 		m.used[byMAC] = true
+		if md := m.rows[strings.ToLower(mac)]; md != "" && m.reattached[strings.ToLower(mac)] {
+			return md
+		}
 		if md := m.stored[byMAC].GetModel(); md != "" {
 			return md
 		}

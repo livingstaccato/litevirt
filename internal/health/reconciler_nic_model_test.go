@@ -68,3 +68,53 @@ func TestDomainXMLFor_NICModelSurvivesALegacyWinningRow(t *testing.T) {
 		}
 	}
 }
+
+// A failover render of a NIC detached and attached again under the same MAC
+// takes the attach's model (its vm_nics row), not the old NIC's spec entry:
+// the detach recorded on the VM's operations says the entry is stale. In
+// both directions; with no detach on record the spec entry still decides.
+//
+// Mutation: ignore the recorded detach in compose.NICModels — both
+// re-attached cases go red.
+func TestDomainXMLFor_AReattachedMACTakesItsNewModel(t *testing.T) {
+	const mac = "52:54:00:aa:bb:07"
+	for _, tc := range []struct {
+		name, spec, row, want string
+		detached              bool
+	}{
+		{"e1000 -> virtio", "e1000", "virtio", "virtio", true},
+		{"virtio -> e1000", "virtio", "e1000", "e1000", true},
+		{"no detach: the spec decides", "e1000", "virtio", "e1000", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := testReconcilerDB(t)
+			ctx := context.Background()
+			r, _, _ := sharedDiskReconciler(t, db)
+			vm := corrosion.VMRecord{Name: "vm1", HostName: "node-a", Spec: "{}", State: "running", CPUActual: 1, MemActual: 512}
+			if err := corrosion.InsertVMWithHardware(ctx, db, vm,
+				[]corrosion.InterfaceRecord{{VMName: "vm1", NetworkName: "br0", Ordinal: 0, MAC: mac}}, nil,
+				[]corrosion.NICRecord{{VMName: "vm1", ID: corrosion.DeterministicNICID("vm1", mac),
+					NetworkName: "br0", Model: tc.row, MAC: mac, Ordinal: 0}}, nil, false); err != nil {
+				t.Fatalf("InsertVM: %v", err)
+			}
+			if tc.detached {
+				if err := corrosion.InsertOperation(ctx, db, corrosion.OperationRecord{ID: "op-detach",
+					Method: "DetachDevice", ResourceKind: "vm", ResourceID: "vm1",
+					OperationKind: string(corrosion.OpDeviceDetach),
+					RequestHash:   corrosion.NICDetachRequestHash("vm1", mac)}); err != nil {
+					t.Fatalf("InsertOperation: %v", err)
+				}
+			}
+			spec := &pb.VMSpec{Name: "vm1", Cpu: 1, MemoryMib: 512,
+				Network: []*pb.NetworkAttachment{{Name: "br0", Model: tc.spec, Mac: mac}}}
+			x, _, failure := r.domainXMLFor(ctx, vm, spec, nil)
+			if failure != "" {
+				t.Fatalf("domainXMLFor: %s", failure)
+			}
+			if !strings.Contains(x, `<model type="`+tc.want+`">`) && !strings.Contains(x, `<model type="`+tc.want+`"/>`) &&
+				!strings.Contains(x, `<model type="`+tc.want+`"></model>`) {
+				t.Fatalf("want model %s:\n%s", tc.want, x)
+			}
+		})
+	}
+}

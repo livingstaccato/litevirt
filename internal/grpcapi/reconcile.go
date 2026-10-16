@@ -104,11 +104,11 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 	if err != nil {
 		return status.Errorf(codes.Internal, "read NICs for %q: %v", vm.Name, err)
 	}
-	rowModels, err := corrosion.VMNICRowModels(ctx, s.db, vm.Name)
+	rowModels, reattached, err := corrosion.NICModelSources(ctx, s.db, vm.Name, nics)
 	if err != nil {
 		return status.Errorf(codes.Internal, "read NIC models for %q: %v", vm.Name, err)
 	}
-	nicModels := compose.NewNICModels(spec, rowModels)
+	nicModels := compose.NewNICModels(spec, rowModels, reattached)
 	var netConfigs []lv.NetworkConfig
 	var wantNICs []lv.WantNIC
 	for _, n := range nics {

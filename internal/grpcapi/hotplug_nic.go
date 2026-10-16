@@ -68,8 +68,7 @@ func attachNICRequestHash(vmName string, spec *pb.NetworkAttachment) string {
 // detachNICRequestHash is the canonical semantic hash for a NIC detach — the mac is
 // the immutable identity a detach acts on.
 func detachNICRequestHash(vmName, mac string) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("detach-nic|%s|%s", vmName, strings.ToLower(mac))))
-	return hex.EncodeToString(sum[:])
+	return corrosion.NICDetachRequestHash(vmName, mac)
 }
 
 // sortStrings sorts a []string in place with a tiny insertion sort — avoids

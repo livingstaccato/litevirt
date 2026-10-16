@@ -1184,11 +1184,16 @@ func (s *Server) sendReattachVFs(ctx context.Context, client pb.LiteVirtClient, 
 	}
 }
 
-// EnsureCloudInit generates a cloud-init ISO on this host unless the one here
-// is already this VM's. Called by the source host before migration so the
-// target has the ISO ready. A seed here of another VM of the name — one
-// deleted while this host kept its seed — is written again
-// (cloudinit/seed_owner.go).
+// EnsureCloudInit generates a cloud-init ISO on this host for a VM migrating
+// in. Called by the source host before migration so the target has the ISO
+// ready. A seed here of another VM of the name — one deleted while this host
+// kept its seed — is written again (cloudinit/seed_owner.go). A seed here that
+// is already this VM's is a copy from an earlier stay, which NICs attached or
+// detached since are not in, and the guest applies a seed's network-config
+// on every boot: its network-config and vendor-data are replaced by the
+// source's, and its meta-data and user-data are kept byte for byte. A source
+// from before it sent vendor-data derives its network-config another way, and
+// the seed is then kept as it is.
 //
 // It writes a seed — user-data and vendor-data the guest runs as root — and
 // stamps it as the VM's, so it is the target half of a migration a source
@@ -1209,7 +1214,17 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 	}
 	owner := cloudinit.SpecUUID(vm.Spec)
 	if cloudinit.SeedIsFor(isoPath, owner) {
-		return &emptypb.Empty{}, nil // already this VM's
+		if req.Vendordata == nil {
+			return &emptypb.Empty{}, nil
+		}
+		changed, err := cloudinit.RebuildISO(isoPath, req.Networkconfig, *req.Vendordata)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "rewrite the network-config of the VM's cloud-init ISO: %v", err)
+		}
+		if changed {
+			slog.Info("cloud-init ISO for migration: the VM's seed here takes the source's network-config", "vm", req.VmName, "path", isoPath)
+		}
+		return &emptypb.Empty{}, nil
 	}
 	// A file already at the path is written over, but it was not created
 	// for this migration: a failed migration's cleanup leaves the path alone,

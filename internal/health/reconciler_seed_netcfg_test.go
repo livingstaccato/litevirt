@@ -372,3 +372,78 @@ func TestDomainXMLFor_ANoCloudInitVMGetsNoSeed(t *testing.T) {
 		})
 	}
 }
+
+// T2 N6: a VM started on a host that holds its own seed from an earlier stay
+// (a failover left it there; nothing removes it when the host rejoins) reused
+// that seed as it was. NICs attached since were not in it, and the guest,
+// which applies a seed's network-config on every boot, lost their
+// configuration (here B's static address) at its first boot back. The seed's
+// network-config and vendor-data are derived again from the VM's NICs, each
+// keeping its name, and its meta-data and user-data are kept byte for byte.
+//
+// Mutation: reuse the VM's own seed as it is (the round-5 code) — red.
+func TestDomainXMLFor_RefreshesTheVMsStaleSeed(t *testing.T) {
+	if _, err := exec.LookPath("genisoimage"); err != nil {
+		t.Skip("genisoimage not installed")
+	}
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	r, _, _ := sharedDiskReconciler(t, db)
+	r.SetNetworkProvision(func(context.Context, *corrosion.Client, string, compose.NetworkDef, string, string) (string, error) {
+		return "", nil
+	})
+	for name, def := range map[string]compose.NetworkDef{
+		"brnet": {Type: "bridge", Subnet: "172.40.0.0/24", DHCP: true},
+		"hinet": {Type: "vxlan", VNI: 7, Subnet: "10.212.0.0/24", HostIsolation: true},
+	} {
+		cfg, _ := json.Marshal(def)
+		if err := corrosion.UpsertNetwork(ctx, db, corrosion.NetworkRecord{Name: name, Type: def.Type, Config: string(cfg)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const macA, macB = "52:54:00:aa:00:01", "52:54:00:aa:00:02"
+	spec := &pb.VMSpec{Name: "vm1", Uuid: "vm1-u", Cpu: 1, MemoryMib: 512, Image: "ubuntu",
+		Network: []*pb.NetworkAttachment{{Name: "brnet", Mac: macA}}}
+	specJSON, _ := json.Marshal(spec)
+	vm := corrosion.VMRecord{Name: "vm1", HostName: "node-a", Spec: string(specJSON), State: "running", CPUActual: 1, MemActual: 512}
+	// A created with the VM; B hot-attached since, with its address.
+	if err := corrosion.InsertVM(ctx, db, vm, []corrosion.InterfaceRecord{
+		{VMName: "vm1", NetworkName: "brnet", MAC: macA},
+		{VMName: "vm1", NetworkName: "hinet", MAC: macB, Ordinal: 1, IP: "10.212.0.7"},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// The seed this host wrote when A was the VM's one NIC.
+	iso, _ := lv.SafeCloudInitISOPath(r.dataDir, "vm1")
+	if err := cloudinit.GenerateISO(cloudinit.Config{InstanceID: "vm1-next", LocalHostname: "vm1",
+		UserData: "#cloud-config\nhostname: vm1\n"}, iso); err != nil {
+		t.Fatal(err)
+	}
+	if err := cloudinit.StampSeed(iso, "vm1-u"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := cloudinit.ReadSeed(iso)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, failure := r.domainXMLFor(ctx, vm, spec, nil); failure != "" {
+		t.Fatalf("domainXMLFor: %s", failure)
+	}
+	got, err := cloudinit.ReadSeed(iso)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got.NetworkConfig, "macaddress: \""+macB+"\"\n    set-name: eth1\n    addresses:\n      - 10.212.0.7/24\n") {
+		t.Errorf("the seed does not configure B, attached since:\n%s", got.NetworkConfig)
+	}
+	if got.VendorData != cloudinit.NetworkUpdatesVendorData {
+		t.Errorf("vendor-data = %q", got.VendorData)
+	}
+	if got.MetaData != before.MetaData || got.UserData != before.UserData {
+		t.Errorf("the seed's identity or user-data changed: %q %q", got.MetaData, got.UserData)
+	}
+	if !cloudinit.SeedIsFor(iso, "vm1-u") {
+		t.Error("the seed is no longer stamped for the VM")
+	}
+}

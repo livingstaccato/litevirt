@@ -26,8 +26,8 @@ import (
 // seededVMCluster is a 2-node cluster, operation protocol (and, latched,
 // hardware_v2) latched, with VM name created on the first node from spec and
 // the seed a cloud image's create writes there, stamped. It returns the
-// cluster and the seed path of each node.
-func seededVMCluster(t *testing.T, latched bool, name string, nets map[string]compose.NetworkDef, spec *pb.VMSpec) (*Cluster, map[string]string) {
+// cluster, the seed path of each node, and each node's gate.
+func seededVMCluster(t *testing.T, latched bool, name string, nets map[string]compose.NetworkDef, spec *pb.VMSpec) (*Cluster, map[string]string, map[string]*health.Checker) {
 	t.Helper()
 	if _, err := exec.LookPath("genisoimage"); err != nil {
 		t.Skip("genisoimage not installed: the scenario reads the seeds back")
@@ -81,7 +81,7 @@ func seededVMCluster(t *testing.T, latched bool, name string, nets map[string]co
 	if err := cloudinit.StampSeed(isos[home.Name], cloudinit.SpecUUID(vm.Spec)); err != nil {
 		t.Fatal(err)
 	}
-	return c, isos
+	return c, isos, gates
 }
 
 // failOver moves name onto to as a failover coordinator does (the owner
@@ -140,7 +140,7 @@ func TestFleet_FailoverToASeedlessHostKeepsNICNames(t *testing.T) {
 				macB = "52:54:00:5f:01:0b"
 				macC = "52:54:00:5f:01:0c"
 			)
-			c, isos := seededVMCluster(t, latched, "nm", map[string]compose.NetworkDef{
+			c, isos, _ := seededVMCluster(t, latched, "nm", map[string]compose.NetworkDef{
 				"na": {Type: "bridge", Subnet: "10.71.0.0/24", DHCP: true},
 				"nb": {Type: "bridge", Subnet: "10.72.0.0/24", DHCP: true},
 				"nc": {Type: "bridge", Subnet: "10.73.0.0/24", DHCP: true},
@@ -184,6 +184,68 @@ func TestFleet_FailoverToASeedlessHostKeepsNICNames(t *testing.T) {
 			}
 			if got.VendorData != cloudinit.NetworkUpdatesVendorData {
 				t.Errorf("survivor vendor-data = %q", got.VendorData)
+			}
+		})
+	}
+}
+
+// T2 N6: a failover leaves the VM's stamped seed on its former host, and
+// nothing removes it when that host rejoins. The VM fails over, a NIC with a
+// static address is attached on the survivor, and the VM goes back to its
+// former host, by a live migration or a failover. That host reused its stale
+// seed as it was — the migration dropped the source's request — and the
+// guest, applying a seed's network-config on every boot, lost the attached
+// NIC's configuration. The former host's seed takes the VM's current NICs,
+// named as on the survivor, its instance-id and user-data unchanged.
+//
+// Mutation: keep EnsureCloudInit's early return for the VM's own seed —
+// "migrate back" goes red; reuse the reconciler's own seed as it is — "fail
+// over back" goes red.
+func TestFleet_FailbackRefreshesTheFormerHostsSeed(t *testing.T) {
+	for _, back := range []string{"migrate back", "fail over back"} {
+		t.Run(back, func(t *testing.T) {
+			ctx := context.Background()
+			const (
+				macA     = "52:54:00:5f:02:0a"
+				userData = "#cloud-config\nhostname: fb\n"
+			)
+			c, isos, gates := seededVMCluster(t, true, "fb", map[string]compose.NetworkDef{
+				"na":    {Type: "bridge", Subnet: "10.76.0.0/24", DHCP: true},
+				"hinet": {Type: "bridge", Subnet: "10.77.0.0/24", HostIsolation: true},
+			}, &pb.VMSpec{Cpu: 1, MemoryMib: 256,
+				CloudInit: &pb.CloudInitSpec{Userdata: userData},
+				Network:   []*pb.NetworkAttachment{{Name: "na", Mac: macA}}})
+			home, survivor := c.Nodes[0], c.Nodes[1]
+			stale := mustReadSeedAt(t, "home before the failover", isos[home.Name])
+
+			failOver(t, c, "fb", home, survivor)
+			if _, err := c.SelfClient(home).AttachDevice(ctx, &pb.AttachDeviceRequest{VmName: "fb",
+				Nic: &pb.NetworkAttachment{Name: "hinet", Ip: "10.77.0.9"}}); err != nil {
+				t.Fatalf("attach a static NIC through %s: %v", home.Name, err)
+			}
+			now := mustReadSeedAt(t, "survivor", isos[survivor.Name])
+			if !strings.Contains(now.NetworkConfig, "    set-name: eth1\n    addresses:\n      - 10.77.0.9/24\n") {
+				t.Fatalf("setup: the survivor's seed does not configure the attached NIC:\n%s", now.NetworkConfig)
+			}
+			if !cloudinit.SeedIsFor(isos[home.Name], vmSpecUUIDOf(t, home, "fb")) {
+				t.Fatal("setup: the former host does not hold the VM's stamped seed")
+			}
+
+			switch back {
+			case "migrate back":
+				for _, n := range c.Nodes {
+					n.Server.SetGate(quorumGranted{&fleetGate{Checker: gates[n.Name], reach: c.reach}})
+				}
+				mustMigrateVM(t, c, survivor, "fb", home.Name)
+			default:
+				failOver(t, c, "fb", survivor, home)
+			}
+			got := mustReadSeedAt(t, "former host", isos[home.Name])
+			if got.NetworkConfig != now.NetworkConfig || got.VendorData != now.VendorData {
+				t.Errorf("the former host's seed:\n%s\n%q\nwant the survivor's:\n%s\n%q", got.NetworkConfig, got.VendorData, now.NetworkConfig, now.VendorData)
+			}
+			if got.MetaData != stale.MetaData || got.UserData != stale.UserData {
+				t.Errorf("the former host's seed changed identity or user-data: %q %q", got.MetaData, got.UserData)
 			}
 		})
 	}

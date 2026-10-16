@@ -22,6 +22,47 @@ clears the barrier only via the exact owner-epoch + spec-generation
 compare-and-swap — so it can never clear a newer operation's barrier, and an
 ordinary mutation's `--force` never bypasses the barrier.
 
+## Host reservations
+
+Admission counts every in-flight capacity claim against its target host until
+the operation that made it is terminal at its header's owner epoch. A claim
+left counted after its operation stopped running shrinks the host's free
+capacity until it is released.
+
+`lv host inspect <host>` lists them under `reservations`, and reports their sum
+as `reservedCpu` and `reservedMemMib`: the figures admission subtracts from the
+host's free capacity. A reservation whose data cannot be read is left out of
+the list and named in `reservationsError`, and `reservationsPartial` is then
+true: the reserved figures count only the listed reservations. `lv host inspect`
+prints it as a warning on stderr, and the rest of the host is still shown.
+`reservationsError` gives the reason only to a caller who may `vm.read` across
+the cluster; anyone else sees the operation ids, and the daemon log has the
+reason. Each row carries the operation id, the RPC that made it
+(`method`), `kind`, the vCPU and MiB it holds, its age, its header owner epoch,
+a `state` and a one-sentence `detail`. The `vm` and `project` fields, and the
+workload name in `detail`, are shown only to a caller who may `vm.read` that
+workload; the amounts and state are shown to every viewer.
+
+| `state` | meaning | released by |
+|---|---|---|
+| `in-flight` | the VM's or container's mutation barrier names the operation | the operation, when it finishes |
+| `admitting` | younger than 15 minutes, no barrier: an admission that may still be committing | the operation |
+| `auto-expires` | an admission lease (`kind` `admission-lease`, or `transfer-lease` for a migration or drain); `detail` names the expiry instant | the stale-lease sweep: 15 minutes after creation, 6 hours for a transfer lease |
+| `journal` | a `vm_replace` or `drain_cold_move` journal | its own recovery; never released by hand |
+| `releasable` | the operation finished at a later owner epoch than its header's, or the VM it was for no longer exists (or was re-created after it began) | the reservation sweep on the target host |
+| `stale` | no barrier, past the admission window, and nothing proves the operation finished | not released automatically |
+| `release-blocked` | a tombstoned release row holds the key its release would be written at (`releaseBlocked` is true; `detail` starts `still counted; release blocked:`) | nothing; it stays counted |
+
+The reservation sweep runs on every host, once at startup after resize
+recovery and then every 60 seconds. It releases each `releasable` reservation
+targeting that host within 60 seconds of the evidence reaching it, by writing a
+`cancelled` step at the operation's header owner epoch. A finished operation
+whose target host has been removed or is not active is released by the
+lexically smallest active host instead; a reservation for a VM that no longer
+exists is released only by its target host. The sweep releases nothing while
+the host's replica has not caught up, and skips a VM whose lock is held until
+the next pass.
+
 ## `hardware_v2` — typed hardware, with no kill switch of its own
 
 `hardware_v2` makes the typed hardware tables (disks, NICs, PCI intents) the

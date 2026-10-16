@@ -1068,14 +1068,24 @@ after its boot write. Its boot can come up to 2 minutes after the SIGTERM and
 still keep the host `upgrading`, so the longest such a host is held unfenced
 is about 4 minutes from the SIGTERM. A daemon that serves late, past
 `upgrade_health_deadline_sec`, logs an error at the deadline and keeps
-checking, and is recorded `active` once it answers. Each of these boots `active`, as before:
+checking, and is recorded `active` once it answers.
 
-- a crash, or a daemon that dies before serving (the marker is consumed);
+A boot with no marker (a crash, a kill, or a stop whose `upgrading` write
+failed, as every write of a WAL-quarantined daemon does) does the same for a
+host recorded `active`, or recorded `upgrading` less than 2 minutes ago: it
+records the host `upgrading` and turns it `active` once it answers its own
+Ping. Such a boot leaves a `boot-awaiting-serving` file in its `data_dir`
+until a daemon serves. Each of these boots `active`, as before:
+
+- a boot without the marker that finds `boot-awaiting-serving`: the daemon
+  before it never served, so a daemon that crash-loops before serving is
+  `upgrading` once and is then fenced on its failure count;
 - a host that was not `active` when it was stopped. A fenced, offline or
   maintenance host keeps that state through the SIGTERM, and a draining one is
   recorded `upgrading` for the restart, as before;
-- a stop more than 2 minutes old;
-- a host recorded as something other than `upgrading` by the time it boots.
+- a stop, or an `upgrading` state without the marker, 2 minutes old or more;
+- a host recorded as something other than `upgrading` by the time it boots
+  (without the marker: other than `active` or `upgrading`).
 
 Recording the host `active` once it serves changes only an `upgrading` host,
 and never its isolation.

@@ -133,8 +133,8 @@ func (d *Daemon) confirmUpgradeHealthy(binaryPath string) {
 	metrics.UpgradeWatchdogOutcome("confirmed")
 }
 
-// awaitServingThenActivate is the boot after a graceful stop
-// (hostboot.BootState): the host stays 'upgrading' until this daemon answers
+// awaitServingThenActivate is the boot after a graceful stop, or after a
+// crash of an active host (hostboot.BootState): the host stays 'upgrading' until this daemon answers
 // its own Ping over mTLS, and is then recorded active. There is no binary to
 // roll back to. If it never answers within the upgrade health deadline the
 // host is LEFT 'upgrading', and the failover coordinator fences it once
@@ -145,17 +145,7 @@ func (d *Daemon) awaitServingThenActivate(ctx context.Context) {
 	if deadline <= 0 {
 		deadline = 120 * time.Second
 	}
-	dial := d.selfPinger
-	if dial == nil {
-		dial = func() (pinger, func(), error) {
-			client, conn, err := d.localGRPCClient()
-			if err != nil {
-				return nil, nil, err
-			}
-			return client, func() { _ = conn.Close() }, nil
-		}
-	}
-	client, closeFn, err := dial()
+	client, closeFn, err := d.dialSelf()
 	if err != nil {
 		// Environmental, and it would never let the host turn active: record
 		// it active now, as the boot write did before.
@@ -165,6 +155,34 @@ func (d *Daemon) awaitServingThenActivate(ctx context.Context) {
 	}
 	defer closeFn()
 	d.activateOnceServing(ctx, client, deadline)
+}
+
+// awaitServingThenNote is the boot that follows one that never served, and is
+// recorded active at once (hostboot.BootState): once this daemon answers its
+// own Ping it clears the note, so the next crash awaits serving again.
+func (d *Daemon) awaitServingThenNote(ctx context.Context) {
+	client, closeFn, err := d.dialSelf()
+	if err != nil {
+		slog.Warn("boot: cannot build the local gRPC client to confirm serving; the next crash boots active", "error", err)
+		return
+	}
+	defer closeFn()
+	if pingUntil(ctx, client) {
+		hostboot.Served(d.cfg.DataDir)
+	}
+}
+
+// dialSelf is the client the boot checks ping this daemon through: the local
+// mTLS client, or selfPinger in tests.
+func (d *Daemon) dialSelf() (pinger, func(), error) {
+	if d.selfPinger != nil {
+		return d.selfPinger()
+	}
+	client, conn, err := d.localGRPCClient()
+	if err != nil {
+		return nil, nil, err
+	}
+	return client, func() { _ = conn.Close() }, nil
 }
 
 // activateOnceServing pings this daemon until it answers, and then records the
@@ -193,6 +211,7 @@ func (d *Daemon) activateOnceServing(ctx context.Context, client pinger, deadlin
 		}
 		slog.Info("restart: this daemon answered its own Ping after the deadline", "deadline", deadline)
 	}
+	hostboot.Served(d.cfg.DataDir)
 	d.activateAfterRestart()
 }
 

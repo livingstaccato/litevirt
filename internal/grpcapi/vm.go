@@ -3470,6 +3470,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// (vm_recreate_replaces.go).
 	s.reportDeletedVM(ctx, deleted)
 	s.retireNICGuards(ctx, req.Name)
+	s.resyncDHCPHosts()
 
 	slog.Info("VM deleted", "name", req.Name)
 	// The mirror's latency shortcut, AFTER the mandatory tombstone: the VM is

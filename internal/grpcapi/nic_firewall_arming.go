@@ -205,12 +205,14 @@ func (s *Server) NICStartGuard(ctx context.Context) lv.StartGuard {
 }
 
 // pendingNICs registers NICs of vm whose rows are not written yet, so the
-// firewall renders them from the moment the domain starts; the returned func
-// forgets them (call it once the rows are written, or the create failed).
+// firewall renders them from the moment the domain starts and the DHCP hosts
+// files tag them (pendingDHCPNICs); the returned func forgets them (call it
+// once the rows are written, or the create failed).
 func (s *Server) pendingNICs(vm, uuid string, recs []corrosion.InterfaceRecord, trunks map[int][]int) func() {
+	forgetDHCP := s.pendingDHCPNICs(vm, recs)
 	a, ok := s.fwRec().(nicArmer)
 	if !ok || len(recs) == 0 {
-		return func() {}
+		return forgetDHCP
 	}
 	nics := make([]corrosion.HostVMNIC, 0, len(recs))
 	for _, r := range recs {
@@ -220,7 +222,10 @@ func (s *Server) pendingNICs(vm, uuid string, recs []corrosion.InterfaceRecord, 
 		})
 	}
 	a.SetPending(vm, nics)
-	return func() { a.ClearPending(vm) }
+	return func() {
+		a.ClearPending(vm)
+		forgetDHCP()
+	}
 }
 
 // ArmNICFirewall is the RPC a migration source calls on the target before

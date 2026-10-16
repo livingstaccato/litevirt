@@ -63,7 +63,7 @@ func TestProvision_IsolatedBridgeJoinsTheGroup(t *testing.T) {
 			}
 			return nil, nil
 		}
-		startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string) error { return nil }
+		startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string, noRouter bool) error { return nil }
 		db := corrosion.NewTestClientT(t)
 		if err := corrosion.InitSchema(context.Background(), db); err != nil {
 			t.Fatal(err)

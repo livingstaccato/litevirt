@@ -87,3 +87,67 @@ func TestStartPendingVM_AReleaseAfterTheClaimNeverStarts(t *testing.T) {
 		t.Fatalf("the start recorded no start checkpoint: step_state %q", pr.StepState)
 	}
 }
+
+// abandonHereFor is abandonHere with the abandonment's reason and time.
+func abandonHereFor(t *testing.T, db *corrosion.Client, proofID, reason string, at time.Time) {
+	t.Helper()
+	if err := db.ExecuteLocal(context.Background(), func(tx *corrosion.LocalTx) error {
+		_, err := tx.Exec(context.Background(), `INSERT INTO local_abandoned_proofs
+			(proof_id, target_kind, target_name, owner_epoch, attempt, reason, abandoned_at)
+			VALUES (?, 'vm', 'vm1', 0, 0, ?, ?)`, proofID, reason, at.UTC().Format(time.RFC3339Nano))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Review m-1: a proof this host abandoned at the lease holder's request,
+// because its lease stamp was superseded, is about to be replaced: the holder
+// re-points the row right after the abandonment. Inside a bounded grace the
+// row is left pending on it, not failed; past the grace it fails as any
+// abandoned proof does. Nothing is started either way.
+//
+// Mutation: no grace (fail at once) — the row leaves pending inside the
+// grace.
+func TestStartPendingVM_ALeaseTermAbandonmentWaitsForTheRepoint(t *testing.T) {
+	ctx := context.Background()
+	db, fake, r, vm := pendingProofFixture(t, 0, "", "node-z")
+	abandonHereFor(t, db, "p1", corrosion.AbandonReasonLeaseOutran+": its proof carries lease term 1", time.Now())
+	r.startPendingVM(ctx, vm)
+	if startedOrDefined(fake, "vm1") {
+		t.Fatal("a VM was started from a proof this host abandoned")
+	}
+	if pr, _, _ := corrosion.GetActionProof(ctx, db, "p1"); pr.Status == corrosion.ProofFailed {
+		t.Fatal("the proof was failed inside the re-point grace")
+	}
+	if fresh, _ := corrosion.GetVM(ctx, db, "vm1"); fresh == nil || fresh.PendingActionID != "p1" || fresh.State != "pending" {
+		t.Fatalf("the row left pending inside the re-point grace: %+v", fresh)
+	}
+
+	// Past the grace: terminal, as for any abandoned proof.
+	db2, fake2, r2, vm2 := pendingProofFixture(t, 0, "", "node-z")
+	var reason string
+	r2.SetGateRefusedObserver(func(_, rs string) { reason = rs })
+	abandonHereFor(t, db2, "p1", corrosion.AbandonReasonLeaseOutran+": its proof carries lease term 1",
+		time.Now().Add(-staleTermRepointGrace-time.Second))
+	r2.startPendingVM(ctx, vm2)
+	if startedOrDefined(fake2, "vm1") {
+		t.Fatal("a VM was started from a proof this host abandoned")
+	}
+	assertAbandonedStartIsTerminal(t, db2, reason)
+}
+
+// Any other abandonment (an operator's `lv cluster claim-release`) gets no
+// grace: nobody re-points the row.
+//
+// Mutation: grant the grace whatever the reason — the released row stays
+// pending.
+func TestStartPendingVM_AReleaseGetsNoRepointGrace(t *testing.T) {
+	ctx := context.Background()
+	db, _, r, vm := pendingProofFixture(t, 0, "", "node-z")
+	var reason string
+	r.SetGateRefusedObserver(func(_, rs string) { reason = rs })
+	abandonHereFor(t, db, "p1", "released by the operator", time.Now())
+	r.startPendingVM(ctx, vm)
+	assertAbandonedStartIsTerminal(t, db, reason)
+}

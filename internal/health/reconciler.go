@@ -1711,6 +1711,9 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 				return
 			}
 			if errors.Is(err, corrosion.ErrProofAbandoned) {
+				if r.awaitingStaleTermRepoint(ctx, vm.Name, proofID) {
+					return
+				}
 				// Terminal, not transient: this host has promised never to run
 				// the proof, and no later tick can change that. Fail the proof
 				// so the row leaves pending instead of retrying every tick.
@@ -2606,6 +2609,38 @@ func (r *Reconciler) deferPendingStart(ctx context.Context, vmName, proofID, det
 		slog.Error("reconciler: re-arm pending write failed", "vm", vmName, "error", err)
 		r.noteStateWriteFail(corrosion.OpVMState, err)
 	}
+}
+
+// staleTermRepointGrace is how long a destination leaves a row pending on a
+// proof it abandoned at the lease holder's request because the proof's lease
+// stamp was superseded (corrosion.AbandonReasonLeaseOutran). The holder
+// re-points the row at the proof decided in its place right after the
+// abandonment: one claim (failover's claimTimeout, 5 s) and replication. Twice
+// one claim and one reconcile tick (reconcileInterval) bounds that; past it the row fails
+// as for any abandoned proof, so a holder that never re-points still ends
+// visibly.
+const staleTermRepointGrace = 2 * (5*time.Second + reconcileInterval)
+
+// awaitingStaleTermRepoint reports whether the pending start of vmName on
+// proofID, which this host abandoned, is left for the lease holder to
+// re-point instead of failed now: the abandonment was the holder's lease-term
+// one, it is younger than staleTermRepointGrace, and the row still names the
+// proof. Any other abandonment (an operator's claim-release) fails at once.
+func (r *Reconciler) awaitingStaleTermRepoint(ctx context.Context, vmName, proofID string) bool {
+	reason, at, ok, err := r.db.ProofAbandonment(ctx, proofID)
+	if err != nil || !ok || !strings.HasPrefix(reason, corrosion.AbandonReasonLeaseOutran) {
+		return false
+	}
+	if age := time.Since(at); age < 0 || age >= staleTermRepointGrace {
+		return false
+	}
+	fresh, err := corrosion.GetVM(ctx, r.db, vmName)
+	if err != nil || fresh == nil || fresh.PendingActionID != proofID {
+		return false
+	}
+	slog.Info("reconciler: this host abandoned the pending proof for the lease holder, which re-points the row; "+
+		"waiting for it", "vm", vmName, "proof", proofID, "abandoned_at", at, "grace", staleTermRepointGrace)
+	return true
 }
 
 // failPendingStart records a local start failure inside startPendingVM, honoring the

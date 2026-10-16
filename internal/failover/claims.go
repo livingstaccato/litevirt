@@ -166,9 +166,16 @@ func (c *Coordinator) claimRecoveryFor(ctx context.Context, proposal corrosion.A
 		return claimedProof{Key: key}, &ClaimRefusedError{Key: key, Reason: health.ReasonClaimNoMajority,
 			Result: ResultNoMajority, Detail: "no recovery claimer is wired on " + c.hostName}
 	}
-	var ev *corrosion.SupersedeEvidence
-	for attempt := int64(0); attempt < maxClaimAttempts; attempt++ {
-		key.Attempt = attempt
+	return c.claimFrom(ctx, key, nil, proposal, source, fits)
+}
+
+// claimFrom walks key's attempts from key.Attempt, ev being the supersede
+// evidence that attempt needs (nil at attempt 0), until a value it can write
+// is decided: claimRecoveryFor's loop, shared with sweepStaleTermProofs,
+// which starts past a decided value its destination has abandoned.
+func (c *Coordinator) claimFrom(ctx context.Context, key corrosion.ClaimKey, ev *corrosion.SupersedeEvidence,
+	proposal corrosion.ActionProof, source string, fits func(corrosion.HostRecord) string) (claimedProof, error) {
+	for i := 0; i < maxClaimAttempts; i, key.Attempt = i+1, key.Attempt+1 {
 		cl, out, err := c.claimAttempt(ctx, key, proposal, source, ev)
 		if err != nil || cl.Ours {
 			return cl, err
@@ -233,6 +240,7 @@ func (c *Coordinator) claimRecoveryFor(ctx context.Context, proposal corrosion.A
 		c.mAttempt(PhaseClaim, ResultSuperseded, "")
 		ev = next
 	}
+	key.Attempt-- // the last attempt walked
 	return claimedProof{Key: key}, &ClaimRefusedError{Key: key, Reason: health.ReasonClaimNoMajority, Result: ResultNoMajority,
 		Detail: fmt.Sprintf("%d attempts of %s were each superseded", maxClaimAttempts, key)}
 }
@@ -330,26 +338,28 @@ func (c *Coordinator) priorEvidence(out claims.Outcome) *corrosion.SupersedeEvid
 // ones a fresh pick of that name gets now: an active host row, the split-brain
 // gate advertised, and fits, the site's own placement check. A value decided
 // for the source itself is not judged here (noteClaimStranded), and neither
-// is a host with no row (supersedeEvidence moves past a removed one) or a
-// value for another action (the site defers to it).
+// is a host with no row (supersedeEvidence moves past a removed one). A value
+// for another action is judged on its lease stamp only; otherwise the site
+// defers to it.
 //
-// The value's lease stamp is judged too, whatever its destination: a value
-// accepted in an earlier outage carries the term of the coordinator that
-// proposed it, and once the lease has moved on, every executor enforcing
-// lease_term_v1 refuses it as stale (judgeProofLeaseTerm). It would stand at
-// its key, written and never run, and the workload would stay pending on its
-// destination for good (witness drill Q5). Its destination's abandonment
-// moves the claim on, as for a destination that cannot take the workload.
+// The value's lease stamp is judged first, whatever its destination or
+// action: a value accepted in an earlier outage carries the term of the
+// coordinator that proposed it, and once the lease has moved on, every
+// executor enforcing lease_term_v1 refuses it as stale (judgeProofLeaseTerm).
+// It would stand at its key, written and never run, or deferred to on every
+// tick, and the workload would never be recovered (witness drill Q5). Its
+// destination's abandonment moves the claim on, as for a destination that
+// cannot take the workload.
 func (c *Coordinator) adoptedDestProblem(ctx context.Context, cl claimedProof, proposal corrosion.ActionProof, source string,
 	fits func(corrosion.HostRecord) string) (string, error) {
 	d := cl.Proof
-	if cl.Ours || d.Action != proposal.Action || d.DestHost == "" || d.DestHost == source {
+	if cl.Ours || d.DestHost == "" || d.DestHost == source {
 		return "", nil
 	}
 	if p := c.adoptedTermSuperseded(ctx, d, proposal); p != "" {
 		return p, nil
 	}
-	if d.DestHost == proposal.DestHost {
+	if d.Action != proposal.Action || d.DestHost == proposal.DestHost {
 		return "", nil
 	}
 	h, err := corrosion.GetHost(ctx, c.db, d.DestHost)
@@ -375,17 +385,43 @@ func (c *Coordinator) adoptedDestProblem(ctx context.Context, cl claimedProof, p
 
 // adoptedTermSuperseded says why a decided value this coordinator did not
 // propose carries a lease stamp the executors refuse, or "" when they do
-// not: lease terms are enforced here, this coordinator stamps a term, and
-// the value's stamp is a lower term of the same lease or none at all.
+// not (staleTermProblem, against the proposal's own stamp). A value whose
+// proof its destination has already claimed is not judged: the executor
+// admitted it under its own lease-term gate at the claim, and a claimed
+// promote may be building its disk as this runs, so it is never abandoned
+// from here (supersedeEvidence). This replica's view of the claim can lag,
+// which only errs toward judging.
 func (c *Coordinator) adoptedTermSuperseded(ctx context.Context, d, proposal corrosion.ActionProof) string {
-	if proposal.LeaseTerm <= 0 || proposal.LeaseKey == "" || !c.leaseTermEnforced(ctx) {
+	p := c.staleTermProblem(ctx, d, proposal.LeaseTerm, proposal.LeaseKey)
+	if p == "" {
 		return ""
 	}
-	if d.LeaseKey == proposal.LeaseKey && d.LeaseTerm >= proposal.LeaseTerm {
+	pr, ok, err := corrosion.GetActionProof(ctx, c.db, d.ID)
+	if err != nil || (ok && (pr.Status != corrosion.ProofPrepared || pr.ExecutorHost != "")) {
+		return ""
+	}
+	return p
+}
+
+// staleTermProblem says why executors refuse d's lease stamp, judged against
+// this coordinator's own stamp (term of key), or "" when they do not: lease
+// terms are enforced here, this coordinator stamps a term, d is a reschedule
+// or a promote (the actions every executor term-gates; a relocate is not
+// gated on its stamp), and d's stamp is a lower term of the same lease or none
+// at all. An operator's promotion is not stamped by a lease holder and is
+// judged by its own start fence (supersedeEvidence).
+func (c *Coordinator) staleTermProblem(ctx context.Context, d corrosion.ActionProof, term int64, key string) string {
+	if term <= 0 || key == "" || corrosion.IsOperatorPromoteValue(d) || !c.leaseTermEnforced(ctx) {
+		return ""
+	}
+	if d.Action != corrosion.ActionReschedule && d.Action != corrosion.ActionPromote {
+		return ""
+	}
+	if d.LeaseKey == key && d.LeaseTerm >= term {
 		return ""
 	}
 	return fmt.Sprintf("its proof carries lease term %d of %q, below this coordinator's %d, and executors refuse it as stale",
-		d.LeaseTerm, d.LeaseKey, proposal.LeaseTerm)
+		d.LeaseTerm, d.LeaseKey, term)
 }
 
 // vmFitsOn is the reschedule site's placement check of one destination for
@@ -733,6 +769,9 @@ func (c *Coordinator) recertifyReplaced(ctx context.Context) {
 		}
 		slog.Info("failover: re-certified a recovery at the forced voter generation", "proof", pr.ID,
 			"claim", cert.Key.String(), "generation", out.Certificate.ConfigGeneration)
+		// Re-certified is not executable: a proof the lease has outrun is
+		// refused as stale whatever its certificate.
+		c.supersedeStaleTerm(ctx, corrosion.ProofRecord{ActionProof: re, Status: pr.Status, ExecutorHost: pr.ExecutorHost})
 	}
 }
 
@@ -780,10 +819,15 @@ func (c *Coordinator) certifyUncertified(ctx context.Context) {
 		if cl.Proof.ID != pr.ID || !corrosion.ProofBindingEqual(cl.Proof, pr.ActionProof) {
 			c.noteClaimLost(action, pr.TargetKind, pr.TargetName, source, cl.Proof)
 			if pr.TargetKind == "vm" && cl.Proof.Action == corrosion.ActionReschedule {
-				if err := corrosion.WriteVMRescheduleProof(ctx, c.db, cl.Proof, pr.TargetName, cl.Proof.DestHost); err != nil &&
-					!errors.Is(err, corrosion.ErrNoRowsAffected) && !errors.Is(err, corrosion.ErrWorkloadStopped) {
+				err := corrosion.WriteVMRescheduleProof(ctx, c.db, cl.Proof, pr.TargetName, cl.Proof.DestHost)
+				if err != nil && !errors.Is(err, corrosion.ErrNoRowsAffected) && !errors.Is(err, corrosion.ErrWorkloadStopped) {
 					slog.Warn("failover: write the decided reschedule in place of an uncertified one", "vm", pr.TargetName,
 						"proof", cl.Proof.ID, "error", err)
+				}
+				if err == nil {
+					// The decided value is written as it was decided; one the
+					// lease has outrun moves on at once.
+					c.supersedeStaleTerm(ctx, corrosion.ProofRecord{ActionProof: cl.Proof, Status: corrosion.ProofPrepared})
 				}
 			}
 			continue
@@ -797,6 +841,9 @@ func (c *Coordinator) certifyUncertified(ctx context.Context) {
 		}
 		slog.Info("failover: certified a recovery minted before recovery claims were enforced", "proof", pr.ID,
 			"kind", pr.TargetKind, "name", pr.TargetName, "dest", pr.DestHost, "source", source)
+		// Certified is not executable: a proof minted at a lease term since
+		// superseded is refused as stale whatever its certificate.
+		c.supersedeStaleTerm(ctx, corrosion.ProofRecord{ActionProof: re, Status: pr.Status, ExecutorHost: pr.ExecutorHost})
 	}
 }
 

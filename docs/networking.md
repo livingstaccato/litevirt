@@ -194,8 +194,9 @@ network uses it. Retiring a device removes only what belongs to it (its
 `dnsmasq`, gateway address and bridge); the network's NAT and host-isolation
 rules follow it to the new device. A device something on the host still uses
 — a guest port on it, a VM whose domain definition names it (running or
-stopped), or a container whose config links to it — is kept until nothing
-does, and goes on the first pass after that. Each VM or container moves to the
+stopped), or a container whose config links to it (a host without the LXC
+tooling has none) — is kept until nothing does, and goes on the first pass
+after that. Each VM or container moves to the
 network's new device when it next starts (`lv start`, `lv restart`); a VM
 records a `vm.nic_moved` event. A VM live-migrated meanwhile lands on the
 device its target serves the network on: the new one, or the old one where

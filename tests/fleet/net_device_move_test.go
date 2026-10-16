@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/netip"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
@@ -705,7 +708,9 @@ func TestFleet_HealthRestartDuringASameSubnetMoveLandsOnTheGatewayDevice(t *test
 // keeps its gateway; a target that moved serves the new one.
 //
 // Mutation: retarget to the network's current device whatever the target
-// says (ignore network_devices) — the refused case lands on lanbb.
+// says (ignore network_devices) — the refused case lands on lanbb; announce
+// the gateway on the network's current device — the refused case announces
+// on lanbb.
 func TestFleet_LiveMigrationLandsOnTheDeviceTheTargetServes(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -755,6 +760,14 @@ func TestFleet_LiveMigrationLandsOnTheDeviceTheTargetServes(t *testing.T) {
 			}
 			put("lanbb")
 			reconcileNetworks(t, dst) // refused with other running, else moved
+			var mu sync.Mutex
+			var announced []string
+			dst.Server.SetGatewayAnnouncer(func(bridge string, gw netip.Addr) (bool, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				announced = append(announced, bridge+" "+gw.String())
+				return true, nil
+			})
 			src.Virt.OnMigrateToTarget = func(name, _ string, p lv.MigrateParams) error {
 				x := p.DestXML
 				if x == "" {
@@ -766,6 +779,18 @@ func TestFleet_LiveMigrationLandsOnTheDeviceTheTargetServes(t *testing.T) {
 			if err := migrateAt(t, c, src, "mover", dst.Name); err != nil {
 				t.Fatalf("migrate mover to %s: %v", dst.Name, err)
 			}
+			// The gateway is announced out of the device the target serves
+			// (lab 1 netprov proof, finding 2), not the network's current one.
+			eventually(t, 10*time.Second, dst.Name+" to announce ic_lan's gateway", func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				return len(announced) > 0
+			})
+			mu.Lock()
+			if got := strings.Join(announced, ","); got != tc.want+" 172.46.0.1" {
+				t.Errorf("%s announced %q, want %s 172.46.0.1", dst.Name, got, tc.want)
+			}
+			mu.Unlock()
 			if got := strings.Join(domainBridges(dst.Virt.DefinedXML("mover")), ","); got != tc.want {
 				t.Errorf("mover landed on %q on %s, want %s", got, dst.Name, tc.want)
 			}

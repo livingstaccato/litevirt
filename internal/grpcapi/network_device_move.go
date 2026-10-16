@@ -3,9 +3,11 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -274,7 +276,8 @@ func (s *Server) retireReplacedDevice(ctx context.Context, name string, def comp
 	}
 	users, err := s.deviceUsers(ctx, oldDev)
 	if err != nil {
-		users = deviceUse{running: []string{"(unknown: " + err.Error() + ")"}}
+		// Whatever could be read is named beside what could not.
+		users.running = append(users.running, "(unknown: "+err.Error()+")")
 	}
 	prov := s.networkProvisioner()
 	if users.none() {
@@ -387,25 +390,33 @@ func (u deviceUse) String() string {
 
 // deviceUsers reads, from the hypervisor and the container runtime now —
 // never from what this process remembers — what on this host uses dev. An
-// answer that cannot be read is an error, and the caller keeps the device.
+// answer that cannot be read is an error, and the caller keeps the device;
+// what could be read is returned with it, so a refusal can name it.
 func (s *Server) deviceUsers(ctx context.Context, dev string) (deviceUse, error) {
 	all, err := s.deviceUsersAll(ctx)
-	if err != nil {
-		return deviceUse{}, err
-	}
 	u := all[dev]
-	ports, err := s.networkProvisioner().GuestPorts(dev)
-	if err != nil {
-		return deviceUse{}, fmt.Errorf("read the guests on %s: %w", dev, err)
+	ports, perr := s.networkProvisioner().GuestPorts(dev)
+	if perr != nil {
+		return u, errors.Join(err, fmt.Errorf("read the guests on %s: %w", dev, perr))
 	}
 	for _, p := range ports {
 		u.running = append(u.running, "guest port "+p)
 	}
-	return u, nil
+	return u, err
+}
+
+// containerRuntimeAbsent reports whether err, from listing the containers,
+// is the lookup of a runtime binary that is not installed: a host without the
+// lxc-* tooling (lxc.Available) runs no containers. Any other failure is not.
+func containerRuntimeAbsent(err error) bool {
+	var ee *exec.Error
+	return errors.As(err, &ee) && errors.Is(ee.Err, exec.ErrNotFound)
 }
 
 // deviceUsersAll maps each bridge any defined VM or container on this host
-// names to what names it: one read of every domain and container.
+// names to what names it: one read of every domain and container. A host
+// without a container runtime has no containers. When the containers cannot
+// be read, the error comes with the VMs read already.
 func (s *Server) deviceUsersAll(ctx context.Context) (map[string]deviceUse, error) {
 	out := map[string]deviceUse{}
 	add := func(dev, who string, running bool) {
@@ -453,17 +464,17 @@ func (s *Server) deviceUsersAll(ctx context.Context) (map[string]deviceUse, erro
 	}
 	if l, ok := s.containerRuntime.(containerNICLinker); ok && s.containerRuntime != nil {
 		cts, err := s.containerRuntime.ListContainers(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("list the containers: %w", err)
+		if err != nil && !containerRuntimeAbsent(err) {
+			return out, fmt.Errorf("list the containers: %w", err)
 		}
 		for _, ct := range cts {
 			st, err := s.containerRuntime.StateContainer(ctx, ct)
 			if err != nil {
-				return nil, fmt.Errorf("container %s state: %w", ct, err)
+				return out, fmt.Errorf("container %s state: %w", ct, err)
 			}
 			links, err := l.ContainerNICLinks(ctx, ct)
 			if err != nil {
-				return nil, fmt.Errorf("read the NIC links of container %s: %w", ct, err)
+				return out, fmt.Errorf("read the NIC links of container %s: %w", ct, err)
 			}
 			for _, b := range links {
 				add(b, "container "+ct, st != "stopped")
@@ -645,14 +656,26 @@ func (s *Server) servedNetworkDevices(ctx context.Context, vm string) map[string
 		if !ok {
 			continue
 		}
-		if def, ok := s.netDevs.lastDef(n.NetworkName); ok {
-			if d := network.BridgeName(n.NetworkName, def); d != "" && !strings.HasPrefix(d, "direct:") {
-				want = d
-			}
+		if def, ok := s.servedDef(n.NetworkName); ok {
+			want = network.BridgeName(n.NetworkName, def)
 		}
 		out[n.NetworkName] = want
 	}
 	return out
+}
+
+// servedDef is the definition network name was last provisioned with on this
+// host, when it puts the network on a bridge: the device this host serves it
+// on, which for a move this host refused is still the previous one.
+func (s *Server) servedDef(name string) (compose.NetworkDef, bool) {
+	def, ok := s.netDevs.lastDef(name)
+	if !ok {
+		return compose.NetworkDef{}, false
+	}
+	if d := network.BridgeName(name, def); d == "" || strings.HasPrefix(d, "direct:") {
+		return compose.NetworkDef{}, false
+	}
+	return def, true
 }
 
 // vmHasManagedNIC reports whether vm has a NIC on a managed bridge network.

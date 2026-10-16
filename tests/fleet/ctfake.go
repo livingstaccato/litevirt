@@ -65,6 +65,7 @@ type CTFake struct {
 	startErr  error
 	exportErr error
 	importErr error
+	listErr   error
 
 	// onExport runs INSIDE ExportContainer, i.e. during a migrate's archive
 	// phase — after the source's preflight has passed but before the IPAM
@@ -216,6 +217,14 @@ func (f *CTFake) FailStart(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.startErr = err
+}
+
+// FailList makes ListContainers fail with err: a host without the lxc-*
+// tooling fails every list at the binary lookup.
+func (f *CTFake) FailList(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listErr = err
 }
 
 // FailExport makes ExportContainer fail with err — the archive-phase failure
@@ -421,6 +430,9 @@ func (f *CTFake) IPContainer(_ context.Context, name string) (string, error) {
 func (f *CTFake) ListContainers(_ context.Context) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	out := make([]string, 0, len(f.state))
 	for n := range f.state {
 		out = append(out, n)

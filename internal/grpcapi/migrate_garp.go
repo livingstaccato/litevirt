@@ -58,8 +58,9 @@ func (s *Server) AnnounceMigratedGuest(ctx context.Context, req *pb.AnnounceMigr
 
 // announceGatewaysOf announces, on this host, the gateway of each network vm
 // has a NIC on that is not on a VLAN: the first address of the network's
-// IPv4 subnet, out of the network's bridge here (network.AnnounceGateway also
-// skips a bridge with an uplink). Best effort; each bridge once.
+// IPv4 subnet, out of the device this host serves the network on (servedDef;
+// network.AnnounceGateway also skips a bridge with an uplink). Best effort;
+// each bridge once.
 func (s *Server) announceGatewaysOf(ctx context.Context, vm string) {
 	nics, err := corrosion.MergedVMNICs(ctx, s.db, vm)
 	if err != nil {
@@ -75,6 +76,11 @@ func (s *Server) announceGatewaysOf(ctx context.Context, vm string) {
 		def, err := networkRowDef(networkRow{name: nr.Name, typ: nr.Type, config: nr.Config})
 		if err != nil {
 			continue
+		}
+		// The device this host serves the network on, where the guest
+		// landed: after a move this host refused, the previous one.
+		if served, ok := s.servedDef(nr.Name); ok {
+			def = served
 		}
 		// On a VLAN the gateway is the VLAN's router, not this host.
 		if def.VLAN > 0 {

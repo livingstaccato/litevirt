@@ -150,16 +150,47 @@ func (d *Daemon) awaitServingThenActivate(ctx context.Context, confirm confirmFu
 	}
 	client, closeFn, err := d.dialSelf()
 	if err != nil {
-		// Environmental, and it would never let the host turn active: record
-		// it active now, as the boot write did before.
-		slog.Warn("restart: cannot build the local gRPC client to confirm serving; recording the host active now", "error", err)
-		// The awaiting-serving note stays: nothing showed this daemon serves,
-		// so the next crash boots 'active', as before this check existed.
-		d.confirmActiveWith(ctx, &unconfirmed{}, false, confirm)
-		return
+		client, closeFn = d.dialSelfUntil(ctx, err)
+		if client == nil {
+			return // shutting down
+		}
 	}
 	defer closeFn()
 	d.activateOnceServingWith(ctx, client, deadline, confirm)
+}
+
+// dialSelfRetry is how often a boot whose local gRPC client cannot be built
+// tries again; a var so tests can shrink it.
+var dialSelfRetry = 5 * time.Second
+
+// dialSelfUntil retries dialSelf after it failed with err, until it succeeds
+// or the daemon shuts down (nil). Nothing shows this daemon serves until
+// then, so the host is not recorded active: it stays as the boot left it
+// ('upgrading', or as recorded), and past its upgrading window it raises
+// upgrading_unconfirmed with the cause, as an unanswered Ping does.
+func (d *Daemon) dialSelfUntil(ctx context.Context, err error) (pinger, func()) {
+	slog.Error("restart: cannot build the local gRPC client to confirm serving; the host is not recorded active until this daemon can confirm it serves. "+
+		"Past its upgrading window it raises upgrading_unconfirmed; 'lv host undrain' records it active. Still retrying.",
+		"error", err, "retry_every", dialSelfRetry)
+	var u unconfirmed
+	checked := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, nil
+		case <-time.After(dialSelfRetry):
+		}
+		client, closeFn, derr := d.dialSelf()
+		if derr == nil {
+			slog.Info("restart: the local gRPC client builds now; checking that this daemon serves")
+			return client, closeFn
+		}
+		err = derr
+		if time.Since(checked) >= unconfirmedCheckEvery {
+			d.noteUnconfirmed(ctx, &u, "cannot build this daemon's local gRPC client: "+err.Error())
+			checked = time.Now()
+		}
+	}
 }
 
 // confirmFunc records the host active once this daemon serves:
@@ -172,7 +203,7 @@ type confirmFunc func(ctx context.Context) (bool, string, error)
 func (d *Daemon) awaitServingThenNote(ctx context.Context) {
 	client, closeFn, err := d.dialSelf()
 	if err != nil {
-		slog.Warn("boot: cannot build the local gRPC client to confirm serving; the next crash boots active", "error", err)
+		slog.Warn("boot: cannot build the local gRPC client to confirm serving; the awaiting-serving note stays", "error", err)
 		return
 	}
 	defer closeFn()
@@ -309,7 +340,7 @@ func (d *Daemon) confirmActiveWith(ctx context.Context, u *unconfirmed, served b
 		}
 		switch {
 		case errors.Is(err, hostboot.ErrNotUpgrading), errors.Is(err, hostboot.ErrMovedOn):
-			slog.Info("restart: serving; host is recorded as something other than upgrading, leaving it", "state", state)
+			slog.Info("restart: serving; this host's recorded state moved on since the boot, leaving it", "state", state, "detail", err)
 			d.clearUnconfirmed(u)
 			return
 		case err == nil:

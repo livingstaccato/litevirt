@@ -666,3 +666,110 @@ func (g *gatedPinger) Ping(ctx context.Context, _ *pb.PingRequest, _ ...grpc.Cal
 		return nil, errors.New("not serving yet")
 	}
 }
+
+// bootTestDaemon is a daemon over a fresh database holding host h, recorded
+// active, for the boot-write tests.
+func bootTestDaemon(t *testing.T, ctx context.Context) (*Daemon, func() *corrosion.HostRecord) {
+	t.Helper()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "h", Address: "127.0.0.1", SSHUser: "root", CertSerial: "s", State: "active",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	host := func() *corrosion.HostRecord {
+		h, err := corrosion.GetHost(ctx, db, "h")
+		if err != nil || h == nil {
+			t.Fatalf("GetHost: %v", err)
+		}
+		return h
+	}
+	return &Daemon{cfg: &Config{HostName: "h", DataDir: t.TempDir(), Version: "v-boot"}, db: db}, host
+}
+
+// TestBootWriteKeepsAFenceRecordedAfterTheDecision: a fence recorded between
+// hostboot's read of the host and the boot write is kept — the write is
+// guarded on the state the decision read (hostboot.Boot.From) — and once
+// this daemon serves it is not recorded active over the fence.
+//
+// Mutation: write the boot state with corrosion.UpdateHostStartup
+// (unguarded) — the fenced host is recorded 'upgrading', then 'active'.
+func TestBootWriteKeepsAFenceRecordedAfterTheDecision(t *testing.T) {
+	old := pingPollInterval
+	pingPollInterval = time.Millisecond
+	defer func() { pingPollInterval = old }()
+	var checks bootChecks
+	defer checks.wait(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d, host := bootTestDaemon(t, ctx)
+	beforeBootWrite = func() {
+		if err := corrosion.UpdateHostState(ctx, d.db, "h", "fenced"); err != nil {
+			t.Errorf("the fence: %v", err)
+		}
+	}
+	t.Cleanup(func() { beforeBootWrite = nil })
+	served := make(chan struct{})
+	var once sync.Once
+	d.selfPinger = checks.pinger(pingerFunc(func() error { once.Do(func() { close(served) }); return nil }))
+	d.writeBootState(ctx, 0, 0, 0, false) // a crash boot of an active host
+	if got := host().State; got != "fenced" {
+		t.Fatalf("the boot write overwrote a fence recorded after its decision: %q", got)
+	}
+	select {
+	case <-served:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the boot started no serving check")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := host().State; got != "fenced" {
+		t.Fatalf("serving recorded the fenced host %q", got)
+	}
+}
+
+// TestBootWithoutALocalClientIsNotActiveBeforeItServes: a boot whose local
+// gRPC client cannot be built (its certificate is not there yet) leaves the
+// host 'upgrading' — it used to record it active at once — and keeps
+// retrying; once the client builds and this daemon answers, the host is
+// recorded active.
+//
+// Mutation: confirm at once when dialSelf fails (the code before) — the host
+// is 'active' while the client still cannot be built.
+func TestBootWithoutALocalClientIsNotActiveBeforeItServes(t *testing.T) {
+	old, oldRetry := pingPollInterval, dialSelfRetry
+	pingPollInterval, dialSelfRetry = time.Millisecond, 5*time.Millisecond
+	defer func() { pingPollInterval, dialSelfRetry = old, oldRetry }()
+	var checks bootChecks
+	defer checks.wait(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d, host := bootTestDaemon(t, ctx)
+	dial := checks.pinger(pingerFunc(func() error { return nil }))
+	var dialable atomic.Bool
+	var tries atomic.Int32
+	d.selfPinger = func() (pinger, func(), error) {
+		tries.Add(1)
+		if !dialable.Load() {
+			return nil, nil, errors.New("no host certificate yet")
+		}
+		return dial()
+	}
+	d.writeBootState(ctx, 0, 0, 0, false) // a crash boot of an active host
+	for deadline := time.Now().Add(3 * time.Second); tries.Load() < 5; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the boot retried building its client %d times", tries.Load())
+		}
+	}
+	if got := host().State; got != "upgrading" {
+		t.Fatalf("with no local client the host is %q, want upgrading until it serves", got)
+	}
+	dialable.Store(true)
+	for deadline := time.Now().Add(3 * time.Second); host().State != "active"; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the client builds and this daemon serves, and the host is %q", host().State)
+		}
+	}
+}

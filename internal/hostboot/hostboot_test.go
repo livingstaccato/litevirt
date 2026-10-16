@@ -125,27 +125,37 @@ func TestUncleanBootAwaitsServingOnce(t *testing.T) {
 // A boot without the marker of a host recorded 'upgrading' — a graceful stop
 // whose next boot never wrote (a WAL-quarantined one), or a draining host's
 // SIGTERM — keeps it 'upgrading' while that state is younger than the
-// coordinator's timeout, and is 'active' once it is older: the coordinator may
-// be fencing it already. Any other state boots 'active' as before, and so does
+// coordinator's timeout. Any other state boots 'active' as before, and so does
 // a boot with no data dir, which could not bound a crash loop.
 //
-// Mutations: drop the age check — the stale 'upgrading' boots 'upgrading';
-// accept any state — the fenced, offline, maintenance, draining and joining
-// hosts boot 'upgrading'.
+// A host recorded 'upgrading' for UpgradingTimeout or longer (or dated after
+// this boot) is not recorded 'active' before it serves either: the boot
+// writes a fresh 'upgrading' once, guarded on the state it read (From), so
+// a fence, drain or offline recorded meanwhile is kept. With serving
+// evidence that write is bounded by FlapLimit like any unclean boot's.
+//
+// Mutations: return 'active' for the stale 'upgrading' (the rule before) —
+// the stale and back-dated cases fail; drop From — likewise; accept any
+// state — the fenced, offline, maintenance, draining and joining hosts boot
+// 'upgrading'.
 func TestUncleanBootByRecordedState(t *testing.T) {
 	db, ctx := hostIn(t, "upgrading")
 	since, ok, err := corrosion.HostStateSince(ctx, db, "h")
 	if err != nil || !ok {
 		t.Fatalf("fixture: HostStateSince ok=%v err=%v", ok, err)
 	}
-	if b := BootState(ctx, db, "h", t.TempDir(), false, since.Add(UpgradingTimeout/2)); b.State != "upgrading" || !b.AwaitServing {
+	if b := BootState(ctx, db, "h", t.TempDir(), false, since.Add(UpgradingTimeout/2)); b.State != "upgrading" || !b.AwaitServing || b.From != "upgrading" {
 		t.Fatalf("unclean boot of a host 'upgrading' for %s = %+v, want upgrading until serving", UpgradingTimeout/2, b)
 	}
-	if b := BootState(ctx, db, "h", t.TempDir(), false, since.Add(UpgradingTimeout+time.Second)); b.State != "active" || b.AwaitServing {
-		t.Fatalf("unclean boot of a host 'upgrading' past the timeout = %+v, want active", b)
+	if b := BootState(ctx, db, "h", t.TempDir(), false, since.Add(UpgradingTimeout+time.Second)); b.State != "upgrading" || !b.AwaitServing || b.Deferred || b.From != "upgrading" {
+		t.Fatalf("unclean boot of a host 'upgrading' past the timeout = %+v, want a fresh 'upgrading' written from upgrading", b)
 	}
-	if b := BootState(ctx, db, "h", t.TempDir(), false, since.Add(-time.Minute)); b.State != "active" || b.AwaitServing {
-		t.Fatalf("unclean boot dated before the 'upgrading' write = %+v, want active", b)
+	if b := BootState(ctx, db, "h", t.TempDir(), false, since.Add(-time.Minute)); b.State != "upgrading" || !b.AwaitServing || b.Deferred || b.From != "upgrading" {
+		t.Fatalf("unclean boot dated before the 'upgrading' write = %+v, want a fresh 'upgrading' written from upgrading", b)
+	}
+	db2, ctx2 := hostIn(t, "active")
+	if b := BootState(ctx2, db2, "h", t.TempDir(), false, time.Now()); b.State != "upgrading" || !b.AwaitServing || b.From != "active" {
+		t.Fatalf("unclean boot of an active host = %+v, want upgrading written from active", b)
 	}
 	for _, st := range []string{"fenced", "offline", "maintenance", "draining", corrosion.HostStateJoining} {
 		db, ctx := hostIn(t, st)
@@ -184,14 +194,18 @@ func TestUncleanBootThatCannotNoteIsActive(t *testing.T) {
 	}
 }
 
-// A graceful stop older than the upgrading timeout boots 'active': the
-// coordinator may have fenced the host while it was down, and this node's
-// replica may not know yet. So does one whose record moved on while it was
-// down.
+// A graceful stop older than the upgrading timeout (or dated after the boot)
+// of a host still recorded 'upgrading' writes a fresh 'upgrading' once,
+// guarded on that state: a fence the coordinator records meanwhile is kept,
+// and one this replica has not heard of yet is judged afresh from the write
+// (failover's upgradingSinceHandled). A host whose record moved on to
+// fenced, offline or maintenance while it was down boots 'active' as before.
+// One still recorded 'active' (the SIGTERM's write did not land) is
+// 'upgrading' until it serves.
 //
-// Mutations: drop the age check — the stale stop boots 'upgrading'; drop the
-// negative-age arm — the stop dated after the boot boots 'upgrading'; drop the
-// state check — the fenced host boots 'upgrading'.
+// Mutations: return 'active' for the stale stop (the rule before) — the
+// stale and back-dated stops fail; drop the state check — the fenced host
+// boots 'upgrading'.
 func TestBootAfterAStaleOrSupersededStop(t *testing.T) {
 	db, ctx := hostIn(t, "active")
 	dir := t.TempDir()
@@ -199,8 +213,8 @@ func TestBootAfterAStaleOrSupersededStop(t *testing.T) {
 	if err := MarkRestarting(ctx, db, "h", dir, now); err != nil {
 		t.Fatal(err)
 	}
-	if b := BootState(ctx, db, "h", dir, false, now.Add(UpgradingTimeout)); b.State != "active" || b.AwaitServing {
-		t.Fatalf("boot %s after the stop = %+v, want active", UpgradingTimeout, b)
+	if b := BootState(ctx, db, "h", dir, false, now.Add(UpgradingTimeout)); b.State != "upgrading" || !b.AwaitServing || b.From != "upgrading" {
+		t.Fatalf("boot %s after the stop = %+v, want a fresh 'upgrading' written from upgrading", UpgradingTimeout, b)
 	}
 	// The clock went back across the restart: the stop is dated in the
 	// future, and its age says nothing.
@@ -210,8 +224,18 @@ func TestBootAfterAStaleOrSupersededStop(t *testing.T) {
 	if err := MarkRestarting(ctx, db, "h", dir, now); err != nil {
 		t.Fatal(err)
 	}
-	if b := BootState(ctx, db, "h", dir, false, now.Add(-time.Second)); b.State != "active" || b.AwaitServing {
-		t.Fatalf("boot dated a second before the stop = %+v, want active", b)
+	if b := BootState(ctx, db, "h", dir, false, now.Add(-time.Second)); b.State != "upgrading" || !b.AwaitServing || b.From != "upgrading" {
+		t.Fatalf("boot dated a second before the stop = %+v, want a fresh 'upgrading' written from upgrading", b)
+	}
+	// The marker was left, but the SIGTERM's 'upgrading' write did not land.
+	if err := corrosion.UpdateHostState(ctx, db, "h", "active"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(MarkerPath(dir), []byte(now.UTC().Format(time.RFC3339Nano)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if b := BootState(ctx, db, "h", dir, false, now.Add(10*time.Second)); b.State != "upgrading" || !b.AwaitServing || b.From != "active" {
+		t.Fatalf("boot after a stop whose 'upgrading' write did not land = %+v, want upgrading written from active", b)
 	}
 
 	for _, moved := range []string{"fenced", "offline", "maintenance"} {
@@ -298,7 +322,8 @@ func TestConfirmServing(t *testing.T) {
 //
 // Mutations: drop the FlapLimit check — the fourth boot writes 'upgrading';
 // return 'active' for it (the boot before this change) — not deferred; make
-// the deferred boot write no note — the note check fails.
+// the deferred boot write no note — the note check fails; take the flapping
+// 'active' deferral before the never-served one — the I1 case is deferred.
 func TestUncleanBootsThatFlapAreDeferred(t *testing.T) {
 	db, ctx := hostIn(t, "active")
 	dir := t.TempDir()
@@ -315,6 +340,12 @@ func TestUncleanBootsThatFlapAreDeferred(t *testing.T) {
 	}
 	if _, err := os.Stat(AwaitingPath(dir)); err != nil {
 		t.Fatalf("a deferred boot did not note that it awaits serving: %v", err)
+	}
+	// Flapping, with the note: the last daemon never served, so the host's
+	// 'active' is a write that did not land. It is 'upgrading' until it
+	// serves, written once (I1).
+	if b := BootState(ctx, db, "h", dir, false, now.Add(FlapLimit*time.Minute+time.Second/2)); b.State != "upgrading" || !b.AwaitServing || b.Deferred || b.From != "active" {
+		t.Fatalf("flapping boot of an active host after a never-served one = %+v, want upgrading written from active", b)
 	}
 	Served(dir)
 	if err := corrosion.UpdateHostState(ctx, db, "h", "upgrading"); err != nil {
@@ -385,9 +416,10 @@ func TestConfirmServingDoesNotOverwriteAFenceThatLandsMeanwhile(t *testing.T) {
 // is judged by the recorded state, and is never recorded 'active' before it
 // serves:
 //
-//   - 'upgrading', at any age: no boot write (Deferred). The timeout the
-//     earlier write started is not re-armed, and the host turns active once
-//     this daemon serves (ConfirmServingReport);
+//   - 'upgrading' younger than the timeout: no boot write (Deferred). The
+//     timeout the earlier write started is not re-armed, and the host turns
+//     active once this daemon serves (ConfirmServingReport);
+//   - 'upgrading' past the timeout: a fresh 'upgrading', written once;
 //   - 'active' (the earlier boot's 'upgrading' write did not land): 'upgrading'
 //     until it serves, written once — the next such boot finds 'upgrading';
 //   - anything else: 'active' as before, which is how a fenced host returns.
@@ -408,13 +440,16 @@ func TestBootWithoutServingEvidenceByRecordedState(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("fixture: HostStateSince ok=%v err=%v", ok, err)
 	}
-	for _, age := range []time.Duration{20 * time.Second, UpgradingTimeout + time.Minute} {
-		if b := BootState(ctx, db, "h", noted(t), false, since.Add(age)); b.State != "upgrading" || !b.AwaitServing || !b.Deferred {
-			t.Fatalf("boot after a never-served one, host upgrading for %s = %+v, want upgrading kept, no boot write", age, b)
-		}
+	if b := BootState(ctx, db, "h", noted(t), false, since.Add(20*time.Second)); b.State != "upgrading" || !b.AwaitServing || !b.Deferred {
+		t.Fatalf("boot after a never-served one, host upgrading for 20s = %+v, want upgrading kept, no boot write", b)
+	}
+	// Past the timeout a deferred host would be fenced at once, before it
+	// serves: it writes a fresh 'upgrading' once, guarded on the state read.
+	if b := BootState(ctx, db, "h", noted(t), false, since.Add(UpgradingTimeout+time.Minute)); b.State != "upgrading" || !b.AwaitServing || b.Deferred || b.From != "upgrading" {
+		t.Fatalf("boot after a never-served one, host upgrading past the timeout = %+v, want a fresh 'upgrading' written from upgrading", b)
 	}
 	db, ctx = hostIn(t, "active")
-	if b := BootState(ctx, db, "h", noted(t), false, time.Now()); b.State != "upgrading" || !b.AwaitServing || b.Deferred {
+	if b := BootState(ctx, db, "h", noted(t), false, time.Now()); b.State != "upgrading" || !b.AwaitServing || b.Deferred || b.From != "active" {
 		t.Fatalf("boot after a never-served one, host active = %+v, want upgrading until serving", b)
 	}
 	for _, st := range []string{"fenced", "offline", "maintenance", "draining", corrosion.HostStateJoining} {
@@ -431,12 +466,14 @@ func TestBootWithoutServingEvidenceByRecordedState(t *testing.T) {
 // ConfirmServingReport is a deferred boot's write once its daemon serves: the
 // boot report (version, resources) and 'active', in one write, only while the
 // host is still recorded as the boot found it. A fence, maintenance or drain
-// recorded meanwhile is kept, report and all, and so is a fence that lands
-// between its read and its write. The isolation is kept.
+// recorded meanwhile is kept, and so is a fence that lands between its read
+// and its write. The isolation is kept.
 //
 // Mutations: write with corrosion.UpdateHostStartup (unconditional) — the
 // fenced host turns active; write the state only (UpdateHostStateFrom) — the
-// version is not reported.
+// version is not reported; drop the moved-on report — the undrained,
+// draining and maintenance hosts keep the old version; report whatever the
+// state — the fenced host takes the new version.
 func TestConfirmServingReport(t *testing.T) {
 	r := Report{Version: "v-new", CPUs: 4, MemMiB: 8, DiskGiB: 16, HasResources: true}
 	for _, from := range []string{"upgrading", "active"} {
@@ -457,13 +494,21 @@ func TestConfirmServingReport(t *testing.T) {
 			t.Fatalf("report from %s changed the isolation: %d %q -> %d %q (%v)", from, epoch, reason, e2, r2, err)
 		}
 	}
-	for _, st := range []string{"fenced", "maintenance", "offline", "draining"} {
+	// Moved on meanwhile: the state is kept. A host that runs again
+	// (undrained to active, draining, maintenance) still gets this boot's
+	// report, so nothing judges it by the previous binary's version; a fenced
+	// or offline one does not, so its fence's time is not re-dated.
+	for st, reported := range map[string]bool{"active": true, "draining": true, "maintenance": true, "fenced": false, "offline": false} {
 		db, ctx := hostIn(t, st)
 		h0, _ := corrosion.GetHost(ctx, db, "h")
 		flipped, got, err := ConfirmServingReport(ctx, db, "h", "upgrading", r)
 		h, _ := corrosion.GetHost(ctx, db, "h")
-		if !errors.Is(err, ErrMovedOn) || flipped || got != st || h.State != st || h.Version != h0.Version {
-			t.Fatalf("report for a host now %s: flipped=%v state=%q err=%v host=%+v", st, flipped, got, err, h)
+		want := h0.Version
+		if reported {
+			want = r.Version
+		}
+		if !errors.Is(err, ErrMovedOn) || flipped || got != st || h.State != st || h.Version != want {
+			t.Fatalf("report for a host now %s: flipped=%v state=%q err=%v host=%+v, want state kept and version %q", st, flipped, got, err, h, want)
 		}
 	}
 	db, ctx := hostIn(t, "upgrading")

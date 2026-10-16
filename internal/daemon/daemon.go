@@ -253,30 +253,57 @@ const localMaxRecvMsgSize = 256 << 20
 // state the cluster records, and the boot report is written with 'active'
 // once this daemon serves (hostboot.ConfirmServingReport).
 //
+// A boot write decided from the recorded state (hostboot.Boot.From) is made
+// only while the host is still recorded so, checked in the write's own
+// transaction: a fence, drain or offline recorded between hostboot's read and
+// this write is kept, and the boot report is written, keeping that state,
+// once this daemon serves.
+//
 // On a WAL-quarantined daemon both writes are refused by the replicated write
 // path, as every write is: the host stays as the cluster recorded it.
 func (d *Daemon) writeBootState(ctx context.Context, cpus, memMiB, diskGiB int, hasResources bool) {
 	boot := hostboot.BootState(ctx, d.db, d.cfg.HostName, d.cfg.DataDir, d.upgradePending, time.Now())
-	slog.Info("boot state", "state", boot.State, "await_serving", boot.AwaitServing, "deferred", boot.Deferred, "reason", boot.Reason)
+	slog.Info("boot state", "state", boot.State, "await_serving", boot.AwaitServing, "deferred", boot.Deferred, "from", boot.From, "reason", boot.Reason)
+	r := hostboot.Report{Version: d.cfg.Version, CPUs: cpus, MemMiB: memMiB, DiskGiB: diskGiB, HasResources: hasResources}
+	reportOnServing := func(from string) confirmFunc {
+		return func(ctx context.Context) (bool, string, error) {
+			return hostboot.ConfirmServingReport(ctx, d.db, d.cfg.HostName, from, r)
+		}
+	}
 	if boot.Deferred {
-		r := hostboot.Report{Version: d.cfg.Version, CPUs: cpus, MemMiB: memMiB, DiskGiB: diskGiB, HasResources: hasResources}
-		go d.awaitServingThenActivate(ctx, func(ctx context.Context) (bool, string, error) {
-			return hostboot.ConfirmServingReport(ctx, d.db, d.cfg.HostName, boot.State, r)
-		})
+		go d.awaitServingThenActivate(ctx, reportOnServing(boot.State))
 		return
 	}
-	if err := corrosion.UpdateHostStartup(ctx, d.db, d.cfg.HostName, boot.State, d.cfg.Version, cpus, memMiB, diskGiB, hasResources); err != nil {
+	if beforeBootWrite != nil {
+		beforeBootWrite()
+	}
+	var confirm confirmFunc
+	if boot.From != "" {
+		applied, err := corrosion.UpdateHostStartupFrom(ctx, d.db, d.cfg.HostName, boot.From, boot.State, d.cfg.Version, cpus, memMiB, diskGiB, hasResources)
+		switch {
+		case err != nil:
+			slog.Warn("failed to write host startup state", "error", err)
+		case !applied:
+			slog.Warn("boot: this host's recorded state changed after the boot read it; leaving it, and reporting this boot once the daemon serves",
+				"read", boot.From)
+			confirm = reportOnServing(boot.State)
+		}
+	} else if err := corrosion.UpdateHostStartup(ctx, d.db, d.cfg.HostName, boot.State, d.cfg.Version, cpus, memMiB, diskGiB, hasResources); err != nil {
 		slog.Warn("failed to write host startup state", "error", err)
 	}
 	switch {
 	case boot.AwaitServing:
-		go d.awaitServingThenActivate(ctx, nil)
+		go d.awaitServingThenActivate(ctx, confirm)
 	case d.cfg.DataDir != "":
 		if _, err := os.Lstat(hostboot.AwaitingPath(d.cfg.DataDir)); err == nil {
 			go d.awaitServingThenNote(ctx)
 		}
 	}
 }
+
+// beforeBootWrite, when set, runs between hostboot's decision and the boot
+// write. Tests only.
+var beforeBootWrite func()
 
 func (d *Daemon) markRestarting() {
 	mctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)

@@ -416,7 +416,7 @@ func TestVMProbe_NoAddressReplacesAnOlderUnknown(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.v.SweepOnce(f.ctx) // settles the verdict to unknown: the VM is stopped
-	if err := corrosion.UpdateVMInterfaceIP(f.ctx, f.db, "web", "lan", ""); err != nil {
+	if _, err := corrosion.UpdateVMInterfaceIP(f.ctx, f.db, "web", "lan", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(2 * time.Millisecond)

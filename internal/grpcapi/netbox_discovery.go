@@ -196,7 +196,7 @@ func (s *Server) recordDiscoveredVMIP(ctx context.Context, vm *corrosion.VMRecor
 		// here, and recording what a guest picked up by DHCP is the whole point
 		// of discovery. This is the pre-existing behaviour, byte for byte, and it
 		// is the overwhelmingly common path.
-		return s.persistDiscoveredVMIP(ctx, vm.Name, netName, ip)
+		return s.persistDiscoveredVMIP(ctx, vm.Name, netName, mac, ip)
 	}
 	if binding == nil {
 		// An allocator with no binding is the fail-closed impossibility CreateVM
@@ -219,7 +219,7 @@ func (s *Server) recordDiscoveredVMIP(ctx context.Context, vm *corrosion.VMRecor
 		return false
 	}
 	if !inside {
-		return s.persistDiscoveredVMIP(ctx, vm.Name, netName, ip)
+		return s.persistDiscoveredVMIP(ctx, vm.Name, netName, mac, ip)
 	}
 
 	if !mayClaim {
@@ -286,7 +286,7 @@ func (s *Server) recordDiscoveredVMIP(ctx context.Context, vm *corrosion.VMRecor
 	// declining the address, and a failed local write is a different fault with
 	// its own log line, which the next tick retries.
 	s.clearDiscoveryRefusal(vm.Name)
-	return s.persistDiscoveredVMIP(ctx, vm.Name, netName, ip)
+	return s.persistDiscoveredVMIP(ctx, vm.Name, netName, mac, ip)
 }
 
 // persistDiscoveredVMIP writes the NIC row. Ordered AFTER the claim on a bound
@@ -295,13 +295,22 @@ func (s *Server) recordDiscoveredVMIP(ctx context.Context, vm *corrosion.VMRecor
 // reverse gap — a granted claim whose row write fails — self-heals, because the
 // next tick discovers the same address and the claim path recovers its own
 // object by identity.
-func (s *Server) persistDiscoveredVMIP(ctx context.Context, vmName, netName, ip string) bool {
-	if err := corrosion.UpdateVMInterfaceIP(ctx, s.db, vmName, netName, ip); err != nil {
+//
+// The write is keyed by the NIC's MAC: a discovered address belongs to the NIC
+// that holds the lease, and only while that NIC is live. A report for a NIC
+// that has since been detached records nothing (UpdateVMInterfaceIP).
+func (s *Server) persistDiscoveredVMIP(ctx context.Context, vmName, netName, mac, ip string) bool {
+	written, err := corrosion.UpdateVMInterfaceIP(ctx, s.db, vmName, netName, mac, ip)
+	if err != nil {
 		slog.Warn("could not record a discovered VM address; it will be re-discovered",
 			"vm", vmName, "network", netName, "ip", ip, "error", err)
 		return false
 	}
-	return true
+	if !written {
+		slog.Debug("discovered address not recorded: the NIC is not a live NIC of the VM on this network",
+			"vm", vmName, "network", netName, "mac", mac, "ip", ip)
+	}
+	return written
 }
 
 // refuseDiscovery is the disposition of every address discovery litevirt

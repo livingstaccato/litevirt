@@ -1746,13 +1746,98 @@ func RenameVM(ctx context.Context, c *Client, oldName, newName string) error {
 	return execVMRekey(ctx, c, c.NowTS(), vmRekeyPass{oldName: oldName, newName: newName})
 }
 
-// UpdateVMInterfaceIP sets the IP of a VM interface.
-func UpdateVMInterfaceIP(ctx context.Context, c *Client, vmName, networkName, ip string) error {
-	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE vm_interfaces SET ip = ?, updated_at = ? WHERE vm_name = ? AND network_name = ?`,
-		ip, now, vmName, networkName,
-	)
+// UpdateVMInterfaceIP records ip on the live NIC of vmName that it is for,
+// and reports whether a row was written.
+//
+// mac names that NIC. Empty means the caller knows only the network (SetVMIP):
+// the network's one live NIC, or, with several, the one its legacy row names —
+// where the old unfiltered UPDATE landed. No live NIC that fits writes nothing.
+//
+// The legacy vm_interfaces row is keyed by (vm, network) and a detach after
+// the hardware_v2 latch tombstones only vm_nics, so that row can belong to a
+// detached NIC, or be the tombstone of a NIC since re-attached under the same
+// MAC. An UPDATE of it would revive the first and hide the second, and the
+// hardware bridge would then make either permanent. So this reads both tables
+// first and writes with the statements that already exist:
+//
+//   - the legacy row, only while it is live and names the target's MAC, so a
+//     peer that reads only vm_interfaces keeps seeing the address;
+//   - the vm_nics row (UpsertNIC, its other fields as read), only when it is
+//     the NIC's current, live row, and after the legacy write, so it stays the
+//     newer row and the bridge does not copy the legacy row over it.
+//
+// A filtered UPDATE would say this in one statement, but a new statement shape
+// would stall this node's stream to every peer on the previous release.
+func UpdateVMInterfaceIP(ctx context.Context, c *Client, vmName, networkName, mac, ip string) (bool, error) {
+	nics, err := GetVMNICsRaw(ctx, c, "vm_nics", vmName)
+	if err != nil {
+		return false, err
+	}
+	ifaces, err := GetVMNICsRaw(ctx, c, "vm_interfaces", vmName)
+	if err != nil {
+		return false, err
+	}
+
+	var legacy *NICRecord // the (vm, network) row; the PK allows one
+	for i := range ifaces {
+		if ifaces[i].NetworkName == networkName {
+			legacy = &ifaces[i]
+		}
+	}
+	legacyLive := legacy != nil && legacy.DeletedAt == ""
+
+	var candidates []NICRecord
+	for _, w := range nicRowWinners(ifaces, nics) {
+		if w.DeletedAt == "" && w.NetworkName == networkName && (mac == "" || strings.EqualFold(w.MAC, mac)) {
+			candidates = append(candidates, w)
+		}
+	}
+	var target *NICRecord
+	switch {
+	case len(candidates) == 1:
+		target = &candidates[0]
+	case len(candidates) > 1 && legacyLive:
+		for i := range candidates {
+			if strings.EqualFold(candidates[i].MAC, legacy.MAC) {
+				target = &candidates[i]
+			}
+		}
+	}
+	if target == nil {
+		return false, nil
+	}
+
+	writeLegacy := legacyLive && strings.EqualFold(legacy.MAC, target.MAC)
+	var nicRow *NICRecord
+	for i := range nics {
+		if nicJoinKey(nics[i]) == nicJoinKey(*target) && (nicRow == nil || nics[i].ID == target.ID) {
+			nicRow = &nics[i]
+		}
+	}
+	// The vm_nics row is the NIC's current one when it is live and at least
+	// as new as the legacy row naming the same MAC (vm_nics wins a tie). The
+	// target is a live winner, so a tombstoned row here is already older than
+	// the legacy row; the liveness test is kept beside the write regardless,
+	// because UpsertNIC clears deleted_at.
+	writeNIC := nicRow != nil && nicRow.DeletedAt == "" &&
+		(!writeLegacy || lwwOrder(nicRow.UpdatedAt, legacy.UpdatedAt) >= 0)
+
+	if writeLegacy {
+		if err := c.Execute(ctx,
+			`UPDATE vm_interfaces SET ip = ?, updated_at = ? WHERE vm_name = ? AND network_name = ?`,
+			ip, c.NowTS(), vmName, networkName,
+		); err != nil {
+			return false, err
+		}
+	}
+	if writeNIC {
+		r := *nicRow
+		r.IP = ip
+		if err := UpsertNIC(ctx, c, r); err != nil {
+			return false, err
+		}
+	}
+	return writeLegacy || writeNIC, nil
 }
 
 // diskRowSQL writes one whole vm_disks row. It is InsertDisk's statement, and

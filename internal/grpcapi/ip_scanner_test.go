@@ -114,7 +114,7 @@ func TestIPScanner_DNSUpsertOnDiscovery(t *testing.T) {
 	// Simulate the post-discovery path that would run after IP is found:
 	// The scanner calls UpdateVMInterfaceIP then dns.UpsertRecord.
 	ip := "10.0.50.100"
-	if err := corrosion.UpdateVMInterfaceIP(ctx, s.db, "web-1", "default", ip); err != nil {
+	if _, err := corrosion.UpdateVMInterfaceIP(ctx, s.db, "web-1", "default", "52:54:00:11:22:33", ip); err != nil {
 		t.Fatalf("UpdateVMInterfaceIP: %v", err)
 	}
 
@@ -158,7 +158,7 @@ func TestIPScanner_DNSNotSetWhenNoDomain(t *testing.T) {
 	}
 
 	// Simulate IP discovery — but since dnsDomain is empty, no DNS record should be created.
-	corrosion.UpdateVMInterfaceIP(ctx, s.db, "no-dns-vm", "default", "10.0.0.99")
+	corrosion.UpdateVMInterfaceIP(ctx, s.db, "no-dns-vm", "default", "52:54:00:44:55:66", "10.0.0.99")
 
 	// The scanner code checks `if domain:= s.server.dnsDomain; domain != ""` before upserting.
 	// Verify no DNS records exist.

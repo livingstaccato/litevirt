@@ -1,8 +1,15 @@
 package corrosion
 
 import (
+	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // Two edits of one VM's desired spec made from the same spec_generation.
@@ -61,12 +68,75 @@ type specEditDrop struct {
 	droppedSpec string
 }
 
-// noteSpecEditDropped records d once tx commits: a rolled-back resolution
-// dropped nothing.
+// SpecEditDroppedEvent is the vm_events type that records a dropped spec edit.
+const SpecEditDroppedEvent = "vm.spec_edit_dropped"
+
+// specDropReasonText says what each reason means, for the event's detail.
+var specDropReasonText = map[string]string{
+	specDropStaleEpoch: "it was made under an owner the VM has since moved from",
+	specDropOperation:  "an operation on the VM held its barrier at that generation",
+	specDropLaterEdit:  "a later edit was made from the same generation",
+	specDropTie:        "another edit was made from the same generation at the same instant; the one on each host stands until one is made again",
+}
+
+// specDropDetailMax bounds the dropped spec quoted in an event's detail.
+const specDropDetailMax = 4096
+
+// noteSpecEditDropped records d once tx commits — a rolled-back resolution
+// dropped nothing: a warning, litevirt_merge_apply_rejected_total{table="vms",
+// reason="spec_edit_dropped"}, and a vm.spec_edit_dropped event on the VM
+// carrying the dropped spec so the edit can be made again.
 func (c *Client) noteSpecEditDropped(tx *sql.Tx, d specEditDrop) {
 	c.deferAfterCommit(tx, func() {
 		slog.Warn("replication: a concurrent edit of a VM's spec was dropped",
 			"vm", d.vm, "generation", d.gen, "owner_epoch", d.epoch, "reason", d.reason, "path", string(d.path),
 			"kept_updated_at", d.keptAt, "dropped_updated_at", d.droppedAt)
+		c.observeMergeRejected("vms", string(d.path), "spec_edit_dropped")
+		// Not here: the deferred effects run under the client's lock, which
+		// the event's own replicated write takes.
+		go c.recordSpecEditDropped(d)
 	})
+}
+
+// specEditDroppedRecord is d's event. Every host that drops the same edit —
+// on either lane — derives the same record, so the replicated rows collapse
+// into one (vm_events is INSERT OR IGNORE on its id).
+func specEditDroppedRecord(d specEditDrop) VMEventRecord {
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		SpecEditDroppedEvent, d.vm, strconv.FormatInt(d.gen, 10), d.droppedAt, d.droppedSpec,
+	}, "\x00")))
+	ts := ""
+	if t, ok := parseInstant(d.keptAt); ok {
+		if dt, dok := parseInstant(d.droppedAt); dok && dt.After(t) {
+			t = dt
+		}
+		ts = t.UTC().Format(nowTSLayout)
+	}
+	spec := d.droppedSpec
+	if len(spec) > specDropDetailMax {
+		spec = spec[:specDropDetailMax] + "…"
+	}
+	why := specDropReasonText[d.reason]
+	if why == "" {
+		why = d.reason
+	}
+	return VMEventRecord{
+		ID:       hex.EncodeToString(sum[:16]),
+		VMName:   d.vm,
+		HostName: d.host,
+		Type:     SpecEditDroppedEvent,
+		Result:   "error",
+		Severity: "warn",
+		Detail: fmt.Sprintf("an edit of the spec made at %s was dropped at generation %d: %s; the version made at %s was kept. "+
+			"Make the edit again if it is still wanted. Dropped spec: %s", d.droppedAt, d.gen, why, d.keptAt, spec),
+		TS: ts,
+	}
+}
+
+func (c *Client) recordSpecEditDropped(d specEditDrop) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := InsertVMEvent(ctx, c, specEditDroppedRecord(d)); err != nil {
+		slog.Warn("replication: could not record a dropped spec edit", "vm", d.vm, "generation", d.gen, "error", err)
+	}
 }

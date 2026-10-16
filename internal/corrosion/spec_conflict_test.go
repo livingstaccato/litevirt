@@ -331,3 +331,101 @@ func TestSpecConflictAE_AFinishedOperationsBarrierNoLongerStands(t *testing.T) {
 		t.Errorf("b after anti-entropy: %s, barrier %q; want c's later edit over the finished claim", got.Spec, got.ActiveOperationID)
 	}
 }
+
+// droppedEvents is p's vm.spec_edit_dropped events for vm1, waiting briefly
+// for the asynchronous write.
+func droppedEvents(t *testing.T, p *specPeer, want int) []VMEventRecord {
+	t.Helper()
+	var evs []VMEventRecord
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		all, err := ListVMEvents(context.Background(), p.c, "vm1", 100, "")
+		if err != nil {
+			t.Fatalf("ListVMEvents on %s: %v", p.name, err)
+		}
+		evs = evs[:0]
+		for _, e := range all {
+			if e.Type == SpecEditDroppedEvent {
+				evs = append(evs, e)
+			}
+		}
+		if len(evs) >= want || time.Now().After(deadline) {
+			return evs
+		}
+	}
+}
+
+// The dropped edit is never silent: every replica that drops a's edit — on
+// whichever side, in whichever order — records one vm.spec_edit_dropped event
+// carrying a's spec, under one id, and counts it.
+func TestSpecConflict_ADroppedEditIsRecorded(t *testing.T) {
+	peers := newSpecPeers(t, true, "a", "b", "c")
+	a, b, c := peers[0], peers[1], peers[2]
+	metrics := map[string]*fakeSyncMetrics{}
+	for _, p := range peers {
+		metrics[p.name] = &fakeSyncMetrics{}
+		p.c.SetSyncMetrics(metrics[p.name])
+	}
+	seedEverywhere(t, peers)
+	setSpec(t, a, `{"cpu":4}`)
+	time.Sleep(5 * time.Millisecond)
+	setSpec(t, b, `{"cpu":2,"labels":{"tier":"front"}}`)
+	ea, eb := a.news(t), b.news(t)
+	applyWAL(t, a.r, eb) // a drops its own edit
+	applyWAL(t, b.r, ea) // b drops a's
+	applyWAL(t, c.r, ea)
+	applyWAL(t, c.r, eb) // c drops a's, which it had applied
+
+	var id string
+	for _, p := range peers {
+		evs := droppedEvents(t, p, 1)
+		if len(evs) != 1 {
+			t.Fatalf("%s recorded %d vm.spec_edit_dropped events, want 1: %+v", p.name, len(evs), evs)
+		}
+		if !strings.Contains(evs[0].Detail, `{"cpu":4}`) || evs[0].Severity != "warn" {
+			t.Errorf("%s's event does not carry a's dropped spec: %+v", p.name, evs[0])
+		}
+		if id == "" {
+			id = evs[0].ID
+		} else if evs[0].ID != id {
+			t.Errorf("%s recorded the drop under id %s, another replica under %s", p.name, evs[0].ID, id)
+		}
+		m := metrics[p.name]
+		m.mu.Lock()
+		got := strings.Join(m.mergeRejected, ",")
+		m.mu.Unlock()
+		if !strings.Contains(got, "vms/wal/spec_edit_dropped") {
+			t.Errorf("%s did not count the drop: %q", p.name, got)
+		}
+	}
+	// Replicating the events adds nothing: one id everywhere.
+	for _, p := range peers {
+		for _, q := range peers {
+			if p != q {
+				applyWAL(t, q.r, p.news(t))
+			}
+		}
+	}
+	for _, p := range peers {
+		if evs := droppedEvents(t, p, 1); len(evs) != 1 {
+			t.Errorf("%s holds %d events after replicating them, want the one", p.name, len(evs))
+		}
+	}
+}
+
+// Anti-entropy's drops are recorded too.
+func TestSpecConflictAE_ADroppedEditIsRecorded(t *testing.T) {
+	peers := newSpecPeers(t, true, "a", "b")
+	a, b := peers[0], peers[1]
+	seedEverywhere(t, peers)
+	setSpec(t, a, `{"cpu":4}`)
+	time.Sleep(5 * time.Millisecond)
+	setSpec(t, b, `{"cpu":2,"labels":{"tier":"front"}}`)
+	mergeFrom(t, a, b)
+	evs := droppedEvents(t, a, 1)
+	if len(evs) != 1 || !strings.Contains(evs[0].Detail, `{"cpu":4}`) {
+		t.Fatalf("a's anti-entropy dropped its edit without recording it: %+v", evs)
+	}
+	if got := vmSpecOn(t, a); !strings.Contains(got.Spec, "tier") {
+		t.Fatalf("premise: a did not take b's later edit: %s", got.Spec)
+	}
+}

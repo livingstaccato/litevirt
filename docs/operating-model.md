@@ -472,8 +472,23 @@ of acting — it says nothing about whether the resulting rows have replicated.
 - VM placement and other state writes use last-writer-wins on the row's
   wall-clock `updated_at`. **The most recent writer (by wall clock) wins**; there
   is no two-phase commit. If two operators concurrently modify the same VM, one
-  set of changes is silently lost — and under clock skew the host with the faster
+  set of changes is lost — and under clock skew the host with the faster
   clock wins, so NTP is required.
+- **A VM's desired spec is edited on its owner.** `lv update`, labels and a
+  deploy's metadata are forwarded to the host that owns the VM, which applies
+  one edit after another, so two edits made while the owner is reachable both
+  stand. An owner that cannot be reached does not refuse the edit; it is made
+  where it entered. Two edits made from the same spec generation on two sides of
+  a partition then conflict, and once `spec_conflict_v1` has latched every host
+  keeps the same one ([upgrades.md](upgrades.md#concurrent-spec-edits-are-resolved-after-the-roll)):
+  the one made under the newer owner; else an operation's (an operation's
+  barrier is never overwritten by an out-of-band edit); else the later one. The
+  other is not lost silently: each host that drops it records a
+  `vm.spec_edit_dropped` event on the VM (`lv events <vm>`) quoting the dropped
+  spec, so the edit can be made again, and counts it in
+  `litevirt_merge_apply_rejected_total{table="vms",reason="spec_edit_dropped"}`.
+  Two edits at the same instant stay apart, one on each host, until either is
+  made again.
 
 ### Leader-lease terms, and what enforcing on them does and does not buy
 

@@ -1023,6 +1023,10 @@ converge the row, so the two paths can never disagree.
   *attempts*, a permanent fault re-increments every cycle — so alert on its **rate**, correlated
   with replication backlog (`litevirt_replication_min_watermark_seq`) and `lv doctor
   divergence`, **not** on its absolute value.
+  `reason="spec_edit_dropped"` (table `vms`) is different in kind: a VM spec edit that met
+  another made from the same generation and lost (see
+  [operating-model.md](operating-model.md#replication)). Each one is also a
+  `vm.spec_edit_dropped` event on the VM, quoting the dropped spec.
 - `litevirt_replication_parked_entries{origin}` — **gauge**: received changes this node
   holds because a constraint refuses them, per sender (see
   [`replication_entry_parked`](#a-received-change-this-node-cannot-apply-replication_entry_parked)).

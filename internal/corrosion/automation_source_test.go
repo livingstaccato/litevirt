@@ -22,10 +22,29 @@ import (
 // ordinary certificates, and invokes the actual import/adoption storage owner.
 // It is intentionally small; later-joined and remote targets live in fleet.
 func sourcePreparationFixture(t *testing.T) (*AutomationSourcePreparer, AutomationSourceRequest) {
+	return sourcePreparationFixtureAt(t, "")
+}
+func sourcePreparationFixtureAt(t *testing.T, dataDir string) (*AutomationSourcePreparer, AutomationSourceRequest) {
 	t.Helper()
 	ctx := context.Background()
 	ca := newClaimTestCA(t)
 	a, b := newClaimTestVoter(t, ca, "a"), newClaimTestVoter(t, ca, "b")
+	if dataDir != "" {
+		c, err := NewLocalClient(dataDir, "a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		if err := InitSchema(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+		c.SetVoterConfigGate(func() bool { return true })
+		a.c = c
+		a.inc, err = c.VoterIncarnation(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := copyTestFile(ca.key, filepath.Join(a.pki, "ca.key")); err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +143,7 @@ func TestSourcePreparationBindings(t *testing.T) {
 	if good.manifest.Signer != hex.EncodeToString(fp[:]) {
 		t.Fatal("wrong signer binding")
 	}
-	for _, mode := range []string{"zero", "copied", "foreign-client", "discarded", "body", "signature", "chain", "manifest", "request", "dependency", "transition", "expired", "future"} {
+	for _, mode := range []string{"zero", "copied", "foreign-client", "discarded", "body", "signature", "chain", "target-chain", "manifest", "request", "dependency", "transition", "expired", "future"} {
 		t.Run(mode, func(t *testing.T) {
 			p := fresh(t)
 			switch mode {
@@ -142,6 +161,8 @@ func TestSourcePreparationBindings(t *testing.T) {
 				p.signature[0] ^= 1
 			case "chain":
 				p.chain[0] = []byte("invalid")
+			case "target-chain":
+				p.targetChain[0][0] ^= 1
 			case "manifest":
 				p.manifest.Request.Job = "changed"
 			case "request":
@@ -367,7 +388,7 @@ func TestSourcePreparationCloseReleases(t *testing.T) {
 	if err := p.checkPrepared(); err == nil {
 		t.Fatal("closed client's preparation remained active")
 	}
-	if len(p.body) != 0 || len(p.artifact) != 0 || len(p.chain) != 0 || p.trust != nil || p.discovery.old != nil {
+	if len(p.body) != 0 || len(p.artifact) != 0 || len(p.chain) != 0 || len(p.targetChain) != 0 || p.targetChainDigest != "" || p.trust != nil || p.discovery.old != nil {
 		t.Fatal("discard retains source evidence")
 	}
 	if _, err := producer.Prepare(context.Background(), request); err == nil {

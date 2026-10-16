@@ -139,7 +139,7 @@ func (c *Client) FreezeAutomationCut(ctx context.Context, generation int64, redu
 		if err != nil {
 			return err
 		}
-		if len(rows) != 1 || rows[0].Int("version") != automationCutSourceSchema {
+		if len(rows) != 1 || !supportedAutomationCutDescriptor(rows[0].Int("version"), automationCutCodec) {
 			return fmt.Errorf("unsupported automation cut source schema")
 		}
 		// Existing replay helpers perform nested anchor/request/membership reads.
@@ -167,7 +167,7 @@ func (c *Client) FreezeAutomationCut(ctx context.Context, generation int64, redu
 			return err
 		}
 		id = hex.EncodeToString(nonce[:])
-		m := automationCutMetadata{Codec: automationCutCodec, SourceSchema: automationCutSourceSchema, ID: id, Source: c.hostName, Incarnation: st.incarnation, Generation: generation, MembersHash: st.cfg.MembersHash, Head: h}
+		m := automationCutMetadata{Codec: automationCutCodec, SourceSchema: rows[0].Int("version"), ID: id, Source: c.hostName, Incarnation: st.incarnation, Generation: generation, MembersHash: st.cfg.MembersHash, Head: h}
 		for sectionIndex, section := range automationCutSections {
 			inv := automationCutInventory{Section: section.name, Codec: automationCutCodec}
 			hash := sha256.New()
@@ -216,7 +216,7 @@ func readAutomationCutMetadata(row Row) (automationCutMetadata, error) {
 		return m, fmt.Errorf("corrupt cut metadata")
 	}
 	encoded, root, err := automationCutRoot(m)
-	if err != nil || string(encoded) != string(b) || root != row.String("root") || m.ID != row.String("id") || m.Codec != automationCutCodec || m.SourceSchema != automationCutSourceSchema || len(m.Inventory) != len(automationCutSections) {
+	if err != nil || string(encoded) != string(b) || root != row.String("root") || m.ID != row.String("id") || !supportedAutomationCutDescriptor(m.SourceSchema, m.Codec) || len(m.Inventory) != len(automationCutSections) {
 		return m, fmt.Errorf("corrupt cut inventory")
 	}
 	for i, inv := range m.Inventory {

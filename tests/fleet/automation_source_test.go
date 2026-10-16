@@ -64,13 +64,81 @@ func TestFleet_AutomationSourceLaterJoiner(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+	if err := source.Server.InitializeAutomationSource(ctx); err != nil {
+		t.Fatal(err)
+	}
 	for _, target := range []string{a.Name, source.Name} {
-		candidate, err := source.Server.PrepareAutomationSource(ctx, corrosion.AutomationSourceRequest{Generation: 2, Target: target, Job: "later-joiner", Revision: 1, Sources: old.Members})
+		candidate, err := source.Server.PrepareAutomationSource(ctx, corrosion.AutomationSourceRequest{Generation: 2, Target: target, Job: "later-joiner-" + target, Revision: 1, Sources: old.Members})
 		if err != nil {
 			t.Fatalf("real later-joined source could not prepare preserved cut for %s: %v", target, err)
 		}
+		if id, err := source.Server.PublishAutomationSource(ctx, candidate); err != nil || id == "" {
+			t.Fatal("real later-joined source did not durably publish", err)
+		}
 		candidate.Discard()
 	}
+	t.Run("durable-fixed-roster-and-revision", func(t *testing.T) {
+		changed := request
+		changed.Job = "later-joiner-" + a.Name
+		changed.Sources = nil
+		for _, member := range old.Members {
+			if member.Name != b.Name {
+				changed.Sources = append(changed.Sources, member)
+			}
+		}
+		candidate, err := source.Server.PrepareAutomationSource(ctx, changed)
+		if err != nil {
+			t.Fatal("valid alternate whole-old-majority fixture refused", err)
+		}
+		if _, err := source.Server.PublishAutomationSource(ctx, candidate); err == nil {
+			t.Fatal("same revision changed durable fixed source roster")
+		}
+		changed.Revision = 2
+		candidate, err = source.Server.PrepareAutomationSource(ctx, changed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := source.Server.PublishAutomationSource(ctx, candidate); err != nil {
+			t.Fatal("new explicit revision did not progress", err)
+		}
+	})
+	t.Run("durable-target-reobservation", func(t *testing.T) {
+		candidate, err := source.Server.PrepareAutomationSource(ctx, request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inc, err := a.DB.VoterIncarnation(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.DB.ReplaceVoterIncarnationForTest(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := source.Server.PublishAutomationSource(ctx, candidate); err == nil {
+			t.Fatal("prepared remote observation silently became current target lifetime")
+		}
+		if err := a.DB.ExecOutOfProcessForTest(`UPDATE local_voter_incarnation SET incarnation=? WHERE id=1`, inc); err != nil {
+			t.Fatal(err)
+		}
+		candidate, err = source.Server.PrepareAutomationSource(ctx, request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := source.Server.PublishAutomationSource(ctx, candidate); err != nil {
+			t.Fatal("rebound real target refused", err)
+		}
+	})
+	t.Run("durable-policy-toggle-back", func(t *testing.T) {
+		candidate, err := source.Server.PrepareAutomationSource(ctx, request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		source.Server.SetTrustRotatedPeerCerts(true)
+		source.Server.SetTrustRotatedPeerCerts(false)
+		if _, err := source.Server.PublishAutomationSource(ctx, candidate); err == nil {
+			t.Fatal("policy toggle-back revived source publication")
+		}
+	})
 	refused := func(t *testing.T, r corrosion.AutomationSourceRequest) {
 		t.Helper()
 		candidate, err := source.Server.PrepareAutomationSource(ctx, r)

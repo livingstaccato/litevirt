@@ -65,6 +65,8 @@ type AutomationSourcePreparation struct {
 	manifest                         sourceManifest
 	body, signature, artifact        []byte
 	chain                            [][]byte
+	targetChain                      [][]byte
+	targetChainDigest                string
 	trust                            *pki.HostTrust
 	validations                      []*pki.HostCertificateValidation
 	at, notBefore, notAfter, expires time.Time
@@ -100,6 +102,8 @@ func (p *AutomationSourcePreparation) Discard() {
 	p.signature = nil
 	p.artifact = nil
 	p.chain = nil
+	p.targetChain = nil
+	p.targetChainDigest = ""
 	p.trust = nil
 	p.transitionEvidence = ""
 	p.discovery = sourceDiscovery{}
@@ -223,6 +227,11 @@ func (producer *AutomationSourcePreparer) Prepare(ctx context.Context, request A
 			return nil, err
 		}
 	}
+	p.targetChain, err = cloneSourceChain(target.Chain)
+	if err != nil {
+		return nil, err
+	}
+	p.targetChainDigest = sourceDigest(p.targetChain...)
 	member, _ := d.next.Member(request.Target)
 	if member.Incarnation != target.Incarnation {
 		return nil, errors.New("observed target storage lifetime differs from successor")
@@ -329,13 +338,9 @@ func (p *AutomationSourcePreparation) signSourceManifest(signer *ClaimSigner, ch
 	}
 	p.body = body
 	p.signature = signature
-	size := 0
-	for _, raw := range chain {
-		size += len(raw)
-		if size > 1<<20 || len(p.chain) >= 8 {
-			return errors.New("source chain exceeds bound")
-		}
-		p.chain = append(p.chain, bytes.Clone(raw))
+	p.chain, err = cloneSourceChain(chain)
+	if err != nil {
+		return err
 	}
 	artifact, err := json.Marshal(sourceSignedArtifact{Manifest: json.RawMessage(body), Signature: signature, Chain: p.chain})
 	if err != nil || len(artifact) > maxSourceArtifactBytes {
@@ -396,6 +401,14 @@ func (p *AutomationSourcePreparation) checkPreparedLocked() error {
 	if !bytes.Equal(request, boundRequest) || !bytes.Equal(cut, boundCut) || p.manifest.Source != c.hostName || p.manifest.Incarnation != p.discovery.incarnation || p.manifest.Root != p.discovery.root || p.manifest.Lineage != p.discovery.lineage || p.manifest.OldValue != sourceConfigDigest(p.discovery.old) || p.manifest.NextValue != sourceConfigDigest(p.discovery.next) || p.dependency != sourceDiscoveryDigest(p.discovery) || p.manifest.MembershipEvidence != sourceDigest([]byte(p.transitionEvidence)) || p.manifest.TrustDomain != hex.EncodeToString(domain[:]) || p.manifest.TrustEvidence != hex.EncodeToString(evidence[:]) {
 		return errors.New("source preparation facts changed")
 	}
+	if sourceChainBounds(p.targetChain) != nil || sourceDigest(p.targetChain...) != p.targetChainDigest {
+		return errors.New("target chain binding changed")
+	}
+	targetLeaf, err := x509.ParseCertificate(p.targetChain[0])
+	targetFingerprint := sha256.Sum256(p.targetChain[0])
+	if err != nil || targetLeaf.Subject.CommonName != p.manifest.Target.Host || hex.EncodeToString(targetFingerprint[:]) != p.manifest.Target.Certificate {
+		return errors.New("target identity binding changed")
+	}
 	body, err := json.Marshal(p.manifest)
 	if err != nil || !bytes.Equal(body, p.body) || len(p.chain) == 0 {
 		return errors.New("source preparation binding changed")
@@ -418,4 +431,31 @@ func (p *AutomationSourcePreparation) checkPreparedLocked() error {
 		return errors.New("invalid source preparation signature")
 	}
 	return nil
+}
+
+const maxSourceChainBytes = 1 << 20
+const maxSourceChainCertificates = 8
+
+func sourceChainBounds(chain [][]byte) error {
+	if len(chain) == 0 || len(chain) > maxSourceChainCertificates {
+		return errors.New("source chain count exceeds bound")
+	}
+	size := 0
+	for _, raw := range chain {
+		if len(raw) == 0 || len(raw) > maxSourceChainBytes-size {
+			return errors.New("source chain exceeds bound")
+		}
+		size += len(raw)
+	}
+	return nil
+}
+func cloneSourceChain(chain [][]byte) ([][]byte, error) {
+	if err := sourceChainBounds(chain); err != nil {
+		return nil, err
+	}
+	out := make([][]byte, len(chain))
+	for i, raw := range chain {
+		out[i] = bytes.Clone(raw)
+	}
+	return out, nil
 }

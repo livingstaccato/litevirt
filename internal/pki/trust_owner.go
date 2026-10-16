@@ -20,6 +20,7 @@ const trustLockName = ".trust.lock"
 // read lease may precede that caller's DB transaction; writers never dial peers
 // or fetch keys while holding this barrier.
 type trustOwner struct {
+	successorFloor    map[[32]byte][]byte
 	dir               string
 	gate              chan struct{}
 	nonce             [32]byte

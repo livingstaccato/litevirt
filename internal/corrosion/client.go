@@ -115,6 +115,10 @@ type Config struct {
 // Client is the embedded state store with WAL-based replication.
 type Client struct {
 	automationSeams              *localCommitSeams
+	automationPublicationMu      sync.Mutex
+	automationPublicationDir     string
+	automationPublicationReady   bool
+	automationPublicationSeams   *localCommitSeams
 	automationSourceMu           sync.Mutex
 	automationSourceClosed       bool
 	automationSourcePreparations map[*AutomationSourcePreparation]bool

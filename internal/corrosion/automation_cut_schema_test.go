@@ -28,6 +28,10 @@ func TestAutomationCutArchiveKeepsSourceSchema(t *testing.T) {
 	if err := a.c.SealVoterGeneration(ctx, 1, "test"); err != nil {
 		t.Fatal(err)
 	}
+	// Create the historical fixture with the genuine schema69 descriptor.
+	if _, err := a.c.db.Exec(`UPDATE schema_state SET version=69 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
 	id, err := a.c.FreezeAutomationCut(ctx, 1, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +53,7 @@ func TestAutomationCutArchiveKeepsSourceSchema(t *testing.T) {
 	}
 	// Even an internally consistent content root cannot make an unsupported
 	// artifact schema readable by this codec.
-	after.SourceSchema++
+	after.SourceSchema = CurrentSchemaVersion + 1
 	metadata, root, err := automationCutRoot(after)
 	if err != nil {
 		t.Fatal(err)
@@ -93,5 +97,54 @@ func TestAutomationCutRetainsLegacyImportedSignature(t *testing.T) {
 	after, _, err := a.c.ClaimState(ctx, key)
 	if err != nil || after.Accept == nil || after.Accept.ConfigGeneration != 1 || after.ValueDigest != before.ValueDigest {
 		t.Fatal("source changed inherited acceptance", err)
+	}
+}
+
+func TestAutomationCutNewLiveExcludesPublicationEgress(t *testing.T) {
+	producer, request := sourcePreparationFixture(t)
+	ctx := context.Background()
+	before, records := cutFixtureRead(t, producer.client, func() string {
+		id, err := producer.client.FreezeAutomationCut(ctx, request.Generation, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}())
+	if before.SourceSchema != 70 || before.Codec != 1 {
+		t.Fatal("new live descriptor differs", before)
+	}
+	if err := producer.InitializePublication(ctx); err != nil {
+		t.Fatal(err)
+	}
+	p, err := producer.Prepare(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Discard()
+	if _, err := producer.Publish(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := producer.client.SealVoterGeneration(ctx, 2, "publication inventory test"); err != nil {
+		t.Fatal(err)
+	}
+	nextID, err := producer.client.FreezeAutomationCut(ctx, 2, nil)
+	if err != nil {
+		t.Fatal("new live cut with prior egress rows refused", err)
+	}
+	next, _ := cutFixtureRead(t, producer.client, nextID)
+	if nextID == before.ID || next.Generation != 2 || next.SourceSchema != 70 || next.Codec != 1 || len(next.Inventory) != 9 {
+		t.Fatal("new live cut descriptor/inventory differs", next)
+	}
+	rows, err := producer.client.Query(ctx, `SELECT COUNT(*) AS n FROM local_automation_publications`)
+	if err != nil || rows[0].Int("n") != 1 {
+		t.Fatal("prior egress row did not survive new cut", err)
+	}
+	id, err := producer.client.FreezeAutomationCut(ctx, request.Generation, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, later := cutFixtureRead(t, producer.client, id)
+	if !reflect.DeepEqual(before, after) || !reflect.DeepEqual(records, later) {
+		t.Fatal("publication recursively changed content cut")
 	}
 }

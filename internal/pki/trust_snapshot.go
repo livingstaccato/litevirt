@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/binary"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -28,6 +27,7 @@ const (
 // database incarnation, source-cut completeness or publication authority.
 // Its private pools/maps never escape. Verification never learns evidence.
 type HostTrust struct {
+	publicEvidence                  *HostTrustEvidence
 	owner                           *trustOwner
 	nonce                           [32]byte
 	revision                        uint64
@@ -218,14 +218,8 @@ func (o *trustOwner) captureLocked(host string) (*HostTrust, error) {
 	if err != nil {
 		return nil, fmt.Errorf("served identity: %w", err)
 	}
-	h := sha256.New()
-	for _, body := range [][]byte{[]byte("litevirt-host-trust-v1"), rootPEM, crlPEM, successorPEM, v.served.Leaf.Raw, []byte(fmt.Sprint(v.policy))} {
-		var length [8]byte
-		binary.BigEndian.PutUint64(length[:], uint64(len(body)))
-		h.Write(length[:])
-		h.Write(body)
-	}
-	copy(v.digest[:], h.Sum(nil))
+	v.publicEvidence = &HostTrustEvidence{rootPEM: bytes.Clone(rootPEM), crlPEM: bytes.Clone(crlPEM), successorPEM: bytes.Clone(successorPEM), leaf: bytes.Clone(v.served.Leaf.Raw), policy: v.policy, root: root}
+	v.digest = v.publicEvidence.Digest()
 	for name, body := range map[string][]byte{"ca.crt": rootPEM, "crl.pem": crlPEM, supersededFile: successorPEM, "host.crt": certPEM, "host.key": keyPEM} {
 		if body != nil {
 			if err := durableTrustReopen(filepath.Join(o.dir, name), body); err != nil {
@@ -290,6 +284,15 @@ func (v *HostTrust) captureSuccessorsLocked() ([]byte, error) {
 		}
 		disk[cert.SerialNumber.Text(16)] = true
 		v.successors[prev] = append(v.successors[prev], supersession{cn: cert.Subject.CommonName, successor: cert})
+	}
+	presentSuccessors := make(map[[32]byte]bool, len(certs))
+	for _, cert := range certs {
+		presentSuccessors[sha256.Sum256(cert.Raw)] = true
+	}
+	for digest := range v.owner.successorFloor {
+		if !presentSuccessors[digest] {
+			return nil, errors.New("installed successors lost completed signed evidence")
+		}
 	}
 	for _, list := range store.byPrev {
 		for _, proof := range list {

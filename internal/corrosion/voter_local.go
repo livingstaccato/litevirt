@@ -23,21 +23,23 @@ import (
 // nodeLocalClaimTables are the tables ExecuteLocal may write. Each is absent
 // from tableNames and sensitiveTableNames (TestNodeLocalClaimTablesAreNotReplicated).
 var nodeLocalClaimTables = map[string]bool{
-	"local_automation_cuts":        true,
-	"local_automation_cut_records": true,
-	"local_automation_authority":   true,
-	"local_automation_recovery":    true,
-	"local_automation_staging":     true,
-	"local_automation_prefix":      true,
-	"local_automation_anchors":     true,
-	"local_automation_history":     true,
-	"local_automation_requests":    true,
-	"local_recovery_claims":        true,
-	"local_voter_incarnation":      true,
-	"local_voter_adoption":         true,
-	"local_abandoned_proofs":       true,
-	"local_voter_seals":            true,
-	"local_incarnation_claims":     true,
+	"local_automation_source_jobs":  true,
+	"local_automation_publications": true,
+	"local_automation_cuts":         true,
+	"local_automation_cut_records":  true,
+	"local_automation_authority":    true,
+	"local_automation_recovery":     true,
+	"local_automation_staging":      true,
+	"local_automation_prefix":       true,
+	"local_automation_anchors":      true,
+	"local_automation_history":      true,
+	"local_automation_requests":     true,
+	"local_recovery_claims":         true,
+	"local_voter_incarnation":       true,
+	"local_voter_adoption":          true,
+	"local_abandoned_proofs":        true,
+	"local_voter_seals":             true,
+	"local_incarnation_claims":      true,
 }
 
 // IsNodeLocalClaimTable reports whether ExecuteLocal may write table. Exported

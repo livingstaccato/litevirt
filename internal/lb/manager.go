@@ -804,9 +804,12 @@ type Transport struct {
 	Iface   string   // the vrrp_instance's interface
 	Src     string   // unicast_src_ip
 	Peers   []string // unicast_peer, sorted, without a sole host's self entry
+	// VIPDev is the VIP's device (the virtual_ipaddress line's dev). It is
+	// not part of the transport: Equal ignores it.
+	VIPDev string
 }
 
-// Equal reports whether t and o render the same transport.
+// Equal reports whether t and o render the same transport (VIPDev aside).
 func (t Transport) Equal(o Transport) bool {
 	if t.Unicast != o.Unicast {
 		return false
@@ -833,7 +836,7 @@ func TransportOf(cfg Config) Transport {
 	if !cfg.VRRPUnicast {
 		return Transport{}
 	}
-	return Transport{Unicast: true, Iface: cfg.VRRPInterface, Src: cfg.UnicastSrc, Peers: cfg.UnicastPeers}
+	return Transport{Unicast: true, Iface: cfg.VRRPInterface, Src: cfg.UnicastSrc, Peers: cfg.UnicastPeers, VIPDev: cfg.Interface}
 }
 
 // KeepalivedTransport reads the VRRP transport of this LB's keepalived config
@@ -850,17 +853,25 @@ func (m *Manager) KeepalivedTransport(name string) (t Transport, ok bool) {
 // entry (rendered with max_ttl 0) is not a peer.
 func parseTransport(conf string) Transport {
 	var t Transport
-	inPeers := false
+	inPeers, inVIP := false, false
 	for _, line := range strings.Split(conf, "\n") {
 		f := strings.Fields(line)
 		switch {
 		case len(f) == 0:
-		case inPeers && f[0] == "}":
-			inPeers = false
+		case (inPeers || inVIP) && f[0] == "}":
+			inPeers, inVIP = false, false
 		case inPeers:
 			if !strings.Contains(line, "max_ttl 0") {
 				t.Peers = append(t.Peers, f[0])
 			}
+		case inVIP:
+			for i := 1; i+1 < len(f); i++ {
+				if f[i] == "dev" {
+					t.VIPDev = f[i+1]
+				}
+			}
+		case f[0] == "virtual_ipaddress":
+			inVIP = true
 		case f[0] == "interface" && len(f) == 2:
 			t.Iface = f[1]
 		case f[0] == "unicast_src_ip" && len(f) == 2:
@@ -1067,6 +1078,17 @@ func InterfaceHoldingIP(ip string) string {
 		}
 	}
 	return ""
+}
+
+// InterfaceUpRunning reports whether dev exists, is up and has carrier
+// (IFF_RUNNING), as keepalived's track_interface requires: without it
+// keepalived enters FAULT and releases the VIP.
+func InterfaceUpRunning(dev string) bool {
+	iface, err := net.InterfaceByName(dev)
+	if err != nil {
+		return false
+	}
+	return iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagRunning != 0
 }
 
 // VRIDFromString converts a string to a stable VRID (helper for tests).

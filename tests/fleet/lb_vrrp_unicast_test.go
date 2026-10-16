@@ -317,10 +317,13 @@ func TestFleet_VRRPUnicast_StandDownAndRemovedPeer(t *testing.T) {
 //   - Both refused: neither is serving, so neither stops; both run the LB on
 //     multicast (where VRRP elects one master between them) and both raise
 //     the condition.
+//   - One refused, then the serving host's VIP device loses carrier: it no
+//     longer reports serving, and the refused host runs the LB again on
+//     multicast.
 //
 // Mutations (each red): demote on a peer that advertises the token rather
 // than one that reports serving (both refused: no holder); never demote (one
-// refused: two holders).
+// refused: two holders); serve without the VIP-device check (no holder).
 func TestFleet_VRRPUnicast_RefusedHost(t *testing.T) {
 	for _, both := range []bool{false, true} {
 		name := "one refused"
@@ -334,6 +337,8 @@ func TestFleet_VRRPUnicast_RefusedHost(t *testing.T) {
 				t.Fatal(err)
 			}
 			ctx := context.Background()
+			var vipUp atomic.Bool // node-1's VIP device has carrier
+			vipUp.Store(true)
 			c := New(t, Options{Nodes: 2, SharedCRDT: true})
 			a, b := c.Nodes[0], c.Nodes[1]
 			confDir, mgr := map[string]string{}, map[string]*lb.Manager{}
@@ -350,6 +355,9 @@ func TestFleet_VRRPUnicast_RefusedHost(t *testing.T) {
 			}
 			if !both {
 				b.Server.SetLBIfaceForIPForTests(func(string) string { return "fleet0" })
+				// Its VIP bridge does not exist here; say it is up, so its
+				// keepalived can hold the VIP and it reports serving.
+				b.Server.SetLBIfaceRunningForTests(func(string) bool { return vipUp.Load() })
 			}
 			gates := gateAll(t, c)
 			for _, n := range c.Nodes {
@@ -406,6 +414,13 @@ func TestFleet_VRRPUnicast_RefusedHost(t *testing.T) {
 						t.Fatalf("node-0 running=%v, node-1 running=%v refused=%v; want node-1 alone", running(a), running(b), refused(b))
 					}
 				}
+				// node-1's VIP device loses carrier: its keepalived runs on in
+				// FAULT without the VIP, so it no longer reports serving, and
+				// node-0 takes the LB back on multicast.
+				vipUp.Store(false)
+				eventually(t, 20*time.Second, "node-0 runs the LB again once node-1 cannot hold the VIP", func() bool {
+					return running(a) && !isUnicast(a) && refused(a)
+				})
 				return
 			}
 			eventually(t, 20*time.Second, "both refuse, and both run the LB on multicast", func() bool {

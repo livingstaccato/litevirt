@@ -156,9 +156,11 @@ func TestParseKeepalivedVIP_UnicastNamesTheVIPDevice(t *testing.T) {
 // TestManager_KeepalivedTransport reads the whole transport of the config on
 // disk — mode, device, source and peers — so the reconciler can find an LB
 // rendered for another transport, another peer set or another address. A
-// sole host's self entry is not a peer.
+// sole host's self entry is not a peer. The VIP's device is read too (a peer
+// asks whether it can hold the VIP).
 //
-// Mutation: parse the peers as empty, or count the self entry — red.
+// Mutation: parse the peers as empty, or count the self entry — red; skip
+// the VIP's device — red.
 func TestManager_KeepalivedTransport(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManagerAt(dir, t.TempDir())
@@ -185,6 +187,9 @@ func TestManager_KeepalivedTransport(t *testing.T) {
 		tr, ok := m.KeepalivedTransport("app")
 		if !ok || !tr.Equal(TransportOf(cfg)) {
 			t.Fatalf("read %+v ok=%v, want %+v", tr, ok, TransportOf(cfg))
+		}
+		if tr.VIPDev == "" || tr.VIPDev != cfg.Interface {
+			t.Fatalf("VIP device read as %q, want %q", tr.VIPDev, cfg.Interface)
 		}
 	}
 	a := TransportOf(unicastCfg("192.168.1.11"))
@@ -227,5 +232,16 @@ func TestRenderKeepalived_UnicastChecksSourceOnEveryVersion(t *testing.T) {
 func TestInterfaceHoldingIP_NotLoopback(t *testing.T) {
 	if dev := InterfaceHoldingIP("127.0.0.1"); dev != "" {
 		t.Fatalf("127.0.0.1 is held by %q for VRRP, want none", dev)
+	}
+}
+
+// TestInterfaceUpRunning: a device that is up with carrier, and none that
+// does not exist.
+func TestInterfaceUpRunning(t *testing.T) {
+	if !InterfaceUpRunning("lo") {
+		t.Fatal("lo is not up and running")
+	}
+	if InterfaceUpRunning("lv-no-such-dev0") {
+		t.Fatal("a missing device is up and running")
 	}
 }

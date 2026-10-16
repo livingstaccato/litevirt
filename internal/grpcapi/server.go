@@ -628,6 +628,9 @@ type Server struct {
 	// address (lb.InterfaceHoldingIP). Nil in production.
 	lbRenderedTransportOverride func(name string) (lb.Transport, bool)
 	lbIfaceForIPOverride        func(ip string) string
+	// lbIfaceRunningOverride is a test seam for whether a device is up and
+	// has carrier (lb.InterfaceUpRunning). Nil in production.
+	lbIfaceRunningOverride func(dev string) bool
 	// vrrpPeerCapsOverride is a test seam for noteVRRPSplit's Ping of an LB
 	// peer (PeerCapabilities). Nil in production.
 	vrrpPeerCapsOverride func(ctx context.Context, host string) (caps []string, walQuarantined bool, err error)
@@ -641,9 +644,15 @@ type Server struct {
 	vrrpLastEvent  map[string]string
 	vrrpRefusedLBs map[string]string
 	// vrrpServing is checkVRRPServing's last answer per refused LB: another
-	// LB host serves it on unicast. vrrpLatchErr is the last latch-row write
+	// LB host serves it on unicast. It is dropped when the refusal clears, and
+	// written only for the refusal it was asked for (vrrpRefusedEpoch), so no
+	// answer outlives its refusal. vrrpLatchErr is the last latch-row write
 	// error (noteVRRPLatch logs a change of it only).
 	vrrpServing map[string]bool
+	// vrrpRefusedEpoch numbers each refusal of an LB (from vrrpEpoch, never
+	// reused) while it lasts.
+	vrrpRefusedEpoch map[string]uint64
+	vrrpEpoch        uint64
 	// vrrpRefusedHosts is each refused LB's hosts, as its last apply had them.
 	vrrpRefusedHosts map[string][]string
 	vrrpLatchErr     string

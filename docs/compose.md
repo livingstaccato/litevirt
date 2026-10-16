@@ -959,8 +959,9 @@ Requirements and edges of the unicast transport:
   it raises the critical health condition `lb.vrrp.transport_refused` naming each
   LB. When another host of the LB reports serving it on unicast, it stops its own
   keepalived for the LB, so that host holds the VIP alone; when none does (they
-  are refused too, or down), it runs the LB on multicast, so the LB always keeps a
-  holder, and stops it again once one serves. Fix the address or the device; where
+  are refused too, down, unreachable, or cannot hold the VIP because its device
+  is down or has no carrier), it runs the LB on multicast, so the LB always keeps
+  a holder, and stops it again once one serves. Fix the address or the device; where
   the address cannot be on a local device — 1:1 NAT, an address routed to `lo` —
   run `lv cluster vrrp-transport multicast`. A failed read of the policy or an
   address is not a refusal: what runs is kept, and the next pass retries.

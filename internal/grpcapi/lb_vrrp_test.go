@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/compose"
@@ -275,8 +277,9 @@ func TestApplyLB_VRRPRefusal(t *testing.T) {
 	if len(f.stopped) != 0 {
 		t.Fatalf("stopped %v with no peer serving", f.stopped)
 	}
-	if on, detail := f.cond(t); !on || !strings.Contains(detail, "lbr-lb") || !strings.Contains(detail, "lv cluster vrrp-transport multicast") {
-		t.Fatalf("condition active=%v detail=%q, want critical, naming the LB and the remedy", on, detail)
+	if on, detail := f.cond(t); !on || !strings.Contains(detail, "lbr-lb") || !strings.Contains(detail, "lv cluster vrrp-transport multicast") ||
+		!strings.Contains(detail, "No other LB host reports serving it on unicast (refused, down, unreachable or on an earlier build)") {
+		t.Fatalf("condition active=%v detail=%q, want critical, naming the LB, the remedy, and that no peer reports serving", on, detail)
 	}
 
 	f.serving = true
@@ -328,8 +331,15 @@ func TestApplyLB_VRRPRefusal(t *testing.T) {
 func TestVRRPUnicastServing(t *testing.T) {
 	f := newRefusalFixture(t)
 	running, uni := true, true
+	f.held = true
 	f.s.lbKeepalivedOverride = func(string) bool { return running }
-	f.s.lbRenderedTransportOverride = func(string) (lb.Transport, bool) { return lb.Transport{Unicast: uni}, true }
+	f.s.lbIfaceRunningOverride = func(string) bool { return true }
+	f.s.lbRenderedTransportOverride = func(string) (lb.Transport, bool) {
+		if !uni {
+			return lb.Transport{}, true
+		}
+		return lb.Transport{Unicast: true, Iface: "eth-host", Src: "192.0.2.11", VIPDev: "hinet"}, true
+	}
 	if !f.s.vrrpUnicastServing("lbr-lb") {
 		t.Fatal("running on unicast, not refused: not serving")
 	}
@@ -337,7 +347,7 @@ func TestVRRPUnicastServing(t *testing.T) {
 	if f.s.vrrpUnicastServing("lbr-lb") {
 		t.Fatal("serving on a multicast config")
 	}
-	uni = true
+	uni, f.held = true, false
 	f.s.lbServingOverride = func(context.Context, string, string) bool {
 		if f.s.vrrpUnicastServing("lbr-lb") {
 			t.Error("asked its peers while still answering serving")
@@ -358,25 +368,45 @@ func TestVRRPUnicastServing(t *testing.T) {
 	}
 }
 
-// TestApplyLB_VRRPReadErrorKeepsWhatRuns: a failed read is not a refusal: the
-// apply returns, nothing is stopped or re-rendered, no condition is raised,
-// and the next pass retries.
+// TestApplyLB_VRRPReadErrorKeepsWhatRuns: a failed read — of the policy, or
+// of a host's address — is not a refusal, even with a peer serving: the apply
+// returns, nothing is stopped or re-rendered, no condition is raised, and the
+// next pass retries.
 //
 // Mutation: treat it as a refusal — red.
 func TestApplyLB_VRRPReadErrorKeepsWhatRuns(t *testing.T) {
-	ctx := context.Background()
-	f := newRefusalFixture(t)
-	f.serving = true
-	f.s.checkVRRPServing(ctx)
-	if err := f.s.db.Execute(ctx, `ALTER TABLE cluster_policies RENAME TO cluster_policies_away`); err != nil {
-		t.Fatal(err)
-	}
-	applied, err := peerApply(t, f.s, []string{"self", "peer-1"})
-	if err == nil || len(applied) != 0 || len(f.stopped) != 0 {
-		t.Fatalf("read error: applied %d, stopped %v (err %v), want left as it runs", len(applied), f.stopped, err)
-	}
-	if on, _ := f.cond(t); on {
-		t.Fatal("a read error raised the refusal condition")
+	for _, table := range []string{"cluster_policies", "hosts"} {
+		t.Run(table, func(t *testing.T) {
+			ctx := context.Background()
+			f := newRefusalFixture(t)
+			// A peer serves the LB: a read error mistaken for a refusal would
+			// stop this host's keepalived.
+			f.s.vrrpMu.Lock()
+			f.s.vrrpServing = map[string]bool{"lbr-lb": true}
+			f.s.vrrpMu.Unlock()
+			if err := f.s.db.Execute(ctx, `ALTER TABLE `+table+` RENAME TO `+table+`_away`); err != nil {
+				t.Fatal(err)
+			}
+			var applied []lb.Config
+			var err error
+			if table == "hosts" {
+				// The ApplyLB RPC reads hosts to authorise its peer caller, so
+				// the apply itself is driven here.
+				f.s.lbApplyOverride = func(_ context.Context, c lb.Config) error { applied = append(applied, c); return nil }
+				err = f.s.applyLBLocal(ctx, lb.Config{Name: "lbr-lb", VIP: "10.202.0.250", VIPPrefix: 24, Interface: "hinet"}, []string{"self", "peer-1"})
+			} else {
+				applied, err = peerApply(t, f.s, []string{"self", "peer-1"})
+			}
+			if err == nil || !strings.Contains(err.Error(), "no such table: "+table) {
+				t.Fatalf("err = %v, want the failed read of %s", err, table)
+			}
+			if len(applied) != 0 || len(f.stopped) != 0 {
+				t.Fatalf("read error: applied %d, stopped %v (err %v), want left as it runs", len(applied), f.stopped, err)
+			}
+			if on, _ := f.cond(t); on {
+				t.Fatal("a read error raised the refusal condition")
+			}
+		})
 	}
 }
 
@@ -579,4 +609,186 @@ func TestAdvertise_VRRPUnicastWithheldWhileOff(t *testing.T) {
 	if !slices.Contains(on.advertisedCapabilities(), capabilities.VRRPUnicastV1) || !on.tokenEnabled(capabilities.VRRPUnicastV1) {
 		t.Fatalf("a flag-on host does not advertise or enable %s", capabilities.VRRPUnicastV1)
 	}
+}
+
+// TestApplyLB_VRRPStaleServingAnswerNeverDemotes: a peer's "serving" answer
+// belongs to the refusal it was asked for. Refused while the peer served,
+// cleared (the address is held again), the peer dies, refused again: no
+// answer has been asked since this refusal, so the host keeps the LB running
+// (on multicast) rather than stop on the old answer and leave no holder.
+//
+// Mutation: keep the answer when the refusal clears — red.
+func TestApplyLB_VRRPStaleServingAnswerNeverDemotes(t *testing.T) {
+	ctx := context.Background()
+	f := newRefusalFixture(t)
+	hosts := []string{"self", "peer-1"}
+	f.serving = true
+	if _, err := peerApply(t, f.s, hosts); err != nil { // multicast until asked
+		t.Fatal(err)
+	}
+	f.s.checkVRRPServing(ctx)
+	if _, err := peerApply(t, f.s, hosts); err == nil || len(f.stopped) != 1 {
+		t.Fatalf("fixture: a serving peer did not demote (err %v, stopped %v)", err, f.stopped)
+	}
+	f.held = true
+	if applied, err := peerApply(t, f.s, hosts); err != nil || len(applied) != 1 || !applied[0].VRRPUnicast {
+		t.Fatalf("address held: applied %+v (%v), want unicast", applied, err)
+	}
+	f.held, f.serving = false, false // the peer dies; refused again
+	applied, err := peerApply(t, f.s, hosts)
+	if len(f.stopped) != 1 {
+		t.Fatalf("stopped %v on an answer asked before this refusal: no holder", f.stopped)
+	}
+	if err != nil || len(applied) != 1 || applied[0].VRRPUnicast {
+		t.Fatalf("refused again: applied %+v (%v), want the LB on multicast", applied, err)
+	}
+}
+
+// TestVRRPUnicastServing_OnlyWhileItCanHoldTheVIP: a keepalived running from
+// a unicast config does not serve the LB when it cannot hold the VIP: the
+// VIP's device is down or has no carrier (track_interface puts it in FAULT,
+// and it releases the VIP while it runs), or this host no longer holds its
+// source address on the device it sends from. A refused peer must not demote
+// on it.
+//
+// Mutations (each red): drop the VIP-device check; drop the source check.
+func TestVRRPUnicastServing_OnlyWhileItCanHoldTheVIP(t *testing.T) {
+	cur := lb.Transport{Unicast: true, Iface: "eth-host", Src: "192.0.2.11", VIPDev: "hinet"}
+	for _, tc := range []struct {
+		name    string
+		vipUp   bool
+		srcDev  string // the device holding 192.0.2.11 now
+		serving bool
+	}{
+		{"can hold it", true, "eth-host", true},
+		{"VIP device down", false, "eth-host", false},
+		{"source gone", true, "", false},
+		{"source on another device", true, "eth-other", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := vrrpServer(t, true, true, true)
+			markLatched(t, s)
+			s.lbKeepalivedOverride = func(string) bool { return true }
+			s.lbRenderedTransportOverride = func(string) (lb.Transport, bool) { return cur, true }
+			s.lbIfaceForIPOverride = func(ip string) string {
+				if ip == "192.0.2.11" {
+					return tc.srcDev
+				}
+				return ""
+			}
+			var asked []string
+			s.lbIfaceRunningOverride = func(dev string) bool { asked = append(asked, dev); return tc.vipUp }
+			if got := s.vrrpUnicastServing("web"); got != tc.serving {
+				t.Fatalf("serving = %v, want %v", got, tc.serving)
+			}
+			if tc.serving && !slices.Equal(asked, []string{"hinet"}) {
+				t.Fatalf("checked devices %v, want the VIP's device hinet", asked)
+			}
+		})
+	}
+}
+
+// TestReconcileDeadLBs_ARunningUnicastHostThatNowRefusesReapplies: an LB
+// running from a unicast config whose source this host no longer holds is
+// stale: the reconciler re-applies it, so the host records its refusal
+// (never answering serving), raises the critical condition and follows its
+// peers' answer — here none serves, so it runs on multicast.
+//
+// Mutation: compare only the mode on a refusal (unicast against unicast:
+// not stale) — red.
+func TestReconcileDeadLBs_ARunningUnicastHostThatNowRefusesReapplies(t *testing.T) {
+	ctx := context.Background()
+	f := newRefusalFixture(t)
+	hosts, _ := json.Marshal([]string{"self", "peer-1"})
+	if err := corrosion.UpsertLBConfig(ctx, f.s.db, corrosion.LBConfigRecord{
+		Name: "web", VIP: "192.0.2.250/24", Algorithm: "roundrobin", Hosts: string(hosts),
+		Ports: `[{"listen":80,"target":8080,"protocol":"tcp"}]`, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.s.lbKeepalivedOverride = func(string) bool { return true }
+	f.s.lbRenderedTransportOverride = func(string) (lb.Transport, bool) {
+		return lb.Transport{Unicast: true, Iface: "eth-host", Src: "192.0.2.11", Peers: []string{"127.0.0.1"}, VIPDev: "br0"}, true
+	}
+	f.s.vrrpPeerCapsOverride = func(context.Context, string) ([]string, bool, error) { return nil, false, errors.New("down") }
+	var applied []lb.Config
+	f.s.lbApplyOverride = func(_ context.Context, c lb.Config) error { applied = append(applied, c); return nil }
+
+	f.s.reconcileDeadLBs(ctx) // f.held is false: the address moved off its device
+
+	if len(applied) != 1 || applied[0].VRRPUnicast {
+		t.Fatalf("applied %+v, want one multicast re-apply", applied)
+	}
+	if !f.s.vrrpRefusedHere("web") {
+		t.Fatal("the refusal was not recorded")
+	}
+	if on, detail := f.cond(t); !on || !strings.Contains(detail, `"web"`) {
+		t.Fatalf("condition active=%v detail=%q, want critical naming web", on, detail)
+	}
+}
+
+// TestCheckVRRPServing_AnswerKeptOnlyForItsRefusal: an answer that arrives
+// after the refusal it was asked for cleared — or after a newer refusal
+// began — is dropped, so it can never demote a later refusal.
+//
+// Mutation: write every answer back — red.
+func TestCheckVRRPServing_AnswerKeptOnlyForItsRefusal(t *testing.T) {
+	ctx := context.Background()
+	for _, anew := range []bool{false, true} {
+		f := newRefusalFixture(t)
+		if _, err := peerApply(t, f.s, []string{"self", "peer-1"}); err != nil {
+			t.Fatal(err)
+		}
+		f.s.lbServingOverride = func(context.Context, string, string) bool {
+			f.s.vrrpApplied(ctx, "lbr-lb") // the refusal clears while asking
+			if anew {
+				f.s.setVRRPRefused(ctx, "lbr-lb", "refused again")
+			}
+			return true
+		}
+		f.s.checkVRRPServing(ctx)
+		if f.s.vrrpPeerServing("lbr-lb") {
+			t.Fatalf("refused anew=%v: an answer asked for a cleared refusal was kept", anew)
+		}
+	}
+}
+
+// TestCheckVRRPServing_OneConnectionPerPeer: the refused LBs a peer runs are
+// asked over one connection to it per round, not one per LB.
+//
+// Mutation: dial per LB — red.
+func TestCheckVRRPServing_OneConnectionPerPeer(t *testing.T) {
+	ctx := context.Background()
+	s := vrrpServer(t, true, true, true)
+	for _, name := range []string{"a", "b", "c"} {
+		s.vrrpMu.Lock()
+		if s.vrrpRefusedHosts == nil {
+			s.vrrpRefusedHosts = map[string][]string{}
+		}
+		s.vrrpRefusedHosts[name] = []string{"self", "peer-1"}
+		s.vrrpMu.Unlock()
+		s.setVRRPRefused(ctx, name, "refused")
+	}
+	dials := 0
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		dials++
+		return servingPeer{serves: map[string]bool{"b": true}}, func() {}, nil
+	}
+	s.checkVRRPServing(ctx)
+	if dials != 1 {
+		t.Fatalf("dialled peer-1 %d times for 3 LBs, want 1", dials)
+	}
+	if s.vrrpPeerServing("a") || !s.vrrpPeerServing("b") || s.vrrpPeerServing("c") {
+		t.Fatal("answers not kept per LB")
+	}
+}
+
+// servingPeer answers CheckLBPresent: serving for the LBs in serves.
+type servingPeer struct {
+	pb.LiteVirtClient
+	serves map[string]bool
+}
+
+func (p servingPeer) CheckLBPresent(_ context.Context, in *pb.CheckLBPresentRequest, _ ...grpc.CallOption) (*pb.CheckLBPresentResponse, error) {
+	return &pb.CheckLBPresentResponse{Present: true, VrrpUnicastServing: p.serves[in.GetLbName()]}, nil
 }

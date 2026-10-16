@@ -4201,9 +4201,11 @@ type CheckLBPresentResponse struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Present bool                   `protobuf:"varint,1,opt,name=present,proto3" json:"present,omitempty"`
 	// vrrp_unicast_serving: the answering host runs keepalived for this LB
-	// from a unicast VRRP config and has not refused the LB's unicast
-	// transport. An earlier build leaves it false. A host that cannot render
-	// the transport stops its own keepalived only when a peer reports this.
+	// from a unicast VRRP config, has not refused the LB's unicast
+	// transport, and can hold the VIP: it still holds its source address on
+	// the device it sends from, and the VIP's device is up with carrier. An
+	// earlier build leaves it false. A host that cannot render the transport
+	// stops its own keepalived only when a peer reports this.
 	VrrpUnicastServing bool `protobuf:"varint,2,opt,name=vrrp_unicast_serving,json=vrrpUnicastServing,proto3" json:"vrrp_unicast_serving,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache

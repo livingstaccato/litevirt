@@ -1617,30 +1617,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	//   - Secure Boot: the secboot/MS OVMF pair (resolved above).
 	// Asserted now, before the container checker starts, and re-asserted every
 	// capabilityLabelInterval (keepCapabilityLabels says why).
+	tpmAvailable := func() bool {
+		_, errSwtpm := exec.LookPath("swtpm")
+		_, errSetup := exec.LookPath("swtpm_setup")
+		return errSwtpm == nil && errSetup == nil
+	}
 	capabilityLabels := []capabilityLabel{
 		{key: corrosion.LabelLXCCapable, capable: lxc.Available},
-		{key: corrosion.LabelTPMCapable, capable: func() bool {
-			_, errSwtpm := exec.LookPath("swtpm")
-			_, errSetup := exec.LookPath("swtpm_setup")
-			return errSwtpm == nil && errSetup == nil
-		}},
+		{key: corrosion.LabelTPMCapable, capable: tpmAvailable},
 		{key: corrosion.LabelSecureBootCapable, capable: firmwarePaths.SecureBootAvailable},
-		{key: corrosion.LabelFwLiveMigrate, capable: func() bool {
-			probe := libvirt.NewFirmwareCodeProbe(d.fwStore, firmwarePaths, d.virt.LibvirtVersion)
-			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-			defer cancel()
-			return fwLiveMigrateCapable(ctx, fwLiveInputs{
-				enabled: d.cfg.Migration.LiveFirmwareEnabled(),
-				tpm: func() bool {
-					_, errSwtpm := exec.LookPath("swtpm")
-					_, errSetup := exec.LookPath("swtpm_setup")
-					return errSwtpm == nil && errSetup == nil
-				},
-				secureBoot: firmwarePaths.SecureBootAvailable,
-				installed:  probe.Installed,
-				guests:     CheckLibvirtGuests,
-			})
-		}},
+		{key: corrosion.LabelFwLiveMigrate, capable: newFwLiveLabel(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmAvailable)},
 	}
 	asserted, err := assertCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels)
 	if err != nil {

@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/libvirt"
 )
@@ -123,16 +125,143 @@ func TestFwLiveMigrateLabel_LibvirtGuests(t *testing.T) {
 	}
 }
 
-// The label rides the capability list the daemon publishes.
+// The label rides the capability list the daemon publishes, built by
+// newFwLiveLabel from the daemon's own config (comments do not count).
 //
-// Mutation: remove the fw_live_migrate entry from daemon.go's list — red.
+// Mutation: remove or comment out the entry in daemon.go's list, or hand it
+// another config - red.
 func TestFwLiveMigrateLabel_InDaemonList(t *testing.T) {
 	src, err := os.ReadFile("daemon.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(src), "key: corrosion.LabelFwLiveMigrate") {
-		t.Fatal("daemon.go's capability label list has no litevirt.fw_live_migrate entry")
+	found := false
+	for _, l := range strings.Split(string(src), "\n") {
+		if t := strings.TrimSpace(l); !strings.HasPrefix(t, "//") &&
+			strings.Contains(t, "key: corrosion.LabelFwLiveMigrate, capable: newFwLiveLabel(d.cfg.Migration,") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("daemon.go's capability label list has no litevirt.fw_live_migrate entry built by newFwLiveLabel(d.cfg.Migration, ...)")
+	}
+}
+
+func okHost() fwLiveHost {
+	return fwLiveHost{
+		tpm:        func() bool { return true },
+		secureBoot: func() bool { return true },
+		installed:  func(context.Context) (libvirt.InstalledFirmwareCode, error) { return okInstalled() },
+		guests:     func(context.Context) error { return nil },
+	}
+}
+
+// The label probe as the daemon builds it: each precondition alone makes it
+// false, and all of them make it true.
+//
+// Mutations: hardcode enabled true - the config-off row goes red; hardcode the
+// probe's result true - every false row goes red; hardcode it false - the
+// all-true row goes red; swap tpm and secureBoot - the two missing rows go red.
+func TestFwLiveLabelProbe(t *testing.T) {
+	off := false
+	cases := []struct {
+		name string
+		cfg  MigrationConfig
+		set  func(*fwLiveHost)
+		want bool
+	}{
+		{"all preconditions", MigrationConfig{}, func(*fwLiveHost) {}, true},
+		{"config on explicitly", MigrationConfig{LiveFirmware: func() *bool { b := true; return &b }()}, func(*fwLiveHost) {}, true},
+		{"config off", MigrationConfig{LiveFirmware: &off}, func(*fwLiveHost) {}, false},
+		{"guests not safe", MigrationConfig{}, func(h *fwLiveHost) { h.guests = func(context.Context) error { return errors.New("saves guests") } }, false},
+		{"tpm missing", MigrationConfig{}, func(h *fwLiveHost) { h.tpm = func() bool { return false } }, false},
+		{"secure boot missing", MigrationConfig{}, func(h *fwLiveHost) { h.secureBoot = func() bool { return false } }, false},
+		{"installed unreadable", MigrationConfig{}, func(h *fwLiveHost) {
+			h.installed = func(context.Context) (libvirt.InstalledFirmwareCode, error) {
+				return libvirt.InstalledFirmwareCode{}, errors.New("x")
+			}
+		}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := okHost()
+			c.set(&h)
+			if got := fwLiveLabelProbe(c.cfg, h)(); got != c.want {
+				t.Fatalf("probe = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// A wedged libvirtd (its version call never returns) makes the host not
+// capable, within the bound, and the next probe does not pile up behind it.
+//
+// Mutations: call fn directly in boundedVersion - the test hangs and goes red;
+// drop the in-flight guard - the second-call row goes red; return a stale
+// success on timeout - the first row goes red.
+func TestBoundedVersion_WedgedLibvirtIsNotCapable(t *testing.T) {
+	release := make(chan struct{})
+	calls := 0
+	var mu sync.Mutex
+	wedged := func() (uint64, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		<-release
+		return 10000000, nil
+	}
+	bv := boundedVersion(50*time.Millisecond, wedged)
+	start := time.Now()
+	if _, err := bv(); err == nil {
+		t.Fatal("a wedged version call returned no error")
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatalf("the wedged call was not bounded: %v", time.Since(start))
+	}
+	start = time.Now()
+	if _, err := bv(); err == nil || time.Since(start) > 40*time.Millisecond {
+		t.Fatalf("second call while the first is blocked: err %v after %v, want an immediate error", err, time.Since(start))
+	}
+	mu.Lock()
+	if calls != 1 {
+		t.Errorf("fn called %d times while wedged, want 1", calls)
+	}
+	mu.Unlock()
+	close(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if v, err := bv(); err == nil && v == 10000000 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("bounded version never recovered after libvirtd answered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// Through the label: a wedged version call is "not capable", and the probe
+// returns (the loop continues).
+//
+// Mutation: pass the raw version func (unbounded) to the probe - it hangs.
+func TestFwLiveLabel_WedgedVersionIsFalse(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	bv := boundedVersion(50*time.Millisecond, func() (uint64, error) { <-release; return 10000000, nil })
+	h := okHost()
+	h.installed = func(context.Context) (libvirt.InstalledFirmwareCode, error) {
+		_, err := bv()
+		return libvirt.InstalledFirmwareCode{}, err
+	}
+	done := make(chan bool, 1)
+	go func() { done <- fwLiveLabelProbe(MigrationConfig{}, h)() }()
+	select {
+	case got := <-done:
+		if got {
+			t.Fatal("capable with libvirt wedged")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the probe did not return")
 	}
 }
 

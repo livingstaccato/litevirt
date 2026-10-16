@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
@@ -10,15 +9,16 @@ import (
 	"time"
 )
 
-// libvirtGuestsFile is the sysconfig file of libvirt's libvirt-guests unit.
-const libvirtGuestsFile = "/etc/default/libvirt-guests"
+// libvirtGuestsFiles are the sysconfig files of libvirt's libvirt-guests unit.
+// (Debian family; RHEL family keeps it under /etc/sysconfig).
+var libvirtGuestsFiles = []string{"/etc/default/libvirt-guests", "/etc/sysconfig/libvirt-guests"}
 
 // libvirtGuests reads whether libvirt-guests would save or restore guests
 // behind litevirt's back (D-9): the unit enabled or active, with
 // ON_SHUTDOWN=suspend or ON_BOOT=start. Keys the file does not set take the
 // unit's defaults, which are suspend and start.
 type libvirtGuests struct {
-	File string
+	Files []string // the first that exists is read
 	// unit answers `systemctl <verb> libvirt-guests.service`: its trimmed
 	// stdout, or an error when there is none.
 	unit func(ctx context.Context, verb string) (string, error)
@@ -29,7 +29,7 @@ type libvirtGuests struct {
 // fails closed: an unreadable file or unit state refuses. The source's stage A
 // and the target's Prepare call it; the label asserts it too.
 func CheckLibvirtGuests(ctx context.Context) error {
-	return libvirtGuests{File: libvirtGuestsFile, unit: systemctlUnit}.Check(ctx)
+	return libvirtGuests{Files: libvirtGuestsFiles, unit: systemctlUnit}.Check(ctx)
 }
 
 func systemctlUnit(ctx context.Context, verb string) (string, error) {
@@ -72,25 +72,27 @@ func (g libvirtGuests) Check(ctx context.Context) error {
 		return nil
 	}
 	onShutdown, onBoot := "suspend", "start"
-	switch b, err := os.ReadFile(g.File); {
-	case err == nil:
-		sc := bufio.NewScanner(strings.NewReader(string(b)))
-		for sc.Scan() {
-			k, v, ok := strings.Cut(strings.TrimSpace(sc.Text()), "=")
-			if !ok {
-				continue
+	for _, f := range g.Files {
+		b, err := os.ReadFile(f)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("libvirt-guests: %s unreadable: %w", f, err)
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			k, v, ok, err := shellAssignment(line)
+			if err != nil {
+				return fmt.Errorf("libvirt-guests: %s: %w", f, err)
 			}
-			v = strings.Trim(strings.TrimSpace(v), `"'`)
-			switch strings.TrimSpace(k) {
-			case "ON_SHUTDOWN":
+			switch {
+			case ok && k == "ON_SHUTDOWN":
 				onShutdown = v
-			case "ON_BOOT":
+			case ok && k == "ON_BOOT":
 				onBoot = v
 			}
 		}
-	case os.IsNotExist(err):
-	default:
-		return fmt.Errorf("libvirt-guests: %s unreadable: %w", g.File, err)
+		break // the first file that exists is the one the unit sources
 	}
 	if onShutdown == "suspend" {
 		return fmt.Errorf("libvirt-guests is enabled with ON_SHUTDOWN=suspend: it would save guests at shutdown (set ON_SHUTDOWN=shutdown or disable the unit)")
@@ -99,4 +101,56 @@ func (g libvirtGuests) Check(ctx context.Context) error {
 		return fmt.Errorf("libvirt-guests is enabled with ON_BOOT=start: it would start guests at boot outside litevirt (set ON_BOOT=ignore or disable the unit)")
 	}
 	return nil
+}
+
+// shellAssignment reads one line of the sysconfig file as a shell would for
+// KEY=value: blank lines, comments and non-assignments are ok=false; an
+// optional leading `export`; a quoted value runs to its closing quote; an
+// unquoted one ends at whitespace, so a trailing `# comment` is not part of
+// it. A value it cannot read the way a shell would (expansions, escapes, an
+// unclosed quote, trailing words) is an error, never a guess: the caller
+// refuses.
+func shellAssignment(line string) (key, val string, ok bool, err error) {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return "", "", false, nil
+	}
+	if rest, found := strings.CutPrefix(line, "export"); found && rest != "" && (rest[0] == ' ' || rest[0] == '\t') {
+		line = strings.TrimSpace(rest)
+	}
+	k, v, found := strings.Cut(line, "=")
+	if !found || k == "" || strings.ContainsAny(k, " \t") {
+		return "", "", false, nil
+	}
+	if k != "ON_SHUTDOWN" && k != "ON_BOOT" {
+		return "", "", false, nil
+	}
+	if v == "" {
+		return k, "", true, nil
+	}
+	if q := v[0]; q == '"' || q == '\'' {
+		end := strings.IndexByte(v[1:], q)
+		if end < 0 {
+			return "", "", false, fmt.Errorf("%s: unclosed quote", k)
+		}
+		val, rest := v[1:1+end], strings.TrimSpace(v[2+end:])
+		if rest != "" && !strings.HasPrefix(rest, "#") && !strings.HasPrefix(rest, ";") {
+			return "", "", false, fmt.Errorf("%s: unreadable value %q", k, v)
+		}
+		if strings.ContainsAny(val, "$`\\") {
+			return "", "", false, fmt.Errorf("%s: unreadable value %q", k, v)
+		}
+		return k, val, true, nil
+	}
+	if i := strings.IndexAny(v, " \t"); i >= 0 {
+		rest := strings.TrimSpace(v[i:])
+		if !strings.HasPrefix(rest, "#") {
+			return "", "", false, fmt.Errorf("%s: unreadable value %q", k, v)
+		}
+		v = v[:i]
+	}
+	if strings.ContainsAny(v, "$`\\\"';&|<>(){}*?~") {
+		return "", "", false, fmt.Errorf("%s: unreadable value %q", k, v)
+	}
+	return k, v, true, nil
 }

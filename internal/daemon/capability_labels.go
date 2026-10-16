@@ -2,9 +2,11 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -195,4 +197,69 @@ func parseXYZ(v string) ([3]int, bool) {
 		out[i] = n
 	}
 	return out, true
+}
+
+// fwLiveProbeTimeout bounds the whole label probe, and the libvirt version
+// call inside it.
+const fwLiveProbeTimeout = 15 * time.Second
+
+// fwLiveHost are the host-side probes behind litevirt.fw_live_migrate.
+type fwLiveHost struct {
+	tpm, secureBoot func() bool
+	installed       func(ctx context.Context) (libvirt.InstalledFirmwareCode, error)
+	guests          func(ctx context.Context) error
+}
+
+// fwLiveLabelProbe is the probe of the litevirt.fw_live_migrate label: the
+// whole condition list of fwLiveMigrateCapable, bounded in time. A probe that
+// outlives its bound is "not capable", and the label loop goes on.
+func fwLiveLabelProbe(cfg MigrationConfig, h fwLiveHost) func() bool {
+	return func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), fwLiveProbeTimeout)
+		defer cancel()
+		return fwLiveMigrateCapable(ctx, fwLiveInputs{
+			enabled: cfg.LiveFirmwareEnabled(), tpm: h.tpm, secureBoot: h.secureBoot,
+			installed: h.installed, guests: h.guests,
+		})
+	}
+}
+
+// newFwLiveLabel is the production probe: this host's installed firmware code,
+// read with the libvirt version call bounded, and the live D-9 check.
+func newFwLiveLabel(cfg MigrationConfig, store *libvirt.FirmwareStore, fp libvirt.FirmwarePaths,
+	libvirtVersion func() (uint64, error), tpm func() bool) func() bool {
+	probe := libvirt.NewFirmwareCodeProbe(store, fp, boundedVersion(fwLiveProbeTimeout, libvirtVersion))
+	return fwLiveLabelProbe(cfg, fwLiveHost{
+		tpm: tpm, secureBoot: fp.SecureBootAvailable,
+		installed: probe.Installed, guests: CheckLibvirtGuests,
+	})
+}
+
+// boundedVersion calls fn with a deadline. A call that does not return in
+// time is an error (the host counts as not capable), and while it is still
+// blocked a later call fails at once rather than piling up another goroutine
+// behind a wedged libvirtd.
+func boundedVersion(timeout time.Duration, fn func() (uint64, error)) func() (uint64, error) {
+	var inflight atomic.Bool
+	return func() (uint64, error) {
+		if !inflight.CompareAndSwap(false, true) {
+			return 0, errors.New("libvirt version: an earlier call has not returned")
+		}
+		type res struct {
+			v   uint64
+			err error
+		}
+		ch := make(chan res, 1)
+		go func() {
+			defer inflight.Store(false)
+			v, err := fn()
+			ch <- res{v, err}
+		}()
+		select {
+		case r := <-ch:
+			return r.v, r.err
+		case <-time.After(timeout):
+			return 0, errors.New("libvirt version: timed out")
+		}
+	}
 }

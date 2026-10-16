@@ -1037,7 +1037,7 @@ when it is on, the host has vTPM and Secure Boot support (`litevirt.tpm` and
 `litevirt.secureboot` are `true`), the installed libvirt is at least 10.0.0,
 QEMU 8.2.2, swtpm 0.7.3 and libtpms 0.9.3, and `libvirt-guests` does not save or
 restore guests (the unit enabled or active with `ON_SHUTDOWN=suspend` or
-`ON_BOOT=start`; keys the file does not set default to those values). A version
+`ON_BOOT=start`; read from `/etc/default/libvirt-guests`, else `/etc/sysconfig/libvirt-guests`; keys the file does not set, and values that cannot be read as a plain shell assignment, count as unsafe). A version
 that cannot be read counts as below the floor. The label is advisory: each
 condition is checked again when a move starts.
 

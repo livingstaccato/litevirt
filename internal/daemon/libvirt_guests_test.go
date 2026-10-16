@@ -12,7 +12,7 @@ import (
 func guestsCheck(t *testing.T, file *string, unit string, unitErr error) error {
 	t.Helper()
 	g := libvirtGuests{
-		File: filepath.Join(t.TempDir(), "libvirt-guests"),
+		Files: []string{filepath.Join(t.TempDir(), "libvirt-guests")},
 		unit: func(_ context.Context, verb string) (string, error) {
 			if unitErr != nil {
 				return "", unitErr
@@ -24,7 +24,7 @@ func guestsCheck(t *testing.T, file *string, unit string, unitErr error) error {
 		},
 	}
 	if file != nil {
-		if err := os.WriteFile(g.File, []byte(*file), 0o644); err != nil {
+		if err := os.WriteFile(g.Files[0], []byte(*file), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -56,6 +56,18 @@ func TestLibvirtGuests(t *testing.T) {
 		{"enabled, file absent: defaults", nil, "enabled", nil, true},
 		{"enabled-runtime counts", str("ON_BOOT=start\n"), "enabled-runtime", nil, true},
 		{"last assignment wins", str("ON_SHUTDOWN=suspend\nON_SHUTDOWN=shutdown\nON_BOOT=ignore\n"), "enabled", nil, false},
+		{"inline comment after suspend", str("ON_SHUTDOWN=suspend # keep\nON_BOOT=ignore\n"), "enabled", nil, true},
+		{"inline comment after start, quoted", str("ON_SHUTDOWN=shutdown\nON_BOOT=\"start\" # c\n"), "enabled", nil, true},
+		{"export prefix", str("export ON_SHUTDOWN=suspend\nexport ON_BOOT=ignore\n"), "enabled", nil, true},
+		{"export prefix, safe values", str("export ON_SHUTDOWN=shutdown\nexport ON_BOOT=ignore # c\n"), "enabled", nil, false},
+		{"indented assignment", str("  ON_SHUTDOWN=shutdown\n\tON_BOOT=ignore\n"), "enabled", nil, false},
+		{"expansion refused", str("ON_SHUTDOWN=$X\nON_BOOT=ignore\n"), "enabled", nil, true},
+		{"unclosed quote refused", str("ON_SHUTDOWN=shutdown\nON_BOOT=\"ignore\n"), "enabled", nil, true},
+		{"trailing word refused", str("ON_SHUTDOWN=shutdown\nON_BOOT=ignore now\n"), "enabled", nil, true},
+		{"later expansion overrides a safe value", str("ON_SHUTDOWN=shutdown\nON_BOOT=ignore\nON_BOOT=$X\n"), "enabled", nil, true},
+		{"later trailing word overrides a safe value", str("ON_SHUTDOWN=shutdown\nON_BOOT=ignore\nON_BOOT=ignore now\n"), "enabled", nil, true},
+		{"later quoted trailing word", str("ON_SHUTDOWN=shutdown\nON_BOOT=ignore\nON_BOOT=\"ignore\" now\n"), "enabled", nil, true},
+		{"later quoted expansion overrides a safe value", str("ON_SHUTDOWN=shutdown\nON_BOOT=ignore\nON_BOOT=\"$X\"\n"), "enabled", nil, true},
 		{"unit state unreadable", str("ON_SHUTDOWN=shutdown\nON_BOOT=ignore\n"), "", errors.New("systemctl: exec failed"), true},
 		{"unit state unrecognised", str("ON_SHUTDOWN=shutdown\nON_BOOT=ignore\n"), "weird", nil, true},
 	}
@@ -75,8 +87,8 @@ func TestLibvirtGuests(t *testing.T) {
 func TestLibvirtGuests_UnreadableFileRefuses(t *testing.T) {
 	dir := t.TempDir()
 	g := libvirtGuests{
-		File: dir, // a directory: reading it is an error that is not ENOENT
-		unit: func(context.Context, string) (string, error) { return "enabled", nil },
+		Files: []string{dir}, // a directory: reading it is an error that is not ENOENT
+		unit:  func(context.Context, string) (string, error) { return "enabled", nil },
 	}
 	err := g.Check(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "unreadable") {
@@ -89,7 +101,7 @@ func TestLibvirtGuests_UnreadableFileRefuses(t *testing.T) {
 // Mutation: drop the is-active read — red.
 func TestLibvirtGuests_ActiveUnitCounts(t *testing.T) {
 	g := libvirtGuests{
-		File: filepath.Join(t.TempDir(), "absent"),
+		Files: []string{filepath.Join(t.TempDir(), "absent")},
 		unit: func(_ context.Context, verb string) (string, error) {
 			if verb == "is-active" {
 				return "active", nil
@@ -99,5 +111,41 @@ func TestLibvirtGuests_ActiveUnitCounts(t *testing.T) {
 	}
 	if err := g.Check(context.Background()); err == nil {
 		t.Fatal("an active libvirt-guests unit with default actions passed")
+	}
+}
+
+// RHEL family: the unit reads /etc/sysconfig/libvirt-guests, and the first
+// file that exists is the one read.
+//
+// Mutations: read only the first path - the sysconfig row goes red; read every
+// file (later wins) - the first-wins row goes red.
+func TestLibvirtGuests_SysconfigPath(t *testing.T) {
+	dir := t.TempDir()
+	deb, rh := filepath.Join(dir, "default"), filepath.Join(dir, "sysconfig")
+	unit := func(_ context.Context, verb string) (string, error) {
+		if verb == "is-enabled" {
+			return "enabled", nil
+		}
+		return "inactive", nil
+	}
+	g := libvirtGuests{Files: []string{deb, rh}, unit: unit}
+	if err := os.WriteFile(rh, []byte("ON_SHUTDOWN=shutdown\nON_BOOT=ignore\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Check(context.Background()); err != nil {
+		t.Fatalf("sysconfig file with safe values refused: %v", err)
+	}
+	if err := os.WriteFile(rh, []byte("ON_SHUTDOWN=suspend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Check(context.Background()); err == nil {
+		t.Fatal("sysconfig file with ON_SHUTDOWN=suspend passed")
+	}
+	// The Debian file exists: it alone is read.
+	if err := os.WriteFile(deb, []byte("ON_SHUTDOWN=shutdown\nON_BOOT=ignore\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Check(context.Background()); err != nil {
+		t.Fatalf("the first existing file is not the one read: %v", err)
 	}
 }

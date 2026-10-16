@@ -878,7 +878,9 @@ firewall tag; copy one over with `lv firewall tag set`.
   `<x>_v6` while a group `<x>` exists keeps its bindings, but its set cannot
   be declared, so its accepts match nothing and its drops lose their address.
   Each raises `firewall.tag_group.unreadable` (critical).
-- A negated accept on a group's set (`!= @lv_tg_<name>`) is never rendered.
+- A negated accept on a group's set (`!= @lv_tg_<name>`) is never rendered;
+  a negated drop or reject on a group this host does not render denies
+  everyone it names.
   A user ip set named `lv_tg_*` is left out.
 - `litevirt_firewall_tag_group_members{group}` counts each group's members
   in this host's view.

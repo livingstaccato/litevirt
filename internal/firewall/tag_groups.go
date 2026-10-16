@@ -194,7 +194,8 @@ func loadTagGroups(ctx context.Context, db *corrosion.Client, host string, now t
 			// this group too would make nft refuse the whole ruleset. Its
 			// bindings need no set and are rendered.
 			t.whyNot[g.Name] = fmt.Sprintf("its set would be the IPv6 companion of group %q's", strings.TrimSuffix(g.Name, ipv6SetSuffix))
-			t.report.Members[g.Name] = 0
+			// Its bindings apply to its real members (re-review m-B).
+			t.report.Members[g.Name] = len(v.Members)
 			t.report.Unreadable = append(t.report.Unreadable, TagGroupRef{Group: g.Name, Reason: t.whyNot[g.Name], Handling: TagHandlingShadowed})
 		case v.Kept:
 			t.readable[g.Name] = true
@@ -375,6 +376,15 @@ func (t *tagPass) rule(q *quarantine, table, id, direction, proto, port, cidr, a
 		default:
 			t.refer(table, id, name, action, TagHandlingLeftOut)
 			return Rule{}, false
+		}
+	}
+	if set, isRef := rulefield.SetRef(cidr); isRef && rulefield.NegatedSetRef(cidr) && !isAccept(action) {
+		if g, isTag := strings.CutPrefix(set, TagGroupSetPrefix); isTag && !t.readable[g] {
+			// "Deny all not in" a group this pass does not render: whom it
+			// spares is unknown, so it denies everyone, as a tag: deny does
+			// (D4 re-review I-A). Left out, it would deny no one.
+			t.refer(table, id, g, action, TagHandlingNoAddress)
+			cidr = ""
 		}
 	}
 	r, ok := q.rule(table, id, direction, proto, port, cidr, action, comment)

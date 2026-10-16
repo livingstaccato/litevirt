@@ -351,6 +351,10 @@ func TestTagGroupLoader_AGroupNamedLikeAnotherGroupsV6Companion(t *testing.T) {
 	if got := planNIC(t, plan, "tap1").SecurityGroups; !slices.Equal(got, []string{"v6-in"}) {
 		t.Errorf("tap1 = %v: the shadowed group's binding was dropped", got)
 	}
+	// And its member count is its real one (D4 re-review m-B).
+	if got := plan.TagGroups.Members["web_v6"]; got != 1 {
+		t.Errorf("web_v6 members = %d, want 1", got)
+	}
 }
 
 // A NIC's bound groups are its own plus those of every group it is a member
@@ -690,5 +694,41 @@ func TestTagGroupLoader_ANegatedAcceptOnAGroupsSetIsLeftOut(t *testing.T) {
 	}
 	if len(plan.InvalidRows) != 1 || plan.InvalidRows[0].ID != "c1" {
 		t.Errorf("invalid rows %+v, want c1", plan.InvalidRows)
+	}
+}
+
+// A negated deny on a group's set this pass does not render — missing, or
+// unreadable and never read here — means "deny everyone not in an unknown
+// group": it renders without its address, denying everyone, as a tag: deny
+// does (D4 re-review I-A). Left out, it would deny no one.
+//
+// Mutation: no such branch (the row is left out) — red.
+func TestTagGroupLoader_ANegatedDenyOnAGroupNotRenderedDeniesEveryone(t *testing.T) {
+	for _, tc := range []struct{ name, group string }{{"missing", ""}, {"never read", `{"match":`}} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newTGLab(t)
+			if tc.group != "" {
+				l.group("g", tc.group)
+			}
+			l.clusterRule("c1", "tcp", "22", "!= @lv_tg_g", "drop")
+			load := l.loader("host-a", nil)
+			plan, script := l.load(load)
+			if !strings.Contains(script, "tcp dport 22 drop") || strings.Contains(script, "lv_tg_g ") || strings.Contains(script, "@lv_tg_g") {
+				t.Errorf("the negated drop on a group not rendered:\n%s", script)
+			}
+			if len(plan.InvalidRows) != 0 {
+				t.Errorf("reported as invalid rows: %+v", plan.InvalidRows)
+			}
+			l.now = l.now.Add(emptySetGrace)
+			plan, _ = l.load(load)
+			refs := append(plan.TagGroups.Missing, plan.TagGroups.Unreadable...)
+			found := false
+			for _, r := range refs {
+				found = found || (r.ID == "c1" && r.Group == "g" && r.Handling == TagHandlingNoAddress)
+			}
+			if !found {
+				t.Errorf("not reported: %+v", refs)
+			}
+		})
 	}
 }

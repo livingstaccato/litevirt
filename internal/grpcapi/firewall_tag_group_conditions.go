@@ -42,7 +42,8 @@ func (s *Server) recordTagGroupState(ctx context.Context, r firewall.TagGroupRep
 	s.setFirewallCondition(ctx, CondFirewallTagGroupUnreadable, len(r.Unreadable) > 0, corrosion.SeverityCritical, unreadable)
 	s.setFirewallCondition(ctx, CondFirewallTagsUnreadable, len(r.TagsUnreadable) > 0, corrosion.SeverityCritical,
 		tagHoldsText("firewall-tags rows that cannot be read grant no membership; the workload's NICs are held at drop "+
-			"on the networks a tag group binds security groups on (all of them while a drop or reject rule names a tag group). "+
+			"on the networks a tag group binds security groups on (all of them while a drop or reject rule names a tag group, "+
+			"or every network while a tag group cannot be read). "+
 			"Set the tags again with lv firewall tag set", r.TagsUnreadable))
 	s.setFirewallCondition(ctx, CondFirewallTagIdentityShared, len(r.SharedIdentity) > 0, corrosion.SeverityCritical,
 		tagHoldsText("workloads share a firewall identity with another live workload (a copy): neither is a member of any tag group, "+

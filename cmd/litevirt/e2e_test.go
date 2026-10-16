@@ -39,6 +39,9 @@ type mockClient struct {
 	// firewall management calls) are satisfied without a hand-written stub.
 	pb.LiteVirtClient
 
+	// listLBsResp, when set, is what ListLoadBalancers returns.
+	listLBsResp *pb.ListLBResponse
+
 	// The backup requests the repo paths were called with, and whether the
 	// retired raw stream RPCs were.
 	backupSnapshotReq    *pb.BackupSnapshotRequest
@@ -399,6 +402,9 @@ func (m *mockClient) DeleteSnapshot(_ context.Context, in *pb.DeleteSnapshotRequ
 // ── Load Balancers ──
 
 func (m *mockClient) ListLoadBalancers(_ context.Context, _ *emptypb.Empty, _ ...grpc.CallOption) (*pb.ListLBResponse, error) {
+	if m.listLBsResp != nil {
+		return m.listLBsResp, nil
+	}
 	return &pb.ListLBResponse{}, nil
 }
 func (m *mockClient) InspectLoadBalancer(_ context.Context, _ *pb.InspectLBRequest, _ ...grpc.CallOption) (*pb.LoadBalancer, error) {

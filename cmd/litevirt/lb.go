@@ -44,14 +44,18 @@ func newLBLsCmd() *cobra.Command {
 				}
 
 				w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-				fmt.Fprintf(w, "NAME\tVIP\tALGORITHM\tSTATE\tBACKENDS\tSTACK\n")
+				fmt.Fprintf(w, "NAME\tVIP\tALGORITHM\tSTATE\tBACKENDS\tSTACK\tSNAT\n")
 				for _, lb := range resp.Lbs {
 					stack := lb.StackName
 					if stack == "" {
 						stack = "-"
 					}
-					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\n",
-						lb.Name, lb.Vip, lb.Algorithm, lb.State, len(lb.Backends), stack)
+					snat := "off"
+					if lb.Snat {
+						snat = "on"
+					}
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
+						lb.Name, lb.Vip, lb.Algorithm, lb.State, len(lb.Backends), stack, snat)
 				}
 				return w.Flush()
 			})

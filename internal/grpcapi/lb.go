@@ -38,9 +38,16 @@ func (s *Server) ListLoadBalancers(ctx context.Context, _ *emptypb.Empty) (*pb.L
 
 	resp := &pb.ListLBResponse{}
 	for _, r := range rows {
-		snat, err := s.lbSNAT(ctx, r.String("name"), r.String("stack_name"), r.String("generation"))
+		lookup := s.lbSNAT
+		if s.lbListSNATOverride != nil {
+			lookup = s.lbListSNATOverride
+		}
+		snat, err := lookup(ctx, r.String("name"), r.String("stack_name"), r.String("generation"))
 		if err != nil {
-			return nil, status.Errorf(codes.Unavailable, "%v", err)
+			// snat is display-only here: one LB's failed lookup is logged and
+			// that LB listed with it unset, not the whole list failed.
+			slog.Warn("ListLoadBalancers: snat lookup failed; listing the LB with snat unset", "lb", r.String("name"), "error", err)
+			snat = false
 		}
 		algo := r.String("algorithm")
 		if algo == "" {

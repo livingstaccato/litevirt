@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -234,5 +235,39 @@ func TestExplicitLB_SettingNotRecordable(t *testing.T) {
 	_, err = s.UpdateLoadBalancer(adminCtx(), &pb.UpdateLBRequest{Name: "shop-lb", Snat: proto.Bool(true)})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Errorf("update --snat on a stack LB: %v, want InvalidArgument", err)
+	}
+}
+
+// TestListLoadBalancers_OneFailingSNATLookupDoesNotFailTheList: snat is a
+// display-only field of the list, so an LB whose lookup errors is listed with
+// snat unset and every other LB is listed normally.
+//
+// Mutation (red): ListLoadBalancers returns the lookup's error again.
+func TestListLoadBalancers_OneFailingSNATLookupDoesNotFailTheList(t *testing.T) {
+	s := explicitSNATServer(t, true)
+	createExplicitLB(t, s, "good", "10.202.0.250/24", true)
+	createExplicitLB(t, s, "broken", "10.202.0.251/24", true)
+	s.lbListSNATOverride = func(ctx context.Context, name, stack, gen string) (bool, error) {
+		if name == "broken" {
+			return false, errors.New("read cluster_policies: database is locked")
+		}
+		return s.lbSNAT(ctx, name, stack, gen)
+	}
+	resp, err := s.ListLoadBalancers(adminCtx(), nil)
+	if err != nil {
+		t.Fatalf("ListLoadBalancers failed for one LB's snat lookup: %v", err)
+	}
+	got := map[string]bool{}
+	for _, l := range resp.Lbs {
+		got[l.Name] = l.Snat
+	}
+	if len(got) != 2 {
+		t.Fatalf("listed %v, want both LBs", got)
+	}
+	if !got["good"] {
+		t.Error("good: snat lost because another LB's lookup failed")
+	}
+	if got["broken"] {
+		t.Error("broken: snat reported on although its lookup failed")
 	}
 }

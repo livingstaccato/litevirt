@@ -151,6 +151,7 @@ drive a local `lv`).
 | `E2E_LAB_NODES` | `5` | nodes are `node-1`..`node-N` |
 | `E2E_LAB_EXCLUDE` | (none) | comma-separated node numbers (`3`, `2,4`) the harness leaves alone: they are not baselined, restored, powered on or picked, and are ignored in the voter-set check. For a lab with a node deliberately frozen or wedged |
 | `E2E_LAB_SOCKET_DIR` | `<user cache dir>/litevirt-e2e-ssh` | where the SSH control sockets are made, outside the lab checkout; keep it short, since unix socket paths cap near 100 characters |
+| `E2E_LAB_PREFIX` | `10.77.0` | the first three octets of the lab's IPv4 /24; node N is `<prefix>.(10+N)`. Lab 2 is `10.78.0`, lab 3 `10.79.0`. A malformed value fails the run |
 | `E2E_LAB_PORT_BASE` | `2230` | node N's SSH is `127.0.0.1:(base+N)` |
 | `E2E_EVIDENCE_DIR` | (none) | per drill: `samples.log` (every sample), `timeline.txt`, extra evidence |
 | `E2E_DRILL_IMAGE` / `E2E_DRILL_MEMORY` | `cirros` / `128M` | the drills' own test VMs |

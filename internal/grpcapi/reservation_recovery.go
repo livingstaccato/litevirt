@@ -27,7 +27,9 @@ const (
 	reservationSweepEvaluator = "reservation-sweep"
 	// CondReservationStale is raised by a node about itself while a reservation
 	// counted against it is older than its operation kind's expected bound and
-	// the sweep cannot release it. Resolved by the first pass with none.
+	// the sweep cannot release it, or its data cannot be read. Resolved by the
+	// first pass with none. For a removed host the deputy (the smallest active
+	// host) raises and resolves it under the removed host's subject.
 	CondReservationStale = "reservation_stale"
 	// reservationStaleListed caps the reservations the condition's evidence
 	// names; `count` always carries the total.
@@ -46,7 +48,18 @@ const (
 		"<operation-id> --force (admin, audited), which writes a failed step at the header's owner epoch instead"
 	remedyReleaseFailed = "the sweep could not write its release row and retries every pass; the daemon log " +
 		"names the error (reservation sweep: could not release a reservation)"
+	remedyUnreadable = "its reservation data (vector, project binding or authority facts) cannot be read, so the " +
+		"sweep neither classifies nor releases it and lv operation release-reservation refuses it; the daemon log " +
+		"names the error (reservation sweep: a reservation could not be read)"
+	remedyRemovedHost = "its host is removed, so no sweep releases it, and it counts against its project quota " +
+		"until it is released: check with lv operation show <vm> (lv ct inspect <container> for a container) that " +
+		"nothing is running, then release it with lv operation release-reservation <operation-id> --force " +
+		"(admin, audited), which any node decides for a removed host"
 )
+
+// classUnreadable is the reservation_stale class of a reservation whose data
+// cannot be read.
+const classUnreadable = "unreadable"
 
 // noRunningOperationRemedy is the reservation_stale remedy of a reservation no
 // running operation holds, worded for its workload kind.
@@ -125,7 +138,9 @@ func (s *Server) SweepReservationsOnce(ctx context.Context) (released int) {
 	}
 	st.untrusted = false
 
-	views, err := corrosion.HostReservations(ctx, s.db, "")
+	// The tolerant listing: one reservation whose data cannot be read is
+	// reported and never released, and does not stop the pass for the rest.
+	views, unreadable, err := corrosion.HostReservationsPartial(ctx, s.db, "")
 	if err != nil {
 		slog.Warn("reservation sweep: list host reservations", "error", err)
 		return 0
@@ -144,6 +159,11 @@ func (s *Server) SweepReservationsOnce(ctx context.Context) (released int) {
 
 	releasedIDs := map[string]bool{}
 	faults := map[string]string{} // op id → remedy, for the condition
+	for _, u := range unreadable {
+		s.reservationMetrics.Skipped(classUnreadable)
+		s.noteUnreadableReservation(u)
+		faults[u.OperationID] = remedyUnreadable
+	}
 	for i := range views {
 		v := &views[i]
 		if v.ReleaseBlocked && sweepReleasableClass(v.Class) && s.isReservationWriter(v, loadHosts) {
@@ -167,7 +187,7 @@ func (s *Server) SweepReservationsOnce(ctx context.Context) (released int) {
 			delete(st.faultLogged, op)
 		}
 	}
-	s.publishReservationHealth(ctx, views, releasedIDs, faults)
+	s.publishReservationHealth(ctx, views, unreadable, releasedIDs, faults, loadHosts)
 	return released
 }
 
@@ -292,6 +312,21 @@ func (s *Server) noteReservationFault(v *corrosion.HostReservationView, fault st
 		"fault", fault, "error", err)
 }
 
+// noteUnreadableReservation logs a reservation whose data cannot be read, once
+// per operation.
+func (s *Server) noteUnreadableReservation(u corrosion.UnreadableReservation) {
+	st := &s.resSweep
+	if st.faultLogged == nil {
+		st.faultLogged = map[string]string{}
+	}
+	if st.faultLogged[u.OperationID] == classUnreadable {
+		return
+	}
+	st.faultLogged[u.OperationID] = classUnreadable
+	slog.Error("reservation sweep: a reservation could not be read",
+		"operation_id", u.OperationID, "host", u.TargetHost, "error", u.Err)
+}
+
 // staleReservation is one entry of the reservation_stale condition's evidence.
 type staleReservation struct {
 	OperationID string `json:"operation_id"`
@@ -330,20 +365,50 @@ func reservationExpectedBound(corrosion.OperationKind) time.Duration {
 }
 
 // publishReservationHealth sets this host's reservation gauges and its
-// reservation_stale condition from the pass's listing.
+// reservation_stale condition from the pass's listing. The deputy also keeps
+// the condition of each removed host: nothing else resolves it.
 func (s *Server) publishReservationHealth(ctx context.Context, views []corrosion.HostReservationView,
-	released map[string]bool, faults map[string]string) {
+	unreadable []corrosion.UnreadableReservation, released map[string]bool, faults map[string]string,
+	loadHosts func() ([]corrosion.HostRecord, error)) {
 	now := time.Now()
 	var oldest float64
+	var cpu, mem int
 	var stale []staleReservation
+	removedStale := map[string][]staleReservation{} // removed host → its entries
+	removed, deputy := s.removedHostsForDeputy(loadHosts)
+	entry := func(v *corrosion.HostReservationView, remedy string) staleReservation {
+		return staleReservation{
+			OperationID: v.Op.ID, Method: v.Op.Method, VM: v.VMName,
+			VCPU: v.Vector.TargetCPU, MemoryMiB: v.Vector.TargetMemMiB,
+			CreatedAt: v.Op.CreatedAt, Class: string(v.Class), Remedy: remedy,
+		}
+	}
 	for i := range views {
 		v := &views[i]
-		if v.Vector.TargetHost != s.hostName || released[v.Op.ID] {
+		if released[v.Op.ID] {
 			continue
 		}
 		created, perr := time.Parse(time.RFC3339Nano, v.Op.CreatedAt)
 		createdOK := perr == nil
 		age := now.Sub(created)
+		overdue := createdOK && age > reservationExpectedBound(corrosion.OperationKind(v.Op.OperationKind))
+		target := v.Vector.TargetHost
+		if target != s.hostName {
+			// A removed host's reservation that no sweep releases: a stale
+			// one, one whose VM is gone (only its target would release it),
+			// a blocked one, or one whose deputy release failed.
+			if deputy && removed(target) && overdue && (v.Class == corrosion.ReservationNoRunningOperation ||
+				v.Class == corrosion.ReservationVMGone || v.ReleaseBlocked || faults[v.Op.ID] != "") {
+				remedy := remedyRemovedHost
+				if f := faults[v.Op.ID]; f != "" && !v.ReleaseBlocked {
+					remedy = f
+				}
+				removedStale[target] = append(removedStale[target], entry(v, remedy))
+			}
+			continue
+		}
+		cpu += v.Vector.TargetCPU
+		mem += v.Vector.TargetMemMiB
 		if reservationCountsTowardOldest(v, age) && createdOK && age.Seconds() > oldest {
 			oldest = age.Seconds()
 		}
@@ -358,28 +423,75 @@ func (s *Server) publishReservationHealth(ctx context.Context, views []corrosion
 		default:
 			continue
 		}
-		if !createdOK || age <= reservationExpectedBound(corrosion.OperationKind(v.Op.OperationKind)) {
+		if !overdue {
 			continue
 		}
-		stale = append(stale, staleReservation{
-			OperationID: v.Op.ID, Method: v.Op.Method, VM: v.VMName,
-			VCPU: v.Vector.TargetCPU, MemoryMiB: v.Vector.TargetMemMiB,
-			CreatedAt: v.Op.CreatedAt, Class: string(v.Class), Remedy: remedy,
-		})
+		stale = append(stale, entry(v, remedy))
 	}
-	cpu, mem, err := corrosion.HostReserved(ctx, s.db, s.hostName)
+	for _, u := range unreadable {
+		e := staleReservation{OperationID: u.OperationID, Class: classUnreadable, Remedy: remedyUnreadable}
+		switch {
+		case u.TargetHost == s.hostName:
+			stale = append(stale, e)
+		case deputy && u.TargetHost != "" && removed(u.TargetHost):
+			removedStale[u.TargetHost] = append(removedStale[u.TargetHost], e)
+		}
+	}
+	// The listed rows are exactly what admission counts against this host
+	// (corrosion.HostReservations); with an unreadable row, only the readable.
+	s.reservationMetrics.SetHostReserved(cpu, mem, oldest)
+	s.writeReservationStaleCondition(ctx, s.hostName, stale)
+	if !deputy {
+		return
+	}
+	open, err := corrosion.ListOpenHealthConditionsByCode(ctx, s.db, reservationSweepEvaluator, CondReservationStale)
 	if err != nil {
-		slog.Warn("reservation sweep: read this host's reserved capacity", "error", err)
-	} else {
-		s.reservationMetrics.SetHostReserved(cpu, mem, oldest)
+		slog.Warn("reservation sweep: list reservation_stale conditions", "error", err)
+		return
 	}
-	s.writeReservationStaleCondition(ctx, stale)
+	for _, c := range open {
+		if c.SubjectKind == "host" && c.SubjectID != s.hostName && removed(c.SubjectID) {
+			if _, ok := removedStale[c.SubjectID]; !ok {
+				removedStale[c.SubjectID] = nil
+			}
+		}
+	}
+	for host, entries := range removedStale {
+		s.writeReservationStaleCondition(ctx, host, entries)
+	}
 }
 
-// writeReservationStaleCondition raises, updates or resolves this host's
-// reservation_stale condition. An unchanged open condition writes nothing.
-func (s *Server) writeReservationStaleCondition(ctx context.Context, stale []staleReservation) {
-	row, found, err := corrosion.GetHealthCondition(ctx, s.db, reservationSweepEvaluator, CondReservationStale, "host", s.hostName)
+// removedHostsForDeputy reports whether this node is the deputy — the smallest
+// active host — and, if so, which hosts are removed: no live hosts row, or
+// state removed.
+func (s *Server) removedHostsForDeputy(loadHosts func() ([]corrosion.HostRecord, error)) (removed func(string) bool, deputy bool) {
+	removed = func(string) bool { return false }
+	hosts, err := loadHosts()
+	if err != nil {
+		return removed, false
+	}
+	state := make(map[string]string, len(hosts))
+	smallest := ""
+	for _, h := range hosts {
+		state[h.Name] = h.State
+		if h.State == "active" && (smallest == "" || h.Name < smallest) {
+			smallest = h.Name
+		}
+	}
+	if smallest != s.hostName {
+		return removed, false
+	}
+	return func(name string) bool {
+		st, ok := state[name]
+		return !ok || st == "removed"
+	}, true
+}
+
+// writeReservationStaleCondition raises, updates or resolves host's
+// reservation_stale condition: this host's, or a removed host's for its
+// deputy. An unchanged open condition writes nothing.
+func (s *Server) writeReservationStaleCondition(ctx context.Context, host string, stale []staleReservation) {
+	row, found, err := corrosion.GetHealthCondition(ctx, s.db, reservationSweepEvaluator, CondReservationStale, "host", host)
 	if err != nil {
 		slog.Warn("reservation sweep: read the reservation_stale condition", "error", err)
 		return
@@ -413,10 +525,10 @@ func (s *Server) writeReservationStaleCondition(ctx context.Context, stale []sta
 	}
 	if !open {
 		row = corrosion.HealthCondition{Evaluator: reservationSweepEvaluator, Code: CondReservationStale,
-			SubjectKind: "host", SubjectID: s.hostName, Lifecycle: corrosion.ConditionConfirmed,
+			SubjectKind: "host", SubjectID: host, Lifecycle: corrosion.ConditionConfirmed,
 			FirstSeen: ts, ConfirmedAt: ts}
 	}
-	row.Evidence, row.Severity, row.Hosts = string(b), corrosion.SeverityWarning, []string{s.hostName}
+	row.Evidence, row.Severity, row.Hosts = string(b), corrosion.SeverityWarning, []string{host}
 	row.ObserveCount++
 	row.CleanCount = 0
 	row.LastSeen, row.ResolvedAt, row.Reporter = ts, "", s.hostName

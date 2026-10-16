@@ -19,7 +19,8 @@ func hostReservationsNote(host *pb.Host) string {
 
 // hostStaleReservationsNote is the stderr note `lv host inspect` prints when
 // reservations on the host belong to no running operation (state "stale") or
-// cannot be released by the sweep (state "release-blocked"): both are released
+// cannot be released by the sweep (state "release-blocked", which the server
+// shows only for a reservation the manual release acts on): both are released
 // only by hand. Empty otherwise.
 func hostStaleReservationsNote(host *pb.Host) string {
 	stale, blocked := 0, 0

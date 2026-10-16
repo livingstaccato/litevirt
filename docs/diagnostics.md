@@ -52,7 +52,7 @@ workload; the amounts and state are shown to every viewer.
 | `journal` | a `vm_replace` or `drain_cold_move` journal | its own recovery; never released by hand |
 | `releasable` | the operation finished at a later owner epoch than its header's, or the VM it was for no longer exists (or was re-created after it began) | the reservation sweep on the target host |
 | `stale` | no barrier, past the admission window, and nothing proves the operation finished | `lv operation release-reservation <operation-id> --force` |
-| `release-blocked` | a tombstoned release row holds the key its release would be written at (`releaseBlocked` is true; `detail` starts `still counted; release blocked:`) | `lv operation release-reservation <operation-id> --force`, which writes a `failed` step at the header owner epoch instead |
+| `release-blocked` | a `releasable` or `stale` reservation whose release key is held by a tombstoned release row (`releaseBlocked` is true; `detail` starts `still counted; release blocked:`). A reservation in any other state keeps that state, with `releaseBlocked` true | `lv operation release-reservation <operation-id> --force`, which writes a `failed` step at the header owner epoch instead |
 
 The reservation sweep runs on every host, once at startup after resize
 recovery and then every 60 seconds. It releases each `releasable` reservation
@@ -62,7 +62,9 @@ whose target host has been removed or is not active is released by the
 lexically smallest active host instead; a reservation for a VM that no longer
 exists is released only by its target host. The sweep releases nothing while
 the host's replica has not caught up, and skips a VM whose lock is held until
-the next pass.
+the next pass. A reservation whose data cannot be read is never released; the
+sweep logs `reservation sweep: a reservation could not be read` once per
+operation and goes on with the rest.
 
 `lv host inspect` prints a note on stderr when the host holds `stale` or
 `release-blocked` reservations.
@@ -89,6 +91,7 @@ VM or container only to a caller who may `vm.read` it.
 | No `--force` | `FailedPrecondition` |
 | No such operation, or it was reaped | `NotFound` |
 | The operation holds no counted reservation | `FailedPrecondition` |
+| The operation's reservation data cannot be read | `FailedPrecondition` |
 | A `vm_replace` or `drain_cold_move` journal | `InvalidArgument` |
 | An admission or transfer lease; the message names the instant the stale-lease sweep releases it | `FailedPrecondition` |
 | The operation holds the VM's or container's mutation barrier | `FailedPrecondition` |
@@ -96,6 +99,7 @@ VM or container only to a caller who may `vm.read` it.
 | The VM's or container's lock is held on the target host | `Unavailable` |
 | The target host's replica has not caught up | `Unavailable` |
 | The target host is unreachable, or refused the request before handling it (a forwarded login it has not replicated yet, or WAL quarantine) | `Unavailable` |
+| The same, for a finished operation (`releasable`, not `release-blocked`) on a fenced, offline or maintenance host: the message says the sweep's deputy releases it within a pass | `Unavailable` |
 | The target host runs a build without the release (`lv host upgrade <host>`) | `FailedPrecondition` |
 
 ## `hardware_v2` — typed hardware, with no kill switch of its own
@@ -1924,7 +1928,8 @@ operation finished at an owner epoch past its header's, or whose VM no longer
 exists, and logs `released a host reservation whose operation is no longer
 running`. A node raises `reservation_stale` about **itself** while a
 reservation counted against it is older than 15 minutes, no operation holds it
-in flight, and the sweep cannot release it. The evidence carries `count` and
+in flight, and the sweep cannot release it, or while a reservation counted
+against it cannot be read. The evidence carries `count` and
 `reservations` (up to 20), each with `operation_id`, `method`, `vm`, `vcpu`,
 `memory_mib`, `created_at`, `class` and `remedy`.
 
@@ -1933,6 +1938,7 @@ in flight, and the sweep cannot release it. The evidence carries `count` and
 | `no_running_operation` | Nothing proves its operation stopped: no VM or container barrier names it, and it has no terminal step at an owner epoch past its header's. | Check with `lv operation show <vm>` (`lv ct inspect <container>` for a container) that nothing is running, then `lv operation release-reservation <operation-id> --force`. |
 | `terminal_past_header` or `vm_gone` | Its release row (a `cancelled` step at the header's owner epoch) is tombstoned and cannot be written again. | `lv operation release-reservation <operation-id> --force`, which writes a `failed` step at the header's owner epoch instead. |
 | `terminal_past_header` or `vm_gone` | The release write failed. | The write is retried every pass, and the daemon logs `reservation sweep: could not release a reservation` once per operation with the error. |
+| `unreadable` | Its reservation data (vector, project binding or authority facts) cannot be read, so it is not classified. The entry carries only `operation_id`. | The daemon logs `reservation sweep: a reservation could not be read` once per operation with the error; `lv host inspect <host>` names it under `reservationsError`. `lv operation release-reservation` refuses it. |
 
 | Raised when | Clears when |
 |---|---|
@@ -1943,6 +1949,15 @@ reservations are released by the smallest active host instead. While that host
 runs an older build or its replica is untrusted, nobody releases them, and a
 release it cannot write is logged there but raises no condition; the operation
 reaper still removes the operation about a day after its last step.
+
+A removed host (`lv host rm`) raises nothing about itself, so the smallest
+active host keeps its `reservation_stale` instead, under the removed host's
+subject, and resolves it, along with any the host left open, once none is
+left. It lists what no sweep releases there: `no_running_operation`, `vm_gone`
+(released only by its target), blocked, and `unreadable` reservations. Each
+still counts against its project quota until `lv operation release-reservation
+<operation-id> --force` releases it; for a removed host that is decided on the
+node called.
 
 ### Observer stalled (`observer_stalled`)
 

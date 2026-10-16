@@ -223,8 +223,8 @@ header's, or whose VM no longer exists. A reservation it cannot release raises
 | Metric | Type | Meaning |
 |---|---|---|
 | `litevirt_host_reservation_releases_total{reason}` | counter | Reservations this node released. `reason` is `terminal_past_header`, `vm_gone` or `admin`. |
-| `litevirt_host_reservation_sweep_skipped_total{reason}` | counter | `replica_untrusted`: a pass that released nothing because this node's replica is not caught up. `vm_busy`: a reservation skipped because its VM's lock was held; the next pass retries it. |
-| `litevirt_host_reserved_vcpu` | gauge | vCPUs of the reservations counted against this host, the figure admission subtracts. |
+| `litevirt_host_reservation_sweep_skipped_total{reason}` | counter | `replica_untrusted`: a pass that released nothing because this node's replica is not caught up. `vm_busy`: a reservation skipped because its VM's lock was held; the next pass retries it. `unreadable`: a reservation whose data cannot be read, never released; counted once per pass while it lasts. |
+| `litevirt_host_reserved_vcpu` | gauge | vCPUs of the reservations counted against this host, the figure admission subtracts. While a reservation cannot be read, it covers only the readable ones. |
 | `litevirt_host_reserved_memory_mib` | gauge | The same, in MiB of memory. |
 | `litevirt_host_reservation_oldest_seconds` | gauge | Age of the oldest reservation counted against this host, leaving out one whose operation holds its VM's barrier, a `vm_replace` or `drain_cold_move` journal, and an admission lease younger than its own max age (15 minutes, or 6 hours for a migration or drain); 0 when there is none. |
 

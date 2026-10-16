@@ -97,7 +97,7 @@ func (s *Server) releaseHostReservation(ctx context.Context, req *pb.ReleaseHost
 				return nil, status.Errorf(codes.FailedPrecondition,
 					"operation %s's reservation is held on %s by this host's (%s) replica, not here; retry", opID, target, s.hostName)
 			}
-			return s.forwardReservationRelease(ctx, req, view)
+			return s.forwardReservationRelease(ctx, req, view, h.State)
 		}
 	}
 	return s.executeReservationRelease(ctx, view, facts)
@@ -117,6 +117,17 @@ func (s *Server) classifyForRelease(ctx context.Context, opID string, facts *res
 			"no operation %s (it may already have been reaped); lv host inspect <host> lists the reservations a host holds", opID)
 	}
 	view, err := corrosion.ClassifyReservation(ctx, s.db, opID)
+	if errors.Is(err, corrosion.ErrReservationUnreadable) {
+		// Its error can name projects, as lv host inspect's does: only a
+		// caller who may vm.read cluster-wide sees it.
+		slog.Warn("release a reservation: its data cannot be read", "operation_id", opID, "error", err)
+		why := "see the daemon log"
+		if s.RequirePerm(ctx, "/", "vm.read", "viewer") == nil {
+			why = err.Error()
+		}
+		return nil, nil, status.Errorf(codes.FailedPrecondition,
+			"the reservation of operation %s cannot be read (%s), so it cannot be classified and is not released", opID, why)
+	}
 	if err != nil {
 		return nil, nil, status.Errorf(codes.Internal, "classify the reservation of operation %s: %v", opID, err)
 	}
@@ -170,11 +181,20 @@ func (s *Server) releaseOfUncounted(ctx context.Context, op *corrosion.Operation
 		op.ID)
 }
 
-// forwardReservationRelease asks the reservation's target host to release it.
+// forwardReservationRelease asks the reservation's target host, in
+// targetState, to release it.
 func (s *Server) forwardReservationRelease(ctx context.Context, req *pb.ReleaseHostReservationRequest,
-	view *corrosion.HostReservationView) (*pb.ReleaseHostReservationResponse, error) {
+	view *corrosion.HostReservationView, targetState string) (*pb.ReleaseHostReservationResponse, error) {
 	target := view.Vector.TargetHost
 	unreachable := func(err error) error {
+		if targetState != "active" && view.Class == corrosion.ReservationTerminalPastHeader && !view.ReleaseBlocked {
+			// The reservation sweep's deputy releases a finished operation's
+			// reservation on a host that is not active, so the host need not
+			// be removed for it.
+			return status.Errorf(codes.Unavailable,
+				"host %s is %s and unreachable, or refused the request before handling it (%v): this operation finished, so the reservation sweep's deputy (the smallest active host) releases its reservation within a pass (%s); check with lv host inspect %s",
+				target, targetState, err, reservationRecoveryInterval, target)
+		}
 		return status.Errorf(codes.Unavailable,
 			"host %s is unreachable, or refused the request before handling it (%v): a reservation is released on the host that holds it, so that host can confirm no admission there still relies on it. Retry when it answers, or remove the host with lv host rm %s if it is gone for good",
 			target, err, target)
@@ -271,9 +291,10 @@ func (s *Server) executeReservationRelease(ctx context.Context, view *corrosion.
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"operation %s was admitted %s ago and may still be committing; retry after %s",
 			opID, age, corrosion.RPCScopedLeaseMaxAge)
-	case corrosion.ReservationTerminalPastHeader, corrosion.ReservationVMGone, corrosion.ReservationNoRunningOperation:
 	default:
-		return nil, status.Errorf(codes.FailedPrecondition, "operation %s's reservation is %s; it is not released by hand", opID, cur.Class)
+		if !handReleasableClass(cur.Class) {
+			return nil, status.Errorf(codes.FailedPrecondition, "operation %s's reservation is %s; it is not released by hand", opID, cur.Class)
+		}
 	}
 
 	release := corrosion.ReleaseReservation
@@ -313,6 +334,12 @@ func (s *Server) executeReservationRelease(ctx context.Context, view *corrosion.
 		out.Vm = cur.VMName
 	}
 	return out, nil
+}
+
+// handReleasableClass: the classes `lv operation release-reservation`
+// releases — the sweep's two, and no_running_operation.
+func handReleasableClass(c corrosion.ReservationClass) bool {
+	return sweepReleasableClass(c) || c == corrosion.ReservationNoRunningOperation
 }
 
 // auditReservationRelease writes the one audit row of a release request.
@@ -371,6 +398,11 @@ func (s *Server) workloadArg(ctx context.Context, name string) string {
 // withheldWorkload stands in for a workload name the caller may not read.
 const withheldWorkload = "(name withheld)"
 
+// workloadArgPattern matches the workload argument of an `lv operation show`
+// or `lv operation abort` a refusal names: the command, the argument, a
+// trailing sentence period, and the character that ends the argument.
+var workloadArgPattern = regexp.MustCompile(`(lv operation (?:show|abort) )([^\s;,()]+?)(\.?)($|[\s;,()])`)
+
 // redactWorkloadName withholds name from a refusal the target host returned
 // when this node's caller may not read it. The target judged the forwarded hop,
 // which is a peer unless forwarded identity is enforced, so only the entry node
@@ -381,7 +413,15 @@ func (s *Server) redactWorkloadName(ctx context.Context, err error, name string)
 	}
 	st := status.Convert(err)
 	msg := strings.ReplaceAll(st.Message(), strconv.Quote(name), withheldWorkload)
-	msg = regexp.MustCompile(`(^|[^\w.-])`+regexp.QuoteMeta(name)+`($|[^\w.-])`).ReplaceAllString(msg, "${1}<vm>${2}")
+	// The bare name appears only as the argument of the commands workloadArg
+	// fills; any other word, even one equal to the name, is left alone.
+	msg = workloadArgPattern.ReplaceAllStringFunc(msg, func(m string) string {
+		sub := workloadArgPattern.FindStringSubmatch(m)
+		if sub[2] != name {
+			return m
+		}
+		return sub[1] + "<vm>" + sub[3] + sub[4]
+	})
 	if msg == st.Message() {
 		return err
 	}

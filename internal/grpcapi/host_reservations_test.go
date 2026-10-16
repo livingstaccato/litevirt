@@ -446,3 +446,27 @@ func TestInspectHost_TotalsMatchRowsUnderConcurrentWrites(t *testing.T) {
 		}
 	}
 }
+
+// release-blocked replaces only a state the manual release acts on
+// (releasable or stale): a blocked row of any other class shows that class's
+// state, with releaseBlocked still set, because neither the sweep, the
+// condition nor lv operation release-reservation would release it.
+func TestHostReservationState_BlockedOnlyOverridesHandReleasable(t *testing.T) {
+	for _, tc := range []struct {
+		class corrosion.ReservationClass
+		want  string
+	}{
+		{corrosion.ReservationTerminalPastHeader, "release-blocked"},
+		{corrosion.ReservationVMGone, "release-blocked"},
+		{corrosion.ReservationNoRunningOperation, "release-blocked"},
+		{corrosion.ReservationInFlight, "in-flight"},
+		{corrosion.ReservationAdmitting, "admitting"},
+		{corrosion.ReservationCapacityLease, "auto-expires"},
+		{corrosion.ReservationManifest, "journal"},
+	} {
+		v := &corrosion.HostReservationView{Class: tc.class, ReleaseBlocked: true}
+		if got := hostReservationState(v); got != tc.want {
+			t.Errorf("blocked %s: state %q, want %q", tc.class, got, tc.want)
+		}
+	}
+}

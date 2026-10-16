@@ -647,3 +647,165 @@ func TestReservationSweep_StaleConditionContainerRemedy(t *testing.T) {
 		t.Fatalf("container remedy %q, want the container check and the manual release", r)
 	}
 }
+
+// seedUnreadableSweepRows adds two reservations whose data cannot be read:
+// bad-here, a test-host reservation whose vector names another project than
+// its operation, and bad-blind, whose vector does not decode (target unknown).
+func seedUnreadableSweepRows(t *testing.T, s *Server) {
+	t.Helper()
+	ctx := context.Background()
+	rv := sweepVector("test-host", 8)
+	rv.Project = "beta"
+	sweepOp(t, s, "bad-here", corrosion.OpResourceUpdateRunning, "vm1", 0, rv, sweepAgo(time.Hour), sweepLeakSteps())
+	sweepOp(t, s, "bad-blind", corrosion.OpResourceUpdateRunning, "vm1", 0, sweepVector("test-host", 8),
+		sweepAgo(time.Hour), sweepLeakSteps())
+	for _, q := range []string{
+		`UPDATE operations SET project = 'alpha' WHERE id = 'bad-here'`,
+		`UPDATE operations SET reservation_json = '{not json' WHERE id = 'bad-blind'`,
+	} {
+		if err := s.db.Execute(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A reservation whose data cannot be read does not stop the sweep: every
+// readable reservation is still released, gauged and reported, while the
+// unreadable one is never released, and is counted, logged once and named in
+// reservation_stale.
+func TestReservationSweep_UnreadableRowDoesNotStopThePass(t *testing.T) {
+	s := testServer(t)
+	reg := sweepMetrics(s)
+	ctx := context.Background()
+	logs := &lockedLog{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	sweepVM(t, s, "vm1", 1, sweepAgoNano(48*time.Hour), "")
+	sweepOp(t, s, "leak", corrosion.OpResourceUpdateRunning, "vm1", 0, sweepVector("test-host", 512),
+		sweepAgo(time.Hour), sweepLeakSteps())
+	sweepOp(t, s, "stuck", corrosion.OpResourceUpdateRunning, "vm1", 1, sweepVector("test-host", 256),
+		sweepAgo(time.Hour), sweepAdmittedSteps(1))
+	seedUnreadableSweepRows(t, s)
+
+	if n := s.SweepReservationsOnce(ctx); n != 1 || releaseRows(t, s, "leak") != 1 {
+		t.Fatalf("released %d (leak rows %d), want the readable terminal reservation released", n, releaseRows(t, s, "leak"))
+	}
+	s.SweepReservationsOnce(ctx)
+	for _, id := range []string{"bad-here", "bad-blind"} {
+		if releaseRows(t, s, id) != 0 {
+			t.Errorf("released %s, whose reservation could not be read", id)
+		}
+		if n := strings.Count(logs.String(), "operation_id="+id+" "); n != 1 {
+			t.Errorf("%s logged %d times over two passes, want once; log:\n%s", id, n, logs.String())
+		}
+	}
+	if !strings.Contains(logs.String(), "reservation sweep: a reservation could not be read") {
+		t.Errorf("no unreadable-reservation log line; log:\n%s", logs.String())
+	}
+	if v := metricValue(t, reg, "litevirt_host_reservation_sweep_skipped_total", map[string]string{"reason": "unreadable"}); v != 4 {
+		t.Errorf("sweep_skipped_total{unreadable} = %v, want 4 (two rows, two passes)", v)
+	}
+	if v := metricValue(t, reg, "litevirt_host_reserved_memory_mib", nil); v != 256 {
+		t.Errorf("reserved_memory_mib = %v, want 256 (the readable stuck reservation)", v)
+	}
+	_, ev, open := staleCondition(t, s)
+	byOp := map[string]staleReservation{}
+	for _, r := range ev.Reservations {
+		byOp[r.OperationID] = r
+	}
+	if !open || len(byOp) != 2 || byOp["stuck"].OperationID == "" {
+		t.Fatalf("reservation_stale: open=%v evidence=%+v, want stuck and bad-here", open, ev)
+	}
+	if r := byOp["bad-here"]; r.Class != "unreadable" || !strings.Contains(r.Remedy, "cannot be read") {
+		t.Fatalf("bad-here entry %+v, want class unreadable with its remedy", r)
+	}
+}
+
+// A removed host's reservations that no sweep releases are reported by the
+// deputy (the smallest active host) under the removed host's subject, with the
+// remedy that frees them; the deputy resolves that condition once none is
+// left, and resolves one the removed host raised about itself.
+func TestReservationSweep_DeputyOwnsARemovedHostsCondition(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	for _, h := range []string{"test-host", "a-first", "z-removed", "y-gone"} {
+		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: h, Address: "10.0.0.1", State: "active"}); err != nil {
+			t.Fatalf("InsertHost %s: %v", h, err)
+		}
+	}
+	if err := corrosion.UpdateHostState(ctx, s.db, "z-removed", "removed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Execute(ctx, `UPDATE hosts SET deleted_at = ? WHERE name = 'y-gone'`, sweepAgo(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	s.db.MarkReplicaCaughtUpForTests("a-first")
+	ts := sweepAgo(2 * time.Hour)
+	if err := corrosion.UpsertHealthCondition(ctx, s.db, corrosion.HealthCondition{
+		Evaluator: reservationSweepEvaluator, Code: CondReservationStale, SubjectKind: "host", SubjectID: "y-gone",
+		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityWarning, Hosts: []string{"y-gone"},
+		FirstSeen: ts, ConfirmedAt: ts, LastSeen: ts, Reporter: "y-gone", Evidence: `{"count":1,"reservations":[]}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sweepVM(t, s, "vm1", 1, sweepAgoNano(48*time.Hour), "")
+	sweepOp(t, s, "orphan-c", corrosion.OpResourceUpdateRunning, "vm1", 1, sweepVector("z-removed", 128),
+		sweepAgo(time.Hour), sweepAdmittedSteps(1))
+	sweepOp(t, s, "orphan-gone", corrosion.OpResourceUpdateRunning, "gone-vm", 1, sweepVector("z-removed", 64),
+		sweepAgo(time.Hour), sweepAdmittedSteps(1))
+
+	subject := func(host string) (corrosion.HealthCondition, staleReservationEvidence, bool) {
+		t.Helper()
+		row, found, err := corrosion.GetHealthCondition(ctx, s.db, reservationSweepEvaluator, CondReservationStale, "host", host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ev staleReservationEvidence
+		open := found && row.Lifecycle != corrosion.ConditionResolved
+		if open {
+			if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil {
+				t.Fatalf("evidence %q: %v", row.Evidence, err)
+			}
+		}
+		return row, ev, open
+	}
+
+	// Not the deputy: a-first is active and sorts first.
+	s.SweepReservationsOnce(ctx)
+	if _, _, open := subject("z-removed"); open {
+		t.Fatal("a node that is not the deputy reported a removed host's reservations")
+	}
+	if _, _, open := subject("y-gone"); !open {
+		t.Fatal("a node that is not the deputy resolved a removed host's condition")
+	}
+
+	if err := corrosion.UpdateHostState(ctx, s.db, "a-first", "removed"); err != nil {
+		t.Fatal(err)
+	}
+	s.SweepReservationsOnce(ctx)
+	row, ev, open := subject("z-removed")
+	if !open || row.Reporter != "test-host" || ev.Count != 2 {
+		t.Fatalf("z-removed: open=%v reporter=%q evidence=%+v, want both reservations reported by the deputy", open, row.Reporter, ev)
+	}
+	for _, r := range ev.Reservations {
+		if !strings.Contains(r.Remedy, "lv operation release-reservation <operation-id> --force") ||
+			!strings.Contains(r.Remedy, "project quota") {
+			t.Errorf("%s remedy %q, want the manual release and the quota it frees", r.OperationID, r.Remedy)
+		}
+	}
+	if _, _, open := subject("y-gone"); open {
+		t.Fatal("the deputy left a removed host's own condition open")
+	}
+
+	for _, id := range []string{"orphan-c", "orphan-gone"} {
+		if resp, err := s.ReleaseHostReservation(adminCtx(), releaseReq(id)); err != nil || !resp.Released {
+			t.Fatalf("release %s: %+v %v", id, resp, err)
+		}
+	}
+	s.SweepReservationsOnce(ctx)
+	if _, _, open := subject("z-removed"); open {
+		t.Fatal("reservation_stale on the removed host still open after its reservations were released")
+	}
+}

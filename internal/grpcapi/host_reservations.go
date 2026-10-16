@@ -96,9 +96,12 @@ func (s *Server) hostReservations(ctx context.Context, host string) (rows []*pb.
 }
 
 // hostReservationState is the state `lv host inspect` shows for a reservation
-// class. A blocked release overrides the class: nothing releases it.
+// class. A blocked release overrides only a class the manual release acts on
+// (releasable or stale), where the sweep cannot write it and `lv operation
+// release-reservation` writes the failed step instead; any other class keeps
+// its own state, since neither releases it (releaseBlocked still says so).
 func hostReservationState(v *corrosion.HostReservationView) string {
-	if v.ReleaseBlocked {
+	if v.ReleaseBlocked && handReleasableClass(v.Class) {
 		return "release-blocked"
 	}
 	switch v.Class {

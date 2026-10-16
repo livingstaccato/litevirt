@@ -496,3 +496,90 @@ func TestRefusedBeforeHandler(t *testing.T) {
 		}
 	}
 }
+
+// One reservation whose data cannot be read does not stop the release of
+// another; asked to release it, the release refuses — FailedPrecondition, not
+// Internal — and writes nothing.
+func TestReleaseHostReservation_UnreadableRowFailsClosedAlone(t *testing.T) {
+	s := testServer(t)
+	seedStuckResize(t, s, "stuck", "vm1", 1, 512)
+	seedUnreadableSweepRows(t, s)
+	if resp, err := s.ReleaseHostReservation(adminCtx(), releaseReq("stuck")); err != nil || !resp.Released {
+		t.Fatalf("release beside an unreadable reservation: %+v err %v, want released", resp, err)
+	}
+	for _, id := range []string{"bad-here", "bad-blind"} {
+		_, err := s.ReleaseHostReservation(adminCtx(), releaseReq(id))
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "cannot be read") {
+			t.Fatalf("release %s: %v, want FailedPrecondition saying it cannot be read", id, err)
+		}
+		if releaseRows(t, s, id) != 0 {
+			t.Fatalf("released %s, whose reservation could not be read", id)
+		}
+	}
+}
+
+// A finished operation's reservation on a fenced, offline or maintenance host
+// that cannot be reached is released by the deputy sweep: the refusal says so
+// rather than asking for the host to be removed.
+func TestReleaseHostReservation_UnreachableNotActiveTargetNamesTheDeputy(t *testing.T) {
+	for _, state := range []string{"fenced", "offline", "maintenance"} {
+		t.Run(state, func(t *testing.T) {
+			s := testServer(t)
+			ctx := context.Background()
+			for _, h := range []string{"test-host", "b-down"} {
+				if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: h, Address: "127.0.0.1", State: "active"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := corrosion.UpdateHostState(ctx, s.db, "b-down", state); err != nil {
+				t.Fatal(err)
+			}
+			sweepVM(t, s, "vm1", 1, sweepAgoNano(48*time.Hour), "")
+			sweepOp(t, s, "done", corrosion.OpResourceUpdateRunning, "vm1", 0, sweepVector("b-down", 512),
+				sweepAgo(time.Hour), sweepLeakSteps())
+			sweepOp(t, s, "stuck", corrosion.OpResourceUpdateRunning, "vm1", 1, sweepVector("b-down", 64),
+				sweepAgo(time.Hour), sweepAdmittedSteps(1))
+			cctx, cancel := context.WithTimeout(adminCtx(), 20*time.Second)
+			defer cancel()
+
+			_, err := s.ReleaseHostReservation(cctx, releaseReq("done"))
+			msg := status.Convert(err).Message()
+			if status.Code(err) != codes.Unavailable || !strings.Contains(msg, "deputy") ||
+				!strings.Contains(msg, "lv host inspect b-down") || strings.Contains(msg, "lv host rm") {
+				t.Fatalf("finished operation on a %s target: %v, want Unavailable naming the deputy sweep and no lv host rm", state, err)
+			}
+			// A reservation the sweep never releases keeps the removal remedy.
+			_, err = s.ReleaseHostReservation(cctx, releaseReq("stuck"))
+			if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "lv host rm b-down") {
+				t.Fatalf("stale reservation on a %s target: %v, want the lv host rm remedy", state, err)
+			}
+		})
+	}
+}
+
+// The forwarded refusal's bare workload name is withheld only where it is a
+// command's argument: words elsewhere that equal the name, or contain it, stay.
+func TestRedactWorkloadName_OnlyTheArgument(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	if err := corrosion.InsertRole(ctx, s.db, corrosion.RoleRecord{Name: "Releaser", Verbs: []string{reservationReleaseVerb}}); err != nil {
+		t.Fatalf("InsertRole: %v", err)
+	}
+	rita := boundAtCtx(t, s, "rita", "viewer", "Releaser", "/")
+	for _, tc := range []struct{ name, in, want string }{
+		{"operation",
+			`operation op1 is still running: it holds VM "operation"'s mutation barrier. inspect it with lv operation show operation; abort a wedged one with lv operation abort operation --force`,
+			`operation op1 is still running: it holds VM (name withheld)'s mutation barrier. inspect it with lv operation show <vm>; abort a wedged one with lv operation abort <vm> --force`},
+		{"node-0",
+			`operation op1 is a vm_replace journal on node-0 (inspect it with lv operation show node-0)`,
+			`operation op1 is a vm_replace journal on node-0 (inspect it with lv operation show <vm>)`},
+		{"web",
+			`webhook web-2 and web are fine; lv operation show web-2; lv operation show web.`,
+			`webhook web-2 and web are fine; lv operation show web-2; lv operation show <vm>.`},
+	} {
+		got := s.redactWorkloadName(rita, status.Error(codes.FailedPrecondition, tc.in), tc.name)
+		if m := status.Convert(got).Message(); m != tc.want {
+			t.Errorf("redact %q:\n got %q\nwant %q", tc.name, m, tc.want)
+		}
+	}
+}

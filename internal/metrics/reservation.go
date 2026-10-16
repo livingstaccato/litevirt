@@ -31,7 +31,7 @@ func newReservationMetrics(reg prometheus.Registerer) *ReservationMetrics {
 		}, []string{"reason"}),
 		skipped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "litevirt_host_reservation_sweep_skipped_total",
-			Help: "Reservation sweep passes (replica_untrusted) or reservations (vm_busy) the sweep declined.",
+			Help: "Reservation sweep passes (replica_untrusted) or reservations (vm_busy, unreadable) the sweep declined.",
 		}, []string{"reason"}),
 		vcpu: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "litevirt_host_reserved_vcpu",

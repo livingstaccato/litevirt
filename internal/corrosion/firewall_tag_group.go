@@ -27,6 +27,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/firewall/rulefield"
@@ -684,11 +685,25 @@ func jsonExactString(doc, key string) string {
 	return s
 }
 
+// tagCIDRTrimSet is every rune unicode.IsSpace holds, so the use probe's
+// LTRIM, whose character set SQLite reads as UTF-8, removes what
+// strings.TrimSpace removes ahead of the loader's tagRef (D5a re-review m-c).
+var tagCIDRTrimSet = func() string {
+	var b strings.Builder
+	for r := rune(0); r <= unicode.MaxRune; r++ {
+		if unicode.IsSpace(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}()
+
 // FirewallTagGroupsDataPresent reports whether this replica holds any data of
 // the release feature firewall_tag_groups (spec DECISION 0-A): a group row or
 // a firewall-tags row with a value, or a live rule whose cidr starts with the
-// tag-group prefix in any case after the blanks strings.TrimSpace removes
-// (the loader's tagRef reads it so), as an entry daemon on an older build
+// tag-group prefix in any case after the white space strings.TrimSpace
+// removes, Unicode included (the loader's tagRef reads it so; tagCIDRTrimSet),
+// as an entry daemon on an older build
 // stores one verbatim. The release use sweep records the feature's use when it
 // finds one (DECISION 0-F).
 func FirewallTagGroupsDataPresent(ctx context.Context, c *Client) (bool, error) {
@@ -707,7 +722,7 @@ func FirewallTagGroupsDataPresent(ctx context.Context, c *Client) (bool, error) 
 	for _, table := range []string{"cluster_firewall_rules", "host_firewall_rules", "sg_rules"} {
 		rows, err := c.Query(ctx,
 			`SELECT 1 FROM `+table+`
-			 WHERE deleted_at IS NULL AND LTRIM(COALESCE(cidr, ''), ' '||char(9, 10, 11, 12, 13)) LIKE 'tag:%' LIMIT 1`)
+			 WHERE deleted_at IS NULL AND LTRIM(COALESCE(cidr, ''), ?) LIKE 'tag:%' LIMIT 1`, tagCIDRTrimSet)
 		if err != nil {
 			return false, err
 		}

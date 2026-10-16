@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"unicode"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/firewall/rulefield"
@@ -172,6 +173,15 @@ func TestFirewallTagGroupsDataPresent(t *testing.T) {
 			mustExec(t, c, `INSERT INTO cluster_firewall_rules (id, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)
 				VALUES ('c', 'ingress', 'tcp', '', char(10, 13, 11, 12) || 'tag:web', 'drop', 100, '', '', 't', 't')`)
 		},
+		// strings.TrimSpace takes Unicode white space too (D5a re-review m-c).
+		"cluster rule, after U+0085 and U+00A0": func(c *Client) {
+			mustExec(t, c, `INSERT INTO cluster_firewall_rules (id, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)
+				VALUES ('c', 'ingress', 'tcp', '', char(133, 160) || 'tag:web', 'drop', 100, '', '', 't', 't')`)
+		},
+		"sg rule, after U+3000 and U+2028": func(c *Client) {
+			mustExec(t, c, `INSERT INTO sg_rules (id, sg_id, direction, proto, port_range, cidr, action, priority, created_at, updated_at)
+				VALUES ('s', 'sg', 'ingress', 'tcp', '', char(12288, 8232) || 'tag:web', 'drop', 100, 't', 't')`)
+		},
 		"sg rule, padded": func(c *Client) {
 			mustExec(t, c, `INSERT INTO sg_rules (id, sg_id, direction, proto, port_range, cidr, action, priority, created_at, updated_at)
 				VALUES ('s', 'sg', 'ingress', 'tcp', '', ' tag:web', 'drop', 100, 't', 't')`)
@@ -181,6 +191,16 @@ func TestFirewallTagGroupsDataPresent(t *testing.T) {
 		write(c)
 		if !present(c) {
 			t.Errorf("%s: not found", what)
+		}
+	}
+}
+
+// The probe trims what strings.TrimSpace trims, so it sees every cidr the
+// loader's tagRef reads as a tag-group reference (D5a re-review m-c).
+func TestTagCIDRTrimSet_IsUnicodeSpace(t *testing.T) {
+	for r := rune(0); r <= unicode.MaxRune; r++ {
+		if unicode.IsSpace(r) != strings.ContainsRune(tagCIDRTrimSet, r) {
+			t.Errorf("U+%04X: unicode.IsSpace %v, in the trim set %v", r, unicode.IsSpace(r), !unicode.IsSpace(r))
 		}
 	}
 }

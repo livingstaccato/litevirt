@@ -79,11 +79,17 @@ type fwlPeer struct {
 	// abortAnswer, when set, answers Abort in place of the handler.
 	abortAnswer func(*pb.AbortLiveFirmwareTargetRequest) (*pb.AbortLiveFirmwareTargetResponse, error)
 	aborts      []*pb.AbortLiveFirmwareTargetRequest
-	ensures     []*pb.EnsureDisksRequest
-	ensureTLS   bool
-	cpuChecks   int
-	cleanups    int
-	coldCalls   int
+	// verifyAnswer and releaseAnswer, when set, answer in place of the
+	// handler; call runs the handler.
+	verifyAnswer  func(call func() (*pb.VerifyLiveFirmwareTargetResponse, error)) (*pb.VerifyLiveFirmwareTargetResponse, error)
+	releaseAnswer func(call func() (*pb.ReleaseLiveFirmwareTargetResponse, error)) (*pb.ReleaseLiveFirmwareTargetResponse, error)
+	// dialErr, when set, fails the source's dial of the target.
+	dialErr   func() error
+	ensures   []*pb.EnsureDisksRequest
+	ensureTLS bool
+	cpuChecks int
+	cleanups  int
+	coldCalls int
 }
 
 func (p *fwlPeer) refuse(name string) error {
@@ -159,7 +165,16 @@ func (p *fwlPeer) VerifyLiveFirmwareTarget(_ context.Context, req *pb.VerifyLive
 	if err := p.refuse("VerifyLiveFirmwareTarget"); err != nil {
 		return nil, err
 	}
-	return p.r.dst.VerifyLiveFirmwareTarget(p.r.peer, req)
+	call := func() (*pb.VerifyLiveFirmwareTargetResponse, error) {
+		return p.r.dst.VerifyLiveFirmwareTarget(p.r.peer, req)
+	}
+	p.mu.Lock()
+	answer := p.verifyAnswer
+	p.mu.Unlock()
+	if answer != nil {
+		return answer(call)
+	}
+	return call()
 }
 
 func (p *fwlPeer) ReleaseLiveFirmwareTarget(_ context.Context, req *pb.ReleaseLiveFirmwareTargetRequest, _ ...grpc.CallOption) (*pb.ReleaseLiveFirmwareTargetResponse, error) {
@@ -167,7 +182,16 @@ func (p *fwlPeer) ReleaseLiveFirmwareTarget(_ context.Context, req *pb.ReleaseLi
 	if err := p.refuse("ReleaseLiveFirmwareTarget"); err != nil {
 		return nil, err
 	}
-	return p.r.dst.ReleaseLiveFirmwareTarget(p.r.peer, req)
+	call := func() (*pb.ReleaseLiveFirmwareTargetResponse, error) {
+		return p.r.dst.ReleaseLiveFirmwareTarget(p.r.peer, req)
+	}
+	p.mu.Lock()
+	answer := p.releaseAnswer
+	p.mu.Unlock()
+	if answer != nil {
+		return answer(call)
+	}
+	return call()
 }
 
 func (p *fwlPeer) AbortLiveFirmwareTarget(_ context.Context, req *pb.AbortLiveFirmwareTargetRequest, _ ...grpc.CallOption) (*pb.AbortLiveFirmwareTargetResponse, error) {
@@ -192,6 +216,15 @@ type fwlCaptureVirt struct {
 	got *[]lv.MigrateParams
 	// after, when set, runs once libvirt's migrate returned.
 	after *func()
+	// onResumeSource, when set, runs as the source guest is resumed (§7 M1p).
+	onResumeSource *func()
+}
+
+func (v fwlCaptureVirt) ResumeFirmwareMoveSource(name, uuid, attempt string) error {
+	if v.onResumeSource != nil && *v.onResumeSource != nil {
+		(*v.onResumeSource)()
+	}
+	return v.Fake.ResumeFirmwareMoveSource(name, uuid, attempt)
 }
 
 func (v fwlCaptureVirt) MigrateToTarget(name, uri string, p lv.MigrateParams) error {
@@ -222,8 +255,11 @@ type fwlRig struct {
 	paramsMu sync.Mutex
 	// afterMigrate runs once libvirt's migrate returned on the source.
 	afterMigrate func()
-	storage      bool
-	spec         map[string]any
+	// onResumeSource runs as the source guest is resumed (§7 M1p).
+	onResumeSource func()
+	sbOnly         bool
+	storage        bool
+	spec           map[string]any
 }
 
 type fwlOpts struct {
@@ -231,11 +267,13 @@ type fwlOpts struct {
 	// liveXMLExtra is appended inside <devices> of the running definition.
 	liveXMLExtra string
 	cpuMode      string
+	// sbOnly is a Secure Boot VM without a vTPM: no permall anywhere.
+	sbOnly bool
 }
 
 func newFwlRig(t *testing.T, o fwlOpts) *fwlRig {
 	t.Helper()
-	r := &fwlRig{t: t, log: &fwlLog{}, storage: o.storage}
+	r := &fwlRig{t: t, log: &fwlLog{}, storage: o.storage, sbOnly: o.sbOnly}
 	layout := t.TempDir()
 
 	r.src = testServerWithLocks(t)
@@ -245,7 +283,7 @@ func newFwlRig(t *testing.T, o fwlOpts) *fwlRig {
 	r.srcFake = libvirtfake.New()
 	r.srcFake.SetFirmwareStore(r.srcStore)
 	fwmig.Wire(r.srcFake, r.srcStore)
-	r.src.virt = fwlCaptureVirt{Fake: r.srcFake, mu: &r.paramsMu, got: &r.params, after: &r.afterMigrate}
+	r.src.virt = fwlCaptureVirt{Fake: r.srcFake, mu: &r.paramsMu, got: &r.params, after: &r.afterMigrate, onResumeSource: &r.onResumeSource}
 	setFWTestFirmwarePaths(t, r.src)
 	r.src.SetFirmwareLayoutDirForTest(layout)
 	r.src.SetLiveFirmwareHost(&stubFWCode{installed: lv.InstalledFirmwareCode{Runtime: fwFloorRuntime}, running: fwFloorRuntime})
@@ -277,7 +315,7 @@ func newFwlRig(t *testing.T, o fwlOpts) *fwlRig {
 	}
 	r.peer = context.WithValue(context.WithValue(peerCtxFor(t, r.dst, "src-host"), ctxKeyUsername, "admin"), ctxKeyRole, "admin")
 
-	r.spec = map[string]any{"name": fwlVM, "secure_boot": true, "tpm": true, "firmware": "uefi", "uuid": fwLiveUUID}
+	r.spec = map[string]any{"name": fwlVM, "secure_boot": true, "tpm": !o.sbOnly, "firmware": "uefi", "uuid": fwLiveUUID}
 	if o.cpuMode != "" {
 		r.spec["cpu_mode"] = o.cpuMode
 	}
@@ -291,14 +329,16 @@ func newFwlRig(t *testing.T, o fwlOpts) *fwlRig {
 		t.Fatal(err)
 	}
 
-	x := fwLiveDomainXML(fwLiveUUID, r.src.firmware.SecbootCode, r.srcStore.NvramPath(fwlVM), true, "yes")
+	x := fwLiveDomainXML(fwLiveUUID, r.src.firmware.SecbootCode, r.srcStore.NvramPath(fwlVM), !o.sbOnly, "yes")
 	if o.liveXMLExtra != "" {
 		x = strings.Replace(x, "</devices>", o.liveXMLExtra+"</devices>", 1)
 	}
 	r.srcFake.SetInactiveXML(fwlVM, x)
 	r.srcFake.SetActiveXML(fwlVM, x)
 	r.srcFake.SetState(fwlVM, libvirtfake.StateRunning)
-	r.write(filepath.Join(r.srcStore.SwtpmDir(fwLiveUUID), "tpm2", "tpm2-00.permall"), fwlPermall)
+	if !o.sbOnly {
+		r.write(filepath.Join(r.srcStore.SwtpmDir(fwLiveUUID), "tpm2", "tpm2-00.permall"), fwlPermall)
+	}
 	r.write(r.srcStore.NvramPath(fwlVM), fwlNvram)
 
 	r.srcFake.OnMigrateToTarget = func(name, _ string, p lv.MigrateParams) error {
@@ -309,7 +349,17 @@ func newFwlRig(t *testing.T, o fwlOpts) *fwlRig {
 	r.src.fwLive.stepHook = func(step string) { r.log.add(step) }
 
 	r.peerC = &fwlPeer{fakeDestPeer: &fakeDestPeer{leaseID: "dst-lease"}, r: r, ensureTLS: true, unimplemented: map[string]bool{}}
-	r.src.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) { return r.peerC, func() {}, nil }
+	r.src.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		r.peerC.mu.Lock()
+		dialErr := r.peerC.dialErr
+		r.peerC.mu.Unlock()
+		if dialErr != nil {
+			if err := dialErr(); err != nil {
+				return nil, nil, err
+			}
+		}
+		return r.peerC, func() {}, nil
+	}
 
 	ob, of := fwLiveRetryBackoff, fwLiveRetryFor
 	fwLiveRetryBackoff, fwLiveRetryFor = 5*time.Millisecond, 50*time.Millisecond
@@ -375,7 +425,7 @@ func (r *fwlRig) migrateParams() []lv.MigrateParams {
 // guest still runs there.
 func (r *fwlRig) requireSourceIntact(why string) {
 	r.t.Helper()
-	if b, _ := os.ReadFile(filepath.Join(r.srcStore.SwtpmDir(fwLiveUUID), "tpm2", "tpm2-00.permall")); !bytes.Equal(b, fwlPermall) {
+	if b, _ := os.ReadFile(filepath.Join(r.srcStore.SwtpmDir(fwLiveUUID), "tpm2", "tpm2-00.permall")); !r.sbOnly && !bytes.Equal(b, fwlPermall) {
 		r.t.Errorf("%s: the source permall is %q", why, b)
 	}
 	if b, _ := os.ReadFile(r.srcStore.NvramPath(fwlVM)); !bytes.Equal(b, fwlNvram) {
@@ -679,8 +729,10 @@ func TestMigrateVM_FirmwareLive_AbortWithTargetDomainParks(t *testing.T) {
 		return &pb.AbortLiveFirmwareTargetResponse{TargetDomain: &pb.TargetDomain{Present: true, State: "paused"}}, nil
 	}
 	_ = r.migrate()
-	if m, ok := r.marker(); !ok || m.Phase != fwmig.PhaseTargetUnreachable {
-		t.Fatalf("marker %+v (present %v), want parked: the target has a domain of the VM", m, ok)
+	// D2-12a review m-4: a reachable target that holds a domain is not
+	// "unreachable"; the park is decided from the answer.
+	if m, ok := r.marker(); !ok || m.Phase != fwmig.PhaseTargetRan {
+		t.Fatalf("marker %+v (present %v), want parked target_ran: the target has a domain of the VM", m, ok)
 	}
 }
 
@@ -842,20 +894,30 @@ func TestMigrateVM_FirmwareLive_MigrateErrorSourceInactiveVerifies(t *testing.T)
 	}
 }
 
-// Step 7: a migration that returned with the source domain still active is
-// not a cutover: the move parks (both copies kept) and never commits.
+// Step 7 (D2-12a review m-3): a migration that returned with the source
+// domain still active and running is not a cutover but §7 M1: Abort
+// PRE_CUTOVER, then (the target holds the landed guest paused under a
+// prepared hold) the automatic DISCARD; the marker goes, the row is running,
+// and Verify is never called. Never source_state_suspect, whose
+// --accept-source would write the row stopped over a running guest.
 //
-// Mutation: skip the active check — red.
-func TestMigrateVM_FirmwareLive_SourceStillActiveParks(t *testing.T) {
+// Mutation: park source_state_suspect for an active source; skip the active
+// check — red.
+func TestMigrateVM_FirmwareLive_SourceStillActiveIsM1(t *testing.T) {
 	r := newFwlRig(t, fwlOpts{})
 	r.afterMigrate = func() { r.srcFake.SetState(fwlVM, libvirtfake.StateRunning) }
 	if err := r.migrate(); err == nil {
 		t.Fatal("the move succeeded with the source domain still active")
 	}
-	if m, ok := r.marker(); !ok || m.Phase != fwmig.PhaseSourceStateSuspect || m.ParkedFrom != fwmig.PhaseMigrating {
-		t.Fatalf("marker %+v (present %v), want parked source_state_suspect from migrating", m, ok)
-	}
 	if r.log.has("verify") || r.log.has("commit") {
 		t.Fatalf("steps %v: verified or committed with the source active", r.log.get())
 	}
+	requireAbortModes(t, r, pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_PRE_CUTOVER, pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_DISCARD_UNVERIFIED)
+	if m, ok := r.marker(); ok {
+		t.Fatalf("marker left %+v, want it removed after the discard", m)
+	}
+	if vm := r.row(); vm.HostName != "src-host" || vm.State != "running" {
+		t.Errorf("row %s on %s, want running on src-host", vm.State, vm.HostName)
+	}
+	r.requireSourceIntact("after the source stayed active")
 }

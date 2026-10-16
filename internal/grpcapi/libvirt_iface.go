@@ -37,6 +37,10 @@ type LibvirtBackend interface {
 	// target guest runs (spec §6.6, I5): only with the attempt's hold in
 	// state resuming.
 	ResumeFirmwareMoveTarget(name, uuid, attempt string) error
+	// ResumeFirmwareMoveSource is the one way the source guest of a live
+	// firmware move that failed paused before cutover runs again (§7 M1p,
+	// I5): only with the attempt's marker before cutover.
+	ResumeFirmwareMoveSource(name, uuid, attempt string) error
 	DomainState(name string) (string, error)
 	// AbortMigration aborts the domain's running migration job. MigrateToTarget
 	// takes no context, so this is the only way to stop one.

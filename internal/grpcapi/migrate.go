@@ -24,6 +24,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/dns"
+	"github.com/litevirt/litevirt/internal/fwmig"
 	"github.com/litevirt/litevirt/internal/hooks"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
@@ -561,14 +562,14 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	var fwl *liveFirmwareRun
 	defer func() {
 		if abort.armed {
-			var answered bool
+			var park fwmig.Phase
 			var why string
 			if fwl != nil {
-				answered, why = s.abortLiveFirmwareBeforeCutover(ctx, fwl)
+				park, why = s.abortLiveFirmwareBeforeCutover(ctx, fwl, false)
 			}
 			s.undoMigrationAttempt(ctx, vm.Name, req.TargetHost, abort)
 			if fwl != nil {
-				s.settleLiveFirmwareAbort(ctx, fwl, answered, why)
+				s.settleLiveFirmwareAbort(ctx, fwl, park, why)
 			}
 		}
 	}()
@@ -775,6 +776,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	}
 	// §6.1 step 5: the marker migrating, last before libvirt has the guest.
 	if fwl != nil {
+		fwl.vfs = detachedVFs
 		if err := s.startLiveFirmwareMigration(fwl); err != nil {
 			return err
 		}
@@ -830,6 +832,41 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		done <- s.virt.MigrateToTarget(vm.Name, dconnuri, params)
 	}()
 
+	// failedOnSource ends a migration that left the guest on this host.
+	failedOnSource := func(migrateErr error) error {
+		// Migration failed — VM is still on the source host.
+		// Check if the domain is still alive; if so, restore to "running"
+		// instead of leaving it in "error" (#21).
+		//
+		// Bounded and detached from the request: a client that goes
+		// away now must not drop the restore and strand the row
+		// `migrating`, which nothing else heals.
+		fctx, fcancel := detachedMigrateCleanupCtx(ctx)
+		defer fcancel()
+		// The VFs go back before the row says running: the guest stayed.
+		s.reattachVFsOnSource(fctx, vm.Name, detachedVFs, len(detachedVFs) > 0)
+		// A live firmware move is aborted (or parked) on the target first;
+		// its marker goes only after the row is restored (§7 M1, M1p). A
+		// park whose source guest is not running keeps the row migrating.
+		var unmark func()
+		keepRow := false
+		if fwl != nil {
+			unmark, keepRow = s.liveFirmwareMigrateFailed(fctx, fwl, migrateErr)
+		}
+		if !keepRow && s.restoreSourceStateAfterFailedMigration(fctx, vm.Name,
+			fmt.Sprintf("migration to %s failed: %v", req.TargetHost, migrateErr), migrateErr.Error()) {
+			slog.Warn("migration failed but VM still running on source",
+				"vm", vm.Name, "target", req.TargetHost, "error", migrateErr)
+		}
+		if unmark != nil {
+			unmark()
+		}
+		s.cleanupFailedMigrationTarget(fctx, vm.Name, req.TargetHost, createdStubs)
+		send(pb.MigratePhase_MIGRATE_FAILED, 0, 0) //nolint:errcheck
+		s.recordMigrationMetrics(strategyLabel, "failure", time.Since(migrationStart), 0, 0)
+		return status.Errorf(codes.Internal, "migration failed: %v", migrateErr)
+	}
+
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -854,38 +891,25 @@ poll:
 					"libvirt and will be completed in the background — watch `lv events %s`",
 				vm.Name, req.TargetHost, migrateCtx.Err(), vm.Name)
 		case migrateErr := <-done:
-			if migrateErr != nil && fwl != nil && s.liveFirmwareSourceInactive(vm.Name) {
-				// The source domain is shut off: the guest left it (a failure
-				// after the target took it, §7 M1b). The move goes on to
-				// cutover, where Verify decides.
-				slog.Warn("migrate: the migration call failed, but the source domain is inactive; verifying the target",
-					"vm", vm.Name, "target", req.TargetHost, "error", migrateErr)
-				break poll
+			if fwl != nil {
+				if !s.liveFirmwareSourceActive(vm.Name) {
+					// The source domain is not known to be active: the guest
+					// may have left it (a failure after the target took it,
+					// §7 M1b). The move goes on to cutover, which confirms the
+					// domain inactive before Verify decides.
+					if migrateErr != nil {
+						slog.Warn("migrate: the migration call failed, but the source domain is not active; verifying the target",
+							"vm", vm.Name, "target", req.TargetHost, "error", migrateErr)
+					}
+					break poll
+				}
+				if migrateErr == nil {
+					// The guest did not leave: never a cutover (§7 M1, M1p).
+					migrateErr = errLiveFirmwareSourceActive
+				}
 			}
 			if migrateErr != nil {
-				// Migration failed — VM is still on the source host.
-				// Check if the domain is still alive; if so, restore to "running"
-				// instead of leaving it in "error" (#21).
-				//
-				// Bounded and detached from the request: a client that goes
-				// away now must not drop the restore and strand the row
-				// `migrating`, which nothing else heals.
-				fctx, fcancel := detachedMigrateCleanupCtx(ctx)
-				defer fcancel()
-				// The VFs go back before the row says running: the guest stayed.
-				s.reattachVFsOnSource(fctx, vm.Name, detachedVFs, len(detachedVFs) > 0)
-				if fwl != nil {
-					s.liveFirmwareMigrateFailed(fctx, fwl, migrateErr)
-				}
-				if s.restoreSourceStateAfterFailedMigration(fctx, vm.Name,
-					fmt.Sprintf("migration to %s failed: %v", req.TargetHost, migrateErr), migrateErr.Error()) {
-					slog.Warn("migration failed but VM still running on source",
-						"vm", vm.Name, "target", req.TargetHost, "error", migrateErr)
-				}
-				s.cleanupFailedMigrationTarget(fctx, vm.Name, req.TargetHost, createdStubs)
-				send(pb.MigratePhase_MIGRATE_FAILED, 0, 0) //nolint:errcheck
-				s.recordMigrationMetrics(strategyLabel, "failure", time.Since(migrationStart), 0, 0)
-				return status.Errorf(codes.Internal, "migration failed: %v", migrateErr)
+				return failedOnSource(migrateErr)
 			}
 			break poll
 		case <-ticker.C:
@@ -906,6 +930,9 @@ poll:
 	// other outcome parks it, both copies kept.
 	if fwl != nil {
 		if err := s.liveFirmwareCutover(ctx, fwl); err != nil {
+			if errors.Is(err, errLiveFirmwareSourceActive) {
+				return failedOnSource(err)
+			}
 			s.recordMigrationMetrics(strategyLabel, "failure", time.Since(migrationStart), 0, 0)
 			return err
 		}
@@ -1016,21 +1043,30 @@ func (s *Server) adoptAbandonedMigration(
 			}
 			err = <-done
 		}
-		if err != nil && finish.fwLive != nil && s.liveFirmwareSourceInactive(vm.Name) {
-			// The guest left the source (§7 M1b): Verify decides, below.
-			slog.Warn("migrate: adopted firmware migration failed with the source domain inactive; verifying the target",
-				"vm", vm.Name, "target", targetHost, "error", err)
-			err = nil
+		if finish.fwLive != nil {
+			if !s.liveFirmwareSourceActive(vm.Name) {
+				// The guest may have left the source (§7 M1b): cutover and
+				// Verify decide, below.
+				if err != nil {
+					slog.Warn("migrate: adopted firmware migration failed with the source domain not active; verifying the target",
+						"vm", vm.Name, "target", targetHost, "error", err)
+				}
+				err = nil
+			} else if err == nil {
+				err = errLiveFirmwareSourceActive
+			}
 		}
-		if err != nil {
+		failed := func(err error) {
 			// The migration failed after we stopped watching; the guest is still
 			// on the source. Anything but `migrating` — that is the state nothing
 			// heals.
 			// The guest stayed, so it gets back the VFs detached for the move,
 			// as a watched failure does.
 			s.reattachVFsOnSource(ctx, vm.Name, finish.detachedVFs, len(finish.detachedVFs) > 0)
+			var unmark func()
+			keepRow := false
 			if finish.fwLive != nil {
-				s.liveFirmwareMigrateFailed(ctx, finish.fwLive, err)
+				unmark, keepRow = s.liveFirmwareMigrateFailed(ctx, finish.fwLive, err)
 			}
 			state, detail := "error", fmt.Sprintf("migration to %s failed after the request was abandoned: %v", targetHost, err)
 			if st, sErr := s.virt.DomainState(vm.Name); sErr == nil && st == "running" {
@@ -1040,21 +1076,34 @@ func (s *Server) adoptAbandonedMigration(
 			// are still on THIS host. state is "error" or "running" depending on
 			// what libvirt reports, so it can publish a running VM and has to be
 			// routed — this function was added after the chokepoint landed and so
-			// was never routed with the rest.
-			if werr := s.publishRunning(ctx, vm.Name, state, func(ctx context.Context) error {
-				return corrosion.UpdateVMState(ctx, s.db, vm.Name, state, detail)
-			}); werr != nil {
-				s.noteStateWriteFail(corrosion.OpVMState, werr)
+			// was never routed with the rest. A parked firmware move whose
+			// source guest is not running keeps the row migrating.
+			if !keepRow {
+				if werr := s.publishRunning(ctx, vm.Name, state, func(ctx context.Context) error {
+					return corrosion.UpdateVMState(ctx, s.db, vm.Name, state, detail)
+				}); werr != nil {
+					s.noteStateWriteFail(corrosion.OpVMState, werr)
+				}
+			}
+			if unmark != nil {
+				unmark()
 			}
 			s.cleanupFailedMigrationTarget(ctx, vm.Name, targetHost, finish.createdStubs)
 			slog.Warn("migrate: adopted migration failed", "vm", vm.Name, "target", targetHost, "error", err)
 			s.recordVMEvent(ctx, vm.Name, "vm.migrated", "error", "abandoned request; migration failed: "+err.Error())
+		}
+		if err != nil {
+			failed(err)
 			return
 		}
 
 		// A live firmware move commits only on Verify's MATCH, adopted or not.
 		if finish.fwLive != nil {
 			if cerr := s.liveFirmwareCutover(ctx, finish.fwLive); cerr != nil {
+				if errors.Is(cerr, errLiveFirmwareSourceActive) {
+					failed(cerr)
+					return
+				}
 				s.recordVMEvent(ctx, vm.Name, "vm.migrated", "error", "abandoned request; "+cerr.Error())
 				return
 			}

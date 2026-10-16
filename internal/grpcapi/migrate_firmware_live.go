@@ -15,6 +15,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -37,6 +38,8 @@ type liveFirmwareRun struct {
 	marker fwmig.Marker
 	// prepared is when Prepare answered: the target's hold is as old.
 	prepared time.Time
+	// vfs are the SR-IOV VFs detached from the guest for the move.
+	vfs []corrosion.PCIDeviceRecord
 }
 
 // fwLiveSourceState is the Server's test seams for the source half.
@@ -84,8 +87,10 @@ var fwmigConditionFor = map[fwmig.Phase]string{
 	fwmig.PhaseSourceStateSuspect: condFwmigSourceStateSuspect,
 	fwmig.PhaseTargetRan:          condFwmigTargetRan,
 	fwmig.PhaseNvramUnconfirmed:   condFwmigNvramUnconfirmed,
-	fwmig.PhaseDiscardPending:     condFwmigUnverified,
-	fwmig.PhaseSourcePaused:       condFwmigSourcePaused,
+	// discard_pending is V1 with the DISCARD unanswered: the target is
+	// unreachable, and nothing is unverified-and-discarded yet.
+	fwmig.PhaseDiscardPending: condFwmigTargetUnreachable,
+	fwmig.PhaseSourcePaused:   condFwmigSourcePaused,
 }
 
 // putLiveFirmwareMarker writes r's marker in phase p.
@@ -104,6 +109,12 @@ func (s *Server) putLiveFirmwareMarker(r *liveFirmwareRun, p fwmig.Phase) error 
 // is what the caller returns.
 func (s *Server) parkLiveFirmwareMove(ctx context.Context, r *liveFirmwareRun, p fwmig.Phase, detail string) error {
 	ctx = context.WithoutCancel(ctx)
+	if p == fwmig.PhaseTargetUnreachable && r.marker.Phase.Parked() {
+		// A retry of a parked move's blocked call that went unanswered (or was
+		// refused for the state the park recorded, D2-10 m-7) learns nothing
+		// new: the park stands, with its own condition.
+		p = r.marker.Phase
+	}
 	m, err := r.marker.Park(p)
 	if err != nil {
 		// A park this marker cannot take keeps it as it is: it still vetoes.
@@ -180,8 +191,9 @@ func (s *Server) beginLiveFirmwareMove(ctx context.Context, vm *corrosion.VMReco
 		return nil, err
 	}
 	client, closer, err := s.liveFirmwarePeer(ctx, target.Name)
+	sent := err == nil
 	var resp *pb.PrepareLiveFirmwareTargetResponse
-	if err == nil {
+	if sent {
 		cctx, cancel := context.WithTimeout(ctx, fwLiveCallTimeout)
 		resp, err = client.PrepareLiveFirmwareTarget(cctx, &pb.PrepareLiveFirmwareTargetRequest{
 			VmName: vm.Name, Uuid: elig.uuid, CreatedAt: vm.CreatedAt, AttemptId: r.marker.Attempt,
@@ -191,8 +203,10 @@ func (s *Server) beginLiveFirmwareMove(ctx context.Context, vm *corrosion.VMReco
 		cancel()
 		closer()
 	}
-	if status.Code(err) == codes.Unimplemented {
-		// An older target: nothing was written there (§7 P1).
+	if !sent || status.Code(err) == codes.Unimplemented {
+		// No request reached the target, or an older target without the
+		// RPC: nothing was written there (§7 P1), so the move is refused
+		// with no marker and no abort.
 		if rerr := s.fwRecords().RemoveMarker(vm.Name); rerr != nil {
 			return r, status.Errorf(codes.Internal, "VM %q: remove the marker of a refused live firmware migration: %v", vm.Name, rerr)
 		}
@@ -231,92 +245,163 @@ func (s *Server) startLiveFirmwareMigration(r *liveFirmwareRun) error {
 	return s.putLiveFirmwareMarker(r, fwmig.PhaseMigrating)
 }
 
-// ── Before cutover: abort (§7 P2) ──
+// ── Before cutover: abort (§7 P1, P2, M1, M1p) ──
 
-// abortLiveFirmwareBeforeCutover sends Abort PRE_CUTOVER for r's attempt. It
-// reports whether the target answered that it holds nothing of the attempt
-// and has no domain of the VM (D2-9 M-6: an OK answer with a domain present
-// is not "nothing held"), with the reason when not.
-func (s *Server) abortLiveFirmwareBeforeCutover(ctx context.Context, r *liveFirmwareRun) (bool, string) {
+// sendLiveFirmwareAbort sends Abort in mode for the attempt b of vm to
+// target, with the stubs it created there. source_domain_active is read live.
+func (s *Server) sendLiveFirmwareAbort(ctx context.Context, target, vm string, b fwmig.Binding, mode pb.FirmwareAbortMode, stubs []string) (*pb.AbortLiveFirmwareTargetResponse, error) {
 	ctx = context.WithoutCancel(ctx)
-	m := r.marker
-	client, closer, err := s.liveFirmwarePeer(ctx, r.target.Name)
+	client, closer, err := s.liveFirmwarePeer(ctx, target)
 	if err != nil {
-		return false, fmt.Sprintf("the abort could not reach %s: %v", r.target.Name, err)
+		return nil, err
 	}
 	defer closer()
 	cctx, cancel := context.WithTimeout(ctx, fwLiveCallTimeout)
 	defer cancel()
-	resp, err := client.AbortLiveFirmwareTarget(cctx, &pb.AbortLiveFirmwareTargetRequest{
-		VmName: m.VM, Uuid: m.UUID, CreatedAt: m.CreatedAt, AttemptId: m.Attempt,
-		Mode: pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_PRE_CUTOVER, SourceDomainActive: s.sourceDomainActive(m.VM),
-		CreatedStubs: m.CreatedStubs,
+	return client.AbortLiveFirmwareTarget(cctx, &pb.AbortLiveFirmwareTargetRequest{
+		VmName: vm, Uuid: b.UUID, CreatedAt: b.CreatedAt, AttemptId: b.Attempt,
+		Mode: mode, SourceDomainActive: s.sourceDomainActive(vm), CreatedStubs: stubs,
 	})
-	switch {
-	case err != nil:
-		return false, fmt.Sprintf("the abort before cutover was not answered by %s: %v", r.target.Name, err)
-	case resp.GetRefused():
-		return false, fmt.Sprintf("%s refused the abort before cutover (hold %s, domain %s): %s",
-			r.target.Name, resp.GetHoldState(), domainWord(resp.GetTargetDomain()), resp.GetDetail())
-	case resp.GetTargetDomain().GetPresent():
-		return false, fmt.Sprintf("%s answered the abort, but a domain of the VM is defined there (%s)",
-			r.target.Name, resp.GetTargetDomain().GetState())
-	}
-	return true, ""
 }
 
-// settleLiveFirmwareAbort ends r's move after an abort before cutover: the
-// marker removed once the target answered for its hold, parked
-// target_unreachable otherwise (restart recovery retries the abort).
-func (s *Server) settleLiveFirmwareAbort(ctx context.Context, r *liveFirmwareRun, answered bool, why string) {
-	if !answered {
-		_ = s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseTargetUnreachable, why)
+// abortLiveFirmwareBeforeCutover sends Abort PRE_CUTOVER for r's attempt and
+// decides from its answer (§7 P2, M1). It returns "" once the target answered
+// that it holds nothing of the attempt and has no domain of the VM (D2-9
+// M-6), and otherwise the phase to park in, with the reason.
+//
+// guestMayBeThere is set after the migration call (M1): libvirt may have
+// left the incoming guest on the target (a Confirm-phase failure, K-3). Its
+// Abort refusal decides — never Verify, which before cutover would judge a
+// copy against a source that still runs: a domain paused or shut off under a
+// prepared hold is discarded at once (the running source is the live,
+// current copy). A DISCARD the target refuses parks target_ran; one it does
+// not answer parks target_unreachable. Any other domain or refusal is a
+// domain this attempt cannot account for, and parks target_ran: both copies
+// kept, nothing resumed.
+func (s *Server) abortLiveFirmwareBeforeCutover(ctx context.Context, r *liveFirmwareRun, guestMayBeThere bool) (fwmig.Phase, string) {
+	m := r.marker
+	resp, err := s.sendLiveFirmwareAbort(ctx, r.target.Name, m.VM, m.Binding, pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_PRE_CUTOVER, m.CreatedStubs)
+	if err != nil {
+		return fwmig.PhaseTargetUnreachable, fmt.Sprintf("the abort before cutover was not answered by %s: %v", r.target.Name, err)
+	}
+	td := resp.GetTargetDomain()
+	if !resp.GetRefused() && !td.GetPresent() {
+		return "", ""
+	}
+	seen := fmt.Sprintf("%s answered the abort before cutover with hold %s and domain %s (refused %v): %s",
+		r.target.Name, orNone(resp.GetHoldState()), domainWord(td), resp.GetRefused(), resp.GetDetail())
+	if !guestMayBeThere || !resp.GetRefused() || !td.GetPresent() ||
+		(td.GetState() != "paused" && td.GetState() != "shutoff") || resp.GetHoldState() != string(fwmig.HoldPrepared) {
+		return fwmig.PhaseTargetRan, seen + "; a domain or hold there this attempt cannot discard before cutover"
+	}
+	d, err := s.sendLiveFirmwareAbort(ctx, r.target.Name, m.VM, m.Binding, pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_DISCARD_UNVERIFIED, m.CreatedStubs)
+	switch {
+	case err != nil:
+		return fwmig.PhaseTargetUnreachable, fmt.Sprintf("%s; the discard of its copy was not answered: %v", seen, err)
+	case d.GetRefused():
+		return fwmig.PhaseTargetRan, fmt.Sprintf("%s; %s refused the discard of its copy: %s", seen, r.target.Name, d.GetDetail())
+	case d.GetTargetDomain().GetPresent():
+		return fwmig.PhaseTargetRan, fmt.Sprintf("%s; after the discard a domain of the VM is still defined there (%s)", seen, d.GetTargetDomain().GetState())
+	}
+	slog.Warn("live firmware move: the target's copy of a migration that failed before cutover was discarded",
+		"vm", m.VM, "attempt", m.Attempt, "target", r.target.Name)
+	return "", ""
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s
+}
+
+// settleLiveFirmwareAbort ends r's move after an abort before cutover: parked
+// in phase when one is given, the marker removed otherwise.
+func (s *Server) settleLiveFirmwareAbort(ctx context.Context, r *liveFirmwareRun, phase fwmig.Phase, why string) {
+	if phase != "" {
+		_ = s.parkLiveFirmwareMove(ctx, r, phase, why)
 		return
 	}
+	s.unmarkLiveFirmwareMove(r, "undone before cutover")
+}
+
+// unmarkLiveFirmwareMove removes r's marker once nothing of the move is left
+// to resolve.
+func (s *Server) unmarkLiveFirmwareMove(r *liveFirmwareRun, how string) {
 	if err := s.fwRecords().RemoveMarker(r.marker.VM); err != nil {
-		slog.Error("live firmware move: the target dropped its hold, but the marker cannot be removed; restart recovery removes it",
-			"vm", r.marker.VM, "attempt", r.marker.Attempt, "error", err)
+		slog.Error("live firmware move: resolved, but the marker cannot be removed; restart recovery removes it",
+			"vm", r.marker.VM, "attempt", r.marker.Attempt, "how", how, "error", err)
 		return
 	}
-	slog.Info("live firmware move: undone before cutover", "vm", r.marker.VM, "attempt", r.marker.Attempt, "target", r.target.Name)
+	slog.Info("live firmware move: "+how, "vm", r.marker.VM, "attempt", r.marker.Attempt, "target", r.target.Name)
 }
 
 // ── After the migration call ──
 
-// liveFirmwareSourceInactive reports whether this host's domain of vm is
-// defined and inactive (shut off): the guest left it, so the move continues
-// to cutover (§7 M1b). An unreadable state is not inactive.
-func (s *Server) liveFirmwareSourceInactive(vm string) bool {
+// liveFirmwareSourceActive reports whether this host's domain of vm is known
+// to be active. An unreadable state is not: the move goes on to cutover,
+// whose own check parks it (§7 M1b).
+func (s *Server) liveFirmwareSourceActive(vm string) bool {
 	if s.virt == nil {
 		return false
 	}
 	active, err := s.virt.DomainIsActive(vm)
-	return err == nil && !active
+	return err == nil && active
 }
 
+// errLiveFirmwareSourceActive is the cutover finding the source domain still
+// active: the guest did not leave, and the caller handles it as a failed
+// migration (§7 M1, M1p).
+var errLiveFirmwareSourceActive = errors.New("the migration returned, and the source domain is still active")
+
 // liveFirmwareMigrateFailed is the source's answer to a migration call that
-// failed with its domain not inactive: before cutover, the guest is still
-// here. A running guest's move is aborted before cutover and its marker
-// removed once the target answered for its hold; anything else is parked
-// with both copies kept. The caller then restores the row as for any failed
-// migration.
-func (s *Server) liveFirmwareMigrateFailed(ctx context.Context, r *liveFirmwareRun, migrateErr error) {
+// left its guest here, its domain active (§7 M1, M1p). It returns unmark, to
+// call once the caller restored the row (nil when the move parked), and
+// keepRow: the row stays migrating because the source guest is not running.
+//
+//   - Paused (M1p): Abort PRE_CUTOVER; a target with nothing of the attempt
+//     lets the source resume its guest first (ResumeFirmwareMoveSource), the
+//     row is then restored and the marker removed. A target with a domain
+//     parks source_paused, both guests paused.
+//   - Running, or any other active state (M1): Abort PRE_CUTOVER, with the
+//     automatic DISCARD of a target's paused copy under a prepared hold.
+func (s *Server) liveFirmwareMigrateFailed(ctx context.Context, r *liveFirmwareRun, migrateErr error) (unmark func(), keepRow bool) {
 	ctx = context.WithoutCancel(ctx)
-	st, err := s.virt.DomainStateReason(r.marker.VM)
+	if st, err := s.virt.DomainStateReason(r.marker.VM); err == nil && st.Reason == "paused" {
+		return s.liveFirmwareSourcePaused(ctx, r, migrateErr)
+	}
+	if phase, why := s.abortLiveFirmwareBeforeCutover(ctx, r, true); phase != "" {
+		_ = s.parkLiveFirmwareMove(ctx, r, phase, fmt.Sprintf("the migration failed (%v); %s", migrateErr, why))
+		return nil, false
+	}
+	return func() { s.unmarkLiveFirmwareMove(r, "the migration failed; undone before cutover") }, false
+}
+
+// liveFirmwareSourcePaused is §7 M1p: the migration failed and left the
+// source guest paused.
+func (s *Server) liveFirmwareSourcePaused(ctx context.Context, r *liveFirmwareRun, migrateErr error) (func(), bool) {
+	m := r.marker
+	resp, err := s.sendLiveFirmwareAbort(ctx, r.target.Name, m.VM, m.Binding, pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_PRE_CUTOVER, m.CreatedStubs)
 	switch {
 	case err != nil:
-		_ = s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseTargetUnreachable,
-			fmt.Sprintf("the migration failed (%v) and the state of the source domain cannot be read: %v", migrateErr, err))
-	case st.State == "running":
-		answered, why := s.abortLiveFirmwareBeforeCutover(ctx, r)
-		s.settleLiveFirmwareAbort(ctx, r, answered, fmt.Sprintf("the migration failed (%v); %s", migrateErr, why))
-	case st.Reason == "paused":
-		_ = s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseSourcePaused,
-			fmt.Sprintf("the migration failed (%v) and left the source guest paused", migrateErr))
-	default:
-		_ = s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseTargetUnreachable,
-			fmt.Sprintf("the migration failed (%v) and the source domain is %s (%s)", migrateErr, st.State, st.Reason))
+		_ = s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseTargetUnreachable, fmt.Sprintf(
+			"the migration failed (%v) and left the source guest paused; the abort before cutover was not answered by %s: %v", migrateErr, r.target.Name, err))
+		return nil, true
+	case resp.GetRefused() || resp.GetTargetDomain().GetPresent():
+		_ = s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseSourcePaused, fmt.Sprintf(
+			"the migration failed (%v) and left the source guest paused, and %s holds a domain of the VM (hold %s, domain %s): %s",
+			migrateErr, r.target.Name, orNone(resp.GetHoldState()), domainWord(resp.GetTargetDomain()), resp.GetDetail()))
+		return nil, true
 	}
+	// The target holds nothing: the paused source is the only copy. It runs
+	// again first; the marker goes only after the row is restored.
+	if err := s.virt.ResumeFirmwareMoveSource(m.VM, m.UUID, m.Attempt); err != nil {
+		_ = s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseSourcePaused, fmt.Sprintf(
+			"the migration failed (%v) and left the source guest paused; the target holds nothing of it, but the resume failed: %v", migrateErr, err))
+		return nil, true
+	}
+	slog.Info("live firmware move: the paused source guest was resumed after a failed migration", "vm", m.VM, "attempt", m.Attempt)
+	return func() { s.unmarkLiveFirmwareMove(r, "the migration failed; the source guest resumed") }, false
 }
 
 // ── Step 7 and 8: cutover and Verify ──
@@ -330,12 +415,14 @@ func (s *Server) liveFirmwareCutover(ctx context.Context, r *liveFirmwareRun) er
 	vm := r.marker.VM
 	active, err := s.virt.DomainIsActive(vm)
 	if err != nil {
-		return s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseTargetUnreachable,
+		// Not known to have stopped, so its state cannot be read as final.
+		return s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseSourceStateMissing,
 			fmt.Sprintf("the migration returned, and whether the source domain is still active cannot be read: %v", err))
 	}
 	if active {
-		return s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseSourceStateSuspect,
-			"the migration returned, and the source domain is still active")
+		// The guest did not leave: the caller handles it as a failed
+		// migration (§7 M1, M1p), never as a cutover.
+		return errLiveFirmwareSourceActive
 	}
 	reason := "unknown"
 	if st, err := s.virt.DomainStateReason(vm); err == nil && st.Reason != "" {
@@ -385,24 +472,97 @@ func (s *Server) verifyLiveFirmwareMove(ctx context.Context, r *liveFirmwareRun)
 		slog.Info("live firmware move: target verified", "vm", m.VM, "attempt", m.Attempt, "target", r.target.Name)
 		return nil
 	case pb.FirmwareVerdict_FIRMWARE_VERDICT_TARGET_RAN:
+		// V5: the guard failed. Nothing deleted, no further step.
 		return s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseTargetRan, resp.GetDetail())
 	case pb.FirmwareVerdict_FIRMWARE_VERDICT_MISMATCH, pb.FirmwareVerdict_FIRMWARE_VERDICT_NOT_RUNNING:
 		if m.SrcStopReason != fwmig.StopReasonMigrated {
-			// The source domain did not stop as a completed migration stops
-			// it: its state may be stale (I6). Both copies are kept.
+			// V1b: the source domain did not stop as a completed migration
+			// stops it: its state may be stale (I6). Both copies are kept.
 			return s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseSourceStateSuspect,
 				fmt.Sprintf("Verify answered %s after the source stopped with reason %q: %s", resp.GetVerdict(), m.SrcStopReason, resp.GetDetail()))
 		}
-		// The target's copy is not the source's final state: it is to be
-		// discarded; until that is done both copies are kept.
-		return s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseDiscardPending,
-			fmt.Sprintf("Verify answered %s: %s", resp.GetVerdict(), resp.GetDetail()))
+		// V1: the target's copy is not the source's final state.
+		return s.discardUnverifiedLiveFirmware(ctx, r, resp)
+	case pb.FirmwareVerdict_FIRMWARE_VERDICT_NOT_HELD:
+		if td.GetPresent() {
+			// V3: no hold, but a domain of the VM: nothing here decides it.
+			return s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseTargetUnreachable,
+				fmt.Sprintf("Verify answered NOT_HELD with a domain of the VM on %s (%s): %s", r.target.Name, domainWord(td), resp.GetDetail()))
+		}
+		// V4: the incoming migration never landed.
+		return s.liveFirmwareNeverLanded(ctx, r, resp.GetDetail())
+	case pb.FirmwareVerdict_FIRMWARE_VERDICT_BAD_REQUEST:
+		// V6: the target lacks a hash this source should have sent (a source
+		// bug): the source's final state is what is missing. Hold kept.
+		return s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseSourceStateMissing,
+			fmt.Sprintf("Verify answered BAD_REQUEST: %s", resp.GetDetail()))
 	default:
-		// NOT_HELD, BAD_REQUEST or a verdict this build does not know: the
-		// target's answer decides nothing here.
+		// A verdict this build does not know decides nothing.
 		return s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseTargetUnreachable,
 			fmt.Sprintf("Verify answered %s (domain %s): %s", resp.GetVerdict(), domainWord(td), resp.GetDetail()))
 	}
+}
+
+// discardUnverifiedLiveFirmware is §7 V1: Verify found the target's copy is
+// not the source's final state, and the source domain stopped as a completed
+// migration stops it, so the source's copy is current. Abort DISCARD; once it
+// answers, the row is stopped on the source, the condition raised and the
+// marker removed. Unanswered → discard_pending; refused (the target domain
+// runs) → target_ran.
+func (s *Server) discardUnverifiedLiveFirmware(ctx context.Context, r *liveFirmwareRun, verify *pb.VerifyLiveFirmwareTargetResponse) error {
+	m := r.marker
+	why := fmt.Sprintf("Verify answered %s: %s", verify.GetVerdict(), verify.GetDetail())
+	d, err := s.sendLiveFirmwareAbort(ctx, r.target.Name, m.VM, m.Binding, pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_DISCARD_UNVERIFIED, m.CreatedStubs)
+	switch {
+	case err != nil:
+		return s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseDiscardPending, fmt.Sprintf("%s; the discard of the target's copy was not answered by %s: %v", why, r.target.Name, err))
+	case d.GetRefused():
+		return s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseTargetRan, fmt.Sprintf("%s; %s refused the discard: %s", why, r.target.Name, d.GetDetail()))
+	case d.GetTargetDomain().GetPresent():
+		return s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseTargetRan,
+			fmt.Sprintf("%s; after the discard a domain of the VM is still defined on %s (%s)", why, r.target.Name, d.GetTargetDomain().GetState()))
+	}
+	quarantine := fmt.Sprintf("%s:<data_dir>/%s/%s-%s/", r.target.Name, fwmig.QuarantineDir, m.VM, m.Attempt)
+	detail := fmt.Sprintf("live firmware migration %s to %s did not verify (%s); the target's copy is quarantined, and the VM is stopped here with its firmware state: `lv start`",
+		m.Attempt, r.target.Name, verify.GetVerdict())
+	s.stopLiveFirmwareMoveOnSource(ctx, r, detail)
+	if cerr := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{
+		Code: condFwmigUnverified, VM: m.VM, Attempt: m.Attempt, Source: s.hostName, Target: r.target.Name,
+		Hashes: map[string]string{"src_permall_sha256": m.SrcPermallSHA256, "src_nvram_sha256": m.SrcNvramSHA256,
+			"dst_permall_sha256": verify.GetDstPermallSha256()},
+		Paths:  []string{quarantine, s.fw().SwtpmDir(m.UUID), s.fw().NvramPath(m.VM)},
+		Detail: why,
+		Action: "the source's firmware state is kept and the VM is stopped here; `lv start` runs it from that state, and the quarantine on the target is for inspection",
+	}); cerr != nil {
+		slog.Warn("live firmware move: raise the condition", "vm", m.VM, "code", condFwmigUnverified, "error", cerr)
+	}
+	s.unmarkLiveFirmwareMove(r, "the target's copy did not verify and was discarded")
+	return status.Errorf(codes.FailedPrecondition, "VM %q: %s", m.VM, detail)
+}
+
+// liveFirmwareNeverLanded is §7 V4: Verify answered NOT_HELD and the target
+// has no domain of the VM, so the incoming migration never landed. The guest
+// runs nowhere: the row is stopped on the source, its state kept, the marker
+// removed.
+func (s *Server) liveFirmwareNeverLanded(ctx context.Context, r *liveFirmwareRun, why string) error {
+	m := r.marker
+	detail := fmt.Sprintf("live firmware migration %s to %s never landed there (%s); the VM is stopped here with its firmware state: `lv start`",
+		m.Attempt, r.target.Name, why)
+	s.stopLiveFirmwareMoveOnSource(ctx, r, detail)
+	s.unmarkLiveFirmwareMove(r, "the migration never landed on the target")
+	return status.Errorf(codes.FailedPrecondition, "VM %q: %s", m.VM, detail)
+}
+
+// stopLiveFirmwareMoveOnSource records a move that ended with its guest on
+// neither host: the VFs detached for it released (the domain is shut off
+// here), the row stopped on the source.
+func (s *Server) stopLiveFirmwareMoveOnSource(ctx context.Context, r *liveFirmwareRun, detail string) {
+	ctx = context.WithoutCancel(ctx)
+	s.reattachVFsOnSource(ctx, r.marker.VM, r.vfs, len(r.vfs) > 0)
+	if err := corrosion.UpdateVMState(ctx, s.db, r.marker.VM, "stopped", detail); err != nil {
+		s.noteStateWriteFail(corrosion.OpVMState, err)
+	}
+	s.recordVMEvent(ctx, r.marker.VM, "vm.migrate.firmware", "error", detail)
 }
 
 // retryLiveFirmwareCall makes call against r's target until it answers, with
@@ -485,6 +645,14 @@ func (s *Server) releaseLiveFirmwareMove(ctx context.Context, r *liveFirmwareRun
 	case pb.FirmwareVerdict_FIRMWARE_VERDICT_UNSPECIFIED:
 	case pb.FirmwareVerdict_FIRMWARE_VERDICT_TARGET_RAN:
 		return s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseTargetRan, resp.GetDetail())
+	case pb.FirmwareVerdict_FIRMWARE_VERDICT_BAD_REQUEST:
+		// V6 after the commit: the source sent no NVRAM hash.
+		return s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseSourceStateMissing, fmt.Sprintf("Release answered BAD_REQUEST: %s", resp.GetDetail()))
+	case pb.FirmwareVerdict_FIRMWARE_VERDICT_NOT_RUNNING:
+		// H1 with the held domain gone (held_domain_absent). The target holds
+		// the only verified copy: this parks, and never takes V1's DISCARD.
+		return s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseTargetUnreachable,
+			fmt.Sprintf("Release answered NOT_RUNNING (domain %s): %s", domainWord(resp.GetTargetDomain()), resp.GetDetail()))
 	default:
 		return s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseTargetUnreachable,
 			fmt.Sprintf("Release answered %s (domain %s): %s", v, domainWord(resp.GetTargetDomain()), resp.GetDetail()))
@@ -502,4 +670,123 @@ func (s *Server) releaseLiveFirmwareMove(ctx context.Context, r *liveFirmwareRun
 		return nil
 	}
 	return liveFirmwareSourceCleanup(s, ctx, r.marker)
+}
+
+// ── Fence-based resolution and owed DISCARDs (§7) ──
+
+// ResolveLiveFirmwareMoveByFence is §7's fence-based resolution of vm's move
+// parked target_unreachable or discard_pending. It acts only when the
+// target is proved off (HostProvedOff: fenced with a proof-grade fence, or
+// fence-confirmed), and only when the VM's row, re-read now, names this host
+// for the move's incarnation: the commit never landed, so this host's state is
+// the only current copy (the target never ran, I1). It then records the
+// DISCARD it owes the target (with the stubs), sets the row from the source
+// domain, and removes the marker, so `lv start` works here. A row naming the
+// target, or anything it cannot read, leaves the park (its start veto keeps
+// the stale source state from booting) for an operator. Reports whether it
+// resolved the move.
+func (s *Server) ResolveLiveFirmwareMoveByFence(ctx context.Context, vm string) (bool, error) {
+	unlock := s.lockVM(vm)
+	defer unlock()
+	m, ok, err := s.fwRecords().GetMarker(vm)
+	if err != nil || !ok {
+		return false, err
+	}
+	if m.Phase != fwmig.PhaseTargetUnreachable && m.Phase != fwmig.PhaseDiscardPending {
+		return false, nil
+	}
+	off, err := corrosion.HostProvedOff(ctx, s.db, m.Target)
+	if err != nil || !off {
+		return false, err
+	}
+	row, err := corrosion.GetVM(ctx, s.db, vm)
+	if err != nil || row == nil {
+		return false, err
+	}
+	if row.HostName != s.hostName ||
+		!m.Binding.SameIncarnation(fwmig.Binding{UUID: parseFirmwareSpec(row.Spec).UUID, CreatedAt: row.CreatedAt}) {
+		slog.Warn("live firmware move: the target is proved off, but the VM's row does not name this host for the move's incarnation; the park stays for an operator",
+			"vm", vm, "attempt", m.Attempt, "target", m.Target, "row_host", row.HostName)
+		return false, nil
+	}
+	if err := s.fwRecords().PutOwedDiscard(fwmig.OwedDiscard{VM: vm, Binding: m.Binding, Target: m.Target,
+		CreatedStubs: m.CreatedStubs, Since: time.Now().UTC()}); err != nil {
+		return false, err
+	}
+	// The row before the marker: a crash between them leaves the marker,
+	// and the next pass resolves it again.
+	state, detail := "stopped", fmt.Sprintf("live firmware migration %s to %s was resolved after %s was proved off; the VM's firmware state here is current: `lv start`", m.Attempt, m.Target, m.Target)
+	if st, serr := s.sourceDomainState(vm); serr == nil && st == "running" {
+		state = "running"
+	} else if s.liveFirmwareSourceActive(vm) {
+		state = "error"
+	}
+	if werr := s.publishRunning(ctx, vm, state, func(ctx context.Context) error {
+		return corrosion.UpdateVMState(ctx, s.db, vm, state, detail)
+	}); werr != nil {
+		return false, werr
+	}
+	if err := s.fwRecords().RemoveMarker(vm); err != nil {
+		return false, err
+	}
+	if code, ok := fwmigConditionFor[m.Phase]; ok {
+		_ = s.resolveFirmwareMigrationCondition(ctx, code, vm)
+	}
+	if cerr := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{
+		Code: condFwmigDiscardOwed, VM: vm, Attempt: m.Attempt, Source: s.hostName, Target: m.Target,
+		Detail: fmt.Sprintf("%s is proved off; the DISCARD of its copy is sent when it answers", m.Target),
+		Action: "nothing: it is sent each interval, and dropped when the host is removed",
+	}); cerr != nil {
+		slog.Warn("live firmware move: raise the condition", "vm", vm, "code", condFwmigDiscardOwed, "error", cerr)
+	}
+	s.recordVMEvent(ctx, vm, "vm.migrate.firmware", "ok", detail)
+	slog.Warn("live firmware move: resolved by fence; a DISCARD is owed", "vm", vm, "attempt", m.Attempt, "target", m.Target, "row", state)
+	return true, nil
+}
+
+// RetryOwedFirmwareDiscardsOnce sends each owed DISCARD (§7 fence
+// resolution) to its target. Answered → the record goes; refused (the target
+// domain runs) → firmware_migration_discard_owed, critical, and it is kept;
+// unanswered → kept. A record whose target host is no longer a member is
+// dropped: nothing is left to discard.
+func (s *Server) RetryOwedFirmwareDiscardsOnce(ctx context.Context) {
+	owed, err := s.fwRecords().ListOwedDiscards()
+	if err != nil {
+		slog.Warn("live firmware move: the owed discards cannot be read", "error", err)
+		return
+	}
+	for _, o := range owed {
+		h, err := corrosion.GetHost(ctx, s.db, o.Target)
+		if err != nil {
+			continue
+		}
+		if h == nil || h.State == "removed" {
+			s.dropOwedDiscard(ctx, o, "its target host was removed from the cluster")
+			continue
+		}
+		resp, err := s.sendLiveFirmwareAbort(ctx, o.Target, o.VM, o.Binding, pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_DISCARD_UNVERIFIED, o.CreatedStubs)
+		switch {
+		case err != nil:
+			slog.Info("live firmware move: the owed discard is not answered yet", "vm", o.VM, "attempt", o.Attempt, "target", o.Target, "error", err)
+		case resp.GetRefused():
+			if cerr := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{
+				Code: condFwmigDiscardOwed, VM: o.VM, Attempt: o.Attempt, Source: s.hostName, Target: o.Target,
+				Severity: corrosion.SeverityCritical, Detail: resp.GetDetail(),
+				Action: "the target's copy runs, and an operator resolves it on the target; the DISCARD is retried each interval",
+			}); cerr != nil {
+				slog.Warn("live firmware move: raise the condition", "vm", o.VM, "code", condFwmigDiscardOwed, "error", cerr)
+			}
+		default:
+			s.dropOwedDiscard(ctx, o, "the target discarded its copy")
+		}
+	}
+}
+
+func (s *Server) dropOwedDiscard(ctx context.Context, o fwmig.OwedDiscard, why string) {
+	if err := s.fwRecords().RemoveOwedDiscard(o.VM, o.Attempt); err != nil {
+		slog.Warn("live firmware move: remove the owed discard", "vm", o.VM, "attempt", o.Attempt, "error", err)
+		return
+	}
+	_ = s.resolveFirmwareMigrationCondition(ctx, condFwmigDiscardOwed, o.VM)
+	slog.Info("live firmware move: owed discard settled: "+why, "vm", o.VM, "attempt", o.Attempt, "target", o.Target)
 }

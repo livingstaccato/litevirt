@@ -2359,6 +2359,21 @@ message AbortVMOperationResponse {
     string detail                = 3;
 }
 
+// ReleaseHostReservation releases a host capacity reservation whose operation
+// is no longer running (admin; see docs/diagnostics.md, "Host reservations").
+message ReleaseHostReservationRequest {
+    string operation_id = 1;
+    bool   force        = 2; // required — a release is never implicit
+}
+message ReleaseHostReservationResponse {
+    bool   released   = 1; // false with detail "already released" is idempotent success
+    string host       = 2; // the target host that released it
+    string vm         = 3; // empty when the caller may not vm.read it
+    int32  vcpu       = 4;
+    int32  memory_mib = 5;
+    string detail     = 6;
+}
+
 // Live restore from backup. The handler:
 //
 //   1. Opens the manifest's chunk reader.
@@ -4513,6 +4528,7 @@ service LiteVirt {
     rpc NormalizeRoleBindings(NormalizeRoleBindingsRequest) returns (NormalizeRoleBindingsResponse);
     rpc GetVMOperation(GetVMOperationRequest) returns (GetVMOperationResponse);
     rpc AbortVMOperation(AbortVMOperationRequest) returns (AbortVMOperationResponse);
+    rpc ReleaseHostReservation(ReleaseHostReservationRequest) returns (ReleaseHostReservationResponse);
     rpc BeginWebAuthnRegistration(BeginWebAuthnRegistrationRequest)   returns (BeginWebAuthnRegistrationResponse);
     rpc FinishWebAuthnRegistration(FinishWebAuthnRegistrationRequest) returns (FinishWebAuthnRegistrationResponse);
     rpc BeginWebAuthnLogin(BeginWebAuthnLoginRequest)                 returns (BeginWebAuthnLoginResponse);

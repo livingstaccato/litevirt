@@ -118,6 +118,10 @@ func SetVNCHandshakeTimeoutForTests(d time.Duration) func() {
 	return func() { vncHandshakeTimeout = old }
 }
 
+// HoldVMLockForTest takes this server's per-VM lock on name, as a request in
+// flight for that VM holds it, and returns its release.
+func (s *Server) HoldVMLockForTest(name string) (release func()) { return s.lockVM(name) }
+
 // NotEnforcingTokensForTests is what this server would report in
 // PingResponse.not_enforcing, for a fleet scenario to assert on.
 func (s *Server) NotEnforcingTokensForTests() []string { return s.notEnforcingTokens() }

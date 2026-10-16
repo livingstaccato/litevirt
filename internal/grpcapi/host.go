@@ -88,6 +88,7 @@ func (s *Server) InspectHost(ctx context.Context, req *pb.InspectHostRequest) (*
 	cpuUsed, memUsed, diskAllocated := s.hostAllocatedResources(ctx, h.Name)
 	pools := s.storagePoolsForHost(ctx, h.Name)
 	diskUsed, diskTotal := hostDiskFromPools(pools, int64(h.DiskTotal))
+	reservations, reservedCPU, reservedMem, reservationsErr := s.hostReservations(ctx, h.Name)
 
 	return &pb.Host{
 		Name:                h.Name,
@@ -115,6 +116,11 @@ func (s *Server) InspectHost(ctx context.Context, req *pb.InspectHostRequest) (*
 		CertSerial:          h.CertSerial,
 		CreatedAt:           parseTimestamp(h.CreatedAt),
 		UpdatedAt:           parseTimestamp(h.UpdatedAt),
+		Reservations:        reservations,
+		ReservedCpu:         reservedCPU,
+		ReservedMemMib:      reservedMem,
+		ReservationsError:   reservationsErr,
+		ReservationsPartial: reservationsErr != "",
 	}, nil
 }
 

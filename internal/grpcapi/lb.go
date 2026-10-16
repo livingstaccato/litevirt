@@ -2847,9 +2847,18 @@ func (s *Server) reconcileDeadLBs(ctx context.Context) {
 		} else {
 			s.reapplyExplicitLB(ctx, cfg)
 		}
-		if stale {
+		switch {
+		case stale && s.vrrpRefusedHere(cfg.Name):
+			// Every pass while refused: said once, then at DEBUG.
+			if s.vrrpEventOnce(cfg.Name, "reapply", "refused") {
+				slog.Info("LB reconciler: re-applied an LB this host cannot render on unicast; repeats are logged at debug", "lb", cfg.Name)
+			} else {
+				slog.Debug("LB reconciler: re-applied an LB this host cannot render on unicast", "lb", cfg.Name)
+			}
+		case stale:
+			s.vrrpEventOnce(cfg.Name, "reapply", "")
 			slog.Info("LB reconciler: re-applied an LB whose VRRP transport changed", "lb", cfg.Name)
-		} else {
+		default:
 			slog.Info("LB reconciler: re-applied a stopped LB", "lb", cfg.Name)
 		}
 	}

@@ -1,9 +1,11 @@
 package grpcapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"slices"
 	"strings"
 	"testing"
@@ -15,6 +17,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lb"
+	"github.com/litevirt/litevirt/internal/testkit/slogtest"
 )
 
 // vrrpServer is a peer-auth server whose hosts are recorded at addresses
@@ -326,8 +329,8 @@ func TestApplyLB_VRRPRefusal(t *testing.T) {
 // before this host asks its peers (and before it runs anything), so two hosts
 // refused at once never see each other as serving: both run multicast.
 //
-// Mutation: do not record the refusal — red; answer serving for a multicast
-// config — red.
+// Mutation: do not record the refusal — red; drop the refused-here check
+// from the answer — red; answer serving for a multicast config — red.
 func TestVRRPUnicastServing(t *testing.T) {
 	f := newRefusalFixture(t)
 	running, uni := true, true
@@ -347,7 +350,13 @@ func TestVRRPUnicastServing(t *testing.T) {
 	if f.s.vrrpUnicastServing("lbr-lb") {
 		t.Fatal("serving on a multicast config")
 	}
-	uni, f.held = true, false
+	// Refused for want of a recorded address: the source stays held on its
+	// device and the VIP's device is up, so only the recorded refusal keeps
+	// this host from answering serving.
+	uni = true
+	if err := corrosion.DeleteHost(context.Background(), f.s.db, f.s.hostName); err != nil {
+		t.Fatal(err)
+	}
 	f.s.lbServingOverride = func(context.Context, string, string) bool {
 		if f.s.vrrpUnicastServing("lbr-lb") {
 			t.Error("asked its peers while still answering serving")
@@ -791,4 +800,43 @@ type servingPeer struct {
 
 func (p servingPeer) CheckLBPresent(_ context.Context, in *pb.CheckLBPresentRequest, _ ...grpc.CallOption) (*pb.CheckLBPresentResponse, error) {
 	return &pb.CheckLBPresentResponse{Present: true, VrrpUnicastServing: p.serves[in.GetLbName()]}, nil
+}
+
+// TestReconcileDeadLBs_RefusedReapplyLoggedOnce: a refused LB is re-applied
+// on every pass; the reconciler says so at INFO once, then at DEBUG while it
+// repeats, and never as "whose VRRP transport changed".
+//
+// Mutation: log every re-apply at INFO — red.
+func TestReconcileDeadLBs_RefusedReapplyLoggedOnce(t *testing.T) {
+	ctx := context.Background()
+	f := newRefusalFixture(t)
+	hosts, _ := json.Marshal([]string{"self", "peer-1"})
+	if err := corrosion.UpsertLBConfig(ctx, f.s.db, corrosion.LBConfigRecord{
+		Name: "web", VIP: "192.0.2.250/24", Algorithm: "roundrobin", Hosts: string(hosts),
+		Ports: `[{"listen":80,"target":8080,"protocol":"tcp"}]`, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.s.lbKeepalivedOverride = func(string) bool { return true }
+	f.s.lbRenderedTransportOverride = func(string) (lb.Transport, bool) { return lb.Transport{}, true }
+	f.s.vrrpPeerCapsOverride = func(context.Context, string) ([]string, bool, error) { return nil, false, errors.New("down") }
+	applied := 0
+	f.s.lbApplyOverride = func(context.Context, lb.Config) error { applied++; return nil }
+	var buf bytes.Buffer
+	slogtest.Swap(t, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+
+	for range 3 {
+		f.s.reconcileDeadLBs(ctx)
+	}
+
+	if applied != 3 {
+		t.Fatalf("re-applied %d times in 3 passes, want 3", applied)
+	}
+	out := buf.String()
+	if n := strings.Count(out, "re-applied an LB this host cannot render on unicast"); n != 1 {
+		t.Fatalf("logged the refused re-apply %d times at INFO in 3 passes, want 1:\n%s", n, out)
+	}
+	if strings.Contains(out, "whose VRRP transport changed") {
+		t.Fatalf("a refused re-apply is logged as a transport change:\n%s", out)
+	}
 }

@@ -78,7 +78,7 @@ func TestUpdateVMInterfaceIP_DoesNotReviveADetachedNIC(t *testing.T) {
 				t.Fatal("fixture: the detached NIC is still live")
 			}
 
-			written, err := UpdateVMInterfaceIP(ctx, c, "web", "lan", mac, "10.0.0.7")
+			written, err := UpdateVMInterfaceIPOwned(ctx, c, "web", "lan", mac, "10.0.0.7")
 			if err != nil {
 				t.Fatalf("UpdateVMInterfaceIP: %v", err)
 			}
@@ -113,7 +113,7 @@ func TestUpdateVMInterfaceIP_LandsOnTheLiveNICNotTheDetachedLegacyRow(t *testing
 				t.Fatal(err)
 			}
 
-			written, err := UpdateVMInterfaceIP(ctx, c, "web", "lan", mac, "10.0.0.8")
+			written, err := UpdateVMInterfaceIPOwned(ctx, c, "web", "lan", mac, "10.0.0.8")
 			if err != nil || !written {
 				t.Fatalf("UpdateVMInterfaceIP: written=%v err=%v", written, err)
 			}
@@ -155,7 +155,7 @@ func TestUpdateVMInterfaceIP_DoesNotBumpATombstoneOverAReattachedNIC(t *testing.
 			}
 			legacyBefore := legacyRow(t, c, "web", "lan")
 
-			written, err := UpdateVMInterfaceIP(ctx, c, "web", "lan", mac, "10.0.0.9")
+			written, err := UpdateVMInterfaceIPOwned(ctx, c, "web", "lan", mac, "10.0.0.9")
 			if err != nil || !written {
 				t.Fatalf("UpdateVMInterfaceIP: written=%v err=%v", written, err)
 			}
@@ -184,7 +184,7 @@ func TestUpdateVMInterfaceIP_NewerLegacyRowKeepsItsFields(t *testing.T) {
 	if err := SetInterfaceSecurityGroups(ctx, c, "web", "lan", []string{"web-sg"}); err != nil {
 		t.Fatal(err)
 	}
-	written, err := UpdateVMInterfaceIP(ctx, c, "web", "lan", ipNICX, "10.0.0.10")
+	written, err := UpdateVMInterfaceIPOwned(ctx, c, "web", "lan", ipNICX, "10.0.0.10")
 	if err != nil || !written {
 		t.Fatalf("UpdateVMInterfaceIP: written=%v err=%v", written, err)
 	}
@@ -214,7 +214,7 @@ func TestUpdateVMInterfaceIP_WritesBothTablesForADualWrittenNIC(t *testing.T) {
 	if err := UpsertNIC(ctx, c, NICRecord{VMName: "web", ID: DeterministicNICID("web", ipNICX), NetworkName: "lan", Model: "e1000", MAC: ipNICX}); err != nil {
 		t.Fatal(err)
 	}
-	written, err := UpdateVMInterfaceIP(ctx, c, "web", "lan", "", "10.0.0.11")
+	written, err := UpdateVMInterfaceIPOwned(ctx, c, "web", "lan", "", "10.0.0.11")
 	if err != nil || !written {
 		t.Fatalf("UpdateVMInterfaceIP: written=%v err=%v", written, err)
 	}
@@ -241,14 +241,14 @@ func TestUpdateVMInterfaceIP_TwoNICsOnOneNetwork(t *testing.T) {
 	if err := UpsertNIC(ctx, c, NICRecord{VMName: "web", ID: DeterministicNICID("web", ipNICY), NetworkName: "lan", MAC: ipNICY, Ordinal: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if written, err := UpdateVMInterfaceIP(ctx, c, "web", "lan", ipNICY, "10.0.0.12"); err != nil || !written {
+	if written, err := UpdateVMInterfaceIPOwned(ctx, c, "web", "lan", ipNICY, "10.0.0.12"); err != nil || !written {
 		t.Fatalf("UpdateVMInterfaceIP(Y): written=%v err=%v", written, err)
 	}
 	got := mergedByMAC(t, c, "web")
 	if got[ipNICY].IP != "10.0.0.12" || got[ipNICX].IP != "" {
 		t.Errorf("after a write for Y: X=%+v Y=%+v, want only Y addressed", got[ipNICX], got[ipNICY])
 	}
-	if written, err := UpdateVMInterfaceIP(ctx, c, "web", "lan", "", "10.0.0.13"); err != nil || !written {
+	if written, err := UpdateVMInterfaceIPOwned(ctx, c, "web", "lan", "", "10.0.0.13"); err != nil || !written {
 		t.Fatalf("UpdateVMInterfaceIP(network): written=%v err=%v", written, err)
 	}
 	got = mergedByMAC(t, c, "web")
@@ -268,4 +268,63 @@ func legacyRow(t *testing.T, c *Client, vm, network string) legacySnapshot {
 		t.Fatalf("legacy row (%s, %s): %d rows, %v", vm, network, len(rows), err)
 	}
 	return legacySnapshot{rows[0].String("ip"), rows[0].String("updated_at"), rows[0].String("deleted_at")}
+}
+
+// The form for a caller that is not the owner holding the VM lock writes the
+// legacy row only. A vm_nics-only NIC gets nothing (its row is not rewritten,
+// so a tombstone or a field change not yet replicated here cannot lose to
+// it); a NIC with a live legacy row gets that row, as the old UPDATE did; a
+// legacy tombstone is never written.
+func TestUpdateVMInterfaceIP_OffOwnerWritesTheLegacyRowOnly(t *testing.T) {
+	c := ifaceIPVM(t)
+	ctx := context.Background()
+	// lan: dual-written X. wan: vm_nics-only Y. dmz: legacy tombstone under a
+	// re-attached vm_nics row Z.
+	createdNIC(t, c, "web", "lan", ipNICX, 0)
+	yID := DeterministicNICID("web", ipNICY)
+	if err := UpsertNIC(ctx, c, NICRecord{VMName: "web", ID: yID, NetworkName: "wan", MAC: ipNICY, Ordinal: 1}); err != nil {
+		t.Fatal(err)
+	}
+	const ipNICZ = "52:54:00:aa:00:03"
+	createdNIC(t, c, "web", "dmz", ipNICZ, 2)
+	if err := TombstoneNIC(ctx, c, "web", DeterministicNICID("web", ipNICZ)); err != nil {
+		t.Fatal(err)
+	}
+	if err := SoftDeleteInterfaceByMAC(ctx, c, "web", ipNICZ); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpsertNIC(ctx, c, NICRecord{VMName: "web", ID: DeterministicNICID("web", ipNICZ), NetworkName: "dmz", MAC: ipNICZ, Ordinal: 2}); err != nil {
+		t.Fatal(err)
+	}
+	nicStamp := func(id string) string {
+		rows, err := c.Query(ctx, `SELECT updated_at FROM vm_nics WHERE vm_name = 'web' AND id = ?`, id)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("vm_nics %s: %v", id, err)
+		}
+		return rows[0].String("updated_at")
+	}
+	xID, zID := DeterministicNICID("web", ipNICX), DeterministicNICID("web", ipNICZ)
+	xBefore, yBefore, zBefore := nicStamp(xID), nicStamp(yID), nicStamp(zID)
+	dmzBefore := legacyRow(t, c, "web", "dmz")
+
+	if written, err := UpdateVMInterfaceIP(ctx, c, "web", "lan", "", "10.0.1.1"); err != nil || !written {
+		t.Fatalf("lan: written=%v err=%v", written, err)
+	}
+	if written, err := UpdateVMInterfaceIP(ctx, c, "web", "wan", "", "10.0.1.2"); err != nil || written {
+		t.Fatalf("wan: written=%v err=%v, want nothing written for a vm_nics-only NIC", written, err)
+	}
+	if written, err := UpdateVMInterfaceIP(ctx, c, "web", "dmz", ipNICZ, "10.0.1.3"); err != nil || written {
+		t.Fatalf("dmz: written=%v err=%v, want nothing written over a legacy tombstone", written, err)
+	}
+	if got := legacyRow(t, c, "web", "lan"); got.ip != "10.0.1.1" {
+		t.Errorf("lan legacy row = %+v, want ip 10.0.1.1", got)
+	}
+	if got := legacyRow(t, c, "web", "dmz"); got != dmzBefore {
+		t.Errorf("dmz legacy tombstone was written: %+v, was %+v", got, dmzBefore)
+	}
+	for id, before := range map[string]string{xID: xBefore, yID: yBefore, zID: zBefore} {
+		if got := nicStamp(id); got != before {
+			t.Errorf("vm_nics row %s was rewritten off-owner: %q, was %q", id, got, before)
+		}
+	}
 }

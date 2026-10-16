@@ -1747,7 +1747,19 @@ func RenameVM(ctx context.Context, c *Client, oldName, newName string) error {
 }
 
 // UpdateVMInterfaceIP records ip on the live NIC of vmName that it is for,
-// and reports whether a row was written.
+// writing the legacy vm_interfaces row only, and reports whether it wrote.
+// It is the form for any caller that is not the VM's owner holding its VM
+// lock: it never rewrites a vm_nics row, so it cannot revive one tombstoned
+// elsewhere and not yet replicated here, nor replace a vm_nics field changed
+// elsewhere. See UpdateVMInterfaceIPOwned for the rule both share.
+func UpdateVMInterfaceIP(ctx context.Context, c *Client, vmName, networkName, mac, ip string) (bool, error) {
+	return updateVMInterfaceIP(ctx, c, vmName, networkName, mac, ip, false)
+}
+
+// UpdateVMInterfaceIPOwned records ip on the live NIC of vmName that it is
+// for, in both tables, and reports whether a row was written. The caller must
+// be the VM's owner and hold its VM lock, so the read and the writes serialise
+// with a detach there.
 //
 // mac names that NIC. Empty means the caller knows only the network (SetVMIP):
 // the network's one live NIC, or, with several, the one its legacy row names —
@@ -1766,9 +1778,27 @@ func RenameVM(ctx context.Context, c *Client, oldName, newName string) error {
 //     the NIC's current, live row, and after the legacy write, so it stays the
 //     newer row and the bridge does not copy the legacy row over it.
 //
-// A filtered UPDATE would say this in one statement, but a new statement shape
-// would stall this node's stream to every peer on the previous release.
-func UpdateVMInterfaceIP(ctx context.Context, c *Client, vmName, networkName, mac, ip string) (bool, error) {
+// UpsertNIC rewrites the whole row with deleted_at cleared, at a fresh stamp:
+// a tombstone or a field change written on another node and not yet
+// replicated here would lose to it. The owner's lock covers a detach (which
+// runs on the owner); it does not cover a change made on another node, and
+// the window there is replication lag. The unfiltered UPDATE this replaced
+// never wrote vm_nics, so it had no such window for a vm_nics-only NIC. A
+// filtered statement (a new shape) is the real fix.
+//
+// Mixed versions: a node on an older build still issues the unfiltered UPDATE
+// and still revives a NIC detached after the latch, or bumps a legacy
+// tombstone over a re-attached NIC, until every node runs this. The latch
+// proves a build at least as new as hardware_v2, not this one.
+//
+// Not atomic: if the legacy write lands and UpsertNIC fails, the legacy row
+// is the newer and the bridge copies it over vm_nics (model "virtio"), as the
+// old UPDATE did on every call.
+func UpdateVMInterfaceIPOwned(ctx context.Context, c *Client, vmName, networkName, mac, ip string) (bool, error) {
+	return updateVMInterfaceIP(ctx, c, vmName, networkName, mac, ip, true)
+}
+
+func updateVMInterfaceIP(ctx context.Context, c *Client, vmName, networkName, mac, ip string, nicRows bool) (bool, error) {
 	nics, err := GetVMNICsRaw(ctx, c, "vm_nics", vmName)
 	if err != nil {
 		return false, err
@@ -1816,10 +1846,12 @@ func UpdateVMInterfaceIP(ctx context.Context, c *Client, vmName, networkName, ma
 	}
 	// The vm_nics row is the NIC's current one when it is live and at least
 	// as new as the legacy row naming the same MAC (vm_nics wins a tie). The
-	// target is a live winner, so a tombstoned row here is already older than
-	// the legacy row; the liveness test is kept beside the write regardless,
-	// because UpsertNIC clears deleted_at.
-	writeNIC := nicRow != nil && nicRow.DeletedAt == "" &&
+	// liveness test cannot fail today: when the target is a vm_nics row,
+	// nicRow resolves to it by ID (the PK) and it is live; when the target is
+	// the legacy row, that row is the strict winner, every same-MAC vm_nics row
+	// is older, writeLegacy is true and the recency test already excludes it.
+	// It is kept beside the write because UpsertNIC clears deleted_at.
+	writeNIC := nicRows && nicRow != nil && nicRow.DeletedAt == "" &&
 		(!writeLegacy || lwwOrder(nicRow.UpdatedAt, legacy.UpdatedAt) >= 0)
 
 	if writeLegacy {

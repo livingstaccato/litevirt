@@ -185,3 +185,75 @@ func legacyStamp(t *testing.T, n *Node, vm string) string {
 	}
 	return rows[0].String("updated_at")
 }
+
+// SetVMIP through a node that has not yet received the owner's detach of a
+// vm_nics-only NIC is served by the owner, where the detach already happened,
+// so the NIC is not rewritten live over its tombstone.
+func TestFleet_IPWrite_DetachRacingAnOffOwnerWrite(t *testing.T) {
+	c, gates := ifaceIPCluster(t)
+	home, other, third := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	mustCreateNICLessVM(t, c, home, "web")
+	latchHardwareV2Converged(t, c, gates)
+	y := strings.ToLower(mustAttachNIC(t, c, home, "web", ifaceIPNet).MAC)
+	c.WaitConverged(t, 30*time.Second)
+	requireNICs(t, c, "web", "after the attach", map[string]string{y: "?"})
+
+	// The detach does not reach the other nodes yet.
+	c.SetLinkFault(home, other, LinkFault{Block: true})
+	c.SetLinkFault(home, third, LinkFault{Block: true})
+	mustDetachNIC(t, c, home, "web", y)
+	if _, live := liveNICSet(t, other, "web")[y]; !live {
+		t.Fatalf("fixture: %s already has the detach of %s", other.Name, y)
+	}
+
+	setVMIP(t, c, other, "web", "172.16.81.70")
+	c.ClearLinkFaults()
+	c.WaitConverged(t, 30*time.Second)
+	requireNICs(t, c, "web", "after the racing IP write", map[string]string{})
+	bridgeEverywhere(t, c, "web")
+	requireNICs(t, c, "web", "after a bridge pass", map[string]string{})
+}
+
+// With the owner unreachable, SetVMIP is served where it arrived and is not
+// refused. It writes the legacy row of a NIC that has a live one, as the old
+// UPDATE did, and leaves a vm_nics-only NIC's row as it is: a rewrite there
+// could revive a NIC the owner detached.
+func TestFleet_IPWrite_OwnerUnreachableWritesTheLegacyRowOnly(t *testing.T) {
+	c, gates := ifaceIPCluster(t)
+	ctx := context.Background()
+	home, other := c.Nodes[0], c.Nodes[1]
+	if _, err := c.SelfClient(home).CreateNetwork(ctx, &pb.CreateNetworkRequest{
+		Name: "nb", Type: "isolated", Subnet: "172.16.82.0/24", Dhcp: true,
+	}); err != nil {
+		t.Fatalf("CreateNetwork nb: %v", err)
+	}
+	mustCreateNICLessVM(t, c, home, "web")
+	x := strings.ToLower(mustAttachNIC(t, c, home, "web", ifaceIPNet).MAC) // both tables
+	latchHardwareV2Converged(t, c, gates)
+	y := strings.ToLower(mustAttachNIC(t, c, home, "web", "nb").MAC) // vm_nics only
+	c.WaitConverged(t, 30*time.Second)
+	yID := corrosion.DeterministicNICID("web", y)
+	yBefore := nicStampOn(t, other, "web", yID)
+
+	c.SetLinkFault(other, home, LinkFault{Block: true, BlockAll: true})
+	setVMIP(t, c, other, "web", "172.16.81.80")
+	if _, err := c.SelfClient(other).SetVMIP(ctx, &pb.SetVMIPRequest{Name: "web", Ip: "172.16.82.80", NetworkName: "nb"}); err != nil {
+		t.Fatalf("SetVMIP nb with the owner unreachable: %v", err)
+	}
+	ifaces, err := corrosion.GetVMInterfaces(ctx, other.DB, "web")
+	if err != nil || len(ifaces) != 1 || !strings.EqualFold(ifaces[0].MAC, x) || ifaces[0].IP != "172.16.81.80" {
+		t.Errorf("legacy rows on %s = %+v (%v), want %s at 172.16.81.80", other.Name, ifaces, err, x)
+	}
+	if got := nicStampOn(t, other, "web", yID); got != yBefore {
+		t.Errorf("the vm_nics row of %s was rewritten off-owner: %q, was %q", y, got, yBefore)
+	}
+}
+
+func nicStampOn(t *testing.T, n *Node, vm, id string) string {
+	t.Helper()
+	rows, err := n.DB.Query(context.Background(), `SELECT updated_at FROM vm_nics WHERE vm_name = ? AND id = ?`, vm, id)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("vm_nics %s of %s on %s: %d rows, %v", id, vm, n.Name, len(rows), err)
+	}
+	return rows[0].String("updated_at")
+}

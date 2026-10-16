@@ -130,8 +130,8 @@ func (s *Server) leaseClaimLatched() bool {
 
 // claimLeaseTerm decides req.Term of req.Key under cfg, proposing req.Holder.
 // ok only when the decided value names req.Holder, or — before the latch —
-// when a majority of the voters that answered run a build without lease-term
-// claims. A term decided for another node is recorded with the corrosion
+// when so many voters refuse the claim as an unknown claim type (older
+// builds) that the rest of the generation cannot form a majority. A term decided for another node is recorded with the corrosion
 // client, so the next poll neither claims it again nor takes the lease over
 // before that node could have recorded it.
 //
@@ -170,10 +170,11 @@ func (s *Server) claimLeaseTerm(ctx context.Context, cfg *corrosion.VoterConfig,
 	}
 	learned = learned.Add(time.Since(started))
 	if err != nil {
-		if !s.leaseClaimLatched() && olderBuildMajority(err) {
-			slog.Info("leader lease: a majority of the voters run a build without lease-term claims; "+
-				"clearing the term on the quorum read alone until every host is upgraded",
+		if !s.leaseClaimLatched() && olderBuildsBlockAMajority(err, names, q) {
+			slog.Info("leader lease: so many voters run a build without lease-term claims that the rest "+
+				"cannot form a majority; clearing the term on the quorum read alone until they are upgraded",
 				"lease", req.Key, "term", req.Term)
+			s.noteLeaseClaimDecided(ctx, req.Key)
 			return true, ""
 		}
 		why := fmt.Sprintf("no majority of voter generation %d decided term %d: %v", cfg.Generation, req.Term, err)
@@ -195,29 +196,36 @@ func (s *Server) claimLeaseTerm(ctx context.Context, cfg *corrosion.VoterConfig,
 		"node's lease (or for it to lapse, then claims the next term)", req.Term, won.Holder)
 }
 
-// olderBuildMajority reports whether err is a claim that failed because a
-// majority of the voters that answered do not know the lease_term claim type
-// — an older build's answer. Unreachable voters are not counted either way.
-func olderBuildMajority(err error) bool {
+// olderBuildsBlockAMajority reports whether err is a claim that failed in
+// phase 1 because the members of the generation that refused it as an unknown
+// claim type — older builds — are so many that the rest of the generation,
+// every other member, answering or not, cannot form a majority of q.
+// Unreachable voters, other refusals and promises all count as voters that
+// could still accept: a voter that does not answer must never make the
+// fallback easier to reach.
+func olderBuildsBlockAMajority(err error, names []string, q int) bool {
 	var nm *claims.NoMajorityError
 	if !errors.As(err, &nm) || nm.Phase != "prepare" {
 		return false
 	}
-	unknown, reached := 0, nm.Got
+	member := make(map[string]bool, len(names))
+	for _, v := range names {
+		member[v] = true
+	}
+	old := map[string]bool{}
 	for _, r := range nm.Refusals {
-		if r.Reason == claims.ReasonUnreachable {
-			continue
-		}
-		reached++
-		if r.Reason == corrosion.RefusalInvalidValue && strings.Contains(r.Detail, olderBuildRefusal) {
-			unknown++
+		if member[r.Voter] && r.Reason == corrosion.RefusalInvalidValue && strings.Contains(r.Detail, olderBuildRefusal) {
+			old[r.Voter] = true
 		}
 	}
-	return reached > 0 && 2*unknown > reached
+	return len(names)-len(old) < q
 }
 
 // olderBuildRefusal is how a build without lease-term claims refuses one:
-// ClaimKey.Validate's answer for a target kind it does not know.
+// ClaimKey.Validate's answer for a target kind it does not know. It mirrors
+// the default branch of ClaimKey.Validate in the release before
+// lease_term_claim_v1 (base f2a5b25a), byte for byte; a later wording change
+// there does not change what an older build answers.
 var olderBuildRefusal = fmt.Sprintf("unknown claim target kind %q", corrosion.ClaimKindLeaseTerm)
 
 // noteLeaseClaimNoMajority counts a claim with no majority and raises
@@ -240,17 +248,39 @@ func (s *Server) noteLeaseClaimNoMajority(ctx context.Context, req corrosion.Lea
 		return
 	}
 	line := fmt.Sprintf("lease %s has had no takeover since %s: %s. A takeover needs a majority of the "+
-		"voters that can vote; `lv cluster voter ls` shows them. Repair an abstaining voter with "+
-		"`lv cluster voter rm <host>` then `lv cluster voter add <host>`, or return to the derived voter set "+
-		"with `lv cluster voter reset`, which also ends recovery-claim protection.",
+		"voters that can vote, and so does every voter change, so `lv cluster voter rm/add/reset` cannot "+
+		"run now either. Restore the lost voter, or fence it proof-grade and run "+
+		"`lv cluster voter force-reconfigure --lost <host>` (docs/design/recovery-claims.md §4.6). "+
+		"Repair a voter while ha.voter.unavailable names it, before it is needed. "+
+		"`lv cluster voter reset` returns lease takeovers to the two-holder race.",
 		req.Key, since.UTC().Format(time.RFC3339), why)
 	s.applyClusterCondition(ctx, leaseClaimEvaluator, condLeaseClaimNoMajority, req.Key,
 		map[string]string{req.Key: line}, []string{s.hostName}, "")
 }
 
 // noteLeaseClaimDecided ends a no-majority stall for key: a claim for it was
-// decided, whoever it names.
+// decided, whoever it names, or the term was cleared by the older-build
+// fallback.
 func (s *Server) noteLeaseClaimDecided(ctx context.Context, key string) {
+	st := &s.leaseClaimStall
+	st.mu.Lock()
+	delete(st.since, key)
+	st.mu.Unlock()
+	s.applyClusterCondition(ctx, leaseClaimEvaluator, condLeaseClaimNoMajority, key, nil, nil, "")
+}
+
+// NoteLeaseLive is told, by corrosion's lease path, that the lease key has a
+// live holder as this node sees it: a peer's live lease, or this node's own
+// renewal or mint. The lease is no longer contested, whoever holds it — the
+// dead holder back, a takeover by any node, a term recorded with no claim
+// (no generation adopted, a fallback). It ends this node's no-majority stall
+// and resolves ha.lease.claim_no_majority.
+//
+// It runs on every lease poll that finds a holder, and costs one indexed read
+// of the condition row when nothing is raised. Not throttled: the row can be
+// raised by ANOTHER node at any moment, and a throttle keyed on this node's
+// last read left a fresh raise standing for the whole window.
+func (s *Server) NoteLeaseLive(ctx context.Context, key string) {
 	st := &s.leaseClaimStall
 	st.mu.Lock()
 	delete(st.since, key)

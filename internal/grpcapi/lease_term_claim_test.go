@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/claims"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 )
@@ -230,8 +231,8 @@ func TestLeaseMintClearance_TheLosersWaitCountsFromLearning(t *testing.T) {
 }
 
 // With the latch formed but no member generation (genesis pending, or after
-// `lv cluster voter reset`) there is no fixed majority, and every node is in
-// that position together: the read alone clears, as before. But a node whose
+// `lv cluster voter reset`) there is no fixed majority to decide with: the
+// read alone clears, as before. But a node whose
 // replica holds a member generation it has not ADOPTED may be the only node
 // not claiming, so it records nothing until it has.
 //
@@ -283,5 +284,160 @@ func TestAdvertise_LeaseTermClaimIsMandatoryAndUnconditional(t *testing.T) {
 	}
 	if !slices.Contains(s.advertisedCapabilities(), tok) {
 		t.Fatalf("%s is not advertised", tok)
+	}
+}
+
+// halfReachableNode is leaseClaimNode under generation 2 = {this node, node-x},
+// with node-x unreachable: every claim finds one voter of two.
+func halfReachableNode(t *testing.T) *Server {
+	t.Helper()
+	ctx := context.Background()
+	s := leaseClaimNode(t, false)
+	inc, err := s.db.VoterIncarnation(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	val := corrosion.VoterConfigValue{Generation: 2, Members: corrosion.SortMembers([]corrosion.VoterMember{
+		{Name: s.hostName, Incarnation: inc}, {Name: "node-x", Incarnation: "x"}}),
+		Change: corrosion.VoterChangeAdd("node-x"), CreatedBy: "test", CreatedAt: "test"}
+	if err := corrosion.WriteVoterConfig(ctx, s.db, val, corrosion.ClaimCertificate{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.RecordVoterAdoption(ctx, s.db, 2); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// noMajorityRaised reports whether s's replica holds a raised
+// ha.lease.claim_no_majority for the failover lease.
+func noMajorityRaised(t *testing.T, s *Server) bool {
+	t.Helper()
+	row, found, err := corrosion.GetHealthCondition(context.Background(), s.db, leaseClaimEvaluator,
+		condLeaseClaimNoMajority, "cluster", corrosion.LeaseKeyFailover)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return found && row.Lifecycle != corrosion.ConditionResolved
+}
+
+// stallFor runs two no-majority claims on s, the second a TTL after the first,
+// which raises the condition.
+func stallFor(t *testing.T, s *Server) time.Time {
+	t.Helper()
+	ctx := context.Background()
+	req := leaseClaimReq(s, 1)
+	req.TTL = 30 * time.Second
+	at, _ := time.Parse(time.RFC3339, clearanceNow)
+	for _, now := range []time.Time{at, at.Add(req.TTL + time.Second)} {
+		req.Now = now.Format(time.RFC3339)
+		if ok, why := s.LeaseMintClearance(ctx, req); ok {
+			t.Fatalf("cleared (%q) with one of two voters reachable", why)
+		}
+	}
+	if !noMajorityRaised(t, s) {
+		t.Fatal("fixture: the stall raised no condition")
+	}
+	return at.Add(req.TTL + time.Second)
+}
+
+// The fallback condition counts every member of the generation as a voter
+// that could still accept unless it answered as an older build: unreachable
+// voters, other refusals and promises never make the fallback easier.
+//
+// Mutation: r1's rule (a majority of those that ANSWERED refused as an older
+// build) — the cut-off case falls back and this goes red.
+func TestOlderBuildsBlockAMajority(t *testing.T) {
+	unknown := func(v string) claims.Refusal {
+		return claims.Refusal{Voter: v, Reason: corrosion.RefusalInvalidValue, Detail: olderBuildRefusal}
+	}
+	gone := func(v string) claims.Refusal { return claims.Refusal{Voter: v, Reason: claims.ReasonUnreachable} }
+	for _, tc := range []struct {
+		name     string
+		voters   []string
+		got      int
+		refusals []claims.Refusal
+		want     bool
+	}{
+		{"2 old, 2 new, all answering", []string{"o1", "o2", "v1", "v2"}, 2,
+			[]claims.Refusal{unknown("o1"), unknown("o2")}, true},
+		{"1 old, 2 new", []string{"o1", "v1", "v2"}, 2, []claims.Refusal{unknown("o1")}, false},
+		{"3 old, 2 new", []string{"o1", "o2", "o3", "v1", "v2"}, 2,
+			[]claims.Refusal{unknown("o1"), unknown("o2"), unknown("o3")}, true},
+		{"2 old, 3 new, one new dead", []string{"o1", "o2", "v1", "v2", "v3"}, 2,
+			[]claims.Refusal{unknown("o1"), unknown("o2"), gone("v3")}, false},
+		{"2 old, 3 new, v1 cut off from v2 and v3", []string{"o1", "o2", "v1", "v2", "v3"}, 1,
+			[]claims.Refusal{unknown("o1"), unknown("o2"), gone("v2"), gone("v3")}, false},
+		{"older-build answers from non-members do not count", []string{"v1", "v2", "v3"}, 1,
+			[]claims.Refusal{unknown("x1"), unknown("x2"), gone("v2"), gone("v3")}, false},
+	} {
+		err := &claims.NoMajorityError{Phase: "prepare", Got: tc.got, Need: corrosion.MajorityOf(len(tc.voters)),
+			Refusals: tc.refusals}
+		if got := olderBuildsBlockAMajority(err, tc.voters, corrosion.MajorityOf(len(tc.voters))); got != tc.want {
+			t.Errorf("%s: fallback=%v, want %v", tc.name, got, tc.want)
+		}
+	}
+	accept := &claims.NoMajorityError{Phase: "accept", Refusals: []claims.Refusal{unknown("o1"), unknown("o2")}}
+	if olderBuildsBlockAMajority(accept, []string{"o1", "o2", "v1"}, 2) {
+		t.Error("an accept-phase failure fell back")
+	}
+}
+
+// ha.lease.claim_no_majority resolves, and the stall start is forgotten, once
+// the lease is held by anyone: this node seeing a live holder or renewing.
+//
+// Mutation: NoteLeaseLive resolves nothing — this goes red.
+func TestLeaseClaimNoMajority_ResolvedByALiveHolder(t *testing.T) {
+	s := halfReachableNode(t)
+	stallFor(t, s)
+	s.NoteLeaseLive(context.Background(), corrosion.LeaseKeyFailover)
+	if noMajorityRaised(t, s) {
+		t.Fatal("a live holder did not resolve the condition")
+	}
+}
+
+// The older-build fallback records a term, so the lease is no longer stalled.
+//
+// Mutation: drop noteLeaseClaimDecided from the fallback — this goes red.
+func TestLeaseClaimNoMajority_ResolvedByAFallback(t *testing.T) {
+	ctx := context.Background()
+	s := halfReachableNode(t)
+	stallFor(t, s)
+	// Now this node answers as an older build: of two voters one refuses the
+	// type, and the other cannot make a majority alone.
+	s.leaseClaimsAsOlderBuild.Store(true)
+	cfg, err := corrosion.AdoptedVoterConfig(ctx, s.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, why := s.claimLeaseTerm(ctx, cfg, leaseClaimReq(s, 1), time.Now()); !ok {
+		t.Fatalf("no fallback (%q)", why)
+	}
+	if noMajorityRaised(t, s) {
+		t.Fatal("the fallback did not resolve the condition")
+	}
+}
+
+// A stall start this node never ended itself — another node took the lease
+// over, and this one only saw it held — must not raise the condition at once
+// on a single failed claim weeks later.
+//
+// Mutation: NoteLeaseLive keeps the stall start — the late failure raises.
+func TestLeaseClaimNoMajority_AStaleStallStartDoesNotRaise(t *testing.T) {
+	ctx := context.Background()
+	s := halfReachableNode(t)
+	req := leaseClaimReq(s, 1)
+	req.TTL = 30 * time.Second
+	if ok, _ := s.LeaseMintClearance(ctx, req); ok {
+		t.Fatal("fixture: cleared")
+	}
+	s.NoteLeaseLive(ctx, corrosion.LeaseKeyFailover) // another node holds it now
+	at, _ := time.Parse(time.RFC3339, clearanceNow)
+	req.Now = at.Add(7 * 24 * time.Hour).Format(time.RFC3339)
+	if ok, _ := s.LeaseMintClearance(ctx, req); ok {
+		t.Fatal("fixture: cleared")
+	}
+	if noMajorityRaised(t, s) {
+		t.Fatal("one failed claim raised the condition from a stall start a week old")
 	}
 }

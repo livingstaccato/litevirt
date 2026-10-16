@@ -381,9 +381,9 @@ const (
 	// claimant gets a majority; the loser learns the winner and records
 	// nothing. The claim does not wait for this node's latch, which forms at
 	// a different moment on each node. Before the latch, and only then, a
-	// claim refused by a majority of the answering voters as an unknown claim
-	// type (older builds) falls back to the quorum read alone; once latched it
-	// never does (grpcapi lease_term_claim.go).
+	// claim that so many voters refuse as an unknown claim type (older builds)
+	// that the rest cannot form a majority falls back to the quorum read
+	// alone; once latched it never does (grpcapi lease_term_claim.go).
 	//
 	// It states a fact about the BINARY, which is why it is mandatory and has
 	// no config flag: this build answers lease-term claims as a voter and
@@ -1069,9 +1069,13 @@ const ReleaseToken = Release202611V1
 //     as it adopts the reset generation, to recording terms from the quorum
 //     high-water read alone. While it is in force a takeover needs a majority
 //     of voters that can VOTE — durable, holding their signing key, at their
-//     admitted incarnation, not sealed — which is more than the read needed;
-//     an abstaining voter is repaired with `lv cluster voter rm` then
-//     `lv cluster voter add`. A binary rolled back below it
+//     admitted incarnation, not sealed — which is more than the read needed.
+//     Voter changes need that same majority: repair a voter while
+//     ha.voter.unavailable names it (`lv cluster voter rm` then `add`); once
+//     the claim has no majority the exits are restoring the lost voter or
+//     `lv cluster voter force-reconfigure --lost` after a proof-grade fence.
+//     `lv cluster voter reset` brings back the two-holder race. A binary
+//     rolled back below it
 //     enters WAL quarantine, as below every latched token; the lease-term
 //     claim rows its voters keep are node-local and left unread.
 //

@@ -563,3 +563,105 @@ func TestFleet_LeaseTakeover_MixedVersionsKeepTheOldClearance(t *testing.T) {
 		t.Fatalf("term 3 was not claimed after the latch: %+v found=%v err=%v", st, found, err)
 	}
 }
+
+// noMajorityRaisedOn reports whether n's replica holds a raised
+// ha.lease.claim_no_majority for the lease.
+func noMajorityRaisedOn(t *testing.T, n *Node) bool {
+	t.Helper()
+	row, found, err := corrosion.GetHealthCondition(context.Background(), n.DB, "lease_term_claim",
+		"ha.lease.claim_no_majority", "cluster", leaseTermKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return found && row.Lifecycle != corrosion.ConditionResolved
+}
+
+// TestFleet_LeaseTakeover_UnreachableVotersAreNoReasonToFallBack: mid-roll,
+// two of five voters run a build without lease-term claims. v1 cannot reach
+// v2 or v3 (v2 reaches everyone). v1's quorum read clears through itself and
+// the two older voters, and its claim finds its own promise, two "unknown
+// claim type" refusals and two unreachable voters. Counting only the voters
+// that answered, the older builds are a majority and v1 would fall back to
+// the read — while v2 decides the same term through v1, v2 and v3. Counting
+// every member, the older builds are two of five: the rest can still form a
+// majority, so v1 records nothing and v2 alone holds the term.
+//
+// Mutation: r1's rule (olderBuildMajority over the voters that answered) —
+// both record term 1.
+func TestFleet_LeaseTakeover_UnreachableVotersAreNoReasonToFallBack(t *testing.T) {
+	c, _ := leaseClaimFleet(t, 5, 67, false)
+	o1, o2, v1, v2, v3 := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3], c.Nodes[4]
+	for _, n := range []*Node{o1, o2} {
+		n.Server.SetLeaseClaimsAsAnOlderBuildForTest(true)
+	}
+	cut := LinkFault{Block: true, BlockClaims: true}
+	c.SetLinkFault(v1, v2, cut) // v1's calls into v2 and v3 fail; theirs into v1 do not
+	c.SetLinkFault(v1, v3, cut)
+	now := time.Now().UTC()
+	res := takeOver(t, []*Node{v1, v2}, func(*Node) time.Time { return now }, nil)
+	c.SetLinkFault(v1, v2, LinkFault{})
+	c.SetLinkFault(v1, v3, LinkFault{})
+	requireOneHolder(t, c, res, 1, v1, v2, v3)
+}
+
+// TestFleet_LeaseTakeover_ADeadUpgradedVoterMidRollStopsTakeovers: two of
+// five voters are older builds and one upgraded voter is dead. The older
+// builds are two of five, so the other three could still form a majority —
+// but one of them is gone. No takeover, no fallback, and a TTL into the stall
+// ha.lease.claim_no_majority is raised. This is the accepted cost of never
+// reading an unreachable voter as an older build.
+func TestFleet_LeaseTakeover_ADeadUpgradedVoterMidRollStopsTakeovers(t *testing.T) {
+	c, _ := leaseClaimFleet(t, 5, 71, false)
+	o1, o2, v1, v3 := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[4]
+	for _, n := range []*Node{o1, o2} {
+		n.Server.SetLeaseClaimsAsAnOlderBuildForTest(true)
+	}
+	c.Kill(v3)
+	now := time.Now().UTC()
+	for _, at := range []time.Time{now, now.Add(catchUpTTL + time.Second)} {
+		if held, term := acquireAt(t, v1, at); held {
+			t.Fatalf("%s took term %d with an older-build minority and a dead upgraded voter", v1.Name, term)
+		}
+	}
+	if newest, err := corrosion.CurrentLeaseTerm(context.Background(), v1.DB, leaseTermKey); err != nil || newest != 0 {
+		t.Fatalf("%s recorded term %d (err %v)", v1.Name, newest, err)
+	}
+	if !noMajorityRaisedOn(t, v1) {
+		t.Fatalf("%s raised no ha.lease.claim_no_majority a TTL into the stall", v1.Name)
+	}
+}
+
+// TestFleet_LeaseTakeover_TheReturningHolderResolvesTheStall: the survivors
+// cannot claim (their claim RPCs to each other fail) and one raises
+// ha.lease.claim_no_majority. Then the holder comes back and renews its
+// lease. Nobody mints and no claim is decided, but the lease is no longer
+// contested: the condition resolves.
+//
+// Mutation: NoteLeaseLive resolves nothing — the condition stays raised.
+func TestFleet_LeaseTakeover_TheReturningHolderResolvesTheStall(t *testing.T) {
+	c, _ := leaseClaimFleet(t, 3, 73, true)
+	a, b, d := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	t0 := time.Now().UTC()
+	holdFirstTerm(t, c, a, t0)
+	c.Kill(a)
+	c.SetLinkFaultBoth(b, d, LinkFault{BlockClaims: true})
+	takeover := t0.Add(catchUpTTL + catchUpPoll)
+	for _, at := range []time.Time{takeover, takeover.Add(catchUpTTL + time.Second)} {
+		if held, term := acquireAt(t, b, at); held {
+			t.Fatalf("%s took term %d without a majority", b.Name, term)
+		}
+	}
+	if !noMajorityRaisedOn(t, b) {
+		t.Fatal("fixture: no condition raised")
+	}
+
+	// a comes back, inside its own lease by its own clock, and renews.
+	for _, o := range []*Node{b, d} {
+		c.SetLinkFaultBoth(a, o, LinkFault{})
+	}
+	c.WaitConverged(t, convergeTimeout, a, b)
+	if held, term := acquireAt(t, a, t0.Add(catchUpTTL/2)); !held || term != 1 {
+		t.Fatalf("%s: held=%v term=%d, want its renewal at term 1", a.Name, held, term)
+	}
+	eventually(t, convergeTimeout, "the stall resolves on "+b.Name, func() bool { return !noMajorityRaisedOn(t, b) })
+}

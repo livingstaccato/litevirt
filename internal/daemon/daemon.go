@@ -3698,6 +3698,13 @@ func (d *Daemon) wireLeaseMintClearance() {
 		}
 		return svc.LeaseMintClearance(ctx, req)
 	})
+	// A lease seen held — a renewal, a mint, a peer's live lease — resolves a
+	// no-majority stall the server raised for it.
+	d.db.SetLeaseLiveObserver(func(ctx context.Context, key string) {
+		if svc := d.mintClearance.Load(); svc != nil {
+			svc.NoteLeaseLive(ctx, key)
+		}
+	})
 }
 
 // wireVoterConfigGate lets corrosion write voter_configs only once

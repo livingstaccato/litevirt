@@ -58,6 +58,32 @@ const maxLeaseAttempts = 3
 // "not held", which is the same shape as losing the race and is what the callers
 // already handle.
 func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, ttl time.Duration, now time.Time) (bool, int64, error) {
+	held, term, err := acquireLeaseWithTerm(ctx, c, key, holder, ttl, now)
+	if err == nil && c.leaseLiveObserver != nil {
+		live := held
+		if !held {
+			// Not ours: live for someone else? One local read, so the
+			// observer hears of a lease that is no longer contested.
+			cur, exp, rerr := leaseRow(ctx, c, key)
+			live = rerr == nil && cur != "" && cur != holder &&
+				exp >= now.UTC().Format(time.RFC3339)
+		}
+		if live {
+			c.leaseLiveObserver(ctx, key)
+		}
+	}
+	return held, term, err
+}
+
+// SetLeaseLiveObserver injects what AcquireLeaseWithTerm tells when it finds
+// the lease key held — by this node (a renewal or a mint) or live for a peer.
+// Wired at daemon start to grpcapi.Server.NoteLeaseLive, which resolves the
+// no-majority condition a stalled takeover raised. Nil tells nobody.
+func (c *Client) SetLeaseLiveObserver(fn func(ctx context.Context, key string)) {
+	c.leaseLiveObserver = fn
+}
+
+func acquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, ttl time.Duration, now time.Time) (bool, int64, error) {
 	// The clock is re-sampled on EVERY attempt, not once at entry.
 	//
 	// A holder that enters before its expiry and then stalls past the TTL -- a

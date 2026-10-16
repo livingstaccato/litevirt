@@ -908,7 +908,11 @@ const leaseTermClaimRetention = 8
 // only after the quorum high-water read showed every term up to it free, and
 // a term this many below one already recorded and replicated is not one any
 // claimant can get past that read for. Within the margin, and for terms that
-// were decided but never recorded, the state is kept.
+// were decided but never recorded, the state is kept. The margin bounds the
+// case, it does not exclude it: the read's quorum and the claim's majority are
+// different sets, so a claimant whose read is more than the margin behind
+// could re-decide a pruned term — one long superseded and fenced by the
+// barrier.
 func pruneLeaseTermClaimsTx(ctx context.Context, tx *LocalTx, lease string) error {
 	rows, err := tx.Query(ctx, `SELECT COALESCE(MAX(term), 0) AS t FROM leader_lease_terms
 		WHERE key = ? AND deleted_at IS NULL`, lease)

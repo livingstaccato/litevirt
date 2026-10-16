@@ -314,3 +314,32 @@ func TestClaimVoter_PrunesLeaseTermsWellBelowTheLedger(t *testing.T) {
 		t.Error("a term within the retention margin was pruned")
 	}
 }
+
+// AcquireLeaseWithTerm tells the live observer whenever it finds the lease
+// held — its own mint or renewal, or a peer's live lease — and not when the
+// lease is still free: that is how a stalled takeover's condition resolves
+// once anyone holds the lease, the returned dead holder included.
+//
+// Mutation: never call the observer — this goes red.
+func TestAcquireLeaseWithTerm_TellsTheLiveObserver(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	var told []string
+	c.SetLeaseLiveObserver(func(_ context.Context, key string) { told = append(told, key) })
+	allow := false
+	c.SetLeaseMintClearance(func(context.Context, LeaseMintRequest) (bool, string) { return allow, "test" })
+
+	if held, _, _ := AcquireLeaseWithTerm(ctx, c, LeaseKeyFailover, "host-a", 30*time.Second, leaseTestNow); held || len(told) != 0 {
+		t.Fatalf("a free lease whose mint was withheld: held=%v told=%v, want neither", held, told)
+	}
+	allow = true
+	if held, _, _ := AcquireLeaseWithTerm(ctx, c, LeaseKeyFailover, "host-a", 30*time.Second, leaseTestNow); !held || len(told) != 1 {
+		t.Fatalf("a mint: held=%v told=%v, want held and told once", held, told)
+	}
+	if held, _, _ := AcquireLeaseWithTerm(ctx, c, LeaseKeyFailover, "host-a", 30*time.Second, leaseTestNow.Add(5*time.Second)); !held || len(told) != 2 {
+		t.Fatalf("a renewal: held=%v told=%v, want held and told", held, told)
+	}
+	if held, _, _ := AcquireLeaseWithTerm(ctx, c, LeaseKeyFailover, "host-b", 30*time.Second, leaseTestNow.Add(6*time.Second)); held || len(told) != 3 {
+		t.Fatalf("a peer polling host-a's live lease: held=%v told=%v, want told", held, told)
+	}
+}

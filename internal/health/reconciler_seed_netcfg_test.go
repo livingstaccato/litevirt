@@ -442,3 +442,155 @@ func TestDomainXMLFor_RefreshesTheVMsStaleSeed(t *testing.T) {
 		t.Error("the seed is no longer stamped for the VM")
 	}
 }
+
+// staleSeedVM is VM vm1 (spec NIC A on brnet; B hot-attached since on hinet
+// with 10.212.0.7) and its own stamped seed on r's host written when A was
+// its one NIC, instance-id vm1-next.
+func staleSeedVM(t *testing.T, r *Reconciler, db *corrosion.Client) (corrosion.VMRecord, *pb.VMSpec, string) {
+	t.Helper()
+	ctx := context.Background()
+	r.SetNetworkProvision(func(context.Context, *corrosion.Client, string, compose.NetworkDef, string, string) (string, error) {
+		return "", nil
+	})
+	for name, def := range map[string]compose.NetworkDef{
+		"brnet": {Type: "bridge", Subnet: "172.40.0.0/24", DHCP: true},
+		"hinet": {Type: "vxlan", VNI: 7, Subnet: "10.212.0.0/24", HostIsolation: true},
+	} {
+		cfg, _ := json.Marshal(def)
+		if err := corrosion.UpsertNetwork(ctx, db, corrosion.NetworkRecord{Name: name, Type: def.Type, Config: string(cfg)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	spec := &pb.VMSpec{Name: "vm1", Uuid: "vm1-u", Cpu: 1, MemoryMib: 512, Image: "ubuntu",
+		Network: []*pb.NetworkAttachment{{Name: "brnet", Mac: "52:54:00:aa:00:01"}}}
+	specJSON, _ := json.Marshal(spec)
+	vm := corrosion.VMRecord{Name: "vm1", HostName: "node-a", Spec: string(specJSON), State: "running", CPUActual: 1, MemActual: 512}
+	if err := corrosion.InsertVM(ctx, db, vm, []corrosion.InterfaceRecord{
+		{VMName: "vm1", NetworkName: "brnet", MAC: "52:54:00:aa:00:01"},
+		{VMName: "vm1", NetworkName: "hinet", MAC: "52:54:00:aa:00:02", Ordinal: 1, IP: "10.212.0.7"},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	iso, _ := lv.SafeCloudInitISOPath(r.dataDir, "vm1")
+	if err := cloudinit.GenerateISO(cloudinit.Config{InstanceID: "vm1-next", LocalHostname: "vm1",
+		UserData: "#cloud-config\nhostname: vm1\n"}, iso); err != nil {
+		t.Fatal(err)
+	}
+	if err := cloudinit.StampSeed(iso, "vm1-u"); err != nil {
+		t.Fatal(err)
+	}
+	return vm, spec, iso
+}
+
+// T2 fix round 1, I1 (controller ruling): a VM whose own stale seed cannot be
+// brought up to date — its network-config cannot be derived, or the seed
+// cannot be rewritten — still starts, on the seed as it is, and a
+// seed.rebuild_failed warning names the seed, the host and the cause. Before,
+// the start failed (retried), so an unwritable seed directory kept the VM
+// from starting there at all.
+//
+// Mutation: fail the start again on either error — both cases go red.
+func TestDomainXMLFor_AStaleSeedThatCannotBeRefreshedStillStarts(t *testing.T) {
+	cloudinit.UseGoISOWithoutGenisoimage(t)
+	for _, tc := range []string{"derivation fails", "rewrite fails"} {
+		t.Run(tc, func(t *testing.T) {
+			if tc == "rewrite fails" && os.Geteuid() == 0 {
+				t.Skip("root writes into a read-only directory")
+			}
+			db := testReconcilerDB(t)
+			ctx := context.Background()
+			r, _, _ := sharedDiskReconciler(t, db)
+			vm, spec, iso := staleSeedVM(t, r, db)
+			before, _ := os.ReadFile(iso)
+			switch tc {
+			case "derivation fails":
+				if err := db.Execute(ctx, `DROP TABLE networks`); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				dir := filepath.Dir(iso)
+				if err := os.Chmod(dir, 0o555); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+			}
+			domXML, _, failure := r.domainXMLFor(ctx, vm, spec, nil)
+			if failure != "" {
+				t.Fatalf("the start failed: %s", failure)
+			}
+			if !strings.Contains(domXML, iso) {
+				t.Errorf("the domain does not attach the seed %s", iso)
+			}
+			if after, _ := os.ReadFile(iso); string(after) != string(before) {
+				t.Error("the seed changed")
+			}
+			evs, err := corrosion.ListVMEvents(ctx, db, "vm1", 50, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			n := 0
+			for _, e := range evs {
+				if e.Type == "seed.rebuild_failed" && e.Severity == "warning" && strings.Contains(e.Detail, iso) && strings.Contains(e.Detail, "node-a") {
+					n++
+				}
+			}
+			if n != 1 {
+				t.Errorf("want one seed.rebuild_failed warning naming %s and node-a: %+v", iso, evs)
+			}
+		})
+	}
+}
+
+// T2 fix round 1, m2: the VM's own seed is read as possibly stale only when
+// it is not the one the VM runs on here. Here the VM's domain on this host
+// attaches it and has exactly its NICs, so the seed is current, and B — which
+// an earlier release attached and no seed of that release lists — keeps the
+// name the guest gave it (matched by MAC, no set-name) at an ordinary start.
+// With no domain here (a copy kept from an earlier stay) B is eth1, as on the
+// host the VM ran on (TestDomainXMLFor_RefreshesTheVMsStaleSeed).
+//
+// A domain here that still lacks B (a leftover definition from before the
+// attach elsewhere) does not make the seed current: B is eth1.
+//
+// Mutation: read every own seed as stale — B gets set-name eth1; take a seed
+// the domain attaches as current whatever NICs the domain has — the leftover
+// case leaves B unnamed.
+func TestDomainXMLFor_ACurrentSeedRenamesNoNIC(t *testing.T) {
+	cloudinit.UseGoISOWithoutGenisoimage(t)
+	for _, tc := range []struct {
+		name    string
+		nics    []string
+		current bool
+	}{
+		{"the domain has the VM's NICs", []string{"52:54:00:aa:00:01", "52:54:00:aa:00:02"}, true},
+		{"a leftover domain without B", []string{"52:54:00:aa:00:01"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := testReconcilerDB(t)
+			ctx := context.Background()
+			r, fake, _ := sharedDiskReconciler(t, db)
+			vm, spec, iso := staleSeedVM(t, r, db)
+			dom := "<domain type='kvm'><name>vm1</name><uuid>vm1-u</uuid><memory unit='MiB'>512</memory><vcpu>1</vcpu><devices>" +
+				"<disk type='file' device='cdrom'><driver name='qemu' type='raw'/><source file='" + iso + "'/><target dev='sdb' bus='sata'/><readonly/></disk>"
+			for _, mac := range tc.nics {
+				dom += "<interface type='bridge'><mac address='" + mac + "'/><source bridge='br0'/></interface>"
+			}
+			dom += "</devices></domain>"
+			if err := fake.DefineDomain(dom); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, failure := r.domainXMLFor(ctx, vm, spec, nil); failure != "" {
+				t.Fatalf("domainXMLFor: %s", failure)
+			}
+			got, err := cloudinit.ReadSeed(iso)
+			if err != nil {
+				t.Fatal(err)
+			}
+			named := strings.Contains(got.NetworkConfig, "macaddress: \"52:54:00:aa:00:02\"\n    set-name: eth1\n    addresses:\n      - 10.212.0.7/24\n")
+			unnamed := !strings.Contains(got.NetworkConfig, "set-name") && strings.Contains(got.NetworkConfig, "macaddress: \"52:54:00:aa:00:02\"\n    addresses:\n      - 10.212.0.7/24\n")
+			if tc.current && !unnamed || !tc.current && !named {
+				t.Errorf("current=%v: B is not as expected:\n%s", tc.current, got.NetworkConfig)
+			}
+		})
+	}
+}

@@ -242,10 +242,13 @@ func loadTagGroups(ctx context.Context, db *corrosion.Client, host string, now t
 	return t, nil
 }
 
-// shadows reports whether name is another group's IPv6 companion: x_v6 while
-// a group x exists.
-// noteDeny records that a deny matches a rendered group's set, through
-// tag:<g> or a positive @lv_tg_<g> (denyRef).
+// noteDeny records that a deny matches a rendered group's set (denyRef). It
+// is given two kinds of cidr:
+//   - every host's stored host-tier rows (loadTagGroups): tag:<g>, and a
+//     positive @lv_tg_<g> stored before writes refused one, counted although
+//     its own host leaves it out, which only widens the hold;
+//   - this host's renderings (rule): the tag pass's rewrite of tag:<g> to
+//     @lv_tg_<g>, this pass's or one kept from an earlier pass.
 func (t *tagPass) noteDeny(cidr, action string) {
 	if isAccept(action) {
 		return
@@ -260,6 +263,8 @@ func (t *tagPass) noteDeny(cidr, action string) {
 	}
 }
 
+// shadows reports whether name is another group's IPv6 companion: x_v6 while
+// a group x exists.
 func (t *tagPass) shadows(name string) bool {
 	base, ok := strings.CutSuffix(name, ipv6SetSuffix)
 	_, exists := t.groups[base]
@@ -370,7 +375,10 @@ func (t *tagPass) rule(q *quarantine, table, id, direction, proto, port, cidr, a
 		if g, isTag := strings.CutPrefix(set, TagGroupSetPrefix); isTag && !t.readable[g] {
 			// "Deny all not in" a group this pass does not render: whom it
 			// spares is unknown, so it denies everyone, as a tag: deny does
-			// (D4 re-review I-A). Left out, it would deny no one.
+			// (D4 re-review I-A). Left out, it would deny no one. Only a row
+			// stored as != @lv_tg_<g> reaches this, from before writes refused
+			// one; on a group this pass renders, the same row is a user set
+			// reference and is left out (userSetName), as on integration.
 			t.refer(table, id, g, action, TagHandlingNoAddress)
 			cidr = ""
 		}
@@ -381,17 +389,10 @@ func (t *tagPass) rule(q *quarantine, table, id, direction, proto, port, cidr, a
 	if !ok {
 		return r, false
 	}
-	if set, isRef := rulefield.SetRef(r.CIDR); isRef && strings.HasPrefix(set, TagGroupSetPrefix) && rulefield.NegatedSetRef(r.CIDR) &&
-		(r.Action == Accept || r.Action == "") {
-		// "Not a member" accepted would admit every workload whose
-		// membership cannot be proven (D4 review I-3): left out, which
-		// matches nothing.
-		delete(q.next, table+"/"+id)
-		q.invalid = append(q.invalid, InvalidRow{Table: table, ID: id, Action: action,
-			Reason:   fmt.Sprintf("cidr %q accepts what is not in a tag group's set, which would admit a workload whose membership cannot be proven", r.CIDR),
-			Handling: HandlingLeftOut})
-		return Rule{}, false
-	}
+	// No rendering names a group's set negated: the tag pass rewrites tag:<g>
+	// to the positive @lv_tg_<g>, and a row stored as != @lv_tg_<g> is left out
+	// by userSetName (or, as a deny on a group not rendered, loses its address
+	// above). So "not a member" is never accepted (D4 review I-3).
 	t.noteDeny(r.CIDR, string(r.Action))
 	// A rendering this host kept from an earlier pass (the row turned
 	// unreadable) may name a group's set this pass does not render: a deny

@@ -523,6 +523,7 @@ func TestCloneVM_FailedCephCloneRemovesTheCopy(t *testing.T) {
 // Every start path puts the secret back first (PrepareHardwareForStart).
 func TestPrepareHardwareForStart_DefinesTheCephSecret(t *testing.T) {
 	f := newCephPoolFixture(t)
+	isolateReviewHardwareNetwork(t, f.s)
 	ctx := context.Background()
 	vm := corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "stopped"}
 	f.world.images["lv/vm1-data"] = map[string]bool{}
@@ -753,6 +754,7 @@ func TestPrepareHardwareForStart_ProvesTheKeyWithRBD(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newCephPoolFixture(t)
+			isolateReviewHardwareNetwork(t, f.s)
 			vm := f.insertCephVM(t, "pk", "test-host")
 			f.world.infoExit, f.world.infoOut = tc.exit, tc.out
 			_, err := f.s.PrepareHardwareForStart(context.Background(), &vm)
@@ -798,6 +800,7 @@ func TestRBDPathOptions_CarriesMonHost(t *testing.T) {
 // that was removed does not stay in it.
 func TestPrepareHardwareForStart_RefreshesMonitorsInThePersistentXML(t *testing.T) {
 	f := newCephPoolFixture(t)
+	isolateReviewHardwareNetwork(t, f.s)
 	defer lv.SetCephMonitorResolver(f.s.CephMonitorsForPool)()
 	vm := f.insertCephVM(t, "mr", "test-host")
 	stale := `<domain type="kvm"><name>mr</name><devices><disk type="network" device="disk"><driver name="qemu" type="raw"></driver><source protocol="rbd" name="lv/mr-data"><host name="10.0.0.99" port="6789"></host><auth username="litevirt"><secret type="ceph" uuid="` + f.secret + `"></secret></auth></source><target dev="vda" bus="virtio"></target></disk></devices></domain>`

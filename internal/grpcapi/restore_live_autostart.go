@@ -399,7 +399,7 @@ func (s *Server) autoDefineRestoredVM(
 	}
 	// Spare root ports last, as in the reconciler's start: a device the
 	// pre-start patches in would otherwise land on a spare.
-	s.ensureSparePCIeRootPorts(targetName)
+	s.EnsureSparePCIeRootPorts(ctx, targetName)
 	if len(guardRecords) > 0 {
 		// The row is written once the domain runs; until then the firewall
 		// renders its NICs from here (nic_firewall_arming.go).

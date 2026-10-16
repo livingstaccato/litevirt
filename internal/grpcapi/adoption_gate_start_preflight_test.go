@@ -74,6 +74,7 @@ func TestAttachDevice_BlockedAdoption_Latched_FailsClosed(t *testing.T) {
 
 func TestStartVM_BlockedAdoption_Latched_FailsClosed(t *testing.T) {
 	s := hotplugDiskServer(t)
+	isolateReviewHardwareNetwork(t, s)
 	enableHardwareV2(t, s)
 	ctx := adminCtx()
 	seedNICVM(t, s, "vm1", "stopped")
@@ -130,6 +131,7 @@ func TestStartVM_BlockedAdoption_NotLatched_StartsAndMutates(t *testing.T) {
 
 func TestStartVM_PCIPreflight_ConcreteAddress_AcquiresRealizesReconciles(t *testing.T) {
 	s := hotplugDiskServer(t)
+	isolateReviewHardwareNetwork(t, s)
 	enableHardwareV2(t, s)
 	fs := newPCIBindFakeFS()
 	restore := vfio.SetFS(fs)
@@ -197,6 +199,7 @@ func TestStartVM_NoIntents_NoPreflight_Unchanged(t *testing.T) {
 
 func TestStartVM_PCIPreflight_VanishedDevice_FailClosed(t *testing.T) {
 	s := hotplugDiskServer(t)
+	isolateReviewHardwareNetwork(t, s)
 	enableHardwareV2(t, s)
 	fs := &failBindFS{pciBindFakeFS: newPCIBindFakeFS(), failAddr: "0000:41:00.0"}
 	restore := vfio.SetFS(fs)

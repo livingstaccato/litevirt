@@ -67,6 +67,7 @@ func TestUpdateVM_HotplugDiskSurvivesRedefine(t *testing.T) {
 // disk is dropped even though the spec blob lists only root.
 func TestReconcile_HotplugDiskSurvivesRedefine(t *testing.T) {
 	s := reconfigServer(t)
+	isolateReviewHardwareNetwork(t, s)
 	ctx := adminCtx()
 	insertTestVMWithSpec(t, ctx, s.db, "vm1", "test-host", "stopped",
 		seedSpecJSON(t, &pb.VMSpec{
@@ -132,6 +133,7 @@ func xmlAttrPresent(xmlText, attr, val string) bool {
 // an ownership row (same BDF, the normal post-backfill state) is emitted once.
 func TestReconcile_MixedIntentAndOwnershipPCIPreservesBoth(t *testing.T) {
 	s := reconfigServer(t)
+	isolateReviewHardwareNetwork(t, s)
 	ctx := adminCtx()
 	insertTestVMWithSpec(t, ctx, s.db, "mix", "test-host", "stopped",
 		seedSpecJSON(t, &pb.VMSpec{Name: "mix", Cpu: 4, MemoryMib: 4096, Machine: "q35"}))
@@ -196,6 +198,7 @@ func TestReconcile_MixedIntentAndOwnershipPCIPreservesBoth(t *testing.T) {
 // aliases byte-for-byte (only <source> may be rewritten — here it's unchanged).
 func TestReconcile_NoopPreservesTopology(t *testing.T) {
 	s := reconfigServer(t)
+	isolateReviewHardwareNetwork(t, s)
 	ctx := adminCtx()
 	insertTestVMWithSpec(t, ctx, s.db, "topo", "test-host", "stopped",
 		seedSpecJSON(t, &pb.VMSpec{Name: "topo", Cpu: 2, MemoryMib: 4096}))

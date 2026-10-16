@@ -85,6 +85,7 @@ type imagePullFlight struct {
 // is running locally in libvirt but corrosion says it belongs to another host.
 type Reconciler struct {
 	networkStarter func(context.Context, string) error
+	spareRootPorts func(context.Context, string)
 	// stopSyncHook, test-only, runs between the out-of-band stop sync's
 	// decision and its write, where a concurrent `lv stop` can land.
 	stopSyncHook func(ctx context.Context, vmName string)
@@ -416,7 +417,16 @@ func (r *Reconciler) SetSparePCIeRootPorts(n int) { r.sparePCIeRootPortsCfg = n 
 // libvirt has placed every device (lv.EnsureSparePCIeRootPorts). Best
 // effort: a failure leaves a valid domain that a later hot-plug may find
 // full, which is no reason to keep the VM from starting.
-func (r *Reconciler) ensureSparePCIeRootPorts(name string) {
+// SetSpareRootPortPreparer installs the server's shared domain rewrite guard.
+func (r *Reconciler) SetSpareRootPortPreparer(fn func(context.Context, string)) {
+	r.spareRootPorts = fn
+}
+
+func (r *Reconciler) ensureSparePCIeRootPorts(ctx context.Context, name string) {
+	if r.spareRootPorts != nil {
+		r.spareRootPorts(ctx, name)
+		return
+	}
 	if _, err := lv.EnsureSparePCIeRootPorts(r.virt, name, r.sparePCIeRootPortsCfg); err != nil {
 		slog.Warn("reconciler: spare PCIe root ports not added; a hot-plug may find no free slot",
 			"vm", name, "want", r.sparePCIeRootPortsCfg, "error", err)
@@ -2093,7 +2103,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	}
 	// Spare root ports last: the pre-start above may have patched hostdevs
 	// in, and libvirt places those on any free port, spares included.
-	r.ensureSparePCIeRootPorts(vm.Name)
+	r.ensureSparePCIeRootPorts(ctx, vm.Name)
 
 	if r.startDomainHook != nil {
 		r.startDomainHook(ctx)

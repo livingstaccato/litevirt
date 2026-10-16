@@ -724,6 +724,12 @@ func (s *Server) refreshRBDMonitors(ctx context.Context, vmName string) {
 	if len(locators) == 0 || !s.virt.DomainExists(vmName) {
 		return
 	}
+	release, err := s.netDevs.acquireTransition(ctx, false)
+	if err != nil {
+		slog.Warn("rbd monitors not refreshed: network transition unavailable", "vm", vmName, "error", err)
+		return
+	}
+	defer release()
 	x, err := s.virt.DumpXMLInactive(vmName)
 	if err != nil {
 		return

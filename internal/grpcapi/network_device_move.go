@@ -57,8 +57,9 @@ type provisionedDevices struct {
 type pendingRetire struct {
 	Network string             `json:"network"`
 	Def     compose.NetworkDef `json:"def"`
-	// Released: its gateway and dnsmasq went to the network's new device
-	// already; only its L2 is kept, for workloads still defined on it.
+	// Released records that this device actually served our gateway before
+	// temporary release. It authorizes restoring implicit DHCP after release
+	// removes the pidfile that normally remembers that ownership.
 	Released bool `json:"released,omitempty"`
 	// Recover keeps an unsuccessful old-service rollback retryable across a daemon restart.
 	Recover bool `json:"recover,omitempty"`
@@ -212,7 +213,7 @@ func (s *Server) provisionDevice(ctx context.Context, db *corrosion.Client, name
 		pending, recovering := s.netDevs.pending[oldDev]
 		s.netDevs.mu.Unlock()
 		if recovering && pending.Network == name && pending.Recover {
-			if _, err := s.provisionOnDevice(ctx, db, name, old, localIP, hostName); err != nil {
+			if _, err := s.restoreReleasedService(ctx, db, name, pending, localIP, hostName); err != nil {
 				return "", fmt.Errorf("restore previous device %s before moving network %s: %w", oldDev, name, err)
 			}
 			s.netDevs.setPending(oldDev, nil)
@@ -228,7 +229,7 @@ func (s *Server) provisionDevice(ctx context.Context, db *corrosion.Client, name
 		if released != nil {
 			// The new device did not come up: the gateway goes back to the
 			// device the network's workloads are on.
-			if _, rerr := s.provisionOnDevice(ctx, db, name, *released, localIP, hostName); rerr != nil {
+			if _, rerr := s.restoreReleasedService(ctx, db, name, pendingRetire{Def: *released, Released: true}, localIP, hostName); rerr != nil {
 				s.netDevs.setPending(network.BridgeName(name, *released), &pendingRetire{Network: name, Def: *released, Released: true, Recover: true})
 				slog.Warn("network move failed; putting the gateway back on the previous device failed too",
 					"network", name, "device", network.BridgeName(name, *released), "error", rerr)
@@ -249,6 +250,26 @@ func (s *Server) provisionDevice(ctx context.Context, db *corrosion.Client, name
 		s.retirePendingHeld(ctx, oldDev)
 	}
 	return got, nil
+}
+
+// restoreReleasedService uses only the ownership proven by a prior service
+// release. Ordinary provisioning must keep refusing implicit DHCP on an
+// operator's pre-existing bridge. Keep the original definition in the record;
+// the explicit DHCP bit is scoped to restoring the service we removed.
+func (s *Server) restoreReleasedService(ctx context.Context, db *corrosion.Client, name string, pending pendingRetire, localIP, hostName string) (string, error) {
+	if !pending.Released {
+		return "", fmt.Errorf("previous device has no released service ownership")
+	}
+	def := pending.Def
+	def.DHCP = true
+	dev, err := s.provisionOnDevice(ctx, db, name, def, localIP, hostName)
+	if err != nil {
+		return "", err
+	}
+	if !s.networkProvisioner().ServingGateway(name, pending.Def) {
+		return "", fmt.Errorf("previous device %s did not restore its gateway service", dev)
+	}
+	return dev, nil
 }
 
 // provisionOnDevice is shared by the forward provision and its rollback:
@@ -1038,8 +1059,9 @@ func (s *Server) removeOrphanUnlessNamed(ctx context.Context, sw orphanBridgeSwe
 	return sw.RemoveOrphanedBridge(b)
 }
 
-// acquireTransition excludes a device transition from starts already handed
-// to the runtime. Starts may run concurrently. Admission is context-aware;
+// acquireTransition excludes a device transition from whole-domain rewrites
+// and starts already handed to the runtime. Readers may run concurrently.
+// Admission is context-aware;
 // a non-context-bound runtime keeps its read hold until it actually returns.
 // Order: caller's workload lock (if any), transition, network, device, mu.
 // The transition owner never acquires a workload lock.

@@ -294,6 +294,6 @@ func TestStart_AnInstallerISOOnADeadMountIsRefusedNotWaitedOn(t *testing.T) {
 		return "", errors.New("released")
 	}
 	t.Cleanup(func() { judgeCDROMs = prev })
-	err := within(t, 10*time.Second, "the start's ISO check", func() error { return f.s.verifyVMISOForStart(vm) })
+	err := within(t, 10*time.Second, "the start's ISO check", func() error { return f.s.verifyVMISOForStart(context.Background(), vm) })
 	wantNoAnswer(t, "ISO check", err)
 }

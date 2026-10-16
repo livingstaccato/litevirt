@@ -428,10 +428,16 @@ func vmSpecFor(vm *corrosion.VMRecord) *pb.VMSpec {
 // after the ISO is gone. The VM's ISO is resolved again here
 // (installerISOResolution) and the domain is pointed at the files resolved
 // here where it names other paths. A refusal keeps the VM down, loudly.
-func (s *Server) verifyVMISOForStart(vm *corrosion.VMRecord) error {
+func (s *Server) verifyVMISOForStart(ctx context.Context, vm *corrosion.VMRecord) error {
 	if vm == nil || s.virt == nil {
 		return nil
 	}
+	// Keep the captured NIC mapping valid until the whole-domain rewrite lands.
+	release, err := s.netDevs.acquireTransition(ctx, false)
+	if err != nil {
+		return err
+	}
+	defer release()
 	domXML, err := s.virt.DumpXMLInactive(vm.Name)
 	if err != nil {
 		return nil

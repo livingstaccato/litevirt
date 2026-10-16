@@ -722,7 +722,7 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 		cleanup()
 		return nil, status.Errorf(codes.Internal, "define clone domain: %v", err)
 	}
-	s.ensureSparePCIeRootPorts(req.Target)
+	s.EnsureSparePCIeRootPorts(ctx, req.Target)
 	// specJSON above was marshalled BEFORE the define, so it carries whatever
 	// the source spec had — an alias if the source was never pinned. The define
 	// just resolved it against this host's qemu; persist that concrete value

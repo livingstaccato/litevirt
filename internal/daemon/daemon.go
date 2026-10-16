@@ -1278,6 +1278,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	vmChecker.SetNetworkFollower(svc.FollowNetworkDevices)
 	vmChecker.SetNetworkStarter(svc.StartDomainOnNetwork)
 	reconciler.SetNetworkStarter(svc.StartDomainOnNetwork)
+	reconciler.SetSpareRootPortPreparer(svc.EnsureSparePCIeRootPorts)
 	vmChecker.SetCancelledStartProbe(svc.HasCancelledStart) // cancelled_starts.go: neither healed to running nor restarted
 
 	// Wire reconciler callbacks now that gRPC server exists.

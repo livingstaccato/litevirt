@@ -1257,7 +1257,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid) // no orphan nvram/swtpm (G1)
 		return nil, status.Errorf(codes.Internal, "define domain: %v", err)
 	}
-	s.ensureSparePCIeRootPorts(spec.Name)
+	s.EnsureSparePCIeRootPorts(ctx, spec.Name)
 
 	// The NIC rows are written once the domain runs; until then the firewall
 	// renders the NICs from here, so their guards are in force when the
@@ -2130,7 +2130,7 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 
 	// qemu reopens the installer ISO at every start, so it is judged again
 	// here, on the host that starts it — every start path runs this hook.
-	if err := s.verifyVMISOForStart(vm); err != nil {
+	if err := s.verifyVMISOForStart(ctx, vm); err != nil {
 		return releasePreflight, err
 	}
 	// An image-store base is a file qemu opens for the guest at every start:
@@ -5985,7 +5985,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		return nil, status.Errorf(codes.Internal, "redefine domain: %v", err)
 	}
 	if regenerated {
-		s.ensureSparePCIeRootPorts(req.Name)
+		s.EnsureSparePCIeRootPorts(ctx, req.Name)
 	}
 	s.ReportSharedDiskWithheld(ctx, req.Name, corrosion.WithheldSharedDiskDetail(req.Name, s.hostName, withheldShared))
 

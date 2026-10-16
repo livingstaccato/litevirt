@@ -662,7 +662,7 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 		return nil
 	}
 	if rec, gErr := corrosion.GetVM(ctx, s.db, m.ReplacedVM); gErr == nil && rec != nil {
-		if e := s.verifyVMISOForStart(rec); e != nil {
+		if e := s.verifyVMISOForStart(ctx, rec); e != nil {
 			return failed("start", e)
 		}
 	}

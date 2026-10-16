@@ -451,6 +451,7 @@ func TestUpdateVM_EnableMemoryHotplugStopped(t *testing.T) {
 // know, so a VM with USB devices is regenerated, which re-resolves them.
 func TestReconcile_KeepsUSBHostdevs(t *testing.T) {
 	s := reconfigServer(t)
+	isolateReviewHardwareNetwork(t, s)
 	ctx := adminCtx()
 	insertTestVMWithSpec(t, ctx, s.db, "ru", "test-host", "stopped",
 		seedSpecJSON(t, &pb.VMSpec{Name: "ru", Cpu: 1, MemoryMib: 1024,
@@ -508,6 +509,7 @@ func TestPrepareHardwareForStart_RefreshesUSBBusPort(t *testing.T) {
 	defer lv.SetUSBSysfsRootForTest(root)()
 
 	s, fake := provableCreateServer(t)
+	isolateReviewHardwareNetwork(t, s)
 	enableUsbMountsMemory(s)
 	ctx := adminCtx()
 	if _, err := s.CreateVM(ctx, usbCreateRequest("u1", &pb.USBDeviceSpec{BusPort: "1-2"})); err != nil {

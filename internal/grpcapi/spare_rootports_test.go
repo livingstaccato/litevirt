@@ -57,6 +57,7 @@ func seedStoppedQ35VM(t *testing.T, s *Server, name string) {
 // Mutation: top up after the patch path too — red.
 func TestReconcile_PatchPathAddsNoSpareRootPorts(t *testing.T) {
 	s := reconfigServer(t)
+	isolateReviewHardwareNetwork(t, s)
 	s.SetSparePCIeRootPorts(4)
 	seedStoppedQ35VM(t, s, "old")
 
@@ -95,6 +96,7 @@ func TestUpdateVM_InPlacePatchAddsNoSpareRootPorts(t *testing.T) {
 // Mutation: drop the top-up from the regenerate branch — red.
 func TestReconcile_RegenerateTopsUpSpareRootPorts(t *testing.T) {
 	s := reconfigServer(t)
+	isolateReviewHardwareNetwork(t, s)
 	s.SetSparePCIeRootPorts(4)
 	ctx := adminCtx()
 	insertTestVMWithSpec(t, ctx, s.db, "fresh", "test-host", "stopped",
@@ -115,6 +117,7 @@ func TestReconcile_RegenerateTopsUpSpareRootPorts(t *testing.T) {
 // Mutation: make CreateVM fail on a top-up error — red.
 func TestCreateVM_SpareRootPortTopUpFailureIsNotFatal(t *testing.T) {
 	s, fake := provableCreateServer(t)
+	isolateReviewHardwareNetwork(t, s)
 	s.SetSparePCIeRootPorts(4)
 	fake.FailDefineDomain = func(x string) error {
 		if strings.Contains(x, "pcie-root-port") {
@@ -155,6 +158,7 @@ func requireSpareRootPorts(t *testing.T, fake *libvirtfake.Fake, name string, wa
 // Mutation: drop the top-up from CloneVM — red.
 func TestCloneVM_TopsUpSpareRootPorts(t *testing.T) {
 	s := cloneSourceTemplate(t)
+	isolateReviewHardwareNetwork(t, s)
 	s.SetSparePCIeRootPorts(4)
 	if _, err := s.CloneVM(adminCtx(), &pb.CloneVMRequest{Source: "tpl", Target: "c1", Mode: "linked"}); err != nil {
 		t.Fatalf("CloneVM: %v", err)
@@ -165,6 +169,7 @@ func TestCloneVM_TopsUpSpareRootPorts(t *testing.T) {
 // Mutation: drop the top-up from ImportVM — red.
 func TestImportVM_TopsUpSpareRootPorts(t *testing.T) {
 	s := testServer(t)
+	isolateReviewHardwareNetwork(t, s)
 	s.dataDir = t.TempDir()
 	admissionHost(t, s)
 	fake := libvirtfake.New()
@@ -181,6 +186,7 @@ func TestImportVM_TopsUpSpareRootPorts(t *testing.T) {
 // Mutation: drop the top-up from the promote define — red.
 func TestPromoteReplica_TopsUpSpareRootPorts(t *testing.T) {
 	s := testServer(t)
+	isolateReviewHardwareNetwork(t, s)
 	s.dataDir = t.TempDir()
 	fake := libvirtfake.New()
 	s.virt = fake
@@ -216,6 +222,7 @@ func TestPromoteReplica_TopsUpSpareRootPorts(t *testing.T) {
 // Mutation: drop the top-up from the live-restore autostart define — red.
 func TestRestoreLive_AutoStart_TopsUpSpareRootPorts(t *testing.T) {
 	s := testServer(t)
+	isolateReviewHardwareNetwork(t, s)
 	s.hostName = "host-a"
 	s.dataDir = t.TempDir()
 	fake := libvirtfake.New()
@@ -245,6 +252,7 @@ func TestRestoreLive_AutoStart_TopsUpSpareRootPorts(t *testing.T) {
 // Mutation: drop the top-up from UpdateVM's regenerate branch — red.
 func TestUpdateVM_RegenerateTopsUpSpareRootPorts(t *testing.T) {
 	s := reconfigServer(t)
+	isolateReviewHardwareNetwork(t, s)
 	s.SetSparePCIeRootPorts(4)
 	ctx := adminCtx()
 	insertTestVMWithSpec(t, ctx, s.db, "regen", "test-host", "stopped",

@@ -439,7 +439,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		}
 		return status.Errorf(codes.Internal, "define domain: %v", err)
 	}
-	s.ensureSparePCIeRootPorts(name)
+	s.EnsureSparePCIeRootPorts(ctx, name)
 
 	// The define above resolved any machine alias against this host's qemu;
 	// persist the concrete value so the imported VM's guest ABI travels with it.

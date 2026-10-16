@@ -292,6 +292,7 @@ func TestVMISO_OwnerRefusesASymlinkFromAPeer(t *testing.T) {
 // start again; one with an ordinary ISO starts as before.
 func TestVMISO_StartRefusesAStoredProtectedISO(t *testing.T) {
 	s, fake, key := isoServer(t)
+	isolateReviewHardwareNetwork(t, s)
 	ok := filepath.Join(t.TempDir(), "ok.iso")
 	writeISO(t, ok)
 	for _, name := range []string{"old-bad", "old-good"} {

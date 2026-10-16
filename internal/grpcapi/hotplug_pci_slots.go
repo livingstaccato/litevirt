@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 
@@ -36,13 +37,29 @@ func pciAttachError(op string, err error) error {
 	return fmt.Errorf("%s: %w", op, err)
 }
 
-// ensureSparePCIeRootPorts gives a domain just defined from GenerateDomainXML
+// EnsureSparePCIeRootPorts gives a domain just defined from GenerateDomainXML
 // the node's pci.spare_pcie_root_ports free root ports, once libvirt has
 // placed every device (lv.EnsureSparePCIeRootPorts). Spares declared in the
 // generated XML would be handed to the domain's own devices instead. Best
 // effort: a failure leaves a valid domain whose hot-plug may later be refused
 // FailedPrecondition, which is no reason to fail the create.
-func (s *Server) ensureSparePCIeRootPorts(name string) {
+// It shares the domain rewrite exclusion with the
+// daemon's reconciler. It must not be called with a transition hold already
+// taken; reconcileDomainDefinition uses the held helper below instead.
+func (s *Server) EnsureSparePCIeRootPorts(ctx context.Context, name string) {
+	if s.sparePCIeRootPortsCfg <= 0 {
+		return
+	}
+	release, err := s.netDevs.acquireTransition(ctx, false)
+	if err != nil {
+		slog.Warn("spare PCIe root ports not added: network transition unavailable", "vm", name, "error", err)
+		return
+	}
+	defer release()
+	s.ensureSparePCIeRootPortsHeld(name)
+}
+
+func (s *Server) ensureSparePCIeRootPortsHeld(name string) {
 	if _, err := lv.EnsureSparePCIeRootPorts(s.virt, name, s.sparePCIeRootPortsCfg); err != nil {
 		slog.Warn("spare PCIe root ports not added; a hot-plug may find no free slot",
 			"vm", name, "want", s.sparePCIeRootPortsCfg, "error", err)

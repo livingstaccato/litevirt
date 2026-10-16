@@ -13,6 +13,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/network"
 )
 
 // reconcileDomainDefinition realizes a VM's desired device state into its libvirt
@@ -50,6 +51,14 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 	if s.virt == nil {
 		return status.Errorf(codes.Internal, "libvirt not connected on host %s", s.hostName)
 	}
+
+	// The NIC snapshot and every whole-domain define/rollback below must
+	// agree with one network transition. This path never provisions a network.
+	release, err := s.netDevs.acquireTransition(ctx, false)
+	if err != nil {
+		return err
+	}
+	defer release()
 
 	spec := &pb.VMSpec{}
 	if vm.Spec != "" {
@@ -112,6 +121,12 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 			model = "virtio"
 		}
 		bridge := resolveBridge(ctx, s.db, n.NetworkName)
+		// A refused move leaves the network on its last provisioned device.
+		// PCI/shared-disk reconciliation must preserve the follower's served
+		// mapping, not reinstall the desired device that failed to come up.
+		if served, ok := s.netDevs.lastDef(n.NetworkName); ok {
+			bridge = network.BridgeName(n.NetworkName, served)
+		}
 		if strings.HasPrefix(bridge, "direct:") {
 			direct := strings.TrimPrefix(bridge, "direct:")
 			netConfigs = append(netConfigs, lv.NetworkConfig{Direct: direct, Model: model, MAC: n.MAC, SpecOrdinal: n.Ordinal + 1, RateMBps: compose.NICRate(spec, n.Ordinal, n.NetworkName)})
@@ -264,7 +279,7 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 		return status.Errorf(codes.Internal, "redefine domain %q: %v", vm.Name, err)
 	}
 	if !usePatch {
-		s.ensureSparePCIeRootPorts(vm.Name)
+		s.ensureSparePCIeRootPortsHeld(vm.Name)
 	}
 	s.ReportSharedDiskWithheld(ctx, vm.Name, corrosion.WithheldSharedDiskDetail(vm.Name, s.hostName, withheldShared))
 	return nil

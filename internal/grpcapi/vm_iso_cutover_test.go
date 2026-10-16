@@ -48,6 +48,7 @@ func seedCutoverFixture(t *testing.T) (s *Server, nextSeed string) {
 // directory, so the VM could never start again.
 func TestCutover_TheSeedFollowsTheVMToItsName(t *testing.T) {
 	s, nextSeed := seedCutoverFixture(t)
+	isolateReviewHardwareNetwork(t, s)
 	ctx := adminCtx()
 
 	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err != nil {
@@ -72,7 +73,7 @@ func TestCutover_TheSeedFollowsTheVMToItsName(t *testing.T) {
 	if err != nil || rec == nil {
 		t.Fatalf("GetVM: %v", err)
 	}
-	if err := s.verifyVMISOForStart(rec); err != nil {
+	if err := s.verifyVMISOForStart(ctx, rec); err != nil {
 		t.Fatalf("a start after the cutover is refused: %v", err)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -26,12 +27,25 @@ func TestReconciler_StartPendingVM_SparePCIeRootPortsReachTheDefinedDomain(t *te
 	fake := libvirtfake.New()
 	r := NewReconciler("node-a", t.TempDir(), db, fake)
 	r.SetSparePCIeRootPorts(5)
+	called := 0
+	r.SetSpareRootPortPreparer(func(gotCtx context.Context, name string) {
+		called++
+		if gotCtx != ctx {
+			t.Error("spare preparation lost start context")
+		}
+		if _, err := lv.EnsureSparePCIeRootPorts(fake, name, 5); err != nil {
+			t.Error(err)
+		}
+	})
 
 	vm, err := corrosion.GetVM(ctx, db, "vm1")
 	if err != nil || vm == nil {
 		t.Fatalf("GetVM: %v %v", vm, err)
 	}
 	r.startPendingVM(ctx, *vm)
+	if called != 1 {
+		t.Fatalf("shared spare preparer called %d times", called)
+	}
 
 	domXML, err := fake.DumpXMLInactive("vm1")
 	if err != nil {

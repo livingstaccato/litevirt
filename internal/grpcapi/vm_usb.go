@@ -404,6 +404,11 @@ func (s *Server) refreshUSBHostdevsForStart(ctx context.Context, vm *corrosion.V
 	if err != nil {
 		return err
 	}
+	release, err := s.netDevs.acquireTransition(ctx, false)
+	if err != nil {
+		return err
+	}
+	defer release()
 	cur, err := s.virt.DumpXMLInactive(vm.Name)
 	if err != nil {
 		return status.Errorf(codes.Internal, "read the definition of %q to refresh its USB devices: %v", vm.Name, err)

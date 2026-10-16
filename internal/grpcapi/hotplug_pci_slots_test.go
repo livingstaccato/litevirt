@@ -17,6 +17,7 @@ import (
 // would pass every other test in this package.
 func TestCreateVM_SparePCIeRootPortsReachTheDefinedDomain(t *testing.T) {
 	s, fake := provableCreateServer(t)
+	isolateReviewHardwareNetwork(t, s)
 	s.SetSparePCIeRootPorts(5)
 	ctx := adminCtx()
 
@@ -41,6 +42,7 @@ func TestCreateVM_SparePCIeRootPortsReachTheDefinedDomain(t *testing.T) {
 // TestEnsureSparePCIeRootPorts's "want 0 never reads or defines anything".
 func TestCreateVM_SparePCIeRootPortsDefaultZero_NoControllers(t *testing.T) {
 	s, fake := provableCreateServer(t)
+	isolateReviewHardwareNetwork(t, s)
 	ctx := adminCtx()
 
 	req := disklessCreateRequest("vm1")

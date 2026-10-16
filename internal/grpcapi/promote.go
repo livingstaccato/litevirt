@@ -1613,7 +1613,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			if err := s.virt.DefineDomain(domXML); err != nil {
 				return "define domain", err
 			}
-			s.ensureSparePCIeRootPorts(targetName)
+			s.EnsureSparePCIeRootPorts(ctx, targetName)
 			// Durable checkpoints BEFORE the start, so a crash between StartDomain and the
 			// "started" checkpoint still lets a retry recognize the running domain as ours
 			// (via the running-domain observation above) instead of destroying it. The

@@ -1721,7 +1721,7 @@ networks:
     nat: false
 ```
 
-NAT is ignored on isolated networks (no uplink) and on host-isolated networks (use `snat: true` on a load balancer instead — see [compose.md](compose.md#snat-via-vip)).
+NAT is ignored on isolated networks (no uplink) and on host-isolated networks (use `snat: true`, or `lv lb create --snat`, on a load balancer instead — see [compose.md](compose.md#snat-via-vip)).
 
 ## IPv6
 

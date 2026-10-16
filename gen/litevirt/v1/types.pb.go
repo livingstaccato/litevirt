@@ -5981,6 +5981,7 @@ type LoadBalancer struct {
 	State         string                 `protobuf:"bytes,7,opt,name=state,proto3" json:"state,omitempty"`
 	StackName     string                 `protobuf:"bytes,8,opt,name=stack_name,json=stackName,proto3" json:"stack_name,omitempty"` // empty for standalone LBs
 	Ports         []*LBPort              `protobuf:"bytes,9,rep,name=ports,proto3" json:"ports,omitempty"`                          // port mappings
+	Snat          bool                   `protobuf:"varint,10,opt,name=snat,proto3" json:"snat,omitempty"`                          // rewrites its network's guest egress to the VIP (InspectLoadBalancer only)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6076,6 +6077,13 @@ func (x *LoadBalancer) GetPorts() []*LBPort {
 		return x.Ports
 	}
 	return nil
+}
+
+func (x *LoadBalancer) GetSnat() bool {
+	if x != nil {
+		return x.Snat
+	}
+	return false
 }
 
 type LBBackend struct {
@@ -7597,7 +7605,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\n" +
 	"expires_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\x129\n" +
 	"\n" +
-	"created_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"\xa2\x02\n" +
+	"created_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"\xb6\x02\n" +
 	"\fLoadBalancer\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
 	"\x03vip\x18\x02 \x01(\tR\x03vip\x12\x1c\n" +
@@ -7609,7 +7617,9 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x05state\x18\a \x01(\tR\x05state\x12\x1d\n" +
 	"\n" +
 	"stack_name\x18\b \x01(\tR\tstackName\x12)\n" +
-	"\x05ports\x18\t \x03(\v2\x13.litevirt.v1.LBPortR\x05ports\"\x96\x01\n" +
+	"\x05ports\x18\t \x03(\v2\x13.litevirt.v1.LBPortR\x05ports\x12\x12\n" +
+	"\x04snat\x18\n" +
+	" \x01(\bR\x04snat\"\x96\x01\n" +
 	"\tLBBackend\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12\x16\n" +

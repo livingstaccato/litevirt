@@ -812,7 +812,7 @@ Defining a `loadbalancer` section automatically provisions HAProxy + keepalived 
 designated hosts. The VIP floats between hosts using VRRP (keepalived), and HAProxy
 handles traffic distribution to backend VMs.
 
-Standalone load balancers (not tied to a stack) can also be created with `lv lb create`.
+Standalone load balancers (not tied to a stack) can also be created with `lv lb create`. Its `--snat` flag is this section's `snat:`, off unless given (see [SNAT via VIP](#snat-via-vip)).
 
 ```yaml
     loadbalancer:
@@ -922,6 +922,7 @@ How it works:
 Requirements:
 
 - `snat:` applies on every LB host; with it unset or `false`, no LB host rewrites the network's egress
+- A load balancer made with `lv lb create` SNATs only with `--snat`, and `lv lb update <name> --snat` or `--snat=false` changes it later; `lv lb inspect` shows it. One created before this setting existed keeps SNATting until it is set. Until every host runs a release with this setting (`failover_scope_v1` latched), `lv lb create` makes one that SNATs, as an earlier build does, and raises a `lb.snat_unrecorded` event; `lv lb update --snat` is refused until then. An LB host on an earlier build SNATs for every load balancer it serves
 - The VIP must be routable from the upstream network
 - IP forwarding is enabled automatically
 - The network's bridge carries the VMs' gateway (see [Host isolation](#host-isolation)): a `vxlan` network, or a `bridge` network on a bridge litevirt created, with no `vlan`
@@ -1309,7 +1310,7 @@ This follows the cloud provider model (AWS, DigitalOcean, GCP): the hypervisor i
 - **Static IPs via cloud-init** — IPAM still allocates IPs, but they are delivered via cloud-init network-config (MAC-matched, distro-agnostic: works on Ubuntu, CentOS, Debian, Arch, Alpine). A VM NIC that names no `ip:` is given a free address in the network's IPv4 subnet; never the gateway, a `reserved-addresses` entry, a live load balancer's VIP, or a VIP named by the VM's own `loadbalancer:` or by a VM of its stack created before it. A VIP named by a VM of the stack that is created later is not known yet: list it in `reserved-addresses`. The address is recorded on the NIC (`lv inspect`). Each host starts its search at a different point of the subnet. Two VMs created on two hosts at the same instant can still be given the same address; each host then records a `network.duplicate_address` event on its VMs that hold it (`lv events`). Name `ip:` explicitly where that matters. A network without a subnet, or with an IPv6 one, gives no address: name one with `ip:`.
 - **DNS from config** — resolvers come from the `dns` field (defaults to `["1.1.1.1", "8.8.8.8"]`).
 - **Gateway stays** — the host keeps the subnet's first address on the bridge as the VMs' gateway, for routing (FORWARD): always on a `vxlan` network (its IRB anycast gateway), and on a `bridge` network when litevirt created the bridge on that host and the network has no `vlan`. A bridge litevirt did not create, a VLAN bridge, and a host-isolated `isolated` network get no gateway address; so does a bridge an earlier build created (litevirt keeps no record of it), until the bridge is created again, for example at a reboot. Either way no host *services* are reachable (INPUT is dropped), the gateway address included. Forwarding through the gateway to the host's other networks is not blocked: host isolation keeps guests off the host, not off other networks.
-- **No implicit NAT** — outbound internet access requires explicit `snat: true` on a load balancer (see below).
+- **No implicit NAT** — outbound internet access requires explicit `snat: true` on a load balancer, or `--snat` on one made with `lv lb create` (see below; one made before that flag existed SNATs until it is set).
 
 Under the hood, litevirt creates a per-bridge nftables chain on the `input` hook that drops all traffic from the bridge interface. VM-to-VM traffic uses the `forward` hook and is unaffected. VXLAN underlay (UDP 4789) arrives on the physical NIC, not the bridge, so it is also unaffected.
 

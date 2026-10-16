@@ -78,6 +78,11 @@ func newLBInspectCmd() *cobra.Command {
 				fmt.Printf("VIP:        %s\n", lb.Vip)
 				fmt.Printf("Algorithm:  %s\n", lb.Algorithm)
 				fmt.Printf("State:      %s\n", lb.State)
+				snat := "off"
+				if lb.Snat {
+					snat = "on"
+				}
+				fmt.Printf("SNAT:       %s\n", snat)
 				if len(lb.LbHosts) > 0 {
 					fmt.Printf("Hosts:      %s\n", strings.Join(lb.LbHosts, ", "))
 				}
@@ -206,6 +211,7 @@ func newLBCreateCmd() *cobra.Command {
 			hosts, _ := cmd.Flags().GetStringSlice("host")
 			backendStrs, _ := cmd.Flags().GetStringSlice("backend")
 			vmBackends, _ := cmd.Flags().GetStringSlice("vm-backend")
+			snat, _ := cmd.Flags().GetBool("snat")
 
 			if vip == "" {
 				return fmt.Errorf("--vip required")
@@ -245,6 +251,7 @@ func newLBCreateCmd() *cobra.Command {
 					Hosts:      hosts,
 					Backends:   backends,
 					VmBackends: vmBackends,
+					Snat:       snat,
 				})
 				if err != nil {
 					return fmt.Errorf("create LB: %w", err)
@@ -262,6 +269,7 @@ func newLBCreateCmd() *cobra.Command {
 	cmd.Flags().StringSlice("host", nil, "Host to run LB on (repeatable)")
 	cmd.Flags().StringSlice("backend", nil, "Backend name=address (repeatable)")
 	cmd.Flags().StringSlice("vm-backend", nil, "VM name to use as backend (repeatable)")
+	cmd.Flags().Bool("snat", false, "On a host-isolated network, SNAT the network's outbound guest traffic to the VIP (off by default: no outbound NAT)")
 	return cmd
 }
 
@@ -298,6 +306,11 @@ func newLBUpdateCmd() *cobra.Command {
 			removeVMBackends, _ := cmd.Flags().GetStringSlice("remove-vm-backend")
 			portStrs, _ := cmd.Flags().GetStringSlice("port")
 			hosts, _ := cmd.Flags().GetStringSlice("host")
+			var snat *bool
+			if cmd.Flags().Changed("snat") {
+				v, _ := cmd.Flags().GetBool("snat")
+				snat = &v
+			}
 
 			var addBackends []*pb.LBBackendAddress
 			for _, b := range addBackendStrs {
@@ -328,6 +341,7 @@ func newLBUpdateCmd() *cobra.Command {
 					RemoveBackends:   removeBackends,
 					AddVmBackends:    addVMBackends,
 					RemoveVmBackends: removeVMBackends,
+					Snat:             snat,
 				})
 				if err != nil {
 					return fmt.Errorf("update LB: %w", err)
@@ -347,6 +361,7 @@ func newLBUpdateCmd() *cobra.Command {
 	cmd.Flags().StringSlice("remove-vm-backend", nil, "Remove VM backend by name (repeatable)")
 	cmd.Flags().StringSlice("port", nil, "Replace ports listen:target[/protocol] (repeatable)")
 	cmd.Flags().StringSlice("host", nil, "Replace hosts (repeatable)")
+	cmd.Flags().Bool("snat", false, "Turn outbound SNAT to the VIP on (--snat) or off (--snat=false); unset = no change. Not for a stack LB")
 	return cmd
 }
 

@@ -10468,14 +10468,17 @@ func (x *RemoveLBRequest) GetLbName() string {
 }
 
 type CreateLBRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Vip           string                 `protobuf:"bytes,2,opt,name=vip,proto3" json:"vip,omitempty"`             // "10.0.100.50/24"
-	Algorithm     string                 `protobuf:"bytes,3,opt,name=algorithm,proto3" json:"algorithm,omitempty"` // roundrobin | leastconn | source
-	Ports         []*LBPort              `protobuf:"bytes,4,rep,name=ports,proto3" json:"ports,omitempty"`
-	Hosts         []string               `protobuf:"bytes,5,rep,name=hosts,proto3" json:"hosts,omitempty"`                             // hosts to run HAProxy+keepalived on
-	Backends      []*LBBackendAddress    `protobuf:"bytes,6,rep,name=backends,proto3" json:"backends,omitempty"`                       // explicit backend addresses
-	VmBackends    []string               `protobuf:"bytes,7,rep,name=vm_backends,json=vmBackends,proto3" json:"vm_backends,omitempty"` // VM names to resolve to IPs
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Name       string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Vip        string                 `protobuf:"bytes,2,opt,name=vip,proto3" json:"vip,omitempty"`             // "10.0.100.50/24"
+	Algorithm  string                 `protobuf:"bytes,3,opt,name=algorithm,proto3" json:"algorithm,omitempty"` // roundrobin | leastconn | source
+	Ports      []*LBPort              `protobuf:"bytes,4,rep,name=ports,proto3" json:"ports,omitempty"`
+	Hosts      []string               `protobuf:"bytes,5,rep,name=hosts,proto3" json:"hosts,omitempty"`                             // hosts to run HAProxy+keepalived on
+	Backends   []*LBBackendAddress    `protobuf:"bytes,6,rep,name=backends,proto3" json:"backends,omitempty"`                       // explicit backend addresses
+	VmBackends []string               `protobuf:"bytes,7,rep,name=vm_backends,json=vmBackends,proto3" json:"vm_backends,omitempty"` // VM names to resolve to IPs
+	// snat: rewrite the guest egress of the host-isolated network the VIP is
+	// placed on to the VIP (compose `snat:`). Default false: no outbound NAT.
+	Snat          bool `protobuf:"varint,8,opt,name=snat,proto3" json:"snat,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -10559,6 +10562,13 @@ func (x *CreateLBRequest) GetVmBackends() []string {
 	return nil
 }
 
+func (x *CreateLBRequest) GetSnat() bool {
+	if x != nil {
+		return x.Snat
+	}
+	return false
+}
+
 type UpdateLBRequest struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	Name             string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
@@ -10570,8 +10580,11 @@ type UpdateLBRequest struct {
 	RemoveBackends   []string               `protobuf:"bytes,7,rep,name=remove_backends,json=removeBackends,proto3" json:"remove_backends,omitempty"` // by name
 	AddVmBackends    []string               `protobuf:"bytes,8,rep,name=add_vm_backends,json=addVmBackends,proto3" json:"add_vm_backends,omitempty"`
 	RemoveVmBackends []string               `protobuf:"bytes,9,rep,name=remove_vm_backends,json=removeVmBackends,proto3" json:"remove_vm_backends,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// snat: set the explicit LB's outbound NAT (CreateLBRequest.snat).
+	// Absent = no change. A stack LB's comes from its compose file.
+	Snat          *bool `protobuf:"varint,10,opt,name=snat,proto3,oneof" json:"snat,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *UpdateLBRequest) Reset() {
@@ -10665,6 +10678,13 @@ func (x *UpdateLBRequest) GetRemoveVmBackends() []string {
 		return x.RemoveVmBackends
 	}
 	return nil
+}
+
+func (x *UpdateLBRequest) GetSnat() bool {
+	if x != nil && x.Snat != nil {
+		return *x.Snat
+	}
+	return false
 }
 
 type DeleteLBRequest struct {
@@ -43615,7 +43635,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0fsticky_sessions\x18\v \x01(\bR\x0estickySessionsB\a\n" +
 	"\x05_snat\"*\n" +
 	"\x0fRemoveLBRequest\x12\x17\n" +
-	"\alb_name\x18\x01 \x01(\tR\x06lbName\"\xf2\x01\n" +
+	"\alb_name\x18\x01 \x01(\tR\x06lbName\"\x86\x02\n" +
 	"\x0fCreateLBRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
 	"\x03vip\x18\x02 \x01(\tR\x03vip\x12\x1c\n" +
@@ -43624,7 +43644,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x05hosts\x18\x05 \x03(\tR\x05hosts\x129\n" +
 	"\bbackends\x18\x06 \x03(\v2\x1d.litevirt.v1.LBBackendAddressR\bbackends\x12\x1f\n" +
 	"\vvm_backends\x18\a \x03(\tR\n" +
-	"vmBackends\"\xd7\x02\n" +
+	"vmBackends\x12\x12\n" +
+	"\x04snat\x18\b \x01(\bR\x04snat\"\xf9\x02\n" +
 	"\x0fUpdateLBRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
 	"\x03vip\x18\x02 \x01(\tR\x03vip\x12\x1c\n" +
@@ -43634,7 +43655,10 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\fadd_backends\x18\x06 \x03(\v2\x1d.litevirt.v1.LBBackendAddressR\vaddBackends\x12'\n" +
 	"\x0fremove_backends\x18\a \x03(\tR\x0eremoveBackends\x12&\n" +
 	"\x0fadd_vm_backends\x18\b \x03(\tR\raddVmBackends\x12,\n" +
-	"\x12remove_vm_backends\x18\t \x03(\tR\x10removeVmBackends\"%\n" +
+	"\x12remove_vm_backends\x18\t \x03(\tR\x10removeVmBackends\x12\x17\n" +
+	"\x04snat\x18\n" +
+	" \x01(\bH\x00R\x04snat\x88\x01\x01B\a\n" +
+	"\x05_snat\"%\n" +
 	"\x0fDeleteLBRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"$\n" +
 	"\x0eLBStatsRequest\x12\x12\n" +
@@ -48201,6 +48225,7 @@ func file_litevirt_v1_service_proto_init() {
 	file_litevirt_v1_service_proto_msgTypes[35].OneofWrappers = []any{}
 	file_litevirt_v1_service_proto_msgTypes[73].OneofWrappers = []any{}
 	file_litevirt_v1_service_proto_msgTypes[138].OneofWrappers = []any{}
+	file_litevirt_v1_service_proto_msgTypes[141].OneofWrappers = []any{}
 	file_litevirt_v1_service_proto_msgTypes[160].OneofWrappers = []any{}
 	file_litevirt_v1_service_proto_msgTypes[177].OneofWrappers = []any{
 		(*PushBackupFrame_Header)(nil),

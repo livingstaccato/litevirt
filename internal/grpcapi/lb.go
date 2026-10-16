@@ -291,11 +291,15 @@ func (s *Server) InspectLoadBalancer(ctx context.Context, req *pb.InspectLBReque
 		return nil, err
 	}
 	rows, err := s.db.Query(ctx,
-		`SELECT name, stack_name, vip, algorithm, hosts, ports, enabled FROM lb_configs WHERE name = ? AND deleted_at IS NULL`, req.Name)
+		`SELECT name, stack_name, vip, algorithm, hosts, ports, enabled, generation FROM lb_configs WHERE name = ? AND deleted_at IS NULL`, req.Name)
 	if err != nil || len(rows) == 0 {
 		return nil, status.Errorf(codes.NotFound, "load balancer %q not found", req.Name)
 	}
 	r := rows[0]
+	snat, err := s.lbSNAT(ctx, r.String("name"), r.String("stack_name"), r.String("generation"))
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "%v", err)
+	}
 	algo := r.String("algorithm")
 	if algo == "" {
 		algo = "roundrobin"
@@ -342,6 +346,7 @@ func (s *Server) InspectLoadBalancer(ctx context.Context, req *pb.InspectLBReque
 		StackName:  r.String("stack_name"),
 		Ports:      ports,
 		Backends:   s.lbBackends(ctx, r.String("name")),
+		Snat:       snat,
 	}
 
 	// Overlay REAL HAProxy health onto the run-state-derived backend status, so
@@ -664,7 +669,7 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 	}
 	hostsJSON, _ := json.Marshal(targetHosts)
 	portsJSON, _ := json.Marshal(req.Ports)
-	if err := corrosion.PersistLBFull(ctx, s.db, corrosion.LBConfigRecord{
+	lbRec := corrosion.LBConfigRecord{
 		Name:       req.Name,
 		VIP:        req.Vip,
 		Algorithm:  algorithm,
@@ -672,8 +677,27 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 		Ports:      string(portsJSON),
 		Enabled:    true,
 		Generation: generation,
-	}, backendRecords); err != nil {
-		return nil, status.Errorf(codes.Internal, "persist LB config: %v", err)
+	}
+	// The LB's outbound NAT (`--snat`, default off) is recorded with it. Until
+	// the setting can be recorded (failover_scope_v1 not latched: a host still
+	// runs an earlier build, which SNATs every explicit LB) the LB is created
+	// as an earlier build creates one, SNATting, and an event says so.
+	snat := req.GetSnat()
+	if s.db.MayWriteClusterPolicy() {
+		if err := corrosion.PersistLBFullWithSNAT(ctx, s.db, lbRec, backendRecords, snat, callerUsername(ctx)); err != nil {
+			return nil, status.Errorf(codes.Internal, "persist LB config: %v", err)
+		}
+	} else {
+		if err := corrosion.PersistLBFull(ctx, s.db, lbRec, backendRecords); err != nil {
+			return nil, status.Errorf(codes.Internal, "persist LB config: %v", err)
+		}
+		if !snat {
+			detail := fmt.Sprintf("load balancer %q SNATs on a host-isolated network until every host runs this release (%v); then set it with `lv lb update %s --snat=false`",
+				req.Name, corrosion.ErrLBSNATGateClosed, req.Name)
+			slog.Warn("lb: "+detail, "lb", req.Name)
+			s.publish("lb.snat_unrecorded", req.Name, detail)
+		}
+		snat = true
 	}
 
 	// Build ports.
@@ -726,9 +750,9 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 					"load balancer %q provisioning failed on %s: %v", req.Name, s.hostName, err)
 			}
 			// Record firewall intent when the VIP is on a host-isolated network
-			// (VIP:port exceptions + SNAT), same as the stack/peer paths. No-op for
-			// non-isolated networks. snat defaults true (matches the peer ApplyLB path).
-			s.updateIsolationForLB(ctx, req.Name, place, vipIP, ports, true)
+			// (VIP:port exceptions, and SNAT when asked), same as the stack/peer
+			// paths. No-op for non-isolated networks.
+			s.updateIsolationForLB(ctx, req.Name, place, vipIP, ports, snat)
 			break
 		}
 	}
@@ -761,7 +785,7 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 			if _, aerr := client.ApplyLB(fctx, &pb.ApplyLBRequest{
 				LbName: req.Name, Vip: req.Vip, Algorithm: algorithm,
 				Backends: pbBackends, Ports: standaloneProtocols(req.Ports), Hosts: req.Hosts, Proof: proof,
-				Snat: proto.Bool(true), // an explicit LB SNATs, as it does locally
+				Snat: proto.Bool(snat),
 			}); aerr != nil {
 				slog.Warn("CreateLoadBalancer: remote apply failed", "host", host, "lb", req.Name, "error", aerr)
 			}
@@ -1491,6 +1515,15 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 		return nil, status.Errorf(codes.NotFound, "load balancer %q not found", req.Name)
 	}
 	r := rows[0]
+	if req.Snat != nil {
+		if r.String("stack_name") != "" {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"load balancer %q belongs to stack %q: its snat is the compose file's `snat:`", req.Name, r.String("stack_name"))
+		}
+		if !s.db.MayWriteClusterPolicy() {
+			return nil, status.Errorf(codes.FailedPrecondition, "load balancer %q: %v", req.Name, corrosion.ErrLBSNATGateClosed)
+		}
+	}
 
 	// A VIP with an ACTIVE dual-holder condition freezes: reconfiguring the LB
 	// that owns it changes who renders/claims the address, which is exactly the
@@ -1651,15 +1684,18 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"load balancer %q has no established holder (legacy row): retry once its VIP host is reachable, or re-create it", req.Name)
 	}
-	// The LB's `snat:`, decided before anything changes: a failed read leaves
-	// the LB as it is applied everywhere.
-	snat, err := s.stackLBSNAT(ctx, r.String("stack_name"))
-	if err != nil {
+	// The LB's snat, decided before anything changes: a failed read leaves
+	// the LB as it is applied everywhere. A new setting is recorded with the
+	// edit below.
+	var snat bool
+	if req.Snat != nil {
+		snat = req.GetSnat()
+	} else if snat, err = s.lbSNAT(ctx, req.Name, r.String("stack_name"), generation); err != nil {
 		return nil, status.Errorf(codes.Unavailable, "load balancer %q: %v", req.Name, err)
 	}
 
 	// Persist updated config + backend changes atomically (generation preserved).
-	if err := corrosion.PersistLBIncremental(ctx, s.db, corrosion.LBConfigRecord{
+	rec := corrosion.LBConfigRecord{
 		Name:       req.Name,
 		StackName:  r.String("stack_name"),
 		VIP:        vip,
@@ -1668,7 +1704,13 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 		Ports:      portsStr,
 		Enabled:    r.Int("enabled") == 1,
 		Generation: generation,
-	}, upserts, tombstones); err != nil {
+	}
+	if req.Snat != nil {
+		err = corrosion.PersistLBIncrementalWithSNAT(ctx, s.db, rec, upserts, tombstones, snat, callerUsername(ctx))
+	} else {
+		err = corrosion.PersistLBIncremental(ctx, s.db, rec, upserts, tombstones)
+	}
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "persist LB config: %v", err)
 	}
 
@@ -2415,13 +2457,20 @@ func (s *Server) ApplyLB(ctx context.Context, req *pb.ApplyLBRequest) (*emptypb.
 	}
 
 	// Update host-isolation rules if the LB interface is on an isolated bridge,
-	// with the LB's own `snat:`. A caller on an earlier build sends none, and
-	// gets SNAT, as every ApplyLB did before the field.
-	snat := true
+	// with the LB's own snat. A caller on an earlier build sends none: a stack
+	// LB then SNATs, as every ApplyLB did before the field, and an explicit LB
+	// has what this host's replica records for it (lbSNAT).
+	snat, serr := true, error(nil)
 	if req.Snat != nil {
 		snat = req.GetSnat()
+	} else if req.GetStackName() == "" {
+		snat, serr = s.explicitLBSNATByName(ctx, req.LbName)
 	}
-	s.updateIsolationForLB(ctx, req.LbName, place, vipIP, ports, snat)
+	if serr != nil {
+		slog.Warn("ApplyLB: snat undecided; firewall intent left as it is", "lb", req.LbName, "error", serr)
+	} else {
+		s.updateIsolationForLB(ctx, req.LbName, place, vipIP, ports, snat)
+	}
 
 	if lbProofID != "" {
 		if err := corrosion.CompleteActionProof(ctx, s.db, lbProofID, s.hostName); err != nil {
@@ -2792,9 +2841,13 @@ func (s *Server) reapplyExplicitLB(ctx context.Context, cfg corrosion.LBConfigRe
 		Priority: priority, Backends: backends, Ports: ports, Algorithm: cfg.Algorithm,
 	}); err != nil {
 		slog.Warn("reapplyExplicitLB: apply failed", "lb", cfg.Name, "error", err)
+	} else if snat, serr := s.lbSNAT(ctx, cfg.Name, cfg.StackName, cfg.Generation); serr != nil {
+		// Its firewall intent stays as it is until a read succeeds.
+		slog.Warn("reapplyExplicitLB: snat undecided; firewall intent left as it is", "lb", cfg.Name, "error", serr)
 	} else {
-		// Re-record firewall intent for an isolated-network VIP (exceptions + SNAT).
-		s.updateIsolationForLB(ctx, cfg.Name, place, vipIP, ports, true)
+		// Re-record firewall intent for an isolated-network VIP (exceptions, and
+		// SNAT when the LB has it).
+		s.updateIsolationForLB(ctx, cfg.Name, place, vipIP, ports, snat)
 		slog.Info("LB reconciled", "lb", cfg.Name)
 	}
 }
@@ -3235,14 +3288,45 @@ func (s *Server) hostIPv4(ctx context.Context, name string) (string, error) {
 	return "", nil
 }
 
+// lbSNAT is whether the LB name, of stack stackName ("" for an explicit LB)
+// and generation, rewrites its network's guest egress to its VIP. A stack LB
+// has its compose file's `snat:` (stackLBSNAT). An explicit LB has its
+// recorded `lv lb create/update --snat`; one with no setting for its
+// generation was stored before the setting existed, or created while it
+// could not be recorded, and SNATs, as every explicit LB did then.
+func (s *Server) lbSNAT(ctx context.Context, name, stackName, generation string) (bool, error) {
+	if stackName != "" {
+		return s.stackLBSNAT(ctx, stackName)
+	}
+	snat, recorded, err := corrosion.GetLBSNAT(ctx, s.db, name, generation)
+	if err != nil {
+		return false, fmt.Errorf("read load balancer %q's snat: %w", name, err)
+	}
+	return snat || !recorded, nil
+}
+
+// explicitLBSNATByName is lbSNAT for an explicit LB known only by name: the
+// generation is this host's replica's. An LB this replica does not hold yet
+// has no setting, so it SNATs, as before.
+func (s *Server) explicitLBSNATByName(ctx context.Context, name string) (bool, error) {
+	rows, err := s.db.Query(ctx, `SELECT generation FROM lb_configs WHERE name = ? AND deleted_at IS NULL`, name)
+	if err != nil {
+		return false, fmt.Errorf("read load balancer %q: %w", name, err)
+	}
+	if len(rows) == 0 {
+		return true, nil
+	}
+	return s.lbSNAT(ctx, name, "", rows[0].String("generation"))
+}
+
 // stackLBSNAT is a stack LB's `snat:` as the paths that re-apply an LB
 // outside a deploy read it (refreshLBLocal, UpdateLoadBalancer and its
 // fan-out). One stack has one LB (<stack>-lb), declared by any VM of the stack
 // that has `loadbalancer:`; when they disagree, any `snat: true` wins. The
 // stack-level value is the stack's stored compose file; a stack with no
 // stored file, or one that does not parse or declares no enabled LB, falls
-// back to its VMs' stored specs. An explicit LB (no stack) has no setting and
-// SNATs, as every LB apply did before `snat:` reached the peers.
+// back to its VMs' stored specs. An explicit LB (no stack) is lbSNAT's to
+// decide; here it SNATs.
 //
 // A read error is returned, never folded into false: callers leave what is
 // applied unchanged and retry on their next pass, rather than turn SNAT off

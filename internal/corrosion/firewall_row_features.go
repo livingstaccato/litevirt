@@ -77,8 +77,8 @@ func RefuseClientRuleForm(cidr, action string) error {
 func firewallRowFeatures(cidr, proto, action string) ([]capabilities.Feature, error) {
 	var out []capabilities.Feature
 	tag := isTagCIDR(cidr)
-	if !tag && hasTagCIDRPrefix(cidr) {
-		return nil, fmt.Errorf("%q is not a tag-group cidr: want %s<group>, the group name [a-z][a-z0-9_]{0,30}", cidr, rulefield.TagCIDRPrefix)
+	if err := malformedTagCIDR(cidr); err != nil {
+		return nil, err
 	}
 	if !tag {
 		v6, err := firewallRuleFamily(cidr, proto)
@@ -96,6 +96,16 @@ func firewallRowFeatures(cidr, proto, action string) ([]capabilities.Feature, er
 		out = append(out, capabilities.FeatureFirewallTagGroups)
 	}
 	return out, nil
+}
+
+// malformedTagCIDR refuses a cidr that starts with the tag-group prefix, in
+// any case, but is not exactly tag:<group>: it is neither an address nor a
+// tag-group reference.
+func malformedTagCIDR(cidr string) error {
+	if hasTagCIDRPrefix(cidr) && !isTagCIDR(cidr) {
+		return fmt.Errorf("%q is not a tag-group cidr: want %s<group>, the group name [a-z][a-z0-9_]{0,30}", cidr, rulefield.TagCIDRPrefix)
+	}
+	return nil
 }
 
 // noLogGrant is the error a writer returns for a logged rule its gLog grant

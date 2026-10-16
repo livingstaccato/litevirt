@@ -168,6 +168,10 @@ func TestFirewallTagGroupsDataPresent(t *testing.T) {
 			mustExec(t, c, `INSERT INTO host_firewall_rules (id, host_name, direction, proto, port_range, cidr, action, priority, comment, created_at, updated_at)
 				VALUES ('h', 'node-0', 'ingress', 'tcp', '', 'TAG:Web', 'drop', 100, '', 't', 't')`)
 		},
+		"cluster rule, after a newline (m-3)": func(c *Client) {
+			mustExec(t, c, `INSERT INTO cluster_firewall_rules (id, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)
+				VALUES ('c', 'ingress', 'tcp', '', char(10, 13, 11, 12) || 'tag:web', 'drop', 100, '', '', 't', 't')`)
+		},
 		"sg rule, padded": func(c *Client) {
 			mustExec(t, c, `INSERT INTO sg_rules (id, sg_id, direction, proto, port_range, cidr, action, priority, created_at, updated_at)
 				VALUES ('s', 'sg', 'ingress', 'tcp', '', ' tag:web', 'drop', 100, 't', 't')`)
@@ -178,5 +182,25 @@ func TestFirewallTagGroupsDataPresent(t *testing.T) {
 		if !present(c) {
 			t.Errorf("%s: not found", what)
 		}
+	}
+}
+
+// D5a review m-4: FirewallRuleFamily validates as the writers do: a
+// tag-group cidr is not IPv6, and a malformed tag: form is refused, as
+// firewallRowFeatures refuses it.
+//
+// Mutation: FirewallRuleFamily calls firewallRuleFamily alone — tag:a:b
+// returns no error, red.
+func TestFirewallRuleFamily_TagForms(t *testing.T) {
+	if v6, err := FirewallRuleFamily("tag:web", "tcp"); v6 || err != nil {
+		t.Errorf("tag:web = %v, %v; want not IPv6", v6, err)
+	}
+	for _, cidr := range []string{"tag:a:b", "TAG:web", "tag:web-1"} {
+		if _, err := FirewallRuleFamily(cidr, "tcp"); err == nil || !strings.Contains(err.Error(), "not a tag-group cidr") {
+			t.Errorf("%s: %v, want refused as a tag-group cidr", cidr, err)
+		}
+	}
+	if v6, err := FirewallRuleFamily("2001:db8::/32", "tcp"); !v6 || err != nil {
+		t.Errorf("2001:db8::/32 = %v, %v; want IPv6", v6, err)
 	}
 }

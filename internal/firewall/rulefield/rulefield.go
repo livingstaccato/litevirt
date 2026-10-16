@@ -637,7 +637,7 @@ func CIDR(s string) error {
 				return err
 			}
 			if _, tag := TagCIDRName(s); !tag {
-				return refuse("cidr", s, "a tag-group cidr is %s<name>, with name an nft set name", TagCIDRPrefix)
+				return refuse("cidr", s, "a tag-group cidr is %s<group>, the group name [a-z][a-z0-9_]{0,30}", TagCIDRPrefix)
 			}
 			return nil
 		}

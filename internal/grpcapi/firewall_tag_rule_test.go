@@ -261,11 +261,22 @@ firewall:
 
 	g.open = true
 	setTagGroup(t, s, "web")
-	for _, f := range []*compose.File{parse("tag:nope", "10.1.0.0/16"), parse("tag:web", "tag:nope")} {
-		if err := s.persistStackFirewall(bg, f); err == nil || !strings.Contains(err.Error(), `tag group "nope" does not exist`) {
+	for _, c := range []struct {
+		f     *compose.File
+		where string
+	}{{parse("tag:nope", "10.1.0.0/16"), `security-group "web" rule: `}, {parse("tag:web", "tag:nope"), "cluster rule: "}} {
+		err := s.persistStackFirewall(bg, c.f)
+		if err == nil || !strings.Contains(err.Error(), `tag group "nope" does not exist`) {
 			t.Errorf("an unknown group: %v, want refused", err)
 		}
 		kept("an unknown group")
+		// As the deploy returns it (review m-2): the code, which rule, and
+		// no rpc error nested in the message.
+		st := status.Convert(stackFirewallErr(err))
+		if st.Code() != codes.FailedPrecondition || !strings.Contains(st.Message(), c.where+`cidr "tag:nope": tag group "nope" does not exist`) ||
+			strings.Contains(st.Message(), "rpc error") {
+			t.Errorf("deploy error = %v, want FailedPrecondition naming %q", st.Err(), c.where)
+		}
 	}
 	if err := s.persistStackFirewall(bg, parse("tag:web", "tag:web")); err != nil {
 		t.Fatalf("a known group: %v", err)

@@ -386,14 +386,19 @@ const (
 )
 
 // stackFirewallErr is a stack's firewall failure as its deploy returns it: a
-// status error — the release gate's refusal — keeps its code and message
-// under "firewall config:", with no rpc error nested in it (switch review
-// m5); anything else is FailedPrecondition, as before.
+// status error — the release gate's refusal, an unknown tag group — keeps its
+// code, and its message under "firewall config:" with whatever the deploy
+// wrapped around it (which security group or rule), with no rpc error nested
+// in it (switch review m5); anything else is FailedPrecondition, as before.
 func stackFirewallErr(err error) error {
-	var se interface{ GRPCStatus() *status.Status }
+	var se interface {
+		GRPCStatus() *status.Status
+		Error() string
+	}
 	if errors.As(err, &se) {
 		st := se.GRPCStatus()
-		return status.Errorf(st.Code(), "firewall config: %s", st.Message())
+		msg := strings.Replace(err.Error(), se.Error(), st.Message(), 1)
+		return status.Errorf(st.Code(), "firewall config: %s", msg)
 	}
 	return status.Errorf(codes.FailedPrecondition, "firewall config: %v", err)
 }

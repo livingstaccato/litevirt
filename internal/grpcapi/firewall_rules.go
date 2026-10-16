@@ -106,10 +106,10 @@ func ipSetFeatures(cidrs []string) ([]capabilities.Feature, error) {
 // ruleRowFeatures is the check every rule a client sends passes before any
 // release gate is asked or anything is stored, and the release features its
 // write then needs (the writeFirewallRow need and invalid arguments). In
-// order: a form a client may not send on this build (a "+" action suffix, a
-// tag-group cidr: corrosion.RefuseClientRuleForm), then the grammar the
-// renderer writes into an nft script (finding F-1), then the row's features
-// (corrosion.FirewallRowFeatures).
+// order: a form a client may not send (a "+" action suffix:
+// corrosion.RefuseClientRuleForm), then the grammar the renderer writes into
+// an nft script (finding F-1, with the tag-group cidr tag:<group>), then the
+// row's features (corrosion.FirewallRowFeatures).
 func ruleRowFeatures(direction, proto, port, cidr, action, comment string) ([]capabilities.Feature, error) {
 	if err := corrosion.RefuseClientRuleForm(cidr, action); err != nil {
 		return nil, err

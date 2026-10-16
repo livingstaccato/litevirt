@@ -45,10 +45,14 @@ func hasTagCIDRPrefix(cidr string) bool {
 }
 
 // FirewallRuleFamily validates a rule naming cidr and proto as its writer
-// does (firewallRuleFamily) and reports whether it is an IPv6 rule, whose
+// does (firewallRowFeatures) and reports whether it is an IPv6 rule, whose
 // write is the release feature firewall_ipv6: a caller refuses a malformed
-// rule before it asks the release gate for anything.
+// rule before it asks the release gate for anything. A tag-group cidr is not
+// IPv6; one that starts tag: but is not in that form is refused.
 func FirewallRuleFamily(cidr, proto string) (v6 bool, err error) {
+	if hasTagCIDRPrefix(cidr) {
+		return false, malformedTagCIDR(cidr)
+	}
 	return firewallRuleFamily(cidr, proto)
 }
 

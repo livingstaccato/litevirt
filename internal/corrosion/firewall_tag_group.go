@@ -687,8 +687,9 @@ func jsonExactString(doc, key string) string {
 // FirewallTagGroupsDataPresent reports whether this replica holds any data of
 // the release feature firewall_tag_groups (spec DECISION 0-A): a group row or
 // a firewall-tags row with a value, or a live rule whose cidr starts with the
-// tag-group prefix in any case, as an entry daemon on an older build stores
-// one verbatim. The release use sweep records the feature's use when it
+// tag-group prefix in any case after the blanks strings.TrimSpace removes
+// (the loader's tagRef reads it so), as an entry daemon on an older build
+// stores one verbatim. The release use sweep records the feature's use when it
 // finds one (DECISION 0-F).
 func FirewallTagGroupsDataPresent(ctx context.Context, c *Client) (bool, error) {
 	for _, prefix := range []string{FirewallTagGroupKeyPrefix, FirewallTagsKeyPrefix} {
@@ -706,7 +707,7 @@ func FirewallTagGroupsDataPresent(ctx context.Context, c *Client) (bool, error) 
 	for _, table := range []string{"cluster_firewall_rules", "host_firewall_rules", "sg_rules"} {
 		rows, err := c.Query(ctx,
 			`SELECT 1 FROM `+table+`
-			 WHERE deleted_at IS NULL AND LTRIM(COALESCE(cidr, ''), ' '||char(9)) LIKE 'tag:%' LIMIT 1`)
+			 WHERE deleted_at IS NULL AND LTRIM(COALESCE(cidr, ''), ' '||char(9, 10, 11, 12, 13)) LIKE 'tag:%' LIMIT 1`)
 		if err != nil {
 			return false, err
 		}

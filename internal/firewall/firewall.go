@@ -530,10 +530,16 @@ func isolationMark(bridge string) uint32 {
 
 // isolationMarks gives each bridge its own value in isolationMarkMask: its
 // isolationMark, or, when a bridge earlier by name already holds that value,
-// the next free one. A shared value would let a guest on one bridge forge
-// replies into the host's connections onto the other. A bridge's value
-// changes only when a bridge whose hash collides with it comes or goes, which
-// drops the replies of the host's connections onto it that were open then.
+// the next free one (linear probing). A shared value would let a guest on one
+// bridge forge replies into the host's connections onto the other.
+//
+// A bridge's value can move when the set of host-isolated bridges on the host
+// changes: when a bridge whose hash collides with it comes or goes, or when
+// one earlier by name probes into its slot. The host's connections onto it
+// that are open then lose their replies, and its old value may now be another
+// bridge's: until those connections close, that bridge's guests can forge
+// replies into them. Both need a 12-bit collision among one host's
+// host-isolated bridges, and last only as long as the connections.
 func isolationMarks(sortedBridges []string) map[string]uint32 {
 	out := make(map[string]uint32, len(sortedBridges))
 	used := map[uint32]bool{}

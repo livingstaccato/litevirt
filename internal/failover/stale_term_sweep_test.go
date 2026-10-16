@@ -185,6 +185,11 @@ func TestStaleTermSweep_ARowThatMovedOnIsNotWrittenOver(t *testing.T) {
 	if vm := mustVM(t, db, "vm1"); vm.PendingActionID != "newer" {
 		t.Fatalf("a row that moved on was written over: %+v", vm)
 	}
+	// Re-review 1 nit: abandoned all the same, so failed and reaped.
+	// Mutation: return without failing it when the row moved on.
+	if pr, _, _ := corrosion.GetActionProof(ctx, db, "at-term-3"); pr.Status != corrosion.ProofFailed {
+		t.Fatalf("the abandoned proof is %q after the row moved on, want failed", pr.Status)
+	}
 }
 
 // certifyUncertified certifies a pre-claims proof for its own value; when
@@ -404,23 +409,57 @@ func TestStaleTermSweep_ARowNoLongerPendingIsNotWrittenOver(t *testing.T) {
 	}
 }
 
-// Review m-5: once the destination has abandoned the stale proof, a claim
-// that decides nothing holds the source's recovery with the reason and the
-// command that shows the claim, and a value decided for the source itself
-// is reported stranded.
+// staleTermHeldEvents lists vm1's vm.failover.stale_term_held events.
+func staleTermHeldEvents(t *testing.T, db *corrosion.Client) []corrosion.VMEventRecord {
+	t.Helper()
+	evs, err := corrosion.ListVMEvents(context.Background(), db, "vm1", 50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []corrosion.VMEventRecord
+	for _, e := range evs {
+		if e.Type == "vm.failover.stale_term_held" {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// Review m-5 (re-review 1): a sweep step that cannot complete is recorded on
+// the VM, naming the remedy, once while it stays held, and it does not
+// overwrite the hold reason of the host the VM left, which belongs to that
+// host's own workloads. A value decided for the source itself still takes
+// the stranded note.
 //
-// Mutations: drop the noteHold on a refused claim — no hold; drop the
-// noteClaimStranded — the source-destined value leaves no hold.
-func TestStaleTermSweep_AnUndecidedReplacementHoldsWithARemedy(t *testing.T) {
+// Mutations: note the hold on the source host (the code before) — the
+// source's own hold is overwritten and no event names vm1; drop the per-step
+// dedupe — a retried step is recorded every cycle; drop the noteClaimStranded
+// — the source-destined value leaves no hold.
+func TestStaleTermSweep_AHeldStepIsRecordedOnTheVMWithARemedy(t *testing.T) {
 	ctx := context.Background()
 	cl := &fakeClaimer{abandon: abandonsAll, decide: func(corrosion.ClaimKey, corrosion.ClaimValue) (claims.Outcome, error) {
 		return claims.Outcome{}, errors.New("no majority")
 	}}
 	db, c := staleTermFixture(t, cl)
 	pendingAtTerm(t, db, vm1Key(t, db), "at-term-3", 3)
+	c.noteHold("dead", "VM vm-other: its own reason")
 	c.sweepStaleTermProofs(ctx)
-	if hold := c.holdReason["dead"]; !strings.Contains(hold, "lv cluster claim vm/vm1") || !strings.Contains(hold, "vm1") {
-		t.Fatalf("hold %q: want the refused replacement named with `lv cluster claim vm/vm1`", hold)
+	c.sweepStaleTermProofs(ctx)
+	if hold := c.holdReason["dead"]; hold != "VM vm-other: its own reason" {
+		t.Fatalf("the source host's hold for its own workloads was overwritten: %q", hold)
+	}
+	evs := staleTermHeldEvents(t, db)
+	if len(evs) != 1 || !strings.Contains(evs[0].Detail, "lv cluster claim vm/vm1") || evs[0].Severity != "warn" {
+		t.Fatalf("events %+v: want one warn event on vm1 naming `lv cluster claim vm/vm1`", evs)
+	}
+
+	// The destination will not abandon: the event names the dead-host remedy.
+	clN := &fakeClaimer{decide: decideOurs}
+	dbN, cN := staleTermFixture(t, clN)
+	pendingAtTerm(t, dbN, vm1Key(t, dbN), "at-term-3", 3)
+	cN.sweepStaleTermProofs(ctx)
+	if evs := staleTermHeldEvents(t, dbN); len(evs) != 1 || !strings.Contains(evs[0].Detail, "lv host rm live --dead") {
+		t.Fatalf("events %+v: want one naming `lv host rm live --dead`", evs)
 	}
 
 	cl2 := &fakeClaimer{abandon: abandonsAll, decide: func(key corrosion.ClaimKey, v corrosion.ClaimValue) (claims.Outcome, error) {

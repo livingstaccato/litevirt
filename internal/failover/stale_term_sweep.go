@@ -50,8 +50,8 @@ func (c *Coordinator) sweepStaleTermProofs(ctx context.Context) {
 //
 // pr can then never run, and the decided proof is the only one the row names;
 // pr is then marked failed so it is reaped. A failure at any step leaves the
-// row as it is, holds the source's recovery with the reason and, where there
-// is one, the remedy, and the next cycle starts again from step 1, which is
+// row as it is, records on the VM why and, where there is one, the remedy
+// (noteStaleTermHeld), and the next cycle starts again from step 1, which is
 // idempotent.
 func (c *Coordinator) supersedeStaleTerm(ctx context.Context, pr corrosion.ProofRecord) {
 	if c.Claimer == nil || pr.Status != corrosion.ProofPrepared || pr.ExecutorHost != "" ||
@@ -102,8 +102,9 @@ func (c *Coordinator) supersedeStaleTerm(ctx context.Context, pr corrosion.Proof
 		slog.Warn("failover: the destination did not abandon a pending reschedule at a superseded lease term; retrying next cycle",
 			"vm", vm.Name, "dest", dest, "proof", pr.ID, "claim", key.String(), "error", err,
 			"fix", "if "+dest+" is down, bring it back; if it is gone for good: lv host rm --dead "+dest+" (--dry-run first)")
-		c.noteHold(source, "VM "+vm.Name+": its pending reschedule to "+dest+" is at a superseded lease term and "+dest+
-			" has not abandoned it ("+err.Error()+"); retried next cycle")
+		c.noteStaleTermHeld(ctx, vm.Name, "abandon:"+dest, "its pending reschedule to "+dest+" is at a superseded "+
+			"lease term and "+dest+" has not abandoned it ("+err.Error()+"); retried every cycle. If "+dest+
+			" is down, bring it back; if it is gone for good: lv host rm "+dest+" --dead (--dry-run first)")
 		return
 	}
 	binding := pr.ActionProof
@@ -130,8 +131,8 @@ func (c *Coordinator) supersedeStaleTerm(ctx context.Context, pr corrosion.Proof
 		slog.Warn("failover: no claim decided a re-stamped reschedule in place of one at a superseded lease term; "+
 			"retrying next cycle", "vm", vm.Name, "proof", pr.ID, "claim", key.String(), "error", err,
 			"fix", "lv cluster claim vm/"+vm.Name+" shows each voter's state")
-		c.noteHold(source, "VM "+vm.Name+": its pending reschedule at a superseded lease term was abandoned by "+dest+
-			" and no claim has decided its replacement ("+err.Error()+"); retried next cycle; `lv cluster claim vm/"+
+		c.noteStaleTermHeld(ctx, vm.Name, "claim", "its pending reschedule at a superseded lease term was abandoned by "+
+			dest+" and no claim has decided its replacement ("+err.Error()+"); retried every cycle; `lv cluster claim vm/"+
 			vm.Name+"` shows each voter's state")
 		return
 	}
@@ -144,9 +145,9 @@ func (c *Coordinator) supersedeStaleTerm(ctx context.Context, pr corrosion.Proof
 			"write; leaving the row", "vm", vm.Name, "proof", pr.ID, "decided", cl.Proof.ID,
 			"decided_action", cl.Proof.Action, "decided_dest", cl.Proof.DestHost,
 			"fix", "lv cluster claim vm/"+vm.Name+" shows the decision")
-		c.noteHold(source, "VM "+vm.Name+": the claim past its abandoned reschedule decided "+cl.Proof.Action+" to "+
-			cl.Proof.DestHost+" by "+cl.Proof.Coordinator+", which this coordinator does not write; `lv cluster claim vm/"+
-			vm.Name+"` shows it")
+		c.noteStaleTermHeld(ctx, vm.Name, "decided:"+cl.Proof.ID, "the claim past its abandoned reschedule decided "+
+			cl.Proof.Action+" to "+cl.Proof.DestHost+" by "+cl.Proof.Coordinator+", which this coordinator does not "+
+			"write; `lv cluster claim vm/"+vm.Name+"` shows it")
 		return
 	}
 	if c.haHold(ctx, source, haSiteReschedule+"-mint") {
@@ -156,6 +157,9 @@ func (c *Coordinator) supersedeStaleTerm(ctx context.Context, pr corrosion.Proof
 		if errors.Is(err, corrosion.ErrNoRowsAffected) {
 			slog.Info("failover: a pending reschedule moved on before its re-stamped proof was written", "vm", vm.Name,
 				"proof", pr.ID)
+			// pr is abandoned on its only executor all the same: fail it so it
+			// is reaped.
+			c.failAbandonedStaleProof(ctx, pr.ID, dest, "the row moved on before it was re-pointed")
 			return
 		}
 		slog.Warn("failover: write the re-stamped reschedule; retrying next cycle", "vm", vm.Name, "proof", cl.Proof.ID,
@@ -164,13 +168,47 @@ func (c *Coordinator) supersedeStaleTerm(ctx context.Context, pr corrosion.Proof
 	}
 	// The abandoned proof can never run on its only executor: fail it, so it
 	// is reaped like any spent proof rather than read by every later pass.
-	if err := corrosion.FailActionProof(ctx, c.db, pr.ID, "", "superseded",
-		"abandoned by "+dest+" at a superseded lease term; replaced by "+cl.Proof.ID); err != nil {
-		slog.Warn("failover: mark the abandoned reschedule proof failed", "proof", pr.ID, "error", err)
-	}
+	c.failAbandonedStaleProof(ctx, pr.ID, dest, "replaced by "+cl.Proof.ID)
+	delete(c.staleTermHeld, vm.Name)
 	slog.Warn("failover: a pending reschedule at a superseded lease term was abandoned by its destination and decided "+
 		"again under this holder's term", "vm", vm.Name, "abandoned_proof", pr.ID, "proof", cl.Proof.ID,
 		"dest", cl.Proof.DestHost, "claim", cl.Key.String(), "term", cl.Proof.LeaseTerm)
 	c.audit(ctx, "failover", vm.Name, "re-stamped the pending reschedule to "+cl.Proof.DestHost+": proof "+pr.ID+
 		" was at a superseded lease term", "ok")
+}
+
+// failAbandonedStaleProof marks proofID, which dest abandoned at a superseded
+// lease term, failed: it never runs on its only executor, and failed it is
+// reaped like any spent proof instead of read by every later pass. Only the
+// proof row is written.
+func (c *Coordinator) failAbandonedStaleProof(ctx context.Context, proofID, dest, why string) {
+	if err := corrosion.FailActionProof(ctx, c.db, proofID, "", "superseded",
+		"abandoned by "+dest+" at a superseded lease term; "+why); err != nil {
+		slog.Warn("failover: mark the abandoned reschedule proof failed", "proof", proofID, "error", err)
+	}
+}
+
+// noteStaleTermHeld records, on the VM, why the sweep could not move its
+// pending reschedule past a superseded lease term, with the remedy: a
+// vm.failover.stale_term_held event, written once per step (and per decided
+// value or destination) while it stays held, since the sweep retries every
+// cycle. The swept VM is recorded on its destination, not on the host it
+// left, so the host's hold reason (the stall alert's) is not the place for
+// it, and that host's own workloads keep theirs.
+func (c *Coordinator) noteStaleTermHeld(ctx context.Context, vmName, step, detail string) {
+	if c.staleTermHeld[vmName] == step {
+		return
+	}
+	if err := corrosion.InsertVMEvent(ctx, c.db, corrosion.VMEventRecord{
+		ID: randid.New(), VMName: vmName, HostName: c.hostName, Type: "vm.failover.stale_term_held",
+		Result: "held", Severity: "warn", Detail: detail, Username: "failover-coordinator",
+	}); err != nil {
+		slog.Warn("failover: record the held stale-term reschedule's event", "vm", vmName, "error", err)
+		return
+	}
+	if c.staleTermHeld == nil {
+		c.staleTermHeld = map[string]string{}
+	}
+	c.staleTermHeld[vmName] = step
+	c.publish("vm.failover.stale_term_held", vmName, detail)
 }

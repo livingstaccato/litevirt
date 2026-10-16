@@ -2418,6 +2418,9 @@ where it described the mechanism; this list records what changed and why.
       the row, still pending on the abandoned proof, at the decided proof
       (`sweepStaleTermProofs`). A destination that has claimed the proof
       refuses, and the proof runs. A proof `certifyUncertified` or
-      `recertifyReplaced` has just certified goes the same way.
+      `recertifyReplaced` has just certified goes the same way. A step that
+      cannot complete (no abandonment, no decided replacement, or one this
+      sweep does not write) records a `vm.failover.stale_term_held` event on
+      the VM naming the remedy, once per step, and is retried every cycle.
     - A coordinator with `enforcement.lease_term` off judges nothing here.
     - No schema, statement shape, protobuf or capability change.

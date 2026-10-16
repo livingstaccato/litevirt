@@ -264,6 +264,10 @@ type Coordinator struct {
 	// own act on that confirmation, not a sign the host ran since it
 	// (newestProofGradeFenceWhy).
 	afreshConfirm map[string]string
+	// staleTermHeld is, per VM, the step at which sweepStaleTermProofs last
+	// recorded the VM held (noteStaleTermHeld), so a step retried every cycle
+	// is recorded once.
+	staleTermHeld map[string]string
 	// LocalStall reports whether THIS node stopped running within the last
 	// health.StallGrace (implemented by *health.Checker.InStallGrace). While it
 	// is true the coordinator decides no new fence: a node that was suspended,

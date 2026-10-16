@@ -672,6 +672,9 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 		if e := s.verifyVMISOForStart(rec); e != nil {
 			return failed("start", e)
 		}
+		// This start runs outside the start hook: a stale seed is rebuilt
+		// here as there, never refusing it.
+		s.retryStaleSeedForStart(ctx, rec)
 	}
 	releaseGuard, gerr := s.guardSharedDiskStart(ctx, m.ReplacedVM, "")
 	if gerr != nil {

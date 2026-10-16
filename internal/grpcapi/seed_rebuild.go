@@ -63,8 +63,19 @@ func (s *Server) retryStaleSeedForStart(ctx context.Context, vm *corrosion.VMRec
 	if err != nil || !cloudinit.SeedMarkedStale(iso) {
 		return
 	}
+	// A start that finds the domain already active (running in libvirt)
+	// boots nothing: its guest holds the seed it was started with open, so
+	// the seed keeps its mark for the next start, or an attach or detach,
+	// which reloads the cdrom.
+	if active, aerr := s.virt.DomainIsActive(vm.Name); aerr == nil && active {
+		return
+	}
 	s.rebuildOwnSeed(ctx, vm, "", true)
 }
+
+// seedStartRebuildRaced, set only by tests, runs in a start's rebuild between
+// the derivation of the network-config and the rewrite.
+var seedStartRebuildRaced func()
 
 // rebuildOwnSeed is rebuildSeedNetworkConfig, after an attach or detach, or,
 // forStart, before a start of the domain (retryStaleSeedForStart): a seed not
@@ -139,12 +150,28 @@ func (s *Server) rebuildOwnSeed(ctx context.Context, vm *corrosion.VMRecord, add
 		failed(err)
 		return
 	}
+	if forStart && seedStartRebuildRaced != nil {
+		seedStartRebuildRaced()
+	}
 	changed, err := cloudinit.RebuildISO(iso, nc, cloudinit.SeedVendorData(&spec, nc))
 	if err != nil {
 		failed(err)
 		return
 	}
 	stamp()
+	if forStart {
+		// A start holds no VM lock on every path (a health restart or a
+		// restore autostart holds none, and the lock is not reentrant, so
+		// the hook cannot take it under startVMLocked): an attach or detach
+		// can commit while this rebuild runs, and this rewrite can land
+		// after its own. Derived again, a NIC set that moved keeps the seed
+		// marked, so the next start or attach or detach rewrites it.
+		if again, aerr := cloudinit.SeedNetworkConfig(ctx, s.db, vm.Name, &spec, prior); aerr != nil || again != nc {
+			if merr := cloudinit.MarkSeedStale(iso); merr != nil {
+				slog.Warn("seed rebuild before a start: could not mark the seed stale", "vm", vm.Name, "seed", iso, "error", merr)
+			}
+		}
+	}
 	if !changed || forStart {
 		if changed {
 			slog.Info("seed rebuilt for the VM's NICs before its start", "vm", vm.Name, "seed", iso)

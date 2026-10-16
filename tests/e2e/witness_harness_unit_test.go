@@ -268,10 +268,45 @@ func TestW4aVerdict(t *testing.T) {
 		{"stranded off, gate inert", off, false, true, false, "p1", "stranded", "fail", "inert"},
 		{"not recovered", off, false, false, false, "", "not recovered", "fail", ""},
 	} {
-		v := w4aVerdict(tc.e, tc.recovered, tc.decided, tc.dp, "p1", tc.gateRef)
+		v := w4aVerdict(tc.e, tc.recovered, tc.decided, tc.dp, "p1", tc.gateRef, w4aFresh{})
 		if v.Name != tc.wantName || (v.Fail != "") != (tc.wantFail != "") || !strings.Contains(v.Fail, tc.mustSay) {
 			t.Errorf("%s: got %+v, want outcome %q fail=%v saying %q", tc.name, v, tc.wantName, tc.wantFail != "", tc.mustSay)
 		}
+	}
+
+	// Recovered with no attempt decided at the owner's epoch after the
+	// recovery (lab 1 at f9bafd75): the stale-term sweep abandoned outage 1's
+	// value and a fresh claim decided. It passes only on that path's
+	// evidence: one proof since the power-off, fresh, completed, at a term
+	// above outage 1's, on the host the VM recovered on.
+	//
+	// Mutation: accept any recovery with no decided attempt — every arm but
+	// the first goes red.
+	good := proof{ID: "p2", Status: "completed", LeaseTerm: 81, Dest: "node-3"}
+	with := func(f func(*proof)) []proof { p := good; f(&p); return []proof{p} }
+	for _, tc := range []struct {
+		name    string
+		proofs  []proof
+		mustSay string
+	}{
+		{"abandoned, then a fresh claim", []proof{good}, ""},
+		{"no proof", nil, "0 recovery proofs"},
+		{"two proofs", []proof{good, {ID: "p3", Status: "completed", LeaseTerm: 81, Dest: "node-4"}}, "2 recovery proofs"},
+		{"outage 1's proof", with(func(p *proof) { p.ID = "p1" }), "outage 1's"},
+		{"not completed", with(func(p *proof) { p.Status = "pending" }), "not completed"},
+		{"outage 1's term", with(func(p *proof) { p.LeaseTerm = 80 }), "not above"},
+		{"another destination", with(func(p *proof) { p.Dest = "node-4" }), "recovered on node-3"},
+	} {
+		v := w4aVerdict(on, true, false, "", "p1", false, w4aFresh{Proofs: tc.proofs, T1: 80, Dest: "node-3"})
+		switch {
+		case tc.mustSay == "" && (v.Fail != "" || v.Name != "B-fresh"):
+			t.Errorf("%s: got %+v, want outcome B-fresh, passing", tc.name, v)
+		case tc.mustSay != "" && (v.Fail == "" || !strings.Contains(v.Fail, tc.mustSay)):
+			t.Errorf("%s: got %+v, want a failure saying %q", tc.name, v, tc.mustSay)
+		}
+	}
+	if v := w4aVerdict(on, false, false, "", "p1", false, w4aFresh{Proofs: []proof{good}, T1: 80, Dest: "node-3"}); v.Fail == "" {
+		t.Errorf("not recovered, with a fresh proof: got %+v, want a failure", v)
 	}
 }
 

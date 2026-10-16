@@ -3,8 +3,10 @@ package failover
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -238,6 +240,14 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 // refusal's kind (pauseVerdict.key) rather than on every re-check.
 func (c *Coordinator) refusePauseWait(ctx context.Context, h *corrosion.HostRecord, w pauseWait, v pauseVerdict) {
 	host := h.Name
+	if v.key == keyVoterSetMoved {
+		// Counted again next cycle, on the generation it reads: the
+		// standing refusal, and its alert, are left as they are.
+		c.pauseWaits[host] = w
+		slog.Info("failover: partition-pause deadline passed while this node adopted a voter generation; recovering nothing, re-checking next cycle",
+			"host", host)
+		return
+	}
 	level := slog.LevelWarn
 	switch {
 	case w.refused == v.key:
@@ -289,6 +299,11 @@ const (
 	keyRestarted     = "observers' failing runs began after the fence"
 	keyContacted     = "this node probed the host healthy since the wait began"
 )
+
+// keyVoterSetMoved is the key, and the reason, of a refusal because this
+// node adopted a voter generation after the cycle read its voter set
+// (voterSnapshot): the deadline is counted again on the next cycle.
+const keyVoterSetMoved = "this node adopted a voter generation since the cycle read its voter set"
 
 // whyContacted is the reason a deadline is not quiet when this node has
 // probed the host healthy since the wait began (LastContact).
@@ -347,21 +362,32 @@ const whyContacted = "this node probed the host healthy since the wait began"
 // healthy since mono, the wait's start on its monotonic clock (LastContact;
 // a zero mono skips that). Either is an answer since the fence overwritten or
 // unseen by the rows, and the host's own word, dated to this outage, decides.
+//
+// Neither holds the deadline when enough voters have failed the host without
+// a break since before the fence that it cannot have held a majority since
+// (noRegainSinceIn): such an answer can only have come from a bridge, and the
+// host, with no majority at any moment since, cannot have resumed. On the
+// derived voter set the restarted-run rule of quietFallback gives way to the
+// same evidence. Answers that are still the latest verdict (a bridge that
+// still stands) are not affected.
 func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.HostRecord, at, mono time.Time) pauseVerdict {
 	hr := c.readHostHealth(ctx, h.Name)
 	if !c.relyOnPartitionPause(ctx, h) {
-		v := c.quietFallback(ctx, hr, h.Name, at)
+		v := c.quietFallback(ctx, hr, h.Name, at, false)
 		v.bridged, v.observers = false, nil
 		return v
 	}
 	sets, explicit, err := c.pauseVoterSets(ctx, h.Name)
+	if errors.Is(err, errVoterSetMoved) {
+		return refused(keyVoterSetMoved)
+	}
 	if err != nil {
 		slog.Warn("failover: voter set read for a partition-pause deadline failed", "host", h.Name, "error", err)
 		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
 		return refused("voter set unreadable")
 	}
 	if !explicit {
-		return c.quietFallback(ctx, hr, h.Name, at)
+		return c.quietFallback(ctx, hr, h.Name, at, c.noRegainSinceIn(ctx, hr, h.Name, at, mono, false))
 	}
 	if hr.err != nil {
 		slog.Warn("failover: host_health read for a partition-pause deadline failed", "host", h.Name, "error", hr.err)
@@ -380,7 +406,7 @@ func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.Hos
 	}
 	answered, observers, quiet := c.answeredSinceIn(hr, h.Name, at)
 	key, bridged := keyAnswered, true
-	if quiet {
+	if quiet && !c.noRegainSinceIn(ctx, hr, h.Name, at, mono, true) {
 		if r := restartedSinceObserversIn(hr, h.Name, at); len(r) > 0 {
 			answered, observers, quiet = whyRestarted(r), nil, false
 			key, bridged = keyRestarted, false
@@ -409,16 +435,32 @@ func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.Hos
 }
 
 // quietFallback is fenceStillStands, for a deadline that keeps its rule
-// (selfPauseStillStands), over host_health rows already read. When it holds
-// and this coordinator already limits the host's recovery from earlier in the
-// down-episode, the host's own word still bounds what moves:
+// (selfPauseStillStands), over host_health rows already read. With noRegain
+// (noRegainSinceIn held, on a pause still relied on) a failing run begun
+// after the fence does not refuse: only a latest verdict that is an answer
+// does. When it holds and this coordinator already limits the host's
+// recovery from earlier in the down-episode, the host's own word still
+// bounds what moves:
 // pausedThisOutage, dating the outage over the voter set this cycle decides
 // on. A refusal on observers whose latest verdict is an answer since the
 // fence is reported bridged: the form selfPauseStillStands raises on a
 // derived voter set. One on failing runs begun after the fence alone, or a
 // read error, is not.
-func (c *Coordinator) quietFallback(ctx context.Context, hr healthRead, host string, at time.Time) pauseVerdict {
-	why, observers, ok := c.fenceStillStandsIn(hr, host, at)
+func (c *Coordinator) quietFallback(ctx context.Context, hr healthRead, host string, at time.Time, noRegain bool) pauseVerdict {
+	var (
+		why       string
+		observers []string
+		ok        bool
+	)
+	if noRegain {
+		// fenceStillStandsIn without its restarted-run rule.
+		why = whyNoStreakSpans
+		if c.streakSpansIn(hr, host, at) {
+			why, observers, ok = c.answeredSinceIn(hr, host, at)
+		}
+	} else {
+		why, observers, ok = c.fenceStillStandsIn(hr, host, at)
+	}
 	if !ok {
 		switch {
 		case len(observers) > 0 && len(answeredSinceObserversIn(hr, host, at)) > 0:
@@ -438,6 +480,475 @@ func (c *Coordinator) quietFallback(ctx context.Context, hr healthRead, host str
 		return refused(why)
 	}
 	return pauseVerdict{ok: true, only: only}
+}
+
+// noRegainSinceIn reports whether host cannot have held a voter majority at
+// any moment since the fence at `at`, by its own count, as far as this node
+// can prove it. Over every voter set host's pauser may be counting over
+// (regainCandidates), enough voters other than host have failed it without a
+// break since before the fence that the rest, host included, are fewer than a
+// majority. An answer since the fence that the rows have overwritten
+// (restartedSinceObserversIn), or this node's own probe answer
+// (LastContact), can then only be a bridge's, as the fence quorum and the
+// pause wait already assume reachability to be symmetric.
+//
+// What it proves rests on two premises, and it reports false whenever it
+// cannot read what they need:
+//
+//   - the voter configuration host may be using is pinned: at most one
+//     generation was decided since the outage began, and no reset (on the
+//     derived voter set, none at all), and host reported, before the outage
+//     began, that it had adopted the oldest generation counted or a later one
+//     (hostReportedAdopting);
+//   - host's replica held every change of a member's voting state made more
+//     than healthFreshness before the outage began.
+//
+// A run counts as spanning only when it began at least fenceSkewMargin plus
+// its observer's clock skew (observerSkews) before the fence: an observer
+// whose clock runs behind dates its run early. When this node has probed the
+// host healthy since mono, its own row is not counted: a probe answer can run
+// ahead of the row that records it.
+func (c *Coordinator) noRegainSinceIn(ctx context.Context, hr healthRead, host string, at, mono time.Time, explicit bool) bool {
+	if hr.err != nil {
+		return false
+	}
+	if !mono.IsZero() && c.contactedSince(host, mono) {
+		rows := make([]corrosion.Row, 0, len(hr.rows))
+		for _, r := range hr.rows {
+			if r.String("observer") != c.hostName {
+				rows = append(rows, r)
+			}
+		}
+		hr = healthRead{rows: rows}
+	}
+	skew, err := c.observerSkews(ctx, host)
+	if err != nil {
+		slog.Warn("failover: clock_skew read for a partition-pause deadline failed", "host", host, "error", err)
+		return false
+	}
+	since, ok := c.outageSinceIn(hr, host, skew)
+	if !ok {
+		return false
+	}
+	cands, ok := c.regainCandidates(ctx, host, explicit, since, skew)
+	if !ok || len(cands) == 0 {
+		return false
+	}
+	freshCutoff := c.now().Add(-healthFreshness)
+	spanning := map[string]bool{}
+	for _, r := range hr.rows {
+		obs := r.String("observer")
+		if obs == host || r.String("status") == health.StatusUnready {
+			continue
+		}
+		n := r.Int("consecutive_failures")
+		if n < offlineThreshold {
+			continue
+		}
+		upd, ok := corrosion.ParseUpdatedAt(r.String("updated_at"))
+		if !ok || !upd.After(freshCutoff) {
+			continue
+		}
+		if !observerRunStart(n, r.String("last_seen"), upd).Add(skew(obs)).After(at.Add(-fenceSkewMargin)) {
+			spanning[obs] = true
+		}
+	}
+	for _, cand := range cands {
+		if len(cand.set) == 0 {
+			return false
+		}
+		need := len(cand.set) - (len(cand.set)/2 + 1) + 1
+		have := 0
+		for v := range cand.set {
+			if v != host && spanning[v] && (cand.countable == nil || cand.countable[v]) {
+				have++
+			}
+		}
+		if have < need {
+			return false
+		}
+	}
+	return true
+}
+
+// outageSinceIn is a moment no later than the outage host is in began: the
+// earliest fresh failing run about it, less its observer's skew and
+// fenceSkewMargin. ok is false when no such run is read.
+func (c *Coordinator) outageSinceIn(hr healthRead, host string, skew func(string) time.Duration) (time.Time, bool) {
+	freshCutoff := c.now().Add(-healthFreshness)
+	var since time.Time
+	for _, r := range hr.rows {
+		if r.String("observer") == host || r.String("status") == health.StatusUnready {
+			continue
+		}
+		n := r.Int("consecutive_failures")
+		if n <= 0 {
+			continue
+		}
+		upd, ok := corrosion.ParseUpdatedAt(r.String("updated_at"))
+		if !ok || !upd.After(freshCutoff) {
+			continue
+		}
+		run := observerRunStart(n, r.String("last_seen"), upd).Add(-skew(r.String("observer")))
+		if since.IsZero() || run.Before(since) {
+			since = run
+		}
+	}
+	if since.IsZero() {
+		return time.Time{}, false
+	}
+	return since.Add(-fenceSkewMargin), true
+}
+
+// regainCandidate is a voter set host's pauser may be counting its majority
+// over, for noRegainSinceIn. set is the denominator. countable, when not nil,
+// names the members whose spanning run counts: the others may not be in the
+// host's set at all, so they are counted only against the claim. A set that
+// may hold more or fewer members is checked at its worst: every member that
+// may be in it, and only the runs of those that surely are.
+type regainCandidate struct {
+	set       map[string]bool
+	countable map[string]bool
+}
+
+// regainCandidates is every voter set host's pauser may be counting over,
+// once the voter configuration is pinned; ok is false when it is not, or a
+// set cannot be known.
+//
+// Pinned: no reset was decided since the outage began, and at most one
+// generation was; on the derived voter set none at all. "Since" reaches
+// healthFreshness back from `since`, the window membership changes use: a
+// generation decided just before the cut may not have reached, or been
+// adopted by, the host (its claim round, replication, the adoption tick).
+// So the host is at least on the last generation decided before that window,
+// which is the adopted one when none was decided since, and the one before
+// the adopted one when one was. A generation is dated by the later of its
+// proposal and its row (decidedBefore), each moved later by stampSkew, and
+// one that cannot be dated was decided since.
+//
+// The sets, every one of which must be spanned, all from one voterSnapshot
+// (ok is false when this node adopted a generation since the cycle read its
+// voter set):
+//
+//   - explicit: the adopted generation and each newer one (pauseVoterSets),
+//     and the one before the adopted one, which a host partitioned before it
+//     adopted the current one still counts over;
+//   - derived: the adopted generation when it is explicit (a newer reset
+//     made the set derived) and the one before it, the explicit generation a
+//     reset replaced, and each newer explicit generation;
+//   - wherever host may be counting over a derived set (the derived branch,
+//     a reset, or no generation before the adopted one), the derived set as
+//     its replica held it (derivedRegainCandidate).
+//
+// ok is also false when this node does not hold every generation from the
+// oldest counted one to the newest (heldThrough), or a member of a counted
+// set reported adopting a generation newer than the newest it holds
+// (aVoterReportedNewer): either is a set host may be counting over that this
+// node cannot count.
+func (c *Coordinator) regainCandidates(ctx context.Context, host string, explicit bool, since time.Time, skew func(string) time.Duration) ([]regainCandidate, bool) {
+	adopted, cfgs, err := c.voterSnapshot(ctx)
+	if err != nil {
+		return nil, false
+	}
+	stampSkew, ok := c.stampSkew(ctx, skew)
+	if !ok {
+		return nil, false
+	}
+	decided := 0
+	for _, cfg := range cfgs {
+		if cfg == nil {
+			continue
+		}
+		if decidedBefore(cfg, since.Add(-healthFreshness), stampSkew) {
+			continue
+		}
+		if !cfg.Explicit() || !explicit {
+			return nil, false
+		}
+		decided++
+	}
+	if decided > 1 {
+		return nil, false
+	}
+	before := func(g int64) *corrosion.VoterConfig {
+		var prev *corrosion.VoterConfig
+		for _, cfg := range cfgs {
+			if cfg != nil && cfg.Generation < g {
+				prev = cfg
+			}
+		}
+		return prev
+	}
+	var cands []regainCandidate
+	derived := !explicit
+	var adoptedGen, newest int64
+	if adopted != nil {
+		adoptedGen = adopted.Generation
+	}
+	for _, cfg := range cfgs {
+		if cfg != nil {
+			newest = max(newest, cfg.Generation)
+		}
+	}
+	// floor is the oldest generation counted: host must have said it adopted
+	// that one or a later one. 0 when every generation, and none, is counted.
+	floor := adoptedGen
+	// counted adds cfg's set; a reset, or none, means the derived set and the
+	// explicit generation it replaced.
+	counted := func(cfg *corrosion.VoterConfig) {
+		for cfg != nil && !cfg.Explicit() {
+			derived = true
+			cfg = before(cfg.Generation)
+		}
+		if cfg == nil {
+			derived = true
+			floor = 0
+			return
+		}
+		floor = min(floor, cfg.Generation)
+		cands = append(cands, regainCandidate{set: c.regionMembers(cfg, host)})
+	}
+	if explicit {
+		sets, ok := c.pauseVoterSetsFrom(host, adopted, cfgs)
+		if !ok {
+			return nil, false
+		}
+		for _, set := range sets {
+			cands = append(cands, regainCandidate{set: set})
+		}
+		counted(before(adoptedGen))
+	} else {
+		if adopted != nil {
+			counted(adopted)
+			if adopted.Explicit() {
+				counted(before(adoptedGen))
+			}
+		}
+		for _, cfg := range cfgs {
+			if cfg != nil && cfg.Generation > adoptedGen && cfg.Explicit() {
+				cands = append(cands, regainCandidate{set: c.regionMembers(cfg, host)})
+			}
+		}
+	}
+	if derived {
+		d, ok := c.derivedRegainCandidate(ctx, host, since, stampSkew)
+		if !ok {
+			return nil, false
+		}
+		cands = append(cands, d)
+	}
+	if !c.hostReportedAdopting(host, since, floor, newest) {
+		return nil, false
+	}
+	if !heldThrough(cfgs, max(floor, 1), newest) {
+		return nil, false
+	}
+	if c.aVoterReportedNewer(cands, newest) {
+		return nil, false
+	}
+	return cands, true
+}
+
+// heldThrough reports whether cfgs holds every generation from `from` to
+// `to`. A generation missing from this node's replica in between is one host
+// may be counting over that no set counts.
+func heldThrough(cfgs []*corrosion.VoterConfig, from, to int64) bool {
+	held := map[int64]bool{}
+	for _, cfg := range cfgs {
+		if cfg != nil {
+			held[cfg.Generation] = true
+		}
+	}
+	for g := from; g <= to; g++ {
+		if !held[g] {
+			return false
+		}
+	}
+	return true
+}
+
+// everyReport is the bound under which PeerVoterGeneration returns the
+// highest generation a peer reported in any Ping this node received.
+var everyReport = time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// aVoterReportedNewer reports whether a member of any of cands' sets said, in
+// any Ping this node received, that it had adopted a generation newer than
+// newest: one this node does not hold, which no set counts.
+func (c *Coordinator) aVoterReportedNewer(cands []regainCandidate, newest int64) bool {
+	if c.PeerVoterGeneration == nil {
+		return false
+	}
+	for _, cand := range cands {
+		for v := range cand.set {
+			if g, ok := c.PeerVoterGeneration(v, everyReport); ok && g > newest {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hostReportedAdopting reports whether host said, in a Ping this node
+// received before `since`, that it had adopted generation floor or a later
+// one this node holds (newest at most). Adoption only moves forward, so host
+// counted over that generation or a later one when the outage began; without
+// such a report it may be counting over an older generation (its adoption
+// stuck behind a sealed-majority import, or an older build that reports
+// none). floor 0 needs no report; a report of a generation newer than newest
+// names a set this node cannot count.
+func (c *Coordinator) hostReportedAdopting(host string, since time.Time, floor, newest int64) bool {
+	if c.PeerVoterGeneration == nil {
+		return floor == 0
+	}
+	g, ok := c.PeerVoterGeneration(host, since)
+	if !ok {
+		return floor == 0
+	}
+	return g >= floor && g <= newest
+}
+
+// regionMembers is cfg's members, host's region's under region scope.
+func (c *Coordinator) regionMembers(cfg *corrosion.VoterConfig, host string) map[string]bool {
+	set := map[string]bool{}
+	for _, m := range cfg.Members {
+		if !c.scope.region || c.scope.regionOf(m.Name) == c.scope.regionOf(host) {
+			set[m.Name] = true
+		}
+	}
+	return set
+}
+
+// derivedRegainCandidate is the derived voter set host's pauser counts over,
+// from the state its replica held when the outage began (`since`): host
+// itself, which the majority has fenced since, and every host whose voting
+// state may have changed since then. A host whose membership has not changed
+// since healthFreshness before `since` (time for its replica to have it) is
+// in the set iff it is voting-eligible here, and its run counts unless its
+// state is unknown here. One that changed since then, or whose change cannot
+// be dated, is in the denominator and its run does not count: the host's
+// replica may or may not hold it. A change is stamped on its writer's clock,
+// moved later by stampSkew.
+func (c *Coordinator) derivedRegainCandidate(ctx context.Context, host string, since time.Time, stampSkew time.Duration) (regainCandidate, bool) {
+	stamps, err := corrosion.HostMembershipStamps(ctx, c.db)
+	if err != nil {
+		return regainCandidate{}, false
+	}
+	cutoff := since.Add(-healthFreshness)
+	cand := regainCandidate{set: map[string]bool{host: true}, countable: map[string]bool{}}
+	for _, st := range stamps {
+		if st.Name == host || (c.scope.region && c.scope.regionOf(st.Name) != c.scope.regionOf(host)) {
+			continue
+		}
+		if st.DeletedAt != "" {
+			if del, ok := corrosion.ParseUpdatedAt(st.DeletedAt); ok && del.Add(stampSkew).Before(cutoff) {
+				continue // deleted before the outage: not in the host's set either
+			}
+			cand.set[st.Name] = true
+			continue
+		}
+		changed, ok := corrosion.ParseUpdatedAt(st.Changed)
+		unchanged := ok && changed.Add(stampSkew).Before(cutoff)
+		switch {
+		case unchanged && corrosion.VotingEligible(st.State):
+			cand.set[st.Name] = true
+			if st.State != corrosion.HostStateUnknown {
+				cand.countable[st.Name] = true
+			}
+		case !unchanged:
+			cand.set[st.Name] = true
+		}
+	}
+	return cand, true
+}
+
+// decidedBefore reports whether cfg was decided, and written, before
+// cutoff: both its proposal's stamp (created_at, which a value another
+// proposer completed keeps) and its row's (updated_at, the stamp of
+// whichever writer's row won the merge, no earlier than that writer's
+// write), moved later by stampSkew, precede it. A row stamped before the
+// cutoff proves only that some node wrote it then, not that the fenced
+// host's replica held it: that is hostReportedAdopting's evidence. A stamp
+// that cannot be read dates nothing.
+func decidedBefore(cfg *corrosion.VoterConfig, cutoff time.Time, stampSkew time.Duration) bool {
+	for _, ts := range []string{cfg.CreatedAt, cfg.UpdatedAt} {
+		at, ok := corrosion.ParseUpdatedAt(ts)
+		if !ok || !at.Add(stampSkew).Before(cutoff) {
+			return false
+		}
+	}
+	return true
+}
+
+// stampSkew is how far a cluster stamp (a generation's created_at or
+// updated_at, a membership change) may read early: the largest skew of any
+// host this node holds a row for, deleted ones and the fenced host included.
+// The writer is not named (created_by is "<user> via <host>" or "automatic
+// genesis by <host>", the row's updated_at is whichever writer's row won the
+// merge, and a membership row records no writer), so any of them may have
+// stamped it. ok is false when the hosts cannot be read.
+func (c *Coordinator) stampSkew(ctx context.Context, skew func(string) time.Duration) (time.Duration, bool) {
+	stamps, err := corrosion.HostMembershipStamps(ctx, c.db)
+	if err != nil {
+		return 0, false
+	}
+	var most time.Duration
+	for _, st := range stamps {
+		most = max(most, skew(st.Name))
+	}
+	return most, true
+}
+
+// unknownSkew is the clock skew assumed for a peer whose skew from this node
+// is unknown: not measured by this run (PeerClockSkew) and named in no
+// clock_skew row. It is the run-start lead an unmeasured observer needs over
+// the fence beyond fenceSkewMargin, and the lead a generation decided by an
+// unmeasured host needs over the outage.
+const unknownSkew = 30 * time.Second
+
+// observerSkews returns each peer's clock skew from this node, for dating
+// its stamps against this node's clock: the largest of this run's own
+// measurement (PeerClockSkew) and every clock_skew row naming the peer, as
+// observer or target. A row paired with host counts for host alone: a skewed
+// host would otherwise shift every observer, but its own skew dates the
+// stamps it may have written (stampSkew). A peer measured nowhere is
+// unknownSkew; this node is 0.
+func (c *Coordinator) observerSkews(ctx context.Context, host string) (func(string) time.Duration, error) {
+	rows, err := c.db.Query(ctx, `SELECT observer, target, skew_seconds FROM clock_skew`)
+	if err != nil {
+		return nil, err
+	}
+	recorded := map[string]time.Duration{}
+	for _, r := range rows {
+		o, t := r.String("observer"), r.String("target")
+		d := time.Duration(math.Abs(r.Float("skew_seconds")) * float64(time.Second))
+		if o == host || t == host {
+			recorded[host] = max(recorded[host], d)
+			continue
+		}
+		for _, p := range []string{o, t} {
+			if d > recorded[p] {
+				recorded[p] = d
+			}
+		}
+	}
+	return func(peer string) time.Duration {
+		if peer == c.hostName {
+			return 0
+		}
+		d, known := recorded[peer]
+		if c.PeerClockSkew != nil {
+			if m, ok := c.PeerClockSkew(peer); ok {
+				known = true
+				if m > d {
+					d = m
+				}
+			}
+		}
+		if !known {
+			return unknownSkew
+		}
+		return d
+	}, nil
 }
 
 // pausedThisOutage is the limit for a deadline at which no observer has seen
@@ -627,20 +1138,68 @@ func (c *Coordinator) answeredByAVoterMajorityIn(hr healthRead, host string, set
 	return "", true
 }
 
+// errVoterSetMoved is voterSnapshot's error when this node adopted a voter
+// generation after the cycle read its voter set (keyVoterSetMoved).
+var errVoterSetMoved = errors.New(keyVoterSetMoved)
+
+// voterSnapshot is the voter configurations every voter set a deadline
+// counts over is taken from: every generation this node holds, and the one
+// it has adopted, which is the generation the cycle read its voter set on
+// (c.scope). Adoption runs on its own ticker, so it can land between that
+// read and this one; a generation adopted in between would then be counted
+// by nobody (neither the cycle's set nor "newer than the adopted one"), and
+// errVoterSetMoved holds the deadline for the cycle. The generations are read
+// before the adopted one, which only rises: when it still equals the
+// cycle's, it was the adopted one throughout, and its row is among them.
+func (c *Coordinator) voterSnapshot(ctx context.Context) (adopted *corrosion.VoterConfig, cfgs []*corrosion.VoterConfig, err error) {
+	cfgs, err = corrosion.ListVoterConfigs(ctx, c.db)
+	if err != nil {
+		return nil, nil, err
+	}
+	adopted, err = corrosion.AdoptedVoterConfig(ctx, c.db)
+	if err != nil {
+		return nil, nil, err
+	}
+	var gen int64
+	if adopted != nil {
+		gen = adopted.Generation
+	}
+	if gen != c.scope.vr.Generation {
+		return nil, nil, errVoterSetMoved
+	}
+	if adopted != nil {
+		held := false
+		for _, cfg := range cfgs {
+			held = held || (cfg != nil && cfg.Generation == gen)
+		}
+		if !held {
+			return nil, nil, errVoterSetMoved
+		}
+	}
+	return adopted, cfgs, nil
+}
+
 // pauseVoterSets is every voter set host's pauser may be counting its
 // majority over, as far as this node's replica knows: the set this cycle
-// decides on (c.scope.voters, host's region's under region scope) and each
-// newer generation this node has not adopted yet. explicit is false while
-// the voter set is derived, or when a newer generation is a reset (which a
-// host that adopted it counts over its own derived set).
+// decides on (c.scope.voters, host's region's under region scope, which is
+// the adopted generation's: voterSnapshot) and each newer generation this
+// node has not adopted yet. explicit is false while the voter set is
+// derived, or when a newer generation is a reset (which a host that adopted
+// it counts over its own derived set). err is errVoterSetMoved when this
+// node adopted a generation since the cycle read its voter set.
 func (c *Coordinator) pauseVoterSets(ctx context.Context, host string) (sets []map[string]bool, explicit bool, err error) {
-	adopted, err := corrosion.AdoptedVoterConfig(ctx, c.db)
-	if err != nil || !adopted.Explicit() {
-		return nil, false, err
-	}
-	cfgs, err := corrosion.ListVoterConfigs(ctx, c.db)
+	adopted, cfgs, err := c.voterSnapshot(ctx)
 	if err != nil {
 		return nil, false, err
+	}
+	sets, explicit = c.pauseVoterSetsFrom(host, adopted, cfgs)
+	return sets, explicit, nil
+}
+
+// pauseVoterSetsFrom is pauseVoterSets over one voterSnapshot.
+func (c *Coordinator) pauseVoterSetsFrom(host string, adopted *corrosion.VoterConfig, cfgs []*corrosion.VoterConfig) (sets []map[string]bool, explicit bool) {
+	if !adopted.Explicit() {
+		return nil, false
 	}
 	sets = []map[string]bool{c.scope.voters(host)}
 	for _, cfg := range cfgs {
@@ -648,17 +1207,11 @@ func (c *Coordinator) pauseVoterSets(ctx context.Context, host string) (sets []m
 			continue
 		}
 		if !cfg.Explicit() {
-			return nil, false, nil
+			return nil, false
 		}
-		set := map[string]bool{}
-		for _, m := range cfg.Members {
-			if !c.scope.region || c.scope.regionOf(m.Name) == c.scope.regionOf(host) {
-				set[m.Name] = true
-			}
-		}
-		sets = append(sets, set)
+		sets = append(sets, c.regionMembers(cfg, host))
 	}
-	return sets, true, nil
+	return sets, true
 }
 
 // ── one-way partitions (docs/design/partition-pause.md §7 F4) ──────────────

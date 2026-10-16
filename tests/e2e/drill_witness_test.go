@@ -686,7 +686,11 @@ func (l *lab) powerOnOwnerManual(via, owner, strategy string) {
 // recover the VM exactly once.
 //
 //   - A (pass): the decided proof is P1, adopted, and it executed;
-//   - B (pass, "not adopted"): a fresh proof was decided and executed;
+//   - B (pass, "not adopted"): a fresh proof was decided and executed. When
+//     the claim view, read at the owner's epoch after the recovery, shows no
+//     decided attempt, B needs the stale-term sweep's evidence instead:
+//     exactly one recovery proof since the power-off, not P1, completed, at
+//     a lease term above outage 1's, naming the host the VM recovered on;
 //   - C (FAIL, design question Q5): the decided proof is P1, the VM does not
 //     run by recoverBy, and the destination logs "reconciler: pending proof
 //     refused by the lease-term gate" for it (health/reconciler.go:1634).
@@ -768,10 +772,16 @@ func TestDrillW4a_PartialAcceptAdoptedAfterALeaseChange(t *testing.T) {
 	lw.avoid(x, true)
 	timer := time.AfterFunc(3*time.Minute, func() { thaw() })
 	t.Cleanup(func() { timer.Stop(); thaw() })
+	off2 := l.nodeNow(v2)
 	off := l.powerOff(w.owner)
+	dest := ""
 	recAt := waitEach(w.s, off, recoverBy, []string{w.key}, func(r round, k string) bool {
 		hs := r.executing(k)
-		return len(hs) == 1 && hs[0] != w.owner
+		if len(hs) == 1 && hs[0] != w.owner {
+			dest = hs[0]
+			return true
+		}
+		return false
 	})
 	_, recovered := recAt[w.key]
 	timer.Stop()
@@ -802,7 +812,18 @@ func TestDrillW4a_PartialAcceptAdoptedAfterALeaseChange(t *testing.T) {
 			l.mark("w4a: %s refused %s by the lease-term gate:\n%s", decided.DecidedDest, p1, j)
 		}
 	}
-	v := w4aVerdict(wt.lt, recovered, decided != nil, dp, p1, gateRefused)
+	fresh := w4aFresh{T1: t1, Dest: dest}
+	if recovered && decided == nil {
+		// The stale-term sweep's path: the decided value was abandoned and a
+		// fresh claim decided, at the owner's earlier epoch, which the
+		// recovery moved on (lab 1 at f9bafd75).
+		fresh.Proofs = l.waitProofs(v3, "vm", w.test, off2, 1, time.Minute)
+		if len(fresh.Proofs) == 1 {
+			l.waitProofStatus(v3, fresh.Proofs[0].ID, "completed", 2*time.Minute)
+			fresh.Proofs = l.proofsSince(v3, "vm", w.test, off2)
+		}
+	}
+	v := w4aVerdict(wt.lt, recovered, decided != nil, dp, p1, gateRefused, fresh)
 	switch v.Name {
 	case "A":
 		l.mark("w4a: outcome A — the accepted value (proof %s) was adopted and decided at attempt %d (lease_term %s)", p1, decided.N, wt.lt.Mode)
@@ -811,6 +832,9 @@ func TestDrillW4a_PartialAcceptAdoptedAfterALeaseChange(t *testing.T) {
 		}
 	case "B":
 		l.mark("w4a: outcome B — not adopted: decided proof %q, outage 1's was %s (lease_term %s)", dp, p1, wt.lt.Mode)
+	case "B-fresh":
+		l.mark("w4a: outcome B — outage 1's %s was abandoned and a fresh claim decided proof %s at lease term %d, completed on %s (lease_term %s)",
+			p1, fresh.Proofs[0].ID, fresh.Proofs[0].LeaseTerm, dest, wt.lt.Mode)
 	}
 	if v.Fail != "" {
 		t.Errorf("w4a outcome %s, lease_term %s: %s; %s within %v of its owner losing power:\n%s", v.Name, wt.lt.Mode, v.Fail, w.key, recoverBy, out)

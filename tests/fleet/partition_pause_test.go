@@ -123,6 +123,12 @@ type ppOpts struct {
 	// lateCoordinators names nodes whose coordinator is built but not
 	// started; the scenario starts it with startCoordinator.
 	lateCoordinators map[string]bool
+	// pauserOnNodeClock runs each node's pauser on Node.Now (ClockSeam), so
+	// a node stepped before the split stamps its partition_paused condition
+	// on its own wall clock, as the daemon's pauser does. A step during a
+	// pause would also move the pauser's timing, which the daemon's
+	// monotonic clock does not.
+	pauserOnNodeClock bool
 }
 
 func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
@@ -145,6 +151,9 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		p.SetVMBackend(n.Virt)
 		p.SetResumeConfirmer(n.Server.CheckPartitionResume)
 		p.SetTimings(ppTPause, 100*time.Millisecond)
+		if o.pauserOnNodeClock {
+			p.SetClock(n.Now)
+		}
 		go p.Start(ctx)
 
 		coord := failover.NewCoordinator(n.Name, n.DB)
@@ -169,6 +178,8 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		coord.PartitionPauseEnforced = func(context.Context) bool { return latched }
 		coord.PauseWaitFor = ppWait
 		coord.LastContact = chk.LastContact
+		coord.PeerClockSkew = chk.MeasuredClockSkew
+		coord.PeerVoterGeneration = n.Server.PeerVoterGeneration
 		// As the daemon wires them: the checker's probes ask each peer's
 		// Ready, whose answer carries the peer's own flag, and the pinger
 		// fills the Ping cache that nothing here may rely on.

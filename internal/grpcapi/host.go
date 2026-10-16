@@ -324,7 +324,8 @@ func notEnforcingFrom(advertised []string, enabled func(string) bool) []string {
 // It also returns the peer's WALL clock so the health checker can detect NTP
 // drift without a second RPC. A peer that predates the field reports the zero
 // time, which the caller must read as "unknown", never as skew. Self returns the
-// zero time too: a node cannot be skewed against itself.
+// zero time too: a node cannot be skewed against itself. The peer's adopted
+// voter generation is recorded (PeerVoterGeneration).
 func (s *Server) PeerCapabilities(ctx context.Context, host string) ([]string, time.Time, error) {
 	if host == s.hostName {
 		return s.advertisedCapabilities(), time.Time{}, nil
@@ -339,6 +340,7 @@ func (s *Server) PeerCapabilities(ctx context.Context, host string) ([]string, t
 		return nil, time.Time{}, err
 	}
 	s.notePeerWALQuarantined(host, resp.GetWalQuarantined())
+	s.notePeerVoterGeneration(host, resp.GetVoterGeneration(), time.Now())
 	peerWall := time.Time{}
 	if s := resp.GetWallClock(); s != "" {
 		if parsed, perr := time.Parse(time.RFC3339Nano, s); perr == nil {

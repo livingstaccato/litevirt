@@ -34,7 +34,16 @@ func explicitPause(t *testing.T) (*Coordinator, *corrosion.Client, context.Conte
 	if err := corrosion.RecordVoterAdoption(ctx, db, 1); err != nil {
 		t.Fatal(err)
 	}
+	reportedGeneration(c, 1, time.Time{})
 	return c, db, ctx, mono
+}
+
+// reportedGeneration has down report, in a Ping this node received at at,
+// that it had adopted generation gen.
+func reportedGeneration(c *Coordinator, gen int64, at time.Time) {
+	c.PeerVoterGeneration = func(peer string, before time.Time) (int64, bool) {
+		return gen, peer == "down" && at.Before(before)
+	}
 }
 
 func healthRow(t *testing.T, db *corrosion.Client, observer, status string, failures int, at time.Time) {

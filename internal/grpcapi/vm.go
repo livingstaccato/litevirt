@@ -5946,7 +5946,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	regenerated := domXML == ""
 	if domXML == "" {
 		priorXML, derr := s.virt.DumpXMLInactive(req.Name)
-		if derr != nil && !lv.IsNoDomain(derr) {
+		if derr != nil && !domainAbsent(derr) {
 			slog.Warn("UpdateVM: the current definition could not be read; regenerating without what only it holds",
 				"vm", req.Name, "error", derr)
 		}

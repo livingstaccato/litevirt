@@ -27,7 +27,7 @@ func (s *Server) domainDiskTargets(vmName string) (map[string]bool, error) {
 	} {
 		x, err := view.dump(vmName)
 		if err != nil {
-			if lv.IsNoDomain(err) || lv.IsNotFound(err) {
+			if domainAbsent(err) {
 				continue
 			}
 			return nil, status.Errorf(codes.Unavailable, "read the %s definition of %q to allocate a disk target: %v", view.name, vmName, err)
@@ -41,4 +41,12 @@ func (s *Server) domainDiskTargets(vmName string) (map[string]bool, error) {
 		}
 	}
 	return out, nil
+}
+
+// domainAbsent reports a definition read that failed because the domain does
+// not exist: libvirt's typed code, or a not-found message from a path that
+// wraps it or carries no code. Every reader of a definition that tolerates a
+// missing domain uses this one rule.
+func domainAbsent(err error) bool {
+	return lv.IsNoDomain(err) || lv.IsNotFound(err)
 }

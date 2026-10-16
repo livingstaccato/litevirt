@@ -39,3 +39,25 @@ func TestUpdateVM_RegenerateLogsAnUnreadableDefinition(t *testing.T) {
 		t.Fatalf("no warning naming the VM and the read error:\n%s", logs.String())
 	}
 }
+
+// A domain that does not exist holds nothing to keep, so it is not warned
+// about: the same "no domain" rule the disk attach uses, which takes the
+// typed libvirt code and a not-found message (domainAbsent).
+//
+// Mutation: test IsNoDomain alone again — the not-found message warns.
+func TestUpdateVM_RegenerateDoesNotWarnForAnAbsentDomain(t *testing.T) {
+	s := reconfigServer(t)
+	ctx := adminCtx()
+	insertTestVMWithSpec(t, ctx, s.db, "nodom", "test-host", "stopped",
+		seedSpecJSON(t, &pb.VMSpec{Name: "nodom", Cpu: 2, MemoryMib: 2048, Machine: "pc"}))
+	s.virt.(*libvirtfake.Fake).FailDumpXMLInactive = func(name string) error {
+		return errors.New(`Domain not found: no domain with matching name '` + name + `'`)
+	}
+	logs := captureSlog(t)
+	if _, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "nodom", Machine: "q35"}); err != nil {
+		t.Fatalf("UpdateVM: %v", err)
+	}
+	if strings.Contains(logs.String(), "the current definition could not be read") {
+		t.Fatalf("an absent domain was warned about:\n%s", logs.String())
+	}
+}

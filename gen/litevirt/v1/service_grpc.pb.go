@@ -78,6 +78,7 @@ const (
 	LiteVirt_UpdateVM_FullMethodName                   = "/litevirt.v1.LiteVirt/UpdateVM"
 	LiteVirt_SetVMMemory_FullMethodName                = "/litevirt.v1.LiteVirt/SetVMMemory"
 	LiteVirt_SetVMLabels_FullMethodName                = "/litevirt.v1.LiteVirt/SetVMLabels"
+	LiteVirt_PatchVMSpec_FullMethodName                = "/litevirt.v1.LiteVirt/PatchVMSpec"
 	LiteVirt_AttachDevice_FullMethodName               = "/litevirt.v1.LiteVirt/AttachDevice"
 	LiteVirt_DetachDevice_FullMethodName               = "/litevirt.v1.LiteVirt/DetachDevice"
 	LiteVirt_ResizeDisk_FullMethodName                 = "/litevirt.v1.LiteVirt/ResizeDisk"
@@ -482,6 +483,10 @@ type LiteVirtClient interface {
 	// SetVMLabels replaces a VM's labels/tags. Metadata-only (not in the domain
 	// XML), so it applies to running VMs without a redefine.
 	SetVMLabels(ctx context.Context, in *SetVMLabelsRequest, opts ...grpc.CallOption) (*VM, error)
+	// PatchVMSpec writes named fields of a desired spec onto a VM's stored
+	// spec, on the host that answers. Peer only: the owner of a VM serialises
+	// its spec edits, so a deploy entering elsewhere forwards its patch here.
+	PatchVMSpec(ctx context.Context, in *PatchVMSpecRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	AttachDevice(ctx context.Context, in *AttachDeviceRequest, opts ...grpc.CallOption) (*VM, error)
 	DetachDevice(ctx context.Context, in *DetachDeviceRequest, opts ...grpc.CallOption) (*VM, error)
 	ResizeDisk(ctx context.Context, in *ResizeDiskRequest, opts ...grpc.CallOption) (*VM, error)
@@ -1740,6 +1745,16 @@ func (c *liteVirtClient) SetVMLabels(ctx context.Context, in *SetVMLabelsRequest
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(VM)
 	err := c.cc.Invoke(ctx, LiteVirt_SetVMLabels_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) PatchVMSpec(ctx context.Context, in *PatchVMSpecRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_PatchVMSpec_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -5004,6 +5019,10 @@ type LiteVirtServer interface {
 	// SetVMLabels replaces a VM's labels/tags. Metadata-only (not in the domain
 	// XML), so it applies to running VMs without a redefine.
 	SetVMLabels(context.Context, *SetVMLabelsRequest) (*VM, error)
+	// PatchVMSpec writes named fields of a desired spec onto a VM's stored
+	// spec, on the host that answers. Peer only: the owner of a VM serialises
+	// its spec edits, so a deploy entering elsewhere forwards its patch here.
+	PatchVMSpec(context.Context, *PatchVMSpecRequest) (*emptypb.Empty, error)
 	AttachDevice(context.Context, *AttachDeviceRequest) (*VM, error)
 	DetachDevice(context.Context, *DetachDeviceRequest) (*VM, error)
 	ResizeDisk(context.Context, *ResizeDiskRequest) (*VM, error)
@@ -5816,6 +5835,9 @@ func (UnimplementedLiteVirtServer) SetVMMemory(context.Context, *SetVMMemoryRequ
 }
 func (UnimplementedLiteVirtServer) SetVMLabels(context.Context, *SetVMLabelsRequest) (*VM, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetVMLabels not implemented")
+}
+func (UnimplementedLiteVirtServer) PatchVMSpec(context.Context, *PatchVMSpecRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method PatchVMSpec not implemented")
 }
 func (UnimplementedLiteVirtServer) AttachDevice(context.Context, *AttachDeviceRequest) (*VM, error) {
 	return nil, status.Error(codes.Unimplemented, "method AttachDevice not implemented")
@@ -7678,6 +7700,24 @@ func _LiteVirt_SetVMLabels_Handler(srv interface{}, ctx context.Context, dec fun
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).SetVMLabels(ctx, req.(*SetVMLabelsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_PatchVMSpec_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PatchVMSpecRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PatchVMSpec(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PatchVMSpec_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PatchVMSpec(ctx, req.(*PatchVMSpecRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -12759,6 +12799,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetVMLabels",
 			Handler:    _LiteVirt_SetVMLabels_Handler,
+		},
+		{
+			MethodName: "PatchVMSpec",
+			Handler:    _LiteVirt_PatchVMSpec_Handler,
 		},
 		{
 			MethodName: "AttachDevice",

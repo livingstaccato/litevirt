@@ -33,6 +33,10 @@ type LibvirtBackend interface {
 	// target domain goes (spec §6.8): destroy if paused, then undefine keeping
 	// its state for the quarantine. Never a running domain.
 	DiscardFirmwareMoveTarget(name, uuid, attempt string) error
+	// ResumeFirmwareMoveTarget is the one way a held live firmware move's
+	// target guest runs (spec §6.6, I5): only with the attempt's hold in
+	// state resuming.
+	ResumeFirmwareMoveTarget(name, uuid, attempt string) error
 	DomainState(name string) (string, error)
 	// AbortMigration aborts the domain's running migration job. MigrateToTarget
 	// takes no context, so this is the only way to stop one.

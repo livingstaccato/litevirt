@@ -280,6 +280,25 @@ func isUUID(s string) bool { return uuidPattern.MatchString(s) }
 // errNotHeld: the guest is not one this host holds paused for its guards.
 var errNotHeld = errors.New("not held")
 
+// errFirmwareMoveHeld: a live firmware move holds the guest here until its
+// state verifies; only that move's release resumes it (spec §6.9, I5).
+var errFirmwareMoveHeld = errors.New("held for firmware verification")
+
+// firmwareMoveHeld is nil when no live firmware move holds vm on this host,
+// else an errFirmwareMoveHeld naming the attempt and its source. A hold that
+// cannot be read holds too.
+func (s *Server) firmwareMoveHeld(vm string) error {
+	h, ok, err := s.fwRecords().GetHold(vm)
+	switch {
+	case err != nil:
+		return fmt.Errorf("%w: its live firmware move hold on %s cannot be read, so it is not resumed: %v", errFirmwareMoveHeld, s.hostName, err)
+	case !ok:
+		return nil
+	}
+	return fmt.Errorf("%w of attempt %s from %s (hold %s); only that move's release resumes it",
+		errFirmwareMoveHeld, h.Attempt, h.Source, h.State)
+}
+
 // resumeHeld lets vm, held paused here for its guards, run: it puts its NIC
 // firewall in force (ArmNICsFor, which refuses while a guard is not), then
 // resumes the domain, then drops the record. A guest already running is
@@ -294,6 +313,9 @@ func (s *Server) resumeHeld(ctx context.Context, vm string) error {
 	}
 	if !ok {
 		return errNotHeld
+	}
+	if err := s.firmwareMoveHeld(vm); err != nil {
+		return err
 	}
 	if !s.domainOfIncarnation(vm, g) {
 		// Not the domain the move carried: never resumed by its record. Kept
@@ -434,6 +456,11 @@ func (s *Server) resumeHeldGuest(ctx context.Context, g heldGuest) string {
 		return ""
 	}
 	if err := s.resumeHeld(ctx, g.VM); err != nil && !errors.Is(err, errNotHeld) {
+		if errors.Is(err, errFirmwareMoveHeld) {
+			// Its guards are not what holds it: the record stays for the
+			// move's release to drop.
+			return fmt.Sprintf("%s (since %s: %v)", g.VM, g.Since, err)
+		}
 		return held(err.Error())
 	}
 	return ""
@@ -477,6 +504,10 @@ func (s *Server) ResumeHeldVM(ctx context.Context, req *pb.ResumeHeldVMRequest) 
 		}
 		defer conn.Close()
 		return client.ResumeHeldVM(ctx, req)
+	}
+	if err := s.firmwareMoveHeld(vm.Name); err != nil {
+		s.audit(ctx, "vm.resume-held", vm.Name, "error: "+err.Error(), "error")
+		return nil, status.Errorf(codes.FailedPrecondition, "%s stays paused: %v", vm.Name, err)
 	}
 	err = s.resumeHeld(ctx, vm.Name)
 	switch {

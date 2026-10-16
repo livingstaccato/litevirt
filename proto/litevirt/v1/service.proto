@@ -1052,6 +1052,11 @@ message ApplyLBRequest {
     // VIP goes on that stack's network when the LB's row has not replicated
     // here yet.
     string stack_name = 9;
+    // A stack LB's health check and sticky sessions, which a forwarded apply
+    // serves as the coordinator's own apply does (TLS and redirects travel in
+    // ports). Absent — a caller on an earlier build — none, as before.
+    LBHealthSpec health          = 10;
+    bool         sticky_sessions = 11;
 }
 
 // RemoveLBRequest tells a host to tear down a local LB instance.
@@ -1067,6 +1072,9 @@ message CreateLBRequest {
     repeated string             hosts        = 5;  // hosts to run HAProxy+keepalived on
     repeated LBBackendAddress   backends     = 6;  // explicit backend addresses
     repeated string             vm_backends  = 7;  // VM names to resolve to IPs
+    // snat: rewrite the guest egress of the host-isolated network the VIP is
+    // placed on to the VIP (compose `snat:`). Default false: no outbound NAT.
+    bool                        snat         = 8;
 }
 
 message UpdateLBRequest {
@@ -1079,6 +1087,9 @@ message UpdateLBRequest {
     repeated string             remove_backends   = 7;  // by name
     repeated string             add_vm_backends   = 8;
     repeated string             remove_vm_backends = 9;
+    // snat: set the explicit LB's outbound NAT (CreateLBRequest.snat).
+    // Absent = no change. A stack LB's comes from its compose file.
+    optional bool               snat              = 10;
 }
 
 message DeleteLBRequest {
@@ -2357,6 +2368,21 @@ message AbortVMOperationResponse {
     bool   aborted               = 1;
     string previous_operation_id = 2;
     string detail                = 3;
+}
+
+// ReleaseHostReservation releases a host capacity reservation whose operation
+// is no longer running (admin; see docs/diagnostics.md, "Host reservations").
+message ReleaseHostReservationRequest {
+    string operation_id = 1;
+    bool   force        = 2; // required — a release is never implicit
+}
+message ReleaseHostReservationResponse {
+    bool   released   = 1; // false with detail "already released" is idempotent success
+    string host       = 2; // the target host that released it
+    string vm         = 3; // empty when the caller may not vm.read it
+    int32  vcpu       = 4;
+    int32  memory_mib = 5;
+    string detail     = 6;
 }
 
 // Live restore from backup. The handler:
@@ -4526,6 +4552,7 @@ service LiteVirt {
     rpc NormalizeRoleBindings(NormalizeRoleBindingsRequest) returns (NormalizeRoleBindingsResponse);
     rpc GetVMOperation(GetVMOperationRequest) returns (GetVMOperationResponse);
     rpc AbortVMOperation(AbortVMOperationRequest) returns (AbortVMOperationResponse);
+    rpc ReleaseHostReservation(ReleaseHostReservationRequest) returns (ReleaseHostReservationResponse);
     rpc BeginWebAuthnRegistration(BeginWebAuthnRegistrationRequest)   returns (BeginWebAuthnRegistrationResponse);
     rpc FinishWebAuthnRegistration(FinishWebAuthnRegistrationRequest) returns (FinishWebAuthnRegistrationResponse);
     rpc BeginWebAuthnLogin(BeginWebAuthnLoginRequest)                 returns (BeginWebAuthnLoginResponse);

@@ -197,40 +197,7 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 		}
 	}
 
-	if vm.LoadBalancer != nil && vm.LoadBalancer.Enabled {
-		lbSpec := &pb.LBSpec{
-			Enabled:        true,
-			Vip:            vm.LoadBalancer.VIP,
-			Algorithm:      vm.LoadBalancer.Algorithm,
-			StickySessions: vm.LoadBalancer.Sticky,
-			Hosts:          vm.LoadBalancer.Hosts,
-			Snat:           vm.LoadBalancer.SNAT,
-		}
-		for _, p := range vm.LoadBalancer.Ports {
-			pbPort := &pb.LBPort{
-				Listen:        int32(p.Listen),
-				Target:        int32(p.Target),
-				Protocol:      p.Protocol,
-				RedirectHttps: p.RedirectHTTPS,
-			}
-			if p.TLS != nil {
-				pbPort.Tls = &pb.LBTlsSpec{
-					Cert: p.TLS.Cert,
-					Key:  p.TLS.Key,
-				}
-			}
-			lbSpec.Ports = append(lbSpec.Ports, pbPort)
-		}
-		if vm.LoadBalancer.Health != nil {
-			lbSpec.Health = &pb.LBHealthSpec{
-				UseVmHealthcheck: vm.LoadBalancer.Health.UseVMHealthcheck,
-				Type:             vm.LoadBalancer.Health.Type,
-				Path:             vm.LoadBalancer.Health.Path,
-				Interval:         fmt.Sprintf("%dms", vm.LoadBalancer.Health.IntervalMS),
-			}
-		}
-		spec.Loadbalancer = lbSpec
-	}
+	spec.Loadbalancer = BuildLBSpec(vm.LoadBalancer)
 
 	if vm.HealthCheck != nil {
 		spec.Healthcheck = &pb.HealthCheckSpec{
@@ -363,6 +330,48 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 
 	_ = baseName
 	return spec, nil
+}
+
+// BuildLBSpec converts a compose load balancer definition into its wire form,
+// or nil when the definition is absent or not enabled. It is the one
+// conversion: a VM's spec and a stack deploy's LB step both take their LB
+// from here, so neither applies an LB missing something the file asked for.
+func BuildLBSpec(def *LBDef) *pb.LBSpec {
+	if def == nil || !def.Enabled {
+		return nil
+	}
+	lbSpec := &pb.LBSpec{
+		Enabled:        true,
+		Vip:            def.VIP,
+		Algorithm:      def.Algorithm,
+		StickySessions: def.Sticky,
+		Hosts:          def.Hosts,
+		Snat:           def.SNAT,
+	}
+	for _, p := range def.Ports {
+		pbPort := &pb.LBPort{
+			Listen:        int32(p.Listen),
+			Target:        int32(p.Target),
+			Protocol:      p.Protocol,
+			RedirectHttps: p.RedirectHTTPS,
+		}
+		if p.TLS != nil {
+			pbPort.Tls = &pb.LBTlsSpec{
+				Cert: p.TLS.Cert,
+				Key:  p.TLS.Key,
+			}
+		}
+		lbSpec.Ports = append(lbSpec.Ports, pbPort)
+	}
+	if def.Health != nil {
+		lbSpec.Health = &pb.LBHealthSpec{
+			UseVmHealthcheck: def.Health.UseVMHealthcheck,
+			Type:             def.Health.Type,
+			Path:             def.Health.Path,
+			Interval:         fmt.Sprintf("%dms", def.Health.IntervalMS),
+		}
+	}
+	return lbSpec
 }
 
 // parseDurationSeconds converts a human-friendly duration string like "30s", "2m", "1h"

@@ -574,6 +574,10 @@ func fwdBearerFromCtx(ctx context.Context) string {
 	return ""
 }
 
+// forwardedIdentityNotVisible is the retryable refusal of a forwarded bearer
+// whose session or user has not replicated to this owner yet.
+const forwardedIdentityNotVisible = "forwarded identity not yet visible on owner; retry"
+
 // authenticateForwardedBearer resolves a forwarded user bearer (relayed by a
 // trusted peer) into the real user identity, so the owner runs RBAC + audit as
 // that user rather than the peer=admin trusted-forward. Fail-closed with
@@ -599,7 +603,7 @@ func (s *Server) authenticateForwardedBearer(ctx context.Context, val string) (c
 		}
 		if sess == nil {
 			// Session not (yet) replicated to this owner — the lag case. Retryable.
-			return nil, status.Error(codes.Unavailable, "forwarded identity not yet visible on owner; retry")
+			return nil, status.Error(codes.Unavailable, forwardedIdentityNotVisible)
 		}
 		if sess.RevokedAt != "" {
 			return nil, status.Error(codes.Unauthenticated, "forwarded session revoked")
@@ -619,7 +623,7 @@ func (s *Server) authenticateForwardedBearer(ctx context.Context, val string) (c
 			// User row not yet replicated → retryable, not a hard denial. Do NOT
 			// TouchSession here — the entry node owns last_used_at; touching from
 			// the owner would churn the row across nodes.
-			return nil, status.Error(codes.Unavailable, "forwarded identity not yet visible on owner; retry")
+			return nil, status.Error(codes.Unavailable, forwardedIdentityNotVisible)
 		}
 		if user.Username != sess.Username {
 			return nil, status.Error(codes.Unauthenticated, "forwarded session belongs to an account that no longer exists")

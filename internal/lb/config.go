@@ -36,12 +36,53 @@ type Config struct {
 	Ports     []Port
 	Algorithm string        // roundrobin | leastconn | source
 	Health    *HealthConfig // backend health check (nil = default tcp-check)
+	Sticky    bool          // keep a client on one backend by its source address
 
 	// SNAT fields — set when LB provides outbound NAT for host-isolated VMs.
 	SNATEnabled bool   // enable SNAT + conntrackd
 	LocalIP     string // this host's IP for conntrackd sync
 	PeerIP      string // VRRP peer IP for conntrackd sync
 	Subnet      string // VM subnet CIDR for SNAT rule (e.g. "10.100.0.0/24")
+	// SyncInterface is the device holding LocalIP, which conntrackd syncs
+	// over. Empty: Interface.
+	SyncInterface string
+	// KeepSNAT leaves this LB's SNAT side as the last apply that set it left
+	// it: conntrackd and its files untouched, and keepalived's notify hooks
+	// rendered exactly when the notify script is there. For an apply that
+	// does not know the LB's snat (a peer on an earlier build).
+	KeepSNAT bool
+
+	// ConfigDir is the directory the manager writes this LB's files to, which
+	// the rendered configs name (TLS PEMs, the notify script, conntrackd's
+	// config). Empty: DefaultConfigDir.
+	ConfigDir  string
+	RunDir     string
+	LockDir    string
+	ControlDir string
+}
+
+// DefaultConfigDir is where the manager writes LB configs in production.
+const DefaultConfigDir = "/etc/litevirt/lb"
+
+// withDefaults returns cfg ready to render, or an error when it may not be
+// rendered at all (checkRender).
+func withDefaults(cfg Config) (Config, error) {
+	if cfg.ConfigDir == "" {
+		cfg.ConfigDir = DefaultConfigDir
+	}
+	if cfg.RunDir == "" {
+		cfg.RunDir = "/run/litevirt/lb"
+	}
+	if cfg.LockDir == "" {
+		cfg.LockDir = "/var/lock"
+	}
+	if cfg.ControlDir == "" {
+		cfg.ControlDir = "/var/run"
+	}
+	if err := checkRender(cfg); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
 }
 
 // HealthConfig configures HAProxy backend health checking.
@@ -64,6 +105,9 @@ type Port struct {
 	Target   int    // backend port
 	Protocol string // tcp | http
 	TLS      *TLSConfig
+	// RedirectHTTPS answers every request on this listener with a redirect
+	// to https. Ignored on a TLS listener.
+	RedirectHTTPS bool
 }
 
 // TLSConfig holds cert/key paths for TLS termination.
@@ -79,7 +123,7 @@ global
     user haproxy
     group haproxy
     daemon
-    stats socket /run/litevirt/lb/{{.Name}}-haproxy.sock mode 660 level admin
+    stats socket {{.RunDir}}/{{.Name}}-haproxy.sock mode 660 level admin
     stats timeout 30s
 
 defaults
@@ -94,14 +138,23 @@ defaults
 {{- range .Ports}}
 frontend {{$.Name}}-{{.Listen}}
     {{- if .TLS}}
-    bind {{$.VIP}}:{{.Listen}} ssl crt /etc/litevirt/lb/{{$.Name}}-{{.Listen}}.pem
+    bind {{$.VIP}}:{{.Listen}} ssl crt {{$.ConfigDir}}/{{$.Name}}-{{.Listen}}.pem
     {{- else}}
     bind {{$.VIP}}:{{.Listen}}
     {{- end}}
+    {{- if and .RedirectHTTPS (not .TLS)}}
+    mode http
+    http-request redirect scheme https code 301
+    {{- else}}
     default_backend {{$.Name}}-{{.Listen}}-be
+    {{- end}}
 
 backend {{$.Name}}-{{.Listen}}-be
     balance {{$.Algorithm}}
+    {{- if $.Sticky}}
+    stick-table type ip size 100k expire 30m
+    stick on src
+    {{- end}}
     {{- if and $.Health (eq $.Health.Type "http")}}
     option httpchk GET {{or $.Health.Path "/"}}
     http-check expect status 200
@@ -149,15 +202,19 @@ vrrp_instance {{.Name}} {
     }
 {{- if .SNATEnabled}}
 
-    notify_master "/etc/litevirt/lb/{{.Name}}-notify.sh MASTER"
-    notify_backup "/etc/litevirt/lb/{{.Name}}-notify.sh BACKUP"
-    notify_fault  "/etc/litevirt/lb/{{.Name}}-notify.sh FAULT"
+    notify_master "{{.ConfigDir}}/{{.Name}}-notify.sh MASTER"
+    notify_backup "{{.ConfigDir}}/{{.Name}}-notify.sh BACKUP"
+    notify_fault  "{{.ConfigDir}}/{{.Name}}-notify.sh FAULT"
 {{- end}}
 }
 `))
 
 // RenderHAProxy produces an haproxy.cfg content string.
 func RenderHAProxy(cfg Config) (string, error) {
+	cfg, err := withDefaults(cfg)
+	if err != nil {
+		return "", err
+	}
 	if cfg.Algorithm == "" {
 		cfg.Algorithm = "roundrobin"
 	}
@@ -190,6 +247,10 @@ func RenderHAProxy(cfg Config) (string, error) {
 // multiple VIPs per instance, parseKeepalivedVIP + DemoteAll must be revisited to
 // enumerate all of them (today "one LB ⇒ one VIP" makes single-address parsing exact).
 func RenderKeepalived(cfg Config) (string, error) {
+	cfg, err := withDefaults(cfg)
+	if err != nil {
+		return "", err
+	}
 	var buf bytes.Buffer
 	// Augment cfg with a derived, per-LB VRRP auth password (F6).
 	data := struct {
@@ -204,6 +265,10 @@ func RenderKeepalived(cfg Config) (string, error) {
 
 // RenderConntrackd produces a conntrackd.conf for SNAT conntrack sync between VRRP peers.
 func RenderConntrackd(cfg Config) (string, error) {
+	cfg, err := withDefaults(cfg)
+	if err != nil {
+		return "", err
+	}
 	if cfg.LocalIP == "" || cfg.PeerIP == "" {
 		return "", fmt.Errorf("conntrackd requires LocalIP and PeerIP")
 	}
@@ -216,6 +281,10 @@ func RenderConntrackd(cfg Config) (string, error) {
 
 // RenderNotifyScript produces the keepalived notify script for conntrackd state transitions.
 func RenderNotifyScript(cfg Config) (string, error) {
+	cfg, err := withDefaults(cfg)
+	if err != nil {
+		return "", err
+	}
 	var buf bytes.Buffer
 	if err := notifyTmpl.Execute(&buf, cfg); err != nil {
 		return "", fmt.Errorf("render notify script: %w", err)
@@ -229,7 +298,7 @@ var conntrackdTmpl = template.Must(template.New("conntrackd").Parse(`Sync {
         IPv4_address {{.LocalIP}}
         IPv4_Destination_Address {{.PeerIP}}
         Port 3780
-        Interface {{.Interface}}
+        Interface {{or .SyncInterface .Interface}}
     }
 }
 
@@ -238,8 +307,8 @@ General {
     HashSize 32768
     HashLimit 131072
     Syslog on
-    LockFile /var/lock/conntrack-{{.Name}}.lock
-    UNIX { Path /var/run/conntrackd-{{.Name}}.ctl }
+    LockFile {{.LockDir}}/conntrack-{{.Name}}.lock
+    UNIX { Path {{.ControlDir}}/conntrackd-{{.Name}}.ctl }
     NetlinkBufferSize 2097152
     NetlinkBufferSizeMaxGrowth 8388608
     Filter From Userspace {
@@ -249,15 +318,23 @@ General {
 }
 `))
 
+// notifyTmpl drives this LB's conntrackd on a VRRP transition. conntrackd's
+// -C names its CONFIG file, which says where its control socket is.
 var notifyTmpl = template.Must(template.New("notify").Parse(`#!/bin/bash
-CTL="/var/run/conntrackd-{{.Name}}.ctl"
+CONF="{{.ConfigDir}}/{{.Name}}-conntrackd.conf"
 case "$1" in
     MASTER)
-        conntrackd -C "$CTL" -c -C commit
-        conntrackd -C "$CTL" -c -f internal
+        conntrackd -C "$CONF" -c
+        conntrackd -C "$CONF" -f
+        conntrackd -C "$CONF" -R
+        conntrackd -C "$CONF" -B
         ;;
-    BACKUP|FAULT)
-        conntrackd -C "$CTL" -c -f external
+    BACKUP)
+        conntrackd -C "$CONF" -t
+        conntrackd -C "$CONF" -n
+        ;;
+    FAULT)
+        conntrackd -C "$CONF" -t
         ;;
 esac
 `))

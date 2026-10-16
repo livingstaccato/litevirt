@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/compose"
-	"github.com/litevirt/litevirt/internal/lb"
 	"github.com/litevirt/litevirt/internal/network"
 )
 
@@ -77,7 +76,7 @@ func (s *Server) lbVIPInterface(ctx context.Context, lbName, stack, vip string) 
 		matches = append(matches, match{n: n, bits: n.prefix.Bits(), ownStack: stack != "" && n.stack == stack})
 	}
 	if len(matches) == 0 {
-		return lbPlacement{iface: lb.DetectInterfaceForIP(vip)}, nil
+		return lbPlacement{iface: s.lbInterfaceForIP(vip)}, nil
 	}
 	sort.SliceStable(matches, func(i, j int) bool {
 		if matches[i].ownStack != matches[j].ownStack {

@@ -780,21 +780,23 @@ func (s *Server) notifyVTEPPeers(ctx context.Context, networkName string, vni in
 		if v.HostName == s.hostName {
 			continue
 		}
-		go func(host string) {
-			// The handler returns before this runs, and gRPC cancels its
-			// context the moment it does. See detachedFanout.
-			fctx, cancel := detachedFanout(ctx)
-			defer cancel()
-			client, conn, err := s.peerClient(fctx, host)
-			if err != nil {
-				return
-			}
-			defer conn.Close()
-			client.SyncVTEP(fctx, &pb.SyncVTEPRequest{
-				NetworkName: networkName,
-				VtepIp:      localVTEP,
-				Vni:         int32(vni),
-			})
-		}(v.HostName)
+		s.startNetworkWork(func() {
+			func(host string) {
+				// The handler returns before this runs, and gRPC cancels its
+				// context the moment it does. See detachedFanout.
+				fctx, cancel := detachedFanout(ctx)
+				defer cancel()
+				client, conn, err := s.peerClient(fctx, host)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				client.SyncVTEP(fctx, &pb.SyncVTEPRequest{
+					NetworkName: networkName,
+					VtepIp:      localVTEP,
+					Vni:         int32(vni),
+				})
+			}(v.HostName)
+		})
 	}
 }

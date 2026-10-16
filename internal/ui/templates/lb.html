@@ -8,7 +8,7 @@
   <div class="section-header"><h2>Active LBs ({{len .LBs}})</h2></div>
   <table>
     <thead><tr>
-      <th>Name</th><th>VIP</th><th>Algorithm</th><th>Stack</th><th>Backends</th><th>State</th><th></th>
+      <th>Name</th><th>VIP</th><th>Algorithm</th><th>Stack</th><th>Backends</th><th>State</th><th>SNAT</th><th></th>
     </tr></thead>
     <tbody>
     {{range .LBs}}
@@ -19,6 +19,7 @@
       <td>{{if .StackName}}<a href="/stacks/{{.StackName}}">{{.StackName}}</a>{{else}}<span style="color:var(--muted)">standalone</span>{{end}}</td>
       <td>{{len .Backends}}</td>
       <td>{{if eq .State "active"}}<span class="badge badge-green">active</span>{{else}}<span class="badge badge-yellow">{{.State}}</span>{{end}}</td>
+      <td>{{snatLabel .}}</td>
       <td>
         <button class="btn btn-sm btn-danger" hx-post="/lb/{{.Name}}/delete"
                 hx-confirm="Delete load balancer {{.Name}}? This stops HAProxy + Keepalived on all hosts.">Delete</button>

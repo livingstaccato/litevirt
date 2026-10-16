@@ -812,7 +812,7 @@ Defining a `loadbalancer` section automatically provisions HAProxy + keepalived 
 designated hosts. The VIP floats between hosts using VRRP (keepalived), and HAProxy
 handles traffic distribution to backend VMs.
 
-Standalone load balancers (not tied to a stack) can also be created with `lv lb create`.
+Standalone load balancers (not tied to a stack) can also be created with `lv lb create`. Its `--snat` flag is this section's `snat:`, off unless given (see [SNAT via VIP](#snat-via-vip)).
 
 ```yaml
     loadbalancer:
@@ -829,19 +829,30 @@ Standalone load balancers (not tied to a stack) can also be created with `lv lb 
         - listen: 80                    # VIP listener port
           target: 8080                  # Backend VM port
           protocol: "tcp"               # tcp | http
-          redirect-https: false         # Redirect HTTP to HTTPS
+          redirect-https: false         # Redirect HTTP to HTTPS (see below)
         - listen: 443
           target: 8443
           protocol: "tcp"
-          tls:                          # TLS termination (optional)
-            cert: "/path/to/cert.pem"
-            key: "/path/to/key.pem"
+          tls:                          # TLS termination (optional; see below)
+            cert: "/etc/litevirt/lb-certs/web.crt"
+            key: "/etc/litevirt/lb-certs/web.key"
       health:
         use-vm-healthcheck: true        # Reuse VM healthcheck for backend health
         type: "http"                    # tcp | http
         path: "/health"                 # HTTP health check path
         interval-ms: 2000               # Check interval in milliseconds
 ```
+
+A stack has one load balancer. Copies of one definition, from a base the VMs `extends` or a YAML anchor, are that one load balancer; two different definitions are refused. The stack's `name` must use only letters, digits, `_`, `.` and `-`.
+
+Values are checked before anything is deployed:
+
+- `algorithm` is `roundrobin`, `leastconn` or `source`.
+- `protocol` and `health.type` are `tcp` or `http`.
+- `health.path` is one absolute path of visible ASCII, without spaces, quotes, `#`, `\` or braces, at most 512 characters.
+- `redirect-https` needs `protocol: http`, no `tls` on the same port, and a `tls` port on the same load balancer to redirect to. A spec stored before this check with any other redirect is served without that redirect, and a `lb.redirect_ignored` event says so.
+
+**TLS files** are read as root on every LB host, from `/etc/litevirt/lb-certs/`. Naming a file anywhere else needs the admin role. A symlink is followed (Let's Encrypt's `live/` names work, for example a symlink in `/etc/litevirt/lb-certs/` to them), and every check applies to the file it reaches: a regular file of at most 1 MiB, never under the PKI directory, the data directory or `/etc/litevirt/lb`. A path in `/etc/litevirt/lb-certs/` is read only while that directory, and every directory below it on the way to the file, is a real directory owned by root and writable by no one else. A file that is not a regular file is refused without being opened for reading, including one swapped in after the path was checked. An LB stored before this rule with files elsewhere keeps working, and each apply raises a `lb.tls_outside_cert_dir` event that names the file.
 
 **Where the VIP goes**: a VIP inside a network's subnet is put on that network's
 bridge on each LB host (a stack LB considers only its own stack's networks and
@@ -911,12 +922,13 @@ How it works:
 Requirements:
 
 - `snat:` applies on every LB host; with it unset or `false`, no LB host rewrites the network's egress
+- A load balancer made with `lv lb create` SNATs only with `--snat`, and `lv lb update <name> --snat` or `--snat=false` changes it later; `lv lb inspect` shows the setting and `lv lb ls`, inspect and the web UI show it as on, off, or unknown when the daemon could not read it (the LB may be SNATting). The web UI's create form has a "SNAT (outbound NAT via the VIP)" checkbox, unticked by default. One created before this setting existed keeps SNATting until it is set. Until every host runs a release with this setting (`failover_scope_v1` latched, as `lv cluster upgrade-status` shows), `lv lb create` without `--snat` is refused, `lv lb create --snat` works, and `lv lb update --snat` is refused. An LB host on an earlier build SNATs for every load balancer it serves, so during a rolling upgrade inspect shows the setting, not what each LB host applied. A host rolled back below this release does the same ([upgrades.md](upgrades.md#manual-rollback-anytime))
 - The VIP must be routable from the upstream network
 - IP forwarding is enabled automatically
 - The network's bridge carries the VMs' gateway (see [Host isolation](#host-isolation)): a `vxlan` network, or a `bridge` network on a bridge litevirt created, with no `vlan`
 - It does not apply to an `isolated` network: nothing is routed off its bridge
 
-**Conntrackd for failover**: When `snat: true` is set, litevirt automatically runs `conntrackd` alongside keepalived to replicate conntrack state between VRRP peers. On failover, the new MASTER imports synced entries so existing SNAT'd connections survive. This is managed automatically — no additional configuration is needed.
+**Conntrackd for failover**: When `snat: true` is set and the LB has two or more `hosts`, litevirt automatically runs `conntrackd` alongside keepalived to replicate conntrack state between VRRP peers, over the hosts' recorded addresses. Each LB host syncs with the first other host in `hosts`. On failover, the new MASTER imports synced entries so existing SNAT'd connections survive. This is managed automatically — no additional configuration is needed.
 
 ## Health checks
 
@@ -1298,7 +1310,7 @@ This follows the cloud provider model (AWS, DigitalOcean, GCP): the hypervisor i
 - **Static IPs via cloud-init** — IPAM still allocates IPs, but they are delivered via cloud-init network-config (MAC-matched, distro-agnostic: works on Ubuntu, CentOS, Debian, Arch, Alpine). A VM NIC that names no `ip:` is given a free address in the network's IPv4 subnet; never the gateway, a `reserved-addresses` entry, a live load balancer's VIP, or a VIP named by the VM's own `loadbalancer:` or by a VM of its stack created before it. A VIP named by a VM of the stack that is created later is not known yet: list it in `reserved-addresses`. The address is recorded on the NIC (`lv inspect`). Each host starts its search at a different point of the subnet. Two VMs created on two hosts at the same instant can still be given the same address; each host then records a `network.duplicate_address` event on its VMs that hold it (`lv events`). Name `ip:` explicitly where that matters. A network without a subnet, or with an IPv6 one, gives no address: name one with `ip:`.
 - **DNS from config** — resolvers come from the `dns` field (defaults to `["1.1.1.1", "8.8.8.8"]`).
 - **Gateway stays** — the host keeps the subnet's first address on the bridge as the VMs' gateway, for routing (FORWARD): always on a `vxlan` network (its IRB anycast gateway), and on a `bridge` network when litevirt created the bridge on that host and the network has no `vlan`. A bridge litevirt did not create, a VLAN bridge, and a host-isolated `isolated` network get no gateway address; so does a bridge an earlier build created (litevirt keeps no record of it), until the bridge is created again, for example at a reboot. Either way no host *services* are reachable (INPUT is dropped), the gateway address included. Forwarding through the gateway to the host's other networks is not blocked: host isolation keeps guests off the host, not off other networks.
-- **No implicit NAT** — outbound internet access requires explicit `snat: true` on a load balancer (see below).
+- **No implicit NAT** — outbound internet access requires explicit `snat: true` on a load balancer, or `--snat` on one made with `lv lb create` (see below; one made before that flag existed SNATs until it is set).
 
 Under the hood, litevirt creates a per-bridge nftables chain on the `input` hook that drops all traffic from the bridge interface. VM-to-VM traffic uses the `forward` hook and is unaffected. VXLAN underlay (UDP 4789) arrives on the physical NIC, not the bridge, so it is also unaffected.
 

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -71,6 +73,13 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// is pulled, provisioned or registered.
 	if err := s.authorizeComposeHostPaths(ctx, f); err != nil {
 		return err
+	}
+	// An LB's TLS files are read as root on every LB host: outside
+	// lb.CertDir, naming one needs the admin role (requireAdminForLBTLS).
+	for _, name := range slices.Sorted(maps.Keys(f.VMs)) {
+		if err := requireAdminForLBTLS(ctx, compose.BuildLBSpec(f.VMs[name].LoadBalancer)); err != nil {
+			return err
+		}
 	}
 
 	// Auto-pull images defined in the compose images: section that are missing locally.
@@ -975,36 +984,21 @@ func (s *Server) applyLBActions(ctx context.Context, f *compose.File, plan *plan
 			Detail: fmt.Sprintf("applying %s", la.Detail),
 		})
 
-		// Build a stub VMSpec with LB config for the existing apply logic.
+		// The LB's spec comes from its compose definition through the same
+		// conversion a VM's spec uses, so the apply carries everything the
+		// file asked for (sticky sessions, health, TLS, redirects, snat), not
+		// a subset that each deploy would re-apply over the LB.
 		// applyLBFromSpecWithRetry reads spec.Loadbalancer and spec.StackName.
-		for _, vmDef := range f.VMs {
-			if vmDef.LoadBalancer == nil || !vmDef.LoadBalancer.Enabled {
-				continue
-			}
-			var ports []*pb.LBPort
-			for _, p := range la.Ports {
-				ports = append(ports, &pb.LBPort{
-					Listen:   int32(p.Listen),
-					Target:   int32(p.Target),
-					Protocol: p.Protocol,
-				})
-			}
-			stubSpec := &pb.VMSpec{
-				StackName: f.Name,
-				Loadbalancer: &pb.LBSpec{
-					Enabled:   true,
-					Vip:       la.VIP,
-					Algorithm: la.Algorithm,
-					Ports:     ports,
-					Hosts:     la.TargetHosts,
-					// The file's `snat:`: without it the stack LB recorded no
-					// SNAT intent on its network's bridge (lab 1 LBAndSNAT).
-					Snat: vmDef.LoadBalancer.SNAT,
-				},
-			}
-			s.applyLBFromSpecWithRetry(ctx, stubSpec)
-			break
+		vmDef, ok := f.VMs[la.VMName]
+		if !ok {
+			continue
 		}
+		lbSpec := compose.BuildLBSpec(vmDef.LoadBalancer)
+		if lbSpec == nil {
+			continue
+		}
+		lbSpec.Hosts = la.TargetHosts
+		s.applyLBFromSpecWithRetry(ctx, &pb.VMSpec{StackName: f.Name, Loadbalancer: lbSpec})
 	}
 }
 

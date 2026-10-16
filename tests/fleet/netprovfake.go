@@ -22,13 +22,14 @@ import (
 // returns — so a NIC that lands on it lands where production would put it.
 // Mirrors n.Virt / n.CT / n.HostNet.
 type NetProvFake struct {
-	mu           sync.Mutex
-	up           map[string]string // network → device, while provisioned
-	provisions   map[string]int    // network → Provision calls
-	deprovisions map[string]int    // network → Deprovision calls
-	flat         map[string]bool   // bridges EnsureBridge created (flat-bridge fallback)
-	busy         map[string]bool   // flat bridges a scenario says have a port attached
-	guestPorts   map[string][]string
+	mu                   sync.Mutex
+	lbRoutes, lbForwards int
+	up                   map[string]string // network → device, while provisioned
+	provisions           map[string]int    // network → Provision calls
+	deprovisions         map[string]int    // network → Deprovision calls
+	flat                 map[string]bool   // bridges EnsureBridge created (flat-bridge fallback)
+	busy                 map[string]bool   // flat bridges a scenario says have a port attached
+	guestPorts           map[string][]string
 	// devSubnets is the subnet each device set up here serves (its gateway
 	// address and dnsmasq), keyed by DEVICE: a network re-provisioned on
 	// another device leaves the old one serving until something tears it

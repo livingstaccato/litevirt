@@ -28,6 +28,12 @@ func PrintHostInspect(ctx context.Context, c pb.LiteVirtClient, name string) err
 	if n := hostUpdatesNote(name, host.GetLabels()); n != "" {
 		fmt.Fprintln(os.Stderr, n)
 	}
+	if n := hostReservationsNote(host); n != "" {
+		fmt.Fprintln(os.Stderr, n)
+	}
+	if n := hostStaleReservationsNote(host); n != "" {
+		fmt.Fprintln(os.Stderr, n)
+	}
 	// Ops-visibility hint (stderr — leaves the JSON on stdout intact): a host whose
 	// fence strategy can't PROVE a power-off (anything but IPMI or Redfish) gives its shared-disk
 	// VMs manual-confirm-only automated failover once shared-storage fencing is

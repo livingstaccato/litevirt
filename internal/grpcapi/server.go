@@ -539,7 +539,16 @@ type Server struct {
 	// lbApplyOverride is a test seam for LB provisioning: when non-nil it
 	// replaces the real haproxy/keepalived Apply (unit tests have no root / no
 	// haproxy). Production leaves it nil so apply failures surface + roll back.
-	lbApplyOverride func(context.Context, lb.Config) error
+	lbApplyOverride       func(context.Context, lb.Config) error
+	lbNetworkEffects      LBNetworkEffects
+	networkWorkMu         sync.Mutex
+	networkWorkCount      int
+	networkWorkIdle       chan struct{}
+	networkWorkGeneration uint64
+
+	// lbListSNATOverride is a test seam for the snat lookup ListLoadBalancers
+	// makes per LB. Nil in production.
+	lbListSNATOverride func(ctx context.Context, name, stackName, generation string) (bool, error)
 
 	// netProvisioner is the host network provisioner seam (see
 	// NetworkProvisioner). Production leaves it nil: package network directly.
@@ -727,6 +736,14 @@ type Server struct {
 	dualRunMetrics   *metrics.DualRunMetrics
 	smartMetrics     *metrics.SMARTMetrics
 	smartRunner      smart.Runner // test seam; nil = real smartctl
+
+	// reservationMetrics and resSweep belong to the reservation sweep
+	// (reservation_recovery.go).
+	reservationMetrics *metrics.ReservationMetrics
+	resSweep           reservationSweepState
+	// resRelease belongs to the manual reservation release
+	// (reservation_release_admin.go).
+	resRelease reservationReleaseState
 
 	// gatherRuntimeOverride is a test seam for the dual-run detector's per-host runtime
 	// gather (self-local + peer GetRuntimeInventory): when non-nil it replaces the real probes,

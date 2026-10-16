@@ -17,6 +17,10 @@
     <div class="card-value card-value-sm">{{.LB.Algorithm}}</div>
   </div>
   <div class="card">
+    <div class="card-title">SNAT</div>
+    <div class="card-value card-value-sm">{{snatLabel .LB}}</div>
+  </div>
+  <div class="card">
     <div class="card-title">Hosts</div>
     <div class="card-value card-value-sm">{{range $i, $h := .LB.LbHosts}}{{if $i}}, {{end}}{{$h}}{{end}}</div>
   </div>

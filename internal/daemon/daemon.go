@@ -1232,6 +1232,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
 	svc.SetDualRunMetrics(metrics.NewDualRunMetrics())
 	svc.SetSMARTMetrics(metrics.NewSMARTMetrics())
+	svc.SetReservationMetrics(metrics.NewReservationMetrics())
 	svc.SetStoragePoolsByName(d.storagePoolRefs())
 	// The ceph pools' libvirt secrets (ephemeral: gone after a libvirtd
 	// restart): defined now, then kept in line with the pools and keyrings.
@@ -1356,6 +1357,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// retries stragglers.
 	svc.RecoverResourceOperations(ctx)
 	go svc.RunResourceOperationRecovery(ctx)
+
+	// Release host reservations whose operation provably stopped running (one
+	// finished past its header's owner epoch, or whose VM is gone), after the
+	// recovery above has finished what it could.
+	svc.SweepReservationsOnce(ctx)
+	go svc.RunReservationRecovery(ctx)
 
 	// F1 hardware-operation recovery: resume any locally-owned VM wedged on a
 	// nonterminal device_attach/device_detach operation (a hot-plug that crashed
@@ -1635,6 +1642,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// The runtime-inventory collector reads owner-epoch markers from the same
 	// root the container checker converges them into.
 	svc.SetContainersRoot(filepath.Join(d.cfg.DataDir, "containers"))
+	// An LB's TLS files are read as root; never from litevirt's own keys.
+	lb.SetProtectedDirs(d.cfg.PKIDir, d.cfg.DataDir)
 
 	// Advertise the host's capabilities as labels so placement puts a workload
 	// only on a host that can run it:

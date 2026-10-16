@@ -240,19 +240,21 @@ type Cluster struct {
 // Node wraps one daemon — its DB, gRPC server, replicator, and
 // addressing info.
 type Node struct {
-	Name     string
-	Region   string
-	Address  string // 127.0.0.1
-	Port     int    // ephemeral, allocated by net.Listen(":0")
-	PKIDir   string
-	DB       *corrosion.Client
-	Server   *grpcapi.Server
-	Virt     *libvirtfake.Fake // in-process libvirt fake; scenarios assert on its Events
-	CT       *CTFake           // in-process container runtime; real on-disk rootfs + tar export/import
-	HostNet  *HostNetFake      // in-memory netplan System for the host-network apply protocol
-	Net      *NetProvFake      // per-node network provisioner: what this node set up, on which device
-	GRPCSrv  *grpc.Server
-	Listener net.Listener
+	// seededGossipAbsent models departure without replacing a live Members callback.
+	seededGossipAbsent atomic.Bool
+	Name               string
+	Region             string
+	Address            string // 127.0.0.1
+	Port               int    // ephemeral, allocated by net.Listen(":0")
+	PKIDir             string
+	DB                 *corrosion.Client
+	Server             *grpcapi.Server
+	Virt               *libvirtfake.Fake // in-process libvirt fake; scenarios assert on its Events
+	CT                 *CTFake           // in-process container runtime; real on-disk rootfs + tar export/import
+	HostNet            *HostNetFake      // in-memory netplan System for the host-network apply protocol
+	Net                *NetProvFake      // per-node network provisioner: what this node set up, on which device
+	GRPCSrv            *grpc.Server
+	Listener           net.Listener
 	// peerConn caches a self-loopback client for scenario assertions
 	// that want to call this node's RPCs from the test thread.
 	selfConn *grpc.ClientConn
@@ -320,6 +322,7 @@ type Node struct {
 	// stopServerLoops stops the background loops buildServer started for this
 	// node's current server, as a daemon's exit does (see restartNode).
 	stopServerLoops context.CancelFunc
+	serveDone       chan struct{}
 }
 
 // StreamWatch observes one server-side streaming handler on a node: Started
@@ -586,13 +589,22 @@ func (c *Cluster) Stop() {
 			n.replStarted = false
 		}
 	}
+	c.waitLBWork()
 	for _, n := range c.Nodes {
+		if n.stopServerLoops != nil {
+			n.stopServerLoops()
+		}
+		n.Server.WaitNetworkWork()
 		if n.selfConn != nil {
 			_ = n.selfConn.Close()
 		}
 		if n.GRPCSrv != nil {
 			n.GRPCSrv.GracefulStop()
+			if n.serveDone != nil {
+				<-n.serveDone
+			}
 			n.Server.WaitGatewayAnnouncements()
+			n.Server.WaitNetworkWork()
 		}
 		if n.Listener != nil {
 			_ = n.Listener.Close()
@@ -780,7 +792,7 @@ func (c *Cluster) seedGossipMembership() {
 		target.DB.SetMembersForTests(func() []corrosion.PeerInfo {
 			var peers []corrosion.PeerInfo
 			for _, n := range nodes {
-				if n.Name == self {
+				if n.Name == self || n.seededGossipAbsent.Load() {
 					continue
 				}
 				// The gossip port, not the gRPC one: memberlist advertises where
@@ -909,6 +921,8 @@ func (c *Cluster) buildServer(n *Node) {
 	n.Server.SetNetworkEffects(n.Net)
 	n.Server.SetNetworkDeviceStatePath(filepath.Join(c.tmpRoot, n.Name, "network-devices.json"))
 	n.Server.SetVTEPResolver(n.Net.ResolveVTEP)
+	n.Server.SetLBNetworkEffects(n.Net)
+	n.Server.SetLBObservations(func(context.Context, string) (map[string]string, error) { return map[string]string{}, nil }, func(string) bool { return true })
 
 	// External IPAM: a REAL netbox.Client (token file and all) pointed at the
 	// scenario's fake server, plus the config kill-switch that lets this node
@@ -938,8 +952,9 @@ func (c *Cluster) buildServer(n *Node) {
 	// longer than a scenario's steps take; a re-create that returns kicks it
 	// at once, as in production.
 	loops, stop := context.WithCancel(c.ctx)
-	n.stopServerLoops = stop
-	go n.Server.RunLUNHoldResolver(loops, 10*time.Second)
+	loopDone := make(chan struct{})
+	n.stopServerLoops = func() { stop(); <-loopDone }
+	go func() { defer close(loopDone); n.Server.RunLUNHoldResolver(loops, 10*time.Second) }()
 
 	// Wire a real Replicator so the server's PushMutations handler + write-notify
 	// path are exercised. By default its background push loop is NOT started, so
@@ -983,7 +998,10 @@ func (c *Cluster) buildServer(n *Node) {
 	)...)
 	pb.RegisterLiteVirtServer(srv, n.Server)
 	n.GRPCSrv = srv
+	serveDone := make(chan struct{})
+	n.serveDone = serveDone
 	go func() {
+		defer close(serveDone)
 		// Errors here usually mean the listener was closed during
 		// teardown — that's fine.
 		_ = srv.Serve(n.Listener)

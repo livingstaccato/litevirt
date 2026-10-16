@@ -79,6 +79,9 @@ func gateEnrollmentOnly(ctx context.Context, fullMethod string) error {
 // fail (TestC1_FailedRevokeFailsTheEnrollment).
 var revokeSessionFn = corrosion.RevokeSession
 
+// walQuarantineUserRefusal begins refuseUserBearersInQuarantine's refusal.
+const walQuarantineUserRefusal = "this host is in WAL quarantine"
+
 // refuseUserBearersInQuarantine refuses every user credential on a node in WAL
 // quarantine: its binary is below a capability the cluster has latched, so it
 // may not enforce what that capability's rows say — a disable, the
@@ -90,7 +93,7 @@ func (s *Server) refuseUserBearersInQuarantine() error {
 	}
 	if reason := s.db.WriteQuarantineReason(); reason != "" {
 		return status.Errorf(codes.Unavailable,
-			"this host is in WAL quarantine (%s) and accepts no user logins, sessions or API tokens; "+
+			walQuarantineUserRefusal+" (%s) and accepts no user logins, sessions or API tokens; "+
 				"use another node", reason)
 	}
 	return nil

@@ -116,7 +116,7 @@ lv host init --local --name <name>        # Bootstrap on localhost (standalone)
 lv host add <user@host> --name <name>     # Add host to cluster
 lv host ls                                # List hosts (UPDATES column: pending OS package updates, see upgrades.md)
 lv host ls --names                        # Print only host names, one per line (for scripts)
-lv host inspect <host>                    # Host details
+lv host inspect <host>                    # Host details, with the capacity reservations counted against it (see diagnostics.md)
 lv host drain <host> [--parallel 2]       # Evacuate VMs off host
 lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (honors stop-delay)
 lv host undrain <host> [--failback]       # Return host to scheduling (--failback: wait for the failback it started and print results)
@@ -1214,7 +1214,9 @@ lv lb create <name> --vip <cidr> --port <l:t/proto> --backend <name=addr>
   --algorithm roundrobin     # roundrobin | leastconn | source
   --host <name>              # Hosts to run LB on (repeatable)
   --vm-backend <vm-name>     # Use VM IP as backend (repeatable)
+  --snat                     # SNAT a host-isolated network's outbound guest traffic to the VIP (default off)
 lv lb update <name> [flags]                       # Update config (zero-downtime)
+lv lb update <name> --snat=false                  # Turn an explicit LB's outbound SNAT off (--snat turns it on)
 lv lb delete <name>
 lv lb stats <name>                                # Live backend metrics
 lv lb drain <name> --backend <vm>                 # Graceful drain

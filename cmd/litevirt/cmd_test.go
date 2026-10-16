@@ -894,6 +894,10 @@ func TestLBCreateFlags(t *testing.T) {
 	if f.DefValue != "roundrobin" {
 		t.Errorf("--algorithm default = %q, want %q", f.DefValue, "roundrobin")
 	}
+	// An LB made with lv lb create does no outbound NAT unless asked.
+	if f := cmd.Flags().Lookup("snat"); f == nil || f.DefValue != "false" {
+		t.Errorf("lb create --snat = %+v, want a flag defaulting to false", f)
+	}
 }
 
 func TestLBUpdateFlags(t *testing.T) {

@@ -229,15 +229,34 @@ func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVecto
 // admitted is the set of operation ids carrying an OpStepAdmitted marker, at any
 // owner epoch: the marker is about the claim, not about an epoch's progress.
 func nonterminalReservationsByID(ctx context.Context, c *Client) (byID map[string]ReservationVector, admitted map[string]bool, err error) {
+	byID, admitted, _, err = nonterminalReservationsScan(ctx, c, false)
+	return byID, admitted, err
+}
+
+// UnreadableReservation is an operation whose reservation could not be read
+// (malformed vector, project binding or authority facts). TargetHost is empty
+// when the vector itself could not be decoded.
+type UnreadableReservation struct {
+	OperationID string
+	TargetHost  string
+	Err         error
+}
+
+// nonterminalReservationsScan is nonterminalReservationsByID's scan. With
+// tolerate false, a row whose reservation data cannot be read fails the whole
+// scan (what admission needs). With tolerate true, that row is left out of
+// byID and returned in unreadable instead, and the scan goes on; a query error
+// still fails it.
+func nonterminalReservationsScan(ctx context.Context, c *Client, tolerate bool) (byID map[string]ReservationVector, admitted map[string]bool, unreadable []UnreadableReservation, err error) {
 	orows, err := c.Query(ctx,
 		`SELECT id, project, resource_kind, resource_id, operation_kind,
 		        reservation_json, desired_ref, vm_owner_epoch
 		 FROM operations WHERE deleted_at IS NULL AND reservation_json != ''`)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if len(orows) == 0 {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	// Bulk-load steps once, grouped by operation id + the immutable header's
@@ -247,7 +266,7 @@ func nonterminalReservationsByID(ctx context.Context, c *Client) (byID map[strin
 		`SELECT operation_id, owner_epoch, step_name, facts
 		 FROM operation_steps WHERE deleted_at IS NULL`)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	stepsByOpEpoch := make(map[string][]string, len(orows))
 	reservationFactsByOpEpoch := make(map[string]string, len(orows))
@@ -273,7 +292,7 @@ func nonterminalReservationsByID(ctx context.Context, c *Client) (byID map[strin
 				id, r.String("resource_kind"), r.String("resource_id"),
 				r.String("desired_ref"), r.Int64("vm_owner_epoch"))
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			if !current {
 				// The immutable header remains journal-visible, but a superseded
@@ -289,21 +308,41 @@ func nonterminalReservationsByID(ctx context.Context, c *Client) (byID map[strin
 		}
 		rv, err := DecodeReservation(r.String("reservation_json"))
 		if err != nil {
-			return nil, nil, err
+			err = fmt.Errorf("reservation %s: %w", id, err)
+			if !tolerate {
+				return nil, nil, nil, err
+			}
+			unreadable = append(unreadable, UnreadableReservation{OperationID: id, Err: err})
+			continue
+		}
+		// bad records a row whose reservation data cannot be read: it fails the
+		// scan, or with tolerate is left out and reported.
+		bad := func(err error) error {
+			if !tolerate {
+				return err
+			}
+			unreadable = append(unreadable, UnreadableReservation{OperationID: id, TargetHost: rv.TargetHost, Err: err})
+			return nil
 		}
 		if operationProject := r.String("project"); operationProject != "" && rv != (ReservationVector{}) {
 			if rv.Project != operationProject {
-				return nil, nil, fmt.Errorf(
+				if err := bad(fmt.Errorf(
 					"reservation %s project %q does not match operation project %q",
-					id, rv.Project, operationProject)
+					id, rv.Project, operationProject)); err != nil {
+					return nil, nil, nil, err
+				}
+				continue
 			}
 			if err := validateReservationProject(r.String("reservation_json"), operationProject); err != nil {
-				return nil, nil, fmt.Errorf("reservation %s has invalid project binding: %w", id, err)
+				if err := bad(fmt.Errorf("reservation %s has invalid project binding: %w", id, err)); err != nil {
+					return nil, nil, nil, err
+				}
+				continue
 			}
 		}
 		authority, ok, err := CurrentProjectAuthority(ctx, c, r.String("project"))
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if ok {
 			rawFacts := reservationFactsByOpEpoch[key]
@@ -315,22 +354,31 @@ func nonterminalReservationsByID(ctx context.Context, c *Client) (byID map[strin
 			}
 			var facts ReservationFacts
 			if err := json.Unmarshal([]byte(rawFacts), &facts); err != nil {
-				return nil, nil, fmt.Errorf("reservation %s has malformed authority facts: %w", id, err)
+				if err := bad(fmt.Errorf("reservation %s has malformed authority facts: %w", id, err)); err != nil {
+					return nil, nil, nil, err
+				}
+				continue
 			}
 			if facts.Project == "" || facts.AuthorityEpoch <= 0 || facts.AuthorityHost == "" {
-				return nil, nil, fmt.Errorf("reservation %s has malformed authority facts", id)
+				if err := bad(fmt.Errorf("reservation %s has malformed authority facts", id)); err != nil {
+					return nil, nil, nil, err
+				}
+				continue
 			}
 			if facts.AuthorityEpoch != authority.Epoch {
 				continue // reservation minted by a fenced/stale authority
 			}
 			if projectOrDefault(facts.Project) != authority.Project ||
 				facts.AuthorityHost != authority.Holder {
-				return nil, nil, fmt.Errorf("reservation %s has invalid current-authority facts", id)
+				if err := bad(fmt.Errorf("reservation %s has invalid current-authority facts", id)); err != nil {
+					return nil, nil, nil, err
+				}
+				continue
 			}
 		}
 		out[id] = rv
 	}
-	return out, admitted, nil
+	return out, admitted, unreadable, nil
 }
 
 func operationOwnsCurrentWorkload(ctx context.Context, c *Client, operationID, resourceKind, resourceID, desiredRef string, ownerEpoch int64) (bool, error) {

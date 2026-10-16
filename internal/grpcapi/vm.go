@@ -72,7 +72,14 @@ func validateSpecNames(spec *pb.VMSpec) error {
 			return fmt.Errorf("disk %q: %w", d.Name, err)
 		}
 	}
-	return nil
+	// The stack name names the stack's LB, whose root-owned config files and
+	// notify script are named after it.
+	if spec.StackName != "" {
+		if err := safename.ValidateStackName(spec.StackName); err != nil {
+			return err
+		}
+	}
+	return validateLBSpec(spec.Loadbalancer)
 }
 
 func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM, error) {
@@ -201,6 +208,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			return nil, status.Error(codes.PermissionDenied,
 				"defining VM lifecycle hooks requires the admin role (hooks execute as root on the target host)")
 		}
+	}
+	if err := requireAdminForLBTLS(ctx, spec.Loadbalancer); err != nil {
+		return nil, err
 	}
 
 	// Check if VM already exists. A rebuild or recreate whose replica here has
@@ -1425,7 +1435,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// Apply LB config if the VM spec includes a load balancer definition.
 	// Use a detached context so the goroutine survives after the RPC returns.
 	if spec.Loadbalancer != nil && spec.Loadbalancer.Enabled {
-		go s.applyLBFromSpecWithRetry(context.Background(), spec)
+		s.startNetworkWork(func() { s.applyLBFromSpecWithRetry(context.Background(), spec) })
 	}
 
 	// post_start hook
@@ -2534,7 +2544,7 @@ func (s *Server) stopVMLockedNote(ctx context.Context, vm *corrosion.VMRecord, f
 	s.recordVMEvent(ctx, vm.Name, "vm.stopped", "ok", evDetail)
 
 	// Refresh LB backends so stopped VM is removed from rotation.
-	go s.refreshLBForStack(context.Background(), vm.StackName)
+	s.startNetworkWork(func() { s.refreshLBForStack(context.Background(), vm.StackName) })
 
 	pbVM.State = pb.VMState_VM_STOPPED
 	hooks.Run(ctx, hooks.PostStop, pbVM, hspec)
@@ -3467,7 +3477,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	}
 
 	// Refresh LB backends so deleted VM is removed from rotation.
-	go s.refreshLBForStack(context.Background(), vm.StackName)
+	s.startNetworkWork(func() { s.refreshLBForStack(context.Background(), vm.StackName) })
 
 	if len(leftovers.hosts) > 0 {
 		go s.cleanupDeletedVMLeftovers(context.WithoutCancel(ctx), leftovers)

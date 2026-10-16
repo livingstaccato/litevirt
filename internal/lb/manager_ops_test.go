@@ -13,10 +13,7 @@ import (
 func testManager(t *testing.T) *Manager {
 	t.Helper()
 	dir := t.TempDir()
-	return &Manager{
-		configDir: filepath.Join(dir, "config"),
-		runDir:    filepath.Join(dir, "run"),
-	}
+	return NewManagerAt(filepath.Join(dir, "config"), filepath.Join(dir, "run"))
 }
 
 // KeepalivedRunning is the VIP-assigned signal: true only when the pidfile

@@ -45,7 +45,16 @@ func runRestoreLiveUntil(t *testing.T, s *Server, req *pb.RestoreLiveRequest, ph
 	ctx, cancel := context.WithCancel(adminCtx())
 	stream := &restoreLiveStream{ctx: ctx}
 	done := make(chan error, 1)
-	go func() { done <- s.RestoreLive(req, stream) }()
+	joined := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-joined:
+		case <-time.After(10 * time.Second):
+			t.Error("RestoreLive did not join before fixture cleanup")
+		}
+	})
+	go func() { defer close(joined); done <- s.RestoreLive(req, stream) }()
 
 	// Judged on STALL, not elapsed wall clock. See phaseWaiter: a flat budget
 	// here belongs to work this helper does not control, and on a loaded machine

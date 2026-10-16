@@ -157,6 +157,7 @@ const (
 	LiteVirt_NormalizeRoleBindings_FullMethodName      = "/litevirt.v1.LiteVirt/NormalizeRoleBindings"
 	LiteVirt_GetVMOperation_FullMethodName             = "/litevirt.v1.LiteVirt/GetVMOperation"
 	LiteVirt_AbortVMOperation_FullMethodName           = "/litevirt.v1.LiteVirt/AbortVMOperation"
+	LiteVirt_ReleaseHostReservation_FullMethodName     = "/litevirt.v1.LiteVirt/ReleaseHostReservation"
 	LiteVirt_BeginWebAuthnRegistration_FullMethodName  = "/litevirt.v1.LiteVirt/BeginWebAuthnRegistration"
 	LiteVirt_FinishWebAuthnRegistration_FullMethodName = "/litevirt.v1.LiteVirt/FinishWebAuthnRegistration"
 	LiteVirt_BeginWebAuthnLogin_FullMethodName         = "/litevirt.v1.LiteVirt/BeginWebAuthnLogin"
@@ -611,6 +612,7 @@ type LiteVirtClient interface {
 	NormalizeRoleBindings(ctx context.Context, in *NormalizeRoleBindingsRequest, opts ...grpc.CallOption) (*NormalizeRoleBindingsResponse, error)
 	GetVMOperation(ctx context.Context, in *GetVMOperationRequest, opts ...grpc.CallOption) (*GetVMOperationResponse, error)
 	AbortVMOperation(ctx context.Context, in *AbortVMOperationRequest, opts ...grpc.CallOption) (*AbortVMOperationResponse, error)
+	ReleaseHostReservation(ctx context.Context, in *ReleaseHostReservationRequest, opts ...grpc.CallOption) (*ReleaseHostReservationResponse, error)
 	BeginWebAuthnRegistration(ctx context.Context, in *BeginWebAuthnRegistrationRequest, opts ...grpc.CallOption) (*BeginWebAuthnRegistrationResponse, error)
 	FinishWebAuthnRegistration(ctx context.Context, in *FinishWebAuthnRegistrationRequest, opts ...grpc.CallOption) (*FinishWebAuthnRegistrationResponse, error)
 	BeginWebAuthnLogin(ctx context.Context, in *BeginWebAuthnLoginRequest, opts ...grpc.CallOption) (*BeginWebAuthnLoginResponse, error)
@@ -2636,6 +2638,16 @@ func (c *liteVirtClient) AbortVMOperation(ctx context.Context, in *AbortVMOperat
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(AbortVMOperationResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_AbortVMOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ReleaseHostReservation(ctx context.Context, in *ReleaseHostReservationRequest, opts ...grpc.CallOption) (*ReleaseHostReservationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseHostReservationResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ReleaseHostReservation_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -5164,6 +5176,7 @@ type LiteVirtServer interface {
 	NormalizeRoleBindings(context.Context, *NormalizeRoleBindingsRequest) (*NormalizeRoleBindingsResponse, error)
 	GetVMOperation(context.Context, *GetVMOperationRequest) (*GetVMOperationResponse, error)
 	AbortVMOperation(context.Context, *AbortVMOperationRequest) (*AbortVMOperationResponse, error)
+	ReleaseHostReservation(context.Context, *ReleaseHostReservationRequest) (*ReleaseHostReservationResponse, error)
 	BeginWebAuthnRegistration(context.Context, *BeginWebAuthnRegistrationRequest) (*BeginWebAuthnRegistrationResponse, error)
 	FinishWebAuthnRegistration(context.Context, *FinishWebAuthnRegistrationRequest) (*FinishWebAuthnRegistrationResponse, error)
 	BeginWebAuthnLogin(context.Context, *BeginWebAuthnLoginRequest) (*BeginWebAuthnLoginResponse, error)
@@ -6088,6 +6101,9 @@ func (UnimplementedLiteVirtServer) GetVMOperation(context.Context, *GetVMOperati
 }
 func (UnimplementedLiteVirtServer) AbortVMOperation(context.Context, *AbortVMOperationRequest) (*AbortVMOperationResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AbortVMOperation not implemented")
+}
+func (UnimplementedLiteVirtServer) ReleaseHostReservation(context.Context, *ReleaseHostReservationRequest) (*ReleaseHostReservationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseHostReservation not implemented")
 }
 func (UnimplementedLiteVirtServer) BeginWebAuthnRegistration(context.Context, *BeginWebAuthnRegistrationRequest) (*BeginWebAuthnRegistrationResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method BeginWebAuthnRegistration not implemented")
@@ -9027,6 +9043,24 @@ func _LiteVirt_AbortVMOperation_Handler(srv interface{}, ctx context.Context, de
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).AbortVMOperation(ctx, req.(*AbortVMOperationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ReleaseHostReservation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseHostReservationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReleaseHostReservation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReleaseHostReservation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReleaseHostReservation(ctx, req.(*ReleaseHostReservationRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -13089,6 +13123,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AbortVMOperation",
 			Handler:    _LiteVirt_AbortVMOperation_Handler,
+		},
+		{
+			MethodName: "ReleaseHostReservation",
+			Handler:    _LiteVirt_ReleaseHostReservation_Handler,
 		},
 		{
 			MethodName: "BeginWebAuthnRegistration",

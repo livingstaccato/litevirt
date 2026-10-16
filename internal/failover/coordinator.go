@@ -932,6 +932,10 @@ func (c *Coordinator) run(ctx context.Context) {
 	}
 	c.evaluateRelayHealth(ctx, voters, fenceCandidates)
 
+	// Which hosts partition_one_way is open for, from the replicated rows:
+	// whoever raised one, this holder resolves it once its case is gone.
+	c.syncOneWay(ctx)
+
 	for _, cand := range candidates {
 		// Re-validate lease before each destructive action: long fence runs
 		// (IPMI verify up to 15 s) can outlast the lease without renewal.

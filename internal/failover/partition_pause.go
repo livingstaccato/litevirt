@@ -735,6 +735,30 @@ func (c *Coordinator) detectOneWay(ctx context.Context, target string) (failing,
 	return failing, healthy, live >= len(voters)/2+1
 }
 
+// syncOneWay sets which hosts partition_one_way is raised for from the
+// replicated rows, whoever raised them. The lease holder resolves a row once
+// its case is gone (noteOneWay, resolveOneWayGone), and it must be able to
+// resolve one another holder raised: its raiser may have died, restarted or
+// lost the lease since, and nothing else ever resolves the row (lab 1,
+// 2026-10-16: open and CRITICAL for two and a half hours after its raiser was
+// powered off). And a row another holder resolved must read as resolved here,
+// so this holder raises it again if the case returns. A read error keeps what
+// this process knew.
+func (c *Coordinator) syncOneWay(ctx context.Context) {
+	open, err := corrosion.ListOpenHealthConditionsByCode(ctx, c.db, corrosion.PartitionPauseEvaluator, corrosion.CondPartitionOneWay)
+	if err != nil {
+		slog.Warn("failover: could not read partition_one_way conditions; judging them from this process's memory", "error", err)
+		return
+	}
+	raised := make(map[string]bool, len(open))
+	for _, row := range open {
+		if row.SubjectKind == "host" {
+			raised[row.SubjectID] = true
+		}
+	}
+	c.oneWay = raised
+}
+
 // resolveOneWayGone resolves partition_one_way for every host it is raised for
 // that is not among this cycle's fence candidates.
 func (c *Coordinator) resolveOneWayGone(ctx context.Context, candidates []string) {

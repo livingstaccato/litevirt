@@ -515,6 +515,29 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 	// the ISO is ejected); otherwise the first non-ISO disk boots.
 	bootFromCDROM := cfg.Boot == "cdrom"
 	diskBootAssigned := false
+	// A CD-ROM's target derives from its position, which is free on a create.
+	// A regenerate carries a hot-plugged disk at its recorded target, which can
+	// be that one; the CD-ROM then takes the next free sd target instead.
+	takenTarget := map[string]bool{}
+	for i, d := range cfg.Disks {
+		if d.IsISO {
+			continue
+		}
+		if d.TargetDev != "" {
+			takenTarget[d.TargetDev] = true
+		} else {
+			takenTarget[DiskDevName(d.Bus, i)] = true
+		}
+	}
+	cdromTarget := func(index int) string {
+		for c := 'a' + index; c <= 'z'; c++ {
+			if dev := fmt.Sprintf("sd%c", c); !takenTarget[dev] {
+				takenTarget[dev] = true
+				return dev
+			}
+		}
+		return fmt.Sprintf("sd%c", 'a'+index)
+	}
 	for i, d := range cfg.Disks {
 		targetDev := d.TargetDev
 		if targetDev == "" {
@@ -547,7 +570,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			disk.Driver.Discard, disk.Driver.DetectZeroes = "", ""
 			disk.IOTune = nil
 			disk.Source = diskSource{File: d.Path}
-			disk.Target = diskTarget{Dev: fmt.Sprintf("sd%c", 'a'+i), Bus: "sata"}
+			disk.Target = diskTarget{Dev: cdromTarget(i), Bus: "sata"}
 			disk.Readonly = &struct{}{}
 		}
 		if isUEFI {
@@ -574,7 +597,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			Device:   "cdrom",
 			Driver:   diskDriver{Name: "qemu", Type: "raw"},
 			Source:   diskSource{File: cfg.CloudInitISO},
-			Target:   diskTarget{Dev: fmt.Sprintf("sd%c", 'a'+len(cfg.Disks)), Bus: "sata"},
+			Target:   diskTarget{Dev: cdromTarget(len(cfg.Disks)), Bus: "sata"},
 			Readonly: &struct{}{},
 		})
 	}

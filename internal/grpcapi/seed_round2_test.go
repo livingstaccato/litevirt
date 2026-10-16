@@ -18,7 +18,7 @@ import (
 // without genisoimage (cloudinit.UseGoISOWithoutGenisoimage).
 func useSeedISOWriter(t *testing.T) {
 	t.Helper()
-	cloudinit.UseGoISOWithoutGenisoimage()
+	cloudinit.UseGoISOWithoutGenisoimage(t)
 }
 
 // r2VM inserts VM name with spec and NIC rows (both tables, as a create and,

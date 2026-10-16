@@ -214,7 +214,7 @@ if [ -f "$src/vendor-data" ]; then cat "$src/vendor-data" > "$out"; else printf 
 // goes red; write no vendor-data — red; ignore the VM's own seed — the second
 // case goes red; OwnSeed without the cdrom check — the third case goes red.
 func TestDomainXMLFor_AmbiguousNICsDisableNetworkRendering(t *testing.T) {
-	cloudinit.UseGoISOWithoutGenisoimage()
+	cloudinit.UseGoISOWithoutGenisoimage(t)
 	db := testReconcilerDB(t)
 	ctx := context.Background()
 	r, fake, _ := sharedDiskReconciler(t, db)
@@ -380,7 +380,7 @@ func TestDomainXMLFor_ANoCloudInitVMGetsNoSeed(t *testing.T) {
 //
 // Mutation: reuse the VM's own seed as it is (the round-5 code) — red.
 func TestDomainXMLFor_RefreshesTheVMsStaleSeed(t *testing.T) {
-	cloudinit.UseGoISOWithoutGenisoimage()
+	cloudinit.UseGoISOWithoutGenisoimage(t)
 	db := testReconcilerDB(t)
 	ctx := context.Background()
 	r, _, _ := sharedDiskReconciler(t, db)

@@ -1,11 +1,14 @@
 package cloudinit
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -221,7 +224,7 @@ func TestNetworkConfig_IsolatedNetworkTakesNoDefaultRoute(t *testing.T) {
 // Mutation: rebuild with the VM name as instance-id — the instance-id check
 // goes red; drop the user-data carry — the user-data check goes red.
 func TestRebuildISO_KeepsIdentityAndUserData(t *testing.T) {
-	UseGoISOWithoutGenisoimage()
+	UseGoISOWithoutGenisoimage(t)
 	path := filepath.Join(t.TempDir(), "hp.iso")
 	if err := GenerateISO(Config{InstanceID: "hp-first", LocalHostname: "hp-host",
 		UserData: "#cloud-config\nhostname: hp\n", NetworkConfig: "version: 1\nconfig: []\n"}, path); err != nil {
@@ -329,7 +332,7 @@ func TestSeedVendorData(t *testing.T) {
 // Mutation: drop the vendor-data file from writeISO — red; keep the old
 // vendor-data on a rebuild — red.
 func TestRebuildISO_SetsVendorData(t *testing.T) {
-	UseGoISOWithoutGenisoimage()
+	UseGoISOWithoutGenisoimage(t)
 	path := filepath.Join(t.TempDir(), "vd.iso")
 	if err := GenerateISO(Config{InstanceID: "vd-first", LocalHostname: "vd", UserData: "#cloud-config\nhostname: vd\n",
 		NetworkConfig: "version: 1\nconfig: []\n"}, path); err != nil {
@@ -365,7 +368,7 @@ func TestRebuildISO_SetsVendorData(t *testing.T) {
 // let the Go writer replace an installed genisoimage — the stand-in's marker
 // is not written.
 func TestGoISO_ReadsBackAsTheSeed(t *testing.T) {
-	UseGoISOWithoutGenisoimage()
+	UseGoISOWithoutGenisoimage(t)
 	want := Seed{MetaData: "instance-id: g\nlocal-hostname: g\n", UserData: "#cloud-config\nhostname: g\n",
 		NetworkConfig: "version: 2\nethernets: {}\n", VendorData: NetworkUpdatesVendorData}
 	dir := t.TempDir()
@@ -410,5 +413,91 @@ func TestGoISO_ReadsBackAsTheSeed(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(path); string(b) != "stand-in" {
 		t.Errorf("the Go writer replaced genisoimage on PATH: %q", b)
+	}
+}
+
+// T2 review m5: in CI (no genisoimage) the Go writer was checked only against
+// ReadSeed. testdata/genisoimage_seed.iso.gz is a seed genisoimage 1.1.11
+// wrote (-volid cidata -joliet -rock) from the same four files: ReadSeed
+// reads it as the same seed, and both images carry the volume label cidata
+// and the same Rock Ridge names.
+//
+// Mutation: label the Go image anything but cidata — red.
+func TestGoISO_MatchesARealGenisoimageSeed(t *testing.T) {
+	want := Seed{MetaData: "instance-id: g\nlocal-hostname: g\n", UserData: "#cloud-config\nhostname: g\n",
+		NetworkConfig: "version: 2\nethernets: {}\n", VendorData: NetworkUpdatesVendorData}
+	gz, err := os.Open(filepath.Join("testdata", "genisoimage_seed.iso.gz"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gz.Close()
+	zr, err := gzip.NewReader(gz)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(t.TempDir(), "real.iso")
+	if err := os.WriteFile(real, img, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadSeed(real); err != nil || got != want {
+		t.Fatalf("ReadSeed of genisoimage's seed = %+v, %v; want %+v", got, err, want)
+	}
+
+	dir := t.TempDir()
+	for name, body := range map[string]string{"meta-data": want.MetaData, "user-data": want.UserData,
+		"network-config": want.NetworkConfig, "vendor-data": want.VendorData} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mine := filepath.Join(t.TempDir(), "go.iso")
+	if err := os.WriteFile(mine, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeGoISO(dir, mine); err != nil {
+		t.Fatal(err)
+	}
+	names := func(path string) (string, []string) {
+		t.Helper()
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		pvd := make([]byte, isoSector)
+		if _, err := f.ReadAt(pvd, 16*isoSector); err != nil {
+			t.Fatal(err)
+		}
+		files, err := isoRootFiles(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for n := range files {
+			out = append(out, n)
+		}
+		sort.Strings(out)
+		return strings.TrimSpace(string(pvd[40:72])), out
+	}
+	rl, rn := names(real)
+	gl, gn := names(mine)
+	if rl != "cidata" || gl != rl || strings.Join(gn, ",") != strings.Join(rn, ",") {
+		t.Errorf("Go image label %q names %v; genisoimage's label %q names %v", gl, gn, rl, rn)
+	}
+}
+
+// T2 review I2: the switch lasts only as long as the test that set it: after
+// it, a host without genisoimage fails to build a seed again.
+//
+// Mutation: never undo the switch (no t.Cleanup) — the seed is built.
+func TestGoISO_SwitchEndsWithItsTest(t *testing.T) {
+	t.Run("uses it", func(t *testing.T) { UseGoISOWithoutGenisoimage(t) })
+	t.Setenv("PATH", t.TempDir())
+	if err := GenerateISO(Config{InstanceID: "x"}, filepath.Join(t.TempDir(), "x.iso")); err == nil {
+		t.Error("a seed was built without genisoimage after the test that allowed it ended")
 	}
 }

@@ -30,7 +30,7 @@ import (
 // goes red; ignore the stamp — "stamped-other" goes red; skip the user-data
 // check — "another user-data" goes red.
 func TestOwnSeed(t *testing.T) {
-	UseGoISOWithoutGenisoimage()
+	UseGoISOWithoutGenisoimage(t)
 	dir := t.TempDir()
 	write := func(name, instanceID, stamp string) string {
 		t.Helper()

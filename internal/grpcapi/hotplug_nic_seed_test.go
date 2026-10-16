@@ -33,7 +33,7 @@ import (
 // instance-id — the identity check goes red; drop the reload — the reload
 // counts go red; rebuild with no vendor-data — the vendor-data check goes red.
 func TestNICHotplug_RebuildsTheSeed(t *testing.T) {
-	cloudinit.UseGoISOWithoutGenisoimage()
+	cloudinit.UseGoISOWithoutGenisoimage(t)
 	const (
 		macA     = "52:54:00:5e:00:0a" // static, detached
 		macD     = "52:54:00:5e:00:0d" // stays
@@ -188,7 +188,7 @@ func hpSeededVM(t *testing.T, s *Server, state string) string {
 //
 // Mutation: fail the attach on a reload error — red; drop the event — red.
 func TestNICHotplug_SeedReloadFailureIsReported(t *testing.T) {
-	cloudinit.UseGoISOWithoutGenisoimage()
+	cloudinit.UseGoISOWithoutGenisoimage(t)
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
 	ctx := adminCtx()
@@ -222,7 +222,7 @@ func TestNICHotplug_SeedReloadFailureIsReported(t *testing.T) {
 // Mutation: reload whether or not the VM runs — the fake refuses a stopped
 // domain and the test sees a reload attempt (a seed.reload_failed event).
 func TestNICHotplug_StoppedVMSeedIsNotReloaded(t *testing.T) {
-	cloudinit.UseGoISOWithoutGenisoimage()
+	cloudinit.UseGoISOWithoutGenisoimage(t)
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
 	ctx := adminCtx()

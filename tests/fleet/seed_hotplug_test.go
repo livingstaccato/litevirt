@@ -38,7 +38,7 @@ import (
 // goes red; drop the vendor-data from EnsureCloudInit — the target's seed
 // goes red.
 func TestFleet_SeedFollowsNICHotplug(t *testing.T) {
-	cloudinit.UseGoISOWithoutGenisoimage()
+	cloudinit.UseGoISOWithoutGenisoimage(t)
 	for _, latched := range []bool{true, false} {
 		name := "unlatched"
 		if latched {

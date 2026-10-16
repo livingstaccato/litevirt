@@ -10,23 +10,38 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
+	"testing"
 )
 
-// goISO is whether seeds are built by writeGoISO where genisoimage is not
-// installed (UseGoISOWithoutGenisoimage).
-var goISO atomic.Bool
+// goISO counts the tests that have the Go writer stand in for a missing
+// genisoimage (UseGoISOWithoutGenisoimage).
+var goISO atomic.Int64
 
-// UseGoISOWithoutGenisoimage has this process build a seed with a small Go
-// ISO 9660 writer whenever genisoimage is not on PATH, instead of failing. It
-// is for tests on a host without genisoimage (CI): the seed logic they test
-// reads the seeds back (ReadSeed). A genisoimage on PATH, a test's stand-in
-// included, is used as before. The daemon never calls it.
-func UseGoISOWithoutGenisoimage() { goISO.Store(true) }
+// TestingT is the part of testing.TB UseGoISOWithoutGenisoimage needs.
+type TestingT interface {
+	Helper()
+	Cleanup(func())
+}
+
+// UseGoISOWithoutGenisoimage has seeds built by a small Go ISO 9660 writer
+// whenever genisoimage is not on PATH, until t ends (t.Cleanup), instead of
+// failing. It is for tests on a host without genisoimage (CI): the seed logic
+// they test reads the seeds back (ReadSeed). A genisoimage on PATH, a test's
+// stand-in included, is used as before. Outside a test binary it panics, and
+// buildISO ignores the switch: a guest never boots from the Go writer's image.
+func UseGoISOWithoutGenisoimage(t TestingT) {
+	t.Helper()
+	if !testing.Testing() {
+		panic("cloudinit.UseGoISOWithoutGenisoimage called outside a test")
+	}
+	goISO.Add(1)
+	t.Cleanup(func() { goISO.Add(-1) })
+}
 
 // buildISO writes the NoCloud ISO image of the files in dir to out, an
 // existing file it replaces the content of.
 func buildISO(dir, out string) error {
-	if goISO.Load() {
+	if goISO.Load() > 0 && testing.Testing() {
 		if _, err := exec.LookPath("genisoimage"); err != nil {
 			return writeGoISO(dir, out)
 		}

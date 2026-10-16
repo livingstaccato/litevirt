@@ -28,7 +28,7 @@ import (
 // cluster, the seed path of each node, and each node's gate.
 func seededVMCluster(t *testing.T, latched bool, name string, nets map[string]compose.NetworkDef, spec *pb.VMSpec) (*Cluster, map[string]string, map[string]*health.Checker) {
 	t.Helper()
-	cloudinit.UseGoISOWithoutGenisoimage()
+	cloudinit.UseGoISOWithoutGenisoimage(t)
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
 	t.Cleanup(c.Stop)

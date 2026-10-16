@@ -687,3 +687,38 @@ func TestDomainXMLFor_AnUnreadableOwnSeedStartsWithAWarning(t *testing.T) {
 		t.Errorf("want one seed.rebuild_failed warning naming %s, node-a and the read: %+v", iso, evs)
 	}
 }
+
+// Review M3: the reconciler's start holds the start lease, not the VM lock an
+// attach or detach holds, so an attach can commit between the refresh's
+// derivation of the network-config and its rewrite, and the rewrite then
+// drops the attached NIC from the seed. Derived again after the rewrite, a
+// NIC set that moved leaves the seed marked stale, so the next start or
+// attach puts the NIC back.
+//
+// Mutation: drop the check after the rewrite — the seed lacks C and is not
+// marked.
+func TestDomainXMLFor_AnAttachDuringTheRefreshMarksTheSeedStale(t *testing.T) {
+	cloudinit.UseGoISOWithoutGenisoimage(t)
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	r, _, _ := sharedDiskReconciler(t, db)
+	vm, spec, iso := staleSeedVM(t, r, db)
+	r.seedRefreshRaced = func() {
+		if err := corrosion.InsertInterface(ctx, db, corrosion.InterfaceRecord{VMName: "vm1", NetworkName: "brnet", MAC: "52:54:00:aa:00:03", Ordinal: 2}); err != nil {
+			t.Errorf("insert C: %v", err)
+		}
+	}
+	if _, _, failure := r.domainXMLFor(ctx, vm, spec, nil); failure != "" {
+		t.Fatalf("domainXMLFor: %s", failure)
+	}
+	got, err := cloudinit.ReadSeed(iso)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got.NetworkConfig, "52:54:00:aa:00:03") {
+		t.Fatalf("setup: the refresh saw C:\n%s", got.NetworkConfig)
+	}
+	if !cloudinit.SeedMarkedStale(iso) {
+		t.Error("a seed that lacks a NIC attached during the refresh is not marked stale")
+	}
+}

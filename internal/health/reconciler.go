@@ -290,6 +290,10 @@ type Reconciler struct {
 	// release func is invoked ONLY if the subsequent StartDomain fails.
 	prepareHardwareForStart func(ctx context.Context, vm *corrosion.VMRecord) (func(), error)
 
+	// seedRefreshRaced, set only by tests, runs in refreshOwnSeed between the
+	// derivation of the network-config and the rewrite.
+	seedRefreshRaced func()
+
 	// orphans / onOrphans: the orphan-runtime report (orphan_runtime.go) — the
 	// sighting counts between passes, and the metric observer (nil-safe).
 	orphans   orphanReporter
@@ -2394,11 +2398,23 @@ func (r *Reconciler) refreshOwnSeed(ctx context.Context, vm corrosion.VMRecord, 
 	}
 	changed := false
 	if err == nil {
+		if r.seedRefreshRaced != nil {
+			r.seedRefreshRaced()
+		}
 		changed, err = cloudinit.RebuildISO(iso, nc, cloudinit.SeedVendorData(spec, nc))
 	}
 	if err != nil {
 		warn(err)
 		return
+	}
+	// The start holds its lease, not the VM lock an attach or detach holds:
+	// one can commit while this refresh runs, and this rewrite can land after
+	// its own. Derived again, a NIC set that moved keeps the seed marked
+	// stale, so the next start or attach or detach rewrites it.
+	if again, aerr := cloudinit.SeedNetworkConfig(ctx, r.db, vm.Name, spec, prior); aerr != nil || again != nc {
+		if merr := cloudinit.MarkSeedStale(iso); merr != nil {
+			slog.Warn("reconciler: could not mark the VM's cloud-init seed stale", "vm", vm.Name, "seed", iso, "error", merr)
+		}
 	}
 	if changed {
 		slog.Info("reconciler: the VM's cloud-init seed here takes its current NICs", "vm", vm.Name, "seed", iso)

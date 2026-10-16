@@ -2611,17 +2611,6 @@ func (r *Reconciler) deferPendingStart(ctx context.Context, vmName, proofID, det
 	}
 }
 
-// failPendingStart records a local start failure inside startPendingVM, honoring the
-// proof lifecycle (plan: transient → retryable, only a KNOWN non-retryable point →
-// terminal) so a proof-gated start is never stranded in_progress:
-//   - no proof (legacy): set the VM to error (unchanged behavior).
-//   - retryable (a transient libvirt / DB / image-pull hiccup): revert the VM to
-//     pending and LEAVE the proof in_progress, so reconcile retries and the same
-//     executor re-claims it — never stranding HA on a blip. (The pending_action_id
-//     stays set, so the retry re-validates + re-claims the same proof.)
-//   - non-retryable (bad spec/disk/firmware/XML — retrying HERE can't help): mark the
-//     proof FAILED (terminal) which atomically sets the VM to error + clears the
-//     pointer, so no in_progress proof dangles and no marker-less pending row is left.
 // staleTermRepointGrace is how long a destination leaves a row pending on a
 // proof it abandoned at the lease holder's request because the proof's lease
 // stamp was superseded (corrosion.AbandonReasonLeaseOutran). The holder
@@ -2654,6 +2643,17 @@ func (r *Reconciler) awaitingStaleTermRepoint(ctx context.Context, vmName, proof
 	return true
 }
 
+// failPendingStart records a local start failure inside startPendingVM, honoring the
+// proof lifecycle (plan: transient → retryable, only a KNOWN non-retryable point →
+// terminal) so a proof-gated start is never stranded in_progress:
+//   - no proof (legacy): set the VM to error (unchanged behavior).
+//   - retryable (a transient libvirt / DB / image-pull hiccup): revert the VM to
+//     pending and LEAVE the proof in_progress, so reconcile retries and the same
+//     executor re-claims it — never stranding HA on a blip. (The pending_action_id
+//     stays set, so the retry re-validates + re-claims the same proof.)
+//   - non-retryable (bad spec/disk/firmware/XML — retrying HERE can't help): mark the
+//     proof FAILED (terminal) which atomically sets the VM to error + clears the
+//     pointer, so no in_progress proof dangles and no marker-less pending row is left.
 func (r *Reconciler) failPendingStart(ctx context.Context, vmName, proofID string, retryable bool, detail string) {
 	if proofID == "" {
 		if err := corrosion.UpdateVMState(ctx, r.db, vmName, "error", detail); err != nil {

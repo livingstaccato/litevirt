@@ -150,6 +150,18 @@ func TestKernelChild_TagGroupsHoldOnTheWire(t *testing.T) {
 		}
 	}
 
+	// One edit moves r1 to another group and makes it unreadable on this
+	// host: its kept rendering still names web's set, so the member is still
+	// dropped (D5a re-review m-a). Left out, it would reach gb.
+	row(`UPDATE sg_rules SET cidr = 'tag:other', proto = 'all;x' WHERE id = 'r1'`)
+	plan = apply()
+	if r, ok := invalidRow(plan, "sg_rules", "r1"); !ok || r.Handling != HandlingKeptLast {
+		t.Errorf("r1 after moving to another group and turning unreadable: %+v, %v; want kept last", r, ok)
+	}
+	if l.ping("ga", "10.20.0.2") {
+		t.Error("a member reached gb once r1's edit left its kept drop out (m-a)")
+	}
+
 	// The member's tags are removed: the next pass drops it from the set.
 	policy(corrosion.FirewallTagsKeyPrefix+"vm/"+idWeb, "")
 	apply()

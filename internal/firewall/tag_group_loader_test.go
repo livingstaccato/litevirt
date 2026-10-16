@@ -752,6 +752,82 @@ func TestTagGroupLoader_TagRewriteIsExemptFromTheReservedName(t *testing.T) {
 	}
 }
 
+// One edit that both moves a tag: deny to another group and makes the row
+// unreadable on this host keeps the row's last rendering (D5a re-review m-a).
+// That rendering names the old group's set, which the tag pass wrote; it is
+// not a user's @lv_tg_ reference, so the reserved-name check must not leave
+// it out — a deny would stop applying.
+//
+// Mutation: the kept rendering judged without the exemption — red.
+func TestTagGroupLoader_AKeptRenderingOfAnotherGroupStaysRenderable(t *testing.T) {
+	for _, other := range []string{"missing", "existing"} {
+		t.Run(other, func(t *testing.T) {
+			l := newTGLab(t)
+			l.group("web", webGroup)
+			if other == "existing" {
+				l.group("other", `{"match":{"role":"other"},"networks":[],"security_groups":[]}`)
+			}
+			l.vm("web-1", "host-a", tgFWID(1))
+			l.nic("web-1", "prod", "52:54:00:00:00:01", "tap1", "10.0.0.5")
+			l.tags("vm", tgFWID(1), `{"tags":{"role":"web"}}`)
+			l.clusterRule("c-drop", "tcp", "25", "tag:web", "drop")
+			load := l.loader("host-a", nil)
+			_, script := l.load(load)
+			if !strings.Contains(script, "tcp dport 25 ip saddr @lv_tg_web drop") {
+				t.Fatalf("the tag: drop did not render:\n%s", script)
+			}
+
+			rawRow(t, l.db, `UPDATE cluster_firewall_rules SET cidr = 'tag:other', proto = 'tcp;x' WHERE id = 'c-drop'`)
+			plan, script := l.load(load)
+			if !strings.Contains(script, "tcp dport 25 ip saddr @lv_tg_web drop") {
+				t.Errorf("the kept-last drop on the old group was not rendered:\n%s", script)
+			}
+			r, ok := invalidRow(plan, "cluster_firewall_rules", "c-drop")
+			if !ok || r.Handling != HandlingKeptLast {
+				t.Errorf("c-drop: %+v, %v; want kept last", r, ok)
+			}
+			if strings.Contains(r.Reason, "reserved") {
+				t.Errorf("c-drop's reason names the reserved prefix: %q", r.Reason)
+			}
+		})
+	}
+}
+
+// A kept accept on a group that has since gone renders against an empty set of
+// its name; another row's tag: accept on the same missing group declares that
+// empty set too. The plan declares it once: nft refuses a whole ruleset that
+// declares a set twice.
+//
+// Mutation: both empty sets appended — red.
+func TestTagGroupLoader_AKeptAcceptOnAGoneGroupDeclaresItsSetOnce(t *testing.T) {
+	l := newTGLab(t)
+	l.group("a", `{"match":{"role":"a"},"networks":[],"security_groups":[]}`)
+	l.clusterRule("c-1", "tcp", "25", "tag:a", "accept")
+	l.clusterRule("c-2", "tcp", "26", "tag:a", "accept")
+	load := l.loader("host-a", nil)
+	if _, script := l.load(load); !strings.Contains(script, "tcp dport 25 ip saddr @lv_tg_a accept") {
+		t.Fatalf("the tag: accept did not render:\n%s", script)
+	}
+	rawRow(t, l.db, `DELETE FROM cluster_policies WHERE key = ?`, corrosion.FirewallTagGroupKeyPrefix+"a")
+	rawRow(t, l.db, `UPDATE cluster_firewall_rules SET cidr = 'tag:b', proto = 'tcp;x' WHERE id = 'c-1'`)
+	plan, script := l.load(load)
+	if !strings.Contains(script, "tcp dport 25 ip saddr @lv_tg_a accept") {
+		t.Errorf("the kept-last accept was not rendered:\n%s", script)
+	}
+	n := 0
+	for _, s := range plan.IPSets {
+		if s.Name == "lv_tg_a" {
+			n++
+			if len(s.CIDRs) != 0 {
+				t.Errorf("lv_tg_a renders elements %v; want empty", s.CIDRs)
+			}
+		}
+	}
+	if n != 1 {
+		t.Errorf("lv_tg_a declared %d times; want once:\n%s", n, script)
+	}
+}
+
 // A negated deny on a group's set this pass does not render — missing, or
 // unreadable and never read here — means "deny everyone not in an unknown
 // group": it renders without its address, denying everyone, as a tag: deny

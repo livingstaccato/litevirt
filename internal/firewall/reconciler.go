@@ -801,7 +801,14 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			opts.OnTagGroupMembers(plan.TagGroups.Members)
 		}
 		plan.IPSets = append(plan.IPSets, q.sets()...)
-		plan.IPSets = append(plan.IPSets, tg.emptySets()...)
+		for _, s := range tg.emptySets() {
+			// A rendering kept from an earlier pass may have declared a gone
+			// group's empty set already (quarantine.judgingKept); nft refuses
+			// a ruleset that declares a set twice.
+			if !q.emptySets[s.Name] {
+				plan.IPSets = append(plan.IPSets, s)
+			}
+		}
 		plan.InvalidRows = append(append(plan.InvalidRows, badSets...), q.invalid...)
 		warnInvalidRows(plan.InvalidRows)
 

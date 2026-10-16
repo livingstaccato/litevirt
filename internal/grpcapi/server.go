@@ -39,6 +39,7 @@ import (
 // Server implements the LiteVirt gRPC service.
 type Server struct {
 	automationMu     sync.Mutex
+	automationSource *corrosion.AutomationSourcePreparer
 	automationEngine *automation.Engine
 	networkEffects   NetworkEffects
 	// reseeding admits one local reseed at a time; see reseed_singleflight.go.

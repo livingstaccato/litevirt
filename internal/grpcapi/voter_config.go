@@ -92,21 +92,7 @@ const voterConfigTimeout = 15 * time.Second
 // electorate, verified by v (this node's verifier, or its Historical form for
 // a generation at or below the anchor — voterAnchor).
 func verifyVoterConfigRow(v *corrosion.ClaimVerifier, prev, row *corrosion.VoterConfig) error {
-	if err := corrosion.ValidateVoterChange(prev, row.VoterConfigValue); err != nil {
-		return err
-	}
-	if row.MembersHash != corrosion.MembersHash(row.Members) {
-		return fmt.Errorf("members_hash does not match members_json")
-	}
-	want, err := corrosion.ExpectedVoterConfigCertificate(prev, row.VoterConfigValue)
-	if err != nil {
-		return err
-	}
-	cert, err := corrosion.DecodeClaimCertificate(row.Certificate)
-	if err != nil {
-		return err
-	}
-	return v.Verify(cert, want)
+	return corrosion.VerifyVoterConfigRow(v, prev, row)
 }
 
 // verifyVoterConfigRowNow checks row with this node's verifier as it stands
@@ -663,10 +649,7 @@ func (s *Server) remoteIncarnation(ctx context.Context, host string, gen int64) 
 	if err != nil {
 		return "", err
 	}
-	if resp.GetState().GetVoter() != host || resp.GetState().GetVoterIncarnation() == "" {
-		return "", fmt.Errorf("%s did not report an incarnation as itself", host)
-	}
-	return resp.GetState().GetVoterIncarnation(), nil
+	return corrosion.ReportedVoterIncarnation(host, resp)
 }
 
 func dedupSorted(in []string) []string {

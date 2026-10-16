@@ -34,6 +34,10 @@ var ErrProofPreparationChanged = errors.New("ordinary proof preparation changed;
 // validates syntax/escapes/depth; this pass counts the exact relevant arrays
 // and decoded PEM byte lengths without allocating their string values.
 func preflightProofJSON(raw string, config bool) error {
+	return preflightProofJSONLimits(raw, config, maxPreparedAccepts, maxPreparedMembers, maxPreparedAcceptPEMBytes)
+}
+
+func preflightProofJSONLimits(raw string, config bool, acceptLimit, memberLimit, pemLimit int) error {
 	if !json.Valid([]byte(raw)) {
 		return errors.New("invalid proof JSON")
 	}
@@ -106,7 +110,7 @@ func preflightProofJSON(raw string, config bool) error {
 				space()
 				if kind == 3 && strings.EqualFold(key, "cert_pem") && raw[i] == '"' {
 					_, size := stringEnd()
-					if size > maxPreparedAcceptPEMBytes {
+					if size > pemLimit {
 						return ErrProofPreparationSize
 					}
 				} else if err := walk(child); err != nil {
@@ -129,12 +133,12 @@ func preflightProofJSON(raw string, config bool) error {
 				count++
 				child := 0
 				if kind == 2 {
-					if count > maxPreparedAccepts {
+					if count > acceptLimit {
 						return ErrProofPreparationSize
 					}
 					child = 3
 				}
-				if kind == 4 && count > maxPreparedMembers {
+				if kind == 4 && count > memberLimit {
 					return ErrProofPreparationSize
 				}
 				if err := walk(child); err != nil {

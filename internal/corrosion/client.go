@@ -114,8 +114,11 @@ type Config struct {
 
 // Client is the embedded state store with WAL-based replication.
 type Client struct {
-	automationSeams *localCommitSeams
-	db              *sql.DB
+	automationSeams              *localCommitSeams
+	automationSourceMu           sync.Mutex
+	automationSourceClosed       bool
+	automationSourcePreparations map[*AutomationSourcePreparation]bool
+	db                           *sql.DB
 	// memKeeper holds a test client's in-memory database open while the
 	// pool above reaps idle connections (openTestDB). Nil outside tests.
 	memKeeper *sql.DB
@@ -1220,6 +1223,16 @@ func NewLocalClient(dataDir string, hostName ...string) (*Client, error) {
 
 // Close leaves the gossip cluster and closes the database.
 func (c *Client) Close() error {
+	c.automationSourceMu.Lock()
+	c.automationSourceClosed = true
+	preparations := make([]*AutomationSourcePreparation, 0, len(c.automationSourcePreparations))
+	for p := range c.automationSourcePreparations {
+		preparations = append(preparations, p)
+	}
+	c.automationSourceMu.Unlock()
+	for _, p := range preparations {
+		p.Discard()
+	}
 	if c.stopMembership != nil {
 		c.stopMembership()
 		<-c.membershipDone

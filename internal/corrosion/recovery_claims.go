@@ -567,6 +567,7 @@ func (s *ClaimSigner) Sign(key ClaimKey, gen int64, b Ballot, digest, incarnatio
 // (§3.10 steps 4–5). It needs no private key and makes no RPC: a destination
 // verifies without re-querying any voter.
 type ClaimVerifier struct {
+	sourceTrust               *pki.HostTrust
 	ordinary                  *pki.OrdinaryClaimTrust
 	policyCell                *atomic.Bool
 	policyPinned, policyNoPin bool
@@ -786,7 +787,7 @@ func (v *ClaimVerifier) pinRefuses(c *x509.Certificate, voter string) error {
 // before any accept is judged, so a renewed voter's own accept in a row proves
 // its predecessor replaced for the rest of that row as well.
 func (v *ClaimVerifier) noteSuccessors(certPEMs ...string) {
-	if v.ordinary != nil {
+	if v.ordinary != nil || v.sourceTrust != nil {
 		return
 	}
 	for _, p := range certPEMs {
@@ -874,17 +875,32 @@ func (v *ClaimVerifier) verifyAccept(cert ClaimCertificate, a ClaimAccept, elect
 	if v.ordinary != nil && !v.ordinary.Contains(c) {
 		return fmt.Errorf("unprepared accept certificate")
 	}
-	if _, err := c.Verify(x509.VerifyOptions{Roots: v.roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err != nil {
-		return fmt.Errorf("certificate does not chain to the cluster CA: %w", err)
+	if v.sourceTrust != nil {
+		if v.renewalBlind {
+			return fmt.Errorf("diagnostic renewal mode is not source authority")
+		}
+		if _, _, err := v.sourceTrust.VerifyOrdinaryCertificate(c.Raw, v.historical, v.pinned); err != nil {
+			return err
+		}
+		if !v.historical && v.extraRevoked[strings.ToLower(c.SerialNumber.Text(16))] {
+			return fmt.Errorf("certificate is revoked")
+		}
+	} else {
+		if _, err := c.Verify(x509.VerifyOptions{Roots: v.roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err != nil {
+			return fmt.Errorf("certificate does not chain to the cluster CA: %w", err)
+		}
+		if c.Subject.CommonName != a.Voter {
+			return fmt.Errorf("signed with %q's certificate", c.Subject.CommonName)
+		}
+		if v.revoked(c) {
+			return fmt.Errorf("certificate %s is revoked", c.SerialNumber.Text(16))
+		}
+		if err := v.pinRefuses(c, a.Voter); err != nil {
+			return err
+		}
 	}
 	if c.Subject.CommonName != a.Voter {
 		return fmt.Errorf("signed with %q's certificate", c.Subject.CommonName)
-	}
-	if v.revoked(c) {
-		return fmt.Errorf("certificate %s is revoked", c.SerialNumber.Text(16))
-	}
-	if err := v.pinRefuses(c, a.Voter); err != nil {
-		return err
 	}
 	pub, ok := c.PublicKey.(*ecdsa.PublicKey)
 	if !ok {

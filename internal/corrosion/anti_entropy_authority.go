@@ -675,6 +675,13 @@ func (c *Client) operationStepAuthorityKeepsLocal(tx *sql.Tx, table syncTable, r
 		!sameOperationMergeAuthority(local, sourceOp) {
 		return true, nil
 	}
+	// Known gap: a step is taken from a peer only while the source holds a
+	// live workload at the header's owner epoch. A reservation release row
+	// (ReservationReleasedFacts) on a create whose workload is gone, or on a
+	// legacy epoch-0 create, therefore never converges by anti-entropy, only by
+	// the live stream; a replica that missed it keeps counting the reservation
+	// until the operation is reaped. Only legacy rows have this shape: no
+	// production path begins a workload_create operation in this build.
 	a, ok := sourceOperationWorkloadAuthority(sourceOp, m)
 	if !ok || !a.valid {
 		return true, nil

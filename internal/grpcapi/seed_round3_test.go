@@ -16,8 +16,8 @@ import (
 )
 
 // Re-review N2: a VM's seed written before seeds were stamped (every VM of a
-// released cluster) is the VM's own when its instance-id is one the VM's
-// create wrote. An attach rebuilds it keeping meta-data and user-data byte for
+// released cluster) is the VM's own when its domain attaches it as its cdrom
+// (re-review 2 N4) and its instance-id is one the VM's create wrote. An attach rebuilds it keeping meta-data and user-data byte for
 // byte — a replaced VM keeps its <name>-next instance-id, so no guest runs
 // first boot again — and stamps it.
 //
@@ -37,6 +37,7 @@ func TestNICHotplug_UnstampedOwnSeedIsRebuiltInPlace(t *testing.T) {
 				{VMName: "x", NetworkName: "lan", MAC: "52:54:00:6e:00:01"},
 				{VMName: "x", NetworkName: "lan3", Ordinal: 1, MAC: "52:54:00:6e:00:03"}}, "running",
 				cloudinit.Config{InstanceID: instanceID, LocalHostname: instanceID, UserData: "#cloud-config\npassword: seed\n"}, "")
+			attachSeedCDROM(t, s, "x", iso)
 			if _, err := s.AttachDevice(adminCtx(), &pb.AttachDeviceRequest{VmName: "x", Nic: &pb.NetworkAttachment{Name: "lan2", Mac: "52:54:00:6e:00:02"}}); err != nil {
 				t.Fatalf("attach: %v", err)
 			}
@@ -59,7 +60,7 @@ func TestNICHotplug_UnstampedOwnSeedIsRebuiltInPlace(t *testing.T) {
 
 // Re-review N2: an unstamped seed whose instance-id the VM's create never
 // wrote (a deleted VM of another name, a renamed VM) is left untouched, with
-// an event naming the file.
+// an event naming the file — even attached as the VM's cdrom.
 //
 // Mutation: take every unstamped seed as the VM's — it is rewritten.
 func TestNICHotplug_UnstampedForeignSeedIsLeftAlone(t *testing.T) {
@@ -72,6 +73,7 @@ func TestNICHotplug_UnstampedForeignSeedIsLeftAlone(t *testing.T) {
 		{VMName: "x", NetworkName: "lan", MAC: "52:54:00:6f:00:01"},
 		{VMName: "x", NetworkName: "lan3", Ordinal: 1, MAC: "52:54:00:6f:00:03"}}, "running",
 		cloudinit.Config{InstanceID: "other", LocalHostname: "other", UserData: "#cloud-config\n"}, "")
+	attachSeedCDROM(t, s, "x", iso)
 	before, _ := os.ReadFile(iso)
 	if _, err := s.AttachDevice(adminCtx(), &pb.AttachDeviceRequest{VmName: "x", Nic: &pb.NetworkAttachment{Name: "lan2", Mac: "52:54:00:6f:00:02"}}); err != nil {
 		t.Fatalf("attach: %v", err)
@@ -104,6 +106,7 @@ func TestNICHotplug_LegacyUnstampedSeedSurvivesAmbiguity(t *testing.T) {
 		{VMName: "lg", NetworkName: "lan1", Ordinal: 1, MAC: macA, IP: "10.1.0.50"},
 	}, "running", cloudinit.Config{InstanceID: "lg", LocalHostname: "lg", UserData: "#cloud-config\n{}\n",
 		NetworkConfig: cloudinit.BuildV1([]cloudinit.StaticIface{{MAC: macX, Address: "10.0.0.10/24"}, {MAC: macA, Address: "10.1.0.50/24"}})}, "")
+	attachSeedCDROM(t, s, "lg", iso)
 	// 1. A clean attach: the seed gains C and the vendor-data, and is stamped.
 	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{VmName: "lg", Nic: &pb.NetworkAttachment{Name: "lan2", Mac: macC}}); err != nil {
 		t.Fatalf("attach: %v", err)
@@ -170,6 +173,7 @@ func TestNICHotplug_UnstampedAmbiguousSeedIsKept(t *testing.T) {
 		{VMName: "lg", NetworkName: "lan1", Ordinal: 1, MAC: macA, IP: "10.1.0.50"},
 	}, "running", cloudinit.Config{InstanceID: "lg", LocalHostname: "lg", UserData: "#cloud-config\n{}\n",
 		NetworkConfig: cloudinit.BuildV1([]cloudinit.StaticIface{{MAC: macX, Address: "10.0.0.10/24"}, {MAC: macA, Address: "10.1.0.50/24"}})}, "")
+	attachSeedCDROM(t, s, "lg", iso)
 	before, _ := os.ReadFile(iso)
 	if _, err := s.AttachDevice(adminCtx(), &pb.AttachDeviceRequest{VmName: "lg", Nic: &pb.NetworkAttachment{Name: "lan2", Mac: "52:54:00:71:00:03"}}); err != nil {
 		t.Fatalf("attach: %v", err)

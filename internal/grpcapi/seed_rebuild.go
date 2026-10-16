@@ -19,15 +19,16 @@ import (
 // lists the NICs the VM has (cloudinit.SeedNetworkConfig) and asks cloud-init
 // to apply it again on boot (cloudinit.SeedVendorData).
 //
-//   - Only the VM's own seed is rewritten (cloudinit.OwnSeed: stamped for it,
-//     or unstamped with an instance-id its create wrote), and only its
-//     network-config and vendor-data: its meta-data — the instance-id — and
-//     user-data are kept byte for byte, so the guest is never a new instance,
-//     and an unstamped one is stamped. Each NIC keeps the guest name that seed
-//     gives it.
-//   - Any other seed at the path is left untouched and reported: it is never
-//     rebuilt from, nor written again live under the running guest; the
-//     VM's next start writes its own.
+//   - Only the VM's own seed is rewritten (cloudinit.OwnSeed: a VM with
+//     cloud-init, and a seed stamped for it, or unstamped and attached as the
+//     cdrom of the VM's domain here), and only its network-config and
+//     vendor-data: its meta-data — the instance-id — and user-data are kept
+//     byte for byte, so the guest is never a new instance, and an unstamped
+//     one is stamped. Each NIC keeps the guest name that seed gives it.
+//   - Any other seed at the path is left untouched — never rebuilt from,
+//     stamped, nor written again live under the running guest — and
+//     reported; the VM's next start writes its own, or none for a VM
+//     without cloud-init.
 //   - Where the VM's NICs cannot be told from its spec
 //     (cloudinit.ErrNICsAmbiguous), the seed is left exactly as it is and the
 //     reason reported.
@@ -52,15 +53,20 @@ func (s *Server) rebuildSeedNetworkConfig(ctx context.Context, vm *corrosion.VMR
 		s.recordVMEvent(ctx, vm.Name, "seed.rebuild_failed", "error", detail)
 	}
 	uuid := cloudinit.SpecUUID(vm.Spec)
-	cur, own, err := cloudinit.OwnSeed(iso, vm.Name, uuid)
+	var spec pb.VMSpec
+	specErr := json.Unmarshal([]byte(vm.Spec), &spec)
+	cur, own, err := cloudinit.OwnSeed(iso, s.seedClaim(vm, &spec))
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return
 	case err != nil:
 		failed(err)
 		return
+	case specErr != nil:
+		failed(fmt.Errorf("parse the VM's spec: %w", specErr))
+		return
 	case !own:
-		detail := fmt.Sprintf("the seed at %s on %s was not written for this VM (a VM of the same name, or one renamed since, left it); it is left as it is, and not changed under the running guest; the VM's next start on %s writes its own, or remove the file", iso, s.hostName, s.hostName)
+		detail := fmt.Sprintf("the seed at %s on %s is not proven this VM's (not stamped for it, and not the cdrom of its domain here; a VM of the same name may have left it); it is left as it is, and not changed under the running guest; the VM's next start on %s writes its own, or none for a VM without cloud-init; or remove the file", iso, s.hostName, s.hostName)
 		slog.Warn("seed rebuild: not this VM's seed; left alone", "vm", vm.Name, "seed", iso)
 		s.recordVMEventSeverity(ctx, vm.Name, "seed.not_rebuilt", "ok", "warning", detail)
 		return
@@ -72,11 +78,6 @@ func (s *Server) rebuildSeedNetworkConfig(ctx context.Context, vm *corrosion.VMR
 		if err := cloudinit.StampSeed(iso, uuid); err != nil {
 			slog.Warn("seed rebuild: could not stamp the seed with its VM", "vm", vm.Name, "error", err)
 		}
-	}
-	var spec pb.VMSpec
-	if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil {
-		failed(fmt.Errorf("parse the VM's spec: %w", err))
-		return
 	}
 	var adds []string
 	if added != "" {
@@ -114,4 +115,18 @@ func (s *Server) rebuildSeedNetworkConfig(ctx context.Context, vm *corrosion.VMR
 		slog.Warn("seed rebuild: reload the seed cdrom", "vm", vm.Name, "seed", iso, "error", err)
 		s.recordVMEvent(ctx, vm.Name, "seed.reload_failed", "error", detail)
 	}
+}
+
+// seedClaim is what this host knows of vm for cloudinit.OwnSeed: its spec
+// (spec, parsed from vm.Spec) and its domain definition here, read-only. A
+// definition that cannot be read attaches nothing.
+func (s *Server) seedClaim(vm *corrosion.VMRecord, spec *pb.VMSpec) cloudinit.SeedClaim {
+	return cloudinit.SeedClaim{VMName: vm.Name, UUID: cloudinit.SpecUUID(vm.Spec),
+		CloudInit: cloudinit.SpecHasCloudInit(spec), DomainXML: func() string {
+			x, err := s.virt.DumpXMLInactive(vm.Name)
+			if err != nil {
+				return ""
+			}
+			return x
+		}}
 }

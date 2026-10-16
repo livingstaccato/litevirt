@@ -2528,7 +2528,7 @@ func (s *Server) ensureCloudInitRequest(ctx context.Context, vm *corrosion.VMRec
 	// when the network-config cannot be derived. Whose it is is the hotplug
 	// rebuild's rule (cloudinit.OwnSeed).
 	iso := lv.CloudInitISOPath(s.dataDir, vm.Name)
-	own, ours, _ := cloudinit.OwnSeed(iso, vm.Name, cloudinit.SpecUUID(vm.Spec))
+	own, ours, _ := cloudinit.OwnSeed(iso, s.seedClaim(vm, &spec))
 	var prior *cloudinit.Prior
 	if ours {
 		prior = cloudinit.PriorFrom(own.NetworkConfig)

@@ -9,17 +9,22 @@ import (
 	"testing"
 )
 
-// Re-review N2: whose a seed is, one rule for every path that reuses a seed
-// (the hotplug rebuild, a migration source). A seed stamped for the VM is its
-// own and one stamped for another VM is not. An unstamped seed — every seed an
-// earlier release wrote — is the VM's when its instance-id is one the VM's
-// create wrote: its name, or the name a replacement was created under
-// (<name>-next) before the cutover renamed it. Anything else (a deleted VM of
-// another name's, a renamed VM's) is not proven the VM's.
+// Re-review N2, re-review 2 N4: whose a seed is, one rule for every path that
+// reuses a seed (the hotplug rebuild, a migration source, the reconciler). A
+// VM whose spec has no cloud-init owns no seed. Otherwise a seed stamped for
+// the VM is its own and one stamped for another VM is not. An unstamped seed —
+// every seed an earlier release wrote — is the VM's only when the VM's domain
+// here attaches exactly that file as its cdrom (the guest boots from it
+// already), that domain is not another VM's, and its instance-id is one the
+// VM's create wrote: its name, or <name>-next. The instance-id alone cannot
+// tell a deleted VM of the same name from this one: such a VM's leftover seed
+// is never taken on it.
 //
-// Mutation: take every unstamped seed as the VM's — the foreign case goes red;
-// none — the name and -next cases go red; ignore the stamp — the stamped-other
-// case goes red.
+// Mutation: take an unstamped seed of the VM's name as its own without the
+// cdrom check — "unstamped-name, no domain" goes red; skip the cloud-init
+// check — both no-cloud-init cases go red; skip the domain uuid check —
+// "another VM's domain" goes red; skip the instance-id check — "foreign"
+// goes red; ignore the stamp — "stamped-other" goes red.
 func TestOwnSeed(t *testing.T) {
 	if _, err := exec.LookPath("genisoimage"); err != nil {
 		t.Skip("genisoimage not installed")
@@ -38,18 +43,42 @@ func TestOwnSeed(t *testing.T) {
 		}
 		return iso
 	}
+	const specUUID, otherUUID = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+	domain := func(uuid, cdrom string) func() string {
+		return func() string {
+			return "<domain type='kvm'><name>vm</name><uuid>" + uuid + "</uuid><devices>" +
+				"<disk type='file' device='cdrom'><source file='" + cdrom + "'/><target dev='sdb' bus='sata'/></disk>" +
+				"</devices></domain>"
+		}
+	}
 	for _, tc := range []struct {
 		name, instanceID, stamp string
+		cloudInit               bool
+		domainUUID              string // "" = no domain here
+		domainCDROM             string // "" = the seed itself
 		want                    bool
 	}{
-		{"stamped-own", "x", "u1", true},
-		{"stamped-other", "x", "u2", false},
-		{"unstamped-name", "vm", "", true},
-		{"unstamped-next", "vm-next", "", true},
-		{"unstamped-foreign", "other", "", false},
+		{"stamped-own", "x", specUUID, true, "", "", true},
+		{"stamped-other", "x", otherUUID, true, "", "", false},
+		{"stamped-own, no cloud-init", "x", specUUID, false, specUUID, "", false},
+		{"unstamped-name, attached", "vm", "", true, specUUID, "", true},
+		{"unstamped-next, attached", "vm-next", "", true, specUUID, "", true},
+		{"unstamped-name, no domain", "vm", "", true, "", "", false},
+		{"unstamped-name, domain attaches another file", "vm", "", true, specUUID, "/elsewhere/vm.iso", false},
+		{"unstamped-name, another VM's domain", "vm", "", true, otherUUID, "", false},
+		{"unstamped-name, attached, no cloud-init", "vm", "", false, specUUID, "", false},
+		{"unstamped-foreign, attached", "other", "", true, specUUID, "", false},
 	} {
-		iso := write(tc.name, tc.instanceID, tc.stamp)
-		sd, own, err := OwnSeed(iso, "vm", "u1")
+		iso := write(strings.NewReplacer(" ", "_", ",", "", "'", "").Replace(tc.name), tc.instanceID, tc.stamp)
+		c := SeedClaim{VMName: "vm", UUID: specUUID, CloudInit: tc.cloudInit}
+		if tc.domainUUID != "" {
+			cdrom := tc.domainCDROM
+			if cdrom == "" {
+				cdrom = iso
+			}
+			c.DomainXML = domain(tc.domainUUID, cdrom)
+		}
+		sd, own, err := OwnSeed(iso, c)
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
@@ -60,11 +89,13 @@ func TestOwnSeed(t *testing.T) {
 			t.Errorf("%s: seed not returned: %+v", tc.name, sd)
 		}
 	}
-	// A VM with no spec uuid: an unstamped seed of its name is still its own.
-	if _, own, _ := OwnSeed(write("nouuid", "vm", ""), "vm", ""); !own {
-		t.Error("a VM with no uuid does not own its unstamped seed")
+	// A VM with no spec uuid: an unstamped seed of its name that its domain
+	// attaches is still its own.
+	nouuid := write("nouuid", "vm", "")
+	if _, own, _ := OwnSeed(nouuid, SeedClaim{VMName: "vm", CloudInit: true, DomainXML: domain(otherUUID, nouuid)}); !own {
+		t.Error("a VM with no uuid does not own its unstamped seed its domain attaches")
 	}
-	if _, _, err := OwnSeed(filepath.Join(dir, "missing.iso"), "vm", "u1"); !errors.Is(err, fs.ErrNotExist) {
+	if _, _, err := OwnSeed(filepath.Join(dir, "missing.iso"), SeedClaim{VMName: "vm", UUID: specUUID, CloudInit: true}); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("missing seed: err = %v, want fs.ErrNotExist", err)
 	}
 }

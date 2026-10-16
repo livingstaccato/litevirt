@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // Seed is the files of a NoCloud seed. NetworkConfig and VendorData are ""
@@ -215,14 +216,42 @@ const NetworkUpdatesOffVendorData = "#cloud-config\nupdates:\n  network:\n    wh
 // fallback, DHCP on one NIC.
 const NetworkConfigDisabled = "network:\n  config: disabled\n"
 
+// SeedClaim is what a host knows of the VM a seed at its path may belong to.
+type SeedClaim struct {
+	VMName string
+	// UUID is the VM's spec uuid (SpecUUID), "" for a VM from before them.
+	UUID string
+	// CloudInit is whether the VM's spec has cloud-init (SpecHasCloudInit).
+	CloudInit bool
+	// DomainXML returns the VM's current domain definition on this host,
+	// read from libvirt: "" when the host has none or it could not be read.
+	// It is called only for an unstamped seed; nil reads as none.
+	DomainXML func() string
+}
+
+// SpecHasCloudInit reports whether a VM with spec boots on a seed: a cloud
+// image, or a spec with a cloud-init section. Any seed at the path of a VM
+// without either is not the VM's.
+func SpecHasCloudInit(spec *pb.VMSpec) bool {
+	return spec.GetImage() != "" || spec.GetCloudInit() != nil
+}
+
 // OwnSeed reads the seed at iso and reports whether it is the seed of the VM
-// named vmName whose spec uuid is uuid: stamped for uuid (StampSeed), or —
-// written before seeds were stamped — unstamped with an instance-id the VM's
-// create wrote: its name, or <name>-next, the name a replacement is created
-// under before a cutover gives it the name (vm_replace). A seed stamped for
-// another VM, or unstamped with any other instance-id, is not proven the
-// VM's. The error is fs.ErrNotExist for no seed, or the read's.
-func OwnSeed(iso, vmName, uuid string) (Seed, bool, error) {
+// c describes. Only a VM whose spec has cloud-init owns a seed. Then:
+//   - a seed stamped (StampSeed) for the VM's uuid is its own; one stamped for
+//     another uuid is not;
+//   - an unstamped seed (written before seeds were stamped) is its own only
+//     when the VM's current domain definition on this host attaches exactly
+//     that file as its cdrom (so the guest already boots from it), the
+//     domain is not another VM's (its uuid, when both are known), and its
+//     instance-id is one the VM's create wrote: its name, or <name>-next, the
+//     name a replacement is created under before a cutover gives it the name
+//     (vm_replace). The instance-id is the VM's name, so it cannot tell a
+//     deleted VM of the name from this one: an unstamped seed such a VM left
+//     on this host is never this VM's on that ground alone.
+//
+// The error is fs.ErrNotExist for no seed, or the read's.
+func OwnSeed(iso string, c SeedClaim) (Seed, bool, error) {
 	owner, stamped, err := SeedOwner(iso)
 	if err != nil {
 		return Seed{}, false, err
@@ -231,9 +260,22 @@ func OwnSeed(iso, vmName, uuid string) (Seed, bool, error) {
 	if err != nil {
 		return Seed{}, false, err
 	}
+	if !c.CloudInit {
+		return seed, false, nil
+	}
 	if stamped {
-		return seed, uuid != "" && owner == uuid, nil
+		return seed, c.UUID != "" && owner == c.UUID, nil
+	}
+	domXML := ""
+	if c.DomainXML != nil {
+		domXML = c.DomainXML()
+	}
+	if !lv.DomainAttachesCDROM(domXML, iso) {
+		return seed, false, nil
+	}
+	if dom := lv.UUIDFromXML(domXML); c.UUID != "" && dom != "" && !strings.EqualFold(dom, c.UUID) {
+		return seed, false, nil
 	}
 	id := seed.InstanceID()
-	return seed, id != "" && (id == vmName || id == vmName+"-next"), nil
+	return seed, id != "" && (id == c.VMName || id == c.VMName+"-next"), nil
 }

@@ -2328,6 +2328,23 @@ func (r *Reconciler) reportPITHeld(ctx context.Context, vm, disk, detail string)
 	})
 }
 
+// seedClaim is what this host knows of vm for cloudinit.OwnSeed: its spec
+// and the domain definition of its name here, if any, read-only. A definition
+// that cannot be read attaches nothing.
+func (r *Reconciler) seedClaim(vm corrosion.VMRecord, spec *pb.VMSpec) cloudinit.SeedClaim {
+	return cloudinit.SeedClaim{VMName: vm.Name, UUID: cloudinit.SpecUUID(vm.Spec),
+		CloudInit: cloudinit.SpecHasCloudInit(spec), DomainXML: func() string {
+			if !r.virt.DomainExists(vm.Name) {
+				return ""
+			}
+			x, err := r.virt.DumpXMLInactive(vm.Name)
+			if err != nil {
+				return ""
+			}
+			return x
+		}}
+}
+
 // domainXMLFor builds vm's domain XML on this host from its stored spec and
 // the disk configs the caller resolved: the cloud-init ISO, the networks
 // (provisioned here), firmware and resources. On failure it returns "" with
@@ -2343,11 +2360,15 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		return "", false, fmt.Sprintf("invalid name: %v", isoErr) // non-retryable
 	}
 	// A seed here is reused only when it is this VM's: one left by a deleted
-	// VM of the name would boot its user-data (cloudinit/seed_owner.go).
+	// VM of the name would boot its user-data (cloudinit/seed_owner.go). A VM
+	// whose spec has no cloud-init gets no seed at all, stamped or not: no
+	// create or clone writes one for it, so any file at its path is another
+	// VM's, or a copy a migration made of one.
 	seedOwner := cloudinit.SpecUUID(vm.Spec)
-	if cloudinit.SeedIsFor(isoPath, seedOwner) {
+	hasCloudInit := cloudinit.SpecHasCloudInit(spec)
+	if hasCloudInit && cloudinit.SeedIsFor(isoPath, seedOwner) {
 		cloudInitISO = isoPath
-	} else if spec.CloudInit != nil || spec.Image != "" {
+	} else if hasCloudInit {
 		// Regenerate the seed the VM was created with: its user-data, and
 		// the network-config derived from the spec, its NIC rows and its
 		// networks exactly as CreateVM derived it (a cloud image with no
@@ -2376,7 +2397,7 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 			// so a guest that recorded the update events earlier keeps the
 			// network it has rather than rendering cloud-init's fallback.
 			var detail string
-			if own, ok, _ := cloudinit.OwnSeed(isoPath, vm.Name, seedOwner); ok {
+			if own, ok, _ := cloudinit.OwnSeed(isoPath, r.seedClaim(vm, spec)); ok {
 				netCfg, vendorData = own.NetworkConfig, own.VendorData
 				detail = fmt.Sprintf("the seed written on %s keeps the network-config of the VM's seed there: %v (the spec of a VM created before it recorded NIC MACs); configure changed NICs in the guest", r.hostName, ncErr)
 			} else {

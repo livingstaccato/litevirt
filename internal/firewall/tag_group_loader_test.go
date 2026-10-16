@@ -863,3 +863,32 @@ func TestTagGroupLoader_ANegatedDenyOnAGroupNotRenderedDeniesEveryone(t *testing
 		})
 	}
 }
+
+// Defence in depth (D4 review I-3, D5b review m-3): no pass can render a
+// negated reference to a group's set, but if a kept rendering ever held one,
+// an accept on it is still left out — "not a member" accepted would admit
+// every workload whose membership cannot be proven. The rendering is injected
+// as the row's last one, since the loader cannot produce it.
+//
+// Mutation: drop the branch after q.rule — the accept renders, red.
+func TestTagGroupLoader_ANegatedAcceptOnAGroupsSetIsNeverRendered(t *testing.T) {
+	key := "cluster_firewall_rules/c1"
+	prev := map[string]Rule{key: FromCorrosionRule("ingress", "tcp", "22", "!= @lv_tg_web", "accept")}
+	q := newQuarantine([]IPSet{{Name: "lv_tg_web", CIDRs: []string{"10.0.0.5"}}}, nil, prev, nil, time.Now())
+	tp := &tagPass{readable: map[string]bool{"web": true}, groups: map[string]corrosion.FirewallTagGroup{},
+		whyNot: map[string]string{}, empty: map[string]bool{}, reported: map[string]bool{}}
+	// The row turns unreadable here, so its last rendering would be kept.
+	if r, ok := tp.rule(q, "cluster_firewall_rules", "c1", "ingress", "tcp;x", "22", "tag:web", "accept", ""); ok {
+		t.Fatalf("a negated accept on a group's set was rendered: %+v", r)
+	}
+	if _, kept := q.next[key]; kept {
+		t.Error("the negated accept stays in the pass's renderings, to be kept by the next pass")
+	}
+	found := false
+	for _, inv := range q.invalid {
+		found = found || (inv.ID == "c1" && inv.Handling == HandlingLeftOut && strings.Contains(inv.Reason, "not in a tag group's set"))
+	}
+	if !found {
+		t.Errorf("not reported as left out: %+v", q.invalid)
+	}
+}

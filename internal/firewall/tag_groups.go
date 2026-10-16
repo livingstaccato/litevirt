@@ -349,6 +349,8 @@ func (t *tagPass) rule(q *quarantine, table, id, direction, proto, port, cidr, a
 		switch {
 		case valid && t.readable[name]:
 			cidr = "@" + set
+			// Before q.rule, which may render a kept rendering instead: a
+			// set never rendered then only widens the hold (fails closed).
 			t.noteDeny(cidr, action)
 		case !isAccept(action):
 			// A deny keeps everything but the address (I-6).
@@ -389,10 +391,21 @@ func (t *tagPass) rule(q *quarantine, table, id, direction, proto, port, cidr, a
 	if !ok {
 		return r, false
 	}
-	// No rendering names a group's set negated: the tag pass rewrites tag:<g>
-	// to the positive @lv_tg_<g>, and a row stored as != @lv_tg_<g> is left out
-	// by userSetName (or, as a deny on a group not rendered, loses its address
-	// above). So "not a member" is never accepted (D4 review I-3).
+	if set, isRef := rulefield.SetRef(r.CIDR); isRef && strings.HasPrefix(set, TagGroupSetPrefix) && rulefield.NegatedSetRef(r.CIDR) &&
+		(r.Action == Accept || r.Action == "") {
+		// Defence in depth: "not a member" accepted would admit every
+		// workload whose membership cannot be proven (D4 review I-3), so it is
+		// left out, which matches nothing. No rendering should reach this —
+		// the tag pass writes the positive @lv_tg_<g>, a row stored as
+		// != @lv_tg_<g> is left out by userSetName (or, as a deny on a group
+		// not rendered, loses its address above), and a kept rendering is one
+		// of those — but the firewall fails closed when that is wrong.
+		delete(q.next, table+"/"+id)
+		q.invalid = append(q.invalid, InvalidRow{Table: table, ID: id, Action: action,
+			Reason:   fmt.Sprintf("cidr %q accepts what is not in a tag group's set, which would admit a workload whose membership cannot be proven", r.CIDR),
+			Handling: HandlingLeftOut})
+		return Rule{}, false
+	}
 	t.noteDeny(r.CIDR, string(r.Action))
 	// A rendering this host kept from an earlier pass (the row turned
 	// unreadable) may name a group's set this pass does not render: a deny

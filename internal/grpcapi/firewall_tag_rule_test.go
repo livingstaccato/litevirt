@@ -286,6 +286,114 @@ firewall:
 	}
 }
 
+// firstUseWatch is a relGate that runs onUse when a feature's first use is
+// granted, before the write it guards.
+type firstUseWatch struct {
+	*relGate
+	onUse func(capabilities.Feature)
+}
+
+func (g *firstUseWatch) WithFeature(ctx context.Context, f capabilities.Feature,
+	write func(context.Context, capabilities.FeatureGrant) error) error {
+	return g.relGate.WithFeature(ctx, f, func(ctx context.Context, grant capabilities.FeatureGrant) error {
+		g.onUse(f)
+		return write(ctx, grant)
+	})
+}
+
+// D5b (spec §4.8): a stack deploy holding a tag: cidr takes the
+// firewall_tag_groups first use before it tears the stack's rows down, as
+// for IPv6. A first use the gate cannot complete (a recipient that never
+// acks) leaves every old row, default-deny included, as it was; one that
+// completes is taken while the old rows are still there.
+//
+// Mutation: the preflight takes no first use (the per-row write takes it,
+// after the teardown) — red.
+func TestStackFirewall_TagFirstUseBeforeTeardown(t *testing.T) {
+	bg := context.Background()
+	parse := func(sgCIDR, clusterCIDR string) *compose.File {
+		t.Helper()
+		f, err := compose.ParseStored([]byte(`
+name: dd
+security-groups:
+  web:
+    rules:
+      - {direction: ingress, proto: tcp, port: "80", cidr: "10.0.0.0/8", action: accept}
+      - {direction: ingress, proto: tcp, port: "443", cidr: "` + sgCIDR + `", action: drop}
+firewall:
+  default-deny: true
+  cluster-rules:
+    - {direction: ingress, proto: tcp, port: "22", cidr: "` + clusterCIDR + `", action: accept}
+`))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		return f
+	}
+	for _, c := range []struct{ name, sgCIDR, clusterCIDR string }{
+		{"in a security-group rule", "tag:web", "10.0.0.0/8"},
+		{"in a cluster rule", "10.1.0.0/16", "tag:web"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s, g, _, _ := tagRuleServer(t)
+			g.open = true
+			setTagGroup(t, s, "web")
+			if err := s.persistStackFirewall(bg, parse("10.1.0.0/16", "10.0.0.0/8")); err != nil {
+				t.Fatal(err)
+			}
+			oldSG, _ := corrosion.ListSecurityGroups(bg, s.db, "dd")
+			oldRules, _ := corrosion.ListClusterFirewallRules(bg, s.db)
+			if len(oldSG) != 1 || len(oldRules) != 1 {
+				t.Fatalf("premise: groups %+v, cluster rules %+v", oldSG, oldRules)
+			}
+			unchanged := func() bool {
+				sgs, _ := corrosion.ListSecurityGroups(bg, s.db, "dd")
+				rules, _ := corrosion.ListClusterFirewallRules(bg, s.db)
+				def, err := corrosion.GetFirewallDefault(bg, s.db, "cluster")
+				if err != nil || def == nil || !def.DefaultDeny {
+					return false
+				}
+				if len(sgs) != 1 || sgs[0].ID != oldSG[0].ID || len(rules) != 1 || rules[0].ID != oldRules[0].ID {
+					return false
+				}
+				r, _ := corrosion.ListSGRules(bg, s.db, sgs[0].ID)
+				return len(r) == 2
+			}
+
+			g.refuseFirstUse, g.refuseCode = true, codes.Unavailable
+			if err := s.persistStackFirewall(bg, parse(c.sgCIDR, c.clusterCIDR)); err == nil {
+				t.Fatal("a redeploy whose tag-group first use was refused reported success")
+			}
+			if !unchanged() {
+				t.Error("a redeploy whose tag-group first use was refused changed the stack's rows or its default-deny")
+			}
+			if tagRuleCount(t, s, "tag:web") != 0 {
+				t.Error("a refused redeploy stored a tag: rule")
+			}
+
+			g.refuseFirstUse = false
+			taken := false
+			s.SetReleaseFeatureGate(&firstUseWatch{relGate: g, onUse: func(f capabilities.Feature) {
+				if f == capabilities.FeatureFirewallTagGroups && !taken {
+					taken = true
+					if !unchanged() {
+						t.Error("the tag-group first use was taken after the stack's rows were torn down")
+					}
+				}
+			}})
+			if err := s.persistStackFirewall(bg, parse(c.sgCIDR, c.clusterCIDR)); err != nil {
+				t.Fatalf("the redeploy once the first use completes: %v", err)
+			}
+			if !taken || !slices.Contains(g.used, capabilities.FeatureFirewallTagGroups) {
+				t.Errorf("no tag-group first use recorded: %v", g.used)
+			}
+			if n := tagRuleCount(t, s, "tag:web"); n != 1 {
+				t.Errorf("tag:web rules = %d, want 1", n)
+			}
+		})
+	}
+}
+
 // D5a (0-F): the sweep's probes include firewall_tag_groups' data. A tag
 // rule an older entry daemon stored verbatim, with no recorded use, has its
 // use recorded by the lease holder's sweep; with no data nothing is recorded.

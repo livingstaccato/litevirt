@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -59,5 +60,29 @@ func TestEnsureCloudInit_RewritesTheVMsStaleSeed(t *testing.T) {
 	}
 	if !cloudinit.SeedIsFor(iso, "st-1") {
 		t.Error("the seed is no longer stamped for the VM")
+	}
+}
+
+// T2 fix round 1, m1: a migration target whose own stale seed cannot take the
+// source's network-config (here it is not an ISO the reader understands)
+// says so with a seed.rebuild_failed warning naming the seed and the host,
+// not only a log line on the source.
+//
+// Mutation: drop the event — red.
+func TestEnsureCloudInit_AStaleSeedItCannotRewriteIsReported(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	insertTestVMWithSpec(t, adminCtx(), s.db, "st", "elsewhere", "running", `{"name":"st","uuid":"st-1","image":"ubuntu"}`)
+	iso, _ := liveISO(t, s, "st")
+	if err := cloudinit.StampSeed(iso, "st-1"); err != nil {
+		t.Fatal(err)
+	}
+	vd := cloudinit.NetworkUpdatesVendorData
+	if _, err := s.EnsureCloudInit(diskPeerCtx(t, s), &pb.EnsureCloudInitRequest{VmName: "st", Networkconfig: "version: 2\nethernets: {}\n", Vendordata: &vd}); err == nil {
+		t.Fatal("EnsureCloudInit succeeded on a seed it cannot read")
+	}
+	evs := vmEventsOf(t, s, "st", "seed.rebuild_failed")
+	if len(evs) != 1 || evs[0].Severity != "warning" || !strings.Contains(evs[0].Detail, iso) || !strings.Contains(evs[0].Detail, s.hostName) {
+		t.Errorf("want one seed.rebuild_failed warning naming %s and %s: %+v", iso, s.hostName, evs)
 	}
 }

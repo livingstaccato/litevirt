@@ -1219,6 +1219,9 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 		}
 		changed, err := cloudinit.RebuildISO(isoPath, req.Networkconfig, *req.Vendordata)
 		if err != nil {
+			detail := fmt.Sprintf("the VM's seed at %s on %s could not take the migration source's network-config: %v; the VM arrives on it as it is, so a NIC attached or detached since the seed was written may lose its configuration in the guest at its next boot; the next start or NIC attach or detach of the VM on %s tries again", isoPath, s.hostName, err, s.hostName)
+			slog.Warn("cloud-init ISO for migration: "+detail, "vm", req.VmName)
+			s.recordVMEventSeverity(ctx, req.VmName, "seed.rebuild_failed", "error", "warning", detail)
 			return nil, status.Errorf(codes.Internal, "rewrite the network-config of the VM's cloud-init ISO: %v", err)
 		}
 		if changed {

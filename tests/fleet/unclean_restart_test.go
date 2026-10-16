@@ -12,11 +12,13 @@ package fleet
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/failover"
+	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/hostboot"
 )
 
@@ -138,4 +140,83 @@ func TestFleet_UncleanCrashLoopIsUpgradingOnce(t *testing.T) {
 	if first := f.fences()[0]; first.Sub(booted) > 45*time.Second {
 		t.Fatalf("d was fenced %s after its second boot", first.Sub(booted).Round(time.Millisecond))
 	}
+}
+
+// TestFleet_HandledHostThatRebootsUncleanAndNeverServesIsFencedAgain: d (best
+// effort) fails with a running VM; the coordinator fences it and parks the
+// VM's recovery on d's partition-pause wait, so d is cached as handled. d's
+// machine reboots: its replica stopped at the crash and still reads d active,
+// so its boot write records it 'upgrading', which wins over the coordinator's
+// write once replication returns. Its daemon never serves.
+//
+// The coordinator judges d afresh from that write (upgradingSinceHandled): it
+// skips d for the upgrading timeout and then fences it again, and the VM is
+// recovered. On the build before, the cached skip held d for good — 'upgrading'
+// is neither back ('active') nor down — and the VM stayed on a dead host.
+//
+// Mutations: drop the 'upgrading' arm from clearRecoveredFromFenced — d is
+// never fenced again; have upgradingLife report nothing — the first fence's
+// row holds the second back for recentFenceWindow (5 min), past this bound.
+func TestFleet_HandledHostThatRebootsUncleanAndNeverServesIsFencedAgain(t *testing.T) {
+	const timeout = 25 * time.Second
+	var shortWait atomic.Bool
+	f := newRestartFleet(t, 3409, func(c *failover.Coordinator) {
+		c.UpgradingTimeout = timeout
+		c.PartitionPauseEnforced = func(context.Context) bool { return true }
+		c.PeerPausesOnLoss = func(string) bool { return true }
+		c.PauseWaitFor = func(int) time.Duration {
+			if shortWait.Load() {
+				return 0
+			}
+			return 10 * time.Minute
+		}
+	})
+	f.mu.Lock()
+	f.fenceAs = &fence.Result{Method: "best-effort-ssh", Success: true, Detail: "SSH failed (fleet), proceeding anyway"}
+	f.mu.Unlock()
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, f.a.DB, corrosion.VMRecord{
+		Name: "uv", HostName: f.d.Name, State: "running", CPUActual: 1, MemActual: 256,
+		Spec: `{"name":"uv","cpu":1,"memory_mib":256,"on_host_failure":"restart-any"}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	f.c.WaitConverged(t, convergeTimeout)
+
+	// The machine dies: no probe answers, and nothing replicates to or from
+	// it, so its replica keeps the state it had.
+	f.c.Isolate(f.d)
+	f.down.Store(true)
+	eventually(t, time.Minute, "the coordinator to fence d", func() bool { return len(f.fences()) == 1 })
+	time.Sleep(3 * time.Second) // a few cycles: the recovery is parked, d cached
+	if vm := vmOn(t, f.a, "uv"); vm == nil || vm.HostName != f.d.Name {
+		t.Fatalf("fixture: uv was recovered at once (%+v); its recovery must wait on d's pause", vm)
+	}
+	if h, err := corrosion.GetHost(ctx, f.d.DB, f.d.Name); err != nil || h == nil || h.State != "active" {
+		t.Fatalf("fixture: d's own replica reads d %+v (%v), want the active it had at the crash", h, err)
+	}
+
+	// It reboots; its daemon makes the boot write and never serves.
+	b, booted := f.uncleanBoot(t, t.TempDir())
+	if b.State != "upgrading" {
+		t.Fatalf("boot of d from a replica that reads it active decided %+v, want 'upgrading'", b)
+	}
+	shortWait.Store(true)
+	f.c.ClearLinkFaults()
+	eventually(t, convergeTimeout, "d's 'upgrading' boot write to reach the coordinator", func() bool {
+		h, err := corrosion.GetHost(ctx, f.a.DB, f.d.Name)
+		return err == nil && h != nil && h.State == "upgrading"
+	})
+
+	eventually(t, timeout+convergeTimeout+10*time.Second, "the coordinator to fence d again", func() bool {
+		return len(f.fences()) >= 2
+	})
+	if second := f.fences()[1]; second.Sub(booted) < timeout {
+		t.Fatalf("d was fenced again %s after its boot write, inside the %s it may be 'upgrading'",
+			second.Sub(booted).Round(time.Millisecond), timeout)
+	}
+	eventually(t, convergeTimeout, "uv to be recovered off d", func() bool {
+		vm := vmOn(t, f.a, "uv")
+		return vm != nil && vm.HostName != f.d.Name
+	})
 }

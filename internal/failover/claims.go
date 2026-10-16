@@ -1013,7 +1013,7 @@ func (c *Coordinator) claimRetryOutageOver(ctx context.Context, target string) b
 	slog.Warn("failover: a recovery claim retry is owed to an outage this host has come back from; "+
 		"dropping it and deciding the host afresh", "host", target,
 		"authority_at", at.UTC().Format(time.RFC3339), "moment_recorded", ok, "probed_healthy_since", contacted)
-	delete(c.fenced, target)
+	c.unmarkHandled(target)
 	delete(c.pauseWaits, target)
 	c.forgetClaimRetries(target)
 	// A recovery an HA hold interrupted belongs to the same outage: left

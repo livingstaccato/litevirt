@@ -133,6 +133,9 @@ func (s *Server) recreatePreflightSpec(ctx context.Context, in *pb.VMSpec, host 
 	if err := validateSpecTuning(spec); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
+	if err := validateSpecNICNetworks(spec); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 	if err := s.RequirePerm(ctx, vmRBACPathFor(spec.Project, spec.Name), "vm.create", "operator"); err != nil {
 		return nil, err
 	}

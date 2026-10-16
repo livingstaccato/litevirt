@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -16,6 +17,28 @@ const guardRetiredBy = "litevirt"
 // domain, so a live NIC is never left without its guard.
 func (s *Server) retireNICGuard(ctx context.Context, vm, mac string) error {
 	return corrosion.RetireNICGuard(ctx, s.db, vm, mac, guardRetiredBy)
+}
+
+// retireFailedCreateGuards retires the guard records recs that a create of
+// vm as the incarnation uuid wrote, once that create has failed: no VM of
+// that incarnation exists, and a record it left live would be demanded in
+// force by the next create of the name. A record another incarnation has
+// written over since is left as it is. The request may be what failed, so it
+// runs detached from it, bounded.
+func (s *Server) retireFailedCreateGuards(ctx context.Context, vm, uuid string, recs []corrosion.NICGuardRecord) {
+	if len(recs) == 0 {
+		return
+	}
+	macs := make([]string, 0, len(recs))
+	for _, r := range recs {
+		macs = append(macs, r.MAC)
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if err := corrosion.RetireNICGuardsOfIncarnation(rctx, s.db, vm, uuid, macs, guardRetiredBy); err != nil {
+		slog.Warn("NIC guard: could not retire the guard records of a failed create; they guard nothing, and the next "+
+			"create of the name does not demand them", "vm", vm, "error", err)
+	}
 }
 
 // retireOrphanNICGuards retires the guard records of vm whose NIC exists

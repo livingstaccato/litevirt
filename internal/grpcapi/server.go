@@ -1153,6 +1153,9 @@ type Server struct {
 	// hwAuditDeferred names the VMs whose hardware audit the backfill left
 	// for their owed cutover handoff to complete (auditAfterVMReplaceHandoff).
 	hwAuditDeferred sync.Map // vm name -> true
+	// creatingIncarnations names the VMs a create on this host is bringing
+	// up, with the uuid of the incarnation it creates (noteCreatingIncarnation).
+	creatingIncarnations sync.Map // vm name -> uuid
 
 	// readyRead is Ready's one local read; nil means the real hosts-table
 	// query. A seam so a test can stand in for a read blocked on the client

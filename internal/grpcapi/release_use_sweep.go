@@ -27,7 +27,9 @@ type releaseUseProbe struct {
 }
 
 // releaseUseProbes are the features the sweep looks for, one data probe each.
-var releaseUseProbes []releaseUseProbe
+var releaseUseProbes = []releaseUseProbe{
+	{feature: capabilities.FeatureFirewallTagGroups, present: corrosion.FirewallTagGroupsDataPresent},
+}
 
 // releaseUseSweepInterval is how often the lease holder sweeps.
 const releaseUseSweepInterval = 5 * time.Minute

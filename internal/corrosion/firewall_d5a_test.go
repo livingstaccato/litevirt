@@ -106,3 +106,77 @@ func TestInsertIPSet_RefusesReservedName(t *testing.T) {
 		t.Errorf("sets = %+v, %v; want office only", sets, err)
 	}
 }
+
+// D5a (0-F): firewall_tag_groups' data is present when this replica holds a
+// group row or a firewall-tags row with a value, or a live rule of any tier
+// whose cidr is a tag-group reference in any case — as an older entry daemon
+// stores one verbatim. A removed row, an emptied one, or a tombstoned rule is
+// not data.
+//
+// Mutations: probe only the group rows — a tags row or a tag rule is not
+// found, red; ignore deleted_at on rules — the tombstoned rule counts, red;
+// count an emptied row — red.
+func TestFirewallTagGroupsDataPresent(t *testing.T) {
+	ctx := context.Background()
+	fresh := func() *Client {
+		c := ipv6FWDB(t)
+		openClusterPolicyGate(c)
+		return c
+	}
+	present := func(c *Client) bool {
+		t.Helper()
+		ok, err := FirewallTagGroupsDataPresent(ctx, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	c := fresh()
+	if present(c) {
+		t.Fatal("an empty replica has data")
+	}
+	// Removed and emptied rows, unrelated policies and rules, and a
+	// tombstoned tag rule are not data.
+	mustExec(t, c, clusterPolicyUpsertSQL, FirewallTagGroupKeyPrefix+"web", "", "a", "t")
+	mustExec(t, c, clusterPolicyUpsertSQL, FirewallTagsKeyPrefix+"vm/"+strings.Repeat("a", 32), "", "a", "t")
+	mustExec(t, c, clusterPolicyUpsertSQL, "firewall_tag", "x", "a", "t")
+	mustExec(t, c, clusterPolicyUpsertSQL, "firewall_tagz/x", "x", "a", "t")
+	if err := InsertClusterFirewallRule(ctx, c, FirewallRule{ID: "v4", Direction: "ingress", Proto: "tcp", CIDR: "10.0.0.0/8"}); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, c, `INSERT INTO cluster_firewall_rules (id, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at, deleted_at)
+		VALUES ('gone', 'ingress', 'tcp', '', 'tag:web', 'drop', 100, '', '', 't', 't', 't')`)
+	if present(c) {
+		t.Fatal("removed rows, other keys or a tombstoned rule counted as data")
+	}
+
+	for what, write := range map[string]func(c *Client){
+		"group row": func(c *Client) {
+			mustExec(t, c, clusterPolicyUpsertSQL, FirewallTagGroupKeyPrefix+"web", `{"match":{"role":"web"}}`, "a", "t")
+		},
+		"tags row": func(c *Client) {
+			mustExec(t, c, clusterPolicyUpsertSQL, FirewallTagsKeyPrefix+"ct/"+strings.Repeat("b", 32), `{"tags":{"role":"web"}}`, "a", "t")
+		},
+		"unreadable group row": func(c *Client) {
+			mustExec(t, c, clusterPolicyUpsertSQL, FirewallTagGroupKeyPrefix+"Bad", `{`, "a", "t")
+		},
+		"cluster rule": func(c *Client) {
+			mustExec(t, c, `INSERT INTO cluster_firewall_rules (id, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)
+				VALUES ('c', 'ingress', 'tcp', '', 'tag:web', 'accept', 100, '', '', 't', 't')`)
+		},
+		"host rule, upper case": func(c *Client) {
+			mustExec(t, c, `INSERT INTO host_firewall_rules (id, host_name, direction, proto, port_range, cidr, action, priority, comment, created_at, updated_at)
+				VALUES ('h', 'node-0', 'ingress', 'tcp', '', 'TAG:Web', 'drop', 100, '', 't', 't')`)
+		},
+		"sg rule, padded": func(c *Client) {
+			mustExec(t, c, `INSERT INTO sg_rules (id, sg_id, direction, proto, port_range, cidr, action, priority, created_at, updated_at)
+				VALUES ('s', 'sg', 'ingress', 'tcp', '', ' tag:web', 'drop', 100, 't', 't')`)
+		},
+	} {
+		c := fresh()
+		write(c)
+		if !present(c) {
+			t.Errorf("%s: not found", what)
+		}
+	}
+}

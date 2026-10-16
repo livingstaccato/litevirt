@@ -274,3 +274,26 @@ firewall:
 		t.Errorf("tag:web rules = %d, want the sg and the cluster rule", n)
 	}
 }
+
+// D5a (0-F): the sweep's probes include firewall_tag_groups' data. A tag
+// rule an older entry daemon stored verbatim, with no recorded use, has its
+// use recorded by the lease holder's sweep; with no data nothing is recorded.
+//
+// Mutation: leave releaseUseProbes without the tag-group probe — red.
+func TestReleaseUseSweep_TagGroupsProbe(t *testing.T) {
+	s, g, _, _ := sweepServer(t, "")
+	g.open = true
+	ctx := context.Background()
+	s.sweepReleaseUses(ctx, releaseUseProbes)
+	if len(g.used) != 0 {
+		t.Fatalf("with no data the sweep recorded %v", g.used)
+	}
+	if err := s.db.Execute(ctx, `INSERT INTO host_firewall_rules (id, host_name, direction, proto, port_range, cidr, action, priority, comment, created_at, updated_at)
+		VALUES ('h', 'node-0', 'ingress', 'tcp', '', 'tag:web', 'drop', 100, '', 't', 't')`); err != nil {
+		t.Fatal(err)
+	}
+	s.sweepReleaseUses(ctx, releaseUseProbes)
+	if !slices.Contains(g.used, capabilities.FeatureFirewallTagGroups) {
+		t.Errorf("uses recorded = %v, want firewall_tag_groups", g.used)
+	}
+}

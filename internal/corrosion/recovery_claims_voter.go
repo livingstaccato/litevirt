@@ -218,7 +218,7 @@ func (st voterStanding) admit(key ClaimKey, gen int64, v *ClaimValue) (string, s
 		if v == nil {
 			return "", ""
 		}
-		if v.Config == nil || v.Proof != nil {
+		if v.Config == nil || v.Proof != nil || v.LeaseTerm != nil {
 			return RefusalInvalidValue, "a voter_config key decides a voter config"
 		}
 		if !st.cfg.Explicit() {
@@ -235,7 +235,7 @@ func (st voterStanding) admit(key ClaimKey, gen int64, v *ClaimValue) (string, s
 		}
 		return "", ""
 	}
-	// A workload key, or a LUN key.
+	// A workload key, a LUN key or a lease-term key.
 	switch {
 	case st.cfg.Explicit():
 		if r, d := memberCheck(st.cfg); r != "" {
@@ -269,9 +269,22 @@ func validateGenerationClaimValue(key ClaimKey, v *ClaimValue) (string, string) 
 	if v == nil {
 		return "", ""
 	}
+	if key.IsLeaseTerm() {
+		l := v.LeaseTerm
+		if l == nil || v.Proof != nil || v.Config != nil || v.LUN != nil || v.SourceHost != "" {
+			return RefusalInvalidValue, "a lease_term key decides a lease term's holder"
+		}
+		if l.Key != key.TargetName || l.Term != key.OwnerEpoch {
+			return RefusalInvalidValue, fmt.Sprintf("value holds %s term %d, key is %s", l.Key, l.Term, key)
+		}
+		if l.Holder == "" {
+			return RefusalInvalidValue, "a lease-term value names its holder"
+		}
+		return "", ""
+	}
 	if key.IsLUN() {
 		l := v.LUN
-		if l == nil || v.Proof != nil || v.Config != nil || v.SourceHost != "" {
+		if l == nil || v.Proof != nil || v.Config != nil || v.LeaseTerm != nil || v.SourceHost != "" {
 			return RefusalInvalidValue, "a LUN key decides a LUN allocation"
 		}
 		if l.LUN != key.TargetName || l.Generation != key.OwnerEpoch {
@@ -282,7 +295,7 @@ func validateGenerationClaimValue(key ClaimKey, v *ClaimValue) (string, string) 
 		}
 		return "", ""
 	}
-	if v.Proof == nil || v.Config != nil || v.LUN != nil {
+	if v.Proof == nil || v.Config != nil || v.LUN != nil || v.LeaseTerm != nil {
 		return RefusalInvalidValue, "a workload key decides a proof"
 	}
 	p := v.Proof
@@ -755,13 +768,16 @@ func (c *Client) ClaimStatesForImport(ctx context.Context, gen int64) (ClaimImpo
 		out.Adopted = st.adopted
 		out.Frozen = st.adopted > gen || (st.adopted == gen && st.sealed)
 		// Both tables: an importer must carry the legacy keys and the
-		// incarnation-scoped ones alike (§4.4 rule 2, §10 item 37).
+		// incarnation-scoped ones alike (§4.4 rule 2, §10 item 37). Lease
+		// terms are carried like workloads: a term decided under this
+		// generation must not be decided again under the next.
 		rows, err := tx.Query(ctx, `SELECT target_kind, target_name, '' AS incarnation, owner_epoch, attempt, `+claimRowCols+`
-			FROM local_recovery_claims WHERE target_kind IN (?, ?, ?)
+			FROM local_recovery_claims WHERE target_kind IN (?, ?, ?, ?)
 			UNION ALL
 			SELECT target_kind, target_name, incarnation, owner_epoch, attempt, `+claimRowCols+`
 			FROM local_incarnation_claims WHERE target_kind IN (?, ?)
-			ORDER BY 1, 2, 3, 4, 5`, ClaimKindVM, ClaimKindContainer, ClaimKindLUN, ClaimKindVM, ClaimKindContainer)
+			ORDER BY 1, 2, 3, 4, 5`, ClaimKindVM, ClaimKindContainer, ClaimKindLUN, ClaimKindLeaseTerm,
+			ClaimKindVM, ClaimKindContainer)
 		if err != nil {
 			return err
 		}

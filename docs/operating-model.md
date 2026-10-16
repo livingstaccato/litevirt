@@ -926,6 +926,46 @@ a takeover and is not held to this. A peer on an older build reports no row, so
 against that peer a takeover is judged on the term alone, as before. The
 withholding reason names the peer and the holder it reported live.
 
+#### Two nodes taking a lease over at once record one term
+
+The quorum read shows that no peer has recorded the next term yet. It does not
+stop two nodes from recording it at the same moment: two survivors whose polls
+line up both read the same high water, both clear, and both record the next
+term. Each then acts as the lease's holder, and the two rows are a contested
+term (below).
+
+Once the mandatory, replication-gated `lease_term_claim_v1` token has latched,
+a node records a new term only after a majority of the adopted voter
+generation has decided that term for it, through the same claim RPCs a
+recovery uses, under the key `lease_term/<lease key>@<term>#0`. A voter keeps one
+promise and one accepted holder per key, durably, so only one claimant can get
+a majority for a term. The other learns which node holds it and records
+nothing. It then treats the term as that node's lease for one TTL, counted from
+the moment it learned of it. A live winner's rows reach it well inside that
+TTL. If the winner died before it recorded the term, the node takes the lease
+over at the next term after the TTL.
+
+- **No majority, no term.** A takeover that cannot reach a majority of the
+  voters records nothing, and the node retries on its next poll. The quorum read
+  already needed a majority, so this costs no availability the read did not
+  already cost. A holder renewing its own term asks nothing.
+- **Clocks play no part.** The decision orders claimants by ballot round and,
+  at an equal round, by name (the lowest-sorting one wins), so clock skew
+  cannot make two holders.
+- **Before the latch, and without an explicit voter set, nothing is claimed.**
+  During a rolling upgrade, a host on the previous build answers no lease-term
+  claim, so terms are recorded from the quorum read alone, as before. With no
+  adopted voter generation that has members (genesis pending, or after
+  `lv cluster voter reset`), there is no fixed majority to decide with, and every
+  node records terms as before, together. A node whose replica holds a voter
+  generation with members that it has not adopted yet records nothing until
+  it has.
+
+While a term is withheld this way, the `leader lease: not claiming a new term
+yet` log line gives the reason: `term N was decided for <host>`, `no majority
+of voter generation G decided term N`, or that the node has not adopted a
+generation yet.
+
 #### A contested lease still converges
 
 Keeping both claims is about the *evidence*. It does not mean both claimants

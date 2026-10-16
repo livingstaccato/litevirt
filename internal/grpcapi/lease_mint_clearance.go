@@ -37,6 +37,11 @@ import (
 //     extra round trip. A peer on an older build reports no row, which is no
 //     evidence: against such a peer the takeover is judged on the term alone,
 //     as before.
+//   - once lease_term_claim_v1 has latched, and this node has adopted a voter
+//     generation with members: cleared only when a majority of that
+//     generation decides the term for this node (lease_term_claim.go). The
+//     read above shows that nobody has recorded the term; only the decision
+//     shows that nobody else is about to.
 //
 // A refusal may be served from the barrier's cached threshold, and an accept
 // may not, for the barrier's own reason: the high water only rises, so a cached
@@ -63,6 +68,10 @@ func (s *Server) LeaseMintClearance(ctx context.Context, req corrosion.LeaseMint
 		return false, "this node's replica has not caught up with the cluster yet (" + why +
 			"), so its lease ledger and voter set may be missing the cluster's history"
 	}
+	mode, cfg, why := s.leaseTermClaimMode(ctx)
+	if mode == leaseClaimClosed {
+		return false, why
+	}
 	if cached, ok := s.cachedLeaseThreshold(key); ok && cached >= next {
 		return false, fmt.Sprintf("a peer has already recorded term %d; waiting for replication to deliver it", cached)
 	}
@@ -85,6 +94,9 @@ func (s *Server) LeaseMintClearance(ctx context.Context, req corrosion.LeaseMint
 				"row is behind (renewals are not carried by anti-entropy), waiting for the renewal or "+
 				"for the reported expiry to pass", row.peer, row.holder)
 		}
+	}
+	if mode == leaseClaimOn {
+		return s.claimLeaseTerm(ctx, cfg, req)
 	}
 	return true, ""
 }

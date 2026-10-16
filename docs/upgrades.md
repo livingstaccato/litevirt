@@ -1685,6 +1685,27 @@ older build honours an explicit key. Clusters founded with `lv host init` on
 this build already carry the explicit key. `lv doctor fence` warns when the
 token has latched and any host does not enforce it, and names the host.
 
+### Lease-term claims latch after the roll
+
+Once the mandatory, replication-gated `lease_term_claim_v1` token has latched,
+a new leader-lease term is recorded only after a majority of the adopted voter
+generation has decided it for the node recording it. Before that, two nodes
+that took a lease over at the same moment could both record the next term
+and both act as its holder. See [Operating model](operating-model.md) → "Two
+nodes taking a lease over at once record one term". There is no schema change:
+voters keep these decisions in `local_recovery_claims`.
+
+During the roll nothing changes. A host on the previous build does not
+advertise the token, and it records terms without claiming them, so the token
+cannot latch while any host the cluster replicates to runs that build, one
+parked in `maintenance` included. The claim is used only once the token has
+latched **and** a voter generation with members is adopted. Without one, terms
+are recorded as before.
+
+There is no flag. `lv cluster voter reset` returns every host to recording
+terms from the quorum read alone, together. A binary rolled back below the
+token after it has latched enters WAL quarantine, as below every latched token.
+
 ## Schema upgrades: `litevirt schema-migrate`
 
 The daemon refuses to start when its `CurrentSchemaVersion` is OLDER

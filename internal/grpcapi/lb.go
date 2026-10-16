@@ -31,13 +31,17 @@ func (s *Server) ListLoadBalancers(ctx context.Context, _ *emptypb.Empty) (*pb.L
 	if err := RequireRole(ctx, "viewer"); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.Query(ctx, `SELECT name, stack_name, vip, algorithm, hosts, ports, enabled FROM lb_configs WHERE deleted_at IS NULL`)
+	rows, err := s.db.Query(ctx, `SELECT name, stack_name, vip, algorithm, hosts, ports, enabled, generation FROM lb_configs WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "query lb_configs: %v", err)
 	}
 
 	resp := &pb.ListLBResponse{}
 	for _, r := range rows {
+		snat, err := s.lbSNAT(ctx, r.String("name"), r.String("stack_name"), r.String("generation"))
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "%v", err)
+		}
 		algo := r.String("algorithm")
 		if algo == "" {
 			algo = "roundrobin"
@@ -64,6 +68,7 @@ func (s *Server) ListLoadBalancers(ctx context.Context, _ *emptypb.Empty) (*pb.L
 			StackName:  r.String("stack_name"),
 			Ports:      ports,
 			Backends:   s.lbBackends(ctx, r.String("name")),
+			Snat:       snat,
 		})
 	}
 	return resp, nil
@@ -593,6 +598,16 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 		return nil, status.Errorf(codes.AlreadyExists, "VIP %s already in use by %q", req.Vip, existingVIP[0].String("name"))
 	}
 
+	// The LB's outbound NAT (`--snat`, default off) is recorded with it, and
+	// an LB with no recorded setting SNATs. Until the setting can be recorded
+	// (failover_scope_v1 not latched: a host still runs an earlier build) a
+	// create that asks for no SNAT would make one that SNATs, so it is refused.
+	if !req.GetSnat() && !s.db.MayWriteClusterPolicy() {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"load balancer %q: %v. Create it with --snat, or without it once failover_scope_v1 shows as latched in `lv cluster upgrade-status`",
+			req.Name, corrosion.ErrLBSNATGateClosed)
+	}
+
 	// Split-brain gate (Phase 2): creating a VIP is a NEW runtime-ownership claim. The
 	// DB uniqueness check above only proves no OTHER row uses it — not that the address
 	// is actually free in the kernel. A prior delete or partition could have left a
@@ -678,26 +693,15 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 		Enabled:    true,
 		Generation: generation,
 	}
-	// The LB's outbound NAT (`--snat`, default off) is recorded with it. Until
-	// the setting can be recorded (failover_scope_v1 not latched: a host still
-	// runs an earlier build, which SNATs every explicit LB) the LB is created
-	// as an earlier build creates one, SNATting, and an event says so.
+	// The setting is recorded when it can be; otherwise --snat was given
+	// (refused above if not) and an LB with no record SNATs.
 	snat := req.GetSnat()
 	if s.db.MayWriteClusterPolicy() {
 		if err := corrosion.PersistLBFullWithSNAT(ctx, s.db, lbRec, backendRecords, snat, callerUsername(ctx)); err != nil {
 			return nil, status.Errorf(codes.Internal, "persist LB config: %v", err)
 		}
-	} else {
-		if err := corrosion.PersistLBFull(ctx, s.db, lbRec, backendRecords); err != nil {
-			return nil, status.Errorf(codes.Internal, "persist LB config: %v", err)
-		}
-		if !snat {
-			detail := fmt.Sprintf("load balancer %q SNATs on a host-isolated network until every host runs this release (%v); then set it with `lv lb update %s --snat=false`",
-				req.Name, corrosion.ErrLBSNATGateClosed, req.Name)
-			slog.Warn("lb: "+detail, "lb", req.Name)
-			s.publish("lb.snat_unrecorded", req.Name, detail)
-		}
-		snat = true
+	} else if err := corrosion.PersistLBFull(ctx, s.db, lbRec, backendRecords); err != nil {
+		return nil, status.Errorf(codes.Internal, "persist LB config: %v", err)
 	}
 
 	// Build ports.

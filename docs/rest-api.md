@@ -234,7 +234,7 @@ Create request body:
 }
 ```
 
-`snat` (default `false`) SNATs a host-isolated network's outbound guest traffic to the VIP, as `lv lb create --snat` does.
+`snat` (default `false`) SNATs a host-isolated network's outbound guest traffic to the VIP, as `lv lb create --snat` does. List and inspect responses carry each load balancer's `snat` setting.
 
 Update request body (all fields optional, empty = no change; `snat` absent = no change):
 

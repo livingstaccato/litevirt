@@ -5981,7 +5981,7 @@ type LoadBalancer struct {
 	State         string                 `protobuf:"bytes,7,opt,name=state,proto3" json:"state,omitempty"`
 	StackName     string                 `protobuf:"bytes,8,opt,name=stack_name,json=stackName,proto3" json:"stack_name,omitempty"` // empty for standalone LBs
 	Ports         []*LBPort              `protobuf:"bytes,9,rep,name=ports,proto3" json:"ports,omitempty"`                          // port mappings
-	Snat          bool                   `protobuf:"varint,10,opt,name=snat,proto3" json:"snat,omitempty"`                          // rewrites its network's guest egress to the VIP (InspectLoadBalancer only)
+	Snat          bool                   `protobuf:"varint,10,opt,name=snat,proto3" json:"snat,omitempty"`                          // rewrites its network's guest egress to the VIP
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }

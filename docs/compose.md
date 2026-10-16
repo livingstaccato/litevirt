@@ -922,7 +922,7 @@ How it works:
 Requirements:
 
 - `snat:` applies on every LB host; with it unset or `false`, no LB host rewrites the network's egress
-- A load balancer made with `lv lb create` SNATs only with `--snat`, and `lv lb update <name> --snat` or `--snat=false` changes it later; `lv lb inspect` shows it. One created before this setting existed keeps SNATting until it is set. Until every host runs a release with this setting (`failover_scope_v1` latched), `lv lb create` makes one that SNATs, as an earlier build does, and raises a `lb.snat_unrecorded` event; `lv lb update --snat` is refused until then. An LB host on an earlier build SNATs for every load balancer it serves
+- A load balancer made with `lv lb create` SNATs only with `--snat`, and `lv lb update <name> --snat` or `--snat=false` changes it later; `lv lb inspect` shows the setting. One created before this setting existed keeps SNATting until it is set. Until every host runs a release with this setting (`failover_scope_v1` latched, as `lv cluster upgrade-status` shows), `lv lb create` without `--snat` is refused, `lv lb create --snat` works, and `lv lb update --snat` is refused. An LB host on an earlier build SNATs for every load balancer it serves, so during a rolling upgrade inspect shows the setting, not what each LB host applied. A host rolled back below this release does the same ([upgrades.md](upgrades.md#manual-rollback-anytime))
 - The VIP must be routable from the upstream network
 - IP forwarding is enabled automatically
 - The network's bridge carries the VMs' gateway (see [Host isolation](#host-isolation)): a `vxlan` network, or a `bridge` network on a bridge litevirt created, with no `vlan`

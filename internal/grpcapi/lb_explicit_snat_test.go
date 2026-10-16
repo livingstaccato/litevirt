@@ -4,7 +4,6 @@ import (
 	"context"
 	"strings"
 	"testing"
-	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
@@ -78,6 +77,21 @@ func inspectSNAT(t *testing.T, s *Server, name string) bool {
 	return resp.Snat
 }
 
+func listSNAT(t *testing.T, s *Server, name string) bool {
+	t.Helper()
+	resp, err := s.ListLoadBalancers(adminCtx(), nil)
+	if err != nil {
+		t.Fatalf("ListLoadBalancers: %v", err)
+	}
+	for _, l := range resp.Lbs {
+		if l.Name == name {
+			return l.Snat
+		}
+	}
+	t.Fatalf("ListLoadBalancers: no %s", name)
+	return false
+}
+
 // TestExplicitLB_SNATOnlyWhenAsked: an LB made with `lv lb create` on a
 // host-isolated network does no outbound SNAT unless --snat asks for it, at
 // create, at every re-apply, and as inspect reports it; `lv lb update --snat`
@@ -86,7 +100,8 @@ func inspectSNAT(t *testing.T, s *Server, name string) bool {
 //
 // Mutations (each red): the create's local intent ignores the setting (SNAT
 // always); reapplyExplicitLB SNATs regardless; lbSNAT ignores the record;
-// the update ignores req.Snat; ApplyLB with no snat field SNATs an explicit LB.
+// the update ignores req.Snat; ApplyLB with no snat field SNATs an explicit LB;
+// ListLoadBalancers leaves snat false.
 func TestExplicitLB_SNATOnlyWhenAsked(t *testing.T) {
 	s := explicitSNATServer(t, true)
 	ctx := context.Background()
@@ -99,6 +114,9 @@ func TestExplicitLB_SNATOnlyWhenAsked(t *testing.T) {
 		}
 		if got := inspectSNAT(t, s, name); got != want {
 			t.Errorf("%s: inspect SNAT %v, want %v", name, got, want)
+		}
+		if got := listSNAT(t, s, name); got != want {
+			t.Errorf("%s: list SNAT %v, want %v", name, got, want)
 		}
 		s.reapplyExplicitLB(ctx, lbConfig(t, s, name))
 		if found, snat := lbIntent(t, s, name); !found || snat != want {
@@ -156,8 +174,8 @@ func TestExplicitLB_StoredBeforeTheSettingKeepsSNAT(t *testing.T) {
 	if found, snat := lbIntent(t, s, "legacy"); !found || !snat {
 		t.Errorf("no record: intent %v, SNAT %v; want SNAT", found, snat)
 	}
-	if !inspectSNAT(t, s, "legacy") {
-		t.Error("no record: inspect says no SNAT")
+	if !inspectSNAT(t, s, "legacy") || !listSNAT(t, s, "legacy") {
+		t.Error("no record: inspect or list says no SNAT")
 	}
 
 	// A record of an earlier incarnation (another generation) is not this
@@ -172,30 +190,37 @@ func TestExplicitLB_StoredBeforeTheSettingKeepsSNAT(t *testing.T) {
 }
 
 // TestExplicitLB_SettingNotRecordable: until cluster_policies is writable
-// (failover_scope_v1 not latched), a create without --snat still succeeds,
-// SNATting as an earlier build's would, and says so in an lb.snat_unrecorded
-// event; an update that sets snat is refused. A stack LB's snat is its
-// compose file's, so an update setting it is refused.
+// (failover_scope_v1 not latched), a create without --snat is refused, since
+// an LB with no recorded setting SNATs, and the refusal names the remedies;
+// a create with --snat succeeds and SNATs; an update that sets snat is
+// refused. A stack LB's snat is its compose file's, so an update setting it
+// is refused.
 //
-// Mutation: drop the event — red.
+// Mutation: create without --snat as before the refusal — red.
 func TestExplicitLB_SettingNotRecordable(t *testing.T) {
 	s := explicitSNATServer(t, false)
-	ch, cancel := s.events.Subscribe()
-	defer cancel()
-	createExplicitLB(t, s, "early", "10.202.0.253/24", false)
-	if _, snat := lbIntent(t, s, "early"); !snat {
-		t.Error("an unrecorded create does not SNAT as before")
+	_, err := s.CreateLoadBalancer(adminCtx(), &pb.CreateLBRequest{
+		Name: "early", Vip: "10.202.0.253/24", Hosts: []string{s.hostName},
+		Ports:    []*pb.LBPort{{Listen: 80, Target: 8080, Protocol: "tcp"}},
+		Backends: []*pb.LBBackendAddress{{Name: "b1", Address: "10.202.0.10"}},
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("create without --snat with the gate closed: %v, want FailedPrecondition", err)
 	}
-	deadline := time.After(2 * time.Second)
-	for seen := false; !seen; {
-		select {
-		case e := <-ch:
-			seen = e.Action == "lb.snat_unrecorded" && strings.Contains(e.Detail, `"early"`)
-		case <-deadline:
-			t.Fatal("no lb.snat_unrecorded event")
+	for _, remedy := range []string{"--snat", "lv cluster upgrade-status", "failover_scope_v1"} {
+		if !strings.Contains(status.Convert(err).Message(), remedy) {
+			t.Errorf("refusal %q does not name %q", status.Convert(err).Message(), remedy)
 		}
 	}
-	_, err := s.UpdateLoadBalancer(adminCtx(), &pb.UpdateLBRequest{Name: "early", Snat: proto.Bool(false)})
+	if cfgs, lerr := corrosion.ListLBConfigs(context.Background(), s.db); lerr != nil || len(cfgs) != 0 {
+		t.Errorf("a refused create left lb_configs %+v (%v)", cfgs, lerr)
+	}
+
+	createExplicitLB(t, s, "early", "10.202.0.253/24", true)
+	if _, snat := lbIntent(t, s, "early"); !snat || !inspectSNAT(t, s, "early") {
+		t.Error("create --snat with the gate closed: not SNATting")
+	}
+	_, err = s.UpdateLoadBalancer(adminCtx(), &pb.UpdateLBRequest{Name: "early", Snat: proto.Bool(false)})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("update --snat=false with the gate closed: %v, want FailedPrecondition", err)
 	}

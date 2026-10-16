@@ -419,6 +419,10 @@ systemctl reset-failed litevirt
 systemctl restart litevirt
 ```
 
+A host rolled back below the release that added `lv lb create --snat` SNATs
+every load balancer made with `lv lb create` that it serves, including one set
+to `--snat=false` ([compose.md](compose.md#snat-via-vip)).
+
 ### Rolling back after a release token latched
 
 A rolled-back binary that finds a durable activation marker for a capability

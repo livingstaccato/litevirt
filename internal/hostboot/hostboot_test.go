@@ -124,12 +124,12 @@ func TestUncleanBootAwaitsServingOnce(t *testing.T) {
 // whose next boot never wrote (a WAL-quarantined one), or a draining host's
 // SIGTERM — keeps it 'upgrading' while that state is younger than the
 // coordinator's timeout, and is 'active' once it is older: the coordinator may
-// be fencing it already. Any other state boots 'active' as before, and so does
-// a boot with no data dir, which could not bound a crash loop.
+// be fencing it already. A host recorded fenced, offline, maintenance,
+// draining or joining is returning to service, and is 'upgrading' until it
+// serves too (TestReturningHostBootsUpgradingUntilItServes). A boot with no
+// data dir, which could not bound a crash loop, boots 'active' as before.
 //
-// Mutations: drop the age check — the stale 'upgrading' boots 'upgrading';
-// accept any state — the fenced, offline, maintenance, draining and joining
-// hosts boot 'upgrading'.
+// Mutation: drop the age check — the stale 'upgrading' boots 'upgrading'.
 func TestUncleanBootByRecordedState(t *testing.T) {
 	db, ctx := hostIn(t, "upgrading")
 	since, ok, err := corrosion.HostStateSince(ctx, db, "h")
@@ -148,11 +148,8 @@ func TestUncleanBootByRecordedState(t *testing.T) {
 	for _, st := range []string{"fenced", "offline", "maintenance", "draining", corrosion.HostStateJoining} {
 		db, ctx := hostIn(t, st)
 		dir := t.TempDir()
-		if b := BootState(ctx, db, "h", dir, false, time.Now()); b.State != "active" || b.AwaitServing {
-			t.Fatalf("unclean boot of a host recorded %s = %+v, want active", st, b)
-		}
-		if _, err := os.Stat(AwaitingPath(dir)); !os.IsNotExist(err) {
-			t.Fatalf("an active boot of a %s host noted that it awaits serving: %v", st, err)
+		if b := BootState(ctx, db, "h", dir, false, time.Now()); b.State != "upgrading" || !b.AwaitServing {
+			t.Fatalf("unclean boot of a host recorded %s = %+v, want upgrading until serving", st, b)
 		}
 	}
 	db, ctx = hostIn(t, "active")
@@ -184,12 +181,13 @@ func TestUncleanBootThatCannotNoteIsActive(t *testing.T) {
 
 // A graceful stop older than the upgrading timeout boots 'active': the
 // coordinator may have fenced the host while it was down, and this node's
-// replica may not know yet. So does one whose record moved on while it was
-// down.
+// replica may not know yet. One whose record moved on while it was down to a
+// returning state (fenced, offline, maintenance) is 'upgrading' until it
+// serves (returningBoot).
 //
 // Mutations: drop the age check — the stale stop boots 'upgrading'; drop the
-// negative-age arm — the stop dated after the boot boots 'upgrading'; drop the
-// state check — the fenced host boots 'upgrading'.
+// negative-age arm — the stop dated after the boot boots 'upgrading'; skip
+// returningBoot — the fenced host boots 'active'.
 func TestBootAfterAStaleOrSupersededStop(t *testing.T) {
 	db, ctx := hostIn(t, "active")
 	dir := t.TempDir()
@@ -225,8 +223,8 @@ func TestBootAfterAStaleOrSupersededStop(t *testing.T) {
 		if err := corrosion.UpdateHostState(ctx, db, "h", moved); err != nil {
 			t.Fatal(err)
 		}
-		if b := BootState(ctx, db, "h", dir, false, now.Add(10*time.Second)); b.State != "active" || b.AwaitServing {
-			t.Fatalf("boot of a host recorded %s while down = %+v, want the old boot (active)", moved, b)
+		if b := BootState(ctx, db, "h", dir, false, now.Add(10*time.Second)); b.State != "upgrading" || !b.AwaitServing {
+			t.Fatalf("boot of a host recorded %s while down = %+v, want upgrading until serving", moved, b)
 		}
 	}
 }

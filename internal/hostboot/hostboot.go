@@ -19,7 +19,7 @@
 // it answered nothing for as long as startup took, and on lab 1 (2026-10-14)
 // its peers SSH-fenced it 19 s after the boot, before it served.
 //
-// Four rules keep that from hiding a host that should be fenced, or
+// These rules keep that from hiding a host that should be fenced, or
 // overwriting a decision made about it:
 //
 //   - only a SIGTERM of an ACTIVE host leaves the marker (MarkRestarting), and
@@ -30,9 +30,11 @@
 //     every boot, so it cannot keep re-arming the 'upgrading' timeout;
 //   - the boot keeps 'upgrading' only while the host is still recorded
 //     'upgrading' (or, without the marker, 'active') and the SIGTERM, or the
-//     'upgrading' state, is younger than UpgradingTimeout: a host the cluster
-//     may have fenced, put in maintenance or isolated while it was down boots
-//     as before;
+//     'upgrading' state, is younger than UpgradingTimeout;
+//   - a host recorded fenced, offline, maintenance, draining or joining is
+//     returning to service, and boots 'upgrading' until it serves too
+//     (returningBoot): once per return, since its own daemon never writes
+//     those states;
 //   - ConfirmServing moves the host from 'upgrading' to 'active' and from
 //     nothing else, and leaves its isolation as it is.
 //
@@ -117,6 +119,11 @@ func BootState(ctx context.Context, db *corrosion.Client, host, dataDir string, 
 		_ = writeAwaiting(dataDir, now)
 		return Boot{State: "upgrading", Reason: "post-upgrade boot; the upgrade watchdog confirms it"}
 	}
+	// A host recorded down or out of service returns 'upgrading' until it
+	// serves, whatever the marker or the history (returningBoot).
+	if b, ok := returningBoot(ctx, db, host, dataDir, marked, now); ok {
+		return b
+	}
 	if !marked {
 		return noteAwaiting(dataDir, uncleanBoot(ctx, db, host, dataDir, now), now)
 	}
@@ -150,8 +157,9 @@ func BootState(ctx context.Context, db *corrosion.Client, host, dataDir string, 
 //     every crash and never fenced;
 //   - a host recorded 'upgrading' for UpgradingTimeout or longer: the
 //     coordinator may be fencing it;
-//   - a host recorded anything else (fenced, offline, maintenance, draining,
-//     joining) or not at all.
+//   - a host recorded anything else, or not at all. (A host recorded fenced,
+//     offline, maintenance, draining or joining does not reach this:
+//     returningBoot.)
 func uncleanBoot(ctx context.Context, db *corrosion.Client, host, dataDir string, now time.Time) Boot {
 	if dataDir == "" {
 		return Boot{State: "active", Reason: "no graceful stop recorded, and no data dir to bound a crash loop"}

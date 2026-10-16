@@ -922,9 +922,9 @@ an unverified fence may never have powered off, or one cut off by a partition.
 A host whose daemon starts again — the machine booting after a power-off, or
 its daemon restarted — turns `active` on its own, whatever the cluster
 recorded for it, and needs no `lv host undrain` ([upgrades](upgrades.md) says
-the same). Its boot write records it `active`, or `upgrading` first when it
-booted into a pending upgrade or a graceful restart, and then `active` once
-it serves. It does not run the workloads that
+the same). Its boot write records it `upgrading`, and the daemon records it
+`active` once it serves, as after a graceful restart. It does not run the
+workloads that
 moved off it: they are recorded on their new hosts, and the copies of their
 disks it still holds are set aside as superseded (`lv host superseded-disks`).
 
@@ -1053,7 +1053,7 @@ than the host's last activation still counts, which is the race the window
 exists for. Likewise, a health observation older than the
 moment a host turned active does not count toward fencing it: a host that just
 turned active is counted down afresh, and a host `lv host add` admitted is not
-probed at all until its daemon's first boot records it `active`. A newer
+probed at all until its daemon's first boot write ends `joining`. A newer
 observation counts only if its failing run began after the activation, or once
 the host has been failing for a whole run since it: 5 probes (8 s) plus the 5 s
 clock-skew margin. Observers keep counting through a restart, and a daemon's
@@ -1094,15 +1094,21 @@ until a daemon serves. Each of these boots `active`, as before:
 - a boot without the marker that follows 3 others within 10 minutes, counted
   in `boot-unclean-history` in its `data_dir`: a daemon that serves and crashes
   again and again is fenced on its failure count, as before;
-- a host that was not `active` when it was stopped. A fenced, offline or
-  maintenance host keeps that state through the SIGTERM, and a draining one is
-  recorded `upgrading` for the restart, as before;
 - a stop, or an `upgrading` state without the marker, 2 minutes old or more.
   A WAL-quarantined daemon writes nothing, so after a quarantine that lasted
   longer than that, the next boot records the host `active` and can be
   fenced before it serves;
-- a host recorded as something other than `upgrading` by the time it boots
-  (without the marker: other than `active` or `upgrading`).
+- a host recorded `unknown`, or with no record this boot can read.
+
+A host recorded `fenced`, `offline`, `maintenance`, `draining` or `joining`
+when it boots, with or without the marker, whatever its earlier boots, is
+returning to service: its boot write records it `upgrading`, and it turns
+`active` once it serves, so it is not fenced before it serves on failures
+counted since its boot write. The write ends the recorded state, as the
+`active` one did, and keeps the host's isolation. It is made once per
+return: a crash of that boot finds the host `upgrading`. A fenced,
+offline or maintenance host keeps that state through a SIGTERM, and a
+draining one is recorded `upgrading` for the restart, as before.
 
 Recording the host `active` once it serves changes only an `upgrading` host,
 and never its isolation.
@@ -1527,7 +1533,7 @@ options below takes. The options need the admin role and are audited:
 
 To run a VM on the real disk a failover left on a host, once that host is
 back and `active` — a host that booted again turns `active` on its own
-(after `upgrading`, if it booted into a pending upgrade); one that
+(after `upgrading`, once its daemon serves); one that
 answered again without restarting stays `fenced` or `offline` until
 `lv host undrain <host>`, and a migration onto it needs it active:
 
@@ -1600,7 +1606,7 @@ one of these happens:
 
 - the host comes back. A host whose daemon starts again — it boots after the
   fence powered it off, or its daemon is restarted — turns `active` on its
-  own (after `upgrading`, if it booted into a pending upgrade), with no
+  own (after `upgrading`, once its daemon serves), with no
   `lv host undrain`. One that answers again without having restarted
   stays `fenced` or `offline` if failover moved anything off it, and
   `lv host undrain <host>` makes it active again;

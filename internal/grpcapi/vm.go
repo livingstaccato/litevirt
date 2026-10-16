@@ -6000,18 +6000,25 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// Build network configs from the VM's live NICs (the vm_nics/vm_interfaces
 	// overlay): a NIC hot-attached or detached on a hardware_v2 cluster is
 	// recorded in vm_nics alone.
-	ifaces, err := liveVMInterfaces(ctx, s.db, req.Name)
+	nicRows, err := corrosion.MergedVMNICs(ctx, s.db, req.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read NICs for %q: %v", req.Name, err)
 	}
+	ifaces := nicInterfaceRecords(nicRows)
+	rowModels, reattached, err := corrosion.NICModelSources(ctx, s.db, req.Name, nicRows, compose.SpecNICModelsByMAC(spec))
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read NIC models for %q: %v", req.Name, err)
+	}
+	nicModels := compose.NewNICModels(spec, rowModels, reattached)
 	var netConfigs []lv.NetworkConfig
-	for _, iface := range ifaces {
+	for _, iface := range nicRows {
 		bridge := resolveBridge(ctx, s.db, iface.NetworkName)
 		rate := compose.NICRate(spec, iface.Ordinal, iface.NetworkName)
+		model := nicModels.Model(iface.MAC, iface.NetworkName, iface.Ordinal, iface.Model)
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
 				Direct:      strings.TrimPrefix(bridge, "direct:"),
-				Model:       "virtio",
+				Model:       model,
 				MAC:         iface.MAC,
 				SpecOrdinal: iface.Ordinal + 1,
 				RateMBps:    rate,
@@ -6020,7 +6027,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		}
 		netConfigs = append(netConfigs, lv.NetworkConfig{
 			Bridge:      bridge,
-			Model:       "virtio",
+			Model:       model,
 			MAC:         iface.MAC,
 			SpecOrdinal: iface.Ordinal + 1,
 			RateMBps:    rate,
@@ -6092,16 +6099,17 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// up after the define; a patched one keeps the ones it had.
 	regenerated := domXML == ""
 	if domXML == "" {
-		var hostdevs []lv.HostdevConfig
-		for _, addr := range liveDevs {
-			hostdevs = append(hostdevs, lv.HostdevConfig{Address: addr})
+		priorXML, derr := s.virt.DumpXMLInactive(req.Name)
+		if derr != nil && !domainAbsent(derr) {
+			slog.Warn("UpdateVM: the current definition could not be read; regenerating without what only it holds",
+				"vm", req.Name, "error", derr)
 		}
+		hostdevs := ownedHostdevConfigs(liveDevs, priorXML)
 		// Regenerate domain XML from the shared builder (MinMemoryMiB/MaxMemoryMiB +
 		// Hostdevs are populated here — the fields the old inline redefine builder
 		// dropped, collapsing the balloon ceiling and detaching passthrough).
 		vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, hostdevs)
 		// The seed and installer CD-ROMs are in neither the spec nor vm_disks.
-		priorXML, _ := s.virt.DumpXMLInactive(req.Name)
 		s.keepCDROMs(&vmCfg, req.Name, spec.Uuid, priorXML)
 		usb, uerr := s.resolveUSBHostdevs(ctx, spec)
 		if uerr != nil {

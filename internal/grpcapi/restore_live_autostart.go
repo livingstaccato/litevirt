@@ -341,6 +341,8 @@ func (s *Server) autoDefineRestoredVM(
 		Disks:       diskCfg,
 		Networks:    netCfg,
 		Boot:        spec.Boot,
+		// A seed this host holds for the restored VM, as CreateVM attaches it.
+		CloudInitISO: s.stampedSeedFor(targetName, spec.Uuid),
 		// Memory hot-add, only as admitted above (admitRestoredUSBAndHotplug).
 		HotplugBaseMiB: int(spec.MemoryHotplugBaseMib),
 		HotplugMaxMiB:  int(spec.MemoryHotplugMaxMib),

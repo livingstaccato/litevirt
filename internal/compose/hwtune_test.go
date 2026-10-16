@@ -215,3 +215,35 @@ func TestDiskKeyAndEmptyNameMatching(t *testing.T) {
 		t.Errorf("a stored empty-name disk is root: the discard change was not seen: %+v", p)
 	}
 }
+
+// A NIC rendered with another model than its spec entry records (a NIC of a
+// stack VM swapped under its MAC, whose entry the attach leaves as the
+// compose file wrote it) keeps only the entry's tuning its rendered model
+// can take: no MTU and no multiqueue on an e1000. A NIC rendered with the
+// entry's own model keeps the entry's tuning as it is, so a define still
+// refuses an MTU recorded for an e1000.
+//
+// Mutation: copy the entry's tuning whatever the rendered model — the
+// "virtio entry, e1000 NIC" case goes red.
+func TestApplyNICTuning_ANICOfAnotherModelKeepsOnlyWhatItCanTake(t *testing.T) {
+	const mac = "52:54:00:aa:cc:01"
+	for _, tc := range []struct {
+		name, entry, rendered string
+		wantMTU, wantQueues   int
+	}{
+		{"virtio entry, e1000 NIC", "virtio", "e1000", 0, 0},
+		{"virtio entry, virtio NIC", "virtio", "virtio", 9000, 4},
+		{"unset entry, virtio NIC", "", "", 9000, 4},
+		{"e1000 entry, virtio NIC", "e1000", "virtio", 9000, 4},
+		{"e1000 entry, e1000 NIC", "e1000", "e1000", 9000, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := &pb.VMSpec{Network: []*pb.NetworkAttachment{{Name: "lan", Model: tc.entry, Mac: mac, Mtu: 9000, Queues: 4}}}
+			nets := []libvirt.NetworkConfig{{Bridge: "lan", Model: tc.rendered, MAC: mac, SpecOrdinal: 1}}
+			ApplyNICTuning(nets, spec)
+			if nets[0].MTU != tc.wantMTU || nets[0].Queues != tc.wantQueues {
+				t.Fatalf("MTU %d queues %d, want %d and %d", nets[0].MTU, nets[0].Queues, tc.wantMTU, tc.wantQueues)
+			}
+		})
+	}
+}

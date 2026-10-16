@@ -50,6 +50,13 @@ func tagGroupMember(t *testing.T, s *Server, name, id, mac, ip string) {
 	seedTagsFor(t, s, corrosion.TagMemberVM, id, map[string]string{"role": "web"}, name, "")
 }
 
+func tagGroupSG(t *testing.T, s *Server, name string) {
+	t.Helper()
+	if _, err := s.CreateSecurityGroup(adminCtx(), &pb.CreateSecurityGroupRequest{Name: name}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func tagGroupNetwork(t *testing.T, s *Server) {
 	t.Helper()
 	if err := s.db.Execute(context.Background(),
@@ -85,6 +92,8 @@ func TestFirewallTagGroup_NeedsSGWriteAndIsAudited(t *testing.T) {
 	wantAudit(t, s, "firewall.tag_group.set", "nina", "web",
 		"before=none after={match={role=web} networks=[] security_groups=[]}")
 
+	tagGroupNetwork(t, s)
+	tagGroupSG(t, s, "web-in")
 	req := tagGroupReq("web", map[string]string{"role": "web", "env": ""}, "web-in")
 	req.Group.Networks = []string{"prod"}
 	if _, err := s.SetFirewallTagGroup(ctx, req); err != nil {
@@ -146,6 +155,100 @@ func TestFirewallTagGroup_RefusedBeforeTheLatch(t *testing.T) {
 	}
 	if tagGroupExists(t, s, "web") {
 		t.Fatal("a tag-group set whose first use was refused wrote the group")
+	}
+	_, err = s.DeleteFirewallTagGroup(adminCtx(), &pb.DeleteFirewallTagGroupRequest{Name: "db"})
+	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), fwReleaseRefusal(capabilities.FeatureFirewallTagGroups)) {
+		t.Fatalf("tag-group rm whose first use was refused: %v, want Unavailable with the release text", err)
+	}
+	if !tagGroupExists(t, s, "db") {
+		t.Fatal("a tag-group rm whose first use was refused removed the group")
+	}
+}
+
+// rm of a group this replica does not hold is NotFound before the release
+// gate is asked, so a mistyped name records no first use (review m-3).
+//
+// Mutation: look the group up only inside the gate — the gate is asked: red.
+func TestDeleteFirewallTagGroup_NotFoundRecordsNoUse(t *testing.T) {
+	s, g := tagsServer(t)
+	_, err := s.DeleteFirewallTagGroup(adminCtx(), &pb.DeleteFirewallTagGroupRequest{Name: "nope"})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("rm of a missing group: %v, want NotFound", err)
+	}
+	if g.calls != 0 || len(g.used) != 0 {
+		t.Fatalf("rm of a missing group asked the gate %d time(s), used %v", g.calls, g.used)
+	}
+}
+
+// set refuses a binding to a security group or network this replica does
+// not hold, and to a security-group name two groups hold (review m-5).
+//
+// Mutations: skip the security-group check — red; skip the duplicate count
+// — red; skip the network check — red.
+func TestSetFirewallTagGroup_RefusesUnknownBindings(t *testing.T) {
+	s, _ := tagsServer(t)
+	ctx := adminCtx()
+	tagGroupNetwork(t, s)
+	tagGroupSG(t, s, "web-in")
+	// Two groups of one name: the handler refuses a second, but two hosts
+	// can each create one before either sees the other's.
+	for _, id := range []string{"twice-1", "twice-2"} {
+		if err := corrosion.InsertSecurityGroup(context.Background(), s.db, corrosion.SecurityGroup{ID: id, Name: "twice"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range []struct {
+		name, want string
+		req        *pb.SetFirewallTagGroupRequest
+	}{
+		{"unknown sg", `no security group named "nope"`, tagGroupReq("a", map[string]string{"role": "a"}, "web-in", "nope")},
+		{"duplicate sg", `2 security groups are named "twice"`, tagGroupReq("b", map[string]string{"role": "b"}, "twice")},
+		{"unknown network", `no network named "dev"`, func() *pb.SetFirewallTagGroupRequest {
+			r := tagGroupReq("c", map[string]string{"role": "c"}, "web-in")
+			r.Group.Networks = []string{"prod", "dev"}
+			return r
+		}()},
+	} {
+		_, err := s.SetFirewallTagGroup(ctx, c.req)
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: %v, want FailedPrecondition containing %q", c.name, err, c.want)
+		}
+		if tagGroupExists(t, s, c.req.Group.Name) {
+			t.Errorf("%s: the group was written", c.name)
+		}
+	}
+	req := tagGroupReq("ok", map[string]string{"role": "ok"}, "web-in")
+	req.Group.Networks = []string{"prod"}
+	if _, err := s.SetFirewallTagGroup(ctx, req); err != nil {
+		t.Fatalf("set with known bindings: %v", err)
+	}
+}
+
+// rm without --force is refused while a workload whose tags row cannot be
+// read has a NIC on a network the group binds: its membership is unknown,
+// and its NICs there are held at drop only while the group binds (review
+// m-4). --force overrides it.
+//
+// Mutation: skip the unreadable workloads — red.
+func TestDeleteFirewallTagGroup_UnreadableTagsOnABoundNetwork(t *testing.T) {
+	s, _ := tagsServer(t)
+	ctx := adminCtx()
+	tagGroupNetwork(t, s)
+	tagGroupSG(t, s, "web-in")
+	tagGroupMember(t, s, "odd-1", fwA, "52:54:00:00:00:01", "10.0.0.5")
+	if err := s.db.Execute(context.Background(), `UPDATE cluster_policies SET value = '{' WHERE key = ?`,
+		corrosion.FirewallTagsKeyPrefix+corrosion.TagMemberVM+"/"+fwA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetFirewallTagGroup(ctx, tagGroupReq("web", map[string]string{"role": "web"}, "web-in")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.DeleteFirewallTagGroup(ctx, &pb.DeleteFirewallTagGroupRequest{Name: "web"})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "VM odd-1 on prod") || !strings.Contains(err.Error(), "membership is unknown") {
+		t.Fatalf("rm while an unreadable-tags workload sits on a bound network: %v", err)
+	}
+	if _, err := s.DeleteFirewallTagGroup(ctx, &pb.DeleteFirewallTagGroupRequest{Name: "web", Force: true}); err != nil {
+		t.Fatalf("rm --force: %v", err)
 	}
 }
 
@@ -282,6 +385,7 @@ func TestDeleteFirewallTagGroup_BindingInUse(t *testing.T) {
 	ctx := adminCtx()
 	tagGroupNetwork(t, s)
 	tagGroupMember(t, s, "web-1", fwA, "52:54:00:00:00:01", "10.0.0.5")
+	tagGroupSG(t, s, "web-in")
 	if _, err := s.SetFirewallTagGroup(ctx, tagGroupReq("web", map[string]string{"role": "web"}, "web-in")); err != nil {
 		t.Fatal(err)
 	}

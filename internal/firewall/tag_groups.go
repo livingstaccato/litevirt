@@ -311,10 +311,11 @@ func (t *tagPass) emptySets() []IPSet {
 	return out
 }
 
-// isAccept reports whether a stored action accepts ("" is accept); any other
-// action is handled as a deny, which fails closed.
+// isAccept reports whether a stored action accepts ("" is accept, and so is
+// a logged accept, "accept+log"); any other action is handled as a deny,
+// which fails closed. tag-group rm --force judges references the same way.
 func isAccept(action string) bool {
-	a := strings.ToLower(strings.TrimSpace(action))
+	a, _ := rulefield.LogActionVerdict(action)
 	return a == "" || a == string(Accept)
 }
 

@@ -137,6 +137,9 @@ func (s *Server) SetFirewallTagGroup(ctx context.Context, req *pb.SetFirewallTag
 	if err := s.refuseTagGroupSetClash(ctx, name); err != nil {
 		return nil, err
 	}
+	if err := s.refuseTagGroupUnknownBindings(ctx, name, def); err != nil {
+		return nil, err
+	}
 
 	actor := s.repairActor(ctx)
 	var before string
@@ -182,6 +185,46 @@ func (s *Server) refuseTagGroupSetClash(ctx context.Context, name string) error 
 		return status.Errorf(codes.FailedPrecondition,
 			"tag group %s: a group named %s%s exists, whose set would be the IPv6 companion of this one's; remove it first (lv firewall tag-group rm %s%s)",
 			name, name, tagGroupV6Suffix, name, tagGroupV6Suffix)
+	}
+	return nil
+}
+
+// refuseTagGroupUnknownBindings refuses a binding to a security group or a
+// network this replica does not hold, or to a security-group name two live
+// groups hold: the renderer would leave the first out silently and hold the
+// members' NICs at drop for the second. It catches mistakes; it is not
+// atomic with a later delete of the group or network.
+func (s *Server) refuseTagGroupUnknownBindings(ctx context.Context, name string, def corrosion.FirewallTagGroupDef) error {
+	if len(def.SecurityGroups) > 0 {
+		sgs, err := corrosion.ListSecurityGroups(ctx, s.db, "")
+		if err != nil {
+			return status.Errorf(codes.Internal, "list security groups: %v", err)
+		}
+		holders := map[string]int{}
+		for _, g := range sgs {
+			holders[g.Name]++
+		}
+		for _, sg := range def.SecurityGroups {
+			switch holders[sg] {
+			case 0:
+				return status.Errorf(codes.FailedPrecondition,
+					"tag group %s: no security group named %q exists; create it first (lv sg create %s)", name, sg, sg)
+			case 1:
+			default:
+				return status.Errorf(codes.FailedPrecondition,
+					"tag group %s: %d security groups are named %q, and a NIC bound to that name is held at drop; "+
+						"remove all but one first (lv sg rm <sg-id>)", name, holders[sg], sg)
+			}
+		}
+	}
+	for _, n := range def.Networks {
+		rec, err := corrosion.GetNetwork(ctx, s.db, n)
+		if err != nil {
+			return status.Errorf(codes.Internal, "read network %s: %v", n, err)
+		}
+		if rec == nil {
+			return status.Errorf(codes.FailedPrecondition, "tag group %s: no network named %q exists", name, n)
+		}
 	}
 	return nil
 }
@@ -276,6 +319,25 @@ func (s *Server) tagGroupBindingsInUse(ctx context.Context, group string) (users
 		if len(v.Group.Def.SecurityGroups) == 0 {
 			return nil, false, nil
 		}
+		// A workload whose tags row cannot be read may be a member: its NICs
+		// on the networks the group binds are held at drop while it binds
+		// (spec §4.6, T-7), and removing it lifts that hold.
+		for _, w := range m.TagsUnreadable {
+			var on []string
+			for _, n := range w.Networks {
+				if v.Group.BindsNetwork(n) {
+					on = append(on, n)
+				}
+			}
+			if len(on) == 0 {
+				continue
+			}
+			who := "VM " + w.Name
+			if w.Kind == corrosion.TagMemberCT {
+				who = "container " + w.Host + "/" + w.Name
+			}
+			users = append(users, who+" on "+strings.Join(on, ",")+" (its tags cannot be read, so its membership is unknown)")
+		}
 		for _, mb := range v.Members {
 			if len(mb.Bound) == 0 {
 				continue
@@ -306,6 +368,13 @@ func (s *Server) DeleteFirewallTagGroup(ctx context.Context, req *pb.DeleteFirew
 	}
 	if err := s.ReleaseFeatureRefusal(ctx, capabilities.FeatureFirewallTagGroups); err != nil {
 		return nil, err
+	}
+	// A group this replica does not hold is NotFound before the gate, which
+	// would record the feature's first use for a removal of nothing.
+	if _, ok, err := corrosion.GetFirewallTagGroup(ctx, s.db, name); err != nil {
+		return nil, status.Errorf(codes.Internal, "read tag group %s: %v", name, err)
+	} else if !ok {
+		return nil, status.Errorf(codes.NotFound, "tag group %q not found", name)
 	}
 	actor := s.repairActor(ctx)
 	var before string

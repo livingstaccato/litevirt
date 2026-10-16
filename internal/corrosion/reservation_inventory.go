@@ -358,7 +358,13 @@ var (
 // reservation is safe to release otherwise is the caller's decision
 // (ClassifyReservation, under the VM lock on the target host).
 func ReleaseReservation(ctx context.Context, c *Client, opID string) (already bool, err error) {
-	return releaseReservationWith(ctx, c, opID, OpStepCancelled)
+	r, err := prepareReservationRelease(ctx, c, opID, OpStepCancelled)
+	if err != nil {
+		return false, err
+	}
+	applied, err := c.ExecuteBatchGuarded(ctx, r.guard,
+		[]Statement{reservationReleaseStatement(*r.op, OpStepCancelled, c.NowTS())})
+	return r.outcome(applied, err)
 }
 
 // ReleaseBlockedReservation releases a reservation whose release is blocked
@@ -371,7 +377,13 @@ func ReleaseReservation(ctx context.Context, c *Client, opID string) (already bo
 // step's facts for those kinds. A tombstoned `failed` row at that key is
 // ErrReservationReleaseBlocked in turn.
 func ReleaseBlockedReservation(ctx context.Context, c *Client, opID string) (already bool, err error) {
-	return releaseReservationWith(ctx, c, opID, OpStepFailed)
+	r, err := prepareReservationRelease(ctx, c, opID, OpStepFailed)
+	if err != nil {
+		return false, err
+	}
+	applied, err := c.ExecuteBatchGuarded(ctx, r.guard,
+		[]Statement{reservationReleaseStatement(*r.op, OpStepFailed, c.NowTS())})
+	return r.outcome(applied, err)
 }
 
 // IsReservationReleaseStep reports whether a live step at an operation's header
@@ -383,28 +395,42 @@ func IsReservationReleaseStep(st OperationStepRecord) bool {
 		(st.StepName == OpStepFailed && st.Facts == ReservationReleasedFacts)
 }
 
-func releaseReservationWith(ctx context.Context, c *Client, opID, step string) (already bool, err error) {
+// pendingReservationRelease is one release's header, its in-transaction guard
+// and what the guard found.
+type pendingReservationRelease struct {
+	op                      *OperationRecord
+	opID, step              string
+	guard                   func(tx *sql.Tx) (bool, error)
+	inFlight, gone, blocked bool
+}
+
+// prepareReservationRelease reads opID's header, refuses what is never
+// released, and builds the guard that re-checks, in the write's own
+// transaction, that the header is live, no barrier names the operation, no
+// tombstoned row holds the key (op, header epoch, step), and the header epoch is
+// not already terminal.
+func prepareReservationRelease(ctx context.Context, c *Client, opID, step string) (*pendingReservationRelease, error) {
 	op, err := GetOperation(ctx, c, opID)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if op == nil {
-		return false, fmt.Errorf("release reservation %s: %w", opID, ErrReservationNotFound)
+		return nil, fmt.Errorf("release reservation %s: %w", opID, ErrReservationNotFound)
 	}
 	if op.ResourceKind == CapacityResourceKind || reservationManifestKinds[OperationKind(op.OperationKind)] ||
 		(step != OpStepCancelled && !reservationSweepKinds[OperationKind(op.OperationKind)]) {
-		return false, fmt.Errorf("release reservation %s (%s %s): %w",
+		return nil, fmt.Errorf("release reservation %s (%s %s): %w",
 			opID, op.ResourceKind, op.OperationKind, ErrReservationNotReleasable)
 	}
-	var inFlight, gone, blocked bool
-	guard := func(tx *sql.Tx) (bool, error) {
+	r := &pendingReservationRelease{op: op, opID: opID, step: step}
+	r.guard = func(tx *sql.Tx) (bool, error) {
 		var n int
 		if err := tx.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM operations WHERE id = ? AND deleted_at IS NULL`, opID).Scan(&n); err != nil {
 			return false, err
 		}
 		if n == 0 {
-			gone = true
+			r.gone = true
 			return false, nil
 		}
 		for _, q := range []string{
@@ -415,7 +441,7 @@ func releaseReservationWith(ctx context.Context, c *Client, opID, step string) (
 				return false, err
 			}
 			if n != 0 {
-				inFlight = true
+				r.inFlight = true
 				return false, nil
 			}
 		}
@@ -428,7 +454,7 @@ func releaseReservationWith(ctx context.Context, c *Client, opID, step string) (
 			return false, err
 		}
 		if n != 0 {
-			blocked = true
+			r.blocked = true
 			return false, nil
 		}
 		rows, err := tx.QueryContext(ctx,
@@ -452,18 +478,22 @@ func releaseReservationWith(ctx context.Context, c *Client, opID, step string) (
 		state, _ := ReduceOperationState(OperationKind(op.OperationKind), names)
 		return !IsOperationTerminal(state), nil
 	}
-	applied, err := c.ExecuteBatchGuarded(ctx, guard, []Statement{reservationReleaseStatement(*op, step, c.NowTS())})
+	return r, nil
+}
+
+// outcome maps the guarded write's result to ReleaseReservation's.
+func (r *pendingReservationRelease) outcome(applied bool, err error) (already bool, _ error) {
 	switch {
 	case err != nil:
 		return false, err
-	case inFlight:
-		return false, fmt.Errorf("release reservation %s: %w", opID, ErrReservationInFlight)
-	case gone:
-		return false, fmt.Errorf("release reservation %s: %w", opID, ErrReservationNotFound)
-	case blocked:
+	case r.inFlight:
+		return false, fmt.Errorf("release reservation %s: %w", r.opID, ErrReservationInFlight)
+	case r.gone:
+		return false, fmt.Errorf("release reservation %s: %w", r.opID, ErrReservationNotFound)
+	case r.blocked:
 		return false, fmt.Errorf("release reservation %s: %w: still counted; its release row "+
 			"(%s at owner epoch %d) is tombstoned and cannot be re-inserted",
-			opID, ErrReservationReleaseBlocked, step, op.VMOwnerEpoch)
+			r.opID, ErrReservationReleaseBlocked, r.step, r.op.VMOwnerEpoch)
 	}
 	return !applied, nil
 }

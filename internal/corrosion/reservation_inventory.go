@@ -358,6 +358,32 @@ var (
 // reservation is safe to release otherwise is the caller's decision
 // (ClassifyReservation, under the VM lock on the target host).
 func ReleaseReservation(ctx context.Context, c *Client, opID string) (already bool, err error) {
+	return releaseReservationWith(ctx, c, opID, OpStepCancelled)
+}
+
+// ReleaseBlockedReservation releases a reservation whose release is blocked
+// (HostReservationView.ReleaseBlocked: a tombstoned `cancelled` row holds the
+// release row's key). It writes a `failed` step at the header's owner epoch
+// instead, with ReservationReleasedFacts and the header's created_at, through
+// the same ledgered statement and the same guards as ReleaseReservation; every
+// reader on every build reduces it as terminal. Only the manual release calls
+// it, and only for a resize or create operation: no reader replays a `failed`
+// step's facts for those kinds. A tombstoned `failed` row at that key is
+// ErrReservationReleaseBlocked in turn.
+func ReleaseBlockedReservation(ctx context.Context, c *Client, opID string) (already bool, err error) {
+	return releaseReservationWith(ctx, c, opID, OpStepFailed)
+}
+
+// IsReservationReleaseStep reports whether a live step at an operation's header
+// epoch is a written release of its reservation: any `cancelled` (the release
+// row, an expiry or an abort), or the `failed` row ReleaseBlockedReservation
+// writes.
+func IsReservationReleaseStep(st OperationStepRecord) bool {
+	return st.StepName == OpStepCancelled ||
+		(st.StepName == OpStepFailed && st.Facts == ReservationReleasedFacts)
+}
+
+func releaseReservationWith(ctx context.Context, c *Client, opID, step string) (already bool, err error) {
 	op, err := GetOperation(ctx, c, opID)
 	if err != nil {
 		return false, err
@@ -365,7 +391,8 @@ func ReleaseReservation(ctx context.Context, c *Client, opID string) (already bo
 	if op == nil {
 		return false, fmt.Errorf("release reservation %s: %w", opID, ErrReservationNotFound)
 	}
-	if op.ResourceKind == CapacityResourceKind || reservationManifestKinds[OperationKind(op.OperationKind)] {
+	if op.ResourceKind == CapacityResourceKind || reservationManifestKinds[OperationKind(op.OperationKind)] ||
+		(step != OpStepCancelled && !reservationSweepKinds[OperationKind(op.OperationKind)]) {
 		return false, fmt.Errorf("release reservation %s (%s %s): %w",
 			opID, op.ResourceKind, op.OperationKind, ErrReservationNotReleasable)
 	}
@@ -397,7 +424,7 @@ func ReleaseReservation(ctx context.Context, c *Client, opID string) (already bo
 		if err := tx.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM operation_steps
 			 WHERE operation_id = ? AND owner_epoch = ? AND step_name = ? AND deleted_at IS NOT NULL`,
-			opID, op.VMOwnerEpoch, OpStepCancelled).Scan(&n); err != nil {
+			opID, op.VMOwnerEpoch, step).Scan(&n); err != nil {
 			return false, err
 		}
 		if n != 0 {
@@ -425,7 +452,7 @@ func ReleaseReservation(ctx context.Context, c *Client, opID string) (already bo
 		state, _ := ReduceOperationState(OperationKind(op.OperationKind), names)
 		return !IsOperationTerminal(state), nil
 	}
-	applied, err := c.ExecuteBatchGuarded(ctx, guard, []Statement{reservationReleaseStatement(*op, c.NowTS())})
+	applied, err := c.ExecuteBatchGuarded(ctx, guard, []Statement{reservationReleaseStatement(*op, step, c.NowTS())})
 	switch {
 	case err != nil:
 		return false, err
@@ -435,8 +462,8 @@ func ReleaseReservation(ctx context.Context, c *Client, opID string) (already bo
 		return false, fmt.Errorf("release reservation %s: %w", opID, ErrReservationNotFound)
 	case blocked:
 		return false, fmt.Errorf("release reservation %s: %w: still counted; its release row "+
-			"(cancelled at owner epoch %d) is tombstoned and cannot be re-inserted",
-			opID, ErrReservationReleaseBlocked, op.VMOwnerEpoch)
+			"(%s at owner epoch %d) is tombstoned and cannot be re-inserted",
+			opID, ErrReservationReleaseBlocked, step, op.VMOwnerEpoch)
 	}
 	return !applied, nil
 }
@@ -444,7 +471,7 @@ func ReleaseReservation(ctx context.Context, c *Client, opID string) (already bo
 // reservationReleaseStatement is the release row: the ledgered operation_steps
 // insert, with no replication guard. Its created_at is the header's, never the
 // writer's clock — see ReleaseReservation.
-func reservationReleaseStatement(op OperationRecord, now string) Statement {
-	return operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepCancelled,
+func reservationReleaseStatement(op OperationRecord, step, now string) Statement {
+	return operationStepInsertStatement(op.ID, op.VMOwnerEpoch, step,
 		ReservationReleasedFacts, op.CreatedAt, now, nil)
 }

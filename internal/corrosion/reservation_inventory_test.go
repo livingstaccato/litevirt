@@ -251,7 +251,7 @@ func TestReleaseReservation_RowIsDeterministicAcrossWriters(t *testing.T) {
 }
 
 func TestReleaseReservation_ShapeIsLedgered(t *testing.T) {
-	st := reservationReleaseStatement(OperationRecord{ID: "x", VMOwnerEpoch: 3, CreatedAt: "t"}, "n")
+	st := reservationReleaseStatement(OperationRecord{ID: "x", VMOwnerEpoch: 3, CreatedAt: "t"}, OpStepCancelled, "n")
 	fp, err := FingerprintSQL(st.SQL)
 	if err != nil {
 		t.Fatalf("FingerprintSQL: %v", err)
@@ -574,5 +574,98 @@ func TestHostReservationsPartial_ListsAroundUnreadableRows(t *testing.T) {
 	}
 	if strings.Join(ids, ",") != "mismatch-h1,undecodable" {
 		t.Fatalf("unreadable on h1 = %v, want [mismatch-h1 undecodable] (an undecodable target is reported everywhere; mismatch-h2 targets h2)", ids)
+	}
+}
+
+// tombstoneStep tombstones op's step at epoch: the state a release that is
+// blocked starts from.
+func tombstoneStep(t *testing.T, c *Client, opID string, epoch int64, step string) {
+	t.Helper()
+	if err := c.Execute(context.Background(), `UPDATE operation_steps SET deleted_at = ?
+		WHERE operation_id = ? AND owner_epoch = ? AND step_name = ?`, ago(time.Minute), opID, epoch, step); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A blocked release of a reservation whose VM is gone — with no terminal at any
+// epoch, so the reaper never collects it — is ended by the blocked release: a
+// `failed` row at the header epoch with the release facts and the header's
+// created_at, which every reader reduces as terminal.
+func TestReleaseBlockedReservation_EndsABlockedVMGoneReservation(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	created := ago(time.Hour)
+	invOp(t, c, "gone", OpResourceUpdateRunning, "vm", "vm-x", "ResizeVMLive", 1, leakVector, created,
+		map[int64][]string{1: {OpStepReserved, OpStepAdmitted}})
+	if err := AppendOperationStep(ctx, c, OperationStepRecord{OperationID: "gone", OwnerEpoch: 1,
+		StepName: OpStepCancelled, Facts: ReservationReleasedFacts}); err != nil {
+		t.Fatal(err)
+	}
+	tombstoneStep(t, c, "gone", 1, OpStepCancelled)
+	v := mustClassify(t, c, "gone")
+	if v.Class != ReservationVMGone || !v.ReleaseBlocked {
+		t.Fatalf("seed: class %q blocked=%v, want a blocked vm_gone", v.Class, v.ReleaseBlocked)
+	}
+	if _, err := ReleaseReservation(ctx, c, "gone"); !errors.Is(err, ErrReservationReleaseBlocked) {
+		t.Fatalf("ReleaseReservation: %v, want ErrReservationReleaseBlocked", err)
+	}
+
+	already, err := ReleaseBlockedReservation(ctx, c, "gone")
+	if err != nil || already {
+		t.Fatalf("ReleaseBlockedReservation: already=%v err=%v, want a write", already, err)
+	}
+	if _, mem, err := HostReserved(ctx, c, "h1"); err != nil || mem != 0 {
+		t.Fatalf("HostReserved(h1) = %d MiB (err %v) after the blocked release, want 0", mem, err)
+	}
+	if v, err := ClassifyReservation(ctx, c, "gone"); err != nil || v != nil {
+		t.Fatalf("ClassifyReservation after the blocked release: %+v err %v, want not counted", v, err)
+	}
+	steps, err := ListOperationSteps(ctx, c, "gone", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var row *OperationStepRecord
+	for i := range steps {
+		if steps[i].StepName == OpStepFailed {
+			row = &steps[i]
+		}
+	}
+	if row == nil || row.Facts != ReservationReleasedFacts || row.CreatedAt != created || !IsReservationReleaseStep(*row) {
+		t.Fatalf("blocked release row = %+v, want failed@1 with the release facts and created_at %s", row, created)
+	}
+	if already, err := ReleaseBlockedReservation(ctx, c, "gone"); err != nil || !already {
+		t.Fatalf("second blocked release: already=%v err=%v, want already=true", already, err)
+	}
+}
+
+// The blocked release writes nothing for a kind whose `failed` facts a reader
+// may replay, nothing under a barrier, and is itself blocked by a tombstoned
+// `failed` row.
+func TestReleaseBlockedReservation_Refusals(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	invOp(t, c, "restart", OpRestart, "vm", "vm-r", "RestartVM", 1, leakVector, ago(time.Hour),
+		map[int64][]string{1: {OpStepReserved}})
+	if _, err := ReleaseBlockedReservation(ctx, c, "restart"); !errors.Is(err, ErrReservationNotReleasable) {
+		t.Fatalf("restart: %v, want ErrReservationNotReleasable", err)
+	}
+	if _, err := ReleaseReservation(ctx, c, "restart"); err != nil {
+		t.Fatalf("restart: the cancelled release stays available: %v", err)
+	}
+
+	invVM(t, c, "vm1", 1, agoNano(48*time.Hour), "held")
+	invOp(t, c, "held", OpResourceUpdateRunning, "vm", "vm1", "ResizeVMLive", 1, leakVector, ago(time.Hour),
+		map[int64][]string{1: {OpStepReserved}})
+	if _, err := ReleaseBlockedReservation(ctx, c, "held"); !errors.Is(err, ErrReservationInFlight) {
+		t.Fatalf("held: %v, want ErrReservationInFlight", err)
+	}
+
+	invOp(t, c, "both", OpResourceUpdateRunning, "vm", "vm-b", "ResizeVMLive", 1, leakVector, ago(time.Hour),
+		map[int64][]string{1: {OpStepReserved, OpStepCancelled, OpStepFailed}})
+	tombstoneStep(t, c, "both", 1, OpStepCancelled)
+	tombstoneStep(t, c, "both", 1, OpStepFailed)
+	already, err := ReleaseBlockedReservation(ctx, c, "both")
+	if !errors.Is(err, ErrReservationReleaseBlocked) || already || !strings.Contains(err.Error(), "failed at owner epoch 1") {
+		t.Fatalf("both tombstoned: already=%v err=%v, want ErrReservationReleaseBlocked naming the failed row", already, err)
 	}
 }

@@ -182,6 +182,12 @@ func (s *Server) applyNICMTURequest(ctx context.Context, spec *pb.VMSpec, req *p
 	if err != nil {
 		return status.Errorf(codes.Internal, "list NICs of %q: %v", req.GetName(), err)
 	}
+	// An entry made for an unlisted NIC takes its recorded model: the merged
+	// row reads virtio when a newer vm_interfaces row wins the merge.
+	rowModels, err := corrosion.VMNICRowModels(ctx, s.db, req.GetName())
+	if err != nil {
+		return status.Errorf(codes.Internal, "read NIC models of %q: %v", req.GetName(), err)
+	}
 	byOrdinal := make(map[int]corrosion.NICRecord, len(nics))
 	for _, ic := range nics {
 		byOrdinal[ic.Ordinal] = ic
@@ -206,7 +212,11 @@ func (s *Server) applyNICMTURequest(ctx context.Context, spec *pb.VMSpec, req *p
 			if !ok {
 				return status.Errorf(codes.NotFound, "VM %q has no NIC %d", req.GetName(), len(spec.Network))
 			}
-			spec.Network = append(spec.Network, &pb.NetworkAttachment{Name: ic.NetworkName, Model: ic.Model, Mac: ic.MAC})
+			model := rowModels[strings.ToLower(ic.MAC)]
+			if model == "" {
+				model = ic.Model
+			}
+			spec.Network = append(spec.Network, &pb.NetworkAttachment{Name: ic.NetworkName, Model: model, Mac: ic.MAC})
 		}
 		n := spec.Network[o]
 		if err := compose.ValidateNICMTU(n.GetModel(), u.GetMtu()); err != nil {

@@ -23,7 +23,6 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/litevirt/litevirt/internal/pki"
-	"github.com/litevirt/litevirt/internal/secretfile"
 	"github.com/litevirt/litevirt/internal/ssh"
 	"github.com/litevirt/litevirt/internal/systemdunit"
 )
@@ -52,7 +51,7 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 	// Connect and inspect the target BEFORE anything is minted or pushed, so a
 	// refusal leaves both this machine's PKI dir and the target untouched.
 	slog.Info("connecting to host", "target", sshTarget)
-	sc, err := ssh.NewClient(sshTarget)
+	sc, err := connectEnrollmentRemote(sshTarget)
 	if err != nil {
 		return fmt.Errorf("SSH connect: %w", err)
 	}
@@ -78,11 +77,8 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 	// 1. Generate CA if it doesn't exist
 	caPath := filepath.Join(pkiDir, "ca.crt")
 	caKeyPath := filepath.Join(pkiDir, "ca.key")
-	if _, err := os.Stat(caPath); os.IsNotExist(err) {
-		slog.Info("generating cluster CA")
-		if err := pki.GenerateCA(caPath, caKeyPath); err != nil {
-			return fmt.Errorf("generate CA: %w", err)
-		}
+	if err := pki.InitializeOperatorCA(ctx, pkiDir); err != nil {
+		return fmt.Errorf("initialize operator CA: %w", err)
 	}
 
 	// 2. Generate CLI client certificate if it doesn't exist
@@ -104,81 +100,31 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 
 	// 3. Generate host certificate
 	slog.Info("generating host certificate", "host", hostName, "address", hostAddr)
-	hostCertPath := filepath.Join(pkiDir, hostName+".crt")
-	hostKeyPath := filepath.Join(pkiDir, hostName+".key")
-
+	staged, err := stageHostEnrollmentIdentity(pkiDir, hostName, hostAddr)
+	if err != nil {
+		return err
+	}
+	defer staged.remove()
+	hostCertPath, hostKeyPath := staged.cert, staged.key
 	ip := net.ParseIP(hostAddr)
-	if err := pki.GenerateHostCert(caPath, caKeyPath, hostCertPath, hostKeyPath, hostName, ip); err != nil {
-		return fmt.Errorf("generate host cert: %w", err)
-	}
 
-	// 4. Push files to host
-	slog.Info("pushing files to host", "target", sshTarget)
-	remotePKIDir := "/etc/litevirt/pki"
-	if err := sc.Run(fmt.Sprintf("mkdir -p %s", remotePKIDir)); err != nil {
-		return fmt.Errorf("create remote PKI dir: %w", err)
-	}
-
-	// The host KEY is 0600. It is the node's entire cluster identity: peer mTLS
-	// authenticates with it and audit rows are signed with it, so a local user
-	// who can read it can both impersonate the host to every peer and forge its
-	// audit history. It shipped 0644 because CopyFile's default mode was
-	// invisible at the call site.
-	for _, f := range []struct {
-		local, remote string
-		mode          os.FileMode
-	}{
-		{caPath, filepath.Join(remotePKIDir, "ca.crt"), 0644},
-		{hostCertPath, filepath.Join(remotePKIDir, "host.crt"), 0644},
-		{hostKeyPath, filepath.Join(remotePKIDir, "host.key"), 0600},
-		// 0600 for the same reason as host.key: whoever reads it speaks gossip.
-		{gossipKeyPath, filepath.Join(remotePKIDir, pki.GossipKeyName), 0600},
-	} {
-		if err := sc.CopyFileMode(f.local, f.remote, f.mode); err != nil {
-			return fmt.Errorf("push %s: %w", filepath.Base(f.local), err)
-		}
-	}
-	// Migration-TLS credentials from the separate migration CA, so storage
-	// migrations to and from this host are encrypted. nil: init founds a
-	// cluster, so there is no host holding another CA's credentials to ask.
+	// Stage all material and the current helper before touching active paths.
 	migFiles, err := issueMigrationCredentials(pkiDir, hostName, ip, nil)
 	if err != nil {
 		return err
 	}
-	if err := pushMigrationCredentials(sc, migFiles); err != nil {
+	request, err := loadEnrollmentRequest(hostName, caPath, hostCertPath, hostKeyPath, gossipKeyPath, migFiles)
+	if err != nil {
 		return err
 	}
-
-	// Push litevirtd binary
-	binPath, err := findDaemonBinary()
-	if err != nil {
-		return fmt.Errorf("find litevirtd binary: %w", err)
+	block := enforcementBlockOf(existingCfg)
+	if block == "" {
+		block = newClusterEnforcement
 	}
-	slog.Info("pushing litevirt binary", "path", binPath)
-	if err := sc.CopyFile(binPath, "/usr/local/bin/litevirt"); err != nil {
-		return fmt.Errorf("push litevirt binary: %w", err)
-	}
-	if err := sc.Run("chmod 755 /usr/local/bin/litevirt"); err != nil {
-		return fmt.Errorf("chmod litevirt: %w", err)
-	}
-	// `lv` stays available as a convenience symlink to the combined binary.
-	if err := sc.Run("ln -sf /usr/local/bin/litevirt /usr/local/bin/lv"); err != nil {
-		return fmt.Errorf("symlink lv: %w", err)
-	}
-
-	// 4. Push and run setup script
-	slog.Info("running host setup")
-	setupScript, err := getSetupScript()
-	if err != nil {
-		return fmt.Errorf("read setup script: %w", err)
-	}
-
-	// bash -s with the script on stdin: it never lands on the remote filesystem,
-	// so there is no path for a local user on the target to pre-create, no window
-	// between writing it and running it, and nothing to clean up if this process
-	// dies in between.
-	if err := sc.RunWithInput(remoteInitSetupCommand(hostName, hostAddr, existingCfg), []byte(setupScript)); err != nil {
-		return fmt.Errorf("run setup script: %w", err)
+	request.SetupEnv = append(setupScriptEnvWith(hostName, hostAddr, localInitJoinPeers, block), foundingSetupEnv)
+	request.Founding, request.Force = true, force
+	if err := runRemoteEnrollment(sc, request); err != nil {
+		return fmt.Errorf("enroll host: %w", err)
 	}
 
 	fmt.Printf("Host %s initialized successfully at %s\n", hostName, hostAddr)
@@ -260,85 +206,34 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	}
 
 	// Generate host certificate
-	hostCertPath := filepath.Join(pkiDir, hostName+".crt")
-	hostKeyPath := filepath.Join(pkiDir, hostName+".key")
-
-	ip := net.ParseIP(hostAddr)
-	if err := pki.GenerateHostCert(caPath, caKeyPath, hostCertPath, hostKeyPath, hostName, ip); err != nil {
-		return fmt.Errorf("generate host cert: %w", err)
+	staged, err := stageHostEnrollmentIdentity(pkiDir, hostName, hostAddr)
+	if err != nil {
+		return err
 	}
+	defer staged.remove()
+	hostCertPath, hostKeyPath := staged.cert, staged.key
+	ip := net.ParseIP(hostAddr)
 
 	// Push to host
-	sc, err := ssh.NewClient(sshTarget)
+	sc, err := connectEnrollmentRemote(sshTarget)
 	if err != nil {
 		return fmt.Errorf("SSH connect: %w", err)
 	}
 	defer sc.Close()
 
-	remotePKIDir := "/etc/litevirt/pki"
-	if err := sc.Run(fmt.Sprintf("mkdir -p %s", remotePKIDir)); err != nil {
-		return fmt.Errorf("create remote PKI dir: %w", err)
-	}
-
-	// The host KEY is 0600. It is the node's entire cluster identity: peer mTLS
-	// authenticates with it and audit rows are signed with it, so a local user
-	// who can read it can both impersonate the host to every peer and forge its
-	// audit history. It shipped 0644 because CopyFile's default mode was
-	// invisible at the call site.
-	for _, f := range []struct {
-		local, remote string
-		mode          os.FileMode
-	}{
-		{caPath, filepath.Join(remotePKIDir, "ca.crt"), 0644},
-		{hostCertPath, filepath.Join(remotePKIDir, "host.crt"), 0644},
-		{hostKeyPath, filepath.Join(remotePKIDir, "host.key"), 0600},
-	} {
-		if err := sc.CopyFileMode(f.local, f.remote, f.mode); err != nil {
-			return fmt.Errorf("push %s: %w", filepath.Base(f.local), err)
-		}
-	}
-	if pushGossipKey {
-		if err := sc.CopyFileMode(gossipKeyPath, filepath.Join(remotePKIDir, pki.GossipKeyName), 0600); err != nil {
-			return fmt.Errorf("push %s: %w", pki.GossipKeyName, err)
-		}
-	}
-	// Migration-TLS credentials from the cluster's migration CA, decided above,
-	// so storage migrations with this host are encrypted.
 	migFiles, err := issueMigrationCredentials(pkiDir, hostName, ip, migHolder)
 	if err != nil {
 		return err
 	}
-	if err := pushMigrationCredentials(sc, migFiles); err != nil {
+	gossipToStage := ""
+	if pushGossipKey {
+		gossipToStage = gossipKeyPath
+	}
+	request, err := loadEnrollmentRequest(hostName, caPath, hostCertPath, hostKeyPath, gossipToStage, migFiles)
+	if err != nil {
 		return err
 	}
-
-	// Push litevirtd binary
-	binPath, err := findDaemonBinary()
-	if err != nil {
-		return fmt.Errorf("find litevirtd binary: %w", err)
-	}
-	slog.Info("pushing litevirt binary", "path", binPath)
-	if err := sc.CopyFile(binPath, "/usr/local/bin/litevirt"); err != nil {
-		return fmt.Errorf("push litevirt binary: %w", err)
-	}
-	if err := sc.Run("chmod 755 /usr/local/bin/litevirt"); err != nil {
-		return fmt.Errorf("chmod litevirt: %w", err)
-	}
-	// `lv` stays available as a convenience symlink to the combined binary.
-	if err := sc.Run("ln -sf /usr/local/bin/litevirt /usr/local/bin/lv"); err != nil {
-		return fmt.Errorf("symlink lv: %w", err)
-	}
-
-	// Run setup
-	setupScript, err := getSetupScript()
-	if err != nil {
-		return fmt.Errorf("read setup script: %w", err)
-	}
-	// hostAddr is the address this command just put in the certificate SAN and the
-	// address peers were told to dial, so it is also the address the node must
-	// advertise. Leaving the daemon to auto-detect meant it registered with its
-	// default-route source IP — a different interface on a multi-homed host — and
-	// that value was then copied into the join_peers of every host added after it.
+	request.SetupEnv = setupScriptEnvWith(hostName, hostAddr, peersYAML, enforcement)
 	serial, err := pki.CertSerial(hostCertPath)
 	if err != nil {
 		return fmt.Errorf("read generated host certificate serial: %w", err)
@@ -358,22 +253,10 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	if err != nil {
 		return fmt.Errorf("sign %s's audit admission record: %w", hostName, err)
 	}
-	rejoinPath := filepath.Join(remotePKIDir, corrosion.AuditRejoinFileName)
-	if rejoin != nil {
-		if err := sc.WriteFile(rejoinPath, rejoin, 0644); err != nil {
-			return fmt.Errorf("push %s: %w", corrosion.AuditRejoinFileName, err)
-		}
-	} else if remove {
-		if err := sc.Run("rm -f " + ssh.ShellQuote(rejoinPath)); err != nil {
-			return fmt.Errorf("remove a stale %s: %w", corrosion.AuditRejoinFileName, err)
-		}
-	}
-	// Admission must replicate before setup starts the daemon. A re-added node's
-	// local database still contains its tombstone; starting it first lets its boot
-	// state update put a fresh timestamp on that tombstone and race the admission
-	// back out to the cluster.
-	if err := sc.RunWithInput(remoteAddSetupCommand(hostName, hostAddr, peersYAML, enforcement), []byte(setupScript)); err != nil {
-		return fmt.Errorf("run setup script after admitting the host identity: %w", err)
+	request.Rejoin, request.RemoveRejoin = rejoin, remove
+	// Admission and its audit record are ready before the helper starts the daemon.
+	if err := runRemoteEnrollment(sc, request); err != nil {
+		return fmt.Errorf("enroll admitted host: %w", err)
 	}
 
 	// Back-fill the new host into THIS machine's gossip seed list. The daemon
@@ -506,7 +389,7 @@ func findDaemonBinary() (string, error) {
 
 // HostInitLocal bootstraps litevirt on the local machine (no SSH).
 // Intended for single-node standalone setups.
-// mintLocalHostCert issues the first host's certificate, covering the address
+// stageHostEnrollmentIdentity issues the first host's certificate, covering the address
 // PEERS will dial as well as loopback.
 //
 // It used to pass 127.0.0.1 alone, which is the one address guaranteed to mean a
@@ -520,7 +403,23 @@ func findDaemonBinary() (string, error) {
 // on a multi-homed host, which is exactly why --address exists: on a box whose
 // cluster network is not the default route, the operator has to say so, and the
 // same value belongs in advertise_address.
-func mintLocalHostCert(pkiDir, hostName, addr string) error {
+type stagedEnrollmentIdentity struct{ dir, cert, key string }
+
+func (s stagedEnrollmentIdentity) remove() { _ = os.RemoveAll(s.dir) }
+
+// Host names never become output paths. In particular "host" and "ca" must
+// not overwrite an operator's active identity while preparing enrollment.
+func stageHostEnrollmentIdentity(pkiDir, hostName, addr string) (stagedEnrollmentIdentity, error) {
+	var staged stagedEnrollmentIdentity
+	if hostName == "" || len(hostName) > 253 || hostName == "." || hostName == ".." || strings.ContainsAny(hostName, "/\\\r\n\x00") {
+		return staged, errors.New("invalid enrollment host name")
+	}
+	dir, err := os.MkdirTemp("", "litevirt-enrollment-identity-")
+	if err != nil {
+		return staged, err
+	}
+	staged = stagedEnrollmentIdentity{dir: dir, cert: filepath.Join(dir, "host.crt"), key: filepath.Join(dir, "host.key")}
+
 	caPath := filepath.Join(pkiDir, "ca.crt")
 	caKeyPath := filepath.Join(pkiDir, "ca.key")
 	if addr == "" {
@@ -536,9 +435,11 @@ func mintLocalHostCert(pkiDir, hostName, addr string) error {
 			"address will fail TLS verification. Pass --address <ip>", "host", hostName, "addr", addr)
 	}
 	slog.Info("generating host certificate", "host", hostName, "address", addr)
-	return pki.GenerateHostCert(caPath, caKeyPath,
-		filepath.Join(pkiDir, hostName+".crt"), filepath.Join(pkiDir, hostName+".key"),
-		hostName, ip)
+	if err := pki.GenerateHostCert(caPath, caKeyPath, staged.cert, staged.key, hostName, ip); err != nil {
+		staged.remove()
+		return stagedEnrollmentIdentity{}, err
+	}
+	return staged, nil
 }
 
 func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bool) error {
@@ -561,11 +462,8 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bo
 	// 1. Generate CA if it doesn't exist
 	caPath := filepath.Join(pkiDir, "ca.crt")
 	caKeyPath := filepath.Join(pkiDir, "ca.key")
-	if _, err := os.Stat(caPath); os.IsNotExist(err) {
-		slog.Info("generating cluster CA")
-		if err := pki.GenerateCA(caPath, caKeyPath); err != nil {
-			return fmt.Errorf("generate CA: %w", err)
-		}
+	if err := pki.InitializeOperatorCA(ctx, pkiDir); err != nil {
+		return fmt.Errorf("initialize operator CA: %w", err)
 	}
 
 	// 2. Generate CLI client certificate if it doesn't exist.
@@ -579,82 +477,32 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bo
 	}
 
 	// 3. Generate the host certificate.
-	hostCertPath := filepath.Join(pkiDir, hostName+".crt")
-	hostKeyPath := filepath.Join(pkiDir, hostName+".key")
-	if err := mintLocalHostCert(pkiDir, hostName, advertiseAddr); err != nil {
+	staged, err := stageHostEnrollmentIdentity(pkiDir, hostName, advertiseAddr)
+	if err != nil {
 		return err
 	}
+	defer staged.remove()
+	hostCertPath, hostKeyPath := staged.cert, staged.key
 
-	// 4. Copy daemon certs to system PKI dir. The daemon host key stays
-	// root-owned; the user CLI gets a separate client certificate below.
-	remotePKIDir := "/etc/litevirt/pki"
-	if err := os.MkdirAll(remotePKIDir, 0700); err != nil {
-		return fmt.Errorf("create system PKI dir: %w", err)
-	}
 	gossipKeyPath, _, err := ensureLocalGossipKey(pkiDir)
 	if err != nil {
 		return fmt.Errorf("gossip key: %w", err)
 	}
-	for src, dst := range map[string]string{
-		caPath:        filepath.Join(remotePKIDir, "ca.crt"),
-		hostCertPath:  filepath.Join(remotePKIDir, "host.crt"),
-		hostKeyPath:   filepath.Join(remotePKIDir, "host.key"),
-		gossipKeyPath: filepath.Join(remotePKIDir, pki.GossipKeyName),
-	} {
-		data, err := os.ReadFile(src)
-		if err != nil {
-			return fmt.Errorf("read %s: %w", filepath.Base(src), err)
-		}
-		// The Chmod this used to do afterwards was too late: WriteFile truncates in
-		// place, so the key was already in the loose inode. secretfile renames a
-		// fresh 0600 file over it instead, and never widens an operator's mode.
-		if err := secretfile.Write(dst, data, 0600); err != nil {
-			return fmt.Errorf("write %s: %w", filepath.Base(dst), err)
-		}
-	}
-
-	// Migration-TLS credentials from the separate migration CA. The daemon
-	// installs them for QEMU, so storage migrations with this host are
-	// encrypted once a peer is provisioned too.
-	// nil: init founds a cluster, so there is no host holding another CA's
-	// credentials to ask about.
 	migFiles, err := issueMigrationCredentials(pkiDir, hostName, net.ParseIP(advertiseAddr), nil)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(remoteMigrationDir, 0o700); err != nil {
-		return fmt.Errorf("create %s: %w", remoteMigrationDir, err)
+	request, err := loadEnrollmentRequest(hostName, caPath, hostCertPath, hostKeyPath, gossipKeyPath, migFiles)
+	if err != nil {
+		return err
 	}
-	for _, f := range migFiles {
-		data, err := os.ReadFile(f.local)
-		if err != nil {
-			return fmt.Errorf("read %s: %w", filepath.Base(f.local), err)
-		}
-		if err := secretfile.Write(f.remote, data, f.mode); err != nil {
-			return fmt.Errorf("write %s: %w", f.remote, err)
-		}
-	}
-
+	request.SetupEnv = localInitSetupEnv(hostName, advertiseAddr)
+	request.Founding, request.Force = true, force
 	if err := installLocalCLIClientBundle(pkiDir); err != nil {
 		return err
 	}
-
-	// 5. Run setup script locally
-	slog.Info("running local host setup")
-	setupScript, err := getSetupScript()
-	if err != nil {
-		return fmt.Errorf("read setup script: %w", err)
-	}
-
-	// Streamed on stdin, same as the remote form: no file means no path for a
-	// local user to pre-create and no write-then-execute window.
-	cmd := execCommand("bash", "-s")
-	cmd.Stdin = strings.NewReader(setupScript)
-	cmd.Env = append(os.Environ(), localInitSetupEnv(hostName, advertiseAddr)...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("setup script failed: %w", err)
+	if err := enrollLocalHost(ctx, request); err != nil {
+		return fmt.Errorf("local enrollment: %w", err)
 	}
 
 	fmt.Printf("Host %s initialized locally\n", hostName)
@@ -724,38 +572,22 @@ func localCLIClientPKITargets() ([]cliPKITarget, error) {
 }
 
 func installCLIClientBundle(srcPKIDir string, target cliPKITarget) error {
-	if err := os.MkdirAll(target.dir, 0700); err != nil {
-		return fmt.Errorf("create CLI PKI dir %s: %w", target.dir, err)
-	}
-	files := []struct {
-		name string
-		mode os.FileMode
-	}{
-		{name: "ca.crt", mode: 0644},
-		{name: "client.crt", mode: 0644},
-		{name: "client.key", mode: 0600},
-	}
-	for _, file := range files {
-		src := filepath.Join(srcPKIDir, file.name)
-		dst := filepath.Join(target.dir, file.name)
-		data, err := os.ReadFile(src)
+	// Read the complete incoming bundle before touching the destination. The PKI
+	// owner classifies and protects an existing active host domain atomically.
+	var incoming [3][]byte
+	for i, name := range []string{"ca.crt", "client.crt", "client.key"} {
+		b, err := readEnrollmentFile(filepath.Join(srcPKIDir, name))
 		if err != nil {
-			return fmt.Errorf("read CLI %s: %w", file.name, err)
+			return fmt.Errorf("read CLI %s: %w", name, err)
 		}
-		// Ownership rides along with the write, on the descriptor. A chown of the
-		// PATHNAME afterwards would be a local privilege escalation: root is writing
-		// into a directory the target user owns, os.Chown follows symlinks, and the
-		// window between publishing the file and chowning it is theirs to use.
-		//
-		// file.mode is a ceiling: an operator who tightened client.key to 0400 keeps
-		// 0400, and a re-run never widens ca.crt/client.crt back to 0644.
-		uid, gid := -1, -1
-		if target.chown {
-			uid, gid = target.uid, target.gid
-		}
-		if err := secretfile.WriteOwned(dst, data, file.mode, uid, gid); err != nil {
-			return fmt.Errorf("write CLI %s: %w", file.name, err)
-		}
+		incoming[i] = b
+	}
+	uid, gid := -1, -1
+	if target.chown {
+		uid, gid = target.uid, target.gid
+	}
+	if err := pki.InstallCLIClientFiles(context.Background(), target.dir, incoming[0], incoming[1], incoming[2], uid, gid); err != nil {
+		return fmt.Errorf("install CLI bundle: %w", err)
 	}
 	if target.chown {
 		if err := chownDirNoFollow(target.dir, target.uid, target.gid); err != nil {
@@ -1299,7 +1131,7 @@ func getSetupScript() (string, error) {
 	return setupScriptContent, nil
 }
 
-const setupScriptContent = `#!/bin/bash
+const setupDependencyScript = `#!/bin/bash
 set -euo pipefail
 
 echo "=== litevirt host setup ==="
@@ -1318,6 +1150,11 @@ elif command -v dnf &>/dev/null; then
     dnf install -y qemu-kvm-core libvirt-daemon-kvm \
         genisoimage bridge-utils haproxy keepalived
 fi
+
+`
+
+const setupScriptContent = setupDependencyScript + `
+set -euo pipefail
 
 # Enable libvirtd with TLS for migration (port 16514).
 # Uses systemd socket activation — enable libvirtd-tls.socket alongside
@@ -1410,7 +1247,9 @@ cat > ` + systemdunit.NeedrestartPath + ` << 'DROPIN'
 ` + systemdunit.Needrestart + `DROPIN
 systemctl daemon-reload
 systemctl enable litevirt.service
-systemctl restart litevirt.service
+if [ "${LITEVIRT_DEFER_START:-}" != "1" ]; then
+    systemctl restart litevirt.service
+fi
 
 echo "=== litevirt setup complete ==="
 `

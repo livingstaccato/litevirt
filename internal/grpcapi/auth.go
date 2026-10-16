@@ -139,7 +139,11 @@ func (s *Server) SetForwardedIdentity(on bool) { s.forwardedIdentity.Store(on) }
 // replicated because replication is what is refused. Leave it false in steady
 // state: with RegisterHost re-recording each node's own serial at startup, an
 // ordinary rotation converges without it.
-func (s *Server) SetTrustRotatedPeerCerts(on bool) { s.trustRotatedPeerCerts.Store(on) }
+func (s *Server) SetTrustRotatedPeerCerts(on bool) {
+	if err := pki.PublishHostTrustPolicy(s.pkiDir, &s.trustRotatedPeerCerts, on); err != nil {
+		slog.Error("could not publish host trust policy; keeping the current policy", "error", err)
+	}
+}
 
 // SetRBACRealm sets this node's opt-in for realm-aware role-binding grammar.
 // The flag is the reversible kill switch; realm enforcement in GrantRole is

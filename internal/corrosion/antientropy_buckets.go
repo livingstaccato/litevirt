@@ -155,6 +155,9 @@ func (c *Client) mergeRepairPull(data []byte, pull []string, scope *pullScope, s
 // mergeRepairPullScoped is mergeRepairPull inside one anti-entropy exchange,
 // whose re-mint judgements rs carries (nil: none).
 func (c *Client) mergeRepairPullScoped(data []byte, pull []string, scope *pullScope, sensitive bool, rs *remintScope) (*syncPayload, error) {
+	return c.mergeRepairPullScopedContext(context.Background(), data, pull, scope, sensitive, rs)
+}
+func (c *Client) mergeRepairPullScopedContext(ctx context.Context, data []byte, pull []string, scope *pullScope, sensitive bool, rs *remintScope) (*syncPayload, error) {
 	if len(data) == 0 {
 		return &syncPayload{}, nil
 	}
@@ -173,5 +176,5 @@ func (c *Client) mergeRepairPullScoped(data []byte, pull []string, scope *pullSc
 		allowed = sensitiveTableSet
 	}
 	payload.remints = rs
-	return payload, c.mergeStatePayloadLWWWithAllowlist(payload, allowed)
+	return payload, c.mergeStatePayloadLWWWithAllowlistContext(ctx, payload, allowed)
 }

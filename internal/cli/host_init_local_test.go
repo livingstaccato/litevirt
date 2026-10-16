@@ -28,11 +28,13 @@ func TestHostInitLocal_CertCoversTheAddressPeersDial(t *testing.T) {
 	t.Setenv("LITEVIRT_PKI_DIR", dir)
 	mustCA(t, dir)
 
-	if err := mintLocalHostCert(dir, "node-1", "10.77.0.11"); err != nil {
-		t.Fatalf("mintLocalHostCert: %v", err)
+	staged, err := stageHostEnrollmentIdentity(dir, "node-1", "10.77.0.11")
+	if err != nil {
+		t.Fatalf("stageHostEnrollmentIdentity: %v", err)
 	}
 
-	pemBytes, err := os.ReadFile(filepath.Join(dir, "node-1.crt"))
+	defer staged.remove()
+	pemBytes, err := os.ReadFile(staged.cert)
 	if err != nil {
 		t.Fatalf("read cert: %v", err)
 	}
@@ -71,10 +73,12 @@ func TestHostInitLocal_FallsBackWhenNoAddressGiven(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("LITEVIRT_PKI_DIR", dir)
 	mustCA(t, dir)
-	if err := mintLocalHostCert(dir, "node-1", ""); err != nil {
+	staged, err := stageHostEnrollmentIdentity(dir, "node-1", "")
+	if err != nil {
 		t.Fatalf("an empty address should fall back to auto-detection, got: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "node-1.crt")); err != nil {
+	defer staged.remove()
+	if _, err := os.Stat(staged.cert); err != nil {
 		t.Fatalf("no certificate was written: %v", err)
 	}
 }

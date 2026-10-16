@@ -359,7 +359,7 @@ func revokeReplaced(ctx context.Context, c pb.LiteVirtClient, hostName, serial s
 			"since, or if revoking now is what you want", serial, err, hostName, serial)
 	}
 	if resp.Revoked {
-		if err := secretfile.Write(crlPath, crl, 0o644); err != nil {
+		if _, _, err := pki.InstallCRL(pkiDir, crl); err != nil {
 			fmt.Printf("  NOTE: published, but could not update %s: %v\n", crlPath, err)
 		}
 		logRenewal(pkiDir, renewalEntry{Host: hostName, Serial: serial, State: "revoked"})
@@ -408,6 +408,10 @@ func rotateAuditKeyHint(hostName, sshTarget string) string {
 // certificate — so no half pair is left behind for a later `lv host add` or a
 // human to trip on.
 func removeCAMachineCopy(pkiDir, hostName string, prev *x509.Certificate) {
+	if !safeHostCacheCleanup(pkiDir, hostName) {
+		fmt.Println("  NOTE: refusing host-cache cleanup of active or aliased PKI paths")
+		return
+	}
 	keyPath := filepath.Join(pkiDir, hostName+".key")
 	crtPath := filepath.Join(pkiDir, hostName+".crt")
 	b, err := os.ReadFile(keyPath)
@@ -431,6 +435,43 @@ func removeCAMachineCopy(pkiDir, hostName string, prev *x509.Certificate) {
 			fmt.Printf("  removed this machine's copy of the replaced certificate (%s)\n", crtPath)
 		}
 	}
+}
+
+// Only historical regular files named directly in the operator directory are
+// cache copies. Pair matching does not authorize removing an active identity,
+// a root, or an alias to one of those files.
+func safeHostCacheCleanup(dir, name string) bool {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\") || filepath.Base(name) != name {
+		return false
+	}
+	protected := []string{"host", "ca", "client", "ui", "migration-ca", "migration-host"}
+	for _, reserved := range protected {
+		if name == reserved {
+			return false
+		}
+	}
+	for _, suffix := range []string{".key", ".crt"} {
+		candidate := filepath.Join(dir, name+suffix)
+		info, err := os.Lstat(candidate)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil || !info.Mode().IsRegular() {
+			return false
+		}
+		for _, reserved := range protected {
+			for _, ending := range []string{".key", ".crt"} {
+				active, err := os.Stat(filepath.Join(dir, reserved+ending))
+				if err == nil && os.SameFile(info, active) {
+					return false
+				}
+				if err != nil && !errors.Is(err, os.ErrNotExist) {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 func pemOfCert(c *x509.Certificate) []byte {

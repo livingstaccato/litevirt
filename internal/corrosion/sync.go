@@ -331,9 +331,11 @@ type syncPayload struct {
 }
 
 type syncTable struct {
-	Name    string          `json:"name"`
-	Columns []string        `json:"cols"`
-	Rows    [][]interface{} `json:"rows"`
+	proofPreparation *proofPreparation
+	mergeContext     context.Context
+	Name             string          `json:"name"`
+	Columns          []string        `json:"cols"`
+	Rows             [][]interface{} `json:"rows"`
 	// authority is receiver-local merge metadata derived from the complete
 	// payload. It is never serialized.
 	authority *mergeAuthorityManifest
@@ -620,6 +622,9 @@ func (c *Client) MergeStateBytesLWW(buf []byte) error {
 // the same LWW engine as the public merge but with a disjoint allowlist so a
 // sensitive dump cannot mutate public tables.
 func (c *Client) MergeSensitiveStateBytesLWW(buf []byte) error {
+	return c.MergeSensitiveStateBytesLWWContext(context.Background(), buf)
+}
+func (c *Client) MergeSensitiveStateBytesLWWContext(ctx context.Context, buf []byte) error {
 	if len(buf) == 0 {
 		return nil
 	}
@@ -628,7 +633,7 @@ func (c *Client) MergeSensitiveStateBytesLWW(buf []byte) error {
 		slog.Error("sync: decompress sensitive", "error", err)
 		return err
 	}
-	return c.mergeStatePayloadLWWWithAllowlist(payload, sensitiveTableSet)
+	return c.mergeStatePayloadLWWWithAllowlistContext(ctx, payload, sensitiveTableSet)
 }
 
 // decompressPayload decompresses and unmarshals a gzipped sync payload.
@@ -667,6 +672,9 @@ func (c *Client) mergeStatePayloadLWW(payload *syncPayload) error {
 // the next cycle re-converges. Validation skips (unknown table, malformed columns) are not
 // errors.
 func (c *Client) mergeStatePayloadLWWWithAllowlist(payload *syncPayload, allowedTables map[string]bool) error {
+	return c.mergeStatePayloadLWWWithAllowlistContext(context.Background(), payload, allowedTables)
+}
+func (c *Client) mergeStatePayloadLWWWithAllowlistContext(ctx context.Context, payload *syncPayload, allowedTables map[string]bool) error {
 	start := time.Now()
 	merged, skipped := 0, 0
 	var firstErr error
@@ -681,6 +689,7 @@ func (c *Client) mergeStatePayloadLWWWithAllowlist(payload *syncPayload, allowed
 	tables := authorityOrderedMergeTables(payload)
 	for _, table := range tables {
 		table.remints = payload.remints
+		table.mergeContext = ctx
 		m, s, err := c.mergeTable(table, allowedTables)
 		merged += m
 		skipped += s
@@ -865,6 +874,12 @@ func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (mer
 // the lock), so the compare→insert decision is atomic within the chunk; the lock
 // is released on return so the next chunk doesn't monopolize it.
 func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL string, pkCols []string, pkIdx []int, updatedAtIdx int) (merged, skipped int, err error) {
+	if table.Name == "runtime_action_proofs" && indexOf(table.Columns, "status") >= 0 {
+		return c.mergePreparedProofChunk(table, rows, insertSQL, pkCols, pkIdx, updatedAtIdx)
+	}
+	return c.mergeChunkTransaction(table, rows, insertSQL, pkCols, pkIdx, updatedAtIdx)
+}
+func (c *Client) mergeChunkTransaction(table syncTable, rows [][]interface{}, insertSQL string, pkCols []string, pkIdx []int, updatedAtIdx int) (merged, skipped int, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -878,7 +893,14 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		return 0, len(rows), nil
 	}
 
-	tx, err := c.db.Begin()
+	ctx := table.mergeContext
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, 0, err
+	}
+	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		slog.Error("sync: begin tx", "table", table.Name, "error", err)
 		return 0, 0, fmt.Errorf("begin merge tx for %s: %w", table.Name, err)
@@ -886,6 +908,12 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 	// Identity tracker/orphan side effects are deferred to run only after this chunk COMMITS; a
 	// rollback (a later row or the commit itself failing) drops them via this deferred cleanup.
 	defer c.dropDeferredEffects(tx)
+	if table.proofPreparation != nil {
+		if err := table.proofPreparation.recheck(c, tx); err != nil {
+			_ = tx.Rollback()
+			return 0, 0, err
+		}
+	}
 
 	// Batch-prefetch existing updated_at by PK so LWW needs no per-row SELECT.
 	var existing map[string]string
@@ -1336,9 +1364,16 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		_ = tx.Rollback()
 		return 0, len(rows), fmt.Errorf("mergeChunkFailHook: forced rollback")
 	}
+	if err := ctx.Err(); err != nil {
+		_ = tx.Rollback()
+		return 0, 0, err
+	}
 	if err := tx.Commit(); err != nil {
 		slog.Error("sync: commit", "table", table.Name, "error", err)
 		return 0, skipped, fmt.Errorf("commit merge chunk for %s: %w", table.Name, err)
+	}
+	if table.proofPreparation != nil {
+		table.proofPreparation.release()
 	}
 	c.runDeferredEffects(tx) // the chunk committed → apply the deferred tracker/orphan effects
 	return merged, skipped, nil
@@ -1560,7 +1595,11 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 	// keep local AND surface it as an unresolved tie for operator/reconciler review,
 	// never silently diverge.
 	if proofRank(localStatus) == 2 && proofRank(incomingStatus) == 2 && localStatus != incomingStatus {
-		c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, TieCategoryRuntimeOwned)
+		// The comparison belongs to this transaction. A later row or failed
+		// commit must not publish a conflict marker for rolled-back work.
+		observed := cloneProofRows([][]interface{}{localRow, row})
+		pk := pkKeyAt(row, pkIdx)
+		c.deferAfterCommit(tx, func() { c.trackUnresolved(table.Name, pk, observed[0], observed[1], pathAE, TieCategoryRuntimeOwned) })
 		return true, nil
 	}
 
@@ -1607,7 +1646,13 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 	if certIdx := indexOf(table.Columns, "claim_certificate"); certIdx >= 0 {
 		lc, _ := localRow[certIdx].(string)
 		ic, _ := row[certIdx].(string)
-		best := betterClaimCertificate(lc, ic, func(raw string) bool { return c.certificateVerifiesTx(tx, raw) })
+		if table.proofPreparation == nil {
+			return false, errors.New("proof comparison lacks prepared trust")
+		}
+		best := betterClaimCertificate(lc, ic, table.proofPreparation.verifies)
+		if table.proofPreparation.err != nil {
+			return false, table.proofPreparation.err
+		}
 		if !keepLocal {
 			row[certIdx] = best
 		} else if best != lc {

@@ -257,7 +257,7 @@ func (s *Server) ReseedHost(ctx context.Context, req *pb.ReseedHostRequest) (*pb
 		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
 		return nil, status.Errorf(codes.Internal, "merge state from %s: %v", source, err)
 	}
-	if err := s.db.MergeSensitiveStateBytesLWW(sensitiveDump); err != nil {
+	if err := s.db.MergeSensitiveStateBytesLWWContext(ctx, sensitiveDump); err != nil {
 		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
 		// The unhydrated mark set by the discard stays SET here, which is what
 		// makes this error a refusal rather than a warning: until a reseed

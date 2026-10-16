@@ -72,7 +72,7 @@ func runDaemon() error {
 	// after the shutdown context so it stops with it. See drainIgnoredSignals.
 	drainIgnoredSignals(ctx)
 
-	d, err := daemon.New(cfg)
+	d, err := daemon.NewContext(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("initializing daemon: %w", err)
 	}

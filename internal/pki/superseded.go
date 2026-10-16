@@ -12,8 +12,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/litevirt/litevirt/internal/secretfile"
 )
 
 // Supersession: which host certificates the CA has REPLACED.
@@ -128,9 +126,10 @@ func (s *supersessionStore) loadLocked() bool {
 // memory, and the read is retried on the next call. When it succeeds the
 // file's evidence and the memory's are merged, and the union is written back.
 func (s *supersessionStore) readFileLocked() {
-	if s.fileRead || time.Now().Before(s.fileNext) {
+	if time.Now().Before(s.fileNext) {
 		return
 	}
+	s.fileRead = false
 	path := filepath.Join(s.pkiDir, supersededFile)
 	b, err := readBoundedN(path, maxSupersededBytes)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -143,22 +142,30 @@ func (s *supersessionStore) readFileLocked() {
 		s.fileNext = time.Now().Add(supersededRetryEvery)
 		return
 	}
-	s.fileRead, s.fileErr = true, ""
-	for rest := b; ; {
-		var block *pem.Block
-		block, rest = pem.Decode(rest)
-		if block == nil {
-			break
+	var certs []*x509.Certificate
+	if len(b) != 0 {
+		certs, err = strictCertificateBundle(b, maxTrustSuccessors)
+		if err == nil {
+			for _, cert := range certs {
+				if !s.validSuccessorLocked(cert) {
+					err = errors.New("invalid retained successor evidence")
+					break
+				}
+			}
 		}
-		if block.Type != "CERTIFICATE" {
-			continue
-		}
-		c, err := x509.ParseCertificate(block.Bytes)
-		if err != nil {
-			continue
-		}
-		s.addLocked(c) // re-verified: the file is evidence, not authority
+	} else if err == nil {
+		err = errors.New("empty retained successor evidence")
 	}
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		s.fileErr = err.Error()
+		s.fileNext = time.Now().Add(supersededRetryEvery)
+		return
+	}
+	s.fileRead, s.fileErr = true, ""
+	for _, cert := range certs {
+		s.addLocked(cert)
+	}
+
 	if s.unsaved {
 		if err := s.persistLocked(); err != nil {
 			slog.Warn("could not persist the proof that a host certificate was replaced; it is kept in memory",
@@ -174,20 +181,25 @@ func (s *supersessionStore) addLocked(c *x509.Certificate) bool {
 	if s.known[succ] {
 		return false
 	}
-	prev, ok := RenewedFromSerial(c)
-	if !ok || c.Subject.CommonName == "" || !hasUsage(c, x509.ExtKeyUsageServerAuth) {
+	if !s.validSuccessorLocked(c) {
 		return false
 	}
-	// Verified at the moment it was issued: an expired successor still proves
-	// that its predecessor was replaced.
-	at := c.NotBefore.Add(time.Second)
-	if _, err := c.Verify(x509.VerifyOptions{Roots: s.roots, CurrentTime: at,
-		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}); err != nil {
-		return false
-	}
+	prev, _ := RenewedFromSerial(c)
 	s.known[succ] = true
 	s.byPrev[prev] = append(s.byPrev[prev], supersession{cn: c.Subject.CommonName, successor: c})
 	return true
+}
+
+func (s *supersessionStore) validSuccessorLocked(c *x509.Certificate) bool {
+	if c == nil || c.SerialNumber == nil {
+		return false
+	}
+	if _, ok := RenewedFromSerial(c); !ok || c.Subject.CommonName == "" || !hasUsage(c, x509.ExtKeyUsageServerAuth) {
+		return false
+	}
+	_, err := c.Verify(x509.VerifyOptions{Roots: s.roots, CurrentTime: c.NotBefore.Add(time.Second),
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}})
+	return err == nil
 }
 
 // NoteSuccessor records cert as proof that the certificate it names as its
@@ -202,15 +214,26 @@ func NoteSuccessor(pkiDir string, cert *x509.Certificate) bool {
 	if _, ok := RenewedFromSerial(cert); !ok {
 		return false
 	}
-	s := supersessionsFor(pkiDir)
+	lock, err := lockTrustWriter(pkiDir)
+	if err != nil {
+		return false
+	}
+	defer lock.release()
+	return lock.owner.noteSuccessorLocked(cert)
+}
+
+func (o *trustOwner) noteSuccessorLocked(cert *x509.Certificate) bool {
+	s := supersessionsFor(o.dir)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.loadLocked() || !s.addLocked(cert) {
 		return false
 	}
+	o.invalidateLocked()
 	if err := s.persistLocked(); err != nil {
+		o.dirty = err
 		slog.Warn("could not persist the proof that a host certificate was replaced; it is kept in memory",
-			"file", filepath.Join(pkiDir, supersededFile), "error", err)
+			"file", filepath.Join(o.dir, supersededFile), "error", err)
 	}
 	prev, _ := RenewedFromSerial(cert)
 	slog.Info("learned that a host certificate was replaced by a CA-issued renewal",
@@ -224,14 +247,21 @@ func (s *supersessionStore) persistLocked() error {
 		return fmt.Errorf("%s could not be read (%s); not writing over it", supersededFile, s.fileErr)
 	}
 	var buf bytes.Buffer
+	count := 0
 	for _, list := range s.byPrev {
 		for _, e := range list {
+			count++
+			// PEM expansion, line breaks and delimiters, before allocation.
+			encoded := ((len(e.successor.Raw) + 2) / 3) * 4
+			if count > maxTrustSuccessors || encoded+(encoded+63)/64+54 > maxSupersededBytes-buf.Len() {
+				return errors.New("successor evidence exceeds supported bound")
+			}
 			if err := pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: e.successor.Raw}); err != nil {
 				return err
 			}
 		}
 	}
-	if err := secretfile.Write(filepath.Join(s.pkiDir, supersededFile), buf.Bytes(), 0o644); err != nil {
+	if err := writeTrustFile(filepath.Join(s.pkiDir, supersededFile), buf.Bytes(), 0o644); err != nil {
 		return err
 	}
 	s.unsaved = false
@@ -243,7 +273,12 @@ func (s *supersessionStore) persistLocked() error {
 // still stands (see the file comment). ok=false means no proof is held: not
 // that the certificate is current.
 func SupersededBy(pkiDir, cn, serial string) (successor string, ok bool) {
-	s := supersessionsFor(pkiDir)
+	lock, err := lockTrustWriter(pkiDir)
+	if err != nil {
+		return "", false
+	}
+	defer lock.release()
+	s := supersessionsFor(lock.owner.dir)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.loadLocked() {

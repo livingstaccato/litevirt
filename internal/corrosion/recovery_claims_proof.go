@@ -3,7 +3,6 @@ package corrosion
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -251,52 +250,6 @@ func (c *Client) SetClaimCertificateVerifier(fn func() *ClaimVerifier) {
 	c.claimCertVerifier.Store(&fn)
 }
 
-func (c *Client) claimCertificateVerifier() *ClaimVerifier {
-	fn := c.claimCertVerifier.Load()
-	if fn == nil || *fn == nil {
-		return nil
-	}
-	return (*fn)()
-}
-
-// certificateVerifiesTx reports whether raw verifies on THIS node, reading
-// through tx: it decodes, is at a generation this node has adopted that no
-// adopted forced generation replaced, and carries a majority of that
-// generation's members' valid signatures (VerifyClaimCertificate's checks
-// minus the proof binding, which the callers compare separately). It is the
-// judge of which of two certificates for one proof a row keeps.
-func (c *Client) certificateVerifiesTx(tx *sql.Tx, raw string) bool {
-	v := c.claimCertificateVerifier()
-	if v == nil || raw == "" {
-		return false
-	}
-	cert, err := DecodeClaimCertificate(raw)
-	if err != nil || cert.ConfigGeneration < 1 {
-		return false
-	}
-	var adopted, forced int64
-	if err := tx.QueryRow(`SELECT COALESCE(MAX(generation), 0) FROM local_voter_adoption`).Scan(&adopted); err != nil ||
-		cert.ConfigGeneration > adopted {
-		return false
-	}
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM voter_configs
-		WHERE deleted_at IS NULL AND generation > ? AND generation <= ? AND change LIKE 'force:%'`,
-		cert.ConfigGeneration, adopted).Scan(&forced); err != nil || forced > 0 {
-		return false
-	}
-	var membersJSON string
-	if err := tx.QueryRow(`SELECT members_json FROM voter_configs WHERE generation = ? AND deleted_at IS NULL`,
-		cert.ConfigGeneration).Scan(&membersJSON); err != nil {
-		return false
-	}
-	var members []VoterMember
-	if err := json.Unmarshal([]byte(membersJSON), &members); err != nil || len(members) == 0 {
-		return false
-	}
-	return v.Verify(cert, CertExpectation{Key: cert.Key, ValueDigest: cert.ValueDigest,
-		ConfigGeneration: cert.ConfigGeneration, Electorate: members, Quorum: MajorityOf(len(members))}) == nil
-}
-
 // ClaimCertificateReplaces reports whether certificate next may take the place
 // of current on one proof row, with verifies judging a certificate on this
 // node (certificateVerifiesTx). An empty or unparseable current is replaced
@@ -381,14 +334,39 @@ func SetProofClaimCertificate(ctx context.Context, c *Client, p ActionProof) err
 	if p.ClaimCertificate == "" {
 		return ErrNoRowsAffected
 	}
+	if _, err := decodePreparedCertificate(p.ClaimCertificate); errors.Is(err, ErrProofPreparationSize) {
+		return err
+	}
 	if _, err := CertificateAuthorizesProof(p.ClaimCertificate, p); err != nil {
 		return fmt.Errorf("%w: %v", ErrProofDiverges, err)
 	}
 	if !c.MayEmitClaimCertificate() {
 		return fmt.Errorf("%w (proof %s)", ErrClaimCertificateNotEmittable, p.ID)
 	}
+	for attempt := 0; attempt < proofPreparationAttempts; attempt++ {
+		prepared, err := c.discoverProofPreparation(ctx, []string{p.ID}, []string{p.ClaimCertificate})
+		if err != nil {
+			return proofPreparationError(err)
+		}
+		if err = prepared.prepare(); err != nil {
+			return proofPreparationError(err)
+		}
+		err = setPreparedProofCertificate(ctx, c, p, prepared)
+		prepared.release()
+		if errors.Is(err, ErrProofPreparationChanged) {
+			continue
+		}
+		return err
+	}
+	return ErrProofPreparationChanged
+}
+
+func setPreparedProofCertificate(ctx context.Context, c *Client, p ActionProof, prepared *proofPreparation) error {
 	var diverges bool
 	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		if err := prepared.recheck(c, tx); err != nil {
+			return false, err
+		}
 		var existing ActionProof
 		var cert string
 		err := tx.QueryRow(
@@ -409,9 +387,8 @@ func SetProofClaimCertificate(ctx context.Context, c *Client, p ActionProof) err
 			diverges = true
 			return false, nil
 		}
-		return ClaimCertificateReplaces(cert, p.ClaimCertificate, func(raw string) bool {
-			return c.certificateVerifiesTx(tx, raw)
-		}), nil
+		replace := ClaimCertificateReplaces(cert, p.ClaimCertificate, prepared.verifies)
+		return replace, prepared.err
 	}, []Statement{{SQL: updateProofCertificateSQL, Params: []interface{}{p.ClaimCertificate, c.NowTS(), p.ID}}})
 	if err != nil {
 		return err

@@ -34,9 +34,21 @@ var (
 // GenerateCRL creates or updates a CRL file, revoking the given serial numbers.
 // The CRL is signed by the CA at caCertPath/caKeyPath.
 func GenerateCRL(caCertPath, caKeyPath, crlPath string, revokedSerials []string) error {
+	lock, err := lockTrustWriter(filepath.Dir(crlPath))
+	if err != nil {
+		return err
+	}
+	defer lock.release()
+	lock.owner.invalidateLocked()
+
 	crlInstallMu.Lock()
 	defer crlInstallMu.Unlock()
-	return generateCRLLocked(caCertPath, caKeyPath, crlPath, revokedSerials)
+	err = generateCRLLocked(caCertPath, caKeyPath, crlPath, revokedSerials)
+	if err != nil {
+		lock.owner.dirty = err
+		return err
+	}
+	return lock.owner.rememberCRLLocked(crlPath)
 }
 
 func generateCRLLocked(caCertPath, caKeyPath, crlPath string, revokedSerials []string) error {
@@ -104,6 +116,13 @@ func generateCRLLocked(caCertPath, caKeyPath, crlPath string, revokedSerials []s
 
 // AppendToCRL adds a serial number to an existing CRL, or creates a new one.
 func AppendToCRL(caCertPath, caKeyPath, crlPath, serial string) error {
+	lock, err := lockTrustWriter(filepath.Dir(crlPath))
+	if err != nil {
+		return err
+	}
+	defer lock.release()
+	lock.owner.invalidateLocked()
+
 	crlInstallMu.Lock()
 	defer crlInstallMu.Unlock()
 
@@ -137,7 +156,12 @@ func AppendToCRL(caCertPath, caKeyPath, crlPath, serial string) error {
 	}
 
 	existing = append(existing, serial)
-	return generateCRLLocked(caCertPath, caKeyPath, crlPath, existing)
+	err = generateCRLLocked(caCertPath, caKeyPath, crlPath, existing)
+	if err != nil {
+		lock.owner.dirty = err
+		return err
+	}
+	return lock.owner.rememberCRLLocked(crlPath)
 }
 
 // LoadCRL reads a CRL file and returns the revoked serial numbers as hex strings.
@@ -272,6 +296,13 @@ func InstallCRL(pkiDir string, crlPEM []byte) (int64, bool, error) {
 // The process-wide lock makes the compare and rename one operation for the
 // PublishCRL and periodic-sync goroutines.
 func InstallCRLs(pkiDir string, candidates [][]byte) (int64, bool, error) {
+	lock, err := lockTrustWriter(pkiDir)
+	if err != nil {
+		return 0, false, err
+	}
+	defer lock.release()
+	lock.owner.invalidateLocked()
+
 	crlInstallMu.Lock()
 	defer crlInstallMu.Unlock()
 
@@ -370,65 +401,24 @@ func InstallCRLs(pkiDir string, candidates [][]byte) (int64, bool, error) {
 	}
 	bundleBytes := bundle.Bytes()
 	if local, err := os.ReadFile(crlPath); err == nil && bytes.Equal(local, bundleBytes) {
+		if err := lock.owner.rememberCRLLocked(crlPath); err != nil {
+			return 0, false, err
+		}
 		return highest, false, nil
 	}
 
-	// Write through a temporary file: the mTLS checker reloads on mtime change and
-	// must never observe a half-written CRL, which it would read as "unparseable →
-	// enforce nothing" and cache until the next write.
-	tmp, err := os.CreateTemp(pkiDir, "crl-*.pem.tmp")
-	if err != nil {
-		return 0, false, fmt.Errorf("create a temporary file for the CRL: %w", err)
+	if err := writeTrustFile(crlPath, bundleBytes, 0600); err != nil {
+		lock.owner.dirty = err
+		return 0, false, err
 	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(bundleBytes); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return 0, false, fmt.Errorf("write CRL: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return 0, false, fmt.Errorf("write CRL: %w", err)
-	}
-	if err := os.Chmod(tmpName, 0o600); err != nil {
-		os.Remove(tmpName)
-		return 0, false, fmt.Errorf("set CRL permissions: %w", err)
-	}
-	if err := os.Rename(tmpName, crlPath); err != nil {
-		os.Remove(tmpName)
-		return 0, false, fmt.Errorf("install CRL: %w", err)
+	if err := lock.owner.rememberCRLLocked(crlPath); err != nil {
+		return 0, false, err
 	}
 	return highest, true, nil
 }
 
 func writeCRLAtomically(path string, der []byte) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, "crl-mint-*.pem.tmp")
-	if err != nil {
-		return fmt.Errorf("create temporary CRL: %w", err)
-	}
-	tmpName := tmp.Name()
-	cleanup := func() {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-	}
-	if err := pem.Encode(tmp, &pem.Block{Type: "X509 CRL", Bytes: der}); err != nil {
-		cleanup()
-		return fmt.Errorf("encode CRL: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		return fmt.Errorf("write CRL: %w", err)
-	}
-	if err := os.Chmod(tmpName, 0o600); err != nil {
-		_ = os.Remove(tmpName)
-		return fmt.Errorf("set CRL permissions: %w", err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
-		return fmt.Errorf("install CRL: %w", err)
-	}
-	return nil
+	return writeTrustFile(path, pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der}), 0600)
 }
 
 // CRLVersion returns the CRL number (version) from a CRL file, or 0 if not found.
@@ -529,4 +519,25 @@ func MintCRLWith(caCertPath, caKeyPath, crlPath string, serials ...string) ([]by
 		}
 	}
 	return os.ReadFile(work)
+}
+
+// Called only after a coordinated verified installation or local CA mint.
+func (o *trustOwner) rememberCRLLocked(path string) error {
+	raw, err := readBoundedN(path, maxTrustCRLBytes)
+	if err != nil {
+		o.dirty = err
+		return err
+	}
+	crls, err := parseCRLs(raw)
+	if err != nil {
+		o.dirty = err
+		return err
+	}
+	for _, crl := range crls {
+		for _, entry := range crl.RevokedCertificateEntries {
+			o.revokedFloor[entry.SerialNumber.Text(16)] = true
+		}
+	}
+	o.crlEstablished = true
+	return nil
 }

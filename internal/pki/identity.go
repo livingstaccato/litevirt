@@ -1,6 +1,7 @@
 package pki
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -44,6 +45,7 @@ import (
 //     new one was not taken.
 type KeyPairSource struct {
 	certPath, keyPath string
+	trustDir          string // only the shared active host identity participates
 	// check vets a changed pair before it replaces the served one. nil accepts
 	// any pair LoadX509KeyPair can load.
 	check func(leaf *x509.Certificate) error
@@ -98,6 +100,28 @@ func (s *KeyPairSource) withPairCheck(fn func(*tls.Certificate) error) *KeyPairS
 // Get returns the pair to serve, re-reading the files if they changed. It errs
 // only while no pair has ever loaded.
 func (s *KeyPairSource) Get() (*tls.Certificate, error) {
+	if s.trustDir == "" {
+		return s.getTrustLocked()
+	}
+	lock, err := lockTrustWriter(s.trustDir)
+	if err != nil {
+		return nil, err
+	}
+	defer lock.release()
+	pair, err := s.getTrustLocked()
+	if err != nil {
+		lock.owner.dirty = err
+		return nil, err
+	}
+	fingerprint := sha256.Sum256(pair.Certificate[0])
+	if lock.owner.servedFingerprint != fingerprint {
+		lock.owner.invalidateLocked()
+		lock.owner.servedFingerprint = fingerprint
+	}
+	return pair, nil
+}
+
+func (s *KeyPairSource) getTrustLocked() (*tls.Certificate, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cs, cerr := stampOf(s.certPath)
@@ -322,6 +346,11 @@ func hostIdentitySource(pkiDir string) *KeyPairSource {
 // the Common Name of the pair first loaded — renewal replaces a certificate; it
 // never changes whose it is.
 func sharedSource(pkiDir, name string, usages ...x509.ExtKeyUsage) *KeyPairSource {
+	if canonical, err := filepath.EvalSymlinks(pkiDir); err == nil {
+		if absolute, err := filepath.Abs(canonical); err == nil {
+			pkiDir = absolute
+		}
+	}
 	certPath := filepath.Join(pkiDir, name+".crt")
 	keyPath := filepath.Join(pkiDir, name+".key")
 	key := certPath + "\x00" + keyPath
@@ -331,6 +360,9 @@ func sharedSource(pkiDir, name string, usages ...x509.ExtKeyUsage) *KeyPairSourc
 		return s
 	}
 	s := NewKeyPairSource(certPath, keyPath, nil)
+	if name == "host" {
+		s.trustDir = pkiDir
+	}
 	s.check = func(leaf *x509.Certificate) error {
 		return checkSameIdentity(pkiDir, s.firstCN(), leaf, usages)
 	}

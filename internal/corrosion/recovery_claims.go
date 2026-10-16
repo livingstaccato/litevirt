@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/litevirt/litevirt/internal/pki"
 )
@@ -566,8 +567,11 @@ func (s *ClaimSigner) Sign(key ClaimKey, gen int64, b Ballot, digest, incarnatio
 // (§3.10 steps 4–5). It needs no private key and makes no RPC: a destination
 // verifies without re-querying any voter.
 type ClaimVerifier struct {
-	roots  *x509.CertPool
-	pkiDir string
+	ordinary                  *pki.OrdinaryClaimTrust
+	policyCell                *atomic.Bool
+	policyPinned, policyNoPin bool
+	roots                     *x509.CertPool
+	pkiDir                    string
 	// historical is set on the copy Historical returns: a certificate
 	// revoked since still counts. Nothing else is relaxed.
 	historical bool
@@ -581,6 +585,32 @@ type ClaimVerifier struct {
 	// renewalBlind (RenewalBlind): an accept signed with a certificate the CA
 	// has replaced counts, revoked or not. Diagnosis only.
 	renewalBlind bool
+}
+
+// WithHostTrustPolicy binds the server's actual effective policy cell. Proof
+// preparation resamples it only while holding that directory's owner lease.
+func (v *ClaimVerifier) WithHostTrustPolicy(cell *atomic.Bool) *ClaimVerifier {
+	if v == nil {
+		return nil
+	}
+	h := *v
+	h.policyCell = cell
+	if v.policyCell == nil {
+		h.policyPinned, h.policyNoPin = v.pinned, v.noPin
+	}
+	// Rebinding must preserve the logical options, not a previously relaxed
+	// effective value that would survive a later policy toggle back.
+	h.pinned, h.noPin = h.policyPinned, h.policyNoPin
+	if cell != nil && cell.Load() {
+		h.pinned, h.noPin = false, true
+	}
+	return &h
+}
+func (v *ClaimVerifier) superseded(c *x509.Certificate) error {
+	if v.ordinary != nil {
+		return v.ordinary.Superseded(c)
+	}
+	return pki.SupersededError(v.pkiDir, c)
 }
 
 // WithRevoked returns a copy of v that also treats serials as revoked: the
@@ -620,6 +650,7 @@ func (v *ClaimVerifier) WithSerialPin() *ClaimVerifier {
 	}
 	h := *v
 	h.pinned, h.noPin = true, false
+	h.policyPinned, h.policyNoPin = true, false
 	return &h
 }
 
@@ -635,6 +666,7 @@ func (v *ClaimVerifier) WithoutSerialPin() *ClaimVerifier {
 	}
 	h := *v
 	h.pinned, h.noPin = false, true
+	h.policyPinned, h.policyNoPin = false, true
 	return &h
 }
 
@@ -655,6 +687,7 @@ func (v *ClaimVerifier) RenewalBlind() *ClaimVerifier {
 	}
 	h := *v
 	h.pinned, h.noPin, h.renewalBlind = false, true, true
+	h.policyPinned, h.policyNoPin = false, true
 	return &h
 }
 
@@ -725,11 +758,14 @@ func (v *ClaimVerifier) revoked(c *x509.Certificate) bool {
 	if v.historical {
 		return false
 	}
-	if v.renewalBlind && pki.SupersededError(v.pkiDir, c) != nil {
+	if v.renewalBlind && v.superseded(c) != nil {
 		return false
 	}
 	if v.extraRevoked[strings.ToLower(c.SerialNumber.Text(16))] {
 		return true
+	}
+	if v.ordinary != nil {
+		return v.ordinary.Revoked(c)
 	}
 	return pki.IsCertRevoked(v.pkiDir, c.SerialNumber)
 }
@@ -739,7 +775,7 @@ func (v *ClaimVerifier) pinRefuses(c *x509.Certificate, voter string) error {
 	if v.historical || !v.pinned {
 		return nil
 	}
-	if err := pki.SupersededError(v.pkiDir, c); err != nil {
+	if err := v.superseded(c); err != nil {
 		return fmt.Errorf("signed as %s with a replaced certificate: %w", voter, err)
 	}
 	return nil
@@ -750,6 +786,9 @@ func (v *ClaimVerifier) pinRefuses(c *x509.Certificate, voter string) error {
 // before any accept is judged, so a renewed voter's own accept in a row proves
 // its predecessor replaced for the rest of that row as well.
 func (v *ClaimVerifier) noteSuccessors(certPEMs ...string) {
+	if v.ordinary != nil {
+		return
+	}
 	for _, p := range certPEMs {
 		if c, err := parseCertPEM([]byte(p)); err == nil {
 			pki.NoteSuccessor(v.pkiDir, c)
@@ -831,6 +870,9 @@ func (v *ClaimVerifier) verifyAccept(cert ClaimCertificate, a ClaimAccept, elect
 	c, err := parseCertPEM([]byte(a.CertPEM))
 	if err != nil {
 		return err
+	}
+	if v.ordinary != nil && !v.ordinary.Contains(c) {
+		return fmt.Errorf("unprepared accept certificate")
 	}
 	if _, err := c.Verify(x509.VerifyOptions{Roots: v.roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err != nil {
 		return fmt.Errorf("certificate does not chain to the cluster CA: %w", err)

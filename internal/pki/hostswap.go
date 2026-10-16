@@ -107,6 +107,18 @@ func GenerateRenewalCSR(pkiDir, cn string) (string, []byte, error) {
 // host as the installed one. It returns the serials (lower-case hex) of the
 // identity it replaced and of the new one.
 func InstallRenewal(pkiDir, stagingID string, certPEM []byte) (prevSerial, newSerial string, err error) {
+	lock, lockErr := lockTrustWriter(pkiDir)
+	if lockErr != nil {
+		return "", "", lockErr
+	}
+	lock.owner.invalidateLocked()
+	defer func() {
+		if err != nil {
+			lock.owner.dirty = err
+		}
+		lock.release()
+	}()
+
 	if stagingID == "" || strings.ContainsAny(stagingID, "/.") {
 		return "", "", fmt.Errorf("invalid staging id %q", stagingID)
 	}
@@ -146,7 +158,7 @@ func InstallRenewal(pkiDir, stagingID string, certPEM []byte) (prevSerial, newSe
 		return "", "", errors.New("the certificate is the one already installed")
 	}
 
-	if err := secretfile.Write(filepath.Join(staging, "host.crt"), certPEM, 0o644); err != nil {
+	if err := writeTrustFile(filepath.Join(staging, "host.crt"), certPEM, 0o644); err != nil {
 		return "", "", err
 	}
 	if err := crashPoint("staged"); err != nil {
@@ -155,6 +167,9 @@ func InstallRenewal(pkiDir, stagingID string, certPEM []byte) (prevSerial, newSe
 	final := filepath.Join(hostDir(pkiDir), newSerial)
 	if err := os.Rename(staging, final); err != nil {
 		return "", "", fmt.Errorf("place the new identity: %w", err)
+	}
+	if err := syncTrustDirectory(hostDir(pkiDir)); err != nil {
+		return "", "", err
 	}
 	if err := crashPoint("placed"); err != nil {
 		return "", "", err
@@ -198,7 +213,7 @@ func ensureLinkedLayout(pkiDir, curSerial string) error {
 			if err != nil {
 				return err
 			}
-			if err := secretfile.Write(filepath.Join(dir, f.name), b, f.mode); err != nil {
+			if err := writeTrustFile(filepath.Join(dir, f.name), b, f.mode); err != nil {
 				return err
 			}
 		}
@@ -252,7 +267,7 @@ func atomicSymlink(target, path string) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	return nil
+	return syncTrustDirectory(filepath.Dir(path))
 }
 
 func switchCurrent(pkiDir, serial string) error {
@@ -266,7 +281,19 @@ func switchCurrent(pkiDir, serial string) error {
 // identity that is already serial — the switch never happened — is left alone.
 // serial must be a hex serial naming a complete pair under host.d that
 // chains to the cluster CA and names the same host as the installed identity.
-func RollbackRenewal(pkiDir, serial string) error {
+func RollbackRenewal(pkiDir, serial string) (err error) {
+	lock, lockErr := lockTrustWriter(pkiDir)
+	if lockErr != nil {
+		return lockErr
+	}
+	lock.owner.invalidateLocked()
+	defer func() {
+		if err != nil {
+			lock.owner.dirty = err
+		}
+		lock.release()
+	}()
+
 	serial = strings.ToLower(serial)
 	if !hexSerialRE.MatchString(serial) {
 		return fmt.Errorf("invalid serial %q: want lower-case hex", serial)
@@ -321,7 +348,19 @@ func readLeafQuiet(path string) *x509.Certificate {
 // used (an abandoned or rolled-back renewal) — so no complete pair for a
 // revoked certificate is left for start-up recovery to find. The current
 // identity is refused.
-func DiscardIdentity(pkiDir, serial string) error {
+func DiscardIdentity(pkiDir, serial string) (err error) {
+	lock, lockErr := lockTrustWriter(pkiDir)
+	if lockErr != nil {
+		return lockErr
+	}
+	lock.owner.invalidateLocked()
+	defer func() {
+		if err != nil {
+			lock.owner.dirty = err
+		}
+		lock.release()
+	}()
+
 	serial = strings.ToLower(serial)
 	if !hexSerialRE.MatchString(serial) {
 		return fmt.Errorf("invalid serial %q: want lower-case hex", serial)
@@ -332,13 +371,28 @@ func DiscardIdentity(pkiDir, serial string) error {
 	if s, err := CertSerial(filepath.Join(pkiDir, "host.crt")); err == nil && strings.EqualFold(s, serial) {
 		return fmt.Errorf("identity %s is the installed one", serial)
 	}
-	return os.RemoveAll(filepath.Join(hostDir(pkiDir), serial))
+	if err := os.RemoveAll(filepath.Join(hostDir(pkiDir), serial)); err != nil {
+		return err
+	}
+	return syncTrustDirectory(hostDir(pkiDir))
 }
 
 // CommitRenewal deletes every identity under host.d except the current one —
 // including the replaced key, so it no longer exists anywhere — and any
 // staging directory.
-func CommitRenewal(pkiDir string) error {
+func CommitRenewal(pkiDir string) (err error) {
+	lock, lockErr := lockTrustWriter(pkiDir)
+	if lockErr != nil {
+		return lockErr
+	}
+	lock.owner.invalidateLocked()
+	defer func() {
+		if err != nil {
+			lock.owner.dirty = err
+		}
+		lock.release()
+	}()
+
 	cur, err := os.Readlink(filepath.Join(hostDir(pkiDir), currentLinkName))
 	if err != nil {
 		return err
@@ -355,7 +409,7 @@ func CommitRenewal(pkiDir string) error {
 			return err
 		}
 	}
-	return nil
+	return syncTrustDirectory(hostDir(pkiDir))
 }
 
 // AbandonStaging removes one staging directory (a renewal that will not be
@@ -373,7 +427,19 @@ func AbandonStaging(pkiDir, stagingID string) error {
 // the newest complete identity under host.d that chains to the cluster CA and
 // names hostName, and says so. Staging directories older than an hour (a
 // renewal that died before installing) are removed.
-func RecoverHostIdentity(pkiDir, hostName string) (bool, error) {
+func RecoverHostIdentity(pkiDir, hostName string) (changed bool, err error) {
+	lock, lockErr := lockTrustWriter(pkiDir)
+	if lockErr != nil {
+		return false, lockErr
+	}
+	lock.owner.invalidateLocked()
+	defer func() {
+		if err != nil {
+			lock.owner.dirty = err
+		}
+		lock.release()
+	}()
+
 	if entries, err := os.ReadDir(hostDir(pkiDir)); err == nil {
 		for _, e := range entries {
 			if !strings.HasPrefix(e.Name(), stagingPrefix) {

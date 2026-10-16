@@ -19,32 +19,41 @@ import (
 // and tests can't overstate what anti-entropy actually repairs.
 var antiEntropyExcluded = map[string]string{
 	// Coordination / local / transient — must not be full-state-merged.
-	"clock_skew":               "per-node clock observations, GC'd locally",
-	"crl_versions":             "per-host CRL version tracking (gossiped)",
-	"schema_state":             "per-node schema version — must stay local for rolling upgrades (not CRDT-replicated)",
-	"leader_election":          "distributed lease — merging would corrupt leadership",
-	"vm_locks":                 "per-VM lease — full-state merge would risk split-brain",
-	"rebalance_proposals":      "transient, leader-gated proposals",
-	"vm_restarts":              "per-node restart bookkeeping",
-	"container_restarts":       "per-node restart bookkeeping (container analogue of vm_restarts)",
-	"vm_events":                "high-volume append-only event log; best-effort, not full-state-repaired",
-	"sessions":                 "ephemeral auth sessions",
-	"mutation_log":             "the replication WAL itself — never full-state-synced",
-	"replication_watermarks":   "per-node replication progress",
-	"mutation_seen":            "per-node relay-dedup table",
-	"host_runtime_usage":       "per-host runtime telemetry (disk_iops/net_mbps); replicates via the WAL/mutation_log but is excluded from full-state anti-entropy — stale telemetry self-corrects on the next sample (cf. vm_events), so it needn't be repaired and shouldn't bloat the digest/dump",
-	"idempotency_keys":         "ephemeral request-dedup records (v39); LOCAL-only (owned by the entry node, never replicated), so no anti-entropy repair applies — see localOnly",
-	"host_fw_intent":           "per-host firewall infra decisions (v40, NAT/SNAT/isolation); LOCAL-only (nft rules are per-host state, never replicated) — see localOnly",
-	"local_term_bindings":      "per-executor (lease_key, lease_term) -> coordinator binding; LOCAL-only and deliberately in NO sync path. The fenced-claim guard used to derive this from runtime_action_proofs, which IS replicated and anti-entropy repaired — so any cluster member could plant rows naming a victim as executor_host across a span of terms and durably refuse that host's recovery. A binding a peer can author is not a binding. See TermFence and TestTermFence_IgnoresPeerAuthoredProofs",
-	"local_recovery_claims":    "v59 a voter's promises and accepts; LOCAL-only and in NO sync path. A grant is a statement about what THIS voter promised, so a replicated one would let a peer write promises on its behalf, LWW would coin-flip two of them and anti-entropy would regress a voter that was correctly ahead (docs/design/recovery-claims.md §3.8). Written only through ExecuteLocal",
-	"local_voter_incarnation":  "v59 the identity of this state.db's claim state; LOCAL-only by definition — it must disappear exactly when the claim state does (§3.11)",
-	"local_voter_adoption":     "v59 which voter generations THIS node has adopted and imported claim state for; a question about this node's own voting state (§4.4)",
-	"local_abandoned_proofs":   "v61 the proofs THIS destination signed it will never execute; LOCAL-only and in NO sync path — an abandonment is this node's own promise, and one a peer could erase or plant would let it either revive a superseded recovery or refuse a live one (docs/design/recovery-claims.md §3.12). Written only through ExecuteLocal",
-	"local_voter_seals":        "v62 the voter generations THIS node sealed as a survivor of a forced reconfiguration; a statement about this voter's own promises (§4.6). Written only through ExecuteLocal",
-	"local_incarnation_claims": "v63 a voter's promises and accepts at incarnation-scoped workload keys; LOCAL-only and in NO sync path, for local_recovery_claims' reasons (docs/design/recovery-claims.md §3.8, §10 item 37). Written only through ExecuteLocal",
-	"session_factors":          "v64 the second factor a session's login presented; as ephemeral as sessions, replicated through the WAL in the session's own batch, never full-state-merged",
-	"session_groups":           "v66 the directory groups a session's external-realm login verified; as ephemeral as sessions, replicated through the WAL in the session's own batch, never full-state-merged",
-	"netbox_sync_queue":        "work queue for the P2 NetBox inventory mirror (v51); a LATENCY optimisation only — the periodic full sweep is the correctness mechanism, so a lost/stale queue row self-heals on the next sweep (cf. vm_events/host_runtime_usage)",
+	"clock_skew":                   "per-node clock observations, GC'd locally",
+	"crl_versions":                 "per-host CRL version tracking (gossiped)",
+	"schema_state":                 "per-node schema version — must stay local for rolling upgrades (not CRDT-replicated)",
+	"leader_election":              "distributed lease — merging would corrupt leadership",
+	"vm_locks":                     "per-VM lease — full-state merge would risk split-brain",
+	"rebalance_proposals":          "transient, leader-gated proposals",
+	"vm_restarts":                  "per-node restart bookkeeping",
+	"container_restarts":           "per-node restart bookkeeping (container analogue of vm_restarts)",
+	"vm_events":                    "high-volume append-only event log; best-effort, not full-state-repaired",
+	"sessions":                     "ephemeral auth sessions",
+	"mutation_log":                 "the replication WAL itself — never full-state-synced",
+	"replication_watermarks":       "per-node replication progress",
+	"mutation_seen":                "per-node relay-dedup table",
+	"host_runtime_usage":           "per-host runtime telemetry (disk_iops/net_mbps); replicates via the WAL/mutation_log but is excluded from full-state anti-entropy — stale telemetry self-corrects on the next sample (cf. vm_events), so it needn't be repaired and shouldn't bloat the digest/dump",
+	"idempotency_keys":             "ephemeral request-dedup records (v39); LOCAL-only (owned by the entry node, never replicated), so no anti-entropy repair applies — see localOnly",
+	"host_fw_intent":               "per-host firewall infra decisions (v40, NAT/SNAT/isolation); LOCAL-only (nft rules are per-host state, never replicated) — see localOnly",
+	"local_term_bindings":          "per-executor (lease_key, lease_term) -> coordinator binding; LOCAL-only and deliberately in NO sync path. The fenced-claim guard used to derive this from runtime_action_proofs, which IS replicated and anti-entropy repaired — so any cluster member could plant rows naming a victim as executor_host across a span of terms and durably refuse that host's recovery. A binding a peer can author is not a binding. See TermFence and TestTermFence_IgnoresPeerAuthoredProofs",
+	"local_recovery_claims":        "v59 a voter's promises and accepts; LOCAL-only and in NO sync path. A grant is a statement about what THIS voter promised, so a replicated one would let a peer write promises on its behalf, LWW would coin-flip two of them and anti-entropy would regress a voter that was correctly ahead (docs/design/recovery-claims.md §3.8). Written only through ExecuteLocal",
+	"local_voter_incarnation":      "v59 the identity of this state.db's claim state; LOCAL-only by definition — it must disappear exactly when the claim state does (§3.11)",
+	"local_voter_adoption":         "v59 which voter generations THIS node has adopted and imported claim state for; a question about this node's own voting state (§4.4)",
+	"local_abandoned_proofs":       "v61 the proofs THIS destination signed it will never execute; LOCAL-only and in NO sync path — an abandonment is this node's own promise, and one a peer could erase or plant would let it either revive a superseded recovery or refuse a live one (docs/design/recovery-claims.md §3.12). Written only through ExecuteLocal",
+	"local_voter_seals":            "v62 the voter generations THIS node sealed as a survivor of a forced reconfiguration; a statement about this voter's own promises (§4.6). Written only through ExecuteLocal",
+	"local_incarnation_claims":     "v63 a voter's promises and accepts at incarnation-scoped workload keys; LOCAL-only and in NO sync path, for local_recovery_claims' reasons (docs/design/recovery-claims.md §3.8, §10 item 37). Written only through ExecuteLocal",
+	"session_factors":              "v64 the second factor a session's login presented; as ephemeral as sessions, replicated through the WAL in the session's own batch, never full-state-merged",
+	"session_groups":               "v66 the directory groups a session's external-realm login verified; as ephemeral as sessions, replicated through the WAL in the session's own batch, never full-state-merged",
+	"netbox_sync_queue":            "work queue for the P2 NetBox inventory mirror (v51); a LATENCY optimisation only — the periodic full sweep is the correctness mechanism, so a lost/stale queue row self-heals on the next sweep (cf. vm_events/host_runtime_usage)",
+	"local_automation_cuts":        "v69 immutable source-cut metadata owned by this database incarnation; generic AE cannot certify or publish a cut",
+	"local_automation_cut_records": "v69 immutable source-cut records; imported only by a future authenticated bounded transfer, never generic AE",
+	"local_automation_recovery":    "v68 this node's in-progress certified prefix recovery cursor; peer-authored state cannot advance it",
+	"local_automation_staging":     "v68 this node's uncommitted recovery evidence; generic AE cannot turn staging into adopted state",
+	"local_automation_authority":   "v68 local automation authority and incarnation binding; replication cannot grant a node authority",
+	"local_automation_prefix":      "v68 this node's durably applied automation prefix; local FULL transaction owns advancement",
+	"local_automation_anchors":     "v68 locally verified certified automation anchors; generic AE cannot establish local adoption",
+	"local_automation_history":     "v68 local applied automation decision history and receipts; only the certified apply path may write it",
+	"local_automation_requests":    "v68 local durable automation request/receipt identity; generic AE cannot mint or overwrite admission facts",
 	// (user_2fa, recovery_codes, recovery_code_sets are now in sensitiveTableNames
 	//  — schema v32 made them LWW-repairable: soft-delete + active-set pointer.)
 }
@@ -53,6 +62,16 @@ var antiEntropyExcluded = map[string]string{
 // DB access, not the replicating Execute path). The updated_at→primary-key
 // invariant below doesn't apply to them.
 var localOnly = map[string]bool{
+	"local_automation_cuts":        true, // local transaction only; see exclusion reason above
+	"local_automation_cut_records": true, // local transaction only; see exclusion reason above
+	"local_automation_recovery":    true, // local transaction only; see exclusion reason above
+	"local_automation_staging":     true, // local transaction only; see exclusion reason above
+	"local_automation_authority":   true, // local transaction only; see exclusion reason above
+	"local_automation_prefix":      true, // local transaction only; see exclusion reason above
+	"local_automation_anchors":     true, // local transaction only; see exclusion reason above
+	"local_automation_history":     true, // local transaction only; see exclusion reason above
+	"local_automation_requests":    true, // local transaction only; see exclusion reason above
+
 	"schema_state":             true, // per-node schema version, set during InitSchema/migrate
 	"idempotency_keys":         true, // v39: entry-node-owned request dedup; execLocal writes, never replicated
 	"host_fw_intent":           true, // v40: per-host firewall infra intent; execLocal writes, never replicated

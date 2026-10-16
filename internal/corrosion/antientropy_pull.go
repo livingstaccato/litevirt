@@ -74,7 +74,7 @@ func (ae *AntiEntropy) pullAndMerge(ctx context.Context, client pb.LiteVirtClien
 				}
 				return p, rerr
 			}
-			kept, rows, perr, merr := ae.client.mergeTableRowsStreamScoped(recv, allowed, keep, rs)
+			kept, rows, perr, merr := ae.client.mergeTableRowsStreamScopedContext(ctx, recv, allowed, keep, rs)
 			if !older {
 				ae.client.observePulledRows(rows, tables, scope, sensitive)
 				return kept, perr, merr
@@ -95,7 +95,7 @@ func (ae *AntiEntropy) pullAndMerge(ctx context.Context, client pb.LiteVirtClien
 	if err != nil {
 		return nil, err, nil
 	}
-	payload, merr := ae.client.mergeRepairPullScoped(data, tables, scope, sensitive, rs)
+	payload, merr := ae.client.mergeRepairPullScopedContext(ctx, data, tables, scope, sensitive, rs)
 	return payload, nil, merr
 }
 

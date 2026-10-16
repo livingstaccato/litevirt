@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -84,18 +85,25 @@ const claimIdentityRetry = 10 * time.Second
 // is retried after claimIdentityRetry, so a host whose key was repaired starts
 // voting without a restart.
 func (s *Server) claimIdentity() (*corrosion.ClaimSigner, *corrosion.ClaimVerifier, error) {
+	pair, pairErr := pki.ServedHostKeyPair(s.pkiDir)
 	c := &s.claims
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.signer != nil && c.verifier != nil {
-		s.followRenewedIdentityLocked(c)
+		if pairErr == nil {
+			s.followRenewedIdentityLocked(c, pair)
+		}
 		return c.signer, s.verifierPolicy(c.verifier), nil
 	}
 	if c.loadErr != nil && time.Since(c.loadedAt) < claimIdentityRetry {
 		return nil, nil, c.loadErr
 	}
 	c.loadedAt = time.Now()
-	signer, err := corrosion.LoadClaimSigner(s.pkiDir, s.hostName)
+	if pairErr != nil {
+		c.loadErr = fmt.Errorf("load served claim signing key: %w", pairErr)
+		return nil, nil, c.loadErr
+	}
+	signer, err := corrosion.ClaimSignerFromKeyPair(s.hostName, pair)
 	if err != nil {
 		c.loadErr = fmt.Errorf("load claim signing key: %w", err)
 		return nil, nil, c.loadErr
@@ -114,10 +122,7 @@ func (s *Server) claimIdentity() (*corrosion.ClaimSigner, *corrosion.ClaimVerifi
 // trust's is, because a fleet whose recorded serials went stale would
 // otherwise refuse every claim certificate too.
 func (s *Server) verifierPolicy(v *corrosion.ClaimVerifier) *corrosion.ClaimVerifier {
-	if s.trustRotatedPeerCerts.Load() {
-		return v.WithoutSerialPin()
-	}
-	return v
+	return v.WithHostTrustPolicy(&s.trustRotatedPeerCerts)
 }
 
 // followRenewedIdentityLocked moves the cached signer onto the host identity
@@ -131,9 +136,8 @@ func (s *Server) verifierPolicy(v *corrosion.ClaimVerifier) *corrosion.ClaimVeri
 // cannot be turned into a signer keeps the current one: it is still valid until
 // the old certificate is revoked, and the TLS source refuses a pair that is not
 // this host's anyway.
-func (s *Server) followRenewedIdentityLocked(c *claimRuntime) {
-	pair, err := pki.ServedHostKeyPair(s.pkiDir)
-	if err != nil || pair.Leaf == nil || strings.EqualFold(pair.Leaf.SerialNumber.Text(16), c.signer.Serial()) {
+func (s *Server) followRenewedIdentityLocked(c *claimRuntime, pair *tls.Certificate) {
+	if pair == nil || pair.Leaf == nil || strings.EqualFold(pair.Leaf.SerialNumber.Text(16), c.signer.Serial()) {
 		return
 	}
 	renewed, err := corrosion.ClaimSignerFromKeyPair(s.hostName, pair)

@@ -165,6 +165,16 @@ type Daemon struct {
 
 // New creates a new daemon instance.
 func New(cfg *Config) (*Daemon, error) {
+	return NewContext(context.Background(), cfg)
+}
+
+// NewContext registers process-lifetime admission before any PKI read or
+// consumer. Neither construction errors nor bounded Run cleanup prove that
+// every consumer stopped; only process exit/exec releases this registration.
+func NewContext(ctx context.Context, cfg *Config) (*Daemon, error) {
+	if err := pki.RegisterDaemonHostDomain(ctx, cfg.PKIDir); err != nil {
+		return nil, fmt.Errorf("host domain admission: %w", err)
+	}
 	// Create HLC clock for this node
 	clock := hlc.NewClock(cfg.HostName)
 
@@ -297,6 +307,10 @@ func boundedTelemetryShutdown(shutdown func(context.Context) error, timeout time
 }
 
 func (d *Daemon) Run(ctx context.Context) error {
+	// Also cover package-local/test construction that bypasses NewContext.
+	if err := pki.RegisterDaemonHostDomain(ctx, d.cfg.PKIDir); err != nil {
+		return fmt.Errorf("host domain admission: %w", err)
+	}
 	if err := d.checkMigrationNetwork(); err != nil {
 		return err
 	}

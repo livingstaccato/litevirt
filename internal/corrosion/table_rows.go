@@ -277,6 +277,7 @@ func decodePageRows(p *pb.TableRowsPage) ([][]interface{}, error) {
 
 // pagedMerge is the receiving side of one paged pull.
 type pagedMerge struct {
+	context context.Context
 	c       *Client
 	allowed map[string]bool
 	// keep names the tables whose rows are retained whole for the caller
@@ -315,6 +316,7 @@ func appendRows(p *syncPayload, table string, cols []string, rows [][]interface{
 
 func (m *pagedMerge) mergeOne(st syncTable) {
 	st.remints = m.remints
+	st.mergeContext = m.context
 	mg, sk, err := m.c.mergeTable(st, m.allowed)
 	m.merged += mg
 	m.skipped += sk
@@ -389,9 +391,13 @@ func (c *Client) mergeTableRowsStream(recv func() (*pb.TableRowsPage, error), al
 // mergeTableRowsStreamScoped is mergeTableRowsStream inside one anti-entropy
 // exchange, whose re-mint judgements rs carries (nil: none).
 func (c *Client) mergeTableRowsStreamScoped(recv func() (*pb.TableRowsPage, error), allowed, keep map[string]bool, rs *remintScope) (kept *syncPayload, rows map[string]int, pullErr, mergeErr error) {
+	return c.mergeTableRowsStreamScopedContext(context.Background(), recv, allowed, keep, rs)
+}
+func (c *Client) mergeTableRowsStreamScopedContext(ctx context.Context, recv func() (*pb.TableRowsPage, error), allowed, keep map[string]bool, rs *remintScope) (kept *syncPayload, rows map[string]int, pullErr, mergeErr error) {
 	start := time.Now()
 	m := newPagedMerge(c, allowed, keep)
 	m.remints = rs
+	m.context = ctx
 	for {
 		p, err := recv()
 		if err == io.EOF {

@@ -266,20 +266,32 @@ func (r *Replicator) applySpecGeneration(ctx context.Context, tx *sql.Tx, s Stat
 	if r.client.skewQuarantinesIncoming(r.client.hlcSkewGuardOn(), local.updatedAt, in.updatedAt, time.Now()) {
 		return nil
 	}
-	var res sql.Result
-	if in.opID != "" {
-		res, err = tx.ExecContext(ctx, specSiblingTakeClaimSQL, in.spec, in.opID, in.updatedAt, in.name, local.epoch, local.gen)
-	} else {
-		res, err = tx.ExecContext(ctx, specSiblingTakeEditSQL, in.spec, in.updatedAt, in.name, local.epoch, local.gen)
-	}
+	changed, err := takeSiblingSpecEdit(ctx, tx, in, local)
 	if err != nil {
 		return err
 	}
-	if rowsChanged(res) && d.reason != "" {
+	if changed && d.reason != "" {
 		r.client.noteSpecEditDropped(tx, specEditDrop{
 			vm: in.name, host: local.host, epoch: local.epoch, gen: local.gen, reason: d.reason, path: pathWAL,
 			keptAt: in.updatedAt, droppedAt: local.updatedAt, droppedSpec: local.spec,
 		})
 	}
 	return nil
+}
+
+// takeSiblingSpecEdit applies a received edit over the local sibling at its
+// generation, carrying the edit's own updated_at as every WAL apply does, so
+// the row is the one its origin holds. It reports whether the row changed.
+func takeSiblingSpecEdit(ctx context.Context, tx *sql.Tx, in specEdit, local specRow) (bool, error) {
+	var res sql.Result
+	var err error
+	if in.opID != "" {
+		res, err = tx.ExecContext(ctx, specSiblingTakeClaimSQL, in.spec, in.opID, in.updatedAt, in.name, local.epoch, local.gen)
+	} else {
+		res, err = tx.ExecContext(ctx, specSiblingTakeEditSQL, in.spec, in.updatedAt, in.name, local.epoch, local.gen)
+	}
+	if err != nil {
+		return false, err
+	}
+	return rowsChanged(res), nil
 }

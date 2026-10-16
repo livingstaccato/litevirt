@@ -43,6 +43,9 @@ var sanctionedSpecWriters = map[string]string{
 		"because the row being written is not the row being read",
 	"validateGuardedVMReplaceEntry": "fingerprints the exact guarded-replace batch envelope; " +
 		"it does not execute a write",
+	"takeSiblingSpecEdit": "the WAL apply of a received spec edit over a sibling at its generation " +
+		"(spec_conflict_apply.go): it replays an edit MutateDesiredSpec or BeginVMOperation made on " +
+		"its origin, under that edit's own generation and barrier guards",
 }
 
 // TestSpecWritersAreSanctioned fails if any function in the corrosion package

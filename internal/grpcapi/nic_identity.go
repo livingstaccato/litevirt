@@ -448,7 +448,12 @@ func (s *Server) syncDHCPReservations(ctx context.Context) error {
 	}
 	defs := map[string]*compose.NetworkDef{}
 	for _, nr := range nets {
-		def, _ := lookupNetworkDef(ctx, s.db, nr.Name)
+		// A network that cannot be read would count as no network: its VMs
+		// as not routed, its tags dropped. The pass writes nothing instead.
+		def, err := lookupNetworkDef(ctx, s.db, nr.Name)
+		if err != nil {
+			return err
+		}
 		defs[nr.Name] = def
 	}
 	noRouter, err := s.noRouterMACs(ctx, defs)
@@ -665,7 +670,13 @@ func (s *Server) anyNoRouterNetwork(recs []corrosion.InterfaceRecord) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	for _, r := range recs {
-		if def, _ := lookupNetworkDef(ctx, s.db, r.NetworkName); def != nil && network.NoRouterNetwork(*def) {
+		def, err := lookupNetworkDef(ctx, s.db, r.NetworkName)
+		if err != nil {
+			// Unknown: register, so a tag the NIC needs is not skipped.
+			slog.Warn("DHCP hosts files: network unreadable; registering the NICs", "network", r.NetworkName, "error", err)
+			return true
+		}
+		if def != nil && network.NoRouterNetwork(*def) {
 			return true
 		}
 	}
@@ -673,27 +684,35 @@ func (s *Server) anyNoRouterNetwork(recs []corrosion.InterfaceRecord) bool {
 }
 
 // resyncDHCPHosts runs SyncDHCPReservations now: a VM's NICs changed. A pass
-// that cannot read what it needs is retried, and one that still fails is
-// logged — a tag it would have written is then missing until the periodic
-// pass, and a guest that asks for a lease before it takes the router.
+// that cannot read what it needs is retried in the background, off the
+// request's path, and one that still fails is logged — a tag it would have
+// written is then missing until the periodic pass, and a guest that asks for
+// a lease before it takes the router.
 func (s *Server) resyncDHCPHosts() {
 	if s.db == nil {
 		return
 	}
-	var err error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err = s.syncDHCPReservations(ctx)
-		cancel()
-		if err == nil {
-			return
-		}
-		slog.Warn("DHCP hosts files: rewrite after a NIC change failed; retrying", "attempt", attempt+1, "error", err)
+	err := s.syncDHCPReservationsOnce()
+	if err == nil {
+		return
 	}
-	slog.Error("DHCP hosts files: rewrite after a NIC change failed; the periodic pass retries every 30s, and a NIC on an isolated network may be offered the router until then", "error", err)
+	slog.Warn("DHCP hosts files: rewrite after a NIC change failed; retrying in the background", "error", err)
+	go func() {
+		for attempt := 1; attempt < 3; attempt++ {
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+			if err = s.syncDHCPReservationsOnce(); err == nil {
+				return
+			}
+			slog.Warn("DHCP hosts files: rewrite after a NIC change failed; retrying", "attempt", attempt+1, "error", err)
+		}
+		slog.Error("DHCP hosts files: rewrite after a NIC change failed; the periodic pass retries every 30s, and a NIC on an isolated network may be offered the router until then", "error", err)
+	}()
+}
+
+func (s *Server) syncDHCPReservationsOnce() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return s.syncDHCPReservations(ctx)
 }
 
 // StartDHCPReservations runs SyncDHCPReservations every interval.

@@ -487,6 +487,9 @@ func (s *Server) clearDeletedFirewallTags(ctx context.Context, kind, host, name,
 // clearFirewallTagsHook is ClearFirewallTags, replaced by a test to make the
 // clear fail.
 func (s *Server) clearFirewallTagsHook(ctx context.Context, g capabilities.FeatureGrant, kind, fwID string) error {
+	if fn := s.testClearFirewallTagsLive.Load(); fn != nil {
+		return (*fn)(ctx, kind, fwID)
+	}
 	if s.testClearFirewallTags != nil {
 		return s.testClearFirewallTags(ctx, kind, fwID)
 	}

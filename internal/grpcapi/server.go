@@ -485,6 +485,9 @@ type Server struct {
 	// delete's, or a tag set's of a copied identity) calls it instead of
 	// corrosion.ClearFirewallTags.
 	testClearFirewallTags func(ctx context.Context, kind, fwID string) error
+	// testClearFirewallTagsLive is the same seam for a hook set on a running
+	// server (SetClearFirewallTagsForTest), read by concurrent deletes.
+	testClearFirewallTagsLive atomic.Pointer[func(ctx context.Context, kind, fwID string) error]
 	// fwTagLocks serializes tag sets of one workload on its owner, so two
 	// concurrent read-merge-writes of its tags row do not lose one
 	// (lockFirewallTags).

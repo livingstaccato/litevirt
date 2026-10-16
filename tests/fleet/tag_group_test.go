@@ -560,6 +560,9 @@ func tgHoldFailoverLease(t *testing.T, n *Node) {
 //
 // Mutation: sweep without the grace — the moving container's row is cleared:
 // red.
+// Mutation of the +48h block alone (seen): FirewallTagsOrphans ignores a live
+// holder (`case false && h != nil && h.live`) — red at the +48h assertion, the
+// +1h one still green.
 func TestTagGroup_TheOrphanSweepSparesAContainerMidMove(t *testing.T) {
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
 	c.WaitConverged(t, convergeTimeout)
@@ -629,6 +632,8 @@ func gatedLatch(t *testing.T, c *Cluster) {
 //
 // Mutation: an insert keeps an incoming identity (the archived create spec
 // carries the deleted one's) — the restored container is a member: red.
+// Also red (seen): an operator restore that seeds its FirewallCarry from the
+// same-name tombstone's create spec (the identity comes back, line 685).
 func TestTagGroup_AReplicaRestoreIntoAFreedNameIsNotAMember(t *testing.T) {
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
 	a, tg := c.Nodes[0], c.Nodes[2]
@@ -702,6 +707,8 @@ func TestTagGroup_AReplicaRestoreIntoAFreedNameIsNotAMember(t *testing.T) {
 //
 // Mutation: an insert keeps an incoming identity — the restored VM is a
 // member: red.
+// Also red (seen): RestoreLive's vmRecord takes its FirewallCarry from the
+// same-name tombstone's spec (the identity comes back).
 func TestTagGroup_AVMRestoredIntoAFreedNameIsNotAMember(t *testing.T) {
 	c := tgFleet(t)
 	a := c.Nodes[0]

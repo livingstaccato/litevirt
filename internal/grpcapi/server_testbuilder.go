@@ -239,7 +239,11 @@ func (s *Server) AutoPullFromPeerForTest(ctx context.Context, name, source strin
 // makes (a delete's, a copied identity's) with fn, so a fleet scenario can
 // make the clear fail; nil restores ClearFirewallTags.
 func (s *Server) SetClearFirewallTagsForTest(fn func(ctx context.Context, kind, fwID string) error) {
-	s.testClearFirewallTags = fn
+	if fn == nil {
+		s.testClearFirewallTagsLive.Store(nil)
+		return
+	}
+	s.testClearFirewallTagsLive.Store(&fn)
 }
 
 // SweepReleaseUsesForTest runs one release use sweep pass on this server, as

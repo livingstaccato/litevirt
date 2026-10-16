@@ -197,3 +197,43 @@ func SeedVendorData(spec *pb.VMSpec, networkConfig string) string {
 	}
 	return NetworkUpdatesVendorData
 }
+
+// NetworkUpdatesOffVendorData is the vendor-data of a seed litevirt writes
+// with no network-config of its own making (NetworkConfigDisabled): it turns
+// cloud-init's per-boot network update events back off, so a guest that
+// recorded NetworkUpdatesVendorData on an earlier boot stops re-rendering its
+// network. cloud-init applies a seed's vendor-data from the boot after the
+// one that records it; NetworkConfigDisabled covers the boot between.
+const NetworkUpdatesOffVendorData = "#cloud-config\nupdates:\n  network:\n    when: [boot-new-instance]\n"
+
+// NetworkConfigDisabled is the network-config litevirt writes where it cannot
+// tell the VM's NICs and keeps no seed of the VM's (cloudinit.ErrNICsAmbiguous
+// on a host without one). cloud-init reads a datasource network config of
+// `config: disabled` as "render nothing" (net.is_disabled_cfg) on every boot,
+// whatever update events are enabled, so the guest keeps the network it has
+// rendered — where a seed with no network-config would have it render its
+// fallback, DHCP on one NIC.
+const NetworkConfigDisabled = "network:\n  config: disabled\n"
+
+// OwnSeed reads the seed at iso and reports whether it is the seed of the VM
+// named vmName whose spec uuid is uuid: stamped for uuid (StampSeed), or —
+// written before seeds were stamped — unstamped with an instance-id the VM's
+// create wrote: its name, or <name>-next, the name a replacement is created
+// under before a cutover gives it the name (vm_replace). A seed stamped for
+// another VM, or unstamped with any other instance-id, is not proven the
+// VM's. The error is fs.ErrNotExist for no seed, or the read's.
+func OwnSeed(iso, vmName, uuid string) (Seed, bool, error) {
+	owner, stamped, err := SeedOwner(iso)
+	if err != nil {
+		return Seed{}, false, err
+	}
+	seed, err := ReadSeed(iso)
+	if err != nil {
+		return Seed{}, false, err
+	}
+	if stamped {
+		return seed, uuid != "" && owner == uuid, nil
+	}
+	id := seed.InstanceID()
+	return seed, id != "" && (id == vmName || id == vmName+"-next"), nil
+}

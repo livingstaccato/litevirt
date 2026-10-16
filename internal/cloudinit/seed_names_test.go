@@ -155,3 +155,26 @@ func TestGuestNetworkConfig_AnUnnamedNICTakesV2(t *testing.T) {
 		t.Errorf("an unnamed static NIC:\n%s", doc)
 	}
 }
+
+// Re-review m-N4: an attached NIC's name never takes the kernel name of a NIC
+// the seed leaves unnamed. A guest booted with net.ifnames=0 numbers every NIC
+// eth0..eth(N-1); so eth0..eth(N-1), N the NICs that were there before the
+// attach, are held, whatever the prior seed named.
+//
+// Mutation: hold only eth0..eth(u-1), u the unnamed NICs — Z takes eth1, the
+// kernel name of the unnamed Y.
+func TestSeedNetworkConfig_AttachedNameSkipsUnnamedKernelNames(t *testing.T) {
+	db, spec := hotplugSeedDB(t) // A(stnet) ord0, B(dnet) ord1
+	ctx := context.Background()
+	// The prior seed names A eth0 and does not list B (an earlier build's
+	// attach): B stays unnamed.
+	prior := "version: 2\nethernets:\n  eth0:\n    match:\n      macaddress: \"52:54:00:00:0a:0a\"\n    set-name: eth0\n    dhcp4: true\n"
+	hotAttachRows(t, db, true, "isonet", "52:54:00:00:0c:0c", 2)
+	got, err := SeedNetworkConfig(ctx, db, "hp", spec, PriorFrom(prior, "52:54:00:00:0c:0c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, namedEntry("eth2", "52:54:00:00:0c:0c")) {
+		t.Errorf("want Z eth2 (eth1 is the unnamed B's kernel name):\n%s", got)
+	}
+}

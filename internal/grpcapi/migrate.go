@@ -1189,7 +1189,16 @@ func (s *Server) sendReattachVFs(ctx context.Context, client pb.LiteVirtClient, 
 // target has the ISO ready. A seed here of another VM of the name — one
 // deleted while this host kept its seed — is written again
 // (cloudinit/seed_owner.go).
+//
+// It writes a seed — user-data and vendor-data the guest runs as root — and
+// stamps it as the VM's, so it is the target half of a migration a source
+// daemon drives, as EnsureFirmwareState is: a peer call (every source calls it
+// through its peer client), and vm.migrate on the VM for the identity the peer
+// forwards.
 func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitRequest) (*emptypb.Empty, error) {
+	if err := s.requirePeerCert(ctx); err != nil {
+		return nil, err
+	}
 	vm, err := s.authorizeMigrationHelper(ctx, req.VmName)
 	if err != nil {
 		return nil, err
@@ -2516,12 +2525,10 @@ func (s *Server) ensureCloudInitRequest(ctx context.Context, vm *corrosion.VMRec
 		req.Userdata = spec.CloudInit.Userdata
 	}
 	// The seed the VM runs on here: its NICs' guest names, and what is sent
-	// when the network-config cannot be derived. One stamped for another VM
-	// is not this VM's.
+	// when the network-config cannot be derived. Whose it is is the hotplug
+	// rebuild's rule (cloudinit.OwnSeed).
 	iso := lv.CloudInitISOPath(s.dataDir, vm.Name)
-	own, ownErr := cloudinit.ReadSeed(iso)
-	_, stamped, _ := cloudinit.SeedOwner(iso)
-	ours := ownErr == nil && (cloudinit.SeedIsFor(iso, cloudinit.SpecUUID(vm.Spec)) || !stamped)
+	own, ours, _ := cloudinit.OwnSeed(iso, vm.Name, cloudinit.SpecUUID(vm.Spec))
 	var prior *cloudinit.Prior
 	if ours {
 		prior = cloudinit.PriorFrom(own.NetworkConfig)
@@ -2530,16 +2537,19 @@ func (s *Server) ensureCloudInitRequest(ctx context.Context, vm *corrosion.VMRec
 	switch {
 	case errors.Is(err, cloudinit.ErrNICsAmbiguous):
 		// Which NIC is which cannot be told: the target gets this host's seed's
-		// network-config and vendor-data as they are, never a seed without
-		// network-config that cloud-init's update events would re-render.
-		var vd string
+		// network-config and vendor-data as they are, or — with no seed of the
+		// VM's here — a seed that has cloud-init leave the guest's network as
+		// it is; never a seed without network-config that update events the
+		// guest recorded would re-render as cloud-init's fallback.
+		var vd, detail string
 		if ours {
 			nc, vd = own.NetworkConfig, own.VendorData
+			detail = fmt.Sprintf("the migration target's seed takes this host's network-config as it is: %v (the spec of a VM created before it recorded NIC MACs)", err)
 		} else {
-			nc = ""
+			nc, vd = cloudinit.NetworkConfigDisabled, cloudinit.NetworkUpdatesOffVendorData
+			detail = fmt.Sprintf("the migration target's seed has cloud-init leave the guest's network as it is, as this host holds no seed of the VM's: %v (the spec of a VM created before it recorded NIC MACs); configure the VM's NICs in the guest", err)
 		}
-		s.recordVMEventSeverity(ctx, vm.Name, "seed.not_rebuilt", "ok", "warning", fmt.Sprintf(
-			"the migration target's seed takes this host's network-config as it is: %v (the spec of a VM created before it recorded NIC MACs)", err))
+		s.recordVMEventSeverity(ctx, vm.Name, "seed.not_rebuilt", "ok", "warning", detail)
 		req.Networkconfig, req.Vendordata = nc, &vd
 		return req
 	case err != nil:

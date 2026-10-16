@@ -123,12 +123,13 @@ func TestSeeds_CarryTheNetworkUpdatesVendorData(t *testing.T) {
 	}
 
 	// A migration target's rebuild, for a VM whose seed it does not hold.
+	peer := diskPeerCtx(t, s)
 	for vm, override := range map[string]string{"mig": "", "migown": "version: 1\nconfig: []\n"} {
 		spec, _ := json.Marshal(&pb.VMSpec{Name: vm, CloudInit: &pb.CloudInitSpec{Networkconfig: override}})
 		if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: vm, HostName: "other-host", State: "running", Spec: string(spec)}, nil, nil); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.EnsureCloudInit(ctx, &pb.EnsureCloudInitRequest{VmName: vm, Networkconfig: "version: 2\n"}); err != nil {
+		if _, err := s.EnsureCloudInit(peer, &pb.EnsureCloudInitRequest{VmName: vm, Networkconfig: "version: 2\n"}); err != nil {
 			t.Fatalf("EnsureCloudInit %s: %v", vm, err)
 		}
 		want := cloudinit.NetworkUpdatesVendorData

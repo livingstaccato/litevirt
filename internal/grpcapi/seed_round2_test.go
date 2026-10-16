@@ -218,15 +218,13 @@ func TestNICHotplug_FirstAttachToAOneNICVMRenamesNothing(t *testing.T) {
 	}
 }
 
-// Review I-2: a seed at the VM's path that is not stamped for this VM — a
-// deleted VM of the same name left it — is never rewritten from. A VM with no
-// cloud-init has it left alone (no reload, no false seed.reload_failed) and
-// an event naming it; a cloud-image VM gets its seed written again from its
-// own spec, as a start writes it, and stamped.
+// Review I-2: a seed at the VM's path that is stamped for another VM — a
+// deleted VM of the same name left it — is never rewritten from, nor
+// rewritten: it is left alone (no reload, no false seed.reload_failed) with an
+// event naming it, for a VM with or without cloud-init.
 //
-// Mutation: drop the SeedIsFor check — the leftover is rewritten with its
-// user-data kept, and the plain VM gets a reload attempt and a
-// seed.reload_failed event.
+// Mutation: take every seed at the path as the VM's — the leftover is
+// rewritten with its user-data kept, and reloaded.
 func TestNICHotplug_ALeftoverSeedIsNotRebuiltFrom(t *testing.T) {
 	needGenisoimage(t)
 	leftover := cloudinit.Config{InstanceID: "x", LocalHostname: "x", UserData: "#cloud-config\npassword: theirs\n",
@@ -256,6 +254,9 @@ func TestNICHotplug_ALeftoverSeedIsNotRebuiltFrom(t *testing.T) {
 	})
 
 	t.Run("cloud image", func(t *testing.T) {
+		// Re-review N2: a seed that is not this VM's is left untouched for a VM
+		// with cloud-init too — never written again live (that would give the
+		// running guest a new instance-id); the next start writes it.
 		s := hotplugDiskServer(t)
 		enableHardwareV2(t, s)
 		spec := &pb.VMSpec{Name: "x", Uuid: "uuid-new", Image: "ubuntu", Cpu: 2, MemoryMib: 4096,
@@ -264,18 +265,18 @@ func TestNICHotplug_ALeftoverSeedIsNotRebuiltFrom(t *testing.T) {
 		iso := r2VM(t, s, spec, []corrosion.InterfaceRecord{
 			{VMName: "x", NetworkName: "lan", MAC: "52:54:00:6c:00:01"},
 			{VMName: "x", NetworkName: "lan3", Ordinal: 1, MAC: "52:54:00:6c:00:03"}}, "running", leftover, "uuid-old")
+		before, _ := os.ReadFile(iso)
 		if _, err := s.AttachDevice(adminCtx(), &pb.AttachDeviceRequest{VmName: "x", Nic: &pb.NetworkAttachment{Name: "lan2", Mac: "52:54:00:6c:00:02"}}); err != nil {
 			t.Fatalf("attach: %v", err)
 		}
-		sd := mustReadSeed(t, iso)
-		if strings.Contains(sd.UserData, "theirs") || !strings.Contains(sd.UserData, "mine") || sd.InstanceID() != "x" {
-			t.Errorf("the seed was not written again from this VM's spec: %q %q", sd.MetaData, sd.UserData)
+		if after, _ := os.ReadFile(iso); !bytes.Equal(before, after) {
+			t.Error("a seed stamped for another VM was rewritten")
 		}
-		if !strings.Contains(sd.NetworkConfig, "52:54:00:6c:00:02") {
-			t.Errorf("the written seed lacks the attached NIC:\n%s", sd.NetworkConfig)
+		if n := cdromReloads(s, "x"); n != 0 {
+			t.Errorf("reloaded %d times", n)
 		}
-		if !cloudinit.SeedIsFor(iso, "uuid-new") {
-			t.Error("the written seed is not stamped for this VM")
+		if evs := vmEventsOf(t, s, "x", "seed.not_rebuilt"); len(evs) != 1 || !strings.Contains(evs[0].Detail, iso) {
+			t.Errorf("want one seed.not_rebuilt event naming %s: %+v", iso, evs)
 		}
 	})
 }
@@ -352,7 +353,7 @@ func TestEnsureCloudInit_AmbiguousSourceSendsItsSeed(t *testing.T) {
 	// The target writes the vendor-data it is sent, not one of its own.
 	tgt := hotplugDiskServer(t)
 	insertTestVMWithSpec(t, adminCtx(), tgt.db, "lg", "test-host", "running", seedSpecJSON(t, &pb.VMSpec{Name: "lg", Uuid: "uuid-lg"}))
-	if _, err := tgt.EnsureCloudInit(adminCtx(), req); err != nil {
+	if _, err := tgt.EnsureCloudInit(diskPeerCtx(t, tgt), req); err != nil {
 		t.Fatalf("EnsureCloudInit: %v", err)
 	}
 	sd := mustReadSeed(t, lv.CloudInitISOPath(tgt.dataDir, "lg"))

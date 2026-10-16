@@ -235,15 +235,16 @@ func PriorFrom(networkConfig string, added ...string) *Prior {
 // the prior seed names keeps its name; one it matched by MAC alone, or did
 // not list and was not attached since, stays unnamed — matched by MAC, under
 // whatever name the guest gave it. A NIC attached since takes the lowest
-// eth<n> no other NIC holds, counting each unnamed NIC as holding one, so a
-// guest that names its NICs eth<n> itself (net.ifnames=0) has no clash. With
-// no prior (nil) the NICs are named by position, as create names them.
+// eth<n> no other NIC holds and above eth<N-1>, N the NICs that were there, so
+// a guest that names its NICs eth<n> itself (net.ifnames=0) has no clash with
+// an unnamed one. A name a detached NIC held is free again. With no prior
+// (nil) the NICs are named by position, as create names them.
 func (p *Prior) name(nics []NIC) {
 	if p == nil {
 		return
 	}
 	used := map[string]bool{}
-	unnamed := 0
+	kept := 0
 	var added []int
 	for k := range nics {
 		mac := strings.ToLower(nics[k].MAC)
@@ -252,14 +253,17 @@ func (p *Prior) name(nics []NIC) {
 		case listed && name != "":
 			nics[k].Name = name
 			used[name] = true
+			kept++
 		case !listed && p.Added[mac]:
 			added = append(added, k)
 		default:
 			nics[k].Unnamed = true
-			unnamed++
+			kept++
 		}
 	}
-	for i := 0; i < unnamed; i++ {
+	// A guest that numbers its NICs itself (net.ifnames=0) calls the NICs
+	// that were there eth0..eth(kept-1): an unnamed one holds one of those.
+	for i := 0; i < kept; i++ {
 		used[fmt.Sprintf("eth%d", i)] = true
 	}
 	for _, k := range added {

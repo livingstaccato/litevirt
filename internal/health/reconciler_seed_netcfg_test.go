@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -193,59 +194,60 @@ if [ -f "$src/vendor-data" ]; then cat "$src/vendor-data" > "$out"; else printf 
 	}
 }
 
-// Review C-1 (failover): a VM whose NICs cannot be told from its spec (a
-// MAC-less spec entry, and a different NIC at its position) gets a seed with
-// no network-config and no vendor-data — nothing that would re-render
-// cloud-init's fallback at every boot — and an event saying why. The start is
-// not retried for it.
+// Re-review N1, the lab-shaped sequence: a legacy VM (MAC-less spec) got a
+// clean rebuild with the network update vendor-data on its old host, and its
+// guest recorded it; `lv config --ip` then made X's entry undecidable; the host
+// fails. The failover host has no seed of the VM's, so it cannot keep one: it
+// writes a network-config cloud-init reads as disabled — it renders nothing,
+// on this boot too, whatever update events the guest recorded — and the
+// vendor-data that turns the per-boot re-render off. A seed with no
+// network-config would have the guest render cloud-init's fallback (DHCP on
+// one NIC) at its next boot and lose X's static address. The start is not
+// retried for it, and an event says why.
 //
-// Mutation: treat the ambiguous result as a read failure — the start is
-// retried and no seed is written; add the vendor-data anyway — red.
-func TestDomainXMLFor_AmbiguousNICsWriteNoNetworkConfig(t *testing.T) {
-	dir := t.TempDir()
-	script := `#!/bin/sh
-out=""; src=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -output) out="$2"; shift ;;
-    -volid) shift ;;
-    -*) ;;
-    *) src="$1" ;;
-  esac
-  shift
-done
-{ if [ -f "$src/network-config" ]; then echo "nc"; fi; if [ -f "$src/vendor-data" ]; then echo "vd"; fi; echo end; } > "$out"
-`
-	if err := os.WriteFile(filepath.Join(dir, "genisoimage"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
+// Where the failover host does hold the VM's own seed (one it wrote before,
+// unstamped, of the VM's instance-id), that seed's network-config and
+// vendor-data are kept.
+//
+// Mutation: write no network-config (the round-2 behaviour) — the first case
+// goes red; write no vendor-data — red; ignore the VM's own seed — the second
+// case goes red.
+func TestDomainXMLFor_AmbiguousNICsDisableNetworkRendering(t *testing.T) {
+	if _, err := exec.LookPath("genisoimage"); err != nil {
+		t.Skip("genisoimage not installed")
 	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	db := testReconcilerDB(t)
 	ctx := context.Background()
 	r, _, _ := sharedDiskReconciler(t, db)
 	r.SetNetworkProvision(func(context.Context, *corrosion.Client, string, compose.NetworkDef, string, string) (string, error) {
 		return "", nil
 	})
-	spec := &pb.VMSpec{Name: "vm1", Cpu: 1, MemoryMib: 512, Image: "ubuntu",
-		Network: []*pb.NetworkAttachment{{Name: "n0", Ip: "10.0.0.10"}, {Name: "n1", Ip: "10.1.0.50"}}}
-	specJSON, _ := json.Marshal(spec)
-	vm := corrosion.VMRecord{Name: "vm1", HostName: "node-a", Spec: string(specJSON), State: "running", CPUActual: 1, MemActual: 512}
-	if err := corrosion.InsertVM(ctx, db, vm, []corrosion.InterfaceRecord{
-		{VMName: "vm1", NetworkName: "n0", MAC: "52:54:00:aa:00:01", IP: "10.0.0.77"}, // not the spec's .10
-		{VMName: "vm1", NetworkName: "n1", Ordinal: 1, MAC: "52:54:00:aa:00:02", IP: "10.1.0.50"},
-	}, nil); err != nil {
-		t.Fatal(err)
+	const macX, macY = "52:54:00:aa:00:01", "52:54:00:aa:00:02"
+	insert := func(vm string) (corrosion.VMRecord, *pb.VMSpec) {
+		spec := &pb.VMSpec{Name: vm, Cpu: 1, MemoryMib: 512, Image: "ubuntu",
+			Network: []*pb.NetworkAttachment{{Name: "n0", Ip: "10.0.0.10"}, {Name: "n1", Ip: "10.1.0.50"}}}
+		specJSON, _ := json.Marshal(spec)
+		rec := corrosion.VMRecord{Name: vm, HostName: "node-a", Spec: string(specJSON), State: "running", CPUActual: 1, MemActual: 512}
+		if err := corrosion.InsertVM(ctx, db, rec, []corrosion.InterfaceRecord{
+			{VMName: vm, NetworkName: "n0", MAC: macX, IP: "10.0.0.99"}, // `lv config --ip`: not the spec's .10
+			{VMName: vm, NetworkName: "n1", Ordinal: 1, MAC: macY, IP: "10.1.0.50"},
+		}, nil); err != nil {
+			t.Fatal(err)
+		}
+		return rec, spec
 	}
-	if _, _, failure := r.domainXMLFor(ctx, vm, spec, nil); failure != "" {
+
+	rec, spec := insert("vm1")
+	if _, _, failure := r.domainXMLFor(ctx, rec, spec, nil); failure != "" {
 		t.Fatalf("domainXMLFor: %s", failure)
 	}
 	iso, _ := lv.SafeCloudInitISOPath(r.dataDir, "vm1")
-	b, err := os.ReadFile(iso)
+	sd, err := cloudinit.ReadSeed(iso)
 	if err != nil {
 		t.Fatalf("no seed written: %v", err)
 	}
-	if string(b) != "end\n" {
-		t.Errorf("seed carries %q, want neither network-config nor vendor-data", b)
+	if sd.NetworkConfig != cloudinit.NetworkConfigDisabled || sd.VendorData != cloudinit.NetworkUpdatesOffVendorData {
+		t.Errorf("failover seed: network-config %q vendor-data %q, want rendering disabled and the update events off", sd.NetworkConfig, sd.VendorData)
 	}
 	evs, err := corrosion.ListVMEvents(ctx, db, "vm1", 50, "")
 	if err != nil {
@@ -259,5 +261,25 @@ done
 	}
 	if !found {
 		t.Errorf("no seed.not_rebuilt event: %+v", evs)
+	}
+
+	// The VM's own (unstamped) seed is here: its network-config and
+	// vendor-data are kept.
+	rec2, spec2 := insert("vm2")
+	iso2, _ := lv.SafeCloudInitISOPath(r.dataDir, "vm2")
+	ownNC := cloudinit.BuildV1([]cloudinit.StaticIface{{MAC: macX, Address: "10.0.0.10/24"}, {MAC: macY, Address: "10.1.0.50/24"}})
+	if err := cloudinit.GenerateISO(cloudinit.Config{InstanceID: "vm2", LocalHostname: "vm2", NetworkConfig: ownNC,
+		VendorData: cloudinit.NetworkUpdatesVendorData}, iso2); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, failure := r.domainXMLFor(ctx, rec2, spec2, nil); failure != "" {
+		t.Fatalf("domainXMLFor: %s", failure)
+	}
+	sd2, err := cloudinit.ReadSeed(iso2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sd2.NetworkConfig != ownNC || sd2.VendorData != cloudinit.NetworkUpdatesVendorData {
+		t.Errorf("the VM's own seed's network-config was not kept: %q %q", sd2.NetworkConfig, sd2.VendorData)
 	}
 }

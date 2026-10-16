@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 )
 
 // tagProbeSpy is macroSpy that also answers the tag-group probe (probeErr)
@@ -25,6 +26,12 @@ type tagProbeSpy struct {
 	deploys  int
 	groups   []*pb.FirewallTagGroup
 	listReq  *pb.ListFirewallTagGroupsRequest
+	setReq   *pb.SetFirewallTagGroupRequest
+}
+
+func (s *tagProbeSpy) SetFirewallTagGroup(_ context.Context, in *pb.SetFirewallTagGroupRequest, _ ...grpc.CallOption) (*pb.FirewallTagGroup, error) {
+	s.setReq = in
+	return in.GetGroup(), nil
 }
 
 func (s *tagProbeSpy) ListFirewallTagGroups(_ context.Context, in *pb.ListFirewallTagGroupsRequest, _ ...grpc.CallOption) (*pb.ListFirewallTagGroupsResponse, error) {
@@ -182,5 +189,95 @@ func TestTagGroupLs_Members(t *testing.T) {
 	spy = &tagProbeSpy{probeErr: status.Error(codes.Unimplemented, "unknown method")}
 	if _, err := runTagProbeCLI(t, spy, newFirewallTagGroupCmd(), "ls"); err == nil || !strings.Contains(err.Error(), "upgrade litevirtd") {
 		t.Fatalf("ls against an older daemon: %v", err)
+	}
+}
+
+// The probe lets a write through only on an answer that proves the daemon
+// has the method; any error other than a refusal of the caller proves
+// nothing, so it refuses (review m-1).
+//
+// Mutation: go ahead on any error but Unimplemented — the Unavailable case
+// writes: red; refuse PermissionDenied — red.
+func TestTagCIDR_ProbeFailsClosed(t *testing.T) {
+	for _, c := range []struct {
+		code  codes.Code
+		write bool
+	}{
+		{codes.Unavailable, false}, {codes.DeadlineExceeded, false}, {codes.Internal, false},
+		{codes.PermissionDenied, true}, {codes.Unauthenticated, true},
+	} {
+		spy := &tagProbeSpy{probeErr: status.Error(c.code, "x")}
+		_, err := runTagProbeCLI(t, spy, newFirewallClusterRuleCmd(), "add", "--cidr", "tag:web")
+		if (spy.adds == 1) != c.write || (err == nil) != c.write {
+			t.Errorf("probe answered %v: err=%v writes=%d, want write=%v", c.code, err, spy.adds, c.write)
+		}
+		if !c.write && (err == nil || !strings.Contains(err.Error(), "could not confirm")) {
+			t.Errorf("probe answered %v: %v, want the could-not-confirm refusal", c.code, err)
+		}
+	}
+}
+
+// --match k= and a key matched twice are refused: either would widen the
+// selector the operator wrote (review m-2). A bare key means "has the key".
+//
+// Mutations: accept an empty value — red; let the last of two values win —
+// red.
+func TestTagGroupSet_MatchRefusesEmptyAndRepeated(t *testing.T) {
+	for _, args := range [][]string{
+		{"set", "web", "--match", "role="},
+		{"set", "web", "--match", "role=web", "--match", "role=db"},
+		{"set", "web", "--match", "role", "--match", "role=db"},
+	} {
+		spy := &tagProbeSpy{}
+		if _, err := runTagProbeCLI(t, spy, newFirewallTagGroupCmd(), args...); err == nil || !strings.Contains(err.Error(), "--match") {
+			t.Errorf("%v: %v, want a --match refusal", args, err)
+		}
+		if spy.setReq != nil {
+			t.Errorf("%v: sent %v", args, spy.setReq)
+		}
+	}
+	spy := &tagProbeSpy{}
+	if _, err := runTagProbeCLI(t, spy, newFirewallTagGroupCmd(), "set", "web", "--match", "role=web", "--match", "env"); err != nil {
+		t.Fatal(err)
+	}
+	if m := spy.setReq.GetGroup().GetMatch(); len(m) != 2 || m["role"] != "web" || m["env"] != "" {
+		t.Fatalf("match sent = %v", m)
+	}
+}
+
+// gitops sends no compose that holds, or may hold, a tag: cidr to a daemon
+// that answers Unimplemented: judged by its rules when lv parses it, and by
+// its raw text when it does not, since an older daemon validates less than
+// lv (review I-1). A file with no tag: deploys.
+//
+// Mutations: probe only on a parse — the unparseable case deploys: red;
+// never probe — red; probe every file — the plain unparseable case is
+// refused: red.
+func TestGitopsDeploy_ProbesForTag(t *testing.T) {
+	unimpl := status.Error(codes.Unimplemented, "unknown method")
+	parses := "name: dd\nsecurity-groups:\n  web:\n    rules:\n      - {direction: ingress, proto: tcp, port: \"443\", cidr: \"tag:web\", action: accept}\n"
+	for _, c := range []struct {
+		name, body string
+		deploy     bool
+	}{
+		{"parses, holds tag:", parses, false},
+		{"does not parse, holds TAG :", "name: dd\nbogus-field: 1\nsecurity-groups:\n  web:\n    rules:\n      - {cidr: \"TAG : web\", port: \"99999\"}\n", false},
+		{"does not parse, no tag", "name: dd\nbogus-field: 1\n", true},
+		{"parses, no tag", "name: dd\nsecurity-groups:\n  web:\n    rules:\n      - {direction: ingress, proto: tcp, port: \"443\", cidr: \"10.0.0.0/8\", action: accept}\n", true},
+	} {
+		if _, perr := compose.ParseNamed("stack.yaml", []byte(c.body)); (perr == nil) != strings.HasPrefix(c.name, "parses") {
+			t.Fatalf("%s: the fixture's parse = %v", c.name, perr)
+		}
+		spy := &tagProbeSpy{probeErr: unimpl}
+		err := gitopsDeploy(context.Background(), spy, "stack.yaml", c.body)
+		if c.deploy {
+			if spy.deploys != 1 || spy.probes != 0 {
+				t.Errorf("%s: deploys=%d probes=%d err=%v, want the deploy and no probe", c.name, spy.deploys, spy.probes, err)
+			}
+			continue
+		}
+		if spy.deploys != 0 || spy.probes != 1 || err == nil || !strings.Contains(err.Error(), "upgrade litevirtd") {
+			t.Errorf("%s: deploys=%d probes=%d err=%v, want the upgrade refusal and no deploy", c.name, spy.deploys, spy.probes, err)
+		}
 	}
 }

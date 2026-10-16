@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -15,6 +16,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cli"
 	"github.com/litevirt/litevirt/internal/compose"
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 	"github.com/litevirt/litevirt/internal/gitops"
 )
 
@@ -58,19 +60,7 @@ func newGitopsCmd() *cobra.Command {
 					return fmt.Errorf("dial daemon: %w", err)
 				}
 				defer closer()
-				// A file that does not parse is the daemon's to refuse.
-				if f, perr := compose.ParseNamed(path, []byte(body)); perr == nil {
-					if err := requireTagGroupSupport(ctx, client, composeRuleCIDRs(f)...); err != nil {
-						return err
-					}
-				}
-				stream, err := client.DeployStack(ctx, &pb.DeployStackRequest{
-					ComposeYaml: body,
-				})
-				if err != nil {
-					return fmt.Errorf("DeployStack: %w", err)
-				}
-				return gitops.DrainDeploy(stream)
+				return gitopsDeploy(ctx, client, path, body)
 			}
 
 			// Differ short-circuits no-op cycles: it returns the number of
@@ -197,4 +187,34 @@ func formatCommitStatus(s gitops.CommitStatus) string {
 		}
 	}
 	return b.String()
+}
+
+// gitopsBodyMayHoldTag matches "tag" then ":" in any case and spacing: a
+// conservative scan of a compose file the client could not parse. Over-matching
+// costs one probe.
+var gitopsBodyMayHoldTag = regexp.MustCompile(`(?i)tag\s*:`)
+
+// gitopsDeploy applies one compose file by streaming DeployStack to its end
+// and reporting every failure (see gitops.DrainDeploy for why it must never
+// stop reading early). A file that holds, or may hold, a tag: cidr is sent
+// only to a daemon that knows tag groups (spec 4.8, I-1): one that parses
+// is judged by its rule cidrs, and one that does not by its raw text, since
+// an older daemon validates less than this client and stores tag: verbatim.
+func gitopsDeploy(ctx context.Context, client pb.LiteVirtClient, path, body string) error {
+	var cidrs []string
+	if f, err := compose.ParseNamed(path, []byte(body)); err == nil {
+		cidrs = composeRuleCIDRs(f)
+	} else if gitopsBodyMayHoldTag.MatchString(body) {
+		cidrs = []string{rulefield.TagCIDRPrefix}
+	}
+	if err := requireTagGroupSupport(ctx, client, cidrs...); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	stream, err := client.DeployStack(ctx, &pb.DeployStackRequest{
+		ComposeYaml: body,
+	})
+	if err != nil {
+		return fmt.Errorf("DeployStack: %w", err)
+	}
+	return gitops.DrainDeploy(stream)
 }

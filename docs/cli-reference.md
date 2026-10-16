@@ -1433,9 +1433,12 @@ lv firewall tag-group ls [--members]   # --members: each member's allocated addr
 lv firewall tag-group rm <name> [--force]
   # rm is refused while a rule references tag:<name> or the group binds security groups to a
   # member's NICs; --force overrides accept rules and the binding, never a drop or reject rule.
-  # set is refused for a name ending in _v6, beside a group <name>_v6, and over an ip set named
-  # lv_tg_<name> or lv_tg_<name>_v6. lv asks the daemon before sending a tag: cidr (a rule or a
-  # compose file) and refuses against a daemon that predates tag groups.
+  # set is refused for a name ending in _v6, beside a group <name>_v6, over an ip set named
+  # lv_tg_<name> or lv_tg_<name>_v6, for an --sg or --network that does not exist (or an --sg name
+  # two groups hold), and for --match k= or a key matched twice. rm also asks --force while a
+  # workload whose tags cannot be read sits on a network the group binds. lv asks the daemon
+  # before sending a tag: cidr (a rule, a compose file, or a gitops file that may hold one) and
+  # refuses unless the daemon shows it knows tag groups.
 ```
 
 See `docs/firewall.md` for the three-tier model, where each tier is enforced

@@ -45,9 +45,14 @@ has finished.`,
 			}
 			sel := map[string]string{}
 			for _, m := range match {
-				k, v, _ := strings.Cut(m, "=")
-				if k == "" {
-					return fmt.Errorf("--match %q: want key=value or key", m)
+				k, v, hasValue := strings.Cut(m, "=")
+				if k == "" || (hasValue && v == "") {
+					// An empty value would mean "has the key", wider than
+					// the k=v the operator wrote (an unset $VAR).
+					return fmt.Errorf("--match %q: want key=value, or key alone for \"has the key\"", m)
+				}
+				if _, dup := sel[k]; dup {
+					return fmt.Errorf("--match %q: key %q is matched twice; a tag holds one value", m, k)
 				}
 				sel[k] = v
 			}
@@ -130,16 +135,23 @@ func isTagCIDR(cidr string) bool {
 
 // requireTagGroupSupport asks the daemon, before a write holding a tag:
 // cidr, whether it knows tag groups at all: an older one would store the
-// cidr unvalidated (spec §4.8, I-1). Only Unimplemented refuses; any other
-// answer leaves the write to the daemon.
+// cidr unvalidated (spec §4.8, I-1). The write goes ahead only on an answer
+// that proves the daemon has the method: success, or a refusal of the
+// caller (PermissionDenied, Unauthenticated), which only a daemon that has
+// it returns. Unimplemented refuses with the upgrade text; any other error
+// proves nothing about the daemon, so it refuses too, fail closed.
 func requireTagGroupSupport(ctx context.Context, c pb.LiteVirtClient, cidrs ...string) error {
 	if !slices.ContainsFunc(cidrs, isTagCIDR) {
 		return nil
 	}
-	if _, err := c.ListFirewallTagGroups(ctx, &pb.ListFirewallTagGroupsRequest{}); status.Code(err) == codes.Unimplemented {
+	_, err := c.ListFirewallTagGroups(ctx, &pb.ListFirewallTagGroupsRequest{})
+	switch status.Code(err) {
+	case codes.OK, codes.PermissionDenied, codes.Unauthenticated:
+		return nil
+	case codes.Unimplemented:
 		return fmt.Errorf("a tag:<group> cidr: %s", tagGroupUpgradeText)
 	}
-	return nil
+	return fmt.Errorf("a tag:<group> cidr: could not confirm the daemon supports tag groups: %w; retry", err)
 }
 
 // composeRuleCIDRs is every rule cidr a compose file holds.

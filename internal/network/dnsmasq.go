@@ -119,10 +119,10 @@ func dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile string, no
 		args = append(args, "--enable-ra", "--dhcp-authoritative")
 	}
 	// A network with no router (an isolated network): a NIC the hosts file
-	// tags NoRouterTag — one of a VM that has another NIC — is offered no
-	// router, so it takes no default route through the bridge whatever its
-	// DHCP client does with the seed's use-routes (cloud-init's sysconfig and
-	// NetworkManager renderers drop it). Every other client is offered the
+	// tags NoRouterTag — one of a VM that also has a NIC on a routed
+	// network — is offered no router, so it takes no default route through
+	// the bridge whatever its DHCP client does with the seed's use-routes
+	// (cloud-init's sysconfig and NetworkManager renderers drop it). Every other client is offered the
 	// bridge as before. IPv4 only: router advertisements cannot be withheld
 	// from one guest.
 	if noRouter && !isIPv6Gateway(gateway) {

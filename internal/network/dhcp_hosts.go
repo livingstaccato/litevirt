@@ -31,7 +31,8 @@ func DHCPHostsFile(bridge string) string {
 var hostsMu sync.Mutex
 
 // NoRouterTag is the dnsmasq tag of a NIC that is offered no router: a NIC on
-// an isolated network of a VM that has another NIC (dnsmasqArgs).
+// an isolated network of a VM that also has a NIC on a routed network
+// (dnsmasqArgs).
 const NoRouterTag = "lv-norouter"
 
 // DHCPHost is one MAC's line in a hosts file: its reserved address ("" for
@@ -48,6 +49,11 @@ type DHCPHost struct {
 func SyncDHCPHosts(bridge string, hosts map[string]DHCPHost) (bool, error) {
 	hostsMu.Lock()
 	defer hostsMu.Unlock()
+	return syncDHCPHostsLocked(bridge, hosts)
+}
+
+// syncDHCPHostsLocked is SyncDHCPHosts with hostsMu held.
+func syncDHCPHostsLocked(bridge string, hosts map[string]DHCPHost) (bool, error) {
 	path := DHCPHostsFile(bridge)
 	old, err := os.ReadFile(path)
 	if err != nil {
@@ -80,11 +86,13 @@ var ErrNoLocalDHCPServer = errors.New("no litevirt DHCP server for this bridge o
 // litevirt's here: that is ErrNoLocalDHCPServer, never a silent success, since
 // the guest would then take a dynamic address its exact guard drops.
 func AddDHCPHost(bridge, mac, ip string) error {
+	// One critical section from read to write: a rewrite between them (a
+	// NIC's no-router tag) would otherwise be lost.
 	hostsMu.Lock()
+	defer hostsMu.Unlock()
 	path := DHCPHostsFile(bridge)
 	old, err := os.ReadFile(path)
 	if err != nil {
-		hostsMu.Unlock()
 		if os.IsNotExist(err) {
 			return fmt.Errorf("%w: %s", ErrNoLocalDHCPServer, bridge)
 		}
@@ -105,8 +113,7 @@ func AddDHCPHost(bridge, mac, ip string) error {
 		}
 	}
 	hosts[mac] = DHCPHost{IP: ip, NoRouter: hosts[mac].NoRouter}
-	hostsMu.Unlock()
-	_, err = SyncDHCPHosts(bridge, hosts)
+	_, err = syncDHCPHostsLocked(bridge, hosts)
 	return err
 }
 

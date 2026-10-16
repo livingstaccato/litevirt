@@ -14,6 +14,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"net/netip"
+	"sort"
 	"strings"
 	"time"
 
@@ -433,11 +434,17 @@ func (s *Server) prunePendingLocked() {
 // NICs offered no router (noRouterMACs). The daemon runs it periodically, and
 // a VM's create, NIC attach and detach, and delete run it at once.
 func (s *Server) SyncDHCPReservations(ctx context.Context) {
+	_ = s.syncDHCPReservations(ctx)
+}
+
+// syncDHCPReservations is SyncDHCPReservations, reporting a pass that could
+// not read what it needs (nothing is written then).
+func (s *Server) syncDHCPReservations(ctx context.Context) error {
 	s.dhcpSyncMu.Lock()
 	defer s.dhcpSyncMu.Unlock()
 	nets, err := corrosion.ListNetworks(ctx, s.db)
 	if err != nil {
-		return
+		return err
 	}
 	defs := map[string]*compose.NetworkDef{}
 	for _, nr := range nets {
@@ -446,15 +453,15 @@ func (s *Server) SyncDHCPReservations(ctx context.Context) {
 	}
 	noRouter, err := s.noRouterMACs(ctx, defs)
 	if err != nil {
-		return
+		return err
 	}
 	ids, err := corrosion.LiveNICIdentities(ctx, s.db)
 	if err != nil {
-		return
+		return err
 	}
 	guards, err := corrosion.ListNICGuards(ctx, s.db)
 	if err != nil {
-		return
+		return err
 	}
 	// Only guarded VM NICs are reserved; the address the NIC row records is
 	// the reservation.
@@ -518,9 +525,10 @@ func (s *Server) SyncDHCPReservations(ctx context.Context) {
 			}
 		}
 		if _, err := sync(network.BridgeName(nr.Name, *def), hosts); err != nil {
-			continue
+			slog.Debug("DHCP hosts file not rewritten", "network", nr.Name, "error", err)
 		}
 	}
+	return nil
 }
 
 // noRouterPendingNIC is a NIC registered by pendingNICs whose row is not
@@ -532,14 +540,26 @@ type noRouterPendingNIC struct {
 
 // noRouterMACs is, per isolated network (network.NoRouterNetwork), the MACs
 // (lower-case) of the NICs its dnsmasq offers no router: every NIC on it of a
-// VM that has another NIC, counting every live VM in the cluster (a VM that
-// moves here finds its tag already in place) and the NICs pendingNICs
-// registered. Such a VM takes its default route from another NIC — or none,
-// as netplan's use-routes: false in its seed already says — and never through
-// a bridge that leads nowhere. A VM whose only NIC is on the network is
-// offered the bridge as before. Containers are not counted.
+// VM that also has a NIC on a network that carries a route (routedNetwork),
+// counting every live VM in the cluster (a VM that moves here finds its tag
+// already in place) and the NICs pendingNICs registered. Such a VM takes its
+// default route from that NIC, never through a bridge that leads nowhere —
+// which netplan's use-routes: false in its seed already says, and RHEL's
+// cloud-init renderers drop. A VM whose NICs are all isolated is offered the
+// bridge as before. Containers are not counted. With no such network nothing
+// is read.
 func (s *Server) noRouterMACs(ctx context.Context, defs map[string]*compose.NetworkDef) (map[string]map[string]bool, error) {
-	rows, err := corrosion.ListAllVMNICs(ctx, s.db)
+	var isolated []string
+	for name, def := range defs {
+		if def != nil && network.NoRouterNetwork(*def) {
+			isolated = append(isolated, name)
+		}
+	}
+	if len(isolated) == 0 {
+		return nil, nil
+	}
+	sort.Strings(isolated)
+	rows, err := corrosion.VMNICsTouching(ctx, s.db, isolated)
 	if err != nil {
 		return nil, err
 	}
@@ -569,7 +589,14 @@ func (s *Server) noRouterMACs(ctx context.Context, defs map[string]*compose.Netw
 	s.dhcpResMu.Unlock()
 	out := map[string]map[string]bool{}
 	for _, nics := range byVM {
-		if len(nics) < 2 {
+		routed := false
+		for _, net := range nics {
+			if routedNetwork(defs[net]) {
+				routed = true
+				break
+			}
+		}
+		if !routed {
 			continue
 		}
 		for mac, net := range nics {
@@ -585,13 +612,22 @@ func (s *Server) noRouterMACs(ctx context.Context, defs map[string]*compose.Netw
 	return out, nil
 }
 
+// routedNetwork reports whether a NIC on def can carry the VM's default
+// route: a bridge, VXLAN, SR-IOV or macvtap network, or a host-isolated one
+// (its seed gives the NIC the bridge as gateway) — anything but an isolated
+// network. A network with no record counts as not routed, which keeps the
+// router an isolated network's dnsmasq offers as it was.
+func routedNetwork(def *compose.NetworkDef) bool {
+	return def != nil && (def.Type != "isolated" || def.HostIsolation)
+}
+
 // pendingDHCPNICs registers vm's NICs whose rows are not written yet with
 // the DHCP hosts files and rewrites them at once, so a NIC that is to be
 // offered no router is tagged before its guest can ask; the returned func
 // forgets them and rewrites the files again (the rows written by then, or the
 // create failed).
 func (s *Server) pendingDHCPNICs(vm string, recs []corrosion.InterfaceRecord) func() {
-	if s.db == nil || len(recs) == 0 {
+	if s.db == nil || len(recs) == 0 || !s.anyNoRouterNetwork(recs) {
 		return func() {}
 	}
 	s.dhcpResMu.Lock()
@@ -620,14 +656,44 @@ func (s *Server) pendingDHCPNICs(vm string, recs []corrosion.InterfaceRecord) fu
 	}
 }
 
-// resyncDHCPHosts runs SyncDHCPReservations now: a VM's NICs changed.
+// anyNoRouterNetwork reports whether one of recs is on a network whose
+// dnsmasq can withhold its router (network.NoRouterNetwork): only then can
+// the NICs change a tag before their rows exist. A NIC on any other network
+// changes a tag only of a guest already running, which takes it at its next
+// lease; the rewrite after the rows are written covers that.
+func (s *Server) anyNoRouterNetwork(recs []corrosion.InterfaceRecord) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, r := range recs {
+		if def, _ := lookupNetworkDef(ctx, s.db, r.NetworkName); def != nil && network.NoRouterNetwork(*def) {
+			return true
+		}
+	}
+	return false
+}
+
+// resyncDHCPHosts runs SyncDHCPReservations now: a VM's NICs changed. A pass
+// that cannot read what it needs is retried, and one that still fails is
+// logged — a tag it would have written is then missing until the periodic
+// pass, and a guest that asks for a lease before it takes the router.
 func (s *Server) resyncDHCPHosts() {
 	if s.db == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	s.SyncDHCPReservations(ctx)
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err = s.syncDHCPReservations(ctx)
+		cancel()
+		if err == nil {
+			return
+		}
+		slog.Warn("DHCP hosts files: rewrite after a NIC change failed; retrying", "attempt", attempt+1, "error", err)
+	}
+	slog.Error("DHCP hosts files: rewrite after a NIC change failed; the periodic pass retries every 30s, and a NIC on an isolated network may be offered the router until then", "error", err)
 }
 
 // StartDHCPReservations runs SyncDHCPReservations every interval.

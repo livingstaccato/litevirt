@@ -2166,6 +2166,30 @@ runcmd:
   - cd /tmp/www && nohup python3 -m http.server 8080 &>/dev/null &
 `
 
+// rhelFamilyImageOn is the first image `lv image ls` lists on host whose
+// name names a RHEL-family distribution (Rocky, Alma, RHEL, CentOS, Oracle,
+// Fedora), or "".
+func rhelFamilyImageOn(t *testing.T, host string) string {
+	t.Helper()
+	re := regexp.MustCompile(`(?i)rocky|alma|rhel|centos|oracle|fedora`)
+	for _, line := range strings.Split(lv(t, "image", "ls"), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 || f[0] == "NAME" || !re.MatchString(f[0]) {
+			continue
+		}
+		i := strings.Index(line, "[")
+		if i < 0 {
+			continue
+		}
+		for _, h := range strings.Fields(strings.Trim(line[i:], "[] ")) {
+			if h == host {
+				return f[0]
+			}
+		}
+	}
+	return ""
+}
+
 // execRetry runs lv exec with retries for guest-agent readiness.
 func execRetry(t *testing.T, vmName string, cmd ...string) (string, error) {
 	t.Helper()
@@ -2475,6 +2499,26 @@ vms:
 		vm2Name, testImage, hostNames[1], strings.ReplaceAll(netCloudInit, "\n", "\n        "),
 		vm3Name, testImage, hostNames[0], strings.ReplaceAll(netCloudInit, "\n", "\n        "))
 
+	// A RHEL-family guest on vxnet + isonet, when such an image is on the
+	// host: the one whose cloud-init renderers drop use-routes, so the only
+	// guest on which Isolated/DefaultRoute tells the fix from main.
+	vm4Name, rhelImage := "", rhelFamilyImageOn(t, hostNames[0])
+	if rhelImage != "" {
+		vm4Name = uniqueName("nv4")
+		compose += fmt.Sprintf(`
+  %s:
+    image: %s
+    cpu: 1
+    memory: `+vmMemory()+`
+    disks:
+      root: 10G
+    network:
+      - name: vxnet
+      - name: isonet
+    placement:
+      host: %s`, vm4Name, rhelImage, hostNames[0])
+	}
+
 	filePath := writeComposeFile(t, stackName, compose)
 	cleanup(t, func() { composeDown(t, stackName) })
 
@@ -2485,6 +2529,10 @@ vms:
 	waitCloudInit(t, vm1Name, 3*time.Minute)
 	waitCloudInit(t, vm2Name, 3*time.Minute)
 	waitCloudInit(t, vm3Name, 3*time.Minute)
+	if vm4Name != "" {
+		waitVM(t, vm4Name, "RUNNING", 3*time.Minute)
+		waitCloudInit(t, vm4Name, 5*time.Minute)
+	}
 
 	t.Run("VXLAN/InterVMPing", func(t *testing.T) {
 		vm2IP := getVMIP(t, vm2Name, stackName, "vxnet")
@@ -2542,10 +2590,13 @@ vms:
 	})
 
 	// The isolated network's dnsmasq offers no router to a NIC of a VM that
-	// has another NIC: vm1 (vxnet + isonet) takes no default route through
-	// its isolated NIC, whatever its cloud-init renderer does with the seed's
-	// use-routes: false. A VM whose only NIC is isolated is offered the
-	// bridge as before: vm3 keeps its default route through it.
+	// also has a NIC on a routed network: vm1 (and vm4) on vxnet + isonet
+	// take no default route through the isolated NIC. A VM whose NICs are all
+	// isolated is offered the bridge as before: vm3 keeps its default route
+	// through it. vm1's assertion holds on main too for a netplan guest
+	// (Debian, Ubuntu: the seed's use-routes: false); it tells the fix from
+	// main only on a RHEL-family guest, which vm4 is when such an image is on
+	// the host.
 	t.Run("Isolated/DefaultRoute", func(t *testing.T) {
 		defaultVia := func(vm string) (iface string, has bool, all string) {
 			iface = getVMIfaceForSubnet(t, vm, "10.201.0.")
@@ -2560,11 +2611,20 @@ vms:
 			}
 			return iface, has, out
 		}
-		if iface, has, all := defaultVia(vm1Name); has {
-			t.Errorf("%s (two NICs) has a default route through its isolated interface %s:\n%s", vm1Name, iface, all)
+		routed := map[string]string{vm1Name: testImage}
+		if vm4Name != "" {
+			routed[vm4Name] = rhelImage
+			t.Logf("RHEL-family guest %s runs %s", vm4Name, rhelImage)
+		} else {
+			t.Logf("no RHEL-family image on %s; only %s (%s) is checked, which does not tell the fix from main on a netplan guest", hostNames[0], vm1Name, testImage)
+		}
+		for vm, img := range routed {
+			if iface, has, all := defaultVia(vm); has {
+				t.Errorf("%s (%s, vxnet + isonet) has a default route through its isolated interface %s:\n%s", vm, img, iface, all)
+			}
 		}
 		if iface, has, all := defaultVia(vm3Name); !has {
-			t.Errorf("%s (only an isolated NIC) has no default route through %s; a VM whose only NIC is isolated keeps the bridge as router:\n%s", vm3Name, iface, all)
+			t.Errorf("%s (only an isolated NIC) has no default route through %s; a VM whose NICs are all isolated keeps the bridge as router:\n%s", vm3Name, iface, all)
 		}
 	})
 

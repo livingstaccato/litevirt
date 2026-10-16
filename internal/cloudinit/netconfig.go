@@ -88,9 +88,10 @@ func NetworkConfig(nics []NIC) string {
 
 // noRouter reports whether def is a network with no router: an isolated
 // network, a host-local bridge with no uplink. Its dnsmasq withholds the
-// router from a NIC of a VM with another NIC (network.NoRouterTag), but one an
-// earlier build started still hands out the bridge's address as one, which a
-// guest must not take as a default route beside its other NICs.
+// router from a NIC of a VM with a NIC on a routed network
+// (network.NoRouterTag), but one an earlier build started still hands out the
+// bridge's address as one, which a guest must not take as a default route
+// beside its other NICs.
 func noRouter(def *compose.NetworkDef) bool {
 	return def != nil && def.Type == "isolated"
 }

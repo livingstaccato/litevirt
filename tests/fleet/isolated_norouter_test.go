@@ -1,5 +1,6 @@
 // Fleet scenario: an isolated network's dnsmasq offers no router to a NIC of
-// a VM that has another NIC, and the bridge to a VM whose only NIC is there.
+// a VM that also has a NIC on a routed network, and the bridge to a VM whose
+// NICs are all isolated.
 //
 // Lab 2 (F5): RHEL-family cloud-init drops the seed's use-routes: false, so a
 // hot-attached DHCP NIC on an isolated network took a default route through
@@ -26,9 +27,9 @@ import (
 )
 
 // Mutation: drop the rewrite when pendingNICs registers NICs — the tag is not
-// there at the first start; drop the rewrite after a detach or a delete — the
-// single-NIC VM keeps its tag, the deleted VM's MAC stays; count a VM with
-// one NIC — the single VM is tagged at create.
+// there at the first start or the hot attach; drop the rewrite after a detach
+// or a delete — the single-NIC VM keeps its tag, the deleted VM's MACs stay;
+// count any second NIC as routed — the all-isolated VM is tagged.
 func TestFleet_IsolatedNoRouterFollowsNICCount(t *testing.T) {
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
@@ -123,27 +124,32 @@ func TestFleet_IsolatedNoRouterFollowsNICCount(t *testing.T) {
 		t.Errorf("single is back to one NIC, its isolated NIC %s is still tagged", macS)
 	}
 
-	// Attach a second isolated NIC to the running VM: the new NIC and the old
-	// one are both tagged before the guest sees the new one.
+	// Attach a second isolated NIC to single: its NICs are all isolated, so
+	// neither is tagged — the router main offers them is kept.
 	var atAttach [2]bool
 	src.Virt.FailAttachNIC = func(_, _, _, mac string) error {
 		atAttach = [2]bool{tagged(mac), tagged(macS)}
 		return nil
 	}
 	x := mustAttachNIC(t, c, dst, "single", "isonet")
-	src.Virt.FailAttachNIC = nil
-	if !atAttach[0] || !atAttach[1] {
-		t.Errorf("at the hot attach: new NIC tagged %v, old NIC tagged %v; want both", atAttach[0], atAttach[1])
+	if atAttach[0] || atAttach[1] || tagged(x.MAC) || tagged(macS) {
+		t.Errorf("single has only isolated NICs, yet a NIC is tagged: at the attach new %v old %v, after new %v old %v",
+			atAttach[0], atAttach[1], tagged(x.MAC), tagged(macS))
 	}
-	if !tagged(x.MAC) || !tagged(macS) {
-		t.Errorf("after the attach: new NIC tagged %v, old NIC tagged %v; want both", tagged(x.MAC), tagged(macS))
+
+	// Hot-attach an isolated NIC to multi, which has a routed NIC: the new
+	// NIC is tagged before the guest sees it.
+	y := mustAttachNIC(t, c, dst, "multi", "isonet")
+	src.Virt.FailAttachNIC = nil
+	if !atAttach[0] || !tagged(y.MAC) || !tagged(macM) {
+		t.Errorf("multi's new isolated NIC: tagged at the attach %v, after %v; old NIC %v; want all true", atAttach[0], tagged(y.MAC), tagged(macM))
 	}
 
 	// Delete: the VM's MAC leaves the file.
 	if _, err := c.SelfClient(src).DeleteVM(ctx, &pb.DeleteVMRequest{Name: "multi"}); err != nil {
 		t.Fatalf("DeleteVM multi: %v", err)
 	}
-	if listed(macM) {
-		t.Errorf("deleted VM's NIC %s is still in the hosts file", macM)
+	if listed(macM) || listed(y.MAC) {
+		t.Errorf("deleted VM's NICs are still in the hosts file: %s %v, %s %v", macM, listed(macM), y.MAC, listed(y.MAC))
 	}
 }

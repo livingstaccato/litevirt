@@ -118,15 +118,18 @@ An isolated network does not span hosts. Every host gets its own copy: its own
 leasing the same range. VMs on different hosts cannot reach each other over it,
 and two VMs on different hosts can be leased the same address.
 
-On an IPv4 subnet, that `dnsmasq` offers no router to a NIC of a VM that has
-another NIC, on any network, and offers the bridge as router to a VM whose
-only NIC is on the isolated network. The NIC's MAC is tagged in the bridge's
-DHCP hosts file, rewritten when a VM is created or deleted and when a NIC is
-attached or detached. A NIC with a static address keeps the gateway its seed
-gives it (see [VM IP addressing](#vm-ip-addressing)). Router advertisements on
-an IPv6 subnet still announce the bridge as a default router to every guest.
-A guest leased by an earlier release keeps that lease's default route until it
-renews the lease or restarts.
+On an IPv4 subnet, that `dnsmasq` offers no router to a NIC of a VM that also
+has a NIC on a network that is not isolated (a bridge, VXLAN, SR-IOV, direct or
+host-isolated network). A VM whose NICs are all on isolated networks is offered
+the bridge as router. The NIC's MAC is tagged in the bridge's DHCP hosts file,
+rewritten when a VM is created or deleted and when a NIC is attached or
+detached. A tag change that an attach or detach makes for a NIC of a running
+guest reaches it when the guest next asks for a lease; restart the VM or renew
+its lease to apply it at once. A NIC with a static address keeps the gateway
+its seed gives it (see [VM IP addressing](#vm-ip-addressing)). Router
+advertisements on an IPv6 subnet still announce the bridge as a default router
+to every guest. A guest leased by an earlier release keeps that lease's default
+route until it renews the lease or restarts.
 
 The firewall drops everything the host would route off an isolated bridge or
 onto it, including to another isolated network on the same host, so a guest

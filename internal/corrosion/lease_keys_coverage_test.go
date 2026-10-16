@@ -60,6 +60,30 @@ func TestLeaseKeys_EveryAcquiredKeyIsListed(t *testing.T) {
 	for dir, files := range pkgs {
 		r := leaseKeyResolver{pkgs: pkgs, dir: dir, corrosionDir: corrosionDir}
 		for _, f := range files {
+			// AcquireLeaseWithTerm taken as a VALUE (acquire :=
+			// corrosion.AcquireLeaseWithTerm) would be called under another
+			// name this scan cannot see. Every reference must be a call's
+			// callee, or the declaration itself.
+			callee := map[ast.Node]bool{}
+			ast.Inspect(f, func(n ast.Node) bool {
+				switch x := n.(type) {
+				case *ast.CallExpr:
+					callee[x.Fun] = true
+					if sel, ok := x.Fun.(*ast.SelectorExpr); ok {
+						callee[sel.Sel] = true
+					}
+				case *ast.FuncDecl:
+					callee[x.Name] = true
+				}
+				return true
+			})
+			ast.Inspect(f, func(n ast.Node) bool {
+				if id, ok := n.(*ast.Ident); ok && id.Name == "AcquireLeaseWithTerm" && !callee[id] {
+					t.Errorf("%s: AcquireLeaseWithTerm is referenced other than as a call; "+
+						"this scan can only vouch for direct calls", paths[f])
+				}
+				return true
+			})
 			ast.Inspect(f, func(n ast.Node) bool {
 				call, ok := n.(*ast.CallExpr)
 				if !ok || calleeName(call.Fun) != "AcquireLeaseWithTerm" || len(call.Args) < 3 {

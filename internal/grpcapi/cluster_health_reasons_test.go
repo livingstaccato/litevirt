@@ -53,14 +53,15 @@ func TestRollUpHealth_EveryNonHealthyStateHasAReason(t *testing.T) {
 	now := time.Now().UTC()
 	fresh := now.Format(time.RFC3339)
 	okEval := corrosion.HealthEvaluatorStatus{Evaluator: "dual_run", LastScan: fresh, Coverage: corrosion.CoverageComplete}
-	cases := []struct {
+	type rollUpCase struct {
 		name       string
 		conds      []corrosion.HealthCondition
 		evals      []corrosion.HealthEvaluatorStatus
 		capacity   []corrosion.HostCapacityObservation
 		mesh       []connectivityEdge
 		want, says string
-	}{
+	}
+	cases := []rollUpCase{
 		{name: "healthy", evals: []corrosion.HealthEvaluatorStatus{okEval}, want: HealthHealthy},
 		{name: "no evaluator", want: HealthUnknown, says: "no health evaluator"},
 		{name: "all stale", evals: []corrosion.HealthEvaluatorStatus{{Evaluator: "dual_run",
@@ -94,6 +95,18 @@ func TestRollUpHealth_EveryNonHealthyStateHasAReason(t *testing.T) {
 			mesh: []connectivityEdge{{Observer: "h1", Target: "h2", Status: "suspect", TargetInMaintenance: true}},
 			want: HealthHealthy},
 	}
+	// A state decided by one cause still lists the others.
+	stale := corrosion.HealthEvaluatorStatus{Evaluator: "shared_lun",
+		LastScan: now.Add(-time.Hour).Format(time.RFC3339), Coverage: corrosion.CoverageComplete}
+	cases = append(cases,
+		rollUpCase{name: "critical lists a stale scan too", evals: []corrosion.HealthEvaluatorStatus{okEval, stale},
+			conds: []corrosion.HealthCondition{{Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "web",
+				Severity: corrosion.SeverityCritical, Lifecycle: corrosion.ConditionConfirmed}},
+			want: HealthCritical, says: "shared_lun is stale"},
+		rollUpCase{name: "unknown lists a bad link too", evals: []corrosion.HealthEvaluatorStatus{stale},
+			mesh: []connectivityEdge{{Observer: "h1", Target: "h2", Status: "suspect"}},
+			want: HealthUnknown, says: "h1 -> h2 is suspect"},
+	)
 	for _, tc := range cases {
 		state, reasons := rollUpHealth(tc.conds, tc.evals, tc.capacity, tc.mesh, now)
 		if state != tc.want {
@@ -111,6 +124,25 @@ func TestRollUpHealth_EveryNonHealthyStateHasAReason(t *testing.T) {
 		}
 		if !strings.Contains(strings.Join(reasons, "\n"), tc.says) {
 			t.Errorf("%s: %s with reasons %q; want one naming %q", tc.name, state, reasons, tc.says)
+		}
+	}
+}
+
+// TestRollUpHealth_ReasonsStayOnOneLine: a free-text detail with a newline must
+// not split the `- ` list lv health prints (and tests/e2e parses).
+//
+// Mutation: make oneLine return s unchanged and this fails.
+func TestRollUpHealth_ReasonsStayOnOneLine(t *testing.T) {
+	now := time.Now().UTC()
+	_, reasons := rollUpHealth(nil, []corrosion.HealthEvaluatorStatus{{Evaluator: "dual_run",
+		LastScan: now.Format(time.RFC3339), Coverage: corrosion.CoveragePartial, Detail: "host h3\nunreachable\r\nagain"}},
+		[]corrosion.HostCapacityObservation{{HostName: "h2", Detail: "a\nb"}}, nil, now)
+	if len(reasons) != 2 {
+		t.Fatalf("reasons = %q, want two", reasons)
+	}
+	for _, r := range reasons {
+		if strings.ContainsAny(r, "\r\n") {
+			t.Errorf("reason %q spans lines", r)
 		}
 	}
 }

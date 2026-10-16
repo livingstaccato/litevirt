@@ -411,9 +411,13 @@ func clusterHealthDTO(h *pb.ClusterHealth) map[string]any {
 			"complete": c.GetComplete(), "detail": c.GetDetail(), "sampled_at": c.GetSampledAt(),
 		})
 	}
+	reasons := h.GetReasons()
+	if reasons == nil {
+		reasons = []string{}
+	}
 	return map[string]any{
 		"overall":      h.GetOverall(),
-		"reasons":      h.GetReasons(),
+		"reasons":      reasons,
 		"conditions":   conditions,
 		"evaluators":   evaluators,
 		"connectivity": connectivity,

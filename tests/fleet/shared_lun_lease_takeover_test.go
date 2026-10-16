@@ -20,7 +20,8 @@ import (
 //
 // The first holder mints alone, as the lab's first node did in a cluster of
 // one; every node then runs the scan as the daemon does, the holder dies, and
-// a survivor must take the lease over and scan again.
+// a survivor must take the lease over, at the term after the holder's, and
+// scan again.
 //
 // Mutation: drop LeaseKeySharedLUN from corrosion.leaseKeys (and its guard in
 // AcquireLeaseWithTerm) and the survivors never take the lease.
@@ -43,8 +44,8 @@ func TestFleet_SharedLUN_ASurvivorTakesTheScanOverWhenItsHolderGoes(t *testing.T
 
 	// Each node's ticker runs at its own phase, as daemons started at
 	// different moments do. Started together, both survivors would sweep for
-	// the takeover in the same instant, both read term 1 as the high water and
-	// both mint term 2 — a contested term the contest machinery then retires.
+	// the takeover in the same instant, both read the same high water and both
+	// mint the next term — a contested term the contest machinery then retires.
 	// That race is the lease's, for every key, and is not what this scenario
 	// is about.
 	stops := map[string]context.CancelFunc{}
@@ -78,15 +79,25 @@ func TestFleet_SharedLUN_ASurvivorTakesTheScanOverWhenItsHolderGoes(t *testing.T
 	if err != nil || holder != taker.Name {
 		t.Fatalf("%s scanned but its lease row names %q (err %v)", taker.Name, holder, err)
 	}
-	if term, err := corrosion.CurrentLeaseTerm(ctx, taker.DB, corrosion.LeaseKeySharedLUN); err != nil || term != 2 {
-		t.Fatalf("%s: lease term %d (err %v), want the takeover at term 2", taker.Name, term, err)
+	// The takeover is the term after a's last one. a's ledger is read now,
+	// not at the kill: its scan has stopped, so the newest term it holds is
+	// final. a usually took term 1, but setup that outlasts its 2s lease makes
+	// a lapse-and-retake mint a later one, so the test does not assume it.
+	held, err := corrosion.CurrentLeaseTerm(ctx, a.DB, corrosion.LeaseKeySharedLUN)
+	if err != nil || held < 1 {
+		t.Fatalf("%s: newest lease term %d (err %v), want the term it held", a.Name, held, err)
+	}
+	want := held + 1
+	if term, err := corrosion.CurrentLeaseTerm(ctx, taker.DB, corrosion.LeaseKeySharedLUN); err != nil || term != want {
+		t.Fatalf("%s: lease term %d (err %v), want the takeover at term %d (%s held %d)",
+			taker.Name, term, err, want, a.Name, held)
 	}
 
-	// One claimant for term 2: the other survivor saw the takeover rather
-	// than minting its own.
+	// One claimant for the takeover term: the other survivor saw the
+	// takeover rather than minting its own.
 	for _, n := range survivors {
-		if h, ok, err := corrosion.LeaseTermHolder(ctx, n.DB, corrosion.LeaseKeySharedLUN, 2); err != nil || (ok && h != taker.Name) {
-			t.Fatalf("%s records term 2 for %q (err %v); %s took it — two holders", n.Name, h, err, taker.Name)
+		if h, ok, err := corrosion.LeaseTermHolder(ctx, n.DB, corrosion.LeaseKeySharedLUN, want); err != nil || (ok && h != taker.Name) {
+			t.Fatalf("%s records term %d for %q (err %v); %s took it — two holders", n.Name, want, h, err, taker.Name)
 		}
 	}
 

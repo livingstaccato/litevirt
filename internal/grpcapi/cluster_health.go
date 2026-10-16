@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -258,15 +259,16 @@ func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosio
 // DEGRADED is derived from the reasons, not from a separate flag that could
 // be set without one.
 func rollUpHealth(conditions []corrosion.HealthCondition, evaluators []corrosion.HealthEvaluatorStatus, capacity []corrosion.HostCapacityObservation, mesh []connectivityEdge, now time.Time) (string, []string) {
-	if len(evaluators) == 0 {
-		return HealthUnknown, []string{"no health evaluator has reported a scan yet"}
-	}
+	// Every cause is collected before the state is picked, so a CRITICAL or
+	// UNKNOWN cluster still lists a stalled scan or a bad link alongside the
+	// cause that decided its state. The precedence is unchanged: no evaluator,
+	// then a critical condition, then every evaluator stale, then DEGRADED.
 	var reasons, critical []string
 	for _, h := range conditions {
 		if h.Lifecycle == corrosion.ConditionResolved {
 			continue
 		}
-		what := fmt.Sprintf("condition %s on %s/%s (%s, %s)", h.Code, h.SubjectKind, h.SubjectID, h.Severity, h.Lifecycle)
+		what := oneLine(fmt.Sprintf("condition %s on %s/%s (%s, %s)", h.Code, h.SubjectKind, h.SubjectID, h.Severity, h.Lifecycle))
 		if h.Severity == corrosion.SeverityCritical {
 			critical = append(critical, what)
 			continue
@@ -298,9 +300,6 @@ func rollUpHealth(conditions []corrosion.HealthCondition, evaluators []corrosion
 		}
 		reasons = append(reasons, what)
 	}
-	if len(critical) > 0 {
-		return HealthCritical, append(critical, reasons...)
-	}
 	allStale := true
 	for _, e := range evaluators {
 		stale := true
@@ -316,19 +315,16 @@ func rollUpHealth(conditions []corrosion.HealthCondition, evaluators []corrosion
 			}
 		}
 		if stale {
-			reasons = append(reasons, fmt.Sprintf("evaluator %s is stale: last scan %q by %s is not within the last %s "+
-				"(its scan has stopped, or no node holds its lease)", e.Evaluator, e.LastScan, e.Reporter, evaluatorScanTTL))
+			reasons = append(reasons, oneLine(fmt.Sprintf("evaluator %s is stale: last scan %q by %s is not within the last %s "+
+				"(its scan has stopped, or no node holds its lease)", e.Evaluator, e.LastScan, e.Reporter, evaluatorScanTTL)))
 		}
 		if e.Coverage != corrosion.CoverageComplete {
-			reasons = append(reasons, fmt.Sprintf("evaluator %s coverage is %s: %s", e.Evaluator, e.Coverage, e.Detail))
+			reasons = append(reasons, oneLine(fmt.Sprintf("evaluator %s coverage is %s: %s", e.Evaluator, e.Coverage, e.Detail)))
 		}
-	}
-	if allStale {
-		return HealthUnknown, reasons
 	}
 	for _, c := range capacity {
 		if !c.Complete {
-			reasons = append(reasons, fmt.Sprintf("capacity observation for %s is incomplete: %s", c.HostName, c.Detail))
+			reasons = append(reasons, oneLine(fmt.Sprintf("capacity observation for %s is incomplete: %s", c.HostName, c.Detail)))
 		}
 	}
 	// A peer-probe mesh full of failing links used to roll up as HEALTHY: the
@@ -345,13 +341,27 @@ func rollUpHealth(conditions []corrosion.HealthCondition, evaluators []corrosion
 			continue
 		}
 		if connectivityDegrades(e.Status) {
-			reasons = append(reasons, fmt.Sprintf("connectivity %s -> %s is %s", e.Observer, e.Target, e.Status))
+			reasons = append(reasons, oneLine(fmt.Sprintf("connectivity %s -> %s is %s", e.Observer, e.Target, e.Status)))
 		}
 	}
-	if len(reasons) > 0 {
+	switch {
+	case len(evaluators) == 0:
+		return HealthUnknown, append([]string{"no health evaluator has reported a scan yet"}, append(critical, reasons...)...)
+	case len(critical) > 0:
+		return HealthCritical, append(critical, reasons...)
+	case allStale:
+		return HealthUnknown, reasons
+	case len(reasons) > 0:
 		return HealthDegraded, reasons
 	}
 	return HealthHealthy, nil
+}
+
+// oneLine keeps a reason on one line. Details are free text from evaluator and
+// sampler rows, and a newline in one would split the `- ` list lv health
+// prints, and the parsers that read it, mid-reason.
+func oneLine(s string) string {
+	return strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(s)
 }
 
 func healthConditionToPB(h corrosion.HealthCondition) *pb.HealthCondition {

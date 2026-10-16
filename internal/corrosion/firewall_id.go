@@ -451,12 +451,8 @@ func DeletedFirewallTags(ctx context.Context, c *Client, kind, project, name str
 	if err != nil || len(vals) == 0 || vals[0].String("value") == "" {
 		return "", "", nil, err
 	}
-	var v firewallTagsValue
-	if json.Unmarshal([]byte(vals[0].String("value")), &v) != nil {
-		return "", "", nil, nil
-	}
-	if tags, ok := nonNullStrings(v.Tags); ok && len(tags) > 0 {
-		return fwID, host, tags, nil
+	if rec := decodeFirewallTags(kind, fwID, vals[0].String("value"), "", ""); !rec.Unreadable && len(rec.Tags) > 0 {
+		return fwID, host, rec.Tags, nil
 	}
 	return "", "", nil, nil
 }

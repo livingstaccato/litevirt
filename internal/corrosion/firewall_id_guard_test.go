@@ -104,6 +104,7 @@ var allowedRequestIdentityFields = []string{"litevirt.v1.VMSpec.firewall_id"}
 type goPackage struct {
 	dir   string // relative to the repo root, slash-separated
 	files []*ast.File
+	paths []string // each file's path relative to the repo root, slash-separated
 }
 
 // repoPackages parses every non-test Go package under the repo's internal/
@@ -137,6 +138,8 @@ func repoPackages(t *testing.T) []goPackage {
 				byDir[rel] = &goPackage{dir: rel}
 			}
 			byDir[rel].files = append(byDir[rel].files, f)
+			relPath, _ := filepath.Rel(root, path)
+			byDir[rel].paths = append(byDir[rel].paths, filepath.ToSlash(relPath))
 			return nil
 		})
 		if err != nil {
@@ -413,7 +416,7 @@ func fixturePackage(t *testing.T, dir, src string) goPackage {
 	if err != nil {
 		t.Fatalf("parse fixture: %v", err)
 	}
-	return goPackage{dir: dir, files: []*ast.File{f}}
+	return goPackage{dir: dir, files: []*ast.File{f}, paths: []string{dir + "/fixture.go"}}
 }
 
 // TestFirewallIDWriterGuard_FlagsAFixture: the guard finds a writer by the

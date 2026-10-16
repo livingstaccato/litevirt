@@ -337,12 +337,6 @@ type tagWorkload struct {
 
 type tagNIC struct{ network, mac string }
 
-// firewallTagsValue is a firewall-tags row's value. name and host are for
-// display only and never matched. A JSON null tag value is a wrong type.
-type firewallTagsValue struct {
-	Tags map[string]*string `json:"tags"`
-}
-
 type tagsRow struct {
 	tags       map[string]string
 	unreadable bool
@@ -529,22 +523,10 @@ func readFirewallTagsRows(ctx context.Context, c *Client) (map[string]tagsRow, e
 		if !ok || (kind != TagMemberVM && kind != TagMemberCT) {
 			continue
 		}
-		value := r.String("value")
-		if value == "" {
-			out[kind+"/"+id] = tagsRow{}
-			continue
-		}
-		var v firewallTagsValue
-		if json.Unmarshal([]byte(value), &v) != nil {
-			out[kind+"/"+id] = tagsRow{unreadable: true}
-			continue
-		}
-		tags, ok := nonNullStrings(v.Tags)
-		if !ok {
-			out[kind+"/"+id] = tagsRow{unreadable: true}
-			continue
-		}
-		out[kind+"/"+id] = tagsRow{tags: tags}
+		// One decoder for every reader (decodeFirewallTags): name and host
+		// are for display only and never matched.
+		rec := decodeFirewallTags(kind, id, r.String("value"), "", "")
+		out[kind+"/"+id] = tagsRow{tags: rec.Tags, unreadable: rec.Unreadable}
 	}
 	return out, nil
 }

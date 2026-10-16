@@ -406,8 +406,10 @@ func (s *Server) deviceUsers(ctx context.Context, dev string) (deviceUse, error)
 }
 
 // containerRuntimeAbsent reports whether err, from listing the containers,
-// is the lookup of a runtime binary that is not installed: a host without the
-// lxc-* tooling (lxc.Available) runs no containers. Any other failure is not.
+// is the lookup of a runtime binary that is not installed. Any other failure
+// is not. It means "no containers" only on a host that also does not run
+// containers (runsContainers, the lxc.Available probe): a host with lxc-create
+// but no lxc-ls can still run them.
 func containerRuntimeAbsent(err error) bool {
 	var ee *exec.Error
 	return errors.As(err, &ee) && errors.Is(ee.Err, exec.ErrNotFound)
@@ -415,7 +417,8 @@ func containerRuntimeAbsent(err error) bool {
 
 // deviceUsersAll maps each bridge any defined VM or container on this host
 // names to what names it: one read of every domain and container. A host
-// without a container runtime has no containers. When the containers cannot
+// that does not run containers and has no container runtime installed has no
+// containers. When the containers cannot
 // be read, the error comes with the VMs read already.
 func (s *Server) deviceUsersAll(ctx context.Context) (map[string]deviceUse, error) {
 	out := map[string]deviceUse{}
@@ -464,7 +467,7 @@ func (s *Server) deviceUsersAll(ctx context.Context) (map[string]deviceUse, erro
 	}
 	if l, ok := s.containerRuntime.(containerNICLinker); ok && s.containerRuntime != nil {
 		cts, err := s.containerRuntime.ListContainers(ctx)
-		if err != nil && !containerRuntimeAbsent(err) {
+		if err != nil && !(containerRuntimeAbsent(err) && !s.runsContainers()) {
 			return out, fmt.Errorf("list the containers: %w", err)
 		}
 		for _, ct := range cts {

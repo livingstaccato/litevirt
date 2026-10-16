@@ -83,6 +83,44 @@ func TestFleet_NetworkMoveOnHostsWithoutLXC(t *testing.T) {
 	}
 }
 
+// A host whose LXC probe says it runs containers but whose lxc-ls is missing
+// may have running containers on the old device, so its not-found list
+// failure holds the move: it keeps serving lanaa, and names what it could not
+// read.
+//
+// Mutation: drop the runsContainers check — node-1 moves to lanbb.
+func TestFleet_NetworkMoveHeldOnAnLXCHostWithoutLxcLs(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	ctx := context.Background()
+	seedTestImageEverywhere(t, c)
+	busy, capable := c.Nodes[0], c.Nodes[1]
+	for _, n := range c.Nodes {
+		n.Net.SetDHCPConflicts(true)
+	}
+	withoutLXC(busy)
+	cl := c.SelfClient(busy)
+	if _, err := deployStream(t, ctx, cl, strings.ReplaceAll(composeIfaceChangeOneVM, "IFACE", "lanaa")); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	reconcileNetworks(t, capable)
+	if got := capable.Net.Serving(); strings.Join(got, ",") != "lanaa" {
+		t.Fatalf("fixture: %s serves %v, want [lanaa]", capable.Name, got)
+	}
+	capable.Server.SetLXCCapableForTest(true)
+	capable.CT.FailList(errNoLXCTooling)
+
+	if _, err := deployStream(t, ctx, cl, strings.ReplaceAll(composeIfaceChangeOneVM, "IFACE", "lanbb")); err == nil {
+		t.Fatal("redeploy onto lanbb while ia runs on lanaa was not refused")
+	}
+	reconcileNetworks(t, capable)
+	if got := capable.Net.Serving(); strings.Join(got, ",") != "lanaa" {
+		t.Errorf("%s (LXC-capable, lxc-ls missing) serves %v, want the move held: [lanaa]", capable.Name, got)
+	}
+	if b, _ := capable.Net.CreatedBridges(); !strings.Contains(strings.Join(b, ","), "lanaa") {
+		t.Errorf("%s keeps bridges %v, want lanaa kept", capable.Name, b)
+	}
+}
+
 // Lab 1 netprov proof, finding 1: `compose down` after a move that hosts
 // refused (a VM ran on the old device) left the old bridge, its dnsmasq and
 // the pending retirement behind on every refusing host without LXC. Down

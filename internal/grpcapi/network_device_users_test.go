@@ -29,24 +29,32 @@ func (listFailCT) SetContainerNICLink(context.Context, string, int, string) erro
 // other list failure still fails closed, and the VMs are still named beside
 // it, so a refusal says who holds the device.
 //
+// A host whose LXC probe says it runs containers (lxc-create present) but
+// whose lxc-ls is missing may have running containers on the device, so its
+// not-found list failure still fails closed.
+//
 // Mutations: treat every list failure as no runtime — the "other" cases
 // return no error; treat none as no runtime — the not-found cases error;
+// drop the runsContainers check — the LXC-capable case returns no error;
 // return nothing on a list failure — the VM is not named.
 func TestDeviceUsersAll_HostWithoutContainerRuntime(t *testing.T) {
 	notFound := &exec.Error{Name: "lxc-ls", Err: exec.ErrNotFound}
 	for _, tc := range []struct {
-		name    string
-		err     error
-		wantErr bool
+		name       string
+		err        error
+		lxcCapable bool
+		wantErr    bool
 	}{
-		{"lxc-ls not installed", fmt.Errorf("lxc-ls: %w", notFound), false},
-		{"lxc-ls not installed, unwrapped", notFound, false},
-		{"lxc-ls failed", errors.New("lxc-ls: exit status 1: permission denied"), true},
-		{"lxc-ls not runnable", fmt.Errorf("lxc-ls: %w", &exec.Error{Name: "lxc-ls", Err: errors.New("permission denied")}), true},
-		{"not-found text without the lookup error", errors.New(`exec: "lxc-ls": executable file not found in $PATH`), true},
+		{"lxc-ls not installed", fmt.Errorf("lxc-ls: %w", notFound), false, false},
+		{"lxc-ls not installed, unwrapped", notFound, false, false},
+		{"lxc-ls not installed on an LXC-capable host", fmt.Errorf("lxc-ls: %w", notFound), true, true},
+		{"lxc-ls failed", errors.New("lxc-ls: exit status 1: permission denied"), false, true},
+		{"lxc-ls not runnable", fmt.Errorf("lxc-ls: %w", &exec.Error{Name: "lxc-ls", Err: errors.New("permission denied")}), false, true},
+		{"not-found text without the lookup error", errors.New(`exec: "lxc-ls": executable file not found in $PATH`), false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := testServer(t)
+			s.SetLXCCapableForTest(tc.lxcCapable)
 			ctx := context.Background()
 			virt := libvirtfake.New()
 			s.virt = virt

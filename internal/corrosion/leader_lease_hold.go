@@ -58,6 +58,13 @@ const maxLeaseAttempts = 3
 // "not held", which is the same shape as losing the race and is what the callers
 // already handle.
 func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, ttl time.Duration, now time.Time) (bool, int64, error) {
+	// A key outside leaseKeys is one no peer answers the quorum high-water read
+	// for, so a term minted for it could never be taken over. Refused here, on
+	// the first acquire, rather than discovered on the first restart.
+	if !ValidLeaseKey(key) {
+		return false, 0, fmt.Errorf("lease key %q is not in corrosion.leaseKeys: peers refuse its "+
+			"high-water read, so no node could take it over", key)
+	}
 	// The clock is re-sampled on EVERY attempt, not once at entry.
 	//
 	// A holder that enters before its expiry and then stalls past the TTL -- a

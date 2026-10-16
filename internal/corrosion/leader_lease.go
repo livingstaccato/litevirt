@@ -13,23 +13,38 @@ import (
 // check a ledger the coordinator never writes and pass every proof.
 const LeaseKeyFailover = "failover"
 
-// The other two lease keys, here for the same reason: an enforcement or
+// The other lease keys, here for the same reason: an enforcement or
 // diagnostic path outside their packages must ask about the SAME key its
 // consumer acquires, and a second copy of the string in a second package is a
 // divergence nothing would catch.
 const (
 	LeaseKeyRebalancer = "rebalancer"
 	LeaseKeyDualRun    = "dual_run_detector"
+	LeaseKeySharedLUN  = "shared_lun_detector"
 )
 
-// leaseKeys is the closed set of real lease keys.
+// leaseKeys is the closed set of real lease keys: the keys
+// AcquireLeaseWithTerm will take, and the keys a peer answers
+// GetLeaseTermHighWater for. It is one set for both sides on purpose. A
+// takeover mints only once a quorum of peers has answered that read for the
+// key (the mint clearance), so a key acquired but not listed here is refused
+// by every peer and, once its first holder goes, nobody can take it over —
+// shared_lun_detector was acquired for a release without being listed, and
+// its scan stopped for good on the first restart of its holder.
+// TestLeaseKeys_EveryAcquiredKeyIsListed pins the acquire sites against it.
+//
+// A peer on an older build answers only for the keys its own set holds, so a
+// NEW key cannot be taken over until a quorum of voters runs a build that
+// lists it: the clearance fails closed and the lease stays unheld, never held
+// twice.
 var leaseKeys = map[string]bool{
 	LeaseKeyFailover:   true,
 	LeaseKeyRebalancer: true,
 	LeaseKeyDualRun:    true,
+	LeaseKeySharedLUN:  true,
 }
 
-// ValidLeaseKey reports whether key names one of the three real leases.
+// ValidLeaseKey reports whether key names one of the real leases.
 //
 // EXACT match only — no trimming, no case folding. A near-miss is a bug or an
 // attack and normalising it would hide both. An unknown key must never be

@@ -35,7 +35,7 @@ import (
 // package-local list here: the answer selects which ledger a fencing decision
 // consults, so a caller must not get to choose, and the key reaches a metric
 // label where unbounded peer-supplied input is what the repo's bounded-label
-// discipline exists to prevent. All three real leases are answerable — a
+// discipline exists to prevent. Every real lease is answerable — a
 // handler that knew only the failover key would answer 0 for a rebalancer
 // proof, and 0 means "no term recorded", so the barrier would read a live
 // tenure as absent.

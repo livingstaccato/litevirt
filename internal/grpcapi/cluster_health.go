@@ -2,6 +2,8 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -88,8 +90,10 @@ func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthR
 		})
 	}
 
+	overall, reasons := rollUpHealth(conditions, evaluators, capacity, mesh, time.Now().UTC())
 	resp := &pb.ClusterHealth{
-		Overall:     overallHealth(conditions, evaluators, capacity, mesh, time.Now().UTC()),
+		Overall:     overall,
+		Reasons:     reasons,
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 	for _, h := range conditions {
@@ -243,16 +247,31 @@ const evaluatorScanTTL = 5 * time.Minute
 // trade than a loudly-degraded health state; an operator who wants a hard stop
 // on a blind cluster has the DEGRADED/UNKNOWN exit codes to wire it from.
 func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosion.HealthEvaluatorStatus, capacity []corrosion.HostCapacityObservation, mesh []connectivityEdge, now time.Time) string {
-	if len(evaluators) == 0 {
-		return HealthUnknown
-	}
-	degraded := false
+	state, _ := rollUpHealth(conditions, evaluators, capacity, mesh, now)
+	return state
+}
+
+// rollUpHealth is overallHealth with its reasons: one line per cause of a
+// state other than HEALTHY, so an operator can see WHY. A stale evaluator, an
+// incomplete capacity sample or a bad edge degrades the cluster without any
+// condition row, and the state alone left `lv health` at DEGRADED with nothing
+// listed to explain it. Every path to a non-HEALTHY state records a reason:
+// DEGRADED is derived from the reasons, not from a separate flag that could
+// be set without one.
+func rollUpHealth(conditions []corrosion.HealthCondition, evaluators []corrosion.HealthEvaluatorStatus, capacity []corrosion.HostCapacityObservation, mesh []connectivityEdge, now time.Time) (string, []string) {
+	// Every cause is collected before the state is picked, so a CRITICAL or
+	// UNKNOWN cluster still lists a stalled scan or a bad link alongside the
+	// cause that decided its state. The precedence is unchanged: no evaluator,
+	// then a critical condition, then every evaluator stale, then DEGRADED.
+	var reasons, critical []string
 	for _, h := range conditions {
 		if h.Lifecycle == corrosion.ConditionResolved {
 			continue
 		}
+		what := oneLine(fmt.Sprintf("condition %s on %s/%s (%s, %s)", h.Code, h.SubjectKind, h.SubjectID, h.Severity, h.Lifecycle))
 		if h.Severity == corrosion.SeverityCritical {
-			return HealthCritical
+			critical = append(critical, what)
+			continue
 		}
 		if h.Severity == corrosion.SeverityInfo {
 			// AN INFO CONDITION IS AN ADVISORY, NOT A FAULT, and the severity
@@ -279,7 +298,7 @@ func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosio
 			// warning or critical, and both still degrade below.
 			continue
 		}
-		degraded = true
+		reasons = append(reasons, what)
 	}
 	allStale := true
 	for _, e := range evaluators {
@@ -295,16 +314,17 @@ func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosio
 				allStale = false
 			}
 		}
-		if stale || e.Coverage != corrosion.CoverageComplete {
-			degraded = true
+		if stale {
+			reasons = append(reasons, oneLine(fmt.Sprintf("evaluator %s is stale: last scan %q by %s is not within the last %s "+
+				"(its scan has stopped, or no node holds its lease)", e.Evaluator, e.LastScan, e.Reporter, evaluatorScanTTL)))
 		}
-	}
-	if allStale {
-		return HealthUnknown
+		if e.Coverage != corrosion.CoverageComplete {
+			reasons = append(reasons, oneLine(fmt.Sprintf("evaluator %s coverage is %s: %s", e.Evaluator, e.Coverage, e.Detail)))
+		}
 	}
 	for _, c := range capacity {
 		if !c.Complete {
-			degraded = true
+			reasons = append(reasons, oneLine(fmt.Sprintf("capacity observation for %s is incomplete: %s", c.HostName, c.Detail)))
 		}
 	}
 	// A peer-probe mesh full of failing links used to roll up as HEALTHY: the
@@ -321,13 +341,27 @@ func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosio
 			continue
 		}
 		if connectivityDegrades(e.Status) {
-			degraded = true
+			reasons = append(reasons, oneLine(fmt.Sprintf("connectivity %s -> %s is %s", e.Observer, e.Target, e.Status)))
 		}
 	}
-	if degraded {
-		return HealthDegraded
+	switch {
+	case len(evaluators) == 0:
+		return HealthUnknown, append([]string{"no health evaluator has reported a scan yet"}, append(critical, reasons...)...)
+	case len(critical) > 0:
+		return HealthCritical, append(critical, reasons...)
+	case allStale:
+		return HealthUnknown, reasons
+	case len(reasons) > 0:
+		return HealthDegraded, reasons
 	}
-	return HealthHealthy
+	return HealthHealthy, nil
+}
+
+// oneLine keeps a reason on one line. Details are free text from evaluator and
+// sampler rows, and a newline in one would split the `- ` list lv health
+// prints, and the parsers that read it, mid-reason.
+func oneLine(s string) string {
+	return strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(s)
 }
 
 func healthConditionToPB(h corrosion.HealthCondition) *pb.HealthCondition {

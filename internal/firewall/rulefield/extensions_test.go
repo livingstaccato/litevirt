@@ -41,6 +41,7 @@ func TestRuleExtensions(t *testing.T) {
 		return errors.As(err, &fe)
 	}
 
+	SetExtensionsForTest(t, Extensions{})
 	for _, f := range []func(string, string) error{client, stored} {
 		if err := f("10.0.0.0/8", "drop+log"); !isField(err) {
 			t.Errorf("no extension: drop+log: %v, want refused", err)
@@ -85,13 +86,13 @@ func TestRuleExtensions_HookCannotWiden(t *testing.T) {
 		LogAction: func(a string) (string, bool) { return "drop", true },
 		TagCIDR:   func(string) (bool, error) { return true, nil },
 	})
-	for _, cidr := range []string{"tag:x;drop", "tag:", "tag:a b", "tag:x\n", "10.0.0.0/8; accept", "tag :web"} {
+	for _, cidr := range []string{"tag:x;drop", "tag:", "tag:a b", "tag:x\n", "10.0.0.0/8; accept", "tag :web", "tag:web-1"} {
 		if err := StoredRule("ingress", "tcp", "22", cidr, "drop", ""); err == nil {
 			t.Errorf("cidr %q taken by a hook that takes anything", cidr)
 		}
 	}
-	if err := StoredRule("ingress", "tcp", "22", "tag:web-1", "drop", ""); err != nil {
-		t.Errorf("tag:web-1: %v", err)
+	if err := StoredRule("ingress", "tcp", "22", "tag:web_1", "drop", ""); err != nil {
+		t.Errorf("tag:web_1: %v", err)
 	}
 	for _, action := range []string{"drop;x", "accept log", "drop+log;x"} {
 		if err := StoredRule("ingress", "tcp", "22", "tag:web", action, ""); err == nil {
@@ -105,8 +106,9 @@ func TestRuleExtensions_HookCannotWiden(t *testing.T) {
 
 // The shared predicates name the forms the corrosion classifier uses too.
 func TestTagCIDRNameAndLogActionVerdict(t *testing.T) {
-	for cidr, want := range map[string]bool{"tag:web": true, "tag:web-1.a": true, "tag:": false, "tag:a:b": false,
-		" tag:web": false, "tag:a b": false, "tag:1a": false, "@web": false} {
+	for cidr, want := range map[string]bool{"tag:web": true, "tag:web_1": true, "tag:lv_x": true, "tag:web-1.a": false,
+		"tag:Web": false, "tag:": false, "tag:a:b": false, " tag:web": false, "tag:a b": false, "tag:1a": false,
+		"tag:" + strings.Repeat("a", 31): true, "tag:" + strings.Repeat("a", 32): false, "@web": false} {
 		if _, ok := TagCIDRName(cidr); ok != want {
 			t.Errorf("TagCIDRName(%q) = %v, want %v", cidr, ok, want)
 		}
@@ -126,5 +128,46 @@ func TestNormaliseRule(t *testing.T) {
 	p, port, a := NormaliseRule("TCP", "{ 80, HTTPS } ", "DROP+Log")
 	if p != "tcp" || port != "{ 80, https } " || a != "drop+log" {
 		t.Errorf("NormaliseRule = %q %q %q", p, port, a)
+	}
+}
+
+// D5a: this build's grammar takes the tag-group cidr, tag:<group>, with the
+// group-name grammar ([a-z][a-z0-9_]{0,30}), at the client grammar and the
+// writers'. A cidr meant as one but outside that form is refused naming the
+// form, not judged as an IPv6 address.
+//
+// Mutations: leave ruleExtensions.TagCIDR nil — tag:web is refused, red;
+// TagCIDRName takes any nft set name — tag:web-1 passes, red; tagCIDR
+// declines a mis-cased prefix — TAG:web is refused as "not an IPv6 address",
+// red.
+func TestTagCIDR_ThisBuild(t *testing.T) {
+	for _, cidr := range []string{"tag:web", "tag:db_2", "tag:lv_x"} {
+		if err := Rule("ingress", "tcp", "5432", cidr, "accept", ""); err != nil {
+			t.Errorf("Rule %q: %v", cidr, err)
+		}
+		if err := StoredRule("ingress", "tcp", "5432", cidr, "drop", ""); err != nil {
+			t.Errorf("StoredRule %q: %v", cidr, err)
+		}
+	}
+	for _, cidr := range []string{"tag:web-1", "tag:Web", "TAG:web", " tag:web", "tag:", "tag:1a", "Tag:a.b"} {
+		err := Rule("ingress", "tcp", "5432", cidr, "accept", "")
+		if err == nil || !strings.Contains(err.Error(), "a tag-group cidr is tag:<group>") {
+			t.Errorf("Rule %q: %v, want refused naming the tag-group form", cidr, err)
+		}
+	}
+	// A cidr that is not in the tag form is judged as before.
+	if err := Rule("ingress", "tcp", "22", "2001:db8::/32", "accept", ""); err != nil {
+		t.Errorf("an IPv6 cidr: %v", err)
+	}
+}
+
+// TagGroupName is the tag group grammar corrosion's group writer uses too.
+func TestTagGroupName(t *testing.T) {
+	for name, want := range map[string]bool{"web": true, "a": true, "a_1": true, "lv_x": true,
+		strings.Repeat("a", 31): true, strings.Repeat("a", 32): false, "": false, "1a": false, "_a": false,
+		"Web": false, "a-b": false, "a.b": false} {
+		if got := TagGroupName(name); got != want {
+			t.Errorf("TagGroupName(%q) = %v, want %v", name, got, want)
+		}
 	}
 }

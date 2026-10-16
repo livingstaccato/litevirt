@@ -478,6 +478,25 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 			return err
 		}
 	}
+	// A rule naming a tag group that does not exist is refused before
+	// anything is torn down, once the gate has granted (so before the latch
+	// the refusal is the release text). Compose cannot declare a group (T-4).
+	if needed[capabilities.FeatureFirewallTagGroups] {
+		for name, sg := range f.SecurityGroups {
+			for _, r := range sg.Rules {
+				if err := s.refuseUnknownTagGroup(ctx, r.CIDR); err != nil {
+					return fmt.Errorf("security-group %q rule: %w", name, err)
+				}
+			}
+		}
+		if fd := f.FirewallDefaults; fd != nil {
+			for _, r := range fd.ClusterRules {
+				if err := s.refuseUnknownTagGroup(ctx, r.CIDR); err != nil {
+					return fmt.Errorf("cluster rule: %w", err)
+				}
+			}
+		}
+	}
 	// The stack's default never fails open (switch re-review 2, R1): a
 	// default-deny the new config asks for is in force before any row is torn
 	// down, and the stack's default row is not torn down with its rows — it

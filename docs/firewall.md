@@ -759,7 +759,8 @@ file, the problem names the rule's place in the file.
 |---|---|
 | `proto` | `all`, a protocol name (`tcp`, `esp`, `ipv6-icmp`, any case) or number 0-255 |
 | `port` (tcp, udp) | a port 0-65535 (decimal or `0x16`), a range `8000-9000` or `ssh - http`, a service name (`ssh`) |
-| `cidr` | an IPv4 address, prefix, range `10.0.0.1-10.0.0.9` or DNS name; one IPv6 address or prefix; `@<ipset>` |
+| `cidr` | an IPv4 address, prefix, range `10.0.0.1-10.0.0.9` or DNS name; one IPv6 address or prefix; `@<ipset>`; `tag:<group>`, naming a tag group that exists |
+| ip set name | a letter, `_` or `.`, then letters, digits, `_`, `.`, `-` or `/`; at most 255 bytes; not starting with `lv_`, which is reserved for litevirt's internal sets |
 | ip set element | an IPv4 address, prefix, range or DNS name; an IPv6 address or prefix. `--cidr 10.0.0.1,10.0.0.2` is stored as two elements |
 | `action` | `accept`, `drop`, `reject` |
 | `comment` | at most 128 bytes, no double quote |
@@ -769,7 +770,8 @@ file, the problem names the rule's place in the file.
 (`& 255.0.0.0 == 10.0.0.0`) and a braced list (`{ 80, 443 }`; a double or
 trailing comma is fine, a leading one is not). A set reference is `@name`,
 `!= @name` or `== @name` (`ne`, `eq`) only: nft refuses `< @name`, a set in
-braces or behind a mask. A rule on a set with IPv6 elements applies to both
+braces or behind a mask. It never names an `lv_` set: a tag group is
+referenced only as `tag:<group>`. A rule on a set with IPv6 elements applies to both
 families, negated or not. A bare comma list (`80,443`) is
 refused: nft rejects it, so it never applied — brace it. Anything else — a
 second word, a newline, `;`, `#`, a stray brace or quote — is refused, because

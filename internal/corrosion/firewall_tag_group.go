@@ -29,6 +29,7 @@ import (
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 )
 
 const (
@@ -45,14 +46,14 @@ const (
 )
 
 var (
-	firewallTagGroupNameRE = regexp.MustCompile(`^[a-z][a-z0-9_]{0,30}$`)
-	firewallTagWordRE      = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,62}$`)
-	firewallIDRE           = regexp.MustCompile(`^[0-9a-f]{32}$`)
+	firewallTagWordRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,62}$`)
+	firewallIDRE      = regexp.MustCompile(`^[0-9a-f]{32}$`)
 )
 
 // ValidFirewallTagGroupName reports whether name is a group name:
-// [a-z][a-z0-9_]{0,30}. It becomes the nft set name lv_tg_<name>.
-func ValidFirewallTagGroupName(name string) bool { return firewallTagGroupNameRE.MatchString(name) }
+// [a-z][a-z0-9_]{0,30}. It becomes the nft set name lv_tg_<name>, and a rule
+// references it as tag:<name> (rulefield.TagGroupName, the one grammar).
+func ValidFirewallTagGroupName(name string) bool { return rulefield.TagGroupName(name) }
 
 // ValidFirewallTagWord reports whether s is a firewall tag key or value:
 // [a-z0-9][a-z0-9_.-]{0,62}.

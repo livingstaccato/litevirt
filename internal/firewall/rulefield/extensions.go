@@ -24,10 +24,24 @@ type Extensions struct {
 	TagCIDR func(cidr string) (ok bool, err error)
 }
 
-// ruleExtensions are this build's: none yet. C2 and D5 fill them here, in
-// this file; nothing assigns them at run time (SetExtensionsForTest is for
-// tests).
-var ruleExtensions Extensions
+// ruleExtensions are this build's: the tag-group cidr (D5). C2 fills the log
+// action here, in this file; nothing assigns them at run time
+// (SetExtensionsForTest is for tests).
+var ruleExtensions = Extensions{TagCIDR: tagCIDR}
+
+// tagCIDR takes a cidr that starts "tag:" in any case, padded or not, and
+// refuses it unless it is exactly tag:<group name>: a client that means a tag
+// group is told the form, rather than that it is not an IPv6 address.
+func tagCIDR(cidr string) (bool, error) {
+	v := trimBlank(cidr)
+	if len(v) < len(TagCIDRPrefix) || !strings.EqualFold(v[:len(TagCIDRPrefix)], TagCIDRPrefix) {
+		return false, nil
+	}
+	if _, ok := TagCIDRName(cidr); !ok {
+		return true, refuse("cidr", cidr, "a tag-group cidr is %s<group>, the group name [a-z][a-z0-9_]{0,30}", TagCIDRPrefix)
+	}
+	return true, nil
+}
 
 // SetExtensionsForTest replaces this build's extensions for the rest of the
 // test and restores them when it ends. It changes package state, so a test
@@ -46,14 +60,29 @@ const TagCIDRPrefix = "tag:"
 const LogActionSuffix = "+log"
 
 // TagCIDRName returns the group a tag-group cidr names: exactly
-// "tag:<name>", where name is an nft set name (it renders as a set
-// reference). Anything else is not a tag-group cidr.
+// "tag:<name>", where name is a tag group name (TagGroupName; it renders as
+// the set reference @lv_tg_<name>). Anything else is not a tag-group cidr.
 func TagCIDRName(cidr string) (string, bool) {
 	name, ok := strings.CutPrefix(cidr, TagCIDRPrefix)
-	if !ok || SetName(name) != nil {
+	if !ok || !TagGroupName(name) {
 		return "", false
 	}
 	return name, true
+}
+
+// TagGroupName reports whether name is a tag group name: [a-z][a-z0-9_]{0,30}.
+// Its set, lv_tg_<name> (and lv_tg_<name>_v6), is then always one nft word
+// within nft's name limit.
+func TagGroupName(name string) bool {
+	if name == "" || len(name) > 31 || name[0] < 'a' || name[0] > 'z' {
+		return false
+	}
+	for _, r := range name[1:] {
+		if !(r >= 'a' && r <= 'z' || isDigit(r) || r == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 // LogActionVerdict returns the verdict a stored action in the log form names

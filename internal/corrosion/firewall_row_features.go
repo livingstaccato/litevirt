@@ -34,7 +34,7 @@ func isLoggedAction(action string) bool {
 }
 
 // isTagCIDR reports whether cidr is exactly one tag-group reference,
-// "tag:<name>" with name an nft set name: the same form the write grammar
+// "tag:<name>" with name a tag group name: the same form the write grammar
 // takes (rulefield.TagCIDRName). Anything else is judged as an address (and
 // an IPv6-looking one must parse as one).
 func isTagCIDR(cidr string) bool {
@@ -42,23 +42,16 @@ func isTagCIDR(cidr string) bool {
 	return ok
 }
 
-// ErrFirewallRuleFormUnsupported refuses a rule form a client may not send on
-// this build: an action carrying a "+" suffix (logging is asked through the
-// rule's log field, never the action string), or a tag-group cidr, which no
-// renderer on this build can render.
+// ErrFirewallRuleFormUnsupported refuses a rule form a client may not send:
+// an action carrying a "+" suffix (logging is asked through the rule's log
+// field, never the action string).
 var ErrFirewallRuleFormUnsupported = errors.New("firewall rule form not supported yet")
-
-// tagCIDRsRenderable reports whether this build renders a tag-group cidr
-// ("tag:<name>"). Until it does, a client's tag cidr is refused at write: a
-// stored one would make every host refuse its whole plan.
-const tagCIDRsRenderable = false
 
 // FirewallRowFeatures validates a rule a CLIENT sent, naming cidr, proto and
 // action, and returns the release features its write needs, in the order
 // their gates nest: firewall_ipv6, then firewall_log, then
 // firewall_tag_groups. A caller refuses a malformed rule before it asks any
-// gate for anything. A client action containing "+" is always refused, and a
-// tag-group cidr is refused while this build cannot render one.
+// gate for anything. A client action containing "+" is always refused.
 func FirewallRowFeatures(cidr, proto, action string) ([]capabilities.Feature, error) {
 	if err := RefuseClientRuleForm(cidr, action); err != nil {
 		return nil, err
@@ -67,17 +60,13 @@ func FirewallRowFeatures(cidr, proto, action string) ([]capabilities.Feature, er
 }
 
 // RefuseClientRuleForm is FirewallRowFeatures' refusal alone: a client action
-// containing "+", or a tag-group cidr while this build cannot render one. The
-// handlers and the stack deploy ask it first, before the field grammar, so a
-// client sending either form is told it is not supported rather than that the
-// field is malformed.
+// containing "+". The handlers and the stack deploy ask it first, before the
+// field grammar, so a client sending it is told it is not supported rather
+// than that the field is malformed.
 func RefuseClientRuleForm(cidr, action string) error {
 	if strings.Contains(action, "+") {
 		return fmt.Errorf("%w: action %q: an action is accept, drop or reject; a \"+\" suffix is not accepted from a client",
 			ErrFirewallRuleFormUnsupported, action)
-	}
-	if isTagCIDR(cidr) && !tagCIDRsRenderable {
-		return fmt.Errorf("%w: cidr %q: tag-group cidrs are not supported on this build", ErrFirewallRuleFormUnsupported, cidr)
 	}
 	return nil
 }
@@ -88,6 +77,9 @@ func RefuseClientRuleForm(cidr, action string) error {
 func firewallRowFeatures(cidr, proto, action string) ([]capabilities.Feature, error) {
 	var out []capabilities.Feature
 	tag := isTagCIDR(cidr)
+	if !tag && hasTagCIDRPrefix(cidr) {
+		return nil, fmt.Errorf("%q is not a tag-group cidr: want %s<group>, the group name [a-z][a-z0-9_]{0,30}", cidr, rulefield.TagCIDRPrefix)
+	}
 	if !tag {
 		v6, err := firewallRuleFamily(cidr, proto)
 		if err != nil {

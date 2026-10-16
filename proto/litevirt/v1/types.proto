@@ -595,6 +595,9 @@ message FirewallTags {
     map<string, string> tags       = 5;
     string              set_by     = 6;
     string              updated_at = 7;
+    // orphan: no live workload holds fw_id; the row an earlier incarnation of
+    // this name left, not applied (only listed when a workload is named).
+    bool                orphan     = 8;
 }
 
 message PCIDevice {

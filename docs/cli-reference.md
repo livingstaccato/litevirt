@@ -1398,6 +1398,12 @@ lv firewall nic-guard resume <vm> # let a VM held paused for its guards run, gua
 lv firewall enforce status          # mode per host + would-drop totals per workload, NIC and rule, since <time>
 lv firewall enforce on              # enforce (admin, audited); off = observe
 lv firewall enforce reset-counters  # restart every host's would-drop totals from now (admin, audited)
+
+# Firewall tags: per-workload key/value pairs, kept apart from labels (sg.write to change; audited).
+lv firewall tag set <vm> <key>=<value>...                          # adds or replaces keys
+lv firewall tag set <ct> --container [--host <host>] <key>=<value>...
+lv firewall tag rm <vm> <key>...                                   # --container [--host <host>] for a container
+lv firewall tag ls [<workload>] [--container [--host <host>]]      # every tagged workload, or one
 ```
 
 See `docs/firewall.md` for the three-tier model, where each tier is enforced

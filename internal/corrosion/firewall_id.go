@@ -298,8 +298,8 @@ func newFirewallID() string {
 // re-key or cutover) is no conflict. With no identity on the row, it mints
 // one and abandons nothing.
 //
-// Only `lv firewall tag set` calls it, with the firewall_tag_groups grant. A VM (ci:skip-cmd until D3 registers it)
-// mints through the desired-spec writer, under its operation barrier; a
+// Only `lv firewall tag set` and `lv firewall tag rm` call it (on the
+// workload's owner), with the firewall_tag_groups grant. A VM mints through the desired-spec writer, under its operation barrier; a
 // container through the compare-and-set on its create_spec, refused while an
 // operation holds it. ErrFirewallIDNotMinted means the caller retries; a
 // container with no create spec is refused (ErrFirewallIDNoCreateSpec), and so

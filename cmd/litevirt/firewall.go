@@ -33,6 +33,7 @@ func newFirewallCmd() *cobra.Command {
 		newFirewallDefaultDenyCmd(),
 		newFirewallNICGuardCmd(),
 		newFirewallEnforceCmd(),
+		newFirewallTagCmd(),
 	)
 	return cmd
 }

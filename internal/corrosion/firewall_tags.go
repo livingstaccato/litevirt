@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 )
@@ -227,5 +228,99 @@ func ListFirewallTagsRows(ctx context.Context, c *Client) ([]FirewallTagsRecord,
 		}
 		return out[i].FWID < out[j].FWID
 	})
+	return out, nil
+}
+
+// FirewallIDOf is the firewall identity a stored VM spec (kind TagMemberVM)
+// or container create_spec (TagMemberCT) holds, read as every reader reads
+// it; "" when it holds none.
+func FirewallIDOf(kind, doc string) string { return firewallIDOf(kind, doc) }
+
+// FirewallTagsOrphans returns the non-empty tags rows the orphan sweep clears
+// at now (spec §4.3, m-4): those whose fw_id no LIVE workload of the row's
+// kind holds, and EITHER the newest tombstone holding it was deleted more
+// than grace ago, OR no row of the kind holds it at all and the tags row was
+// last written more than grace ago. The grace covers a move or re-create in
+// flight, which leaves no live row for a moment. A timestamp that does not
+// parse keeps the row.
+func FirewallTagsOrphans(ctx context.Context, c *Client, now time.Time, grace time.Duration) ([]FirewallTagsRecord, error) {
+	rows, err := ListFirewallTagsRows(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	var pending []FirewallTagsRecord
+	for _, r := range rows {
+		if r.Unreadable || len(r.Tags) > 0 {
+			pending = append(pending, r)
+		}
+	}
+	if len(pending) == 0 {
+		return nil, nil
+	}
+	type holders struct {
+		live       bool
+		tombstones int
+		// newest is the newest tombstone's deletion; ok false when one
+		// did not parse.
+		newest time.Time
+		ok     bool
+	}
+	read := func(kind, q string) (map[string]*holders, error) {
+		rs, err := c.Query(ctx, q)
+		if err != nil {
+			return nil, err
+		}
+		out := map[string]*holders{}
+		for _, r := range rs {
+			id := firewallIDOf(kind, r.String("doc"))
+			if id == "" {
+				continue
+			}
+			h := out[id]
+			if h == nil {
+				h = &holders{ok: true}
+				out[id] = h
+			}
+			del := r.String("deleted_at")
+			if del == "" {
+				h.live = true
+				continue
+			}
+			h.tombstones++
+			t, ok := ParseUpdatedAt(del)
+			if !ok {
+				h.ok = false
+				continue
+			}
+			if t.After(h.newest) {
+				h.newest = t
+			}
+		}
+		return out, nil
+	}
+	byKind := map[string]map[string]*holders{}
+	if byKind[TagMemberVM], err = read(TagMemberVM,
+		`SELECT spec AS doc, COALESCE(deleted_at, '') AS deleted_at FROM vms`); err != nil {
+		return nil, err
+	}
+	if byKind[TagMemberCT], err = read(TagMemberCT,
+		`SELECT COALESCE(create_spec, '') AS doc, COALESCE(deleted_at, '') AS deleted_at FROM containers`); err != nil {
+		return nil, err
+	}
+	var out []FirewallTagsRecord
+	for _, r := range pending {
+		h := byKind[r.Kind][r.FWID]
+		switch {
+		case h != nil && h.live:
+		case h != nil && h.tombstones > 0:
+			if h.ok && now.Sub(h.newest) > grace {
+				out = append(out, r)
+			}
+		default:
+			if t, ok := ParseUpdatedAt(r.UpdatedAt); ok && now.Sub(t) > grace {
+				out = append(out, r)
+			}
+		}
+	}
 	return out, nil
 }

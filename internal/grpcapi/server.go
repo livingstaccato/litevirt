@@ -473,6 +473,9 @@ type Server struct {
 	// recreateTornDown is a test seam: it runs in a rebuild and a rolling
 	// recreate once the old VM is torn down, before it is created again.
 	recreateTornDown func(name string)
+	// testClearFirewallTags is a test seam: when set, a delete's firewall-tags
+	// clear calls it instead of corrosion.ClearFirewallTags.
+	testClearFirewallTags func(ctx context.Context, kind, fwID string) error
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that

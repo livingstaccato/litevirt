@@ -260,8 +260,12 @@ func TestMintFirewallID_ACoordinatedRelocationInFlightIsRefused(t *testing.T) {
 	f.relocationProof("p-r", "rel", "node-2", "node-3", "tok-r", ProofCompleted, false)
 	for _, host := range []string{"node-1", "node-2"} {
 		_, _, err := MintFirewallID(ctx, f.c, mintGrant(t), TagMemberCT, host, "rel")
-		if !errors.Is(err, ErrFirewallIDMoveOpen) || !strings.Contains(err.Error(), "remove the stale container rel on node-1") {
-			t.Fatalf("mint on %s mid-relocation: %v, want refused naming the stale copy on node-1", host, err)
+		// D2b re-review 4 m4-1: the proof's coordinator is a third host, so
+		// the relocation's marker may still be on its way: the refusal leads
+		// with the retry, and names the copy only "if no move is open".
+		if !errors.Is(err, ErrFirewallIDMoveOpen) ||
+			!strings.Contains(err.Error(), "retry; if no move is open, remove the stale container rel on node-1") {
+			t.Fatalf("mint on %s mid-relocation: %v, want refused leading with the retry, naming the stale copy on node-1", host, err)
 		}
 	}
 	for _, host := range []string{"node-1", "node-2"} {
@@ -388,19 +392,23 @@ func TestTagGroupMembers_SkewAndRunningRowsAreHeld(t *testing.T) {
 	}
 }
 
-// Re-review 3 m3-1: the holder carries a token from an old migrate that a
-// third host coordinated and that completed, beside a copy. No record will
-// ever arrive to bind the two, so the refusal leads with the stale copy's
-// remedy, not a retry for records in flight.
+// Re-review 3 m3-1: the holder carries a token from an old migrate, which
+// completed, beside a copy. The migrate was coordinated by one of the two
+// holders (its source) and sent the container to a third host, so it binds
+// neither row to the other and no record will ever arrive to: the refusal
+// leads with the stale copy's remedy, not a retry for records in flight.
+// (A proof a third host coordinated is a relocation and never settled:
+// TestMintFirewallID_ACoordinatedRelocationInFlightIsRefused, m4-1.)
 //
-// Mutation: drop the settled-records branch — the refusal leads with
-// "move records not yet replicated": red.
+// Mutations: drop the settled-records branch — the refusal leads with
+// "move records not yet replicated": red. Count a third host's proof as
+// settled — the relocation test is red.
 func TestMintFirewallID_ASettledTokenBesideACopyLeadsWithTheRemedy(t *testing.T) {
 	f := newTagGroupFixture(t)
 	f.c.SetRepointReady(func(context.Context) bool { return true })
 	f.moveCT("node-1", "old", tgID(1), "running", "", "")
 	f.moveCT("node-2", "old", tgID(1), "running", "", "tok-x")
-	f.relocationProof("p-x", "old", "node-2", "node-3", "tok-x", ProofCompleted, true)
+	f.relocationProof("p-x", "old", "node-3", "node-1", "tok-x", ProofCompleted, true)
 	_, _, err := MintFirewallID(context.Background(), f.c, mintGrant(t), TagMemberCT, "node-2", "old")
 	if !errors.Is(err, ErrFirewallIDMoveOpen) || !strings.Contains(err.Error(), "remove the stale container old on node-1, then retry") ||
 		strings.Contains(err.Error(), "not yet replicated") {

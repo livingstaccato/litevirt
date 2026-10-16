@@ -804,6 +804,40 @@ rendered against an empty set is named only once that has lasted a minute, so
 a rule that replicates just before its set, or a stack redeploy, raises
 nothing.
 
+## Firewall tags
+
+A workload's firewall tags are key/value pairs kept apart from its labels.
+Labels can be edited by any holder of `vm.update` and are copied by clone,
+restore and import, so a label (`fw.`-prefixed or not) never counts as a
+firewall tag; copy one over with `lv firewall tag set`.
+
+- `lv firewall tag set` and `lv firewall tag rm` need `sg.write` at `/`
+  (Admin or NetworkAdmin; Operator holds only `sg.read`), are refused until
+  the cluster upgrade has finished (`firewall_tag_groups`), and leave a
+  `firewall.tag.set` / `.rm` audit row with the tags before and after. A key
+  and a value are each `[a-z0-9][a-z0-9_.-]{0,62}`.
+- Tags belong to the workload's firewall identity (`fw_id`), which the first
+  `tag set` gives it on its host. The identity, and with it the tags, follows
+  the workload through a migrate, a relocation, a rebuild, a stack's rolling
+  update or recreate, and a same-name replica promotion. A clone, an import, a
+  template instance, and a restore under a new name or into a freed name are
+  new workloads with none.
+- A restore into a freed name, and a rebuild or recreate that fails after
+  tearing the VM down, print the tags the deleted incarnation left and the
+  `lv firewall tag set` command that sets them again.
+- `lv cutover` gives the name to the `-next` VM, which keeps its own tags.
+  The replaced VM's tags stay with it, and the cutover prints them with the
+  command that sets them on the VM now named so.
+- Deleting a workload clears its tags. A row whose identity no live workload
+  holds is cleared by the failover lease holder 24 hours after the last
+  record of that identity, so a move or re-create in flight keeps its tags.
+- A container created by a build before the container create spec existed
+  (its row has none) cannot be tagged until it is created again.
+- `lv inspect` (on stderr, beside the JSON) and `lv ct inspect` print a
+  `Firewall tags:` line: the tags, `none`, `none (no firewall identity yet)`,
+  or `none (a row for an earlier incarnation of this name exists, fw_id <id>,
+  not applied)`. The web UI's VM page shows them read-only.
+
 ## CLI
 
 The CLI lives at `lv sg …` and `lv firewall …`:
@@ -843,6 +877,12 @@ lv firewall nic-guard resume <vm>   # a VM held paused for its guards (see "Held
 # Observe or enforce the per-NIC rules (see "Observe and enforce")
 lv firewall enforce status
 
+# Per-workload firewall tags (see "Firewall tags")
+lv firewall tag set web-1 role=web env=prod
+lv firewall tag set cache-1 --container --host node-2 role=web
+lv firewall tag rm web-1 env
+lv firewall tag ls [web-1]
+
 # Inspect the live rulesets on this host (litevirt-fw and litevirt-nic) / force a reconcile now
 lv firewall show
 lv firewall reload
@@ -876,6 +916,7 @@ the row names the user the session belongs to.
 | `sg.rule.add` / `sg.rule.rm` | group id (add) / rule id (rm) | `lv sg rule-add/rule-rm`, UI |
 | `nic.guard.set` | VM name, or `ct:<host>/<name>` | `lv firewall nic-guard set` |
 | `firewall.enforcement` | `cluster` | `lv firewall enforce on/off` |
+| `firewall.tag.set` / `.rm` | VM name, or `<host>/<name>` for a container | `lv firewall tag set/rm` |
 
 The row's user is the authenticated caller. Its detail records the policy
 before and after the change, in the form `before=<state> after=<state>`:

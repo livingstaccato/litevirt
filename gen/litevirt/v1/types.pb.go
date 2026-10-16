@@ -3954,14 +3954,17 @@ func (x *FirewallTagMember) GetAddressNote() string {
 
 // FirewallTags is one workload's firewall tags.
 type FirewallTags struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Kind          string                 `protobuf:"bytes,1,opt,name=kind,proto3" json:"kind,omitempty"` // vm | container
-	Workload      string                 `protobuf:"bytes,2,opt,name=workload,proto3" json:"workload,omitempty"`
-	Host          string                 `protobuf:"bytes,3,opt,name=host,proto3" json:"host,omitempty"`
-	FwId          string                 `protobuf:"bytes,4,opt,name=fw_id,json=fwId,proto3" json:"fw_id,omitempty"` // the workload's firewall identity
-	Tags          map[string]string      `protobuf:"bytes,5,rep,name=tags,proto3" json:"tags,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	SetBy         string                 `protobuf:"bytes,6,opt,name=set_by,json=setBy,proto3" json:"set_by,omitempty"`
-	UpdatedAt     string                 `protobuf:"bytes,7,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Kind      string                 `protobuf:"bytes,1,opt,name=kind,proto3" json:"kind,omitempty"` // vm | container
+	Workload  string                 `protobuf:"bytes,2,opt,name=workload,proto3" json:"workload,omitempty"`
+	Host      string                 `protobuf:"bytes,3,opt,name=host,proto3" json:"host,omitempty"`
+	FwId      string                 `protobuf:"bytes,4,opt,name=fw_id,json=fwId,proto3" json:"fw_id,omitempty"` // the workload's firewall identity
+	Tags      map[string]string      `protobuf:"bytes,5,rep,name=tags,proto3" json:"tags,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	SetBy     string                 `protobuf:"bytes,6,opt,name=set_by,json=setBy,proto3" json:"set_by,omitempty"`
+	UpdatedAt string                 `protobuf:"bytes,7,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	// orphan: no live workload holds fw_id; the row an earlier incarnation of
+	// this name left, not applied (only listed when a workload is named).
+	Orphan        bool `protobuf:"varint,8,opt,name=orphan,proto3" json:"orphan,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4043,6 +4046,13 @@ func (x *FirewallTags) GetUpdatedAt() string {
 		return x.UpdatedAt
 	}
 	return ""
+}
+
+func (x *FirewallTags) GetOrphan() bool {
+	if x != nil {
+		return x.Orphan
+	}
+	return false
 }
 
 type PCIDevice struct {
@@ -7376,7 +7386,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\bworkload\x18\x02 \x01(\tR\bworkload\x12\x12\n" +
 	"\x04host\x18\x03 \x01(\tR\x04host\x12\x1c\n" +
 	"\taddresses\x18\x04 \x03(\tR\taddresses\x12!\n" +
-	"\faddress_note\x18\x05 \x01(\tR\vaddressNote\"\x8f\x02\n" +
+	"\faddress_note\x18\x05 \x01(\tR\vaddressNote\"\xa7\x02\n" +
 	"\fFirewallTags\x12\x12\n" +
 	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x1a\n" +
 	"\bworkload\x18\x02 \x01(\tR\bworkload\x12\x12\n" +
@@ -7385,7 +7395,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x04tags\x18\x05 \x03(\v2#.litevirt.v1.FirewallTags.TagsEntryR\x04tags\x12\x15\n" +
 	"\x06set_by\x18\x06 \x01(\tR\x05setBy\x12\x1d\n" +
 	"\n" +
-	"updated_at\x18\a \x01(\tR\tupdatedAt\x1a7\n" +
+	"updated_at\x18\a \x01(\tR\tupdatedAt\x12\x16\n" +
+	"\x06orphan\x18\b \x01(\bR\x06orphan\x1a7\n" +
 	"\tTagsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xbb\x04\n" +

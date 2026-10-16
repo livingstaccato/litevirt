@@ -196,6 +196,14 @@ func isRecreateDelete(ctx context.Context) bool {
 	return ok && !sink.reportOnly
 }
 
+// hasDeletedVMSink reports whether ctx carries a deleted-VM sink of either
+// kind: the delete is a rebuild's or a recreate's (rolling or inline), whose
+// VM is re-created with the same firewall identity, so its tags are kept.
+func hasDeletedVMSink(ctx context.Context) bool {
+	_, ok := ctx.Value(deletedVMSinkKey{}).(*deletedVMSink)
+	return ok
+}
+
 // deletedVMSinkKey carries a *deletedVMSink in a context.
 type deletedVMSinkKey struct{}
 
@@ -510,6 +518,11 @@ func (s *Server) recreateFailedAfterTeardown(ctx context.Context, op, name, wher
 	}
 	slog.Error(op+": the VM was torn down and its re-create failed",
 		"vm", name, "torn_down_on", where, "spec_kept_at", kept, "error", cause)
+	// Its firewall tags stay on the torn-down incarnation's row: a VM created
+	// again by hand is a new one (D2b review M-5).
+	if left := s.recreateFirewallTagsLeft(context.WithoutCancel(ctx), name); left != "" {
+		kept += " " + left
+	}
 	st := status.Convert(cause)
 	return status.Errorf(st.Code(), "%s %q: the VM was torn down on %s (its domain, disks and record are gone) and "+
 		"re-creating it failed: %s. %s", op, name, where, st.Message(), kept)

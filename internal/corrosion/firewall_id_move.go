@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/litevirt/litevirt/internal/hlc"
 )
@@ -355,7 +356,7 @@ func containerMoveOpen(ctx context.Context, c *Client, host, name, fwID string) 
 			default:
 				stale = "the stale one of container " + name + " on " + host + " and on " + o.host
 			}
-			if movesSettled(proofs, self.token, o.token) {
+			if movesSettled(proofs, []string{host, o.host}, self.token, o.token) {
 				return fmt.Sprintf("container %s on %s and on %s hold one firewall identity, and the moves recorded for "+
 					"their tokens have finished without binding the two: remove %s, then retry", name, host, o.host, stale), nil
 			}
@@ -367,10 +368,13 @@ func containerMoveOpen(ctx context.Context, c *Client, host, name, fwID string) 
 	return "", nil
 }
 
-// movesSettled reports whether every token carried has visible proofs and
-// all of them are completed or reaped: no record that could still bind the
-// pair is on its way.
-func movesSettled(proofs map[string][]relocationProof, tokens ...string) bool {
+// movesSettled reports whether every token carried has visible proofs, all
+// of them completed or reaped and each coordinated by one of holders (a
+// migrate between them): no record that could still bind the pair is on its
+// way. A proof a third host coordinated is a failover relocation, bound to
+// the pair only by its coordinator's marker, which may still be in flight
+// (D2b re-review 4, m4-1): it never counts as settled.
+func movesSettled(proofs map[string][]relocationProof, holders []string, tokens ...string) bool {
 	for _, tok := range tokens {
 		if tok == "" {
 			continue
@@ -380,6 +384,9 @@ func movesSettled(proofs map[string][]relocationProof, tokens ...string) bool {
 		}
 		for _, p := range proofs[tok] {
 			if p.status != ProofCompleted && !p.reaped {
+				return false
+			}
+			if !slices.Contains(holders, p.coordinator) {
 				return false
 			}
 		}

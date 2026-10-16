@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
+	"strings"
 )
 
 // FirmwareRuntime is the firmware code a live firmware move depends on: the
@@ -112,4 +114,60 @@ func sha256File(p string) (string, error) {
 		return "", fmt.Errorf("hash %s: %w", p, err)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// LiveFirmwareFloors are the lowest releases a host may run a live firmware
+// move with (spec §3.1, the lab 1 probe's versions). The OVMF fingerprint has
+// no floor: it is compared for equality only.
+var LiveFirmwareFloors = FirmwareRuntime{Libvirt: "10.0.0", QEMU: "8.2.2", Swtpm: "0.7.3", Libtpms: "0.9.3"}
+
+// FirmwareFloorsMet is nil when every version of rt is at least its floor in
+// LiveFirmwareFloors, compared numerically. Otherwise it names the first
+// component below its floor, or not X.Y.Z: an unreadable version never meets
+// a floor.
+func FirmwareFloorsMet(rt FirmwareRuntime) error {
+	for _, c := range []struct{ what, have, floor string }{
+		{"libvirt", rt.Libvirt, LiveFirmwareFloors.Libvirt},
+		{"qemu", rt.QEMU, LiveFirmwareFloors.QEMU},
+		{"swtpm", rt.Swtpm, LiveFirmwareFloors.Swtpm},
+		{"libtpms", rt.Libtpms, LiveFirmwareFloors.Libtpms},
+	} {
+		if !versionAtLeast(c.have, c.floor) {
+			return fmt.Errorf("%s %s is below the live firmware migration floor %s", c.what, c.have, c.floor)
+		}
+	}
+	return nil
+}
+
+// versionAtLeast compares two X.Y.Z releases numerically; anything that is not
+// X.Y.Z is false.
+func versionAtLeast(have, floor string) bool {
+	h, ok1 := parseXYZ(have)
+	f, ok2 := parseXYZ(floor)
+	if !ok1 || !ok2 {
+		return false
+	}
+	for i := range h {
+		if h[i] != f[i] {
+			return h[i] > f[i]
+		}
+	}
+	return true
+}
+
+var xyzRe = regexp.MustCompile(`^(` + xyz + `)$`)
+
+func parseXYZ(v string) ([3]int, bool) {
+	var out [3]int
+	if !xyzRe.MatchString(v) {
+		return out, false
+	}
+	for i, p := range strings.Split(v, ".") {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return out, false
+		}
+		out[i] = n
+	}
+	return out, true
 }

@@ -535,6 +535,10 @@ type Server struct {
 	fwRecordsMu         sync.Mutex
 	fwWipesRefused      []lv.RefusedWipe
 	fwWipesRefusedTotal int
+	// liveFW is what a live firmware move reads of this host: the
+	// migration.live_firmware setting, the live libvirt-guests check and its
+	// firmware code (migrate_firmware_live_eligibility.go).
+	liveFW liveFirmwareHost
 
 	// lbApplyOverride is a test seam for LB provisioning: when non-nil it
 	// replaces the real haproxy/keepalived Apply (unit tests have no root / no

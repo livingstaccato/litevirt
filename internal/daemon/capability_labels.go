@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -131,12 +129,6 @@ func reassertCapabilityLabels(ctx context.Context, db *corrosion.Client, host st
 	return set, nil
 }
 
-// fwLiveFloors are the installed versions a live firmware move needs (spec
-// §3.1): libvirt, QEMU, swtpm and libtpms.
-var fwLiveFloors = struct{ libvirt, qemu, swtpm, libtpms string }{
-	libvirt: "10.0.0", qemu: "8.2.2", swtpm: "0.7.3", libtpms: "0.9.3",
-}
-
 // fwLiveInputs are what litevirt.fw_live_migrate is computed from.
 type fwLiveInputs struct {
 	enabled    bool // migration.live_firmware
@@ -170,51 +162,14 @@ func fwLiveMigrateCheck(ctx context.Context, in fwLiveInputs) (libvirt.FirmwareR
 	if err != nil {
 		return libvirt.FirmwareRuntime{}, fmt.Errorf("installed firmware code: %w", err)
 	}
-	for _, c := range []struct{ name, have, floor string }{
-		{"libvirt", code.Runtime.Libvirt, fwLiveFloors.libvirt},
-		{"qemu", code.Runtime.QEMU, fwLiveFloors.qemu},
-		{"swtpm", code.Runtime.Swtpm, fwLiveFloors.swtpm},
-		{"libtpms", code.Runtime.Libtpms, fwLiveFloors.libtpms},
-	} {
-		if !versionAtLeast(c.have, c.floor) {
-			return libvirt.FirmwareRuntime{}, fmt.Errorf("%s %q is below the floor %s", c.name, c.have, c.floor)
-		}
+	// The installed-version floors (spec §3.1), shared with stage A.
+	if err := libvirt.FirmwareFloorsMet(code.Runtime); err != nil {
+		return libvirt.FirmwareRuntime{}, err
 	}
 	if err := in.guests(ctx); err != nil {
 		return libvirt.FirmwareRuntime{}, fmt.Errorf("libvirt-guests: %w", err)
 	}
 	return code.Runtime, nil
-}
-
-// versionAtLeast compares X.Y.Z numerically; anything else is false.
-func versionAtLeast(have, floor string) bool {
-	h, ok1 := parseXYZ(have)
-	f, ok2 := parseXYZ(floor)
-	if !ok1 || !ok2 {
-		return false
-	}
-	for i := range h {
-		if h[i] != f[i] {
-			return h[i] > f[i]
-		}
-	}
-	return true
-}
-
-func parseXYZ(v string) ([3]int, bool) {
-	var out [3]int
-	parts := strings.Split(v, ".")
-	if len(parts) != 3 {
-		return out, false
-	}
-	for i, p := range parts {
-		n, err := strconv.Atoi(p)
-		if err != nil || n < 0 {
-			return out, false
-		}
-		out[i] = n
-	}
-	return out, true
 }
 
 // fwLiveProbeTimeout bounds the whole label probe, and the libvirt version

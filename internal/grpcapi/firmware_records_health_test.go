@@ -132,3 +132,44 @@ func TestFirmwareRecordUnreadable_RefusedWipesBounded(t *testing.T) {
 		t.Fatalf("the newest wipe is not kept: last named %s", last)
 	}
 }
+
+// m-13 (D2-6 re-review 2): refusals past the store's own bound in one pass
+// are still counted in wipes_refused_total, though only the newest are named.
+//
+// Mutation: add only the taken wipes to the total — red.
+func TestFirmwareRecordUnreadable_RefusedWipesPastStoreBoundCounted(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	s := NewServerForTests(TestServerOpts{HostName: "h1", DataDir: dir, DB: db})
+	fwmig.Wire(fwNoVirt{}, s.fw())
+	bad := filepath.Join(dir, fwmig.InflightDir, "vm9.json")
+	if err := os.MkdirAll(filepath.Dir(bad), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bad, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const n = 150 // past the store's bound of 64 in a single pass
+	for i := 0; i < n; i++ {
+		s.fw().WipeFirmwareStateByUUID(fmt.Sprintf("aad2e0bb-3311-42a9-92f9-%012d", i))
+	}
+	s.judgeFirmwareMoveRecords(ctx)
+	row, found, err := corrosion.GetHealthCondition(ctx, s.db, firmwareMoveEvaluator, condFirmwareRecordUnreadable, "host", "h1")
+	if err != nil || !found {
+		t.Fatalf("no condition: %v", err)
+	}
+	var ev struct {
+		Wipes []lvRefusedWipe `json:"wipes_refused"`
+		Total int             `json:"wipes_refused_total"`
+	}
+	if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Total != n || len(ev.Wipes) != maxFirmwareWipesNamed {
+		t.Fatalf("total %d, %d named; want total %d, %d named", ev.Total, len(ev.Wipes), n, maxFirmwareWipesNamed)
+	}
+}

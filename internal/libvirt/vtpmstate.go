@@ -55,6 +55,9 @@ type FirmwareStore struct {
 	// silently did nothing would leak the state.
 	refusedMu sync.Mutex
 	refused   []RefusedWipe
+	// refusedDropped counts the refusals dropped past maxRefusedWipes since
+	// the last collection, so the report's total still counts them.
+	refusedDropped int
 }
 
 // RefusedWipe is a best-effort wipe the firmware move guard refused because a
@@ -69,13 +72,14 @@ type RefusedWipe struct {
 const maxRefusedWipes = 64
 
 // TakeRefusedWipes returns, and forgets, the wipes refused for an unreadable
-// record since the last call (the oldest dropped past maxRefusedWipes).
-func (f *FirmwareStore) TakeRefusedWipes() []RefusedWipe {
+// record since the last call: the newest maxRefusedWipes of them, and how
+// many older ones were dropped past that bound.
+func (f *FirmwareStore) TakeRefusedWipes() (wipes []RefusedWipe, dropped int) {
 	f.refusedMu.Lock()
 	defer f.refusedMu.Unlock()
-	out := f.refused
-	f.refused = nil
-	return out
+	wipes, dropped = f.refused, f.refusedDropped
+	f.refused, f.refusedDropped = nil, 0
+	return wipes, dropped
 }
 
 // SetFirmwareMoveGuard installs the firmware move guard every state write
@@ -470,6 +474,7 @@ func (f *FirmwareStore) wipeRefused(c FirmwareCall) bool {
 		f.refusedMu.Lock()
 		f.refused = append(f.refused, RefusedWipe{VM: c.Name, UUID: c.UUID, At: time.Now(), Err: err})
 		if n := len(f.refused); n > maxRefusedWipes {
+			f.refusedDropped += n - maxRefusedWipes
 			f.refused = append([]RefusedWipe(nil), f.refused[n-maxRefusedWipes:]...)
 		}
 		f.refusedMu.Unlock()

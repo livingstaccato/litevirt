@@ -28,7 +28,7 @@ func okInputs() fwLiveInputs {
 	}
 }
 
-// Mutation: lower any one floor in fwLiveFloors (or compare the versions as
+// Mutation: lower any one floor in libvirt.LiveFirmwareFloors (or compare the versions as
 // strings) and the matching row goes red.
 func TestFwLiveMigrateLabel_Floors(t *testing.T) {
 	if !fwLiveMigrateCapable(context.Background(), okInputs()) {

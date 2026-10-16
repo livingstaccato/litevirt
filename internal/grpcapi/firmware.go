@@ -26,14 +26,54 @@ import (
 // mismatch rather than defining a domain pointing at the source's paths (G1).
 func (s *Server) firmwareLayoutFingerprint() string {
 	fp := s.firmware
-	dataDir := s.dataDir
-	if s.firmwareLayoutDir != "" {
-		dataDir = s.firmwareLayoutDir
-	}
 	h := sha256.Sum256([]byte(strings.Join([]string{
-		dataDir, fp.Code, fp.Vars, fp.SecbootCode, fp.MsVars,
+		s.firmwareLayoutDataDir(), fp.Code, fp.Vars, fp.SecbootCode, fp.MsVars,
 	}, "\x00")))
 	return hex.EncodeToString(h[:])
+}
+
+// firmwareLayoutDataDir is the dataDir the firmware fingerprints name: the
+// server's, or the fleet's shared stand-in (SetFirmwareLayoutDirForTest).
+func (s *Server) firmwareLayoutDataDir() string {
+	if s.firmwareLayoutDir != "" {
+		return s.firmwareLayoutDir
+	}
+	return s.dataDir
+}
+
+// The two halves of a live firmware fingerprint, in the order they compare.
+const (
+	liveFWLayoutPrefix = "layout:"
+	liveFWOVMFPrefix   = "ovmf:"
+)
+
+// liveFirmwareFingerprint is the FirmwareRuntime.ovmf_fingerprint this host
+// sends for a live firmware move (spec §3.2 item 9): its firmware layout
+// fingerprint (dataDir and the OVMF paths, which the migrated domain XML names)
+// beside the OVMF content fingerprint (what those files hold). The source
+// compares the layout half first, so a host with other paths is named as a
+// layout difference rather than as another OVMF build. A configured OVMF file
+// that cannot be read is an error, never a fingerprint.
+func (s *Server) liveFirmwareFingerprint() (string, error) {
+	content, err := lv.OVMFContentFingerprint(s.firmware, s.firmwareLayoutDataDir())
+	if err != nil {
+		return "", err
+	}
+	return liveFWLayoutPrefix + s.firmwareLayoutFingerprint() + " " + liveFWOVMFPrefix + content, nil
+}
+
+// splitLiveFirmwareFingerprint is the inverse of liveFirmwareFingerprint; ok is
+// false for anything else (an empty field, an older format).
+func splitLiveFirmwareFingerprint(v string) (layout, ovmf string, ok bool) {
+	l, o, found := strings.Cut(v, " ")
+	if !found || !strings.HasPrefix(l, liveFWLayoutPrefix) || !strings.HasPrefix(o, liveFWOVMFPrefix) {
+		return "", "", false
+	}
+	layout, ovmf = strings.TrimPrefix(l, liveFWLayoutPrefix), strings.TrimPrefix(o, liveFWOVMFPrefix)
+	if layout == "" || ovmf == "" {
+		return "", "", false
+	}
+	return layout, ovmf, true
 }
 
 // SetFirmwareLayoutDirForTest makes the firmware layout fingerprint name dir

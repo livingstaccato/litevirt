@@ -40,7 +40,7 @@ func TestFwLiveHostCheck_Reasons(t *testing.T) {
 				v.Runtime.Libtpms = "0.9.2"
 				return v, nil
 			}
-		}, `libtpms "0.9.2" is below the floor 0.9.3`},
+		}, "libtpms 0.9.2 is below the live firmware migration floor 0.9.3"},
 		{"libvirt-guests", MigrationConfig{}, func(h *fwLiveHost) {
 			h.guests = func(context.Context) error { return errors.New("ON_SHUTDOWN=suspend") }
 		}, "libvirt-guests: ON_SHUTDOWN=suspend"},

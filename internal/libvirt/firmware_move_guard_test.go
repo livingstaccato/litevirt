@@ -770,17 +770,40 @@ func TestFirmwareStore_RefusedWipesForUnreadableRecord(t *testing.T) {
 	e := newFWEnv(t, fwState{err: fwUnreadable}, golibvirt.DomainShutoff)
 	e.store.WipeFirmwareState(fwTestVM, fwTestUUID)
 	e.store.WipeFirmwareStateByUUID(fwTestUUID)
-	got := e.store.TakeRefusedWipes()
-	if len(got) != 2 || got[0].VM != fwTestVM || got[1].UUID != fwTestUUID || !errors.Is(got[0].Err, ErrFirmwareMoveRecordUnreadable) {
+	got, dropped := e.store.TakeRefusedWipes()
+	if len(got) != 2 || dropped != 0 || got[0].VM != fwTestVM || got[1].UUID != fwTestUUID || !errors.Is(got[0].Err, ErrFirmwareMoveRecordUnreadable) {
 		t.Fatalf("refused wipes = %+v", got)
 	}
-	if again := e.store.TakeRefusedWipes(); len(again) != 0 {
+	if again, _ := e.store.TakeRefusedWipes(); len(again) != 0 {
 		t.Fatalf("taken twice: %+v", again)
 	}
 	e = newFWEnv(t, fwMarker("m", "migrating", true, false), golibvirt.DomainShutoff)
 	e.store.WipeFirmwareState(fwTestVM, fwTestUUID)
-	if got := e.store.TakeRefusedWipes(); len(got) != 0 {
+	if got, _ := e.store.TakeRefusedWipes(); len(got) != 0 {
 		t.Fatalf("a marker's refusal reported as a leak: %+v", got)
+	}
+}
+
+// Past maxRefusedWipes between two collections the store keeps the newest
+// and counts the ones it drops, so the report's total still counts every
+// refusal (D2-6 re-review 2, m-13).
+//
+// Mutation: do not count the dropped refusals; keep the count after a
+// collection — red.
+func TestFirmwareStore_RefusedWipesDroppedAreCounted(t *testing.T) {
+	e := newFWEnv(t, fwState{err: fwUnreadable}, golibvirt.DomainShutoff)
+	for i := 0; i < maxRefusedWipes+6; i++ {
+		e.store.WipeFirmwareStateByUUID(fmt.Sprintf("aad2e0bb-3311-42a9-92f9-%012d", i))
+	}
+	got, dropped := e.store.TakeRefusedWipes()
+	if len(got) != maxRefusedWipes || dropped != 6 {
+		t.Fatalf("took %d wipes, %d dropped; want %d and 6", len(got), dropped, maxRefusedWipes)
+	}
+	if got[len(got)-1].UUID != fmt.Sprintf("aad2e0bb-3311-42a9-92f9-%012d", maxRefusedWipes+5) {
+		t.Fatalf("the newest refusal was not kept: %+v", got[len(got)-1])
+	}
+	if again, d := e.store.TakeRefusedWipes(); len(again) != 0 || d != 0 {
+		t.Fatalf("a second collection took %d wipes, %d dropped", len(again), d)
 	}
 }
 

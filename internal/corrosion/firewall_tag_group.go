@@ -298,6 +298,9 @@ type TagGroupView struct {
 // TagWorkload names a live workload the membership read could not admit.
 type TagWorkload struct {
 	Kind, Name, Host, FWID string
+	// On is the host the workload runs on: a VM's host_name, a container's
+	// host.
+	On string
 	// Networks are the networks of its live NICs, sorted.
 	Networks []string
 }
@@ -322,6 +325,13 @@ type TagGroupMembership struct {
 	// groups. The renderer must hold every NIC of each listed workload at
 	// drop and raise a critical condition.
 	SharedFWID []TagWorkload
+	// IdentityLost are live workloads with no firewall identity whose name a
+	// non-empty, readable tags row of their kind still names while no live
+	// workload holds that row's identity (FWID is the row's): their
+	// membership was most likely lost on the way here, by a relocation that
+	// landed without its identity (D2b review M-7) or a restore into a freed
+	// name. For display only; nothing matches on the name for membership.
+	IdentityLost []TagWorkload
 }
 
 type tagWorkloadKey struct{ kind, host, name string }
@@ -329,6 +339,7 @@ type tagWorkloadKey struct{ kind, host, name string }
 type tagWorkload struct {
 	tagWorkloadKey
 	fwID string
+	on   string // the host it runs on
 	nics []tagNIC
 	// move is a container row's part in a move (containerMove): its state,
 	// state_detail and relocate_token.
@@ -340,6 +351,7 @@ type tagNIC struct{ network, mac string }
 type tagsRow struct {
 	tags       map[string]string
 	unreadable bool
+	name       string // the workload's name when the tags were set: display only
 }
 
 // ListTagGroupMembers resolves every group on this replica to its members.
@@ -466,7 +478,42 @@ func ListTagGroupMembers(ctx context.Context, c *Client) (*TagGroupMembership, e
 		}
 		out.Groups = append(out.Groups, v)
 	}
+	out.IdentityLost = identityLost(workloads, tags)
 	return out, nil
+}
+
+// identityLost lists each live workload with no identity whose name a
+// non-empty, readable tags row of its kind names while no live workload holds
+// that row's identity (TagGroupMembership.IdentityLost), FWID the row's.
+func identityLost(workloads []*tagWorkload, tags map[string]tagsRow) []TagWorkload {
+	held := map[string]bool{}
+	for _, w := range workloads {
+		if w.fwID != "" {
+			held[w.kind+"/"+w.fwID] = true
+		}
+	}
+	orphans := map[string][]string{} // kind/name -> the identities its rows name
+	for key, row := range tags {
+		if held[key] || row.unreadable || len(row.tags) == 0 || row.name == "" {
+			continue
+		}
+		kind, id, _ := strings.Cut(key, "/")
+		orphans[kind+"/"+row.name] = append(orphans[kind+"/"+row.name], id)
+	}
+	var out []TagWorkload
+	for _, w := range workloads {
+		if w.fwID != "" {
+			continue
+		}
+		ids := orphans[w.kind+"/"+w.name]
+		slices.Sort(ids)
+		for _, id := range ids {
+			lost := w.public()
+			lost.FWID = id
+			out = append(out, lost)
+		}
+	}
+	return out
 }
 
 // leaseElement parses a lease's address and checks it lies inside subnet. A
@@ -503,7 +550,7 @@ func (w *tagWorkload) networks() []string {
 }
 
 func (w *tagWorkload) public() TagWorkload {
-	return TagWorkload{Kind: w.kind, Name: w.name, Host: w.host, FWID: w.fwID, Networks: w.networks()}
+	return TagWorkload{Kind: w.kind, Name: w.name, Host: w.host, FWID: w.fwID, On: w.on, Networks: w.networks()}
 }
 
 // readFirewallTagsRows reads every firewall-tags row, keyed "<kind>/<fw_id>".
@@ -525,7 +572,7 @@ func readFirewallTagsRows(ctx context.Context, c *Client) (map[string]tagsRow, e
 		// One decoder for every reader (decodeFirewallTags): name and host
 		// are for display only and never matched.
 		rec := decodeFirewallTags(kind, id, r.String("value"), "", "")
-		out[kind+"/"+id] = tagsRow{tags: rec.Tags, unreadable: rec.Unreadable}
+		out[kind+"/"+id] = tagsRow{tags: rec.Tags, unreadable: rec.Unreadable, name: rec.Name}
 	}
 	return out, nil
 }
@@ -534,7 +581,7 @@ func readFirewallTagsRows(ctx context.Context, c *Client) (map[string]tagsRow, e
 // firewall identity ("" when it has none, or one that is not well formed)
 // and its live NICs.
 func readTagWorkloads(ctx context.Context, c *Client) ([]*tagWorkload, error) {
-	vms, err := c.Query(ctx, `SELECT name, spec FROM vms WHERE deleted_at IS NULL`)
+	vms, err := c.Query(ctx, `SELECT name, COALESCE(host_name, '') AS host_name, spec FROM vms WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
@@ -564,10 +611,12 @@ func readTagWorkloads(ctx context.Context, c *Client) ([]*tagWorkload, error) {
 		return w
 	}
 	for _, r := range vms {
-		add(tagWorkloadKey{kind: TagMemberVM, name: r.String("name")}, firewallIDOf(TagMemberVM, r.String("spec")))
+		w := add(tagWorkloadKey{kind: TagMemberVM, name: r.String("name")}, firewallIDOf(TagMemberVM, r.String("spec")))
+		w.on = r.String("host_name")
 	}
 	for _, r := range cts {
 		w := add(tagWorkloadKey{kind: TagMemberCT, host: r.String("host_name"), name: r.String("name")}, firewallIDOf(TagMemberCT, r.String("create_spec")))
+		w.on = w.host
 		w.move = containerMove{host: w.host, name: w.name, state: r.String("state"),
 			detail: r.String("state_detail"), token: r.String("relocate_token")}
 	}

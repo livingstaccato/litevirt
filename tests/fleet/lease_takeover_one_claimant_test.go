@@ -42,10 +42,14 @@ func leaseClaimFleet(t *testing.T, n int, seed int64, latch bool) (*Cluster, map
 	return c, gates
 }
 
-// latchLeaseTermClaims drives lease_term_claim_v1's latch on every node.
-func latchLeaseTermClaims(t *testing.T, c *Cluster, gates map[string]*health.Checker) {
+// latchLeaseTermClaims drives lease_term_claim_v1's latch on the given nodes,
+// every node when none are given.
+func latchLeaseTermClaims(t *testing.T, c *Cluster, gates map[string]*health.Checker, nodes ...*Node) {
 	t.Helper()
-	for _, n := range c.Nodes {
+	if len(nodes) == 0 {
+		nodes = c.Nodes
+	}
+	for _, n := range nodes {
 		node := n
 		eventually(t, 20*time.Second, "lease_term_claim_v1 latches on "+node.Name, func() bool {
 			g := gates[node.Name]
@@ -227,34 +231,79 @@ func TestFleet_LeaseTakeover_AlignedClaimantsYieldOneHolder(t *testing.T) {
 	}
 }
 
-// TestFleet_LeaseTakeover_NoMajorityNoHolder: the two survivors of three are
-// cut off from each other, so each reaches one voter of three — itself. Fail
-// closed: neither holds the lease, rather than both. Healed, they take it
-// over on the same tick and exactly one holds term 2.
+// TestFleet_LeaseTakeover_NoMajorityNoHolder: the two survivors of three can
+// read each other's ledgers — the quorum high-water read clears for both —
+// but their claim RPCs to each other are refused, so each reaches one voter
+// of three: itself. No majority, no term: neither holds the lease, rather than
+// both. A TTL into the stall the survivor raises ha.lease.claim_no_majority.
+// Healed, they take it over on the same tick, exactly one holds term 2, and
+// the decided claim resolves the condition.
 //
-// Mutation: skip claimLeaseTerm — the healed takeover yields two holders.
+// Mutation: skip claimLeaseTerm — the read alone clears, and both hold the
+// lease in the first half.
 func TestFleet_LeaseTakeover_NoMajorityNoHolder(t *testing.T) {
+	ctx := context.Background()
 	c, _ := leaseClaimFleet(t, 3, 43, true)
 	a, b, d := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	t0 := time.Now().UTC()
 	holdFirstTerm(t, c, a, t0)
 
 	c.Kill(a)
-	c.SetLinkFaultBoth(b, d, LinkFault{Block: true, BlockClaims: true})
+	c.SetLinkFaultBoth(b, d, LinkFault{BlockClaims: true})
 	takeover := t0.Add(catchUpTTL + catchUpPoll)
 	same := func(*Node) time.Time { return takeover }
 	if res := takeOver(t, []*Node{b, d}, same, nil); len(takeHolders(res)) != 0 {
 		t.Fatalf("a claimant without a majority of the voters holds the lease: %v", takeHolders(res))
 	}
 	for _, n := range []*Node{b, d} {
-		if newest, err := corrosion.CurrentLeaseTerm(context.Background(), n.DB, leaseTermKey); err != nil || newest != 1 {
+		if newest, err := corrosion.CurrentLeaseTerm(ctx, n.DB, leaseTermKey); err != nil || newest != 1 {
 			t.Fatalf("%s recorded term %d (err %v) without a majority", n.Name, newest, err)
 		}
 	}
+	noMajority := func(n *Node) bool {
+		row, found, err := corrosion.GetHealthCondition(ctx, n.DB, "lease_term_claim", "ha.lease.claim_no_majority",
+			"cluster", leaseTermKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return found && row.Lifecycle != corrosion.ConditionResolved
+	}
+	if held, term := acquireAt(t, b, takeover.Add(catchUpTTL+time.Second)); held {
+		t.Fatalf("%s took term %d without a majority", b.Name, term)
+	}
+	if !noMajority(b) {
+		t.Fatalf("%s raised no ha.lease.claim_no_majority a TTL into the stall", b.Name)
+	}
 
 	c.SetLinkFaultBoth(b, d, LinkFault{})
-	res := takeOver(t, []*Node{b, d}, func(*Node) time.Time { return takeover.Add(catchUpPoll) }, nil)
+	res := takeOver(t, []*Node{b, d}, func(*Node) time.Time { return takeover.Add(catchUpTTL + catchUpPoll) }, nil)
 	requireOneHolder(t, c, res, 2, b, d)
+	if noMajority(b) || noMajority(d) {
+		t.Fatal("ha.lease.claim_no_majority is still raised after a claim was decided")
+	}
+}
+
+// TestFleet_LeaseTakeover_ALatchHeldBackStillClaims: every node advertises the
+// token, but only some have latched it yet — each node forms its latch from
+// its own sweep, at its own moment (the end of every roll, every joiner, a
+// node that cannot reach one member). The node whose latch is held back takes
+// the lease over on the same tick as a latched one. It must claim too, or it
+// is the second holder the latched node's claim excludes.
+//
+// Mutation: claim only once latched (09116039's rule) — two holders.
+func TestFleet_LeaseTakeover_ALatchHeldBackStillClaims(t *testing.T) {
+	c, gates := leaseClaimFleet(t, 3, 61, false)
+	a, behind, d := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	latchLeaseTermClaims(t, c, gates, a, d)
+	if gates[behind.Name].DurablyLatched(capabilities.LeaseTermClaimV1) {
+		t.Fatalf("fixture: %s latched", behind.Name)
+	}
+	t0 := time.Now().UTC()
+	holdFirstTerm(t, c, a, t0)
+	c.Kill(a)
+	takeover := t0.Add(catchUpTTL + catchUpPoll)
+	res := takeOver(t, []*Node{behind, d}, func(*Node) time.Time { return takeover }, nil)
+	requireOneHolder(t, c, res, 2, behind, d)
 }
 
 // TestFleet_LeaseTakeover_AWinnerThatNeverRecordsItsTermIsWaitedOut: the
@@ -447,34 +496,39 @@ func TestFleet_LeaseTakeover_AlignedTickersRotateWithOneHolderPerTerm(t *testing
 	}
 }
 
-// TestFleet_LeaseTakeover_MixedVersionsKeepTheOldClearance: while one node
-// runs a build without lease-term claims (here: it does not advertise the
-// token), the token cannot latch, and nothing is claimed — that node would
-// not answer a lease-term claim, and asking it would stop every takeover for
-// the length of a rolling upgrade. Takeovers clear on the high-water read as
-// they always did. Once that node advertises the token too, the latch forms
-// and the next takeover is claimed.
+// TestFleet_LeaseTakeover_MixedVersionsKeepTheOldClearance: mid-roll, three
+// of four nodes run a build without lease-term claims (they refuse one as an
+// unknown claim type, record terms on the quorum read alone, and do not
+// advertise the token), so it cannot latch. The holder dies. The upgraded
+// survivor claims, a majority of the voters that answer refuse the claim
+// type, and it records the term from the read alone, as before: a roll does
+// not stop takeovers. Once every node runs the new build the token latches and
+// the next takeover is claimed.
 //
-// Mutation: claim before the latch (leaseTermClaimMode ignoring it) — the
-// voters hold a decision for term 2 and this goes red.
+// Mutation: never fall back to the read — the upgraded survivor holds nothing
+// and this goes red.
 func TestFleet_LeaseTakeover_MixedVersionsKeepTheOldClearance(t *testing.T) {
 	ctx := context.Background()
-	c, gates := leaseClaimFleet(t, 3, 59, false)
-	a, b, old := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	c, gates := leaseClaimFleet(t, 4, 59, false)
+	a, b, old1, old2 := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3]
+	olds := []*Node{a, old1, old2}
 
 	var upgraded atomic.Bool
+	for _, n := range olds {
+		n.Server.SetLeaseClaimsAsAnOlderBuildForTest(true)
+	}
 	for _, n := range c.Nodes {
 		node := n
 		gates[node.Name].SetPeerPinger(func(pctx context.Context, host string) ([]string, time.Time, error) {
 			caps, wall, err := node.Server.PeerCapabilities(pctx, host)
-			if host == old.Name && !upgraded.Load() {
+			if host != b.Name && !upgraded.Load() {
 				caps = withoutToken(caps, capabilities.LeaseTermClaimV1)
 			}
 			return caps, wall, err
 		})
 	}
 	if gates[a.Name].Enforced(ctx, capabilities.LeaseTermClaimV1) {
-		t.Fatalf("%s latched across %s, which does not advertise it", capabilities.LeaseTermClaimV1, old.Name)
+		t.Fatalf("%s latched across nodes that do not advertise it", capabilities.LeaseTermClaimV1)
 	}
 
 	t0 := time.Now().UTC()
@@ -482,27 +536,30 @@ func TestFleet_LeaseTakeover_MixedVersionsKeepTheOldClearance(t *testing.T) {
 	c.Kill(a)
 	takeover := t0.Add(catchUpTTL + catchUpPoll)
 	if held, term := acquireAt(t, b, takeover); !held || term != 2 {
-		t.Fatalf("%s: held=%v term=%d; a takeover must still work before the latch", b.Name, held, term)
+		t.Fatalf("%s: held=%v term=%d; a takeover must still work while older builds hold the voter majority", b.Name, held, term)
 	}
-	for _, n := range c.Nodes {
+	for _, n := range olds[1:] {
 		if _, found, err := n.DB.ClaimState(ctx, corrosion.LeaseTermClaimKey(leaseTermKey, 2)); err != nil || found {
-			t.Fatalf("%s holds lease-term claim state (found=%v, err %v) before the latch", n.Name, found, err)
+			t.Fatalf("%s, an older build, holds lease-term claim state (found=%v, err %v)", n.Name, found, err)
 		}
 	}
 
-	// a comes back and the last node upgrades: every node advertises the
+	// a comes back and the older nodes upgrade: every node advertises the
 	// token, and it latches.
 	c.ClearLinkFaults()
 	c.WaitConverged(t, convergeTimeout)
+	for _, n := range olds {
+		n.Server.SetLeaseClaimsAsAnOlderBuildForTest(false)
+	}
 	upgraded.Store(true)
 	latchLeaseTermClaims(t, c, gates)
-	// b's lease lapses; old takes it over, now under a claim.
+	// b's lease lapses; old1 takes it over, now under a claim.
 	later := takeover.Add(catchUpTTL + catchUpPoll)
-	if held, term := acquireAt(t, old, later); !held || term != 3 {
-		t.Fatalf("%s: held=%v term=%d after the latch, want term 3", old.Name, held, term)
+	if held, term := acquireAt(t, old1, later); !held || term != 3 {
+		t.Fatalf("%s: held=%v term=%d after the latch, want term 3", old1.Name, held, term)
 	}
-	st, found, err := old.DB.ClaimState(ctx, corrosion.LeaseTermClaimKey(leaseTermKey, 3))
-	if err != nil || !found || st.Value == nil || st.Value.LeaseTerm == nil || st.Value.LeaseTerm.Holder != old.Name {
+	st, found, err := old1.DB.ClaimState(ctx, corrosion.LeaseTermClaimKey(leaseTermKey, 3))
+	if err != nil || !found || st.Value == nil || st.Value.LeaseTerm == nil || st.Value.LeaseTerm.Holder != old1.Name {
 		t.Fatalf("term 3 was not claimed after the latch: %+v found=%v err=%v", st, found, err)
 	}
 }

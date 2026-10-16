@@ -3010,8 +3010,8 @@ message GetLeaseTermHighWaterResponse {
 // ── Recovery claims and the voter set (docs/design/recovery-claims.md) ──
 
 message RecoveryClaimKey {
-    string target_kind = 1;  // vm | container | voter_config
-    string target_name = 2;  // workload name; "" for voter_config
+    string target_kind = 1;  // vm | container | voter_config | lun | lease_term
+    string target_name = 2;  // workload, LUN or lease name; "" for voter_config
     int64  owner_epoch = 3;  // generation being left; config generation for voter_config
     int64  attempt     = 4;
     // incarnation is the workload row's created_at: which incarnation of the

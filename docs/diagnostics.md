@@ -1350,6 +1350,20 @@ evidence names each such member and the command that clears it:
 for one that should stay a host but stop voting, and `lv cluster voter rm`
 then `lv cluster voter add` for an abstaining one.
 
+### A lease with no claim majority (`ha.lease.claim_no_majority`)
+
+Evaluator `lease_term_claim`, subject `cluster/<lease key>`, severity warning.
+Raised by a node whose takeover of a lease has found no majority of the voter
+generation to decide its next term for longer than one of the lease's TTLs, so
+nobody holds the lease (docs/operating-model.md, "Two nodes taking a lease over
+at once record one term"). Resolved by the next claim for that lease that is
+decided. `litevirt_lease_term_claim_no_majority_total{lease}` counts each claim
+without a majority. The evidence names the refusing voters; `ha.voter.unavailable`
+names any voter that cannot vote. Repair an abstaining one with
+`lv cluster voter rm <host>` then `lv cluster voter add <host>`, or return to the
+derived voter set with `lv cluster voter reset`, which also ends recovery-claim
+protection.
+
 ### A forced voter reconfiguration (`ha.voter.forced`)
 
 Evaluator `voter_config`, subject `cluster/voters`, severity warning. Raised

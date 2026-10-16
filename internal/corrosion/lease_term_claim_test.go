@@ -14,17 +14,23 @@ func leaseTermValue(key string, term int64, holder string) ClaimValue {
 	return ClaimValue{LeaseTerm: &LeaseTermValue{Key: key, Term: term, Holder: holder}}
 }
 
-// A lease-term key names a real lease and a term of at least 1, never an
-// attempt or an incarnation. An unknown lease key is refused like everywhere
-// else: a voter would otherwise keep state for a ledger nobody reads.
+// A lease-term key names a lease-key-shaped name and a term of at least 1,
+// never an attempt or an incarnation. A well-shaped name this build does not
+// acquire is valid: a later build's voters claim terms of leases this one has
+// never heard of, and this build must still keep and carry them.
 //
-// Mutation: accept any lease_term key — the malformed keys go red.
+// Mutations: accept any lease_term key — the malformed keys go red; require
+// ValidLeaseKey — the later build's key goes red.
 func TestLeaseTermClaimKey_Validate(t *testing.T) {
-	if err := LeaseTermClaimKey(LeaseKeyFailover, 3).Validate(); err != nil {
-		t.Fatalf("a lease-term key: %v", err)
+	for _, name := range []string{LeaseKeyFailover, "future_detector"} {
+		if err := LeaseTermClaimKey(name, 3).Validate(); err != nil {
+			t.Fatalf("lease-term key for %q: %v", name, err)
+		}
 	}
 	for _, k := range []ClaimKey{
 		LeaseTermClaimKey("not-a-lease", 3),
+		LeaseTermClaimKey("", 3),
+		LeaseTermClaimKey("Failover", 3),
 		LeaseTermClaimKey(LeaseKeyFailover, 0),
 		{TargetKind: ClaimKindLeaseTerm, TargetName: LeaseKeyFailover, OwnerEpoch: 3, Attempt: 1},
 		{TargetKind: ClaimKindLeaseTerm, TargetName: LeaseKeyFailover, OwnerEpoch: 3, Incarnation: "i"},
@@ -238,5 +244,73 @@ func TestDecidedElsewhere_OnlyAnotherNodesCurrentTerm(t *testing.T) {
 	c.NoteLeaseTermDecided(LeaseKeyFailover, 2, "host-c", now)
 	if next, wait := c.decidedElsewhere(LeaseKeyFailover, "host-a", 3, now, time.Minute); !wait || next != 3 {
 		t.Errorf("an older decision replaced a newer one: next=%d wait=%v", next, wait)
+	}
+}
+
+// A voter-generation import that carries a lease-term decision for a lease
+// this build does not know — a later build's, mid-roll — succeeds and keeps
+// it. Failing the import would leave the generation sealed: no lease
+// takeover and no recovery until every voter ran the later build.
+//
+// Mutation: require ValidLeaseKey in Validate — the import fails.
+func TestImportClaimsAndAdopt_KeepsAnUnknownLeaseKey(t *testing.T) {
+	ctx := context.Background()
+	_, a, b, c := threeVoters(t)
+	k := LeaseTermClaimKey("future_detector", 9)
+	v := leaseTermValue("future_detector", 9, "a")
+	for _, x := range []*claimTestVoter{a, b} {
+		if res, err := x.c.ClaimAccept(ctx, k, testBallot(1, "a"), v, 1, x.signer, unreachable); err != nil || !res.Accepted {
+			t.Fatalf("%s accepting a later build's lease key: %+v %v", x.name, res, err)
+		}
+	}
+	var states []ClaimVoterState
+	for _, x := range []*claimTestVoter{a, b} {
+		src, err := x.c.ClaimStatesForImport(ctx, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		states = append(states, src.States...)
+	}
+	next := VoterConfigValue{Generation: 2, Members: membersOf(b, c), Change: VoterChangeRm("a"), CreatedBy: "b", CreatedAt: "t"}
+	if err := WriteVoterConfig(ctx, c.c, next, ClaimCertificate{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.c.ImportClaimsAndAdopt(ctx, 2, []string{"a", "b"}, states); err != nil {
+		t.Fatalf("an import carrying an unknown lease key failed: %v", err)
+	}
+	st, found, err := c.c.ClaimState(ctx, k)
+	if err != nil || !found || st.Value == nil || st.Value.LeaseTerm == nil || st.Value.LeaseTerm.Holder != "a" {
+		t.Fatalf("the decision was not carried: %+v found=%v err=%v", st, found, err)
+	}
+}
+
+// A voter keeps lease-term claim state only for terms within
+// leaseTermClaimRetention of the newest term its own ledger has recorded, so
+// the table does not grow a row per takeover forever; a decided term above
+// that, recorded or not, is kept.
+//
+// Mutation: drop pruneLeaseTermClaimsTx's call — the old row survives.
+func TestClaimVoter_PrunesLeaseTermsWellBelowTheLedger(t *testing.T) {
+	ctx := context.Background()
+	_, a, _, _ := threeVoters(t)
+	accept := func(term int64) {
+		t.Helper()
+		k := LeaseTermClaimKey(LeaseKeyFailover, term)
+		if res, err := a.c.ClaimAccept(ctx, k, testBallot(1, "b"), leaseTermValue(LeaseKeyFailover, term, "b"), 1, a.signer, unreachable); err != nil || !res.Accepted {
+			t.Fatalf("accept term %d: %+v %v", term, res, err)
+		}
+	}
+	accept(2)
+	putLeaseTerm(t, a.c, LeaseKeyFailover, 20, "b", "2026-09-08T12:00:00Z", a.c.NowTS())
+	accept(21)
+	if _, found, _ := a.c.ClaimState(ctx, LeaseTermClaimKey(LeaseKeyFailover, 2)); found {
+		t.Error("term 2's claim state survived a recorded term 20")
+	}
+	if _, found, _ := a.c.ClaimState(ctx, LeaseTermClaimKey(LeaseKeyFailover, 21)); !found {
+		t.Error("the current term's claim state was pruned")
+	}
+	accept(13) // within the retention margin of the recorded term 20
+	if _, found, _ := a.c.ClaimState(ctx, LeaseTermClaimKey(LeaseKeyFailover, 13)); !found {
+		t.Error("a term within the retention margin was pruned")
 	}
 }

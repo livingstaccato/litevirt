@@ -147,6 +147,26 @@ func NewProposer(self string, t Transport) *Proposer {
 		bound: map[corrosion.ClaimKey]map[uint64]string{}}
 }
 
+// ForgetBelow drops this process's ballot bookkeeping for keys of kind and
+// name whose owner epoch is below epoch: decisions it will never propose at
+// again (a lease's past terms). Without it the bookkeeping grows by one key
+// per decision for the life of the process.
+func (p *Proposer) ForgetBelow(kind, name string, epoch int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for k := range p.used {
+		if k.TargetKind == kind && k.TargetName == name && k.OwnerEpoch < epoch {
+			delete(p.used, k)
+			delete(p.bound, k)
+		}
+	}
+	for k := range p.bound {
+		if k.TargetKind == kind && k.TargetName == name && k.OwnerEpoch < epoch {
+			delete(p.bound, k)
+		}
+	}
+}
+
 // Nonce is this process's boot nonce.
 func (p *Proposer) Nonce() []byte { return append([]byte(nil), p.nonce...) }
 

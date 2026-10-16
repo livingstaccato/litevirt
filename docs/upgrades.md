@@ -1687,23 +1687,29 @@ token has latched and any host does not enforce it, and names the host.
 
 ### Lease-term claims latch after the roll
 
-Once the mandatory, replication-gated `lease_term_claim_v1` token has latched,
-a new leader-lease term is recorded only after a majority of the adopted voter
-generation has decided it for the node recording it. Before that, two nodes
-that took a lease over at the same moment could both record the next term
-and both act as its holder. See [Operating model](operating-model.md) → "Two
-nodes taking a lease over at once record one term". There is no schema change:
-voters keep these decisions in `local_recovery_claims`.
+A node with an adopted voter generation that has members records a new
+leader-lease term only after a majority of that generation has decided it for
+the node. Before that, two nodes that took a lease over at the same moment
+could both record the next term and both act as its holder. See
+[Operating model](operating-model.md) → "Two nodes taking a lease over at once
+record one term". There is no schema change: voters keep these decisions in
+`local_recovery_claims`.
 
-During the roll nothing changes. A host on the previous build does not
-advertise the token, and it records terms without claiming them, so the token
-cannot latch while any host the cluster replicates to runs that build, one
-parked in `maintenance` included. The claim is used only once the token has
-latched **and** a voter generation with members is adopted. Without one, terms
-are recorded as before.
+During the roll, a host on the previous build refuses a lease-term claim as an
+unknown claim type and records terms without claiming them. An upgraded host
+claims anyway, and records a term from the quorum read alone only when a
+majority of the voters that answer give that refusal. Once the mandatory,
+replication-gated `lease_term_claim_v1` token has latched on a host, it always
+claims. The token cannot latch while any host the cluster replicates to runs
+the previous build, one parked in `maintenance` included.
 
-There is no flag. `lv cluster voter reset` returns every host to recording
-terms from the quorum read alone, together. A binary rolled back below the
+A takeover now needs a majority of voters that can vote, not only a majority
+that answers a read. `ha.lease.claim_no_majority` and
+`litevirt_lease_term_claim_no_majority_total` show a lease that cannot get one.
+There is no flag. Repair an abstaining voter with `lv cluster voter rm <host>`
+then `lv cluster voter add <host>`; `lv cluster voter reset` returns hosts, as
+each adopts the reset generation, to recording terms from the quorum read
+alone, and also ends recovery-claim protection. A binary rolled back below the
 token after it has latched enters WAL quarantine, as below every latched token.
 
 ## Schema upgrades: `litevirt schema-migrate`

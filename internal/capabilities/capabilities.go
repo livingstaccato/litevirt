@@ -367,9 +367,10 @@ const (
 	// (claims.Spec.AdoptLegacy, grpcapi Server.legacyValueExcluded).
 	ClaimIncarnationV1 = "claim_incarnation_v1"
 
-	// LeaseTermClaimV1 gates SINGLE-CLAIMANT lease terms: once latched, a node
-	// records a new leader-lease term (internal/corrosion leader_lease.go) only
-	// after a majority of the adopted voter generation has decided, by a
+	// LeaseTermClaimV1 concerns SINGLE-CLAIMANT lease terms: a node with an
+	// adopted member voter generation records a new leader-lease term
+	// (internal/corrosion leader_lease.go) only after a majority of that
+	// generation has decided, by a
 	// recovery-claim style single-decree claim at key (lease_term, <lease key>,
 	// <term>, 0), that the term is its own. Two nodes that take a dead holder's
 	// lease over in the same instant both read the same high-water term and,
@@ -378,7 +379,11 @@ const (
 	// `lv cluster acknowledge-lease-term` cleared. A voter promises a term's
 	// key to one ballot at a time and accepts one value, so at most one
 	// claimant gets a majority; the loser learns the winner and records
-	// nothing. Before it latches, a term is recorded as it always was.
+	// nothing. The claim does not wait for this node's latch, which forms at
+	// a different moment on each node. Before the latch, and only then, a
+	// claim refused by a majority of the answering voters as an unknown claim
+	// type (older builds) falls back to the quorum read alone; once latched it
+	// never does (grpcapi lease_term_claim.go).
 	//
 	// It states a fact about the BINARY, which is why it is mandatory and has
 	// no config flag: this build answers lease-term claims as a voter and
@@ -1060,10 +1065,13 @@ const ReleaseToken = Release202611V1
 //
 //   - lease_term_claim_v1 has no flag either: every claimant relies on every
 //     other claiming the terms it records. It is inert without an adopted
-//     member voter generation, so `lv cluster voter reset` returns every node
-//     to recording terms from the quorum high-water read alone, together.
-//     While it is in force a takeover needs a majority of the voters, which
-//     the quorum high-water read already did. A binary rolled back below it
+//     member voter generation, so `lv cluster voter reset` returns each node,
+//     as it adopts the reset generation, to recording terms from the quorum
+//     high-water read alone. While it is in force a takeover needs a majority
+//     of voters that can VOTE — durable, holding their signing key, at their
+//     admitted incarnation, not sealed — which is more than the read needed;
+//     an abstaining voter is repaired with `lv cluster voter rm` then
+//     `lv cluster voter add`. A binary rolled back below it
 //     enters WAL quarantine, as below every latched token; the lease-term
 //     claim rows its voters keep are node-local and left unread.
 //

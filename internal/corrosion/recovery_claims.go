@@ -57,6 +57,20 @@ func LUNClaimKey(lun string, gen int64) ClaimKey {
 // generation like a workload key, and carried across a generation change.
 const ClaimKindLeaseTerm = "lease_term"
 
+// leaseKeyShaped reports whether name could be a lease key, of this build or a
+// later one: 1–64 characters of a-z, 0-9 and '_'.
+func leaseKeyShaped(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	for _, r := range name {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
+			return false
+		}
+	}
+	return true
+}
+
 // LeaseTermClaimKey is the key of term of the lease named key.
 func LeaseTermClaimKey(key string, term int64) ClaimKey {
 	return ClaimKey{TargetKind: ClaimKindLeaseTerm, TargetName: key, OwnerEpoch: term}
@@ -142,7 +156,12 @@ func (k ClaimKey) Validate() error {
 			return fmt.Errorf("a LUN key is (lun, <LUN>, generation, 0) with no incarnation, got %+v", k)
 		}
 	case k.IsLeaseTerm():
-		if !ValidLeaseKey(k.TargetName) || k.OwnerEpoch < 1 || k.Attempt != 0 || k.Incarnation != "" {
+		// The SHAPE of a lease key only, not ValidLeaseKey: a later build adds
+		// lease keys, and a voter or an importer on this build must keep a
+		// decision for one it does not know — refusing it here failed a whole
+		// voter-generation import mid-roll. The proposer (grpcapi
+		// claimLeaseTerm) claims only keys this build acquires.
+		if !leaseKeyShaped(k.TargetName) || k.OwnerEpoch < 1 || k.Attempt != 0 || k.Incarnation != "" {
 			return fmt.Errorf("a lease_term key is (lease_term, <lease key>, term >= 1, 0) with no incarnation, got %+v", k)
 		}
 	case k.IsVoterConfig():

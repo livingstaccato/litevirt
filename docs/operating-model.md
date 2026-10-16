@@ -934,37 +934,57 @@ line up both read the same high water, both clear, and both record the next
 term. Each then acts as the lease's holder, and the two rows are a contested
 term (below).
 
-Once the mandatory, replication-gated `lease_term_claim_v1` token has latched,
-a node records a new term only after a majority of the adopted voter
-generation has decided that term for it, through the same claim RPCs a
-recovery uses, under the key `lease_term/<lease key>@<term>#0`. A voter keeps one
-promise and one accepted holder per key, durably, so only one claimant can get
-a majority for a term. The other learns which node holds it and records
-nothing. It then treats the term as that node's lease for one TTL, counted from
-the moment it learned of it. A live winner's rows reach it well inside that
-TTL. If the winner died before it recorded the term, the node takes the lease
-over at the next term after the TTL.
+Once a node has adopted a voter generation with members, it records a new
+term only after a majority of that generation has decided that term for it,
+through the same claim RPCs a recovery uses, under the key
+`lease_term/<lease key>@<term>#0`. A voter keeps one promise and one accepted
+holder per key, durably, so only one claimant can get a majority for a term.
+The other learns which node holds it and records nothing. It then treats the
+term as that node's lease for one TTL, counted from when it learned the
+decision. A live winner's rows reach it well inside that TTL. If the winner
+died before it recorded the term, the node takes the lease over at the next
+term after the TTL.
 
-- **No majority, no term.** A takeover that cannot reach a majority of the
-  voters records nothing, and the node retries on its next poll. The quorum read
-  already needed a majority, so this costs no availability the read did not
-  already cost. A holder renewing its own term asks nothing.
+- **No majority, no term.** A takeover records nothing unless a majority of
+  the voters can *vote*: answer, keep the promise durably
+  (`synchronous=FULL`), sign with their host key, run at the incarnation they
+  were admitted with, and not be sealed by an unfinished voter change. That is
+  more than the quorum read needs, which is any majority answering a read. The
+  node retries on its next poll; a voter that does not answer is never a
+  reason to record the term without a decision. A holder renewing its own term
+  asks nothing.
 - **Clocks play no part.** The decision orders claimants by ballot round and,
   at an equal round, by name (the lowest-sorting one wins), so clock skew
   cannot make two holders.
-- **Before the latch, and without an explicit voter set, nothing is claimed.**
-  During a rolling upgrade, a host on the previous build answers no lease-term
-  claim, so terms are recorded from the quorum read alone, as before. With no
-  adopted voter generation that has members (genesis pending, or after
-  `lv cluster voter reset`), there is no fixed majority to decide with, and every
-  node records terms as before, together. A node whose replica holds a voter
-  generation with members that it has not adopted yet records nothing until
-  it has.
+- **During a rolling upgrade.** A node claims whether or not its own
+  `lease_term_claim_v1` latch has formed yet, because each node forms the
+  latch at its own moment. While the token is not latched on that node, and a
+  majority of the voters that answer refuse the claim as an unknown claim type
+  (hosts on the previous build), it records the term from the quorum read
+  alone, as before. Once the mandatory, replication-gated token has latched it
+  never does: every host then answers lease-term claims.
+- **Without an explicit voter set, nothing is claimed.** With no adopted voter
+  generation that has members (genesis pending, or after
+  `lv cluster voter reset`), there is no fixed majority to decide with, and a
+  node records terms from the quorum read alone. After a reset, nodes adopt
+  the reset generation at different moments, so for that window some still
+  claim and some do not. A node whose replica holds a voter generation with
+  members that it has not adopted yet records nothing until it has.
 
-While a term is withheld this way, the `leader lease: not claiming a new term
-yet` log line gives the reason: `term N was decided for <host>`, `no majority
-of voter generation G decided term N`, or that the node has not adopted a
-generation yet.
+While a lease has had no claim majority for longer than one of its TTLs, the
+`ha.lease.claim_no_majority` condition is raised for it (evaluator
+`lease_term_claim`, subject the lease key) and it is resolved by the next
+claim that is decided. `litevirt_lease_term_claim_no_majority_total{lease}`
+counts every claim without a majority. To stand down when the read reaches a
+majority but the claim cannot: `lv cluster voter ls` shows the voters and
+`ha.voter.unavailable` names any that cannot vote. Repair an abstaining voter
+with `lv cluster voter rm <host>` then `lv cluster voter add <host>`, or return
+the cluster to the derived voter set with `lv cluster voter reset`, which also
+ends recovery-claim protection.
+
+The `leader lease: not claiming a new term yet` log line gives each reason:
+`term N was decided for <host>`, `no majority of voter generation G decided
+term N`, or that the node has not adopted a generation yet.
 
 #### A contested lease still converges
 

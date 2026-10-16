@@ -617,6 +617,11 @@ func (c *Client) ClaimAccept(ctx context.Context, key ClaimKey, b Ballot, v Clai
 			if err := saveClaimRowTx(ctx, tx, row); err != nil {
 				return err
 			}
+			if key.IsLeaseTerm() {
+				if err := pruneLeaseTermClaimsTx(ctx, tx, key.TargetName); err != nil {
+					return err
+				}
+			}
 			res.Accepted, res.PromisedBallot, res.Accept = true, b, &a
 			return nil
 		})
@@ -889,4 +894,32 @@ func (c *Client) ImportClaimsAndAdopt(ctx context.Context, newGen int64, from []
 		return recordAdoptionTx(ctx, tx, newGen, from)
 	})
 	return imported, err
+}
+
+// leaseTermClaimRetention is how many terms below this voter's own newest
+// recorded term of a lease it keeps lease-term claim state for.
+const leaseTermClaimRetention = 8
+
+// pruneLeaseTermClaimsTx drops this voter's lease-term claim state for terms
+// of lease well below the newest term its own ledger has recorded, so the
+// table does not grow by a row per takeover forever.
+//
+// Only below a RECORDED term, and with a margin: a claimant asks about a term
+// only after the quorum high-water read showed every term up to it free, and
+// a term this many below one already recorded and replicated is not one any
+// claimant can get past that read for. Within the margin, and for terms that
+// were decided but never recorded, the state is kept.
+func pruneLeaseTermClaimsTx(ctx context.Context, tx *LocalTx, lease string) error {
+	rows, err := tx.Query(ctx, `SELECT COALESCE(MAX(term), 0) AS t FROM leader_lease_terms
+		WHERE key = ? AND deleted_at IS NULL`, lease)
+	if err != nil || len(rows) == 0 {
+		return err
+	}
+	below := rows[0].Int64("t") - leaseTermClaimRetention
+	if below <= 1 {
+		return nil
+	}
+	_, err = tx.Exec(ctx, `DELETE FROM local_recovery_claims
+		WHERE target_kind = ? AND target_name = ? AND owner_epoch < ?`, ClaimKindLeaseTerm, lease, below)
+	return err
 }

@@ -37,17 +37,17 @@ import (
 //     extra round trip. A peer on an older build reports no row, which is no
 //     evidence: against such a peer the takeover is judged on the term alone,
 //     as before.
-//   - once lease_term_claim_v1 has latched, and this node has adopted a voter
-//     generation with members: cleared only when a majority of that
-//     generation decides the term for this node (lease_term_claim.go). The
-//     read above shows that nobody has recorded the term; only the decision
-//     shows that nobody else is about to.
+//   - once this node has adopted a voter generation with members: cleared
+//     only when a majority of that generation decides the term for this node
+//     (lease_term_claim.go). The read above shows that nobody has recorded
+//     the term; only the decision shows that nobody else is about to.
 //
 // A refusal may be served from the barrier's cached threshold, and an accept
 // may not, for the barrier's own reason: the high water only rises, so a cached
 // value is a lower bound — enough to refuse on, never enough to accept on.
 func (s *Server) LeaseMintClearance(ctx context.Context, req corrosion.LeaseMintRequest) (bool, string) {
 	key, next := req.Key, req.Term
+	started := time.Now()
 	alone, err := s.clusterOfOne(ctx)
 	if err != nil {
 		return false, "hosts table unreadable: " + err.Error()
@@ -96,7 +96,7 @@ func (s *Server) LeaseMintClearance(ctx context.Context, req corrosion.LeaseMint
 		}
 	}
 	if mode == leaseClaimOn {
-		return s.claimLeaseTerm(ctx, cfg, req)
+		return s.claimLeaseTerm(ctx, cfg, req, started)
 	}
 	return true, ""
 }

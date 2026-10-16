@@ -1003,6 +1003,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.mintClearance.Store(svc)
 	svc.SetGateRefusedObserver(gateMetrics.Refused)
 	svc.SetLeaseBarrierIncompleteObserver(gateMetrics.LeaseBarrierIncomplete)
+	svc.SetLeaseClaimNoMajorityObserver(gateMetrics.LeaseTermClaimNoMajority)
 	svc.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	// SR-IOV VF-pool policy: which PFs litevirt may adopt for VF creation, the pool
 	// cap, and the degraded gauge. Validate the allowlist against live hardware now,

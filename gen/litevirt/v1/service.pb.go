@@ -27697,8 +27697,8 @@ func (x *GetLeaseTermHighWaterResponse) GetLeaseExpiresAt() string {
 
 type RecoveryClaimKey struct {
 	state      protoimpl.MessageState `protogen:"open.v1"`
-	TargetKind string                 `protobuf:"bytes,1,opt,name=target_kind,json=targetKind,proto3" json:"target_kind,omitempty"`  // vm | container | voter_config
-	TargetName string                 `protobuf:"bytes,2,opt,name=target_name,json=targetName,proto3" json:"target_name,omitempty"`  // workload name; "" for voter_config
+	TargetKind string                 `protobuf:"bytes,1,opt,name=target_kind,json=targetKind,proto3" json:"target_kind,omitempty"`  // vm | container | voter_config | lun | lease_term
+	TargetName string                 `protobuf:"bytes,2,opt,name=target_name,json=targetName,proto3" json:"target_name,omitempty"`  // workload, LUN or lease name; "" for voter_config
 	OwnerEpoch int64                  `protobuf:"varint,3,opt,name=owner_epoch,json=ownerEpoch,proto3" json:"owner_epoch,omitempty"` // generation being left; config generation for voter_config
 	Attempt    int64                  `protobuf:"varint,4,opt,name=attempt,proto3" json:"attempt,omitempty"`
 	// incarnation is the workload row's created_at: which incarnation of the

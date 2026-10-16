@@ -57,20 +57,106 @@ func TestLeaseMintClearance_ClaimsTheTermOnceLatched(t *testing.T) {
 	}
 }
 
-// Before the latch, nothing is claimed: a node of an older build answers no
-// lease-term claim, so asking would only stop takeovers for the length of a
-// rolling upgrade. The high-water read clears, as it always did.
+// The claim does not wait for this node's own latch: each node latches at its
+// own moment, and a node minting unclaimed while its peers claim is the
+// second holder they exclude.
 //
-// Mutation: claim whatever the latch says — the voter holds a decision and
-// this goes red.
-func TestLeaseMintClearance_ClaimsNothingBeforeTheLatch(t *testing.T) {
+// Mutation: claim only once latched (the 09116039 rule) — the voter holds no
+// decision and this goes red.
+func TestLeaseMintClearance_ClaimsBeforeItsOwnLatch(t *testing.T) {
 	ctx := context.Background()
 	s := leaseClaimNode(t, false)
 	if ok, why := s.LeaseMintClearance(ctx, leaseClaimReq(s, 1)); !ok {
-		t.Fatalf("an unlatched mint was refused: %q", why)
+		t.Fatalf("an uncontested unlatched claim was refused: %q", why)
 	}
-	if _, found, _ := s.db.ClaimState(ctx, corrosion.LeaseTermClaimKey(corrosion.LeaseKeyFailover, 1)); found {
-		t.Fatal("a lease-term claim was made before lease_term_claim_v1 latched")
+	if _, found, _ := s.db.ClaimState(ctx, corrosion.LeaseTermClaimKey(corrosion.LeaseKeyFailover, 1)); !found {
+		t.Fatal("no lease-term claim was made before this node's lease_term_claim_v1 latch formed")
+	}
+}
+
+// The one fallback: before the latch, a majority of the voters that answered
+// refuse the claim as an unknown claim type — older builds, which record
+// terms unclaimed anyway. After the latch, never.
+//
+// Mutations: never fall back — the unlatched case goes red; fall back
+// whatever the latch — the latched case goes red.
+func TestLeaseMintClearance_FallsBackToTheReadOnlyOnOlderBuildsBeforeTheLatch(t *testing.T) {
+	ctx := context.Background()
+	for _, latched := range []bool{false, true} {
+		s := leaseClaimNode(t, latched)
+		// The only voter answers like a build without lease-term claims; it
+		// still clears the read and records the term as an older build would.
+		s.leaseClaimsAsOlderBuild.Store(true)
+		key := corrosion.LeaseTermClaimKey(corrosion.LeaseKeyFailover, 1)
+		cfg, err := corrosion.AdoptedVoterConfig(ctx, s.db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ok, why := s.claimLeaseTerm(ctx, cfg, leaseClaimReq(s, 1), time.Now())
+		if ok != !latched {
+			t.Fatalf("latched=%v: cleared=%v (%q); want the read-only fallback only before the latch", latched, ok, why)
+		}
+		if _, found, _ := s.db.ClaimState(ctx, key); found {
+			t.Fatalf("latched=%v: the older-build voter recorded lease-term state", latched)
+		}
+	}
+}
+
+// A voter that does not answer is never read as an older build: with half
+// the generation unreachable, no majority decides and nothing is recorded.
+// The claim is counted, and once a TTL has passed without a majority the
+// lease's ha.lease.claim_no_majority condition is raised; a decided claim
+// resolves it.
+//
+// Mutations: fall back on an unreachable voter — this clears and goes red;
+// never raise the condition — red; never resolve it — red.
+func TestLeaseMintClearance_AnUnreachableVoterIsNoMajorityNotAFallback(t *testing.T) {
+	ctx := context.Background()
+	s := leaseClaimNode(t, false)
+	inc, err := s.db.VoterIncarnation(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Generation 2: this node and node-x, which nobody can reach.
+	val := corrosion.VoterConfigValue{Generation: 2, Members: corrosion.SortMembers([]corrosion.VoterMember{
+		{Name: s.hostName, Incarnation: inc}, {Name: "node-x", Incarnation: "x"}}),
+		Change: corrosion.VoterChangeAdd("node-x"), CreatedBy: "test", CreatedAt: "test"}
+	if err := corrosion.WriteVoterConfig(ctx, s.db, val, corrosion.ClaimCertificate{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.RecordVoterAdoption(ctx, s.db, 2); err != nil {
+		t.Fatal(err)
+	}
+	var counted []string
+	s.SetLeaseClaimNoMajorityObserver(func(lease string) { counted = append(counted, lease) })
+	req := leaseClaimReq(s, 1)
+	req.TTL = 30 * time.Second
+	if ok, why := s.LeaseMintClearance(ctx, req); ok || !strings.Contains(why, "no majority") {
+		t.Fatalf("cleared=%v (%q) with one of two voters reachable; want no majority, no term", ok, why)
+	}
+	cond := func() (corrosion.HealthCondition, bool) {
+		row, found, err := corrosion.GetHealthCondition(ctx, s.db, leaseClaimEvaluator, condLeaseClaimNoMajority,
+			"cluster", corrosion.LeaseKeyFailover)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return row, found && row.Lifecycle != corrosion.ConditionResolved
+	}
+	if _, raised := cond(); raised {
+		t.Fatal("the condition was raised on the first claim without a majority, before a TTL had passed")
+	}
+	at, _ := time.Parse(time.RFC3339, clearanceNow)
+	req.Now = at.Add(req.TTL + time.Second).Format(time.RFC3339)
+	s.LeaseMintClearance(ctx, req)
+	if row, raised := cond(); !raised || !strings.Contains(row.Evidence, "lv cluster voter") {
+		t.Fatalf("no %s raised a TTL into the stall (row %+v)", condLeaseClaimNoMajority, row)
+	}
+	if len(counted) != 2 || counted[0] != corrosion.LeaseKeyFailover {
+		t.Fatalf("no-majority claims counted %v, want two for %s", counted, corrosion.LeaseKeyFailover)
+	}
+	s.noteLeaseClaimDecided(ctx, corrosion.LeaseKeyFailover)
+	if _, raised := cond(); raised {
+		t.Fatal("a decided claim did not resolve the condition")
 	}
 }
 
@@ -105,6 +191,41 @@ func TestLeaseMintClearance_ATermDecidedForAnotherNodeIsRefused(t *testing.T) {
 	at, _ := time.Parse(time.RFC3339, clearanceNow)
 	if held, _, err := corrosion.AcquireLeaseWithTerm(ctx, s.db, corrosion.LeaseKeyFailover, s.hostName, 30*time.Second, at); err != nil || held {
 		t.Fatalf("held=%v err=%v within a TTL of learning node-x holds term 1", held, err)
+	}
+}
+
+// The TTL a loser waits counts from when it LEARNED the decision — its
+// classification instant plus the time its sweep and claim took — not from
+// when it classified the lease: the winner may have classified, and started
+// its own TTL, while the loser's clearance was still running.
+//
+// Mutation: note the decision at req.Now — the acquire 31 s later takes term 2
+// and this goes red.
+func TestLeaseMintClearance_TheLosersWaitCountsFromLearning(t *testing.T) {
+	ctx := context.Background()
+	s := leaseClaimNode(t, true)
+	k := corrosion.LeaseTermClaimKey(corrosion.LeaseKeyFailover, 1)
+	signer, _, err := s.claimIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := corrosion.ClaimValue{LeaseTerm: &corrosion.LeaseTermValue{Key: corrosion.LeaseKeyFailover, Term: 1, Holder: "node-x"}}
+	if res, err := s.db.ClaimAccept(ctx, k, corrosion.Ballot{Round: 1, Coordinator: "node-x", Nonce: []byte{9}}, other, 1, signer, nil); err != nil || !res.Accepted {
+		t.Fatalf("seed: %+v %v", res, err)
+	}
+	cfg, err := corrosion.AdoptedVoterConfig(ctx, s.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This node's clearance began 20 s before the decision came back.
+	if ok, _ := s.claimLeaseTerm(ctx, cfg, leaseClaimReq(s, 1), time.Now().Add(-20*time.Second)); ok {
+		t.Fatal("a term decided for node-x was cleared")
+	}
+	s.db.SetLeaseMintClearance(func(context.Context, corrosion.LeaseMintRequest) (bool, string) { return true, "" })
+	at, _ := time.Parse(time.RFC3339, clearanceNow)
+	if held, term, err := corrosion.AcquireLeaseWithTerm(ctx, s.db, corrosion.LeaseKeyFailover, s.hostName,
+		30*time.Second, at.Add(31*time.Second)); err != nil || held {
+		t.Fatalf("held=%v term=%d err=%v 31 s after classifying, 11 s after learning node-x holds term 1", held, term, err)
 	}
 }
 

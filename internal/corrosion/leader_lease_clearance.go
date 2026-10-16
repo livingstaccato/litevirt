@@ -72,6 +72,8 @@ type LeaseMintRequest struct {
 	// the clock its own expiry comparison used, so a peer's expiry is judged
 	// against the same instant.
 	Now string
+	// TTL is the lease's: how long a tenure taken now would last.
+	TTL time.Duration
 }
 
 // LeaseMintClearanceFunc reports whether this node may record req.Term for
@@ -121,8 +123,8 @@ func (c *Client) clearLeaseMint(ctx context.Context, req LeaseMintRequest) bool 
 //
 // The quorum high-water read above is a READ, not a lock: two nodes that take
 // a dead holder's lease over in the same instant both read the same high
-// water, both clear, and both record the next term. Once lease_term_claim_v1
-// has latched the clearance therefore also DECIDES the term, by a
+// water, both clear, and both record the next term. Once a voter generation
+// with members is adopted the clearance therefore also DECIDES the term, by a
 // single-decree claim among the adopted voter generation
 // (grpcapi.Server.LeaseMintClearance), and a term is recorded only by the node
 // the decision names. The other learns who holds the term and records nothing.
@@ -149,9 +151,15 @@ type leaseTermDecision struct {
 }
 
 // NoteLeaseTermDecided records that term of the lease key was decided for
-// holder, learned at at (the instant the asking node classified the lease at,
-// LeaseMintRequest.Now). A decision for an older term than one already noted
-// is ignored.
+// holder, learned at at: the caller's clock (LeaseMintRequest.Now) plus the
+// time its clearance took, so the wait counts from learning, not from
+// classifying. A decision for an older term than one already noted is
+// ignored.
+//
+// In memory, and keyed by host name: a winner that crashed before recording
+// its term and restarted can still record that old term late, after another
+// node waited it out and recorded the next one. That is still one holder per
+// term, and the lower term is fenced by the barrier and the contest rule.
 func (c *Client) NoteLeaseTermDecided(key string, term int64, holder string, at time.Time) {
 	if key == "" || term <= 0 || holder == "" {
 		return

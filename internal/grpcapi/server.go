@@ -1118,6 +1118,14 @@ type Server struct {
 	// superseding term — so it is counted rather than left to a log line.
 	onLeaseBarrierIncomplete func(key string, answered, peers int)
 
+	// onLeaseClaimNoMajority feeds litevirt_lease_term_claim_no_majority_total
+	// (nil-safe); leaseClaimStall drives ha.lease.claim_no_majority
+	// (lease_term_claim.go).
+	onLeaseClaimNoMajority func(lease string)
+	leaseClaimStall        leaseClaimStall
+	// leaseClaimsAsOlderBuild is SetLeaseClaimsAsAnOlderBuildForTest's seam.
+	leaseClaimsAsOlderBuild atomic.Bool
+
 	// leaseBarrierFullProbe remembers which peers have already been given the
 	// full budget in a repair pass and still said nothing, so a dead peer is
 	// charged once per window instead of on every sweep.

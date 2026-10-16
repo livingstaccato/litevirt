@@ -544,7 +544,7 @@ func takeLeaseAndMintTerm(ctx context.Context, c *Client, key, holder, expires, 
 	// inside this call would ask the same peers the same question. See
 	// leader_lease_clearance.go.
 	if !c.clearLeaseMint(ctx, LeaseMintRequest{
-		Key: key, Term: next, Holder: holder, Takeover: takeover, Now: nowRFC,
+		Key: key, Term: next, Holder: holder, Takeover: takeover, Now: nowRFC, TTL: ttl,
 	}) {
 		return false, 0, nil
 	}

@@ -259,6 +259,12 @@ func newFwLiveHostCheck(cfg MigrationConfig, store *libvirt.FirmwareStore, fp li
 // label) never refuse each other, and a wedged libvirtd never has more than
 // one goroutine blocked in it. A caller after the answer starts a new call.
 func boundedVersion(timeout time.Duration, fn func() (uint64, error)) func() (uint64, error) {
+	return boundedVersionJoined(timeout, fn, nil)
+}
+
+// boundedVersionJoined is boundedVersion; joined, when set, is called by each
+// caller once it holds the call it waits on (a test's synchronisation point).
+func boundedVersionJoined(timeout time.Duration, fn func() (uint64, error), joined func()) func() (uint64, error) {
 	type call struct {
 		done chan struct{}
 		v    uint64
@@ -282,6 +288,9 @@ func boundedVersion(timeout time.Duration, fn func() (uint64, error)) func() (ui
 			}()
 		}
 		mu.Unlock()
+		if joined != nil {
+			joined()
+		}
 		select {
 		case <-c.done:
 			return c.v, c.err

@@ -252,13 +252,14 @@ func TestBoundedVersion_ConcurrentCallersShareOneCall(t *testing.T) {
 	release := make(chan struct{})
 	var mu sync.Mutex
 	calls := 0
-	bv := boundedVersion(5*time.Second, func() (uint64, error) {
+	joined := make(chan struct{}, 2)
+	bv := boundedVersionJoined(5*time.Second, func() (uint64, error) {
 		mu.Lock()
 		calls++
 		mu.Unlock()
 		<-release
 		return 10000000, nil
-	})
+	}, func() { joined <- struct{}{} })
 	type res struct {
 		v   uint64
 		err error
@@ -270,21 +271,16 @@ func TestBoundedVersion_ConcurrentCallersShareOneCall(t *testing.T) {
 			out <- res{v, err}
 		}()
 	}
-	// Both callers are in before the call returns.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		mu.Lock()
-		c := calls
-		mu.Unlock()
-		if c >= 1 {
-			break
+	// Both callers hold a call before it can return: the call blocks on
+	// release, so a second call would be one neither shares (D2-12a review
+	// m-7: no sleep decides this).
+	for i := 0; i < 2; i++ {
+		select {
+		case <-joined:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("caller %d never joined a call", i)
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("no version call started")
-		}
-		time.Sleep(time.Millisecond)
 	}
-	time.Sleep(20 * time.Millisecond)
 	close(release)
 	for i := 0; i < 2; i++ {
 		r := <-out

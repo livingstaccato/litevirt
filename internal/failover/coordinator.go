@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -972,8 +973,10 @@ func (c *Coordinator) run(ctx context.Context) {
 		// restarting within its allowance, which the fence path below skips
 		// too: its daemon writes healthy rows about its peers before its own
 		// gRPC server serves, so it has exactly the one-way shape for the
-		// 15-25 s every reboot takes (lab 1, 2026-10-16). It is neither raised
-		// nor resolved for it until then.
+		// 15-25 s a graceful restart takes (lab 1, 2026-10-16). It is neither
+		// raised nor resolved for it until then. A host booting back from a
+		// fence is recorded 'fenced' or 'offline' (hostboot), not 'upgrading',
+		// and is not skipped: it can still raise the condition for that window.
 		if !c.restartingWithinAllowance(ctx, target) {
 			if failing, healthy, oneWay := c.detectOneWay(ctx, target); oneWay || c.oneWay[target] {
 				c.noteOneWay(ctx, target, failing, healthy, oneWay)
@@ -2588,8 +2591,14 @@ func restartedSinceObserversIn(hr healthRead, host string, at time.Time) []strin
 // began more than fenceSkewMargin before at: it has not seen host answer
 // since before at (health.SilentSince). The record and the verdict replicate
 // separately; a verdict that arrives first refuses until the record does.
+//
+// silent_since is the observer's clock and at the fence leader's, compared
+// with the margin given to the safe side as the run-start check above is: an
+// observer whose clock runs more than fenceSkewMargin behind can be excused
+// for a stall that began just after at, the same exposure that check has
+// (the clock-skew alert fires first).
 func (hr healthRead) silentThroughStall(observer, host, lastSeen string, at time.Time) bool {
-	since, ok := health.SilentSince(hr.stalls[observer], host, lastSeen)
+	since, ok := health.SilentSince(hr.stalls.evidence(observer), host, lastSeen)
 	return ok && since.Before(at.Add(-fenceSkewMargin))
 }
 
@@ -2607,9 +2616,27 @@ func whyRestarted(observers []string) string {
 type healthRead struct {
 	rows []corrosion.Row
 	err  error
-	// stalls is each observer's observer_stalled evidence, by observer
-	// (silentThroughStall). Unreadable, it is empty: nothing is excused.
-	stalls map[string]string
+	// stalls is each observer's observer_stalled evidence (silentThroughStall),
+	// read only if some run needs it. Unreadable, it is empty: nothing is
+	// excused.
+	stalls *stallRead
+}
+
+// stallRead is the observer_stalled evidence of every observer, read once,
+// on first use, for one healthRead.
+type stallRead struct {
+	once sync.Once
+	load func() map[string]string
+	m    map[string]string
+}
+
+// evidence is observer's own observer_stalled evidence ("" when none).
+func (s *stallRead) evidence(observer string) string {
+	if s == nil {
+		return ""
+	}
+	s.once.Do(func() { s.m = s.load() })
+	return s.m[observer]
 }
 
 // readHostHealth reads every observer's latest verdict about host: observer,
@@ -2622,19 +2649,29 @@ func (c *Coordinator) readHostHealth(ctx context.Context, host string) healthRea
 	if err != nil {
 		return hr
 	}
-	stalled, serr := c.db.Query(ctx,
-		`SELECT subject_id, evidence FROM health_conditions
+	hr.stalls = &stallRead{load: func() map[string]string { return c.readStallEvidence(ctx, host) }}
+	return hr
+}
+
+// readStallEvidence reads every host's observer_stalled evidence, by host.
+// Only a host's own row counts: it is the only writer of it, and another
+// host's row about it must not excuse its run. A read error yields none.
+func (c *Coordinator) readStallEvidence(ctx context.Context, host string) map[string]string {
+	stalled, err := c.db.Query(ctx,
+		`SELECT subject_id, reporter, evidence FROM health_conditions
 		 WHERE evaluator = ? AND code = ? AND subject_kind = 'host' AND deleted_at IS NULL`,
 		health.StallEvaluator, health.CondObserverStalled)
-	if serr != nil {
-		slog.Warn("failover: observer_stalled read failed; no observer's stall excuses its failing run", "host", host, "error", serr)
-		return hr
+	if err != nil {
+		slog.Warn("failover: observer_stalled read failed; no observer's stall excuses its failing run", "host", host, "error", err)
+		return nil
 	}
-	hr.stalls = make(map[string]string, len(stalled))
+	out := make(map[string]string, len(stalled))
 	for _, r := range stalled {
-		hr.stalls[r.String("subject_id")] = r.String("evidence")
+		if id := r.String("subject_id"); r.String("reporter") == id {
+			out[id] = r.String("evidence")
+		}
 	}
-	return hr
+	return out
 }
 
 // answeredSinceObserversIn names the observers whose latest verdict about

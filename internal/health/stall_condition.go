@@ -40,7 +40,7 @@ type stallEvidence struct {
 	GapSeconds float64 `json:"gap_seconds"`
 	GraceUntil string  `json:"grace_until"`
 	// SilentRuns are this node's failing runs, by target, that are silent
-	// through the stall (silentThroughStall). Written as each begins, so it
+	// through the stall (peerState.silentFrom). Written as each begins, so it
 	// may be added after the condition resolved.
 	SilentRuns map[string]SilentRun `json:"silent_runs,omitempty"`
 }

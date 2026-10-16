@@ -364,3 +364,76 @@ func TestCheckHost_ARunAfterAnAnswerIsNotSilentThroughTheStall(t *testing.T) {
 		check(t, r)
 	})
 }
+
+// A long stop is commonly followed by a short one as the process catches up
+// (8.0 s then 2.2 s on the lab). The run after the second is still silent
+// since the FIRST: the observer has seen no answer since before it. Recorded
+// from the latest stall instead, it reads as silent only since after the
+// fence, and failover refuses the recovery for good, as before the record
+// existed. Whether or not a probe of the target ran between the two stops.
+//
+// Mutation: record the latest stall's start (drop silentFrom's carry-over,
+// use the newest epoch's from) — both cases go red.
+func TestCheckHost_ASilentRunCarriesTheEarliestStallAcrossACatchUp(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		between func(r *runStartRig)
+	}{
+		{"probed between the stops", func(r *runStartRig) { r.run(3 * time.Second) }},
+		{"no probe between the stops", func(r *runStartRig) {
+			r.advance(stallBeat)
+			r.c.stallTick(context.Background())
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRunStartRig(t)
+			r.run(10 * time.Second)
+			stoppedAt := r.clock()
+			r.answer = "down"
+			r.stop(40 * time.Second)
+			tc.between(r)
+			r.stop(3 * time.Second)
+			r.run(StallGrace + 8*time.Second)
+			got := r.failing()
+			if len(got) == 0 {
+				t.Fatal("no failing verdict")
+			}
+			v := got[len(got)-1]
+			since, ok := r.silentSince(t, v)
+			if !ok || !since.Equal(stoppedAt) {
+				t.Fatalf("the run beginning at %v is recorded silent since %s (%v); the observer has seen no answer since %s",
+					v.lastSeen, wallStamp(since), ok, wallStamp(stoppedAt))
+			}
+		})
+	}
+}
+
+// An answer between two stops ends the silence: the run after the second is
+// silent only since the second.
+//
+// Mutation: keep silentFrom across an answer — the run is recorded silent
+// since the first stop and this goes red.
+func TestCheckHost_AnAnswerBetweenTwoStallsEndsTheSilence(t *testing.T) {
+	r := newRunStartRig(t)
+	r.run(10 * time.Second)
+	firstStop := r.clock()
+	r.answer = "down"
+	r.stop(40 * time.Second)
+	r.run(1 * time.Second) // one probe, unanswered, inside the grace window
+	r.answer = "up"
+	r.run(4 * time.Second) // answered
+	answeredBy := r.clock()
+	r.answer = "down"
+	r.stop(3 * time.Second)
+	r.run(StallGrace + 8*time.Second)
+	got := r.failing()
+	if len(got) == 0 {
+		t.Fatal("no failing verdict")
+	}
+	v := got[len(got)-1]
+	since, ok := r.silentSince(t, v)
+	if !ok || since.Equal(firstStop) || since.Before(answeredBy.Add(-time.Second)) {
+		t.Fatalf("the run beginning at %v is recorded silent since %s (%v); the target answered up to %s",
+			v.lastSeen, wallStamp(since), ok, wallStamp(answeredBy))
+	}
+}

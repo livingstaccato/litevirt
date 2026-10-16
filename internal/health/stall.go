@@ -71,9 +71,11 @@ type stallState struct {
 	mu       sync.Mutex
 	lastBeat time.Time     // local clock at the previous beat; zero before the first
 	stallAt  time.Time     // local clock when the most recent stall was noticed
-	from     time.Time     // local clock at the last beat before the most recent stall
 	epoch    uint64        // incremented once per stall
 	gap      time.Duration // length of the most recent stall
+	// froms is the local clock at the last beat before each recent stall, by
+	// epoch (the most recent stallFromsKept).
+	froms map[uint64]time.Time
 
 	// running is set while a heartbeat loop runs; a second loop on the same
 	// checker returns at once (runStallHeartbeat).
@@ -107,9 +109,13 @@ func (c *Checker) beat(now time.Time) (stallAt time.Time, epoch uint64) {
 	if !s.lastBeat.IsZero() {
 		if g := stallGap(s.lastBeat, now); g > stallThreshold {
 			gap = g
-			s.from = s.lastBeat
 			s.stallAt = now
 			s.epoch++
+			if s.froms == nil {
+				s.froms = map[uint64]time.Time{}
+			}
+			s.froms[s.epoch] = s.lastBeat
+			delete(s.froms, s.epoch-stallFromsKept)
 			s.gap = g
 		}
 	}
@@ -125,18 +131,24 @@ func (c *Checker) beat(now time.Time) (stallAt time.Time, epoch uint64) {
 	return stallAt, epoch
 }
 
-// stalledFrom is the last beat before stall epoch's stall: the latest moment
-// this process can have been running before it stopped, and so the latest at
-// which it can have processed a probe's answer (every processed probe beats).
-// Zero when epoch is not the most recent stall.
-func (c *Checker) stalledFrom(epoch uint64) time.Time {
+// stallFromsKept is how many recent stalls' starts beat keeps. A peer probed
+// less often than that many stalls has its first one forgotten, and is then
+// never silent through it (firstStallAfter): the safe direction.
+const stallFromsKept = 64
+
+// firstStallAfter is the last beat before the first stall after epoch: the
+// latest moment this process can have been running before it stopped, and so
+// the latest at which it can have processed a probe's answer (every processed
+// probe beats). Zero when there has been none since epoch, or it is no longer
+// kept.
+func (c *Checker) firstStallAfter(epoch uint64) time.Time {
 	s := &c.stall
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if epoch == 0 || epoch != s.epoch {
+	if epoch >= s.epoch {
 		return time.Time{}
 	}
-	return s.from
+	return s.froms[epoch+1]
 }
 
 // inGrace reports whether now falls inside the grace window of stallAt.

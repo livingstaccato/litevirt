@@ -85,7 +85,11 @@ func TestPartitionPause_OneWayRaisedByAPreviousHolderIsResolvedByTheNext(t *test
 			if err := db.Execute(ctx, `DELETE FROM leader_election`); err != nil {
 				t.Fatal(err)
 			}
+			// It takes over once the lease has run out, which is also how
+			// long another holder's row stands before this one resolves it
+			// (syncOneWay).
 			succ := newTestCoordinator("alive", db)
+			succ.Now = func() time.Time { return time.Now().Add(leaseDuration + time.Second) }
 			succ.SetFencer(fencerReturning("best-effort-ssh", true))
 			succ.Mono = mono.Now
 			succ.PartitionPauseEnforced = func(context.Context) bool { return true }
@@ -127,5 +131,51 @@ func TestPartitionPause_OneWayResolvedElsewhereIsRaisedAgain(t *testing.T) {
 	c.run(ctx)
 	if row, raised := oneWayRow(t, db); !raised {
 		t.Fatalf("partition_one_way not raised again once the case returned: %+v", row)
+	}
+}
+
+// Two coordinators that both believe they hold the lease (a handover, a
+// lagging replica) must not flap partition_one_way every cycle, one raising
+// it and the other resolving it. A row another holder raised stands until it
+// is older than the lease: a raiser that is still a holder keeps it in line
+// itself, and one that is gone has had its lease run out by then.
+//
+// Mutation: resolve another holder's row at once (drop the age guard in
+// syncOneWay) — the first check goes red.
+func TestPartitionPause_AFreshOneWayRowOfAnotherHolderIsNotResolved(t *testing.T) {
+	c, db, ctx, mono := pauseCoordinator(t, true)
+	ensureVoter(t, db, "down")
+	now := c.now()
+	if err := corrosion.UpsertHealthCondition(ctx, db, corrosion.HealthCondition{
+		Evaluator: corrosion.PartitionPauseEvaluator, Code: corrosion.CondPartitionOneWay,
+		SubjectKind: "host", SubjectID: "down", Lifecycle: corrosion.ConditionConfirmed,
+		Severity: corrosion.SeverityCritical, Hosts: []string{"down"}, Reporter: "alive",
+		FirstSeen: now.UTC().Format(time.RFC3339), ConfirmedAt: now.UTC().Format(time.RFC3339),
+		LastSeen: now.UTC().Format(time.RFC3339), ObserveCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Here the case is gone: "down" is no fence candidate.
+	for _, o := range []string{"coordinator", "alive"} {
+		if err := db.Execute(ctx,
+			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES (?, 'down', 'healthy', 0, NULL, ?)`, o, now.UTC().Format(time.RFC3339Nano)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.run(ctx)
+	if row, raised := oneWayRow(t, db); !raised {
+		t.Fatalf("a row another holder raised moments ago was resolved at once: %+v", row)
+	}
+	later := newTestCoordinator("coordinator", db)
+	later.Now = func() time.Time { return time.Now().Add(leaseDuration + time.Second) }
+	later.Mono = mono.Now
+	later.PartitionPauseEnforced = func(context.Context) bool { return true }
+	if err := db.Execute(ctx, `DELETE FROM leader_election`); err != nil {
+		t.Fatal(err)
+	}
+	later.run(ctx)
+	if row, raised := oneWayRow(t, db); raised {
+		t.Fatalf("a row another holder raised a lease ago is still open after its case went: %+v", row)
 	}
 }

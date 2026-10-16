@@ -744,6 +744,13 @@ func (c *Coordinator) detectOneWay(ctx context.Context, target string) (failing,
 // powered off). And a row another holder resolved must read as resolved here,
 // so this holder raises it again if the case returns. A read error keeps what
 // this process knew.
+//
+// A row another holder raised counts only once it is older than the lease
+// (leaseDuration, by its last_seen). Two coordinators that both believe they
+// hold the lease — a handover, a lagging replica — would otherwise flap it
+// every cycle, one raising and the other resolving. A raiser still holding
+// the lease keeps its row in line itself; one that is gone has had its lease
+// run out by then. An unreadable last_seen counts as old.
 func (c *Coordinator) syncOneWay(ctx context.Context) {
 	open, err := corrosion.ListOpenHealthConditionsByCode(ctx, c.db, corrosion.PartitionPauseEvaluator, corrosion.CondPartitionOneWay)
 	if err != nil {
@@ -752,9 +759,15 @@ func (c *Coordinator) syncOneWay(ctx context.Context) {
 	}
 	raised := make(map[string]bool, len(open))
 	for _, row := range open {
-		if row.SubjectKind == "host" {
-			raised[row.SubjectID] = true
+		if row.SubjectKind != "host" {
+			continue
 		}
+		if row.Reporter != c.hostName {
+			if seen, err := time.Parse(time.RFC3339, row.LastSeen); err == nil && c.now().Sub(seen) < leaseDuration {
+				continue
+			}
+		}
+		raised[row.SubjectID] = true
 	}
 	c.oneWay = raised
 }

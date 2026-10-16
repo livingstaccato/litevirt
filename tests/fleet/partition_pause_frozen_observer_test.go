@@ -135,6 +135,22 @@ func silentRecord(reader, obs, target *Node, run observerRow) (time.Time, bool) 
 // excuse in restartedSinceObserversIn — the deadline refuses for good and the
 // recovery wait goes red.
 func TestFleet_PartitionPause_AFrozenObserverDoesNotStallRecovery(t *testing.T) {
+	frozenObserverRecovers(t, false)
+}
+
+// TestFleet_PartitionPause_AFrozenObserverThatCatchesUpDoesNotStallRecovery
+// is the same with the catch-up a resumed process commonly has: moments after
+// the thaw node-1 stops again, for 3 s (8.0 s then 2.2 s on the lab). Its run
+// is silent since the FIRST stop, before the fence.
+//
+// Mutation: record the latest stall's start (drop silentFrom's carry-over in
+// checkHost) — silent_since is after the fence, the deadline refuses for good
+// and the recovery wait goes red.
+func TestFleet_PartitionPause_AFrozenObserverThatCatchesUpDoesNotStallRecovery(t *testing.T) {
+	frozenObserverRecovers(t, true)
+}
+
+func frozenObserverRecovers(t *testing.T, catchUp bool) {
 	c, s, rs, frz := frozenObserverFleet(t)
 	owner, obs, coord := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 
@@ -144,6 +160,12 @@ func TestFleet_PartitionPause_AFrozenObserverDoesNotStallRecovery(t *testing.T) 
 	eventually(t, ppRecoverBound, "node-2 to fence node-0", func() bool { return len(s.fencesOf(owner.Name)) > 0 })
 	fenceAt := s.fencesOf(owner.Name)[0].at
 	frz.thaw()
+	if catchUp {
+		time.Sleep(600 * time.Millisecond) // the heartbeat beats once or twice
+		frz.freeze()
+		time.Sleep(3 * time.Second)
+		frz.thaw()
+	}
 	thawAt := time.Now()
 
 	// When node-1's first failing verdict after the thaw reached the

@@ -74,6 +74,7 @@ func TestResolveStackBackends_DiscoversOnTheNICsBridge(t *testing.T) {
 
 func TestCreateLoadBalancer_VMBackendDiscoversOnTheNICsBridge(t *testing.T) {
 	s := bridgeDiscoveryFixture(t)
+	s.db.SetClusterPolicyGate(func() bool { return true }) // failover_scope_v1 latched: the LB's snat is recordable
 	ctx := adminCtx()
 	createLBTable(t, ctx, s.db)
 	if _, err := s.CreateLoadBalancer(ctx, &pb.CreateLBRequest{

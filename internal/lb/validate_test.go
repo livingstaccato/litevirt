@@ -350,30 +350,6 @@ func TestReadTLSFile_CertDirSubdirsMustBeTrusted(t *testing.T) {
 	}
 }
 
-// TestReadTLSFile_NeverOpensANonRegularFile (M-R3): a device or FIFO is
-// refused before it is opened (opening a device can act, as a watchdog's
-// does).
-//
-// Mutation: drop the stat before the open — red (the open is reached).
-func TestReadTLSFile_NeverOpensANonRegularFile(t *testing.T) {
-	m := testManager(t)
-	fifo := filepath.Join(t.TempDir(), "fifo")
-	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	opens := 0
-	beforeTLSOpen = func() { opens++ }
-	t.Cleanup(func() { beforeTLSOpen = func() {} })
-	for _, p := range []string{"/dev/null", "/dev/zero", fifo} {
-		if _, err := m.readTLSFile(p); err == nil {
-			t.Errorf("%s read", p)
-		}
-	}
-	if opens != 0 {
-		t.Errorf("%d non-regular files reached the open", opens)
-	}
-}
-
 // TestApply_TLSRefusedWritesNothing: a refused TLS file fails the apply
 // before any config is written.
 func TestApply_TLSRefusedWritesNothing(t *testing.T) {

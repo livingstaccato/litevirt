@@ -1,7 +1,6 @@
 package lb
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -48,17 +47,19 @@ var beforeTLSOpen = func() {}
 // The path may be a symlink (a Let's Encrypt live/ name is one): it is
 // resolved, and every check applies to the file actually read:
 //   - the path is clean and absolute;
-//   - the resolved file is opened once, O_NOFOLLOW on its final component,
-//     and the kernel's own name for the opened descriptor must be the
-//     resolved path. A component swapped for a symlink between the resolve
-//     and the open shows up there and is refused; everything after reads
-//     the descriptor, never the path again;
+//   - the resolved file is opened once by path, O_PATH|O_NOFOLLOW
+//     (openTLSForRead): that open never calls a device's or FIFO's own open,
+//     so it cannot act on one. The kernel's own name for that descriptor
+//     must be the resolved path; a component swapped for a symlink between
+//     the resolve and the open shows up there and is refused. Everything
+//     after uses the descriptor, never the path again;
 //   - that name is never inside the PKI dir, the data dir or the LB config
 //     dir (other LBs' combined PEMs);
-//   - it is a regular file of at most maxTLSFile bytes, read non-blocking,
-//     so a device or FIFO cannot exhaust or hang the apply;
-//   - it is a regular file before it is opened (opening a device can act),
-//     and the descriptor is one after;
+//   - the descriptor is a regular file of at most maxTLSFile bytes before
+//     it is opened for reading, through /proc/self/fd, which reopens the
+//     same file whatever the path names by then; the reading descriptor is
+//     checked to be that file, a regular one, under the cap, and is read
+//     non-blocking;
 //   - a path named inside CertDir needs CertDir and every directory below it
 //     on the way to the file to be a real directory owned by this daemon's
 //     user and writable by no one else: what a non-admin may name there, and
@@ -79,38 +80,17 @@ func (m *Manager) readTLSFile(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Never open what is not a regular file: opening some devices does
-	// something (a watchdog arms). The descriptor is checked again below.
-	if fi, err := os.Stat(resolved); err != nil {
-		return nil, err
-	} else if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s: %s is not a regular file", path, resolved)
-	}
-	beforeTLSOpen()
-	f, err := os.OpenFile(resolved, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	f, err := m.openTLSForRead(path, resolved)
 	if err != nil {
-		if errors.Is(err, syscall.ELOOP) {
-			return nil, fmt.Errorf("%s: changed to a symlink while it was opened", path)
-		}
 		return nil, err
 	}
 	defer f.Close()
-	opened, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd()))
-	if err != nil {
-		return nil, fmt.Errorf("%s: cannot tell which file was opened: %w", path, err)
-	}
-	if opened != resolved {
-		return nil, fmt.Errorf("%s: resolved to %s, but %s was opened (changed while it was opened)", path, resolved, opened)
-	}
-	if err := m.checkNotProtected(path, opened); err != nil {
-		return nil, err
-	}
 	fi, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
 	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s: %s is not a regular file", path, opened)
+		return nil, fmt.Errorf("%s: %s is not a regular file", path, resolved)
 	}
 	if fi.Size() > maxTLSFile {
 		return nil, fmt.Errorf("%s: %d bytes, over the %d-byte limit", path, fi.Size(), maxTLSFile)

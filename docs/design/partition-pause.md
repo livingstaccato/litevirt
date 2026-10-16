@@ -539,26 +539,33 @@ All of this is in the failover coordinator (`internal/failover`).
      the wait started and this node has not probed the host healthy since;
      otherwise the host's own condition, dated to this outage, decides as
      for an answer (a refusal on these alone is not reported as a bridge).
-     Neither of those two holds the deadline when, over every voter set the
-     host may be counting over, `n−q+1` voters other than the host have
-     failing runs that span the fence: the host cannot then have held a
-     majority at any moment since, so the answer was a bridge's, and the
-     deadline is quiet. Those sets are the adopted generation, each newer
-     one, and the one before the adopted one (a host that had not adopted it
-     yet counts over that; before the first generation, the derived set).
-     A run spans only when it began `fenceSkewMargin` plus its observer's
-     recorded clock skew from this node before the fence, and this node's
-     own run is left out once it has probed the host since the wait began.
+     Neither of those two holds the deadline when this node can prove that
+     the host has not held a majority since the fence by its own count:
+     over every voter set the host may be counting over, `n−q+1` voters
+     other than the host have failing runs that span the fence, so the
+     answer was a bridge's, and the deadline is quiet. The proof rests on
+     two premises, and without either the rule stands. The voter
+     configuration is pinned: at most one generation, and no reset, was
+     decided since the outage began (none at all on a derived set), and
+     the host had adopted the generation current when it began, or the one
+     before; the sets are then the adopted generation, each newer one and
+     the one before it. And the host's replica held every change of a
+     member's voting state made more than 30 s before the outage began. A
+     run spans only when it began `fenceSkewMargin` plus its observer's
+     clock skew from this node before the fence; an observer whose skew is
+     unknown (neither measured by this run nor recorded in `clock_skew`)
+     is taken as 30 s off. This node's own run is left out once it has
+     probed the host since the wait began.
      A derived one, or a newer generation that is a
      reset, is read from each node's own replica of host state, and then
      any observer that has seen the host answer since the fence refuses
      (`fenceStillStands`), except that a failing run begun after the fence
-     does not refuse under the same `n−q+1` spanning runs, counted over the
-     derived set as the host's replica held it when the outage began: the
-     host itself, though it is fenced here; a host whose voting state
-     changed since, or cannot be dated, in the set but not counted as
-     spanning; and every explicit generation this node has not adopted.
-     A read error, or a set that cannot be known, keeps the rule. So does
+     does not refuse under the same proof, counted over the derived set as
+     the host's replica held it when the outage began: the host itself,
+     though it is fenced here; a host whose voting state changed since, or
+     within 30 s before, or cannot be dated, or reads `unknown`, in the set
+     but not counted as spanning; and the explicit generation a reset
+     replaced. A read error keeps the rule. So does
      any observer once the pause can no longer
      be relied on (§4.3: the host has since reported
      `partition_pause_failed`), since a host that answered was never

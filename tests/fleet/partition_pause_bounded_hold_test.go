@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/failover"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -84,6 +86,8 @@ func TestFleet_PartitionPause_ExplicitSetSkewedPauserBridgeCutRecovers(t *testin
 			ctx := context.Background()
 			c, s, rs := bridgeFleetWith(t, ppOpts{coordinators: map[string]bool{"node-2": true}, pauserOnNodeClock: true}, Options{ClockSeam: true})
 			owner, n2, n5 := c.Nodes[0], c.Nodes[2], c.Nodes[5]
+			measureSkews(t, c, s)
+			settleVoterHistory(t, c)
 			if skewed {
 				owner.StepClock(-60 * time.Second)
 			}
@@ -167,6 +171,8 @@ func TestFleet_PartitionPause_DerivedSetRegainedMajorityHolds(t *testing.T) {
 	eventually(t, time.Minute, "the owner's pauser to be healed before the split", func() bool {
 		return s.node(owner).pauser.HealedForTests()
 	})
+	measureSkews(t, c, s)
+	settleMembership(t, c)
 	logs := captureLogs(t)
 
 	c.SplitGossip([]*Node{owner}, c.Nodes[1:])
@@ -188,14 +194,8 @@ func TestFleet_PartitionPause_DerivedSetRegainedMajorityHolds(t *testing.T) {
 	noStart := func() {
 		for _, n := range c.Nodes[1:] {
 			if _, ok := firstEvent(n, "start", "pp-vm"); ok {
-				var lines []string
-				for _, l := range strings.Split(logs.String(), "\n") {
-					if strings.Contains(l, "msg=\"failover:") || strings.Contains(l, "msg=\"partition-pause:") {
-						lines = append(lines, l)
-					}
-				}
 				t.Fatalf("%s started pp-vm while node-0 may hold its majority again; the failover log:\n%s",
-					n.Name, strings.Join(lines, "\n"))
+					n.Name, failoverLog(logs.String()))
 			}
 		}
 	}
@@ -217,4 +217,142 @@ func answered(ctx context.Context, n *Node, target, observer string, since time.
 	}
 	upd, ok := corrosion.ParseUpdatedAt(rows[0].String("updated_at"))
 	return ok && upd.After(since)
+}
+
+// failoverLog is the failover and partition-pause lines of a captured log.
+func failoverLog(out string) string {
+	var lines []string
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "msg=\"failover:") || strings.Contains(l, "msg=\"partition-pause:") {
+			lines = append(lines, l)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// TestFleet_PartitionPause_TwoVoterChangesSinceTheOutageHold: the bound holds
+// only while the voter configuration n0 may count over is pinned. On voter
+// generation 2 = n0..n4 (n5 a non-member), n0 is cut from every other node,
+// paused and fenced by n3. For a while it reaches n1 and n2 again, three of
+// five on generation 2, and is cut from them again, so their runs restart.
+// Then the operator replaces the dead voter: `voter rm node-0` (generation
+// 3 = n1..n4), then `voter add node-5` (4 = n1..n5). On generation 4, n3, n4
+// and n5 span; on 3, n3 and n4 do. n0, which still counts over generation 2,
+// may hold its majority there, so two generations decided since the outage
+// began keep the hold.
+//
+// Mutation: allow two generations since the outage in regainCandidates —
+// n3 recovers pp-vm once it adopts generation 4.
+func TestFleet_PartitionPause_TwoVoterChangesSinceTheOutageHold(t *testing.T) {
+	ctx := context.Background()
+	c, s, _ := bridgeFleet(t, ppOpts{coordinators: map[string]bool{"node-3": true}})
+	owner, n1, n2, n3, n5 := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3], c.Nodes[5]
+	measureSkews(t, c, s)
+	settleVoterHistory(t, c)
+	logs := captureLogs(t)
+	noStart := func() {
+		for _, n := range c.Nodes[1:] {
+			if _, ok := firstEvent(n, "start", "pp-vm"); ok {
+				t.Fatalf("%s started pp-vm while node-0 may hold its majority on generation 2; the failover log:\n%s",
+					n.Name, failoverLog(logs.String()))
+			}
+		}
+	}
+
+	c.SplitGossip([]*Node{owner}, c.Nodes[1:])
+	eventually(t, ppRecoverBound, "node-3 to fence node-0", func() bool {
+		h, err := corrosion.GetHost(ctx, n3.DB, owner.Name)
+		return err == nil && h != nil && (h.State == "fenced" || h.State == "offline")
+	})
+	fencedAt := time.Now()
+	c.HealGossipBetween([]*Node{owner}, []*Node{n1, n2})
+	late := fencedAt.Add(10 * time.Second)
+	eventually(t, ppRecoverBound, "node-3 to hold node-1's and node-2's answers from node-0, 10 s after the fence", func() bool {
+		noStart()
+		return answered(ctx, n3, owner.Name, n1.Name, late) && answered(ctx, n3, owner.Name, n2.Name, late)
+	})
+	c.SplitGossip([]*Node{owner}, []*Node{n1, n2})
+
+	for i, ch := range []*pb.ChangeVoterConfigRequest{{Op: "rm", Host: owner.Name}, {Op: "add", Host: n5.Name}} {
+		resp, err := c.SelfClient(n3).ChangeVoterConfig(ctx, ch)
+		if err != nil || resp.GetGeneration() != int64(3+i) {
+			t.Fatalf("voter %s %s: %+v %v", ch.Op, ch.Host, resp, err)
+		}
+		adoptAll(t, c, int64(3+i), c.Nodes[1:]...)
+	}
+	noStart()
+	eventually(t, ppRecoverBound, "node-3 to hold the deadline on a restarted run", func() bool {
+		noStart()
+		return strings.Contains(logs.String(), "began after the fence")
+	})
+	// Several coordinator cycles on generation 4.
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		noStart()
+		time.Sleep(time.Second)
+	}
+}
+
+// measureSkews has every node's checker Ping every peer, as the daemon's
+// capability sweeps do, until each has measured every peer's clock skew: a
+// coordinator reads an unmeasured observer's skew as unknown, and its run
+// then spans only well before the fence.
+func measureSkews(t *testing.T, c *Cluster, s *ppStack) {
+	t.Helper()
+	ctx := context.Background()
+	eventually(t, time.Minute, "every node to measure every peer's clock skew", func() bool {
+		all := true
+		for _, n := range c.Nodes {
+			chk := s.node(n).chk
+			for _, p := range c.Nodes {
+				if p == n {
+					continue
+				}
+				if _, ok := chk.MeasuredClockSkew(p.Name); !ok {
+					chk.PeerSupportsFresh(ctx, p.Name, capabilities.SplitBrainGateV1)
+					_, ok = chk.MeasuredClockSkew(p.Name)
+					all = all && ok
+				}
+			}
+		}
+		return all
+	})
+}
+
+// settleVoterHistory waits until the setup's voter generations are older than
+// any outage the scenario starts by more than the deadline's dating margin
+// (fenceSkewMargin plus a measured skew): a generation decided since the
+// outage began is one the host may not have adopted.
+func settleVoterHistory(t *testing.T, c *Cluster) {
+	t.Helper()
+	cfgs, err := corrosion.ListVoterConfigs(context.Background(), c.Nodes[1].DB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cfg := range cfgs {
+		if at, ok := corrosion.ParseUpdatedAt(cfg.CreatedAt); ok {
+			if d := time.Until(at.Add(10 * time.Second)); d > 0 {
+				time.Sleep(d)
+			}
+		}
+	}
+}
+
+// settleMembership waits until no host's membership has changed for longer
+// than the deadline's window for a change the host's replica may lack
+// (healthFreshness, 30 s, before the outage), so every voter's spanning run
+// counts: a cluster just built has every membership freshly written.
+func settleMembership(t *testing.T, c *Cluster) {
+	t.Helper()
+	stamps, err := corrosion.HostMembershipStamps(context.Background(), c.Nodes[1].DB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, st := range stamps {
+		if at, ok := corrosion.ParseUpdatedAt(st.Changed); ok {
+			if d := time.Until(at.Add(45 * time.Second)); d > 0 {
+				time.Sleep(d)
+			}
+		}
+	}
 }

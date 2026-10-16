@@ -177,3 +177,32 @@ func TestCheckClockSkew_SlowResponseIsNotSkew(t *testing.T) {
 		t.Fatalf("real skew must still be recorded (control), got %d row(s)", len(rows))
 	}
 }
+
+// MeasuredClockSkew remembers every measurement, a skew too small for a
+// clock_skew row included, so a missing row and a peer never measured can be
+// told apart (failover's observerSkews). A zero peer timestamp measures
+// nothing.
+//
+// Mutation: record only skews above a second — "host-b" reads unmeasured.
+func TestMeasuredClockSkew_RemembersSmallSkews(t *testing.T) {
+	c := NewChecker("host-a", "/etc/litevirt/pki", testCheckerDB(t))
+	now := time.Now()
+	c.checkClockSkew(context.Background(), "host-b", now.Add(-300*time.Millisecond), now, now)
+	c.checkClockSkew(context.Background(), "host-c", now.Add(-5*time.Second), now, now)
+	c.checkClockSkew(context.Background(), "host-d", time.Time{}, now, now)
+	for _, tc := range []struct {
+		peer   string
+		want   time.Duration
+		wantOK bool
+	}{
+		{"host-b", 300 * time.Millisecond, true},
+		{"host-c", 5 * time.Second, true},
+		{"host-d", 0, false},
+		{"host-e", 0, false},
+	} {
+		got, ok := c.MeasuredClockSkew(tc.peer)
+		if ok != tc.wantOK || (ok && (got < tc.want-50*time.Millisecond || got > tc.want+50*time.Millisecond)) {
+			t.Errorf("%s: MeasuredClockSkew = %v, %v; want %v, %v", tc.peer, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}

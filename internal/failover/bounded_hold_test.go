@@ -9,12 +9,14 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// backdateMembership stamps every host's membership, and its hosts copy, at
-// ts: no host's voting state changed during the outage the test builds.
-func backdateMembership(t *testing.T, db *corrosion.Client, ts time.Time) {
+// backdateHistory stamps every host's membership, its hosts copy and every
+// voter generation at ts: no host's voting state changed, and no generation
+// was decided, during the outage the test builds.
+func backdateHistory(t *testing.T, db *corrosion.Client, ts time.Time) {
 	t.Helper()
 	s := ts.UTC().Format(time.RFC3339Nano)
-	for _, q := range []string{`UPDATE host_membership SET updated_at = ?`, `UPDATE hosts SET updated_at = ?`} {
+	for _, q := range []string{`UPDATE host_membership SET updated_at = ?`, `UPDATE hosts SET updated_at = ?`,
+		`UPDATE voter_configs SET created_at = ?`} {
 		if err := db.Execute(context.Background(), q, s); err != nil {
 			t.Fatal(err)
 		}
@@ -101,7 +103,7 @@ func TestSelfPauseExplicit_SpanningVotersBoundARestartedRunOrAProbeAnswer(t *tes
 				t.Fatal(err)
 			}
 			at := time.Now().Add(-time.Minute)
-			backdateMembership(t, db, at.Add(-time.Hour))
+			backdateHistory(t, db, at.Add(-time.Hour))
 			deadlineScope(t, c, db)
 			// Raised on a clock behind the voters': it predates this outage.
 			pausedCondition(t, db, at.Add(-time.Hour))
@@ -169,7 +171,7 @@ func TestSelfPauseExplicit_ThePreviousGenerationMustBeSpannedToo(t *testing.T) {
 				t.Fatal(err)
 			}
 			at := time.Now().Add(-time.Minute)
-			backdateMembership(t, db, at.Add(-time.Hour))
+			backdateHistory(t, db, at.Add(-time.Hour))
 			deadlineScope(t, c, db)
 			if v := c.scope.voters("down"); len(v) != 6 {
 				t.Fatalf("setup: the deadline counts over %v, not generation 2", v)
@@ -192,6 +194,65 @@ func TestSelfPauseExplicit_ThePreviousGenerationMustBeSpannedToo(t *testing.T) {
 	}
 }
 
+// The voter configuration down may be counting over must be pinned: two
+// generations decided since the outage began (`voter rm down` then
+// `voter add v6`), or a reset, keep the hold whatever spans. down,
+// coordinator and alive are a majority of generation 1, which down still
+// counts over; the deadline's generation 3 and the generation 2 before it
+// are both spanned by v4, v5 and v6.
+//
+// Mutation: allow two generations since the outage in regainCandidates —
+// "rm down, then add v6" goes ahead.
+func TestSelfPauseExplicit_TheVoterConfigurationMustBePinned(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		gens   [][]string // generations decided since the outage, from 2; nil a reset
+		adopt  int64
+		wantOK bool
+	}{
+		{"rm down, then add v6", [][]string{{"coordinator", "alive", "v4", "v5"}, {"coordinator", "alive", "v4", "v5", "v6"}}, 3, false},
+		{"a reset", [][]string{nil}, 1, false},
+		{"one generation, spanned with the one before it", [][]string{{"coordinator", "alive", "v4", "v5", "v6"}}, 2, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, db, ctx, _ := explicitPause(t)
+			ensureVoter(t, db, "v6")
+			c.run(ctx)
+			h, err := corrosion.GetHost(ctx, db, "down")
+			if err != nil || h == nil {
+				t.Fatal(err)
+			}
+			at := time.Now().Add(-time.Minute)
+			backdateHistory(t, db, at.Add(-time.Hour))
+			for i, g := range tc.gens {
+				writeGen(t, db, int64(i+2), g...)
+			}
+			if err := corrosion.RecordVoterAdoption(ctx, db, tc.adopt); err != nil {
+				t.Fatal(err)
+			}
+			deadlineScope(t, c, db)
+			pausedCondition(t, db, at.Add(-time.Hour))
+			for _, o := range []string{"coordinator", "alive", "v4", "v5", "v6"} {
+				healthRow(t, db, o, "healthy", 0, at.Add(-time.Hour))
+			}
+			spanning, restart := []string{"v4", "v5", "v6"}, []string{"coordinator", "alive"}
+			if tc.wantOK {
+				spanning, restart = []string{"alive", "v4", "v5", "v6"}, []string{"coordinator"}
+			}
+			for _, o := range spanning {
+				failingSince(t, db, o, at.Add(-time.Minute), time.Now())
+			}
+			for _, o := range restart {
+				failingSince(t, db, o, at.Add(20*time.Second), time.Now())
+			}
+			v := c.selfPauseStillStands(ctx, h, at, time.Now())
+			if v.ok != tc.wantOK {
+				t.Fatalf("deadline: %+v; want ok=%v", v, tc.wantOK)
+			}
+		})
+	}
+}
+
 // The same bound on the derived voter set, counted as the host counts it. At
 // the deadline the host is fenced, so this node's derived set (down's own
 // cycle) no longer holds it; down's replica, frozen since the outage began,
@@ -199,56 +260,149 @@ func TestSelfPauseExplicit_ThePreviousGenerationMustBeSpannedToo(t *testing.T) {
 // this node now derives, but not of down's five: down with the two restarted
 // voters is three of five, a majority it may have held and resumed on.
 //
+// The other arms keep the hold where down may count over a set this node
+// cannot pin or measure: a voter whose state changed since, or within
+// healthFreshness before, the outage began (down's replica may not hold the
+// change); an explicit generation decided since the outage began; the
+// explicit generation a reset replaced, on which down with the restarted
+// voters is a majority though the larger derived set is spanned; and a
+// spanning voter whose clock skew this node has never measured, whose run
+// began only 20 s before the fence.
+//
 // Mutations: count over this node's derived set (drop down from
 // derivedRegainCandidate's set) — "two spanning, two restarted" goes ahead;
 // pass noRegain=false to quietFallback on the derived path — "three
 // spanning" refuses; drop the answeredSinceIn check from its noRegain branch
 // — "three spanning, the bridge still answers" goes ahead; count a voter
-// whose state changed since the outage began — "two spanning, a third fenced
-// since the outage began" goes ahead.
+// whose state changed since the outage began — "a third fenced since" goes
+// ahead; count a voter whose state reads unknown — "a third reads unknown"
+// goes ahead; date a change against the outage start alone — "a third changed
+// just before" goes ahead; allow a generation since the outage on the
+// derived set — "an explicit generation since" goes ahead; leave out the
+// generation a reset replaced — "a reset replaced generation 1" goes ahead;
+// read an unmeasured observer's skew as 0 — "a voter never measured" goes
+// ahead.
 func TestSelfPauseDerived_SpanningVotersBoundARestartedRun(t *testing.T) {
+	type env struct {
+		c   *Coordinator
+		db  *corrosion.Client
+		ctx context.Context
+		at  time.Time
+	}
 	for _, tc := range []struct {
 		name     string
 		spanning []string
 		restart  []string
-		bridge   bool   // a non-voter's latest verdict is an answer
-		changed  string // a voter whose state changed since the outage began
+		bridge   bool // a non-voter's latest verdict is an answer
+		extra    []string
+		late     map[string]time.Duration // spanning runs that begin this long before the fence, not a minute
+		setup    func(t *testing.T, e env)
 		wantOK   bool
 		wantKey  string
 	}{
-		{"three spanning", []string{"coordinator", "v4", "v5"}, []string{"alive"}, false, "", true, ""},
-		{"two spanning, two restarted", []string{"v4", "v5"}, []string{"coordinator", "alive"}, false, "", false, keyRestarted},
-		{"three spanning, the bridge still answers", []string{"coordinator", "v4", "v5"}, []string{"alive"}, true, "", false, keyAnswered},
-		{"two spanning, a third fenced since the outage began", []string{"coordinator", "v4", "v5"}, []string{"alive"}, false, "v5", false, keyRestarted},
+		{name: "three spanning", spanning: []string{"coordinator", "v4", "v5"}, restart: []string{"alive"}, wantOK: true},
+		{name: "two spanning, two restarted", spanning: []string{"v4", "v5"}, restart: []string{"coordinator", "alive"}, wantKey: keyRestarted},
+		{name: "three spanning, the bridge still answers", spanning: []string{"coordinator", "v4", "v5"}, restart: []string{"alive"}, bridge: true, wantKey: keyAnswered},
+		{name: "a third fenced since the outage began", spanning: []string{"coordinator", "v4", "v5"}, restart: []string{"alive"}, wantKey: keyRestarted,
+			setup: func(t *testing.T, e env) {
+				if err := corrosion.UpdateHostState(e.ctx, e.db, "v5", "fenced"); err != nil {
+					t.Fatal(err)
+				}
+			}},
+		// Every observer is measured at no skew, so the outage is dated a
+		// minute before the fence, less 5 s: v5's membership was written
+		// 15 s before that, inside healthFreshness.
+		{name: "a third changed just before the outage began", spanning: []string{"coordinator", "v4", "v5"}, restart: []string{"alive"}, wantKey: keyRestarted,
+			setup: func(t *testing.T, e env) {
+				ts := e.at.Add(-time.Minute - 5*time.Second - 15*time.Second).UTC().Format(time.RFC3339Nano)
+				for _, q := range []string{`UPDATE host_membership SET updated_at = ? WHERE host_name = 'v5'`, `UPDATE hosts SET updated_at = ? WHERE name = 'v5'`} {
+					if err := e.db.Execute(e.ctx, q, ts); err != nil {
+						t.Fatal(err)
+					}
+				}
+				e.c.PeerClockSkew = func(string) (time.Duration, bool) { return 0, true }
+			}},
+		// v5 has no membership row and this node's hosts copy is frozen:
+		// it reads unknown here, which down's replica need not share.
+		{name: "a third reads unknown", spanning: []string{"coordinator", "v4", "v5"}, restart: []string{"alive"}, wantKey: keyRestarted,
+			setup: func(t *testing.T, e env) {
+				// Every other host keeps a membership row, down's fenced.
+				e.db.SetHostMembershipGate(func() bool { return true })
+				if _, err := e.db.SplitHostMembership(e.ctx); err != nil {
+					t.Fatal(err)
+				}
+				if err := e.db.Execute(e.ctx, `DELETE FROM host_membership WHERE host_name = 'v5'`); err != nil {
+					t.Fatal(err)
+				}
+				backdateHistory(t, e.db, e.at.Add(-time.Hour))
+				e.db.SetHostMembershipRetireGate(func() bool { return true })
+				if st, err := corrosion.HostMembershipStamps(e.ctx, e.db); err != nil {
+					t.Fatal(err)
+				} else {
+					for _, x := range st {
+						if (x.Name == "v5") != (x.State == corrosion.HostStateUnknown) {
+							t.Fatalf("setup: %s reads %q; want only v5 unknown", x.Name, x.State)
+						}
+					}
+				}
+			}},
+		{name: "an explicit generation decided since the outage began", spanning: []string{"coordinator", "v4", "v5"}, restart: []string{"alive"}, wantKey: keyRestarted,
+			setup: func(t *testing.T, e env) {
+				writeGen(t, e.db, 1, "coordinator", "alive", "down", "v4", "v5")
+			}},
+		{name: "a reset replaced generation 1", spanning: []string{"v4", "v5", "w1", "w2"}, restart: []string{"coordinator", "alive"}, extra: []string{"w1", "w2"}, wantKey: keyRestarted,
+			setup: func(t *testing.T, e env) {
+				writeGen(t, e.db, 1, "coordinator", "alive", "down", "v4", "v5")
+				writeGen(t, e.db, 2)
+				if err := corrosion.RecordVoterAdoption(e.ctx, e.db, 2); err != nil {
+					t.Fatal(err)
+				}
+				backdateHistory(t, e.db, e.at.Add(-time.Hour))
+			}},
+		{name: "a voter never measured, 20 s before the fence", spanning: []string{"coordinator", "v4", "v5"}, restart: []string{"alive"},
+			late: map[string]time.Duration{"v5": 20 * time.Second}, wantKey: keyRestarted,
+			setup: func(t *testing.T, e env) {
+				e.c.PeerClockSkew = func(p string) (time.Duration, bool) { return 0, p != "v5" }
+			}},
+		{name: "a voter measured, 20 s before the fence", spanning: []string{"coordinator", "v4", "v5"}, restart: []string{"alive"},
+			late: map[string]time.Duration{"v5": 20 * time.Second}, wantOK: true,
+			setup: func(t *testing.T, e env) {
+				e.c.PeerClockSkew = func(string) (time.Duration, bool) { return 0, true }
+			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, db, ctx, _ := pauseCoordinator(t, true)
-			for _, v := range []string{"v4", "v5"} {
+			db.SetVoterConfigGate(func() bool { return true })
+			for _, v := range append([]string{"v4", "v5"}, tc.extra...) {
 				ensureVoter(t, db, v)
 			}
-			// A third voter failing down: a quorum of five, so the cycle fences.
-			healthRow(t, db, "v4", "suspect", offlineThreshold, time.Now())
+			// More voters failing down: a quorum, so the cycle fences.
+			for _, v := range append([]string{"v4"}, tc.extra...) {
+				healthRow(t, db, v, "suspect", offlineThreshold, time.Now())
+			}
 			c.run(ctx)
 			h, err := corrosion.GetHost(ctx, db, "down")
 			if err != nil || h == nil || (h.State != "fenced" && h.State != "offline") {
 				t.Fatalf("setup: down is %+v after the fence (%v)", h, err)
 			}
+			at := time.Now().Add(-time.Minute)
+			backdateHistory(t, db, at.Add(-time.Hour))
+			if tc.setup != nil {
+				tc.setup(t, env{c: c, db: db, ctx: ctx, at: at})
+			}
 			if a, err := corrosion.AdoptedVoterConfig(ctx, db); err != nil || a.Explicit() {
 				t.Fatalf("setup: the voter set is not derived (%v)", err)
-			}
-			at := time.Now().Add(-time.Minute)
-			backdateMembership(t, db, at.Add(-time.Hour))
-			if tc.changed != "" {
-				if err := corrosion.UpdateHostState(ctx, db, tc.changed, "fenced"); err != nil {
-					t.Fatal(err)
-				}
 			}
 			deadlineScope(t, c, db)
 			if v := c.scope.voters("down"); v["down"] {
 				t.Fatalf("setup: the deadline's derived set %v still holds the fenced host", v)
 			}
 			for _, o := range tc.spanning {
-				failingSince(t, db, o, at.Add(-time.Minute), time.Now())
+				lead := time.Minute
+				if d, ok := tc.late[o]; ok {
+					lead = d
+				}
+				failingSince(t, db, o, at.Add(-lead), time.Now())
 			}
 			for _, o := range tc.restart {
 				failingSince(t, db, o, at.Add(20*time.Second), time.Now())

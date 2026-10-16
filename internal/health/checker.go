@@ -130,6 +130,13 @@ type Checker struct {
 	peers  map[string]*peerState // target hostname → cached state
 	crlVer int64                 // last published CRL version
 
+	// skewSeen is each peer's last measured clock skew from this node and
+	// when it was measured (checkClockSkew), whatever its size: the
+	// clock_skew table records only skews above a second, so a missing row
+	// cannot tell "measured and small" from "never measured"
+	// (MeasuredClockSkew).
+	skewSeen map[string]skewSample
+
 	// Warmup / quorum-timing anchors (local monotonic; reset on restart).
 	startedAt  time.Time // when Start began; bounds the Unknown warmup window
 	probedOnce bool      // set true after the first full probe cycle completes
@@ -251,6 +258,7 @@ func NewChecker(hostName, pkiDir string, db *corrosion.Client) *Checker {
 		pkiDir:              pkiDir,
 		db:                  db,
 		peers:               make(map[string]*peerState),
+		skewSeen:            make(map[string]skewSample),
 		peerCaps:            make(map[string]peerCapEntry),
 		capActiveNeg:        make(map[string]capNegEntry),
 		capActivePos:        make(map[string]time.Time),
@@ -765,6 +773,9 @@ func (c *Checker) checkClockSkew(ctx context.Context, peerName string, peerTimes
 	}
 	mid := reqStart.Add(reqEnd.Sub(reqStart) / 2)
 	skew := peerTimestamp.Sub(mid).Abs()
+	c.mu.Lock()
+	c.skewSeen[peerName] = skewSample{skew: skew, at: time.Now()}
+	c.mu.Unlock()
 	if skew > time.Second {
 		slog.Warn("clock skew detected — LWW conflict resolution may be unreliable",
 			"peer", peerName, "skew", skew, "fix", "Check NTP on "+peerName)
@@ -778,4 +789,26 @@ func (c *Checker) checkClockSkew(ctx context.Context, peerName string, peerTimes
 			c.hostName, peerName, skew.Seconds(), time.Now().UTC().Format(time.RFC3339),
 		)
 	}
+}
+
+// skewSample is one clock skew measurement of a peer (Checker.skewSeen).
+type skewSample struct {
+	skew time.Duration
+	at   time.Time
+}
+
+// skewMemory is how long a skew measurement stands for the peer's clock, as
+// long as the clock_skew table keeps a row.
+const skewMemory = time.Hour
+
+// MeasuredClockSkew reports peer's clock skew from this node as this run last
+// measured it, within skewMemory; ok is false when it has not measured it.
+func (c *Checker) MeasuredClockSkew(peer string) (time.Duration, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s, ok := c.skewSeen[peer]
+	if !ok || time.Since(s.at) > skewMemory {
+		return 0, false
+	}
+	return s.skew, true
 }

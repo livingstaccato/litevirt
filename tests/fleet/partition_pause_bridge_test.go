@@ -282,6 +282,8 @@ func derivedBridgeHeld(t *testing.T) (*Cluster, *ppStack, *runSampler) {
 	eventually(t, time.Minute, "the owner's pauser to be healed before the split", func() bool {
 		return s.node(owner).pauser.HealedForTests()
 	})
+	measureSkews(t, c, s)
+	settleMembership(t, c)
 
 	c.SplitGossip(c.Nodes[:2], c.Nodes[2:5])
 

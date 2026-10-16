@@ -1807,6 +1807,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return d.cfg.Enforcement.PartitionPause && d.checker.Enforced(ctx, capabilities.PartitionPauseV1)
 	}
 	fc.LastContact = d.checker.LastContact
+	fc.PeerClockSkew = d.checker.MeasuredClockSkew
 	fc.PeerPausesOnLoss = svc.PeerPausesOnLoss
 	// Once pit_overlay is used, no VM recovery onto a peer whose Ping says it
 	// is WAL-quarantined, or that does not answer (it may be a build that

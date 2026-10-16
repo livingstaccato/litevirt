@@ -281,6 +281,8 @@ func TestGracefulRestartWiring(t *testing.T) {
 	old := pingPollInterval
 	pingPollInterval = time.Millisecond
 	defer func() { pingPollInterval = old }()
+	var checks bootChecks
+	defer checks.wait(t) // after cancel, before the restore
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	db := corrosion.NewTestClientT(t)
@@ -310,7 +312,7 @@ func TestGracefulRestartWiring(t *testing.T) {
 	// then the host must stay 'upgrading'.
 	serving := make(chan struct{})
 	p := &gatedPinger{open: serving}
-	d.selfPinger = func() (pinger, func(), error) { return p, func() {}, nil }
+	d.selfPinger = checks.pinger(p)
 	d.writeBootState(ctx, 0, 0, 0, false)
 	time.Sleep(50 * time.Millisecond)
 	if got := stateOf(); got != "upgrading" {
@@ -343,6 +345,8 @@ func TestUncleanBootWiring(t *testing.T) {
 	old := pingPollInterval
 	pingPollInterval = time.Millisecond
 	defer func() { pingPollInterval = old }()
+	var checks bootChecks
+	defer checks.wait(t) // after cancel, before the restore
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	db := corrosion.NewTestClientT(t)
@@ -378,7 +382,7 @@ func TestUncleanBootWiring(t *testing.T) {
 
 	// A crash: no markRestarting. This boot serves once `serving` closes.
 	serving := make(chan struct{})
-	d.selfPinger = func() (pinger, func(), error) { return &gatedPinger{open: serving}, func() {}, nil }
+	d.selfPinger = checks.pinger(&gatedPinger{open: serving})
 	bctx, bcancel := context.WithCancel(ctx)
 	d.writeBootState(bctx, 0, 0, 0, false)
 	time.Sleep(50 * time.Millisecond)
@@ -391,7 +395,7 @@ func TestUncleanBootWiring(t *testing.T) {
 
 	// Another crash, and this daemon never serves.
 	never := make(chan struct{})
-	d.selfPinger = func() (pinger, func(), error) { return &gatedPinger{open: never}, func() {}, nil }
+	d.selfPinger = checks.pinger(&gatedPinger{open: never})
 	bctx, bcancel = context.WithCancel(ctx)
 	d.writeBootState(bctx, 0, 0, 0, false)
 	time.Sleep(50 * time.Millisecond)
@@ -402,7 +406,7 @@ func TestUncleanBootWiring(t *testing.T) {
 
 	// The next boot follows a daemon that never served: 'active' at once.
 	serving = make(chan struct{})
-	d.selfPinger = func() (pinger, func(), error) { return &gatedPinger{open: serving}, func() {}, nil }
+	d.selfPinger = checks.pinger(&gatedPinger{open: serving})
 	d.writeBootState(ctx, 0, 0, 0, false)
 	if got := stateOf(); got != "active" {
 		t.Fatalf("the boot after a daemon that never served recorded %q, want active", got)
@@ -429,6 +433,8 @@ func TestQuarantinedBootWritesNothing(t *testing.T) {
 	old := pingPollInterval
 	pingPollInterval = time.Millisecond
 	defer func() { pingPollInterval = old }()
+	var checks bootChecks
+	defer checks.wait(t) // after cancel, before the restore
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	db := corrosion.NewTestClientT(t)
@@ -451,9 +457,7 @@ func TestQuarantinedBootWritesNothing(t *testing.T) {
 	d := &Daemon{cfg: &Config{HostName: "h", DataDir: t.TempDir()}, db: db}
 	served := make(chan struct{})
 	var once sync.Once
-	d.selfPinger = func() (pinger, func(), error) {
-		return pingerFunc(func() error { once.Do(func() { close(served) }); return nil }), func() {}, nil
-	}
+	d.selfPinger = checks.pinger(pingerFunc(func() error { once.Do(func() { close(served) }); return nil }))
 	d.writeBootState(ctx, 0, 0, 0, false)
 	select {
 	case <-served:
@@ -482,6 +486,32 @@ func (f pingerFunc) Ping(context.Context, *pb.PingRequest, ...grpc.CallOption) (
 
 // gatedPinger fails every Ping until open is closed.
 type gatedPinger struct{ open chan struct{} }
+
+// bootChecks counts the serving checks a test's boots start, so the test can
+// wait for them to end before it restores the package timings they read: a
+// check that outlives its test races that restore, and the next test's.
+type bootChecks struct{ wg sync.WaitGroup }
+
+// pinger is the selfPinger for one boot. The boot's check is counted from
+// here until it closes its client.
+func (b *bootChecks) pinger(p pinger) func() (pinger, func(), error) {
+	b.wg.Add(1)
+	var once sync.Once
+	return func() (pinger, func(), error) { return p, func() { once.Do(b.wg.Done) }, nil }
+}
+
+// wait waits, bounded, for every counted check to end. Cancel their contexts
+// first.
+func (b *bootChecks) wait(t *testing.T) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { b.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Error("a boot's serving check did not end once its context was cancelled")
+	}
+}
 
 func (g *gatedPinger) Ping(ctx context.Context, _ *pb.PingRequest, _ ...grpc.CallOption) (*pb.PingResponse, error) {
 	select {

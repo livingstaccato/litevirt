@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"net/netip"
 
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -57,18 +58,19 @@ func WouldServeGateway(ctx context.Context, db *corrosion.Client, networkName st
 	f := DHCPHostFacts{}
 	switch def.Type {
 	case "", "bridge":
-		dev := BridgeName(networkName, def)
-		f.BridgePreExisted = BridgeExists(dev) && !bridgeRecorded(dev) && !litevirtServedDHCP(dnsmasqPidFile(dev))
+		f.BridgePreExisted = bridgePreExistedFor(def, BridgeName(networkName, def))
 	case "vxlan":
 		f.IsGatewayHost = db != nil && isGatewayHost(ctx, db, networkName, hostName)
 	}
 	return DHCPWouldServe(def, f)
 }
 
-// SameGateway reports whether two network definitions put the same gateway
-// address on their devices.
-func SameGateway(a, b compose.NetworkDef) bool {
-	ga, okA := SubnetGatewayV4(a.Subnet)
-	gb, okB := SubnetGatewayV4(b.Subnet)
-	return okA && okB && ga == gb
+// SubnetsOverlap reports whether two network definitions' subnets overlap:
+// carried on two devices of one host at once, they leave two connected routes
+// for the shared range (and, with the same first address, one gateway
+// address twice).
+func SubnetsOverlap(a, b compose.NetworkDef) bool {
+	pa, errA := netip.ParsePrefix(a.Subnet)
+	pb, errB := netip.ParsePrefix(b.Subnet)
+	return errA == nil && errB == nil && pa.Overlaps(pb)
 }

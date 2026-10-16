@@ -104,6 +104,14 @@ func BridgeName(networkName string, def compose.NetworkDef) string {
 	return FlatBridgeName(networkName)
 }
 
+// bridgePreExistedFor is whether bridge counts as one litevirt found already
+// there for def, the fact the DHCP gate reads (see Provision). One predicate,
+// so WouldServeGateway answers as Provision acts.
+func bridgePreExistedFor(def compose.NetworkDef, bridge string) bool {
+	return BridgeExists(bridge) &&
+		(def.NetBoxPrefixID != 0 || !litevirtServedDHCP(dnsmasqPidFile(bridge)))
+}
+
 // VTEPRecord holds a host's VTEP information for a network.
 type VTEPRecord struct {
 	NetworkName string
@@ -138,8 +146,7 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 		// to the plain fact: its refusal below must read the same host state
 		// on every attempt.
 		pidFile := dnsmasqPidFile(bridge)
-		bridgePreExisted := BridgeExists(bridge) &&
-			(def.NetBoxPrefixID != 0 || !litevirtServedDHCP(pidFile))
+		bridgePreExisted := bridgePreExistedFor(def, bridge)
 
 		// REFUSE BEFORE CREATING ANYTHING, and this ordering is the whole of
 		// whether the refusal survives a retry.

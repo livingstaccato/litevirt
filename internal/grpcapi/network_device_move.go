@@ -211,6 +211,14 @@ func (s *Server) provisionDevice(ctx context.Context, db *corrosion.Client, name
 	}
 	s.netDevs.setDef(name, def, true)
 	s.netDevs.setPending(dev, nil) // in use by name again
+	if released != nil {
+		// The gateway is on the new device now: every stopped workload still
+		// defined on the old one follows at once, and the old device goes
+		// when nothing uses it.
+		oldDev := network.BridgeName(name, *released)
+		s.repointStoppedOn(ctx, name, oldDev, dev)
+		s.retirePendingHeld(ctx, oldDev)
+	}
 	return got, nil
 }
 
@@ -235,11 +243,12 @@ func (s *Server) deprovisionDevice(ctx context.Context, name string, def compose
 //   - Another live network names the old device: it is left as it is.
 //   - Nothing on this host uses it: it is retired now.
 //   - Something does — a guest port, a VM's domain definition, a container's
-//     config — and this host would carry the SAME gateway on both devices:
-//     while a running workload is on the old device the move is refused,
-//     naming the running workloads; with only stopped ones defined on it, the
-//     gateway and dnsmasq move to the new device now (returned as released),
-//     the old device keeps its L2 for them, and each moves when it starts.
+//     config — and both devices would serve overlapping subnets here: while a
+//     running workload is on the old device the move is refused, naming the
+//     running workloads; with only stopped ones defined on it, the gateway and
+//     dnsmasq move to the new device now (returned as released), and once the
+//     new device is up every stopped definition on the old one is re-pointed
+//     to it (repointStoppedOn) and the old one retired.
 //   - Otherwise the old device is kept whole, pending.
 //
 // A pending device is retired once nothing uses it (retirePendingDevices).
@@ -278,7 +287,7 @@ func (s *Server) retireReplacedDevice(ctx context.Context, name string, def comp
 		slog.Info("network moved to another device; retired the previous one", "network", name, "from", oldDev, "to", newDev)
 		return nil, nil
 	}
-	collide := network.SameGateway(old, def) && prov.ServingGateway(name, old) &&
+	collide := network.SubnetsOverlap(old, def) && prov.ServingGateway(name, old) &&
 		prov.WouldServeGateway(ctx, s.db, name, def, s.hostName)
 	switch {
 	case collide && len(users.running) > 0:
@@ -322,27 +331,40 @@ func (s *Server) retirePendingDevices(ctx context.Context) {
 		func() {
 			unlock := s.netDevs.lockNetwork(p.Network)
 			defer unlock()
-			unlockDev := s.netDevs.lockDevice(dev)
-			defer unlockDev()
-			if user, err := s.liveNetworkNaming(ctx, dev, ""); err != nil {
-				return
-			} else if user != "" {
-				s.netDevs.setPending(dev, nil)
-				return
-			}
-			if users, err := s.deviceUsers(ctx, dev); err != nil || !users.none() {
-				return
-			}
-			if err := s.networkProvisioner().RetireDevice(ctx, s.db, p.Network, p.Def, s.hostName); err != nil {
-				slog.Warn("network moved off a device; retiring it failed (will retry)",
-					"network", p.Network, "device", dev, "error", err)
-				return
-			}
-			s.netDevs.setPending(dev, nil)
-			slog.Info("network moved off a device; retired it once nothing on this host used it",
-				"network", p.Network, "device", dev)
+			s.retirePendingHeld(ctx, dev)
 		}()
 	}
+}
+
+// retirePendingHeld retires pending device dev if nothing on this host uses
+// it any more. The caller holds the lock of dev's network.
+func (s *Server) retirePendingHeld(ctx context.Context, dev string) {
+	s.netDevs.mu.Lock()
+	s.netDevs.loadLocked()
+	p, ok := s.netDevs.pending[dev]
+	s.netDevs.mu.Unlock()
+	if !ok {
+		return
+	}
+	unlockDev := s.netDevs.lockDevice(dev)
+	defer unlockDev()
+	if user, err := s.liveNetworkNaming(ctx, dev, ""); err != nil {
+		return
+	} else if user != "" {
+		s.netDevs.setPending(dev, nil)
+		return
+	}
+	if users, err := s.deviceUsers(ctx, dev); err != nil || !users.none() {
+		return
+	}
+	if err := s.networkProvisioner().RetireDevice(ctx, s.db, p.Network, p.Def, s.hostName); err != nil {
+		slog.Warn("network moved off a device; retiring it failed (will retry)",
+			"network", p.Network, "device", dev, "error", err)
+		return
+	}
+	s.netDevs.setPending(dev, nil)
+	slog.Info("network moved off a device; retired it once nothing on this host used it",
+		"network", p.Network, "device", dev)
 }
 
 // containerNICLinker is the part of a ContainerRuntime that reads and sets
@@ -571,11 +593,14 @@ func (s *Server) followNetworkDevicesCT(ctx context.Context, ct string) {
 }
 
 // migrationNICBridges maps each NIC of vm (by MAC) whose running domain is on
-// another device than its network names now to that device: the live
-// migration lands it there (MigrateParams.NICBridges), so the target never
-// needs the device the network moved off.
-func (s *Server) migrationNICBridges(ctx context.Context, vm string) map[string]string {
-	if s.virt == nil {
+// another device than the one the target serves its network on (targetDevs,
+// from the target's EnsureDisks answer) to that device: the live migration
+// lands it there (MigrateParams.NICBridges). A target that is still on the
+// device the network moved off — it refused the move — gets the NIC on that
+// device; one that moved gets it on the new one. nil targetDevs (an older
+// target, or no answer) retargets nothing.
+func (s *Server) migrationNICBridges(ctx context.Context, vm string, targetDevs map[string]string) map[string]string {
+	if s.virt == nil || len(targetDevs) == 0 {
 		return nil
 	}
 	x, err := s.virt.DumpXML(vm)
@@ -593,8 +618,8 @@ func (s *Server) migrationNICBridges(ctx context.Context, vm string) map[string]
 		if !ok {
 			continue
 		}
-		want, ok := s.networkDeviceFor(ctx, n.NetworkName)
-		if !ok || want == cur {
+		want := targetDevs[n.NetworkName]
+		if want == "" || want == cur {
 			continue
 		}
 		if out == nil {
@@ -603,6 +628,114 @@ func (s *Server) migrationNICBridges(ctx context.Context, vm string) map[string]
 		out[n.MAC] = want
 	}
 	return out
+}
+
+// servedNetworkDevices answers a migration source (EnsureDisks): for each
+// managed network vm has a NIC on, the device this host serves it on — the
+// one it was last provisioned on here, which for a move this host refused is
+// still the previous one, else the device the network names now.
+func (s *Server) servedNetworkDevices(ctx context.Context, vm string) map[string]string {
+	nics, err := corrosion.MergedVMNICs(ctx, s.db, vm)
+	if err != nil {
+		return nil
+	}
+	out := map[string]string{}
+	for _, n := range nics {
+		want, ok := s.networkDeviceFor(ctx, n.NetworkName)
+		if !ok {
+			continue
+		}
+		if def, ok := s.netDevs.lastDef(n.NetworkName); ok {
+			if d := network.BridgeName(n.NetworkName, def); d != "" && !strings.HasPrefix(d, "direct:") {
+				want = d
+			}
+		}
+		out[n.NetworkName] = want
+	}
+	return out
+}
+
+// vmHasManagedNIC reports whether vm has a NIC on a managed bridge network.
+func (s *Server) vmHasManagedNIC(ctx context.Context, vm string) bool {
+	nics, err := corrosion.MergedVMNICs(ctx, s.db, vm)
+	if err != nil {
+		return false
+	}
+	for _, n := range nics {
+		if _, ok := s.networkDeviceFor(ctx, n.NetworkName); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// repointStoppedOn moves every stopped workload on this host whose
+// definition names device from onto device to: a stopped VM's persistent
+// definition (vm.nic_moved), a stopped container's config. A running one is
+// never touched. It runs once a network's gateway has moved from from to to,
+// so no start path — one that does not follow its network (a health restart,
+// libvirt autostart) — brings a workload back on a device without its
+// gateway.
+func (s *Server) repointStoppedOn(ctx context.Context, network, from, to string) {
+	if s.virt != nil {
+		if doms, err := s.virt.ListDomains(); err == nil {
+			for _, d := range doms {
+				if active, err := s.virt.DomainIsActive(d); err != nil || active {
+					continue
+				}
+				x, err := s.virt.DumpXMLInactive(d)
+				if err != nil {
+					continue
+				}
+				for mac, b := range libvirt.InterfaceBridges(x) {
+					if b != from {
+						continue
+					}
+					if err := s.virt.SetNICBridgeConfig(d, mac, to); err != nil {
+						slog.Warn("network moved; a stopped VM's NIC stays on the previous device until it starts",
+							"vm", d, "mac", mac, "from", from, "to", to, "error", err)
+						continue
+					}
+					s.recordVMEvent(ctx, d, "vm.nic_moved", "ok",
+						fmt.Sprintf("NIC %s moved from %s to %s, the device network %s is on now", mac, from, to, network))
+				}
+			}
+		}
+	}
+	l, ok := s.containerRuntime.(containerNICLinker)
+	if !ok || s.containerRuntime == nil {
+		return
+	}
+	cts, err := s.containerRuntime.ListContainers(ctx)
+	if err != nil {
+		return
+	}
+	for _, ct := range cts {
+		if st, err := s.containerRuntime.StateContainer(ctx, ct); err != nil || st != "stopped" {
+			continue
+		}
+		links, err := l.ContainerNICLinks(ctx, ct)
+		if err != nil {
+			continue
+		}
+		for ord, b := range links {
+			if b != from {
+				continue
+			}
+			if err := l.SetContainerNICLink(ctx, ct, ord, to); err != nil {
+				slog.Warn("network moved; a stopped container's NIC stays on the previous device until it starts",
+					"container", ct, "nic", ord, "from", from, "to", to, "error", err)
+				continue
+			}
+			slog.Info("network moved; relinked a stopped container's NIC", "container", ct, "nic", ord, "from", from, "to", to)
+		}
+	}
+}
+
+// FollowNetworkDevices is followNetworkDevices for a start path outside this
+// package (the health checker's restart).
+func (s *Server) FollowNetworkDevices(ctx context.Context, vm string) {
+	s.followNetworkDevices(ctx, vm)
 }
 
 // networkDeviceFor is the device network name is on now, when it is a

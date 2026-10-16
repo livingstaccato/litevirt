@@ -197,13 +197,17 @@ rules follow it to the new device. A device something on the host still uses
 stopped), or a container whose config links to it — is kept until nothing
 does, and goes on the first pass after that. Each VM or container moves to the
 network's new device when it next starts (`lv start`, `lv restart`); a VM
-records a `vm.nic_moved` event. A VM live-migrated meanwhile lands on the new
-device on its target. When the new device would carry the same gateway as the
-old one and only stopped workloads are defined on the old device, the gateway
-and `dnsmasq` move to the new device at once and the old one keeps only its
-bridge for them. While a workload still RUNS on the old device, the change is
-refused on that host, naming those workloads: stop them or migrate them off
-the host, and the change completes; each then starts on the new device. A
+records a `vm.nic_moved` event. A VM live-migrated meanwhile lands on the
+device its target serves the network on: the new one, or the old one where
+the target has not moved yet. When the new device's subnet overlaps the old
+one's, both would serve it, and only stopped workloads are defined on the old
+device, the gateway and `dnsmasq` move to the new device at once, and every
+stopped VM and container defined on the old device is re-pointed with them
+(their persistent definitions only), so any later start, a health restart
+included, lands on the new device. While a workload still RUNS on the old
+device, the change is refused on that host, naming those workloads: stop them
+or migrate them off the host, and the change completes; each then starts on
+the new device. A
 network on a VLAN, a host-isolated one, an operator bridge without `--dhcp`
 and a vxlan host that is not the network's DHCP gateway carry no gateway
 there and are never refused. The record of the moved-off devices is kept

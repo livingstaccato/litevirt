@@ -568,6 +568,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	var targetCgroup string
 	// stripVNC: the target cannot do VNC passwords (MigrateParams.StripVNCPassword).
 	var stripVNC bool
+	// targetNetDevs: the device the target serves each of the VM's managed
+	// networks on, when it said (MigrateParams.NICBridges).
+	var targetNetDevs map[string]string
 	useTLS := false
 	// route is where the migration's data goes: the cluster address, or the
 	// target's address in migration.network (migration_network.go).
@@ -581,7 +584,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			return err
 		}
 		createdStubs, dstTLS, cdromSources, targetCgroup = ens.created, ens.tlsReady, ens.remap, ens.cgroupMode
-		stripVNC = ens.vncPasswordUnavailable
+		stripVNC, targetNetDevs = ens.vncPasswordUnavailable, ens.netDevices
 		abort.createdStubs = createdStubs
 		useTLS = srcTLS && dstTLS
 		kind := routeStorage
@@ -608,7 +611,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			return eerr
 		}
 		cdromSources, targetCgroup = ens.remap, ens.cgroupMode
-		stripVNC = ens.vncPasswordUnavailable
+		stripVNC, targetNetDevs = ens.vncPasswordUnavailable, ens.netDevices
 		if fwVM || coldStopped {
 			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeCold, true)
 		} else {
@@ -767,9 +770,8 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			// The destination definition carries each rbd disk's monitors as
 			// its pool resolves them now (a re-addressed cluster's).
 			RBDLocators: s.rbdLocatorsOf(ctx, vm.Name),
-			// A NIC whose network moved since the domain was defined lands on
-			// the network's device now.
-			NICBridges: s.migrationNICBridges(ctx, vm.Name),
+			// Each NIC lands on the device the target serves its network on.
+			NICBridges: s.migrationNICBridges(ctx, vm.Name, targetNetDevs),
 		}
 		armed.apply(&params)
 		logVNCPasswordStrip(vm.Name, req.TargetHost, params.StripVNCPassword)
@@ -1306,6 +1308,9 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		// A live migration onto this host moves a guest without its VNC
 		// password when this QEMU cannot do one (docs/ui.md "Console passwords").
 		VncPasswordUnavailable: s.vncPasswordUnavailableForMigration() != ""}
+	if req.GetWantNetworkDevices() {
+		resp.NetworkDevices = s.servedNetworkDevices(ctx, req.GetVmName())
+	}
 	var made []string // created by this call: removed again if a later one fails
 	undo := func() {
 		for _, p := range made {
@@ -2209,6 +2214,10 @@ type ensureOutcome struct {
 	// authentication (FIPS), so a live migration strips the guest's VNC
 	// password (MigrateParams.StripVNCPassword). False when it did not say.
 	vncPasswordUnavailable bool
+	// netDevices: the device the target serves each of the VM's managed
+	// networks on (EnsureDisksResponse.network_devices); nil when it did not
+	// say (an older target, or no call was made).
+	netDevices map[string]string
 }
 
 // ensureDisksOnTargetNet is ensureDisksOnTargetISO that also asks for the
@@ -2235,7 +2244,10 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 	if err != nil {
 		return ensureOutcome{}, err
 	}
-	shareOnly := runtime && (s.vmSharesWeight(ctx, vmName) > 0 || hasVNCPassword) && len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 &&
+	// A runtime move of a VM with a NIC on a managed network asks which device
+	// the target serves each such network on. Best effort, like the cgroup ask.
+	wantNetDevs := runtime && s.vmHasManagedNIC(ctx, vmName)
+	shareOnly := runtime && (s.vmSharesWeight(ctx, vmName) > 0 || hasVNCPassword || wantNetDevs) && len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 &&
 		s.migrationNetwork == "" && !hasRBD && len(mtus) == 0
 	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 && s.migrationNetwork == "" && !shareOnly && !hasRBD && len(mtus) == 0 {
 		return ensureOutcome{}, nil
@@ -2256,9 +2268,10 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 		InstallerIsoSha256: s.judgedISOSHA256(ctx, vmName, isoPaths),
 		MigrationNetwork:   s.migrationNetwork,
 		NicMtu:             mtus,
+		WantNetworkDevices: wantNetDevs,
 	})
 	if err != nil && shareOnly {
-		slog.Warn("migration: the target did not report its cgroup version; cpu-shares move as defined",
+		slog.Warn("migration: the target did not answer the migration preflight; cpu-shares, VNC password and NICs move as defined",
 			"vm", vmName, "target", targetHost, "error", err)
 		return ensureOutcome{}, nil
 	}
@@ -2297,7 +2310,7 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 			slog.Info("migration: the target opens the installer ISO at its own file", "vm", vmName, "target", targetHost, "here", from, "there", to)
 		}
 	}
-	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode(), vncPasswordUnavailable: resp.GetVncPasswordUnavailable()}, nil
+	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode(), vncPasswordUnavailable: resp.GetVncPasswordUnavailable(), netDevices: resp.GetNetworkDevices()}, nil
 }
 
 // olderTargetISORemap points, for a move to an older target, the CD-ROM that

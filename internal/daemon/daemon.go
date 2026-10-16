@@ -1241,6 +1241,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// adoption-gate + PCI-start-preflight. A strict no-op until hardware_v2 latches, so
 	// this changes nothing on a fleet where the feature is off.
 	vmChecker.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
+	// A health restart moves a stopped VM's NICs onto the devices their
+	// networks are on now, as a start through the Server does.
+	vmChecker.SetNetworkFollower(svc.FollowNetworkDevices)
 	vmChecker.SetCancelledStartProbe(svc.HasCancelledStart) // cancelled_starts.go: neither healed to running nor restarted
 
 	// Wire reconciler callbacks now that gRPC server exists.

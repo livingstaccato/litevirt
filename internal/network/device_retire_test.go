@@ -55,3 +55,22 @@ func TestRetireDevice_KeepsTheNetworksFirewallIntent(t *testing.T) {
 		t.Errorf("Deprovision left the network's intent %+v", in)
 	}
 }
+
+// Re-review R2-m3: a move refuses on overlapping subnets, not only on equal
+// gateways — a /16 and a /24 inside it leave two connected routes.
+func TestSubnetsOverlap(t *testing.T) {
+	d := func(s string) compose.NetworkDef { return compose.NetworkDef{Subnet: s} }
+	for _, tc := range []struct {
+		a, b string
+		want bool
+	}{
+		{"172.46.0.0/24", "172.46.0.0/24", true},
+		{"172.46.0.0/16", "172.46.9.0/24", true},
+		{"172.46.0.0/24", "172.47.0.0/24", false},
+		{"", "172.46.0.0/24", false},
+	} {
+		if got := SubnetsOverlap(d(tc.a), d(tc.b)); got != tc.want {
+			t.Errorf("SubnetsOverlap(%s, %s) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
+	}
+}

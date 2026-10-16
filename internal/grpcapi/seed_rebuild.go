@@ -48,6 +48,9 @@ func (s *Server) rebuildSeedNetworkConfig(ctx context.Context, vm *corrosion.VMR
 		return
 	}
 	failed := func(cause error) {
+		if merr := cloudinit.MarkSeedStale(iso); merr != nil {
+			slog.Warn("seed rebuild: could not mark the seed stale", "vm", vm.Name, "seed", iso, "error", merr)
+		}
 		detail := fmt.Sprintf("the seed at %s on %s keeps its previous network-config, so a reboot of the guest does not reflect this change: %v; the next NIC attach or detach of this VM tries again", iso, s.hostName, cause)
 		slog.Warn("seed rebuild failed", "vm", vm.Name, "seed", iso, "error", cause)
 		s.recordVMEvent(ctx, vm.Name, "seed.rebuild_failed", "error", detail)
@@ -83,7 +86,11 @@ func (s *Server) rebuildSeedNetworkConfig(ctx context.Context, vm *corrosion.VMR
 	if added != "" {
 		adds = []string{added}
 	}
-	nc, err := cloudinit.SeedNetworkConfig(ctx, s.db, vm.Name, &spec, cloudinit.PriorFrom(cur.NetworkConfig, adds...))
+	// A seed an earlier rebuild here failed for may not list a NIC the VM
+	// has: its names are read as possibly stale.
+	prior := cloudinit.PriorFrom(cur.NetworkConfig, adds...)
+	prior.Stale = cloudinit.SeedMarkedStale(iso)
+	nc, err := cloudinit.SeedNetworkConfig(ctx, s.db, vm.Name, &spec, prior)
 	switch {
 	case errors.Is(err, cloudinit.ErrNICsAmbiguous):
 		stamp()

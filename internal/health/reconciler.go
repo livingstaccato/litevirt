@@ -2354,13 +2354,28 @@ func (r *Reconciler) seedClaim(vm corrosion.VMRecord, spec *pb.VMSpec) cloudinit
 // derived again from the VM's NICs, each NIC keeping its name, and its
 // meta-data (the instance-id) and user-data are kept byte for byte. Where the
 // VM's NICs cannot be told from its spec the seed is kept as it is. The VM
-// starts on the seed whatever happens here: a seed that cannot be read is
-// used as it is, and one whose network-config cannot be derived or rewritten
-// is used as it is with a seed.rebuild_failed warning naming it.
+// starts on the seed whatever happens here: a seed that cannot be read, or
+// whose network-config cannot be derived or rewritten, is used as it is, with
+// a seed.rebuild_failed warning naming it and the seed marked stale
+// (cloudinit.MarkSeedStale) until a rebuild succeeds.
 func (r *Reconciler) refreshOwnSeed(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, iso string) {
+	warn := func(cause error) {
+		if merr := cloudinit.MarkSeedStale(iso); merr != nil {
+			slog.Warn("reconciler: could not mark the VM's cloud-init seed stale", "vm", vm.Name, "seed", iso, "error", merr)
+		}
+		detail := fmt.Sprintf("the VM's seed at %s on %s could not be brought up to date with its NICs: %v; the VM starts on it as it is, so a NIC attached or detached since the seed was written may lose its configuration in the guest at this boot; the next start or NIC attach or detach of the VM on %s tries again", iso, r.hostName, cause, r.hostName)
+		slog.Warn("reconciler: "+detail, "vm", vm.Name)
+		_ = corrosion.InsertVMEvent(ctx, r.db, corrosion.VMEventRecord{
+			ID: randid.New(), VMName: vm.Name, HostName: r.hostName, Type: "seed.rebuild_failed",
+			Result: "error", Severity: "warning", Detail: detail, Username: "reconciler",
+		})
+	}
 	cur, err := cloudinit.ReadSeed(iso)
-	if err != nil || cur.InstanceID() == "" {
-		slog.Warn("reconciler: the VM's cloud-init seed cannot be read; used as it is", "vm", vm.Name, "seed", iso, "error", err)
+	if err == nil && cur.InstanceID() == "" {
+		err = errors.New("the seed names no instance-id")
+	}
+	if err != nil {
+		warn(fmt.Errorf("read it: %w", err))
 		return
 	}
 	prior := cloudinit.PriorFrom(cur.NetworkConfig)
@@ -2380,12 +2395,7 @@ func (r *Reconciler) refreshOwnSeed(ctx context.Context, vm corrosion.VMRecord, 
 		changed, err = cloudinit.RebuildISO(iso, nc, cloudinit.SeedVendorData(spec, nc))
 	}
 	if err != nil {
-		detail := fmt.Sprintf("the VM's seed at %s on %s could not be brought up to date with its NICs: %v; the VM starts on it as it is, so a NIC attached or detached since the seed was written may lose its configuration in the guest at this boot; the next start or NIC attach or detach of the VM on %s tries again", iso, r.hostName, err, r.hostName)
-		slog.Warn("reconciler: "+detail, "vm", vm.Name)
-		_ = corrosion.InsertVMEvent(ctx, r.db, corrosion.VMEventRecord{
-			ID: randid.New(), VMName: vm.Name, HostName: r.hostName, Type: "seed.rebuild_failed",
-			Result: "error", Severity: "warning", Detail: detail, Username: "reconciler",
-		})
+		warn(err)
 		return
 	}
 	if changed {
@@ -2396,11 +2406,13 @@ func (r *Reconciler) refreshOwnSeed(ctx context.Context, vm corrosion.VMRecord, 
 // seedIsCurrent reports whether the VM's seed at iso on this host is the one
 // it runs on here, not a copy kept from an earlier stay: the VM's domain
 // definition here attaches it and has exactly the VM's live NICs (an attach
-// or detach on this host changes both, and rebuilds the seed with them). A
+// or detach on this host changes both, and rebuilds the seed with them), and
+// no rebuild of it has failed since the last that succeeded (a failed one
+// leaves the domain with NICs the seed does not list: MarkSeedStale). A
 // current seed's names are complete: a NIC it does not list was never named,
 // such as one an earlier release attached.
 func (r *Reconciler) seedIsCurrent(ctx context.Context, vmName, iso string) bool {
-	if r.virt == nil || !r.virt.DomainExists(vmName) {
+	if r.virt == nil || cloudinit.SeedMarkedStale(iso) || !r.virt.DomainExists(vmName) {
 		return false
 	}
 	x, err := r.virt.DumpXMLInactive(vmName)

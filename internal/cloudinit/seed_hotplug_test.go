@@ -501,3 +501,39 @@ func TestGoISO_SwitchEndsWithItsTest(t *testing.T) {
 		t.Error("a seed was built without genisoimage after the test that allowed it ended")
 	}
 }
+
+// T2 fix round 2, R1: a seed's stale mark lasts until a rebuild of it
+// succeeds — RebuildISO, whether or not it had to rewrite, or the seed
+// written again — and goes with the seed when it is removed.
+//
+// Mutation: keep the mark after a RebuildISO that changed nothing — red;
+// keep it after GenerateISO — red; leave it behind on RemoveSeed — red.
+func TestSeedStaleMark(t *testing.T) {
+	UseGoISOWithoutGenisoimage(t)
+	iso := filepath.Join(t.TempDir(), "m.iso")
+	if err := GenerateISO(Config{InstanceID: "m", NetworkConfig: "version: 2\nethernets: {}\n"}, iso); err != nil {
+		t.Fatal(err)
+	}
+	mark := func() {
+		t.Helper()
+		if err := MarkSeedStale(iso); err != nil || !SeedMarkedStale(iso) {
+			t.Fatalf("MarkSeedStale: %v", err)
+		}
+	}
+	mark()
+	if _, err := RebuildISO(iso, "version: 2\nethernets: {}\n", ""); err != nil || SeedMarkedStale(iso) {
+		t.Errorf("a rebuild that changed nothing kept the mark (%v)", err)
+	}
+	mark()
+	if changed, err := RebuildISO(iso, "", ""); err != nil || !changed || SeedMarkedStale(iso) {
+		t.Errorf("a rebuild that rewrote kept the mark (%v, %v)", changed, err)
+	}
+	mark()
+	if err := GenerateISO(Config{InstanceID: "m"}, iso); err != nil || SeedMarkedStale(iso) {
+		t.Errorf("the seed written again kept the mark (%v)", err)
+	}
+	mark()
+	if err := RemoveSeed(iso); err != nil || SeedMarkedStale(iso) {
+		t.Errorf("RemoveSeed left the mark (%v)", err)
+	}
+}

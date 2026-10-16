@@ -35,6 +35,7 @@ func (s Seed) InstanceID() string {
 // instance-id would run first boot again). It reports whether the seed was
 // rewritten: a seed that already carries both is left as it is. A seed that
 // cannot be read, or names no instance-id, is left as it is and is an error.
+// A seed that now carries both loses its stale mark (MarkSeedStale).
 func RebuildISO(path, networkConfig, vendorData string) (bool, error) {
 	seed, err := ReadSeed(path)
 	if err != nil {
@@ -44,6 +45,7 @@ func RebuildISO(path, networkConfig, vendorData string) (bool, error) {
 		return false, fmt.Errorf("seed %s names no instance-id", path)
 	}
 	if seed.NetworkConfig == networkConfig && seed.VendorData == vendorData {
+		clearSeedStale(path)
 		return false, nil
 	}
 	seed.NetworkConfig, seed.VendorData = networkConfig, vendorData

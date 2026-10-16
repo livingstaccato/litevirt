@@ -594,3 +594,96 @@ func TestDomainXMLFor_ACurrentSeedRenamesNoNIC(t *testing.T) {
 		})
 	}
 }
+
+// T2 fix round 2, R1: a start whose refresh of the VM's own stale seed failed
+// defines the domain with the VM's NICs over a seed that lacks one (B). At the
+// next start on this host the domain has exactly the VM's NICs, but the seed
+// still lacks B: the stale mark the failure left keeps it read as stale, and
+// B is eth1, as on the host that attached it, not left unnamed (which the
+// guest would take as a rename). The successful refresh clears the mark.
+//
+// Mutation: ignore the mark in seedIsCurrent — B is unnamed; do not mark on
+// a failed refresh — the same.
+func TestDomainXMLFor_AFailedRefreshLeavesTheSeedStale(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	r, fake, _ := sharedDiskReconciler(t, db)
+	var vm corrosion.VMRecord
+	var spec *pb.VMSpec
+	var iso string
+	t.Run("write the stale seed", func(t *testing.T) {
+		cloudinit.UseGoISOWithoutGenisoimage(t)
+		vm, spec, iso = staleSeedVM(t, r, db)
+	})
+	// No genisoimage and no Go writer: the rewrite fails.
+	t.Setenv("PATH", t.TempDir())
+	if _, _, failure := r.domainXMLFor(ctx, vm, spec, nil); failure != "" {
+		t.Fatalf("the start failed: %s", failure)
+	}
+	if !cloudinit.SeedMarkedStale(iso) {
+		t.Fatal("a failed refresh left no stale mark")
+	}
+	// The domain that start defined: the VM's NICs, A and B.
+	dom := "<domain type='kvm'><name>vm1</name><uuid>vm1-u</uuid><memory unit='MiB'>512</memory><vcpu>1</vcpu><devices>" +
+		"<disk type='file' device='cdrom'><driver name='qemu' type='raw'/><source file='" + iso + "'/><target dev='sdb' bus='sata'/><readonly/></disk>" +
+		"<interface type='bridge'><mac address='52:54:00:aa:00:01'/><source bridge='br0'/></interface>" +
+		"<interface type='bridge'><mac address='52:54:00:aa:00:02'/><source bridge='br1'/></interface>" +
+		"</devices></domain>"
+	if err := fake.DefineDomain(dom); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("the next start", func(t *testing.T) {
+		cloudinit.UseGoISOWithoutGenisoimage(t)
+		if _, _, failure := r.domainXMLFor(ctx, vm, spec, nil); failure != "" {
+			t.Fatalf("domainXMLFor: %s", failure)
+		}
+	})
+	got, err := cloudinit.ReadSeed(iso)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got.NetworkConfig, "macaddress: \"52:54:00:aa:00:02\"\n    set-name: eth1\n") {
+		t.Errorf("want B eth1:\n%s", got.NetworkConfig)
+	}
+	if cloudinit.SeedMarkedStale(iso) {
+		t.Error("the successful refresh left the stale mark")
+	}
+}
+
+// T2 fix round 2, m-a: an own seed that cannot be read is started on as it
+// is, with the same seed.rebuild_failed warning naming the seed, the host and
+// the cause.
+//
+// Mutation: only log it — red.
+func TestDomainXMLFor_AnUnreadableOwnSeedStartsWithAWarning(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	r, _, _ := sharedDiskReconciler(t, db)
+	var vm corrosion.VMRecord
+	var spec *pb.VMSpec
+	var iso string
+	t.Run("write the seed", func(t *testing.T) {
+		cloudinit.UseGoISOWithoutGenisoimage(t)
+		vm, spec, iso = staleSeedVM(t, r, db)
+	})
+	if err := os.WriteFile(iso, []byte("not an ISO"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	domXML, _, failure := r.domainXMLFor(ctx, vm, spec, nil)
+	if failure != "" || !strings.Contains(domXML, iso) {
+		t.Fatalf("the start failed, or does not attach the seed: %q", failure)
+	}
+	evs, err := corrosion.ListVMEvents(ctx, db, "vm1", 50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range evs {
+		if e.Type == "seed.rebuild_failed" && e.Severity == "warning" && strings.Contains(e.Detail, iso) && strings.Contains(e.Detail, "node-a") && strings.Contains(e.Detail, "read it") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("want one seed.rebuild_failed warning naming %s, node-a and the read: %+v", iso, evs)
+	}
+}

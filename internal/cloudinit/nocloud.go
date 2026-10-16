@@ -84,6 +84,7 @@ func writeISO(seed Seed, outputPath string) error {
 	if err := os.Rename(tmp, outputPath); err != nil {
 		return fmt.Errorf("place seed: %w", err)
 	}
+	clearSeedStale(outputPath)
 	return nil
 }
 

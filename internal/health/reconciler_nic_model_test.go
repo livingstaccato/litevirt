@@ -151,3 +151,44 @@ func TestDomainXMLFor_ASwappedNICDefinesWithoutTheOldMTU(t *testing.T) {
 		t.Fatalf("want an e1000 NIC with no MTU:\n%s", x)
 	}
 }
+
+// A failover render of a stack VM's NIC swapped under its MAC from a virtio
+// NIC with an MTU and queues to an e1000 one. The attach leaves a stack VM's
+// spec as its compose file wrote it (a rewritten entry would read as a
+// topology change and recreate the VM at the next deploy), so the entry
+// still says virtio with that tuning. The detach on record makes the NIC
+// render as e1000, and the tuning an e1000 cannot take is left off: the
+// domain is defined instead of refused as non-retryable.
+//
+// Mutation: keep the matched entry's MTU whatever the rendered model
+// (compose.ApplyNICTuning) — the render fails ("an MTU needs the virtio
+// model").
+func TestDomainXMLFor_AStackVMsSwappedNICDefinesWithoutTheOldTuning(t *testing.T) {
+	const mac = "52:54:00:aa:bb:41"
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	r, fake, _ := sharedDiskReconciler(t, db)
+	fake.SetBridgeMTU("br0", 9000)
+	vm := corrosion.VMRecord{Name: "vm1", StackName: "web", HostName: "node-a", Spec: "{}", State: "running", CPUActual: 2, MemActual: 512}
+	if err := corrosion.InsertVMWithHardware(ctx, db, vm,
+		[]corrosion.InterfaceRecord{{VMName: "vm1", NetworkName: "br0", Ordinal: 0, MAC: mac}}, nil,
+		[]corrosion.NICRecord{{VMName: "vm1", ID: corrosion.DeterministicNICID("vm1", mac),
+			NetworkName: "br0", Model: "e1000", MAC: mac, Ordinal: 0}}, nil, false); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := corrosion.InsertOperation(ctx, db, corrosion.OperationRecord{ID: "op-detach",
+		Method: "DetachDevice", ResourceKind: "vm", ResourceID: "vm1",
+		OperationKind: string(corrosion.OpDeviceDetach),
+		RequestHash:   corrosion.NICDetachRequestHash("vm1", mac)}); err != nil {
+		t.Fatalf("InsertOperation: %v", err)
+	}
+	spec := &pb.VMSpec{Name: "vm1", Cpu: 2, MemoryMib: 512,
+		Network: []*pb.NetworkAttachment{{Name: "br0", Model: "virtio", Mac: mac, Mtu: 9000, Queues: 4}}}
+	x, _, failure := r.domainXMLFor(ctx, vm, spec, nil)
+	if failure != "" {
+		t.Fatalf("domainXMLFor: %s", failure)
+	}
+	if !strings.Contains(x, `"e1000"`) || strings.Contains(x, "<mtu") || strings.Contains(x, "queues=") {
+		t.Fatalf("want an e1000 NIC with no MTU and no queues:\n%s", x)
+	}
+}

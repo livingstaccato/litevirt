@@ -296,8 +296,16 @@ func (s *Server) attachNICOwner(ctx context.Context, req *pb.AttachDeviceRequest
 	}
 	// A spec entry with this MAC is a detached NIC's: it describes the new one
 	// from here on, in the spec this operation begins with and in the record
-	// the define below renders from.
-	desiredSpec := specForNICAttach(vm.Spec, mac, model)
+	// the define below renders from. Not on a VM of a stack: its spec is what
+	// its compose file wrote, and a NIC model the file does not say reads as a
+	// topology change, so the next deploy would recreate the VM. Its renders
+	// take the new model from the NIC's row instead (the detach on record),
+	// and leave off the old NIC's tuning the new model cannot take
+	// (compose.ApplyNICTuning).
+	desiredSpec := vm.Spec
+	if vm.StackName == "" {
+		desiredSpec = specForNICAttach(vm.Spec, mac, model)
+	}
 	applied, err := s.db.BeginVMOperation(ctx, op, desiredSpec, vm.OwnerEpoch, vm.SpecGeneration)
 	if err != nil {
 		if errors.Is(err, corrosion.ErrOperationHashConflict) {

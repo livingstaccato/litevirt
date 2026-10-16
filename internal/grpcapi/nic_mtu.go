@@ -184,13 +184,20 @@ func (s *Server) applyNICMTURequest(ctx context.Context, spec *pb.VMSpec, req *p
 	}
 	// An entry made for an unlisted NIC takes its recorded model: the merged
 	// row reads virtio when a newer vm_interfaces row wins the merge.
-	rowModels, err := corrosion.VMNICRowModels(ctx, s.db, req.GetName())
+	rowModels, reattached, err := corrosion.NICModelSources(ctx, s.db, req.GetName(), nics, compose.SpecNICModelsByMAC(spec))
 	if err != nil {
 		return status.Errorf(codes.Internal, "read NIC models of %q: %v", req.GetName(), err)
 	}
+	// The model each live NIC renders with, by ordinal: an MTU is judged
+	// against it as well as against the spec entry, which on a VM of a stack
+	// can be a detached NIC's (a NIC attached again under its MAC with another
+	// model leaves the entry as the compose file wrote it).
+	rendered := make(map[int]string, len(nics))
+	nicModels := compose.NewNICModels(spec, rowModels, reattached)
 	byOrdinal := make(map[int]corrosion.NICRecord, len(nics))
 	for _, ic := range nics {
 		byOrdinal[ic.Ordinal] = ic
+		rendered[ic.Ordinal] = nicModels.Model(ic.MAC, ic.NetworkName, ic.Ordinal, ic.Model)
 	}
 	seen := map[int]bool{}
 	for _, u := range req.GetNicMtu() {
@@ -221,6 +228,11 @@ func (s *Server) applyNICMTURequest(ctx context.Context, spec *pb.VMSpec, req *p
 		n := spec.Network[o]
 		if err := compose.ValidateNICMTU(n.GetModel(), u.GetMtu()); err != nil {
 			return status.Errorf(codes.InvalidArgument, "NIC %d: %v", o, err)
+		}
+		if m, ok := rendered[o]; ok {
+			if err := compose.ValidateNICMTU(m, u.GetMtu()); err != nil {
+				return status.Errorf(codes.InvalidArgument, "NIC %d: %v", o, err)
+			}
 		}
 		n.Mtu = u.GetMtu()
 		if n.Mtu == 0 {

@@ -516,3 +516,51 @@ func TestAcceptsAction_ABareLogSuffixIsADeny(t *testing.T) {
 		}
 	}
 }
+
+// A tag set answers with the networks where the workload has no allocated
+// address although a tag group it is a member of covers them (Track D final
+// review I-2: a VM is leased an address only on a NetBox-bound network), so
+// `lv` can warn. A group that covers only networks where it has a lease, or
+// no group at all, names none. The set itself is never refused.
+//
+// Mutations: name no network — red; name every network a group covers
+// whatever the leases — red.
+func TestSetFirewallTags_NamesTheNetworksAMemberHasNoAddressOn(t *testing.T) {
+	s, _ := tagsServer(t)
+	ctx := adminCtx()
+	tagGroupNetwork(t, s)
+	if err := s.db.Execute(context.Background(),
+		`INSERT INTO networks (name, type, config, created_at, updated_at) VALUES ('dev', 'bridge', '{"Subnet":"10.1.0.0/24"}', 't', 't')`); err != nil {
+		t.Fatal(err)
+	}
+	tagGroupMember(t, s, "web-1", fwA, "52:54:00:00:00:01", "10.0.0.5")
+	if err := s.db.Execute(context.Background(),
+		`INSERT INTO vm_interfaces (vm_name, network_name, ordinal, mac, ip, updated_at) VALUES ('web-1', 'dev', 1, '52:54:00:00:00:02', '', 't')`); err != nil {
+		t.Fatal(err)
+	}
+	set := func() []string {
+		t.Helper()
+		out, err := s.SetFirewallTags(ctx, &pb.SetFirewallTagsRequest{Kind: "vm", Workload: "web-1", Set: map[string]string{"role": "web"}})
+		if err != nil {
+			t.Fatalf("tag set: %v", err)
+		}
+		return out.GetUnaddressedNetworks()
+	}
+
+	if got := set(); len(got) != 0 {
+		t.Fatalf("with no group, unaddressed = %v", got)
+	}
+	if _, err := s.SetFirewallTagGroup(ctx, &pb.SetFirewallTagGroupRequest{Group: &pb.FirewallTagGroup{
+		Name: "web", Match: map[string]string{"role": "web"}, Networks: []string{"prod"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := set(); len(got) != 0 {
+		t.Fatalf("a group covering only prod, where web-1 holds a lease: unaddressed = %v", got)
+	}
+	if _, err := s.SetFirewallTagGroup(ctx, tagGroupReq("web", map[string]string{"role": "web"})); err != nil {
+		t.Fatal(err)
+	}
+	if got := set(); !slices.Equal(got, []string{"dev"}) {
+		t.Fatalf("a group covering every network: unaddressed = %v, want [dev]", got)
+	}
+}

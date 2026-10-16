@@ -943,6 +943,12 @@ lv firewall tag-group rm web
   set; `lv firewall tag-group ls --members` shows it as `no allocated
   address`. A change to a VM's recorded address does not change the set; the
   lease does.
+- A VM has an allocated lease only on a network bound to NetBox. On any other
+  network a VM adds no address to a group's set, though the group's bindings
+  still apply to its NICs there: a `tag:` drop or reject never matches it, so
+  bind a security group with `--sg` instead. `lv firewall tag set` warns, naming the
+  networks, when the workload has no allocated address on a network a group
+  it is a member of covers.
 - A rule references the group as `cidr: tag:<name>` (an `lv sg rule-add`, a
   cluster or host rule, a compose security group or `firewall.cluster-rules`
   entry). It is stored as written and rendered as `@lv_tg_<name>`; it applies
@@ -1058,7 +1064,7 @@ lv firewall nic-guard resume <vm>   # a VM held paused for its guards (see "Held
 # Observe or enforce the per-NIC rules (see "Observe and enforce")
 lv firewall enforce status
 
-# Per-workload firewall tags (see "Firewall tags")
+# Per-workload firewall tags (see "Firewall tags"); web-1 is a VM on a NetBox-bound network
 lv firewall tag set web-1 role=web env=prod
 lv firewall tag set cache-1 --container --host node-2 role=web
 lv firewall tag rm web-1 env

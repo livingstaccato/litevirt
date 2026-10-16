@@ -70,6 +70,7 @@ again.`,
 					return firewallTagRPCError(err)
 				}
 				printFirewallTagsResult(os.Stdout, out)
+				warnUnaddressedNetworks(cmd.ErrOrStderr(), out)
 				return nil
 			})
 		},
@@ -90,6 +91,7 @@ again.`,
 					return firewallTagRPCError(err)
 				}
 				printFirewallTagsResult(os.Stdout, out)
+				warnUnaddressedNetworks(cmd.ErrOrStderr(), out)
 				return nil
 			})
 		},
@@ -163,6 +165,22 @@ func printFirewallTagsResult(w io.Writer, t *pb.FirewallTags) {
 		fmt.Fprintf(w, "note: %s shared its firewall identity with another workload (a copy); the identity's tags were cleared: %s. "+
 			"Set them again with lv firewall tag set where they belong.\n", fwTagWho(t), tagPairs(t.GetDroppedTags()))
 	}
+}
+
+// warnUnaddressedNetworks warns that the workload has no allocated address
+// on networks a tag group it is a member of covers.
+func warnUnaddressedNetworks(w io.Writer, t *pb.FirewallTags) {
+	nets := t.GetUnaddressedNetworks()
+	if len(nets) == 0 {
+		return
+	}
+	word := "network"
+	if len(nets) > 1 {
+		word = "networks"
+	}
+	fmt.Fprintf(w, "warning: %s has no allocated address on %s %s, which a tag group it is a member of covers: "+
+		"a tag: rule never matches its traffic there (a VM is leased an address only on a NetBox-bound network). "+
+		"The group's bound security groups (--sg) still apply.\n", fwTagWho(t), word, strings.Join(nets, ", "))
 }
 
 func printFirewallTagsList(w io.Writer, tags []*pb.FirewallTags) error {

@@ -3973,9 +3973,14 @@ type FirewallTags struct {
 	// unreadable: the workload's tags row cannot be read (malformed). It
 	// grants no membership, and its NICs are held at drop where a tag group
 	// binds security groups (tags shows none).
-	Unreadable    bool `protobuf:"varint,11,opt,name=unreadable,proto3" json:"unreadable,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Unreadable bool `protobuf:"varint,11,opt,name=unreadable,proto3" json:"unreadable,omitempty"`
+	// Set only in a tag set's answer: the networks on which the workload has
+	// no allocated address while a tag group it is a member of covers them.
+	// A tag: rule never matches its traffic there (a VM is leased an address
+	// only on a NetBox-bound network); the group's bindings still apply.
+	UnaddressedNetworks []string `protobuf:"bytes,12,rep,name=unaddressed_networks,json=unaddressedNetworks,proto3" json:"unaddressed_networks,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *FirewallTags) Reset() {
@@ -4083,6 +4088,13 @@ func (x *FirewallTags) GetUnreadable() bool {
 		return x.Unreadable
 	}
 	return false
+}
+
+func (x *FirewallTags) GetUnaddressedNetworks() []string {
+	if x != nil {
+		return x.UnaddressedNetworks
+	}
+	return nil
 }
 
 type PCIDevice struct {
@@ -7651,7 +7663,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\bworkload\x18\x02 \x01(\tR\bworkload\x12\x12\n" +
 	"\x04host\x18\x03 \x01(\tR\x04host\x12\x1c\n" +
 	"\taddresses\x18\x04 \x03(\tR\taddresses\x12!\n" +
-	"\faddress_note\x18\x05 \x01(\tR\vaddressNote\"\xfc\x03\n" +
+	"\faddress_note\x18\x05 \x01(\tR\vaddressNote\"\xaf\x04\n" +
 	"\fFirewallTags\x12\x12\n" +
 	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x1a\n" +
 	"\bworkload\x18\x02 \x01(\tR\bworkload\x12\x12\n" +
@@ -7667,7 +7679,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	" \x03(\v2*.litevirt.v1.FirewallTags.DroppedTagsEntryR\vdroppedTags\x12\x1e\n" +
 	"\n" +
 	"unreadable\x18\v \x01(\bR\n" +
-	"unreadable\x1a7\n" +
+	"unreadable\x121\n" +
+	"\x14unaddressed_networks\x18\f \x03(\tR\x13unaddressedNetworks\x1a7\n" +
 	"\tTagsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a>\n" +

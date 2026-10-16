@@ -298,7 +298,36 @@ func (s *Server) SetFirewallTags(ctx context.Context, req *pb.SetFirewallTagsReq
 	if rec, ok, err := corrosion.ResolveFirewallTags(ctx, s.db, kind, id); err == nil && ok {
 		out.UpdatedAt = rec.UpdatedAt
 	}
+	out.UnaddressedNetworks = s.unaddressedTagNetworks(ctx, kind, host, name)
 	return out, nil
+}
+
+// unaddressedTagNetworks names, sorted, the networks on which workload (kind,
+// host, name) has no allocated address while a tag group it is a member of
+// covers them: a tag: rule never matches its traffic there. A VM is leased an
+// address only on a NetBox-bound network. A failed read names none; the set
+// has already been written.
+func (s *Server) unaddressedTagNetworks(ctx context.Context, kind, host, name string) []string {
+	m, err := corrosion.ListTagGroupMembers(ctx, s.db)
+	if err != nil {
+		slog.Warn("tag set: could not read the tag groups' members", "kind", kind, "name", name, "error", err)
+		return nil
+	}
+	var out []string
+	for _, g := range m.Groups {
+		for _, mb := range g.Members {
+			if mb.Kind != kind || mb.Host != host || mb.Name != name {
+				continue
+			}
+			for _, n := range mb.Bound {
+				if !slices.ContainsFunc(mb.Addrs, func(a corrosion.TagGroupAddr) bool { return a.Network == n }) {
+					out = append(out, n)
+				}
+			}
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // fwTagFinishTimeout bounds what a tag set does once a copied identity's

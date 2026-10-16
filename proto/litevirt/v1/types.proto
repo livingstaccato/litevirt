@@ -607,6 +607,11 @@ message FirewallTags {
     // grants no membership, and its NICs are held at drop where a tag group
     // binds security groups (tags shows none).
     bool                unreadable     = 11;
+    // Set only in a tag set's answer: the networks on which the workload has
+    // no allocated address while a tag group it is a member of covers them.
+    // A tag: rule never matches its traffic there (a VM is leased an address
+    // only on a NetBox-bound network); the group's bindings still apply.
+    repeated string     unaddressed_networks = 12;
 }
 
 message PCIDevice {

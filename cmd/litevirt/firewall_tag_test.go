@@ -24,6 +24,7 @@ func (m *mockClient) SetFirewallTags(_ context.Context, in *pb.SetFirewallTagsRe
 		FwId: "0123456789abcdef0123456789abcdef", Tags: tags}
 	if x := m.fwTagsSetExtra; x != nil {
 		out.ReplacedFwId, out.DroppedTags = x.GetReplacedFwId(), x.GetDroppedTags()
+		out.UnaddressedNetworks = x.GetUnaddressedNetworks()
 	}
 	return out, nil
 }
@@ -86,6 +87,26 @@ func TestFirewallTagCLI_SetNamesTheTagsACopyDropped(t *testing.T) {
 	plain, _, err := runCmd(t, &mockClient{}, "firewall", "tag", "set", "web-1", "role=web")
 	if err != nil || strings.Contains(plain, "note:") {
 		t.Fatalf("a plain tag set printed %q (%v)", plain, err)
+	}
+}
+
+// A tag set whose workload has no allocated address on a network a tag group
+// it is a member of covers warns on stderr, naming the networks (Track D final
+// review I-2), and still succeeds; one with an address everywhere does not.
+//
+// Mutation: drop the warning — red.
+func TestFirewallTagCLI_SetWarnsOfNetworksWithNoAddress(t *testing.T) {
+	m := &mockClient{fwTagsSetExtra: &pb.FirewallTags{UnaddressedNetworks: []string{"dev", "lan"}}}
+	out, errOut, err := runCmd(t, m, "firewall", "tag", "set", "web-1", "role=web")
+	if err != nil {
+		t.Fatalf("tag set: %v", err)
+	}
+	assertContains(t, out, "Firewall tags of VM web-1")
+	assertContains(t, errOut, "warning: VM web-1 has no allocated address on networks dev, lan")
+	assertContains(t, errOut, "NetBox-bound network")
+	_, plain, err := runCmd(t, &mockClient{}, "firewall", "tag", "set", "web-1", "role=web")
+	if err != nil || strings.Contains(plain, "warning:") {
+		t.Fatalf("a tag set with an address everywhere warned %q (%v)", plain, err)
 	}
 }
 

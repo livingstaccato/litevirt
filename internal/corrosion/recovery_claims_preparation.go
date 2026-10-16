@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -191,6 +190,7 @@ type proofConfigDiscovery struct {
 	Raw    string
 }
 type proofCandidate struct {
+	raw         string
 	certificate *ClaimCertificate
 	members     []VoterMember
 }
@@ -198,6 +198,7 @@ type proofPreparation struct {
 	ctx        context.Context
 	rows       map[string]proofRowDiscovery
 	configs    map[int64]proofConfigDiscovery
+	members    map[int64][]VoterMember
 	adopted    int64
 	candidates map[string]proofCandidate
 	factory    *func() *ClaimVerifier
@@ -215,51 +216,180 @@ func (p *proofPreparation) charge(n int) error {
 	return nil
 }
 
-func readProofRow(ctx context.Context, tx *sql.Tx, id string) (proofRowDiscovery, error) {
-	var row proofRowDiscovery
-	var length int
-	err := tx.QueryRowContext(ctx, `SELECT length(CAST(claim_certificate AS BLOB)) FROM runtime_action_proofs WHERE id=?`, id).Scan(&length)
-	if errors.Is(err, sql.ErrNoRows) {
-		return row, nil
+// Test-only observation of the actual stored-row body fetch; nil in production.
+var proofRowBodyReadSeam func(string)
+
+// Read lengths, not stored text, before retaining any body. The single-row
+// envelope includes its identifier and every compared binding field.
+func proofRowLengths(ctx context.Context, tx *sql.Tx, id string) (exists bool, lengths [11]int64, err error) {
+	if len(id) > maxProofPreparationBytes {
+		return false, lengths, ErrProofPreparationSize
 	}
+	err = tx.QueryRowContext(ctx, `SELECT length(CAST(claim_certificate AS BLOB)),length(CAST(action AS BLOB)),length(CAST(target_kind AS BLOB)),length(CAST(target_name AS BLOB)),length(CAST(dest_host AS BLOB)),length(CAST(coordinator AS BLOB)),length(CAST(relocation_token AS BLOB)),length(CAST(fence_epoch AS BLOB)),length(CAST(owner_epoch AS BLOB)),length(CAST(lease_term AS BLOB)),length(CAST(lease_key AS BLOB)) FROM runtime_action_proofs WHERE id=?`, id).Scan(&lengths[0], &lengths[1], &lengths[2], &lengths[3], &lengths[4], &lengths[5], &lengths[6], &lengths[7], &lengths[8], &lengths[9], &lengths[10])
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, lengths, nil
+	}
+	if err != nil {
+		return false, lengths, err
+	}
+	if lengths[0] > maxPreparedCertificateBytes {
+		return false, lengths, ErrProofPreparationSize
+	}
+	total := int64(len(id))
+	for _, n := range lengths {
+		if n < 0 || n > int64(maxProofPreparationBytes)-total {
+			return false, lengths, ErrProofPreparationSize
+		}
+		total += n
+	}
+	return true, lengths, nil
+}
+
+func (p *proofPreparation) readRow(tx *sql.Tx, id string) (proofRowDiscovery, error) {
+	var row proofRowDiscovery
+	exists, lengths, err := proofRowLengths(p.ctx, tx, id)
 	if err != nil {
 		return row, err
 	}
-	if length > maxPreparedCertificateBytes {
-		return row, ErrProofPreparationSize
+	if err := p.charge(len(id)); err != nil {
+		return row, err
 	}
-	err = tx.QueryRowContext(ctx, `SELECT claim_certificate,action,target_kind,target_name,dest_host,coordinator,relocation_token,fence_epoch,owner_epoch,lease_term,lease_key FROM runtime_action_proofs WHERE id=?`, id).Scan(&row.Raw, &row.Binding[0], &row.Binding[1], &row.Binding[2], &row.Binding[3], &row.Binding[4], &row.Binding[5], &row.Binding[6], &row.Binding[7], &row.Binding[8], &row.Binding[9])
-	row.Exists = err == nil
-	return row, err
-}
-func readProofConfig(ctx context.Context, tx *sql.Tx, gen, adopted int64) (proofConfigDiscovery, error) {
-	var cfg proofConfigDiscovery
-	if gen < 1 || gen > adopted {
-		return cfg, nil
+	if !exists {
+		return row, nil
 	}
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM voter_configs WHERE deleted_at IS NULL AND generation>? AND generation<=? AND change LIKE 'force:%'`, gen, adopted).Scan(&cfg.Forced); err != nil {
-		return cfg, err
+	bindingBytes := 0
+	for _, n := range lengths[1:] {
+		bindingBytes += int(n)
 	}
-	var length int
-	err := tx.QueryRowContext(ctx, `SELECT length(CAST(members_json AS BLOB)) FROM voter_configs WHERE generation=? AND deleted_at IS NULL`, gen).Scan(&length)
-	if errors.Is(err, sql.ErrNoRows) {
-		return cfg, nil
+	if err := p.charge(bindingBytes); err != nil {
+		return row, err
 	}
+	rawBytes := int(lengths[0])
+	reused := false
+	// If a new body would cross the budget, compare against already-owned raw
+	// candidates inside SQLite. Never fetch an over-budget body just to dedup it.
+	if rawBytes > maxProofPreparationBytes-p.bytes {
+		for raw := range p.candidates {
+			if len(raw) != rawBytes {
+				continue
+			}
+			var same bool
+			if err := tx.QueryRowContext(p.ctx, `SELECT CAST(claim_certificate AS BLOB)=CAST(? AS BLOB) FROM runtime_action_proofs WHERE id=?`, raw, id).Scan(&same); err != nil {
+				return row, err
+			}
+			if same {
+				row.Raw = raw
+				reused = true
+				break
+			}
+		}
+	}
+	if !reused {
+		if err := p.charge(rawBytes); err != nil {
+			return row, err
+		}
+	}
+	if proofRowBodyReadSeam != nil {
+		proofRowBodyReadSeam(id)
+	}
+	var fetched string
+	err = tx.QueryRowContext(p.ctx, `SELECT CASE WHEN ? THEN '' ELSE claim_certificate END,action,target_kind,target_name,dest_host,coordinator,relocation_token,fence_epoch,owner_epoch,lease_term,lease_key FROM runtime_action_proofs WHERE id=?`, reused, id).Scan(&fetched, &row.Binding[0], &row.Binding[1], &row.Binding[2], &row.Binding[3], &row.Binding[4], &row.Binding[5], &row.Binding[6], &row.Binding[7], &row.Binding[8], &row.Binding[9])
 	if err != nil {
-		return cfg, err
+		return row, err
 	}
-	if length > maxPreparedConfigBytes {
-		return cfg, ErrProofPreparationSize
+	if !reused {
+		row.Raw = fetched
+		if known, ok := p.candidates[fetched]; ok {
+			row.Raw = known.raw
+			p.bytes -= rawBytes
+		}
 	}
-	err = tx.QueryRowContext(ctx, `SELECT members_json FROM voter_configs WHERE generation=? AND deleted_at IS NULL`, gen).Scan(&cfg.Raw)
-	cfg.Exists = err == nil
-	return cfg, err
+	row.Exists = true
+	return row, nil
 }
 
-// discoverProofPreparation owns only DB state. It never invokes the verifier
-// factory, a PKI getter, or a writer. Both exact compared candidates are owned.
+func proofConfigMetadata(ctx context.Context, tx *sql.Tx, gen, adopted int64) (cfg proofConfigDiscovery, length int, err error) {
+	if gen < 1 || gen > adopted {
+		return cfg, 0, nil
+	}
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM voter_configs WHERE deleted_at IS NULL AND generation>? AND generation<=? AND change LIKE 'force:%'`, gen, adopted).Scan(&cfg.Forced); err != nil {
+		return cfg, 0, err
+	}
+	err = tx.QueryRowContext(ctx, `SELECT length(CAST(members_json AS BLOB)) FROM voter_configs WHERE generation=? AND deleted_at IS NULL`, gen).Scan(&length)
+	if errors.Is(err, sql.ErrNoRows) {
+		return cfg, 0, nil
+	}
+	if err != nil {
+		return cfg, 0, err
+	}
+	if length < 0 || length > maxPreparedConfigBytes {
+		return cfg, 0, ErrProofPreparationSize
+	}
+	cfg.Exists = true
+	return cfg, length, nil
+}
+
+func (p *proofPreparation) addCandidate(tx *sql.Tx, raw string, charged bool) error {
+	if _, ok := p.candidates[raw]; ok {
+		return nil
+	}
+	if len(raw) > maxPreparedCertificateBytes {
+		return ErrProofPreparationSize
+	}
+	if !charged {
+		if err := p.charge(len(raw)); err != nil {
+			return err
+		}
+	}
+	cert, err := decodePreparedCertificate(raw)
+	if errors.Is(err, ErrProofPreparationSize) {
+		return err
+	}
+	candidate := proofCandidate{raw: raw, certificate: cert}
+	p.candidates[raw] = candidate
+	if err != nil || cert.ConfigGeneration < 1 || cert.ConfigGeneration > p.adopted {
+		return nil
+	}
+	gen := cert.ConfigGeneration
+	cfg, ok := p.configs[gen]
+	if !ok {
+		var length int
+		cfg, length, err = proofConfigMetadata(p.ctx, tx, gen, p.adopted)
+		if err != nil {
+			return err
+		}
+		if err = p.charge(length); err != nil {
+			return err
+		}
+		if cfg.Exists {
+			if err = tx.QueryRowContext(p.ctx, `SELECT members_json FROM voter_configs WHERE generation=? AND deleted_at IS NULL`, gen).Scan(&cfg.Raw); err != nil {
+				return err
+			}
+		}
+		p.configs[gen] = cfg
+		if cfg.Exists && cfg.Forced == 0 {
+			err = preflightProofJSON(cfg.Raw, true)
+			if errors.Is(err, ErrProofPreparationSize) {
+				return err
+			}
+			if err == nil {
+				var members []VoterMember
+				if json.Unmarshal([]byte(cfg.Raw), &members) == nil {
+					p.members[gen] = members
+				}
+			}
+		}
+	}
+	candidate.members = p.members[gen]
+	p.candidates[raw] = candidate
+	return nil
+}
+
+// Discovery charges each retained body before materialization and processes it
+// incrementally. Shared exact certificates and each generation's decoded member
+// set remain privately owned once, rather than once per compared candidate.
 func (c *Client) discoverProofPreparation(ctx context.Context, ids []string, incoming []string) (*proofPreparation, error) {
-	p := &proofPreparation{ctx: ctx, rows: map[string]proofRowDiscovery{}, configs: map[int64]proofConfigDiscovery{}, candidates: map[string]proofCandidate{}, factory: c.claimCertVerifier.Load()}
+	p := &proofPreparation{ctx: ctx, rows: map[string]proofRowDiscovery{}, configs: map[int64]proofConfigDiscovery{}, members: map[int64][]VoterMember{}, candidates: map[string]proofCandidate{}, factory: c.claimCertVerifier.Load()}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -270,63 +400,133 @@ func (c *Client) discoverProofPreparation(ctx context.Context, ids []string, inc
 		return nil, err
 	}
 	defer tx.Rollback()
-	raws := append([]string(nil), incoming...)
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(generation),0) FROM local_voter_adoption`).Scan(&p.adopted); err != nil {
+		return nil, err
+	}
+	// Fixed-size metadata is checked across the whole chunk before an earlier
+	// aggregate boundary can hide a later individually unsupported row.
+	for _, id := range ids {
+		if _, _, err := proofRowLengths(ctx, tx, id); err != nil {
+			return nil, err
+		}
+	}
+	for _, raw := range incoming {
+		if err := p.addCandidate(tx, raw, false); err != nil {
+			return nil, err
+		}
+	}
 	for _, id := range ids {
 		if _, ok := p.rows[id]; ok {
 			continue
 		}
-		row, err := readProofRow(ctx, tx, id)
+		row, err := p.readRow(tx, id)
 		if err != nil {
 			return nil, err
 		}
 		p.rows[id] = row
-		raws = append(raws, row.Raw)
-	}
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(generation),0) FROM local_voter_adoption`).Scan(&p.adopted); err != nil {
-		return nil, err
-	}
-	for _, raw := range raws {
-		if _, ok := p.candidates[raw]; ok {
-			continue
-		}
-		if err := p.charge(len(raw)); err != nil {
+		if err := p.addCandidate(tx, row.Raw, true); err != nil {
 			return nil, err
+		}
+	}
+	return p, nil
+}
+
+// Before subdivision can commit a prefix, check individual decoded limits in
+// every candidate in one read snapshot. This pass retains no chunk bodies or
+// member collections. Each certificate is individually bounded and discarded
+// before the next; configurations are length-preflighted and scanned one at a
+// time. Subsequent subchunks still discover and recheck their exact own facts.
+func (c *Client) preflightProofSubdivision(ctx context.Context, ids, incoming []string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var adopted int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(generation),0) FROM local_voter_adoption`).Scan(&adopted); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if _, _, err := proofRowLengths(ctx, tx, id); err != nil {
+			return err
+		}
+	}
+	checked := map[int64]bool{}
+	checkConfig := func(gen int64) error {
+		if checked[gen] || gen < 1 || gen > adopted {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		cfg, _, err := proofConfigMetadata(ctx, tx, gen, adopted)
+		if err != nil {
+			return err
+		}
+		if cfg.Exists && cfg.Forced == 0 {
+			var raw string
+			if err := tx.QueryRowContext(ctx, `SELECT members_json FROM voter_configs WHERE generation=? AND deleted_at IS NULL`, gen).Scan(&raw); err != nil {
+				return err
+			}
+			if err := preflightProofJSON(raw, true); errors.Is(err, ErrProofPreparationSize) {
+				return err
+			}
+		}
+		checked[gen] = true
+		return nil
+	}
+	// Decode one bounded candidate to preserve the ordinary malformed-input
+	// fallback exactly. Its accepts are not retained across candidates or config
+	// loads; only the generation survives this helper's return.
+	generation := func(raw string) (int64, error) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
 		}
 		cert, err := decodePreparedCertificate(raw)
 		if errors.Is(err, ErrProofPreparationSize) {
-			return nil, err
-		}
-		candidate := proofCandidate{certificate: cert}
-		p.candidates[raw] = candidate
-		if err != nil || cert.ConfigGeneration < 1 || cert.ConfigGeneration > p.adopted {
-			continue
-		}
-		cfg, ok := p.configs[cert.ConfigGeneration]
-		if !ok {
-			cfg, err = readProofConfig(ctx, tx, cert.ConfigGeneration, p.adopted)
-			if err != nil {
-				return nil, err
-			}
-			if err = p.charge(len(cfg.Raw)); err != nil {
-				return nil, err
-			}
-			p.configs[cert.ConfigGeneration] = cfg
-		}
-		if !cfg.Exists || cfg.Forced != 0 {
-			continue
-		}
-		if err = preflightProofJSON(cfg.Raw, true); errors.Is(err, ErrProofPreparationSize) {
-			return nil, err
+			return 0, err
 		}
 		if err != nil {
+			return 0, nil
+		}
+		return cert.ConfigGeneration, nil
+	}
+	for _, raw := range incoming {
+		gen, err := generation(raw)
+		if err != nil {
+			return err
+		}
+		if err := checkConfig(gen); err != nil {
+			return err
+		}
+	}
+	for _, id := range ids {
+		exists, _, err := proofRowLengths(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if !exists {
 			continue
 		}
-		if err = json.Unmarshal([]byte(cfg.Raw), &candidate.members); err != nil {
-			candidate.members = nil
+		var raw string
+		if err := tx.QueryRowContext(ctx, `SELECT claim_certificate FROM runtime_action_proofs WHERE id=?`, id).Scan(&raw); err != nil {
+			return err
 		}
-		p.candidates[raw] = candidate
+		gen, err := generation(raw)
+		raw = ""
+		if err != nil {
+			return err
+		}
+		if err := checkConfig(gen); err != nil {
+			return err
+		}
 	}
-	return p, nil
+	return nil
 }
 
 func (p *proofPreparation) prepare() error {
@@ -401,21 +601,43 @@ func (p *proofPreparation) recheck(c *Client, tx *sql.Tx) error {
 		return ErrProofPreparationChanged
 	}
 	for id, was := range p.rows {
-		now, err := readProofRow(p.ctx, tx, id)
+		exists, _, err := proofRowLengths(p.ctx, tx, id)
 		if err != nil {
 			return err
 		}
-		if now != was {
+		if exists != was.Exists {
+			return ErrProofPreparationChanged
+		}
+		if !exists {
+			continue
+		}
+		// Comparison returns only a boolean: even changed stored fields are never
+		// materialized into another retained row during the final transaction.
+		var same bool
+		err = tx.QueryRowContext(p.ctx, `SELECT CAST(claim_certificate AS BLOB)=CAST(? AS BLOB) AND CAST(action AS BLOB)=CAST(? AS BLOB) AND CAST(target_kind AS BLOB)=CAST(? AS BLOB) AND CAST(target_name AS BLOB)=CAST(? AS BLOB) AND CAST(dest_host AS BLOB)=CAST(? AS BLOB) AND CAST(coordinator AS BLOB)=CAST(? AS BLOB) AND CAST(relocation_token AS BLOB)=CAST(? AS BLOB) AND CAST(fence_epoch AS BLOB)=CAST(? AS BLOB) AND CAST(owner_epoch AS BLOB)=CAST(? AS BLOB) AND CAST(lease_term AS BLOB)=CAST(? AS BLOB) AND CAST(lease_key AS BLOB)=CAST(? AS BLOB) FROM runtime_action_proofs WHERE id=?`, was.Raw, was.Binding[0], was.Binding[1], was.Binding[2], was.Binding[3], was.Binding[4], was.Binding[5], was.Binding[6], was.Binding[7], was.Binding[8], was.Binding[9], id).Scan(&same)
+		if err != nil {
+			return err
+		}
+		if !same {
 			return ErrProofPreparationChanged
 		}
 	}
 	for gen, was := range p.configs {
-		now, err := readProofConfig(p.ctx, tx, gen, adopted)
+		now, length, err := proofConfigMetadata(p.ctx, tx, gen, adopted)
 		if err != nil {
 			return err
 		}
-		if !reflect.DeepEqual(now, was) {
+		if now.Exists != was.Exists || now.Forced != was.Forced || length != len(was.Raw) {
 			return ErrProofPreparationChanged
+		}
+		if now.Exists {
+			var same bool
+			if err := tx.QueryRowContext(p.ctx, `SELECT CAST(members_json AS BLOB)=CAST(? AS BLOB) FROM voter_configs WHERE generation=? AND deleted_at IS NULL`, was.Raw, gen).Scan(&same); err != nil {
+				return err
+			}
+			if !same {
+				return ErrProofPreparationChanged
+			}
 		}
 	}
 	return nil
@@ -474,6 +696,9 @@ func (c *Client) mergePreparedProofChunk(table syncTable, rows [][]interface{}, 
 			err = prepared.prepare()
 		}
 		if errors.Is(err, errProofPreparationAggregate) && len(rows) > 1 {
+			if err := c.preflightProofSubdivision(ctx, ids, raws); err != nil {
+				return 0, 0, proofPreparationError(err)
+			}
 			middle := len(rows) / 2
 			m, s, e := c.mergePreparedProofChunk(table, rows[:middle], insertSQL, pkCols, pkIdx, updatedAtIdx)
 			if e != nil {

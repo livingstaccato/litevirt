@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/litevirt/litevirt/internal/pki"
@@ -665,5 +666,272 @@ func TestPreparedProofMultiChunkFailureReleasesTrustAndResumes(t *testing.T) {
 		if table.Rows[i][step] != name {
 			t.Fatal("retry mutated source row")
 		}
+	}
+}
+
+func TestProofDiscoveryPreflightsStoredBodies(t *testing.T) {
+	for _, kind := range []string{"aggregate", "binding"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newCertFixture(t)
+			c := f.voters[0].c
+			ctx := context.Background()
+			c.SetRecoveryClaimGate(func() bool { return true })
+			good, _ := f.cert.Encode()
+			var ids []string
+			count := 4
+			if kind == "binding" {
+				count = 1
+			}
+			for i := 0; i < count; i++ {
+				proof := *f.value.Proof
+				proof.ID = fmt.Sprintf("bounded-stored-%d", i)
+				if kind == "binding" {
+					proof.ID = f.value.Proof.ID
+				}
+				proof.ClaimCertificate = good
+				if kind == "aggregate" {
+					proof.ClaimCertificate = good + strings.Repeat(" ", maxPreparedCertificateBytes-len(good)-i) + strings.Repeat("\t", i)
+				}
+				if err := WriteActionProof(ctx, c, proof); err != nil {
+					t.Fatal(err)
+				}
+				ids = append(ids, proof.ID)
+			}
+			if kind == "binding" {
+				c.mu.Lock()
+				_, err := c.db.Exec(`UPDATE runtime_action_proofs SET relocation_token=? WHERE id=?`, strings.Repeat("x", maxProofPreparationBytes+1), ids[0])
+				c.mu.Unlock()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			var fetched []string
+			proofRowBodyReadSeam = func(id string) { fetched = append(fetched, id) }
+			defer func() { proofRowBodyReadSeam = nil }()
+			_, err := c.discoverProofPreparation(ctx, ids, nil)
+			if kind == "aggregate" {
+				if !errors.Is(err, errProofPreparationAggregate) {
+					t.Fatal("stored aggregate not refused", err)
+				}
+				if len(fetched) > 3 {
+					t.Fatalf("fetched over-budget stored row body: %v", fetched)
+				}
+				p, err := c.discoverProofPreparation(ctx, ids[:2], nil)
+				if err != nil {
+					t.Fatal("supported subdivision did not progress", err)
+				}
+				p.release()
+				peer := f.voters[1].c
+				peer.SetRecoveryClaimGate(func() bool { return true })
+				c.SetClaimCertificateVerifier(func() *ClaimVerifier { return f.verifier })
+				for _, id := range ids {
+					proof := *f.value.Proof
+					proof.ID = id
+					proof.ClaimCertificate = good
+					if err := WriteActionProof(ctx, peer, proof); err != nil {
+						t.Fatal(err)
+					}
+				}
+				payload, err := decompressPayload(peer.DumpSensitiveStateBytes())
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, row := range payload.Tables[0].Rows {
+					row[indexOf(payload.Tables[0].Columns, "step_state")] = "progress"
+				}
+				before, err := json.Marshal(payload)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := c.mergeStatePayloadLWWWithAllowlist(payload, sensitiveTableSet); err != nil {
+					t.Fatal("stored aggregate subdivision failed", err)
+				}
+				after, err := json.Marshal(payload)
+				if err != nil || string(before) != string(after) {
+					t.Fatal("subdivision changed incoming rows", err)
+				}
+				for _, id := range ids {
+					got, _, err := GetActionProof(ctx, c, id)
+					if err != nil || !ProofStepDone(got.StepState, "progress") {
+						t.Fatal("subdivision omitted row", id, err)
+					}
+				}
+			} else {
+				if !errors.Is(err, ErrProofPreparationSize) || errors.Is(err, errProofPreparationAggregate) {
+					t.Fatal("oversized binding not individual operational error", err)
+				}
+				if len(fetched) != 0 {
+					t.Fatal("oversized binding materialized before refusal", fetched)
+				}
+				proof := *f.value.Proof
+				proof.ID = ids[0]
+				proof.ClaimCertificate = good
+				if err := SetProofClaimCertificate(ctx, c, proof); !errors.Is(err, ErrProofPreparationSize) || errors.Is(err, ErrNoRowsAffected) {
+					t.Fatal("oversized binding became ranking verdict", err)
+				}
+			}
+		})
+	}
+}
+
+func TestProofDiscoverySharesOneOwnedMemberSet(t *testing.T) {
+	f := newCertFixture(t)
+	c := f.voters[0].c
+	ctx := context.Background()
+	members := []VoterMember{{Name: "host", Incarnation: strings.Repeat("i", 2<<20)}}
+	rawMembers, err := json.Marshal(members)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	_, err = c.db.Exec(`UPDATE voter_configs SET members_json=? WHERE generation=1`, string(rawMembers))
+	c.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var incoming []string
+	for i := 0; i < 24; i++ {
+		cert := f.cert
+		cert.Ballot.Round = uint64(i + 1)
+		raw, err := cert.Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		incoming = append(incoming, raw)
+	}
+	p, err := c.discoverProofPreparation(ctx, nil, incoming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.release()
+	var first *VoterMember
+	for _, candidate := range p.candidates {
+		if len(candidate.members) != 1 || candidate.members[0].Incarnation != members[0].Incarnation {
+			t.Fatal("lost decoded members")
+		}
+		if first == nil {
+			first = &candidate.members[0]
+		} else if first != &candidate.members[0] {
+			t.Fatal("shared config materialized multiple retained member sets")
+		}
+	}
+	members[0].Name = "caller-mutated"
+	rawMembers[0] = '!'
+	if first.Name != "host" {
+		t.Fatal("prepared member set aliases caller storage")
+	}
+}
+
+func TestProofRecheckRejectsOversizedBindingBeforeMaterialization(t *testing.T) {
+	f := newCertFixture(t)
+	c := f.voters[0].c
+	ctx := context.Background()
+	c.SetRecoveryClaimGate(func() bool { return true })
+	proof := *f.value.Proof
+	proof.ClaimCertificate, _ = f.cert.Encode()
+	if err := WriteActionProof(ctx, c, proof); err != nil {
+		t.Fatal(err)
+	}
+	calls, fetches := 0, 0
+	proofRowBodyReadSeam = func(string) { fetches++ }
+	defer func() { proofRowBodyReadSeam = nil }()
+	c.SetClaimCertificateVerifier(func() *ClaimVerifier {
+		calls++
+		c.mu.Lock()
+		_, err := c.db.Exec(`UPDATE runtime_action_proofs SET target_name=? WHERE id=?`, strings.Repeat("x", maxProofPreparationBytes+1), proof.ID)
+		c.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f.verifier
+	})
+	err := SetProofClaimCertificate(ctx, c, proof)
+	if !errors.Is(err, ErrProofPreparationSize) || errors.Is(err, errProofPreparationAggregate) {
+		t.Fatal("recheck did not refuse oversized changed binding", err)
+	}
+	if calls != 1 || fetches != 1 {
+		t.Fatalf("recheck fetched changed body or retried oversized row: factory=%d body=%d", calls, fetches)
+	}
+	c.mu.Lock()
+	_, err = c.db.Exec(`UPDATE runtime_action_proofs SET target_name=? WHERE id=?`, proof.TargetName, proof.ID)
+	c.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetClaimCertificateVerifier(func() *ClaimVerifier { return f.verifier })
+	if err := SetProofClaimCertificate(ctx, c, proof); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatal("repair after oversized recheck failed to progress", err)
+	}
+}
+
+func TestProofStoredTailIndividualLimitPrecedesSubdivision(t *testing.T) {
+	for _, kind := range []string{"binding", "decoded-pem", "members"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newCertFixture(t)
+			c, peer := f.voters[0].c, f.voters[1].c
+			ctx := context.Background()
+			c.SetRecoveryClaimGate(func() bool { return true })
+			peer.SetRecoveryClaimGate(func() bool { return true })
+			c.SetClaimCertificateVerifier(func() *ClaimVerifier { return f.verifier })
+			if kind == "members" {
+				adoptHandBuilt(t, 2, membersOf(f.voters...), f.voters...)
+			}
+			good, _ := f.cert.Encode()
+			for i := 0; i < 5; i++ {
+				proof := *f.value.Proof
+				proof.ID = fmt.Sprintf("stored-tail-%d", i)
+				proof.ClaimCertificate = good
+				if err := WriteActionProof(ctx, peer, proof); err != nil {
+					t.Fatal(err)
+				}
+				if i < 4 {
+					proof.ClaimCertificate = good + strings.Repeat(" ", maxPreparedCertificateBytes-len(good)-i) + strings.Repeat("\t", i)
+				}
+				if err := WriteActionProof(ctx, c, proof); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var err error
+			c.mu.Lock()
+			switch kind {
+			case "binding":
+				_, err = c.db.Exec(`UPDATE runtime_action_proofs SET relocation_token=? WHERE id='stored-tail-4'`, strings.Repeat("x", maxProofPreparationBytes+1))
+			case "decoded-pem":
+				_, err = c.db.Exec(`UPDATE runtime_action_proofs SET claim_certificate=? WHERE id='stored-tail-4'`, `{"config_generation":1,"accepts":[{"cert_pem":"`+strings.Repeat("a", maxPreparedAcceptPEMBytes+1)+`"}]}`)
+			case "members":
+				_, err = c.db.Exec(`UPDATE voter_configs SET members_json=? WHERE generation=2`, `[`+strings.Repeat(`{},`, maxPreparedMembers)+`{}]`)
+				if err == nil {
+					_, err = c.db.Exec(`UPDATE runtime_action_proofs SET claim_certificate=? WHERE id='stored-tail-4'`, `{"config_generation":2,"accepts":[]}`)
+				}
+			}
+			c.mu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload, err := decompressPayload(peer.DumpSensitiveStateBytes())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, row := range payload.Tables[0].Rows {
+				row[indexOf(payload.Tables[0].Columns, "step_state")] = "must-not-commit"
+			}
+			fetches := 0
+			proofRowBodyReadSeam = func(string) { fetches++ }
+			defer func() { proofRowBodyReadSeam = nil }()
+			err = c.mergeStatePayloadLWWWithAllowlist(payload, sensitiveTableSet)
+			if !errors.Is(err, ErrProofPreparationSize) || errors.Is(err, errProofPreparationAggregate) {
+				t.Fatal("stored individual limit became splittable", err)
+			}
+			c.mu.Lock()
+			var written int
+			err = c.db.QueryRow(`SELECT COUNT(*) FROM runtime_action_proofs WHERE step_state<>''`).Scan(&written)
+			c.mu.Unlock()
+			if err != nil || written != 0 {
+				t.Fatalf("late individually oversized stored value committed siblings: %d, %v", written, err)
+			}
+			if kind == "binding" && fetches != 0 {
+				t.Fatal("fetched bodies before checking all individual stored lengths", fetches)
+			}
+		})
 	}
 }

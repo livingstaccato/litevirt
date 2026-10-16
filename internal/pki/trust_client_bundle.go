@@ -35,7 +35,7 @@ func InstallCLIClientFiles(ctx context.Context, dir string, ca, cert, key []byte
 	}
 	defer lock.release()
 	active := len(owner.root) != 0 || owner.servedFingerprint != [32]byte{} || owner.retired
-	for _, name := range []string{"host.crt", "host.key"} {
+	for _, name := range []string{"host.crt", "host.key", hostDirName} {
 		if _, e := os.Lstat(filepath.Join(owner.dir, name)); e == nil {
 			active = true
 		} else if !errors.Is(e, os.ErrNotExist) {

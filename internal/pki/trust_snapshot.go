@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"time"
 )
@@ -232,6 +233,17 @@ func (o *trustOwner) captureLocked(host string) (*HostTrust, error) {
 				return nil, err
 			}
 		}
+	}
+	// Leaf and visible-parent syncs do not persist host.d/current. Reconcile
+	// that intermediate directory entry before certifying an active switch.
+	if _, err := os.Lstat(hostDir(o.dir)); err == nil {
+		if err := syncTrustDirectory(hostDir(o.dir)); err != nil {
+			o.dirty = err
+			return nil, err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		o.dirty = err
+		return nil, err
 	}
 	if v.digest != o.digest {
 		o.invalidateLocked()

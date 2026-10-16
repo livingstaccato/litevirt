@@ -650,3 +650,130 @@ func TestHostInitDoesNotRegenerateMissingEstablishedOperatorCA(t *testing.T) {
 		}
 	}
 }
+
+func TestCLIClientRetainedDomainProcess(t *testing.T) {
+	mode := os.Getenv("LITEVIRT_RETAINED_COPY_MODE")
+	if mode == "" {
+		t.Skip("subprocess only")
+	}
+	dir := os.Getenv("LITEVIRT_RETAINED_COPY_DIR")
+	if mode == "daemon" {
+		if err := pki.RegisterDaemonHostDomain(context.Background(), dir); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(os.Getenv("LITEVIRT_RETAINED_COPY_READY"), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+		var b [1]byte
+		_, _ = os.Stdin.Read(b[:])
+		return
+	}
+	if err := installCLIClientBundle(os.Getenv("LITEVIRT_RETAINED_COPY_SOURCE"), cliPKITarget{dir: dir}); err == nil {
+		t.Fatal("fresh CLI copy replaced retained host domain root")
+	}
+}
+
+func TestCLIClientFreshProcessPreservesRetainedDomain(t *testing.T) {
+	for _, layout := range []string{"retained", "dangling", "unknown"} {
+		for _, alias := range []bool{false, true} {
+			for _, daemon := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/alias=%v/daemon=%v", layout, alias, daemon), func(t *testing.T) {
+					fixture := newRenewFixture(t)
+					dir := fixture.op
+					if err := pki.GenerateHostCert(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"), filepath.Join(dir, "host.crt"), filepath.Join(dir, "host.key"), "operator-host", nil); err != nil {
+						t.Fatal(err)
+					}
+					if _, _, err := pki.RenewLocal(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"), dir, "operator-host"); err != nil {
+						t.Fatal(err)
+					}
+					source := t.TempDir()
+					mustCA(t, source)
+					for _, name := range []string{"client.crt", "client.key"} {
+						if err := os.WriteFile(filepath.Join(source, name), []byte("different client material"), 0600); err != nil {
+							t.Fatal(err)
+						}
+					}
+					exe, err := os.Executable()
+					if err != nil {
+						t.Fatal(err)
+					}
+					if daemon {
+						ready := filepath.Join(t.TempDir(), "ready")
+						child := exec.Command(exe, "-test.run=^TestCLIClientRetainedDomainProcess$")
+						child.Env = append(os.Environ(), "LITEVIRT_RETAINED_COPY_MODE=daemon", "LITEVIRT_RETAINED_COPY_DIR="+dir, "LITEVIRT_RETAINED_COPY_READY="+ready)
+						stdin, err := child.StdinPipe()
+						if err != nil {
+							t.Fatal(err)
+						}
+						if err := child.Start(); err != nil {
+							t.Fatal(err)
+						}
+						defer func() { _ = stdin.Close(); _ = child.Process.Kill(); _ = child.Wait() }()
+						deadline := time.Now().Add(5 * time.Second)
+						for {
+							if _, err := os.Stat(ready); err == nil {
+								break
+							}
+							if time.Now().After(deadline) {
+								t.Fatal("daemon SH not acquired")
+							}
+							time.Sleep(5 * time.Millisecond)
+						}
+					}
+					for _, name := range []string{"host.crt", "host.key"} {
+						if err := os.Remove(filepath.Join(dir, name)); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if layout != "retained" {
+						if err := os.Rename(filepath.Join(dir, "host.d"), filepath.Join(dir, "retained-recovery")); err != nil {
+							t.Fatal(err)
+						}
+						if layout == "dangling" {
+							err = os.Symlink("missing-layout", filepath.Join(dir, "host.d"))
+						} else {
+							err = os.WriteFile(filepath.Join(dir, "host.d"), []byte("unknown"), 0600)
+						}
+						if err != nil {
+							t.Fatal(err)
+						}
+					}
+					before := map[string][]byte{}
+					inodes := map[string]os.FileInfo{}
+					for _, name := range []string{"ca.crt", "client.crt", "client.key"} {
+						before[name], err = os.ReadFile(filepath.Join(dir, name))
+						if err != nil {
+							t.Fatal(err)
+						}
+						inodes[name], err = os.Stat(filepath.Join(dir, name))
+						if err != nil {
+							t.Fatal(err)
+						}
+					}
+					target := dir
+					if alias {
+						target = filepath.Join(t.TempDir(), "alias")
+						if err := os.Symlink(dir, target); err != nil {
+							t.Fatal(err)
+						}
+					}
+					child := exec.Command(exe, "-test.run=^TestCLIClientRetainedDomainProcess$")
+					child.Env = append(os.Environ(), "LITEVIRT_RETAINED_COPY_MODE=copy", "LITEVIRT_RETAINED_COPY_DIR="+target, "LITEVIRT_RETAINED_COPY_SOURCE="+source)
+					if out, err := child.CombinedOutput(); err != nil {
+						t.Fatalf("fresh copy refusal: %v\n%s", err, out)
+					}
+					for name, body := range before {
+						after, err := os.ReadFile(filepath.Join(dir, name))
+						if err != nil {
+							t.Fatal(err)
+						}
+						info, err := os.Stat(filepath.Join(dir, name))
+						if err != nil || !os.SameFile(inodes[name], info) || !bytes.Equal(body, after) {
+							t.Fatal("refused copy changed", name, err)
+						}
+					}
+				})
+			}
+		}
+	}
+}

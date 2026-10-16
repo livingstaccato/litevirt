@@ -20,6 +20,9 @@ func trustDurabilityPoint(stage string) error {
 }
 
 func syncTrustDirectory(dir string) error {
+	if err := trustDurabilityPoint("directory-sync:" + dir); err != nil {
+		return err
+	}
 	if err := trustDurabilityPoint("directory-sync"); err != nil {
 		return err
 	}

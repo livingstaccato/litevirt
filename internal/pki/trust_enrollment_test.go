@@ -443,3 +443,73 @@ func TestHostEnrollmentLatePointerFailureRequiresReconciliation(t *testing.T) {
 	}
 	lease.Release()
 }
+
+func TestHostTrustCaptureRepairsCurrentPointerDurability(t *testing.T) {
+	ctx := context.Background()
+	source, dir := setupPKI(t), t.TempDir()
+	if err := InstallHostEnrollment(ctx, dir, enrollmentMaterial(t, source)); err != nil {
+		t.Fatal(err)
+	}
+	old, err := CaptureHostTrust(ctx, dir, "test-host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pair, err := ServedHostKeyPair(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap, err := old.ValidateHostCertificate(ctx, pair.Certificate, "test-host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mintInto(t, source, source, "test-host")
+	next := enrollmentMaterial(t, source)
+	pointerParent := filepath.Join(dir, hostDirName)
+	previous, err := os.Readlink(filepath.Join(pointerParent, "current"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("current parent sync unavailable")
+	failed, repaired := false, false
+	trustDurabilitySeam = func(stage string) error {
+		target, _ := os.Readlink(filepath.Join(pointerParent, "current"))
+		if stage == "directory-sync:"+pointerParent && target != previous {
+			failed = true
+			return injected
+		}
+		return nil
+	}
+	defer func() { trustDurabilitySeam = nil }()
+	if err := InstallHostEnrollment(ctx, dir, next); !errors.Is(err, injected) || !failed {
+		t.Fatalf("did not fail after current rename: %v", err)
+	}
+	if _, err := CaptureHostTrust(ctx, dir, "test-host"); !errors.Is(err, injected) {
+		t.Fatalf("capture skipped unsynced current parent: %v", err)
+	}
+	trustDurabilitySeam = func(stage string) error {
+		if stage == "directory-sync:"+pointerParent {
+			repaired = true
+		}
+		return nil
+	}
+	freshView, err := CaptureHostTrust(ctx, dir, "test-host")
+	if err != nil || !repaired {
+		t.Fatalf("capture-only repair did not sync current parent: %v", err)
+	}
+	if lease, err := AcquireHostCertificateLease(ctx, dir, cap); err == nil {
+		lease.Release()
+		t.Fatal("old capability survived capture-only repair")
+	}
+	fresh, err := freshView.ValidateHostCertificate(ctx, [][]byte{next.leaf.Raw}, "test-host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := AcquireHostCertificateLease(ctx, dir, fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if err := lease.Check(); err != nil {
+		t.Fatal(err)
+	}
+}

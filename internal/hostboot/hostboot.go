@@ -25,14 +25,17 @@
 //   - only a SIGTERM of an ACTIVE host leaves the marker (MarkRestarting), and
 //     the boot consumes it before its write (BootState);
 //   - a boot that awaits serving leaves AwaitingPath until a daemon serves
-//     (Served), and a boot without the marker that finds it is 'active': a
-//     daemon that crash-loops before it serves is 'upgrading' once, not on
-//     every boot, so it cannot keep re-arming the 'upgrading' timeout;
-//   - the boot keeps 'upgrading' only while the host is still recorded
-//     'upgrading' (or, without the marker, 'active') and the SIGTERM, or the
-//     'upgrading' state, is younger than UpgradingTimeout: a host the cluster
-//     may have fenced, put in maintenance or isolated while it was down boots
-//     as before;
+//     (Served), and a boot without the marker that finds it makes no boot
+//     write until it serves (Deferred): a daemon that crash-loops before it
+//     serves is written 'upgrading' once, not on every boot, so it cannot keep
+//     re-arming the 'upgrading' timeout, and it is not recorded 'active'
+//     before it serves either;
+//   - the boot writes 'upgrading' only while the host is still recorded
+//     'upgrading' or 'active', checked in the write's own transaction
+//     (Boot.From): a host the cluster has fenced, put in maintenance or
+//     isolated while it was down keeps that, and one past its upgrading
+//     timeout gets one fresh 'upgrading', not an 'active' its peers fence
+//     before it serves;
 //   - ConfirmServing moves the host from 'upgrading' to 'active' and from
 //     nothing else, and leaves its isolation as it is.
 //
@@ -70,6 +73,18 @@ func MarkerPath(dataDir string) string { return filepath.Join(dataDir, MarkerNam
 type Boot struct {
 	State        string
 	AwaitServing bool
+	// Deferred: no boot write is made at boot. The host keeps the state the
+	// cluster records (State; empty when this boot could not read it), so
+	// its 'upgrading' timeout is not re-armed and it is not newly recorded
+	// 'active'; once the daemon serves, the boot report and 'active' are
+	// written together, only while the host is still recorded State
+	// (ConfirmServingReport; an empty State is read then).
+	Deferred bool
+	// From, when set, is the state the decision read: the boot write is made
+	// only while the host is still recorded From (corrosion's
+	// UpdateHostStartupFrom), so a fence, drain or offline recorded between
+	// the read and the write is kept.
+	From string
 	// Reason says why, for the boot log.
 	Reason string
 }
@@ -108,6 +123,14 @@ func MarkRestarting(ctx context.Context, db *corrosion.Client, host, dataDir str
 // BootState decides the state the boot write records, and consumes the
 // marker. upgradePending is the post-upgrade watchdog's sentinel, whose boot
 // is 'upgrading' as it always was and whose watchdog confirms it.
+//
+// No boot of a host recorded 'active' or 'upgrading' records it 'active'
+// before its daemon serves: it writes 'upgrading' (guarded on the state it
+// read, Boot.From) or nothing at all (Boot.Deferred), and the serving check
+// records it active. Only a host recorded as something else (fenced,
+// offline, maintenance, draining, joining), or one this boot cannot judge
+// (no record, no data dir, an unclean boot it cannot count), boots 'active'
+// as before.
 func BootState(ctx context.Context, db *corrosion.Client, host, dataDir string, upgradePending bool, now time.Time) Boot {
 	at, marked := takeMarker(dataDir)
 	if upgradePending {
@@ -118,72 +141,119 @@ func BootState(ctx context.Context, db *corrosion.Client, host, dataDir string, 
 		return Boot{State: "upgrading", Reason: "post-upgrade boot; the upgrade watchdog confirms it"}
 	}
 	if !marked {
-		return noteAwaiting(dataDir, uncleanBoot(ctx, db, host, dataDir, now), now)
+		return noteAwaiting(dataDir, uncleanBoot(ctx, db, host, dataDir, now), now, false)
 	}
-	if age := now.Sub(at); age < 0 || age >= UpgradingTimeout {
-		return Boot{State: "active", Reason: fmt.Sprintf("the graceful stop was %s ago; the cluster may have acted on this host since", age.Round(time.Second))}
-	}
-	h, err := corrosion.GetHost(ctx, db, host)
+	h, err := readHost(ctx, db, host)
 	if err != nil || h == nil {
-		return Boot{State: "active", Reason: "this host's record is unreadable"}
+		// Noted, best effort, so a crash of this boot before it serves
+		// leaves the next one its never-served signal. If the note cannot
+		// be written either, that next boot reads as after a daemon that
+		// served: for a host still 'upgrading' it may write one fresh
+		// 'upgrading', the bounded re-arm of any unclean boot (FlapLimit).
+		_ = writeAwaiting(dataDir, now)
+		return unreadable("graceful stop recorded", err)
 	}
-	if h.State != "upgrading" {
-		return Boot{State: "active", Reason: "recorded " + h.State + " since the graceful stop"}
+	switch h.State {
+	case "upgrading":
+		if age := now.Sub(at); age < 0 || age >= UpgradingTimeout {
+			// The coordinator may treat it as stuck 'upgrading' and fence it
+			// at once; a fresh 'upgrading', written once (the marker is
+			// consumed), gives it the timeout to serve. A fence recorded
+			// meanwhile is kept by the write's guard.
+			return noteAwaiting(dataDir, Boot{State: "upgrading", AwaitServing: true, From: "upgrading",
+				Reason: fmt.Sprintf("the graceful stop was %s ago; a fresh 'upgrading' until this daemon serves", age.Round(time.Second))}, now, true)
+		}
+		return noteAwaiting(dataDir, Boot{State: "upgrading", AwaitServing: true, From: "upgrading", Reason: "graceful restart; active once this daemon serves"}, now, true)
+	case "active":
+		// The marker was left, but the SIGTERM's 'upgrading' write did not
+		// land.
+		return noteAwaiting(dataDir, Boot{State: "upgrading", AwaitServing: true, From: "active",
+			Reason: "graceful stop recorded, but its 'upgrading' write did not land; active once this daemon serves"}, now, true)
 	}
-	return noteAwaiting(dataDir, Boot{State: "upgrading", AwaitServing: true, Reason: "graceful restart; active once this daemon serves"}, now)
+	return Boot{State: "active", Reason: "recorded " + h.State + " since the graceful stop"}
 }
 
 // uncleanBoot is the boot after a stop that left no marker: a crash, a kill,
 // or a stop whose 'upgrading' write failed (a WAL-quarantined daemon writes
-// nothing). It is 'upgrading' until this daemon serves, as after a graceful
-// stop, for a host recorded 'active', or 'upgrading' for less than
-// UpgradingTimeout. Every other boot is 'active' as before:
+// nothing). For a host recorded 'active' or 'upgrading' it is 'upgrading'
+// until this daemon serves, written or kept:
 //
-//   - one that follows a boot that awaited serving and never served
-//     (AwaitingPath): a daemon that crash-loops before it serves is recorded
-//     'upgrading' once, not on every boot, so it cannot keep re-arming the
-//     coordinator's timeout;
-//   - one with no data dir, which could not tell that;
-//   - one that follows FlapLimit unclean boots within FlapWindow
-//     (UncleanHistoryName): a daemon that serves briefly and crashes again
-//     clears the note each time, and would otherwise be 'upgrading' after
-//     every crash and never fenced;
-//   - a host recorded 'upgrading' for UpgradingTimeout or longer: the
-//     coordinator may be fencing it;
-//   - a host recorded anything else (fenced, offline, maintenance, draining,
-//     joining) or not at all.
+//   - recorded 'active': 'upgrading' is written, guarded on 'active'. Only
+//     when this boot is flapping (FlapLimit unclean boots within FlapWindow,
+//     UncleanHistoryName) and the daemon before it served (no AwaitingPath)
+//     is nothing written (Deferred): writing 'upgrading' after every crash of
+//     a daemon that serves in between would keep re-arming the timeout, and
+//     the host is judged on its failure count as recorded. After a daemon
+//     that never served, the 'active' is a write that did not land, and
+//     'upgrading' is written once: the next such boot finds 'upgrading';
+//   - recorded 'upgrading' and flapping, or after a daemon that never served
+//     while the state is younger than UpgradingTimeout (or its age is
+//     unreadable): nothing is written (Deferred), so a crash loop cannot
+//     re-arm the timeout the earlier write started;
+//   - recorded 'upgrading' otherwise — younger than the timeout with serving
+//     evidence, or past it (or dated after this boot): 'upgrading' is
+//     written, guarded on 'upgrading'. Past the timeout the coordinator
+//     treats the host as stuck and would fence it on its failure count
+//     before it serves; the fresh write gives it the timeout to serve, once
+//     per unclean boot, and FlapLimit bounds how often.
+//
+// A boot that cannot record itself in UncleanHistoryName, which could not
+// bound a crash loop, or cannot read the host's record, writes nothing until
+// it serves (Deferred). Every other boot is 'active' as before: one with no
+// data dir, and a host recorded anything else (fenced, offline, maintenance,
+// draining, joining).
 func uncleanBoot(ctx context.Context, db *corrosion.Client, host, dataDir string, now time.Time) Boot {
 	if dataDir == "" {
 		return Boot{State: "active", Reason: "no graceful stop recorded, and no data dir to bound a crash loop"}
 	}
-	prior, err := recordUncleanBoot(dataDir, now)
-	if err != nil {
-		return Boot{State: "active", Reason: "no graceful stop recorded, and recording this unclean boot failed (" + err.Error() + ")"}
-	}
-	if prior >= FlapLimit {
-		return Boot{State: "active", Reason: fmt.Sprintf("no graceful stop recorded, and this is unclean boot %d within %s; a flapping daemon boots active", prior+1, FlapWindow)}
-	}
-	if _, err := os.Lstat(AwaitingPath(dataDir)); !os.IsNotExist(err) {
-		return Boot{State: "active", Reason: "no graceful stop recorded, and the last boot never served"}
-	}
-	h, err := corrosion.GetHost(ctx, db, host)
+	prior, herr := recordUncleanBoot(dataDir, now)
+	flapping := prior >= FlapLimit
+	_, nerr := os.Lstat(AwaitingPath(dataDir))
+	neverServed := !os.IsNotExist(nerr)
+	h, err := readHost(ctx, db, host)
 	if err != nil || h == nil {
-		return Boot{State: "active", Reason: "no graceful stop recorded, and this host's record is unreadable"}
+		return unreadable("no graceful stop recorded", err)
+	}
+	if herr != nil {
+		// It cannot bound a crash loop, so it writes nothing: no re-armed
+		// timeout, and no 'active' before it serves.
+		return Boot{State: h.State, AwaitServing: true, Deferred: true,
+			Reason: "no graceful stop recorded, and recording this unclean boot failed (" + herr.Error() + "); no boot write until this daemon serves"}
+	}
+	why := "no graceful stop recorded"
+	if flapping {
+		why += fmt.Sprintf(", this is unclean boot %d within %s", prior+1, FlapWindow)
+	}
+	if neverServed {
+		why += ", and the last boot never served"
 	}
 	switch h.State {
 	case "active":
+		if flapping && !neverServed {
+			return Boot{State: "active", AwaitServing: true, Deferred: true,
+				Reason: why + "; a flapping daemon makes no boot write, and reports once it serves"}
+		}
+		return Boot{State: "upgrading", AwaitServing: true, From: "active", Reason: why + "; active once this daemon serves"}
 	case "upgrading":
+		if flapping {
+			return Boot{State: "upgrading", AwaitServing: true, Deferred: true,
+				Reason: why + "; the host stays 'upgrading' as recorded, without a boot write, until this daemon serves"}
+		}
 		since, ok, err := corrosion.HostStateSince(ctx, db, host)
-		if err != nil || !ok {
-			return Boot{State: "active", Reason: "no graceful stop recorded, and when this host turned 'upgrading' is unreadable"}
+		readable := err == nil && ok
+		age := now.Sub(since)
+		stale := readable && (age < 0 || age >= UpgradingTimeout)
+		if neverServed && !stale {
+			return Boot{State: "upgrading", AwaitServing: true, Deferred: true,
+				Reason: why + "; the host stays 'upgrading' as recorded, without a boot write, until this daemon serves"}
 		}
-		if age := now.Sub(since); age < 0 || age >= UpgradingTimeout {
-			return Boot{State: "active", Reason: fmt.Sprintf("no graceful stop recorded, and this host turned 'upgrading' %s ago; the cluster may have acted on it since", age.Round(time.Second))}
+		if stale {
+			return Boot{State: "upgrading", AwaitServing: true, From: "upgrading",
+				Reason: fmt.Sprintf("%s; this host turned 'upgrading' %s ago, so a fresh 'upgrading' until this daemon serves", why, age.Round(time.Second))}
 		}
-	default:
-		return Boot{State: "active", Reason: "no graceful stop recorded; recorded " + h.State}
+		return Boot{State: "upgrading", AwaitServing: true, From: "upgrading", Reason: why + "; active once this daemon serves"}
 	}
-	return Boot{State: "upgrading", AwaitServing: true, Reason: "no graceful stop recorded; active once this daemon serves"}
+	return Boot{State: "active", Reason: why + "; recorded " + h.State}
 }
 
 // AwaitingName is the file, in the daemon's data directory, a boot that awaits
@@ -195,16 +265,43 @@ const AwaitingName = "boot-awaiting-serving"
 func AwaitingPath(dataDir string) string { return filepath.Join(dataDir, AwaitingName) }
 
 // noteAwaiting leaves AwaitingPath for a boot b that awaits serving, keeping
-// one an earlier boot left. A boot that cannot leave it is 'active': the next
-// boot could not tell that this daemon never served.
-func noteAwaiting(dataDir string, b Boot, now time.Time) Boot {
+// one an earlier boot left. An unclean boot that cannot leave it writes
+// nothing until it serves (Deferred, the state it read): the next boot could
+// not tell that this daemon never served, so a write now could be re-armed
+// on every crash. A deferred boot, and a boot after a graceful stop (bounded:
+// the marker is consumed), write what they decided whatever the next boot
+// can tell: their note is best effort.
+func noteAwaiting(dataDir string, b Boot, now time.Time, bounded bool) Boot {
 	if !b.AwaitServing {
 		return b
 	}
-	if err := writeAwaiting(dataDir, now); err != nil {
-		return Boot{State: "active", Reason: b.Reason + "; but noting that it awaits serving failed (" + err.Error() + "), so active now"}
+	err := writeAwaiting(dataDir, now)
+	if err == nil || b.Deferred || bounded {
+		return b
 	}
-	return b
+	return Boot{State: b.From, AwaitServing: true, Deferred: true,
+		Reason: b.Reason + "; but noting that it awaits serving failed (" + err.Error() + "), so no boot write until this daemon serves"}
+}
+
+// readHost reads host's record, once more after a failed read.
+func readHost(ctx context.Context, db *corrosion.Client, host string) (*corrosion.HostRecord, error) {
+	h, err := corrosion.GetHost(ctx, db, host)
+	if err != nil {
+		h, err = corrosion.GetHost(ctx, db, host)
+	}
+	return h, err
+}
+
+// unreadable is the boot of a host whose record cannot be read (or is not
+// there): it writes nothing, and once the daemon serves the record is read
+// again (Deferred with no State).
+func unreadable(why string, err error) Boot {
+	cause := "there is none"
+	if err != nil {
+		cause = err.Error()
+	}
+	return Boot{AwaitServing: true, Deferred: true,
+		Reason: why + ", and this host's record is unreadable (" + cause + "); no boot write until this daemon serves"}
 }
 
 // writeAwaiting leaves AwaitingPath, keeping one an earlier boot left.
@@ -216,8 +313,11 @@ func writeAwaiting(dataDir string, now time.Time) error {
 	if _, err := os.Lstat(p); err == nil {
 		return nil
 	}
-	return os.WriteFile(p, []byte(now.UTC().Format(time.RFC3339Nano)), 0o600)
+	return writeAwaitingFile(p, []byte(now.UTC().Format(time.RFC3339Nano)), 0o600)
 }
+
+// writeAwaitingFile writes AwaitingPath; a var so tests can fail it alone.
+var writeAwaitingFile = os.WriteFile
 
 // FlapLimit unclean boots within FlapWindow make the next one 'active'.
 const (
@@ -324,6 +424,105 @@ func ConfirmServing(ctx context.Context, db *corrosion.Client, host string) (boo
 		return false, now.State, ErrNotUpgrading
 	}
 	return true, "active", nil
+}
+
+// ErrMovedOn is ConfirmServingReport's answer for a host recorded in another
+// state than the deferred boot found: nothing was written.
+var ErrMovedOn = errors.New("host's recorded state changed since the boot")
+
+// Report is the boot report a deferred boot writes once its daemon serves:
+// what UpdateHostStartup writes at any other boot.
+type Report struct {
+	Version               string
+	CPUs, MemMiB, DiskGiB int
+	HasResources          bool
+}
+
+// ConfirmServingReport is ConfirmServing for a deferred boot (Boot.Deferred),
+// or one whose guarded boot write found the host moved on: once its daemon
+// serves, it records host 'active' with the boot report, in one write, only
+// while the host is still recorded from, checked in the write's own
+// transaction. A host fenced, drained or put in maintenance meanwhile keeps
+// that state (flipped=false, ErrMovedOn); the isolation is kept as it is.
+//
+// A host that moved on and runs again — undrained to 'active', or
+// 'draining' or 'maintenance' — still gets the report (reportKeepingState):
+// it is the only writer of the running version and schema, and `lv host
+// upgrade` skips a host by its recorded version.
+func ConfirmServingReport(ctx context.Context, db *corrosion.Client, host, from string, r Report) (bool, string, error) {
+	h, err := corrosion.GetHost(ctx, db, host)
+	if err != nil {
+		return false, "", err
+	}
+	if h == nil {
+		return false, "", ErrMovedOn // no record to write: the host is gone
+	}
+	if from == "" {
+		// The boot could not read the record: confirm from what it is now.
+		from = h.State
+	}
+	switch {
+	case from != "upgrading" && from != "active":
+		// A deferred boot of a host recorded fenced, offline, maintenance,
+		// draining or joining wrote nothing: serving does not record it
+		// active over that state. It gets its report as any moved-on host.
+		return false, h.State, reportKeepingState(ctx, db, host, h.State, r)
+	case h.State == "upgrading":
+		// Recorded 'upgrading' since the boot: confirmed as ConfirmServing
+		// would, rather than left unplaceable while it serves.
+		from = "upgrading"
+	case h.State != from:
+		return false, h.State, reportKeepingState(ctx, db, host, h.State, r)
+	}
+	if beforeConfirmWrite != nil {
+		beforeConfirmWrite()
+	}
+	applied, err := corrosion.UpdateHostStartupFrom(ctx, db, host, from, "active", r.Version, r.CPUs, r.MemMiB, r.DiskGiB, r.HasResources)
+	if err != nil {
+		return false, h.State, err
+	}
+	if !applied {
+		now, err := corrosion.GetHost(ctx, db, host)
+		if err != nil {
+			return false, "", err // retried
+		}
+		if now == nil {
+			return false, "", ErrMovedOn
+		}
+		if now.State == "upgrading" {
+			return false, now.State, errors.New("host turned 'upgrading' during the confirm; retried")
+		}
+		return false, now.State, reportKeepingState(ctx, db, host, now.State, r)
+	}
+	return true, "active", nil
+}
+
+// reportKeepingState writes the boot report r of a host recorded state,
+// leaving the state as it is, and returns ErrMovedOn; a failed write returns
+// its error instead, so the caller retries. An 'active' host gets the whole
+// report, guarded on 'active': that rewrites 'active' and so re-dates when it
+// became active (HostActiveSince, HostFenceLife) to the moment it serves. A
+// 'draining' or 'maintenance' one gets its version and resources, which
+// leave its membership row (and so its state's time) as it is; any other —
+// fenced, offline, upgrading, joining — none, so neither a fence's time nor
+// the upgrading timeout is re-dated.
+func reportKeepingState(ctx context.Context, db *corrosion.Client, host, state string, r Report) error {
+	var err error
+	switch state {
+	case "active":
+		_, err = corrosion.UpdateHostStartupFrom(ctx, db, host, "active", "active", r.Version, r.CPUs, r.MemMiB, r.DiskGiB, r.HasResources)
+	case "draining", "maintenance":
+		if r.Version != "" {
+			err = corrosion.UpdateHostVersion(ctx, db, host, r.Version)
+		}
+		if err == nil && r.HasResources {
+			err = corrosion.UpdateHostResources(ctx, db, host, r.CPUs, r.MemMiB, r.DiskGiB)
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("reporting this boot to a host recorded %s: %w", state, err)
+	}
+	return ErrMovedOn
 }
 
 // beforeConfirmWrite, when set, runs between ConfirmServing's read and its

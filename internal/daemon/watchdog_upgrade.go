@@ -140,24 +140,62 @@ func (d *Daemon) confirmUpgradeHealthy(binaryPath string) {
 // host is LEFT 'upgrading', and the failover coordinator fences it once
 // hostboot.UpgradingTimeout has passed since the boot write: a daemon that
 // cannot serve is a failed host.
-func (d *Daemon) awaitServingThenActivate(ctx context.Context) {
+//
+// confirm records the host active once it serves; nil is ConfirmServing (or
+// the test hook), a deferred boot's is ConfirmServingReport.
+func (d *Daemon) awaitServingThenActivate(ctx context.Context, confirm confirmFunc) {
 	deadline := time.Duration(d.cfg.UpgradeHealthDeadlineSec) * time.Second
 	if deadline <= 0 {
 		deadline = 120 * time.Second
 	}
 	client, closeFn, err := d.dialSelf()
 	if err != nil {
-		// Environmental, and it would never let the host turn active: record
-		// it active now, as the boot write did before.
-		slog.Warn("restart: cannot build the local gRPC client to confirm serving; recording the host active now", "error", err)
-		// The awaiting-serving note stays: nothing showed this daemon serves,
-		// so the next crash boots 'active', as before this check existed.
-		d.confirmActive(ctx, &unconfirmed{}, false)
-		return
+		client, closeFn = d.dialSelfUntil(ctx, err)
+		if client == nil {
+			return // shutting down
+		}
 	}
 	defer closeFn()
-	d.activateOnceServing(ctx, client, deadline)
+	d.activateOnceServingWith(ctx, client, deadline, confirm)
 }
+
+// dialSelfRetry is how often a boot whose local gRPC client cannot be built
+// tries again; a var so tests can shrink it.
+var dialSelfRetry = 5 * time.Second
+
+// dialSelfUntil retries dialSelf after it failed with err, until it succeeds
+// or the daemon shuts down (nil). Nothing shows this daemon serves until
+// then, so the host is not recorded active: it stays as the boot left it
+// ('upgrading', or as recorded), and past its upgrading window it raises
+// upgrading_unconfirmed with the cause, as an unanswered Ping does.
+func (d *Daemon) dialSelfUntil(ctx context.Context, err error) (pinger, func()) {
+	slog.Error("restart: cannot build the local gRPC client to confirm serving; the host is not recorded active until this daemon can confirm it serves. "+
+		"Past its upgrading window it raises upgrading_unconfirmed; 'lv host undrain' records it active. Still retrying.",
+		"error", err, "retry_every", dialSelfRetry)
+	var u unconfirmed
+	checked := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, nil
+		case <-time.After(dialSelfRetry):
+		}
+		client, closeFn, derr := d.dialSelf()
+		if derr == nil {
+			slog.Info("restart: the local gRPC client builds now; checking that this daemon serves")
+			return client, closeFn
+		}
+		err = derr
+		if time.Since(checked) >= unconfirmedCheckEvery {
+			d.noteUnconfirmed(ctx, &u, "cannot build this daemon's local gRPC client: "+err.Error())
+			checked = time.Now()
+		}
+	}
+}
+
+// confirmFunc records the host active once this daemon serves:
+// hostboot.ConfirmServing, or a deferred boot's ConfirmServingReport.
+type confirmFunc func(ctx context.Context) (bool, string, error)
 
 // awaitServingThenNote is the boot that follows one that never served, and is
 // recorded active at once (hostboot.BootState): once this daemon answers its
@@ -165,7 +203,7 @@ func (d *Daemon) awaitServingThenActivate(ctx context.Context) {
 func (d *Daemon) awaitServingThenNote(ctx context.Context) {
 	client, closeFn, err := d.dialSelf()
 	if err != nil {
-		slog.Warn("boot: cannot build the local gRPC client to confirm serving; the next crash boots active", "error", err)
+		slog.Warn("boot: cannot build the local gRPC client to confirm serving; the awaiting-serving note stays", "error", err)
 		return
 	}
 	defer closeFn()
@@ -204,6 +242,12 @@ func (d *Daemon) dialSelf() (pinger, func(), error) {
 // host raises upgrading_unconfirmed about itself (noteUnconfirmed), so that
 // case is visible.
 func (d *Daemon) activateOnceServing(ctx context.Context, client pinger, deadline time.Duration) {
+	d.activateOnceServingWith(ctx, client, deadline, nil)
+}
+
+// activateOnceServingWith is activateOnceServing recording the host active
+// with confirm (nil: ConfirmServing).
+func (d *Daemon) activateOnceServingWith(ctx context.Context, client pinger, deadline time.Duration, confirm confirmFunc) {
 	start := time.Now()
 	checked := start
 	var u unconfirmed
@@ -238,7 +282,7 @@ func (d *Daemon) activateOnceServing(ctx context.Context, client pinger, deadlin
 	if logged {
 		slog.Info("restart: this daemon answered its own Ping after the deadline", "deadline", deadline)
 	}
-	d.confirmActive(ctx, &u, true)
+	d.confirmActiveWith(ctx, &u, true, confirm)
 }
 
 // unconfirmedCheckEvery is how often a ping loop that is not answered reads
@@ -272,7 +316,15 @@ var unconfirmedAfter = hostboot.UpgradingTimeout
 // did, because a WAL-quarantined daemon's write is refused on every attempt
 // and must not make the boot after it 'active'.
 func (d *Daemon) confirmActive(ctx context.Context, u *unconfirmed, served bool) {
-	confirm := d.confirmServing
+	d.confirmActiveWith(ctx, u, served, nil)
+}
+
+// confirmActiveWith is confirmActive recording the host active with confirm:
+// nil is the confirmServing test hook, or else hostboot.ConfirmServing.
+func (d *Daemon) confirmActiveWith(ctx context.Context, u *unconfirmed, served bool, confirm confirmFunc) {
+	if confirm == nil {
+		confirm = d.confirmServing
+	}
 	if confirm == nil {
 		confirm = func(ctx context.Context) (bool, string, error) {
 			return hostboot.ConfirmServing(ctx, d.db, d.cfg.HostName)
@@ -287,8 +339,8 @@ func (d *Daemon) confirmActive(ctx context.Context, u *unconfirmed, served bool)
 			hostboot.Served(d.cfg.DataDir)
 		}
 		switch {
-		case errors.Is(err, hostboot.ErrNotUpgrading):
-			slog.Info("restart: serving; host is recorded as something other than upgrading, leaving it", "state", state)
+		case errors.Is(err, hostboot.ErrNotUpgrading), errors.Is(err, hostboot.ErrMovedOn):
+			slog.Info("restart: serving; this host's recorded state moved on since the boot, leaving it", "state", state, "detail", err)
 			d.clearUnconfirmed(u)
 			return
 		case err == nil:

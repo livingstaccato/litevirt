@@ -364,3 +364,135 @@ func TestReleaseHostReservation_AuditsOnceWithCaller(t *testing.T) {
 		t.Fatalf("already-released audit rows: %d, want a second row with result already", len(rows))
 	}
 }
+
+// A refusal names the workload only to a caller who may read it, as the
+// success response's vm field does: a role holding the release verb at /
+// without vm.read learns no VM name from any refusal.
+func TestReleaseHostReservation_RefusalsWithholdUnreadableNames(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	if err := corrosion.InsertRole(ctx, s.db, corrosion.RoleRecord{Name: "Releaser", Verbs: []string{reservationReleaseVerb}}); err != nil {
+		t.Fatalf("InsertRole: %v", err)
+	}
+	rita := boundAtCtx(t, s, "rita", "viewer", "Releaser", "/")
+	if s.canReadVM(rita, "secret-held") {
+		t.Fatal("precondition: the Releaser role reads VMs")
+	}
+
+	seedStuckResize(t, s, "held", "secret-held", 1, 512)
+	sweepVM(t, s, "secret-run", 1, sweepAgoNano(48*time.Hour), "running")
+	sweepOp(t, s, "running", corrosion.OpResourceUpdateRunning, "secret-run", 1, sweepVector("test-host", 512),
+		sweepAgo(time.Hour), map[int64][]string{1: {corrosion.OpStepReserved, corrosion.OpStepAdmitted, corrosion.OpStepPlanned}})
+	sweepOpAs(t, s, "journal", corrosion.OpVMReplace, "vm", "secret-journal", "CutoverVM", 0, sweepVector("test-host", 16),
+		sweepAgo(time.Hour), map[int64][]string{0: {corrosion.OpStepPlanned}})
+
+	cases := []struct {
+		op, vm string
+		code   codes.Code
+		want   string
+		lock   bool
+	}{
+		{"held", "secret-held", codes.Unavailable, "VM (name withheld) has a request in flight", true},
+		{"running", "secret-run", codes.FailedPrecondition, "lv operation show <vm>", false},
+		{"journal", "secret-journal", codes.InvalidArgument, "lv operation show <vm>", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.op, func(t *testing.T) {
+			call := func(ctx context.Context) error {
+				if tc.lock {
+					defer s.lockVM(tc.vm)()
+				}
+				_, err := s.ReleaseHostReservation(ctx, releaseReq(tc.op))
+				return err
+			}
+			err := call(rita)
+			if status.Code(err) != tc.code || !strings.Contains(err.Error(), tc.want) || strings.Contains(err.Error(), tc.vm) {
+				t.Fatalf("as a caller without vm.read: %v, want %s with %q and no %q", err, tc.code, tc.want, tc.vm)
+			}
+			if err := call(adminCtx()); status.Code(err) != tc.code || !strings.Contains(err.Error(), tc.vm) {
+				t.Fatalf("as Admin: %v, want %s naming %q", err, tc.code, tc.vm)
+			}
+		})
+	}
+
+	// The entry node withholds the name from a refusal the target returned:
+	// the target judged a peer, which reads every VM.
+	mustInsertVM(t, s, "secret-fwd", "")
+	fwd := status.Error(codes.FailedPrecondition,
+		`operation x is still running: it holds VM "secret-fwd"'s mutation barrier. inspect it with lv operation show secret-fwd; abort a wedged one with lv operation abort secret-fwd --force`)
+	got := s.redactWorkloadName(rita, fwd, "secret-fwd")
+	if status.Code(got) != codes.FailedPrecondition || strings.Contains(got.Error(), "secret-fwd") ||
+		!strings.Contains(got.Error(), "VM (name withheld)'s") || !strings.Contains(got.Error(), "lv operation abort <vm> --force") {
+		t.Fatalf("forwarded refusal for a caller without vm.read: %v", got)
+	}
+	if got := s.redactWorkloadName(adminCtx(), fwd, "secret-fwd"); got != fwd {
+		t.Fatalf("forwarded refusal for Admin was rewritten: %v", got)
+	}
+}
+
+// A container reservation is locked by the container its create journalled
+// (the operation's resource id), not by the reservation vector's copy of the
+// name, which a legacy reservation may leave empty.
+func TestReleaseHostReservation_ContainerLockNamedByResourceID(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	now := sweepAgo(time.Hour)
+	if err := s.db.Execute(ctx, `INSERT INTO containers (host_name, name, image, state, created_at, updated_at, active_operation_id)
+		VALUES ('test-host', 'ct2', 'img', 'running', ?, ?, '')`, now, now); err != nil {
+		t.Fatalf("seed container: %v", err)
+	}
+	sweepOpAs(t, s, "legacy-ct", corrosion.OpWorkloadCreate, "container", "ct2", "CreateContainer", 0,
+		corrosion.ReservationVector{TargetHost: "test-host", TargetMemMiB: 256},
+		now, map[int64][]string{0: {corrosion.OpStepPlanned, corrosion.OpStepReserved}})
+	if v, _ := corrosion.ClassifyReservation(ctx, s.db, "legacy-ct"); v == nil || v.Class != corrosion.ReservationNoRunningOperation {
+		t.Fatalf("precondition: want a counted no_running_operation reservation, got %+v", v)
+	}
+
+	unlock, ok := s.TryLockContainer("ct2")
+	if !ok {
+		t.Fatal("TryLockContainer")
+	}
+	_, err := s.ReleaseHostReservation(adminCtx(), releaseReq("legacy-ct"))
+	unlock()
+	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), `container "ct2" has a request in flight`) {
+		t.Fatalf("under ct2's lock: %v, want Unavailable naming ct2", err)
+	}
+	if releaseRows(t, s, "legacy-ct") != 0 {
+		t.Fatal("released a container reservation while its container's lock was held")
+	}
+	if resp, err := s.ReleaseHostReservation(adminCtx(), releaseReq("legacy-ct")); err != nil || !resp.Released {
+		t.Fatalf("after the lock is released: %+v err %v, want released", resp, err)
+	}
+}
+
+// A forwarded request the target answered "already released" is audited as
+// already released, whatever the entry node's replica classified it as before
+// the forward.
+func TestReleaseHostReservation_ForwardedAlreadyReleasedAudit(t *testing.T) {
+	s := testServer(t)
+	f := &reservationReleaseFacts{host: "peer-y", vm: "vm1", class: string(corrosion.ReservationNoRunningOperation), vcpu: 1, memMiB: 512}
+	s.auditReservationRelease(userCtx("ada", "admin"), "fwd-op", f,
+		&pb.ReleaseHostReservationResponse{Released: false, Host: "peer-y", Detail: "already released"}, nil)
+	rows := reservationReleaseAudits(t, s, "fwd-op")
+	if len(rows) != 1 || rows[0].String("result") != "already" ||
+		!strings.Contains(rows[0].String("detail"), "class=already_released") {
+		t.Fatalf("audit rows %+v, want one result=already row with class=already_released", rows)
+	}
+}
+
+// Only the target's interceptor refusals — the host is up and answering —
+// are told apart from a target that cannot be reached.
+func TestRefusedBeforeHandler(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{status.Error(codes.Unavailable, forwardedIdentityNotVisible), true},
+		{status.Error(codes.Unavailable, walQuarantineUserRefusal+" (behind) and accepts no user logins, sessions or API tokens; use another node"), true},
+		{status.Error(codes.Unavailable, "connection error: desc = \"transport: Error while dialing: dial tcp 10.0.0.9:7443: connect: connection refused\""), false},
+	} {
+		if got := refusedBeforeHandler(tc.err); got != tc.want {
+			t.Errorf("refusedBeforeHandler(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}

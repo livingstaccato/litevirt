@@ -81,7 +81,8 @@ removed (`lv host rm`) is decided on the node called. It needs the
 `host.reservation.release` permission (built-in Admin) and `--force`, and every
 request, released or refused, is audited once, as
 `operation.reservation.release`, on the node called. Asking again for a
-reservation already released answers `already released`.
+reservation already released answers `already released`. A refusal names the
+VM or container only to a caller who may `vm.read` it.
 
 | Refusal | Code |
 |---|---|
@@ -94,7 +95,7 @@ reservation already released answers `already released`.
 | Younger than 15 minutes with no barrier: it may still be admitting | `FailedPrecondition` |
 | The VM's or container's lock is held on the target host | `Unavailable` |
 | The target host's replica has not caught up | `Unavailable` |
-| The target host is unreachable | `Unavailable` |
+| The target host is unreachable, or refused the request before handling it (a forwarded login it has not replicated yet, or WAL quarantine) | `Unavailable` |
 | The target host runs a build without the release (`lv host upgrade <host>`) | `FailedPrecondition` |
 
 ## `hardware_v2` — typed hardware, with no kill switch of its own

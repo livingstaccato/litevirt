@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -97,7 +100,7 @@ func (s *Server) releaseHostReservation(ctx context.Context, req *pb.ReleaseHost
 			return s.forwardReservationRelease(ctx, req, view)
 		}
 	}
-	return s.executeReservationRelease(ctx, opID, facts)
+	return s.executeReservationRelease(ctx, view, facts)
 }
 
 // classifyForRelease classifies opID and answers the cases decided on any node:
@@ -127,7 +130,7 @@ func (s *Server) classifyForRelease(ctx context.Context, opID string, facts *res
 	case corrosion.ReservationManifest:
 		return nil, nil, status.Errorf(codes.InvalidArgument,
 			"operation %s is a %s journal, not a capacity reservation; it is never released by hand (inspect it with lv operation show %s)",
-			opID, view.Op.OperationKind, view.VMName)
+			opID, view.Op.OperationKind, s.workloadArg(ctx, view.VMName))
 	case corrosion.ReservationCapacityLease:
 		maxAge := corrosion.CapacityLeaseMaxAge(view.Op.Method)
 		at := "its expiry"
@@ -173,7 +176,7 @@ func (s *Server) forwardReservationRelease(ctx context.Context, req *pb.ReleaseH
 	target := view.Vector.TargetHost
 	unreachable := func(err error) error {
 		return status.Errorf(codes.Unavailable,
-			"host %s is unreachable (%v): a reservation is released on the host that holds it, so that host can confirm no admission there still relies on it. Retry when it is reachable, or remove the host with lv host rm %s if it is gone for good",
+			"host %s is unreachable, or refused the request before handling it (%v): a reservation is released on the host that holds it, so that host can confirm no admission there still relies on it. Retry when it answers, or remove the host with lv host rm %s if it is gone for good",
 			target, err, target)
 	}
 	client, conn, err := s.peerClient(ctx, target)
@@ -188,6 +191,10 @@ func (s *Server) forwardReservationRelease(ctx context.Context, req *pb.ReleaseH
 		switch status.Code(err) {
 		case codes.Unavailable:
 			if !answered {
+				if refusedBeforeHandler(err) {
+					return nil, status.Errorf(codes.Unavailable, "host %s refused the request before handling it: %s",
+						target, status.Convert(err).Message())
+				}
 				return nil, unreachable(err)
 			}
 		case codes.Unimplemented:
@@ -197,7 +204,7 @@ func (s *Server) forwardReservationRelease(ctx context.Context, req *pb.ReleaseH
 					target, target)
 			}
 		}
-		return nil, err
+		return nil, s.redactWorkloadName(ctx, err, view.VMName)
 	}
 	if resp.Vm != "" && !s.canReadVM(ctx, resp.Vm) {
 		resp.Vm = ""
@@ -208,21 +215,19 @@ func (s *Server) forwardReservationRelease(ctx context.Context, req *pb.ReleaseH
 // executeReservationRelease decides and writes the release on this node, under
 // the workload's lock: the VM lock for a VM's reservation, the container lock
 // for a container's.
-func (s *Server) executeReservationRelease(ctx context.Context, opID string,
+func (s *Server) executeReservationRelease(ctx context.Context, view *corrosion.HostReservationView,
 	facts *reservationReleaseFacts) (*pb.ReleaseHostReservationResponse, error) {
 	if err := s.requireReplicaCaughtUp(ctx, "ReleaseHostReservation"); err != nil {
 		return nil, err
 	}
-	op, err := corrosion.GetOperation(ctx, s.db, opID)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "read operation %s: %v", opID, err)
+	opID := view.Op.ID
+	container := view.Op.ResourceKind == "container"
+	// The workload's own name, as its create journalled it: the lock is
+	// keyed by it, not by the reservation vector's copy.
+	name := view.Op.ResourceID
+	if name == "" {
+		name = view.VMName
 	}
-	if op == nil {
-		return nil, status.Errorf(codes.NotFound,
-			"no operation %s (it may already have been reaped); lv host inspect <host> lists the reservations a host holds", opID)
-	}
-	container := op.ResourceKind == "container"
-	name := facts.vm
 	var unlock func()
 	var locked bool
 	if container {
@@ -236,7 +241,7 @@ func (s *Server) executeReservationRelease(ctx context.Context, opID string,
 			noun = "container"
 		}
 		return nil, status.Errorf(codes.Unavailable,
-			"%s %q has a request in flight on %s that may be deciding on this reservation; retry in a moment", noun, name, s.hostName)
+			"%s %s has a request in flight on %s that may be deciding on this reservation; retry in a moment", noun, s.workloadRef(ctx, name), s.hostName)
 	}
 	defer unlock()
 	if h := s.resRelease.beforeReclassify; h != nil {
@@ -251,12 +256,13 @@ func (s *Server) executeReservationRelease(ctx context.Context, opID string,
 	case corrosion.ReservationInFlight:
 		if container {
 			return nil, status.Errorf(codes.FailedPrecondition,
-				"operation %s is still running: it holds container %q's mutation barrier (state %s at owner epoch %d). Wait for it to finish; its reservation is released once it is terminal",
-				opID, cur.VMName, cur.LatestState, cur.LatestEpoch)
+				"operation %s is still running: it holds container %s's mutation barrier (state %s at owner epoch %d). Wait for it to finish; its reservation is released once it is terminal",
+				opID, s.workloadRef(ctx, name), cur.LatestState, cur.LatestEpoch)
 		}
+		arg := s.workloadArg(ctx, cur.VMName)
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"operation %s is still running: it holds VM %q's mutation barrier (state %s at owner epoch %d). Wait for it to finish, or inspect it with lv operation show %s; abort a wedged one with lv operation abort %s --force, and its reservation is released once it is terminal",
-			opID, cur.VMName, cur.LatestState, cur.LatestEpoch, cur.VMName, cur.VMName)
+			"operation %s is still running: it holds VM %s's mutation barrier (state %s at owner epoch %d). Wait for it to finish, or inspect it with lv operation show %s; abort a wedged one with lv operation abort %s --force, and its reservation is released once it is terminal",
+			opID, s.workloadRef(ctx, cur.VMName), cur.LatestState, cur.LatestEpoch, arg, arg)
 	case corrosion.ReservationAdmitting:
 		age := time.Duration(0)
 		if created, err := time.Parse(time.RFC3339Nano, cur.Op.CreatedAt); err == nil {
@@ -318,6 +324,9 @@ func (s *Server) auditReservationRelease(ctx context.Context, opID string, f *re
 		result = "refused"
 	case !resp.GetReleased():
 		result = "already"
+		// Whichever node decided it: the entry node's own classification
+		// of a forwarded request says nothing about what was released.
+		f.class = "already_released"
 	}
 	if resp != nil && resp.Host != "" {
 		f.host = resp.Host
@@ -330,4 +339,51 @@ func (s *Server) auditReservationRelease(ctx context.Context, opID string, f *re
 	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reservationReleaseAuditTimeout)
 	defer cancel()
 	s.audit(actx, "operation.reservation.release", boundAuditValue(opID, 128), detail, result)
+}
+
+// refusedBeforeHandler reports whether a codes.Unavailable from the target host
+// is one its interceptors return before any handler runs (so without the
+// handler's trailer): the host is up and answering, and the remedy is to retry,
+// not to remove it.
+func refusedBeforeHandler(err error) bool {
+	msg := status.Convert(err).Message()
+	return msg == forwardedIdentityNotVisible || strings.HasPrefix(msg, walQuarantineUserRefusal)
+}
+
+// workloadRef names a workload in a refusal: quoted when the caller may read
+// it, as the success response's vm field is filled, and withheld otherwise.
+func (s *Server) workloadRef(ctx context.Context, name string) string {
+	if s.canReadVM(ctx, name) {
+		return strconv.Quote(name)
+	}
+	return withheldWorkload
+}
+
+// workloadArg is workloadRef for a command argument: the bare name, or a
+// placeholder.
+func (s *Server) workloadArg(ctx context.Context, name string) string {
+	if s.canReadVM(ctx, name) {
+		return name
+	}
+	return "<vm>"
+}
+
+// withheldWorkload stands in for a workload name the caller may not read.
+const withheldWorkload = "(name withheld)"
+
+// redactWorkloadName withholds name from a refusal the target host returned
+// when this node's caller may not read it. The target judged the forwarded hop,
+// which is a peer unless forwarded identity is enforced, so only the entry node
+// knows what its caller may see.
+func (s *Server) redactWorkloadName(ctx context.Context, err error, name string) error {
+	if name == "" || s.canReadVM(ctx, name) {
+		return err
+	}
+	st := status.Convert(err)
+	msg := strings.ReplaceAll(st.Message(), strconv.Quote(name), withheldWorkload)
+	msg = regexp.MustCompile(`(^|[^\w.-])`+regexp.QuoteMeta(name)+`($|[^\w.-])`).ReplaceAllString(msg, "${1}<vm>${2}")
+	if msg == st.Message() {
+		return err
+	}
+	return status.Error(st.Code(), msg)
 }

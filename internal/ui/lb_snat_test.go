@@ -8,7 +8,9 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -100,4 +102,36 @@ func TestCreateLB_OtherRefusalUnchanged(t *testing.T) {
 	w := serveRequest(s, formPost(t, "/ui/lb", lbCreateForm(nil)))
 	assertStatus(t, w, http.StatusBadRequest)
 	assertToast(t, w, "VIP is held elsewhere")
+}
+
+// The LB list and detail show SNAT as on, off, or unknown (never off for an
+// LB whose setting the daemon could not read).
+func TestLBPages_SNATOnOffUnknown(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listLBsResp = &pb.ListLBResponse{Lbs: []*pb.LoadBalancer{
+		{Name: "plain", State: "active", Snat: proto.Bool(false)},
+		{Name: "unread", State: "active"},
+	}}
+	s := newTestUIServer(t, mock)
+	r, _ := http.NewRequest("GET", "/lb", nil)
+	w := serveRequest(s, withAuth(r))
+	assertStatus(t, w, http.StatusOK)
+	body := w.Body.String()
+	if !strings.Contains(body, "<th>SNAT</th>") {
+		t.Fatalf("no SNAT column:\n%s", body)
+	}
+	row := func(name string) string {
+		i := strings.Index(body, `/lb/`+name+`"`)
+		if i < 0 {
+			t.Fatalf("no row for %s", name)
+		}
+		j := strings.Index(body[i:], "</tr>")
+		return body[i : i+j]
+	}
+	if r := row("plain"); !strings.Contains(r, "<td>off</td>") {
+		t.Errorf("plain row has no SNAT off: %s", r)
+	}
+	if r := row("unread"); !strings.Contains(r, "<td>unknown</td>") || strings.Contains(r, "<td>off</td>") {
+		t.Errorf("unread row is not SNAT unknown: %s", r)
+	}
 }

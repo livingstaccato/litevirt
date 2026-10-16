@@ -50,17 +50,25 @@ func newLBLsCmd() *cobra.Command {
 					if stack == "" {
 						stack = "-"
 					}
-					snat := "off"
-					if lb.Snat {
-						snat = "on"
-					}
 					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
-						lb.Name, lb.Vip, lb.Algorithm, lb.State, len(lb.Backends), stack, snat)
+						lb.Name, lb.Vip, lb.Algorithm, lb.State, len(lb.Backends), stack, snatLabel(lb))
 				}
 				return w.Flush()
 			})
 		},
 	}
+}
+
+// snatLabel is an LB's outbound NAT as on/off, or "unknown" when the daemon
+// could not read it (the LB may be SNATting).
+func snatLabel(lb *pb.LoadBalancer) string {
+	switch {
+	case lb.Snat == nil:
+		return "unknown"
+	case lb.GetSnat():
+		return "on"
+	}
+	return "off"
 }
 
 func newLBInspectCmd() *cobra.Command {
@@ -82,11 +90,7 @@ func newLBInspectCmd() *cobra.Command {
 				fmt.Printf("VIP:        %s\n", lb.Vip)
 				fmt.Printf("Algorithm:  %s\n", lb.Algorithm)
 				fmt.Printf("State:      %s\n", lb.State)
-				snat := "off"
-				if lb.Snat {
-					snat = "on"
-				}
-				fmt.Printf("SNAT:       %s\n", snat)
+				fmt.Printf("SNAT:       %s\n", snatLabel(lb))
 				if len(lb.LbHosts) > 0 {
 					fmt.Printf("Hosts:      %s\n", strings.Join(lb.LbHosts, ", "))
 				}

@@ -42,12 +42,15 @@ func (s *Server) ListLoadBalancers(ctx context.Context, _ *emptypb.Empty) (*pb.L
 		if s.lbListSNATOverride != nil {
 			lookup = s.lbListSNATOverride
 		}
+		var snatKnown *bool
 		snat, err := lookup(ctx, r.String("name"), r.String("stack_name"), r.String("generation"))
 		if err != nil {
 			// snat is display-only here: one LB's failed lookup is logged and
 			// that LB listed with it unset, not the whole list failed.
-			slog.Warn("ListLoadBalancers: snat lookup failed; listing the LB with snat unset", "lb", r.String("name"), "error", err)
-			snat = false
+			slog.Warn("ListLoadBalancers: snat lookup failed; listing the LB with snat unknown", "lb", r.String("name"), "error", err)
+			snatKnown = nil
+		} else {
+			snatKnown = proto.Bool(snat)
 		}
 		algo := r.String("algorithm")
 		if algo == "" {
@@ -75,7 +78,7 @@ func (s *Server) ListLoadBalancers(ctx context.Context, _ *emptypb.Empty) (*pb.L
 			StackName:  r.String("stack_name"),
 			Ports:      ports,
 			Backends:   s.lbBackends(ctx, r.String("name")),
-			Snat:       snat,
+			Snat:       snatKnown,
 		})
 	}
 	return resp, nil
@@ -358,7 +361,7 @@ func (s *Server) InspectLoadBalancer(ctx context.Context, req *pb.InspectLBReque
 		StackName:  r.String("stack_name"),
 		Ports:      ports,
 		Backends:   s.lbBackends(ctx, r.String("name")),
-		Snat:       snat,
+		Snat:       proto.Bool(snat),
 	}
 
 	// Overlay REAL HAProxy health onto the run-state-derived backend status, so

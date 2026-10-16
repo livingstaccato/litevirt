@@ -13,6 +13,18 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
+// snatLabel is an LB's outbound NAT as on/off, or "unknown" when the daemon
+// could not read it (the LB may be SNATting).
+func snatLabel(lb *pb.LoadBalancer) string {
+	switch {
+	case lb.Snat == nil:
+		return "unknown"
+	case lb.GetSnat():
+		return "on"
+	}
+	return "off"
+}
+
 func (s *Server) handleLB(w http.ResponseWriter, r *http.Request) {
 	ctx := s.uiBearerCtx(r)
 	lbs, _ := s.grpc.ListLoadBalancers(ctx, &emptypb.Empty{})

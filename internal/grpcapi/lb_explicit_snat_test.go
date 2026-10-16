@@ -75,7 +75,7 @@ func inspectSNAT(t *testing.T, s *Server, name string) bool {
 	if err != nil {
 		t.Fatalf("InspectLoadBalancer %s: %v", name, err)
 	}
-	return resp.Snat
+	return resp.GetSnat()
 }
 
 func listSNAT(t *testing.T, s *Server, name string) bool {
@@ -86,7 +86,7 @@ func listSNAT(t *testing.T, s *Server, name string) bool {
 	}
 	for _, l := range resp.Lbs {
 		if l.Name == name {
-			return l.Snat
+			return l.GetSnat()
 		}
 	}
 	t.Fatalf("ListLoadBalancers: no %s", name)
@@ -240,7 +240,7 @@ func TestExplicitLB_SettingNotRecordable(t *testing.T) {
 
 // TestListLoadBalancers_OneFailingSNATLookupDoesNotFailTheList: snat is a
 // display-only field of the list, so an LB whose lookup errors is listed with
-// snat unset and every other LB is listed normally.
+// snat unknown (unset, not false) and every other LB is listed normally.
 //
 // Mutation (red): ListLoadBalancers returns the lookup's error again.
 func TestListLoadBalancers_OneFailingSNATLookupDoesNotFailTheList(t *testing.T) {
@@ -257,17 +257,17 @@ func TestListLoadBalancers_OneFailingSNATLookupDoesNotFailTheList(t *testing.T) 
 	if err != nil {
 		t.Fatalf("ListLoadBalancers failed for one LB's snat lookup: %v", err)
 	}
-	got := map[string]bool{}
+	got := map[string]*bool{}
 	for _, l := range resp.Lbs {
 		got[l.Name] = l.Snat
 	}
 	if len(got) != 2 {
 		t.Fatalf("listed %v, want both LBs", got)
 	}
-	if !got["good"] {
+	if got["good"] == nil || !*got["good"] {
 		t.Error("good: snat lost because another LB's lookup failed")
 	}
-	if got["broken"] {
-		t.Error("broken: snat reported on although its lookup failed")
+	if got["broken"] != nil {
+		t.Errorf("broken: snat reported as %v although its lookup failed; want unknown (unset)", *got["broken"])
 	}
 }

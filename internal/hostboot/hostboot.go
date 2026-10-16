@@ -13,17 +13,26 @@
 // UpgradingTimeout, and becomes 'active' once the daemon answers its own
 // Ping, which closes the gap however long startup takes.
 //
-// Three rules keep that from hiding a host that should be fenced, or
+// A boot after a stop that left no marker (a crash, a kill, a stop whose
+// write failed) is 'upgrading' until it serves too, for a host recorded
+// 'active' (or 'upgrading' for less than UpgradingTimeout): recorded 'active'
+// it answered nothing for as long as startup took, and on lab 1 (2026-10-14)
+// its peers SSH-fenced it 19 s after the boot, before it served.
+//
+// Four rules keep that from hiding a host that should be fenced, or
 // overwriting a decision made about it:
 //
 //   - only a SIGTERM of an ACTIVE host leaves the marker (MarkRestarting), and
-//     the boot consumes it before its write (BootState): a daemon that
-//     crash-loops boots 'active' as before, so it cannot keep re-arming the
-//     'upgrading' timeout;
+//     the boot consumes it before its write (BootState);
+//   - a boot that awaits serving leaves AwaitingPath until a daemon serves
+//     (Served), and a boot without the marker that finds it is 'active': a
+//     daemon that crash-loops before it serves is 'upgrading' once, not on
+//     every boot, so it cannot keep re-arming the 'upgrading' timeout;
 //   - the boot keeps 'upgrading' only while the host is still recorded
-//     'upgrading' and the SIGTERM is younger than UpgradingTimeout: a host the
-//     cluster may have fenced, put in maintenance or isolated while it was
-//     down boots as before;
+//     'upgrading' (or, without the marker, 'active') and the SIGTERM, or the
+//     'upgrading' state, is younger than UpgradingTimeout: a host the cluster
+//     may have fenced, put in maintenance or isolated while it was down boots
+//     as before;
 //   - ConfirmServing moves the host from 'upgrading' to 'active' and from
 //     nothing else, and leaves its isolation as it is.
 //
@@ -102,10 +111,14 @@ func MarkRestarting(ctx context.Context, db *corrosion.Client, host, dataDir str
 func BootState(ctx context.Context, db *corrosion.Client, host, dataDir string, upgradePending bool, now time.Time) Boot {
 	at, marked := takeMarker(dataDir)
 	if upgradePending {
+		// Noted like any boot that awaits serving, so a crash of this boot
+		// before it serves is not 'upgrading' again with a fresh timeout. Best
+		// effort: the watchdog, not the note, confirms this boot.
+		_ = writeAwaiting(dataDir, now)
 		return Boot{State: "upgrading", Reason: "post-upgrade boot; the upgrade watchdog confirms it"}
 	}
 	if !marked {
-		return Boot{State: "active", Reason: "no graceful stop recorded"}
+		return noteAwaiting(dataDir, uncleanBoot(ctx, db, host, dataDir, now), now)
 	}
 	if age := now.Sub(at); age < 0 || age >= UpgradingTimeout {
 		return Boot{State: "active", Reason: fmt.Sprintf("the graceful stop was %s ago; the cluster may have acted on this host since", age.Round(time.Second))}
@@ -117,7 +130,143 @@ func BootState(ctx context.Context, db *corrosion.Client, host, dataDir string, 
 	if h.State != "upgrading" {
 		return Boot{State: "active", Reason: "recorded " + h.State + " since the graceful stop"}
 	}
-	return Boot{State: "upgrading", AwaitServing: true, Reason: "graceful restart; active once this daemon serves"}
+	return noteAwaiting(dataDir, Boot{State: "upgrading", AwaitServing: true, Reason: "graceful restart; active once this daemon serves"}, now)
+}
+
+// uncleanBoot is the boot after a stop that left no marker: a crash, a kill,
+// or a stop whose 'upgrading' write failed (a WAL-quarantined daemon writes
+// nothing). It is 'upgrading' until this daemon serves, as after a graceful
+// stop, for a host recorded 'active', or 'upgrading' for less than
+// UpgradingTimeout. Every other boot is 'active' as before:
+//
+//   - one that follows a boot that awaited serving and never served
+//     (AwaitingPath): a daemon that crash-loops before it serves is recorded
+//     'upgrading' once, not on every boot, so it cannot keep re-arming the
+//     coordinator's timeout;
+//   - one with no data dir, which could not tell that;
+//   - one that follows FlapLimit unclean boots within FlapWindow
+//     (UncleanHistoryName): a daemon that serves briefly and crashes again
+//     clears the note each time, and would otherwise be 'upgrading' after
+//     every crash and never fenced;
+//   - a host recorded 'upgrading' for UpgradingTimeout or longer: the
+//     coordinator may be fencing it;
+//   - a host recorded anything else (fenced, offline, maintenance, draining,
+//     joining) or not at all.
+func uncleanBoot(ctx context.Context, db *corrosion.Client, host, dataDir string, now time.Time) Boot {
+	if dataDir == "" {
+		return Boot{State: "active", Reason: "no graceful stop recorded, and no data dir to bound a crash loop"}
+	}
+	prior, err := recordUncleanBoot(dataDir, now)
+	if err != nil {
+		return Boot{State: "active", Reason: "no graceful stop recorded, and recording this unclean boot failed (" + err.Error() + ")"}
+	}
+	if prior >= FlapLimit {
+		return Boot{State: "active", Reason: fmt.Sprintf("no graceful stop recorded, and this is unclean boot %d within %s; a flapping daemon boots active", prior+1, FlapWindow)}
+	}
+	if _, err := os.Lstat(AwaitingPath(dataDir)); !os.IsNotExist(err) {
+		return Boot{State: "active", Reason: "no graceful stop recorded, and the last boot never served"}
+	}
+	h, err := corrosion.GetHost(ctx, db, host)
+	if err != nil || h == nil {
+		return Boot{State: "active", Reason: "no graceful stop recorded, and this host's record is unreadable"}
+	}
+	switch h.State {
+	case "active":
+	case "upgrading":
+		since, ok, err := corrosion.HostStateSince(ctx, db, host)
+		if err != nil || !ok {
+			return Boot{State: "active", Reason: "no graceful stop recorded, and when this host turned 'upgrading' is unreadable"}
+		}
+		if age := now.Sub(since); age < 0 || age >= UpgradingTimeout {
+			return Boot{State: "active", Reason: fmt.Sprintf("no graceful stop recorded, and this host turned 'upgrading' %s ago; the cluster may have acted on it since", age.Round(time.Second))}
+		}
+	default:
+		return Boot{State: "active", Reason: "no graceful stop recorded; recorded " + h.State}
+	}
+	return Boot{State: "upgrading", AwaitServing: true, Reason: "no graceful stop recorded; active once this daemon serves"}
+}
+
+// AwaitingName is the file, in the daemon's data directory, a boot that awaits
+// serving leaves until a daemon serves (Served): while it is there, no daemon
+// has served since that boot.
+const AwaitingName = "boot-awaiting-serving"
+
+// AwaitingPath is AwaitingName's path under dataDir.
+func AwaitingPath(dataDir string) string { return filepath.Join(dataDir, AwaitingName) }
+
+// noteAwaiting leaves AwaitingPath for a boot b that awaits serving, keeping
+// one an earlier boot left. A boot that cannot leave it is 'active': the next
+// boot could not tell that this daemon never served.
+func noteAwaiting(dataDir string, b Boot, now time.Time) Boot {
+	if !b.AwaitServing {
+		return b
+	}
+	if err := writeAwaiting(dataDir, now); err != nil {
+		return Boot{State: "active", Reason: b.Reason + "; but noting that it awaits serving failed (" + err.Error() + "), so active now"}
+	}
+	return b
+}
+
+// writeAwaiting leaves AwaitingPath, keeping one an earlier boot left.
+func writeAwaiting(dataDir string, now time.Time) error {
+	if dataDir == "" {
+		return errors.New("no data dir")
+	}
+	p := AwaitingPath(dataDir)
+	if _, err := os.Lstat(p); err == nil {
+		return nil
+	}
+	return os.WriteFile(p, []byte(now.UTC().Format(time.RFC3339Nano)), 0o600)
+}
+
+// FlapLimit unclean boots within FlapWindow make the next one 'active'.
+const (
+	FlapLimit  = 3
+	FlapWindow = 10 * time.Minute
+)
+
+// UncleanHistoryName is the file, in the daemon's data directory, that lists
+// the times of the last unclean boots (boots without the graceful-stop
+// marker), one RFC 3339 time per line.
+const UncleanHistoryName = "boot-unclean-history"
+
+// recordUncleanBoot adds now to UncleanHistoryName and returns how many
+// unclean boots it already held within FlapWindow of now, either side (a clock
+// that went back keeps counting them). It keeps only those, at most FlapLimit.
+func recordUncleanBoot(dataDir string, now time.Time) (int, error) {
+	p := filepath.Join(dataDir, UncleanHistoryName)
+	b, err := os.ReadFile(p)
+	if err != nil && !os.IsNotExist(err) {
+		return 0, err
+	}
+	var recent []string
+	for _, line := range strings.Split(string(b), "\n") {
+		at, perr := time.Parse(time.RFC3339Nano, strings.TrimSpace(line))
+		if perr != nil {
+			continue
+		}
+		if d := now.Sub(at); d > -FlapWindow && d < FlapWindow {
+			recent = append(recent, at.UTC().Format(time.RFC3339Nano))
+		}
+	}
+	prior := len(recent)
+	recent = append(recent, now.UTC().Format(time.RFC3339Nano))
+	if len(recent) > FlapLimit {
+		recent = recent[len(recent)-FlapLimit:]
+	}
+	if err := os.WriteFile(p, []byte(strings.Join(recent, "\n")+"\n"), 0o600); err != nil {
+		return prior, err
+	}
+	return prior, nil
+}
+
+// Served records that this daemon answers its own Ping: the next boot is no
+// longer one after a daemon that never served. Best effort.
+func Served(dataDir string) {
+	if dataDir == "" {
+		return
+	}
+	_ = os.Remove(AwaitingPath(dataDir))
 }
 
 // takeMarker reads and removes the marker. Removed whatever it says, so a

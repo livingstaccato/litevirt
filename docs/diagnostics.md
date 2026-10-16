@@ -1717,6 +1717,27 @@ network heals. It logs what came back and what did not, but raises no condition.
 See [Gossip membership heals itself after a
 partition](operating-model.md#gossip-membership-heals-itself-after-a-partition).
 
+### A host stuck `upgrading` while its daemon runs (`upgrading_unconfirmed`)
+
+After a restart the host stays `upgrading` until its daemon answers its own
+Ping and records it `active` ([migration-failover.md](migration-failover.md),
+"A graceful restart stays `upgrading` until it serves"). Peers that cannot
+reach such a host fence it once it has been `upgrading` for 2 minutes. Peers
+that reach it do not, so a daemon that runs but never records itself `active`
+leaves its host unplaceable, listed as draining, and nothing else shows why.
+Evaluator `host_boot`; the host writes the row about **itself**.
+
+| Raised when | Clears when |
+|---|---|
+| The host has been recorded `upgrading` for 2 minutes or more, and its daemon's serving check still has not recorded it `active`: its own Ping does not answer, or the write that records it `active` fails (that write is retried with backoff, 1 s doubling to 1 min, until it lands). **Warning** severity. The evidence names the cause, the time the host turned `upgrading` and the remedy. | The check records the host `active`, or finds it recorded as something else (fenced, drained, undrained), whether or not its own Ping answers yet. One left open by an earlier daemon process is resolved too. While it stays open its row is written again only when the cause changes, and otherwise every 10 minutes. |
+
+While it is open the host also exports `litevirt_host_upgrading_unconfirmed 1`,
+and logs the cause and the remedy at error level. Fix what the cause names:
+the daemon's own mTLS client or its listener on 127.0.0.1, or the write (a
+WAL-quarantined node writes nothing, this condition included, so there only
+the log and the metric show it). The host then records itself `active`. Or run
+`lv host undrain <host>` to record it `active` now.
+
 ### Partition pause (`partition_paused`, `partition_pause_failed`, `partition_one_way`, `vm_settled`, `vm_settle_declined`)
 
 Evaluator `partition_pause` (design/partition-pause.md). Every row is written by

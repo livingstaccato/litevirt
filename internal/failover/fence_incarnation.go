@@ -105,8 +105,9 @@ func (c *Coordinator) turnedActiveThisCycle(ctx context.Context, target string, 
 
 // fenceRowCutoff is the instant before which a fencing_log row of host is
 // about an earlier life of the host: the moment it last turned active
-// (corrosion.HostActiveSince). ok=false when there is none to judge by — the
-// host is not active, has no membership row, or this node does not read
+// (corrosion.HostActiveSince), or, for a host recorded 'upgrading', the moment
+// it wrote that (upgradingLife). ok=false when there is none to judge by — the
+// host is neither, has no membership row, or this node does not read
 // host_membership yet — and every row is then judged as before.
 //
 // recentlyFenced and manualFenceConfirmed used to count any accepted row under
@@ -132,6 +133,25 @@ func (c *Coordinator) fenceRowCutoff(ctx context.Context, host string) (time.Tim
 		return time.Time{}, false
 	}
 	if !ok {
+		return c.upgradingLife(ctx, host)
+	}
+	return since.Truncate(time.Second), true
+}
+
+// upgradingLife is fenceRowCutoff for a host recorded 'upgrading': the moment
+// it wrote that state. Only the host writes it (its SIGTERM, its boot, an
+// upgrade it runs), so a fence row older than the write is about a host that
+// was up after it: a boot without a graceful-stop marker records an active
+// host 'upgrading' until it serves, and a fence before that boot must not hold
+// back, for recentFenceWindow, the fence of a daemon that then never serves
+// (upgradingSinceHandled). A row newer than the write still counts.
+func (c *Coordinator) upgradingLife(ctx context.Context, host string) (time.Time, bool) {
+	h, err := corrosion.GetHost(ctx, c.db, host)
+	if err != nil || h == nil || h.State != "upgrading" {
+		return time.Time{}, false
+	}
+	since, ok, err := corrosion.HostStateSince(ctx, c.db, host)
+	if err != nil || !ok {
 		return time.Time{}, false
 	}
 	return since.Truncate(time.Second), true

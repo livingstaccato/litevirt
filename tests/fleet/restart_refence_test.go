@@ -47,6 +47,8 @@ type restartFleet struct {
 
 	mu       sync.Mutex
 	fencedAt []time.Time
+	// fenceAs, when set, is what the fencer reports for d.
+	fenceAs *fence.Result
 }
 
 func newRestartFleet(t *testing.T, seed int64, tune ...func(*failover.Coordinator)) *restartFleet {
@@ -83,7 +85,11 @@ func newRestartFleet(t *testing.T, seed int64, tune ...func(*failover.Coordinato
 		if h.Name == f.d.Name {
 			f.mu.Lock()
 			f.fencedAt = append(f.fencedAt, time.Now())
+			as := f.fenceAs
 			f.mu.Unlock()
+			if as != nil {
+				return *as
+			}
 		}
 		return fence.Result{Method: "fleet-test", Success: true}
 	})

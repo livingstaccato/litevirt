@@ -125,6 +125,9 @@ type Daemon struct {
 	// selfPinger, when set, replaces the local mTLS client the restart check
 	// pings this daemon through (awaitServingThenActivate). Tests only.
 	selfPinger func() (pinger, func(), error)
+	// confirmServing, when set, replaces hostboot.ConfirmServing in the
+	// restart's serving check (confirmActive). Tests only.
+	confirmServing func(ctx context.Context) (bool, string, error)
 
 	// rolledBackTokens names capability tokens this node already latched that this
 	// binary has never heard of — i.e. this binary is a rollback below them. Set at
@@ -239,16 +242,27 @@ func New(cfg *Config) (*Daemon, error) {
 const localMaxRecvMsgSize = 256 << 20
 
 // writeBootState is the boot write: the state hostboot decides, with this
-// build's version and resources, and — after a graceful stop — the check that
-// records the host active once this daemon serves.
+// build's version and resources, and — after a graceful stop or a crash of an
+// active host — the check that records the host active once this daemon
+// serves. A boot that does not await serving but follows one that never
+// served checks too, so that once this daemon serves the next crash awaits
+// serving again (hostboot.Served).
+//
+// On a WAL-quarantined daemon both writes are refused by the replicated write
+// path, as every write is: the host stays as the cluster recorded it.
 func (d *Daemon) writeBootState(ctx context.Context, cpus, memMiB, diskGiB int, hasResources bool) {
 	boot := hostboot.BootState(ctx, d.db, d.cfg.HostName, d.cfg.DataDir, d.upgradePending, time.Now())
 	slog.Info("boot state", "state", boot.State, "await_serving", boot.AwaitServing, "reason", boot.Reason)
 	if err := corrosion.UpdateHostStartup(ctx, d.db, d.cfg.HostName, boot.State, d.cfg.Version, cpus, memMiB, diskGiB, hasResources); err != nil {
 		slog.Warn("failed to write host startup state", "error", err)
 	}
-	if boot.AwaitServing {
+	switch {
+	case boot.AwaitServing:
 		go d.awaitServingThenActivate(ctx)
+	case d.cfg.DataDir != "":
+		if _, err := os.Lstat(hostboot.AwaitingPath(d.cfg.DataDir)); err == nil {
+			go d.awaitServingThenNote(ctx)
+		}
 	}
 }
 
@@ -575,8 +589,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// On an upgrade boot, stay "upgrading" until the watchdog confirms local gRPC
 	// is healthy (it flips to "active"); version + resources are still written
 	// here either way so the new version propagates immediately. After a
-	// graceful stop (SIGTERM) the host likewise stays "upgrading" until this
-	// daemon answers its own Ping (awaitServingThenActivate): recorded active
+	// graceful stop (SIGTERM), or a crash of an active host, the host likewise
+	// stays "upgrading" until this daemon answers its own Ping
+	// (awaitServingThenActivate): recorded active
 	// before its gRPC server listened, it was fenced on the failure count its
 	// observers carried through the restart (hostboot).
 	d.writeBootState(ctx, cpus, memMiB, diskGiB, niErr == nil)

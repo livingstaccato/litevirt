@@ -82,7 +82,7 @@ func TestNICHotplug_UnstampedForeignSeedIsLeftAlone(t *testing.T) {
 	if after, _ := os.ReadFile(iso); !bytes.Equal(before, after) {
 		t.Error("an unstamped seed of another instance was rewritten")
 	}
-	if evs := vmEventsOf(t, s, "x", "seed.not_rebuilt"); len(evs) != 1 || !strings.Contains(evs[0].Detail, iso) {
+	if evs := vmEventsOf(t, s, "x", "seed.not_rebuilt"); len(evs) != 1 || !strings.Contains(evs[0].Detail, iso) || !strings.Contains(evs[0].Detail, "its instance-id \"other\"") {
 		t.Errorf("want one seed.not_rebuilt event naming %s: %+v", iso, evs)
 	}
 }

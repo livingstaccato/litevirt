@@ -273,33 +273,48 @@ func SpecUserData(spec *pb.VMSpec) string {
 //
 // The error is fs.ErrNotExist for no seed, or the read's.
 func OwnSeed(iso string, c SeedClaim) (Seed, bool, error) {
+	seed, own, _, err := OwnSeedWhy(iso, c)
+	return seed, own, err
+}
+
+// OwnSeedWhy is OwnSeed with, for a seed that is not the VM's, the reason:
+// which of OwnSeed's conditions it fails.
+func OwnSeedWhy(iso string, c SeedClaim) (Seed, bool, string, error) {
 	owner, stamped, err := SeedOwner(iso)
 	if err != nil {
-		return Seed{}, false, err
+		return Seed{}, false, "", err
 	}
 	seed, err := ReadSeed(iso)
 	if err != nil {
-		return Seed{}, false, err
+		return Seed{}, false, "", err
 	}
 	if !c.CloudInit {
-		return seed, false, nil
+		return seed, false, "the VM's spec has no cloud-init, so no seed is its own", nil
 	}
 	if stamped {
-		return seed, c.UUID != "" && owner == c.UUID, nil
+		switch {
+		case c.UUID == "":
+			return seed, false, "it is stamped for a VM, and the VM's spec records no uuid to match it", nil
+		case owner != c.UUID:
+			return seed, false, fmt.Sprintf("it is stamped for another VM (uuid %s)", owner), nil
+		}
+		return seed, true, "", nil
 	}
 	domXML := ""
 	if c.DomainXML != nil {
 		domXML = c.DomainXML()
 	}
 	if !lv.DomainAttachesCDROM(domXML, iso) {
-		return seed, false, nil
+		return seed, false, "it is not stamped, and the VM's domain here does not attach it as its cdrom", nil
 	}
 	if dom := lv.UUIDFromXML(domXML); c.UUID != "" && dom != "" && !strings.EqualFold(dom, c.UUID) {
-		return seed, false, nil
+		return seed, false, "it is not stamped, and the domain here that attaches it is another VM's", nil
 	}
 	if seed.UserData != c.UserData {
-		return seed, false, nil
+		return seed, false, "it is not stamped, and its user-data is not the one the VM's spec gives", nil
 	}
-	id := seed.InstanceID()
-	return seed, id != "" && (id == c.VMName || id == c.VMName+"-next"), nil
+	if id := seed.InstanceID(); id == "" || id != c.VMName && id != c.VMName+"-next" {
+		return seed, false, fmt.Sprintf("it is not stamped, and its instance-id %q is not one the VM's create wrote", id), nil
+	}
+	return seed, true, "", nil
 }

@@ -71,7 +71,7 @@ func TestNICHotplug_ANoCloudInitVMNeverTakesALeftoverSeed(t *testing.T) {
 			if n := cdromReloads(s, "x"); n != 0 {
 				t.Errorf("reloaded %d times", n)
 			}
-			if evs := vmEventsOf(t, s, "x", "seed.not_rebuilt"); len(evs) != 1 || !strings.Contains(evs[0].Detail, iso) {
+			if evs := vmEventsOf(t, s, "x", "seed.not_rebuilt"); len(evs) != 1 || !strings.Contains(evs[0].Detail, iso) || !strings.Contains(evs[0].Detail, "has no cloud-init") {
 				t.Errorf("want one seed.not_rebuilt event naming %s: %+v", iso, evs)
 			}
 		})
@@ -103,7 +103,7 @@ func TestNICHotplug_AnUnattachedUnstampedSeedIsLeftAlone(t *testing.T) {
 	if seedStamped(t, iso) {
 		t.Error("an unstamped seed the VM's domain does not attach was stamped")
 	}
-	if evs := vmEventsOf(t, s, "x", "seed.not_rebuilt"); len(evs) != 1 || !strings.Contains(evs[0].Detail, iso) {
+	if evs := vmEventsOf(t, s, "x", "seed.not_rebuilt"); len(evs) != 1 || !strings.Contains(evs[0].Detail, iso) || !strings.Contains(evs[0].Detail, "does not attach it") {
 		t.Errorf("want one seed.not_rebuilt event naming %s: %+v", iso, evs)
 	}
 }
@@ -166,7 +166,7 @@ func TestNICHotplug_AnAttachedResidueOfAnotherUserDataIsNotTaken(t *testing.T) {
 	if n := cdromReloads(s, "x"); n != 0 {
 		t.Errorf("reloaded %d times", n)
 	}
-	if evs := vmEventsOf(t, s, "x", "seed.not_rebuilt"); len(evs) != 1 || !strings.Contains(evs[0].Detail, iso) {
+	if evs := vmEventsOf(t, s, "x", "seed.not_rebuilt"); len(evs) != 1 || !strings.Contains(evs[0].Detail, iso) || !strings.Contains(evs[0].Detail, "its user-data is not") {
 		t.Errorf("want one seed.not_rebuilt event naming %s: %+v", iso, evs)
 	}
 }

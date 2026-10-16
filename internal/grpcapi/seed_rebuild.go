@@ -55,7 +55,7 @@ func (s *Server) rebuildSeedNetworkConfig(ctx context.Context, vm *corrosion.VMR
 	uuid := cloudinit.SpecUUID(vm.Spec)
 	var spec pb.VMSpec
 	specErr := json.Unmarshal([]byte(vm.Spec), &spec)
-	cur, own, err := cloudinit.OwnSeed(iso, s.seedClaim(vm, &spec))
+	cur, own, why, err := cloudinit.OwnSeedWhy(iso, s.seedClaim(vm, &spec))
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return
@@ -66,7 +66,7 @@ func (s *Server) rebuildSeedNetworkConfig(ctx context.Context, vm *corrosion.VMR
 		failed(fmt.Errorf("parse the VM's spec: %w", specErr))
 		return
 	case !own:
-		detail := fmt.Sprintf("the seed at %s on %s is not proven this VM's (not stamped for it, and not the cdrom of its domain here; a VM of the same name may have left it); it is left as it is, and not changed under the running guest; the VM's next start on %s writes its own, or none for a VM without cloud-init; or remove the file", iso, s.hostName, s.hostName)
+		detail := fmt.Sprintf("the seed at %s on %s is not proven this VM's: %s (a VM of the same name may have left it); it is left as it is, and not changed under the running guest; the VM's next start on %s writes its own, or none for a VM without cloud-init; or, with the VM stopped, remove the file and its .owner file", iso, s.hostName, why, s.hostName)
 		slog.Warn("seed rebuild: not this VM's seed; left alone", "vm", vm.Name, "seed", iso)
 		s.recordVMEventSeverity(ctx, vm.Name, "seed.not_rebuilt", "ok", "warning", detail)
 		return

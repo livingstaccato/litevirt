@@ -248,7 +248,7 @@ func TestNICHotplug_ALeftoverSeedIsNotRebuiltFrom(t *testing.T) {
 		if n := cdromReloads(s, "x"); n != 0 || len(vmEventsOf(t, s, "x", "seed.reload_failed")) != 0 {
 			t.Errorf("a reload was attempted for a seed that is not this VM's (%d)", n)
 		}
-		if evs := vmEventsOf(t, s, "x", "seed.not_rebuilt"); len(evs) != 1 || !strings.Contains(evs[0].Detail, iso) {
+		if evs := vmEventsOf(t, s, "x", "seed.not_rebuilt"); len(evs) != 1 || !strings.Contains(evs[0].Detail, iso) || !strings.Contains(evs[0].Detail, "has no cloud-init") {
 			t.Errorf("want one seed.not_rebuilt event naming %s: %+v", iso, evs)
 		}
 	})
@@ -275,7 +275,7 @@ func TestNICHotplug_ALeftoverSeedIsNotRebuiltFrom(t *testing.T) {
 		if n := cdromReloads(s, "x"); n != 0 {
 			t.Errorf("reloaded %d times", n)
 		}
-		if evs := vmEventsOf(t, s, "x", "seed.not_rebuilt"); len(evs) != 1 || !strings.Contains(evs[0].Detail, iso) {
+		if evs := vmEventsOf(t, s, "x", "seed.not_rebuilt"); len(evs) != 1 || !strings.Contains(evs[0].Detail, iso) || !strings.Contains(evs[0].Detail, "stamped for another VM") {
 			t.Errorf("want one seed.not_rebuilt event naming %s: %+v", iso, evs)
 		}
 	})

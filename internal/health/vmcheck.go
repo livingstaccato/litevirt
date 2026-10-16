@@ -29,13 +29,17 @@ const healthCheckGracePeriod = 5 * time.Minute
 
 // VMChecker runs per-VM health checks defined in each VM's HealthCheckSpec.
 type VMChecker struct {
-	hostName string
+	networkStarter func(context.Context, string) error
+	hostName       string
 	// dataDir is the host data root the owner-epoch file marker lives under.
 	// Taken positionally like NewReconciler's rather than through a setter: a
 	// setter would leave every existing construction at "", and an empty dataDir
 	// SKIPS the file marker — so the path would be untested by construction.
 	dataDir string
 	db      *corrosion.Client
+	// followNetworks moves a stopped VM's NICs onto their networks' devices
+	// before a start (SetNetworkFollower).
+	followNetworks func(ctx context.Context, name string)
 	// virt is nil when there is no libvirt connection (most tests). An
 	// interface, not *lv.Client, so a test can drive a restart through
 	// libvirtfake; NewVMChecker keeps a nil *lv.Client a nil interface.
@@ -139,6 +143,14 @@ func (v *VMChecker) hwPrepareStart(ctx context.Context, vm *corrosion.VMRecord) 
 		return func() {}, nil
 	}
 	return v.prepareHardwareForStart(ctx, vm)
+}
+
+// SetNetworkFollower wires the hook that moves a stopped VM's NICs onto the
+// devices their networks are on now before the checker starts it
+// (grpcapi.Server.FollowNetworkDevices), as every start through the Server
+// does. nil-safe; unwired, the domain starts as defined.
+func (v *VMChecker) SetNetworkFollower(fn func(ctx context.Context, name string)) {
+	v.followNetworks = fn
 }
 
 // SetGate injects the split-brain safety gate (the health.Checker).
@@ -1229,6 +1241,9 @@ func (v *VMChecker) sharesWeightOf(vm corrosion.VMRecord) int {
 // startGuarded starts name's domain under the shared-disk release check
 // (GuardSharedDiskStart, review c2b).
 func (v *VMChecker) startGuarded(ctx context.Context, name string) error {
+	if v.followNetworks != nil {
+		v.followNetworks(ctx, name)
+	}
 	xml := ""
 	if d, ok := v.virt.(interface {
 		DumpXMLInactive(string) (string, error)
@@ -1240,7 +1255,7 @@ func (v *VMChecker) startGuarded(ctx context.Context, name string) error {
 		return err
 	}
 	defer release()
-	return v.virt.StartDomain(name)
+	return v.startOnNetwork(ctx, name)
 }
 
 // haHoldsHealthAction says why an automatic health-check restart or migrate
@@ -1257,4 +1272,13 @@ func haHoldsHealthAction(ctx context.Context, db *corrosion.Client) string {
 		return "cluster HA is disarmed (lv cluster ha)"
 	}
 	return ""
+}
+
+// SetNetworkStarter installs the shared network/runtime-start exclusion.
+func (v *VMChecker) SetNetworkStarter(fn func(context.Context, string) error) { v.networkStarter = fn }
+func (v *VMChecker) startOnNetwork(ctx context.Context, name string) error {
+	if v.networkStarter != nil {
+		return v.networkStarter(ctx, name)
+	}
+	return v.virt.StartDomain(name)
 }

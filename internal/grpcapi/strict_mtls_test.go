@@ -188,6 +188,8 @@ func TestAuthenticate_BearerWins(t *testing.T) {
 // the actual network op — we assert only that the auth gate did not deny it).
 func TestStep0Gates_PeerOnly(t *testing.T) {
 	s := testServer(t)
+	s.SetNetworkProvisioner(&bridgeRemovalProv{})
+	s.SetNetworkEffects(isolatedNetworkEffects{})
 	peerCtx := peerCtxFor(t, s, "peer-1")
 	op := userCtx("op", "operator")
 	viewer := userCtx("v", "viewer")
@@ -207,6 +209,10 @@ func TestStep0Gates_PeerOnly(t *testing.T) {
 
 	deniedForNonPeer(t, "SyncVTEP", func(ctx context.Context) error {
 		_, err := s.SyncVTEP(ctx, &pb.SyncVTEPRequest{Vni: 100, VtepIp: "10.0.0.9"})
+		return err
+	})
+	deniedForNonPeer(t, "AnnounceMigratedGuest", func(ctx context.Context) error {
+		_, err := s.AnnounceMigratedGuest(ctx, &pb.AnnounceMigratedGuestRequest{VmName: "x"})
 		return err
 	})
 	deniedForNonPeer(t, "UpdateFDB", func(ctx context.Context) error {

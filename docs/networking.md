@@ -196,6 +196,45 @@ with the cluster's network table every 30 seconds, and at startup:
 A deleted network whose bridge a live network still uses is left alone, so
 the live one keeps its bridge, gateway and `dnsmasq`.
 
+When a network's device changes (a new `interface:` in a redeploy, say), each
+host sets up the new device and retires the old one, unless another live
+network uses it. Retiring a device removes only what belongs to it (its
+`dnsmasq`, gateway address and bridge); the network's NAT and host-isolation
+rules follow it to the new device. A device something on the host still uses
+— a guest port on it, a VM whose domain definition names it (running or
+stopped), or a container whose config links to it (a host without the LXC
+tooling has none) — is kept until nothing does, and goes on the first pass
+after that. Each VM or container moves to the
+network's new device when it next starts (`lv start`, `lv restart`); a VM
+records a `vm.nic_moved` event. A VM live-migrated meanwhile lands on the
+device its target serves the network on: the new one, or the old one where
+the target has not moved yet. When the new device's subnet overlaps the old
+one's, both would serve it, and only stopped workloads are defined on the old
+device, the gateway and `dnsmasq` move to the new device at once, and every
+stopped VM and container defined on the old device is re-pointed with them
+(their persistent definitions only), so any later start, a health restart
+included, lands on the new device. While a workload still RUNS on the old
+device, the change is refused on that host, naming those workloads: stop them
+or migrate them off the host, and the change completes; each then starts on
+the new device. A
+network on a VLAN, a host-isolated one, an operator bridge without `--dhcp`
+and a vxlan host that is not the network's DHCP gateway carry no gateway
+there and are never refused. The record of the moved-off devices is kept
+under `/run/litevirt`, so a daemon restart still finishes them. Each pass also
+removes a bridge litevirt created on that host (recorded under
+`/run/litevirt/bridges`, see below) that no live network, pending teardown,
+VM or container on the host names any more, and that has nothing plugged into
+it, together with its `dnsmasq`. A bridge litevirt did not create is never
+removed.
+
+A bridge litevirt created for a network (recorded under
+`/run/litevirt/bridges`, below) and an isolated network's bridge get a MAC
+derived from the bridge's name, the same on every host and for every network
+sharing the bridge, unless the bridge is on a VLAN or has an uplink. Provisioning sets it on a bridge that has another
+MAC, so it reaches existing bridges on the daemon's first pass; an operator's
+bridge keeps its own. A guest that moves to another host then finds its
+gateway at the MAC it already has.
+
 Tearing down a bridge network removes the Linux bridge itself only when
 litevirt created it on that host. Each daemon records the bridges it creates
 under `/run/litevirt/bridges` (one file per bridge holding its interface index;

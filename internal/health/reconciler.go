@@ -84,6 +84,7 @@ type imagePullFlight struct {
 // and starts them. It also detects split-brain conditions where a VM
 // is running locally in libvirt but corrosion says it belongs to another host.
 type Reconciler struct {
+	networkStarter func(context.Context, string) error
 	// stopSyncHook, test-only, runs between the out-of-band stop sync's
 	// decision and its write, where a concurrent `lv stop` can land.
 	stopSyncHook func(ctx context.Context, vmName string)
@@ -2139,7 +2140,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		r.failPendingStart(ctx, vm.Name, proofID, false, gerr.Error())
 		return
 	}
-	startErr := r.virt.StartDomain(vm.Name)
+	startErr := r.startOnNetwork(ctx, vm.Name)
 	releaseGuard()
 	if err := startErr; err != nil {
 		releaseHW() // release any passthrough the preflight bound for this failed start
@@ -2986,4 +2987,13 @@ func (r *Reconciler) runtimeSuperseded(ctx context.Context, name string) bool {
 		return false
 	}
 	return row.OwnerEpoch > marker
+}
+
+// SetNetworkStarter installs the shared network/runtime-start exclusion.
+func (r *Reconciler) SetNetworkStarter(fn func(context.Context, string) error) { r.networkStarter = fn }
+func (r *Reconciler) startOnNetwork(ctx context.Context, name string) error {
+	if r.networkStarter != nil {
+		return r.networkStarter(ctx, name)
+	}
+	return r.virt.StartDomain(name)
 }

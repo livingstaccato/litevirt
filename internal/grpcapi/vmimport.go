@@ -532,7 +532,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 
 	stateMsg := "imported (stopped)"
 	if first.Start {
-		if err := s.virt.StartDomain(name); err != nil {
+		if err := s.StartDomainOnNetwork(ctx, name); err != nil {
 			// Roll back fully: remove DB row, undefine, delete disks. The
 			// tombstone is best-effort inside a rollback that already fails the
 			// RPC — but a decline must at least be visible, since it leaves a

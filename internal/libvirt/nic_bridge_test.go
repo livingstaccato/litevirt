@@ -49,3 +49,17 @@ func TestRetargetInterfaceXML(t *testing.T) {
 		t.Error("an unknown MAC was found")
 	}
 }
+
+// InterfaceBridges reads each bridge interface's MAC and source bridge, in
+// either quote style, and leaves out an interface that is not on a bridge.
+func TestInterfaceBridges(t *testing.T) {
+	x := `<domain><devices>
+<interface type="bridge"><mac address="52:54:00:AA:00:01"/><source bridge="lanaa"/><model type="virtio"/></interface>
+<interface type='bridge'><mac address='52:54:00:aa:00:02'/><source bridge='lanbb'/></interface>
+<interface type="direct"><mac address="52:54:00:aa:00:03"/><source dev="eth0" mode="bridge"/></interface>
+</devices></domain>`
+	got := InterfaceBridges(x)
+	if len(got) != 2 || got["52:54:00:aa:00:01"] != "lanaa" || got["52:54:00:aa:00:02"] != "lanbb" {
+		t.Errorf("InterfaceBridges = %v, want the two bridge NICs by lower-case MAC", got)
+	}
+}

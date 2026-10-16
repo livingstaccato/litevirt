@@ -77,8 +77,10 @@ var dnsmasqLeaseDir = "/var/lib/libvirt/dnsmasq" // a variable so a test can poi
 // /var/run is deliberately not normalised to /run: they are the same directory
 // via symlink, but the stop/kill paths match the argv STRING, so a dnsmasq
 // started by a previous binary with --pid-file=/var/run/... would stop matching.
+var dnsmasqPIDDir = "/var/run"
+
 func dnsmasqPidFile(key string) string {
-	return "/var/run/litevirt-dnsmasq-" + key + ".pid"
+	return dnsmasqPIDDir + "/litevirt-dnsmasq-" + key + ".pid"
 }
 
 // dnsmasqPidFileVNI returns the pidfile path for a VXLAN network's dnsmasq. Its

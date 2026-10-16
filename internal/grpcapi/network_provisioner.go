@@ -37,6 +37,19 @@ type NetworkProvisioner interface {
 	// replicated state (network.SyncFDB); a no-op for other networks. The
 	// network reconciler runs it every pass.
 	SyncFDB(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, hostName string) error
+	// RetireDevice tears down what def's device carries for network name —
+	// never anything keyed by the network, such as its firewall intent
+	// (network.RetireDevice). It retires a device a network moved off.
+	RetireDevice(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, hostName string) error
+	// ReleaseDeviceServices stops the network's dnsmasq and removes its
+	// gateway address on def's device, and leaves the device.
+	ReleaseDeviceServices(name string, def compose.NetworkDef)
+	// ServingGateway reports whether this host serves the network's gateway
+	// on def's device now.
+	ServingGateway(name string, def compose.NetworkDef) bool
+	// WouldServeGateway reports whether provisioning def here would put the
+	// network's gateway on its device.
+	WouldServeGateway(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, hostName string) bool
 }
 
 type hostNetworkProvisioner struct{}
@@ -59,6 +72,30 @@ func (hostNetworkProvisioner) RemoveUnusedBridge(name string) (bool, error) {
 
 func (hostNetworkProvisioner) GuestPorts(bridge string) ([]string, error) {
 	return network.BridgeGuestPorts(bridge)
+}
+
+func (hostNetworkProvisioner) RetireDevice(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, hostName string) error {
+	return network.RetireDevice(ctx, db, name, def, hostName)
+}
+
+func (hostNetworkProvisioner) ReleaseDeviceServices(name string, def compose.NetworkDef) {
+	network.ReleaseDeviceServices(name, def)
+}
+
+func (hostNetworkProvisioner) ServingGateway(name string, def compose.NetworkDef) bool {
+	return network.ServingGateway(name, def)
+}
+
+func (hostNetworkProvisioner) WouldServeGateway(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, hostName string) bool {
+	return network.WouldServeGateway(ctx, db, name, def, hostName)
+}
+
+func (hostNetworkProvisioner) CreatedBridges() ([]string, error) {
+	return network.CreatedBridges()
+}
+
+func (hostNetworkProvisioner) RemoveOrphanedBridge(name string) (bool, error) {
+	return network.RemoveOrphanedBridge(name)
 }
 
 func (hostNetworkProvisioner) SyncFDB(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, hostName string) error {
@@ -88,7 +125,7 @@ func (s *Server) ProvisionNetworkHere(ctx context.Context, db *corrosion.Client,
 			return "", err
 		}
 	}
-	dev, err := s.networkProvisioner().Provision(ctx, db, name, def, localIP, hostName)
+	dev, err := s.provisionDevice(ctx, db, name, def, localIP, hostName)
 	if err == nil {
 		s.pushVTEP(ctx, name, def, localIP)
 	}
@@ -103,7 +140,7 @@ func (s *Server) provisionHere(ctx context.Context, name string, def compose.Net
 	if err != nil {
 		return "", "", err
 	}
-	dev, err = s.networkProvisioner().Provision(ctx, s.db, name, def, vtep, s.hostName)
+	dev, err = s.provisionDevice(ctx, s.db, name, def, vtep, s.hostName)
 	if err == nil {
 		s.pushVTEP(ctx, name, def, vtep)
 	}

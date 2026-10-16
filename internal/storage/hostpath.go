@@ -430,6 +430,16 @@ func CheckDaemonStatePath(p, dataDir, pkiDir string) error {
 		return fmt.Errorf("%q is not an absolute path", p)
 	}
 	for _, cand := range pathForms(p) {
+		// These are file targets, not a reservation of every ordinary file
+		// under /run. Compare both lexical and resolved component paths.
+		for _, owned := range []string{"/run/litevirt/network-devices.json", "/run/litevirt/network-devices.json.tmp"} {
+			for _, target := range pathForms(owned) {
+				if within(target, cand) {
+					return fmt.Errorf("%q is the daemon's network device state", p)
+				}
+			}
+		}
+
 		if pkiDir != "" {
 			for _, d := range pathForms(pkiDir) {
 				if within(d, cand) {

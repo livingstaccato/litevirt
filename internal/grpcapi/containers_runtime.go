@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/litevirt/litevirt/internal/lxc"
@@ -41,6 +42,30 @@ func (a *LXCRuntimeAdapter) CreateContainer(ctx context.Context, opts CreateCont
 		return nil, err
 	}
 	return &ContainerInfo{Name: c.Name, State: string(c.State), Image: c.Image}, nil
+}
+
+// ContainerNICLinks reads the bridge each NIC of container name links to, by
+// ordinal, from its runtime config.
+func (a *LXCRuntimeAdapter) ContainerNICLinks(_ context.Context, name string) (map[int]string, error) {
+	l, ok := a.Inner.(interface {
+		NetLinks(name string) (map[int]string, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("container runtime cannot read NIC links")
+	}
+	return l.NetLinks(name)
+}
+
+// SetContainerNICLink links NIC ordinal of the stopped container name to
+// bridge in its runtime config.
+func (a *LXCRuntimeAdapter) SetContainerNICLink(_ context.Context, name string, ordinal int, bridge string) error {
+	l, ok := a.Inner.(interface {
+		SetNetLink(name string, n int, bridge string) error
+	})
+	if !ok {
+		return fmt.Errorf("container runtime cannot set NIC links")
+	}
+	return l.SetNetLink(name, ordinal, bridge)
 }
 
 func (a *LXCRuntimeAdapter) StartContainer(ctx context.Context, name string) error {

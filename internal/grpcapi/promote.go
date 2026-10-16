@@ -1650,7 +1650,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				}
 				return "shared disk released", status.Error(codes.FailedPrecondition, gerr.Error())
 			}
-			startErr := s.virt.StartDomain(targetName)
+			startErr := s.StartDomainOnNetwork(ctx, targetName)
 			releaseGuard()
 			if err := startErr; err != nil {
 				_ = s.virt.UndefineDomain(targetName, false) // wipe by design: half-built promote

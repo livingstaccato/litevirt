@@ -66,14 +66,27 @@ func TestFleet_UncleanRestartIsUpgradingUntilItServes(t *testing.T) {
 			t.Fatalf("fixture: %s counted d failing %d times (ok=%v), want past the fence threshold", n.Name, got, ok)
 		}
 	}
+	// Anchor before answers are enabled: healthy rows record transitions,
+	// not every probe. A valid first answer can precede ConfirmServing below.
+	served := time.Now()
 	f.down.Store(false)
+	// Force that ordering so the later assertion cannot rely on another
+	// healthy-row write after confirmation; unchanged healthy rows need none.
+	eventually(t, time.Minute, "every observer to hear the serving daemon before confirmation", func() bool {
+		for _, n := range f.observers {
+			got, _, ok := observedFailures(n, f.d.Name)
+			if !ok || got != 0 {
+				return false
+			}
+		}
+		return true
+	})
 	hostboot.Served(dir)
 	if b.AwaitServing {
 		if flipped, state, err := hostboot.ConfirmServing(ctx, f.d.DB, f.d.Name); err != nil || !flipped {
 			t.Fatalf("confirm serving: flipped=%v state=%q err=%v", flipped, state, err)
 		}
 	}
-	served := time.Now()
 	// Generous: under -race on a loaded host the observers' next probes and
 	// the confirm's replication have taken longer than convergeTimeout. What
 	// is asserted is that d is never fenced, not how fast it settles.

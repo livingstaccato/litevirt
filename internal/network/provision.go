@@ -97,6 +97,14 @@ func BridgeName(networkName string, def compose.NetworkDef) string {
 	return FlatBridgeName(networkName)
 }
 
+// bridgePreExistedFor is whether bridge counts as one litevirt found already
+// there for def, the fact the DHCP gate reads (see Provision). One predicate,
+// so WouldServeGateway answers as Provision acts.
+func bridgePreExistedFor(def compose.NetworkDef, bridge string) bool {
+	return BridgeExists(bridge) &&
+		(def.NetBoxPrefixID != 0 || !litevirtServedDHCP(dnsmasqPidFile(bridge)))
+}
+
 // VTEPRecord holds a host's VTEP information for a network.
 type VTEPRecord struct {
 	NetworkName string
@@ -131,8 +139,7 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 		// to the plain fact: its refusal below must read the same host state
 		// on every attempt.
 		pidFile := dnsmasqPidFile(bridge)
-		bridgePreExisted := BridgeExists(bridge) &&
-			(def.NetBoxPrefixID != 0 || !litevirtServedDHCP(pidFile))
+		bridgePreExisted := bridgePreExistedFor(def, bridge)
 
 		// REFUSE BEFORE CREATING ANYTHING, and this ordering is the whole of
 		// whether the refusal survives a retry.
@@ -157,6 +164,17 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 
 		if err := EnsureBridge(bridge); err != nil {
 			return "", err
+		}
+		// A bridge litevirt made (its record says so), with no VLAN and no
+		// uplink, gets the network's MAC, the same on every host
+		// (BridgeMAC). An operator's bridge, and a bridge that shares
+		// one L2 with the other hosts' (a VLAN, an uplink), keep their own.
+		if def.VLAN == 0 && bridgeRecorded(bridge) {
+			if BridgeHasUplink(bridge) {
+				warnSharedMACOnUplink(networkName, bridge)
+			} else {
+				ensureNetworkBridgeMAC(networkName, bridge, def.Subnet)
+			}
 		}
 
 		// If a VLAN ID is specified, create a VLAN sub-interface on the
@@ -341,6 +359,9 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 		if err != nil && !isFileExists(out) {
 			return "", fmt.Errorf("ip link set %s up: %w: %s", bridge, err, out)
 		}
+		if !BridgeHasUplink(bridge) {
+			ensureNetworkBridgeMAC(networkName, bridge, def.Subnet)
+		}
 
 		scope := fwScopeNet(networkName)
 		if def.HostIsolation {
@@ -411,6 +432,16 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 	if db != nil {
 		_ = corrosion.DeleteHostFWIntent(ctx, db, hostName, fwScopeNet(networkName))
 	}
+	return RetireDevice(ctx, db, networkName, def, hostName)
+}
+
+// RetireDevice tears down what def's device carries for networkName on this
+// host — its dnsmasq, gateway address, the legacy NAT, SNAT, isolation and
+// proxy-ARP rules of that device, its VLAN sub-interface, and the bridge when
+// litevirt created it and nothing uses it — and nothing keyed by the network
+// itself: the network's firewall intent stays. It is the teardown of a device
+// a network has moved off, whose intent now describes the new device.
+func RetireDevice(ctx context.Context, db *corrosion.Client, networkName string, def compose.NetworkDef, hostName string) error {
 	switch def.Type {
 	case "", "bridge":
 		bridge := def.Interface

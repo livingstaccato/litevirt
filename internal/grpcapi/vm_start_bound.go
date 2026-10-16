@@ -715,7 +715,7 @@ func (s *Server) startDomainWithin(ctx context.Context, vm *corrosion.VMRecord, 
 	name := vm.Name
 	flight := s.beginStartFlight(name)
 	answered := make(chan error, 1)
-	go func() { answered <- s.virt.StartDomain(name) }()
+	go func() { answered <- s.StartDomainOnNetwork(ctx, name) }()
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {

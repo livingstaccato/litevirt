@@ -405,7 +405,7 @@ func (s *Server) autoDefineRestoredVM(
 		// renders its NICs from here (nic_firewall_arming.go).
 		defer s.pendingNICs(targetName, spec.Uuid, ifaceRecords, nil)()
 	}
-	if err := s.virt.StartDomain(targetName); err != nil {
+	if err := s.StartDomainOnNetwork(ctx, targetName); err != nil {
 		releaseHW()
 		// Roll back the definition but KEEP the overlay + NBD so the operator can
 		// retry define/start against the still-valid source. For a firmware VM the

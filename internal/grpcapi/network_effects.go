@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"log/slog"
+	"net/netip"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/network"
@@ -15,6 +16,7 @@ type NetworkEffects interface {
 	AddFDBEntry(vni int, mac, remoteVTEP string) error
 	DeleteFDBEntry(vni int, mac, remoteVTEP string) error
 	SendGARP(bridge, ip string) error
+	AnnounceGateway(bridge string, gateway netip.Addr) (bool, error)
 	SyncPeerVTEP(ctx context.Context, db *corrosion.Client, networkName, hostName string, vni int, peer, peerAddr string) error
 }
 
@@ -22,6 +24,10 @@ type NetworkEffects interface {
 func (s *Server) SetNetworkEffects(effects NetworkEffects) { s.networkEffects = effects }
 
 type hostNetworkEffects struct{}
+
+func (hostNetworkEffects) AnnounceGateway(bridge string, gateway netip.Addr) (bool, error) {
+	return network.AnnounceGateway(bridge, gateway)
+}
 
 func (hostNetworkEffects) AddFDBEntry(vni int, mac, remoteVTEP string) error {
 	return network.AddFDBEntry(vni, mac, remoteVTEP)

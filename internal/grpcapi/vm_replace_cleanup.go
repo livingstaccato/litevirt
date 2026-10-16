@@ -670,7 +670,7 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 	if gerr != nil {
 		return failed("start", gerr)
 	}
-	e := s.virt.StartDomain(m.ReplacedVM)
+	e := s.StartDomainOnNetwork(ctx, m.ReplacedVM)
 	releaseGuard()
 	if e != nil {
 		return failed("start", e)

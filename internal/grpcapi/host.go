@@ -727,6 +727,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// the VM's networks and its cloud-init ISO. libvirt checks both on the
 	// destination, and without them every cloud-init VM's live drain failed
 	// and fell back to a cold move that waits for the guest to shut down.
+	ctx = withNetworkArrival(ctx)
 	s.prepareMigrationTarget(ctx, fresh, target.Name)
 	// The target's qemu opens the installer ISO from its own filesystem: the
 	// target judges that file first (EnsureDisks with no stubs does only that).
@@ -746,6 +747,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// target puts the guest's NIC guards in force before it arrives.
 	armed, aerr := s.armMigrationTarget(ctx, &target, vm.Name)
 	if aerr != nil {
+		s.cleanupFailedMigrationTarget(ctx, vm.Name, target.Name, nil)
 		progress.Status = "error"
 		progress.Error = "target refused: " + aerr.Error()
 		return progress
@@ -762,6 +764,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		SharesWeight: s.vmSharesWeight(ctx, vm.Name), TargetCgroup: targetCgroup,
 		StripVNCPassword: ens.vncPasswordUnavailable,
 		RBDLocators:      s.rbdLocatorsOf(ctx, vm.Name),
+		NICBridges:       s.migrationNICBridges(ctx, vm.Name, ens.netDevices),
 	}
 	if route.direct {
 		mp.Direct, mp.TLS = true, true

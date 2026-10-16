@@ -592,6 +592,7 @@ func (c *Cluster) Stop() {
 		}
 		if n.GRPCSrv != nil {
 			n.GRPCSrv.GracefulStop()
+			n.Server.WaitGatewayAnnouncements()
 		}
 		if n.Listener != nil {
 			_ = n.Listener.Close()
@@ -906,6 +907,7 @@ func (c *Cluster) buildServer(n *Node) {
 	n.Net = NewNetProvFake()
 	n.Server.SetNetworkProvisioner(n.Net)
 	n.Server.SetNetworkEffects(n.Net)
+	n.Server.SetNetworkDeviceStatePath(filepath.Join(c.tmpRoot, n.Name, "network-devices.json"))
 	n.Server.SetVTEPResolver(n.Net.ResolveVTEP)
 
 	// External IPAM: a REAL netbox.Client (token file and all) pointed at the

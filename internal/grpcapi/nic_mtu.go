@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"github.com/litevirt/litevirt/internal/network"
 	"log/slog"
 	"strings"
 
@@ -307,6 +308,9 @@ func (s *Server) nicMTUProblem(ctx context.Context, want []*pb.NICMTUExpectation
 	var problems []string
 	for _, e := range want {
 		bridge := resolveBridge(ctx, s.db, e.GetNetwork())
+		if served, ok := s.servedDef(e.GetNetwork()); ok {
+			bridge = network.BridgeName(e.GetNetwork(), served)
+		}
 		if strings.HasPrefix(bridge, "direct:") {
 			problems = append(problems, fmt.Sprintf("NIC %d: an MTU needs a bridged network, and %s is not one on host %s",
 				e.GetOrdinal(), e.GetNetwork(), s.hostName))

@@ -106,6 +106,7 @@ func (n *Node) Stop() {
 	}
 	if n.GRPCSrv != nil {
 		n.GRPCSrv.Stop()
+		n.Server.WaitGatewayAnnouncements()
 	}
 	if n.Listener != nil {
 		_ = n.Listener.Close()

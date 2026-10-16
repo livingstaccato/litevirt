@@ -544,6 +544,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// stubs and cloud-init ISO. Disarmed when libvirt takes over (its failure
 	// branch and the adopter own the outcome from then) and for the firmware
 	// cold move, which owns its own.
+	ctx = withNetworkArrival(ctx)
 	abort := &migrationAbort{armed: true}
 	defer func() {
 		if abort.armed {
@@ -568,6 +569,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	var targetCgroup string
 	// stripVNC: the target cannot do VNC passwords (MigrateParams.StripVNCPassword).
 	var stripVNC bool
+	// targetNetDevs: the device the target serves each of the VM's managed
+	// networks on, when it said (MigrateParams.NICBridges).
+	var targetNetDevs map[string]string
 	useTLS := false
 	// route is where the migration's data goes: the cluster address, or the
 	// target's address in migration.network (migration_network.go).
@@ -581,7 +585,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			return err
 		}
 		createdStubs, dstTLS, cdromSources, targetCgroup = ens.created, ens.tlsReady, ens.remap, ens.cgroupMode
-		stripVNC = ens.vncPasswordUnavailable
+		stripVNC, targetNetDevs = ens.vncPasswordUnavailable, ens.netDevices
 		abort.createdStubs = createdStubs
 		useTLS = srcTLS && dstTLS
 		kind := routeStorage
@@ -608,7 +612,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			return eerr
 		}
 		cdromSources, targetCgroup = ens.remap, ens.cgroupMode
-		stripVNC = ens.vncPasswordUnavailable
+		stripVNC, targetNetDevs = ens.vncPasswordUnavailable, ens.netDevices
 		if fwVM || coldStopped {
 			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeCold, true)
 		} else {
@@ -769,6 +773,8 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			// The destination definition carries each rbd disk's monitors as
 			// its pool resolves them now (a re-addressed cluster's).
 			RBDLocators: s.rbdLocatorsOf(ctx, vm.Name),
+			// Each NIC lands on the device the target serves its network on.
+			NICBridges: s.migrationNICBridges(ctx, vm.Name, targetNetDevs),
 		}
 		armed.apply(&params)
 		logVNCPasswordStrip(vm.Name, req.TargetHost, params.StripVNCPassword)
@@ -1250,8 +1256,16 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 // Every path is checked before any is created, and a failure part-way removes
 // the stubs this call created, so a refused or failed call leaves nothing.
 func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*pb.EnsureDisksResponse, error) {
-	if _, err := s.authorizeMigrationHelper(ctx, req.VmName); err != nil {
-		return nil, err
+	vm, authErr := s.authorizeMigrationHelper(ctx, req.VmName)
+	if authErr != nil {
+		return nil, authErr
+	}
+	if req.GetWantNetworkDevices() {
+		release, err := s.netDevs.acquireTransition(ctx, false)
+		if err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
+		defer release()
 	}
 	// A NIC whose MTU this host's bridge does not equal: answered before
 	// anything is created here, and the source refuses the move.
@@ -1356,6 +1370,14 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		resp.MigrationTlsReady = s.migrationTLSReady()
 	}
 	s.answerMigrationNetwork(ctx, req, resp)
+	if req.GetWantNetworkDevices() {
+		devices, err := s.holdNetworkArrival(ctx, vm, req.GetNetworkArrivalId())
+		if err != nil {
+			undo()
+			return nil, status.Errorf(codes.FailedPrecondition, "retain arrival devices: %v", err)
+		}
+		resp.NetworkDevices = devices
+	}
 	return resp, nil
 }
 
@@ -1922,6 +1944,11 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 	// never got that far.
 	rowNamesHere := vm != nil && vm.HostName == s.hostName
 	vmLivesHere := rowNamesHere || (s.virt != nil && s.virt.DomainExists(req.VmName))
+	if req.GetNetworkArrivalId() != "" {
+		if err := s.releaseNetworkArrival(ctx, req.GetVmName(), req.GetNetworkArrivalId()); err != nil {
+			return nil, status.Errorf(codes.Internal, "release arrival devices: %v", err)
+		}
+	}
 	// The paths the source names, and the stubs this host recorded making for
 	// the VM that it does not name. The source names only what EnsureDisks
 	// reported, and a source whose EnsureDisks call was cut — its client went
@@ -2030,10 +2057,11 @@ func (s *Server) cleanupMigrationArtifactsOnTarget(ctx context.Context, targetHo
 	}
 	defer closeConn()
 	if _, err := client.CleanupMigrationArtifacts(ctx, &pb.CleanupMigrationArtifactsRequest{
-		VmName:          vmName,
-		DiskPaths:       diskPaths,
-		RemoveCloudInit: true,
-		FirmwareUuid:    firmwareUUID,
+		VmName:           vmName,
+		DiskPaths:        diskPaths,
+		RemoveCloudInit:  true,
+		FirmwareUuid:     firmwareUUID,
+		NetworkArrivalId: networkArrivalID(ctx),
 	}); err != nil {
 		slog.Warn("cleanupMigrationArtifactsOnTarget: cleanup failed", "host", targetHost, "vm", vmName, "error", err)
 	}
@@ -2208,6 +2236,10 @@ type ensureOutcome struct {
 	// authentication (FIPS), so a live migration strips the guest's VNC
 	// password (MigrateParams.StripVNCPassword). False when it did not say.
 	vncPasswordUnavailable bool
+	// netDevices: the device the target serves each of the VM's managed
+	// networks on (EnsureDisksResponse.network_devices); nil when it did not
+	// say (an older target, or no call was made).
+	netDevices map[string]string
 }
 
 // ensureDisksOnTargetNet is ensureDisksOnTargetISO that also asks for the
@@ -2234,7 +2266,10 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 	if err != nil {
 		return ensureOutcome{}, err
 	}
-	shareOnly := runtime && (s.vmSharesWeight(ctx, vmName) > 0 || hasVNCPassword) && len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 &&
+	// A runtime move of a VM with a NIC on a managed network asks which device
+	// the target serves each such network on. Best effort, like the cgroup ask.
+	wantNetDevs := runtime && s.vmHasManagedNIC(ctx, vmName)
+	shareOnly := runtime && (s.vmSharesWeight(ctx, vmName) > 0 || hasVNCPassword || wantNetDevs) && len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 &&
 		s.migrationNetwork == "" && !hasRBD && len(mtus) == 0
 	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 && s.migrationNetwork == "" && !shareOnly && !hasRBD && len(mtus) == 0 {
 		return ensureOutcome{}, nil
@@ -2255,9 +2290,11 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 		InstallerIsoSha256: s.judgedISOSHA256(ctx, vmName, isoPaths),
 		MigrationNetwork:   s.migrationNetwork,
 		NicMtu:             mtus,
+		WantNetworkDevices: wantNetDevs,
+		NetworkArrivalId:   networkArrivalID(ctx),
 	})
 	if err != nil && shareOnly {
-		slog.Warn("migration: the target did not report its cgroup version; cpu-shares move as defined",
+		slog.Warn("migration: the target did not answer the migration preflight; cpu-shares, VNC password and NICs move as defined",
 			"vm", vmName, "target", targetHost, "error", err)
 		return ensureOutcome{}, nil
 	}
@@ -2296,7 +2333,7 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 			slog.Info("migration: the target opens the installer ISO at its own file", "vm", vmName, "target", targetHost, "here", from, "there", to)
 		}
 	}
-	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode(), vncPasswordUnavailable: resp.GetVncPasswordUnavailable()}, nil
+	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode(), vncPasswordUnavailable: resp.GetVncPasswordUnavailable(), netDevices: resp.GetNetworkDevices()}, nil
 }
 
 // olderTargetISORemap points, for a move to an older target, the CD-ROM that
@@ -2651,13 +2688,10 @@ func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRe
 		s.reattachVFsOnTarget(ctx, target, f.target.Address, f.target.GRPCPort, vm.Name, f.detachedVFs)
 	}
 
-	// Send gratuitous ARP for each VM interface to update switch MAC tables.
+	// The target announces each network's gateway to the guest from its own
+	// bridge, so the guest's cached gateway entry moves with it.
+	s.startGatewayAnnouncement(ctx, f.target, vm.Name)
 	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
-	for _, iface := range ifaces {
-		if iface.IP != "" {
-			go s.sendGARPBestEffort(iface.NetworkName, iface.IP)
-		}
-	}
 
 	// Update DNS records so VM names resolve correctly after migration.
 	if s.dnsDomain != "" {

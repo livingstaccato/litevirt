@@ -1272,7 +1272,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	}
 	defer s.pendingNICs(spec.Name, spec.Uuid, ifaceRecords, trunks)()
 
-	if err := s.virt.StartDomain(spec.Name); err != nil {
+	if err := s.StartDomainOnNetwork(ctx, spec.Name); err != nil {
 		s.virt.UndefineDomain(spec.Name, false)
 		claims.releaseAll(ctx)
 		cleanupDisks()
@@ -2227,6 +2227,9 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 	if err := s.rejudgeSharedDisksForStart(ctx, vm); err != nil {
 		return nil, err
 	}
+	// A NIC whose network moved to another device since the domain was
+	// defined starts on the network's device now.
+	s.followNetworkDevices(ctx, vm.Name)
 	// Adoption gate + PCI start-preflight (shared with the automated restart paths).
 	// No-op pre-latch, so every start behaves byte-for-behavior as before until
 	// hardware_v2 latches.
@@ -2263,7 +2266,7 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 		return s.finishStartLocked(ctx, vm, startErr, releasePreflight, pbVM, hspec)
 	}
 	if wait <= 0 {
-		return finish(ctx, s.virt.StartDomain(vm.Name))
+		return finish(ctx, s.StartDomainOnNetwork(ctx, vm.Name))
 	}
 	finishCancelled := func(ctx context.Context, startErr error, since, cancelled time.Time) {
 		releaseGuard()

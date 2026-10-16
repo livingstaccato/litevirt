@@ -1319,6 +1319,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		svc.RecoverDeviceLeases(ctx) // roll back device leases a crash orphaned
 	}
 
+	// Resume, park or abort each live firmware move this host is the source
+	// of (spec §8.1): its VM's lock is taken here, before any runtime loop
+	// starts, and held until its recovery resolves or parks it.
+	// Unconditional: outside the operation journal's branch above.
+	svc.RecoverFirmwareMoves(ctx)
+
 	// F1 resource-update recovery: resume any locally-owned VM wedged on a nonterminal
 	// resource_update_running operation (a live resize that crashed after committing its
 	// desired spec) — converge it to the committed spec + clear the barrier so a partial
@@ -1950,13 +1956,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	grpcOpts = append(grpcOpts, obs.ServerOptions()...)
 	d.grpcSrv = grpc.NewServer(grpcOpts...)
 
-	// Resume, park or abort each live firmware move this host is the source
-	// of (spec §8.1). Unconditional, outside the operation journal's
-	// recovery, after every setter above and before the server serves: each
-	// move's VM lock is taken here, and released once its move is resolved
-	// or parked. Then, every minute, a parked move's blocked call is retried,
-	// fence resolution tried, and each owed DISCARD sent.
-	svc.RecoverFirmwareMoves(ctx)
+	// The firmware move recovery's pass (spec §8.1): every minute, a parked
+	// move's blocked call is retried, fence resolution tried, and each owed
+	// DISCARD sent.
 	go svc.RunFirmwareMoveRecovery(ctx)
 
 	pb.RegisterLiteVirtServer(d.grpcSrv, svc)

@@ -18,6 +18,8 @@ import (
 	"github.com/litevirt/litevirt/internal/fwmig"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/opjournal"
+	"github.com/litevirt/litevirt/internal/vfio"
 )
 
 // T-24: restart recovery of a live firmware move on its source (spec §8.1),
@@ -682,7 +684,8 @@ func TestFirmwareMoveRecovery_NvramUnconfirmedRetriesRelease(t *testing.T) {
 }
 
 // The interval's pass resolves a move parked target_unreachable by fence
-// (§7), and sends the DISCARD it then owes.
+// (§7); a pass sends the DISCARD it then owes (the next one at the latest:
+// the owed DISCARDs are sent beside the moves, not after them).
 //
 // Mutation: no fence resolution in the pass — red.
 func TestFirmwareMoveRecovery_ResolvesByFence(t *testing.T) {
@@ -696,6 +699,7 @@ func TestFirmwareMoveRecovery_ResolvesByFence(t *testing.T) {
 	if vm := r.row(); vm.State != "stopped" || vm.HostName != "src-host" {
 		t.Errorf("row %s on %s, want stopped on src-host", vm.State, vm.HostName)
 	}
+	r.src.FirmwareMoveRecoveryOnce(context.Background())
 	requireAbortModes(t, r, modeDiscard)
 }
 
@@ -782,4 +786,387 @@ func TestFirmwareMoveRecovery_SourceSuspectTakesNoStep(t *testing.T) {
 	}
 	r.requireNothingCommitted("source_state_suspect retried")
 	r.requireTargetPausedWithHold("source_state_suspect retried")
+}
+
+// ── SR-IOV VFs of a recovered move (review D2-13 I-1) ──
+
+const fwlVF = "0000:41:10.0"
+
+// fwlVFs gives os1 an SR-IOV VF in its guest on the source, and the source an
+// operation journal, so the move detaches the VF under a migration lease as
+// MigrateVM does. targetAttached records the target attaches the source asks
+// for.
+type fwlVFs struct {
+	fs             *pciUnbindRecordingFS
+	j              *opjournal.Journal
+	targetAttached *[]string
+}
+
+func (r *fwlRig) withVF() *fwlVFs {
+	r.t.Helper()
+	v := &fwlVFs{fs: newPCIUnbindRecordingFS(), targetAttached: &[]string{}}
+	r.t.Cleanup(vfio.SetFS(v.fs))
+	j, err := opjournal.Open(r.t.TempDir())
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	v.j = j
+	r.src.SetOpJournal(j)
+	if err := corrosion.UpsertPCIDevice(adminCtx(), r.src.db, corrosion.PCIDeviceRecord{
+		HostName: "src-host", Address: fwlVF, Type: "net", VendorID: "8086", VMName: fwlVM}); err != nil {
+		r.t.Fatal(err)
+	}
+	v.fs.setVF(fwlVF)
+	v.fs.setBound(fwlVF)
+	if err := r.srcFake.AttachHostdev(fwlVM, fwlVF); err != nil {
+		r.t.Fatal(err)
+	}
+	var mu = &r.paramsMu
+	old := reattachVFsOnTargetHook
+	reattachVFsOnTargetHook = func(target, vm string, vfs []corrosion.PCIDeviceRecord) []string {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, vf := range vfs {
+			*v.targetAttached = append(*v.targetAttached, target+":"+vf.Address)
+		}
+		return nil
+	}
+	r.t.Cleanup(func() { reattachVFsOnTargetHook = old })
+	return v
+}
+
+// detachForMove is MigrateVM's step before the migration call: the lease,
+// then the VF out of the guest (still owned by the VM).
+func (r *fwlRig) detachForMove() {
+	r.t.Helper()
+	if err := r.src.beginMigrationVFLease(fwlVM, []string{fwlVF}); err != nil {
+		r.t.Fatal(err)
+	}
+	if err := r.src.detachHostdevIfPresent(adminCtx(), fwlVM, fwlVF); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
+// restartWithLeases is the daemon's start: the device leases, then the
+// firmware move recovery.
+func (r *fwlRig) restartWithLeases() {
+	r.src.RecoverDeviceLeases(context.Background())
+	r.restart()
+}
+
+func (r *fwlRig) srcVFOwner() string {
+	r.t.Helper()
+	devs, err := corrosion.ListPCIDevices(adminCtx(), r.src.db, "src-host", "")
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	for _, d := range devs {
+		if d.Address == fwlVF {
+			return d.VMName
+		}
+	}
+	return ""
+}
+
+func (v *fwlVFs) leaseLeft(t *testing.T) bool {
+	t.Helper()
+	_, found, err := v.j.Read(deviceLeaseOpID(fwlVM))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return found
+}
+
+// requireVFsMovedOut: the source's VF released (unowned, lease gone) and the
+// target asked to attach one.
+func (r *fwlRig) requireVFsMovedOut(v *fwlVFs, why string) {
+	r.t.Helper()
+	if o := r.srcVFOwner(); o != "" {
+		r.t.Errorf("%s: the source's VF is still owned by %q", why, o)
+	}
+	if v.leaseLeft(r.t) {
+		r.t.Errorf("%s: the migration lease is left", why)
+	}
+	r.paramsMu.Lock()
+	got := strings.Join(*v.targetAttached, ",")
+	r.paramsMu.Unlock()
+	if got != "dst-host:"+fwlVF {
+		r.t.Errorf("%s: target attaches %q, want dst-host:%s", why, got, fwlVF)
+	}
+}
+
+// A move parked at Verify (no restart) and retried by the interval's pass:
+// after the commit the source's VF is released and its lease ended, and the
+// target is asked to attach one.
+//
+// Mutations: no VFs on a recovered run; no release after the recovered
+// commit; no target attach — red.
+func TestFirmwareMoveRecovery_VFsAfterRetriedVerify(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	v := r.withVF()
+	r.parkUnreachableAtVerify()
+	if !v.leaseLeft(t) || r.srcVFOwner() != fwlVM {
+		t.Fatalf("parked at Verify: lease %v, owner %q; want the VF held for the move", v.leaseLeft(t), r.srcVFOwner())
+	}
+	r.src.FirmwareMoveRecoveryOnce(context.Background())
+	r.requireCleanedUp("after the retried Verify")
+	r.requireVFsMovedOut(v, "after the retried Verify")
+}
+
+// A restart while libvirt still runs the migration: the device lease
+// recovery leaves the move's lease to the firmware recovery (one owner), which
+// waits the job out, commits, releases the source's VF and asks the target to
+// attach one.
+//
+// Mutations: RecoverDeviceLeases takes a marked VM's lease — red.
+func TestRecoverFirmwareMoves_VFsAfterRunningJob(t *testing.T) {
+	fastRecovery(t)
+	r := newFwlRig(t, fwlOpts{})
+	v := r.withVF()
+	r.crashAt(fwmig.PhaseMigrating)
+	r.detachForMove()
+	var polls atomic.Int32
+	r.srcFake.JobActive = func(string) (bool, error) {
+		if polls.Add(1) < 3 {
+			return true, nil
+		}
+		r.land()
+		return false, nil
+	}
+	r.restartWithLeases()
+	r.requireCleanedUp("after the job ended")
+	r.requireVFsMovedOut(v, "after the job ended")
+}
+
+// M1p after a restart: the paused source is resumed and gets its VF back, the
+// lease ended; no VF-missing condition.
+//
+// Mutation: no reattach after the recovered M1p resume — red.
+func TestRecoverFirmwareMoves_M1pResumedGuestGetsItsVFs(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	v := r.withVF()
+	r.crashAt(fwmig.PhaseMigrating)
+	r.detachForMove()
+	r.srcFake.SetState(fwlVM, libvirtfake.StatePaused)
+	r.restartWithLeases()
+	r.requireUndone("after M1p with a VF")
+	if !guestHasHostdev(t, r.src, fwlVM, fwlVF) {
+		t.Fatal("the resumed guest runs without its VF")
+	}
+	if v.leaseLeft(t) {
+		t.Error("the lease is left after the VF went back")
+	}
+	requireNoFwmigCondition(t, r.src, condFwmigVFMissing)
+}
+
+// A resumed guest whose VF cannot go back raises firmware_migration_vf_missing:
+// it runs without its NIC, and says so.
+//
+// Mutation: no condition — red.
+func TestRecoverFirmwareMoves_VFNotBackRaisesCondition(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	v := r.withVF()
+	r.crashAt(fwmig.PhaseMigrating)
+	r.detachForMove()
+	r.srcFake.SetState(fwlVM, libvirtfake.StatePaused)
+	r.srcFake.FailAttachHostdev = func(string, string, string) error { return errors.New("injected attach failure") }
+	r.restartWithLeases()
+	if st, _ := r.srcFake.RawState(fwlVM); st != libvirtfake.StateRunning {
+		t.Fatalf("source domain %q, want resumed", st)
+	}
+	requireFwmigCondition(t, r.src, condFwmigVFMissing)
+	if !v.leaseLeft(t) {
+		t.Error("the lease went with the VF out of the guest")
+	}
+}
+
+// VFs that cannot be read (the lease names a VF with no device row) park the
+// move before the guest runs anywhere: the paused source is not resumed.
+//
+// Mutation: go on without the VFs — red.
+func TestRecoverFirmwareMoves_UnreadableVFsPark(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	v := r.withVF()
+	r.crashAt(fwmig.PhaseMigrating)
+	if err := r.src.beginMigrationVFLease(fwlVM, []string{fwlVF, "0000:41:10.7"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = v
+	r.srcFake.SetState(fwlVM, libvirtfake.StatePaused)
+	r.restartWithLeases()
+	requireMarker(t, r, fwmig.PhaseSourceStateMissing, fwmig.PhaseMigrating)
+	if st, _ := r.srcFake.RawState(fwlVM); st != libvirtfake.StatePaused {
+		t.Errorf("source domain %q, want left paused", st)
+	}
+	requireAbortModes(t, r)
+}
+
+// ── Review m-5: the remaining rows ──
+
+// An unreadable job state is never read as "no job" (M1 would abort, and
+// discard a copy libvirt may still be making): recovery keeps waiting.
+//
+// Mutation: read an unreadable job as no job — red.
+func TestRecoverFirmwareMoves_JobStateUnreadableWaits(t *testing.T) {
+	fastRecovery(t)
+	r := newFwlRig(t, fwlOpts{})
+	r.crashAt(fwmig.PhaseMigrating)
+	var polls atomic.Int32
+	r.srcFake.JobActive = func(string) (bool, error) {
+		if polls.Add(1) < 3 {
+			return false, errors.New("injected: the job cannot be read")
+		}
+		r.land()
+		return false, nil
+	}
+	r.restart()
+	if len(r.aborts()) != 0 {
+		t.Fatalf("aborts %v sent with the job state unreadable", r.aborts())
+	}
+	r.requireCleanedUp("after the job state became readable")
+}
+
+// m-9: a target whose build has no Abort holds nothing of the attempt: the
+// move is undone, not parked.
+//
+// Mutation: park on Unimplemented — red.
+func TestRecoverFirmwareMoves_AbortUnimplementedHoldsNothing(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	r.crashAt(fwmig.PhasePrepared)
+	r.peerC.mu.Lock()
+	r.peerC.unimplemented["AbortLiveFirmwareTarget"] = true
+	r.peerC.mu.Unlock()
+	r.restart()
+	if m, ok := r.marker(); ok {
+		t.Fatalf("marker left %+v", m)
+	}
+	if vm := r.row(); vm.State != "running" || vm.HostName != "src-host" {
+		t.Errorf("row %s on %s, want running on src-host", vm.State, vm.HostName)
+	}
+	r.requireSourceIntact("after an Unimplemented abort")
+}
+
+// committed with the source domain running again: never released.
+//
+// Mutation: skip the source check at committed — red.
+func TestRecoverFirmwareMoves_CommittedSourceActiveAgain(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	r.crashAt(fwmig.PhaseCommitted)
+	r.srcFake.SetState(fwlVM, libvirtfake.StateRunning)
+	r.restart()
+	requireMarker(t, r, fwmig.PhaseSourceStateSuspect, fwmig.PhaseCommitted)
+	r.requireTargetPausedWithHold("committed with the source active")
+}
+
+// released, Release answering NOT_HELD with no domain there: the target does
+// not have the VM, so the source state is kept.
+//
+// Mutation: accept NOT_HELD whatever the domain — red.
+func TestRecoverFirmwareMoves_ReleasedNotHeldNoDomainParks(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	r.crashAt(fwmig.PhaseReleased)
+	r.peerC.releaseAnswer = func(func() (*pb.ReleaseLiveFirmwareTargetResponse, error)) (*pb.ReleaseLiveFirmwareTargetResponse, error) {
+		return &pb.ReleaseLiveFirmwareTargetResponse{Verdict: pb.FirmwareVerdict_FIRMWARE_VERDICT_NOT_HELD, TargetDomain: &pb.TargetDomain{}}, nil
+	}
+	r.restart()
+	requireMarker(t, r, fwmig.PhaseTargetUnreachable, fwmig.PhaseReleased)
+	r.requireSourceIntact("released, NOT_HELD with no domain")
+}
+
+// released with the row naming a third host: the source state is kept.
+//
+// Mutation: clean up whatever the row names — red.
+func TestRecoverFirmwareMoves_ReleasedRowOtherHostParks(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	r.crashAt(fwmig.PhaseReleased)
+	if err := corrosion.UpdateVMHost(context.Background(), r.src.db, fwlVM, "third-host", "running"); err != nil {
+		t.Fatal(err)
+	}
+	releases := strings.Count(strings.Join(r.log.get(), ","), "release")
+	r.restart()
+	requireMarker(t, r, fwmig.PhaseTargetUnreachable, fwmig.PhaseReleased)
+	if got := strings.Count(strings.Join(r.log.get(), ","), "release"); got != releases {
+		t.Error("Release was sent to a target the row does not name")
+	}
+	r.requireSourceIntact("released, row on a third host")
+}
+
+// source_state_missing is retried: once the source domain can be read, the
+// move goes on from where it parked.
+//
+// Mutation: no retry for source_state_missing — red.
+func TestFirmwareMoveRecovery_SourceStateMissingRetried(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	r.crashAt(fwmig.PhaseMigrating)
+	r.land()
+	r.srcFake.FailDomainState = func(name string) error {
+		if name == fwlVM {
+			return errors.New("injected: libvirt does not answer")
+		}
+		return nil
+	}
+	r.restart()
+	requireMarker(t, r, fwmig.PhaseSourceStateMissing, fwmig.PhaseMigrating)
+	r.srcFake.FailDomainState = nil
+	r.src.FirmwareMoveRecoveryOnce(context.Background())
+	r.requireCleanedUp("after source_state_missing was retried")
+	requireNoFwmigCondition(t, r.src, condFwmigSourceStateMissing)
+}
+
+// discard_pending is retried: the DISCARD lands, the row is stopped on the
+// source and the marker removed.
+//
+// Mutation: no retry for discard_pending — red.
+func TestFirmwareMoveRecovery_DiscardPendingRetried(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	r.dstFake.CorruptLandedPermall = func(string) bool { return true }
+	r.peerC.abortAnswer = func(*pb.AbortLiveFirmwareTargetRequest) (*pb.AbortLiveFirmwareTargetResponse, error) {
+		return nil, status.Error(codes.Unavailable, "connection refused")
+	}
+	_ = r.migrate()
+	requireMarker(t, r, fwmig.PhaseDiscardPending, fwmig.PhaseCutover)
+	r.peerC.mu.Lock()
+	r.peerC.abortAnswer = nil
+	r.peerC.mu.Unlock()
+	r.src.FirmwareMoveRecoveryOnce(context.Background())
+	if m, ok := r.marker(); ok {
+		t.Fatalf("marker left %+v", m)
+	}
+	if vm := r.row(); vm.State != "stopped" || vm.HostName != "src-host" {
+		t.Errorf("row %s on %s, want stopped on src-host", vm.State, vm.HostName)
+	}
+	if !r.quarantined() {
+		t.Error("the target's copy was not quarantined")
+	}
+	requireFwmigCondition(t, r.src, condFwmigUnverified)
+	requireNoFwmigCondition(t, r.src, condFwmigTargetUnreachable)
+}
+
+// Review m-7: the recovery's waits end with the daemon's context: a move whose
+// migration job never ends does not outlive it, and is left as it was.
+//
+// Mutation: wait on a context detached from the daemon's — red.
+func TestRecoverFirmwareMoves_WaitsEndWithTheContext(t *testing.T) {
+	fastRecovery(t)
+	r := newFwlRig(t, fwlOpts{})
+	r.crashAt(fwmig.PhaseMigrating)
+	r.srcFake.JobActive = func(string) (bool, error) { return true, nil }
+	ctx, cancel := context.WithCancel(context.Background())
+	r.src.RecoverFirmwareMoves(ctx)
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		r.src.fwLive.recovering.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the recovery kept waiting on the job after its context ended")
+	}
+	requireMarker(t, r, fwmig.PhaseMigrating, "")
+	if len(r.aborts()) != 0 {
+		t.Errorf("aborts %v sent", r.aborts())
+	}
 }

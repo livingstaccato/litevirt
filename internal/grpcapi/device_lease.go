@@ -249,6 +249,14 @@ func (s *Server) RecoverDeviceLeases(ctx context.Context) {
 				continue // do NOT remove the entry; a later pass retries
 			}
 		} else if e.Stage == deviceLeaseStageMigrationDetached {
+			// A live firmware move's VFs are its recovery's
+			// (RecoverFirmwareMoves): one owner, which knows whether the
+			// guest runs here, there, or nowhere yet. A marker that cannot
+			// be read is one too.
+			if _, marked, merr := s.fwRecords().GetMarker(e.ResourceID); marked || merr != nil {
+				slog.Info("device-lease recovery: a live firmware move's VFs — left to its recovery", "vm", e.ResourceID, "devices", addrs)
+				continue
+			}
 			// MigrateVM died with VFs out of the guest: reattach if the guest
 			// stayed, release if it left (recoverMigrationVFLease).
 			if !s.recoverMigrationVFLease(ctx, vm, addrs) {

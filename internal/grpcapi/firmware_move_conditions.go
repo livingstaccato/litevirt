@@ -48,6 +48,10 @@ const (
 	// retained bundle, undefine or wipe failed). The guest runs on the
 	// target; the source state is kept and the cleanup retried.
 	condFwmigCleanupFailed = "firmware_migration_cleanup_failed"
+	// condFwmigVFMissing: the guest runs (on the source after a failed move,
+	// or on the target after its release) without SR-IOV VFs the move
+	// detached from it (review D2-13 I-1).
+	condFwmigVFMissing = "firmware_migration_vf_missing"
 )
 
 // firmwareMigrationConditionSeverity is each code's default severity.
@@ -63,6 +67,7 @@ var firmwareMigrationConditionSeverity = map[string]string{
 	condFwmigHeld:               corrosion.SeverityWarning,
 	condFwmigQuarantine:         corrosion.SeverityWarning,
 	condFwmigCleanupFailed:      corrosion.SeverityCritical,
+	condFwmigVFMissing:          corrosion.SeverityCritical,
 }
 
 // fwmigCondition is one raise of a firmware move condition.

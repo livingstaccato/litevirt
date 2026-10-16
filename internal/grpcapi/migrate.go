@@ -1308,15 +1308,22 @@ const reattachVFTimeout = 60 * time.Second
 
 // reattachVFsOnTarget sends AttachDevice RPCs to the target host for each VF
 // that was detached before migration. The target allocates equivalent VFs from its own pool.
-func (s *Server) reattachVFsOnTarget(ctx context.Context, targetHostName, addr string, grpcPort int, vmName string, vfs []corrosion.PCIDeviceRecord) {
+func (s *Server) reattachVFsOnTarget(ctx context.Context, targetHostName, addr string, grpcPort int, vmName string, vfs []corrosion.PCIDeviceRecord) (failed []string) {
+	if h := reattachVFsOnTargetHook; h != nil {
+		return h(targetHostName, vmName, vfs)
+	}
 	conn, err := s.dialPeerAddr(peerTarget(addr, grpcPort))
 	if err != nil {
 		slog.Warn("reattach VFs: dial target", "host", targetHostName, "error", err)
-		return
+		return pciAddresses(vfs)
 	}
 	defer conn.Close()
-	s.sendReattachVFs(ctx, pb.NewLiteVirtClient(conn), targetHostName, vmName, vfs)
+	return s.sendReattachVFs(ctx, pb.NewLiteVirtClient(conn), targetHostName, vmName, vfs)
 }
+
+// reattachVFsOnTargetHook, when set, answers reattachVFsOnTarget in place of
+// the target. Test-only.
+var reattachVFsOnTargetHook func(target, vm string, vfs []corrosion.PCIDeviceRecord) (failed []string)
 
 // sendReattachVFs issues an AttachDevice to the target for each pre-migration
 // detached VF. It runs on a context detached from the inbound RPC — same
@@ -1328,7 +1335,7 @@ func (s *Server) reattachVFsOnTarget(ctx context.Context, targetHostName, addr s
 // this a plain peer/system call; the span survives (via ctx's value chain) so
 // the reattach still links into the vm.migrate trace. The client is a parameter
 // so a test can capture the exact outbound context.
-func (s *Server) sendReattachVFs(ctx context.Context, client pb.LiteVirtClient, targetHostName, vmName string, vfs []corrosion.PCIDeviceRecord) {
+func (s *Server) sendReattachVFs(ctx context.Context, client pb.LiteVirtClient, targetHostName, vmName string, vfs []corrosion.PCIDeviceRecord) (failed []string) {
 	ctx, cancel := notifyDetachedContext(ctx, reattachVFTimeout)
 	defer cancel()
 	for _, vf := range vfs {
@@ -1342,12 +1349,14 @@ func (s *Server) sendReattachVFs(ctx context.Context, client pb.LiteVirtClient, 
 			},
 		})
 		if err != nil {
+			failed = append(failed, vf.Address)
 			slog.Warn("reattach VF on target failed", "vm", vmName, "type", vf.Type,
 				"vendor", vf.VendorID, "target", targetHostName, "error", err)
 		} else {
 			slog.Info("VF reattached on target", "vm", vmName, "type", vf.Type, "target", targetHostName)
 		}
 	}
+	return failed
 }
 
 // EnsureCloudInit generates a cloud-init ISO on this host if it doesn't already exist.
@@ -2783,7 +2792,12 @@ func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRe
 
 	// Re-attach equivalent VFs on the target host for any VFs detached pre-migration.
 	if len(f.detachedVFs) > 0 {
-		s.reattachVFsOnTarget(ctx, target, f.target.Address, f.target.GRPCPort, vm.Name, f.detachedVFs)
+		failed := s.reattachVFsOnTarget(ctx, target, f.target.Address, f.target.GRPCPort, vm.Name, f.detachedVFs)
+		if f.fwLive != nil && len(failed) > 0 {
+			// Release still runs the guest: its NIC firewall is what the
+			// move holds it for; the missing VF is named, not silent.
+			s.noteFirmwareMoveVFsMissing(ctx, f.fwLive.marker, target, failed)
+		}
 	}
 
 	// Send gratuitous ARP for each VM interface to update switch MAC tables.

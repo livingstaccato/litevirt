@@ -844,7 +844,7 @@ func TestFirmwareMigrationConditions_EveryCode(t *testing.T) {
 	warn := map[string]bool{condFwmigDiscardOwed: true, condFwmigQuarantine: true, condFwmigHeld: true}
 	codesAll := []string{condFwmigUnverified, condFwmigSourceStateMissing, condFwmigSourceStateSuspect, condFwmigTargetRan,
 		condFwmigSourcePaused, condFwmigDiscardOwed, condFwmigTargetUnreachable, condFwmigNvramUnconfirmed, condFwmigHeld, condFwmigQuarantine,
-		condFwmigCleanupFailed}
+		condFwmigCleanupFailed, condFwmigVFMissing}
 	if len(firmwareMigrationConditionSeverity) != len(codesAll) {
 		t.Fatalf("%d codes known, %d listed", len(firmwareMigrationConditionSeverity), len(codesAll))
 	}

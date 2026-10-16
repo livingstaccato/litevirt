@@ -46,6 +46,13 @@ type liveFirmwareRun struct {
 	// that park (D2-10 m-7), and one that ends in it again with the same
 	// detail writes nothing (spec §8.1).
 	parked fwmig.Marker
+	// oneAttempt makes each call to the target one attempt, not a retry for
+	// fwLiveRetryFor: the recovery's next pass is its backoff, and the VM's
+	// lock is not held between attempts (review D2-13 m-1).
+	oneAttempt bool
+	// waitCtx, when set, bounds the recovery's waits (a migration job): the
+	// daemon's context, where the steps themselves run detached from it.
+	waitCtx context.Context
 }
 
 // fwLiveSourceState is the Server's test seams for the source half.
@@ -53,9 +60,22 @@ type fwLiveSourceState struct {
 	// stepHook, when set, is called with each source step as it is reached
 	// ("commit", "cleanup"). Test-only.
 	stepHook func(step string)
-	// recovering counts the goroutines RecoverFirmwareMoves started, so a
-	// test can wait for them.
+	// recovering counts the goroutines the recovery started, so a test can
+	// wait for them.
 	recovering sync.WaitGroup
+	// recoveryMu guards owedRunning.
+	recoveryMu sync.Mutex
+	// owedRunning is set while a pass sends the owed DISCARDs.
+	owedRunning bool
+	// recoverySlots bounds how many moves the recovery takes at once.
+	recoverySlots     chan struct{}
+	recoverySlotsOnce sync.Once
+}
+
+// pendingFirmwareRecovery is one move RecoverFirmwareMoves locked.
+type pendingFirmwareRecovery struct {
+	vm     string
+	unlock func()
 }
 
 func (s *Server) fwLiveStep(step string) {
@@ -314,6 +334,10 @@ func (s *Server) sendLiveFirmwareAbort(ctx context.Context, target, vm string, b
 func (s *Server) abortLiveFirmwareBeforeCutover(ctx context.Context, r *liveFirmwareRun, guestMayBeThere bool) (fwmig.Phase, string) {
 	m := r.marker
 	resp, err := s.sendLiveFirmwareAbort(ctx, r.target.Name, m.VM, m.Binding, pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_PRE_CUTOVER, m.CreatedStubs)
+	if abortTargetPredatesRPC(err) {
+		slog.Warn("live firmware move: the target's build has no abort; it holds nothing of the attempt", "vm", m.VM, "attempt", m.Attempt, "target", r.target.Name)
+		return "", ""
+	}
 	if err != nil {
 		return fwmig.PhaseTargetUnreachable, fmt.Sprintf("the abort before cutover was not answered by %s: %v", r.target.Name, err)
 	}
@@ -339,6 +363,13 @@ func (s *Server) abortLiveFirmwareBeforeCutover(ctx context.Context, r *liveFirm
 	slog.Warn("live firmware move: the target's copy of a migration that failed before cutover was discarded",
 		"vm", m.VM, "attempt", m.Attempt, "target", r.target.Name)
 	return "", ""
+}
+
+// abortTargetPredatesRPC reports an Abort a target answered Unimplemented: its
+// build predates the live firmware RPCs, so it holds nothing of any attempt
+// (§7 P1, review D2-13 m-9).
+func abortTargetPredatesRPC(err error) bool {
+	return err != nil && status.Code(err) == codes.Unimplemented
 }
 
 func orNone(s string) string {
@@ -424,6 +455,9 @@ func (s *Server) liveFirmwareMigrateFailed(ctx context.Context, r *liveFirmwareR
 func (s *Server) liveFirmwareSourcePaused(ctx context.Context, r *liveFirmwareRun, migrateErr error) (func(), bool) {
 	m := r.marker
 	resp, err := s.sendLiveFirmwareAbort(ctx, r.target.Name, m.VM, m.Binding, pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_PRE_CUTOVER, m.CreatedStubs)
+	if abortTargetPredatesRPC(err) {
+		resp, err = &pb.AbortLiveFirmwareTargetResponse{}, nil
+	}
 	switch {
 	case err != nil:
 		_ = s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseTargetUnreachable, fmt.Sprintf(
@@ -612,6 +646,9 @@ func (s *Server) stopLiveFirmwareMoveOnSource(ctx context.Context, r *liveFirmwa
 // this host, is not retried.
 func (s *Server) retryLiveFirmwareCall(ctx context.Context, r *liveFirmwareRun, what string, call func(context.Context, pb.LiteVirtClient) error) error {
 	deadline := time.Now().Add(fwLiveRetryFor)
+	if r.oneAttempt {
+		deadline = time.Now()
+	}
 	wait := fwLiveRetryBackoff
 	for {
 		client, closer, err := s.liveFirmwarePeer(ctx, r.target.Name)

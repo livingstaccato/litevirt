@@ -1008,9 +1008,14 @@ condition:
 - A rule naming a tag group this host does not hold matches nothing when it
   accepts, and loses its address match when it drops or rejects
   (`firewall.tag_group.missing`, critical, named once it has lasted a
-  minute).
+  minute). A cluster-tier drop or reject on a missing group therefore denies
+  what else it names on every NIC of every host that does not hold the
+  group; a `tag-group rm` and a new drop on the group sent through two hosts
+  at once can leave one so.
 - A group whose row cannot be read is rendered from the last definition this
-  host read: its set, its bindings and its rules stay. When this host never
+  host read: its set, its bindings and its rules stay, so an edit that
+  narrowed its match does not take effect here, and accepts keep admitting
+  the members the old match selected, until the row reads again. When this host never
   read it (the daemon started since), every NIC here of every workload with
   tags is held at drop on every network until it reads again. A group named
   `<x>_v6` while a group `<x>` exists keeps its bindings, but its set cannot

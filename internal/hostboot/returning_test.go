@@ -117,8 +117,8 @@ func TestReturningBootOnlyForReturningStates(t *testing.T) {
 	if b, ok := returningBoot(ctx, db, "nobody", t.TempDir(), false, time.Now()); ok {
 		t.Fatalf("a host with no record was taken by the returning rule: %+v", b)
 	}
-	if b := BootState(ctx, db, "nobody", t.TempDir(), false, time.Now()); b.State != "active" || b.AwaitServing {
-		t.Fatalf("boot of a host with no record = %+v, want active as before", b)
+	if b := BootState(ctx, db, "nobody", t.TempDir(), false, time.Now()); b.State != "" || !b.Deferred {
+		t.Fatalf("boot of a host with no record = %+v, want it decided as before (no boot write)", b)
 	}
 	if returning(corrosion.HostStateUnknown) {
 		t.Fatalf("%q is taken as a returning state; a state this node cannot know must not be", corrosion.HostStateUnknown)

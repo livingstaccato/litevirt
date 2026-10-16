@@ -38,10 +38,14 @@ func returning(state string) bool {
 // The write ends the returning state as the 'active' one did: a recorded
 // fence's authority to resume a recovery (the coordinator resumes only from
 // 'fenced' or 'offline'), and the maintenance or drain. The host's isolation
-// is kept. ok=false, and the boot is decided as before, for any other state
-// and for a record this boot cannot read.
+// is kept. The write is guarded on the state read here (From): readHost
+// resolves the state from the same copy the guard checks (the membership row
+// when it exists), so a fence, undrain or drain recorded between the read and
+// the write is kept, and nothing else refuses it. ok=false, and the boot is
+// decided as before, for any other state and for a record this boot cannot
+// read.
 func returningBoot(ctx context.Context, db *corrosion.Client, host, dataDir string, marked bool, now time.Time) (Boot, bool) {
-	h, err := corrosion.GetHost(ctx, db, host)
+	h, err := readHost(ctx, db, host)
 	if err != nil || h == nil || !returning(h.State) {
 		return Boot{}, false
 	}
@@ -51,6 +55,8 @@ func returningBoot(ctx context.Context, db *corrosion.Client, host, dataDir stri
 		// decision does not depend on it.
 		_, _ = recordUncleanBoot(dataDir, now)
 	}
-	return noteAwaiting(dataDir, Boot{State: "upgrading", AwaitServing: true,
-		Reason: "recorded " + h.State + "; returning to service, active once this daemon serves"}, now), true
+	// Bounded by the returning state itself, so written whether or not the
+	// note can be left.
+	return noteAwaiting(dataDir, Boot{State: "upgrading", AwaitServing: true, From: h.State,
+		Reason: "recorded " + h.State + "; returning to service, active once this daemon serves"}, now, true), true
 }

@@ -124,7 +124,9 @@ func TestAutomationCutAuditsSource(t *testing.T) {
 	}
 }
 
-func TestAutomationCutRetainsLosingAcceptance(t *testing.T) {
+func TestAutomationCutRetainsLosingAcceptance(t *testing.T) { automationLosingCutFixture(t) }
+func automationLosingCutFixture(t *testing.T) (*AutomationFixture, *corrosion.VoterConfig, string) {
+	t.Helper()
 	f := NewAutomationFixture(t, 3)
 	n := f.cluster.Nodes[0]
 	head := f.Head(t, 0)
@@ -165,13 +167,15 @@ func TestAutomationCutRetainsLosingAcceptance(t *testing.T) {
 	if err = n.DB.SealVoterGeneration(f.ctx, cfg.Generation, "test"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = f.Engine(0).FreezeMembershipCut(f.ctx, cfg.Generation); err != nil {
+	cut, err := f.Engine(0).FreezeMembershipCut(f.ctx, cfg.Generation)
+	if err != nil {
 		t.Fatal("legitimate older losing acceptance falsely treated as fork", err)
 	}
 	retained, ok, err := n.DB.ClaimState(f.ctx, key)
 	if err != nil || !ok || retained.ValueDigest != value.MustDigest() {
 		t.Fatal("cut rewrote losing acceptance", err)
 	}
+	return f, cfg, cut
 }
 
 func TestAutomationCutManyLargeRecords(t *testing.T) { largeAutomationCutFixture(t) }

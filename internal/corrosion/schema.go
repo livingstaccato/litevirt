@@ -547,7 +547,9 @@ import (
 //	     records. No transfer publication, adoption or capability authority.
 //	v70: completed node-local outgoing automation publications, immutable job
 //	     pins and retained public trust evidence; excluded from source content.
-const CurrentSchemaVersion = 70
+//
+// v71: inert receiver attempts, pending metadata and bounded transport inventory.
+const CurrentSchemaVersion = 71
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -2856,6 +2858,38 @@ var schemaDDL = []string{
 	// promise a peer could write is not a promise (§3.8). Written only through
 	// ExecuteLocal, one transaction per voter step, committed before the reply
 	// is built. Rows are never deleted or downgraded.
+	// Inert receiver evidence only: no adoption, voting, import or runtime authority.
+	`CREATE TABLE IF NOT EXISTS local_automation_receiver_jobs (
+ id TEXT PRIMARY KEY, job TEXT NOT NULL, revision INTEGER NOT NULL,
+ binding BLOB NOT NULL, evidence BLOB NOT NULL, UNIQUE(job,revision)
+ )`,
+	`CREATE TABLE IF NOT EXISTS local_automation_receiver_current (
+ id INTEGER PRIMARY KEY CHECK(id=1), attempt TEXT NOT NULL
+ )`,
+	`CREATE TABLE IF NOT EXISTS local_automation_receiver_validations (
+ attempt TEXT NOT NULL, digest TEXT NOT NULL, evidence BLOB NOT NULL,
+ PRIMARY KEY(attempt,digest)
+ )`,
+	`CREATE TABLE IF NOT EXISTS local_automation_receiver_sources (
+ attempt TEXT NOT NULL, source TEXT NOT NULL, publication TEXT NOT NULL,
+ authenticated INTEGER NOT NULL DEFAULT 0, metadata BLOB NOT NULL,
+ PRIMARY KEY(attempt,source)
+ )`,
+	`CREATE TABLE IF NOT EXISTS local_automation_receiver_components (
+ attempt TEXT NOT NULL, source TEXT NOT NULL, component INTEGER NOT NULL,
+ state BLOB NOT NULL, cursor TEXT NOT NULL, terminal INTEGER NOT NULL,
+ PRIMARY KEY(attempt,source,component)
+ )`,
+	`CREATE TABLE IF NOT EXISTS local_automation_receiver_records (
+ attempt TEXT NOT NULL, source TEXT NOT NULL, component INTEGER NOT NULL,
+ ordinal INTEGER NOT NULL, record BLOB NOT NULL,
+ PRIMARY KEY(attempt,source,component,ordinal)
+ )`,
+	`CREATE TABLE IF NOT EXISTS local_automation_receiver_pages (
+ attempt TEXT NOT NULL, source TEXT NOT NULL, component INTEGER NOT NULL,
+ position INTEGER NOT NULL, request TEXT NOT NULL, digest TEXT NOT NULL, progress BLOB NOT NULL,
+ PRIMARY KEY(attempt,source,component,position)
+ )`,
 	`CREATE TABLE IF NOT EXISTS local_automation_source_jobs (
  job TEXT NOT NULL, revision INTEGER NOT NULL, binding BLOB NOT NULL, publications INTEGER NOT NULL,
  PRIMARY KEY(job,revision)
@@ -3672,6 +3706,13 @@ var createTableUnits = []struct {
 	{68, "local_automation_requests"}, {68, "local_automation_recovery"}, {68, "local_automation_staging"},
 	{69, "local_automation_cuts"}, {69, "local_automation_cut_records"},
 	{70, "local_automation_source_jobs"}, {70, "local_automation_publications"},
+	{71, "local_automation_receiver_jobs"},
+	{71, "local_automation_receiver_current"},
+	{71, "local_automation_receiver_validations"},
+	{71, "local_automation_receiver_sources"},
+	{71, "local_automation_receiver_components"},
+	{71, "local_automation_receiver_records"},
+	{71, "local_automation_receiver_pages"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

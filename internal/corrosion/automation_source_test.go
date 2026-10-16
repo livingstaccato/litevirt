@@ -29,6 +29,9 @@ func sourcePreparationFixtureAt(t *testing.T, dataDir string) (*AutomationSource
 	return p, r
 }
 func sourcePreparationFixtureWithPeer(t *testing.T, dataDir string) (*AutomationSourcePreparer, AutomationSourceRequest, *claimTestVoter) {
+	return sourcePreparationFixtureWithSeed(t, dataDir, nil)
+}
+func sourcePreparationFixtureWithSeed(t *testing.T, dataDir string, seed func(*claimTestVoter)) (*AutomationSourcePreparer, AutomationSourceRequest, *claimTestVoter) {
 	t.Helper()
 	ctx := context.Background()
 	ca := newClaimTestCA(t)
@@ -82,6 +85,9 @@ func sourcePreparationFixtureWithPeer(t *testing.T, dataDir string) (*Automation
 	}
 	if err := RecordVoterAdoption(ctx, a.c, 1); err != nil {
 		t.Fatal(err)
+	}
+	if seed != nil {
+		seed(a)
 	}
 	second := choose(first, VoterConfigValue{Generation: 2, Members: membersOf(a, b), Change: "add:b", CreatedBy: "a", CreatedAt: "t2"})
 	if _, err := a.c.FreezeAutomationCut(ctx, 1, nil); err != nil {

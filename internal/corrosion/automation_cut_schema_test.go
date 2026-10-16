@@ -110,7 +110,7 @@ func TestAutomationCutNewLiveExcludesPublicationEgress(t *testing.T) {
 		}
 		return id
 	}())
-	if before.SourceSchema != 70 || before.Codec != 1 {
+	if before.SourceSchema != CurrentSchemaVersion || before.Codec != 1 {
 		t.Fatal("new live descriptor differs", before)
 	}
 	if err := producer.InitializePublication(ctx); err != nil {
@@ -132,7 +132,7 @@ func TestAutomationCutNewLiveExcludesPublicationEgress(t *testing.T) {
 		t.Fatal("new live cut with prior egress rows refused", err)
 	}
 	next, _ := cutFixtureRead(t, producer.client, nextID)
-	if nextID == before.ID || next.Generation != 2 || next.SourceSchema != 70 || next.Codec != 1 || len(next.Inventory) != 9 {
+	if nextID == before.ID || next.Generation != 2 || next.SourceSchema != CurrentSchemaVersion || next.Codec != 1 || len(next.Inventory) != 9 {
 		t.Fatal("new live cut descriptor/inventory differs", next)
 	}
 	rows, err := producer.client.Query(ctx, `SELECT COUNT(*) AS n FROM local_automation_publications`)
@@ -146,5 +146,35 @@ func TestAutomationCutNewLiveExcludesPublicationEgress(t *testing.T) {
 	after, later := cutFixtureRead(t, producer.client, id)
 	if !reflect.DeepEqual(before, after) || !reflect.DeepEqual(records, later) {
 		t.Fatal("publication recursively changed content cut")
+	}
+}
+
+func TestAutomationCutArchive70SurvivesReceiverSchema71(t *testing.T) {
+	_, a, _, _ := threeVoters(t)
+	ctx := context.Background()
+	if err := a.c.SealVoterGeneration(ctx, 1, "archive70"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.c.db.Exec(`UPDATE schema_state SET version=70 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	id, err := a.c.FreezeAutomationCut(ctx, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, records := cutFixtureRead(t, a.c, id)
+	if before.SourceSchema != 70 {
+		t.Fatal("archive descriptor wrong")
+	}
+	if _, err = a.c.db.Exec(`UPDATE schema_state SET version=71 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	again, err := a.c.FreezeAutomationCut(ctx, 1, nil)
+	if err != nil || again != id {
+		t.Fatal("receiver schema invalidated archive70", err)
+	}
+	after, later := cutFixtureRead(t, a.c, id)
+	if !reflect.DeepEqual(before, after) || !reflect.DeepEqual(records, later) {
+		t.Fatal("receiver schema relabeled archive70 bytes/root")
 	}
 }

@@ -918,23 +918,82 @@ firewall tag; copy one over with `lv firewall tag set`.
   not applied)`, or `unreadable` for a row that cannot be read. The web UI's
   VM page shows them read-only, and `lv firewall tag ls` lists unreadable
   rows too.
-- Where membership cannot be proven, the firewall fails closed and the host
-  raises a condition:
-  - a workload whose tags row cannot be read is a member of no group, and its
-    NICs are held at drop on the networks a tag group binds security groups
-    on, or on every network while a drop or reject rule names a tag group
-    (`firewall.tag_group.tags_unreadable`, critical);
-  - a workload whose identity another live workload holds too (a copy) is a
-    member of no group, and every NIC of each is held at drop; an open move's
-    own source and target are not held (`firewall.tag_group.identity_shared`,
-    critical);
-  - a workload with no identity, while a row of an earlier incarnation of its
-    name remains (a relocation or restore that did not carry the identity),
-    is named with the `lv firewall tag set` command that sets its tags again
-    (`firewall.tag_group.identity_lost`, warning).
 
-  The hold is the per-NIC chain's own rules, after the cluster and host
-  tiers, and observe mode counts it instead of dropping.
+## Tag groups
+
+A tag group selects workloads by their firewall tags and gives the cluster
+one nft set, `lv_tg_<name>`, holding their addresses.
+
+```
+lv firewall tag-group set web --match role=web --match env=prod --network prod --sg web-in
+lv firewall tag-group ls --members
+lv firewall tag-group rm web
+```
+
+- A group name is `[a-z][a-z0-9_]{0,30}`. A name ending in `_v6` is refused,
+  because `lv_tg_<name>_v6` is the IPv6 companion of another group's set.
+- `--match k=v` needs the tag `k` to hold `v`, and `--match k` needs only
+  that the workload holds `k`. Every match must hold. `--match k=` and a key
+  matched twice are refused.
+- A member's addresses are its allocated leases, IPv4 in `lv_tg_<name>`
+  and IPv6 in `lv_tg_<name>_v6`. A member with no allocated address is in no
+  set; `lv firewall tag-group ls --members` shows it as `no allocated
+  address`. A change to a VM's recorded address does not change the set; the
+  lease does.
+- A rule references the group as `cidr: tag:<name>` (an `lv sg rule-add`, a
+  cluster or host rule, a compose security group or `firewall.cluster-rules`
+  entry). It is stored as written and rendered as `@lv_tg_<name>`; it applies
+  to both families, negated or not. Writing a rule for a group that does not
+  exist is refused.
+- `--sg` and `--network` bind security groups: every NIC of every member is
+  also bound to the listed security groups, on the listed networks (every
+  network when none is listed), merged with the NIC's own.
+- `rm` is refused while a rule references `tag:<name>` or the group binds
+  security groups to a member's NICs. `--force` overrides accept rules and
+  the binding, never a drop or reject rule. It also asks `--force` while a
+  workload whose tags cannot be read sits on a network the group binds.
+- Writing a group, or a rule that references one, is refused until the
+  cluster upgrade has finished (`firewall_tag_groups`). `lv` asks the daemon
+  before it sends a `tag:` cidr, from a rule, a compose file or a gitops file
+  that may hold one, and refuses unless the daemon shows it knows tag groups.
+
+**Propagation.** A host reflects a tag or group change made at `t0` by
+`t0 + L + T + pass`: `L` is that host's replication lag, `T` the 30 second
+reconcile tick and `pass` one reconcile. The host that takes the write
+reconciles at once. Hosts may disagree inside that window, and no host relies
+on another's view:
+
+| Change | A host that has not yet seen it |
+|---|---|
+| A tag is added | The member's accepts apply later; drops on it apply later |
+| A tag is removed, or a lease released | The member is still allowed |
+| A lease is reallocated to a non-member | Treated as a removal |
+
+**Established connections survive removal.** `ct state established,related
+accept` comes before every rule (see "Stateful conntrack baked in"), and
+litevirt does not flush conntrack when a member leaves a group, so a
+connection that was accepted keeps passing. To cut one at once, delete it on
+the host that carries it: `conntrack -D -s <address>`.
+
+**Fail closed.** Where membership cannot be proven, the firewall holds back
+rather than allow, and the host raises a condition:
+
+- A workload whose tags row cannot be read is a member of no group, and its
+  NICs are held at drop on the networks a tag group binds security groups
+  on, or on every network while a drop or reject rule names a tag group
+  (`firewall.tag_group.tags_unreadable`, critical).
+- A workload whose identity another live workload holds too (a copy) is a
+  member of no group, and every NIC of each is held at drop; an open move's
+  own source and target are not held (`firewall.tag_group.identity_shared`,
+  critical).
+- A workload with no identity, while a row of an earlier incarnation of its
+  name remains (a relocation or restore that did not carry the identity),
+  is named with the `lv firewall tag set` command that sets its tags again
+  (`firewall.tag_group.identity_lost`, warning).
+
+  The first two holds are partial. They are the per-NIC chain's own rules, so
+  they come after the cluster and host tiers: traffic those tiers accept
+  still passes. Observe mode counts the hold instead of dropping.
 - A rule naming a tag group this host does not hold matches nothing when it
   accepts, and loses its address match when it drops or rejects
   (`firewall.tag_group.missing`, critical, named once it has lasted a
@@ -952,7 +1011,8 @@ firewall tag; copy one over with `lv firewall tag set`.
   not render denies everyone it names. A user ip set named `lv_tg_*` is left
   out.
 - `litevirt_firewall_tag_group_members{group}` counts each group's members
-  in this host's view.
+  in this host's view (0 for a group this host cannot read), and
+  `lv firewall tag-group ls --members` lists them.
 
 ## CLI
 

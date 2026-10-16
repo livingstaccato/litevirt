@@ -1428,7 +1428,7 @@ lv firewall tag ls [<workload>] [--container [--host <host>]]      # every tagge
 
 # Tag groups: selectors over firewall tags; reference one from a rule with --cidr tag:<group>
 # (sg.write to change; audited; refused until the cluster upgrade has finished).
-lv firewall tag-group set <name> --match <k>=<v> [--match <k>] [--sg <sg>] [--network <net>]   # upsert; matches are ANDed
+lv firewall tag-group set <name> --match <k>=<v> [--match <k>] [--sg <sg>] [--network <net>]   # upsert; matches are ANDed; --match <k> = holds the key; name [a-z][a-z0-9_]{0,30}
 lv firewall tag-group ls [--members]   # --members: each member's allocated addresses, or "no allocated address"
 lv firewall tag-group rm <name> [--force]
   # rm is refused while a rule references tag:<name> or the group binds security groups to a
@@ -1439,6 +1439,7 @@ lv firewall tag-group rm <name> [--force]
   # workload whose tags cannot be read sits on a network the group binds. lv asks the daemon
   # before sending a tag: cidr (a rule, a compose file, or a gitops file that may hold one) and
   # refuses unless the daemon shows it knows tag groups.
+  # A member leaving a group does not cut its open connections (docs/firewall.md, "Tag groups").
 ```
 
 See `docs/firewall.md` for the three-tier model, where each tier is enforced

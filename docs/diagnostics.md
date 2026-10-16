@@ -1701,6 +1701,26 @@ on` keeps it as the operator's; a stack deployed later that asks for
 default-deny takes it over. The condition resolves on the next pass after
 either.
 
+### Tag-group conditions (`firewall.tag_group.*`)
+
+Raised per host by its firewall reconciler, and resolved on the next pass that
+no longer finds the cause. Each names the rules, groups or workloads involved
+(at most ten, then a count) and the command that fixes them. docs/firewall.md,
+"Tag groups", says what each one holds back.
+
+| Condition | Severity | Raised when |
+|---|---|---|
+| `firewall.tag_group.missing` | critical | a rule has named a tag group this host's replica does not hold for a minute: an accept matches nothing, a drop or reject loses its address match |
+| `firewall.tag_group.unreadable` | critical | a group's row cannot be read here, or its set cannot be declared (`<x>_v6` beside `<x>`) |
+| `firewall.tag_group.tags_unreadable` | critical | a workload's tags row cannot be read: its NICs are held at drop |
+| `firewall.tag_group.identity_shared` | critical | two live workloads hold one firewall identity (a copy): every NIC of each is held at drop |
+| `firewall.tag_group.identity_lost` | warning | a workload has no firewall identity while a tags row of an earlier incarnation of its name remains; the evidence gives the `lv firewall tag set` command |
+
+`litevirt_firewall_tag_group_members{group}` is a gauge of each group's members
+in this host's view, 0 for a group this host cannot read. Hosts can differ for
+up to one replication lag plus the 30 second reconcile tick;
+`lv firewall tag-group ls --members` shows the members.
+
 ### Deferred out-of-band stop sync after a restart or rejoin
 
 When a VM's domain is found shut off out of band (a crash, an external

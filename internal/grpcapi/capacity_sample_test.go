@@ -3,7 +3,11 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
@@ -166,23 +170,42 @@ func TestCapacityObservation_UncountedStatesWithALiveQemuStayRuntimeOnly(t *test
 	}
 }
 
-// fakeSampling scripts capacitySampler's two inputs.
+// fakeSampling scripts capacitySampler's inputs, on a clock the test moves.
 type fakeSampling struct {
 	fp        string
 	fpErr     error
 	obs       corrosion.HostCapacityObservation
 	sampleErr error
+	closed    string
+	clock     time.Time
 	samples   int
+	sampledAt []time.Time
 }
 
+const fakeCheck = time.Second
+
+// sampler is a capacitySampler on f with a 1 s check, no spacing (the spacing
+// test sets its own) and a 60 s interval.
 func (f *fakeSampling) sampler() *capacitySampler {
+	f.clock = time.Date(2026, 10, 16, 18, 42, 0, 0, time.UTC)
 	return &capacitySampler{
 		fingerprint: func(context.Context) (string, error) { return f.fp, f.fpErr },
 		sample: func(context.Context) (corrosion.HostCapacityObservation, error) {
 			f.samples++
+			f.sampledAt = append(f.sampledAt, f.clock)
 			return f.obs, f.sampleErr
 		},
+		writeClosed: func() string { return f.closed },
+		now:         func() time.Time { return f.clock },
+		check:       fakeCheck,
+		maxBackoff:  time.Minute,
 	}
+}
+
+// poll advances the clock one check, then polls, as the ticker does.
+func (f *fakeSampling) poll(ctx context.Context, cs *capacitySampler) {
+	f.clock = f.clock.Add(fakeCheck)
+	cs.poll(ctx)
 }
 
 var cleanObs = corrosion.HostCapacityObservation{HostName: "h1", Complete: true}
@@ -196,26 +219,26 @@ func TestCapacitySampler_ResamplesWhenTheHostsWorkloadsChange(t *testing.T) {
 	f := &fakeSampling{fp: "with-mover", obs: cleanObs}
 	cs := f.sampler()
 	cs.take(ctx, false)
-	cs.poll(ctx)
+	f.poll(ctx, cs)
 	if f.samples != 1 {
 		t.Fatalf("samples = %d after a check with nothing changed; want 1 (the first)", f.samples)
 	}
 	f.fp = "mover-gone"
-	cs.poll(ctx)
+	f.poll(ctx, cs)
 	if f.samples != 2 {
 		t.Fatalf("samples = %d after the host's workloads changed; want 2", f.samples)
 	}
-	cs.poll(ctx)
+	f.poll(ctx, cs)
 	if f.samples != 2 {
 		t.Fatalf("samples = %d after a second check with nothing new; want still 2", f.samples)
 	}
 }
 
-// A sample can pair a runtime read that began before the change with the
-// database after it (concurrent inventory reads share one libvirt scan), and
-// then charge a workload that has already gone. A change-triggered sample that
-// charges any runtime-only load, or cannot account for the host, is confirmed
-// once at the next check; one that charges nothing is not.
+// A sample can pair a runtime read that began before the change it was taken
+// for with the database after it (concurrent inventory reads share one libvirt
+// scan), and then charge a workload that has already gone. A change-triggered
+// sample that charges any runtime-only load, or cannot account for the host,
+// is confirmed once at the next check; one that charges nothing is not.
 func TestCapacitySampler_ConfirmsAChangeTriggeredSampleThatChargedRuntimeLoad(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
@@ -232,9 +255,9 @@ func TestCapacitySampler_ConfirmsAChangeTriggeredSampleThatChargedRuntimeLoad(t 
 		cs := f.sampler()
 		cs.take(ctx, false)
 		f.fp, f.obs = "b", tc.obs
-		cs.poll(ctx) // the change
-		cs.poll(ctx) // the confirmation, if any
-		cs.poll(ctx) // never a second one
+		f.poll(ctx, cs) // the change
+		f.poll(ctx, cs) // the confirmation, if any
+		f.poll(ctx, cs) // never a second one
 		want := 2
 		if tc.confirm {
 			want = 3
@@ -248,14 +271,33 @@ func TestCapacitySampler_ConfirmsAChangeTriggeredSampleThatChargedRuntimeLoad(t 
 	f := &fakeSampling{fp: "a", obs: corrosion.HostCapacityObservation{Complete: true, ExtraMemMiB: 1024}}
 	cs := f.sampler()
 	cs.take(ctx, false)
-	cs.poll(ctx)
+	f.poll(ctx, cs)
 	if f.samples != 1 {
 		t.Fatalf("samples = %d; an interval sample must not be confirmed", f.samples)
 	}
 }
 
+// A second change that lands while a confirmation is pending makes the
+// confirmation a change-triggered sample itself, so it is confirmed in turn:
+// its runtime read can predate the second change just as the first could.
+func TestCapacitySampler_AChangeDuringAConfirmationIsConfirmedToo(t *testing.T) {
+	ctx := context.Background()
+	f := &fakeSampling{fp: "a", obs: cleanObs}
+	cs := f.sampler()
+	cs.take(ctx, false)
+	f.fp, f.obs = "b", corrosion.HostCapacityObservation{Complete: true, ExtraMemMiB: 1024}
+	f.poll(ctx, cs) // change → confirmation pending
+	f.fp = "c"
+	f.poll(ctx, cs) // the confirmation, which also sees the second change
+	f.poll(ctx, cs) // its own confirmation
+	f.poll(ctx, cs) // nothing more
+	if f.samples != 4 {
+		t.Fatalf("samples = %d, want 4: the sample that saw the second change is confirmed too", f.samples)
+	}
+}
+
 // A check that cannot read the database samples nothing (the interval still
-// does), and a sample whose fingerprint could not be read is retried at the
+// does), and a sample whose fingerprint could not be read is retaken at the
 // next check that can.
 func TestCapacitySampler_FingerprintErrors(t *testing.T) {
 	ctx := context.Background()
@@ -263,7 +305,7 @@ func TestCapacitySampler_FingerprintErrors(t *testing.T) {
 	cs := f.sampler()
 	cs.take(ctx, false)
 	f.fpErr = errors.New("database is locked")
-	cs.poll(ctx)
+	f.poll(ctx, cs)
 	if f.samples != 1 {
 		t.Fatalf("samples = %d after a check that could not read the database; want 1", f.samples)
 	}
@@ -272,28 +314,184 @@ func TestCapacitySampler_FingerprintErrors(t *testing.T) {
 	cs = f.sampler()
 	cs.take(ctx, false)
 	f.fpErr = nil
-	cs.poll(ctx)
+	f.poll(ctx, cs)
 	if f.samples != 2 {
 		t.Fatalf("samples = %d; a sample with no fingerprint must be retaken at the next good check", f.samples)
 	}
 }
 
 // A sample that failed published nothing, so the change it was taken for is
-// sampled again at the next check.
-func TestCapacitySampler_AFailedSampleIsRetakenAtTheNextCheck(t *testing.T) {
+// sampled again, after its backoff.
+func TestCapacitySampler_AFailedSampleIsRetaken(t *testing.T) {
 	ctx := context.Background()
 	f := &fakeSampling{fp: "a", obs: cleanObs}
 	cs := f.sampler()
 	cs.take(ctx, false)
 	f.fp, f.sampleErr = "b", errors.New("upsert: database is locked")
-	cs.poll(ctx)
+	f.poll(ctx, cs) // fails; retry one check later
 	f.sampleErr = nil
-	cs.poll(ctx)
+	f.poll(ctx, cs)
 	if f.samples != 3 {
 		t.Fatalf("samples = %d; the change whose sample failed must be sampled again", f.samples)
 	}
-	cs.poll(ctx)
+	f.poll(ctx, cs)
 	if f.samples != 3 {
 		t.Fatalf("samples = %d after the retake succeeded; want no more", f.samples)
+	}
+}
+
+// A sample that keeps failing — the first one at daemon start included — is
+// retried after one check, then two, four ... up to the interval, not on every
+// check. A success resets the backoff.
+func TestCapacitySampler_AFailingSampleBacksOffToTheInterval(t *testing.T) {
+	ctx := context.Background()
+	f := &fakeSampling{fp: "a", obs: cleanObs, sampleErr: errors.New("upsert: disk I/O error")}
+	cs := f.sampler()
+	cs.take(ctx, false) // the first sample, at start, fails
+	for i := 0; i < 400; i++ {
+		f.poll(ctx, cs)
+	}
+	var gaps []time.Duration
+	for i := 1; i < len(f.sampledAt); i++ {
+		gaps = append(gaps, f.sampledAt[i].Sub(f.sampledAt[i-1]))
+	}
+	var want []time.Duration
+	for _, sec := range []int{1, 2, 4, 8, 16, 32, 60, 60, 60, 60} {
+		want = append(want, time.Duration(sec)*time.Second)
+	}
+	for i, w := range want {
+		if i >= len(gaps) || gaps[i] != w {
+			t.Fatalf("retry gaps = %v, want %v then 1m0s each", gaps, want)
+		}
+	}
+	f.sampleErr = nil
+	f.clock = f.clock.Add(time.Minute)
+	f.poll(ctx, cs) // recovers
+	f.sampleErr = errors.New("upsert: disk I/O error")
+	f.fp = "b"
+	n := f.samples
+	f.poll(ctx, cs) // a fresh failure
+	f.poll(ctx, cs)
+	if f.samples != n+2 {
+		t.Fatalf("after a success the next failure is retried one check later; samples %d → %d", n, f.samples)
+	}
+}
+
+// While replicated writes are refused (WAL quarantine, release probation) no
+// sample can be published, so none is taken — no libvirt scan, on the interval
+// or on a change. The first check after writes reopen samples.
+func TestCapacitySampler_StandsDownWhileWritesAreRefused(t *testing.T) {
+	ctx := context.Background()
+	f := &fakeSampling{fp: "a", obs: cleanObs, closed: "release probation: started below latched release token(s) x"}
+	cs := f.sampler()
+	cs.take(ctx, false)
+	f.fp = "b"
+	for i := 0; i < 30; i++ {
+		f.poll(ctx, cs)
+	}
+	cs.take(ctx, false) // the interval
+	if f.samples != 0 {
+		t.Fatalf("samples = %d while replicated writes are refused; want 0", f.samples)
+	}
+	f.closed = ""
+	f.poll(ctx, cs)
+	if f.samples != 1 {
+		t.Fatalf("samples = %d at the first check after writes reopened; want 1", f.samples)
+	}
+}
+
+// The stand-down reads the server's real write gate.
+func TestCapacitySampler_ReadsTheDatabasesWriteQuarantine(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	s := NewServerForTests(TestServerOpts{HostName: "h1", DataDir: t.TempDir(), DB: db})
+	cs := s.newCapacitySampler(time.Minute)
+	samples := 0
+	cs.sample = func(context.Context) (corrosion.HostCapacityObservation, error) {
+		samples++
+		return cleanObs, nil
+	}
+	quarantined := "test: WAL quarantine"
+	db.SetWriteQuarantine(func() string { return quarantined })
+	cs.take(ctx, false)
+	if samples != 0 {
+		t.Fatalf("samples = %d on a WAL-quarantined node; want 0", samples)
+	}
+	quarantined = ""
+	cs.take(ctx, false)
+	if samples != 1 {
+		t.Fatalf("samples = %d once the quarantine lifted; want 1", samples)
+	}
+}
+
+// Change-triggered samples are spaced: under sustained churn a host rescans at
+// most once per spacing, and the changes in between coalesce into the next.
+func TestCapacitySampler_ChangeSamplesAreSpaced(t *testing.T) {
+	ctx := context.Background()
+	f := &fakeSampling{fp: "0", obs: cleanObs}
+	cs := f.sampler()
+	cs.spacing = time.Duration(float64(fakeCheck) * capacityChangeSpacing)
+	cs.take(ctx, false)
+	for i := 1; i <= 30; i++ {
+		f.fp = string(rune('a' + i%26))
+		f.poll(ctx, cs)
+	}
+	// 30 checks of 1 s with a 2.5 s spacing: a sample every third check.
+	if f.samples != 1+10 {
+		t.Fatalf("samples = %d over 30 s of changes every second; want 11 (the first, then one per 3 s)", f.samples)
+	}
+}
+
+// slogCapture collects the sampler's log records.
+type slogCapture struct {
+	mu   sync.Mutex
+	recs []string
+}
+
+func (h *slogCapture) Enabled(context.Context, slog.Level) bool { return true }
+func (h *slogCapture) Handle(_ context.Context, r slog.Record) error {
+	if strings.HasPrefix(r.Message, "capacity sampler") {
+		h.mu.Lock()
+		h.recs = append(h.recs, r.Level.String()+" "+r.Message)
+		h.mu.Unlock()
+	}
+	return nil
+}
+func (h *slogCapture) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *slogCapture) WithGroup(string) slog.Handler      { return h }
+
+// A failing run logs one warning, its repeats at debug, and one info when it
+// recovers; a write refusal logs once when it starts and once when it ends.
+func TestCapacitySampler_LogsAFailingRunOnce(t *testing.T) {
+	h := &slogCapture{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	ctx := context.Background()
+	f := &fakeSampling{fp: "a", obs: cleanObs, sampleErr: errors.New("boom")}
+	cs := f.sampler()
+	cs.take(ctx, false)
+	for i := 0; i < 200; i++ {
+		f.poll(ctx, cs)
+	}
+	f.sampleErr = nil
+	f.clock = f.clock.Add(time.Minute)
+	f.poll(ctx, cs)
+	f.closed = "test: WAL quarantine"
+	for i := 0; i < 10; i++ {
+		f.poll(ctx, cs)
+	}
+	f.closed = ""
+	f.poll(ctx, cs)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	count := map[string]int{}
+	for _, r := range h.recs {
+		count[strings.SplitN(r, " ", 2)[0]]++
+	}
+	if count["WARN"] != 1 || count["INFO"] != 3 || count["DEBUG"] < 3 {
+		t.Fatalf("log levels = %v, want 1 WARN, several DEBUG, 3 INFO (recovered, stand-down, resume): %q", count, h.recs)
 	}
 }

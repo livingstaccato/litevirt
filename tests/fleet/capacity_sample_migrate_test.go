@@ -112,6 +112,8 @@ func TestFleet_MigrateVMAway_PlacementIsNotRefusedOnAStaleCapacitySample(t *test
 
 // The fresh sample is still a sample: a migration that left the guest running
 // on the source too leaves real load there, and placement keeps refusing it.
+// No sampler loop runs here: the one sample asserted on is taken after big's
+// row has moved, so no older sample can land on top of it.
 //
 // Mutation "a sample drops a VM the database records on another host" — red.
 func TestFleet_MigrateVMAway_ACopyLeftOnTheSourceIsStillCharged(t *testing.T) {
@@ -122,7 +124,6 @@ func TestFleet_MigrateVMAway_ACopyLeftOnTheSourceIsStillCharged(t *testing.T) {
 	if _, err := runVM(t, c, src, "big", src.Name, 1, 3072); err != nil {
 		t.Fatalf("create big: %v", err)
 	}
-	startCapacitySampler(t, src)
 	mid := migrateWithMidSample(t, src, dst, true)
 	if err := migrateAt(t, c, src, "big", dst.Name); err != nil {
 		t.Fatalf("migrate big away: %v", err)
@@ -130,8 +131,13 @@ func TestFleet_MigrateVMAway_ACopyLeftOnTheSourceIsStillCharged(t *testing.T) {
 	if mid.ExtraMemMiB < 3072 {
 		t.Fatalf("premise: the mid-migration sample charged %d MiB, want big's 3072", mid.ExtraMemMiB)
 	}
-	// Give the sampler time to take its post-change sample and its confirmation.
-	time.Sleep(500 * time.Millisecond)
+	if vm, err := corrosion.GetVM(context.Background(), src.DB, "big"); err != nil || vm == nil || vm.HostName != dst.Name {
+		t.Fatalf("premise: big's row is %+v (err %v), want it on %s", vm, err, dst.Name)
+	}
+	// The sample a change triggers once big's row has moved.
+	if err := src.Server.SampleHostCapacity(context.Background()); err != nil {
+		t.Fatalf("SampleHostCapacity: %v", err)
+	}
 	obs, _, err := corrosion.GetHostCapacityObservation(context.Background(), src.DB, src.Name)
 	if err != nil {
 		t.Fatalf("GetHostCapacityObservation: %v", err)

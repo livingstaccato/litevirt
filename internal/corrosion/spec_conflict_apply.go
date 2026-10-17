@@ -354,6 +354,21 @@ func (r *Replicator) applySpecGeneration(ctx context.Context, tx *sql.Tx, s Stat
 		if d.reason != "" {
 			r.client.noteSpecEditDropped(tx, dropIncoming)
 		}
+		if local.gen == in.fromGen+1 && local.epoch == in.epoch {
+			id, err := siblingFirewallID(ctx, tx, local.name, local.spec, in.spec)
+			if err != nil {
+				return err
+			}
+			if id != firewallIDOf(TagMemberVM, local.spec) {
+				// A sibling the local version beat, which carried the
+				// identity: the local version takes it, as the replicas
+				// that took the local version over the edit do. Its clock
+				// is the later of the two, as keepClock leaves it.
+				kept := specEdit{name: local.name, spec: local.spec, updatedAt: in.updatedAt}
+				_, err := takeSiblingSpecEdit(ctx, tx, kept, in.spec, local.activeOp, local)
+				return err
+			}
+		}
 		return keepClock(ctx, tx, local, in.updatedAt)
 	case specApplyByGeneration:
 		changed, err := byGeneration()
@@ -377,7 +392,7 @@ func (r *Replicator) applySpecGeneration(ctx context.Context, tx *sql.Tx, s Stat
 	if ferr != nil {
 		return ferr
 	}
-	changed, err := takeSiblingSpecEdit(ctx, tx, in, op, local)
+	changed, err := takeSiblingSpecEdit(ctx, tx, in, local.spec, op, local)
 	if err != nil {
 		return err
 	}
@@ -417,16 +432,82 @@ func keepClock(ctx context.Context, tx *sql.Tx, local specRow, incoming string) 
 	return err
 }
 
-// takeSiblingSpecEdit applies a received edit over the local sibling at its
-// generation, leaving barrier op. The row's clock is the later of the edit's
-// and the row's, as every generation-ordered apply keeps it — the edit's own
-// stamp, stamped by NowTS on its origin, is inside the spec. It reports
-// whether the row changed.
-func takeSiblingSpecEdit(ctx context.Context, tx *sql.Tx, in specEdit, op string, local specRow) (bool, error) {
-	res, err := tx.ExecContext(ctx, specSiblingTakeSQL, in.spec, op, laterClock(local.updatedAt, in.updatedAt),
+// takeSiblingSpecEdit makes in, the version kept of two siblings at the local
+// row's generation, the row's spec, leaving barrier op; other is the sibling
+// it was kept over. The spec holds the firewall identity siblingFirewallID
+// gives it, never other's dropped or a different one. The row's clock is the
+// later of the edit's and the row's, as every generation-ordered apply keeps
+// it — the edit's own stamp, stamped by NowTS on its origin, is inside the
+// spec. It reports whether the row changed.
+func takeSiblingSpecEdit(ctx context.Context, tx *sql.Tx, in specEdit, other, op string, local specRow) (bool, error) {
+	id, err := siblingFirewallID(ctx, tx, in.name, in.spec, other)
+	if err != nil {
+		return false, err
+	}
+	spec, err := keepFirewallID(TagMemberVM, in.spec, id)
+	if err != nil {
+		return false, err
+	}
+	res, err := tx.ExecContext(ctx, specSiblingTakeSQL, spec, op, laterClock(local.updatedAt, in.updatedAt),
 		in.name, local.epoch, local.gen, local.activeOp)
 	if err != nil {
 		return false, err
 	}
 	return rowsChanged(res), nil
+}
+
+// siblingFirewallID is the firewall identity the version kept from two
+// siblings of VM name at one generation holds (firewall_id.go). Every writer
+// keeps the identity of the spec it was made from, and only MintFirewallID
+// changes it, so two siblings differ in identity only when one is a mint (or
+// an edit from a writer that did not keep it). The kept version holds:
+//
+//   - its own identity, when the other holds none or the same;
+//   - the other's, when it holds none itself: an edit never drops one;
+//   - the other's, when another live VM holds the kept one's and none holds
+//     the other's: the kept one is the copy a mint replaced (MintFirewallID
+//     mints over exactly such an identity, after its caller cleared the
+//     copy's tags), and the other is that mint or a version that took it;
+//   - otherwise its own.
+//
+// Every rule but the copy's reads only the two versions and which is kept.
+// The copy's reads the other live VMs too, which every replica holds once
+// replication settles; a replica that resolved before then holds another
+// identity at the same generation, which anti-entropy resolves again here.
+func siblingFirewallID(ctx context.Context, tx *sql.Tx, name, kept, other string) (string, error) {
+	k, o := firewallIDOf(TagMemberVM, kept), firewallIDOf(TagMemberVM, other)
+	switch {
+	case k == o || o == "":
+		return k, nil
+	case k == "":
+		return o, nil
+	}
+	kHeld, err := vmFirewallIDHeldByAnother(ctx, tx, name, k)
+	if err != nil || !kHeld {
+		return k, err
+	}
+	oHeld, err := vmFirewallIDHeldByAnother(ctx, tx, name, o)
+	if err != nil || oHeld {
+		return k, err
+	}
+	return o, nil
+}
+
+// vmFirewallIDHeldByAnother is FirewallIDHeldByAnother for a VM, inside tx.
+func vmFirewallIDHeldByAnother(ctx context.Context, tx *sql.Tx, name, id string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT COALESCE(spec, '') FROM vms WHERE name != ? AND deleted_at IS NULL`, name)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var spec string
+		if err := rows.Scan(&spec); err != nil {
+			return false, err
+		}
+		if firewallIDOf(TagMemberVM, spec) == id {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }

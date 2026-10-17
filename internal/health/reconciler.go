@@ -1264,6 +1264,7 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 	var declines []settleDecline
 	keep := map[string]bool{}
 	defer func() { r.reportSettleDeclines(ctx, declines, keep) }()
+	r.resolveSettled(ctx, localDomains)
 	for _, domName := range localDomains {
 		vm, err := corrosion.GetVM(ctx, r.db, domName)
 		if err != nil {

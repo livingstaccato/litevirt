@@ -1901,7 +1901,8 @@ and logs the cause and the remedy at error level. Fix what the cause names:
 the daemon's own mTLS client or its listener on 127.0.0.1, or the write (a
 WAL-quarantined node writes nothing, this condition included, so there only
 the log and the metric show it). The host then records itself `active`. Or run
-`lv host undrain <host>` to record it `active` now.
+`lv host undrain <host>` to record it `active` now; it does so only if the
+host's daemon answers a Ping from the node handling the undrain.
 
 ### Partition pause (`partition_paused`, `partition_pause_failed`, `partition_one_way`, `vm_settled`, `vm_settle_declined`)
 

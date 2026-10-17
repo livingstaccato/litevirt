@@ -165,3 +165,29 @@ func HostStateSince(ctx context.Context, c *Client, host string) (time.Time, boo
 	}
 	return lifeBoundary(at), true, nil
 }
+
+// HostStateAt is a host's membership state and when it was written
+// (HostStateSince).
+type HostStateAt struct {
+	State string
+	Since time.Time
+}
+
+// HostsStateSince is HostStateSince for every live host with a membership row
+// this node reads, with the state it records.
+func HostsStateSince(ctx context.Context, c *Client) (map[string]HostStateAt, error) {
+	rows, err := scanMembership(ctx, c, ` WHERE h.deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]HostStateAt, len(rows))
+	for _, r := range rows {
+		if !r.memPresent {
+			continue
+		}
+		if at, ok := ParseUpdatedAt(r.memTS); ok {
+			out[r.name] = HostStateAt{State: r.mem.State, Since: lifeBoundary(at)}
+		}
+	}
+	return out, nil
+}

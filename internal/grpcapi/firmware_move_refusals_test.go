@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/pbsstore"
+	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
 // Entry refusals of a live firmware move (spec §6.9; T-17, T-18, T-19, T-25,
@@ -206,6 +208,34 @@ func frSites() []frSite {
 		{"backup", "running", libvirtfake.StateRunning, func(f *frFixture) error {
 			return f.s.BackupSnapshot(&pb.BackupSnapshotRequest{VmName: "os1", RepoPath: f.t.TempDir()},
 				&progressStream[pb.BackupSnapshotProgress]{ctx: ctx})
+		}},
+		// An in-place restore overwrites the VM's own stopped disk from a
+		// backup in a repo that has a manifest of it (D2-14 review m-2).
+		{"backup_restore_in_place", "stopped", libvirtfake.StateShutdown, func(f *frFixture) error {
+			const ts = "2026-10-17T09:00:00Z"
+			repoDir := filepath.Join(f.t.TempDir(), "repo")
+			repo, err := pbsstore.Init(repoDir)
+			if err != nil {
+				return err
+			}
+			// A real image, so a restore that went on would replace the disk.
+			img := filepath.Join(f.t.TempDir(), "os1-root.qcow2")
+			if err := qcow2.Create(img, 1<<20, nil); err != nil {
+				return err
+			}
+			body, err := os.ReadFile(img)
+			if err != nil {
+				return err
+			}
+			if _, err := pbsstore.PushDisk(ctx, repo, bytes.NewReader(body), pbsstore.PushOptions{
+				VMName: "os1", DiskName: "root", Timestamp: ts, ContentFormat: pbsstore.ContentDiskFile,
+			}); err != nil {
+				return err
+			}
+			f.s.SetBackupRepos(map[string]string{"r": repoDir})
+			return f.s.RestoreFromBackup(&pb.RestoreFromBackupRequest{
+				RepoPath: "r", VmName: "os1", DiskName: "root", Timestamp: ts, InPlace: true,
+			}, &progressStream[pb.RestoreFromBackupProgress]{ctx: ctx})
 		}},
 		{"reconcile_definition", "stopped", libvirtfake.StateShutdown, func(f *frFixture) error {
 			row, err := corrosion.GetVM(ctx, f.s.db, "os1")

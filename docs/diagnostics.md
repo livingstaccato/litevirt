@@ -26,7 +26,8 @@ ordinary mutation's `--force` never bypasses the barrier. Without
 `--operation`, `abort` clears whichever operation is active when it runs;
 with `--operation <id>` it is refused unless `<id>` is that operation, so an
 operation that finished, or one that began, after you ran `show` is never
-the one cleared. The commands act on the host the CLI targets (`LV_HOST`).
+the one cleared. A daemon too old to honour `--operation` is refused before
+anything is sent. The commands act on the host the CLI targets (`LV_HOST`).
 
 ## Host reservations
 
@@ -2435,8 +2436,9 @@ that holds the line raises `vm.spec_edit_held` (evaluator `spec_conflict`,
 subject `vm/<name>@<host>`, warning): observed at the end of the first
 anti-entropy pass that holds, confirmed at the end of the second consecutive
 one for the same operation, each time only if the operation still has not
-finished once the whole pass has merged. A host that has merely not yet
-heard the operation finish therefore never confirms it. On
+finished once the whole pass has merged. A pass that brings the
+operation's terminal step therefore does not confirm it; it resolves the
+condition at its end. On
 confirmation the host logs a warning and counts
 `litevirt_spec_edit_held_total`, once per VM and operation. The evidence
 names the operation, the owner host it shows on (the VM's host as of the

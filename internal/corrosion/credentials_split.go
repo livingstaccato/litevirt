@@ -64,7 +64,11 @@ import (
 // included — runs a build that reads only the old columns.
 //
 // READ RULE. A reader takes the live credential row whenever one exists, and
-// the old column only when none does. It never compares the credential row's
+// the old column only when no credential row exists at all. A RETIRED row (a
+// tombstone, written only by retireFenceCredential on a host's removal or
+// re-admission) reads as no secret, never as the old column: a node whose
+// hosts row predates the re-admission still holds the old machine's password
+// there. It never compares the credential row's
 // updated_at with the PARENT row's: the parent's is bumped by every unrelated
 // write to the row, and when one of those reaches a replica ahead of a latched
 // rotation the LWW gate refuses the rotation's parent half there, leaving the
@@ -188,6 +192,17 @@ type CredentialSplitReport struct {
 // deleted_at = NULL, and the next pass would replicate the removed machine's BMC
 // password cluster-wide. Nothing reinstates a removed host's password: a
 // re-admission under the name resets ipmi_pass to NULL.
+//
+// A LIVE host can hold a retired credential row too: a host re-added while its
+// disk survived boots on its old database, re-records its serial (a hosts row
+// newer than the re-admission, which therefore does not reset it there), and
+// keeps the old machine's ipmi_pass while the re-admission retires the
+// credential row. So no pass ever copies over a tombstone, and the clear pass
+// clears the old column beside one without re-emitting it. A live old column
+// over a tombstone is never a legitimate secret: a latched writer pairs every
+// password with the credential upsert, which revives the row, and an
+// unlatched writer's password is absorbed from its entry, which revives it too
+// (credentials_absorb.go).
 const (
 	hostCredentialSplitScanSQL = `SELECT h.name AS pk, h.ipmi_pass AS old_val, h.updated_at AS src_ts,
 		       c.host_name AS cred_key, c.ipmi_pass AS cred_val, c.updated_at AS cred_ts,
@@ -217,7 +232,8 @@ const (
 // credentialSplitRow is one parent row the pass looked at.
 type credentialSplitRow struct {
 	pk, oldVal, srcTS string
-	present           bool
+	present           bool // a live credential row exists
+	retired           bool // the credential row exists and is a tombstone
 	credVal, credTS   string
 }
 
@@ -233,6 +249,7 @@ func scanCredentialSplitRows(ctx context.Context, c *Client, query string) ([]cr
 			oldVal:  r.String("old_val"),
 			srcTS:   r.String("src_ts"),
 			present: r.String("cred_key") != "" && r.String("cred_deleted") == "",
+			retired: r.String("cred_key") != "" && r.String("cred_deleted") != "",
 			credVal: r.String("cred_val"),
 			credTS:  r.String("cred_ts"),
 		})
@@ -241,12 +258,12 @@ func scanCredentialSplitRows(ctx context.Context, c *Client, query string) ([]cr
 }
 
 // needsCopy reports whether the old column holds a value the credential table
-// must take: only when there is no live credential row. A credential row that
-// exists is never overwritten from the old column — the parent's updated_at
+// must take: only when there is no credential row at all. A credential row
+// that exists, live or retired, is never overwritten from the old column — the parent's updated_at
 // does not date the secret (READ RULE); an unlatched write that belongs in the
 // row is absorbed at apply time instead (credentials_absorb.go).
 func (r credentialSplitRow) needsCopy() bool {
-	return !r.present
+	return !r.present && !r.retired
 }
 
 // copyTS is the updated_at a copied credential row carries: the PARENT row's.
@@ -446,6 +463,10 @@ func (c *Client) clearCredentialColumns(ctx context.Context) (CredentialSplitRep
 		if skipped("host_fence_credentials", r) {
 			continue
 		}
+		if r.retired {
+			count("host_fence_credentials", false, c.clearOldColumn(ctx, "host_fence_credentials", r.pk, stamp(r)))
+			continue
+		}
 		val, ts, copied := c.credentialFor(r)
 		count("host_fence_credentials", copied, c.clearHostCredential(ctx, r.pk, val, ts, stamp(r)))
 	}
@@ -455,6 +476,10 @@ func (c *Client) clearCredentialColumns(ctx context.Context) (CredentialSplitRep
 		if skipped("user_credentials", r) {
 			continue
 		}
+		if r.retired {
+			count("user_credentials", false, c.clearOldColumn(ctx, "user_credentials", r.pk, stamp(r)))
+			continue
+		}
 		val, ts, copied := c.credentialFor(r)
 		count("user_credentials", copied, c.clearUserCredential(ctx, r.pk, val, ts, stamp(r)))
 	}
@@ -462,6 +487,10 @@ func (c *Client) clearCredentialColumns(ctx context.Context) (CredentialSplitRep
 	note("token_credentials", err)
 	for _, r := range tokens {
 		if skipped("token_credentials", r) {
+			continue
+		}
+		if r.retired {
+			count("token_credentials", false, c.clearOldColumn(ctx, "token_credentials", r.pk, stamp(r)))
 			continue
 		}
 		val, ts, copied := c.credentialFor(r)
@@ -474,7 +503,7 @@ func (c *Client) clearCredentialColumns(ctx context.Context) (CredentialSplitRep
 		if skipped("hosts", r) {
 			continue
 		}
-		count("hosts", false, c.clearRemovedHostPass(ctx, r.pk, stamp(r)))
+		count("hosts", false, c.clearOldColumn(ctx, "host_fence_credentials", r.pk, stamp(r)))
 	}
 	return rep, firstErr
 }
@@ -505,8 +534,17 @@ func (c *Client) clearTokenCredential(ctx context.Context, tokenID, hash, credTS
 	})
 }
 
-// clearRemovedHostPass clears a removed host's BMC password alone, stamped with
-// the updatedAt its caller computed (clearTS).
-func (c *Client) clearRemovedHostPass(ctx context.Context, host, updatedAt string) error {
-	return c.Execute(ctx, hostsClearIPMIPassSQL, "", updatedAt, host)
+// clearOldColumn clears the old secret column that credTable replaces, alone,
+// with no credential row beside it: a removed host's, or one whose credential
+// row is retired. updatedAt is the caller's clearTS.
+func (c *Client) clearOldColumn(ctx context.Context, credTable, key, updatedAt string) error {
+	switch credTable {
+	case "host_fence_credentials":
+		return c.Execute(ctx, hostsClearIPMIPassSQL, "", updatedAt, key)
+	case "user_credentials":
+		return c.Execute(ctx, usersClearPasswordHashSQL, "", updatedAt, key)
+	case "token_credentials":
+		return c.Execute(ctx, tokensClearTokenHashSQL, "", updatedAt, key)
+	}
+	return fmt.Errorf("no old secret column for %s", credTable)
 }

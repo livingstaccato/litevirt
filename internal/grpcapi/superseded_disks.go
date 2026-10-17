@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/notify"
 )
@@ -26,6 +27,11 @@ const SupersededNamedOnlySec = 9_000_000_000
 
 // keptHeld is a .kept- file's held reason in a SupersededDisks answer.
 const keptHeld = "a disk a deleted VM was kept with; only an operator removes it, by hand"
+
+// supersededVarsHeld is a set-aside UEFI vars file's held reason in a
+// SupersededDisks answer.
+const supersededVarsHeld = "the UEFI vars of a deleted VM's superseded definition; only an operator removes it, by hand " +
+	"(rename it back to its path to use it again)"
 
 // SetSupersededDiskRetentionDays records superseded_disk_retention_days, which
 // a SupersededDisks answer reports (the sweep itself runs in the daemon).
@@ -141,6 +147,26 @@ func (s *Server) SupersededDisks(ctx context.Context, req *pb.SupersededDisksReq
 			Path: k.Path, DiskPath: k.DiskPath, SetAsideAt: k.MovedAt.UTC().Format(time.RFC3339), SizeBytes: k.SizeBytes,
 			Held: keptHeld, Kept: true,
 		})
+	}
+	// The UEFI vars of deleted VMs' superseded definitions this host
+	// undefined (health.ReapSupersededStoppedLeftover): listed only, like a
+	// kept disk, with the VM they were by name.
+	vars, err := health.ListSupersededVars(s.dataDir)
+	if err != nil {
+		if !req.Purge && !named {
+			return nil, status.Errorf(codes.Internal, "list set-aside UEFI vars: %v", err)
+		}
+		slog.Warn("superseded disks: the set-aside UEFI vars could not be listed; the answer has none", "error", err)
+	}
+	for _, v := range vars {
+		d := &pb.SupersededDisk{
+			Path: v.Path, DiskPath: v.VarsPath, SetAsideAt: v.SetAsideAt.UTC().Format(time.RFC3339), SizeBytes: v.SizeBytes,
+			VmName: v.VM, Held: supersededVarsHeld, Kept: true, UefiVars: true,
+		}
+		if vm, err := corrosion.GetVM(ctx, s.db, v.VM); err == nil && vm != nil {
+			d.VmState = vm.State
+		}
+		resp.Disks = append(resp.Disks, d)
 	}
 	return resp, nil
 }

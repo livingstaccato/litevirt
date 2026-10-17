@@ -141,6 +141,8 @@ func printSupersededDisks(out io.Writer, resp *pb.SupersededDisksResponse, purge
 		}
 		st := "kept"
 		switch {
+		case d.Kept && d.UefiVars:
+			st = "kept: the UEFI vars of a deleted VM's superseded definition this host undefined; never purged, removed or restored here (only an operator removes it, by hand)"
 		case d.Kept:
 			st = "kept: a disk a deleted VM was kept with; never purged, removed or restored here (only an operator removes it, by hand)"
 		case d.Removed:

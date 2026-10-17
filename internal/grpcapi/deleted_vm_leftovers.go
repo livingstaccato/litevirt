@@ -51,6 +51,9 @@ type deletedVMLeftovers struct {
 	hosts []string
 	// detached maps a host to the detached disk files the VM left on it.
 	detached map[string][]string
+	// left are the hosts in hosts this replica records the VM on (vmLeftHosts):
+	// the only ones a delete waits for, and names as pending.
+	left map[string]bool
 }
 
 // deletedVMCleanupAttempts / deletedVMCleanupBackoff bound the retry while a
@@ -159,7 +162,42 @@ func (s *Server) planDeletedVMLeftovers(ctx context.Context, vm *corrosion.VMRec
 		}
 	}
 	sort.Strings(plan.hosts)
+	plan.left = s.vmLeftHosts(ctx, vm, plan)
 	return plan
+}
+
+// vmLeftHosts picks, from the hosts a delete asks, those this replica records
+// the VM on: a host it left a detached disk on, a host with an open
+// vm_disk_stranded record of it (a failover's old host), and a host that
+// recorded an event of this incarnation (a create, start, migration or
+// failover there). A read that fails adds nothing: that host is still asked,
+// only not waited for.
+func (s *Server) vmLeftHosts(ctx context.Context, vm *corrosion.VMRecord, plan deletedVMLeftovers) map[string]bool {
+	asked := map[string]bool{}
+	for _, h := range plan.hosts {
+		asked[h] = true
+	}
+	left := map[string]bool{}
+	add := func(h string) {
+		if asked[h] {
+			left[h] = true
+		}
+	}
+	for h := range plan.detached {
+		add(h)
+	}
+	if stranded, err := health.StrandedDisksOf(ctx, s.db, vm.Name); err == nil {
+		for _, ev := range stranded {
+			add(ev.Host)
+		}
+	}
+	if rows, err := s.db.Query(ctx, `SELECT DISTINCT host_name FROM vm_events WHERE vm_name = ? AND ts >= ?`,
+		vm.Name, vm.CreatedAt); err == nil {
+		for _, r := range rows {
+			add(r.String("host_name"))
+		}
+	}
+	return left
 }
 
 // LeftoverDomainMD is the DeleteVM response header naming, one JSON
@@ -177,21 +215,22 @@ type LeftoverDomain struct {
 	Detail  string `json:"detail"`
 }
 
-// deletedVMCleanupReportWait is how long a delete waits for the hosts it asks
-// before it returns; a host still being asked then is named as pending. A
-// variable so a test can shorten it.
+// deletedVMCleanupReportWait bounds how long a delete waits, holding no lock,
+// for the hosts the VM left (plan.left) to answer; one still being asked then
+// is named as pending. A variable so a test can shorten it.
 var deletedVMCleanupReportWait = 5 * time.Second
 
 // cleanupDeletedVMLeftovers asks each host in the plan, all at once, to
-// remove the VM's leftovers, and returns what the delete's caller is told:
-// the hosts that declined because a domain of the name is defined there, and
-// the hosts that had not answered within deletedVMCleanupReportWait (they are
-// still asked after it returns). It runs after the tombstone, on a context
-// detached from the caller's (a peer call, so the receiving host authorises
-// it as the system), and never fails the delete: the VM is gone, and a host
-// that is unreachable or declines keeps its files, which is the safe
-// direction.
-func (s *Server) cleanupDeletedVMLeftovers(ctx context.Context, plan deletedVMLeftovers) []LeftoverDomain {
+// remove the VM's leftovers. With wait, it waits up to
+// deletedVMCleanupReportWait for the hosts the VM left, holding no lock, and
+// returns what the delete's caller is told: each host that declined within the
+// wait because a domain of the name is defined there, and each host the VM
+// left that had not answered (it is still asked after the delete returns).
+// Without wait it returns at once. A peer call runs on a context detached
+// from the caller's (the receiving host authorises it as the system), and
+// never fails the delete: the VM is gone, and a host that is unreachable or
+// declines keeps its files, which is the safe direction.
+func (s *Server) cleanupDeletedVMLeftovers(ctx context.Context, plan deletedVMLeftovers, wait bool) []LeftoverDomain {
 	type result struct {
 		host     string
 		declined string
@@ -202,29 +241,72 @@ func (s *Server) cleanupDeletedVMLeftovers(ctx context.Context, plan deletedVMLe
 			results <- result{host, s.cleanupDeletedVMLeftoversOn(ctx, host, plan.vm, plan.detached[host])}
 		}(host)
 	}
-	wait := time.NewTimer(deletedVMCleanupReportWait)
-	defer wait.Stop()
+	waitFor := 0
+	for _, host := range plan.hosts {
+		if plan.left[host] {
+			waitFor++
+		}
+	}
+	if !wait || waitFor == 0 {
+		return nil
+	}
+	timer := time.NewTimer(deletedVMCleanupReportWait)
+	defer timer.Stop()
 	answered := map[string]bool{}
 	var out []LeftoverDomain
 collect:
-	for len(answered) < len(plan.hosts) {
+	for waitFor > 0 {
 		select {
 		case r := <-results:
 			answered[r.host] = true
+			if plan.left[r.host] {
+				waitFor--
+			}
 			if r.declined != "" {
 				out = append(out, LeftoverDomain{Host: r.host, Detail: r.declined})
 			}
-		case <-wait.C:
+		case <-timer.C:
 			break collect
 		}
 	}
 	for _, host := range plan.hosts {
-		if !answered[host] {
+		if plan.left[host] && !answered[host] {
 			out = append(out, LeftoverDomain{Host: host, Pending: true,
 				Detail: "it has not answered yet; the delete keeps asking it to remove the VM's leftovers"})
 		}
 	}
 	return out
+}
+
+// leftoverSink carries a delete's plan out of deleteVM, which holds the
+// VM's lock and start lease, to DeleteVM, which waits for the hosts once
+// both are released (deferLeftoverCleanup).
+type leftoverSink struct{ plan *deletedVMLeftovers }
+
+type leftoverSinkKey struct{}
+
+// deleteVMMethod is DeleteVM's full gRPC method name.
+const deleteVMMethod = "/litevirt.v1.LiteVirt/DeleteVM"
+
+// withLeftoverSink gives a DeleteVM served for a gRPC caller of DeleteVM
+// itself a sink; an in-process caller (a stack teardown, a rolling recreate)
+// gets none, so its deletes do not wait.
+func withLeftoverSink(ctx context.Context) (context.Context, *leftoverSink) {
+	if m, ok := grpc.Method(ctx); !ok || m != deleteVMMethod {
+		return ctx, nil
+	}
+	sink := &leftoverSink{}
+	return context.WithValue(ctx, leftoverSinkKey{}, sink), sink
+}
+
+// deferLeftoverCleanup hands the plan to DeleteVM's sink when there is one,
+// and otherwise asks the hosts in the background, waiting for none.
+func (s *Server) deferLeftoverCleanup(ctx context.Context, plan deletedVMLeftovers) {
+	if sink, ok := ctx.Value(leftoverSinkKey{}).(*leftoverSink); ok && sink != nil {
+		sink.plan = &plan
+		return
+	}
+	go s.cleanupDeletedVMLeftovers(context.WithoutCancel(ctx), plan, false)
 }
 
 // setLeftoverDomainHeader names each of leftovers in the delete's response.

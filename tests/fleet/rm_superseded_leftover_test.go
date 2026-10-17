@@ -20,7 +20,7 @@ import (
 // epoch, and `lv rm rv` ran while home was away. When home is back, its
 // reconciler undefines the shut-off domain: the deleted record moved past
 // that copy before the delete. Disks stay (at their path after --keep-disks,
-// set aside for the retention otherwise), the UEFI vars stay, the
+// set aside for the retention otherwise), the UEFI vars are set aside whole, the
 // owner-epoch marker goes, and no vm_orphan_runtime stays open.
 //
 // Red on b4ef9fe9: the domain stays defined, the marker stays, and
@@ -83,8 +83,16 @@ func TestFleet_RmWhileTheOldHostIsAwayUndefinesItsSupersededDomain(t *testing.T)
 			if len(undefines) != 1 || undefines[0].Note != "keep_state=true" {
 				t.Fatalf("undefines = %+v, want one keeping the UEFI vars and TPM state", undefines)
 			}
-			if b, err := os.ReadFile(vars); err != nil || string(b) != "rv's UEFI vars" {
-				t.Fatalf("rv's UEFI vars: %q, %v", b, err)
+			// The vars are kept, set aside off the name-keyed path.
+			if present(vars) {
+				t.Fatalf("rv's UEFI vars are still at %s, where a create of the name is refused for them", vars)
+			}
+			set, _ := filepath.Glob(vars + ".superseded-*")
+			if len(set) != 1 {
+				t.Fatalf("rv's UEFI vars set aside as %v, want one file", set)
+			}
+			if b, err := os.ReadFile(set[0]); err != nil || string(b) != "rv's UEFI vars" {
+				t.Fatalf("rv's set-aside UEFI vars: %q, %v", b, err)
 			}
 			if present(marker) {
 				t.Fatal("rv's owner-epoch marker is still on home")

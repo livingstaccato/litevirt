@@ -1,10 +1,14 @@
 package grpcapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +19,8 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -98,39 +104,55 @@ func TestCleanupMigrationArtifacts_VMDeletedUndefinesASupersededStoppedDomain(t 
 	})
 }
 
-// A host that declines because a domain of the name is defined there, and a
-// host that has not answered when the delete returns, are named in the
-// delete's response (LeftoverDomainMD), which `lv rm` prints. A host that
-// removed its leftovers is not.
-//
-// Red on b4ef9fe9: the header is never set (the request runs after the
-// delete returns, and its refusal is a WARN on the owner only).
-func TestDeleteVM_NamesTheHostsThatKeepADefinition(t *testing.T) {
-	defer func(w time.Duration) { deletedVMCleanupReportWait = w }(deletedVMCleanupReportWait)
-	deletedVMCleanupReportWait = 300 * time.Millisecond
+// deleteFixture: os1 runs on this host; node-3, node-4 and node-5 recorded
+// events of it (the VM was there), node-6 never did. node-3 declines (a
+// domain is defined there), node-4 and node-6 answer only once released,
+// node-5 removes its leftovers.
+func deleteFixture(t *testing.T, wait time.Duration) (*Server, chan struct{}, chan string) {
+	t.Helper()
+	old := deletedVMCleanupReportWait
+	t.Cleanup(func() { deletedVMCleanupReportWait = old })
+	deletedVMCleanupReportWait = wait
 	s, fake := provableCreateServer(t)
 	ctx := adminCtx()
-	for _, h := range []corrosion.HostRecord{
-		{Name: "node-3", Address: "10.0.0.3", State: "active"},
-		{Name: "node-4", Address: "10.0.0.4", State: "active"},
-		{Name: "node-5", Address: "10.0.0.5", State: "active"},
-	} {
-		if err := corrosion.InsertHost(ctx, s.db, h); err != nil {
+	for _, h := range []string{"node-3", "node-4", "node-5", "node-6"} {
+		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: h, Address: "10.0.0.9", State: "active"}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	release := make(chan struct{})
-	defer close(release)
+	t.Cleanup(func() { close(release) })
+	locks := make(chan string, 8)
 	s.peerClientOverride = func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
-		return declaringPeer{host: host, release: release}, func() {}, nil
+		return declaringPeer{s: s, host: host, release: release, locks: locks}, func() {}, nil
 	}
 	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "os1", HostName: s.hostName, State: "stopped"}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
+	for _, h := range []string{"node-3", "node-4", "node-5"} {
+		if err := corrosion.InsertVMEvent(ctx, s.db, corrosion.VMEventRecord{VMName: "os1", HostName: h, Type: "vm.started", Result: "ok"}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	fake.SetState("os1", libvirtfake.StateShutdown)
+	return s, release, locks
+}
 
+// A host the VM was on that declines because a domain of the name is defined
+// there, and one that has not answered when the wait ends, are named in the
+// delete's response (LeftoverDomainMD), which `lv rm` prints. A host that
+// removed its leftovers is not, and neither is a host the VM never was on,
+// slow as it may be: it is asked, not waited for. The wait holds neither the
+// VM's lock nor its start lease.
+//
+// Red on b4ef9fe9: the header is never set. Red on a021a6d3: node-6 is named
+// pending, and the lock and lease are held during the wait.
+// Mutations: wait inside deleteVM (before its deferred releases) — the lock
+// and lease are held; wait for every asked host — node-6 is pending.
+func TestDeleteVM_NamesTheHostsThatKeepADefinition(t *testing.T) {
+	s, _, locks := deleteFixture(t, 300*time.Millisecond)
 	hs := &headerStream{}
-	if _, err := s.DeleteVM(grpc.NewContextWithServerTransportStream(ctx, hs), &pb.DeleteVMRequest{Name: "os1"}); err != nil {
+	if _, err := s.DeleteVM(grpc.NewContextWithServerTransportStream(adminCtx(), hs), &pb.DeleteVMRequest{Name: "os1"}); err != nil {
 		t.Fatalf("DeleteVM: %v", err)
 	}
 	type leftover struct {
@@ -150,19 +172,48 @@ func TestDeleteVM_NamesTheHostsThatKeepADefinition(t *testing.T) {
 		t.Errorf("node-3 (declined) = %+v, %v", l, ok)
 	}
 	if l, ok := got["node-4"]; !ok || !l.Pending {
-		t.Errorf("node-4 (not answered) = %+v, %v", l, ok)
+		t.Errorf("node-4 (the VM was there, not answered) = %+v, %v", l, ok)
 	}
-	if l, ok := got["node-5"]; ok {
-		t.Errorf("node-5 removed its leftovers, yet is named: %+v", l)
+	for _, h := range []string{"node-5", "node-6"} {
+		if l, ok := got[h]; ok {
+			t.Errorf("%s is named: %+v", h, l)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case l := <-locks:
+			if l != "" {
+				t.Error(l)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the blocking hosts were never asked")
+		}
 	}
 }
 
-// declaringPeer: node-3 declines (a domain is defined there), node-4 answers
-// only once released, node-5 removes its leftovers.
+// A delete made in-process (a stack teardown deletes its members one by one)
+// waits for no host: a slow host the VM was on costs it nothing.
+//
+// Red on a021a6d3: every member delete waits deletedVMCleanupReportWait.
+func TestDeleteVM_InProcessDeleteWaitsForNoHost(t *testing.T) {
+	s, _, _ := deleteFixture(t, 2*time.Second)
+	start := time.Now()
+	if _, err := s.DeleteVM(adminCtx(), &pb.DeleteVMRequest{Name: "os1"}); err != nil {
+		t.Fatalf("DeleteVM: %v", err)
+	}
+	if d := time.Since(start); d >= time.Second {
+		t.Fatalf("an in-process delete took %s: it waited for a host", d)
+	}
+}
+
+var probeMu sync.Mutex
+
 type declaringPeer struct {
 	pb.LiteVirtClient
+	s       *Server
 	host    string
 	release chan struct{}
+	locks   chan string
 }
 
 func (p declaringPeer) CleanupMigrationArtifacts(ctx context.Context, r *pb.CleanupMigrationArtifactsRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
@@ -170,7 +221,26 @@ func (p declaringPeer) CleanupMigrationArtifacts(ctx context.Context, r *pb.Clea
 	case "node-3":
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"a domain named %q is defined on node-3; nothing of it is removed: (running, running) the domain is not shut off", r.VmName)
-	case "node-4":
+	case "node-4", "node-6":
+		// Asked while the delete waits: its lock and start lease are free.
+		// One probe at a time, so two hosts' probes do not see each other's.
+		probeMu.Lock()
+		why := ""
+		if unlock, ok := p.s.tryLockVM(r.VmName); !ok {
+			why = p.host + " was asked while the VM's lock was held"
+		} else {
+			unlock()
+			if held, err := health.TryVMStartLease(context.Background(), p.s.db, "probe-"+p.host, r.VmName, time.Now()); err != nil || held != "probe-"+p.host {
+				why = fmt.Sprintf("%s was asked while the start lease was held by %q (%v)", p.host, held, err)
+			} else {
+				health.ReleaseVMStartLease(context.Background(), p.s.db, held, r.VmName)
+			}
+		}
+		probeMu.Unlock()
+		select {
+		case p.locks <- why:
+		default:
+		}
 		select {
 		case <-p.release:
 		case <-ctx.Done():
@@ -178,4 +248,130 @@ func (p declaringPeer) CleanupMigrationArtifacts(ctx context.Context, r *pb.Clea
 		return &emptypb.Empty{}, nil
 	}
 	return &emptypb.Empty{}, nil
+}
+
+// reapedSBHost: this host holds a stopped Secure Boot definition of os1 at
+// owner epoch 3, its UEFI vars at the name-keyed path, while the record was
+// tombstoned on owner-host at epoch 4; the deleting host's leftover request
+// has undefined it.
+func reapedSBHost(t *testing.T) (*Server, *libvirtfake.Fake, string, []byte) {
+	t.Helper()
+	s, fake := provableCreateServer(t)
+	s.firmware = lv.FirmwarePaths{Code: "/c", Vars: "/v", SecbootCode: "/sc", MsVars: "/mv"}
+	old := health.LibvirtNvramDir
+	health.LibvirtNvramDir = t.TempDir()
+	t.Cleanup(func() { health.LibvirtNvramDir = old })
+	ctx := adminCtx()
+	if err := corrosion.SetHostLabels(ctx, s.db, s.hostName, map[string]string{corrosion.LabelSecureBootCapable: "true"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	_ = peerCtxFor(t, s, "owner-host")
+	s.db.MarkReplicaCaughtUpForTests("owner-host")
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "os1", HostName: "owner-host", State: "running"}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecuteRows(ctx, `UPDATE vms SET vm_owner_epoch = 4 WHERE name = 'os1'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.DeleteVM(ctx, s.db, "os1"); err != nil {
+		t.Fatal(err)
+	}
+	vars := lv.NvramPath(s.dataDir, "os1")
+	oldVars := []byte("os1's own Secure Boot vars")
+	if err := os.MkdirAll(filepath.Dir(vars), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(vars, oldVars, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetState("os1", libvirtfake.StateShutdown)
+	fake.SetInactiveXML("os1", `<domain type="kvm"><name>os1</name><uuid>11111111-2222-4333-8444-555555555555</uuid>`+
+		`<os><nvram>`+vars+`</nvram></os></domain>`)
+	if err := fake.SetDomainOwnerEpoch("os1", 3, false); err != nil {
+		t.Fatal(err)
+	}
+	return s, fake, vars, oldVars
+}
+
+func cleanupDeleted(s *Server, name string) error {
+	_, err := s.CleanupMigrationArtifacts(systemPeerCtx("owner-host"), &pb.CleanupMigrationArtifactsRequest{VmName: name, VmDeleted: true})
+	return err
+}
+
+// After the reap, a Secure Boot VM of the same name can be created on this
+// host, and the deleted VM's UEFI vars are kept under a .superseded- name,
+// which `lv host superseded-disks` lists with the VM's name.
+//
+// Red on a021a6d3: the vars stay at the name-keyed path, and the create is
+// refused ("UEFI vars already exist").
+// Mutation: drop the vars set-aside — the create is refused and no
+// .superseded- file exists.
+func TestReapedSupersededDomain_SecureBootCreateOfTheNameSucceeds(t *testing.T) {
+	s, fake, vars, oldVars := reapedSBHost(t)
+	if err := cleanupDeleted(s, "os1"); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if fake.DomainExists("os1") {
+		t.Fatal("the superseded domain is still defined")
+	}
+	set, _ := filepath.Glob(vars + ".superseded-*")
+	if len(set) != 1 {
+		t.Fatalf("set-aside vars = %v, want one", set)
+	}
+	if b, err := os.ReadFile(set[0]); err != nil || !bytes.Equal(b, oldVars) {
+		t.Fatalf("set-aside vars hold %q (%v), want the deleted VM's", b, err)
+	}
+
+	resp, err := s.SupersededDisks(adminCtx(), &pb.SupersededDisksRequest{})
+	if err != nil {
+		t.Fatalf("SupersededDisks: %v", err)
+	}
+	listed := false
+	for _, d := range resp.Disks {
+		if d.Path == set[0] {
+			listed = d.UefiVars && d.Kept && d.VmName == "os1" && d.DiskPath == vars && d.Held != ""
+			if !listed {
+				t.Fatalf("listed as %+v", d)
+			}
+		}
+	}
+	if !listed {
+		t.Fatalf("superseded-disks does not list %s: %+v", set[0], resp.Disks)
+	}
+
+	req := disklessCreateRequest("os1")
+	req.Spec.Machine, req.Spec.Firmware, req.Spec.SecureBoot = "q35", "uefi", true
+	if _, err := s.CreateVM(adminCtx(), req); err != nil {
+		t.Fatalf("a Secure Boot create of the name after the reap: %v", err)
+	}
+	if b, err := os.ReadFile(set[0]); err != nil || !bytes.Equal(b, oldVars) {
+		t.Fatalf("after the create, the set-aside vars hold %q (%v)", b, err)
+	}
+}
+
+// A domain that starts between the rule's check and the undefine survives the
+// undefine as a transient, running domain: the request declines, and the
+// marker and the UEFI vars stay.
+//
+// Mutation: drop the post-undefine DomainExists check — the request succeeds
+// and the marker and vars go.
+func TestCleanupMigrationArtifacts_VMDeletedDomainStartedAtTheUndefine(t *testing.T) {
+	s, fake, vars, _ := reapedSBHost(t)
+	if err := health.WriteVMOwnerEpochMarker(s.dataDir, "os1", 3); err != nil {
+		t.Fatal(err)
+	}
+	fake.FailUndefinePreserv = func(name string) error {
+		fake.SetState(name, libvirtfake.StateRunning)
+		return nil
+	}
+	err := cleanupDeleted(s, "os1")
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "running at its undefine") {
+		t.Fatalf("cleanup = %v, want FailedPrecondition naming the start", err)
+	}
+	if !fake.DomainExists("os1") {
+		t.Fatal("the started domain is gone")
+	}
+	if !fileExists(filepath.Join(s.dataDir, "vms", "os1", "owner_epoch")) || !fileExists(vars) {
+		t.Fatal("the marker or the vars of a running domain were moved")
+	}
 }

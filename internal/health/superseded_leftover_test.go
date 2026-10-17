@@ -27,6 +27,7 @@ type leftoverFixture struct {
 	dataDir string
 	disk    string
 	marker  string
+	vars    []string // UEFI vars files the domain has
 }
 
 type supersededCase struct {
@@ -107,6 +108,23 @@ func newLeftoverFixture(t *testing.T, c supersededCase) *leftoverFixture {
 		}
 	}
 
+	// UEFI vars: the definition's own (libvirt's directory, a plain UEFI
+	// VM's) and the name-keyed one a Secure Boot or vTPM VM uses.
+	old := LibvirtNvramDir
+	LibvirtNvramDir = t.TempDir()
+	t.Cleanup(func() { LibvirtNvramDir = old })
+	f.vars = []string{filepath.Join(LibvirtNvramDir, "pakg_VARS.fd"), filepath.Join(f.dataDir, "nvram", "pakg_VARS.fd")}
+	for _, v := range f.vars {
+		if err := os.MkdirAll(filepath.Dir(v), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(v, []byte("vars of "+v), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.fake.SetInactiveXML("pakg", `<domain type="kvm"><name>pakg</name><uuid>11111111-2222-4333-8444-555555555555</uuid>`+
+		`<os><nvram>`+f.vars[0]+`</nvram></os></domain>`)
+
 	f.r = NewReconciler("node-4", f.dataDir, f.db, f.fake)
 	if c.staleReplica {
 		f.r.SetReplicaFreshness(func() (bool, string) { return false, "process restarted (test)" })
@@ -178,6 +196,30 @@ func TestReconciler_UndefinesADeletedVMsSupersededStoppedDomain(t *testing.T) {
 			if f.orphanOpen(t) {
 				t.Fatal("vm_orphan_runtime is open for an undefined domain")
 			}
+			// Each vars file is set aside whole, and listed with the VM's name.
+			listed, err := ListSupersededVars(f.dataDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, v := range f.vars {
+				if supersededPresent(v) {
+					t.Errorf("%s is still at its path", v)
+				}
+				set, _ := filepath.Glob(v + ".superseded-*")
+				if len(set) != 1 {
+					t.Fatalf("%s set aside as %v, want one file", v, set)
+				}
+				if b, err := os.ReadFile(set[0]); err != nil || string(b) != "vars of "+v {
+					t.Errorf("%s holds %q (%v)", set[0], b, err)
+				}
+				found := false
+				for _, l := range listed {
+					found = found || (l.Path == set[0] && l.VarsPath == v && l.VM == "pakg")
+				}
+				if !found {
+					t.Errorf("%s not listed: %+v", set[0], listed)
+				}
+			}
 			evs, err := corrosion.ListVMEvents(ctx, f.db, "pakg", 10, "")
 			if err != nil {
 				t.Fatal(err)
@@ -241,9 +283,86 @@ func TestReconciler_KeepsEveryDomainNotProvablySuperseded(t *testing.T) {
 			if supersededPresent(f.marker) != markerBefore {
 				t.Fatal("the owner-epoch marker was removed")
 			}
+			for _, v := range f.vars {
+				if !supersededPresent(v) {
+					t.Errorf("%s was moved", v)
+				}
+			}
 			if got := f.orphanOpen(t); got != tc.reported {
 				t.Fatalf("vm_orphan_runtime open = %v, want %v", got, tc.reported)
 			}
 		})
+	}
+}
+
+// A domain that starts between the rule's check and the undefine survives the
+// undefine as a transient, running one: it is left to the orphan report, with
+// its marker and UEFI vars, and no event says it was undefined.
+//
+// Mutation: drop the post-undefine DomainExists check — the marker and the
+// vars go and the event is written.
+func TestReconciler_DomainStartedAtTheUndefineIsLeftAlone(t *testing.T) {
+	f := newLeftoverFixture(t, lab2Case())
+	f.fake.FailUndefinePreserv = func(name string) error {
+		f.fake.SetState(name, libvirtfake.StateRunning)
+		return nil
+	}
+	ctx := context.Background()
+	f.r.ReconcileOnce(ctx)
+	f.r.ReconcileOnce(ctx)
+	if !f.fake.DomainExists("pakg") {
+		t.Fatal("the started domain is gone")
+	}
+	if !supersededPresent(f.marker) {
+		t.Fatal("the marker of a running domain was removed")
+	}
+	for _, v := range f.vars {
+		if !supersededPresent(v) {
+			t.Errorf("%s of a running domain was moved", v)
+		}
+	}
+	evs, err := corrosion.ListVMEvents(ctx, f.db, "pakg", 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range evs {
+		if e.Type == "vm.leftover.undefined" {
+			t.Fatalf("an undefine was recorded for a domain that kept running: %+v", e)
+		}
+	}
+}
+
+// A create of the name on this host replaces the definition between the
+// rule's check and the undefine: the new definition (no owner epoch, another
+// uuid) is never undefined.
+//
+// Mutation: drop the identity re-check before the undefine — the new
+// definition is undefined.
+func TestReconciler_ADefinitionReplacedMeanwhileIsNotUndefined(t *testing.T) {
+	f := newLeftoverFixture(t, lab2Case())
+	ctx := context.Background()
+	f.r.ReconcileOnce(ctx) // the first sighting
+	replaced := false
+	f.fake.FailHasManagedSaveImage = func(name string) error {
+		if !replaced {
+			replaced = true
+			// What a create does: undefine the stopped leftover, define its own.
+			if err := f.fake.UndefineDomain(name, true); err != nil {
+				t.Error(err)
+			}
+			f.fake.SetState(name, libvirtfake.StateShutdown)
+			f.fake.SetInactiveXML(name, `<domain type="kvm"><name>pakg</name><uuid>99999999-2222-4333-8444-555555555555</uuid></domain>`)
+		}
+		return nil
+	}
+	f.r.ReconcileOnce(ctx)
+	if !replaced {
+		t.Fatal("the rule never reached the managed-save check")
+	}
+	if !f.fake.DomainExists("pakg") {
+		t.Fatal("the create's new definition was undefined")
+	}
+	if u := f.undefines(); len(u) != 1 || u[0].Note != "remove_storage=true" {
+		t.Fatalf("undefines = %+v, want only the create's", u)
 	}
 }

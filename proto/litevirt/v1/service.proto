@@ -218,6 +218,7 @@ message SupersededDisk {
     bool   removed      = 8;  // removed by this request
     string retained     = 9;  // why the sweep and a bare purge keep it (its VM exists); "" when not retained
     bool   kept         = 10; // a disk a deleted VM was kept with, moved off its path by a create (<path>.kept-<time>): listed only, never purged, removed or restored
+    bool   uefi_vars    = 13; // with kept: the UEFI vars of a deleted VM's superseded definition its host undefined (<vars>.superseded-<time>), not a disk
 }
 message SupersededDisksResponse {
     string                  host           = 1;

@@ -4,7 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -35,10 +42,18 @@ import (
 //
 // Undefine only: no destroy, no disk touched, and the UEFI vars and TPM state
 // kept (UndefineDomainPreservingState), since no replicated record says
-// whether the delete was `lv rm --keep-disks`. Then the owner-epoch marker
-// goes, once the domain is gone and the name still has no live row. A running
-// or paused domain, an equal or older row epoch, a managed-stamp-only domain
-// and anything unreadable stay report-only.
+// whether the delete was `lv rm --keep-disks`. The domain's identity (its
+// uuid and owner epoch) is read again right before the undefine, so a domain
+// a create of the name defined meanwhile is never the one undefined. Then,
+// once the domain is gone and the name still has no live row, the
+// owner-epoch marker goes, and each UEFI vars file the definition named, and
+// the name-keyed one (<data_dir>/nvram/<vm>_VARS.fd), is renamed to
+// <path>.superseded-<time>: its bytes stay, `lv host superseded-disks` lists
+// it (ListSupersededVars), and a create of the name is not refused for vars
+// already there. The TPM state is UUID-keyed, so a new VM never meets it, and
+// it is left where it is. A running or paused domain, an equal or older row
+// epoch, a managed-stamp-only domain and anything unreadable stay
+// report-only.
 
 // SupersededLeftoverVirt is the libvirt surface the rule needs.
 type SupersededLeftoverVirt interface {
@@ -46,6 +61,7 @@ type SupersededLeftoverVirt interface {
 	DomainStateReason(name string) (lv.DomainStatus, error)
 	HasManagedSaveImage(name string) (bool, error)
 	GetDomainOwnerEpoch(name string) (int64, bool, error)
+	DumpXMLInactive(name string) (string, error)
 	UndefineDomainPreservingState(name string) error
 }
 
@@ -55,7 +71,9 @@ type SupersededLeftover struct {
 	RowHost       string
 	RowOwnerEpoch int64
 	MarkerEpoch   int64
-	Reason        string // the shut-off reason
+	Reason        string   // the shut-off reason
+	UUID          string   // the definition's uuid, "" when it names none
+	Vars          []string // the UEFI vars files to set aside once it is gone
 }
 
 // supersededStoppedLeftover applies the rule to name. ok=false carries why.
@@ -94,6 +112,16 @@ func supersededStoppedLeftover(ctx context.Context, db *corrosion.Client, virt S
 	} else if has && fileEpoch >= trace.OwnerEpoch {
 		return lo, false, fmt.Sprintf("the owner-epoch marker %d is not older than the deleted record's %d", fileEpoch, trace.OwnerEpoch)
 	}
+	xml, err := virt.DumpXMLInactive(name)
+	if err != nil {
+		return lo, false, "the domain's definition cannot be read: " + err.Error()
+	}
+	lo.UUID = lv.UUIDFromXML(xml)
+	for _, p := range []string{lv.NvramPathFromXML(xml), lv.NvramPath(dataDir, name)} {
+		if p != "" && !slices.Contains(lo.Vars, filepath.Clean(p)) {
+			lo.Vars = append(lo.Vars, filepath.Clean(p))
+		}
+	}
 	st, err := virt.DomainStateReason(name)
 	if err != nil {
 		return lo, false, "the domain's state cannot be read: " + err.Error()
@@ -125,6 +153,15 @@ func ReapSupersededStoppedLeftover(ctx context.Context, db *corrosion.Client, vi
 	if !ok {
 		return false, why
 	}
+	// The same definition as the rule judged: a create of the name on this
+	// host undefines a stopped leftover and defines its own domain, which
+	// carries no owner epoch until it runs.
+	if epoch, marked, err := virt.GetDomainOwnerEpoch(name); err != nil || !marked || epoch != lo.MarkerEpoch {
+		return false, "the domain changed since it was judged (owner epoch)"
+	}
+	if xml, err := virt.DumpXMLInactive(name); err != nil || lv.UUIDFromXML(xml) != lo.UUID {
+		return false, "the domain changed since it was judged (uuid)"
+	}
 	if err := virt.UndefineDomainPreservingState(name); err != nil {
 		if !virt.DomainExists(name) {
 			return false, "the domain is already gone"
@@ -146,12 +183,13 @@ func ReapSupersededStoppedLeftover(ctx context.Context, db *corrosion.Client, vi
 	} else if err := RemoveVMOwnerEpochMarker(dataDir, name); err != nil {
 		marker = "not removed: " + err.Error()
 	}
+	vars := setAsideSupersededVars(lo.Vars, time.Now())
 	detail := fmt.Sprintf("%s undefined its shut-off definition of deleted VM %s: the deleted record names %s at owner epoch %d, "+
-		"newer than this copy's %d; disks, UEFI vars and TPM state kept; owner-epoch marker %s",
-		self, name, lo.RowHost, lo.RowOwnerEpoch, lo.MarkerEpoch, marker)
+		"newer than this copy's %d; disks and TPM state kept; UEFI vars %s; owner-epoch marker %s",
+		self, name, lo.RowHost, lo.RowOwnerEpoch, lo.MarkerEpoch, vars, marker)
 	slog.Warn(by+": undefined a deleted VM's superseded shut-off domain",
 		"vm", name, "host", self, "row_host", lo.RowHost, "row_owner_epoch", lo.RowOwnerEpoch,
-		"marker_epoch", lo.MarkerEpoch, "reason", lo.Reason, "owner_epoch_marker", marker)
+		"marker_epoch", lo.MarkerEpoch, "reason", lo.Reason, "owner_epoch_marker", marker, "uefi_vars", vars)
 	if err := corrosion.InsertVMEvent(ctx, db, corrosion.VMEventRecord{
 		VMName: name, HostName: self, Type: "vm.leftover.undefined", Result: "ok", Severity: "info",
 		Detail: detail, Username: by,
@@ -159,4 +197,78 @@ func ReapSupersededStoppedLeftover(ctx context.Context, db *corrosion.Client, vi
 		slog.Warn(by+": record the undefine's event", "vm", name, "error", err)
 	}
 	return true, ""
+}
+
+// setAsideSupersededVars renames each of paths that is a regular file to
+// <path>.superseded-<at>, and says what became of them, for the event.
+func setAsideSupersededVars(paths []string, at time.Time) string {
+	var done []string
+	for _, p := range paths {
+		fi, err := os.Lstat(p)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil || !fi.Mode().IsRegular() {
+			done = append(done, fmt.Sprintf("%s left in place (not a readable regular file: %v)", p, err))
+			continue
+		}
+		to := supersededName(p, at)
+		if err := os.Rename(p, to); err != nil {
+			slog.Warn("could not set aside a deleted VM's superseded UEFI vars; left in place", "path", p, "error", err)
+			done = append(done, fmt.Sprintf("%s left in place (%v)", p, err))
+			continue
+		}
+		done = append(done, p+" set aside as "+to)
+	}
+	if len(done) == 0 {
+		return "none"
+	}
+	return strings.Join(done, ", ")
+}
+
+// LibvirtNvramDir is libvirt's own UEFI vars directory, where a plain UEFI
+// domain's vars live (a Secure Boot or vTPM one's are under
+// <data_dir>/nvram). A variable so a test can point it elsewhere.
+var LibvirtNvramDir = "/var/lib/libvirt/qemu/nvram"
+
+// SupersededVars is a UEFI vars file a superseded leftover's undefine set
+// aside (<dir>/<vm>_VARS.fd.superseded-<time>). Nothing on the host removes
+// it.
+type SupersededVars struct {
+	Path       string    // the file
+	VarsPath   string    // the path it was moved from
+	VM         string    // the VM it was, by its file name
+	SetAsideAt time.Time // when
+	SizeBytes  int64
+}
+
+// ListSupersededVars lists the set-aside UEFI vars in <data_dir>/nvram and
+// LibvirtNvramDir, oldest first. A directory that does not exist has none.
+func ListSupersededVars(dataDir string) ([]SupersededVars, error) {
+	var out []SupersededVars
+	for _, dir := range []string{filepath.Join(dataDir, "nvram"), LibvirtNvramDir} {
+		matches, err := filepath.Glob(filepath.Join(dir, "*_VARS.fd"+supersededInfix+"*"))
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range matches {
+			varsPath, at, ok := parseSupersededName(p)
+			if !ok {
+				continue
+			}
+			fi, err := os.Lstat(p)
+			if err != nil || !fi.Mode().IsRegular() {
+				continue
+			}
+			out = append(out, SupersededVars{Path: p, VarsPath: varsPath, SetAsideAt: at, SizeBytes: fi.Size(),
+				VM: strings.TrimSuffix(filepath.Base(varsPath), "_VARS.fd")})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].SetAsideAt.Equal(out[j].SetAsideAt) {
+			return out[i].SetAsideAt.Before(out[j].SetAsideAt)
+		}
+		return out[i].Path < out[j].Path
+	})
+	return out, nil
 }

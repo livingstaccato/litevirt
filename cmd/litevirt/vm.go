@@ -351,12 +351,11 @@ func newRmCmd() *cobra.Command {
 						continue
 					}
 					if l.Pending {
-						fmt.Printf("Host %s has not confirmed it holds nothing of %s: %s\n", l.Host, args[0], l.Detail)
-					} else {
-						fmt.Printf("Host %s still holds a definition of %s: %s\n", l.Host, args[0], l.Detail)
+						fmt.Printf("Host %s, which %s was on, has not confirmed it removed its leftovers: %s\n", l.Host, args[0], l.Detail)
+						continue
 					}
-					fmt.Printf("  Its reconciler undefines a shut-off definition this delete superseded (disks and firmware state kept);\n" +
-						"  anything else is reported as vm_orphan_runtime: see docs/diagnostics.md, orphaned runtimes\n")
+					fmt.Printf("Host %s still holds a definition of %s: %s\n", l.Host, args[0], l.Detail)
+					fmt.Printf("  It is reported as vm_orphan_runtime: see docs/diagnostics.md, orphaned runtimes\n")
 				}
 				return nil
 			})

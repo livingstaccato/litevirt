@@ -2971,7 +2971,13 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			}
 		}
 	}
-	out, err := s.deleteVM(ctx, req)
+	sinkCtx, sink := withLeftoverSink(ctx)
+	out, err := s.deleteVM(sinkCtx, req)
+	if err == nil && sink != nil && sink.plan != nil {
+		// deleteVM has released the VM's lock and start lease: wait for the
+		// hosts the VM left here, bounded, holding neither.
+		setLeftoverDomainHeader(ctx, s.cleanupDeletedVMLeftovers(context.WithoutCancel(ctx), *sink.plan, true))
+	}
 	var noAnswer probeNoAnswer
 	if err != nil && deleteLocalOnly(ctx) && status.Code(err) != codes.NotFound && !errors.As(err, &noAnswer) {
 		// A probe that found the domain here and refused its delete: the
@@ -3652,7 +3658,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	go s.refreshLBForStack(context.Background(), vm.StackName)
 
 	if len(leftovers.hosts) > 0 {
-		setLeftoverDomainHeader(ctx, s.cleanupDeletedVMLeftovers(context.WithoutCancel(ctx), leftovers))
+		s.deferLeftoverCleanup(ctx, leftovers)
 	}
 
 	return &emptypb.Empty{}, nil

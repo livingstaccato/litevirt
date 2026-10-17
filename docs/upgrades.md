@@ -1426,6 +1426,39 @@ A FIPS-mode host (whose QEMU has no DES for VNC authentication) sets no VNC
 passwords, takes incoming live migrations without them, and reports
 `console_password_v1` in `not_enforcing`; it never fails a start over one.
 
+### Load balancer VRRP moves off the guest network after the roll
+
+On earlier releases, each load balancer host multicasts its keepalived VRRP
+adverts on the bridge its VIP is on, with a password derived from the LB's
+name, so any guest on that bridge can read the password and answer with a
+higher priority, which takes the VIP off its holder. This release sends them
+as unicast between the LB hosts' recorded addresses, over the host network
+([compose.md](compose.md#load-balancer)). A host on the old transport and a
+host on the new one do not hear each other and would both hold the VIP, so
+nothing switches until the `vrrp_unicast_v1` capability token has latched. It
+latches once every host the cluster replicates to, including one parked in
+`maintenance`, runs this release; a host with `enforcement.vrrp_unicast: false`
+withholds it, so it holds the switch off. The first host whose latch is durable
+records it cluster-wide, once `failover_scope_v1` has latched there too (the
+record lives in `cluster_policies`), and until then every host stays multicast.
+Every LB host then re-applies its LBs within 2 seconds of that record reaching
+it, whatever its own flag says: an LB is held by both its hosts for about the
+replication delay between them plus 2 seconds. A host that cannot render unicast
+(its recorded address is on no up, non-loopback local device) raises
+`lb.vrrp.transport_refused`, stops its keepalived for each LB another host serves
+on unicast, and runs on multicast each LB no other host serves.
+Hosts must pass IP protocol 112 between their recorded addresses.
+
+The stand-down is cluster-wide: `lv cluster vrrp-transport multicast` (admin),
+which every host renders within 2 seconds of receiving it, and
+`lv cluster vrrp-transport unicast` undoes it. It can be set before the latch
+too, to keep the old transport. A host on an earlier build that comes back
+after the latch renders multicast while its LB peers render unicast; they raise
+`lb.vrrp.transport_split` naming it. A binary rolled back below the latched
+token enters WAL quarantine, as below every latched token, and renders the
+multicast transport its peers have left: roll forward, or set
+`lv cluster vrrp-transport multicast` first.
+
 ### SPICE through the daemon
 
 `lv spice --launch` and `--listen` now carry the SPICE console through the

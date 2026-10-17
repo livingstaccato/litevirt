@@ -18,6 +18,11 @@ table inet litevirt-fw {
     chain host_overrides {
     }
 
+    chain guest_vrrp {
+        type filter hook input priority filter; policy accept;
+        meta mark & 0x40000000 == 0x40000000 meta l4proto 112 drop
+    }
+
     chain isolated_forward {
         type filter hook forward priority filter; policy accept;
         iifgroup 27766 oifgroup != 27766 drop
@@ -108,6 +113,7 @@ table bridge litevirt-nic {
     chain input {
         type filter hook input priority filter; policy accept;
         iifname != @lv_nic_devs accept
+        meta l4proto 112 meta mark set meta mark | 0x40000000
         ct state established,related accept
         meta protocol != { ip, ip6 } accept
         ip6 hoplimit 255 icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept

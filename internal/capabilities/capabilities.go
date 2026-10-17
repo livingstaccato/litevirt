@@ -799,6 +799,34 @@ const (
 	// by a migration once it returns, so the latch waits for it too.
 	ConsolePasswordV1 = "console_password_v1"
 
+	// VRRPUnicastV1 gates the load balancers' VRRP transport. Before it, each
+	// LB host multicasts its keepalived adverts on the bridge its VIP is on,
+	// with a PASS password derived from the LB's name: every guest on that
+	// segment reads the password and can answer with a higher priority,
+	// which takes the VIP off its holder. Once latched, each LB host sends
+	// them as unicast from its recorded address to the other LB hosts'
+	// recorded addresses, over the device holding its own, and accepts them
+	// only from those addresses (lb.Config.VRRPUnicast).
+	//
+	// A host on the old transport and a host on the new one do not hear each
+	// other, and both hold the VIP, so no host switches before the latch. The
+	// transport is then ONE cluster-wide value, never a host's own config: the
+	// first host whose latch is durable records it in cluster_policies, and
+	// every host renders unicast once that row reaches it, or once its own
+	// latch is durable; an operator's `lv cluster vrrp-transport` overrides
+	// both and is the stand-down (corrosion.GetVRRPTransport).
+	//
+	// Advertised CONDITIONALLY on enforcement.vrrp_unicast (DEFAULT ON) until
+	// it has latched: before the latch a host's peers rely on it rendering the
+	// same transport, so the latch must mean every host opted in. After it the
+	// flag decides nothing and the host advertises it: one that does not is an
+	// earlier build back in the cluster (grpcapi CondLBVRRPSplit).
+	//
+	// ReplicationGated: a host parked in maintenance on an older build may
+	// still run an LB, and is an LB peer once it returns, so the latch waits
+	// for it too.
+	VRRPUnicastV1 = "vrrp_unicast_v1"
+
 	// Release202611V1 is the RELEASE TOKEN of the 2026-11 release train: one
 	// mandatory, ReplicationGated token that every feature of the release
 	// gates on, in place of one token per feature. Its claim is the one
@@ -1206,6 +1234,11 @@ var supported = []string{
 	// decides only whether this host SETS passwords, and no host relies on a
 	// peer setting them. See ConsolePasswordV1.
 	ConsolePasswordV1,
+	// VRRPUnicastV1 is advertised CONDITIONALLY on enforcement.vrrp_unicast
+	// (default on) until it has latched: each LB host relies on its peers
+	// rendering the same VRRP transport, so the latch must mean every host
+	// opted in. See VRRPUnicastV1.
+	VRRPUnicastV1,
 	// Release202611V1 is advertised UNCONDITIONALLY: it says "this build
 	// decodes, keeps and honours every field and shape of its release", a fact
 	// about the binary. What opens a feature is WithFeature, not a flag.
@@ -1215,7 +1248,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, Release202611V1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -1308,6 +1341,11 @@ var replicationGated = map[string]bool{
 	// to open its console. Holding the latch for it costs only time. See
 	// ConsolePasswordV1.
 	ConsolePasswordV1: true,
+	// Confirmed against every replication recipient: not a decode claim but a
+	// transport one — a host parked in maintenance on an older build may run
+	// an LB, and every LB host must render the transport its peers do. See
+	// VRRPUnicastV1.
+	VRRPUnicastV1: true,
 	// Confirmed against every replication recipient: a feature of the release
 	// may write what a previous-release peer cannot decode or would drop on a
 	// rewrite. See Release202611V1.

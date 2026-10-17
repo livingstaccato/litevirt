@@ -302,10 +302,16 @@ func vidList(v []int) string {
 // setFirewallCondition raises or resolves one of this host's firewall
 // conditions, writing and notifying only on a change.
 func (s *Server) setFirewallCondition(ctx context.Context, code string, active bool, severity, detail string) {
+	s.setHostCondition(ctx, FirewallEvaluator, code, active, severity, detail)
+}
+
+// setHostCondition raises or resolves one of this host's conditions of an
+// evaluator, writing and notifying only on a change.
+func (s *Server) setHostCondition(ctx context.Context, evaluator, code string, active bool, severity, detail string) {
 	if s.db == nil {
 		return
 	}
-	row, ok, err := corrosion.GetHealthCondition(ctx, s.db, FirewallEvaluator, code, "host", s.hostName)
+	row, ok, err := corrosion.GetHealthCondition(ctx, s.db, evaluator, code, "host", s.hostName)
 	if err != nil {
 		return
 	}
@@ -318,7 +324,7 @@ func (s *Server) setFirewallCondition(ctx context.Context, code string, active b
 		if !active {
 			return
 		}
-		row = corrosion.HealthCondition{Evaluator: FirewallEvaluator, Code: code, SubjectKind: "host", SubjectID: s.hostName, FirstSeen: ts}
+		row = corrosion.HealthCondition{Evaluator: evaluator, Code: code, SubjectKind: "host", SubjectID: s.hostName, FirstSeen: ts}
 	}
 	if active {
 		if !isActive {
@@ -331,7 +337,7 @@ func (s *Server) setFirewallCondition(ctx context.Context, code string, active b
 	}
 	row.Severity, row.Hosts, row.LastSeen, row.Reporter = severity, []string{s.hostName}, ts, s.hostName
 	if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
-		slog.Warn("firewall: could not record a health condition", "code", code, "error", err)
+		slog.Warn("could not record a health condition", "evaluator", evaluator, "code", code, "error", err)
 		return
 	}
 	sev := notify.SevWarn

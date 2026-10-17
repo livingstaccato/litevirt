@@ -9,13 +9,14 @@ package firewall
 //
 //	prerouting (-300)  VLAN rule for every NIC, then each guarded NIC's guard.
 //	forward            guest ↔ guest / guest ↔ another port: sender nic_out_*, then receiver nic_in_*.
-//	input              guest → host, or → routed: sender nic_out_*; what passes is marked judged.
+//	input              guest → host, or → routed: VRRP marked, then sender nic_out_*; what passes is marked judged.
 //	output             host or routed → guest: receiver nic_in_*; routed → another port: routed_to_port.
 //
 // Modes (Plan.NICMode): enforce drops; observe replaces every drop with a
-// counter carrying an "lv-wd" comment and drops nothing (WouldDrops reads
-// them); guards-only renders prerouting only, because the rest needs
-// nf_conntrack_bridge.
+// counter carrying an "lv-wd" comment and drops nothing it judges per NIC
+// (WouldDrops reads them; the guards, and the drop of a guest's VRRP to the
+// host, hold in both); guards-only renders prerouting only, because the rest
+// needs nf_conntrack_bridge.
 
 import (
 	"fmt"
@@ -25,8 +26,8 @@ import (
 	"strings"
 )
 
-// Packet marks the bridge table sets for the inet forward chain. Two high bits
-// of skb->mark; a host that routes by fwmark must not use them.
+// Packet marks the bridge table sets for the inet chains. Three high bits of
+// skb->mark; a host that routes by fwmark must not use them.
 const (
 	// judgedMark: a guest's frame passed its NIC's egress rules (bridge
 	// input), so inet forward need not judge it again.
@@ -34,6 +35,14 @@ const (
 	// deferMark: inet forward handed routed traffic toward a guest bridge to
 	// that bridge's output hook to judge.
 	deferMark = 0x20000000
+	// guestVRRPMark: a guest sent this VRRP (IP protocol 112) to the host, or
+	// to be routed (bridge input). The inet input hook drops it
+	// (renderGuestVRRPInput) in every mode that renders the bridge input
+	// chain: no litevirt function takes VRRP from a guest, and a guest's
+	// adverts could take a load balancer's VIP off its holder. Routed VRRP
+	// (keepalived unicast between guests on two networks) never reaches the
+	// input hook, and VRRP between guests on one bridge is bridged.
+	guestVRRPMark = 0x40000000
 )
 
 // WouldDropComment prefixes the comment of every observe-mode counter:
@@ -169,6 +178,9 @@ func renderNICTable(b *strings.Builder, p Plan, sgs map[string]SecurityGroup, v6
 	fmt.Fprintf(b, "    chain input {\n")
 	fmt.Fprintf(b, "        type filter hook input priority filter; policy accept;\n")
 	fmt.Fprintf(b, "        iifname != @%s accept\n", setNICDevs)
+	// A guest's VRRP, marked here and dropped at the inet input hook if it
+	// is for the host itself (guestVRRPMark).
+	fmt.Fprintf(b, "        meta l4proto 112 meta mark set meta mark | %#x\n", guestVRRPMark)
 	bridgeCommon(b, p)
 	// litevirt's own services on the guest networks: dnsmasq's DHCP and DNS
 	// at the network's gateway address, and nowhere else.

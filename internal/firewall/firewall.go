@@ -482,6 +482,9 @@ func RenderParts(p Plan, nicActive bool) (inet, nic string, err error) {
 	// no NAT / isolation renders byte-identically to before this feature (and so
 	// removing the last rule drops the whole chain on the next atomic replace).
 	renderNAT(&b, p.NAT)
+	if nicTable && nicActive && p.nicMode() != NICModeGuardsOnly {
+		renderGuestVRRPInput(&b)
+	}
 	renderHostIsolation(&b, p.HostIsolation)
 	renderIsolatedForward(&b, p.IsolatedBridges)
 	b.WriteString("}\n")
@@ -599,6 +602,18 @@ func isolationMarks(sortedBridges []string) map[string]uint32 {
 		out[br] = v << 16
 	}
 	return out
+}
+
+// renderGuestVRRPInput drops, at the input hook, VRRP the bridge table marked
+// as a guest's (guestVRRPMark): what a guest sent the host itself. Rendered
+// while the bridge table that sets the mark is in force. Its own chain, so it
+// holds whatever the host-isolation input chain accepts (that chain's VRRP
+// exception is for the host's LB peers on the uplink).
+func renderGuestVRRPInput(b *strings.Builder) {
+	fmt.Fprintf(b, "    chain guest_vrrp {\n")
+	fmt.Fprintf(b, "        type filter hook input priority filter; policy accept;\n")
+	fmt.Fprintf(b, "        meta mark & %#x == %#x meta l4proto 112 drop\n", guestVRRPMark, guestVRRPMark)
+	fmt.Fprintf(b, "    }\n\n")
 }
 
 // renderHostIsolation emits a single `input` filter chain that drops guest→host

@@ -147,7 +147,8 @@ func TestRender_BaseChainsScopedToNICs(t *testing.T) {
 
 // TestRender_ObserveDropsNothing (ruling 1, review I8): in observe mode the
 // per-NIC chains count what they would drop and drop nothing; the inet table
-// stays exactly what it was before per-NIC enforcement (no trust in marks).
+// trusts no mark of the bridge table's (the one mark it reads in observe mode
+// is guestVRRPMark, to drop, never to let anything through).
 func TestRender_ObserveDropsNothing(t *testing.T) {
 	p := sgPlan(NICModeObserve, true, Rule{Direction: Ingress, Proto: "icmp", Action: Drop, Comment: "x"})
 	inet, nic, err := RenderParts(p, true)
@@ -164,7 +165,7 @@ func TestRender_ObserveDropsNothing(t *testing.T) {
 		`counter comment "lv-wd vnet1 in default"`,
 		`counter comment "lv-wd - vlan tagged"`,
 	)
-	if strings.Contains(inet, "meta mark") {
+	if strings.Contains(chainBody(t, inet, "forward"), "meta mark") {
 		t.Errorf("observe mode trusts bridge marks in inet forward:\n%s", inet)
 	}
 }

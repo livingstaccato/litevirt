@@ -194,6 +194,8 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		MigratePreconditions: !s.pingWithoutMigratePreconditionsForTest,
 		// This build force-stops inside DeleteVM (DeleteVMRequest.force).
 		DeleteForce: true,
+		// This build reads UpdateVMRequest.nic_by_list_position (nic_index.go).
+		NicListPosition: !s.pingWithoutNICListPositionForTest,
 	}, nil
 }
 

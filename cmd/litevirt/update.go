@@ -168,6 +168,9 @@ stopped or --restart-if-needed; USB devices are not hot-plugged.`,
 				}
 				req.NicMtu = append(req.NicMtu, nm)
 			}
+			// The NIC numbers are positions in the VM's NIC list, as lv
+			// inspect shows them, not spec entries.
+			req.NicByListPosition = len(req.NicRate) > 0 || len(req.NicMtu) > 0
 			// Live metadata: only send what changed (presence-detected).
 			if f.Changed("restart") || f.Changed("restart-max-attempts") ||
 				f.Changed("restart-delay") || f.Changed("restart-window") {

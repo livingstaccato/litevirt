@@ -5375,11 +5375,23 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	}
 	// Forward to the owning host first — it has authoritative state.
 	if vm.HostName != s.hostName {
-		client, conn, err := s.peerClient(ctx, vm.HostName)
+		client, closePeer, err := s.dialPeer(ctx, vm.HostName)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)
 		}
-		defer conn.Close()
+		defer closePeer()
+		// An owner that predates nic_by_list_position reads every NIC number
+		// as a spec index: translate the positions for it, or refuse
+		// (nic_index.go).
+		if req.GetNicByListPosition() && requestNamesNICs(req) && !s.peerReadsNICListPosition(ctx, client) {
+			nics, nerr := corrosion.MergedVMNICs(ctx, s.db, req.Name)
+			if nerr != nil {
+				return nil, status.Errorf(codes.Internal, "list NICs of %q: %v", req.Name, nerr)
+			}
+			if req, err = nicPositionsForOlderOwner(vm, nics, req); err != nil {
+				return nil, err
+			}
+		}
 		return client.UpdateVM(ctx, req)
 	}
 
@@ -6020,9 +6032,18 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// Build network configs from the VM's live NICs (the vm_nics/vm_interfaces
 	// overlay): a NIC hot-attached or detached on a hardware_v2 cluster is
 	// recorded in vm_nics alone.
+	if s.updateVMNICsHookForTest != nil {
+		s.updateVMNICsHookForTest()
+	}
 	nicRows, err := corrosion.MergedVMNICs(ctx, s.db, req.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read NICs for %q: %v", req.Name, err)
+	}
+	// The NIC numbers were resolved against the list read before the stop
+	// (and the VM lock, when it restarts); a NIC attached or detached since
+	// moves the positions, so the update is not applied to another NIC.
+	if requestNamesNICs(req) && !nicIx.sameNICs(nicIndex{nics: nicRows}) {
+		return nil, status.Errorf(codes.Aborted, "the NICs of %q changed while the update was prepared; retry", req.Name)
 	}
 	rowModels, reattached, err := corrosion.NICModelSources(ctx, s.db, req.Name, nicRows, compose.SpecNICModelsByMAC(spec))
 	if err != nil {

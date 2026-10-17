@@ -120,7 +120,8 @@ func riMTU(x, mac string) int {
 	return 0
 }
 
-// `lv update --nic-mtu N=` names the NIC at position N of the VM's NIC list,
+// `lv update --nic-mtu N=` (nic_by_list_position) names the NIC at position N
+// of the VM's NIC list,
 // whatever its ordinal: A, attached again (ordinal 2), is NIC 1 after B; C,
 // hot-plugged and attached again (ordinal 4), is NIC 2 and has no spec entry
 // until the update makes one. Main set NIC 1's MTU on B's entry (index 1) and
@@ -153,7 +154,7 @@ func TestFleet_NICMTUReachesNICsAttachedAgain(t *testing.T) {
 	}
 
 	allow := true
-	if _, err := c.SelfClient(entry).UpdateVM(ctx, &pb.UpdateVMRequest{Name: "rx", AllowRestart: &allow,
+	if _, err := c.SelfClient(entry).UpdateVM(ctx, &pb.UpdateVMRequest{Name: "rx", AllowRestart: &allow, NicByListPosition: true,
 		NicMtu: []*pb.NICMTUUpdate{{Ordinal: 1, Mtu: 9000}, {Ordinal: 2, Mtu: 9000}}}); err != nil {
 		t.Fatalf("--nic-mtu 1=9000 --nic-mtu 2=9000: %v", err)
 	}
@@ -235,5 +236,84 @@ func TestFleet_NetworkMoveReachesANICAttachedAgain(t *testing.T) {
 	}
 	if !replugged {
 		t.Errorf("no set-nic-bridge %q on %s", want, own.Name)
+	}
+}
+
+// riReattachedFleet is a fleet whose VM rx on node-0 lists A (rxa) and B
+// (rxb), with A detached and attached again through node-1: its NIC list is
+// B (ordinal 1), A (ordinal 2), and C (rxc, ordinal 3) has no spec entry.
+func riReattachedFleet(t *testing.T) (*Cluster, *Node, *Node) {
+	t.Helper()
+	ctx := context.Background()
+	c := riFleet(t, "rxa", "rxb", "rxc")
+	own, entry := c.Nodes[0], c.Nodes[1]
+	if _, err := c.SelfClient(entry).CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "rx", Cpu: 1, MemoryMib: 256,
+		Placement: &pb.PlacementSpec{Host: own.Name},
+		Network: []*pb.NetworkAttachment{
+			{Name: "rxa", Mac: riMACA, Model: "virtio"},
+			{Name: "rxb", Mac: riMACB, Model: "virtio"},
+		},
+	}}); err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	riReattach(t, c, entry, "rx", riMACA, "rxa")
+	if _, err := c.SelfClient(entry).AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "rx", Nic: &pb.NetworkAttachment{Name: "rxc", Mac: riMACC},
+	}); err != nil {
+		t.Fatalf("attach C: %v", err)
+	}
+	if _, err := c.SelfClient(entry).StopVM(ctx, &pb.StopVMRequest{Name: "rx", Force: true}); err != nil {
+		t.Fatalf("StopVM: %v", err)
+	}
+	return c, own, entry
+}
+
+// Review I-1: a request without nic_by_list_position — what an older lv or
+// an older deploy node sends — means spec indices on this owner too: entry 0
+// is A, though A is at position 1.
+//
+// Mutation: read a request without the field by list position — B takes the
+// MTU, red.
+func TestFleet_NICNumbersWithoutListPositionAreSpecIndices(t *testing.T) {
+	ctx := context.Background()
+	c, own, entry := riReattachedFleet(t)
+	if _, err := c.SelfClient(entry).UpdateVM(ctx, &pb.UpdateVMRequest{Name: "rx",
+		NicMtu: []*pb.NICMTUUpdate{{Ordinal: 0, Mtu: 9000}}}); err != nil {
+		t.Fatalf("UpdateVM by spec index: %v", err)
+	}
+	if a, b := riEntry(riSpec(t, own, "rx"), riMACA), riEntry(riSpec(t, own, "rx"), riMACB); a.GetMtu() != 9000 || b.GetMtu() != 0 {
+		t.Errorf("A %+v, B %+v; want the MTU on A (entry 0)", a, b)
+	}
+	if x := own.Virt.DefinedXML("rx"); riMTU(x, riMACA) != 9000 || riMTU(x, riMACB) != 0 {
+		t.Errorf("want <mtu> 9000 on A only:\n%s", x)
+	}
+}
+
+// Review I-2: an owner whose Ping lacks nic_list_position reads NIC numbers
+// as spec indices. The entry node translates lv update's positions for it:
+// position 1 (A) reaches A. A position it cannot translate (C, which has no
+// spec entry) is refused, naming the owner, and nothing changes.
+//
+// Mutation: forward positions unchanged to the older owner — B takes the
+// MTU, red.
+func TestFleet_NICPositionsToAnOlderOwnerAreTranslatedOrRefused(t *testing.T) {
+	ctx := context.Background()
+	c, own, entry := riReattachedFleet(t)
+	own.Server.SetPingWithoutNICListPositionForTest(true)
+	if _, err := c.SelfClient(entry).UpdateVM(ctx, &pb.UpdateVMRequest{Name: "rx", NicByListPosition: true,
+		NicMtu: []*pb.NICMTUUpdate{{Ordinal: 1, Mtu: 9000}}}); err != nil {
+		t.Fatalf("--nic-mtu 1=9000: %v", err)
+	}
+	if a, b := riEntry(riSpec(t, own, "rx"), riMACA), riEntry(riSpec(t, own, "rx"), riMACB); a.GetMtu() != 9000 || b.GetMtu() != 0 {
+		t.Errorf("A %+v, B %+v; want the MTU on A (position 1)", a, b)
+	}
+	_, err := c.SelfClient(entry).UpdateVM(ctx, &pb.UpdateVMRequest{Name: "rx", NicByListPosition: true,
+		NicMtu: []*pb.NICMTUUpdate{{Ordinal: 2, Mtu: 9000}}})
+	if err == nil || !strings.Contains(err.Error(), "runs an older build") {
+		t.Fatalf("--nic-mtu 2=9000 (C) to the older owner: %v, want a refusal naming it", err)
+	}
+	if e := riEntry(riSpec(t, own, "rx"), riMACC); e != nil {
+		t.Errorf("C got an entry %+v from a refused update", e)
 	}
 }

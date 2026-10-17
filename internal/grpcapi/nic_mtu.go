@@ -172,8 +172,8 @@ func requestSetsNICMTU(req *pb.UpdateVMRequest) bool {
 
 // applyNICMTURequest merges an UpdateVM's NIC MTUs into spec, validated, and
 // checks each against its bridge on this host, so a refusal comes before
-// anything is stopped. Each update names a NIC by its position in the VM's
-// NIC list (nicIndex). A NIC the stored spec does not describe (a hot-plugged
+// anything is stopped. Each update names a NIC by spec index, or by its
+// position in the VM's NIC list (nicIndex). A NIC the stored spec does not describe (a hot-plugged
 // one) gets an entry made from its NIC record, carrying its MAC, as does
 // every such NIC before it in the list — except on a VM of a stack (stack
 // non-empty), whose NIC list is its compose file's: a longer list would read
@@ -199,6 +199,13 @@ func (s *Server) applyNICMTURequest(ctx context.Context, spec *pb.VMSpec, req *p
 			return status.Errorf(codes.InvalidArgument, "NIC %d named twice", o)
 		}
 		seen[o] = true
+		if !ix.byListPosition && o >= len(spec.Network) && stack == "" {
+			// By spec index (an older client): main's entries for the unlisted
+			// NICs up to o, made from the rows at the ordinals they stand for.
+			if err := appendNICEntriesByOrdinal(spec, nics, o, rowModels, req.GetName()); err != nil {
+				return err
+			}
+		}
 		e, nic, ok := ix.resolve(spec, o)
 		if (!ok || e < 0) && stack != "" {
 			return status.Errorf(codes.FailedPrecondition,
@@ -259,6 +266,29 @@ func appendNICEntries(spec *pb.VMSpec, nics []corrosion.NICRecord, target *corro
 		}
 	}
 	return -1
+}
+
+// appendNICEntriesByOrdinal is main's reading of an MTU update by spec index
+// past the spec's end: an entry for each NIC from the spec's length up to o,
+// made from the NIC row whose ordinal is that index. A missing row is
+// NotFound, as on main.
+func appendNICEntriesByOrdinal(spec *pb.VMSpec, nics []corrosion.NICRecord, o int, rowModels map[string]string, vm string) error {
+	byOrdinal := make(map[int]corrosion.NICRecord, len(nics))
+	for _, ic := range nics {
+		byOrdinal[ic.Ordinal] = ic
+	}
+	for len(spec.Network) <= o {
+		ic, ok := byOrdinal[len(spec.Network)]
+		if !ok {
+			return status.Errorf(codes.NotFound, "VM %q has no NIC %d", vm, len(spec.Network))
+		}
+		model := rowModels[strings.ToLower(ic.MAC)]
+		if model == "" {
+			model = ic.Model
+		}
+		spec.Network = append(spec.Network, &pb.NetworkAttachment{Name: ic.NetworkName, Model: model, Mac: ic.MAC})
+	}
+	return nil
 }
 
 // patchNICMTUInPlace applies an update's NIC MTUs (merged into spec) to the

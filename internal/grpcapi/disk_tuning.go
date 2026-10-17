@@ -390,8 +390,8 @@ func (s *Server) applyDesiredDiskIO(ctx context.Context, name string, desired *p
 // queue changes into spec, validating the result. It touches only the in-memory
 // spec: the owner writes it after the domain has the setting. A disk the spec
 // does not list but vm_disks has gets its entry made here. A queue change
-// names its NIC by its position in the NIC list (nicIndex), and needs the
-// NIC's spec entry.
+// names its NIC by spec index or by its position in the NIC list (nicIndex),
+// and needs the NIC's spec entry.
 func applyTuningRequest(spec *pb.VMSpec, dbDisks []corrosion.DiskRecord, req *pb.UpdateVMRequest, ix nicIndex) error {
 	for _, u := range req.GetDiskTuning() {
 		key := compose.DiskKey(u.GetName())
@@ -426,9 +426,10 @@ func applyTuningRequest(spec *pb.VMSpec, dbDisks []corrosion.DiskRecord, req *pb
 	}
 	for _, u := range req.GetNicQueues() {
 		i := int(u.GetOrdinal())
-		e, _, ok := ix.resolve(spec, i)
+		e, nic, ok := ix.resolve(spec, i)
 		if !ok || e < 0 {
-			return status.Errorf(codes.NotFound, "VM %q has no NIC %d in its spec", spec.GetName(), i)
+			return ix.noEntry(codes.NotFound, req.GetName(), spec, i, nic, "a queue count",
+				fmt.Sprintf("VM %q has no NIC %d in its spec", spec.GetName(), i))
 		}
 		if err := compose.ValidateQueues(spec.Network[e].GetModel(), u.GetQueues()); err != nil {
 			return status.Errorf(codes.InvalidArgument, "NIC %d: %v", i, err)

@@ -220,8 +220,8 @@ func limitsRequested(req *pb.UpdateVMRequest) bool {
 // mergeLimitUpdate validates req's limit fields against the VM's FINAL vCPU
 // count and folds them into spec. It also re-validates a limit the request did
 // not touch, because a vCPU shrink can strand it above the new count. A NIC
-// rate names its NIC by its position in the NIC list (nicIndex), and needs
-// the NIC's spec entry.
+// rate names its NIC by spec index or by its position in the NIC list
+// (nicIndex), and needs the NIC's spec entry.
 func mergeLimitUpdate(spec *pb.VMSpec, req *pb.UpdateVMRequest, ix nicIndex) (limitsUpdate, error) {
 	up := limitsUpdate{
 		nicNewRate: map[int]float64{}, nicPrevRate: map[int]float64{}, nicAsked: map[int]int{},
@@ -256,10 +256,10 @@ func mergeLimitUpdate(spec *pb.VMSpec, req *pb.UpdateVMRequest, ix nicIndex) (li
 	seen := map[int]bool{}
 	for _, nr := range req.NicRate {
 		o := int(nr.GetOrdinal())
-		e, _, ok := ix.resolve(spec, o)
+		e, nic, ok := ix.resolve(spec, o)
 		if !ok || e < 0 {
-			return up, status.Errorf(codes.InvalidArgument,
-				"nic %d: the VM declares %d NIC(s) (0-based); a NIC hot-plugged after create has no spec entry to hold a rate", o, len(spec.Network))
+			return up, ix.noEntry(codes.InvalidArgument, req.GetName(), spec, o, nic, "a rate",
+				fmt.Sprintf("nic %d: the VM declares %d NIC(s) (0-based); a NIC hot-plugged after create has no spec entry to hold a rate", o, len(spec.Network)))
 		}
 		if seen[o] {
 			return up, status.Errorf(codes.InvalidArgument, "nic %d named twice", o)
@@ -388,10 +388,10 @@ func splitLimitFields(fields []string) (limits, rest []string) {
 
 // limitUpdateFromDesired builds the UpdateVM request that moves a VM's limits
 // to the values a desired spec declares, for the named limit fields. Its NIC
-// rates name spec entries (nic_by_spec_entry): a compose file's NICs are its
-// entries.
+// rates name spec entries (nic_by_list_position unset): a compose file's NICs
+// are its entries.
 func limitUpdateFromDesired(name string, desired *pb.VMSpec, limitFields []string) *pb.UpdateVMRequest {
-	req := &pb.UpdateVMRequest{Name: name, NicBySpecEntry: true}
+	req := &pb.UpdateVMRequest{Name: name}
 	for _, f := range limitFields {
 		switch {
 		case f == "cpu_limit":

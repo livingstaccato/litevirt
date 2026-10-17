@@ -18,11 +18,17 @@ func holdPort(addr string, port int) (func(), error) {
 	if ip == nil {
 		return nil, fmt.Errorf("hold port: %q is not an IPv4 address", addr)
 	}
+	// Under ForkLock, as the net package does, so no fork between the two
+	// calls can inherit the fd.
+	syscall.ForkLock.RLock()
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if err == nil {
+		syscall.CloseOnExec(fd)
+	}
+	syscall.ForkLock.RUnlock()
 	if err != nil {
 		return nil, err
 	}
-	syscall.CloseOnExec(fd)
 	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
 		_ = syscall.Close(fd)
 		return nil, err

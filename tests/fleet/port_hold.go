@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"log/slog"
 	"net"
 	"strconv"
 	"testing"
@@ -22,22 +23,35 @@ import (
 // in between.
 
 // holdStoppedPort reserves n's port after its listener has closed. A failure
-// leaves the port unheld, which is what the harness had before.
+// leaves the port unheld, which is what the harness had before, and is logged:
+// a rebind that then collides should not be a mystery.
 func (n *Node) holdStoppedPort() {
 	if n.portHold != nil || n.Port == 0 {
 		return
 	}
-	if release, err := holdPort(n.Address, n.Port); err == nil {
-		n.portHold = release
+	release, err := holdPort(n.Address, n.Port)
+	if err != nil {
+		slog.Warn("fleet: could not hold a stopped node's port; a later rebind on it may collide",
+			"node", n.Name, "port", n.Port, "error", err)
+		return
 	}
+	n.portHold, n.heldPort = release, n.Port
 }
 
 // releasePortHold lets go of the hold Stop took, if any.
 func (n *Node) releasePortHold() {
 	if n.portHold != nil {
 		n.portHold()
-		n.portHold = nil
+		n.portHold, n.heldPort = nil, 0
 	}
+}
+
+// movePort gives n the new listener l, on a port of its own, and lets go of
+// any hold on the old one: nothing will rebind that port, and a later Stop
+// must be free to hold the new one.
+func (n *Node) movePort(l net.Listener) {
+	n.Port, n.Listener = l.Addr().(*net.TCPAddr).Port, l
+	n.releasePortHold()
 }
 
 // rebindPort listens on n's port again, as a restarted daemon does on the

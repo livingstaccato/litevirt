@@ -255,6 +255,7 @@ type Node struct {
 	Listener net.Listener
 	// portHold keeps Port reserved while the node is stopped (port_hold.go).
 	portHold func()
+	heldPort int // the port portHold holds
 	// peerConn caches a self-loopback client for scenario assertions
 	// that want to call this node's RPCs from the test thread.
 	selfConn *grpc.ClientConn

@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"strings"
 	"testing"
@@ -496,6 +497,149 @@ func TestUpdateVM_AnOlderOwnerIsRefusedWhatItCannotBeTranslated(t *testing.T) {
 			!strings.Contains(err.Error(), "Upgrade other-host first") || len(spy.updates) != 0 {
 			t.Errorf("%s: err %v, %d forwarded; want FailedPrecondition naming the owner, nothing forwarded", name, err, len(spy.updates))
 		}
+	}
+}
+
+// Review I-new-1, the reviewer's shapes through the forward: entries A, C (1),
+// D (2) with rows A@0, C@2, D@3 (an upgraded owner made C and D entries 1 and
+// 2 to close the gap B left). `--nic-mtu 2=0` means D, spec entry 2; an older
+// owner patches the NIC at ordinal 2, which is C. With D detached, a rate on
+// position 2 (D's entry, past the list) would cap C. Both are refused, and
+// nothing is forwarded.
+//
+// Mutation: drop the other-NIC-at-ordinal refusal — red.
+func TestUpdateVM_AnOlderOwnerIsRefusedAnOrdinalThatIsAnotherNICs(t *testing.T) {
+	const macD = "52:54:00:00:61:0d"
+	entries := []*pb.NetworkAttachment{
+		{Name: "lan", Model: "virtio", Mac: ixMACA},
+		{Name: "lan3", Model: "virtio", Mac: ixMACC},
+		{Name: "lan2", Model: "virtio", Mac: macD},
+	}
+	for name, c := range map[string]struct {
+		rows []corrosion.NICRecord
+		req  *pb.UpdateVMRequest
+	}{
+		"mtu on D": {[]corrosion.NICRecord{ixRow(ixMACA, "lan", 0), ixRow(ixMACC, "lan3", 2), ixRow(macD, "lan2", 3)},
+			&pb.UpdateVMRequest{NicMtu: []*pb.NICMTUUpdate{{Ordinal: 2, Mtu: 0}}}},
+		"rate on detached D's entry": {[]corrosion.NICRecord{ixRow(ixMACA, "lan", 0), ixRow(ixMACC, "lan3", 2)},
+			&pb.UpdateVMRequest{NicRate: []*pb.NICRateUpdate{{Ordinal: 2, RateMbSec: 5}}}},
+	} {
+		s, _ := ixVMOn(t, "other-host", "", c.rows, entries...)
+		spy, err := ixForward(t, s, false, byPos(c.req))
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "which is another NIC (MAC "+ixMACC+")") || len(spy.updates) != 0 {
+			t.Errorf("%s: err %v, %d forwarded; want FailedPrecondition naming C, nothing forwarded", name, err, len(spy.updates))
+		}
+	}
+}
+
+// olderOwnerNIC is the live NIC a build before nic_by_list_position applies
+// spec index e of an MTU or a rate to: the one whose ordinal is e (f6f0918a:
+// patchNICMTUInPlace takes SpecOrdinal == e+1; applyLimitsToDomain and the
+// redefine's bandwidth patch take the NIC at ordinal e). Its queues go by the
+// entry's MAC, and its regenerate by MAC.
+func olderOwnerNIC(nics []corrosion.NICRecord, e int) *corrosion.NICRecord {
+	for i := range nics {
+		if nics[i].Ordinal == e {
+			return &nics[i]
+		}
+	}
+	return nil
+}
+
+// Whatever the entry node forwards to an older owner reaches the NIC the
+// position names, read with that build's own rules (olderOwnerNIC), or is
+// refused: never another NIC. Every position of every shape, for MTU, rate
+// and queues. tests/fleet cannot run an older build, whose fake would apply by
+// MAC like this one, so the older owner's rules are modelled here exactly.
+//
+// Mutation: drop the other-NIC-at-ordinal refusal — red; drop the rate
+// ordinal refusal — red.
+func TestNICPositionsForOlderOwner_NeverReachAnotherNIC(t *testing.T) {
+	const macD = "52:54:00:00:61:0d"
+	ent := func(macs ...string) []*pb.NetworkAttachment {
+		var out []*pb.NetworkAttachment
+		for _, m := range macs {
+			out = append(out, &pb.NetworkAttachment{Name: "lan", Mac: m})
+		}
+		return out
+	}
+	row := func(mac string, o int) corrosion.NICRecord {
+		return corrosion.NICRecord{MAC: mac, NetworkName: "lan", Ordinal: o}
+	}
+	shapes := map[string]struct {
+		spec []*pb.NetworkAttachment
+		nics []corrosion.NICRecord
+	}{
+		"A attached again":      {ent(ixMACA, ixMACB), []corrosion.NICRecord{row(ixMACB, 1), row(ixMACA, 2)}},
+		"gap closed by entries": {ent(ixMACA, ixMACC, macD), []corrosion.NICRecord{row(ixMACA, 0), row(ixMACC, 2), row(macD, 3)}},
+		"D detached":            {ent(ixMACA, ixMACC, macD), []corrosion.NICRecord{row(ixMACA, 0), row(ixMACC, 2)}},
+		"unreordered":           {ent(ixMACA, ixMACB), []corrosion.NICRecord{row(ixMACA, 0), row(ixMACB, 1), row(ixMACC, 2)}},
+		"B detached, C later":   {ent(ixMACA, ixMACB), []corrosion.NICRecord{row(ixMACA, 0), row(ixMACC, 2)}},
+	}
+	translated := 0
+	for name, sh := range shapes {
+		spec := &pb.VMSpec{Name: "rx", Network: sh.spec}
+		b, _ := json.Marshal(spec)
+		vm := &corrosion.VMRecord{Name: "rx", HostName: "old", Spec: string(b)}
+		ix := nicIndex{nics: sh.nics, byListPosition: true}
+		for pos := 0; pos < len(sh.spec)+len(sh.nics)+1; pos++ {
+			e0, nic, ok := ix.resolve(spec, pos)
+			for _, kind := range []string{"mtu", "rate", "queues"} {
+				req := &pb.UpdateVMRequest{Name: "rx", NicByListPosition: true}
+				switch kind {
+				case "mtu":
+					req.NicMtu = []*pb.NICMTUUpdate{{Ordinal: int32(pos), Mtu: 9000}}
+				case "rate":
+					req.NicRate = []*pb.NICRateUpdate{{Ordinal: int32(pos), RateMbSec: 5}}
+				default:
+					req.NicQueues = []*pb.NICQueuesUpdate{{Ordinal: int32(pos), Queues: 2}}
+				}
+				out, err := nicPositionsForOlderOwner(vm, sh.nics, req)
+				if err != nil {
+					continue
+				}
+				translated++
+				var e int32
+				switch kind {
+				case "mtu":
+					e = out.NicMtu[0].Ordinal
+				case "rate":
+					e = out.NicRate[0].Ordinal
+				default:
+					e = out.NicQueues[0].Ordinal
+				}
+				if out.GetNicByListPosition() {
+					// Sent unchanged (the list matches the spec): the older
+					// owner reads the position as spec index and ordinal, and
+					// past the spec makes entries from the rows by ordinal.
+					if got := olderOwnerNIC(sh.nics, pos); (got == nil) != (nic == nil) || (got != nil && !strings.EqualFold(got.MAC, nic.MAC)) {
+						t.Errorf("%s: %s on position %d sent unchanged reaches %v on the older owner, want %v", name, kind, pos, got, nic)
+					}
+					continue
+				}
+				if !ok || int(e) != e0 {
+					t.Errorf("%s: %s on position %d forwarded as entry %d, want entry %d (ok %v)", name, kind, pos, e, e0, ok)
+					continue
+				}
+				if kind == "queues" {
+					continue
+				}
+				if got := olderOwnerNIC(sh.nics, int(e)); got != nil && (nic == nil || !strings.EqualFold(got.MAC, nic.MAC)) {
+					t.Errorf("%s: %s on position %d (entry %d) reaches %s on the older owner, another NIC", name, kind, pos, e, got.MAC)
+				}
+			}
+		}
+	}
+	if translated == 0 {
+		t.Fatal("nothing was translated: the property was never exercised")
+	}
+	// The re-attached A still translates (no NIC at ordinal 0).
+	spec := &pb.VMSpec{Name: "rx", Network: ent(ixMACA, ixMACB)}
+	b, _ := json.Marshal(spec)
+	out, err := nicPositionsForOlderOwner(&corrosion.VMRecord{Name: "rx", HostName: "old", Spec: string(b)},
+		shapes["A attached again"].nics, &pb.UpdateVMRequest{Name: "rx", NicByListPosition: true, NicMtu: []*pb.NICMTUUpdate{{Ordinal: 1, Mtu: 9000}}})
+	if err != nil || out.NicMtu[0].Ordinal != 0 {
+		t.Errorf("--nic-mtu 1= on re-attached A: %v, %v; want entry 0", out, err)
 	}
 }
 

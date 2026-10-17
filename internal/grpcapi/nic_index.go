@@ -179,16 +179,29 @@ func nicPositionsForOlderOwner(vm *corrosion.VMRecord, nics []corrosion.NICRecor
 				"Upgrade %s first, or retry once the VM is on an upgraded host",
 			vm.Name, vm.HostName, i, why, vm.HostName)
 	}
-	// translate maps position i to the spec index the older owner reads; rate
-	// says the owner also finds the live NIC by that index read as an ordinal.
-	translate := func(i int32, rate bool) (int32, error) {
+	// translate maps position i to the spec index e the older owner reads.
+	// That build applies an MTU (its in-place patch) and a rate (live, and
+	// its bandwidth patch) to the live NIC whose ordinal is e; queues it
+	// patches by the entry's MAC. So for an MTU or a rate, e must not be the
+	// ordinal of another live NIC (review I-new-1), and a rate needs its own
+	// NIC at ordinal e. Where no live NIC holds e, the older owner's MTU patch
+	// fails and it regenerates the definition, by MAC.
+	atOrdinal := make(map[int]*corrosion.NICRecord, len(nics))
+	for k := range nics {
+		atOrdinal[nics[k].Ordinal] = &nics[k]
+	}
+	translate := func(i int32, byOrdinal, rate bool) (int32, error) {
 		e, nic, ok := ix.resolve(spec, int(i))
 		switch {
 		case !ok:
 			return 0, status.Errorf(codes.NotFound, "VM %q has no NIC %d", vm.Name, i)
 		case e < 0:
 			return 0, refuse(int(i), fmt.Sprintf("(MAC %s) has no spec entry there", nic.MAC))
-		case rate && nic != nil && nic.Ordinal != e:
+		}
+		if other := atOrdinal[e]; byOrdinal && other != nil && (nic == nil || !strings.EqualFold(other.MAC, nic.MAC)) {
+			return 0, refuse(int(i), fmt.Sprintf("is spec entry %d there, and that build applies it to the NIC at ordinal %d, which is another NIC (MAC %s)", e, e, other.MAC))
+		}
+		if rate && nic != nil && nic.Ordinal != e {
 			return 0, refuse(int(i), fmt.Sprintf("(MAC %s) is at ordinal %d, where that build looks for spec entry %d's NIC", nic.MAC, nic.Ordinal, e))
 		}
 		return int32(e), nil
@@ -196,21 +209,21 @@ func nicPositionsForOlderOwner(vm *corrosion.VMRecord, nics []corrosion.NICRecor
 	out := proto.Clone(req).(*pb.UpdateVMRequest)
 	out.NicByListPosition = false
 	for _, u := range out.NicMtu {
-		e, err := translate(u.Ordinal, false)
+		e, err := translate(u.Ordinal, true, false)
 		if err != nil {
 			return nil, err
 		}
 		u.Ordinal = e
 	}
 	for _, u := range out.NicQueues {
-		e, err := translate(u.Ordinal, false)
+		e, err := translate(u.Ordinal, false, false)
 		if err != nil {
 			return nil, err
 		}
 		u.Ordinal = e
 	}
 	for _, u := range out.NicRate {
-		e, err := translate(u.Ordinal, true)
+		e, err := translate(u.Ordinal, true, true)
 		if err != nil {
 			return nil, err
 		}

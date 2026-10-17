@@ -689,6 +689,7 @@ func (c *Client) mergeStatePayloadLWWWithAllowlist(payload *syncPayload, allowed
 		}
 	}
 	c.observeMerge(time.Since(start), merged, skipped)
+	c.endSpecHoldPass()
 	slog.Info("sync: merged remote state (LWW)", "tables", len(payload.Tables), "merged", merged, "skipped", skipped)
 	return firstErr
 }

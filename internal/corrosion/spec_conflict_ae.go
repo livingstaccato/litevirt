@@ -64,7 +64,18 @@ const specVersionWriteSQL = `UPDATE vms SET spec = ?, active_operation_id = ? WH
 // local row. row is the incoming row; when the local version wins at one
 // generation its spec and barrier cells are replaced with the local ones.
 func (c *Client) specConflictAE(tx *sql.Tx, table syncTable, row []interface{}, incoming workloadMergeAuthority, decision mergeAuthorityDecision) (mergeAuthorityDecision, error) {
-	if incoming.deleted || !incoming.valid {
+	if !incoming.valid {
+		return decision, nil
+	}
+	// Every decision that does not hold may have ended a hold here — a
+	// deleted VM's among them. Free while nothing is held (spec_hold.go).
+	held := false
+	defer func() {
+		if !held {
+			c.noteSpecHoldMaybeOver(tx, incoming.name)
+		}
+	}()
+	if incoming.deleted {
 		return decision, nil
 	}
 	ctx := context.Background()
@@ -75,12 +86,6 @@ func (c *Client) specConflictAE(tx *sql.Tx, table syncTable, row []interface{}, 
 	if !found || local.deleted {
 		return decision, nil
 	}
-	held := false
-	defer func() {
-		if !held {
-			c.noteSpecHoldMaybeOver(tx, incoming.name)
-		}
-	}()
 	inHash, localHash := specContentHash(incoming.spec), specContentHash(local.spec)
 	dropLocal := specEditDrop{vm: incoming.name, host: incoming.host, gen: local.gen, path: pathAE,
 		droppedSpec: local.spec, keptSpec: incoming.spec}
@@ -109,7 +114,7 @@ func (c *Client) specConflictAE(tx *sql.Tx, table syncTable, row []interface{}, 
 				}
 				if !done {
 					held = true
-					c.noteSpecEditHeld(tx, specHold{vm: incoming.name, op: local.activeOp, owner: local.host})
+					c.noteSpecEditHeld(tx, incoming.name, local.activeOp)
 					return mergeAuthorityKeepLocal, nil
 				}
 			}

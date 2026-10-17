@@ -491,10 +491,12 @@ of acting — it says nothing about whether the resulting rows have replicated.
   operation's claim first, the barrier stands and the operation can complete.
   Hosts that kept the longer line show it, and no operation, until then.
   Nothing ends an operation that never reaches a terminal step: the hold lasts
-  until it finishes or an admin runs `lv operation abort <vm> --force` on a
-  host that shows it, normally the owner. Each host that holds the line
-  raises `vm.spec_edit_held` (see [diagnostics.md](diagnostics.md)) and counts
-  it in `litevirt_spec_edit_held_total`. A newer owner's row
+  until it finishes or an admin runs
+  `lv operation abort <vm> --operation <id> --force` on a host that shows
+  it, normally the owner. Each host that holds the line for a second
+  consecutive pass raises `vm.spec_edit_held` (see
+  [diagnostics.md](diagnostics.md)) and counts it in
+  `litevirt_spec_edit_held_total`. A newer owner's row
   replaces the barrier of an operation started under the old one. The edit
   that loses is not lost silently: each host that drops it records a
   `vm.spec_edit_dropped` event on the VM (`lv events <vm>`) quoting the dropped

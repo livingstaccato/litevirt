@@ -1588,6 +1588,11 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*em
 
 	slog.Warn("host removed from cluster", "host", req.Name, "cert_serial", h.CertSerial)
 	s.publish("host.removed", req.Name, "cert_serial="+h.CertSerial)
+	// Only the raising host resolves its held-line conditions, and a removed
+	// one never will.
+	if err := corrosion.ResolveSpecEditHeldOfHost(ctx, s.db, req.Name); err != nil {
+		slog.Warn("could not resolve a removed host's held-spec-edit conditions", "host", req.Name, "error", err)
+	}
 
 	return &emptypb.Empty{}, nil
 }

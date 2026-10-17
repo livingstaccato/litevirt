@@ -15,13 +15,18 @@ operation can be inspected and force-cleared manually:
 ```
 lv operation show <vm>            # inspect the operation holding the barrier + its steps
 lv operation abort <vm> --force   # force-clear the barrier so the VM is mutable again
+lv operation abort <vm> --operation <id> --force   # the same, only if <id> is the active operation
 lv operation release-reservation <operation-id> --force   # release a host reservation no running operation holds
 ```
 
 `show` is read-only. `abort` is admin-only, requires `--force`, is audited, and
 clears the barrier only via the exact owner-epoch + spec-generation
 compare-and-swap — so it can never clear a newer operation's barrier, and an
-ordinary mutation's `--force` never bypasses the barrier.
+ordinary mutation's `--force` never bypasses the barrier. Without
+`--operation`, `abort` clears whichever operation is active when it runs;
+with `--operation <id>` it is refused unless `<id>` is that operation, so an
+operation that finished, or one that began, after you ran `show` is never
+the one cleared. The commands act on the host the CLI targets (`LV_HOST`).
 
 ## Host reservations
 
@@ -1028,7 +1033,8 @@ converge the row, so the two paths can never disagree.
   [operating-model.md](operating-model.md#replication)). Each one is also a
   `vm.spec_edit_dropped` event on the VM, quoting the dropped spec.
 - `litevirt_spec_edit_held_total` — **monotonic counter** of lines of VM spec edits this node
-  holds off a VM because an operation on it has not finished, once per VM and operation; each
+  holds off a VM because an operation on it has not finished, counted once per VM and
+  operation when the hold is confirmed (a second consecutive pass); each
   raises `vm.spec_edit_held` (see
   [the condition](#a-line-of-spec-edits-is-held-off-by-a-running-operation-vmspec_edit_held)).
 - `litevirt_replication_parked_entries{origin}` — **gauge**: received changes this node
@@ -2426,14 +2432,24 @@ the operation has finished, so the operation can complete
 disagree: the owner, and those that saw the operation first, show the
 operation and its spec; the others show the line and no operation. Each host
 that holds the line raises `vm.spec_edit_held` (evaluator `spec_conflict`,
-subject `vm/<name>@<host>`, warning), once per VM and operation, logs a
-warning and counts `litevirt_spec_edit_held_total`. The evidence names the
-operation, the owner host it shows on, and the remedy: let the operation
-finish, or run `lv operation abort <vm> --force` on that host — on a host
-that kept the line, `lv operation show <vm>` reports no operation. The
-condition resolves when the operation turns terminal there or the held line
-applies; anti-entropy carries the line on its next pass after that. Nothing
-ends an operation that never reaches a terminal step on its own.
+subject `vm/<name>@<host>`, warning): observed at the end of the first
+anti-entropy pass that holds, confirmed at the end of the second consecutive
+one for the same operation, each time only if the operation still has not
+finished once the whole pass has merged. A host that has merely not yet
+heard the operation finish therefore never confirms it. On
+confirmation the host logs a warning and counts
+`litevirt_spec_edit_held_total`, once per VM and operation. The evidence
+names the operation, the owner host it shows on (the VM's host as of the
+latest pass) and the remedy: on that host, check `lv operation show <vm>`;
+if that operation is wedged there, run
+`lv operation abort <vm> --operation <id> --force`, which is refused if
+another operation is active by then. On a host that kept the line,
+`lv operation show <vm>` reports no operation. The condition resolves when
+the operation turns terminal there, the held line applies, or the VM is
+deleted; anti-entropy carries the line on its next pass after that. A host
+removed with `lv host rm` never resolves its own, so the removal resolves
+them. Nothing ends an operation that never reaches a terminal step on its
+own.
 
 ### A cancelled start is still recorded (`cancelled_start_kept`)
 

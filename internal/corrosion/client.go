@@ -452,11 +452,12 @@ type Client struct {
 	// at one generation is resolved (spec_conflict.go). Unset reads false,
 	// the previous release's behaviour.
 	specConflictGate atomic.Pointer[func() bool]
-	// specDropsSeen is the spec-edit drops already noted (firstSpecDrop).
+	// specDropsSeen is the spec-edit drops already noted (firstSpecDrop),
+	// with whether each one's event is recorded.
 	specDropsMu   sync.Mutex
-	specDropsSeen map[string]struct{}
-	// specHolds is the (vm, operation) holds already noted (spec_hold.go).
-	specHolds map[string]struct{}
+	specDropsSeen map[string]specDropState
+	// specHold is this node's held lines of spec edits (spec_hold.go).
+	specHold specHoldTracker
 	// voterConfigGate, when set and returning true, permits WRITING
 	// voter_configs. Injected via SetVoterConfigGate, wired to the durable
 	// voter_config_v1 latch. Fails CLOSED when unset: that table's shapes

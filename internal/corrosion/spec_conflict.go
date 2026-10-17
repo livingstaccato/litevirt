@@ -90,17 +90,22 @@ func (c *Client) noteSpecEditDropped(tx *sql.Tx, d specEditDrop) {
 	c.deferAfterCommit(tx, func() {
 		// A drop is noted once per process: anti-entropy can meet the same
 		// losing version on every pass until the peer holding it catches up,
-		// and the event already collapses by id.
-		if !c.firstSpecDrop(specEditDroppedRecord(d).ID) {
+		// and the event already collapses by id. One whose event could not
+		// be written is recorded again by the next pass that drops it, but
+		// not warned or counted again.
+		note, record := c.firstSpecDrop(specEditDroppedRecord(d).ID)
+		if record {
+			// Not here: the deferred effects run under the client's lock,
+			// which the event's own replicated write takes.
+			defer func() { go c.recordSpecEditDropped(d) }()
+		}
+		if !note {
 			return
 		}
 		slog.Warn("replication: a concurrent edit of a VM's spec was dropped",
 			"vm", d.vm, "generation", d.gen, "reason", d.reason, "path", string(d.path),
 			"dropped_edit_at", specMetaOf(d.droppedSpec).At, "kept_edit_at", specMetaOf(d.keptSpec).At)
 		c.observeMergeRejected("vms", string(d.path), "spec_edit_dropped")
-		// Not here: the deferred effects run under the client's lock, which
-		// the event's own replicated write takes.
-		go c.recordSpecEditDropped(d)
 	})
 }
 
@@ -148,29 +153,48 @@ func (c *Client) recordSpecEditDropped(d specEditDrop) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	rec := specEditDroppedRecord(d)
-	if err := InsertVMEvent(ctx, c, rec); err != nil {
+	err := InsertVMEvent(ctx, c, rec)
+	if err != nil {
 		slog.Warn("replication: could not record a dropped spec edit", "vm", d.vm, "generation", d.gen, "error", err)
-		// Not noted after all: the next pass that drops it records it again.
-		c.specDropsMu.Lock()
-		delete(c.specDropsSeen, rec.ID)
-		c.specDropsMu.Unlock()
 	}
+	c.specDropsMu.Lock()
+	if _, ok := c.specDropsSeen[rec.ID]; ok {
+		if err != nil {
+			// The next pass that drops it records it again.
+			c.specDropsSeen[rec.ID] = specDropUnrecorded
+		} else {
+			c.specDropsSeen[rec.ID] = specDropRecorded
+		}
+	}
+	c.specDropsMu.Unlock()
 }
+
+// specDropState is how far a noted drop's event has got.
+type specDropState uint8
+
+const (
+	specDropRecording  specDropState = iota // its insert is in flight
+	specDropUnrecorded                      // its insert failed
+	specDropRecorded
+)
 
 // specDropsSeenMax bounds the drop ids remembered; past it the set restarts,
 // which at worst counts a drop twice.
 const specDropsSeenMax = 4096
 
-// firstSpecDrop reports whether id has not been noted before in this process.
-func (c *Client) firstSpecDrop(id string) bool {
+// firstSpecDrop reports whether id has not been noted before in this process
+// (note: warn and count it), and whether its event is to be written now
+// (record: never before, or its last insert failed and none is in flight).
+func (c *Client) firstSpecDrop(id string) (note, record bool) {
 	c.specDropsMu.Lock()
 	defer c.specDropsMu.Unlock()
 	if c.specDropsSeen == nil || len(c.specDropsSeen) >= specDropsSeenMax {
-		c.specDropsSeen = make(map[string]struct{})
+		c.specDropsSeen = make(map[string]specDropState)
 	}
-	if _, seen := c.specDropsSeen[id]; seen {
-		return false
+	st, seen := c.specDropsSeen[id]
+	if seen && st != specDropUnrecorded {
+		return false, false
 	}
-	c.specDropsSeen[id] = struct{}{}
-	return true
+	c.specDropsSeen[id] = specDropRecording
+	return !seen, true
 }

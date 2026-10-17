@@ -4,6 +4,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // AntiEntropyMetrics times the anti-entropy dump/digest/merge phases and counts
@@ -170,6 +172,10 @@ func (m *AntiEntropyMetrics) ObserveTombstoneTie(table string) {
 func (m *AntiEntropyMetrics) ObserveMergeRejected(table, path, reason string) {
 	m.mergeRejected.WithLabelValues(table, path, reason).Inc()
 }
+
+// The hold counter is reached through an optional method corrosion looks
+// for; pinned here so a rename cannot silently stop the count.
+var _ corrosion.SpecEditHeldObserver = (*AntiEntropyMetrics)(nil)
 
 // ObserveSpecEditHeld counts a line of spec edits held off by a running operation.
 func (m *AntiEntropyMetrics) ObserveSpecEditHeld() {

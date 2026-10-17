@@ -313,6 +313,9 @@ func (r *Replicator) applySpecGeneration(ctx context.Context, tx *sql.Tx, s Stat
 		if err != nil {
 			return err
 		}
+		// A clear may end a hold here (spec_hold.go), and so may finding
+		// the VM deleted.
+		r.client.noteSpecHoldMaybeOver(tx, coerceString(pk[0]))
 		if !found || local.deleted {
 			return asBefore()
 		}
@@ -320,7 +323,6 @@ func (r *Replicator) applySpecGeneration(ctx context.Context, tx *sql.Tx, s Stat
 		if err != nil {
 			return err
 		}
-		r.client.noteSpecHoldMaybeOver(tx, local.name)
 		if changed {
 			return nil
 		}

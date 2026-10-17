@@ -258,9 +258,10 @@ func TestFleet_ImageRm_DuringAPullKeepsTheImageDeletedAndAPullAfterRevives(t *te
 		hosts, err := n0.DB.Query(context.Background(), `SELECT status FROM image_hosts WHERE image_name = 'imgp' AND host_name = ?`, n0.Name)
 		return err == nil && len(hosts) == 1 && hosts[0].String("status") == "ready"
 	})
-	antiEntropyEverywhere(t, c)
-	c.WaitConverged(t, convergeTimeout)
-	antiEntropyEverywhere(t, c)
+	// The revived copy's record ties with the delete's rows as the delete
+	// raced the record above: settled as deletedEverywhere settles it (8 of
+	// 24 runs under load stayed apart on image_hosts after one pass each).
+	settleByAntiEntropy(t, c)
 	for _, n := range c.Nodes {
 		if img := listedImage(t, c, n, "imgp"); img == nil {
 			t.Errorf("%s does not list imgp after a pull brought it back", n.Name)

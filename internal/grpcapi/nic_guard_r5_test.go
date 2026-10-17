@@ -549,3 +549,51 @@ func TestHeldAfterAFailedCommit_IsReportedAndKept(t *testing.T) {
 		t.Error("an unreadable VM row dropped the record of a held guest")
 	}
 }
+
+// TestRetarget_CarriesTheTrunkOfTheNICsOwnEntry: the VLANs carried onto the
+// cluster network are those of the moving NIC's own spec entry, found by its
+// MAC. A NIC attached again after a detach can take an ordinal that is
+// another entry's index (a build that never reuses one numbers it past every
+// earlier NIC); read by ordinal, the trunk came from that other entry — here
+// one with no trunk, so nothing was carried and the moved trunk lost its
+// VLANs. The NIC rows are written as such a build leaves them: the trunk
+// NIC's entry is index 0, its NIC ordinal 1, and the entry at index 1 is a
+// detached NIC's.
+//
+// Mutation: take the trunk from spec.Network[rt.Ordinal] — red.
+func TestRetarget_CarriesTheTrunkOfTheNICsOwnEntry(t *testing.T) {
+	ctx := context.Background()
+	s := guardServer(t, true)
+	s.SetNetworkProvisioner(&r5Prov{})
+	if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{Name: "uplink", Type: "bridge",
+		Config: `{"Type":"bridge","Interface":"brup"}`}); err != nil {
+		t.Fatal(err)
+	}
+	const trunkMAC, goneMAC = "52:54:00:00:05:14", "52:54:00:00:05:15"
+	spec := `{"name":"edge","uuid":"u-edge","stack_name":"prod","network":[` +
+		`{"name":"prod_uplink","mac":"` + trunkMAC + `","trunk":[10,20]},` +
+		`{"name":"prod_uplink","mac":"` + goneMAC + `"}]}`
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "edge", HostName: s.hostName, State: "running", Spec: spec, StackName: "prod"},
+		[]corrosion.InterfaceRecord{{VMName: "edge", NetworkName: "prod_uplink", MAC: trunkMAC, Ordinal: 1}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.recordExistingTrunkVLANs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r5Latch(s)
+	if _, err := s.recordExistingTrunkVLANs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.retargetVMNICs(ctx, "edge", []compose.NICRetarget{
+		{Ordinal: 0, From: "prod_uplink", To: "uplink"}, {Ordinal: 1, From: "prod_uplink", To: "uplink"}}); err != nil {
+		t.Fatalf("retarget: %v", err)
+	}
+	nics, err := corrosion.MergedVMNICs(ctx, s.db, "edge")
+	if err != nil || len(nics) != 1 || nics[0].NetworkName != "uplink" {
+		t.Fatalf("the NIC after the move: %+v, %v; want it on uplink", nics, err)
+	}
+	got, _ := r5Load(t, s, map[string]map[string]string{"edge": {trunkMAC: "vnet14"}})
+	if want := (r5Trunk{VIDs: []int{10, 20}}); !reflect.DeepEqual(got["vnet14"], want) {
+		t.Errorf("the moved trunk: %+v, want %+v (its own entry's VLANs)", got["vnet14"], want)
+	}
+}

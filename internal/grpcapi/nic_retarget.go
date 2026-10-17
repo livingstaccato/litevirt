@@ -173,6 +173,25 @@ func pendingNICRetargets(spec *pb.VMSpec, nics []corrosion.NICRecord) []compose.
 	return out
 }
 
+// specEntryForNIC is the spec entry that describes nic: the one recording
+// its MAC, else — only for an entry that records no MAC — the one at its
+// ordinal. nil when none does.
+func specEntryForNIC(spec *pb.VMSpec, nic corrosion.NICRecord) *pb.NetworkAttachment {
+	if nic.MAC != "" {
+		for _, e := range spec.GetNetwork() {
+			if e != nil && e.GetMac() != "" && strings.EqualFold(e.GetMac(), nic.MAC) {
+				return e
+			}
+		}
+	}
+	if o := nic.Ordinal; o >= 0 && o < len(spec.GetNetwork()) {
+		if e := spec.Network[o]; e != nil && e.GetMac() == "" {
+			return e
+		}
+	}
+	return nil
+}
+
 // retargetLocalVMNICs does the host half for a VM that lives on this host:
 // for each NIC the spec has moved, provision the cluster network here,
 // re-plug the NIC onto its bridge, and rewrite the NIC rows. The rows change
@@ -214,9 +233,11 @@ func (s *Server) retargetLocalVMNICs(ctx context.Context, vm corrosion.VMRecord)
 		}
 		// The trunk keeps the VLANs recorded for it under the flat name, on
 		// its new network's list, before any row says it is there
-		// (re-review R4-I2).
-		if rt.Ordinal < len(spec.Network) {
-			if err := s.carryRetargetVLANs(ctx, vm.Name, spec.GetUuid(), nic.MAC, spec.Network[rt.Ordinal].GetTrunk(), rt); err != nil {
+		// (re-review R4-I2). The trunk is the one of the NIC's own spec
+		// entry, found by its MAC: a NIC attached again after a detach can
+		// take an ordinal that is another entry's index.
+		if e := specEntryForNIC(spec, nic); e != nil {
+			if err := s.carryRetargetVLANs(ctx, vm.Name, spec.GetUuid(), nic.MAC, e.GetTrunk(), rt); err != nil {
 				return err
 			}
 		}

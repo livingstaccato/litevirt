@@ -245,6 +245,11 @@ func valueFromPB(v *pb.RecoveryClaimValue) *corrosion.ClaimValue {
 	if v == nil {
 		return nil
 	}
+	if l := v.GetLeaseTermClaim(); l != nil {
+		return &corrosion.ClaimValue{LeaseTerm: &corrosion.LeaseTermValue{
+			Key: l.GetKey(), Term: l.GetTerm(), Holder: l.GetHolder(),
+		}}
+	}
 	if l := v.GetLun(); l != nil {
 		return &corrosion.ClaimValue{LUN: &corrosion.LUNAllocation{
 			LUN: l.GetLun(), Generation: l.GetGeneration(), ClaimID: l.GetClaimId(), VMID: l.GetVmId(),
@@ -270,6 +275,11 @@ func valueFromPB(v *pb.RecoveryClaimValue) *corrosion.ClaimValue {
 func valueToPB(v *corrosion.ClaimValue) *pb.RecoveryClaimValue {
 	if v == nil {
 		return nil
+	}
+	if l := v.LeaseTerm; l != nil {
+		return &pb.RecoveryClaimValue{LeaseTermClaim: &pb.LeaseTermClaimValue{
+			Key: l.Key, Term: l.Term, Holder: l.Holder,
+		}}
 	}
 	if l := v.LUN; l != nil {
 		return &pb.RecoveryClaimValue{Lun: &pb.LUNAllocationValue{
@@ -372,6 +382,9 @@ func (s *Server) localPrepare(ctx context.Context, key corrosion.ClaimKey, b cor
 	if err := s.claimDurable(ctx); err != nil {
 		return corrosion.PrepareResult{}, err
 	}
+	if d := s.olderBuildLeaseClaimRefusal(key); d != "" {
+		return corrosion.PrepareResult{Voter: s.hostName, Refusal: corrosion.RefusalInvalidValue, Detail: d}, nil
+	}
 	// Start the owner probe the round's Accept will want, so it has finished
 	// by the time the Accept arrives (§3.5.1, §10 item 36).
 	s.primeOwnerProbe(ctx, key)
@@ -407,6 +420,9 @@ func (s *Server) localPrepare(ctx context.Context, key corrosion.ClaimKey, b cor
 func (s *Server) localAccept(ctx context.Context, key corrosion.ClaimKey, b corrosion.Ballot, v corrosion.ClaimValue, gen int64) (corrosion.AcceptResult, error) {
 	if err := s.claimDurable(ctx); err != nil {
 		return corrosion.AcceptResult{}, err
+	}
+	if d := s.olderBuildLeaseClaimRefusal(key); d != "" {
+		return corrosion.AcceptResult{Voter: s.hostName, Refusal: corrosion.RefusalInvalidValue, Detail: d}, nil
 	}
 	signer, _, err := s.claimIdentity()
 	if err != nil {

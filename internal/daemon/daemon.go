@@ -1083,6 +1083,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.mintClearance.Store(svc)
 	svc.SetGateRefusedObserver(gateMetrics.Refused)
 	svc.SetLeaseBarrierIncompleteObserver(gateMetrics.LeaseBarrierIncomplete)
+	svc.SetLeaseClaimNoMajorityObserver(gateMetrics.LeaseTermClaimNoMajority)
 	svc.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	// SR-IOV VF-pool policy: which PFs litevirt may adopt for VF creation, the pool
 	// cap, and the degraded gauge. Validate the allowlist against live hardware now,
@@ -3781,6 +3782,21 @@ func (d *Daemon) wireLeaseMintClearance() {
 			return false, "daemon starting: the lease-term quorum read is not wired yet"
 		}
 		return svc.LeaseMintClearance(ctx, req)
+	})
+	// A lease seen held — a renewal, a mint, a peer's live lease — resolves a
+	// no-majority stall the server raised for it.
+	d.db.SetLeaseLiveObserver(func(ctx context.Context, key string) {
+		if svc := d.mintClearance.Load(); svc != nil {
+			svc.NoteLeaseLive(ctx, key)
+		}
+	})
+	// A lease poll that stood down for want of the voter majority, over a
+	// lease with no live holder, is a stalled takeover like a claim with no
+	// majority.
+	d.db.SetLeaseNoMajorityObserver(func(ctx context.Context, ev corrosion.LeaseNoMajority) {
+		if svc := d.mintClearance.Load(); svc != nil {
+			svc.NoteLeaseNoMajority(ctx, ev)
+		}
 	})
 }
 

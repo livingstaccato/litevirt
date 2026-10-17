@@ -1726,6 +1726,41 @@ older build honours an explicit key. Clusters founded with `lv host init` on
 this build already carry the explicit key. `lv doctor fence` warns when the
 token has latched and any host does not enforce it, and names the host.
 
+### Lease-term claims latch after the roll
+
+A node with an adopted voter generation that has members records a new
+leader-lease term only after a majority of that generation has decided it for
+the node. Before that, two nodes that took a lease over at the same moment
+could both record the next term and both act as its holder. See
+[Operating model](operating-model.md) → "Two nodes taking a lease over at once
+record one term". There is no schema change: voters keep these decisions in
+`local_recovery_claims`.
+
+During the roll, a host on the previous build refuses a lease-term claim as an
+unknown claim type and records terms without claiming them. An upgraded host
+claims anyway, and records a term from the quorum read alone only when so many
+voters give that refusal that the rest cannot form a majority. A voter that
+does not answer counts as one that could still accept, so an older-build
+minority plus one dead upgraded voter leaves a lease with no takeover until
+the roll finishes. Once the mandatory, replication-gated `lease_term_claim_v1`
+token has latched on a host, it always claims while a voter generation with
+members is adopted. The token cannot latch while any host the cluster replicates to runs
+the previous build, one parked in `maintenance` included.
+
+A takeover now needs a majority of voters that can vote, not only a majority
+that answers a read. `ha.lease.claim_no_majority` and
+`litevirt_lease_term_claim_no_majority_total` show a lease that cannot get one.
+There is no flag. Voter changes are decided by the same majority, so repair a
+voter while `ha.voter.unavailable` names it (`lv cluster voter rm <host>` then
+`lv cluster voter add <host>`). Once the claim itself has no majority, the
+exits are restoring the lost voter, or fencing proof-grade every member that
+cannot vote, abstaining ones included, and naming each in
+`lv cluster voter force-reconfigure --lost <host>[,<host>...]`. `lv cluster voter reset`
+returns hosts, as each adopts the reset generation, to recording terms from
+the quorum read alone — the two-holder race — and also ends recovery-claim
+protection. A binary rolled back below the
+token after it has latched enters WAL quarantine, as below every latched token.
+
 ## Schema upgrades: `litevirt schema-migrate`
 
 The daemon refuses to start when its `CurrentSchemaVersion` is OLDER

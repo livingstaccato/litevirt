@@ -1360,6 +1360,31 @@ evidence names each such member and the command that clears it:
 for one that should stay a host but stop voting, and `lv cluster voter rm`
 then `lv cluster voter add` for an abstaining one.
 
+### A lease with no claim majority (`ha.lease.claim_no_majority`)
+
+Evaluator `lease_term_claim`, subject `cluster/<lease key>`, severity warning.
+Raised by a node that has seen a lease with no live holder and could not take
+it over for want of a voter majority for longer than one of the lease's TTLs,
+so nobody holds the lease (docs/operating-model.md, "Two nodes taking a lease
+over at once record one term"). That covers a node that has lost the voter
+majority and stands down from the lease, a quorum high-water read that no
+quorum answered, and a claim no majority of the voter generation could
+decide. Resolved once the lease is no longer contested: a
+claim for it is decided, a term is recorded without a claim, or a node sees a
+live holder renewing it. During a split, a node that cannot see the holder may
+raise it again, and the row then alternates between observed and resolved
+without reaching confirmed. `litevirt_lease_term_claim_no_majority_total{lease}`
+counts each such poll. A claim lost to another claimant of the same term, with
+a majority there to decide it, is not counted. The evidence names the reason,
+and for a claim the refusing voters.
+Voter changes are decided by the same majority, so `lv cluster voter rm`,
+`add` and `reset` may not be able to run while this is raised. Repair a voter
+while `ha.voter.unavailable` names it, before it is needed. Once this is
+raised, the exits are restoring the lost voter, or fencing proof-grade every
+member that cannot vote, abstaining ones included, and naming each in
+`lv cluster voter force-reconfigure --lost <host>[,<host>...]`. `lv cluster voter reset`
+returns lease takeovers to the two-holder race.
+
 ### A forced voter reconfiguration (`ha.voter.forced`)
 
 Evaluator `voter_config`, subject `cluster/voters`, severity warning. Raised

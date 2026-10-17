@@ -1675,6 +1675,9 @@ func (c *Coordinator) acquireLeaseTenure(ctx context.Context) (held, newTenure b
 		}
 		c.dropLeaseTerm()
 		c.mAttempt(PhaseLease, ResultSkipped, ErrNoQuorum)
+		// A lease nobody holds that this node cannot take over is a stalled
+		// takeover: counted, and raised once it has lasted a TTL.
+		corrosion.NoteLeaseNoQuorum(ctx, c.db, failoverLeaseKey, c.hostName, leaseDuration, c.now())
 		// Not (false, nil): that is "another node holds the lease", on which
 		// run steps this node's gauges down. When every node has lost its
 		// majority nobody holds it, and every node publishing

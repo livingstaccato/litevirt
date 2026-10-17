@@ -367,6 +367,40 @@ const (
 	// (claims.Spec.AdoptLegacy, grpcapi Server.legacyValueExcluded).
 	ClaimIncarnationV1 = "claim_incarnation_v1"
 
+	// LeaseTermClaimV1 concerns SINGLE-CLAIMANT lease terms: a node with an
+	// adopted member voter generation records a new leader-lease term
+	// (internal/corrosion leader_lease.go) only after a majority of that
+	// generation has decided, by a
+	// recovery-claim style single-decree claim at key (lease_term, <lease key>,
+	// <term>, 0), that the term is its own. Two nodes that take a dead holder's
+	// lease over in the same instant both read the same high-water term and,
+	// before it, both recorded the next one — two holders for one term, each
+	// acting as the leader, and an immutable-ledger conflict only
+	// `lv cluster acknowledge-lease-term` cleared. A voter promises a term's
+	// key to one ballot at a time and accepts one value, so at most one
+	// claimant gets a majority; the loser learns the winner and records
+	// nothing. The claim does not wait for this node's latch, which forms at
+	// a different moment on each node. Before the latch, and only then, a
+	// claim that so many voters refuse as an unknown claim type (older builds)
+	// that the rest cannot form a majority falls back to the quorum read
+	// alone; once latched it never does (grpcapi lease_term_claim.go).
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build answers lease-term claims as a voter and
+	// claims every term it records. Every claimant relies on every OTHER
+	// claimant doing the same — a node that recorded a term without claiming
+	// it is the second holder the claim exists to prevent — so a flag would
+	// have to be withheld while off, and with it off anywhere the token could
+	// never latch. Standing down is the voter set's: with no adopted member
+	// generation (genesis pending, or after `lv cluster voter reset`) terms are
+	// recorded as before, because there is no fixed majority to decide them.
+	//
+	// ReplicationGated: any replication recipient can hold a lease, a
+	// maintenance host on the previous build included, and that build records
+	// terms without claiming them, so the claim must hold of every host this
+	// node replicates to.
+	LeaseTermClaimV1 = "lease_term_claim_v1"
+
 	// FenceStateV1 gates what an UNVERIFIED fence records as the host's state
 	// (colonelpanik/litevirt#253). Before it latches, a coordinator records
 	// 'fenced' for any successful fence, as every earlier build does. Once
@@ -1057,6 +1091,23 @@ const ReleaseToken = Release202611V1
 //     intact, and the incarnation-scoped one is left unread until it is
 //     upgraded again.
 //
+//   - lease_term_claim_v1 has no flag either: every claimant relies on every
+//     other claiming the terms it records. It is inert without an adopted
+//     member voter generation, so `lv cluster voter reset` returns each node,
+//     as it adopts the reset generation, to recording terms from the quorum
+//     high-water read alone. While it is in force a takeover needs a majority
+//     of voters that can VOTE — durable, holding their signing key, at their
+//     admitted incarnation, not sealed — which is more than the read needed.
+//     Voter changes need that same majority: repair a voter while
+//     ha.voter.unavailable names it (`lv cluster voter rm` then `add`); once
+//     the claim has no majority the exits are restoring the lost voter or
+//     `lv cluster voter force-reconfigure --lost`, naming every member that
+//     cannot vote (abstaining ones included), each fenced proof-grade.
+//     `lv cluster voter reset` brings back the two-holder race. A binary
+//     rolled back below it
+//     enters WAL quarantine, as below every latched token; the lease-term
+//     claim rows its voters keep are node-local and left unread.
+//
 //   - fence_state_v1 has no flag either: it says this build resumes from an
 //     unverified fence recorded 'offline' and does not auto-activate such a
 //     host, which the lease holder relies on of every node. It changes only
@@ -1198,6 +1249,10 @@ var supported = []string{
 	// keys claims by incarnation and seals the legacy key", a fact about the
 	// binary.
 	ClaimIncarnationV1,
+	// LeaseTermClaimV1 is advertised UNCONDITIONALLY: it says "this build
+	// answers lease-term claims and claims every term it records", a fact
+	// about the binary.
+	LeaseTermClaimV1,
 	// FenceStateV1 is advertised UNCONDITIONALLY: it says "this build resumes
 	// a recovery from an unverified fence recorded 'offline' and does not
 	// auto-activate such a host", a fact about the binary.
@@ -1248,7 +1303,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, LeaseTermClaimV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -1323,6 +1378,10 @@ var replicationGated = map[string]bool{
 	// Confirmed against every replication recipient: a v2 accept inside a
 	// replicated certificate must be verifiable by every host we stream to.
 	ClaimIncarnationV1: true,
+	// Confirmed against every replication recipient: any of them can hold a
+	// lease, and a build before this token records terms without claiming
+	// them. See LeaseTermClaimV1.
+	LeaseTermClaimV1: true,
 	// Confirmed against every replication recipient: any of them can hold the
 	// failover lease, a maintenance host on the previous build included, and
 	// that build resumes only from 'fenced'. See FenceStateV1.
@@ -1408,6 +1467,10 @@ var mandatory = map[string]bool{
 	// legacy key), and a coordinator relies on every voter keeping that
 	// format. See ClaimIncarnationV1.
 	ClaimIncarnationV1: true,
+	// A fact about the binary (it answers lease-term claims and claims every
+	// term it records), and every claimant relies on every other doing so.
+	// See LeaseTermClaimV1.
+	LeaseTermClaimV1: true,
 	// A fact about the binary (it resumes from an unverified fence recorded
 	// 'offline' and does not auto-activate such a host), and the lease holder
 	// relies on whichever node holds the lease next. See FenceStateV1.

@@ -111,7 +111,7 @@ func TestLeaseMintClearance_TellsATakeoverFromAMintOverOurOwnLease(t *testing.T)
 			t.Fatalf("acquire: held=%v err=%v", held, err)
 		}
 		want := LeaseMintRequest{Key: "failover", Term: 1, Holder: "host-a", Takeover: true,
-			Now: leaseTestNow.Format(time.RFC3339)}
+			Now: leaseTestNow.Format(time.RFC3339), TTL: 30 * time.Second}
 		if len(p.reqs) != 1 || p.reqs[0] != want {
 			t.Fatalf("clearance asked %+v, want exactly [%+v]", p.reqs, want)
 		}

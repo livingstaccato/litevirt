@@ -94,6 +94,16 @@ func TestCreateVM_ARefusedCreateLeavesTheKeptDiskWhereItsVMRecordedIt(t *testing
 	if k := keptCopiesOf(t, path); len(k) != 0 {
 		t.Errorf("the refused create moved the kept disk: %v", k)
 	}
+	// Moved and put back reads the same on disk; the events say it moved.
+	evs, err := corrosion.ListVMEvents(context.Background(), s.db, "win", 50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range evs {
+		if ev.Type == "vm.disk.kept" {
+			t.Errorf("the refused create moved the kept disk: %s", ev.Detail)
+		}
+	}
 }
 
 // A create that fails after it moved a kept disk off its path puts the disk

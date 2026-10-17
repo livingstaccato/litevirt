@@ -427,11 +427,12 @@ func TestUncleanBootWiring(t *testing.T) {
 		_, err := os.Stat(hostboot.AwaitingPath(dir))
 		return err == nil
 	}
-	d := &Daemon{cfg: &Config{HostName: "h", DataDir: dir}, db: db}
+	// Each boot is a process of its own (nextProcess).
+	d0 := &Daemon{cfg: &Config{HostName: "h", DataDir: dir}, db: db}
 
 	// A crash: no markRestarting. This boot serves once `serving` closes.
 	serving := make(chan struct{})
-	d.selfPinger = checks.pinger(&gatedPinger{open: serving})
+	d := nextProcess(d0, "", checks.pinger(&gatedPinger{open: serving}))
 	bctx, bcancel := context.WithCancel(ctx)
 	d.writeBootState(bctx, 0, 0, 0, false)
 	time.Sleep(50 * time.Millisecond)
@@ -444,7 +445,7 @@ func TestUncleanBootWiring(t *testing.T) {
 
 	// Another crash, and this daemon never serves.
 	never := make(chan struct{})
-	d.selfPinger = checks.pinger(&gatedPinger{open: never})
+	d = nextProcess(d0, "", checks.pinger(&gatedPinger{open: never}))
 	bctx, bcancel = context.WithCancel(ctx)
 	d.writeBootState(bctx, 0, 0, 0, false)
 	time.Sleep(50 * time.Millisecond)
@@ -459,9 +460,8 @@ func TestUncleanBootWiring(t *testing.T) {
 	if err != nil || h0 == nil {
 		t.Fatalf("GetHost: %v", err)
 	}
-	d.cfg.Version = "v-deferred"
 	serving = make(chan struct{})
-	d.selfPinger = checks.pinger(&gatedPinger{open: serving})
+	d = nextProcess(d0, "v-deferred", checks.pinger(&gatedPinger{open: serving}))
 	d.writeBootState(ctx, 2, 3, 4, true)
 	time.Sleep(50 * time.Millisecond)
 	h, err := corrosion.GetHost(ctx, db, "h")
@@ -518,11 +518,12 @@ func TestBootAfterAQuarantinedStopWiring(t *testing.T) {
 		}
 		return h
 	}
-	d := &Daemon{cfg: &Config{HostName: "h", DataDir: t.TempDir(), Version: "v-up"}, db: db}
+	// Each boot is a process of its own (nextProcess).
+	d0 := &Daemon{cfg: &Config{HostName: "h", DataDir: t.TempDir(), Version: "v-up"}, db: db}
 	never := make(chan struct{})
 
 	// A crash boot that is stopped before it serves.
-	d.selfPinger = checks.pinger(&gatedPinger{open: never})
+	d := nextProcess(d0, "", checks.pinger(&gatedPinger{open: never}))
 	bctx, bcancel := context.WithCancel(ctx)
 	d.writeBootState(bctx, 0, 0, 0, false)
 	if got := host().State; got != "upgrading" {
@@ -540,7 +541,7 @@ func TestBootAfterAQuarantinedStopWiring(t *testing.T) {
 		}
 		return ""
 	})
-	d.selfPinger = checks.pinger(&gatedPinger{open: never})
+	d = nextProcess(d0, "", checks.pinger(&gatedPinger{open: never}))
 	bctx, bcancel = context.WithCancel(ctx)
 	d.writeBootState(bctx, 0, 0, 0, false)
 	d.markRestarting()
@@ -548,9 +549,8 @@ func TestBootAfterAQuarantinedStopWiring(t *testing.T) {
 
 	// Upgraded again: the cleanup boot.
 	quarantined.Store(false)
-	d.cfg.Version = "v-up2"
 	serving := make(chan struct{})
-	d.selfPinger = checks.pinger(&gatedPinger{open: serving})
+	d = nextProcess(d0, "v-up2", checks.pinger(&gatedPinger{open: serving}))
 	d.writeBootState(ctx, 0, 0, 0, false)
 	time.Sleep(50 * time.Millisecond)
 	if h := host(); h.State != "upgrading" || h.UpdatedAt != h0.UpdatedAt {
@@ -628,6 +628,20 @@ func (f pingerFunc) Ping(context.Context, *pb.PingRequest, ...grpc.CallOption) (
 		return nil, err
 	}
 	return &pb.PingResponse{}, nil
+}
+
+// nextProcess is d's daemon started again: a Daemon of its own, over d's
+// database and a copy of d's config (version, when set, replacing d's), whose
+// boot pings through p. A boot's serving check reads its Daemon's selfPinger
+// and config from its own goroutine, which a cancelled boot may not have
+// reached yet, so a later boot must not reassign them on the same Daemon: the
+// earlier check races the write and can take the later boot's pinger.
+func nextProcess(d *Daemon, version string, p func() (pinger, func(), error)) *Daemon {
+	cfg := *d.cfg
+	if version != "" {
+		cfg.Version = version
+	}
+	return &Daemon{cfg: &cfg, db: d.db, selfPinger: p}
 }
 
 // gatedPinger fails every Ping until open is closed.
@@ -893,8 +907,8 @@ func TestBootResolvesAKeptFenceLeftByAnEarlierProcess(t *testing.T) {
 	defer checks.wait(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	d, _ := bootTestDaemon(t, ctx)
-	d.selfPinger = checks.pinger(&gatedPinger{open: make(chan struct{})})
+	d0, _ := bootTestDaemon(t, ctx)
+	d := nextProcess(d0, "", checks.pinger(&gatedPinger{open: make(chan struct{})}))
 	d.writeBootState(ctx, 0, 0, 0, false) // an ordinary boot of an active host
 	if open, err := hostboot.FenceKeptOpen(ctx, d.db, "h"); err != nil || open {
 		t.Fatalf("an ordinary boot raised boot_kept_fence: open=%v err=%v", open, err)
@@ -902,7 +916,7 @@ func TestBootResolvesAKeptFenceLeftByAnEarlierProcess(t *testing.T) {
 	if err := hostboot.RaiseFenceKept(ctx, d.db, "h", "offline", "disk full", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	d.selfPinger = checks.pinger(&gatedPinger{open: make(chan struct{})})
+	d = nextProcess(d0, "", checks.pinger(&gatedPinger{open: make(chan struct{})}))
 	d.writeBootState(ctx, 0, 0, 0, false)
 	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 		if open, err := hostboot.FenceKeptOpen(ctx, d.db, "h"); err == nil && !open {

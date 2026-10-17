@@ -188,8 +188,9 @@ type Fake struct {
 	FailAfterTargetTree       func(name string) error
 	ReportSourceReasonUnknown func(name string) bool
 	// OnRunning, when set, is called (outside the fake's lock) each time a
-	// domain starts running: a start, a resume. A scenario samples what is in
-	// force at the moment a guest runs.
+	// domain starts running: a start, a resume, a migration that lands it
+	// running (LandMigratedState), and SetState into running. A scenario
+	// samples what is in force at the moment a guest runs.
 	OnRunning func(name string)
 	// OnMigrateToTarget, when set, runs inside MigrateToTarget after it is
 	// recorded, with the parameters libvirt was given; a scenario uses it to
@@ -444,17 +445,22 @@ func (f *Fake) EventLog() []Event {
 
 // SetState forces a domain into a particular state. Scenarios use
 // this to simulate "the VM is already running" without rolling
-// through DefineDomain + StartDomain.
+// through DefineDomain + StartDomain. A domain it takes into running from
+// any other state starts running, as far as OnRunning is concerned.
 func (f *Fake) SetState(name string, s State) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if s != StatePaused {
 		delete(f.pendingNvram, name)
 	}
 	if s != StateShutdown {
 		delete(f.offReason, name)
 	}
+	started := s == StateRunning && f.domains[name] != StateRunning
 	f.domains[name] = s
+	f.mu.Unlock()
+	if started {
+		f.running(name)
+	}
 }
 
 // SetStats sets the GetDomainStats / GetAllDomainStats response for
@@ -1549,7 +1555,6 @@ func (f *Fake) LandMigrated(domXML string) {
 func (f *Fake) LandMigratedState(domXML string, paused bool) {
 	name := domainNameFromXML(domXML)
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.leftStateLocked(name)
 	f.xml[name] = domXML
 	f.domains[name] = StateRunning
@@ -1560,6 +1565,12 @@ func (f *Fake) LandMigratedState(domXML string, paused bool) {
 	}
 	f.captureConsolePasswordsLocked(name, domXML)
 	f.record("migrate-in", name, note)
+	f.mu.Unlock()
+	// A guest that lands running starts running here (OnRunning), however
+	// it arrived.
+	if !paused {
+		f.running(name)
+	}
 }
 
 // captureConsolePasswordsLocked records the console passwords a guest runs

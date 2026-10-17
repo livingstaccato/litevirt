@@ -213,8 +213,7 @@ func TestFleet_NICGuard_OlderDomainGuardedUnderItsOwnTap(t *testing.T) {
 		if p.Paused {
 			dst.Virt.SetState(name, libvirtfake.StatePaused)
 		} else {
-			dst.Virt.SetState(name, libvirtfake.StateRunning)
-			dst.Virt.OnRunning(name)
+			dst.Virt.SetState(name, libvirtfake.StateRunning) // fires OnRunning
 		}
 		return nil
 	}

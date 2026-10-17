@@ -124,7 +124,8 @@ func fwliveCluster(t *testing.T) (*Cluster, *Node, *Node, *fwliveOneCopy) {
 // fwliveOneCopy records each moment fwlive1 started running on one host while
 // the other host ran it: one copy of the VM at every moment. It is event
 // driven (the fakes' OnRunning, called each time a domain starts running: a
-// start or a resume), so no overlap is missed between two looks, and it
+// start, a resume, a migration that lands it running, or SetState into
+// running), so no overlap is missed between two looks, and it
 // reports at the end of the test. A scenario adds its own reaction to a guest
 // starting with onRunning, before the move starts.
 type fwliveOneCopy struct {

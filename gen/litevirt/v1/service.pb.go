@@ -5684,9 +5684,15 @@ type UpdateVMRequest struct {
 	MemoryHotplugMaxMib *int32 `protobuf:"varint,42,opt,name=memory_hotplug_max_mib,json=memoryHotplugMaxMib,proto3,oneof" json:"memory_hotplug_max_mib,omitempty"`
 	// nic_mtu sets each listed NIC's MTU (NetworkAttachment.mtu). It takes
 	// effect on the next define, like nic_queues.
-	NicMtu        []*NICMTUUpdate `protobuf:"bytes,27,rep,name=nic_mtu,json=nicMtu,proto3" json:"nic_mtu,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	NicMtu []*NICMTUUpdate `protobuf:"bytes,27,rep,name=nic_mtu,json=nicMtu,proto3" json:"nic_mtu,omitempty"`
+	// nic_by_spec_entry: the ordinal of every nic_queues, nic_rate and nic_mtu
+	// update names the entry at that position in the VM's stored spec, not the
+	// NIC at that position in the VM's NIC list. A stack deploy sets it: its
+	// values are its compose file's, entry by entry. A build that predates the
+	// field reads every ordinal this way.
+	NicBySpecEntry bool `protobuf:"varint,43,opt,name=nic_by_spec_entry,json=nicBySpecEntry,proto3" json:"nic_by_spec_entry,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *UpdateVMRequest) Reset() {
@@ -5950,6 +5956,13 @@ func (x *UpdateVMRequest) GetNicMtu() []*NICMTUUpdate {
 	return nil
 }
 
+func (x *UpdateVMRequest) GetNicBySpecEntry() bool {
+	if x != nil {
+		return x.NicBySpecEntry
+	}
+	return false
+}
+
 // DiskTuningUpdate changes one disk's discard / detect_zeroes (an empty value
 // leaves it as stored).
 type DiskTuningUpdate struct {
@@ -6012,8 +6025,18 @@ func (x *DiskTuningUpdate) GetDetectZeroes() string {
 	return ""
 }
 
-// NICQueuesUpdate changes the virtio-net queue count of the NIC at this position
-// in the VM's spec (1 turns multiqueue off).
+// The NIC of a NICQueuesUpdate, NICRateUpdate or NICMTUUpdate is named by
+// ordinal: its 0-based position in the VM's NIC list, the VM's live NICs in
+// ordinal order, as `lv inspect` lists them under spec.network. That is not
+// the NIC's ordinal, which is never reused: a NIC detached and attached again
+// takes a new one. The owner finds the NIC's spec entry by its MAC (an entry
+// that records no MAC, by the NIC's ordinal). A position past the end of the
+// list names the spec entry at that index when no live NIC carries it, as
+// before. UpdateVMRequest.nic_by_spec_entry reads ordinal as a spec index
+// instead.
+//
+// NICQueuesUpdate changes one NIC's virtio-net queue count (1 turns
+// multiqueue off).
 type NICQueuesUpdate struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Ordinal       int32                  `protobuf:"varint,1,opt,name=ordinal,proto3" json:"ordinal,omitempty"`
@@ -6066,8 +6089,7 @@ func (x *NICQueuesUpdate) GetQueues() int32 {
 	return 0
 }
 
-// NICRateUpdate sets (or, at 0, clears) one NIC's bandwidth cap in MB/s. The NIC
-// is named by its 0-based position in the VM's interface list.
+// NICRateUpdate sets (or, at 0, clears) one NIC's bandwidth cap in MB/s.
 type NICRateUpdate struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Ordinal       int32                  `protobuf:"varint,1,opt,name=ordinal,proto3" json:"ordinal,omitempty"`
@@ -6120,8 +6142,7 @@ func (x *NICRateUpdate) GetRateMbSec() float64 {
 	return 0
 }
 
-// NICMTUUpdate sets one NIC's MTU by its 0-based position in the VM's
-// interface list: 0 removes it, 1 means the bridge's MTU.
+// NICMTUUpdate sets one NIC's MTU: 0 removes it, 1 means the bridge's MTU.
 type NICMTUUpdate struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Ordinal       int32                  `protobuf:"varint,1,opt,name=ordinal,proto3" json:"ordinal,omitempty"`
@@ -43568,7 +43589,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x10RebuildVMRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"+\n" +
 	"\x10CutoverVMRequest\x12\x17\n" +
-	"\avm_name\x18\x01 \x01(\tR\x06vmName\"\x87\f\n" +
+	"\avm_name\x18\x01 \x01(\tR\x06vmName\"\xb2\f\n" +
 	"\x0fUpdateVMRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
 	"\x03cpu\x18\x02 \x01(\x05R\x03cpu\x12\x1d\n" +
@@ -43612,7 +43633,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"usbDevices\x12&\n" +
 	"\x0fset_usb_devices\x18) \x01(\bR\rsetUsbDevices\x128\n" +
 	"\x16memory_hotplug_max_mib\x18* \x01(\x05H\rR\x13memoryHotplugMaxMib\x88\x01\x01\x122\n" +
-	"\anic_mtu\x18\x1b \x03(\v2\x19.litevirt.v1.NICMTUUpdateR\x06nicMtuB\t\n" +
+	"\anic_mtu\x18\x1b \x03(\v2\x19.litevirt.v1.NICMTUUpdateR\x06nicMtu\x12)\n" +
+	"\x11nic_by_spec_entry\x18+ \x01(\bR\x0enicBySpecEntryB\t\n" +
 	"\a_onbootB\x10\n" +
 	"\x0e_startup_orderB\x12\n" +
 	"\x10_start_delay_secB\x11\n" +

@@ -5425,8 +5425,14 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	limitsReq := limitsRequested(req)
 	var limitsUp limitsUpdate
 	var limitsErr error
+	// The NICs the request names by index: positions in the VM's NIC list
+	// (nic_index.go).
+	nicIx, err := s.loadNICIndex(ctx, req)
+	if err != nil {
+		return nil, err
+	}
 	if limitsReq || (req.Cpu > 0 && spec.CpuLimit > 0) {
-		limitsUp, limitsErr = mergeLimitUpdate(spec, req)
+		limitsUp, limitsErr = mergeLimitUpdate(spec, req, nicIx)
 	}
 
 	// This node writes the tuning, so the feature's gate runs here (the entry
@@ -5457,14 +5463,14 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// the setting, so it never claims what the domain lacks.
 	if len(req.DiskTuning) > 0 || len(req.NicQueues) > 0 {
 		tdisks, _ := corrosion.GetVMDisks(ctx, s.db, req.Name)
-		if err := applyTuningRequest(spec, tdisks, req); err != nil {
+		if err := applyTuningRequest(spec, tdisks, req, nicIx); err != nil {
 			return nil, err
 		}
 	}
 	// NIC MTUs likewise, each checked against its bridge here before anything
 	// is stopped.
 	if len(req.NicMtu) > 0 {
-		if err := s.applyNICMTURequest(ctx, spec, req, vm.StackName); err != nil {
+		if err := s.applyNICMTURequest(ctx, spec, req, vm.StackName, nicIx); err != nil {
 			return nil, err
 		}
 	}
@@ -5860,7 +5866,12 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				}
 			}
 			applyLiveMetadataFields(cur, req)
-			fup, lerr := mergeLimitUpdate(cur, req)
+			// The NIC list as the lock sees it, too.
+			curIx, ierr := s.loadNICIndex(ctx, req)
+			if ierr != nil {
+				return nil, ierr
+			}
+			fup, lerr := mergeLimitUpdate(cur, req, curIx)
 			if lerr != nil {
 				return nil, lerr
 			}
@@ -6013,7 +6024,6 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read NICs for %q: %v", req.Name, err)
 	}
-	ifaces := nicInterfaceRecords(nicRows)
 	rowModels, reattached, err := corrosion.NICModelSources(ctx, s.db, req.Name, nicRows, compose.SpecNICModelsByMAC(spec))
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read NIC models for %q: %v", req.Name, err)
@@ -6022,7 +6032,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	var netConfigs []lv.NetworkConfig
 	for _, iface := range nicRows {
 		bridge := resolveBridge(ctx, s.db, iface.NetworkName)
-		rate := compose.NICRate(spec, iface.Ordinal, iface.NetworkName)
+		rate := compose.NICRate(spec, iface.MAC, iface.Ordinal, iface.NetworkName)
 		model := nicModels.Model(iface.MAC, iface.NetworkName, iface.Ordinal, iface.Model)
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
@@ -6080,11 +6090,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 					patched, perr = lv.PatchInactiveCPUTune(patched, spec.CpuLimit, int(spec.CpuShares))
 				}
 				if perr == nil {
-					for _, o := range limitsUp.nicOrdinals {
-						for _, iface := range ifaces {
-							if iface.Ordinal == o {
-								patched, _ = lv.PatchInterfaceBandwidth(patched, iface.MAC, spec.Network[o].RateMbSec)
-							}
+					for _, e := range limitsUp.nicEntries {
+						if nic := liveNICForEntry(spec, nicRows, e); nic != nil {
+							patched, _ = lv.PatchInterfaceBandwidth(patched, nic.MAC, spec.Network[e].RateMbSec)
 						}
 					}
 				}
@@ -6092,10 +6100,10 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			if perr == nil && (len(req.DiskTuning) > 0 || len(req.NicQueues) > 0) {
 				// discard / detect_zeroes / queues patch into the existing
 				// definition too, so the addresses libvirt assigned survive.
-				patched, perr = patchTuningInPlace(patched, req, spec, diskConfigs, ifaces)
+				patched, perr = patchTuningInPlace(patched, req, spec, diskConfigs, nicIx)
 			}
 			if perr == nil && len(req.NicMtu) > 0 {
-				patched, perr = s.patchNICMTUInPlace(patched, req, spec, netConfigs)
+				patched, perr = s.patchNICMTUInPlace(patched, req, spec, netConfigs, nicIx)
 			}
 			if perr == nil {
 				domXML = patched

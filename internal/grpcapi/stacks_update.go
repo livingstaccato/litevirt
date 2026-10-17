@@ -85,7 +85,9 @@ func (s *Server) reconfigureWithRestart(ctx context.Context, name string, desire
 		}
 	}
 	allow := true
-	req := &pb.UpdateVMRequest{Name: name, AllowRestart: &allow, DisableVnc: desired.DisableVnc}
+	// Its NIC queues, MTUs and rates are the file's, entry by entry: each
+	// names a spec entry, not a position in the VM's NIC list.
+	req := &pb.UpdateVMRequest{Name: name, AllowRestart: &allow, DisableVnc: desired.DisableVnc, NicBySpecEntry: true}
 	if compose.IsTransientOrErrorState(vm.State) {
 		// A VM a previous deploy left half-made: repair it — redefine the
 		// domain from the spec over its existing disks, and start it — even

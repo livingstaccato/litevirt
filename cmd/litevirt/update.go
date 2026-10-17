@@ -205,8 +205,8 @@ stopped or --restart-if-needed; USB devices are not hot-plugged.`,
 	}
 	cmd.Flags().Float64Var(&cpuLimit, "cpu-limit", 0, "Cap the VM's total CPU at this many host cores, fractions allowed, at most --cpu (live; 0 removes the cap)")
 	cmd.Flags().Int32Var(&cpuShares, "cpu-shares", 0, "CPU weight under contention, 1-10000: the cgroup v2 weight, Proxmox cpuunits, default 100 (live; 0 restores the default)")
-	cmd.Flags().StringArrayVar(&nicRates, "nic-rate", nil, "Cap one NIC's bandwidth, <nic>=<MB/s> with a 0-based NIC number, e.g. 0=12.5 (live; 0=0 removes it; repeatable)")
-	cmd.Flags().StringArrayVar(&nicMTUs, "nic-mtu", nil, "Set one NIC's MTU, <nic>=<MTU|bridge> with a 0-based NIC number, e.g. 0=9000; it must equal the bridge's MTU (VM must be stopped; 0=0 removes it; repeatable)")
+	cmd.Flags().StringArrayVar(&nicRates, "nic-rate", nil, "Cap one NIC's bandwidth, <nic>=<MB/s>, the NIC numbered from 0 in the order lv inspect lists them under spec.network, e.g. 0=12.5 (live; 0=0 removes it; repeatable)")
+	cmd.Flags().StringArrayVar(&nicMTUs, "nic-mtu", nil, "Set one NIC's MTU, <nic>=<MTU|bridge>, the NIC numbered from 0 in the order lv inspect lists them under spec.network, e.g. 0=9000; it must equal the bridge's MTU (VM must be stopped; 0=0 removes it; repeatable)")
 	cmd.Flags().Int32Var(&cpu, "cpu", 0, "Number of vCPUs (VM must be stopped)")
 	cmd.Flags().Int32Var(&memory, "memory", 0, "Memory in MiB (VM must be stopped)")
 	cmd.Flags().StringVar(&cpuMode, "cpu-mode", "", "CPU mode: host-passthrough|host-model|custom (VM must be stopped)")

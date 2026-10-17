@@ -389,8 +389,10 @@ func (s *Server) applyDesiredDiskIO(ctx context.Context, name string, desired *p
 // applyTuningRequest merges an UpdateVM request's discard / detect_zeroes and
 // queue changes into spec, validating the result. It touches only the in-memory
 // spec: the owner writes it after the domain has the setting. A disk the spec
-// does not list but vm_disks has gets its entry made here.
-func applyTuningRequest(spec *pb.VMSpec, dbDisks []corrosion.DiskRecord, req *pb.UpdateVMRequest) error {
+// does not list but vm_disks has gets its entry made here. A queue change
+// names its NIC by its position in the NIC list (nicIndex), and needs the
+// NIC's spec entry.
+func applyTuningRequest(spec *pb.VMSpec, dbDisks []corrosion.DiskRecord, req *pb.UpdateVMRequest, ix nicIndex) error {
 	for _, u := range req.GetDiskTuning() {
 		key := compose.DiskKey(u.GetName())
 		var d *pb.DiskSpec
@@ -424,13 +426,14 @@ func applyTuningRequest(spec *pb.VMSpec, dbDisks []corrosion.DiskRecord, req *pb
 	}
 	for _, u := range req.GetNicQueues() {
 		i := int(u.GetOrdinal())
-		if i < 0 || i >= len(spec.Network) {
+		e, _, ok := ix.resolve(spec, i)
+		if !ok || e < 0 {
 			return status.Errorf(codes.NotFound, "VM %q has no NIC %d in its spec", spec.GetName(), i)
 		}
-		if err := compose.ValidateQueues(spec.Network[i].GetModel(), u.GetQueues()); err != nil {
+		if err := compose.ValidateQueues(spec.Network[e].GetModel(), u.GetQueues()); err != nil {
 			return status.Errorf(codes.InvalidArgument, "NIC %d: %v", i, err)
 		}
-		spec.Network[i].Queues = u.GetQueues()
+		spec.Network[e].Queues = u.GetQueues()
 	}
 	return nil
 }
@@ -572,8 +575,9 @@ func requestsTuningWrite(req *pb.UpdateVMRequest, storedSpec string) bool {
 
 // patchTuningInPlace applies a request's discard / detect_zeroes / queue
 // changes to the persistent definition by patching it (the merged spec holds the
-// final values), so the addresses libvirt assigned are not reshuffled.
-func patchTuningInPlace(x string, req *pb.UpdateVMRequest, spec *pb.VMSpec, disks []lv.DiskConfig, ifaces []corrosion.InterfaceRecord) (string, error) {
+// final values), so the addresses libvirt assigned are not reshuffled. A
+// queue change's NIC is patched by its MAC.
+func patchTuningInPlace(x string, req *pb.UpdateVMRequest, spec *pb.VMSpec, disks []lv.DiskConfig, ix nicIndex) (string, error) {
 	var err error
 	for _, u := range req.GetDiskTuning() {
 		key := compose.DiskKey(u.GetName())
@@ -599,21 +603,18 @@ func patchTuningInPlace(x string, req *pb.UpdateVMRequest, spec *pb.VMSpec, disk
 		}
 	}
 	for _, u := range req.GetNicQueues() {
-		mac := ""
-		if o := int(u.GetOrdinal()); o >= 0 && o < len(spec.Network) {
-			mac = spec.Network[o].GetMac()
+		e, nic, ok := ix.resolve(spec, int(u.GetOrdinal()))
+		if !ok || e < 0 {
+			return "", fmt.Errorf("NIC %d not found for an in-place patch", u.GetOrdinal())
 		}
-		if mac == "" {
-			for _, ic := range ifaces {
-				if ic.Ordinal == int(u.GetOrdinal()) {
-					mac = ic.MAC
-				}
-			}
+		mac := spec.Network[e].GetMac()
+		if nic != nil {
+			mac = nic.MAC
 		}
 		if mac == "" {
 			return "", fmt.Errorf("NIC %d has no MAC to patch by", u.GetOrdinal())
 		}
-		if x, err = lv.PatchInactiveNICQueues(x, mac, int(spec.Network[u.GetOrdinal()].GetQueues())); err != nil {
+		if x, err = lv.PatchInactiveNICQueues(x, mac, int(spec.Network[e].GetQueues())); err != nil {
 			return "", err
 		}
 	}

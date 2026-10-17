@@ -1509,7 +1509,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 		model := takeoverModels.Model(n.MAC, n.NetworkName, n.Ordinal, n.Model)
 		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: model, MAC: n.MAC, SpecOrdinal: n.Ordinal + 1,
-			RateMBps: compose.NICRate(&spec, n.Ordinal, n.NetworkName)})
+			RateMBps: compose.NICRate(&spec, n.MAC, n.Ordinal, n.NetworkName)})
 	}
 	// A renamed promotion is a second VM: its NICs are the spec's, with fresh
 	// MACs.

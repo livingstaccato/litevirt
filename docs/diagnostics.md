@@ -1252,6 +1252,7 @@ observed → confirmed → resolved lifecycle:
   `ct_orphan_runtime`, the certificate and audit conditions,
   `vm_disk_stranded`, `vm_failover_held`, `vm_start_cancelled`,
   `ct_rootfs_stranded`, `reservation_stale`, the `iscsi_lun_hold_*` pair,
+  `ceph_image_leftover`, `ceph_trash_leftover`,
   and the inputs failover recovery reads (`partition_paused`,
   `partition_pause_failed`, `partition_one_way`, evaluator `failover`);
 - remove the cause, and the evaluator proves the resolution. For a

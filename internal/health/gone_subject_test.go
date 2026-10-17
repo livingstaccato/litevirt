@@ -198,7 +198,8 @@ func TestGoneSubject_ConditionsOfADeletedWorkloadResolve(t *testing.T) {
 // (subject host), a pool on it (pool@host), and a workload's on it
 // (vm@host) — while those that outlive a removal by design stay open:
 // certificate revocation owed for the host, the deputy's reservation_stale,
-// and the inputs failover recovery reads.
+// the inputs failover recovery reads, and the LUN holds and Ceph leftovers
+// that name images in shared storage the removal does not release.
 //
 // Mutations: drop the host check — every "want resolved" goes red; parse
 // pool@host by its prefix — the pool one goes red; empty the keep list —
@@ -225,6 +226,8 @@ func TestGoneSubject_ConditionsOfARemovedHostResolve(t *testing.T) {
 		{corrosion.PartitionPauseEvaluator, corrosion.CondPartitionPauseFailed, "host", "node-c"},
 		{"failover", "refence_failed", "host", "node-c"},
 		{"iscsi_lun_hold", "iscsi_lun_hold_standing", "host", "node-c"},
+		{"ceph_pool", "ceph_image_leftover", "host", "node-c"},
+		{"ceph_pool", "ceph_trash_leftover", "host", "node-c"},
 	}
 	for _, c := range append(append([]condID{}, resolved...), open...) {
 		f.raise(c.evaluator, c.code, c.kind, c.subject)

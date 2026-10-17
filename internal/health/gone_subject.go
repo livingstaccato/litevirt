@@ -70,6 +70,11 @@ var goneSubjectKeepCodes = map[string]string{
 	// LUN holds guard shared storage, which a removal does not release.
 	"iscsi_lun_hold_standing":   "a LUN hold guards shared storage beyond the host",
 	"iscsi_lun_hold_unreadable": "a LUN hold guards shared storage beyond the host",
+	// Each names images left in a shared Ceph pool, which the removal neither
+	// releases nor purges; the removed host's own record of them is gone with
+	// it, and a trash entry held open may be a running VM's disk.
+	"ceph_image_leftover": "names images left in shared Ceph storage beyond the host",
+	"ceph_trash_leftover": "names images left in shared Ceph storage beyond the host",
 }
 
 // goneSubjectKept reports whether c outlives its subject by design.
@@ -108,8 +113,8 @@ type goneLookup struct {
 	cache map[string]bool
 }
 
-// tombstonedOnly reports whether table holds at least one tombstoned row
-// where col = name and no live one. An unreadable table proves nothing.
+// tombstonedOnly reports whether a workload table holds at least one
+// tombstoned row where col = name and no live one. An unreadable table proves nothing.
 func (g *goneLookup) tombstonedOnly(table, col, name string) bool {
 	key := table + "\x00" + name
 	if v, ok := g.cache[key]; ok {
@@ -128,6 +133,21 @@ func (g *goneLookup) tombstonedOnly(table, col, name string) bool {
 	return gone
 }
 
+// hostRemoved is corrosion.HostRemoved, once per host per pass. An
+// unreadable table proves nothing.
+func (g *goneLookup) hostRemoved(host string) bool {
+	key := "hosts\x00" + host
+	if v, ok := g.cache[key]; ok {
+		return v
+	}
+	removed, err := corrosion.HostRemoved(g.ctx, g.db, host)
+	if err != nil {
+		return false
+	}
+	g.cache[key] = removed
+	return removed
+}
+
 // why reports why c's subject is gone, or "" when it is not proven gone.
 func (g *goneLookup) why(c corrosion.HealthCondition) string {
 	workload, host := conditionSubject(c.SubjectKind, c.SubjectID)
@@ -136,7 +156,7 @@ func (g *goneLookup) why(c corrosion.HealthCondition) string {
 		return "the VM was deleted"
 	case workload != "" && c.SubjectKind == "container" && g.tombstonedOnly("containers", "name", workload):
 		return "the container was deleted"
-	case host != "" && g.tombstonedOnly("hosts", "name", host):
+	case host != "" && g.hostRemoved(host):
 		return "the host was removed"
 	}
 	return ""

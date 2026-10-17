@@ -290,10 +290,12 @@ func FirewallIDOf(kind, doc string) string { return firewallIDOf(kind, doc) }
 //
 // A row is kept at any age while a live workload lost its identity from it
 // (TagGroupMembership.IdentityLost, matched as the loader matches it: the
-// loader holds that workload while the row remains), or while its display
-// name matches a workload of its kind with a relocation or move still in
-// flight (a live container marked relocating, or an open relocation,
-// reschedule or promote proof naming it).
+// loader holds that workload while the row remains), or while a relocation
+// or move of the workload it names is still in flight out of the host it was
+// recorded on: a live container of its name on that host marked relocating,
+// or an open relocation proof that host coordinated for its name; for a VM
+// (whose name is cluster-wide), an open relocation, reschedule or promote
+// proof naming it.
 func FirewallTagsOrphans(ctx context.Context, c *Client, now time.Time, grace time.Duration) ([]FirewallTagsRecord, error) {
 	rows, err := ListFirewallTagsRows(ctx, c)
 	if err != nil {
@@ -316,7 +318,8 @@ func FirewallTagsOrphans(ctx context.Context, c *Client, now time.Time, grace ti
 		newest time.Time
 		ok     bool
 	}
-	// spared are kind/name of each workload with a move in flight.
+	// spared are kind/host/name of each workload with a move in flight out
+	// of host ("" for a VM).
 	spared := map[string]bool{}
 	lost, err := identityLostRows(ctx, c)
 	if err != nil {
@@ -333,7 +336,7 @@ func FirewallTagsOrphans(ctx context.Context, c *Client, now time.Time, grace ti
 			if r.String("deleted_at") == "" {
 				_, _, relocating := RelocateRestoreMarker(r.String("state"), r.String("state_detail"))
 				if relocating {
-					spared[kind+"/"+r.String("name")] = true
+					spared[kind+"/"+r.String("host_name")+"/"+r.String("name")] = true
 				}
 			}
 			if id == "" {
@@ -363,16 +366,16 @@ func FirewallTagsOrphans(ctx context.Context, c *Client, now time.Time, grace ti
 	}
 	byKind := map[string]map[string]*holders{}
 	if byKind[TagMemberVM], err = read(TagMemberVM,
-		`SELECT name, spec AS doc, '' AS state, '' AS state_detail, COALESCE(deleted_at, '') AS deleted_at FROM vms`); err != nil {
+		`SELECT name, '' AS host_name, spec AS doc, '' AS state, '' AS state_detail, COALESCE(deleted_at, '') AS deleted_at FROM vms`); err != nil {
 		return nil, err
 	}
 	if byKind[TagMemberCT], err = read(TagMemberCT,
-		`SELECT name, COALESCE(create_spec, '') AS doc, COALESCE(state, '') AS state, COALESCE(state_detail, '') AS state_detail,
+		`SELECT name, host_name, COALESCE(create_spec, '') AS doc, COALESCE(state, '') AS state, COALESCE(state_detail, '') AS state_detail,
 		        COALESCE(deleted_at, '') AS deleted_at FROM containers`); err != nil {
 		return nil, err
 	}
 	open, err := c.Query(ctx,
-		`SELECT target_kind, target_name FROM runtime_action_proofs
+		`SELECT target_kind, target_name, coordinator FROM runtime_action_proofs
 		  WHERE action IN (?, ?, ?) AND status IN (?, ?) AND deleted_at IS NULL`,
 		ActionRelocate, ActionReschedule, ActionPromote, ProofPrepared, ProofInProgress)
 	if err != nil {
@@ -381,9 +384,9 @@ func FirewallTagsOrphans(ctx context.Context, c *Client, now time.Time, grace ti
 	for _, r := range open {
 		switch r.String("target_kind") {
 		case "vm":
-			spared[TagMemberVM+"/"+r.String("target_name")] = true
+			spared[TagMemberVM+"//"+r.String("target_name")] = true
 		case "container":
-			spared[TagMemberCT+"/"+r.String("target_name")] = true
+			spared[TagMemberCT+"/"+r.String("coordinator")+"/"+r.String("target_name")] = true
 		}
 	}
 	var out []FirewallTagsRecord
@@ -392,7 +395,7 @@ func FirewallTagsOrphans(ctx context.Context, c *Client, now time.Time, grace ti
 		switch {
 		case h != nil && h.live:
 		case lost[r.Kind+"/"+r.FWID]:
-		case r.Name != "" && spared[r.Kind+"/"+r.Name]:
+		case r.Name != "" && spared[r.Kind+"/"+sparedHost(r)+"/"+r.Name]:
 		case h != nil && h.tombstones > 0:
 			if h.ok && now.Sub(h.newest) > grace {
 				out = append(out, r)
@@ -404,4 +407,13 @@ func FirewallTagsOrphans(ctx context.Context, c *Client, now time.Time, grace ti
 		}
 	}
 	return out, nil
+}
+
+// sparedHost is the host part of a tags row's in-flight key: the container
+// host it was recorded on, "" for a VM.
+func sparedHost(r FirewallTagsRecord) string {
+	if r.Kind == TagMemberCT {
+		return r.Host
+	}
+	return ""
 }

@@ -583,15 +583,18 @@ type arrivals struct {
 }
 
 // from reports whether container w arrived on its host from host src: a
-// proof bound to its token moved it, by name, to its host; or src's row of
-// the name carries a relocate-restore marker naming its host and token.
+// proof src coordinated, bound to its token, moved it by name to its host
+// (as matchMove binds a migrate); or src's row of the name carries a
+// relocate-restore marker naming its host and token. A token and its proof
+// outlive the move, so a record that does not name src binds nothing
+// (Track D residual I-A2).
 func (a arrivals) from(w *tagWorkload, src string) bool {
 	tok := w.move.token
 	if tok == "" || src == "" {
 		return false
 	}
 	for _, p := range a.proofs[tok] {
-		if p.targetName == w.name && p.destHost == w.host {
+		if p.targetName == w.name && p.destHost == w.host && p.coordinator == src {
 			return true
 		}
 	}

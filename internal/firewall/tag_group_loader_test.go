@@ -591,7 +591,7 @@ func TestTagGroupLoader_ALostIdentityIsHeldLikeUnreadableTags(t *testing.T) {
 //
 // Mutations: match a container on another host with no relocation record —
 // red; hold a container with no create spec — red; ignore the relocation
-// proof — red.
+// proof — red; bind a proof without its coordinator — red.
 func TestTagGroupLoader_ALostIdentityMatchesAContainerOnlyWhereItCouldHaveBeen(t *testing.T) {
 	l := newTGLab(t)
 	l.sg("sg-web", "web-in")
@@ -612,6 +612,12 @@ func TestTagGroupLoader_ALostIdentityMatchesAContainerOnlyWhereItCouldHaveBeen(t
 	l.ctNIC("host-b", "mv", "prod", "00:16:3e:00:00:03", "veth3", "10.0.0.11")
 	l.proof("tok-mv", "mv", "host-b", corrosion.ProofInProgress)
 	l.tags("ct", tgFWID(3), `{"tags":{"role":"web"},"name":"mv","host":"host-a"}`)
+	// Once migrated host-a -> host-b (its proof completed); the row of its
+	// name was recorded for host-c, which no record links it to (I-A2).
+	l.ct("host-b", "once", "", "", "tok-once")
+	l.ctNIC("host-b", "once", "prod", "00:16:3e:00:00:04", "veth4", "10.0.0.12")
+	l.proof("tok-once", "once", "host-b", corrosion.ProofCompleted)
+	l.tags("ct", tgFWID(4), `{"tags":{"role":"web"},"name":"once","host":"host-c"}`)
 
 	plan, _ := l.load(l.loader("host-b", nil))
 	if n := planNIC(t, plan, "veth1"); heldAtDrop(n) {
@@ -619,6 +625,9 @@ func TestTagGroupLoader_ALostIdentityMatchesAContainerOnlyWhereItCouldHaveBeen(t
 	}
 	if n := planNIC(t, plan, "veth2"); heldAtDrop(n) {
 		t.Errorf("a container with no create spec is held: %+v", n)
+	}
+	if n := planNIC(t, plan, "veth4"); heldAtDrop(n) {
+		t.Errorf("a container once relocated from host-a is held for a row recorded for host-c: %+v", n)
 	}
 	if n := planNIC(t, plan, "veth3"); !heldAtDrop(n) {
 		t.Errorf("a relocated container that lost its identity is not held: %+v", n)

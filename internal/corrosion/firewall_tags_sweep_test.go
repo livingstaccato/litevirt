@@ -191,3 +191,65 @@ func TestFirewallTagsOrphans_SparesOnlyAContainerThatCouldHaveLostTheIdentity(t 
 		t.Fatalf("orphans = %v, want %v", ids, want)
 	}
 }
+
+// Relocation records bind a row only to the host that row was recorded on
+// (Track D residual I-A2). A relocate_token and its proof outlive the move,
+// so a container once moved host-a -> host-b must not match an orphan row
+// of its name recorded for host-c: it is not lost (not held), and the row
+// is swept. Likewise the in-flight spare keeps a row only for a move out of
+// the row's own host: an open proof coordinated by host-a, or host-a's
+// relocating marker, keeps the row recorded for host-a and not one for
+// host-c.
+//
+// Mutations: bind a proof without its coordinator — red; spare an open
+// proof or a relocating marker by name across hosts — red.
+func TestFirewallTagsOrphans_RelocationRecordsBindOnlyTheirSourceHost(t *testing.T) {
+	f := newTagGroupFixture(t)
+	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-25 * time.Hour).Format(time.RFC3339Nano)
+	row := func(id, name, host string) {
+		mustExec(t, f.c, `INSERT INTO cluster_policies (key, value, set_by, updated_at) VALUES (?, ?, 'x', ?)`,
+			FirewallTagsKeyPrefix+TagMemberCT+"/"+id, `{"tags":{"role":"web"},"name":"`+name+`","host":"`+host+`"}`, old)
+	}
+	proof := func(id, name, status string) {
+		mustExec(t, f.c, `INSERT INTO runtime_action_proofs (id, action, target_kind, target_name, dest_host, coordinator, relocation_token, status, created_at, updated_at)
+			VALUES (?, ?, 'container', ?, 'host-b', 'host-a', ?, ?, 't', 't')`, id, ActionRelocate, name, "tok-"+name, status)
+	}
+	// moved: once migrated host-a -> host-b (completed), untagged; a row of
+	// its name recorded for host-c: not lost, swept. One recorded for
+	// host-a: lost, kept.
+	mustExec(t, f.c, `INSERT INTO containers (host_name, name, state, relocate_token, create_spec, created_at, updated_at) VALUES ('host-b', 'moved', 'running', 'tok-moved', '{"template":"debian"}', 't', 't')`)
+	proof("p1", "moved", ProofCompleted)
+	row(tgID(1), "moved", "host-c")
+	// inflight: an open proof out of host-a names it: the row for host-a is
+	// kept, the row for host-c is swept.
+	proof("p2", "inflight", ProofInProgress)
+	row(tgID(2), "inflight", "host-a")
+	row(tgID(3), "inflight", "host-c")
+	// relocating: host-a's row of the name is marked relocating: the row
+	// for host-a is kept, the row for host-c is swept.
+	mustExec(t, f.c, `INSERT INTO containers (host_name, name, state, state_detail, create_spec, created_at, updated_at) VALUES ('host-a', 'rel', 'relocating', ?, ?, 't', 't')`,
+		RelocateRestoreDetail("host-b", "tok-rel"), `{"fw_id":"`+tgID(9)+`"}`)
+	row(tgID(4), "rel", "host-a")
+	row(tgID(5), "rel", "host-c")
+
+	got, err := FirewallTagsOrphans(f.ctx, f.c, now, 24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, r := range got {
+		ids = append(ids, r.FWID)
+	}
+	slices.Sort(ids)
+	if want := []string{tgID(1), tgID(3), tgID(5)}; !slices.Equal(ids, want) {
+		t.Fatalf("orphans = %v, want %v", ids, want)
+	}
+	lost, err := identityLostRows(f.ctx, f.c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lost[TagMemberCT+"/"+tgID(1)] {
+		t.Error("a container once relocated from host-a matches a row recorded for host-c")
+	}
+}

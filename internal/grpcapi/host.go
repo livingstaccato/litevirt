@@ -966,6 +966,10 @@ func (s *Server) pingHost(ctx context.Context, host string) error {
 // under its write.
 const undrainAttempts = 3
 
+// undrainStateWrite is undrainFrom's conditional write; a var so a test can
+// make the state change under every write.
+var undrainStateWrite = corrosion.UpdateHostStateFrom
+
 // undrainFrom records host active, read as `from`. The write is made only
 // while the host is still recorded so, and on a miss the state is read again:
 // a SIGTERM's 'upgrading' write landing after the read is not overwritten,
@@ -975,7 +979,7 @@ func (s *Server) undrainFrom(ctx context.Context, host, from string) error {
 		if from == "upgrading" {
 			return s.undrainRestarting(ctx, host)
 		}
-		applied, err := corrosion.UpdateHostStateFrom(ctx, s.db, host, from, "active")
+		applied, err := undrainStateWrite(ctx, s.db, host, from, "active")
 		if err != nil {
 			return status.Errorf(codes.Internal, "update host state: %v", err)
 		}

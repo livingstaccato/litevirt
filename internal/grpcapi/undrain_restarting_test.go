@@ -197,3 +197,31 @@ func TestUndrainHost_StateChangedToAnotherDrainedStateStillUndrains(t *testing.T
 		t.Errorf("host state = %q, want active", got)
 	}
 }
+
+// TestUndrainHost_StateThatKeepsChangingIsAborted: a state that changes under
+// every one of undrain's conditional writes is not chased forever, nor written
+// over: after undrainAttempts misses the undrain is refused with Aborted, and
+// says to run it again.
+//
+// Mutation: return nil after the loop — the undrain reports success without
+// having recorded the host active.
+func TestUndrainHost_StateThatKeepsChangingIsAborted(t *testing.T) {
+	s, _ := undrainServer(t, "draining", nil)
+	var writes atomic.Int32
+	orig := undrainStateWrite
+	undrainStateWrite = func(context.Context, *corrosion.Client, string, string, string) (bool, error) {
+		writes.Add(1)
+		return false, nil
+	}
+	t.Cleanup(func() { undrainStateWrite = orig })
+	_, err := s.UndrainHost(adminCtx(), &pb.UndrainHostRequest{Name: "w1"})
+	if status.Code(err) != codes.Aborted || !strings.Contains(status.Convert(err).Message(), "again") {
+		t.Fatalf("undrain of a host whose state keeps changing: err=%v, want Aborted saying to run it again", err)
+	}
+	if got := writes.Load(); got != undrainAttempts {
+		t.Errorf("conditional writes = %d, want %d", got, undrainAttempts)
+	}
+	if got := hostStateOf(t, s, "w1"); got != "draining" {
+		t.Errorf("host state = %q, want 'draining' untouched", got)
+	}
+}

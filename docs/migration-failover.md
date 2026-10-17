@@ -394,7 +394,9 @@ fenced or offline, which ends the fence) and moves nothing back. A host
 recorded `upgrading` is recorded `active` only if its daemon answers a Ping
 from the node handling the undrain. One that does not answer is restarting,
 and the undrain is refused (FailedPrecondition) with its state unchanged: it
-turns `active` by itself once its daemon serves. Failback
+turns `active` by itself once its daemon serves. The write is made only from
+the state the undrain read; if the state changes under it three times, the
+undrain is refused (Aborted) and can be run again. Failback
 is the opt-in that does, as Proxmox's HA failback property does: after the
 undrain, the VMs the drain moved away return by live migration, at a bounded
 rate.

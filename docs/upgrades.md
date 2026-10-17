@@ -43,7 +43,8 @@ Six guarantees the upgrade pipeline enforces:
    `upgrading` keeps the rest of those 2 minutes even if the host is recorded
    `active` before it serves, if the failover leader saw it `upgrading`. The
    new daemon transitions back to `active` on healthy startup, and a host
-   left `offline` by a transient blip is auto-recovered to `active` once a fresh quorum sees it healthy.
+   left `offline` by a transient blip is auto-recovered to `active` once a
+   fresh quorum sees it healthy.
 
 3. **Auto-rollback on a panicking binary.** If the new daemon panics
    past systemd's `StartLimitBurst=10` within 5 minutes, the

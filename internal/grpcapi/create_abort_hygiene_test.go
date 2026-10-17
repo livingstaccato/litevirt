@@ -66,14 +66,14 @@ func assertFileIs(t *testing.T, p string, want []byte, what string) {
 }
 
 // A create refused for what it reads before it makes anything — Secure
-// Boot over the UEFI vars a `delete --keep-disks` kept, a USB device the
-// host does not have — is refused before it moves the kept disk at the path
+// Boot over the UEFI vars a `delete --keep-disks` kept, an image it cannot
+// pull, a USB device the host does not have — is refused before it moves the kept disk at the path
 // its data disk would take: the disk stays where its VM recorded it (lab 2,
 // O2; 5c).
 //
-// Mutations: drop firmwarePreflight, or resolve the USB devices where the
-// domain is built again — the disk is moved to .kept- (and put back) before
-// the refusal, red.
+// Mutations: drop firmwarePreflight, resolve the USB devices where the
+// domain is built again, or pull the image after the debris pass again — the
+// disk is moved to .kept- (and put back) before the refusal, red.
 func TestCreateVM_ARefusedCreateLeavesTheKeptDiskWhereItsVMRecordedIt(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -91,6 +91,9 @@ func TestCreateVM_ARefusedCreateLeavesTheKeptDiskWhereItsVMRecordedIt(t *testing
 				t.Fatal(err)
 			}
 			req.Spec.Firmware, req.Spec.SecureBoot = "uefi", true
+		}},
+		{"an image this host does not have and cannot pull", codes.FailedPrecondition, "auto-pull failed", func(t *testing.T, s *Server, req *pb.CreateVMRequest) {
+			req.Spec.Image = "nosuch"
 		}},
 		{"a USB port with nothing in it", codes.FailedPrecondition, "usb device 0", func(t *testing.T, s *Server, req *pb.CreateVMRequest) {
 			t.Cleanup(lv.SetUSBSysfsRootForTest(t.TempDir()))
@@ -383,4 +386,28 @@ func TestCreateVM_TheOwnerLogsAFailedCreateAndItsCleanup(t *testing.T) {
 			t.Errorf("cleanup result %q does not say %q", cleanup["result"], want)
 		}
 	}
+}
+
+// A failed create whose stopped domain could not be undefined leaves the
+// kept disk at its .kept- name: linked back, it would be the disk the
+// still-defined domain names (review m1).
+//
+// Mutation: restore whatever the undefine did — the disk is back at the
+// path, red.
+func TestCreateVM_AKeptDiskStaysAsideWhileTheDomainIsLeftDefined(t *testing.T) {
+	s, fake := provableCreateServer(t)
+	path, kept := keptDataDisk(t, s, "vm1")
+	failInsert(t, s)
+	fake.FailUndefinePreserv = func(string) error { return errors.New("undefine refused") }
+	if _, err := s.CreateVM(adminCtx(), withDataDisk(disklessCreateRequest("vm1"))); err == nil || !strings.Contains(err.Error(), "left defined") {
+		t.Fatalf("CreateVM = %v; want the domain left defined named", err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a file is at the path the still-defined domain names: %v", err)
+	}
+	k := keptCopiesOf(t, path)
+	if len(k) != 1 {
+		t.Fatalf("kept copies = %v; want the kept disk left aside", k)
+	}
+	assertFileIs(t, k[0], kept, "the kept disk")
 }

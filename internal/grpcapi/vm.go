@@ -447,6 +447,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	var undone []string
 	noteUndo := func(what string) { undone = append(undone, what) }
 	rowCommitted, keepHeld := false, false
+	// leftDefined: the abort stopped this create's domain but could not
+	// undefine it, so a domain of the name still names the disk paths.
+	leftDefined := false
 	defer func() {
 		switch {
 		case retErr == nil:
@@ -697,7 +700,15 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	moved, debrisErr := s.clearDiskDebrisBeforeCreate(ctx, spec.Name, setAt)
 	var seedKept keptSeed
 	defer func() {
-		if retErr != nil && !rowCommitted && !keepHeld {
+		switch {
+		case retErr == nil || rowCommitted || keepHeld:
+		case leftDefined:
+			// A kept disk linked back would be the disk of that domain's
+			// definition: it stays at its .kept- name.
+			if len(moved) > 0 || seedKept.to != "" {
+				noteUndo("kept disks and seed left at their .kept- names: the domain is still defined")
+			}
+		default:
 			s.restoreKeptAfterFailedCreate(context.WithoutCancel(ctx), spec.Name, moved, seedKept, noteUndo)
 		}
 	}()
@@ -1492,6 +1503,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		if uerr := s.virt.UndefineDomainPreservingState(spec.Name); uerr != nil {
 			slog.Warn("vm create: undefine after a failed create failed", "name", spec.Name, "error", uerr)
 			noteUndo(fmt.Sprintf("domain left defined: it could not be undefined (%v)", uerr))
+			leftDefined = true
 			cause = fmt.Errorf("%w; its domain is stopped but could not be undefined on %s (%v) and is left defined, "+
 				"with no VM record: the next create of %s removes it", cause, s.hostName, uerr, spec.Name)
 		} else {

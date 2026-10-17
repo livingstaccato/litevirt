@@ -125,17 +125,8 @@ func receiverAuditInventory(ctx context.Context, tx *LocalTx, a *AutomationRecei
 	if err = receiverVerifyInventory(ctx, tx, a.id, source, p); err != nil {
 		return err
 	}
-	for _, q := range []string{
-		`SELECT component FROM local_automation_receiver_components WHERE attempt=? AND source=? AND component<0 LIMIT 1`,
-		`SELECT component FROM local_automation_receiver_components WHERE attempt=? AND source=? AND component>=12 LIMIT 1`,
-	} {
-		rows, err = tx.Query(ctx, q, a.id, source)
-		if err != nil {
-			return err
-		}
-		if len(rows) != 0 {
-			return errors.New("extra audit component")
-		}
+	if err = receiverVerifyComponentKeys(ctx, tx, a.id, source, "local_automation_receiver_components"); err != nil {
+		return err
 	}
 	for component := uint32(0); component < 12; component++ {
 		rows, err = tx.Query(ctx, `SELECT state FROM local_automation_receiver_components WHERE attempt=? AND source=? AND component=? AND terminal=1 AND cursor='' AND typeof(state)='blob' AND length(CAST(state AS BLOB)) BETWEEN 1 AND ? LIMIT 1`, a.id, source, component, receiverStateBytes)

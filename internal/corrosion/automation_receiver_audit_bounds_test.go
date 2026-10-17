@@ -22,6 +22,8 @@ type receiverSemanticReads struct {
 	enabled                                                 bool
 	queries, probes, bodies, requestBodies, operationBodies int
 	maxRows, maxBytes                                       int
+	metadataBodies                                          [3]int
+	componentQueries                                        int
 	plans                                                   map[string]string
 	bad                                                     []string
 }
@@ -55,7 +57,7 @@ func (c *receiverSemanticConn) QueryContext(ctx context.Context, q string, args 
 	c.state.mu.Lock()
 	enabled := c.state.enabled
 	c.state.mu.Unlock()
-	tracked := enabled && (strings.Contains(q, "FROM local_automation_receiver_records") || strings.Contains(q, "FROM local_automation_receiver_refs") || strings.Contains(q, "FROM local_automation_receiver_requests"))
+	tracked := enabled && (strings.Contains(q, "FROM local_automation_receiver_components") || strings.Contains(q, "FROM local_automation_receiver_records") || strings.Contains(q, "FROM local_automation_receiver_refs") || strings.Contains(q, "FROM local_automation_receiver_requests"))
 	if tracked {
 		plan, err := reader.QueryContext(ctx, "EXPLAIN QUERY PLAN "+q, args)
 		if err != nil {
@@ -79,6 +81,9 @@ func (c *receiverSemanticConn) QueryContext(ctx context.Context, q string, args 
 		}
 		c.state.mu.Lock()
 		c.state.queries++
+		if strings.HasPrefix(q, "SELECT CASE WHEN typeof(component)") {
+			c.state.componentQueries++
+		}
 		c.state.plans[q] = detail
 		if !strings.Contains(detail, "SEARCH ") || strings.Contains(detail, "SCAN ") || strings.Contains(detail, "TEMP B-TREE") {
 			c.state.bad = append(c.state.bad, "not an indexed bounded search: "+q+" "+detail)
@@ -91,6 +96,11 @@ func (c *receiverSemanticConn) QueryContext(ctx context.Context, q string, args 
 		}
 		if strings.HasPrefix(q, "SELECT record ") {
 			c.state.bodies++
+			if len(args) >= 3 {
+				if component, ok := args[2].Value.(int64); ok && component >= 0 && component < 3 {
+					c.state.metadataBodies[component]++
+				}
+			}
 		}
 		if strings.HasPrefix(q, "SELECT identity,receipt ") {
 			c.state.requestBodies++
@@ -186,16 +196,20 @@ func TestReceiverSourceAuditManyPagesBoundedReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	state.enabled = false
-	if len(state.bad) != 0 || state.maxRows != 1 || state.maxBytes > maxAutomationCutRecordBytes || state.probes < 130 || state.bodies < 130 || state.requestBodies == 0 || state.operationBodies == 0 {
+	if len(state.bad) != 0 || state.maxRows != 1 || state.maxBytes > maxAutomationCutRecordBytes || state.probes < 130 || state.bodies < 130 || state.requestBodies == 0 || state.operationBodies == 0 || state.componentQueries < 13 || state.componentQueries > 26 {
 		t.Fatal("actual production read bounds", state.bad, state.maxRows, state.maxBytes, state.probes, state.bodies, state.requestBodies, state.operationBodies)
 	}
 	if receiverActive(t, r.client) != active {
 		t.Fatal("many-page audit activated receiver")
 	}
 	for query, plan := range state.plans {
+		if strings.HasPrefix(query, "SELECT CASE WHEN typeof(component)") && !strings.Contains(plan, "component>?") {
+			t.Fatal("component walk lacks indexed range", plan)
+		}
 		t.Logf("actual indexed SQL %s => %s", query, plan)
 	}
 	t.Logf("actual reads=%d length predicates/probes=%d body reads=%d max returned rows=%d max field bytes=%d request bodies=%d operation bodies=%d", state.queries, state.probes, state.bodies, state.maxRows, state.maxBytes, state.requestBodies, state.operationBodies)
+	t.Logf("actual component key seeks=%d metadata body reads=%v", state.componentQueries, state.metadataBodies)
 }
 
 func TestReceiverSourceAuditLengthBeforeMaterialization(t *testing.T) {

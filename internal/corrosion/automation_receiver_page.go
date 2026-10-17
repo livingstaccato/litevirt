@@ -329,12 +329,12 @@ func receiverVerifyRows(ctx context.Context, tx *LocalTx, attempt, source string
 		h.Write(prefix)
 	}
 	var ordinal, total int64
-	bad, err := tx.Query(ctx, `SELECT ordinal FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component=? AND ordinal<=0 LIMIT 1`, attempt, source, component)
+	bad, err := tx.Query(ctx, `SELECT 1 AS invalid FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component=? AND ordinal<=0 LIMIT 1`, attempt, source, component)
 	if err != nil || len(bad) != 0 {
 		return errors.New("receiver invalid retained ordinal")
 	}
 	for {
-		rows, err := tx.Query(ctx, `SELECT ordinal,length(CAST(record AS BLOB)) AS size FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component=? AND ordinal>? ORDER BY ordinal LIMIT 1`, attempt, source, component, ordinal)
+		rows, err := tx.Query(ctx, `SELECT CASE WHEN typeof(ordinal)='integer' THEN ordinal END AS canonical_ordinal,typeof(record) AS kind,length(CAST(record AS BLOB)) AS size FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component=? AND ordinal>? ORDER BY ordinal LIMIT 1`, attempt, source, component, ordinal)
 		if err != nil {
 			return err
 		}
@@ -346,11 +346,11 @@ func receiverVerifyRows(ctx context.Context, tx *LocalTx, attempt, source string
 		if component < 3 {
 			bound = AutomationExportChunkBytes
 		}
-		if ordinal == math.MaxInt64 || rows[0].Int64("ordinal") != ordinal+1 || ordinal >= want.TotalRecords || n <= 0 || n > bound || n > want.TotalBytes-total {
+		if rows[0].String("kind") != "blob" || ordinal == math.MaxInt64 || rows[0].Int64("canonical_ordinal") != ordinal+1 || ordinal >= want.TotalRecords || n <= 0 || n > bound || n > want.TotalBytes-total {
 			return errors.New("receiver retained inventory length/order differs")
 		}
 		ordinal++
-		rows, err = tx.Query(ctx, `SELECT record FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component=? AND ordinal=? AND length(CAST(record AS BLOB))=? LIMIT 1`, attempt, source, component, ordinal, n)
+		rows, err = tx.Query(ctx, `SELECT record FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component=? AND ordinal=? AND typeof(record)='blob' AND length(CAST(record AS BLOB))=? LIMIT 1`, attempt, source, component, ordinal, n)
 		if err != nil || len(rows) != 1 {
 			return errors.New("receiver retained record missing")
 		}
@@ -372,14 +372,8 @@ func receiverVerifyRows(ctx context.Context, tx *LocalTx, attempt, source string
 // Last transport terminal audits every pinned inventory from actual rows. This
 // is not the semantic aggregate audit or any completion/adoption capability.
 func receiverVerifyInventory(ctx context.Context, tx *LocalTx, attempt, source string, p receiverPublication) error {
-	for _, q := range []string{
-		`SELECT component FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component<0 LIMIT 1`,
-		`SELECT component FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component>=12 LIMIT 1`,
-	} {
-		rows, err := tx.Query(ctx, q, attempt, source)
-		if err != nil || len(rows) != 0 {
-			return errors.New("receiver unsupported retained component")
-		}
+	if err := receiverVerifyComponentKeys(ctx, tx, attempt, source, "local_automation_receiver_records"); err != nil {
+		return err
 	}
 	if err := receiverCheckPublicationRows(ctx, tx, attempt, source, p); err != nil {
 		return err
@@ -396,4 +390,34 @@ func receiverVerifyInventory(ctx context.Context, tx *LocalTx, attempt, source s
 		}
 	}
 	return nil
+}
+
+// Non-STRICT retained tables can contain fractional, TEXT or BLOB keys despite
+// INTEGER affinity. Jump directly to the next distinct component with the
+// (attempt,source,component,ordinal) or (attempt,source,component) primary index.
+// There are at most twelve valid keys. CASE returns only a bounded canonical
+// integer or -1, never an arbitrary malformed key/body. No residual type filter
+// scans a component's history before LIMIT. table is an internal fixed name.
+func receiverVerifyComponentKeys(ctx context.Context, tx *LocalTx, attempt, source, table string) error {
+	rows, err := tx.Query(ctx, `SELECT 1 AS invalid FROM `+table+` WHERE attempt=? AND source=? AND component<0 LIMIT 1`, attempt, source)
+	if err != nil {
+		return err
+	}
+	if len(rows) != 0 {
+		return errors.New("receiver invalid retained component")
+	}
+	for component := int64(-1); ; {
+		rows, err = tx.Query(ctx, `SELECT CASE WHEN typeof(component)='integer' AND component BETWEEN 0 AND 11 THEN component ELSE -1 END AS canonical_component FROM `+table+` WHERE attempt=? AND source=? AND component>? ORDER BY component LIMIT 1`, attempt, source, component)
+		if err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+		next := rows[0].Int64("canonical_component")
+		if next < 0 || next <= component {
+			return errors.New("receiver noncanonical retained component")
+		}
+		component = next
+	}
 }

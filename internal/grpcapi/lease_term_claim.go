@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"time"
@@ -50,10 +51,38 @@ import (
 // — so skew cannot produce a second holder, and a minority side of a
 // partition cannot decide anything.
 
-// leaseTermClaimBudget bounds one term's claim. A voter that does not answer
-// costs one claims.DefaultCallTimeout per phase; a duel costs a few rounds of
-// milliseconds.
+// leaseTermClaimBudget bounds one term's claim. A phase that reaches its
+// quorum returns at once (claims.Spec.ReturnAtQuorum); one that does not waits
+// out a voter that does not answer, one claims.DefaultCallTimeout.
 const leaseTermClaimBudget = 10 * time.Second
+
+// leaseClaimYieldBase is how long a claimant outbid by another claimant of the
+// same term lets it finish before going above it (leaseClaimYield). A
+// claimant with its quorum decides in two round trips to the voters — tens of
+// milliseconds — so this is many decisions' worth, and a few yields still fit
+// leaseTermClaimBudget.
+const leaseClaimYieldBase = 250 * time.Millisecond
+
+// leaseClaimYield is the pause before self outbids stale, another claimant's
+// ballot. Every claimant of a dead holder's lease polls on the same tick and
+// proposes at round 1. Outbidding at once pre-empts the leader between its
+// two phases, and with several claimants that repeats round after round: five
+// claimants against a dead voter reached round 39 on the lab and took the
+// lease over a TTL late. Waiting instead lets the leader decide; the retry,
+// one round up, then finds the decided value in a promise and completes it,
+// learning the holder. A claimant defers longer to a lower-sorting name —
+// the one the tie rule prefers at an equal round — and the jitter keeps the
+// rest from retrying together. Safety does not rest on any of this: the
+// ballots decide, whatever the timing.
+func leaseClaimYield(self string) func(int, corrosion.Ballot) time.Duration {
+	return func(_ int, stale corrosion.Ballot) time.Duration {
+		d := leaseClaimYieldBase + time.Duration(rand.Int64N(int64(leaseClaimYieldBase)))
+		if stale.Coordinator < self {
+			d += leaseClaimYieldBase
+		}
+		return d
+	}
+}
 
 // condLeaseClaimNoMajority is raised while a lease cannot get a claim
 // majority for longer than one of its TTLs, and resolved when it can.
@@ -151,24 +180,14 @@ func (s *Server) claimLeaseTerm(ctx context.Context, cfg *corrosion.VoterConfig,
 	}
 	names := cfg.Names()
 	q := corrosion.MajorityOf(len(names))
-	proposal := corrosion.ClaimValue{LeaseTerm: &corrosion.LeaseTermValue{Key: req.Key, Term: req.Term, Holder: self}}
-	spec := claims.Spec{
-		Key: key, Generation: cfg.Generation, Voters: names, PrepareQuorum: q,
-		Electorate: func(corrosion.ClaimValue) ([]string, int) { return names, q },
-		Propose:    func(map[string]corrosion.PrepareResult) (corrosion.ClaimValue, error) { return proposal, nil },
-		StartRound: 1,
-	}
+	spec := leaseTermClaimSpec(key, cfg.Generation, names, req, self)
 	cctx, cancel := context.WithTimeout(ctx, leaseTermClaimBudget)
 	defer cancel()
 	p := s.claimProposer()
 	out, err := p.Decide(cctx, spec)
 	// The decision is learned now, not when the lease was classified: the
 	// winner may have classified, and so started its TTL, after this node did.
-	learned := started
-	if at, perr := time.Parse(time.RFC3339, req.Now); perr == nil {
-		learned = at
-	}
-	learned = learned.Add(time.Since(started))
+	learned := clearanceInstant(req, started)
 	if err != nil {
 		if !s.leaseClaimLatched() && olderBuildsBlockAMajority(err, names, q) {
 			slog.Info("leader lease: so many voters run a build without lease-term claims that the rest "+
@@ -178,7 +197,15 @@ func (s *Server) claimLeaseTerm(ctx context.Context, cfg *corrosion.VoterConfig,
 			return true, ""
 		}
 		why := fmt.Sprintf("no majority of voter generation %d decided term %d: %v", cfg.Generation, req.Term, err)
-		s.noteLeaseClaimNoMajority(ctx, req, learned, why)
+		if majorityAnswered(err, names, q) {
+			// A duel lost to another claimant of the term, with a majority
+			// there to decide it: not a stall, and not counted.
+			slog.Debug("leader lease: another claimant of the term outranked this one; retries next poll",
+				"lease", req.Key, "term", req.Term, "reason", why)
+			s.noteLeaseClaimContended(req.Key)
+			return false, why
+		}
+		s.noteLeaseNoMajority(ctx, req.Key, req.TTL, learned, why)
 		return false, why
 	}
 	s.noteLeaseClaimDecided(ctx, req.Key)
@@ -194,6 +221,24 @@ func (s *Server) claimLeaseTerm(ctx context.Context, cfg *corrosion.VoterConfig,
 	s.db.NoteLeaseTermDecided(req.Key, req.Term, won.Holder, learned)
 	return false, fmt.Sprintf("term %d was decided for %s; this node records nothing and waits for that "+
 		"node's lease (or for it to lapse, then claims the next term)", req.Term, won.Holder)
+}
+
+// leaseTermClaimSpec is the claim for req's term among names, the members of
+// voter generation gen, proposing self as the holder.
+func leaseTermClaimSpec(key corrosion.ClaimKey, gen int64, names []string, req corrosion.LeaseMintRequest, self string) claims.Spec {
+	q := corrosion.MajorityOf(len(names))
+	proposal := corrosion.ClaimValue{LeaseTerm: &corrosion.LeaseTermValue{Key: req.Key, Term: req.Term, Holder: self}}
+	return claims.Spec{
+		Key: key, Generation: gen, Voters: names, PrepareQuorum: q,
+		Electorate: func(corrosion.ClaimValue) ([]string, int) { return names, q },
+		Propose:    func(map[string]corrosion.PrepareResult) (corrosion.ClaimValue, error) { return proposal, nil },
+		StartRound: 1,
+		// A dead voter must not cost each phase the call timeout, and an
+		// outbid claimant lets the leader finish: together they keep a
+		// takeover by many claimants to about one decision's time.
+		ReturnAtQuorum: true,
+		Yield:          leaseClaimYield(self),
+	}
 }
 
 // olderBuildsBlockAMajority reports whether err is a claim that failed in
@@ -234,6 +279,30 @@ func olderBuildsBlockAMajority(err error, names []string, q int) bool {
 	return len(names)-len(old) < q
 }
 
+// majorityAnswered reports whether err is a claim that a majority of the
+// generation was there to decide: the members that promised or accepted, plus
+// those that refused only because another claimant's ballot outranked this
+// one's, are a majority. That is a duel lost, not a stall. Anything else —
+// unreachable members, refusals no higher ballot can change, an error that is
+// not a claim's answer at all — leaves no majority this node could reach.
+func majorityAnswered(err error, names []string, q int) bool {
+	var nm *claims.NoMajorityError
+	if !errors.As(err, &nm) {
+		return false
+	}
+	member := make(map[string]bool, len(names))
+	for _, v := range names {
+		member[v] = true
+	}
+	outbid := map[string]bool{}
+	for _, r := range nm.Refusals {
+		if member[r.Voter] && (r.Reason == corrosion.RefusalBallotStale || r.Reason == corrosion.RefusalValueConflict) {
+			outbid[r.Voter] = true
+		}
+	}
+	return nm.Got+len(outbid) >= q
+}
+
 // olderBuildRefusal is how a build without lease-term claims refuses one:
 // ClaimKey.Validate's answer for a target kind it does not know. It mirrors
 // the default branch of ClaimKey.Validate in the release before
@@ -241,23 +310,33 @@ func olderBuildsBlockAMajority(err error, names []string, q int) bool {
 // there does not change what an older build answers.
 var olderBuildRefusal = fmt.Sprintf("unknown claim target kind %q", corrosion.ClaimKindLeaseTerm)
 
-// noteLeaseClaimNoMajority counts a claim with no majority and raises
-// ha.lease.claim_no_majority once the lease has had none for one TTL.
-func (s *Server) noteLeaseClaimNoMajority(ctx context.Context, req corrosion.LeaseMintRequest, now time.Time, why string) {
+// NoteLeaseNoMajority is corrosion's report (SetLeaseNoMajorityObserver) of
+// a lease poll that stood down for want of the voter majority, over a lease
+// this node sees no live holder of: a takeover that cannot happen.
+func (s *Server) NoteLeaseNoMajority(ctx context.Context, ev corrosion.LeaseNoMajority) {
+	s.noteLeaseNoMajority(ctx, ev.Key, ev.TTL, ev.Now, ev.Why)
+}
+
+// noteLeaseNoMajority counts one poll on which this node would take key over
+// and cannot, because no voter majority is available to it — the health
+// voter quorum is lost, the quorum high-water read found no quorum, or the
+// term's claim reached no majority — and raises ha.lease.claim_no_majority
+// once the lease has had none for one TTL.
+func (s *Server) noteLeaseNoMajority(ctx context.Context, key string, ttl time.Duration, now time.Time, why string) {
 	if s.onLeaseClaimNoMajority != nil {
-		s.onLeaseClaimNoMajority(req.Key)
+		s.onLeaseClaimNoMajority(key)
 	}
 	st := &s.leaseClaimStall
 	st.mu.Lock()
 	if st.since == nil {
 		st.since = map[string]time.Time{}
 	}
-	since, ok := st.since[req.Key]
+	since, ok := st.since[key]
 	if !ok {
-		st.since[req.Key], since = now, now
+		st.since[key], since = now, now
 	}
 	st.mu.Unlock()
-	if req.TTL <= 0 || now.Sub(since) < req.TTL {
+	if ttl <= 0 || now.Sub(since) < ttl {
 		return
 	}
 	line := fmt.Sprintf("lease %s has had no takeover since %s: %s. A takeover needs a majority of the "+
@@ -267,9 +346,18 @@ func (s *Server) noteLeaseClaimNoMajority(ctx context.Context, req corrosion.Lea
 		"(docs/design/recovery-claims.md §4.6). "+
 		"Repair a voter while ha.voter.unavailable names it, before it is needed. "+
 		"`lv cluster voter reset` returns lease takeovers to the two-holder race.",
-		req.Key, since.UTC().Format(time.RFC3339), why)
-	s.applyClusterCondition(ctx, leaseClaimEvaluator, condLeaseClaimNoMajority, req.Key,
-		map[string]string{req.Key: line}, []string{s.hostName}, "")
+		key, since.UTC().Format(time.RFC3339), why)
+	s.applyClusterCondition(ctx, leaseClaimEvaluator, condLeaseClaimNoMajority, key,
+		map[string]string{key: line}, []string{s.hostName}, "")
+}
+
+// noteLeaseClaimContended ends this node's no-majority stall for key without
+// touching the condition row: a duel showed a majority there to decide.
+func (s *Server) noteLeaseClaimContended(key string) {
+	st := &s.leaseClaimStall
+	st.mu.Lock()
+	delete(st.since, key)
+	st.mu.Unlock()
 }
 
 // noteLeaseClaimDecided ends a no-majority stall for key: a claim for it was

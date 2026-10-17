@@ -62,9 +62,18 @@ func TestRebalancer_NoLeaseWithoutQuorum(t *testing.T) {
 	r.Now = func() time.Time { return now }
 	lost := true
 	r.QuorumLost = func(context.Context) bool { return lost }
+	stalls := 0
+	db.SetLeaseNoMajorityObserver(func(_ context.Context, ev corrosion.LeaseNoMajority) {
+		if ev.Key == r.LeaseKey && ev.TTL == 2*r.PollInterval && ev.Now.Equal(now) {
+			stalls++
+		}
+	})
 
 	if r.acquireLease(ctx) {
 		t.Fatal("took the rebalancer lease with the voter majority lost")
+	}
+	if stalls != 1 {
+		t.Fatalf("%d stalled takeovers reported for a free lease with the voter majority lost, want 1", stalls)
 	}
 	lost = false
 	if !r.acquireLease(ctx) {
@@ -81,5 +90,8 @@ func TestRebalancer_NoLeaseWithoutQuorum(t *testing.T) {
 	}
 	if _, again, err := corrosion.ReadLeaseRow(ctx, db, r.LeaseKey); err != nil || again != first {
 		t.Fatalf("the lease's expiry moved from %s to %s (%v) with the voter majority lost", first, again, err)
+	}
+	if stalls != 1 {
+		t.Fatal("a holder standing down over its own live lease was reported as a stalled takeover")
 	}
 }

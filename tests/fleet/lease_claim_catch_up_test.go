@@ -30,6 +30,7 @@ func wireMintClearance(c *Cluster) {
 	for _, n := range c.Nodes {
 		n.DB.SetLeaseMintClearance(n.Server.LeaseMintClearance)
 		n.DB.SetLeaseLiveObserver(n.Server.NoteLeaseLive)
+		n.DB.SetLeaseNoMajorityObserver(n.Server.NoteLeaseNoMajority)
 	}
 }
 

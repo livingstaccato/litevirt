@@ -65,6 +65,9 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		defer conn.Close()
 		return client.CreateSnapshot(ctx, req)
 	}
+	if err := s.firmwareMoveRefusal("snapshot", vm); err != nil {
+		return nil, err
+	}
 
 	// A libvirt snapshot of a VM is an external qcow2 overlay per disk, which a
 	// network (rbd) disk cannot have.
@@ -360,6 +363,12 @@ func (s *Server) restoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 		return vm, err
 	}
 
+	// A revert redefines and starts the domain and overwrites its firmware
+	// state from the snapshot's (restoreFW): not while a live firmware move's
+	// record names it (spec §6.9).
+	if err := s.firmwareMoveRefusal("snapshot restore", vm); err != nil {
+		return nil, err
+	}
 	// A revert can bring the domain back running with its installer ISO; it
 	// is judged here, on the owner, after the caller's authority.
 	if err := s.verifyVMISOForStart(vm); err != nil {

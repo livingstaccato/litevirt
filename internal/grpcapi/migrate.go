@@ -1281,6 +1281,11 @@ func (s *Server) MigrateVMForHealthCheck(ctx context.Context, vmName, targetHost
 	// internal (health-checker-driven) call. Both username and role must
 	// be present — RequirePerm rejects an empty principal before reaching
 	// the role fallback.
+	// The health-check migrate action does not live-move a Secure Boot /
+	// vTPM VM (spec §1, §12).
+	if err := s.migrateVMForHealthCheckRefusal(ctx, vmName); err != nil {
+		return err
+	}
 	authCtx := context.WithValue(ctx, ctxKeyRole, "admin")
 	authCtx = context.WithValue(authCtx, ctxKeyUsername, "system:healthcheck")
 	return s.MigrateVM(req, &discardMigrateStream{ctx: authCtx})

@@ -105,6 +105,11 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return status.Errorf(codes.AlreadyExists,
 			"VM %q already exists (on host %s) — choose a different --name or remove it first", name, existing.HostName)
 	}
+	// The import defines a domain and NVRAM of this name, undefining a
+	// leftover one: not one a live firmware move's record names (spec §6.9).
+	if err := s.firmwareMoveNameRefusal("import", name); err != nil {
+		return err
+	}
 	// ── Stage the source into a temp import dir (always cleaned up) ──
 	if err := os.MkdirAll(filepath.Join(s.dataDir, "imports"), 0o755); err != nil {
 		return status.Errorf(codes.Internal, "prepare import dir: %v", err)

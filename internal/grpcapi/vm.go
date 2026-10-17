@@ -404,6 +404,11 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		return s.forwardCreateVM(ctx, req, targetHost)
 	}
+	// The NVRAM is keyed by name: a live firmware move's record of this name
+	// here holds a domain and state the create would replace (spec §6.9).
+	if err := s.firmwareMoveNameRefusal("create", spec.Name); err != nil {
+		return nil, err
+	}
 	// Stable domain identity (G1): persisted in the spec so libvirt's default
 	// swtpm path (/var/lib/libvirt/swtpm/<uuid>/) is deterministic across the VM's
 	// life — letting vTPM state be located + carried without an explicit <source>.
@@ -1844,6 +1849,9 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	if vm.HostName != s.hostName {
 		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
 	}
+	if err := s.firmwareMoveRefusal("start", vm); err != nil {
+		return nil, err
+	}
 	// A point-in-time overlay an earlier copy left holds writes the disk's
 	// file lacks: settle it before anything reads or starts the disk.
 	if err := s.settlePITOverlays(ctx, vm); err != nil {
@@ -2390,6 +2398,11 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 	if vm.HostName != s.hostName {
 		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
 	}
+	// A VM a live firmware move's record names is not stopped (spec §6.9);
+	// every other VM stops as before.
+	if err := s.firmwareMoveStopRefusal(vm); err != nil {
+		return nil, err
+	}
 
 	return s.stopVMLocked(ctx, vm, req.Force, req.Timeout)
 }
@@ -2629,6 +2642,9 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 	}
 	if vm.HostName != s.hostName {
 		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
+	}
+	if err := s.firmwareMoveRefusal("restart", vm); err != nil {
+		return nil, err
 	}
 
 	// Split-brain gate (Phase 1): a restart (destroy+start) is a runtime action on a
@@ -2955,6 +2971,14 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		if vm.HostName != s.hostName {
 			return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-delete; retry", req.Name, vm.HostName)
 		}
+	}
+
+	// A VM a live firmware move's record names here is not deleted: its
+	// definition and both copies of its firmware state stay until the move
+	// ends (spec §6.9). A peer's probe is refused the same, and passes the
+	// refusal on.
+	if err := s.firmwareMoveRefusal("delete", vm); err != nil {
+		return nil, err
 	}
 
 	// Verify the domain actually exists in libvirt on this host. If the
@@ -4339,6 +4363,11 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		return client.RebuildVM(ctx, req)
 	}
 
+	// Required, not only the guard (spec §6.9): rebuild deletes the disks
+	// after an undefine whose refusal it ignores.
+	if err := s.firmwareMoveRefusal("rebuild", vm); err != nil {
+		return nil, err
+	}
 	// The same three barriers DeleteVM carries, for the same reason: this is a
 	// destructive operation and each of these states means something else owns
 	// the VM's disks right now.
@@ -4608,6 +4637,19 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 		}
 		defer conn.Close()
 		return client.CutoverVM(ctx, req)
+	}
+
+	// The cutover stops and deletes the replaced VM and renames the
+	// replacement's NVRAM: neither may be in a live firmware move here.
+	if err := s.firmwareMoveRefusal("cutover", nextVM); err != nil {
+		return nil, err
+	}
+	if old, _ := corrosion.GetVM(ctx, s.db, req.VmName); old != nil {
+		if err := s.firmwareMoveRefusal("cutover", old); err != nil {
+			return nil, err
+		}
+	} else if err := s.firmwareMoveNameRefusal("cutover", req.VmName); err != nil {
+		return nil, err
 	}
 
 	// Resource pre-check: during the cutover overlap window, both the old and
@@ -5082,6 +5124,9 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 		defer conn.Close()
 		return client.ResizeDisk(ctx, req)
 	}
+	if err := s.firmwareMoveRefusal("disk resize", vm); err != nil {
+		return nil, err
+	}
 
 	// Find the disk record.
 	disks, err := corrosion.GetVMDisks(ctx, s.db, req.VmName)
@@ -5279,6 +5324,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		}
 		defer conn.Close()
 		return client.UpdateVM(ctx, req)
+	}
+	if err := s.firmwareMoveRefusal("update", vm); err != nil {
+		return nil, err
 	}
 
 	// Deserialize stored spec.

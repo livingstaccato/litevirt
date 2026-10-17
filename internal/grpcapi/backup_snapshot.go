@@ -70,6 +70,11 @@ func (s *Server) BackupSnapshot(req *pb.BackupSnapshotRequest, stream grpc.Serve
 
 	unlock := s.lockVM(req.VmName)
 	defer unlock()
+	// The backup reads the VM's disks and firmware state, which a live
+	// firmware move holds (spec §6.9): refused while its record names the VM.
+	if err := s.firmwareMoveRefusal("backup", vm); err != nil {
+		return err
+	}
 	// A point-in-time overlay an earlier copy left holds writes the disk's
 	// file lacks: settle it before anything reads or starts the disk.
 	if err := s.settlePITOverlays(ctx, vm); err != nil {
@@ -671,6 +676,15 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 	switch {
 	case req.InPlace || ownDisk:
 		if err := inPlaceContentAccepted(manifest); err != nil {
+			return err
+		}
+		// An in-place restore overwrites the VM's own disk: not while a live
+		// firmware move's record names it here (spec §6.9).
+		if vm, _ := corrosion.GetVM(ctx, s.db, req.VmName); vm != nil {
+			if err := s.firmwareMoveRefusal("backup restore", vm); err != nil {
+				return err
+			}
+		} else if err := s.firmwareMoveNameRefusal("backup restore", req.VmName); err != nil {
 			return err
 		}
 		if dest, err = s.inPlaceRestoreTarget(ctx, req.VmName, req.DiskName, authProject); err != nil {

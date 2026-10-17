@@ -102,6 +102,13 @@ func (s *Server) CrossRegionMigrate(req *pb.CrossRegionMigrateRequest, stream gr
 	if _, _, vErr := region.ValidateCrossRegion(ctx, s.db, vm.HostName, req.TargetHost); vErr != nil {
 		return status.Error(codes.FailedPrecondition, vErr.Error())
 	}
+	// A Secure Boot / vTPM VM is not live-moved across regions in v1 (spec
+	// §12); refused before any disk is replicated. Its cold move is as before.
+	if req.Live {
+		if why := firmwareMoverRefusal("CrossRegionMigrate", vm); why != "" {
+			return status.Error(codes.FailedPrecondition, why)
+		}
+	}
 
 	if req.IncludeDisks {
 		if err := s.replicateDisksForCrossRegion(ctx, req.VmName, req.TargetPool, stream); err != nil {

@@ -831,6 +831,12 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	if s.virt == nil {
 		return status.Error(codes.FailedPrecondition, "no libvirt backend on this host")
 	}
+	// The promote defines (and may first destroy and undefine) a domain of
+	// the VM's name here: not one a live firmware move's record names
+	// (spec §6.9). Refused before any proof is claimed.
+	if err := s.firmwareMoveRefusal("promote", vm); err != nil {
+		return err
+	}
 	// Split-brain gate (Phase 1), EXECUTE side: the replica host must itself have
 	// local quorum to promote (a runtime-ownership action). A carried proof MARKER
 	// forces the gate even if THIS host hasn't latched enforcement — an asymmetric

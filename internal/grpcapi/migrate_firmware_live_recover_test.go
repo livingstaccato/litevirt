@@ -1271,12 +1271,11 @@ func TestRecoverFirmwareMoves_AbortUnimplementedAfterMigrationParks(t *testing.T
 			r.peerC.unimplemented["AbortLiveFirmwareTarget"] = true
 			r.peerC.mu.Unlock()
 			r.restart()
-			want := fwmig.PhaseTargetUnreachable
 			wantState := libvirtfake.StateRunning
 			if paused {
-				want, wantState = fwmig.PhaseSourcePaused, libvirtfake.StatePaused
+				wantState = libvirtfake.StatePaused
 			}
-			m := requireMarker(t, r, want, fwmig.PhaseMigrating)
+			m := requireMarker(t, r, fwmig.PhaseTargetUnreachable, fwmig.PhaseMigrating)
 			if st, _ := r.srcFake.RawState(fwlVM); st != wantState {
 				t.Errorf("source domain %q, want %q", st, wantState)
 			}
@@ -1491,4 +1490,85 @@ func TestRecoverFirmwareMoves_OwedDiscardWaitsForReplica(t *testing.T) {
 	if owed, _ := r.src.fwRecords().ListOwedDiscards(); len(owed) != 1 {
 		t.Errorf("owed discards %v, want the record kept", owed)
 	}
+}
+
+// Re-review 2 I-A: the M1p park for a rolled-back target is retried. Once the
+// target answers Abort again (holding nothing), the next pass resumes the
+// paused source and undoes the move: the guest is never left paused with no
+// automatic exit.
+//
+// Mutation: park M1p's Unimplemented as source_paused (no retry) — red.
+func TestFirmwareMoveRecovery_RolledBackTargetM1pRetried(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	r.crashAt(fwmig.PhaseMigrating)
+	r.srcFake.SetState(fwlVM, libvirtfake.StatePaused)
+	r.peerC.mu.Lock()
+	r.peerC.unimplemented["AbortLiveFirmwareTarget"] = true
+	r.peerC.mu.Unlock()
+	r.restart()
+	requireMarker(t, r, fwmig.PhaseTargetUnreachable, fwmig.PhaseMigrating)
+	if st, _ := r.srcFake.RawState(fwlVM); st != libvirtfake.StatePaused {
+		t.Fatalf("source domain %q, want kept paused while the target cannot answer", st)
+	}
+	r.peerC.mu.Lock()
+	delete(r.peerC.unimplemented, "AbortLiveFirmwareTarget")
+	r.peerC.mu.Unlock()
+	r.src.FirmwareMoveRecoveryOnce(context.Background())
+	if m, ok := r.marker(); ok {
+		t.Fatalf("marker left %+v", m)
+	}
+	if st, _ := r.srcFake.RawState(fwlVM); st != libvirtfake.StateRunning {
+		t.Errorf("source domain %q, want resumed once the target answered", st)
+	}
+	if vm := r.row(); vm.State != "running" || vm.HostName != "src-host" {
+		t.Errorf("row %s on %s, want running on src-host", vm.State, vm.HostName)
+	}
+}
+
+// vfMissingOpen leaves os1 running on the source without its VF, the
+// condition open and no marker (a failed reattach after a recovered M1p).
+func (r *fwlRig) vfMissingOpen() {
+	r.t.Helper()
+	r.withVF()
+	r.crashAt(fwmig.PhaseMigrating)
+	r.detachForMove()
+	r.srcFake.SetState(fwlVM, libvirtfake.StatePaused)
+	r.srcFake.FailAttachHostdev = func(string, string, string) error { return errors.New("injected attach failure") }
+	r.restartWithLeases()
+	requireFwmigCondition(r.t, r.src, condFwmigVFMissing)
+	if _, ok := r.marker(); ok {
+		r.t.Fatal("the marker is left")
+	}
+}
+
+// Re-review 2 I-B: a paused (or pm-suspended) guest is not stopped: it
+// resumes without its VF, so the condition stays open. Only a shut-off domain
+// resolves it.
+//
+// Mutation: treat paused as stopped — red.
+func TestFirmwareVFMissing_PausedGuestKeepsItOpen(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	r.vfMissingOpen()
+	r.srcFake.SetState(fwlVM, libvirtfake.StatePaused) // a partition-pause-style pause
+	r.src.FirmwareMoveRecoveryOnce(context.Background())
+	requireFwmigCondition(t, r.src, condFwmigVFMissing)
+	r.srcFake.SetState(fwlVM, libvirtfake.StateShutdown)
+	r.src.FirmwareMoveRecoveryOnce(context.Background())
+	requireNoFwmigCondition(t, r.src, condFwmigVFMissing)
+}
+
+// Re-review 2 m-2: the resolver skips a VM whose lock is held (a move or its
+// recovery decides that VM's condition itself).
+//
+// Mutation: judge the VM without the lock — red.
+func TestFirmwareVFMissing_SkipsLockedVM(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	r.vfMissingOpen()
+	r.srcFake.SetState(fwlVM, libvirtfake.StateShutdown) // would resolve
+	unlock := r.src.lockVM(fwlVM)
+	r.src.ResolveFirmwareVFMissingOnce(context.Background())
+	unlock()
+	requireFwmigCondition(t, r.src, condFwmigVFMissing)
+	r.src.ResolveFirmwareVFMissingOnce(context.Background())
+	requireNoFwmigCondition(t, r.src, condFwmigVFMissing)
 }

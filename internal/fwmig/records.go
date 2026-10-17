@@ -40,6 +40,13 @@ const (
 	QuarantineDir  = "fwmig-quarantine"   // quarantine, <vm>-<attempt>/
 )
 
+// Dirs are the record directories, every one of them: each is the daemon's
+// own child of the data directory, and no storage pool may be aimed at one
+// (storage.dataDirOwned). TestDirs_EveryDirConstant pins it to the constants.
+func Dirs() []string {
+	return []string{InflightDir, DiscardOwedDir, HoldDir, RetainedDir, QuarantineDir}
+}
+
 // Phase is a source marker's phase.
 type Phase string
 

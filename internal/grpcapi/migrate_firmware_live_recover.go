@@ -213,65 +213,94 @@ func (s *Server) ResolveFirmwareVFMissingOnce(ctx context.Context) {
 	}
 	conds, err := corrosion.ListOpenHealthConditionsByCode(ctx, s.db, firmwareMigrationEvaluator, condFwmigVFMissing)
 	if err != nil {
+		slog.Debug("live firmware move: the VF-missing conditions cannot be listed", "error", err)
 		return
 	}
 	for _, c := range conds {
 		if c.SubjectKind != "vm" {
 			continue
 		}
+		// A condition raised by a build before vfs_wanted was recorded has
+		// none, and resolves on the next look (unreleased: no backfill).
 		var ev struct {
 			RunsOn    string   `json:"runs_on"`
 			VFs       []string `json:"vfs"`
 			VFsWanted int      `json:"vfs_wanted"`
 		}
-		if json.Unmarshal([]byte(c.Evidence), &ev) != nil {
-			continue
-		}
 		vm := c.SubjectID
-		row, err := corrosion.GetVM(ctx, s.db, vm)
-		if err != nil {
+		if err := json.Unmarshal([]byte(c.Evidence), &ev); err != nil {
+			slog.Debug("live firmware move: VF-missing left open: its evidence cannot be read", "vm", vm, "error", err)
 			continue
 		}
-		why := ""
-		switch {
-		case row == nil:
-			why = "the VM was deleted"
-		case ev.RunsOn != "" && row.HostName != ev.RunsOn:
-			why = "the VM moved to " + row.HostName
-		case row.HostName != s.hostName:
-			continue // its host judges it
-		default:
-			want := ev.VFsWanted
-			if want < len(ev.VFs) {
-				want = len(ev.VFs)
-			}
-			why = s.firmwareVFsBack(ctx, vm, want)
-		}
-		if why == "" {
+		// A move in progress (or its recovery) decides its VM's condition
+		// itself: one it just raised is not resolved under it.
+		unlock, ok := s.tryLockVM(vm)
+		if !ok {
+			slog.Debug("live firmware move: VF-missing left open: the VM is locked", "vm", vm)
 			continue
 		}
-		if err := s.resolveFirmwareMigrationCondition(ctx, condFwmigVFMissing, vm); err == nil {
-			slog.Info("live firmware move: the VF-missing condition is resolved", "vm", vm, "why", why)
+		s.judgeFirmwareVFMissing(ctx, vm, ev.RunsOn, ev.VFs, ev.VFsWanted)
+		unlock()
+	}
+}
+
+// judgeFirmwareVFMissing is ResolveFirmwareVFMissingOnce for one VM, under its
+// lock.
+func (s *Server) judgeFirmwareVFMissing(ctx context.Context, vm, runsOn string, vfs []string, wanted int) {
+	row, err := corrosion.GetVM(ctx, s.db, vm)
+	if err != nil {
+		slog.Debug("live firmware move: VF-missing left open: the VM's row cannot be read", "vm", vm, "error", err)
+		return
+	}
+	why := ""
+	switch {
+	case row == nil:
+		why = "the VM was deleted"
+	case runsOn != "" && row.HostName != runsOn:
+		why = "the VM moved to " + row.HostName
+	case row.HostName != s.hostName:
+		slog.Debug("live firmware move: VF-missing left to the host the VM's row names", "vm", vm, "host", row.HostName)
+		return
+	default:
+		want := wanted
+		if want < len(vfs) {
+			want = len(vfs)
 		}
+		why = s.firmwareVFsBack(ctx, vm, want)
+	}
+	if why == "" {
+		return
+	}
+	if err := s.resolveFirmwareMigrationCondition(ctx, condFwmigVFMissing, vm); err == nil {
+		slog.Info("live firmware move: the VF-missing condition is resolved", "vm", vm, "why", why)
 	}
 }
 
 // firmwareVFsBack says why vm, whose row names this host, no longer misses
-// VFs: it is not running, or runs with at least want of the VFs it owns here
-// in the guest. "" is still missing, or unknown.
+// VFs: its domain is shut off, or it runs with at least want of the VFs it
+// owns here in the guest. "" is still missing (paused or pm-suspended
+// included), or unknown.
 func (s *Server) firmwareVFsBack(ctx context.Context, vm string, want int) string {
 	if s.virt == nil {
 		return ""
 	}
-	st, err := s.sourceDomainState(vm)
-	if err != nil {
+	// Only an inactive (shut off) domain no longer misses its VFs: a paused
+	// or pm-suspended guest resumes with what it has (re-review 2 I-B).
+	active, err := s.virt.DomainIsActive(vm)
+	switch {
+	case err != nil:
+		slog.Debug("live firmware move: VF-missing left open: whether the domain is active cannot be read", "vm", vm, "error", err)
 		return ""
+	case !active:
+		return "the VM is shut off"
 	}
-	if st != "running" {
-		return "the VM is " + st
+	if st, err := s.sourceDomainState(vm); err != nil || st != "running" {
+		slog.Debug("live firmware move: VF-missing left open: the guest is active but not running", "vm", vm, "state", st, "error", err)
+		return ""
 	}
 	devs, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
 	if err != nil {
+		slog.Debug("live firmware move: VF-missing left open: the PCI devices cannot be listed", "vm", vm, "error", err)
 		return ""
 	}
 	in := 0
@@ -284,6 +313,7 @@ func (s *Server) firmwareVFsBack(ctx context.Context, vm string, want int) strin
 		}
 	}
 	if in < want {
+		slog.Debug("live firmware move: VF-missing left open: VFs still missing", "vm", vm, "in_guest", in, "want", want)
 		return ""
 	}
 	return fmt.Sprintf("the guest runs with %d VF(s) it owns here", in)
@@ -904,7 +934,9 @@ func (s *Server) recoverFirmwareMoveCommitted(ctx context.Context, r *liveFirmwa
 		return
 	}
 	// The commit landed: the source's VFs go back to the pool, as after a
-	// watched commit; the target allocates its own.
+	// watched commit; the target allocates its own. Parked (re-review 2
+	// m-1): a finish redone after a crash may attach a VF the first one
+	// already attached, since AttachDevice allocates per call.
 	s.releaseSourceVFsAfterCutover(ctx, r.marker.VM, r.vfs)
 	if finish {
 		if row, err := corrosion.GetVM(ctx, s.db, r.marker.VM); err == nil && row != nil {

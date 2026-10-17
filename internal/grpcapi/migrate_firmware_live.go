@@ -481,8 +481,10 @@ func (s *Server) liveFirmwareSourcePaused(ctx context.Context, r *liveFirmwareRu
 	switch {
 	case abortTargetPredatesRPC(err):
 		// The target may hold the paused incoming copy and cannot say: the
-		// source guest stays paused (review D2-13 N-2).
-		_ = s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseSourcePaused, fmt.Sprintf(
+		// source guest stays paused (review D2-13 N-2), parked
+		// target_unreachable so each pass asks again, and M1p decides once
+		// the target answers (re-review 2 I-A).
+		_ = s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseTargetUnreachable, fmt.Sprintf(
 			"the migration failed (%v) and left the source guest paused; %s: %s", migrateErr, r.target.Name, errTargetRolledBack))
 		return nil, true
 	case err != nil:

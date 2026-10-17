@@ -20,8 +20,6 @@ package fleet
 
 import (
 	"context"
-	"net"
-	"strconv"
 	"testing"
 
 	"github.com/google/uuid"
@@ -424,11 +422,7 @@ func restartForSignal(t *testing.T, c *Cluster, n *Node) {
 		n.stopServerLoops()
 	}
 	n.Stop()
-	l, err := net.Listen("tcp", net.JoinHostPort(n.Address, strconv.Itoa(n.Port)))
-	if err != nil {
-		t.Fatalf("rebind %s: %v", n.Name, err)
-	}
-	n.Listener = l
+	n.rebindPort(t)
 	c.buildServer(n)
 	n.DB.ForgetHeldRefusalsForTest()
 }

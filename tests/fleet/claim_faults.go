@@ -278,6 +278,8 @@ func (c *Cluster) Crash(n *Node) {
 		n.replStarted = false
 	}
 	if n.GRPCSrv != nil {
-		n.GRPCSrv.Stop()
+		n.GRPCSrv.Stop() // closes n.Listener
+		// A crashed node's machine may come back on the same port.
+		n.holdStoppedPort()
 	}
 }

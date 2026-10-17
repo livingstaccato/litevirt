@@ -16,6 +16,16 @@ import (
 // compose up running beside the compose down, or a member re-created on
 // another host) is another incarnation, and is left. Nothing deletes it: this
 // condition names it and the remedy.
+//
+// Only the VM's own host raises it. A teardown's delete of a VM tombstones it
+// on the host its row names (DeleteVM forwards to it), including when a peer
+// held the domain, and a teardown tombstones the stack only after every
+// member's delete has answered, so on that host a member the teardown
+// deleted is gone before its stack is. On any other host the stack's
+// tombstone can arrive first (lab 2 2026-10-17, F2), and a live row there
+// says nothing about the VM. A VM recorded on a removed host is judged by no
+// host. A host whose replica is not trusted (corrosion.ReplicaTrusted) raises
+// nothing: it may still name itself the host of a VM moved away from it.
 const (
 	stackVMOrphanEvaluator = "stack_reconciler"
 	stackVMOrphanCode      = "stack.vm_outlived_stack"
@@ -65,10 +75,13 @@ func vmsOfTornDownStacks(ctx context.Context, db *corrosion.Client) ([]vmOfTornD
 	return out, nil
 }
 
-// reportVMsOfTornDownStacks raises the condition for each such VM and
-// resolves an open one whose VM is gone, records another stack, or whose
-// stack was deployed again. An unchanged condition writes nothing, so every
-// host running this pass costs one write per change, not per pass.
+// reportVMsOfTornDownStacks raises the condition for each such VM on this
+// host and resolves an open one whose VM is gone, records another stack, or
+// whose stack was deployed again. An unchanged condition writes nothing, so
+// every host running this pass costs one write per change, not per pass.
+// A host whose replica has not yet received the stack's tombstone resolves
+// the condition too, and the VM's host raises it again on its next pass, so
+// it can flap while that tombstone replicates.
 func (r *StackReconciler) reportVMsOfTornDownStacks(ctx context.Context) {
 	found, err := vmsOfTornDownStacks(ctx, r.db)
 	if err != nil {
@@ -81,9 +94,18 @@ func (r *StackReconciler) reportVMsOfTornDownStacks(ctx context.Context) {
 		return
 	}
 	ts := time.Now().UTC().Format(time.RFC3339)
+	trusted, why := corrosion.ReplicaTrusted(ctx, r.db, r.hostName, r.replicaCaughtUp)
 	still := map[string]bool{}
 	for _, v := range found {
 		still[v.name] = true
+		if v.host != r.hostName {
+			continue // judged by its own host
+		}
+		if !trusted {
+			slog.Debug("stack-reconciler: not judging a VM that may have outlived its stack; the replica is not trusted",
+				"vm", v.name, "stack", v.stack, "reason", why)
+			continue
+		}
 		row, ok, gerr := corrosion.GetHealthCondition(ctx, r.db, stackVMOrphanEvaluator, stackVMOrphanCode, stackVMOrphanKind, v.name)
 		if gerr != nil {
 			slog.Warn("stack-reconciler: read the outlived-stack condition", "vm", v.name, "error", gerr)

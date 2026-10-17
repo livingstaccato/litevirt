@@ -1563,6 +1563,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start stack deletion reconciler — retries cleanup for stacks stuck in "deleting" state.
 	stackReconciler := health.NewStackReconciler(d.cfg.HostName, d.db)
 	stackReconciler.SetCleaner(svc)
+	stackReconciler.SetReplicaFreshness(d.db.ReplicaCaughtUp)
 	go stackReconciler.Start(ctx)
 
 	// Re-apply LB configs (haproxy + keepalived) that should run on this host.

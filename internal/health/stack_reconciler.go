@@ -51,6 +51,10 @@ type StackReconciler struct {
 	// host first saw that value (teardownInFlight).
 	now          func() time.Time
 	deletingSeen map[string]deletingSighting
+
+	// replicaCaughtUp gates the raise of stack.vm_outlived_stack
+	// (corrosion.ReplicaTrusted). Nil is unwired and trusted.
+	replicaCaughtUp func() (bool, string)
 }
 
 // deletingSighting is a stack's teardown stamp and when this host first saw it.
@@ -73,6 +77,10 @@ func NewStackReconciler(hostName string, db *corrosion.Client) *StackReconciler 
 func (r *StackReconciler) SetCleaner(c StackCleaner) {
 	r.cleaner = c
 }
+
+// SetReplicaFreshness wires the replica catch-up signal the outlived-stack
+// report is gated on (stack_vm_orphan.go).
+func (r *StackReconciler) SetReplicaFreshness(fn func() (bool, string)) { r.replicaCaughtUp = fn }
 
 // SetClock replaces the clock the in-flight grace is judged by (tests).
 func (r *StackReconciler) SetClock(now func() time.Time) { r.now = now }

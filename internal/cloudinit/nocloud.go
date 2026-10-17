@@ -31,13 +31,15 @@ func GenerateISO(cfg Config, outputPath string) error {
 		UserData:      userData,
 		NetworkConfig: cfg.NetworkConfig,
 		VendorData:    cfg.VendorData,
-	}, outputPath)
+	}, outputPath, true)
 }
 
 // writeISO writes seed's files as a NoCloud seed at outputPath, replacing
 // any file there. A seed with no network-config or vendor-data carries no
-// such file.
-func writeISO(seed Seed, outputPath string) error {
+// such file. fresh is a new seed (GenerateISO), which its caller stamps only
+// once this returns nil; a rebuild (RebuildISO) rewrites a seed already
+// stamped as the VM's.
+func writeISO(seed Seed, outputPath string, fresh bool) error {
 	tmpDir, err := os.MkdirTemp("", "litevirt-cloudinit-")
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
@@ -81,8 +83,37 @@ func writeISO(seed Seed, outputPath string) error {
 		return err
 	}
 	diskmode.NarrowBestEffort(tmp)
-	if err := os.Rename(tmp, outputPath); err != nil {
+	// Durable, as the stamp is (StampSeed): the image's bytes reach the disk
+	// before the rename makes it the seed, and the rename before this
+	// returns. Every caller stamps the seed only after this returns, so a
+	// stamp that survives a power cut never names an empty or truncated
+	// seed.
+	if err := syncFile(tmp); err != nil {
+		return fmt.Errorf("sync seed: %w", err)
+	}
+	placed, err := os.Lstat(tmp)
+	if err != nil {
 		return fmt.Errorf("place seed: %w", err)
+	}
+	if err := renameFile(tmp, outputPath); err != nil {
+		return fmt.Errorf("place seed: %w", err)
+	}
+	if err := syncDir(filepath.Dir(outputPath)); err != nil {
+		if !fresh {
+			return fmt.Errorf("sync seed directory: %w", err)
+		}
+		// A new seed whose name may not survive a power cut is not left at
+		// the path, unstamped: its caller never records it, so nothing
+		// would remove it, and it would hold the path a seed the create
+		// moved aside (a kept one, at its .kept- name) is linked back to.
+		// Only the file this wrote is removed. A rebuild keeps its seed:
+		// the path held the VM's own, stamped, and has its new content.
+		if cur, lerr := os.Lstat(outputPath); lerr == nil && os.SameFile(placed, cur) {
+			if rerr := os.Remove(outputPath); rerr != nil && !os.IsNotExist(rerr) {
+				return fmt.Errorf("sync seed directory: %w; the new seed is left at %s, and removing it failed: %v", err, outputPath, rerr)
+			}
+		}
+		return fmt.Errorf("sync seed directory: %w; the new seed is not left in place", err)
 	}
 	clearSeedStale(outputPath)
 	return nil

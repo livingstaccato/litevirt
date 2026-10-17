@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -440,6 +441,31 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		return s.forwardCreateVM(ctx, req, targetHost)
 	}
+	// This host owns the create. A create that fails here is logged with its
+	// cause, and with what its cleanup did (undone, noted as each step runs),
+	// so the owner's log shows both and not only "creating VM" (lab 2, O5).
+	var undone []string
+	noteUndo := func(what string) { undone = append(undone, what) }
+	rowCommitted, keepHeld := false, false
+	// leftDefined: the abort stopped this create's domain but could not
+	// undefine it, so a domain of the name still names the disk paths.
+	leftDefined := false
+	defer func() {
+		switch {
+		case retErr == nil:
+		case rowCommitted:
+			slog.Warn("vm create: the VM was created, and the create still failed after that; nothing is undone",
+				"name", spec.Name, "host", s.hostName, "error", retErr)
+		default:
+			slog.Warn("vm create failed", "name", spec.Name, "host", s.hostName, "cause", retErr)
+			result := "nothing to undo"
+			if len(undone) > 0 {
+				result = strings.Join(undone, "; ")
+			}
+			slog.Warn("vm create: cleanup after the failed create", "name", spec.Name, "host", s.hostName,
+				"result", result, "left_held", keepHeld)
+		}
+	}()
 	// Stable domain identity (G1): persisted in the spec so libvirt's default
 	// swtpm path (/var/lib/libvirt/swtpm/<uuid>/) is deterministic across the VM's
 	// life — letting vTPM state be located + carried without an explicit <source>.
@@ -454,8 +480,8 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// exists and runs, and a later failure (reading it back, a step after it,
 	// a caller that stopped waiting) undoes nothing — no deferred cleanup
 	// below acts once it is set. keepHeld is set when the create failed with
-	// its domain still running: what that guest uses stays held.
-	rowCommitted, keepHeld := false, false
+	// its domain still running: what that guest uses stays held. (Both are
+	// declared above, with the failure log that reads them.)
 	defer func() {
 		if retErr != nil && !rowCommitted {
 			s.forgetISOIdentity(isoIdentityKey(spec.Name, spec))
@@ -582,28 +608,47 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			createdSeed, createdSeedFile = path, fi
 		}
 	}
-	cleanupDisks := func() {
-		if createdSeed != "" {
-			if fi, err := os.Stat(createdSeed); err == nil && os.SameFile(fi, createdSeedFile) {
-				if rmErr := cloudinit.RemoveSeed(createdSeed); rmErr != nil {
-					slog.Warn("cleanup: failed to remove cloud-init seed", "path", createdSeed, "error", rmErr)
-				}
-			}
+	// removeSeed removes the seed this create placed, if it is still the
+	// file at that name.
+	removeSeed := func() {
+		if createdSeed == "" {
+			return
 		}
+		fi, err := os.Stat(createdSeed)
+		if err != nil || !os.SameFile(fi, createdSeedFile) {
+			noteUndo("seed " + createdSeed + " left: it is no longer the file this create placed")
+			return
+		}
+		if rmErr := cloudinit.RemoveSeed(createdSeed); rmErr != nil {
+			slog.Warn("cleanup: failed to remove cloud-init seed", "path", createdSeed, "error", rmErr)
+			noteUndo(fmt.Sprintf("seed %s not removed (%v)", createdSeed, rmErr))
+			return
+		}
+		noteUndo("removed seed " + createdSeed)
+	}
+	cleanupDisks := func() {
+		removeSeed()
 		for _, p := range createdDiskPaths {
 			if drv := createdBy[p]; drv != nil {
 				// The request may be what failed (cancelled, timed out); the
 				// image this create made is removed regardless.
 				rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
-				if rmErr := drv.DeleteDisk(rmCtx, p); rmErr != nil {
-					slog.Warn("cleanup: failed to remove disk", "path", p, "error", rmErr)
-				}
+				rmErr := drv.DeleteDisk(rmCtx, p)
 				cancel()
+				if rmErr != nil {
+					slog.Warn("cleanup: failed to remove disk", "path", p, "error", rmErr)
+					noteUndo(fmt.Sprintf("disk %s not removed (%v)", p, rmErr))
+					continue
+				}
+				noteUndo("removed disk " + p)
 				continue
 			}
 			if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
 				slog.Warn("cleanup: failed to remove disk", "path", p, "error", rmErr)
+				noteUndo(fmt.Sprintf("disk %s not removed (%v)", p, rmErr))
+				continue
 			}
+			noteUndo("removed disk " + p)
 		}
 	}
 
@@ -623,21 +668,56 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		s.virt.UndefineDomain(spec.Name, true)
 	}
 
-	// Clean up any orphaned disk files / cloud-init ISO left from a previous
-	// incomplete delete, even if the libvirt domain is already gone. A disk
-	// a deleted VM of this name was kept with, or that a failover left here,
-	// is moved off its path first (clearDiskDebrisBeforeCreate).
-	if err := s.clearDiskDebrisBeforeCreate(ctx, spec.Name, time.Now()); err != nil {
-		return nil, status.Errorf(codes.Unavailable, "create %s refused on %s: %v; nothing was created", spec.Name, s.hostName, err)
+	// The refusals the create would meet later that do not depend on what it
+	// makes, met before it moves a disk or seed a deleted VM of the name was
+	// kept with: a create refused for them leaves those where they are. After
+	// the orphan sweep above, which can remove a leftover domain's vars.
+	if err := s.firmwarePreflight(spec); err != nil {
+		return nil, err
 	}
-	_ = cloudinit.RemoveSeed(lv.CloudInitISOPath(s.dataDir, spec.Name))
-
+	// USB passthrough, resolved on this (the owning) host: a mapping's row
+	// for it, a bus-port read from its sysfs. A device it cannot resolve
+	// refuses the create rather than defining a VM without it.
+	usbDevs, usbErr := s.resolveUSBHostdevs(ctx, spec)
+	if usbErr != nil {
+		return nil, usbErr
+	}
 	// Auto-pull image from a peer if not available locally.
 	if spec.Image != "" && !s.images.ImageExists(spec.Image) {
 		if err := s.autoPullImage(ctx, spec.Image); err != nil {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"image %q not available locally and auto-pull failed: %v", spec.Image, err)
 		}
+	}
+
+	// Clean up any orphaned disk files / cloud-init ISO left from a previous
+	// incomplete delete, even if the libvirt domain is already gone. A disk
+	// a deleted VM of this name was kept with, or that a failover left here,
+	// is moved off its path first (clearDiskDebrisBeforeCreate), and so is
+	// the kept VM's seed (setAsideKeptSeed). A create that fails puts them
+	// back (create_kept.go).
+	setAt := time.Now()
+	moved, debrisErr := s.clearDiskDebrisBeforeCreate(ctx, spec.Name, setAt)
+	var seedKept keptSeed
+	defer func() {
+		switch {
+		case retErr == nil || rowCommitted || keepHeld:
+		case leftDefined:
+			// A kept disk linked back would be the disk of that domain's
+			// definition: it stays at its .kept- name.
+			if len(moved) > 0 || seedKept.to != "" {
+				noteUndo("kept disks and seed left at their .kept- names: the domain is still defined")
+			}
+		default:
+			s.restoreKeptAfterFailedCreate(context.WithoutCancel(ctx), spec.Name, moved, seedKept, noteUndo)
+		}
+	}()
+	if debrisErr != nil {
+		return nil, status.Errorf(codes.Unavailable, "create %s refused on %s: %v; nothing was created", spec.Name, s.hostName, debrisErr)
+	}
+	keptDisks := slices.ContainsFunc(moved, func(m health.MovedBeforeCreate) bool { return m.Kept })
+	if seedKept, err = s.setAsideKeptSeed(ctx, spec.Name, keptDisks, setAt); err != nil {
+		return nil, status.Errorf(codes.Unavailable, "create %s refused on %s: %v; nothing was created", spec.Name, s.hostName, err)
 	}
 
 	for i, d := range spec.Disks {
@@ -894,7 +974,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// External-IPAM claims taken for this create. A NetBox claim is a synchronous
 	// REMOTE side-effect: it cannot join the local atomic write, so every failure
 	// path from here to the end of CreateVM compensates it explicitly.
-	claims := &claimSet{srv: s}
+	claims := &claimSet{srv: s, report: func(released, failed int) {
+		if failed > 0 {
+			noteUndo(fmt.Sprintf("released %d address claims, %d left to the orphan sweep", released, failed))
+			return
+		}
+		noteUndo(fmt.Sprintf("released %d address claims", released))
+	}}
 
 	// The cluster fingerprint is read at most ONCE, and only if some NIC is
 	// actually on a bound network. A VM on unbound networks must not gain a DB
@@ -1206,16 +1292,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// here, not in the shared builder.
 	vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, nil)
 	vmCfg.CloudInitISO = cloudInitISO
-	// USB passthrough, resolved on this (the owning) host: a mapping's row for
-	// it, a bus-port read from its sysfs. A device it cannot resolve refuses
-	// the create rather than defining a VM without it.
-	if usb, uerr := s.resolveUSBHostdevs(ctx, spec); uerr != nil {
-		claims.releaseAll(ctx)
-		cleanupDisks()
-		return nil, uerr
-	} else {
-		vmCfg.USBHostdevs = usb
-	}
+	vmCfg.USBHostdevs = usbDevs // resolved before anything was made
 	// Secure Boot + vTPM (G1). Use the host-resolved firmware paths and pin per-VM
 	// nvram + swtpm state under dataDir so they travel across the lifecycle. Refuse
 	// to silently adopt firmware state left by a prior `delete --keep-disks`.
@@ -1353,12 +1430,20 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// under a running guest is worse, and the next create of the name removes
 	// a leftover domain first. A domain gone by then is gone: its claims and
 	// swtpm tree are released, the disks are left (whatever removed the domain
-	// may have created at their paths since).
+	// may have created at their paths since). Its seed is removed if it is
+	// still the file this create placed.
+	//
+	// The domain is undefined only after the disks, seed and vars at its
+	// name's paths are removed: while a domain of the name is defined, a
+	// concurrent create of the name cannot define its own, so it has not made
+	// files at those paths for this abort to remove (re-review N8).
 	abortDefined := func(cause error) error {
 		gone := func(why string) error {
 			slog.Error("vm create: the create failed and the domain of its name is not one it can undo; disks left as they are",
 				"name", spec.Name, "host", s.hostName, "why", why, "cause", cause)
+			noteUndo("domain not undone: " + why + "; disks left as they are")
 			claims.releaseAll(ctx)
+			removeSeed()
 			lv.WipeFirmwareStateByUUID(spec.Uuid)
 			return fmt.Errorf("%w; %s, so the disks at this create's paths were not touched", cause, why)
 		}
@@ -1377,6 +1462,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			keepHeld, lunHold.committed = true, true
 			slog.Error("vm create: the create failed and its domain's definition cannot be read; it is left as it is",
 				"name", spec.Name, "host", s.hostName, "cause", cause, "error", xerr)
+			noteUndo(fmt.Sprintf("domain left as it is, with its disks: its definition could not be read (%v)", xerr))
 			return fmt.Errorf("%w; the definition of domain %s on %s could not be read (%v), so it is left as it is, "+
 				"with its disks and no VM record: the next create of %s removes it", cause, spec.Name, s.hostName, xerr, spec.Name)
 		}
@@ -1389,27 +1475,41 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				keepHeld, lunHold.committed = true, true
 				slog.Error("vm create: the create failed and its domain could not be stopped; it is left defined, with its disks",
 					"name", spec.Name, "host", s.hostName, "cause", cause, "error", derr)
+				noteUndo(fmt.Sprintf("domain left defined and running, with its disks: it could not be stopped (%v)", derr))
 				return fmt.Errorf("%w; its domain could not be stopped on %s (%v) and is left defined with its disks, "+
 					"with no VM record: the next create of %s removes it", cause, s.hostName, derr, spec.Name)
 			}
 		}
-		// Preserving: vars at the domain's path may be ones a
-		// `delete --keep-disks` kept; this create's own go below.
-		if uerr := s.virt.UndefineDomainPreservingState(spec.Name); uerr != nil {
-			slog.Warn("vm create: undefine after a failed create failed", "name", spec.Name, "error", uerr)
-			cause = fmt.Errorf("%w; its domain is stopped but could not be undefined on %s (%v) and is left defined, "+
-				"with no VM record: the next create of %s removes it", cause, s.hostName, uerr, spec.Name)
-		}
-		claims.releaseAll(ctx)
+		noteUndo("domain stopped")
+		// While the stopped domain is still defined: the disks and seed
+		// this create made, and the vars its start made, at the domain's
+		// path and at the name-keyed path a Secure Boot or vTPM domain uses.
 		cleanupDisks()
-		// Vars this create's start made, at the domain's path and at the
-		// name-keyed path a Secure Boot or vTPM domain uses.
+		removeVars := func(p string) {
+			if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				noteUndo(fmt.Sprintf("vars %s not removed (%v)", p, err))
+			} else if err == nil {
+				noteUndo("removed vars " + p)
+			}
+		}
 		if domainVars != "" && !domainVarsBefore {
-			_ = os.Remove(domainVars)
+			removeVars(domainVars)
 		}
 		if !nvramBefore {
-			_ = os.Remove(lv.NvramPath(s.dataDir, spec.Name))
+			removeVars(lv.NvramPath(s.dataDir, spec.Name))
 		}
+		// Preserving: vars at the domain's path may be ones a
+		// `delete --keep-disks` kept; this create's own went above.
+		if uerr := s.virt.UndefineDomainPreservingState(spec.Name); uerr != nil {
+			slog.Warn("vm create: undefine after a failed create failed", "name", spec.Name, "error", uerr)
+			noteUndo(fmt.Sprintf("domain left defined: it could not be undefined (%v)", uerr))
+			leftDefined = true
+			cause = fmt.Errorf("%w; its domain is stopped but could not be undefined on %s (%v) and is left defined, "+
+				"with no VM record: the next create of %s removes it", cause, s.hostName, uerr, spec.Name)
+		} else {
+			noteUndo("domain undefined, firmware state kept")
+		}
+		claims.releaseAll(ctx)
 		lv.WipeFirmwareStateByUUID(spec.Uuid) // no orphan swtpm (G1)
 		return cause
 	}

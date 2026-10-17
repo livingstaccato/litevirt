@@ -90,6 +90,29 @@ func usesFirmwareState(specJSON string) bool {
 // left by a prior `delete --keep-disks` (vTPM can't be inherited — fresh create
 // mints a new UUID). No-op when neither flag is set and firmware is bios.
 func (s *Server) applyFirmwareConfig(cfg *lv.VMConfig, spec *pb.VMSpec) error {
+	if err := s.firmwareRefusal(cfg, spec); err != nil {
+		return err
+	}
+	if !spec.SecureBoot && !spec.Tpm {
+		return nil
+	}
+	if cfg.NvramPath != "" {
+		// Searchable (0711) so the dropped-privilege qemu user can traverse to
+		// the vars file (the file itself is dynamic-owned by libvirt), listable
+		// by nobody else; matches the disks dir (internal/diskmode).
+		if err := diskmode.MkdirAll(filepath.Dir(cfg.NvramPath)); err != nil {
+			return status.Errorf(codes.Internal, "create nvram dir: %v", err)
+		}
+	}
+	return nil
+}
+
+// firmwareRefusal is applyFirmwareConfig's refusals, with cfg's firmware
+// fields set as they apply: a Secure Boot VM on a host without its firmware, a
+// vTPM VM on a host without swtpm, and name-keyed UEFI vars already there.
+// It changes nothing on the host, so a create runs it on a copy of its config
+// before it touches anything of the name (firmwarePreflight).
+func (s *Server) firmwareRefusal(cfg *lv.VMConfig, spec *pb.VMSpec) error {
 	if spec.SecureBoot && !s.firmware.SecureBootAvailable() {
 		return status.Errorf(codes.FailedPrecondition,
 			"host %s has no Secure Boot OVMF firmware; cannot create a Secure Boot VM here", s.hostName)
@@ -109,22 +132,22 @@ func (s *Server) applyFirmwareConfig(cfg *lv.VMConfig, spec *pb.VMSpec) error {
 	// --keep-disks` (SB key inheritance). vTPM state is UUID-keyed and the VM gets
 	// a fresh UUID at create, so it can never inherit an old TPM secret — no guard
 	// needed there (any retained swtpm state is orphaned, only restorable explicitly).
-	if cfg.NvramPath != "" {
-		if lv.HasNvram(s.dataDir, spec.Name) {
-			return status.Errorf(codes.FailedPrecondition,
-				"UEFI vars already exist for %q at %s: a prior `delete --keep-disks` keeps them on purpose (restore the VM "+
-					"instead of recreating it), and a guest the reconciler booted for a since-deleted VM can leave them "+
-					"too (docs/diagnostics.md, orphaned runtimes); remove the file only if no kept VM needs it",
-				spec.Name, cfg.NvramPath)
-		}
-		// Searchable (0711) so the dropped-privilege qemu user can traverse to
-		// the vars file (the file itself is dynamic-owned by libvirt), listable
-		// by nobody else; matches the disks dir (internal/diskmode).
-		if err := diskmode.MkdirAll(filepath.Dir(cfg.NvramPath)); err != nil {
-			return status.Errorf(codes.Internal, "create nvram dir: %v", err)
-		}
+	if cfg.NvramPath != "" && lv.HasNvram(s.dataDir, spec.Name) {
+		return status.Errorf(codes.FailedPrecondition,
+			"UEFI vars already exist for %q at %s: a prior `delete --keep-disks` keeps them on purpose (restore the VM "+
+				"instead of recreating it), and a guest the reconciler booted for a since-deleted VM can leave them "+
+				"too (docs/diagnostics.md, orphaned runtimes); remove the file only if no kept VM needs it",
+			spec.Name, cfg.NvramPath)
 	}
 	return nil
+}
+
+// firmwarePreflight is a create's firmware refusal, judged before the create
+// moves a kept disk or seed of its name or makes anything: the refusal the
+// create would meet once it applies its firmware, met first.
+func (s *Server) firmwarePreflight(spec *pb.VMSpec) error {
+	cfg := lv.VMConfig{Firmware: spec.Firmware} // all ApplyTo reads
+	return s.firmwareRefusal(&cfg, spec)
 }
 
 // firmwarePresent verifies every firmware component the spec declares is present

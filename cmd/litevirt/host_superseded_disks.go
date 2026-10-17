@@ -141,6 +141,8 @@ func printSupersededDisks(out io.Writer, resp *pb.SupersededDisksResponse, purge
 		}
 		st := "kept"
 		switch {
+		case d.Kept && d.Seed:
+			st = "kept: a cloud-init seed a deleted VM was kept with, which can hold user-data; never purged, removed or restored here (only an operator removes it, by hand)"
 		case d.Kept:
 			st = "kept: a disk a deleted VM was kept with; never purged, removed or restored here (only an operator removes it, by hand)"
 		case d.Removed:
@@ -155,6 +157,9 @@ func printSupersededDisks(out io.Writer, resp *pb.SupersededDisksResponse, purge
 			if at, err := time.Parse(time.RFC3339, d.SetAsideAt); err == nil {
 				st = "removed after " + at.Add(time.Duration(resp.RetentionDays)*24*time.Hour).Format(time.RFC3339)
 			}
+		}
+		if d.Kept && d.EarlierVm {
+			st += fmt.Sprintf("; it is an earlier VM %s's, not the VM %s that exists now", d.VmName, d.VmName)
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", d.Path, vm, age, d.SizeBytes, st)
 	}

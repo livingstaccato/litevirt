@@ -148,6 +148,11 @@ alone, logged at WARN, and reported as `kept <name>: ...`, naming the stack it
 belongs to. Such a VM is not counted as a deletion. A stack network that such a VM (or a
 container the stack did not create) is attached to is kept too, reported as
 `kept network <name>: used by ...`, so it is not pulled out from under it.
+In a stack whose last deploy failed (`degraded`), a member the stored file
+names that no host has, because its create failed, is reported as
+`absent <name>: never created; nothing to delete`, and is neither a deletion
+nor a failure. It is taken as absent only when this host has no record of it
+and every other host was asked and answered that it has none.
 
 `compose down` follows the same rule. It ends with `Stack "<name>" torn down.`
 and exit status 0 only when every VM and container was deleted, every stack
@@ -159,7 +164,11 @@ or `backup repos`), the success line is withheld, and the command
 exits non-zero with a summary such as `stack "web": 1 of 3 deletions failed
 (web-2)`. The stack is then left in state `deleting`, the daemon keeps retrying
 the teardown in the background, and the `stack.delete` audit entry has result
-`error` and names what was not removed. While any of the stack's VMs or
+`error` and names what was not removed. A `compose up` of a stack in state
+`deleting` is refused until the teardown has finished: wait until
+`lv compose ls` no longer lists it, then run `lv compose up` again. If the
+teardown does not finish, `lv compose down --name <stack>` retries it, and
+`lv rm <vm> --force` clears a member that is stuck. While any of the stack's VMs or
 containers is left, none of its networks is deprovisioned: a deleted network
 is torn down on every host, and would be pulled out from under that workload.
 The background retry deletes the remaining VMs and containers first, and

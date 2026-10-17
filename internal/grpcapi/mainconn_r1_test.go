@@ -34,7 +34,10 @@ import (
 //
 // Mutations: the inventory read on s.virt, unbounded: the first inventory
 // does not return: red. No single flight (each inventory asks anew): the
-// second takes a wait: red. DumpXML or DomainState asked on s.virt: calls
+// second takes a wait: red. A joiner that finds the flight stalled and
+// starts its own while answering at once: the flight-identity check, red. A
+// joiner that waits one wall-clock tick, or the stall, before its first
+// look: within, red. DumpXML or DomainState asked on s.virt: calls
 // naming ok on the daemon's connection: red. (A stalled flight answered from
 // the cache is pinned by TestRuntimeInventory_AStalledReadIsNotFilledFromTheCache:
 // here the list itself hangs, so there is no list to fill.)
@@ -75,6 +78,15 @@ func TestRuntimeInventory_AListLibvirtDoesNotAnswerIsIncompleteAndOffTheDaemonsC
 	if snap := snapshotFromInventory(inv); !snap.partial {
 		t.Error("the dual-run snapshot of an incomplete inventory is not partial")
 	}
+	// Later callers join the hung list's flight and answer from their first
+	// look. The stall becomes two minutes and the inventory clock moves five
+	// past the flight's last progress, then stands still: the flight is
+	// stalled, well inside its cap, and a joiner's wall-clock tick is now 12 s.
+	// One that waited a tick, or the stall, on the wall clock before it looked
+	// misses within's 5 s; one that looks at once returns. (The flight
+	// goroutine never reads liveStateWait, and no caller is waiting now.)
+	s.liveStateWait = 2 * time.Minute
+	clock.Advance(5 * time.Minute)
 	// One flight answers them all: the hung list's flight is still the
 	// current one after each later caller, and none starts its own.
 	flight := func() *inventoryFlight {
@@ -90,8 +102,9 @@ func TestRuntimeInventory_AListLibvirtDoesNotAnswerIsIncompleteAndOffTheDaemonsC
 		later := within(t, 5*time.Second, "a later inventory while the clock stands still", func() runtimeInventory {
 			return s.collectRuntimeInventory(context.Background())
 		})
-		if later.Complete {
-			t.Fatal("a later inventory read complete while libvirt still hangs on st")
+		if later.Complete || !strings.Contains(strings.Join(later.Errors, ";"), "has not answered") {
+			t.Fatalf("later inventory %d: complete %v, errors %v; want incomplete saying libvirt has not answered",
+				i+1, later.Complete, later.Errors)
 		}
 		if cur := flight(); cur != hung {
 			t.Fatalf("later inventory %d is not answered from the hung list's flight: it started its own", i+1)

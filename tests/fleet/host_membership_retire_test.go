@@ -33,7 +33,7 @@ func TestFleet_HostMembershipRetire_ConcurrentFenceAndVersionBothSurvive(t *test
 	for _, n := range c.Nodes {
 		retireMembership(t, n)
 	}
-	c.WaitConverged(t, convergeTimeout)
+	settleLatch(t, c)
 
 	c.Isolate(a)
 	c.Isolate(b)
@@ -73,7 +73,7 @@ func TestFleet_HostMembershipRetire_APreviousBuildNodeReadsStateCorrectly(t *tes
 	retireMembership(t, a)
 	splitMembership(t, b)
 	splitMembership(t, subject)
-	c.WaitConverged(t, convergeTimeout)
+	settleLatch(t, c)
 
 	if err := corrosion.UpdateHostState(ctx, a.DB, subject.Name, "maintenance"); err != nil {
 		t.Fatal(err)
@@ -120,7 +120,7 @@ func TestFleet_HostMembershipRetire_AMissedRowNeverUndoesAFence(t *testing.T) {
 	for _, node := range c.Nodes {
 		retireMembership(t, node)
 	}
-	c.WaitConverged(t, convergeTimeout)
+	settleLatch(t, c)
 
 	if err := corrosion.RecordFenceWithState(ctx, a.DB, corrosion.FenceLogRecord{
 		ID: "f-h1", HostName: h, Method: "ipmi", Result: "fenced",
@@ -173,7 +173,7 @@ func TestFleet_HostMembershipRetire_ANotLiveNodeReadsTheRetiredFence(t *testing.
 	for _, node := range c.Nodes[:3] {
 		retireMembership(t, node)
 	}
-	c.WaitConverged(t, convergeTimeout)
+	settleLatch(t, c)
 	if err := corrosion.RecordFenceWithState(ctx, a.DB, corrosion.FenceLogRecord{
 		ID: "f-m1", HostName: h, Method: "ipmi", Result: "fenced",
 	}, "fenced"); err != nil {
@@ -201,7 +201,7 @@ func TestFleet_HostMembershipRetire_ANotLiveNeighboursDrainReachesARetiredNode(t
 	a, b, h := c.Nodes[0], c.Nodes[1], c.Nodes[2].Name
 	c.WaitConverged(t, convergeTimeout)
 	retireMembership(t, a)
-	c.WaitConverged(t, convergeTimeout)
+	settleLatch(t, c)
 	if err := corrosion.UpdateHostState(ctx, b.DB, h, "draining"); err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func TestFleet_HostMembershipRetire_TheCoordinatorNeverFencesAnUnknownHost(t *te
 	for _, n := range c.Nodes {
 		retireMembership(t, n)
 	}
-	c.WaitConverged(t, convergeTimeout)
+	settleLatch(t, c)
 
 	// The observations come after the host's current life began (its
 	// membership row dates it from its hosts row, HostFenceLife).

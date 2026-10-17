@@ -73,7 +73,7 @@ func newRestartFleet(t *testing.T, seed int64, tune ...func(*failover.Coordinato
 	for _, n := range c.Nodes {
 		splitMembership(t, n)
 	}
-	c.WaitConverged(t, convergeTimeout)
+	settleLatch(t, c)
 	for _, n := range f.observers {
 		ch := health.NewChecker(n.Name, n.PKIDir, n.DB)
 		// The daemon's readiness prober, reduced to the one fact this

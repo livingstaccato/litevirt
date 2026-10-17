@@ -66,7 +66,7 @@ func TestFleet_HostRuntime_AStaleDBReaddReadsItsRealReport(t *testing.T) {
 		retireMembership(t, n)
 		retireRuntime(t, n)
 	}
-	c.WaitConverged(t, convergeTimeout)
+	settleLatch(t, c)
 	if err := corrosion.UpdateHostStartup(ctx, d.DB, d.Name, "active", "v-before-rm", 16, 32, 48, true); err != nil {
 		t.Fatal(err)
 	}

@@ -90,7 +90,7 @@ func staleDBReadd(t *testing.T, retired, aeFirst bool, seed int64) {
 			retireMembership(t, n)
 			retireRuntime(t, n)
 		}
-		c.WaitConverged(t, convergeTimeout)
+		settleLatch(t, c)
 	}
 
 	// The old machine's per-host settings, which the re-admission resets.

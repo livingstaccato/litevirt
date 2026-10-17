@@ -37,7 +37,7 @@ func TestFleet_DeadRemovalOfAReaddedHostNeedsItsOwnFence(t *testing.T) {
 	for _, n := range c.Nodes {
 		splitMembership(t, n)
 	}
-	c.WaitConverged(t, convergeTimeout)
+	settleLatch(t, c)
 	d.Stop()
 	c.Kill(d)
 	withOperatorPKI(t, a)

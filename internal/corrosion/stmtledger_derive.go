@@ -1,6 +1,10 @@
 package corrosion
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
+)
 
 // appendOnlyTables are immutable append-only tables: a replicated INSERT is applied with
 // INSERT OR IGNORE and never LWW-gated, because a row never changes after creation.
@@ -184,8 +188,16 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	{SQL: vmHostStateSQL, Disposition: DispLiveRowUpdate},
 	// The VM operation barrier claim and clear, for the same reason: the
 	// origin's Go guard reads the live row, but a receiver has only the SQL.
-	{SQL: vmOperationBeginSQL, Disposition: DispLiveRowUpdate},
-	{SQL: vmOperationClearSQL, Disposition: DispLiveRowUpdate},
+	// Once spec_conflict_v1 is active the claim is also resolved against an
+	// out-of-band edit at its generation (spec_conflict_apply.go); before,
+	// it applies as it always has.
+	{SQL: vmOperationBeginSQL, Disposition: DispLiveRowUpdate, RequiresCapability: capabilities.SpecConflictV1, DispositionAfter: DispSpecGeneration},
+	// The epoch-carrying out-of-band spec edit. Only emitted once
+	// spec_conflict_v1 has latched, and only this build knows it.
+	{SQL: vmSpecMutateAtEpochSQL, Disposition: DispSpecGeneration},
+	// Likewise the clear: once spec_conflict_v1 is active its guard, not the
+	// row's clock, orders it (spec_conflict_apply.go).
+	{SQL: vmOperationClearSQL, Disposition: DispLiveRowUpdate, RequiresCapability: capabilities.SpecConflictV1, DispositionAfter: DispSpecGeneration},
 	// Host re-admission over a tombstone: applied through its reset form on
 	// the origin and every receiver, so the new machine inherits no per-host
 	// setting of the one removed under its name. The wire shape is unchanged

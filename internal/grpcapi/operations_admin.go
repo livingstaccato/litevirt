@@ -52,7 +52,8 @@ func (s *Server) GetVMOperation(ctx context.Context, req *pb.GetVMOperationReque
 // AbortVMOperation force-clears a wedged operation's mutation barrier so the VM
 // is mutable again. Deliberate admin recovery: requires force, and clears the
 // barrier only via the exact owner/generation CAS (a superseded op can't clear a
-// newer one). Admin-only.
+// newer one). With operation_id it is refused unless that operation is the
+// active one. Admin-only.
 func (s *Server) AbortVMOperation(ctx context.Context, req *pb.AbortVMOperationRequest) (*pb.AbortVMOperationResponse, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
@@ -66,6 +67,17 @@ func (s *Server) AbortVMOperation(ctx context.Context, req *pb.AbortVMOperationR
 	view, found, err := corrosion.GetVMActiveOperation(ctx, s.db, req.VmName)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "get active operation: %v", err)
+	}
+	// A scoped abort (operation_id) acts on that operation only: one that
+	// has finished, or been followed by another, is not this one's to clear.
+	// The CAS below then carries the same id, so it cannot clear a later one.
+	if req.OperationId != "" && (!found || view.ActiveOperationID != req.OperationId) {
+		active := "no operation"
+		if found {
+			active = "operation " + view.ActiveOperationID
+		}
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%s has %s active, not %s; re-inspect with lv operation show %s", req.VmName, active, req.OperationId, req.VmName)
 	}
 	if !found {
 		return &pb.AbortVMOperationResponse{Aborted: false, Detail: "no active operation"}, nil

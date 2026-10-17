@@ -1882,6 +1882,12 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		}
 		return nil
 
+	case DispSpecGeneration:
+		// A VM desired-spec edit: DispLiveRowUpdate, but an edit that meets
+		// another at its generation is resolved, not dropped
+		// (spec_conflict_apply.go).
+		return r.applySpecGeneration(ctx, tx, s, sh, tableName, pkCols, incomingHLC)
+
 	case DispHostReadmit:
 		// Exactly DispFullPKUpdate, through the reset form: the re-admitted
 		// row starts with no per-host setting of the machine removed under

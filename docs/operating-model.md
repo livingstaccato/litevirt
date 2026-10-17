@@ -472,8 +472,41 @@ of acting — it says nothing about whether the resulting rows have replicated.
 - VM placement and other state writes use last-writer-wins on the row's
   wall-clock `updated_at`. **The most recent writer (by wall clock) wins**; there
   is no two-phase commit. If two operators concurrently modify the same VM, one
-  set of changes is silently lost — and under clock skew the host with the faster
+  set of changes is lost — and under clock skew the host with the faster
   clock wins, so NTP is required.
+- **A VM's desired spec is edited on its owner.** `lv update`, labels and a
+  deploy's metadata are forwarded to the host that owns the VM, which applies
+  one edit after another, so two edits made while the owner is reachable both
+  stand. An owner that cannot be reached does not refuse the edit; it is made
+  where it entered. Two edits made from the same spec generation on two sides of
+  a partition then conflict, and once `spec_conflict_v1` has latched every host
+  keeps the same one ([upgrades.md](upgrades.md#concurrent-spec-edits-are-resolved-after-the-roll)):
+  the one made under the newer owner; else an operation's claim over an
+  out-of-band edit while the operation has not finished; else the one edited
+  later, by the edit time each edit records in the spec itself (not the row's
+  clock, which state writes move); else the one whose content orders higher.
+  When one side made more edits, its longer line wins — except that, under
+  the same owner, a longer line of out-of-band edits waits until a running
+  operation has finished, so on the owner, and on every host that saw the
+  operation's claim first, the barrier stands and the operation can complete.
+  Hosts that kept the longer line show it, and no operation, until then.
+  Nothing ends an operation that never reaches a terminal step: the hold lasts
+  until it finishes or an admin runs
+  `lv operation abort <vm> --operation <id> --force` on a host that shows
+  it, normally the owner. Each host that holds the line raises
+  `vm.spec_edit_held` (see [diagnostics.md](diagnostics.md)), observed after
+  the first pass that holds and confirmed after a second consecutive one, and
+  counts a confirmed one in `litevirt_spec_edit_held_total`. A newer owner's row
+  replaces the barrier of an operation started under the old one. The edit
+  that loses is not lost silently: each host that drops it records a
+  `vm.spec_edit_dropped` event on the VM (`lv events <vm>`) quoting the dropped
+  spec, and counts it in
+  `litevirt_merge_apply_rejected_total{table="vms",reason="spec_edit_dropped"}`.
+  A version kept since may already contain the dropped edit, so compare it with
+  the current spec before making any of it again. Once an operation has
+  finished, out-of-band edits made from its generation or before are ordered
+  like any others, so they can replace the operation's desired spec while the
+  VM keeps what the operation applied — recorded the same way.
 
 ### Leader-lease terms, and what enforcing on them does and does not buy
 

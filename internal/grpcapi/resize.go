@@ -502,50 +502,8 @@ func (s *Server) applyLiveMetadata(ctx context.Context, name string, desired *pb
 			return nil
 		}
 	}
-	patch := rest
-	applied, _, err := corrosion.MutateDesiredSpec(ctx, s.db, name, func(old string) (string, error) {
-		fresh := &pb.VMSpec{}
-		if old != "" {
-			if uerr := json.Unmarshal([]byte(old), fresh); uerr != nil {
-				return "", uerr
-			}
-		}
-		for _, f := range patch {
-			switch f {
-			case "disk_io":
-				// applied and recorded by applyDesiredDiskIO above
-			case "restart":
-				fresh.Restart = desired.Restart
-			case "onboot":
-				fresh.Onboot = desired.Onboot
-			case "startup_order":
-				fresh.StartupOrder = desired.StartupOrder
-			case "start_delay":
-				fresh.StartDelaySec = desired.StartDelaySec
-			case "stop_delay":
-				fresh.StopDelaySec = desired.StopDelaySec
-			case "labels":
-				fresh.Labels = desired.Labels
-			case "placement":
-				fresh.Placement = desired.Placement
-			case "migrate":
-				// With its top-level mirror, which is all the failover
-				// coordinator reads (compose.BuildVMSpec; a create stores both).
-				fresh.Migrate = desired.Migrate
-				fresh.OnHostFailure = desired.OnHostFailure
-			case "healthcheck":
-				fresh.Healthcheck = desired.Healthcheck
-			case "hooks":
-				fresh.Hooks = desired.Hooks
-			case "stop_timeout":
-				fresh.StopTimeoutSec = desired.StopTimeoutSec
-			default:
-				slog.Warn("applyLiveMetadata: ignoring unknown live-metadata field", "vm", name, "field", f)
-			}
-		}
-		b, merr := json.Marshal(fresh)
-		return string(b), merr
-	})
+	// Made on the VM's owner, which serialises its spec edits (spec_owner.go).
+	applied, err := s.patchSpecAtOwner(ctx, name, desired, rest)
 	if err != nil {
 		return status.Errorf(codes.Internal, "apply live metadata for %q: %v", name, err)
 	}

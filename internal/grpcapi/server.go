@@ -2089,6 +2089,10 @@ func (s *Server) tokenEnabled(token string) bool {
 		// when it elects relays, and every node relies on every other
 		// electing the same set.
 		return true
+	case capabilities.SpecConflictV1:
+		// No kill switch: it says how this build resolves two edits of one
+		// spec at one generation, and every replica must resolve them alike.
+		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm.Load()
 	case capabilities.RecoveryClaimV1:

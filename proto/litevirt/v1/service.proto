@@ -3012,8 +3012,8 @@ message GetLeaseTermHighWaterResponse {
 // ── Recovery claims and the voter set (docs/design/recovery-claims.md) ──
 
 message RecoveryClaimKey {
-    string target_kind = 1;  // vm | container | voter_config
-    string target_name = 2;  // workload name; "" for voter_config
+    string target_kind = 1;  // vm | container | voter_config | lun | lease_term
+    string target_name = 2;  // workload, LUN or lease name; "" for voter_config
     int64  owner_epoch = 3;  // generation being left; config generation for voter_config
     int64  attempt     = 4;
     // incarnation is the workload row's created_at: which incarnation of the
@@ -3058,6 +3058,15 @@ message RecoveryClaimValue {
     VoterConfigValue voter_config = 13;
     // An iSCSI LUN allocation: the value a key of target_kind "lun" decides.
     LUNAllocationValue lun = 14;
+    // A leader-lease term's holder: the value a key of target_kind
+    // "lease_term" decides (lease_term_claim_v1).
+    LeaseTermClaimValue lease_term_claim = 15;
+}
+// LeaseTermClaimValue is which node holds one term of one leader lease.
+message LeaseTermClaimValue {
+    string key    = 1;  // the lease key (failover, rebalancer, ...)
+    int64  term   = 2;
+    string holder = 3;
 }
 // LUNAllocationValue is which disk of which VM one allocation of a LUN is.
 message LUNAllocationValue {

@@ -282,6 +282,13 @@ type Client struct {
 	// withholding once rather than every tick. Guarded by its own mutex.
 	mintWithheldMu sync.Mutex
 	mintWithheld   map[string]string
+	// leaseDecided is, per lease key, the newest term this node learned was
+	// decided for ANOTHER node by a lease-term claim (NoteLeaseTermDecided).
+	// Guarded by mintWithheldMu.
+	leaseDecided map[string]leaseTermDecision
+	// leaseLiveObserver is told when AcquireLeaseWithTerm finds a lease held
+	// (SetLeaseLiveObserver).
+	leaseLiveObserver func(ctx context.Context, key string)
 	// unresolvedTies records, per (table,PK), the last classified-unresolved tie:
 	// its sorted content-hash pair and its CATEGORY. The pair makes
 	// lww_tie_unresolved count DISTINCT rows (re-observing the same divergence is

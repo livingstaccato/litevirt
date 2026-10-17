@@ -14,6 +14,9 @@ type RuntimeGateMetrics struct {
 	// complete sweep, so without this the one shape that can miss a superseding
 	// term is the one shape nothing records.
 	leaseBarrierIncomplete *prometheus.CounterVec
+	// leaseClaimNoMajority counts lease-term claims that no majority of the
+	// voter generation decided: a takeover that recorded nothing.
+	leaseClaimNoMajority *prometheus.CounterVec
 }
 
 // NewRuntimeGateMetrics registers the refusal counter on the default registry.
@@ -33,8 +36,12 @@ func newRuntimeGateMetrics(reg prometheus.Registerer) *RuntimeGateMetrics {
 			Name: "litevirt_lease_barrier_incomplete_sweeps_total",
 			Help: "Lease-term accepts reached without every healthy peer answering, by lease key.",
 		}, []string{"key"}),
+		leaseClaimNoMajority: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "litevirt_lease_term_claim_no_majority_total",
+			Help: "Lease-term claims no majority of the voter generation decided, so the takeover recorded no term, by lease.",
+		}, []string{"lease"}),
 	}
-	reg.MustRegister(m.refused, m.leaseBarrierIncomplete)
+	reg.MustRegister(m.refused, m.leaseBarrierIncomplete, m.leaseClaimNoMajority)
 	return m
 }
 
@@ -47,4 +54,10 @@ func (m *RuntimeGateMetrics) Refused(action, reason string) {
 // Safe to pass as the observer func.
 func (m *RuntimeGateMetrics) LeaseBarrierIncomplete(key string, _, _ int) {
 	m.leaseBarrierIncomplete.WithLabelValues(key).Inc()
+}
+
+// LeaseTermClaimNoMajority records one lease-term claim with no majority.
+// Safe to pass as the observer func.
+func (m *RuntimeGateMetrics) LeaseTermClaimNoMajority(lease string) {
+	m.leaseClaimNoMajority.WithLabelValues(lease).Inc()
 }

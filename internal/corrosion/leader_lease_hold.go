@@ -65,6 +65,32 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 		return false, 0, fmt.Errorf("lease key %q is not in corrosion.leaseKeys: peers refuse its "+
 			"high-water read, so no node could take it over", key)
 	}
+	held, term, err := acquireLeaseWithTerm(ctx, c, key, holder, ttl, now)
+	if err == nil && c.leaseLiveObserver != nil {
+		live := held
+		if !held {
+			// Not ours: live for someone else? One local read, so the
+			// observer hears of a lease that is no longer contested.
+			cur, exp, rerr := leaseRow(ctx, c, key)
+			live = rerr == nil && cur != "" && cur != holder &&
+				exp >= now.UTC().Format(time.RFC3339)
+		}
+		if live {
+			c.leaseLiveObserver(ctx, key)
+		}
+	}
+	return held, term, err
+}
+
+// SetLeaseLiveObserver injects what AcquireLeaseWithTerm tells when it finds
+// the lease key held — by this node (a renewal or a mint) or live for a peer.
+// Wired at daemon start to grpcapi.Server.NoteLeaseLive, which resolves the
+// no-majority condition a stalled takeover raised. Nil tells nobody.
+func (c *Client) SetLeaseLiveObserver(fn func(ctx context.Context, key string)) {
+	c.leaseLiveObserver = fn
+}
+
+func acquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, ttl time.Duration, now time.Time) (bool, int64, error) {
 	// The clock is re-sampled on EVERY attempt, not once at entry.
 	//
 	// A holder that enters before its expiry and then stalls past the TTL -- a
@@ -149,7 +175,7 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 				// still records. Retire it: mint above it, atomically with the
 				// renewal, so the term we act under is one no replica attributes to
 				// anyone else and the contested one falls below every threshold.
-				held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, cur, newest.Term, false)
+				held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, cur, ttl, newest.Term, false)
 				if err != nil {
 					return false, 0, err
 				}
@@ -247,7 +273,7 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 		if ourTenure && newest.Term > 0 && newest.Holder == holder && c.termBelongsToEarlierTenure(key, newest.Term) {
 			supersede = newest.Term
 		}
-		held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, cur, supersede, !ourTenure)
+		held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, cur, ttl, supersede, !ourTenure)
 		if err != nil {
 			return false, 0, err
 		}
@@ -530,20 +556,28 @@ func renewLease(ctx context.Context, c *Client, key, holder, expires, nowRFC str
 // our own lease is live (0 for an ordinary acquisition); see leaseAcquirableTx.
 // takeover is true when our own replica shows no live tenure of ours: the
 // clearance must then also confirm that no peer sees the lease live (see
-// leader_lease_clearance.go).
-func takeLeaseAndMintTerm(ctx context.Context, c *Client, key, holder, expires, nowRFC string, now time.Time, supersede int64, takeover bool) (bool, int64, error) {
+// leader_lease_clearance.go). ttl is the lease's: a term this node learned was
+// decided for another node is that node's lease for one ttl (decidedElsewhere).
+func takeLeaseAndMintTerm(ctx context.Context, c *Client, key, holder, expires, nowRFC string, now time.Time, ttl time.Duration, supersede int64, takeover bool) (bool, int64, error) {
 	acquiredAt := now.UTC().Format(time.RFC3339)
 
 	next, err := nextLeaseTerm(ctx, c, key)
 	if err != nil {
 		return false, 0, err
 	}
+	// A term decided for another node is not ours to claim again: its holder
+	// may be recording and acting under it while this replica has not seen
+	// it yet. Not held until its lease would have lapsed, then the next term.
+	next, wait := c.decidedElsewhere(key, holder, next, now, ttl)
+	if wait {
+		return false, 0, nil
+	}
 	// Confirm the cluster has not already minted `next` before claiming it from
 	// this replica's view. Withheld is "not held", never contended: retrying
 	// inside this call would ask the same peers the same question. See
 	// leader_lease_clearance.go.
 	if !c.clearLeaseMint(ctx, LeaseMintRequest{
-		Key: key, Term: next, Holder: holder, Takeover: takeover, Now: nowRFC,
+		Key: key, Term: next, Holder: holder, Takeover: takeover, Now: nowRFC, TTL: ttl,
 	}) {
 		return false, 0, nil
 	}

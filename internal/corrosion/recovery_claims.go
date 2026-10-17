@@ -51,6 +51,31 @@ func LUNClaimKey(lun string, gen int64) ClaimKey {
 	return ClaimKey{TargetKind: ClaimKindLUN, TargetName: lun, OwnerEpoch: gen}
 }
 
+// ClaimKindLeaseTerm is the target_kind of a leader-lease term: the claim at
+// key (lease_term, <lease key>, term, 0) decides which node holds that term
+// of that lease (capabilities.LeaseTermClaimV1). It is decided under the voter
+// generation like a workload key, and carried across a generation change.
+const ClaimKindLeaseTerm = "lease_term"
+
+// leaseKeyShaped reports whether name could be a lease key, of this build or a
+// later one: 1–64 characters of a-z, 0-9 and '_'.
+func leaseKeyShaped(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	for _, r := range name {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+// LeaseTermClaimKey is the key of term of the lease named key.
+func LeaseTermClaimKey(key string, term int64) ClaimKey {
+	return ClaimKey{TargetKind: ClaimKindLeaseTerm, TargetName: key, OwnerEpoch: term}
+}
+
 // ClaimKey is what one claim decides.
 type ClaimKey struct {
 	TargetKind string `json:"target_kind"`
@@ -115,10 +140,13 @@ func (k ClaimKey) IsWorkload() bool {
 // IsLUN reports whether k decides an iSCSI LUN allocation.
 func (k ClaimKey) IsLUN() bool { return k.TargetKind == ClaimKindLUN }
 
+// IsLeaseTerm reports whether k decides the holder of a leader-lease term.
+func (k ClaimKey) IsLeaseTerm() bool { return k.TargetKind == ClaimKindLeaseTerm }
+
 // IsGenerationScoped reports whether k is decided by the members of the voter
-// generation and carried into the next one (§4.4): a workload recovery or a LUN
-// allocation. A voter_config key decides the generation itself.
-func (k ClaimKey) IsGenerationScoped() bool { return k.IsWorkload() || k.IsLUN() }
+// generation and carried into the next one (§4.4): a workload recovery, a LUN
+// allocation or a lease term. A voter_config key decides the generation itself.
+func (k ClaimKey) IsGenerationScoped() bool { return k.IsWorkload() || k.IsLUN() || k.IsLeaseTerm() }
 
 // Validate refuses a key no voter should record state for.
 func (k ClaimKey) Validate() error {
@@ -126,6 +154,15 @@ func (k ClaimKey) Validate() error {
 	case k.IsLUN():
 		if k.TargetName == "" || k.OwnerEpoch < 0 || k.Attempt != 0 || k.Incarnation != "" {
 			return fmt.Errorf("a LUN key is (lun, <LUN>, generation, 0) with no incarnation, got %+v", k)
+		}
+	case k.IsLeaseTerm():
+		// The SHAPE of a lease key only, not ValidLeaseKey: a later build adds
+		// lease keys, and a voter or an importer on this build must keep a
+		// decision for one it does not know — refusing it here failed a whole
+		// voter-generation import mid-roll. The proposer (grpcapi
+		// claimLeaseTerm) claims only keys this build acquires.
+		if !leaseKeyShaped(k.TargetName) || k.OwnerEpoch < 1 || k.Attempt != 0 || k.Incarnation != "" {
+			return fmt.Errorf("a lease_term key is (lease_term, <lease key>, term >= 1, 0) with no incarnation, got %+v", k)
 		}
 	case k.IsVoterConfig():
 		if k.TargetName != "" || k.Attempt != 0 || k.OwnerEpoch < 0 || k.Incarnation != "" {
@@ -263,9 +300,17 @@ type LUNAllocation struct {
 	ReplacedCreatedAt string `json:"replaced_created_at,omitempty"`
 }
 
+// LeaseTermValue is the value a lease_term claim decides: which node holds
+// term Term of the lease Key.
+type LeaseTermValue struct {
+	Key    string `json:"key"`
+	Term   int64  `json:"term"`
+	Holder string `json:"holder"`
+}
+
 // ClaimValue is what a claim decides. Exactly one of Proof (a workload
-// recovery, §3.4), Config (a voter-config change, §4.3) and LUN (an iSCSI LUN
-// allocation) is set.
+// recovery, §3.4), Config (a voter-config change, §4.3), LUN (an iSCSI LUN
+// allocation) and LeaseTerm (a leader-lease term's holder) is set.
 type ClaimValue struct {
 	// Proof carries the ActionProof binding fields (ProofBindingEqual's set
 	// plus the proof ID). The lease-holder and quorum fields are not part of
@@ -277,12 +322,14 @@ type ClaimValue struct {
 	SourceHost string            `json:"source_host,omitempty"`
 	Config     *VoterConfigValue `json:"config,omitempty"`
 	LUN        *LUNAllocation    `json:"lun,omitempty"`
+	LeaseTerm  *LeaseTermValue   `json:"lease_term,omitempty"`
 }
 
 const (
 	claimValueDomain       = "litevirt-recovery-value-v1"
 	claimConfigValueDomain = "litevirt-voter-config-value-v1"
 	claimLUNValueDomain    = "litevirt-lun-allocation-v1"
+	claimLeaseValueDomain  = "litevirt-lease-term-v1"
 	claimAcceptDomain      = "litevirt-recovery-accept-v1"
 	// claimAcceptDomainV2 signs an accept at an incarnation-scoped key. Its
 	// own domain, so no v2 accept is ever the same bytes as a v1 one: a legacy
@@ -329,6 +376,14 @@ func SortMembers(members []VoterMember) []VoterMember {
 func (v ClaimValue) Digest() (string, error) {
 	h := sha256.New()
 	switch {
+	case v.LeaseTerm != nil && v.Proof == nil && v.Config == nil && v.LUN == nil && v.SourceHost == "":
+		l := v.LeaseTerm
+		claimField(h, claimLeaseValueDomain)
+		claimField(h, l.Key)
+		claimField(h, i64(l.Term))
+		claimField(h, l.Holder)
+	case v.LeaseTerm != nil:
+		return "", fmt.Errorf("a lease-term claim value carries nothing but the lease term")
 	case v.Proof != nil && v.Config == nil && v.LUN == nil:
 		p := v.Proof
 		claimField(h, claimValueDomain)
@@ -373,7 +428,7 @@ func (v ClaimValue) Digest() (string, error) {
 		claimField(h, cfg.CreatedBy)
 		claimField(h, cfg.CreatedAt)
 	default:
-		return "", fmt.Errorf("a claim value carries exactly one of a proof, a voter config or a LUN allocation")
+		return "", fmt.Errorf("a claim value carries exactly one of a proof, a voter config, a LUN allocation or a lease term")
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }

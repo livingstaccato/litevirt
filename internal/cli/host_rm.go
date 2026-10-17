@@ -74,10 +74,11 @@ func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force
 	// available as `lv host retire-audit-key`.
 	closeRemovedHostAuditContract(ctx, c, hostName)
 
-	if _, err := c.RemoveHost(ctx, &pb.RemoveHostRequest{Name: hostName, Force: force}); err != nil {
+	removed, err := c.RemoveHost(ctx, &pb.RemoveHostRequest{Name: hostName, Force: force, ExpectedCertSerial: serial})
+	if err != nil {
 		return fmt.Errorf("remove host after publishing its certificate revocation: %w", err)
 	}
-	fmt.Printf("Host %s removed from cluster.\n", hostName)
+	printRemoved(hostName, removed, "Host %s removed from cluster.\n")
 	fmt.Printf("  revoked certificate %s in CRL %d before removing the host\n", serial, version)
 	fmt.Println("  `lv health` warns for as long as any peer's CRL version is behind another's")
 	return nil
@@ -128,10 +129,11 @@ func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, d
 		return err
 	}
 	closeRemovedHostAuditContract(ctx, c, hostName)
-	if _, err := c.RemoveHost(ctx, &pb.RemoveHostRequest{Name: hostName, Dead: true}); err != nil {
+	removed, err := c.RemoveHost(ctx, &pb.RemoveHostRequest{Name: hostName, Dead: true, ExpectedCertSerial: serial})
+	if err != nil {
 		return fmt.Errorf("remove host after publishing its certificate revocation: %w", err)
 	}
-	fmt.Printf("Host %s removed from the cluster for good.\n", hostName)
+	printRemoved(hostName, removed, "Host %s removed from the cluster for good.\n")
 	fmt.Printf("  revoked certificate %s in CRL %d before removing the host\n", serial, version)
 	n := 0
 	for _, s := range plan.GetStranded() {
@@ -302,4 +304,15 @@ func refuseVoterRemoval(ctx context.Context, c pb.LiteVirtClient, hostName strin
 		}
 	}
 	return nil
+}
+
+// printRemoved prints what a removal tombstoned: the incarnation and serial
+// the daemon reports, or, from a daemon too old to report them, plain.
+func printRemoved(hostName string, removed *pb.RemoveHostResponse, plain string) {
+	if removed.GetCertSerial() == "" {
+		fmt.Printf(plain, hostName)
+		return
+	}
+	fmt.Printf("Host %s removed (incarnation %d, serial %s).\n", hostName,
+		removed.GetIncarnation(), removed.GetCertSerial())
 }

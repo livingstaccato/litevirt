@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,8 @@ type hostRemoveTestClient struct {
 	publishErr error
 	calls      []string
 	voters     []string // members of the adopted voter generation
+	removeReq  *pb.RemoveHostRequest
+	removeResp *pb.RemoveHostResponse
 }
 
 func (c *hostRemoveTestClient) GetVoterConfig(context.Context, *pb.GetVoterConfigRequest, ...grpc.CallOption) (*pb.GetVoterConfigResponse, error) {
@@ -45,8 +48,12 @@ func (c *hostRemoveTestClient) RetireAuditKey(context.Context, *pb.RetireAuditKe
 	return nil, errors.New(`rpc error: code = FailedPrecondition desc = host "node-9" has no live audit signing certificate: it either never published one or its key is already retired, so there is nothing to retire`)
 }
 
-func (c *hostRemoveTestClient) RemoveHost(context.Context, *pb.RemoveHostRequest, ...grpc.CallOption) (*pb.RemoveHostResponse, error) {
+func (c *hostRemoveTestClient) RemoveHost(_ context.Context, req *pb.RemoveHostRequest, _ ...grpc.CallOption) (*pb.RemoveHostResponse, error) {
 	c.calls = append(c.calls, "remove")
+	c.removeReq = req
+	if c.removeResp != nil {
+		return c.removeResp, nil
+	}
 	return &pb.RemoveHostResponse{}, nil
 }
 
@@ -276,4 +283,54 @@ func TestHostRemove_RefusesAVoterBeforeRevoking(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(pkiDir, "crl.pem")); err == nil {
 		t.Fatal("the voter's certificate was revoked before the refusal")
 	}
+}
+
+// R-I2, R-M5: `lv host rm` asks the daemon to remove only the serial it
+// revoked, and prints what was removed — or, from a daemon too old to say,
+// the line it always printed.
+func TestHostRemove_RemovesOnlyTheRevokedSerialAndSaysSo(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("LV_CONFIG_DIR", configDir)
+	pkiDir := filepath.Join(configDir, "pki")
+	if err := os.MkdirAll(pkiDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := pki.GenerateCA(filepath.Join(pkiDir, "ca.crt"), filepath.Join(pkiDir, "ca.key")); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		resp *pb.RemoveHostResponse
+		want string
+	}{
+		{&pb.RemoveHostResponse{CertSerial: "a1b2c3", Incarnation: 2}, "Host node-9 removed (incarnation 2, serial a1b2c3)."},
+		{nil, "Host node-9 removed from cluster."},
+	} {
+		client := &hostRemoveTestClient{removeResp: tc.resp}
+		out := captureStdout(t, func() {
+			if err := HostRemove(context.Background(), client, "node-9", false); err != nil {
+				t.Fatalf("HostRemove: %v", err)
+			}
+		})
+		if client.removeReq.GetExpectedCertSerial() != "a1b2c3" {
+			t.Errorf("RemoveHost asked to remove serial %q, want the revoked a1b2c3", client.removeReq.GetExpectedCertSerial())
+		}
+		if !strings.Contains(out, tc.want) {
+			t.Errorf("printed %q, want %q", out, tc.want)
+		}
+	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = old }()
+	fn()
+	w.Close()
+	b, _ := io.ReadAll(r)
+	return string(b)
 }

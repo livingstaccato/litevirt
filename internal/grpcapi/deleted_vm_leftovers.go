@@ -2,13 +2,16 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
 
@@ -159,18 +162,89 @@ func (s *Server) planDeletedVMLeftovers(ctx context.Context, vm *corrosion.VMRec
 	return plan
 }
 
-// cleanupDeletedVMLeftovers asks each host in the plan to remove the VM's
-// leftovers. It runs after the tombstone, on a context detached from the
-// caller's (a peer call, so the receiving host authorises it as the system),
-// and never fails the delete: the VM is gone, and a host that is unreachable or
-// declines keeps its files, which is the safe direction.
-func (s *Server) cleanupDeletedVMLeftovers(ctx context.Context, plan deletedVMLeftovers) {
-	for _, host := range plan.hosts {
-		s.cleanupDeletedVMLeftoversOn(ctx, host, plan.vm, plan.detached[host])
-	}
+// LeftoverDomainMD is the DeleteVM response header naming, one JSON
+// LeftoverDomain per host, a host the VM may have left that declined to
+// remove its leftovers because a domain of the name is defined there, or that
+// had not answered when the delete returned. `lv rm` prints each.
+const LeftoverDomainMD = "x-litevirt-leftover-domain"
+
+// LeftoverDomain is one value of LeftoverDomainMD.
+type LeftoverDomain struct {
+	Host string `json:"host"`
+	// Pending: the host had not answered within deletedVMCleanupReportWait;
+	// the delete keeps asking it after it returns.
+	Pending bool   `json:"pending,omitempty"`
+	Detail  string `json:"detail"`
 }
 
-func (s *Server) cleanupDeletedVMLeftoversOn(ctx context.Context, host, vmName string, paths []string) {
+// deletedVMCleanupReportWait is how long a delete waits for the hosts it asks
+// before it returns; a host still being asked then is named as pending. A
+// variable so a test can shorten it.
+var deletedVMCleanupReportWait = 5 * time.Second
+
+// cleanupDeletedVMLeftovers asks each host in the plan, all at once, to
+// remove the VM's leftovers, and returns what the delete's caller is told:
+// the hosts that declined because a domain of the name is defined there, and
+// the hosts that had not answered within deletedVMCleanupReportWait (they are
+// still asked after it returns). It runs after the tombstone, on a context
+// detached from the caller's (a peer call, so the receiving host authorises
+// it as the system), and never fails the delete: the VM is gone, and a host
+// that is unreachable or declines keeps its files, which is the safe
+// direction.
+func (s *Server) cleanupDeletedVMLeftovers(ctx context.Context, plan deletedVMLeftovers) []LeftoverDomain {
+	type result struct {
+		host     string
+		declined string
+	}
+	results := make(chan result, len(plan.hosts))
+	for _, host := range plan.hosts {
+		go func(host string) {
+			results <- result{host, s.cleanupDeletedVMLeftoversOn(ctx, host, plan.vm, plan.detached[host])}
+		}(host)
+	}
+	wait := time.NewTimer(deletedVMCleanupReportWait)
+	defer wait.Stop()
+	answered := map[string]bool{}
+	var out []LeftoverDomain
+collect:
+	for len(answered) < len(plan.hosts) {
+		select {
+		case r := <-results:
+			answered[r.host] = true
+			if r.declined != "" {
+				out = append(out, LeftoverDomain{Host: r.host, Detail: r.declined})
+			}
+		case <-wait.C:
+			break collect
+		}
+	}
+	for _, host := range plan.hosts {
+		if !answered[host] {
+			out = append(out, LeftoverDomain{Host: host, Pending: true,
+				Detail: "it has not answered yet; the delete keeps asking it to remove the VM's leftovers"})
+		}
+	}
+	return out
+}
+
+// setLeftoverDomainHeader names each of leftovers in the delete's response.
+func setLeftoverDomainHeader(ctx context.Context, leftovers []LeftoverDomain) {
+	if len(leftovers) == 0 {
+		return
+	}
+	md := metadata.MD{}
+	for _, l := range leftovers {
+		if b, err := json.Marshal(l); err == nil {
+			md.Append(LeftoverDomainMD, string(b))
+		}
+	}
+	_ = grpc.SetHeader(ctx, md)
+}
+
+// cleanupDeletedVMLeftoversOn asks one host, retrying while its replica has
+// not seen the tombstone. It returns the host's refusal when a domain of the
+// name is defined there, and "" otherwise.
+func (s *Server) cleanupDeletedVMLeftoversOn(ctx context.Context, host, vmName string, paths []string) string {
 	req := &pb.CleanupMigrationArtifactsRequest{VmName: vmName, DiskPaths: paths, VmDeleted: true}
 	for attempt := 0; attempt < deletedVMCleanupAttempts; attempt++ {
 		if attempt > 0 {
@@ -182,25 +256,29 @@ func (s *Server) cleanupDeletedVMLeftoversOn(ctx context.Context, host, vmName s
 			cancel()
 			slog.Warn("delete: cannot reach a host the VM may have left; its leftovers there are kept",
 				"vm", vmName, "host", host, "error", err)
-			return
+			return ""
 		}
 		_, err = client.CleanupMigrationArtifacts(cctx, req)
 		closeConn()
 		cancel()
 		switch status.Code(err) {
 		case codes.OK:
-			return
+			return ""
 		case codes.Aborted:
 			// That host's replica has not seen the tombstone yet.
 			continue
 		default:
 			slog.Warn("delete: a host the VM may have left declined to remove its leftovers",
 				"vm", vmName, "host", host, "paths", paths, "error", err)
-			return
+			if status.Code(err) == codes.FailedPrecondition {
+				return status.Convert(err).Message()
+			}
+			return ""
 		}
 	}
 	slog.Warn("delete: a host still holds a live record of the deleted VM; its leftovers there are kept",
 		"vm", vmName, "host", host, "paths", paths)
+	return ""
 }
 
 // removeDeletedVMLeftoversHere is the receiving side: remove a deleted VM's
@@ -215,7 +293,10 @@ func (s *Server) cleanupDeletedVMLeftoversOn(ctx context.Context, host, vmName s
 //     live row turns a refused self-heal restart into a permitted one
 //     (runtimeSuperseded reads an absent marker as "not superseded").
 //   - a domain of that name is defined here. Whatever it is, its marker and its
-//     disks are not a deleted VM's leftovers.
+//     disks are not a deleted VM's leftovers. The one exception is a shut-off
+//     domain the deleted record superseded at a newer owner epoch, which is
+//     undefined first (health.ReapSupersededStoppedLeftover), firmware state
+//     kept.
 //
 // and a disk path is removed only when, in addition:
 //
@@ -267,8 +348,11 @@ func (s *Server) removeDeletedVMLeftoversHere(ctx context.Context, req *pb.Clean
 			"VM %q still has a live record on %s; its leftovers here are kept until the delete reaches it", name, s.hostName)
 	}
 	if s.virt != nil && s.virt.DomainExists(name) {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"a domain named %q is defined on %s; nothing of it is removed", name, s.hostName)
+		why := s.reapSupersededLeftoverHere(ctx, name)
+		if why != "" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"a domain named %q is defined on %s; nothing of it is removed: %s", name, s.hostName, why)
+		}
 	}
 
 	if err := health.RemoveVMOwnerEpochMarker(s.dataDir, name); err != nil {
@@ -403,4 +487,26 @@ func (s *Server) requireSystemPeer(ctx context.Context) error {
 			"only the deleting host may ask for a deleted VM's leftovers; this call carries a user identity (%s)", m)
 	}
 	return nil
+}
+
+// reapSupersededLeftoverHere undefines a deleted VM's shut-off domain here
+// when health.ReapSupersededStoppedLeftover admits it, and returns "" once it
+// is gone; otherwise it returns why the domain is kept, with its state.
+func (s *Server) reapSupersededLeftoverHere(ctx context.Context, name string) string {
+	state := "state unreadable"
+	if st, err := s.virt.DomainStateReason(name); err == nil {
+		state = st.State + ", " + st.Reason
+	}
+	v, ok := s.virt.(health.SupersededLeftoverVirt)
+	if !ok {
+		return "(" + state + ") this host's libvirt backend cannot tell whether it is a superseded leftover"
+	}
+	if trusted, why := corrosion.ReplicaTrusted(ctx, s.db, s.hostName, s.db.ReplicaCaughtUp); !trusted {
+		return "(" + state + ") this host's replica is not caught up: " + why
+	}
+	reaped, why := health.ReapSupersededStoppedLeftover(ctx, s.db, v, s.dataDir, s.hostName, name, "deleted VM leftovers")
+	if reaped || !s.virt.DomainExists(name) {
+		return ""
+	}
+	return "(" + state + ") " + why
 }

@@ -343,6 +343,21 @@ func newRmCmd() *cobra.Command {
 					fmt.Printf("Kept disk %s (disk %s) on %s: %s\n  It is named by the health condition disk_leftover; check nothing uses it, then remove it by hand\n",
 						k.Path, k.Disk, k.Host, k.Reason)
 				}
+				// A host the VM left that still holds a definition of it,
+				// or had not answered yet.
+				for _, v := range hdr.Get(grpcapi.LeftoverDomainMD) {
+					var l grpcapi.LeftoverDomain
+					if json.Unmarshal([]byte(v), &l) != nil {
+						continue
+					}
+					if l.Pending {
+						fmt.Printf("Host %s has not confirmed it holds nothing of %s: %s\n", l.Host, args[0], l.Detail)
+					} else {
+						fmt.Printf("Host %s still holds a definition of %s: %s\n", l.Host, args[0], l.Detail)
+					}
+					fmt.Printf("  Its reconciler undefines a shut-off definition this delete superseded (disks and firmware state kept);\n" +
+						"  anything else is reported as vm_orphan_runtime: see docs/diagnostics.md, orphaned runtimes\n")
+				}
 				return nil
 			})
 		},

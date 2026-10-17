@@ -3652,7 +3652,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	go s.refreshLBForStack(context.Background(), vm.StackName)
 
 	if len(leftovers.hosts) > 0 {
-		go s.cleanupDeletedVMLeftovers(context.WithoutCancel(ctx), leftovers)
+		setLeftoverDomainHeader(ctx, s.cleanupDeletedVMLeftovers(context.WithoutCancel(ctx), leftovers))
 	}
 
 	return &emptypb.Empty{}, nil

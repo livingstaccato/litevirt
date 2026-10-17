@@ -2458,9 +2458,10 @@ max by (host, name) (litevirt_orphan_runtime{row="missing"}) > 0
 image) recognised by its owner-epoch element, whose tombstoned record names
 another host at a strictly newer owner epoch than the domain's and the host's
 `<data_dir>/vms/<vm>/owner_epoch`. Its host undefines it on the second
-sighting, or when the delete asks it, keeping disks, UEFI vars and TPM state,
-removes that marker, and records a `vm.leftover.undefined` event; `lv rm`
-names a host that still holds a definition of the VM or has not answered.
+sighting, or when the delete asks it, and removes that marker: disks and TPM
+state stay, its UEFI vars are renamed to `<vars>.superseded-<time>` (listed by
+`lv host superseded-disks`, never removed by the host), and a
+`vm.leftover.undefined` event records it.
 
 **Nothing else reaps an orphan automatically.** The only tombstone that could prove a
 running workload is unwanted is one naming this host at the runtime's own owner

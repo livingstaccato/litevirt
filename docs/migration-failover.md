@@ -1547,8 +1547,8 @@ The restart is not silent, and the real disk is not lost:
   VM's cloud-init seed there (`cloudinit/<vm>.iso`) if this release wrote it;
   a seed from an earlier release stays. A shut-off domain of the VM still
   defined on that host, from an owner epoch older than the deleted record's,
-  is undefined there (disks, UEFI vars and TPM state kept) and its
-  owner-epoch marker removed (orphaned runtimes in
+  is undefined there (disks and TPM state kept, UEFI vars renamed to
+  `<vars>.superseded-<time>`) and its owner-epoch marker removed (orphaned runtimes in
   [diagnostics](diagnostics.md)).
 - A VM of the same name created on that host before then clears
   `<data_dir>/disks/<vm>-<disk>.qcow2` files the earlier VM left. Of those, a

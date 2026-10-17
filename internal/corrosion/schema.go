@@ -549,7 +549,9 @@ import (
 //	     pins and retained public trust evidence; excluded from source content.
 //
 // v71: inert receiver attempts, pending metadata and bounded transport inventory.
-const CurrentSchemaVersion = 71
+// v72: inert per-source audit results, spool references and causal request indexes.
+// No active import, origin mode, replication or authority is introduced.
+const CurrentSchemaVersion = 72
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -2859,6 +2861,31 @@ var schemaDDL = []string{
 	// ExecuteLocal, one transaction per voter step, committed before the reply
 	// is built. Rows are never deleted or downgraded.
 	// Inert receiver evidence only: no adoption, voting, import or runtime authority.
+	`CREATE TABLE IF NOT EXISTS local_automation_receiver_audits (
+ id TEXT PRIMARY KEY, attempt TEXT NOT NULL, source TEXT NOT NULL,
+ publication TEXT NOT NULL, root TEXT NOT NULL, head BLOB NOT NULL,
+ lineage TEXT NOT NULL, coverage TEXT NOT NULL, records INTEGER NOT NULL,
+ payloads INTEGER NOT NULL, requests INTEGER NOT NULL, UNIQUE(attempt,source)
+ )`,
+	`CREATE TABLE IF NOT EXISTS local_automation_receiver_refs (
+ audit TEXT NOT NULL, component INTEGER NOT NULL, ordinal INTEGER NOT NULL,
+ sequence INTEGER NOT NULL, semantic_key BLOB NOT NULL,
+ scope TEXT NOT NULL, request_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+ claim_key BLOB NOT NULL, generation INTEGER NOT NULL,
+ accepted_round INTEGER NOT NULL, accepted_coord TEXT NOT NULL, accepted_nonce BLOB NOT NULL,
+ PRIMARY KEY(audit,component,ordinal), UNIQUE(audit,component,semantic_key)
+ )`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS automation_receiver_ref_sequence ON local_automation_receiver_refs(audit,component,sequence)
+ WHERE component IN (5,6,8,9,10,11)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS automation_receiver_ref_request ON local_automation_receiver_refs(audit,scope,request_id) WHERE component=7`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS automation_receiver_ref_operation ON local_automation_receiver_refs(audit,operation_id) WHERE component=7 AND operation_id<>''`,
+	`CREATE INDEX IF NOT EXISTS automation_receiver_ref_claim ON local_automation_receiver_refs(audit,claim_key,accepted_round,accepted_coord,accepted_nonce,component,ordinal)`,
+	`CREATE TABLE IF NOT EXISTS local_automation_receiver_requests (
+ audit TEXT NOT NULL, scope TEXT NOT NULL, request_id TEXT NOT NULL,
+ identity BLOB NOT NULL, receipt BLOB NOT NULL, operation_id TEXT NOT NULL,
+ origin INTEGER NOT NULL, PRIMARY KEY(audit,scope,request_id)
+ )`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS automation_receiver_request_operation ON local_automation_receiver_requests(audit,operation_id) WHERE operation_id<>''`,
 	`CREATE TABLE IF NOT EXISTS local_automation_receiver_jobs (
  id TEXT PRIMARY KEY, job TEXT NOT NULL, revision INTEGER NOT NULL,
  binding BLOB NOT NULL, evidence BLOB NOT NULL, UNIQUE(job,revision)
@@ -3706,6 +3733,9 @@ var createTableUnits = []struct {
 	{68, "local_automation_requests"}, {68, "local_automation_recovery"}, {68, "local_automation_staging"},
 	{69, "local_automation_cuts"}, {69, "local_automation_cut_records"},
 	{70, "local_automation_source_jobs"}, {70, "local_automation_publications"},
+	{72, "local_automation_receiver_audits"},
+	{72, "local_automation_receiver_refs"},
+	{72, "local_automation_receiver_requests"},
 	{71, "local_automation_receiver_jobs"},
 	{71, "local_automation_receiver_current"},
 	{71, "local_automation_receiver_validations"},

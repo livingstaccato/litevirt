@@ -25,12 +25,12 @@ func TestReceiverSchemaInertInventory(t *testing.T) {
 			t.Fatalf("receiver evidence is not exclusively local: %s", table)
 		}
 	}
-	for _, schema := range []int{69, 70, 71} {
+	for _, schema := range []int{69, 70, 71, 72} {
 		if !supportedAutomationCutDescriptor(schema, 1) {
 			t.Fatalf("explicit compatible descriptor %d/1 missing", schema)
 		}
 	}
-	if supportedAutomationCutDescriptor(72, 1) || supportedAutomationCutDescriptor(71, 2) {
+	if supportedAutomationCutDescriptor(73, 1) || supportedAutomationCutDescriptor(71, 2) {
 		t.Fatal("unknown source provenance accepted")
 	}
 }
@@ -80,8 +80,12 @@ func receiverFixture(t *testing.T) (*AutomationSourcePreparer, *AutomationReceiv
 }
 func receiverFixtureSeed(t *testing.T, seed func(*claimTestVoter)) (*AutomationSourcePreparer, *AutomationReceiver, AutomationExportRequest, context.Context, string) {
 	t.Helper()
-	ctx := context.Background()
 	producer, intent, b := sourcePreparationFixtureWithSeed(t, "", seed)
+	return receiverFixtureProducer(t, producer, intent, b)
+}
+func receiverFixtureProducer(t *testing.T, producer *AutomationSourcePreparer, intent AutomationSourceRequest, b *claimTestVoter) (*AutomationSourcePreparer, *AutomationReceiver, AutomationExportRequest, context.Context, string) {
+	t.Helper()
+	ctx := context.Background()
 	dir := t.TempDir()
 	c, err := NewLocalClient(dir, "b")
 	if err != nil {
@@ -101,7 +105,7 @@ func receiverFixtureSeed(t *testing.T, seed func(*claimTestVoter)) (*AutomationS
 	}
 	c.SetVoterConfigGate(func() bool { return true })
 	b.c = c
-	for g := int64(1); g <= 2; g++ {
+	for g := int64(1); g <= intent.Generation+1; g++ {
 		rows, err := producer.client.Query(ctx, `SELECT `+automationCutSections[8].columns+` FROM voter_configs WHERE generation=?`, g)
 		if err != nil || len(rows) != 1 {
 			t.Fatal(err)

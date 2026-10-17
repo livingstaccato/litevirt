@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
-	"time"
 
 	"github.com/litevirt/litevirt/internal/pki"
 )
@@ -89,73 +88,16 @@ func (r *AutomationReceiver) Stage(ctx context.Context, a *AutomationReceiverAtt
 	if !sameSourceRequest(request.Intent, a.request) {
 		return out, errors.New("receiver request context differs")
 	}
-	var member VoterMember
-	for _, m := range a.request.Sources {
-		if m.Name == source {
-			member = m
-			break
-		}
-	}
-	if member.Name == "" {
-		return out, errors.New("receiver source is not in fixed old roster")
-	}
 	if err = receiverPageBounds(request, page); err != nil {
 		return out, err
 	}
-	// Read-only authorization before metadata/body loading or network acquisition.
-	if err = r.client.sourceExportReadLock(ctx); err != nil {
-		return out, err
-	}
-	tx, err := r.client.db.BeginTx(ctx, nil)
-	if err != nil {
-		r.client.mu.RUnlock()
-		return out, err
-	}
-	local := &LocalTx{tx: tx}
-	err = r.currentTx(ctx, local, a)
-	var host sourceHost
-	if err == nil {
-		host, err = sourceReadHost(ctx, local, source)
-	}
-	if err == nil {
-		var facts receiverFacts
-		facts, _, _, err = r.factsTx(ctx, local, a.request, nil)
-		if err == nil && !sameReceiverFacts(facts, a.facts) {
-			err = errors.New("receiver current dependencies changed")
-		}
-	}
-	tx.Rollback()
-	r.client.mu.RUnlock()
+	authorization, err := r.authorizeSource(ctx, a, source)
 	if err != nil {
 		return out, err
 	}
-	observed := time.Now()
-	var peer sourceTarget
-	if source == r.client.hostName {
-		fp := sha256.Sum256(a.pair.Certificate[0])
-		peer = sourceTarget{Host: host, Incarnation: a.facts.Incarnation, Chain: a.pair.Certificate, Fingerprint: hex.EncodeToString(fp[:]), Local: true}
-	} else {
-		_, peer, err = sourceQueryPeer(ctx, r.dir, host, a.request.Generation, false)
-		if err != nil {
-			return out, err
-		}
-	}
-	if peer.Incarnation != member.Incarnation {
-		return out, errors.New("receiver source current incarnation differs")
-	}
-	if err = sourceAdmission(a.view, host, peer.Chain[0]); err != nil {
-		return out, err
-	}
-	sourceCap, err := a.view.ValidateHostCertificate(ctx, peer.Chain, source)
-	if err != nil {
-		return out, err
-	}
-	defer sourceCap.Discard()
-	targetCap, err := a.view.ValidateServedHost(ctx, a.pair)
-	if err != nil {
-		return out, err
-	}
-	defer targetCap.Discard()
+	defer authorization.discard()
+	host, peer, observed := authorization.host, authorization.peer, authorization.observed
+	sourceCap, targetCap := authorization.source, authorization.target
 	leaf, err := x509.ParseCertificate(peer.Chain[0])
 	if err != nil {
 		return out, err

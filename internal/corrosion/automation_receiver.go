@@ -429,6 +429,19 @@ func (r *AutomationReceiver) transaction(ctx context.Context, a *AutomationRecei
 			return err
 		}
 	}
+	// Recheck the final transaction snapshot after all storage work and test
+	// commit seams. Durable inert rows never outlive a changed selection or
+	// membership binding, even if transaction-local work changes dependencies.
+	if err = r.currentTx(ctx, local, a); err != nil {
+		return err
+	}
+	finalFacts, _, _, err := r.factsTx(ctx, local, a.request, nil)
+	if err != nil {
+		return err
+	}
+	if !sameReceiverFacts(finalFacts, a.facts) {
+		return errors.New("receiver final authorization dependencies changed")
+	}
 	if err = ctx.Err(); err != nil {
 		return err
 	}

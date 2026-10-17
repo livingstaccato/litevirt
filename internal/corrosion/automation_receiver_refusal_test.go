@@ -207,7 +207,7 @@ func TestReceiverPageRefusalsAndAtomicity(t *testing.T) {
 			case "schema":
 				var m automationCutMetadata
 				json.Unmarshal(bad.Metadata, &m)
-				m.SourceSchema = 72
+				m.SourceSchema = 73
 				bad.Metadata, _ = json.Marshal(m)
 			case "codec":
 				var m automationCutMetadata

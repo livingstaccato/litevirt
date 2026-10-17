@@ -45,6 +45,9 @@ var antiEntropyExcluded = map[string]string{
 	"session_factors":                       "v64 the second factor a session's login presented; as ephemeral as sessions, replicated through the WAL in the session's own batch, never full-state-merged",
 	"session_groups":                        "v66 the directory groups a session's external-realm login verified; as ephemeral as sessions, replicated through the WAL in the session's own batch, never full-state-merged",
 	"netbox_sync_queue":                     "work queue for the P2 NetBox inventory mirror (v51); a LATENCY optimisation only — the periodic full sweep is the correctness mechanism, so a lost/stale queue row self-heals on the next sweep (cf. vm_events/host_runtime_usage)",
+	"local_automation_receiver_audits":      "v72 inert semantic audit; never authority or replication",
+	"local_automation_receiver_refs":        "v72 inert semantic audit; never authority or replication",
+	"local_automation_receiver_requests":    "v72 inert semantic audit; never authority or replication",
 	"local_automation_receiver_jobs":        "v71 inert receiver staging; never authority or replication",
 	"local_automation_receiver_current":     "v71 inert receiver staging; never authority or replication",
 	"local_automation_receiver_validations": "v71 inert receiver staging; never authority or replication",
@@ -71,6 +74,9 @@ var antiEntropyExcluded = map[string]string{
 // DB access, not the replicating Execute path). The updated_at→primary-key
 // invariant below doesn't apply to them.
 var localOnly = map[string]bool{
+	"local_automation_receiver_audits":      true,
+	"local_automation_receiver_refs":        true,
+	"local_automation_receiver_requests":    true,
 	"local_automation_receiver_jobs":        true,
 	"local_automation_receiver_current":     true,
 	"local_automation_receiver_validations": true,

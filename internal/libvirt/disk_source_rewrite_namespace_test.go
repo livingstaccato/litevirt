@@ -241,7 +241,7 @@ func TestRewriteDiskSource_RefusesUnsafeRewrites(t *testing.T) {
 		{name: "the kernel", devices: vda, extra: "  <os>\n    <kernel>" + old + "</kernel>\n  </os>\n", wantErr: "<domain/os/kernel> text"},
 		{name: "a qemu:override argument", devices: vda,
 			extra:   "  <qemu:override xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>\n    <qemu:device alias='x'>\n      <qemu:frontend>\n        <qemu:property name='drive' type='string' value='" + old + "'/>\n      </qemu:frontend>\n    </qemu:device>\n  </qemu:override>\n",
-			wantErr: "attribute value"},
+			wantErr: "qemu:property> attribute value"},
 		{name: "the new path already named by another disk", devices: vda +
 			"    <disk type='file'>\n      <source file='/srv/pools/fast/mv1-root.qcow2'/>\n      <target dev='vdb'/>\n    </disk>\n",
 			wantErr: "disk vda to \"/srv/pools/fast/mv1-root.qcow2\": the domain already names that path in <devices/disk/source> attribute file"},

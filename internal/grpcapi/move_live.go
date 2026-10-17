@@ -263,8 +263,18 @@ func (s *Server) liveMoveVolume(
 	// Still on src. Redefine persistent → commit DB → pivot, rolling back on failure.
 	cs, rerr := s.redefineMovedDiskSource(vm, src, destPath)
 	if rerr != nil {
+		// The define may have been stored despite the error. Point the persistent
+		// config back at src while the mirror still tracks it, then stop the mirror;
+		// the dest is removed only once the config is back on src.
+		safe := s.rollbackCutover(cutoverRedefined, vm, src, destPath)
 		_ = s.liveMover.CancelBlockCopy(vm.Name, src.Path)
-		return status.Errorf(codes.Internal, "redefine persistent config (cutover aborted%s): %v", s.keptCopyNote(vm, destPath), rerr)
+		kept := ""
+		if safe {
+			_ = os.Remove(destPath)
+		} else {
+			kept = unrolledCopyNote(src, destPath)
+		}
+		return status.Errorf(codes.Internal, "redefine persistent config (cutover aborted%s): %v", kept, rerr)
 	}
 	if err := commit(); err != nil {
 		// Roll persistent back; only remove the dest when it's no longer referenced

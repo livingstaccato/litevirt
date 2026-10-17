@@ -213,8 +213,9 @@ func TestMoveVolume_Live_RollbackKeepsMarkerWrittenAfterDefine(t *testing.T) {
 }
 
 // defineThenFail makes the define that names path apply and then report an
-// error, as a define whose reply is lost after libvirt stored it.
-func defineThenFail(f *libvirtfake.Fake, path string) {
+// error, as a define whose reply is lost after libvirt stored it. With
+// failAfter, every later define fails too, so the rollback cannot apply.
+func defineThenFail(f *libvirtfake.Fake, path string, failAfter bool) {
 	f.FailDefineDomain = func(x string) error {
 		if !strings.Contains(x, path) {
 			return nil
@@ -223,22 +224,48 @@ func defineThenFail(f *libvirtfake.Fake, path string) {
 		if err := f.DefineDomain(x); err != nil {
 			return err
 		}
+		if failAfter {
+			f.FailDefineDomain = func(string) error { return errors.New("libvirt connection lost") }
+		}
 		return errors.New("connection reset after define")
 	}
 }
 
-// A failed offline define that libvirt applied anyway leaves the config naming
-// the copy: the copy is kept and named in the error.
-func TestMoveVolume_Offline_DefineFailureKeepsACopyTheConfigNames(t *testing.T) {
+// A failed offline define that libvirt applied anyway is rolled back: the
+// config names the source again, byte for byte, and the copy is removed.
+func TestMoveVolume_Offline_AppliedDefineFailureRepointsTheSource(t *testing.T) {
+	s, f, srcFile, dstFile := offlineMoveServer(t)
+	before := litevirtDomainXML("vm1", "vda", srcFile)
+	if err := f.DefineDomain(before); err != nil {
+		t.Fatalf("define: %v", err)
+	}
+	defineThenFail(f, dstFile, false)
+	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+	err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm1", DiskName: "root", TargetPool: "warm"}, rec)
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("want Internal, got %v", err)
+	}
+	if after, _ := f.DumpXMLInactive("vm1"); after != before {
+		t.Fatalf("the config does not name the source again:\n%s", after)
+	}
+	if exists(dstFile) || !exists(srcFile) {
+		t.Fatalf("dst exists=%v src exists=%v, want false/true", exists(dstFile), exists(srcFile))
+	}
+}
+
+// The rollback of that define fails too: the config still names the copy, so
+// the copy is kept, the error names it, and nothing is deleted.
+func TestMoveVolume_Offline_UnrolledDefineKeepsAndNamesTheCopy(t *testing.T) {
 	s, f, srcFile, dstFile := offlineMoveServer(t)
 	if err := f.DefineDomain(litevirtDomainXML("vm1", "vda", srcFile)); err != nil {
 		t.Fatalf("define: %v", err)
 	}
-	defineThenFail(f, dstFile)
+	defineThenFail(f, dstFile, true)
 	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
 	err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm1", DiskName: "root", TargetPool: "warm"}, rec)
-	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), dstFile) {
-		t.Fatalf("want Internal naming %s, got %v", dstFile, err)
+	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), dstFile) ||
+		!strings.Contains(err.Error(), "could not be pointed back") {
+		t.Fatalf("want Internal naming the kept copy %s, got %v", dstFile, err)
 	}
 	if !exists(dstFile) || !exists(srcFile) {
 		t.Fatalf("dst exists=%v src exists=%v, want both", exists(dstFile), exists(srcFile))
@@ -268,22 +295,62 @@ func TestMoveVolume_Offline_UnreadableReplanKeepsAndNamesTheCopy(t *testing.T) {
 	}
 }
 
-// The live twin: a redefine that libvirt applied but reported failed keeps
-// the destination the config names.
-func TestMoveVolume_Live_DefineFailureKeepsACopyTheConfigNames(t *testing.T) {
-	s, f, src, destPath, _ := liveLitevirtMove(t)
-	mover := &fakeLiveMover{jobEnd: 4096, progressBytesPerPoll: 4096}
+// cancelChecker is a live mover whose CancelBlockCopy records what the
+// persistent config names at that moment.
+type cancelChecker struct {
+	fakeLiveMover
+	f            *libvirtfake.Fake
+	atCancel     string
+	cancelledSeq int
+}
+
+func (m *cancelChecker) CancelBlockCopy(dom, disk string) error {
+	m.atCancel, _ = m.f.DumpXMLInactive(dom)
+	m.cancelledSeq++
+	return m.fakeLiveMover.CancelBlockCopy(dom, disk)
+}
+
+// The live twin: a redefine that libvirt applied but reported failed is
+// rolled back before the mirror stops, so the config never names a copy that
+// no longer receives the guest's writes; then the dest is removed.
+func TestMoveVolume_Live_AppliedDefineFailureRepointsTheSourceBeforeCancel(t *testing.T) {
+	s, f, src, destPath, before := liveLitevirtMove(t)
+	mover := &cancelChecker{fakeLiveMover: fakeLiveMover{jobEnd: 4096, progressBytesPerPoll: 4096}, f: f}
 	s.SetLiveMover(mover)
-	defineThenFail(f, destPath)
+	defineThenFail(f, destPath, false)
 	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
 	err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm-live", DiskName: "root", TargetPool: "warm"}, rec)
-	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), destPath) {
-		t.Fatalf("want Internal naming %s, got %v", destPath, err)
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("want Internal, got %v", err)
 	}
-	if !exists(destPath) || !exists(src) {
-		t.Fatalf("dest exists=%v src exists=%v, want both", exists(destPath), exists(src))
+	if mover.cancelledSeq == 0 || mover.atCancel != before {
+		t.Fatalf("at the mirror's cancel (%d calls) the config was not back on the source:\n%s", mover.cancelledSeq, mover.atCancel)
+	}
+	if after, _ := f.DumpXMLInactive("vm-live"); after != before {
+		t.Fatalf("the config does not name the source again:\n%s", after)
+	}
+	if exists(destPath) || !exists(src) {
+		t.Fatalf("dest exists=%v src exists=%v, want false/true", exists(destPath), exists(src))
 	}
 	if mover.pivotCalls != 0 {
 		t.Fatalf("pivot = %d, want 0", mover.pivotCalls)
+	}
+}
+
+// The live rollback fails too: the copy is kept, the error names it, and
+// nothing is deleted.
+func TestMoveVolume_Live_UnrolledDefineKeepsAndNamesTheCopy(t *testing.T) {
+	s, f, src, destPath, _ := liveLitevirtMove(t)
+	mover := &fakeLiveMover{jobEnd: 4096, progressBytesPerPoll: 4096}
+	s.SetLiveMover(mover)
+	defineThenFail(f, destPath, true)
+	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+	err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm-live", DiskName: "root", TargetPool: "warm"}, rec)
+	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), destPath) ||
+		!strings.Contains(err.Error(), "could not be pointed back") {
+		t.Fatalf("want Internal naming the kept copy %s, got %v", destPath, err)
+	}
+	if !exists(destPath) || !exists(src) {
+		t.Fatalf("dest exists=%v src exists=%v, want both", exists(destPath), exists(src))
 	}
 }

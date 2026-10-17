@@ -3,13 +3,11 @@ package fleet
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fwmig"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -30,45 +28,14 @@ var (
 	fwwNvram   = []byte("fwlive1's UEFI vars")
 )
 
-// fwwCluster is two nodes, src running fwlive1 (Secure Boot + vTPM, no disk)
-// with its firmware state, dst labelled for a live firmware move, one firmware
-// layout, and src's migrations landing on dst.
+// fwwCluster is the live firmware move scene without a disk (fwliveSetup,
+// fwlive_scene_test.go): two nodes, src running fwlive1 (Secure Boot + vTPM)
+// with its firmware state, dst labelled for a live firmware move, one
+// firmware layout, and src's migrations landing on dst.
 func fwwCluster(t *testing.T) (*Cluster, *Node, *Node) {
 	t.Helper()
-	c := New(t, Options{Nodes: 2, SharedCRDT: true})
-	t.Cleanup(c.Stop)
-	src, dst := c.Nodes[0], c.Nodes[1]
-	ctx := context.Background()
-	setHostCapacity(t, c, src.Name, 64, 65536)
-	setHostCapacity(t, c, dst.Name, 64, 65536)
-	layout := filepath.Join(c.tmpRoot, "layout")
-	for _, n := range c.Nodes {
-		n.Server.SetFirmwareLayoutDirForTest(layout)
-	}
-	for _, l := range []string{corrosion.LabelTPMCapable, corrosion.LabelSecureBootCapable, corrosion.LabelFwLiveMigrate} {
-		if err := corrosion.SetHostLabel(ctx, src.DB, dst.Name, l, "true"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	spec, err := json.Marshal(&pb.VMSpec{Name: fwwVM, Cpu: 1, MemoryMib: 256, SecureBoot: true, Tpm: true, Firmware: "uefi", Uuid: fwwUUID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := corrosion.InsertVM(ctx, src.DB, corrosion.VMRecord{Name: fwwVM, HostName: src.Name, State: "running",
-		Spec: string(spec), CPUActual: 1, MemActual: 256}, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	x := "<domain type='kvm'><name>" + fwwVM + "</name><uuid>" + fwwUUID + "</uuid><os><type>hvm</type>" +
-		"<loader readonly='yes' secure='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE.secboot.fd</loader>" +
-		"<nvram>" + src.FW.NvramPath(fwwVM) + "</nvram></os><devices>" +
-		"<tpm model='tpm-crb'><backend type='emulator' version='2.0' persistent_state='yes'/></tpm></devices></domain>"
-	src.Virt.SetInactiveXML(fwwVM, x)
-	src.Virt.SetActiveXML(fwwVM, x)
-	src.Virt.SetState(fwwVM, libvirtfake.StateRunning)
-	hlWrite(t, filepath.Join(src.FW.SwtpmDir(fwwUUID), "tpm2", "tpm2-00.permall"), fwwPermall)
-	hlWrite(t, src.FW.NvramPath(fwwVM), fwwNvram)
-	src.LandMigrationsOn(dst)
-	return c, src, dst
+	sc := fwliveSetup(t, false)
+	return sc.c, sc.src, sc.dst
 }
 
 // A live firmware move runs end to end over real gRPC: the guest lands paused,

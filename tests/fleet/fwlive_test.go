@@ -3,15 +3,13 @@ package fleet
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
-	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -27,189 +25,21 @@ import (
 // Live firmware (Secure Boot + vTPM) migration scenarios over real gRPC and
 // the D2-7 fake (spec §15, Fleet: F-1, F-2, F-2b, F-4, F-9). Each node has a
 // firmware store of its own, the fake models what libvirt did to the state
-// in the probes, and every scenario checks that the guest runs on at most
-// one host at every moment.
+// in the probes, and the scene's one-copy watcher checks that the guest never
+// starts running on one host while the other runs it.
 
-const (
-	fwliveVM   = "fwlivesc"
-	fwliveUUID = "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f"
-)
+// The scene (fwliveSetup), its one-copy watcher and the accessors are
+// fwlive_scene_test.go's.
 
-var (
-	fwlivePermall = []byte("fwlivesc's TPM state")
-	fwliveNvram   = []byte("fwlivesc's UEFI vars")
-)
-
-// fwliveScene is two nodes, src running fwlivesc (Secure Boot + vTPM) with
-// its firmware state in src's store, dst labelled for a live firmware move,
-// one firmware layout, and src's migrations landing on dst.
-type fwliveScene struct {
-	c        *Cluster
-	src, dst *Node
-	// disk is the host-local disk's path when the VM has one (a storage
-	// copy), else "".
-	disk string
-}
-
-func fwliveSetup(t *testing.T, withDisk bool) *fwliveScene {
-	t.Helper()
-	c := New(t, Options{Nodes: 2, SharedCRDT: true})
-	t.Cleanup(c.Stop)
-	src, dst := c.Nodes[0], c.Nodes[1]
-	ctx := context.Background()
-	setHostCapacity(t, c, src.Name, 64, 65536)
-	setHostCapacity(t, c, dst.Name, 64, 65536)
-	layout := filepath.Join(c.tmpRoot, "layout")
-	for _, n := range c.Nodes {
-		n.Server.SetFirmwareLayoutDirForTest(layout)
-	}
-	for _, l := range []string{corrosion.LabelTPMCapable, corrosion.LabelSecureBootCapable, corrosion.LabelFwLiveMigrate} {
-		if err := corrosion.SetHostLabel(ctx, src.DB, dst.Name, l, "true"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	spec, err := json.Marshal(&pb.VMSpec{Name: fwliveVM, Cpu: 1, MemoryMib: 256, SecureBoot: true, Tpm: true, Firmware: "uefi", Uuid: fwliveUUID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	sc := &fwliveScene{c: c, src: src, dst: dst}
-	var disks []corrosion.DiskRecord
-	if withDisk {
-		// Both hosts can encrypt the copy (a storage copy carries the TPM
-		// state and has no plaintext fallback).
-		migrationTLSReady(src, true)
-		migrationTLSReady(dst, true)
-		sc.disk = filepath.Join(c.tmpRoot, dst.Name, "data", "disks", fwliveVM+"-root.qcow2")
-		disks = []corrosion.DiskRecord{{VMName: fwliveVM, DiskName: "root", HostName: src.Name, Path: sc.disk,
-			SizeBytes: 1 << 30, StorageType: "local", TargetDev: "vda"}}
-	}
-	if err := corrosion.InsertVM(ctx, src.DB, corrosion.VMRecord{Name: fwliveVM, HostName: src.Name, State: "running",
-		Spec: string(spec), CPUActual: 1, MemActual: 256}, nil, disks); err != nil {
-		t.Fatal(err)
-	}
-	x := "<domain type='kvm'><name>" + fwliveVM + "</name><uuid>" + fwliveUUID + "</uuid><os><type>hvm</type>" +
-		"<loader readonly='yes' secure='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE.secboot.fd</loader>" +
-		"<nvram>" + src.FW.NvramPath(fwliveVM) + "</nvram></os><devices>" +
-		"<tpm model='tpm-crb'><backend type='emulator' version='2.0' persistent_state='yes'/></tpm></devices></domain>"
-	src.Virt.SetInactiveXML(fwliveVM, x)
-	src.Virt.SetActiveXML(fwliveVM, x)
-	src.Virt.SetState(fwliveVM, libvirtfake.StateRunning)
-	hlWrite(t, fwlivePermallPath(src), fwlivePermall)
-	hlWrite(t, src.FW.NvramPath(fwliveVM), fwliveNvram)
-	src.LandMigrationsOn(dst)
-	return sc
-}
-
-func fwlivePermallPath(n *Node) string {
-	return filepath.Join(n.FW.SwtpmDir(fwliveUUID), "tpm2", "tpm2-00.permall")
-}
-
-// migrate runs `lv migrate fwlivesc <dst>` on src (live, a storage copy when
-// the VM has a disk) and returns its terminal error.
-func (sc *fwliveScene) migrate(t *testing.T) error {
-	t.Helper()
-	st, err := sc.c.SelfClient(sc.src).MigrateVM(context.Background(), &pb.MigrateVMRequest{
-		VmName: fwliveVM, TargetHost: sc.dst.Name, Strategy: pb.MigrateStrategy_MIGRATE_LIVE, WithStorage: sc.disk != "",
-	})
-	if err != nil {
-		return err
-	}
-	for {
-		if _, err := st.Recv(); err == io.EOF {
-			return nil
-		} else if err != nil {
-			return err
-		}
-	}
-}
-
-// fwliveOneCopy samples both fakes every millisecond for the whole scenario
-// and fails the test if the guest is ever running on both hosts, or running
-// on one while the other's guest is not shut off or absent: one copy of the
-// VM at every moment. Its stop func ends the sampling and reports.
-func fwliveOneCopy(t *testing.T, a, b *Node) (stop func()) {
-	t.Helper()
-	done := make(chan struct{})
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var seen []string
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			sa, _ := a.Virt.RawState(fwliveVM)
-			sb, _ := b.Virt.RawState(fwliveVM)
-			if sa == libvirtfake.StateRunning && sb == libvirtfake.StateRunning {
-				mu.Lock()
-				if len(seen) < 3 {
-					seen = append(seen, string(sa)+"/"+string(sb))
-				}
-				mu.Unlock()
-			}
-			select {
-			case <-done:
-				return
-			case <-time.After(time.Millisecond):
-			}
-		}
-	}()
-	return func() {
-		close(done)
-		wg.Wait()
-		mu.Lock()
-		defer mu.Unlock()
-		if len(seen) > 0 {
-			t.Errorf("the guest ran on both %s and %s at once (%v)", a.Name, b.Name, seen)
-		}
-	}
-}
-
-// fwliveEventIndex is the index of the first event op for fwlivesc in n's
+// fwliveEventIndex is the index of the first event op for fwlive1 in n's
 // fake log at or after from, or -1.
 func fwliveEventIndex(n *Node, op string, from int) int {
 	for i, e := range n.Virt.EventLog() {
-		if i >= from && e.Op == op && e.Domain == fwliveVM {
+		if i >= from && e.Op == op && e.Domain == fwwVM {
 			return i
 		}
 	}
 	return -1
-}
-
-func fwliveExists(p string) bool {
-	_, err := os.Stat(p)
-	return err == nil
-}
-
-func fwliveRow(t *testing.T, n *Node) *corrosion.VMRecord {
-	t.Helper()
-	vm, err := corrosion.GetVM(context.Background(), n.DB, fwliveVM)
-	if err != nil || vm == nil {
-		t.Fatalf("the VM's row: %+v (%v)", vm, err)
-	}
-	return vm
-}
-
-// fwliveQuarantine is the one quarantine directory dst keeps for fwlivesc,
-// or "".
-func fwliveQuarantine(t *testing.T, n *Node) string {
-	t.Helper()
-	dirs, _ := filepath.Glob(filepath.Join(n.FW.DataDir, fwmig.QuarantineDir, fwliveVM+"-*"))
-	if len(dirs) > 1 {
-		t.Fatalf("quarantines %v, want at most one", dirs)
-	}
-	if len(dirs) == 0 {
-		return ""
-	}
-	return dirs[0]
-}
-
-func fwliveOpenCondition(t *testing.T, n *Node, code string) (corrosion.HealthCondition, bool) {
-	t.Helper()
-	row, found, err := corrosion.GetHealthCondition(context.Background(), n.DB, "firmware_migration", code, "vm", fwliveVM)
-	if err != nil {
-		t.Fatalf("condition %s: %v", code, err)
-	}
-	return row, found && row.Lifecycle != corrosion.ConditionResolved
 }
 
 // F-1. The happy path of a Secure Boot + vTPM VM with a host-local disk
@@ -226,12 +56,11 @@ func fwliveOpenCondition(t *testing.T, n *Node, code string) (corrosion.HealthCo
 func TestFleet_FwLive_F1_HappyPathWithStorage(t *testing.T) {
 	sc := fwliveSetup(t, true)
 	src, dst := sc.src, sc.dst
-	stop := fwliveOneCopy(t, src, dst)
 
 	var mu sync.Mutex
 	verifyEnd, releaseStart, releaseEnd := -1, -1, -1
 	dst.HookUnary("VerifyLiveFirmwareTarget", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
-		if st, _ := dst.Virt.RawState(fwliveVM); st != libvirtfake.StatePaused {
+		if st, _ := dst.Virt.RawState(fwwVM); st != libvirtfake.StatePaused {
 			t.Errorf("at Verify the target guest is %q, want paused", st)
 		}
 		if i := fwliveEventIndex(dst, "migrate-in", 0); i < 0 {
@@ -241,10 +70,10 @@ func TestFleet_FwLive_F1_HappyPathWithStorage(t *testing.T) {
 		mu.Lock()
 		verifyEnd = len(dst.Virt.EventLog())
 		mu.Unlock()
-		if v := resp.(*pb.VerifyLiveFirmwareTargetResponse).GetVerdict(); err != nil || v != pb.FirmwareVerdict_FIRMWARE_VERDICT_MATCH {
-			t.Errorf("Verify answered %v (%v), want MATCH", v, err)
+		if r, _ := resp.(*pb.VerifyLiveFirmwareTargetResponse); err != nil || r.GetVerdict() != pb.FirmwareVerdict_FIRMWARE_VERDICT_MATCH {
+			t.Errorf("Verify answered %v (%v), want MATCH", r.GetVerdict(), err)
 		}
-		if st, _ := dst.Virt.RawState(fwliveVM); st != libvirtfake.StatePaused {
+		if st, _ := dst.Virt.RawState(fwwVM); st != libvirtfake.StatePaused {
 			t.Errorf("after Verify the target guest is %q, want still paused", st)
 		}
 		return resp, err
@@ -257,32 +86,31 @@ func TestFleet_FwLive_F1_HappyPathWithStorage(t *testing.T) {
 		if row := fwliveRow(t, dst); row.HostName != dst.Name {
 			t.Errorf("Release before the commit: the row names %s", row.HostName)
 		}
-		if st, _ := dst.Virt.RawState(fwliveVM); st != libvirtfake.StatePaused {
+		if st, _ := dst.Virt.RawState(fwwVM); st != libvirtfake.StatePaused {
 			t.Errorf("at Release the target guest is %q, want paused", st)
 		}
 		resp, err := h(ctx, req)
 		mu.Lock()
 		releaseEnd = len(dst.Virt.EventLog())
 		mu.Unlock()
-		if err != nil || !resp.(*pb.ReleaseLiveFirmwareTargetResponse).GetNvramConfirmed() {
+		if r, _ := resp.(*pb.ReleaseLiveFirmwareTargetResponse); err != nil || !r.GetNvramConfirmed() {
 			t.Errorf("Release answered %+v (%v), want the NVRAM confirmed", resp, err)
 		}
 		// The source's state is all still there when Release answers: the
 		// cleanup waits for it.
-		if _, ok := src.Virt.RawState(fwliveVM); !ok {
+		if _, ok := src.Virt.RawState(fwwVM); !ok {
 			t.Error("the source domain was undefined before Release answered")
 		}
-		if !bytes.Equal(hlRead(t, fwlivePermallPath(src)), fwlivePermall) || !bytes.Equal(hlRead(t, src.FW.NvramPath(fwliveVM)), fwliveNvram) {
+		if !bytes.Equal(hlRead(t, fwlivePermall(src)), fwwPermall) || !bytes.Equal(hlRead(t, src.FW.NvramPath(fwwVM)), fwwNvram) {
 			t.Error("the source's firmware state changed before Release answered")
 		}
-		if got := hlRead(t, dst.FW.NvramPath(fwliveVM)); !bytes.Equal(got, fwliveNvram) {
+		if got := hlRead(t, dst.FW.NvramPath(fwwVM)); !bytes.Equal(got, fwwNvram) {
 			t.Errorf("target NVRAM when Release answered = %q, want the source's final", got)
 		}
 		return resp, err
 	})
 
 	err := sc.migrate(t)
-	stop()
 	if err != nil {
 		t.Fatalf("live firmware move: %v", err)
 	}
@@ -293,53 +121,25 @@ func TestFleet_FwLive_F1_HappyPathWithStorage(t *testing.T) {
 
 	// The fake's order log: landed, Verify, Release, and the one resume
 	// inside Release.
+	mu.Lock()
+	vEnd, rStart, rEnd := verifyEnd, releaseStart, releaseEnd
+	mu.Unlock()
 	resume := fwliveEventIndex(dst, "resume", 0)
-	if verifyEnd < 0 || releaseStart < 0 || releaseEnd < 0 {
-		t.Fatalf("Verify or Release never ran on the target (%d %d %d)", verifyEnd, releaseStart, releaseEnd)
+	if vEnd < 0 || rStart < 0 || rEnd < 0 {
+		t.Fatalf("Verify or Release never ran on the target (%d %d %d)", vEnd, rStart, rEnd)
 	}
-	if resume < verifyEnd || resume < releaseStart || resume >= releaseEnd {
+	if resume < vEnd || resume < rStart || resume >= rEnd {
 		t.Errorf("target resume at event %d, want inside Release [%d,%d) and after Verify (%d): %+v",
-			resume, releaseStart, releaseEnd, verifyEnd, dst.Virt.EventLog())
+			resume, rStart, rEnd, vEnd, dst.Virt.EventLog())
 	}
 	if again := fwliveEventIndex(dst, "resume", resume+1); again >= 0 {
 		t.Errorf("the target guest was resumed twice (events %d and %d)", resume, again)
 	}
 
-	if st, _ := dst.Virt.RawState(fwliveVM); st != libvirtfake.StateRunning {
-		t.Errorf("target domain %q, want running", st)
-	}
-	row := fwliveRow(t, src)
-	if row.HostName != dst.Name || row.State != "running" {
-		t.Errorf("row %s/%s, want running on %s", row.HostName, row.State, dst.Name)
-	}
-	disks, err := corrosion.ListDisks(context.Background(), src.DB, fwliveVM)
+	fwliveMoved(t, src, dst)
+	disks, err := corrosion.ListDisks(context.Background(), src.DB, fwwVM)
 	if err != nil || len(disks) != 1 || disks[0].HostName != dst.Name {
 		t.Errorf("disk rows %+v (%v), want root on %s", disks, err, dst.Name)
-	}
-	if got := hlRead(t, dst.FW.NvramPath(fwliveVM)); !bytes.Equal(got, fwliveNvram) {
-		t.Errorf("target NVRAM %q, want the source's final", got)
-	}
-	// Source: undefined, state wiped, retained bundle kept.
-	if st, ok := src.Virt.RawState(fwliveVM); ok {
-		t.Errorf("the source domain is still defined (%s)", st)
-	}
-	for _, p := range []string{fwlivePermallPath(src), src.FW.NvramPath(fwliveVM)} {
-		if fwliveExists(p) {
-			t.Errorf("source state %s not wiped", p)
-		}
-	}
-	if tars, _ := filepath.Glob(filepath.Join(src.FW.DataDir, fwmig.RetainedDir, fwliveVM+"-*.tar")); len(tars) != 1 {
-		t.Errorf("retained bundles %v, want one", tars)
-	}
-	// No record on either host.
-	if _, ok, err := fwmig.New(dst.FW.DataDir).GetHold(fwliveVM); ok || err != nil {
-		t.Errorf("the target still holds the move (%v)", err)
-	}
-	if m, ok, err := fwmig.New(src.FW.DataDir).GetMarker(fwliveVM); ok || err != nil {
-		t.Errorf("source marker %s left (%v)", m.Phase, err)
-	}
-	if q := fwliveQuarantine(t, dst); q != "" {
-		t.Errorf("a happy move quarantined %s", q)
 	}
 }
 
@@ -357,7 +157,6 @@ func TestFleet_FwLive_F2_MismatchQuarantines(t *testing.T) {
 	sc := fwliveSetup(t, false)
 	src, dst := sc.src, sc.dst
 	dst.Virt.CorruptLandedPermall = func(string) bool { return true }
-	stop := fwliveOneCopy(t, src, dst)
 
 	err := sc.migrate(t)
 	if err == nil || status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "did not verify") {
@@ -369,26 +168,26 @@ func TestFleet_FwLive_F2_MismatchQuarantines(t *testing.T) {
 		t.Fatalf("no quarantine on %s", dst.Name)
 	}
 	if got, err := os.ReadFile(filepath.Join(q, "swtpm", "tpm2", "tpm2-00.permall")); err != nil ||
-		!bytes.HasPrefix(got, fwlivePermall) || bytes.Equal(got, fwlivePermall) {
+		!bytes.HasPrefix(got, fwwPermall) || bytes.Equal(got, fwwPermall) {
 		t.Errorf("quarantined permall %q (%v), want the corrupted copy", got, err)
 	}
 	// The NVRAM Prepare materialised from the source (T0); the guest never
 	// resumed, so nothing wrote it since.
-	if got, err := os.ReadFile(filepath.Join(q, "nvram")); err != nil || !bytes.Equal(got, fwliveNvram) {
+	if got, err := os.ReadFile(filepath.Join(q, "nvram")); err != nil || !bytes.Equal(got, fwwNvram) {
 		t.Errorf("quarantined NVRAM %q (%v), want the one Prepare materialised", got, err)
 	}
-	for _, p := range []string{fwlivePermallPath(dst), dst.FW.NvramPath(fwliveVM)} {
+	for _, p := range []string{fwlivePermall(dst), dst.FW.NvramPath(fwwVM)} {
 		if fwliveExists(p) {
 			t.Errorf("target state %s left outside the quarantine", p)
 		}
 	}
-	if _, ok := dst.Virt.RawState(fwliveVM); ok {
+	if _, ok := dst.Virt.RawState(fwwVM); ok {
 		t.Error("the held domain is still defined on the target")
 	}
-	if _, ok, err := fwmig.New(dst.FW.DataDir).GetHold(fwliveVM); ok || err != nil {
+	if _, ok, err := fwmig.New(dst.FW.DataDir).GetHold(fwwVM); ok || err != nil {
 		t.Errorf("the target still holds the move (%v)", err)
 	}
-	if _, ok, err := fwmig.New(src.FW.DataDir).GetMarker(fwliveVM); ok || err != nil {
+	if _, ok, err := fwmig.New(src.FW.DataDir).GetMarker(fwwVM); ok || err != nil {
 		t.Errorf("the source marker was kept (%v)", err)
 	}
 
@@ -396,22 +195,21 @@ func TestFleet_FwLive_F2_MismatchQuarantines(t *testing.T) {
 	if row.HostName != src.Name || row.State != "stopped" {
 		t.Errorf("row %s/%s, want stopped on %s", row.HostName, row.State, src.Name)
 	}
-	if st, ok := src.Virt.RawState(fwliveVM); !ok || st != libvirtfake.StateShutdown {
+	if st, ok := src.Virt.RawState(fwwVM); !ok || st != libvirtfake.StateShutdown {
 		t.Errorf("source domain %q (defined %v), want defined and shut off", st, ok)
 	}
-	if !bytes.Equal(hlRead(t, fwlivePermallPath(src)), fwlivePermall) || !bytes.Equal(hlRead(t, src.FW.NvramPath(fwliveVM)), fwliveNvram) {
+	if !bytes.Equal(hlRead(t, fwlivePermall(src)), fwwPermall) || !bytes.Equal(hlRead(t, src.FW.NvramPath(fwwVM)), fwwNvram) {
 		t.Error("the source's firmware state is not byte-for-byte what it was")
 	}
-	if _, open := fwliveOpenCondition(t, src, "firmware_migration_unverified"); !open {
+	if !fwliveCondition(t, src, "firmware_migration_unverified") {
 		t.Error("no firmware_migration_unverified on the source")
 	}
 
 	// The source's copy is the VM: it starts there.
-	if _, err := sc.c.SelfClient(src).StartVM(context.Background(), &pb.StartVMRequest{Name: fwliveVM}); err != nil {
+	if _, err := sc.c.SelfClient(src).StartVM(context.Background(), &pb.StartVMRequest{Name: fwwVM}); err != nil {
 		t.Fatalf("lv start on the source after the discard: %v", err)
 	}
-	stop()
-	if st, _ := src.Virt.RawState(fwliveVM); st != libvirtfake.StateRunning {
+	if st, _ := src.Virt.RawState(fwwVM); st != libvirtfake.StateRunning {
 		t.Errorf("source domain after lv start %q, want running", st)
 	}
 }
@@ -430,24 +228,22 @@ func TestFleet_FwLive_F2b_MismatchAfterUnknownReasonParks(t *testing.T) {
 	src, dst := sc.src, sc.dst
 	dst.Virt.CorruptLandedPermall = func(string) bool { return true }
 	src.Virt.ReportSourceReasonUnknown = func(string) bool { return true }
-	stop := fwliveOneCopy(t, src, dst)
-	defer stop()
 
 	if err := sc.migrate(t); err == nil {
 		t.Fatal("the move succeeded with a mismatched target copy")
 	}
-	m, ok, err := fwmig.New(src.FW.DataDir).GetMarker(fwliveVM)
+	m, ok, err := fwmig.New(src.FW.DataDir).GetMarker(fwwVM)
 	if err != nil || !ok || m.Phase != fwmig.PhaseSourceStateSuspect {
 		t.Fatalf("source marker %q (present %v, %v), want source_state_suspect", m.Phase, ok, err)
 	}
 	if m.SrcStopReason != "unknown" {
 		t.Errorf("marker stop reason %q, want unknown", m.SrcStopReason)
 	}
-	h, ok, err := fwmig.New(dst.FW.DataDir).GetHold(fwliveVM)
+	h, ok, err := fwmig.New(dst.FW.DataDir).GetHold(fwwVM)
 	if err != nil || !ok || h.State != fwmig.HoldMismatch || h.Attempt != m.Attempt {
 		t.Errorf("target hold %+v (present %v, %v), want mismatch for attempt %s", h, ok, err, m.Attempt)
 	}
-	if st, _ := dst.Virt.RawState(fwliveVM); st != libvirtfake.StatePaused {
+	if st, _ := dst.Virt.RawState(fwwVM); st != libvirtfake.StatePaused {
 		t.Errorf("target guest %q, want paused", st)
 	}
 	if fwliveEventIndex(dst, "resume", 0) >= 0 {
@@ -457,27 +253,27 @@ func TestFleet_FwLive_F2b_MismatchAfterUnknownReasonParks(t *testing.T) {
 		t.Errorf("the target's copy was quarantined (%s)", q)
 	}
 	// Both copies.
-	if !bytes.Equal(hlRead(t, fwlivePermallPath(src)), fwlivePermall) || !bytes.Equal(hlRead(t, src.FW.NvramPath(fwliveVM)), fwliveNvram) {
+	if !bytes.Equal(hlRead(t, fwlivePermall(src)), fwwPermall) || !bytes.Equal(hlRead(t, src.FW.NvramPath(fwwVM)), fwwNvram) {
 		t.Error("the source's firmware state changed")
 	}
-	if !fwliveExists(fwlivePermallPath(dst)) || !fwliveExists(dst.FW.NvramPath(fwliveVM)) {
+	if !fwliveExists(fwlivePermall(dst)) || !fwliveExists(dst.FW.NvramPath(fwwVM)) {
 		t.Error("the target's copy is gone")
 	}
-	if st, ok := src.Virt.RawState(fwliveVM); !ok || st != libvirtfake.StateShutdown {
+	if st, ok := src.Virt.RawState(fwwVM); !ok || st != libvirtfake.StateShutdown {
 		t.Errorf("source domain %q (defined %v), want defined and shut off", st, ok)
 	}
-	if row := fwliveRow(t, src); row.State == "stopped" || row.State == "running" {
-		t.Errorf("row %s/%s, want neither stopped nor running while parked", row.HostName, row.State)
+	if row := fwliveRow(t, src); row.HostName != src.Name || row.State != "migrating" {
+		t.Errorf("row %s/%s, want migrating on %s while parked (§7 V1b)", row.HostName, row.State, src.Name)
 	}
-	if _, open := fwliveOpenCondition(t, src, "firmware_migration_source_state_suspect"); !open {
+	if !fwliveCondition(t, src, "firmware_migration_source_state_suspect") {
 		t.Error("no firmware_migration_source_state_suspect on the source")
 	}
 	// The parked source's start veto.
-	_, err = sc.c.SelfClient(src).StartVM(context.Background(), &pb.StartVMRequest{Name: fwliveVM})
+	_, err = sc.c.SelfClient(src).StartVM(context.Background(), &pb.StartVMRequest{Name: fwwVM})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("lv start on the parked source = %v, want FailedPrecondition", err)
 	}
-	if st, _ := src.Virt.RawState(fwliveVM); st != libvirtfake.StateShutdown {
+	if st, _ := src.Virt.RawState(fwwVM); st != libvirtfake.StateShutdown {
 		t.Errorf("source domain after the refused start %q, want shut off", st)
 	}
 }
@@ -496,9 +292,9 @@ func TestFleet_FwLive_F4_SourceStateMissingParks(t *testing.T) {
 		t.Run(missing, func(t *testing.T) {
 			sc := fwliveSetup(t, false)
 			src, dst := sc.src, sc.dst
-			gone := fwlivePermallPath(src)
+			gone := fwlivePermall(src)
 			if missing == "nvram" {
-				gone = src.FW.NvramPath(fwliveVM)
+				gone = src.FW.NvramPath(fwwVM)
 			}
 			// The guest lands on dst; then its final state vanishes from src.
 			src.Virt.OnMigrateToTarget = func(name, _ string, p lv.MigrateParams) error {
@@ -507,30 +303,28 @@ func TestFleet_FwLive_F4_SourceStateMissingParks(t *testing.T) {
 				}
 				return os.Remove(gone)
 			}
-			verifies := 0
+			var verifies atomic.Int32
 			dst.HookUnary("VerifyLiveFirmwareTarget", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
-				verifies++
+				verifies.Add(1)
 				return h(ctx, req)
 			})
-			stop := fwliveOneCopy(t, src, dst)
-			defer stop()
 
 			err := sc.migrate(t)
 			if err == nil {
 				t.Fatal("the move succeeded without the source's final state")
 			}
-			m, ok, merr := fwmig.New(src.FW.DataDir).GetMarker(fwliveVM)
+			m, ok, merr := fwmig.New(src.FW.DataDir).GetMarker(fwwVM)
 			if merr != nil || !ok || m.Phase != fwmig.PhaseSourceStateMissing {
 				t.Fatalf("source marker %q (present %v, %v), want source_state_missing (migrate: %v)", m.Phase, ok, merr, err)
 			}
-			if verifies != 0 {
-				t.Errorf("Verify was called %d time(s) without the source's final state", verifies)
+			if n := verifies.Load(); n != 0 {
+				t.Errorf("Verify was called %d time(s) without the source's final state", n)
 			}
-			h, ok, herr := fwmig.New(dst.FW.DataDir).GetHold(fwliveVM)
+			h, ok, herr := fwmig.New(dst.FW.DataDir).GetHold(fwwVM)
 			if herr != nil || !ok || h.Attempt != m.Attempt || h.State != fwmig.HoldPrepared {
 				t.Errorf("target hold %+v (present %v, %v), want prepared for attempt %s", h, ok, herr, m.Attempt)
 			}
-			if st, _ := dst.Virt.RawState(fwliveVM); st != libvirtfake.StatePaused {
+			if st, _ := dst.Virt.RawState(fwwVM); st != libvirtfake.StatePaused {
 				t.Errorf("target guest %q, want paused", st)
 			}
 			if fwliveEventIndex(dst, "resume", 0) >= 0 {
@@ -540,25 +334,25 @@ func TestFleet_FwLive_F4_SourceStateMissingParks(t *testing.T) {
 				t.Errorf("the target's copy was quarantined (%s)", q)
 			}
 			// Nothing deleted: the target's copy, and what the source kept.
-			if got := hlRead(t, fwlivePermallPath(dst)); !bytes.Equal(got, fwlivePermall) {
+			if got := hlRead(t, fwlivePermall(dst)); !bytes.Equal(got, fwwPermall) {
 				t.Errorf("target permall %q, want the landed copy", got)
 			}
-			if !fwliveExists(dst.FW.NvramPath(fwliveVM)) {
+			if !fwliveExists(dst.FW.NvramPath(fwwVM)) {
 				t.Error("the target's NVRAM is gone")
 			}
-			if missing == "permall" && !bytes.Equal(hlRead(t, src.FW.NvramPath(fwliveVM)), fwliveNvram) {
+			if missing == "permall" && !bytes.Equal(hlRead(t, src.FW.NvramPath(fwwVM)), fwwNvram) {
 				t.Error("the source's NVRAM changed")
 			}
-			if missing == "nvram" && !bytes.Equal(hlRead(t, fwlivePermallPath(src)), fwlivePermall) {
+			if missing == "nvram" && !bytes.Equal(hlRead(t, fwlivePermall(src)), fwwPermall) {
 				t.Error("the source's permall changed")
 			}
-			if st, ok := src.Virt.RawState(fwliveVM); !ok || st != libvirtfake.StateShutdown {
+			if st, ok := src.Virt.RawState(fwwVM); !ok || st != libvirtfake.StateShutdown {
 				t.Errorf("source domain %q (defined %v), want defined and shut off", st, ok)
 			}
-			if row := fwliveRow(t, src); row.State == "stopped" || row.State == "running" {
-				t.Errorf("row %s/%s, want neither stopped nor running while parked", row.HostName, row.State)
+			if row := fwliveRow(t, src); row.HostName != src.Name || row.State != "migrating" {
+				t.Errorf("row %s/%s, want migrating on %s while parked (§7 V2)", row.HostName, row.State, src.Name)
 			}
-			if _, open := fwliveOpenCondition(t, src, "firmware_migration_source_state_missing"); !open {
+			if !fwliveCondition(t, src, "firmware_migration_source_state_missing") {
 				t.Error("no firmware_migration_source_state_missing on the source")
 			}
 		})
@@ -578,8 +372,6 @@ func TestFleet_FwLive_F9_OlderTargetRefusedNoWrite(t *testing.T) {
 	sc := fwliveSetup(t, false)
 	src, dst := sc.src, sc.dst
 	dst.RefuseRPCs("PrepareLiveFirmwareTarget", "VerifyLiveFirmwareTarget", "ReleaseLiveFirmwareTarget", "AbortLiveFirmwareTarget")
-	stop := fwliveOneCopy(t, src, dst)
-	defer stop()
 
 	err := sc.migrate(t)
 	if status.Code(err) != codes.FailedPrecondition {
@@ -592,17 +384,17 @@ func TestFleet_FwLive_F9_OlderTargetRefusedNoWrite(t *testing.T) {
 	if n := migrateCalls(src); n != 0 {
 		t.Errorf("libvirt was asked to migrate %d time(s)", n)
 	}
-	if st, _ := src.Virt.RawState(fwliveVM); st != libvirtfake.StateRunning {
+	if st, _ := src.Virt.RawState(fwwVM); st != libvirtfake.StateRunning {
 		t.Errorf("source guest %q, want running", st)
 	}
 	if row := fwliveRow(t, src); row.HostName != src.Name || row.State != "running" {
 		t.Errorf("row %s/%s, want running on %s", row.HostName, row.State, src.Name)
 	}
-	if _, ok, err := fwmig.New(src.FW.DataDir).GetMarker(fwliveVM); ok || err != nil {
+	if _, ok, err := fwmig.New(src.FW.DataDir).GetMarker(fwwVM); ok || err != nil {
 		t.Errorf("a marker was left on the source (%v)", err)
 	}
 	// Nothing written on the target: no domain, no record, no state.
-	if _, ok := dst.Virt.RawState(fwliveVM); ok {
+	if _, ok := dst.Virt.RawState(fwwVM); ok {
 		t.Error("a domain was defined on the target")
 	}
 	for _, sub := range fwmig.Dirs() {
@@ -614,7 +406,7 @@ func TestFleet_FwLive_F9_OlderTargetRefusedNoWrite(t *testing.T) {
 			t.Errorf("the target wrote %s/%s", sub, ents[0].Name())
 		}
 	}
-	for _, p := range []string{dst.FW.SwtpmDir(fwliveUUID), dst.FW.NvramPath(fwliveVM)} {
+	for _, p := range []string{dst.FW.SwtpmDir(fwwUUID), dst.FW.NvramPath(fwwVM)} {
 		if fwliveExists(p) {
 			t.Errorf("the target has %s", p)
 		}

@@ -96,9 +96,24 @@ func deployResult(ctx context.Context, client pb.LiteVirtClient, yaml string) ([
 // restartNode stands in for a daemon restart on n: its gRPC server stops —
 // every RPC it was serving is cancelled, as a process exit cancels them — and
 // a new server comes up on the same port, over the same state database and
-// data directory. Nothing held only in the old server's memory survives.
+// data directory. Nothing held only in the old server's memory survives. The
+// new daemon gets a fresh libvirt fake, and its replicator's push loop is
+// started.
 func restartNode(t *testing.T, c *Cluster, n *Node) {
 	t.Helper()
+	downNode(n)
+	upNode(t, c, n, false)
+	n.repl.SetProofReplicaGate(func(context.Context, string) bool { return true })
+	n.repl.Start(c.ctx)
+	n.replStarted = true
+	wireLUNReleaseGate(t, c, n)
+}
+
+// downNode takes n's daemon down as a process exit does: its replicator's
+// push loop and its server loops stop, and its gRPC server goes away with
+// every RPC it was serving cancelled. n.Virt (libvirt and its guests) is left
+// as it is.
+func downNode(n *Node) {
 	if n.replStarted {
 		n.repl.Stop()
 		n.replStarted = false
@@ -107,16 +122,24 @@ func restartNode(t *testing.T, c *Cluster, n *Node) {
 		n.stopServerLoops()
 	}
 	n.Stop()
+}
+
+// upNode starts a new daemon for n on its port, over the same state database
+// and data directory (buildServer). keepLibvirt keeps n.Virt, as a restart of
+// the daemon alone does (libvirt and its guests outlive it, KillMode=process);
+// otherwise the new daemon gets a fresh fake. The replicator's push loop is
+// not started: the caller starts it when its scenario runs one.
+func upNode(t *testing.T, c *Cluster, n *Node, keepLibvirt bool) {
+	t.Helper()
 	l, err := net.Listen("tcp", net.JoinHostPort(n.Address, strconv.Itoa(n.Port)))
 	if err != nil {
 		t.Fatalf("rebind %s on port %d: %v", n.Name, n.Port, err)
 	}
 	n.Listener = l
+	if keepLibvirt {
+		n.keepVirt = n.Virt
+	}
 	c.buildServer(n)
-	n.repl.SetProofReplicaGate(func(context.Context, string) bool { return true })
-	n.repl.Start(c.ctx)
-	n.replStarted = true
-	wireLUNReleaseGate(t, c, n)
 }
 
 // webOn reports whether n's replica has web live on host.

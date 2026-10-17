@@ -19,19 +19,16 @@ package fleet
 // writes back the marker the source wrote at that point (fwliveRestartAt):
 // the durable record a crash there leaves, with nothing else changed.
 //
-// fwliveRestartOneCopy checks the invariant every scenario keeps: at no moment
-// do both hosts run the guest.
+// The scene's one-copy watcher (fwliveOneCopy, fwlive_scene_test.go) checks
+// the invariant every scenario keeps: at no moment do both hosts run the
+// guest.
 
 import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
-	"io"
-	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,97 +42,32 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fwmig"
-	"github.com/litevirt/litevirt/internal/grpcapi"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
 // ── harness ──
+//
+// The scene, the one-copy watcher and the accessors are fwlive_scene_test.go's.
 
-// fwliveRestartCluster is fwwCluster (src runs fwlive1, Secure Boot + vTPM,
-// dst labelled for a live firmware move) with each node's daemon
-// configuration reapplied on every restart, and the one-copy invariant
-// watched on both hosts.
-func fwliveRestartCluster(t *testing.T) (*Cluster, *Node, *Node, *fwliveRestartOneCopy) {
-	t.Helper()
-	c, src, dst := fwwCluster(t)
-	layout := filepath.Join(c.tmpRoot, "layout")
-	for _, n := range c.Nodes {
-		n.serverSetup = func(s *grpcapi.Server) { s.SetFirmwareLayoutDirForTest(layout) }
-	}
-	return c, src, dst, fwliveRestartWatchOneCopy(t, src, dst)
-}
-
-// fwliveRestartOneCopy records each moment a guest started running on one host
-// while the other ran it too. A scenario adds its own reaction to a guest
-// starting with also, before the move starts.
-type fwliveRestartOneCopy struct {
-	mu   sync.Mutex
-	bad  []string
-	also map[*libvirtfake.Fake]func(name string)
-}
-
-func fwliveRestartWatchOneCopy(t *testing.T, a, b *Node) *fwliveRestartOneCopy {
-	w := &fwliveRestartOneCopy{also: map[*libvirtfake.Fake]func(string){}}
-	watch := func(self, other *libvirtfake.Fake, host string) {
-		self.OnRunning = func(name string) {
-			if name == fwwVM {
-				if st, _ := other.RawState(name); st == libvirtfake.StateRunning {
-					w.mu.Lock()
-					w.bad = append(w.bad, fmt.Sprintf("%s started running on %s while the other host ran it", name, host))
-					w.mu.Unlock()
-				}
-			}
-			w.mu.Lock()
-			fn := w.also[self]
-			w.mu.Unlock()
-			if fn != nil {
-				fn(name)
-			}
-		}
-	}
-	watch(a.Virt, b.Virt, a.Name)
-	watch(b.Virt, a.Virt, b.Name)
-	t.Cleanup(func() {
-		w.mu.Lock()
-		defer w.mu.Unlock()
-		for _, s := range w.bad {
-			t.Errorf("one copy of the VM at every moment: %s", s)
-		}
-	})
-	return w
-}
-
-// onRunning sets n's extra reaction to a guest starting to run there.
-func (w *fwliveRestartOneCopy) onRunning(n *Node, fn func(name string)) {
-	w.mu.Lock()
-	w.also[n.Virt] = fn
-	w.mu.Unlock()
-}
-
-// fwliveRestartDown takes n's daemon down: its loops stop and its gRPC server
-// goes away, every RPC it was serving cancelled. Its libvirt and its guests
-// stay as they are.
-func fwliveRestartDown(n *Node) {
-	if n.stopServerLoops != nil {
-		n.stopServerLoops()
-	}
-	n.Stop()
-}
+// fwliveRestartDown takes n's daemon down (downNode): its loops stop and its
+// gRPC server goes away, every RPC it was serving cancelled. Its libvirt and
+// its guests stay as they are.
+func fwliveRestartDown(n *Node) { downNode(n) }
 
 // fwliveRestartUp starts n's daemon again over the same database, data
-// directory, firmware store and libvirt: a new server on the same port, with
-// nothing of the old one's memory. Its start-up recovery runs as the daemon's
-// does (buildServer).
+// directory, firmware store and libvirt (upNode, keeping n.Virt): a new
+// server on the same port, with nothing of the old one's memory. Its
+// start-up recovery runs as the daemon's does (buildServer). Unlike
+// restartNode it starts the replicator's push loop only on a cluster that
+// runs one, and wires no LUN gate.
 func fwliveRestartUp(t *testing.T, c *Cluster, n *Node) {
 	t.Helper()
-	l, err := net.Listen("tcp", net.JoinHostPort(n.Address, strconv.Itoa(n.Port)))
-	if err != nil {
-		t.Fatalf("rebind %s on port %d: %v", n.Name, n.Port, err)
+	upNode(t, c, n, true)
+	if c.opts.IndependentReplicas {
+		n.repl.Start(c.ctx)
+		n.replStarted = true
 	}
-	n.Listener = l
-	n.keepVirt = n.Virt
-	c.buildServer(n)
 }
 
 // fwliveRestartDaemon restarts n's daemon (down, then up).
@@ -151,64 +83,11 @@ func fwliveRestartRecovered(n *Node) {
 	n.Server.FirmwareMoveRecoveryOnce(context.Background())
 }
 
-// fwliveRestartMigrate starts the live move of fwlive1 from src to dst and
-// returns its outcome when it ends.
-func fwliveRestartMigrate(t *testing.T, c *Cluster, src, dst *Node) <-chan error {
-	t.Helper()
-	return fwliveRestartMigrateReq(t, c, src, &pb.MigrateVMRequest{
-		VmName: fwwVM, TargetHost: dst.Name, Strategy: pb.MigrateStrategy_MIGRATE_LIVE,
-	})
-}
-
-// fwliveRestartMigrateReq starts the move req asks of src.
-func fwliveRestartMigrateReq(t *testing.T, c *Cluster, src *Node, req *pb.MigrateVMRequest) <-chan error {
-	t.Helper()
-	cl := c.SelfClient(src)
-	done := make(chan error, 1)
-	go func() {
-		st, err := cl.MigrateVM(context.Background(), req)
-		if err != nil {
-			done <- err
-			return
-		}
-		for {
-			if _, err := st.Recv(); err != nil {
-				if err == io.EOF {
-					err = nil
-				}
-				done <- err
-				return
-			}
-		}
-	}()
-	return done
-}
-
-// fwliveRestartWait waits for a move's outcome.
-func fwliveRestartWait(t *testing.T, done <-chan error) error {
-	t.Helper()
-	select {
-	case err := <-done:
-		return err
-	case <-time.After(3 * time.Minute):
-		t.Fatal("the move did not end within 3 minutes")
-		return nil
-	}
-}
-
-// fwliveRestartGrave is where a killed daemon's goroutine stops: for good,
-// as a killed process does. Only a test that has already failed lets it go
-// at cleanup, so a failure before the daemon was replaced does not hang the
-// cluster's graceful stop on it.
-func fwliveRestartGrave(t *testing.T) func() {
-	ch := make(chan struct{})
-	t.Cleanup(func() {
-		if t.Failed() {
-			close(ch)
-		}
-	})
-	return func() { <-ch }
-}
+// fwliveRestartNever is never closed: a killed daemon's goroutine waits on it
+// for good, as a killed process never resumes, so it writes nothing after its
+// death. Its server is replaced (or, on a failed test, stopped outright by
+// fwliveSetup's cleanup before the cluster stops), so nothing waits on it.
+var fwliveRestartNever = make(chan struct{})
 
 // fwliveRestartFreeze makes src's next migration of fwlive1 stop inside
 // libvirt for good, as the source daemon dying there leaves it: crash runs
@@ -216,14 +95,13 @@ func fwliveRestartGrave(t *testing.T) func() {
 // returned channel is closed, and the call never returns. The frozen
 // goroutine belongs to the old daemon, which the scenario then replaces.
 func fwliveRestartFreeze(t *testing.T, src, dst *Node, crash func(name string, p lv.MigrateParams)) <-chan struct{} {
-	die := fwliveRestartGrave(t)
 	reached := make(chan struct{})
 	src.Virt.OnMigrateToTarget = func(name, _ string, p lv.MigrateParams) error {
 		if crash != nil {
 			crash(name, p)
 		}
 		close(reached)
-		die() // the daemon died here: nothing after this runs
+		<-fwliveRestartNever // the daemon died here: nothing after this runs
 		return errors.New("the daemon died in this call")
 	}
 	return reached
@@ -265,143 +143,21 @@ func fwliveRestartAt(t *testing.T, n *Node, m fwmig.Marker, phase fwmig.Phase) f
 	return m
 }
 
-func fwliveRestartMarker(t *testing.T, n *Node) (fwmig.Marker, bool) {
+// fwliveRestartResolve resolves fwlive1's open condition code, as the move
+// resolves a condition its park raised: staging that takes a park back
+// (fwliveRestartAt) takes its condition back too.
+func fwliveRestartResolve(t *testing.T, n *Node, code string) {
 	t.Helper()
-	m, ok, err := fwmig.New(n.FW.DataDir).GetMarker(fwwVM)
-	if err != nil {
-		t.Fatalf("read the marker on %s: %v", n.Name, err)
+	ctx := context.Background()
+	row, found, err := corrosion.GetHealthCondition(ctx, n.DB, "firmware_migration", code, "vm", fwwVM)
+	if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved {
+		t.Fatalf("condition %s to resolve: %+v (found %v, %v)", code, row, found, err)
 	}
-	return m, ok
-}
-
-func fwliveRestartHold(t *testing.T, n *Node) (fwmig.Hold, bool) {
-	t.Helper()
-	h, ok, err := fwmig.New(n.FW.DataDir).GetHold(fwwVM)
-	if err != nil {
-		t.Fatalf("read the hold on %s: %v", n.Name, err)
+	now := time.Now().UTC().Format(time.RFC3339)
+	row.Lifecycle, row.ResolvedAt, row.LastSeen, row.ObserveCount, row.CleanCount = corrosion.ConditionResolved, now, now, 0, row.CleanCount+1
+	if err := corrosion.UpsertHealthCondition(ctx, n.DB, row); err != nil {
+		t.Fatal(err)
 	}
-	return h, ok
-}
-
-func fwliveRestartRow(t *testing.T, n *Node) *corrosion.VMRecord {
-	t.Helper()
-	vm, err := corrosion.GetVM(context.Background(), n.DB, fwwVM)
-	if err != nil || vm == nil {
-		t.Fatalf("read %s's row: %v (row %v)", fwwVM, err, vm)
-	}
-	return vm
-}
-
-func fwliveRestartState(n *Node) string {
-	st, ok := n.Virt.RawState(fwwVM)
-	if !ok {
-		return "undefined"
-	}
-	return string(st)
-}
-
-func fwliveRestartPermall(n *Node) string {
-	return filepath.Join(n.FW.SwtpmDir(fwwUUID), "tpm2", "tpm2-00.permall")
-}
-
-func fwliveRestartFile(path string) ([]byte, bool) {
-	b, err := os.ReadFile(path)
-	return b, err == nil
-}
-
-func fwliveRestartQuarantines(n *Node) []string {
-	q, _ := filepath.Glob(filepath.Join(n.FW.DataDir, fwmig.QuarantineDir, fwwVM+"-*"))
-	return q
-}
-
-// fwliveRestartOps lists the libvirt operations n's fake performed on
-// fwlive1, in order.
-func fwliveRestartOps(n *Node) []string {
-	var ops []string
-	for _, e := range n.Virt.EventLog() {
-		if e.Domain == fwwVM {
-			ops = append(ops, e.Op)
-		}
-	}
-	return ops
-}
-
-func fwliveRestartDid(n *Node, op string) bool {
-	for _, o := range fwliveRestartOps(n) {
-		if o == op {
-			return true
-		}
-	}
-	return false
-}
-
-// fwliveRestartMoved asserts the move completed (§6.1 steps 9 to 12): the
-// guest runs on dst with the source's final NVRAM and TPM state, the row names
-// dst, no hold and no marker remain, the source leftover is undefined and its
-// state wiped, and the retained bundle keeps it.
-func fwliveRestartMoved(t *testing.T, src, dst *Node) {
-	t.Helper()
-	if st := fwliveRestartState(dst); st != string(libvirtfake.StateRunning) {
-		t.Errorf("%s's domain is %s, want running", dst.Name, st)
-	}
-	if st := fwliveRestartState(src); st != "undefined" {
-		t.Errorf("%s's leftover domain is %s, want undefined", src.Name, st)
-	}
-	if row := fwliveRestartRow(t, src); row.HostName != dst.Name || row.State != "running" {
-		t.Errorf("row on %s %s, want running on %s", row.HostName, row.State, dst.Name)
-	}
-	if b, _ := fwliveRestartFile(dst.FW.NvramPath(fwwVM)); !bytes.Equal(b, fwwNvram) {
-		t.Errorf("%s's NVRAM %q, want the source's final", dst.Name, b)
-	}
-	if b, _ := fwliveRestartFile(fwliveRestartPermall(dst)); !bytes.HasPrefix(b, fwwPermall) {
-		t.Errorf("%s's permall %q, want the source's (then the running swtpm's)", dst.Name, b)
-	}
-	if h, ok := fwliveRestartHold(t, dst); ok {
-		t.Errorf("%s still holds the move (%s)", dst.Name, h.State)
-	}
-	if m, ok := fwliveRestartMarker(t, src); ok {
-		t.Errorf("%s's marker is left in %s (%s)", src.Name, m.Phase, m.Detail)
-	}
-	for _, p := range []string{fwliveRestartPermall(src), src.FW.NvramPath(fwwVM)} {
-		if _, ok := fwliveRestartFile(p); ok {
-			t.Errorf("source state %s is not wiped", p)
-		}
-	}
-	if tars, _ := filepath.Glob(filepath.Join(src.FW.DataDir, fwmig.RetainedDir, fwwVM+"-*.tar")); len(tars) != 1 {
-		t.Errorf("retained bundles %v, want one", tars)
-	}
-	if q := fwliveRestartQuarantines(dst); len(q) != 0 {
-		t.Errorf("%s quarantined %v in a move that verified", dst.Name, q)
-	}
-}
-
-// fwliveRestartSourceKept asserts the source still holds its firmware state
-// byte for byte.
-func fwliveRestartSourceKept(t *testing.T, src *Node) {
-	t.Helper()
-	if b, _ := fwliveRestartFile(fwliveRestartPermall(src)); !bytes.Equal(b, fwwPermall) {
-		t.Errorf("%s's permall %q, want its own, kept", src.Name, b)
-	}
-	if b, _ := fwliveRestartFile(src.FW.NvramPath(fwwVM)); !bytes.Equal(b, fwwNvram) {
-		t.Errorf("%s's NVRAM %q, want its own, kept", src.Name, b)
-	}
-}
-
-// fwliveRestartCondition reports whether n's database holds the open
-// firmware_migration condition code for fwlive1.
-func fwliveRestartCondition(t *testing.T, n *Node, code string) bool {
-	t.Helper()
-	row, found, err := corrosion.GetHealthCondition(context.Background(), n.DB, "firmware_migration", code, "vm", fwwVM)
-	if err != nil {
-		t.Fatalf("read condition %s: %v", code, err)
-	}
-	return found && row.Lifecycle != corrosion.ConditionResolved
-}
-
-// fwliveRestartHookOnce runs fn in place of n's next call of method; fn gets
-// the handler to call (or not).
-func fwliveRestartHookOnce(n *Node, method string, fn func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error)) {
-	n.HookUnary(method, fn)
 }
 
 // fwliveRestartStoppedHere is the answer of a hook whose daemon was restarted
@@ -424,18 +180,18 @@ func fwliveRestartCrashMigrating(t *testing.T, c *Cluster, src, dst *Node, crash
 func fwliveRestartCrashMigratingReq(t *testing.T, c *Cluster, src, dst *Node, crash func(string, lv.MigrateParams), req *pb.MigrateVMRequest) fwmig.Marker {
 	t.Helper()
 	reached := fwliveRestartFreeze(t, src, dst, crash)
-	done := fwliveRestartMigrateReq(t, c, src, req)
+	done := fwliveMigrateReq(t, c, src, req)
 	fwliveRestartReach(t, reached, done, "the migration call")
 	src.LandMigrationsOn(dst)
 	fwliveRestartDown(src)
-	m, ok := fwliveRestartMarker(t, src)
+	m, ok := fwliveMarker(t, src)
 	if !ok || m.Phase != fwmig.PhaseMigrating {
 		t.Fatalf("the source died in the migration call with marker %+v (present %v), want migrating", m, ok)
 	}
-	if row := fwliveRestartRow(t, src); row.HostName != src.Name || row.State != "migrating" {
+	if row := fwliveRow(t, src); row.HostName != src.Name || row.State != "migrating" {
 		t.Fatalf("row %s on %s when the source died, want migrating on %s", row.State, row.HostName, src.Name)
 	}
-	if h, ok := fwliveRestartHold(t, dst); !ok || h.State != fwmig.HoldPrepared {
+	if h, ok := fwliveHold(t, dst); !ok || h.State != fwmig.HoldPrepared {
 		t.Fatalf("%s's hold %+v (present %v) when the source died, want prepared", dst.Name, h, ok)
 	}
 	return m
@@ -447,28 +203,28 @@ func fwliveRestartCrashMigratingReq(t *testing.T, c *Cluster, src, dst *Node, cr
 // marker gone, the row running on src, the source state kept.
 func fwliveRestartUndone(t *testing.T, src, dst *Node) {
 	t.Helper()
-	if st := fwliveRestartState(src); st != string(libvirtfake.StateRunning) {
+	if st := fwliveState(src); st != string(libvirtfake.StateRunning) {
 		t.Errorf("%s's guest is %s, want running", src.Name, st)
 	}
-	if st := fwliveRestartState(dst); st != "undefined" {
+	if st := fwliveState(dst); st != "undefined" {
 		t.Errorf("%s has a domain (%s), want none", dst.Name, st)
 	}
-	if row := fwliveRestartRow(t, src); row.HostName != src.Name || row.State != "running" {
+	if row := fwliveRow(t, src); row.HostName != src.Name || row.State != "running" {
 		t.Errorf("row %s on %s, want running on %s", row.State, row.HostName, src.Name)
 	}
-	if m, ok := fwliveRestartMarker(t, src); ok {
+	if m, ok := fwliveMarker(t, src); ok {
 		t.Errorf("marker left in %s (%s)", m.Phase, m.Detail)
 	}
-	if h, ok := fwliveRestartHold(t, dst); ok {
+	if h, ok := fwliveHold(t, dst); ok {
 		t.Errorf("%s's hold left in %s", dst.Name, h.State)
 	}
-	if _, ok := fwliveRestartFile(dst.FW.NvramPath(fwwVM)); ok {
+	if _, ok := fwliveFile(dst.FW.NvramPath(fwwVM)); ok {
 		t.Errorf("%s keeps the NVRAM Prepare materialised", dst.Name)
 	}
-	if q := fwliveRestartQuarantines(dst); len(q) != 0 {
+	if q := fwliveQuarantines(dst); len(q) != 0 {
 		t.Errorf("%s quarantined %v; a prepared hold with the source's domain active is deleted (rule D)", dst.Name, q)
 	}
-	fwliveRestartSourceKept(t, src)
+	fwliveSourceKept(t, src)
 }
 
 // F-5. The source daemon restarts with a live firmware move at each phase of
@@ -479,7 +235,7 @@ func fwliveRestartUndone(t *testing.T, src, dst *Node) {
 // Release (committed), the target checked first (released), and the cleanup
 // resumed (cleaning). The guest runs on one host at every moment.
 //
-// Mutations (each red, then restored; see trackD2-15b-report.md):
+// Mutations (each red, then restored; trackD2-15-r1-report.md has the table):
 //   - prepared: Abort sends source_domain_active=false — the target
 //     quarantines instead of deleting (rule Q), red.
 //   - migrating/paused: M1p does not resume the source — red.
@@ -489,12 +245,18 @@ func fwliveRestartUndone(t *testing.T, src, dst *Node) {
 //   - migrating/unknown mismatch: V1 on any stop reason — red.
 //   - cutover/changed: the cutover row skips its re-hash — red.
 //   - released/fenced: the released row skips the proved-off check — red.
+//   - verified: the row naming the source does not commit — red.
+//   - committed: the committed row takes no step — red.
+//   - cleaning: the source cleanup does not resume a cleaning marker — red.
+//     (The start-up recovery and the cleanup retry both resume it,
+//     whichever takes the VM first, so taking it from one of them alone is
+//     not a reliable mutation.)
 func TestFleet_FwLiveRestart_F5_SourceRestartAtEachPhase(t *testing.T) {
 	ctx := context.Background()
 
 	for _, phase := range []fwmig.Phase{fwmig.PhasePreparing, fwmig.PhasePrepared} {
 		t.Run(string(phase), func(t *testing.T) {
-			c, src, dst, _ := fwliveRestartCluster(t)
+			c, src, dst, _ := fwliveCluster(t)
 			m := fwliveRestartCrashMigrating(t, c, src, dst, nil)
 			// The marker as written at that phase, before the migration
 			// call: the row is not yet migrating.
@@ -505,7 +267,7 @@ func TestFleet_FwLiveRestart_F5_SourceRestartAtEachPhase(t *testing.T) {
 			if err := corrosion.UpdateVMState(ctx, src.DB, fwwVM, "running", ""); err != nil {
 				t.Fatal(err)
 			}
-			if _, ok := fwliveRestartFile(dst.FW.NvramPath(fwwVM)); !ok {
+			if _, ok := fwliveFile(dst.FW.NvramPath(fwwVM)); !ok {
 				t.Fatalf("%s holds no materialised NVRAM before the restart", dst.Name)
 			}
 			fwliveRestartUp(t, c, src)
@@ -515,7 +277,7 @@ func TestFleet_FwLiveRestart_F5_SourceRestartAtEachPhase(t *testing.T) {
 	}
 
 	t.Run("migrating/running_no_job", func(t *testing.T) {
-		c, src, dst, _ := fwliveRestartCluster(t)
+		c, src, dst, _ := fwliveCluster(t)
 		fwliveRestartCrashMigrating(t, c, src, dst, nil)
 		fwliveRestartUp(t, c, src)
 		fwliveRestartRecovered(src)
@@ -524,7 +286,7 @@ func TestFleet_FwLiveRestart_F5_SourceRestartAtEachPhase(t *testing.T) {
 	})
 
 	t.Run("migrating/paused_no_job", func(t *testing.T) {
-		c, src, dst, _ := fwliveRestartCluster(t)
+		c, src, dst, _ := fwliveCluster(t)
 		fwliveRestartCrashMigrating(t, c, src, dst, func(name string, _ lv.MigrateParams) {
 			src.Virt.SetState(name, libvirtfake.StatePaused)
 		})
@@ -532,57 +294,63 @@ func TestFleet_FwLiveRestart_F5_SourceRestartAtEachPhase(t *testing.T) {
 		fwliveRestartRecovered(src)
 		// M1p: the target holds no domain, so the paused source is resumed
 		// first, then the row restored and the marker removed.
-		if !fwliveRestartDid(src, "resume") {
-			t.Errorf("%s's paused guest was not resumed (ops %v)", src.Name, fwliveRestartOps(src))
+		if !fwliveDid(src, "resume") {
+			t.Errorf("%s's paused guest was not resumed (ops %v)", src.Name, fwliveOps(src))
 		}
 		fwliveRestartUndone(t, src, dst)
 	})
 
 	t.Run("migrating/job_running", func(t *testing.T) {
-		c, src, dst, _ := fwliveRestartCluster(t)
+		c, src, dst, _ := fwliveCluster(t)
 		var job atomic.Bool
+		var polls atomic.Int32
 		job.Store(true)
-		src.Virt.JobActive = func(string) (bool, error) { return job.Load(), nil }
+		src.Virt.JobActive = func(string) (bool, error) {
+			polls.Add(1)
+			return job.Load(), nil
+		}
 		// libvirt has the guest on both hosts and is still migrating it.
 		fwliveRestartCrashMigrating(t, c, src, dst, func(name string, p lv.MigrateParams) {
 			if err := dst.Virt.LandFirmwareLive(src.Virt, name, p); err != nil {
 				t.Errorf("land: %v", err)
 			}
 		})
+		polls.Store(0)
 		fwliveRestartUp(t, c, src)
-		// While the job runs, the recovery waits: nothing is aborted,
-		// verified or resumed.
-		time.Sleep(5 * time.Second)
-		if m, _ := fwliveRestartMarker(t, src); m.Phase != fwmig.PhaseMigrating {
+		// While the job runs, the recovery waits: it looks at the job when
+		// it takes the move and again while waiting for it, and nothing is
+		// aborted, verified or resumed.
+		eventually(t, time.Minute, "the recovery to look at the running job twice", func() bool { return polls.Load() >= 2 })
+		if m, _ := fwliveMarker(t, src); m.Phase != fwmig.PhaseMigrating {
 			t.Errorf("marker %s (%s) while libvirt still migrates, want migrating", m.Phase, m.Detail)
 		}
-		if h, ok := fwliveRestartHold(t, dst); !ok || h.State != fwmig.HoldPrepared {
+		if h, ok := fwliveHold(t, dst); !ok || h.State != fwmig.HoldPrepared {
 			t.Errorf("%s's hold %+v (present %v) while libvirt still migrates, want prepared", dst.Name, h.State, ok)
 		}
-		if st := fwliveRestartState(dst); st != string(libvirtfake.StatePaused) {
+		if st := fwliveState(dst); st != string(libvirtfake.StatePaused) {
 			t.Errorf("%s's guest is %s while libvirt still migrates, want paused", dst.Name, st)
 		}
 		// The job ends with the migration complete.
 		src.Virt.ShutOffDomain(fwwVM, "migrated")
 		job.Store(false)
 		fwliveRestartRecovered(src)
-		fwliveRestartMoved(t, src, dst)
+		fwliveMoved(t, src, dst)
 	})
 
 	for _, reason := range []string{"migrated", "unknown"} {
 		t.Run("migrating/inactive_"+reason, func(t *testing.T) {
-			c, src, dst, _ := fwliveRestartCluster(t)
+			c, src, dst, _ := fwliveCluster(t)
 			fwliveRestartCrashMigrating(t, c, src, dst, fwliveRestartLand(t, src, dst, reason))
 			fwliveRestartUp(t, c, src)
 			fwliveRestartRecovered(src)
 			// Cutover with the stop reason read now, Verify MATCH, then
 			// the commit, Release and the cleanup.
-			fwliveRestartMoved(t, src, dst)
+			fwliveMoved(t, src, dst)
 		})
 	}
 
 	t.Run("migrating/inactive_unknown_mismatch", func(t *testing.T) {
-		c, src, dst, _ := fwliveRestartCluster(t)
+		c, src, dst, _ := fwliveCluster(t)
 		dst.Virt.CorruptLandedPermall = func(string) bool { return true }
 		fwliveRestartCrashMigrating(t, c, src, dst, fwliveRestartLand(t, src, dst, "unknown"))
 		fwliveRestartUp(t, c, src)
@@ -590,27 +358,27 @@ func TestFleet_FwLiveRestart_F5_SourceRestartAtEachPhase(t *testing.T) {
 		// V1b: the source did not stop as a completed migration stops it,
 		// so neither copy is declared current. Both are kept, the target
 		// paused.
-		m, ok := fwliveRestartMarker(t, src)
+		m, ok := fwliveMarker(t, src)
 		if !ok || m.Phase != fwmig.PhaseSourceStateSuspect {
 			t.Fatalf("marker %+v (present %v), want source_state_suspect", m, ok)
 		}
-		if st := fwliveRestartState(dst); st != string(libvirtfake.StatePaused) {
+		if st := fwliveState(dst); st != string(libvirtfake.StatePaused) {
 			t.Errorf("%s's guest is %s, want paused", dst.Name, st)
 		}
-		if h, ok := fwliveRestartHold(t, dst); !ok || h.State != fwmig.HoldMismatch {
+		if h, ok := fwliveHold(t, dst); !ok || h.State != fwmig.HoldMismatch {
 			t.Errorf("%s's hold %+v (present %v), want mismatch", dst.Name, h.State, ok)
 		}
-		if _, ok := fwliveRestartFile(fwliveRestartPermall(dst)); !ok {
+		if _, ok := fwliveFile(fwlivePermall(dst)); !ok {
 			t.Errorf("%s's copy of the TPM state is gone", dst.Name)
 		}
-		if q := fwliveRestartQuarantines(dst); len(q) != 0 {
+		if q := fwliveQuarantines(dst); len(q) != 0 {
 			t.Errorf("%s quarantined %v; V1b discards nothing", dst.Name, q)
 		}
-		if row := fwliveRestartRow(t, src); row.HostName != src.Name || row.State != "migrating" {
+		if row := fwliveRow(t, src); row.HostName != src.Name || row.State != "migrating" {
 			t.Errorf("row %s on %s, want migrating on %s", row.State, row.HostName, src.Name)
 		}
-		fwliveRestartSourceKept(t, src)
-		if !fwliveRestartCondition(t, src, "firmware_migration_source_state_suspect") {
+		fwliveSourceKept(t, src)
+		if !fwliveCondition(t, src, "firmware_migration_source_state_suspect") {
 			t.Error("no firmware_migration_source_state_suspect")
 		}
 	})
@@ -618,7 +386,7 @@ func TestFleet_FwLiveRestart_F5_SourceRestartAtEachPhase(t *testing.T) {
 	// cutover: the marker as liveFirmwareCutover writes it, with the final
 	// hashes and the stop reason, before Verify.
 	cutover := func(t *testing.T, change bool) {
-		c, src, dst, _ := fwliveRestartCluster(t)
+		c, src, dst, _ := fwliveCluster(t)
 		m := fwliveRestartCrashMigrating(t, c, src, dst, fwliveRestartLand(t, src, dst, "migrated"))
 		var err error
 		if m.SrcPermallSHA256, err = src.FW.PermallSHA256(fwwUUID); err != nil {
@@ -636,21 +404,21 @@ func TestFleet_FwLiveRestart_F5_SourceRestartAtEachPhase(t *testing.T) {
 		fwliveRestartUp(t, c, src)
 		fwliveRestartRecovered(src)
 		if !change {
-			fwliveRestartMoved(t, src, dst)
+			fwliveMoved(t, src, dst)
 			return
 		}
 		// I6: the source copy may not be the final one, so nothing is
 		// verified, committed or released.
-		if m, ok := fwliveRestartMarker(t, src); !ok || m.Phase != fwmig.PhaseSourceStateSuspect {
+		if m, ok := fwliveMarker(t, src); !ok || m.Phase != fwmig.PhaseSourceStateSuspect {
 			t.Fatalf("marker %+v (present %v), want source_state_suspect", m, ok)
 		}
-		if h, ok := fwliveRestartHold(t, dst); !ok || h.State != fwmig.HoldPrepared {
+		if h, ok := fwliveHold(t, dst); !ok || h.State != fwmig.HoldPrepared {
 			t.Errorf("%s's hold %+v (present %v), want prepared: Verify must not be asked", dst.Name, h.State, ok)
 		}
-		if st := fwliveRestartState(dst); st != string(libvirtfake.StatePaused) {
+		if st := fwliveState(dst); st != string(libvirtfake.StatePaused) {
 			t.Errorf("%s's guest is %s, want paused", dst.Name, st)
 		}
-		if row := fwliveRestartRow(t, src); row.HostName != src.Name {
+		if row := fwliveRow(t, src); row.HostName != src.Name {
 			t.Errorf("row on %s, want %s (not committed)", row.HostName, src.Name)
 		}
 	}
@@ -658,7 +426,7 @@ func TestFleet_FwLiveRestart_F5_SourceRestartAtEachPhase(t *testing.T) {
 	t.Run("cutover/source_changed", func(t *testing.T) { cutover(t, true) })
 
 	t.Run("verified", func(t *testing.T) {
-		c, src, dst, _ := fwliveRestartCluster(t)
+		c, src, dst, _ := fwliveCluster(t)
 		src.LandMigrationsOn(dst)
 		// C1: the commit does not land; the marker stays verified and the
 		// target keeps its verified guest paused.
@@ -666,49 +434,52 @@ func TestFleet_FwLiveRestart_F5_SourceRestartAtEachPhase(t *testing.T) {
 			WHEN NEW.host_name <> OLD.host_name BEGIN SELECT RAISE(ABORT, 'induced commit failure'); END`); err != nil {
 			t.Fatal(err)
 		}
-		err := fwliveRestartWait(t, fwliveRestartMigrate(t, c, src, dst))
+		err := fwliveWait(t, fwliveMigrate(t, c, src, dst))
 		if err == nil {
 			t.Fatal("the move succeeded with its commit failing")
 		}
 		if err := localExec(ctx, src.DB, `DROP TRIGGER fwlive_restart_no_commit`); err != nil {
 			t.Fatal(err)
 		}
-		if m, ok := fwliveRestartMarker(t, src); !ok || m.Phase != fwmig.PhaseVerified {
+		if m, ok := fwliveMarker(t, src); !ok || m.Phase != fwmig.PhaseVerified {
 			t.Fatalf("marker %+v (present %v) after the failed commit (%v), want verified", m, ok, err)
 		}
-		if h, ok := fwliveRestartHold(t, dst); !ok || h.State != fwmig.HoldVerified {
+		if h, ok := fwliveHold(t, dst); !ok || h.State != fwmig.HoldVerified {
 			t.Fatalf("%s's hold %+v (present %v), want verified", dst.Name, h.State, ok)
 		}
-		if row := fwliveRestartRow(t, src); row.HostName != src.Name {
+		if row := fwliveRow(t, src); row.HostName != src.Name {
 			t.Fatalf("row on %s after the failed commit", row.HostName)
 		}
 		fwliveRestartDaemon(t, c, src)
 		fwliveRestartRecovered(src)
-		fwliveRestartMoved(t, src, dst)
+		fwliveMoved(t, src, dst)
 	})
 
 	t.Run("committed", func(t *testing.T) {
-		c, src, dst, _ := fwliveRestartCluster(t)
+		c, src, dst, _ := fwliveCluster(t)
 		src.LandMigrationsOn(dst)
 		// Stop the move after its commit: a Release the target does not
 		// have parks it, and the marker is then written back as it was.
 		restore := dst.RefuseRPCs("ReleaseLiveFirmwareTarget")
-		err := fwliveRestartWait(t, fwliveRestartMigrate(t, c, src, dst))
+		err := fwliveWait(t, fwliveMigrate(t, c, src, dst))
 		restore()
-		m, ok := fwliveRestartMarker(t, src)
+		m, ok := fwliveMarker(t, src)
 		if !ok || m.ParkedFrom != fwmig.PhaseCommitted {
 			t.Fatalf("marker %+v (present %v) after Release was refused (%v), want parked from committed", m, ok, err)
 		}
 		fwliveRestartAt(t, src, m, fwmig.PhaseCommitted)
-		if row := fwliveRestartRow(t, src); row.HostName != dst.Name {
+		// A crash at committed leaves no condition: the park's goes with
+		// the park.
+		fwliveRestartResolve(t, src, "firmware_migration_target_unreachable")
+		if row := fwliveRow(t, src); row.HostName != dst.Name {
 			t.Fatalf("row on %s, want %s (committed)", row.HostName, dst.Name)
 		}
-		if st := fwliveRestartState(dst); st != string(libvirtfake.StatePaused) {
+		if st := fwliveState(dst); st != string(libvirtfake.StatePaused) {
 			t.Fatalf("%s's guest is %s before Release, want paused", dst.Name, st)
 		}
 		fwliveRestartDaemon(t, c, src)
 		fwliveRestartRecovered(src)
-		fwliveRestartMoved(t, src, dst)
+		fwliveMoved(t, src, dst)
 	})
 
 	// cleanupCrash runs the move until the source daemon dies in its
@@ -719,26 +490,25 @@ func TestFleet_FwLiveRestart_F5_SourceRestartAtEachPhase(t *testing.T) {
 		src.LandMigrationsOn(dst)
 		reached := make(chan struct{})
 		var once atomic.Bool
-		die := fwliveRestartGrave(t)
 		src.Virt.FailUndefinePreserv = func(name string) error {
 			if name == fwwVM && once.CompareAndSwap(false, true) {
 				close(reached)
-				die() // the daemon died here
+				<-fwliveRestartNever // the daemon died here
 				return errors.New("the daemon died in this call")
 			}
 			return nil
 		}
-		done := fwliveRestartMigrate(t, c, src, dst)
+		done := fwliveMigrate(t, c, src, dst)
 		fwliveRestartReach(t, reached, done, "the source cleanup's undefine")
 		if beforeDeath != nil {
 			beforeDeath()
 		}
 		fwliveRestartDown(src)
-		m, ok := fwliveRestartMarker(t, src)
+		m, ok := fwliveMarker(t, src)
 		if !ok || m.Phase != fwmig.PhaseCleaning {
 			t.Fatalf("marker %+v (present %v), want cleaning", m, ok)
 		}
-		if st := fwliveRestartState(src); st != string(libvirtfake.StateShutdown) {
+		if st := fwliveState(src); st != string(libvirtfake.StateShutdown) {
 			t.Fatalf("%s's leftover is %s, want defined and shut off", src.Name, st)
 		}
 		return m
@@ -748,7 +518,7 @@ func TestFleet_FwLiveRestart_F5_SourceRestartAtEachPhase(t *testing.T) {
 	}
 
 	t.Run("released", func(t *testing.T) {
-		c, src, dst, _ := fwliveRestartCluster(t)
+		c, src, dst, _ := fwliveCluster(t)
 		m := cleanupCrash(t, c, src, dst, nil)
 		// Released: the cleanup had not begun.
 		fwliveRestartAt(t, src, m, fwmig.PhaseReleased)
@@ -757,11 +527,11 @@ func TestFleet_FwLiveRestart_F5_SourceRestartAtEachPhase(t *testing.T) {
 		}
 		fwliveRestartUp(t, c, src)
 		fwliveRestartRecovered(src)
-		fwliveRestartMoved(t, src, dst)
+		fwliveMoved(t, src, dst)
 	})
 
 	t.Run("released/target_fenced", func(t *testing.T) {
-		c, src, dst, _ := fwliveRestartCluster(t)
+		c, src, dst, _ := fwliveCluster(t)
 		// An operator confirms the target off while the source is down.
 		m := cleanupCrash(t, c, src, dst, func() { mustFenceConfirm(t, src, dst.Name) })
 		fwliveRestartAt(t, src, m, fwmig.PhaseReleased)
@@ -772,25 +542,40 @@ func TestFleet_FwLiveRestart_F5_SourceRestartAtEachPhase(t *testing.T) {
 		fwliveRestartRecovered(src)
 		// The target is proved off: the source state is kept for an
 		// operator, not cleaned up.
-		if m, ok := fwliveRestartMarker(t, src); !ok || m.Phase != fwmig.PhaseTargetUnreachable {
+		if m, ok := fwliveMarker(t, src); !ok || m.Phase != fwmig.PhaseTargetUnreachable {
 			t.Fatalf("marker %+v (present %v), want target_unreachable", m, ok)
 		}
-		fwliveRestartSourceKept(t, src)
-		if st := fwliveRestartState(src); st != string(libvirtfake.StateShutdown) {
+		fwliveSourceKept(t, src)
+		if st := fwliveState(src); st != string(libvirtfake.StateShutdown) {
 			t.Errorf("%s's leftover is %s, want kept, shut off", src.Name, st)
 		}
 	})
 
 	t.Run("cleaning", func(t *testing.T) {
-		c, src, dst, _ := fwliveRestartCluster(t)
+		c, src, dst, _ := fwliveCluster(t)
 		cleanupCrash(t, c, src, dst, nil)
 		fwliveRestartUp(t, c, src)
 		fwliveRestartRecovered(src)
-		fwliveRestartMoved(t, src, dst)
+		fwliveMoved(t, src, dst)
 	})
 }
 
 // ── F-6, F-6b, F-6c, F-6d: target daemon restarts around Release ──
+
+// fwliveRestartFinalNvram lands src's migrations on dst with the guest
+// having written its UEFI variables during the migration: its final NVRAM,
+// returned, is not the one Prepare materialised on the target (T0), so the
+// target's NVRAM tells T0 from a run.
+func fwliveRestartFinalNvram(src, dst *Node) []byte {
+	final := []byte("fwlive1's UEFI vars, as the guest left them on the source")
+	src.Virt.OnMigrateToTarget = func(name, _ string, p lv.MigrateParams) error {
+		if err := os.WriteFile(src.FW.NvramPath(name), final, 0o600); err != nil {
+			return err
+		}
+		return dst.Virt.LandFirmwareLive(src.Virt, name, p)
+	}
+	return final
+}
 
 // fwliveRestartHoldRelease stops the source's next Release call at dst before
 // its handler runs: at is closed when it arrives, and the call then waits for
@@ -802,7 +587,7 @@ func fwliveRestartHoldRelease(t *testing.T, dst *Node) (at <-chan struct{}, goOn
 	var once sync.Once
 	goOn = func() { once.Do(func() { close(g) }) }
 	t.Cleanup(goOn)
-	fwliveRestartHookOnce(dst, "ReleaseLiveFirmwareTarget", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
+	dst.HookUnary("ReleaseLiveFirmwareTarget", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
 		close(a)
 		<-g
 		return nil, fwliveRestartStoppedHere
@@ -826,24 +611,24 @@ func fwliveRestartArrive(t *testing.T, at <-chan struct{}, done <-chan error, wh
 // attempt in the watched path) — the move parks target_unreachable, red.
 func TestFleet_FwLiveRestart_F6_TargetRestartBetweenVerifyAndRelease(t *testing.T) {
 	ctx := context.Background()
-	c, src, dst, _ := fwliveRestartCluster(t)
+	c, src, dst, _ := fwliveCluster(t)
 	src.LandMigrationsOn(dst)
 	at, goOn := fwliveRestartHoldRelease(t, dst)
-	done := fwliveRestartMigrate(t, c, src, dst)
+	done := fwliveMigrate(t, c, src, dst)
 	fwliveRestartArrive(t, at, done, "Release")
 
 	check := func(when string) {
 		t.Helper()
-		if st := fwliveRestartState(dst); st != string(libvirtfake.StatePaused) {
+		if st := fwliveState(dst); st != string(libvirtfake.StatePaused) {
 			t.Errorf("%s: %s's guest is %s, want held paused", when, dst.Name, st)
 		}
-		if h, ok := fwliveRestartHold(t, dst); !ok || h.State != fwmig.HoldVerified {
+		if h, ok := fwliveHold(t, dst); !ok || h.State != fwmig.HoldVerified {
 			t.Errorf("%s: %s's hold %+v (present %v), want verified", when, dst.Name, h.State, ok)
 		}
-		if m, ok := fwliveRestartMarker(t, src); !ok || m.Phase != fwmig.PhaseCommitted {
+		if m, ok := fwliveMarker(t, src); !ok || m.Phase != fwmig.PhaseCommitted {
 			t.Errorf("%s: marker %+v (present %v), want committed", when, m.Phase, ok)
 		}
-		if row := fwliveRestartRow(t, src); row.HostName != dst.Name {
+		if row := fwliveRow(t, src); row.HostName != dst.Name {
 			t.Errorf("%s: row on %s, want %s (committed)", when, row.HostName, dst.Name)
 		}
 	}
@@ -870,16 +655,20 @@ func TestFleet_FwLiveRestart_F6_TargetRestartBetweenVerifyAndRelease(t *testing.
 	dst.Server.FirmwareHoldSweepOnce(ctx, time.Now().Add(3*time.Hour))
 	check("after the restarted daemon's sweeps and the refused calls")
 	for _, op := range []string{"resume", "start", "destroy", "shutdown", "undefine"} {
-		if fwliveRestartDid(dst, op) {
-			t.Errorf("%s's libvirt did %s on the held guest (ops %v)", dst.Name, op, fwliveRestartOps(dst))
+		if fwliveDid(dst, op) {
+			t.Errorf("%s's libvirt did %s on the held guest (ops %v)", dst.Name, op, fwliveOps(dst))
 		}
 	}
 
 	goOn()
-	if err := fwliveRestartWait(t, done); err != nil {
+	if err := fwliveWait(t, done); err != nil {
 		t.Fatalf("the move after the target's restart: %v", err)
 	}
-	fwliveRestartMoved(t, src, dst)
+	// The late sweep above raised firmware_migration_held for the guest it
+	// found held 3 h; the sweep's next pass, with the hold gone, resolves
+	// it.
+	dst.Server.FirmwareHoldSweepOnce(ctx, time.Now())
+	fwliveMoved(t, src, dst)
 }
 
 // F-6b. The target host goes down after Verify: the held guest's QEMU dies
@@ -892,18 +681,12 @@ func TestFleet_FwLiveRestart_F6_TargetRestartBetweenVerifyAndRelease(t *testing.
 // Mutation: H1 skips the NVRAM push ("resume without the push") — the
 // target's NVRAM stays the template, red.
 func TestFleet_FwLiveRestart_F6b_HeldTargetShutOffAfterVerify(t *testing.T) {
-	c, src, dst, _ := fwliveRestartCluster(t)
+	c, src, dst, _ := fwliveCluster(t)
 	// The guest writes its UEFI variables during the migration: its final
 	// NVRAM is not the one Prepare materialised on the target (T0), so H1
 	// has something to push.
-	final := []byte("fwlive1's UEFI vars, as the guest left them on the source")
-	src.Virt.OnMigrateToTarget = func(name, _ string, p lv.MigrateParams) error {
-		if err := os.WriteFile(src.FW.NvramPath(name), final, 0o600); err != nil {
-			return err
-		}
-		return dst.Virt.LandFirmwareLive(src.Virt, name, p)
-	}
-	fwliveRestartHookOnce(dst, "VerifyLiveFirmwareTarget", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
+	final := fwliveRestartFinalNvram(src, dst)
+	dst.HookUnary("VerifyLiveFirmwareTarget", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
 		resp, err := h(ctx, req)
 		if r, _ := resp.(*pb.VerifyLiveFirmwareTargetResponse); err != nil || r.GetVerdict() != pb.FirmwareVerdict_FIRMWARE_VERDICT_MATCH {
 			t.Errorf("Verify answered %v (%v), want MATCH", r.GetVerdict(), err)
@@ -913,45 +696,45 @@ func TestFleet_FwLiveRestart_F6b_HeldTargetShutOffAfterVerify(t *testing.T) {
 		return resp, err
 	})
 	at, goOn := fwliveRestartHoldRelease(t, dst)
-	done := fwliveRestartMigrate(t, c, src, dst)
+	done := fwliveMigrate(t, c, src, dst)
 	fwliveRestartArrive(t, at, done, "Release")
-	if b, _ := fwliveRestartFile(dst.FW.NvramPath(fwwVM)); !bytes.Equal(b, fwwNvram) {
+	if b, _ := fwliveFile(dst.FW.NvramPath(fwwVM)); !bytes.Equal(b, fwwNvram) {
 		t.Errorf("fixture: %s's NVRAM at Release is %q, want T0 (what Prepare materialised)", dst.Name, b)
 	}
 	fwliveRestartDaemon(t, c, dst)
 	goOn()
-	if err := fwliveRestartWait(t, done); err != nil {
+	if err := fwliveWait(t, done); err != nil {
 		t.Logf("the move returned %v", err)
 	}
 
-	if st := fwliveRestartState(dst); st != string(libvirtfake.StateShutdown) {
+	if st := fwliveState(dst); st != string(libvirtfake.StateShutdown) {
 		t.Errorf("%s's domain is %s, want defined and shut off: H1 never boots it", dst.Name, st)
 	}
 	for _, op := range []string{"start", "resume"} {
-		if fwliveRestartDid(dst, op) {
-			t.Errorf("%s's libvirt did %s (ops %v)", dst.Name, op, fwliveRestartOps(dst))
+		if fwliveDid(dst, op) {
+			t.Errorf("%s's libvirt did %s (ops %v)", dst.Name, op, fwliveOps(dst))
 		}
 	}
-	row := fwliveRestartRow(t, src)
+	row := fwliveRow(t, src)
 	if row.HostName != dst.Name || row.State != "stopped" || !strings.Contains(row.StateDetail, "before release; firmware verified") {
 		t.Errorf("row %s on %s (%q), want stopped on %s by H1", row.State, row.HostName, row.StateDetail, dst.Name)
 	}
-	if b, _ := fwliveRestartFile(dst.FW.NvramPath(fwwVM)); !bytes.Equal(b, final) {
+	if b, _ := fwliveFile(dst.FW.NvramPath(fwwVM)); !bytes.Equal(b, final) {
 		t.Errorf("%s's NVRAM %q, want the source's final, pushed", dst.Name, b)
 	}
-	if b, _ := fwliveRestartFile(fwliveRestartPermall(dst)); !bytes.Equal(b, fwwPermall) {
+	if b, _ := fwliveFile(fwlivePermall(dst)); !bytes.Equal(b, fwwPermall) {
 		t.Errorf("%s's permall %q, want the verified copy, unchanged", dst.Name, b)
 	}
-	if h, ok := fwliveRestartHold(t, dst); ok {
+	if h, ok := fwliveHold(t, dst); ok {
 		t.Errorf("%s's hold left in %s", dst.Name, h.State)
 	}
-	if m, ok := fwliveRestartMarker(t, src); ok {
+	if m, ok := fwliveMarker(t, src); ok {
 		t.Errorf("marker left in %s (%s)", m.Phase, m.Detail)
 	}
-	if st := fwliveRestartState(src); st != "undefined" {
+	if st := fwliveState(src); st != "undefined" {
 		t.Errorf("%s's leftover is %s, want undefined by the cleanup", src.Name, st)
 	}
-	if _, ok := fwliveRestartFile(src.FW.NvramPath(fwwVM)); ok {
+	if _, ok := fwliveFile(src.FW.NvramPath(fwwVM)); ok {
 		t.Errorf("%s's NVRAM not wiped by the cleanup", src.Name)
 	}
 }
@@ -961,8 +744,7 @@ func TestFleet_FwLiveRestart_F6b_HeldTargetShutOffAfterVerify(t *testing.T) {
 // 6), as a daemon killed there leaves it. killed is closed then; the
 // caller restarts the daemon. crash runs first, in the old daemon's last
 // moment (a host crash).
-func fwliveRestartKillAfterResume(t *testing.T, w *fwliveRestartOneCopy, dst *Node, crash func()) <-chan struct{} {
-	die := fwliveRestartGrave(t)
+func fwliveRestartKillAfterResume(t *testing.T, w *fwliveOneCopy, dst *Node, crash func()) <-chan struct{} {
 	killed := make(chan struct{})
 	var once atomic.Bool
 	w.onRunning(dst, func(name string) {
@@ -973,7 +755,7 @@ func fwliveRestartKillAfterResume(t *testing.T, w *fwliveRestartOneCopy, dst *No
 			crash()
 		}
 		close(killed)
-		die() // the daemon died here
+		<-fwliveRestartNever // the daemon died here
 	})
 	return killed
 }
@@ -988,23 +770,23 @@ func fwliveRestartKillAfterResume(t *testing.T, w *fwliveRestartOneCopy, dst *No
 // before resuming is written") — the restarted daemon finds a running guest
 // under a verified hold and answers TARGET_RAN, red.
 func TestFleet_FwLiveRestart_F6c_TargetKilledAfterResume(t *testing.T) {
-	c, src, dst, w := fwliveRestartCluster(t)
+	c, src, dst, w := fwliveCluster(t)
 	src.LandMigrationsOn(dst)
 	killed := fwliveRestartKillAfterResume(t, w, dst, nil)
-	done := fwliveRestartMigrate(t, c, src, dst)
+	done := fwliveMigrate(t, c, src, dst)
 	fwliveRestartReach(t, killed, done, "the target's resume")
-	if h, ok := fwliveRestartHold(t, dst); !ok || h.State != fwmig.HoldResuming {
+	if h, ok := fwliveHold(t, dst); !ok || h.State != fwmig.HoldResuming {
 		t.Errorf("%s's hold %+v (present %v) when its daemon died, want resuming", dst.Name, h.State, ok)
 	}
 	fwliveRestartDaemon(t, c, dst)
-	if err := fwliveRestartWait(t, done); err != nil {
+	if err := fwliveWait(t, done); err != nil {
 		t.Fatalf("the move after the target's restart: %v", err)
 	}
-	fwliveRestartMoved(t, src, dst)
-	if fwliveRestartCondition(t, src, "firmware_migration_target_ran") {
+	fwliveMoved(t, src, dst)
+	if fwliveCondition(t, src, "firmware_migration_target_ran") {
 		t.Error("firmware_migration_target_ran raised for a hand-over")
 	}
-	if n := strings.Count(strings.Join(fwliveRestartOps(dst), " "), "resume"); n != 1 {
+	if n := strings.Count(strings.Join(fwliveOps(dst), " "), "resume"); n != 1 {
 		t.Errorf("%s resumed the guest %d times, want once", dst.Name, n)
 	}
 }
@@ -1013,16 +795,22 @@ func TestFleet_FwLiveRestart_F6c_TargetKilledAfterResume(t *testing.T) {
 // guest, and the source's retry resumes it (§6.6 step 2a).
 //
 // Then the target host crashes right after a resume: the guest ran (its
-// NVRAM is the source's final, its swtpm wrote the TPM state back), the
-// domain is shut off and the daemon restarts. The retried Release takes H1's
-// checks (step 2b), which find the guest ran: the move parks target_ran, the
-// hold kept, nothing written anywhere, both copies kept.
+// NVRAM is T1, the source's final, not the T0 Prepare materialised; its
+// swtpm wrote the TPM state back), the domain is shut off and the daemon
+// restarts. The retried Release takes H1's checks (step 2b), which find the
+// guest ran: the move parks target_ran, the hold kept, nothing written
+// anywhere, both copies kept. Each of H1's two run detectors catches it on
+// its own (the NVRAM one is the only one an SB-only VM has).
 //
-// Mutation: a resuming hold over a paused guest is refused ("treat resuming +
-// paused as refused") — the first case parks instead of resuming, red.
+// Mutations: a resuming hold over a paused guest is refused ("treat resuming
+// + paused as refused") — the first case parks instead of resuming, red.
+// H1 skips its permall check — the crash case still parks (the NVRAM
+// detector), green; H1 skips its NVRAM-is-T0 check — still parks (the
+// permall detector), green; H1 skips both — the crash case pushes the NVRAM
+// and leaves the VM stopped, red.
 func TestFleet_FwLiveRestart_F6d_ResumeFailsThenTargetCrashes(t *testing.T) {
 	t.Run("resume_fails_once", func(t *testing.T) {
-		c, src, dst, _ := fwliveRestartCluster(t)
+		c, src, dst, _ := fwliveCluster(t)
 		src.LandMigrationsOn(dst)
 		var failed atomic.Bool
 		dst.Virt.FailResumeDomain = func(name string) error {
@@ -1031,62 +819,69 @@ func TestFleet_FwLiveRestart_F6d_ResumeFailsThenTargetCrashes(t *testing.T) {
 			}
 			return nil
 		}
-		if err := fwliveRestartWait(t, fwliveRestartMigrate(t, c, src, dst)); err != nil {
+		if err := fwliveWait(t, fwliveMigrate(t, c, src, dst)); err != nil {
 			t.Fatalf("the move with one failed resume: %v", err)
 		}
 		if !failed.Load() {
 			t.Fatal("the resume never failed")
 		}
-		fwliveRestartMoved(t, src, dst)
+		fwliveMoved(t, src, dst)
 	})
 
 	t.Run("target_crash_after_resume", func(t *testing.T) {
-		c, src, dst, w := fwliveRestartCluster(t)
-		src.LandMigrationsOn(dst)
+		c, src, dst, w := fwliveCluster(t)
+		final := fwliveRestartFinalNvram(src, dst)
 		killed := fwliveRestartKillAfterResume(t, w, dst, func() { dst.Virt.ShutOffDomain(fwwVM, "crashed") })
-		done := fwliveRestartMigrate(t, c, src, dst)
+		done := fwliveMigrate(t, c, src, dst)
 		fwliveRestartReach(t, killed, done, "the target's resume")
-		ran, _ := fwliveRestartFile(dst.FW.NvramPath(fwwVM))
-		if !bytes.Equal(ran, fwwNvram) {
-			t.Fatalf("fixture: the resumed guest's NVRAM is %q, want the source's final (T1)", ran)
+		// The guest ran: its NVRAM is T1 (the source's final, written on
+		// resume), not the T0 Prepare materialised.
+		ran, _ := fwliveFile(dst.FW.NvramPath(fwwVM))
+		if !bytes.Equal(ran, final) || bytes.Equal(ran, fwwNvram) {
+			t.Fatalf("fixture: the resumed guest's NVRAM is %q, want the source's final (T1), not T0", ran)
 		}
-		permall, _ := fwliveRestartFile(fwliveRestartPermall(dst))
-		rowBefore := fwliveRestartRow(t, src)
+		permall, _ := fwliveFile(fwlivePermall(dst))
+		rowBefore := fwliveRow(t, src)
 		fwliveRestartDaemon(t, c, dst)
-		err := fwliveRestartWait(t, done)
+		err := fwliveWait(t, done)
 		if err == nil {
 			t.Fatal("the move succeeded over a guest that ran before the crash")
 		}
-		m, ok := fwliveRestartMarker(t, src)
+		m, ok := fwliveMarker(t, src)
 		if !ok || m.Phase != fwmig.PhaseTargetRan {
 			t.Fatalf("marker %+v (present %v) (move: %v), want target_ran", m, ok, err)
 		}
-		if !fwliveRestartCondition(t, src, "firmware_migration_target_ran") {
+		if !fwliveCondition(t, src, "firmware_migration_target_ran") {
 			t.Error("no firmware_migration_target_ran")
 		}
-		if h, ok := fwliveRestartHold(t, dst); !ok || h.State != fwmig.HoldResuming {
+		if h, ok := fwliveHold(t, dst); !ok || h.State != fwmig.HoldResuming {
 			t.Errorf("%s's hold %+v (present %v), want kept resuming", dst.Name, h.State, ok)
 		}
 		// Nothing written: the target's state and the row as the crash left
 		// them, the source's state kept.
-		if b, _ := fwliveRestartFile(dst.FW.NvramPath(fwwVM)); !bytes.Equal(b, ran) {
+		if b, _ := fwliveFile(dst.FW.NvramPath(fwwVM)); !bytes.Equal(b, ran) {
 			t.Errorf("%s's NVRAM changed to %q", dst.Name, b)
 		}
-		if b, _ := fwliveRestartFile(fwliveRestartPermall(dst)); !bytes.Equal(b, permall) {
+		if b, _ := fwliveFile(fwlivePermall(dst)); !bytes.Equal(b, permall) {
 			t.Errorf("%s's permall changed to %q", dst.Name, b)
 		}
-		if row := fwliveRestartRow(t, src); row.HostName != rowBefore.HostName || row.State != rowBefore.State || row.StateDetail != rowBefore.StateDetail {
+		if row := fwliveRow(t, src); row.HostName != rowBefore.HostName || row.State != rowBefore.State || row.StateDetail != rowBefore.StateDetail {
 			t.Errorf("row %s on %s (%q), want as before Release: %s on %s (%q)",
 				row.State, row.HostName, row.StateDetail, rowBefore.State, rowBefore.HostName, rowBefore.StateDetail)
 		}
-		if st := fwliveRestartState(dst); st != string(libvirtfake.StateShutdown) {
+		if st := fwliveState(dst); st != string(libvirtfake.StateShutdown) {
 			t.Errorf("%s's domain is %s, want shut off, not booted", dst.Name, st)
 		}
-		if n := strings.Count(strings.Join(fwliveRestartOps(dst), " "), "start"); n != 0 {
+		if n := strings.Count(strings.Join(fwliveOps(dst), " "), "start"); n != 0 {
 			t.Errorf("%s started the guest %d times", dst.Name, n)
 		}
-		fwliveRestartSourceKept(t, src)
-		if st := fwliveRestartState(src); st != string(libvirtfake.StateShutdown) {
+		if b, _ := fwliveFile(fwlivePermall(src)); !bytes.Equal(b, fwwPermall) {
+			t.Errorf("%s's permall %q, want its own, kept", src.Name, b)
+		}
+		if b, _ := fwliveFile(src.FW.NvramPath(fwwVM)); !bytes.Equal(b, final) {
+			t.Errorf("%s's NVRAM %q, want its final, kept", src.Name, b)
+		}
+		if st := fwliveState(src); st != string(libvirtfake.StateShutdown) {
 			t.Errorf("%s's leftover is %s, want kept, shut off", src.Name, st)
 		}
 	})
@@ -1112,15 +907,15 @@ func fwliveRestartFailMigration(src *Node, do func(name string, p lv.MigratePara
 //
 // Mutation: rule D leaves the swtpm tree — red.
 func TestFleet_FwLiveRestart_F7_MigrationFailsAfterTargetTree(t *testing.T) {
-	c, src, dst, _ := fwliveRestartCluster(t)
+	c, src, dst, _ := fwliveCluster(t)
 	src.LandMigrationsOn(dst)
 	var tree atomic.Bool
 	dst.Virt.FailAfterTargetTree = func(name string) error {
-		_, ok := fwliveRestartFile(fwliveRestartPermall(dst))
+		_, ok := fwliveFile(fwlivePermall(dst))
 		tree.Store(ok)
 		return errors.New("induced failure after the target's swtpm tree was created")
 	}
-	if err := fwliveRestartWait(t, fwliveRestartMigrate(t, c, src, dst)); err == nil {
+	if err := fwliveWait(t, fwliveMigrate(t, c, src, dst)); err == nil {
 		t.Fatal("the move succeeded with its migration failing")
 	}
 	if !tree.Load() {
@@ -1140,12 +935,12 @@ func TestFleet_FwLiveRestart_F7_MigrationFailsAfterTargetTree(t *testing.T) {
 // source domain's state ("Abort on error") — the target's copy is discarded
 // and the guest runs nowhere, red.
 func TestFleet_FwLiveRestart_F7b_MigrationErrorWithSourceInactive(t *testing.T) {
-	c, src, dst, _ := fwliveRestartCluster(t)
+	c, src, dst, _ := fwliveCluster(t)
 	fwliveRestartFailMigration(src, fwliveRestartLand(t, src, dst, "migrated"))
-	if err := fwliveRestartWait(t, fwliveRestartMigrate(t, c, src, dst)); err != nil {
+	if err := fwliveWait(t, fwliveMigrate(t, c, src, dst)); err != nil {
 		t.Fatalf("the move after a Confirm-phase error: %v", err)
 	}
-	fwliveRestartMoved(t, src, dst)
+	fwliveMoved(t, src, dst)
 }
 
 // F-7c. The migration call fails and leaves the source guest paused, with no
@@ -1155,11 +950,11 @@ func TestFleet_FwLiveRestart_F7b_MigrationErrorWithSourceInactive(t *testing.T) 
 //
 // Mutation: M1p leaves the source paused ("leave it paused") — red.
 func TestFleet_FwLiveRestart_F7c_MigrationErrorWithSourcePaused(t *testing.T) {
-	c, src, dst, _ := fwliveRestartCluster(t)
+	c, src, dst, _ := fwliveCluster(t)
 	fwliveRestartFailMigration(src, func(name string, _ lv.MigrateParams) {
 		src.Virt.SetState(name, libvirtfake.StatePaused)
 	})
-	if err := fwliveRestartWait(t, fwliveRestartMigrate(t, c, src, dst)); err == nil {
+	if err := fwliveWait(t, fwliveMigrate(t, c, src, dst)); err == nil {
 		t.Fatal("the move succeeded with its migration failing")
 	}
 	fwliveRestartUndone(t, src, dst)
@@ -1175,45 +970,45 @@ func TestFleet_FwLiveRestart_F7c_MigrationErrorWithSourcePaused(t *testing.T) {
 // marker stays and `lv stop` is refused, red.
 func TestFleet_FwLiveRestart_F7d_ConfirmPhaseFailureDiscardsTargetCopy(t *testing.T) {
 	ctx := context.Background()
-	c, src, dst, _ := fwliveRestartCluster(t)
+	c, src, dst, _ := fwliveCluster(t)
 	fwliveRestartFailMigration(src, func(name string, p lv.MigrateParams) {
 		if err := dst.Virt.LandFirmwareLive(src.Virt, name, p); err != nil {
 			t.Errorf("land: %v", err)
 		}
 	})
-	if err := fwliveRestartWait(t, fwliveRestartMigrate(t, c, src, dst)); err == nil {
+	if err := fwliveWait(t, fwliveMigrate(t, c, src, dst)); err == nil {
 		t.Fatal("the move succeeded with its migration failing")
 	}
-	if st := fwliveRestartState(src); st != string(libvirtfake.StateRunning) {
+	if st := fwliveState(src); st != string(libvirtfake.StateRunning) {
 		t.Errorf("%s's guest is %s, want still running", src.Name, st)
 	}
-	if st := fwliveRestartState(dst); st != "undefined" {
+	if st := fwliveState(dst); st != "undefined" {
 		t.Errorf("%s's copy is %s, want discarded", dst.Name, st)
 	}
-	if m, ok := fwliveRestartMarker(t, src); ok {
+	if m, ok := fwliveMarker(t, src); ok {
 		t.Fatalf("marker left in %s (%s)", m.Phase, m.Detail)
 	}
-	if h, ok := fwliveRestartHold(t, dst); ok {
+	if h, ok := fwliveHold(t, dst); ok {
 		t.Errorf("%s's hold left in %s", dst.Name, h.State)
 	}
-	q := fwliveRestartQuarantines(dst)
+	q := fwliveQuarantines(dst)
 	if len(q) != 1 {
 		t.Fatalf("%s's quarantine %v, want the discarded copy", dst.Name, q)
 	}
-	if b, ok := fwliveRestartFile(filepath.Join(q[0], "swtpm", "tpm2", "tpm2-00.permall")); !ok || !bytes.Equal(b, fwwPermall) {
+	if b, ok := fwliveFile(filepath.Join(q[0], "swtpm", "tpm2", "tpm2-00.permall")); !ok || !bytes.Equal(b, fwwPermall) {
 		t.Errorf("the quarantine holds permall %q (present %v), want the discarded copy", b, ok)
 	}
-	if b, ok := fwliveRestartFile(filepath.Join(q[0], "nvram")); !ok || !bytes.Equal(b, fwwNvram) {
+	if b, ok := fwliveFile(filepath.Join(q[0], "nvram")); !ok || !bytes.Equal(b, fwwNvram) {
 		t.Errorf("the quarantine holds NVRAM %q (present %v), want the copy Prepare materialised", b, ok)
 	}
-	if row := fwliveRestartRow(t, src); row.HostName != src.Name || row.State != "running" {
+	if row := fwliveRow(t, src); row.HostName != src.Name || row.State != "running" {
 		t.Errorf("row %s on %s, want running on %s", row.State, row.HostName, src.Name)
 	}
-	fwliveRestartSourceKept(t, src)
+	fwliveSourceKept(t, src)
 	if _, err := c.SelfClient(src).StopVM(ctx, &pb.StopVMRequest{Name: fwwVM, Force: true}); err != nil {
 		t.Fatalf("lv stop after the discard: %v", err)
 	}
-	if st := fwliveRestartState(src); st != string(libvirtfake.StateShutdown) {
+	if st := fwliveState(src); st != string(libvirtfake.StateShutdown) {
 		t.Errorf("%s's guest is %s after lv stop, want shut off", src.Name, st)
 	}
 }
@@ -1225,25 +1020,30 @@ func TestFleet_FwLiveRestart_F7d_ConfirmPhaseFailureDiscardsTargetCopy(t *testin
 // move keeps defined and shut off — with stop reason migrated, and (a source
 // host reboot) unknown, where the reconciler's proven-owner path asks the
 // owner and finds the guest running there. Leftover cleanup would undefine it
-// with UNDEFINE_NVRAM, deleting its NVRAM (probe (g)); the marker skip and the
-// undefine guard leave the definition, the NVRAM and the TPM state as they
-// are, and the move then completes.
+// with UNDEFINE_NVRAM, deleting its NVRAM (probe (g)). The definition, the
+// NVRAM and the TPM state stay as they are, and the move then completes.
 //
-// Mutation: remove the reconciler's marker skip and the undefine guard's
-// marker refusal — the unknown case's leftover is undefined and its NVRAM
-// deleted, red. (A leftover with reason migrated is also left by the
-// reconciler's own allowlist, cleanableLeftover, so that case stays green
-// under this mutation: the skip and the guard are not its only protection.)
+// What protects each case:
+//   - unknown: the reconciler's marker skip and the undefine guard's marker
+//     refusal. Mutation: remove both — the leftover is undefined and its
+//     NVRAM deleted, red.
+//   - migrated: three layers — the reconciler's allowlist (cleanableLeftover
+//     does not clean reason migrated), the marker skip and the guard.
+//     Mutation: admit migrated in cleanableLeftover AND remove the skip AND
+//     the guard's refusal — red. Any one of the three left in place keeps it
+//     green (each was checked: allowlist alone admitting migrated; with the
+//     skip removed too; with the guard's refusal removed too), so the case
+//     pins all three as defence in depth.
 func TestFleet_FwLiveRestart_F8_ReconcilerLeavesSourceStateAfterCommit(t *testing.T) {
 	for _, reason := range []string{"migrated", "unknown"} {
 		t.Run(reason, func(t *testing.T) {
 			ctx := context.Background()
-			c, src, dst, _ := fwliveRestartCluster(t)
+			c, src, dst, _ := fwliveCluster(t)
 			src.LandMigrationsOn(dst)
 			if reason == "unknown" {
 				src.Virt.ReportSourceReasonUnknown = func(string) bool { return true }
 			}
-			fwliveRestartHookOnce(dst, "ReleaseLiveFirmwareTarget", func(hctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
+			dst.HookUnary("ReleaseLiveFirmwareTarget", func(hctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
 				resp, err := h(hctx, req)
 				if err != nil {
 					t.Errorf("Release: %v", err)
@@ -1251,10 +1051,10 @@ func TestFleet_FwLiveRestart_F8_ReconcilerLeavesSourceStateAfterCommit(t *testin
 				}
 				// The guest runs on the target; the source has its
 				// marker, committed, and its leftover.
-				if st := fwliveRestartState(dst); st != string(libvirtfake.StateRunning) {
+				if st := fwliveState(dst); st != string(libvirtfake.StateRunning) {
 					t.Errorf("fixture: %s's guest is %s after Release, want running", dst.Name, st)
 				}
-				if m, _ := fwliveRestartMarker(t, src); m.Phase != fwmig.PhaseCommitted {
+				if m, _ := fwliveMarker(t, src); m.Phase != fwmig.PhaseCommitted {
 					t.Errorf("fixture: marker %s, want committed", m.Phase)
 				}
 				if ds, _ := src.Virt.DomainStateReason(fwwVM); ds.Reason != reason {
@@ -1265,21 +1065,21 @@ func TestFleet_FwLiveRestart_F8_ReconcilerLeavesSourceStateAfterCommit(t *testin
 				for i := 0; i < 2; i++ {
 					rec.ReconcileOnce(ctx)
 				}
-				if st := fwliveRestartState(src); st != string(libvirtfake.StateShutdown) {
+				if st := fwliveState(src); st != string(libvirtfake.StateShutdown) {
 					t.Errorf("after the source's reconciler: leftover %s, want defined and shut off", st)
 				}
 				for _, op := range []string{"undefine", "nvram-deleted"} {
-					if fwliveRestartDid(src, op) {
-						t.Errorf("after the source's reconciler: %s's libvirt did %s (ops %v)", src.Name, op, fwliveRestartOps(src))
+					if fwliveDid(src, op) {
+						t.Errorf("after the source's reconciler: %s's libvirt did %s (ops %v)", src.Name, op, fwliveOps(src))
 					}
 				}
-				fwliveRestartSourceKept(t, src)
+				fwliveSourceKept(t, src)
 				return resp, err
 			})
-			if err := fwliveRestartWait(t, fwliveRestartMigrate(t, c, src, dst)); err != nil {
+			if err := fwliveWait(t, fwliveMigrate(t, c, src, dst)); err != nil {
 				t.Fatalf("the move: %v", err)
 			}
-			fwliveRestartMoved(t, src, dst)
+			fwliveMoved(t, src, dst)
 		})
 	}
 }
@@ -1304,20 +1104,10 @@ func TestFleet_FwLiveRestart_F8_ReconcilerLeavesSourceStateAfterCommit(t *testin
 // record stay, red.
 func TestFleet_FwLiveRestart_F3_TargetUnreachableFenceConfirmRejoin(t *testing.T) {
 	ctx := context.Background()
-	c, src, dst, _ := fwliveRestartCluster(t)
 	// A host-local disk, copied with the memory (storage route), so the
 	// attempt creates a stub on the target.
-	tls := func(s *grpcapi.Server) { s.SetMigrationTLS(func() (bool, error) { return true, nil }) }
-	for _, n := range c.Nodes {
-		setup := n.serverSetup
-		n.serverSetup = func(s *grpcapi.Server) { setup(s); tls(s) }
-		tls(n.Server)
-	}
-	disk := filepath.Join(c.tmpRoot, dst.Name, "data", "disks", fwwVM+"-root.qcow2")
-	if err := corrosion.InsertDisk(ctx, src.DB, corrosion.DiskRecord{VMName: fwwVM, DiskName: "root", HostName: src.Name, Path: disk,
-		SizeBytes: 1 << 30, StorageType: "local", TargetDev: "vda"}); err != nil {
-		t.Fatal(err)
-	}
+	sc := fwliveSetup(t, true)
+	c, src, dst, disk := sc.c, sc.src, sc.dst, sc.disk
 
 	m := fwliveRestartCrashMigratingReq(t, c, src, dst, fwliveRestartLand(t, src, dst, "migrated"), &pb.MigrateVMRequest{
 		VmName: fwwVM, TargetHost: dst.Name, Strategy: pb.MigrateStrategy_MIGRATE_LIVE, WithStorage: true,
@@ -1325,7 +1115,7 @@ func TestFleet_FwLiveRestart_F3_TargetUnreachableFenceConfirmRejoin(t *testing.T
 	if len(m.CreatedStubs) != 1 || m.CreatedStubs[0] != disk {
 		t.Fatalf("the marker records stubs %v, want [%s]", m.CreatedStubs, disk)
 	}
-	if _, ok := fwliveRestartFile(disk); !ok {
+	if _, ok := fwliveFile(disk); !ok {
 		t.Fatalf("fixture: no stub at %s on %s", disk, dst.Name)
 	}
 
@@ -1334,27 +1124,27 @@ func TestFleet_FwLiveRestart_F3_TargetUnreachableFenceConfirmRejoin(t *testing.T
 	fwliveRestartDown(dst)
 	fwliveRestartUp(t, c, src)
 	fwliveRestartRecovered(src)
-	parked, ok := fwliveRestartMarker(t, src)
+	parked, ok := fwliveMarker(t, src)
 	if !ok || parked.Phase != fwmig.PhaseTargetUnreachable || parked.ParkedFrom != fwmig.PhaseCutover {
 		t.Fatalf("marker %+v (present %v), want target_unreachable from cutover", parked, ok)
 	}
-	if !fwliveRestartCondition(t, src, "firmware_migration_target_unreachable") {
+	if !fwliveCondition(t, src, "firmware_migration_target_unreachable") {
 		t.Error("no firmware_migration_target_unreachable")
 	}
 	if _, err := c.SelfClient(src).StartVM(ctx, &pb.StartVMRequest{Name: fwwVM}); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("lv start while parked = %v, want FailedPrecondition", err)
 	}
-	if st := fwliveRestartState(src); st != string(libvirtfake.StateShutdown) {
+	if st := fwliveState(src); st != string(libvirtfake.StateShutdown) {
 		t.Fatalf("%s's guest is %s after a refused start, want shut off", src.Name, st)
 	}
 
 	// fence-confirm, then the next recovery pass.
 	mustFenceConfirm(t, src, dst.Name)
 	fwliveRestartRecovered(src)
-	if m, ok := fwliveRestartMarker(t, src); ok {
+	if m, ok := fwliveMarker(t, src); ok {
 		t.Fatalf("marker left in %s after the fence (%s)", m.Phase, m.Detail)
 	}
-	if row := fwliveRestartRow(t, src); row.HostName != src.Name || row.State != "stopped" {
+	if row := fwliveRow(t, src); row.HostName != src.Name || row.State != "stopped" {
 		t.Errorf("row %s on %s after the fence, want stopped on %s", row.State, row.HostName, src.Name)
 	}
 	owed, ok, err := fwmig.New(src.FW.DataDir).GetOwedDiscard(fwwVM, m.Attempt)
@@ -1364,14 +1154,14 @@ func TestFleet_FwLiveRestart_F3_TargetUnreachableFenceConfirmRejoin(t *testing.T
 	if owed.Target != dst.Name || len(owed.CreatedStubs) != 1 || owed.CreatedStubs[0] != disk {
 		t.Errorf("owed discard %+v, want to %s with stubs [%s]", owed, dst.Name, disk)
 	}
-	if !fwliveRestartCondition(t, src, "firmware_migration_discard_owed") {
+	if !fwliveCondition(t, src, "firmware_migration_discard_owed") {
 		t.Error("no firmware_migration_discard_owed")
 	}
-	fwliveRestartSourceKept(t, src)
+	fwliveSourceKept(t, src)
 	if _, err := c.SelfClient(src).StartVM(ctx, &pb.StartVMRequest{Name: fwwVM}); err != nil {
 		t.Fatalf("lv start on %s after the fence: %v", src.Name, err)
 	}
-	if st := fwliveRestartState(src); st != string(libvirtfake.StateRunning) {
+	if st := fwliveState(src); st != string(libvirtfake.StateRunning) {
 		t.Fatalf("%s's guest is %s after lv start, want running", src.Name, st)
 	}
 	// The owed DISCARD is not answered while the target is down.
@@ -1389,26 +1179,26 @@ func TestFleet_FwLiveRestart_F3_TargetUnreachableFenceConfirmRejoin(t *testing.T
 	if _, ok, _ := fwmig.New(src.FW.DataDir).GetOwedDiscard(fwwVM, m.Attempt); ok {
 		t.Error("the owed discard is still recorded after the target answered it")
 	}
-	if fwliveRestartCondition(t, src, "firmware_migration_discard_owed") {
+	if fwliveCondition(t, src, "firmware_migration_discard_owed") {
 		t.Error("firmware_migration_discard_owed still open after the discard landed")
 	}
-	if h, ok := fwliveRestartHold(t, dst); ok {
+	if h, ok := fwliveHold(t, dst); ok {
 		t.Errorf("%s's hold left in %s", dst.Name, h.State)
 	}
-	if st := fwliveRestartState(dst); st != "undefined" {
+	if st := fwliveState(dst); st != "undefined" {
 		t.Errorf("%s's copy is %s, want undefined by the discard", dst.Name, st)
 	}
-	q := fwliveRestartQuarantines(dst)
+	q := fwliveQuarantines(dst)
 	if len(q) != 1 {
 		t.Fatalf("%s's quarantine %v, want the discarded copy", dst.Name, q)
 	}
-	if b, ok := fwliveRestartFile(filepath.Join(q[0], "swtpm", "tpm2", "tpm2-00.permall")); !ok || !bytes.Equal(b, fwwPermall) {
+	if b, ok := fwliveFile(filepath.Join(q[0], "swtpm", "tpm2", "tpm2-00.permall")); !ok || !bytes.Equal(b, fwwPermall) {
 		t.Errorf("the quarantine holds permall %q (present %v), want the discarded copy", b, ok)
 	}
-	if _, ok := fwliveRestartFile(disk); !ok {
+	if _, ok := fwliveFile(disk); !ok {
 		t.Errorf("the stub %s was removed by a target that no longer owns it", disk)
 	}
-	if st := fwliveRestartState(src); st != string(libvirtfake.StateRunning) {
+	if st := fwliveState(src); st != string(libvirtfake.StateRunning) {
 		t.Errorf("%s's guest is %s after the discard, want still running", src.Name, st)
 	}
 }

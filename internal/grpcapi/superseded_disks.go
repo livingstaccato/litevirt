@@ -146,7 +146,7 @@ func (s *Server) SupersededDisks(ctx context.Context, req *pb.SupersededDisksReq
 		}
 		resp.Disks = append(resp.Disks, &pb.SupersededDisk{
 			Path: k.Path, DiskPath: k.DiskPath, SetAsideAt: k.MovedAt.UTC().Format(time.RFC3339), SizeBytes: k.SizeBytes,
-			Held: held, Kept: true,
+			Held: held, Kept: true, Seed: k.Seed,
 		})
 	}
 	return resp, nil

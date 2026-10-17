@@ -228,7 +228,8 @@ func (r *recoveredVM) keptForRetention(t *testing.T) {
 // the copy stays, and the retention sweep removes it only once it is older
 // than superseded_disk_retention_days. --keep-disks does the same with the
 // copy, which is retained either way, and keeps rv's seed: a seed a
-// --keep-disks delete kept is never removed (review m8).
+// --keep-disks delete kept is never removed (review m8), and
+// `lv host superseded-disks` lists it (re-review N2).
 //
 // (superseded_disk_retention_days: 0 starts no sweep at all
 // (daemon.runSupersededDiskSweep), so a copy then stays until
@@ -258,6 +259,21 @@ func TestFleet_RmAfterRecoveryKeepsTheCopyForRetention(t *testing.T) {
 				t.Fatalf("home removed rv's seed %s after lv rm --keep-disks", r.iso)
 			case !keepDisks && (present(r.iso) || present(cloudinit.SeedOwnerPath(r.iso))):
 				t.Fatalf("home still holds rv's seed %s after rv was deleted", r.iso)
+			}
+			if keepDisks {
+				// It can hold user-data: lv host superseded-disks lists it
+				// (re-review N2).
+				resp, err := r.c.SelfClient(r.home).SupersededDisks(context.Background(), &pb.SupersededDisksRequest{Host: r.home.Name})
+				if err != nil {
+					t.Fatalf("lv host superseded-disks: %v", err)
+				}
+				listed := false
+				for _, d := range resp.Disks {
+					listed = listed || (d.Path == r.iso && d.Kept && d.Seed)
+				}
+				if !listed {
+					t.Errorf("lv host superseded-disks on home does not list rv's kept seed %s: %+v", r.iso, resp.Disks)
+				}
 			}
 			r.keptForRetention(t)
 		})

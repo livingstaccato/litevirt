@@ -1544,9 +1544,13 @@ The restart is not silent, and the real disk is not lost:
   disk stays at its path. It also stays there when the record does not say
   what the delete decided: a delete by an earlier release, or one whose mark
   on the record was lost to a later write of it. The host also removes the
-  VM's cloud-init seed there (`cloudinit/<vm>.iso`) if this release wrote it;
-  a seed from an earlier release stays, and so does the seed when a disk
-  stays at its path for one of the reasons above.
+  VM's cloud-init seed there (`cloudinit/<vm>.iso`) if this release wrote it,
+  except in these cases, where the seed stays: after `lv rm --keep-disks`,
+  whether or not a disk is still at its path (one set aside before the delete
+  is not); when a disk stays at its path for one of the other reasons above;
+  and for a seed from an earlier release. A seed that stays can hold
+  user-data, and nothing removes it but an operator: while no VM of the name
+  exists, `lv host superseded-disks <host>` lists it as `kept`.
 - A VM of the same name created on that host before then clears
   `<data_dir>/disks/<vm>-<disk>.qcow2` files the earlier VM left. Of those, a
   disk that a failover left at its path is first renamed to

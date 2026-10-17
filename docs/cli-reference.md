@@ -236,8 +236,9 @@ after the rename puts each file back at the path the kept VM recorded, unless
 a file is there by then. The host that holds
 kept disks lists them in `<data_dir>/kept-disks/<vm>.json` until a create
 renames them. `lv host superseded-disks <host>` lists each `.kept-` file there
-as `kept`, the seeds in `<data_dir>/cloudinit` among them (a seed can hold
-user-data passwords); `--purge`, `--remove` and `--restore` never take one, so
+as `kept`, the seeds in `<data_dir>/cloudinit` among them, and the seed a
+deleted VM was kept with where it was, while no VM of its name exists (a seed
+can hold user-data passwords); `--purge`, `--remove` and `--restore` never take one, so
 only an operator removes it, by hand. A `--keep-disks` delete whose
 `<data_dir>/kept-disks/<vm>.json` cannot be read is refused, naming the file,
 with nothing deleted: repair or remove that file, then retry.

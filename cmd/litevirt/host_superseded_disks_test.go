@@ -38,15 +38,15 @@ func TestPrintSupersededDisks_MarksAKeptDisk(t *testing.T) {
 	}
 }
 
-// A .kept- seed is listed as a kept seed, which can hold user-data (review
-// m4).
+// A kept seed is listed as a kept seed, which can hold user-data (review m4),
+// told by its seed field, not by the server's reason text (re-review N3).
 //
-// Mutation: drop the seed case — it reads as a kept disk.
+// Mutation: drop the seed case, or select it by the held text again — it
+// reads as a kept disk.
 func TestPrintSupersededDisks_MarksAKeptSeed(t *testing.T) {
 	var out bytes.Buffer
 	printSupersededDisks(&out, &pb.SupersededDisksResponse{Host: "node-a", Disks: []*pb.SupersededDisk{
-		{Path: "/c/rv.iso.kept-x", DiskPath: "/c/rv.iso", SizeBytes: 9, Kept: true,
-			Held: "a cloud-init seed a deleted VM was kept with, which can hold user-data; only an operator removes it, by hand"},
+		{Path: "/c/rv.iso.kept-x", DiskPath: "/c/rv.iso", SizeBytes: 9, Kept: true, Seed: true, Held: "kept"},
 	}}, false, time.Now())
 	if !strings.Contains(out.String(), "kept: a cloud-init seed a deleted VM was kept with, which can hold user-data") {
 		t.Fatalf("the kept seed is not marked a kept seed:\n%s", out.String())

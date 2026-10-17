@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/storage"
 )
@@ -245,8 +246,9 @@ type KeptCopy struct {
 }
 
 // ListKeptDisks lists the .kept- files on this host, where set-aside copies
-// can be (supersededDirs), and the .kept- seeds in <data_dir>/cloudinit,
-// oldest first. Storage that does not answer fails the listing, as it fails
+// can be (supersededDirs), the .kept- seeds in <data_dir>/cloudinit, and the
+// seeds of deleted VMs kept where they were (keptSeedsInPlace), oldest
+// first. Storage that does not answer fails the listing, as it fails
 // ListSupersededDisks.
 func ListKeptDisks(ctx context.Context, db *corrosion.Client, dataDir string) ([]KeptCopy, error) {
 	dirs, err := supersededDirs(ctx, db, dataDir)
@@ -279,6 +281,11 @@ func ListKeptDisks(ctx context.Context, db *corrosion.Client, dataDir string) ([
 			out = append(out, KeptCopy{Path: p, DiskPath: p[:i], MovedAt: at, SizeBytes: fi.Size(), Seed: dir == seedDir})
 		}
 	}
+	inPlace, err := keptSeedsInPlace(ctx, db, seedDir)
+	if err != nil {
+		return nil, fmt.Errorf("list kept seeds: %w", err)
+	}
+	out = append(out, inPlace...)
 	sort.Slice(out, func(i, j int) bool {
 		if !out[i].MovedAt.Equal(out[j].MovedAt) {
 			return out[i].MovedAt.Before(out[j].MovedAt)
@@ -375,4 +382,55 @@ func RemoveSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir st
 		removed = append(removed, c)
 	}
 	return removed, nil
+}
+
+// keptSeedsInPlace lists the seeds in seedDir (<data_dir>/cloudinit/<vm>.iso)
+// of VMs that no longer exist: no live row of the name here, and a tombstone
+// of it. A seed stamped for another VM of the name is not the deleted VM's
+// and is left out; an unstamped one (written before seeds were stamped) is
+// listed, as is one stamped for the deleted incarnation. Such a seed is one a
+// delete kept (`lv rm --keep-disks`, or a disk left at its path on a
+// failover's old host), or one an earlier release left; it can hold
+// user-data, and nothing on the host removes it. MovedAt is its mtime.
+func keptSeedsInPlace(ctx context.Context, db *corrosion.Client, seedDir string) ([]KeptCopy, error) {
+	matches, err := storage.Bounded("list the seeds in", seedDir, func() ([]string, error) {
+		return supersededGlob(filepath.Join(seedDir, "*.iso"))
+	})
+	if err != nil {
+		return nil, err
+	}
+	var out []KeptCopy
+	for _, iso := range matches {
+		name := strings.TrimSuffix(filepath.Base(iso), ".iso")
+		if name == "" || strings.HasPrefix(name, ".") {
+			continue
+		}
+		fi, err := lstatSetAside(iso)
+		if storage.IsFSNoAnswer(err) {
+			return nil, err
+		}
+		if err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		live, err := corrosion.GetVM(ctx, db, name)
+		if err != nil {
+			return nil, err
+		}
+		if live != nil {
+			continue
+		}
+		createdAt, spec, err := corrosion.GetTombstonedVM(ctx, db, name)
+		if err != nil {
+			return nil, err
+		}
+		if createdAt == "" {
+			continue
+		}
+		stamp, stamped, err := cloudinit.SeedOwner(iso)
+		if err == nil && stamped && stamp != cloudinit.SpecUUID(spec) {
+			continue
+		}
+		out = append(out, KeptCopy{Path: iso, DiskPath: iso, MovedAt: fi.ModTime(), SizeBytes: fi.Size(), Seed: true})
+	}
+	return out, nil
 }

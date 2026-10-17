@@ -2819,6 +2819,7 @@ type SupersededDisk struct {
 	Removed       bool                   `protobuf:"varint,8,opt,name=removed,proto3" json:"removed,omitempty"`  // removed by this request
 	Retained      string                 `protobuf:"bytes,9,opt,name=retained,proto3" json:"retained,omitempty"` // why the sweep and a bare purge keep it (its VM exists); "" when not retained
 	Kept          bool                   `protobuf:"varint,10,opt,name=kept,proto3" json:"kept,omitempty"`       // a disk a deleted VM was kept with, moved off its path by a create (<path>.kept-<time>): listed only, never purged, removed or restored
+	Seed          bool                   `protobuf:"varint,11,opt,name=seed,proto3" json:"seed,omitempty"`       // with kept: a cloud-init seed (it can hold user-data), not a disk
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2919,6 +2920,13 @@ func (x *SupersededDisk) GetRetained() string {
 func (x *SupersededDisk) GetKept() bool {
 	if x != nil {
 		return x.Kept
+	}
+	return false
+}
+
+func (x *SupersededDisk) GetSeed() bool {
+	if x != nil {
+		return x.Seed
 	}
 	return false
 }
@@ -43354,7 +43362,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x05purge\x18\x02 \x01(\bR\x05purge\x12$\n" +
 	"\x0eolder_than_sec\x18\x03 \x01(\x03R\folderThanSec\x12!\n" +
 	"\fremove_paths\x18\x04 \x03(\tR\vremovePaths\x12!\n" +
-	"\frestore_path\x18\x05 \x01(\tR\vrestorePath\"\x94\x02\n" +
+	"\frestore_path\x18\x05 \x01(\tR\vrestorePath\"\xa8\x02\n" +
 	"\x0eSupersededDisk\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1b\n" +
 	"\tdisk_path\x18\x02 \x01(\tR\bdiskPath\x12 \n" +
@@ -43368,7 +43376,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\aremoved\x18\b \x01(\bR\aremoved\x12\x1a\n" +
 	"\bretained\x18\t \x01(\tR\bretained\x12\x12\n" +
 	"\x04kept\x18\n" +
-	" \x01(\bR\x04kept\"\xe1\x01\n" +
+	" \x01(\bR\x04kept\x12\x12\n" +
+	"\x04seed\x18\v \x01(\bR\x04seed\"\xe1\x01\n" +
 	"\x17SupersededDisksResponse\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x121\n" +
 	"\x05disks\x18\x02 \x03(\v2\x1b.litevirt.v1.SupersededDiskR\x05disks\x12%\n" +

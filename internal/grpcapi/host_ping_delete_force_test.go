@@ -16,3 +16,13 @@ func TestPing_AdvertisesDeleteForce(t *testing.T) {
 		t.Fatalf("Ping = %v, %v; want delete_force", resp, err)
 	}
 }
+
+// Ping advertises abort_scoped, which lv operation abort --operation requires
+// before it sends operation_id.
+func TestPing_AdvertisesAbortScoped(t *testing.T) {
+	s := testServer(t)
+	resp, err := s.Ping(context.Background(), &pb.PingRequest{})
+	if err != nil || !resp.GetAbortScoped() {
+		t.Fatalf("Ping = %v, %v; want abort_scoped", resp, err)
+	}
+}

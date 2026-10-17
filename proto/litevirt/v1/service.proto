@@ -3543,6 +3543,10 @@ message PingResponse {
   // so a caller that needs the stop first (lv rm --force, a forwarding entry
   // node) sends StopVM{force} itself when this is false.
   bool delete_force = 12;
+  // abort_scoped: this build honours AbortVMOperationRequest.operation_id. An
+  // older daemon ignores the field and aborts whatever operation is active, so
+  // lv operation abort --operation refuses to send it when this is false.
+  bool abort_scoped = 13;
 }
 
 // Ready: application-level readiness. Ping answers "is this daemon's TLS

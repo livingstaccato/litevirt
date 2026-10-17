@@ -31637,7 +31637,11 @@ type PingResponse struct {
 	// runs hooks and records the operator stop). An older owner ignores the field,
 	// so a caller that needs the stop first (lv rm --force, a forwarding entry
 	// node) sends StopVM{force} itself when this is false.
-	DeleteForce   bool `protobuf:"varint,12,opt,name=delete_force,json=deleteForce,proto3" json:"delete_force,omitempty"`
+	DeleteForce bool `protobuf:"varint,12,opt,name=delete_force,json=deleteForce,proto3" json:"delete_force,omitempty"`
+	// abort_scoped: this build honours AbortVMOperationRequest.operation_id. An
+	// older daemon ignores the field and aborts whatever operation is active, so
+	// lv operation abort --operation refuses to send it when this is false.
+	AbortScoped   bool `protobuf:"varint,13,opt,name=abort_scoped,json=abortScoped,proto3" json:"abort_scoped,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -31752,6 +31756,13 @@ func (x *PingResponse) GetMigratePreconditions() bool {
 func (x *PingResponse) GetDeleteForce() bool {
 	if x != nil {
 		return x.DeleteForce
+	}
+	return false
+}
+
+func (x *PingResponse) GetAbortScoped() bool {
+	if x != nil {
+		return x.AbortScoped
 	}
 	return false
 }
@@ -45656,7 +45667,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"LOCALIZING\x10\x04\x12\b\n" +
 	"\x04DONE\x10\x05\"\r\n" +
-	"\vPingRequest\"\xd8\x03\n" +
+	"\vPingRequest\"\xfb\x03\n" +
 	"\fPingResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x12%\n" +
@@ -45671,7 +45682,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x10voter_generation\x18\n" +
 	" \x01(\x03R\x0fvoterGeneration\x123\n" +
 	"\x15migrate_preconditions\x18\v \x01(\bR\x14migratePreconditions\x12!\n" +
-	"\fdelete_force\x18\f \x01(\bR\vdeleteForce\"\x0e\n" +
+	"\fdelete_force\x18\f \x01(\bR\vdeleteForce\x12!\n" +
+	"\fabort_scoped\x18\r \x01(\bR\vabortScoped\"\x0e\n" +
 	"\fReadyRequest\"\xf3\x01\n" +
 	"\rReadyResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x14\n" +

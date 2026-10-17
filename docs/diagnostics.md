@@ -1752,8 +1752,9 @@ either.
 ### A VM that outlived its stack's teardown (`stack.vm_outlived_stack`)
 
 Evaluator `stack_reconciler`, subject kind `vm`, subject the VM's name,
-severity warning. Raised by the stack reconciler for a live VM whose record
-names a compose stack that was torn down while the VM existed. A teardown
+severity warning. Raised by the stack reconciler on the VM's host for a live
+VM whose record names a compose stack that was torn down while the VM
+existed. A teardown
 deletes the VMs it listed, each as the incarnation it listed, so a VM of a
 member's name created during `compose down` (a `compose up` running beside
 it, or the member re-created on another host) is left, and nothing else

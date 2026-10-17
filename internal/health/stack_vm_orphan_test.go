@@ -52,7 +52,7 @@ func outlivedCondition(t *testing.T, db *corrosion.Client) (corrosion.HealthCond
 func TestStackReconciler_ReportsAVMThatOutlivedItsStack(t *testing.T) {
 	now := time.Now()
 	db := orphanStackDB(t, now.Add(-time.Minute), now)
-	r := NewStackReconciler("node-0", db)
+	r := NewStackReconciler("node-2", db)
 	r.SetCleaner(&recordingStackCleaner{})
 	r.ReconcileOnce(context.Background())
 	row, open := outlivedCondition(t, db)
@@ -83,7 +83,7 @@ func TestStackReconciler_ReportsAVMThatOutlivedItsStack(t *testing.T) {
 func TestStackReconciler_AVMOfAStackDeployedAgainIsNotReported(t *testing.T) {
 	now := time.Now()
 	db := orphanStackDB(t, now.Add(-time.Minute), now)
-	r := NewStackReconciler("node-0", db)
+	r := NewStackReconciler("node-2", db)
 	r.SetCleaner(&recordingStackCleaner{})
 	r.ReconcileOnce(context.Background())
 	if _, open := outlivedCondition(t, db); !open {
@@ -106,10 +106,39 @@ func TestStackReconciler_AVMOfAStackDeployedAgainIsNotReported(t *testing.T) {
 func TestStackReconciler_AVMCreatedAfterTheTeardownIsNotReported(t *testing.T) {
 	now := time.Now()
 	db := orphanStackDB(t, now.Add(5*time.Second), now)
-	r := NewStackReconciler("node-0", db)
+	r := NewStackReconciler("node-2", db)
 	r.SetCleaner(&recordingStackCleaner{})
 	r.ReconcileOnce(context.Background())
 	if _, open := outlivedCondition(t, db); open {
 		t.Error("a VM created after its stack's teardown (a deploy in progress) was reported")
+	}
+}
+
+// Lab 2 2026-10-17, F2: on a host other than the VM's, a live row of a
+// torn-down stack's VM may be a member whose tombstone has not replicated
+// yet: the stack's tombstone came from the host that finished the teardown,
+// the member's from its owner. Only the VM's own host judges it, and a
+// condition its host raised is not resolved by a host that sees the VM too.
+//
+// Mutation: drop the own-host check — red.
+func TestStackReconciler_AVMOnAnotherHostIsJudgedByItsHost(t *testing.T) {
+	now := time.Now()
+	db := orphanStackDB(t, now.Add(-time.Minute), now)
+	elsewhere := NewStackReconciler("node-0", db)
+	elsewhere.SetCleaner(&recordingStackCleaner{})
+	elsewhere.ReconcileOnce(context.Background())
+	if _, open := outlivedCondition(t, db); open {
+		t.Fatal("node-0 reported web, which is node-2's VM: a live row here may be a delete not yet replicated")
+	}
+
+	own := NewStackReconciler("node-2", db)
+	own.SetCleaner(&recordingStackCleaner{})
+	own.ReconcileOnce(context.Background())
+	if _, open := outlivedCondition(t, db); !open {
+		t.Fatal("setup: node-2 did not report its own VM")
+	}
+	elsewhere.ReconcileOnce(context.Background())
+	if _, open := outlivedCondition(t, db); !open {
+		t.Error("node-0 resolved the condition while its replica still shows web outliving stack st")
 	}
 }

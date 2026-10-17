@@ -884,7 +884,11 @@ func (s *Server) UndrainHost(ctx context.Context, req *pb.UndrainHostRequest) (*
 		return nil, status.Errorf(codes.NotFound, "host %q not found", req.Name)
 	}
 
-	if err := corrosion.UpdateHostState(ctx, s.db, req.Name, "active"); err != nil {
+	if h.State == "upgrading" {
+		if err := s.undrainRestarting(ctx, req.Name); err != nil {
+			return nil, err
+		}
+	} else if err := corrosion.UpdateHostState(ctx, s.db, req.Name, "active"); err != nil {
 		return nil, status.Errorf(codes.Internal, "update host state: %v", err)
 	}
 	s.publish("host.undrained", req.Name, "")
@@ -897,6 +901,61 @@ func (s *Server) UndrainHost(ctx context.Context, req *pb.UndrainHostRequest) (*
 	// to returning (failback.go), and says so in the reply.
 	s.autoFailback(ctx, req.Name, reply)
 	return reply, nil
+}
+
+// undrainPingTimeout bounds the Ping undrain sends a host recorded
+// 'upgrading'.
+const undrainPingTimeout = 5 * time.Second
+
+// undrainRestarting records active a host recorded 'upgrading', only if its
+// daemon answers a Ping. A host that answers serves but did not record itself
+// active (upgrading_unconfirmed), and recording it active is the remedy. One
+// that does not answer is still restarting: recording it active would end its
+// restart allowance, and the failover coordinator would fence it on the
+// failing run left from its stop (lab 1, 2026-10-17). It turns active by
+// itself once it serves (hostboot.ConfirmServing). The write is made only
+// while the host is still recorded 'upgrading'.
+func (s *Server) undrainRestarting(ctx context.Context, host string) error {
+	if host != s.hostName {
+		if err := s.pingHost(ctx, host); err != nil {
+			age := ""
+			if since, ok, serr := corrosion.HostStateSince(ctx, s.db, host); serr == nil && ok {
+				age = fmt.Sprintf(" (recorded upgrading %s ago)", time.Since(since).Round(time.Second))
+			}
+			return status.Errorf(codes.FailedPrecondition,
+				"%s is restarting%s and its daemon does not answer yet (%v); it turns active by itself once its daemon serves",
+				host, age, err)
+		}
+	}
+	applied, err := corrosion.UpdateHostStateFrom(ctx, s.db, host, "upgrading", "active")
+	if err != nil {
+		return status.Errorf(codes.Internal, "update host state: %v", err)
+	}
+	if applied {
+		return nil
+	}
+	h, err := corrosion.GetHost(ctx, s.db, host)
+	if err != nil || h == nil {
+		return status.Errorf(codes.NotFound, "host %q not found", host)
+	}
+	if h.State == "active" {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"%s is now recorded %s; run 'lv host undrain %s' again if it should be active", host, h.State, host)
+}
+
+// pingHost reports whether host's daemon answers a Ping.
+func (s *Server) pingHost(ctx context.Context, host string) error {
+	pctx, cancel := context.WithTimeout(ctx, undrainPingTimeout)
+	defer cancel()
+	c, closeConn, err := s.dialPeer(pctx, host)
+	if err != nil {
+		return err
+	}
+	defer closeConn()
+	_, err = c.Ping(pctx, &pb.PingRequest{})
+	return err
 }
 
 // SetHostLabels sets or removes labels on a host.

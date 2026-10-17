@@ -106,6 +106,7 @@ func (s *Server) deleteContainerOnRemovedHost(ctx context.Context, host, name, p
 	}
 	ctx, cancel := s.detachDelete(ctx)
 	defer cancel()
+	s.deleteStepHook(name, "removed-host")
 	derr := corrosion.DeleteContainerStrict(ctx, s.db, host, name)
 	if derr != nil && !errors.Is(derr, corrosion.ErrNoRowsAffected) {
 		s.audit(ctx, "ct.delete", name, "project="+project+" recorded on removed host "+host, "error")

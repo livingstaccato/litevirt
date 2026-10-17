@@ -703,3 +703,50 @@ func TestFleet_ARebuildWhoseClientLeavesStillCreatesTheVM(t *testing.T) {
 		t.Error("hb-1 has a row but no domain after its rebuild")
 	}
 }
+
+// A delete of a running row whose domain is gone everywhere, failing after
+// it has freed the disks (here its budget runs out before the tombstone):
+// the row must say stopped, never running, or the reconciler's self-heal
+// starts the VM again with its disks gone.
+//
+// Mutation: record the stop only for a pending or starting row — red: the
+// row stays running, and a reconcile pass defines dcx-1.
+func TestFleet_DeleteVMWithNoDomainFailingAfterItsDisksRecordsTheStop(t *testing.T) {
+	c, disks := newDeleteCancelFleet(t)
+	owner := c.Nodes[1]
+	undefineOnOwner(t, owner)
+	owner.Server.SetDeleteFinishTimeoutForTest(200 * time.Millisecond)
+	var hit atomic.Bool
+	owner.Server.SetDeleteStepHookForTest(func(vm, step string) {
+		if vm == "dcx-1" && step == "tombstone" {
+			hit.Store(true)
+			time.Sleep(400 * time.Millisecond) // past the delete's budget
+		}
+	})
+	t.Cleanup(func() { owner.Server.SetDeleteStepHookForTest(nil) })
+
+	ctx := context.Background()
+	if _, err := c.SelfClient(owner).DeleteVM(ctx, &pb.DeleteVMRequest{Name: "dcx-1"}); err == nil {
+		t.Fatal("DeleteVM succeeded although its budget ran out before the tombstone")
+	}
+	if !hit.Load() {
+		t.Fatal("the delete never reached its tombstone")
+	}
+	for _, p := range disks {
+		if _, err := os.Stat(p); err == nil {
+			t.Fatalf("premise: disk %s was not freed before the failure", p)
+		}
+	}
+	vm, err := corrosion.GetVM(ctx, owner.DB, "dcx-1")
+	if err != nil || vm == nil {
+		t.Fatalf("dcx-1's row: %+v (%v), want it kept by the failed delete", vm, err)
+	}
+	if vm.State != "stopped" {
+		t.Errorf("dcx-1's row says %q after a delete that freed its disks and failed; want stopped", vm.State)
+	}
+	rec := health.NewReconciler(owner.Name, filepath.Join(c.tmpRoot, owner.Name, "data"), owner.DB, owner.Virt)
+	rec.ReconcileOnce(ctx)
+	if owner.Virt.DomainExists("dcx-1") {
+		t.Error("a reconcile pass defined dcx-1, whose disks its delete had freed")
+	}
+}

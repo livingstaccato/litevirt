@@ -287,10 +287,12 @@ the container's runtime delete on. An interrupted command reports that the
 delete may still complete on its host, and names `lv ls` (`lv ct ls` for a
 container, `lv compose ls` for a stack) to see the outcome.
 
-`lv rebuild` and a `lv compose up` that re-creates a VM work the same way: once
-the old VM's teardown has started, the create of its replacement runs whatever
-becomes of the client, so an interrupted replace does not end with no VM.
-Interrupted before the teardown, nothing is deleted.
+`lv rebuild` and a `lv compose up` that re-creates a VM work the same way.
+Interrupted before the re-create sends its delete (a rebuild: before its
+teardown), nothing is deleted. From then on the replace runs to its create
+whatever becomes of the client, so an interrupted replace does not end with no
+VM; the command reports that it may still complete, and names `lv ls`. A
+create that replaces nothing (the delete found no VM) stays cancellable.
 
 **CPU mode.** The default, `host-model`, gives the guest the host's modern
 instruction set — SSE4.2, AVX, AVX2, AVX-512 as the host has them — while keeping

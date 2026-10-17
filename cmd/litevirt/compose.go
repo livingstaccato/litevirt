@@ -155,7 +155,9 @@ func newUpCmd() *cobra.Command {
 				for {
 					p, err := stream.Recv()
 					if err != nil {
-						if st, ok := status.FromError(err); ok && st.Code() != codes.OK {
+						if ierr := interruptedOp("compose up "+f.Name, "deploy", err, "lv ls"); ierr != nil {
+							deployErr = ierr
+						} else if st, ok := status.FromError(err); ok && st.Code() != codes.OK {
 							deployErr = fmt.Errorf("deploy failed: %s", st.Message())
 						}
 						break

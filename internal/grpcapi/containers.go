@@ -635,7 +635,11 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	} else if removed {
 		out, err := s.deleteContainerOnRemovedHost(ctx, targetHost, req.Name, project)
 		if err == nil {
-			s.clearDeletedFirewallTags(ctx, corrosion.TagMemberCT, targetHost, req.Name, fwID)
+			// The delete has happened: its tags go whatever becomes of the
+			// caller.
+			pctx, pcancel := context.WithTimeout(context.WithoutCancel(ctx), deletePostStepsTimeout)
+			s.clearDeletedFirewallTags(pctx, corrosion.TagMemberCT, targetHost, req.Name, fwID)
+			pcancel()
 		}
 		return out, err
 	}

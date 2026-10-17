@@ -3053,7 +3053,8 @@ func (s *Server) SetDeleteFinishTimeoutForTest(d time.Duration) { s.deleteFinish
 
 // SetDeleteStepHookForTest sets a hook run at named steps of a VM delete:
 // "acting" once the no-domain cleanup has detached, "nics" before the NIC
-// read, "tombstone" before the tombstone.
+// read, "tombstone" before the tombstone (on either path); and for a
+// container on a removed host, "removed-host" once its delete has detached.
 func (s *Server) SetDeleteStepHookForTest(fn func(vm, step string)) { s.deleteStep = fn }
 
 // deleteStepHook runs the deleteStep test seam.
@@ -3405,11 +3406,29 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			return nil, err
 		}
 		slog.Warn("DeleteVM: domain not found on any host — cleaning up stale record", "vm", req.Name)
-		// From here the delete acts: devices, the stop record, disks, then
+		// From here the delete acts: the stop record, devices, disks, then
 		// the tombstone. A cancellation must not stop it between them.
 		ctx, cancel := s.detachDelete(ctx)
 		defer cancel()
 		s.deleteStepHook(req.Name, "acting")
+		// A row being started (pending/starting: a failover's start, or
+		// one re-armed after a cancel) is one the reconciler starts, and
+		// a transfer start rebuilds a missing disk from its image; a
+		// running row with no domain is one the reconciler's self-heal
+		// starts again. A delete that removes some disks and then fails
+		// would leave it to boot the VM being deleted on missing or
+		// blank disks. So, before anything is done, the row is
+		// recorded stopped by its operator, as a delete that fails after
+		// its stop leaves it (abortDeleteAfterStop): no start path starts
+		// it, whatever this delete then manages. Nothing is done when
+		// that write fails.
+		if (vm.State == "pending" || vm.State == "starting" || vm.State == "running") && vm.HostName == s.hostName {
+			if werr := s.persistVMState(ctx, req.Name, "stopped", "operator-stop", corrosion.OpVMState); werr != nil {
+				return nil, status.Errorf(codes.Internal,
+					"cannot delete VM %q: its row says %s, and recording its stop before cleaning up its record failed; nothing was done: %v",
+					req.Name, vm.State, werr)
+			}
+		}
 		if err := s.releaseDevices(ctx, req.Name); err != nil {
 			return nil, status.Errorf(codes.Internal,
 				"cannot clean up stale VM %q: its PCI device(s) could not be released (still bound to vfio-pci); resolve the device and retry: %v", req.Name, err)
@@ -3432,23 +3451,6 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// never removed on a guess. A disk whose removal fails fails the
 		// delete, and the record stays.
 		if !req.KeepDisks {
-			// A row being started (pending/starting: a failover's start, or
-			// one re-armed after a cancel) is one the reconciler starts, and
-			// a transfer start rebuilds a missing disk from its image. A
-			// delete that removes some disks and then fails would leave it
-			// to boot the VM being deleted on blank disks. So, before any
-			// disk is removed, the row is recorded stopped by its operator,
-			// as a delete that fails after its stop leaves it
-			// (abortDeleteAfterStop): no start path starts it, whatever
-			// this delete then manages. Nothing is removed when that write
-			// fails.
-			if (vm.State == "pending" || vm.State == "starting") && vm.HostName == s.hostName {
-				if werr := s.persistVMState(ctx, req.Name, "stopped", "operator-stop", corrosion.OpVMState); werr != nil {
-					return nil, status.Errorf(codes.Internal,
-						"cannot delete VM %q: it is being started (%s), and recording its stop before its disks are removed failed; nothing was removed: %v",
-						req.Name, vm.State, werr)
-				}
-			}
 			_, derr := s.virt.DomainIsActive(req.Name)
 			domainGone := lv.IsNoDomain(derr)
 			cephKept, keptDisks, leftovers := s.freeRecordedVMDisks(ctx, req.Name, func(d *corrosion.DiskRecord) (bool, string, string) {
@@ -3487,6 +3489,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// node keeps scheduling around. A failure is logged and every NIC named
 		// for the orphan sweep, never swallowed.
 		s.releaseNICLeasesBestEffort(ctx, vm, "delete-stale-record")
+		s.deleteStepHook(req.Name, "tombstone")
 		deleted, err := s.tombstoneDeletedVM(ctx, req.Name, req.KeepDisks)
 		if err != nil {
 			// A declined delete means the stale row is still live cluster-wide;

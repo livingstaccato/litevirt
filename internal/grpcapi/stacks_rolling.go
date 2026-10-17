@@ -133,12 +133,21 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 		st := status.Convert(err)
 		return status.Errorf(st.Code(), "recreate %s: %s; nothing was deleted", target, st.Message())
 	}
+	callerCtx := ctx
 	ctx, cancelReplace := detachReplace(ctx)
 	defer cancelReplace()
 	dctx, deleted := withDeletedVMSink(ctx, target, curCreated)
 	_, derr := o.s.DeleteVM(dctx, &pb.DeleteVMRequest{Name: target})
 	if derr != nil && status.Code(derr) != codes.NotFound {
 		return fmt.Errorf("delete %s before recreate: %w", target, derr)
+	}
+	if derr != nil {
+		// The delete removed nothing: the create is a fresh one, and stays
+		// the caller's to cancel.
+		ctx = callerCtx
+	}
+	if hook := o.s.recreateDeleted; hook != nil {
+		hook(target)
 	}
 	// The delete may have run on the VM's own host, and the create may land
 	// on a host — this one included — whose replica has not applied its
@@ -636,8 +645,6 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 	defer cancelReplace()
 	deleteCtx, cancelDelete := detachReplace(deleteCtx)
 	defer cancelDelete()
-	createCtx, cancelCreate := detachReplace(createCtx)
-	defer cancelCreate()
 	delErr := s.deleteWorkload(deleteCtx, action)
 	tornDown := delErr == nil
 	if status.Code(delErr) == codes.NotFound {
@@ -647,6 +654,16 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 		slog.Warn("deploy update delete failed", "workload", action.VMName, "error", delErr)
 		gate.markUnmet(action.VMName, fmt.Errorf("delete before recreate failed: %w", delErr))
 		return fmt.Errorf("delete before recreate: %w", delErr)
+	}
+	if tornDown {
+		// Only a create that replaces what the delete removed runs whatever
+		// becomes of the caller; a fresh one stays the caller's to cancel.
+		var cancelCreate context.CancelFunc
+		createCtx, cancelCreate = detachReplace(createCtx)
+		defer cancelCreate()
+	}
+	if hook := s.recreateDeleted; hook != nil {
+		hook(action.VMName)
 	}
 	if hook := s.recreateTornDown; hook != nil {
 		hook(action.VMName)

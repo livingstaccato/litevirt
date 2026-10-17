@@ -591,9 +591,20 @@ func (c *Cluster) waitDelivered(t *testing.T, timeout time.Duration) {
 		// it is delivered yet.
 		return
 	}
+	// Only nodes whose push loop runs deliver or receive anything: a crashed
+	// or not yet started one would hold every wait to its timeout.
+	var live []*Node
+	for _, n := range c.Nodes {
+		if n.replStarted {
+			live = append(live, n)
+		}
+	}
+	if len(live) < 2 {
+		return
+	}
 	deadline := time.Now().Add(timeout)
 	for {
-		n, err := undelivered(c.Nodes)
+		n, err := undelivered(live)
 		if err == nil && n == 0 {
 			return
 		}

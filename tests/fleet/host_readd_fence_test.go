@@ -80,7 +80,7 @@ func TestFleet_ReaddedHostIsNotFencedWhileItJoins(t *testing.T) {
 	for _, n := range c.Nodes {
 		splitMembership(t, n)
 	}
-	settleLatch(t, c)
+	settleByAntiEntropy(t, c, true)
 	for _, n := range observers {
 		go health.NewChecker(n.Name, n.PKIDir, n.DB).Start(ctx)
 	}

@@ -28,7 +28,7 @@ func splitRuntime(t *testing.T, n *Node) corrosion.HostRuntimeReport {
 	// everywhere (waitDelivered): one still on the wire is absorbed by a
 	// node that latched before it arrived, at its own time, and held as a
 	// floor copy by one that latched after, and the two differ until
-	// anti-entropy (settleLatch).
+	// anti-entropy (settleByAntiEntropy).
 	if n.cluster != nil {
 		n.cluster.waitDelivered(t, convergeTimeout)
 	}
@@ -82,7 +82,7 @@ func concurrentVersionAndRegion(t *testing.T, split bool, seed int64) map[string
 		for _, n := range c.Nodes {
 			splitRuntime(t, n)
 		}
-		settleLatch(t, c)
+		settleByAntiEntropy(t, c, true)
 	}
 
 	// No relay either: with three nodes every node relays.
@@ -167,7 +167,7 @@ func TestFleet_HostRuntime_AnUnlatchedNeighboursReportIsAbsorbed(t *testing.T) {
 	c.WaitConverged(t, convergeTimeout)
 	splitRuntime(t, a)
 	splitRuntime(t, b)
-	settleLatch(t, c)
+	settleByAntiEntropy(t, c, true)
 	for _, n := range []*Node{a, b} {
 		if v := hostOn(t, n, late.Name).Version; v == "v-late-boot" {
 			t.Fatalf("%s already reads the report it has not been sent; the rest is vacuous", n.Name)
@@ -237,7 +237,7 @@ func TestFleet_HostRuntime_NothingBeforeTheLatchAndTheOldColumnsStayCurrent(t *t
 	for _, n := range c.Nodes {
 		splitRuntime(t, n)
 	}
-	settleLatch(t, c)
+	settleByAntiEntropy(t, c, true)
 	if err := corrosion.UpdateHostStartup(ctx, a.DB, a.Name, "active", "v-post", 8, 16, 64, true); err != nil {
 		t.Fatal(err)
 	}

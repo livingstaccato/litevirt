@@ -243,7 +243,7 @@ func TestReservationRecovery_DeputyReleasesForRemovedHost(t *testing.T) {
 	for _, n := range c.Nodes {
 		splitMembership(t, n)
 	}
-	settleLatch(t, c)
+	settleByAntiEntropy(t, c, true)
 	gone.Stop()
 	c.Kill(gone)
 	withOperatorPKI(t, deputy)

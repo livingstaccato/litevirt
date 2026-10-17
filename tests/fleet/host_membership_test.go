@@ -28,7 +28,7 @@ func splitMembership(t *testing.T, n *Node) corrosion.HostMembershipReport {
 	// everywhere (waitDelivered): one still on the wire is absorbed by a
 	// node that latched before it arrived, at its own time, and held as a
 	// floor copy by one that latched after, and the two differ until
-	// anti-entropy (settleLatch).
+	// anti-entropy (settleByAntiEntropy).
 	if n.cluster != nil {
 		n.cluster.waitDelivered(t, convergeTimeout)
 	}
@@ -41,43 +41,6 @@ func splitMembership(t *testing.T, n *Node) corrosion.HostMembershipReport {
 		t.Fatalf("%s: a complete split pass did not make the node live", n.Name)
 	}
 	return rep
-}
-
-// settleLatch waits, after a split pass has latched on every node, for the
-// replicas to converge, running a public anti-entropy round on every node
-// between looks, as the daemon runs one on a timer and this harness does not.
-//
-// WaitConverged before the latch is not enough. The harness registers each
-// host on every node with a hosts-only INSERT, and digests agree once every
-// node holds the winning one: a losing INSERT can still be on the wire. One
-// that reaches a node after it latched is absorbed there, at the INSERT's own
-// time, while a node that got it before its latch holds the pass's floor
-// copy. The state is the same, the updated_at is not, and only anti-entropy
-// carries the absorbed row to the others (host_membership.go names the gap).
-// Under load on kvm003 that left host_membership or host_runtime apart for
-// good: 2 minutes on, still apart; one anti-entropy round per node, converged
-// in 25 ms.
-func settleLatch(t *testing.T, c *Cluster) {
-	t.Helper()
-	ctx := context.Background()
-	deadline := time.Now().Add(convergeTimeout)
-	for {
-		apart, err := divergence(c.Nodes)
-		if err != nil {
-			t.Fatalf("divergence: %v", err)
-		}
-		if len(apart) == 0 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("replicas did not converge within %s after the latch, anti-entropy included; tables apart: %v",
-				convergeTimeout, apart)
-		}
-		for _, n := range c.Nodes {
-			corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(ctx)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
 }
 
 func hostOn(t *testing.T, n *Node, name string) *corrosion.HostRecord {
@@ -127,7 +90,7 @@ func concurrentStateAndVersion(t *testing.T, split bool) map[string][2]string {
 		for _, n := range c.Nodes {
 			splitMembership(t, n)
 		}
-		settleLatch(t, c)
+		settleByAntiEntropy(t, c, true)
 	}
 
 	// No relay either: with three nodes every node relays, so a's drain could

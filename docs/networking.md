@@ -327,7 +327,10 @@ stops waiting, undoes nothing.
 ### Per-NIC MTU
 
 A VM NIC can carry a guest MTU: `mtu:` on its network entry in compose, or
-`lv update <vm> --nic-mtu <nic>=<MTU|bridge>`.
+`lv update <vm> --nic-mtu <nic>=<MTU|bridge>`. `<nic>` is the NIC's position
+in the VM's NIC list, from 0: its NICs in ordinal order, as `lv inspect <vm>`
+lists them under `spec.network`. A NIC detached and attached again goes to the
+end of the list.
 
 | Value | Meaning |
 |---|---|

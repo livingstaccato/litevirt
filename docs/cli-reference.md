@@ -297,6 +297,15 @@ lv update <vm> [--cpu-limit CORES] [--cpu-shares N]   # noisy-neighbour limits (
 lv update <vm> --nic-rate 0=12.5 [--nic-rate 1=0]     # per-NIC bandwidth cap in MB/s, NIC numbered from 0 (live; 0 clears it)
 lv update <vm> --nic-mtu 0=9000 [--nic-mtu 1=bridge] # per-NIC MTU, NIC numbered from 0; must equal the
                                              # bridge's MTU (VM STOPPED or --restart-if-needed; 0 removes it)
+# The NIC number in --nic-rate and --nic-mtu is the NIC's position in the VM's
+# NIC list, from 0: its NICs in ordinal order, as `lv inspect <vm>` lists them
+# under spec.network. A NIC detached and attached again goes to the end of it.
+# --nic-rate needs the NIC's spec entry: give a NIC attached after the create
+# one with --nic-mtu <nic>=0. A host on an older build reads the numbers as
+# spec entries: an update reaching it through an upgraded node is translated,
+# or refused naming the host to upgrade; the CLI talking to it directly
+# refuses a number at or past the first gap in the VM's NIC numbering (a NIC
+# was detached) and sends the others.
 lv update <vm> [--cpu N] [--memory N]        # resources — VM must be STOPPED
   [--cpu-mode host-passthrough|host-model|custom] [--cpu-model <model>]
   [--disable-vnc]

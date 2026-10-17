@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -168,6 +169,9 @@ stopped or --restart-if-needed; USB devices are not hot-plugged.`,
 				}
 				req.NicMtu = append(req.NicMtu, nm)
 			}
+			// The NIC numbers are positions in the VM's NIC list, as lv
+			// inspect shows them, not spec entries.
+			req.NicByListPosition = len(req.NicRate) > 0 || len(req.NicMtu) > 0
 			// Live metadata: only send what changed (presence-detected).
 			if f.Changed("restart") || f.Changed("restart-max-attempts") ||
 				f.Changed("restart-delay") || f.Changed("restart-window") {
@@ -193,6 +197,9 @@ stopped or --restart-if-needed; USB devices are not hot-plugged.`,
 			}
 
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if err := nicNumbersForNode(ctx, c, req); err != nil {
+					return err
+				}
 				vm, err := c.UpdateVM(ctx, req)
 				if err != nil {
 					return fmt.Errorf("update VM: %w", err)
@@ -205,8 +212,8 @@ stopped or --restart-if-needed; USB devices are not hot-plugged.`,
 	}
 	cmd.Flags().Float64Var(&cpuLimit, "cpu-limit", 0, "Cap the VM's total CPU at this many host cores, fractions allowed, at most --cpu (live; 0 removes the cap)")
 	cmd.Flags().Int32Var(&cpuShares, "cpu-shares", 0, "CPU weight under contention, 1-10000: the cgroup v2 weight, Proxmox cpuunits, default 100 (live; 0 restores the default)")
-	cmd.Flags().StringArrayVar(&nicRates, "nic-rate", nil, "Cap one NIC's bandwidth, <nic>=<MB/s> with a 0-based NIC number, e.g. 0=12.5 (live; 0=0 removes it; repeatable)")
-	cmd.Flags().StringArrayVar(&nicMTUs, "nic-mtu", nil, "Set one NIC's MTU, <nic>=<MTU|bridge> with a 0-based NIC number, e.g. 0=9000; it must equal the bridge's MTU (VM must be stopped; 0=0 removes it; repeatable)")
+	cmd.Flags().StringArrayVar(&nicRates, "nic-rate", nil, "Cap one NIC's bandwidth, <nic>=<MB/s>, the NIC numbered from 0 in the order lv inspect lists them under spec.network, e.g. 0=12.5 (live; 0=0 removes it; repeatable). A node on an older build is refused a number at or past a gap in the NIC numbering (a NIC was detached)")
+	cmd.Flags().StringArrayVar(&nicMTUs, "nic-mtu", nil, "Set one NIC's MTU, <nic>=<MTU|bridge>, the NIC numbered from 0 in the order lv inspect lists them under spec.network, e.g. 0=9000; it must equal the bridge's MTU (VM must be stopped; 0=0 removes it; repeatable). A node on an older build is refused a number at or past a gap in the NIC numbering (a NIC was detached)")
 	cmd.Flags().Int32Var(&cpu, "cpu", 0, "Number of vCPUs (VM must be stopped)")
 	cmd.Flags().Int32Var(&memory, "memory", 0, "Memory in MiB (VM must be stopped)")
 	cmd.Flags().StringVar(&cpuMode, "cpu-mode", "", "CPU mode: host-passthrough|host-model|custom (VM must be stopped)")
@@ -237,6 +244,64 @@ stopped or --restart-if-needed; USB devices are not hot-plugged.`,
 	cmd.Flags().BoolVar(&clearUSB, "clear-usb", false, "Remove every USB passthrough device (VM must be stopped)")
 	usb.register(cmd)
 	return cmd
+}
+
+// nicNumbersForNode makes sure the node lv update talks to reads the NIC
+// numbers as list positions. A node whose Ping lacks nic_list_position drops
+// nic_by_list_position and reads each number N as a spec index, applying an
+// MTU or a rate to the NIC whose ordinal is N. While the VM's NIC ordinals run
+// 0..N unbroken, the N-th NIC has ordinal N and spec entry N names it, so N
+// means the same NIC either way and goes as a spec index; so does a number
+// past the list when the whole list runs unbroken. A number at or past the
+// first gap in the numbering (a NIC was detached, whether or not it was
+// attached again) is refused: that node does not expose the VM's spec order,
+// so it cannot be translated exactly for it.
+func nicNumbersForNode(ctx context.Context, c pb.LiteVirtClient, req *pb.UpdateVMRequest) error {
+	if !req.GetNicByListPosition() {
+		return nil
+	}
+	if p, err := c.Ping(ctx, &pb.PingRequest{}); err == nil && p.GetNicListPosition() {
+		return nil
+	}
+	hw, err := c.ListVMHardware(ctx, &pb.ListVMHardwareRequest{VmName: req.GetName()})
+	if err != nil {
+		return fmt.Errorf("read the NICs of %s: %w", req.GetName(), err)
+	}
+	var ords []int32
+	for _, d := range hw.GetDevices() {
+		if n := d.GetNic(); n != nil {
+			ords = append(ords, n.GetOrdinal())
+		}
+	}
+	sort.Slice(ords, func(i, j int) bool { return ords[i] < ords[j] })
+	gap := len(ords) // the first position whose ordinal is not its position
+	for i, o := range ords {
+		if int(o) != i {
+			gap = i
+			break
+		}
+	}
+	exact := func(n int32) error {
+		if int(n) < gap || (gap == len(ords) && int(n) >= len(ords)) {
+			return nil
+		}
+		return fmt.Errorf("the node this command talks to runs an older build, which reads --nic-mtu and --nic-rate "+
+			"numbers as spec entries, and NIC %d of %s is at or past a gap in its NIC numbering (a NIC was detached), "+
+			"so that number means another NIC there; run lv update against an upgraded node, or upgrade this one first",
+			n, req.GetName())
+	}
+	for _, u := range req.GetNicMtu() {
+		if err := exact(u.GetOrdinal()); err != nil {
+			return err
+		}
+	}
+	for _, u := range req.GetNicRate() {
+		if err := exact(u.GetOrdinal()); err != nil {
+			return err
+		}
+	}
+	req.NicByListPosition = false
+	return nil
 }
 
 // parseNICRate parses one --nic-rate value, "<nic>=<MB/s>".

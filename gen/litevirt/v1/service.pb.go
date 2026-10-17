@@ -5684,9 +5684,17 @@ type UpdateVMRequest struct {
 	MemoryHotplugMaxMib *int32 `protobuf:"varint,42,opt,name=memory_hotplug_max_mib,json=memoryHotplugMaxMib,proto3,oneof" json:"memory_hotplug_max_mib,omitempty"`
 	// nic_mtu sets each listed NIC's MTU (NetworkAttachment.mtu). It takes
 	// effect on the next define, like nic_queues.
-	NicMtu        []*NICMTUUpdate `protobuf:"bytes,27,rep,name=nic_mtu,json=nicMtu,proto3" json:"nic_mtu,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	NicMtu []*NICMTUUpdate `protobuf:"bytes,27,rep,name=nic_mtu,json=nicMtu,proto3" json:"nic_mtu,omitempty"`
+	// nic_by_list_position: the ordinal of every nic_queues, nic_rate and
+	// nic_mtu update names the NIC at that position in the VM's NIC list, not
+	// the entry at that position in its stored spec. lv update sets it. Unset
+	// (an older client, a stack deploy) every ordinal is a spec index, as it
+	// always was. An entry node forwards it only to an owner whose Ping
+	// advertises nic_list_position; for an older owner it translates each
+	// position to the spec index, or refuses where it cannot.
+	NicByListPosition bool `protobuf:"varint,43,opt,name=nic_by_list_position,json=nicByListPosition,proto3" json:"nic_by_list_position,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *UpdateVMRequest) Reset() {
@@ -5950,6 +5958,13 @@ func (x *UpdateVMRequest) GetNicMtu() []*NICMTUUpdate {
 	return nil
 }
 
+func (x *UpdateVMRequest) GetNicByListPosition() bool {
+	if x != nil {
+		return x.NicByListPosition
+	}
+	return false
+}
+
 // DiskTuningUpdate changes one disk's discard / detect_zeroes (an empty value
 // leaves it as stored).
 type DiskTuningUpdate struct {
@@ -6012,8 +6027,18 @@ func (x *DiskTuningUpdate) GetDetectZeroes() string {
 	return ""
 }
 
-// NICQueuesUpdate changes the virtio-net queue count of the NIC at this position
-// in the VM's spec (1 turns multiqueue off).
+// The NIC of a NICQueuesUpdate, NICRateUpdate or NICMTUUpdate is named by
+// ordinal: the index of its entry in the VM's stored spec, or, with
+// UpdateVMRequest.nic_by_list_position, its 0-based position in the VM's NIC
+// list (the VM's live NICs in ordinal order, as `lv inspect` lists them under
+// spec.network). Neither is the NIC's ordinal, which is never reused: a NIC
+// detached and attached again takes a new one. By position, the owner finds
+// the NIC's spec entry by its MAC (an entry that records no MAC, by the NIC's
+// ordinal), and a position past the end of the list names the spec entry at
+// that index when no live NIC carries it.
+//
+// NICQueuesUpdate changes one NIC's virtio-net queue count (1 turns
+// multiqueue off).
 type NICQueuesUpdate struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Ordinal       int32                  `protobuf:"varint,1,opt,name=ordinal,proto3" json:"ordinal,omitempty"`
@@ -6066,8 +6091,7 @@ func (x *NICQueuesUpdate) GetQueues() int32 {
 	return 0
 }
 
-// NICRateUpdate sets (or, at 0, clears) one NIC's bandwidth cap in MB/s. The NIC
-// is named by its 0-based position in the VM's interface list.
+// NICRateUpdate sets (or, at 0, clears) one NIC's bandwidth cap in MB/s.
 type NICRateUpdate struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Ordinal       int32                  `protobuf:"varint,1,opt,name=ordinal,proto3" json:"ordinal,omitempty"`
@@ -6120,8 +6144,7 @@ func (x *NICRateUpdate) GetRateMbSec() float64 {
 	return 0
 }
 
-// NICMTUUpdate sets one NIC's MTU by its 0-based position in the VM's
-// interface list: 0 removes it, 1 means the bridge's MTU.
+// NICMTUUpdate sets one NIC's MTU: 0 removes it, 1 means the bridge's MTU.
 type NICMTUUpdate struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Ordinal       int32                  `protobuf:"varint,1,opt,name=ordinal,proto3" json:"ordinal,omitempty"`
@@ -31656,9 +31679,13 @@ type PingResponse struct {
 	// runs hooks and records the operator stop). An older owner ignores the field,
 	// so a caller that needs the stop first (lv rm --force, a forwarding entry
 	// node) sends StopVM{force} itself when this is false.
-	DeleteForce   bool `protobuf:"varint,12,opt,name=delete_force,json=deleteForce,proto3" json:"delete_force,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	DeleteForce bool `protobuf:"varint,12,opt,name=delete_force,json=deleteForce,proto3" json:"delete_force,omitempty"`
+	// nic_list_position: this build reads UpdateVMRequest.nic_by_list_position.
+	// An older owner ignores the field and reads every NIC ordinal as a spec
+	// index, so an entry node translates the positions for it, or refuses.
+	NicListPosition bool `protobuf:"varint,14,opt,name=nic_list_position,json=nicListPosition,proto3" json:"nic_list_position,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *PingResponse) Reset() {
@@ -31771,6 +31798,13 @@ func (x *PingResponse) GetMigratePreconditions() bool {
 func (x *PingResponse) GetDeleteForce() bool {
 	if x != nil {
 		return x.DeleteForce
+	}
+	return false
+}
+
+func (x *PingResponse) GetNicListPosition() bool {
+	if x != nil {
+		return x.NicListPosition
 	}
 	return false
 }
@@ -43639,7 +43673,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x10RebuildVMRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"+\n" +
 	"\x10CutoverVMRequest\x12\x17\n" +
-	"\avm_name\x18\x01 \x01(\tR\x06vmName\"\x87\f\n" +
+	"\avm_name\x18\x01 \x01(\tR\x06vmName\"\xb8\f\n" +
 	"\x0fUpdateVMRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
 	"\x03cpu\x18\x02 \x01(\x05R\x03cpu\x12\x1d\n" +
@@ -43683,7 +43717,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"usbDevices\x12&\n" +
 	"\x0fset_usb_devices\x18) \x01(\bR\rsetUsbDevices\x128\n" +
 	"\x16memory_hotplug_max_mib\x18* \x01(\x05H\rR\x13memoryHotplugMaxMib\x88\x01\x01\x122\n" +
-	"\anic_mtu\x18\x1b \x03(\v2\x19.litevirt.v1.NICMTUUpdateR\x06nicMtuB\t\n" +
+	"\anic_mtu\x18\x1b \x03(\v2\x19.litevirt.v1.NICMTUUpdateR\x06nicMtu\x12/\n" +
+	"\x14nic_by_list_position\x18+ \x01(\bR\x11nicByListPositionB\t\n" +
 	"\a_onbootB\x10\n" +
 	"\x0e_startup_orderB\x12\n" +
 	"\x10_start_delay_secB\x11\n" +
@@ -45811,7 +45846,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"LOCALIZING\x10\x04\x12\b\n" +
 	"\x04DONE\x10\x05\"\r\n" +
-	"\vPingRequest\"\xd8\x03\n" +
+	"\vPingRequest\"\x84\x04\n" +
 	"\fPingResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x12%\n" +
@@ -45826,7 +45861,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x10voter_generation\x18\n" +
 	" \x01(\x03R\x0fvoterGeneration\x123\n" +
 	"\x15migrate_preconditions\x18\v \x01(\bR\x14migratePreconditions\x12!\n" +
-	"\fdelete_force\x18\f \x01(\bR\vdeleteForce\"\x0e\n" +
+	"\fdelete_force\x18\f \x01(\bR\vdeleteForce\x12*\n" +
+	"\x11nic_list_position\x18\x0e \x01(\bR\x0fnicListPosition\"\x0e\n" +
 	"\fReadyRequest\"\xf3\x01\n" +
 	"\rReadyResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x14\n" +

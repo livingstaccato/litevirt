@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"os"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -57,5 +59,76 @@ func assertSignalDrained(t *testing.T, sig syscall.Signal) {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("%v was never delivered to the drain; if the handler is not installed "+
 			"this test does not fail here — the process is killed outright", sig)
+	}
+}
+
+type capturedRecord struct {
+	level slog.Level
+	msg   string
+	attrs map[string]any
+}
+
+type captureHandler struct {
+	mu   sync.Mutex
+	recs []capturedRecord
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h *captureHandler) WithGroup(string) slog.Handler            { return h }
+func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	rec := capturedRecord{level: r.Level, msg: r.Message, attrs: map[string]any{}}
+	r.Attrs(func(a slog.Attr) bool { rec.attrs[a.Key] = a.Value.Any(); return true })
+	h.mu.Lock()
+	h.recs = append(h.recs, rec)
+	h.mu.Unlock()
+	return nil
+}
+
+// A peer's readiness probe resets the socket before our close_notify, so SIGPIPE
+// arrives about five times a minute per node. A burst must produce one summary
+// line carrying the count, not one WARN per signal; SIGHUP stays a WARN each time.
+func TestSignalLogger_SIGPIPEIsSummarisedAndSIGHUPIsNot(t *testing.T) {
+	h := &captureHandler{}
+	now := time.Unix(1000, 0)
+	l := newSignalLogger(slog.New(h), func() time.Time { return now })
+
+	for i := 0; i < 7; i++ {
+		l.observe(syscall.SIGPIPE)
+	}
+	l.observe(syscall.SIGHUP)
+	l.observe(syscall.SIGHUP)
+
+	if len(h.recs) != 2 {
+		t.Fatalf("got %d records inside the window, want only the 2 SIGHUP warnings: %+v", len(h.recs), h.recs)
+	}
+	for _, r := range h.recs {
+		if r.level != slog.LevelWarn || r.attrs["signal"] != syscall.SIGHUP.String() {
+			t.Fatalf("SIGHUP record = %+v, want WARN with signal=hangup", r)
+		}
+	}
+
+	now = now.Add(sigpipeSummaryInterval + time.Second)
+	l.observe(syscall.SIGPIPE)
+	if len(h.recs) != 3 {
+		t.Fatalf("got %d records after the window, want exactly one summary: %+v", len(h.recs), h.recs)
+	}
+	sum := h.recs[2]
+	if sum.level != slog.LevelInfo || sum.attrs["count"] != int64(8) {
+		t.Fatalf("summary = %+v, want INFO with count=8", sum)
+	}
+
+	// The window restarts: another signal right away is counted, not logged.
+	l.observe(syscall.SIGPIPE)
+	if len(h.recs) != 3 {
+		t.Fatalf("second summary inside the window: %+v", h.recs)
+	}
+	l.flush()
+	if len(h.recs) != 4 || h.recs[3].attrs["count"] != int64(1) {
+		t.Fatalf("flush = %+v, want one summary with count=1", h.recs)
+	}
+	l.flush()
+	if len(h.recs) != 4 {
+		t.Fatalf("flush with nothing pending logged: %+v", h.recs)
 	}
 }

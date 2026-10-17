@@ -78,6 +78,12 @@ const (
 	// and every receiver; it retires the host's fence credential row with it
 	// (host_readmit.go).
 	DispHostReadmit Disposition = "host_readmit"
+	// DispSpecGeneration is a VM desired-spec edit — the epoch-carrying
+	// out-of-band edit, and an operation's claim once spec_conflict_v1 is
+	// active — applied as DispLiveRowUpdate, except that an edit meeting
+	// another at its generation is resolved as anti-entropy resolves it
+	// instead of missing its compare-and-swap (spec_conflict_apply.go).
+	DispSpecGeneration Disposition = "spec_generation"
 	// DispReject always back-pressures. Used as the BEFORE-activation disposition of a
 	// capability-gated shape (RequiresCapability + DispositionAfter): the shape is not authorized
 	// until its capability is active on this receiver, so a prematurely-emitted write fails closed.

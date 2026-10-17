@@ -236,11 +236,20 @@ func TestTagGroup_TagRmRemovesTheMember(t *testing.T) {
 	tgEverywhere(t, c, "web", ip, false)
 }
 
-// R1-I1: node-1's replication is cut. node-0 (the owner) removes role=web
-// from app-1; node-1, still holding the tagged view, runs `lv update
-// --cpu-limit 1` and SetVMLabels on app-1. Once replication resumes, no node
-// holds app-1's address in lv_tg_web, and the tags row still says removed:
-// no spec write carries membership back.
+// R1-I1: node-1 is cut off. node-0 (the owner) removes role=web from app-1;
+// node-1, still holding the tagged view, runs SetVMLabels on app-1. Once
+// replication resumes, node-1's label is kept everywhere, yet no node holds
+// app-1's address in lv_tg_web, and the tags row still says removed: no spec
+// write carries membership back.
+//
+// A spec edit entered off the owner is made on the owner while it can be
+// reached (grpcapi/spec_owner.go), so the owner is cut off from node-1
+// entirely: that is what still makes the edit over node-1's own, lagging
+// view. `lv update` is not part of it any more: UpdateVM always runs on the
+// owner and refuses when it cannot reach it, so it never writes over a
+// lagging view, and an update the owner made during the cut, an operation
+// at the next generation, outranks the lagging label edit, which is then
+// dropped and proves nothing here.
 //
 // Mutation: SetVMLabels writes the tags its replica holds back with the
 // spec (tags stored with the spec) — node-1's write re-admits app-1: red.
@@ -251,23 +260,13 @@ func TestTagGroup_ALaggingSpecWriteDoesNotReAdmitARemovedMember(t *testing.T) {
 	ip := tgVM(t, c, a, "app-1", "52:54:00:7a:00:04")
 	id := tagVia(t, c, a, "vm", "app-1", "")
 	tgEverywhere(t, c, "web", ip, true)
-	// A first cpu limit records vm_limits' use on every host while all are
-	// reachable: a first use needs every host's acknowledgement.
-	half := 0.5
-	if _, err := c.SelfClient(a).UpdateVM(ctx, &pb.UpdateVMRequest{Name: "app-1", CpuLimit: &half}); err != nil {
-		t.Fatalf("a first cpu limit: %v", err)
-	}
-	c.WaitConverged(t, convergeTimeout)
 
 	c.Isolate(b)
 	tagRm(t, c, a, "vm", "app-1", "", "role")
 	if !slices.Contains(tgSet(t, b, "web"), ip) {
 		t.Fatalf("premise: %s, cut off, still holds app-1 in lv_tg_web", b.Name)
 	}
-	one := 1.0
-	if _, err := c.SelfClient(b).UpdateVM(ctx, &pb.UpdateVMRequest{Name: "app-1", CpuLimit: &one}); err != nil {
-		t.Fatalf("lv update app-1 --cpu-limit 1 via %s: %v", b.Name, err)
-	}
+	c.SetLinkFaultBoth(a, b, LinkFault{Block: true, BlockAll: true})
 	if _, err := c.SelfClient(b).SetVMLabels(ctx, &pb.SetVMLabelsRequest{Name: "app-1", Labels: map[string]string{"tier": "front"}}); err != nil {
 		t.Fatalf("SetVMLabels via %s: %v", b.Name, err)
 	}
@@ -277,6 +276,14 @@ func TestTagGroup_ALaggingSpecWriteDoesNotReAdmitARemovedMember(t *testing.T) {
 	}
 
 	c.ClearLinkFaults()
+	// node-1's lagging write is kept everywhere: what follows is about a spec
+	// write that landed, not one that was dropped on the way.
+	for _, n := range c.Nodes {
+		eventually(t, convergeTimeout, n.Name+" to hold node-1's label", func() bool {
+			vm, _ := corrosion.GetVM(ctx, n.DB, "app-1")
+			return vm != nil && strings.Contains(vm.Spec, `"tier"`)
+		})
+	}
 	for _, n := range c.Nodes {
 		eventually(t, convergeTimeout, n.Name+" to hold app-1 out of lv_tg_web and its tags row removed", func() bool {
 			rec, ok := tagsRowOn(t, n, corrosion.TagMemberVM, id)
@@ -295,13 +302,17 @@ func TestTagGroup_ALaggingSpecWriteDoesNotReAdmitARemovedMember(t *testing.T) {
 	}
 }
 
-// Track D final review I-1: app-1 has no identity yet and node-1 is cut off.
-// A tag set on node-0 (the owner) mints the identity into the spec; node-1,
-// which never saw that write, runs SetVMLabels over its own view. Once
-// replication resumes, anti-entropy settles the row by its clock and node-1's
-// later spec wins, so the identity is gone cluster-wide. app-1 is then held at drop on the network its group binds
-// security groups on, the identity_lost condition is critical, and the
-// orphan sweep keeps its tags row past the 24 h grace.
+// Track D final review I-1: app-1 has no identity yet and node-1 is cut off,
+// from node-0 (the owner) entirely, so its spec edits are made on its own
+// view rather than forwarded to the owner (grpcapi/spec_owner.go). A tag set
+// on node-0 mints the identity into the spec; node-1, which never saw that
+// write, runs SetVMLabels over its own view twice. Once replication resumes,
+// node-1's line of edits reaches the later generation and is kept, so the
+// identity is gone cluster-wide. (One edit no longer erases it: a sibling of
+// the mint at its generation keeps the minted identity, spec_conflict.) app-1
+// is then held at drop on the network its group binds security groups on,
+// the identity_lost condition is critical, and the orphan sweep keeps its
+// tags row past the 24 h grace.
 //
 // Mutations: no hold for a lost identity (tagPass.hold) — red; raise
 // identity_lost as a warning — red; sweep a row whose name a live workload
@@ -330,21 +341,26 @@ func TestTagGroup_ALabelEditThroughALaggingNodeHoldsTheVMWhoseIdentityItErased(t
 	if vm, _ := corrosion.GetVM(ctx, b.DB, "app-1"); vm == nil || corrosion.FirewallIDOf(corrosion.TagMemberVM, vm.Spec) != "" {
 		t.Fatalf("premise: %s, cut off, has not seen the mint: %+v", b.Name, vm)
 	}
-	if _, err := c.SelfClient(b).SetVMLabels(ctx, &pb.SetVMLabelsRequest{Name: "app-1", Labels: map[string]string{"tier": "front"}}); err != nil {
-		t.Fatalf("SetVMLabels via %s: %v", b.Name, err)
+	c.SetLinkFaultBoth(a, b, LinkFault{Block: true, BlockAll: true})
+	for _, labels := range []map[string]string{{"tier": "front"}, {"tier": "front", "zone": "z1"}} {
+		if _, err := c.SelfClient(b).SetVMLabels(ctx, &pb.SetVMLabelsRequest{Name: "app-1", Labels: labels}); err != nil {
+			t.Fatalf("SetVMLabels %v via %s: %v", labels, b.Name, err)
+		}
+	}
+	if vm, _ := corrosion.GetVM(ctx, b.DB, "app-1"); vm == nil || !strings.Contains(vm.Spec, `"zone"`) {
+		t.Fatalf("premise: %s made both label edits over its own view: %+v", b.Name, vm)
 	}
 	c.ClearLinkFaults()
 	time.Sleep(2 * time.Second)
-	// The WAL lane applies neither edit over the other (each is guarded by the
-	// generation it was made at); anti-entropy settles the row by its clock,
-	// and node-1's edit is the later one.
+	// node-1's line of two edits reaches a later generation than the mint, so
+	// it is kept on both lanes.
 	for _, n := range c.Nodes {
 		corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(ctx)
 	}
 	for _, n := range c.Nodes {
 		eventually(t, convergeTimeout, n.Name+" to hold node-1's spec, with no identity", func() bool {
 			vm, _ := corrosion.GetVM(ctx, n.DB, "app-1")
-			return vm != nil && strings.Contains(vm.Spec, `"tier"`) && corrosion.FirewallIDOf(corrosion.TagMemberVM, vm.Spec) == ""
+			return vm != nil && strings.Contains(vm.Spec, `"zone"`) && corrosion.FirewallIDOf(corrosion.TagMemberVM, vm.Spec) == ""
 		})
 	}
 	if rec, ok := tagsRowOn(t, a, corrosion.TagMemberVM, id); !ok || !maps.Equal(rec.Tags, webTags) {

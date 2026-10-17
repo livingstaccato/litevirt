@@ -260,6 +260,9 @@ type Node struct {
 	Net                *NetProvFake      // per-node network provisioner: what this node set up, on which device
 	GRPCSrv            *grpc.Server
 	Listener           net.Listener
+	// portHold keeps Port reserved while the node is stopped (port_hold.go).
+	portHold func()
+	heldPort int
 	// peerConn caches a self-loopback client for scenario assertions
 	// that want to call this node's RPCs from the test thread.
 	selfConn *grpc.ClientConn
@@ -637,6 +640,7 @@ func (c *Cluster) Stop() {
 		if n.Listener != nil {
 			_ = n.Listener.Close()
 		}
+		n.releasePortHold()
 		if n.DB != nil {
 			if c.beforeDependencyClose != nil {
 				c.beforeDependencyClose(n)

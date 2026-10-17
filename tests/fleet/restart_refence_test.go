@@ -152,6 +152,21 @@ func (f *restartFleet) fences() []time.Time {
 func (f *restartFleet) restart(t *testing.T) time.Time {
 	t.Helper()
 	ctx := context.Background()
+	f.gracefulStop(t)
+	booted := time.Now()
+	if err := corrosion.UpdateHostStartup(ctx, f.d.DB, f.d.Name, "active", "", 0, 0, 0, false); err != nil {
+		t.Fatalf("boot write: %v", err)
+	}
+	return booted
+}
+
+// gracefulStop is restart up to the boot write: d's SIGTERM records it
+// 'upgrading', and every observer counts it failing past the fence threshold.
+// It returns when the 'upgrading' write was made.
+func (f *restartFleet) gracefulStop(t *testing.T) time.Time {
+	t.Helper()
+	ctx := context.Background()
+	stopped := time.Now()
 	if err := corrosion.UpdateHostState(ctx, f.d.DB, f.d.Name, "upgrading"); err != nil {
 		t.Fatalf("SIGTERM's 'upgrading' write: %v", err)
 	}
@@ -176,11 +191,7 @@ func (f *restartFleet) restart(t *testing.T) time.Time {
 	if n := len(f.fences()); n != 0 {
 		t.Fatalf("fixture: d was fenced %d times while it was recorded 'upgrading'", n)
 	}
-	booted := time.Now()
-	if err := corrosion.UpdateHostStartup(ctx, f.d.DB, f.d.Name, "active", "", 0, 0, 0, false); err != nil {
-		t.Fatalf("boot write: %v", err)
-	}
-	return booted
+	return stopped
 }
 
 // TestFleet_RestartedHostIsNotFencedBeforeItServes: d restarts, its boot write
@@ -220,21 +231,37 @@ func TestFleet_RestartedHostIsNotFencedBeforeItServes(t *testing.T) {
 // TestFleet_RestartedHostThatNeverServesIsFenced: the other half. d's boot
 // write records it 'active' and it never answers. It is a failed host like any
 // other and is fenced, once it has failed a whole run of probes since the
-// activation.
+// activation and its restart allowance, timed from its 'upgrading' write, has
+// passed: its observers' run began while it was 'upgrading'.
 //
-// Mutation: discard every failing run that began before the activation, with
+// Mutations: discard every failing run that began before the activation, with
 // no allowance for its length since — the observers' runs never break, so d
-// is never fenced.
+// is never fenced; drop the restart allowance of a run begun while 'upgrading'
+// (failover.upgradingLifeGrace) — d is fenced inside it; cap that allowance
+// 15 s late — d is fenced past the 8 s slack.
 func TestFleet_RestartedHostThatNeverServesIsFenced(t *testing.T) {
-	f := newRestartFleet(t, 3402)
+	const allowance = 40 * time.Second
+	f := newRestartFleet(t, 3402, func(c *failover.Coordinator) { c.UpgradingTimeout = allowance })
+	stopped := time.Now()
 	booted := f.restart(t)
-	eventually(t, convergeTimeout, "the coordinator to fence the restarted host that does not answer", func() bool {
+	eventually(t, allowance+convergeTimeout, "the coordinator to fence the restarted host that does not answer", func() bool {
 		return len(f.fences()) > 0
 	})
 	first := f.fences()[0]
 	if grace := time.Duration(health.FailuresToFence-1) * health.ProbeInterval; first.Sub(booted) < grace {
 		t.Fatalf("d was fenced %s after its boot write, inside the %s its observers need to count it down afresh",
 			first.Sub(booted).Round(time.Millisecond), grace)
+	}
+	if first.Sub(stopped) < allowance {
+		t.Fatalf("d was fenced %s after its 'upgrading' write, inside its %s restart allowance",
+			first.Sub(stopped).Round(time.Millisecond), allowance)
+	}
+	// And no later than the allowance's end, give or take the probes and
+	// cycles that observe it: the guard never fences later than a host
+	// stuck 'upgrading' is.
+	if slack := 4 * health.ProbeInterval; first.Sub(stopped) > allowance+slack {
+		t.Fatalf("d was fenced %s after its 'upgrading' write, more than %s past its %s restart allowance",
+			first.Sub(stopped).Round(time.Millisecond), slack, allowance)
 	}
 }
 

@@ -55,7 +55,9 @@ import (
 //     it is gone, and its entry goes;
 //   - removes the VM's own cloud-init seed: one stamped with the deleted VM's
 //     spec uuid (cloudinit/seed_owner.go), and only while no domain of the
-//     name is live here. An unstamped seed (written before seeds were
+//     name is live here, and only when the delete kept no disk here: after
+//     `lv rm --keep-disks`, or with a disk left at its path as one the delete
+//     kept, the seed is kept with them. An unstamped seed (written before seeds were
 //     stamped), or one of another VM of the name, is left alone, and is never
 //     reused by another VM;
 //   - resolves the record. It stays open while the disk at its path cannot be
@@ -83,6 +85,10 @@ func (r *Reconciler) tendDeletedVMStranded(ctx context.Context, name string, ev 
 	}
 	var recorded, keptByDelete map[string]bool
 	var kept []StrandedDisk
+	// deleteKept: the delete kept the VM's disks here (--keep-disks), or a
+	// disk is left at its path as one it may have kept. The seed is then
+	// kept too.
+	deleteKept := ev.KeptByDelete
 	for _, d := range ev.Disks {
 		if d.Copy != "" {
 			continue // the retention sweep's
@@ -104,6 +110,7 @@ func (r *Reconciler) tendDeletedVMStranded(ctx context.Context, name string, ev 
 		// of the name on this host moves it rather than clear it
 		// (SetAsideBeforeCreate).
 		leave := func(why string) {
+			deleteKept = true
 			if err := NoteKeptDisks(r.dataDir, name, []string{filepath.Clean(d.Path)}); err != nil {
 				slog.Warn("reconciler: could not note a disk a delete kept; its record stays open", "vm", name, "path", d.Path, "error", err)
 				kept = append(kept, d)
@@ -139,7 +146,7 @@ func (r *Reconciler) tendDeletedVMStranded(ctx context.Context, name string, ev 
 				"vm", name, "disk", d.Disk, "path", d.Path, "set_aside_to", set.Copy)
 		}
 	}
-	if r.domainAbsentOrDeadLeftover(name) {
+	if !deleteKept && r.domainAbsentOrDeadLeftover(name) {
 		r.removeDeletedVMSeed(name, cloudinit.SpecUUID(spec))
 	}
 	if len(kept) == 0 {

@@ -21,16 +21,38 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-func newGossipClient(t *testing.T, name, bind, advertise string, port int, join []string) *Client {
+// newClientOnFreePort runs NewClient with cfg on a port freePort picks, and on
+// another one when that bind is refused as in use. freePort only proves a port
+// was free for TCP on 127.0.0.1 a moment ago; memberlist binds TCP and UDP on
+// cfg.BindAddr afterwards, so another socket -- this binary's other nodes, a
+// parallel package, anything on the machine -- can hold either one by then.
+// cfg.BindPort is ignored. An empty cfg.DataDir gets a fresh directory per
+// attempt (a refused bind closes what NewClient opened). The port the client
+// got is c.list.LocalNode().Port. Any other error, or the last attempt's, is
+// returned for the caller to judge.
+func newClientOnFreePort(t *testing.T, cfg Config) (*Client, error) {
 	t.Helper()
-	c, err := NewClient(Config{
+	freshDir := cfg.DataDir == ""
+	for attempt := 1; ; attempt++ {
+		if freshDir {
+			cfg.DataDir = t.TempDir()
+		}
+		cfg.BindPort = freePort(t)
+		c, err := NewClient(cfg, hlc.NewClock(cfg.HostName))
+		if err == nil || attempt == 8 || !strings.Contains(err.Error(), "address already in use") {
+			return c, err
+		}
+	}
+}
+
+func newGossipClient(t *testing.T, name, bind, advertise string, join []string) *Client {
+	t.Helper()
+	c, err := newClientOnFreePort(t, Config{
 		HostName:      name,
-		DataDir:       t.TempDir(),
 		BindAddr:      bind,
 		AdvertiseAddr: advertise,
-		BindPort:      port,
 		JoinPeers:     join,
-	}, hlc.NewClock(name))
+	})
 	if err != nil {
 		t.Fatalf("NewClient %s: %v", name, err)
 	}
@@ -49,17 +71,14 @@ func newGossipClient(t *testing.T, name, bind, advertise string, port int, join 
 // can advertise an address that is real but wrong, and the only place that shows
 // up is in what the peer received.
 func TestAdvertiseAddr_IsWhatPeersSee(t *testing.T) {
-	portA := freePort(t)
-	portB := freePort(t)
-
 	// node-a binds ALL interfaces so memberlist's auto-detection would pick this
 	// host's real private IP, then overrides it with an advertise address that
 	// auto-detection could never produce. Binding 127.0.0.1 instead would make
 	// this test vacuous: auto-detect derives the advertise address from a
 	// specific BindAddr, so it would report 127.0.0.1 with the wiring removed too.
-	a := newGossipClient(t, "node-a", "0.0.0.0", "127.0.0.1", portA, nil)
-	_ = a
-	b := newGossipClient(t, "node-b", "127.0.0.1", "127.0.0.1", portB,
+	a := newGossipClient(t, "node-a", "0.0.0.0", "127.0.0.1", nil)
+	portA := int(a.list.LocalNode().Port)
+	b := newGossipClient(t, "node-b", "127.0.0.1", "127.0.0.1",
 		[]string{net.JoinHostPort("127.0.0.1", itoa(portA))})
 
 	// Gossip converges asynchronously.

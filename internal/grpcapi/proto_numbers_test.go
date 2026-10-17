@@ -32,6 +32,8 @@ func TestProtoNumbers_TheIntegratedBranchesDoNotCollide(t *testing.T) {
 		{&pb.StoragePoolContent{}, 6, "replica_vm"},
 		{&pb.StoragePoolContent{}, 7, "replica_disk"},
 		{&pb.StoragePoolContent{}, 8, "replica_taken"},
+		{&pb.UpdateVMRequest{}, 43, "nic_by_list_position"},
+		{&pb.PingResponse{}, 14, "nic_list_position"},
 	}
 	for _, f := range fields {
 		md := f.msg.ProtoReflect().Descriptor()
@@ -290,6 +292,27 @@ func TestProtoNumbers_FirewallExtras(t *testing.T) {
 	for _, rpc := range firewallExtrasRPCs() {
 		if svc.Methods().ByName(protoreflect.Name(rpc)) == nil {
 			t.Errorf("RPC %s is missing", rpc)
+		}
+	}
+}
+
+// The scoped operation abort and the Ping bit that gates it keep their numbers;
+// abort_scoped follows delete_force, the last PingResponse feature bit.
+func TestProtoNumbers_ScopedOperationAbort(t *testing.T) {
+	fields := []struct {
+		msg  protoreflect.ProtoMessage
+		num  protoreflect.FieldNumber
+		name protoreflect.Name
+	}{
+		{&pb.AbortVMOperationRequest{}, 3, "operation_id"},
+		{&pb.PingResponse{}, 12, "delete_force"},
+		{&pb.PingResponse{}, 13, "abort_scoped"},
+	}
+	for _, f := range fields {
+		md := f.msg.ProtoReflect().Descriptor()
+		fd := md.Fields().ByNumber(f.num)
+		if fd == nil || fd.Name() != f.name {
+			t.Errorf("%s field %d is %v, want %s", md.FullName(), f.num, fd, f.name)
 		}
 	}
 }

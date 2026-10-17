@@ -482,3 +482,32 @@ func TestListHosts_ReturnsLabels(t *testing.T) {
 		t.Errorf("node-1 labels = %v, want none", got["node-1"])
 	}
 }
+
+// A removed host never resolves the held-line conditions it raised, so its
+// removal does; another host's stay as they are.
+func TestRemoveHost_ResolvesTheHostsHeldLineConditions(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	insertTestHost(t, ctx, s.db, "gone-host", "active")
+	raise := func(subject string) {
+		t.Helper()
+		if err := corrosion.UpsertHealthCondition(ctx, s.db, corrosion.HealthCondition{
+			Evaluator: "spec_conflict", Code: corrosion.SpecEditHeldCode, SubjectKind: "vm", SubjectID: subject,
+			Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityWarning,
+			Evidence: `{"vm":"vm1","operation":"op-1","owner":"n1"}`, ObserveCount: 2,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raise("vm1@gone-host")
+	raise("vm1@other-host")
+	if _, err := s.RemoveHost(ctx, &pb.RemoveHostRequest{Name: "gone-host"}); err != nil {
+		t.Fatalf("RemoveHost: %v", err)
+	}
+	for subject, want := range map[string]string{"vm1@gone-host": corrosion.ConditionResolved, "vm1@other-host": corrosion.ConditionConfirmed} {
+		row, found, err := corrosion.GetHealthCondition(ctx, s.db, "spec_conflict", corrosion.SpecEditHeldCode, "vm", subject)
+		if err != nil || !found || row.Lifecycle != want {
+			t.Errorf("%s: %+v found=%v err=%v; want %s", subject, row.Lifecycle, found, err, want)
+		}
+	}
+}

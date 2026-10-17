@@ -39,9 +39,12 @@ Six guarantees the upgrade pipeline enforces:
    restart isn't mistaken for a failure either. Failover coordinators on peer
    hosts skip fence candidacy for `upgrading` hosts, but only up to a timeout
    (2 min): a host that entered `upgrading` and never came back is still fenced,
-   so its VMs aren't stranded. The new daemon transitions back to `active` on
-   healthy startup, and a host left `offline` by a transient blip is
-   auto-recovered to `active` once a fresh quorum sees it healthy.
+   so its VMs aren't stranded. A failing run that began while the host was
+   `upgrading` keeps the rest of those 2 minutes even if the host is recorded
+   `active` before it serves, if the failover leader saw it `upgrading`. The
+   new daemon transitions back to `active` on healthy startup, and a host
+   left `offline` by a transient blip is auto-recovered to `active` once a
+   fresh quorum sees it healthy.
 
 3. **Auto-rollback on a panicking binary.** If the new daemon panics
    past systemd's `StartLimitBurst=10` within 5 minutes, the
@@ -774,16 +777,20 @@ lv host upgrade host-01 --binary ./bin/litevirt --yes
 cp litevirt.new /usr/local/bin/litevirt && systemctl restart litevirt
 ```
 
-A bare `systemctl restart` bypasses the `upgrading` state that
-`lv host upgrade` sets. The failover **leader** sees the host vanish for a
-few seconds and opens a fence against it. The fence usually can't complete
-(SSH-poweroff fails), so it lingers as a stale `partial` record — and a
-stale fence record on the leader then *blocks the leader's own upgrade*
-(`leader-with-pending-fence`). Always upgrade through `lv host upgrade`,
-which marks the host `upgrading` (the coordinator skips `offline`,
-`maintenance`, `fenced`, and `upgrading` hosts). If you must hand-restart a
-host, put it in maintenance first (`lv host drain <host>`), restart, then
-return it.
+A bare `systemctl restart` gets only guarantee 2: the SIGTERM records the
+host `upgrading`, and the failover coordinators skip it for 2 minutes from
+that write. **A daemon stopped for longer than that without a drain gets its
+host fenced**: powered off, with its VMs recovered elsewhere. That holds
+whoever records the host `active` meanwhile: a failing run that began while
+the host was `upgrading` keeps the rest of those 2 minutes, and a host that
+still does not answer when they end is fenced. The run keeps them only if the
+failover leader saw the host `upgrading`; a leader that did not (it took over
+meanwhile) allows 13 s from the activation
+([migration-failover.md](migration-failover.md)). The restarted daemon records
+the host `active` itself once it serves; `lv host undrain` is refused while it
+does not answer. Always upgrade through `lv host upgrade`. If you must
+hand-restart a host, or stop its daemon for longer, put it in maintenance
+first (`lv host drain <host>`), restart, then return it.
 
 **Overriding a stale block.** `--force` is sent to the daemon, so a
 genuinely-stale server-side block can be overridden:
@@ -1397,6 +1404,27 @@ it clears the demotion at once for the whole cluster and, with a hold, keeps
 the lease holder from demoting the host again until the hold runs out. A
 binary rolled back below the latched token enters WAL quarantine, as below
 every latched token. Roll forward.
+
+### Concurrent spec edits are resolved after the roll
+
+Two edits of one VM's spec made from the same generation, one on each side of
+a partition, used to leave each host holding whichever reached it first until
+anti-entropy kept the newer one. A spec edit entering on a host that does not
+own the VM is now made on the owner, which serialises them; an owner that
+cannot be reached still takes the edit where it entered. Once the
+`spec_conflict_v1` capability token has latched — on its own, once every host
+the cluster replicates to, including one parked in `maintenance`, runs this
+release — an edit also carries the owner epoch it was made at, a statement a
+host on the previous release cannot decode, records in the spec (`spec_edit`)
+when it was made and the content it was made from, and every host resolves
+two edits at one generation the same way (see
+[operating-model.md](operating-model.md#replication)). Until then edits are
+replicated exactly as before.
+
+`spec_conflict_v1` is mandatory and replication-gated, with no flag: every
+host must resolve one conflict the same way. A binary rolled back below the
+latched token enters WAL quarantine, as below every latched token. Roll
+forward.
 
 ### Console passwords start after the roll
 

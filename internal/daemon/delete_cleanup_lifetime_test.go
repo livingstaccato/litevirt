@@ -6,6 +6,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/tests/fleet"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -17,9 +18,12 @@ func TestDaemonDeleteCleanup_AllStopTriggersHoldDependencyCleanup(t *testing.T) 
 	for _, trigger := range []string{"context", "reexec", "shutdown"} {
 		t.Run(trigger, func(t *testing.T) {
 			entered, release, exited, draining := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
-			var once, drainOnce sync.Once
+			var once, entryOnce, drainOnce sync.Once
+			var exits atomic.Int32
+			const nodes = 3
+			const children = nodes - 1 // The planner targets both other active hosts.
 			unpark := func() { once.Do(func() { close(release) }) }
-			f := fleet.New(t, fleet.Options{Nodes: 3, IndependentReplicas: true, DBWorkerEvent: func(host string, _ context.Context, worker, event string) {
+			f := fleet.New(t, fleet.Options{Nodes: nodes, IndependentReplicas: true, DBWorkerEvent: func(host string, _ context.Context, worker, event string) {
 				if host != "node-0" {
 					return
 				}
@@ -31,18 +35,30 @@ func TestDaemonDeleteCleanup_AllStopTriggersHoldDependencyCleanup(t *testing.T) 
 					return
 				}
 				if event == "entry" {
-					close(entered)
+					entryOnce.Do(func() { close(entered) })
 					<-release
 				}
-				if event == "exit" {
+				if event == "exit" && exits.Add(1) == children {
 					close(exited)
 				}
 			}})
-			// Runs before fleet's cleanup even if an assertion fails.
-			t.Cleanup(unpark)
 			n := f.Nodes[0]
 			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
+			coordinatorDone := make(chan struct{})
+			coordinatorStarted := false
+			// Registered before fatal assertions; release and join before fleet
+			// closes the dependencies, including a failed assertion after launch.
+			t.Cleanup(func() {
+				unpark()
+				cancel()
+				if coordinatorStarted {
+					select {
+					case <-coordinatorDone:
+					case <-time.After(10 * time.Second):
+						t.Error("coordinator did not exit during fixture cleanup")
+					}
+				}
+			})
 			if err := corrosion.InsertVM(ctx, n.DB, corrosion.VMRecord{Name: "owned", HostName: n.Name, State: "stopped", Spec: `{"name":"owned","cpu":1,"memory_mib":256}`}, nil, nil); err != nil {
 				t.Fatal(err)
 			}
@@ -61,12 +77,21 @@ func TestDaemonDeleteCleanup_AllStopTriggersHoldDependencyCleanup(t *testing.T) 
 			f.WaitConverged(t, 20*time.Second)
 			c := newDBWorkerCoordinator(ctx, n.Server)
 			reexec, shutdown, stopped, cleaned := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
-			go c.shutdown(ctx, reexec, shutdown, func(reason daemonStopReason) {
-				want := map[string]daemonStopReason{"context": daemonContextStop, "reexec": daemonReExecStop, "shutdown": daemonUninstallStop}[trigger]
-				if reason != want {
-					t.Errorf("prepare reason %v want %v", reason, want)
-				}
-			}, func() { close(stopped) }, func() { close(cleaned) })
+			coordinatorStarted = true
+			go func() {
+				defer close(coordinatorDone)
+				c.shutdown(ctx, reexec, shutdown, func(reason daemonStopReason) {
+					want := map[string]daemonStopReason{"context": daemonContextStop, "reexec": daemonReExecStop, "shutdown": daemonUninstallStop}[trigger]
+					if reason != want {
+						t.Errorf("prepare reason %v want %v", reason, want)
+					}
+				}, func() { close(stopped) }, func() {
+					if got := exits.Load(); got != children {
+						t.Errorf("dependency cleanup preceded both actual child exits: got %d want %d", got, children)
+					}
+					close(cleaned)
+				})
+			}()
 			switch trigger {
 			case "context":
 				cancel()

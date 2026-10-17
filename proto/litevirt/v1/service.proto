@@ -218,6 +218,9 @@ message SupersededDisk {
     bool   removed      = 8;  // removed by this request
     string retained     = 9;  // why the sweep and a bare purge keep it (its VM exists); "" when not retained
     bool   kept         = 10; // a disk a deleted VM was kept with, moved off its path by a create (<path>.kept-<time>): listed only, never purged, removed or restored
+    bool   seed         = 11; // with kept: a cloud-init seed (it can hold user-data), not a disk
+    bool   earlier_vm   = 12; // with kept and vm_name: the file is an earlier VM's of that name, not the VM of that name that exists now
+    bool   uefi_vars    = 13; // with kept: the UEFI vars of a deleted VM's superseded definition its host undefined (<vars>.superseded-<time>), not a disk
 }
 message SupersededDisksResponse {
     string                  host           = 1;
@@ -682,18 +685,34 @@ message UpdateVMRequest    { string name = 1; int32 cpu = 2;
     // nic_mtu sets each listed NIC's MTU (NetworkAttachment.mtu). It takes
     // effect on the next define, like nic_queues.
     repeated NICMTUUpdate nic_mtu = 27;
+    // nic_by_list_position: the ordinal of every nic_queues, nic_rate and
+    // nic_mtu update names the NIC at that position in the VM's NIC list, not
+    // the entry at that position in its stored spec. lv update sets it. Unset
+    // (an older client, a stack deploy) every ordinal is a spec index, as it
+    // always was. An entry node forwards it only to an owner whose Ping
+    // advertises nic_list_position; for an older owner it translates each
+    // position to the spec index, or refuses where it cannot.
+    bool nic_by_list_position = 43;
 }
 // DiskTuningUpdate changes one disk's discard / detect_zeroes (an empty value
 // leaves it as stored).
 message DiskTuningUpdate { string name = 1; string discard = 2; string detect_zeroes = 3; }
-// NICQueuesUpdate changes the virtio-net queue count of the NIC at this position
-// in the VM's spec (1 turns multiqueue off).
+// The NIC of a NICQueuesUpdate, NICRateUpdate or NICMTUUpdate is named by
+// ordinal: the index of its entry in the VM's stored spec, or, with
+// UpdateVMRequest.nic_by_list_position, its 0-based position in the VM's NIC
+// list (the VM's live NICs in ordinal order, as `lv inspect` lists them under
+// spec.network). Neither is the NIC's ordinal, which is never reused: a NIC
+// detached and attached again takes a new one. By position, the owner finds
+// the NIC's spec entry by its MAC (an entry that records no MAC, by the NIC's
+// ordinal), and a position past the end of the list names the spec entry at
+// that index when no live NIC carries it.
+//
+// NICQueuesUpdate changes one NIC's virtio-net queue count (1 turns
+// multiqueue off).
 message NICQueuesUpdate  { int32 ordinal = 1; int32 queues = 2; }
-// NICRateUpdate sets (or, at 0, clears) one NIC's bandwidth cap in MB/s. The NIC
-// is named by its 0-based position in the VM's interface list.
+// NICRateUpdate sets (or, at 0, clears) one NIC's bandwidth cap in MB/s.
 message NICRateUpdate { int32 ordinal = 1; double rate_mb_sec = 2; }
-// NICMTUUpdate sets one NIC's MTU by its 0-based position in the VM's
-// interface list: 0 removes it, 1 means the bridge's MTU.
+// NICMTUUpdate sets one NIC's MTU: 0 removes it, 1 means the bridge's MTU.
 message NICMTUUpdate { int32 ordinal = 1; int32 mtu = 2; }
 // SetVMMemory (#4) sets the running balloon target (and persists it). target_mib
 // must be within [min_memory_mib, max_memory_mib] of the VM's spec; a live VM is
@@ -703,6 +722,16 @@ message SetVMMemoryRequest  { string name = 1; int32 target_mib = 2;
 // SetVMLabelsRequest replaces the full label set (the request is authoritative —
 // an empty map clears all tags).
 message SetVMLabelsRequest  { string name = 1; map<string, string> labels = 2; }
+// PatchVMSpecRequest names fields of desired to write onto a VM's stored spec.
+// Peer only: a deploy that entered on another host forwards its spec patch to
+// the VM's owner, so every edit of one VM's spec is made on one host.
+message PatchVMSpecRequest {
+    string name = 1;
+    VMSpec desired = 2;
+    // fields: the compose live-metadata field names, plus "cpu" and "memory"
+    // for a size a live resize already applied.
+    repeated string fields = 3;
+}
 message ResizeDiskRequest  { string vm_name = 1; string disk_name = 2;
     string size = 3; }  // size: new total size e.g. "40G"
 
@@ -2374,6 +2403,9 @@ message GetVMOperationResponse {
 message AbortVMOperationRequest {
     string vm_name = 1;
     bool   force   = 2; // required — an abort is never implicit
+    // operation_id, when set, scopes the abort: it is refused unless the VM's
+    // active operation is exactly this one. Empty aborts whatever is active.
+    string operation_id = 3;
 }
 message AbortVMOperationResponse {
     bool   aborted               = 1;
@@ -3561,6 +3593,14 @@ message PingResponse {
   // so a caller that needs the stop first (lv rm --force, a forwarding entry
   // node) sends StopVM{force} itself when this is false.
   bool delete_force = 12;
+  // abort_scoped: this build honours AbortVMOperationRequest.operation_id. An
+  // older daemon ignores the field and aborts whatever operation is active, so
+  // lv operation abort --operation refuses to send it when this is false.
+  bool abort_scoped = 13;
+  // nic_list_position: this build reads UpdateVMRequest.nic_by_list_position.
+  // An older owner ignores the field and reads every NIC ordinal as a spec
+  // index, so an entry node translates the positions for it, or refuses.
+  bool nic_list_position = 14;
 }
 
 // Ready: application-level readiness. Ping answers "is this daemon's TLS
@@ -4442,6 +4482,10 @@ service LiteVirt {
     // SetVMLabels replaces a VM's labels/tags. Metadata-only (not in the domain
     // XML), so it applies to running VMs without a redefine.
     rpc SetVMLabels(SetVMLabelsRequest)  returns (VM);
+    // PatchVMSpec writes named fields of a desired spec onto a VM's stored
+    // spec, on the host that answers. Peer only: the owner of a VM serialises
+    // its spec edits, so a deploy entering elsewhere forwards its patch here.
+    rpc PatchVMSpec(PatchVMSpecRequest) returns (google.protobuf.Empty);
     rpc AttachDevice(AttachDeviceRequest) returns (VM);
     rpc DetachDevice(DetachDeviceRequest) returns (VM);
     rpc ResizeDisk(ResizeDiskRequest)    returns (VM);

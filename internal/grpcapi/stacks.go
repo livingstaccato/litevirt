@@ -54,6 +54,14 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "parse compose: %v", err)
 	}
+	// A stack being torn down is not deployed over: the teardown would take
+	// down the networks under what this deploy creates (review m2).
+	if st, gErr := corrosion.GetStack(ctx, s.db, f.Name); !req.DryRun && gErr == nil && st != nil && st.State == stackStateDeleting {
+		return status.Errorf(codes.FailedPrecondition,
+			"stack %q is being torn down (state %q): wait until `lv compose ls` no longer lists it, then run `lv compose up` again; "+
+				"if the teardown does not finish, `lv compose down --name %s` retries it, and `lv rm <vm> --force` clears a member that is stuck",
+			f.Name, stackStateDeleting, f.Name)
+	}
 
 	// Disk/NIC tuning in the file is refused before anything is deployed, rather
 	// than by the Nth VM's create after the first N-1 are up (the disk/NIC feature gate).
@@ -384,6 +392,7 @@ func (s *Server) withStackDefaultDenyNote(ctx context.Context, stack string, err
 const (
 	stackStateActive   = "active"
 	stackStateDegraded = "degraded"
+	stackStateDeleting = "deleting"
 )
 
 // stackFirewallErr is a stack's firewall failure as its deploy returns it: a
@@ -1161,6 +1170,15 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	// it deletes (fanoutDeleteVM).
 	var notMembers []corrosion.VMRecord
 	var unknown []string
+	// A stack recorded "degraded" finished its last deploy with failed
+	// actions: a name its file lists that no host has may be a member whose
+	// create failed (vmNeverCreated). Read before the state becomes
+	// "deleting" below.
+	degraded := false
+	if st, gErr := corrosion.GetStack(ctx, s.db, req.Name); gErr == nil && st != nil {
+		degraded = st.State == stackStateDegraded
+	}
+	fileOnly := map[string]bool{}
 	stored, storedErr := s.storedStackFile(ctx, req.Name)
 	if stored != nil {
 		for baseName, vmDef := range stored.VMs {
@@ -1184,6 +1202,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 					// Listed above when it named this stack; so not.
 					notMembers = append(notMembers, *row)
 				default:
+					fileOnly[instName] = true
 					vms = append(vms, corrosion.VMRecord{
 						Name:      instName,
 						StackName: req.Name,
@@ -1194,8 +1213,10 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	}
 
 	// Mark stack as "deleting" first — this is durable and survives crashes.
-	// The background StackReconciler will pick up stacks stuck in this state.
-	if err := corrosion.SetStackState(ctx, s.db, req.Name, "deleting"); err != nil {
+	// The background StackReconciler will pick up stacks stuck in this state,
+	// and keeps the disks when this teardown does (keep_disks): the choice
+	// is recorded with the state, in the same write.
+	if err := corrosion.MarkStackDeleting(ctx, s.db, req.Name, req.KeepDisks, s.hostName); err != nil {
 		return status.Errorf(codes.Internal, "set stack state: %v", err)
 	}
 
@@ -1253,7 +1274,14 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 		if h := s.stackMemberDeleteHook; h != nil {
 			h(vm.Name)
 		}
-		delErr := s.deleteVMWithFanout(ctx, stackMember{Name: vm.Name, Stack: req.Name, CreatedAt: vm.CreatedAt}, req.KeepDisks)
+		delErr := s.deleteVMWithFanout(ctx, stackMember{Name: vm.Name, Stack: req.Name, CreatedAt: vm.CreatedAt,
+			MayHaveFailedCreate: degraded && fileOnly[vm.Name]}, req.KeepDisks)
+		if errors.Is(delErr, errMemberNeverCreated) {
+			if err := stream.Send(&pb.DeleteProgress{VmName: vm.Name, Status: "absent", Error: delErr.Error()}); err != nil {
+				return err
+			}
+			continue
+		}
 		if errors.Is(delErr, errNotStackMember) {
 			keptAtDelete = append(keptAtDelete, vm.Name)
 			if err := stream.Send(&pb.DeleteProgress{VmName: vm.Name, Status: "kept", Error: delErr.Error()}); err != nil {
@@ -1545,6 +1573,11 @@ func (s *Server) deleteVMWithFanout(ctx context.Context, m stackMember, keepDisk
 				// is removed, and the stack's teardown goes on.
 				slog.Info("stack delete: member was already deleted", "stack", stackName, "vm", vmName)
 				return nil
+			case errors.Is(peerErr, errNoPeerHasVM) && s.vmNeverCreated(ctx, m):
+				// A member the stored file names whose create failed (lab 2,
+				// O4): no host has it, so there is nothing to delete.
+				slog.Info("stack delete: member was never created; nothing to delete", "stack", stackName, "vm", vmName)
+				return errMemberNeverCreated
 			}
 			return err
 		}
@@ -1597,11 +1630,34 @@ func (s *Server) vmAlreadyDeleted(ctx context.Context, m stackMember) bool {
 	return m.CreatedAt == "" || rows[0].String("created_at") == m.CreatedAt
 }
 
+// vmNeverCreated reports a member whose create failed: the stack's last
+// deploy finished with failed actions ("degraded") and the teardown listed
+// the member from the stored file alone (MayHaveFailedCreate: no row here,
+// so no incarnation), this host still has no live row of the name, and every
+// peer that may hold the VM answered that it has none (errNoPeerHasVM, the
+// caller's). The StackReconciler, acting on rows only, already treats such a
+// name as nothing to delete. A name with no row in a stack recorded "active"
+// is not taken as gone: nothing says its create ran and failed.
+func (s *Server) vmNeverCreated(ctx context.Context, m stackMember) bool {
+	if !m.MayHaveFailedCreate || m.CreatedAt != "" {
+		return false
+	}
+	live, err := corrosion.GetVM(ctx, s.db, m.Name)
+	return err == nil && live == nil
+}
+
+// errMemberNeverCreated: a stack member the stored file names that no host
+// has (vmNeverCreated). The teardown reports it and goes on.
+var errMemberNeverCreated = errors.New("never created; nothing to delete")
+
 // stackMember is a stack's VM as the teardown saw it: its name, the stack
 // its row records, and its incarnation (the row's created_at; "" for a name
 // the stored file lists that has no row here yet).
 type stackMember struct {
 	Name, Stack, CreatedAt string
+	// MayHaveFailedCreate: listed from the stored file of a stack whose
+	// last deploy failed some action (vmNeverCreated).
+	MayHaveFailedCreate bool
 }
 
 // isDeleteBindingMismatch reports a DeleteVM refused because the VM is not
@@ -1775,6 +1831,35 @@ func (s *Server) DeleteVMForStackCleanup(ctx context.Context, req *pb.DeleteVMRe
 	authCtx := context.WithValue(ctx, ctxKeyRole, "admin")
 	authCtx = context.WithValue(authCtx, ctxKeyUsername, "system:stack-reconciler")
 	return s.DeleteVM(authCtx, req)
+}
+
+// NameStackTeardownKeptDisks names, by disk_leftover on this host, the disks
+// of vm, a stack member the stack reconciler deleted keeping its disks because
+// it could not prove the teardown let them go (why): no disk choice recorded,
+// another teardown's, or one it cannot read. Disks a delete keeps by their
+// own record (delete_with_vm=false) are not named here.
+func (s *Server) NameStackTeardownKeptDisks(ctx context.Context, stack string, vm corrosion.VMRecord, why string) {
+	disks, err := corrosion.VMIncarnationDisks(ctx, s.db, vm.Name, vm.CreatedAt)
+	if err != nil {
+		slog.Warn("stack-reconciler: the disks it kept could not be read, so they are not named",
+			"stack", stack, "vm", vm.Name, "reason", why, "error", err)
+		return
+	}
+	var kept []KeptDisk
+	for _, d := range disks {
+		if !d.DeleteWithVM || d.Path == "" {
+			continue
+		}
+		kept = append(kept, KeptDisk{Path: d.Path, Disk: d.DiskName, Host: d.HostName,
+			Reason: fmt.Sprintf("the stack reconciler finished stack %q's teardown and kept this disk, as it could not prove "+
+				"the teardown let it go: %s. Remove it by hand unless the stack delete asked to keep disks", stack, why)})
+	}
+	// As at every other record site: a disk on this host that is positively
+	// gone (the other deleter removed it) has nothing left to name.
+	kept = s.keptThere(kept)
+	authCtx := context.WithValue(ctx, ctxKeyRole, "admin")
+	authCtx = context.WithValue(authCtx, ctxKeyUsername, "system:stack-reconciler")
+	s.recordKeptDisks(authCtx, vm.Name, kept)
 }
 
 // DeleteContainerForStackCleanup is DeleteVMForStackCleanup for a stack's

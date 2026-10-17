@@ -68,16 +68,47 @@ func deletedEverywhere(t *testing.T, c *Cluster, name string) {
 	// Anti-entropy first: a bulk image_hosts tombstone expands over each
 	// replica's own rows, so replicas that held different rows can stay
 	// apart until a pass reconciles them.
-	antiEntropyEverywhere(t, c)
-	c.WaitConverged(t, convergeTimeout)
-	antiEntropyEverywhere(t, c)
-	c.WaitConverged(t, convergeTimeout)
+	settleByAntiEntropy(t, c)
 	for _, n := range c.Nodes {
 		if img := listedImage(t, c, n, name); img != nil {
 			t.Errorf("%s lists %s again after lv image rm: %+v", n.Name, name, img)
 		}
 		if d, err := corrosion.ImageDeletedAt(context.Background(), n.DB, name); err != nil || d == "" {
 			t.Errorf("%s: %s's row reads live (err %v)", n.Name, name, err)
+		}
+	}
+}
+
+// settleByAntiEntropy runs anti-entropy passes on every node, as the
+// daemons' schedule does, until the replicas agree. Only a pass settles a
+// tie; the push loops carry nothing that does. After an lv image rm that
+// raced a record, three replicas can each hold a different row at the
+// delete's one stamp (it rewrote only some columns of each), and one pass
+// per node in turn does not always settle three: a node that pulled before
+// its peers settled keeps a row they then move past, and only the next pass
+// takes it there.
+func settleByAntiEntropy(t *testing.T, c *Cluster) {
+	t.Helper()
+	deadline := time.Now().Add(convergeTimeout)
+	for {
+		antiEntropyEverywhere(t, c)
+		settle := time.Now().Add(2 * time.Second)
+		for {
+			apart, err := divergence(c.Nodes)
+			if err != nil {
+				t.Fatalf("divergence: %v", err)
+			}
+			if len(apart) == 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("replicas did not converge within %s of anti-entropy passes; tables apart: %s",
+					convergeTimeout, strings.Join(apart, ", "))
+			}
+			if time.Now().After(settle) {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
 		}
 	}
 }

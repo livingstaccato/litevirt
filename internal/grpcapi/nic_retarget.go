@@ -154,18 +154,22 @@ func (s *Server) retargetVMNICs(ctx context.Context, vmName string, rts []compos
 }
 
 // pendingNICRetargets derives, from a VM's desired spec and its NIC rows, the
-// NICs still on a legacy "<stack>_<name>" network whose spec now names
-// "<name>".
+// NICs still on a legacy "<stack>_<name>" network whose spec entry now names
+// "<name>". A NIC's entry is the one that records its MAC (specEntryForNIC):
+// a NIC attached again after a detach takes a new ordinal, often past the end
+// of the spec, and read as an index that ordinal named another NIC's entry or
+// none.
 func pendingNICRetargets(spec *pb.VMSpec, nics []corrosion.NICRecord) []compose.NICRetarget {
 	if spec.GetStackName() == "" {
 		return nil
 	}
 	var out []compose.NICRetarget
 	for _, n := range nics {
-		if n.Ordinal < 0 || n.Ordinal >= len(spec.Network) {
+		e := specEntryForNIC(spec, n)
+		if e == nil {
 			continue
 		}
-		want := spec.Network[n.Ordinal].GetName()
+		want := e.GetName()
 		if n.NetworkName != want && n.NetworkName == compose.ScopedNetworkName(spec.StackName, want) {
 			out = append(out, compose.NICRetarget{Ordinal: n.Ordinal, From: n.NetworkName, To: want})
 		}
@@ -177,17 +181,8 @@ func pendingNICRetargets(spec *pb.VMSpec, nics []corrosion.NICRecord) []compose.
 // its MAC, else — only for an entry that records no MAC — the one at its
 // ordinal. nil when none does.
 func specEntryForNIC(spec *pb.VMSpec, nic corrosion.NICRecord) *pb.NetworkAttachment {
-	if nic.MAC != "" {
-		for _, e := range spec.GetNetwork() {
-			if e != nil && e.GetMac() != "" && strings.EqualFold(e.GetMac(), nic.MAC) {
-				return e
-			}
-		}
-	}
-	if o := nic.Ordinal; o >= 0 && o < len(spec.GetNetwork()) {
-		if e := spec.Network[o]; e != nil && e.GetMac() == "" {
-			return e
-		}
+	if i := compose.SpecEntryIndexForNIC(spec, nic.MAC, nic.Ordinal); i >= 0 {
+		return spec.Network[i]
 	}
 	return nil
 }

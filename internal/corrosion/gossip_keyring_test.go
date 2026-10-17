@@ -19,7 +19,6 @@ import (
 
 	"github.com/hashicorp/memberlist"
 
-	"github.com/litevirt/litevirt/internal/hlc"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/testkit/slogtest"
 )
@@ -149,20 +148,11 @@ func TestGossipStagesCompatible_AdjacentStagesOnly(t *testing.T) {
 func keyedGossipNode(t *testing.T, name string, mode GossipEncryption, keys GossipKeys,
 	join []string, rows ...string) *Client {
 	t.Helper()
-	var c *Client
-	var err error
-	// A port free for TCP can still be taken for UDP -- by this test's other
-	// parallel nodes or by anything else on the machine -- so retry the bind.
-	for attempt := 0; attempt < 8; attempt++ {
-		c, err = NewClient(Config{
-			HostName: name, DataDir: t.TempDir(), BindAddr: "0.0.0.0", AdvertiseAddr: "127.0.0.1",
-			BindPort: freePort(t), JoinPeers: join, GossipEncryption: mode, GossipKeys: keys,
-			pushPullInterval: 300 * time.Millisecond,
-		}, hlc.NewClock(name))
-		if err == nil || !strings.Contains(err.Error(), "address already in use") {
-			break
-		}
-	}
+	c, err := newClientOnFreePort(t, Config{
+		HostName: name, BindAddr: "0.0.0.0", AdvertiseAddr: "127.0.0.1",
+		JoinPeers: join, GossipEncryption: mode, GossipKeys: keys,
+		pushPullInterval: 300 * time.Millisecond,
+	})
 	if err != nil {
 		t.Fatalf("NewClient %s: %v", name, err)
 	}

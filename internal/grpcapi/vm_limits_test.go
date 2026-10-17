@@ -90,14 +90,14 @@ func TestMergeLimitUpdate(t *testing.T) {
 
 	s := spec()
 	up, err := mergeLimitUpdate(s, &pb.UpdateVMRequest{CpuLimit: f(3.5), CpuShares: i(100),
-		NicRate: []*pb.NICRateUpdate{{Ordinal: 1, RateMbSec: 0}}})
+		NicRate: []*pb.NICRateUpdate{{Ordinal: 1, RateMbSec: 0}}}, nicIndex{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if s.CpuLimit != 3.5 || s.CpuShares != 100 || s.Network[1].RateMbSec != 0 || s.Network[0].RateMbSec != 0 {
 		t.Errorf("merged spec = %+v", s)
 	}
-	if !up.cpu || !up.sharesTouch || len(up.nicOrdinals) != 1 || up.nicPrevRate[1] != 3 {
+	if !up.cpu || !up.sharesTouch || len(up.nicEntries) != 1 || up.nicPrevRate[1] != 3 {
 		t.Errorf("update record = %+v", up)
 	}
 
@@ -114,12 +114,12 @@ func TestMergeLimitUpdate(t *testing.T) {
 		"limit vs the new cpus": {Cpu: 2, CpuLimit: f(2.5)},
 	}
 	for name, req := range bad {
-		if _, err := mergeLimitUpdate(spec(), req); status.Code(err) != codes.InvalidArgument {
+		if _, err := mergeLimitUpdate(spec(), req, nicIndex{}); status.Code(err) != codes.InvalidArgument {
 			t.Errorf("%s: err = %v, want InvalidArgument", name, err)
 		}
 	}
 	// Shrinking is fine once the limit comes down with it.
-	if _, err := mergeLimitUpdate(spec(), &pb.UpdateVMRequest{Cpu: 1, CpuLimit: f(1)}); err != nil {
+	if _, err := mergeLimitUpdate(spec(), &pb.UpdateVMRequest{Cpu: 1, CpuLimit: f(1)}, nicIndex{}); err != nil {
 		t.Errorf("shrink with a matching limit: %v", err)
 	}
 }

@@ -49,7 +49,7 @@ func RebuildISO(path, networkConfig, vendorData string) (bool, error) {
 		return false, nil
 	}
 	seed.NetworkConfig, seed.VendorData = networkConfig, vendorData
-	if err := writeISO(seed, path); err != nil {
+	if err := writeISO(seed, path, false); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -295,6 +295,8 @@ func OwnSeedWhy(iso string, c SeedClaim) (Seed, bool, string, error) {
 	}
 	if stamped {
 		switch {
+		case owner == "":
+			return seed, false, "its .owner stamp is empty or unreadable, so the VM it was written for is not known (a power cut while the stamp was written can leave it so)", nil
 		case c.UUID == "":
 			return seed, false, "it is stamped for a VM, and the VM's spec records no uuid to match it", nil
 		case owner != c.UUID:

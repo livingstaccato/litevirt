@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/metrics"
 )
@@ -46,14 +47,14 @@ func drainIgnoredSignals(ctx context.Context) <-chan os.Signal {
 	signal.Notify(incoming, cleanExitSignals...)
 
 	observed := make(chan os.Signal, 8)
+	logger := newSignalLogger(slog.Default(), time.Now)
 	go func() {
 		defer signal.Stop(incoming)
+		defer logger.flush()
 		for {
 			select {
 			case sig := <-incoming:
-				slog.Warn("ignoring signal: the daemon neither terminates nor reloads on it; "+
-					"dying here would look like a clean exit to systemd and leave this node down",
-					"signal", sig.String())
+				logger.observe(sig)
 				metrics.SignalIgnored(sig.String())
 				select {
 				case observed <- sig:
@@ -65,4 +66,44 @@ func drainIgnoredSignals(ctx context.Context) <-chan os.Signal {
 		}
 	}()
 	return observed
+}
+
+// sigpipeSummaryInterval bounds how often SIGPIPE is logged.
+const sigpipeSummaryInterval = time.Minute
+
+// signalLogger logs each SIGHUP at WARN and folds SIGPIPE into one INFO summary
+// per sigpipeSummaryInterval.
+type signalLogger struct {
+	log   *slog.Logger
+	now   func() time.Time
+	last  time.Time
+	count int64
+}
+
+func newSignalLogger(log *slog.Logger, now func() time.Time) *signalLogger {
+	return &signalLogger{log: log, now: now, last: now()}
+}
+
+func (l *signalLogger) observe(sig os.Signal) {
+	if sig == syscall.SIGPIPE {
+		l.count++
+		if l.now().Sub(l.last) >= sigpipeSummaryInterval {
+			l.flush()
+		}
+		return
+	}
+	l.log.Warn("ignoring signal: the daemon neither terminates nor reloads on it; "+
+		"dying here would look like a clean exit to systemd and leave this node down",
+		"signal", sig.String())
+}
+
+func (l *signalLogger) flush() {
+	if l.count == 0 {
+		return
+	}
+	l.log.Info("ignored SIGPIPE: a peer closed a connection before our write, "+
+		"routine for readiness probes; count since the last summary",
+		"signal", syscall.SIGPIPE.String(), "count", l.count)
+	l.count = 0
+	l.last = l.now()
 }

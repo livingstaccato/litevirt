@@ -378,8 +378,10 @@ type Server struct {
 	// should travel on (migration_network.go). Empty means the host's cluster
 	// address. localIPs is a test seam for the host's own addresses.
 	migrationNetwork                       string
-	pingWithoutMigratePreconditionsForTest bool // Ping answers as a release that does not check migration preconditions
-	cloneAsOlderBuildForTest               bool // CloneVM ignores destination_host and target_pool, as an older release does
+	pingWithoutMigratePreconditionsForTest bool   // Ping answers as a release that does not check migration preconditions
+	pingWithoutNICListPositionForTest      bool   // Ping answers as a release that reads every NIC number as a spec index
+	updateVMNICsHookForTest                func() // runs in UpdateVM's redefine just before it reads the NIC list it defines
+	cloneAsOlderBuildForTest               bool   // CloneVM ignores destination_host and target_pool, as an older release does
 	migrationDial                          func(ctx context.Context, host, addr string) (pb.LiteVirtClient, func(), error)
 	migrationAddress                       string // migration.address: this host's own answer, when set
 	localIPs                               func() ([]localAddr, error)
@@ -420,6 +422,9 @@ type Server struct {
 	// each member's name right before deleting it, where a test re-creates
 	// the VM as another incarnation.
 	stackMemberDeleteHook func(name string)
+	// deleteLeaseTakenHook is a test-only seam: deleteVM calls it with the
+	// VM's name once it holds the start lease, before it re-reads the row.
+	deleteLeaseTakenHook func(name string)
 	// restoreClaimedHook is a test-only seam; see SetRestoreClaimedHook.
 	restoreClaimedHook func(name string)
 	// restoreTargetResolvedHook is a test-only seam run after RestoreFromBackup
@@ -2120,6 +2125,10 @@ func (s *Server) tokenEnabled(token string) bool {
 		// No kill switch: it says this build reads the relay demotion rows
 		// when it elects relays, and every node relies on every other
 		// electing the same set.
+		return true
+	case capabilities.SpecConflictV1:
+		// No kill switch: it says how this build resolves two edits of one
+		// spec at one generation, and every replica must resolve them alike.
 		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm.Load()

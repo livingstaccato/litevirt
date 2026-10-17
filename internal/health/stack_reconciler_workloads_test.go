@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -17,6 +18,7 @@ type failingStackCleaner struct {
 	failVM, failCT bool
 	deprovisioned  []string
 	ctDeleted      []string
+	namedKept      []string // NameStackTeardownKeptDisks: "<vm>: <why>"
 }
 
 func (c *failingStackCleaner) DeleteVMForStackCleanup(context.Context, *pb.DeleteVMRequest) (*emptypb.Empty, error) {
@@ -33,6 +35,9 @@ func (c *failingStackCleaner) DeleteContainerForStackCleanup(_ context.Context, 
 	return &emptypb.Empty{}, nil
 }
 func (c *failingStackCleaner) RemoveLBForStack(context.Context, string, []corrosion.VMRecord) {}
+func (c *failingStackCleaner) NameStackTeardownKeptDisks(_ context.Context, _ string, vm corrosion.VMRecord, why string) {
+	c.namedKept = append(c.namedKept, vm.Name+": "+why)
+}
 func (c *failingStackCleaner) DeprovisionNetworkByName(_ context.Context, name string) error {
 	c.deprovisioned = append(c.deprovisioned, name)
 	return nil
@@ -51,6 +56,8 @@ func seedDeletingStack(t *testing.T, withVM, withCT bool) *corrosion.Client {
 	if err := corrosion.UpsertStack(ctx, db, corrosion.StackRecord{Name: "app", ComposeYAML: "vms: {}\n", State: "deleting"}); err != nil {
 		t.Fatal(err)
 	}
+	// A teardown begun long ago: not one in flight (stackTeardownGrace).
+	setStackUpdatedAt(t, db, "app", time.Now().Add(-time.Hour))
 	if err := corrosion.UpsertNetwork(ctx, db, corrosion.NetworkRecord{Name: "app_lan", StackName: "app", Type: "bridge", Config: "{}"}); err != nil {
 		t.Fatal(err)
 	}

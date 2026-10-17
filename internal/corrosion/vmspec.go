@@ -103,19 +103,30 @@ func mutateDesiredSpec(ctx context.Context, c *Client, name string, fn func(oldS
 			return created == incarnation && host == owner && ownerEpoch == epoch &&
 				generation == specGen && active == "" && currentSpec == oldSpec, nil
 		}
+		// Preserve the incoming epoch-carrying shape and content-only no-op
+		// once latched. Even a no-op must pass the incarnation/barrier guard.
+		specConflict := c.SpecConflictOn()
+		changed := newSpec != oldSpec
+		if specConflict {
+			changed = specContentHash(newSpec) != specContentHash(oldSpec)
+		}
 		var stmts []Statement
-		if newSpec != oldSpec {
-			// Keep the existing full-PK replicated statement and its receiver rules.
-			stmts = []Statement{{SQL: `UPDATE vms SET spec = ?, spec_generation = spec_generation + 1, updated_at = ?
-			 WHERE name = ? AND spec_generation = ? AND active_operation_id = '' AND deleted_at IS NULL`,
-				Params: []interface{}{newSpec, c.NowTS(), name, specGen}}}
+		if changed {
+			now := c.NowTS()
+			if specConflict {
+				stmts = []Statement{{SQL: vmSpecMutateAtEpochSQL,
+					Params: []interface{}{stampSpec(newSpec, oldSpec, now), now, name, epoch, specGen}}}
+			} else {
+				stmts = []Statement{{SQL: vmSpecMutateSQL,
+					Params: []interface{}{newSpec, now, name, specGen}}}
+			}
 		}
 		applied, uerr := c.ExecuteBatchGuarded(ctx, guard, stmts)
 		if uerr != nil {
 			return false, specGen, uerr
 		}
 		if applied {
-			if newSpec == oldSpec {
+			if !changed {
 				return true, specGen, nil
 			}
 			return true, specGen + 1, nil

@@ -150,7 +150,7 @@ lv host fence-confirm <host>              # Confirm an already-powered-off manua
 lv host rescan [host]                     # Rescan PCI devices
 lv host devices <host> [--type gpu|network|nvme|infiniband]   # List PCI devices
 lv host superseded-disks <host>           # List the disk copies a failover set aside, and the
-                                          #   .kept- files a create made (marked kept, list only)
+                                          #   .kept- disks and seeds a create made (marked kept, list only)
   [--purge] [--older-than 72h]            #   remove the ones neither retained nor held (admin)
   [--remove <copy>]...                    #   remove exactly these copies, even retained (admin)
   [--restore <copy>]                      #   put a copy back as its stopped VM's disk (admin)
@@ -225,13 +225,24 @@ lv logs <vm> [-f] [-n 50]                 # VM logs (-f to follow)
 **A kept disk and a create of the same name.** After `lv rm --keep-disks
 <vm>`, the VM's disks stay where they were. A VM of the same name created later
 on the same host would take `<data_dir>/disks/<vm>-<disk>.qcow2`, so the create
-first renames a kept disk there to `<path>.kept-<time>`. Nothing removes that
-file; the rename is recorded as a `vm.disk.kept` event of the VM. A disk
-recorded `delete_with_vm=false` is handled the same way. The host that holds
+first renames a kept disk there to `<path>.kept-<time>`, and the kept VM's
+cloud-init seed (`cloudinit/<vm>.iso`) to `<seed>.kept-<time>`. Nothing removes
+those files; each rename is recorded as a `vm.disk.kept` event of the VM. A disk
+recorded `delete_with_vm=false` is handled the same way. The create renames
+nothing until the refusals it can judge up front have passed (Secure Boot or
+vTPM over kept UEFI vars, a USB device the host does not have, the image not
+available), and a create that fails
+after the rename puts each file back at the path the kept VM recorded, unless
+a file is there by then. The host that holds
 kept disks lists them in `<data_dir>/kept-disks/<vm>.json` until a create
 renames them. `lv host superseded-disks <host>` lists each `.kept-` file there
-as `kept`; `--purge`, `--remove` and `--restore` never take one, so only an
-operator removes it, by hand. A `--keep-disks` delete whose
+as `kept`, the seeds in `<data_dir>/cloudinit` among them, and the seed a
+deleted VM was kept with where it was, while no VM of its name exists (a seed
+can hold user-data passwords); `--purge`, `--remove` and `--restore` never take one, so
+only an operator removes it, by hand. Each is listed under the VM of its name
+when that is known; while a VM of that name exists, one that is an earlier
+VM's (every kept disk, and a seed not stamped for the VM there now) says so.
+A seed whose owner stamp is empty or unreadable is listed as kept. A `--keep-disks` delete whose
 `<data_dir>/kept-disks/<vm>.json` cannot be read is refused, naming the file,
 with nothing deleted: repair or remove that file, then retry.
 
@@ -297,6 +308,15 @@ lv update <vm> [--cpu-limit CORES] [--cpu-shares N]   # noisy-neighbour limits (
 lv update <vm> --nic-rate 0=12.5 [--nic-rate 1=0]     # per-NIC bandwidth cap in MB/s, NIC numbered from 0 (live; 0 clears it)
 lv update <vm> --nic-mtu 0=9000 [--nic-mtu 1=bridge] # per-NIC MTU, NIC numbered from 0; must equal the
                                              # bridge's MTU (VM STOPPED or --restart-if-needed; 0 removes it)
+# The NIC number in --nic-rate and --nic-mtu is the NIC's position in the VM's
+# NIC list, from 0: its NICs in ordinal order, as `lv inspect <vm>` lists them
+# under spec.network. A NIC detached and attached again goes to the end of it.
+# --nic-rate needs the NIC's spec entry: give a NIC attached after the create
+# one with --nic-mtu <nic>=0. A host on an older build reads the numbers as
+# spec entries: an update reaching it through an upgraded node is translated,
+# or refused naming the host to upgrade; the CLI talking to it directly
+# refuses a number at or past the first gap in the VM's NIC numbering (a NIC
+# was detached) and sends the others.
 lv update <vm> [--cpu N] [--memory N]        # resources — VM must be STOPPED
   [--cpu-mode host-passthrough|host-model|custom] [--cpu-model <model>]
   [--disable-vnc]

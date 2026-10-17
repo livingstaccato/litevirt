@@ -38,8 +38,15 @@ type claimedAddr struct {
 	NetBoxID  int
 }
 
-// claimReleaseTimeout bounds a claimSet's compensating release.
-const claimReleaseTimeout = 30 * time.Second
+// claimReleaseTimeout bounds the compensating release of each claim in a
+// claimSet, and orphanEnqueueTimeout each enqueue of one for the orphan sweep:
+// one claim that exhausts its budget (NetBox not answering) costs neither the
+// next claim its release nor itself its enqueue (re-review N9). Variables so a
+// test can shorten them.
+var (
+	claimReleaseTimeout  = 30 * time.Second
+	orphanEnqueueTimeout = 5 * time.Second
+)
 
 // claimSet accumulates the claims one create has taken.
 //
@@ -48,6 +55,9 @@ const claimReleaseTimeout = 30 * time.Second
 type claimSet struct {
 	srv   *Server
 	items []claimedAddr
+	// report, when set, is told what a releaseAll that had claims did: how
+	// many it released, and how many it left to the orphan sweep.
+	report func(released, failed int)
 }
 
 func (c *claimSet) add(a claimedAddr) { c.items = append(c.items, a) }
@@ -57,63 +67,89 @@ func (c *claimSet) empty() bool       { return len(c.items) == 0 }
 // address nothing references, so it is enqueued for the sweeper rather than
 // dropped — otherwise it is stranded until a human notices.
 //
-// It runs detached from ctx, bounded: it is cleanup after a failure, and the
-// caller's context may be what failed (a client that stopped waiting).
+// It runs detached from ctx, each claim's release and each enqueue bounded on
+// its own: it is cleanup after a failure, and the caller's context may be
+// what failed (a client that stopped waiting).
 func (c *claimSet) releaseAll(ctx context.Context) {
 	if len(c.items) == 0 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claimReleaseTimeout)
-	defer cancel()
+	base := context.WithoutCancel(ctx)
+	released, failed := 0, 0
 	for _, a := range c.items {
-		// The LOCAL lease goes first, and a failure to tombstone it stops the
-		// remote delete — the same order and the same reason as
-		// netboxAllocator.Release. Freeing the address in NetBox while litevirt
-		// still holds the lease lets another system take an address litevirt
-		// believes is its own; the reverse order only risks an address the
-		// orphan sweep can reclaim. A claim that never persisted a lease
-		// (Name empty) has nothing local to undo.
-		if a.Name != "" {
-			if err := network.ReleaseLease(ctx, c.srv.db, a.Network, a.IP, a.MAC, a.OwnerKind, a.OwnerHost, a.Name); err != nil {
-				slog.Warn("netbox: local lease tombstone failed during rollback; NetBox delete skipped",
-					"address", a.IP, "owner", a.Name, "error", err)
-				if eerr := c.srv.enqueueOrphanCheck(ctx, a.Identity); eerr != nil {
-					slog.Error("netbox: could not enqueue orphan check — address may be stranded",
-						"identity", a.Identity, "error", eerr)
-				}
-				continue
-			}
-		}
-		if a.NetBoxID == 0 {
-			continue
-		}
-		var releaseErr error
-		if c.srv.netbox == nil {
-			// A non-zero NetBoxID with no wired client is a programming error (a
-			// server that claimed an address without a client could not exist),
-			// but panicking mid-rollback is the worst place to discover that.
-			// Treat it exactly like a failed release.
-			releaseErr = fmt.Errorf("netbox client not wired")
+		if c.releaseOne(base, a) {
+			released++
 		} else {
-			releaseErr = c.srv.netbox.ReleaseIP(ctx, a.NetBoxID)
-			if releaseErr != nil {
-				// Counted where the API call is, not where the rollback ends: a
-				// compensating release is a NetBox request like any other, and
-				// leaving it out made a cluster whose rollbacks were all failing
-				// read as zero API errors.
-				c.srv.nbMetrics().IncAPIError(netbox.Classify(releaseErr))
-			}
-		}
-		if releaseErr != nil {
-			slog.Warn("netbox: compensating release failed; enqueueing orphan check",
-				"address", a.IP, "netbox_id", a.NetBoxID, "error", releaseErr)
-			if eerr := c.srv.enqueueOrphanCheck(ctx, a.Identity); eerr != nil {
-				slog.Error("netbox: could not enqueue orphan check — address may be stranded",
-					"identity", a.Identity, "error", eerr)
-			}
+			failed++
 		}
 	}
 	c.items = nil
+	if c.report != nil {
+		c.report(released, failed)
+	}
+}
+
+// enqueueOrphanBounded names identity for the orphan sweep on a context of
+// its own, detached from base and bounded.
+func (c *claimSet) enqueueOrphanBounded(base context.Context, identity string) error {
+	ctx, cancel := context.WithTimeout(base, orphanEnqueueTimeout)
+	defer cancel()
+	return c.srv.enqueueOrphanCheck(ctx, identity)
+}
+
+// releaseOne compensates claim a within its own budget, and reports whether
+// it was released; one that was not is named for the orphan sweep.
+func (c *claimSet) releaseOne(base context.Context, a claimedAddr) bool {
+	ctx, cancel := context.WithTimeout(base, claimReleaseTimeout)
+	defer cancel()
+	// The LOCAL lease goes first, and a failure to tombstone it stops the
+	// remote delete — the same order and the same reason as
+	// netboxAllocator.Release. Freeing the address in NetBox while litevirt
+	// still holds the lease lets another system take an address litevirt
+	// believes is its own; the reverse order only risks an address the
+	// orphan sweep can reclaim. A claim that never persisted a lease
+	// (Name empty) has nothing local to undo.
+	if a.Name != "" {
+		if err := network.ReleaseLease(ctx, c.srv.db, a.Network, a.IP, a.MAC, a.OwnerKind, a.OwnerHost, a.Name); err != nil {
+			slog.Warn("netbox: local lease tombstone failed during rollback; NetBox delete skipped",
+				"address", a.IP, "owner", a.Name, "error", err)
+			if eerr := c.enqueueOrphanBounded(base, a.Identity); eerr != nil {
+				slog.Error("netbox: could not enqueue orphan check — address may be stranded",
+					"identity", a.Identity, "error", eerr)
+			}
+			return false
+		}
+	}
+	if a.NetBoxID == 0 {
+		return true
+	}
+	var releaseErr error
+	if c.srv.netbox == nil {
+		// A non-zero NetBoxID with no wired client is a programming error (a
+		// server that claimed an address without a client could not exist),
+		// but panicking mid-rollback is the worst place to discover that.
+		// Treat it exactly like a failed release.
+		releaseErr = fmt.Errorf("netbox client not wired")
+	} else {
+		releaseErr = c.srv.netbox.ReleaseIP(ctx, a.NetBoxID)
+		if releaseErr != nil {
+			// Counted where the API call is, not where the rollback ends: a
+			// compensating release is a NetBox request like any other, and
+			// leaving it out made a cluster whose rollbacks were all failing
+			// read as zero API errors.
+			c.srv.nbMetrics().IncAPIError(netbox.Classify(releaseErr))
+		}
+	}
+	if releaseErr != nil {
+		slog.Warn("netbox: compensating release failed; enqueueing orphan check",
+			"address", a.IP, "netbox_id", a.NetBoxID, "error", releaseErr)
+		if eerr := c.enqueueOrphanBounded(base, a.Identity); eerr != nil {
+			slog.Error("netbox: could not enqueue orphan check — address may be stranded",
+				"identity", a.Identity, "error", eerr)
+		}
+		return false
+	}
+	return true
 }
 
 // enqueueOrphanChecks names every claim in the set for the orphan sweep WITHOUT

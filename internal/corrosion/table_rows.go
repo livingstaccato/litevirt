@@ -374,6 +374,7 @@ func (m *pagedMerge) page(p *pb.TableRowsPage) error {
 func (m *pagedMerge) finish(start time.Time) error {
 	m.finishParents()
 	m.c.observeMerge(time.Since(start), m.merged, m.skipped)
+	m.c.endSpecHoldPass()
 	slog.Info("sync: merged paged remote state (LWW)", "tables", len(m.rows), "merged", m.merged, "skipped", m.skipped)
 	return m.firstErr
 }

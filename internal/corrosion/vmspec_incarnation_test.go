@@ -9,10 +9,21 @@ import (
 // The actual mutation callbacks run outside the transaction. Recreate at the
 // same generation there, so a generation-only CAS necessarily sees the ABA.
 func TestMutateDesiredSpec_RecreateCannotInheritOldIdentity(t *testing.T) {
+	testSpecIncarnationABA(t, false)
+}
+
+func TestMutateDesiredSpec_LatchedRecreateCannotInheritOldIdentity(t *testing.T) {
+	testSpecIncarnationABA(t, true)
+}
+
+func testSpecIncarnationABA(t *testing.T, latched bool) {
 	for _, path := range []string{"metadata", "mint-helper", "noop"} {
 		t.Run(path, func(t *testing.T) {
 			ctx := context.Background()
 			c := testClient(t)
+			if latched {
+				specConflictOn(c)
+			}
 			g := mintGrant(t)
 			seedVM(t, c, "aba", `{"cpu":2}`)
 			oldID, _, err := MintFirewallID(ctx, c, g, TagMemberVM, "", "aba")
@@ -85,10 +96,21 @@ func TestMutateDesiredSpec_RecreateCannotInheritOldIdentity(t *testing.T) {
 }
 
 func TestMutateDesiredSpec_RetriesWithinSameIncarnation(t *testing.T) {
+	testSpecIncarnationRetry(t, false)
+}
+
+func TestMutateDesiredSpec_LatchedRetriesWithinSameIncarnation(t *testing.T) {
+	testSpecIncarnationRetry(t, true)
+}
+
+func testSpecIncarnationRetry(t *testing.T, latched bool) {
 	for _, noop := range []bool{false, true} {
 		t.Run(map[bool]string{false: "write", true: "noop"}[noop], func(t *testing.T) {
 			ctx := context.Background()
 			c := testClient(t)
+			if latched {
+				specConflictOn(c)
+			}
 			seedVM(t, c, "retry", `{"cpu":2}`)
 			calls := 0
 			applied, gen, err := MutateDesiredSpec(ctx, c, "retry", func(old string) (string, error) {

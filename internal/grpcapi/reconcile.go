@@ -131,11 +131,11 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 		}
 		if strings.HasPrefix(bridge, "direct:") {
 			direct := strings.TrimPrefix(bridge, "direct:")
-			netConfigs = append(netConfigs, lv.NetworkConfig{Direct: direct, Model: model, MAC: n.MAC, SpecOrdinal: n.Ordinal + 1, RateMBps: compose.NICRate(spec, n.Ordinal, n.NetworkName)})
+			netConfigs = append(netConfigs, lv.NetworkConfig{Direct: direct, Model: model, MAC: n.MAC, SpecOrdinal: n.Ordinal + 1, RateMBps: compose.NICRate(spec, n.MAC, n.Ordinal, n.NetworkName)})
 			wantNICs = append(wantNICs, lv.WantNIC{MAC: n.MAC, Direct: direct, Model: model})
 			continue
 		}
-		netConfigs = append(netConfigs, lv.NetworkConfig{Bridge: bridge, Model: model, MAC: n.MAC, SpecOrdinal: n.Ordinal + 1, RateMBps: compose.NICRate(spec, n.Ordinal, n.NetworkName)})
+		netConfigs = append(netConfigs, lv.NetworkConfig{Bridge: bridge, Model: model, MAC: n.MAC, SpecOrdinal: n.Ordinal + 1, RateMBps: compose.NICRate(spec, n.MAC, n.Ordinal, n.NetworkName)})
 		wantNICs = append(wantNICs, lv.WantNIC{MAC: n.MAC, Bridge: bridge, Model: model})
 	}
 

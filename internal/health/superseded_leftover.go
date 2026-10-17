@@ -183,7 +183,17 @@ func ReapSupersededStoppedLeftover(ctx context.Context, db *corrosion.Client, vi
 	} else if err := RemoveVMOwnerEpochMarker(dataDir, name); err != nil {
 		marker = "not removed: " + err.Error()
 	}
-	vars := setAsideSupersededVars(lo.Vars, time.Now())
+	// Re-checked right before each rename: a same-name create may have
+	// defined its domain, or its record arrived, since the undefine.
+	vars := setAsideSupersededVars(lo.Vars, time.Now(), func() string {
+		if virt.DomainExists(name) {
+			return "a domain of the name is defined again"
+		}
+		if vm, err := corrosion.GetVM(ctx, db, name); err != nil || vm != nil {
+			return "the name has a live record again, or it cannot be read"
+		}
+		return ""
+	})
 	detail := fmt.Sprintf("%s undefined its shut-off definition of deleted VM %s: the deleted record names %s at owner epoch %d, "+
 		"newer than this copy's %d; disks and TPM state kept; UEFI vars %s; owner-epoch marker %s",
 		self, name, lo.RowHost, lo.RowOwnerEpoch, lo.MarkerEpoch, vars, marker)
@@ -201,7 +211,9 @@ func ReapSupersededStoppedLeftover(ctx context.Context, db *corrosion.Client, vi
 
 // setAsideSupersededVars renames each of paths that is a regular file to
 // <path>.superseded-<at>, and says what became of them, for the event.
-func setAsideSupersededVars(paths []string, at time.Time) string {
+// keep, called right before each rename, names why the file must stay, or
+// returns "".
+func setAsideSupersededVars(paths []string, at time.Time, keep func() string) string {
 	var done []string
 	for _, p := range paths {
 		fi, err := os.Lstat(p)
@@ -210,6 +222,10 @@ func setAsideSupersededVars(paths []string, at time.Time) string {
 		}
 		if err != nil || !fi.Mode().IsRegular() {
 			done = append(done, fmt.Sprintf("%s left in place (not a readable regular file: %v)", p, err))
+			continue
+		}
+		if why := keep(); why != "" {
+			done = append(done, fmt.Sprintf("%s left in place (%s)", p, why))
 			continue
 		}
 		to := supersededName(p, at)

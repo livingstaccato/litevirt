@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -365,4 +366,85 @@ func TestReconciler_ADefinitionReplacedMeanwhileIsNotUndefined(t *testing.T) {
 	if u := f.undefines(); len(u) != 1 || u[0].Note != "remove_storage=true" {
 		t.Fatalf("undefines = %+v, want only the create's", u)
 	}
+}
+
+// redefineAfterCheck is the fake with a same-name create's define landing
+// right after the reap's post-undefine DomainExists check.
+type redefineAfterCheck struct {
+	*libvirtfake.Fake
+	undefined, redefined bool
+}
+
+func (v *redefineAfterCheck) UndefineDomainPreservingState(name string) error {
+	err := v.Fake.UndefineDomainPreservingState(name)
+	v.undefined = err == nil
+	return err
+}
+
+func (v *redefineAfterCheck) DomainExists(name string) bool {
+	exists := v.Fake.DomainExists(name)
+	if v.undefined && !v.redefined {
+		v.redefined = true
+		v.Fake.SetState(name, libvirtfake.StateShutdown)
+		v.Fake.SetInactiveXML(name, `<domain type="kvm"><name>pakg</name><uuid>99999999-2222-4333-8444-555555555555</uuid></domain>`)
+	}
+	return exists
+}
+
+// A same-name create that defines its domain, or whose record arrives, after
+// the reap's undefine keeps the UEFI vars where they are: the name may be
+// theirs now.
+//
+// Mutation: drop the re-check before each vars rename — both subtests red.
+func TestReap_VarsStayWhenTheNameIsRetakenAfterTheUndefine(t *testing.T) {
+	ctx := context.Background()
+	check := func(t *testing.T, f *leftoverFixture, virt SupersededLeftoverVirt, why string) {
+		t.Helper()
+		ok, reason := ReapSupersededStoppedLeftover(ctx, f.db, virt, f.dataDir, "node-4", "pakg", "test")
+		if !ok {
+			t.Fatalf("not undefined: %s", reason)
+		}
+		for _, v := range f.vars {
+			if !supersededPresent(v) {
+				t.Errorf("%s was moved", v)
+			}
+		}
+		set, err := ListSupersededVars(f.dataDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(set) != 0 {
+			t.Errorf("set-aside vars = %+v, want none", set)
+		}
+		evs, err := corrosion.ListVMEvents(ctx, f.db, "pakg", 10, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, e := range evs {
+			if e.Type == "vm.leftover.undefined" && strings.Contains(e.Detail, "left in place ("+why) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no event says the vars were left in place because %s: %+v", why, evs)
+		}
+	}
+	t.Run("live record", func(t *testing.T) {
+		f := newLeftoverFixture(t, lab2Case())
+		f.fake.OnUndefined = func(name string) {
+			if err := corrosion.InsertVM(ctx, f.db, corrosion.VMRecord{Name: name, HostName: "node-4", State: "pending", Spec: `{}`}, nil, nil); err != nil {
+				t.Error(err)
+			}
+		}
+		check(t, f, f.fake, "the name has a live record again")
+	})
+	t.Run("domain defined again", func(t *testing.T) {
+		f := newLeftoverFixture(t, lab2Case())
+		v := &redefineAfterCheck{Fake: f.fake}
+		check(t, f, v, "a domain of the name is defined again")
+		if !v.redefined {
+			t.Fatal("the create's define never landed")
+		}
+	})
 }

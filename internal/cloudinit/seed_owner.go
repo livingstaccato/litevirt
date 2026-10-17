@@ -49,16 +49,52 @@ func StampSeed(iso, owner string) error {
 		return nil
 	}
 	// The sweep of stale seed temporaries (sweepStaleSeedTemps) covers this
-	// name too.
+	// name too. Durable: the stamp's bytes reach the disk before the rename
+	// makes it the stamp, and the rename before this returns — a power cut
+	// otherwise leaves an empty stamp (lab 2, abort proof, surprise 1).
 	tmp := filepath.Join(filepath.Dir(iso), "."+filepath.Base(iso)+"."+randid.New()+".tmp")
-	if err := os.WriteFile(tmp, []byte(owner+"\n"), 0o600); err != nil {
+	if err := writeSynced(tmp, []byte(owner+"\n")); err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, stamp); err != nil {
 		os.Remove(tmp)
 		return err
 	}
-	return nil
+	return syncDir(filepath.Dir(stamp))
+}
+
+// fileSync and dirSync are (*os.File).Sync; a test records them.
+var (
+	fileSync = (*os.File).Sync
+	dirSync  = (*os.File).Sync
+)
+
+// writeSynced writes b to a new file at p, mode 0600, and syncs it.
+func writeSynced(p string, b []byte) error {
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := fileSync(f); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// syncDir syncs directory dir, so a rename in it survives a power cut.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return dirSync(d)
 }
 
 // RemoveSeed removes the seed at iso, its stamp and its stale mark.
@@ -121,6 +157,9 @@ func SeedTriedForStart(ctx context.Context) bool {
 func clearSeedStale(iso string) { _ = os.Remove(SeedStalePath(iso)) }
 
 // SeedOwner returns the stamp of the seed at iso: ok=false when it has none.
+// A stamp that is there but empty (a stamp written before stamps were
+// synced, cut short by a power loss) is ok with owner "": its owner is not
+// known, and a caller must not read it as another VM's.
 func SeedOwner(iso string) (owner string, ok bool, err error) {
 	b, err := os.ReadFile(SeedOwnerPath(iso))
 	if errors.Is(err, os.ErrNotExist) {

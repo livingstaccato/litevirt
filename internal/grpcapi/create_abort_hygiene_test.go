@@ -411,3 +411,41 @@ func TestCreateVM_AKeptDiskStaysAsideWhileTheDomainIsLeftDefined(t *testing.T) {
 	}
 	assertFileIs(t, k[0], kept, "the kept disk")
 }
+
+// A seed whose stamp is empty (a power cut while it was written) has an
+// owner not known, so a create of the name keeps it as a kept VM's: put back
+// after a failed create, moved to .kept- by one that succeeds — never
+// removed (lab 2, abort proof, surprise 1).
+//
+// Mutation: read an empty stamp as another VM's again — the seed is removed,
+// red.
+func TestCreateVM_ASeedWithAnEmptyStampIsKept(t *testing.T) {
+	stageGenisoimage(t)
+	s, fake, _ := isoServer(t)
+	tombstonedVM(t, s, "w", "00000000-0000-4000-8000-00000000c0de")
+	kept := []byte("a seed whose stamp a power cut emptied")
+	iso := lv.CloudInitISOPath(s.dataDir, "w")
+	if err := os.MkdirAll(filepath.Dir(iso), 0o711); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(iso, kept, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cloudinit.SeedOwnerPath(iso), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake.FailStartDomain = func(string) error { return errors.New("boom") }
+	if _, err := s.CreateVM(adminCtx(), seedCreateRequest(t, s, "w", "#cloud-config\n")); err == nil {
+		t.Fatal("the create was meant to fail")
+	}
+	assertFileIs(t, iso, kept, "the seed after the failed create")
+	fake.FailStartDomain = nil
+	if _, err := s.CreateVM(adminCtx(), seedCreateRequest(t, s, "w", "#cloud-config\n")); err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	k := keptCopiesOf(t, iso)
+	if len(k) != 1 {
+		t.Fatalf("kept seeds after a create that succeeded = %v; want the one with the empty stamp", k)
+	}
+	assertFileIs(t, k[0], kept, "the set-aside seed")
+}

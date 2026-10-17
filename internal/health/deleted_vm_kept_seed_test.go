@@ -136,3 +136,42 @@ func TestListKeptDisks_ListsADeletedVMsSeedKeptInPlace(t *testing.T) {
 		t.Errorf("kept files = %+v; want only the deleted VMs' own seeds", got)
 	}
 }
+
+// A seed whose stamp is empty (a power cut while it was written) has an
+// owner not known: while no VM of the name exists it is listed as kept,
+// never hidden (lab 2, abort proof, surprise 1).
+//
+// Mutation: read an empty stamp as another VM's again — the seed is not
+// listed, red.
+func TestListKeptDisks_ListsASeedWithAnEmptyStamp(t *testing.T) {
+	db := corrosion.NewTestClientT(t)
+	ctx := context.Background()
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "pakf", HostName: "node-4", State: "stopped",
+		Spec: `{"uuid":"pakf-1"}`}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.DeleteVM(ctx, db, "pakf"); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := t.TempDir()
+	iso := lv.CloudInitISOPath(dataDir, "pakf")
+	if err := os.MkdirAll(filepath.Dir(iso), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(iso, []byte("user-data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cloudinit.SeedOwnerPath(iso), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ListKeptDisks(ctx, db, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Path != iso || !got[0].Seed {
+		t.Fatalf("kept files = %+v; want the seed %s with the empty stamp", got, iso)
+	}
+}

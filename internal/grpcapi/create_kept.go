@@ -71,12 +71,12 @@ func (s *Server) setAsideKeptSeed(ctx context.Context, name string, keptDisks bo
 // name was kept with: it is stamped for the name's deleted incarnation, or
 // for the VM whose firmware state a --keep-disks delete retained. An
 // unstamped seed (written before stamps) counts when this host holds what a
-// delete kept of the name. What cannot be read counts: a seed moved aside is
-// kept, a seed removed is lost.
+// delete kept of the name. What cannot be read counts, and so does an empty
+// stamp: a seed moved aside is kept, a seed removed is lost.
 func (s *Server) seedOfAKeptVM(ctx context.Context, name, iso string, keptDisks bool) bool {
 	stamp, stamped, err := cloudinit.SeedOwner(iso)
-	if err != nil {
-		return true
+	if err != nil || (stamped && stamp == "") {
+		return true // an owner not known (an empty stamp: a power cut)
 	}
 	_, spec, err := corrosion.GetTombstonedVM(ctx, s.db, name)
 	if err != nil {

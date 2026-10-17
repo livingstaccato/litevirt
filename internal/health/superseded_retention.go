@@ -387,8 +387,9 @@ func RemoveSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir st
 // keptSeedsInPlace lists the seeds in seedDir (<data_dir>/cloudinit/<vm>.iso)
 // of VMs that no longer exist: no live row of the name here, and a tombstone
 // of it. A seed stamped for another VM of the name is not the deleted VM's
-// and is left out; an unstamped one (written before seeds were stamped) is
-// listed, as is one stamped for the deleted incarnation. Such a seed is one a
+// and is left out; an unstamped one (written before seeds were stamped), one
+// whose stamp is empty or cannot be read, and one stamped for the deleted
+// incarnation are listed. Such a seed is one a
 // delete kept (`lv rm --keep-disks`, or a disk left at its path on a
 // failover's old host), or one an earlier release left; it can hold
 // user-data, and nothing on the host removes it. MovedAt is its mtime.
@@ -426,8 +427,11 @@ func keptSeedsInPlace(ctx context.Context, db *corrosion.Client, seedDir string)
 		if createdAt == "" {
 			continue
 		}
+		// Left out only when the stamp names another VM: an empty or
+		// unreadable stamp (a power cut while it was written) is an owner
+		// not known, and the seed stays listed (lab 2, abort proof).
 		stamp, stamped, err := cloudinit.SeedOwner(iso)
-		if err == nil && stamped && stamp != cloudinit.SpecUUID(spec) {
+		if err == nil && stamped && stamp != "" && stamp != cloudinit.SpecUUID(spec) {
 			continue
 		}
 		out = append(out, KeptCopy{Path: iso, DiskPath: iso, MovedAt: fi.ModTime(), SizeBytes: fi.Size(), Seed: true})

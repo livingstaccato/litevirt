@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -42,6 +43,7 @@ func TestStackReconciler_UnreadableStoredComposeKeepsNetworksAndStack(t *testing
 	if err := corrosion.UpsertStack(ctx, db, corrosion.StackRecord{Name: "bad", ComposeYAML: "vms: [a]\n", State: "deleting"}); err != nil {
 		t.Fatal(err)
 	}
+	setStackUpdatedAt(t, db, "bad", time.Now().Add(-time.Hour))
 	if err := corrosion.UpsertNetwork(ctx, db, corrosion.NetworkRecord{Name: "bad_lan", StackName: "bad", Type: "bridge", Config: "{}"}); err != nil {
 		t.Fatal(err)
 	}

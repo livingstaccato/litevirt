@@ -157,8 +157,11 @@ not even be listed — each failure is printed, named for what was left (a VM or
 container name, `network <name>`, `containers (list failed)`, `firewall rows`
 or `backup repos`), the success line is withheld, and the command
 exits non-zero with a summary such as `stack "web": 1 of 3 deletions failed
-(web-2)`. The stack is then left in state `deleting`, the daemon keeps retrying
-the teardown in the background, and the `stack.delete` audit entry has result
+(web-2)`. A member VM that another delete removed first (`lv rm`, or the
+background retry) counts as deleted. The stack is then left in state
+`deleting`, the daemon keeps retrying the teardown in the background (it takes
+a teardown up no sooner than a minute after it began, leaving a `compose down`
+still running to finish), and the `stack.delete` audit entry has result
 `error` and names what was not removed. While any of the stack's VMs or
 containers is left, none of its networks is deprovisioned: a deleted network
 is torn down on every host, and would be pulled out from under that workload.

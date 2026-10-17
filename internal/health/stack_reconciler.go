@@ -13,6 +13,14 @@ import (
 
 const stackReconcileInterval = 30 * time.Second
 
+// stackTeardownGrace is how long a teardown is left to the compose down that
+// began it before the reconciler takes it up. DeleteStack marks the stack
+// "deleting" before it deletes anything (so a crashed teardown is finished
+// here), and every host runs this loop: with no grace a reconciler took up a
+// teardown 0.1 s after it began and raced it member by member (lab 2
+// 2026-10-17, anomaly 2).
+const stackTeardownGrace = 60 * time.Second
+
 // StackCleaner is the interface for resource cleanup operations.
 // Implemented by grpcapi.Server.
 type StackCleaner interface {
@@ -33,13 +41,27 @@ type StackReconciler struct {
 	hostName string
 	db       *corrosion.Client
 	cleaner  StackCleaner
+
+	// now is the clock (time.Now; tests replace it). deletingSeen is, per
+	// stack in "deleting", the updated_at it was seen with and when this
+	// host first saw that value (teardownInFlight).
+	now          func() time.Time
+	deletingSeen map[string]deletingSighting
+}
+
+// deletingSighting is a stack's teardown stamp and when this host first saw it.
+type deletingSighting struct {
+	updatedAt string
+	at        time.Time
 }
 
 // NewStackReconciler creates a stack reconciler.
 func NewStackReconciler(hostName string, db *corrosion.Client) *StackReconciler {
 	return &StackReconciler{
-		hostName: hostName,
-		db:       db,
+		hostName:     hostName,
+		db:           db,
+		now:          time.Now,
+		deletingSeen: map[string]deletingSighting{},
 	}
 }
 
@@ -73,8 +95,20 @@ func (r *StackReconciler) reconcile(ctx context.Context) {
 		return
 	}
 
+	listed := make(map[string]bool, len(stacks))
 	for _, stack := range stacks {
+		listed[stack.Name] = true
+		if r.teardownInFlight(stack) {
+			slog.Debug("stack-reconciler: teardown began recently; left to the compose down running it",
+				"stack", stack.Name, "updated_at", stack.UpdatedAt)
+			continue
+		}
 		r.reconcileStack(ctx, stack)
+	}
+	for name := range r.deletingSeen {
+		if !listed[name] {
+			delete(r.deletingSeen, name)
+		}
 	}
 
 	// Rows a torn-down stack still owns (handed to it by a concurrent
@@ -92,6 +126,31 @@ func (r *StackReconciler) reconcile(ctx context.Context) {
 	if err := corrosion.ReassertStackDefaultDeny(ctx, r.db, compose.StoredStackWants); err != nil {
 		slog.Warn("stack-reconciler: re-assert the cluster default-deny a stack asks for", "error", err)
 	}
+}
+
+// teardownInFlight reports a stack whose teardown began less than
+// stackTeardownGrace ago: its updated_at (stamped by SetStackState when
+// DeleteStack marked it "deleting") is younger than the grace by this host's
+// clock, and this host has not yet seen that same stamp for the grace.
+//
+// The second half is what bounds the wait. updated_at comes from the
+// coordinator's clock, and one running ahead of this host's would keep the
+// stamp young for as long as it is ahead; a stamp that sits unchanged for the
+// grace is taken up whatever it says. Only a new stamp — a teardown begun
+// again — restarts the grace, so a stack is left only while compose down keeps
+// being re-run, each run a teardown of its own.
+func (r *StackReconciler) teardownInFlight(stack corrosion.StackRecord) bool {
+	now := r.now()
+	seen, ok := r.deletingSeen[stack.Name]
+	if !ok || seen.updatedAt != stack.UpdatedAt {
+		seen = deletingSighting{updatedAt: stack.UpdatedAt, at: now}
+		r.deletingSeen[stack.Name] = seen
+	}
+	if now.Sub(seen.at) >= stackTeardownGrace {
+		return false
+	}
+	began, ok := corrosion.ParseUpdatedAt(stack.UpdatedAt)
+	return ok && now.Sub(began) < stackTeardownGrace
 }
 
 func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.StackRecord) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -51,6 +52,8 @@ func seedDeletingStack(t *testing.T, withVM, withCT bool) *corrosion.Client {
 	if err := corrosion.UpsertStack(ctx, db, corrosion.StackRecord{Name: "app", ComposeYAML: "vms: {}\n", State: "deleting"}); err != nil {
 		t.Fatal(err)
 	}
+	// A teardown begun long ago: not one in flight (stackTeardownGrace).
+	setStackUpdatedAt(t, db, "app", time.Now().Add(-time.Hour))
 	if err := corrosion.UpsertNetwork(ctx, db, corrosion.NetworkRecord{Name: "app_lan", StackName: "app", Type: "bridge", Config: "{}"}); err != nil {
 		t.Fatal(err)
 	}

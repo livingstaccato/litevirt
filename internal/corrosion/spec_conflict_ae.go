@@ -23,7 +23,9 @@ import (
 //     did not survive into the version kept.
 //
 // An operation counts as finished once either side records a terminal step
-// for it: the row without its barrier is then its completion.
+// for it: the row without its barrier is then its completion. Until then its
+// barrier also holds off a longer line of out-of-band edits under the same
+// owner that does not descend from its claim.
 
 // finishedOperationsInPayload is every operation an anti-entropy payload
 // records a terminal step for.
@@ -79,7 +81,24 @@ func (c *Client) specConflictAE(tx *sql.Tx, table syncTable, row []interface{}, 
 	switch {
 	case incoming.generation > local.gen:
 		if decision == mergeAuthorityApplyIncoming || decision == mergeAuthorityApplyIncomingAndSweep {
-			if is, known := specAncestorAt(incoming.spec, incoming.generation-local.gen, localHash); known && !is && inHash != localHash {
+			is, known := specAncestorAt(incoming.spec, incoming.generation-local.gen, localHash)
+			// A longer line of edits under the same owner that does not
+			// descend from the local row's claim waits while that claim's
+			// operation runs: its barrier is not overwritten. It applies, and
+			// the claim's version is recorded, once either side records the
+			// operation terminal.
+			if incoming.ownerEpoch == local.epoch && local.activeOp != "" && !(known && is) {
+				done := incoming.finishedOps[local.activeOp]
+				if !done {
+					if done, err = operationFinished(ctx, tx, local.activeOp); err != nil {
+						return mergeAuthorityKeepLocal, err
+					}
+				}
+				if !done {
+					return mergeAuthorityKeepLocal, nil
+				}
+			}
+			if known && !is && inHash != localHash {
 				dropLocal.reason = specDropNewerGen
 				c.noteSpecEditDropped(tx, dropLocal)
 			}

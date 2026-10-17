@@ -88,6 +88,12 @@ const specDropDetailMax = 4096
 // carrying the dropped spec so the edit can be made again.
 func (c *Client) noteSpecEditDropped(tx *sql.Tx, d specEditDrop) {
 	c.deferAfterCommit(tx, func() {
+		// A drop is noted once per process: anti-entropy can meet the same
+		// losing version on every pass until the peer holding it catches up,
+		// and the event already collapses by id.
+		if !c.firstSpecDrop(specEditDroppedRecord(d).ID) {
+			return
+		}
 		slog.Warn("replication: a concurrent edit of a VM's spec was dropped",
 			"vm", d.vm, "generation", d.gen, "reason", d.reason, "path", string(d.path),
 			"dropped_edit_at", specMetaOf(d.droppedSpec).At, "kept_edit_at", specMetaOf(d.keptSpec).At)
@@ -132,7 +138,8 @@ func specEditDroppedRecord(d specEditDrop) VMEventRecord {
 		Result:   "error",
 		Severity: "warn",
 		Detail: fmt.Sprintf("an edit of the spec made at %s was dropped at generation %d: %s. "+
-			"Make the edit again if it is still wanted. Dropped spec: %s", dropped, d.gen, why, spec),
+			"A version kept since may already contain this edit; compare the dropped spec below with the "+
+			"current spec, and make again only the part of it that is missing. Dropped spec: %s", dropped, d.gen, why, spec),
 		TS: ts,
 	}
 }
@@ -143,4 +150,22 @@ func (c *Client) recordSpecEditDropped(d specEditDrop) {
 	if err := InsertVMEvent(ctx, c, specEditDroppedRecord(d)); err != nil {
 		slog.Warn("replication: could not record a dropped spec edit", "vm", d.vm, "generation", d.gen, "error", err)
 	}
+}
+
+// specDropsSeenMax bounds the drop ids remembered; past it the set restarts,
+// which at worst counts a drop twice.
+const specDropsSeenMax = 4096
+
+// firstSpecDrop reports whether id has not been noted before in this process.
+func (c *Client) firstSpecDrop(id string) bool {
+	c.specDropsMu.Lock()
+	defer c.specDropsMu.Unlock()
+	if c.specDropsSeen == nil || len(c.specDropsSeen) >= specDropsSeenMax {
+		c.specDropsSeen = make(map[string]struct{})
+	}
+	if _, seen := c.specDropsSeen[id]; seen {
+		return false
+	}
+	c.specDropsSeen[id] = struct{}{}
+	return true
 }

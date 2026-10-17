@@ -106,6 +106,12 @@ func specOrder(local, in specVersion, finished func(op string) bool) (inWins boo
 	case in.epoch < local.epoch:
 		return false, why(specDropStaleEpoch)
 	}
+	// An unfinished operation's barrier. Two claims at one epoch and
+	// generation need two hosts that each think they own the VM (an
+	// ownership split brain): they fall through to the stamp, and the
+	// losing host's completion then misses — as main's clock merge let the
+	// later claim win — and its resize recovery, which keeps no journal,
+	// re-drives the winner's resize on its own copy.
 	localBarrier := local.op != "" && !finished(local.op)
 	inBarrier := in.op != "" && !finished(in.op)
 	switch {
@@ -389,9 +395,13 @@ func clearClock(s Statement) string {
 // keepClock advances the live row's clock to the later of its own and a
 // received edit's that changed nothing here. Every replica's row clock is
 // then the latest of every write to the row, whichever ones each kept, so
-// replicas that keep the same version also hold the same row; and a write
-// older than a dropped edit is skipped everywhere alike. The clock orders no
-// spec — the stamp does (spec_stamp.go).
+// replicas that keep the same version converge on the same clock. The clock
+// orders no spec — the stamp does (spec_stamp.go). It is still the row's LWW
+// clock for its other columns: a non-spec write from a third host whose
+// clock falls between the kept edit's and the dropped one's is skipped on a
+// replica that advanced past it, while one that saw it first applied it —
+// the same partial-column class any replica that saw the dropped edit first
+// already had; anti-entropy settles the columns by the tie resolver.
 func keepClock(ctx context.Context, tx *sql.Tx, local specRow, incoming string) error {
 	later := laterClock(local.updatedAt, incoming)
 	if later == local.updatedAt {

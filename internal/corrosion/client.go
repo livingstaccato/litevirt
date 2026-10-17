@@ -452,6 +452,9 @@ type Client struct {
 	// at one generation is resolved (spec_conflict.go). Unset reads false,
 	// the previous release's behaviour.
 	specConflictGate atomic.Pointer[func() bool]
+	// specDropsSeen is the spec-edit drops already noted (firstSpecDrop).
+	specDropsMu   sync.Mutex
+	specDropsSeen map[string]struct{}
 	// voterConfigGate, when set and returning true, permits WRITING
 	// voter_configs. Injected via SetVoterConfigGate, wired to the durable
 	// voter_config_v1 latch. Fails CLOSED when unset: that table's shapes

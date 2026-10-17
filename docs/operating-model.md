@@ -481,19 +481,24 @@ of acting — it says nothing about whether the resulting rows have replicated.
   where it entered. Two edits made from the same spec generation on two sides of
   a partition then conflict, and once `spec_conflict_v1` has latched every host
   keeps the same one ([upgrades.md](upgrades.md#concurrent-spec-edits-are-resolved-after-the-roll)):
-  the one made under the newer owner; else an operation's (an operation's
-  barrier is never overwritten by an out-of-band edit while the operation
-  runs); else the one edited later, by the edit time each edit records in the
-  spec itself (not the row's clock, which state writes move); else the one
-  whose content orders higher. When one side made more edits, its longer line
-  wins. The edit that loses is not lost silently: each host that drops it
-  records a `vm.spec_edit_dropped` event on the VM (`lv events <vm>`) quoting
-  the dropped spec, so the edit can be made again, and counts it in
+  the one made under the newer owner; else an operation's claim over an
+  out-of-band edit while the operation has not finished; else the one edited
+  later, by the edit time each edit records in the spec itself (not the row's
+  clock, which state writes move); else the one whose content orders higher.
+  When one side made more edits, its longer line wins — except that, under
+  the same owner, a longer line of out-of-band edits that does not descend
+  from a running operation's claim waits until that operation has finished,
+  so the operation's barrier stands and it can complete. A newer owner's row
+  replaces the barrier of an operation started under the old one. The edit
+  that loses is not lost silently: each host that drops it records a
+  `vm.spec_edit_dropped` event on the VM (`lv events <vm>`) quoting the dropped
+  spec, and counts it in
   `litevirt_merge_apply_rejected_total{table="vms",reason="spec_edit_dropped"}`.
-  Once an operation has finished, an out-of-band edit made from its
-  generation is ordered like any other, so it can replace the operation's
-  desired spec while the VM keeps what the operation applied — recorded the
-  same way.
+  A version kept since may already contain the dropped edit, so compare it with
+  the current spec before making any of it again. Once an operation has
+  finished, out-of-band edits made from its generation or before are ordered
+  like any others, so they can replace the operation's desired spec while the
+  VM keeps what the operation applied — recorded the same way.
 
 ### Leader-lease terms, and what enforcing on them does and does not buy
 

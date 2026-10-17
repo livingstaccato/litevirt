@@ -256,7 +256,10 @@ func (c *Client) BeginVMOperation(ctx context.Context, op OperationRecord, desir
 	if c.SpecConflictOn() {
 		// The claim stamps the spec with when it was edited and the content
 		// it was made from (spec_stamp.go). Read here, outside the guard: a
-		// row that moved meanwhile fails the guard's generation check.
+		// row that moved to another generation meanwhile fails the guard. A
+		// sibling taken at the same generation in between is not caught, and
+		// the lineage then names the version the caller computed the claim
+		// from — the one the claim does replace on receivers.
 		rows, err := c.Query(ctx, `SELECT spec FROM vms WHERE name = ? AND deleted_at IS NULL`, op.ResourceID)
 		if err != nil {
 			return false, err

@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
@@ -151,5 +152,59 @@ func TestFleet_IsolatedNoRouterFollowsNICCount(t *testing.T) {
 	}
 	if listed(macM) || listed(y.MAC) {
 		t.Errorf("deleted VM's NICs are still in the hosts file: %s %v, %s %v", macM, listed(macM), y.MAC, listed(y.MAC))
+	}
+}
+
+// The same owner used before buildServer replaces a server must wait for an
+// actual DHCP backend reader, including a callback already in progress.
+func TestFleet_ServerLoopStopJoinsDHCPWorker(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 1, SharedCRDT: true})
+	n := c.Nodes[0]
+	old := n.Server
+	cfg, err := json.Marshal(compose.NetworkDef{Type: "isolated", Subnet: "10.66.0.0/24", DHCP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertNetwork(ctx, n.DB, corrosion.NetworkRecord{Name: "lifetime-dhcp", Type: "isolated", Config: string(cfg)}); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var enteredOnce, releaseOnce sync.Once
+	old.SetDHCPHostsSync(func(string, map[string]network.DHCPHost) (bool, error) {
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+		return false, nil
+	})
+	workerDone := old.StartDHCPReservations(ctx, time.Hour)
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }); old.StopDHCPReservations(); <-workerDone })
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the old server's DHCP worker did not enter its backend")
+	}
+	stop := n.stopServerLoops
+	stopped := make(chan struct{})
+	go func() { defer close(stopped); stop() }()
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }); <-stopped })
+	select {
+	case <-stopped:
+		t.Fatal("replacement stop returned while the old DHCP worker still owned its backend")
+	case <-time.After(30 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case <-stopped:
+	case <-time.After(3 * time.Second):
+		t.Fatal("replacement stop did not finish after the held backend returned")
+	}
+	select {
+	case <-workerDone:
+	default:
+		t.Fatal("replacement stop returned before the actual DHCP worker completed")
+	}
+	restartNode(t, c, n)
+	if n.Server == old {
+		t.Fatal("the fixture did not replace the server")
 	}
 }

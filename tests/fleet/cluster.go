@@ -980,8 +980,13 @@ func (c *Cluster) buildServer(n *Node) {
 	// at once, as in production.
 	loops, stop := context.WithCancel(c.ctx)
 	loopDone := make(chan struct{})
-	n.stopServerLoops = func() { stop(); <-loopDone }
-	go func() { defer close(loopDone); n.Server.RunLUNHoldResolver(loops, 10*time.Second) }()
+	server := n.Server
+	n.stopServerLoops = func() {
+		stop()
+		server.StopDHCPReservations()
+		<-loopDone
+	}
+	go func() { defer close(loopDone); server.RunLUNHoldResolver(loops, 10*time.Second) }()
 
 	// Wire a real Replicator so the server's PushMutations handler + write-notify
 	// path are exercised. By default its background push loop is NOT started, so

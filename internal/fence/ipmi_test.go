@@ -360,3 +360,26 @@ func TestVerifyIPMIPowerOff_ABudgetTimeoutDoesNotEraseTheBMCsReason(t *testing.T
 		t.Errorf("the BMC's stderr was lost: %v", err)
 	}
 }
+
+// TestFenceIPMI_RetiredCredentialIsReportedNotSent: a host whose fence
+// credential row was retired (removed or re-admitted, password not set since)
+// has no password. The fence must say so and stop, not run ipmitool with an
+// empty password and report whatever the BMC answers.
+func TestFenceIPMI_RetiredCredentialIsReportedNotSent(t *testing.T) {
+	logPath := fakeIpmitool(t, "Chassis Power is off", 0, 0)
+	h := testIPMIHost()
+	h.IPMIPass = ""
+	h.IPMICredentialRetired = true
+
+	r := Execute(context.Background(), h)
+	if r.Success {
+		t.Fatalf("fence with a retired credential succeeded: %+v", r)
+	}
+	if r.Method != "ipmi" || !strings.Contains(r.Detail, "no IPMI password") ||
+		!strings.Contains(r.Detail, "lv host config "+h.Name+" --ipmi-pass") {
+		t.Errorf("result = %+v; want an ipmi failure that says there is no password and how to set one", r)
+	}
+	if n := countInvocations(t, logPath); n != 0 {
+		t.Errorf("ipmitool ran %d time(s) with no password", n)
+	}
+}

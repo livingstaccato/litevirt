@@ -670,6 +670,11 @@ row and the old `hosts.ipmi_pass` column, so it is refused until
 predates the flag ignores it; the CLI reports an error when the host it gets
 back still has an IPMI address.
 
+`lv host rm` and a re-admission by `lv host add` retire the host's IPMI
+password. Until it is set again with `lv host config <host> --ipmi-pass`, an
+`ipmi` fence of that host fails at once with `no IPMI password`, and never
+falls back to a password from before the removal.
+
 ### Redfish
 
 A host whose BMC speaks Redfish (DMTF DSP0266) can be fenced through it

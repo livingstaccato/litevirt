@@ -34,6 +34,9 @@ type HostConfig struct {
 	IPMIAddress string
 	IPMIUser    string
 	IPMIPass    string
+	// IPMICredentialRetired: the host's fence credential was retired (the host
+	// was removed or re-admitted) and no password has been set since.
+	IPMICredentialRetired bool
 	// Redfish — only used when FenceStrategy = "redfish"
 	Redfish RedfishConfig
 	// Watchdog — only used when FenceStrategy = "watchdog" (self-fencing)
@@ -274,6 +277,14 @@ func fenceIPMI(ctx context.Context, h HostConfig) Result {
 		return Result{
 			Method:  "ipmi",
 			Detail:  "ipmi_address not configured on host",
+			Success: false,
+		}
+	}
+	if h.IPMICredentialRetired {
+		return Result{
+			Method: "ipmi",
+			Detail: "no IPMI password: the host's fence credential was retired when it was removed or re-admitted; " +
+				"set it with `lv host config " + h.Name + " --ipmi-pass <secret>`",
 			Success: false,
 		}
 	}

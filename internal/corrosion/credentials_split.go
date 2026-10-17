@@ -64,7 +64,8 @@ import (
 // included — runs a build that reads only the old columns.
 //
 // READ RULE. A reader takes the live credential row whenever one exists, and
-// the old column only when none does. It never compares the credential row's
+// the old column only when none does — for hosts, only when no credential row
+// exists at all, live or retired (resolveHostCredential). It never compares the credential row's
 // updated_at with the PARENT row's: the parent's is bumped by every unrelated
 // write to the row, and when one of those reaches a replica ahead of a latched
 // rotation the LWW gate refuses the rotation's parent half there, leaving the
@@ -137,6 +138,22 @@ func resolveCredential(present bool, credVal, oldVal string) string {
 	return oldVal
 }
 
+// resolveHostCredential is resolveCredential for a hosts row read through
+// hostSelectSQL, whose credential join keeps a RETIRED row too. A host's
+// credential row is retired only by its re-admission (retireFenceCredential),
+// and a retired row answers "this host has no BMC password": the old column
+// beside it is never served. Every write of a new password revives the row —
+// a latched writer's upsert, or the absorb of an unlatched one's — so the only
+// old-column value a retired row can sit beside is the removed machine's,
+// brought back by a stale row of its previous incarnation. No timestamp is
+// compared (READ RULE).
+func resolveHostCredential(r Row) string {
+	if r.String("cred_key") != "" && r.String("cred_deleted") != "" {
+		return ""
+	}
+	return resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("ipmi_pass"))
+}
+
 // The credential writers. Each is an explicit upsert on the table's primary
 // key, so the originating node applies it whether or not it already holds the
 // row, and a receiver LWW-gates it on updated_at (DispExplicitUpsert). A write
@@ -188,6 +205,14 @@ type CredentialSplitReport struct {
 // deleted_at = NULL, and the next pass would replicate the removed machine's BMC
 // password cluster-wide. Nothing reinstates a removed host's password: a
 // re-admission under the name resets ipmi_pass to NULL.
+//
+// A LIVE host whose credential row is retired is the same password. Its row
+// was retired by a re-admission, which reset the old column with it, so an
+// old-column value beside the tombstone is the removed machine's, brought back
+// by a whole row of its previous incarnation (a host re-added within the
+// incarnation grace whose daemon booted on its old database). The hosts passes
+// never copy it, and a clearing pass clears it without re-emitting the
+// tombstone (retired).
 const (
 	hostCredentialSplitScanSQL = `SELECT h.name AS pk, h.ipmi_pass AS old_val, h.updated_at AS src_ts,
 		       c.host_name AS cred_key, c.ipmi_pass AS cred_val, c.updated_at AS cred_ts,
@@ -218,7 +243,10 @@ const (
 type credentialSplitRow struct {
 	pk, oldVal, srcTS string
 	present           bool
-	credVal, credTS   string
+	// retired: the credential row exists as a tombstone. Only the hosts
+	// passes act on it (retiredHostCredential).
+	retired         bool
+	credVal, credTS string
 }
 
 func scanCredentialSplitRows(ctx context.Context, c *Client, query string) ([]credentialSplitRow, error) {
@@ -233,6 +261,7 @@ func scanCredentialSplitRows(ctx context.Context, c *Client, query string) ([]cr
 			oldVal:  r.String("old_val"),
 			srcTS:   r.String("src_ts"),
 			present: r.String("cred_key") != "" && r.String("cred_deleted") == "",
+			retired: r.String("cred_key") != "" && r.String("cred_deleted") != "",
 			credVal: r.String("cred_val"),
 			credTS:  r.String("cred_ts"),
 		})
@@ -359,7 +388,7 @@ func (c *Client) copyCredentialColumns(ctx context.Context) (CredentialSplitRepo
 	hosts, err := scanCredentialSplitRows(ctx, c, hostCredentialSplitScanSQL)
 	note("host_fence_credentials", err)
 	for _, r := range hosts {
-		if r.needsCopy() {
+		if r.needsCopy() && !r.retired {
 			rep.note(c.copyHostCredential(ctx, r.pk, r.oldVal, c.copyTS(r)), "host_fence_credentials", note)
 		}
 	}
@@ -444,6 +473,12 @@ func (c *Client) clearCredentialColumns(ctx context.Context) (CredentialSplitRep
 	note("host_fence_credentials", err)
 	for _, r := range hosts {
 		if skipped("host_fence_credentials", r) {
+			continue
+		}
+		if r.retired {
+			// The old column is cleared and the retired row left as it is
+			// (resolveHostCredential).
+			count("hosts", false, c.clearRemovedHostPass(ctx, r.pk, stamp(r)))
 			continue
 		}
 		val, ts, copied := c.credentialFor(r)

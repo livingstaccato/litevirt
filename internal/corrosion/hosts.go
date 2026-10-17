@@ -463,7 +463,8 @@ func GetHost(ctx context.Context, c *Client, name string) (*HostRecord, error) {
 }
 
 // hostSelectSQL is the column list scanHost reads, joined to the host's fence
-// credential so IPMIPass is resolved new-first (credentials_split.go), to its
+// credential, live or retired, so IPMIPass is resolved new-first
+// (credentials_split.go, resolveHostCredential), to its
 // live Redfish row (host_fence_redfish.go), to its membership row so State is
 // too (host_membership.go), and to its runtime row so the self-reported columns
 // are (host_runtime.go). Columns the tables
@@ -476,12 +477,12 @@ const hostSelectSQL = `SELECT h.name, h.address, h.ssh_user, h.ssh_port, h.grpc_
 			h.cpu_overcommit, h.mem_overcommit, h.cpu_reserve, h.mem_reserve_mib,
 			h.capacity_policy_hash,
 			h.created_at, h.updated_at,
-			c.host_name AS cred_key, c.ipmi_pass AS cred_val, c.updated_at AS cred_ts,
+			c.host_name AS cred_key, c.ipmi_pass AS cred_val, c.updated_at AS cred_ts, c.deleted_at AS cred_deleted,
 			rf.endpoint AS rf_endpoint, rf.username AS rf_username, rf.password AS rf_password,
 			rf.system_id AS rf_system_id, rf.auth AS rf_auth, rf.ca_pem AS rf_ca_pem,
 			` + membershipCols + `,
 			` + runtimeCols + `
-		 FROM hosts h LEFT JOIN host_fence_credentials c ON c.host_name = h.name AND c.deleted_at IS NULL
+		 FROM hosts h LEFT JOIN host_fence_credentials c ON c.host_name = h.name
 		 LEFT JOIN host_fence_redfish rf ON rf.host_name = h.name AND rf.deleted_at IS NULL` +
 	membershipJoins + runtimeJoins
 
@@ -502,7 +503,7 @@ func scanHost(r Row, hostsCopyFrozen bool) HostRecord {
 		FenceStrategy:      r.String("fence_strategy"),
 		IPMIAddress:        r.String("ipmi_address"),
 		IPMIUser:           r.String("ipmi_user"),
-		IPMIPass:           resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("ipmi_pass")),
+		IPMIPass:           resolveHostCredential(r),
 		Redfish:            redfishFromRow(r, "rf_"),
 		WatchdogDev:        r.String("watchdog_dev"),
 		Labels:             decodeLabels(r.String("labels")),

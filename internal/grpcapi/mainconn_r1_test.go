@@ -75,12 +75,26 @@ func TestRuntimeInventory_AListLibvirtDoesNotAnswerIsIncompleteAndOffTheDaemonsC
 	if snap := snapshotFromInventory(inv); !snap.partial {
 		t.Error("the dual-run snapshot of an incomplete inventory is not partial")
 	}
+	// One flight answers them all: the hung list's flight is still the
+	// current one after each later caller, and none starts its own.
+	flight := func() *inventoryFlight {
+		s.invFlights.mu.Lock()
+		defer s.invFlights.mu.Unlock()
+		return s.invFlights.cur
+	}
+	hung := flight()
+	if hung == nil {
+		t.Fatal("fixture: no flight in progress while libvirt hangs on st")
+	}
 	for i := 0; i < 3; i++ {
 		later := within(t, 5*time.Second, "a later inventory while the clock stands still", func() runtimeInventory {
 			return s.collectRuntimeInventory(context.Background())
 		})
 		if later.Complete {
 			t.Fatal("a later inventory read complete while libvirt still hangs on st")
+		}
+		if cur := flight(); cur != hung {
+			t.Fatalf("later inventory %d is not answered from the hung list's flight: it started its own", i+1)
 		}
 	}
 	if n := f.MainConnCallsFor(""); n != 0 {
@@ -278,8 +292,18 @@ func TestRuntimeInventory_ASlowButHealthyHostCompletes(t *testing.T) {
 	s.liveStateWait = 150 * time.Millisecond // stall 150 ms (reads 40 ms: 3.75x), cap 3 s
 	clock := newInvTestClock(s)
 	// 25 x 40 ms = 1 s: past any bound fixed from the flight's start. The
-	// real pause gives the caller's wait its looks while the flight runs.
-	steppedSequence(f, clock, 40*time.Millisecond, func(string) { time.Sleep(5 * time.Millisecond) })
+	// flight is held at vm10, 400 ms in on its clock, until the caller has
+	// looked at it there: the flight reads no clock while held, so each read
+	// is the caller's, and a look reads it twice (the stall, the cap).
+	steppedSequence(f, clock, 40*time.Millisecond, func(n string) {
+		if n != "vm10" {
+			return
+		}
+		base := clock.Reads()
+		for deadline := time.Now().Add(10 * time.Second); clock.Reads() < base+2 && time.Now().Before(deadline); {
+			time.Sleep(time.Millisecond)
+		}
+	})
 	inv := within(t, 10*time.Second, "an inventory of a slow host", func() runtimeInventory {
 		return s.collectRuntimeInventory(context.Background())
 	})
@@ -342,8 +366,9 @@ func TestRuntimeInventory_AStalledReadIsNoAnswer(t *testing.T) {
 // ms) between two reads, as a host at a load of 300 did, and "past the cap"
 // without the flight having been slow.
 type invTestClock struct {
-	mu  sync.Mutex
-	now time.Time
+	mu    sync.Mutex
+	now   time.Time
+	reads int // how many times Now was called
 }
 
 func newInvTestClock(s *Server) *invTestClock {
@@ -355,7 +380,15 @@ func newInvTestClock(s *Server) *invTestClock {
 func (c *invTestClock) Now() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.reads++
 	return c.now
+}
+
+// Reads is how many times Now has been called.
+func (c *invTestClock) Reads() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reads
 }
 
 func (c *invTestClock) Advance(d time.Duration) {

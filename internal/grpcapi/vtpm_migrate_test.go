@@ -327,8 +327,9 @@ func TestCleanupMigrationArtifacts_RefusesPathOutsideDataDir(t *testing.T) {
 // A stopped firmware VM with a host-local disk is no longer refused: it moves
 // with its disks and its firmware (TestColdMigrateStoppedVM_CarriesFirmwareWithAHostLocalDisk).
 
-// Drain must refuse an SB/vTPM VM regardless of storage type (firmware isn't
-// transferred by reassignment / raw live-migrate).
+// Drain skips a running SB/vTPM VM it cannot move by the live firmware move
+// (here: neither host is labelled for it), and never by reassignment or its
+// raw live-migrate.
 func TestDrainOneVM_RefusesFirmwareVM(t *testing.T) {
 	s := testServerWithLocks(t)
 	ctx := adminCtx()

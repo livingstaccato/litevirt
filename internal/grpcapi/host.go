@@ -593,6 +593,15 @@ func buildDrainPlacementRequest(vm corrosion.VMRecord, drainHost string, capacit
 	}
 	// A Secure-Boot/vTPM VM may only drain onto a capable host (G1).
 	addCapabilityLabels(&placementReq, spec)
+	// A running one moves live only onto a host labelled for the live
+	// firmware move (spec §13): such a host is preferred, not required, so a
+	// cluster without one keeps today's placement and the VM is skipped.
+	if vm.State == "running" && (spec.SecureBoot || spec.Tpm) {
+		if placementReq.PreferLabels == nil {
+			placementReq.PreferLabels = map[string]string{}
+		}
+		placementReq.PreferLabels[corrosion.LabelFwLiveMigrate] = "true"
+	}
 	return placementReq
 }
 
@@ -604,12 +613,13 @@ const notMoved = pb.MigrateStrategy_MIGRATE_NONE
 
 // drainOneVM migrates a single VM to the target host. Returns progress message.
 //
-// A running VM whose disks are all on shared storage is live-migrated. Every
-// other VM moves the way `lv migrate --cold` moves a stopped one, with its
-// host-local disks: a stopped VM as it is (drainStoppedVM), a running one shut
-// down first and started again on the target (drainRunningVMCold), which is
-// also where a failed live migration falls back to. No VM is moved by its row
-// alone.
+// A running VM whose disks are all on shared storage is live-migrated; a
+// running Secure Boot / vTPM VM only by the live firmware move, or not at all
+// (drainRunningFirmwareVM). Every other VM moves the way `lv migrate --cold`
+// moves a stopped one, with its host-local disks: a stopped VM as it is
+// (drainStoppedVM), a running one shut down first and started again on the
+// target (drainRunningVMCold), which is also where a failed live migration
+// falls back to. No VM is moved by its row alone.
 func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target corrosion.HostRecord) *pb.DrainProgress {
 	// Acquire per-VM lock to avoid migrating while a backup is in progress (#54).
 	// It is MigrateVM's lock discipline: a migration that outlives this step
@@ -648,18 +658,17 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			Error: fmt.Sprintf("VM is %s — not drainable", fresh.State)}
 	}
 
-	// A RUNNING VM is drained either by a raw libvirt live-migrate (shared storage)
-	// or shut down and cold-moved — NEITHER carries the host-local NVRAM + swtpm of a
-	// running Secure-Boot/vTPM VM (and a stale live carry would race the TPM). Refuse
-	// such a VM REGARDLESS of storage type (NVRAM is host-local even on shared disks)
-	// and point the operator at explicit migration, which captures firmware
-	// quiescently and transfers it (G1). A STOPPED one takes that explicit path
-	// below (drainStoppedVM), with its refusals.
-	if fresh.State == "running" && usesFirmwareState(fresh.Spec) {
-		return &pb.DrainProgress{
-			VmName: vm.Name, TargetHost: target.Name, Status: "skipped", Strategy: notMoved,
-			Error: "Secure Boot / vTPM VM can't be drained while running (its firmware state isn't transferred live) — stop it (`lv stop " + vm.Name + "`), " +
-				"then drain again, or migrate it with `lv migrate " + vm.Name + " <target-host> --cold`; either moves it stopped, with its disks and its firmware",
+	// A RUNNING Secure-Boot/vTPM VM's NVRAM and swtpm state are host-local even
+	// on shared disks: neither drain's raw live-migrate nor its cold move (which
+	// would shut it down) carries them. It moves only by the live firmware move
+	// (drainRunningFirmwareVM, below), and only when it may (spec §13); any
+	// other is skipped, left running, with the routes that move it stopped. A
+	// STOPPED one takes the cold path below (drainStoppedVM), with its refusals.
+	fwRunning := fresh.State == "running" && usesFirmwareState(fresh.Spec)
+	if fwRunning {
+		if why := s.firmwareLiveMoveIneligible(ctx, fresh, s.hostName, target.Name); why != "" {
+			return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped", Strategy: notMoved,
+				Error: firmwareDrainSkipText(vm.Name, why)}
 		}
 	}
 
@@ -683,6 +692,9 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// after the handoff commits.
 	if fresh.State == "stopped" {
 		return s.drainStoppedVM(ctx, fresh, target, unlock, &adopted)
+	}
+	if fwRunning {
+		return s.drainRunningFirmwareVM(ctx, fresh, target, unlock, &adopted)
 	}
 
 	// A running VM with a host-local disk (local or dir storage, or a legacy

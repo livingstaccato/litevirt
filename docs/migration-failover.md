@@ -390,9 +390,18 @@ other VM moves the way `lv migrate <vm> <target> --cold` moves a stopped VM
 (see [Cold migration](#cold-migration)): its host-local disks (`local` and
 `dir` storage) are copied to the target, its domain is defined there, and the
 VM and its disk records move in one transaction. It is refused for the same
-reasons. A Secure Boot / vTPM VM drains only while stopped, with its
-host-local disks and its firmware; a running one is reported with the commands
-to stop it and move it.
+reasons. A stopped Secure Boot / vTPM VM drains this way, with its host-local
+disks and its firmware.
+
+A running Secure Boot / vTPM VM is drained by the live firmware move (see
+[Secure Boot / vTPM VMs](#secure-boot--vtpm-vms)) when all its disks are on
+shared storage, it has no USB device, and both hosts carry
+`litevirt.fw_live_migrate=true`; drain prefers a target with that label. It is
+never moved cold. Otherwise, or when the move is refused before the guest
+leaves (a target on a build without live firmware migration included), it is
+`skipped` and keeps running, and the frame gives the reason with the commands
+to stop it and move it. A move that fails or parks is an `error` for that VM;
+the drain goes on with the others.
 
 - A **stopped** VM stays stopped on the target.
 - A **running** VM with a host-local disk is checked first, while it still
@@ -416,7 +425,8 @@ host the VM ended on — the target after the live move or after a cold move
 that a failed live attempt fell back to, or the drained host when the VM
 stayed there. Unlike `lv migrate`, a drain's live move applies no
 `timeout-sec`: it runs until libvirt finishes or fails it (bounding it is a
-tracked follow-up). After the cut-over the source's
+tracked follow-up). A Secure Boot / vTPM VM's live firmware move is the
+exception: it is `lv migrate`'s move, and applies it. After the cut-over the source's
 cloud-init ISO is removed and DNS, load-balancer backends and VXLAN
 forwarding entries follow the VM, as for a migration. A live attempt that
 fails takes back the cloud-init ISO it put on the target before the cold move
@@ -581,7 +591,9 @@ a returning host is not hit by every migration at once.
 
 Failback moves a running VM live. A VM that is stopped, or has a disk on
 host-local storage (local, dir or btrfs) that a live move would have to copy, is
-reported and left; move it with `lv migrate <vm> <host> --cold`. The host must
+reported and left; move it with `lv migrate <vm> <host> --cold`. A running
+Secure Boot / vTPM VM returns by the live firmware move under drain's
+conditions, and is skipped with the reason otherwise. The host must
 be `active`. A cancelled record stays in the replicated table as an empty row
 (a later release can delete them); the same VM name reuses its row.
 

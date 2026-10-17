@@ -197,9 +197,11 @@ func TestFirmwareMoveExemptCallers(t *testing.T) {
 }
 
 // D2-14 review I-1: the marker refusal at migrateOwnedVM's entry stops only a
-// new migration. migrateOwnedVM is entered only by MigrateVM and drain's cold
-// move; a live move writes its marker after the entry, and the adopter and
-// restart recovery carry the move on without re-entering it, so a marker of
+// new migration. migrateOwnedVM is entered only by MigrateVM and drainMove
+// (drain's cold moves, and a running Secure Boot / vTPM VM's live firmware
+// move, D2-17: each a new migration the entry refusal stops); a live move
+// writes its marker after the entry, and the adopter and restart recovery
+// carry the move on without re-entering it, so a marker of
 // a move in progress never refuses that move's own steps. (The live happy
 // path, TestMigrateVM_FirmwareLive_HappyPathOrder, and the adopter,
 // TestAdoptedFirmwareMigration_VerifiesBeforeCommit, run through it.)
@@ -207,8 +209,8 @@ func TestFirmwareMoveExemptCallers(t *testing.T) {
 // Mutation: call migrateOwnedVM from the adopter or the recovery — red.
 func TestMigrateOwnedVM_EnteredOnlyByMigrateAndDrain(t *testing.T) {
 	allowed := map[string]bool{
-		"internal/grpcapi.Server.MigrateVM":     true,
-		"internal/grpcapi.Server.drainColdMove": true,
+		"internal/grpcapi.Server.MigrateVM": true,
+		"internal/grpcapi.Server.drainMove": true,
 	}
 	n := 0
 	for _, c := range fwCallSites(t, map[string]bool{"migrateOwnedVM": true}) {

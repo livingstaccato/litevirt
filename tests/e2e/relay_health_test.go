@@ -116,7 +116,7 @@ func TestRelayHealth_DegradedLinkBecomesALeafEverywhere(t *testing.T) {
 		t.Errorf("%s demoted after %s, inside the %s window", victim, took, failover.RelayDemoteWindow)
 	}
 	// Demoted, not fenced: two of four observers is below fence quorum. The
-	// victim must still print HOST_ACTIVE (a fenced host prints HOST_OFFLINE).
+	// victim must still print HOST_ACTIVE (a fenced host prints HOST_FENCED).
 	if out, err := l.lv(l.hosts[len(l.hosts)-1], "host", "ls"); err == nil {
 		if line, bad := hostls.TakenDown(out, victim); bad {
 			t.Errorf("%s was taken out of service, not just demoted: %s", victim, line)

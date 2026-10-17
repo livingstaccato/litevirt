@@ -532,6 +532,7 @@ func (r *Reconciler) reconcilePass(ctx context.Context) {
 	// the ones litevirt created that have none. Neither touches the runtime.
 	r.adoptManagedDomains(ctx)
 	r.reportOrphanRuntimes(ctx)
+	r.resolveGoneSubjects(ctx)
 }
 
 // Start begins the reconcile loop. Blocks until ctx is cancelled.
@@ -1264,6 +1265,7 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 	var declines []settleDecline
 	keep := map[string]bool{}
 	defer func() { r.reportSettleDeclines(ctx, declines, keep) }()
+	r.resolveSettled(ctx, localDomains)
 	for _, domName := range localDomains {
 		vm, err := corrosion.GetVM(ctx, r.db, domName)
 		if err != nil {

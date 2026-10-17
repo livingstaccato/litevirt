@@ -1289,7 +1289,8 @@ off (colonelpanik/litevirt#253). Two things change:
 What an operator sees after the latch: the host's recorded state (the
 `host_membership` row, and the assurance `lv doctor fence` and `lv host fence`
 print) is `offline` for an SSH-fenced host. `lv host ls` shows `HOST_OFFLINE`
-for both `offline` and `fenced`, so it looks as before. Bring the host back
+for `offline` and `HOST_FENCED` for `fenced` (a server on an earlier release
+shows `HOST_OFFLINE` for both, and `HOST_DRAINING` for `upgrading`). Bring the host back
 with `lv host undrain <host>` as before. An
 `offline` host whose newest fence **failed** is still put back in service
 when a quorum sees it healthy again, as before; one whose newest fence

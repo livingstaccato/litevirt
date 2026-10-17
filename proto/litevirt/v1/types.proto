@@ -35,6 +35,14 @@ enum HostState {
     // on a release before this value reports such a host HOST_OFFLINE; a
     // client before it shows the number 5.
     HOST_JOINING     = 5;
+    // Booted into a pending upgrade, or upgrading in place. A server on a
+    // release before this value reports such a host HOST_DRAINING; a client
+    // before it shows the number 6.
+    HOST_UPGRADING   = 6;
+    // Fenced by failover (or an operator) and not yet returned. A server on a
+    // release before this value reports such a host HOST_OFFLINE; a client
+    // before it shows the number 7.
+    HOST_FENCED      = 7;
 }
 
 enum MigrateStrategy {

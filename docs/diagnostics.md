@@ -1242,6 +1242,19 @@ observed → confirmed → resolved lifecycle:
 - leadership changes and restarts preserve counts and confirmed state;
 - resolved conditions stay readable for 30 days (`lv health --resolved`),
   then are tombstoned;
+- a condition whose subject is gone resolves on the next reconciler pass of
+  any node whose replica has caught up: a VM or container that was deleted
+  (a tombstoned row and no live one; a name with no row at all is not
+  proof), or a host removed with `lv host rm`, whether the subject names the
+  host itself, a pool on it (`<pool>@<host>`) or a workload on it
+  (`<name>@<host>`). These outlive their subject and stay: the dual-run
+  detector's (it resolves its own), `vm_orphan_runtime` /
+  `ct_orphan_runtime`, the certificate and audit conditions,
+  `vm_disk_stranded`, `vm_failover_held`, `vm_start_cancelled`,
+  `ct_rootfs_stranded`, `reservation_stale`, the `iscsi_lun_hold_*` pair,
+  `ceph_image_leftover`, `ceph_trash_leftover`,
+  and the inputs failover recovery reads (`partition_paused`,
+  `partition_pause_failed`, `partition_one_way`, evaluator `failover`);
 - remove the cause, and the evaluator proves the resolution. For a
   condition it can no longer prove, an admin can resolve it by hand:
   `lv health resolve <code> <kind>/<id> --reason "..."`, with the code and
@@ -1939,6 +1952,8 @@ holder writes.
   the destination's own runtime reports the workload running. The host
   stopped its copy (a VM is destroyed, which keeps its definition and disks)
   and wrote a `partition.settle` audit row. The leftover cleanup then handles the shut-off domain as usual.
+  The host resolves `vm_settled` on the pass that finds no domain of that
+  name defined there, or the VM's row naming it again.
 - `vm_settle_declined` (`<name>@<host>`, warning): the host runs a copy of a
   VM whose row names another host, and settle declined to stop it for two
   passes in a row. The evidence carries the `reason` (the clause of the proof

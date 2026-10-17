@@ -3,8 +3,9 @@
 // every test in package e2e is gated behind LITEVIRT_E2E.
 //
 // The STATE column prints the proto enum name (HOST_ACTIVE, HOST_OFFLINE,
-// ...), never the database's lowercase state. There is no HOST_FENCED: a
-// fenced host prints HOST_OFFLINE (grpcapi hostStateToPB).
+// ...), never the database's lowercase state. A fenced host prints
+// HOST_FENCED and an upgrading one HOST_UPGRADING (grpcapi hostStateToPB); a
+// server on an earlier release prints HOST_OFFLINE and HOST_DRAINING for them.
 package hostls
 
 import (
@@ -45,8 +46,8 @@ func CountActive(out string) (total, active int, notActive []string) {
 }
 
 // TakenDown reports whether `lv host ls` output shows host in any state but
-// active — offline (which is also how a fenced host prints), suspect,
-// draining, maintenance — and its line. A host the output does not list is
+// active — offline, fenced, upgrading, suspect, draining, maintenance — and
+// its line. A host the output does not list is
 // not reported.
 func TakenDown(out, host string) (string, bool) {
 	for _, line := range strings.Split(out, "\n") {

@@ -68,11 +68,12 @@ func (c *Client) specConflictAE(tx *sql.Tx, table syncTable, row []interface{}, 
 		return decision, nil
 	}
 	// Every decision that does not hold may have ended a hold here — a
-	// deleted VM's among them. Free while nothing is held (spec_hold.go).
+	// deleted VM's among them — checked once the pass ends. Free while
+	// nothing is held (spec_hold.go).
 	held := false
 	defer func() {
 		if !held {
-			c.noteSpecHoldMaybeOver(tx, incoming.name)
+			c.noteSpecHoldMaybeOverInPass(tx, incoming.name)
 		}
 	}()
 	if incoming.deleted {

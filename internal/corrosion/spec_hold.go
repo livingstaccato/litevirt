@@ -28,7 +28,7 @@ import (
 //     unfinished barrier once the whole pass has merged. A node that merely
 //     has not yet heard an operation finish — the paged pull merges its
 //     terminal step after the vms row, in the same pass — is not left
-//     holding at the end of that pass, so it never confirms;
+//     holding at the end of that pass, so that pass does not confirm it;
 //   - on confirmation, once per (VM, operation): a warning and
 //     litevirt_spec_edit_held_total. Not repeated while the condition's own
 //     write fails; the write alone is retried, on the next pass that holds;
@@ -37,7 +37,8 @@ import (
 //
 // The condition resolves when the row no longer holds that operation's
 // unfinished barrier — the operation turned terminal here, the held line
-// applied, or the VM was deleted — and, for a removed host, through
+// applied, or the VM was deleted — checked at every pass end, and, for a
+// removed host, through
 // ResolveSpecEditHeldOfHost. Every read-then-write of the condition on this
 // node runs under one lock, so a raise cannot land after the resolve that
 // followed the clear it missed.
@@ -90,6 +91,7 @@ type specHoldTracker struct {
 	mu           sync.Mutex
 	holds        map[string]*specHoldState // vm → hold
 	heldThisPass map[string]string         // vm → operation, held in the pass under way
+	overThisPass map[string]struct{}       // VMs the pass under way may have released
 	seeded       bool                      // holds loaded from this host's open conditions
 	pending      map[string]struct{}       // VMs whose hold may be over
 	sweeping     bool
@@ -125,14 +127,40 @@ func (c *Client) noteSpecEditHeld(tx *sql.Tx, vm, op string) {
 	})
 }
 
+// noteSpecHoldMaybeOverInPass is noteSpecHoldMaybeOver for an anti-entropy
+// pass: the VM is checked when the pass ends, after its operation's terminal
+// step, merged on a later page, can have landed.
+func (c *Client) noteSpecHoldMaybeOverInPass(tx *sql.Tx, vm string) {
+	if vm == "" {
+		return
+	}
+	c.deferAfterCommit(tx, func() {
+		t := &c.specHold
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if t.seeded && t.holds[vm] == nil {
+			return
+		}
+		if t.overThisPass == nil {
+			t.overThisPass = make(map[string]struct{})
+		}
+		t.overThisPass[vm] = struct{}{}
+	})
+}
+
 // endSpecHoldPass ends an anti-entropy pass for the holds: each VM held in it
 // counts one more consecutive pass for its operation, and its condition is
-// written as it now stands — after every table of the pass has merged.
+// written as it now stands — after every table of the pass has merged. Every
+// other open hold, and every VM the pass may have released, is swept in one
+// round: the pass may have merged an operation's terminal step without
+// streaming its vms row again.
 func (c *Client) endSpecHoldPass() {
 	t := &c.specHold
 	t.mu.Lock()
 	held := t.heldThisPass
 	t.heldThisPass = nil
+	over := t.overThisPass
+	t.overThisPass = nil
 	if len(held) > 0 && t.holds == nil {
 		t.holds = make(map[string]*specHoldState)
 	}
@@ -144,7 +172,35 @@ func (c *Client) endSpecHoldPass() {
 		}
 		st.passes++
 	}
+	for vm := range t.holds {
+		if over == nil {
+			over = make(map[string]struct{})
+		}
+		over[vm] = struct{}{}
+	}
+	sweep := false
+	for vm := range over {
+		if _, ok := held[vm]; ok {
+			continue // judged by its raise below
+		}
+		if t.pending == nil {
+			t.pending = make(map[string]struct{})
+		}
+		t.pending[vm] = struct{}{}
+		sweep = true
+	}
+	start := sweep && !t.sweeping
+	if start {
+		t.sweeping = true
+	}
 	t.mu.Unlock()
+	if start {
+		t.wg.Add(1)
+		go func() {
+			defer t.wg.Done()
+			c.sweepSpecHolds()
+		}()
+	}
 	for vm := range held {
 		// Not inline: the condition's own replicated write takes the
 		// client's lock, which a caller may hold.

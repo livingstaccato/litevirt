@@ -275,7 +275,7 @@ func TestRelays_PhantomsDoNotInflateNOrR(t *testing.T) {
 // node's OWN alive message, at memberlist.Create, before the schema exists. A
 // fresh single-node cluster must come up as a member of itself.
 func TestGossip_SingleNodeFounderAdmitsItself(t *testing.T) {
-	a := newGossipClient(t, "node-a", "127.0.0.1", "127.0.0.1", freePort(t), nil)
+	a := newGossipClient(t, "node-a", "127.0.0.1", "127.0.0.1", 0, nil)
 	if n := a.list.NumMembers(); n != 1 {
 		t.Fatalf("founder memberlist has %d members, want exactly itself", n)
 	}

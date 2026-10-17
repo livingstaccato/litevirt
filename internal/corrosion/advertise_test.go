@@ -21,16 +21,33 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
+// newGossipClient starts a gossip client bound to bind:port. With port 0 it
+// takes a free port and retries the bind: freePort only proves a port was free
+// for TCP on 127.0.0.1 a moment ago, and memberlist binds TCP and UDP on the
+// configured address afterwards, so another socket -- this binary's other
+// nodes, a parallel package, anything on the machine -- can hold either one
+// by then. The port the client got is c.list.LocalNode().Port.
 func newGossipClient(t *testing.T, name, bind, advertise string, port int, join []string) *Client {
 	t.Helper()
-	c, err := NewClient(Config{
+	cfg := Config{
 		HostName:      name,
-		DataDir:       t.TempDir(),
 		BindAddr:      bind,
 		AdvertiseAddr: advertise,
 		BindPort:      port,
 		JoinPeers:     join,
-	}, hlc.NewClock(name))
+	}
+	var c *Client
+	var err error
+	for attempt := 0; attempt < 8; attempt++ {
+		cfg.DataDir = t.TempDir()
+		if port == 0 {
+			cfg.BindPort = freePort(t)
+		}
+		c, err = NewClient(cfg, hlc.NewClock(name))
+		if err == nil || port != 0 || !strings.Contains(err.Error(), "address already in use") {
+			break
+		}
+	}
 	if err != nil {
 		t.Fatalf("NewClient %s: %v", name, err)
 	}
@@ -49,17 +66,14 @@ func newGossipClient(t *testing.T, name, bind, advertise string, port int, join 
 // can advertise an address that is real but wrong, and the only place that shows
 // up is in what the peer received.
 func TestAdvertiseAddr_IsWhatPeersSee(t *testing.T) {
-	portA := freePort(t)
-	portB := freePort(t)
-
 	// node-a binds ALL interfaces so memberlist's auto-detection would pick this
 	// host's real private IP, then overrides it with an advertise address that
 	// auto-detection could never produce. Binding 127.0.0.1 instead would make
 	// this test vacuous: auto-detect derives the advertise address from a
 	// specific BindAddr, so it would report 127.0.0.1 with the wiring removed too.
-	a := newGossipClient(t, "node-a", "0.0.0.0", "127.0.0.1", portA, nil)
-	_ = a
-	b := newGossipClient(t, "node-b", "127.0.0.1", "127.0.0.1", portB,
+	a := newGossipClient(t, "node-a", "0.0.0.0", "127.0.0.1", 0, nil)
+	portA := int(a.list.LocalNode().Port)
+	b := newGossipClient(t, "node-b", "127.0.0.1", "127.0.0.1", 0,
 		[]string{net.JoinHostPort("127.0.0.1", itoa(portA))})
 
 	// Gossip converges asynchronously.

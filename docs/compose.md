@@ -164,7 +164,9 @@ or `backup repos`), the success line is withheld, and the command
 exits non-zero with a summary such as `stack "web": 1 of 3 deletions failed
 (web-2)`. The stack is then left in state `deleting`, the daemon keeps retrying
 the teardown in the background, and the `stack.delete` audit entry has result
-`error` and names what was not removed. While any of the stack's VMs or
+`error` and names what was not removed. A `compose up` of a stack in state
+`deleting` is refused until the teardown has finished: wait until
+`lv compose ls` no longer lists it, then run `lv compose up` again. While any of the stack's VMs or
 containers is left, none of its networks is deprovisioned: a deleted network
 is torn down on every host, and would be pulled out from under that workload.
 The background retry deletes the remaining VMs and containers first, and

@@ -54,6 +54,13 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "parse compose: %v", err)
 	}
+	// A stack being torn down is not deployed over: the teardown would take
+	// down the networks under what this deploy creates (review m2).
+	if st, gErr := corrosion.GetStack(ctx, s.db, f.Name); !req.DryRun && gErr == nil && st != nil && st.State == stackStateDeleting {
+		return status.Errorf(codes.FailedPrecondition,
+			"stack %q is being torn down (state %q): wait until `lv compose ls` no longer lists it, then run `lv compose up` again",
+			f.Name, stackStateDeleting)
+	}
 
 	// Disk/NIC tuning in the file is refused before anything is deployed, rather
 	// than by the Nth VM's create after the first N-1 are up (the disk/NIC feature gate).
@@ -384,6 +391,7 @@ func (s *Server) withStackDefaultDenyNote(ctx context.Context, stack string, err
 const (
 	stackStateActive   = "active"
 	stackStateDegraded = "degraded"
+	stackStateDeleting = "deleting"
 )
 
 // stackFirewallErr is a stack's firewall failure as its deploy returns it: a

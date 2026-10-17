@@ -2,7 +2,11 @@ package grpcapi
 
 import (
 	"context"
+	"strings"
 	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -39,5 +43,32 @@ func TestDeleteStack_AMemberWhoseCreateFailedIsAbsent(t *testing.T) {
 	}
 	if st, _ := corrosion.GetStack(ctx, s.db, "fbm"); st != nil {
 		t.Errorf("the stack was not torn down in the one call: %+v", st)
+	}
+}
+
+// A compose up of a stack being torn down is refused, saying what to do: a
+// deploy under a teardown would have its networks taken down under the VMs
+// it creates (review m2).
+//
+// Mutation: drop the refusal — the deploy goes ahead (or fails elsewhere,
+// without the message), red.
+func TestDeployStack_AStackBeingTornDownIsRefused(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminContext(context.Background())
+	if err := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{Name: "fbm", State: "deleting", ComposeYAML: goneStackYAML}); err != nil {
+		t.Fatal(err)
+	}
+	stream := &mockDeployStreamR2{ctx: ctx}
+	err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: goneStackYAML}, stream)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "being torn down") ||
+		!strings.Contains(err.Error(), "then run `lv compose up` again") {
+		t.Fatalf("DeployStack = %v; want FailedPrecondition saying to wait for the teardown, then run up again", err)
+	}
+	if len(stream.sent) != 0 {
+		t.Errorf("the refused deploy reported progress: %+v", stream.sent)
+	}
+	if st, _ := corrosion.GetStack(ctx, s.db, "fbm"); st == nil || st.State != "deleting" {
+		t.Errorf("the stack = %+v, want it still deleting", st)
 	}
 }

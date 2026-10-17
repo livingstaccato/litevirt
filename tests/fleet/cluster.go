@@ -560,7 +560,7 @@ func New(t *testing.T, opts Options) *Cluster {
 	if opts.RealGossip && opts.Joiners == 0 {
 		// Nodes opened early dialled seeds that were not up yet; the later
 		// joins and the membership loop close the mesh.
-		c.WaitGossip(t, 20*time.Second, "the gossip mesh to form", c.GossipConverged)
+		c.WaitGossip(t, 20*time.Second*raceBudgetScale, "the gossip mesh to form", c.GossipConverged)
 	}
 	if opts.IndependentReplicas && opts.Joiners == 0 {
 		// crossRegisterHosts wrote every node's copy of every hosts row on

@@ -1091,8 +1091,8 @@ checking, and is recorded `active` once it answers. A write that records it
 minutes on while its daemon runs raises `upgrading_unconfirmed`
 ([diagnostics.md](diagnostics.md)): peers that reach it never fence it.
 A failing run that began while the host was `upgrading` keeps the rest of
-those 2 minutes if the host is recorded `active` by anything but its own
-serving check, such as an undrain handled by a node on an older build, and
+those 2 minutes however the host is recorded `active` (an undrain handled by
+a node on an older build, for one), and
 the host is fenced when they end if it still does not answer. The failover
 leader knows of the `upgrading` state only if it saw it: a leader that took
 over after the host was recorded `active` gives such a run 13 s, as above.

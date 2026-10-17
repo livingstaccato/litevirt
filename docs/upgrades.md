@@ -41,9 +41,9 @@ Six guarantees the upgrade pipeline enforces:
    (2 min): a host that entered `upgrading` and never came back is still fenced,
    so its VMs aren't stranded. A failing run that began while the host was
    `upgrading` keeps the rest of those 2 minutes even if the host is recorded
-   `active` before it serves. The new daemon transitions back to `active` on
-   healthy startup, and a host left `offline` by a transient blip is
-   auto-recovered to `active` once a fresh quorum sees it healthy.
+   `active` before it serves, if the failover leader saw it `upgrading`. The
+   new daemon transitions back to `active` on healthy startup, and a host
+   left `offline` by a transient blip is auto-recovered to `active` once a fresh quorum sees it healthy.
 
 3. **Auto-rollback on a panicking binary.** If the new daemon panics
    past systemd's `StartLimitBurst=10` within 5 minutes, the
@@ -782,7 +782,10 @@ that write. **A daemon stopped for longer than that without a drain gets its
 host fenced**: powered off, with its VMs recovered elsewhere. That holds
 whoever records the host `active` meanwhile: a failing run that began while
 the host was `upgrading` keeps the rest of those 2 minutes, and a host that
-still does not answer when they end is fenced. The restarted daemon records
+still does not answer when they end is fenced. The run keeps them only if the
+failover leader saw the host `upgrading`; a leader that did not (it took over
+meanwhile) allows 13 s from the activation
+([migration-failover.md](migration-failover.md)). The restarted daemon records
 the host `active` itself once it serves; `lv host undrain` is refused while it
 does not answer. Always upgrade through `lv host upgrade`. If you must
 hand-restart a host, or stop its daemon for longer, put it in maintenance

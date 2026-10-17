@@ -54,8 +54,17 @@ type restartFleet struct {
 func newRestartFleet(t *testing.T, seed int64, tune ...func(*failover.Coordinator)) *restartFleet {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
 	c := New(t, Options{Nodes: 4, IndependentReplicas: true, FaultSeed: seed})
+	// The checkers and the coordinator loop below end before the cluster
+	// closes its databases: registered after New, this runs before its Stop.
+	// They used to be cancelled only after it, and went on querying closed
+	// databases, the coordinator's in-flight query keeping node-0's open into
+	// the next test (Cluster.dbName).
+	var loops sync.WaitGroup
+	t.Cleanup(func() {
+		cancel()
+		loops.Wait()
+	})
 	f := &restartFleet{c: c, a: c.Nodes[0], d: c.Nodes[3], observers: []*Node{c.Nodes[0], c.Nodes[1], c.Nodes[2]}}
 	c.WaitConverged(t, convergeTimeout)
 	// host_membership_split_v1 is mandatory and latched on any current
@@ -75,7 +84,11 @@ func newRestartFleet(t *testing.T, seed int64, tune ...func(*failover.Coordinato
 			}
 			return true, "", nil
 		})
-		go ch.Start(ctx)
+		loops.Add(1)
+		go func() {
+			defer loops.Done()
+			ch.Start(ctx)
+		}()
 	}
 	coord := failover.NewCoordinator(f.a.Name, f.a.DB)
 	for _, fn := range tune {
@@ -93,7 +106,9 @@ func newRestartFleet(t *testing.T, seed int64, tune ...func(*failover.Coordinato
 		}
 		return fence.Result{Method: "fleet-test", Success: true}
 	})
+	loops.Add(1)
 	go func() {
+		defer loops.Done()
 		tk := time.NewTicker(250 * time.Millisecond)
 		defer tk.Stop()
 		for {

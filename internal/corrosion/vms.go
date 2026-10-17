@@ -1510,6 +1510,10 @@ func deleteVMGuardedFrom(ctx context.Context, c *Client, vm VMRecord) (deleteOut
 	if !applied {
 		return deleteContended, nil
 	}
+	// The VM is gone, so a drain record for it can never apply: spend it, as
+	// every writer that changes a VM's host does. An older node's delete leaves
+	// it, and the undrain's validity check keeps the count right.
+	SpendDrainOrigin(ctx, c, name)
 	return deleteApplied, nil
 }
 

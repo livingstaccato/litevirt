@@ -147,6 +147,12 @@ func TestHostChangingWritersSpendTheDrainRecord(t *testing.T) {
 			}
 			return err
 		},
+		// A deleted VM's record outlives it otherwise, and an undrain counts it.
+		"DeleteVM": func(c *Client) error { return DeleteVM(ctx, c, "v") },
+		"DeleteVMIncarnation": func(c *Client) error {
+			vm, _ := GetVM(ctx, c, "v")
+			return DeleteVMIncarnation(ctx, c, "v", SnapshotForDelete(*vm))
+		},
 		"RekeyStoppedVM": func(c *Client) error {
 			if err := UpdateVMState(ctx, c, "v", "stopped", ""); err != nil {
 				return err

@@ -624,8 +624,27 @@ func (s *Server) autoFailback(ctx context.Context, host string, h *pb.Host) {
 		}
 		return
 	}
-	origins, err := corrosion.ListDrainOrigins(ctx, s.db, host)
-	if err != nil || len(origins) == 0 {
+	listed, err := corrosion.ListDrainOrigins(ctx, s.db, host)
+	if err != nil || len(listed) == 0 {
+		return
+	}
+	// Count only records that still describe their VM, by the check a failback
+	// makes; one that fails it can never apply, so it is collected here rather
+	// than reported again on every undrain.
+	var origins []corrosion.DrainOrigin
+	vms := make(map[string]*corrosion.VMRecord, len(listed))
+	for _, o := range listed {
+		vm, why := s.drainOriginStale(ctx, o)
+		if why != "" {
+			if cerr := corrosion.CollectDrainOrigin(ctx, s.db, o.VM, "undrain"); cerr != nil {
+				slog.Debug("undrain: could not collect a stale record", "vm", o.VM, "error", cerr)
+			}
+			continue
+		}
+		origins = append(origins, o)
+		vms[o.VM] = vm
+	}
+	if len(origins) == 0 {
 		return
 	}
 	// Only when something would move: the policy is on, or a VM with a record
@@ -635,8 +654,8 @@ func (s *Server) autoFailback(ctx context.Context, host string, h *pb.Host) {
 		if optedIn {
 			break
 		}
-		vm, gerr := corrosion.GetVM(ctx, s.db, o.VM)
-		if gerr != nil || vm == nil || vm.Spec == "" {
+		vm := vms[o.VM]
+		if vm.Spec == "" {
 			continue
 		}
 		var spec pb.VMSpec
@@ -727,6 +746,24 @@ func (s *Server) runFailback(ctx context.Context, run *failbackRun, opts failbac
 	return nil
 }
 
+// drainOriginStale reports why o can never apply again (empty when it still
+// describes its VM), and the VM it was checked against. It is failbackOne's
+// validity check, shared with the undrain's count so the two agree.
+func (s *Server) drainOriginStale(ctx context.Context, o corrosion.DrainOrigin) (*corrosion.VMRecord, string) {
+	vm, err := corrosion.GetVM(ctx, s.db, o.VM)
+	if err != nil || vm == nil {
+		return nil, "the VM no longer exists"
+	}
+	if vm.CreatedAt != o.CreatedAt {
+		return nil, "the VM was deleted and created again since the drain"
+	}
+	if gen, _ := corrosion.GetPlacementGen(ctx, s.db, o.VM); vm.HostName != o.To || vm.OwnerEpoch != o.Epoch || gen != o.Gen {
+		return nil, fmt.Sprintf("the VM was moved since the drain put it on %s (it is on %s): "+
+			"it was moved for another reason and stays where it is", o.To, vm.HostName)
+	}
+	return vm, ""
+}
+
 // failbackOne decides and, unless dry, performs one VM's move back to host.
 func (s *Server) failbackOne(ctx context.Context, host string, o corrosion.DrainOrigin, policyOn bool, opts failbackOpts) *pb.FailbackProgress {
 	res := &pb.FailbackProgress{VmName: o.VM, FromHost: o.To}
@@ -739,16 +776,9 @@ func (s *Server) failbackOne(ctx context.Context, host string, o corrosion.Drain
 		return skip(why)
 	}
 
-	vm, err := corrosion.GetVM(ctx, s.db, o.VM)
-	if err != nil || vm == nil {
-		return stale("the VM no longer exists")
-	}
-	if vm.CreatedAt != o.CreatedAt {
-		return stale("the VM was deleted and created again since the drain")
-	}
-	if gen, _ := corrosion.GetPlacementGen(ctx, s.db, o.VM); vm.HostName != o.To || vm.OwnerEpoch != o.Epoch || gen != o.Gen {
-		return stale(fmt.Sprintf("the VM was moved since the drain put it on %s (it is on %s): "+
-			"it was moved for another reason and stays where it is", o.To, vm.HostName))
+	vm, why := s.drainOriginStale(ctx, o)
+	if why != "" {
+		return stale(why)
 	}
 
 	var spec pb.VMSpec
@@ -788,6 +818,7 @@ func (s *Server) failbackOne(ctx context.Context, host string, o corrosion.Drain
 	if why := s.ownerCannotCheck(ctx, o.To); why != "" {
 		return skip(why)
 	}
+	var err error
 	for try := 0; ; try++ {
 		err = s.MigrateVM(&pb.MigrateVMRequest{
 			VmName: vm.Name, TargetHost: host, Strategy: pb.MigrateStrategy_MIGRATE_LIVE,

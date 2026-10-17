@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -235,4 +236,99 @@ func TestDrainRecords_AVMMovedAgainGetsNoRecordAndAnEvent(t *testing.T) {
 			t.Errorf("%s's events do not say why it got no record", vm)
 		}
 	}
+}
+
+// An undrain counts only the drain records that still describe a VM: a record
+// whose VM was deleted (or moved for another reason) is not "a VM a drain moved
+// that has not opted in", and it is collected rather than reported again on
+// every later undrain.
+//
+// The record is written AFTER the delete in the "older node" case: a node that
+// predates the delete writers spending the record leaves it behind, and only
+// the validity filter keeps the count right then.
+//
+// Mutations: drop the filter in autoFailback - the deleted VMs are counted
+// ("1 VM(s)" / "2 VM(s)") and their records stay; drop the delete writers'
+// spend - the "this build" case leaves its record.
+func TestAutoFailback_CountsOnlyRecordsThatStillApply(t *testing.T) {
+	ctx := context.Background()
+	put := func(t *testing.T, s *Server, vm string) {
+		t.Helper()
+		v, err := corrosion.GetVM(ctx, s.db, vm)
+		if err != nil || v == nil {
+			t.Fatalf("GetVM %s: %v", vm, err)
+		}
+		gen, _ := corrosion.GetPlacementGen(ctx, s.db, vm)
+		if err := corrosion.PutDrainOrigin(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureDrainFailback),
+			corrosion.DrainOrigin{VM: vm, From: "h1", To: "h2", Epoch: v.OwnerEpoch, CreatedAt: v.CreatedAt, Gen: gen}, "drain"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	undrain := func(s *Server) *pb.Host {
+		h := &pb.Host{Name: "h1"}
+		s.autoFailback(ctx, "h1", h)
+		return h
+	}
+
+	t.Run("deleted by this build", func(t *testing.T) {
+		s, _ := recordServer(t, map[string]string{"v": "h2"})
+		put(t, s, "v")
+		if err := corrosion.DeleteVM(ctx, s.db, "v"); err != nil {
+			t.Fatal(err)
+		}
+		if h := undrain(s); h.FailbackNote != "" || h.FailbackStarted {
+			t.Fatalf("note = %q started = %v, want neither for a deleted VM", h.FailbackNote, h.FailbackStarted)
+		}
+		if vms := recordedVMs(t, s, "h1"); len(vms) != 0 {
+			t.Fatalf("records left = %v", vms)
+		}
+	})
+
+	t.Run("deleted by an older node that left the record", func(t *testing.T) {
+		s, _ := recordServer(t, map[string]string{"v": "h2", "w": "h2"})
+		put(t, s, "v")
+		put(t, s, "w")
+		v, _ := corrosion.GetVM(ctx, s.db, "v")
+		w, _ := corrosion.GetVM(ctx, s.db, "w")
+		for _, name := range []string{"v", "w"} {
+			if err := corrosion.DeleteVM(ctx, s.db, name); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// What an older node's delete leaves behind.
+		for _, vm := range []*corrosion.VMRecord{v, w} {
+			if err := corrosion.PutDrainOrigin(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureDrainFailback),
+				corrosion.DrainOrigin{VM: vm.Name, From: "h1", To: "h2", Epoch: vm.OwnerEpoch, CreatedAt: vm.CreatedAt}, "drain"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if vms := recordedVMs(t, s, "h1"); len(vms) != 2 {
+			t.Fatalf("setup: records = %v, want 2", vms)
+		}
+		if h := undrain(s); h.FailbackNote != "" || h.FailbackStarted {
+			t.Fatalf("note = %q started = %v, want neither for deleted VMs", h.FailbackNote, h.FailbackStarted)
+		}
+		if vms := recordedVMs(t, s, "h1"); len(vms) != 0 {
+			t.Fatalf("records left = %v, want them collected", vms)
+		}
+	})
+
+	t.Run("a live record still counts, a moved one does not", func(t *testing.T) {
+		s, _ := recordServer(t, map[string]string{"live": "h2", "moved": "h2"})
+		put(t, s, "live")
+		// moved's record is from an earlier placement generation: failback
+		// would discard it as moved for another reason.
+		mv, _ := corrosion.GetVM(ctx, s.db, "moved")
+		if err := corrosion.PutDrainOrigin(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureDrainFailback),
+			corrosion.DrainOrigin{VM: "moved", From: "h1", To: "h2", Epoch: mv.OwnerEpoch, CreatedAt: mv.CreatedAt, Gen: 99}, "drain"); err != nil {
+			t.Fatal(err)
+		}
+		h := undrain(s)
+		if !strings.HasPrefix(h.FailbackNote, "1 VM(s) a drain moved from h1 have not opted in") {
+			t.Fatalf("note = %q, want exactly the live VM counted", h.FailbackNote)
+		}
+		if vms := recordedVMs(t, s, "h1"); !slices.Equal(vms, []string{"live"}) {
+			t.Fatalf("records = %v, want only live's", vms)
+		}
+	})
 }

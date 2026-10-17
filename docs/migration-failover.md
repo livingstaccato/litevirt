@@ -390,7 +390,13 @@ not `active`. A VM moved by a drain is started on its target, which is
 ### Failback after maintenance
 
 `lv host undrain` returns a host to scheduling (draining, maintenance, and also
-fenced or offline, which ends the fence) and moves nothing back. Failback
+fenced or offline, which ends the fence) and moves nothing back. A host
+recorded `upgrading` is recorded `active` only if its daemon answers a Ping
+from the node handling the undrain. One that does not answer is restarting,
+and the undrain is refused (FailedPrecondition) with its state unchanged: it
+turns `active` by itself once its daemon serves. The write is made only from
+the state the undrain read; if the state changes under it three times, the
+undrain is refused (Aborted) and can be run again. Failback
 is the opt-in that does, as Proxmox's HA failback property does: after the
 undrain, the VMs the drain moved away return by live migration, at a bounded
 rate.
@@ -1086,6 +1092,12 @@ checking, and is recorded `active` once it answers. A write that records it
 `active` and fails is retried until it lands. A host still `upgrading` 2
 minutes on while its daemon runs raises `upgrading_unconfirmed`
 ([diagnostics.md](diagnostics.md)): peers that reach it never fence it.
+A failing run that began while the host was `upgrading` keeps the rest of
+those 2 minutes however the host is recorded `active` (an undrain handled by
+a node on an older build, for one), and
+the host is fenced when they end if it still does not answer. The failover
+leader knows of the `upgrading` state only if it saw it: a leader that took
+over after the host was recorded `active` gives such a run 13 s, as above.
 
 A boot with no marker (a crash, a kill, or a stop whose `upgrading` write
 failed, as every write of a WAL-quarantined daemon does) does the same for a

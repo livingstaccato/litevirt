@@ -261,7 +261,7 @@ func (s *Server) liveMoveVolume(
 	}
 
 	// Still on src. Redefine persistent → commit DB → pivot, rolling back on failure.
-	cs, origXML, rerr := s.redefineMovedDiskSource(vm, src, destPath)
+	cs, rerr := s.redefineMovedDiskSource(vm, src, destPath)
 	if rerr != nil {
 		_ = s.liveMover.CancelBlockCopy(vm.Name, src.Path)
 		_ = os.Remove(destPath)
@@ -270,7 +270,7 @@ func (s *Server) liveMoveVolume(
 	if err := commit(); err != nil {
 		// Roll persistent back; only remove the dest when it's no longer referenced
 		// (rollbackCutover keeps it for the already-at-dst / rollback-failed cases).
-		safe := s.rollbackCutover(cs, vm.Name, origXML)
+		safe := s.rollbackCutover(cs, vm, src, destPath)
 		_ = s.liveMover.CancelBlockCopy(vm.Name, src.Path)
 		if safe {
 			_ = os.Remove(destPath)
@@ -290,7 +290,7 @@ func (s *Server) liveMoveVolume(
 			slog.Error("live move: pivot failed and DB rollback to src also failed — DB records dest but guest is on src; operator must reconcile",
 				"vm", vm.Name, "disk", src.DiskName, "pivot_error", err, "db_rollback_error", dbErr)
 		}
-		safe := s.rollbackCutover(cs, vm.Name, origXML)
+		safe := s.rollbackCutover(cs, vm, src, destPath)
 		_ = s.liveMover.CancelBlockCopy(vm.Name, src.Path)
 		if safe {
 			_ = os.Remove(destPath)
@@ -317,7 +317,7 @@ func liveMovePlacementErr(err error) error {
 // and NEVER touches destPath (the live disk) or rolls back to src. On a commit failure
 // it keeps dest and surfaces a reconcile error. No block-copy job runs here.
 func (s *Server) liveCatchUpAtDest(ctx context.Context, vm *corrosion.VMRecord, src *corrosion.DiskRecord, destPath, targetPool string, dstPool StoragePoolRef, deleteSource bool, send func(*pb.MoveVolumeProgress) error) error {
-	if _, _, rerr := s.redefineMovedDiskSource(vm, src, destPath); rerr != nil {
+	if _, rerr := s.redefineMovedDiskSource(vm, src, destPath); rerr != nil {
 		return status.Errorf(codes.Internal, "redefine persistent config (guest already on dest): %v", rerr)
 	}
 	if err := corrosion.UpdateDiskPlacement(ctx, s.db, vm.Name, src.DiskName, vm.HostName, destPath, dstPool.Driver, targetPool); err != nil {

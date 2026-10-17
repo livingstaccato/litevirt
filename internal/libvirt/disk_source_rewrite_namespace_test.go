@@ -106,15 +106,151 @@ func TestRewriteDiskSource_RefusesNamespacesAroundDevices(t *testing.T) {
 // The file attribute is found by parsing the tag's attributes, not by a
 // pattern that can match inside another attribute's value.
 func TestRewriteDiskSource_FileTextInsideAnotherAttribute(t *testing.T) {
-	in := `<domain><devices><disk type="file"><source index="z file='/old/root.qcow2'" file='/old/root.qcow2'/>` +
+	in := `<domain><devices><disk type="file"><source index="z file='/decoy.qcow2'" file='/old/root.qcow2'/>` +
 		`<target dev="vda"/></disk></devices></domain>`
 	out, changed, err := RewriteDiskSource(in, "vda", "/old/root.qcow2", "/new/root.qcow2")
 	if err != nil || !changed {
 		t.Fatalf("changed=%v err=%v", changed, err)
 	}
-	want := `<domain><devices><disk type="file"><source index="z file='/old/root.qcow2'" file='/new/root.qcow2'/>` +
+	want := `<domain><devices><disk type="file"><source index="z file='/decoy.qcow2'" file='/new/root.qcow2'/>` +
 		`<target dev="vda"/></disk></devices></domain>`
 	if out != want {
 		t.Fatalf("got\n%s\nwant\n%s", out, want)
+	}
+}
+
+// edgeDomain wraps devices in a litevirt domain's header and metadata.
+func edgeDomain(devices string) string {
+	return "<domain type='kvm'>\n  <name>mv1</name>\n  <metadata>\n    " + mvManaged + "\n    " + mvOwnerEpoch +
+		"\n  </metadata>\n  <devices>\n" + devices + "  </devices>\n</domain>\n"
+}
+
+// Each case rewrites vda from its old path to its new one and must return the
+// input with only that value changed, byte for byte.
+func TestRewriteDiskSource_EdgeCasesByteExact(t *testing.T) {
+	const (
+		old = "/var/lib/litevirt/disks/mv1-root.qcow2"
+		nw  = "/srv/pools/fast/mv1-root.qcow2"
+	)
+	other := "    <disk type='file' device='disk'>\n      <source file='/var/lib/litevirt/disks/mv1-data.qcow2'/>\n" +
+		"      <backingStore type='file'>\n        <format type='qcow2'/>\n        <source file='/var/lib/litevirt/images/base.qcow2'/>\n" +
+		"      </backingStore>\n      <target dev='vdb' bus='virtio'/>\n    </disk>\n"
+	for _, c := range []struct {
+		name, oldPath, newPath, in, want string
+	}{{
+		name: "backingStore with its own source inside the target disk",
+		in: "    <disk type='file' device='disk'>\n      <source file='" + old + "'/>\n      <backingStore type='file'>\n" +
+			"        <format type='qcow2'/>\n        <source file='/var/lib/litevirt/images/base.qcow2'/>\n      </backingStore>\n" +
+			"      <target dev='vda' bus='virtio'/>\n    </disk>\n",
+		want: "    <disk type='file' device='disk'>\n      <source file='" + nw + "'/>\n      <backingStore type='file'>\n" +
+			"        <format type='qcow2'/>\n        <source file='/var/lib/litevirt/images/base.qcow2'/>\n      </backingStore>\n" +
+			"      <target dev='vda' bus='virtio'/>\n    </disk>\n",
+	}, {
+		name: "target disk second, after a disk with a backingStore",
+		in:   other + "    <disk type='file' device='disk'>\n      <source file='" + old + "'/>\n      <target dev='vda'/>\n    </disk>\n",
+		want: other + "    <disk type='file' device='disk'>\n      <source file='" + nw + "'/>\n      <target dev='vda'/>\n    </disk>\n",
+	}, {
+		name: "non-disk sources between two disks",
+		in: other + "    <interface type='network'>\n      <source network='default'/>\n      <model type='virtio'/>\n    </interface>\n" +
+			"    <hostdev mode='subsystem' type='pci'>\n      <source>\n        <address domain='0x0000' bus='0x01' slot='0x00' function='0x0'/>\n      </source>\n    </hostdev>\n" +
+			"    <disk type='file' device='disk'>\n      <source file='" + old + "'/>\n      <target dev='vda'/>\n    </disk>\n",
+		want: other + "    <interface type='network'>\n      <source network='default'/>\n      <model type='virtio'/>\n    </interface>\n" +
+			"    <hostdev mode='subsystem' type='pci'>\n      <source>\n        <address domain='0x0000' bus='0x01' slot='0x00' function='0x0'/>\n      </source>\n    </hostdev>\n" +
+			"    <disk type='file' device='disk'>\n      <source file='" + nw + "'/>\n      <target dev='vda'/>\n    </disk>\n",
+	}, {
+		name: "comment and CDATA inside the disk",
+		in: "    <disk type='file' device='disk'>\n      <!-- <source file='" + old + "'/> -->\n      <![CDATA[<source file='/decoy.qcow2'/>]]>\n" +
+			"      <source file='" + old + "'/>\n      <target dev='vda'/>\n    </disk>\n",
+		want: "    <disk type='file' device='disk'>\n      <!-- <source file='" + old + "'/> -->\n      <![CDATA[<source file='/decoy.qcow2'/>]]>\n" +
+			"      <source file='" + nw + "'/>\n      <target dev='vda'/>\n    </disk>\n",
+	}, {
+		name: "newlines and spaces inside the tag",
+		in:   "    <disk type='file'>\n      <source\n        file = \"" + old + "\"\n\tindex='1'\n      />\n      <target dev='vda'/>\n    </disk>\n",
+		want: "    <disk type='file'>\n      <source\n        file = \"" + nw + "\"\n\tindex='1'\n      />\n      <target dev='vda'/>\n    </disk>\n",
+	}, {
+		name:    "double-quoted value holding a single quote",
+		oldPath: "/var/lib/litevirt/disks/a'b.qcow2",
+		in:      "    <disk type='file'>\n      <source file=\"/var/lib/litevirt/disks/a'b.qcow2\"/>\n      <target dev='vda'/>\n    </disk>\n",
+		want:    "    <disk type='file'>\n      <source file=\"" + nw + "\"/>\n      <target dev='vda'/>\n    </disk>\n",
+	}, {
+		name:    "entity-escaped old value",
+		oldPath: "/var/lib/litevirt/disks/a&b'c.qcow2",
+		in:      "    <disk type='file'>\n      <source file='/var/lib/litevirt/disks/a&amp;b&apos;c.qcow2'/>\n      <target dev='vda'/>\n    </disk>\n",
+		want:    "    <disk type='file'>\n      <source file='" + nw + "'/>\n      <target dev='vda'/>\n    </disk>\n",
+	}, {
+		name: "paired source with children",
+		in:   "    <disk type='file'>\n      <source file='" + old + "'>\n        <seclabel model='dac' relabel='no'/>\n      </source>\n      <target dev='vda'/>\n    </disk>\n",
+		want: "    <disk type='file'>\n      <source file='" + nw + "'>\n        <seclabel model='dac' relabel='no'/>\n      </source>\n      <target dev='vda'/>\n    </disk>\n",
+	}, {
+		name:    "new path holding ' \" < & and a double-quoted attribute",
+		newPath: `/p/a&b'c"d<e.qcow2`,
+		in:      "    <disk type='file'>\n      <source file=\"" + old + "\"/>\n      <target dev='vda'/>\n    </disk>\n",
+		want:    "    <disk type='file'>\n      <source file=\"/p/a&amp;b&apos;c&quot;d&lt;e.qcow2\"/>\n      <target dev='vda'/>\n    </disk>\n",
+	}, {
+		name: "another disk on an overlay of the old path is not a mention",
+		in: "    <disk type='file'>\n      <source file='" + old + "'/>\n      <target dev='vda'/>\n    </disk>\n" +
+			"    <disk type='file'>\n      <source file='" + old + ".s1'/>\n      <target dev='vdb'/>\n    </disk>\n",
+		want: "    <disk type='file'>\n      <source file='" + nw + "'/>\n      <target dev='vda'/>\n    </disk>\n" +
+			"    <disk type='file'>\n      <source file='" + old + ".s1'/>\n      <target dev='vdb'/>\n    </disk>\n",
+	}, {
+		name: "another disk on a longer path ending in the old path is not a mention",
+		in: "    <disk type='file'>\n      <source file='" + old + "'/>\n      <target dev='vda'/>\n    </disk>\n" +
+			"    <disk type='file'>\n      <source file='/x" + old + "'/>\n      <target dev='vdb'/>\n    </disk>\n",
+		want: "    <disk type='file'>\n      <source file='" + nw + "'/>\n      <target dev='vda'/>\n    </disk>\n" +
+			"    <disk type='file'>\n      <source file='/x" + old + "'/>\n      <target dev='vdb'/>\n    </disk>\n",
+	}} {
+		t.Run(c.name, func(t *testing.T) {
+			from, to := old, nw
+			if c.oldPath != "" {
+				from = c.oldPath
+			}
+			if c.newPath != "" {
+				to = c.newPath
+			}
+			out, changed, err := RewriteDiskSource(edgeDomain(c.in), "vda", from, to)
+			if err != nil || !changed {
+				t.Fatalf("changed=%v err=%v", changed, err)
+			}
+			if want := edgeDomain(c.want); out != want {
+				t.Fatalf("got\n%s\nwant\n%s", out, want)
+			}
+			if got := srcOf(t, out, "vda"); got != to {
+				t.Fatalf("vda decodes to %q, want %q", got, to)
+			}
+		})
+	}
+}
+
+// Refused: a new path libvirt would alter, and an old path the domain still
+// names somewhere the rewrite leaves alone.
+func TestRewriteDiskSource_RefusesUnsafeRewrites(t *testing.T) {
+	const old = "/var/lib/litevirt/disks/mv1-root.qcow2"
+	vda := "    <disk type='file'>\n      <source file='" + old + "'/>\n      <target dev='vda'/>\n    </disk>\n"
+	for _, c := range []struct {
+		name, devices, newPath, extra, wantErr string
+	}{
+		{name: "tab in the new path", devices: vda, newPath: "/srv/a\tb.qcow2", wantErr: "tab or line break"},
+		{name: "newline in the new path", devices: vda, newPath: "/srv/a\nb.qcow2", wantErr: "tab or line break"},
+		{name: "carriage return in the new path", devices: vda, newPath: "/srv/a\rb.qcow2", wantErr: "tab or line break"},
+		{name: "another disk's backing store", devices: vda +
+			"    <disk type='file'>\n      <source file='/d/clone.qcow2'/>\n      <backingStore type='file'>\n        <source file='" + old + "'/>\n      </backingStore>\n      <target dev='vdb'/>\n    </disk>\n",
+			wantErr: "<disk/backingStore/source> attribute file"},
+		{name: "a qemu:commandline argument", devices: vda,
+			extra:   "  <qemu:commandline xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>\n    <qemu:arg value='file=" + old + ",if=none'/>\n  </qemu:commandline>\n",
+			wantErr: "/qemu:commandline/qemu:arg> attribute value"},
+		{name: "element text", devices: vda, extra: "  <description>" + old + "</description>\n", wantErr: "<domain/description> text"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			in := edgeDomain(c.devices)
+			in = strings.Replace(in, "</domain>\n", c.extra+"</domain>\n", 1)
+			to := "/srv/pools/fast/mv1-root.qcow2"
+			if c.newPath != "" {
+				to = c.newPath
+			}
+			_, _, err := RewriteDiskSource(in, "vda", old, to)
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("err = %v, want one naming %q", err, c.wantErr)
+			}
+		})
 	}
 }

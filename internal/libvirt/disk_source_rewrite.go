@@ -7,34 +7,6 @@ import (
 	"strings"
 )
 
-// RewriteDiskSourceFile rewrites exactly one disk's <source file=...> in a libvirt
-// domain XML from oldFile to newFile and returns the new XML. It is the authoritative
-// cutover used by MoveVolume to repoint a domain's persistent config after a disk
-// moves between pools — so it is deliberately strict and precise rather than a blunt
-// string replace (which can hit the path outside the <source> attribute or mishandle
-// XML-escaped attribute values).
-//
-// Matching:
-//   - targetDev != "": the disk with <target dev=targetDev> is the subject. Its current
-//     <source file> must equal oldFile (→ rewrite, changed=true) or newFile (→ already
-//     cut over, changed=false); anything else, a missing such disk, or a subject disk
-//     that has no file-backed <source> (cdrom/block/network) is an error.
-//   - targetDev == "" (legacy rows with no recorded dev): exactly one disk whose
-//     <source file> equals oldFile → rewrite; else exactly one equal to newFile →
-//     idempotent (changed=false); zero or multiple matches → error.
-//
-// Other disks — including source-less devices (empty cdrom) and block/network disks
-// (<source dev=…>/<source protocol=…>, no file attr) — are parsed but never modified.
-//
-// The result is the input with only that attribute's value replaced: the edit is
-// spliced into the original text, so every other byte is kept. Every litevirt
-// domain carries namespaced metadata (litevirt-managed, litevirt-owner-epoch),
-// and a re-encode through encoding/xml would rewrite those elements, so the text
-// is never re-encoded. Namespaces outside <devices> (that metadata, a
-// qemu:commandline block) are kept as they are. A namespace on the domain
-// element, on <devices>, or on anything inside <devices> is refused: disks are
-// matched by element and attribute name there, and a namespaced name could be
-// taken for one it is not.
 // RewriteDiskSource repoints one disk's source, whichever attribute that disk
 // actually uses: <source file=> for a file, <source dev=> for a block device,
 // <source name=> for an rbd image.
@@ -70,6 +42,40 @@ const (
 // first for a malformed domain that carries several.
 var sourceAttrKinds = []sourceAttrKind{sourceAttrFile, sourceAttrDev, sourceAttrName}
 
+// RewriteDiskSourceFile rewrites exactly one disk's <source file=...> in a libvirt
+// domain XML from oldFile to newFile and returns the new XML. It is the authoritative
+// cutover used by MoveVolume to repoint a domain's persistent config after a disk
+// moves between pools — so it is deliberately strict and precise rather than a blunt
+// string replace (which can hit the path outside the <source> attribute or mishandle
+// XML-escaped attribute values).
+//
+// Matching:
+//   - targetDev != "": the disk with <target dev=targetDev> is the subject. Its current
+//     <source file> must equal oldFile (→ rewrite, changed=true) or newFile (→ already
+//     cut over, changed=false); anything else, a missing such disk, or a subject disk
+//     that has no file-backed <source> (cdrom/block/network) is an error.
+//   - targetDev == "" (legacy rows with no recorded dev): exactly one disk whose
+//     <source file> equals oldFile → rewrite; else exactly one equal to newFile →
+//     idempotent (changed=false); zero or multiple matches → error.
+//
+// Other disks — including source-less devices (empty cdrom) and block/network disks
+// (<source dev=…>/<source protocol=…>, no file attr) — are parsed but never modified.
+//
+// The result is the input with only that attribute's value replaced: the edit is
+// spliced into the original text, so every other byte is kept. Every litevirt
+// domain carries namespaced metadata (litevirt-managed, litevirt-owner-epoch),
+// and a re-encode through encoding/xml would rewrite those elements, so the text
+// is never re-encoded. Namespaces outside <devices> (that metadata, a
+// qemu:commandline block) are kept as they are. A namespace on the domain
+// element, on <devices>, or on anything inside <devices> is refused: disks are
+// matched by element and attribute name there, and a namespaced name could be
+// taken for one it is not.
+//
+// The rewrite is refused when the new path holds a tab, CR or LF (libvirt
+// would read each as a space), when the old path is still named anywhere else
+// in the domain — another element's attribute or text, such as a
+// qemu:commandline argument or another disk's backing store — and when the
+// output, parsed again, differs from the input anywhere but that one value.
 func RewriteDiskSourceFile(domXML, targetDev, oldFile, newFile string) (out string, changed bool, err error) {
 	return rewriteDiskSourceLocator(domXML, targetDev, oldFile, newFile, sourceAttrFile)
 }
@@ -99,9 +105,19 @@ func rewriteDiskSourceLocator(domXML, targetDev, oldSource, newSource string, wa
 				"the disk type and driver type to change too, which this rewrite does not do",
 			sourceAttrDescription(kind), newSource, sourceAttrDescription(kindOfSource(newSource)))
 	}
+	if strings.ContainsAny(newSource, "\t\r\n") {
+		return "", false, fmt.Errorf("refusing to repoint a disk to %q: it holds a tab or line break, which libvirt would read as a space", newSource)
+	}
 	rewritten, err := spliceDiskSource(domXML, disks[matchIndex], kind, oldSource, newSource)
 	if err != nil {
 		return "", false, err
+	}
+	if err := verifySplice(disks, rewritten, matchIndex, kind, newSource); err != nil {
+		return "", false, err
+	}
+	if where := elsewhereNamed(rewritten, oldSource); where != "" {
+		return "", false, fmt.Errorf("refusing to repoint the disk from %q: the domain still names that path in %s, "+
+			"which this rewrite would leave pointing at the old file", oldSource, where)
 	}
 	return rewritten, true, nil
 }
@@ -315,6 +331,9 @@ func spliceDiskSource(domXML string, d diskSourceInfo, kind sourceAttrKind, oldS
 		return "", fmt.Errorf("internal: matched disk %q has no <source %s=%q>", d.dev, kind, oldSource)
 	}
 	tag := domXML[d.srcStart:d.srcEnd]
+	if !strings.HasPrefix(tag, "<source") {
+		return "", fmt.Errorf("internal: disk %q's <source> span reads %q", d.dev, tag)
+	}
 	vs, ve, err := attrValueSpan(tag, string(kind))
 	if err != nil {
 		return "", fmt.Errorf("disk %q: %w", d.dev, err)
@@ -379,4 +398,114 @@ func attrValueSpan(tag, name string) (start, end int, err error) {
 		return 0, 0, fmt.Errorf("no %s attribute in %q", name, tag)
 	}
 	return start, end, nil
+}
+
+// verifySplice parses the rewritten XML again and requires the same disks as
+// before, each with the same target and locators, except that the matched
+// disk's `kind` locator is now newSource.
+func verifySplice(before []diskSourceInfo, out string, matchIndex int, kind sourceAttrKind, newSource string) error {
+	after, err := parseDiskSourceInfos(out)
+	if err != nil {
+		return fmt.Errorf("internal: the rewritten domain xml does not parse: %w", err)
+	}
+	if len(after) != len(before) {
+		return fmt.Errorf("internal: the rewrite changed the disk count from %d to %d", len(before), len(after))
+	}
+	for i := range before {
+		for _, k := range sourceAttrKinds {
+			want := before[i].src[k]
+			if i == matchIndex && k == kind {
+				want = newSource
+			}
+			if after[i].dev != before[i].dev || after[i].src[k] != want {
+				return fmt.Errorf("internal: the rewrite changed disk %d (%q) beyond its %s", i, before[i].dev, kind)
+			}
+		}
+	}
+	return nil
+}
+
+// DomainXMLNamesPath reports whether the domain XML names path in any
+// attribute value or text.
+func DomainXMLNamesPath(domXML, path string) bool {
+	return elsewhereNamed(domXML, path) != ""
+}
+
+// elsewhereNamed reports where, if anywhere, the domain XML still names path
+// in an attribute value or in text: "<parent>/<element> attribute <name>" or
+// "<parent>/<element> text". A comment is not read by libvirt and is skipped.
+// A document that does not parse counts as naming it. A longer path that
+// merely starts or ends with path (an overlay "root.qcow2.s1" of "root.qcow2",
+// or "/x/a/root.qcow2" of "/a/root.qcow2") is not a mention.
+func elsewhereNamed(domXML, path string) string {
+	if path == "" {
+		return ""
+	}
+	// RawToken keeps each name's prefix as written (qemu:arg), for the message.
+	dec := xml.NewDecoder(strings.NewReader(domXML))
+	var stack []string
+	for {
+		tok, err := dec.RawToken()
+		if err == io.EOF {
+			return ""
+		}
+		if err != nil {
+			return "a part of the domain xml that does not parse"
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			stack = append(stack, qualifiedName(t.Name))
+			for _, a := range t.Attr {
+				if namesPath(a.Value, path) {
+					return fmt.Sprintf("<%s> attribute %s", elementPath(stack), qualifiedName(a.Name))
+				}
+			}
+		case xml.EndElement:
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+		case xml.CharData:
+			if namesPath(string(t), path) {
+				return fmt.Sprintf("<%s> text", elementPath(stack))
+			}
+		}
+	}
+}
+
+// namesPath reports whether s holds path neither followed by a character that
+// would make it part of a longer file name nor preceded by one other than '/'.
+func namesPath(s, path string) bool {
+	for i := 0; ; {
+		j := strings.Index(s[i:], path)
+		if j < 0 {
+			return false
+		}
+		start, end := i+j, i+j+len(path)
+		before := start == 0 || s[start-1] == '/' || !isFileNameByte(s[start-1])
+		after := end == len(s) || !isFileNameByte(s[end])
+		if before && after {
+			return true
+		}
+		i = start + 1
+	}
+}
+
+func isFileNameByte(c byte) bool {
+	return c == '.' || c == '_' || c == '-' || c == '/' ||
+		(c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func qualifiedName(n xml.Name) string {
+	if n.Space == "" {
+		return n.Local
+	}
+	return n.Space + ":" + n.Local
+}
+
+// elementPath names an element by itself and its two nearest ancestors.
+func elementPath(stack []string) string {
+	if len(stack) > 3 {
+		stack = stack[len(stack)-3:]
+	}
+	return strings.Join(stack, "/")
 }

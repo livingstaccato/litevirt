@@ -238,7 +238,7 @@ func (s *Server) moveOneVolume(
 	// may have left the persistent config already booting from dstPath (with possibly
 	// newer guest writes than src.Path); re-copying src→dst would clobber it. So decide
 	// the cutover BEFORE the copy.
-	cs, origXML, newXML, perr := s.planCutover(vm, src, dstPath)
+	cs, _, perr := s.planCutover(vm, src, dstPath)
 	if perr != nil {
 		s.recordVMEvent(ctx, vm.Name, "disk.moved", "error",
 			fmt.Sprintf("%s: cutover preflight failed: %v", src.DiskName, perr))
@@ -273,6 +273,22 @@ func (s *Server) moveOneVolume(
 		if err := s.copyNoClobber(ctx, src, dstPath, emit); err != nil {
 			return err
 		}
+		// The copy can take minutes. Plan again on the persistent config as it is now,
+		// so the define carries any change made to it meanwhile (an owner-epoch or
+		// managed-stamp write) with only the disk's source repointed. A config whose
+		// disk no longer reads src (or dst) is refused: the VM keeps booting from
+		// whatever it names, and the copy is removed only if the config does not name
+		// it.
+		cs2, newXML, rerr := s.planCutover(vm, src, dstPath)
+		if rerr != nil {
+			if !s.persistentNamesPath(vm, dstPath) {
+				_ = os.Remove(dstPath)
+			}
+			s.recordVMEvent(ctx, vm.Name, "disk.moved", "error",
+				fmt.Sprintf("%s: the domain changed during the copy; cutover aborted (source preserved): %v", src.DiskName, rerr))
+			return status.Errorf(codes.Aborted, "the persistent domain config changed during the copy (cutover aborted, source preserved): %v", rerr)
+		}
+		cs = cs2
 		if cs == cutoverRedefined {
 			// The stopped VM must be redefined or it fails to start with "Cannot access
 			// storage file" once the old path is removed.
@@ -287,7 +303,7 @@ func (s *Server) moveOneVolume(
 			// Roll the cutover back; only remove the copy if the persistent config no
 			// longer points at it. A clean rollback leaves DB recording the old pool, so
 			// a retry is a fresh move.
-			if s.rollbackCutover(cs, vm.Name, origXML) {
+			if s.rollbackCutover(cs, vm, src, dstPath) {
 				_ = os.Remove(dstPath)
 			}
 			if errors.Is(err, corrosion.ErrNoRowsAffected) {
@@ -319,19 +335,6 @@ func (s *Server) moveOneVolume(
 	})
 }
 
-// redefineMovedDiskSource repoints the moved disk's <source> in the VM's PERSISTENT
-// domain config from src.Path to dstPath and reports whether a libvirt define was
-// performed (so the caller can roll it back) plus the original XML for that rollback.
-// It is the precise, hard cutover gate shared by the offline and live MoveVolume
-// paths: any error must abort/roll back the move rather than leave the persistent
-// config stale (which fails the next start with "Cannot access storage file").
-//
-// It reads the INACTIVE config (DumpXMLInactive): for a running domain the live
-// config may already show the new path post-pivot, but the persistent config — what
-// a restart loads — is what must be rewritten. It is idempotent: if the config
-// already points the disk at dstPath it returns (false, xml, nil), so a retry after a
-// partial cutover heals cleanly. When there is no libvirt backend (tests) it is a
-// no-op.
 // cutoverState records what redefineMovedDiskSource did to the PERSISTENT domain
 // config. It decides post-failure cleanup: the destination file is safe to remove
 // only when the persistent config does NOT point at it.
@@ -339,7 +342,7 @@ type cutoverState int
 
 const (
 	cutoverNoVirt       cutoverState = iota // no libvirt backend (tests) — nothing references dst
-	cutoverRedefined                        // rewrote the disk source src→dst this call (origXML restores src)
+	cutoverRedefined                        // rewrote the disk source src→dst this call
 	cutoverAlreadyAtDst                     // the persistent config already pointed the disk at dst
 )
 
@@ -347,55 +350,78 @@ const (
 // changing anything (no DefineDomain, no file writes). The move paths run it as a
 // read-only preflight *before* copying, so a prior partial cutover that already points
 // the persistent config at dstPath is detected before the (possibly stale) source
-// could clobber the authoritative destination.
+// could clobber the authoritative destination. The offline path runs it again right
+// before the define, so newXML is the config as it is then with only the disk's
+// source changed.
 //   - cutoverNoVirt       — no libvirt backend (tests)
 //   - cutoverAlreadyAtDst — persistent already boots the disk from dstPath (newXML "")
-//   - cutoverRedefined    — needs DefineDomain(newXML) to repoint src→dst (origXML restores src)
-func (s *Server) planCutover(vm *corrosion.VMRecord, src *corrosion.DiskRecord, dstPath string) (cs cutoverState, origXML, newXML string, err error) {
+//   - cutoverRedefined    — needs DefineDomain(newXML) to repoint src→dst
+func (s *Server) planCutover(vm *corrosion.VMRecord, src *corrosion.DiskRecord, dstPath string) (cs cutoverState, newXML string, err error) {
 	if s.virt == nil {
-		return cutoverNoVirt, "", "", nil
+		return cutoverNoVirt, "", nil
 	}
 	xml, derr := s.virt.DumpXMLInactive(vm.Name)
 	if derr != nil {
-		return cutoverNoVirt, "", "", fmt.Errorf("dump inactive domain xml: %w", derr)
+		return cutoverNoVirt, "", fmt.Errorf("dump inactive domain xml: %w", derr)
 	}
 	// Backing-aware: a zfs, lvm-thin or iscsi disk carries <source dev=> and a
 	// ceph one <source name=>, so the file-only spelling would refuse them.
 	out, changed, derr := libvirt.RewriteDiskSource(xml, src.TargetDev, src.Path, dstPath)
 	if derr != nil {
-		return cutoverNoVirt, xml, "", derr
+		return cutoverNoVirt, "", derr
 	}
 	if !changed {
-		return cutoverAlreadyAtDst, xml, "", nil
+		return cutoverAlreadyAtDst, "", nil
 	}
-	return cutoverRedefined, xml, out, nil
+	return cutoverRedefined, out, nil
 }
 
-// redefineMovedDiskSource is planCutover followed by APPLYING the redefine. The live
-// path uses it (it has no separate copy step to gate); the offline path uses
-// planCutover directly so it can decide whether to copy first.
-func (s *Server) redefineMovedDiskSource(vm *corrosion.VMRecord, src *corrosion.DiskRecord, dstPath string) (cutoverState, string, error) {
-	cs, origXML, newXML, err := s.planCutover(vm, src, dstPath)
+// redefineMovedDiskSource repoints the moved disk's <source> in the VM's PERSISTENT
+// domain config from src.Path to dstPath and reports whether a libvirt define was
+// performed, so the caller can roll it back. It is the precise, hard cutover gate
+// shared by the offline and live MoveVolume paths: any error must abort/roll back the
+// move rather than leave the persistent config stale (which fails the next start with
+// "Cannot access storage file").
+//
+// It reads the INACTIVE config (DumpXMLInactive): for a running domain the live
+// config may already show the new path post-pivot, but the persistent config — what
+// a restart loads — is what must be rewritten. It is idempotent: if the config
+// already points the disk at dstPath it defines nothing, so a retry after a partial
+// cutover heals cleanly. When there is no libvirt backend (tests) it is a no-op.
+func (s *Server) redefineMovedDiskSource(vm *corrosion.VMRecord, src *corrosion.DiskRecord, dstPath string) (cutoverState, error) {
+	cs, newXML, err := s.planCutover(vm, src, dstPath)
 	if err != nil {
-		return cs, origXML, err
+		return cs, err
 	}
 	if cs == cutoverRedefined {
 		if derr := s.virt.DefineDomain(newXML); derr != nil {
-			return cutoverNoVirt, origXML, fmt.Errorf("define domain: %w", derr)
+			return cutoverNoVirt, fmt.Errorf("define domain: %w", derr)
 		}
 	}
-	return cs, origXML, nil
+	return cs, nil
 }
 
 // rollbackCutover undoes redefineMovedDiskSource after a failed move and reports
-// whether the destination file is now safe to remove. It NEVER reports safe while the
-// persistent config still points the disk at dst (removing it would strand the domain).
-func (s *Server) rollbackCutover(cs cutoverState, vmName, origXML string) (safeToRemoveDst bool) {
+// whether the destination file is now safe to remove. It reads the persistent config
+// as it is now and repoints only the disk's source from dst back to src, so a change
+// made to the config since the define (an owner-epoch or managed-stamp write) is kept.
+// It NEVER reports safe while the persistent config still points the disk at dst
+// (removing it would strand the domain).
+func (s *Server) rollbackCutover(cs cutoverState, vm *corrosion.VMRecord, src *corrosion.DiskRecord, dstPath string) (safeToRemoveDst bool) {
 	switch cs {
 	case cutoverRedefined:
-		if err := s.virt.DefineDomain(origXML); err != nil {
+		cur, err := s.virt.DumpXMLInactive(vm.Name)
+		if err == nil {
+			var back string
+			var changed bool
+			back, changed, err = libvirt.RewriteDiskSource(cur, src.TargetDev, dstPath, src.Path)
+			if err == nil && changed {
+				err = s.virt.DefineDomain(back)
+			}
+		}
+		if err != nil {
 			slog.Error("move: cutover rollback failed — persistent domain still points at the new path; keeping the new file so the VM boots, operator must reconcile the disk row",
-				"vm", vmName, "error", err)
+				"vm", vm.Name, "error", err)
 			return false
 		}
 		return true // persistent restored to the source path
@@ -403,11 +429,25 @@ func (s *Server) rollbackCutover(cs cutoverState, vmName, origXML string) (safeT
 		// Persistent already pointed at dst before this move; there is no source XML to
 		// restore, so keep the file (the VM boots from it) and surface for reconcile.
 		slog.Error("move: persistent domain already pointed at the new path before this move and the commit failed — keeping the new file so the VM boots, operator must reconcile the disk row",
-			"vm", vmName)
+			"vm", vm.Name)
 		return false
 	default: // cutoverNoVirt — no persistent config references dst
 		return true
 	}
+}
+
+// persistentNamesPath reports whether the VM's persistent config names path. An
+// unreadable config counts as naming it, so a caller never removes a file the
+// domain may boot from.
+func (s *Server) persistentNamesPath(vm *corrosion.VMRecord, path string) bool {
+	if s.virt == nil {
+		return false
+	}
+	cur, err := s.virt.DumpXMLInactive(vm.Name)
+	if err != nil {
+		return true
+	}
+	return libvirt.DomainXMLNamesPath(cur, path)
 }
 
 // referenceKind names HOW d depends on path, for the message an operator reads

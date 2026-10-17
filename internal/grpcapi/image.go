@@ -101,7 +101,13 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 	// pull completes even if the client disconnects (#17).
 	errCh := make(chan error, 1)
 	handedOff = true
+	// The goroutine outlives this RPC: it records the pull and starts the
+	// refresh's prune after errCh has answered the client. It joins bg here,
+	// before the RPC can return, so the prune's own bg.Add never starts the
+	// group from zero against a Wait that began after the RPC returned.
+	s.imagePrune.bg.Add(1)
 	go func() {
+		defer s.imagePrune.bg.Done()
 		defer release()
 		pub, pullErr := image.PullPublished(s.images, req.Name, req.SourceUrl, req.Checksum, s.imagePullOptions(), progressCh)
 		errCh <- pullErr

@@ -1479,7 +1479,7 @@ type imagePruneState struct {
 	pubs  map[string]int    // image → in-flight pulls, imports, builds (holdImagePublish)
 	gens  map[string]uint64 // image → holds ever taken, either kind
 	cgens map[string]uint64 // image → disk-create holds ever taken (holdImage)
-	bg    sync.WaitGroup    // background prunes after a refresh, and after DeleteImage
+	bg    sync.WaitGroup    // background prunes after a refresh and after DeleteImage, and a pull's work after its RPC returns
 
 	readDir  func(string) ([]os.DirEntry, error) // test seam; os.ReadDir when nil
 	mounted  func(string) (bool, error)          // test seam; isMountpoint when nil

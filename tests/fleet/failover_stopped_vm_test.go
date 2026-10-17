@@ -633,6 +633,10 @@ func TestFleet_ReKeyedStoppedVMDefinedOnlyWhereTheRowEnds(t *testing.T) {
 	a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	sharedDiskVM(t, c, a, "sv-split", victim.Name, "stopped", "operator-stop")
 	c.WaitConverged(t, convergeTimeout)
+	// The victim is down, so it relays nothing either: left linked, it carried
+	// each side's re-key to the other (every node is a relay here), and under
+	// load the two converged on one owner before b reconciled.
+	c.Isolate(victim)
 	c.SetLinkFaultBoth(a, b, LinkFault{Block: true})
 	// Each side's coordinator re-keys to its own host, at the same generation.
 	for _, n := range []*Node{a, b} {
@@ -668,9 +672,18 @@ func TestFleet_ReKeyedStoppedVMDefinedOnlyWhereTheRowEnds(t *testing.T) {
 			t.Errorf("%s defines sv-split: %v; only its owner %s should", n.Name, defined, owner.Name)
 		}
 	}
-	if _, err := c.SelfClient(owner).StartVM(ctx, &pb.StartVMRequest{Name: "sv-split"}); err != nil {
-		t.Fatalf("lv start sv-split on %s: %v", owner.Name, err)
-	}
+	// Each reconciler defines under the VM's start lease, a replicated row.
+	// Until the loser's release reaches the owner, the start refuses with
+	// "retry in a moment" (once in 480 runs under load): retried as an
+	// operator would; any other refusal fails.
+	var startErr error
+	eventually(t, convergeTimeout, "lv start sv-split on its owner", func() bool {
+		_, startErr = c.SelfClient(owner).StartVM(ctx, &pb.StartVMRequest{Name: "sv-split"})
+		if startErr != nil && !strings.Contains(startErr.Error(), "retry in a moment") {
+			t.Fatalf("lv start sv-split on %s: %v", owner.Name, startErr)
+		}
+		return startErr == nil
+	})
 }
 
 // Under the shared-storage fence, a stopped VM on shared storage is moved off

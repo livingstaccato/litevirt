@@ -1127,6 +1127,9 @@ type Server struct {
 	// streamRecheckEvery is how often an open user-authenticated stream
 	// re-checks its credential (stream_watch.go); 0 = StreamRecheckInterval.
 	streamRecheckEvery time.Duration
+	// streamClock, when set, is the stream watcher's clock (streamNow).
+	// Test seam only.
+	streamClock func() time.Time
 	// streamKick wakes every open stream's watcher to re-check now; replaced
 	// (closed) on each kick. Guarded by streamKickMu.
 	streamKickMu sync.Mutex

@@ -922,6 +922,9 @@ type Server struct {
 	// started acting (detachDelete). Zero, as in production, means
 	// deleteFinishTimeout.
 	deleteFinish time.Duration
+	// deleteStep is a TEST SEAM run at named steps of a VM delete
+	// (SetDeleteStepHookForTest). Nil in production.
+	deleteStep func(vm, step string)
 	// diskSpaceOverride is a TEST SEAM for the free-space checks of a cold
 	// migration's disk copy (diskSpace). Nil in production.
 	diskSpaceOverride func(dir string) (avail, total uint64, err error)

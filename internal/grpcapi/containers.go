@@ -700,7 +700,11 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	ctMACs := s.containerNICMACs(ctx, req.Name)
 	// From the runtime delete on, the delete runs to its tombstone whatever
 	// becomes of its caller: a client gone between the two would leave a live
-	// row over a container that no longer exists (detachDelete).
+	// row over a container that no longer exists (detachDelete). A caller
+	// already gone refuses it with nothing done.
+	if err := refuseIfCancelled(ctx); err != nil {
+		return nil, err
+	}
 	ctx, cancelFinish := s.detachDelete(ctx)
 	defer cancelFinish()
 	// A runtime "not found" is acceptable (idempotent) — proceed to the row

@@ -318,6 +318,9 @@ func newRmCmd() *cobra.Command {
 					Force:     daemonForces,
 				}, grpc.Header(&hdr))
 				if err != nil {
+					if ierr := interruptedDelete("delete VM "+args[0], err, "lv ls"); ierr != nil {
+						return ierr
+					}
 					return fmt.Errorf("delete VM: %w", err)
 				}
 				fmt.Printf("VM %s deleted\n", args[0])

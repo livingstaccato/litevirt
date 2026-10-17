@@ -418,6 +418,9 @@ func newCTRmCmd() *cobra.Command {
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				_, err := c.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: host, Name: args[0], Force: force})
+				if ierr := interruptedDelete("delete container "+args[0], err, "lv ct ls"); ierr != nil {
+					return ierr
+				}
 				return err
 			})
 		},

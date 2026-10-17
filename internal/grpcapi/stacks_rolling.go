@@ -126,6 +126,15 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 	if cur != nil {
 		curCreated = cur.CreatedAt
 	}
+	// From the delete on, the re-create runs to its create whatever becomes
+	// of its caller (detachReplace); a caller already gone refuses it with
+	// nothing deleted.
+	if err := refuseIfCancelled(ctx); err != nil {
+		st := status.Convert(err)
+		return status.Errorf(st.Code(), "recreate %s: %s; nothing was deleted", target, st.Message())
+	}
+	ctx, cancelReplace := detachReplace(ctx)
+	defer cancelReplace()
 	dctx, deleted := withDeletedVMSink(ctx, target, curCreated)
 	_, derr := o.s.DeleteVM(dctx, &pb.DeleteVMRequest{Name: target})
 	if derr != nil && status.Code(derr) != codes.NotFound {
@@ -612,6 +621,23 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 			}
 		}
 	}
+	// From the delete on, the re-create runs to its create whatever becomes
+	// of its caller (detachReplace); a caller already gone refuses it with
+	// nothing deleted. The wait for the created workload's dependents stays
+	// on the caller's context.
+	if err := refuseIfCancelled(ctx); err != nil {
+		st := status.Convert(err)
+		err = status.Errorf(st.Code(), "recreate %s: %s; nothing was deleted", action.VMName, st.Message())
+		gate.markUnmet(action.VMName, err)
+		return err
+	}
+	waitCtx := ctx
+	ctx, cancelReplace := detachReplace(ctx)
+	defer cancelReplace()
+	deleteCtx, cancelDelete := detachReplace(deleteCtx)
+	defer cancelDelete()
+	createCtx, cancelCreate := detachReplace(createCtx)
+	defer cancelCreate()
 	delErr := s.deleteWorkload(deleteCtx, action)
 	tornDown := delErr == nil
 	if status.Code(delErr) == codes.NotFound {
@@ -686,7 +712,7 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 		return vmErr
 	}
 	// A recreated workload is as new to its dependents as a created one.
-	return gate.waitCreated(ctx, action)
+	return gate.waitCreated(waitCtx, action)
 }
 
 // preflightInlineRecreate runs, before an inline compose re-create deletes

@@ -306,7 +306,9 @@ func newDownCmd() *cobra.Command {
 				for {
 					p, err := stream.Recv()
 					if err != nil {
-						if st, ok := status.FromError(err); ok && st.Code() != codes.OK {
+						if ierr := interruptedDelete("compose down "+name, err, "lv compose ls", "lv ls"); ierr != nil {
+							downErr = ierr
+						} else if st, ok := status.FromError(err); ok && st.Code() != codes.OK {
 							downErr = fmt.Errorf("delete failed: %s", st.Message())
 						}
 						break

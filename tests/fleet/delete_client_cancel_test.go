@@ -21,7 +21,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -286,23 +288,70 @@ func TestFleet_DeleteContainerFinishesWhenItsClientLeaves(t *testing.T) {
 	}
 }
 
-// lv rm on the owner of a VM whose domain is already gone there (a crash
-// mid-teardown, a `virsh undefine`): the owner asks every peer whether it has
-// the domain, then cleans up the record. The client leaves while the peer is
-// being asked. Past the probes the delete acts — devices, the stop record,
-// disks, the tombstone — and must run to its end.
-//
-// Mutation: drop the detach after the probes — red: the delete fails on its
-// first write, and the row stays running with no domain.
-func TestFleet_DeleteVMWithNoDomainFinishesWhenItsClientLeaves(t *testing.T) {
-	c, _ := newDeleteCancelFleet(t)
-	owner, peer := c.Nodes[1], c.Nodes[0]
+// undefineOnOwner leaves dcx-1's row running on node-1 with no domain there
+// (a crash mid-teardown, a `virsh undefine`).
+func undefineOnOwner(t *testing.T, owner *Node) {
+	t.Helper()
 	if err := owner.Virt.DestroyDomain("dcx-1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := owner.Virt.UndefineDomain("dcx-1", false); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// lv rm on the owner of a VM whose domain is already gone there: the owner
+// asks every peer whether it has the domain, then cleans up the record. The
+// client leaves once the cleanup has started acting. Past that point the
+// delete — devices, the stop record, disks, the tombstone — runs to its end.
+//
+// Mutation: drop the detach after the probes — red: the delete fails on its
+// first write, and the row stays running with no domain.
+func TestFleet_DeleteVMWithNoDomainFinishesWhenItsClientLeaves(t *testing.T) {
+	c, _ := newDeleteCancelFleet(t)
+	owner := c.Nodes[1]
+	undefineOnOwner(t, owner)
+	cctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	returned, armAct, reached := cancelAfter(t, owner, "DeleteVM", cancel)
+	act := armAct()
+	owner.Server.SetDeleteStepHookForTest(func(vm, step string) {
+		if vm == "dcx-1" && step == "acting" {
+			act()
+		}
+	})
+	t.Cleanup(func() { owner.Server.SetDeleteStepHookForTest(nil) })
+
+	_, _ = c.SelfClient(owner).DeleteVM(cctx, &pb.DeleteVMRequest{Name: "dcx-1"})
+	herr := waitHandler(t, returned, "DeleteVM")
+	if !reached() {
+		t.Fatal("the cancellation never reached the owner once its cleanup was acting; the scenario missed the window")
+	}
+	if herr != nil {
+		t.Errorf("the owner's delete failed after its client left: %v", herr)
+	}
+	ctx := context.Background()
+	if vm, _ := corrosion.GetVM(ctx, owner.DB, "dcx-1"); vm != nil {
+		t.Errorf("dcx-1's row is live (state %q) with no domain anywhere: the delete did not finish", vm.State)
+	}
+	rec := health.NewReconciler(owner.Name, filepath.Join(c.tmpRoot, owner.Name, "data"), owner.DB, owner.Virt)
+	rec.ReconcileOnce(ctx)
+	if owner.Virt.DomainExists("dcx-1") {
+		t.Errorf("a reconcile pass defined dcx-1 on %s after its delete", owner.Name)
+	}
+}
+
+// The client leaves while the owner is still asking its peers. Nothing has
+// been done yet, and a peer's answer is lost to the cancellation — one that
+// has the domain among them — so the delete is refused and the record, the
+// only handle on the VM, stays with its disks.
+//
+// Mutation: drop the ctx.Err() refusal after the probes — red: the owner
+// tombstones the record on a view it never got.
+func TestFleet_DeleteVMWithNoDomainCancelledDuringTheProbesIsRefused(t *testing.T) {
+	c, disks := newDeleteCancelFleet(t)
+	owner, peer := c.Nodes[1], c.Nodes[0]
+	undefineOnOwner(t, owner)
 	cctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	returned, armAct, reached := cancelAfter(t, owner, "DeleteVM", cancel)
@@ -317,17 +366,21 @@ func TestFleet_DeleteVMWithNoDomainFinishesWhenItsClientLeaves(t *testing.T) {
 	if !reached() {
 		t.Fatal("the cancellation never reached the owner while it asked its peer; the scenario missed the window")
 	}
-	if herr != nil {
-		t.Errorf("the owner's delete failed after its client left: %v", herr)
+	if herr == nil {
+		t.Error("the owner's delete succeeded although its client left before it acted")
 	}
 	ctx := context.Background()
-	if vm, _ := corrosion.GetVM(ctx, owner.DB, "dcx-1"); vm != nil {
-		t.Errorf("dcx-1's row is live (state %q) with no domain anywhere: the delete did not finish", vm.State)
+	vm, _ := corrosion.GetVM(ctx, owner.DB, "dcx-1")
+	if vm == nil {
+		t.Fatal("dcx-1's record was tombstoned by a delete whose peer answers were lost to the cancellation")
 	}
-	rec := health.NewReconciler(owner.Name, filepath.Join(c.tmpRoot, owner.Name, "data"), owner.DB, owner.Virt)
-	rec.ReconcileOnce(ctx)
-	if owner.Virt.DomainExists("dcx-1") {
-		t.Errorf("a reconcile pass defined dcx-1 on %s after its delete", owner.Name)
+	if vm.State != "running" {
+		t.Errorf("dcx-1's row says %q after a refused delete; want it untouched (running)", vm.State)
+	}
+	for _, p := range disks {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("disk %s of a refused delete is gone: %v", p, err)
+		}
 	}
 }
 
@@ -366,5 +419,287 @@ func TestFleet_DeleteVMAbortRecordsTheStopAfterItsBudgetRanOut(t *testing.T) {
 	rec.ReconcileOnce(ctx)
 	if active, _ := node.Virt.DomainIsActive("hb-1"); active {
 		t.Error("a reconcile pass started hb-1, whose delete stopped it")
+	}
+}
+
+// A delete that runs out of its budget at a step after the undefine — the
+// NIC read, the address release, the tombstone — fails there. It must leave
+// the row recorded stopped, never running (or starting) over an undefined
+// domain whose disks are freed: the reconciler would start that VM again.
+//
+// Mutations: drop the abort on the NIC-read return, or on the tombstone
+// return — that case goes red; record the stop only for a destroyed domain
+// — the starting case goes red.
+func TestFleet_DeleteVMRunningOutOfBudgetAfterTheUndefineRecordsTheStop(t *testing.T) {
+	for _, tc := range []struct {
+		name, step, state string
+	}{
+		{"running, before the NIC read", "nics", "running"},
+		{"running, before the tombstone", "tombstone", "running"},
+		{"starting with no active domain, before the NIC read", "nics", "starting"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, node, client := newComposeFailNode(t)
+			ctx := context.Background()
+			deployOneVM(t, ctx, node, client)
+			if tc.state != "running" {
+				if err := node.Virt.DestroyDomain("hb-1"); err != nil {
+					t.Fatal(err)
+				}
+				if err := corrosion.UpdateVMState(ctx, node.DB, "hb-1", tc.state, ""); err != nil {
+					t.Fatal(err)
+				}
+			}
+			node.Server.SetDeleteFinishTimeoutForTest(200 * time.Millisecond)
+			var hit atomic.Bool
+			node.Server.SetDeleteStepHookForTest(func(vm, step string) {
+				if vm == "hb-1" && step == tc.step {
+					hit.Store(true)
+					time.Sleep(400 * time.Millisecond) // past the delete's budget
+				}
+			})
+			t.Cleanup(func() { node.Server.SetDeleteStepHookForTest(nil) })
+
+			if _, err := client.DeleteVM(ctx, &pb.DeleteVMRequest{Name: "hb-1"}); err == nil {
+				t.Fatal("DeleteVM succeeded although its budget ran out before the step")
+			}
+			if !hit.Load() {
+				t.Fatalf("the delete never reached step %q", tc.step)
+			}
+			vm, err := corrosion.GetVM(ctx, node.DB, "hb-1")
+			if err != nil || vm == nil {
+				t.Fatalf("hb-1's row: %+v (%v), want it kept by the failed delete", vm, err)
+			}
+			if vm.State != "stopped" {
+				t.Errorf("hb-1's row says %q after a delete that undefined it and failed; want stopped", vm.State)
+			}
+			rec := health.NewReconciler(node.Name, filepath.Join(c.tmpRoot, node.Name, "data"), node.DB, node.Virt)
+			rec.ReconcileOnce(ctx)
+			if node.Virt.DomainExists("hb-1") {
+				t.Error("a reconcile pass defined hb-1, whose delete undefined it")
+			}
+		})
+	}
+}
+
+// lv rm entered on the owner, its client gone mid-delete: the delete
+// completes, and so do the steps the entry runs after it — here, the
+// partial-recovery marker of the name is resolved, so a later VM of the name
+// does not inherit it.
+//
+// Mutation: run the post-steps on the request context — red.
+func TestFleet_DeleteVMOnTheOwnerRunsItsPostStepsWhenItsClientLeaves(t *testing.T) {
+	c, disks := newDeleteCancelFleet(t)
+	owner := c.Nodes[1]
+	ctx := context.Background()
+	ts := time.Now().UTC().Format(time.RFC3339)
+	if err := corrosion.UpsertHealthCondition(ctx, owner.DB, corrosion.HealthCondition{
+		Evaluator: "replica_set", Code: "vm.promoted_partial", SubjectKind: "vm", SubjectID: "dcx-1",
+		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityWarning,
+		Evidence: `{}`, ObserveCount: 1, FirstSeen: ts, LastSeen: ts, ConfirmedAt: ts, Reporter: owner.Name,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	returned, armAct, reached := cancelAfter(t, owner, "DeleteVM", cancel)
+	act := armAct()
+	owner.Virt.OnUndefined = func(name string) {
+		if name == "dcx-1" {
+			act()
+		}
+	}
+	defer func() { owner.Virt.OnUndefined = nil }()
+
+	_, _ = c.SelfClient(owner).DeleteVM(cctx, &pb.DeleteVMRequest{Name: "dcx-1"})
+	herr := waitHandler(t, returned, "DeleteVM")
+	if !reached() {
+		t.Fatal("the cancellation never reached the owner mid-delete; the scenario missed the window")
+	}
+	// Read before any reconcile pass: its gone-subject sweep would resolve
+	// the marker by itself.
+	row, found, err := corrosion.GetHealthCondition(ctx, owner.DB, "replica_set", "vm.promoted_partial", "vm", "dcx-1")
+	if err != nil || !found {
+		t.Fatalf("partial-recovery marker: found=%v err=%v", found, err)
+	}
+	if row.Lifecycle != corrosion.ConditionResolved {
+		t.Errorf("dcx-1's partial-recovery marker is %q after its delete; want resolved by the delete", row.Lifecycle)
+	}
+	assertVMDeleteFinished(t, c, owner, disks, herr)
+}
+
+// deployCancelledInside runs a deploy of yaml entered on entry, and lets arm
+// install trigger wherever the scenario wants the client to leave: trigger
+// cancels the client and holds its caller until entry's DeployStack context
+// is done. It returns once that handler has returned.
+func deployCancelledInside(t *testing.T, c *Cluster, entry *Node, yaml string, arm func(trigger func())) {
+	t.Helper()
+	watch := entry.WatchStream("DeployStack")
+	cctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var (
+		once sync.Once
+		mu   sync.Mutex
+		hit  bool
+	)
+	arm(func() {
+		once.Do(func() {
+			var sctx context.Context
+			select {
+			case sctx = <-watch.Started:
+			default:
+				t.Error("triggered outside the deploy")
+				return
+			}
+			cancel()
+			select {
+			case <-sctx.Done():
+				mu.Lock()
+				hit = true
+				mu.Unlock()
+			case <-time.After(20 * time.Second):
+				t.Error("the client's cancellation did not reach the deploy within 20s")
+			}
+		})
+	})
+	stream, err := c.SelfClient(entry).DeployStack(cctx, &pb.DeployStackRequest{ComposeYaml: yaml})
+	if err != nil {
+		t.Fatalf("DeployStack: %v", err)
+	}
+	for {
+		if _, err := stream.Recv(); err != nil {
+			break
+		}
+	}
+	select {
+	case <-watch.Returned:
+	case <-time.After(90 * time.Second):
+		t.Fatal("the deploy had not returned 90s after its client left")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !hit {
+		t.Fatal("the client never left inside the re-create; the scenario missed the window")
+	}
+}
+
+// assertReplaced checks that name is live on owner, re-created from the
+// update (its spec carries want), with its domain defined there.
+func assertReplaced(t *testing.T, owner *Node, name, want string) {
+	t.Helper()
+	vm, err := corrosion.GetVM(context.Background(), owner.DB, name)
+	if err != nil || vm == nil {
+		t.Fatalf("%s is gone on %s after a re-create whose client left: no copy of the VM is left", name, owner.Name)
+	}
+	if !strings.Contains(vm.Spec, want) {
+		t.Errorf("%s on %s is not the re-created VM: its spec lacks %q", name, owner.Name, want)
+	}
+	if !owner.Virt.DomainExists(name) {
+		t.Errorf("%s has a row on %s but no domain", name, owner.Name)
+	}
+}
+
+// A compose re-create whose client leaves once the teardown has started
+// must not end with no copy of the VM: the replace runs to its create.
+//
+// Mutation: run the inline re-create's create (or delete) on the request
+// context — red: web is gone.
+func TestFleet_AComposeRecreateWhoseClientLeavesStillCreatesTheVM(t *testing.T) {
+	t.Run("entered on the owner, client gone after the teardown", func(t *testing.T) {
+		c, _ := newRecreateRemoteFleet(t, 0, "node-0")
+		n0 := c.Nodes[0]
+		deployCancelledInside(t, c, n0, recreateRemoteYAML("node-0", "second"), func(trigger func()) {
+			n0.Server.SetRecreateTornDownHookForTest(func(string) { trigger() })
+		})
+		n0.Server.SetRecreateTornDownHookForTest(nil)
+		assertReplaced(t, n0, "web", "second")
+	})
+	t.Run("entered on another node, client gone mid-delete on the owner", func(t *testing.T) {
+		c, _ := newRecreateRemoteFleet(t, 1, "node-0")
+		n0, n1 := c.Nodes[0], c.Nodes[1]
+		ownerDone := make(chan struct{})
+		var doneOnce sync.Once
+		n0.HookUnary("DeleteVM", func(ctx context.Context, req any, handler grpc.UnaryHandler) (any, error) {
+			defer doneOnce.Do(func() { close(ownerDone) })
+			return handler(ctx, req)
+		})
+		deployCancelledInside(t, c, n1, recreateRemoteYAML("node-0", "second"), func(trigger func()) {
+			n0.Virt.OnUndefined = func(name string) {
+				if name == "web" {
+					trigger()
+				}
+			}
+		})
+		n0.Virt.OnUndefined = nil
+		select {
+		case <-ownerDone:
+		case <-time.After(60 * time.Second):
+			t.Fatal("the owner's delete had not returned 60s after the client left")
+		}
+		assertReplaced(t, n0, "web", "second")
+	})
+}
+
+// The same for a rolling update's re-create (recreateAs).
+//
+// Mutation: run recreateAs's create on the request context — red.
+func TestFleet_ARollingRecreateWhoseClientLeavesStillCreatesTheVM(t *testing.T) {
+	c, node, client := newComposeFailNode(t)
+	ctx := context.Background()
+	if msgs, err := deployRolling(t, ctx, client, composeRolling, 20*time.Second); err != nil {
+		t.Fatalf("setup deploy: %v (%v)", err, msgs)
+	}
+	// An image change is a recreate-class change: the rolling engine
+	// re-creates hb-1 (recreateAs).
+	if err := corrosion.InsertImage(ctx, node.DB, corrosion.ImageRecord{Name: "test2", Format: "qcow2",
+		SourceURL: "file:///dev/null", Checksum: "deadbeef", SizeBytes: 1024}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeEmptyImageFile(node.Server.ImagePathForTests("test2")); err != nil {
+		t.Fatal(err)
+	}
+	update := strings.Replace(strings.Replace(composeRolling,
+		"    image: test\n", "    image: test2\n", 1),
+		"  test:\n    source: file:///dev/null\n", "  test:\n    source: file:///dev/null\n  test2:\n    source: file:///dev/null\n", 1)
+	deployCancelledInside(t, c, node, update, func(trigger func()) {
+		node.Server.SetRecreateTornDownHookForTest(func(string) { trigger() })
+	})
+	node.Server.SetRecreateTornDownHookForTest(nil)
+	assertReplaced(t, node, "hb-1", `"image":"test2"`)
+}
+
+// The same for lv rebuild: torn down, then created again from its stored
+// spec, whatever becomes of the client.
+//
+// Mutation: drop the rebuild's detach — red: hb-1 is gone.
+func TestFleet_ARebuildWhoseClientLeavesStillCreatesTheVM(t *testing.T) {
+	_, node, client := newComposeFailNode(t)
+	ctx := context.Background()
+	deployOneVM(t, ctx, node, client)
+	before, _ := corrosion.GetVM(ctx, node.DB, "hb-1")
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	returned, armAct, reached := cancelAfter(t, node, "RebuildVM", cancel)
+	act := armAct()
+	node.Server.SetRecreateTornDownHookForTest(func(string) { act() })
+	t.Cleanup(func() { node.Server.SetRecreateTornDownHookForTest(nil) })
+
+	_, _ = client.RebuildVM(cctx, &pb.RebuildVMRequest{Name: "hb-1"})
+	herr := waitHandler(t, returned, "RebuildVM")
+	if !reached() {
+		t.Fatal("the cancellation never reached the rebuild after its teardown; the scenario missed the window")
+	}
+	if herr != nil {
+		t.Errorf("the rebuild failed after its client left: %v", herr)
+	}
+	vm, err := corrosion.GetVM(ctx, node.DB, "hb-1")
+	if err != nil || vm == nil {
+		t.Fatal("hb-1 is gone after a rebuild whose client left: no copy of the VM is left")
+	}
+	if before != nil && vm.CreatedAt == before.CreatedAt {
+		t.Errorf("hb-1 is still the old incarnation (created_at %s)", vm.CreatedAt)
+	}
+	if !node.Virt.DomainExists("hb-1") {
+		t.Error("hb-1 has a row but no domain after its rebuild")
 	}
 }

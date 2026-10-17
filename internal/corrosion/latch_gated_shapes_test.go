@@ -18,7 +18,9 @@ import (
 var frozenLatchGatedShapes = map[string][]string{
 	capabilities.Release202611V1: {
 		"stmtshape/v1:6450d3276c39ec8bf822855d4383a8e28f237e957f420516ca0755ce08894478",
+		"stmtshape/v1:73d563d5354c900e138a55aeaf1ead8c66d89436f520501363e5ab0573035d28", // readmitHostV2SQL (host_incarnation)
 		"stmtshape/v1:7ed4a32cf5eac0729d6dd4133bbbcf74826005634126d1e32504b864aa15982e",
+		"stmtshape/v1:83f910f2e35a4b7ab7ac51f5dee634c2b37925838de6ac23c1543786c14de656", // hostOwnEndpointSQL (host_incarnation)
 		"stmtshape/v1:ab30a087c3d613badbf21d09a8699381fe9d6f5d73fe19ac96aad997eb32dfa4",
 		"stmtshape/v1:e3428cc6a7557a34588a878ed81a5f47e59c17c11b1be584384d4afb0b832c8e",
 	},

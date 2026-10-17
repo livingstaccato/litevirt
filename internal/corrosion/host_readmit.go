@@ -73,24 +73,28 @@ var readmitResetSQL = buildReadmitReset()
 // readmitFingerprint is the wire fingerprint applied through readmitResetSQL.
 var readmitFingerprint = mustStatementFingerprint(readmitHostSQL)
 
-func buildReadmitReset() string {
+func buildReadmitReset() string { return buildReadmitResetFor(readmitHostSQL) }
+
+// buildReadmitResetFor inserts the reset columns into a re-admission's wire
+// form (readmitHostSQL, readmitHostV2SQL). The reset form binds exactly the
+// wire form's parameters, in the same order: a receiver executes it with the
+// INCOMING params.
+func buildReadmitResetFor(wireSQL string) string {
 	const anchor = "deleted_at = NULL,"
-	if strings.Count(readmitHostSQL, anchor) != 1 {
-		panic("readmitHostSQL must clear deleted_at exactly once: " + readmitHostSQL)
+	if strings.Count(wireSQL, anchor) != 1 {
+		panic("a re-admission must clear deleted_at exactly once: " + wireSQL)
 	}
-	reset := strings.Replace(readmitHostSQL, anchor, readmitResetColumns+anchor, 1)
-	// The reset form binds exactly the wire form's parameters, in the same
-	// order: a receiver executes it with the INCOMING params.
-	wire, _, err := parseResolved(readmitHostSQL)
+	reset := strings.Replace(wireSQL, anchor, readmitResetColumns+anchor, 1)
+	wire, _, err := parseResolved(wireSQL)
 	if err != nil {
-		panic("readmitHostSQL does not resolve: " + err.Error())
+		panic("re-admission SQL does not resolve: " + err.Error())
 	}
 	r, _, err := parseResolved(reset)
 	if err != nil {
 		panic("readmit reset SQL does not resolve: " + reset + ": " + err.Error())
 	}
 	if wire.Kind != KindUpdate || !wire.HasFullPKIdentity || wire.UpdatedAtParamIdx < 0 {
-		panic("readmitHostSQL must be a full-PK UPDATE binding updated_at")
+		panic("a re-admission must be a full-PK UPDATE binding updated_at")
 	}
 	if r.ValidateParamArity(wire.ParamCount) != nil || r.UpdatedAtParamIdx != wire.UpdatedAtParamIdx {
 		panic("readmit reset form must bind the wire form's parameters")
@@ -159,6 +163,17 @@ func retireReadmittedCredentials(ctx context.Context, tx *sql.Tx, stmts []Statem
 		var host, ts string
 		var ok bool
 		switch {
+		case isReadmitV2(s):
+			if len(s.Params) == 15 {
+				ts, _ = s.Params[8].(string)
+				host, _ = s.Params[9].(string)
+				ok = host != "" && ts != ""
+			}
+			if ok {
+				if err := retireHostOwnedRows(ctx, tx, host, ts); err != nil {
+					return fmt.Errorf("reset %s's per-host rows on re-admission: %w", host, err)
+				}
+			}
 		case isReadmit(s):
 			host, ts, ok = readmitParams(s)
 			if ok {

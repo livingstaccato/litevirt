@@ -122,6 +122,8 @@ type Client struct {
 	// incarnationRefusals rate-limits the hosts merge floor's warning, per
 	// row (host_incarnation_floor.go). Its zero value is ready.
 	incarnationRefusals refusalLogLimiter
+	// ownHold is the own-row hold (own_row_hold.go).
+	ownHold ownRowHold
 	// dsn is what db was opened with; tableGens counts the row changes every
 	// connection of that database reports (digest_cache.go), and digests is
 	// the anti-entropy digest cache they invalidate. tableGens is nil for a
@@ -1288,6 +1290,11 @@ type Statement struct {
 	// transaction before executing the statement. Nil preserves the historical
 	// statement wire format and behavior.
 	Guard *MutationGuard `json:",omitempty"`
+	// HostIncarnation is the ordering key of the hosts row this statement was
+	// written against (host_incarnation.go). Set only by stampHostIncarnation,
+	// only on hosts statements, and nil at incarnation 0, which preserves the
+	// historical wire format.
+	HostIncarnation *HostIncarnation `json:",omitempty"`
 }
 
 // Query executes a read query against the local SQLite database.
@@ -1463,6 +1470,13 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 					c.mu.Unlock()
 					return false, nil
 				}
+			}
+			// The hosts row's key, as it stands just before this statement
+			// runs (host_incarnation.go).
+			if err := stampHostIncarnation(ctx, tx, &s); err != nil {
+				tx.Rollback()
+				c.mu.Unlock()
+				return false, fmt.Errorf("stamp host incarnation: %w", err)
 			}
 			// A live-row update runs here through the same guarded form every
 			// receiver uses; what is logged is the wire form (live_row_update.go).
@@ -1640,6 +1654,13 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	var parks []func()      // updates that met no row because it has not arrived yet
 	relay := make([]Statement, 0, len(stmts))
 	for _, s := range stmts {
+		// The hosts row's key, as it stands just before this statement runs
+		// (host_incarnation.go).
+		if err := stampHostIncarnation(ctx, tx, &s); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return 0, fmt.Errorf("stamp host incarnation: %w", err)
+		}
 		// A live-row update runs here through the same guarded form every
 		// receiver uses; what is logged is the wire form (live_row_update.go).
 		res, err := tx.ExecContext(ctx, appliedForm(s).SQL, s.Params...)

@@ -540,7 +540,21 @@ import (
 //	     SSH, so nothing writes it, or a 'redfish' fence strategy, without the
 //	     release feature redfish_fence (release_2026_11_v1, ReplicationGated).
 //	     One new table.
-const CurrentSchemaVersion = 67
+//	v68: hosts.incarnation (INTEGER NOT NULL DEFAULT 0) — the host
+//	     incarnation counter (host_incarnation.go). 0 on every row written
+//	     before the release feature host_incarnation is first used; a
+//	     re-admission over a tombstone at N writes N+1, and nothing else
+//	     raises it. Rows are ordered by (incarnation, created_at,
+//	     cert_serial) ahead of their clock. A previous-release node does not
+//	     write the column and cannot decode the re-admission that raises it,
+//	     which is written only through the feature (ReplicationGated).
+//	     Additive. The number is schemaVersionHostIncarnation's, and may be
+//	     renumbered when this merges after other schema bumps.
+const CurrentSchemaVersion = schemaVersionHostIncarnation
+
+// schemaVersionHostIncarnation is the version hosts.incarnation was added in.
+// The one place to renumber it.
+const schemaVersionHostIncarnation = 68
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -1219,7 +1233,8 @@ var schemaDDL = []string{
 		deleted_at   TEXT,
 		version      TEXT DEFAULT '',
 		region       TEXT NOT NULL DEFAULT 'default',
-		capacity_policy_hash TEXT NOT NULL DEFAULT ''
+		capacity_policy_hash TEXT NOT NULL DEFAULT '',
+		incarnation  INTEGER NOT NULL DEFAULT 0
 	)`,
 
 	`CREATE TABLE IF NOT EXISTS host_labels (
@@ -3470,6 +3485,8 @@ var schemaMigrations = []string{
 	// field: '' reads as "no certificate", which a destination enforcing
 	// recovery_claim_v1 refuses.
 	`ALTER TABLE runtime_action_proofs ADD COLUMN claim_certificate TEXT NOT NULL DEFAULT ''`,
+	// The host incarnation counter (see History, schemaVersionHostIncarnation).
+	`ALTER TABLE hosts ADD COLUMN incarnation INTEGER NOT NULL DEFAULT 0`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -3558,10 +3575,11 @@ var alterVersions = []int{
 	45, 45, 45, // audit_log.key_id/signature/seq
 	49, 49, // hosts.isolation_epoch/isolation_reason
 	51, 51, // ip_allocations.netbox_ip_id/netbox_prefix_id
-	51, // netbox_bindings.netbox_cluster
-	53, // runtime_action_proofs.lease_term
-	54, // runtime_action_proofs.lease_key
-	60, // runtime_action_proofs.claim_certificate
+	51,                           // netbox_bindings.netbox_cluster
+	53,                           // runtime_action_proofs.lease_term
+	54,                           // runtime_action_proofs.lease_key
+	60,                           // runtime_action_proofs.claim_certificate
+	schemaVersionHostIncarnation, // hosts.incarnation
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

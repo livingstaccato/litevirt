@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/fence"
 )
 
@@ -200,6 +201,14 @@ func AdmitHost(ctx context.Context, c *Client, h HostRecord) error {
 	if strings.EqualFold(rows[0].String("cert_serial"), h.CertSerial) {
 		return fmt.Errorf("host %q cannot be re-admitted with its removed certificate", h.Name)
 	}
+	// A tombstone of a counted incarnation is re-admitted only by
+	// AdmitHostV2, never by this legacy shape (host_incarnation.go): the
+	// row would keep its number, and a stale copy of it would tie.
+	if n, _, _, _, _, err := HostIncarnationOf(ctx, c, h.Name); err != nil {
+		return err
+	} else if n >= 1 {
+		return fmt.Errorf("%w: host %q was removed at incarnation %d", ErrReadmitNeedsCounter, h.Name, n)
+	}
 	return c.withMembershipWrite(ctx, func(live bool) error {
 		uts := c.NowTS()
 		params := []interface{}{h.Address, h.SSHUser, h.SSHPort, h.GRPCPort, h.State, h.CertSerial, uts,
@@ -219,6 +228,92 @@ func AdmitHost(ctx context.Context, c *Client, h HostRecord) error {
 			{SQL: hostMembershipStateSQL, Params: []interface{}{h.Name, h.State, epoch, reason, uts}},
 		})
 	})
+}
+
+// ErrReadmitNeedsCounter refuses a legacy re-admission over a tombstone of a
+// counted incarnation (AdmitHostV2 is the only one allowed there).
+var ErrReadmitNeedsCounter = errors.New("re-admitting this host needs the host_incarnation release feature")
+
+// AdmitHostV2 re-admits a removed host at the next incarnation: one past its
+// tombstone's (host_incarnation.go). The caller decides that the counter is
+// due (grpcapi.AdmitHost: always over a counted tombstone, and over a legacy
+// one once the release feature is available) and holds the feature's grant.
+// A missing row, a live one or the removed certificate are refused as
+// AdmitHost refuses them. It returns the incarnation issued and its stamp.
+func AdmitHostV2(ctx context.Context, c *Client, h HostRecord, g capabilities.FeatureGrant) (int64, string, error) {
+	if err := g.Check(capabilities.FeatureHostIncarnation); err != nil {
+		return 0, "", err
+	}
+	if h.Name == "" || h.Address == "" || h.CertSerial == "" || h.CertSerial == "unknown" {
+		return 0, "", fmt.Errorf("host admission requires name, address, and certificate serial")
+	}
+	if !ValidHostAddress(h.Address) {
+		return 0, "", fmt.Errorf("host admission: address %q is not a bare IPv4 literal", h.Address)
+	}
+	n, _, serial, deleted, found, err := HostIncarnationOf(ctx, c, h.Name)
+	switch {
+	case err != nil:
+		return 0, "", err
+	case !found:
+		return 0, "", fmt.Errorf("host %q has no row to re-admit", h.Name)
+	case !deleted:
+		return 0, "", fmt.Errorf("host %q is already active", h.Name)
+	case strings.EqualFold(serial, h.CertSerial):
+		return 0, "", fmt.Errorf("host %q cannot be re-admitted with its removed certificate", h.Name)
+	}
+	next := n + 1
+	var at string
+	err = c.withMembershipWrite(ctx, func(live bool) error {
+		uts := c.NowTS()
+		stamp, ok := ReadmitStamp(uts)
+		if !ok {
+			return fmt.Errorf("re-admit %s: unreadable clock %q", h.Name, uts)
+		}
+		at = stamp
+		params := readmitV2Params(h, next, at, uts)
+		if !live {
+			return c.ExecuteBatch(ctx, []Statement{{SQL: readmitHostV2SQL, Params: params}})
+		}
+		epoch, reason, err := currentIsolation(ctx, c, h.Name)
+		if err != nil {
+			return err
+		}
+		return c.ExecuteBatch(ctx, []Statement{
+			{SQL: readmitHostV2SQL, Params: params},
+			{SQL: hostMembershipStateSQL, Params: []interface{}{h.Name, h.State, epoch, reason, uts}},
+		})
+	})
+	if err != nil {
+		return 0, "", err
+	}
+	return next, at, nil
+}
+
+// WriteOwnEndpoint records this host's own address and gRPC port on its row,
+// which an admission recorded as `lv host add` saw them. Only for an own row
+// at incarnation ≥ 1 (host_incarnation.go); every other address correction
+// keeps its previous-release statement.
+func WriteOwnEndpoint(ctx context.Context, c *Client, name, address string, grpcPort int, g capabilities.FeatureGrant) error {
+	if err := g.Check(capabilities.FeatureHostIncarnation); err != nil {
+		return err
+	}
+	if name != c.hostName {
+		return fmt.Errorf("WriteOwnEndpoint: %q is not this host", name)
+	}
+	if !ValidHostAddress(address) {
+		return fmt.Errorf("WriteOwnEndpoint: address %q is not a bare IPv4 literal", address)
+	}
+	if err := c.ownRowWriteRefused(name); err != nil {
+		return err
+	}
+	n, _, _, deleted, found, err := HostIncarnationOf(ctx, c, name)
+	if err != nil {
+		return err
+	}
+	if !found || deleted || n < 1 {
+		return fmt.Errorf("WriteOwnEndpoint: %s's row is not a live row at a counted incarnation", name)
+	}
+	return c.Execute(ctx, hostOwnEndpointSQL, address, grpcPort, c.NowTS(), name)
 }
 
 const readmitHostSQL = `UPDATE hosts SET address = ?, ssh_user = ?, ssh_port = ?, grpc_port = ?,
@@ -243,12 +338,23 @@ const readmitHostSQL = `UPDATE hosts SET address = ?, ssh_user = ?, ssh_port = ?
 // back in-product: the correction has to reach the PEER, and the stale serial is
 // what blocks the peer channel. Rotation now converges by ordinary replication.
 func RegisterHost(ctx context.Context, c *Client, h HostRecord) error {
-	rows, err := c.Query(ctx, `SELECT cert_serial, deleted_at FROM hosts WHERE name = ?`, h.Name)
+	if err := c.ownRowWriteRefused(h.Name); err != nil {
+		return err
+	}
+	rows, err := c.Query(ctx, `SELECT cert_serial, deleted_at, incarnation FROM hosts WHERE name = ?`, h.Name)
 	if err != nil {
 		return err
 	}
 	if len(rows) == 0 {
 		return InsertHost(ctx, c, h)
+	}
+	// The daemon never issues an incarnation (host_incarnation.go): over its
+	// own tombstone of a counted incarnation it writes nothing, and the
+	// operator's re-admission reaches it by replication.
+	if rows[0].String("deleted_at") != "" && rows[0].Int("incarnation") >= 1 {
+		slog.Warn("this host's own row is removed at a counted incarnation; waiting for its re-admission "+
+			"to replicate rather than re-admitting itself", "host", h.Name, "incarnation", rows[0].Int("incarnation"))
+		return nil
 	}
 	if rows[0].String("deleted_at") == "" {
 		recorded := rows[0].String("cert_serial")
@@ -290,6 +396,9 @@ const recordOwnCertSerialSQL = `UPDATE hosts SET cert_serial = ?, updated_at = ?
 func RecordOwnCertSerial(ctx context.Context, c *Client, name, serial string) (bool, error) {
 	if name == "" || serial == "" || strings.EqualFold(serial, "unknown") {
 		return false, nil
+	}
+	if err := c.ownRowWriteRefused(name); err != nil {
+		return false, err
 	}
 	rows, err := c.Query(ctx, `SELECT cert_serial, deleted_at FROM hosts WHERE name = ?`, name)
 	if err != nil {
@@ -766,6 +875,9 @@ const updateHostVersionSQL = `UPDATE hosts SET version = ?, updated_at = ? WHERE
 // whenever available, including the fresh-insert case, so startup state is
 // single-source rather than relying on a later write.
 func UpdateHostStartup(ctx context.Context, c *Client, name, state, version string, cpu, mem, disk int, hasResources bool) error {
+	if err := c.ownRowWriteRefused(name); err != nil {
+		return err
+	}
 	return c.withMembershipWrite(ctx, func(live bool) error {
 		return c.withRuntimeWrite(ctx, func(liveRuntime bool) error {
 			stmts, err := hostStartupStatements(ctx, c, name, state, version, cpu, mem, disk, hasResources, live, liveRuntime)
@@ -784,6 +896,9 @@ func UpdateHostStartup(ctx context.Context, c *Client, name, state, version stri
 // statements are UpdateHostStartup's; the guard is local only. applied=false,
 // with no error, when the host is recorded as something else (or absent).
 func UpdateHostStartupFrom(ctx context.Context, c *Client, name, from, state, version string, cpu, mem, disk int, hasResources bool) (bool, error) {
+	if err := c.ownRowWriteRefused(name); err != nil {
+		return false, err
+	}
 	var applied bool
 	err := c.withMembershipWrite(ctx, func(live bool) error {
 		return c.withRuntimeWrite(ctx, func(liveRuntime bool) error {

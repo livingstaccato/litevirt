@@ -223,3 +223,26 @@ func TestMigrateOwnedVM_EnteredOnlyByMigrateAndDrain(t *testing.T) {
 		t.Fatalf("%d calls of migrateOwnedVM, want one from each of %v", n, allowed)
 	}
 }
+
+// drainMove is migrateOwnedVM's drain entry: a cold move (drainColdMove) or a
+// running Secure Boot / vTPM VM's live firmware move (drainRunningFirmwareVM),
+// each under drain's lock discipline. A third caller would reach
+// migrateOwnedVM past the guard above.
+//
+// Mutation: call drainMove from drainOneVM directly — red.
+func TestDrainMove_EnteredOnlyByDrainsMoves(t *testing.T) {
+	allowed := map[string]bool{
+		"internal/grpcapi.Server.drainColdMove":          true,
+		"internal/grpcapi.Server.drainRunningFirmwareVM": true,
+	}
+	n := 0
+	for _, c := range fwCallSites(t, map[string]bool{"drainMove": true}) {
+		n++
+		if !allowed[c.caller] {
+			t.Errorf("drainMove called from %s at %s", c.caller, c.pos)
+		}
+	}
+	if n != len(allowed) {
+		t.Fatalf("%d calls of drainMove, want one from each of %v", n, allowed)
+	}
+}

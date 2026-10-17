@@ -1060,8 +1060,11 @@ func adminContext(ctx context.Context) context.Context {
 	return ctx
 }
 
-// ── DrainHost: with VMs in error state (should be skipped) ──────────────────
+// ── DrainHost: with VMs in error state (not moved; the drain is incomplete) ─
 
+// An error-state VM is not moved, and its row still names the host: the
+// drain ends incomplete, naming it, instead of reporting the host drained
+// (D2-17 r1: every row still on the host counts, whatever its state).
 func TestDrainHost_ErrorVMs_Skipped(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminContext(context.Background())
@@ -1072,9 +1075,12 @@ func TestDrainHost_ErrorVMs_Skipped(t *testing.T) {
 	stream := &mockDrainStreamR2{ctx: ctx}
 	err := s.DrainHost(&pb.DrainHostRequest{Name: "test-host"}, stream)
 
-	// Error VMs are not "running" or "stopped", so toMigrate is empty → nil return.
-	if err != nil {
-		t.Errorf("DrainHost: %v", err)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "drain incomplete") ||
+		!strings.Contains(err.Error(), "err-vm1 (error)") {
+		t.Errorf("DrainHost = %v, want FailedPrecondition drain incomplete naming err-vm1 (error)", err)
+	}
+	if vm, _ := corrosion.GetVM(ctx, s.db, "err-vm1"); vm == nil || vm.HostName != "test-host" {
+		t.Errorf("err-vm1 = %+v, want left on test-host", vm)
 	}
 }
 

@@ -2,13 +2,21 @@ package fleet
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fwmig"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -273,4 +281,135 @@ func TestFailback_FirmwareFollowsDrainRules(t *testing.T) {
 	if h, ok := fwliveHold(t, src); ok {
 		t.Errorf("%s still holds the move (%s)", src.Name, h.State)
 	}
+}
+
+// fwliveDrainIncomplete asserts the drain ended incomplete and named fwlive1
+// in state on the host.
+func fwliveDrainIncomplete(t *testing.T, err error, state string) {
+	t.Helper()
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "drain incomplete") ||
+		!strings.Contains(err.Error(), fwwVM+" ("+state+")") {
+		t.Fatalf("drain = %v, want FailedPrecondition drain incomplete naming %s (%s)", err, fwwVM, state)
+	}
+}
+
+// A drain whose live firmware move parks (here: Verify mismatched after a
+// source stop reason it cannot read, §7 V1b) reports the VM as an error and
+// ends incomplete, naming it migrating on the host: the parked source still
+// holds a copy, and the host is not drained (K-7). The marker is kept.
+//
+// Mutation: count only running and stopped rows as remaining, and ignore
+// failed moves (the drain's terminal check before D2-17 r1) — red: the drain
+// returns nil, "drained".
+func TestFleet_FwLive_DrainParkedMoveEndsIncomplete(t *testing.T) {
+	sc := fwliveSetup(t, false)
+	src, dst := sc.src, sc.dst
+	fwliveAllShared(t, sc)
+	dst.Virt.CorruptLandedPermall = func(string) bool { return true }
+	src.Virt.ReportSourceReasonUnknown = func(string) bool { return true }
+
+	progress, err := fwliveDrain(t, sc, src)
+	fwliveDrainIncomplete(t, err, "migrating")
+	if p := progress[fwwVM]; p == nil || p.Status != "error" || !strings.Contains(p.Error, "parked") {
+		t.Fatalf("drain progress for %s = %+v, want error naming the park", fwwVM, p)
+	}
+	if m, ok := fwliveMarker(t, src); !ok || m.Phase != fwmig.PhaseSourceStateSuspect {
+		t.Errorf("source marker %q (present %v), want source_state_suspect, kept", m.Phase, ok)
+	}
+	if row := fwliveRow(t, src); row.HostName != src.Name || row.State != "migrating" {
+		t.Errorf("row %s/%s, want migrating on %s while parked", row.HostName, row.State, src.Name)
+	}
+	fwliveSourceKept(t, src)
+
+	// Drained again while parked: still not drained.
+	_, err = fwliveDrain(t, sc, src)
+	fwliveDrainIncomplete(t, err, "migrating")
+}
+
+// A drain that stops waiting for a live firmware move (the VM's timeout_sec
+// passed while libvirt still moves the guest) leaves the move to its
+// adopter, reports the VM as an error, and ends incomplete, naming it
+// migrating: the guest is mid-move, and powering the host off would kill
+// it. Once libvirt finishes, the adopter completes the move.
+//
+// Mutation: as TestFleet_FwLive_DrainParkedMoveEndsIncomplete — red.
+func TestFleet_FwLive_DrainAdoptedMoveEndsIncomplete(t *testing.T) {
+	sc := fwliveSetup(t, false)
+	src, dst := sc.src, sc.dst
+	fwliveAllShared(t, sc)
+	ctx := context.Background()
+	if ok, _, err := corrosion.MutateDesiredSpec(ctx, src.DB, fwwVM, func(old string) (string, error) {
+		var spec pb.VMSpec
+		if err := json.Unmarshal([]byte(old), &spec); err != nil {
+			return "", err
+		}
+		spec.Migrate = &pb.MigrationPolicy{TimeoutSec: 1}
+		b, err := json.Marshal(&spec)
+		return string(b), err
+	}); err != nil || !ok {
+		t.Fatalf("set timeout_sec: applied %v, %v", ok, err)
+	}
+	release := make(chan struct{})
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+	})
+	src.Virt.OnMigrateToTarget = func(name, _ string, p lv.MigrateParams) error {
+		<-release
+		return dst.Virt.LandFirmwareLive(src.Virt, name, p)
+	}
+
+	progress, err := fwliveDrain(t, sc, src)
+	fwliveDrainIncomplete(t, err, "migrating")
+	if p := progress[fwwVM]; p == nil || p.Status != "error" || !strings.Contains(p.Error, "background") {
+		t.Fatalf("drain progress for %s = %+v, want error naming the move left running in the background", fwwVM, p)
+	}
+	if _, ok := fwliveMarker(t, src); !ok {
+		t.Error("the move's marker is gone while libvirt still moves the guest")
+	}
+
+	close(release)
+	released = true
+	eventually(t, time.Minute, "the adopter to complete the move", func() bool {
+		_, marked := fwliveMarker(t, src)
+		return !marked && fwliveRow(t, src).HostName == dst.Name
+	})
+	fwliveMoved(t, src, dst)
+}
+
+// A live firmware move whose migration fails with the guest still running on
+// the source (§7 M1) leaves it running there: the drain reports an error,
+// "not moved, still on" the host, and ends incomplete with it running; the
+// target's hold is undone and no marker is left.
+//
+// Mutation: report a failed move as skipped (drop the status-code check, so
+// every error is a refusal) — red.
+func TestFleet_FwLive_DrainM1LeavesVMRunning(t *testing.T) {
+	sc := fwliveSetup(t, false)
+	src, dst := sc.src, sc.dst
+	fwliveAllShared(t, sc)
+	src.Virt.FailMigrateToTarget = func(string, string) error {
+		return errors.New("operation failed: migration job: unexpectedly failed")
+	}
+
+	progress, err := fwliveDrain(t, sc, src)
+	fwliveDrainIncomplete(t, err, "running")
+	if p := progress[fwwVM]; p == nil || p.Status != "error" || !strings.Contains(p.Error, "not moved, still on "+src.Name) {
+		t.Fatalf("drain progress for %s = %+v, want error: not moved, still on %s", fwwVM, p, src.Name)
+	}
+	if st := fwliveState(src); st != string(libvirtfake.StateRunning) {
+		t.Errorf("%s's guest is %s, want running", src.Name, st)
+	}
+	if row := fwliveRow(t, src); row.HostName != src.Name || row.State != "running" {
+		t.Errorf("row %s/%s, want running on %s", row.HostName, row.State, src.Name)
+	}
+	if m, ok := fwliveMarker(t, src); ok {
+		t.Errorf("a marker was left on %s (%s)", src.Name, m.Phase)
+	}
+	if h, ok := fwliveHold(t, dst); ok {
+		t.Errorf("%s still holds the move (%s)", dst.Name, h.State)
+	}
+	fwliveSourceKept(t, src)
 }

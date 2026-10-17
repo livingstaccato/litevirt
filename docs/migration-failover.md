@@ -403,6 +403,13 @@ leaves (a target on a build without live firmware migration included), it is
 to stop it and move it. A move that fails or parks is an `error` for that VM;
 the drain goes on with the others.
 
+A drain reports the host drained only when no VM names it any more and every
+move ended clean. Otherwise it ends incomplete (`lv host drain` exits
+non-zero) and names each VM still on the host with its state, whatever that
+state is: one skipped or refused, one in `error`, or one still `migrating`
+because its move is parked or continues in the background. Do not power such
+a host off; `lv events <vm>` shows what happened to each.
+
 - A **stopped** VM stays stopped on the target.
 - A **running** VM with a host-local disk is checked first, while it still
   runs: everything the cold move checks, including the target's capacity, a

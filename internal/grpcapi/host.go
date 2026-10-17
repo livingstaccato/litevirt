@@ -416,7 +416,9 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 		}
 	}
 	if len(toMigrate) == 0 {
-		return nil
+		// Nothing to move, but the host may still hold a VM in another state
+		// (a move in progress or parked by an earlier drain): it is not drained.
+		return s.drainOutcome(ctx, req.Name, nil, nil)
 	}
 	// Highest compose migrate.priority first, ties in name order: targets are
 	// chosen, and the moves handed to the workers, in this order, so a
@@ -431,6 +433,8 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 		target corrosion.HostRecord
 	}
 	var drainJobs []drainJob
+	// failed names each VM whose frame was failed or error, with its reason.
+	var failed []string
 	for _, vm := range toMigrate {
 		placementReq := buildDrainPlacementRequest(vm, req.Name, s.capacity)
 		// A guarded VM drains only onto a host that enforces NIC guards
@@ -451,6 +455,7 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 			}); err != nil {
 				return err
 			}
+			failed = append(failed, vm.Name+" (no eligible target)")
 			continue
 		}
 
@@ -462,7 +467,7 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	}
 
 	if len(drainJobs) == 0 {
-		return nil
+		return s.drainOutcome(ctx, req.Name, failed, nil)
 	}
 
 	// Worker pool for parallel migrations.
@@ -505,7 +510,6 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	// notStarted: VMs moved off the host that did not start on their target
 	// (a `done` frame carrying an Error). They left the host, but the drain
 	// did not do what it was asked for them, so it does not end clean.
-	var failures int
 	var notStarted []string
 	// Drain records (failback.go) are written off this loop, after each frame:
 	// the release gate can take seconds, and a drain never waits for it.
@@ -516,7 +520,7 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 		progress := res.progress
 		record := false
 		if progress.Status == "error" || progress.Status == "failed" {
-			failures++
+			failed = append(failed, fmt.Sprintf("%s (%s: %s)", progress.VmName, progress.Status, progress.Error))
 		} else if progress.Status == "done" && progress.Error != "" {
 			notStarted = append(notStarted, progress.VmName)
 		} else if progress.Status == "done" {
@@ -531,27 +535,42 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 		}
 	}
 	recordsQueued()
+	return s.drainOutcome(ctx, req.Name, failed, notStarted)
+}
 
-	// Check for VMs that were skipped (pinned, no placement target).
-	// If any VMs remain on the host, report a partial drain (#25).
-	remaining, _ := corrosion.ListVMs(ctx, s.db, "", req.Name)
-	var stillRunning int
-	for _, vm := range remaining {
-		if vm.State == "running" || vm.State == "stopped" {
-			stillRunning++
-		}
-	}
-	if stillRunning > 0 {
+// drainOutcome is a drain's terminal result. The host is drained only when no
+// VM row names it any more and every move the drain made ended clean. Every
+// row still on the host counts, whatever its state: a VM skipped or refused,
+// one whose move is still running in the background, parked, or left
+// `migrating`, each still has its guest, or may have, on this host, and
+// powering it off then could lose that guest (K-7). failed names the moves
+// that failed or ended in error; notStarted the VMs moved that did not start.
+func (s *Server) drainOutcome(ctx context.Context, host string, failed, notStarted []string) error {
+	remaining, err := corrosion.ListVMs(ctx, s.db, "", host)
+	if err != nil {
 		return status.Errorf(codes.FailedPrecondition,
-			"drain incomplete: %d VM(s) remain on host %q (pinned, no eligible target, or not movable; see each VM's result)",
-			stillRunning, req.Name)
+			"drain incomplete: cannot confirm that no VM remains on host %q: %v", host, err)
+	}
+	if len(remaining) > 0 {
+		here := make([]string, 0, len(remaining))
+		for _, vm := range remaining {
+			here = append(here, fmt.Sprintf("%s (%s)", vm.Name, vm.State))
+		}
+		return status.Errorf(codes.FailedPrecondition,
+			"drain incomplete: %d VM(s) remain on host %q (pinned, no eligible target, not movable, or a move still running or parked; "+
+				"see each VM's result and `lv events <vm>`): %s",
+			len(remaining), host, strings.Join(here, ", "))
 	}
 	if len(notStarted) > 0 {
 		return status.Errorf(codes.FailedPrecondition,
 			"drain incomplete: every VM left host %q, but %d did not start on its target (%s); start each with `lv start <vm>`",
-			req.Name, len(notStarted), strings.Join(notStarted, ", "))
+			host, len(notStarted), strings.Join(notStarted, ", "))
 	}
-
+	if len(failed) > 0 {
+		return status.Errorf(codes.FailedPrecondition,
+			"drain incomplete: every VM left host %q, but %d move(s) did not end clean: %s; see `lv events <vm>`",
+			host, len(failed), strings.Join(failed, "; "))
+	}
 	return nil
 }
 

@@ -386,7 +386,7 @@ than silently breaking BitLocker. The explicit refusals:
 | revert with no captured firmware | refused (a pre-firmware/older snapshot can't be reverted safely) |
 | backup | snapshot backup only; the legacy raw stream backup is refused. Running VMs are refused — **stop the VM** to back up its firmware consistently. Multi-disk firmware VMs are not supported yet |
 | clone | gets a **fresh** vTPM + fresh NVRAM (the secret is never copied) — a cloned BitLocker guest needs its recovery key |
-| live migration | refused — use cold migration |
+| live migration | supported for a **running** VM between hosts with equal firmware code; its NVRAM and vTPM state move with it and are verified on the target (see [migration-failover.md](migration-failover.md#secure-boot--vtpm-vms)) |
 | cold migration | supported for a **stopped** VM; its host-local disks are copied as for any stopped VM, and its firmware is captured quiescent and carried to the target. PCI-passthrough firmware VMs are not supported yet |
 | host drain | a stopped VM is moved as cold migration moves it, host-local disks included; a running one is refused — stop it (`lv stop <vm>`), then drain again or `lv migrate <vm> <target-host> --cold` |
 | automatic failover (host died) | skipped — firmware is host-local and died with the host; recover via restore from a firmware-carrying backup |

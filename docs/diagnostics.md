@@ -2352,7 +2352,7 @@ minute and at daemon start.
 
 | Code | Severity, host | What happened | What you do; when it resolves |
 |---|---|---|---|
-| `firmware_migration_target_unreachable` | critical, source | The source could not finish a call to the target (unreachable, a build without the RPCs, or the target reports no record of the attempt while a domain of the VM is defined there). Also a mismatch whose discard of the target's copy did not get through | Bring the target back; the retry resolves it. If the target is down for good, fence it (`lv host fence <host>` or `lv host fence-confirm <host>`): when the VM's row still names the source, and the move had not reached cutover or the source's guest stopped for the migration, the source drops its record, the VM is `stopped` on the source with its firmware state, `lv start <vm>` works, and `firmware_migration_discard_owed` follows. When the row names the target, it stays parked |
+| `firmware_migration_target_unreachable` | critical, source | The source could not finish a call to the target (unreachable, a build without the RPCs, or the target reports no record of the attempt while a domain of the VM is defined there). Also a mismatch whose discard of the target's copy did not get through | Bring the target back; the retry resolves it. If the target is down for good, give it a proof-grade fence: an `ipmi` or `redfish` fence that powered it off, or `lv host fence-confirm <host>`. An `ssh`, `watchdog` or best-effort fence does not count (see [What a fence records](migration-failover.md#what-a-fence-records)). Then, when the VM's row still names the source, and the move had not reached cutover or the source's guest stopped for the migration, the source drops its record and `firmware_migration_discard_owed` follows. The VM's row becomes `running` when its source domain runs, `error` when the domain is active but not running, and `stopped` otherwise; from `stopped`, `lv start <vm>` starts it from the source's firmware state. When the row names the target, it stays parked |
 | `firmware_migration_discard_owed` | warning, source; critical while the target refuses | The move was resolved by fence, and the target's copy is still to be discarded. The source sends the discard every minute | Nothing while a warning. Resolves when the discard lands on the target's return, or the target host is removed (`lv host rm <host>`). Critical: the target refused it because the VM's domain runs there, or a domain of the VM is still defined there |
 | `firmware_migration_unverified` | critical, source | The target's vTPM state did not match the source's final copy, or the target's guest was no longer there, after the source's guest stopped for the migration. The target's copy is quarantined; the VM is `stopped` on the source with its firmware state | `lv start <vm>` runs it on the source. The quarantine on the target is for inspection (`firmware_migration_quarantine`). The condition stays open |
 | `firmware_migration_source_state_missing` | critical, source | After the guest left the source, the source's final vTPM state or NVRAM is missing, or the source domain's state cannot be read. The target's guest stays paused | Nothing is deleted. Retried every minute |
@@ -2369,8 +2369,8 @@ In a quarantine made before the guest resumed on the target, the NVRAM is the
 source's NVRAM the target materialised when it prepared the move, not libvirt's
 template.
 
-A move parked `target_ran`, `source_paused`, `source_state_suspect`,
-`source_state_missing` or `nvram_unconfirmed`, a `target_unreachable` park
+A move parked `target_ran`, `source_paused` or `source_state_suspect`, a
+`target_unreachable` park
 whose row names the target after a fence, and a critical
 `firmware_migration_discard_owed` need an operator to choose between the two
 copies. This build has no command for that: leave both records and both

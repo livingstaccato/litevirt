@@ -721,9 +721,10 @@ A live move of a Secure Boot / vTPM VM needs the same libvirt, QEMU, swtpm,
 libtpms and OVMF on both hosts, and on the source it compares the versions
 the guest's processes were started from. While those packages are updated
 host by host, such a VM does not move live between an updated and a
-not-updated host. Nor does it move off a host whose packages were updated after
-the guest started, until it is restarted (`lv stop <vm>`, `lv start <vm>`). A target running a litevirt
-build without live firmware migration refuses the move too. The refusal names
+not-updated host. Nor does it move off a host whose packages were updated
+after the guest started, until it is restarted (`lv stop <vm>`,
+`lv start <vm>`). A target running a litevirt build without live firmware
+migration refuses the move too. The refusal names
 the first difference and gives the cold move (`lv stop <vm>`, then
 `lv migrate <vm> <host> --cold`).
 

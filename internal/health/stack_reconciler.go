@@ -126,6 +126,9 @@ func (r *StackReconciler) reconcile(ctx context.Context) {
 		r.reportOrphanDeny(ctx, orphan)
 	}
 
+	// A VM that outlived its stack's teardown is reported (stack_vm_orphan.go).
+	r.reportVMsOfTornDownStacks(ctx)
+
 	// A live stack that asks for the cluster default-deny gets it back when
 	// the cluster has none, e.g. after its owner went down while this
 	// stack's deploy was in flight.

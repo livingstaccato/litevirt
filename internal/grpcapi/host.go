@@ -553,13 +553,25 @@ func (s *Server) drainOutcome(ctx context.Context, host string, failed, notStart
 	}
 	if len(remaining) > 0 {
 		here := make([]string, 0, len(remaining))
+		var untried []string
 		for _, vm := range remaining {
 			here = append(here, fmt.Sprintf("%s (%s)", vm.Name, vm.State))
+			if vm.State != "running" && vm.State != "stopped" {
+				untried = append(untried, vm.Name)
+			}
+		}
+		next := ""
+		if len(untried) > 0 {
+			// A drain moves only running and stopped VMs, so these have no
+			// result of their own to read.
+			next = fmt.Sprintf("; the drain did not try to move %s (neither running nor stopped): "+
+				"start each with `lv start <vm>` and drain again, or remove it with `lv rm <vm>`",
+				strings.Join(untried, ", "))
 		}
 		return status.Errorf(codes.FailedPrecondition,
 			"drain incomplete: %d VM(s) remain on host %q (pinned, no eligible target, not movable, or a move still running or parked; "+
-				"see each VM's result and `lv events <vm>`): %s",
-			len(remaining), host, strings.Join(here, ", "))
+				"see each VM's result and `lv events <vm>`): %s%s",
+			len(remaining), host, strings.Join(here, ", "), next)
 	}
 	if len(notStarted) > 0 {
 		return status.Errorf(codes.FailedPrecondition,

@@ -720,12 +720,14 @@ func TestHost_DrainUndrain(t *testing.T) {
 	out, err := lvWithin(t, drainBudget, "host", "drain", host)
 	if err != nil {
 		// A drain that leaves a VM behind fails with "drain incomplete" and
-		// names every VM it left, with the reason, before it does. Anything
-		// else is a failure of the drain itself.
+		// names every VM it left: a move it tried has its own ERROR: line, and
+		// a VM it never tried (an `error` or `migrating` row) is named in the
+		// server's own listing of what remains. Anything else is a failure of
+		// the drain itself.
 		if !strings.Contains(out, "drain incomplete") {
 			t.Fatalf("lv host drain %s failed: %v\n%s", host, err, out)
 		}
-		if !strings.Contains(out, "ERROR:") {
+		if !strings.Contains(out, "ERROR:") && !strings.Contains(out, "remain on host") {
 			t.Fatalf("lv host drain %s ended incomplete without naming the VMs it left:\n%s", host, out)
 		}
 		t.Logf("drain of %s was incomplete; the VMs it left and why:\n%s", host, out)

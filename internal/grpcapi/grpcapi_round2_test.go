@@ -1064,8 +1064,10 @@ func adminContext(ctx context.Context) context.Context {
 
 // An error-state VM is not moved, and its row still names the host: the
 // drain ends incomplete, naming it, instead of reporting the host drained
-// (D2-17 r1: every row still on the host counts, whatever its state).
-func TestDrainHost_ErrorVMs_Skipped(t *testing.T) {
+// (D2-17 r1: every row still on the host counts, whatever its state). The
+// drain never tried it, so no frame of its own says what to do: the result
+// names the next step (D2-17 re-review m-A).
+func TestDrainHost_ErrorVMIncompleteNamesNextStep(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminContext(context.Background())
 
@@ -1079,8 +1081,34 @@ func TestDrainHost_ErrorVMs_Skipped(t *testing.T) {
 		!strings.Contains(err.Error(), "err-vm1 (error)") {
 		t.Errorf("DrainHost = %v, want FailedPrecondition drain incomplete naming err-vm1 (error)", err)
 	}
+	for _, want := range []string{"did not try to move err-vm1", "`lv start <vm>`", "`lv rm <vm>`"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("DrainHost = %v, want the next step %q", err, want)
+		}
+	}
+	if len(stream.sent) != 0 {
+		t.Errorf("frames = %v, want none: the drain never tried err-vm1", stream.sent)
+	}
 	if vm, _ := corrosion.GetVM(ctx, s.db, "err-vm1"); vm == nil || vm.HostName != "test-host" {
 		t.Errorf("err-vm1 = %+v, want left on test-host", vm)
+	}
+}
+
+// A drain whose every VM left the host, but one of whose moves ended in error
+// (the guest left, its hand-over did not finish), is not a clean drain
+// (D2-17 re-review m-C).
+func TestDrainOutcome_EveryVMLeftButAMoveFailed(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminContext(context.Background())
+	insertTestHostR2(t, ctx, s.db, "test-host", "active")
+
+	err := s.drainOutcome(ctx, "test-host", []string{"x (error: migrated; finishing on the target failed)"}, nil)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "every VM left host") ||
+		!strings.Contains(err.Error(), "x (error: migrated; finishing on the target failed)") {
+		t.Errorf("drainOutcome = %v, want FailedPrecondition naming the failed move", err)
+	}
+	if err := s.drainOutcome(ctx, "test-host", nil, nil); err != nil {
+		t.Errorf("drainOutcome with nothing left and nothing failed = %v, want nil", err)
 	}
 }
 

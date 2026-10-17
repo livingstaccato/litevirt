@@ -148,6 +148,11 @@ alone, logged at WARN, and reported as `kept <name>: ...`, naming the stack it
 belongs to. Such a VM is not counted as a deletion. A stack network that such a VM (or a
 container the stack did not create) is attached to is kept too, reported as
 `kept network <name>: used by ...`, so it is not pulled out from under it.
+In a stack whose last deploy failed (`degraded`), a member the stored file
+names that no host has, because its create failed, is reported as
+`absent <name>: never created; nothing to delete`, and is neither a deletion
+nor a failure. It is taken as absent only when this host has no record of it
+and every other host was asked and answered that it has none.
 
 `compose down` follows the same rule. It ends with `Stack "<name>" torn down.`
 and exit status 0 only when every VM and container was deleted, every stack

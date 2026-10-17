@@ -337,6 +337,9 @@ func newDownCmd() *cobra.Command {
 					case "kept":
 						// A VM of a member's name the stack did not create.
 						fmt.Printf("  kept %s: %s\n", p.VmName, p.Error)
+					case "absent":
+						// A member whose create failed: nothing to delete.
+						fmt.Printf("  absent %s: %s\n", p.VmName, p.Error)
 					default:
 						fmt.Printf("  %s: %s\n", p.VmName, p.Status)
 					}

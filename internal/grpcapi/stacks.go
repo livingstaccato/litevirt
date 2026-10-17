@@ -1137,6 +1137,15 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	// it deletes (fanoutDeleteVM).
 	var notMembers []corrosion.VMRecord
 	var unknown []string
+	// A stack recorded "degraded" finished its last deploy with failed
+	// actions: a name its file lists that no host has may be a member whose
+	// create failed (vmNeverCreated). Read before the state becomes
+	// "deleting" below.
+	degraded := false
+	if st, gErr := corrosion.GetStack(ctx, s.db, req.Name); gErr == nil && st != nil {
+		degraded = st.State == stackStateDegraded
+	}
+	fileOnly := map[string]bool{}
 	stored, storedErr := s.storedStackFile(ctx, req.Name)
 	if stored != nil {
 		for baseName, vmDef := range stored.VMs {
@@ -1160,6 +1169,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 					// Listed above when it named this stack; so not.
 					notMembers = append(notMembers, *row)
 				default:
+					fileOnly[instName] = true
 					vms = append(vms, corrosion.VMRecord{
 						Name:      instName,
 						StackName: req.Name,
@@ -1229,7 +1239,14 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 		if h := s.stackMemberDeleteHook; h != nil {
 			h(vm.Name)
 		}
-		delErr := s.deleteVMWithFanout(ctx, stackMember{Name: vm.Name, Stack: req.Name, CreatedAt: vm.CreatedAt}, req.KeepDisks)
+		delErr := s.deleteVMWithFanout(ctx, stackMember{Name: vm.Name, Stack: req.Name, CreatedAt: vm.CreatedAt,
+			MayHaveFailedCreate: degraded && fileOnly[vm.Name]}, req.KeepDisks)
+		if errors.Is(delErr, errMemberNeverCreated) {
+			if err := stream.Send(&pb.DeleteProgress{VmName: vm.Name, Status: "absent", Error: delErr.Error()}); err != nil {
+				return err
+			}
+			continue
+		}
 		if errors.Is(delErr, errNotStackMember) {
 			keptAtDelete = append(keptAtDelete, vm.Name)
 			if err := stream.Send(&pb.DeleteProgress{VmName: vm.Name, Status: "kept", Error: delErr.Error()}); err != nil {
@@ -1521,6 +1538,11 @@ func (s *Server) deleteVMWithFanout(ctx context.Context, m stackMember, keepDisk
 				// is removed, and the stack's teardown goes on.
 				slog.Info("stack delete: member was already deleted", "stack", stackName, "vm", vmName)
 				return nil
+			case errors.Is(peerErr, errNoPeerHasVM) && s.vmNeverCreated(ctx, m):
+				// A member the stored file names whose create failed (lab 2,
+				// O4): no host has it, so there is nothing to delete.
+				slog.Info("stack delete: member was never created; nothing to delete", "stack", stackName, "vm", vmName)
+				return errMemberNeverCreated
 			}
 			return err
 		}
@@ -1573,11 +1595,34 @@ func (s *Server) vmAlreadyDeleted(ctx context.Context, m stackMember) bool {
 	return m.CreatedAt == "" || rows[0].String("created_at") == m.CreatedAt
 }
 
+// vmNeverCreated reports a member whose create failed: the stack's last
+// deploy finished with failed actions ("degraded") and the teardown listed
+// the member from the stored file alone (MayHaveFailedCreate: no row here,
+// so no incarnation), this host still has no live row of the name, and every
+// peer that may hold the VM answered that it has none (errNoPeerHasVM, the
+// caller's). The StackReconciler, acting on rows only, already treats such a
+// name as nothing to delete. A name with no row in a stack recorded "active"
+// is not taken as gone: nothing says its create ran and failed.
+func (s *Server) vmNeverCreated(ctx context.Context, m stackMember) bool {
+	if !m.MayHaveFailedCreate || m.CreatedAt != "" {
+		return false
+	}
+	live, err := corrosion.GetVM(ctx, s.db, m.Name)
+	return err == nil && live == nil
+}
+
+// errMemberNeverCreated: a stack member the stored file names that no host
+// has (vmNeverCreated). The teardown reports it and goes on.
+var errMemberNeverCreated = errors.New("never created; nothing to delete")
+
 // stackMember is a stack's VM as the teardown saw it: its name, the stack
 // its row records, and its incarnation (the row's created_at; "" for a name
 // the stored file lists that has no row here yet).
 type stackMember struct {
 	Name, Stack, CreatedAt string
+	// MayHaveFailedCreate: listed from the stored file of a stack whose
+	// last deploy failed some action (vmNeverCreated).
+	MayHaveFailedCreate bool
 }
 
 // isDeleteBindingMismatch reports a DeleteVM refused because the VM is not

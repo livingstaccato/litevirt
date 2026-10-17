@@ -13,6 +13,8 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/cloudinit"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/notify"
 )
@@ -144,10 +146,12 @@ func (s *Server) SupersededDisks(ctx context.Context, req *pb.SupersededDisksReq
 		if k.Seed {
 			held = keptSeedHeld
 		}
-		resp.Disks = append(resp.Disks, &pb.SupersededDisk{
+		d := &pb.SupersededDisk{
 			Path: k.Path, DiskPath: k.DiskPath, SetAsideAt: k.MovedAt.UTC().Format(time.RFC3339), SizeBytes: k.SizeBytes,
 			Held: held, Kept: true, Seed: k.Seed,
-		})
+		}
+		s.nameKeptCopy(ctx, k, d)
+		resp.Disks = append(resp.Disks, d)
 	}
 	return resp, nil
 }
@@ -217,3 +221,41 @@ func (s *Server) NotifyCTRootfsStranded(ct, host, detail string) {
 
 // supersededRelist lists the copies again after a restore; tests make it fail.
 var supersededRelist = health.ListSupersededDisks
+
+// nameKeptCopy fills in the VM a kept file belongs to by name, when that is
+// known (lab 2, abort proof, surprise 3): a seed's from its file name
+// (<data_dir>/cloudinit/<vm>.iso), a disk's from the disk rows of this host
+// that record its path, a live one first. When a VM of that name exists, its
+// state is filled in too, and EarlierVm says whether the file is an earlier
+// VM's of that name rather than that VM's: a kept disk always is (a create
+// of the name moved it off the path), a seed is unless it is stamped for the
+// VM that exists now. A name that cannot be told, or a read that fails,
+// leaves the VM column empty, as before.
+func (s *Server) nameKeptCopy(ctx context.Context, k health.KeptCopy, d *pb.SupersededDisk) {
+	name := ""
+	if k.Seed {
+		name = strings.TrimSuffix(filepath.Base(k.DiskPath), ".iso")
+	} else {
+		rows, err := s.db.Query(ctx, `SELECT vm_name FROM vm_disks WHERE path = ? AND host_name = ?
+			ORDER BY CASE WHEN deleted_at IS NULL THEN 0 ELSE 1 END LIMIT 1`, k.DiskPath, s.hostName)
+		if err != nil || len(rows) == 0 {
+			return
+		}
+		name = rows[0].String("vm_name")
+	}
+	if name == "" {
+		return
+	}
+	d.VmName = name
+	vm, err := corrosion.GetVM(ctx, s.db, name)
+	if err != nil || vm == nil {
+		return
+	}
+	d.VmState = vm.State
+	if !k.Seed {
+		d.EarlierVm = true
+		return
+	}
+	stamp, stamped, serr := cloudinit.SeedOwner(k.Path)
+	d.EarlierVm = serr != nil || !stamped || stamp == "" || stamp != cloudinit.SpecUUID(vm.Spec)
+}

@@ -239,7 +239,10 @@ renames them. `lv host superseded-disks <host>` lists each `.kept-` file there
 as `kept`, the seeds in `<data_dir>/cloudinit` among them, and the seed a
 deleted VM was kept with where it was, while no VM of its name exists (a seed
 can hold user-data passwords); `--purge`, `--remove` and `--restore` never take one, so
-only an operator removes it, by hand. A `--keep-disks` delete whose
+only an operator removes it, by hand. Each is listed under the VM of its name
+when that is known; while a VM of that name exists, one that is an earlier
+VM's (every kept disk, and a seed not stamped for the VM there now) says so.
+A seed whose owner stamp is empty or unreadable is listed as kept. A `--keep-disks` delete whose
 `<data_dir>/kept-disks/<vm>.json` cannot be read is refused, naming the file,
 with nothing deleted: repair or remove that file, then retry.
 

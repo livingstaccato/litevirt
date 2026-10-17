@@ -158,6 +158,9 @@ func printSupersededDisks(out io.Writer, resp *pb.SupersededDisksResponse, purge
 				st = "removed after " + at.Add(time.Duration(resp.RetentionDays)*24*time.Hour).Format(time.RFC3339)
 			}
 		}
+		if d.Kept && d.EarlierVm {
+			st += fmt.Sprintf("; it is an earlier VM %s's, not the VM %s that exists now", d.VmName, d.VmName)
+		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", d.Path, vm, age, d.SizeBytes, st)
 	}
 	w.Flush()

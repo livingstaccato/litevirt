@@ -52,3 +52,19 @@ func TestPrintSupersededDisks_MarksAKeptSeed(t *testing.T) {
 		t.Fatalf("the kept seed is not marked a kept seed:\n%s", out.String())
 	}
 }
+
+// A kept file is listed under the VM of its name, and one that is an earlier
+// VM's of that name says it is not the VM that exists now (lab 2, abort
+// proof, surprise 3).
+//
+// Mutation: drop the earlier-VM note — red.
+func TestPrintSupersededDisks_SaysAKeptFileIsAnEarlierVMs(t *testing.T) {
+	var out bytes.Buffer
+	printSupersededDisks(&out, &pb.SupersededDisksResponse{Host: "node-a", Disks: []*pb.SupersededDisk{
+		{Path: "/d/web-root.qcow2.kept-x", DiskPath: "/d/web-root.qcow2", SizeBytes: 9, Kept: true, VmName: "web", VmState: "running", EarlierVm: true},
+	}}, false, time.Now())
+	s := out.String()
+	if !strings.Contains(s, " web ") || !strings.Contains(s, "it is an earlier VM web's, not the VM web that exists now") {
+		t.Fatalf("the kept disk is not listed under web as an earlier web's:\n%s", s)
+	}
+}

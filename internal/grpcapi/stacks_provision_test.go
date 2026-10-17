@@ -23,7 +23,7 @@ func TestProvisionPlannedNetworks_PeerFailureSurfaces(t *testing.T) {
 	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
-	s := &Server{db: db, hostName: "host-a"}
+	s := &Server{dataDir: t.TempDir(), db: db, hostName: "host-a"}
 
 	f := &compose.File{
 		Name:     "s1",
@@ -61,7 +61,7 @@ func TestProvisionPlannedNetworks_NoPeersNoError(t *testing.T) {
 	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
-	s := &Server{db: db, hostName: "host-a"}
+	s := &Server{dataDir: t.TempDir(), db: db, hostName: "host-a"}
 
 	f := &compose.File{
 		Name:     "s1",

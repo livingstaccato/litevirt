@@ -19,7 +19,7 @@ func newFWTestServer(t *testing.T) *Server {
 	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
-	return &Server{db: db, hostName: "host-a"}
+	return &Server{dataDir: t.TempDir(), db: db, hostName: "host-a"}
 }
 
 // TestPersistStackFirewall is the v21 regression for the compose→firewall gap:

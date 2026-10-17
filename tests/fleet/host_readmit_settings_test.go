@@ -17,7 +17,6 @@ import (
 	"context"
 	"net"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -85,11 +84,7 @@ func rebuildWithEmptyDB(t *testing.T, c *Cluster, n, peer *Node) string {
 		return peers
 	})
 
-	l, err := net.Listen("tcp", net.JoinHostPort(n.Address, strconv.Itoa(n.Port)))
-	if err != nil {
-		t.Fatalf("rebind %s on port %d: %v", n.Name, n.Port, err)
-	}
-	n.Listener = l
+	n.rebindPort(t)
 	// The replaced server's loops stop with it (re-review 4, n-1).
 	if n.stopServerLoops != nil {
 		n.stopServerLoops()

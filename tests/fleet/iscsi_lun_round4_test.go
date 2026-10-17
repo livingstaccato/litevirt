@@ -15,8 +15,6 @@ package fleet
 import (
 	"context"
 	"io"
-	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -107,11 +105,7 @@ func restartNode(t *testing.T, c *Cluster, n *Node) {
 		n.stopServerLoops()
 	}
 	n.Stop()
-	l, err := net.Listen("tcp", net.JoinHostPort(n.Address, strconv.Itoa(n.Port)))
-	if err != nil {
-		t.Fatalf("rebind %s on port %d: %v", n.Name, n.Port, err)
-	}
-	n.Listener = l
+	n.rebindPort(t)
 	c.buildServer(n)
 	n.repl.SetProofReplicaGate(func(context.Context, string) bool { return true })
 	n.repl.Start(c.ctx)

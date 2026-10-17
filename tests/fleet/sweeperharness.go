@@ -109,6 +109,8 @@ func (n *Node) Stop() {
 	}
 	if n.Listener != nil {
 		_ = n.Listener.Close()
+		// Its peers will dial this port again if it comes back.
+		n.holdStoppedPort()
 	}
 }
 

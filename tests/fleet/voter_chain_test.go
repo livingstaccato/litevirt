@@ -56,7 +56,7 @@ func reimage(t *testing.T, c *Cluster, n, via *Node, live ...*Node) {
 	if err != nil {
 		t.Fatalf("reserve a port for the rebuilt %s: %v", n.Name, err)
 	}
-	n.Port, n.Listener = l.Addr().(*net.TCPAddr).Port, l
+	n.movePort(l)
 
 	// A database of its own name: nothing of the old machine's survives.
 	db, err := corrosion.NewSharedTestClient(fmt.Sprintf("fleet-%s-rebuilt-%s", n.Name, t.Name()), n.Name)

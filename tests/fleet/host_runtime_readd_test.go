@@ -4,10 +4,8 @@ package fleet
 
 import (
 	"context"
-	"net"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"testing"
 	"time"
 
@@ -33,11 +31,7 @@ func restartWithNewCert(t *testing.T, c *Cluster, n *Node) string {
 	if err != nil {
 		t.Fatalf("read %s's new certificate serial: %v", n.Name, err)
 	}
-	l, err := net.Listen("tcp", net.JoinHostPort(n.Address, strconv.Itoa(n.Port)))
-	if err != nil {
-		t.Fatalf("rebind %s on port %d: %v", n.Name, n.Port, err)
-	}
-	n.Listener = l
+	n.rebindPort(t)
 	if n.stopServerLoops != nil {
 		n.stopServerLoops()
 	}

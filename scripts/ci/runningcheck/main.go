@@ -122,7 +122,11 @@ var nonMinting = map[string]int{
 	// RekeyStoppedVM(ctx, c, name, from, dest, state, epoch): the
 	// reschedule's statement for a stopped VM moved off a failed host; it
 	// refuses any state but "stopped", and its one caller passes that literal.
-	"RekeyStoppedVM":       5,
+	"RekeyStoppedVM": 5,
+	// ReturnMigratedVM(ctx, c, vm, from, to, uuid, createdAt, state, disks):
+	// the commit's statements with from and to swapped, for the D-5 return
+	// of a committed live firmware move; it refuses any state but "stopped".
+	"ReturnMigratedVM":     7,
 	"InsertVM":             stateInVMRecord,
 	"InsertVMWithHardware": stateInVMRecord,
 }
@@ -593,8 +597,8 @@ var stateWritingStatements = []stateStatement{
 	},
 	{
 		sql:     `UPDATE vms SET host_name = ?, state = ?, state_detail = '', updated_at = ? WHERE name = ?`,
-		writers: []string{"UpdateVMHost", "CommitMigrationOwnership", "RescheduleVMHost", "RepointMigratedVM", "RekeyStoppedVM"},
-		note:    "all nonMinting (state at arg 4, 5, 4, 5 and 5) - identical SQL, different guards and companions in Go",
+		writers: []string{"UpdateVMHost", "CommitMigrationOwnership", "RescheduleVMHost", "RepointMigratedVM", "RekeyStoppedVM", "ReturnMigratedVM"},
+		note:    "all nonMinting (state at arg 4, 5, 4, 5, 5 and 7) - identical SQL, different guards and companions in Go",
 	},
 	{
 		sql: `UPDATE vms

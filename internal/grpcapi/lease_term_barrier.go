@@ -161,6 +161,10 @@ type leaseSweepResult struct {
 	// peer reports live is a renewal that peer has seen. The executor barrier
 	// ignores them.
 	rows []peerLeaseRow
+	// unwired is set when no sweep ran because the health gate is not wired
+	// yet (start-up): no quorum was asked, so it is no evidence of a missing
+	// majority.
+	unwired bool
 }
 
 // peerLeaseRow is one peer's leader_election row for a key, as it reported it.
@@ -276,7 +280,7 @@ func (s *Server) sweepLeaseTermHighWater(ctx context.Context, key string) (int64
 // after it arrived, so a row it reads was reported after it started asking.
 func (s *Server) sweepLeaseTerm(ctx context.Context, key string) leaseSweepResult {
 	if s.gateV() == nil {
-		return leaseSweepResult{}
+		return leaseSweepResult{unwired: true}
 	}
 
 	// The instant this caller began validating. Only evidence gathered from here

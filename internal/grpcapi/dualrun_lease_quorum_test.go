@@ -26,7 +26,11 @@ func TestDualRunLease_NotTakenOrRenewedWithoutQuorum(t *testing.T) {
 	ctx := context.Background()
 	s := dualRunTestServerNoLease(t, 2)
 	var stalls []corrosion.LeaseNoMajority
-	s.db.SetLeaseNoMajorityObserver(func(_ context.Context, ev corrosion.LeaseNoMajority) { stalls = append(stalls, ev) })
+	s.db.SetLeaseNoMajorityObserver(func(_ context.Context, ev corrosion.LeaseNoMajority) {
+		if !ev.Live {
+			stalls = append(stalls, ev)
+		}
+	})
 
 	s.SetGate(fakeServerGate{execOK: true, quorum: health.QuorumNo, live: 1, needed: 2})
 	if s.acquireDualRunLease(ctx, time.Minute) {

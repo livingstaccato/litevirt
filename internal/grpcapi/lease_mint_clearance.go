@@ -78,8 +78,13 @@ func (s *Server) LeaseMintClearance(ctx context.Context, req corrosion.LeaseMint
 	sweep := s.sweepLeaseTerm(ctx, key)
 	if !sweep.ok {
 		// No quorum to read from is no voter majority to take the lease over
-		// with: a stalled takeover, counted and raised like a claim's.
+		// with: a stalled takeover, counted and raised like a claim's. A sweep
+		// that did not run, because the gate is not wired yet at start-up, asked
+		// nobody and is not counted.
 		why := "quorum high-water mark unconfirmed: a quorum of peers did not answer"
+		if sweep.unwired {
+			return false, "quorum high-water mark unconfirmed: the health gate is not wired yet"
+		}
 		s.noteLeaseNoMajority(ctx, key, req.TTL, clearanceInstant(req, started), why)
 		return false, why
 	}

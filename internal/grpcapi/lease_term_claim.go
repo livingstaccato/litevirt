@@ -312,8 +312,14 @@ var olderBuildRefusal = fmt.Sprintf("unknown claim target kind %q", corrosion.Cl
 
 // NoteLeaseNoMajority is corrosion's report (SetLeaseNoMajorityObserver) of
 // a lease poll that stood down for want of the voter majority, over a lease
-// this node sees no live holder of: a takeover that cannot happen.
+// this node sees no live holder of: a takeover that cannot happen. With
+// ev.Live the lease was live as this node sees it: no takeover is due, so the
+// stall start is forgotten and nothing is counted or written.
 func (s *Server) NoteLeaseNoMajority(ctx context.Context, ev corrosion.LeaseNoMajority) {
+	if ev.Live {
+		s.noteLeaseClaimContended(ev.Key)
+		return
+	}
 	s.noteLeaseNoMajority(ctx, ev.Key, ev.TTL, ev.Now, ev.Why)
 }
 
@@ -352,7 +358,8 @@ func (s *Server) noteLeaseNoMajority(ctx context.Context, key string, ttl time.D
 }
 
 // noteLeaseClaimContended ends this node's no-majority stall for key without
-// touching the condition row: a duel showed a majority there to decide.
+// touching the condition row: a duel showed a majority there to decide, or a
+// node standing down at the gate saw the lease live.
 func (s *Server) noteLeaseClaimContended(key string) {
 	st := &s.leaseClaimStall
 	st.mu.Lock()

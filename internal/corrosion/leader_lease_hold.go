@@ -96,6 +96,11 @@ type LeaseNoMajority struct {
 	Now time.Time
 	// Why is the stand-down's reason, for the condition's evidence.
 	Why string
+	// Live is set when the poll stood down over a lease this replica shows
+	// live: no takeover is due, so the report ends this node's stall for Key
+	// rather than counting one. It writes no condition (a node at the gate
+	// may hold a stale view) and is not a no-majority poll.
+	Live bool
 }
 
 // SetLeaseNoMajorityObserver injects what NoteLeaseNoQuorum tells. Wired at
@@ -111,14 +116,22 @@ func (c *Client) SetLeaseNoMajorityObserver(fn func(ctx context.Context, ev Leas
 // (the failover coordinator, the dual-run detector, the rebalancer). The
 // stand-down is a takeover that cannot happen only when this replica shows no
 // live holder: the lease row is expired or absent. A holder that cannot renew
-// its own live lease, and a lease live for a peer, are not takeovers and are
-// not reported. One local read.
+// its own live lease, and a lease live for a peer, are not takeovers: they are
+// reported with Live set, which only ends this node's stall. A node that stays
+// at the gate never renews or takes the lease, so this is the only place it
+// learns the lease was held since its stall began; without it the next brief
+// expiry at an ordinary holder change raised the condition at once, with a
+// stall start from before that holder. One local read.
 func NoteLeaseNoQuorum(ctx context.Context, c *Client, key, holder string, ttl time.Duration, now time.Time) {
 	if c == nil || c.leaseNoMajorityObserver == nil {
 		return
 	}
 	cur, exp, err := leaseRow(ctx, c, key)
-	if err != nil || (cur != "" && exp >= now.UTC().Format(time.RFC3339)) {
+	if err != nil {
+		return
+	}
+	if cur != "" && exp >= now.UTC().Format(time.RFC3339) {
+		c.leaseNoMajorityObserver(ctx, LeaseNoMajority{Key: key, TTL: ttl, Now: now, Live: true})
 		return
 	}
 	c.leaseNoMajorityObserver(ctx, LeaseNoMajority{Key: key, TTL: ttl, Now: now,

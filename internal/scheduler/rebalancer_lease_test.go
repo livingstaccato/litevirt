@@ -64,7 +64,7 @@ func TestRebalancer_NoLeaseWithoutQuorum(t *testing.T) {
 	r.QuorumLost = func(context.Context) bool { return lost }
 	stalls := 0
 	db.SetLeaseNoMajorityObserver(func(_ context.Context, ev corrosion.LeaseNoMajority) {
-		if ev.Key == r.LeaseKey && ev.TTL == 2*r.PollInterval && ev.Now.Equal(now) {
+		if !ev.Live && ev.Key == r.LeaseKey && ev.TTL == 2*r.PollInterval && ev.Now.Equal(now) {
 			stalls++
 		}
 	})

@@ -408,6 +408,9 @@ type Server struct {
 	// each member's name right before deleting it, where a test re-creates
 	// the VM as another incarnation.
 	stackMemberDeleteHook func(name string)
+	// deleteLeaseTakenHook is a test-only seam: deleteVM calls it with the
+	// VM's name once it holds the start lease, before it re-reads the row.
+	deleteLeaseTakenHook func(name string)
 	// restoreClaimedHook is a test-only seam; see SetRestoreClaimedHook.
 	restoreClaimedHook func(name string)
 	// restoreTargetResolvedHook is a test-only seam run after RestoreFromBackup

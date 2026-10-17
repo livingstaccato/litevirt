@@ -1764,6 +1764,20 @@ on` keeps it as the operator's; a stack deployed later that asks for
 default-deny takes it over. The condition resolves on the next pass after
 either.
 
+### A VM that outlived its stack's teardown (`stack.vm_outlived_stack`)
+
+Evaluator `stack_reconciler`, subject kind `vm`, subject the VM's name,
+severity warning. Raised by the stack reconciler for a live VM whose record
+names a compose stack that was torn down while the VM existed. A teardown
+deletes the VMs it listed, each as the incarnation it listed, so a VM of a
+member's name created during `compose down` (a `compose up` running beside
+it, or the member re-created on another host) is left, and nothing else
+deletes it. The evidence names the stack, the VM's host and when each was
+created and torn down. `lv rm <vm>` removes the VM; deploying the stack again
+(`lv compose up`) makes it the stack's again. The condition resolves on the
+next pass after either. A VM created after the stack was torn down is a
+deploy of that stack name in progress, and is not reported.
+
 ### Tag-group conditions (`firewall.tag_group.*`)
 
 Raised per host by its firewall reconciler, and resolved on the next pass that
@@ -2640,6 +2654,11 @@ reason. The VM gets a `vm.disk_kept` event and an audit entry. The host the
 delete ran on records it in `<data_dir>/kept-disks.json` and raises
 `disk_leftover` (evaluator `vm_delete`, subject `host/<host>`, warning), whose
 evidence gives each path, its host, the VM and disk, when, and the reason.
+The stack reconciler records there too, on its own host, the disks of a stack
+member it deleted while keeping them because it could not prove the teardown
+let them go (the teardown recorded no disk choice, or another teardown's); the
+reason names the stack. Unless that stack delete asked to keep disks, they are
+leftovers.
 litevirt removes none of them: check that nothing uses each one (another VM's
 disk, a process holding it open), then remove it by hand. A file on that host
 is forgotten once it is gone; a disk is not named while another VM's disk

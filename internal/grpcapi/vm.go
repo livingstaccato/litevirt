@@ -3123,6 +3123,44 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	return out, err
 }
 
+// deleteOfNoLiveRow answers a delete that finds no live row of the name here.
+//
+// A delete bound to a stack member's incarnation (expected_stack and
+// expected_created_at: a stack teardown or the stack reconciler) that finds
+// that incarnation's tombstone here is done: the member was deleted, by
+// another deleter that got there first. Answered NotFound, the caller judged
+// it from its own replica, which can lag the tombstone written here: compose
+// down reported a member it had seen deleted as a failed deletion (lab 2
+// 2026-10-17, anomaly 2). Everything else is NotFound as before: an unbound
+// delete (lv rm), a peer-search probe, a delete bound to the stack only (the
+// stored file names a member the caller holds no row of, and a tombstone of
+// an older incarnation says nothing of a newer one a peer may hold), and a
+// tombstone of another incarnation or of another stack's VM.
+func (s *Server) deleteOfNoLiveRow(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
+	notFound := status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+	if req.GetExpectedStack() == "" || req.GetExpectedCreatedAt() == "" || deleteLocalOnly(ctx) {
+		return nil, notFound
+	}
+	rows, err := s.db.Query(ctx,
+		`SELECT COALESCE(stack_name, '') AS stack_name, COALESCE(created_at, '') AS created_at,
+		        COALESCE(project, '_default') AS project
+		 FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, req.Name)
+	if err != nil || len(rows) == 0 {
+		return nil, notFound
+	}
+	row := rows[0]
+	if row.String("stack_name") != req.GetExpectedStack() || row.String("created_at") != req.GetExpectedCreatedAt() {
+		return nil, notFound
+	}
+	if err := s.RequirePerm(ctx, vmRBACPathFor(row.String("project"), req.Name), "vm.delete", "operator"); err != nil {
+		s.audit(ctx, "vm.delete", req.Name, "permission denied", "denied")
+		return nil, err
+	}
+	slog.Info("delete: the stack member was already deleted", "vm", req.Name,
+		"stack", req.GetExpectedStack(), "created_at", req.GetExpectedCreatedAt())
+	return &emptypb.Empty{}, nil
+}
+
 func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
@@ -3143,8 +3181,11 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	defer s.invalidateInventoryCache()
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
-	if err != nil || vm == nil {
+	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+	}
+	if vm == nil {
+		return s.deleteOfNoLiveRow(ctx, req)
 	}
 	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.delete", "operator"); err != nil {
 		s.audit(ctx, "vm.delete", req.Name, "permission denied", "denied")
@@ -3224,11 +3265,17 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			return nil, lerr
 		}
 		defer releaseLease()
+		if h := s.deleteLeaseTakenHook; h != nil {
+			h(req.Name)
+		}
 		// A start that held the lease until a moment ago may have changed
 		// the row since it was read above: decide from the row as it is now.
 		vm, err = corrosion.GetVM(ctx, s.db, req.Name)
-		if err != nil || vm == nil {
+		if err != nil {
 			return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+		}
+		if vm == nil {
+			return s.deleteOfNoLiveRow(ctx, req)
 		}
 		if err := checkDeleteBinding(req, vm); err != nil {
 			return nil, err

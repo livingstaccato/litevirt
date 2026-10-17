@@ -162,8 +162,15 @@ not even be listed — each failure is printed, named for what was left (a VM or
 container name, `network <name>`, `containers (list failed)`, `firewall rows`
 or `backup repos`), the success line is withheld, and the command
 exits non-zero with a summary such as `stack "web": 1 of 3 deletions failed
-(web-2)`. The stack is then left in state `deleting`, the daemon keeps retrying
-the teardown in the background, and the `stack.delete` audit entry has result
+(web-2)`. A member VM that another delete removed first (`lv rm`, or the
+background retry) counts as deleted. The stack is then left in state
+`deleting`, the daemon keeps retrying the teardown in the background (it takes
+a teardown up no sooner than a minute after it began, leaving a `compose down`
+still running to finish, and keeps the VMs' disks when the teardown was asked
+to keep them, `keep_disks` on the REST or gRPC stack delete, or was begun by a
+host that did not record whether it was; disks kept for that last reason are
+named by `disk_leftover`), and
+the `stack.delete` audit entry has result
 `error` and names what was not removed. A `compose up` of a stack in state
 `deleting` is refused until the teardown has finished: wait until
 `lv compose ls` no longer lists it, then run `lv compose up` again. If the

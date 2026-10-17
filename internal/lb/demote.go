@@ -401,9 +401,13 @@ func (m *Manager) stopKeepalivedConfirmed(name string, timeout time.Duration) er
 
 // keepalivedPidsForConfig returns every keepalived pid whose cmdline binds cfgPath
 // (scanning /proc; mirrors killProcByConfig's matcher). Empty on a /proc-less host.
+// procCmdlines is where keepalivedPidsForConfig looks for processes; a test
+// points it at a directory of its own.
+var procCmdlines = "/proc/[0-9]*/cmdline"
+
 func keepalivedPidsForConfig(cfgPath string) []int {
 	var pids []int
-	matches, _ := filepath.Glob("/proc/[0-9]*/cmdline")
+	matches, _ := filepath.Glob(procCmdlines)
 	for _, cf := range matches {
 		data, err := os.ReadFile(cf)
 		if err != nil {

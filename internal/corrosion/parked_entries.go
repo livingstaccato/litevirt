@@ -203,7 +203,7 @@ func (r *Replicator) entryParkable(stmts []Statement, failed Statement, applyErr
 			disp = entry.DispositionAfter
 		}
 		switch disp {
-		case DispPlainInsert, DispExplicitUpsert, DispFullPKUpdate, DispLiveRowUpdate:
+		case DispPlainInsert, DispExplicitUpsert, DispFullPKUpdate, DispLiveRowUpdate, DispSpecGeneration:
 		case DispBulkUpdate:
 			if entry.Category != CatPerRowLWW {
 				return "", "", false

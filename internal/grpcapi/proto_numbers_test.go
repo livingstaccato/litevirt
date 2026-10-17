@@ -295,3 +295,24 @@ func TestProtoNumbers_FirewallExtras(t *testing.T) {
 		}
 	}
 }
+
+// The scoped operation abort and the Ping bit that gates it keep their numbers;
+// abort_scoped follows delete_force, the last PingResponse feature bit.
+func TestProtoNumbers_ScopedOperationAbort(t *testing.T) {
+	fields := []struct {
+		msg  protoreflect.ProtoMessage
+		num  protoreflect.FieldNumber
+		name protoreflect.Name
+	}{
+		{&pb.AbortVMOperationRequest{}, 3, "operation_id"},
+		{&pb.PingResponse{}, 12, "delete_force"},
+		{&pb.PingResponse{}, 13, "abort_scoped"},
+	}
+	for _, f := range fields {
+		md := f.msg.ProtoReflect().Descriptor()
+		fd := md.Fields().ByNumber(f.num)
+		if fd == nil || fd.Name() != f.name {
+			t.Errorf("%s field %d is %v, want %s", md.FullName(), f.num, fd, f.name)
+		}
+	}
+}

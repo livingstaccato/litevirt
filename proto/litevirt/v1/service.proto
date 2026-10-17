@@ -719,6 +719,16 @@ message SetVMMemoryRequest  { string name = 1; int32 target_mib = 2;
 // SetVMLabelsRequest replaces the full label set (the request is authoritative —
 // an empty map clears all tags).
 message SetVMLabelsRequest  { string name = 1; map<string, string> labels = 2; }
+// PatchVMSpecRequest names fields of desired to write onto a VM's stored spec.
+// Peer only: a deploy that entered on another host forwards its spec patch to
+// the VM's owner, so every edit of one VM's spec is made on one host.
+message PatchVMSpecRequest {
+    string name = 1;
+    VMSpec desired = 2;
+    // fields: the compose live-metadata field names, plus "cpu" and "memory"
+    // for a size a live resize already applied.
+    repeated string fields = 3;
+}
 message ResizeDiskRequest  { string vm_name = 1; string disk_name = 2;
     string size = 3; }  // size: new total size e.g. "40G"
 
@@ -2390,6 +2400,9 @@ message GetVMOperationResponse {
 message AbortVMOperationRequest {
     string vm_name = 1;
     bool   force   = 2; // required — an abort is never implicit
+    // operation_id, when set, scopes the abort: it is refused unless the VM's
+    // active operation is exactly this one. Empty aborts whatever is active.
+    string operation_id = 3;
 }
 message AbortVMOperationResponse {
     bool   aborted               = 1;
@@ -3566,6 +3579,10 @@ message PingResponse {
   // so a caller that needs the stop first (lv rm --force, a forwarding entry
   // node) sends StopVM{force} itself when this is false.
   bool delete_force = 12;
+  // abort_scoped: this build honours AbortVMOperationRequest.operation_id. An
+  // older daemon ignores the field and aborts whatever operation is active, so
+  // lv operation abort --operation refuses to send it when this is false.
+  bool abort_scoped = 13;
   // nic_list_position: this build reads UpdateVMRequest.nic_by_list_position.
   // An older owner ignores the field and reads every NIC ordinal as a spec
   // index, so an entry node translates the positions for it, or refuses.
@@ -4449,6 +4466,10 @@ service LiteVirt {
     // SetVMLabels replaces a VM's labels/tags. Metadata-only (not in the domain
     // XML), so it applies to running VMs without a redefine.
     rpc SetVMLabels(SetVMLabelsRequest)  returns (VM);
+    // PatchVMSpec writes named fields of a desired spec onto a VM's stored
+    // spec, on the host that answers. Peer only: the owner of a VM serialises
+    // its spec edits, so a deploy entering elsewhere forwards its patch here.
+    rpc PatchVMSpec(PatchVMSpecRequest) returns (google.protobuf.Empty);
     rpc AttachDevice(AttachDeviceRequest) returns (VM);
     rpc DetachDevice(DetachDeviceRequest) returns (VM);
     rpc ResizeDisk(ResizeDiskRequest)    returns (VM);

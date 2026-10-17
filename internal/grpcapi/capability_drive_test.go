@@ -115,6 +115,10 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// elects relays". Every node relies on every other electing the same
 		// relay set.
 		capabilities.RelayHealthV1: true,
+		// spec_conflict_v1: "this build decodes the epoch-carrying spec edit
+		// and resolves a conflict at one generation as anti-entropy does".
+		// Every replica must resolve one conflict the same way.
+		capabilities.SpecConflictV1: true,
 		// release_2026_11_v1, the release token: "this build decodes, keeps
 		// and honours every field and shape of its release". Nothing changes
 		// when it latches; a feature is opened only through WithFeature,

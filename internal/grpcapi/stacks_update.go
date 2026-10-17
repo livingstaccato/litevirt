@@ -173,24 +173,17 @@ func (s *Server) reconfigureWithRestart(ctx context.Context, name string, desire
 // persistResourceSize records the plan's live-resized cpu/memory in the VM's
 // stored spec.
 func (s *Server) persistResourceSize(ctx context.Context, name string, desired *pb.VMSpec, plan compose.ChangePlan) error {
-	applied, _, err := corrosion.MutateDesiredSpec(ctx, s.db, name, func(old string) (string, error) {
-		spec := &pb.VMSpec{}
-		if old != "" {
-			if err := json.Unmarshal([]byte(old), spec); err != nil {
-				return "", err
-			}
+	var fields []string
+	for _, d := range plan.ResourceChanges {
+		if d.Field == "cpu" || d.Field == "memory" {
+			fields = append(fields, d.Field)
 		}
-		for _, d := range plan.ResourceChanges {
-			switch d.Field {
-			case "cpu":
-				spec.Cpu = desired.Cpu
-			case "memory":
-				spec.MemoryMib = desired.MemoryMib
-			}
-		}
-		b, err := json.Marshal(spec)
-		return string(b), err
-	})
+	}
+	if len(fields) == 0 {
+		return nil
+	}
+	// Made on the VM's owner, which serialises its spec edits (spec_owner.go).
+	applied, err := s.patchSpecAtOwner(ctx, name, desired, fields)
 	if err != nil {
 		return status.Errorf(codes.Internal, "record the new size of %q: %v", name, err)
 	}

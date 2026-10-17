@@ -26,6 +26,7 @@ type fakeSyncMetrics struct {
 	digestCached            int      // tables served from the digest cache
 	digestComputed          int      // tables scanned for a digest
 	pullRows                map[string]int
+	specEditHeld            int
 }
 
 func (f *fakeSyncMetrics) ObserveDigestTables(cached, computed int) {
@@ -80,6 +81,11 @@ func (f *fakeSyncMetrics) ObserveMergeRejected(table, path, reason string) {
 func (f *fakeSyncMetrics) ObserveLegacyTransformed(transformer string) {
 	f.mu.Lock()
 	f.legacyTransformed = append(f.legacyTransformed, transformer)
+	f.mu.Unlock()
+}
+func (f *fakeSyncMetrics) ObserveSpecEditHeld() {
+	f.mu.Lock()
+	f.specEditHeld++
 	f.mu.Unlock()
 }
 func (f *fakeSyncMetrics) ObserveIdentityCollapseOrphan(table string) {

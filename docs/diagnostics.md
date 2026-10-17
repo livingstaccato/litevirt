@@ -15,13 +15,19 @@ operation can be inspected and force-cleared manually:
 ```
 lv operation show <vm>            # inspect the operation holding the barrier + its steps
 lv operation abort <vm> --force   # force-clear the barrier so the VM is mutable again
+lv operation abort <vm> --operation <id> --force   # the same, only if <id> is the active operation
 lv operation release-reservation <operation-id> --force   # release a host reservation no running operation holds
 ```
 
 `show` is read-only. `abort` is admin-only, requires `--force`, is audited, and
 clears the barrier only via the exact owner-epoch + spec-generation
 compare-and-swap — so it can never clear a newer operation's barrier, and an
-ordinary mutation's `--force` never bypasses the barrier.
+ordinary mutation's `--force` never bypasses the barrier. Without
+`--operation`, `abort` clears whichever operation is active when it runs;
+with `--operation <id>` it is refused unless `<id>` is that operation, so an
+operation that finished, or one that began, after you ran `show` is never
+the one cleared. A daemon too old to honour `--operation` is refused before
+anything is sent. The commands act on the host the CLI targets (`LV_HOST`).
 
 ## Host reservations
 
@@ -1023,6 +1029,15 @@ converge the row, so the two paths can never disagree.
   *attempts*, a permanent fault re-increments every cycle — so alert on its **rate**, correlated
   with replication backlog (`litevirt_replication_min_watermark_seq`) and `lv doctor
   divergence`, **not** on its absolute value.
+  `reason="spec_edit_dropped"` (table `vms`) is different in kind: a VM spec edit that met
+  another made from the same generation and lost (see
+  [operating-model.md](operating-model.md#replication)). Each one is also a
+  `vm.spec_edit_dropped` event on the VM, quoting the dropped spec.
+- `litevirt_spec_edit_held_total` — **monotonic counter** of lines of VM spec edits this node
+  holds off a VM because an operation on it has not finished, counted once per VM and
+  operation when the hold is confirmed (a second consecutive pass); each
+  raises `vm.spec_edit_held` (see
+  [the condition](#a-line-of-spec-edits-is-held-off-by-a-running-operation-vmspec_edit_held)).
 - `litevirt_replication_parked_entries{origin}` — **gauge**: received changes this node
   holds because a constraint refuses them, per sender (see
   [`replication_entry_parked`](#a-received-change-this-node-cannot-apply-replication_entry_parked)).
@@ -2498,6 +2513,36 @@ migration onto a host whose key differs from the source host's is refused
 before libvirt is asked. Install the cluster's keyring for the client on the
 odd host; the next reconcile (30 s) resolves the condition.
 See [storage.md](storage.md#ceph-rbd-pools).
+
+### A line of spec edits is held off by a running operation (`vm.spec_edit_held`)
+
+After a partition, one side can hold a longer line of out-of-band edits to a
+VM's spec (labels, a deploy's metadata) while the owner runs an operation on
+the VM from an earlier generation (a hotplug, a resize). The line waits until
+the operation has finished, so the operation can complete
+([operating-model.md](operating-model.md#replication)). Meanwhile the hosts
+disagree: the owner, and those that saw the operation first, show the
+operation and its spec; the others show the line and no operation. Each host
+that holds the line raises `vm.spec_edit_held` (evaluator `spec_conflict`,
+subject `vm/<name>@<host>`, warning): observed at the end of the first
+anti-entropy pass that holds, confirmed at the end of the second consecutive
+one for the same operation, each time only if the operation still has not
+finished once the whole pass has merged. A pass that brings the
+operation's terminal step therefore does not confirm it; it resolves the
+condition at its end. On
+confirmation the host logs a warning and counts
+`litevirt_spec_edit_held_total`, once per VM and operation. The evidence
+names the operation, the owner host it shows on (the VM's host as of the
+latest pass) and the remedy: on that host, check `lv operation show <vm>`;
+if that operation is wedged there, run
+`lv operation abort <vm> --operation <id> --force`, which is refused if
+another operation is active by then. On a host that kept the line,
+`lv operation show <vm>` reports no operation. The condition resolves when
+the operation turns terminal there, the held line applies, or the VM is
+deleted; anti-entropy carries the line on its next pass after that. A host
+removed with `lv host rm` never resolves its own, so the removal resolves
+them. Nothing ends an operation that never reaches a terminal step on its
+own.
 
 ### A cancelled start is still recorded (`cancelled_start_kept`)
 

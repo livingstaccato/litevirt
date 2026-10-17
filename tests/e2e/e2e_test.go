@@ -546,6 +546,39 @@ func TestCluster_Version(t *testing.T) {
 // after it was not there before the run.
 var suiteStart = time.Now()
 
+// healthReasons returns the "  - <reason>" lines `lv health` prints under its
+// overall line.
+func healthReasons(out string) []string {
+	var reasons []string
+	lines := strings.Split(out, "\n")
+	for i, line := range lines {
+		if i == 0 {
+			continue
+		}
+		r, ok := strings.CutPrefix(line, "  - ")
+		if !ok {
+			break
+		}
+		reasons = append(reasons, r)
+	}
+	return reasons
+}
+
+// staleEvaluatorScan reads the last-scan time out of a stale-evaluator reason
+// (`evaluator X is stale: last scan "<RFC3339>" by ...`).
+func staleEvaluatorScan(reason string) (time.Time, bool) {
+	_, rest, ok := strings.Cut(reason, " is stale: last scan \"")
+	if !ok {
+		return time.Time{}, false
+	}
+	ts, _, ok := strings.Cut(rest, "\"")
+	if !ok {
+		return time.Time{}, false
+	}
+	at, err := time.Parse(time.RFC3339, ts)
+	return at, err == nil
+}
+
 // conditionsSince returns the condition rows of `lv health` output whose SINCE
 // (the last column; RFC3339 or "2006-01-02 15:04:05") is at or after t, or
 // cannot be read: an unreadable time is treated as new, never as old.
@@ -608,6 +641,7 @@ func TestConditionsSince(t *testing.T) {
 }
 
 func TestCluster_Health(t *testing.T) {
+	ensureTopology(t) // hostNames: run alone, TestSetup has not
 	// `lv health` exits 1 when the overall state is DEGRADED (and 2 when
 	// CRITICAL): the report is still printed in full. This test pins that the
 	// report names the cluster's hosts, so a DEGRADED cluster, whose old
@@ -625,6 +659,22 @@ func TestCluster_Health(t *testing.T) {
 		if fresh := conditionsSince(out, suiteStart); len(fresh) > 0 {
 			t.Fatalf("the cluster is DEGRADED by conditions first seen since this run began (%s) or with an unreadable SINCE:\n%s",
 				suiteStart.UTC().Format(time.RFC3339), strings.Join(fresh, "\n"))
+		}
+		// A DEGRADED report must say why. lab 3 sat at DEGRADED with no
+		// condition and nothing else listed, because the shared_lun scan had
+		// stopped; the report now names each cause under the overall line.
+		reasons := healthReasons(out)
+		if len(reasons) == 0 && !strings.Contains(out, "\nconditions:") {
+			t.Fatalf("the cluster is DEGRADED and the report names no reason and no condition:\n%s", out)
+		}
+		// An evaluator that was already stale when this run began stopped
+		// scanning before anything here could have caused it — on lab 3, a
+		// lease no node could take over. One that went stale during the run
+		// may be a scenario's partition, so it is only logged.
+		for _, r := range reasons {
+			if at, ok := staleEvaluatorScan(r); ok && at.Before(suiteStart.Add(-5*time.Minute)) {
+				t.Fatalf("a health evaluator stopped scanning before this run began: %s\n%s", r, out)
+			}
 		}
 		t.Logf("cluster is DEGRADED (exit 1) by older conditions only; checking the report still names the hosts:\n%s", out)
 	}
@@ -2166,6 +2216,45 @@ runcmd:
   - cd /tmp/www && nohup python3 -m http.server 8080 &>/dev/null &
 `
 
+// guestReady is waitCloudInit without the failure: whether vmName runs
+// netCloudInit's user-data (its /tmp/www/index.html answers lv exec) within
+// timeout.
+func guestReady(t *testing.T, vmName string, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := lvErr(t, "exec", vmName, "test", "-f", "/tmp/www/index.html"); err == nil {
+			return true
+		}
+		time.Sleep(15 * time.Second)
+	}
+	return false
+}
+
+// rhelFamilyImageOn is the first image `lv image ls` lists on host whose
+// name names a RHEL-family distribution (Rocky, Alma, RHEL, CentOS, Oracle,
+// Fedora), or "".
+func rhelFamilyImageOn(t *testing.T, host string) string {
+	t.Helper()
+	re := regexp.MustCompile(`(?i)rocky|alma|rhel|centos|oracle|fedora`)
+	for _, line := range strings.Split(lv(t, "image", "ls"), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 || f[0] == "NAME" || !re.MatchString(f[0]) {
+			continue
+		}
+		i := strings.Index(line, "[")
+		if i < 0 {
+			continue
+		}
+		for _, h := range strings.Fields(strings.Trim(line[i:], "[] ")) {
+			if h == host {
+				return f[0]
+			}
+		}
+	}
+	return ""
+}
+
 // execRetry runs lv exec with retries for guest-agent readiness.
 func execRetry(t *testing.T, vmName string, cmd ...string) (string, error) {
 	t.Helper()
@@ -2475,6 +2564,29 @@ vms:
 		vm2Name, testImage, hostNames[1], strings.ReplaceAll(netCloudInit, "\n", "\n        "),
 		vm3Name, testImage, hostNames[0], strings.ReplaceAll(netCloudInit, "\n", "\n        "))
 
+	// A RHEL-family guest on vxnet + isonet, when such an image is on the
+	// host: the one whose cloud-init renderers drop use-routes, so the only
+	// guest on which Isolated/DefaultRoute tells the fix from main.
+	vm4Name, rhelImage := "", rhelFamilyImageOn(t, hostNames[0])
+	if rhelImage != "" {
+		vm4Name = uniqueName("nv4")
+		compose += fmt.Sprintf(`
+  %s:
+    image: %s
+    cpu: 1
+    memory: `+vmMemory()+`
+    disks:
+      root: 10G
+    network:
+      - name: vxnet
+      - name: isonet
+    placement:
+      host: %s
+    cloud-init:
+      userdata: |
+        %s`, vm4Name, rhelImage, hostNames[0], strings.ReplaceAll(netCloudInit, "\n", "\n        "))
+	}
+
 	filePath := writeComposeFile(t, stackName, compose)
 	cleanup(t, func() { composeDown(t, stackName) })
 
@@ -2485,6 +2597,13 @@ vms:
 	waitCloudInit(t, vm1Name, 3*time.Minute)
 	waitCloudInit(t, vm2Name, 3*time.Minute)
 	waitCloudInit(t, vm3Name, 3*time.Minute)
+	// vm4 is extra: one that never becomes ready (no guest agent in the
+	// image, a boot that fails) is left out of Isolated/DefaultRoute, logged,
+	// rather than failing the stack.
+	if vm4Name != "" && !guestReady(t, vm4Name, 8*time.Minute) {
+		t.Logf("RHEL-family guest %s (%s) did not become ready; Isolated/DefaultRoute checks it not", vm4Name, rhelImage)
+		vm4Name = ""
+	}
 
 	t.Run("VXLAN/InterVMPing", func(t *testing.T) {
 		vm2IP := getVMIP(t, vm2Name, stackName, "vxnet")
@@ -2538,6 +2657,45 @@ vms:
 			t.Fatalf("lv exec ping from %s failed without a ping result, so cross-host unreachability is unproven: %v\n%s", vm1Name, err, out)
 		case reached:
 			t.Errorf("ping from %s (%s) to %s (%s) on the isolated net succeeded across hosts; an isolated network does not span hosts: %s", vm1Name, hostNames[0], vm2Name, vm2IP, out)
+		}
+	})
+
+	// The isolated network's dnsmasq offers no router to a NIC of a VM that
+	// also has a NIC on a routed network: vm1 (and vm4) on vxnet + isonet
+	// take no default route through the isolated NIC. A VM whose NICs are all
+	// isolated is offered the bridge as before: vm3 keeps its default route
+	// through it. vm1's assertion holds on main too for a netplan guest
+	// (Debian, Ubuntu: the seed's use-routes: false); it tells the fix from
+	// main only on a RHEL-family guest, which vm4 is when such an image is on
+	// the host.
+	t.Run("Isolated/DefaultRoute", func(t *testing.T) {
+		defaultVia := func(vm string) (iface string, has bool, all string) {
+			iface = getVMIfaceForSubnet(t, vm, "10.201.0.")
+			out, err := execRetry(t, vm, "ip", "-4", "route", "show", "default")
+			if err != nil {
+				t.Fatalf("ip route on %s failed: %v\n%s", vm, err, out)
+			}
+			for _, line := range strings.Split(out, "\n") {
+				if strings.Contains(" "+line+" ", " dev "+iface+" ") {
+					has = true
+				}
+			}
+			return iface, has, out
+		}
+		routed := map[string]string{vm1Name: testImage}
+		if vm4Name != "" {
+			routed[vm4Name] = rhelImage
+			t.Logf("RHEL-family guest %s runs %s", vm4Name, rhelImage)
+		} else {
+			t.Logf("no RHEL-family image on %s; only %s (%s) is checked, which does not tell the fix from main on a netplan guest", hostNames[0], vm1Name, testImage)
+		}
+		for vm, img := range routed {
+			if iface, has, all := defaultVia(vm); has {
+				t.Errorf("%s (%s, vxnet + isonet) has a default route through its isolated interface %s:\n%s", vm, img, iface, all)
+			}
+		}
+		if iface, has, all := defaultVia(vm3Name); !has {
+			t.Errorf("%s (only an isolated NIC) has no default route through %s; a VM whose NICs are all isolated keeps the bridge as router:\n%s", vm3Name, iface, all)
 		}
 	})
 
@@ -3093,7 +3251,7 @@ func sgChainOrdered(chain string, observe bool) error {
 
 // pureTests are the tests that touch no cluster and no lv, and so are the only
 // ones LITEVIRT_E2E_UNIT=1 may run.
-var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed", "TestEnforcementEditScript", "TestJoinMajority", "TestUsbHostdevPattern", "TestInspectFenceStrategy", "TestKnownAuditFork", "TestMinorityCopyStopped", "TestConditionsSince", "TestEnforcementEditScriptRefusesAnInlineBlock", "TestParseClaimView", "TestParseLogLines", "TestMailpitMatches", "TestCutPlan", "TestHoldersBetween", "TestTenureAt", "TestMintTime", "TestParseEnforcementGauges", "TestLeaseTermModeOf", "TestLeaseTermExpectFor", "TestW4aVerdict", "TestFreshTenureAt", "TestLeaseTermRefusalPattern", "TestInertJournalVerdict", "TestRefusalVerdict", "TestInspectNICIP", "TestPollFor", "TestHostStateInLs", "TestClassifyLease", "TestLeaseSampleExpiry", "TestExpiredLagNeverFails", "TestExpiredUnexplainedIsNoTenure", "TestLeaseWatchObserve", "TestObserveTick", "TestObserveTickUnknown", "TestSampleTick", "TestHoldersIn", "TestIncoherenceTracker", "TestPingVerdict", "TestUncertifiedDeclineVerdict", "TestGuestBootVerdict", "TestForwardHookChains"}
+var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed", "TestEnforcementEditScript", "TestJoinMajority", "TestUsbHostdevPattern", "TestInspectFenceStrategy", "TestKnownAuditFork", "TestMinorityCopyStopped", "TestConditionsSince", "TestEnforcementEditScriptRefusesAnInlineBlock", "TestParseClaimView", "TestParseLogLines", "TestMailpitMatches", "TestCutPlan", "TestHoldersBetween", "TestTenureAt", "TestMintTime", "TestParseEnforcementGauges", "TestLeaseTermModeOf", "TestLeaseTermExpectFor", "TestW4aVerdict", "TestFreshTenureAt", "TestLeaseTermRefusalPattern", "TestInertJournalVerdict", "TestRefusalVerdict", "TestInspectNICIP", "TestPollFor", "TestHostStateInLs", "TestClassifyLease", "TestLeaseSampleExpiry", "TestExpiredLagNeverFails", "TestExpiredUnexplainedIsNoTenure", "TestLeaseWatchObserve", "TestObserveTick", "TestObserveTickUnknown", "TestSampleTick", "TestHoldersIn", "TestIncoherenceTracker", "TestPingVerdict", "TestUncertifiedDeclineVerdict", "TestGuestBootVerdict", "TestForwardHookChains", "TestParseLabPrefix"}
 
 // unitRunAllowed reports whether a -test.run pattern selects only pureTests:
 // the exact form ^(A|B)$ or ^A$, with every name pure.

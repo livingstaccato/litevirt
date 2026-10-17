@@ -17,6 +17,7 @@ package fleet
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -44,9 +45,11 @@ func runCheckers(t *testing.T, c *Cluster) map[string]*health.Checker {
 	t.Helper()
 	gates := gateAll(t, c)
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
+	var workers sync.WaitGroup
+	t.Cleanup(func() { cancel(); workers.Wait() })
 	for _, n := range c.Nodes {
-		go gates[n.Name].Start(ctx)
+		workers.Add(1)
+		go func() { defer workers.Done(); gates[n.Name].Start(ctx) }()
 	}
 	for _, n := range c.Nodes {
 		node := n

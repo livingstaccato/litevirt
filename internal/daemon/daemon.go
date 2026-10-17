@@ -82,6 +82,10 @@ type Daemon struct {
 	checker *health.Checker
 	metrics *metrics.Server
 
+	// startWaitSvc is svc for the libvirt start-guard wait, which is wired
+	// before svc exists and asks it which incarnation a create is starting.
+	startWaitSvc *atomic.Pointer[grpcapi.Server]
+
 	// buildServer replaces grpcapi.NewServer in newServer (tests, which have
 	// no libvirt); nil in a daemon.
 	buildServer func() *grpcapi.Server
@@ -128,6 +132,9 @@ type Daemon struct {
 	// confirmServing, when set, replaces hostboot.ConfirmServing in the
 	// restart's serving check (confirmActive). Tests only.
 	confirmServing func(ctx context.Context) (bool, string, error)
+	// returningGate, when set, replaces the release-feature gate a returning
+	// boot's write goes through (returningBootGate). Tests only.
+	returningGate releaseGate
 
 	// rolledBackTokens names capability tokens this node already latched that this
 	// binary has never heard of — i.e. this binary is a rollback below them. Set at
@@ -214,7 +221,13 @@ func NewContext(ctx context.Context, cfg *Config) (*Daemon, error) {
 	// start waits for SetStartGuard (Run), and refuses if it never comes. A
 	// VM with no NIC guard does not wait (m3): it starts as it did before
 	// guards. One whose guards cannot be read waits.
-	virt.RequireStartGuard(5*time.Minute, startWaitNeeded(db))
+	startWaitSvc := &atomic.Pointer[grpcapi.Server]{}
+	virt.RequireStartGuard(5*time.Minute, startWaitNeeded(db, func(name string) string {
+		if svc := startWaitSvc.Load(); svc != nil {
+			return svc.CreatingIncarnation(name)
+		}
+		return ""
+	}))
 
 	// An earlier build left the backup session directories 0777; narrow them
 	// now rather than at the first backup (best effort, logged).
@@ -231,6 +244,8 @@ func NewContext(ctx context.Context, cfg *Config) (*Daemon, error) {
 		db:     db,
 		virt:   virt,
 		images: store,
+
+		startWaitSvc: startWaitSvc,
 	}, nil
 }
 
@@ -275,8 +290,9 @@ const localMaxRecvMsgSize = 256 << 20
 // including cancellation before dialSelf has ever constructed a client.
 func (d *Daemon) writeBootState(ctx context.Context, cpus, memMiB, diskGiB int, hasResources bool) <-chan struct{} {
 	done := make(chan struct{})
+	var fenceDone <-chan struct{}
 	start := func(check func()) <-chan struct{} {
-		go func() { defer close(done); check() }()
+		go func() { defer close(done); check(); <-fenceDone }()
 		return done
 	}
 	boot := hostboot.BootState(ctx, d.db, d.cfg.HostName, d.cfg.DataDir, d.upgradePending, time.Now())
@@ -287,6 +303,7 @@ func (d *Daemon) writeBootState(ctx context.Context, cpus, memMiB, diskGiB int, 
 			return hostboot.ConfirmServingReport(ctx, d.db, d.cfg.HostName, from, r)
 		}
 	}
+	fenceDone = d.watchKeptFence(ctx, boot)
 	if boot.Deferred {
 		return start(func() { d.awaitServingThenActivate(ctx, reportOnServing(boot.State)) })
 	}
@@ -294,7 +311,28 @@ func (d *Daemon) writeBootState(ctx context.Context, cpus, memMiB, diskGiB int, 
 		beforeBootWrite()
 	}
 	var confirm confirmFunc
-	if boot.From != "" {
+	returned := false
+	if boot.Returning {
+		var applied bool
+		var err error
+		if returned, applied, err = d.writeReturningBoot(ctx, boot, r); !returned {
+			boot = boot.Fallback(err.Error())
+			slog.Info("boot state", "state", boot.State, "from", boot.From, "reason", boot.Reason)
+		} else {
+			switch {
+			case err != nil:
+				slog.Warn("failed to write host startup state", "error", err)
+				confirm = reportOnServing(boot.State)
+			case !applied:
+				slog.Warn("boot: this host's recorded state changed after the boot read it; leaving it, and reporting this boot once the daemon serves",
+					"read", boot.From)
+				confirm = reportOnServing(boot.State)
+			}
+		}
+	}
+	if returned {
+		// Written through the release gate above.
+	} else if boot.From != "" {
 		applied, err := corrosion.UpdateHostStartupFrom(ctx, d.db, d.cfg.HostName, boot.From, boot.State, d.cfg.Version, cpus, memMiB, diskGiB, hasResources)
 		switch {
 		case err != nil:
@@ -317,8 +355,7 @@ func (d *Daemon) writeBootState(ctx context.Context, cpus, memMiB, diskGiB int, 
 			return start(func() { d.awaitServingThenNote(ctx) })
 		}
 	}
-	close(done)
-	return done
+	return start(func() {})
 }
 
 // beforeBootWrite, when set, runs between hostboot's decision and the boot
@@ -658,7 +695,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// before its gRPC server listened, it was fenced on the failure count its
 	// observers carried through the restart (hostboot).
 	bootCtx, stopBootCheck := context.WithCancel(ctx)
-	bootDone := d.writeBootState(bootCtx, cpus, memMiB, diskGiB, niErr == nil)
+	bootDone := d.checkerThenBootWrite(bootCtx, cpus, memMiB, diskGiB, niErr == nil)
 	defer func() { stopBootCheck(); <-bootDone }()
 	// Record version on the corrosion client so it goes into Crescent
 	// peer handshakes (used by skew detection).
@@ -682,16 +719,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// are observed too.
 	d.db.SetSyncMetrics(metrics.NewAntiEntropyMetrics())
 
-	// Create the host health checker BEFORE the replicator so the proof-table WAL
-	// gate is installed before any replication goroutine runs (a nil gate fails
-	// closed, but wiring it up front means no reliance on that). Load the durable
-	// split-brain activation latch here too, before any runtime work is wired, so a
-	// previously-enforced node that restarts (including mid-partition) gates onboot
-	// VM starts / LB (re)apply instead of running them ungated. (Peer capability is
-	// wired later via SetPeerPinger; until then PeerSupports fails closed, so proof
-	// WAL entries defer rather than leak — never a schema-version guess.)
-	d.checker = health.NewChecker(d.cfg.HostName, d.cfg.PKIDir, d.db)
-	d.wireActivationMarker()
+	// The host health checker was created (above, before the boot write) BEFORE
+	// the replicator so the proof-table WAL gate is installed before any
+	// replication goroutine runs (a nil gate fails closed, but wiring it up front
+	// means no reliance on that), with the durable split-brain activation latch
+	// loaded before any runtime work is wired, so a previously-enforced node that
+	// restarts (including mid-partition) gates onboot VM starts / LB (re)apply
+	// instead of running them ungated. (Peer capability is wired later via
+	// SetPeerPinger; until then PeerSupports fails closed, so proof WAL entries
+	// defer rather than leak — never a schema-version guess.)
 	gateMetrics := metrics.NewRuntimeGateMetrics()      // shared by all gate observers
 	stateWriteMetrics := metrics.NewStateWriteMetrics() // shared by all state-write observers
 
@@ -1017,6 +1053,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// every host does (re-review m8).
 	fc.SetNICGuardPlacement(svc.GuardHostNeeded)
 	d.svc = svc
+	if d.startWaitSvc != nil {
+		d.startWaitSvc.Store(svc)
+	}
 	svc.SetSupersededDiskRetentionDays(d.cfg.SupersededDiskRetentionDays)
 	{
 		iv := d.cfg.HostUpdates.IntervalMinutes
@@ -1105,6 +1144,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetSessionTimeouts(parseDurationOr(d.cfg.Auth.SessionIdleTimeout, 0), parseDurationOr(d.cfg.Auth.SessionHardExpiry, 0))
 	svc.SetStrictMTLSIdentity(d.cfg.Auth.StrictMTLSIdentity)
 	svc.SetTrustRotatedPeerCerts(d.cfg.Auth.TrustRotatedPeerCerts)
+	defer svc.StopDHCPReservations()
 	if err := svc.InitializeAutomationSource(ctx); err != nil {
 		slog.Warn("automation source publication unavailable after completed-evidence reconciliation", "error", err)
 	}
@@ -1655,7 +1695,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Effective-capacity sampler: every host publishes what it is ACTUALLY
 	// carrying (union of DB and runtime workloads), so placement counts rogue
 	// runtimes and refuses hosts whose observation is stale or incomplete.
-	go svc.RunCapacitySampler(ctx, 60*time.Second)
+	capacityCtx, stopCapacity := context.WithCancel(ctx)
+	capacityDone := make(chan struct{})
+	go func() { defer close(capacityDone); svc.RunCapacitySampler(capacityCtx, 60*time.Second) }()
+	defer func() { stopCapacity(); <-capacityDone }()
 
 	// Start periodic IP scanner — discovers VM IPs via ARP/DHCP and broadcasts FDB entries.
 	ipScanner := grpcapi.NewIPScanner(svc)
@@ -1937,6 +1980,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.wireFenceCandidates(svc)
 	d.startHAPolicyCache(ctx, svc)
 	d.startHADisarmPreRecord(ctx, fc)
+	preRecordCtx, stopPreRecord := context.WithCancel(ctx)
+	preRecordDone := d.startReturningBootPreRecord(preRecordCtx, fc)
+	defer func() { stopPreRecord(); <-preRecordDone }()
 	go fc.Start(ctx)
 	// Adopt each decided voter generation once its certificate verifies,
 	// importing claim state first where this node is a member of it (§4.4).
@@ -2155,6 +2201,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		stopBootCheck()
 		<-bootDone // the boot worker no longer owns the DB or local client
+		stopPreRecord()
+		<-preRecordDone
+		stopCapacity()
+		<-capacityDone
+		svc.StopDHCPReservations()
 		repl.Stop()
 		// The database closes first: closing libvirt fails the calls still
 		// waiting on it, and their error paths would otherwise write what
@@ -3840,12 +3891,14 @@ func (d *Daemon) wireLeaseTermLedgerGate() {
 // startWaitNeeded is the predicate RequireStartGuard waits on (re-review
 // m3): a start waits for the start guard only when its VM has a NIC guard
 // on, or whether it has one cannot be read. A VM with none starts as it did
-// before guards.
-func startWaitNeeded(db *corrosion.Client) func(name string) bool {
+// before guards. creating names the incarnation a create on this host is
+// starting (grpcapi.Server.CreatingIncarnation): such a start waits only for
+// that incarnation's guards.
+func startWaitNeeded(db *corrosion.Client, creating func(name string) string) func(name string) bool {
 	return func(name string) bool {
 		gctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		macs, err := corrosion.GuardedMACsOf(gctx, db, name)
+		macs, err := corrosion.GuardedMACsOfIncarnation(gctx, db, name, creating(name))
 		return err != nil || len(macs) > 0
 	}
 }

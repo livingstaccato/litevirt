@@ -179,6 +179,8 @@ message ClusterHealth {
     repeated ConnectivityEdge connectivity = 4;
     repeated HostCapacityAssessment capacity = 5;
     string generated_at = 6;   // RFC3339
+    // Why overall is not HEALTHY: one line per cause, empty when it is.
+    repeated string reasons = 7;
 }
 
 message RescanHostRequest  { string name = 1; }

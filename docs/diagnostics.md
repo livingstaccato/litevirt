@@ -1261,7 +1261,12 @@ observed → confirmed → resolved lifecycle:
 `lv health` prints the overall state (HEALTHY / DEGRADED / CRITICAL /
 UNKNOWN), every active condition with its involved hosts, evaluator
 coverage, peer connectivity, and per-host effective capacity — and exits
-0 / 1 / 2 so scripts can gate on it.
+0 / 1 / 2 so scripts can gate on it. Under any state but HEALTHY it lists
+each cause on its own `- ` line beneath the overall state, including the ones
+that are not conditions: an evaluator whose last scan is more than 5 minutes
+old (stale: its scan has stopped, or no node holds its lease), an evaluator
+with incomplete coverage, an incomplete capacity sample, and a link not
+proven good.
 
 Peer connectivity counts toward that state: a link the checker cannot prove
 good is a coverage gap, so a `suspect` or `failing` edge reads DEGRADED
@@ -1283,11 +1288,15 @@ and exactly equal to the DB epoch being superseded — missing, corrupt,
 unreadable, or unequal evidence refuses with a distinct reason.
 
 Effective capacity: every host samples the union of its database and
-runtime workloads each minute into `host_capacity_observations` — a rogue
+runtime workloads each minute into `host_capacity_observations`, and again
+within a few seconds of any change to the database's record of the host's
+workloads (one arriving, leaving, changing state or being resized) — a rogue
 runtime the database does not know about still consumes headroom in
 placement, and an uncapped rogue container makes the host's capacity
 explicitly *incomplete*, which disqualifies it as a placement target until
-resolved.
+resolved. A VM that is migrating is charged by neither placement nor
+admission, so its qemu counts in EXTRA on the host it runs on until the move
+commits.
 
 The `capacity:` table in `lv health` has one row per host that has sampled:
 
@@ -1298,8 +1307,9 @@ capacity:
 ```
 
 - **DB** is what the database holds on the host now, read at request time
-  with the rules placement charges by: running VMs at their recorded vCPU and
-  memory, then (`+… ct`) the memory of running containers. A container is
+  with the rules both placement and admission charge by: running and
+  starting VMs at their recorded vCPU and memory (placement also charges a
+  VM still `creating`, which is not shown here), then (`+… ct`) the memory of running containers. A container is
   charged its memory and nothing else — its cpu is a cap in cores, not a
   reservation — and carries no qemu overhead.
 - **EXTRA** is the sampler's finding: runtime usage beyond the database (a
@@ -1797,6 +1807,23 @@ network heals. It logs what came back and what did not, but raises no condition.
 See [Gossip membership heals itself after a
 partition](operating-model.md#gossip-membership-heals-itself-after-a-partition).
 
+### A host whose boot kept its fence (`boot_kept_fence`)
+
+A host recorded `fenced` or `offline` returns to service on its own when its
+daemon boots ([migration-failover.md](migration-failover.md), "A graceful
+restart stays `upgrading` until it serves"), except when that boot cannot
+write `boot-unclean-history` in its `data_dir` (a full or read-only disk). It
+then keeps the fence: its daemon runs and serves, and the host stays `fenced` or
+`offline`, unplaceable. Evaluator `host_boot`; the host writes the row about
+**itself**, and logs the same at warning level.
+
+| Raised when | Clears when |
+|---|---|
+| The boot of a host recorded `fenced` or `offline` could not record its unclean-boot history and kept the fence. **Warning** severity. The evidence names the state kept, the cause and the remedy. | The host is recorded as anything but `fenced` or `offline` (`lv host undrain <host>`). One left open by an earlier daemon process is resolved by the next boot once that holds. |
+
+Fix what the cause names, confirm the host should run workloads again, then
+run `lv host undrain <host>`.
+
 ### A host stuck `upgrading` while its daemon runs (`upgrading_unconfirmed`)
 
 After a restart the host stays `upgrading` until its daemon answers its own
@@ -2163,7 +2190,10 @@ the LUN; the involved hosts are the hosts those VMs are on.
 | A scan of the replica's `vm_disks` finds two or more live disks of live VMs whose recorded paths are one LUN (the target compared case-insensitively, the portal ignored), or such a disk and an older linked clone layered on it. Observed (warning) on the first such scan, confirmed (critical) on the second. | Two consecutive scans find no such use, under a valid decision gate. |
 
 It runs once a minute on whichever node holds its own lease
-(`shared_lun_detector`). It is detection only: the voter-majority LUN claim
+(`shared_lun_detector`). A survivor takes that lease over once a quorum of
+voters runs a build that answers for the key; until then the scan stops when
+its holder does, and `lv health` lists `shared_lun` as stale after 5 minutes.
+It is detection only: the voter-majority LUN claim
 at create time is the prevention ([storage.md](storage.md#iscsi-one-lun-one-disk)).
 It **changes nothing**: no disk is touched, and it is not an ownership code, so
 admission — starting either VM included — does not read it. Refusing the start
@@ -2576,7 +2606,7 @@ down host that no other host runs.
 
 | Raised when | Clears when |
 |---|---|
-| Failover leaves a restart-same VM with a host-local disk on its failed host. | The host is back and the VM runs there again (a host that boots again turns `active` on its own, after `upgrading` if it booted into a pending upgrade; one that answered again without restarting and stays `fenced` or `offline` needs `lv host undrain <host>` first), or, once the host is back, the VM is on another host or deleted. A record for a host removed from the cluster clears once the VM is deleted or on another host. |
+| Failover leaves a restart-same VM with a host-local disk on its failed host. | The host is back and the VM runs there again (a host that boots again turns `active` on its own, after `upgrading` until its daemon serves; one that answered again without restarting and stays `fenced` or `offline` needs `lv host undrain <host>` first), or, once the host is back, the VM is on another host or deleted. A record for a host removed from the cluster clears once the VM is deleted or on another host. |
 
 ### A start an operator cancelled (`vm_start_cancelled`)
 

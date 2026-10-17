@@ -847,8 +847,8 @@ func TestUpdateVMInterfaceIP(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	if err := UpdateVMInterfaceIP(ctx, c, "vm-ip", "default", "10.0.0.5"); err != nil {
-		t.Fatalf("UpdateVMInterfaceIP: %v", err)
+	if written, err := UpdateVMInterfaceIP(ctx, c, "vm-ip", "default", "", "10.0.0.5"); err != nil || !written {
+		t.Fatalf("UpdateVMInterfaceIP: written=%v err=%v", written, err)
 	}
 
 	got, _ := GetVMInterfaces(ctx, c, "vm-ip")

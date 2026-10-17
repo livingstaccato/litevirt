@@ -82,6 +82,27 @@ func validateSpecNames(spec *pb.VMSpec) error {
 	return validateLBSpec(spec.Loadbalancer)
 }
 
+// postCommitReconcileTimeout bounds the firewall pass a create runs once its
+// row has committed; the periodic pass applies the guards anyway.
+const postCommitReconcileTimeout = 30 * time.Second
+
+// validateSpecNICNetworks refuses a VM spec with two NICs on one network.
+// A VM's NIC record (vm_interfaces) is keyed by VM and network, so the
+// create's record of the second NIC collides with the first's. It is checked
+// before anything is created. A further NIC on a network the VM already has
+// is attached with lv attach-nic, which allows it once hardware_v2 is active.
+func validateSpecNICNetworks(spec *pb.VMSpec) error {
+	seen := make(map[string]int, len(spec.GetNetwork()))
+	for i, n := range spec.GetNetwork() {
+		if j, dup := seen[n.GetName()]; dup {
+			return fmt.Errorf("NICs %d and %d are both on network %q: a VM is created with at most one NIC per network "+
+				"(attach another with lv attach-nic once hardware_v2 is active)", j, i, n.GetName())
+		}
+		seen[n.GetName()] = i
+	}
+	return nil
+}
+
 func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM, error) {
 	if err := validateCreateVMForwardHop(ctx); err != nil {
 		return nil, err
@@ -92,6 +113,10 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision *resolvedCreateVMDecision) (resp *pb.VM, retErr error) {
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
+	}
+	if h := s.createReturnedHook; h != nil {
+		name := req.GetSpec().GetName()
+		defer func() { h(name, retErr) }()
 	}
 	// A re-create forwarded here by the host that tears the VM down carries
 	// the VM's own installer ISO grant; only a peer host's is honoured.
@@ -117,6 +142,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	if err := validateSpecTuning(spec); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if err := validateSpecNICNetworks(spec); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	if err := s.RequirePerm(ctx, vmRBACPathFor(spec.Project, spec.Name), "vm.create", "operator"); err != nil {
@@ -422,8 +450,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// keyed by it (never by the name, which a deleted namesake may have used),
 	// and removed again if the create fails.
 	spec.Uuid = uuid.NewString()
+	// rowCommitted is set once the VM row has committed: from then on the VM
+	// exists and runs, and a later failure (reading it back, a step after it,
+	// a caller that stopped waiting) undoes nothing — no deferred cleanup
+	// below acts once it is set. keepHeld is set when the create failed with
+	// its domain still running: what that guest uses stays held.
+	rowCommitted, keepHeld := false, false
 	defer func() {
-		if retErr != nil {
+		if retErr != nil && !rowCommitted {
 			s.forgetISOIdentity(isoIdentityKey(spec.Name, spec))
 		}
 	}()
@@ -836,7 +870,11 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// Host-isolated picks of this create: in flight until it returns, by
 	// which time its rows hold them or it failed (review m-4).
 	var isoPicks []isoPick
-	defer func() { s.releaseHostIsolatedPicks(isoPicks) }()
+	defer func() {
+		if !keepHeld {
+			s.releaseHostIsolatedPicks(isoPicks)
+		}
+	}()
 	// The VIPs this VM's own load balancer and its stack's will take
 	// (review I-2, R1-m2): their LB rows are written after the stack's VMs.
 	// Read only for a create that makes a host-isolated pick.
@@ -1080,9 +1118,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// the first reconcile that sees the VM's row and its running tap, which
 	// this create triggers right after the row is written; until then the
 	// guest runs unguarded, as it does for the first seconds after any start
-	// or migration. A create that fails after this leaves records behind,
-	// which is harmless: they are keyed by VM name and MAC, and a NIC created
-	// under the same pair writes its own first.
+	// or migration. A create that fails from here on retires the records it
+	// wrote (those of its own incarnation only), so none outlives it.
+	defer func() {
+		if retErr != nil && !rowCommitted && !keepHeld {
+			s.retireFailedCreateGuards(ctx, spec.Name, spec.Uuid, guardRecords)
+		}
+	}()
 	if err := s.writeNewNICGuards(ctx, guardRecords); err != nil {
 		claims.releaseAll(ctx)
 		cleanupDisks()
@@ -1177,6 +1219,16 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// Secure Boot + vTPM (G1). Use the host-resolved firmware paths and pin per-VM
 	// nvram + swtpm state under dataDir so they travel across the lifecycle. Refuse
 	// to silently adopt firmware state left by a prior `delete --keep-disks`.
+	//
+	// A failed create removes only firmware state it made. The swtpm tree of
+	// its own, fresh uuid is always its own. UEFI vars are written by libvirt
+	// at the first start, so only a create that started its own domain can
+	// have made vars, and only the abort of that domain removes them, and only
+	// when none were at that path before (abortDefined). Vars or a
+	// retained-firmware marker a `delete --keep-disks` left under the name are
+	// never its to remove.
+	_, statErr := os.Lstat(lv.NvramPath(s.dataDir, spec.Name))
+	nvramBefore := !errors.Is(statErr, fs.ErrNotExist)
 	if err := s.applyFirmwareConfig(&vmCfg, spec); err != nil {
 		claims.releaseAll(ctx)
 		cleanupDisks()
@@ -1194,6 +1246,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		// Clear the durable device lease once create returns; a crash before the
 		// VM row is finalized leaves it for startup recovery to roll back.
+		// Cleared on every return, a failed create's too: the device stays
+		// owned and bound under the name, and a lease left behind would have
+		// startup recovery unbind it from a guest that could not be stopped.
 		defer devFinish()
 		for _, addr := range pciAddrs {
 			vmCfg.Hostdevs = append(vmCfg.Hostdevs, lv.HostdevConfig{Address: addr})
@@ -1252,7 +1307,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err := gs.refusal(spec); err != nil {
 		claims.releaseAll(ctx)
 		cleanupDisks()
-		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
+		lv.WipeFirmwareStateByUUID(spec.Uuid)
 		return nil, status.Errorf(codes.Internal, "vm create: %v", err)
 	}
 
@@ -1266,10 +1321,98 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		claims.releaseAll(ctx)
 		cleanupDisks()
-		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid) // no orphan nvram/swtpm (G1)
+		lv.WipeFirmwareStateByUUID(spec.Uuid) // no orphan swtpm (G1); no vars exist before a start
 		return nil, status.Errorf(codes.Internal, "define domain: %v", err)
 	}
 	s.EnsureSparePCIeRootPorts(ctx, spec.Name)
+
+	// The vars file libvirt keeps for the domain (filled into its definition
+	// at the define), and whether something was there before this create's
+	// start: a failed create removes vars only when it made them.
+	domainVars, domainVarsBefore := "", true
+	if x, xerr := s.virt.DumpXMLInactive(spec.Name); xerr == nil {
+		if p := lv.NvramPathFromXML(x); p != "" {
+			_, verr := os.Lstat(p)
+			domainVars, domainVarsBefore = p, !errors.Is(verr, fs.ErrNotExist)
+		}
+	}
+
+	// abortDefined undoes this create once its domain is defined (and perhaps
+	// running) and the create cannot finish: a domain with no VM row is a copy
+	// of the VM that no command of litevirt sees. It stops and undefines the
+	// domain, keeping its firmware state, then removes the disks, seed and
+	// firmware state this create made and gives back its address claims (its
+	// guard records go in the deferred retire above).
+	//
+	// It acts only on the domain this create defined, told by its uuid: a
+	// concurrent create of the name may have replaced it, and then neither
+	// that domain nor the disks at this create's paths are this create's to
+	// remove. A domain still running after the stop, or one whose definition
+	// cannot be read or names no uuid, is left as it is with its disks,
+	// claims, LUNs and host-isolated addresses, and reported: removing them
+	// under a running guest is worse, and the next create of the name removes
+	// a leftover domain first. A domain gone by then is gone: its claims and
+	// swtpm tree are released, the disks are left (whatever removed the domain
+	// may have created at their paths since).
+	abortDefined := func(cause error) error {
+		gone := func(why string) error {
+			slog.Error("vm create: the create failed and the domain of its name is not one it can undo; disks left as they are",
+				"name", spec.Name, "host", s.hostName, "why", why, "cause", cause)
+			claims.releaseAll(ctx)
+			lv.WipeFirmwareStateByUUID(spec.Uuid)
+			return fmt.Errorf("%w; %s, so the disks at this create's paths were not touched", cause, why)
+		}
+		if !s.virt.DomainExists(spec.Name) {
+			return gone(fmt.Sprintf("domain %s no longer exists on %s", spec.Name, s.hostName))
+		}
+		x, xerr := s.virt.DumpXMLInactive(spec.Name)
+		if xerr != nil && lv.IsNotFound(xerr) && !s.virt.DomainExists(spec.Name) {
+			return gone(fmt.Sprintf("domain %s no longer exists on %s", spec.Name, s.hostName))
+		}
+		u := domainUUIDFromXML(x)
+		if xerr != nil || u == "" {
+			if xerr == nil {
+				xerr = errors.New("it names no uuid")
+			}
+			keepHeld, lunHold.committed = true, true
+			slog.Error("vm create: the create failed and its domain's definition cannot be read; it is left as it is",
+				"name", spec.Name, "host", s.hostName, "cause", cause, "error", xerr)
+			return fmt.Errorf("%w; the definition of domain %s on %s could not be read (%v), so it is left as it is, "+
+				"with its disks and no VM record: the next create of %s removes it", cause, spec.Name, s.hostName, xerr, spec.Name)
+		}
+		if u != spec.Uuid {
+			return gone(fmt.Sprintf("domain %s on %s is no longer the one this create defined (uuid %s)", spec.Name, s.hostName, u))
+		}
+		if active, aerr := s.virt.DomainIsActive(spec.Name); aerr != nil || active {
+			derr := s.virt.DestroyDomain(spec.Name)
+			if still, serr := s.virt.DomainIsActive(spec.Name); derr != nil && (serr != nil || still) {
+				keepHeld, lunHold.committed = true, true
+				slog.Error("vm create: the create failed and its domain could not be stopped; it is left defined, with its disks",
+					"name", spec.Name, "host", s.hostName, "cause", cause, "error", derr)
+				return fmt.Errorf("%w; its domain could not be stopped on %s (%v) and is left defined with its disks, "+
+					"with no VM record: the next create of %s removes it", cause, s.hostName, derr, spec.Name)
+			}
+		}
+		// Preserving: vars at the domain's path may be ones a
+		// `delete --keep-disks` kept; this create's own go below.
+		if uerr := s.virt.UndefineDomainPreservingState(spec.Name); uerr != nil {
+			slog.Warn("vm create: undefine after a failed create failed", "name", spec.Name, "error", uerr)
+			cause = fmt.Errorf("%w; its domain is stopped but could not be undefined on %s (%v) and is left defined, "+
+				"with no VM record: the next create of %s removes it", cause, s.hostName, uerr, spec.Name)
+		}
+		claims.releaseAll(ctx)
+		cleanupDisks()
+		// Vars this create's start made, at the domain's path and at the
+		// name-keyed path a Secure Boot or vTPM domain uses.
+		if domainVars != "" && !domainVarsBefore {
+			_ = os.Remove(domainVars)
+		}
+		if !nvramBefore {
+			_ = os.Remove(lv.NvramPath(s.dataDir, spec.Name))
+		}
+		lv.WipeFirmwareStateByUUID(spec.Uuid) // no orphan swtpm (G1)
+		return cause
+	}
 
 	// The NIC rows are written once the domain runs; until then the firewall
 	// renders the NICs from here, so their guards are in force when the
@@ -1283,13 +1426,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 	}
 	defer s.pendingNICs(spec.Name, spec.Uuid, ifaceRecords, trunks)()
+	// Its start is this incarnation's: the before-start hook demands this
+	// create's guards, not records an earlier one of the name left.
+	defer s.noteCreatingIncarnation(spec.Name, spec.Uuid)()
 
 	if err := s.StartDomainOnNetwork(ctx, spec.Name); err != nil {
-		s.virt.UndefineDomain(spec.Name, false)
-		claims.releaseAll(ctx)
-		cleanupDisks()
-		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid) // failed first boot must not strand TPM/NVRAM (G1)
-		return nil, status.Errorf(codes.Internal, "start domain: %v", err)
+		// A failed first boot must not strand the domain, disks or TPM/NVRAM (G1).
+		return nil, status.Errorf(codes.Internal, "%v", abortDefined(fmt.Errorf("start domain: %w", err)))
 	}
 
 	// Configure VLAN tags on tap interfaces for any networks that need it.
@@ -1375,57 +1518,44 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// without the explicit wipe (and cleanupDisks) an aborted create strands
 	// exactly the orphans the start-failure path above already cleans.
 	if ferr := createLease.allowCommit(ctx); ferr != nil {
-		if derr := s.virt.DestroyDomain(spec.Name); derr != nil {
-			slog.Warn("vm create: teardown after an aborted admission also failed",
-				"name", spec.Name, "error", derr)
+		if aerr := abortDefined(ferr); aerr != ferr {
+			return nil, status.Errorf(status.Code(ferr), "%v", aerr)
 		}
-		_ = s.virt.UndefineDomain(spec.Name, false)
-		claims.releaseAll(ctx)
-		cleanupDisks()
-		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
 		return nil, ferr
 	}
 	// The grants were checked before the define (gs.refusal above).
 	if err := s.insertVMWithGrants(ctx, spec, gs, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
-		// Scoped to creates that took an EXTERNAL-IPAM claim, so every existing
-		// deployment keeps today's behaviour exactly. With a claim in play, a
-		// running VM with no row is the one state that lets the orphan sweeper
-		// release a LIVE guest's address: the address carries our identity, and
-		// the proof the sweeper reclaims on is that no VM row anywhere in the
-		// cluster references it. Nothing later re-creates the row, so the only
-		// fail-closed answer is to undo the create — teardown, disks, firmware
-		// state, and the claims themselves, matching the admission fence above.
-		// The same for a create that took an iSCSI LUN: a guest left running on
-		// the LUN with no row is one no claim can see (review N-2). And for a
-		// grant the writer refused: it refuses before writing anything, so no
-		// row can exist, and the check before the define makes it unreachable
-		// unless the spec's needs changed since.
-		if !claims.empty() || len(keepLUNs) > 0 || len(lunHold.own) > 0 || errors.Is(err, capabilities.ErrNoFeatureGrant) {
-			slog.Error("vm create: row persistence failed after an address or LUN claim, or for a refused grant — aborting",
-				"name", spec.Name, "error", err)
-			if derr := s.virt.DestroyDomain(spec.Name); derr != nil {
-				slog.Warn("vm create: teardown after failed persistence also failed",
-					"name", spec.Name, "error", derr)
-			}
-			_ = s.virt.UndefineDomain(spec.Name, false)
-			cleanupDisks()
-			lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
-			claims.releaseAll(ctx)
-			return nil, status.Errorf(codes.Internal, "persist VM state: %v", err)
+		// No row was written (the insert is one transaction), so the running
+		// domain is a copy of the VM nothing records: litevirt neither lists,
+		// stops nor deletes it, and with an address or LUN claim the orphan
+		// sweep would reclaim the address of a live guest. The create is
+		// undone — domain, disks, seed, firmware state, claims and guard
+		// records — and fails.
+		slog.Error("vm create: the VM record could not be written; undoing the create",
+			"name", spec.Name, "error", err)
+		return nil, status.Errorf(codes.Internal, "%v", abortDefined(fmt.Errorf("persist VM state: %w", err)))
+	}
+	lunHold.committed = true
+	rowCommitted = true
+	// The VM exists from here: nothing after this depends on the caller still
+	// waiting, and nothing after this is undone (rowCommitted).
+	ctx = context.WithoutCancel(ctx)
+	if h := s.createCommittedHook; h != nil {
+		if herr := h(spec.Name); herr != nil {
+			st := status.Convert(herr)
+			return nil, status.Errorf(st.Code(), "VM %q was created on %s and runs, but %s", spec.Name, s.hostName, st.Message())
 		}
-		slog.Error("failed to write VM to corrosion", "error", err)
-		// VM is running, but state may not be synced — log and continue
-	} else {
-		lunHold.committed = true
-		// Guarded on the insert having landed: with no row there is nothing to
-		// graduate or publish. The invariant it maintains lives on
-		// assignOwnerEpochAtCreate; do not restate it here, or the two copies drift.
-		s.assignOwnerEpochAtCreate(ctx, spec.Name, true)
-		// The guards apply from the first reconcile that sees the VM's row;
-		// run it now rather than on the next tick.
-		if len(guardRecords) > 0 {
-			s.reconcileLocal(ctx)
-		}
+	}
+	// After the insert has landed: with no row there is nothing to graduate or
+	// publish. The invariant it maintains lives on assignOwnerEpochAtCreate; do
+	// not restate it here, or the two copies drift.
+	s.assignOwnerEpochAtCreate(ctx, spec.Name, true)
+	// The guards apply from the first reconcile that sees the VM's row;
+	// run it now rather than on the next tick.
+	if len(guardRecords) > 0 {
+		rctx, cancel := context.WithTimeout(ctx, postCommitReconcileTimeout)
+		s.reconcileLocal(rctx)
+		cancel()
 	}
 
 	slog.Info("VM created successfully", "name", spec.Name, "host", s.hostName)
@@ -1444,7 +1574,22 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	stubVM.State = pb.VMState_VM_RUNNING
 	hooks.Run(ctx, hooks.PostStart, stubVM, spec.Hooks)
 
-	return s.vmToProto(ctx, spec.Name)
+	out, rerr := s.vmToProto(ctx, spec.Name)
+	switch {
+	case status.Code(rerr) == codes.NotFound:
+		// Its record went after the commit (a delete, or a create of the name
+		// elsewhere that won): it is not reported as existing.
+		return nil, status.Errorf(codes.NotFound, "VM %q was created on %s but its record is gone: %v",
+			spec.Name, s.hostName, rerr)
+	case rerr != nil:
+		// The VM was created; a read of it back failing does not change that.
+		// Its state is not known here (the publish may have left it creating).
+		slog.Warn("vm create: the created VM could not be read back; answering with what the create knows",
+			"name", spec.Name, "error", rerr)
+		return &pb.VM{Name: spec.Name, StackName: spec.StackName, HostName: s.hostName, State: pb.VMState_VM_UNKNOWN,
+			CpuActual: int32(spec.Cpu), MemActualMib: int32(spec.MemoryMib)}, nil
+	}
+	return out, nil
 }
 
 // assignOwnerEpochAtCreate finishes a freshly inserted VM row: it assigns the
@@ -3470,6 +3615,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// (vm_recreate_replaces.go).
 	s.reportDeletedVM(ctx, deleted)
 	s.retireNICGuards(ctx, req.Name)
+	s.resyncDHCPHosts()
 
 	slog.Info("VM deleted", "name", req.Name)
 	// The mirror's latency shortcut, AFTER the mandatory tombstone: the VM is
@@ -4198,8 +4344,17 @@ func (s *Server) SetVMIP(ctx context.Context, req *pb.SetVMIPRequest) (*pb.VM, e
 			networkName, binding.PrefixID)
 	}
 
-	if err := corrosion.UpdateVMInterfaceIP(ctx, s.db, req.Name, networkName, req.Ip); err != nil {
+	// The request names a network, not a NIC, so the write is resolved to the
+	// network's live NIC (UpdateVMInterfaceIP). No live NIC there records
+	// nothing, as the unfiltered UPDATE this replaced recorded nothing visible;
+	// it is reported, not refused.
+	written, err := corrosion.UpdateVMInterfaceIP(ctx, s.db, req.Name, networkName, "", req.Ip)
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "update VM interface IP: %v", err)
+	}
+	if !written {
+		slog.Warn("SetVMIP: no single live NIC of the VM is on this network; no interface row records the address",
+			"vm", req.Name, "network", networkName, "ip", req.Ip)
 	}
 
 	// Update DNS record so VM is reachable by name.

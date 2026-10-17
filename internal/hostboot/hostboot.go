@@ -19,7 +19,7 @@
 // it answered nothing for as long as startup took, and on lab 1 (2026-10-14)
 // its peers SSH-fenced it 19 s after the boot, before it served.
 //
-// Four rules keep that from hiding a host that should be fenced, or
+// These rules keep that from hiding a host that should be fenced, or
 // overwriting a decision made about it:
 //
 //   - only a SIGTERM of an ACTIVE host leaves the marker (MarkRestarting), and
@@ -36,6 +36,11 @@
 //     isolated while it was down keeps that, and one past its upgrading
 //     timeout gets one fresh 'upgrading', not an 'active' its peers fence
 //     before it serves;
+//   - a host recorded fenced, offline, maintenance, draining or joining is
+//     returning to service, and boots 'upgrading' until it serves too
+//     (returningBoot), once the returning_boot release feature is open, and
+//     'active' as before until then: once per return, since its own daemon
+//     never writes those states;
 //   - ConfirmServing moves the host from 'upgrading' to 'active' and from
 //     nothing else, and leaves its isolation as it is.
 //
@@ -85,6 +90,15 @@ type Boot struct {
 	// UpdateHostStartupFrom), so a fence, drain or offline recorded between
 	// the read and the write is kept.
 	From string
+	// Returning: the host was recorded in a returning state (From), and its
+	// 'upgrading' write is the returning_boot release feature's
+	// (WriteReturningBoot). Until the feature opens, the boot is Fallback().
+	Returning bool
+	// KeptFence: a deferred boot of a host recorded fenced or offline that
+	// could not record its unclean-boot history, which keeps the fence
+	// (CondFenceKeptOnBoot); Cause is why.
+	KeptFence bool
+	Cause     string
 	// Reason says why, for the boot log.
 	Reason string
 }
@@ -127,9 +141,10 @@ func MarkRestarting(ctx context.Context, db *corrosion.Client, host, dataDir str
 // No boot of a host recorded 'active' or 'upgrading' records it 'active'
 // before its daemon serves: it writes 'upgrading' (guarded on the state it
 // read, Boot.From) or nothing at all (Boot.Deferred), and the serving check
-// records it active. Only a host recorded as something else (fenced,
-// offline, maintenance, draining, joining), or one with no data dir, boots
-// 'active' as before. An unreadable record or uncountable boot defers writes.
+// records it active. A host recorded fenced, offline, maintenance, draining
+// or joining is returning to service (returningBoot). An unreadable record
+// or an unclean boot whose history cannot be recorded defers writes or keeps
+// its recorded fence; a boot with no record or data directory uses 'active'.
 func BootState(ctx context.Context, db *corrosion.Client, host, dataDir string, upgradePending bool, now time.Time) Boot {
 	at, marked := takeMarker(dataDir)
 	if upgradePending {
@@ -138,6 +153,11 @@ func BootState(ctx context.Context, db *corrosion.Client, host, dataDir string, 
 		// effort: the watchdog, not the note, confirms this boot.
 		_ = writeAwaiting(dataDir, now)
 		return Boot{State: "upgrading", Reason: "post-upgrade boot; the upgrade watchdog confirms it"}
+	}
+	// A host recorded down or out of service returns 'upgrading' until it
+	// serves, whatever the marker or the history (returningBoot).
+	if b, ok := returningBoot(ctx, db, host, dataDir, marked, now); ok {
+		return b
 	}
 	if !marked {
 		return noteAwaiting(dataDir, uncleanBoot(ctx, db, host, dataDir, now), now, false)
@@ -199,8 +219,9 @@ func BootState(ctx context.Context, db *corrosion.Client, host, dataDir string, 
 // A boot that cannot record itself in UncleanHistoryName, which could not
 // bound a crash loop, or cannot read the host's record, writes nothing until
 // it serves (Deferred). Every other boot is 'active' as before: one with no
-// data dir, and a host recorded anything else (fenced, offline, maintenance,
-// draining, joining).
+// data dir, and a host recorded anything else. (A host recorded fenced,
+// offline, maintenance, draining or joining does not reach this:
+// returningBoot.)
 func uncleanBoot(ctx context.Context, db *corrosion.Client, host, dataDir string, now time.Time) Boot {
 	if dataDir == "" {
 		return Boot{State: "active", Reason: "no graceful stop recorded, and no data dir to bound a crash loop"}

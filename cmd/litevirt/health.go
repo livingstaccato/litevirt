@@ -123,6 +123,9 @@ ha.condition.resolved event.`,
 
 func printClusterHealth(h *pb.ClusterHealth) {
 	fmt.Printf("overall: %s\n", h.GetOverall())
+	for _, r := range h.GetReasons() {
+		fmt.Printf("  - %s\n", r)
+	}
 
 	if conds := h.GetConditions(); len(conds) > 0 {
 		fmt.Println("\nconditions:")

@@ -592,6 +592,7 @@ func (c *Cluster) Stop() {
 		}
 	}
 	for _, n := range c.Nodes {
+		n.Server.StopDHCPReservations()
 		if n.stopServerLoops != nil {
 			n.stopServerLoops()
 		}

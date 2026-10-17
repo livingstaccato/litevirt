@@ -188,3 +188,72 @@ func TestHostCapacityObservation_RoundTrips(t *testing.T) {
 		t.Errorf("after recovery sample: %+v", got)
 	}
 }
+
+// HostWorkloadFingerprint moves with every change a capacity sample of h1
+// charges differently, and with nothing else.
+func TestHostWorkloadFingerprint_MovesWithTheHostsWorkloads(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	fp := func() string {
+		t.Helper()
+		s, err := HostWorkloadFingerprint(ctx, db, "h1")
+		if err != nil {
+			t.Fatalf("HostWorkloadFingerprint: %v", err)
+		}
+		return s
+	}
+	for _, vm := range []VMRecord{
+		{Name: "a", HostName: "h1", State: "running", Spec: "{}", CPUActual: 1, MemActual: 1024},
+		{Name: "b", HostName: "h1", State: "running", Spec: "{}", CPUActual: 1, MemActual: 512},
+		{Name: "elsewhere", HostName: "h2", State: "running", Spec: "{}", CPUActual: 1, MemActual: 512},
+	} {
+		if err := InsertVM(ctx, db, vm, nil, nil); err != nil {
+			t.Fatalf("InsertVM %s: %v", vm.Name, err)
+		}
+	}
+	if err := UpsertContainer(ctx, db, ContainerRecord{HostName: "h1", Name: "ct", State: "running", MemMiB: 256}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+	prev := fp()
+	if prev == "" {
+		t.Fatal("empty fingerprint for a host with workloads")
+	}
+	step := func(what string, change func() error, wantMoved bool) {
+		t.Helper()
+		if err := change(); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		now := fp()
+		if moved := now != prev; moved != wantMoved {
+			t.Errorf("%s: fingerprint moved=%v, want %v", what, moved, wantMoved)
+		}
+		prev = now
+	}
+	step("another host's VM changes state", func() error {
+		return UpdateVMState(ctx, db, "elsewhere", "stopped", "")
+	}, false)
+	step("a VM here starts migrating", func() error {
+		return UpdateVMState(ctx, db, "a", "migrating", "→ h2")
+	}, true)
+	step("the VM's state detail alone changes", func() error {
+		return db.Execute(ctx, `UPDATE vms SET state_detail = 'converging' WHERE name = 'a'`)
+	}, false)
+	step("the VM leaves for h2", func() error {
+		return UpdateVMHost(ctx, db, "a", "h2", "running")
+	}, true)
+	step("a VM arrives here", func() error {
+		return UpdateVMHost(ctx, db, "elsewhere", "h1", "running")
+	}, true)
+	step("a VM here is resized", func() error {
+		return db.Execute(ctx, `UPDATE vms SET mem_actual = 2048 WHERE name = 'b'`)
+	}, true)
+	step("a VM here is deleted", func() error {
+		return DeleteVM(ctx, db, "b")
+	}, true)
+	step("a container here stops", func() error {
+		return db.Execute(ctx, `UPDATE containers SET state = 'stopped' WHERE name = 'ct'`)
+	}, true)
+	step("a container here is re-capped", func() error {
+		return db.Execute(ctx, `UPDATE containers SET memory_mib = 512 WHERE name = 'ct'`)
+	}, true)
+}

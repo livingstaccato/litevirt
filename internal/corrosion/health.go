@@ -2,6 +2,8 @@ package corrosion
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -373,6 +375,30 @@ func UpsertHostCapacityObservation(ctx context.Context, c *Client, o HostCapacit
 		o.HostName, o.DBCPU, o.DBMemMiB, o.ExtraCPU, o.ExtraMemMiB,
 		o.EffectiveCPU, o.EffectiveMemMiB, complete, o.Detail, o.SampledAt,
 		healthConditionCreatedAt, now)
+}
+
+// HostWorkloadFingerprint summarises the database's record of the workloads on
+// host that a capacity sample charges: each VM's state and actuals, and each
+// container's state and memory cap. It changes when a workload arrives, leaves,
+// changes state or is resized, so the host's capacity sampler knows its last
+// observation may no longer hold.
+func HostWorkloadFingerprint(ctx context.Context, c *Client, host string) (string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT 'vm' AS kind, name, state, cpu_actual AS cpu, mem_actual AS mem
+		   FROM vms WHERE deleted_at IS NULL AND host_name = ?
+		 UNION ALL
+		 SELECT 'ct' AS kind, name, state, 0 AS cpu, memory_mib AS mem
+		   FROM containers WHERE deleted_at IS NULL AND host_name = ?
+		 ORDER BY kind, name`, host, host)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	for _, r := range rows {
+		fmt.Fprintf(h, "%s\x00%s\x00%s\x00%d\x00%d\n",
+			r.String("kind"), r.String("name"), r.String("state"), r.Int("cpu"), r.Int("mem"))
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // GetHostCapacityObservation reads one host's sample; ok=false when the host

@@ -62,7 +62,8 @@ const specVersionWriteSQL = `UPDATE vms SET spec = ?, active_operation_id = ? WH
 
 // specConflictAE adjusts decision for a live incoming VM row against the live
 // local row. row is the incoming row; when the local version wins at one
-// generation its spec and barrier cells are replaced with the local ones.
+// generation its spec and barrier cells are replaced with the local ones. The
+// version kept holds the firewall identity siblingFirewallID gives it.
 func (c *Client) specConflictAE(tx *sql.Tx, table syncTable, row []interface{}, incoming workloadMergeAuthority, decision mergeAuthorityDecision) (mergeAuthorityDecision, error) {
 	if !incoming.valid {
 		return decision, nil
@@ -161,9 +162,18 @@ func (c *Client) specConflictAE(tx *sql.Tx, table syncTable, row []interface{}, 
 	if ferr != nil {
 		return mergeAuthorityKeepLocal, ferr
 	}
-	winSpec, winOp := local.spec, local.activeOp
+	winSpec, winOp, loseSpec := local.spec, local.activeOp, incoming.spec
 	if inWins {
-		winSpec, winOp = incoming.spec, incoming.activeOperationID
+		winSpec, winOp, loseSpec = incoming.spec, incoming.activeOperationID, local.spec
+	}
+	// The kept version holds the workload's firewall identity, whichever
+	// sibling carried it (siblingFirewallID).
+	keepID, err := siblingFirewallID(ctx, tx, incoming.name, winSpec, loseSpec)
+	if err != nil {
+		return mergeAuthorityKeepLocal, err
+	}
+	if winSpec, err = keepFirewallID(TagMemberVM, winSpec, keepID); err != nil {
+		return mergeAuthorityKeepLocal, err
 	}
 	if winOp != "" && finished(winOp) {
 		winOp = "" // a finished operation leaves no barrier behind

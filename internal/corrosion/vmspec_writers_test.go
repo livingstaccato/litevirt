@@ -44,10 +44,12 @@ var sanctionedSpecWriters = map[string]string{
 	"validateGuardedVMReplaceEntry": "fingerprints the exact guarded-replace batch envelope; " +
 		"it does not execute a write",
 	"specConflictAE": "the anti-entropy merge's resolution of two versions of a spec at one generation " +
-		"(spec_conflict_ae.go): it writes the version both lanes keep, one a stamped writer made",
+		"(spec_conflict_ae.go): it writes the version both lanes keep, one a stamped writer made, " +
+		"holding the firewall identity siblingFirewallID gives it",
 	"takeSiblingSpecEdit": "the WAL apply of a received spec edit over a sibling at its generation " +
 		"(spec_conflict_apply.go): it replays an edit MutateDesiredSpec or BeginVMOperation made on " +
-		"its origin, under that edit's own generation and barrier guards",
+		"its origin, under that edit's own generation and barrier guards, or keeps the local one; " +
+		"either holds the firewall identity siblingFirewallID gives it",
 }
 
 // TestSpecWritersAreSanctioned fails if any function in the corrosion package

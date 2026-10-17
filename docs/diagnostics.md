@@ -1104,6 +1104,13 @@ restarted daemon's first pass, and `lv cluster converge` pull regardless.
 Resolve an unresolved row by making one side authoritative with a fresh write —
 which clears the tracking and lets the table converge.
 
+A `control_plane` tie on a `hosts` row is not cleared by `lv host config` or
+any other write to the row: each applies to both copies. Once
+`release_2026_11_v1` has latched, run `lv host rm <name>` and then `lv host add`
+for the machine; the re-admission is a later incarnation of the row and every
+node keeps it ([upgrades.md](upgrades.md)). The host does not need to be
+reachable.
+
 ### VM ownership ties — automatic and manual repair
 
 A `vms.host_name` split is the runtime-owned category: the resolver keeps it
@@ -2044,6 +2051,47 @@ itself. If no node will ever hold the history, removing `<pki_dir>/audit-rejoin.
 on the host and restarting its daemon ends the hold at the cost of a permanent
 fork finding for that host
 ([audit-log.md](audit-log.md#rebuilding-a-host-under-its-old-name)).
+
+### Own row held (`own_row_held`)
+
+A daemon raises `own_row_held` about **itself** while it makes no write to its
+own `hosts` row, because that row is not the cluster's admission for the
+certificate the daemon serves ([upgrades.md](upgrades.md)). Its boot report,
+address correction and certificate re-record wait; replication and its gRPC
+server run.
+
+| Raised when | Clears when |
+|---|---|
+| At start or at runtime, the host's own row is live and names a serial other than the installed certificate's (evidence `arm` `a`), or is removed (`arm` `b`). Re-raised once a minute while held. **Warning**. The evidence carries `reason` (`at_start`; `superseded`: another admission replaced the row; `removed`), `held_for`, `timed_out`, `installed_serial` and `recorded_serial`. | The host's own row is live and names the installed certificate's serial. |
+
+After ten minutes the hold reports `timed_out` and the daemon makes the writes
+it made before the hold existed. A cluster that holds a later incarnation of
+the row refuses them.
+
+**`reason` `at_start`** is a host re-added while its data directory still held
+its old database, or a host whose certificate was renewed while it was down.
+It clears once the host's replica receives the re-admission from a peer. If it
+does not clear, check that a peer is reachable from the host and that the
+peer's `lv host inspect <name>` shows the installed serial.
+
+**`reason` `superseded`** is a host whose admission another `lv host add` of
+the same name replaced. Peers no longer accept its certificate. To recover:
+
+1. On the superseded machine, read `installed_serial` and `recorded_serial`
+   from `lv health`. On another node, `lv host inspect <name>` shows the
+   recorded serial.
+2. Stop the litevirt daemon on the superseded machine, outside the cluster,
+   and confirm that its workloads are stopped.
+3. If the machine that holds the recorded serial is the one to keep, wipe the
+   superseded machine's data directory before adding it under any name.
+4. If no machine holds the recorded serial, or it is the machine to remove,
+   run `lv host rm --dead <name>` only after step 2 is confirmed, then run
+   `lv host add` for the machine to keep. `lv host add` is refused while
+   workloads are still recorded on the name; `lv health` shows
+   `ha.claim.stranded` for any the failover coordinator cannot recover.
+
+**`reason` `removed`** is a host removed while its daemon runs. It clears if
+the host is re-added and its re-admission reaches it.
 
 ### Audit replica not seeded (`audit_not_seeded`)
 

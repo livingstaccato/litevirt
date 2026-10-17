@@ -21,33 +21,38 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-// newGossipClient starts a gossip client bound to bind:port. With port 0 it
-// takes a free port and retries the bind: freePort only proves a port was free
-// for TCP on 127.0.0.1 a moment ago, and memberlist binds TCP and UDP on the
-// configured address afterwards, so another socket -- this binary's other
-// nodes, a parallel package, anything on the machine -- can hold either one
-// by then. The port the client got is c.list.LocalNode().Port.
-func newGossipClient(t *testing.T, name, bind, advertise string, port int, join []string) *Client {
+// newClientOnFreePort runs NewClient with cfg on a port freePort picks, and on
+// another one when that bind is refused as in use. freePort only proves a port
+// was free for TCP on 127.0.0.1 a moment ago; memberlist binds TCP and UDP on
+// cfg.BindAddr afterwards, so another socket -- this binary's other nodes, a
+// parallel package, anything on the machine -- can hold either one by then.
+// cfg.BindPort is ignored. An empty cfg.DataDir gets a fresh directory per
+// attempt (a refused bind closes what NewClient opened). The port the client
+// got is c.list.LocalNode().Port. Any other error, or the last attempt's, is
+// returned for the caller to judge.
+func newClientOnFreePort(t *testing.T, cfg Config) (*Client, error) {
 	t.Helper()
-	cfg := Config{
+	freshDir := cfg.DataDir == ""
+	for attempt := 1; ; attempt++ {
+		if freshDir {
+			cfg.DataDir = t.TempDir()
+		}
+		cfg.BindPort = freePort(t)
+		c, err := NewClient(cfg, hlc.NewClock(cfg.HostName))
+		if err == nil || attempt == 8 || !strings.Contains(err.Error(), "address already in use") {
+			return c, err
+		}
+	}
+}
+
+func newGossipClient(t *testing.T, name, bind, advertise string, join []string) *Client {
+	t.Helper()
+	c, err := newClientOnFreePort(t, Config{
 		HostName:      name,
 		BindAddr:      bind,
 		AdvertiseAddr: advertise,
-		BindPort:      port,
 		JoinPeers:     join,
-	}
-	var c *Client
-	var err error
-	for attempt := 0; attempt < 8; attempt++ {
-		cfg.DataDir = t.TempDir()
-		if port == 0 {
-			cfg.BindPort = freePort(t)
-		}
-		c, err = NewClient(cfg, hlc.NewClock(name))
-		if err == nil || port != 0 || !strings.Contains(err.Error(), "address already in use") {
-			break
-		}
-	}
+	})
 	if err != nil {
 		t.Fatalf("NewClient %s: %v", name, err)
 	}
@@ -71,9 +76,9 @@ func TestAdvertiseAddr_IsWhatPeersSee(t *testing.T) {
 	// auto-detection could never produce. Binding 127.0.0.1 instead would make
 	// this test vacuous: auto-detect derives the advertise address from a
 	// specific BindAddr, so it would report 127.0.0.1 with the wiring removed too.
-	a := newGossipClient(t, "node-a", "0.0.0.0", "127.0.0.1", 0, nil)
+	a := newGossipClient(t, "node-a", "0.0.0.0", "127.0.0.1", nil)
 	portA := int(a.list.LocalNode().Port)
-	b := newGossipClient(t, "node-b", "127.0.0.1", "127.0.0.1", 0,
+	b := newGossipClient(t, "node-b", "127.0.0.1", "127.0.0.1",
 		[]string{net.JoinHostPort("127.0.0.1", itoa(portA))})
 
 	// Gossip converges asynchronously.

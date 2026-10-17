@@ -410,3 +410,40 @@ func GetReplicationCheckpoint(ctx context.Context, c *Client, vmName, repo strin
 	}
 	return rows[0].String("checkpoint"), nil
 }
+
+// VMScheduleOrphanGrace is how long a vm-scoped schedule is kept after its
+// VM's tombstone: it covers a rebuild, re-create or cutover in flight, which
+// leaves the name with no live row for a moment, as firewallTagsOrphanGrace
+// does for the VM's firewall tags.
+const VMScheduleOrphanGrace = 24 * time.Hour
+
+// OrphanedVMSchedules returns the live vm-scoped schedules, backup and
+// replication, of a VM that was deleted: the vms row of the name is a
+// tombstone whose deletion is at least grace before now, and the schedule
+// was last written no later than that tombstone (LWW order). A schedule
+// written after the tombstone belongs to a re-create of the name, and a
+// schedule of a name with no vms row at all — one replicated ahead of its
+// VM, or added before the VM is made — is not an orphan. Only VMName and
+// Repo are set.
+func OrphanedVMSchedules(ctx context.Context, c *Client, now time.Time, grace time.Duration) ([]BackupScheduleRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT s.vm_name, s.repo, s.updated_at AS schedule_at, v.updated_at AS vm_at, v.deleted_at AS vm_deleted
+		 FROM backup_schedules s JOIN vms v ON v.name = s.vm_name
+		 WHERE s.deleted_at IS NULL AND v.deleted_at IS NOT NULL
+		   AND COALESCE(s.scope, 'vm') IN ('vm', '') AND COALESCE(s.pool_name, '') = ''`)
+	if err != nil {
+		return nil, fmt.Errorf("orphaned vm schedules: %w", err)
+	}
+	var out []BackupScheduleRecord
+	for _, r := range rows {
+		deleted, ok := ParseUpdatedAt(r.String("vm_deleted"))
+		if !ok || now.Sub(deleted) < grace {
+			continue
+		}
+		if lwwOrder(r.String("schedule_at"), r.String("vm_at")) > 0 {
+			continue
+		}
+		out = append(out, BackupScheduleRecord{VMName: r.String("vm_name"), Repo: r.String("repo"), Scope: "vm"})
+	}
+	return out, nil
+}

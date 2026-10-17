@@ -3059,6 +3059,15 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			fwID = corrosion.FirewallIDOf(corrosion.TagMemberVM, vm.Spec)
 		}
 	}
+	// A plain delete ends the VM's own schedules too (deleteVMSchedules), on
+	// the same terms, and never on a host a peer called: an entry on an older
+	// build forwards a re-create's delete with no marker. A blue-green
+	// cutover's delete of the blue keeps them (withSchedulesKept).
+	dropSchedules := false
+	if !deleteLocalOnly(ctx) && !hasDeletedVMSink(ctx) && !schedulesKept(ctx) && !s.forwardedByEntry(ctx) && !s.isRemotePeer(ctx) {
+		vm, err := corrosion.GetVM(ctx, s.db, req.Name)
+		dropSchedules = err == nil && vm != nil
+	}
 	if !deleteLocalOnly(ctx) && !s.isRemotePeer(ctx) && !isRecreateDelete(ctx) {
 		if vm, err := corrosion.GetVM(ctx, s.db, req.Name); err == nil && vm != nil {
 			createdAt = vm.CreatedAt
@@ -3089,6 +3098,9 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// A deleted VM's partial-recovery marker goes with it (review N5).
 		s.clearPromotedPartial(ctx, req.Name)
 		s.clearDeletedFirewallTags(ctx, corrosion.TagMemberVM, "", req.Name, fwID)
+		if dropSchedules {
+			s.deleteVMSchedules(context.WithoutCancel(ctx), req.Name)
+		}
 	}
 	if err == nil && len(luns) > 0 && !s.lunPlainDeleteRecordable(ctx) &&
 		s.ReleaseFeatureAvailable(capabilities.FeatureISCSILUNClaim) {

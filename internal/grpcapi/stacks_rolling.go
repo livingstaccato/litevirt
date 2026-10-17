@@ -217,8 +217,11 @@ func (o *serverOps) ApplyLiveMetadata(ctx context.Context, name string, desired 
 	return o.s.applyLiveMetadata(ctx, name, desired, fields)
 }
 
+// DeleteVM is the blue-green cutover's delete (of the blue, or of a green
+// rolled back). It keeps the VM's schedules, as main did: the stack's VM
+// serves on under the other name.
 func (o *serverOps) DeleteVM(ctx context.Context, name string) error {
-	if _, err := o.s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: name}); err != nil && status.Code(err) != codes.NotFound {
+	if _, err := o.s.DeleteVM(withSchedulesKept(ctx), &pb.DeleteVMRequest{Name: name}); err != nil && status.Code(err) != codes.NotFound {
 		return err
 	}
 	return nil

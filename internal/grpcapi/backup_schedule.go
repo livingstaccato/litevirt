@@ -7,6 +7,7 @@ package grpcapi
 
 import (
 	"context"
+	"log/slog"
 	"strconv"
 
 	"google.golang.org/grpc/codes"
@@ -209,6 +210,47 @@ func (s *Server) DeleteBackupSchedule(ctx context.Context, req *pb.DeleteBackupS
 		return nil, status.Errorf(codes.Internal, "delete schedule: %v", err)
 	}
 	return &emptypb.Empty{}, nil
+}
+
+// schedulesKeptKey marks a DeleteVM whose VM's schedules stay
+// (withSchedulesKept).
+type schedulesKeptKey struct{}
+
+// withSchedulesKept marks a delete that keeps the deleted VM's schedules: a
+// blue-green cutover's delete of the blue, whose green serves in its place.
+func withSchedulesKept(ctx context.Context) context.Context {
+	return context.WithValue(ctx, schedulesKeptKey{}, true)
+}
+
+// schedulesKept reports whether ctx carries withSchedulesKept.
+func schedulesKept(ctx context.Context) bool {
+	kept, _ := ctx.Value(schedulesKeptKey{}).(bool)
+	return kept
+}
+
+// deleteVMSchedules tombstones the vm-scoped schedules, backup and
+// replication, of name: DeleteVM calls it once a plain delete of the VM has
+// succeeded, so no schedule is left firing for a VM that is gone, or keeping
+// a torn-down stack's backup repo registered (DeleteStackBackupRepos). A
+// rebuild, re-create or cutover keeps them: the VM of the name comes back. A
+// failure is logged and leaves the row to the orphan sweep
+// (sweepVMScheduleOrphans); the delete has happened.
+func (s *Server) deleteVMSchedules(ctx context.Context, name string) {
+	rows, err := corrosion.ListBackupSchedules(ctx, s.db)
+	if err != nil {
+		slog.Warn("delete: could not read the deleted VM's schedules; the orphan sweep removes them", "vm", name, "error", err)
+		return
+	}
+	for _, r := range rows {
+		if r.Scope != "vm" || r.VMName != name || r.PoolName != "" {
+			continue
+		}
+		if err := s.deleteScheduleRow(ctx, r.VMName, r.Repo); err != nil {
+			slog.Warn("delete: could not remove the deleted VM's schedule; the orphan sweep removes it", "vm", name, "repo", r.Repo, "error", err)
+			continue
+		}
+		slog.Info("delete: removed the deleted VM's schedule", "vm", name, "repo", r.Repo, "type", r.Type)
+	}
 }
 
 func scheduleToPB(r corrosion.BackupScheduleRecord) *pb.BackupSchedule {

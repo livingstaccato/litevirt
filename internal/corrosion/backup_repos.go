@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"time"
 )
 
 // GetBackupRepo returns the live registration of name, or nil if there is
@@ -146,15 +147,27 @@ func DeleteStackBackupRepos(ctx context.Context, c *Client, stack string, read S
 	return nil
 }
 
-// scheduledBackupRepos is the set of repo names a live backup schedule names.
+// scheduledBackupRepos is the set of repo names a live backup schedule names,
+// leaving out the schedules of a deleted VM (OrphanedVMSchedules): those fire
+// for nothing, and the orphan sweep removes them.
 func scheduledBackupRepos(ctx context.Context, c *Client) (map[string]bool, error) {
-	rows, err := c.Query(ctx, `SELECT DISTINCT repo FROM backup_schedules WHERE deleted_at IS NULL`)
+	rows, err := c.Query(ctx, `SELECT vm_name, repo FROM backup_schedules WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
+	orphans, err := OrphanedVMSchedules(ctx, c, time.Now(), VMScheduleOrphanGrace)
+	if err != nil {
+		return nil, err
+	}
+	orphaned := make(map[[2]string]bool, len(orphans))
+	for _, o := range orphans {
+		orphaned[[2]string{o.VMName, o.Repo}] = true
+	}
 	out := make(map[string]bool, len(rows))
 	for _, r := range rows {
-		out[r.String("repo")] = true
+		if !orphaned[[2]string{r.String("vm_name"), r.String("repo")}] {
+			out[r.String("repo")] = true
+		}
 	}
 	return out, nil
 }

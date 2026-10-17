@@ -49,6 +49,7 @@ func (s *Server) runReleaseUseSweep(ctx context.Context, every time.Duration, pr
 		case <-t.C:
 			s.sweepReleaseUses(ctx, probes)
 			s.sweepFirewallTagOrphans(ctx, time.Now())
+			s.sweepVMScheduleOrphans(ctx, time.Now())
 		}
 	}
 }
@@ -136,4 +137,34 @@ func (s *Server) sweepFirewallTagOrphans(ctx context.Context, now time.Time) {
 	}); err != nil {
 		slog.Info("firewall tags sweep: the release gate refused; retrying next sweep", "error", err)
 	}
+}
+
+// sweepVMScheduleOrphans is the vm-schedule orphan sweep: on the failover
+// lease holder, it tombstones every schedule corrosion.OrphanedVMSchedules
+// selects at now — a schedule of a VM deleted more than
+// VMScheduleOrphanGrace ago, written no later than its tombstone. A delete
+// removes the VM's schedules itself (deleteVMSchedules); this clears what a
+// delete left: one by an older build, or one that failed to remove them.
+func (s *Server) sweepVMScheduleOrphans(ctx context.Context, now time.Time) {
+	held, err := corrosion.IsLeaseHolder(ctx, s.db, corrosion.LeaseKeyFailover, s.hostName, time.Now())
+	if err != nil || !held {
+		return
+	}
+	orphans, err := corrosion.OrphanedVMSchedules(ctx, s.db, now, corrosion.VMScheduleOrphanGrace)
+	if err != nil {
+		slog.Warn("schedule sweep: could not read the schedules of deleted VMs", "error", err)
+		return
+	}
+	for _, o := range orphans {
+		if err := s.deleteScheduleRow(ctx, o.VMName, o.Repo); err != nil {
+			slog.Warn("schedule sweep: could not remove the schedule of a deleted VM", "vm", o.VMName, "repo", o.Repo, "error", err)
+			continue
+		}
+		slog.Info("schedule sweep: removed the schedule of a deleted VM", "vm", o.VMName, "repo", o.Repo)
+	}
+}
+
+// SweepVMScheduleOrphansForTest runs one pass of the vm-schedule orphan sweep.
+func (s *Server) SweepVMScheduleOrphansForTest(ctx context.Context, now time.Time) {
+	s.sweepVMScheduleOrphans(ctx, now)
 }

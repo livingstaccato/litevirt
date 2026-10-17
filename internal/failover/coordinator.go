@@ -238,6 +238,9 @@ type Coordinator struct {
 	// cycleCandidates is the set of fence candidates of the current cycle,
 	// for the stall alert's default reason.
 	cycleCandidates map[string]bool
+	// upgradingLives is, per host, the last span this holder saw it recorded
+	// 'upgrading' (noteUpgradingLives, upgradingLifeGrace).
+	upgradingLives map[string]UpgradingLife
 	// holdReason is, per host, why its recovery last did not proceed; the
 	// stall alert names it (alertStalledRecoveries).
 	holdReason map[string]string
@@ -599,6 +602,42 @@ func (c *Coordinator) restartingWithinAllowance(ctx context.Context, host string
 	return within
 }
 
+// noteUpgradingLives records, from each host's membership state this cycle,
+// the span it was last recorded 'upgrading': its start while it lasts, and the
+// activation that ended it, read on the first cycle that sees the host active
+// after it. A life that ended in any state but active, or a later activation,
+// is forgotten. An unreadable state keeps what was known. It is in memory
+// only: a coordinator that did not see a host 'upgrading' (a new lease holder,
+// a restart) knows of no life, and gives its runs afreshRun as before.
+func (c *Coordinator) noteUpgradingLives(ctx context.Context) {
+	states, err := corrosion.HostsStateSince(ctx, c.db)
+	if err != nil {
+		return
+	}
+	if c.upgradingLives == nil {
+		c.upgradingLives = map[string]UpgradingLife{}
+	}
+	for host, life := range c.upgradingLives {
+		st, ok := states[host]
+		switch {
+		case !ok:
+			delete(c.upgradingLives, host)
+		case st.State == "upgrading":
+		case st.State == "active" && life.End.IsZero() && st.Since.After(life.Start):
+			life.End = st.Since
+			c.upgradingLives[host] = life
+		case st.State == "active" && life.End.Equal(st.Since):
+		default:
+			delete(c.upgradingLives, host)
+		}
+	}
+	for host, st := range states {
+		if st.State == "upgrading" {
+			c.upgradingLives[host] = UpgradingLife{Start: st.Since}
+		}
+	}
+}
+
 // upgradingTimeout is how long a host recorded 'upgrading' is skipped.
 func (c *Coordinator) upgradingTimeout() time.Duration {
 	if c.UpgradingTimeout > 0 {
@@ -906,8 +945,10 @@ func (c *Coordinator) run(ctx context.Context) {
 	// The count itself is FenceCandidates, a pure function of these inputs,
 	// so the HA arm handler's list of down hosts is this decision exactly
 	// (CurrentFenceCandidates). The side effects stay here.
+	c.noteUpgradingLives(ctx)
 	in := CandidateInputs{Self: c.hostName, RegionScope: c.scope.region, Voters: vr, Now: now,
-		Observations: obs, ActiveSince: activeSince, UpgradingTimeout: c.upgradingTimeout()}
+		Observations: obs, ActiveSince: activeSince, UpgradingTimeout: c.upgradingTimeout(),
+		UpgradingLives: c.upgradingLives}
 	readFenceTimes(ctx, c.db, &in)
 	candidates, declinedList := FenceCandidates(in)
 	// Region scope: say so when the cluster-wide count would have fenced a
@@ -1391,6 +1432,9 @@ func (c *Coordinator) stepDownGauges() {
 	// The stall alert is the leader's too: a node that takes the lease back
 	// starts its clocks afresh rather than alerting on a stale one.
 	c.stallSince, c.stallAlerted, c.stallUnfenced, c.holdReason = nil, nil, nil, nil
+	// So are the upgrading lives it saw: a later tenure has not seen what
+	// happened meanwhile.
+	c.upgradingLives = nil
 }
 
 // dropLeaseTerm records that this coordinator cannot show it holds the
@@ -1439,6 +1483,7 @@ func (c *Coordinator) forgetEpisodes() {
 	c.retryNotified, c.retryRefusedLogged = nil, nil
 	c.resumeDeclined, c.confirmStale, c.notRelying = nil, nil, nil
 	c.stallSince, c.stallAlerted, c.stallUnfenced, c.holdReason = nil, nil, nil, nil
+	c.upgradingLives = nil
 }
 
 // resolvePendingRelocations re-derives every relocate-restore marker in the

@@ -40,8 +40,19 @@ type CandidateInputs struct {
 	// inherited-run grace needs them for (fenceTimesNeeded).
 	FenceTimes map[string][]time.Time
 	// UpgradingTimeout is the allowance a host fenced inside a failing run it
-	// has since come back from gets (inheritedRunGrace).
+	// has since come back from gets (inheritedRunGrace), and the restart
+	// allowance UpgradingLives extends.
 	UpgradingTimeout time.Duration
+	// UpgradingLives is, per host, the last span the deciding node saw it
+	// recorded 'upgrading' (upgradingLifeGrace). nil: none.
+	UpgradingLives map[string]UpgradingLife
+}
+
+// UpgradingLife is a span a host was recorded 'upgrading', as the deciding
+// coordinator saw it: from its 'upgrading' write (Start) to the activation
+// that ended it (End; zero while it lasts).
+type UpgradingLife struct {
+	Start, End time.Time
 }
 
 // FenceCandidate is a host enough fresh voters report down.
@@ -117,7 +128,8 @@ func countVoters(in CandidateInputs) (fresh, cluster map[string]map[string]struc
 			continue
 		}
 		if since, has := in.ActiveSince[o.Target]; has && !countedSinceActiveWithin(o.Failures, o.LastSeen, inst, since,
-			inheritedRunGraceFrom(in.FenceTimes[o.Target], since, in.UpgradingTimeout)) {
+			longerGrace(inheritedRunGraceFrom(in.FenceTimes[o.Target], since, in.UpgradingTimeout),
+				upgradingLifeGrace(in.UpgradingLives[o.Target], since, in.UpgradingTimeout))) {
 			continue
 		}
 		if q.region && countsAsVote(in.Voters.Voters, o.Observer, o.Target) {
@@ -162,6 +174,39 @@ func inheritedRunGraceFrom(times []time.Time, since time.Time, upgrading time.Du
 			}
 		}
 		return afreshRun
+	}
+}
+
+// upgradingLifeGrace is the allowance of a failing run that began while the
+// host was recorded 'upgrading', when the activation at `since` is the one that
+// ended that life: the rest of the restart allowance (upgrading, from the
+// 'upgrading' write), and never less than afreshRun. Any other run gets
+// afreshRun.
+//
+// Only the host records itself active once it serves, and its observers'
+// runs then break. Anything else that records it active mid-restart — an
+// operator's undrain handled by a node without the serving check — would
+// otherwise leave it afreshRun before a fence on the failing run left from
+// its stop (lab 1, 2026-10-17: fenced 19 s after the undrain, 0.4 s after its
+// gRPC server listened). It is never fenced later than it would have been
+// had it stayed 'upgrading': once Start+upgrading has passed, a host that
+// still does not answer is fenced as one stuck 'upgrading' is.
+func upgradingLifeGrace(life UpgradingLife, since time.Time, upgrading time.Duration) func(time.Time) time.Duration {
+	return func(runStart time.Time) time.Duration {
+		if life.Start.IsZero() || !life.End.Equal(since) || runStart.Before(life.Start.Add(-fenceSkewMargin)) {
+			return afreshRun
+		}
+		if left := life.Start.Add(upgrading).Sub(since); left > afreshRun {
+			return left
+		}
+		return afreshRun
+	}
+}
+
+// longerGrace is the longer of two run allowances.
+func longerGrace(a, b func(time.Time) time.Duration) func(time.Time) time.Duration {
+	return func(runStart time.Time) time.Duration {
+		return max(a(runStart), b(runStart))
 	}
 }
 

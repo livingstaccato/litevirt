@@ -60,7 +60,7 @@ func (s *Server) firmwareMoveStopRefusal(vm *corrosion.VMRecord) error {
 	}
 	return status.Errorf(codes.FailedPrecondition,
 		"%s; it is left running until the move ends, or, if the move is parked, until the action its "+
-			"firmware_migration condition names resolves it (the D-5 firmware-move doctor). A host drain or "+
+			"firmware_migration condition names resolves it (the D-5 firmware-move doctor). A "+
 			"shutdown-workloads reports this VM and goes on with the others", status.Convert(err).Message())
 }
 

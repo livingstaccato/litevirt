@@ -200,6 +200,15 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// runtime-only load (invalidateInventoryCache; P-3 of lab 2 run c2). An
 	// adopted migration drops it again when it finishes.
 	defer s.invalidateInventoryCache()
+	// A VM a live firmware move's record names here is not moved, by any
+	// strategy (spec §6.9, §9). A live move is refused again by stage A
+	// item 5; a cold one would hand the row to a third host, away from the
+	// parked move's records and the start veto they hold. Drain's cold
+	// moves enter here too. A move in progress writes its marker below this
+	// point, and the adopter and recovery never re-enter here.
+	if err := s.firmwareMoveRefusal("migrate", vm); err != nil {
+		return err
+	}
 	// A failback move is conditional on the VM still being where the drain left
 	// it, judged here, by its owner under its lock (failback.go).
 	if req.GetExpectDrainRecord() {

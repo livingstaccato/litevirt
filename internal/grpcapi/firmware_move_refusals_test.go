@@ -595,3 +595,77 @@ func TestFirmwareMove_ScheduledJobsSkip(t *testing.T) {
 		})
 	}
 }
+
+// D2-14 review I-1 (spec §6.9, §9): no migration of a VM a live firmware
+// move's marker names here, whatever the strategy. Under a parked move whose
+// source guest was shut down from inside (the stop sync records `stopped`),
+// a cold move would hand the row to a third host, cut off from the move's
+// records and their start veto. Drain's cold path enters the same way.
+//
+// Mutation: remove the refusal at migrateOwnedVM's entry — red.
+func TestMigrateVM_ColdRefusedUnderMarker(t *testing.T) {
+	ctx := adminCtx()
+	for _, phase := range []fwmig.Phase{fwmig.PhaseTargetRan, fwmig.PhaseTargetUnreachable} {
+		t.Run(string(phase)+"/migrate_cold", func(t *testing.T) {
+			f := newFRFixture(t, "stopped", libvirtfake.StateShutdown)
+			if err := corrosion.InsertHost(ctx, f.s.db, corrosion.HostRecord{Name: "dst-host", Address: "10.0.0.2", State: "active",
+				CPUTotal: 8, MemTotal: 16384}); err != nil {
+				t.Fatal(err)
+			}
+			f.marker(phase)
+			err := f.s.MigrateVM(&pb.MigrateVMRequest{VmName: "os1", TargetHost: "dst-host", Strategy: pb.MigrateStrategy_MIGRATE_COLD},
+				&progressStream[pb.MigrateProgress]{ctx: ctx})
+			f.requireEntryRefusal(err)
+			f.requireKept(libvirtfake.StateShutdown)
+			if row, _ := corrosion.GetVM(ctx, f.s.db, "os1"); row == nil || row.HostName != f.s.hostName || row.State != "stopped" {
+				t.Fatalf("row %+v, want stopped on %s", row, f.s.hostName)
+			}
+		})
+		t.Run(string(phase)+"/drain_cold", func(t *testing.T) {
+			f := newFRFixture(t, "stopped", libvirtfake.StateShutdown)
+			dst := corrosion.HostRecord{Name: "dst-host", Address: "10.0.0.2", State: "active", CPUTotal: 8, MemTotal: 16384}
+			if err := corrosion.InsertHost(ctx, f.s.db, dst); err != nil {
+				t.Fatal(err)
+			}
+			f.marker(phase)
+			row, _ := corrosion.GetVM(ctx, f.s.db, "os1")
+			adopted := false
+			p := f.s.drainStoppedVM(ctx, row, dst, func() {}, &adopted)
+			if p.Status != "failed" || !strings.Contains(p.Error, "refused on "+f.s.hostName) || !strings.Contains(p.Error, frAttempt) {
+				t.Fatalf("drain progress %+v, want failed with the entry refusal", p)
+			}
+			f.requireKept(libvirtfake.StateShutdown)
+		})
+	}
+	// An unmarked firmware VM's cold move is not stopped by this refusal (it
+	// goes on, and fails or not on its own terms).
+	t.Run("unmarked_control", func(t *testing.T) {
+		f := newFRFixture(t, "stopped", libvirtfake.StateShutdown)
+		err := f.s.MigrateVM(&pb.MigrateVMRequest{VmName: "os1", TargetHost: "dst-host", Strategy: pb.MigrateStrategy_MIGRATE_COLD},
+			&progressStream[pb.MigrateProgress]{ctx: ctx})
+		if err != nil && strings.Contains(status.Convert(err).Message(), "refused on "+f.s.hostName) {
+			t.Fatalf("an unmarked VM's cold move was refused as a firmware move: %v", err)
+		}
+	})
+}
+
+// D2-14 review m-1: CutoverVM refuses when the record names the replacement
+// (-next) VM, not only the replaced one.
+//
+// Mutation: remove the -next check — red.
+func TestCutoverVM_RefusesRecordOnNext(t *testing.T) {
+	ctx := adminCtx()
+	f := newFRFixture(t, "running", libvirtfake.StateRunning)
+	enableVMReplace(f.s)
+	const nextUUID = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+	insertTestVMWithSpec(t, ctx, f.s.db, "os1-next", f.s.hostName, "running", `{"name":"os1-next","uuid":"`+nextUUID+`"}`)
+	h := fwmig.Hold{VM: "os1-next", Binding: fwmig.Binding{UUID: nextUUID, CreatedAt: "2026-10-17T00:00:00Z", Attempt: frAttempt},
+		Source: "src-host", Since: time.Now().UTC(), State: fwmig.HoldReleasedUnconfirmed, TPM: true, UEFI: true,
+		NvramMaterialised: fwmig.NvramDone}
+	if err := f.recs.PutHold(h); err != nil {
+		t.Fatal(err)
+	}
+	_, err := f.s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "os1"})
+	f.requireEntryRefusal(err)
+	f.requireKept(libvirtfake.StateRunning)
+}

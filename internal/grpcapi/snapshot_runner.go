@@ -66,6 +66,9 @@ func (r *backupRunner) RunBackup(ctx context.Context, sched corrosion.BackupSche
 	r.server.recordVMEvent(ctx, sched.VMName, "backup.started", "ok", "scheduled → "+sched.Repo)
 	err := r.runBackupInner(ctx, sched, runAt)
 	if errors.Is(err, errFirmwareMoveSkipped) {
+		// A move began between the check above and the VM lock: the
+		// started event gets its end.
+		r.server.recordVMEvent(ctx, sched.VMName, "backup.skipped", "ok", err.Error())
 		return nil
 	}
 	if err != nil {

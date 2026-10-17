@@ -3053,6 +3053,7 @@ func (s *Server) deleteOfNoLiveRow(ctx context.Context, req *pb.DeleteVMRequest)
 		return nil, notFound
 	}
 	if err := s.RequirePerm(ctx, vmRBACPathFor(row.String("project"), req.Name), "vm.delete", "operator"); err != nil {
+		s.audit(ctx, "vm.delete", req.Name, "permission denied", "denied")
 		return nil, err
 	}
 	slog.Info("delete: the stack member was already deleted", "vm", req.Name,

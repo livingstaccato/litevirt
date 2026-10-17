@@ -34,7 +34,7 @@ func multiPoolServer(t testing.TB) *Server {
 	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
-	s := &Server{hostName: "test-host", pkiDir: "/etc/litevirt/pki", db: db, events: events.NewBus()}
+	s := &Server{dataDir: t.TempDir(), hostName: "test-host", pkiDir: "/etc/litevirt/pki", db: db, events: events.NewBus()}
 	for _, p := range []string{"dr", "p1", "p2", "p3"} {
 		if err := corrosion.UpsertStoragePool(context.Background(), s.db, corrosion.StoragePoolRecord{
 			HostName: s.hostName, Name: p, Driver: "dir", Target: t.TempDir(), State: "active",

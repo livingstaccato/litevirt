@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -335,5 +336,29 @@ func TestAbandon_IsRefusedWhileTheWorkloadsDomainMayRun(t *testing.T) {
 	fake.FailDomainState = nil
 	if _, err := s.RequestAbandonment(context.Background(), s.hostName, key, "unfenced", "x"); err != nil {
 		t.Errorf("abandonment with db-c shut off here: %v", err)
+	}
+}
+
+// A promote test must keep its markers in its own data dir. The markers used
+// to land in ./promote-markers and ./promote-started under the package
+// directory, where concurrent test processes deleted each other's.
+func TestPromoteMarkers_StayInTheServersDataDir(t *testing.T) {
+	s := testServer(t)
+	if s.dataDir == "" {
+		t.Fatal("testServer has no dataDir; its markers would be written relative to the working directory")
+	}
+	if err := s.writePromoteMarker("guarddb", "proof-1"); err != nil {
+		t.Fatalf("writePromoteMarker: %v", err)
+	}
+	if !strings.HasPrefix(s.promoteMarkerPath("guarddb"), s.dataDir) {
+		t.Fatalf("marker path %q is outside dataDir %q", s.promoteMarkerPath("guarddb"), s.dataDir)
+	}
+	if p := s.operatorStartPath("proof-1"); !strings.HasPrefix(p, s.dataDir) {
+		t.Fatalf("operator start path %q is outside dataDir %q", p, s.dataDir)
+	}
+	for _, d := range []string{"promote-markers", "promote-started"} {
+		if _, err := os.Stat(d); err == nil {
+			t.Errorf("./%s exists under the package directory", d)
+		}
 	}
 }

@@ -21,7 +21,7 @@ func newNetBoxHealthServer(t *testing.T) *Server {
 	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
-	return &Server{hostName: "test-host", db: db}
+	return &Server{dataDir: t.TempDir(), hostName: "test-host", db: db}
 }
 
 // netboxCondition finds one active condition by code and subject.

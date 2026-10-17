@@ -204,6 +204,8 @@ type Cluster struct {
 	caCert  string
 	caKey   string
 	tmpRoot string
+	// dbPrefix names this cluster's in-memory databases (dbName).
+	dbPrefix string
 	// opts is the bootstrap request, kept so per-node wiring (buildServer) can
 	// read options the harness applies after the nodes exist.
 	opts Options
@@ -454,7 +456,8 @@ func New(t *testing.T, opts Options) *Cluster {
 	// between tests — and, worse, every node in a cluster shared one tail, so
 	// node B's first audit row linked to node A's. The state now hangs off each
 	// Client and is keyed by host_name, which is correct by construction here.
-	c := &Cluster{t: t, tmpRoot: t.TempDir(), opts: opts, reach: newReachSet()}
+	c := &Cluster{t: t, tmpRoot: t.TempDir(), opts: opts, reach: newReachSet(),
+		dbPrefix: fmt.Sprintf("fleet-%d", clusterSeq.Add(1))}
 	if opts.RealGossip {
 		c.gossip = &gossipCut{byAddr: map[string]string{}, blocked: map[string]map[string]bool{}}
 	}
@@ -721,15 +724,31 @@ func (c *Cluster) mintHostCert(n *Node) {
 	}
 }
 
+// clusterSeq numbers the clusters this process builds (dbName).
+var clusterSeq atomic.Int64
+
+// dbName is the name of this cluster's shared in-memory database for suffix
+// (a node's name, "shared", a rebuilt node's): unique to the cluster, so a
+// database opened by name is never another cluster's. An in-memory database
+// outlives its Close while any connection to it is still open, and one can be:
+// a background loop of the test before, under load, still in a query when its
+// cluster closed the database. Under one process-wide name per node
+// ("fleet-node-0") the next test's node-0 then opened that database, holding
+// the earlier cluster's hosts rows, ports and certificate serials: it dialed
+// ports nobody listened on, refused every peer whose serial it did not hold,
+// and the cluster never converged (its schema init healed nothing, the
+// earlier test having already healed it).
+func (c *Cluster) dbName(suffix string) string { return c.dbPrefix + "-" + suffix }
+
 func (c *Cluster) openDB(n *Node, shared bool) {
 	var (
 		db  *corrosion.Client
 		err error
 	)
 	if shared {
-		db, err = corrosion.NewSharedTestClient("fleet-shared", n.Name)
+		db, err = corrosion.NewSharedTestClient(c.dbName("shared"), n.Name)
 	} else {
-		db, err = corrosion.NewSharedTestClient("fleet-"+n.Name, n.Name)
+		db, err = corrosion.NewSharedTestClient(c.dbName(n.Name), n.Name)
 	}
 	if err != nil {
 		c.t.Fatalf("open DB for %s: %v", n.Name, err)

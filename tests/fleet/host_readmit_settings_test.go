@@ -50,7 +50,7 @@ func rebuildWithEmptyDB(t *testing.T, c *Cluster, n, peer *Node) string {
 		t.Fatalf("read %s's new certificate serial: %v", n.Name, err)
 	}
 
-	db, err := corrosion.NewSharedTestClient("fleet-rebuilt-"+n.Name, n.Name)
+	db, err := corrosion.NewSharedTestClient(c.dbName("rebuilt-"+n.Name), n.Name)
 	if err != nil {
 		t.Fatalf("open %s's new database: %v", n.Name, err)
 	}

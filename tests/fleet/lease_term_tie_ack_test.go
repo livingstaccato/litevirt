@@ -139,7 +139,7 @@ func TestFleet_LeaseTermTieAck_StaysAcknowledgedAndReadsConverged(t *testing.T) 
 	// A restart: a fresh daemon over each node's database, meeting its peers
 	// from an empty register.
 	for _, n := range c.Nodes {
-		restarted, err := corrosion.NewSharedTestClient("fleet-"+n.Name, n.Name)
+		restarted, err := corrosion.NewSharedTestClient(c.dbName(n.Name), n.Name)
 		if err != nil {
 			t.Fatalf("%s: reopen: %v", n.Name, err)
 		}

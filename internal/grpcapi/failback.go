@@ -634,7 +634,10 @@ func (s *Server) autoFailback(ctx context.Context, host string, h *pb.Host) {
 	var origins []corrosion.DrainOrigin
 	vms := make(map[string]*corrosion.VMRecord, len(listed))
 	for _, o := range listed {
-		vm, why := s.drainOriginStale(ctx, o)
+		vm, why, proven := s.drainOriginProvenStale(ctx, o)
+		if !proven && why != "" {
+			continue // unknown: neither counted nor spent
+		}
 		if why != "" {
 			if cerr := corrosion.CollectDrainOrigin(ctx, s.db, o.VM, "undrain"); cerr != nil {
 				slog.Debug("undrain: could not collect a stale record", "vm", o.VM, "error", cerr)
@@ -655,7 +658,7 @@ func (s *Server) autoFailback(ctx context.Context, host string, h *pb.Host) {
 			break
 		}
 		vm := vms[o.VM]
-		if vm.Spec == "" {
+		if vm == nil || vm.Spec == "" {
 			continue
 		}
 		var spec pb.VMSpec
@@ -762,6 +765,41 @@ func (s *Server) drainOriginStale(ctx context.Context, o corrosion.DrainOrigin) 
 			"it was moved for another reason and stays where it is", o.To, vm.HostName)
 	}
 	return vm, ""
+}
+
+// drainOriginProvenStale is drainOriginStale for a caller that SPENDS the record
+// on the answer, which last-write-wins makes permanent. It returns a reason
+// only with proof: the VM is tombstoned, or a created_at, host, epoch or
+// generation that was read successfully differs. A read error, a missing row
+// with no tombstone (a lagging replica) or an unreadable generation is "unknown"
+// (why != "", proven == false), and the caller leaves the record alone. A
+// missing generation row only matches a record whose generation is 0.
+func (s *Server) drainOriginProvenStale(ctx context.Context, o corrosion.DrainOrigin) (vm *corrosion.VMRecord, why string, proven bool) {
+	vm, err := corrosion.GetVM(ctx, s.db, o.VM)
+	if err != nil {
+		return nil, "the VM could not be read", false
+	}
+	if vm == nil {
+		dead, derr := corrosion.GetDeletedVM(ctx, s.db, o.VM)
+		if derr != nil || dead == nil {
+			return nil, "the VM is not on this replica", false
+		}
+		return nil, "the VM no longer exists", true
+	}
+	if vm.CreatedAt != o.CreatedAt {
+		return nil, "the VM was deleted and created again since the drain", true
+	}
+	if vm.HostName != o.To || vm.OwnerEpoch != o.Epoch {
+		return nil, "the VM was moved since the drain", true
+	}
+	gen, known := corrosion.GetPlacementGenChecked(ctx, s.db, o.VM)
+	if !known && o.Gen != 0 {
+		return nil, "the placement generation is not on this replica", false
+	}
+	if gen != o.Gen {
+		return nil, "the VM was moved since the drain", true
+	}
+	return vm, "", true
 }
 
 // failbackOne decides and, unless dry, performs one VM's move back to host.

@@ -316,11 +316,11 @@ func TestAutoFailback_CountsOnlyRecordsThatStillApply(t *testing.T) {
 	t.Run("a live record still counts, a moved one does not", func(t *testing.T) {
 		s, _ := recordServer(t, map[string]string{"live": "h2", "moved": "h2"})
 		put(t, s, "live")
-		// moved's record is from an earlier placement generation: failback
-		// would discard it as moved for another reason.
+		// moved's record names a host the VM is not on: failback would discard
+		// it as moved for another reason.
 		mv, _ := corrosion.GetVM(ctx, s.db, "moved")
 		if err := corrosion.PutDrainOrigin(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureDrainFailback),
-			corrosion.DrainOrigin{VM: "moved", From: "h1", To: "h2", Epoch: mv.OwnerEpoch, CreatedAt: mv.CreatedAt, Gen: 99}, "drain"); err != nil {
+			corrosion.DrainOrigin{VM: "moved", From: "h1", To: "h3", Epoch: mv.OwnerEpoch, CreatedAt: mv.CreatedAt}, "drain"); err != nil {
 			t.Fatal(err)
 		}
 		h := undrain(s)
@@ -330,5 +330,66 @@ func TestAutoFailback_CountsOnlyRecordsThatStillApply(t *testing.T) {
 		if vms := recordedVMs(t, s, "h1"); !slices.Equal(vms, []string{"live"}) {
 			t.Fatalf("records = %v, want only live's", vms)
 		}
+	})
+}
+
+// A record is spent only on proof. A read error, a VM row this replica does not
+// hold (and has no tombstone for) or an unreadable placement generation could
+// all be a lagging or failing replica, and spending is permanent under
+// last-write-wins, so the record is left alone and not counted.
+//
+// Mutations: treat a GetVM error / a row with no tombstone / an unreadable
+// generation as stale again - the record is collected.
+func TestAutoFailback_KeepsARecordItCannotProveStale(t *testing.T) {
+	ctx := context.Background()
+	grant := func(t *testing.T) capabilities.FeatureGrant {
+		return capabilities.GrantForTest(t, capabilities.FeatureDrainFailback)
+	}
+	check := func(t *testing.T, s *Server) {
+		t.Helper()
+		h := &pb.Host{Name: "h1"}
+		s.autoFailback(ctx, "h1", h)
+		if h.FailbackNote != "" || h.FailbackStarted {
+			t.Fatalf("note = %q started = %v, want an unprovable record neither counted nor run", h.FailbackNote, h.FailbackStarted)
+		}
+		if vms := recordedVMs(t, s, "h1"); !slices.Equal(vms, []string{"v"}) {
+			t.Fatalf("records = %v, want v's kept", vms)
+		}
+	}
+
+	t.Run("GetVM error", func(t *testing.T) {
+		s, _ := recordServer(t, map[string]string{"v": "h2"})
+		vm, _ := corrosion.GetVM(ctx, s.db, "v")
+		if err := corrosion.PutDrainOrigin(ctx, s.db, grant(t),
+			corrosion.DrainOrigin{VM: "v", From: "h1", To: "h2", Epoch: vm.OwnerEpoch, CreatedAt: vm.CreatedAt}, "drain"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.db.Execute(ctx, `ALTER TABLE vms RENAME TO vms_unreadable`); err != nil {
+			t.Fatal(err)
+		}
+		check(t, s)
+	})
+
+	t.Run("no row and no tombstone", func(t *testing.T) {
+		s, _ := recordServer(t, nil)
+		if err := corrosion.PutDrainOrigin(ctx, s.db, grant(t),
+			corrosion.DrainOrigin{VM: "v", From: "h1", To: "h2", CreatedAt: "2026-10-17T00:00:00Z"}, "drain"); err != nil {
+			t.Fatal(err)
+		}
+		check(t, s)
+	})
+
+	t.Run("placement generation unreadable", func(t *testing.T) {
+		s, _ := recordServer(t, map[string]string{"v": "h2"})
+		vm, _ := corrosion.GetVM(ctx, s.db, "v")
+		if err := corrosion.PutDrainOrigin(ctx, s.db, grant(t),
+			corrosion.DrainOrigin{VM: "v", From: "h1", To: "h2", Epoch: vm.OwnerEpoch, CreatedAt: vm.CreatedAt, Gen: 3}, "drain"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.db.Execute(ctx, `INSERT INTO cluster_policies (key, value, set_by, updated_at, deleted_at)
+			VALUES ('placement_gen/v', 'garbled', 'test', ?, NULL)`, s.db.NowTS()); err != nil {
+			t.Fatal(err)
+		}
+		check(t, s)
 	})
 }

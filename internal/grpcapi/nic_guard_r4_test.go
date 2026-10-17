@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -217,41 +218,72 @@ func TestArmNICsFor_UnguardedVMWaitsForNoPass(t *testing.T) {
 // TestRecordExistingTrunkVLANsLoop_KeepsGoingUntilTheRelease (re-review
 // R3-I1): the loop does not stop after one pass while the release has not
 // latched: a trunk an older host creates during the rollout is recorded by a
-// later pass.
+// later pass. The first pass made with the release latched that writes
+// nothing ends it.
+//
+// The test hands the loop its ticks: a tick is taken only once the pass
+// before it has finished, so every step is ordered and no wall clock races
+// the loop.
 func TestRecordExistingTrunkVLANsLoop_KeepsGoingUntilTheRelease(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s := guardServer(t, true)
+	gate := &latchLaterGate{relGate: guardRelease(s)}
+	s.SetReleaseFeatureGate(gate) // records may be written; the release has not latched
 	if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{Name: "core", Type: "bridge",
 		Config: `{"Type":"bridge","Interface":"brcore"}`}); err != nil {
 		t.Fatal(err)
 	}
+	tick := make(chan time.Time)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.RecordExistingTrunkVLANsLoop(ctx, 20*time.Millisecond)
+		s.recordExistingTrunkVLANsLoop(ctx, tick)
 	}()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if _, have, _ := corrosion.TrunkVLANsRecorded(ctx, s.db); have {
-			break
+	// step returns once the loop has finished the pass in progress and
+	// started the next.
+	step := func(what string) {
+		t.Helper()
+		select {
+		case tick <- time.Time{}:
+		case <-done:
+			t.Fatalf("%s: the loop returned while the release had not latched", what)
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("the loop never made a first pass")
-		}
-		time.Sleep(10 * time.Millisecond)
+	}
+	step("the first pass")
+	step("a pass with nothing new")
+	if _, have, _ := corrosion.TrunkVLANsRecorded(ctx, s.db); !have {
+		t.Fatal("the first pass did not say it ran")
 	}
 	spec := `{"name":"later","uuid":"u-later","network":[{"name":"core","trunk":[300,301]}]}`
 	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "later", HostName: s.hostName, State: "running", Spec: spec},
 		[]corrosion.InterfaceRecord{{VMName: "later", NetworkName: "core", MAC: "52:54:00:00:00:09"}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	for !reflect.DeepEqual(networkDef(t, s, "core").AllowedVLANs, []int{300, 301}) {
-		if time.Now().After(deadline) {
-			t.Fatalf("a trunk created during the rollout was not recorded: %v", networkDef(t, s, "core").AllowedVLANs)
-		}
-		time.Sleep(10 * time.Millisecond)
+	step("the pass after the rollout trunk")
+	step("the pass after the rollout trunk")
+	if got := networkDef(t, s, "core").AllowedVLANs; !reflect.DeepEqual(got, []int{300, 301}) {
+		t.Fatalf("a trunk created during the rollout was not recorded: %v", got)
 	}
-	cancel()
-	<-done
+	gate.latched.Store(true)
+	select {
+	case tick <- time.Time{}:
+		// The pass under way when the release latched may have read it
+		// unlatched; the next one, with nothing to write, must end the loop.
+		select {
+		case <-done:
+		case tick <- time.Time{}:
+			t.Fatal("the loop kept going after a pass with the release latched wrote nothing")
+		}
+	case <-done:
+	}
 }
+
+// latchLaterGate is a release gate whose release latches when the test says
+// so, while the loop under test reads it.
+type latchLaterGate struct {
+	*relGate
+	latched atomic.Bool
+}
+
+func (g *latchLaterGate) FeatureAvailable(capabilities.Feature) bool { return g.latched.Load() }

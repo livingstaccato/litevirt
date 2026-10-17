@@ -195,7 +195,7 @@ func (r *Records) markerRecord(m Marker) (lv.FirmwareMoveRecord, error) {
 	rec := lv.FirmwareMoveRecord{
 		Kind: lv.FirmwareMarker, VM: m.VM, UUID: m.UUID, Attempt: m.Attempt,
 		Peer: m.Target, State: string(m.Phase), PreCutover: m.BeforeCutover(),
-		ParkedPreCutover: m.Phase.Parked() && preCutover(m.ParkedFrom),
+		ParkedPreCutover: m.Phase.Parked() && preCutover(m.ParkedFrom), Parked: m.Phase.Parked(),
 	}
 	if m.Phase != PhaseCleaning {
 		return rec, nil

@@ -136,6 +136,9 @@ type FirmwareMoveRecord struct {
 	// copy is still the current one. Unlike PreCutover it holds for
 	// source_paused too.
 	ParkedPreCutover bool
+	// Parked (marker): the phase is a parked one, whatever it was parked
+	// from.
+	Parked bool
 	// RetainedBundle (marker): the attempt's retained bundle is on disk.
 	RetainedBundle bool
 }
@@ -237,8 +240,12 @@ func exemptionAllows(r FirmwareMoveRecord, c FirmwareCall) bool {
 		// when that park came before cutover: the source's copy is current.
 		return marker && c.Op == OpResume && bound && r.State == FirmwarePhaseSourcePaused && r.ParkedPreCutover
 	case ViaResumePartitionPaused:
-		// The partition pauser knows the domain's uuid, not the attempt.
-		return marker && c.Op == OpResume && sameUUID(r.UUID, c.UUID) && r.PreCutover
+		// The partition pauser knows the domain's uuid, not the attempt. A
+		// marker in progress before cutover only: a parked move resumes its
+		// source through its own steps (the M1p handler and its retry, which
+		// ask the target first), never the pauser, since a parked target may
+		// hold a copy it cannot report (D2-13 re-review 3, m-C).
+		return marker && c.Op == OpResume && sameUUID(r.UUID, c.UUID) && r.PreCutover && !r.Parked
 	case ViaResumeFirmwareMoveTarget:
 		return hold && c.Op == OpResume && bound && r.State == FirmwareHoldResuming
 	case ViaDiscardFirmwareMoveTarget:
@@ -465,8 +472,10 @@ func (c *Client) ResumeFirmwareMoveSourceForOperator(name, uuid, attempt string)
 }
 
 // ResumePartitionPaused is the partition pauser resuming a guest it paused.
-// Under a marker it is allowed only before cutover (spec §5.1), so a source
-// guest still the live copy is not left paused once the partition heals.
+// Under a marker it is allowed only while the move is in progress before
+// cutover (spec §5.1), so a source guest still the live copy is not left
+// paused once the partition heals; under a parked marker it is refused, and
+// the move's own steps resume the source.
 func (c *Client) ResumePartitionPaused(name, uuid string) error {
 	return resumeDomain(c.virt, c.firmwareGuard(), FirmwareCall{Op: OpResume, Name: name, UUID: uuid, Via: ViaResumePartitionPaused})
 }

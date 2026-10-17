@@ -249,11 +249,12 @@ func TestFwmigWire_UnreadableRecordRefuses(t *testing.T) {
 
 // T-34 (fwmig half): through Wire and the real records, the partition
 // pauser's resume goes ahead under a marker exactly while the phase is
-// preparing, prepared or migrating, or parked from one of those other than
-// source_paused.
+// preparing, prepared or migrating; never under a parked marker, whatever it
+// was parked from (D2-13 re-review 3, m-C: a parked move resumes its source
+// through its own steps).
 //
 // Mutations: Marker.BeforeCutover true at cutover — red; ResumePartitionPaused
-// refused under every marker — red.
+// refused under every marker — red; Parked not carried by the record — red.
 func TestFwmigWire_PartitionPauseResume(t *testing.T) {
 	pre := map[Phase]bool{PhasePreparing: true, PhasePrepared: true, PhaseMigrating: true}
 	type tc struct {
@@ -281,7 +282,7 @@ func TestFwmigWire_PartitionPauseResume(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			cases = append(cases, tc{pm, p != PhaseSourcePaused && pre[from]})
+			cases = append(cases, tc{pm, false})
 		}
 	}
 	for _, c := range cases {

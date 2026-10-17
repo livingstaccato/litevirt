@@ -59,6 +59,11 @@ func (r *Reconciler) defineRekeyedStoppedVM(ctx context.Context, vm corrosion.VM
 		!corrosion.IsStoppedRekeyDetail(fresh.StateDetail) {
 		return
 	}
+	// Its domain is not replaced while a live firmware move's record names
+	// it here (spec §6.9).
+	if r.firmwareMoveSkip(vm.Name, specUUIDOf(fresh.Spec), "re-key define") {
+		return
+	}
 	r.rekeyMu.Lock()
 	at, done := r.rekeyDefined[vm.Name]
 	r.rekeyMu.Unlock()
@@ -204,6 +209,15 @@ func (r *Reconciler) cleanupRekeyLeftovers(ctx context.Context) {
 		}
 		if r.virt.DomainExists(name) {
 			if st, serr := r.virt.DomainState(name); serr != nil || st == "running" {
+				continue
+			}
+			// Kept, and asked again next pass, while a live firmware move's
+			// record names it here (spec §6.9).
+			uuid := ""
+			if row != nil {
+				uuid = specUUIDOf(row.Spec)
+			}
+			if r.firmwareMoveSkip(name, uuid, "re-key leftover cleanup") {
 				continue
 			}
 			r.virt.UndefineDomainPreservingState(name)

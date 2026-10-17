@@ -77,6 +77,7 @@ func fwStates() []fwState {
 		for _, from := range []string{"migrating", "cutover"} {
 			st := fwMarker("marker/"+p+"_from_"+from, p, p != "source_paused" && fwPrePhase(from), false)
 			st.recs[0].ParkedPreCutover = fwPrePhase(from)
+			st.recs[0].Parked = true
 			out = append(out, st)
 		}
 	}
@@ -431,8 +432,10 @@ func fwExempts() []fwExempt {
 			run: func(e *fwEnv, id, a string) error {
 				return resumeDomain(e.api, e.guard, FirmwareCall{Op: OpResume, Name: fwTestVM, UUID: id, Attempt: a, Via: ViaResumeFirmwareMoveSourceOperator})
 			}, acted: func(e *fwEnv) bool { return e.api.called("resume") }},
+		// The partition pauser: a move in progress before cutover only, never
+		// a parked one (D2-13 re-review 3, m-C).
 		{via: ViaResumePartitionPaused, op: OpResume, dom: golibvirt.DomainPaused,
-			allow: func(r FirmwareMoveRecord) bool { return marker(r) && r.PreCutover },
+			allow: func(r FirmwareMoveRecord) bool { return marker(r) && r.PreCutover && !r.Parked },
 			run: func(e *fwEnv, id, _ string) error {
 				return resumeDomain(e.api, e.guard, FirmwareCall{Op: OpResume, Name: fwTestVM, UUID: id, Via: ViaResumePartitionPaused})
 			}, acted: func(e *fwEnv) bool { return e.api.called("resume") }},
@@ -568,16 +571,17 @@ func TestFirmwareMoveGuard_ExemptBinding(t *testing.T) {
 }
 
 // T-34 (libvirt half). The partition pauser's resume of a source guest it
-// paused goes ahead while the marker is before cutover (preparing, prepared,
-// migrating, or parked from those other than source_paused), so a running
-// source left by a failed move is not kept paused; from cutover on, or in
-// source_paused, it is refused. fwmig's TestFwmigWire_PartitionPauseResume
-// runs the same through every real phase.
+// paused goes ahead while the move is in progress before cutover (preparing,
+// prepared, migrating); from cutover on it is refused, and so is every parked
+// marker, whatever it was parked from: a parked move resumes its source
+// through its own steps, which ask the target first (D2-13 re-review 3, m-C).
+// fwmig's TestFwmigWire_PartitionPauseResume runs the same through every real
+// phase.
 //
 // Mutation: refuse ResumePartitionPaused under every marker — red.
 func TestPartitionPauseResume_PreCutoverMarkerAllowed(t *testing.T) {
 	for _, st := range fwStates() {
-		if !strings.HasPrefix(st.name, "marker/") || !st.recs[0].PreCutover {
+		if !strings.HasPrefix(st.name, "marker/") || !st.recs[0].PreCutover || st.recs[0].Parked {
 			continue
 		}
 		t.Run(st.name, func(t *testing.T) {
@@ -592,12 +596,16 @@ func TestPartitionPauseResume_PreCutoverMarkerAllowed(t *testing.T) {
 	}
 }
 
-// Mutation: allow ResumePartitionPaused whatever the phase — red.
+// Mutations: allow ResumePartitionPaused whatever the phase — red; allow it
+// under a parked marker reached before cutover — red.
 func TestPartitionPauseResume_CutoverMarkerRefused(t *testing.T) {
-	n := 0
+	n, parkedPre := 0, 0
 	for _, st := range fwStates() {
-		if !strings.HasPrefix(st.name, "marker/") || st.recs[0].PreCutover {
+		if !strings.HasPrefix(st.name, "marker/") || (st.recs[0].PreCutover && !st.recs[0].Parked) {
 			continue
+		}
+		if st.recs[0].PreCutover {
+			parkedPre++
 		}
 		n++
 		t.Run(st.name, func(t *testing.T) {
@@ -608,8 +616,8 @@ func TestPartitionPauseResume_CutoverMarkerRefused(t *testing.T) {
 			}
 		})
 	}
-	if n < 10 {
-		t.Fatalf("only %d post-cutover marker states", n)
+	if n < 10 || parkedPre < 6 {
+		t.Fatalf("only %d refused marker states, %d of them parked before cutover", n, parkedPre)
 	}
 }
 
@@ -932,7 +940,10 @@ func TestQuarantine_CrossFilesystemKeepsSourceUntilCopyDurable(t *testing.T) {
 		if !entryDurable {
 			t.Error("the quarantine dir holding the swtpm copy was not fsynced before the source was removed")
 		}
-		for _, d := range []string{filepath.Join(q, "swtpm"), filepath.Join(q, "swtpm", "tpm2"), q, filepath.Dir(q)} {
+		// The swtpm copy is made, and fsynced, under its temporary name, and
+		// renamed into place only once durable.
+		cp := filepath.Join(q, "swtpm"+quarantineCopySuffix)
+		for _, d := range []string{cp, filepath.Join(cp, "tpm2"), q, filepath.Dir(q)} {
 			was, ok := syncedWhileSource[d]
 			if !ok {
 				t.Errorf("%s never fsynced (synced %v)", d, synced)
@@ -962,6 +973,156 @@ func TestQuarantine_CrossFilesystemKeepsSourceUntilCopyDurable(t *testing.T) {
 		}
 		if !e.hasSwtpm() {
 			t.Fatal("the swtpm source is gone although its copy was not durable")
+		}
+	})
+
+	// The swtpm tree's own copy fails to become durable, after the NVRAM has
+	// moved: the tree's source is kept, whole (D2-6 re-review 2, m-14 test
+	// nit: the failure above stops at the NVRAM, before the tree).
+	t.Run("fsync_fails_swtpm", func(t *testing.T) {
+		e := newFWEnv(t, fwHold("mismatch"), golibvirt.DomainShutoff)
+		q := filepath.Join(e.store.DataDir, "fwmig-quarantine", "vm1-x")
+		cp := filepath.Join(q, "swtpm"+quarantineCopySuffix)
+		hit := false
+		quarantineSync = func(p string) error {
+			if p == cp {
+				hit = true
+				return errors.New("injected fsync failure")
+			}
+			return fsyncPath(p)
+		}
+		if err := e.store.QuarantineFirmwareMoveTargetState(fwTestVM, fwTestUUID, fwTestAttempt, q); err == nil {
+			t.Fatal("a failed fsync of the swtpm copy reported success")
+		}
+		if !hit {
+			t.Fatal("the swtpm copy was never fsynced")
+		}
+		if !e.hasSwtpm() {
+			t.Fatal("the swtpm source is gone although its copy was not durable")
+		}
+		if b, err := os.ReadFile(filepath.Join(q, "nvram")); err != nil || string(b) != "T0" {
+			t.Fatalf("the NVRAM was not quarantined before the tree: %q, %v", b, err)
+		}
+		for _, p := range []string{cp, filepath.Join(q, "swtpm")} {
+			if _, err := os.Lstat(p); !os.IsNotExist(err) {
+				t.Fatalf("%s left behind by a copy that was not durable (%v)", p, err)
+			}
+		}
+	})
+}
+
+// m-14 (D2-6 re-review 2): a cross-filesystem quarantine a crash interrupted
+// completes on the retry, and never removes a source the quarantine does not
+// hold, byte for byte.
+//
+// Mutations: refuse an existing destination as before ("already exists") —
+// red (placed_source_not_removed, source_partly_removed); remove the source
+// without comparing — red (differs_keeps_both); copy straight to the final
+// name — red (partial_copy_leftover).
+func TestQuarantine_CrossFilesystemRetryAfterCrash(t *testing.T) {
+	exdev := func(o, n string) error { return &os.LinkError{Op: "rename", Old: o, New: n, Err: syscall.EXDEV} }
+	defer func(r, pl func(string, string) error) { quarantineRename, quarantinePlace = r, pl }(quarantineRename, quarantinePlace)
+	quarantineRename = exdev
+	crash := errors.New("injected crash")
+
+	quarantine := func(e *fwEnv, q string) error {
+		return e.store.QuarantineFirmwareMoveTargetState(fwTestVM, fwTestUUID, fwTestAttempt, q)
+	}
+	requireMoved := func(t *testing.T, e *fwEnv, q string) {
+		t.Helper()
+		if b, err := os.ReadFile(filepath.Join(q, "nvram")); err != nil || string(b) != "T0" {
+			t.Fatalf("quarantined nvram = %q, %v", b, err)
+		}
+		if b, err := os.ReadFile(filepath.Join(q, "swtpm", "tpm2", "tpm2-00.permall")); err != nil || string(b) != "P0" {
+			t.Fatalf("quarantined permall = %q, %v", b, err)
+		}
+		if _, ok := e.nvram(fwTestVM); ok || e.hasSwtpm() {
+			t.Fatal("a source is still there after the retry")
+		}
+		if _, err := os.Lstat(filepath.Join(q, "swtpm"+quarantineCopySuffix)); !os.IsNotExist(err) {
+			t.Fatalf("the temporary copy is left (%v)", err)
+		}
+	}
+
+	// A crash mid-copy: a partial copy under the temporary name, the source
+	// whole. The retry replaces the partial copy and completes.
+	t.Run("partial_copy_leftover", func(t *testing.T) {
+		quarantinePlace = os.Rename
+		e := newFWEnv(t, fwHold("mismatch"), golibvirt.DomainShutoff)
+		q := filepath.Join(e.store.DataDir, "fwmig-quarantine", "vm1-x")
+		fwWriteFile(t, filepath.Join(q, "swtpm"+quarantineCopySuffix, "tpm2", "tpm2-00.permall"), "P")
+		if err := quarantine(e, q); err != nil {
+			t.Fatalf("retry after a crash mid-copy: %v", err)
+		}
+		requireMoved(t, e, q)
+	})
+
+	// A crash after the copy took its name, before (or during) the removal of
+	// the source: the retry finds a whole copy and removes what is left of
+	// the source.
+	t.Run("placed_source_not_removed", func(t *testing.T) {
+		e := newFWEnv(t, fwHold("mismatch"), golibvirt.DomainShutoff)
+		q := filepath.Join(e.store.DataDir, "fwmig-quarantine", "vm1-x")
+		quarantinePlace = func(o, n string) error {
+			if err := os.Rename(o, n); err != nil {
+				return err
+			}
+			if filepath.Base(n) == "swtpm" {
+				return crash // placed; the process dies before removing the source
+			}
+			return nil
+		}
+		if err := quarantine(e, q); err == nil {
+			t.Fatal("the injected crash did not stop the move")
+		}
+		if _, err := os.Lstat(filepath.Join(q, "swtpm")); err != nil {
+			t.Fatalf("the crash did not leave the placed copy: %v", err)
+		}
+		if !e.hasSwtpm() {
+			t.Fatal("the source went before the copy was durable")
+		}
+		quarantinePlace = os.Rename
+		if err := quarantine(e, q); err != nil {
+			t.Fatalf("retry after a crash before the source's removal: %v", err)
+		}
+		requireMoved(t, e, q)
+	})
+
+	// The removal of the source was cut short: a part of it is left. The
+	// quarantine holds that part, so the retry removes it.
+	t.Run("source_partly_removed", func(t *testing.T) {
+		quarantinePlace = os.Rename
+		e := newFWEnv(t, fwHold("mismatch"), golibvirt.DomainShutoff)
+		q := filepath.Join(e.store.DataDir, "fwmig-quarantine", "vm1-x")
+		fwWriteFile(t, filepath.Join(q, "nvram"), "T0")
+		fwWriteFile(t, filepath.Join(q, "swtpm", "tpm2", "tpm2-00.permall"), "P0")
+		fwWriteFile(t, filepath.Join(q, "swtpm", "tpm2", "other"), "O")
+		if err := os.Remove(e.store.NvramPath(fwTestVM)); err != nil {
+			t.Fatal(err)
+		}
+		if err := quarantine(e, q); err != nil {
+			t.Fatalf("retry after a partial removal: %v", err)
+		}
+		requireMoved(t, e, q)
+	})
+
+	// The destination holds something else: both are kept and the retry
+	// refuses, naming them.
+	t.Run("differs_keeps_both", func(t *testing.T) {
+		quarantinePlace = os.Rename
+		e := newFWEnv(t, fwHold("mismatch"), golibvirt.DomainShutoff)
+		q := filepath.Join(e.store.DataDir, "fwmig-quarantine", "vm1-x")
+		fwWriteFile(t, filepath.Join(q, "nvram"), "T0")
+		fwWriteFile(t, filepath.Join(q, "swtpm", "tpm2", "tpm2-00.permall"), "P-OTHER")
+		err := quarantine(e, q)
+		if err == nil || !strings.Contains(err.Error(), "both are kept") {
+			t.Fatalf("err = %v, want a refusal keeping both", err)
+		}
+		if !e.hasSwtpm() {
+			t.Fatal("a source the quarantine does not hold was removed")
+		}
+		if b, _ := os.ReadFile(filepath.Join(q, "swtpm", "tpm2", "tpm2-00.permall")); string(b) != "P-OTHER" {
+			t.Fatalf("the quarantined copy was overwritten: %q", b)
 		}
 	})
 }

@@ -2,6 +2,7 @@ package libvirt
 
 import (
 	"archive/tar"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -652,10 +653,12 @@ func (f *FirmwareStore) QuarantineFirmwareMoveTargetState(vmName, uuid, attempt,
 	return nil
 }
 
-// The quarantine's rename and directory fsync; variables so a test can fail
-// a step and check what is left.
+// The quarantine's rename, its placing rename (a whole cross-filesystem copy
+// renamed into place within the quarantine dir) and directory fsync;
+// variables so a test can fail a step and check what is left.
 var (
 	quarantineRename = os.Rename
+	quarantinePlace  = os.Rename
 	quarantineSync   = fsyncPath
 )
 
@@ -696,9 +699,18 @@ func mkdirAllDurable(dir string) error {
 }
 
 // moveIntoQuarantine renames from to to, or, across filesystems, copies it
-// (files 0600, dirs 0700, each file fsynced), makes the copy durable (every
-// copied directory and the directory holding the new entry), and only then
-// removes from: a crash at any point leaves at least one whole copy.
+// (files 0600, dirs 0700, each file fsynced) under a temporary name beside
+// to, makes the copy durable (every copied directory and the directory
+// holding it), renames it to to, makes that entry durable, and only then
+// removes from: a crash at any point leaves at least one whole copy, and to,
+// once it exists, is always whole.
+//
+// So a retry after a crash finishes the move (D2-6 re-review 2, m-14): a
+// leftover temporary copy is never whole and is replaced; an existing to is
+// whole, and what is left of from (all of it, or what a crash in the final
+// RemoveAll left) is removed once every file of it is found byte-equal in to
+// and to is durable. A from that differs from to is kept, with to, and
+// refused: nothing is ever removed that the quarantine does not hold.
 func moveIntoQuarantine(from, to string) error {
 	if _, err := os.Lstat(from); os.IsNotExist(err) {
 		return nil
@@ -706,7 +718,7 @@ func moveIntoQuarantine(from, to string) error {
 		return err
 	}
 	if _, err := os.Lstat(to); err == nil {
-		return fmt.Errorf("%s already exists", to)
+		return finishQuarantine(from, to)
 	} else if !os.IsNotExist(err) {
 		return err
 	}
@@ -714,27 +726,118 @@ func moveIntoQuarantine(from, to string) error {
 	if err == nil || !errors.Is(err, syscall.EXDEV) {
 		return err
 	}
-	if err := copyQuarantine(from, to); err != nil {
+	tmp := to + quarantineCopySuffix
+	// A leftover of a copy a crash interrupted: never renamed into place, so
+	// never whole, while from still is.
+	if err := os.RemoveAll(tmp); err != nil {
+		return err
+	}
+	if err := copyQuarantine(from, tmp); err != nil {
+		_ = os.RemoveAll(tmp)
+		return err
+	}
+	// The copy is durable before it takes its name: each copied directory
+	// (the files were fsynced as written) and the directory holding it. A
+	// failure here keeps the source, whole.
+	if err := syncQuarantineTree(tmp); err != nil {
+		_ = os.RemoveAll(tmp)
+		return err
+	}
+	if err := quarantinePlace(tmp, to); err != nil {
+		_ = os.RemoveAll(tmp)
+		return err
+	}
+	if err := quarantineSync(filepath.Dir(to)); err != nil {
+		// Not known durable: the source stays, whole, and the copy goes.
 		_ = os.RemoveAll(to)
 		return err
 	}
-	// The copy is durable before the source goes: each copied directory
-	// (the files were fsynced as written) and the directory holding the new
-	// entry. A failure here keeps the source, whole.
-	err = filepath.WalkDir(to, func(p string, d os.DirEntry, err error) error {
+	return os.RemoveAll(from)
+}
+
+// quarantineCopySuffix names a cross-filesystem copy until it is whole and
+// durable.
+const quarantineCopySuffix = ".copying"
+
+// syncQuarantineTree fsyncs every directory of tree and the one holding it.
+func syncQuarantineTree(tree string) error {
+	err := filepath.WalkDir(tree, func(p string, d os.DirEntry, err error) error {
 		if err != nil || !d.IsDir() {
 			return err
 		}
 		return quarantineSync(p)
 	})
-	if err == nil {
+	if err != nil {
+		return err
+	}
+	return quarantineSync(filepath.Dir(tree))
+}
+
+// finishQuarantine is a move whose destination already exists: what is left
+// of from goes only if the quarantine holds every file of it, byte for byte,
+// durably. Anything else keeps both and refuses.
+func finishQuarantine(from, to string) error {
+	if err := quarantineHolds(from, to); err != nil {
+		return fmt.Errorf("%s already exists and does not hold %s (%v); both are kept: compare them, and move the one that is not wanted out of the way", to, from, err)
+	}
+	fi, err := os.Lstat(to)
+	if err != nil {
+		return err
+	}
+	if fi.IsDir() {
+		err = syncQuarantineTree(to)
+	} else {
 		err = quarantineSync(filepath.Dir(to))
 	}
 	if err != nil {
-		_ = os.RemoveAll(to)
 		return err
 	}
 	return os.RemoveAll(from)
+}
+
+// quarantineHolds checks that every regular file under from (or from itself)
+// is in to at the same relative path with the same bytes, and that every
+// directory under from is a directory in to. Any other entry fails it.
+func quarantineHolds(from, to string) error {
+	return filepath.WalkDir(from, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(from, p)
+		if err != nil {
+			return err
+		}
+		dst := filepath.Join(to, rel)
+		fi, err := os.Lstat(dst)
+		if err != nil {
+			return err
+		}
+		switch {
+		case d.IsDir():
+			if !fi.IsDir() {
+				return fmt.Errorf("%s is not a directory", dst)
+			}
+			return nil
+		case d.Type().IsRegular():
+			if !fi.Mode().IsRegular() {
+				return fmt.Errorf("%s is not a regular file", dst)
+			}
+			a, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			b, err := os.ReadFile(dst)
+			if err != nil {
+				return err
+			}
+			if !bytes.Equal(a, b) {
+				return fmt.Errorf("%s differs from %s", p, dst)
+			}
+			return nil
+		default:
+			return fmt.Errorf("unexpected firmware state entry %q (type %v)", p, d.Type())
+		}
+	})
 }
 
 func copyQuarantine(from, to string) error {

@@ -22,6 +22,7 @@ import (
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fwmig"
 	"github.com/litevirt/litevirt/internal/image"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
@@ -97,6 +98,9 @@ type Reconciler struct {
 	rekeyMu      sync.Mutex
 	rekeyDefined map[string]string
 	rekeyLogged  map[string]string
+	// fwSkips logs, once per record, a VM this reconciler leaves alone
+	// because a live firmware move's record names it here.
+	fwSkips firmwareMoveSkips
 	// startDomainHook runs immediately before StartDomain, with the context
 	// the start is running under. Test-only seam: it makes a walk budget that
 	// expires between the start and the commit reproducible instead of a
@@ -1273,6 +1277,14 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 
 		// If corrosion says this VM belongs to a different host, we no longer own it.
 		if vm.HostName != r.hostName {
+			// A live firmware move's record names it here: a moved VM's
+			// source leftover (reason migrated, or unknown after a reboot)
+			// or a held target guest. Its definition and both copies of
+			// its state stay until the move resolves it (spec §6.9, R-I5).
+			if r.firmwareMoveSkip(domName, specUUIDOf(vm.Spec), "leftover cleanup") {
+				keep[domName] = true
+				continue
+			}
 			// Non-destruction guard (LWW-repair Phase 1): NEVER destroy a domain
 			// that holds live or resumable state locally, whatever the DB host_name
 			// says. A converged-wrong host_name — the equal-`updated_at` LWW tie this
@@ -1456,6 +1468,11 @@ func (r *Reconciler) startedDetail(ctx context.Context, vm corrosion.VMRecord) s
 }
 
 func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) {
+	// A VM a live firmware move's record names here is not started (and its
+	// domain not redefined) by the reconciler (spec §6.9).
+	if r.firmwareMoveSkip(vm.Name, specUUIDOf(vm.Spec), "start") {
+		return
+	}
 	// A start that would be deferred for want of time is left as it is
 	// before anything is done for it — no lease, no proof claimed, no
 	// define — and goes first on the next pass (start_deferral.go).
@@ -2910,4 +2927,79 @@ func (r *Reconciler) runtimeSuperseded(ctx context.Context, name string) bool {
 		return false
 	}
 	return row.OwnerEpoch > marker
+}
+
+// ── Live firmware moves (spec §6.9) ──
+//
+// While a live firmware move's record — a source marker or a target hold —
+// names a VM on this host, the health paths that would undefine, define,
+// start, stop or restart it leave it alone: the move, its recovery or an
+// operator's D-5 action resolves it. The firmware move guard refuses the
+// libvirt calls beneath them too; skipping first keeps a refused call from
+// being followed by another (a refused destroy by a start) or by a row
+// write, and keeps the leftover's state and definition as they are.
+
+// firmwareMoveSkips logs each skip once per VM and record.
+type firmwareMoveSkips struct {
+	mu     sync.Mutex
+	logged map[string]map[string]string // VM → what was skipped → why
+}
+
+// specUUIDOf is the uuid a stored VM spec carries, or "".
+func specUUIDOf(spec string) string {
+	var sp struct {
+		UUID string `json:"uuid"`
+	}
+	_ = json.Unmarshal([]byte(spec), &sp)
+	return sp.UUID
+}
+
+// skip reports whether a live firmware move's record names the VM on this
+// host (by name, or by uuid when known), logging it once. A record that
+// cannot be read counts as one: the guard refuses on it too. dataDir "" is a
+// host with no records.
+func (k *firmwareMoveSkips) skip(dataDir, name, uuid, what string) bool {
+	if dataDir == "" {
+		return false
+	}
+	recs, err := fwmig.New(dataDir).Lookup(name, uuid)
+	var why string
+	switch {
+	case err != nil:
+		why = "a firmware move record cannot be read: " + err.Error()
+	case len(recs) == 0:
+		k.mu.Lock()
+		delete(k.logged, name)
+		k.mu.Unlock()
+		return false
+	default:
+		r := recs[0]
+		dir := "to"
+		if r.Kind == lv.FirmwareHold {
+			dir = "from"
+		}
+		why = fmt.Sprintf("live firmware migration %s %s %s in %s %s", r.Attempt, dir, r.Peer, r.Kind, r.State)
+	}
+	k.mu.Lock()
+	if k.logged == nil {
+		k.logged = map[string]map[string]string{}
+	}
+	if k.logged[name] == nil {
+		k.logged[name] = map[string]string{}
+	}
+	first := k.logged[name][what] != why
+	k.logged[name][what] = why
+	k.mu.Unlock()
+	if first {
+		slog.Info("health: leaving a VM in a live firmware move alone", "vm", name, "skipped", what, "reason", why)
+	}
+	return true
+}
+
+// firmwareMoveSkip is skip over this reconciler's firmware store.
+func (r *Reconciler) firmwareMoveSkip(name, uuid, what string) bool {
+	if r.fwStore == nil {
+		return false
+	}
+	return r.fwSkips.skip(r.fwStore.DataDir, name, uuid, what)
 }

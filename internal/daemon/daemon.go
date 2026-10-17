@@ -67,6 +67,10 @@ const grpcMaxMsgSize = 64 << 20 // 64 MiB
 
 // Daemon is the main litevirtd process.
 type Daemon struct {
+	// ownRowWake is signalled when an apply changes this host's own row;
+	// bootRes keeps the boot report's figures (own_row.go).
+	ownRowWake chan struct{}
+	bootRes    bootResources
 	// auditWired is closed once wireAuditKeyring has installed the keyring
 	// audit rows are signed with; runAuditHold lands nothing before it.
 	auditWiredOnce sync.Once
@@ -642,6 +646,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.wireHostRuntimeGate()
 	d.wireHostRuntimeRetireGate()
 
+	// The own-row hold goes in before this host's first own-row write
+	// (corrosion/own_row_hold.go).
+	d.configureOwnRowHold(ctx)
 	// Register this host in corrosion
 	if err := d.registerHost(ctx); err != nil {
 		slog.Warn("failed to register host", "error", err)
@@ -672,7 +679,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// (awaitServingThenActivate): recorded active
 	// before its gRPC server listened, it was fenced on the failure count its
 	// observers carried through the restart (hostboot).
+	d.bootRes.mu.Lock()
+	d.bootRes.cpus, d.bootRes.memMiB, d.bootRes.diskGiB, d.bootRes.hasResources = cpus, memMiB, diskGiB, niErr == nil
+	d.bootRes.mu.Unlock()
 	d.checkerThenBootWrite(ctx, cpus, memMiB, diskGiB, niErr == nil)
+	go d.runOwnRowHold(ctx)
 	// Record version on the corrosion client so it goes into Crescent
 	// peer handshakes (used by skew detection).
 	d.db.SetLocalVersion(d.cfg.Version)
@@ -1059,6 +1070,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Wire the split-brain gate onto the gRPC server BEFORE ReconcileLBs (below)
 	// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
 	svc.SetGate(d.checker)
+	// The operator's hosts writes refuse on a replica that has not caught up
+	// (grpcapi/host_incarnation.go).
+	svc.SetHostWriteCurrencyCheck(true)
 	// Start rebalance coordinator. Leader-gated; safe to start on
 	// every host. Defaults to dry-run on every VM unless compose says otherwise.
 	// Its lease stands down on the server's LeaseQuorumLost, as RunRebalance's
@@ -2299,6 +2313,9 @@ func (d *Daemon) ensureClusterRecord(ctx context.Context) {
 // Only on a real change, so an unchanged address cannot restamp updated_at on
 // every restart and win LWW against a genuine concurrent write from another node.
 func (d *Daemon) reconcileHostAddress(ctx context.Context) error {
+	if err := d.db.OwnRowWritable(d.cfg.HostName); err != nil {
+		return nil // held: the own-row reconcile runs this again when it opens
+	}
 	want := d.hostAddress()
 	h, err := corrosion.GetHost(ctx, d.db, d.cfg.HostName)
 	if err != nil || h == nil || h.Address == want {

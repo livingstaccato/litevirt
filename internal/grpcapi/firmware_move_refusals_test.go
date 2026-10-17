@@ -339,7 +339,7 @@ func TestStopVM_RefusesFirmwareMove(t *testing.T) {
 				put(f)
 				_, err := f.s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "os1", Force: force})
 				f.requireEntryRefusal(err)
-				if msg := status.Convert(err).Message(); !strings.Contains(msg, "firmware_migration condition") {
+				if msg := status.Convert(err).Message(); !strings.Contains(msg, "`lv doctor firmware-move os1`") {
 					t.Fatalf("refusal %q does not name what resolves it", msg)
 				}
 				f.requireKept(libvirtfake.StateRunning)

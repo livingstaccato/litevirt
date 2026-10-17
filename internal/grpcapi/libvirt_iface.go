@@ -41,6 +41,15 @@ type LibvirtBackend interface {
 	// firmware move that failed paused before cutover runs again (§7 M1p,
 	// I5): only with the attempt's marker before cutover.
 	ResumeFirmwareMoveSource(name, uuid, attempt string) error
+	// ResumeFirmwareMoveSourceForOperator is the one way an operator's D-5
+	// --accept-source resumes the source guest of a move parked
+	// source_paused before cutover, once the target's copy is discarded.
+	ResumeFirmwareMoveSourceForOperator(name, uuid, attempt string) error
+	// StopFirmwareMoveTargetForOperator stops a held target guest for an
+	// operator's D-5 --stop-target (destroy when force, else an ACPI
+	// shutdown): the attempt's hold prepared, verified, resuming or
+	// released_unconfirmed.
+	StopFirmwareMoveTargetForOperator(name, uuid, attempt string, force bool) error
 	// UndefineFirmwareMoveLeftover is the one way a moved VM's source
 	// definition goes (spec §6.7 step 3, I5): marker cleaning, domain shut
 	// off, its NVRAM and TPM state kept for the wipe that follows.

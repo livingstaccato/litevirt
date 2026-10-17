@@ -484,6 +484,13 @@ func fwExempts() []fwExempt {
 			run: func(e *fwEnv, id, a string) error {
 				return e.store.QuarantineFirmwareMoveTargetState(fwTestVM, id, a, filepath.Join(e.store.DataDir, "q"))
 			}, acted: func(e *fwEnv) bool { _, ok := e.nvram(fwTestVM); return !ok && !e.hasSwtpm() }},
+		// D-5 --accept-target on a stopped source cleanup: a cleaning marker,
+		// bundle or not; never a hold, never another phase.
+		{via: ViaQuarantineFirmwareMoveSourceForOperator, op: OpWipe,
+			allow: func(r FirmwareMoveRecord) bool { return marker(r) && r.State == "cleaning" },
+			run: func(e *fwEnv, id, a string) error {
+				return e.store.QuarantineFirmwareMoveSourceForOperator(fwTestVM, id, a, filepath.Join(e.store.DataDir, "q"))
+			}, acted: func(e *fwEnv) bool { _, ok := e.nvram(fwTestVM); return !ok && !e.hasSwtpm() }},
 	}
 }
 
@@ -529,19 +536,20 @@ func TestFirmwareMoveGuard_Exempt(t *testing.T) {
 // ResumePartitionPaused knows no attempt and is bound by the uuid alone.
 func TestFirmwareMoveGuard_ExemptBinding(t *testing.T) {
 	allowing := map[FirmwareExemption]fwState{
-		ViaResumeFirmwareMoveSource:          fwMarker("m", "migrating", true, false),
-		ViaResumeFirmwareMoveSourceOperator:  fwSourcePausedPre(),
-		ViaResumePartitionPaused:             fwMarker("m", "migrating", true, false),
-		ViaResumeFirmwareMoveTarget:          fwHold("resuming"),
-		ViaDiscardFirmwareMoveTarget:         fwHold("verified"),
-		ViaStopFirmwareMoveTargetForOperator: fwHold("released_unconfirmed"),
-		ViaUndefineFirmwareMoveLeftover:      fwMarker("m", "cleaning", false, true),
-		ViaMaterialiseFirmwareMoveNvram:      fwHold("prepared"),
-		ViaPushFirmwareMoveNvram:             fwHold("verified"),
-		ViaPushSourceNvramForOperator:        fwHold("released_unconfirmed"),
-		ViaWipeFirmwareMoveSource:            fwMarker("m", "cleaning", false, true),
-		ViaRemoveFirmwareMoveTargetState:     fwHold("prepared"),
-		ViaQuarantineFirmwareMoveTargetState: fwHold("mismatch"),
+		ViaResumeFirmwareMoveSource:                fwMarker("m", "migrating", true, false),
+		ViaResumeFirmwareMoveSourceOperator:        fwSourcePausedPre(),
+		ViaResumePartitionPaused:                   fwMarker("m", "migrating", true, false),
+		ViaResumeFirmwareMoveTarget:                fwHold("resuming"),
+		ViaDiscardFirmwareMoveTarget:               fwHold("verified"),
+		ViaStopFirmwareMoveTargetForOperator:       fwHold("released_unconfirmed"),
+		ViaUndefineFirmwareMoveLeftover:            fwMarker("m", "cleaning", false, true),
+		ViaMaterialiseFirmwareMoveNvram:            fwHold("prepared"),
+		ViaPushFirmwareMoveNvram:                   fwHold("verified"),
+		ViaPushSourceNvramForOperator:              fwHold("released_unconfirmed"),
+		ViaWipeFirmwareMoveSource:                  fwMarker("m", "cleaning", false, true),
+		ViaRemoveFirmwareMoveTargetState:           fwHold("prepared"),
+		ViaQuarantineFirmwareMoveTargetState:       fwHold("mismatch"),
+		ViaQuarantineFirmwareMoveSourceForOperator: fwMarker("m", "cleaning", false, false),
 	}
 	for _, x := range fwExempts() {
 		st, ok := allowing[x.via]

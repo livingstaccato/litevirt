@@ -723,7 +723,7 @@ func TestCleanupSource_StateChangedConditionNamesTheOperatorStep(t *testing.T) {
 	if !open {
 		t.Fatal("no cleanup condition")
 	}
-	for _, w := range []string{"changed after the cutover", "an operator", "D-5"} {
+	for _, w := range []string{"changed after the cutover", "lv doctor firmware-move", "--accept-target"} {
 		if !strings.Contains(c.Evidence, w) {
 			t.Errorf("evidence %s lacks %q", c.Evidence, w)
 		}

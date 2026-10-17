@@ -195,7 +195,8 @@ func (s *Server) raiseParkCondition(ctx context.Context, m fwmig.Marker, p fwmig
 		return
 	}
 	if action == "" {
-		action = "both copies of the firmware state are kept, and nothing is deleted until the move is resolved"
+		action = "both copies of the firmware state are kept, and nothing is deleted until the move is resolved; " +
+			"`lv doctor firmware-move <vm>` shows both records and the actions that resolve it"
 	}
 	if cerr := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{
 		Code: code, VM: m.VM, Attempt: m.Attempt, Source: s.hostName, Target: m.Target,
@@ -896,7 +897,7 @@ func (s *Server) RetryOwedFirmwareDiscardsOnce(ctx context.Context) {
 			if cerr := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{
 				Code: condFwmigDiscardOwed, VM: o.VM, Attempt: o.Attempt, Source: s.hostName, Target: o.Target,
 				Severity: corrosion.SeverityCritical, Detail: resp.GetDetail(),
-				Action: "the target's copy runs, and an operator resolves it on the target; the DISCARD is retried each interval",
+				Action: "the target's copy runs: `lv doctor firmware-move <vm> --discard-target --stop-target` discards it on the target; the DISCARD is retried each interval",
 			}); cerr != nil {
 				slog.Warn("live firmware move: raise the condition", "vm", o.VM, "code", condFwmigDiscardOwed, "error", cerr)
 			}

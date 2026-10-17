@@ -1100,3 +1100,54 @@ func TestFwmig_SweepsStaleTemps(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A hold the operator's D-5 --adopt-target-copy took to verified records who,
+// when, from which state, why and the target's hashes (spec §17 D-5, the hold
+// transition). The record is optional: a hold a move wrote, without it, reads
+// as before; one with it round-trips; an adoption missing who or when, or
+// naming an unknown state, does not read.
+//
+// Mutation: require the adoption key; drop the adoption check — red.
+func TestFwmig_HoldAdoption(t *testing.T) {
+	r := New(t.TempDir())
+	h := tHold(HoldVerified, NvramDone)
+	if err := r.PutHold(h); err != nil {
+		t.Fatal(err)
+	}
+	if got := fileKeys(t, filepath.Join(r.dataDir, HoldDir, "vm1.json")); reflect.DeepEqual(got, nil) || contains(got, "adoption") {
+		t.Fatalf("a move's hold carries %v; want no adoption key", got)
+	}
+	if _, _, err := r.GetHold("vm1"); err != nil {
+		t.Fatalf("a hold without an adoption: %v", err)
+	}
+	h.Adoption = &HoldAdoption{By: "alice", At: tSince, From: HoldMismatch, Reason: "the source host was lost",
+		PermallSHA256: tHashA, NvramSHA256: tHashB}
+	if err := r.PutHold(h); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := r.GetHold("vm1")
+	if err != nil || !ok || !reflect.DeepEqual(got, h) {
+		t.Fatalf("adopted hold round trip: %+v ok=%v err=%v", got, ok, err)
+	}
+	for name, a := range map[string]HoldAdoption{
+		"no_by":      {At: tSince, From: HoldPrepared},
+		"no_at":      {By: "alice", From: HoldPrepared},
+		"bad_from":   {By: "alice", At: tSince, From: "running"},
+		"bad_hashes": {By: "alice", At: tSince, From: HoldPrepared, PermallSHA256: "x"},
+	} {
+		a := a
+		h.Adoption = &a
+		if err := r.PutHold(h); err == nil {
+			t.Errorf("%s: an invalid adoption was written", name)
+		}
+	}
+}
+
+func contains(s []string, x string) bool {
+	for _, v := range s {
+		if v == x {
+			return true
+		}
+	}
+	return false
+}

@@ -628,9 +628,26 @@ func (f *FirmwareStore) QuarantineFirmwareMoveTargetState(vmName, uuid, attempt,
 	if err := f.moveGuard().check(FirmwareCall{Op: OpWipe, Name: vmName, UUID: uuid, Attempt: attempt, Via: ViaQuarantineFirmwareMoveTargetState}); err != nil {
 		return fmt.Errorf("quarantine target firmware state of %s: %w", vmName, err)
 	}
+	return f.quarantineMoveState(vmName, uuid, dir)
+}
+
+// QuarantineFirmwareMoveSourceForOperator moves a moved VM's source state
+// (swtpm tree, NVRAM) into dir, for the D-5 --accept-target action on a
+// source cleanup that stopped (spec §17 D-5, the cleaning row): the marker is
+// the attempt's, in phase cleaning. Nothing is deleted.
+func (f *FirmwareStore) QuarantineFirmwareMoveSourceForOperator(vmName, uuid, attempt, dir string) error {
+	if err := f.moveGuard().check(FirmwareCall{Op: OpWipe, Name: vmName, UUID: uuid, Attempt: attempt, Via: ViaQuarantineFirmwareMoveSourceForOperator}); err != nil {
+		return fmt.Errorf("quarantine source firmware state of %s: %w", vmName, err)
+	}
+	return f.quarantineMoveState(vmName, uuid, dir)
+}
+
+// quarantineMoveState moves the VM's NVRAM and swtpm tree into dir, durably,
+// once the guard allowed it.
+func (f *FirmwareStore) quarantineMoveState(vmName, uuid, dir string) error {
 	swtpm, ok := f.swtpmDir(uuid)
 	if !ok {
-		return fmt.Errorf("quarantine target firmware state of %s: invalid swtpm uuid %q", vmName, uuid)
+		return fmt.Errorf("quarantine firmware state of %s: invalid swtpm uuid %q", vmName, uuid)
 	}
 	if err := mkdirAllDurable(dir); err != nil {
 		return fmt.Errorf("quarantine %s: %w", vmName, err)

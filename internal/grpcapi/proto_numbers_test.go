@@ -403,6 +403,8 @@ func TestProtoNumbers_LiveFirmware(t *testing.T) {
 	for _, rpc := range []protoreflect.Name{
 		"PrepareLiveFirmwareTarget", "VerifyLiveFirmwareTarget",
 		"ReleaseLiveFirmwareTarget", "AbortLiveFirmwareTarget",
+		// lv doctor firmware-move (D2-18): the operator's RPC and the target's part.
+		"FirmwareMoveDoctor", "FirmwareMoveDoctorTarget",
 	} {
 		m := svc.Methods().ByName(rpc)
 		if m == nil {

@@ -89,6 +89,10 @@ const (
 	ViaQuarantineFirmwareMoveTargetState FirmwareExemption = "QuarantineFirmwareMoveTargetState"
 	ViaStopFirmwareMoveTargetForOperator FirmwareExemption = "StopFirmwareMoveTargetForOperator"
 	ViaPushSourceNvramForOperator        FirmwareExemption = "PushSourceNvramForOperator"
+	// ViaQuarantineFirmwareMoveSourceForOperator moves a cleaning move's
+	// source state into the quarantine (D-5 --accept-target on a cleanup the
+	// source state's change stopped).
+	ViaQuarantineFirmwareMoveSourceForOperator FirmwareExemption = "QuarantineFirmwareMoveSourceForOperator"
 )
 
 // FirmwareCall is one guarded call.
@@ -274,6 +278,10 @@ func exemptionAllows(r FirmwareMoveRecord, c FirmwareCall) bool {
 		// D-5 --push-source-nvram while the hold is released_unconfirmed
 		// (spec §5.y).
 		return hold && c.Op == OpWriteState && bound && r.State == FirmwareHoldReleasedUnconfirmed
+	case ViaQuarantineFirmwareMoveSourceForOperator:
+		// D-5 --accept-target on a source cleanup that stopped: the source
+		// state is moved aside, never deleted, from a cleaning marker.
+		return marker && c.Op == OpWipe && bound && r.State == FirmwarePhaseCleaning
 	}
 	return false
 }

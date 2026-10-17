@@ -18,9 +18,8 @@ import (
 // belongs to; the raw libvirt calls that undefine, resume, destroy or define a
 // domain appear only in the guarded internal/libvirt functions listed here.
 //
-// The owners of the D-5 operator entry points (ResumeFirmwareMoveSourceForOperator,
-// StopFirmwareMoveTargetForOperator, PushSourceNvramForOperator) come with
-// task D2-18; until then nothing may call them.
+// The D-5 operator entry points (`lv doctor firmware-move`, task D2-18) each
+// have one owner too, and that owner is reached only from the doctor.
 //
 // Mutation: call an exempt entry point from deleteVM — red; call
 // DomainUndefineFlags from a new function in internal/libvirt — red.
@@ -35,27 +34,46 @@ var fwExemptOwners = map[string][]string{
 	// The partition pauser resuming a guest it paused.
 	"ResumePartitionPaused": {"internal/health.PartitionPauser.resume"},
 	// Release, the one resume of a held target guest, and its H1 NVRAM push.
+	// The doctor's adopt on a target whose source host is lost releases the
+	// adopted guest through the same resume (D-5).
 	"ResumeFirmwareMoveTarget": {"internal/grpcapi.Server.resumeReleased"},
-	"resumeReleased":           {"internal/grpcapi.Server.ReleaseLiveFirmwareTarget"},
-	"PushFirmwareMoveNvram":    {"internal/grpcapi.Server.releaseH1"},
-	"releaseH1":                {"internal/grpcapi.Server.ReleaseLiveFirmwareTarget"},
-	// Abort, the one removal of a held target domain.
-	"DiscardFirmwareMoveTarget": {"internal/grpcapi.Server.AbortLiveFirmwareTarget"},
+	"resumeReleased":           {"internal/grpcapi.Server.ReleaseLiveFirmwareTarget", "internal/grpcapi.Server.doctorTargetLocalAdopt"},
+	// H1's push, and the D-5 push of held_domain_absent (H1's checks without
+	// "domain defined", D2-6 m-10).
+	"PushFirmwareMoveNvram": {"internal/grpcapi.Server.releaseH1", "internal/grpcapi.Server.pushSourceNvramForOperator"},
+	"releaseH1":             {"internal/grpcapi.Server.ReleaseLiveFirmwareTarget"},
+	// Abort, the one removal of a held target domain, and the D-5
+	// --discard-target on a target whose source holds no marker.
+	"DiscardFirmwareMoveTarget": {"internal/grpcapi.Server.AbortLiveFirmwareTarget", "internal/grpcapi.Server.doctorTargetLocalDiscard"},
 	// Cleanup, the one undefine of a moved VM's source definition and the
-	// one wipe of its source state.
+	// one wipe of its source state; the D-5 --accept-target on a stopped
+	// cleanup undefines the same way and quarantines instead of wiping.
 	"UndefineFirmwareMoveLeftover": {"internal/grpcapi.Server.undefineLiveFirmwareLeftover"},
-	"undefineLiveFirmwareLeftover": {"internal/grpcapi.Server.fwmigCleanupSource"},
+	"undefineLiveFirmwareLeftover": {"internal/grpcapi.Server.fwmigCleanupSource", "internal/grpcapi.Server.quarantineFirmwareMoveSource"},
 	"WipeFirmwareMoveSource":       {"internal/grpcapi.Server.fwmigCleanupSource"},
 	// Prepare's materialisation; rule D and rule Q of the hold's disposal.
 	"MaterialiseFirmwareMoveNvram":      {"internal/grpcapi.Server.PrepareLiveFirmwareTarget"},
 	"RemoveFirmwareMoveTargetState":     {"internal/grpcapi.Server.deleteHoldState"},
 	"deleteHoldState":                   {"internal/grpcapi.Server.disposePreparedHold", "internal/grpcapi.Server.AbortLiveFirmwareTarget"},
 	"QuarantineFirmwareMoveTargetState": {"internal/grpcapi.Server.quarantineHold"},
-	"quarantineHold":                    {"internal/grpcapi.Server.disposePreparedHold", "internal/grpcapi.Server.AbortLiveFirmwareTarget", "internal/grpcapi.Server.sweepFirmwareHold"},
-	// D-5 (task D2-18): no caller yet.
-	"ResumeFirmwareMoveSourceForOperator": nil,
-	"StopFirmwareMoveTargetForOperator":   nil,
-	"PushSourceNvramForOperator":          nil,
+	"quarantineHold": {"internal/grpcapi.Server.disposePreparedHold", "internal/grpcapi.Server.AbortLiveFirmwareTarget", "internal/grpcapi.Server.sweepFirmwareHold",
+		"internal/grpcapi.Server.doctorTargetLocalDiscard"},
+	// D-5 (`lv doctor firmware-move`, D2-18): each operator entry point from
+	// its one action, and each action only from the doctor.
+	"ResumeFirmwareMoveSourceForOperator":     {"internal/grpcapi.Server.doctorAcceptSourcePaused"},
+	"doctorAcceptSourcePaused":                {"internal/grpcapi.Server.doctorAcceptSource"},
+	"StopFirmwareMoveTargetForOperator":       {"internal/grpcapi.Server.stopHeldGuestForOperator"},
+	"stopHeldGuestForOperator":                {"internal/grpcapi.Server.FirmwareMoveDoctorTarget", "internal/grpcapi.Server.doctorTargetLocalDiscard"},
+	"PushSourceNvramForOperator":              {"internal/grpcapi.Server.pushSourceNvramForOperator"},
+	"pushSourceNvramForOperator":              {"internal/grpcapi.Server.FirmwareMoveDoctorTarget"},
+	"QuarantineFirmwareMoveSourceForOperator": {"internal/grpcapi.Server.quarantineFirmwareMoveSource"},
+	"quarantineFirmwareMoveSource":            {"internal/grpcapi.Server.doctorAcceptTarget", "internal/grpcapi.Server.doctorAdopt"},
+	"doctorTargetLocalDiscard":                {"internal/grpcapi.Server.doctorTargetLocalAct"},
+	"doctorTargetLocalAdopt":                  {"internal/grpcapi.Server.doctorTargetLocalAct"},
+	"adoptHold":                               {"internal/grpcapi.Server.FirmwareMoveDoctorTarget", "internal/grpcapi.Server.doctorTargetLocalAdopt"},
+	"doctorTargetLocalAct":                    {"internal/grpcapi.Server.firmwareMoveDoctorAct"},
+	"doctorSourceAct":                         {"internal/grpcapi.Server.firmwareMoveDoctorAct"},
+	"firmwareMoveDoctorAct":                   {"internal/grpcapi.Server.FirmwareMoveDoctor"},
 }
 
 // fwRawLibvirt: the raw libvirt calls that undefine, resume, destroy or

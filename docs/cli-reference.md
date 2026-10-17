@@ -1441,6 +1441,13 @@ lv doctor divergence [--json] [--table <name>]... [--include-sensitive]   # Repo
 lv doctor repair-owner <vm> <host>           # Re-assert a VM's owner on the host that actually runs it (audited)
 lv doctor fence                              # Report whether a shared-disk VM's cross-host transfer would be fenced and whether every host enforces recovery claims (read-only)
 lv doctor privileged-containers              # Report privileged or legacy-confined containers (read-only)
+lv doctor firmware-move <vm> [--json]        # Show a live firmware migration's records on every host, with every hash and path (read-only)
+lv doctor firmware-move <vm> --accept-target | --reverify | --adopt-target-copy | --discard-target [--stop-target]
+lv doctor firmware-move <vm> --accept-source [--acknowledge-rollback] [--stop-target]
+lv doctor firmware-move <vm> --confirm-target-nvram --accept-nvram-hash=<sha256>
+lv doctor firmware-move <vm> --push-source-nvram [--acknowledge-rollback] [--stop-target]
+lv doctor firmware-move <vm> --resolve unverified|quarantine
+                                             # Resolve a parked live firmware move (admin, vm.firmware-move; audited)
 ```
 
 `divergence` is read-only, and lists a lease-term tie that every host has
@@ -1449,6 +1456,13 @@ audited, admin-gated repair for an equal-timestamp ownership split a stationary 
 splits are reclaimed automatically by the runtime-repair reconcilers — see
 `docs/diagnostics.md` for the full model (categories, metrics, alerts, and the
 operational repair flow).
+
+`firmware-move` resolves a live Secure Boot / vTPM migration that parked, on
+the host whose record it acts on, by the move's state: see
+[Live firmware migration](diagnostics.md#live-firmware-migration-firmware_migration_)
+for which action takes which state. It refuses an action the state has no row
+for. `--acknowledge-rollback` is required where the source's copy may be older
+than the target's.
 
 ## Ansible integration
 

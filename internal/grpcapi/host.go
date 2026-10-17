@@ -565,7 +565,8 @@ func (s *Server) drainOutcome(ctx context.Context, host string, failed, notStart
 			// A drain moves only running and stopped VMs, so these have no
 			// result of their own to read.
 			next = fmt.Sprintf("; the drain did not try to move %s (neither running nor stopped): "+
-				"start each with `lv start <vm>` and drain again, or remove it with `lv rm <vm>`",
+				"start each with `lv start <vm>` and drain again, or remove it with `lv rm <vm>`; "+
+				"a VM a live firmware move left `migrating` is resolved with `lv doctor firmware-move <vm>`",
 				strings.Join(untried, ", "))
 		}
 		return status.Errorf(codes.FailedPrecondition,

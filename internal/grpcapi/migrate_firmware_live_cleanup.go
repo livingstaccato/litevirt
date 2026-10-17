@@ -150,8 +150,8 @@ func (s *Server) liveFirmwareCleanupStopped(ctx context.Context, m fwmig.Marker,
 			"each minute, and at daemon start, the firmware move recovery checks the target again and resumes the cleanup once the cause is fixed"
 	case errors.Is(cause, errFirmwareCleanupStateChanged):
 		action = "the VM runs on the target from the verified copy; the source's firmware state changed after the cutover, " +
-			"so it is kept and never wiped automatically, and a retry cannot heal it: an operator saves the state at the paths named " +
-			"and resolves the move with the D-5 firmware-move doctor (task D2-18); until then the marker keeps the state and vetoes its use"
+			"so it is kept and never wiped automatically, and a retry cannot heal it: `lv doctor firmware-move <vm> --accept-target` " +
+			"moves it into the quarantine here and ends the move; until then the marker keeps the state and vetoes its use"
 	}
 	if s.cleanupConditionOpenWith(ctx, m.VM, detail) {
 		slog.Debug("live firmware move: the source cleanup is still stopped", "vm", m.VM, "attempt", m.Attempt, "step", step, "error", cause)

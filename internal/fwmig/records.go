@@ -332,6 +332,21 @@ type Hold struct {
 	NvramT0SHA256         string            `json:"nvram_t0_sha256"`
 	SwtpmAbsentAtPrepare  bool              `json:"swtpm_absent_at_prepare"`
 	VerifiedPermallSHA256 string            `json:"verified_permall_sha256"`
+	// Adoption, when set, records the operator's D-5 --adopt-target-copy that
+	// took the hold to verified (or resuming) without a Verify MATCH (spec
+	// §17 D-5, the hold transition). Absent from every hold a move writes.
+	Adoption *HoldAdoption `json:"adoption,omitempty"`
+}
+
+// HoldAdoption is who adopted the target's copy, when, from which hold state,
+// why, and the target's hashes then.
+type HoldAdoption struct {
+	By            string    `json:"by"`
+	At            time.Time `json:"at"`
+	From          HoldState `json:"from"`
+	Reason        string    `json:"reason"`
+	PermallSHA256 string    `json:"permall_sha256"`
+	NvramSHA256   string    `json:"nvram_sha256"`
 }
 
 // Validate checks every field's domain.
@@ -356,6 +371,17 @@ func (h Hold) Validate() error {
 	}
 	if err := validateHash("nvram_t0_sha256", h.NvramT0SHA256); err != nil {
 		return err
+	}
+	if a := h.Adoption; a != nil {
+		if a.By == "" || a.At.IsZero() || !a.From.Valid() {
+			return fmt.Errorf("hold %s: adoption needs by, at and a known from state", h.VM)
+		}
+		if err := validateHash("adoption.permall_sha256", a.PermallSHA256); err != nil {
+			return err
+		}
+		if err := validateHash("adoption.nvram_sha256", a.NvramSHA256); err != nil {
+			return err
+		}
 	}
 	return validateHash("verified_permall_sha256", h.VerifiedPermallSHA256)
 }
@@ -641,6 +667,11 @@ func (r *Records) get(path string, v interface{ Validate() error }) (bool, error
 // nullableKeys may be JSON null: a nil list encodes as null.
 var nullableKeys = map[string]bool{"created_stubs": true}
 
+// optionalKeys may be absent: a record field a move never writes, only an
+// operator's D-5 action (a hold's adoption). A record written before the
+// field existed reads as it did.
+var optionalKeys = map[string]bool{"adoption": true}
+
 // requireKeys fails unless the object b carries every key of v's type,
 // non-null: a missing key must not decode as a zero value
 // (swtpm_absent_at_prepare=false is a statement, not a default).
@@ -652,6 +683,9 @@ func requireKeys(b []byte, v any) error {
 	for _, k := range jsonKeys(reflect.TypeOf(v).Elem()) {
 		raw, ok := obj[k]
 		if !ok {
+			if optionalKeys[k] {
+				continue
+			}
 			return fmt.Errorf("missing key %q", k)
 		}
 		if !nullableKeys[k] && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {

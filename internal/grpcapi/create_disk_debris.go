@@ -76,13 +76,15 @@ func (s *Server) noteKeptDisks(ctx context.Context, name string, keepDisks bool)
 // <path>.superseded-<time> (health.SetAsideBeforeCreate); each move is a VM
 // event of the name, as is each path of the deleted VM's disks that reads as
 // missing on what may be a volume not mounted yet. An error refuses the
-// create: nothing was removed.
-func (s *Server) clearDiskDebrisBeforeCreate(ctx context.Context, name string, now time.Time) error {
+// create: nothing was removed. The files it moved are returned, with an error
+// too, so a create that fails puts the kept ones back
+// (restoreKeptAfterFailedCreate).
+func (s *Server) clearDiskDebrisBeforeCreate(ctx context.Context, name string, now time.Time) ([]health.MovedBeforeCreate, error) {
 	candidates, err := s.images.VMDiskCandidates(name)
 	if err != nil {
 		slog.Error("create: skipping the disk debris sweep; its candidate list is unreadable",
 			"vm", name, "error", err)
-		return nil
+		return nil, nil
 	}
 	keep := s.protectedDiskPathsFrom(ctx, name, candidates)
 	var unlink []string
@@ -120,10 +122,10 @@ func (s *Server) clearDiskDebrisBeforeCreate(ctx context.Context, name string, n
 		event(typ, sev, detail)
 	}
 	if err != nil {
-		return err
+		return done.Moved, err
 	}
 	if err := s.images.DeleteVMDisksIn(name, candidates, keep); err != nil {
 		slog.Warn("create: disk debris sweep failed", "vm", name, "error", err)
 	}
-	return nil
+	return done.Moved, nil
 }

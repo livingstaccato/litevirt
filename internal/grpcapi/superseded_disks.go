@@ -27,6 +27,9 @@ const SupersededNamedOnlySec = 9_000_000_000
 // keptHeld is a .kept- file's held reason in a SupersededDisks answer.
 const keptHeld = "a disk a deleted VM was kept with; only an operator removes it, by hand"
 
+// keptSeedHeld is a .kept- seed's held reason in a SupersededDisks answer.
+const keptSeedHeld = "a cloud-init seed a deleted VM was kept with, which can hold user-data; only an operator removes it, by hand"
+
 // SetSupersededDiskRetentionDays records superseded_disk_retention_days, which
 // a SupersededDisks answer reports (the sweep itself runs in the daemon).
 func (s *Server) SetSupersededDiskRetentionDays(days int) { s.supersededRetentionDays = days }
@@ -137,9 +140,13 @@ func (s *Server) SupersededDisks(ctx context.Context, req *pb.SupersededDisksReq
 		slog.Warn("superseded disks: the kept disks could not be listed; the answer has none", "error", err)
 	}
 	for _, k := range kept {
+		held := keptHeld
+		if k.Seed {
+			held = keptSeedHeld
+		}
 		resp.Disks = append(resp.Disks, &pb.SupersededDisk{
 			Path: k.Path, DiskPath: k.DiskPath, SetAsideAt: k.MovedAt.UTC().Format(time.RFC3339), SizeBytes: k.SizeBytes,
-			Held: keptHeld, Kept: true,
+			Held: held, Kept: true, Seed: k.Seed,
 		})
 	}
 	return resp, nil

@@ -1544,8 +1544,13 @@ The restart is not silent, and the real disk is not lost:
   disk stays at its path. It also stays there when the record does not say
   what the delete decided: a delete by an earlier release, or one whose mark
   on the record was lost to a later write of it. The host also removes the
-  VM's cloud-init seed there (`cloudinit/<vm>.iso`) if this release wrote it;
-  a seed from an earlier release stays.
+  VM's cloud-init seed there (`cloudinit/<vm>.iso`) if this release wrote it,
+  except in these cases, where the seed stays: after `lv rm --keep-disks`,
+  whether or not a disk is still at its path (one set aside before the delete
+  is not); when a disk stays at its path for one of the other reasons above;
+  and for a seed from an earlier release. A seed that stays can hold
+  user-data, and nothing removes it but an operator: while no VM of the name
+  exists, `lv host superseded-disks <host>` lists it as `kept`.
 - A VM of the same name created on that host before then clears
   `<data_dir>/disks/<vm>-<disk>.qcow2` files the earlier VM left. Of those, a
   disk that a failover left at its path is first renamed to
@@ -1579,8 +1584,9 @@ rebuilt disk the only copy of its data from before the failover was deleted.
 
 To see the copies on a host, with the VM each came from, when it was set aside
 and whether it is retained or held, run `lv host superseded-disks <host>`.
-It also lists each `.kept-` file there, marked `kept`, which none of the
-options below takes. The options need the admin role and are audited:
+It also lists each `.kept-` file there, marked `kept`, and each `.kept-`
+cloud-init seed in `<data_dir>/cloudinit`, which can hold user-data; none of
+the options below takes one. The options need the admin role and are audited:
 
 - `--purge` removes every copy that is neither retained nor held, whatever its
   age; `--older-than <duration>` narrows it (`host.superseded_disks.purge`).

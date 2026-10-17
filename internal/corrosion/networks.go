@@ -372,6 +372,11 @@ func migrateVMSpecNetworkNames(ctx context.Context, c *Client, renamed map[strin
 			continue
 		}
 
+		// The same VM: it keeps its firewall identity.
+		updated, err = keepFirewallID(TagMemberVM, updated, firewallIDOf(TagMemberVM, spec))
+		if err != nil {
+			return err
+		}
 		slog.Info("migrating VM spec network names", "vm", vmName)
 		_ = c.Execute(ctx,
 			`UPDATE vms SET spec = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,

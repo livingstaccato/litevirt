@@ -1317,7 +1317,12 @@ func (s *Server) RestoreContainerReplica(ctx context.Context, req *pb.RestoreCon
 			return nil, status.Errorf(codes.Unavailable, "reach host %q: %v", host, err)
 		}
 		defer closeConn()
-		return c.RestoreContainerReplica(metadata.AppendToOutgoingContext(ctx, repairActorMDKey, actor), req)
+		var hdr metadata.MD
+		resp, err := c.RestoreContainerReplica(metadata.AppendToOutgoingContext(ctx, repairActorMDKey, actor), req, grpc.Header(&hdr))
+		if left := hdr.Get(firewallTagsLeftMD); err == nil && len(left) == 1 {
+			_ = grpc.SetHeader(ctx, metadata.Pairs(firewallTagsLeftMD, left[0]))
+		}
+		return resp, err
 	}
 	cts, err := corrosion.ListContainers(ctx, s.db, "")
 	if err != nil {
@@ -1341,6 +1346,9 @@ func (s *Server) RestoreContainerReplica(ctx context.Context, req *pb.RestoreCon
 	if err := s.confirmNoLiveCopy(ctx, project, req.GetName(), source); err != nil {
 		return nil, err
 	}
+	// The restored container is a new one, with no firewall identity: what the
+	// deleted container of this name left is read before its row lands.
+	tagsLeft := s.firewallTagsLeftNote(ctx, corrosion.TagMemberCT, project, req.GetName(), s.hostName)
 	rctx := context.WithValue(ctx, operatorReplicaRestoreKey{}, true)
 	st := &localRestoreStream{ctx: rctx}
 	if err := s.RestoreContainer(&pb.RestoreContainerRequest{
@@ -1353,6 +1361,9 @@ func (s *Server) RestoreContainerReplica(ctx context.Context, req *pb.RestoreCon
 	}
 	s.auditAs(ctx, actor, "ct.replica.restore", req.GetName(),
 		fmt.Sprintf("project=%s repo=%s replica=%s restored stopped on %s", project, req.GetRepo(), req.GetTimestamp(), s.hostName), "ok")
+	if tagsLeft != "" {
+		_ = grpc.SetHeader(ctx, metadata.Pairs(firewallTagsLeftMD, tagsLeft))
+	}
 	return &pb.RestoreContainerReplicaResponse{Host: s.hostName}, nil
 }
 

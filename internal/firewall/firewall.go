@@ -283,6 +283,9 @@ type Plan struct {
 	IPSets         []IPSet
 	NICs           []NICBinding
 
+	// TagGroups is what the loader could not render as the tag groups ask.
+	TagGroups TagGroupReport
+
 	// NAT (postrouting masquerade + SNAT) and HostIsolation (input drops) are
 	// per-host infra rules folded in from the old out-of-band paths. They render
 	// into their own hook chains in the same table, so the atomic replace keeps

@@ -106,10 +106,10 @@ func ipSetFeatures(cidrs []string) ([]capabilities.Feature, error) {
 // ruleRowFeatures is the check every rule a client sends passes before any
 // release gate is asked or anything is stored, and the release features its
 // write then needs (the writeFirewallRow need and invalid arguments). In
-// order: a form a client may not send on this build (a "+" action suffix, a
-// tag-group cidr: corrosion.RefuseClientRuleForm), then the grammar the
-// renderer writes into an nft script (finding F-1), then the row's features
-// (corrosion.FirewallRowFeatures).
+// order: a form a client may not send (a "+" action suffix:
+// corrosion.RefuseClientRuleForm), then the grammar the renderer writes into
+// an nft script (finding F-1, with the tag-group cidr tag:<group>), then the
+// row's features (corrosion.FirewallRowFeatures).
 func ruleRowFeatures(direction, proto, port, cidr, action, comment string) ([]capabilities.Feature, error) {
 	if err := corrosion.RefuseClientRuleForm(cidr, action); err != nil {
 		return nil, err
@@ -127,6 +127,27 @@ func ipSetRowFeatures(name string, cidrs []string) ([]capabilities.Feature, erro
 		return nil, err
 	}
 	return ipSetFeatures(cidrs)
+}
+
+// refuseUnknownTagGroup refuses a new rule whose cidr names a tag group this
+// replica does not hold (removed, or never set). A rule written ahead of its
+// group would match nothing as an accept and lose its address as a deny
+// (spec §4.6) from the moment it is stored. It is asked once the
+// firewall_tag_groups gate has granted, so before the latch the refusal is
+// the release text. A group whose row cannot be read exists.
+func (s *Server) refuseUnknownTagGroup(ctx context.Context, cidr string) error {
+	name, ok := rulefield.TagCIDRName(cidr)
+	if !ok {
+		return nil
+	}
+	_, exists, err := corrosion.GetFirewallTagGroup(ctx, s.db, name)
+	if err != nil {
+		return status.Errorf(codes.Internal, "read tag group %s: %v", name, err)
+	}
+	if !exists {
+		return status.Errorf(codes.FailedPrecondition, "cidr %q: tag group %q does not exist; set the group before a rule references it", cidr, name)
+	}
+	return nil
 }
 
 // firewallWriteErr is a firewall-row write's error as the handler returns it:
@@ -227,6 +248,9 @@ func (s *Server) CreateClusterFirewallRule(ctx context.Context, req *pb.CreateCl
 	row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
 	need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, row.Comment)
 	if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
+		if err := s.refuseUnknownTagGroup(ctx, row.CIDR); err != nil {
+			return err
+		}
 		return corrosion.InsertClusterFirewallRuleWithGrant(ctx, s.db, g.IPv6, g.Log, g.Tag, row)
 	}); err != nil {
 		return nil, firewallWriteErr(err, codes.InvalidArgument, "create cluster rule")
@@ -284,6 +308,9 @@ func (s *Server) CreateHostFirewallRule(ctx context.Context, req *pb.CreateHostF
 	row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
 	need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, row.Comment)
 	if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
+		if err := s.refuseUnknownTagGroup(ctx, row.CIDR); err != nil {
+			return err
+		}
 		return corrosion.InsertHostFirewallRuleWithGrant(ctx, s.db, g.IPv6, g.Log, g.Tag, row)
 	}); err != nil {
 		return nil, firewallWriteErr(err, codes.InvalidArgument, "create host rule")

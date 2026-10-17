@@ -86,7 +86,8 @@ func TestFirewallRuleWriters_EachFeatureNeedsItsOwnGrant(t *testing.T) {
 			return InsertHostFirewallRuleWithGrant(ctx, c, g, gl, gt, FirewallRule{ID: fmt.Sprint("h", n), HostName: "h", Direction: "ingress", Proto: "tcp", CIDR: cidr, Action: action})
 		},
 	}
-	// This build: no extension, so the grammar refuses both forms first.
+	// No extension: the grammar refuses both forms first.
+	rulefield.SetExtensionsForTest(t, rulefield.Extensions{})
 	for name, w := range writers {
 		for _, r := range []struct {
 			what         string
@@ -146,24 +147,26 @@ func TestFirewallRuleWriters_EachFeatureNeedsItsOwnGrant(t *testing.T) {
 }
 
 // A client's rule (FirewallRowFeatures, the handler and stack entry) may not
-// carry a "+" in its action, and may not name a tag-group cidr while this
-// build renders none: either would be stored and make every host refuse its
-// plan. Ordinary IPv4 and IPv6 rules pass as before.
+// carry a "+" in its action: it would be stored as the server's log form. A
+// tag-group cidr is classified (D5a). Ordinary IPv4 and IPv6 rules pass as
+// before.
 //
-// Mutations: drop the "+" refusal — drop+log is classified, red; drop the
-// tag refusal — tag:web is classified, red.
+// Mutation: drop the "+" refusal — drop+log is classified, red.
 func TestFirewallRowFeatures_RefusesClientLogAndTagForms(t *testing.T) {
 	for _, tc := range []struct{ cidr, action string }{
 		{"10.0.0.0/8", "drop+log"},
 		{"10.0.0.0/8", "accept+"},
 		{"2001:db8::/32", "REJECT+LOG"},
-		{"tag:web", "accept"},
-		{"tag:web", "drop"},
+		{"tag:web", "drop+log"},
 	} {
 		got, err := FirewallRowFeatures(tc.cidr, "tcp", tc.action)
 		if !errors.Is(err, ErrFirewallRuleFormUnsupported) || !strings.Contains(err.Error(), "not supported") {
 			t.Errorf("client rule %q/%q = %v, %v; want ErrFirewallRuleFormUnsupported", tc.cidr, tc.action, got, err)
 		}
+	}
+	if got, err := FirewallRowFeatures("tag:web", "tcp", "accept"); err != nil ||
+		!slices.Equal(got, []capabilities.Feature{capabilities.FeatureFirewallTagGroups}) {
+		t.Errorf("a client tag rule = %v, %v; want firewall_tag_groups", got, err)
 	}
 	if got, err := FirewallRowFeatures("2001:db8::/32", "tcp", "drop"); err != nil ||
 		!slices.Equal(got, []capabilities.Feature{capabilities.FeatureFirewallIPv6}) {

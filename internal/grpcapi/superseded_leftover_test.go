@@ -14,6 +14,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
 
@@ -203,6 +204,61 @@ func TestDeleteVM_InProcessDeleteWaitsForNoHost(t *testing.T) {
 	}
 	if d := time.Since(start); d >= time.Second {
 		t.Fatalf("an in-process delete took %s: it waited for a host", d)
+	}
+}
+
+// A peer-search probe (x-lv-delete-local-only) waits for no host: the
+// probing host holds the VM's lock and start lease until it answers, and is
+// itself among the hosts the VM left, so a wait there would stall the full
+// deletedVMCleanupReportWait on the prober's own lock and name it pending.
+//
+// Red on a28d65c4: the probe takes the full wait and names node-4 pending.
+// Mutation: drop the deleteLocalOnly check in withLeftoverSink — red.
+func TestDeleteVM_LocalOnlyProbeWaitsForNoHost(t *testing.T) {
+	s, _, _ := deleteFixture(t, 2*time.Second)
+	// node-4 is the probing host: the row names it, and it recorded events
+	// of the VM, so it is in plan.left; its CleanupMigrationArtifacts blocks
+	// as the prober's own lockVM would.
+	if _, err := s.db.ExecuteRows(adminCtx(), `UPDATE vms SET host_name = 'node-4' WHERE name = 'os1'`); err != nil {
+		t.Fatal(err)
+	}
+	hs := &headerStream{}
+	ctx := metadata.NewIncomingContext(adminCtx(), metadata.Pairs("x-lv-delete-local-only", "1"))
+	ctx = grpc.NewContextWithServerTransportStream(ctx, hs)
+	start := time.Now()
+	if _, err := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: "os1"}); err != nil {
+		t.Fatalf("DeleteVM (probe): %v", err)
+	}
+	if d := time.Since(start); d >= time.Second {
+		t.Fatalf("a peer-search probe took %s: it waited for a host", d)
+	}
+	if v := hs.hdr.Get(LeftoverDomainMD); len(v) != 0 {
+		t.Fatalf("a peer-search probe named hosts: %v", v)
+	}
+}
+
+// The hosts a delete waits for include one whose event of this incarnation
+// came within created_at's second, however created_at is written: vm_events.ts
+// is fixed-width, created_at bare or with trailing zeros trimmed, and the two
+// are compared as text.
+//
+// Red on a28d65c4: both hosts are missing. Mutation: compare against
+// created_at as written — red.
+func TestVMLeftHosts_ComparesCreatedAtInTheEventsLayout(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	ctx := adminCtx()
+	for _, tc := range []struct{ createdAt, host, ts string }{
+		{"2026-10-17T10:00:00Z", "node-5", "2026-10-17T10:00:00.500000000Z"},
+		{"2026-10-17T11:00:00.12Z", "node-6", "2026-10-17T11:00:00.120000001Z"},
+	} {
+		name := "vm-" + tc.host
+		if err := corrosion.InsertVMEvent(ctx, s.db, corrosion.VMEventRecord{VMName: name, HostName: tc.host, Type: "vm.started", Result: "ok", TS: tc.ts}); err != nil {
+			t.Fatal(err)
+		}
+		left := s.vmLeftHosts(ctx, &corrosion.VMRecord{Name: name, CreatedAt: tc.createdAt}, deletedVMLeftovers{hosts: []string{tc.host}})
+		if !left[tc.host] {
+			t.Errorf("created_at %s, event at %s on %s: left = %v", tc.createdAt, tc.ts, tc.host, left)
+		}
 	}
 }
 

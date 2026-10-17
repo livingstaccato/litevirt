@@ -191,14 +191,24 @@ func (s *Server) vmLeftHosts(ctx context.Context, vm *corrosion.VMRecord, plan d
 			add(ev.Host)
 		}
 	}
+	// ts is compared as TEXT, so created_at (RFC3339, bare or with trailing
+	// zeros trimmed) is put in ts's fixed-width layout first.
+	since := vm.CreatedAt
+	if t, err := time.Parse(time.RFC3339Nano, vm.CreatedAt); err == nil {
+		since = t.UTC().Format(vmEventTSLayout)
+	}
 	if rows, err := s.db.Query(ctx, `SELECT DISTINCT host_name FROM vm_events WHERE vm_name = ? AND ts >= ?`,
-		vm.Name, vm.CreatedAt); err == nil {
+		vm.Name, since); err == nil {
 		for _, r := range rows {
 			add(r.String("host_name"))
 		}
 	}
 	return left
 }
+
+// vmEventTSLayout is vm_events.ts's fixed-width layout (corrosion's
+// nowTSLayout).
+const vmEventTSLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
 // LeftoverDomainMD is the DeleteVM response header naming, one JSON
 // LeftoverDomain per host, a host the VM may have left that declined to
@@ -290,9 +300,11 @@ const deleteVMMethod = "/litevirt.v1.LiteVirt/DeleteVM"
 
 // withLeftoverSink gives a DeleteVM served for a gRPC caller of DeleteVM
 // itself a sink; an in-process caller (a stack teardown, a rolling recreate)
-// gets none, so its deletes do not wait.
+// gets none, so its deletes do not wait. Neither does a peer-search probe
+// (deleteLocalOnly): the probing host holds the VM's lock and start lease
+// while it waits for the answer.
 func withLeftoverSink(ctx context.Context) (context.Context, *leftoverSink) {
-	if m, ok := grpc.Method(ctx); !ok || m != deleteVMMethod {
+	if m, ok := grpc.Method(ctx); !ok || m != deleteVMMethod || deleteLocalOnly(ctx) {
 		return ctx, nil
 	}
 	sink := &leftoverSink{}

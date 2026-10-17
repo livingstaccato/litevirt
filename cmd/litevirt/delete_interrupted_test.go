@@ -40,11 +40,17 @@ func TestInterruptedDelete(t *testing.T) {
 // A rebuild or a deploy the client stopped waiting for is said to be the
 // operation that may still complete, not a delete.
 //
-// Mutation: word interruptedOp's message for a delete whatever op is — red.
+// Mutations: word interruptedOp's message for a delete whatever op is, or
+// word a deadline as an interruption — red.
 func TestInterruptedOp(t *testing.T) {
 	err := interruptedOp("rebuild web", "rebuild", status.Error(codes.Canceled, "context canceled"), "lv ls")
 	if err == nil || !strings.Contains(err.Error(), "the rebuild may still complete") || !strings.Contains(err.Error(), "`lv ls`") {
 		t.Fatalf("interrupted rebuild: %v", err)
+	}
+	late := interruptedOp("compose up st", "deploy", status.Error(codes.DeadlineExceeded, "deadline exceeded"), "lv ls")
+	if late == nil || strings.Contains(late.Error(), "interrupted") || !strings.Contains(late.Error(), "timed out") ||
+		!strings.Contains(late.Error(), "the deploy may still complete") || !strings.Contains(late.Error(), "`lv ls`") {
+		t.Errorf("a deadline is worded as an interruption, or names no check: %v", late)
 	}
 	if got := interruptedOp("rebuild web", "rebuild", status.Error(codes.FailedPrecondition, "no"), "lv ls"); got != nil {
 		t.Errorf("a refusal reported as interrupted: %v", got)

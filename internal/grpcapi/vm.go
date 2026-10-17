@@ -3421,8 +3421,15 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// recorded stopped by its operator, as a delete that fails after
 		// its stop leaves it (abortDeleteAfterStop): no start path starts
 		// it, whatever this delete then manages. Nothing is done when
-		// that write fails.
+		// that write fails, nor while libvirt does not confirm there is no
+		// domain here: stopped written over a live guest would not be
+		// synced back.
 		if (vm.State == "pending" || vm.State == "starting" || vm.State == "running") && vm.HostName == s.hostName {
+			if _, aerr := s.virt.DomainIsActive(req.Name); !lv.IsNoDomain(aerr) {
+				return nil, status.Errorf(codes.Unavailable,
+					"cannot delete VM %q: its row says %s, and libvirt does not confirm it has no domain on %s (%v); nothing was done (retry is safe)",
+					req.Name, vm.State, s.hostName, aerr)
+			}
 			if werr := s.persistVMState(ctx, req.Name, "stopped", "operator-stop", corrosion.OpVMState); werr != nil {
 				return nil, status.Errorf(codes.Internal,
 					"cannot delete VM %q: its row says %s, and recording its stop before cleaning up its record failed; nothing was done: %v",

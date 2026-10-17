@@ -138,6 +138,10 @@ func NewTestClient() (*Client, error) {
 		membershipNotify: make(chan struct{}, 1),
 	}
 	c.SetLeaseTermLedgerGate(testLeaseTermLedgerOpen)
+	// Test clients start as replicas that have merged the sensitive lane, as
+	// they start converged; a test of the gate resets it
+	// (MarkSensitiveLaneUnmergedForTests).
+	c.sensitiveLaneMerged.Store(true)
 	return c, nil
 }
 
@@ -211,6 +215,10 @@ func NewSharedTestClient(dsnSuffix, hostName string) (*Client, error) {
 		membershipNotify: make(chan struct{}, 1),
 	}
 	c.SetLeaseTermLedgerGate(testLeaseTermLedgerOpen)
+	// Test clients start as replicas that have merged the sensitive lane, as
+	// they start converged; a test of the gate resets it
+	// (MarkSensitiveLaneUnmergedForTests).
+	c.sensitiveLaneMerged.Store(true)
 	return c, nil
 }
 
@@ -402,3 +410,7 @@ func (c *Client) ResetAuditSeededForTests() {
 	s.unpersisted, s.pendingSeeded, s.pendingReason = false, false, ""
 	s.assertNonce = ""
 }
+
+// MarkSensitiveLaneUnmergedForTests puts c back in the state of a process that
+// has not completed a sensitive-lane exchange with any peer yet.
+func (c *Client) MarkSensitiveLaneUnmergedForTests() { c.sensitiveLaneMerged.Store(false) }

@@ -1498,6 +1498,13 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 			r.client.deferAfterCommit(tx, func() { r.client.noteRemintCredentialRefused(pathWAL) })
 			continue
 		}
+		// A credential upsert that would revive a retired host credential
+		// without an operator's password write (credentials_revive_guard.go).
+		if refuse, err := refuseUnpairedCredentialRevive(ctx, tx, s, stmts); err != nil {
+			return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+		} else if refuse {
+			continue
+		}
 		if err := r.applyStatementLWW(ctx, tx, s, entry.Hlc); err != nil {
 			// A held entry's periodic retry is not a new refusal: counting it
 			// would keep the rejected-rate alert firing while it is held.

@@ -524,6 +524,9 @@ func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVir
 	}
 
 	mismatched := ae.drift.mismatches(peerName, resp.Tables, localMap)
+	if len(mismatched) == 0 {
+		ae.client.markSensitiveLaneMerged(peerName)
+	}
 	if usersUnjudged && slices.Contains(mismatched, "user_credentials") {
 		mismatched = slices.DeleteFunc(mismatched, func(t string) bool { return t == "user_credentials" })
 		slog.Warn("anti-entropy: not repairing user_credentials from a peer whose users rows were not judged this cycle",
@@ -556,6 +559,7 @@ func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVir
 		return
 	}
 	slog.Info("anti-entropy: sensitive merge complete", "peer", peerName, "tables", mismatched)
+	ae.client.markSensitiveLaneMerged(peerName)
 }
 
 // fetchStateDump pulls a peer's full state dump, preferring the chunked

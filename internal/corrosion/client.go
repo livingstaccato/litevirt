@@ -432,6 +432,9 @@ type Client struct {
 	// credentialsLiveFile. credentialsLiveChecked makes the file read once.
 	credentialsLive        atomic.Bool
 	credentialsLiveChecked atomic.Bool
+	// sensitiveLaneMerged is set once this process has completed a
+	// sensitive-lane anti-entropy exchange with a peer (SensitiveLaneMerged).
+	sensitiveLaneMerged atomic.Bool
 	// The credentials baseline and the external-seen set
 	// (credentials_live.go), guarded by externalSeenMu.
 	externalSeenMu  sync.Mutex
@@ -1451,6 +1454,14 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 	for _, stmts := range entries {
 		relay := make([]Statement, 0, len(stmts))
 		for _, s := range stmts {
+			// See executeBatchInternal (credentials_revive_guard.go).
+			if refuse, err := refuseUnpairedCredentialRevive(ctx, tx, s, stmts); err != nil {
+				tx.Rollback()
+				c.mu.Unlock()
+				return false, err
+			} else if refuse {
+				continue
+			}
 			if s.Guard != nil {
 				matches, err := c.mutationGuardMatches(ctx, tx, s.Guard)
 				if err != nil {
@@ -1640,6 +1651,15 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	var parks []func()      // updates that met no row because it has not arrived yet
 	relay := make([]Statement, 0, len(stmts))
 	for _, s := range stmts {
+		// Never revive a retired host credential without an operator's
+		// password write (credentials_revive_guard.go).
+		if refuse, err := refuseUnpairedCredentialRevive(ctx, tx, s, stmts); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return 0, err
+		} else if refuse {
+			continue
+		}
 		// A live-row update runs here through the same guarded form every
 		// receiver uses; what is logged is the wire form (live_row_update.go).
 		res, err := tx.ExecContext(ctx, appliedForm(s).SQL, s.Params...)

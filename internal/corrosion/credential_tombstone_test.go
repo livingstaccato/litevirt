@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"fmt"
 	"testing"
 )
 
@@ -50,7 +51,8 @@ func staleDBAfterReadmission(t *testing.T, c *Client) {
 		t.Fatal("fixture: the re-admission did not retire the credential row")
 	}
 	if got := readHostSettings(t, c); got.ipmiPass != "'"+staleOldPass+"'" || got.deleted {
-		t.Fatalf("fixture: hosts row = %+v, want the stale live row with the old password", got)
+		t.Fatalf("fixture: hosts row has ipmi_pass %s (deleted %v), want the stale live row with the old password",
+			redactedPass(got.ipmiPass), got.deleted)
 	}
 }
 
@@ -61,7 +63,7 @@ func TestGetHost_ARetiredCredentialIsNotReadFromTheOldColumn(t *testing.T) {
 	staleDBAfterReadmission(t, c)
 	h, err := GetHost(context.Background(), c, "host-x")
 	if err != nil || h == nil {
-		t.Fatalf("GetHost: %+v %v", h, err)
+		t.Fatalf("GetHost = %s", hostPassState(h, err))
 	}
 	if h.IPMIPass != "" {
 		t.Errorf("GetHost served IPMIPass %q from the old column over a retired credential row; want none",
@@ -103,7 +105,7 @@ func TestGetHost_NoCredentialRowStillReadsTheOldColumn(t *testing.T) {
 	}
 	h, err := GetHost(ctx, c, "host-x")
 	if err != nil || h == nil || h.IPMIPass != "pre-split" || h.IPMIPassRetired {
-		t.Fatalf("GetHost = %+v, %v; want the old column's password, not retired", h, err)
+		t.Fatalf("GetHost = %s; want the old column's password, not retired", hostPassState(h, err))
 	}
 }
 
@@ -151,30 +153,6 @@ func TestSplitCredentials_ClearPassDoesNotReviveARetiredCredential(t *testing.T)
 	}
 }
 
-// The operator sets the new machine's password after the re-admission: the
-// latched write revives the row, and every reader serves it.
-func TestRetiredCredential_OperatorCanSetItAgain(t *testing.T) {
-	ctx := context.Background()
-	c := newTestDB(t)
-	staleDBAfterReadmission(t, c)
-	if err := c.ExecuteBatch(ctx, []Statement{
-		{SQL: hostsClearIPMIPassSQL, Params: []interface{}{"New-Machine-Pass", "2026-10-03T00:00:00Z", "host-x"}},
-		{SQL: HostFenceCredentialUpsertSQL, Params: []interface{}{"host-x", "New-Machine-Pass", "2026-10-03T00:00:00Z"}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	h, err := GetHost(ctx, c, "host-x")
-	if err != nil || h == nil || h.IPMIPass != "New-Machine-Pass" || h.IPMIPassRetired {
-		t.Fatalf("GetHost = %+v, %v; want the operator's new password, not retired", h, err)
-	}
-	if _, err := c.SplitCredentials(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if pass, ok := liveCredential(t, c); !ok || pass != "New-Machine-Pass" {
-		t.Errorf("credential row = %s (live %v) after a pass, want the operator's password", redactedPass(pass), ok)
-	}
-}
-
 // A neighbour that has not latched sets the new machine's password in the old
 // column alone; the absorb revives the retired row with it, gate open or
 // closed.
@@ -187,9 +165,17 @@ func TestRetiredCredential_AnUnlatchedWriteIsStillAbsorbed(t *testing.T) {
 			Params: []interface{}{"Unlatched-New-Pass", "2026-10-03T00:00:00.000001Z", "host-x"}})
 		h, err := GetHost(context.Background(), c, "host-x")
 		if err != nil || h == nil || h.IPMIPass != "Unlatched-New-Pass" || h.IPMIPassRetired {
-			t.Errorf("gate %v: GetHost = %+v, %v; want the unlatched write's password, not retired", gate, h, err)
+			t.Errorf("gate %v: GetHost = %s; want the unlatched write's password, not retired", gate, hostPassState(h, err))
 		}
 	}
+}
+
+// hostPassState describes what GetHost returned without printing a secret.
+func hostPassState(h *HostRecord, err error) string {
+	if err != nil || h == nil {
+		return fmt.Sprintf("(nil host, err %v)", err)
+	}
+	return fmt.Sprintf("(ipmi_pass %s, retired %v)", redactedPass(h.IPMIPass), h.IPMIPassRetired)
 }
 
 func redactedPass(s string) string {
@@ -198,3 +184,165 @@ func redactedPass(s string) string {
 	}
 	return "<set>"
 }
+
+// I-1(a): a node that holds a stale hosts row and NO credential row (it took
+// the row on a public pull before any sensitive pull) cannot tell a password
+// that was never copied from one whose row it has not pulled retired yet. It
+// copies nothing until it has merged the sensitive lane. Mutation: drop the
+// gate in the copy pass — red.
+func TestSplitCredentials_NoHostCopyBeforeTheSensitiveLaneMerged(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	staleDBAfterReadmission(t, c)
+	if _, err := c.DB().Exec(`DELETE FROM host_fence_credentials WHERE host_name = 'host-x'`); err != nil {
+		t.Fatal(err)
+	}
+	c.MarkSensitiveLaneUnmergedForTests()
+	rep, err := c.SplitCredentials(ctx)
+	if err != nil {
+		t.Fatalf("SplitCredentials: %v", err)
+	}
+	if _, ok := liveCredential(t, c); ok || rep.Copied != 0 {
+		t.Fatalf("a node that has not merged the sensitive lane copied a host password (report %+v)", rep)
+	}
+	// Once merged (a peer had no row either), the copy proceeds.
+	c.markSensitiveLaneMerged("peer")
+	if rep, err = c.SplitCredentials(ctx); err != nil || rep.Copied != 1 {
+		t.Fatalf("after the sensitive lane merged: report %+v, err %v; want the copy", rep, err)
+	}
+}
+
+// The clear pass does not clear a password it may not copy yet: that would
+// drop the only copy. Mutation: drop the gate in the clear pass — red.
+func TestSplitCredentials_NoHostClearBeforeTheSensitiveLaneMerged(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	staleDBAfterReadmission(t, c)
+	if _, err := c.DB().Exec(`DELETE FROM host_fence_credentials WHERE host_name = 'host-x'`); err != nil {
+		t.Fatal(err)
+	}
+	c.MarkSensitiveLaneUnmergedForTests()
+	c.SetCredentialsClearGate(func() bool { return true })
+	c.credentialsLive.Store(true)
+	rep, err := c.SplitCredentials(ctx)
+	if err != nil {
+		t.Fatalf("SplitCredentials: %v", err)
+	}
+	if _, ok := liveCredential(t, c); ok || rep.Copied != 0 || rep.Cleared != 0 {
+		t.Errorf("clear pass before the sensitive lane merged: report %+v; want nothing copied or cleared", rep)
+	}
+	if got := readHostSettings(t, c); got.ipmiPass != "'"+staleOldPass+"'" {
+		t.Errorf("hosts.ipmi_pass = %s; the only copy of the password was cleared", redactedPass(got.ipmiPass))
+	}
+}
+
+// A cluster of one has no peer to pull a row from: its copy is not gated.
+func TestSplitCredentials_AClusterOfOneCopiesWithoutAMerge(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	c.SetCredentialsSplitGate(func() bool { return true })
+	c.MarkSensitiveLaneUnmergedForTests()
+	if err := InsertHost(ctx, c, HostRecord{
+		Name: c.HostName(), Address: "10.0.0.1", SSHUser: "root", SSHPort: 22, GRPCPort: 7443,
+		State: "active", CertSerial: "01", FenceStrategy: "ipmi",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.DB().Exec(`UPDATE hosts SET ipmi_pass = 'Solo-Pass', updated_at = ? WHERE name = ?`,
+		credTS, c.HostName()); err != nil {
+		t.Fatal(err)
+	}
+	if rep, err := c.SplitCredentials(ctx); err != nil || rep.Copied != 1 {
+		t.Fatalf("a cluster of one: report %+v, err %v; want its password copied", rep, err)
+	}
+}
+
+// I-1(b): an entry that revives a retired credential with no operator password
+// write beside it — a previous build's copy pass (the upsert alone) or its
+// clear pass (the upsert and the empty old-column clear) — is not applied over
+// a tombstone. Mutation: entryWritesHostPassword reports every entry paired, or
+// the apply hook is removed — red.
+func TestApply_AnUnpairedReviveOfARetiredCredentialIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stmts []Statement
+	}{
+		{"previous build's copy pass", []Statement{
+			{SQL: HostFenceCredentialUpsertSQL, Params: []interface{}{"host-x", staleOldPass, staleBoot}}}},
+		{"previous build's clear pass", []Statement{
+			{SQL: HostFenceCredentialUpsertSQL, Params: []interface{}{"host-x", staleOldPass, staleBoot}},
+			{SQL: hostsClearIPMIPassSQL, Params: []interface{}{"", "2026-10-02T00:00:00.000002Z", "host-x"}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newTestDB(t)
+			staleDBAfterReadmission(t, c)
+			applyRemote(t, c, "2026000000002-0000-peer", tc.stmts...)
+			if pass, ok := liveCredential(t, c); ok {
+				t.Errorf("the entry revived the retired credential row (ipmi_pass %s)", redactedPass(pass))
+			}
+			if h, err := GetHost(context.Background(), c, "host-x"); err != nil || h == nil || !h.IPMIPassRetired {
+				t.Errorf("GetHost = %s; want retired", hostPassState(h, err))
+			}
+		})
+	}
+}
+
+// The operator's write revives it: its entry carries the hosts write of the
+// password. Applied from a peer, whatever the old column holds after
+// credentials_clear_v1 (empty), as long as the statement is not the clear.
+func TestApply_AnOperatorPasswordWriteRevivesARetiredCredential(t *testing.T) {
+	c := newTestDB(t)
+	staleDBAfterReadmission(t, c)
+	const ts = "2026-10-03T00:00:00.000001Z"
+	applyRemote(t, c, "2026000000003-0000-peer",
+		Statement{SQL: operatorConfigureHostSQL,
+			Params: []interface{}{"ipmi", nil, nil, "", nil, nil, nil, nil, nil, nil, nil, ts, "host-x"}},
+		Statement{SQL: HostFenceCredentialUpsertSQL, Params: []interface{}{"host-x", "New-Machine-Pass", ts}})
+	h, err := GetHost(context.Background(), c, "host-x")
+	if err != nil || h == nil || h.IPMIPass != "New-Machine-Pass" || h.IPMIPassRetired {
+		t.Fatalf("GetHost = %s; want the operator's new password, not retired", hostPassState(h, err))
+	}
+}
+
+// The local write path refuses the same entry, and logs nothing for a peer.
+func TestLocalWrite_AnUnpairedReviveOfARetiredCredentialIsRefused(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	staleDBAfterReadmission(t, c)
+	before, err := c.Query(ctx, `SELECT COUNT(*) AS n FROM mutation_log`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Execute(ctx, HostFenceCredentialUpsertSQL, "host-x", staleOldPass, staleBoot); err != nil {
+		t.Fatal(err)
+	}
+	if pass, ok := liveCredential(t, c); ok {
+		t.Errorf("a local unpaired upsert revived the retired credential row (ipmi_pass %s)", redactedPass(pass))
+	}
+	after, err := c.Query(ctx, `SELECT COUNT(*) AS n FROM mutation_log`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after[0].Int("n") != before[0].Int("n") {
+		t.Errorf("the refused revive was logged for peers (%d -> %d entries)", before[0].Int("n"), after[0].Int("n"))
+	}
+}
+
+// operatorConfigureHostSQL is grpcapi's configureHostSQL, the statement
+// `lv host config` writes (copied: corrosion cannot import grpcapi). The
+// grpcapi test TestConfigureHost_SetsAPasswordOverARetiredCredential covers the
+// real ConfigureHost path.
+const operatorConfigureHostSQL = `UPDATE hosts SET ` +
+	`fence_strategy = COALESCE(?, fence_strategy), ` +
+	`ipmi_address = COALESCE(?, ipmi_address), ` +
+	`ipmi_user = COALESCE(?, ipmi_user), ` +
+	`ipmi_pass = COALESCE(?, ipmi_pass), ` +
+	`watchdog_dev = COALESCE(?, watchdog_dev), ` +
+	`role = COALESCE(?, role), ` +
+	`region = COALESCE(?, region), ` +
+	`cpu_overcommit = COALESCE(?, cpu_overcommit), ` +
+	`mem_overcommit = COALESCE(?, mem_overcommit), ` +
+	`cpu_reserve = COALESCE(?, cpu_reserve), ` +
+	`mem_reserve_mib = COALESCE(?, mem_reserve_mib), ` +
+	`updated_at = ? ` +
+	`WHERE name = ?`

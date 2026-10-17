@@ -142,3 +142,42 @@ func TestStackReconciler_AVMOnAnotherHostIsJudgedByItsHost(t *testing.T) {
 		t.Error("node-0 resolved the condition while its replica still shows web outliving stack st")
 	}
 }
+
+// Re-review 4 m-2: a host whose replica is not trusted (back from a fence,
+// say) raises nothing, as its row may name it the host of a VM rekeyed
+// away; it still leaves the condition its peers see open. Once trusted, it
+// raises.
+//
+// Mutation: drop the trust gate on the raise — red. Gate the resolve as
+// well — the stale host leaves a resolved VM's condition open, red.
+func TestStackReconciler_AnUntrustedReplicaRaisesNothing(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	db := orphanStackDB(t, now.Add(-time.Minute), now)
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{Name: "node-0", Address: "10.0.0.1", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	caught := false
+	r := NewStackReconciler("node-2", db)
+	r.SetCleaner(&recordingStackCleaner{})
+	r.SetReplicaFreshness(func() (bool, string) { return caught, "not yet caught up (test)" })
+	r.ReconcileOnce(ctx)
+	if row, open := outlivedCondition(t, db); open {
+		t.Fatalf("node-2 raised the condition from a replica not yet trusted: %s", row.Evidence)
+	}
+
+	caught = true
+	r.ReconcileOnce(ctx)
+	if _, open := outlivedCondition(t, db); !open {
+		t.Fatal("node-2 did not raise the condition once its replica was trusted")
+	}
+
+	caught = false
+	if err := corrosion.DeleteVM(ctx, db, "web"); err != nil {
+		t.Fatal(err)
+	}
+	r.ReconcileOnce(ctx)
+	if _, open := outlivedCondition(t, db); open {
+		t.Error("an untrusted replica left open the condition of a VM it holds deleted")
+	}
+}

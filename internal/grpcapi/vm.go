@@ -3240,8 +3240,24 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			cancel()
 			conn.Close()
 			if peerErr == nil {
+				// The probe answers OK only from a delete that undefined
+				// its domain and tombstoned the row in its own replica; no
+				// domain, no live row and an unanswerable libvirt are each
+				// an error. This host's row names this host, so this host
+				// tombstones it too, as the incarnation read under the
+				// lease, before answering OK: a caller reading this
+				// replica must not see the VM live once its delete has
+				// answered (stack_vm_orphan.go).
 				forwardKeptImages(ctx, phdr)
 				slog.Info("DeleteVM: domain found and deleted on peer", "vm", req.Name, "peer", h.Name)
+				if terr := corrosion.DeleteVMIncarnation(ctx, s.db, req.Name, corrosion.SnapshotForDelete(*vm)); terr != nil {
+					if errors.Is(terr, corrosion.ErrVMIncarnationMismatch) {
+						return nil, status.Errorf(codes.Aborted,
+							"VM %q: host %s deleted its domain, but the row here changed mid-delete; retry", req.Name, h.Name)
+					}
+					return nil, status.Errorf(codes.Internal,
+						"VM %q: host %s deleted its domain, but its row here was not tombstoned; retry: %v", req.Name, h.Name, terr)
+				}
 				return &emptypb.Empty{}, nil
 			}
 			if len(ptrl.Get(deleteProbeRefusedMD)) > 0 || status.Code(peerErr) == codes.FailedPrecondition {

@@ -31612,7 +31612,7 @@ type PingResponse struct {
 	// nic_list_position: this build reads UpdateVMRequest.nic_by_list_position.
 	// An older owner ignores the field and reads every NIC ordinal as a spec
 	// index, so an entry node translates the positions for it, or refuses.
-	NicListPosition bool `protobuf:"varint,13,opt,name=nic_list_position,json=nicListPosition,proto3" json:"nic_list_position,omitempty"`
+	NicListPosition bool `protobuf:"varint,14,opt,name=nic_list_position,json=nicListPosition,proto3" json:"nic_list_position,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -45786,7 +45786,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	" \x01(\x03R\x0fvoterGeneration\x123\n" +
 	"\x15migrate_preconditions\x18\v \x01(\bR\x14migratePreconditions\x12!\n" +
 	"\fdelete_force\x18\f \x01(\bR\vdeleteForce\x12*\n" +
-	"\x11nic_list_position\x18\r \x01(\bR\x0fnicListPosition\"\x0e\n" +
+	"\x11nic_list_position\x18\x0e \x01(\bR\x0fnicListPosition\"\x0e\n" +
 	"\fReadyRequest\"\xf3\x01\n" +
 	"\rReadyResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x14\n" +

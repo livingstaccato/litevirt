@@ -33,7 +33,7 @@ func TestProtoNumbers_TheIntegratedBranchesDoNotCollide(t *testing.T) {
 		{&pb.StoragePoolContent{}, 7, "replica_disk"},
 		{&pb.StoragePoolContent{}, 8, "replica_taken"},
 		{&pb.UpdateVMRequest{}, 43, "nic_by_list_position"},
-		{&pb.PingResponse{}, 13, "nic_list_position"},
+		{&pb.PingResponse{}, 14, "nic_list_position"},
 	}
 	for _, f := range fields {
 		md := f.msg.ProtoReflect().Descriptor()

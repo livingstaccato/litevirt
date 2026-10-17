@@ -3560,7 +3560,7 @@ message PingResponse {
   // nic_list_position: this build reads UpdateVMRequest.nic_by_list_position.
   // An older owner ignores the field and reads every NIC ordinal as a spec
   // index, so an entry node translates the positions for it, or refuses.
-  bool nic_list_position = 13;
+  bool nic_list_position = 14;
 }
 
 // Ready: application-level readiness. Ping answers "is this daemon's TLS

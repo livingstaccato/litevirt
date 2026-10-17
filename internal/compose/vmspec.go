@@ -460,16 +460,39 @@ func nicQueues(q NICQueues, cpu int) int32 {
 	return ResolveAutoQueues(cpu)
 }
 
+// SpecEntryIndexForNIC is the index of the spec entry that describes the NIC
+// with this MAC and ordinal: the entry that records its MAC (case folded),
+// else — only for an entry that records no MAC — the entry at its ordinal.
+// -1 when none does. A NIC's ordinal is not its entry's index once a NIC was
+// detached: an ordinal is never reused, so a NIC attached again takes a new
+// one while its MAC's entry keeps its place.
+func SpecEntryIndexForNIC(spec *pb.VMSpec, mac string, ordinal int) int {
+	if mac != "" {
+		for i, e := range spec.GetNetwork() {
+			if e != nil && e.Mac != "" && strings.EqualFold(e.Mac, mac) {
+				return i
+			}
+		}
+	}
+	if ordinal >= 0 && ordinal < len(spec.GetNetwork()) {
+		if e := spec.Network[ordinal]; e != nil && e.Mac == "" {
+			return ordinal
+		}
+	}
+	return -1
+}
+
 // NICRate is the bandwidth cap (MB/s, 0 = unlimited) a VM spec declares for
-// the NIC at ordinal, trusted only when the spec's NIC at that position names
-// the same network — a hot-plugged NIC, or one a retarget moved, carries no
-// cap rather than another NIC's.
-func NICRate(spec *pb.VMSpec, ordinal int, network string) float64 {
-	if spec == nil || ordinal < 0 || ordinal >= len(spec.Network) {
+// the NIC with this MAC and ordinal: its own entry's (SpecEntryIndexForNIC),
+// trusted only when that entry names the same network — a hot-plugged NIC,
+// or one a retarget moved, carries no cap rather than another NIC's.
+func NICRate(spec *pb.VMSpec, mac string, ordinal int, network string) float64 {
+	i := SpecEntryIndexForNIC(spec, mac, ordinal)
+	if i < 0 {
 		return 0
 	}
-	n := spec.Network[ordinal]
-	if n == nil || (network != "" && n.Name != network) {
+	n := spec.Network[i]
+	if network != "" && n.Name != network {
 		return 0
 	}
 	return n.RateMbSec

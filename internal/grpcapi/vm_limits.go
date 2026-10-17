@@ -28,8 +28,11 @@ type limitsUpdate struct {
 	newLimit    float64
 	sharesTouch bool // cpu_shares is named (0 = restore the host's default weight)
 	newShares   int32
-	nicOrdinals []int
-	nicNewRate  map[int]float64
+	// nicEntries are the spec entries of the NICs whose rate changes, each
+	// keyed in nicAsked to the NIC index the request named it by.
+	nicEntries []int
+	nicAsked   map[int]int
+	nicNewRate map[int]float64
 
 	// What the update started from, for revertLimits.
 	prevLimit   float64
@@ -37,7 +40,7 @@ type limitsUpdate struct {
 	nicPrevRate map[int]float64
 }
 
-func (u limitsUpdate) any() bool { return u.cpu || len(u.nicOrdinals) > 0 }
+func (u limitsUpdate) any() bool { return u.cpu || len(u.nicEntries) > 0 }
 
 // applyTo sets the update's values on spec (leaving untouched limits alone).
 func (u limitsUpdate) applyTo(spec *pb.VMSpec) {
@@ -47,9 +50,9 @@ func (u limitsUpdate) applyTo(spec *pb.VMSpec) {
 	if u.sharesTouch {
 		spec.CpuShares = u.newShares
 	}
-	for _, o := range u.nicOrdinals {
-		if o < len(spec.Network) && spec.Network[o] != nil {
-			spec.Network[o].RateMbSec = u.nicNewRate[o]
+	for _, e := range u.nicEntries {
+		if e < len(spec.Network) && spec.Network[e] != nil {
+			spec.Network[e].RateMbSec = u.nicNewRate[e]
 		}
 	}
 }
@@ -216,10 +219,12 @@ func limitsRequested(req *pb.UpdateVMRequest) bool {
 
 // mergeLimitUpdate validates req's limit fields against the VM's FINAL vCPU
 // count and folds them into spec. It also re-validates a limit the request did
-// not touch, because a vCPU shrink can strand it above the new count.
-func mergeLimitUpdate(spec *pb.VMSpec, req *pb.UpdateVMRequest) (limitsUpdate, error) {
+// not touch, because a vCPU shrink can strand it above the new count. A NIC
+// rate names its NIC by spec index or by its position in the NIC list
+// (nicIndex), and needs the NIC's spec entry.
+func mergeLimitUpdate(spec *pb.VMSpec, req *pb.UpdateVMRequest, ix nicIndex) (limitsUpdate, error) {
 	up := limitsUpdate{
-		nicNewRate: map[int]float64{}, nicPrevRate: map[int]float64{},
+		nicNewRate: map[int]float64{}, nicPrevRate: map[int]float64{}, nicAsked: map[int]int{},
 		prevLimit: spec.CpuLimit, prevShares: spec.CpuShares,
 	}
 	cpus := spec.Cpu
@@ -251,9 +256,10 @@ func mergeLimitUpdate(spec *pb.VMSpec, req *pb.UpdateVMRequest) (limitsUpdate, e
 	seen := map[int]bool{}
 	for _, nr := range req.NicRate {
 		o := int(nr.GetOrdinal())
-		if o < 0 || o >= len(spec.Network) {
-			return up, status.Errorf(codes.InvalidArgument,
-				"nic %d: the VM declares %d NIC(s) (0-based); a NIC hot-plugged after create has no spec entry to hold a rate", o, len(spec.Network))
+		e, nic, ok := ix.resolve(spec, o)
+		if !ok || e < 0 {
+			return up, ix.noEntry(codes.InvalidArgument, req.GetName(), spec, o, nic, "a rate",
+				fmt.Sprintf("nic %d: the VM declares %d NIC(s) (0-based); a NIC hot-plugged after create has no spec entry to hold a rate", o, len(spec.Network)))
 		}
 		if seen[o] {
 			return up, status.Errorf(codes.InvalidArgument, "nic %d named twice", o)
@@ -262,9 +268,13 @@ func mergeLimitUpdate(spec *pb.VMSpec, req *pb.UpdateVMRequest) (limitsUpdate, e
 		if err := lv.ValidateNICRate(nr.GetRateMbSec()); err != nil {
 			return up, status.Errorf(codes.InvalidArgument, "nic %d: %v", o, err)
 		}
-		up.nicOrdinals = append(up.nicOrdinals, o)
-		up.nicPrevRate[o] = spec.Network[o].RateMbSec
-		up.nicNewRate[o] = nr.GetRateMbSec()
+		if _, dup := up.nicAsked[e]; dup {
+			return up, status.Errorf(codes.InvalidArgument, "nic %d named twice", o)
+		}
+		up.nicEntries = append(up.nicEntries, e)
+		up.nicAsked[e] = o
+		up.nicPrevRate[e] = spec.Network[e].RateMbSec
+		up.nicNewRate[e] = nr.GetRateMbSec()
 	}
 	up.applyTo(spec)
 	return up, nil
@@ -293,32 +303,31 @@ func (s *Server) applyLimitsToDomain(ctx context.Context, name string, spec *pb.
 			return status.Errorf(codes.Internal, "apply cpu limits to %q: %v", name, err)
 		}
 	}
-	if len(up.nicOrdinals) == 0 {
+	if len(up.nicEntries) == 0 {
 		return nil
 	}
 	nics, err := corrosion.MergedVMNICs(ctx, s.db, name)
 	if err != nil {
 		return status.Errorf(codes.Internal, "read NICs for %q: %v", name, err)
 	}
-	byOrdinal := make(map[int]corrosion.NICRecord, len(nics))
-	for _, n := range nics {
-		byOrdinal[n.Ordinal] = n
-	}
-	for _, o := range up.nicOrdinals {
-		nic, ok := byOrdinal[o]
-		if !ok {
+	for _, e := range up.nicEntries {
+		o := up.nicAsked[e]
+		// The NIC the entry describes: by its MAC, an entry that records none
+		// by the NIC's ordinal (compose.SpecEntryIndexForNIC).
+		nic := liveNICForEntry(spec, nics, e)
+		if nic == nil {
 			return status.Errorf(codes.FailedPrecondition, "VM %q has no NIC %d", name, o)
 		}
-		// A spec entry describes the NIC at its position only while that NIC is
-		// still on the network the entry names; the rebuild paths (failover,
-		// redefine) apply the same test, so a cap set on a NIC that moved would
-		// be lost at the next rebuild.
-		if want := spec.Network[o].GetName(); nic.NetworkName != want {
+		// A spec entry describes its NIC only while that NIC is still on the
+		// network the entry names; the rebuild paths (failover, redefine)
+		// apply the same test (compose.NICRate), so a cap set on a NIC that
+		// moved would be lost at the next rebuild.
+		if want := spec.Network[e].GetName(); nic.NetworkName != want {
 			return status.Errorf(codes.FailedPrecondition,
 				"NIC %d of %q is on network %q but the spec entry for it names %q; a rate set now would not survive a rebuild",
 				o, name, nic.NetworkName, want)
 		}
-		if err := s.virt.SetNICRate(name, nic.MAC, spec.Network[o].RateMbSec); err != nil {
+		if err := s.virt.SetNICRate(name, nic.MAC, spec.Network[e].RateMbSec); err != nil {
 			if lv.IsNotFound(err) {
 				return nil
 			}
@@ -333,9 +342,9 @@ func (s *Server) applyLimitsToDomain(ctx context.Context, name string, spec *pb.
 func (s *Server) revertLimits(ctx context.Context, name string, spec *pb.VMSpec, up limitsUpdate) {
 	prev := proto.Clone(spec).(*pb.VMSpec)
 	prev.CpuLimit, prev.CpuShares = up.prevLimit, up.prevShares
-	for o, r := range up.nicPrevRate {
-		if o < len(prev.Network) {
-			prev.Network[o].RateMbSec = r
+	for e, r := range up.nicPrevRate {
+		if e < len(prev.Network) {
+			prev.Network[e].RateMbSec = r
 		}
 	}
 	_ = s.applyLimitsToDomain(ctx, name, prev, up)
@@ -378,7 +387,9 @@ func splitLimitFields(fields []string) (limits, rest []string) {
 }
 
 // limitUpdateFromDesired builds the UpdateVM request that moves a VM's limits
-// to the values a desired spec declares, for the named limit fields.
+// to the values a desired spec declares, for the named limit fields. Its NIC
+// rates name spec entries (nic_by_list_position unset): a compose file's NICs
+// are its entries.
 func limitUpdateFromDesired(name string, desired *pb.VMSpec, limitFields []string) *pb.UpdateVMRequest {
 	req := &pb.UpdateVMRequest{Name: name}
 	for _, f := range limitFields {

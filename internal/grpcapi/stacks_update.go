@@ -85,6 +85,8 @@ func (s *Server) reconfigureWithRestart(ctx context.Context, name string, desire
 		}
 	}
 	allow := true
+	// Its NIC queues, MTUs and rates are the file's, entry by entry: each
+	// names a spec entry (nic_by_list_position unset), as on every build.
 	req := &pb.UpdateVMRequest{Name: name, AllowRestart: &allow, DisableVnc: desired.DisableVnc}
 	if compose.IsTransientOrErrorState(vm.State) {
 		// A VM a previous deploy left half-made: repair it — redefine the

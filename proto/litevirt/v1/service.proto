@@ -682,18 +682,34 @@ message UpdateVMRequest    { string name = 1; int32 cpu = 2;
     // nic_mtu sets each listed NIC's MTU (NetworkAttachment.mtu). It takes
     // effect on the next define, like nic_queues.
     repeated NICMTUUpdate nic_mtu = 27;
+    // nic_by_list_position: the ordinal of every nic_queues, nic_rate and
+    // nic_mtu update names the NIC at that position in the VM's NIC list, not
+    // the entry at that position in its stored spec. lv update sets it. Unset
+    // (an older client, a stack deploy) every ordinal is a spec index, as it
+    // always was. An entry node forwards it only to an owner whose Ping
+    // advertises nic_list_position; for an older owner it translates each
+    // position to the spec index, or refuses where it cannot.
+    bool nic_by_list_position = 43;
 }
 // DiskTuningUpdate changes one disk's discard / detect_zeroes (an empty value
 // leaves it as stored).
 message DiskTuningUpdate { string name = 1; string discard = 2; string detect_zeroes = 3; }
-// NICQueuesUpdate changes the virtio-net queue count of the NIC at this position
-// in the VM's spec (1 turns multiqueue off).
+// The NIC of a NICQueuesUpdate, NICRateUpdate or NICMTUUpdate is named by
+// ordinal: the index of its entry in the VM's stored spec, or, with
+// UpdateVMRequest.nic_by_list_position, its 0-based position in the VM's NIC
+// list (the VM's live NICs in ordinal order, as `lv inspect` lists them under
+// spec.network). Neither is the NIC's ordinal, which is never reused: a NIC
+// detached and attached again takes a new one. By position, the owner finds
+// the NIC's spec entry by its MAC (an entry that records no MAC, by the NIC's
+// ordinal), and a position past the end of the list names the spec entry at
+// that index when no live NIC carries it.
+//
+// NICQueuesUpdate changes one NIC's virtio-net queue count (1 turns
+// multiqueue off).
 message NICQueuesUpdate  { int32 ordinal = 1; int32 queues = 2; }
-// NICRateUpdate sets (or, at 0, clears) one NIC's bandwidth cap in MB/s. The NIC
-// is named by its 0-based position in the VM's interface list.
+// NICRateUpdate sets (or, at 0, clears) one NIC's bandwidth cap in MB/s.
 message NICRateUpdate { int32 ordinal = 1; double rate_mb_sec = 2; }
-// NICMTUUpdate sets one NIC's MTU by its 0-based position in the VM's
-// interface list: 0 removes it, 1 means the bridge's MTU.
+// NICMTUUpdate sets one NIC's MTU: 0 removes it, 1 means the bridge's MTU.
 message NICMTUUpdate { int32 ordinal = 1; int32 mtu = 2; }
 // SetVMMemory (#4) sets the running balloon target (and persists it). target_mib
 // must be within [min_memory_mib, max_memory_mib] of the VM's spec; a live VM is
@@ -3550,6 +3566,10 @@ message PingResponse {
   // so a caller that needs the stop first (lv rm --force, a forwarding entry
   // node) sends StopVM{force} itself when this is false.
   bool delete_force = 12;
+  // nic_list_position: this build reads UpdateVMRequest.nic_by_list_position.
+  // An older owner ignores the field and reads every NIC ordinal as a spec
+  // index, so an entry node translates the positions for it, or refuses.
+  bool nic_list_position = 14;
 }
 
 // Ready: application-level readiness. Ping answers "is this daemon's TLS

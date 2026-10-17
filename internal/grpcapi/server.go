@@ -364,8 +364,10 @@ type Server struct {
 	// should travel on (migration_network.go). Empty means the host's cluster
 	// address. localIPs is a test seam for the host's own addresses.
 	migrationNetwork                       string
-	pingWithoutMigratePreconditionsForTest bool // Ping answers as a release that does not check migration preconditions
-	cloneAsOlderBuildForTest               bool // CloneVM ignores destination_host and target_pool, as an older release does
+	pingWithoutMigratePreconditionsForTest bool   // Ping answers as a release that does not check migration preconditions
+	pingWithoutNICListPositionForTest      bool   // Ping answers as a release that reads every NIC number as a spec index
+	updateVMNICsHookForTest                func() // runs in UpdateVM's redefine just before it reads the NIC list it defines
+	cloneAsOlderBuildForTest               bool   // CloneVM ignores destination_host and target_pool, as an older release does
 	migrationDial                          func(ctx context.Context, host, addr string) (pb.LiteVirtClient, func(), error)
 	migrationAddress                       string // migration.address: this host's own answer, when set
 	localIPs                               func() ([]localAddr, error)

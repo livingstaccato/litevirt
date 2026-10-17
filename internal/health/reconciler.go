@@ -2568,7 +2568,7 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 	var netConfigs []lv.NetworkConfig
 	for _, iface := range ifaces {
 		bridge := network.FlatBridgeName(iface.NetworkName)
-		rate := compose.NICRate(spec, iface.Ordinal, iface.NetworkName)
+		rate := compose.NICRate(spec, iface.MAC, iface.Ordinal, iface.NetworkName)
 		model := nicModels.Model(iface.MAC, iface.NetworkName, iface.Ordinal, iface.Model)
 		// Provision network infrastructure (VXLAN tunnels, DHCP, NAT, bridges).
 		// This is critical after failover — the new host may not have the network set up.

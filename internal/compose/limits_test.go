@@ -59,12 +59,34 @@ func TestNICRate(t *testing.T) {
 		net  string
 		want float64
 	}{{0, "a", 3}, {1, "b", 4}, {1, "a", 0}, {2, "a", 0}, {-1, "a", 0}, {0, "", 3}} {
-		if got := NICRate(spec, c.ord, c.net); got != c.want {
+		if got := NICRate(spec, "52:54:00:00:00:99", c.ord, c.net); got != c.want {
 			t.Errorf("NICRate(%d,%q) = %v, want %v", c.ord, c.net, got, c.want)
 		}
 	}
-	if NICRate(nil, 0, "a") != 0 {
+	if NICRate(nil, "", 0, "a") != 0 {
 		t.Error("nil spec has a rate")
+	}
+}
+
+// An entry that records a MAC is the NIC's with that MAC wherever its ordinal
+// is (a NIC detached and attached again takes a new one), and never the NIC's
+// whose ordinal is its index.
+//
+// Mutation: look the entry up by ordinal first — red.
+func TestNICRate_AnEntryWithAMACIsFoundByIt(t *testing.T) {
+	const a, b = "52:54:00:00:00:0a", "52:54:00:00:00:0b"
+	spec := &pb.VMSpec{Network: []*pb.NetworkAttachment{{Name: "n", Mac: a, RateMbSec: 3}, {Name: "n", RateMbSec: 4}}}
+	for _, c := range []struct {
+		mac  string
+		ord  int
+		want float64
+	}{{strings.ToUpper(a), 5, 3}, {b, 0, 0}, {b, 1, 4}, {b, 7, 0}} {
+		if got := NICRate(spec, c.mac, c.ord, "n"); got != c.want {
+			t.Errorf("NICRate(%s,%d) = %v, want %v", c.mac, c.ord, got, c.want)
+		}
+	}
+	if got := SpecEntryIndexForNIC(spec, a, 1); got != 0 {
+		t.Errorf("SpecEntryIndexForNIC(a, 1) = %d, want 0", got)
 	}
 }
 

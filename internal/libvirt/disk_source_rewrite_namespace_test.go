@@ -238,7 +238,13 @@ func TestRewriteDiskSource_RefusesUnsafeRewrites(t *testing.T) {
 		{name: "a qemu:commandline argument", devices: vda,
 			extra:   "  <qemu:commandline xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>\n    <qemu:arg value='file=" + old + ",if=none'/>\n  </qemu:commandline>\n",
 			wantErr: "/qemu:commandline/qemu:arg> attribute value"},
-		{name: "element text", devices: vda, extra: "  <description>" + old + "</description>\n", wantErr: "<domain/description> text"},
+		{name: "the kernel", devices: vda, extra: "  <os>\n    <kernel>" + old + "</kernel>\n  </os>\n", wantErr: "<domain/os/kernel> text"},
+		{name: "a qemu:override argument", devices: vda,
+			extra:   "  <qemu:override xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>\n    <qemu:device alias='x'>\n      <qemu:frontend>\n        <qemu:property name='drive' type='string' value='" + old + "'/>\n      </qemu:frontend>\n    </qemu:device>\n  </qemu:override>\n",
+			wantErr: "attribute value"},
+		{name: "the new path already named by another disk", devices: vda +
+			"    <disk type='file'>\n      <source file='/srv/pools/fast/mv1-root.qcow2'/>\n      <target dev='vdb'/>\n    </disk>\n",
+			wantErr: "disk vda to \"/srv/pools/fast/mv1-root.qcow2\": the domain already names that path in <devices/disk/source> attribute file"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			in := edgeDomain(c.devices)
@@ -250,6 +256,46 @@ func TestRewriteDiskSource_RefusesUnsafeRewrites(t *testing.T) {
 			_, _, err := RewriteDiskSource(in, "vda", old, to)
 			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
 				t.Fatalf("err = %v, want one naming %q", err, c.wantErr)
+			}
+			if !strings.Contains(err.Error(), "disk vda") {
+				t.Fatalf("err = %v, want one naming disk vda", err)
+			}
+		})
+	}
+}
+
+// The old path in free text libvirt opens nothing from (<title>,
+// <description>, an element or attribute under <metadata>) does not refuse
+// the move, which returns the input with only vda's value changed. The scan
+// that decides whether a copy may be removed still finds those mentions.
+func TestRewriteDiskSource_FreeTextMentionsAccepted(t *testing.T) {
+	const (
+		old = "/var/lib/litevirt/disks/mv1-root.qcow2"
+		nw  = "/srv/pools/fast/mv1-root.qcow2"
+	)
+	vda := func(p string) string {
+		return "    <disk type='file'>\n      <source file='" + p + "'/>\n      <target dev='vda'/>\n    </disk>\n"
+	}
+	for _, c := range []struct{ name, find, insert string }{
+		{"title", "  <metadata>", "  <title>" + old + "</title>\n"},
+		{"description", "  <metadata>", "  <description>disk was " + old + "</description>\n"},
+		{"metadata element and attribute", "  </metadata>", "    <x:note xmlns:x='urn:x' path='" + old + "'>" + old + "</x:note>\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			with := func(dom string) string { return strings.Replace(dom, c.find, c.insert+c.find, 1) }
+			in, want := with(edgeDomain(vda(old))), with(edgeDomain(vda(nw)))
+			if in == edgeDomain(vda(old)) {
+				t.Fatal("the mention was not inserted")
+			}
+			out, changed, err := RewriteDiskSource(in, "vda", old, nw)
+			if err != nil || !changed {
+				t.Fatalf("changed=%v err=%v", changed, err)
+			}
+			if out != want {
+				t.Fatalf("got\n%s\nwant\n%s", out, want)
+			}
+			if !DomainXMLNamesPath(out, old) {
+				t.Fatal("DomainXMLNamesPath must still find the free-text mention")
 			}
 		})
 	}

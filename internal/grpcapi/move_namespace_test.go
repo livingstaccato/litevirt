@@ -211,3 +211,79 @@ func TestMoveVolume_Live_RollbackKeepsMarkerWrittenAfterDefine(t *testing.T) {
 		t.Fatalf("rollback did not keep the marker written after the define:\n%s", after)
 	}
 }
+
+// defineThenFail makes the define that names path apply and then report an
+// error, as a define whose reply is lost after libvirt stored it.
+func defineThenFail(f *libvirtfake.Fake, path string) {
+	f.FailDefineDomain = func(x string) error {
+		if !strings.Contains(x, path) {
+			return nil
+		}
+		f.FailDefineDomain = nil
+		if err := f.DefineDomain(x); err != nil {
+			return err
+		}
+		return errors.New("connection reset after define")
+	}
+}
+
+// A failed offline define that libvirt applied anyway leaves the config naming
+// the copy: the copy is kept and named in the error.
+func TestMoveVolume_Offline_DefineFailureKeepsACopyTheConfigNames(t *testing.T) {
+	s, f, srcFile, dstFile := offlineMoveServer(t)
+	if err := f.DefineDomain(litevirtDomainXML("vm1", "vda", srcFile)); err != nil {
+		t.Fatalf("define: %v", err)
+	}
+	defineThenFail(f, dstFile)
+	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+	err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm1", DiskName: "root", TargetPool: "warm"}, rec)
+	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), dstFile) {
+		t.Fatalf("want Internal naming %s, got %v", dstFile, err)
+	}
+	if !exists(dstFile) || !exists(srcFile) {
+		t.Fatalf("dst exists=%v src exists=%v, want both", exists(dstFile), exists(srcFile))
+	}
+}
+
+// A replan that cannot read the config keeps the copy and names it.
+func TestMoveVolume_Offline_UnreadableReplanKeepsAndNamesTheCopy(t *testing.T) {
+	s, f, srcFile, dstFile := offlineMoveServer(t)
+	if err := f.DefineDomain(litevirtDomainXML("vm1", "vda", srcFile)); err != nil {
+		t.Fatalf("define: %v", err)
+	}
+	n := 0
+	f.FailDumpXMLInactive = func(string) error {
+		if n++; n >= 2 {
+			return errors.New("libvirt connection lost")
+		}
+		return nil
+	}
+	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+	err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm1", DiskName: "root", TargetPool: "warm"}, rec)
+	if status.Code(err) != codes.Aborted || !strings.Contains(err.Error(), dstFile) {
+		t.Fatalf("want Aborted naming %s, got %v", dstFile, err)
+	}
+	if !exists(dstFile) || !exists(srcFile) {
+		t.Fatalf("dst exists=%v src exists=%v, want both", exists(dstFile), exists(srcFile))
+	}
+}
+
+// The live twin: a redefine that libvirt applied but reported failed keeps
+// the destination the config names.
+func TestMoveVolume_Live_DefineFailureKeepsACopyTheConfigNames(t *testing.T) {
+	s, f, src, destPath, _ := liveLitevirtMove(t)
+	mover := &fakeLiveMover{jobEnd: 4096, progressBytesPerPoll: 4096}
+	s.SetLiveMover(mover)
+	defineThenFail(f, destPath)
+	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+	err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm-live", DiskName: "root", TargetPool: "warm"}, rec)
+	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), destPath) {
+		t.Fatalf("want Internal naming %s, got %v", destPath, err)
+	}
+	if !exists(destPath) || !exists(src) {
+		t.Fatalf("dest exists=%v src exists=%v, want both", exists(destPath), exists(src))
+	}
+	if mover.pivotCalls != 0 {
+		t.Fatalf("pivot = %d, want 0", mover.pivotCalls)
+	}
+}

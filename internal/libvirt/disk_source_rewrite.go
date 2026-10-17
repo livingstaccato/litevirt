@@ -105,8 +105,15 @@ func rewriteDiskSourceLocator(domXML, targetDev, oldSource, newSource string, wa
 				"the disk type and driver type to change too, which this rewrite does not do",
 			sourceAttrDescription(kind), newSource, sourceAttrDescription(kindOfSource(newSource)))
 	}
+	subject := "the disk"
+	if dev := disks[matchIndex].dev; dev != "" {
+		subject = "disk " + dev
+	}
 	if strings.ContainsAny(newSource, "\t\r\n") {
-		return "", false, fmt.Errorf("refusing to repoint a disk to %q: it holds a tab or line break, which libvirt would read as a space", newSource)
+		return "", false, fmt.Errorf("refusing to repoint %s to %q: it holds a tab or line break, which libvirt would read as a space", subject, newSource)
+	}
+	if where := elsewhereNamed(domXML, newSource, true); where != "" {
+		return "", false, fmt.Errorf("refusing to repoint %s to %q: the domain already names that path in %s", subject, newSource, where)
 	}
 	rewritten, err := spliceDiskSource(domXML, disks[matchIndex], kind, oldSource, newSource)
 	if err != nil {
@@ -115,9 +122,9 @@ func rewriteDiskSourceLocator(domXML, targetDev, oldSource, newSource string, wa
 	if err := verifySplice(disks, rewritten, matchIndex, kind, newSource); err != nil {
 		return "", false, err
 	}
-	if where := elsewhereNamed(rewritten, oldSource); where != "" {
-		return "", false, fmt.Errorf("refusing to repoint the disk from %q: the domain still names that path in %s, "+
-			"which this rewrite would leave pointing at the old file", oldSource, where)
+	if where := elsewhereNamed(rewritten, oldSource, true); where != "" {
+		return "", false, fmt.Errorf("refusing to repoint %s from %q: the domain still names that path in %s, "+
+			"which this rewrite would leave pointing at the old file", subject, oldSource, where)
 	}
 	return rewritten, true, nil
 }
@@ -428,7 +435,7 @@ func verifySplice(before []diskSourceInfo, out string, matchIndex int, kind sour
 // DomainXMLNamesPath reports whether the domain XML names path in any
 // attribute value or text.
 func DomainXMLNamesPath(domXML, path string) bool {
-	return elsewhereNamed(domXML, path) != ""
+	return elsewhereNamed(domXML, path, false) != ""
 }
 
 // elsewhereNamed reports where, if anywhere, the domain XML still names path
@@ -437,13 +444,17 @@ func DomainXMLNamesPath(domXML, path string) bool {
 // A document that does not parse counts as naming it. A longer path that
 // merely starts or ends with path (an overlay "root.qcow2.s1" of "root.qcow2",
 // or "/x/a/root.qcow2" of "/a/root.qcow2") is not a mention.
-func elsewhereNamed(domXML, path string) string {
+//
+// With skipFreeText, the <description>, <title> and <metadata> children of the
+// domain are not read: libvirt opens nothing named there.
+func elsewhereNamed(domXML, path string, skipFreeText bool) string {
 	if path == "" {
 		return ""
 	}
 	// RawToken keeps each name's prefix as written (qemu:arg), for the message.
 	dec := xml.NewDecoder(strings.NewReader(domXML))
 	var stack []string
+	skipFrom := 0 // stack depth of the free-text element being skipped, or 0
 	for {
 		tok, err := dec.RawToken()
 		if err == io.EOF {
@@ -455,17 +466,27 @@ func elsewhereNamed(domXML, path string) string {
 		switch t := tok.(type) {
 		case xml.StartElement:
 			stack = append(stack, qualifiedName(t.Name))
+			if skipFrom == 0 && skipFreeText && len(stack) == 2 && stack[0] == "domain" &&
+				(stack[1] == "description" || stack[1] == "title" || stack[1] == "metadata") {
+				skipFrom = len(stack)
+			}
+			if skipFrom != 0 {
+				continue
+			}
 			for _, a := range t.Attr {
 				if namesPath(a.Value, path) {
 					return fmt.Sprintf("<%s> attribute %s", elementPath(stack), qualifiedName(a.Name))
 				}
 			}
 		case xml.EndElement:
+			if len(stack) == skipFrom {
+				skipFrom = 0
+			}
 			if len(stack) > 0 {
 				stack = stack[:len(stack)-1]
 			}
 		case xml.CharData:
-			if namesPath(string(t), path) {
+			if skipFrom == 0 && namesPath(string(t), path) {
 				return fmt.Sprintf("<%s> text", elementPath(stack))
 			}
 		}

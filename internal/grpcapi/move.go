@@ -281,22 +281,20 @@ func (s *Server) moveOneVolume(
 		// it.
 		cs2, newXML, rerr := s.planCutover(vm, src, dstPath)
 		if rerr != nil {
-			if !s.persistentNamesPath(vm, dstPath) {
-				_ = os.Remove(dstPath)
-			}
+			kept := s.keptCopyNote(vm, dstPath)
 			s.recordVMEvent(ctx, vm.Name, "disk.moved", "error",
-				fmt.Sprintf("%s: the domain changed during the copy; cutover aborted (source preserved): %v", src.DiskName, rerr))
-			return status.Errorf(codes.Aborted, "the persistent domain config changed during the copy (cutover aborted, source preserved): %v", rerr)
+				fmt.Sprintf("%s: the domain changed during the copy; cutover aborted (source preserved%s): %v", src.DiskName, kept, rerr))
+			return status.Errorf(codes.Aborted, "the persistent domain config changed during the copy (cutover aborted, source preserved%s): %v", kept, rerr)
 		}
 		cs = cs2
 		if cs == cutoverRedefined {
 			// The stopped VM must be redefined or it fails to start with "Cannot access
 			// storage file" once the old path is removed.
 			if derr := s.virt.DefineDomain(newXML); derr != nil {
-				_ = os.Remove(dstPath)
+				kept := s.keptCopyNote(vm, dstPath)
 				s.recordVMEvent(ctx, vm.Name, "disk.moved", "error",
-					fmt.Sprintf("%s: cutover aborted (source preserved): %v", src.DiskName, derr))
-				return status.Errorf(codes.Internal, "redefine inactive domain (cutover aborted, source preserved): %v", derr)
+					fmt.Sprintf("%s: cutover aborted (source preserved%s): %v", src.DiskName, kept, derr))
+				return status.Errorf(codes.Internal, "redefine inactive domain (cutover aborted, source preserved%s): %v", kept, derr)
 			}
 		}
 		if err := corrosion.UpdateDiskPlacement(ctx, s.db, vm.Name, src.DiskName, vm.HostName, dstPath, dstPool.Driver, targetPool); err != nil {
@@ -434,6 +432,16 @@ func (s *Server) rollbackCutover(cs cutoverState, vm *corrosion.VMRecord, src *c
 	default: // cutoverNoVirt — no persistent config references dst
 		return true
 	}
+}
+
+// keptCopyNote removes the copy at path unless the VM's persistent config names
+// it, and returns "" when it was removed or a note naming the kept copy.
+func (s *Server) keptCopyNote(vm *corrosion.VMRecord, path string) string {
+	if !s.persistentNamesPath(vm, path) {
+		_ = os.Remove(path)
+		return ""
+	}
+	return fmt.Sprintf("; the copy %s is kept because the persistent config names it", path)
 }
 
 // persistentNamesPath reports whether the VM's persistent config names path. An

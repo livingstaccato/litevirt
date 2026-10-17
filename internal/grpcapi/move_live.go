@@ -264,8 +264,7 @@ func (s *Server) liveMoveVolume(
 	cs, rerr := s.redefineMovedDiskSource(vm, src, destPath)
 	if rerr != nil {
 		_ = s.liveMover.CancelBlockCopy(vm.Name, src.Path)
-		_ = os.Remove(destPath)
-		return status.Errorf(codes.Internal, "redefine persistent config (cutover aborted): %v", rerr)
+		return status.Errorf(codes.Internal, "redefine persistent config (cutover aborted%s): %v", s.keptCopyNote(vm, destPath), rerr)
 	}
 	if err := commit(); err != nil {
 		// Roll persistent back; only remove the dest when it's no longer referenced

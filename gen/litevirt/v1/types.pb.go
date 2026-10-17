@@ -107,6 +107,14 @@ const (
 	// on a release before this value reports such a host HOST_OFFLINE; a
 	// client before it shows the number 5.
 	HostState_HOST_JOINING HostState = 5
+	// Booted into a pending upgrade, or upgrading in place. A server on a
+	// release before this value reports such a host HOST_DRAINING; a client
+	// before it shows the number 6.
+	HostState_HOST_UPGRADING HostState = 6
+	// Fenced by failover (or an operator) and not yet returned. A server on a
+	// release before this value reports such a host HOST_OFFLINE; a client
+	// before it shows the number 7.
+	HostState_HOST_FENCED HostState = 7
 )
 
 // Enum value maps for HostState.
@@ -118,6 +126,8 @@ var (
 		3: "HOST_SUSPECT",
 		4: "HOST_OFFLINE",
 		5: "HOST_JOINING",
+		6: "HOST_UPGRADING",
+		7: "HOST_FENCED",
 	}
 	HostState_value = map[string]int32{
 		"HOST_ACTIVE":      0,
@@ -126,6 +136,8 @@ var (
 		"HOST_SUSPECT":     3,
 		"HOST_OFFLINE":     4,
 		"HOST_JOINING":     5,
+		"HOST_UPGRADING":   6,
+		"HOST_FENCED":      7,
 	}
 )
 
@@ -7979,14 +7991,16 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\bVM_ERROR\x10\x06\x12\x0e\n" +
 	"\n" +
 	"VM_UNKNOWN\x10\a\x12\r\n" +
-	"\tVM_PAUSED\x10\b*{\n" +
+	"\tVM_PAUSED\x10\b*\xa0\x01\n" +
 	"\tHostState\x12\x0f\n" +
 	"\vHOST_ACTIVE\x10\x00\x12\x11\n" +
 	"\rHOST_DRAINING\x10\x01\x12\x14\n" +
 	"\x10HOST_MAINTENANCE\x10\x02\x12\x10\n" +
 	"\fHOST_SUSPECT\x10\x03\x12\x10\n" +
 	"\fHOST_OFFLINE\x10\x04\x12\x10\n" +
-	"\fHOST_JOINING\x10\x05*G\n" +
+	"\fHOST_JOINING\x10\x05\x12\x12\n" +
+	"\x0eHOST_UPGRADING\x10\x06\x12\x0f\n" +
+	"\vHOST_FENCED\x10\a*G\n" +
 	"\x0fMigrateStrategy\x12\x10\n" +
 	"\fMIGRATE_LIVE\x10\x00\x12\x10\n" +
 	"\fMIGRATE_COLD\x10\x01\x12\x10\n" +

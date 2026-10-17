@@ -6,9 +6,8 @@ import (
 )
 
 // Real `lv host ls` output from lab 1 (2026-10-10, ~/lab-build-2c2cd6a5): the
-// state column prints the proto enum name. There is no HOST_FENCED — a fenced
-// host prints HOST_OFFLINE (grpcapi hostStateToPB) — and anything but
-// HOST_ACTIVE is a host taken out of service.
+// state column prints the proto enum name (grpcapi hostStateToPB), and
+// anything but HOST_ACTIVE is a host taken out of service.
 const labHostLs = `NAME    ADDRESS     STATE        CPU  MEMORY        VMs  VERSION
 node-1  10.77.0.11  HOST_ACTIVE  1/4  768/2971 MiB  1    labrelay-2c2cd6a5
 node-2  10.77.0.12  HOST_ACTIVE  0/4  0/2971 MiB    1    labrelay-2c2cd6a5
@@ -45,7 +44,9 @@ func TestParsesRealHostLs(t *testing.T) {
 		wantDown   bool // node-1 taken out of service
 	}{
 		{"all active", labHostLs, 5, false},
-		{"node-1 offline (fenced prints this too)", withState("node-1", "HOST_OFFLINE"), 4, true},
+		{"node-1 offline", withState("node-1", "HOST_OFFLINE"), 4, true},
+		{"node-1 fenced", withState("node-1", "HOST_FENCED"), 4, true},
+		{"node-1 upgrading", withState("node-1", "HOST_UPGRADING"), 4, true},
 		{"node-1 suspect", withState("node-1", "HOST_SUSPECT"), 4, true},
 		{"node-1 draining", withState("node-1", "HOST_DRAINING"), 4, true},
 		{"node-2 maintenance", withState("node-2", "HOST_MAINTENANCE"), 4, false},

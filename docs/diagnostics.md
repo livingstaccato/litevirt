@@ -2336,6 +2336,46 @@ and each such VM also gets a `vm.firmware_wipe_refused` event. Repair the file,
 or move it out of its directory once no firmware move on the host needs it;
 the condition resolves within a pass once every file reads.
 
+### Live firmware migration (`firmware_migration_*`)
+
+A live move of a Secure Boot / vTPM VM
+([migration](migration-failover.md#secure-boot--vtpm-vms)) raises these
+conditions: evaluator `firmware_migration`, subject `vm/<vm>`, shown by
+`lv health`. The evidence gives the VM, the attempt, the source and target,
+the host that raised it, the hashes and paths it is about, a `detail`, and an
+`action` when an operator has one. While a move is parked, its records stay
+on both hosts (`<data_dir>/fwmig-inflight/<vm>.json` on the source,
+`<data_dir>/fwmig-hold/<vm>.json` on the target), so starts, stops, redefines
+and firmware state writes of the VM stay refused there, and nothing is
+deleted on either host. The source's recovery looks at each parked move every
+minute and at daemon start.
+
+| Code | Severity, host | What happened | What you do; when it resolves |
+|---|---|---|---|
+| `firmware_migration_target_unreachable` | critical, source | The source could not finish a call to the target (unreachable, a build without the RPCs, or the target reports no record of the attempt while a domain of the VM is defined there). Also a mismatch whose discard of the target's copy did not get through | Bring the target back; the retry resolves it. If the target is down for good, fence it (`lv host fence <host>` or `lv host fence-confirm <host>`): when the VM's row still names the source, and the move had not reached cutover or the source's guest stopped for the migration, the source drops its record, the VM is `stopped` on the source with its firmware state, `lv start <vm>` works, and `firmware_migration_discard_owed` follows. When the row names the target, it stays parked |
+| `firmware_migration_discard_owed` | warning, source; critical while the target refuses | The move was resolved by fence, and the target's copy is still to be discarded. The source sends the discard every minute | Nothing while a warning. Resolves when the discard lands on the target's return, or the target host is removed (`lv host rm <host>`). Critical: the target refused it because the VM's domain runs there, or a domain of the VM is still defined there |
+| `firmware_migration_unverified` | critical, source | The target's vTPM state did not match the source's final copy, or the target's guest was no longer there, after the source's guest stopped for the migration. The target's copy is quarantined; the VM is `stopped` on the source with its firmware state | `lv start <vm>` runs it on the source. The quarantine on the target is for inspection (`firmware_migration_quarantine`). The condition stays open |
+| `firmware_migration_source_state_missing` | critical, source | After the guest left the source, the source's final vTPM state or NVRAM is missing, or the source domain's state cannot be read. The target's guest stays paused | Nothing is deleted. Retried every minute |
+| `firmware_migration_source_state_suspect` | critical, source | The target's copy did not match, or its guest is gone, and the source's guest had stopped for a reason other than the migration (a host crash or reboot), so the source's copy may be stale. Both copies kept; the target's guest stays paused | Not retried |
+| `firmware_migration_target_ran` | critical, source | The target's guest was found running before it was released, or a discard of the target's copy was refused because its guest runs | Not retried. Nothing is deleted on either host |
+| `firmware_migration_source_paused` | critical, source | The migration failed with the source's guest paused and a domain of the VM on the target. Both guests are paused | Not retried |
+| `firmware_migration_nvram_unconfirmed` | critical, source | The guest runs on the target, but the target's NVRAM did not equal the source's final NVRAM within 10 s of the resume. A guest writing EFI variables just after the resume can cause it. The source's state is kept; the VM cannot be started on the source, nor started or stopped on the target | The guest keeps running on the target |
+| `firmware_migration_cleanup_failed` | critical, source | The guest runs on the target, but the source cleanup stopped: writing the retained bundle, undefining the source's leftover definition, wiping the source's state, or removing the record failed. The source's state is kept | Fix the cause the detail names; the cleanup is retried every minute and at daemon start, and the condition resolves when it finishes. If the detail says the source's state changed after the cutover, it is never wiped automatically and a retry does not heal it: save the state at the paths named |
+| `firmware_migration_vf_missing` | critical, source (`runs_on` names where the guest runs) | The guest runs (on the source after a failed move, or on the target) without SR-IOV VFs the move detached from it; `vfs` lists them | Attach the VFs to the guest again, or restart it on that host so its devices are allocated again. Resolves once the guest runs there with all its VFs, or is stopped, deleted, or moved off that host |
+| `firmware_migration_held` | warning, target | A hold with a domain of the VM has existed for 5 minutes (it starts when the target prepares the move). A long storage copy reaches this in a move that is going well | Resolves when the hold goes |
+| `firmware_migration_quarantine` | warning, target | The target moved a held copy (vTPM state, NVRAM, record) into `<data_dir>/fwmig-quarantine/<vm>-<attempt>/`, with `reason.txt` giving every hash. This happens on a mismatch, on the abort of a hold that was past `prepared`, when a new move of the VM finds an earlier attempt's hold with no domain, and when the hold sweep finds a hold with no domain older than 2 hours whose VM is gone, recreated, or not migrating to this host | Nothing removes a quarantine. Inspect it and remove the directory by hand when it is no longer needed. The condition stays open |
+
+In a quarantine made before the guest resumed on the target, the NVRAM is the
+source's NVRAM the target materialised when it prepared the move, not libvirt's
+template.
+
+A move parked `target_ran`, `source_paused`, `source_state_suspect`,
+`source_state_missing` or `nvram_unconfirmed`, a `target_unreachable` park
+whose row names the target after a fence, and a critical
+`firmware_migration_discard_owed` need an operator to choose between the two
+copies. This build has no command for that: leave both records and both
+copies in place.
+
 ### A VM's disk is missing on its own host (`vm_disk_missing`)
 
 A start on the VM's own host never boots it from a blank disk. This covers the

@@ -394,7 +394,7 @@ type LiteVirtClient interface {
 	// so a condition that still holds is raised again on the next one.
 	ResolveHealthCondition(ctx context.Context, in *ResolveHealthConditionRequest, opts ...grpc.CallOption) (*ResolveHealthConditionResponse, error)
 	GetFenceReadiness(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*FenceReadiness, error)
-	RemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	RemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*RemoveHostResponse, error)
 	AdmitHost(ctx context.Context, in *AdmitHostRequest, opts ...grpc.CallOption) (*AdmitHostResponse, error)
 	// Host network configuration (v48): intent CRUD runs anywhere (replicated
 	// rows); Plan and Apply are forwarded to the OWNING host — they read and
@@ -1293,9 +1293,9 @@ func (c *liteVirtClient) GetFenceReadiness(ctx context.Context, in *emptypb.Empt
 	return out, nil
 }
 
-func (c *liteVirtClient) RemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *liteVirtClient) RemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*RemoveHostResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(emptypb.Empty)
+	out := new(RemoveHostResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_RemoveHost_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -4958,7 +4958,7 @@ type LiteVirtServer interface {
 	// so a condition that still holds is raised again on the next one.
 	ResolveHealthCondition(context.Context, *ResolveHealthConditionRequest) (*ResolveHealthConditionResponse, error)
 	GetFenceReadiness(context.Context, *emptypb.Empty) (*FenceReadiness, error)
-	RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error)
+	RemoveHost(context.Context, *RemoveHostRequest) (*RemoveHostResponse, error)
 	AdmitHost(context.Context, *AdmitHostRequest) (*AdmitHostResponse, error)
 	// Host network configuration (v48): intent CRUD runs anywhere (replicated
 	// rows); Plan and Apply are forwarded to the OWNING host — they read and
@@ -5739,7 +5739,7 @@ func (UnimplementedLiteVirtServer) ResolveHealthCondition(context.Context, *Reso
 func (UnimplementedLiteVirtServer) GetFenceReadiness(context.Context, *emptypb.Empty) (*FenceReadiness, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetFenceReadiness not implemented")
 }
-func (UnimplementedLiteVirtServer) RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error) {
+func (UnimplementedLiteVirtServer) RemoveHost(context.Context, *RemoveHostRequest) (*RemoveHostResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveHost not implemented")
 }
 func (UnimplementedLiteVirtServer) AdmitHost(context.Context, *AdmitHostRequest) (*AdmitHostResponse, error) {

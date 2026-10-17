@@ -2,6 +2,8 @@ package corrosion
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"slices"
 
@@ -119,4 +121,55 @@ func (c *Client) observePulledRows(rows map[string]int, pull []string, scope *pu
 		}
 		c.observePullRows(label, n)
 	}
+}
+
+// ErrNoPeerConfirmed is PullTableNow's answer when no peer completed the pull.
+var ErrNoPeerConfirmed = errors.New("no peer completed the pull")
+
+// PullTableNow pulls one replicated table from the first member that answers
+// and merges it, ahead of a decision read from that table: the currency pull
+// `lv host rm` and `lv host add` make before deciding a host's incarnation
+// (host_incarnation.go). It takes the same refusals a pass does (an isolated
+// peer, a peer that cannot keep a release feature in use, this node in
+// release probation) and is not debounced. peer is the member it pulled from;
+// a cluster this node is alone in has nobody to pull from and returns ("",
+// nil). Bounded by ctx.
+func (ae *AntiEntropy) PullTableNow(ctx context.Context, table string) (peer string, err error) {
+	if !replicatedTableSet[table] {
+		return "", fmt.Errorf("%s is not a replicated table", table)
+	}
+	members := ae.client.Members()
+	if len(members) == 0 {
+		return "", nil
+	}
+	var lastErr error
+	for _, m := range members {
+		if ctx.Err() != nil {
+			break
+		}
+		if epoch, _, ierr := HostIsolation(ctx, ae.client, m.Name); ierr == nil && epoch > 0 {
+			continue
+		}
+		if ae.client.ReplicationSourceAllowed(ctx, m.Name) != nil {
+			continue
+		}
+		pctx, cancel := context.WithTimeout(ctx, antiEntropyPeerTimeout)
+		client, conn, cerr := ae.peerClient(pctx, m.Name)
+		if cerr != nil {
+			cancel()
+			lastErr = cerr
+			continue
+		}
+		_, perr, merr := ae.pullAndMerge(pctx, client, []string{table}, nil, nil, nil)
+		conn.Close()
+		cancel()
+		if perr == nil && merr == nil {
+			return m.Name, nil
+		}
+		lastErr = errors.Join(perr, merr)
+	}
+	if lastErr == nil {
+		lastErr = ctx.Err()
+	}
+	return "", fmt.Errorf("%w: %v", ErrNoPeerConfirmed, lastErr)
 }

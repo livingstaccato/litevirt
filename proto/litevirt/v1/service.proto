@@ -73,7 +73,16 @@ message FenceHostRequest   {
 // re-checks the fence and that the host is no longer a voter, and does not
 // require its workloads to be drained — they are the stranded ones, and their
 // rows stay for the recovery claims to supersede.
-message RemoveHostRequest  { string name = 1; bool force = 2; bool dead = 3; }
+//
+// expected_cert_serial is the serial `lv host rm` revoked before calling. The
+// daemon refuses the removal when the row names another serial (a re-admission
+// landed in between). Empty skips the check: an older CLI sends none.
+message RemoveHostRequest  { string name = 1; bool force = 2; bool dead = 3; string expected_cert_serial = 4; }
+// RemoveHostResponse names what was removed: the serial and incarnation of the
+// row the removal tombstoned. Replaces google.protobuf.Empty, which is
+// wire-compatible: an older daemon's empty response reads as zero values, and
+// an older CLI ignores the fields.
+message RemoveHostResponse { string cert_serial = 1; int64 incarnation = 2; }
 message PublishCRLRequest  { string crl_pem = 1; }
 // version is the published CRL's number, echoed back because the daemon has
 // verified it by then and the caller has not. Whether the answering node had to
@@ -4377,7 +4386,7 @@ service LiteVirt {
     // so a condition that still holds is raised again on the next one.
     rpc ResolveHealthCondition(ResolveHealthConditionRequest) returns (ResolveHealthConditionResponse);
     rpc GetFenceReadiness(google.protobuf.Empty)  returns (FenceReadiness);
-    rpc RemoveHost(RemoveHostRequest)          returns (google.protobuf.Empty);
+    rpc RemoveHost(RemoveHostRequest)          returns (RemoveHostResponse);
     rpc AdmitHost(AdmitHostRequest)            returns (AdmitHostResponse);
     // Host network configuration (v48): intent CRUD runs anywhere (replicated
     // rows); Plan and Apply are forwarded to the OWNING host — they read and

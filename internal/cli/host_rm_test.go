@@ -11,7 +11,6 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pki"
 	"google.golang.org/grpc"
-	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 type hostRemoveTestClient struct {
@@ -46,9 +45,9 @@ func (c *hostRemoveTestClient) RetireAuditKey(context.Context, *pb.RetireAuditKe
 	return nil, errors.New(`rpc error: code = FailedPrecondition desc = host "node-9" has no live audit signing certificate: it either never published one or its key is already retired, so there is nothing to retire`)
 }
 
-func (c *hostRemoveTestClient) RemoveHost(context.Context, *pb.RemoveHostRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *hostRemoveTestClient) RemoveHost(context.Context, *pb.RemoveHostRequest, ...grpc.CallOption) (*pb.RemoveHostResponse, error) {
 	c.calls = append(c.calls, "remove")
-	return &emptypb.Empty{}, nil
+	return &pb.RemoveHostResponse{}, nil
 }
 
 // Removing a host tombstones its row and nothing else. The certificate it holds

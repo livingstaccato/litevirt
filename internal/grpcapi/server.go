@@ -957,6 +957,8 @@ type Server struct {
 	// invFlights is the runtime inventory's libvirt single flight
 	// (runtime_inventory.go).
 	invFlights inventoryFlights
+	// invClock, when set, is the inventory's clock (invNow). Test seam only.
+	invClock func() time.Time
 	// liveStateCalls holds each live-state read of a local domain libvirt
 	// has not answered yet (vm_live_state.go); liveStateWait is how long a
 	// read waits for one (zero: defaultLiveStateWait).

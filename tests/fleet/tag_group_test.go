@@ -236,16 +236,20 @@ func TestTagGroup_TagRmRemovesTheMember(t *testing.T) {
 	tgEverywhere(t, c, "web", ip, false)
 }
 
-// R1-I1: node-1's replication is cut. node-0 (the owner) removes role=web
-// from app-1; node-1, still holding the tagged view, runs `lv update
-// --cpu-limit 1` and SetVMLabels on app-1. Once replication resumes, no node
-// holds app-1's address in lv_tg_web, and the tags row still says removed:
-// no spec write carries membership back.
+// R1-I1: node-1 is cut off. node-0 (the owner) removes role=web from app-1;
+// node-1, still holding the tagged view, runs SetVMLabels on app-1. Once
+// replication resumes, node-1's label is kept everywhere, yet no node holds
+// app-1's address in lv_tg_web, and the tags row still says removed: no spec
+// write carries membership back.
 //
 // A spec edit entered off the owner is made on the owner while it can be
 // reached (grpcapi/spec_owner.go), so the owner is cut off from node-1
-// entirely before the label edit: that is what still makes it over node-1's
-// own, lagging view. The cpu limit is forwarded, as it always was.
+// entirely: that is what still makes the edit over node-1's own, lagging
+// view. `lv update` is not part of it any more: UpdateVM always runs on the
+// owner and refuses when it cannot reach it, so it never writes over a
+// lagging view, and an update the owner made during the cut, an operation
+// at the next generation, outranks the lagging label edit, which is then
+// dropped and proves nothing here.
 //
 // Mutation: SetVMLabels writes the tags its replica holds back with the
 // spec (tags stored with the spec) — node-1's write re-admits app-1: red.
@@ -256,22 +260,11 @@ func TestTagGroup_ALaggingSpecWriteDoesNotReAdmitARemovedMember(t *testing.T) {
 	ip := tgVM(t, c, a, "app-1", "52:54:00:7a:00:04")
 	id := tagVia(t, c, a, "vm", "app-1", "")
 	tgEverywhere(t, c, "web", ip, true)
-	// A first cpu limit records vm_limits' use on every host while all are
-	// reachable: a first use needs every host's acknowledgement.
-	half := 0.5
-	if _, err := c.SelfClient(a).UpdateVM(ctx, &pb.UpdateVMRequest{Name: "app-1", CpuLimit: &half}); err != nil {
-		t.Fatalf("a first cpu limit: %v", err)
-	}
-	c.WaitConverged(t, convergeTimeout)
 
 	c.Isolate(b)
 	tagRm(t, c, a, "vm", "app-1", "", "role")
 	if !slices.Contains(tgSet(t, b, "web"), ip) {
 		t.Fatalf("premise: %s, cut off, still holds app-1 in lv_tg_web", b.Name)
-	}
-	one := 1.0
-	if _, err := c.SelfClient(b).UpdateVM(ctx, &pb.UpdateVMRequest{Name: "app-1", CpuLimit: &one}); err != nil {
-		t.Fatalf("lv update app-1 --cpu-limit 1 via %s: %v", b.Name, err)
 	}
 	c.SetLinkFaultBoth(a, b, LinkFault{Block: true, BlockAll: true})
 	if _, err := c.SelfClient(b).SetVMLabels(ctx, &pb.SetVMLabelsRequest{Name: "app-1", Labels: map[string]string{"tier": "front"}}); err != nil {
@@ -283,6 +276,14 @@ func TestTagGroup_ALaggingSpecWriteDoesNotReAdmitARemovedMember(t *testing.T) {
 	}
 
 	c.ClearLinkFaults()
+	// node-1's lagging write is kept everywhere: what follows is about a spec
+	// write that landed, not one that was dropped on the way.
+	for _, n := range c.Nodes {
+		eventually(t, convergeTimeout, n.Name+" to hold node-1's label", func() bool {
+			vm, _ := corrosion.GetVM(ctx, n.DB, "app-1")
+			return vm != nil && strings.Contains(vm.Spec, `"tier"`)
+		})
+	}
 	for _, n := range c.Nodes {
 		eventually(t, convergeTimeout, n.Name+" to hold app-1 out of lv_tg_web and its tags row removed", func() bool {
 			rec, ok := tagsRowOn(t, n, corrosion.TagMemberVM, id)

@@ -161,7 +161,10 @@ exits non-zero with a summary such as `stack "web": 1 of 3 deletions failed
 background retry) counts as deleted. The stack is then left in state
 `deleting`, the daemon keeps retrying the teardown in the background (it takes
 a teardown up no sooner than a minute after it began, leaving a `compose down`
-still running to finish), and the `stack.delete` audit entry has result
+still running to finish, and keeps the VMs' disks when the teardown was asked
+to keep them, `keep_disks` on the REST or gRPC stack delete, or was begun by a
+host that did not record whether it was), and
+the `stack.delete` audit entry has result
 `error` and names what was not removed. While any of the stack's VMs or
 containers is left, none of its networks is deprovisioned: a deleted network
 is torn down on every host, and would be pulled out from under that workload.

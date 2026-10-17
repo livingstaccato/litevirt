@@ -70,6 +70,12 @@ func (r *StackReconciler) SetCleaner(c StackCleaner) {
 	r.cleaner = c
 }
 
+// SetClock replaces the clock the in-flight grace is judged by (tests).
+func (r *StackReconciler) SetClock(now func() time.Time) { r.now = now }
+
+// ReconcileOnce runs one pass, as the loop does each tick.
+func (r *StackReconciler) ReconcileOnce(ctx context.Context) { r.reconcile(ctx) }
+
 // Start begins the reconcile loop. Blocks until ctx is cancelled.
 func (r *StackReconciler) Start(ctx context.Context) {
 	ticker := time.NewTicker(stackReconcileInterval)
@@ -163,6 +169,15 @@ func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.St
 		return
 	}
 
+	// The disks go only when the teardown recorded that they may: one begun
+	// with keep_disks keeps them, and so does one whose choice this host
+	// cannot read (StackTeardownDeletesDisks).
+	deletesDisks, keepWhy := corrosion.StackTeardownDeletesDisks(ctx, r.db, stack)
+	if len(vms) > 0 && !deletesDisks {
+		slog.Info("stack-reconciler: deleting the stack's VMs, keeping their disks",
+			"stack", stack.Name, "reason", keepWhy)
+	}
+
 	remainingVMs := 0
 	for _, vm := range vms {
 		// Bound to the incarnation listed as the stack's: the host that
@@ -170,6 +185,7 @@ func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.St
 		// longer this one is left alone (WARN) and listed afresh next pass.
 		if _, err := r.cleaner.DeleteVMForStackCleanup(ctx, &pb.DeleteVMRequest{
 			Name: vm.Name, ExpectedStack: stack.Name, ExpectedCreatedAt: vm.CreatedAt,
+			KeepDisks: !deletesDisks,
 		}); err != nil {
 			slog.Warn("stack-reconciler: delete VM failed, will retry",
 				"stack", stack.Name, "vm", vm.Name, "error", err)

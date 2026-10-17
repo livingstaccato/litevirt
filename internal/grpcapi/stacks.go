@@ -1194,8 +1194,10 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	}
 
 	// Mark stack as "deleting" first — this is durable and survives crashes.
-	// The background StackReconciler will pick up stacks stuck in this state.
-	if err := corrosion.SetStackState(ctx, s.db, req.Name, "deleting"); err != nil {
+	// The background StackReconciler will pick up stacks stuck in this state,
+	// and keeps the disks when this teardown does (--keep-disks): the choice
+	// is recorded with the state, in the same write.
+	if err := corrosion.MarkStackDeleting(ctx, s.db, req.Name, req.KeepDisks, s.hostName); err != nil {
 		return status.Errorf(codes.Internal, "set stack state: %v", err)
 	}
 

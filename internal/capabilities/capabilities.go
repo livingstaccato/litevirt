@@ -1073,7 +1073,8 @@ const ReleaseToken = Release202611V1
 //     Voter changes need that same majority: repair a voter while
 //     ha.voter.unavailable names it (`lv cluster voter rm` then `add`); once
 //     the claim has no majority the exits are restoring the lost voter or
-//     `lv cluster voter force-reconfigure --lost` after a proof-grade fence.
+//     `lv cluster voter force-reconfigure --lost`, naming every member that
+//     cannot vote (abstaining ones included), each fenced proof-grade.
 //     `lv cluster voter reset` brings back the two-holder race. A binary
 //     rolled back below it
 //     enters WAL quarantine, as below every latched token; the lease-term

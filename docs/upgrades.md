@@ -1712,8 +1712,9 @@ that answers a read. `ha.lease.claim_no_majority` and
 There is no flag. Voter changes are decided by the same majority, so repair a
 voter while `ha.voter.unavailable` names it (`lv cluster voter rm <host>` then
 `lv cluster voter add <host>`). Once the claim itself has no majority, the
-exits are restoring the lost voter, or fencing it proof-grade and running
-`lv cluster voter force-reconfigure --lost <host>`. `lv cluster voter reset`
+exits are restoring the lost voter, or fencing proof-grade every member that
+cannot vote, abstaining ones included, and naming each in
+`lv cluster voter force-reconfigure --lost <host>[,<host>...]`. `lv cluster voter reset`
 returns hosts, as each adopts the reset generation, to recording terms from
 the quorum read alone — the two-holder race — and also ends recovery-claim
 protection. A binary rolled back below the

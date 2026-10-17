@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/claims"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -345,13 +348,16 @@ func stallFor(t *testing.T, s *Server) time.Time {
 // that could still accept unless it answered as an older build: unreachable
 // voters, other refusals and promises never make the fallback easier.
 //
-// Mutation: r1's rule (a majority of those that ANSWERED refused as an older
-// build) — the cut-off case falls back and this goes red.
+// Mutations: r1's rule (a majority of those that ANSWERED refused as an older
+// build) — the cut-off case falls back; count refusals rather than distinct
+// members — the duplicate case falls back; drop the stale-generation guard —
+// the stale-generation cases fall back. Each goes red.
 func TestOlderBuildsBlockAMajority(t *testing.T) {
 	unknown := func(v string) claims.Refusal {
 		return claims.Refusal{Voter: v, Reason: corrosion.RefusalInvalidValue, Detail: olderBuildRefusal}
 	}
 	gone := func(v string) claims.Refusal { return claims.Refusal{Voter: v, Reason: claims.ReasonUnreachable} }
+	stale := func(v, reason string) claims.Refusal { return claims.Refusal{Voter: v, Reason: reason, Detail: "x"} }
 	for _, tc := range []struct {
 		name     string
 		voters   []string
@@ -370,6 +376,17 @@ func TestOlderBuildsBlockAMajority(t *testing.T) {
 			[]claims.Refusal{unknown("o1"), unknown("o2"), gone("v2"), gone("v3")}, false},
 		{"older-build answers from non-members do not count", []string{"v1", "v2", "v3"}, 1,
 			[]claims.Refusal{unknown("x1"), unknown("x2"), gone("v2"), gone("v3")}, false},
+		{"one member answering twice counts once", []string{"o1", "v1", "v2"}, 0,
+			[]claims.Refusal{unknown("o1"), unknown("o1"), gone("v1"), gone("v2")}, false},
+		{"a non-member's older-build answer does not make up a blocking count", []string{"o1", "o2", "v1"}, 0,
+			[]claims.Refusal{unknown("o1"), unknown("x9"), gone("o2"), gone("v1")}, false},
+		{"a stale generation: the upgraded members answer wrong generation", []string{"o1", "o2", "v1", "v2"}, 0,
+			[]claims.Refusal{unknown("o1"), unknown("o2"), stale("v1", corrosion.RefusalWrongGeneration),
+				stale("v2", corrosion.RefusalWrongGeneration)}, false},
+		{"a stale generation: a member answers sealed", []string{"o1", "o2", "v1", "v2"}, 1,
+			[]claims.Refusal{unknown("o1"), unknown("o2"), stale("v2", corrosion.RefusalSealed)}, false},
+		{"a stale generation: a member answers not a member", []string{"o1", "o2", "v1", "v2"}, 1,
+			[]claims.Refusal{unknown("o1"), unknown("o2"), stale("v2", corrosion.RefusalNotMember)}, false},
 	} {
 		err := &claims.NoMajorityError{Phase: "prepare", Got: tc.got, Need: corrosion.MajorityOf(len(tc.voters)),
 			Refusals: tc.refusals}
@@ -439,5 +456,77 @@ func TestLeaseClaimNoMajority_AStaleStallStartDoesNotRaise(t *testing.T) {
 	}
 	if noMajorityRaised(t, s) {
 		t.Fatal("one failed claim raised the condition from a stall start a week old")
+	}
+}
+
+// claimPeer answers the high-water read at term 0 and a lease-term Prepare
+// with a fixed refusal, as one voter of the generation would.
+type claimPeer struct {
+	fakeHighWaterPeer
+	name, reason, detail string
+}
+
+func (p *claimPeer) PrepareRecoveryClaim(_ context.Context, req *pb.PrepareRecoveryClaimRequest, _ ...grpc.CallOption) (*pb.PrepareRecoveryClaimResponse, error) {
+	return &pb.PrepareRecoveryClaimResponse{Voter: p.name, RefusalReason: p.reason, RefusalDetail: p.detail}, nil
+}
+
+// The review's mid-roll scenario. Generation 1 is {o1, o2, v1, v2}, o1 and o2
+// on the previous build. `lv cluster voter rm o2` has decided generation 2 =
+// {o1, v1, v2}, under which v1 and v2 are a majority and claim. A takeover by
+// a node whose replica has not received generation 2 yet claims under 1: o1
+// and o2 answer "unknown claim type" — an older build fails Validate before
+// it checks the generation — and v1 and v2 answer wrong generation. Under
+// generation 1 the older builds look like 2 of 4, which blocks a majority, so
+// without the guard this node fell back and recorded the term on the read
+// alone, while a node on generation 2 decided the same term for itself. It
+// must record nothing.
+//
+// Mutation: drop the stale-generation guard — this node records term 1 and
+// this goes red.
+func TestLeaseMintClearance_AStaleGenerationDoesNotFallBack(t *testing.T) {
+	ctx := context.Background()
+	s := namedVoterServer(t)
+	s.db.SetVoterConfigGate(func() bool { return true })
+	members := []corrosion.VoterMember{{Name: "o1", Incarnation: "i"}, {Name: "o2", Incarnation: "i"},
+		{Name: "v1", Incarnation: "i"}, {Name: "v2", Incarnation: "i"}}
+	val := corrosion.VoterConfigValue{Generation: 1, Members: corrosion.SortMembers(members),
+		Change: corrosion.VoterChangeGenesis, CreatedBy: "test", CreatedAt: "test"}
+	if err := corrosion.WriteVoterConfig(ctx, s.db, val, corrosion.ClaimCertificate{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.RecordVoterAdoption(ctx, s.db, 1); err != nil {
+		t.Fatal(err)
+	}
+	insertTestHost(t, ctx, s.db, s.hostName, "active")
+	for _, m := range members {
+		insertTestHost(t, ctx, s.db, m.Name, "active")
+	}
+	s.db.MarkReplicaCaughtUpForTests("v1")
+	s.SetGate(fakeServerGate{quorum: health.QuorumYes, needed: 3, healthy: []string{"o1", "o2", "v1", "v2"}})
+	peers := map[string]*claimPeer{
+		"o1": {name: "o1", reason: corrosion.RefusalInvalidValue, detail: olderBuildRefusal},
+		"o2": {name: "o2", reason: corrosion.RefusalInvalidValue, detail: olderBuildRefusal},
+		"v1": {name: "v1", reason: corrosion.RefusalWrongGeneration, detail: "v1 has adopted voter generation 2, not 1"},
+		"v2": {name: "v2", reason: corrosion.RefusalWrongGeneration, detail: "v2 has adopted voter generation 2, not 1"},
+	}
+	s.peerClientOverride = func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
+		p, ok := peers[host]
+		if !ok {
+			return nil, nil, context.DeadlineExceeded
+		}
+		return p, func() {}, nil
+	}
+	s.db.SetLeaseMintClearance(s.LeaseMintClearance)
+	at, _ := time.Parse(time.RFC3339, clearanceNow)
+	held, term, err := corrosion.AcquireLeaseWithTerm(ctx, s.db, corrosion.LeaseKeyFailover, s.hostName, 30*time.Second, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held {
+		t.Fatalf("a claimant on a superseded voter generation recorded term %d on the read alone, beside "+
+			"the node deciding it under the new generation", term)
+	}
+	if newest, _ := corrosion.CurrentLeaseTerm(ctx, s.db, corrosion.LeaseKeyFailover); newest != 0 {
+		t.Fatalf("term %d recorded", newest)
 	}
 }

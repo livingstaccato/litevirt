@@ -1358,13 +1358,16 @@ generation to decide its next term for longer than one of the lease's TTLs, so
 nobody holds the lease (docs/operating-model.md, "Two nodes taking a lease over
 at once record one term"). Resolved once the lease is no longer contested: a
 claim for it is decided, a term is recorded without a claim, or a node sees a
-live holder renewing it. `litevirt_lease_term_claim_no_majority_total{lease}`
+live holder renewing it. During a split, a node that cannot see the holder may
+raise it again, and the row then alternates between observed and resolved
+without reaching confirmed. `litevirt_lease_term_claim_no_majority_total{lease}`
 counts each claim without a majority. The evidence names the refusing voters.
 Voter changes are decided by the same majority, so `lv cluster voter rm`,
-`add` and `reset` cannot run while this is raised. Repair a voter while
-`ha.voter.unavailable` names it, before it is needed. Once this is raised, the
-exits are restoring the lost voter, or fencing it proof-grade and running
-`lv cluster voter force-reconfigure --lost <host>`. `lv cluster voter reset`
+`add` and `reset` may not be able to run while this is raised. Repair a voter
+while `ha.voter.unavailable` names it, before it is needed. Once this is
+raised, the exits are restoring the lost voter, or fencing proof-grade every
+member that cannot vote, abstaining ones included, and naming each in
+`lv cluster voter force-reconfigure --lost <host>[,<host>...]`. `lv cluster voter reset`
 returns lease takeovers to the two-holder race.
 
 ### A forced voter reconfiguration (`ha.voter.forced`)

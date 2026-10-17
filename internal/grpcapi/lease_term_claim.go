@@ -214,7 +214,20 @@ func olderBuildsBlockAMajority(err error, names []string, q int) bool {
 	}
 	old := map[string]bool{}
 	for _, r := range nm.Refusals {
-		if member[r.Voter] && r.Reason == corrosion.RefusalInvalidValue && strings.Contains(r.Detail, olderBuildRefusal) {
+		if !member[r.Voter] {
+			continue
+		}
+		switch r.Reason {
+		case corrosion.RefusalWrongGeneration, corrosion.RefusalNotMember, corrosion.RefusalSealed:
+			// This claimant's generation is stale: a newer one has been
+			// decided, and under it the upgraded voters may well be a
+			// majority deciding this very term. An older build answers
+			// "unknown kind" whatever generation it is asked under, so the
+			// count below would be the stale generation's. Retry under the
+			// current one instead.
+			return false
+		}
+		if r.Reason == corrosion.RefusalInvalidValue && strings.Contains(r.Detail, olderBuildRefusal) {
 			old[r.Voter] = true
 		}
 	}
@@ -248,9 +261,10 @@ func (s *Server) noteLeaseClaimNoMajority(ctx context.Context, req corrosion.Lea
 		return
 	}
 	line := fmt.Sprintf("lease %s has had no takeover since %s: %s. A takeover needs a majority of the "+
-		"voters that can vote, and so does every voter change, so `lv cluster voter rm/add/reset` cannot "+
-		"run now either. Restore the lost voter, or fence it proof-grade and run "+
-		"`lv cluster voter force-reconfigure --lost <host>` (docs/design/recovery-claims.md §4.6). "+
+		"voters that can vote, and so does every voter change, so `lv cluster voter rm/add/reset` may not "+
+		"be able to run either. Restore the lost voter, or fence proof-grade every member that cannot vote, "+
+		"abstaining ones included, and run `lv cluster voter force-reconfigure --lost <host>[,<host>...]` "+
+		"(docs/design/recovery-claims.md §4.6). "+
 		"Repair a voter while ha.voter.unavailable names it, before it is needed. "+
 		"`lv cluster voter reset` returns lease takeovers to the two-holder race.",
 		req.Key, since.UTC().Format(time.RFC3339), why)

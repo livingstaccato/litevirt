@@ -983,19 +983,24 @@ While a lease has had no claim majority for longer than one of its TTLs, the
 `lease_term_claim`, subject the lease key). It is resolved once the lease is
 no longer contested: a claim for it is decided, a term is recorded without a
 claim (no generation adopted, or the older-build fallback), or a node sees a
-live holder renewing it, the returned holder included.
+live holder renewing it, the returned holder included. During a split, a node
+that cannot see the holder may raise it again, and the row then alternates
+between observed and resolved without being confirmed.
 `litevirt_lease_term_claim_no_majority_total{lease}` counts every claim
 without a majority. `lv cluster voter ls` shows the voters.
 
 To stand down, know that every voter change is decided by the same majority
 as a lease-term claim: `lv cluster voter rm`, `lv cluster voter add` and
-`lv cluster voter reset` cannot run once the claim itself has no majority.
+`lv cluster voter reset` may not be able to run once the claim itself has no
+majority. (Mid-roll, older-build voters still decide voter changes, so
+`lv cluster voter rm <dead host>` can be the exit there.)
 
 - **Before it is needed.** Repair a voter while `ha.voter.unavailable` names it
   (`lv cluster voter rm <host>` then `lv cluster voter add <host>` for an
   abstaining one), while the remaining voters still form a majority.
 - **Once the claim has no majority.** The exits are restoring the lost voter,
-  or fencing it proof-grade and running
+  or fencing proof-grade every member that cannot vote, abstaining ones
+  included, and naming each of them in
   `lv cluster voter force-reconfigure --lost <host>[,<host>...]`
   (docs/design/recovery-claims.md §4.6).
 - **`lv cluster voter reset`** returns lease takeovers to the quorum read

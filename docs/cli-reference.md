@@ -225,9 +225,14 @@ lv logs <vm> [-f] [-n 50]                 # VM logs (-f to follow)
 **A kept disk and a create of the same name.** After `lv rm --keep-disks
 <vm>`, the VM's disks stay where they were. A VM of the same name created later
 on the same host would take `<data_dir>/disks/<vm>-<disk>.qcow2`, so the create
-first renames a kept disk there to `<path>.kept-<time>`. Nothing removes that
-file; the rename is recorded as a `vm.disk.kept` event of the VM. A disk
-recorded `delete_with_vm=false` is handled the same way. The host that holds
+first renames a kept disk there to `<path>.kept-<time>`, and the kept VM's
+cloud-init seed (`cloudinit/<vm>.iso`) to `<seed>.kept-<time>`. Nothing removes
+those files; each rename is recorded as a `vm.disk.kept` event of the VM. A disk
+recorded `delete_with_vm=false` is handled the same way. The create renames
+nothing until the refusals it can judge up front have passed (Secure Boot or
+vTPM over kept UEFI vars, the image not available), and a create that fails
+after the rename puts each file back at the path the kept VM recorded, unless
+a file is there by then. The host that holds
 kept disks lists them in `<data_dir>/kept-disks/<vm>.json` until a create
 renames them. `lv host superseded-disks <host>` lists each `.kept-` file there
 as `kept`; `--purge`, `--remove` and `--restore` never take one, so only an

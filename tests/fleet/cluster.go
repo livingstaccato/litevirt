@@ -569,8 +569,9 @@ func New(t *testing.T, opts Options) *Cluster {
 		// hosts column before then outruns a peer's late seed INSERT, which
 		// loses the LWW gate on that node and leaves its one-second created_at
 		// apart for good; only anti-entropy, which the fleet does not run,
-		// would settle it. Joiners start apart on purpose.
-		c.WaitConverged(t, 20*time.Second)
+		// would settle it. Joiners start apart on purpose. The budget is
+		// raceBudgetScale times longer under the race detector.
+		c.WaitConverged(t, 20*time.Second*raceBudgetScale)
 	}
 	return c
 }

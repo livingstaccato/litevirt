@@ -532,6 +532,7 @@ func (r *Reconciler) reconcilePass(ctx context.Context) {
 	// the ones litevirt created that have none. Neither touches the runtime.
 	r.adoptManagedDomains(ctx)
 	r.reportOrphanRuntimes(ctx)
+	r.resolveGoneSubjects(ctx)
 }
 
 // Start begins the reconcile loop. Blocks until ctx is cancelled.

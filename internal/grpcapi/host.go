@@ -884,12 +884,8 @@ func (s *Server) UndrainHost(ctx context.Context, req *pb.UndrainHostRequest) (*
 		return nil, status.Errorf(codes.NotFound, "host %q not found", req.Name)
 	}
 
-	if h.State == "upgrading" {
-		if err := s.undrainRestarting(ctx, req.Name); err != nil {
-			return nil, err
-		}
-	} else if err := corrosion.UpdateHostState(ctx, s.db, req.Name, "active"); err != nil {
-		return nil, status.Errorf(codes.Internal, "update host state: %v", err)
+	if err := s.undrainFrom(ctx, req.Name, h.State); err != nil {
+		return nil, err
 	}
 	s.publish("host.undrained", req.Name, "")
 	s.audit(ctx, "host.undrain", req.Name, "", "ok")
@@ -945,7 +941,9 @@ func (s *Server) undrainRestarting(ctx context.Context, host string) error {
 		"%s is now recorded %s; run 'lv host undrain %s' again if it should be active", host, h.State, host)
 }
 
-// pingHost reports whether host's daemon answers a Ping.
+// pingHost reports whether host's daemon answers a Ping as host. An answer
+// in another host's name (a misaddressed peer, or a node that dials itself
+// behind NAT) is not one.
 func (s *Server) pingHost(ctx context.Context, host string) error {
 	pctx, cancel := context.WithTimeout(ctx, undrainPingTimeout)
 	defer cancel()
@@ -954,8 +952,43 @@ func (s *Server) pingHost(ctx context.Context, host string) error {
 		return err
 	}
 	defer closeConn()
-	_, err = c.Ping(pctx, &pb.PingRequest{})
-	return err
+	resp, err := c.Ping(pctx, &pb.PingRequest{})
+	if err != nil {
+		return err
+	}
+	if got := resp.GetHostName(); got != host {
+		return fmt.Errorf("the daemon at its address answered as %q", got)
+	}
+	return nil
+}
+
+// undrainAttempts bounds how often undrainFrom re-reads a state that changed
+// under its write.
+const undrainAttempts = 3
+
+// undrainFrom records host active, read as `from`. The write is made only
+// while the host is still recorded so, and on a miss the state is read again:
+// a SIGTERM's 'upgrading' write landing after the read is not overwritten,
+// and goes through undrainRestarting instead.
+func (s *Server) undrainFrom(ctx context.Context, host, from string) error {
+	for i := 0; i < undrainAttempts; i++ {
+		if from == "upgrading" {
+			return s.undrainRestarting(ctx, host)
+		}
+		applied, err := corrosion.UpdateHostStateFrom(ctx, s.db, host, from, "active")
+		if err != nil {
+			return status.Errorf(codes.Internal, "update host state: %v", err)
+		}
+		if applied {
+			return nil
+		}
+		h, err := corrosion.GetHost(ctx, s.db, host)
+		if err != nil || h == nil {
+			return status.Errorf(codes.NotFound, "host %q not found", host)
+		}
+		from = h.State
+	}
+	return status.Errorf(codes.Aborted, "%s's state kept changing while undrain wrote it; run 'lv host undrain %s' again", host, host)
 }
 
 // SetHostLabels sets or removes labels on a host.

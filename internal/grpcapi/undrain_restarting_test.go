@@ -20,6 +20,8 @@ type pingPeer struct {
 	pb.LiteVirtClient
 	err   error
 	calls *atomic.Int32
+	// as is the host name the peer answers in; empty: "w1".
+	as string
 }
 
 func (p pingPeer) Ping(context.Context, *pb.PingRequest, ...grpc.CallOption) (*pb.PingResponse, error) {
@@ -29,7 +31,11 @@ func (p pingPeer) Ping(context.Context, *pb.PingRequest, ...grpc.CallOption) (*p
 	if p.err != nil {
 		return nil, p.err
 	}
-	return &pb.PingResponse{}, nil
+	as := p.as
+	if as == "" {
+		as = "w1"
+	}
+	return &pb.PingResponse{HostName: as}, nil
 }
 
 func undrainServer(t *testing.T, state string, pingErr error) (*Server, *atomic.Int32) {
@@ -131,5 +137,63 @@ func TestUndrainHost_RestartingSelfTurnsActive(t *testing.T) {
 	}
 	if calls.Load() != 0 {
 		t.Errorf("pinged a peer %d times for this node itself", calls.Load())
+	}
+}
+
+// TestUndrainHost_AnswerInAnotherNameIsRefused: a Ping answered by a daemon
+// that is not the host (its address reaches another node, as on a NAT'd lab
+// where every node dials itself) does not show the host serves.
+//
+// Mutation: drop the host-name check from pingHost — the undrain records the
+// restarting host active.
+func TestUndrainHost_AnswerInAnotherNameIsRefused(t *testing.T) {
+	s, calls := undrainServer(t, "upgrading", nil)
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return pingPeer{calls: calls, as: "w2"}, func() {}, nil
+	}
+	_, err := s.UndrainHost(adminCtx(), &pb.UndrainHostRequest{Name: "w1"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("undrain answered in another host's name: err=%v, want FailedPrecondition", err)
+	}
+	if !strings.Contains(status.Convert(err).Message(), `answered as "w2"`) {
+		t.Errorf("refusal %q does not name the host that answered", status.Convert(err).Message())
+	}
+	if got := hostStateOf(t, s, "w1"); got != "upgrading" {
+		t.Errorf("host state = %q, want 'upgrading'", got)
+	}
+}
+
+// TestUndrainHost_RestartRecordedAfterTheReadIsNotOverwritten: undrain read
+// the host 'active', and the host's SIGTERM recorded it 'upgrading' before the
+// write. The write is made only from the state read, so it does not land; the
+// state is read again and the undrain goes the restarting host's way: its
+// daemon does not answer, so it is refused and the host stays 'upgrading'.
+//
+// Mutation: make undrainFrom's write unconditional (UpdateHostState) — the
+// host is recorded active over its SIGTERM's write.
+func TestUndrainHost_RestartRecordedAfterTheReadIsNotOverwritten(t *testing.T) {
+	s, calls := undrainServer(t, "upgrading", status.Error(codes.Unavailable, "stopping"))
+	err := s.undrainFrom(adminCtx(), "w1", "active")
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("undrain over a SIGTERM's write: err=%v, want FailedPrecondition", err)
+	}
+	if got := hostStateOf(t, s, "w1"); got != "upgrading" {
+		t.Errorf("host state = %q, want the SIGTERM's 'upgrading'", got)
+	}
+	if calls.Load() == 0 {
+		t.Error("the host recorded 'upgrading' since the read was not asked whether it serves")
+	}
+}
+
+// TestUndrainHost_StateChangedToAnotherDrainedStateStillUndrains: a state
+// that changed between the read and the write to anything but 'upgrading'
+// (draining -> maintenance) is read again and undrained, as before.
+func TestUndrainHost_StateChangedToAnotherDrainedStateStillUndrains(t *testing.T) {
+	s, _ := undrainServer(t, "maintenance", nil)
+	if err := s.undrainFrom(adminCtx(), "w1", "draining"); err != nil {
+		t.Fatalf("undrain after the state changed to maintenance: %v", err)
+	}
+	if got := hostStateOf(t, s, "w1"); got != "active" {
+		t.Errorf("host state = %q, want active", got)
 	}
 }

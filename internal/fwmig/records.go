@@ -239,6 +239,19 @@ type Marker struct {
 	// when Phase is not parked. A parked marker parked again keeps the
 	// original progress phase: use Park.
 	ParkedFrom Phase `json:"parked_from"`
+	// CommitDisks is the VM's disk rows as the commit left them, recorded when
+	// the marker becomes committed: the D-5 return writer's guard (§17 D-5).
+	// Absent before the commit, and on a marker an earlier build wrote.
+	CommitDisks []CommitDisk `json:"commit_disks,omitempty"`
+}
+
+// CommitDisk is one disk row's placement as the commit left it.
+type CommitDisk struct {
+	Disk          string `json:"disk"`
+	Host          string `json:"host"`
+	Path          string `json:"path"`
+	StorageType   string `json:"storage_type"`
+	StorageVolume string `json:"storage_volume"`
 }
 
 // Park returns m moved to the parked phase p. ParkedFrom is m's phase when m
@@ -309,6 +322,11 @@ func (m Marker) Validate() error {
 	}
 	if !m.TPM && !m.UEFI {
 		return fmt.Errorf("marker %s: neither tpm nor uefi", m.VM)
+	}
+	for _, d := range m.CommitDisks {
+		if d.Disk == "" || d.Host == "" {
+			return fmt.Errorf("marker %s: commit_disks entry %+v has no disk or host", m.VM, d)
+		}
 	}
 	if err := validateHash("src_permall_sha256", m.SrcPermallSHA256); err != nil {
 		return err
@@ -667,10 +685,10 @@ func (r *Records) get(path string, v interface{ Validate() error }) (bool, error
 // nullableKeys may be JSON null: a nil list encodes as null.
 var nullableKeys = map[string]bool{"created_stubs": true}
 
-// optionalKeys may be absent: a record field a move never writes, only an
-// operator's D-5 action (a hold's adoption). A record written before the
-// field existed reads as it did.
-var optionalKeys = map[string]bool{"adoption": true}
+// optionalKeys may be absent: a field written only by an operator's D-5
+// action (a hold's adoption) or only from the commit on (a marker's commit
+// disks). A record written before the field existed reads as it did.
+var optionalKeys = map[string]bool{"adoption": true, "commit_disks": true}
 
 // requireKeys fails unless the object b carries every key of v's type,
 // non-null: a missing key must not decode as a zero value

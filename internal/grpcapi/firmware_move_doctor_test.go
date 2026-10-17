@@ -328,14 +328,14 @@ func TestDoctorFirmwareMove(t *testing.T) {
 		r.resolved(err, "src-host", "running")
 		r.discardedOnTarget("source_paused, source running")
 	})
-	// The target's copy goes first: with its guest running the DISCARD is
-	// refused, and the source guest stays paused.
-	// Mutation: resume before the DISCARD — red.
+	// A target guest that runs ran after the source paused: its copy is the
+	// newer one, and the source guest stays paused.
+	// Mutation: resume before the check — red.
 	t.Run("source_paused/accept_source_refuses_running_target", func(t *testing.T) {
 		r := sourcePaused(t, libvirtfake.StatePaused, libvirtfake.StateRunning)
 		before := r.snap()
 		_, err := r.doctor(actAcceptSource)
-		r.refused(err, "refused the DISCARD", before)
+		r.refused(err, "it ran after the source paused", before)
 	})
 
 	// D2-13 re-review 3 m-A: a source_paused park whose target holds nothing
@@ -770,27 +770,6 @@ func TestDoctorFirmwareMove(t *testing.T) {
 		before := r.snap()
 		_, err := r.doctor(actDiscard)
 		r.refused(err, "the VM's own copy", before)
-	})
-
-	// ── owed discard refused, the target domain running ──
-	owedRunning := func(t *testing.T) *fwlRig {
-		r := lost(t, false)
-		r.dstFake.SetState(fwlVM, libvirtfake.StateRunning)
-		return r
-	}
-	t.Run("owed_discard_target_running/discard_needs_stop_target", func(t *testing.T) {
-		r := owedRunning(t)
-		before := r.snap()
-		_, err := r.doctor(actDiscard)
-		r.refused(err, "add --stop-target", before)
-	})
-	t.Run("owed_discard_target_running/discard_stop_target", func(t *testing.T) {
-		r := owedRunning(t)
-		_, err := r.doctor(actDiscard, withStop)
-		if err != nil {
-			t.Fatalf("discard: %v", err)
-		}
-		r.discardedOnTarget("owed discard, --stop-target")
 	})
 
 	// ── conditions no move closes: --resolve ──

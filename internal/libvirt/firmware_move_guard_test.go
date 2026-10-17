@@ -330,6 +330,10 @@ func fwPrims() map[FirmwareOp][]fwPrim {
 			// vm_replace_cleanup.go:348 case).
 			{name: "WipeFirmwareStateByUUID", bestEffort: true, run: func(e *fwEnv) error { e.store.WipeFirmwareStateByUUID(fwTestUUID); return nil },
 				acted: func(e *fwEnv) bool { return !e.hasSwtpm() }},
+			// The D-5 discard of a leftover no record names: an ordinary call.
+			{name: "QuarantineFirmwareStateForOperator", run: func(e *fwEnv) error {
+				return e.store.QuarantineFirmwareStateForOperator(fwTestVM, fwTestUUID, filepath.Join(e.store.DataDir, "q"))
+			}, acted: func(e *fwEnv) bool { _, ok := e.nvram(fwTestVM); return !ok && !e.hasSwtpm() }},
 		},
 	}
 }

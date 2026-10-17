@@ -1151,3 +1151,33 @@ func contains(s []string, x string) bool {
 	}
 	return false
 }
+
+// A committed marker records the commit's disk rows; a marker without them
+// (written before the commit, or by an earlier build) reads as before; an
+// entry with no disk or host does not read.
+//
+// Mutation: require the commit_disks key; drop the entry check — red.
+func TestFwmig_MarkerCommitDisks(t *testing.T) {
+	r := New(t.TempDir())
+	m := tMarker(PhaseCommitted)
+	if err := r.PutMarker(m); err != nil {
+		t.Fatal(err)
+	}
+	if got := fileKeys(t, filepath.Join(r.dataDir, InflightDir, "vm1.json")); contains(got, "commit_disks") {
+		t.Fatalf("a marker without commit disks carries the key: %v", got)
+	}
+	if _, _, err := r.GetMarker("vm1"); err != nil {
+		t.Fatalf("a marker without commit disks: %v", err)
+	}
+	m.CommitDisks = []CommitDisk{{Disk: "root", Host: "node-2", Path: "/nfs/vm1-root", StorageType: "nfs"}}
+	if err := r.PutMarker(m); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, err := r.GetMarker("vm1"); err != nil || !ok || !reflect.DeepEqual(got, m) {
+		t.Fatalf("round trip: %+v %v %v", got, ok, err)
+	}
+	m.CommitDisks = []CommitDisk{{Path: "/nfs/x"}}
+	if err := r.PutMarker(m); err == nil {
+		t.Error("a commit disk with no disk or host was written")
+	}
+}

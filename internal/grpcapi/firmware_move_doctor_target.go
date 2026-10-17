@@ -9,8 +9,10 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -339,6 +341,10 @@ func (s *Server) doctorTargetLocalAct(ctx context.Context, h fwmig.Hold, req *pb
 	if err != nil {
 		return "", status.Errorf(codes.Unavailable, "VM %q: whether %s is proved off cannot be read: %v", h.VM, h.Source, err)
 	}
+	// sourceOwes: the source answered and holds an owed DISCARD of this
+	// attempt, so the VM's current copy is the source's (the refused owed
+	// discard row), and only then may --stop-target stop a held guest here.
+	sourceOwes := false
 	if !off {
 		if a == pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_ADOPT_TARGET_COPY {
 			return refuse(fmt.Sprintf("the source %s is not proved off: once it is powered off, `lv host fence-confirm %s`", h.Source, h.Source))
@@ -350,10 +356,11 @@ func (s *Server) doctorTargetLocalAct(ctx context.Context, h fwmig.Hold, req *pb
 		if m := markerOf(sr); m != nil && m.Attempt == h.Attempt {
 			return refuse(fmt.Sprintf("the source %s holds the move's marker (%s); the action runs there", h.Source, fwDescribe(*m)))
 		}
+		sourceOwes = owesDiscard(sr, h.VM, h.Binding)
 	}
 	switch a {
 	case pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_DISCARD_TARGET:
-		return s.doctorTargetLocalDiscard(ctx, h, req.GetStopTarget())
+		return s.doctorTargetLocalDiscard(ctx, h, req.GetStopTarget(), sourceOwes)
 	case pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_ADOPT_TARGET_COPY:
 		return s.doctorTargetLocalAdopt(ctx, h, actor)
 	default:
@@ -370,11 +377,26 @@ func (s *Server) doctorTargetLocalAct(ctx context.Context, h fwmig.Hold, req *pb
 	}
 }
 
+// owesDiscard reports whether a host's records carry an owed DISCARD of b's
+// attempt of vm.
+func owesDiscard(r *pb.FirmwareMoveHostRecords, vm string, b fwmig.Binding) bool {
+	for _, j := range r.GetOwedDiscards() {
+		var o fwmig.OwedDiscard
+		if json.Unmarshal([]byte(j), &o) == nil && o.VM == vm && o.Binding.Matches(b) {
+			return true
+		}
+	}
+	return false
+}
+
 // doctorTargetLocalDiscard is --discard-target on the target: the VM's row
 // does not name this host for the hold's incarnation, so the held copy is
-// not the VM's; --stop-target stops a guest that runs here; the domain goes
-// (its state kept) and the state is quarantined. Nothing is deleted.
-func (s *Server) doctorTargetLocalDiscard(ctx context.Context, h fwmig.Hold, stop bool) (string, error) {
+// not the VM's; the domain goes (its state kept) and the state is
+// quarantined. Nothing is deleted. A held guest that runs is stopped
+// (--stop-target) only in the refused owed DISCARD row, where the source
+// answered with the owed record: with the source lost, a guest that runs may
+// be the only copy, and is never stopped here.
+func (s *Server) doctorTargetLocalDiscard(ctx context.Context, h fwmig.Hold, stop, sourceOwes bool) (string, error) {
 	row, err := corrosion.GetVM(ctx, s.db, h.VM)
 	if err != nil {
 		return "", status.Errorf(codes.Unavailable, "VM %q: its row cannot be read: %v", h.VM, err)
@@ -395,6 +417,11 @@ func (s *Server) doctorTargetLocalDiscard(ctx context.Context, h fwmig.Hold, sto
 		return "", status.Errorf(codes.Unavailable, "VM %q: %v", h.VM, err)
 	}
 	if td.Present && td.State != "shutoff" && td.State != "paused" {
+		if !sourceOwes {
+			return "", status.Errorf(codes.FailedPrecondition,
+				"VM %q: its held guest is %s on %s, and %s holds no owed DISCARD of attempt %s: that guest may be the only copy of the VM, and it is not stopped",
+				h.VM, td.State, s.hostName, h.Source, h.Attempt)
+		}
 		if !stop {
 			return "", status.Errorf(codes.FailedPrecondition, "VM %q: its held guest is %s on %s: add --stop-target", h.VM, td.State, s.hostName)
 		}
@@ -447,13 +474,17 @@ func (s *Server) doctorTargetLocalAdopt(ctx context.Context, h fwmig.Hold, actor
 	if td.State != "paused" {
 		return "", status.Errorf(codes.FailedPrecondition, "VM %q: its held domain on %s is %s; an adopted copy without its source must be paused here", h.VM, s.hostName, domainWord(td))
 	}
-	adopted, err := s.adoptHold(cur, actor, fmt.Sprintf("the source %s is proved off and holds no marker", h.Source))
-	if err != nil {
-		return "", err
+	adopted := cur
+	if cur.State != fwmig.HoldResuming {
+		// A resuming hold is an earlier run's adoption whose resume failed.
+		if adopted, err = s.adoptHold(cur, actor, fmt.Sprintf("the source %s is proved off and holds no marker", h.Source)); err != nil {
+			return "", err
+		}
 	}
 	if row.HostName == h.Source {
-		//runningcheck:allow the adopted target's own commit: the row names the lost source until it lands, so the publish helper refuses it; this host marks the runtime it resumes, as a watched commit's destination does.
-		ok, err := corrosion.CommitMigrationOwnership(ctx, s.db, h.VM, h.Source, s.hostName, "running", disks)
+		// The row says migrating until the guest runs here; the commit
+		// moves it and its disks to this host.
+		ok, err := corrosion.CommitMigrationOwnership(ctx, s.db, h.VM, h.Source, s.hostName, "migrating", disks)
 		if err != nil || !ok {
 			return "", status.Errorf(codes.FailedPrecondition, "VM %q: the hold is adopted (verified), and the commit from %s to %s did not land (ok %v, %v); run this again",
 				h.VM, h.Source, s.hostName, ok, err)
@@ -464,6 +495,123 @@ func (s *Server) doctorTargetLocalAdopt(ctx context.Context, h fwmig.Hold, actor
 	if _, err := s.resumeReleased(ctx, resp, adopted, adopted.UEFI, nv); err != nil {
 		return "", err
 	}
+	did := fmt.Sprintf("an operator adopted the held copy of attempt %s from %s, which is proved off", h.Attempt, h.Source)
+	if err := s.publishRunning(ctx, h.VM, "running", func(ctx context.Context) error {
+		return corrosion.UpdateVMState(ctx, s.db, h.VM, "running", did)
+	}); err != nil {
+		s.noteStateWriteFail(corrosion.OpVMState, err)
+	}
+	if cur, err := corrosion.GetVM(ctx, s.db, h.VM); err == nil && cur != nil {
+		s.convergeMovedGuest(ctx, cur, h.Source, s.hostName, true)
+	}
+	s.noteAdoptedVFsMissing(ctx, h)
+	s.recordVMEvent(ctx, h.VM, "vm.migrate.firmware", "ok", did)
 	return fmt.Sprintf("VM %q: the held copy of attempt %s was adopted by %s, committed to %s and released (NVRAM confirmed %v)",
 		h.VM, h.Attempt, actor, s.hostName, resp.GetNvramConfirmed()), nil
+}
+
+// noteAdoptedVFsMissing raises firmware_migration_vf_missing for the PCI
+// devices the lost source still records for the VM: the move detached them,
+// and nothing allocated equivalents here.
+func (s *Server) noteAdoptedVFsMissing(ctx context.Context, h fwmig.Hold) {
+	devs, err := corrosion.ListPCIDevices(ctx, s.db, h.Source, "")
+	if err != nil {
+		slog.Warn("firmware-move doctor: the lost source's devices cannot be listed", "vm", h.VM, "error", err)
+		return
+	}
+	var missing []string
+	for _, d := range devs {
+		if d.VMName == h.VM {
+			missing = append(missing, d.Address)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	if err := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{
+		Code: condFwmigVFMissing, VM: h.VM, Attempt: h.Attempt, Source: h.Source, Target: s.hostName,
+		RunsOn: s.hostName, VFs: missing, VFsWanted: len(missing),
+		Detail: fmt.Sprintf("the adopted guest runs on %s without the devices %s it had on %s", s.hostName, strings.Join(missing, ", "), h.Source),
+		Action: fmt.Sprintf("attach %d SR-IOV VF(s) to the guest on %s, or restart it there so its devices are allocated again", len(missing), s.hostName),
+	}); err != nil {
+		slog.Warn("firmware-move doctor: raise the condition", "vm", h.VM, "code", condFwmigVFMissing, "error", err)
+	}
+}
+
+// doctorDiscardOwedLeftover is --discard-target on a target that holds no
+// hold of the VM, while another host owes this one a DISCARD of it (the hold
+// went with a release, and the source took the VM back after the commit). The
+// VM's row names that host for the owed incarnation; the domain here, of the
+// owed uuid, is shut off (or already undefined by an earlier run). It is
+// undefined keeping its state, and the swtpm tree and NVRAM go into
+// <data_dir>/fwmig-quarantine/<vm>-<attempt>/, as rule Q keeps a held copy.
+// The owed DISCARD then finds nothing left, and its record goes.
+func (s *Server) doctorDiscardOwedLeftover(ctx context.Context, vm, actor string) (string, error) {
+	report := s.gatherFirmwareMoveRecords(ctx, vm, actor)
+	var (
+		o     fwmig.OwedDiscard
+		owner string
+		found bool
+	)
+	for _, h := range report.GetHosts() {
+		for _, j := range h.GetOwedDiscards() {
+			var x fwmig.OwedDiscard
+			if json.Unmarshal([]byte(j), &x) == nil && x.VM == vm && x.Target == s.hostName {
+				o, owner, found = x, h.GetHost(), true
+			}
+		}
+	}
+	if !found {
+		return "", status.Errorf(codes.FailedPrecondition, "VM %q: no move record names it on %s, and no host that answered owes %s a DISCARD of it", vm, s.hostName, s.hostName)
+	}
+	row, err := corrosion.GetVM(ctx, s.db, vm)
+	if err != nil {
+		return "", status.Errorf(codes.Unavailable, "VM %q: its row cannot be read: %v", vm, err)
+	}
+	if row == nil || row.HostName != owner || !o.Binding.SameIncarnation(fwmig.Binding{UUID: parseFirmwareSpec(row.Spec).UUID, CreatedAt: row.CreatedAt}) {
+		return "", status.Errorf(codes.FailedPrecondition, "VM %q: its row (on %s) does not name %s, which owes the DISCARD, for its incarnation; the leftover here is not discarded",
+			vm, rowHost(row), owner)
+	}
+	td, err := s.targetDomain(vm)
+	if err != nil {
+		return "", status.Errorf(codes.Unavailable, "VM %q: %v", vm, err)
+	}
+	switch {
+	case td.Present && !strings.EqualFold(td.Uuid, o.UUID):
+		return "", status.Errorf(codes.FailedPrecondition, "VM %q: the domain here has uuid %q, not the owed incarnation's %s; it is not touched", vm, td.Uuid, o.UUID)
+	case td.Present && td.State != "shutoff":
+		return "", status.Errorf(codes.FailedPrecondition, "VM %q: its leftover domain on %s is %s, and the VM's row names %s; this action never stops it: shut that guest down on %s (`virsh shutdown %s` keeps its state), then run this again",
+			vm, s.hostName, td.State, owner, s.hostName, vm)
+	}
+	if s.virt == nil {
+		return "", status.Errorf(codes.Unavailable, "VM %q: no libvirt connection", vm)
+	}
+	if td.Present {
+		if err := s.virt.UndefineDomainPreservingState(vm); err != nil {
+			return "", status.Errorf(codes.FailedPrecondition, "VM %q: undefine the leftover keeping its state: %v", vm, err)
+		}
+	}
+	dir, err := s.fwRecords().QuarantinePath(vm, o.Attempt)
+	if err != nil {
+		return "", status.Errorf(codes.Internal, "VM %q: %v", vm, err)
+	}
+	if err := s.fw().QuarantineFirmwareStateForOperator(vm, o.UUID, dir); err != nil {
+		return "", status.Errorf(codes.Internal, "VM %q: quarantine the leftover's state: %v", vm, err)
+	}
+	reason := fmt.Sprintf("vm: %s\nuuid: %s\ncreated_at: %s\nattempt: %s\nsource: %s\ntarget: %s\nquarantined_at: %s\n"+
+		"reason: an operator discarded the leftover an owed DISCARD names (lv doctor firmware-move --discard-target)\n"+
+		"quarantined_permall: %s\nquarantined_nvram: %s\n",
+		vm, o.UUID, o.CreatedAt, o.Attempt, owner, s.hostName, time.Now().UTC().Format(time.RFC3339),
+		fileSHA256OrAbsent(filepath.Join(dir, "swtpm", "tpm2", "tpm2-00.permall")), fileSHA256OrAbsent(filepath.Join(dir, "nvram")))
+	if err := writeFileDurable(filepath.Join(dir, "reason.txt"), []byte(reason)); err != nil {
+		return "", status.Errorf(codes.Internal, "VM %q: quarantine reason.txt: %v", vm, err)
+	}
+	if err := s.raiseQuarantineCondition(ctx, fwmigCondition{
+		VM: vm, Attempt: o.Attempt, Source: owner, Target: s.hostName, Paths: []string{dir},
+		Detail: fmt.Sprintf("an operator discarded the leftover of attempt %s on %s; its state is quarantined in %s", o.Attempt, s.hostName, dir),
+		Action: "inspect it and remove the directory by hand when it is no longer needed; `lv doctor firmware-move <vm> --resolve quarantine` closes this",
+	}); err != nil {
+		slog.Warn("firmware-move doctor: raise the quarantine condition", "vm", vm, "error", err)
+	}
+	return fmt.Sprintf("VM %q: the leftover of attempt %s on %s is undefined, its state quarantined in %s; nothing was deleted", vm, o.Attempt, s.hostName, dir), nil
 }

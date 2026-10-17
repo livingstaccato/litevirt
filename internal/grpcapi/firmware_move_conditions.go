@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -160,4 +161,34 @@ func (s *Server) resolveFirmwareMigrationCondition(ctx context.Context, code, vm
 	row.Lifecycle, row.ResolvedAt, row.LastSeen, row.Reporter = corrosion.ConditionResolved, now, now, s.hostName
 	row.ObserveCount, row.CleanCount = 0, row.CleanCount+1
 	return corrosion.UpsertHealthCondition(ctx, s.db, row)
+}
+
+// raiseQuarantineCondition raises firmware_migration_quarantine for c and
+// keeps every path an open one already names: one VM's quarantines on its
+// source and on its target share the condition, and each stays named.
+func (s *Server) raiseQuarantineCondition(ctx context.Context, c fwmigCondition) error {
+	c.Code = condFwmigQuarantine
+	if s.db != nil {
+		row, found, err := corrosion.GetHealthCondition(ctx, s.db, firmwareMigrationEvaluator, condFwmigQuarantine, "vm", c.VM)
+		if err == nil && found && row.Lifecycle != corrosion.ConditionResolved {
+			var ev struct {
+				Paths  []string `json:"paths"`
+				Host   string   `json:"host"`
+				Detail string   `json:"detail"`
+			}
+			if json.Unmarshal([]byte(row.Evidence), &ev) == nil {
+				merged := false
+				for _, p := range ev.Paths {
+					if !slices.Contains(c.Paths, p) {
+						c.Paths = append(c.Paths, p)
+						merged = true
+					}
+				}
+				if merged && ev.Host != "" {
+					c.Detail += fmt.Sprintf("; earlier, on %s: %s", ev.Host, ev.Detail)
+				}
+			}
+		}
+	}
+	return s.raiseFirmwareMigrationCondition(ctx, c)
 }

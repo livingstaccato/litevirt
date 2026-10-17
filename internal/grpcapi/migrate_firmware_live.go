@@ -711,10 +711,32 @@ func (s *Server) retryLiveFirmwareCall(ctx context.Context, r *liveFirmwareRun, 
 
 // ── Steps 9 to 12: commit, Release, NVRAM, cleanup ──
 
-// liveFirmwareCommitted is §6.1 step 9's record: the commit landed.
+// liveFirmwareCommitted is §6.1 step 9's record: the commit landed. The
+// marker records the VM's disk rows as the commit left them, which the D-5
+// return writer's guard compares with (§17 D-5); a read that fails leaves
+// them out, and the return then judges the rows as they are.
 func (s *Server) liveFirmwareCommitted(r *liveFirmwareRun) error {
 	s.fwLiveStep("commit")
+	if s.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		disks, err := corrosion.GetVMDisks(ctx, s.db, r.marker.VM)
+		cancel()
+		if err != nil {
+			slog.Warn("live firmware move: the committed disk rows cannot be read; the marker records none", "vm", r.marker.VM, "error", err)
+		} else {
+			r.marker.CommitDisks = commitDisksOf(disks)
+		}
+	}
 	return s.putLiveFirmwareMarker(r, fwmig.PhaseCommitted)
+}
+
+// commitDisksOf is the marker's record of disk rows.
+func commitDisksOf(disks []corrosion.DiskRecord) []fwmig.CommitDisk {
+	out := make([]fwmig.CommitDisk, 0, len(disks))
+	for _, d := range disks {
+		out = append(out, fwmig.CommitDisk{Disk: d.DiskName, Host: d.HostName, Path: d.Path, StorageType: d.StorageType, StorageVolume: d.StorageVolume})
+	}
+	return out
 }
 
 // releaseLiveFirmwareMove is §6.1 steps 10 to 12, in place of the NIC

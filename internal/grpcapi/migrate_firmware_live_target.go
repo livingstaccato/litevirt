@@ -355,7 +355,7 @@ func (s *Server) quarantineHold(ctx context.Context, h fwmig.Hold, reason string
 	}
 	slog.Warn("live firmware move: target state quarantined (rule Q)", "vm", h.VM, "attempt", h.Attempt,
 		"source", h.Source, "state", h.State, "dir", dir, "reason", reason)
-	if err := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{
+	if err := s.raiseQuarantineCondition(ctx, fwmigCondition{
 		Code: condFwmigQuarantine, VM: h.VM, Attempt: h.Attempt, Source: h.Source, Target: s.hostName,
 		Hashes: hashes, Paths: []string{dir},
 		Detail: fmt.Sprintf("the firmware state the hold of attempt %s (state %s) kept on %s is quarantined in %s: %s; nothing was deleted, and nothing removes a quarantine",

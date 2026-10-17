@@ -24,8 +24,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -36,6 +38,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fwmig"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/safename"
 )
 
@@ -118,8 +121,9 @@ func (s *Server) FirmwareMoveDoctor(ctx context.Context, req *pb.FirmwareMoveDoc
 		report.Outcome = outcome
 		return report, nil
 	}
-	exec, err := firmwareMoveDoctorHost(report, vm)
+	exec, err := firmwareMoveDoctorHost(report, vm, action)
 	if err != nil {
+		s.auditFirmwareMoveDoctor(ctx, actor, req, "", err)
 		return nil, err
 	}
 	fwd := &pb.FirmwareMoveDoctorRequest{VmName: vm, Action: action, AcknowledgeRollback: req.GetAcknowledgeRollback(),
@@ -132,6 +136,10 @@ func (s *Server) FirmwareMoveDoctor(ctx context.Context, req *pb.FirmwareMoveDoc
 		var resp *pb.FirmwareMoveDoctorResponse
 		resp, err = s.forwardFirmwareMoveDoctor(ctx, exec, fwd, actor)
 		outcome = resp.GetOutcome()
+		if err != nil && status.Code(err) == codes.Unavailable {
+			// Not carried to the host that acts: audited here.
+			s.auditFirmwareMoveDoctor(ctx, actor, fwd, "", err)
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -179,26 +187,38 @@ func (s *Server) gatherFirmwareMoveRecords(ctx context.Context, vm, actor string
 		resp.Unreachable = append(resp.Unreachable, fmt.Sprintf("(the host list cannot be read here: %v)", err))
 		return resp
 	}
+	var (
+		mu sync.Mutex
+		wg sync.WaitGroup
+	)
 	for _, h := range hosts {
 		if h.Name == s.hostName || h.State == "removed" {
 			continue
 		}
-		r, err := s.forwardFirmwareMoveDoctor(ctx, h.Name, &pb.FirmwareMoveDoctorRequest{VmName: vm, Host: h.Name}, actor)
-		if err != nil || len(r.GetHosts()) != 1 {
-			resp.Unreachable = append(resp.Unreachable, fmt.Sprintf("%s (%s): %v", h.Name, h.State, err))
-			continue
-		}
-		resp.Hosts = append(resp.Hosts, r.GetHosts()[0])
+		wg.Add(1)
+		go func(h corrosion.HostRecord) {
+			defer wg.Done()
+			r, err := s.forwardFirmwareMoveDoctor(ctx, h.Name, &pb.FirmwareMoveDoctorRequest{VmName: vm, Host: h.Name}, actor)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil || len(r.GetHosts()) != 1 {
+				resp.Unreachable = append(resp.Unreachable, fmt.Sprintf("%s (%s): %v", h.Name, h.State, err))
+				return
+			}
+			resp.Hosts = append(resp.Hosts, r.GetHosts()[0])
+		}(h)
 	}
+	wg.Wait()
 	sort.Slice(resp.Hosts, func(i, j int) bool { return resp.Hosts[i].GetHost() < resp.Hosts[j].GetHost() })
+	sort.Strings(resp.Unreachable)
 	return resp
 }
 
 // firmwareMoveDoctorHost is the host an action runs on: the one whose marker
 // names the VM (the move's source drives every action it has a record for),
 // else the one whose hold does.
-func firmwareMoveDoctorHost(report *pb.FirmwareMoveDoctorResponse, vm string) (string, error) {
-	var markers, holds []string
+func firmwareMoveDoctorHost(report *pb.FirmwareMoveDoctorResponse, vm string, action pb.FirmwareMoveDoctorAction) (string, error) {
+	var markers, holds, owedTo []string
 	for _, h := range report.GetHosts() {
 		if h.GetMarkerJson() != "" {
 			markers = append(markers, h.GetHost())
@@ -206,6 +226,18 @@ func firmwareMoveDoctorHost(report *pb.FirmwareMoveDoctorResponse, vm string) (s
 		if h.GetHoldJson() != "" {
 			holds = append(holds, h.GetHost())
 		}
+		for _, j := range h.GetOwedDiscards() {
+			var o fwmig.OwedDiscard
+			if json.Unmarshal([]byte(j), &o) == nil && o.VM == vm && !slices.Contains(owedTo, o.Target) {
+				owedTo = append(owedTo, o.Target)
+			}
+		}
+	}
+	if len(markers) == 0 && len(holds) == 0 && len(owedTo) == 1 &&
+		action == pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_DISCARD_TARGET {
+		// An owed DISCARD whose target holds no hold any more: the discard
+		// of the leftover runs on that target.
+		return owedTo[0], nil
 	}
 	switch {
 	case len(markers) == 1:
@@ -419,6 +451,9 @@ func (s *Server) firmwareMoveDoctorAct(ctx context.Context, req *pb.FirmwareMove
 	}
 	if ok {
 		return s.doctorTargetLocalAct(ctx, h, req, actor)
+	}
+	if req.GetAction() == pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_DISCARD_TARGET {
+		return s.doctorDiscardOwedLeftover(ctx, vm, actor)
 	}
 	return "", status.Errorf(codes.FailedPrecondition, "VM %q: no live firmware move record names it on %s", vm, s.hostName)
 }
@@ -761,7 +796,7 @@ func (s *Server) quarantineFirmwareMoveSource(ctx context.Context, m fwmig.Marke
 			return "", status.Errorf(codes.Internal, "VM %q: quarantine %s: %v", m.VM, name, err)
 		}
 	}
-	if err := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{
+	if err := s.raiseQuarantineCondition(ctx, fwmigCondition{
 		Code: condFwmigQuarantine, VM: m.VM, Attempt: m.Attempt, Source: s.hostName, Target: m.Target,
 		Hashes: map[string]string{"src_permall_sha256": m.SrcPermallSHA256, "src_nvram_sha256": m.SrcNvramSHA256,
 			"quarantined_permall": orNone(permall), "quarantined_nvram": orNone(nvram)},
@@ -826,6 +861,17 @@ func (s *Server) doctorAdopt(ctx context.Context, m fwmig.Marker, actor string) 
 	from := fwProgress(m)
 	switch m.Phase {
 	case fwmig.PhaseSourceStateSuspect:
+	case fwmig.PhaseSourcePaused:
+		// Only a target guest that runs ran after the source paused: its
+		// copy is the newer one, taken once the source's domain is shut off.
+		tr, _, err := s.targetRecords(ctx, m, action)
+		if err != nil {
+			return "", err
+		}
+		if td := tr.GetDomain(); !td.GetPresent() || td.GetState() != "running" {
+			return "", doctorRefuse(m, action, fmt.Sprintf("the target's guest is %s on %s and never ran: the source's copy is current; --accept-source",
+				domainWord(td), m.Target))
+		}
 	case fwmig.PhaseTargetRan:
 		if fwPreCutover(from) {
 			return "", doctorRefuse(m, action, "the source's guest runs and its copy is current: `lv doctor firmware-move <vm> --discard-target --stop-target`")
@@ -840,7 +886,7 @@ func (s *Server) doctorAdopt(ctx context.Context, m fwmig.Marker, actor string) 
 			return "", doctorRefuse(m, action, "the source's final state is present here: --reverify, or --accept-source")
 		}
 	default:
-		return "", doctorRefuse(m, action, "it takes a move parked source_state_suspect, source_state_missing or target_ran after cutover")
+		return "", doctorRefuse(m, action, "it takes a move parked source_state_suspect, source_state_missing or target_ran after cutover, or source_paused with its source shut off")
 	}
 	if err := s.sourceDomainInactive(m, action); err != nil {
 		return "", err
@@ -888,57 +934,102 @@ func (s *Server) doctorAdopt(ctx context.Context, m fwmig.Marker, actor string) 
 
 // ── --accept-source ──
 
+// fwDoctorAfterReturnHook, when set, runs right after the return writer
+// landed; an error ends the action there, as a crash would. Test-only.
+var fwDoctorAfterReturnHook func() error
+
 // doctorAcceptSource takes the source's copy (spec §17 D-5):
-//   - source_paused (M1p with a target domain): the target's copy discarded,
-//     the source guest resumed (a running one is left running), the marker
-//     removed; no acknowledgement (the source's copy is current);
+//   - source_paused (M1p with a target domain that never ran): the target's
+//     copy discarded, the source guest resumed (a running one is left
+//     running), the marker removed; no acknowledgement;
 //   - after cutover, before the commit (source_state_suspect, target_ran,
-//     V6 source_state_missing): the target's copy discarded, the row
-//     stopped here, the marker removed; --acknowledge-rollback;
-//   - after the commit (the target fenced, held_domain_absent, target_ran,
-//     source_state_suspect): the return writer, the target's copy discarded
-//     or owed, the row stopped here, the marker removed; never for a storage
-//     copy, whose commit deleted the source's disks; --acknowledge-rollback.
+//     V6 source_state_missing with the recorded state present): the target's
+//     copy discarded, the row stopped here, the marker removed;
+//     --acknowledge-rollback;
+//   - after the commit (the target proved off, or answering with the
+//     attempt's hold): the owed DISCARD recorded, the return writer, the
+//     target's copy discarded when it answers, the row stopped here, the
+//     marker removed; never for a storage copy, whose commit deleted the
+//     source's disks; --acknowledge-rollback. A run interrupted after the
+//     return is taken up again where it stopped.
+//
+// The source's own copy must be there first: a target copy is never
+// discarded for a source that has none.
 func (s *Server) doctorAcceptSource(ctx context.Context, m fwmig.Marker, req *pb.FirmwareMoveDoctorRequest) (string, error) {
 	const action = pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_ACCEPT_SOURCE
 	from := fwProgress(m)
 	switch {
 	case m.Phase == fwmig.PhaseSourcePaused:
-		return s.doctorAcceptSourcePaused(ctx, m, req)
+		return s.doctorAcceptSourcePaused(ctx, m)
 	case m.Phase == fwmig.PhaseCleaning || from == fwmig.PhaseCleaning:
 		return "", doctorRefuse(m, action, "the source cleanup has begun, and the target's copy runs")
 	case m.Phase == fwmig.PhaseNvramUnconfirmed:
 		return "", doctorRefuse(m, action, "the guest runs on the target: --confirm-target-nvram, or --push-source-nvram once it is powered off")
 	case fwPreCutover(from):
 		return "", doctorRefuse(m, action, "before cutover the source's copy is current: `lv doctor firmware-move <vm> --discard-target`")
-	case !req.GetAcknowledgeRollback():
-		return "", doctorRefuse(m, action, "the source's copy may be older than the target's: add --acknowledge-rollback")
-	case !fwPostCommit(from):
-		switch m.Phase {
-		case fwmig.PhaseSourceStateSuspect, fwmig.PhaseTargetRan:
-		case fwmig.PhaseSourceStateMissing:
-			if from != fwmig.PhaseCutover {
-				return "", doctorRefuse(m, action, "the source's final state is missing")
-			}
-		default:
-			return "", doctorRefuse(m, action, "it is retried each minute, and resolved by fence when the target is proved off")
-		}
-		return s.doctorAcceptSourceBeforeCommit(ctx, m, req)
 	}
 	switch m.Phase {
-	case fwmig.PhaseTargetUnreachable, fwmig.PhaseDiscardPending, fwmig.PhaseTargetRan, fwmig.PhaseSourceStateSuspect,
-		fwmig.PhaseCommitted, fwmig.PhaseReleased:
+	case fwmig.PhaseSourceStateSuspect, fwmig.PhaseTargetRan:
+	case fwmig.PhaseSourceStateMissing:
+		if from != fwmig.PhaseCutover {
+			return "", doctorRefuse(m, action, "the source's final state is missing: --adopt-target-copy takes the target's")
+		}
+	case fwmig.PhaseTargetUnreachable, fwmig.PhaseDiscardPending, fwmig.PhaseCommitted, fwmig.PhaseReleased:
+		if !fwPostCommit(from) {
+			return "", doctorRefuse(m, action, "it is retried each minute, and resolved by fence when the target is proved off")
+		}
 	default:
-		return "", doctorRefuse(m, action, "after the commit it takes a move whose target is fenced or lost its held domain, a target_ran or a source_state_suspect park")
+		return "", doctorRefuse(m, action, "it takes source_paused, source_state_suspect, target_ran, the V6 park before the commit, "+
+			"or a committed move whose target is proved off or lost its held domain")
+	}
+	if !req.GetAcknowledgeRollback() {
+		return "", doctorRefuse(m, action, fwAckReason(m)+": add --acknowledge-rollback")
+	}
+	if !fwPostCommit(from) {
+		return s.doctorAcceptSourceBeforeCommit(ctx, m, req)
 	}
 	return s.doctorAcceptSourceAfterCommit(ctx, m, req)
 }
 
-// doctorAcceptSourcePaused is the source_paused row: the target's copy is
-// discarded first (its domain must not run), and only then does the source
-// guest run again, through its own entry point; a source guest already
+// fwAckReason says why taking the source's copy of m's move may roll the
+// guest back.
+func fwAckReason(m fwmig.Marker) string {
+	switch m.Phase {
+	case fwmig.PhaseSourceStateSuspect:
+		return "the source's state is suspect (its guest stopped for a reason other than the migration, or ran again after the cutover), and the target's copy may be the newer one"
+	case fwmig.PhaseTargetRan:
+		return "the target's guest ran, so its copy is newer than the source's"
+	case fwmig.PhaseSourceStateMissing:
+		return "the source's final state was never compared with the target's copy"
+	}
+	return "the target's copy is the committed one, and may be newer than the source's"
+}
+
+// requireSourceCopy refuses unless the source's own firmware state is there
+// to take (C-1): readable, and, for a move parked source_state_missing, the
+// state the cutover recorded, with a recorded hash for every part the VM has.
+func (s *Server) requireSourceCopy(m fwmig.Marker, action pb.FirmwareMoveDoctorAction) error {
+	permall, nvram, err := s.sourceStateHashes(m)
+	if err != nil {
+		return doctorRefuse(m, action, err.Error()+": the source has no copy to take; --adopt-target-copy takes the target's")
+	}
+	if m.Phase == fwmig.PhaseSourceStateMissing &&
+		((m.TPM && m.SrcPermallSHA256 == "") || (m.UEFI && m.SrcNvramSHA256 == "") ||
+			permall != m.SrcPermallSHA256 || nvram != m.SrcNvramSHA256) {
+		return doctorRefuse(m, action, fmt.Sprintf("the source's state is permall %s nvram %s, and the cutover recorded permall %s nvram %s: "+
+			"it is not the source's final state; --adopt-target-copy takes the target's",
+			orNone(permall), orNone(nvram), orNone(m.SrcPermallSHA256), orNone(m.SrcNvramSHA256)))
+	}
+	return nil
+}
+
+// doctorAcceptSourcePaused is the source_paused row: the source's copy is
+// current only while the target's guest never ran, so a target guest that
+// runs (or ran: any active state but paused) is refused, --stop-target or
+// not. Otherwise the target's copy is discarded first, and only then does the
+// source guest run again, through its own entry point; a source guest already
 // running (D2-12b re-review m-B) or shut off is left as it is.
-func (s *Server) doctorAcceptSourcePaused(ctx context.Context, m fwmig.Marker, req *pb.FirmwareMoveDoctorRequest) (string, error) {
+func (s *Server) doctorAcceptSourcePaused(ctx context.Context, m fwmig.Marker) (string, error) {
 	const action = pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_ACCEPT_SOURCE
 	if s.virt == nil {
 		return "", status.Errorf(codes.Unavailable, "VM %q: no libvirt connection on %s", m.VM, s.hostName)
@@ -955,7 +1046,15 @@ func (s *Server) doctorAcceptSourcePaused(ctx context.Context, m fwmig.Marker, r
 		}
 		paused = st.Reason == "paused"
 	}
-	if err := s.doctorDiscardTargetCopy(ctx, m, req.GetStopTarget(), action); err != nil {
+	tr, _, err := s.targetRecords(ctx, m, action)
+	if err != nil {
+		return "", err
+	}
+	if td := tr.GetDomain(); td.GetPresent() && td.GetState() != "shutoff" && td.GetState() != "paused" {
+		return "", doctorRefuse(m, action, fmt.Sprintf("the target's guest is %s on %s: it ran after the source paused, so its copy is the newer one and is not discarded; "+
+			"shut the source's paused domain off outside litevirt (virsh destroy %s keeps its state), then --adopt-target-copy", td.GetState(), m.Target, m.VM))
+	}
+	if err := s.doctorDiscardTargetCopy(ctx, m, false, action); err != nil {
 		return "", err
 	}
 	if paused {
@@ -992,12 +1091,20 @@ func (s *Server) stopRowByOperator(ctx context.Context, m fwmig.Marker, did stri
 }
 
 // doctorAcceptSourceBeforeCommit: the row still names this host. The
-// target's copy is discarded (--stop-target stops a guest that runs there
-// first), the row stopped here (or running, for a source guest that runs
-// again), the marker removed.
+// source's own copy must be there (C-1); the target's copy is discarded
+// (--stop-target stops a guest that runs there first), the row stopped here
+// (or running, for a source guest that runs again), the marker removed.
 func (s *Server) doctorAcceptSourceBeforeCommit(ctx context.Context, m fwmig.Marker, req *pb.FirmwareMoveDoctorRequest) (string, error) {
 	const action = pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_ACCEPT_SOURCE
 	if _, err := s.requireRowOn(ctx, m, s.hostName, action); err != nil {
+		return "", err
+	}
+	if st, err := s.sourceDomainState(m.VM); err != nil || st != "running" {
+		if err := s.sourceDomainInactive(m, action); err != nil {
+			return "", err
+		}
+	}
+	if err := s.requireSourceCopy(m, action); err != nil {
 		return "", err
 	}
 	if err := s.doctorDiscardTargetCopy(ctx, m, req.GetStopTarget(), action); err != nil {
@@ -1017,29 +1124,113 @@ func (s *Server) doctorAcceptSourceBeforeCommit(ctx context.Context, m fwmig.Mar
 	return fmt.Sprintf("VM %q: %s; start it here with `lv start %s`", m.VM, did, m.VM), nil
 }
 
-// doctorAcceptSourceAfterCommit returns a committed VM to this host: the
-// target's guest must not run (--stop-target stops one under the move's
-// hold), the return writer moves the VM and disk rows back, and the target's
-// copy is discarded, or owed to a target that is proved off or does not take
-// it now.
+// returnDisks are the disk rows the return writer moves back, as its guard
+// expects them: the commit's own (recorded in the marker), or, for a marker
+// an earlier build wrote, the rows now, each on the target (or kept by its
+// owner) and on shared storage. Every row now must be on shared storage.
+func (s *Server) returnDisks(ctx context.Context, m fwmig.Marker, action pb.FirmwareMoveDoctorAction) ([]corrosion.DiskRecord, error) {
+	now, err := corrosion.GetVMDisks(ctx, s.db, m.VM)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "VM %q: its disks cannot be read: %v", m.VM, err)
+	}
+	for _, d := range now {
+		if !corrosion.DiskOnSharedStorage(ctx, s.db, d, m.Target, s.hostName) {
+			return nil, doctorRefuse(m, action, fmt.Sprintf("disk %s (%s on %s) is not on shared storage, so the source cannot take the VM back", d.DiskName, d.Path, d.HostName))
+		}
+	}
+	if len(m.CommitDisks) > 0 {
+		out := make([]corrosion.DiskRecord, 0, len(m.CommitDisks))
+		for _, d := range m.CommitDisks {
+			out = append(out, corrosion.DiskRecord{VMName: m.VM, DiskName: d.Disk, HostName: d.Host, Path: d.Path,
+				StorageType: d.StorageType, StorageVolume: d.StorageVolume})
+		}
+		return out, nil
+	}
+	for _, d := range now {
+		if d.HostName == m.Target {
+			continue
+		}
+		if keep, _ := corrosion.SharedRowKeepsOwner(ctx, s.db, d, m.Target, s.hostName); !keep {
+			return nil, doctorRefuse(m, action, fmt.Sprintf("disk %s's row names %s, not %s, and the marker holds no record of the commit's disks", d.DiskName, d.HostName, m.Target))
+		}
+	}
+	return now, nil
+}
+
+// rowState is a row's state, for operator text.
+func rowState(row *corrosion.VMRecord) string {
+	if row == nil {
+		return "gone"
+	}
+	return row.State
+}
+
+// requireDisksReturned refuses unless every disk row of m's VM names this
+// host, or is a shared row its owner keeps: the return writer's disks.
+func (s *Server) requireDisksReturned(ctx context.Context, m fwmig.Marker, action pb.FirmwareMoveDoctorAction) error {
+	disks, err := corrosion.GetVMDisks(ctx, s.db, m.VM)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "VM %q: its disks cannot be read: %v", m.VM, err)
+	}
+	for _, d := range disks {
+		if d.HostName == s.hostName {
+			continue
+		}
+		if keep, _ := corrosion.SharedRowKeepsOwner(ctx, s.db, d, m.Target, s.hostName); !keep {
+			return doctorRefuse(m, action, fmt.Sprintf("the VM's row is here, and disk %s's row names %s", d.DiskName, d.HostName))
+		}
+	}
+	return nil
+}
+
+// doctorAcceptSourceAfterCommit returns a committed VM to this host. The
+// target must be proved off, or answer with the attempt's hold, so its copy
+// can be discarded through the move (I-6); a guest that runs there must be
+// stopped first (--stop-target, under the hold). The owed DISCARD is
+// recorded before the return writer moves the VM and disk rows back, then
+// sent; a target that takes it drops the record. A run that stopped after
+// the return (the row here for the incarnation, the owed record there)
+// takes up from there.
 func (s *Server) doctorAcceptSourceAfterCommit(ctx context.Context, m fwmig.Marker, req *pb.FirmwareMoveDoctorRequest) (string, error) {
 	const action = pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_ACCEPT_SOURCE
 	if m.Route == fwmig.RouteStorageCopy {
 		return "", doctorRefuse(m, action, fmt.Sprintf("the VM's disks are on %s: the commit of a storage copy deleted the source's copies", m.Target))
 	}
-	if _, err := s.requireRowOn(ctx, m, m.Target, action); err != nil {
+	row, ours, err := s.moveRow(ctx, m)
+	if err != nil {
 		return "", err
 	}
+	_, owedFound, oerr := s.fwRecords().GetOwedDiscardFor(m.VM, m.Binding)
+	if oerr != nil && !errors.Is(oerr, fwmig.ErrOtherIncarnation) {
+		return "", status.Errorf(codes.FailedPrecondition, "VM %q: its owed-discard record cannot be read: %v", m.VM, oerr)
+	}
+	owedHere := owedFound && oerr == nil
 	sourceRuns := false
 	if m.Phase == fwmig.PhaseSourceStateSuspect {
 		// The source guest ran again after the cutover: the operator keeps it.
 		st, err := s.sourceDomainState(m.VM)
 		sourceRuns = err == nil && st == "running"
 	}
+	returned := false
+	switch {
+	case ours && row.HostName == m.Target:
+	case ours && row.HostName == s.hostName && (row.State == "stopped" || (sourceRuns && row.State == "running")):
+		// An earlier run's return landed: the disk rows must have come
+		// with it.
+		if err := s.requireDisksReturned(ctx, m, action); err != nil {
+			return "", err
+		}
+		returned = true
+	default:
+		return "", doctorRefuse(m, action, fmt.Sprintf("it needs the VM's row on %s for the move's incarnation, and the row is %s on %s", m.Target, rowState(row), rowHost(row)))
+	}
 	if !sourceRuns {
 		if err := s.sourceDomainInactive(m, action); err != nil {
 			return "", err
 		}
+	}
+	if err := s.requireSourceCopy(m, action); err != nil {
+		return "", err
 	}
 	if m.Phase != fwmig.PhaseSourceStateSuspect && m.Phase != fwmig.PhaseTargetRan {
 		if err := s.requireSourceStateRecorded(m, action); err != nil {
@@ -1056,11 +1247,22 @@ func (s *Server) doctorAcceptSourceAfterCommit(ctx context.Context, m fwmig.Mark
 			return "", status.Errorf(codes.Unavailable, "%s; bring it back, or once it is powered off fence it (`lv host fence-confirm %s`) and run this again",
 				status.Convert(err).Message(), m.Target)
 		}
-		if td := tr.GetDomain(); td.GetPresent() && td.GetState() != "shutoff" && td.GetState() != "paused" {
-			switch {
-			case h == nil:
-				return "", doctorRefuse(m, action, fmt.Sprintf("its guest is %s on %s outside the move's hold: stop it there with `lv stop %s`", td.GetState(), m.Target, m.VM))
-			case !req.GetStopTarget():
+		td := tr.GetDomain()
+		switch {
+		case returned && h == nil:
+			// An earlier run's return landed; its DISCARD may have too.
+		case h == nil:
+			return "", doctorRefuse(m, action, fmt.Sprintf("%s holds no hold of the attempt, so its copy cannot be discarded through the move: "+
+				"once %s is powered off, `lv host fence-confirm %s`, and run this again", m.Target, m.Target, m.Target))
+		case !returned && m.Phase != fwmig.PhaseTargetRan && m.Phase != fwmig.PhaseSourceStateSuspect && td.GetPresent():
+			// The committed/released row takes a target proved off; a
+			// target that answers takes it only with its held domain gone
+			// (held_domain_absent).
+			return "", doctorRefuse(m, action, fmt.Sprintf("%s answers and holds the committed copy (domain %s): the move is retried each minute; "+
+				"if %s must not take the VM, once it is powered off, `lv host fence-confirm %s`, and run this again", m.Target, td.GetState(), m.Target, m.Target))
+		}
+		if h != nil && td.GetPresent() && td.GetState() != "shutoff" && td.GetState() != "paused" {
+			if !req.GetStopTarget() {
 				return "", doctorRefuse(m, action, fmt.Sprintf("its guest is %s on %s: add --stop-target", td.GetState(), m.Target))
 			}
 			if err := s.doctorStopTarget(ctx, m); err != nil {
@@ -1068,28 +1270,56 @@ func (s *Server) doctorAcceptSourceAfterCommit(ctx context.Context, m fwmig.Mark
 			}
 		}
 	}
-	disks, err := corrosion.GetVMDisks(ctx, s.db, m.VM)
-	if err != nil {
-		return "", status.Errorf(codes.Unavailable, "VM %q: its disks cannot be read: %v", m.VM, err)
+	recs := s.fwRecords()
+	if !returned {
+		disks, err := s.returnDisks(ctx, m, action)
+		if err != nil {
+			return "", err
+		}
+		// Owed before the return: a target refuses the DISCARD while the row
+		// names it, so the record is never acted on early, and a return that
+		// lands is never left without it.
+		if err := recs.PutOwedDiscard(fwmig.OwedDiscard{VM: m.VM, Binding: m.Binding, Target: m.Target,
+			CreatedStubs: m.CreatedStubs, Since: time.Now().UTC()}); err != nil {
+			return "", status.Errorf(codes.Internal, "VM %q: record the DISCARD owed to %s: %v; nothing was returned", m.VM, m.Target, err)
+		}
+		ok, err := corrosion.ReturnMigratedVM(ctx, s.db, m.VM, m.Target, s.hostName, m.UUID, m.CreatedAt, "stopped", disks)
+		if err != nil {
+			// Whether it landed is not known: the owed record stays, and a
+			// target refuses its DISCARD while the row names it.
+			return "", status.Errorf(codes.Unavailable, "VM %q: return it to %s: %v; run this again", m.VM, s.hostName, err)
+		}
+		if !ok {
+			if rerr := recs.RemoveOwedDiscard(m.VM, m.Attempt); rerr != nil {
+				slog.Warn("firmware-move doctor: a declined return leaves its owed-discard record", "vm", m.VM, "error", rerr)
+			}
+			return "", doctorRefuse(m, action, "the VM's row or disk rows changed since the commit; nothing was written")
+		}
+		if h := fwDoctorAfterReturnHook; h != nil {
+			if err := h(); err != nil {
+				return "", err
+			}
+		}
+	} else if !owedHere {
+		// An earlier run's DISCARD landed and dropped its record, or the run
+		// stopped between the two: the record again; a target with nothing
+		// left of the attempt drops it.
+		if err := recs.PutOwedDiscard(fwmig.OwedDiscard{VM: m.VM, Binding: m.Binding, Target: m.Target,
+			CreatedStubs: m.CreatedStubs, Since: time.Now().UTC()}); err != nil {
+			return "", status.Errorf(codes.Internal, "VM %q: record the DISCARD owed to %s: %v", m.VM, m.Target, err)
+		}
 	}
-	ok, err := corrosion.ReturnMigratedVM(ctx, s.db, m.VM, m.Target, s.hostName, m.UUID, m.CreatedAt, "stopped", disks)
-	switch {
-	case err != nil:
-		return "", status.Errorf(codes.Unavailable, "VM %q: return it to %s: %v", m.VM, s.hostName, err)
-	case !ok:
-		return "", doctorRefuse(m, action, "the VM's row or disk rows changed since the commit; nothing was written")
-	}
+	owed := ""
 	discarded := false
 	if !off {
 		d, derr := s.sendLiveFirmwareAbort(ctx, m.Target, m.VM, m.Binding, pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_DISCARD_UNVERIFIED, m.CreatedStubs)
 		discarded = derr == nil && !d.GetRefused() && !d.GetTargetDomain().GetPresent()
 	}
-	owed := ""
-	if !discarded {
-		if err := s.fwRecords().PutOwedDiscard(fwmig.OwedDiscard{VM: m.VM, Binding: m.Binding, Target: m.Target,
-			CreatedStubs: m.CreatedStubs, Since: time.Now().UTC()}); err != nil {
-			return "", status.Errorf(codes.Internal, "VM %q: returned here, but the DISCARD owed to %s cannot be recorded: %v; its marker stays", m.VM, m.Target, err)
+	if discarded {
+		if err := recs.RemoveOwedDiscard(m.VM, m.Attempt); err != nil {
+			slog.Warn("firmware-move doctor: the discard landed, and its owed record stays for the next pass", "vm", m.VM, "error", err)
 		}
+	} else {
 		if cerr := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{
 			Code: condFwmigDiscardOwed, VM: m.VM, Attempt: m.Attempt, Source: s.hostName, Target: m.Target,
 			Detail: fmt.Sprintf("an operator returned the VM to %s; the DISCARD of %s's copy is sent when it answers", s.hostName, m.Target),
@@ -1105,12 +1335,33 @@ func (s *Server) doctorAcceptSourceAfterCommit(ctx context.Context, m fwmig.Mark
 	} else {
 		s.stopRowByOperator(ctx, m, did)
 	}
+	if cur, err := corrosion.GetVM(ctx, s.db, m.VM); err == nil && cur != nil {
+		s.convergeMovedGuest(ctx, cur, m.Target, s.hostName, sourceRuns)
+	}
 	r := s.doctorRun(ctx, m)
 	s.reattachVFsOnSource(ctx, m.VM, r.vfs, len(r.vfs) > 0)
 	if err := s.unmarkByOperator(ctx, m, did); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("VM %q: %s%s; start it here with `lv start %s`", m.VM, did, owed, m.VM), nil
+}
+
+// convergeMovedGuest is the part of a migration's finish that does not need
+// the other host, for a VM whose copy now lives on `on` (this host) after
+// living on `from`: each VXLAN NIC's FDB entry pointed at on's VTEP, a
+// gratuitous ARP for a guest that runs here, and the stack's LB backends
+// refreshed.
+func (s *Server) convergeMovedGuest(ctx context.Context, vm *corrosion.VMRecord, from, on string, running bool) {
+	ctx = context.WithoutCancel(ctx)
+	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
+	for _, iface := range ifaces {
+		s.updateFDBForMigration(ctx, iface, from, on)
+		if running && iface.IP != "" {
+			go network.SendGARPBestEffort(iface.NetworkName, iface.IP)
+		}
+	}
+	go s.refreshLBForStack(context.Background(), vm.StackName)
+	s.fwLiveStep("converge:" + from + "->" + on)
 }
 
 // doctorDiscardTargetCopy is the DISCARD of m's target copy, which must be

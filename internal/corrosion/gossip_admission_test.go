@@ -9,8 +9,6 @@ import (
 	"time"
 
 	"github.com/hashicorp/memberlist"
-
-	"github.com/litevirt/litevirt/internal/hlc"
 )
 
 // admissionClient is a gossip-less client named self whose hosts table holds
@@ -275,7 +273,7 @@ func TestRelays_PhantomsDoNotInflateNOrR(t *testing.T) {
 // node's OWN alive message, at memberlist.Create, before the schema exists. A
 // fresh single-node cluster must come up as a member of itself.
 func TestGossip_SingleNodeFounderAdmitsItself(t *testing.T) {
-	a := newGossipClient(t, "node-a", "127.0.0.1", "127.0.0.1", freePort(t), nil)
+	a := newGossipClient(t, "node-a", "127.0.0.1", "127.0.0.1", nil)
 	if n := a.list.NumMembers(); n != 1 {
 		t.Fatalf("founder memberlist has %d members, want exactly itself", n)
 	}
@@ -289,11 +287,11 @@ func TestGossip_SingleNodeFounderAdmitsItself(t *testing.T) {
 // replicated to node-a, and is refused. Its row then arrives, and the next
 // periodic push/pull — no re-join, no restart — admits it.
 func TestGossip_JoinRaceIsAdmittedOnTheNextExchange(t *testing.T) {
-	portA, portN := freePort(t), freePort(t)
 	a := newGossipClientWith(t, Config{
-		HostName: "node-a", BindAddr: "127.0.0.1", AdvertiseAddr: "127.0.0.1", BindPort: portA,
+		HostName: "node-a", BindAddr: "127.0.0.1", AdvertiseAddr: "127.0.0.1",
 		pushPullInterval: 200 * time.Millisecond,
 	})
+	portA := int(a.list.LocalNode().Port)
 	if err := InitSchema(context.Background(), a); err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +299,7 @@ func TestGossip_JoinRaceIsAdmittedOnTheNextExchange(t *testing.T) {
 	admitRow(t, a, "node-b", "127.0.0.2") // node-a knows its cluster: no bootstrap trust
 
 	n := newGossipClientWith(t, Config{
-		HostName: "node-new", BindAddr: "127.0.0.1", AdvertiseAddr: "127.0.0.1", BindPort: portN,
+		HostName: "node-new", BindAddr: "127.0.0.1", AdvertiseAddr: "127.0.0.1",
 		JoinPeers:        []string{net.JoinHostPort("127.0.0.1", itoa(portA))},
 		pushPullInterval: 200 * time.Millisecond,
 	})
@@ -321,10 +319,12 @@ func TestGossip_JoinRaceIsAdmittedOnTheNextExchange(t *testing.T) {
 	})
 }
 
+// newGossipClientWith starts a gossip client from cfg on a free port
+// (newClientOnFreePort).
 func newGossipClientWith(t *testing.T, cfg Config) *Client {
 	t.Helper()
-	cfg.DataDir = t.TempDir()
-	c, err := NewClient(cfg, hlc.NewClock(cfg.HostName))
+	cfg.DataDir = ""
+	c, err := newClientOnFreePort(t, cfg)
 	if err != nil {
 		t.Fatalf("NewClient %s: %v", cfg.HostName, err)
 	}

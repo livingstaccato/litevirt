@@ -23,6 +23,7 @@ package fleet
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -52,30 +53,29 @@ func TestFleet_LeaseClaim_AFreshDatabaseDoesNotReuseATerm(t *testing.T) {
 
 	// 1.
 	t0 := time.Now().UTC()
-	if held, term := acquireAt(t, a, t0); !held || term != 1 {
-		t.Fatalf("%s: held=%v term=%d, want term 1", a.Name, held, term)
-	}
+	fixtureAcquire(t, a, t0, 1)
 	t1 := t0.Add(catchUpTTL + catchUpPoll)
-	if held, term := acquireAt(t, a, t1); !held || term != 2 {
-		t.Fatalf("%s: held=%v term=%d after a lapse, want a new tenure at term 2", a.Name, held, term)
-	}
+	fixtureAcquire(t, a, t1, 2)
 	c.WaitConverged(t, convergeTimeout)
 
 	// 2. d is reinstalled. Its database is empty but for its own row, as the
 	// lab's was: rebuildWithEmptyDB seeds the peers' rows, which `lv host add`
 	// does not, so they are taken out again without logging. Pushes into d are
 	// held back, as nothing had reached node-5 when it minted.
-	serial := rebuildWithEmptyDB(t, c, d, a)
-	if _, err := d.DB.DB().Exec(`DELETE FROM hosts WHERE name != ?`, d.Name); err != nil {
-		t.Fatalf("empty %s's hosts table: %v", d.Name, err)
-	}
-	bootRebuiltNode(t, d, serial)
-	d.DB.MarkReplicaStale("process started on a fresh database (fleet: modelled reinstall)")
+	// Pushes into d are held back from before its rebuild: blocked after it,
+	// a peer's push loop reached the new database first under load, and d's
+	// ledger held terms 1 and 2 before step 3 (2 of 58 runs on kvm003).
 	for _, p := range c.Nodes {
 		if p != d {
 			c.SetLinkFault(p, d, LinkFault{Block: true})
 		}
 	}
+	serial := rebuildWithEmptyDBLinks(t, c, d, a, false)
+	if _, err := d.DB.DB().Exec(`DELETE FROM hosts WHERE name != ?`, d.Name); err != nil {
+		t.Fatalf("empty %s's hosts table: %v", d.Name, err)
+	}
+	bootRebuiltNode(t, d, serial)
+	d.DB.MarkReplicaStale("process started on a fresh database (fleet: modelled reinstall)")
 	d.DB.SetLeaseMintClearance(d.Server.LeaseMintClearance)
 	gd := gateFor(t, c, d)
 	gctx, cancel := context.WithCancel(ctx)
@@ -145,4 +145,22 @@ func TestFleet_LeaseClaim_AFreshDatabaseDoesNotReuseATerm(t *testing.T) {
 			}
 		}
 	}
+}
+
+// fixtureAcquire has n take the lease at virtual time at, at want, for a
+// scenario's history. A mint is cleared on the node's real health checker's
+// quorum, and a checker whose own process paused past a check interval
+// withholds it for health.StallGrace: on a host at a load of 300 the
+// lapse-and-retake at term 2 came back held=false term=0. A withheld mint
+// records nothing, so it is asked again at the same instant until it is
+// granted; one granted at another term fails at once.
+func fixtureAcquire(t *testing.T, n *Node, at time.Time, want int64) {
+	t.Helper()
+	eventually(t, 30*time.Second, fmt.Sprintf("%s to take the lease at term %d", n.Name, want), func() bool {
+		held, term := acquireAt(t, n, at)
+		if held && term != want {
+			t.Fatalf("%s: held at term %d, want term %d", n.Name, term, want)
+		}
+		return held
+	})
 }

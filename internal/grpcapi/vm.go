@@ -672,6 +672,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err := s.firmwarePreflight(spec); err != nil {
 		return nil, err
 	}
+	// USB passthrough, resolved on this (the owning) host: a mapping's row
+	// for it, a bus-port read from its sysfs. A device it cannot resolve
+	// refuses the create rather than defining a VM without it.
+	usbDevs, usbErr := s.resolveUSBHostdevs(ctx, spec)
+	if usbErr != nil {
+		return nil, usbErr
+	}
 	// Auto-pull image from a peer if not available locally.
 	if spec.Image != "" && !s.images.ImageExists(spec.Image) {
 		if err := s.autoPullImage(ctx, spec.Image); err != nil {
@@ -1274,16 +1281,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// here, not in the shared builder.
 	vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, nil)
 	vmCfg.CloudInitISO = cloudInitISO
-	// USB passthrough, resolved on this (the owning) host: a mapping's row for
-	// it, a bus-port read from its sysfs. A device it cannot resolve refuses
-	// the create rather than defining a VM without it.
-	if usb, uerr := s.resolveUSBHostdevs(ctx, spec); uerr != nil {
-		claims.releaseAll(ctx)
-		cleanupDisks()
-		return nil, uerr
-	} else {
-		vmCfg.USBHostdevs = usb
-	}
+	vmCfg.USBHostdevs = usbDevs // resolved before anything was made
 	// Secure Boot + vTPM (G1). Use the host-resolved firmware paths and pin per-VM
 	// nvram + swtpm state under dataDir so they travel across the lifecycle. Refuse
 	// to silently adopt firmware state left by a prior `delete --keep-disks`.

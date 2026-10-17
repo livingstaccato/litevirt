@@ -230,7 +230,8 @@ cloud-init seed (`cloudinit/<vm>.iso`) to `<seed>.kept-<time>`. Nothing removes
 those files; each rename is recorded as a `vm.disk.kept` event of the VM. A disk
 recorded `delete_with_vm=false` is handled the same way. The create renames
 nothing until the refusals it can judge up front have passed (Secure Boot or
-vTPM over kept UEFI vars, the image not available), and a create that fails
+vTPM over kept UEFI vars, a USB device the host does not have, the image not
+available), and a create that fails
 after the rename puts each file back at the path the kept VM recorded, unless
 a file is there by then. The host that holds
 kept disks lists them in `<data_dir>/kept-disks/<vm>.json` until a create

@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
@@ -64,45 +65,65 @@ func assertFileIs(t *testing.T, p string, want []byte, what string) {
 	}
 }
 
-// A create the firmware refuses (Secure Boot over the UEFI vars a
-// `delete --keep-disks` kept) is refused before it moves the kept disk at
-// the path its data disk would take: the disk stays where its VM recorded
-// it (lab 2, O2; 5c).
+// A create refused for what it reads before it makes anything — Secure
+// Boot over the UEFI vars a `delete --keep-disks` kept, a USB device the
+// host does not have — is refused before it moves the kept disk at the path
+// its data disk would take: the disk stays where its VM recorded it (lab 2,
+// O2; 5c).
 //
-// Mutation: drop firmwarePreflight — the disk is moved to .kept- before the
-// refusal, red.
+// Mutations: drop firmwarePreflight, or resolve the USB devices where the
+// domain is built again — the disk is moved to .kept- (and put back) before
+// the refusal, red.
 func TestCreateVM_ARefusedCreateLeavesTheKeptDiskWhereItsVMRecordedIt(t *testing.T) {
-	s, fake := provableCreateServer(t)
-	sbHost(t, s)
-	path, kept := keptDataDisk(t, s, "win")
-	vars := lv.NvramPath(s.dataDir, "win")
-	if err := os.MkdirAll(filepath.Dir(vars), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(vars, []byte("kept vars"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	req := withDataDisk(disklessCreateRequest("win"))
-	req.Spec.Firmware, req.Spec.SecureBoot = "uefi", true
-	if _, err := s.CreateVM(adminCtx(), req); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "UEFI vars already exist") {
-		t.Fatalf("CreateVM = %v; want the kept vars refusing it", err)
-	}
-	if fake.DomainExists("win") {
-		t.Error("a domain was defined")
-	}
-	assertFileIs(t, path, kept, "the kept disk")
-	if k := keptCopiesOf(t, path); len(k) != 0 {
-		t.Errorf("the refused create moved the kept disk: %v", k)
-	}
-	// Moved and put back reads the same on disk; the events say it moved.
-	evs, err := corrosion.ListVMEvents(context.Background(), s.db, "win", 50, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, ev := range evs {
-		if ev.Type == "vm.disk.kept" {
-			t.Errorf("the refused create moved the kept disk: %s", ev.Detail)
-		}
+	for _, tc := range []struct {
+		name string
+		code codes.Code
+		want string
+		set  func(t *testing.T, s *Server, req *pb.CreateVMRequest)
+	}{
+		{"secure boot over kept vars", codes.FailedPrecondition, "UEFI vars already exist", func(t *testing.T, s *Server, req *pb.CreateVMRequest) {
+			sbHost(t, s)
+			vars := lv.NvramPath(s.dataDir, "win")
+			if err := os.MkdirAll(filepath.Dir(vars), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(vars, []byte("kept vars"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			req.Spec.Firmware, req.Spec.SecureBoot = "uefi", true
+		}},
+		{"a USB port with nothing in it", codes.FailedPrecondition, "usb device 0", func(t *testing.T, s *Server, req *pb.CreateVMRequest) {
+			t.Cleanup(lv.SetUSBSysfsRootForTest(t.TempDir()))
+			enableUsbMountsMemory(s)
+			req.Spec.UsbDevices = []*pb.USBDeviceSpec{{BusPort: "3-2"}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, fake := provableCreateServer(t)
+			path, kept := keptDataDisk(t, s, "win")
+			req := withDataDisk(disklessCreateRequest("win"))
+			tc.set(t, s, req)
+			if _, err := s.CreateVM(adminCtx(), req); status.Code(err) != tc.code || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("CreateVM = %v; want %v naming %q", err, tc.code, tc.want)
+			}
+			if fake.DomainExists("win") {
+				t.Error("a domain was defined")
+			}
+			assertFileIs(t, path, kept, "the kept disk")
+			if k := keptCopiesOf(t, path); len(k) != 0 {
+				t.Errorf("the refused create moved the kept disk: %v", k)
+			}
+			// Moved and put back reads the same on disk; the events say it moved.
+			evs, err := corrosion.ListVMEvents(context.Background(), s.db, "win", 50, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, ev := range evs {
+				if ev.Type == "vm.disk.kept" {
+					t.Errorf("the refused create moved the kept disk: %s", ev.Detail)
+				}
+			}
+		})
 	}
 }
 

@@ -1800,6 +1800,9 @@ func (s *Server) NameStackTeardownKeptDisks(ctx context.Context, stack string, v
 			Reason: fmt.Sprintf("the stack reconciler finished stack %q's teardown and kept this disk, as it could not prove "+
 				"the teardown let it go: %s. Remove it by hand unless the stack delete asked to keep disks", stack, why)})
 	}
+	// As at every other record site: a disk on this host that is positively
+	// gone (the other deleter removed it) has nothing left to name.
+	kept = s.keptThere(kept)
 	authCtx := context.WithValue(ctx, ctxKeyRole, "admin")
 	authCtx = context.WithValue(authCtx, ctxKeyUsername, "system:stack-reconciler")
 	s.recordKeptDisks(authCtx, vm.Name, kept)

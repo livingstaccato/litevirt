@@ -1562,7 +1562,11 @@ The restart is not silent, and the real disk is not lost:
   is not); when a disk stays at its path for one of the other reasons above;
   and for a seed from an earlier release. A seed that stays can hold
   user-data, and nothing removes it but an operator: while no VM of the name
-  exists, `lv host superseded-disks <host>` lists it as `kept`.
+  exists, `lv host superseded-disks <host>` lists it as `kept`. A shut-off domain of the VM still
+  defined on that host, from an owner epoch older than the deleted record's,
+  is undefined there (disks and TPM state kept, UEFI vars renamed to
+  `<vars>.superseded-<time>`) and its owner-epoch marker removed (orphaned runtimes in
+  [diagnostics](diagnostics.md)).
 - A VM of the same name created on that host before then clears
   `<data_dir>/disks/<vm>-<disk>.qcow2` files the earlier VM left. Of those, a
   disk that a failover left at its path is first renamed to

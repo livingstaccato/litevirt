@@ -2484,7 +2484,16 @@ max by (host, name) (litevirt_orphan_runtime{row="tombstoned"}) > 0
 max by (host, name) (litevirt_orphan_runtime{row="missing"}) > 0
 ```
 
-**Nothing reaps an orphan automatically.** The only tombstone that could prove a
+**One orphan is undefined automatically:** a shut-off domain (no managed-save
+image) recognised by its owner-epoch element, whose tombstoned record names
+another host at a strictly newer owner epoch than the domain's and the host's
+`<data_dir>/vms/<vm>/owner_epoch`. Its host undefines it on the second
+sighting, or when the delete asks it, and removes that marker: disks and TPM
+state stay, its UEFI vars are renamed to `<vars>.superseded-<time>` (listed by
+`lv host superseded-disks`, never removed by the host), and a
+`vm.leftover.undefined` event records it.
+
+**Nothing else reaps an orphan automatically.** The only tombstone that could prove a
 running workload is unwanted is one naming this host at the runtime's own owner
 epoch. The delete paths remove the runtime before they write that tombstone, so
 such a pair only appears after a crash or a replication anomaly, which is

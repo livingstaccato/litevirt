@@ -220,6 +220,7 @@ message SupersededDisk {
     bool   kept         = 10; // a disk a deleted VM was kept with, moved off its path by a create (<path>.kept-<time>): listed only, never purged, removed or restored
     bool   seed         = 11; // with kept: a cloud-init seed (it can hold user-data), not a disk
     bool   earlier_vm   = 12; // with kept and vm_name: the file is an earlier VM's of that name, not the VM of that name that exists now
+    bool   uefi_vars    = 13; // with kept: the UEFI vars of a deleted VM's superseded definition its host undefined (<vars>.superseded-<time>), not a disk
 }
 message SupersededDisksResponse {
     string                  host           = 1;

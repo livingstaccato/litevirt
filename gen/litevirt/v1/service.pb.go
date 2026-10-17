@@ -2821,6 +2821,7 @@ type SupersededDisk struct {
 	Kept          bool                   `protobuf:"varint,10,opt,name=kept,proto3" json:"kept,omitempty"`                            // a disk a deleted VM was kept with, moved off its path by a create (<path>.kept-<time>): listed only, never purged, removed or restored
 	Seed          bool                   `protobuf:"varint,11,opt,name=seed,proto3" json:"seed,omitempty"`                            // with kept: a cloud-init seed (it can hold user-data), not a disk
 	EarlierVm     bool                   `protobuf:"varint,12,opt,name=earlier_vm,json=earlierVm,proto3" json:"earlier_vm,omitempty"` // with kept and vm_name: the file is an earlier VM's of that name, not the VM of that name that exists now
+	UefiVars      bool                   `protobuf:"varint,13,opt,name=uefi_vars,json=uefiVars,proto3" json:"uefi_vars,omitempty"`    // with kept: the UEFI vars of a deleted VM's superseded definition its host undefined (<vars>.superseded-<time>), not a disk
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2935,6 +2936,13 @@ func (x *SupersededDisk) GetSeed() bool {
 func (x *SupersededDisk) GetEarlierVm() bool {
 	if x != nil {
 		return x.EarlierVm
+	}
+	return false
+}
+
+func (x *SupersededDisk) GetUefiVars() bool {
+	if x != nil {
+		return x.UefiVars
 	}
 	return false
 }
@@ -43561,7 +43569,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x05purge\x18\x02 \x01(\bR\x05purge\x12$\n" +
 	"\x0eolder_than_sec\x18\x03 \x01(\x03R\folderThanSec\x12!\n" +
 	"\fremove_paths\x18\x04 \x03(\tR\vremovePaths\x12!\n" +
-	"\frestore_path\x18\x05 \x01(\tR\vrestorePath\"\xc7\x02\n" +
+	"\frestore_path\x18\x05 \x01(\tR\vrestorePath\"\xe4\x02\n" +
 	"\x0eSupersededDisk\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1b\n" +
 	"\tdisk_path\x18\x02 \x01(\tR\bdiskPath\x12 \n" +
@@ -43578,7 +43586,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	" \x01(\bR\x04kept\x12\x12\n" +
 	"\x04seed\x18\v \x01(\bR\x04seed\x12\x1d\n" +
 	"\n" +
-	"earlier_vm\x18\f \x01(\bR\tearlierVm\"\xe1\x01\n" +
+	"earlier_vm\x18\f \x01(\bR\tearlierVm\x12\x1b\n" +
+	"\tuefi_vars\x18\r \x01(\bR\buefiVars\"\xe1\x01\n" +
 	"\x17SupersededDisksResponse\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x121\n" +
 	"\x05disks\x18\x02 \x03(\v2\x1b.litevirt.v1.SupersededDiskR\x05disks\x12%\n" +

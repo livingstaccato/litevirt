@@ -314,6 +314,17 @@ type Node struct {
 	// stopServerLoops stops the background loops buildServer started for this
 	// node's current server, as a daemon's exit does (see restartNode).
 	stopServerLoops context.CancelFunc
+
+	// keepVirt, when set, is the libvirt fake the next buildServer gives the
+	// node's new server instead of a fresh one, and is then cleared: a daemon
+	// restart, where libvirt and its guests outlive the daemon
+	// (KillMode=process), so the new daemon finds the domains and their states
+	// the old one left.
+	keepVirt *libvirtfake.Fake
+	// serverSetup, when set, runs on every server buildServer makes for this
+	// node, right after it is made and before any of its loops start: the
+	// configuration a scenario's daemon applies at each start.
+	serverSetup func(*grpcapi.Server)
 }
 
 // StreamWatch observes one server-side streaming handler on a node: Started
@@ -847,7 +858,11 @@ func (c *Cluster) buildServer(n *Node) {
 	// NewServer demands a *libvirt.Client; for the fleet harness we construct
 	// the Server directly and inject an in-process libvirt fake (n.Virt) so
 	// VM-lifecycle RPCs run without a real libvirtd.
-	n.Virt = libvirtfake.New()
+	if n.keepVirt != nil {
+		n.Virt, n.keepVirt = n.keepVirt, nil
+	} else {
+		n.Virt = libvirtfake.New()
+	}
 	n.Server = grpcapi.NewServerForTests(grpcapi.TestServerOpts{
 		HostName: n.Name,
 		DataDir:  dataDir,
@@ -855,6 +870,9 @@ func (c *Cluster) buildServer(n *Node) {
 		DB:       n.DB,
 		Virt:     n.Virt,
 	})
+	if n.serverSetup != nil {
+		n.serverSetup(n.Server)
+	}
 	// A running VM's replica or copy is point-in-time through the external
 	// snapshot layer, as the daemon wires it from its libvirt client
 	// (grpcapi/pit_copy.go). The fleet has no backup sessions.

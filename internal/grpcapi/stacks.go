@@ -58,8 +58,9 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// down the networks under what this deploy creates (review m2).
 	if st, gErr := corrosion.GetStack(ctx, s.db, f.Name); !req.DryRun && gErr == nil && st != nil && st.State == stackStateDeleting {
 		return status.Errorf(codes.FailedPrecondition,
-			"stack %q is being torn down (state %q): wait until `lv compose ls` no longer lists it, then run `lv compose up` again",
-			f.Name, stackStateDeleting)
+			"stack %q is being torn down (state %q): wait until `lv compose ls` no longer lists it, then run `lv compose up` again; "+
+				"if the teardown does not finish, `lv compose down --name %s` retries it, and `lv rm <vm> --force` clears a member that is stuck",
+			f.Name, stackStateDeleting, f.Name)
 	}
 
 	// Disk/NIC tuning in the file is refused before anything is deployed, rather

@@ -166,7 +166,9 @@ exits non-zero with a summary such as `stack "web": 1 of 3 deletions failed
 the teardown in the background, and the `stack.delete` audit entry has result
 `error` and names what was not removed. A `compose up` of a stack in state
 `deleting` is refused until the teardown has finished: wait until
-`lv compose ls` no longer lists it, then run `lv compose up` again. While any of the stack's VMs or
+`lv compose ls` no longer lists it, then run `lv compose up` again. If the
+teardown does not finish, `lv compose down --name <stack>` retries it, and
+`lv rm <vm> --force` clears a member that is stuck. While any of the stack's VMs or
 containers is left, none of its networks is deprovisioned: a deleted network
 is torn down on every host, and would be pulled out from under that workload.
 The background retry deletes the remaining VMs and containers first, and

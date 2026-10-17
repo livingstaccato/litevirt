@@ -46,9 +46,10 @@ func TestDeleteStack_AMemberWhoseCreateFailedIsAbsent(t *testing.T) {
 	}
 }
 
-// A compose up of a stack being torn down is refused, saying what to do: a
-// deploy under a teardown would have its networks taken down under the VMs
-// it creates (review m2).
+// A compose up of a stack being torn down is refused, saying what to do,
+// and how out of a teardown that does not finish: a deploy under a teardown
+// would have its networks taken down under the VMs it creates (review m2,
+// re-review N1).
 //
 // Mutation: drop the refusal — the deploy goes ahead (or fails elsewhere,
 // without the message), red.
@@ -62,8 +63,10 @@ func TestDeployStack_AStackBeingTornDownIsRefused(t *testing.T) {
 	stream := &mockDeployStreamR2{ctx: ctx}
 	err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: goneStackYAML}, stream)
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "being torn down") ||
-		!strings.Contains(err.Error(), "then run `lv compose up` again") {
-		t.Fatalf("DeployStack = %v; want FailedPrecondition saying to wait for the teardown, then run up again", err)
+		!strings.Contains(err.Error(), "then run `lv compose up` again") ||
+		!strings.Contains(err.Error(), "`lv compose down --name fbm` retries it") ||
+		!strings.Contains(err.Error(), "`lv rm <vm> --force` clears a member that is stuck") {
+		t.Fatalf("DeployStack = %v; want FailedPrecondition saying to wait for the teardown, then run up again, and naming the exits", err)
 	}
 	if len(stream.sent) != 0 {
 		t.Errorf("the refused deploy reported progress: %+v", stream.sent)

@@ -23,8 +23,8 @@ package fleet
 
 import (
 	"context"
-	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -150,17 +150,50 @@ func TestFleet_LeaseClaim_AFreshDatabaseDoesNotReuseATerm(t *testing.T) {
 // fixtureAcquire has n take the lease at virtual time at, at want, for a
 // scenario's history. A mint is cleared on the node's real health checker's
 // quorum, and a checker whose own process paused past a check interval
-// withholds it for health.StallGrace: on a host at a load of 300 the
-// lapse-and-retake at term 2 came back held=false term=0. A withheld mint
-// records nothing, so it is asked again at the same instant until it is
-// granted; one granted at another term fails at once.
+// withholds it for health.StallGrace: the quorum sweep then reports "quorum
+// high-water mark unconfirmed" (on a host at a load of 300 the
+// lapse-and-retake at term 2 came back held=false term=0). That refusal
+// records nothing, so it alone is asked again at the same instant. Any other
+// refusal fails at once, naming its reason: above all "a peer has already
+// recorded term N", the term reuse this file exists to catch. So does a grant
+// at any term but want.
 func fixtureAcquire(t *testing.T, n *Node, at time.Time, want int64) {
 	t.Helper()
-	eventually(t, 30*time.Second, fmt.Sprintf("%s to take the lease at term %d", n.Name, want), func() bool {
-		held, term := acquireAt(t, n, at)
-		if held && term != want {
-			t.Fatalf("%s: held at term %d, want term %d", n.Name, term, want)
+	var mu sync.Mutex
+	var asked bool
+	var why string
+	n.DB.SetLeaseMintClearance(func(ctx context.Context, req corrosion.LeaseMintRequest) (bool, string) {
+		ok, reason := n.Server.LeaseMintClearance(ctx, req)
+		mu.Lock()
+		asked, why = true, reason
+		if ok {
+			why = ""
 		}
-		return held
+		mu.Unlock()
+		return ok, reason
 	})
+	defer n.DB.SetLeaseMintClearance(n.Server.LeaseMintClearance)
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		mu.Lock()
+		asked, why = false, ""
+		mu.Unlock()
+		held, term := acquireAt(t, n, at)
+		if held {
+			if term != want {
+				t.Fatalf("%s: held at term %d, want term %d", n.Name, term, want)
+			}
+			return
+		}
+		mu.Lock()
+		gotAsked, gotWhy := asked, why
+		mu.Unlock()
+		if !gotAsked || !strings.HasPrefix(gotWhy, "quorum high-water mark unconfirmed") {
+			t.Fatalf("%s: refused the lease at term %d (clearance asked=%v): %q", n.Name, want, gotAsked, gotWhy)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: the term %d mint was still withheld after 30 s: %q", n.Name, want, gotWhy)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }

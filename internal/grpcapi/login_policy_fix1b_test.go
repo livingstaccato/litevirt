@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -132,17 +133,40 @@ func TestI1_LocalChangeCutsAtOnce(t *testing.T) {
 	wantStreamCut(t, "a local disable with an hour-long recheck interval", done, 2*time.Second)
 }
 
-// I1: a stream with nothing wrong is not cut.
+// I1: a stream with nothing wrong is not cut, across several rechecks.
+//
+// The test interval scales the fail-closed bound too (2.5 intervals), and a
+// recheck's budget is what is left of it after the tick that started it
+// fired. At a 20 ms interval that bound was 50 ms, so a loaded host whose
+// timer fired late cut a healthy stream — correctly, at that bound. The
+// interval here keeps the bound far above scheduler delay, and the test
+// counts the rechecks that ran instead of sleeping a fixed time, so a slow
+// host takes longer but still sees them.
 func TestI1_HealthyStreamStaysOpen(t *testing.T) {
 	s := loginPolicyServer(t)
-	s.streamRecheckEvery = 20 * time.Millisecond
+	s.streamRecheckEvery = 250 * time.Millisecond
 	seedUser(t, s, "bob", "operator", "bob-pw")
+	var rechecks atomic.Int32
+	hook := func(context.Context) error { rechecks.Add(1); return nil }
+	recheckHook.Store(&hook)
+	t.Cleanup(func() { recheckHook.Store(nil) })
 	done, started := openStream(s, login(t, s, "bob", "bob-pw").Token)
 	<-started
+	const want = 4
+	deadline := time.After(30 * time.Second)
+	for rechecks.Load() <= want {
+		select {
+		case err := <-done:
+			t.Fatalf("a healthy stream ended after %d rechecks: %v", rechecks.Load(), err)
+		case <-deadline:
+			t.Fatalf("only %d rechecks ran in 30s; want more than %d", rechecks.Load(), want)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 	select {
 	case err := <-done:
-		t.Fatalf("a healthy stream ended: %v", err)
-	case <-time.After(300 * time.Millisecond):
+		t.Fatalf("a healthy stream ended after %d rechecks: %v", rechecks.Load(), err)
+	default:
 	}
 }
 

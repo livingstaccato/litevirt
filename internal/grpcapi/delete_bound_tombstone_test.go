@@ -3,7 +3,6 @@ package grpcapi
 import (
 	"context"
 	"testing"
-	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -11,7 +10,6 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -108,9 +106,11 @@ func TestDeleteVM_ABoundDeleteOfADeletedMemberChecksThePermission(t *testing.T) 
 	}
 }
 
-// The second no-live-row site: a delete that found the row live, then waited
-// for the start lease while another deleter removed the member, re-reads the
-// row and finds the tombstone (review m-3).
+// The second no-live-row site: a delete that found the row live, then took
+// the start lease while another deleter removed the member, re-reads the row
+// and finds the tombstone (review m-3). The other deleter runs from the seam
+// right after the lease is taken, so the first read has seen the live row and
+// only the re-read can answer (re-review m-D).
 //
 // Mutation: answer NotFound at the re-read after the lease — red.
 func TestDeleteVM_ABoundDeleteFindsTheTombstoneAfterTheLease(t *testing.T) {
@@ -123,24 +123,20 @@ func TestDeleteVM_ABoundDeleteFindsTheTombstoneAfterTheLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	row, _ := corrosion.GetVM(ctx, s.db, "web")
-	if by, err := health.TryVMStartLease(ctx, s.db, "other-holder", "web", time.Now()); err != nil || by != "other-holder" {
-		t.Fatalf("setup: take the start lease: %q, %v", by, err)
-	}
-	s.SetDeleteLeaseWaitForTest(30 * time.Second)
-	// The other deleter: the row goes while this delete waits on the lease,
-	// and then the lease is free.
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		time.Sleep(600 * time.Millisecond)
-		if err := corrosion.DeleteVM(ctx, s.db, "web"); err != nil {
+	hooked := 0
+	s.deleteLeaseTakenHook = func(name string) {
+		hooked++
+		if live, _ := corrosion.GetVM(ctx, s.db, name); live == nil {
+			t.Errorf("the row was gone before the lease: the first read answered, not the re-read")
+		}
+		if err := corrosion.DeleteVM(ctx, s.db, name); err != nil {
 			t.Errorf("the other deleter: %v", err)
 		}
-		health.ReleaseVMStartLease(ctx, s.db, "other-holder", "web")
-	}()
-	_, err := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: "web", ExpectedStack: "st", ExpectedCreatedAt: row.CreatedAt})
-	<-done
-	if err != nil {
-		t.Fatalf("a bound delete that waited on the lease while the member was deleted: %v, want OK", err)
+	}
+	if _, err := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: "web", ExpectedStack: "st", ExpectedCreatedAt: row.CreatedAt}); err != nil {
+		t.Fatalf("a bound delete whose member was deleted while it took the lease: %v, want OK", err)
+	}
+	if hooked != 1 {
+		t.Fatalf("the delete reached the lease %d times, want 1", hooked)
 	}
 }

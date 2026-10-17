@@ -3165,6 +3165,9 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			return nil, lerr
 		}
 		defer releaseLease()
+		if h := s.deleteLeaseTakenHook; h != nil {
+			h(req.Name)
+		}
 		// A start that held the lease until a moment ago may have changed
 		// the row since it was read above: decide from the row as it is now.
 		vm, err = corrosion.GetVM(ctx, s.db, req.Name)

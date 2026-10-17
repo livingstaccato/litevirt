@@ -1545,7 +1545,8 @@ The restart is not silent, and the real disk is not lost:
   what the delete decided: a delete by an earlier release, or one whose mark
   on the record was lost to a later write of it. The host also removes the
   VM's cloud-init seed there (`cloudinit/<vm>.iso`) if this release wrote it;
-  a seed from an earlier release stays.
+  a seed from an earlier release stays, and so does the seed when a disk
+  stays at its path for one of the reasons above.
 - A VM of the same name created on that host before then clears
   `<data_dir>/disks/<vm>-<disk>.qcow2` files the earlier VM left. Of those, a
   disk that a failover left at its path is first renamed to

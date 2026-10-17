@@ -226,16 +226,18 @@ func (r *recoveredVM) keptForRetention(t *testing.T) {
 // to other, home comes back and sets rv's real disk aside, and `lv rm rv` on
 // other. home's next pass resolves vm_disk_stranded and removes rv's seed;
 // the copy stays, and the retention sweep removes it only once it is older
-// than superseded_disk_retention_days. --keep-disks does the same: the copy
-// is retained either way, and the seed is not a disk.
+// than superseded_disk_retention_days. --keep-disks does the same with the
+// copy, which is retained either way, and keeps rv's seed: a seed a
+// --keep-disks delete kept is never removed (review m8).
 //
 // (superseded_disk_retention_days: 0 starts no sweep at all
 // (daemon.runSupersededDiskSweep), so a copy then stays until
 // `lv host superseded-disks --purge` or `--remove`.)
 //
 // Mutations: remove a copy on the deleted-VM pass — the copy is gone after
-// rm; drop the seed removal — the seed stays; keep the record open while a
-// copy exists — vm_disk_stranded stays.
+// rm; drop the seed removal — the seed stays after rm; remove it after
+// --keep-disks too — the seed is gone; keep the record open while a copy
+// exists — vm_disk_stranded stays.
 func TestFleet_RmAfterRecoveryKeepsTheCopyForRetention(t *testing.T) {
 	for _, keepDisks := range []bool{false, true} {
 		t.Run(map[bool]string{false: "rm", true: "keep-disks"}[keepDisks], func(t *testing.T) {
@@ -251,7 +253,10 @@ func TestFleet_RmAfterRecoveryKeepsTheCopyForRetention(t *testing.T) {
 			if open := r.strandedOpen(t); len(open) != 0 {
 				t.Fatalf("vm_disk_stranded is still open for the deleted rv: %+v", open)
 			}
-			if present(r.iso) || present(cloudinit.SeedOwnerPath(r.iso)) {
+			switch {
+			case keepDisks && (!present(r.iso) || !present(cloudinit.SeedOwnerPath(r.iso))):
+				t.Fatalf("home removed rv's seed %s after lv rm --keep-disks", r.iso)
+			case !keepDisks && (present(r.iso) || present(cloudinit.SeedOwnerPath(r.iso))):
 				t.Fatalf("home still holds rv's seed %s after rv was deleted", r.iso)
 			}
 			r.keptForRetention(t)

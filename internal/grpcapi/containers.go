@@ -698,6 +698,11 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// Its NICs' MACs, for retiring their guard records below: the tombstone
 	// takes the NIC rows with it.
 	ctMACs := s.containerNICMACs(ctx, req.Name)
+	// From the runtime delete on, the delete runs to its tombstone whatever
+	// becomes of its caller: a client gone between the two would leave a live
+	// row over a container that no longer exists (detachDelete).
+	ctx, cancelFinish := s.detachDelete(ctx)
+	defer cancelFinish()
 	// A runtime "not found" is acceptable (idempotent) — proceed to the row
 	// tombstone so a retry after "runtime gone but DB write failed" can clear the
 	// ghost row. A real runtime failure still aborts.

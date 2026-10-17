@@ -918,6 +918,10 @@ type Server struct {
 	// lease another holder has (SetDeleteLeaseWaitForTest). Zero in
 	// production means deleteLeaseWaitDefault.
 	deleteLeaseWait time.Duration
+	// deleteFinish is a TEST SEAM for how long a delete runs once it has
+	// started acting (detachDelete). Zero, as in production, means
+	// deleteFinishTimeout.
+	deleteFinish time.Duration
 	// diskSpaceOverride is a TEST SEAM for the free-space checks of a cold
 	// migration's disk copy (diskSpace). Nil in production.
 	diskSpaceOverride func(dir string) (avail, total uint64, err error)

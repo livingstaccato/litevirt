@@ -2985,6 +2985,11 @@ func (s *Server) checkNoRemotePCIOwner(ctx context.Context, vmName string) error
 // claiming a running guest, and no restart policy may bring back a VM that is
 // being deleted. The audit row carries why the delete stopped.
 func (s *Server) abortDeleteAfterStop(ctx context.Context, name string, destroyed bool, why string) {
+	// Its own budget: the delete's may be what ran out, and a stop left
+	// unrecorded is a running row with no domain, which the reconciler
+	// restarts.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deleteAbortRecordTimeout)
+	defer cancel()
 	if destroyed {
 		if werr := s.persistVMState(ctx, name, "stopped", "operator-stop", corrosion.OpVMState); werr != nil {
 			slog.Warn("DeleteVM: recording the stop of a VM whose delete failed also failed", "vm", name, "error", werr)
@@ -2992,6 +2997,34 @@ func (s *Server) abortDeleteAfterStop(ctx context.Context, name string, destroye
 	}
 	s.audit(ctx, "vm.delete", name, why, "error")
 }
+
+// deleteFinishTimeout bounds the rest of a VM delete once it has started
+// acting (detachDelete).
+const deleteFinishTimeout = 10 * time.Minute
+
+// deleteAbortRecordTimeout bounds abortDeleteAfterStop's writes.
+const deleteAbortRecordTimeout = 30 * time.Second
+
+// detachDelete is the context a delete runs on from its first destructive
+// step: the request's values (identity, trace, the response header) without
+// its cancellation, bounded by deleteFinishTimeout. A client that goes away
+// after the domain is stopped or undefined, or a peer's forward or stack
+// teardown cancelled with it, must not stop the delete between that step and
+// the tombstone (lab 2 F1): the row would stay running over an undefined
+// domain, and the reconciler would start the VM again on the disks the
+// delete had set out to remove. Before this point a cancellation still
+// refuses the delete with nothing done.
+func (s *Server) detachDelete(ctx context.Context) (context.Context, context.CancelFunc) {
+	bound := s.deleteFinish
+	if bound <= 0 {
+		bound = deleteFinishTimeout
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), bound)
+}
+
+// SetDeleteFinishTimeoutForTest sets how long a delete runs once it has
+// started acting.
+func (s *Server) SetDeleteFinishTimeoutForTest(d time.Duration) { s.deleteFinish = d }
 
 // without returns ss with every occurrence of drop removed (order preserved).
 func without(ss []string, drop string) []string {
@@ -3322,6 +3355,10 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// tombstone on its error (retryable; never leave a stale owner or an unowned-but-bound
 		// device).
 		slog.Warn("DeleteVM: domain not found on any host — cleaning up stale record", "vm", req.Name)
+		// From here the delete acts: devices, the stop record, disks, then
+		// the tombstone. A cancellation must not stop it between them.
+		ctx, cancel := s.detachDelete(ctx)
+		defer cancel()
 		if err := s.releaseDevices(ctx, req.Name); err != nil {
 			return nil, status.Errorf(codes.Internal,
 				"cannot clean up stale VM %q: its PCI device(s) could not be released (still bound to vfio-pci); resolve the device and retry: %v", req.Name, err)
@@ -3452,6 +3489,12 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	if err := s.settleKeptPITOverlays(ctx, vm, req.KeepDisks); err != nil {
 		return nil, err
 	}
+
+	// Every check that refuses the delete with nothing done has passed. From
+	// the stop on, the delete runs to its tombstone or to a recorded abort
+	// whatever becomes of its caller (detachDelete).
+	ctx, cancelFinish := s.detachDelete(ctx)
+	defer cancelFinish()
 
 	// Stop it. Ask libvirt, not only the row: an ACTIVE domain (running, or
 	// paused — which the row does not call "running") survives the undefine

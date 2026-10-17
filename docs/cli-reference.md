@@ -273,6 +273,16 @@ nothing restarts the VM: the reconciler and the restart policy do not take a
 lease over. A retried `lv rm` runs on the same host and is the same holder, so
 it takes the lease back at once and completes the delete.
 
+**An interrupted delete still completes.** Once a delete has passed its checks
+and started acting on the VM (its stop, or for a VM with no domain left, the
+cleanup of its record), the host that carries it out finishes it even if the
+client goes away: `lv rm` or `lv compose down` killed or interrupted, or the
+entry host's forward cancelled. It ends in the tombstone, or in a failure
+recorded as above, within 10 minutes. The same holds for `lv ct rm` once the
+container's runtime delete has started. Interrupted before that point, the
+delete is refused with nothing touched. The command itself may report the
+interruption although the delete then completes: `lv ls` shows the outcome.
+
 **CPU mode.** The default, `host-model`, gives the guest the host's modern
 instruction set — SSE4.2, AVX, AVX2, AVX-512 as the host has them — while keeping
 live migration to a host with an equal-or-richer CPU. It matters because the

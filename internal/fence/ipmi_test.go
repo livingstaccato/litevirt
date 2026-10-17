@@ -383,3 +383,20 @@ func TestFenceIPMI_RetiredCredentialIsReportedNotSent(t *testing.T) {
 		t.Errorf("ipmitool ran %d time(s) with no password", n)
 	}
 }
+
+// TestFenceIPMI_EmptyPasswordIsReportedNotSent: a host fenced by ipmi whose
+// password was never set is refused the same way, never sent an empty one.
+func TestFenceIPMI_EmptyPasswordIsReportedNotSent(t *testing.T) {
+	logPath := fakeIpmitool(t, "Chassis Power is off", 0, 0)
+	h := testIPMIHost()
+	h.IPMIPass = ""
+
+	r := Execute(context.Background(), h)
+	if r.Success || r.Method != "ipmi" || !strings.Contains(r.Detail, "no IPMI password") ||
+		!strings.Contains(r.Detail, "lv host config "+h.Name+" --ipmi-pass") {
+		t.Errorf("result = %+v; want an ipmi failure that says there is no password and how to set one", r)
+	}
+	if n := countInvocations(t, logPath); n != 0 {
+		t.Errorf("ipmitool ran %d time(s) with no password", n)
+	}
+}

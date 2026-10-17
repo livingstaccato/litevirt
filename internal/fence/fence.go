@@ -280,11 +280,20 @@ func fenceIPMI(ctx context.Context, h HostConfig) Result {
 			Success: false,
 		}
 	}
+	// No password is never sent as an empty one: ipmitool would make an
+	// unauthenticated attempt and report whatever the BMC answers.
 	if h.IPMICredentialRetired {
 		return Result{
 			Method: "ipmi",
 			Detail: "no IPMI password: the host's fence credential was retired when it was removed or re-admitted; " +
 				"set it with `lv host config " + h.Name + " --ipmi-pass <secret>`",
+			Success: false,
+		}
+	}
+	if h.IPMIPass == "" {
+		return Result{
+			Method:  "ipmi",
+			Detail:  "no IPMI password configured on host; set it with `lv host config " + h.Name + " --ipmi-pass <secret>`",
 			Success: false,
 		}
 	}

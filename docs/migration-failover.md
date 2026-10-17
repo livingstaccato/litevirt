@@ -671,9 +671,10 @@ predates the flag ignores it; the CLI reports an error when the host it gets
 back still has an IPMI address.
 
 `lv host rm` and a re-admission by `lv host add` retire the host's IPMI
-password. Until it is set again with `lv host config <host> --ipmi-pass`, an
-`ipmi` fence of that host fails at once with `no IPMI password`, and never
-falls back to a password from before the removal.
+password, and it never falls back to a password from before the removal. An
+`ipmi` fence of a host with no IPMI password, retired or never set, fails at
+once with `no IPMI password` and sends nothing to the BMC; set one with
+`lv host config <host> --ipmi-pass`.
 
 ### Redfish
 

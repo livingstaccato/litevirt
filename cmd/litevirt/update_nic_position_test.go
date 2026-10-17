@@ -73,27 +73,49 @@ func TestUpdate_NICNumbersAreListPositions(t *testing.T) {
 	}
 }
 
-// Review m-new-1: a node whose Ping lacks nic_list_position drops the field
-// and reads each number as a spec index, applied to the NIC at that ordinal.
-// lv sends it the numbers as they are only when the VM's NIC ordinals run 0,
-// 1, 2, ... (no NIC detached and attached again): there every number means
-// the same NIC. Otherwise it refuses, and sends nothing.
+// Review m-new-1 and m-r2-2: a node whose Ping lacks nic_list_position drops
+// the field and reads each number N as a spec index, applied to the NIC at
+// ordinal N. While ordinals 0..N run unbroken, N means the same NIC there,
+// and goes unchanged; a number at or past the first gap is refused, and
+// nothing is sent.
 //
-// Mutations: send positions to the older node regardless — the reordered case
-// goes through, red; refuse every older node — the plain case is refused,
+// Mutations: send positions to the older node regardless — the gap cases go
+// through, red; refuse every older node, or every number once there is a
+// gap — the plain and before-the-gap cases are refused, red; keep the field —
 // red.
 func TestUpdate_NICNumbersToAnOlderNode(t *testing.T) {
 	plain := &updateSpy{ordinals: []int32{0, 1, 2}}
-	if err := runUpdate(plain, "--nic-mtu", "1=9000", "--nic-rate", "2=5", "vm"); err != nil {
+	if err := runUpdate(plain, "--nic-mtu", "1=9000", "--nic-rate", "2=5", "--nic-rate", "3=1", "vm"); err != nil {
 		t.Fatalf("plain VM on an older node: %v", err)
 	}
-	if g := plain.got; g == nil || g.GetNicByListPosition() || g.NicMtu[0].Ordinal != 1 || g.NicRate[0].Ordinal != 2 {
+	if g := plain.got; g == nil || g.GetNicByListPosition() || g.NicMtu[0].Ordinal != 1 || g.NicRate[0].Ordinal != 2 || g.NicRate[1].Ordinal != 3 {
 		t.Errorf("plain VM on an older node: sent %v, want the numbers unchanged as spec indices", g)
 	}
 
+	// A@0, C@2, B (ordinal 1) detached: NIC 0 is A either way; NIC 1 is C,
+	// which that node would read as entry 1, B's.
+	before := &updateSpy{ordinals: []int32{0, 2}}
+	if err := runUpdate(before, "--nic-mtu", "0=9000", "vm"); err != nil {
+		t.Fatalf("--nic-mtu 0= before the gap: %v", err)
+	}
+	if g := before.got; g == nil || g.GetNicByListPosition() || g.NicMtu[0].Ordinal != 0 {
+		t.Errorf("--nic-mtu 0= before the gap: sent %v, want it unchanged as a spec index", g)
+	}
+	for _, args := range [][]string{
+		{"--nic-mtu", "1=9000", "vm"},                      // C, at the gap
+		{"--nic-rate", "2=5", "vm"},                        // past the list, after a gap
+		{"--nic-mtu", "0=9000", "--nic-rate", "1=5", "vm"}, // one exact, one not
+	} {
+		spy := &updateSpy{ordinals: []int32{0, 2}}
+		err := runUpdate(spy, args...)
+		if err == nil || !strings.Contains(err.Error(), "gap in its NIC numbering") || spy.got != nil {
+			t.Errorf("%v on A@0, C@2: err %v, sent %v; want a refusal and nothing sent", args, err, spy.got)
+		}
+	}
+
 	reordered := &updateSpy{ordinals: []int32{2, 1}}
-	err := runUpdate(reordered, "--nic-mtu", "1=9000", "vm")
+	err := runUpdate(reordered, "--nic-mtu", "0=9000", "vm")
 	if err == nil || !strings.Contains(err.Error(), "runs an older build") || reordered.got != nil {
-		t.Errorf("reordered VM on an older node: err %v, sent %v; want a refusal and nothing sent", err, reordered.got)
+		t.Errorf("A attached again (ordinals 1, 2): err %v, sent %v; want a refusal and nothing sent", err, reordered.got)
 	}
 }

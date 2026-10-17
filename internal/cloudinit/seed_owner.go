@@ -6,7 +6,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
 
 	"github.com/litevirt/litevirt/internal/randid"
 )
@@ -57,18 +61,76 @@ func StampSeed(iso, owner string) error {
 		os.Remove(tmp)
 		return err
 	}
-	if err := os.Rename(tmp, stamp); err != nil {
+	if err := renameFile(tmp, stamp); err != nil {
 		os.Remove(tmp)
 		return err
 	}
 	return syncDir(filepath.Dir(stamp))
 }
 
-// fileSync and dirSync are (*os.File).Sync; a test records them.
+// fileSync and dirSync are (*os.File).Sync, and renameFile is os.Rename, each
+// reported to a test's ObserveSeedWrites; a test may also replace them.
 var (
-	fileSync = (*os.File).Sync
-	dirSync  = (*os.File).Sync
+	fileSync   = func(f *os.File) error { return observed("sync", f.Name(), f.Sync()) }
+	dirSync    = func(f *os.File) error { return observed("syncdir", f.Name(), f.Sync()) }
+	renameFile = func(from, to string) error { return observed("rename", to, os.Rename(from, to)) }
 )
+
+// seedWriteObserver is the observer ObserveSeedWrites sets; nil outside it.
+var seedWriteObserver atomic.Pointer[func(step, path string)]
+
+// observed reports step on path to the observer when it succeeded, and
+// returns err.
+func observed(step, path string, err error) error {
+	if f := seedWriteObserver.Load(); f != nil && err == nil {
+		(*f)(step, path)
+	}
+	return err
+}
+
+// ObserveSeedWrites records, until t ends, each step of a durable seed write
+// on a path under dir: "sync <file>" (a file's bytes reached the disk),
+// "rename <to>" (it took its name), "syncdir <dir>" (the name reached the
+// disk). The returned func reads what was recorded so far. Outside a test
+// binary it panics.
+func ObserveSeedWrites(t TestingT, dir string) func() []string {
+	t.Helper()
+	if !testing.Testing() {
+		panic("cloudinit.ObserveSeedWrites called outside a test")
+	}
+	var (
+		mu    sync.Mutex
+		steps []string
+	)
+	f := func(step, path string) {
+		if path != dir && !strings.HasPrefix(path, dir+string(filepath.Separator)) {
+			return
+		}
+		mu.Lock()
+		steps = append(steps, step+" "+path)
+		mu.Unlock()
+	}
+	seedWriteObserver.Store(&f)
+	t.Cleanup(func() { seedWriteObserver.CompareAndSwap(&f, nil) })
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(steps)
+	}
+}
+
+// syncFile syncs the file at p, so its bytes survive a power cut.
+func syncFile(p string) error {
+	f, err := os.Open(p)
+	if err != nil {
+		return err
+	}
+	if err := fileSync(f); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
 
 // writeSynced writes b to a new file at p, mode 0600, and syncs it.
 func writeSynced(p string, b []byte) error {

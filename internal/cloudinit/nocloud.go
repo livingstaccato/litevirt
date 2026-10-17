@@ -81,8 +81,19 @@ func writeISO(seed Seed, outputPath string) error {
 		return err
 	}
 	diskmode.NarrowBestEffort(tmp)
-	if err := os.Rename(tmp, outputPath); err != nil {
+	// Durable, as the stamp is (StampSeed): the image's bytes reach the disk
+	// before the rename makes it the seed, and the rename before this
+	// returns. Every caller stamps the seed only after this returns, so a
+	// stamp that survives a power cut never names an empty or truncated
+	// seed.
+	if err := syncFile(tmp); err != nil {
+		return fmt.Errorf("sync seed: %w", err)
+	}
+	if err := renameFile(tmp, outputPath); err != nil {
 		return fmt.Errorf("place seed: %w", err)
+	}
+	if err := syncDir(filepath.Dir(outputPath)); err != nil {
+		return fmt.Errorf("sync seed directory: %w", err)
 	}
 	clearSeedStale(outputPath)
 	return nil

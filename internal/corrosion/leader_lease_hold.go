@@ -83,6 +83,48 @@ func (c *Client) SetLeaseLiveObserver(fn func(ctx context.Context, key string)) 
 	c.leaseLiveObserver = fn
 }
 
+// LeaseNoMajority is one poll on which this node would take a lease over and
+// cannot, because no voter majority is available to it: the health voter
+// quorum is lost (NoteLeaseNoQuorum), the quorum high-water read found no
+// quorum, or the term's claim reached no majority of the voter generation
+// (grpcapi lease_term_claim.go).
+type LeaseNoMajority struct {
+	Key string
+	// TTL is the lease's; the stall is reported once it has lasted one.
+	TTL time.Duration
+	// Now is the caller's clock for this poll.
+	Now time.Time
+	// Why is the stand-down's reason, for the condition's evidence.
+	Why string
+}
+
+// SetLeaseNoMajorityObserver injects what NoteLeaseNoQuorum tells. Wired at
+// daemon start to grpcapi.Server.NoteLeaseNoMajority, which counts the poll
+// and raises ha.lease.claim_no_majority once a lease has gone a TTL without a
+// takeover. Nil tells nobody.
+func (c *Client) SetLeaseNoMajorityObserver(fn func(ctx context.Context, ev LeaseNoMajority)) {
+	c.leaseNoMajorityObserver = fn
+}
+
+// NoteLeaseNoQuorum is called by a lease's poll loop that stood down without
+// calling AcquireLeaseWithTerm because this node has lost the voter majority
+// (the failover coordinator, the dual-run detector, the rebalancer). The
+// stand-down is a takeover that cannot happen only when this replica shows no
+// live holder: the lease row is expired or absent. A holder that cannot renew
+// its own live lease, and a lease live for a peer, are not takeovers and are
+// not reported. One local read.
+func NoteLeaseNoQuorum(ctx context.Context, c *Client, key, holder string, ttl time.Duration, now time.Time) {
+	if c == nil || c.leaseNoMajorityObserver == nil {
+		return
+	}
+	cur, exp, err := leaseRow(ctx, c, key)
+	if err != nil || (cur != "" && exp >= now.UTC().Format(time.RFC3339)) {
+		return
+	}
+	c.leaseNoMajorityObserver(ctx, LeaseNoMajority{Key: key, TTL: ttl, Now: now,
+		Why: "this node has lost the voter majority, so it neither takes the lease over nor records a term"})
+}
+
 func acquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, ttl time.Duration, now time.Time) (bool, int64, error) {
 	// The clock is re-sampled on EVERY attempt, not once at entry.
 	//

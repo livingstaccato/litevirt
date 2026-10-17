@@ -289,6 +289,10 @@ type Client struct {
 	// leaseLiveObserver is told when AcquireLeaseWithTerm finds a lease held
 	// (SetLeaseLiveObserver).
 	leaseLiveObserver func(ctx context.Context, key string)
+	// leaseNoMajorityObserver is told when a lease poll stands down for want
+	// of the voter majority over a lease with no live holder
+	// (SetLeaseNoMajorityObserver).
+	leaseNoMajorityObserver func(ctx context.Context, ev LeaseNoMajority)
 	// unresolvedTies records, per (table,PK), the last classified-unresolved tie:
 	// its sorted content-hash pair and its CATEGORY. The pair makes
 	// lww_tie_unresolved count DISTINCT rows (re-observing the same divergence is

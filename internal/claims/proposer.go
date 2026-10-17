@@ -76,6 +76,23 @@ type Spec struct {
 	// Server.legacyValueExcluded). Then Propose builds a fresh value. Nil
 	// adopts nothing.
 	AdoptLegacy func(v corrosion.ClaimValue) bool
+	// ReturnAtQuorum ends each phase as soon as a quorum of the voters has
+	// promised (phase 1) or accepted (phase 2), and cancels the calls still
+	// outstanding, instead of waiting for every voter. Any quorum of promises
+	// holds every value a quorum can have accepted, so this decides the same
+	// values; it only stops a voter that does not answer from costing the
+	// whole call timeout on every phase of a claim that already has its
+	// quorum. A phase that does not reach a quorum still waits for every
+	// voter, so its refusals are complete. Lease-term claims set it.
+	ReturnAtQuorum bool
+	// Yield, when set, replaces the short random pause before a retry after
+	// ANOTHER proposer's ballot outranked this one (stale names it): how long
+	// to let that proposer finish before going above it. Outbidding it at
+	// once can only pre-empt it between its phases, so several claimants of
+	// one key would outbid each other round after round; one that waits finds
+	// its value accepted and completes it. A ballot this process used itself
+	// (an earlier Decide's) is no competitor and gets the short pause.
+	Yield func(attempt int, stale corrosion.Ballot) time.Duration
 }
 
 // Outcome is a decided value and the certificate that proves it.
@@ -267,12 +284,17 @@ func (p *Proposer) Decide(ctx context.Context, spec Spec) (Outcome, error) {
 			return Outcome{}, err // refused for a reason a higher ballot cannot fix
 		}
 		// A voter has promised above us: go above it, after a short random
-		// pause so two duelling proposers stop alternating (§6).
+		// pause so two duelling proposers stop alternating (§6) — or, with
+		// spec.Yield, after letting the other proposer finish.
 		round = stale.Round + 1
+		pause := p.backoff(attempt)
+		if spec.Yield != nil && stale.Coordinator != p.Self {
+			pause = spec.Yield(attempt, stale)
+		}
 		select {
 		case <-ctx.Done():
 			return Outcome{}, lastErr
-		case <-time.After(p.backoff(attempt)):
+		case <-time.After(pause):
 		}
 	}
 	return Outcome{}, lastErr
@@ -403,7 +425,7 @@ func (p *Proposer) try(ctx context.Context, spec Spec, b corrosion.Ballot, own m
 	if spec.Electorate != nil {
 		targets, quorum = spec.Electorate(*value)
 	}
-	accepts, arefusals := p.acceptAll(ctx, spec, b, *value, targets)
+	accepts, arefusals := p.acceptAll(ctx, spec, b, *value, targets, quorum)
 	for _, r := range arefusals {
 		noteStale(r.reason, r.promised)
 	}
@@ -435,61 +457,83 @@ func publicRefusals(rs []refusal) []Refusal {
 }
 
 func (p *Proposer) prepareAll(ctx context.Context, spec Spec, b corrosion.Ballot) (map[string]corrosion.PrepareResult, []refusal) {
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	promises := map[string]corrosion.PrepareResult{}
-	var refusals []refusal
-	for _, v := range dedup(spec.Voters) {
-		wg.Add(1)
+	type answer struct {
+		voter string
+		res   corrosion.PrepareResult
+		err   error
+	}
+	voters := dedup(spec.Voters)
+	// Cancelled on return: with ReturnAtQuorum, the calls still outstanding.
+	actx, cancelAll := context.WithCancel(ctx)
+	defer cancelAll()
+	// Buffered for every voter, so a call that answers after an early return
+	// never blocks.
+	answers := make(chan answer, len(voters))
+	for _, v := range voters {
 		go func(voter string) {
-			defer wg.Done()
-			cctx, cancel := context.WithTimeout(ctx, p.callTimeout())
+			cctx, cancel := context.WithTimeout(actx, p.callTimeout())
 			defer cancel()
 			res, err := p.Transport.Prepare(cctx, voter, spec.Key, b, spec.Generation, spec.Supersede)
-			mu.Lock()
-			defer mu.Unlock()
-			switch {
-			case err != nil:
-				refusals = append(refusals, refusal{voter: voter, reason: ReasonUnreachable, detail: err.Error()})
-			case res.Promised:
-				promises[voter] = res
-			default:
-				refusals = append(refusals, refusal{voter: voter, reason: res.Refusal, detail: res.Detail, promised: res.PromisedBallot})
-			}
+			answers <- answer{voter: voter, res: res, err: err}
 		}(v)
 	}
-	wg.Wait()
+	promises := map[string]corrosion.PrepareResult{}
+	var refusals []refusal
+	for range voters {
+		a := <-answers
+		switch {
+		case a.err != nil:
+			refusals = append(refusals, refusal{voter: a.voter, reason: ReasonUnreachable, detail: a.err.Error()})
+		case a.res.Promised:
+			promises[a.voter] = a.res
+		default:
+			refusals = append(refusals, refusal{voter: a.voter, reason: a.res.Refusal, detail: a.res.Detail, promised: a.res.PromisedBallot})
+		}
+		if spec.ReturnAtQuorum && spec.PrepareQuorum > 0 && len(promises) >= spec.PrepareQuorum {
+			break
+		}
+	}
 	return promises, refusals
 }
 
-func (p *Proposer) acceptAll(ctx context.Context, spec Spec, b corrosion.Ballot, v corrosion.ClaimValue, targets []string) (map[string]corrosion.ClaimAccept, []refusal) {
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	accepts := map[string]corrosion.ClaimAccept{}
-	var refusals []refusal
-	for _, t := range dedup(targets) {
-		wg.Add(1)
+func (p *Proposer) acceptAll(ctx context.Context, spec Spec, b corrosion.Ballot, v corrosion.ClaimValue, targets []string, quorum int) (map[string]corrosion.ClaimAccept, []refusal) {
+	type answer struct {
+		voter string
+		res   corrosion.AcceptResult
+		err   error
+	}
+	voters := dedup(targets)
+	actx, cancelAll := context.WithCancel(ctx)
+	defer cancelAll()
+	answers := make(chan answer, len(voters))
+	for _, t := range voters {
 		go func(voter string) {
-			defer wg.Done()
-			cctx, cancel := context.WithTimeout(ctx, p.callTimeout())
+			cctx, cancel := context.WithTimeout(actx, p.callTimeout())
 			defer cancel()
 			res, err := p.Transport.Accept(cctx, voter, spec.Key, b, v, spec.Generation)
-			mu.Lock()
-			defer mu.Unlock()
-			switch {
-			case err != nil:
-				refusals = append(refusals, refusal{voter: voter, reason: ReasonUnreachable, detail: err.Error()})
-			case res.Accepted && res.Accept != nil && res.Accept.Voter == voter && res.Accept.Key == spec.Key:
-				// An accept counts only for the key it signs. A voter on an
-				// older build drops a key's incarnation and signs the legacy
-				// key, and its accept certifies nothing here.
-				accepts[voter] = *res.Accept
-			default:
-				refusals = append(refusals, refusal{voter: voter, reason: res.Refusal, detail: res.Detail, promised: res.PromisedBallot})
-			}
+			answers <- answer{voter: voter, res: res, err: err}
 		}(t)
 	}
-	wg.Wait()
+	accepts := map[string]corrosion.ClaimAccept{}
+	var refusals []refusal
+	for range voters {
+		a := <-answers
+		voter, res := a.voter, a.res
+		switch {
+		case a.err != nil:
+			refusals = append(refusals, refusal{voter: voter, reason: ReasonUnreachable, detail: a.err.Error()})
+		case res.Accepted && res.Accept != nil && res.Accept.Voter == voter && res.Accept.Key == spec.Key:
+			// An accept counts only for the key it signs. A voter on an
+			// older build drops a key's incarnation and signs the legacy
+			// key, and its accept certifies nothing here.
+			accepts[voter] = *res.Accept
+		default:
+			refusals = append(refusals, refusal{voter: voter, reason: res.Refusal, detail: res.Detail, promised: res.PromisedBallot})
+		}
+		if spec.ReturnAtQuorum && quorum > 0 && len(accepts) >= quorum {
+			break
+		}
+	}
 	return accepts, refusals
 }
 

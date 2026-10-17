@@ -309,6 +309,7 @@ const dualRunLeaseProbeTTL = 60 * time.Second
 func (s *Server) acquireDualRunLease(ctx context.Context, interval time.Duration) bool {
 	if s.LeaseQuorumLost(ctx) {
 		s.dualRunLeaseTerm.Store(0)
+		corrosion.NoteLeaseNoQuorum(ctx, s.db, dualRunLeaseKey, s.hostName, 2*interval, time.Now())
 		return false
 	}
 	held, term, err := corrosion.AcquireLeaseWithTerm(

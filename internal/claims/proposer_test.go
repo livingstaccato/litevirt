@@ -252,8 +252,12 @@ func (m *memTransport) chosen(key corrosion.ClaimKey, n int) map[string]bool {
 // proposer ignore accepted values in promises. Either one produces a second
 // chosen value within the schedules below.
 func TestProposer_SafetyUnderRandomSchedules(t *testing.T) {
-	for _, n := range []int{3, 5} {
-		t.Run(fmt.Sprintf("%d voters", n), func(t *testing.T) {
+	for _, tc := range []struct {
+		n        int
+		atQuorum bool // Spec.ReturnAtQuorum, as lease-term claims run
+	}{{3, false}, {5, false}, {3, true}, {5, true}} {
+		n := tc.n
+		t.Run(fmt.Sprintf("%d voters, return at quorum %v", n, tc.atQuorum), func(t *testing.T) {
 			var vnames []string
 			for i := 0; i < n; i++ {
 				vnames = append(vnames, fmt.Sprintf("v%d", i))
@@ -279,7 +283,9 @@ func TestProposer_SafetyUnderRandomSchedules(t *testing.T) {
 						p.Backoff = func(int) time.Duration { return time.Duration(rand.Int64N(int64(2 * time.Millisecond))) }
 						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 						defer cancel()
-						out, err := p.Decide(ctx, workloadSpec(key, all, fmt.Sprintf("dest-%d", pi)))
+						spec := workloadSpec(key, all, fmt.Sprintf("dest-%d", pi))
+						spec.ReturnAtQuorum = tc.atQuorum
+						out, err := p.Decide(ctx, spec)
 						if err == nil {
 							mu.Lock()
 							certs[out.Digest] = true

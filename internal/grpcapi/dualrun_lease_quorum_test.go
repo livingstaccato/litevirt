@@ -25,10 +25,16 @@ import (
 func TestDualRunLease_NotTakenOrRenewedWithoutQuorum(t *testing.T) {
 	ctx := context.Background()
 	s := dualRunTestServerNoLease(t, 2)
+	var stalls []corrosion.LeaseNoMajority
+	s.db.SetLeaseNoMajorityObserver(func(_ context.Context, ev corrosion.LeaseNoMajority) { stalls = append(stalls, ev) })
 
 	s.SetGate(fakeServerGate{execOK: true, quorum: health.QuorumNo, live: 1, needed: 2})
 	if s.acquireDualRunLease(ctx, time.Minute) {
 		t.Fatal("took the dual-run lease with the voter majority lost")
+	}
+	// Nobody holds it and this node cannot take it: a stalled takeover.
+	if len(stalls) != 1 || stalls[0].Key != dualRunLeaseKey || stalls[0].TTL != 2*time.Minute {
+		t.Fatalf("stand-downs reported %+v, want one for %s with its TTL", stalls, dualRunLeaseKey)
 	}
 	if h, _, err := corrosion.ReadLeaseRow(ctx, s.db, dualRunLeaseKey); err != nil || h != "" {
 		t.Fatalf("a lease row names %q (%v) after a refused take", h, err)
@@ -49,6 +55,10 @@ func TestDualRunLease_NotTakenOrRenewedWithoutQuorum(t *testing.T) {
 	}
 	if _, again, err := corrosion.ReadLeaseRow(ctx, s.db, dualRunLeaseKey); err != nil || again != first {
 		t.Fatalf("the lease's expiry moved from %s to %s (%v) with the voter majority lost", first, again, err)
+	}
+	// Its own lease is still live: a holder that cannot renew, not a takeover.
+	if len(stalls) != 1 {
+		t.Fatalf("a holder standing down over its own live lease was reported as a stalled takeover: %+v", stalls)
 	}
 }
 

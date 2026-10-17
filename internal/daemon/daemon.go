@@ -3705,6 +3705,14 @@ func (d *Daemon) wireLeaseMintClearance() {
 			svc.NoteLeaseLive(ctx, key)
 		}
 	})
+	// A lease poll that stood down for want of the voter majority, over a
+	// lease with no live holder, is a stalled takeover like a claim with no
+	// majority.
+	d.db.SetLeaseNoMajorityObserver(func(ctx context.Context, ev corrosion.LeaseNoMajority) {
+		if svc := d.mintClearance.Load(); svc != nil {
+			svc.NoteLeaseNoMajority(ctx, ev)
+		}
+	})
 }
 
 // wireVoterConfigGate lets corrosion write voter_configs only once

@@ -978,16 +978,21 @@ term after the TTL.
   holds a voter generation with members that it has not adopted yet records
   nothing until it has.
 
-While a lease has had no claim majority for longer than one of its TTLs, the
-`ha.lease.claim_no_majority` condition is raised for it (evaluator
+While a lease with no live holder has had no voter majority to take it over
+for longer than one of its TTLs, the `ha.lease.claim_no_majority` condition is
+raised for it (evaluator
 `lease_term_claim`, subject the lease key). It is resolved once the lease is
 no longer contested: a claim for it is decided, a term is recorded without a
 claim (no generation adopted, or the older-build fallback), or a node sees a
 live holder renewing it, the returned holder included. During a split, a node
 that cannot see the holder may raise it again, and the row then alternates
 between observed and resolved without being confirmed.
-`litevirt_lease_term_claim_no_majority_total{lease}` counts every claim
-without a majority. `lv cluster voter ls` shows the voters.
+`litevirt_lease_term_claim_no_majority_total{lease}` counts every such poll:
+one on a node that has lost the voter majority, one whose quorum high-water
+read no quorum answered, and one whose claim no majority could decide. A claim
+lost to another claimant of the term is not counted; a claimant outranked by
+another waits a moment for it to finish rather than outbidding it at once.
+`lv cluster voter ls` shows the voters.
 
 To stand down, know that every voter change is decided by the same majority
 as a lease-term claim: `lv cluster voter rm`, `lv cluster voter add` and

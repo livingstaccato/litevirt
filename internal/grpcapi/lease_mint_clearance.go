@@ -77,7 +77,11 @@ func (s *Server) LeaseMintClearance(ctx context.Context, req corrosion.LeaseMint
 	}
 	sweep := s.sweepLeaseTerm(ctx, key)
 	if !sweep.ok {
-		return false, "quorum high-water mark unconfirmed: a quorum of peers did not answer"
+		// No quorum to read from is no voter majority to take the lease over
+		// with: a stalled takeover, counted and raised like a claim's.
+		why := "quorum high-water mark unconfirmed: a quorum of peers did not answer"
+		s.noteLeaseNoMajority(ctx, key, req.TTL, clearanceInstant(req, started), why)
+		return false, why
 	}
 	threshold := sweep.threshold
 	s.storeLeaseThreshold(key, threshold)
@@ -99,6 +103,17 @@ func (s *Server) LeaseMintClearance(ctx context.Context, req corrosion.LeaseMint
 		return s.claimLeaseTerm(ctx, cfg, req, started)
 	}
 	return true, ""
+}
+
+// clearanceInstant is req.Now advanced by the time the clearance has taken
+// since started: the caller's clock, now. An unparseable req.Now falls back
+// to this node's clock.
+func clearanceInstant(req corrosion.LeaseMintRequest, started time.Time) time.Time {
+	at := started
+	if t, err := time.Parse(time.RFC3339, req.Now); err == nil {
+		at = t
+	}
+	return at.Add(time.Since(started))
 }
 
 // liveLeaseElsewhere returns a row some peer reported that shows the lease live

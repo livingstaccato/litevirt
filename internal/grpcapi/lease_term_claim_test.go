@@ -530,3 +530,121 @@ func TestLeaseMintClearance_AStaleGenerationDoesNotFallBack(t *testing.T) {
 		t.Fatalf("term %d recorded", newest)
 	}
 }
+
+// A claim outranked by another claimant of the term, with a majority of the
+// generation there to decide it, lost a duel: it is not a no-majority stall
+// and is not counted. Only a claim no majority could have decided is.
+//
+// Mutation: count every failed claim (majorityAnswered always false) — the
+// duel rows go red.
+func TestMajorityAnswered(t *testing.T) {
+	outbid := func(v string) claims.Refusal { return claims.Refusal{Voter: v, Reason: corrosion.RefusalBallotStale} }
+	conflict := func(v string) claims.Refusal { return claims.Refusal{Voter: v, Reason: corrosion.RefusalValueConflict} }
+	gone := func(v string) claims.Refusal { return claims.Refusal{Voter: v, Reason: claims.ReasonUnreachable} }
+	other := func(v string) claims.Refusal { return claims.Refusal{Voter: v, Reason: corrosion.RefusalSealed} }
+	voters := []string{"v1", "v2", "v3", "v4", "v5"}
+	for _, tc := range []struct {
+		name     string
+		phase    string
+		got      int
+		refusals []claims.Refusal
+		want     bool
+	}{
+		{"outbid at every live voter, one dead", "prepare", 0,
+			[]claims.Refusal{outbid("v1"), outbid("v2"), outbid("v3"), outbid("v4"), gone("v5")}, true},
+		{"two promises and one outbid", "prepare", 2, []claims.Refusal{outbid("v3"), gone("v4"), gone("v5")}, true},
+		{"accept lost to a higher ballot", "accept", 1, []claims.Refusal{outbid("v2"), conflict("v3"), gone("v4")}, true},
+		{"three of five unreachable", "prepare", 1, []claims.Refusal{outbid("v2"), gone("v3"), gone("v4"), gone("v5")}, false},
+		{"refusals no ballot changes", "prepare", 1, []claims.Refusal{other("v2"), other("v3"), gone("v4"), gone("v5")}, false},
+		{"outbid answers from non-members do not count", "prepare", 1,
+			[]claims.Refusal{outbid("x1"), outbid("x2"), gone("v3"), gone("v4"), gone("v5")}, false},
+		{"one member outbid twice counts once", "prepare", 1,
+			[]claims.Refusal{outbid("v2"), outbid("v2"), gone("v3"), gone("v4"), gone("v5")}, false},
+	} {
+		err := &claims.NoMajorityError{Phase: tc.phase, Got: tc.got, Need: 3, Refusals: tc.refusals}
+		if got := majorityAnswered(err, voters, 3); got != tc.want {
+			t.Errorf("%s: majorityAnswered=%v, want %v", tc.name, got, tc.want)
+		}
+	}
+	if majorityAnswered(context.DeadlineExceeded, voters, 3) {
+		t.Error("an error that is not a claim's answer read as a majority")
+	}
+}
+
+// A claim lost to another claimant — every other voter has promised a higher
+// ballot — had a majority there to decide it: it is not counted, and it does
+// not raise ha.lease.claim_no_majority however long it goes on.
+//
+// Mutation: report a lost duel as no majority — this goes red.
+func TestLeaseMintClearance_ALostDuelIsNotANoMajority(t *testing.T) {
+	ctx := context.Background()
+	s := namedVoterServer(t)
+	inc, err := s.db.VoterIncarnation(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adoptTestGeneration(t, s, []corrosion.VoterMember{{Name: s.hostName, Incarnation: inc},
+		{Name: "v1", Incarnation: "i"}, {Name: "v2", Incarnation: "i"}})
+	for _, h := range []string{s.hostName, "v1", "v2"} {
+		insertTestHost(t, ctx, s.db, h, "active")
+	}
+	s.db.MarkReplicaCaughtUpForTests("v1")
+	s.SetGate(fakeServerGate{quorum: health.QuorumYes, needed: 2, healthy: []string{"v1", "v2"},
+		durablyLatchedTok: map[string]bool{capabilities.LeaseTermClaimV1: true}})
+	peers := map[string]*claimPeer{
+		"v1": {name: "v1", reason: corrosion.RefusalBallotStale, detail: "v1 has promised a higher ballot"},
+		"v2": {name: "v2", reason: corrosion.RefusalBallotStale, detail: "v2 has promised a higher ballot"},
+	}
+	s.peerClientOverride = func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
+		p, ok := peers[host]
+		if !ok {
+			return nil, nil, context.DeadlineExceeded
+		}
+		return p, func() {}, nil
+	}
+	var counted int
+	s.SetLeaseClaimNoMajorityObserver(func(string) { counted++ })
+	req := leaseClaimReq(s, 1)
+	req.TTL = 30 * time.Second
+	at, _ := time.Parse(time.RFC3339, clearanceNow)
+	for _, now := range []time.Time{at, at.Add(req.TTL + time.Second)} {
+		req.Now = now.Format(time.RFC3339)
+		if ok, why := s.LeaseMintClearance(ctx, req); ok {
+			t.Fatalf("fixture: cleared against two outbidding voters (%q)", why)
+		}
+	}
+	if counted != 0 {
+		t.Fatalf("%d claims outbid by another claimant were counted as no majority", counted)
+	}
+	if noMajorityRaised(t, s) {
+		t.Fatal("a duel lost for a TTL raised the condition")
+	}
+}
+
+// A lease-term claim ends each phase at its quorum, and an outbid claimant
+// yields to the claimant ahead of it, longer to one the tie rule prefers. The
+// mechanisms are claims' (TestProposer_YieldLetsTheLeaderFinish) and the
+// fleet's five-claimant takeover; this pins that the claim uses them.
+//
+// Mutations: drop ReturnAtQuorum or Yield from the spec — this goes red.
+func TestLeaseTermClaimSpec_EndsAtQuorumAndYields(t *testing.T) {
+	req := corrosion.LeaseMintRequest{Key: corrosion.LeaseKeyFailover, Term: 7, Holder: "node-3"}
+	spec := leaseTermClaimSpec(corrosion.LeaseTermClaimKey(req.Key, req.Term), 1,
+		[]string{"node-1", "node-2", "node-3", "node-4", "node-5"}, req, "node-3")
+	if !spec.ReturnAtQuorum {
+		t.Fatal("a lease-term claim waits for every voter in each phase: a dead voter costs each phase its call timeout")
+	}
+	if spec.Yield == nil {
+		t.Fatal("a lease-term claim outbids a rival claimant at once")
+	}
+	for i := 0; i < 50; i++ {
+		lower := spec.Yield(0, corrosion.Ballot{Round: 1, Coordinator: "node-1"})
+		higher := spec.Yield(0, corrosion.Ballot{Round: 2, Coordinator: "node-5"})
+		if higher < leaseClaimYieldBase || higher >= 2*leaseClaimYieldBase {
+			t.Fatalf("yield to a higher-sorting rival %s, want [%s, %s)", higher, leaseClaimYieldBase, 2*leaseClaimYieldBase)
+		}
+		if lower < 2*leaseClaimYieldBase || lower >= 3*leaseClaimYieldBase {
+			t.Fatalf("yield to the rival the tie rule prefers %s, want [%s, %s)", lower, 2*leaseClaimYieldBase, 3*leaseClaimYieldBase)
+		}
+	}
+}

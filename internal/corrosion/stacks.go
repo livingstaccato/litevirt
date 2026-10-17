@@ -120,31 +120,32 @@ func MarkStackDeleting(ctx context.Context, c *Client, name string, keepDisks bo
 
 // StackTeardownDeletesDisks reports whether the teardown of st (a stack in
 // "deleting") may delete its VMs' disks: only when the teardown's own record
-// says it does not keep them. No record, a record of another teardown (its
-// stamp is not st's updated_at), one this build cannot read, or a read that
-// fails: the disks are kept — the operator may have asked to keep them, and
-// a kept disk can still be removed by hand where a deleted one is gone. why
-// says which.
-func StackTeardownDeletesDisks(ctx context.Context, c *Client, st StackRecord) (deletes bool, why string) {
+// says it does not keep them. proven is whether the record speaks for this
+// teardown (it deletes them, or the operator asked to keep them). No record,
+// a record of another teardown (its stamp is not st's updated_at), one this
+// build cannot read, or a read that fails is not proven: the disks are kept —
+// the operator may have asked to keep them, and a kept disk can still be
+// removed by hand where a deleted one is gone. why says why they are kept.
+func StackTeardownDeletesDisks(ctx context.Context, c *Client, st StackRecord) (deletes, proven bool, why string) {
 	rows, err := c.Query(ctx,
 		`SELECT value FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`, stackTeardownKeyPrefix+st.Name)
 	switch {
 	case err != nil:
-		return false, "the teardown's disk choice cannot be read: " + err.Error()
+		return false, false, "the teardown's disk choice cannot be read: " + err.Error()
 	case len(rows) == 0:
-		return false, "the teardown recorded no disk choice (begun by an older build, or before cluster_policies could be written)"
+		return false, false, "the teardown recorded no disk choice (begun by an older build, or before cluster_policies could be written)"
 	}
 	var rec stackTeardownRecord
 	if err := json.Unmarshal([]byte(rows[0].String("value")), &rec); err != nil || rec.Teardown == "" {
-		return false, "the teardown's disk choice cannot be read"
+		return false, false, "the teardown's disk choice cannot be read"
 	}
 	if rec.Teardown != st.UpdatedAt {
-		return false, "the disk choice recorded is another teardown's"
+		return false, false, "the disk choice recorded is another teardown's (the stack was re-stamped since)"
 	}
 	if rec.KeepDisks {
-		return false, "the teardown keeps disks (keep_disks)"
+		return false, true, "the teardown keeps disks (keep_disks)"
 	}
-	return true, ""
+	return true, true, ""
 }
 
 // ListDeletingStacks returns stacks that are mid-deletion (state = 'deleting').

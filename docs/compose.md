@@ -163,7 +163,8 @@ background retry) counts as deleted. The stack is then left in state
 a teardown up no sooner than a minute after it began, leaving a `compose down`
 still running to finish, and keeps the VMs' disks when the teardown was asked
 to keep them, `keep_disks` on the REST or gRPC stack delete, or was begun by a
-host that did not record whether it was), and
+host that did not record whether it was; disks kept for that last reason are
+named by `disk_leftover`), and
 the `stack.delete` audit entry has result
 `error` and names what was not removed. While any of the stack's VMs or
 containers is left, none of its networks is deprovisioned: a deleted network

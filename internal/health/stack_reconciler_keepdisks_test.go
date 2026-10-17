@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,4 +80,32 @@ func TestStackReconciler_KeepsDisksItCannotProveMayGo(t *testing.T) {
 			t.Fatalf("VM deletes = %+v, want one that keeps the disks", c.vmReqs)
 		}
 	})
+}
+
+// Disks kept for want of proof are named where kept disks are (disk_leftover,
+// through the cleaner), not only logged; disks the operator asked to keep,
+// and a teardown that deletes them, name nothing (re-review m-A).
+//
+// Mutation: never name them — red.
+func TestStackReconciler_NamesTheDisksItKeptForWantOfProof(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		keepDisks, gate bool
+		named           bool
+	}{
+		{"no record", false, false, true},
+		{"operator kept them", true, true, false},
+		{"deleted", false, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, r, c := keepDisksStack(t, tc.keepDisks, tc.gate)
+			r.ReconcileOnce(context.Background())
+			if got := len(c.namedKept) == 1; got != tc.named {
+				t.Fatalf("named = %v, want named %v", c.namedKept, tc.named)
+			}
+			if tc.named && !strings.Contains(c.namedKept[0], "app-web: the teardown recorded no disk choice") {
+				t.Errorf("named %q, want app-web with the reason", c.namedKept[0])
+			}
+		})
+	}
 }

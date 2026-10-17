@@ -23,6 +23,8 @@ func (c *unreadableStackCleaner) DeleteContainerForStackCleanup(context.Context,
 	return &emptypb.Empty{}, nil
 }
 func (c *unreadableStackCleaner) RemoveLBForStack(context.Context, string, []corrosion.VMRecord) {}
+func (c *unreadableStackCleaner) NameStackTeardownKeptDisks(context.Context, string, corrosion.VMRecord, string) {
+}
 func (c *unreadableStackCleaner) DeprovisionNetworkByName(_ context.Context, name string) error {
 	c.deprovisioned = append(c.deprovisioned, name)
 	return nil

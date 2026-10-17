@@ -12,6 +12,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,17 +41,27 @@ func downHB(t *testing.T, client pb.LiteVirtClient, keepDisks bool) []*pb.Delete
 	}
 }
 
-// Mutation: drop KeepDisks from the reconciler's delete — the keep-disks
+// The "unproven" case is a teardown that recorded no disk choice
+// (cluster_policies not writable yet): the reconciler keeps the disks and
+// names them by disk_leftover (re-review m-A).
+//
+// Mutations: drop KeepDisks from the reconciler's delete — the keep-disks
 // case loses its disks, red. Always keep — the plain case keeps them, red.
+// Never name the disks kept for want of proof — the unproven case, red.
 func TestFleet_ComposeDown_TheReconcilerKeepsTheDisksAKeepDisksTeardownKept(t *testing.T) {
-	for _, keepDisks := range []bool{true, false} {
-		name := "plain"
-		if keepDisks {
-			name = "keep-disks"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		keepDisks, gate bool
+		kept, named     bool
+	}{
+		{"keep-disks", true, true, true, false},
+		{"plain", false, true, false, false},
+		{"unproven", false, false, true, true},
+	} {
+		keepDisks := tc.keepDisks
+		t.Run(tc.name, func(t *testing.T) {
 			_, node, client := newComposeFailNode(t)
-			node.DB.SetClusterPolicyGate(func() bool { return true })
+			node.DB.SetClusterPolicyGate(func() bool { return tc.gate })
 			ctx := context.Background()
 			disks := deployOneVM(t, ctx, node, client)
 
@@ -86,10 +97,28 @@ func TestFleet_ComposeDown_TheReconcilerKeepsTheDisksAKeepDisksTeardownKept(t *t
 			for _, p := range disks {
 				_, err := os.Stat(p)
 				switch {
-				case keepDisks && err != nil:
-					t.Errorf("disk %s of a keep_disks teardown was deleted by the reconciler: %v", p, err)
-				case !keepDisks && err == nil:
+				case tc.kept && err != nil:
+					t.Errorf("disk %s was deleted by the reconciler (%s teardown): %v", p, tc.name, err)
+				case !tc.kept && err == nil:
 					t.Errorf("disk %s of a plain teardown was kept", p)
+				}
+			}
+
+			// Named by disk_leftover on the reconciler's host, or not at all.
+			node.Server.JudgeKeptDisksForTest(ctx)
+			row, found, err := corrosion.GetHealthCondition(ctx, node.DB, "vm_delete", "disk_leftover", "host", node.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			open := found && row.Lifecycle != corrosion.ConditionResolved
+			if open != tc.named {
+				t.Fatalf("disk_leftover open = %v, want %v: %+v", open, tc.named, row)
+			}
+			if tc.named {
+				for _, p := range disks {
+					if !strings.Contains(row.Evidence, p) || !strings.Contains(row.Evidence, `stack \"hb\"`) {
+						t.Errorf("disk_leftover evidence does not name %s with stack hb: %s", p, row.Evidence)
+					}
 				}
 			}
 		})

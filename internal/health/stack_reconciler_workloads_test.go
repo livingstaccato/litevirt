@@ -18,6 +18,7 @@ type failingStackCleaner struct {
 	failVM, failCT bool
 	deprovisioned  []string
 	ctDeleted      []string
+	namedKept      []string // NameStackTeardownKeptDisks: "<vm>: <why>"
 }
 
 func (c *failingStackCleaner) DeleteVMForStackCleanup(context.Context, *pb.DeleteVMRequest) (*emptypb.Empty, error) {
@@ -34,6 +35,9 @@ func (c *failingStackCleaner) DeleteContainerForStackCleanup(_ context.Context, 
 	return &emptypb.Empty{}, nil
 }
 func (c *failingStackCleaner) RemoveLBForStack(context.Context, string, []corrosion.VMRecord) {}
+func (c *failingStackCleaner) NameStackTeardownKeptDisks(_ context.Context, _ string, vm corrosion.VMRecord, why string) {
+	c.namedKept = append(c.namedKept, vm.Name+": "+why)
+}
 func (c *failingStackCleaner) DeprovisionNetworkByName(_ context.Context, name string) error {
 	c.deprovisioned = append(c.deprovisioned, name)
 	return nil

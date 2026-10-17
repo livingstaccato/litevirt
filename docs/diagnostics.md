@@ -2608,6 +2608,11 @@ reason. The VM gets a `vm.disk_kept` event and an audit entry. The host the
 delete ran on records it in `<data_dir>/kept-disks.json` and raises
 `disk_leftover` (evaluator `vm_delete`, subject `host/<host>`, warning), whose
 evidence gives each path, its host, the VM and disk, when, and the reason.
+The stack reconciler records there too, on its own host, the disks of a stack
+member it deleted while keeping them because it could not prove the teardown
+let them go (the teardown recorded no disk choice, or another teardown's); the
+reason names the stack. Unless that stack delete asked to keep disks, they are
+leftovers.
 litevirt removes none of them: check that nothing uses each one (another VM's
 disk, a process holding it open), then remove it by hand. A file on that host
 is forgotten once it is gone; a disk is not named while another VM's disk

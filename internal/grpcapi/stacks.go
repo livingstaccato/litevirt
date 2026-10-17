@@ -1195,7 +1195,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 
 	// Mark stack as "deleting" first — this is durable and survives crashes.
 	// The background StackReconciler will pick up stacks stuck in this state,
-	// and keeps the disks when this teardown does (--keep-disks): the choice
+	// and keeps the disks when this teardown does (keep_disks): the choice
 	// is recorded with the state, in the same write.
 	if err := corrosion.MarkStackDeleting(ctx, s.db, req.Name, req.KeepDisks, s.hostName); err != nil {
 		return status.Errorf(codes.Internal, "set stack state: %v", err)
@@ -1777,6 +1777,32 @@ func (s *Server) DeleteVMForStackCleanup(ctx context.Context, req *pb.DeleteVMRe
 	authCtx := context.WithValue(ctx, ctxKeyRole, "admin")
 	authCtx = context.WithValue(authCtx, ctxKeyUsername, "system:stack-reconciler")
 	return s.DeleteVM(authCtx, req)
+}
+
+// NameStackTeardownKeptDisks names, by disk_leftover on this host, the disks
+// of vm, a stack member the stack reconciler deleted keeping its disks because
+// it could not prove the teardown let them go (why): no disk choice recorded,
+// another teardown's, or one it cannot read. Disks a delete keeps by their
+// own record (delete_with_vm=false) are not named here.
+func (s *Server) NameStackTeardownKeptDisks(ctx context.Context, stack string, vm corrosion.VMRecord, why string) {
+	disks, err := corrosion.VMIncarnationDisks(ctx, s.db, vm.Name, vm.CreatedAt)
+	if err != nil {
+		slog.Warn("stack-reconciler: the disks it kept could not be read, so they are not named",
+			"stack", stack, "vm", vm.Name, "reason", why, "error", err)
+		return
+	}
+	var kept []KeptDisk
+	for _, d := range disks {
+		if !d.DeleteWithVM || d.Path == "" {
+			continue
+		}
+		kept = append(kept, KeptDisk{Path: d.Path, Disk: d.DiskName, Host: d.HostName,
+			Reason: fmt.Sprintf("the stack reconciler finished stack %q's teardown and kept this disk, as it could not prove "+
+				"the teardown let it go: %s. Remove it by hand unless the stack delete asked to keep disks", stack, why)})
+	}
+	authCtx := context.WithValue(ctx, ctxKeyRole, "admin")
+	authCtx = context.WithValue(authCtx, ctxKeyUsername, "system:stack-reconciler")
+	s.recordKeptDisks(authCtx, vm.Name, kept)
 }
 
 // DeleteContainerForStackCleanup is DeleteVMForStackCleanup for a stack's

@@ -30,6 +30,10 @@ type StackCleaner interface {
 	DeleteVMForStackCleanup(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error)
 	// DeleteContainerForStackCleanup is the same for a stack's container.
 	DeleteContainerForStackCleanup(ctx context.Context, req *pb.DeleteContainerRequest) (*emptypb.Empty, error)
+	// NameStackTeardownKeptDisks names the disks of vm, a member the
+	// reconciler deleted keeping its disks because it could not prove the
+	// teardown let them go, by disk_leftover with why.
+	NameStackTeardownKeptDisks(ctx context.Context, stack string, vm corrosion.VMRecord, why string)
 	RemoveLBForStack(ctx context.Context, stackName string, vms []corrosion.VMRecord)
 	DeprovisionNetworkByName(ctx context.Context, name string) error
 	ExternalNetworkNames(ctx context.Context, stackName string) (map[string]bool, error)
@@ -138,7 +142,7 @@ func (r *StackReconciler) reconcile(ctx context.Context) {
 }
 
 // teardownInFlight reports a stack whose teardown began less than
-// stackTeardownGrace ago: its updated_at (stamped by SetStackState when
+// stackTeardownGrace ago: its updated_at (stamped by MarkStackDeleting when
 // DeleteStack marked it "deleting") is younger than the grace by this host's
 // clock, and this host has not yet seen that same stamp for the grace.
 //
@@ -175,7 +179,7 @@ func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.St
 	// The disks go only when the teardown recorded that they may: one begun
 	// with keep_disks keeps them, and so does one whose choice this host
 	// cannot read (StackTeardownDeletesDisks).
-	deletesDisks, keepWhy := corrosion.StackTeardownDeletesDisks(ctx, r.db, stack)
+	deletesDisks, proven, keepWhy := corrosion.StackTeardownDeletesDisks(ctx, r.db, stack)
 	if len(vms) > 0 && !deletesDisks {
 		slog.Info("stack-reconciler: deleting the stack's VMs, keeping their disks",
 			"stack", stack.Name, "reason", keepWhy)
@@ -193,6 +197,10 @@ func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.St
 			slog.Warn("stack-reconciler: delete VM failed, will retry",
 				"stack", stack.Name, "vm", vm.Name, "error", err)
 			remainingVMs++
+		} else if !proven {
+			// Kept for want of proof, not by the operator's choice: named
+			// where kept disks are, so they do not pile up unseen.
+			r.cleaner.NameStackTeardownKeptDisks(ctx, stack.Name, vm, keepWhy)
 		}
 	}
 

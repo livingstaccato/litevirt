@@ -150,7 +150,7 @@ lv host fence-confirm <host>              # Confirm an already-powered-off manua
 lv host rescan [host]                     # Rescan PCI devices
 lv host devices <host> [--type gpu|network|nvme|infiniband]   # List PCI devices
 lv host superseded-disks <host>           # List the disk copies a failover set aside, and the
-                                          #   .kept- files a create made (marked kept, list only)
+                                          #   .kept- disks and seeds a create made (marked kept, list only)
   [--purge] [--older-than 72h]            #   remove the ones neither retained nor held (admin)
   [--remove <copy>]...                    #   remove exactly these copies, even retained (admin)
   [--restore <copy>]                      #   put a copy back as its stopped VM's disk (admin)
@@ -236,8 +236,9 @@ after the rename puts each file back at the path the kept VM recorded, unless
 a file is there by then. The host that holds
 kept disks lists them in `<data_dir>/kept-disks/<vm>.json` until a create
 renames them. `lv host superseded-disks <host>` lists each `.kept-` file there
-as `kept`; `--purge`, `--remove` and `--restore` never take one, so only an
-operator removes it, by hand. A `--keep-disks` delete whose
+as `kept`, the seeds in `<data_dir>/cloudinit` among them (a seed can hold
+user-data passwords); `--purge`, `--remove` and `--restore` never take one, so
+only an operator removes it, by hand. A `--keep-disks` delete whose
 `<data_dir>/kept-disks/<vm>.json` cannot be read is refused, naming the file,
 with nothing deleted: repair or remove that file, then retry.
 

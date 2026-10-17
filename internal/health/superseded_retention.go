@@ -233,23 +233,28 @@ func listSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir stri
 
 // KeptCopy is a disk an earlier VM of a name was deleted with and its delete
 // kept, which a create of the name moved off its path (<path>.kept-<time>,
-// SetAsideBeforeCreate). Nothing on the host removes it, and no purge,
-// removal or restore of set-aside copies takes it.
+// SetAsideBeforeCreate), or that VM's cloud-init seed, moved the same way
+// (Seed). Nothing on the host removes it, and no purge, removal or restore
+// of set-aside copies takes it.
 type KeptCopy struct {
 	Path      string    // the file
 	DiskPath  string    // the path it was moved from
 	MovedAt   time.Time // when
 	SizeBytes int64
+	Seed      bool // a cloud-init seed (it can hold user-data), not a disk
 }
 
 // ListKeptDisks lists the .kept- files on this host, where set-aside copies
-// can be (supersededDirs), oldest first. Storage that does not answer fails
-// the listing, as it fails ListSupersededDisks.
+// can be (supersededDirs), and the .kept- seeds in <data_dir>/cloudinit,
+// oldest first. Storage that does not answer fails the listing, as it fails
+// ListSupersededDisks.
 func ListKeptDisks(ctx context.Context, db *corrosion.Client, dataDir string) ([]KeptCopy, error) {
 	dirs, err := supersededDirs(ctx, db, dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("list disk directories: %w", err)
 	}
+	seedDir := filepath.Join(dataDir, "cloudinit")
+	dirs = append(dirs, seedDir)
 	glob := supersededGlob
 	var out []KeptCopy
 	for _, dir := range dirs {
@@ -271,7 +276,7 @@ func ListKeptDisks(ctx context.Context, db *corrosion.Client, dataDir string) ([
 			if err != nil || !fi.Mode().IsRegular() {
 				continue
 			}
-			out = append(out, KeptCopy{Path: p, DiskPath: p[:i], MovedAt: at, SizeBytes: fi.Size()})
+			out = append(out, KeptCopy{Path: p, DiskPath: p[:i], MovedAt: at, SizeBytes: fi.Size(), Seed: dir == seedDir})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {

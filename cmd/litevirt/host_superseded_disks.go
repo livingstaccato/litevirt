@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -141,6 +142,8 @@ func printSupersededDisks(out io.Writer, resp *pb.SupersededDisksResponse, purge
 		}
 		st := "kept"
 		switch {
+		case d.Kept && strings.Contains(d.Held, "cloud-init seed"):
+			st = "kept: a cloud-init seed a deleted VM was kept with, which can hold user-data; never purged, removed or restored here (only an operator removes it, by hand)"
 		case d.Kept:
 			st = "kept: a disk a deleted VM was kept with; never purged, removed or restored here (only an operator removes it, by hand)"
 		case d.Removed:

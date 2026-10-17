@@ -1579,8 +1579,9 @@ rebuilt disk the only copy of its data from before the failover was deleted.
 
 To see the copies on a host, with the VM each came from, when it was set aside
 and whether it is retained or held, run `lv host superseded-disks <host>`.
-It also lists each `.kept-` file there, marked `kept`, which none of the
-options below takes. The options need the admin role and are audited:
+It also lists each `.kept-` file there, marked `kept`, and each `.kept-`
+cloud-init seed in `<data_dir>/cloudinit`, which can hold user-data; none of
+the options below takes one. The options need the admin role and are audited:
 
 - `--purge` removes every copy that is neither retained nor held, whatever its
   age; `--older-than <duration>` narrows it (`host.superseded_disks.purge`).

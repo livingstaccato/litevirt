@@ -240,6 +240,7 @@ func TestRecordExistingTrunkVLANsLoop_KeepsGoingUntilTheRelease(t *testing.T) {
 		defer close(done)
 		s.recordExistingTrunkVLANsLoop(ctx, tick)
 	}()
+	defer func() { cancel(); <-done }()
 	// step returns once the loop has finished the pass in progress and
 	// started the next.
 	step := func(what string) {
@@ -251,17 +252,17 @@ func TestRecordExistingTrunkVLANsLoop_KeepsGoingUntilTheRelease(t *testing.T) {
 		}
 	}
 	step("the first pass")
-	step("a pass with nothing new")
 	if _, have, _ := corrosion.TrunkVLANsRecorded(ctx, s.db); !have {
 		t.Fatal("the first pass did not say it ran")
 	}
+	step("a pass with nothing new")
 	spec := `{"name":"later","uuid":"u-later","network":[{"name":"core","trunk":[300,301]}]}`
 	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "later", HostName: s.hostName, State: "running", Spec: spec},
 		[]corrosion.InterfaceRecord{{VMName: "later", NetworkName: "core", MAC: "52:54:00:00:00:09"}}, nil); err != nil {
 		t.Fatal(err)
 	}
 	step("the pass after the rollout trunk")
-	step("the pass after the rollout trunk")
+	step("the pass that sees it")
 	if got := networkDef(t, s, "core").AllowedVLANs; !reflect.DeepEqual(got, []int{300, 301}) {
 		t.Fatalf("a trunk created during the rollout was not recorded: %v", got)
 	}

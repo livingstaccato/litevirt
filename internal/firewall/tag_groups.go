@@ -65,6 +65,9 @@ type TagWorkloadHold struct {
 	Kind, Name, Host, FWID string // Host: a container's; "" for a VM
 	// Holders are, for a shared identity, every live workload holding it.
 	Holders []string
+	// RowHost is, for a lost identity, the container host its tags row was
+	// recorded on.
+	RowHost string
 	// NICs are this host's devices of the workload held at drop, sorted.
 	NICs []string
 }
@@ -541,7 +544,9 @@ func (t *tagPass) finish() TagGroupReport {
 	}
 	for _, w := range t.members.IdentityLost {
 		if here(w) {
-			t.report.IdentityLost = append(t.report.IdentityLost, hold(w))
+			h := hold(w)
+			h.RowHost = w.RowHost
+			t.report.IdentityLost = append(t.report.IdentityLost, h)
 		}
 	}
 	if t.holdAll {

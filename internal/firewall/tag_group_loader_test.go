@@ -102,6 +102,12 @@ func (l *tgLab) ctNIC(host, ct, network, mac, veth, ip string, sgs ...string) {
 	}
 }
 
+// proof is a container relocation proof binding token: name moved to dest.
+func (l *tgLab) proof(token, name, dest, status string) {
+	rawRow(l.t, l.db, `INSERT INTO runtime_action_proofs (id, action, target_kind, target_name, dest_host, coordinator, relocation_token, status, created_at, updated_at)
+		VALUES (?, ?, 'container', ?, ?, 'host-a', ?, ?, 't', 't')`, "p-"+token, corrosion.ActionRelocate, name, dest, token, status)
+}
+
 func (l *tgLab) policy(key, value string) {
 	rawRow(l.t, l.db, `INSERT INTO cluster_policies (key, value, set_by, updated_at) VALUES (?, ?, 'test', 't')`, key, value)
 }
@@ -505,7 +511,8 @@ func TestTagGroupLoader_SharedIdentityHoldsEveryNICButAMovePair(t *testing.T) {
 func TestTagGroupLoader_ReportsAnIdentityLostOnItsHost(t *testing.T) {
 	l := newTGLab(t)
 	l.group("web", webGroup)
-	l.ct("host-b", "web", "", "", "")
+	l.ct("host-b", "web", "", "", "tok")
+	l.proof("tok", "web", "host-b", corrosion.ProofCompleted)
 	l.ctNIC("host-b", "web", "prod", "00:16:3e:00:00:01", "veth1", "10.0.0.9")
 	l.tags("ct", tgFWID(7), `{"tags":{"role":"web"},"name":"web","host":"host-a"}`)
 
@@ -564,6 +571,66 @@ func TestTagGroupLoader_ALostIdentityIsHeldLikeUnreadableTags(t *testing.T) {
 	plan, _ = l.load(load)
 	if !heldAtDrop(planNIC(t, plan, "tap2")) {
 		t.Error("with a drop on a tag group, the lost identity's NIC on another network is not held")
+	}
+
+	// tag set or rm gives it an identity: the hold is released.
+	rawRow(t, l.db, `UPDATE vms SET spec = ? WHERE name = 'app-1'`, `{"name":"app-1","firewall_id":"`+tgFWID(9)+`"}`)
+	plan, _ = l.load(load)
+	if heldAtDrop(planNIC(t, plan, "tap1")) || len(plan.TagGroups.IdentityLost) != 0 {
+		t.Errorf("an identity given again does not release the hold: %+v %+v", planNIC(t, plan, "tap1"), plan.TagGroups.IdentityLost)
+	}
+}
+
+// Container names are unique per host only (Track D final fix re-review
+// I-A). A row recorded for a container on host-a does not make an unrelated,
+// untagged container of the same name on host-b lost, nor held; a
+// container with no create spec (an earlier build's, which cannot hold an
+// identity) is never lost or held, even on the row's host. A container that
+// relocation records bind to the row's host — a migrate still in flight
+// that landed without its identity — is held.
+//
+// Mutations: match a container on another host with no relocation record —
+// red; hold a container with no create spec — red; ignore the relocation
+// proof — red.
+func TestTagGroupLoader_ALostIdentityMatchesAContainerOnlyWhereItCouldHaveBeen(t *testing.T) {
+	l := newTGLab(t)
+	l.sg("sg-web", "web-in")
+	l.group("web", `{"match":{"role":"web"},"networks":["prod"],"security_groups":["web-in"]}`)
+	l.clusterRule("c1", "tcp", "22", "tag:web", "drop")
+	// Unrelated: web on host-b, the row was web on host-a.
+	l.ct("host-b", "web", "", "", "")
+	l.ctNIC("host-b", "web", "prod", "00:16:3e:00:00:01", "veth1", "10.0.0.9")
+	l.tags("ct", tgFWID(1), `{"tags":{"role":"web"},"name":"web","host":"host-a"}`)
+	// Legacy: no create spec, on the row's own host.
+	rawRow(t, l.db, `INSERT INTO containers (host_name, name, state, state_detail, relocate_token, create_spec, created_at, updated_at)
+		VALUES ('host-b', 'old', 'running', '', '', '', 't', 't')`)
+	l.ctNIC("host-b", "old", "prod", "00:16:3e:00:00:02", "veth2", "10.0.0.10")
+	l.tags("ct", tgFWID(2), `{"tags":{"role":"web"},"name":"old","host":"host-b"}`)
+	// Moving host-a -> host-b, landed without its identity, its proof still
+	// in progress.
+	l.ct("host-b", "mv", "", "", "tok-mv")
+	l.ctNIC("host-b", "mv", "prod", "00:16:3e:00:00:03", "veth3", "10.0.0.11")
+	l.proof("tok-mv", "mv", "host-b", corrosion.ProofInProgress)
+	l.tags("ct", tgFWID(3), `{"tags":{"role":"web"},"name":"mv","host":"host-a"}`)
+
+	plan, _ := l.load(l.loader("host-b", nil))
+	if n := planNIC(t, plan, "veth1"); heldAtDrop(n) {
+		t.Errorf("an unrelated container of the row's name on another host is held: %+v", n)
+	}
+	if n := planNIC(t, plan, "veth2"); heldAtDrop(n) {
+		t.Errorf("a container with no create spec is held: %+v", n)
+	}
+	if n := planNIC(t, plan, "veth3"); !heldAtDrop(n) {
+		t.Errorf("a relocated container that lost its identity is not held: %+v", n)
+	}
+	var got []string
+	for _, w := range plan.TagGroups.IdentityLost {
+		got = append(got, w.Host+"/"+w.Name)
+	}
+	if !slices.Equal(got, []string{"host-b/mv"}) {
+		t.Errorf("identity lost %v, want only host-b/mv", got)
+	} else if rh := plan.TagGroups.IdentityLost[0].RowHost; rh != "host-a" {
+		t.Errorf("the report names the row recorded on %q, want host-a", rh)
 	}
 }
 

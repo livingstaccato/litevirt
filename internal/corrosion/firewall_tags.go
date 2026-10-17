@@ -288,11 +288,12 @@ func FirewallIDOf(kind, doc string) string { return firewallIDOf(kind, doc) }
 // flight, which leaves no live row for a moment. A timestamp that does not
 // parse keeps the row.
 //
-// A row is kept at any age while its display name matches a live workload of
-// its kind that has no identity (TagGroupMembership.IdentityLost: the loader
-// holds that workload while the row remains), or a workload of its kind with
-// a relocation or move still in flight (a live container marked relocating,
-// or an open relocation, reschedule or promote proof naming it).
+// A row is kept at any age while a live workload lost its identity from it
+// (TagGroupMembership.IdentityLost, matched as the loader matches it: the
+// loader holds that workload while the row remains), or while its display
+// name matches a workload of its kind with a relocation or move still in
+// flight (a live container marked relocating, or an open relocation,
+// reschedule or promote proof naming it).
 func FirewallTagsOrphans(ctx context.Context, c *Client, now time.Time, grace time.Duration) ([]FirewallTagsRecord, error) {
 	rows, err := ListFirewallTagsRows(ctx, c)
 	if err != nil {
@@ -315,9 +316,12 @@ func FirewallTagsOrphans(ctx context.Context, c *Client, now time.Time, grace ti
 		newest time.Time
 		ok     bool
 	}
-	// spared are kind/name of each live workload with no identity, and of
-	// each workload with a move in flight.
+	// spared are kind/name of each workload with a move in flight.
 	spared := map[string]bool{}
+	lost, err := identityLostRows(ctx, c)
+	if err != nil {
+		return nil, err
+	}
 	read := func(kind, q string) (map[string]*holders, error) {
 		rs, err := c.Query(ctx, q)
 		if err != nil {
@@ -328,7 +332,7 @@ func FirewallTagsOrphans(ctx context.Context, c *Client, now time.Time, grace ti
 			id := firewallIDOf(kind, r.String("doc"))
 			if r.String("deleted_at") == "" {
 				_, _, relocating := RelocateRestoreMarker(r.String("state"), r.String("state_detail"))
-				if id == "" || relocating {
+				if relocating {
 					spared[kind+"/"+r.String("name")] = true
 				}
 			}
@@ -387,6 +391,7 @@ func FirewallTagsOrphans(ctx context.Context, c *Client, now time.Time, grace ti
 		h := byKind[r.Kind][r.FWID]
 		switch {
 		case h != nil && h.live:
+		case lost[r.Kind+"/"+r.FWID]:
 		case r.Name != "" && spared[r.Kind+"/"+r.Name]:
 		case h != nil && h.tombstones > 0:
 			if h.ok && now.Sub(h.newest) > grace {

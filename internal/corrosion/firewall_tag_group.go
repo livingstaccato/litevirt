@@ -316,6 +316,9 @@ type TagWorkload struct {
 	On string
 	// Networks are the networks of its live NICs, sorted.
 	Networks []string
+	// RowHost is, in IdentityLost, the container host the orphaned tags row
+	// was recorded on ("" for a VM).
+	RowHost string
 }
 
 // TagGroupMembership is one read of every group's members.
@@ -360,7 +363,10 @@ type tagWorkload struct {
 	tagWorkloadKey
 	fwID string
 	on   string // the host it runs on
-	nics []tagNIC
+	// noSpec: a container row with no create spec (an earlier build's),
+	// which can never hold an identity (ErrFirewallIDNoCreateSpec).
+	noSpec bool
+	nics   []tagNIC
 	// move is a container row's part in a move (containerMove): its state,
 	// state_detail and relocate_token.
 	move containerMove
@@ -372,6 +378,7 @@ type tagsRow struct {
 	tags       map[string]string
 	unreadable bool
 	name       string // the workload's name when the tags were set: display only
+	host       string // a container's host when the tags were set
 }
 
 // ListTagGroupMembers resolves every group on this replica to its members.
@@ -515,42 +522,136 @@ func ListTagGroupMembersKeeping(ctx context.Context, c *Client, kept map[string]
 		}
 		out.Groups = append(out.Groups, v)
 	}
-	out.IdentityLost = identityLost(workloads, tags)
+	moves, err := readArrivals(ctx, c, workloads)
+	if err != nil {
+		return nil, err
+	}
+	out.IdentityLost = identityLost(workloads, tags, moves)
 	return out, nil
 }
 
 // identityLost lists each live workload with no identity whose name a
 // non-empty, readable tags row of its kind names while no live workload holds
 // that row's identity (TagGroupMembership.IdentityLost), FWID the row's.
-func identityLost(workloads []*tagWorkload, tags map[string]tagsRow) []TagWorkload {
+//
+// Container names are unique per host only, so a container matches a row
+// recorded on its own host, or on another host only when relocation records
+// show it arrived from there (arrivals). A container with no create spec can
+// never have held an identity, so it never lost one (Track D final fix
+// re-review I-A).
+func identityLost(workloads []*tagWorkload, tags map[string]tagsRow, moves arrivals) []TagWorkload {
 	held := map[string]bool{}
 	for _, w := range workloads {
 		if w.fwID != "" {
 			held[w.kind+"/"+w.fwID] = true
 		}
 	}
-	orphans := map[string][]string{} // kind/name -> the identities its rows name
+	type orphan struct{ id, host string }
+	orphans := map[string][]orphan{} // kind/name -> the rows naming it
 	for key, row := range tags {
 		if held[key] || row.unreadable || len(row.tags) == 0 || row.name == "" {
 			continue
 		}
 		kind, id, _ := strings.Cut(key, "/")
-		orphans[kind+"/"+row.name] = append(orphans[kind+"/"+row.name], id)
+		orphans[kind+"/"+row.name] = append(orphans[kind+"/"+row.name], orphan{id: id, host: row.host})
 	}
 	var out []TagWorkload
 	for _, w := range workloads {
-		if w.fwID != "" {
+		if w.fwID != "" || (w.kind == TagMemberCT && w.noSpec) {
 			continue
 		}
-		ids := orphans[w.kind+"/"+w.name]
-		slices.Sort(ids)
-		for _, id := range ids {
+		rows := orphans[w.kind+"/"+w.name]
+		sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
+		for _, o := range rows {
+			if w.kind == TagMemberCT && o.host != w.host && !moves.from(w, o.host) {
+				continue
+			}
 			lost := w.public()
-			lost.FWID = id
+			lost.FWID, lost.RowHost = o.id, o.host
 			out = append(out, lost)
 		}
 	}
 	return out
+}
+
+// arrivals are the relocation records that show a live container arrived on
+// its host from another: the proofs bound to the relocate_token it carries,
+// and every relocate-restore marker (on a live row or a tombstone).
+type arrivals struct {
+	proofs  map[string][]relocationProof // by token
+	markers map[string]bool              // source host|name|target host|token
+}
+
+// from reports whether container w arrived on its host from host src: a
+// proof bound to its token moved it, by name, to its host; or src's row of
+// the name carries a relocate-restore marker naming its host and token.
+func (a arrivals) from(w *tagWorkload, src string) bool {
+	tok := w.move.token
+	if tok == "" || src == "" {
+		return false
+	}
+	for _, p := range a.proofs[tok] {
+		if p.targetName == w.name && p.destHost == w.host {
+			return true
+		}
+	}
+	return a.markers[src+"|"+w.name+"|"+w.host+"|"+tok]
+}
+
+// readArrivals reads the relocation records of the live containers with no
+// identity that carry a relocate_token; none when there are none.
+func readArrivals(ctx context.Context, c *Client, workloads []*tagWorkload) (arrivals, error) {
+	out := arrivals{proofs: map[string][]relocationProof{}, markers: map[string]bool{}}
+	tokens := map[string]bool{}
+	for _, w := range workloads {
+		if w.kind == TagMemberCT && w.fwID == "" && w.move.token != "" {
+			tokens[w.move.token] = true
+		}
+	}
+	if len(tokens) == 0 {
+		return out, nil
+	}
+	proofs, err := readRelocationProofs(ctx, c, tokens)
+	if err != nil {
+		return out, err
+	}
+	out.proofs = proofs
+	rows, err := c.Query(ctx, `SELECT host_name, name, COALESCE(state_detail, '') AS state_detail FROM containers
+		WHERE state_detail LIKE ?`, ContainerRelocateRestorePrefix+"%")
+	if err != nil {
+		return out, err
+	}
+	for _, r := range rows {
+		rest := strings.TrimPrefix(r.String("state_detail"), ContainerRelocateRestorePrefix)
+		i := strings.LastIndex(rest, ":")
+		if i < 0 || !tokens[rest[i+1:]] {
+			continue
+		}
+		out.markers[r.String("host_name")+"|"+r.String("name")+"|"+rest[:i]+"|"+rest[i+1:]] = true
+	}
+	return out, nil
+}
+
+// identityLostRows returns the kind/fw_id of every tags row a live workload
+// lost its identity from (identityLost), read on its own.
+func identityLostRows(ctx context.Context, c *Client) (map[string]bool, error) {
+	tags, err := readFirewallTagsRows(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	workloads, err := readTagWorkloads(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	moves, err := readArrivals(ctx, c, workloads)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	for _, w := range identityLost(workloads, tags, moves) {
+		out[w.Kind+"/"+w.FWID] = true
+	}
+	return out, nil
 }
 
 // leaseElement parses a lease's address and checks it lies inside subnet. A
@@ -609,7 +710,7 @@ func readFirewallTagsRows(ctx context.Context, c *Client) (map[string]tagsRow, e
 		// One decoder for every reader (decodeFirewallTags): name and host
 		// are for display only and never matched.
 		rec := decodeFirewallTags(kind, id, r.String("value"), "", "")
-		out[kind+"/"+id] = tagsRow{tags: rec.Tags, unreadable: rec.Unreadable, name: rec.Name}
+		out[kind+"/"+id] = tagsRow{tags: rec.Tags, unreadable: rec.Unreadable, name: rec.Name, host: rec.Host}
 	}
 	return out, nil
 }
@@ -654,6 +755,7 @@ func readTagWorkloads(ctx context.Context, c *Client) ([]*tagWorkload, error) {
 	for _, r := range cts {
 		w := add(tagWorkloadKey{kind: TagMemberCT, host: r.String("host_name"), name: r.String("name")}, firewallIDOf(TagMemberCT, r.String("create_spec")))
 		w.on = w.host
+		w.noSpec = r.String("create_spec") == ""
 		w.move = containerMove{host: w.host, name: w.name, state: r.String("state"),
 			detail: r.String("state_detail"), token: r.String("relocate_token")}
 	}

@@ -3,6 +3,9 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -103,8 +106,10 @@ func tagHoldsText(lead string, holds []firewall.TagWorkloadHold) string {
 }
 
 // identityLostText names each workload whose identity was likely lost, the
-// tags its earlier incarnation's row holds, and the command that sets them
-// again.
+// row it was matched to (for a container, the host that row was recorded
+// on) and its tags, then the commands: tag rm first, which releases the hold
+// and admits the workload to nothing, and tag set with the row's tags, which
+// admits it to the groups they match and fits only the same workload.
 func (s *Server) identityLostText(ctx context.Context, lost []firewall.TagWorkloadHold) string {
 	if len(lost) == 0 {
 		return ""
@@ -115,24 +120,48 @@ func (s *Server) identityLostText(ctx context.Context, lost []firewall.TagWorklo
 			parts = append(parts, fmt.Sprintf("and %d more", len(lost)-conditionListMax))
 			break
 		}
-		lead := strings.ReplaceAll(fwTagWhoText(w.Kind, w.Host, w.Name), "%", "%%") + " has no firewall identity; the row of identity %s, an earlier incarnation of its name, holds"
-		note := s.firewallTagsLeftForID(ctx, w.Kind, w.FWID, w.Name, w.Host, lead)
-		if note == "" {
-			note = fmt.Sprintf("%s has no firewall identity; a row of identity %s names it", fwTagWhoText(w.Kind, w.Host, w.Name), w.FWID)
-		}
-		if len(w.NICs) > 0 {
-			note += " (NICs held at drop here: " + strings.Join(w.NICs, " ") + ")"
-		} else {
-			note += " (no NIC held here)"
-		}
-		parts = append(parts, note)
+		parts = append(parts, s.identityLostNote(ctx, w))
 	}
 	return "workloads that are members of no tag group although a tags row of an earlier incarnation of their name remains " +
 		"(a relocation, a restore or a spec write that did not carry the identity). Their NICs are held at drop on the networks " +
 		"a tag group binds security groups on (all of them while a drop or reject rule names a tag group, or every network while " +
-		"a tag group cannot be read), and the row is kept until the identity is restored. lv firewall tag set on the workload " +
-		"gives it a new identity and releases the hold; lv firewall tag rm does too, leaving it a member of no group: " +
+		"a tag group cannot be read), and the row is kept until the identity is restored. lv firewall tag rm on the workload " +
+		"gives it a new identity with no tags and releases the hold; lv firewall tag set with the row's tags does too, and " +
+		"admits it to the groups they match, so run it only when the workload is the one the row was recorded for: " +
 		strings.Join(parts, "; ")
+}
+
+// identityLostNote is one workload's part of identityLostText.
+func (s *Server) identityLostNote(ctx context.Context, w firewall.TagWorkloadHold) string {
+	who := fwTagWhoText(w.Kind, w.Host, w.Name)
+	recorded := fwTagWhoText(w.Kind, w.RowHost, w.Name)
+	note := fmt.Sprintf("%s has no firewall identity; the row of identity %s was recorded for %s", who, w.FWID, recorded)
+	var pairs, keys []string
+	if rec, ok, err := corrosion.ResolveFirewallTags(ctx, s.db, w.Kind, w.FWID); err != nil {
+		slog.Warn("could not read the firewall tags left behind", "kind", w.Kind, "name", w.Name, "fw_id", w.FWID, "error", err)
+	} else if ok && !rec.Unreadable {
+		for _, k := range slices.Sorted(maps.Keys(rec.Tags)) {
+			if corrosion.ValidFirewallTagWord(k) && corrosion.ValidFirewallTagWord(rec.Tags[k]) {
+				pairs = append(pairs, k+"="+rec.Tags[k])
+				keys = append(keys, k)
+			}
+		}
+	}
+	if len(pairs) > 0 {
+		target := w.Name
+		if w.Kind == corrosion.TagMemberCT {
+			target += " --container --host " + w.Host
+		}
+		note += fmt.Sprintf(" and holds %s. To release the hold (sg.write): lv firewall tag rm %s %s. "+
+			"Only if it is that workload: lv firewall tag set %s %s",
+			strings.Join(pairs, " "), target, keys[0], target, strings.Join(pairs, " "))
+	}
+	if len(w.NICs) > 0 {
+		note += " (NICs held at drop here: " + strings.Join(w.NICs, " ") + ")"
+	} else {
+		note += " (no NIC held here)"
+	}
+	return note
 }
 
 // fwTagWhoText names a workload in a condition.

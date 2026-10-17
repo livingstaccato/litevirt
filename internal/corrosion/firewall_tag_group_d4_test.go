@@ -37,16 +37,44 @@ func TestTagGroupMembers_ReportsTheHostAWorkloadRunsOn(t *testing.T) {
 // M-7; a restore into a freed name). Display only: nothing is matched on the
 // name for membership.
 //
+// A container is matched only on the host the row was recorded on, or on
+// another host when a relocation record binds it there (its relocate_token
+// names a proof into its host, or the source's relocate-restore marker
+// names its host and token): container names are unique per host only. A
+// container with no create spec (an earlier build's) cannot have held an
+// identity, so it never lost one (Track D final fix re-review I-A).
+//
 // Mutations: report a row a live workload still holds — red; report a
-// workload that has an identity — red; match a row of the other kind — red.
+// workload that has an identity — red; match a row of the other kind — red;
+// match a container on another host with no relocation record — red; report
+// a container with no create spec — red; ignore the proof or the marker —
+// red.
 func TestTagGroupMembers_IdentityLostNamesAnOrphanRowOfTheName(t *testing.T) {
 	f := newTagGroupFixture(t)
 	f.group("web", FirewallTagGroupDef{Match: map[string]string{"role": "web"}})
-	// Relocated to node-2 with no identity; its old row names it (written
-	// on node-1).
-	f.ct("node-2", "web", "", "running")
+	// Migrated node-1 -> node-2 with no identity: its relocate_token names
+	// a proof into node-2; its old row names it (written on node-1).
+	mustExec(t, f.c, `INSERT INTO containers (host_name, name, state, relocate_token, create_spec, created_at, updated_at) VALUES ('node-2', 'web', 'running', 'tok-web', '{"template":"debian"}', 't', 't')`)
 	f.ctNIC("node-2", "web", "prod", "00:16:3e:00:00:01", "")
 	f.tags("ct", tgID(1), `{"tags":{"role":"web"},"name":"web","host":"node-1"}`)
+	mustExec(t, f.c, `INSERT INTO runtime_action_proofs (id, action, target_kind, target_name, dest_host, coordinator, relocation_token, status, created_at, updated_at)
+		VALUES ('p1', ?, 'container', 'web', 'node-2', 'node-1', 'tok-web', ?, 't', 't')`, ActionRelocate, ProofCompleted)
+	// Relocated by failover node-5 -> node-6: the source's marker, on its
+	// tombstone, names node-6 and the target's token.
+	mustExec(t, f.c, `INSERT INTO containers (host_name, name, state, state_detail, create_spec, created_at, updated_at, deleted_at) VALUES ('node-5', 'fo', 'relocating', ?, '{}', 't', 't', 't')`,
+		RelocateRestoreDetail("node-6", "tok-fo"))
+	mustExec(t, f.c, `INSERT INTO containers (host_name, name, state, relocate_token, create_spec, created_at, updated_at) VALUES ('node-6', 'fo', 'running', 'tok-fo', '{"template":"debian"}', 't', 't')`)
+	f.tags("ct", tgID(9), `{"tags":{"role":"web"},"name":"fo","host":"node-5"}`)
+	// An unrelated container of the name on another host, with no
+	// relocation record (and one whose token binds nothing): not reported.
+	f.ct("node-7", "api", "", "running")
+	mustExec(t, f.c, `INSERT INTO containers (host_name, name, state, relocate_token, create_spec, created_at, updated_at) VALUES ('node-8', 'api', 'running', 'tok-other', '{"template":"debian"}', 't', 't')`)
+	f.tags("ct", tgID(10), `{"tags":{"role":"web"},"name":"api","host":"node-1"}`)
+	// On the row's own host: reported. With no create spec there: not.
+	f.ct("node-1", "same", "", "running")
+	f.tags("ct", tgID(11), `{"tags":{"role":"web"},"name":"same","host":"node-1"}`)
+	mustExec(t, f.c, `INSERT INTO containers (host_name, name, state, create_spec, created_at, updated_at) VALUES ('node-1', 'legacy', 'running', '', 't', 't')`)
+	f.tags("ct", tgID(12), `{"tags":{"role":"web"},"name":"legacy","host":"node-1"}`)
 	// A VM restored into a freed name.
 	f.vm("app", "", "running")
 	f.tags("vm", tgID(2), `{"tags":{"role":"web"},"name":"app"}`)
@@ -73,7 +101,9 @@ func TestTagGroupMembers_IdentityLostNamesAnOrphanRowOfTheName(t *testing.T) {
 	}
 	want := []string{
 		"vm::app@node-0:" + tgID(2) + ":[]",
+		"ct:node-1:same@node-1:" + tgID(11) + ":[]",
 		"ct:node-2:web@node-2:" + tgID(1) + ":[prod]",
+		"ct:node-6:fo@node-6:" + tgID(9) + ":[]",
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("identity lost %v, want %v", got, want)

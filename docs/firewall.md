@@ -910,9 +910,9 @@ firewall tag; copy one over with `lv firewall tag set`.
   the same identity (the other side of a move, or a copy), which keeps them.
   A row whose identity no live workload holds is cleared by the failover lease holder 24 hours after the last
   record of that identity, so a move or re-create in flight keeps its tags.
-  A row is kept, at any age, while a live workload of its name and kind has
-  no identity, or while a workload of its name and kind has a relocation or
-  move in flight.
+  A row is kept, at any age, while a workload has lost its identity from it
+  (see "Fail closed"), or while a workload of its name and kind has a
+  relocation or move in flight.
 - A container created by a build before the container create spec existed
   (its row has none) cannot be tagged until it is created again.
 - `lv inspect` (on stderr, beside the JSON) and `lv ct inspect` print a
@@ -997,10 +997,13 @@ condition:
 - A workload with no identity, while a row of an earlier incarnation of its
   name remains (a relocation, a restore or a spec write that did not carry
   the identity), is a member of no group, and its NICs are held as for a row
-  that cannot be read (`firewall.tag_group.identity_lost`, critical). The
-  condition names the `lv firewall tag set` command that sets its tags
-  again; that gives it a new identity and releases the hold, and so does
-  `lv firewall tag rm`.
+  that cannot be read (`firewall.tag_group.identity_lost`, critical). A
+  container matches only a row recorded on its own host, or on the host a
+  relocation record shows it came from; a container with no create spec
+  never matches. `lv firewall tag rm`, which the condition names first,
+  gives the workload a new identity with no tags and releases the hold.
+  `lv firewall tag set` with the row's tags does too, and admits it to the
+  groups they match: run it only for the workload the row was recorded for.
 
   These holds are partial. They are the per-NIC chain's own rules, so
   they come after the cluster and host tiers: traffic those tiers accept

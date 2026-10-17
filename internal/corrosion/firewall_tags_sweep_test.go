@@ -86,8 +86,12 @@ func TestFirewallTagsOrphans_SparesALostIdentityAndAMoveInFlight(t *testing.T) {
 	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
 	ancient := now.Add(-30 * 24 * time.Hour).Format(time.RFC3339Nano)
 	row := func(kind, id, name string) {
+		host := ""
+		if kind == TagMemberCT {
+			host = "node-1"
+		}
 		mustExec(t, f.c, `INSERT INTO cluster_policies (key, value, set_by, updated_at) VALUES (?, ?, 'x', ?)`,
-			FirewallTagsKeyPrefix+kind+"/"+id, `{"tags":{"role":"web"},"name":"`+name+`"}`, ancient)
+			FirewallTagsKeyPrefix+kind+"/"+id, `{"tags":{"role":"web"},"name":"`+name+`","host":"`+host+`"}`, ancient)
 	}
 	proof := func(id, kind, name, status, deleted string) {
 		mustExec(t, f.c, `INSERT INTO runtime_action_proofs (id, action, target_kind, target_name, dest_host, coordinator,
@@ -98,7 +102,8 @@ func TestFirewallTagsOrphans_SparesALostIdentityAndAMoveInFlight(t *testing.T) {
 	// lost-vm: a live VM of the name with no identity: kept.
 	f.vm("lost-vm", "", "running")
 	row(TagMemberVM, tgID(1), "lost-vm")
-	// lost-ct: a live container of the name with no identity: kept.
+	// lost-ct: a live container of the name with no identity, on the host
+	// the row was recorded on: kept.
 	f.ct("node-1", "lost-ct", "", "stopped")
 	row(TagMemberCT, tgID(2), "lost-ct")
 	// other-kind: only a VM of the name has no identity; the row is a
@@ -140,6 +145,49 @@ func TestFirewallTagsOrphans_SparesALostIdentityAndAMoveInFlight(t *testing.T) {
 	want := []string{"ct/" + tgID(11), "ct/" + tgID(3), "ct/" + tgID(9), "vm/" + tgID(5)}
 	slices.Sort(want)
 	if !slices.Equal(ids, want) {
+		t.Fatalf("orphans = %v, want %v", ids, want)
+	}
+}
+
+// The no-identity spare matches a container as the loader's hold does
+// (Track D final fix re-review I-A): on the row's own host, or on another
+// host only with a relocation record binding it there, and never a container
+// with no create spec. An unrelated container of the name elsewhere, or a
+// legacy one, leaves the row to the grace.
+//
+// Mutations: spare by name across hosts — red; spare a container with no
+// create spec — red; ignore the relocation proof — red.
+func TestFirewallTagsOrphans_SparesOnlyAContainerThatCouldHaveLostTheIdentity(t *testing.T) {
+	f := newTagGroupFixture(t)
+	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-25 * time.Hour).Format(time.RFC3339Nano)
+	row := func(id, name string) {
+		mustExec(t, f.c, `INSERT INTO cluster_policies (key, value, set_by, updated_at) VALUES (?, ?, 'x', ?)`,
+			FirewallTagsKeyPrefix+TagMemberCT+"/"+id, `{"tags":{"role":"web"},"name":"`+name+`","host":"host-a"}`, old)
+	}
+	// unrelated: an untagged web on host-b, no relocation record: swept.
+	f.ct("host-b", "web", "", "running")
+	row(tgID(1), "web")
+	// legacy: a container on the row's host with no create spec: swept.
+	mustExec(t, f.c, `INSERT INTO containers (host_name, name, state, create_spec, created_at, updated_at) VALUES ('host-a', 'legacy', 'running', '', 't', 't')`)
+	row(tgID(2), "legacy")
+	// moved: migrated host-a -> host-b without its identity, its token bound
+	// by a proof into host-b: kept.
+	mustExec(t, f.c, `INSERT INTO containers (host_name, name, state, relocate_token, create_spec, created_at, updated_at) VALUES ('host-b', 'moved', 'running', 'tok-m', '{"template":"debian"}', 't', 't')`)
+	mustExec(t, f.c, `INSERT INTO runtime_action_proofs (id, action, target_kind, target_name, dest_host, coordinator, relocation_token, status, created_at, updated_at)
+		VALUES ('pm', ?, 'container', 'moved', 'host-b', 'host-a', 'tok-m', ?, 't', 't')`, ActionRelocate, ProofCompleted)
+	row(tgID(3), "moved")
+
+	got, err := FirewallTagsOrphans(f.ctx, f.c, now, 24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, r := range got {
+		ids = append(ids, r.FWID)
+	}
+	slices.Sort(ids)
+	if want := []string{tgID(1), tgID(2)}; !slices.Equal(ids, want) {
 		t.Fatalf("orphans = %v, want %v", ids, want)
 	}
 }

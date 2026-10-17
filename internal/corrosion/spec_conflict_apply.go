@@ -317,8 +317,12 @@ func (r *Replicator) applySpecGeneration(ctx context.Context, tx *sql.Tx, s Stat
 			return asBefore()
 		}
 		changed, err := byGeneration()
-		if err != nil || changed {
+		if err != nil {
 			return err
+		}
+		r.client.noteSpecHoldMaybeOver(tx, local.name)
+		if changed {
+			return nil
 		}
 		return keepClock(ctx, tx, local, clearClock(s))
 	}

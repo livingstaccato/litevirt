@@ -25,7 +25,10 @@ import (
 // An operation counts as finished once either side records a terminal step
 // for it: the row without its barrier is then its completion. Until then its
 // barrier also holds off a longer line of out-of-band edits under the same
-// owner that does not descend from its claim.
+// owner, and the hold is made visible (spec_hold.go). On the paged stream —
+// the production pull — the manifest carries only the parent tier, so the
+// incoming side's terminal steps are not seen until they merge at rank 3 in
+// the same pass: "either side" is then this side, one pass later.
 
 // finishedOperationsInPayload is every operation an anti-entropy payload
 // records a terminal step for.
@@ -72,6 +75,12 @@ func (c *Client) specConflictAE(tx *sql.Tx, table syncTable, row []interface{}, 
 	if !found || local.deleted {
 		return decision, nil
 	}
+	held := false
+	defer func() {
+		if !held {
+			c.noteSpecHoldMaybeOver(tx, incoming.name)
+		}
+	}()
 	inHash, localHash := specContentHash(incoming.spec), specContentHash(local.spec)
 	dropLocal := specEditDrop{vm: incoming.name, host: incoming.host, gen: local.gen, path: pathAE,
 		droppedSpec: local.spec, keptSpec: incoming.spec}
@@ -82,12 +91,16 @@ func (c *Client) specConflictAE(tx *sql.Tx, table syncTable, row []interface{}, 
 	case incoming.generation > local.gen:
 		if decision == mergeAuthorityApplyIncoming || decision == mergeAuthorityApplyIncomingAndSweep {
 			is, known := specAncestorAt(incoming.spec, incoming.generation-local.gen, localHash)
-			// A longer line of edits under the same owner that does not
-			// descend from the local row's claim waits while that claim's
-			// operation runs: its barrier is not overwritten. It applies, and
-			// the claim's version is recorded, once either side records the
-			// operation terminal.
-			if incoming.ownerEpoch == local.epoch && local.activeOp != "" && !(known && is) {
+			// A longer line of edits under the same owner waits while the
+			// local row's operation runs: its barrier is not overwritten. It
+			// applies, and the claim's version is recorded, once either side
+			// records the operation terminal. No lineage exemption: a line
+			// that truly descends from the claim was made after the barrier
+			// was cleared on its origin, by a clear that wrote the terminal
+			// step in the same batch, so it never waits past that step's
+			// arrival — and content alone cannot tell such a line from one
+			// that only happens to repeat the claim's spec.
+			if incoming.ownerEpoch == local.epoch && local.activeOp != "" {
 				done := incoming.finishedOps[local.activeOp]
 				if !done {
 					if done, err = operationFinished(ctx, tx, local.activeOp); err != nil {
@@ -95,6 +108,8 @@ func (c *Client) specConflictAE(tx *sql.Tx, table syncTable, row []interface{}, 
 					}
 				}
 				if !done {
+					held = true
+					c.noteSpecEditHeld(tx, specHold{vm: incoming.name, op: local.activeOp, owner: local.host})
 					return mergeAuthorityKeepLocal, nil
 				}
 			}

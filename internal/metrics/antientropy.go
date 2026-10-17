@@ -27,6 +27,7 @@ type AntiEntropyMetrics struct {
 	identityOrphan       *prometheus.CounterVec
 	digestTables         *prometheus.CounterVec
 	pullRows             *prometheus.CounterVec
+	specEditHeld         prometheus.Counter
 }
 
 // NewAntiEntropyMetrics registers the anti-entropy timing metrics on the default
@@ -61,6 +62,10 @@ func newAntiEntropyMetrics(reg prometheus.Registerer) *AntiEntropyMetrics {
 		rowsSkipped: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "litevirt_antientropy_rows_skipped_total",
 			Help: "Rows skipped by anti-entropy merges (LWW kept local, or malformed).",
+		}),
+		specEditHeld: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "litevirt_spec_edit_held_total",
+			Help: "Lines of VM spec edits this node held off a VM because an operation on it has not finished, counted once per VM and operation (health condition vm.spec_edit_held).",
 		}),
 		mergeRejected: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "litevirt_merge_apply_rejected_total",
@@ -99,7 +104,7 @@ func newAntiEntropyMetrics(reg prometheus.Registerer) *AntiEntropyMetrics {
 			Help: "Distinct unresolved ties this node is CURRENTLY tracking (a gauge — drops to 0 when repaired). Alert on this for 'something is divergent now'; the _total counter is monotonic and would page forever.",
 		}),
 	}
-	reg.MustRegister(m.dumpSeconds, m.digestSeconds, m.mergeSeconds, m.dumpBytes, m.rowsMerged, m.rowsSkipped, m.tieBreaks, m.tieUnresolved, m.tombstoneTies, m.tieUnresolvedCurrent, m.mergeRejected, m.legacyTransformed, m.identityOrphan, m.digestTables, m.pullRows)
+	reg.MustRegister(m.dumpSeconds, m.digestSeconds, m.mergeSeconds, m.dumpBytes, m.rowsMerged, m.rowsSkipped, m.tieBreaks, m.tieUnresolved, m.tombstoneTies, m.tieUnresolvedCurrent, m.mergeRejected, m.legacyTransformed, m.identityOrphan, m.digestTables, m.pullRows, m.specEditHeld)
 	return m
 }
 
@@ -164,6 +169,11 @@ func (m *AntiEntropyMetrics) ObserveTombstoneTie(table string) {
 // ObserveMergeRejected records a replicated row/statement rejected without applying. (Satisfies corrosion.SyncMetrics.)
 func (m *AntiEntropyMetrics) ObserveMergeRejected(table, path, reason string) {
 	m.mergeRejected.WithLabelValues(table, path, reason).Inc()
+}
+
+// ObserveSpecEditHeld counts a line of spec edits held off by a running operation.
+func (m *AntiEntropyMetrics) ObserveSpecEditHeld() {
+	m.specEditHeld.Inc()
 }
 
 // ObserveLegacyTransformed records a prior-release statement normalized by a legacy transformer. (Satisfies corrosion.SyncMetrics.)

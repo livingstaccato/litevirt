@@ -455,6 +455,8 @@ type Client struct {
 	// specDropsSeen is the spec-edit drops already noted (firstSpecDrop).
 	specDropsMu   sync.Mutex
 	specDropsSeen map[string]struct{}
+	// specHolds is the (vm, operation) holds already noted (spec_hold.go).
+	specHolds map[string]struct{}
 	// voterConfigGate, when set and returning true, permits WRITING
 	// voter_configs. Injected via SetVoterConfigGate, wired to the durable
 	// voter_config_v1 latch. Fails CLOSED when unset: that table's shapes

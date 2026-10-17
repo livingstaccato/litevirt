@@ -147,8 +147,13 @@ func specEditDroppedRecord(d specEditDrop) VMEventRecord {
 func (c *Client) recordSpecEditDropped(d specEditDrop) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := InsertVMEvent(ctx, c, specEditDroppedRecord(d)); err != nil {
+	rec := specEditDroppedRecord(d)
+	if err := InsertVMEvent(ctx, c, rec); err != nil {
 		slog.Warn("replication: could not record a dropped spec edit", "vm", d.vm, "generation", d.gen, "error", err)
+		// Not noted after all: the next pass that drops it records it again.
+		c.specDropsMu.Lock()
+		delete(c.specDropsSeen, rec.ID)
+		c.specDropsMu.Unlock()
 	}
 }
 

@@ -9,7 +9,8 @@ package corrosion
 // host), the pool records' (pool_records.go) and relay health's
 // (relay_health.go: one relay_demoted/<host> row per host the failover lease
 // holder has demoted from relay duty, and one relay_hold/<host> row per
-// operator hold), all written through
+// operator hold) and the load balancers' VRRP transport's (vrrp_transport.go:
+// vrrp_transport and vrrp_transport_latched), all written through
 // clusterPolicyUpsertSQL.
 // failover_scope says whether a host is fenced and its workloads recovered by a
 // quorum of the whole cluster (the default, and what every cluster did before

@@ -1242,6 +1242,19 @@ observed → confirmed → resolved lifecycle:
 - leadership changes and restarts preserve counts and confirmed state;
 - resolved conditions stay readable for 30 days (`lv health --resolved`),
   then are tombstoned;
+- a condition whose subject is gone resolves on the next reconciler pass of
+  any node whose replica has caught up: a VM or container that was deleted
+  (a tombstoned row and no live one; a name with no row at all is not
+  proof), or a host removed with `lv host rm`, whether the subject names the
+  host itself, a pool on it (`<pool>@<host>`) or a workload on it
+  (`<name>@<host>`). These outlive their subject and stay: the dual-run
+  detector's (it resolves its own), `vm_orphan_runtime` /
+  `ct_orphan_runtime`, the certificate and audit conditions,
+  `vm_disk_stranded`, `vm_failover_held`, `vm_start_cancelled`,
+  `ct_rootfs_stranded`, `reservation_stale`, the `iscsi_lun_hold_*` pair,
+  `ceph_image_leftover`, `ceph_trash_leftover`,
+  and the inputs failover recovery reads (`partition_paused`,
+  `partition_pause_failed`, `partition_one_way`, evaluator `failover`);
 - remove the cause, and the evaluator proves the resolution. For a
   condition it can no longer prove, an admin can resolve it by hand:
   `lv health resolve <code> <kind>/<id> --reason "..."`, with the code and
@@ -1359,6 +1372,31 @@ evidence names each such member and the command that clears it:
 `lv host rm --dead <host>` for one gone for good, `lv cluster voter rm <host>`
 for one that should stay a host but stop voting, and `lv cluster voter rm`
 then `lv cluster voter add` for an abstaining one.
+
+### A lease with no claim majority (`ha.lease.claim_no_majority`)
+
+Evaluator `lease_term_claim`, subject `cluster/<lease key>`, severity warning.
+Raised by a node that has seen a lease with no live holder and could not take
+it over for want of a voter majority for longer than one of the lease's TTLs,
+so nobody holds the lease (docs/operating-model.md, "Two nodes taking a lease
+over at once record one term"). That covers a node that has lost the voter
+majority and stands down from the lease, a quorum high-water read that no
+quorum answered, and a claim no majority of the voter generation could
+decide. Resolved once the lease is no longer contested: a
+claim for it is decided, a term is recorded without a claim, or a node sees a
+live holder renewing it. During a split, a node that cannot see the holder may
+raise it again, and the row then alternates between observed and resolved
+without reaching confirmed. `litevirt_lease_term_claim_no_majority_total{lease}`
+counts each such poll. A claim lost to another claimant of the same term, with
+a majority there to decide it, is not counted. The evidence names the reason,
+and for a claim the refusing voters.
+Voter changes are decided by the same majority, so `lv cluster voter rm`,
+`add` and `reset` may not be able to run while this is raised. Repair a voter
+while `ha.voter.unavailable` names it, before it is needed. Once this is
+raised, the exits are restoring the lost voter, or fencing proof-grade every
+member that cannot vote, abstaining ones included, and naming each in
+`lv cluster voter force-reconfigure --lost <host>[,<host>...]`. `lv cluster voter reset`
+returns lease takeovers to the two-holder race.
 
 ### A forced voter reconfiguration (`ha.voter.forced`)
 
@@ -1711,6 +1749,26 @@ on` keeps it as the operator's; a stack deployed later that asks for
 default-deny takes it over. The condition resolves on the next pass after
 either.
 
+### Tag-group conditions (`firewall.tag_group.*`)
+
+Raised per host by its firewall reconciler, and resolved on the next pass that
+no longer finds the cause. Each names the rules, groups or workloads involved
+(at most ten, then a count) and the command that fixes them. docs/firewall.md,
+"Tag groups", says what each one holds back.
+
+| Condition | Severity | Raised when |
+|---|---|---|
+| `firewall.tag_group.missing` | critical | a rule has named a tag group this host's replica does not hold for a minute: an accept matches nothing, a drop or reject loses its address match |
+| `firewall.tag_group.unreadable` | critical | a group's row cannot be read here, or its set cannot be declared (`<x>_v6` beside `<x>`) |
+| `firewall.tag_group.tags_unreadable` | critical | a workload's tags row cannot be read: its NICs are held at drop |
+| `firewall.tag_group.identity_shared` | critical | two live workloads hold one firewall identity (a copy): every NIC of each is held at drop |
+| `firewall.tag_group.identity_lost` | critical | a workload has no firewall identity while a tags row of an earlier incarnation of its name remains: its NICs are held at drop as for an unreadable tags row; the evidence gives the `lv firewall tag set` command |
+
+`litevirt_firewall_tag_group_members{group}` is a gauge of each group's members
+in this host's view, 0 for a group this host cannot read. Hosts can differ for
+up to one replication lag plus the 30 second reconcile tick;
+`lv firewall tag-group ls --members` shows the members.
+
 ### Deferred out-of-band stop sync after a restart or rejoin
 
 When a VM's domain is found shut off out of band (a crash, an external
@@ -1894,6 +1952,8 @@ holder writes.
   the destination's own runtime reports the workload running. The host
   stopped its copy (a VM is destroyed, which keeps its definition and disks)
   and wrote a `partition.settle` audit row. The leftover cleanup then handles the shut-off domain as usual.
+  The host resolves `vm_settled` on the pass that finds no domain of that
+  name defined there, or the VM's row naming it again.
 - `vm_settle_declined` (`<name>@<host>`, warning): the host runs a copy of a
   VM whose row names another host, and settle declined to stop it for two
   passes in a row. The evidence carries the `reason` (the clause of the proof

@@ -23,6 +23,8 @@ type receiverAuditOptions struct {
 	beforeFreeze   func(*claimTestVoter, []*claimTestVoter)
 	recovery       bool
 	legacy         bool
+	legacyLease    bool
+	legacyAccepted func(ClaimVoterState)
 	explicitSeal   bool
 	uniqueRequests bool
 }
@@ -81,6 +83,10 @@ func receiverAuditFixtureOptions(t *testing.T, n int, options receiverAuditOptio
 		}
 		k := workloadKey()
 		value := workloadValue("original-legacy", "a", "ghost")
+		if options.legacyLease {
+			k = LeaseTermClaimKey("future_lease", 7)
+			value = ClaimValue{LeaseTerm: &LeaseTermValue{Key: k.TargetName, Term: k.OwnerEpoch, Holder: "a"}}
+		}
 		accepted, err := a.c.ClaimAccept(ctx, k, testBallot(2, "a"), value, 1, a.signer, unreachable)
 		if err != nil || !accepted.Accepted {
 			t.Fatal(err)
@@ -101,6 +107,9 @@ func receiverAuditFixtureOptions(t *testing.T, n int, options receiverAuditOptio
 		original, found, err := a.c.ClaimState(ctx, k)
 		if err != nil || !found {
 			t.Fatal(err)
+		}
+		if options.legacyAccepted != nil {
+			options.legacyAccepted(original)
 		}
 		states = append(states, original)
 		promise, found, err := c.c.ClaimState(ctx, k)

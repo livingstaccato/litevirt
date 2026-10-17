@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"hash/fnv"
 	"net/netip"
 	"os"
@@ -37,5 +38,27 @@ func TestMain(m *testing.M) {
 		v := h.Sum32()
 		return []netip.Addr{netip.AddrFrom4([4]byte{198, 18 + byte(v>>16)&1, byte(v >> 8), byte(v)})}, nil
 	})
-	os.Exit(m.Run())
+	before := packageDirEntries()
+	code := m.Run()
+	// No test may write relative to the working directory (the package dir):
+	// concurrent test processes share it, so one process's promote marker is
+	// another's to delete. A server without a dataDir does exactly that.
+	if code == 0 {
+		for name := range packageDirEntries() {
+			if !before[name] {
+				fmt.Fprintf(os.Stderr, "FAIL: tests left %q in the package directory; a test server has no per-test dataDir\n", name)
+				code = 1
+			}
+		}
+	}
+	os.Exit(code)
+}
+
+func packageDirEntries() map[string]bool {
+	out := map[string]bool{}
+	ents, _ := os.ReadDir(".")
+	for _, e := range ents {
+		out[e.Name()] = true
+	}
+	return out
 }

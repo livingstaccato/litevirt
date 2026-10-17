@@ -283,6 +283,9 @@ type Plan struct {
 	IPSets         []IPSet
 	NICs           []NICBinding
 
+	// TagGroups is what the loader could not render as the tag groups ask.
+	TagGroups TagGroupReport
+
 	// NAT (postrouting masquerade + SNAT) and HostIsolation (input drops) are
 	// per-host infra rules folded in from the old out-of-band paths. They render
 	// into their own hook chains in the same table, so the atomic replace keeps
@@ -409,6 +412,12 @@ func Render(p Plan) (string, error) {
 // does the inet forward chain trust its per-NIC decisions (judgedMark,
 // deferMark). nic is "" when the plan needs no bridge table.
 func RenderParts(p Plan, nicActive bool) (inet, nic string, err error) {
+	return renderParts(p, nicActive, len(p.NICs) > 0 && nicActive && p.nicMode() != NICModeGuardsOnly)
+}
+
+// guestVRRPActive describes the marking table actually installed, independently
+// of whether its positive allow decisions are safe to trust for this plan.
+func renderParts(p Plan, nicActive, guestVRRPActive bool) (inet, nic string, err error) {
 	if err := validate(p); err != nil {
 		return "", "", err
 	}
@@ -482,6 +491,9 @@ func RenderParts(p Plan, nicActive bool) (inet, nic string, err error) {
 	// no NAT / isolation renders byte-identically to before this feature (and so
 	// removing the last rule drops the whole chain on the next atomic replace).
 	renderNAT(&b, p.NAT)
+	if guestVRRPActive {
+		renderGuestVRRPInput(&b)
+	}
 	renderHostIsolation(&b, p.HostIsolation)
 	renderIsolatedForward(&b, p.IsolatedBridges)
 	b.WriteString("}\n")
@@ -599,6 +611,18 @@ func isolationMarks(sortedBridges []string) map[string]uint32 {
 		out[br] = v << 16
 	}
 	return out
+}
+
+// renderGuestVRRPInput drops, at the input hook, VRRP the bridge table marked
+// as a guest's (guestVRRPMark): what a guest sent the host itself. Rendered
+// while the bridge table that sets the mark is in force. Its own chain, so it
+// holds whatever the host-isolation input chain accepts (that chain's VRRP
+// exception is for the host's LB peers on the uplink).
+func renderGuestVRRPInput(b *strings.Builder) {
+	fmt.Fprintf(b, "    chain guest_vrrp {\n")
+	fmt.Fprintf(b, "        type filter hook input priority filter; policy accept;\n")
+	fmt.Fprintf(b, "        meta mark & %#x == %#x meta l4proto 112 drop\n", guestVRRPMark, guestVRRPMark)
+	fmt.Fprintf(b, "    }\n\n")
 }
 
 // renderHostIsolation emits a single `input` filter chain that drops guest→host

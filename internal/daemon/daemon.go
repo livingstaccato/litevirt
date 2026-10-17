@@ -1107,6 +1107,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.mintClearance.Store(svc)
 	svc.SetGateRefusedObserver(gateMetrics.Refused)
 	svc.SetLeaseBarrierIncompleteObserver(gateMetrics.LeaseBarrierIncomplete)
+	svc.SetLeaseClaimNoMajorityObserver(gateMetrics.LeaseTermClaimNoMajority)
 	svc.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	// SR-IOV VF-pool policy: which PFs litevirt may adopt for VF creation, the pool
 	// cap, and the degraded gauge. Validate the allowlist against live hardware now,
@@ -1217,6 +1218,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// reconciler's, which share d.virt) applies svc.ConsolePasswordActive —
 	// this flag AND the console_password_v1 latch. NewServer wired the hook.
 	svc.SetConsolePassword(d.cfg.Enforcement.ConsolePassword)
+	// vrrp_unicast_v1: advertised only with enforcement.vrrp_unicast on; an
+	// LB renders unicast VRRP only with this flag AND the durable latch.
+	svc.SetVRRPUnicast(d.cfg.Enforcement.VRRPUnicast)
 	svc.SetAllowUnencryptedStorageMigration(d.cfg.Migration.AllowUnencryptedStorage)
 	svc.SetMigrationNetwork(d.cfg.Migration.Network)
 	svc.SetMigrationAddress(d.cfg.Migration.Address)
@@ -1512,6 +1516,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	bridgeCT := firewall.BridgeConntrackAvailable(ctx, true)
 	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
 		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs,
+			OnTagGroupMembers:    fwMetrics.SetTagGroupMembers,
 			OnDuplicateAddresses: firewall.NewDuplicateAddressReporter(d.db, d.cfg.HostName).Report,
 			BridgeConntrack:      func() bool { return bridgeCT }, Arming: fwArming})
 	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
@@ -1572,7 +1577,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// recorded (one written through a daemon that predates the gate), on the
 	// failover lease holder, so a later rollback below the release still
 	// quarantines.
-	go svc.RunReleaseUseSweep(ctx)
+	dbWorkers := newDBWorkerCoordinator(ctx, svc)
+	dbWorkers.startSweep()
 	// Autostart onboot VMs once, in startup_order (#10). Runs only for VMs not
 	// already running in libvirt, so a daemon restart (qemu kept alive by
 	// KillMode=process) is a no-op while a host reboot brings them up in order;
@@ -1600,7 +1606,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Periodically re-apply this host's LBs whose keepalived is dead — recovers a sole VIP
 	// holder after a restart/upgrade (the one-shot boot ReconcileLBs above is refused during
 	// warmup / while 'upgrading') and a self-demoted VIP on quorum heal. Only touches dead LBs.
-	go svc.RunLBReconciler(ctx, 30*time.Second)
+	dbWorkers.startLB(30 * time.Second)
 
 	// Split-brain Phase 2: minority VIP self-demotion. On sustained local quorum
 	// loss, an isolated LB host drops its own VIPs (stop keepalived + remove the
@@ -2159,9 +2165,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	grpcStopped := make(chan struct{})
 	reexecRequested := false
 	uninstalled := false
-	go func() {
-		select {
-		case <-ctx.Done():
+	go dbWorkers.shutdown(ctx, svc.ReExecCh, svc.ShutdownCh, func(reason daemonStopReason) {
+		switch reason {
+		case daemonContextStop:
 			stopBootCheck()
 			<-bootDone
 			slog.Info("shutting down")
@@ -2173,13 +2179,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// over. (Re-exec already runs under 'upgrading'; uninstall is removing
 			// the host, so neither needs this.)
 			d.markRestarting()
-		case <-svc.ReExecCh:
+		case daemonReExecStop:
 			slog.Info("re-exec requested after upgrade")
 			reexecRequested = true
-		case <-svc.ShutdownCh:
+		case daemonUninstallStop:
 			slog.Info("shutdown requested by uninstall")
 			uninstalled = true
 		}
+	}, func() {
 		// Bounded whatever the RPCs in flight do: one stuck on storage that
 		// does not answer must not hold the restart (stopGRPC). stopServing
 		// closes grpcStopped as soon as that stop returns or is given up on.
@@ -2193,6 +2200,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// replicator still runs, and name every VM whose record is lost.
 			svc.FinishDrainRecords(grpcapi.DrainRecordStopWait)
 		})
+	}, func() {
 		if d.fwReconciler != nil {
 			d.fwReconciler.Stop()
 		}
@@ -2214,7 +2222,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.db.Close()
 		d.virt.Close()
 		close(shutdownDone)
-	}()
+	})
 
 	serveErrs := make(chan error, 1)
 	go func() { serveErrs <- d.grpcSrv.Serve(lis) }()
@@ -3822,6 +3830,21 @@ func (d *Daemon) wireLeaseMintClearance() {
 			return false, "daemon starting: the lease-term quorum read is not wired yet"
 		}
 		return svc.LeaseMintClearance(ctx, req)
+	})
+	// A lease seen held — a renewal, a mint, a peer's live lease — resolves a
+	// no-majority stall the server raised for it.
+	d.db.SetLeaseLiveObserver(func(ctx context.Context, key string) {
+		if svc := d.mintClearance.Load(); svc != nil {
+			svc.NoteLeaseLive(ctx, key)
+		}
+	})
+	// A lease poll that stood down for want of the voter majority, over a
+	// lease with no live holder, is a stalled takeover like a claim with no
+	// majority.
+	d.db.SetLeaseNoMajorityObserver(func(ctx context.Context, ev corrosion.LeaseNoMajority) {
+		if svc := d.mintClearance.Load(); svc != nil {
+			svc.NoteLeaseNoMajority(ctx, ev)
+		}
 	})
 }
 

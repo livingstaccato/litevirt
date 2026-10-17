@@ -27,13 +27,37 @@ func TestHostStateToPB_NeverMasqueradesAsActive(t *testing.T) {
 		{"suspect", pb.HostState_HOST_SUSPECT},
 		{"offline", pb.HostState_HOST_OFFLINE},
 		{"joining", pb.HostState_HOST_JOINING},           // admitted, daemon not started: not offline
-		{"fenced", pb.HostState_HOST_OFFLINE},            // fenced ⇒ down, not active
-		{"upgrading", pb.HostState_HOST_DRAINING},        // transient, not steady-active
+		{"fenced", pb.HostState_HOST_FENCED},             // fenced ⇒ down, not active
+		{"upgrading", pb.HostState_HOST_UPGRADING},       // transient, not steady-active
 		{"some-future-state", pb.HostState_HOST_OFFLINE}, // fail safe: unknown ≠ active
 	}
 	for _, c := range cases {
 		if got := hostStateToPB(c.in); got != c.want {
 			t.Errorf("hostStateToPB(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// TestHostStateToPB_NamesTheRealState: `lv host ls` prints the enum's name,
+// so each stored state must map to the value named after it. An upgrading
+// host printed HOST_DRAINING and a fenced one HOST_OFFLINE, which sent
+// operators after a drain nobody started and a host that was only fenced.
+//
+// Mutation: map "upgrading" back to HOST_DRAINING, or "fenced" back to
+// HOST_OFFLINE — this goes red.
+func TestHostStateToPB_NamesTheRealState(t *testing.T) {
+	for stored, want := range map[string]string{
+		"active":      "HOST_ACTIVE",
+		"draining":    "HOST_DRAINING",
+		"maintenance": "HOST_MAINTENANCE",
+		"suspect":     "HOST_SUSPECT",
+		"offline":     "HOST_OFFLINE",
+		"joining":     "HOST_JOINING",
+		"upgrading":   "HOST_UPGRADING",
+		"fenced":      "HOST_FENCED",
+	} {
+		if got := hostStateToPB(stored).String(); got != want {
+			t.Errorf("host state %q prints as %s, want %s", stored, got, want)
 		}
 	}
 }

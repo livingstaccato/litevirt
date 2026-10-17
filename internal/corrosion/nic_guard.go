@@ -853,8 +853,14 @@ func TrunkVLANsRecorded(ctx context.Context, c *Client) (map[string][]int, bool,
 }
 
 // SetClusterPolicy writes one cluster_policies key (behind the gate), through
-// the table's one upsert.
+// the table's one upsert. It refuses a firewall-tags or tag-group key
+// (ErrReservedClusterPolicyKey): those rows have their own writers, which
+// check the sg.write authority and the grammar (firewall_tags.go,
+// firewall_tag_group.go).
 func SetClusterPolicy(ctx context.Context, c *Client, key, value, setBy string) error {
+	if err := refuseReservedPolicyKey(key); err != nil {
+		return err
+	}
 	if !c.MayWriteClusterPolicy() {
 		return ErrClusterPolicyGateClosed
 	}

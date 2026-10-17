@@ -1506,6 +1506,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		CPUActual: int(spec.Cpu),
 		MemActual: int(spec.MemoryMib),
 		Project:   project, // tenancy label
+		// A re-create keeps the firewall identity of the row its own delete
+		// tombstoned; any other create stores none, whatever its spec says.
+		FirewallCarry: replacedFirewallCarry(ctx, spec.Name),
 	}
 
 	// FENCE, immediately before the durable write: if project-quota authority moved
@@ -2937,6 +2940,11 @@ func deleteLocalOnly(ctx context.Context) bool {
 }
 
 func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
+	owner, ok := s.deleteWork.begin()
+	if !ok {
+		return nil, status.Error(codes.Unavailable, "DeleteVM admission stopped")
+	}
+	defer owner.finish()
 	// A plain delete — not a rebuild's or recreate's teardown, not a peer's
 	// forward or probe of one — ends the VM's claim to its iSCSI LUNs'
 	// contents: once it succeeds, it is recorded on each LUN, which voids a
@@ -2944,6 +2952,18 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// the entry host, which knows what the delete is for.
 	var luns []string
 	var createdAt string
+	// A plain delete ends the VM's firewall identity, so its tags row is
+	// cleared once the delete succeeds (spec §4.3) — by the entry host only.
+	// Never for a rebuild's, rolling recreate's or inline recreate's delete
+	// (it carries a deleted-VM sink of either kind, D2b review I-4): the VM
+	// they re-create keeps the identity, and with it the tags. Never on the
+	// owner a delete was forwarded to, nor on a peer's probe.
+	var fwID string
+	if !deleteLocalOnly(ctx) && !hasDeletedVMSink(ctx) && !s.forwardedByEntry(ctx) {
+		if vm, err := corrosion.GetVM(ctx, s.db, req.Name); err == nil && vm != nil {
+			fwID = corrosion.FirewallIDOf(corrosion.TagMemberVM, vm.Spec)
+		}
+	}
 	if !deleteLocalOnly(ctx) && !s.isRemotePeer(ctx) && !isRecreateDelete(ctx) {
 		if vm, err := corrosion.GetVM(ctx, s.db, req.Name); err == nil && vm != nil {
 			createdAt = vm.CreatedAt
@@ -2956,7 +2976,7 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			}
 		}
 	}
-	out, err := s.deleteVM(ctx, req)
+	out, err := s.deleteVM(ctx, req, owner)
 	var noAnswer probeNoAnswer
 	if err != nil && deleteLocalOnly(ctx) && status.Code(err) != codes.NotFound && !errors.As(err, &noAnswer) {
 		// A probe that found the domain here and refused its delete: the
@@ -2967,6 +2987,7 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	if err == nil {
 		// A deleted VM's partial-recovery marker goes with it (review N5).
 		s.clearPromotedPartial(ctx, req.Name)
+		s.clearDeletedFirewallTags(ctx, corrosion.TagMemberVM, "", req.Name, fwID)
 	}
 	if err == nil && len(luns) > 0 && !s.lunPlainDeleteRecordable(ctx) &&
 		s.ReleaseFeatureAvailable(capabilities.FeatureISCSILUNClaim) {
@@ -3007,7 +3028,7 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	return out, err
 }
 
-func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
+func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *deleteVMParent) (*emptypb.Empty, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
@@ -3072,7 +3093,9 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)
 		}
 		defer closePeer()
-		proxyCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		// The entry clears the firewall tags of a plain delete itself; the
+		// owner must not (entryForwardCtx).
+		proxyCtx, cancel := context.WithTimeout(entryForwardCtx(ctx), 2*time.Minute)
 		defer cancel()
 		// An owner that predates DeleteVMRequest.force ignores it, and would
 		// destroy a running VM without the stop hooks or the operator-stop
@@ -3634,7 +3657,14 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	s.startNetworkWork(func() { s.refreshLBForStack(context.Background(), vm.StackName) })
 
 	if len(leftovers.hosts) > 0 {
-		go s.cleanupDeletedVMLeftovers(context.WithoutCancel(ctx), leftovers)
+		done, ok := owner.retainChild()
+		if !ok {
+			panic("DeleteVM child outlived its admitted parent")
+		}
+		go func() {
+			defer done()
+			s.cleanupDeletedVMLeftovers(context.WithoutCancel(ctx), leftovers)
+		}()
 	}
 
 	return &emptypb.Empty{}, nil
@@ -4624,7 +4654,9 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	if deleted != nil {
 		rctx = s.withReplacedLUNs(withReplacedVM(rctx, deleted), deleted)
 	} else {
-		rctx = s.withReplacedLUNs(withReplacedVM(rctx, vm), vm)
+		// No row was tombstoned here: another delete ended the incarnation,
+		// and with it its firewall identity.
+		rctx = withoutReplacedFirewallID(s.withReplacedLUNs(withReplacedVM(rctx, vm), vm), req.Name)
 	}
 	var out *pb.VM
 	if placed {
@@ -4709,7 +4741,12 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 				"cannot reach host %s that owns %q for cutover: %v", nextVM.HostName, nextName, err)
 		}
 		defer conn.Close()
-		return client.CutoverVM(ctx, req)
+		var hdr metadata.MD
+		out, err := client.CutoverVM(ctx, req, grpc.Header(&hdr))
+		if left := hdr.Get(firewallTagsLeftMD); err == nil && len(left) == 1 {
+			_ = grpc.SetHeader(ctx, metadata.Pairs(firewallTagsLeftMD, left[0]))
+		}
+		return out, err
 	}
 
 	// Resource pre-check: during the cutover overlap window, both the old and
@@ -4740,6 +4777,13 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// cutover retryable. It used to be the other way round, which is what made
 	// the rename's UNIQUE-constraint failure destroy the VM it was replacing.
 	oldVM, _ = corrosion.GetVM(ctx, s.db, req.VmName)
+	// The replaced VM keeps its firewall identity, and its tags stay with it
+	// (T-8): the name goes to a VM with an identity of its own. Read now,
+	// while its row is intact, to say so once the cutover is done.
+	var replacedFWID string
+	if oldVM != nil {
+		replacedFWID = corrosion.FirewallIDOf(corrosion.TagMemberVM, oldVM.Spec)
+	}
 	var replacedDisks []corrosion.DiskRecord
 	// An earlier attempt may have tombstoned the original and then failed the
 	// re-key. GetVM hides a tombstone, so without this the retry would read
@@ -4947,6 +4991,11 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 				"phases will be retried)", err)
 	}
 
+	if note := s.firewallTagsLeftForID(ctx, corrosion.TagMemberVM, replacedFWID, req.VmName, "",
+		"the replaced VM "+req.VmName+"'s firewall tags (fw_id %s) stay with it and do not follow the cutover to the VM now named "+req.VmName); note != "" {
+		slog.Info("cutover: the replaced VM's firewall tags stay with it", "vm", req.VmName, "fw_id", replacedFWID)
+		_ = grpc.SetHeader(ctx, metadata.Pairs(firewallTagsLeftMD, note))
+	}
 	slog.Info("cutover complete", "vm", req.VmName, "replaced_from", nextName)
 	s.recordVMEvent(ctx, req.VmName, "vm.cutover", "ok", "from="+nextName)
 	return s.vmToProto(ctx, req.VmName)
@@ -6009,18 +6058,25 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// Build network configs from the VM's live NICs (the vm_nics/vm_interfaces
 	// overlay): a NIC hot-attached or detached on a hardware_v2 cluster is
 	// recorded in vm_nics alone.
-	ifaces, err := liveVMInterfaces(ctx, s.db, req.Name)
+	nicRows, err := corrosion.MergedVMNICs(ctx, s.db, req.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read NICs for %q: %v", req.Name, err)
 	}
+	ifaces := nicInterfaceRecords(nicRows)
+	rowModels, reattached, err := corrosion.NICModelSources(ctx, s.db, req.Name, nicRows, compose.SpecNICModelsByMAC(spec))
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read NIC models for %q: %v", req.Name, err)
+	}
+	nicModels := compose.NewNICModels(spec, rowModels, reattached)
 	var netConfigs []lv.NetworkConfig
-	for _, iface := range ifaces {
+	for _, iface := range nicRows {
 		bridge := resolveBridge(ctx, s.db, iface.NetworkName)
 		rate := compose.NICRate(spec, iface.Ordinal, iface.NetworkName)
+		model := nicModels.Model(iface.MAC, iface.NetworkName, iface.Ordinal, iface.Model)
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
 				Direct:      strings.TrimPrefix(bridge, "direct:"),
-				Model:       "virtio",
+				Model:       model,
 				MAC:         iface.MAC,
 				SpecOrdinal: iface.Ordinal + 1,
 				RateMBps:    rate,
@@ -6029,7 +6085,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		}
 		netConfigs = append(netConfigs, lv.NetworkConfig{
 			Bridge:      bridge,
-			Model:       "virtio",
+			Model:       model,
 			MAC:         iface.MAC,
 			SpecOrdinal: iface.Ordinal + 1,
 			RateMBps:    rate,
@@ -6101,16 +6157,17 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// up after the define; a patched one keeps the ones it had.
 	regenerated := domXML == ""
 	if domXML == "" {
-		var hostdevs []lv.HostdevConfig
-		for _, addr := range liveDevs {
-			hostdevs = append(hostdevs, lv.HostdevConfig{Address: addr})
+		priorXML, derr := s.virt.DumpXMLInactive(req.Name)
+		if derr != nil && !domainAbsent(derr) {
+			slog.Warn("UpdateVM: the current definition could not be read; regenerating without what only it holds",
+				"vm", req.Name, "error", derr)
 		}
+		hostdevs := ownedHostdevConfigs(liveDevs, priorXML)
 		// Regenerate domain XML from the shared builder (MinMemoryMiB/MaxMemoryMiB +
 		// Hostdevs are populated here — the fields the old inline redefine builder
 		// dropped, collapsing the balloon ceiling and detaching passthrough).
 		vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, hostdevs)
 		// The seed and installer CD-ROMs are in neither the spec nor vm_disks.
-		priorXML, _ := s.virt.DumpXMLInactive(req.Name)
 		s.keepCDROMs(&vmCfg, req.Name, spec.Uuid, priorXML)
 		usb, uerr := s.resolveUSBHostdevs(ctx, spec)
 		if uerr != nil {

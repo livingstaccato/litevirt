@@ -1681,25 +1681,27 @@ func (s *Server) hostAllocatedResources(ctx context.Context, hostName string) (c
 }
 
 // hostStateToPB maps a stored hosts.state string to the wire enum for display.
-// Critically it must never report a non-active host as HOST_ACTIVE: a fenced
-// (forcibly isolated after failover) or upgrading host shown as ACTIVE would
-// hide a dead/transitioning node from operators. There is no HOST_FENCED /
-// HOST_UPGRADING enum yet (would need a proto bump), so fenced maps to the
-// honest "unavailable" state OFFLINE and upgrading to the transitional DRAINING.
-// The default fails safe to OFFLINE so an unknown/future state can't masquerade
-// as healthy.
+// Each state maps to the value named after it, since `lv host ls` prints that
+// name. Critically it must never report a non-active host as HOST_ACTIVE: a
+// fenced (forcibly isolated after failover) or upgrading host shown as ACTIVE
+// would hide a dead/transitioning node from operators. The default fails safe
+// to OFFLINE so an unknown/future state can't masquerade as healthy.
 func hostStateToPB(s string) pb.HostState {
 	switch s {
 	case "active":
 		return pb.HostState_HOST_ACTIVE
-	case "draining", "upgrading":
+	case "draining":
 		return pb.HostState_HOST_DRAINING
+	case "upgrading":
+		return pb.HostState_HOST_UPGRADING
 	case "maintenance":
 		return pb.HostState_HOST_MAINTENANCE
 	case "suspect":
 		return pb.HostState_HOST_SUSPECT
-	case "offline", "fenced":
+	case "offline":
 		return pb.HostState_HOST_OFFLINE
+	case "fenced":
+		return pb.HostState_HOST_FENCED
 	case corrosion.HostStateJoining:
 		// Admitted by `lv host add`, its daemon not yet started. Not OFFLINE:
 		// nothing has failed, and the coordinator never fences it.

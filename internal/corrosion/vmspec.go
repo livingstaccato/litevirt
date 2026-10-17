@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 )
 
@@ -34,15 +35,35 @@ var ErrSpecMutateContention = errors.New("corrosion: MutateDesiredSpec exceeded 
 // newGen is the VM's spec_generation after the call (the bumped value, or the
 // unchanged value for a no-op / deferral) — thread it into a later
 // UpdateObservedActuals so the observation records against the spec it applied to.
+//
+// The new spec keeps the firewall identity the current spec holds, whatever fn
+// returns (keepFirewallID): a spec writer can neither set nor drop it.
 func MutateDesiredSpec(ctx context.Context, c *Client, name string, fn func(oldSpec string) (string, error)) (applied bool, newGen int64, err error) {
+	return mutateDesiredSpec(ctx, c, name, fn, func(old string) (string, error) {
+		return firewallIDOf(TagMemberVM, old), nil
+	})
+}
+
+// mutateDesiredSpec is MutateDesiredSpec storing the firewall identity keepFor
+// returns for the spec it read. Only MutateDesiredSpec (the current identity)
+// and MintFirewallID call it.
+func mutateDesiredSpec(ctx context.Context, c *Client, name string, fn func(oldSpec string) (string, error),
+	keepFor func(oldSpec string) (string, error), tagOwners ...FirewallTagWorkload) (applied bool, newGen int64, err error) {
+	var incarnation, owner string
+	var epoch int64
 	for attempt := 0; attempt < specMutateMaxRetries; attempt++ {
 		rows, qerr := c.Query(ctx,
-			`SELECT spec, spec_generation, active_operation_id FROM vms WHERE name = ? AND deleted_at IS NULL`, name)
+			`SELECT spec, spec_generation, active_operation_id, created_at, host_name, vm_owner_epoch FROM vms WHERE name = ? AND deleted_at IS NULL`, name)
 		if qerr != nil {
 			return false, 0, qerr
 		}
 		if len(rows) == 0 {
 			return false, 0, nil // no such VM — caller treats as not-applied
+		}
+		if attempt == 0 {
+			incarnation, owner, epoch = rows[0].String("created_at"), rows[0].String("host_name"), rows[0].Int64("vm_owner_epoch")
+		} else if rows[0].String("created_at") != incarnation || rows[0].String("host_name") != owner || rows[0].Int64("vm_owner_epoch") != epoch {
+			return false, rows[0].Int64("spec_generation"), nil
 		}
 		oldSpec := rows[0].String("spec")
 		specGen := rows[0].Int64("spec_generation")
@@ -53,20 +74,50 @@ func MutateDesiredSpec(ctx context.Context, c *Client, name string, fn func(oldS
 		if ferr != nil {
 			return false, specGen, ferr
 		}
-		if newSpec == oldSpec {
-			return true, specGen, nil // no-op: MUST NOT bump the generation
+		keep, kerr := keepFor(oldSpec)
+		if kerr != nil {
+			return false, specGen, kerr
 		}
-		// CAS: apply only if the generation is still specGen AND no operation has
-		// since claimed the barrier. A miss means a concurrent writer moved the row;
-		// re-read and retry (bounded).
-		n, uerr := c.ExecuteRowsStrict(ctx,
-			`UPDATE vms SET spec = ?, spec_generation = spec_generation + 1, updated_at = ?
+		if newSpec, ferr = keepFirewallID(TagMemberVM, newSpec, keep); ferr != nil {
+			return false, specGen, ferr
+		}
+		// Bind the sampled row inside the write transaction. Generation alone
+		// repeats after delete/recreate; a no-op must not report a stale read as
+		// successful either. Retrying stays within this invocation's incarnation
+		// and owner, while ordinary concurrent metadata writes may be recomputed.
+		guard := func(tx *sql.Tx) (bool, error) {
+			if err := checkFirewallTagWorkloads(ctx, &LocalTx{tx: tx}, tagOwners); err != nil {
+				return false, err
+			}
+			var currentSpec, active, created, host string
+			var generation, ownerEpoch int64
+			err := tx.QueryRowContext(ctx,
+				`SELECT spec, spec_generation, active_operation_id, created_at, host_name, vm_owner_epoch FROM vms WHERE name = ? AND deleted_at IS NULL`, name).
+				Scan(&currentSpec, &generation, &active, &created, &host, &ownerEpoch)
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+			if err != nil {
+				return false, err
+			}
+			return created == incarnation && host == owner && ownerEpoch == epoch &&
+				generation == specGen && active == "" && currentSpec == oldSpec, nil
+		}
+		var stmts []Statement
+		if newSpec != oldSpec {
+			// Keep the existing full-PK replicated statement and its receiver rules.
+			stmts = []Statement{{SQL: `UPDATE vms SET spec = ?, spec_generation = spec_generation + 1, updated_at = ?
 			 WHERE name = ? AND spec_generation = ? AND active_operation_id = '' AND deleted_at IS NULL`,
-			newSpec, c.NowTS(), name, specGen)
+				Params: []interface{}{newSpec, c.NowTS(), name, specGen}}}
+		}
+		applied, uerr := c.ExecuteBatchGuarded(ctx, guard, stmts)
 		if uerr != nil {
 			return false, specGen, uerr
 		}
-		if n > 0 {
+		if applied {
+			if newSpec == oldSpec {
+				return true, specGen, nil
+			}
 			return true, specGen + 1, nil
 		}
 	}

@@ -393,7 +393,7 @@ func leaseServer(t *testing.T) *Server {
 	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
-	return &Server{db: db, hostName: "lease-host"}
+	return &Server{dataDir: t.TempDir(), db: db, hostName: "lease-host"}
 }
 
 // seedLease writes the `netbox` leader_election row verbatim, so a test can

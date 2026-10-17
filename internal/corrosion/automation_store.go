@@ -43,7 +43,7 @@ func validateAutomationKey(k ClaimKey) error {
 }
 
 func automationDecision(v ClaimValue) (contract.Decision, error) {
-	if v.Automation == nil || v.Proof != nil || v.Config != nil || v.LUN != nil || v.SourceHost != "" {
+	if v.Automation == nil || v.Proof != nil || v.Config != nil || v.LUN != nil || v.LeaseTerm != nil || v.SourceHost != "" {
 		return contract.Decision{}, fmt.Errorf("invalid automation alternative")
 	}
 	d, err := contract.DecodeDecision(v.Automation.Envelope)

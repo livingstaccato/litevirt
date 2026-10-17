@@ -205,7 +205,7 @@ func TestProto_NetworkAutomationWireUnion(t *testing.T) {
 		m    proto.Message
 		n    protoreflect.FieldNumber
 		name protoreflect.Name
-	}{{&pb.AnnounceMigratedGuestRequest{}, 1, "vm_name"}, {&pb.EnsureDisksRequest{}, 10, "want_network_devices"}, {&pb.EnsureDisksResponse{}, 9, "network_devices"}, {&pb.EnsureDisksRequest{}, 11, "network_arrival_id"}, {&pb.CleanupMigrationArtifactsRequest{}, 7, "network_arrival_id"}, {&pb.AutomationClaimValue{}, 1, "envelope"}, {&pb.RecoveryClaimValue{}, 15, "automation"}, {&pb.LUNAllocationValue{}, 8, "run_host"}, {&pb.LUNAllocationValue{}, 9, "kept"}, {&pb.LUNAllocationValue{}, 10, "project"}, {&pb.LUNAllocationValue{}, 11, "replaced_created_at"}} {
+	}{{&pb.AnnounceMigratedGuestRequest{}, 1, "vm_name"}, {&pb.EnsureDisksRequest{}, 10, "want_network_devices"}, {&pb.EnsureDisksResponse{}, 9, "network_devices"}, {&pb.EnsureDisksRequest{}, 11, "network_arrival_id"}, {&pb.CleanupMigrationArtifactsRequest{}, 7, "network_arrival_id"}, {&pb.AutomationClaimValue{}, 1, "envelope"}, {&pb.RecoveryClaimValue{}, 16, "automation"}, {&pb.LUNAllocationValue{}, 8, "run_host"}, {&pb.LUNAllocationValue{}, 9, "kept"}, {&pb.LUNAllocationValue{}, 10, "project"}, {&pb.LUNAllocationValue{}, 11, "replaced_created_at"}} {
 		fd := f.m.ProtoReflect().Descriptor().Fields().ByNumber(f.n)
 		if fd == nil || fd.Name() != f.name {
 			t.Fatalf("descriptor %T %d", f.m, f.n)

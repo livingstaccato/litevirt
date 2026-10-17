@@ -22,6 +22,10 @@ import (
 // without libvirt + an image store. Tests that need those plumbing
 // pieces inject them via the existing Set*() methods.
 type TestServerOpts struct {
+	// DBWorkerEvent observes actual loop boundaries; configure before startup.
+	DBWorkerEvent     func(context.Context, string, string)
+	ReleaseSweepEvery time.Duration
+
 	HostName string
 	DataDir  string
 	PKIDir   string
@@ -78,19 +82,23 @@ func NewServerForTests(opts TestServerOpts) *Server {
 	imgs := image.NewStore(opts.DataDir)
 	_ = imgs.Init()
 	s := &Server{
-		hostName:            opts.HostName,
-		dataDir:             opts.DataDir,
-		pkiDir:              opts.PKIDir,
-		db:                  opts.DB,
-		virt:                opts.Virt,
-		images:              imgs,
-		events:              events.NewBus(),
-		vmLocks:             make(map[string]*sync.Mutex),
-		ReExecCh:            make(chan struct{}, 1),
-		ShutdownCh:          make(chan struct{}, 1),
-		fetchBinarySem:      make(chan struct{}, fetchBinaryMaxConcurrent),
-		pushBackupSem:       make(chan struct{}, pushBackupMaxConcurrent),
-		automationExportSem: make(chan struct{}, automationExportConcurrent),
+		testDBWorkerEvent:     opts.DBWorkerEvent,
+		testReleaseSweepEvery: opts.ReleaseSweepEvery,
+		hostName:              opts.HostName,
+		dataDir:               opts.DataDir,
+		pkiDir:                opts.PKIDir,
+		db:                    opts.DB,
+		virt:                  opts.Virt,
+		images:                imgs,
+		events:                events.NewBus(),
+		vmLocks:               make(map[string]*sync.Mutex),
+		ReExecCh:              make(chan struct{}, 1),
+		ShutdownCh:            make(chan struct{}, 1),
+		fetchBinarySem:        make(chan struct{}, fetchBinaryMaxConcurrent),
+		pushBackupSem:         make(chan struct{}, pushBackupMaxConcurrent),
+		automationExportSem:   make(chan struct{}, automationExportConcurrent),
+		lbKick:                make(chan struct{}, 1),
+		vrrpAskKick:           make(chan struct{}, 1),
 	}
 	s.wireCertificateVerifier()
 	s.wireReplicationReleaseGates()
@@ -235,4 +243,34 @@ func (s *Server) SetImagePushUnmarkedForTest(unmarked bool) {
 // that both checked before either published each run it.
 func (s *Server) AutoPullFromPeerForTest(ctx context.Context, name, source string) error {
 	return s.pullImageFromPeer(ctx, name, source)
+}
+
+// SetClearFirewallTagsForTest replaces every firewall-tags clear this server
+// makes (a delete's, a copied identity's) with fn, so a fleet scenario can
+// make the clear fail; nil restores ClearFirewallTags.
+func (s *Server) SetClearFirewallTagsForTest(fn func(ctx context.Context, kind, fwID string) error) {
+	if fn == nil {
+		s.testClearFirewallTagsLive.Store(nil)
+		return
+	}
+	s.testClearFirewallTagsLive.Store(&fn)
+}
+
+// SweepReleaseUsesForTest runs one release use sweep pass on this server, as
+// the lease holder's ticker does every releaseUseSweepInterval.
+func (s *Server) SweepReleaseUsesForTest(ctx context.Context) {
+	s.sweepReleaseUses(ctx, releaseUseProbes)
+}
+
+// SweepFirewallTagOrphansForTest runs one firewall-tags orphan sweep pass on
+// this server with its clock at now (a fake clock: the grace is judged
+// against it).
+func (s *Server) SweepFirewallTagOrphansForTest(ctx context.Context, now time.Time) {
+	s.sweepFirewallTagOrphans(ctx, now)
+}
+
+func (s *Server) dbWorkerEvent(ctx context.Context, name, event string) {
+	if s.testDBWorkerEvent != nil {
+		s.testDBWorkerEvent(ctx, name, event)
+	}
 }

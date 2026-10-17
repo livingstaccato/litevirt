@@ -250,6 +250,7 @@ func TestScanPkg_Fixtures(t *testing.T) {
 		"Guarded":                {resolved: 1},
 		"GuardedEntries":         {resolved: 2},
 		"OpaqueEntries":          {unresolved: 1},
+		"OpaqueGuarded":          {unresolved: 1},
 		"SameHelperTwice":        {resolved: 2}, // finding 4: visited set popped, both calls resolve
 		"Shadowed":               {unresolved: 1},
 		"AssignAfterCall":        {unresolved: 1}, // finding 1: post-call assignment ignored
@@ -280,5 +281,46 @@ func TestScanPkg_Fixtures(t *testing.T) {
 		if _, expected := want[fn]; !expected {
 			t.Errorf("unexpected findings attributed to %q: %+v", fn, *got[fn])
 		}
+	}
+}
+
+// A literal zero-statement transaction has no SQL shape. Unknown or nonempty
+// malformed batches still fail the complete guard decision.
+func TestGuardE2E_EmptyGuardedBatchOnly(t *testing.T) {
+	cfg := &packages.Config{
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
+			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps,
+		Tests: false,
+	}
+	pkgs, err := packages.Load(cfg, "./testdata/fixtures")
+	if err != nil || packages.PrintErrors(pkgs) > 0 || len(pkgs) != 1 {
+		t.Fatalf("load fixtures: %v (pkgs=%d)", err, len(pkgs))
+	}
+	byFn := map[string][]finding{}
+	for _, f := range scanPkg(pkgs[0]) {
+		byFn[f.fn] = append(byFn[f.fn], f)
+	}
+	for name, wantGap := range map[string]bool{
+		"EmptyGuarded":       false,
+		"OpaqueGuarded":      true,
+		"UnkeyedComposite":   true,
+		"Shadowed":           true,
+		"FieldMutation":      true,
+		"HelperMutation":     true,
+		"RecursiveBatch":     true,
+		"UnregisteredStatic": true,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if pkgs[0].Types.Scope().Lookup(name) == nil {
+				t.Fatalf("missing actual fixture %s", name)
+			}
+			gaps := computeGaps(byFn[name])
+			if (len(gaps) != 0) != wantGap {
+				t.Fatalf("complete guard gap=%v wantGap=%t: %v", len(gaps) != 0, wantGap, gaps)
+			}
+			if !wantGap && len(byFn[name]) != 0 {
+				t.Fatalf("zero statements fabricated shapes: %+v", byFn[name])
+			}
+		})
 	}
 }

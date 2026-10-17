@@ -249,51 +249,31 @@ func valueFromPB(v *pb.RecoveryClaimValue) *corrosion.ClaimValue {
 	if v == nil {
 		return nil
 	}
+	out := &corrosion.ClaimValue{SourceHost: v.GetSourceHost()}
+	// Retain every alternative, including malformed mixtures, for validation.
 	if a := v.GetAutomation(); a != nil {
-		out := &corrosion.ClaimValue{Automation: &corrosion.AutomationClaimValue{Envelope: a.GetEnvelope()}, SourceHost: v.GetSourceHost()}
-		// Preserve malformed alternatives so validation can reject them; never
-		// silently turn a mixed wire value into a valid automation decision.
-		if v.GetLun() != nil {
-			out.LUN = &corrosion.LUNAllocation{}
-		}
-		if v.GetVoterConfig() != nil {
-			out.Config = &corrosion.VoterConfigValue{}
-		}
-		if v.GetId() != "" || v.GetAction() != "" || v.GetTargetKind() != "" || v.GetTargetName() != "" ||
-			v.GetDestHost() != "" || v.GetCoordinator() != "" || v.GetRelocationToken() != "" ||
-			v.GetFenceEpoch() != "" || v.GetOwnerEpoch() != "" || v.GetLeaseTerm() != 0 || v.GetLeaseKey() != "" {
-			out.Proof = &corrosion.ActionProof{}
-		}
-		return out
+		out.Automation = &corrosion.AutomationClaimValue{Envelope: a.GetEnvelope()}
+	}
+	if l := v.GetLeaseTermClaim(); l != nil {
+		out.LeaseTerm = &corrosion.LeaseTermValue{Key: l.GetKey(), Term: l.GetTerm(), Holder: l.GetHolder()}
 	}
 	if l := v.GetLun(); l != nil {
-		return &corrosion.ClaimValue{LUN: &corrosion.LUNAllocation{
-			LUN: l.GetLun(), Generation: l.GetGeneration(), ClaimID: l.GetClaimId(), VMID: l.GetVmId(),
-			VMName: l.GetVmName(), Disk: l.GetDisk(), Host: l.GetHost(),
-			RunHost: l.GetRunHost(), Kept: l.GetKept(), Project: l.GetProject(), ReplacedCreatedAt: l.GetReplacedCreatedAt(),
-		}}
+		out.LUN = &corrosion.LUNAllocation{LUN: l.GetLun(), Generation: l.GetGeneration(), ClaimID: l.GetClaimId(), VMID: l.GetVmId(), VMName: l.GetVmName(), Disk: l.GetDisk(), Host: l.GetHost(), RunHost: l.GetRunHost(), Kept: l.GetKept(), Project: l.GetProject(), ReplacedCreatedAt: l.GetReplacedCreatedAt()}
 	}
-	if cfg := v.GetVoterConfig(); cfg != nil {
-		return &corrosion.ClaimValue{Config: &corrosion.VoterConfigValue{
-			Generation: cfg.GetGeneration(), Members: corrosion.SortMembers(membersFromPB(cfg.GetMembers())),
-			Change: cfg.GetChange(), CreatedBy: cfg.GetCreatedBy(), CreatedAt: cfg.GetCreatedAt(),
-		}}
+	if c := v.GetVoterConfig(); c != nil {
+		out.Config = &corrosion.VoterConfigValue{Generation: c.GetGeneration(), Members: corrosion.SortMembers(membersFromPB(c.GetMembers())), Change: c.GetChange(), CreatedBy: c.GetCreatedBy(), CreatedAt: c.GetCreatedAt()}
 	}
-	return &corrosion.ClaimValue{
-		Proof: &corrosion.ActionProof{
-			ID: v.GetId(), Action: v.GetAction(), TargetKind: v.GetTargetKind(), TargetName: v.GetTargetName(),
-			DestHost: v.GetDestHost(), Coordinator: v.GetCoordinator(), RelocationToken: v.GetRelocationToken(),
-			FenceEpoch: v.GetFenceEpoch(), OwnerEpoch: v.GetOwnerEpoch(), LeaseTerm: v.GetLeaseTerm(), LeaseKey: v.GetLeaseKey(),
-		},
-		SourceHost: v.GetSourceHost(),
+	if out.Automation == nil && out.LeaseTerm == nil && out.LUN == nil && out.Config == nil || v.GetId() != "" || v.GetAction() != "" || v.GetTargetKind() != "" || v.GetTargetName() != "" || v.GetDestHost() != "" || v.GetCoordinator() != "" || v.GetRelocationToken() != "" || v.GetFenceEpoch() != "" || v.GetOwnerEpoch() != "" || v.GetLeaseTerm() != 0 || v.GetLeaseKey() != "" {
+		out.Proof = &corrosion.ActionProof{ID: v.GetId(), Action: v.GetAction(), TargetKind: v.GetTargetKind(), TargetName: v.GetTargetName(), DestHost: v.GetDestHost(), Coordinator: v.GetCoordinator(), RelocationToken: v.GetRelocationToken(), FenceEpoch: v.GetFenceEpoch(), OwnerEpoch: v.GetOwnerEpoch(), LeaseTerm: v.GetLeaseTerm(), LeaseKey: v.GetLeaseKey()}
 	}
+	return out
 }
 
 func checkedValueFromPB(v *pb.RecoveryClaimValue) (*corrosion.ClaimValue, error) {
 	out := valueFromPB(v)
-	if out != nil && out.Automation != nil {
+	if out != nil && (out.Automation != nil || out.LeaseTerm != nil) {
 		if _, err := out.Digest(); err != nil {
-			return nil, fmt.Errorf("invalid automation wire value")
+			return nil, fmt.Errorf("invalid structured claim wire value: %w", err)
 		}
 	}
 	return out, nil
@@ -303,28 +283,19 @@ func valueToPB(v *corrosion.ClaimValue) *pb.RecoveryClaimValue {
 	if v == nil {
 		return nil
 	}
-	if v.Automation != nil {
-		legacy := *v
-		legacy.Automation = nil
-		out := valueToPB(&legacy)
-		out.Automation = &pb.AutomationClaimValue{Envelope: v.Automation.Envelope}
-		return out
+	out := &pb.RecoveryClaimValue{SourceHost: v.SourceHost}
+	if a := v.Automation; a != nil {
+		out.Automation = &pb.AutomationClaimValue{Envelope: a.Envelope}
+	}
+	if l := v.LeaseTerm; l != nil {
+		out.LeaseTermClaim = &pb.LeaseTermClaimValue{Key: l.Key, Term: l.Term, Holder: l.Holder}
 	}
 	if l := v.LUN; l != nil {
-		return &pb.RecoveryClaimValue{Lun: &pb.LUNAllocationValue{
-			Lun: l.LUN, Generation: l.Generation, ClaimId: l.ClaimID, VmId: l.VMID,
-			VmName: l.VMName, Disk: l.Disk, Host: l.Host,
-			RunHost: l.RunHost, Kept: l.Kept, Project: l.Project, ReplacedCreatedAt: l.ReplacedCreatedAt,
-		}}
+		out.Lun = &pb.LUNAllocationValue{Lun: l.LUN, Generation: l.Generation, ClaimId: l.ClaimID, VmId: l.VMID, VmName: l.VMName, Disk: l.Disk, Host: l.Host, RunHost: l.RunHost, Kept: l.Kept, Project: l.Project, ReplacedCreatedAt: l.ReplacedCreatedAt}
 	}
-	if v.Config != nil {
-		c := v.Config
-		return &pb.RecoveryClaimValue{VoterConfig: &pb.VoterConfigValue{
-			Generation: c.Generation, Members: membersToPB(c.Members), Change: c.Change,
-			CreatedBy: c.CreatedBy, CreatedAt: c.CreatedAt,
-		}}
+	if c := v.Config; c != nil {
+		out.VoterConfig = &pb.VoterConfigValue{Generation: c.Generation, Members: membersToPB(c.Members), Change: c.Change, CreatedBy: c.CreatedBy, CreatedAt: c.CreatedAt}
 	}
-	out := &pb.RecoveryClaimValue{SourceHost: v.SourceHost}
 	if p := v.Proof; p != nil {
 		out.Id, out.Action, out.TargetKind, out.TargetName = p.ID, p.Action, p.TargetKind, p.TargetName
 		out.DestHost, out.Coordinator, out.RelocationToken = p.DestHost, p.Coordinator, p.RelocationToken
@@ -424,6 +395,9 @@ func (s *Server) localPrepare(ctx context.Context, key corrosion.ClaimKey, b cor
 	if err := s.claimDurable(ctx); err != nil {
 		return corrosion.PrepareResult{}, err
 	}
+	if d := s.olderBuildLeaseClaimRefusal(key); d != "" {
+		return corrosion.PrepareResult{Voter: s.hostName, Refusal: corrosion.RefusalInvalidValue, Detail: d}, nil
+	}
 	// Start the owner probe the round's Accept will want, so it has finished
 	// by the time the Accept arrives (§3.5.1, §10 item 36).
 	s.primeOwnerProbe(ctx, key)
@@ -459,6 +433,9 @@ func (s *Server) localPrepare(ctx context.Context, key corrosion.ClaimKey, b cor
 func (s *Server) localAccept(ctx context.Context, key corrosion.ClaimKey, b corrosion.Ballot, v corrosion.ClaimValue, gen int64) (corrosion.AcceptResult, error) {
 	if err := s.claimDurable(ctx); err != nil {
 		return corrosion.AcceptResult{}, err
+	}
+	if d := s.olderBuildLeaseClaimRefusal(key); d != "" {
+		return corrosion.AcceptResult{Voter: s.hostName, Refusal: corrosion.RefusalInvalidValue, Detail: d}, nil
 	}
 	signer, _, err := s.claimIdentity()
 	if err != nil {
@@ -516,6 +493,11 @@ func (s *Server) PrepareRecoveryClaim(ctx context.Context, req *pb.PrepareRecove
 	if err := ballotSenderCheck(b, callerMTLSCommonName(ctx)); err != nil {
 		return nil, err
 	}
+	if keyFromPB(req.GetKey()).IsLeaseTerm() {
+		if err := s.requireInboundLeaseWire(ctx); err != nil {
+			return nil, err
+		}
+	}
 	res, err := s.localPrepare(ctx, keyFromPB(req.GetKey()), b, req.GetConfigGeneration(), supersedeFromPB(req.GetSupersede()))
 	if err != nil {
 		return nil, err
@@ -535,9 +517,20 @@ func (s *Server) AcceptRecoveryClaim(ctx context.Context, req *pb.AcceptRecovery
 	if err := ballotSenderCheck(b, callerMTLSCommonName(ctx)); err != nil {
 		return nil, err
 	}
+	key := keyFromPB(req.GetKey())
+	if key.IsLeaseTerm() {
+		if err := s.requireInboundLeaseWire(ctx); err != nil {
+			return nil, err
+		}
+	}
 	v, err := checkedValueFromPB(req.GetValue())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, "invalid claim value")
+	}
+	if !key.IsLeaseTerm() && leaseBearingValue(v) {
+		if err := s.requireInboundLeaseWire(ctx); err != nil {
+			return nil, err
+		}
 	}
 	res, err := s.localAccept(ctx, keyFromPB(req.GetKey()), b, *v, req.GetConfigGeneration())
 	if err != nil {
@@ -554,6 +547,11 @@ func (s *Server) GetRecoveryClaim(ctx context.Context, req *pb.GetRecoveryClaimR
 		return nil, err
 	}
 	key := keyFromPB(req.GetKey())
+	if key.IsLeaseTerm() {
+		if err := s.requireInboundLeaseWire(ctx); err != nil {
+			return nil, err
+		}
+	}
 	resp, err := s.localGetRecoveryClaim(ctx, key)
 	if err != nil || !req.GetReattest() {
 		return resp, err
@@ -662,6 +660,14 @@ func (s *Server) ListRecoveryClaims(req *pb.ListRecoveryClaimsRequest, stream gr
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "read claim states: %v", err)
 	}
+	for _, st := range src.States {
+		if st.Key.IsLeaseTerm() || leaseBearingValue(st.Value) {
+			if err := s.requireInboundLeaseWire(ctx); err != nil {
+				return err
+			}
+			break
+		}
+	}
 	if err := stream.Send(&pb.RecoveryClaimState{Header: true, Voter: src.Voter, Frozen: src.Frozen,
 		AdoptedGeneration: src.Adopted}); err != nil {
 		return err
@@ -687,6 +693,14 @@ func (t serverClaimTransport) Prepare(ctx context.Context, voter string, key cor
 	if voter == t.s.hostName {
 		return t.s.localPrepare(ctx, key, b, gen, ev)
 	}
+	preKind := false
+	if key.IsLeaseTerm() {
+		var err error
+		preKind, err = t.s.leaseWireSupport(ctx, voter)
+		if err != nil {
+			return corrosion.PrepareResult{}, err
+		}
+	}
 	cl, closer, err := t.s.dialPeer(ctx, voter)
 	if err != nil {
 		return corrosion.PrepareResult{}, err
@@ -700,12 +714,20 @@ func (t serverClaimTransport) Prepare(ctx context.Context, voter string, key cor
 	if resp.GetVoter() != voter {
 		return corrosion.PrepareResult{}, fmt.Errorf("%s answered as %q", voter, resp.GetVoter())
 	}
+	if preKind && (resp.GetPromised() || resp.GetAcceptedValue() != nil || resp.GetLegacyAcceptedValue() != nil || resp.GetRefusalReason() != corrosion.RefusalInvalidValue || resp.GetRefusalDetail() != `unknown claim target kind "lease_term"`) {
+		return corrosion.PrepareResult{}, fmt.Errorf("%s did not supply the exact pre-kind refusal", voter)
+	}
 	return prepareFromPB(resp, key)
 }
 
 func (t serverClaimTransport) Accept(ctx context.Context, voter string, key corrosion.ClaimKey, b corrosion.Ballot, v corrosion.ClaimValue, gen int64) (corrosion.AcceptResult, error) {
 	if voter == t.s.hostName {
 		return t.s.localAccept(ctx, key, b, v, gen)
+	}
+	if key.IsLeaseTerm() || leaseBearingValue(&v) {
+		if err := t.s.requireLeaseWire(ctx, voter); err != nil {
+			return corrosion.AcceptResult{}, err
+		}
 	}
 	cl, closer, err := t.s.dialPeer(ctx, voter)
 	if err != nil {
@@ -730,6 +752,8 @@ func (s *Server) fetchImportSource(ctx context.Context, voter string, gen int64)
 		return corrosion.ClaimImportSource{}, err
 	}
 	defer closer()
+	// Observe once per new stream; only lease-bearing rows require this support.
+	preKind, wireErr := s.leaseWireSupport(ctx, voter)
 	stream, err := cl.ListRecoveryClaims(ctx, &pb.ListRecoveryClaimsRequest{ConfigGeneration: gen})
 	if err != nil {
 		return corrosion.ClaimImportSource{}, err
@@ -742,7 +766,7 @@ func (s *Server) fetchImportSource(ctx context.Context, voter string, gen int64)
 			if !first && errors.Is(err, io.EOF) {
 				return out, nil
 			}
-			return out, err
+			return corrosion.ClaimImportSource{}, err
 		}
 		if first {
 			if !m.GetHeader() || m.GetVoter() != voter {
@@ -752,14 +776,22 @@ func (s *Server) fetchImportSource(ctx context.Context, voter string, gen int64)
 			first = false
 			continue
 		}
+		if keyFromPB(m.GetKey()).IsLeaseTerm() || m.GetValue().GetLeaseTermClaim() != nil {
+			if wireErr != nil {
+				return corrosion.ClaimImportSource{}, wireErr
+			}
+			if preKind {
+				return corrosion.ClaimImportSource{}, fmt.Errorf("%s supplied lease state without compatible wire support", voter)
+			}
+		}
 		v, err := checkedValueFromPB(m.GetValue())
 		if err != nil {
-			return out, err
+			return corrosion.ClaimImportSource{}, err
 		}
 		st := corrosion.ClaimVoterState{Key: keyFromPB(m.GetKey()), Promised: ballotFromPB(m.GetPromised()),
 			Accepted: ballotFromPB(m.GetAccepted()), Value: v, ValueDigest: m.GetValueDigest()}
 		if err := corrosion.ValidateAutomationState(st); err != nil {
-			return out, err
+			return corrosion.ClaimImportSource{}, err
 		}
 		out.States = append(out.States, st)
 	}

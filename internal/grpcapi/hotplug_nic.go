@@ -68,8 +68,7 @@ func attachNICRequestHash(vmName string, spec *pb.NetworkAttachment) string {
 // detachNICRequestHash is the canonical semantic hash for a NIC detach — the mac is
 // the immutable identity a detach acts on.
 func detachNICRequestHash(vmName, mac string) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("detach-nic|%s|%s", vmName, strings.ToLower(mac))))
-	return hex.EncodeToString(sum[:])
+	return corrosion.NICDetachRequestHash(vmName, mac)
 }
 
 // sortStrings sorts a []string in place with a tiny insertion sort — avoids
@@ -298,7 +297,19 @@ func (s *Server) attachNICOwner(ctx context.Context, req *pb.AttachDeviceRequest
 		RequestHash:    reqHash,
 		IdempotencyKey: idemKey,
 	}
-	applied, err := s.db.BeginVMOperation(ctx, op, vm.Spec, vm.OwnerEpoch, vm.SpecGeneration)
+	// A spec entry with this MAC is a detached NIC's: it describes the new one
+	// from here on, in the spec this operation begins with and in the record
+	// the define below renders from. Not on a VM of a stack: its spec is what
+	// its compose file wrote, and a NIC model the file does not say reads as a
+	// topology change, so the next deploy would recreate the VM. Its renders
+	// take the new model from the NIC's row instead (the detach on record),
+	// and leave off the old NIC's tuning the new model cannot take
+	// (compose.ApplyNICTuning).
+	desiredSpec := vm.Spec
+	if vm.StackName == "" {
+		desiredSpec = specForNICAttach(vm.Spec, mac, model)
+	}
+	applied, err := s.db.BeginVMOperation(ctx, op, desiredSpec, vm.OwnerEpoch, vm.SpecGeneration)
 	if err != nil {
 		if errors.Is(err, corrosion.ErrOperationHashConflict) {
 			return nil, status.Errorf(codes.InvalidArgument, "idempotency key reused with a different NIC attach for %q", vmName)
@@ -309,6 +320,7 @@ func (s *Server) attachNICOwner(ctx context.Context, req *pb.AttachDeviceRequest
 		return nil, status.Errorf(codes.FailedPrecondition, "cannot attach a NIC to %q: an operation is in progress", vmName)
 	}
 	newGen := vm.SpecGeneration + 1
+	vm.Spec = desiredSpec
 	return s.executeNICAttach(ctx, vm, spec, mac, model, nicID, sgsJSON, ordinal, opID, vm.OwnerEpoch, newGen, running, latched)
 }
 

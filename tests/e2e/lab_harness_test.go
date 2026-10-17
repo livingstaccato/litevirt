@@ -767,8 +767,9 @@ func (l *lab) restartDaemon(host string, opts ...restartOpt) error {
 }
 
 // waitServing is waitDaemon plus: the host's own view lists it HOST_ACTIVE. A
-// restarted daemon answers its CLI while still recording HOST_DRAINING (the
-// "upgrading, serving after ~28 s" boot state), and a test that returns then
+// restarted daemon answers its CLI while still recording HOST_UPGRADING (the
+// "upgrading, serving after ~28 s" boot state; HOST_DRAINING from a server
+// on an earlier release), and a test that returns then
 // makes the next test's baseline fail. A host its own `host ls` does not list
 // at all (not yet a member) is not held to this. The whole wait, including each
 // lv call, ends by timeout.

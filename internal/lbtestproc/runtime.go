@@ -4,6 +4,7 @@ package lbtestproc
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -88,6 +89,24 @@ func (r *Runtime) Run(ctx context.Context, bin string, args ...string) ([]byte, 
 		}
 		if _, e := os.ReadFile(args[2]); e != nil {
 			return nil, e
+		}
+	case "ip":
+		if len(args) != 5 || args[0] != "addr" || args[1] != "del" || args[3] != "dev" || args[4] == "" {
+			return nil, fmt.Errorf("unexpected private VIP deletion %v", args)
+		}
+		if _, _, err := net.ParseCIDR(args[2]); err != nil {
+			return nil, err
+		}
+		// The fixture has no kernel VIP. Its deletion observation must follow
+		// actual exit/reap of every owned keepalived child, never just a signal.
+		for key, c := range r.children {
+			if strings.HasPrefix(key, "keepalived:") {
+				select {
+				case <-c.done:
+				case <-time.After(5 * time.Second):
+					return nil, fmt.Errorf("VIP deletion before owned keepalived exit: %s", key)
+				}
+			}
 		}
 	case "conntrackd":
 		if len(args) != 3 || args[0] != "-C" || args[2] != "-d" {

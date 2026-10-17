@@ -401,6 +401,14 @@ func (s *Server) attachDiskOwner(ctx context.Context, req *pb.AttachDeviceReques
 		}
 		occupied[d.TargetDev] = true
 	}
+	// The domain's own targets too: the seed and installer CD-ROMs are in no table.
+	inDomain, err := s.domainDiskTargets(vmName)
+	if err != nil {
+		return nil, err
+	}
+	for dev := range inDomain {
+		occupied[dev] = true
+	}
 	targetDev, err := allocateDiskTargetDev(occupied, bus)
 	if err != nil {
 		return nil, err
@@ -433,8 +441,8 @@ func (s *Server) attachDiskOwner(ctx context.Context, req *pb.AttachDeviceReques
 }
 
 // allocateDiskTargetDev returns the first free target device name given the
-// OCCUPIED target-dev set of the VM's current live disks (root is normally
-// "<prefix>a"). Allocating from the occupied set — rather than the disk COUNT —
+// OCCUPIED target-dev set of the VM's current live disks and every target its
+// domain holds, CD-ROMs included (root is normally "<prefix>a"). Allocating from the occupied set — rather than the disk COUNT —
 // means a detach-then-add cycle can never recompute an in-use name: a count-based
 // scheme recomputes the same slot a disk added in between the detach and the next
 // attach already holds. Safe under the VM lock + mutation barrier (which

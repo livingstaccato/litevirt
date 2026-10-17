@@ -165,6 +165,8 @@ func (s *Server) planDeletedVMLeftovers(ctx context.Context, vm *corrosion.VMRec
 // and never fails the delete: the VM is gone, and a host that is unreachable or
 // declines keeps its files, which is the safe direction.
 func (s *Server) cleanupDeletedVMLeftovers(ctx context.Context, plan deletedVMLeftovers) {
+	defer s.dbWorkerEvent(ctx, "delete_cleanup", "exit")
+	s.dbWorkerEvent(ctx, "delete_cleanup", "entry")
 	for _, host := range plan.hosts {
 		s.cleanupDeletedVMLeftoversOn(ctx, host, plan.vm, plan.detached[host])
 	}

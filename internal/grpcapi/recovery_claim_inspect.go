@@ -175,7 +175,12 @@ func (s *Server) inspectVoter(ctx context.Context, m corrosion.VoterMember, key 
 		cl, closer, err = s.dialPeer(cctx, m.Name)
 		if err == nil {
 			defer closer()
-			resp, err = cl.GetRecoveryClaim(cctx, &pb.GetRecoveryClaimRequest{Key: keyToPB(key)})
+			if key.IsLeaseTerm() {
+				err = s.requireLeaseWire(cctx, m.Name)
+			}
+			if err == nil {
+				resp, err = cl.GetRecoveryClaim(cctx, &pb.GetRecoveryClaimRequest{Key: keyToPB(key)})
+			}
 		}
 	}
 	if err != nil {

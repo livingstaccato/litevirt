@@ -2,6 +2,7 @@ package lb
 
 import (
 	"fmt"
+	"net"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -174,6 +175,15 @@ func checkRender(cfg Config) error {
 		{"local ip", cfg.LocalIP}, {"peer ip", cfg.PeerIP}, {"subnet", cfg.Subnet},
 		{"sync interface", cfg.SyncInterface}, {"config dir", cfg.ConfigDir},
 		{"run dir", cfg.RunDir}, {"lock dir", cfg.LockDir}, {"control dir", cfg.ControlDir},
+		{"vrrp interface", cfg.VRRPInterface}, {"unicast source", cfg.UnicastSrc},
+	}
+	for _, p := range cfg.UnicastPeers {
+		fields = append(fields, struct{ name, v string }{"unicast peer", p})
+	}
+	if cfg.VRRPUnicast {
+		if err := checkUnicast(cfg); err != nil {
+			return err
+		}
 	}
 	if cfg.Health != nil {
 		fields = append(fields, struct{ name, v string }{"health type", cfg.Health.Type},
@@ -189,6 +199,21 @@ func checkRender(cfg Config) error {
 	for _, f := range fields {
 		if err := checkToken(f.name, f.v); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// checkUnicast refuses a unicast VRRP transport it cannot render: no device to
+// send on, or a source or peer that is not an IPv4 literal (the cluster
+// transport is IPv4-only).
+func checkUnicast(cfg Config) error {
+	if cfg.VRRPInterface == "" {
+		return fmt.Errorf("lb: unicast VRRP needs the device holding this host's address")
+	}
+	for _, a := range append([]string{cfg.UnicastSrc}, cfg.UnicastPeers...) {
+		if ip := net.ParseIP(a); ip == nil || ip.To4() == nil || strings.Contains(a, ":") {
+			return fmt.Errorf("lb: unicast VRRP address %q is not an IPv4 address", a)
 		}
 	}
 	return nil

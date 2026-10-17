@@ -141,7 +141,7 @@ func LeaseTenure(ctx context.Context, c *Client, key string, now time.Time) (hol
 // term 6 got 6 back on a tenure it acquired as term 1, and a reimaged host
 // reusing a hostname inherited its predecessor's highest term. Reading the
 // newest row and checking WHOSE it is answers the actual question.
-func newestLeaseTerm(ctx context.Context, c *Client, key string) (leaseTerm, error) {
+func newestLeaseTerm(ctx context.Context, c rowQuerier, key string) (leaseTerm, error) {
 	rows, err := c.Query(ctx,
 		`SELECT term, holder FROM leader_lease_terms
 		 WHERE key = ? AND deleted_at IS NULL

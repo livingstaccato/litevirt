@@ -464,6 +464,13 @@ enforcement:
                               # passwords (FIPS mode) sets none, keeps SPICE ones, never fails
                               # a start over them, and reports console_password_v1 in
                               # not_enforcing. See ui.md "Console passwords".
+  vrrp_unicast: true          # DEFAULT ON. Whether this host advertises vrrp_unicast_v1 before
+                              # it has latched. The token moves the load balancers' VRRP off the
+                              # VIP's bridge, where any guest can read and answer it, to unicast
+                              # between the LB hosts' recorded addresses; false holds that off for
+                              # the whole cluster. Once latched it decides nothing: the transport
+                              # is cluster-wide, and its stand-down is
+                              # `lv cluster vrrp-transport multicast`. See upgrades.md.
   gossip_encryption: false    # encrypt and authenticate gossip (memberlist, gossip_port)
                               # with the cluster key in <pki_dir>/gossip.key. false is
                               # plaintext; true is encrypted-only (anything unencrypted or

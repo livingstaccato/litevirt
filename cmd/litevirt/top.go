@@ -114,6 +114,10 @@ func hostStateShort(s pb.HostState) string {
 		return "OFFLN"
 	case pb.HostState_HOST_JOINING:
 		return "join"
+	case pb.HostState_HOST_UPGRADING:
+		return "upgr"
+	case pb.HostState_HOST_FENCED:
+		return "FENCE"
 	default:
 		return "?"
 	}

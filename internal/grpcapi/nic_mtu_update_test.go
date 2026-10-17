@@ -209,3 +209,41 @@ func TestRenderStatus(t *testing.T) {
 		t.Errorf("another render error: %v", got)
 	}
 }
+
+// An MTU update writes a spec entry for each unlisted (hot-plugged) NIC up to
+// the one it names. The entry's model is the NIC's recorded one (its vm_nics
+// row), not the merged row's, which reads virtio when a newer vm_interfaces
+// row wins the merge — a model the spec entry would then hand every later
+// regenerate. The MTU is validated against that recorded model too.
+//
+// Mutation: take the merged row's model for the new entry again — the stored
+// model and the refusal both go red.
+func TestUpdateVM_NICMTUEntryTakesTheRecordedModel(t *testing.T) {
+	const mac2 = "52:54:00:00:10:03"
+	s, fake, ctx := mtuVM(t, "stopped", newMTUGate(t, true))
+	fake.SetBridgeMTU("lan3", 9000)
+	// lan2 was hot-plugged as rtl8139 before the latch: vm_nics, then the
+	// newer vm_interfaces row (mtuVM's, written again here).
+	if err := corrosion.UpsertNIC(ctx, s.db, corrosion.NICRecord{VMName: "m", ID: corrosion.DeterministicNICID("m", mtuMAC1),
+		NetworkName: "lan2", Model: "rtl8139", MAC: mtuMAC1, Ordinal: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertInterface(ctx, s.db, corrosion.InterfaceRecord{VMName: "m", NetworkName: "lan2", MAC: mtuMAC1, Ordinal: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertNIC(ctx, s.db, corrosion.NICRecord{VMName: "m", ID: corrosion.DeterministicNICID("m", mac2),
+		NetworkName: "lan3", Model: "virtio", MAC: mac2, Ordinal: 2}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.UpdateVM(ctx, mtuReq(&pb.NICMTUUpdate{Ordinal: 1, Mtu: 9000})); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("an MTU on the rtl8139 NIC: err %v, want InvalidArgument (mtu needs virtio)", err)
+	}
+	if _, err := s.UpdateVM(ctx, mtuReq(&pb.NICMTUUpdate{Ordinal: 2, Mtu: 9000})); err != nil {
+		t.Fatalf("UpdateVM: %v", err)
+	}
+	spec := loadStoredSpec(t, s, "m")
+	if len(spec.Network) != 3 || spec.Network[1].GetMac() != mtuMAC1 || spec.Network[1].GetModel() != "rtl8139" {
+		t.Fatalf("stored network = %+v, want the lan2 entry with model rtl8139", spec.Network)
+	}
+}

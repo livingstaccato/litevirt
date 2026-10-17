@@ -35,6 +35,14 @@ enum HostState {
     // on a release before this value reports such a host HOST_OFFLINE; a
     // client before it shows the number 5.
     HOST_JOINING     = 5;
+    // Booted into a pending upgrade, or upgrading in place. A server on a
+    // release before this value reports such a host HOST_DRAINING; a client
+    // before it shows the number 6.
+    HOST_UPGRADING   = 6;
+    // Fenced by failover (or an operator) and not yet returned. A server on a
+    // release before this value reports such a host HOST_OFFLINE; a client
+    // before it shows the number 7.
+    HOST_FENCED      = 7;
 }
 
 enum MigrateStrategy {
@@ -595,6 +603,23 @@ message FirewallTags {
     map<string, string> tags       = 5;
     string              set_by     = 6;
     string              updated_at = 7;
+    // orphan: no live workload holds fw_id; the row an earlier incarnation of
+    // this name left, not applied (only listed when a workload is named).
+    bool                orphan     = 8;
+    // Set only in a tag set's answer when the workload's identity was a copy
+    // (another live workload held it too): the identity replaced, and the
+    // tags its row held, now cleared from both workloads.
+    string              replaced_fw_id = 9;
+    map<string, string> dropped_tags   = 10;
+    // unreadable: the workload's tags row cannot be read (malformed). It
+    // grants no membership, and its NICs are held at drop where a tag group
+    // binds security groups (tags shows none).
+    bool                unreadable     = 11;
+    // Set only in a tag set's answer: the networks on which the workload has
+    // no allocated address while a tag group it is a member of covers them.
+    // A tag: rule never matches its traffic there (a VM is leased an address
+    // only on a NetBox-bound network); the group's bindings still apply.
+    repeated string     unaddressed_networks = 12;
 }
 
 message PCIDevice {

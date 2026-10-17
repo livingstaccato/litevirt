@@ -543,6 +543,7 @@ func (r *Reconciler) reconcilePass(ctx context.Context) {
 	// the ones litevirt created that have none. Neither touches the runtime.
 	r.adoptManagedDomains(ctx)
 	r.reportOrphanRuntimes(ctx)
+	r.resolveGoneSubjects(ctx)
 }
 
 // Start begins the reconcile loop. Blocks until ctx is cancelled.
@@ -1275,6 +1276,7 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 	var declines []settleDecline
 	keep := map[string]bool{}
 	defer func() { r.reportSettleDeclines(ctx, declines, keep) }()
+	r.resolveSettled(ctx, localDomains)
 	for _, domName := range localDomains {
 		vm, err := corrosion.GetVM(ctx, r.db, domName)
 		if err != nil {
@@ -2568,10 +2570,17 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		slog.Error("reconciler: get VM interfaces", "vm", vm.Name, "error", err)
 		return "", true, fmt.Sprintf("get interfaces: %v", err) // transient DB
 	}
+	rowModels, reattached, err := corrosion.NICModelSources(ctx, r.db, vm.Name, ifaces, compose.SpecNICModelsByMAC(spec))
+	if err != nil {
+		slog.Error("reconciler: get VM NIC models", "vm", vm.Name, "error", err)
+		return "", true, fmt.Sprintf("get NIC models: %v", err) // transient DB
+	}
+	nicModels := compose.NewNICModels(spec, rowModels, reattached)
 	var netConfigs []lv.NetworkConfig
 	for _, iface := range ifaces {
 		bridge := network.FlatBridgeName(iface.NetworkName)
 		rate := compose.NICRate(spec, iface.Ordinal, iface.NetworkName)
+		model := nicModels.Model(iface.MAC, iface.NetworkName, iface.Ordinal, iface.Model)
 		// Provision network infrastructure (VXLAN tunnels, DHCP, NAT, bridges).
 		// This is critical after failover — the new host may not have the network set up.
 		provision := r.provision
@@ -2583,12 +2592,6 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 				"vm", vm.Name, "network", iface.NetworkName, "error", err)
 		} else if provBridge != "" {
 			bridge = provBridge
-		}
-		// The NIC's own model: a NIC attached as e1000 stays e1000, its
-		// guest driver is bound to it.
-		model := iface.Model
-		if model == "" {
-			model = "virtio"
 		}
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{

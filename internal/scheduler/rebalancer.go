@@ -722,6 +722,7 @@ func (r *Rebalancer) HoldsLease(ctx context.Context) bool {
 func (r *Rebalancer) acquireLease(ctx context.Context) bool {
 	if r.QuorumLost != nil && r.QuorumLost(ctx) {
 		r.leaseTerm.Store(0)
+		corrosion.NoteLeaseNoQuorum(ctx, r.db, r.LeaseKey, r.hostName, 2*r.PollInterval, r.now())
 		return false
 	}
 	held, term, err := corrosion.AcquireLeaseWithTerm(

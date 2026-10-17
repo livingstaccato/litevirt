@@ -50,6 +50,17 @@ type mockClient struct {
 	restoreFromBackupReq *pb.RestoreFromBackupRequest
 	rawBackupCalled      bool
 
+	// Firewall tags (firewall_tag_test.go): fwTags answers ListFirewallTags
+	// (nil: Unimplemented, an older daemon), fwTagsSetReq records the last
+	// SetFirewallTags, fwTagsLeft is the cutover's tags-left header, and
+	// fwTagsSetExtra is merged into SetFirewallTags' answer.
+	fwTags         []*pb.FirewallTags
+	fwTagsErr      error
+	fwTagsSetReq   *pb.SetFirewallTagsRequest
+	fwTagsLsReq    *pb.ListFirewallTagsRequest
+	fwTagsLeft     string
+	fwTagsSetExtra *pb.FirewallTags
+
 	// Canned responses
 	vms          []*pb.VM
 	hosts        []*pb.Host
@@ -280,7 +291,14 @@ func (m *mockClient) SetBootOrder(_ context.Context, in *pb.SetBootOrderRequest,
 func (m *mockClient) RebuildVM(_ context.Context, in *pb.RebuildVMRequest, _ ...grpc.CallOption) (*pb.VM, error) {
 	return &pb.VM{Name: in.Name, HostName: "host-a", State: pb.VMState_VM_RUNNING}, nil
 }
-func (m *mockClient) CutoverVM(_ context.Context, in *pb.CutoverVMRequest, _ ...grpc.CallOption) (*pb.VM, error) {
+func (m *mockClient) CutoverVM(_ context.Context, in *pb.CutoverVMRequest, opts ...grpc.CallOption) (*pb.VM, error) {
+	if m.fwTagsLeft != "" {
+		for _, o := range opts {
+			if h, ok := o.(grpc.HeaderCallOption); ok {
+				*h.HeaderAddr = metadata.Pairs("x-litevirt-firewall-tags-left", m.fwTagsLeft)
+			}
+		}
+	}
 	return &pb.VM{Name: in.VmName, HostName: "host-a", State: pb.VMState_VM_RUNNING}, nil
 }
 func (m *mockClient) AttachDevice(_ context.Context, in *pb.AttachDeviceRequest, _ ...grpc.CallOption) (*pb.VM, error) {

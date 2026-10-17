@@ -27,20 +27,25 @@ type releaseUseProbe struct {
 }
 
 // releaseUseProbes are the features the sweep looks for, one data probe each.
-var releaseUseProbes []releaseUseProbe
+var releaseUseProbes = []releaseUseProbe{
+	{feature: capabilities.FeatureFirewallTagGroups, present: corrosion.FirewallTagGroupsDataPresent},
+}
 
 // releaseUseSweepInterval is how often the lease holder sweeps.
 const releaseUseSweepInterval = 5 * time.Minute
 
 // RunReleaseUseSweep runs the release use sweep until ctx ends.
 func (s *Server) RunReleaseUseSweep(ctx context.Context) {
-	s.runReleaseUseSweep(ctx, releaseUseSweepInterval, releaseUseProbes)
+	s.dbWorkerEvent(ctx, "sweep", "entry")
+	defer s.dbWorkerEvent(ctx, "sweep", "exit")
+	every := releaseUseSweepInterval
+	if s.testReleaseSweepEvery > 0 {
+		every = s.testReleaseSweepEvery
+	}
+	s.runReleaseUseSweep(ctx, every, releaseUseProbes)
 }
 
 func (s *Server) runReleaseUseSweep(ctx context.Context, every time.Duration, probes []releaseUseProbe) {
-	if len(probes) == 0 {
-		return
-	}
 	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
@@ -48,7 +53,9 @@ func (s *Server) runReleaseUseSweep(ctx context.Context, every time.Duration, pr
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			s.dbWorkerEvent(ctx, "sweep", "round")
 			s.sweepReleaseUses(ctx, probes)
+			s.sweepFirewallTagOrphans(ctx, time.Now())
 		}
 	}
 }
@@ -91,5 +98,53 @@ func (s *Server) sweepReleaseUses(ctx context.Context, probes []releaseUseProbe)
 			continue
 		}
 		slog.Info("release use sweep: recorded a use found in replicated data", "feature", p.feature)
+	}
+}
+
+// firewallTagsOrphanGrace is how long a firewall-tags row whose identity no
+// live workload holds is kept: it covers a move or re-create in flight, which
+// leaves no live row for a moment (spec §4.3).
+const firewallTagsOrphanGrace = 24 * time.Hour
+
+// sweepFirewallTagOrphans is the firewall-tags orphan sweep (spec §4.3, m-4):
+// on the failover lease holder, once firewall_tag_groups is recorded used, it
+// clears every tags row corrosion.FirewallTagsOrphans selects at now — no live
+// workload holds its identity, and the newest tombstone holding it, or the
+// row itself when nothing holds it, is older than the grace. So every orphan
+// is cleared within the grace plus one sweep interval. A clear is hygiene: an
+// orphan row already matches no workload.
+func (s *Server) sweepFirewallTagOrphans(ctx context.Context, now time.Time) {
+	held, err := corrosion.IsLeaseHolder(ctx, s.db, corrosion.LeaseKeyFailover, s.hostName, time.Now())
+	if err != nil || !held {
+		return
+	}
+	info, _ := capabilities.LookupFeature(capabilities.FeatureFirewallTagGroups)
+	if used, err := corrosion.ReleaseFeatureUsed(ctx, s.db, info.Token, string(capabilities.FeatureFirewallTagGroups)); err != nil || !used {
+		return
+	}
+	orphans, err := corrosion.FirewallTagsOrphans(ctx, s.db, now, firewallTagsOrphanGrace)
+	if err != nil {
+		slog.Warn("firewall tags sweep: could not read the rows", "error", err)
+		return
+	}
+	if len(orphans) == 0 {
+		return
+	}
+	if err := s.WithReleaseFeature(ctx, capabilities.FeatureFirewallTagGroups, func(ctx context.Context, g capabilities.FeatureGrant) error {
+		for _, o := range orphans {
+			cleared, err := corrosion.ClearFirewallTagsOrphan(ctx, s.db, g, o, s.hostName, now, firewallTagsOrphanGrace)
+			if err != nil {
+				slog.Warn("firewall tags sweep: could not clear an orphan row", "kind", o.Kind, "fw_id", o.FWID, "error", err)
+				continue
+			}
+			if !cleared {
+				continue
+			}
+			slog.Info("firewall tags sweep: cleared the tags of an identity no workload holds",
+				"kind", o.Kind, "fw_id", o.FWID, "name", o.Name)
+		}
+		return nil
+	}); err != nil {
+		slog.Info("firewall tags sweep: the release gate refused; retrying next sweep", "error", err)
 	}
 }

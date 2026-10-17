@@ -103,3 +103,42 @@ func TestBindSecurityGroups_NoMatchingNICIsRefused(t *testing.T) {
 		t.Errorf("refused bind audit row = %+v, want a non-ok result", got)
 	}
 }
+
+// A bind rewrites each matching vm_nics row whole from the merged record. When
+// an IP write had made the NIC's legacy row the newer one, that record's model
+// was the legacy row's synthesized "virtio", and the bind wrote it over the
+// NIC's real model. The merge now carries the live vm_nics row's model.
+//
+// Mutation: take the legacy winner's model in corrosion's nicRowWinners —
+// the model goes red.
+func TestBindSecurityGroups_KeepsTheNICModel(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtxWithEngine(t, s)
+	bg := context.Background()
+	if err := corrosion.InsertVM(bg, s.db, corrosion.VMRecord{
+		Name: "app", HostName: s.hostName, Spec: "{}", State: "running", Project: "_default",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	mac := "52:54:00:00:00:0b"
+	if err := corrosion.UpsertNIC(bg, s.db, corrosion.NICRecord{
+		VMName: "app", ID: corrosion.DeterministicNICID("app", mac), NetworkName: "lan", Model: "e1000", MAC: mac,
+	}); err != nil {
+		t.Fatalf("UpsertNIC: %v", err)
+	}
+	if err := corrosion.InsertInterface(bg, s.db, corrosion.InterfaceRecord{VMName: "app", NetworkName: "lan", MAC: mac, IP: "10.0.0.9"}); err != nil {
+		t.Fatalf("InsertInterface: %v", err)
+	}
+	if _, err := s.BindSecurityGroups(ctx, &pb.BindSecurityGroupsRequest{
+		VmName: "app", NetworkName: "lan", SecurityGroups: []string{"web"},
+	}); err != nil {
+		t.Fatalf("BindSecurityGroups: %v", err)
+	}
+	models, err := corrosion.VMNICRowModels(bg, s.db, "app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if models[mac] != "e1000" {
+		t.Fatalf("vm_nics model after the bind = %q, want e1000", models[mac])
+	}
+}

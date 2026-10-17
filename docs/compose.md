@@ -928,6 +928,58 @@ Requirements:
 - The network's bridge carries the VMs' gateway (see [Host isolation](#host-isolation)): a `vxlan` network, or a `bridge` network on a bridge litevirt created, with no `vlan`
 - It does not apply to an `isolated` network: nothing is routed off its bridge
 
+**VRRP transport**: once every host runs a release with `vrrp_unicast_v1`, each LB
+host sends its VRRP adverts as unicast from its recorded address to the other LB
+hosts' recorded addresses, over the device that holds its own, and accepts adverts
+only from them. The VIP stays on its network's bridge; nothing VRRP is sent on that
+bridge, and there is no password for a guest to read. Before that, the adverts are
+multicast on the VIP's bridge with a password derived from the LB's name, as on
+earlier releases, and any guest on that bridge can read them.
+
+The transport is one value for the whole cluster, read by every LB host from the
+replicated `cluster_policies` table, whatever its own configuration or latch: what an
+admin sets with `lv cluster vrrp-transport unicast` or
+`lv cluster vrrp-transport multicast`, else unicast once the latch has been
+recorded there, else multicast. The first host whose `vrrp_unicast_v1` latch is
+durable records it, which also needs `failover_scope_v1` latched on that host
+(the table is not writable before), so on an upgrade the switch waits for both
+tokens. Until the record exists every host stays multicast. Each host re-applies
+its LBs within 2 seconds of the record (or an admin's change) reaching it, so an
+LB is held by both its hosts for about as long as the record takes to replicate
+between them plus 2 seconds — seconds on a healthy cluster, longer only while
+replication to one of them is lagging. `lv cluster vrrp-transport` with no
+argument shows what the connected host renders.
+
+Requirements and edges of the unicast transport:
+
+- Hosts must pass IP protocol 112 between their recorded addresses. Where something
+  between them does not, run `lv cluster vrrp-transport multicast`.
+- A host must hold its recorded address (`advertise_address`) on a local device
+  that is up and is not loopback. Otherwise it cannot render unicast for its LBs:
+  it raises the critical health condition `lb.vrrp.transport_refused` naming each
+  LB. When another host of the LB reports serving it on unicast, it stops its own
+  keepalived for the LB, so that host holds the VIP alone; when none does (they
+  are refused too, down, unreachable, or cannot hold the VIP because its device
+  is down or has no carrier), it runs the LB on multicast, so the LB always keeps
+  a holder, and stops it again once one serves. Fix the address or the device; where
+  the address cannot be on a local device — 1:1 NAT, an address routed to `lo` —
+  run `lv cluster vrrp-transport multicast`. A failed read of the policy or an
+  address is not a refusal: what runs is kept, and the next pass retries.
+- A host in an LB's `hosts` that has no recorded address (it was removed with
+  `lv host rm`) is not a VRRP peer, and the event `lb.vrrp_peer_dropped` names it.
+  With no peer left the remaining host serves the VIP alone. Correct the list with
+  `lv lb update <name> --host <host>` (repeated for each host).
+- An LB host on an earlier build (or rolled back) that is back in the cluster
+  renders multicast, and both hold the VIP. Each LB host that renders unicast
+  raises the critical health condition `lb.vrrp.transport_split`, naming the LB and
+  the host. Upgrade that host, or run `lv cluster vrrp-transport multicast` until
+  it is.
+- keepalived 2.1 or later. On 2.0 the instance's source check and a single LB
+  host's TTL range are ignored (litevirt also renders the global
+  `vrrp_check_unicast_src`, which 2.0 honours).
+
+A guest's VRRP to its own host is dropped either way ([firewall.md](firewall.md)).
+
 **Conntrackd for failover**: When `snat: true` is set and the LB has two or more `hosts`, litevirt automatically runs `conntrackd` alongside keepalived to replicate conntrack state between VRRP peers, over the hosts' recorded addresses. Each LB host syncs with the first other host in `hosts`. On failover, the new MASTER imports synced entries so existing SNAT'd connections survive. This is managed automatically — no additional configuration is needed.
 
 ## Health checks
@@ -1521,6 +1573,14 @@ force throughout: a default-deny the new file asks for is set before the old
 rows go, and the stack's default is removed only once the new rows are written
 and only when the new file drops it. A redeploy that fails part way leaves the
 cluster denying, with fewer accepts, until the next one succeeds.
+
+A security-group rule or a `firewall.cluster-rules` entry takes
+`cidr: "tag:<group>"`, naming a tag group (`lv firewall tag-group set`). The
+group must already exist, and a stack deploy that holds one is refused until
+the cluster upgrade has finished. A group's members come from firewall tags,
+which a compose file does not set (`lv firewall tag set`, docs/firewall.md,
+"Tag groups"). `lv compose up` asks the daemon first and refuses against one
+that does not know tag groups.
 
 Per-NIC security groups can also be bound at runtime with
 `lv sg bind <vm> --network <name> --sg <name>`. See

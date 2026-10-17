@@ -106,13 +106,14 @@ var ErrNICTableRefused = errors.New("per-NIC table refused")
 type Applier struct {
 	runner NftRunner
 
-	mu          sync.Mutex
-	lastInet    string
-	lastNIC     string // the per-NIC table last loaded; "" = none loaded by this process
-	nicCleaned  bool   // a stale per-NIC table from before this process was looked for
-	lastApplyAt time.Time
-	resyncAfter time.Duration
-	now         func() time.Time
+	mu            sync.Mutex
+	lastInet      string
+	lastGuestVRRP bool   // last successfully installed bridge table marks guest VRRP
+	lastNIC       string // the per-NIC table last loaded; "" = none loaded by this process
+	nicCleaned    bool   // a stale per-NIC table from before this process was looked for
+	lastApplyAt   time.Time
+	resyncAfter   time.Duration
+	now           func() time.Time
 
 	// tally, when set, is handed the observe counters of the per-NIC table
 	// before every replace or removal of it, which zeroes them.
@@ -213,6 +214,7 @@ func (a *Applier) Apply(ctx context.Context, p Plan) (bool, error) {
 			} else {
 				changed = changed || nic != a.lastNIC
 				a.lastNIC, sent = nic, true
+				a.lastGuestVRRP = p.nicMode() != NICModeGuardsOnly
 				a.lastOwners = nicOwners(p)
 			}
 		}
@@ -230,13 +232,18 @@ func (a *Applier) Apply(ctx context.Context, p Plan) (bool, error) {
 		if nicErr == nil {
 			changed = changed || a.lastNIC != ""
 			a.lastNIC, a.nicCleaned, a.lastOwners = "", true, nil
+			a.lastGuestVRRP = false
 		}
 	}
 	if nic != "" && nicErr == nil {
 		a.nicCleaned = true
 	}
 
-	inet, _, _ := RenderParts(p, nicActive)
+	// A new daemon or Reset has no proof that the previous bridge table is
+	// absent. A refused atomic replacement/removal leaves it in place. Keep the
+	// conservative drop for that possible guest mark, never its positive allows.
+	guestVRRPActive := a.lastGuestVRRP || nicErr != nil && !a.nicCleaned
+	inet, _, _ := renderParts(p, nicActive, guestVRRPActive)
 	if inet != a.lastInet || resync {
 		if out, err := a.runner.Apply(ctx, inet); err != nil {
 			return changed, fmt.Errorf("nft apply: %w: %s", err, strings.TrimSpace(out))
@@ -291,6 +298,7 @@ func (a *Applier) Reset() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.lastInet, a.lastNIC = "", ""
+	a.lastGuestVRRP = false
 	a.nicCleaned = false
 	a.lastApplyAt = time.Time{}
 }

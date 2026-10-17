@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -317,5 +318,94 @@ func TestSettle_AMatchingUUIDIsNotIncarnationEvidence(t *testing.T) {
 	if settled || settleReasonClass(why) != "incarnation_unknown" || local.Incarnation != "" {
 		t.Fatalf("settle = (%v, %q, incarnation %q), want a decline because the incarnation is unknown",
 			settled, why, local.Incarnation)
+	}
+}
+
+// settledRow reads node-a's vm_settled for vm-a with its raw updated_at.
+func settledRow(t *testing.T, f *settleFixture) (corrosion.HealthCondition, string) {
+	t.Helper()
+	ctx := context.Background()
+	c, ok, err := corrosion.GetHealthCondition(ctx, f.db, corrosion.PartitionPauseEvaluator, corrosion.CondVMSettled, "vm", "vm-a@node-a")
+	if err != nil || !ok {
+		t.Fatalf("vm_settled = (%+v, %v, %v), want a row", c, ok, err)
+	}
+	rows, err := f.db.Query(ctx, `SELECT updated_at FROM health_conditions WHERE code = ? AND subject_id = ?`,
+		corrosion.CondVMSettled, "vm-a@node-a")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("vm_settled updated_at: %d rows, %v", len(rows), err)
+	}
+	return c, rows[0].String("updated_at")
+}
+
+// vm_settled says this host holds a stopped copy of a VM a certified claim
+// gave to another host. It stays open while that copy is defined here, and
+// resolves on the pass that finds it gone (the leftover cleanup, or an
+// operator, undefined it). On lab 3 it never resolved: nothing resolved the
+// code at all, and `lv health resolve` refuses it.
+//
+// A host resolves only its own: another host's copy is not in its domain
+// list, and that says nothing about whether it is still there.
+//
+// Mutations: drop the resolution — red at "resolved"; resolve without the
+// domain check — red at "still defined"; rewrite a resolved row each pass —
+// red at the idempotence check; drop the subject's host check — red at
+// node-c's row.
+func TestSettle_VMSettledResolvesOnceTheStoppedCopyIsGone(t *testing.T) {
+	f := newSettleFixture(t)
+	f.run()
+	// Another host's vm_settled: node-a's domain list says nothing about a
+	// copy on node-c, so a node-a pass leaves it open.
+	ctx := context.Background()
+	ts := time.Now().UTC().Format(time.RFC3339)
+	if err := corrosion.UpsertHealthCondition(ctx, f.db, corrosion.HealthCondition{
+		Evaluator: corrosion.PartitionPauseEvaluator, Code: corrosion.CondVMSettled,
+		SubjectKind: "vm", SubjectID: "vm-z@node-c", Lifecycle: corrosion.ConditionConfirmed,
+		Severity: corrosion.SeverityWarning, FirstSeen: ts, LastSeen: ts, ConfirmedAt: ts, Reporter: "node-c",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The stopped copy stays defined: a reason the leftover cleanup does
+	// not take, and not a live state settle would act on again.
+	f.virt.SetStateReason("vm-a", "crashed")
+	f.r.selfFence(ctx)
+	f.r.selfFence(ctx)
+	if c, _ := settledRow(t, f); c.Lifecycle != corrosion.ConditionConfirmed {
+		t.Fatalf("vm_settled is %s while the stopped copy is still defined here; it still holds", c.Lifecycle)
+	}
+
+	if err := f.virt.UndefineDomain("vm-a", false); err != nil {
+		t.Fatal(err)
+	}
+	f.r.selfFence(ctx)
+	c, at := settledRow(t, f)
+	if c.Lifecycle != corrosion.ConditionResolved || c.ResolvedAt == "" || c.Reporter != "node-a" {
+		t.Fatalf("vm_settled = %+v once the stopped copy is gone, want resolved by node-a", c)
+	}
+	f.r.selfFence(ctx)
+	if _, again := settledRow(t, f); again != at {
+		t.Fatalf("a pass over a resolved vm_settled rewrote it (updated_at %s → %s)", at, again)
+	}
+	other, ok, err := corrosion.GetHealthCondition(ctx, f.db, corrosion.PartitionPauseEvaluator, corrosion.CondVMSettled, "vm", "vm-z@node-c")
+	if err != nil || !ok || other.Lifecycle != corrosion.ConditionConfirmed {
+		t.Fatalf("node-c's vm_settled = (%+v, %v, %v) after node-a's passes, want it left open", other, ok, err)
+	}
+}
+
+// A copy is superseded only while the VM's row names another host. Once the
+// row names this host again (the VM came back), the domain here is the VM's
+// own, and vm_settled no longer holds.
+//
+// Mutation: drop the row clause — red.
+func TestSettle_VMSettledResolvesWhenTheRowNamesThisHostAgain(t *testing.T) {
+	f := newSettleFixture(t)
+	f.run()
+	f.virt.SetStateReason("vm-a", "crashed")
+	ctx := context.Background()
+	if err := corrosion.UpdateVMHost(ctx, f.db, "vm-a", "node-a", "stopped"); err != nil {
+		t.Fatal(err)
+	}
+	f.r.selfFence(ctx)
+	if c, _ := settledRow(t, f); c.Lifecycle != corrosion.ConditionResolved {
+		t.Fatalf("vm_settled is %s while vm-a's row names node-a again, want resolved", c.Lifecycle)
 	}
 }

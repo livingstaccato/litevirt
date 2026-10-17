@@ -96,6 +96,9 @@ import (
 
 // Options control fleet bootstrap. Zero values are sane defaults.
 type Options struct {
+	// DBWorkerEvent observes real server bodies; configure before construction.
+	DBWorkerEvent func(string, context.Context, string, string)
+
 	// Nodes is how many daemons to spin up. Default 3.
 	Nodes int
 	// SharedCRDT, when true, gives every node a SQLite handle into
@@ -579,6 +582,14 @@ func New(t *testing.T, opts Options) *Cluster {
 
 // Stop tears down every daemon in the fleet. Idempotent.
 func (c *Cluster) Stop() {
+	// Stop new public deletes, then join admitted parents and their retained
+	// cleanup children while every peer and replica still serves.
+	for _, n := range c.Nodes {
+		n.Server.StopDeleteVMAdmission()
+	}
+	for _, n := range c.Nodes {
+		n.Server.WaitDeleteVMWork()
+	}
 	// Before anything closes: the logged statements are read from each DB.
 	c.checkReplicatedShapes()
 	if c.cancel != nil {
@@ -899,6 +910,11 @@ func (c *Cluster) buildServer(n *Node) {
 		PKIDir:   n.PKIDir,
 		DB:       n.DB,
 		Virt:     n.Virt,
+		DBWorkerEvent: func(ctx context.Context, worker, event string) {
+			if c.opts.DBWorkerEvent != nil {
+				c.opts.DBWorkerEvent(n.Name, ctx, worker, event)
+			}
+		},
 	})
 	// A running VM's replica or copy is point-in-time through the external
 	// snapshot layer, as the daemon wires it from its libvirt client

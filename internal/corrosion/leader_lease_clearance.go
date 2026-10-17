@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"log/slog"
+	"time"
 )
 
 // Mint clearance: a node must not record lease term N+1 from a ledger that has
@@ -71,6 +72,8 @@ type LeaseMintRequest struct {
 	// the clock its own expiry comparison used, so a peer's expiry is judged
 	// against the same instant.
 	Now string
+	// TTL is the lease's: how long a tenure taken now would last.
+	TTL time.Duration
 }
 
 // LeaseMintClearanceFunc reports whether this node may record req.Term for
@@ -114,4 +117,78 @@ func (c *Client) clearLeaseMint(ctx context.Context, req LeaseMintRequest) bool 
 		slog.Info("leader lease: new-term claim cleared", "lease", key, "term", req.Term)
 	}
 	return ok
+}
+
+// A term decided for another node (lease_term_claim_v1).
+//
+// The quorum high-water read above is a READ, not a lock: two nodes that take
+// a dead holder's lease over in the same instant both read the same high
+// water, both clear, and both record the next term. Once a voter generation
+// with members is adopted the clearance therefore also DECIDES the term, by a
+// single-decree claim among the adopted voter generation
+// (grpcapi.Server.LeaseMintClearance), and a term is recorded only by the node
+// the decision names. The other learns who holds the term and records nothing.
+//
+// What the loser learned has to outlive the call. The winner's term row and
+// lease row reach the loser by replication, and until they do the loser's
+// replica still shows the dead holder's expired lease and the old high water:
+// its next poll would allocate the same term again and ask again, and if the
+// winner died between the decision and its mint, it would ask forever — the
+// term is decided, so every claim for it learns the same holder. So the
+// loser keeps the decision and treats it as the winner's lease taken at the
+// instant it learned of it: no mint until a TTL has passed from then (a live
+// winner's rows arrive well inside it, and the ordinary lease rules take
+// over), and after that the next mint allocates ABOVE the decided term,
+// exactly as a lapsed lease is taken at the next term.
+//
+// In memory: after a restart the next claim for the term learns it again.
+
+// leaseTermDecision is one decided term, as this node learned it.
+type leaseTermDecision struct {
+	term   int64
+	holder string
+	at     time.Time // the caller's clock when it learned the decision
+}
+
+// NoteLeaseTermDecided records that term of the lease key was decided for
+// holder, learned at at: the caller's clock (LeaseMintRequest.Now) plus the
+// time its clearance took, so the wait counts from learning, not from
+// classifying. A decision for an older term than one already noted is
+// ignored.
+//
+// In memory, and keyed by host name: a winner that crashed before recording
+// its term and restarted can still record that old term late, after another
+// node waited it out and recorded the next one. That is still one holder per
+// term, and the lower term is fenced by the barrier and the contest rule.
+func (c *Client) NoteLeaseTermDecided(key string, term int64, holder string, at time.Time) {
+	if key == "" || term <= 0 || holder == "" {
+		return
+	}
+	c.mintWithheldMu.Lock()
+	defer c.mintWithheldMu.Unlock()
+	if d, ok := c.leaseDecided[key]; ok && d.term > term {
+		return
+	}
+	if c.leaseDecided == nil {
+		c.leaseDecided = make(map[string]leaseTermDecision, 1)
+	}
+	c.leaseDecided[key] = leaseTermDecision{term: term, holder: holder, at: at}
+}
+
+// decidedElsewhere adjusts next, the term this node would record for key, for
+// a term decided for another node. wait is true while that node may still be
+// recording and acting under its term: until ttl after the decision was
+// learned, as of now. Otherwise next is moved above the decided term when it
+// would claim it.
+func (c *Client) decidedElsewhere(key, holder string, next int64, now time.Time, ttl time.Duration) (int64, bool) {
+	c.mintWithheldMu.Lock()
+	d, ok := c.leaseDecided[key]
+	c.mintWithheldMu.Unlock()
+	if !ok || d.holder == holder || d.term < next {
+		return next, false
+	}
+	if now.Before(d.at.Add(ttl)) {
+		return next, true
+	}
+	return d.term + 1, false
 }

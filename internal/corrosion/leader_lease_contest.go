@@ -233,7 +233,11 @@ func (c *Client) noteLeaseTermWALClaim(ctx context.Context, tx *sql.Tx, cols []s
 // to the row. A ledger read error returns it: this is a reporting question, and
 // the caller decides what an unanswerable one means.
 func IsLeaseHolder(ctx context.Context, c *Client, key, host string, now time.Time) (bool, error) {
-	rows, err := c.Query(ctx,
+	return isLeaseHolder(ctx, c, c, key, host, now)
+}
+
+func isLeaseHolder(ctx context.Context, c *Client, reader rowQuerier, key, host string, now time.Time) (bool, error) {
+	rows, err := reader.Query(ctx,
 		`SELECT holder FROM leader_election WHERE key = ? AND expires_at >= ?`,
 		key, now.UTC().Format(time.RFC3339))
 	if err != nil {
@@ -242,7 +246,7 @@ func IsLeaseHolder(ctx context.Context, c *Client, key, host string, now time.Ti
 	if len(rows) == 0 || rows[0].String("holder") != host {
 		return false, nil
 	}
-	newest, err := newestLeaseTerm(ctx, c, key)
+	newest, err := newestLeaseTerm(ctx, reader, key)
 	if err != nil {
 		return false, err
 	}

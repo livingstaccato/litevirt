@@ -625,7 +625,8 @@ func portNum(s string) string {
 // match: an address, a prefix, a range A-B (A <= B), a DNS name, or a braced
 // list of them, after an optional relational operator; a negated set
 // reference ("!= @name") too; and a tag-group cidr when Extensions.TagCIDR
-// accepts it.
+// accepts it. A set reference never names a set with ReservedSetPrefix: a tag
+// group is referenced only as tag:<name>.
 func CIDR(s string) error {
 	if s == "" {
 		return nil
@@ -636,16 +637,13 @@ func CIDR(s string) error {
 				return err
 			}
 			if _, tag := TagCIDRName(s); !tag {
-				return refuse("cidr", s, "a tag-group cidr is %s<name>, with name an nft set name", TagCIDRPrefix)
+				return refuse("cidr", s, "a tag-group cidr is %s<group>, the group name [a-z][a-z0-9_]{0,30}", TagCIDRPrefix)
 			}
 			return nil
 		}
 	}
 	if strings.HasPrefix(s, "@") {
-		if err := SetName(s[1:]); err != nil {
-			return refuse("cidr", s, "set reference: %s", err.(*FieldError).Reason)
-		}
-		return nil
+		return setRef(s, s[1:])
 	}
 	if strings.Contains(s, ":") {
 		if !v6AddrOrPrefix(s) {
@@ -660,10 +658,7 @@ func CIDR(s string) error {
 		if !SetRefOpOK(op) {
 			return refuse("cidr", s, "a set can be matched only with ==, eq, != or ne, not %s", op)
 		}
-		if err := SetName(name); err != nil {
-			return refuse("cidr", s, "set reference: %s", err.(*FieldError).Reason)
-		}
-		return nil
+		return setRef(s, name)
 	}
 	if why := grammar(s, v4Elem); why != "" {
 		return refuse("cidr", s, "%s", why)
@@ -807,6 +802,23 @@ func isDotted(s string) bool {
 		}
 	}
 	return true
+}
+
+// tagGroupSetPrefix starts a tag group's set (lv_tg_<name>, and its
+// lv_tg_<name>_v6 companion).
+const tagGroupSetPrefix = ReservedSetPrefix + "tg_"
+
+// setRef checks the set a cidr references: a set name, never a reserved one.
+// A tag group's own set is named with the form that references the group.
+func setRef(cidr, name string) error {
+	if group, ok := strings.CutPrefix(name, tagGroupSetPrefix); ok {
+		group = strings.TrimSuffix(group, "_v6")
+		return refuse("cidr", cidr, "a tag group is referenced as %s%s, not through its set", TagCIDRPrefix, group)
+	}
+	if err := SetName(name); err != nil {
+		return refuse("cidr", cidr, "set reference: %s", err.(*FieldError).Reason)
+	}
+	return nil
 }
 
 // SetName accepts an nft set name: a letter, '_' or '.', then letters,

@@ -395,7 +395,16 @@ message RelayCheckVIPParticipantResponse { RelayVIPResult result = 1; }
 // CheckVIPParticipant but keyed by LB NAME (used to resolve the true participant set for
 // implicit/legacy hosts=[] LBs before a move). Peer-only (mTLS).
 message CheckLBPresentRequest  { string lb_name = 1; }
-message CheckLBPresentResponse { bool present = 1; }
+message CheckLBPresentResponse {
+    bool present = 1;
+    // vrrp_unicast_serving: the answering host runs keepalived for this LB
+    // from a unicast VRRP config, has not refused the LB's unicast
+    // transport, and can hold the VIP: it still holds its source address on
+    // the device it sends from, and the VIP's device is up with carrier. An
+    // earlier build leaves it false. A host that cannot render the transport
+    // stops its own keepalived only when a peer reports this.
+    bool vrrp_unicast_serving = 2;
+}
 
 // CheckContainerRuntime is the container analogue of CheckVMRuntime: it reports
 // the responding host's LOCAL LXC view of a container ({absent, defined_stopped,
@@ -3018,8 +3027,8 @@ message InstallAutomationDecisionRequest { bytes record_json = 1; }
 message InstallAutomationDecisionResponse { uint64 applied_sequence = 1; }
 
 message RecoveryClaimKey {
-    string target_kind = 1;  // vm | container | voter_config
-    string target_name = 2;  // workload name; "" for voter_config
+    string target_kind = 1;  // vm | container | voter_config | lun | lease_term
+    string target_name = 2;  // workload, LUN or lease name; "" for voter_config
     int64  owner_epoch = 3;  // generation being left; config generation for voter_config
     int64  attempt     = 4;
     // incarnation is the workload row's created_at: which incarnation of the
@@ -3064,7 +3073,16 @@ message RecoveryClaimValue {
     VoterConfigValue voter_config = 13;
     // An iSCSI LUN allocation: the value a key of target_kind "lun" decides.
     LUNAllocationValue lun = 14;
-    AutomationClaimValue automation = 15;
+    // A leader-lease term's holder: the value a key of target_kind
+    // "lease_term" decides (lease_term_claim_v1).
+    LeaseTermClaimValue lease_term_claim = 15;
+    AutomationClaimValue automation = 16;
+}
+// LeaseTermClaimValue is which node holds one term of one leader lease.
+message LeaseTermClaimValue {
+    string key    = 1;  // the lease key (failover, rebalancer, ...)
+    int64  term   = 2;
+    string holder = 3;
 }
 // LUNAllocationValue is which disk of which VM one allocation of a LUN is.
 message LUNAllocationValue {
@@ -4943,6 +4961,15 @@ service LiteVirt {
     rpc GetFailoverScope(google.protobuf.Empty)       returns (FailoverScopeStatus);
     rpc SetFailoverScope(SetFailoverScopeRequest)     returns (FailoverScopeStatus);
 
+    // GetVRRPTransport reports the load balancers' VRRP transport as the
+    // answering host renders it, and the cluster-wide policy behind it.
+    // SetVRRPTransport records the operator's choice (admin), "unicast" or
+    // "multicast", which every host then renders. It refuses until
+    // failover_scope_v1 has durably latched, "unicast" refuses until
+    // vrrp_unicast_v1 has, and both refuse while any voter is unreachable.
+    rpc GetVRRPTransport(google.protobuf.Empty)       returns (VRRPTransportStatus);
+    rpc SetVRRPTransport(SetVRRPTransportRequest)     returns (VRRPTransportStatus);
+
     // GetHAPolicy reports the cluster HA policy (armed or disarmed) and its
     // confirmation; SetHAPolicy changes it (admin). While disarmed, no host is
     // fenced and no workload is recovered automatically.
@@ -5276,6 +5303,25 @@ message HARegionConfirmation {
 
 message SetFailoverScopeRequest {
     string scope = 1;  // "cluster" | "region"
+}
+
+// VRRPTransportStatus is the load balancers' VRRP transport as the answering
+// host renders it, and the cluster-wide policy it follows.
+message VRRPTransportStatus {
+    string transport  = 1;  // "unicast" | "multicast": what this host renders
+    string policy     = 2;  // the operator's choice; "" when never set
+    string set_by     = 3;  // principal of the last change; "" when never set
+    string updated_at = 4;  // "" when never set
+    // latched: vrrp_unicast_v1 has latched on some host (its latch row) or
+    // durably on the answering host.
+    bool   latched    = 5;
+    // settable is false until failover_scope_v1 has durably latched on the
+    // answering host.
+    bool   settable   = 6;
+}
+
+message SetVRRPTransportRequest {
+    string transport = 1;  // "unicast" | "multicast"
 }
 
 message RestoreRelayRequest {

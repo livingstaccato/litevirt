@@ -603,6 +603,9 @@ func (s *scanner) isLocalDefinable(obj types.Object) bool {
 func (s *scanner) resolveBatchArg(arg ast.Expr) []finding {
 	switch e := arg.(type) {
 	case *ast.CompositeLit: // []Statement{ elt, elt, ... }
+		if len(e.Elts) == 0 {
+			return []finding{} // a literal empty batch has no replicated SQL
+		}
 		var out []finding
 		for _, elt := range e.Elts {
 			out = append(out, s.resolveStmtElt(elt)...)

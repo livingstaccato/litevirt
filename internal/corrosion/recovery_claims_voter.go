@@ -218,7 +218,7 @@ func (st voterStanding) admit(key ClaimKey, gen int64, v *ClaimValue) (string, s
 		if v == nil {
 			return "", ""
 		}
-		if v.Config == nil || v.Proof != nil || v.LUN != nil || v.Automation != nil || v.SourceHost != "" {
+		if v.Config == nil || v.Proof != nil || v.LUN != nil || v.Automation != nil || v.SourceHost != "" || v.LeaseTerm != nil {
 			return RefusalInvalidValue, "a voter_config key decides a voter config"
 		}
 		if !st.cfg.Explicit() {
@@ -235,7 +235,7 @@ func (st voterStanding) admit(key ClaimKey, gen int64, v *ClaimValue) (string, s
 		}
 		return "", ""
 	}
-	// A workload key, or a LUN key.
+	// A workload key, a LUN key or a lease-term key.
 	switch {
 	case st.cfg.Explicit():
 		if r, d := memberCheck(st.cfg); r != "" {
@@ -278,9 +278,22 @@ func validateGenerationClaimValue(key ClaimKey, v *ClaimValue) (string, string) 
 	if v.Automation != nil {
 		return RefusalInvalidValue, "automation value at another kind"
 	}
+	if key.IsLeaseTerm() {
+		l := v.LeaseTerm
+		if l == nil || v.Proof != nil || v.Config != nil || v.LUN != nil || v.Automation != nil || v.SourceHost != "" {
+			return RefusalInvalidValue, "a lease_term key decides a lease term's holder"
+		}
+		if l.Key != key.TargetName || l.Term != key.OwnerEpoch {
+			return RefusalInvalidValue, fmt.Sprintf("value holds %s term %d, key is %s", l.Key, l.Term, key)
+		}
+		if l.Holder == "" {
+			return RefusalInvalidValue, "a lease-term value names its holder"
+		}
+		return "", ""
+	}
 	if key.IsLUN() {
 		l := v.LUN
-		if l == nil || v.Proof != nil || v.Config != nil || v.SourceHost != "" {
+		if l == nil || v.Proof != nil || v.Config != nil || v.LeaseTerm != nil || v.SourceHost != "" {
 			return RefusalInvalidValue, "a LUN key decides a LUN allocation"
 		}
 		if l.LUN != key.TargetName || l.Generation != key.OwnerEpoch {
@@ -291,7 +304,7 @@ func validateGenerationClaimValue(key ClaimKey, v *ClaimValue) (string, string) 
 		}
 		return "", ""
 	}
-	if v.Proof == nil || v.Config != nil || v.LUN != nil {
+	if v.Proof == nil || v.Config != nil || v.LUN != nil || v.LeaseTerm != nil {
 		return RefusalInvalidValue, "a workload key decides a proof"
 	}
 	p := v.Proof
@@ -655,6 +668,11 @@ func (c *Client) ClaimAccept(ctx context.Context, key ClaimKey, b Ballot, v Clai
 			if err := saveClaimRowTx(ctx, tx, row); err != nil {
 				return err
 			}
+			if key.IsLeaseTerm() {
+				if err := pruneLeaseTermClaimsTx(ctx, tx, key.TargetName); err != nil {
+					return err
+				}
+			}
 			res.Accepted, res.PromisedBallot, res.Accept = true, b, &a
 			return nil
 		}, c.claimCommitSeams(key))
@@ -809,13 +827,15 @@ func (c *Client) ClaimStatesForImport(ctx context.Context, gen int64) (ClaimImpo
 		out.Adopted = st.adopted
 		out.Frozen = st.adopted > gen || (st.adopted == gen && st.sealed)
 		// Both tables: an importer must carry the legacy keys and the
-		// incarnation-scoped ones alike (§4.4 rule 2, §10 item 37).
+		// incarnation-scoped ones alike (§4.4 rule 2, §10 item 37). Lease
+		// terms are carried like workloads: a term decided under this
+		// generation must not be decided again under the next.
 		rows, err := tx.Query(ctx, `SELECT target_kind, target_name, '' AS incarnation, owner_epoch, attempt, `+claimRowCols+`
-			FROM local_recovery_claims WHERE target_kind IN (?, ?, ?, ?)
+			FROM local_recovery_claims WHERE target_kind IN (?, ?, ?, ?, ?)
 			UNION ALL
 			SELECT target_kind, target_name, incarnation, owner_epoch, attempt, `+claimRowCols+`
 			FROM local_incarnation_claims WHERE target_kind IN (?, ?)
-			ORDER BY 1, 2, 3, 4, 5`, ClaimKindVM, ClaimKindContainer, ClaimKindLUN, ClaimKindAutomation, ClaimKindVM, ClaimKindContainer)
+			ORDER BY 1, 2, 3, 4, 5`, ClaimKindVM, ClaimKindContainer, ClaimKindLUN, ClaimKindAutomation, ClaimKindLeaseTerm, ClaimKindVM, ClaimKindContainer)
 		if err != nil {
 			return err
 		}
@@ -933,4 +953,36 @@ func (c *Client) ImportClaimsAndAdopt(ctx context.Context, newGen int64, from []
 		return recordAdoptionTx(ctx, tx, newGen, from)
 	})
 	return imported, err
+}
+
+// leaseTermClaimRetention is how many terms below this voter's own newest
+// recorded term of a lease it keeps lease-term claim state for.
+const leaseTermClaimRetention = 8
+
+// pruneLeaseTermClaimsTx drops this voter's lease-term claim state for terms
+// of lease well below the newest term its own ledger has recorded, so the
+// table does not grow by a row per takeover forever.
+//
+// Only below a RECORDED term, and with a margin: a claimant asks about a term
+// only after the quorum high-water read showed every term up to it free, and
+// a term this many below one already recorded and replicated is not one any
+// claimant can get past that read for. Within the margin, and for terms that
+// were decided but never recorded, the state is kept. The margin bounds the
+// case, it does not exclude it: the read's quorum and the claim's majority are
+// different sets, so a claimant whose read is more than the margin behind
+// could re-decide a pruned term — one long superseded and fenced by the
+// barrier.
+func pruneLeaseTermClaimsTx(ctx context.Context, tx *LocalTx, lease string) error {
+	rows, err := tx.Query(ctx, `SELECT COALESCE(MAX(term), 0) AS t FROM leader_lease_terms
+		WHERE key = ? AND deleted_at IS NULL`, lease)
+	if err != nil || len(rows) == 0 {
+		return err
+	}
+	below := rows[0].Int64("t") - leaseTermClaimRetention
+	if below <= 1 {
+		return nil
+	}
+	_, err = tx.Exec(ctx, `DELETE FROM local_recovery_claims
+		WHERE target_kind = ? AND target_name = ? AND owner_epoch < ?`, ClaimKindLeaseTerm, lease, below)
+	return err
 }

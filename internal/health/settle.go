@@ -298,6 +298,52 @@ func (r *Reconciler) raiseSettled(ctx context.Context, name string, p corrosion.
 	}
 }
 
+// resolveSettled resolves this host's vm_settled conditions that no longer
+// hold. One says this host holds a stopped copy of a VM that a certified
+// claim gave to another host, so it holds while a domain of that name is
+// defined here AND the VM's row names another host. It resolves when the
+// domain is gone from localDomains (the leftover cleanup undefined it, or an
+// operator did), or when the row names this host again (the VM came back,
+// and the domain is its own). A row that cannot be read keeps it open.
+//
+// Only this host's own: its domain list says nothing about another host's
+// copy. localDomains must come from a successful list. An open row is
+// written once, so a resolved one is never rewritten.
+func (r *Reconciler) resolveSettled(ctx context.Context, localDomains []string) {
+	open, err := corrosion.ListOpenHealthConditionsByCode(ctx, r.db, corrosion.PartitionPauseEvaluator, corrosion.CondVMSettled)
+	if err != nil || len(open) == 0 {
+		return
+	}
+	defined := make(map[string]bool, len(localDomains))
+	for _, d := range localDomains {
+		defined[d] = true
+	}
+	suffix := "@" + r.hostName
+	for _, row := range open {
+		if row.SubjectKind != "vm" || !strings.HasSuffix(row.SubjectID, suffix) {
+			continue
+		}
+		name := strings.TrimSuffix(row.SubjectID, suffix)
+		why := ""
+		if !defined[name] {
+			why = "the stopped copy is no longer defined on this host"
+		} else if vm, err := corrosion.GetVM(ctx, r.db, name); err == nil && vm != nil && vm.HostName == r.hostName {
+			why = "the VM's row names this host again, so the domain here is its own"
+		}
+		if why == "" {
+			continue
+		}
+		ts := r.now().UTC().Format(time.RFC3339)
+		row.Lifecycle, row.ResolvedAt, row.LastSeen = corrosion.ConditionResolved, ts, ts
+		row.ObserveCount, row.CleanCount, row.Reporter = 0, 1, r.hostName
+		if err := corrosion.UpsertHealthCondition(ctx, r.db, row); err != nil {
+			slog.Warn("partition-settle: could not resolve vm_settled", "vm", name, "error", err)
+			continue
+		}
+		slog.Info("partition-settle: vm_settled resolved — "+why, "vm", name, "host", r.hostName)
+	}
+}
+
 // settleContainer is Layer 3 for a container this host paused: its own row is
 // gone (a relocation tombstones it) and the container's one live row names
 // another host, at the recorded incarnation, with a live relocate proof whose

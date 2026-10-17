@@ -180,3 +180,12 @@ func MethodExpr(c *corrosion.Client, ctx context.Context) {
 func UnrelatedExecute(tmpl *template.Template) {
 	_ = tmpl.Execute(nil, "UPDATE t SET a = ? WHERE id = ?")
 }
+
+// EmptyGuarded has no replicated statements; the guard still runs locally.
+func EmptyGuarded(c *corrosion.Client, ctx context.Context, g func(*sql.Tx) (bool, error)) {
+	_, _ = c.ExecuteBatchGuarded(ctx, g, []corrosion.Statement{})
+}
+
+func OpaqueGuarded(c *corrosion.Client, ctx context.Context, g func(*sql.Tx) (bool, error), stmts []corrosion.Statement) {
+	_, _ = c.ExecuteBatchGuarded(ctx, g, stmts)
+}

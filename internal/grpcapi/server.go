@@ -38,6 +38,14 @@ import (
 
 // Server implements the LiteVirt gRPC service.
 type Server struct {
+	deleteWork            deleteVMWork
+	fwTagWorkMu           sync.Mutex
+	fwTagWorkStopped      bool
+	fwTagWorkCount        int
+	fwTagWorkIdle         chan struct{}
+	testDBWorkerEvent     func(context.Context, string, string)
+	testReleaseSweepEvery time.Duration
+
 	automationMu        sync.Mutex
 	automationSource    *corrosion.AutomationSourcePreparer
 	automationExportSem chan struct{}
@@ -353,6 +361,10 @@ type Server struct {
 	// host gives the consoles of each domain it defines a password, once
 	// console_password_v1 has latched (ConsolePasswordPolicy).
 	enfConsolePassword atomic.Bool
+	// enfVRRPUnicast is enforcement.vrrp_unicast (default on). Off withholds
+	// vrrp_unicast_v1 until it has latched; it never decides the transport an
+	// LB renders, which is cluster-wide (vrrpUnicastActive).
+	enfVRRPUnicast atomic.Bool
 	// allowPlaintextStorageMigration is this node's
 	// migration.allow_unencrypted_storage. A storage-copying migration sends RAM
 	// and disk blocks over a direct, unencrypted QEMU stream, so MigrateVM refuses
@@ -495,6 +507,23 @@ type Server struct {
 	// recreateTornDown is a test seam: it runs in a rebuild and a rolling
 	// recreate once the old VM is torn down, before it is created again.
 	recreateTornDown func(name string)
+	// testClearFirewallTags is a test seam: when set, a firewall-tags clear (a
+	// delete's, or a tag set's of a copied identity) calls it instead of
+	// corrosion.ClearFirewallTags.
+	testClearFirewallTags func(ctx context.Context, kind, fwID string) error
+	// testClearFirewallTagsLive is the same seam for a hook set on a running
+	// server (SetClearFirewallTagsForTest), read by concurrent deletes.
+	testClearFirewallTagsLive atomic.Pointer[func(ctx context.Context, kind, fwID string) error]
+	// fwTagLocks serializes tag sets of one workload on its owner, so two
+	// concurrent read-merge-writes of its tags row do not lose one
+	// (lockFirewallTags).
+	fwTagLocks [32]sync.Mutex
+	// testFirewallTagsBeforeWrite is a test seam: a tag set calls it between
+	// reading the workload's tags and writing them.
+	testFirewallTagsBeforeWrite func()
+	// testFirewallTagsBeforeMint is a test seam: a tag set calls it between
+	// its copied-identity check (and clear) and the mint.
+	testFirewallTagsBeforeMint func()
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
@@ -645,6 +674,54 @@ type Server struct {
 	// lbKeepalivedOverride is a test seam for the VIP-health (degraded) check:
 	// when non-nil it reports whether this host's keepalived for an LB is running.
 	lbKeepalivedOverride func(name string) bool
+
+	// lbRenderedTransportOverride is a test seam for the reconciler's read of
+	// the VRRP transport an LB's keepalived config on disk renders (lb.Manager
+	// KeepalivedTransport); lbIfaceForIPOverride for the device holding an
+	// address (lb.InterfaceHoldingIP). Nil in production.
+	lbRenderedTransportOverride func(name string) (lb.Transport, bool)
+	lbIfaceForIPOverride        func(ip string) string
+	// lbIfaceRunningOverride is a test seam for whether a device is up and
+	// has carrier (lb.InterfaceUpRunning). Nil in production.
+	lbIfaceRunningOverride func(dev string) bool
+	// vrrpPeerCapsOverride is a test seam for noteVRRPSplit's Ping of an LB
+	// peer (PeerCapabilities). Nil in production.
+	vrrpPeerCapsOverride func(ctx context.Context, host string) (caps []string, walQuarantined bool, err error)
+	// lbDemoteOverride is a test seam for stopping an LB's keepalived here
+	// (lb.Manager.DemoteByName). Nil in production.
+	lbDemoteOverride func(name string) error
+	// vrrpMu guards vrrpLastEvent (the last value each LB's VRRP events said,
+	// so each is published on a change only) and vrrpRefusedLBs (the LBs
+	// whose transport this host cannot render, for CondLBVRRPRefused).
+	vrrpMu         sync.Mutex
+	vrrpLastEvent  map[string]string
+	vrrpRefusedLBs map[string]string
+	// vrrpServing is checkVRRPServing's last answer per refused LB: another
+	// LB host serves it on unicast. It is dropped when the refusal clears, and
+	// written only for the refusal it was asked for (vrrpRefusedEpoch), so no
+	// answer outlives its refusal. vrrpLatchErr is the last latch-row write
+	// error (noteVRRPLatch logs a change of it only).
+	vrrpServing map[string]bool
+	// vrrpRefusedEpoch numbers each refusal of an LB (from vrrpEpoch, never
+	// reused) while it lasts.
+	vrrpRefusedEpoch map[string]uint64
+	vrrpEpoch        uint64
+	// vrrpRefusedHosts is each refused LB's hosts, as its last apply had them.
+	vrrpRefusedHosts map[string][]string
+	vrrpLatchErr     string
+	// vrrpAskKick asks checkVRRPServing for a pass now.
+	vrrpAskKick chan struct{}
+	// lbServingOverride is a test seam for asking a peer whether it serves an
+	// LB on unicast (CheckLBPresent). Nil in production.
+	lbServingOverride func(ctx context.Context, host, lbName string) bool
+	// lbKick asks the LB reconciler for a pass now (kickLBReconcile).
+	lbKick chan struct{}
+	// vrrpRowLatched: vrrp_unicast_v1 has latched on some host (its latch
+	// row) or durably here, as vrrpUnicastActive last read it.
+	vrrpRowLatched atomic.Bool
+	// lbMgr is the LB manager the keepalived reads (running, transport) go
+	// to. Nil: lb.NewManager(), the production paths. Test-only (SetLBManager).
+	lbMgr *lb.Manager
 
 	// migrateRestoreOverride is a test seam for container cold migration + failover
 	// relocation: when non-nil it replaces the real "dial the target peer + drive
@@ -1157,6 +1234,14 @@ type Server struct {
 	// superseding term — so it is counted rather than left to a log line.
 	onLeaseBarrierIncomplete func(key string, answered, peers int)
 
+	// onLeaseClaimNoMajority feeds litevirt_lease_term_claim_no_majority_total
+	// (nil-safe); leaseClaimStall drives ha.lease.claim_no_majority
+	// (lease_term_claim.go).
+	onLeaseClaimNoMajority func(lease string)
+	leaseClaimStall        leaseClaimStall
+	// leaseClaimsAsOlderBuild is SetLeaseClaimsAsAnOlderBuildForTest's seam.
+	leaseClaimsAsOlderBuild atomic.Bool
+
 	// leaseBarrierFullProbe remembers which peers have already been given the
 	// full budget in a repair pass and still said nothing, so a dead peer is
 	// charged once per window instead of on every sweep.
@@ -1263,6 +1348,9 @@ func (s *Server) advertisedCapabilities() []string {
 		return []string{}
 	}
 	caps := capabilities.Supported()
+	if s.leaseClaimsAsOlderBuild.Load() {
+		caps = withoutCapability(caps, capabilities.LeaseTermClaimV1)
+	}
 	// operation_protocol_v1 is advertised CONDITIONALLY on the local config flag,
 	// unlike the other reversible tokens. Those are additive safety checks where a
 	// flag-off peer is merely permissive; but a peer that isn't enforcing the F1
@@ -1453,6 +1541,16 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfPartitionPause.Load() {
 		caps = withoutCapability(caps, capabilities.PartitionPauseV1)
 	}
+	// vrrp_unicast_v1 is withheld while enforcement.vrrp_unicast is off and
+	// it has not latched: before the latch an LB host and its peers hear each
+	// other only on the same VRRP transport, so the latch has to mean every
+	// host opted in. After it the transport is cluster-wide, whatever the
+	// flag, and this host renders unicast too, so it says so: a host that does
+	// not advertise it is one on an earlier build (CondLBVRRPSplit). See
+	// TestAdvertise_VRRPUnicastWithheldWhileOff.
+	if !s.enfVRRPUnicast.Load() && !s.vrrpRowLatched.Load() {
+		caps = withoutCapability(caps, capabilities.VRRPUnicastV1)
+	}
 	return caps
 }
 
@@ -1618,6 +1716,19 @@ func (s *Server) SetLinkAddrs(fn func(name string) []netip.Prefix) { s.linkAddrs
 // host (lbApplyOverride). Test-only seam, nil in production.
 func (s *Server) SetLBApply(fn func(context.Context, lb.Config) error) { s.lbApplyOverride = fn }
 
+// SetLBManager points this host's reads of its LBs' keepalived — whether it
+// runs, which VRRP transport its config renders — at m instead of the
+// production paths. Test-only seam, nil in production.
+func (s *Server) SetLBManager(m *lb.Manager) { s.lbMgr = m }
+
+// lbManager is the manager the keepalived reads go to (SetLBManager).
+func (s *Server) lbManager() *lb.Manager {
+	if s.lbMgr != nil {
+		return s.lbMgr
+	}
+	return lb.NewManager()
+}
+
 // SetBridgeHasUplink injects the "does this bridge carry anything off the host"
 // seam (see bridgeUplink). It is the fact that tells an operator's
 // infrastructure bridge from one litevirt auto-created for a placement, and it
@@ -1721,6 +1832,10 @@ func (s *Server) SetLiveResize(on bool) { s.enfLiveResize.Store(on) }
 // gives the consoles of each domain it defines a password (once
 // console_password_v1 has latched).
 func (s *Server) SetConsolePassword(on bool) { s.enfConsolePassword.Store(on) }
+
+// SetVRRPUnicast sets enforcement.vrrp_unicast: whether this host advertises
+// vrrp_unicast_v1 before it has latched.
+func (s *Server) SetVRRPUnicast(on bool) { s.enfVRRPUnicast.Store(on) }
 
 // ConsolePasswordPolicy is what this host's defines do to a domain's console
 // passwords. Until console_password_v1 has latched, nothing (PolicyLeave):
@@ -2012,6 +2127,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfRecoveryClaim.Load()
 	case capabilities.PartitionPauseV1:
 		return s.enfPartitionPause.Load()
+	case capabilities.VRRPUnicastV1:
+		return s.enfVRRPUnicast.Load()
 	case capabilities.IsolationEpochV1:
 		return s.enfIsolationEpoch.Load()
 	case capabilities.NetBoxIPAMV1:
@@ -2470,6 +2587,8 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 		fetchBinarySem:      make(chan struct{}, fetchBinaryMaxConcurrent),
 		pushBackupSem:       make(chan struct{}, pushBackupMaxConcurrent),
 		automationExportSem: make(chan struct{}, automationExportConcurrent),
+		lbKick:              make(chan struct{}, 1),
+		vrrpAskKick:         make(chan struct{}, 1),
 	}
 	s.wireCertificateVerifier()
 	s.wireReplicationReleaseGates()

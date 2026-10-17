@@ -37,12 +37,17 @@ import (
 //     extra round trip. A peer on an older build reports no row, which is no
 //     evidence: against such a peer the takeover is judged on the term alone,
 //     as before.
+//   - once this node has adopted a voter generation with members: cleared
+//     only when a majority of that generation decides the term for this node
+//     (lease_term_claim.go). The read above shows that nobody has recorded
+//     the term; only the decision shows that nobody else is about to.
 //
 // A refusal may be served from the barrier's cached threshold, and an accept
 // may not, for the barrier's own reason: the high water only rises, so a cached
 // value is a lower bound — enough to refuse on, never enough to accept on.
 func (s *Server) LeaseMintClearance(ctx context.Context, req corrosion.LeaseMintRequest) (bool, string) {
 	key, next := req.Key, req.Term
+	started := time.Now()
 	alone, err := s.clusterOfOne(ctx)
 	if err != nil {
 		return false, "hosts table unreadable: " + err.Error()
@@ -63,12 +68,25 @@ func (s *Server) LeaseMintClearance(ctx context.Context, req corrosion.LeaseMint
 		return false, "this node's replica has not caught up with the cluster yet (" + why +
 			"), so its lease ledger and voter set may be missing the cluster's history"
 	}
+	mode, cfg, why := s.leaseTermClaimMode(ctx)
+	if mode == leaseClaimClosed {
+		return false, why
+	}
 	if cached, ok := s.cachedLeaseThreshold(key); ok && cached >= next {
 		return false, fmt.Sprintf("a peer has already recorded term %d; waiting for replication to deliver it", cached)
 	}
 	sweep := s.sweepLeaseTerm(ctx, key)
 	if !sweep.ok {
-		return false, "quorum high-water mark unconfirmed: a quorum of peers did not answer"
+		// No quorum to read from is no voter majority to take the lease over
+		// with: a stalled takeover, counted and raised like a claim's. A sweep
+		// that did not run, because the gate is not wired yet at start-up, asked
+		// nobody and is not counted.
+		why := "quorum high-water mark unconfirmed: a quorum of peers did not answer"
+		if sweep.unwired {
+			return false, "quorum high-water mark unconfirmed: the health gate is not wired yet"
+		}
+		s.noteLeaseNoMajority(ctx, key, req.TTL, clearanceInstant(req, started), why)
+		return false, why
 	}
 	threshold := sweep.threshold
 	s.storeLeaseThreshold(key, threshold)
@@ -86,7 +104,21 @@ func (s *Server) LeaseMintClearance(ctx context.Context, req corrosion.LeaseMint
 				"for the reported expiry to pass", row.peer, row.holder)
 		}
 	}
+	if mode == leaseClaimOn {
+		return s.claimLeaseTerm(ctx, cfg, req, started)
+	}
 	return true, ""
+}
+
+// clearanceInstant is req.Now advanced by the time the clearance has taken
+// since started: the caller's clock, now. An unparseable req.Now falls back
+// to this node's clock.
+func clearanceInstant(req corrosion.LeaseMintRequest, started time.Time) time.Time {
+	at := started
+	if t, err := time.Parse(time.RFC3339, req.Now); err == nil {
+		at = t
+	}
+	return at.Add(time.Since(started))
 }
 
 // liveLeaseElsewhere returns a row some peer reported that shows the lease live

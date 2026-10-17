@@ -1289,7 +1289,8 @@ off (colonelpanik/litevirt#253). Two things change:
 What an operator sees after the latch: the host's recorded state (the
 `host_membership` row, and the assurance `lv doctor fence` and `lv host fence`
 print) is `offline` for an SSH-fenced host. `lv host ls` shows `HOST_OFFLINE`
-for both `offline` and `fenced`, so it looks as before. Bring the host back
+for `offline` and `HOST_FENCED` for `fenced` (a server on an earlier release
+shows `HOST_OFFLINE` for both, and `HOST_DRAINING` for `upgrading`). Bring the host back
 with `lv host undrain <host>` as before. An
 `offline` host whose newest fence **failed** is still put back in service
 when a quorum sees it healthy again, as before; one whose newest fence
@@ -1425,6 +1426,39 @@ guest, so their next start has no password.
 A FIPS-mode host (whose QEMU has no DES for VNC authentication) sets no VNC
 passwords, takes incoming live migrations without them, and reports
 `console_password_v1` in `not_enforcing`; it never fails a start over one.
+
+### Load balancer VRRP moves off the guest network after the roll
+
+On earlier releases, each load balancer host multicasts its keepalived VRRP
+adverts on the bridge its VIP is on, with a password derived from the LB's
+name, so any guest on that bridge can read the password and answer with a
+higher priority, which takes the VIP off its holder. This release sends them
+as unicast between the LB hosts' recorded addresses, over the host network
+([compose.md](compose.md#load-balancer)). A host on the old transport and a
+host on the new one do not hear each other and would both hold the VIP, so
+nothing switches until the `vrrp_unicast_v1` capability token has latched. It
+latches once every host the cluster replicates to, including one parked in
+`maintenance`, runs this release; a host with `enforcement.vrrp_unicast: false`
+withholds it, so it holds the switch off. The first host whose latch is durable
+records it cluster-wide, once `failover_scope_v1` has latched there too (the
+record lives in `cluster_policies`), and until then every host stays multicast.
+Every LB host then re-applies its LBs within 2 seconds of that record reaching
+it, whatever its own flag says: an LB is held by both its hosts for about the
+replication delay between them plus 2 seconds. A host that cannot render unicast
+(its recorded address is on no up, non-loopback local device) raises
+`lb.vrrp.transport_refused`, stops its keepalived for each LB another host serves
+on unicast, and runs on multicast each LB no other host serves.
+Hosts must pass IP protocol 112 between their recorded addresses.
+
+The stand-down is cluster-wide: `lv cluster vrrp-transport multicast` (admin),
+which every host renders within 2 seconds of receiving it, and
+`lv cluster vrrp-transport unicast` undoes it. It can be set before the latch
+too, to keep the old transport. A host on an earlier build that comes back
+after the latch renders multicast while its LB peers render unicast; they raise
+`lb.vrrp.transport_split` naming it. A binary rolled back below the latched
+token enters WAL quarantine, as below every latched token, and renders the
+multicast transport its peers have left: roll forward, or set
+`lv cluster vrrp-transport multicast` first.
 
 ### SPICE through the daemon
 
@@ -1692,6 +1726,41 @@ roll, add `enforcement.recovery_claim: true` **explicitly** to its config; the
 older build honours an explicit key. Clusters founded with `lv host init` on
 this build already carry the explicit key. `lv doctor fence` warns when the
 token has latched and any host does not enforce it, and names the host.
+
+### Lease-term claims latch after the roll
+
+A node with an adopted voter generation that has members records a new
+leader-lease term only after a majority of that generation has decided it for
+the node. Before that, two nodes that took a lease over at the same moment
+could both record the next term and both act as its holder. See
+[Operating model](operating-model.md) → "Two nodes taking a lease over at once
+record one term". There is no schema change: voters keep these decisions in
+`local_recovery_claims`.
+
+During the roll, a host on the previous build refuses a lease-term claim as an
+unknown claim type and records terms without claiming them. An upgraded host
+claims anyway, and records a term from the quorum read alone only when so many
+voters give that refusal that the rest cannot form a majority. A voter that
+does not answer counts as one that could still accept, so an older-build
+minority plus one dead upgraded voter leaves a lease with no takeover until
+the roll finishes. Once the mandatory, replication-gated `lease_term_claim_v1`
+token has latched on a host, it always claims while a voter generation with
+members is adopted. The token cannot latch while any host the cluster replicates to runs
+the previous build, one parked in `maintenance` included.
+
+A takeover now needs a majority of voters that can vote, not only a majority
+that answers a read. `ha.lease.claim_no_majority` and
+`litevirt_lease_term_claim_no_majority_total` show a lease that cannot get one.
+There is no flag. Voter changes are decided by the same majority, so repair a
+voter while `ha.voter.unavailable` names it (`lv cluster voter rm <host>` then
+`lv cluster voter add <host>`). Once the claim itself has no majority, the
+exits are restoring the lost voter, or fencing proof-grade every member that
+cannot vote, abstaining ones included, and naming each in
+`lv cluster voter force-reconfigure --lost <host>[,<host>...]`. `lv cluster voter reset`
+returns hosts, as each adopts the reset generation, to recording terms from
+the quorum read alone — the two-holder race — and also ends recovery-claim
+protection. A binary rolled back below the
+token after it has latched enters WAL quarantine, as below every latched token.
 
 ## Schema upgrades: `litevirt schema-migrate`
 

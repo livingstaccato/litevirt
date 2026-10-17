@@ -164,8 +164,9 @@ is not. Step 2 (§4) makes the set explicit.
   already serialized by an operator.
 - **Inventory, observations, placement and every other LWW table stay as they
   are.** Only the recovery decision gets a stronger authority.
-- **No general-purpose consensus.** Voter-config changes (§4) are the only
-  other decision routed through claims.
+- **No general-purpose consensus.** Besides recoveries, only voter-config
+  changes (§4), iSCSI LUN allocations and leader-lease terms
+  (`lease_term_claim_v1`) are decided through claims.
 - **No storage-level exclusivity.** See §8.2.
 
 ---
@@ -251,8 +252,8 @@ key on `ClaimAccept`, the adopted generation on `GetRecoveryClaim`).
 
 ```proto
 message RecoveryClaimKey {
-  string target_kind = 1;  // vm | container | voter_config
-  string target_name = 2;  // workload name; "" for voter_config
+  string target_kind = 1;  // vm | container | voter_config | lun | lease_term
+  string target_name = 2;  // workload, LUN or lease name; "" for voter_config
   int64  owner_epoch = 3;  // generation being left; config generation for voter_config
   int64  attempt     = 4;
 }

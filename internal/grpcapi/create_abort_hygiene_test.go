@@ -449,3 +449,59 @@ func TestCreateVM_ASeedWithAnEmptyStampIsKept(t *testing.T) {
 	}
 	assertFileIs(t, k[0], kept, "the set-aside seed")
 }
+
+// The vm.disk.kept event of a seed a create moves aside says why it is kept:
+// a deleted VM's seed its delete kept, or a seed whose owner is not known (an
+// empty stamp, a power cut) — not "which the operator kept" for a seed
+// nobody kept (abort re-review 34, m2).
+//
+// Mutation: one text for both, as before — the owner-unknown case reads as
+// one a delete kept, red.
+func TestCreateVM_TheKeptSeedEventSaysWhyItIsKept(t *testing.T) {
+	const keptUUID = "00000000-0000-4000-8000-00000000c0de"
+	for _, tc := range []struct {
+		name      string
+		stamp     func(t *testing.T, iso string)
+		want, not string
+	}{
+		{"kept by its delete", func(t *testing.T, iso string) {
+			if err := cloudinit.StampSeed(iso, keptUUID); err != nil {
+				t.Fatal(err)
+			}
+		}, "the cloud-init seed of the deleted VM w, which its delete kept,", "not known"},
+		{"owner not known", func(t *testing.T, iso string) {
+			if err := os.WriteFile(cloudinit.SeedOwnerPath(iso), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, "whose owner is not known (its .owner stamp is empty or unreadable", "its delete kept"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stageGenisoimage(t)
+			s, _, _ := isoServer(t)
+			tombstonedVM(t, s, "w", keptUUID)
+			iso := lv.CloudInitISOPath(s.dataDir, "w")
+			if err := os.MkdirAll(filepath.Dir(iso), 0o711); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(iso, []byte("a seed"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			tc.stamp(t, iso)
+			if _, err := s.CreateVM(adminCtx(), seedCreateRequest(t, s, "w", "#cloud-config\n")); err != nil {
+				t.Fatalf("CreateVM: %v", err)
+			}
+			k := keptCopiesOf(t, iso)
+			if len(k) != 1 {
+				t.Fatalf("kept seeds = %v; want the one set aside", k)
+			}
+			evs := vmEventsOf(t, s, "w", "vm.disk.kept")
+			if len(evs) != 1 {
+				t.Fatalf("vm.disk.kept events = %+v; want one", evs)
+			}
+			d := evs[0].Detail
+			if !strings.Contains(d, tc.want) || strings.Contains(d, tc.not) || strings.Contains(d, "operator kept") || !strings.Contains(d, k[0]) {
+				t.Errorf("event = %q; want it to say %q and name %s, not %q", d, tc.want, k[0], tc.not)
+			}
+		})
+	}
+}

@@ -219,9 +219,11 @@ func SeedTriedForStart(ctx context.Context) bool {
 func clearSeedStale(iso string) { _ = os.Remove(SeedStalePath(iso)) }
 
 // SeedOwner returns the stamp of the seed at iso: ok=false when it has none.
-// A stamp that is there but empty (a stamp written before stamps were
-// synced, cut short by a power loss) is ok with owner "": its owner is not
-// known, and a caller must not read it as another VM's.
+// A stamp that is there but empty or unreadable (a stamp written before
+// stamps were synced, cut short by a power loss, can be empty or hold zeroed
+// blocks) is ok with owner "": its owner is not known, and a caller must not
+// read it as another VM's. A stamp is a uuid, so anything but printable
+// ASCII in it is unreadable.
 func SeedOwner(iso string) (owner string, ok bool, err error) {
 	b, err := os.ReadFile(SeedOwnerPath(iso))
 	if errors.Is(err, os.ErrNotExist) {
@@ -230,7 +232,11 @@ func SeedOwner(iso string) (owner string, ok bool, err error) {
 	if err != nil {
 		return "", false, err
 	}
-	return strings.TrimSpace(string(b)), true, nil
+	owner = strings.TrimSpace(string(b))
+	if strings.IndexFunc(owner, func(r rune) bool { return r <= ' ' || r > '~' }) >= 0 {
+		return "", true, nil
+	}
+	return owner, true, nil
 }
 
 // SeedIsFor reports whether the seed at iso exists and is stamped as written

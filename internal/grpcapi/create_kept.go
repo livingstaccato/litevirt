@@ -36,51 +36,69 @@ var seedCompanions = []func(string) string{cloudinit.SeedOwnerPath, cloudinit.Se
 type keptSeed struct{ path, to string }
 
 // setAsideKeptSeed clears name's seed path for a create: a seed of the
-// deleted VM the name was kept with (seedOfAKeptVM) is moved to
-// <seed>.kept-<time> with its stamp and stale mark, and any other seed there
-// is removed, as before. keptDisks says the create moved a disk a delete kept.
-// A kept seed that cannot be moved refuses the create: removing it is what
-// this exists to prevent.
+// deleted VM the name was kept with, or one whose owner is not known
+// (seedOfAKeptVM), is moved to <seed>.kept-<time> with its stamp and stale
+// mark, and any other seed there is removed, as before. keptDisks says the
+// create moved a disk a delete kept. A seed that cannot be moved refuses the
+// create: removing it is what this exists to prevent.
 func (s *Server) setAsideKeptSeed(ctx context.Context, name string, keptDisks bool, now time.Time) (keptSeed, error) {
 	iso := lv.CloudInitISOPath(s.dataDir, name)
 	if _, err := os.Lstat(iso); errors.Is(err, fs.ErrNotExist) {
 		return keptSeed{}, nil
 	}
-	if !s.seedOfAKeptVM(ctx, name, iso, keptDisks) {
+	keep, unknown := s.seedOfAKeptVM(ctx, name, iso, keptDisks)
+	if !keep {
 		_ = cloudinit.RemoveSeed(iso)
 		return keptSeed{}, nil
 	}
+	// What the seed is, as the operator reads it: a deleted VM's that its
+	// delete kept, or one whose owner is not known.
+	what := fmt.Sprintf("the cloud-init seed of the deleted VM %s, which its delete kept,", name)
+	if unknown != "" {
+		what = fmt.Sprintf("a cloud-init seed of the name %s whose owner is not known (%s)", name, unknown)
+	}
 	to := health.KeptName(iso, now)
 	if err := os.Rename(iso, to); err != nil {
-		return keptSeed{}, fmt.Errorf("the cloud-init seed of the deleted VM %s the create would replace is kept, and moving it to %s failed (%v); "+
-			"retry, or place the VM on another host", name, to, err)
+		return keptSeed{}, fmt.Errorf("%s is at %s, which the create would replace; it is kept, and moving it to %s failed (%v); "+
+			"retry, or place the VM on another host", what, iso, to, err)
 	}
 	for _, c := range seedCompanions {
 		if err := os.Rename(c(iso), c(to)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			slog.Warn("create: could not move a file beside a kept seed with it", "vm", name, "path", c(iso), "error", err)
 		}
 	}
-	slog.Info("create: moved the cloud-init seed of a deleted VM of this name that the operator kept off the path the create writes; nothing removes it",
-		"vm", name, "path", iso, "moved_to", to)
-	s.keptEvent(ctx, name, fmt.Sprintf("the cloud-init seed of the deleted VM %s, which the operator kept, was at %s, which the create of %s on %s writes; it is moved to %s, and only an operator removes it",
-		name, iso, name, s.hostName, to))
+	if unknown != "" {
+		slog.Info("create: moved a cloud-init seed of this name whose owner is not known off the path the create writes, instead of removing it; nothing removes it",
+			"vm", name, "path", iso, "moved_to", to, "owner_unknown", unknown)
+	} else {
+		slog.Info("create: moved the cloud-init seed of a deleted VM of this name that its delete kept off the path the create writes; nothing removes it",
+			"vm", name, "path", iso, "moved_to", to)
+	}
+	s.keptEvent(ctx, name, fmt.Sprintf("%s was at %s, which the create of %s on %s writes; it is moved to %s, not removed, and only an operator removes it",
+		what, iso, name, s.hostName, to))
 	return keptSeed{path: iso, to: to}, nil
 }
 
-// seedOfAKeptVM reports whether the seed at iso is the one a deleted VM of
-// name was kept with: it is stamped for the name's deleted incarnation, or
-// for the VM whose firmware state a --keep-disks delete retained. An
-// unstamped seed (written before stamps) counts when this host holds what a
-// delete kept of the name. What cannot be read counts, and so does an empty
-// stamp: a seed moved aside is kept, a seed removed is lost.
-func (s *Server) seedOfAKeptVM(ctx context.Context, name, iso string, keptDisks bool) bool {
+// seedOfAKeptVM reports whether the seed at iso is kept rather than removed
+// by a create of name, and, when it is kept because its owner is not known,
+// why not (unknown; "" for a seed known to be the deleted VM's). It is the
+// deleted VM's when it is stamped for the name's deleted incarnation, or for
+// the VM whose firmware state a --keep-disks delete retained; an unstamped
+// seed (written before stamps) is when this host holds what a delete kept of
+// the name. A stamp that is empty or cannot be read, and a deleted VM that
+// cannot be read, leave the owner not known, and such a seed is kept too: a
+// seed moved aside is kept, a seed removed is lost.
+func (s *Server) seedOfAKeptVM(ctx context.Context, name, iso string, keptDisks bool) (keep bool, unknown string) {
 	stamp, stamped, err := cloudinit.SeedOwner(iso)
-	if err != nil || (stamped && stamp == "") {
-		return true // an owner not known (an empty stamp: a power cut)
+	switch {
+	case err != nil:
+		return true, fmt.Sprintf("its .owner stamp could not be read: %v", err)
+	case stamped && stamp == "":
+		return true, "its .owner stamp is empty or unreadable, as a power cut while it was written leaves it"
 	}
 	_, spec, err := corrosion.GetTombstonedVM(ctx, s.db, name)
 	if err != nil {
-		return true
+		return true, fmt.Sprintf("the deleted VM of the name could not be read to match it: %v", err)
 	}
 	var owners []string
 	if u := cloudinit.SpecUUID(spec); u != "" {
@@ -91,9 +109,9 @@ func (s *Server) seedOfAKeptVM(ctx context.Context, name, iso string, keptDisks 
 		owners = append(owners, marker)
 	}
 	if stamped {
-		return slices.Contains(owners, stamp)
+		return slices.Contains(owners, stamp), ""
 	}
-	return keptDisks || markerOK
+	return keptDisks || markerOK, ""
 }
 
 // restoreKeptAfterFailedCreate puts back what a failed create of name moved

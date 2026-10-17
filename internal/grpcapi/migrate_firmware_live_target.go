@@ -418,6 +418,57 @@ func writeFileDurable(p string, data []byte) error {
 	return d.Sync()
 }
 
+// answerOwedLeftover is a DISCARD (an owed one: the caller took the VM back
+// after the commit) that finds no hold here. A domain of the owed uuid while
+// the VM's row names the caller for the owed incarnation is the leftover the
+// DISCARD names: it is put under a leftover record, which the guard and the
+// reconciler honour, and the DISCARD is refused until an operator's
+// --discard-target quarantines it. Once that domain is gone the record goes.
+// handled false is the ordinary no-hold answer. The caller holds
+// firmwareTargets.op.
+func (s *Server) answerOwedLeftover(ctx context.Context, req *pb.AbortLiveFirmwareTargetRequest, td *pb.TargetDomain, resp *pb.AbortLiveFirmwareTargetResponse) (bool, error) {
+	b := fwmig.Binding{UUID: req.Uuid, CreatedAt: req.CreatedAt, Attempt: req.AttemptId}
+	recs := s.fwRecords()
+	l, lok, err := recs.GetLeftover(req.VmName)
+	if err != nil {
+		return true, status.Errorf(codes.FailedPrecondition, "VM %q: its leftover record on %s cannot be read: %v", req.VmName, s.hostName, err)
+	}
+	if !td.GetPresent() {
+		if lok && l.Binding.Matches(b) {
+			if err := recs.RemoveLeftover(req.VmName); err != nil {
+				return true, status.Errorf(codes.Internal, "VM %q: remove the leftover record: %v", req.VmName, err)
+			}
+		}
+		return false, nil
+	}
+	if !strings.EqualFold(td.GetUuid(), req.Uuid) {
+		return false, nil
+	}
+	caller := callerMTLSCommonName(ctx)
+	row, err := corrosion.GetVM(ctx, s.db, req.VmName)
+	if err != nil {
+		return true, status.Errorf(codes.Unavailable, "VM %q: its row cannot be read: %v", req.VmName, err)
+	}
+	if row == nil || row.HostName != caller || !b.SameIncarnation(fwmig.Binding{UUID: parseFirmwareSpec(row.Spec).UUID, CreatedAt: row.CreatedAt}) {
+		return false, nil
+	}
+	if !lok || !l.Binding.Matches(b) {
+		if err := recs.PutLeftover(fwmig.Leftover{VM: req.VmName, Binding: b, Source: caller, Since: time.Now().UTC()}); err != nil {
+			return true, status.Errorf(codes.Internal, "VM %q: record the leftover of attempt %s: %v", req.VmName, req.AttemptId, err)
+		}
+		slog.Warn("live firmware move: an owed DISCARD found a leftover with no hold; it is kept under a leftover record",
+			"vm", req.VmName, "attempt", req.AttemptId, "source", caller, "domain", td.GetState())
+	}
+	stop := ""
+	if td.GetState() != "shutoff" {
+		stop = " --stop-target"
+	}
+	resp.Refused = true
+	resp.Detail = fmt.Sprintf("VM %s: %s holds no hold of attempt %s, and its leftover domain (%s) is kept under a leftover record: `lv doctor firmware-move %s --discard-target%s` quarantines it",
+		req.VmName, s.hostName, req.AttemptId, td.GetState(), req.VmName, stop)
+	return true, nil
+}
+
 // ── Abort (spec §6.8) ──
 
 // AbortLiveFirmwareTarget disposes of the hold of one attempt. It binds to
@@ -453,6 +504,11 @@ func (s *Server) AbortLiveFirmwareTarget(ctx context.Context, req *pb.AbortLiveF
 		return nil, status.Errorf(codes.FailedPrecondition, "VM %q: its firmware move hold on %s cannot be read: %v", req.VmName, s.hostName, err)
 	}
 	if !ok || !h.Binding.Matches(fwmig.Binding{UUID: req.Uuid, CreatedAt: req.CreatedAt, Attempt: req.AttemptId}) {
+		if !ok && mode == pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_DISCARD_UNVERIFIED {
+			if handled, err := s.answerOwedLeftover(ctx, req, td, resp); err != nil || handled {
+				return resp, err
+			}
+		}
 		slog.Info("live firmware move: abort of an attempt this host holds nothing of", "vm", req.VmName, "attempt", req.AttemptId)
 		return resp, nil
 	}

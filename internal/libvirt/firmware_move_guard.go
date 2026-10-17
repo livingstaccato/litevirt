@@ -93,6 +93,11 @@ const (
 	// source state into the quarantine (D-5 --accept-target on a cleanup the
 	// source state's change stopped).
 	ViaQuarantineFirmwareMoveSourceForOperator FirmwareExemption = "QuarantineFirmwareMoveSourceForOperator"
+	// The D-5 --discard-target of a leftover an owed DISCARD names after its
+	// hold went: stop it, quarantine its state, undefine it keeping state.
+	ViaStopOwedFirmwareLeftover       FirmwareExemption = "StopOwedFirmwareLeftover"
+	ViaQuarantineOwedFirmwareLeftover FirmwareExemption = "QuarantineOwedFirmwareLeftover"
+	ViaUndefineOwedFirmwareLeftover   FirmwareExemption = "UndefineOwedFirmwareLeftover"
 )
 
 // FirmwareCall is one guarded call.
@@ -110,6 +115,9 @@ type FirmwareRecordKind string
 const (
 	FirmwareMarker FirmwareRecordKind = "marker"
 	FirmwareHold   FirmwareRecordKind = "hold"
+	// FirmwareLeftover is a target's record of a leftover an owed DISCARD
+	// names after its hold went (fwmig.Leftover).
+	FirmwareLeftover FirmwareRecordKind = "leftover"
 )
 
 // The record states the rules name. They are fwmig's values; fwmig's tests
@@ -278,6 +286,12 @@ func exemptionAllows(r FirmwareMoveRecord, c FirmwareCall) bool {
 		// D-5 --push-source-nvram while the hold is released_unconfirmed
 		// (spec §5.y).
 		return hold && c.Op == OpWriteState && bound && r.State == FirmwareHoldReleasedUnconfirmed
+	case ViaStopOwedFirmwareLeftover:
+		return r.Kind == FirmwareLeftover && c.Op == OpStop && bound
+	case ViaQuarantineOwedFirmwareLeftover:
+		return r.Kind == FirmwareLeftover && c.Op == OpWipe && bound
+	case ViaUndefineOwedFirmwareLeftover:
+		return r.Kind == FirmwareLeftover && c.Op == OpUndefine && bound
 	case ViaQuarantineFirmwareMoveSourceForOperator:
 		// D-5 --accept-target on a source cleanup that stopped: the source
 		// state is moved aside, never deleted, from a cleaning marker.
@@ -288,15 +302,23 @@ func exemptionAllows(r FirmwareMoveRecord, c FirmwareCall) bool {
 
 func refusal(r FirmwareMoveRecord, c FirmwareCall) error {
 	dir, what := "to", "phase"
-	if r.Kind == FirmwareHold {
+	switch r.Kind {
+	case FirmwareHold:
 		dir, what = "from", "state"
+	case FirmwareLeftover:
+		return fmt.Errorf("%w: VM %s: the leftover of live firmware migration %s from %s, whose DISCARD is owed, is kept until `lv doctor firmware-move %s --discard-target` quarantines it; %s refused",
+			ErrFirmwareMoveInFlight, r.VM, r.Attempt, r.Peer, r.VM, refusedHow(c))
 	}
+	return fmt.Errorf("%w: VM %s: live firmware migration %s %s %s in %s %s; %s refused",
+		ErrFirmwareMoveInFlight, r.VM, r.Attempt, dir, r.Peer, what, r.State, refusedHow(c))
+}
+
+func refusedHow(c FirmwareCall) string {
 	how := string(c.Op)
 	if c.Via != "" {
 		how += " through " + string(c.Via)
 	}
-	return fmt.Errorf("%w: VM %s: live firmware migration %s %s %s in %s %s; %s refused",
-		ErrFirmwareMoveInFlight, r.VM, r.Attempt, dir, r.Peer, what, r.State, how)
+	return how
 }
 
 // domainOpsAPI is the part of libvirt the guarded domain operations use.
@@ -544,7 +566,11 @@ func (c *Client) UndefineFirmwareMoveLeftover(name, uuid, attempt string) error 
 }
 
 func undefineFirmwareMoveLeftover(v snapshotAPI, fg FirmwareMoveGuard, name, uuid, attempt string) error {
-	if err := fg.check(FirmwareCall{Op: OpUndefine, Name: name, UUID: uuid, Attempt: attempt, Via: ViaUndefineFirmwareMoveLeftover}); err != nil {
+	return undefineKeepingState(v, fg, name, uuid, attempt, ViaUndefineFirmwareMoveLeftover)
+}
+
+func undefineKeepingState(v snapshotAPI, fg FirmwareMoveGuard, name, uuid, attempt string, via FirmwareExemption) error {
+	if err := fg.check(FirmwareCall{Op: OpUndefine, Name: name, UUID: uuid, Attempt: attempt, Via: via}); err != nil {
 		return fmt.Errorf("undefine leftover %s: %w", name, err)
 	}
 	dom, err := lookupBound(v, name, uuid)
@@ -561,6 +587,19 @@ func undefineFirmwareMoveLeftover(v snapshotAPI, fg FirmwareMoveGuard, name, uui
 	return nil
 }
 
+// StopOwedFirmwareLeftover stops a leftover an owed DISCARD names, under its
+// leftover record (D-5 --discard-target --stop-target): destroy when force,
+// else an ACPI shutdown.
+func (c *Client) StopOwedFirmwareLeftover(name, uuid, attempt string, force bool) error {
+	return stopForOperator(c.virt, c.firmwareGuard(), name, uuid, attempt, force, ViaStopOwedFirmwareLeftover)
+}
+
+// UndefineOwedFirmwareLeftover undefines a shut-off leftover an owed DISCARD
+// names, keeping its state, under its leftover record.
+func (c *Client) UndefineOwedFirmwareLeftover(name, uuid, attempt string) error {
+	return undefineKeepingState(c.virt, c.firmwareGuard(), name, uuid, attempt, ViaUndefineOwedFirmwareLeftover)
+}
+
 // StopFirmwareMoveTargetForOperator stops a held target guest for an
 // operator's D-5 action (--stop-target, spec §5.y): the hold is prepared,
 // verified, resuming or released_unconfirmed. Destroy when force, else an
@@ -570,7 +609,11 @@ func (c *Client) StopFirmwareMoveTargetForOperator(name, uuid, attempt string, f
 }
 
 func stopFirmwareMoveTargetForOperator(v domainOpsAPI, fg FirmwareMoveGuard, name, uuid, attempt string, force bool) error {
-	if err := fg.check(FirmwareCall{Op: OpStop, Name: name, UUID: uuid, Attempt: attempt, Via: ViaStopFirmwareMoveTargetForOperator}); err != nil {
+	return stopForOperator(v, fg, name, uuid, attempt, force, ViaStopFirmwareMoveTargetForOperator)
+}
+
+func stopForOperator(v domainOpsAPI, fg FirmwareMoveGuard, name, uuid, attempt string, force bool, via FirmwareExemption) error {
+	if err := fg.check(FirmwareCall{Op: OpStop, Name: name, UUID: uuid, Attempt: attempt, Via: via}); err != nil {
 		return fmt.Errorf("stop %s: %w", name, err)
 	}
 	dom, err := lookupBound(v, name, uuid)

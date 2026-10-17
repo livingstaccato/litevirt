@@ -11,6 +11,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -27,11 +28,44 @@ import (
 // each refusal leaves both records and both copies as they were.
 
 // The doctor's RPCs, as the source's peer reaches the target.
-func (p *fwlPeer) FirmwareMoveDoctor(_ context.Context, req *pb.FirmwareMoveDoctorRequest, _ ...grpc.CallOption) (*pb.FirmwareMoveDoctorResponse, error) {
+func (p *fwlPeer) FirmwareMoveDoctor(_ context.Context, req *pb.FirmwareMoveDoctorRequest, opts ...grpc.CallOption) (*pb.FirmwareMoveDoctorResponse, error) {
 	if err := p.refuse("FirmwareMoveDoctor"); err != nil {
 		return nil, err
 	}
-	return p.r.dst.FirmwareMoveDoctor(p.r.peer, req)
+	p.mu.Lock()
+	aerr := p.actionErr
+	p.mu.Unlock()
+	if aerr != nil && req.GetAction() != pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_UNSPECIFIED {
+		return nil, aerr
+	}
+	return withPeerTrailer(p.r.peer, opts, func(ctx context.Context) (*pb.FirmwareMoveDoctorResponse, error) {
+		return p.r.dst.FirmwareMoveDoctor(ctx, req)
+	})
+}
+
+// fwTrailerStream records the trailer a handler sets, as a gRPC transport
+// would carry it to the caller.
+type fwTrailerStream struct{ md metadata.MD }
+
+func (*fwTrailerStream) Method() string               { return "" }
+func (*fwTrailerStream) SetHeader(metadata.MD) error  { return nil }
+func (*fwTrailerStream) SendHeader(metadata.MD) error { return nil }
+func (t *fwTrailerStream) SetTrailer(md metadata.MD) error {
+	t.md = metadata.Join(t.md, md)
+	return nil
+}
+
+// withPeerTrailer runs an in-process handler and hands its trailer to a
+// grpc.Trailer call option, as the real peer call does.
+func withPeerTrailer(ctx context.Context, opts []grpc.CallOption, fn func(context.Context) (*pb.FirmwareMoveDoctorResponse, error)) (*pb.FirmwareMoveDoctorResponse, error) {
+	st := &fwTrailerStream{}
+	resp, err := fn(grpc.NewContextWithServerTransportStream(ctx, st))
+	for _, o := range opts {
+		if t, ok := o.(grpc.TrailerCallOption); ok {
+			*t.TrailerAddr = st.md
+		}
+	}
+	return resp, err
 }
 
 func (p *fwlPeer) FirmwareMoveDoctorTarget(_ context.Context, req *pb.FirmwareMoveDoctorTargetRequest, _ ...grpc.CallOption) (*pb.FirmwareMoveDoctorTargetResponse, error) {
@@ -48,9 +82,11 @@ type fwdSrcPeer struct {
 	r *fwlRig
 }
 
-func (p *fwdSrcPeer) FirmwareMoveDoctor(_ context.Context, req *pb.FirmwareMoveDoctorRequest, _ ...grpc.CallOption) (*pb.FirmwareMoveDoctorResponse, error) {
+func (p *fwdSrcPeer) FirmwareMoveDoctor(_ context.Context, req *pb.FirmwareMoveDoctorRequest, opts ...grpc.CallOption) (*pb.FirmwareMoveDoctorResponse, error) {
 	ctx := context.WithValue(context.WithValue(mtlsCtx("dst-host"), ctxKeyUsername, "admin"), ctxKeyRole, "admin")
-	return p.r.src.FirmwareMoveDoctor(ctx, req)
+	return withPeerTrailer(ctx, opts, func(ctx context.Context) (*pb.FirmwareMoveDoctorResponse, error) {
+		return p.r.src.FirmwareMoveDoctor(ctx, req)
+	})
 }
 
 // newFwdRig is the fwlRig with the target's peer reaching the source, and

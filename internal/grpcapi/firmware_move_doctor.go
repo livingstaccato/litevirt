@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -102,6 +103,7 @@ func (s *Server) FirmwareMoveDoctor(ctx context.Context, req *pb.FirmwareMoveDoc
 	case host == s.hostName:
 		outcome, err := s.firmwareMoveDoctorAct(ctx, req, actor)
 		s.auditFirmwareMoveDoctor(ctx, actor, req, outcome, err)
+		_ = grpc.SetTrailer(ctx, metadata.Pairs(fwDoctorAuditedMD, "1"))
 		if err != nil {
 			return nil, err
 		}
@@ -134,10 +136,12 @@ func (s *Server) FirmwareMoveDoctor(ctx context.Context, req *pb.FirmwareMoveDoc
 		s.auditFirmwareMoveDoctor(ctx, actor, fwd, outcome, err)
 	} else {
 		var resp *pb.FirmwareMoveDoctorResponse
-		resp, err = s.forwardFirmwareMoveDoctor(ctx, exec, fwd, actor)
+		var audited bool
+		resp, audited, err = s.forwardFirmwareMoveDoctorAudited(ctx, exec, fwd, actor)
 		outcome = resp.GetOutcome()
-		if err != nil && status.Code(err) == codes.Unavailable {
-			// Not carried to the host that acts: audited here.
+		if err != nil && !audited {
+			// The host that acts did not audit it (unreachable, a deadline,
+			// an older build): audited here.
 			s.auditFirmwareMoveDoctor(ctx, actor, fwd, "", err)
 		}
 	}
@@ -175,6 +179,25 @@ func (s *Server) forwardFirmwareMoveDoctor(ctx context.Context, host string, req
 	cctx, cancel := context.WithTimeout(metadata.AppendToOutgoingContext(ctx, repairActorMDKey, actor), d)
 	defer cancel()
 	return client.FirmwareMoveDoctor(cctx, req)
+}
+
+// fwDoctorAuditedMD is the trailer a host that acted on a forwarded action
+// sets once it audited it.
+const fwDoctorAuditedMD = "litevirt-fwdoctor-audited"
+
+// forwardFirmwareMoveDoctorAudited is forwardFirmwareMoveDoctor for an
+// action, also saying whether the host that answered audited it.
+func (s *Server) forwardFirmwareMoveDoctorAudited(ctx context.Context, host string, req *pb.FirmwareMoveDoctorRequest, actor string) (*pb.FirmwareMoveDoctorResponse, bool, error) {
+	client, closer, err := s.dialPeer(ctx, host)
+	if err != nil {
+		return nil, false, status.Errorf(codes.Unavailable, "reach host %q: %v", host, err)
+	}
+	defer closer()
+	cctx, cancel := context.WithTimeout(metadata.AppendToOutgoingContext(ctx, repairActorMDKey, actor), fwDoctorActTimeout)
+	defer cancel()
+	var tr metadata.MD
+	resp, err := client.FirmwareMoveDoctor(cctx, req, grpc.Trailer(&tr))
+	return resp, len(tr.Get(fwDoctorAuditedMD)) > 0, err
 }
 
 // gatherFirmwareMoveRecords reads vm's records on every host in the cluster
@@ -453,7 +476,7 @@ func (s *Server) firmwareMoveDoctorAct(ctx context.Context, req *pb.FirmwareMove
 		return s.doctorTargetLocalAct(ctx, h, req, actor)
 	}
 	if req.GetAction() == pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_DISCARD_TARGET {
-		return s.doctorDiscardOwedLeftover(ctx, vm, actor)
+		return s.doctorDiscardOwedLeftover(ctx, vm, actor, req.GetStopTarget())
 	}
 	return "", status.Errorf(codes.FailedPrecondition, "VM %q: no live firmware move record names it on %s", vm, s.hostName)
 }
@@ -864,13 +887,14 @@ func (s *Server) doctorAdopt(ctx context.Context, m fwmig.Marker, actor string) 
 	case fwmig.PhaseSourcePaused:
 		// Only a target guest that runs ran after the source paused: its
 		// copy is the newer one, taken once the source's domain is shut off.
-		tr, _, err := s.targetRecords(ctx, m, action)
+		tr, th, err := s.targetRecords(ctx, m, action)
 		if err != nil {
 			return "", err
 		}
-		if td := tr.GetDomain(); !td.GetPresent() || td.GetState() != "running" {
-			return "", doctorRefuse(m, action, fmt.Sprintf("the target's guest is %s on %s and never ran: the source's copy is current; --accept-source",
-				domainWord(td), m.Target))
+		td := tr.GetDomain()
+		if !td.GetPresent() || !(td.GetState() == "running" || (td.GetState() == "paused" && th != nil && th.State != fwmig.HoldPrepared)) {
+			return "", doctorRefuse(m, action, fmt.Sprintf("the target's guest is %s on %s (%s) and never ran: the source's copy is current; --accept-source",
+				domainWord(td), m.Target, holdWord(th)))
 		}
 	case fwmig.PhaseTargetRan:
 		if fwPreCutover(from) {
@@ -1039,20 +1063,40 @@ func (s *Server) doctorAcceptSourcePaused(ctx context.Context, m fwmig.Marker) (
 		return "", doctorRefuse(m, action, fmt.Sprintf("whether the source domain is active cannot be read (%v); run this again once libvirt answers", err))
 	}
 	paused := false
+	srcWord := "shut off"
 	if active {
 		st, err := s.virt.DomainStateReason(m.VM)
 		if err != nil {
 			return "", doctorRefuse(m, action, fmt.Sprintf("the source domain's state cannot be read (%v); run this again once libvirt answers", err))
 		}
 		paused = st.Reason == "paused"
+		srcWord = st.State
+		if paused {
+			srcWord = "paused"
+		}
 	}
-	tr, _, err := s.targetRecords(ctx, m, action)
+	tr, h, err := s.targetRecords(ctx, m, action)
 	if err != nil {
 		return "", err
 	}
-	if td := tr.GetDomain(); td.GetPresent() && td.GetState() != "shutoff" && td.GetState() != "paused" {
-		return "", doctorRefuse(m, action, fmt.Sprintf("the target's guest is %s on %s: it ran after the source paused, so its copy is the newer one and is not discarded; "+
-			"shut the source's paused domain off outside litevirt (virsh destroy %s keeps its state), then --adopt-target-copy", td.GetState(), m.Target, m.VM))
+	td := tr.GetDomain()
+	ran := ""
+	switch {
+	case !td.GetPresent() || td.GetState() == "shutoff":
+	case td.GetState() == "running":
+		ran = "runs"
+	case td.GetState() == "paused" && (h == nil || h.State != fwmig.HoldPrepared):
+		ran = fmt.Sprintf("is paused under %s, so it may have run", holdWord(h))
+	case td.GetState() != "paused":
+		return "", doctorRefuse(m, action, fmt.Sprintf("the target's guest is %s on %s; no doctor action takes a target guest in that state", td.GetState(), m.Target))
+	}
+	if ran != "" {
+		exit := "then --adopt-target-copy"
+		if active {
+			exit = fmt.Sprintf("shut the source's %s domain off outside litevirt (virsh destroy %s keeps its state), then --adopt-target-copy", srcWord, m.VM)
+		}
+		return "", doctorRefuse(m, action, fmt.Sprintf("the target's guest %s on %s: it ran after the source paused, so its copy is the newer one and is not discarded; %s",
+			ran, m.Target, exit))
 	}
 	if err := s.doctorDiscardTargetCopy(ctx, m, false, action); err != nil {
 		return "", err
@@ -1139,6 +1183,9 @@ func (s *Server) returnDisks(ctx context.Context, m fwmig.Marker, action pb.Firm
 		}
 	}
 	if len(m.CommitDisks) > 0 {
+		if !sameCommitDisks(commitDisksOf(now), m.CommitDisks) {
+			return nil, doctorRefuse(m, action, "the VM's disk rows changed since the commit; nothing was written")
+		}
 		out := make([]corrosion.DiskRecord, 0, len(m.CommitDisks))
 		for _, d := range m.CommitDisks {
 			out = append(out, corrosion.DiskRecord{VMName: m.VM, DiskName: d.Disk, HostName: d.Host, Path: d.Path,
@@ -1181,6 +1228,27 @@ func (s *Server) requireDisksReturned(ctx context.Context, m fwmig.Marker, actio
 		}
 	}
 	return nil
+}
+
+// sameCommitDisks: a and b hold the same disk rows, in any order.
+func sameCommitDisks(a, b []fwmig.CommitDisk) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	key := func(d fwmig.CommitDisk) string {
+		return d.Disk + "\x00" + d.Host + "\x00" + d.Path + "\x00" + d.StorageType + "\x00" + d.StorageVolume
+	}
+	seen := map[string]int{}
+	for _, d := range a {
+		seen[key(d)]++
+	}
+	for _, d := range b {
+		if seen[key(d)] == 0 {
+			return false
+		}
+		seen[key(d)]--
+	}
+	return true
 }
 
 // doctorAcceptSourceAfterCommit returns a committed VM to this host. The
@@ -1237,6 +1305,31 @@ func (s *Server) doctorAcceptSourceAfterCommit(ctx context.Context, m fwmig.Mark
 			return "", err
 		}
 	}
+	// Every check that can still refuse runs before the target's guest is
+	// stopped: the disks the return takes, and the owed DISCARD recorded (a
+	// target refuses it while the row names the target). A refusal after
+	// this point and before the return removes the record again.
+	recs := s.fwRecords()
+	var disks []corrosion.DiskRecord
+	owedPut := false
+	if !returned {
+		if disks, err = s.returnDisks(ctx, m, action); err != nil {
+			return "", err
+		}
+		if err := recs.PutOwedDiscard(fwmig.OwedDiscard{VM: m.VM, Binding: m.Binding, Target: m.Target,
+			CreatedStubs: m.CreatedStubs, Since: time.Now().UTC()}); err != nil {
+			return "", status.Errorf(codes.Internal, "VM %q: record the DISCARD owed to %s: %v; nothing was returned", m.VM, m.Target, err)
+		}
+		owedPut = true
+	}
+	landed := false
+	defer func() {
+		if owedPut && !landed {
+			if rerr := recs.RemoveOwedDiscard(m.VM, m.Attempt); rerr != nil {
+				slog.Warn("firmware-move doctor: a refused return leaves its owed-discard record", "vm", m.VM, "error", rerr)
+			}
+		}
+	}()
 	off, err := corrosion.HostProvedOff(ctx, s.db, m.Target)
 	if err != nil {
 		return "", status.Errorf(codes.Unavailable, "VM %q: whether %s is proved off cannot be read: %v", m.VM, m.Target, err)
@@ -1270,31 +1363,18 @@ func (s *Server) doctorAcceptSourceAfterCommit(ctx context.Context, m fwmig.Mark
 			}
 		}
 	}
-	recs := s.fwRecords()
 	if !returned {
-		disks, err := s.returnDisks(ctx, m, action)
-		if err != nil {
-			return "", err
-		}
-		// Owed before the return: a target refuses the DISCARD while the row
-		// names it, so the record is never acted on early, and a return that
-		// lands is never left without it.
-		if err := recs.PutOwedDiscard(fwmig.OwedDiscard{VM: m.VM, Binding: m.Binding, Target: m.Target,
-			CreatedStubs: m.CreatedStubs, Since: time.Now().UTC()}); err != nil {
-			return "", status.Errorf(codes.Internal, "VM %q: record the DISCARD owed to %s: %v; nothing was returned", m.VM, m.Target, err)
-		}
 		ok, err := corrosion.ReturnMigratedVM(ctx, s.db, m.VM, m.Target, s.hostName, m.UUID, m.CreatedAt, "stopped", disks)
 		if err != nil {
 			// Whether it landed is not known: the owed record stays, and a
 			// target refuses its DISCARD while the row names it.
+			landed = true
 			return "", status.Errorf(codes.Unavailable, "VM %q: return it to %s: %v; run this again", m.VM, s.hostName, err)
 		}
 		if !ok {
-			if rerr := recs.RemoveOwedDiscard(m.VM, m.Attempt); rerr != nil {
-				slog.Warn("firmware-move doctor: a declined return leaves its owed-discard record", "vm", m.VM, "error", rerr)
-			}
 			return "", doctorRefuse(m, action, "the VM's row or disk rows changed since the commit; nothing was written")
 		}
+		landed = true
 		if h := fwDoctorAfterReturnHook; h != nil {
 			if err := h(); err != nil {
 				return "", err

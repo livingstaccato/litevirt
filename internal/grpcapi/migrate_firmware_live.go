@@ -919,7 +919,7 @@ func (s *Server) RetryOwedFirmwareDiscardsOnce(ctx context.Context) {
 			if cerr := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{
 				Code: condFwmigDiscardOwed, VM: o.VM, Attempt: o.Attempt, Source: s.hostName, Target: o.Target,
 				Severity: corrosion.SeverityCritical, Detail: resp.GetDetail(),
-				Action: "the target's copy runs: `lv doctor firmware-move <vm> --discard-target --stop-target` discards it on the target; the DISCARD is retried each interval",
+				Action: "`lv doctor firmware-move <vm> --discard-target` quarantines the target's copy (add --stop-target while its guest runs); the DISCARD is retried each interval",
 			}); cerr != nil {
 				slog.Warn("live firmware move: raise the condition", "vm", o.VM, "code", condFwmigDiscardOwed, "error", cerr)
 			}
@@ -930,7 +930,7 @@ func (s *Server) RetryOwedFirmwareDiscardsOnce(ctx context.Context) {
 				Code: condFwmigDiscardOwed, VM: o.VM, Attempt: o.Attempt, Source: s.hostName, Target: o.Target,
 				Severity: corrosion.SeverityCritical,
 				Detail:   fmt.Sprintf("%s answered the owed discard, but a domain of the VM is still defined there (%s)", o.Target, domainWord(resp.GetTargetDomain())),
-				Action:   "an operator removes the target's definition; the DISCARD is retried each interval",
+				Action:   "`lv doctor firmware-move <vm> --discard-target` quarantines the target's copy (add --stop-target while its guest runs); the DISCARD is retried each interval",
 			}); cerr != nil {
 				slog.Warn("live firmware move: raise the condition", "vm", o.VM, "code", condFwmigDiscardOwed, "error", cerr)
 			}

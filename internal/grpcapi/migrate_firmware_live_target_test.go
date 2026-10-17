@@ -551,8 +551,11 @@ func TestAbort_BindsToHoldIncarnationNotRow(t *testing.T) {
 	}
 }
 
-// T-20: with no hold for the attempt, Abort answers OK and touches nothing,
-// though a domain and state of that name are here.
+// T-20: with no hold for the attempt, Abort touches nothing, though a domain
+// and state of that name are here. A DISCARD whose domain has the owed uuid
+// while the row names the caller (an owed one, after its hold went) is
+// refused, and the domain put under a leftover record (D2-18 re-review 1
+// I-1); a pre-cutover abort answers OK.
 //
 // Mutation: act on a domain or files found by name — red.
 func TestAbort_NoHoldTouchesNothingByName(t *testing.T) {
@@ -562,9 +565,15 @@ func TestAbort_NoHoldTouchesNothingByName(t *testing.T) {
 	f.writeFile(f.permallPath(), []byte("theirs"))
 	for _, mode := range []pb.FirmwareAbortMode{preCutover, discard} {
 		resp, err := f.abort(f.peer, fwtA1, mode, true, f.binding(fwtA1))
-		if err != nil || resp.Refused {
+		if err != nil || resp.Refused != (mode == discard) {
 			t.Fatalf("%v: %+v %v", mode, resp, err)
 		}
+	}
+	if l, ok, err := f.recs.GetLeftover(fwtVM); err != nil || !ok || l.Attempt != fwtA1 {
+		t.Fatalf("leftover record %+v %v %v, want one of the owed attempt", l, ok, err)
+	}
+	if err := f.recs.RemoveLeftover(fwtVM); err != nil {
+		t.Fatal(err)
 	}
 	// A hold of another attempt is not this attempt's either.
 	f.putHold(fwmig.Hold{Binding: f.binding(fwtA2), State: fwmig.HoldPrepared}, nil, nil)

@@ -16,6 +16,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fwmig"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -301,11 +302,33 @@ func TestDoctorFirmwareMove_R1(t *testing.T) {
 	})
 	// Mutations: drop the convergence, or the VF condition, after the adopt —
 	// red.
-	t.Run("hold_no_marker/adopt_converges_and_names_missing_vfs", func(t *testing.T) {
+	// m-1 (re-review 1): only the SR-IOV VFs the spec asks for; a VM whose
+	// spec asks for none raises nothing, whatever rows the source holds.
+	// Mutation: count every PCI row of the VM on the source — red.
+	t.Run("hold_no_marker/adopt_no_sriov_in_spec_raises_no_vf_missing", func(t *testing.T) {
 		r, _ := lostWithOwed(t, true, false, "")
 		if err := corrosion.UpsertPCIDevice(context.Background(), r.src.db, corrosion.PCIDeviceRecord{HostName: "src-host",
 			Address: "0000:3b:02.1", Type: "network", VMName: fwlVM}); err != nil {
 			t.Fatal(err)
+		}
+		if _, err := r.doctor(actAdopt); err != nil {
+			t.Fatalf("adopt: %v", err)
+		}
+		if _, found, _ := corrosion.GetHealthCondition(context.Background(), r.src.db, firmwareMigrationEvaluator, condFwmigVFMissing, "vm", fwlVM); found {
+			t.Error("vf_missing raised for a VM whose spec asks for no SR-IOV VF")
+		}
+	})
+	t.Run("hold_no_marker/adopt_converges_and_names_missing_vfs", func(t *testing.T) {
+		r, _ := lostWithOwed(t, true, false, "")
+		r.specDevices(`[{"sriov":true}]`)
+		for _, d := range []corrosion.PCIDeviceRecord{
+			{HostName: "src-host", Address: "0000:3b:02.1", Type: "network", VMName: fwlVM},
+			{HostName: "src-host", Address: "0000:3b:00.0", Type: "network", SRIOVCapable: true, VMName: fwlVM},
+			{HostName: "src-host", Address: "0000:5e:00.0", Type: "gpu", VMName: fwlVM},
+		} {
+			if err := corrosion.UpsertPCIDevice(context.Background(), r.src.db, d); err != nil {
+				t.Fatal(err)
+			}
 		}
 		r.dst.fwLive.stepHook = func(step string) { r.log.add(step) }
 		if _, err := r.doctor(actAdopt); err != nil {
@@ -318,8 +341,9 @@ func TestDoctorFirmwareMove_R1(t *testing.T) {
 			t.Errorf("no convergence on the adopt (steps %v)", r.log.get())
 		}
 		c, found, err := corrosion.GetHealthCondition(context.Background(), r.src.db, firmwareMigrationEvaluator, condFwmigVFMissing, "vm", fwlVM)
-		if err != nil || !found || c.Lifecycle == corrosion.ConditionResolved || !strings.Contains(c.Evidence, "0000:3b:02.1") {
-			t.Errorf("vf_missing %+v found=%v err=%v, want it open naming 0000:3b:02.1", c, found, err)
+		if err != nil || !found || c.Lifecycle == corrosion.ConditionResolved || !strings.Contains(c.Evidence, "0000:3b:02.1") ||
+			strings.Contains(c.Evidence, "0000:3b:00.0") || strings.Contains(c.Evidence, "0000:5e:00.0") {
+			t.Errorf("vf_missing %+v found=%v err=%v, want it open naming 0000:3b:02.1 only", c, found, err)
 		}
 	})
 
@@ -448,6 +472,263 @@ func TestDoctorFirmwareMove_R1(t *testing.T) {
 		_, err := r.doctor(actAcceptSource)
 		if err == nil || !strings.Contains(err.Error(), "the source's state is suspect") {
 			t.Errorf("err %v, want it to name the suspect state", err)
+		}
+	})
+}
+
+// specDevices sets the device list of the VM's stored spec.
+func (r *fwlRig) specDevices(devices string) {
+	r.t.Helper()
+	vm := r.row()
+	var sp map[string]any
+	if err := json.Unmarshal([]byte(vm.Spec), &sp); err != nil {
+		r.t.Fatal(err)
+	}
+	var d any
+	if err := json.Unmarshal([]byte(devices), &d); err != nil {
+		r.t.Fatal(err)
+	}
+	sp["devices"] = d
+	b, _ := json.Marshal(sp)
+	if err := r.src.db.Execute(context.Background(), `UPDATE vms SET spec = ? WHERE name = ?`, string(b), fwlVM); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
+// Re-review 1 of D2-18 (round 2): the owed leftover kept from the target's
+// reconciler (I-1), a target-local adopt rerun after its resume landed
+// (I-2), every refusal before the target's guest is stopped (I-3), and the
+// minors.
+func TestDoctorFirmwareMove_R2(t *testing.T) {
+	ctx := context.Background()
+	// A released move returned to the fenced source; the target comes back
+	// with the leftover the owed DISCARD names.
+	returnedReleased := func(t *testing.T) (*fwlRig, fwmig.OwedDiscard) {
+		r := newFwdRig(t, fwlOpts{})
+		run := r.crashAt(fwmig.PhaseReleased)
+		r.park(run, fwmig.PhaseTargetUnreachable, "Release was not answered")
+		r.fenceTarget()
+		if _, err := r.doctor(actAcceptSource, withAck); err != nil {
+			t.Fatalf("accept-source: %v", err)
+		}
+		owed, _ := r.src.fwRecords().ListOwedDiscards()
+		if len(owed) != 1 {
+			t.Fatalf("owed discards %+v, want one", owed)
+		}
+		return r, owed[0]
+	}
+	reconcileDst := func(r *fwlRig) {
+		rc := health.NewReconciler(r.dst.hostName, r.dst.dataDir, r.dst.db, r.dstFake)
+		rc.SetFirmwareStore(r.dstStore)
+		rc.ReconcileOnce(ctx)
+	}
+	quarantined := func(t *testing.T, r *fwlRig, o fwmig.OwedDiscard) {
+		t.Helper()
+		if st, ok := r.dstFake.RawState(fwlVM); ok {
+			t.Errorf("the leftover domain is still defined (%s)", st)
+		}
+		dir, _ := r.dst.fwRecords().QuarantinePath(fwlVM, o.Attempt)
+		if b, _ := os.ReadFile(filepath.Join(dir, "nvram")); len(b) == 0 {
+			t.Error("the leftover's NVRAM is not in the quarantine")
+		}
+		if b, _ := os.ReadFile(filepath.Join(dir, "swtpm", "tpm2", "tpm2-00.permall")); len(b) == 0 {
+			t.Error("the leftover's TPM state is not in the quarantine")
+		}
+		if _, ok, _ := r.dst.fwRecords().GetLeftover(fwlVM); ok {
+			t.Error("the leftover record stays")
+		}
+		r.src.RetryOwedFirmwareDiscardsOnce(ctx)
+		if left, _ := r.src.fwRecords().ListOwedDiscards(); len(left) != 0 {
+			t.Errorf("owed discards %+v after the leftover went", left)
+		}
+	}
+
+	// ── I-1: the owed DISCARD puts the leftover under a record, and the
+	// target's reconciler leaves it alone ──
+	// Mutation: answer a no-hold DISCARD without the leftover record — red
+	// (the reconciler undefines the domain with its NVRAM).
+	t.Run("released_target_back_shut_off/reconciler_keeps_leftover", func(t *testing.T) {
+		r, o := returnedReleased(t)
+		r.dstFake.SetState(fwlVM, libvirtfake.StateShutdown)
+		r.dstFake.SetStateReason(fwlVM, "destroyed")
+		r.src.RetryOwedFirmwareDiscardsOnce(ctx)
+		if _, ok, _ := r.dst.fwRecords().GetLeftover(fwlVM); !ok {
+			t.Fatal("the owed DISCARD left no leftover record")
+		}
+		reconcileDst(r)
+		if _, ok := r.dstFake.RawState(fwlVM); !ok {
+			t.Fatal("the target's reconciler undefined the leftover")
+		}
+		if b, _ := os.ReadFile(r.dstStore.NvramPath(fwlVM)); len(b) == 0 {
+			t.Fatal("the leftover's NVRAM is gone")
+		}
+		if _, err := r.doctor(actDiscard); err != nil {
+			t.Fatalf("discard the leftover: %v", err)
+		}
+		quarantined(t, r, o)
+	})
+	// I-1 (a): a running leftover is stopped by the doctor itself, under the
+	// record, never handed to the operator. Mutation: drop the record write
+	// in the doctor's discard — red (the guard refuses the exempt stop).
+	t.Run("released_target_back_running/discard_stop_target", func(t *testing.T) {
+		r, o := returnedReleased(t)
+		r.dstFake.SetState(fwlVM, libvirtfake.StateRunning)
+		_, err := r.doctor(actDiscard)
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "add --stop-target") || strings.Contains(err.Error(), "virsh") {
+			t.Fatalf("err %v, want the --stop-target refusal with no virsh hint", err)
+		}
+		if _, ok, _ := r.dst.fwRecords().GetLeftover(fwlVM); !ok {
+			t.Fatal("the refusal left the running leftover without a record")
+		}
+		if _, err := r.doctor(actDiscard, withStop); err != nil {
+			t.Fatalf("discard --stop-target: %v", err)
+		}
+		quarantined(t, r, o)
+	})
+	// m-3: a run that stops between the quarantine and the undefine is taken
+	// up by the next; the owed DISCARD in between keeps its record.
+	// Mutation: undefine before the quarantine — red.
+	t.Run("released_target_back_shut_off/discard_interrupted", func(t *testing.T) {
+		r, o := returnedReleased(t)
+		r.dstFake.SetState(fwlVM, libvirtfake.StateShutdown)
+		old := fwDoctorLeftoverHook
+		fwDoctorLeftoverHook = func() error { return errors.New("daemon died") }
+		_, err := r.doctor(actDiscard)
+		fwDoctorLeftoverHook = old
+		if err == nil {
+			t.Fatal("first run did not stop")
+		}
+		r.src.RetryOwedFirmwareDiscardsOnce(ctx)
+		if left, _ := r.src.fwRecords().ListOwedDiscards(); len(left) != 1 {
+			t.Fatalf("owed discards %+v, want the record kept", left)
+		}
+		if _, err := r.doctor(actDiscard); err != nil {
+			t.Fatalf("rerun: %v", err)
+		}
+		quarantined(t, r, o)
+	})
+
+	// ── I-2: the target-local adopt is rerun after its resume landed ──
+	// Mutation: refuse a held domain that is not paused — red.
+	for _, step := range []string{"resumed", "published"} {
+		t.Run("hold_no_marker/adopt_interrupted_after_"+step, func(t *testing.T) {
+			r, _ := lostWithOwed(t, true, false, "")
+			old := fwDoctorAdoptHook
+			fwDoctorAdoptHook = func(s string) error {
+				if s == step {
+					return errors.New("daemon died after " + s)
+				}
+				return nil
+			}
+			_, err := r.doctor(actAdopt)
+			fwDoctorAdoptHook = old
+			if err == nil {
+				t.Fatal("first run did not stop")
+			}
+			if h, ok := r.hold(); !ok || h.State != fwmig.HoldResuming {
+				t.Fatalf("hold %+v (%v), want resuming", h.State, ok)
+			}
+			if st, _ := r.dstFake.RawState(fwlVM); st != libvirtfake.StateRunning {
+				t.Fatalf("target domain %s, want running", st)
+			}
+			if _, err := r.doctor(actAdopt); err != nil {
+				t.Fatalf("rerun: %v", err)
+			}
+			if vm := r.row(); vm.HostName != "dst-host" || vm.State != "running" {
+				t.Errorf("row %s on %s, want running on dst-host", vm.State, vm.HostName)
+			}
+			if _, ok := r.hold(); ok {
+				t.Error("the hold stays")
+			}
+		})
+	}
+
+	// ── I-3: the disk refusal comes before the target's guest is stopped ──
+	// Mutation: drop the commit-disk comparison in returnDisks — red (the
+	// return writer declines only after the stop).
+	t.Run("target_ran_from_committed_disk_changed/accept_source_stop_target_refused", func(t *testing.T) {
+		r := newFwdRig(t, fwlOpts{})
+		run := r.crashAt(fwmig.PhaseCommitted)
+		r.dstFake.SetState(fwlVM, libvirtfake.StateRunning)
+		r.park(run, fwmig.PhaseTargetRan, "TARGET_RAN")
+		if err := corrosion.UpdateDiskHostAndPath(ctx, r.src.db, fwlVM, "root", "dst-host", "/srv/nfs/os1-root-moved.qcow2"); err != nil {
+			t.Fatal(err)
+		}
+		before := r.snap()
+		_, err := r.doctor(actAcceptSource, withAck, withStop)
+		r.refused(err, "changed since the commit", before)
+		if st, _ := r.dstFake.RawState(fwlVM); st != libvirtfake.StateRunning {
+			t.Errorf("the target's guest is %s, want it left running", st)
+		}
+		if owed, _ := r.src.fwRecords().ListOwedDiscards(); len(owed) != 0 {
+			t.Errorf("a refused return left owed discards %+v", owed)
+		}
+	})
+
+	// ── m-4: source_paused ──
+	// Mutation: accept a paused target under any hold — red.
+	t.Run("source_paused_target_paused_after_running/accept_source_refused", func(t *testing.T) {
+		r := newFwdRig(t, fwlOpts{})
+		run := r.crashAt(fwmig.PhaseMigrating)
+		r.land()
+		r.srcFake.SetState(fwlVM, libvirtfake.StatePaused)
+		r.dstFake.SetState(fwlVM, libvirtfake.StatePaused)
+		h, _ := r.hold()
+		h.State = fwmig.HoldResuming
+		if err := r.dst.fwRecords().PutHold(h); err != nil {
+			t.Fatal(err)
+		}
+		r.park(run, fwmig.PhaseSourcePaused, "test")
+		before := r.snap()
+		_, err := r.doctor(actAcceptSource)
+		r.refused(err, "may have run", before)
+	})
+	t.Run("source_paused_source_running/refusal_names_its_state", func(t *testing.T) {
+		r := newFwdRig(t, fwlOpts{})
+		run := r.crashAt(fwmig.PhaseMigrating)
+		r.land()
+		r.srcFake.SetState(fwlVM, libvirtfake.StateRunning)
+		r.dstFake.SetState(fwlVM, libvirtfake.StateRunning)
+		r.park(run, fwmig.PhaseSourcePaused, "test")
+		before := r.snap()
+		_, err := r.doctor(actAcceptSource)
+		r.refused(err, "shut the source's running domain off", before)
+	})
+
+	// ── m-5: a forward that never reaches the host that acts is audited at
+	// the entry; one the host audited is not audited twice ──
+	// Mutations: audit only Unavailable at the entry; ignore the trailer —
+	// red.
+	auditRows := func(t *testing.T, r *fwlRig) []string {
+		rows, err := r.src.db.Query(ctx, `SELECT result FROM audit_log WHERE action = ? AND target = ?`, fwDoctorVerb, fwlVM)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, row := range rows {
+			out = append(out, row.String("result"))
+		}
+		return out
+	}
+	t.Run("forward_deadline/audited_at_entry", func(t *testing.T) {
+		r, _ := lostWithOwed(t, true, false, "")
+		r.peerC.mu.Lock()
+		r.peerC.actionErr = status.Error(codes.DeadlineExceeded, "context deadline exceeded")
+		r.peerC.mu.Unlock()
+		if _, err := r.doctor(actAdopt); status.Code(err) != codes.DeadlineExceeded {
+			t.Fatalf("err %v, want the deadline", err)
+		}
+		if got := auditRows(t, r); len(got) != 1 || got[0] != "error" {
+			t.Errorf("audit rows %v, want one error", got)
+		}
+	})
+	t.Run("forwarded_refusal/audited_once", func(t *testing.T) {
+		r, _ := lostWithOwed(t, false, false, "")
+		if _, err := r.doctor(actAdopt); status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("adopt with the source not proved off: %v", err)
+		}
+		if got := auditRows(t, r); len(got) != 1 || got[0] != "error" {
+			t.Errorf("audit rows %v, want one error (the target's)", got)
 		}
 	})
 }

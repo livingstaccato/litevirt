@@ -50,6 +50,11 @@ type LibvirtBackend interface {
 	// shutdown): the attempt's hold prepared, verified, resuming or
 	// released_unconfirmed.
 	StopFirmwareMoveTargetForOperator(name, uuid, attempt string, force bool) error
+	// StopOwedFirmwareLeftover and UndefineOwedFirmwareLeftover act on a
+	// leftover an owed DISCARD names, under its leftover record (D-5
+	// --discard-target): the only stop and undefine of it.
+	StopOwedFirmwareLeftover(name, uuid, attempt string, force bool) error
+	UndefineOwedFirmwareLeftover(name, uuid, attempt string) error
 	// UndefineFirmwareMoveLeftover is the one way a moved VM's source
 	// definition goes (spec §6.7 step 3, I5): marker cleaning, domain shut
 	// off, its NVRAM and TPM state kept for the wipe that follows.

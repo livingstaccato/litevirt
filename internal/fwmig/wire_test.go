@@ -545,3 +545,38 @@ func TestFwmigWire_SourcePausedOnlyBeforeCutover(t *testing.T) {
 		t.Fatal("the M1p entry point resumed a source_paused source")
 	}
 }
+
+// A leftover record (an owed DISCARD's leftover, D2-18 re-review 1 I-1) is a
+// record the guard sees, by name and by uuid, and refuses every ordinary
+// call on; one that does not read is unreadable, as a hold is.
+//
+// Mutation: leave the leftover out of the uuid walk — red.
+func TestFwmigWire_LeftoverVetoes(t *testing.T) {
+	r := New(t.TempDir())
+	l := Leftover{VM: wireVM, Binding: wireMarker(wireVM, PhaseCutover).Binding, Source: "node-1", Since: time.Unix(1, 0)}
+	if err := r.PutLeftover(l); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range [][2]string{{wireVM, ""}, {"", strings.ToUpper(wireUUID)}} {
+		recs, err := r.Lookup(q[0], q[1])
+		if err != nil || len(recs) != 1 || recs[0].Kind != lv.FirmwareLeftover || recs[0].Peer != "node-1" || recs[0].Attempt != wireAttempt {
+			t.Fatalf("lookup %v: %+v %v", q, recs, err)
+		}
+	}
+	g := lv.NewFirmwareMoveGuard(r.Lookup)
+	if err := g.Check(lv.FirmwareCall{Op: lv.OpUndefine, Name: wireVM}); !errors.Is(err, lv.ErrFirmwareMoveInFlight) {
+		t.Fatalf("ordinary undefine under a leftover record: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(r.dataDir, LeftoverDir, wireVM+".json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if u := r.Unreadable(); len(u) != 1 {
+		t.Fatalf("unreadable %+v, want the leftover", u)
+	}
+	if err := r.RemoveLeftover(wireVM); err != nil {
+		t.Fatal(err)
+	}
+	if recs, err := r.Lookup(wireVM, wireUUID); err != nil || len(recs) != 0 {
+		t.Fatalf("after removal: %+v %v", recs, err)
+	}
+}

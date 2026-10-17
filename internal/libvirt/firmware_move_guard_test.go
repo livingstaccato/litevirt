@@ -64,6 +64,13 @@ func fwHold(state string) fwState {
 	}}}
 }
 
+func fwLeftover() fwState {
+	return fwState{name: "leftover", recs: []FirmwareMoveRecord{{
+		Kind: FirmwareLeftover, VM: fwTestVM, UUID: fwTestUUID, Attempt: fwTestAttempt,
+		Peer: "node-1", State: "leftover",
+	}}}
+}
+
 // fwStates: no record; a record that cannot be read; a marker in every phase
 // (a parked one from a pre-cutover and from a post-cutover phase; a cleaning
 // one with and without its retained bundle); a hold in every state.
@@ -84,7 +91,7 @@ func fwStates() []fwState {
 	for _, h := range fwHoldStates {
 		out = append(out, fwHold(h))
 	}
-	return out
+	return append(out, fwLeftover())
 }
 
 // fwLookup answers from st: the records that carry the name or the uuid.
@@ -330,10 +337,6 @@ func fwPrims() map[FirmwareOp][]fwPrim {
 			// vm_replace_cleanup.go:348 case).
 			{name: "WipeFirmwareStateByUUID", bestEffort: true, run: func(e *fwEnv) error { e.store.WipeFirmwareStateByUUID(fwTestUUID); return nil },
 				acted: func(e *fwEnv) bool { return !e.hasSwtpm() }},
-			// The D-5 discard of a leftover no record names: an ordinary call.
-			{name: "QuarantineFirmwareStateForOperator", run: func(e *fwEnv) error {
-				return e.store.QuarantineFirmwareStateForOperator(fwTestVM, fwTestUUID, filepath.Join(e.store.DataDir, "q"))
-			}, acted: func(e *fwEnv) bool { _, ok := e.nvram(fwTestVM); return !ok && !e.hasSwtpm() }},
 		},
 	}
 }
@@ -419,6 +422,7 @@ func fwExempts() []fwExempt {
 		}
 	}
 	held := hold("prepared", "verified", "resuming", "mismatch")
+	leftover := func(r FirmwareMoveRecord) bool { return r.Kind == FirmwareLeftover }
 	nvram := []byte("PUSHED")
 	return []fwExempt{
 		// §7 M1p and its retry: before cutover only, never source_paused.
@@ -488,6 +492,20 @@ func fwExempts() []fwExempt {
 			run: func(e *fwEnv, id, a string) error {
 				return e.store.QuarantineFirmwareMoveTargetState(fwTestVM, id, a, filepath.Join(e.store.DataDir, "q"))
 			}, acted: func(e *fwEnv) bool { _, ok := e.nvram(fwTestVM); return !ok && !e.hasSwtpm() }},
+		// D-5 --discard-target of a leftover an owed DISCARD names: under
+		// its leftover record only.
+		{via: ViaStopOwedFirmwareLeftover, op: OpStop, dom: golibvirt.DomainRunning, allow: leftover,
+			run: func(e *fwEnv, id, a string) error {
+				return stopForOperator(e.api, e.guard, fwTestVM, id, a, true, ViaStopOwedFirmwareLeftover)
+			}, acted: func(e *fwEnv) bool { return e.api.called("destroy") }},
+		{via: ViaUndefineOwedFirmwareLeftover, op: OpUndefine, dom: golibvirt.DomainShutoff, allow: leftover,
+			run: func(e *fwEnv, id, a string) error {
+				return undefineKeepingState(e.api, e.guard, fwTestVM, id, a, ViaUndefineOwedFirmwareLeftover)
+			}, acted: func(e *fwEnv) bool { return e.api.called("undefine") }},
+		{via: ViaQuarantineOwedFirmwareLeftover, op: OpWipe, allow: leftover,
+			run: func(e *fwEnv, id, a string) error {
+				return e.store.QuarantineOwedFirmwareLeftover(fwTestVM, id, a, filepath.Join(e.store.DataDir, "q"))
+			}, acted: func(e *fwEnv) bool { _, ok := e.nvram(fwTestVM); return !ok && !e.hasSwtpm() }},
 		// D-5 --accept-target on a stopped source cleanup: a cleaning marker,
 		// bundle or not; never a hold, never another phase.
 		{via: ViaQuarantineFirmwareMoveSourceForOperator, op: OpWipe,
@@ -554,6 +572,9 @@ func TestFirmwareMoveGuard_ExemptBinding(t *testing.T) {
 		ViaRemoveFirmwareMoveTargetState:           fwHold("prepared"),
 		ViaQuarantineFirmwareMoveTargetState:       fwHold("mismatch"),
 		ViaQuarantineFirmwareMoveSourceForOperator: fwMarker("m", "cleaning", false, false),
+		ViaStopOwedFirmwareLeftover:                fwLeftover(),
+		ViaUndefineOwedFirmwareLeftover:            fwLeftover(),
+		ViaQuarantineOwedFirmwareLeftover:          fwLeftover(),
 	}
 	for _, x := range fwExempts() {
 		st, ok := allowing[x.via]

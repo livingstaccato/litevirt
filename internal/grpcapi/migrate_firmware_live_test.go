@@ -74,6 +74,9 @@ type fwlPeer struct {
 
 	mu            sync.Mutex
 	unimplemented map[string]bool
+	// actionErr, when set, fails a forwarded doctor action (not a read)
+	// before it reaches the target, as a transport would.
+	actionErr error
 	// prepareAfter replaces Prepare's answer after the handler ran.
 	prepareAfter func(*pb.PrepareLiveFirmwareTargetResponse, error) (*pb.PrepareLiveFirmwareTargetResponse, error)
 	// abortAnswer, when set, answers Abort in place of the handler.

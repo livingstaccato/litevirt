@@ -36,8 +36,9 @@ var fwExemptOwners = map[string][]string{
 	// Release, the one resume of a held target guest, and its H1 NVRAM push.
 	// The doctor's adopt on a target whose source host is lost releases the
 	// adopted guest through the same resume (D-5).
-	"ResumeFirmwareMoveTarget": {"internal/grpcapi.Server.resumeReleased"},
-	"resumeReleased":           {"internal/grpcapi.Server.ReleaseLiveFirmwareTarget", "internal/grpcapi.Server.doctorTargetLocalAdopt"},
+	"ResumeFirmwareMoveTarget": {"internal/grpcapi.Server.resumeReleased", "internal/grpcapi.Server.releaseAdoptedHold"},
+	"resumeReleased":           {"internal/grpcapi.Server.ReleaseLiveFirmwareTarget"},
+	"releaseAdoptedHold":       {"internal/grpcapi.Server.doctorTargetLocalAdopt"},
 	// H1's push, and the D-5 push of held_domain_absent (H1's checks without
 	// "domain defined", D2-6 m-10).
 	"PushFirmwareMoveNvram": {"internal/grpcapi.Server.releaseH1", "internal/grpcapi.Server.pushSourceNvramForOperator"},
@@ -74,6 +75,11 @@ var fwExemptOwners = map[string][]string{
 	"doctorTargetLocalAct":                    {"internal/grpcapi.Server.firmwareMoveDoctorAct"},
 	"doctorSourceAct":                         {"internal/grpcapi.Server.firmwareMoveDoctorAct"},
 	"firmwareMoveDoctorAct":                   {"internal/grpcapi.Server.FirmwareMoveDoctor"},
+	// The D-5 --discard-target of a leftover an owed DISCARD names.
+	"StopOwedFirmwareLeftover":       {"internal/grpcapi.Server.doctorDiscardOwedLeftover"},
+	"QuarantineOwedFirmwareLeftover": {"internal/grpcapi.Server.doctorDiscardOwedLeftover"},
+	"UndefineOwedFirmwareLeftover":   {"internal/grpcapi.Server.doctorDiscardOwedLeftover"},
+	"doctorDiscardOwedLeftover":      {"internal/grpcapi.Server.firmwareMoveDoctorAct"},
 }
 
 // fwRawLibvirt: the raw libvirt calls that undefine, resume, destroy or
@@ -82,7 +88,7 @@ var fwExemptOwners = map[string][]string{
 var fwRawLibvirt = map[string][]string{
 	"DomainUndefineFlags": {
 		"internal/libvirt.discardFirmwareMoveTarget", "internal/libvirt.undefineDomain",
-		"internal/libvirt.undefineDomainPreservingState", "internal/libvirt.undefineFirmwareMoveLeftover",
+		"internal/libvirt.undefineDomainPreservingState", "internal/libvirt.undefineKeepingState",
 		"internal/libvirt.forceRemoveDomain", "internal/libvirt.revertToLiveSnapshot", "internal/libvirt.revertToSnapshot",
 	},
 	"DomainResume": {
@@ -91,7 +97,7 @@ var fwRawLibvirt = map[string][]string{
 	},
 	"DomainDestroy": {
 		"internal/libvirt.startDomainGuarded", "internal/libvirt.destroyDomain", "internal/libvirt.discardFirmwareMoveTarget",
-		"internal/libvirt.stopFirmwareMoveTargetForOperator", "internal/libvirt.forceRemoveDomain",
+		"internal/libvirt.stopForOperator", "internal/libvirt.forceRemoveDomain",
 		"internal/libvirt.restoreWithRetry", "internal/libvirt.revertToLiveSnapshot", "internal/libvirt.revertToSnapshot",
 	},
 	"DomainDefineXML": {

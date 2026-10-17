@@ -700,7 +700,35 @@ func (f *Fake) UndefineFirmwareMoveLeftover(name, uuid, attempt string) error {
 // StopFirmwareMoveTargetForOperator mirrors
 // libvirt.Client.StopFirmwareMoveTargetForOperator.
 func (f *Fake) StopFirmwareMoveTargetForOperator(name, uuid, attempt string, force bool) error {
-	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpStop, Name: name, UUID: uuid, Attempt: attempt, Via: libvirt.ViaStopFirmwareMoveTargetForOperator}); err != nil {
+	return f.stopForOperator(name, uuid, attempt, force, libvirt.ViaStopFirmwareMoveTargetForOperator)
+}
+
+// StopOwedFirmwareLeftover mirrors libvirt.Client.StopOwedFirmwareLeftover.
+func (f *Fake) StopOwedFirmwareLeftover(name, uuid, attempt string, force bool) error {
+	return f.stopForOperator(name, uuid, attempt, force, libvirt.ViaStopOwedFirmwareLeftover)
+}
+
+// UndefineOwedFirmwareLeftover mirrors
+// libvirt.Client.UndefineOwedFirmwareLeftover: the domain must be shut off.
+func (f *Fake) UndefineOwedFirmwareLeftover(name, uuid, attempt string) error {
+	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpUndefine, Name: name, UUID: uuid, Attempt: attempt, Via: libvirt.ViaUndefineOwedFirmwareLeftover}); err != nil {
+		return fmt.Errorf("undefine leftover %s: %w", name, err)
+	}
+	st, ok, err := f.boundDomain(name, uuid)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("libvirtfake: domain %q not defined", name)
+	}
+	if st != StateShutdown {
+		return fmt.Errorf("undefine leftover %s: the domain is not shut off (%s)", name, st)
+	}
+	return f.undefinePreservingState(name)
+}
+
+func (f *Fake) stopForOperator(name, uuid, attempt string, force bool, via libvirt.FirmwareExemption) error {
+	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpStop, Name: name, UUID: uuid, Attempt: attempt, Via: via}); err != nil {
 		return fmt.Errorf("stop %s: %w", name, err)
 	}
 	if _, ok, err := f.boundDomain(name, uuid); err != nil {

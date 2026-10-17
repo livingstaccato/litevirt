@@ -39,7 +39,7 @@ func Wire(virt Virt, store *lv.FirmwareStore) {
 // read (the guard's own type, so it can name the file in its refusal).
 type UnreadableRecordError = lv.FirmwareRecordUnreadableError
 
-// Lookup returns every marker and hold that names the VM: the record under
+// Lookup returns every marker, hold and leftover record that names the VM: the record under
 // name, and, when uuid is set, any record of that uuid under any name. A
 // record that cannot be read — corrupt, of a value this build does not know,
 // in a directory that cannot be listed — is an *UnreadableRecordError naming
@@ -72,6 +72,14 @@ func (r *Records) Lookup(name, uuid string) ([]lv.FirmwareMoveRecord, error) {
 		out = append(out, rec)
 		return nil
 	}
+	addLeftover := func(l Leftover) {
+		if seen["l/"+l.VM] {
+			return
+		}
+		seen["l/"+l.VM] = true
+		out = append(out, lv.FirmwareMoveRecord{Kind: lv.FirmwareLeftover, VM: l.VM, UUID: l.UUID, Attempt: l.Attempt,
+			Peer: l.Source, State: string(lv.FirmwareLeftover)})
+	}
 	addHold := func(h Hold) {
 		if seen["h/"+h.VM] {
 			return
@@ -103,6 +111,16 @@ func (r *Records) Lookup(name, uuid string) ([]lv.FirmwareMoveRecord, error) {
 		if ok {
 			addHold(h)
 		}
+		if p, err = r.vmPath(LeftoverDir, name); err != nil {
+			return nil, err
+		}
+		l, ok, err := r.readLeftover(p, name)
+		if err != nil {
+			return nil, &UnreadableRecordError{Path: p, Err: err}
+		}
+		if ok {
+			addLeftover(l)
+		}
 	}
 	if uuid != "" {
 		var err error
@@ -124,6 +142,18 @@ func (r *Records) Lookup(name, uuid string) ([]lv.FirmwareMoveRecord, error) {
 				}
 				if ok && strings.EqualFold(h.UUID, uuid) {
 					addHold(h)
+				}
+				return nil
+			})
+		}
+		if walkErr == nil {
+			walkErr = r.eachRecord(LeftoverDir, func(p, vm string) error {
+				l, ok, rerr := r.readLeftover(p, vm)
+				if rerr != nil {
+					return &UnreadableRecordError{Path: p, Err: rerr}
+				}
+				if ok && strings.EqualFold(l.UUID, uuid) {
+					addLeftover(l)
 				}
 				return nil
 			})
@@ -163,18 +193,21 @@ func (r *Records) eachRecord(sub string, fn func(path, vm string) error) error {
 	return nil
 }
 
-// Unreadable is every marker and hold file (and record directory) on this
+// Unreadable is every marker, hold and leftover file (and record directory) on this
 // host that cannot be read: what the guard would refuse on. The daemon raises
 // firmware_migration_record_unreadable from it.
 func (r *Records) Unreadable() []*UnreadableRecordError {
 	var out []*UnreadableRecordError
-	for _, sub := range []string{InflightDir, HoldDir} {
+	for _, sub := range []string{InflightDir, HoldDir, LeftoverDir} {
 		read := func(p, vm string) error {
 			var err error
-			if sub == InflightDir {
+			switch sub {
+			case InflightDir:
 				_, _, err = r.readMarker(p, vm)
-			} else {
+			case HoldDir:
 				_, _, err = r.readHold(p, vm)
+			default:
+				_, _, err = r.readLeftover(p, vm)
 			}
 			if err != nil {
 				out = append(out, &UnreadableRecordError{Path: p, Err: err})

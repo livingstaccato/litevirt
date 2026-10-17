@@ -642,12 +642,11 @@ func (f *FirmwareStore) QuarantineFirmwareMoveSourceForOperator(vmName, uuid, at
 	return f.quarantineMoveState(vmName, uuid, dir)
 }
 
-// QuarantineFirmwareStateForOperator moves a VM's NVRAM and swtpm tree into
-// dir when no firmware move record names it on this host (an ordinary
-// OpWipe): the D-5 --discard-target of a target's leftover definition that an
-// owed DISCARD names after its hold is gone. Nothing is deleted.
-func (f *FirmwareStore) QuarantineFirmwareStateForOperator(vmName, uuid, dir string) error {
-	if err := f.moveGuard().check(FirmwareCall{Op: OpWipe, Name: vmName, UUID: uuid}); err != nil {
+// QuarantineOwedFirmwareLeftover moves the NVRAM and swtpm tree of a leftover
+// an owed DISCARD names into dir, under its leftover record (D-5
+// --discard-target). Nothing is deleted.
+func (f *FirmwareStore) QuarantineOwedFirmwareLeftover(vmName, uuid, attempt, dir string) error {
+	if err := f.moveGuard().check(FirmwareCall{Op: OpWipe, Name: vmName, UUID: uuid, Attempt: attempt, Via: ViaQuarantineOwedFirmwareLeftover}); err != nil {
 		return fmt.Errorf("quarantine firmware state of %s: %w", vmName, err)
 	}
 	return f.quarantineMoveState(vmName, uuid, dir)

@@ -38,13 +38,14 @@ const (
 	HoldDir        = "fwmig-hold"         // target hold, <vm>.json
 	RetainedDir    = "fwmig-retained"     // retained bundle, <vm>-<attempt>.tar
 	QuarantineDir  = "fwmig-quarantine"   // quarantine, <vm>-<attempt>/
+	LeftoverDir    = "fwmig-leftover"     // owed leftover, <vm>.json
 )
 
 // Dirs are the record directories, every one of them: each is the daemon's
 // own child of the data directory, and no storage pool may be aimed at one
 // (storage.dataDirOwned). TestDirs_EveryDirConstant pins it to the constants.
 func Dirs() []string {
-	return []string{InflightDir, DiscardOwedDir, HoldDir, RetainedDir, QuarantineDir}
+	return []string{InflightDir, DiscardOwedDir, HoldDir, RetainedDir, QuarantineDir, LeftoverDir}
 }
 
 // Phase is a source marker's phase.
@@ -354,6 +355,69 @@ type Hold struct {
 	// took the hold to verified (or resuming) without a Verify MATCH (spec
 	// §17 D-5, the hold transition). Absent from every hold a move writes.
 	Adoption *HoldAdoption `json:"adoption,omitempty"`
+}
+
+// Leftover is a target's record of a domain an owed DISCARD names after its
+// hold went, <dataDir>/fwmig-leftover/<vm>.json: written when the DISCARD
+// reaches this host and finds the owed incarnation's domain defined, and by
+// the D-5 --discard-target of that domain. It vetoes every ordinary call on
+// the VM here, as a hold does, until the leftover is quarantined (§17 D-5).
+type Leftover struct {
+	VM string `json:"vm"`
+	Binding
+	Source string    `json:"source"`
+	Since  time.Time `json:"since"`
+}
+
+// Validate checks every field's domain.
+func (l Leftover) Validate() error {
+	if err := validateCommon(l.VM, l.Binding, l.Since); err != nil {
+		return err
+	}
+	return validateHost("source", l.Source)
+}
+
+// PutLeftover writes vm's leftover record durably.
+func (r *Records) PutLeftover(l Leftover) error {
+	if err := l.Validate(); err != nil {
+		return err
+	}
+	p, err := r.vmPath(LeftoverDir, l.VM)
+	if err != nil {
+		return err
+	}
+	return r.put(p, l)
+}
+
+// GetLeftover reads vm's leftover record; ok is false when there is none. It
+// does NOT check the binding.
+func (r *Records) GetLeftover(vm string) (Leftover, bool, error) {
+	p, err := r.vmPath(LeftoverDir, vm)
+	if err != nil {
+		return Leftover{}, false, err
+	}
+	return r.readLeftover(p, vm)
+}
+
+func (r *Records) readLeftover(p, vm string) (Leftover, bool, error) {
+	var l Leftover
+	ok, err := r.get(p, &l)
+	if err != nil || !ok {
+		return Leftover{}, false, err
+	}
+	if l.VM != vm {
+		return Leftover{}, false, fmt.Errorf("fwmig: leftover %s names vm %q", p, l.VM)
+	}
+	return l, true, nil
+}
+
+// RemoveLeftover drops vm's leftover record durably; absent is success.
+func (r *Records) RemoveLeftover(vm string) error {
+	p, err := r.vmPath(LeftoverDir, vm)
+	if err != nil {
+		return err
+	}
+	return r.remove(p)
 }
 
 // HoldAdoption is who adopted the target's copy, when, from which hold state,
@@ -779,7 +843,7 @@ func (r *Records) SweepTemps() error {
 	if err != nil {
 		return err
 	}
-	for _, sub := range []string{InflightDir, HoldDir, DiscardOwedDir} {
+	for _, sub := range []string{InflightDir, HoldDir, DiscardOwedDir, LeftoverDir} {
 		if err := r.sweepDir(filepath.Join(root, sub)); err != nil {
 			return err
 		}

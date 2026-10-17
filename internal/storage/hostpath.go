@@ -218,6 +218,7 @@ var dataDirOwned = []string{
 	"fwmig-hold",                // fwmig.HoldDir: live firmware move target holds
 	"fwmig-retained",            // fwmig.RetainedDir: retained firmware bundles
 	"fwmig-quarantine",          // fwmig.QuarantineDir: quarantined firmware state
+	"fwmig-leftover",            // fwmig.LeftoverDir: leftovers an owed DISCARD names
 	"promote-started",           // grpcapi/promote_serialize.go: an operator promotion's recorded start, per proof
 	"shared-disk-released",      // health/shared_disk_release.go sharedReleaseDir: shared disks released for a start
 	"vfio-host-drivers.json",    // vfio.HostDriversFileName (grpcapi/pci.go vfioHost): each bound device's previous host driver (its .tmp is a dot-name)

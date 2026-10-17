@@ -61,20 +61,25 @@ func newOperationShowCmd() *cobra.Command {
 
 func newOperationAbortCmd() *cobra.Command {
 	var force bool
+	var operation string
 	cmd := &cobra.Command{
 		Use:   "abort <vm>",
 		Short: "Force-clear a wedged operation's mutation barrier (admin recovery)",
 		Long: `Force-clear the operation holding a VM's mutation barrier so the VM can be
 mutated again. This is a deliberate recovery action for a wedged operation — it
 clears the barrier only via the exact owner/generation compare-and-swap (a stale
-or superseded operation can't clear a newer one). Requires --force.`,
+or superseded operation can't clear a newer one). Requires --force.
+
+With --operation <id>, the abort is refused unless <id> is the VM's active
+operation, so an operation that finished, or was followed by another, between
+lv operation show and the abort is never the one cleared.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !force {
 				return fmt.Errorf("--force is required to abort an operation")
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				resp, err := c.AbortVMOperation(ctx, &pb.AbortVMOperationRequest{VmName: args[0], Force: true})
+				resp, err := c.AbortVMOperation(ctx, &pb.AbortVMOperationRequest{VmName: args[0], Force: true, OperationId: operation})
 				if err != nil {
 					return fmt.Errorf("abort operation: %w", err)
 				}
@@ -88,6 +93,7 @@ or superseded operation can't clear a newer one). Requires --force.`,
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "Confirm the destructive abort")
+	cmd.Flags().StringVar(&operation, "operation", "", "Abort only if this operation id is the VM's active operation")
 	return cmd
 }
 

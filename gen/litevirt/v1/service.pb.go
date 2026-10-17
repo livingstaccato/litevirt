@@ -20898,9 +20898,12 @@ func (x *GetVMOperationResponse) GetSteps() []*OperationStepInfo {
 }
 
 type AbortVMOperationRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VmName        string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
-	Force         bool                   `protobuf:"varint,2,opt,name=force,proto3" json:"force,omitempty"` // required — an abort is never implicit
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	VmName string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
+	Force  bool                   `protobuf:"varint,2,opt,name=force,proto3" json:"force,omitempty"` // required — an abort is never implicit
+	// operation_id, when set, scopes the abort: it is refused unless the VM's
+	// active operation is exactly this one. Empty aborts whatever is active.
+	OperationId   string `protobuf:"bytes,3,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -20947,6 +20950,13 @@ func (x *AbortVMOperationRequest) GetForce() bool {
 		return x.Force
 	}
 	return false
+}
+
+func (x *AbortVMOperationRequest) GetOperationId() string {
+	if x != nil {
+		return x.OperationId
+	}
+	return ""
 }
 
 type AbortVMOperationResponse struct {
@@ -44819,10 +44829,11 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0evm_owner_epoch\x18\x06 \x01(\x03R\fvmOwnerEpoch\x12'\n" +
 	"\x0fspec_generation\x18\a \x01(\x03R\x0especGeneration\x12%\n" +
 	"\x0eheader_missing\x18\b \x01(\bR\rheaderMissing\x124\n" +
-	"\x05steps\x18\t \x03(\v2\x1e.litevirt.v1.OperationStepInfoR\x05steps\"H\n" +
+	"\x05steps\x18\t \x03(\v2\x1e.litevirt.v1.OperationStepInfoR\x05steps\"k\n" +
 	"\x17AbortVMOperationRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x14\n" +
-	"\x05force\x18\x02 \x01(\bR\x05force\"\x80\x01\n" +
+	"\x05force\x18\x02 \x01(\bR\x05force\x12!\n" +
+	"\foperation_id\x18\x03 \x01(\tR\voperationId\"\x80\x01\n" +
 	"\x18AbortVMOperationResponse\x12\x18\n" +
 	"\aaborted\x18\x01 \x01(\bR\aaborted\x122\n" +
 	"\x15previous_operation_id\x18\x02 \x01(\tR\x13previousOperationId\x12\x16\n" +

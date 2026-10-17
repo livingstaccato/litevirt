@@ -2373,6 +2373,9 @@ message GetVMOperationResponse {
 message AbortVMOperationRequest {
     string vm_name = 1;
     bool   force   = 2; // required — an abort is never implicit
+    // operation_id, when set, scopes the abort: it is refused unless the VM's
+    // active operation is exactly this one. Empty aborts whatever is active.
+    string operation_id = 3;
 }
 message AbortVMOperationResponse {
     bool   aborted               = 1;

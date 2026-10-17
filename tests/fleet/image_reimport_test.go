@@ -93,7 +93,12 @@ func settleByAntiEntropy(t *testing.T, c *Cluster, whileApart bool) {
 				return
 			}
 		}
-		antiEntropyEverywhere(t, c)
+		// A pass that does not run (a node in release probation, or one
+		// already in progress) is not a failure here, as it was not in
+		// settleLatch: the next round asks again, and only the deadline fails.
+		for _, n := range c.Nodes {
+			corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(context.Background())
+		}
 		settle := time.Now().Add(2 * time.Second)
 		for {
 			apart, err := divergence(c.Nodes)

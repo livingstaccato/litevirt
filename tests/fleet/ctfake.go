@@ -65,6 +65,7 @@ type CTFake struct {
 	startErr  error
 	exportErr error
 	importErr error
+	deleteErr error
 	listErr   error
 
 	// onExport runs INSIDE ExportContainer, i.e. during a migrate's archive
@@ -243,6 +244,14 @@ func (f *CTFake) FailImport(err error) {
 	f.importErr = err
 }
 
+// FailDelete makes DeleteContainer fail with err: a migrate whose target
+// landed then parks its source.
+func (f *CTFake) FailDelete(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleteErr = err
+}
+
 // OnExport registers fn to run inside the next ExportContainer call. See the
 // onExport field: this is the mid-migrate window.
 func (f *CTFake) OnExport(fn func()) {
@@ -392,6 +401,9 @@ func (f *CTFake) DeleteContainer(_ context.Context, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleteCalls = append(f.deleteCalls, name)
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	if _, ok := f.state[name]; !ok {
 		// Idempotent: the migrate finaliser treats this as success on retry.
 		return lxc.ErrContainerNotFound

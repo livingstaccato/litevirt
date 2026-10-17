@@ -1574,6 +1574,14 @@ rows go, and the stack's default is removed only once the new rows are written
 and only when the new file drops it. A redeploy that fails part way leaves the
 cluster denying, with fewer accepts, until the next one succeeds.
 
+A security-group rule or a `firewall.cluster-rules` entry takes
+`cidr: "tag:<group>"`, naming a tag group (`lv firewall tag-group set`). The
+group must already exist, and a stack deploy that holds one is refused until
+the cluster upgrade has finished. A group's members come from firewall tags,
+which a compose file does not set (`lv firewall tag set`, docs/firewall.md,
+"Tag groups"). `lv compose up` asks the daemon first and refuses against one
+that does not know tag groups.
+
 Per-NIC security groups can also be bound at runtime with
 `lv sg bind <vm> --network <name> --sg <name>`. See
 [`docs/firewall.md`](firewall.md) for the three-tier model and CLI surface.

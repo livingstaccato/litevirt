@@ -312,6 +312,9 @@ func TestSetName_ReservedPrefix(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), `"lv_"`) || !strings.Contains(err.Error(), "choose another name") {
 			t.Errorf("SetName(%s) = %v, want a refusal naming the reserved prefix and the remedy", name, err)
 		}
+		if err := IPSet(name, []string{"10.0.0.0/8"}); err == nil {
+			t.Errorf("IPSet(%s) accepted", name)
+		}
 	}
 	for _, name := range []string{"lv", "lvx_a", "LV_gw4", "office_lv_"} {
 		if err := SetName(name); err != nil {
@@ -321,5 +324,44 @@ func TestSetName_ReservedPrefix(t *testing.T) {
 	// The renderer's own internal names still pass the nft-level check.
 	if err := RenderSetName("lv_gw4"); err != nil {
 		t.Errorf("RenderSetName(lv_gw4): %v", err)
+	}
+}
+
+// D5a (D4 re-review m-C): a rule's cidr never references a reserved set,
+// bare, compared or negated. A tag group's own set (lv_tg_<g>, lv_tg_<g>_v6)
+// is refused naming tag:<g>, the one way to reference a group; any other
+// lv_* set is refused as reserved. A user set's reference passes as before.
+// The render-side check (RenderCIDR) still passes a stored reference.
+//
+// Mutations: CIDR checks a set reference with RenderSetName (no reserved
+// prefix) — @lv_gw4 passes, red; drop the tag-group branch — @lv_tg_web is
+// refused without naming tag:web, red.
+func TestCIDR_RefusesReservedSetReferences(t *testing.T) {
+	for cidr, want := range map[string]string{
+		"@lv_gw4":          `"lv_"`,
+		"!= @lv_office":    `"lv_"`,
+		"ne @lv_nic_devs":  `"lv_"`,
+		"== @lv_lb_src4":   `"lv_"`,
+		"@lv_tg_web":       "tag:web",
+		"!= @lv_tg_web":    "tag:web",
+		"@lv_tg_web_v6":    "tag:web",
+		"!=@lv_tg_db_2_v6": "tag:db_2",
+		"eq @lv_tg_x":      "tag:x",
+	} {
+		err := CIDR(cidr)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("CIDR(%q) = %v, want refused naming %s", cidr, err, want)
+		}
+		if err := Rule("ingress", "tcp", "22", cidr, "drop", ""); err == nil {
+			t.Errorf("Rule with cidr %q accepted", cidr)
+		}
+		if err := RenderCIDR(cidr); err != nil {
+			t.Errorf("RenderCIDR(%q) = %v: a stored reference must still render", cidr, err)
+		}
+	}
+	for _, cidr := range []string{"@office", "!= @office", "@lv", "@lvx_a"} {
+		if err := CIDR(cidr); err != nil {
+			t.Errorf("CIDR(%q): %v", cidr, err)
+		}
 	}
 }

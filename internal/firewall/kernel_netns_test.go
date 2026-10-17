@@ -110,7 +110,8 @@ func TestKernel_NICGuard(t *testing.T) {
 		"TestKernelChild_RulesHoldOnEveryPath", "TestKernelChild_DefaultDenyAndBypasses",
 		"TestKernelChild_VLANToNICAndTrunk", "TestKernelChild_SynFloodShapeLoads",
 		"TestKernelChild_IsolatedNetworkStaysOnHost", "TestKernelChild_HostIsolationAnswersTheHost",
-		"TestKernelChild_HostIsolatedGatewayRoutesWithSNAT", "TestKernelChild_GuestVRRPNeverReachesTheHost"} {
+		"TestKernelChild_HostIsolatedGatewayRoutesWithSNAT", "TestKernelChild_GuestVRRPNeverReachesTheHost",
+		"TestKernelChild_TagGroupsHoldOnTheWire"} {
 		if !strings.Contains(string(out), "--- PASS: "+child) {
 			t.Errorf("%s did not pass in the namespace", child)
 		}

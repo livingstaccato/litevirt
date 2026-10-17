@@ -1353,6 +1353,7 @@ Operators should monitor these Prometheus metrics:
 | `litevirt_daemon_open_fds` | > 5000 (FD leak) |
 | `litevirt_lb_keepalived_up{lb}` | `== 0` sustained (a load balancer's VIP is not assigned — see [compose.md](compose.md#load-balancer)) |
 | `litevirt_firewall_sg_duplicate_name_nics{sg}` | `> 0` (NICs held at drop because two live security groups share the name — see [firewall.md](firewall.md#per-nic-sg-binding--reload)) |
+| `litevirt_firewall_tag_group_members{group}` | a group at `0` that should have members (a tag or lease did not replicate, or the group cannot be read here — see [diagnostics.md](diagnostics.md#tag-group-conditions-firewalltag_group)) |
 
 The web UI at port 7445 surfaces the most critical of these on the
 **Cluster** page; full dashboards are on the roadmap.

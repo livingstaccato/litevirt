@@ -2,18 +2,24 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cli"
+	"github.com/litevirt/litevirt/internal/compose"
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 	"github.com/litevirt/litevirt/internal/gitops"
 )
 
@@ -57,13 +63,7 @@ func newGitopsCmd() *cobra.Command {
 					return fmt.Errorf("dial daemon: %w", err)
 				}
 				defer closer()
-				stream, err := client.DeployStack(ctx, &pb.DeployStackRequest{
-					ComposeYaml: body,
-				})
-				if err != nil {
-					return fmt.Errorf("DeployStack: %w", err)
-				}
-				return gitops.DrainDeploy(stream)
+				return gitopsDeploy(ctx, client, path, body)
 			}
 
 			// Differ short-circuits no-op cycles: it returns the number of
@@ -190,4 +190,81 @@ func formatCommitStatus(s gitops.CommitStatus) string {
 		}
 	}
 	return b.String()
+}
+
+// gitopsTagRE matches "tag" then ":" in any case and spacing.
+var gitopsTagRE = regexp.MustCompile(`(?i)tag\s*:`)
+
+// gitopsYAMLMayHoldTag reports whether any string of any YAML document in
+// body, a key or a value, holds tag:. It reads the DECODED documents, so a
+// quoted escape ("\x74ag:web"), an alias or a folded scalar cannot hide one.
+// ok is false when body is not valid YAML.
+func gitopsYAMLMayHoldTag(body string) (hit, ok bool) {
+	dec := yaml.NewDecoder(strings.NewReader(body))
+	for {
+		var doc any
+		err := dec.Decode(&doc)
+		if errors.Is(err, io.EOF) {
+			return false, true
+		}
+		if err != nil {
+			return false, false
+		}
+		if yamlHoldsTag(doc) {
+			return true, true
+		}
+	}
+}
+
+func yamlHoldsTag(v any) bool {
+	switch x := v.(type) {
+	case string:
+		return gitopsTagRE.MatchString(x)
+	case map[string]any:
+		for k, e := range x {
+			if yamlHoldsTag(k) || yamlHoldsTag(e) {
+				return true
+			}
+		}
+	case map[any]any:
+		for k, e := range x {
+			if yamlHoldsTag(k) || yamlHoldsTag(e) {
+				return true
+			}
+		}
+	case []any:
+		for _, e := range x {
+			if yamlHoldsTag(e) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// gitopsDeploy applies one compose file by streaming DeployStack to its end
+// and reporting every failure (see gitops.DrainDeploy for why it must never
+// stop reading early). A file that holds, or may hold, a tag: cidr is sent
+// only to a daemon that knows tag groups (spec 4.8, I-1), since an older
+// daemon validates less than this client and stores tag: verbatim: one lv
+// parses is judged by its rule cidrs; one it does not, by every decoded
+// string of its YAML; one that is not YAML at all is probed (an older daemon
+// cannot take it either). Any other file is sent as before.
+func gitopsDeploy(ctx context.Context, client pb.LiteVirtClient, path, body string) error {
+	cidrs := []string{rulefield.TagCIDRPrefix}
+	if f, err := compose.ParseNamed(path, []byte(body)); err == nil {
+		cidrs = composeRuleCIDRs(f)
+	} else if hit, ok := gitopsYAMLMayHoldTag(body); ok && !hit {
+		cidrs = nil
+	}
+	if err := requireTagGroupSupport(ctx, client, cidrs...); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	stream, err := client.DeployStack(ctx, &pb.DeployStackRequest{
+		ComposeYaml: body,
+	})
+	if err != nil {
+		return fmt.Errorf("DeployStack: %w", err)
+	}
+	return gitops.DrainDeploy(stream)
 }

@@ -387,14 +387,19 @@ const (
 )
 
 // stackFirewallErr is a stack's firewall failure as its deploy returns it: a
-// status error — the release gate's refusal — keeps its code and message
-// under "firewall config:", with no rpc error nested in it (switch review
-// m5); anything else is FailedPrecondition, as before.
+// status error — the release gate's refusal, an unknown tag group — keeps its
+// code, and its message under "firewall config:" with whatever the deploy
+// wrapped around it (which security group or rule), with no rpc error nested
+// in it (switch review m5); anything else is FailedPrecondition, as before.
 func stackFirewallErr(err error) error {
-	var se interface{ GRPCStatus() *status.Status }
+	var se interface {
+		GRPCStatus() *status.Status
+		Error() string
+	}
 	if errors.As(err, &se) {
 		st := se.GRPCStatus()
-		return status.Errorf(st.Code(), "firewall config: %s", st.Message())
+		msg := strings.Replace(err.Error(), se.Error(), st.Message(), 1)
+		return status.Errorf(st.Code(), "firewall config: %s", msg)
 	}
 	return status.Errorf(codes.FailedPrecondition, "firewall config: %v", err)
 }
@@ -499,6 +504,25 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 			return nil
 		}); err != nil {
 			return err
+		}
+	}
+	// A rule naming a tag group that does not exist is refused before
+	// anything is torn down, once the gate has granted (so before the latch
+	// the refusal is the release text). Compose cannot declare a group (T-4).
+	if needed[capabilities.FeatureFirewallTagGroups] {
+		for name, sg := range f.SecurityGroups {
+			for _, r := range sg.Rules {
+				if err := s.refuseUnknownTagGroup(ctx, r.CIDR); err != nil {
+					return fmt.Errorf("security-group %q rule: %w", name, err)
+				}
+			}
+		}
+		if fd := f.FirewallDefaults; fd != nil {
+			for _, r := range fd.ClusterRules {
+				if err := s.refuseUnknownTagGroup(ctx, r.CIDR); err != nil {
+					return fmt.Errorf("cluster rule: %w", err)
+				}
+			}
 		}
 	}
 	// The stack's default never fails open (switch re-review 2, R1): a

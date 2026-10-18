@@ -7,6 +7,7 @@ import (
 	"io"
 	"slices"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -124,6 +125,17 @@ func (c *Client) observePulledRows(rows map[string]int, pull []string, scope *pu
 	}
 }
 
+// pullTableFrom pulls table from peer and merges it.
+func (ae *AntiEntropy) pullTableFrom(ctx context.Context, peer, table string) error {
+	client, conn, err := ae.peerClient(ctx, peer)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_, perr, merr := ae.pullAndMerge(ctx, client, []string{table}, nil, nil, nil)
+	return errors.Join(perr, merr)
+}
+
 // ErrNoPeerConfirmed is PullTableNow's answer when no peer completed the pull.
 var ErrNoPeerConfirmed = errors.New("no peer completed the pull")
 
@@ -140,7 +152,7 @@ var ErrNoPeerConfirmed = errors.New("no peer completed the pull")
 // caller's voter-majority gate has already decided whether this node may act.
 // When a voter was skipped (isolated, or unable to keep a release feature in
 // use) it refuses, naming them. It is not debounced, and is
-// bounded by ctx.
+// bounded by ctx, which it shares out among the candidates.
 func (ae *AntiEntropy) PullTableNow(ctx context.Context, table, exclude string) (peer string, skipped []string, err error) {
 	if !replicatedTableSet[table] {
 		return "", nil, fmt.Errorf("%s is not a replicated table", table)
@@ -188,25 +200,30 @@ func (ae *AntiEntropy) PullTableNow(ctx context.Context, table, exclude string) 
 		}
 		return "", skipped, nil
 	}
+	pull := ae.tablePull
+	if pull == nil {
+		pull = ae.pullTableFrom
+	}
 	var errs []string
-	for _, name := range candidates {
+	for i, name := range candidates {
 		if ctx.Err() != nil {
 			break
 		}
-		pctx, cancel := context.WithTimeout(ctx, antiEntropyPeerTimeout)
-		client, conn, cerr := ae.peerClient(pctx, name)
-		if cerr != nil {
-			cancel()
-			errs = append(errs, name+": "+cerr.Error())
-			continue
+		// Each candidate gets its share of what is left of ctx's budget, so
+		// one that does not answer cannot spend the time of those behind it.
+		budget := antiEntropyPeerTimeout
+		if dl, ok := ctx.Deadline(); ok {
+			if share := time.Until(dl) / time.Duration(len(candidates)-i); share < budget {
+				budget = share
+			}
 		}
-		_, perr, merr := ae.pullAndMerge(pctx, client, []string{table}, nil, nil, nil)
-		conn.Close()
+		pctx, cancel := context.WithTimeout(ctx, budget)
+		err := pull(pctx, name, table)
 		cancel()
-		if perr == nil && merr == nil {
+		if err == nil {
 			return name, skipped, nil
 		}
-		errs = append(errs, name+": "+errors.Join(perr, merr).Error())
+		errs = append(errs, name+": "+err.Error())
 	}
 	if len(errs) == 0 && ctx.Err() != nil {
 		errs = append(errs, ctx.Err().Error())

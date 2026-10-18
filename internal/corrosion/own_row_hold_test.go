@@ -489,3 +489,44 @@ func TestOwnRowHold_EveryWriteReadsTheRowItWrites(t *testing.T) {
 		}
 	})
 }
+
+// Lab test 26, F7: a certificate swapped while the daemon runs, not by a
+// renewal, is held until the daemon restarts even over the admission this host
+// remembers (docs/auth.md); the restart's registration then re-records it. A
+// renewal is re-recorded at runtime.
+func TestOwnAdmission_ARuntimeSwapIsHeldUntilRestart(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	ownRow(t, c, "s1")
+	if _, err := c.DB().Exec(`UPDATE hosts SET incarnation = 1, created_at = '2026-01-01T00:00:00.000000000Z' WHERE name = ?`, c.hostName); err != nil {
+		t.Fatal(err)
+	}
+	c.SetOwnAdmissionMemory(&memAdmission{})
+	if _, err := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("s1", "")); err != nil {
+		t.Fatal(err)
+	}
+	// An unrelated certificate is loaded at runtime.
+	if _, err := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("s2", "")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RecordOwnCertSerial(ctx, c, c.hostName, "s2"); !errors.Is(err, ErrCertSwappedAtRuntime) {
+		t.Errorf("runtime re-record of a swapped certificate = %v, want ErrCertSwappedAtRuntime", err)
+	}
+	if got := oneString(t, c, `SELECT cert_serial FROM hosts WHERE name = ?`, "cert_serial", c.hostName); got != "s1" {
+		t.Fatalf("serial = %s, want s1 held until restart", got)
+	}
+	// The restart's registration re-records it over its own admission.
+	if err := RegisterHost(ctx, c, HostRecord{Name: c.hostName, Address: "10.0.0.15", State: "active", CertSerial: "s2"}); err != nil {
+		t.Fatalf("RegisterHost at restart: %v", err)
+	}
+	if got := oneString(t, c, `SELECT cert_serial FROM hosts WHERE name = ?`, "cert_serial", c.hostName); got != "s2" {
+		t.Fatalf("serial = %s, want s2 after the restart", got)
+	}
+	// A renewal at runtime is re-recorded.
+	if _, err := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("s3", "s2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RecordOwnCertSerial(ctx, c, c.hostName, "s3"); err != nil {
+		t.Errorf("runtime re-record of a renewal: %v", err)
+	}
+}

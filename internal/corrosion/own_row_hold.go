@@ -401,6 +401,25 @@ func (c *Client) ownRowStatementRefused(ctx context.Context, tx *sql.Tx, s State
 // name to this machine.
 var ErrReRecordAtCountedRow = errors.New("this host's own row is another admission's; its serial is not re-recorded over it")
 
+// ErrCertSwappedAtRuntime refuses a running daemon's re-record of a
+// certificate that is not a renewal of the one its counted row records: a
+// certificate swapped while the daemon runs is held until it restarts, when
+// the boot's registration decides it (reRecordRefused).
+var ErrCertSwappedAtRuntime = errors.New("a certificate swapped while the daemon runs, not by a renewal, is re-recorded only once the daemon restarts")
+
+// installedRenews reports whether serial is the installed certificate and a
+// renewal of recorded (the hold's certificate source says so).
+func (c *Client) installedRenews(serial, recorded string) bool {
+	c.ownHold.mu.Lock()
+	src := c.ownHold.installed
+	c.ownHold.mu.Unlock()
+	if src == nil {
+		return false
+	}
+	installed, renewedFrom := src()
+	return strings.EqualFold(installed, serial) && renewedFrom != "" && strings.EqualFold(renewedFrom, recorded)
+}
+
 // reRecordRefused decides a re-record of serial over the own row naming
 // recorded at (n, createdAt). At incarnation 0 it is the previous release's
 // behaviour and always allowed. At n ≥ 1 it is allowed for a renewal of the

@@ -430,7 +430,10 @@ const recordOwnCertSerialSQL = `UPDATE hosts SET cert_serial = ?, updated_at = ?
 
 // RecordOwnCertSerial is RegisterHost's re-record for a RUNNING daemon whose
 // certificate was renewed in place (`lv host renew-cert`): it writes serial to
-// the host's own live row when the row names another one.
+// the host's own live row when the row names another one. Over a counted row
+// (incarnation 1 or higher) only a renewal of the recorded certificate is
+// re-recorded at runtime; any other certificate swapped while the daemon runs
+// is refused (ErrCertSwappedAtRuntime) until the daemon restarts.
 //
 // The same entitlement as at boot applies — the caller passes its own name and
 // the serial it is serving, so the write touches only the node's own row — and
@@ -456,11 +459,21 @@ func RecordOwnCertSerial(ctx context.Context, c *Client, name, serial string) (b
 	if strings.EqualFold(recorded, serial) {
 		return false, nil
 	}
-	if err := c.reRecordRefused(name, recorded, serial, int64(rows[0].Int("incarnation")), rows[0].String("created_at")); err != nil {
+	n := int64(rows[0].Int("incarnation"))
+	if err := c.reRecordRefused(name, recorded, serial, n, rows[0].String("created_at")); err != nil {
 		return false, err
 	}
-	slog.Info("re-recording this host's renewed certificate serial so peers pin the new certificate",
-		"host", name, "recorded_serial", recorded, "serving_serial", serial)
+	renewal := c.installedRenews(serial, recorded)
+	if n >= 1 && name == c.hostName && !renewal {
+		return false, fmt.Errorf("%w (recorded %s, serving %s, incarnation %d)", ErrCertSwappedAtRuntime, recorded, serial, n)
+	}
+	if renewal {
+		slog.Info("re-recording this host's renewed certificate serial so peers pin the new certificate",
+			"host", name, "recorded_serial", recorded, "serving_serial", serial)
+	} else {
+		slog.Warn("re-recording this host's certificate serial, which is not a renewal of the recorded one, so peers pin it",
+			"host", name, "recorded_serial", recorded, "serving_serial", serial)
+	}
 	if err := c.Execute(ctx, recordOwnCertSerialSQL, serial, c.NowTS(), name); err != nil {
 		return false, err
 	}

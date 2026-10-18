@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -162,6 +163,11 @@ func (w *certWatch) recordHostSerial(ctx context.Context) {
 		return
 	}
 	if _, err := corrosion.RecordOwnCertSerial(ctx, w.db, w.host, serial); err != nil {
+		if errors.Is(err, corrosion.ErrCertSwappedAtRuntime) {
+			slog.Warn("this host's certificate was replaced while the daemon runs, not renewed; its serial is "+
+				"re-recorded when the daemon restarts", "serial", serial, "error", err)
+			return
+		}
 		slog.Warn("could not re-record this host's certificate serial; peers accept the renewed "+
 			"certificate by its predecessor until this succeeds", "serial", serial, "error", err)
 		return

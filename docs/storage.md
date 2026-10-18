@@ -1278,8 +1278,10 @@ at the same time, bounded together by 8 s and by rbd's own 5 s monitor and OSD
 timeouts (rbd runs under the C locale, so its messages are read the same on
 any host). A key a probe proved is taken as proven for 2 minutes for every
 disk of that pool and client — until its keyring changes — so the VMs a
-failover starts after the first on a pool need no probe; an image that is
-gone is still reported, by qemu, when the domain starts. The start refuses for
+failover starts after the first on a pool need no probe — except a VM whose
+own probe got no answer, which is probed itself until one of its own probes
+answers; an image that is gone is still reported, by qemu, when the domain
+starts. The start refuses for
 good, with the reason, only when Ceph is unambiguous that an operator must
 act: permission denied (naming the keyring), or the image not in a pool that
 answers. Anything else — Ceph not answering in time, a cluster re-electing

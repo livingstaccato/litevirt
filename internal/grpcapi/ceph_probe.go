@@ -38,6 +38,11 @@ const cephKeyProofTTL = 2 * time.Minute
 // probes.
 const cephKeyFailTTL = 15 * time.Second
 
+// cephOwnFailTTL bounds a VM's own failure record (cephKeyProofs.own). The
+// record lasts until the VM's own probe answers; this bound only drops the
+// records of VMs that are never started again (deleted, moved away).
+const cephOwnFailTTL = 24 * time.Hour
+
 // cephProbeFloor is the least time a walk's first probe runs on: with less,
 // rbd cannot even reach the monitors (client_mount_timeout), and the start is
 // deferred for time instead.
@@ -55,20 +60,21 @@ type cephKeyProofs struct {
 	// own: VM + cephProofKey → when that VM's OWN probe through the key got
 	// no answer. A proof of the key another VM's probe made says nothing
 	// about this VM's image (an inactive PG under it), so it does not skip
-	// this VM's probe while the record lasts (cephKeyProofTTL); only this
-	// VM's own answered probe clears it (Breaker R-1).
+	// this VM's probe while the record lasts; only this VM's own answered
+	// probe clears it (Breaker R-1), however long that takes
+	// (cephOwnFailTTL only drops records no start will clear).
 	own map[string]time.Time
 }
 
 func ownKey(vm, key string) string { return vm + "\x00" + key }
 
-// ownFailed reports whether vm's own probe through key got no answer within
-// cephKeyProofTTL.
+// ownFailed reports whether vm's own probe through key got no answer, and
+// no own probe of vm's has answered since.
 func (c *cephKeyProofs) ownFailed(vm, key string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	t, ok := c.own[ownKey(vm, key)]
-	return ok && cephProofNow().Sub(t) < cephKeyProofTTL
+	return ok && cephProofNow().Sub(t) < cephOwnFailTTL
 }
 
 // provedFor records vm's own answered probe through key: the key is proven,
@@ -77,7 +83,17 @@ func (c *cephKeyProofs) provedFor(vm, key string) {
 	c.put(key)
 	c.mu.Lock()
 	delete(c.own, ownKey(vm, key))
+	c.pruneOwnLocked(cephProofNow())
 	c.mu.Unlock()
+}
+
+// pruneOwnLocked drops the own failure records past cephOwnFailTTL.
+func (c *cephKeyProofs) pruneOwnLocked(now time.Time) {
+	for k, t := range c.own {
+		if now.Sub(t) >= cephOwnFailTTL {
+			delete(c.own, k)
+		}
+	}
 }
 
 type cephProbeFailure struct {
@@ -119,11 +135,7 @@ func (c *cephKeyProofs) fail(key, vm string) {
 		c.own = map[string]time.Time{}
 	}
 	c.own[ownKey(vm, key)] = now
-	for k, t := range c.own {
-		if now.Sub(t) >= cephKeyProofTTL {
-			delete(c.own, k)
-		}
-	}
+	c.pruneOwnLocked(now)
 }
 
 // anyFailed reports whether some probe failure is still remembered.

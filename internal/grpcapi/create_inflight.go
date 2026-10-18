@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -250,7 +251,9 @@ func (s *Server) domainIsVMsOwn(ctx context.Context, name, specUUID, diskOwner s
 // domainRunsOnAny reports whether a domain's own disks (not its CD-ROMs, not
 // their backing chains) name one of paths: a file or block device by
 // spelling, then by the file it is; a Ceph RBD network disk by its
-// pool/image against an "rbd:" path. A file is looked at within
+// pool/image against an "rbd:" path on the same Ceph cluster
+// (rbdSameCluster) — the same pool/image on another cluster is another
+// image. A file is looked at within
 // sharedDiskStatTimeout; a path at which no file can be (missing, a
 // component that is a file, a symlink loop) matches nothing, and one that
 // cannot be looked at (a hard mount whose server is gone) is an error:
@@ -268,6 +271,10 @@ func domainRunsOnAny(domXML string, paths []string) (bool, error) {
 					Dev      string `xml:"dev,attr"`
 					Protocol string `xml:"protocol,attr"`
 					Name     string `xml:"name,attr"`
+					Hosts    []struct {
+						Name string `xml:"name,attr"`
+						Port string `xml:"port,attr"`
+					} `xml:"host"`
 				} `xml:"source"`
 			} `xml:"disk"`
 		} `xml:"devices"`
@@ -284,8 +291,12 @@ func domainRunsOnAny(domXML string, paths []string) (bool, error) {
 			if d.Source.Name == "" {
 				continue
 			}
+			var mons []cephMon
+			for _, h := range d.Source.Hosts {
+				mons = append(mons, cephMon{host: strings.Trim(h.Name, "[]"), port: h.Port})
+			}
 			for _, p := range paths {
-				if l, ok := storage.ParseCephLocator(p); ok && l.Spec == d.Source.Name {
+				if l, ok := storage.ParseCephLocator(p); ok && l.Spec == d.Source.Name && rbdSameCluster(mons, l) {
 					return true, nil
 				}
 			}
@@ -353,6 +364,94 @@ func domainRunsOnAny(domXML string, paths []string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// cephMon is one Ceph monitor address: host, and port when one is named.
+type cephMon struct{ host, port string }
+
+// parseCephMon reads one storage.ParseMonHost entry: "host", "host:port" or
+// "[v6]:port".
+func parseCephMon(m string) cephMon {
+	if strings.HasPrefix(m, "[") {
+		if end := strings.IndexByte(m, ']'); end > 0 {
+			return cephMon{host: m[1:end], port: strings.TrimPrefix(m[end+1:], ":")}
+		}
+	}
+	if h, p, found := strings.Cut(m, ":"); found && !strings.Contains(p, ":") {
+		return cephMon{host: h, port: p}
+	}
+	return cephMon{host: m}
+}
+
+// sameMon reports whether a and b are one monitor: one host, on one port or
+// on its two protocol ports (v2 3300, v1 6789); a monitor with no port is on
+// its default one.
+func sameMon(a, b cephMon) bool {
+	if a.host == "" || a.host != b.host {
+		return false
+	}
+	if a.port == "" || b.port == "" || a.port == b.port {
+		return true
+	}
+	isMonPort := func(p string) bool { return p == "3300" || p == "6789" }
+	return isMonPort(a.port) && isMonPort(b.port)
+}
+
+// rbdSameCluster reports whether a domain's rbd source, on monitors dom,
+// and the "rbd:" locator l name the same Ceph cluster, positively: they
+// share a monitor. l's monitors are its litevirt pool's on this host, its
+// mon_host, and its conf's; a side that names none uses the default
+// ceph.conf, whose monitors stand in for it, and two sides that both name
+// none read the same file. A cluster that cannot be known (a conf or the
+// default ceph.conf unreadable, or naming no monitor) is not the same.
+func rbdSameCluster(dom []cephMon, l storage.CephLocator) bool {
+	var want []cephMon
+	add := func(ms []string) {
+		for _, m := range ms {
+			want = append(want, parseCephMon(m))
+		}
+	}
+	explicit := false
+	if ms, ok := lv.CephPoolMonitors(l.Opts["lvpool"]); ok {
+		explicit = true
+		add(ms)
+	}
+	if v, ok := l.Opts["mon_host"]; ok {
+		explicit = true
+		add(storage.ParseMonHost(v))
+	}
+	if conf := l.Opts["conf"]; conf != "" && !storage.IsDefaultCephConf(conf) {
+		explicit = true
+		if ms, err := storage.CephMonHosts(conf); err == nil {
+			add(ms)
+		}
+	}
+	if !explicit && len(dom) == 0 {
+		return true
+	}
+	if !explicit || len(dom) == 0 {
+		def, err := storage.CephMonHosts(storage.DefaultCephConf())
+		if err != nil {
+			return false
+		}
+		var ms []cephMon
+		for _, m := range def {
+			ms = append(ms, parseCephMon(m))
+		}
+		if !explicit {
+			want = ms
+		} else {
+			dom = ms
+		}
+	}
+	for _, a := range dom {
+		for _, b := range want {
+			if sameMon(a, b) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // domainNIC is one <interface> of a domain definition: its MAC (lower

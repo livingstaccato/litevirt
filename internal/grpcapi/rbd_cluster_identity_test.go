@@ -1,0 +1,152 @@
+package grpcapi
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/storage"
+)
+
+// rbdDomain is a domain whose one disk is the Ceph image name on the
+// monitors hosts ("" for a source that names none).
+func rbdDomain(uuid, name string, hosts ...string) string {
+	var h strings.Builder
+	for _, m := range hosts {
+		host, port, _ := strings.Cut(m, ":")
+		if port != "" {
+			fmt.Fprintf(&h, "<host name='%s' port='%s'/>", host, port)
+		} else {
+			fmt.Fprintf(&h, "<host name='%s'/>", host)
+		}
+	}
+	return fmt.Sprintf("<domain type='kvm'><name>vm1</name><uuid>%s</uuid><devices><disk type='network' device='disk'>"+
+		"<source protocol='rbd' name='%s'>%s</source></disk></devices></domain>", uuid, name, h.String())
+}
+
+// withDefaultCephConf points ceph's default ceph.conf at one naming mon
+// ("" for no ceph.conf at all).
+func withDefaultCephConf(t *testing.T, mon string) {
+	t.Helper()
+	dir := t.TempDir()
+	if mon != "" {
+		if err := os.WriteFile(filepath.Join(dir, "ceph.conf"), []byte("[global]\nmon_host = "+mon+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(storage.OverrideCephConfDirForTest(dir))
+}
+
+// A Ceph RBD disk is the recorded one only on the same Ceph cluster: an
+// image of the same pool/image on another cluster is another disk. The
+// cluster is known by its monitors — the domain's <host> elements, or the
+// default ceph.conf's when it names none, against the locator's mon_host,
+// its conf's, or the default conf's — and one neither side names a
+// monitor for is the default conf's on both.
+//
+// Mutation: match on pool/image alone — "another cluster" and "default
+// against another" red.
+func TestDomainRunsOnAny_RBDNeedsTheSameCephCluster(t *testing.T) {
+	const pinned = `rbd:lv/vm1-root:id=litevirt:keyring=/k:mon_host=10.0.0.1\:6789`
+	for _, tc := range []struct {
+		name     string
+		hosts    []string
+		recorded string
+		defConf  string
+		want     bool
+	}{
+		{"same cluster", []string{"10.0.0.1:6789"}, pinned, "", true},
+		{"same monitor on its v2 port", []string{"10.0.0.1:3300"}, pinned, "", true},
+		{"one shared monitor of several", []string{"10.0.0.7:6789", "10.0.0.1:6789"}, pinned, "", true},
+		{"another cluster", []string{"10.0.9.1:6789"}, pinned, "", false},
+		{"default against another", nil, pinned, "10.0.9.1:6789", false},
+		{"default against the same", nil, pinned, "10.0.0.1:6789", true},
+		{"default, unreadable", nil, pinned, "", false},
+		{"neither names a monitor", nil, "rbd:lv/vm1-root", "", true},
+		{"locator default against another", []string{"10.0.9.1:6789"}, "rbd:lv/vm1-root", "10.0.0.1:6789", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withDefaultCephConf(t, tc.defConf)
+			got, err := domainRunsOnAny(rbdDomain("u", "lv/vm1-root", tc.hosts...), []string{tc.recorded})
+			if err != nil || got != tc.want {
+				t.Errorf("domainRunsOnAny = %v, %v; want %v", got, err, tc.want)
+			}
+		})
+	}
+}
+
+// A rebuild never stops or undefines a domain of the name that runs on an
+// image of the VM's pool/image on ANOTHER Ceph cluster: it is not the VM's
+// runtime. One on the VM's own cluster (a legacy domain under a uuid
+// libvirt chose) still is.
+//
+// Mutation: match RBD by pool/image alone — the foreign guest is destroyed
+// and undefined, red.
+func TestRebuildVM_NeverDestroysAnRBDDomainOnAnotherCephCluster(t *testing.T) {
+	const recorded = `rbd:lv/vm1-root:id=litevirt:keyring=/k:mon_host=10.0.0.1\:6789`
+	const foreign = "eeeeeeee-0000-0000-0000-000000000041"
+	withDefaultCephConf(t, "")
+	// No real rbd runs: a rebuild that got as far as deleting the disks
+	// would reach a Ceph cluster from the test host.
+	var ran []string
+	t.Cleanup(storage.OverrideCephRunnerForTest(func(_ context.Context, name string, args ...string) ([]byte, error) {
+		ran = append(ran, name+" "+strings.Join(args, " "))
+		return nil, errors.New("no ceph in this test")
+	}))
+	t.Run("another cluster", func(t *testing.T) {
+		s, fake := promoteFixture(t)
+		if err := s.db.Execute(adminCtx(), `UPDATE vm_disks SET path = ?, storage_type = 'ceph' WHERE vm_name = 'vm1'`, recorded); err != nil {
+			t.Fatal(err)
+		}
+		if err := fake.DefineDomain(rbdDomain(foreign, "lv/vm1-root", "10.0.9.1:6789")); err != nil {
+			t.Fatal(err)
+		}
+		if err := fake.StartDomain("vm1"); err != nil {
+			t.Fatal(err)
+		}
+		// This fixture has no image store: a rebuild past the identity
+		// check panics in its debris sweep, after the destroy.
+		err := func() (err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("the rebuild went past the identity check: %v", r)
+				}
+			}()
+			_, err = s.RebuildVM(adminCtx(), &pb.RebuildVMRequest{Name: "vm1"})
+			return err
+		}()
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(fmt.Sprint(err), foreign) {
+			t.Errorf("rebuild over a domain on another Ceph cluster: %v, want FailedPrecondition naming it", err)
+		}
+		if u, d := undefinesOf(fake, "vm1"); u != 0 || d != 0 {
+			t.Errorf("the foreign guest was undefined %d and destroyed %d times", u, d)
+		}
+		if len(ran) != 0 {
+			t.Errorf("the rebuild ran ceph commands on the VM's image: %q", ran)
+		}
+		if active, _ := fake.DomainIsActive("vm1"); !active {
+			t.Error("the foreign guest no longer runs")
+		}
+	})
+	t.Run("the same cluster", func(t *testing.T) {
+		s, fake := promoteFixture(t)
+		if err := s.db.Execute(adminCtx(), `UPDATE vm_disks SET path = ?, storage_type = 'ceph' WHERE vm_name = 'vm1'`, recorded); err != nil {
+			t.Fatal(err)
+		}
+		if err := fake.DefineDomain(rbdDomain(foreign, "lv/vm1-root", "10.0.0.1:6789")); err != nil {
+			t.Fatal(err)
+		}
+		own, _, why, err := s.domainIsVMsOwn(adminCtx(), "vm1", "aaaaaaaa-0000-0000-0000-000000000001", "vm1")
+		if err != nil || !own {
+			t.Errorf("domainIsVMsOwn = %v, %q, %v; want the VM's own", own, why, err)
+		}
+	})
+}

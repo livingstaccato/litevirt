@@ -1,39 +1,12 @@
 package libvirt
 
 import (
-	"bytes"
 	"encoding/xml"
 	"fmt"
 	"io"
 	"strings"
 )
 
-// RewriteDiskSourceFile rewrites exactly one disk's <source file=...> in a libvirt
-// domain XML from oldFile to newFile and returns the new XML. It is the authoritative
-// cutover used by MoveVolume to repoint a domain's persistent config after a disk
-// moves between pools — so it is deliberately strict and precise rather than a blunt
-// string replace (which can hit the path outside the <source> attribute or mishandle
-// XML-escaped attribute values).
-//
-// Matching:
-//   - targetDev != "": the disk with <target dev=targetDev> is the subject. Its current
-//     <source file> must equal oldFile (→ rewrite, changed=true) or newFile (→ already
-//     cut over, changed=false); anything else, a missing such disk, or a subject disk
-//     that has no file-backed <source> (cdrom/block/network) is an error.
-//   - targetDev == "" (legacy rows with no recorded dev): exactly one disk whose
-//     <source file> equals oldFile → rewrite; else exactly one equal to newFile →
-//     idempotent (changed=false); zero or multiple matches → error.
-//
-// Other disks — including source-less devices (empty cdrom) and block/network disks
-// (<source dev=…>/<source protocol=…>, no file attr) — are parsed but never modified.
-//
-// The result is semantically equivalent, not byte-identical: it is produced via the
-// encoding/xml tokenizer (lossless at the element/attribute level and escaping-safe),
-// and libvirt re-canonicalizes on DomainDefineXML anyway, so formatting/comments need
-// not be preserved. Domains carrying XML namespaces (e.g. the qemu:/ passthrough
-// extension) are refused rather than risk a mangling round-trip — litevirt-managed
-// domains are namespace-free, so this only blocks externally-customized ones, where
-// failing the cutover safely beats corrupting the definition.
 // RewriteDiskSource repoints one disk's source, whichever attribute that disk
 // actually uses: <source file=> for a file, <source dev=> for a block device,
 // <source name=> for an rbd image.
@@ -69,6 +42,40 @@ const (
 // first for a malformed domain that carries several.
 var sourceAttrKinds = []sourceAttrKind{sourceAttrFile, sourceAttrDev, sourceAttrName}
 
+// RewriteDiskSourceFile rewrites exactly one disk's <source file=...> in a libvirt
+// domain XML from oldFile to newFile and returns the new XML. It is the authoritative
+// cutover used by MoveVolume to repoint a domain's persistent config after a disk
+// moves between pools — so it is deliberately strict and precise rather than a blunt
+// string replace (which can hit the path outside the <source> attribute or mishandle
+// XML-escaped attribute values).
+//
+// Matching:
+//   - targetDev != "": the disk with <target dev=targetDev> is the subject. Its current
+//     <source file> must equal oldFile (→ rewrite, changed=true) or newFile (→ already
+//     cut over, changed=false); anything else, a missing such disk, or a subject disk
+//     that has no file-backed <source> (cdrom/block/network) is an error.
+//   - targetDev == "" (legacy rows with no recorded dev): exactly one disk whose
+//     <source file> equals oldFile → rewrite; else exactly one equal to newFile →
+//     idempotent (changed=false); zero or multiple matches → error.
+//
+// Other disks — including source-less devices (empty cdrom) and block/network disks
+// (<source dev=…>/<source protocol=…>, no file attr) — are parsed but never modified.
+//
+// The result is the input with only that attribute's value replaced: the edit is
+// spliced into the original text, so every other byte is kept. Every litevirt
+// domain carries namespaced metadata (litevirt-managed, litevirt-owner-epoch),
+// and a re-encode through encoding/xml would rewrite those elements, so the text
+// is never re-encoded. Namespaces outside <devices> (that metadata, a
+// qemu:commandline block) are kept as they are. A namespace on the domain
+// element, on <devices>, or on anything inside <devices> is refused: disks are
+// matched by element and attribute name there, and a namespaced name could be
+// taken for one it is not.
+//
+// The rewrite is refused when the new path holds a tab, CR or LF (libvirt
+// would read each as a space), when the old path is still named anywhere else
+// in the domain — another element's attribute or text, such as a
+// qemu:commandline argument or another disk's backing store — and when the
+// output, parsed again, differs from the input anywhere but that one value.
 func RewriteDiskSourceFile(domXML, targetDev, oldFile, newFile string) (out string, changed bool, err error) {
 	return rewriteDiskSourceLocator(domXML, targetDev, oldFile, newFile, sourceAttrFile)
 }
@@ -76,10 +83,11 @@ func RewriteDiskSourceFile(domXML, targetDev, oldFile, newFile string) (out stri
 // rewriteDiskSource is the shared body. `want` pins which source attribute is
 // eligible; anySourceAttr accepts whichever the disk carries.
 func rewriteDiskSourceLocator(domXML, targetDev, oldSource, newSource string, want sourceAttrKind) (string, bool, error) {
-	if hasXMLNamespace(domXML) {
-		return "", false, fmt.Errorf("domain xml uses XML namespaces; refusing automated disk-source rewrite")
+	disks, err := parseDiskSourceInfos(domXML)
+	if err != nil {
+		return "", false, err
 	}
-	matchIndex, kind, idempotent, err := matchDiskToRewrite(domXML, targetDev, oldSource, newSource, want)
+	matchIndex, kind, idempotent, err := matchDiskToRewrite(disks, targetDev, oldSource, newSource, want)
 	if err != nil {
 		return "", false, err
 	}
@@ -97,48 +105,40 @@ func rewriteDiskSourceLocator(domXML, targetDev, oldSource, newSource string, wa
 				"the disk type and driver type to change too, which this rewrite does not do",
 			sourceAttrDescription(kind), newSource, sourceAttrDescription(kindOfSource(newSource)))
 	}
-	rewritten, err := rewriteNthDiskSource(domXML, matchIndex, kind, oldSource, newSource)
+	subject := "the disk"
+	if dev := disks[matchIndex].dev; dev != "" {
+		subject = "disk " + dev
+	}
+	if strings.ContainsAny(newSource, "\t\r\n") {
+		return "", false, fmt.Errorf("refusing to repoint %s to %q: it holds a tab or line break, which libvirt would read as a space", subject, newSource)
+	}
+	if where := elsewhereNamed(domXML, newSource, true); where != "" {
+		return "", false, fmt.Errorf("refusing to repoint %s to %q: the domain already names that path in %s", subject, newSource, where)
+	}
+	rewritten, err := spliceDiskSource(domXML, disks[matchIndex], kind, oldSource, newSource)
 	if err != nil {
 		return "", false, err
+	}
+	if err := verifySplice(disks, rewritten, matchIndex, kind, newSource); err != nil {
+		return "", false, err
+	}
+	if where := elsewhereNamed(rewritten, oldSource, true); where != "" {
+		return "", false, fmt.Errorf("refusing to repoint %s from %q: the domain still names that path in %s, "+
+			"which this rewrite would leave pointing at the old file", subject, oldSource, where)
 	}
 	return rewritten, true, nil
 }
 
-// hasXMLNamespace reports whether the domain XML actually declares or uses an XML
-// namespace (e.g. the qemu:/ passthrough extension), detected via the tokenizer —
-// a namespaced element name or an xmlns/xmlns:prefix declaration. This is precise,
-// unlike a substring scan for "xmlns" which false-positives on path/attribute values.
-// On a parse error it returns false and lets the main rewrite surface the error.
-func hasXMLNamespace(domXML string) bool {
-	dec := xml.NewDecoder(strings.NewReader(domXML))
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			return false
-		}
-		se, ok := tok.(xml.StartElement)
-		if !ok {
-			continue
-		}
-		if se.Name.Space != "" {
-			return true // a namespaced element (e.g. qemu:commandline)
-		}
-		for _, a := range se.Attr {
-			// xmlns="…" → {Space:"", Local:"xmlns"}; xmlns:p="…" → {Space:"xmlns", …}.
-			if a.Name.Local == "xmlns" || a.Name.Space == "xmlns" {
-				return true
-			}
-		}
-	}
-}
-
 // diskSourceInfo is one disk's identity for matching: its target dev and its
-// file-backed source (empty when the disk has no <source file>).
+// source locators, plus where its <source> start tag sits in the text.
 type diskSourceInfo struct {
 	dev string // <target dev=…>, the disk's stable name
 	// Exactly one of these is non-empty for a well-formed disk; all three are
 	// empty for a source-less device such as an ejected cdrom.
 	src map[sourceAttrKind]string
+	// srcStart, srcEnd bound the disk's <source ...> start tag in the domain
+	// XML; srcStart is -1 when the disk has no <source>.
+	srcStart, srcEnd int64
 }
 
 // source returns the disk's locator under `want`, plus which attribute it came
@@ -155,49 +155,87 @@ func (d diskSourceInfo) source(want sourceAttrKind) (string, sourceAttrKind) {
 	return "", anySourceAttr
 }
 
-// parseDiskSourceInfos returns every devices/disk in document order with its target
-// dev and <source file>. Document order matches the token stream in
-// rewriteNthDiskSource, so a disk's index is a stable handle between the two passes.
+// parseDiskSourceInfos returns every <domain>/<devices>/<disk> in document
+// order with its target dev, its <source> locators and the byte span of that
+// <source> start tag. It refuses a namespace on the domain element, on
+// <devices> or on anything inside <devices> (namespaceInDevicesError);
+// namespaces elsewhere are skipped over.
 func parseDiskSourceInfos(domXML string) ([]diskSourceInfo, error) {
-	var domain struct {
-		Devices struct {
-			Disks []struct {
-				Source struct {
-					File string `xml:"file,attr"`
-					Dev  string `xml:"dev,attr"`
-					Name string `xml:"name,attr"`
-				} `xml:"source"`
-				Target struct {
-					Dev string `xml:"dev,attr"`
-				} `xml:"target"`
-			} `xml:"disk"`
-		} `xml:"devices"`
-	}
-	if err := xml.Unmarshal([]byte(domXML), &domain); err != nil {
-		return nil, fmt.Errorf("parse domain xml: %w", err)
-	}
-	out := make([]diskSourceInfo, 0, len(domain.Devices.Disks))
-	for _, d := range domain.Devices.Disks {
-		out = append(out, diskSourceInfo{
-			dev: d.Target.Dev,
-			src: map[sourceAttrKind]string{
-				sourceAttrFile: d.Source.File,
-				sourceAttrDev:  d.Source.Dev,
-				sourceAttrName: d.Source.Name,
-			},
-		})
+	dec := xml.NewDecoder(strings.NewReader(domXML))
+	var out []diskSourceInfo
+	depth := 0 // depth of the element being read; the domain is 1
+	inDevices := false
+	cur := -1 // index in out of the disk being read, or -1
+	for {
+		start := dec.InputOffset()
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("parse domain xml: %w", err)
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			depth++
+			if depth == 1 && t.Name.Space != "" {
+				return nil, namespaceInDevicesError("the domain element is in namespace " + t.Name.Space)
+			}
+			if depth == 2 && t.Name.Local == "devices" {
+				inDevices = true
+			}
+			if inDevices {
+				if t.Name.Space != "" {
+					return nil, namespaceInDevicesError("element " + t.Name.Space + ":" + t.Name.Local)
+				}
+				for _, a := range t.Attr {
+					// xmlns="…" is {Space:"", Local:"xmlns"}; xmlns:p="…" is {Space:"xmlns", …}.
+					if a.Name.Space != "" || a.Name.Local == "xmlns" {
+						return nil, namespaceInDevicesError("attribute " + a.Name.Space + ":" + a.Name.Local + " on <" + t.Name.Local + ">")
+					}
+				}
+			}
+			switch {
+			case inDevices && depth == 3 && t.Name.Local == "disk":
+				out = append(out, diskSourceInfo{src: map[sourceAttrKind]string{}, srcStart: -1, srcEnd: -1})
+				cur = len(out) - 1
+			case cur >= 0 && depth == 4 && t.Name.Local == "source":
+				d := &out[cur]
+				if d.srcStart >= 0 {
+					return nil, fmt.Errorf("disk %d has more than one <source>", cur)
+				}
+				d.srcStart, d.srcEnd = start, dec.InputOffset()
+				for _, k := range sourceAttrKinds {
+					d.src[k] = attrValue(t, string(k))
+				}
+			case cur >= 0 && depth == 4 && t.Name.Local == "target":
+				if out[cur].dev == "" {
+					out[cur].dev = attrValue(t, "dev")
+				}
+			}
+		case xml.EndElement:
+			if depth == 3 {
+				cur = -1
+			}
+			if depth == 2 {
+				inDevices = false
+			}
+			depth--
+		}
 	}
 	return out, nil
+}
+
+// namespaceInDevicesError is the refusal for a namespace where disks are
+// matched by name.
+func namespaceInDevicesError(what string) error {
+	return fmt.Errorf("domain xml uses an XML namespace where disks are matched (%s); refusing automated disk-source rewrite", what)
 }
 
 // matchDiskToRewrite resolves which devices/disk (by document-order index) must have
 // its source rewritten, enforcing the locked matching rules. idempotent=true means
 // the subject disk already points at newFile and no rewrite is needed.
-func matchDiskToRewrite(domXML, targetDev, oldSource, newSource string, want sourceAttrKind) (matchIndex int, kind sourceAttrKind, idempotent bool, err error) {
-	disks, err := parseDiskSourceInfos(domXML)
-	if err != nil {
-		return -1, anySourceAttr, false, err
-	}
+func matchDiskToRewrite(disks []diskSourceInfo, targetDev, oldSource, newSource string, want sourceAttrKind) (matchIndex int, kind sourceAttrKind, idempotent bool, err error) {
 	if targetDev != "" {
 		idx := -1
 		for i, d := range disks {
@@ -292,82 +330,203 @@ func sourceAttrDescription(k sourceAttrKind) string {
 	}
 }
 
-// rewriteNthDiskSource streams the domain XML through the tokenizer and rewrites the
-// file attribute of the <source> that is a direct child of the matchIndex-th
-// devices/disk, from oldFile to newFile, re-emitting every other token verbatim.
-func rewriteNthDiskSource(domXML string, matchIndex int, kind sourceAttrKind, oldSource, newSource string) (string, error) {
-	dec := xml.NewDecoder(strings.NewReader(domXML))
-	var buf bytes.Buffer
-	enc := xml.NewEncoder(&buf)
+// spliceDiskSource replaces the value of the `kind` attribute of disk d's
+// <source> start tag, which must currently read oldSource, with newSource
+// escaped. Every byte outside that value is kept.
+func spliceDiskSource(domXML string, d diskSourceInfo, kind sourceAttrKind, oldSource, newSource string) (string, error) {
+	if d.srcStart < 0 || d.src[kind] != oldSource {
+		return "", fmt.Errorf("internal: matched disk %q has no <source %s=%q>", d.dev, kind, oldSource)
+	}
+	tag := domXML[d.srcStart:d.srcEnd]
+	if !strings.HasPrefix(tag, "<source") {
+		return "", fmt.Errorf("internal: disk %q's <source> span reads %q", d.dev, tag)
+	}
+	vs, ve, err := attrValueSpan(tag, string(kind))
+	if err != nil {
+		return "", fmt.Errorf("disk %q: %w", d.dev, err)
+	}
+	return domXML[:d.srcStart] + tag[:vs] + escapeAttr(newSource) + tag[ve:] + domXML[d.srcEnd:], nil
+}
 
-	var stack []string     // open ancestor element names (parent is the last entry)
-	diskIndex := -1        // index among devices/disk
-	matchedDiskDepth := -1 // stack depth at the matched <disk> start; -1 ⇒ not inside it
-	rewrote := false
-
+// attrValueSpan finds the attribute named exactly `name` in one raw start tag
+// by reading the tag's attributes in turn, so text inside another attribute's
+// value is never taken for it. It returns the bounds of the value between its
+// quotes.
+func attrValueSpan(tag, name string) (start, end int, err error) {
+	isSpace := func(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
+	i := 1 // past '<'
+	for i < len(tag) && !isSpace(tag[i]) && tag[i] != '/' && tag[i] != '>' {
+		i++
+	}
+	found := -1
 	for {
-		tok, err := dec.Token()
-		if err == io.EOF {
+		for i < len(tag) && isSpace(tag[i]) {
+			i++
+		}
+		if i >= len(tag) || tag[i] == '/' || tag[i] == '>' {
 			break
 		}
+		ns := i
+		for i < len(tag) && !isSpace(tag[i]) && tag[i] != '=' {
+			i++
+		}
+		attr := tag[ns:i]
+		for i < len(tag) && isSpace(tag[i]) {
+			i++
+		}
+		if i >= len(tag) || tag[i] != '=' {
+			return 0, 0, fmt.Errorf("malformed attribute %q in %q", attr, tag)
+		}
+		i++
+		for i < len(tag) && isSpace(tag[i]) {
+			i++
+		}
+		if i >= len(tag) || (tag[i] != '\'' && tag[i] != '"') {
+			return 0, 0, fmt.Errorf("unquoted attribute %q in %q", attr, tag)
+		}
+		q := tag[i]
+		i++
+		vs := i
+		for i < len(tag) && tag[i] != q {
+			i++
+		}
+		if i >= len(tag) {
+			return 0, 0, fmt.Errorf("unterminated attribute %q in %q", attr, tag)
+		}
+		if attr == name {
+			if found >= 0 {
+				return 0, 0, fmt.Errorf("attribute %q appears twice in %q", name, tag)
+			}
+			found, start, end = 1, vs, i
+		}
+		i++
+	}
+	if found < 0 {
+		return 0, 0, fmt.Errorf("no %s attribute in %q", name, tag)
+	}
+	return start, end, nil
+}
+
+// verifySplice parses the rewritten XML again and requires the same disks as
+// before, each with the same target and locators, except that the matched
+// disk's `kind` locator is now newSource.
+func verifySplice(before []diskSourceInfo, out string, matchIndex int, kind sourceAttrKind, newSource string) error {
+	after, err := parseDiskSourceInfos(out)
+	if err != nil {
+		return fmt.Errorf("internal: the rewritten domain xml does not parse: %w", err)
+	}
+	if len(after) != len(before) {
+		return fmt.Errorf("internal: the rewrite changed the disk count from %d to %d", len(before), len(after))
+	}
+	for i := range before {
+		for _, k := range sourceAttrKinds {
+			want := before[i].src[k]
+			if i == matchIndex && k == kind {
+				want = newSource
+			}
+			if after[i].dev != before[i].dev || after[i].src[k] != want {
+				return fmt.Errorf("internal: the rewrite changed disk %d (%q) beyond its %s", i, before[i].dev, kind)
+			}
+		}
+	}
+	return nil
+}
+
+// DomainXMLNamesPath reports whether the domain XML names path in any
+// attribute value or text.
+func DomainXMLNamesPath(domXML, path string) bool {
+	return elsewhereNamed(domXML, path, false) != ""
+}
+
+// elsewhereNamed reports where, if anywhere, the domain XML still names path
+// in an attribute value or in text: "<parent>/<element> attribute <name>" or
+// "<parent>/<element> text". A comment is not read by libvirt and is skipped.
+// A document that does not parse counts as naming it. A longer path that
+// merely starts or ends with path (an overlay "root.qcow2.s1" of "root.qcow2",
+// or "/x/a/root.qcow2" of "/a/root.qcow2") is not a mention.
+//
+// With skipFreeText, the <description>, <title> and <metadata> children of the
+// domain are not read: libvirt opens nothing named there.
+func elsewhereNamed(domXML, path string, skipFreeText bool) string {
+	if path == "" {
+		return ""
+	}
+	// RawToken keeps each name's prefix as written (qemu:arg), for the message.
+	dec := xml.NewDecoder(strings.NewReader(domXML))
+	var stack []string
+	skipFrom := 0 // stack depth of the free-text element being skipped, or 0
+	for {
+		tok, err := dec.RawToken()
+		if err == io.EOF {
+			return ""
+		}
 		if err != nil {
-			return "", fmt.Errorf("decode domain xml: %w", err)
+			return "a part of the domain xml that does not parse"
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
-			parent := ""
-			if len(stack) > 0 {
-				parent = stack[len(stack)-1]
+			stack = append(stack, qualifiedName(t.Name))
+			if skipFrom == 0 && skipFreeText && len(stack) == 2 && stack[0] == "domain" &&
+				(stack[1] == "description" || stack[1] == "title" || stack[1] == "metadata") {
+				skipFrom = len(stack)
 			}
-			if t.Name.Local == "disk" && parent == "devices" {
-				diskIndex++
-				if diskIndex == matchIndex {
-					matchedDiskDepth = len(stack)
+			if skipFrom != 0 {
+				continue
+			}
+			for _, a := range t.Attr {
+				if namesPath(a.Value, path) {
+					return fmt.Sprintf("<%s> attribute %s", elementPath(stack), qualifiedName(a.Name))
 				}
 			}
-			emit := t
-			if matchedDiskDepth >= 0 && t.Name.Local == "source" && parent == "disk" {
-				emit = rewriteSourceAttr(t, kind, oldSource, newSource, &rewrote)
-			}
-			stack = append(stack, t.Name.Local)
-			if err := enc.EncodeToken(emit); err != nil {
-				return "", err
-			}
 		case xml.EndElement:
-			if err := enc.EncodeToken(t); err != nil {
-				return "", err
+			if len(stack) == skipFrom {
+				skipFrom = 0
 			}
 			if len(stack) > 0 {
 				stack = stack[:len(stack)-1]
 			}
-			if matchedDiskDepth >= 0 && len(stack) == matchedDiskDepth {
-				matchedDiskDepth = -1 // closed the matched <disk>
-			}
-		default:
-			if err := enc.EncodeToken(tok); err != nil {
-				return "", err
+		case xml.CharData:
+			if skipFrom == 0 && namesPath(string(t), path) {
+				return fmt.Sprintf("<%s> text", elementPath(stack))
 			}
 		}
 	}
-	if err := enc.Flush(); err != nil {
-		return "", err
-	}
-	if !rewrote {
-		return "", fmt.Errorf("internal: matched disk %d had no rewritable <source %s=%q>", matchIndex, kind, oldSource)
-	}
-	return buf.String(), nil
 }
 
-// rewriteSourceFileAttr returns a copy of a <source> start element with its file
-// attribute changed oldFile→newFile (and flags rewrote). It copies first so the
-// decoder's internal attribute buffer is never mutated.
-func rewriteSourceAttr(se xml.StartElement, kind sourceAttrKind, oldSource, newSource string, rewrote *bool) xml.StartElement {
-	se = se.Copy()
-	for i := range se.Attr {
-		if se.Attr[i].Name.Local == string(kind) && se.Attr[i].Value == oldSource {
-			se.Attr[i].Value = newSource
-			*rewrote = true
+// namesPath reports whether s holds path neither followed by a character that
+// would make it part of a longer file name nor preceded by one other than '/'.
+func namesPath(s, path string) bool {
+	for i := 0; ; {
+		j := strings.Index(s[i:], path)
+		if j < 0 {
+			return false
 		}
+		start, end := i+j, i+j+len(path)
+		before := start == 0 || s[start-1] == '/' || !isFileNameByte(s[start-1])
+		after := end == len(s) || !isFileNameByte(s[end])
+		if before && after {
+			return true
+		}
+		i = start + 1
 	}
-	return se
+}
+
+func isFileNameByte(c byte) bool {
+	return c == '.' || c == '_' || c == '-' || c == '/' ||
+		(c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func qualifiedName(n xml.Name) string {
+	if n.Space == "" {
+		return n.Local
+	}
+	return n.Space + ":" + n.Local
+}
+
+// elementPath names an element by itself and its two nearest ancestors.
+func elementPath(stack []string) string {
+	if len(stack) > 3 {
+		stack = stack[len(stack)-3:]
+	}
+	return strings.Join(stack, "/")
 }

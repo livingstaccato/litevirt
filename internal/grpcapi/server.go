@@ -1456,6 +1456,9 @@ func (s *Server) advertisedCapabilities() []string {
 	// relay_health_v1 is not withheld either: it says this binary reads the
 	// relay demotion rows when it elects relays, a fact about the build. The
 	// demotion rows are not written until the ReplicationGated latch forms.
+	// netbox_ip_repoint_v1 is not withheld either: it says this binary decodes
+	// the lease re-point statement, a fact about the build. No re-point is
+	// written until the ReplicationGated latch forms.
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
 	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
@@ -2113,6 +2116,10 @@ func (s *Server) tokenEnabled(token string) bool {
 	case capabilities.SpecConflictV1:
 		// No kill switch: it says how this build resolves two edits of one
 		// spec at one generation, and every replica must resolve them alike.
+		return true
+	case capabilities.NetBoxIPRepointV1:
+		// No kill switch: it says this build decodes the lease re-point
+		// statement. The inventory mirror's own opt-in is its stand-down.
 		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm.Load()

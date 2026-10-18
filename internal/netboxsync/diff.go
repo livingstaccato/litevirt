@@ -43,6 +43,10 @@ type DesiredNIC struct {
 	// the lease and not from the NIC row: the lease is what names the object,
 	// and its family is what decides which primary field may carry it.
 	NetBoxIP string
+	// LeaseNetwork and LeasePrefixID locate the lease that names NetBoxIPID and
+	// the binding it was claimed through. Read only to repair a dead address.
+	LeaseNetwork  string
+	LeasePrefixID int
 }
 
 // Action is one unit of work for the applier.

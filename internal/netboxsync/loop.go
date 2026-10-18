@@ -1502,11 +1502,13 @@ func desiredNICs(nics []corrosion.NICRecord, byLease map[string]leasedAddress) (
 		}
 		leased := byLease[leaseKey(n.NetworkName, strings.ToLower(n.MAC))]
 		out = append(out, DesiredNIC{
-			Name:       nicName(n, used),
-			MAC:        strings.ToLower(n.MAC),
-			IP:         n.IP,
-			NetBoxIPID: leased.ID,
-			NetBoxIP:   leased.IP,
+			Name:          nicName(n, used),
+			MAC:           strings.ToLower(n.MAC),
+			IP:            n.IP,
+			NetBoxIPID:    leased.ID,
+			NetBoxIP:      leased.IP,
+			LeaseNetwork:  leased.Network,
+			LeasePrefixID: leased.PrefixID,
 		})
 	}
 	return out, skipped
@@ -1533,6 +1535,10 @@ func nicName(n corrosion.NICRecord, used map[string]bool) string {
 type leasedAddress struct {
 	ID int
 	IP string
+	// Network and PrefixID locate the lease row and the binding it was claimed
+	// through, which a re-point of a dead address needs (see repairDeadAddress).
+	Network  string
+	PrefixID int
 }
 
 // indexLeases builds the (network, MAC) -> NetBox address id index the desired
@@ -1570,7 +1576,8 @@ func indexLeases(leases []corrosion.LeaseRecord) (map[string]leasedAddress, int)
 	dropped := 0
 	for k, group := range grouped {
 		if len(group) == 1 {
-			out[k] = leasedAddress{ID: group[0].NetBoxIPID, IP: group[0].IP}
+			out[k] = leasedAddress{ID: group[0].NetBoxIPID, IP: group[0].IP,
+				Network: group[0].Network, PrefixID: group[0].NetBoxPrefix}
 			continue
 		}
 		ambiguousKeys = append(ambiguousKeys, k)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -54,6 +55,14 @@ type netboxWriter interface {
 
 	AssignIPToInterface(ctx context.Context, ipID, ifaceID int) error
 	ClearIPAssignment(ctx context.Context, ipID int) error
+
+	// The address half a dead-address repair re-creates through: a lookup by
+	// identity first, so a repair interrupted after its create adopts the
+	// object rather than duplicating it, then the create, and a release to
+	// compensate a create whose lease re-point did not land.
+	LookupByIdentity(ctx context.Context, identity string, vrfID int, prefixCIDR string) ([]netbox.IPAddress, error)
+	ClaimSpecificIP(ctx context.Context, address string, vrfID int, identity string) (netbox.IPAddress, error)
+	ReleaseIP(ctx context.Context, id int) error
 
 	FindDeviceInCluster(ctx context.Context, name string, clusterID int) (int, error)
 
@@ -190,6 +199,9 @@ type Reconciler struct {
 	// start of every sweep. See assignAddress.
 	deadMu    sync.Mutex
 	deadAddrs map[int]string
+	// repointed maps a dead address id this pass repaired to the address that
+	// replaced it, so the primary phase points at the live one.
+	repointed map[int]int
 }
 
 // sink returns the metrics sink, never nil.
@@ -299,7 +311,9 @@ func (r *Reconciler) applyOne(ctx context.Context, a Action, idx desiredIndex, f
 		// One address per action, so the set case needs no handling here: Diff
 		// emits one assign for the desired address plus one clear per stale
 		// litevirt-owned address.
-		return r.assignAddress(ctx, a.IPID, a.NetBoxID, a.Key)
+		// A NIC missing from the index carries no lease to repair through; the
+		// zero value makes a dead address stay dead rather than fail the pass.
+		return r.assignAddress(ctx, a.IPID, a.NetBoxID, a.Key, idx.NICs[a.Key])
 	case a.Kind == kindNIC && a.Op == "clear":
 		// IPID is only ever a litevirt-owned address — BuildActual admits no
 		// other into the set Diff clears from — so this branch cannot detach an
@@ -606,7 +620,7 @@ func (r *Reconciler) createNIC(ctx context.Context, a Action, idx desiredIndex, 
 	if dn.NIC.NetBoxIPID == 0 {
 		return nil
 	}
-	return r.assignAddress(ctx, dn.NIC.NetBoxIPID, id, identity)
+	return r.assignAddress(ctx, dn.NIC.NetBoxIPID, id, identity, dn)
 }
 
 // assignAddress attaches one leased address to an interface.
@@ -621,17 +635,157 @@ func (r *Reconciler) createNIC(ctx context.Context, a Action, idx desiredIndex, 
 //
 // Only a 404, which is NetBox saying the address is absent. Any other refusal
 // is a fault this pass cannot classify, and still fails it.
-func (r *Reconciler) assignAddress(ctx context.Context, ipID, ifaceID int, nicKey string) error {
+//
+// Once netbox_ip_repoint_v1 has latched the dead address is REPAIRED instead:
+// see repairDeadAddress. Until then, and whenever a repair cannot be made,
+// it is recorded as dead.
+func (r *Reconciler) assignAddress(ctx context.Context, ipID, ifaceID int, nicKey string, dn desiredNIC) error {
 	err := r.nb.AssignIPToInterface(ctx, ipID, ifaceID)
 	switch {
 	case err == nil:
 		return nil
 	case isNotFound(err):
-		r.markDeadAddress(ipID, nicKey)
+		if !r.db.MayRepointNetBoxLease() {
+			r.markDeadAddress(ipID, nicKey)
+			return nil
+		}
+		newID, rerr := r.repairDeadAddress(ctx, ipID, nicKey, dn)
+		if rerr != nil || newID == 0 {
+			if rerr != nil {
+				slog.Warn("netbox mirror: could not re-create a NetBox address a live lease still "+
+					"names; the NIC is left without it this pass",
+					"netbox_address_id", ipID, "nic", nicKey, "error", rerr)
+			}
+			r.markDeadAddress(ipID, nicKey)
+			return nil
+		}
+		r.markRepointed(ipID, newID)
+		if err := r.nb.AssignIPToInterface(ctx, newID, ifaceID); err != nil {
+			return fmt.Errorf("netboxsync: assign re-created address %d to interface %d: %w", newID, ifaceID, err)
+		}
 		return nil
 	default:
 		return fmt.Errorf("netboxsync: assign address %d to interface %d: %w", ipID, ifaceID, err)
 	}
+}
+
+// repairDeadAddress re-creates the NetBox address a live lease names but NetBox
+// no longer holds, and re-points the lease at it. It returns the new address
+// id, or 0 with no error when there is nothing it may repair.
+//
+// THE ADDRESS AND IDENTITY ARE THE LEASE'S. It is created at the lease's
+// address, inside the VRF and prefix the lease was claimed through, under the
+// NIC's identity — the same identity the original claim carried — so the
+// result is the object the claim would have made, not a new decision.
+//
+// LOOKED UP FIRST. A repair that created the object and then lost its re-point
+// (a crash, a lost response) leaves an object carrying this identity; finding
+// it adopts it instead of making a second. Anything at the address that is
+// NOT ours — an operator's object, another installation's — refuses the
+// repair: NetBox will not hold two, and it is not this mirror's to take.
+//
+// THE RE-POINT IS GUARDED ON THE DEAD ID (corrosion.RepointNetBoxLease). A lease
+// released or re-pointed meanwhile is left alone; an object this call created
+// for it is then released again, since nothing names it.
+func (r *Reconciler) repairDeadAddress(ctx context.Context, deadID int, identity string, dn desiredNIC) (int, error) {
+	n := dn.NIC
+	if n.LeaseNetwork == "" || n.NetBoxIP == "" || n.LeasePrefixID == 0 {
+		return 0, nil
+	}
+	b, err := corrosion.GetBindingByPrefix(ctx, r.db, n.LeasePrefixID)
+	if err != nil {
+		return 0, fmt.Errorf("read the binding of prefix %d: %w", n.LeasePrefixID, err)
+	}
+	if b == nil || b.Suspended || b.Network != n.LeaseNetwork || b.VRFID == 0 {
+		// No live binding to claim through: the address cannot be re-created
+		// under the scope its lease was claimed in.
+		return 0, nil
+	}
+	_, prefix, err := net.ParseCIDR(b.ObservedCIDR)
+	if err != nil {
+		return 0, fmt.Errorf("binding of prefix %d carries an unparseable CIDR %q", b.PrefixID, b.ObservedCIDR)
+	}
+	host := net.ParseIP(n.NetBoxIP)
+	if host == nil || !prefix.Contains(host) {
+		return 0, fmt.Errorf("leased address %q is not inside the bound prefix %s", n.NetBoxIP, b.ObservedCIDR)
+	}
+	ones, _ := prefix.Mask.Size()
+	address := fmt.Sprintf("%s/%d", host.String(), ones)
+
+	found, err := r.nb.LookupByIdentity(ctx, identity, b.VRFID, b.ObservedCIDR)
+	if err != nil {
+		return 0, fmt.Errorf("look up address identity %s: %w", identity, err)
+	}
+	var ip netbox.IPAddress
+	created := false
+	switch len(found) {
+	case 0:
+		ip, err = r.nb.ClaimSpecificIP(ctx, address, b.VRFID, identity)
+		if err != nil {
+			return 0, fmt.Errorf("re-create address %s: %w", address, err)
+		}
+		created = true
+	case 1:
+		ip = found[0]
+	default:
+		return 0, fmt.Errorf("%d NetBox addresses carry identity %s", len(found), identity)
+	}
+	if !sameHost(ip.Address, host) || ip.Identity != identity || ip.VRFID != b.VRFID || ip.ID == 0 {
+		if created {
+			r.compensate(ctx, ip.ID)
+		}
+		return 0, fmt.Errorf("NetBox address %d (%s, identity %q, VRF %d) is not the leased %s",
+			ip.ID, ip.Address, ip.Identity, ip.VRFID, address)
+	}
+	moved, err := corrosion.RepointNetBoxLease(ctx, r.db, n.LeaseNetwork, host.String(), deadID, ip.ID)
+	if err != nil || !moved {
+		if created {
+			r.compensate(ctx, ip.ID)
+		}
+		if err != nil {
+			return 0, err
+		}
+		return 0, nil
+	}
+	slog.Info("netbox mirror: re-created a NetBox address a live lease still named, and re-pointed "+
+		"the lease at it", "address", address, "dead_netbox_address_id", deadID,
+		"netbox_address_id", ip.ID, "nic", identity)
+	return ip.ID, nil
+}
+
+// compensate releases an address this pass created and could not attach to a
+// lease. A failure leaves an object carrying our identity that no lease names,
+// which is the orphan sweeper's to reclaim.
+func (r *Reconciler) compensate(ctx context.Context, id int) {
+	if id == 0 {
+		return
+	}
+	if err := r.nb.ReleaseIP(ctx, id); err != nil && !isNotFound(err) {
+		slog.Warn("netbox mirror: could not release a re-created address no lease names; the "+
+			"orphan sweep reclaims it", "netbox_address_id", id, "error", err)
+	}
+}
+
+// sameHost reports whether a NetBox address (CIDR) is the host want.
+func sameHost(cidr string, want net.IP) bool {
+	h, _, err := net.ParseCIDR(cidr)
+	return err == nil && h.Equal(want)
+}
+
+func (r *Reconciler) markRepointed(deadID, newID int) {
+	r.deadMu.Lock()
+	defer r.deadMu.Unlock()
+	if r.repointed == nil {
+		r.repointed = map[int]int{}
+	}
+	r.repointed[deadID] = newID
+}
+
+// replacement is the address that replaced a dead one this pass, or 0.
+func (r *Reconciler) replacement(deadID int) int {
+	r.deadMu.Lock()
+	defer r.deadMu.Unlock()
+	return r.repointed[deadID]
 }
 
 func (r *Reconciler) markDeadAddress(ipID int, nicKey string) {
@@ -654,6 +808,7 @@ func (r *Reconciler) resetDeadAddresses() {
 	r.deadMu.Lock()
 	defer r.deadMu.Unlock()
 	r.deadAddrs = nil
+	r.repointed = nil
 }
 
 // deadAddresses is this pass's dead address ids, sorted, with the NIC identity
@@ -791,16 +946,21 @@ func (r *Reconciler) setPrimaryIP(ctx context.Context, a Action) error {
 		}
 		vmID = ref.NetBoxID
 	}
-	if a.IPID != 0 && r.isDeadAddress(a.IPID) {
+	ipID := a.IPID
+	if repl := r.replacement(ipID); repl != 0 {
+		// Repaired this pass: the lease now names the re-created address.
+		ipID = repl
+	}
+	if ipID != 0 && r.isDeadAddress(ipID) {
 		// The interface phase found this address gone. NetBox refuses a primary
 		// that does not exist, and the refusal would fail the pass the 404 was
 		// kept from failing.
 		return nil
 	}
 	if a.Op == opPrimaryIP6 {
-		return r.nb.SetPrimaryIP6(ctx, vmID, a.IPID)
+		return r.nb.SetPrimaryIP6(ctx, vmID, ipID)
 	}
-	return r.nb.SetPrimaryIP4(ctx, vmID, a.IPID)
+	return r.nb.SetPrimaryIP4(ctx, vmID, ipID)
 }
 
 // keepOldest resolves a search result to the one object to adopt.

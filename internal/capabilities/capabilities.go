@@ -486,6 +486,26 @@ const (
 	// build included, and every such host must resolve as the rest do.
 	SpecConflictV1 = "spec_conflict_v1"
 
+	// NetBoxIPRepointV1 gates re-pointing a live lease at a re-created NetBox
+	// address (internal/corrosion/netbox_repoint.go). A lease names its NetBox
+	// address object by id; when an operator deletes that object by hand, the
+	// lease goes on naming the dead id and the inventory mirror cannot assign
+	// the NIC its address. Once latched, the mirror re-creates the address in
+	// NetBox with the lease's address and identity, re-points the lease at the
+	// new id with an UPDATE of ip_allocations.netbox_ip_id, and assigns it.
+	// Until then it skips that NIC's address and reports the pass unconverged.
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build decodes the re-point statement. The repair
+	// is opted into already, by the inventory mirror's own opt-in
+	// (netbox.mirror_inventory, netbox_mirror_v1), which is its stand-down.
+	//
+	// ReplicationGated: the re-point is a statement shape a previous-release
+	// peer has no ledger entry for, so it must be decodable by every host
+	// still receiving replication, a maintenance host on the previous build
+	// included.
+	NetBoxIPRepointV1 = "netbox_ip_repoint_v1"
+
 	// RecoveryClaimV1 gates ENFORCEMENT of single-winner recovery claims
 	// (docs/design/recovery-claims.md §3, §5.1–§5.2,
 	// colonelpanik/litevirt#250): a failover coordinator collects a majority
@@ -1170,6 +1190,14 @@ const ReleaseToken = Release202611V1
 //     dropped edit can be made again. A binary rolled back below it enters
 //     WAL quarantine, as below every latched token.
 //
+//   - netbox_ip_repoint_v1 has no flag either: it says this build decodes the
+//     lease re-point statement. What it licenses is bounded to a NetBox
+//     address object that is provably gone (NetBox answered 404) while a live
+//     lease still names it, and the re-point is guarded on the dead id. Its
+//     stand-down is the inventory mirror's own: netbox.mirror_inventory off on
+//     every node stops the only writer. A binary rolled back below it enters
+//     WAL quarantine, as below every latched token.
+//
 //   - release_2026_11_v1 (the release token) has no flag and no stand-down of
 //     its own, and needs none: latching it changes nothing until a feature is
 //     USED, and every feature is opened through WithFeature, which records
@@ -1304,6 +1332,9 @@ var supported = []string{
 	// decodes the epoch-carrying spec edit and resolves a conflict at one
 	// generation as anti-entropy does", a fact about the binary.
 	SpecConflictV1,
+	// NetBoxIPRepointV1 is advertised UNCONDITIONALLY: it says "this build
+	// decodes the lease re-point statement", a fact about the binary.
+	NetBoxIPRepointV1,
 	// RecoveryClaimV1 is advertised CONDITIONALLY: enforcement.recovery_claim
 	// (default on) on AND this node ready (split_brain_gate_v1 latched, voter_config_v1
 	// ready). Withheld while the flag is off because every flag-on node relies
@@ -1347,7 +1378,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, LeaseTermClaimV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1, SpecConflictV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, LeaseTermClaimV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1, SpecConflictV1, NetBoxIPRepointV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -1438,6 +1469,10 @@ var replicationGated = map[string]bool{
 	// epoch-carrying spec edit and resolve a conflict as the rest do. See
 	// SpecConflictV1.
 	SpecConflictV1: true,
+	// Confirmed against every replication recipient: the lease re-point
+	// statement must be decodable by every host we stream to. See
+	// NetBoxIPRepointV1.
+	NetBoxIPRepointV1: true,
 	// Confirmed against every replication recipient: the claim_certificate
 	// column's statement shapes on runtime_action_proofs must be decodable by
 	// every host we stream to. Not mandatory: the flag is the opt-in.
@@ -1531,6 +1566,9 @@ var mandatory = map[string]bool{
 	// resolves a conflict at one generation as every replica does). See
 	// SpecConflictV1.
 	SpecConflictV1: true,
+	// A fact about the binary (it decodes the lease re-point statement). The
+	// mirror's own opt-in is its stand-down. See NetBoxIPRepointV1.
+	NetBoxIPRepointV1: true,
 	// A fact about the binary (it decodes, keeps and honours its release's
 	// fields and shapes). Nothing changes until a feature is used, and every
 	// use is recorded first. See Release202611V1.

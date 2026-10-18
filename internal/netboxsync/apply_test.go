@@ -772,6 +772,12 @@ type stubVirt struct {
 	primaryIPs [][2]int
 	// primaryIP6s records every SetPrimaryIP6 call the same way.
 	primaryIP6s [][2]int
+	// The dead-address repair's address state; see LookupByIdentity.
+	byIdentityIPs map[string][]netbox.IPAddress
+	claimed       [][2]string
+	claimErr      error
+	releasedIPs   []int
+	nextIP        int
 	// sites is the NetBox site name -> id table FindSiteByName resolves against.
 	sites map[string]int
 
@@ -995,6 +1001,33 @@ func (s *stubVirt) SetPrimaryIP4(_ context.Context, vmID, ipID int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.primaryIPs = append(s.primaryIPs, [2]int{vmID, ipID})
+	return nil
+}
+
+// The dead-address repair's address surface. claimed records every
+// ClaimSpecificIP as {address, identity}; byIdentityIPs is what a lookup finds;
+// claimErr fails a create; released records every ReleaseIP.
+func (s *stubVirt) LookupByIdentity(_ context.Context, identity string, _ int, _ string) ([]netbox.IPAddress, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]netbox.IPAddress(nil), s.byIdentityIPs[identity]...), nil
+}
+
+func (s *stubVirt) ClaimSpecificIP(_ context.Context, address string, vrfID int, identity string) (netbox.IPAddress, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.claimErr != nil {
+		return netbox.IPAddress{}, s.claimErr
+	}
+	s.claimed = append(s.claimed, [2]string{address, identity})
+	s.nextIP++
+	return netbox.IPAddress{ID: 9000 + s.nextIP, Address: address, Identity: identity, VRFID: vrfID}, nil
+}
+
+func (s *stubVirt) ReleaseIP(_ context.Context, id int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.releasedIPs = append(s.releasedIPs, id)
 	return nil
 }
 

@@ -61,6 +61,8 @@ type NetBoxFake struct {
 	// cascaded records every address id deleted because the interface it was
 	// assigned to was deleted, in order.
 	cascaded []int
+	// lastIPID is the highest address id ever handed out; see nextID.
+	lastIPID int
 
 	// addrRequests counts EVERY request to the ipam address surface — the
 	// collection, the id-scoped routes and the per-prefix available-ips band —
@@ -1041,9 +1043,12 @@ func (f *NetBoxFake) Reassign(id int, identity string) {
 // nextID hands out object ids from a band that cannot collide with the address
 // host numbers, so a test misreading one for the other fails loudly.
 func (f *NetBoxFake) nextID() int {
-	id := 9000 + len(f.byID)
+	// Never an id handed out before, as NetBox's are monotonic: an address
+	// re-created after a delete must not come back under the dead id.
+	id := max(9000+len(f.byID), f.lastIPID+1)
 	for {
 		if _, taken := f.byID[id]; !taken {
+			f.lastIPID = id
 			return id
 		}
 		id++

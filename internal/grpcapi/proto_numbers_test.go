@@ -316,3 +316,59 @@ func TestProtoNumbers_ScopedOperationAbort(t *testing.T) {
 		}
 	}
 }
+
+// Storage hygiene (older-17 #9, #11): the set-aside overlay and replication
+// checkpoint RPCs, and their messages' numbers.
+func TestProtoNumbers_StorageHygiene(t *testing.T) {
+	fields := []struct {
+		msg  protoreflect.ProtoMessage
+		num  protoreflect.FieldNumber
+		name protoreflect.Name
+	}{
+		{&pb.ListSetAsideOverlaysRequest{}, 1, "host"},
+		{&pb.ListSetAsideOverlaysRequest{}, 2, "vm_name"},
+		{&pb.SetAsideOverlay{}, 1, "vm_name"},
+		{&pb.SetAsideOverlay{}, 2, "disk_name"},
+		{&pb.SetAsideOverlay{}, 3, "name"},
+		{&pb.SetAsideOverlay{}, 4, "path"},
+		{&pb.SetAsideOverlay{}, 5, "disk_path"},
+		{&pb.SetAsideOverlay{}, 6, "set_aside_at"},
+		{&pb.SetAsideOverlay{}, 7, "size_bytes"},
+		{&pb.SetAsideOverlay{}, 8, "in_use"},
+		{&pb.ListSetAsideOverlaysResponse{}, 1, "host"},
+		{&pb.ListSetAsideOverlaysResponse{}, 2, "overlays"},
+		{&pb.RemoveSetAsideOverlayRequest{}, 1, "vm_name"},
+		{&pb.RemoveSetAsideOverlayRequest{}, 2, "disk_name"},
+		{&pb.RemoveSetAsideOverlayRequest{}, 3, "name"},
+		{&pb.RemoveSetAsideOverlayResponse{}, 1, "host"},
+		{&pb.RemoveSetAsideOverlayResponse{}, 2, "path"},
+		{&pb.RemoveSetAsideOverlayResponse{}, 3, "size_bytes"},
+		{&pb.ListReplicationCheckpointsRequest{}, 1, "vm_name"},
+		{&pb.ReplicationCheckpointRow{}, 1, "vm_name"},
+		{&pb.ReplicationCheckpointRow{}, 2, "target_pool"},
+		{&pb.ReplicationCheckpointRow{}, 3, "checkpoint"},
+		{&pb.ReplicationCheckpointRow{}, 4, "updated_at"},
+		{&pb.ReplicationCheckpointRow{}, 5, "in_use"},
+		{&pb.ReplicationCheckpointRow{}, 6, "vm_deleted"},
+		{&pb.ListReplicationCheckpointsResponse{}, 1, "checkpoints"},
+		{&pb.DeleteReplicationCheckpointRequest{}, 1, "vm_name"},
+		{&pb.DeleteReplicationCheckpointRequest{}, 2, "target_pool"},
+		{&pb.DeleteReplicationCheckpointResponse{}, 1, "checkpoint"},
+	}
+	for _, f := range fields {
+		md := f.msg.ProtoReflect().Descriptor()
+		fd := md.Fields().ByNumber(f.num)
+		if fd == nil || fd.Name() != f.name {
+			t.Errorf("%s field %d is %v, want %s", md.FullName(), f.num, fd, f.name)
+		}
+		if n := md.Fields().Len(); f.num == 1 && n == 0 {
+			t.Errorf("%s has no fields", md.FullName())
+		}
+	}
+	svc := pb.File_litevirt_v1_service_proto.Services().ByName("LiteVirt")
+	for _, rpc := range []protoreflect.Name{"ListSetAsideOverlays", "RemoveSetAsideOverlay", "ListReplicationCheckpoints", "DeleteReplicationCheckpoint"} {
+		if svc.Methods().ByName(rpc) == nil {
+			t.Errorf("RPC %s is missing", rpc)
+		}
+	}
+}

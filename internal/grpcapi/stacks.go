@@ -503,9 +503,9 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 			return fmt.Errorf("security-group %q: check for an existing group: %w", name, err)
 		}
 		if held != nil {
-			if !s.sgReadable(ctx, held) {
-				// Names are unique across projects; the holder of a group
-				// the caller may not read is not its to know.
+			if held.Project != "" && !s.sgReadable(ctx, held) {
+				// Names are unique across projects; the id of another
+				// project's group the caller may not read is not its to know.
 				return fmt.Errorf("security-group %q is already defined; names must be unique across projects", name)
 			}
 			owner := "lv sg create"

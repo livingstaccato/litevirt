@@ -402,6 +402,10 @@ type Server struct {
 	commitFenceHook func(op string)
 	// createCommittedHook is a test-only seam; see SetCreateCommittedHook.
 	createCommittedHook func(name string) error
+	// createBeforeFlightHook, when set, runs on the owner between a create's
+	// first existence check and its in-flight registration (beginCreate).
+	// Test seam only; nil in production.
+	createBeforeFlightHook func(name string)
 	// createReturnedHook is a test-only seam; see SetCreateReturnedHook.
 	createReturnedHook func(name string, err error)
 	// stackMemberDeleteHook is a test-only seam: DeleteStack calls it with
@@ -958,6 +962,11 @@ type Server struct {
 
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
+	// createFlights holds each create this host runs as the VM's owner until
+	// it returns: a second create of the name is refused while one is in
+	// flight (create_inflight.go).
+	createFlightsMu sync.Mutex
+	createFlights   map[*createFlight]struct{}
 	// vmLockQueues holds the callers waiting for a VM's lock through
 	// lockVMUnlessStartHeld (vm_start_bound.go).
 	vmLockQueuesMu sync.Mutex

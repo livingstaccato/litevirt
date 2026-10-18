@@ -320,9 +320,11 @@ marker a `delete --keep-disks` left under the name are kept. The client gets
 the error. If the domain cannot be stopped, is gone, or is no longer the one
 the create defined, the disks are left as they are, and so is any such domain,
 and the error says so; the next create of the same name removes a leftover
-domain. The host that ran the create logs it at WARN (`vm create failed`, with
-the cause), and what the cleanup did (`vm create: cleanup after the failed
-create`).
+domain once it is stopped, and is refused while one runs. A create of a name
+whose create is still in flight on the owning host is refused (`a create of VM
+"<name>" is in progress`) and touches nothing. The host that ran the create
+logs it at WARN (`vm create failed`, with the cause), and what the cleanup did
+(`vm create: cleanup after the failed create`).
 Once the VM record is written the VM exists: a later failure, or a client that
 stops waiting, undoes nothing.
 

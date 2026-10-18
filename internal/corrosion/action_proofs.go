@@ -135,107 +135,108 @@ func ReplaceVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmN
 }
 
 func writeVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmName, destHost, replacing string) error {
-	if err := proofStampEmittable(c, p); err != nil {
-		return err
-	}
-	disks, err := GetVMDisks(ctx, c, vmName)
-	if err != nil {
-		return err
-	}
-	source, err := vmHostOf(ctx, c, vmName)
-	if err != nil {
-		return err
-	}
-	now := c.NowTS()
-	stmts := []Statement{
-		proofInsertStmt(c, p, now),
-		{SQL: `UPDATE vms SET host_name = ?, state = 'pending', pending_action_id = ?, updated_at = ?
-		        WHERE name = ? AND deleted_at IS NULL`,
-			Params: []interface{}{destHost, p.ID, now, vmName}},
-	}
-	for _, d := range disks {
-		if d.HostName == destHost {
-			continue
+	return retryDiskMove(func() error {
+		if err := proofStampEmittable(c, p); err != nil {
+			return err
 		}
-		if keep, _ := SharedRowKeepsOwner(ctx, c, d, source, destHost); keep {
-			continue // its unproven owner is judged at the destination's start (review I1)
+		disks, err := disksToMove(ctx, c, vmName)
+		if err != nil {
+			return err
 		}
-		stmts = append(stmts, Statement{
-			SQL:    vmDiskHostMoveSQL,
-			Params: []interface{}{destHost, now, vmName, d.DiskName},
-		})
-	}
-	stmts = append(stmts, placementGenStmts(ctx, c, vmName)...)
-	// Guard: only mint the proof + stamp the pending link if the VM row still
-	// exists (not deleted) AND no DIFFERENT proof already carries this id — so
-	// we never leave an orphan proof for a vanished VM or (astronomically) point
-	// a VM at a pre-existing proof on an id collision. applied=false →
-	// ErrNoRowsAffected.
-	//
-	// A row that already carries this id with the SAME binding is not a
-	// collision, it is the same proof: a coordinator re-materializing a
-	// recovery claim another coordinator decided (docs/design/recovery-claims.md
-	// §3.4, §3.13 step 5) writes the identical proof, and has to be able to
-	// point its replica's VM row at it even when the proof row itself arrived by
-	// replication first. The insert is then a no-op and only the pending link
-	// is written.
-	//
-	// A row that is stopped by intent NOW (VMStoppedForFailover) is refused
-	// with ErrWorkloadStopped, whatever the coordinator read when it chose this
-	// VM: this write would replace the stop with "pending" — a start on the
-	// destination. A stop that lands after selection therefore still wins.
-	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
-		var currentOwnerEpoch int64
-		var startable bool
-		var pendingID, state string
-		if err := tx.QueryRow(`SELECT vm_owner_epoch, NOT `+vmStoppedByIntentSQL+`, COALESCE(pending_action_id, ''), COALESCE(state, '')
-			FROM vms WHERE name = ? AND deleted_at IS NULL`,
-			append(vmStoppedByIntentArgs(), vmName)...).
-			Scan(&currentOwnerEpoch, &startable, &pendingID, &state); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
+		source, err := vmHostOf(ctx, c, vmName)
+		if err != nil {
+			return err
+		}
+		now := c.NowTS()
+		stmts := []Statement{
+			proofInsertStmt(c, p, now),
+			{SQL: `UPDATE vms SET host_name = ?, state = 'pending', pending_action_id = ?, updated_at = ?
+			        WHERE name = ? AND deleted_at IS NULL`,
+				Params: []interface{}{destHost, p.ID, now, vmName}},
+		}
+		var moved []DiskRecord
+		for _, d := range disks {
+			if d.HostName == destHost {
+				continue
+			}
+			if keep, _ := SharedRowKeepsOwner(ctx, c, d, source, destHost); keep {
+				continue // its unproven owner is judged at the destination's start (review I1)
+			}
+			moved = append(moved, d)
+			stmts = append(stmts, diskRowMove(d, destHost, now))
+		}
+		stmts = append(stmts, placementGenStmts(ctx, c, vmName)...)
+		// Guard: only mint the proof + stamp the pending link if the VM row still
+		// exists (not deleted) AND no DIFFERENT proof already carries this id — so
+		// we never leave an orphan proof for a vanished VM or (astronomically) point
+		// a VM at a pre-existing proof on an id collision. applied=false →
+		// ErrNoRowsAffected.
+		//
+		// A row that already carries this id with the SAME binding is not a
+		// collision, it is the same proof: a coordinator re-materializing a
+		// recovery claim another coordinator decided (docs/design/recovery-claims.md
+		// §3.4, §3.13 step 5) writes the identical proof, and has to be able to
+		// point its replica's VM row at it even when the proof row itself arrived by
+		// replication first. The insert is then a no-op and only the pending link
+		// is written.
+		//
+		// A row that is stopped by intent NOW (VMStoppedForFailover) is refused
+		// with ErrWorkloadStopped, whatever the coordinator read when it chose this
+		// VM: this write would replace the stop with "pending" — a start on the
+		// destination. A stop that lands after selection therefore still wins.
+		applied, err := c.ExecuteBatchGuarded(ctx, disksStill(ctx, moved, func(tx *sql.Tx) (bool, error) {
+			var currentOwnerEpoch int64
+			var startable bool
+			var pendingID, state string
+			if err := tx.QueryRow(`SELECT vm_owner_epoch, NOT `+vmStoppedByIntentSQL+`, COALESCE(pending_action_id, ''), COALESCE(state, '')
+				FROM vms WHERE name = ? AND deleted_at IS NULL`,
+				append(vmStoppedByIntentArgs(), vmName)...).
+				Scan(&currentOwnerEpoch, &startable, &pendingID, &state); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return false, nil
+				}
+				return false, err
+			}
+			if !startable {
+				return false, ErrWorkloadStopped
+			}
+			if replacing != "" && (pendingID != replacing || state != "pending") {
 				return false, nil
 			}
-			return false, err
-		}
-		if !startable {
-			return false, ErrWorkloadStopped
-		}
-		if replacing != "" && (pendingID != replacing || state != "pending") {
-			return false, nil
-		}
-		if p.OwnerEpoch != "" {
-			expectedOwnerEpoch, err := strconv.ParseInt(p.OwnerEpoch, 10, 64)
+			if p.OwnerEpoch != "" {
+				expectedOwnerEpoch, err := strconv.ParseInt(p.OwnerEpoch, 10, 64)
+				if err != nil {
+					return false, err
+				}
+				if currentOwnerEpoch != expectedOwnerEpoch {
+					return false, nil
+				}
+			}
+			var existing ActionProof
+			err := tx.QueryRow(
+				`SELECT action, target_kind, target_name, dest_host, coordinator,
+				        relocation_token, fence_epoch, owner_epoch, lease_term, lease_key
+				   FROM runtime_action_proofs WHERE id = ?`, p.ID).
+				Scan(&existing.Action, &existing.TargetKind, &existing.TargetName,
+					&existing.DestHost, &existing.Coordinator, &existing.RelocationToken,
+					&existing.FenceEpoch, &existing.OwnerEpoch, &existing.LeaseTerm,
+					&existing.LeaseKey)
+			if errors.Is(err, sql.ErrNoRows) {
+				return true, nil
+			}
 			if err != nil {
 				return false, err
 			}
-			if currentOwnerEpoch != expectedOwnerEpoch {
-				return false, nil
-			}
-		}
-		var existing ActionProof
-		err := tx.QueryRow(
-			`SELECT action, target_kind, target_name, dest_host, coordinator,
-			        relocation_token, fence_epoch, owner_epoch, lease_term, lease_key
-			   FROM runtime_action_proofs WHERE id = ?`, p.ID).
-			Scan(&existing.Action, &existing.TargetKind, &existing.TargetName,
-				&existing.DestHost, &existing.Coordinator, &existing.RelocationToken,
-				&existing.FenceEpoch, &existing.OwnerEpoch, &existing.LeaseTerm,
-				&existing.LeaseKey)
-		if errors.Is(err, sql.ErrNoRows) {
-			return true, nil
-		}
+			return ProofBindingEqual(existing, p) && existing.DestHost == destHost, nil
+		}), stmts)
 		if err != nil {
-			return false, err
+			return err
 		}
-		return ProofBindingEqual(existing, p) && existing.DestHost == destHost, nil
-	}, stmts)
-	if err != nil {
-		return err
-	}
-	if !applied {
-		return ErrNoRowsAffected
-	}
-	return nil
+		if !applied {
+			return ErrNoRowsAffected
+		}
+		return nil
+	})
 }
 
 // vmStoppedByIntentSQL is VMStoppedForFailover as a predicate on a vms row,

@@ -410,5 +410,15 @@ func HistoricalShapes() []HistoricalShape {
 	add(`UPDATE rebalance_proposals SET status='failed', detail='execution timed out', updated_at=?
 		 WHERE status='applying' AND updated_at < ?`, "rebalance_reap_stale_bulk_v130")
 
+	// The host-only move of a disk row (vmDiskHostMoveSQL), which every release
+	// emits in a migration's ownership commit and, since 386206a3, in each
+	// failover reschedule and ownership transfer. The current tree moves the
+	// whole row instead (diskRowMove, InsertDisk's shape), so a replica holding
+	// an earlier path for the row cannot keep it under the new host. A peer on
+	// an older build still sends this during a rolling upgrade; it applies as
+	// the LWW-gated full-PK update it always was.
+	add(`UPDATE vm_disks SET host_name = ?, updated_at = ?
+			      WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`, "vm_disk_host_move_v130")
+
 	return out
 }

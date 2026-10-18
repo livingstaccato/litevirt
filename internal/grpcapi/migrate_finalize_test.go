@@ -44,11 +44,16 @@ func TestFinalizeMigrationOwnership_CommitFailurePreservesSource(t *testing.T) {
 		t.Fatalf("GetVMDisks: %v", err)
 	}
 
-	// Inject a failure of the disk-ownership UPDATE (simulates a Corrosion write
-	// error at the post-cutover commit).
-	if err := s.db.Execute(ctx,
-		`CREATE TRIGGER inject_fail BEFORE UPDATE ON vm_disks BEGIN SELECT RAISE(ABORT, 'inject'); END;`); err != nil {
-		t.Fatalf("create trigger: %v", err)
+	// Inject a failure of the disk-ownership write (simulates a Corrosion write
+	// error at the post-cutover commit). The move writes the whole row, an
+	// INSERT OR REPLACE.
+	for _, ddl := range []string{
+		`CREATE TRIGGER inject_fail BEFORE UPDATE ON vm_disks BEGIN SELECT RAISE(ABORT, 'inject'); END;`,
+		`CREATE TRIGGER inject_fail_row BEFORE INSERT ON vm_disks BEGIN SELECT RAISE(ABORT, 'inject'); END;`,
+	} {
+		if err := s.db.Execute(ctx, ddl); err != nil {
+			t.Fatalf("create trigger: %v", err)
+		}
 	}
 
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)

@@ -48,35 +48,39 @@ func IsStoppedRekeyDetail(detail string) bool {
 // polices the call site like every other ownership writer's (a literal
 // "stopped" there is provably not a running publish).
 func RekeyStoppedVM(ctx context.Context, c *Client, name, fromHost, destHost, state string, expectedEpoch int64) error {
-	if state != "stopped" {
-		return fmt.Errorf("RekeyStoppedVM moves a stopped VM; asked for state %q", state)
-	}
-	disks, err := GetVMDisks(ctx, c, name)
-	if err != nil {
-		return err
-	}
-	now := c.NowTS()
-	stmts := []Statement{{SQL: vmHostStateSQL, Params: []interface{}{destHost, state, now, name}}}
-	for _, d := range disks {
-		if d.HostName == destHost {
-			continue
+	return retryDiskMove(func() error {
+		if state != "stopped" {
+			return fmt.Errorf("RekeyStoppedVM moves a stopped VM; asked for state %q", state)
 		}
-		if keep, _ := SharedRowKeepsOwner(ctx, c, d, fromHost, destHost); keep {
-			continue // its unproven owner keeps the row (review I1)
+		disks, err := disksToMove(ctx, c, name)
+		if err != nil {
+			return err
 		}
-		stmts = append(stmts, Statement{SQL: vmDiskHostMoveSQL, Params: []interface{}{destHost, now, name, d.DiskName}})
-	}
-	stmts = append(stmts, Statement{SQL: vmStateUpdateSQL, Params: []interface{}{state, StoppedRekeyDetail(fromHost), c.NowTS(), name}})
-	stmts = append(stmts, placementGenStmts(ctx, c, name)...)
-	applied, err := c.ExecuteBatchGuarded(ctx, rekeyStoppedGuard(ctx, name, fromHost, expectedEpoch), stmts)
-	if err != nil {
-		return err
-	}
-	if !applied {
-		return ErrNoRowsAffected
-	}
-	SpendDrainOrigin(ctx, c, name)
-	return nil
+		now := c.NowTS()
+		stmts := []Statement{{SQL: vmHostStateSQL, Params: []interface{}{destHost, state, now, name}}}
+		var moved []DiskRecord
+		for _, d := range disks {
+			if d.HostName == destHost {
+				continue
+			}
+			if keep, _ := SharedRowKeepsOwner(ctx, c, d, fromHost, destHost); keep {
+				continue // its unproven owner keeps the row (review I1)
+			}
+			moved = append(moved, d)
+			stmts = append(stmts, diskRowMove(d, destHost, now))
+		}
+		stmts = append(stmts, Statement{SQL: vmStateUpdateSQL, Params: []interface{}{state, StoppedRekeyDetail(fromHost), c.NowTS(), name}})
+		stmts = append(stmts, placementGenStmts(ctx, c, name)...)
+		applied, err := c.ExecuteBatchGuarded(ctx, disksStill(ctx, moved, rekeyStoppedGuard(ctx, name, fromHost, expectedEpoch)), stmts)
+		if err != nil {
+			return err
+		}
+		if !applied {
+			return ErrNoRowsAffected
+		}
+		SpendDrainOrigin(ctx, c, name)
+		return nil
+	})
 }
 
 // RekeyStoppedVMClaimed is RekeyStoppedVM for a re-key decided under a
@@ -88,42 +92,46 @@ func RekeyStoppedVM(ctx context.Context, c *Client, name, fromHost, destHost, st
 // decided destination, so the epoch-bound transfer cannot leave two replicas
 // on two hosts.
 func RekeyStoppedVMClaimed(ctx context.Context, c *Client, name, fromHost, destHost, state string, expectedEpoch int64) error {
-	if state != "stopped" {
-		return fmt.Errorf("RekeyStoppedVMClaimed moves a stopped VM; asked for state %q", state)
-	}
-	disks, err := GetVMDisks(ctx, c, name)
-	if err != nil {
-		return err
-	}
-	now := c.NowTS()
-	stmts := []Statement{{
-		SQL: `UPDATE vms
-		      SET host_name = ?, state = ?, state_detail = '',
-		          vm_owner_epoch = vm_owner_epoch + 1, updated_at = ?
-		      WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
-		Params: []interface{}{destHost, state, now, name, expectedEpoch},
-	}}
-	for _, d := range disks {
-		if d.HostName == destHost {
-			continue
+	return retryDiskMove(func() error {
+		if state != "stopped" {
+			return fmt.Errorf("RekeyStoppedVMClaimed moves a stopped VM; asked for state %q", state)
 		}
-		if keep, _ := SharedRowKeepsOwner(ctx, c, d, fromHost, destHost); keep {
-			continue // its unproven owner keeps the row (review I1)
+		disks, err := disksToMove(ctx, c, name)
+		if err != nil {
+			return err
 		}
-		stmts = append(stmts, Statement{SQL: vmDiskHostMoveSQL, Params: []interface{}{destHost, now, name, d.DiskName}})
-	}
-	stmts = append(stmts, Statement{SQL: vmStateAtEpochSQL,
-		Params: []interface{}{state, StoppedRekeyDetail(fromHost), c.NowTS(), name, expectedEpoch + 1}})
-	stmts = append(stmts, placementGenStmts(ctx, c, name)...)
-	applied, err := c.ExecuteBatchGuarded(ctx, rekeyStoppedGuard(ctx, name, fromHost, expectedEpoch), stmts)
-	if err != nil {
-		return err
-	}
-	if !applied {
-		return ErrNoRowsAffected
-	}
-	SpendDrainOrigin(ctx, c, name)
-	return nil
+		now := c.NowTS()
+		stmts := []Statement{{
+			SQL: `UPDATE vms
+			      SET host_name = ?, state = ?, state_detail = '',
+			          vm_owner_epoch = vm_owner_epoch + 1, updated_at = ?
+			      WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
+			Params: []interface{}{destHost, state, now, name, expectedEpoch},
+		}}
+		var moved []DiskRecord
+		for _, d := range disks {
+			if d.HostName == destHost {
+				continue
+			}
+			if keep, _ := SharedRowKeepsOwner(ctx, c, d, fromHost, destHost); keep {
+				continue // its unproven owner keeps the row (review I1)
+			}
+			moved = append(moved, d)
+			stmts = append(stmts, diskRowMove(d, destHost, now))
+		}
+		stmts = append(stmts, Statement{SQL: vmStateAtEpochSQL,
+			Params: []interface{}{state, StoppedRekeyDetail(fromHost), c.NowTS(), name, expectedEpoch + 1}})
+		stmts = append(stmts, placementGenStmts(ctx, c, name)...)
+		applied, err := c.ExecuteBatchGuarded(ctx, disksStill(ctx, moved, rekeyStoppedGuard(ctx, name, fromHost, expectedEpoch)), stmts)
+		if err != nil {
+			return err
+		}
+		if !applied {
+			return ErrNoRowsAffected
+		}
+		SpendDrainOrigin(ctx, c, name)
+		return nil
+	})
 }
 
 // rekeyStoppedGuard is a re-key's transaction precondition: the row is still

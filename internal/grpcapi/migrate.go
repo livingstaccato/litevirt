@@ -563,8 +563,15 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		// lease is a dead process's, or one whose release failed, which
 		// every recovery pass releases (review m4).
 		// An adopted move's marker is the adopter's, under the lock it took
-		// over: it clears the lease when it ends (re-review 2, m-A).
-		if migLease.released(ctx) && fwl != nil && (adopted == nil || !*adopted) {
+		// over: it is told whether the release succeeded, and clears the
+		// lease when it ends only if it did (re-review 2, m-A; re-review 3,
+		// m-2).
+		ok := migLease.released(ctx)
+		switch {
+		case fwl == nil:
+		case adopted != nil && *adopted && fwl.leaseReleased != nil:
+			fwl.leaseReleased <- ok
+		case ok:
 			s.clearMarkerLease(fwl.marker.VM, fwl.marker.Attempt)
 		}
 	}()
@@ -1064,13 +1071,24 @@ func (s *Server) adoptAbandonedMigration(
 	unlock func(),
 	finish migrationFinish,
 ) {
+	// The request releases the move's lease when it returns, and says here
+	// whether that succeeded (re-review 3, m-2).
+	var leaseReleased chan bool
+	if fwl := finish.fwLive; fwl != nil {
+		leaseReleased = make(chan bool, 1)
+		fwl.leaseReleased = leaseReleased
+	}
 	go func() {
 		defer unlock()
-		// Under the lock: the request's process released the move's lease
-		// when it returned; the marker the adopter leaves no longer names it
-		// (re-review 2, m-A).
+		// Under the lock: the marker the adopter leaves no longer names a
+		// lease the request released; one whose release failed stays named,
+		// and the recovery releases it (re-review 2, m-A).
 		if fwl := finish.fwLive; fwl != nil {
-			defer func() { s.clearMarkerLease(fwl.marker.VM, fwl.marker.Attempt) }()
+			defer func() {
+				if <-leaseReleased {
+					s.clearMarkerLease(fwl.marker.VM, fwl.marker.Attempt)
+				}
+			}()
 		}
 		defer s.invalidateInventoryCache()
 		defer func() {

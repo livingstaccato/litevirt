@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -14,6 +15,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fwmig"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -162,5 +164,54 @@ func TestFwmigCleanup_ProvedOffTargetActionText(t *testing.T) {
 		if !strings.Contains(a, want) {
 			t.Errorf("action %q does not name %q", a, want)
 		}
+	}
+}
+
+// Re-review 3, m-2: an adopted move clears the lease from its marker only
+// when the request's release of it succeeded, so a failed release is left
+// named for the recovery to retry; a successful one is cleared.
+//
+// Mutation: clear the lease after the adoption whatever the release
+// answered (the round-3 rule) — the failed case loses it, red.
+func TestAdoptedFirmwareMigration_KeepsTheLeaseWhoseReleaseFailed(t *testing.T) {
+	for _, fail := range []bool{true, false} {
+		t.Run(map[bool]string{true: "release_failed", false: "released"}[fail], func(t *testing.T) {
+			r := newFwlRig(t, fwlOpts{})
+			old := liveFirmwareSourceCleanup
+			liveFirmwareSourceCleanup = nil // the marker stays released
+			t.Cleanup(func() { liveFirmwareSourceCleanup = old })
+			if fail {
+				r.peerC.fakeDestPeer.mu.Lock()
+				r.peerC.fakeDestPeer.releaseErr = status.Error(codes.Unavailable, "the destination is unreachable")
+				r.peerC.fakeDestPeer.mu.Unlock()
+			}
+			ctx, cancel := context.WithCancel(adminCtx())
+			defer cancel()
+			proceed := make(chan struct{})
+			land := r.srcFake.OnMigrateToTarget
+			r.srcFake.OnMigrateToTarget = func(name, uri string, p lv.MigrateParams) error {
+				cancel() // the client goes away mid-copy
+				<-proceed
+				return land(name, uri, p)
+			}
+			err := r.src.MigrateVM(&pb.MigrateVMRequest{VmName: fwlVM, TargetHost: "dst-host", Strategy: pb.MigrateStrategy_MIGRATE_LIVE},
+				&mockMigrateStream{ctx: ctx})
+			if status.Code(err) != codes.DeadlineExceeded {
+				t.Fatalf("got %v, want the adopted move's DeadlineExceeded", err)
+			}
+			close(proceed)
+			deadline := time.Now().Add(10 * time.Second)
+			for !r.log.has("cleanup") {
+				if time.Now().After(deadline) {
+					t.Fatalf("the adopted move never reached cleanup: steps %v", r.log.get())
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			r.src.lockVM(fwlVM)() // the adopter has ended
+			m := requireMarker(t, r, fwmig.PhaseReleased, "")
+			if got := m.CapacityLease != ""; got != fail {
+				t.Fatalf("marker names lease %q (holder %q), want named = %v", m.CapacityLease, m.CapacityLeaseHolder, fail)
+			}
+		})
 	}
 }

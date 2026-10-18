@@ -1694,9 +1694,22 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*pb
 		return nil, err
 	}
 
-	// Soft-delete the host and clean up related records.
-	if err := corrosion.DeleteHost(ctx, s.db, req.Name); err != nil {
+	if hook := s.removeHostBeforeDeleteHook; hook != nil {
+		hook(req.Name)
+	}
+	// Soft-delete the host and clean up related records, only while its row
+	// is still the admission the checks above passed: a removal and a
+	// re-admission of the name, or a certificate renewal, may have landed
+	// since, and the new machine is not this removal's to delete.
+	applied, err := corrosion.DeleteHostIf(ctx, s.db, req.Name, h.CertSerial, incarnation)
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "delete host: %v", err)
+	}
+	if !applied {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%s's row changed while it was being removed (it was serial %s at incarnation %d); nothing was removed. "+
+				"Check `lv host inspect %s`, and run `lv host rm` again if it is still to go",
+			req.Name, h.CertSerial, incarnation, req.Name)
 	}
 
 	slog.Warn("host removed from cluster", "host", req.Name, "cert_serial", h.CertSerial, "incarnation", incarnation)

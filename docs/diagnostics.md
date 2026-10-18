@@ -2774,6 +2774,14 @@ the image open. An image stops being named as soon as a VM's disk names it
 again, and is forgotten once its pool answers without it (checked every 5
 minutes).
 
+An image is also left, and named the same way, when its cluster cannot be
+told as its domain would be given it: its pool is on this host but its
+monitors cannot be read, the pool of its name here is not a ceph pool, its
+locator carries an option a domain cannot be given, or its pool is not on
+this host and its locator recorded monitors (`mon_host`). Those recorded
+monitors may no longer be its cluster's, so no rbd command is run on them.
+Add the pool to this host with `lv pool create`, then delete again.
+
 ### A VM delete kept a disk file (`disk_leftover`)
 
 A VM delete never removes a disk it cannot prove unused, and never leaves one

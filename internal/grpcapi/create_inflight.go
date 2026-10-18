@@ -547,7 +547,7 @@ func rbdSameCluster(dom []cephMon, domConf string, l storage.CephLocator) bool {
 		// nothing this host can compare.
 		return false
 	}
-	ms, known := rbdLocatorMonitors(l)
+	ms, known := rbdLocatorMonitors(l, lv.CephPoolMonitors)
 	if !known {
 		return false
 	}
@@ -589,13 +589,26 @@ func rbdSameCluster(dom []cephMon, domConf string, l storage.CephLocator) bool {
 // host, else l's mon_host, else its conf's. Only that one source names the
 // VM's cluster; a lower one it passes over may name another. known is false
 // when the domain could not be given one (rbdDomainSource refuses such a
-// locator): a conf other than the default that cannot be read, or that names
-// no monitor while nothing stands before it. An empty list with known true
-// is the default ceph.conf's cluster.
-func rbdLocatorMonitors(l storage.CephLocator) (mons []string, known bool) {
+// locator): an option it does not know, or a conf other than the default
+// that cannot be read, or that names no monitor while nothing stands before
+// it. An empty list with known true is the default ceph.conf's cluster.
+// poolMonitors is the pool's current monitors on this host
+// (Server.CephMonitorsForPool, which the daemon installs as the renderer's
+// lv.CephPoolMonitors).
+func rbdLocatorMonitors(l storage.CephLocator, poolMonitors func(string) ([]string, bool)) (mons []string, known bool) {
+	for _, key := range l.Order {
+		switch key {
+		case "mon_host", "id", "keyring", "conf", "lvpool":
+		default:
+			// An option rbdDomainSource refuses (ceph's own spellings of
+			// mon_host among them: "mon-host", "mon host"): no domain is
+			// given a cluster for it.
+			return nil, false
+		}
+	}
 	conf := l.Opts["conf"]
 	ownConf := conf != "" && !storage.IsDefaultCephConf(conf)
-	mons, ok := lv.CephPoolMonitors(l.Opts["lvpool"])
+	mons, ok := poolMonitors(l.Opts["lvpool"])
 	if !ok {
 		if v, has := l.Opts["mon_host"]; has {
 			mons = storage.ParseMonHost(v)

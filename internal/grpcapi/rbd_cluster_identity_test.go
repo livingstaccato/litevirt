@@ -292,10 +292,13 @@ func TestDomainRunsOnAny_RBDOnlyTheRenderedMonitorSource(t *testing.T) {
 
 // A locator whose monitors cannot be known as its domain would be given them
 // — a conf that cannot be read, or names no monitor, with no pool and no
-// mon_host to stand before it — is on no cluster this host can tell, so no
-// domain is on it, not even one on the default ceph.conf's monitors.
+// mon_host to stand before it, or an option the renderer refuses (ceph reads
+// "mon-host" and "mon host" as mon_host) — is on no cluster this host can
+// tell, so no domain is on it, not even one on the default ceph.conf's
+// monitors (here, also the option's).
 //
-// Mutation: read such a locator as the default ceph.conf's — red.
+// Mutations: read such a locator as the default ceph.conf's — red; ignore
+// options the renderer refuses — both "mon-host"/"mon host" cases red.
 func TestDomainRunsOnAny_RBDUnknowableLocatorIsNoCluster(t *testing.T) {
 	withDefaultCephConf(t, "10.0.0.1:6789")
 	empty := filepath.Join(t.TempDir(), "empty.conf")
@@ -310,6 +313,8 @@ func TestDomainRunsOnAny_RBDUnknowableLocatorIsNoCluster(t *testing.T) {
 		{"unreadable conf, no host", "rbd:lv/vm1-root:conf=/nonexistent/b.conf", nil},
 		{"conf naming no monitor", "rbd:lv/vm1-root:conf=" + empty, []string{"10.0.0.1:6789"}},
 		{"conf naming no monitor, no host", "rbd:lv/vm1-root:conf=" + empty, nil},
+		{"mon-host, on its monitor", `rbd:lv/vm1-root:mon-host=10.0.0.1\:6789`, []string{"10.0.0.1:6789"}},
+		{"mon host, on its monitor", `rbd:lv/vm1-root:mon host=10.0.0.1\:6789`, []string{"10.0.0.1:6789"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := domainRunsOnAny(rbdDomain("u", "lv/vm1-root", tc.hosts...), []string{tc.recorded})

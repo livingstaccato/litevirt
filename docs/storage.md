@@ -1341,8 +1341,9 @@ given: its current ones on that host, else the disk's `mon_host`, else its
 conf's; a source behind the one used never counts. A domain with no `<host>`
 uses the default `/etc/ceph/ceph.conf`, and one that names a `<config file>`
 of its own and no monitor is on a cluster that cannot be told, as is a disk
-whose conf cannot be read or names no monitor. Otherwise the rebuild is refused with nothing changed, and the
-refusal names the domain's monitors. A domain defined under a uuid libvirt
+whose conf cannot be read or names no monitor, or that carries an option a
+domain cannot be given. Otherwise the rebuild is refused with nothing
+changed, and the refusal names the domain's monitors. A domain defined under a uuid libvirt
 chose (an older promotion or restore) that still names monitors that were all
 replaced is refused this way: undefine it, or give it the current monitors,
 then run `lv rebuild <vm>` again.

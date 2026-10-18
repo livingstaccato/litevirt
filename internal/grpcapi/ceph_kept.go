@@ -208,7 +208,7 @@ func forwardKeptImages(ctx context.Context, hdr metadata.MD) {
 // answer stays named.
 func (s *Server) recheckKeptCephImages(ctx context.Context) {
 	for _, r := range s.keptRecords() {
-		drv, err := s.diskDriver(&corrosion.DiskRecord{Path: r.Path, StorageVolume: r.Volume, StorageType: "ceph"})
+		drv, err := s.diskDriver(ctx, &corrosion.DiskRecord{Path: r.Path, StorageVolume: r.Volume, StorageType: "ceph"})
 		if err != nil {
 			continue
 		}

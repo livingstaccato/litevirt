@@ -46,6 +46,10 @@ type VirtualMachine struct {
 	// an assigned address but no primary reads to all of them as a machine with
 	// no address at all. 0 = none.
 	PrimaryIP4ID int
+	// PrimaryIP6ID is virtual_machine.primary_ip6, the IPv6 counterpart. NetBox
+	// keeps the two apart and refuses an address of the wrong family in either.
+	// 0 = none.
+	PrimaryIP6ID int
 }
 
 // bytesPerMB is NetBox's megabyte: DECIMAL, 1 MB = 1,000,000 bytes — not the
@@ -154,6 +158,9 @@ type vmJSON struct {
 	PrimaryIP4 *struct {
 		ID int `json:"id"`
 	} `json:"primary_ip4"`
+	PrimaryIP6 *struct {
+		ID int `json:"id"`
+	} `json:"primary_ip6"`
 	CustomFields map[string]any `json:"custom_fields"`
 }
 
@@ -177,6 +184,9 @@ func (j vmJSON) toVM() VirtualMachine {
 	}
 	if j.PrimaryIP4 != nil {
 		out.PrimaryIP4ID = j.PrimaryIP4.ID
+	}
+	if j.PrimaryIP6 != nil {
+		out.PrimaryIP6ID = j.PrimaryIP6.ID
 	}
 	if v, ok := j.CustomFields[IdentityField].(string); ok {
 		out.Identity = v
@@ -317,9 +327,22 @@ func (c *Client) UpdateVM(ctx context.Context, id int, vm VirtualMachine) error 
 // vmBody is also what CREATE sends, when the VM has no interfaces at all. Fold
 // them together and every create carries a field the server must reject.
 func (c *Client) SetPrimaryIP4(ctx context.Context, vmID, ipID int) error {
-	body := map[string]any{"primary_ip4": nil}
+	return c.setPrimary(ctx, vmID, "primary_ip4", ipID)
+}
+
+// SetPrimaryIP6 sets (or, with ipID 0, clears) a virtual machine's primary_ip6.
+// Same preconditions as SetPrimaryIP4, and NetBox additionally refuses an
+// address that is not IPv6.
+func (c *Client) SetPrimaryIP6(ctx context.Context, vmID, ipID int) error {
+	return c.setPrimary(ctx, vmID, "primary_ip6", ipID)
+}
+
+// setPrimary PATCHes one primary-address field, sending an explicit null to
+// clear it: an omitted key is a no-op on a PATCH.
+func (c *Client) setPrimary(ctx context.Context, vmID int, field string, ipID int) error {
+	body := map[string]any{field: nil}
 	if ipID != 0 {
-		body["primary_ip4"] = ipID
+		body[field] = ipID
 	}
 	return c.do(ctx, http.MethodPatch, fmt.Sprintf(vmsPath+"%d/", vmID), body, nil)
 }

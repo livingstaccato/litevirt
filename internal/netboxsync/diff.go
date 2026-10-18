@@ -9,6 +9,7 @@ package netboxsync
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 
@@ -38,6 +39,10 @@ type DesiredNIC struct {
 	MAC        string
 	IP         string
 	NetBoxIPID int
+	// NetBoxIP is the address the NetBoxIPID object was leased for, read from
+	// the lease and not from the NIC row: the lease is what names the object,
+	// and its family is what decides which primary field may carry it.
+	NetBoxIP string
 }
 
 // Action is one unit of work for the applier.
@@ -174,6 +179,11 @@ const opPark = "park"
 // true during a create. Folding it into vmBody would put a field on every create
 // that the server must reject.
 const opPrimaryIP = "primary-ip"
+
+// opPrimaryIP6 is opPrimaryIP for primary_ip6. A separate op rather than a
+// family field on the action, because the two are separate NetBox fields that
+// converge independently: a dual-stack VM can need one, the other, or both.
+const opPrimaryIP6 = "primary-ip6"
 
 // parkedNamePrefix heads every temporary name the cycle-breaker writes.
 //
@@ -509,9 +519,19 @@ func Diff(desired []DesiredVM, actual Actual, fingerprint string) []Action {
 		// ParentNetBoxID carries the id from ACTUAL state and is 0 for a VM
 		// created this sweep, exactly as the NIC actions do; the applier falls
 		// back to the mapping row the VM phase wrote. See parentVMID.
-		if want := desiredPrimaryIP(d); want != a.PrimaryIP4ID {
+		//
+		// ONE PER FAMILY. NetBox keeps primary_ip4 and primary_ip6 apart and
+		// refuses an address of the wrong family in either, so each is chosen
+		// from the addresses of its own family and converges on its own.
+		if want := desiredPrimaryIP(d, 4); want != a.PrimaryIP4ID {
 			out = append(out, Action{
 				Kind: "vm", Op: opPrimaryIP, Key: vmID,
+				ParentNetBoxID: a.ID, IPID: want,
+			})
+		}
+		if want := desiredPrimaryIP(d, 6); want != a.PrimaryIP6ID {
+			out = append(out, Action{
+				Kind: "vm", Op: opPrimaryIP6, Key: vmID,
 				ParentNetBoxID: a.ID, IPID: want,
 			})
 		}
@@ -934,8 +954,15 @@ func vmDiffers(d DesiredVM, a netbox.VirtualMachine) bool {
 		d.DeviceID != a.DeviceID
 }
 
-// desiredPrimaryIP is the address a mirrored VM should carry as its primary: the
-// first NIC that holds one, or 0 when none does.
+// desiredPrimaryIP is the address a mirrored VM should carry as its primary of
+// one address family (4 or 6): the first NIC holding an address of that family,
+// or 0 when none does.
+//
+// BY FAMILY, because NetBox refuses an IPv6 address as primary_ip4 and the
+// reverse. Taking the first NIC's address whatever its family made a VM whose
+// first NIC sat on an IPv6 network send that address as primary_ip4, and the
+// refusal failed every sweep. An address whose family cannot be read is never
+// chosen: a primary NetBox might refuse is worse than none.
 //
 // FIRST, over an order the caller already fixed — desiredNICs sorts by ordinal
 // then MAC — because "primary" has to be stable across sweeps. Picking by map or
@@ -944,13 +971,27 @@ func vmDiffers(d DesiredVM, a netbox.VirtualMachine) bool {
 //
 // eth0 is what that ordering makes it in practice, which is also the one a guest
 // configures first and the one an operator means by "the VM's address".
-func desiredPrimaryIP(d DesiredVM) int {
+func desiredPrimaryIP(d DesiredVM, family int) int {
 	for _, n := range d.NICs {
-		if n.NetBoxIPID != 0 {
+		if n.NetBoxIPID != 0 && addressFamily(n.NetBoxIP) == family {
 			return n.NetBoxIPID
 		}
 	}
 	return 0
+}
+
+// addressFamily is 4 or 6 for a bare address, or 0 when it cannot be parsed.
+// An IPv4-mapped IPv6 address is family 6, as NetBox stores it.
+func addressFamily(ip string) int {
+	addr, err := netip.ParseAddr(ip)
+	switch {
+	case err != nil:
+		return 0
+	case addr.Is4():
+		return 4
+	default:
+		return 6
+	}
 }
 
 // nicDiffers compares the mirrored interface fields. The MAC comparison is
@@ -1013,7 +1054,7 @@ func Phase(a Action) int {
 		return PhaseNICUpsert
 	case a.Kind == "nic" && a.Op == "delete":
 		return PhaseNICDelete
-	case a.Kind == "vm" && a.Op == opPrimaryIP:
+	case a.Kind == "vm" && (a.Op == opPrimaryIP || a.Op == opPrimaryIP6):
 		return PhaseVMPrimaryIP
 	default:
 		// Everything left is a VM delete, and anything unrecognised lands here

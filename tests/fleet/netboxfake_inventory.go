@@ -34,6 +34,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -56,6 +57,10 @@ type fakeVM struct {
 	// fake that accepted any id would let a mirror set a primary the real
 	// server refuses — the same hole the device/cluster constraint fell through.
 	PrimaryIP4ID int
+	// PrimaryIP6ID is virtual_machine.primary_ip6, validated the same way and
+	// additionally by family: NetBox refuses an IPv4 address here, and an IPv6
+	// one in primary_ip4.
+	PrimaryIP6ID int
 }
 
 // fakeIface is one virtualization.vminterface.
@@ -228,27 +233,53 @@ func (f *NetBoxFake) AddDeviceInCluster(name string, id, clusterID int) {
 // Modelled here rather than assumed away because the fake NOT enforcing it is
 // precisely how a mirror that attaches an out-of-cluster device reached
 // production: every fleet scenario passed while the real NetBox answered 400.
-// primaryIPRefusalLocked mirrors NetBox's validation of primary_ip4: the address
-// must be assigned to an interface of THIS virtual machine. Returns true when
-// the write must be refused. Caller holds f.mu.
+// primaryIPRefusalLocked mirrors NetBox's validation of primary_ip4 (family 4)
+// and primary_ip6 (family 6): the address must be of that family, and it must be
+// assigned to an interface of THIS virtual machine. Returns NetBox's refusal
+// when the write must be refused, or "". Caller holds f.mu.
 //
 // id 0 is "no primary" and is always allowed — clearing it is legitimate.
 //
 // Modelled rather than assumed, for the same reason the device/cluster rule is:
 // a fake that accepted any id would let the mirror set a primary the real server
 // refuses, and every scenario built on it would be green while production 400s.
-func (f *NetBoxFake) primaryIPRefusalLocked(vmID, ipID int) bool {
+func (f *NetBoxFake) primaryIPRefusalLocked(vmID, ipID, family int) string {
 	if ipID == 0 {
-		return false
+		return ""
 	}
 	ip, known := f.byID[ipID]
 	if !known {
-		return true
+		return primaryIPNotOnVMMsg
+	}
+	// The family first, as NetBox checks it first.
+	if got := fakeAddressFamily(ip.Address); got != family {
+		return fmt.Sprintf("Must be an IPv%d address. (%s is an IPv%d address.)", family, ip.Address, got)
 	}
 	// The address must hang off an interface, and that interface must belong to
 	// this VM.
 	iface, ok := f.ifaces[ip.AssignedObjectID]
-	return !ok || iface.VMID != vmID
+	if !ok || iface.VMID != vmID {
+		return primaryIPNotOnVMMsg
+	}
+	return ""
+}
+
+// fakeAddressFamily is 4 or 6 for an address with or without its prefix
+// length, or 0.
+func fakeAddressFamily(address string) int {
+	host := address
+	if i := strings.IndexByte(host, '/'); i >= 0 {
+		host = host[:i]
+	}
+	ip := net.ParseIP(host)
+	switch {
+	case ip == nil:
+		return 0
+	case ip.To4() != nil && !strings.Contains(host, ":"):
+		return 4
+	default:
+		return 6
+	}
 }
 
 func (f *NetBoxFake) deviceRefusalLocked(deviceID, clusterID int) (string, bool) {
@@ -351,9 +382,13 @@ func (f *NetBoxFake) createVM(w http.ResponseWriter, r *http.Request) {
 	}
 	// A create cannot name a primary: the VM has no interfaces yet, so no
 	// address can belong to it. NetBox refuses it and so does this.
-	if vm.PrimaryIP4ID != 0 {
+	if vm.PrimaryIP4ID != 0 || vm.PrimaryIP6ID != 0 {
 		f.mu.Unlock()
-		writeValidationErr(w, "primary_ip4", primaryIPNotOnVMMsg)
+		field := "primary_ip4"
+		if vm.PrimaryIP4ID == 0 {
+			field = "primary_ip6"
+		}
+		writeValidationErr(w, field, primaryIPNotOnVMMsg)
 		return
 	}
 	vm.ID = f.nextVMID()
@@ -399,8 +434,8 @@ func (f *NetBoxFake) vmObject(w http.ResponseWriter, r *http.Request, id int) {
 		f.mu.Lock()
 		vm, known := f.vms[id]
 		var out vmView
-		var clash, badDevice, badPrimary bool
-		var badDeviceName string
+		var clash, badDevice bool
+		var badDeviceName, badPrimaryField, badPrimaryMsg string
 		if known {
 			// Applied to a COPY: a PATCH that would violate the constraint must
 			// leave the stored object untouched, exactly as a rejected write does.
@@ -408,8 +443,12 @@ func (f *NetBoxFake) vmObject(w http.ResponseWriter, r *http.Request, id int) {
 			applyVMBody(&next, body)
 			clash = f.vmNameTakenLocked(next.Name, next.ClusterID, id)
 			badDeviceName, badDevice = f.deviceRefusalLocked(next.DeviceID, next.ClusterID)
-			badPrimary = f.primaryIPRefusalLocked(id, next.PrimaryIP4ID)
-			if !clash && !badDevice && !badPrimary {
+			if msg := f.primaryIPRefusalLocked(id, next.PrimaryIP4ID, 4); msg != "" {
+				badPrimaryField, badPrimaryMsg = "primary_ip4", msg
+			} else if msg := f.primaryIPRefusalLocked(id, next.PrimaryIP6ID, 6); msg != "" {
+				badPrimaryField, badPrimaryMsg = "primary_ip6", msg
+			}
+			if !clash && !badDevice && badPrimaryMsg == "" {
 				*vm = next
 				out = vmJSONOf(*vm)
 			}
@@ -427,8 +466,8 @@ func (f *NetBoxFake) vmObject(w http.ResponseWriter, r *http.Request, id int) {
 			writeValidationErr(w, "device", deviceOutsideClusterMsg(badDeviceName))
 			return
 		}
-		if badPrimary {
-			writeValidationErr(w, "primary_ip4", primaryIPNotOnVMMsg)
+		if badPrimaryMsg != "" {
+			writeValidationErr(w, badPrimaryField, badPrimaryMsg)
 			return
 		}
 		writeJSON(w, out)
@@ -471,8 +510,10 @@ type vmBody struct {
 	Status       *string            `json:"status"`
 	CustomFields *map[string]string `json:"custom_fields"`
 	PrimaryIP4   *int               `json:"primary_ip4"`
+	PrimaryIP6   *int               `json:"primary_ip6"`
 	hasDevice    bool
 	hasPrimary   bool
+	hasPrimary6  bool
 }
 
 func decodeVMBody(w http.ResponseWriter, r *http.Request) (vmBody, bool) {
@@ -484,7 +525,7 @@ func decodeVMBody(w http.ResponseWriter, r *http.Request) (vmBody, bool) {
 	allowed := map[string]bool{
 		"name": true, "cluster": true, "device": true, "vcpus": true,
 		"memory": true, "disk": true, "status": true, "custom_fields": true,
-		"primary_ip4": true,
+		"primary_ip4": true, "primary_ip6": true,
 	}
 	for k := range raw {
 		if !allowed[k] {
@@ -502,6 +543,7 @@ func decodeVMBody(w http.ResponseWriter, r *http.Request) (vmBody, bool) {
 	}
 	_, out.hasDevice = raw["device"]
 	_, out.hasPrimary = raw["primary_ip4"]
+	_, out.hasPrimary6 = raw["primary_ip6"]
 	return out, true
 }
 
@@ -517,6 +559,12 @@ func applyVMBody(vm *fakeVM, b vmBody) {
 		vm.PrimaryIP4ID = 0
 		if b.PrimaryIP4 != nil {
 			vm.PrimaryIP4ID = *b.PrimaryIP4
+		}
+	}
+	if b.hasPrimary6 {
+		vm.PrimaryIP6ID = 0
+		if b.PrimaryIP6 != nil {
+			vm.PrimaryIP6ID = *b.PrimaryIP6
 		}
 	}
 	if b.hasDevice {
@@ -1006,6 +1054,42 @@ func (f *NetBoxFake) SetVMPrimaryIP4Direct(vmName string, ipID int) error {
 	return nil
 }
 
+// SetVMPrimaryIP6Direct PATCHes primary_ip6 through the fake's own HTTP
+// surface, bypassing the mirror, so a scenario can prove the HARNESS enforces
+// NetBox's validation rather than trusting that it does.
+func (f *NetBoxFake) SetVMPrimaryIP6Direct(vmName string, ipID int) error {
+	f.mu.Lock()
+	id := 0
+	for _, vm := range f.vms {
+		if vm.Name == vmName {
+			id = vm.ID
+		}
+	}
+	f.mu.Unlock()
+	if id == 0 {
+		return fmt.Errorf("no virtual machine %q", vmName)
+	}
+	raw, err := json.Marshal(map[string]any{"primary_ip6": ipID})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPatch, f.URL()+vmsAPIPath+strconv.Itoa(id)+"/", bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, out)
+	}
+	return nil
+}
+
 // VMCountAll is every virtual_machine object.
 func (f *NetBoxFake) VMCountAll() int {
 	f.mu.Lock()
@@ -1292,6 +1376,7 @@ type vmView struct {
 	Cluster      *idRef            `json:"cluster"`
 	Device       *idRef            `json:"device"`
 	PrimaryIP4   *addrRef          `json:"primary_ip4"`
+	PrimaryIP6   *addrRef          `json:"primary_ip6"`
 	CustomFields map[string]string `json:"custom_fields"`
 }
 
@@ -1321,6 +1406,9 @@ func vmJSONOf(vm fakeVM) vmView {
 	}
 	if vm.PrimaryIP4ID != 0 {
 		out.PrimaryIP4 = &addrRef{ID: vm.PrimaryIP4ID}
+	}
+	if vm.PrimaryIP6ID != 0 {
+		out.PrimaryIP6 = &addrRef{ID: vm.PrimaryIP6ID}
 	}
 	return out
 }

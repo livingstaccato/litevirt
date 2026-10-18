@@ -61,6 +61,9 @@ type netboxWriter interface {
 	// because NetBox only accepts a primary already assigned to an interface of
 	// that VM, which is never true at create time.
 	SetPrimaryIP4(ctx context.Context, vmID, ipID int) error
+	// SetPrimaryIP6 is the IPv6 counterpart. NetBox refuses an address of the
+	// wrong family in either field.
+	SetPrimaryIP6(ctx context.Context, vmID, ipID int) error
 
 	// The cluster every mirrored VM hangs off, resolved once per sweep. Both
 	// halves are here because a cluster cannot be created without its type, and
@@ -296,7 +299,7 @@ func (r *Reconciler) applyOne(ctx context.Context, a Action, idx desiredIndex, f
 		// other into the set Diff clears from — so this branch cannot detach an
 		// operator's address even by mistake.
 		return r.nb.ClearIPAssignment(ctx, a.IPID)
-	case a.Kind == kindVM && a.Op == opPrimaryIP:
+	case a.Kind == kindVM && (a.Op == opPrimaryIP || a.Op == opPrimaryIP6):
 		return r.setPrimaryIP(ctx, a)
 	case a.Op == "delete":
 		return r.deleteObject(ctx, a)
@@ -700,8 +703,9 @@ func (r *Reconciler) parentVMID(ctx context.Context, a Action, dn desiredNIC) (i
 	return ref.NetBoxID, nil
 }
 
-// setPrimaryIP points a mirrored VM's primary_ip4 at the address on its own
-// first NIC, or clears it.
+// setPrimaryIP points a mirrored VM's primary_ip4 — or, for a primary-ip6
+// action, its primary_ip6 — at the address on its own first NIC of that family,
+// or clears it.
 //
 // The VM id is resolved exactly as a NIC's parent is — ACTUAL state first, then
 // the mapping row the VM phase wrote this sweep — because a VM created this pass
@@ -721,6 +725,9 @@ func (r *Reconciler) setPrimaryIP(ctx context.Context, a Action) error {
 			return nil
 		}
 		vmID = ref.NetBoxID
+	}
+	if a.Op == opPrimaryIP6 {
+		return r.nb.SetPrimaryIP6(ctx, vmID, a.IPID)
 	}
 	return r.nb.SetPrimaryIP4(ctx, vmID, a.IPID)
 }

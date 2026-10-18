@@ -1463,7 +1463,7 @@ func (r *Reconciler) lookupDevice(ctx context.Context, host string) int {
 // desiredNICs maps litevirt NIC rows onto the mirror's NIC shape, resolving each
 // one's NetBox address object through the lease index. It also returns how many
 // NICs it skipped — see desiredState.
-func desiredNICs(nics []corrosion.NICRecord, byLease map[string]int) ([]DesiredNIC, int) {
+func desiredNICs(nics []corrosion.NICRecord, byLease map[string]leasedAddress) ([]DesiredNIC, int) {
 	// Ordered before naming, because the names are derived positionally on a
 	// collision and map/query order must not decide them.
 	sort.Slice(nics, func(i, j int) bool {
@@ -1489,11 +1489,13 @@ func desiredNICs(nics []corrosion.NICRecord, byLease map[string]int) ([]DesiredN
 			skipped++
 			continue
 		}
+		leased := byLease[leaseKey(n.NetworkName, strings.ToLower(n.MAC))]
 		out = append(out, DesiredNIC{
 			Name:       nicName(n, used),
 			MAC:        strings.ToLower(n.MAC),
 			IP:         n.IP,
-			NetBoxIPID: byLease[leaseKey(n.NetworkName, strings.ToLower(n.MAC))],
+			NetBoxIPID: leased.ID,
+			NetBoxIP:   leased.IP,
 		})
 	}
 	return out, skipped
@@ -1513,6 +1515,13 @@ func nicName(n corrosion.NICRecord, used map[string]bool) string {
 	}
 	used[name] = true
 	return name
+}
+
+// leasedAddress is the NetBox address object one lease names, and the address
+// it was leased for.
+type leasedAddress struct {
+	ID int
+	IP string
 }
 
 // indexLeases builds the (network, MAC) -> NetBox address id index the desired
@@ -1539,18 +1548,18 @@ func nicName(n corrosion.NICRecord, used map[string]bool) string {
 // and the count returned here withholds the destructive half of the pass (see
 // deleteBlocker), so the address the mirror could not resolve is not detached
 // either. The duplicate is left for an operator, named in the log.
-func indexLeases(leases []corrosion.LeaseRecord) (map[string]int, int) {
+func indexLeases(leases []corrosion.LeaseRecord) (map[string]leasedAddress, int) {
 	grouped := make(map[string][]corrosion.LeaseRecord, len(leases))
 	for _, l := range leases {
 		k := leaseKey(l.Network, l.MAC)
 		grouped[k] = append(grouped[k], l)
 	}
-	out := make(map[string]int, len(grouped))
+	out := make(map[string]leasedAddress, len(grouped))
 	var ambiguousKeys []string
 	dropped := 0
 	for k, group := range grouped {
 		if len(group) == 1 {
-			out[k] = group[0].NetBoxIPID
+			out[k] = leasedAddress{ID: group[0].NetBoxIPID, IP: group[0].IP}
 			continue
 		}
 		ambiguousKeys = append(ambiguousKeys, k)

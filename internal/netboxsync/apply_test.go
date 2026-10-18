@@ -770,6 +770,8 @@ type stubVirt struct {
 	// primaryIPs records every SetPrimaryIP4 call as {vmID, ipID}, so a test
 	// can assert the mirror set one and did not re-send it.
 	primaryIPs [][2]int
+	// primaryIP6s records every SetPrimaryIP6 call the same way.
+	primaryIP6s [][2]int
 	// sites is the NetBox site name -> id table FindSiteByName resolves against.
 	sites map[string]int
 
@@ -993,6 +995,13 @@ func (s *stubVirt) SetPrimaryIP4(_ context.Context, vmID, ipID int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.primaryIPs = append(s.primaryIPs, [2]int{vmID, ipID})
+	return nil
+}
+
+func (s *stubVirt) SetPrimaryIP6(_ context.Context, vmID, ipID int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.primaryIP6s = append(s.primaryIP6s, [2]int{vmID, ipID})
 	return nil
 }
 

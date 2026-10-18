@@ -3,6 +3,8 @@ package corrosion
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -123,6 +125,20 @@ type credentialUpsertPlan struct {
 	ts    string // whether what landed is this statement's
 	// evidence is the retirement the row carries if it lands.
 	evidence string
+	// behind: skipped because the entry is an operator's password write and
+	// this node's hosts row predates the admission the retirement belongs to.
+	// The local write path refuses the write (ErrHostRowBehindAdmission).
+	behind bool
+}
+
+// ErrHostRowBehindAdmission refuses an operator's password write on a node
+// whose hosts row predates the host's current admission: the write takes no
+// retirement as evidence there, so it would not set the credential.
+var ErrHostRowBehindAdmission = errors.New("this node's hosts row predates the host's current admission")
+
+func hostRowBehindAdmission(host string) error {
+	return fmt.Errorf("%w: %s's IPMI password was not set; retry on an up-to-date node, or on this one once replication has caught up",
+		ErrHostRowBehindAdmission, host)
 }
 
 // planCredentialUpsert decides a HostFenceCredentialUpsertSQL statement on
@@ -175,6 +191,10 @@ func planCredentialUpsert(ctx context.Context, tx *sql.Tx, s Statement, entry []
 	}
 	if local.deletedAt == "" && local.pass == pass && local.updatedAt == ts {
 		return credentialUpsertPlan{}, nil // its own re-emission: a no-op here
+	}
+	if entryWritesHostPassword(entry, host) {
+		noteRetiredCredentialKept(host, "a password write on a hosts row older than the retirement")
+		return credentialUpsertPlan{skip: true, behind: true}, nil
 	}
 	noteRetiredCredentialKept(host, "an entry with no operator password write")
 	return credentialUpsertPlan{skip: true}, nil

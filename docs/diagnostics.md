@@ -2127,8 +2127,9 @@ the same name replaced. Peers no longer accept its certificate. To recover:
    data directory before adding it under any name.
 4. Run `lv host rm --dead <name>` only when step 3 found no machine, running
    or powered off, that holds the serial from step 1, or when the operator has
-   decided to retire the machine that holds it (stopped, as in step 2). Run it
-   only after step 2 is confirmed, then run `lv host add` for the machine to
+   decided to retire the machine that holds it, after stopping that machine's
+   daemon and confirming its workloads are stopped. Run it only after step 2
+   is confirmed, then run `lv host add` for the machine to
    keep. `lv host add` is refused while workloads are still recorded on the
    name; `lv health` shows `ha.claim.stranded` for any the failover
    coordinator cannot recover.

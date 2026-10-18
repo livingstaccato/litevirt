@@ -1514,7 +1514,7 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 			if _, ok := status.FromError(err); ok {
 				return nil, err
 			}
-			return nil, status.Errorf(codes.Internal, "update host config: %v", err)
+			return nil, configureHostError(err)
 		}
 	case hostsProvided == 0:
 		// Only a --clear-redfish of a host with no Redfish settings: there is
@@ -1528,13 +1528,23 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 		err = s.db.Execute(ctx, configureHostSQL, args...)
 	}
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "update host config: %v", err)
+		return nil, configureHostError(err)
 	}
 
 	slog.Info("host configured", "host", req.Name)
 	s.audit(ctx, "host.configure", req.Name, fmt.Sprintf("fields=%d", provided), "ok")
 
 	return s.InspectHost(ctx, &pb.InspectHostRequest{Name: req.Name})
+}
+
+// configureHostError is the status of a failed ConfigureHost write. A
+// password this node's replica cannot set (its hosts row predates the host's
+// current admission) is the operator's to retry elsewhere or later.
+func configureHostError(err error) error {
+	if errors.Is(err, corrosion.ErrHostRowBehindAdmission) {
+		return status.Errorf(codes.FailedPrecondition, "update host config: %v", err)
+	}
+	return status.Errorf(codes.Internal, "update host config: %v", err)
 }
 
 // redfishChange is what one ConfigureHost does to a host's Redfish settings.

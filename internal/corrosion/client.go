@@ -967,6 +967,32 @@ func (c *Client) NowWallTS() string {
 	return t.Format(nowTSLayout)
 }
 
+// nowTSAfter is NowTS taken once this node's clocks have observed every stamp
+// of floor, so it orders strictly after each. A stamp more than the skew
+// cutoff ahead of this node's clock is not adopted, and the write is refused.
+func (c *Client) nowTSAfter(floor ...string) (string, error) {
+	for _, f := range floor {
+		if f == "" || tsFutureSkewed(f, c.now()) {
+			continue
+		}
+		ObserveStamp(c, f)
+		if at, ok := tsInstant(f); ok {
+			c.tsMu.Lock()
+			if at.After(c.lastTS) {
+				c.lastTS = at
+			}
+			c.tsMu.Unlock()
+		}
+	}
+	ts := c.NowTS()
+	for _, f := range floor {
+		if f != "" && lwwOrder(ts, f) <= 0 {
+			return "", fmt.Errorf("this node's clock cannot be stamped after %s; retry once the nodes' clocks agree", f)
+		}
+	}
+	return ts, nil
+}
+
 // advanceDurableLWWLocked commits a new LWW ceiling (t + persist-ahead) BEFORE NowTS
 // returns a value beyond the last durable one, then returns the timestamp NowTS may
 // safely emit. On a persistence failure it FAILS CLOSED: it never returns a value past
@@ -1472,6 +1498,9 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 		for _, s := range stmts {
 			// See executeBatchInternal (credentials_revive_guard.go).
 			credPlan, err := planCredentialUpsert(ctx, tx, s, stmts, credHosts)
+			if err == nil && credPlan.behind {
+				err = hostRowBehindAdmission(credPlan.host)
+			}
 			if err != nil {
 				tx.Rollback()
 				c.mu.Unlock()
@@ -1547,7 +1576,7 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 	// nothing locally.
 	// A secret this node writes without its credential statement (its gate is
 	// closed) also refreshes the credential row it holds (credentials_absorb.go).
-	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables(), allCredHosts); err != nil {
+	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables(), true, allCredHosts); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return false, err
@@ -1698,6 +1727,11 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 		// A fence credential carries the retirement it was set after
 		// (credentials_revive_guard.go).
 		credPlan, err := planCredentialUpsert(ctx, tx, s, stmts, credHosts)
+		if err == nil && credPlan.behind {
+			// An operator's password write this node cannot carry: refused,
+			// not dropped (credentials_revive_guard.go).
+			err = hostRowBehindAdmission(credPlan.host)
+		}
 		if err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
@@ -1759,7 +1793,7 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	// must not be replayed by a peer. See relayStatement.
 	// A secret this node writes without its credential statement (its gate is
 	// closed) also refreshes the credential row it holds (credentials_absorb.go).
-	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables(), credHosts); err != nil {
+	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables(), true, credHosts); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return 0, err

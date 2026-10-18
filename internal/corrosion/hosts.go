@@ -268,7 +268,20 @@ func AdmitHostV2(ctx context.Context, c *Client, h HostRecord, g capabilities.Fe
 	next := n + 1
 	var at string
 	err = c.withMembershipWrite(ctx, func(live bool) error {
-		uts := c.NowTS()
+		// Strictly after the removal this re-admits over, as this node holds
+		// it: a removal that reached this node by anti-entropy advanced no
+		// clock, and an admission stamped before its retirement would leave
+		// the row's created_at before the credential's retirement, so no
+		// password write for the new machine would ever carry it
+		// (admissionAtOrAfter).
+		floor, err := readmitClockFloor(ctx, c, h.Name)
+		if err != nil {
+			return err
+		}
+		uts, err := c.nowTSAfter(floor...)
+		if err != nil {
+			return fmt.Errorf("re-admit %s: %w", h.Name, err)
+		}
 		stamp, ok := ReadmitStamp(uts)
 		if !ok {
 			return fmt.Errorf("re-admit %s: unreadable clock %q", h.Name, uts)
@@ -291,6 +304,30 @@ func AdmitHostV2(ctx context.Context, c *Client, h HostRecord, g capabilities.Fe
 		return 0, "", err
 	}
 	return next, at, nil
+}
+
+// readmitClockFloor is what a re-admission of name must be stamped after on
+// this node: its tombstone's updated_at and its fence credential's retirement.
+func readmitClockFloor(ctx context.Context, c *Client, name string) ([]string, error) {
+	var floor []string
+	rows, err := c.Query(ctx, `SELECT updated_at FROM hosts WHERE name = ?`, name)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 1 && rows[0].String("updated_at") != "" {
+		floor = append(floor, rows[0].String("updated_at"))
+	}
+	rows, err = c.Query(ctx, `SELECT COALESCE(deleted_at, '') AS d, COALESCE(after_retirement, '') AS a
+		FROM host_fence_credentials WHERE host_name = ?`, name)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 1 {
+		if r := rowRetirement(rows[0].String("d"), rows[0].String("a")); r != "" {
+			floor = append(floor, r)
+		}
+	}
+	return floor, nil
 }
 
 // WriteOwnEndpoint records this host's own address and gRPC port on its row,

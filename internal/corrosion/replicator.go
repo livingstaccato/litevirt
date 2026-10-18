@@ -1581,7 +1581,7 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 	// credential row readers use (credentials_absorb.go). A users row the
 	// re-mint floor refused did not apply here, so it has nothing to absorb.
 	applied := withoutIndexes(stmts, refusedIncarnation)
-	if err := absorbUnlatchedSecretWrite(ctx, tx, withoutRefusedRemints(applied, refusedRemints), r.client.MayWriteCredentialTables(), credHosts); err != nil {
+	if err := absorbUnlatchedSecretWrite(ctx, tx, withoutRefusedRemints(applied, refusedRemints), r.client.MayWriteCredentialTables(), false, credHosts); err != nil {
 		slog.Error("replicator: absorbing an unlatched secret write failed — back-pressuring replication",
 			"origin", entry.Origin, "seq", entry.Seq, "error", err)
 		return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)

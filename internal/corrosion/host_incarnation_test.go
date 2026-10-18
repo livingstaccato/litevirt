@@ -2,11 +2,13 @@ package corrosion
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 )
@@ -762,14 +764,53 @@ func TestCredential_ALaggingHostsRowGivesAnOperatorWriteNoEvidence(t *testing.T)
 			if pass, live, after := incCredentialRow(t, c); live || after == retired {
 				t.Errorf("credential row = (%q, live %v, after %q); want the tombstone", pass, live, after)
 			}
+			// The lagging node's sensitive state, merged into a node at the
+			// re-admission's incarnation, leaves that node's tombstone.
+			k1, _ := admittedV2(t)
+			if err := k1.MergeSensitiveStateBytesLWW(c.DumpSensitiveStateBytes()); err != nil {
+				t.Fatal(err)
+			}
+			if pass, live, after := incCredentialRow(t, k1); live || pass != "" || after == retirementOf(t, k1) {
+				t.Errorf("after merging the lagging dump, the node at incarnation 1 holds (%q, live %v, after %q); want its tombstone",
+					pass, live, after)
+			}
 		})
+		// N-2: on this node's own write path the write is refused, with an
+		// error the operator sees, and nothing of it is written.
 		t.Run(fmt.Sprintf("local write, hosts row at %d", n), func(t *testing.T) {
 			c := lagging(t, n)
-			if err := c.ExecuteBatch(ctx, laggingConfigure("old-pass", ts)); err != nil {
-				t.Fatal(err)
+			err := c.ExecuteBatch(ctx, laggingConfigure("old-pass", ts))
+			if !errors.Is(err, ErrHostRowBehindAdmission) {
+				t.Fatalf("a password write this node cannot carry returned %v, want ErrHostRowBehindAdmission", err)
 			}
 			if pass, live, after := incCredentialRow(t, c); live || after == retired {
 				t.Errorf("credential row = (%q, live %v, after %q); want the tombstone", pass, live, after)
+			}
+			if got := oneString(t, c, `SELECT ipmi_pass FROM hosts WHERE name = 'host-x'`, "ipmi_pass"); got == "old-pass" {
+				t.Error("the refused write's hosts half was committed")
+			}
+		})
+		t.Run(fmt.Sprintf("guarded local write, hosts row at %d", n), func(t *testing.T) {
+			c := lagging(t, n)
+			_, err := c.ExecuteEntriesGuarded(ctx, func(*sql.Tx) (bool, error) { return true, nil },
+				[][]Statement{laggingConfigure("old-pass", ts)})
+			if !errors.Is(err, ErrHostRowBehindAdmission) {
+				t.Fatalf("a password write this node cannot carry returned %v, want ErrHostRowBehindAdmission", err)
+			}
+			if got := oneString(t, c, `SELECT ipmi_pass FROM hosts WHERE name = 'host-x'`, "ipmi_pass"); got == "old-pass" {
+				t.Error("the refused write's hosts half was committed")
+			}
+		})
+		// An unlatched node writes the old column alone; its own absorb
+		// refuses the same way.
+		t.Run(fmt.Sprintf("unpaired local write, hosts row at %d", n), func(t *testing.T) {
+			c := lagging(t, n)
+			err := c.ExecuteBatch(ctx, laggingConfigure("old-pass", ts)[:1])
+			if !errors.Is(err, ErrHostRowBehindAdmission) {
+				t.Fatalf("an unpaired password write this node cannot carry returned %v, want ErrHostRowBehindAdmission", err)
+			}
+			if pass, live, _ := incCredentialRow(t, c); live || pass != "" {
+				t.Errorf("credential row = (%q, live %v); want the tombstone", pass, live)
 			}
 		})
 	}
@@ -807,5 +848,49 @@ func TestHostIncarnation_ASkippedNewerPasswordArrivesByAntiEntropy(t *testing.T)
 	}
 	if pass, ok := liveCredential(t, c); !ok || pass != "new-pass" {
 		t.Errorf("after the re-admission and a sensitive merge the password is %q (live %v), want new-pass", pass, ok)
+	}
+}
+
+// N-1: a removal this node learned by anti-entropy advanced no clock, so on a
+// node whose clock runs behind the remover's, a re-admission would be stamped
+// before the removal's retirement. Its created_at would then sort before the
+// retirement, and no password write for the new machine would ever carry it.
+// AdmitHostV2 stamps the re-admission strictly after both.
+func TestHostIncarnation_AReadmissionIsStampedAfterTheRemoval(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	oldIncarnation(t, c)
+	// The removal, from a node whose clock is two minutes ahead of this one's.
+	removed := time.Now().UTC().Add(2 * time.Minute).Format(nowTSLayout)
+	if _, err := c.DB().Exec(`UPDATE hosts SET deleted_at = ?, updated_at = ? WHERE name = 'host-x'`,
+		removed, removed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.DB().Exec(`UPDATE host_fence_credentials SET ipmi_pass = '', deleted_at = ?, updated_at = ?,
+		after_retirement = '' WHERE host_name = 'host-x'`, removed, removed); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := AdmitHostV2(ctx, c, HostRecord{
+		Name: "host-x", Address: "10.0.0.15", SSHUser: "root", SSHPort: 22, GRPCPort: 7443,
+		State: HostStateJoining, CertSerial: incSerialA,
+	}, incGrant(t)); err != nil {
+		t.Fatalf("AdmitHostV2: %v", err)
+	}
+	k := incKey(t, c)
+	if lwwOrder(oneString(t, c, `SELECT updated_at FROM hosts WHERE name = 'host-x'`, "updated_at"), removed) <= 0 {
+		t.Errorf("the re-admission was stamped at or before the removal it re-admits over (%s)", removed)
+	}
+	retired := retirementOf(t, c)
+	if !notBefore(k.at, retired) {
+		t.Fatalf("the re-admission's created_at %s sorts before the credential's retirement %s", k.at, retired)
+	}
+	// The operator's password for the new machine lands, and carries the
+	// retirement.
+	ts := c.NowTS()
+	if err := c.ExecuteBatch(ctx, laggingConfigure("new-pass", ts)); err != nil {
+		t.Fatalf("a password write for the re-admitted machine: %v", err)
+	}
+	if pass, live, after := incCredentialRow(t, c); !live || pass != "new-pass" || after != retired {
+		t.Errorf("credential row = (%q, live %v, after %q); want new-pass carrying %s", pass, live, after, retired)
 	}
 }

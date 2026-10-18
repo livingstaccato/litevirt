@@ -343,9 +343,14 @@ VM's lock and the target's capacity reservation until libvirt ends it, then
 records the VM on whichever host it ended on and runs `post_migrate` naming
 it. No cold move is tried while the move can still complete, and a drain run
 meanwhile skips the VM. A move that completes in the background is recorded
-for failback like any other. Watch it with `lv events <vm>`. After the cut-over the source's
-cloud-init ISO is removed and DNS, load-balancer backends and VXLAN
-forwarding entries follow the VM, as for a migration. A live attempt that
+for failback like any other. Watch it with `lv events <vm>`. A drain whose
+client goes away still records a move that completes afterwards on its
+target. A VM whose lock another operation holds (a scheduled snapshot, a
+replication run) is waited for, up to 10 minutes, then skipped.
+
+After the cut-over the source's cloud-init ISO is removed and DNS,
+load-balancer backends and VXLAN forwarding entries follow the VM, as for a
+migration. A live attempt that
 fails takes back the cloud-init ISO it put on the target before the cold move
 is tried. (Builds before this put no ISO on the target, so every cloud-init
 VM's live drain failed and fell back to the cold move.)

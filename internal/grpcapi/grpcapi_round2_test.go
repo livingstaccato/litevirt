@@ -2140,34 +2140,3 @@ func TestListHosts_MultipleHosts(t *testing.T) {
 		t.Errorf("expected at least 2 hosts, got %d", len(resp.Hosts))
 	}
 }
-
-// ── drainOneVM: a VM whose lock is held is skipped at once ─────────────────
-
-// A move of the VM finishing in the background holds its lock until libvirt
-// ends it. A drain does not wait on that lock (it could for an hour, holding a
-// worker): it skips the VM, saying why.
-//
-// Mutation: take the lock with lockVM — the call blocks, and the test's
-// deadline goes red.
-func TestDrainOneVM_SkipsAVMWhoseLockIsHeld(t *testing.T) {
-	s := testServerR2(t)
-	ctx := adminCtx()
-	insertTestVMR2(t, ctx, s.db, "held-vm", "test-host", "running")
-	unlock := s.lockVM("held-vm")
-	defer unlock()
-
-	vm := corrosion.VMRecord{Name: "held-vm", HostName: "test-host", State: "running"}
-	target := corrosion.HostRecord{Name: "target-h", Address: "10.0.0.2"}
-	done := make(chan *pb.DrainProgress, 1)
-	go func() { done <- s.drainOneVM(ctx, vm, target) }()
-	select {
-	case p := <-done:
-		if p.Status != "skipped" || !strings.Contains(p.Error, "in progress") {
-			t.Errorf("progress = %q %q, want skipped, another operation in progress", p.Status, p.Error)
-		}
-	case <-time.After(5 * time.Second):
-		unlock()
-		<-done
-		t.Fatal("drainOneVM waited on a held VM lock")
-	}
-}

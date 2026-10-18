@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -222,8 +223,9 @@ func TestFleet_DrainBackgroundMoveIsNotRestartedOnTheSourceAfterADaemonRestart(t
 // the ownership commit declines. The fallback re-points the VM row to the
 // target, where the guest runs, and the source does not restart it.
 //
-// Mutation: leave the row running at the hand-off — the re-point's guard
+// Mutations: leave the row running at the hand-off — the re-point's guard
 // (source, migrating) declines, the row stays on the source, and goes red.
+// Run no post_migrate when the commit fails — the hooks go red.
 func TestFleet_DrainBackgroundMoveWhoseCommitDeclinesIsRepointedToTheTarget(t *testing.T) {
 	sc := newStuckLiveDrain(t, false)
 	ctx := context.Background()
@@ -240,6 +242,12 @@ func TestFleet_DrainBackgroundMoveWhoseCommitDeclinesIsRepointedToTheTarget(t *t
 	if reconcileSource(t, sc) {
 		t.Fatalf("the source's reconciler started slow on %s while it runs on %s: two copies", sc.src.Name, sc.dst.Name)
 	}
+	// The commit failed, but libvirt reported the cut-over: the guest runs on
+	// the target, and post_migrate says so (the one-pre/one-post pairing).
+	wantHooks := []string{"pre_migrate_" + sc.src.Name + "_running", "post_migrate_" + sc.dst.Name + "_running"}
+	eventually(t, 10*time.Second, "post_migrate to name the target after a failed commit", func() bool {
+		return slices.Equal(sc.hooks(t), wantHooks)
+	})
 }
 
 // The client goes away (Ctrl-C) before a VM's move times out. The drain's
@@ -352,5 +360,166 @@ func TestFleet_DrainBackgroundMoveThatCompletesIsRecordedForFailback(t *testing.
 		vm, _ := corrosion.GetVM(ctx, a.DB, "bgfb")
 		_, ok, _ := corrosion.GetLiveDrainOrigin(ctx, a.DB, "bgfb")
 		return vm != nil && vm.HostName == b.Name && ok
+	})
+}
+
+// The client goes away (Ctrl-C) while a live move is in flight, and libvirt
+// then completes it. The commit that follows the cut-over does not run on the
+// drain's cancelled request: the row is owned by the target, where the only
+// copy runs, the source starts nothing, and post_migrate names the target.
+//
+// Mutation: commit on the request's context — the commit fails, the row stays
+// migrating on the source, and goes red.
+func TestFleet_DrainCompletedLiveMoveIsCommittedWhenTheClientLeaves(t *testing.T) {
+	sc := newStuckLiveDrain(t, false)
+	ctx := context.Background()
+	release := releaseOnCleanup(t)
+	started := make(chan struct{})
+	var once sync.Once
+	sc.src.Virt.FailMigrateToTarget = func(name, _ string) error {
+		if name != "slow" {
+			return nil
+		}
+		once.Do(func() { close(started) })
+		<-release
+		cutOver(t, sc)
+		return nil
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	st, err := sc.c.SelfClient(sc.src).DrainHost(cctx, &pb.DrainHostRequest{Name: sc.src.Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			if _, err := st.Recv(); err != nil {
+				return
+			}
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the live move never started")
+	}
+	cancel()
+	time.Sleep(150 * time.Millisecond) // the server sees the stream end
+	close(release)                     // well inside the 1s timeout: no abort
+
+	waitRow(t, sc.src, sc.dst.Name, "running")
+	if reconcileSource(t, sc) {
+		t.Fatalf("the source's reconciler started slow on %s while it runs on %s: two copies", sc.src.Name, sc.dst.Name)
+	}
+	wantHooks := []string{"pre_migrate_" + sc.src.Name + "_running", "post_migrate_" + sc.dst.Name + "_running"}
+	eventually(t, 10*time.Second, "post_migrate to name the target", func() bool {
+		return slices.Equal(sc.hooks(t), wantHooks)
+	})
+}
+
+// addFBDrainVM adds a running VM on n with one shared disk and no migration
+// timeout, whose live move blocks until release is closed and then completes.
+func addFBDrainVM(t *testing.T, f *fbScenario, blocked map[string]fbBlock, name string, n, to *Node, started, release chan struct{}) {
+	t.Helper()
+	ctx := context.Background()
+	disk := filepath.Join(f.c.tmpRoot, "nfs", name+"-root.qcow2")
+	if err := corrosion.InsertVM(ctx, n.DB, corrosion.VMRecord{
+		Name: name, HostName: n.Name, State: "running", Spec: `{"name":"` + name + `","cpu":1,"memory_mib":256}`, CPUActual: 1, MemActual: 256,
+	}, nil, []corrosion.DiskRecord{
+		{VMName: name, DiskName: "root", HostName: n.Name, Path: disk, SizeBytes: 1 << 30, StorageType: "nfs", TargetDev: "vda"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Virt.DefineDomain(`<domain type='kvm'><name>` + name + `</name><uuid>` + uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String() +
+		`</uuid><devices><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='` + disk + `'/><target dev='vda'/></disk></devices></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Virt.StartDomain(name); err != nil {
+		t.Fatal(err)
+	}
+	blocked[name] = fbBlock{started: started, release: release, to: to}
+}
+
+type fbBlock struct {
+	started, release chan struct{}
+	to               *Node
+}
+
+// After the client leaves, a move that completes later still gets its drain
+// record, as one that completed while it watched: undrain fails both back.
+//
+// Mutation: drop the records in the collector that runs after the stream
+// breaks — the later move has none, red.
+func TestFleet_DrainRecordsAMoveThatCompletesAfterTheClientLeft(t *testing.T) {
+	f := newFB(t, 2, true)
+	ctx := context.Background()
+	a, b := f.a, f.b
+	blocked := map[string]fbBlock{}
+	startedA, releaseA := make(chan struct{}), make(chan struct{})
+	startedB, releaseB := make(chan struct{}), make(chan struct{})
+	addFBDrainVM(t, f, blocked, "fba", a, b, startedA, releaseA)
+	addFBDrainVM(t, f, blocked, "fbb", a, b, startedB, releaseB)
+	f.c.WaitConverged(t, convergeTimeout)
+	var mu sync.Mutex
+	startedOnce := map[string]bool{}
+	a.Virt.FailMigrateToTarget = func(name, _ string) error {
+		blk, ok := blocked[name]
+		if !ok {
+			return nil
+		}
+		mu.Lock()
+		if !startedOnce[name] {
+			startedOnce[name] = true
+			close(blk.started)
+		}
+		mu.Unlock()
+		<-blk.release
+		_ = a.Virt.UndefineDomain(name, false)
+		blk.to.Virt.SetState(name, "running")
+		return nil
+	}
+	t.Cleanup(func() {
+		for _, c := range []chan struct{}{releaseA, releaseB} {
+			select {
+			case <-c:
+			default:
+				close(c)
+			}
+		}
+	})
+
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	st, err := f.c.SelfClient(a).DrainHost(cctx, &pb.DrainHostRequest{Name: a.Name, Parallel: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			if _, err := st.Recv(); err != nil {
+				return
+			}
+		}
+	}()
+	for _, c := range []chan struct{}{startedA, startedB} {
+		select {
+		case <-c:
+		case <-time.After(10 * time.Second):
+			t.Fatal("a live move never started")
+		}
+	}
+	cancel()
+	time.Sleep(150 * time.Millisecond)
+	close(releaseA) // its frame is the one whose send fails
+	eventually(t, 15*time.Second, "fba to move", func() bool {
+		vm, _ := corrosion.GetVM(ctx, a.DB, "fba")
+		return vm != nil && vm.HostName == b.Name
+	})
+	time.Sleep(300 * time.Millisecond)
+	close(releaseB) // completes after the drain's loop has returned
+	eventually(t, 15*time.Second, "both moves to be recorded for failback", func() bool {
+		_, okA, _ := corrosion.GetLiveDrainOrigin(ctx, a.DB, "fba")
+		_, okB, _ := corrosion.GetLiveDrainOrigin(ctx, a.DB, "fbb")
+		return okA && okB
 	})
 }

@@ -998,12 +998,25 @@ func (s *Server) adoptAbandonedMigration(
 		// libvirt cut over. The commit is the only thing that makes the cluster
 		// agree with reality, and it cannot be skipped just because nobody is
 		// listening any more.
+		ferr := s.finalizeMigrationOwnership(ctx, vm, targetHost, withStorage, disks)
 		if finish.drainFrom != "" {
-			// The guest has left the drained host, whatever the commit does.
+			// The guest has left the drained host, whatever the commit did. After
+			// the commit, so a judgement reading the row in between cannot find
+			// it still migrating on the source and name it again.
+			if drainForgetHookForTest != nil {
+				drainForgetHookForTest()
+			}
 			s.forgetDrainTimeout(ctx, finish.drainFrom, vm.Name)
 		}
-		if ferr := s.finalizeMigrationOwnership(ctx, vm, targetHost, withStorage, disks); ferr != nil {
+		if ferr != nil {
 			finish.armed.uncommitted(ctx)
+			if finish.drainFrom != "" && finish.pbVM != nil {
+				// libvirt reported the cut-over: the guest runs on the target,
+				// whatever the row says. post_migrate names it, as the watched
+				// drain's commit failure does.
+				finish.pbVM.HostName, finish.pbVM.State = targetHost, pb.VMState_VM_RUNNING
+				hooks.Run(ctx, hooks.PostMigrate, finish.pbVM, finish.hspec)
+			}
 			slog.Error("migrate: adopted migration cut over but ownership commit FAILED — "+
 				"the guest is on the target and the cluster does not know",
 				"vm", vm.Name, "target", targetHost, "error", ferr)
@@ -2793,6 +2806,10 @@ type migrationFinish struct {
 	// drain_move_timed_out.
 	drainFrom string
 }
+
+// drainForgetHookForTest runs just before a completed background drain move
+// leaves drain_move_timed_out. Tests only.
+var drainForgetHookForTest func()
 
 // adoptedMigrationCeiling bounds how long an adopted migration may run before
 // it is aborted. A var so tests can shorten it.

@@ -139,27 +139,44 @@ var fwmigConditionFor = map[fwmig.Phase]string{
 // no marker to resolve it later (lab2-D2-proof F5). A park another host
 // raised as the source of its own move of the VM is that move's (review m1).
 func (s *Server) resolveFirmwareMoveParkConditions(ctx context.Context, vm string) {
-	if s.db == nil {
-		return
-	}
 	seen := map[string]bool{}
 	for _, code := range fwmigConditionFor {
 		if seen[code] {
 			continue
 		}
 		seen[code] = true
-		row, found, err := corrosion.GetHealthCondition(ctx, s.db, firmwareMigrationEvaluator, code, "vm", vm)
-		if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved {
-			continue
-		}
-		var ev struct {
-			Source string `json:"source"`
-		}
-		if json.Unmarshal([]byte(row.Evidence), &ev) == nil && ev.Source != "" && ev.Source != s.hostName {
-			continue
-		}
-		_ = s.resolveFirmwareMigrationCondition(ctx, code, vm)
+		s.resolveOwnFirmwareMoveCondition(ctx, code, vm)
 	}
+}
+
+// resolveOwnFirmwareMoveCondition resolves vm's condition code unless its
+// evidence names another host as the move's source: that host's own move of
+// the VM raised it (re-review 2, m-C).
+func (s *Server) resolveOwnFirmwareMoveCondition(ctx context.Context, code, vm string) {
+	if s.db == nil {
+		return
+	}
+	row, found, err := corrosion.GetHealthCondition(ctx, s.db, firmwareMigrationEvaluator, code, "vm", vm)
+	if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved {
+		return
+	}
+	var ev struct {
+		Source string `json:"source"`
+	}
+	if json.Unmarshal([]byte(row.Evidence), &ev) == nil && ev.Source != "" && ev.Source != s.hostName {
+		return
+	}
+	_ = s.resolveFirmwareMigrationCondition(ctx, code, vm)
+}
+
+// fwTargetProvedOff reports whether a move's target is proved powered off:
+// fenced over a proof-grade newest fence, or no longer a member (`lv host rm
+// --dead`) over a proof-grade fence of its last life
+// (corrosion.SharedDiskOwnerProvedOff). A removed target keeps every exit
+// a fenced one has (lab2-D2 re-review 2, I-A). h is its live row, nil when
+// it has none.
+func (s *Server) fwTargetProvedOff(ctx context.Context, target string) (h *corrosion.HostRecord, off bool, err error) {
+	return corrosion.SharedDiskOwnerProvedOff(ctx, s.db, target)
 }
 
 // putLiveFirmwareMarker writes r's marker in phase p.
@@ -897,7 +914,7 @@ func (s *Server) resolveLiveFirmwareMoveByFenceLocked(ctx context.Context, m fwm
 	}
 	// The target proved off first: the recovery asks every interval, and
 	// only a proved-off target makes the rest worth saying.
-	off, err := corrosion.HostProvedOff(ctx, s.db, m.Target)
+	_, off, err := s.fwTargetProvedOff(ctx, m.Target)
 	if err != nil || !off {
 		return false, err
 	}
@@ -964,6 +981,21 @@ func (s *Server) RetryOwedFirmwareDiscardsOnce(ctx context.Context) {
 		return
 	}
 	for _, o := range owed {
+		// A record its move's marker still names is the move's own: the
+		// doctor or the recovery sends it. With no such marker, a row that
+		// names the target for the record's incarnation means the return it
+		// was written for never landed: the target's copy is the VM's, and
+		// nothing is owed (re-review 2, m-D).
+		if m, ok, merr := s.fwRecords().GetMarker(o.VM); merr != nil || (ok && m.Attempt == o.Attempt) {
+			continue
+		}
+		if row, rerr := corrosion.GetVM(ctx, s.db, o.VM); rerr != nil {
+			continue
+		} else if row != nil && row.HostName == o.Target &&
+			o.Binding.SameIncarnation(fwmig.Binding{UUID: parseFirmwareSpec(row.Spec).UUID, CreatedAt: row.CreatedAt}) {
+			s.dropOwedDiscard(ctx, o, "the VM's row names the target for the attempt's incarnation: the return it was recorded for never landed")
+			continue
+		}
 		h, err := corrosion.GetHost(ctx, s.db, o.Target)
 		if err != nil {
 			continue

@@ -724,7 +724,7 @@ func (s *Server) unmarkByOperator(ctx context.Context, m fwmig.Marker, did strin
 		return status.Errorf(codes.Internal, "VM %q: %s, but its marker cannot be removed: %v", m.VM, did, err)
 	}
 	s.resolveFirmwareMoveParkConditions(ctx, m.VM)
-	_ = s.resolveFirmwareMigrationCondition(ctx, condFwmigCleanupFailed, m.VM)
+	s.resolveOwnFirmwareMoveCondition(ctx, condFwmigCleanupFailed, m.VM)
 	s.recordVMEvent(ctx, m.VM, "vm.migrate.firmware", "ok", fmt.Sprintf("live firmware migration %s to %s: %s", m.Attempt, m.Target, did))
 	slog.Warn("firmware-move doctor: move resolved by an operator", "vm", m.VM, "attempt", m.Attempt, "target", m.Target, "how", did)
 	return nil
@@ -1365,7 +1365,7 @@ func (s *Server) doctorAcceptSourceAfterCommit(ctx context.Context, m fwmig.Mark
 			return "", err
 		}
 	}
-	if m.Phase == fwmig.PhaseCleaning && !returned {
+	if fwProgress(m) == fwmig.PhaseCleaning && !returned {
 		// The cleanup undefines the source's leftover definition before it
 		// wipes the state: without one, there is nothing here to start.
 		if _, err := s.virt.DomainIsActive(m.VM); lv.IsNoDomain(err) {
@@ -1382,9 +1382,8 @@ func (s *Server) doctorAcceptSourceAfterCommit(ctx context.Context, m fwmig.Mark
 		}
 	}
 	// Every check that can still refuse runs before the target's guest is
-	// stopped: the disks the return takes, and the owed DISCARD recorded (a
-	// target refuses it while the row names the target). A refusal after
-	// this point and before the return removes the record again.
+	// stopped: the disks the return takes. The owed DISCARD is recorded
+	// just before the return; a refusal after it removes the record again.
 	recs := s.fwRecords()
 	var disks []corrosion.DiskRecord
 	owedPut := false
@@ -1392,20 +1391,17 @@ func (s *Server) doctorAcceptSourceAfterCommit(ctx context.Context, m fwmig.Mark
 		if disks, err = s.returnDisks(ctx, m, action); err != nil {
 			return "", err
 		}
-		if err := recs.PutOwedDiscard(fwmig.OwedDiscard{VM: m.VM, Binding: m.Binding, Target: m.Target,
-			CreatedStubs: m.CreatedStubs, Since: time.Now().UTC()}); err != nil {
-			return "", status.Errorf(codes.Internal, "VM %q: record the DISCARD owed to %s: %v; nothing was returned", m.VM, m.Target, err)
-		}
-		owedPut = true
 	}
 	landed := false
 	defer func() {
-		if !owedPut || landed {
+		if landed {
 			return
 		}
-		if rerr := recs.RemoveOwedDiscard(m.VM, m.Attempt); rerr != nil {
-			slog.Warn("firmware-move doctor: a refused return leaves its owed-discard record", "vm", m.VM, "error", rerr)
-			return
+		if owedPut {
+			if rerr := recs.RemoveOwedDiscard(m.VM, m.Attempt); rerr != nil {
+				slog.Warn("firmware-move doctor: a refused return leaves its owed-discard record", "vm", m.VM, "error", rerr)
+				return
+			}
 		}
 		// An owed-discard retry may have raised discard_owed on the record
 		// while the action ran; with no record of the VM left, it goes too.
@@ -1413,7 +1409,7 @@ func (s *Server) doctorAcceptSourceAfterCommit(ctx context.Context, m fwmig.Mark
 			_ = s.resolveFirmwareMigrationCondition(ctx, condFwmigDiscardOwed, m.VM)
 		}
 	}()
-	off, err := corrosion.HostProvedOff(ctx, s.db, m.Target)
+	_, off, err := s.fwTargetProvedOff(ctx, m.Target)
 	if err != nil {
 		return "", status.Errorf(codes.Unavailable, "VM %q: whether %s is proved off cannot be read: %v", m.VM, m.Target, err)
 	}
@@ -1427,7 +1423,7 @@ func (s *Server) doctorAcceptSourceAfterCommit(ctx context.Context, m fwmig.Mark
 		switch {
 		case returned && h == nil:
 			// An earlier run's return landed; its DISCARD may have too.
-		case m.Phase == fwmig.PhaseCleaning:
+		case fwProgress(m) == fwmig.PhaseCleaning:
 			// The target released the guest: its copy is the VM's.
 			dom := "not defined"
 			if td.GetPresent() {
@@ -1469,6 +1465,13 @@ func (s *Server) doctorAcceptSourceAfterCommit(ctx context.Context, m fwmig.Mark
 		}
 	}
 	if !returned {
+		// Recorded just before the return, so a run that stops before it
+		// leaves no record of a DISCARD nothing owes (re-review 2, m-D).
+		if err := recs.PutOwedDiscard(fwmig.OwedDiscard{VM: m.VM, Binding: m.Binding, Target: m.Target,
+			CreatedStubs: m.CreatedStubs, Since: time.Now().UTC()}); err != nil {
+			return "", status.Errorf(codes.Internal, "VM %q: record the DISCARD owed to %s: %v; nothing was returned", m.VM, m.Target, err)
+		}
+		owedPut = true
 		ok, err := corrosion.ReturnMigratedVM(ctx, s.db, m.VM, m.Target, s.hostName, m.UUID, m.CreatedAt, "stopped", disks)
 		if err != nil {
 			// Whether it landed is not known: the owed record stays, and a

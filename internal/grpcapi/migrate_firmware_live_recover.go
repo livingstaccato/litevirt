@@ -1023,7 +1023,7 @@ func (s *Server) recoverFirmwareMoveReleased(ctx context.Context, r *liveFirmwar
 			"the move was released, but the VM's row (on %s) does not name %s for the move's incarnation; the source state is kept", rowHost(row), m.Target))
 		return
 	}
-	off, err := corrosion.HostProvedOff(ctx, s.db, m.Target)
+	_, off, err := s.fwTargetProvedOff(ctx, m.Target)
 	if err != nil {
 		slog.Warn("live firmware move recovery: whether the target is proved off cannot be read; the cleanup waits for the next pass", "vm", m.VM, "error", err)
 		return

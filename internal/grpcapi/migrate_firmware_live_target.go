@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fwmig"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -353,6 +354,7 @@ func (s *Server) quarantineHold(ctx context.Context, h fwmig.Hold, reason string
 	if err := recs.RemoveHold(h.VM); err != nil {
 		return "", fmt.Errorf("remove the hold of attempt %s: %w", h.Attempt, err)
 	}
+	s.removeDiscardedCopySeed(ctx, h.VM, h.UUID)
 	slog.Warn("live firmware move: target state quarantined (rule Q)", "vm", h.VM, "attempt", h.Attempt,
 		"source", h.Source, "state", h.State, "dir", dir, "reason", reason)
 	if err := s.raiseQuarantineCondition(ctx, fwmigCondition{
@@ -364,6 +366,30 @@ func (s *Server) quarantineHold(ctx context.Context, h fwmig.Hold, reason string
 		slog.Warn("live firmware move: raise the quarantine condition", "vm", h.VM, "error", err)
 	}
 	return dir, nil
+}
+
+// removeDiscardedCopySeed removes the cloud-init seed of vm here once this
+// host's copy of it was discarded or quarantined: the seed the move wrote
+// for the copy (EnsureCloudInit), stamped for the VM's uuid. Never while the
+// VM's row names this host, or cannot be read; a seed of another VM of the
+// name is not touched (lab-2 D2: seeds left on a lost target).
+func (s *Server) removeDiscardedCopySeed(ctx context.Context, vm, uuid string) {
+	if s.db == nil || uuid == "" {
+		return
+	}
+	row, err := corrosion.GetVM(ctx, s.db, vm)
+	if err != nil || (row != nil && row.HostName == s.hostName) {
+		return
+	}
+	iso, err := lv.SafeCloudInitISOPath(s.dataDir, vm)
+	if err != nil || !cloudinit.SeedIsFor(iso, uuid) {
+		return
+	}
+	if err := cloudinit.RemoveSeed(iso); err != nil {
+		slog.Warn("live firmware move: the discarded copy's seed was not removed", "vm", vm, "seed", iso, "error", err)
+		return
+	}
+	slog.Info("live firmware move: removed the discarded copy's seed", "vm", vm, "seed", iso)
 }
 
 // fileSHA256OrAbsent is the hex sha256 of the file at p, "absent" when there

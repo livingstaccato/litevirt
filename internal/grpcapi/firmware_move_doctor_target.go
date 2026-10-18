@@ -757,6 +757,7 @@ func (s *Server) doctorDiscardOwedLeftover(ctx context.Context, vm, actor string
 			return "", status.Errorf(codes.FailedPrecondition, "VM %q: undefine the leftover keeping its state: %v; its state is quarantined in %s, and the record stays", vm, err, dir)
 		}
 	}
+	s.removeDiscardedCopySeed(ctx, vm, o.UUID)
 	if err := recs.RemoveLeftover(vm); err != nil {
 		return "", status.Errorf(codes.Internal, "VM %q: remove the leftover record: %v", vm, err)
 	}

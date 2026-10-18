@@ -118,11 +118,14 @@ func (s *Server) fwmigCleanupSourceAs(ctx context.Context, m fwmig.Marker, byOpe
 		return s.liveFirmwareCleanupStopped(ctx, m, "write the retained bundle", err)
 	}
 	if !byOperator && s.db != nil {
-		off, err := corrosion.HostProvedOff(ctx, s.db, m.Target)
+		// Held while the target is proved off, fenced at all, or no longer
+		// a member (`lv host rm --dead` leaves no row to be fenced on):
+		// re-review 2, I-A.
+		h, off, err := s.fwTargetProvedOff(ctx, m.Target)
 		if err != nil {
 			return s.liveFirmwareCleanupStopped(ctx, m, "read whether the target is proved off", err)
 		}
-		if off {
+		if off || h == nil || h.State == "removed" || h.State == "fenced" {
 			return s.liveFirmwareCleanupStopped(ctx, m, "undefine the leftover definition", errFirmwareCleanupTargetOff)
 		}
 	}
@@ -144,7 +147,7 @@ func (s *Server) fwmigCleanupSourceAs(ctx context.Context, m fwmig.Marker, byOpe
 	}
 	// Resolved before the marker goes: a crash in between leaves the marker,
 	// which the retry finishes, never an open condition with no marker.
-	_ = s.resolveFirmwareMigrationCondition(ctx, condFwmigCleanupFailed, m.VM)
+	s.resolveOwnFirmwareMoveCondition(ctx, condFwmigCleanupFailed, m.VM)
 	s.resolveFirmwareMoveParkConditions(ctx, m.VM)
 	if h := cleanupRemoveMarkerHook; h != nil {
 		h()
@@ -183,9 +186,9 @@ func (s *Server) liveFirmwareCleanupStopped(ctx context.Context, m fwmig.Marker,
 		action = "the VM was returned here, so its firmware state here is its own and the cleanup does not take it: " +
 			"`lv doctor firmware-move <vm> --accept-source --acknowledge-rollback` finishes the return"
 	case errors.Is(cause, errFirmwareCleanupTargetOff):
-		action = "the target is proved off, so the source's copy may be the only one that can still run: it is kept, defined and not wiped. " +
+		action = "the target is fenced, proved off or removed, so the source's copy may be the only one that can still run: it is kept, defined and not wiped. " +
 			"`lv doctor firmware-move <vm> --accept-source --acknowledge-rollback` returns the VM here; `--accept-target` takes the target's copy " +
-			"(the source's state quarantined); the cleanup goes on by itself once the target answers again"
+			"(the source's state quarantined); the cleanup goes on by itself once the target is an active member again"
 	case errors.Is(cause, errFirmwareCleanupStateChanged):
 		action = "the VM runs on the target from the verified copy; the source's firmware state changed after the cutover, " +
 			"so it is kept and never wiped automatically, and a retry cannot heal it: `lv doctor firmware-move <vm> --accept-target` " +
@@ -243,9 +246,9 @@ var errFirmwareCleanupStateChanged = errors.New("changed after the cutover")
 // incarnation; its state here is the VM's again.
 var errFirmwareCleanupReturned = errors.New("the VM was returned here: its row names this host")
 
-// errFirmwareCleanupTargetOff: the target is proved off, so the source's
-// copy may be the only one that can still run.
-var errFirmwareCleanupTargetOff = errors.New("the target is proved off")
+// errFirmwareCleanupTargetOff: the target is fenced, proved off or no longer
+// a member, so the source's copy may be the only one that can still run.
+var errFirmwareCleanupTargetOff = errors.New("the target is fenced, proved off or no longer a member")
 
 // writeRetainedFirmwareBundle is §6.7 step 2. A bundle of the attempt already
 // there is the one an earlier pass wrote (it is renamed into place only once

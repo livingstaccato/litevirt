@@ -1450,6 +1450,15 @@ func (r *Reconciler) quarantineLeftoverFirmware(domName string, vm *corrosion.VM
 		return true
 	}
 	slog.Warn("reconciler: a leftover's firmware state was quarantined, not wiped", "vm", domName, "row_host", vm.HostName, "dir", final)
+	// The leftover's seed, stamped for its uuid, goes with it: the VM lives
+	// on vm.HostName (lab-2 D2: seeds left on a lost target).
+	if uuid != "" {
+		if iso, err := lv.SafeCloudInitISOPath(r.fwStore.DataDir, domName); err == nil && cloudinit.SeedIsFor(iso, uuid) {
+			if err := cloudinit.RemoveSeed(iso); err != nil {
+				slog.Warn("reconciler: the quarantined leftover's seed was not removed", "vm", domName, "seed", iso, "error", err)
+			}
+		}
+	}
 	return true
 }
 

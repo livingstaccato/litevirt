@@ -15,7 +15,6 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/daemon"
 	"github.com/litevirt/litevirt/internal/firewall"
@@ -139,11 +138,11 @@ func requireSGProjects(ctx context.Context, c pb.LiteVirtClient, sub string) err
 		return fmt.Errorf("lv sg %s --project: could not ask the daemon whether it supports project security groups: %w", sub, err)
 	}
 	for _, f := range st.GetFeatures() {
-		if f.GetName() == string(capabilities.FeatureSGProjects) && f.GetDeclared() {
+		if f.GetName() == string(corrosion.FeatureSGProjects) && f.GetDeclared() {
 			return nil
 		}
 	}
-	return errSGProjectsUnsupported{sub, "it does not declare the " + string(capabilities.FeatureSGProjects) + " feature"}
+	return errSGProjectsUnsupported{sub, "it does not declare the " + string(corrosion.FeatureSGProjects) + " feature"}
 }
 
 // sgRPCError explains an Unimplemented reply. A daemon older than the

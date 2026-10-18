@@ -347,8 +347,7 @@ func TestGrantMinter_ClaimedOnce(t *testing.T) {
 // reviewed change to releaseFeatures and to this pin together.
 // (release_2026_11_v1 gained nic_guards and redfish_fence that way, and later
 // ha_disarm, nic_mtu and replication_rate, and then firewall_synflood, firewall_log
-// and firewall_tag_groups, and then host_incarnation, and then sg_projects,
-// before it shipped.)
+// and firewall_tag_groups, and then host_incarnation, before it shipped.)
 var frozenReleaseFeatures = map[string][]Feature{
 	Release202611V1: {
 		"backup_zstd",
@@ -369,7 +368,6 @@ var frozenReleaseFeatures = map[string][]Feature{
 		"redfish_fence",
 		"replication_rate",
 		"returning_boot",
-		"sg_projects",
 		"usb_mounts_memory",
 		"vm_disk_nic_io",
 		"vm_limits",

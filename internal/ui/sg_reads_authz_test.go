@@ -201,7 +201,7 @@ func TestUIReads_DuringAWhoamiOutageADeadSessionGetsNoData(t *testing.T) {
 func TestUIAddNICModal_ListsTheVMsProjectAndGlobalGroups(t *testing.T) {
 	s, db, _ := newUIBoundAt(t, "pat", "/projects/acme", "Admin")
 	ctx := context.Background()
-	grant := capabilities.GrantForTest(t, capabilities.FeatureSGProjects)
+	grant := capabilities.GrantForTest(t, corrosion.FeatureSGProjects)
 	if err := corrosion.InsertSecurityGroup(ctx, db, corrosion.SecurityGroup{ID: "sg-base", Name: "base-global"}); err != nil {
 		t.Fatal(err)
 	}

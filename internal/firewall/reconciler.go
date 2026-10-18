@@ -200,6 +200,10 @@ type AppliedState struct {
 	SynFlood            SynFlood
 	SynFloodUnavailable string
 	UnreadablePolicies  []string
+	// SynFloodInForce is what the pass put in force of SYN-flood
+	// protection: SynFloodInForceOn, ...Observe, ...GuardsOnly,
+	// ...Unavailable or ...Off; "" before the first pass.
+	SynFloodInForce string
 }
 
 // SetStateHook registers fn to receive the applied state after every pass
@@ -239,7 +243,8 @@ func (r *Reconciler) AppliedState() AppliedState {
 func (r *Reconciler) recordState(ctx context.Context, p Plan, applyErr error) {
 	st := AppliedState{NICs: map[string]string{}, Guarded: map[string]map[string]bool{}, BlockedTrunks: p.BlockedTrunks,
 		InvalidRows: p.InvalidRows, TagGroups: p.TagGroups,
-		SynFlood: p.SynFlood, SynFloodUnavailable: p.SynFloodUnavailable, UnreadablePolicies: p.UnreadablePolicies}
+		SynFlood: p.SynFlood, SynFloodUnavailable: p.SynFloodUnavailable, UnreadablePolicies: p.UnreadablePolicies,
+		SynFloodInForce: synFloodInForce(p)}
 	if len(p.NICs) > 0 {
 		st.Mode = p.nicMode()
 	}

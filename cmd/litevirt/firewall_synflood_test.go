@@ -18,7 +18,6 @@ type synfloodSpy struct {
 	err      error
 	sets     []*pb.SetFirewallSynfloodRequest
 	get      *pb.GetFirewallSynfloodResponse
-	health   *pb.ClusterHealth
 	deadline bool
 }
 
@@ -36,10 +35,6 @@ func (s *synfloodSpy) GetFirewallSynflood(ctx context.Context, _ *pb.GetFirewall
 		return nil, s.err
 	}
 	return s.get, nil
-}
-
-func (s *synfloodSpy) GetClusterHealth(context.Context, *pb.GetClusterHealthRequest, ...grpc.CallOption) (*pb.ClusterHealth, error) {
-	return s.health, nil
 }
 
 func runSynfloodCLI(t *testing.T, spy *synfloodSpy, args ...string) (string, error) {
@@ -92,23 +87,22 @@ func TestSynfloodCLI_Writes(t *testing.T) {
 	}
 }
 
-// status prints the cluster's policy, then each host's with where it comes
-// from and what is in force: a host whose kernel refused the probe shows
-// unavailable.
+// status prints the cluster's policy, then each host's: its policy, where
+// that comes from, what the host itself has in force, and its drops. A host
+// whose daemon predates in_force shows "predates"; a host that could not be
+// asked shows "-" and why, never a 0 or an "on" (Track B review I-2).
 //
-// Mutations: ignore the condition — h2 shows on: red; print an unreadable
-// count as 0 — red.
+// Mutations: show the policy as IN FORCE — h1 and h2 show on: red; show an
+// empty in_force as on — h3: red; print an unreadable count as 0 — h4: red.
 func TestSynfloodCLI_Status(t *testing.T) {
 	spy := &synfloodSpy{
 		get: &pb.GetFirewallSynfloodResponse{Policies: []*pb.FirewallSynfloodPolicy{
 			{Scope: "cluster", Mode: "on", Rate: 200, Burst: 1000, SetBy: "olga", UpdatedAt: "t1"},
-			{Scope: "host/h1", Mode: "off", SetBy: "olga", UpdatedAt: "t2"},
-			{Scope: "host/h2", Mode: "on", Rate: 200, Burst: 1000, Inherited: true, DropsV4: 17, DropsV6: 3},
-			{Scope: "host/h3", Mode: "on", Rate: 200, Burst: 1000, Inherited: true, Error: "unreachable"},
-		}},
-		health: &pb.ClusterHealth{Conditions: []*pb.HealthCondition{
-			{Code: "firewall.synflood.unavailable", SubjectKind: "host", SubjectId: "h2", Lifecycle: "confirmed"},
-			{Code: "firewall.synflood.unavailable", SubjectKind: "host", SubjectId: "h1", Lifecycle: "resolved"},
+			{Scope: "host/h1", Mode: "on", Rate: 200, Burst: 1000, Inherited: true, InForce: "observe", DropsV4: 0, DropsV6: 0},
+			{Scope: "host/h2", Mode: "on", Rate: 200, Burst: 1000, Inherited: true, InForce: "unavailable"},
+			{Scope: "host/h3", Mode: "on", Rate: 200, Burst: 1000, Inherited: true},
+			{Scope: "host/h4", Mode: "on", Rate: 200, Burst: 1000, Inherited: true, Error: "unreachable"},
+			{Scope: "host/h5", Mode: "off", SetBy: "olga", UpdatedAt: "t2", InForce: "off", DropsV4: 17, DropsV6: 3},
 		}},
 	}
 	out, err := runSynfloodCLI(t, spy, "status")
@@ -116,17 +110,19 @@ func TestSynfloodCLI_Status(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 5 || lines[0] != "cluster: on, 200/second burst 1000 (set by olga at t1)" {
+	if len(lines) != 7 || lines[0] != "cluster: on, 200/second burst 1000 (set by olga at t1)" {
 		t.Fatalf("status output:\n%s", out)
 	}
-	if f := strings.Fields(lines[2]); strings.Join(f, " ") != "h1 off off - - host 0 0 olga t2" {
-		t.Errorf("h1 row = %q", lines[2])
-	}
-	if f := strings.Fields(lines[3]); strings.Join(f, " ") != "h2 on unavailable 200 1000 cluster 17 3 -" {
-		t.Errorf("h2 row = %q", lines[3])
-	}
-	if f := strings.Fields(lines[4]); strings.Join(f, " ") != "h3 on on 200 1000 cluster - - - unreachable" {
-		t.Errorf("h3 row = %q (a count that could not be read must not show as 0)", lines[4])
+	for i, want := range []string{
+		"h1 on observe 200 1000 cluster 0 0 -",
+		"h2 on unavailable 200 1000 cluster 0 0 -",
+		"h3 on predates 200 1000 cluster 0 0 -",
+		"h4 on - 200 1000 cluster - - - unreachable",
+		"h5 off off - - host 17 3 olga t2",
+	} {
+		if got := strings.Join(strings.Fields(lines[i+2]), " "); got != want {
+			t.Errorf("row %d = %q, want %q", i+1, got, want)
+		}
 	}
 }
 

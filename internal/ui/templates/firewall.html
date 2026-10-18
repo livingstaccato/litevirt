@@ -89,6 +89,18 @@
   <div class="section">
     <div class="section-header">
       <div>
+        <h2 style="text-transform:none;color:var(--text);font-size:14px">SYN-flood protection</h2>
+        <span class="muted" style="font-size:11px">New TCP connections toward guest NICs, limited per NIC and source. "In force" is what each host's firewall applies; change it with <span class="mono">lv firewall synflood</span>.</span>
+      </div>
+    </div>
+    <div style="padding:8px 16px" hx-get="/ui/firewall/synflood" hx-trigger="load" hx-swap="innerHTML">
+      <span class="muted">Asking every host…</span>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header">
+      <div>
         <h2 style="text-transform:none;color:var(--text);font-size:14px">IP sets</h2>
         <span class="muted" style="font-size:11px">Named CIDR lists. Reference one in any rule with <span class="mono">cidr = @name</span>.</span>
       </div>

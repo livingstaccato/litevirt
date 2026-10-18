@@ -132,7 +132,8 @@ var synfloodFanoutTimeout = 10 * time.Second
 // GetFirewallSynflood reports the cluster's policy (scope "cluster"), then
 // each host's (scope "host/<name>") as this replica resolves it — its own
 // row, else the cluster's (inherited), else off — sorted by host name, with
-// the host's SYN-flood drops since its last reload: this host's read from its
+// what the host itself has in force (in_force, from its last firewall pass)
+// and its SYN-flood drops since its last reload: this host's read from its
 // kernel, every other active host's asked of it (local_only), all at once
 // under one deadline. A host that cannot be asked, or is not active, says why
 // in error and carries no count. With local_only, only this host's entry; a
@@ -149,6 +150,7 @@ func (s *Server) GetFirewallSynflood(ctx context.Context, req *pb.GetFirewallSyn
 		} else {
 			s.localSynfloodDrops(ctx, p)
 		}
+		s.localSynfloodInForce(p)
 		return &pb.GetFirewallSynfloodResponse{Policies: []*pb.FirewallSynfloodPolicy{p}}, nil
 	}
 	cluster, err := s.synfloodPolicy(ctx, "")
@@ -172,6 +174,7 @@ func (s *Server) GetFirewallSynflood(ctx context.Context, req *pb.GetFirewallSyn
 		switch {
 		case h.Name == s.hostName:
 			s.localSynfloodDrops(ctx, p)
+			s.localSynfloodInForce(p)
 		case h.State != "active":
 			p.Error = fmt.Sprintf("not asked: the host is %s", h.State)
 		default:
@@ -202,6 +205,21 @@ func (s *Server) localSynfloodDrops(ctx context.Context, p *pb.FirewallSynfloodP
 	p.DropsV4, p.DropsV6 = v4, v6
 }
 
+// localSynfloodInForce fills p with what this host's last firewall pass put
+// in force, or says in p's error that no pass has completed.
+func (s *Server) localSynfloodInForce(p *pb.FirewallSynfloodPolicy) {
+	if r, ok := s.fwRec().(appliedStater); ok {
+		p.InForce = r.AppliedState().SynFloodInForce
+	}
+	if p.InForce == "" {
+		why := "no firewall pass has completed on this host yet"
+		if p.Error != "" {
+			why = p.Error + "; " + why
+		}
+		p.Error = why
+	}
+}
+
 // peerSynfloodDrops asks host for its own drop counters (local_only) and
 // fills p with them, or with why not: the host's daemon predates the
 // counters, the host reported its own failure to read them, or it could not
@@ -223,6 +241,7 @@ func (s *Server) peerSynfloodDrops(ctx context.Context, host string, p *pb.Firew
 		p.Error = "no answer"
 	default:
 		got := r.GetPolicies()[0]
+		p.InForce = got.GetInForce() // "" from a build that predates it
 		p.DropsV4, p.DropsV6 = got.GetDropsV4(), got.GetDropsV6()
 		if got.GetError() != "" {
 			p.DropsV4, p.DropsV6, p.Error = 0, 0, "reported by the host: "+got.GetError()

@@ -211,3 +211,29 @@ func parseSynFloodDrops(js []byte) (v4, v6 uint64, err error) {
 	}
 	return v4, v6, nil
 }
+
+// What a pass put in force of SYN-flood protection (AppliedState.SynFloodInForce).
+const (
+	SynFloodInForceOn          = "on"
+	SynFloodInForceObserve     = "observe"
+	SynFloodInForceGuardsOnly  = "guards-only"
+	SynFloodInForceUnavailable = "unavailable"
+	SynFloodInForceOff         = "off"
+)
+
+// synFloodInForce is what a plan puts in force of SYN-flood protection: the
+// lines drop only in enforce mode; observe mode counts them; guards-only mode
+// renders none.
+func synFloodInForce(p Plan) string {
+	switch {
+	case p.SynFloodUnavailable != "":
+		return SynFloodInForceUnavailable
+	case !p.SynFlood.On:
+		return SynFloodInForceOff
+	case p.nicMode() == NICModeGuardsOnly:
+		return SynFloodInForceGuardsOnly
+	case p.nicMode() == NICModeObserve:
+		return SynFloodInForceObserve
+	}
+	return SynFloodInForceOn
+}

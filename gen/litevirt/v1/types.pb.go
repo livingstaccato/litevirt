@@ -3440,9 +3440,14 @@ type FirewallSynfloodPolicy struct {
 	// A host's entry only: its SYN-flood drops per family since its last
 	// reload (the lv-sf 4 and lv-sf 6 counters), asked of the host itself.
 	// error says why they could not be read; then the counts mean nothing.
-	DropsV4       uint64 `protobuf:"varint,8,opt,name=drops_v4,json=dropsV4,proto3" json:"drops_v4,omitempty"`
-	DropsV6       uint64 `protobuf:"varint,9,opt,name=drops_v6,json=dropsV6,proto3" json:"drops_v6,omitempty"`
-	Error         string `protobuf:"bytes,10,opt,name=error,proto3" json:"error,omitempty"`
+	DropsV4 uint64 `protobuf:"varint,8,opt,name=drops_v4,json=dropsV4,proto3" json:"drops_v4,omitempty"`
+	DropsV6 uint64 `protobuf:"varint,9,opt,name=drops_v6,json=dropsV6,proto3" json:"drops_v6,omitempty"`
+	Error   string `protobuf:"bytes,10,opt,name=error,proto3" json:"error,omitempty"`
+	// A host's entry only: what that host has in force, from its last
+	// firewall pass: on | observe (counted, not dropped) | guards-only (no
+	// bridge conntrack: nothing rendered) | unavailable (the kernel refused
+	// the SYN-flood rules) | off. Empty from a daemon that predates it.
+	InForce       string `protobuf:"bytes,11,opt,name=in_force,json=inForce,proto3" json:"in_force,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3543,6 +3548,13 @@ func (x *FirewallSynfloodPolicy) GetDropsV6() uint64 {
 func (x *FirewallSynfloodPolicy) GetError() string {
 	if x != nil {
 		return x.Error
+	}
+	return ""
+}
+
+func (x *FirewallSynfloodPolicy) GetInForce() string {
+	if x != nil {
+		return x.InForce
 	}
 	return ""
 }
@@ -7645,7 +7657,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x04cidr\x18\x06 \x01(\tR\x04cidr\x12\x16\n" +
 	"\x06action\x18\a \x01(\tR\x06action\x12\x1a\n" +
 	"\bpriority\x18\b \x01(\x05R\bpriority\x12\x10\n" +
-	"\x03log\x18\t \x01(\bR\x03log\"\x8c\x02\n" +
+	"\x03log\x18\t \x01(\bR\x03log\"\xa7\x02\n" +
 	"\x16FirewallSynfloodPolicy\x12\x14\n" +
 	"\x05scope\x18\x01 \x01(\tR\x05scope\x12\x12\n" +
 	"\x04mode\x18\x02 \x01(\tR\x04mode\x12\x12\n" +
@@ -7658,7 +7670,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\bdrops_v4\x18\b \x01(\x04R\adropsV4\x12\x19\n" +
 	"\bdrops_v6\x18\t \x01(\x04R\adropsV6\x12\x14\n" +
 	"\x05error\x18\n" +
-	" \x01(\tR\x05error\"\xce\x01\n" +
+	" \x01(\tR\x05error\x12\x19\n" +
+	"\bin_force\x18\v \x01(\tR\ainForce\"\xce\x01\n" +
 	"\x11FirewallLogPolicy\x12\x14\n" +
 	"\x05scope\x18\x01 \x01(\tR\x05scope\x12%\n" +
 	"\x0edefault_policy\x18\x02 \x01(\bR\rdefaultPolicy\x12\x12\n" +

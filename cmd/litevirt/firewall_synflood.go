@@ -109,13 +109,7 @@ refused until the cluster upgrade has finished.`,
 				if err != nil {
 					return synfloodRPCError(err)
 				}
-				// Hosts whose kernel refused the SYN-flood probe render
-				// none whatever the policy (firewall.synflood.unavailable).
-				var unavailable map[string]bool
-				if h, err := c.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{}); err == nil {
-					unavailable = synfloodUnavailableHosts(h)
-				}
-				return printSynflood(os.Stdout, r, unavailable)
+				return printSynflood(os.Stdout, r)
 			})
 		},
 	}
@@ -140,23 +134,24 @@ func synfloodPolicyText(p *pb.FirewallSynfloodPolicy) string {
 	return fmt.Sprintf("on, %d/second burst %d", p.GetRate(), p.GetBurst())
 }
 
-// synfloodUnavailableHosts is the hosts with an open
-// firewall.synflood.unavailable condition.
-func synfloodUnavailableHosts(h *pb.ClusterHealth) map[string]bool {
-	out := map[string]bool{}
-	for _, c := range h.GetConditions() {
-		if c.GetCode() == "firewall.synflood.unavailable" && c.GetSubjectKind() == "host" && c.GetLifecycle() != "resolved" {
-			out[c.GetSubjectId()] = true
-		}
+// synfloodInForceText is what a host has in force, as the host reported it:
+// "-" when it could not be asked (its error says why), "predates" when its
+// daemon is older than the report.
+func synfloodInForceText(p *pb.FirewallSynfloodPolicy) string {
+	switch {
+	case p.GetInForce() != "":
+		return p.GetInForce()
+	case p.GetError() != "":
+		return "-"
 	}
-	return out
+	return "predates"
 }
 
-// printSynflood prints the cluster's policy (the reply's first entry: a host
-// may be named "cluster" too) and each host's, with what the host has in
-// force (off, on, or unavailable: its kernel refused the probe) and its
-// SYN-flood drops per family since its last reload.
-func printSynflood(out io.Writer, r *pb.GetFirewallSynfloodResponse, unavailable map[string]bool) error {
+// printSynflood prints the cluster's policy (the reply's first entry) and
+// each host's: its policy, what the host itself has in force (on, observe,
+// guards-only, unavailable or off; synfloodInForceText) and its SYN-flood
+// drops per family since its last reload.
+func printSynflood(out io.Writer, r *pb.GetFirewallSynfloodResponse) error {
 	ps := r.GetPolicies()
 	if len(ps) == 0 {
 		return fmt.Errorf("the daemon returned no SYN-flood policy")
@@ -183,10 +178,7 @@ func printSynflood(out io.Writer, r *pb.GetFirewallSynfloodResponse, unavailable
 			setBy = "-"
 		}
 		host := strings.TrimPrefix(p.GetScope(), "host/")
-		inForce := p.GetMode()
-		if inForce == "on" && unavailable[host] {
-			inForce = "unavailable"
-		}
+		inForce := synfloodInForceText(p)
 		// A count that could not be read is "-", with why, never a 0.
 		d4, d6 := "-", "-"
 		if p.GetError() == "" {

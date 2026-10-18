@@ -14,6 +14,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/firewall"
 )
 
 func synfloodServer(t *testing.T, open bool, hosts ...string) *Server {
@@ -180,6 +181,7 @@ func TestGetFirewallSynflood_PerHost(t *testing.T) {
 type synfloodPeer struct {
 	pb.LiteVirtClient
 	v4, v6  uint64
+	inForce string // what the host has in force ("" from an older build)
 	err     error  // the RPC fails
 	readErr string // the host could not read its own counters
 	block   bool   // answers only when the caller gives up
@@ -196,7 +198,7 @@ func (p synfloodPeer) GetFirewallSynflood(ctx context.Context, in *pb.GetFirewal
 	if p.err != nil {
 		return nil, p.err
 	}
-	return &pb.GetFirewallSynfloodResponse{Policies: []*pb.FirewallSynfloodPolicy{{DropsV4: p.v4, DropsV6: p.v6, Error: p.readErr}}}, nil
+	return &pb.GetFirewallSynfloodResponse{Policies: []*pb.FirewallSynfloodPolicy{{DropsV4: p.v4, DropsV6: p.v6, Error: p.readErr, InForce: p.inForce}}}, nil
 }
 
 // status asks every active host for its own lv-sf 4 and lv-sf 6 counters
@@ -225,6 +227,7 @@ func TestGetFirewallSynflood_DropsPerHost(t *testing.T) {
 		return nil, nil, errors.New("connection refused")
 	}
 	s.synFloodDrops = func(context.Context) (uint64, uint64, error) { return 11, 4, nil }
+	s.SetFirewallReconciler(&appliedRec{st: firewall.AppliedState{SynFloodInForce: firewall.SynFloodInForceOn}})
 	r, err := s.GetFirewallSynflood(viewerCtx(), &pb.GetFirewallSynfloodRequest{})
 	if err != nil {
 		t.Fatal(err)
@@ -306,5 +309,66 @@ func TestGetFirewallSynflood_FanOutIsParallelAndBounded(t *testing.T) {
 				t.Errorf("%s = %q, want unreachable", p.GetScope(), p.GetError())
 			}
 		}
+	}
+}
+
+// appliedRec is a reconciler whose last pass put st in force.
+type appliedRec struct {
+	fakeReconciler
+	st firewall.AppliedState
+}
+
+func (a *appliedRec) AppliedState() firewall.AppliedState { return a.st }
+
+// IN FORCE is what each host's last firewall pass put in force, reported by
+// the host itself (Track B review I-2), not the policy the entry node's
+// replica holds: an observing host says observe. A peer on a build that
+// predates the field answers with it empty, which stays empty (the CLI shows
+// "predates"); a host that could not be asked carries none. A host with no
+// firewall pass yet says so in error.
+//
+// Mutations: fill in_force from the replica's policy — red; drop the peer's
+// in_force — red; report a host with no pass as off — red.
+func TestGetFirewallSynflood_InForceIsTheHostsAppliedState(t *testing.T) {
+	s := synfloodServer(t, true, "test-host", "h1", "h2", "h3")
+	if _, err := s.SetFirewallSynflood(userCtx("olga", "operator"), &pb.SetFirewallSynfloodRequest{Mode: "on"}); err != nil {
+		t.Fatal(err)
+	}
+	s.SetFirewallReconciler(&appliedRec{st: firewall.AppliedState{SynFloodInForce: firewall.SynFloodInForceObserve}})
+	s.synFloodDrops = func(context.Context) (uint64, uint64, error) { return 0, 0, nil }
+	s.peerClientOverride = func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
+		switch host {
+		case "h1":
+			return synfloodPeer{inForce: firewall.SynFloodInForceGuardsOnly}, func() {}, nil
+		case "h2":
+			return synfloodPeer{}, func() {}, nil // an older build
+		}
+		return nil, nil, errors.New("connection refused")
+	}
+	r, err := s.GetFirewallSynflood(viewerCtx(), &pb.GetFirewallSynfloodRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"host/test-host": "observe", "host/h1": "guards-only", "host/h2": "", "host/h3": ""}
+	for _, p := range r.GetPolicies()[1:] {
+		if p.GetMode() != "on" {
+			t.Errorf("%s: policy %q, want the replicated on", p.GetScope(), p.GetMode())
+		}
+		if got := p.GetInForce(); got != want[p.GetScope()] {
+			t.Errorf("%s: in_force %q, want %q", p.GetScope(), got, want[p.GetScope()])
+		}
+	}
+	if c := r.GetPolicies()[0]; c.GetInForce() != "" {
+		t.Errorf("the cluster entry carries in_force %q", c.GetInForce())
+	}
+
+	r, err = s.GetFirewallSynflood(viewerCtx(), &pb.GetFirewallSynfloodRequest{LocalOnly: true})
+	if err != nil || r.GetPolicies()[0].GetInForce() != "observe" {
+		t.Fatalf("local_only = %+v, %v; want observe", r, err)
+	}
+	s.SetFirewallReconciler(&appliedRec{}) // no pass has completed yet
+	r, err = s.GetFirewallSynflood(viewerCtx(), &pb.GetFirewallSynfloodRequest{LocalOnly: true})
+	if p := r.GetPolicies()[0]; err != nil || p.GetInForce() != "" || !strings.Contains(p.GetError(), "no firewall pass") {
+		t.Errorf("before the first pass: %+v, %v; want no in_force and the reason", p, err)
 	}
 }

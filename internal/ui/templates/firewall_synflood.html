@@ -1,0 +1,17 @@
+<div id="fw-synflood">
+  {{if .Unsupported}}
+    <span class="muted">This daemon predates SYN-flood status; upgrade litevirtd on the host the UI talks to.</span>
+  {{else if .Err}}
+    <span class="muted">SYN-flood status could not be read: {{.Err}}</span>
+  {{else}}
+    <div class="rule-line"><span class="muted">Cluster policy:</span> <span class="mono">{{.Cluster}}</span></div>
+    <table class="table" style="margin-top:8px">
+      <thead><tr><th>Host</th><th>Policy</th><th>In force</th><th>Rate</th><th>Burst</th><th>From</th><th>Drops v4</th><th>Drops v6</th><th>Error</th></tr></thead>
+      <tbody>
+      {{range .Rows}}
+        <tr><td>{{.Host}}</td><td>{{.Policy}}</td><td><span class="badge {{if eq .InForce "on"}}badge-green{{else}}badge-gray{{end}}">{{.InForce}}</span></td><td>{{.Rate}}</td><td>{{.Burst}}</td><td>{{.From}}</td><td class="mono">{{.DropsV4}}</td><td class="mono">{{.DropsV6}}</td><td class="muted">{{.Error}}</td></tr>
+      {{end}}
+      </tbody>
+    </table>
+  {{end}}
+</div>

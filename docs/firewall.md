@@ -1071,9 +1071,12 @@ lv firewall synflood inherit --scope <host>                       # clear a host
 
 - A host's own policy (`--scope <host>`) wins over the cluster's; with
   neither, protection is off. `status` shows, per host, the policy, where it
-  comes from (`host` or `cluster`), what is in force (`unavailable` for a
-  host whose kernel refused SYN-flood rules), and its drops per address
-  family since its last reload, asked of every active host at once. A host
+  comes from (`host` or `cluster`), what the host itself has in force
+  (IN FORCE: `on`; `observe`, counted and not dropped; `guards-only`, no
+  bridge conntrack, nothing rendered; `unavailable`, the kernel refused the
+  rules; `off`; `predates`, the host's litevirtd does not report it), and its
+  drops per address family since its last reload, asked of every active host
+  at once. The firewall page of the web UI shows the same. A host
   without counts shows `-` and why in ERROR, never a 0: `unreachable` (no
   answer within 10 seconds), `not asked` (not active), `predates` (its
   litevirtd is older) or `reported by the host` (it could not read them).

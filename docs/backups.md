@@ -345,7 +345,8 @@ replacement, so keep backups too.
 **Replica sets.** One run replicates every disk with one run time, so the
 replicas a run writes are a set: the root disk first, exactly as before (its
 `--incremental` chain, its fallback, its top-level copy for a host on an older
-build), then each other disk as a full point-in-time copy. Each disk keeps its
+build), then each other disk as a full point-in-time copy, or on an
+`--incremental` schedule through a chain of its own (below). Each disk keeps its
 own replica and record, so `keep_replicas` applies per disk and the storage
 cost is one replica per disk per kept run. A run whose copy of any disk fails
 reports the run failed (`disk.replicated` names the disk), and the disks it
@@ -361,11 +362,26 @@ did copy stand. What a run does not copy:
 - every disk but the root, when the target host runs an older build, which
   promotes the root disk alone (`skipped`, naming the host).
 
-**`--incremental` schedules still copy the other disks in full on every run.**
-The incremental chain covers the root disk only; per-disk incremental is a
-tracked follow-up that needs verifying on real libvirt first. A VM with large
-data disks on an `--incremental` schedule therefore pays a full copy of each
-data disk per run, in time, I/O and target storage.
+**`--incremental` copies every disk incrementally, each on its own chain.**
+Each disk of a running VM has its own checkpoint (a dirty bitmap on that disk
+alone) and its own anchor, and a run reads only the extents that disk wrote
+since its last run, into a raw replica forked from that run's replica. A disk
+whose chain is broken is copied in full, never by increments over content its
+bitmap did not see, and its chain starts again from that run. A chain is broken
+when:
+
+- the VM moved to another host, or moved away and back (its owner changed);
+- the disk's file is another file: swapped, or restored in place;
+- the disk was resized;
+- the target no longer holds the replica the last run wrote;
+- the session cannot open: the VM is shut off, or libvirt no longer has the
+  checkpoint or the disk its bitmap.
+
+The disk's full point-in-time copy (below) is the fallback when no session can
+open; it is a `qcow2` replica, and the next run on a running VM starts the
+chain again. The `disk.replicated` event of each run says which disks were
+incremental and why any was full. A receiver on an older build still gets the
+root disk alone.
 
 **The VM lock during another disk's copy.** The root disk's run holds the VM's
 lock as it always did. Each other disk takes it only for its brief
@@ -696,7 +712,8 @@ pool, and prunes old replicas there.
 **Incremental** (`--incremental`): instead of a full copy each run, the daemon
 reads only the dirty extents since the last run (via a libvirt backup
 session/dirty-bitmap) and applies them into a sparse **raw** replica forked from
-the previous one on the target — only changed extents cross the wire. Falls back
+the previous one on the target — only changed extents cross the wire. Every disk
+of the VM has its own chain ([Replica sets](#replication-schedules)). Falls back
 to a full copy for a stopped VM / old libvirt / broken chain.
 
 ### Replication bandwidth limit

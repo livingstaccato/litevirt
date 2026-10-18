@@ -34,7 +34,9 @@ import (
 // format it always had (replica_records.go), and a run's set is the records
 // that carry its time. The root disk goes first and exactly as before — its
 // incremental chain, its fallback, its top-level mirror for a main-build host —
-// then each other disk as a full point-in-time copy (copyVMDiskConsistent).
+// then each other disk as a full point-in-time copy (copyVMDiskConsistent), or,
+// on an --incremental schedule, through its own incremental chain
+// (replica_set_incremental.go).
 //
 // A promotion, manual or automatic, recovers every disk that has a replica:
 // the replica of the root's run, or, for a disk that run did not copy, its
@@ -313,14 +315,25 @@ func (s *Server) replicateOtherDisks(ctx context.Context, sched corrosion.Backup
 			return nil
 		}
 	}
+	take := relock
+	if take == nil {
+		take = func() func() { return func() {} }
+	}
 	var errs []error
 	for i := range copyable {
 		d := &copyable[i]
+		full := func() error {
+			if targetHost == s.hostName {
+				return s.replicateLocal(ctx, sched, vm, d, ts, allowForceShare)
+			}
+			return s.replicateCrossHost(ctx, sched, vm, d, targetHost, ts, allowForceShare)
+		}
 		var err error
-		if targetHost == s.hostName {
-			err = s.replicateLocal(ctx, sched, vm, d, ts, allowForceShare)
+		if sched.Incremental && s.backupSource != nil {
+			// Its own dirty-bitmap chain, as the root's (replica_set_incremental.go).
+			err = s.replicateOtherDiskIncrementalOr(ctx, sched, vm, d, targetHost, ts, take, full)
 		} else {
-			err = s.replicateCrossHost(ctx, sched, vm, d, targetHost, ts, allowForceShare)
+			err = full()
 		}
 		if err != nil {
 			slog.Warn("replication: a disk of the set was not replicated; the set of this run is incomplete",

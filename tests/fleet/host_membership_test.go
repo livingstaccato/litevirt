@@ -76,6 +76,47 @@ func assertNoMembershipStatements(t *testing.T, n *Node) {
 	}
 }
 
+// waitEveryWriteApplied waits until every entry any node has logged as its
+// own has been delivered to every other node (mutation_seen, which also
+// records an entry that was parked or refused there). A digest wait that
+// leaves a table out cannot say that a write to that table has arrived; this
+// can, whatever the write won or lost on arrival.
+func waitEveryWriteApplied(t *testing.T, c *Cluster) {
+	t.Helper()
+	ctx := context.Background()
+	var lastErr error
+	defer func() {
+		if t.Failed() && lastErr != nil {
+			t.Logf("last query error while waiting: %v", lastErr)
+		}
+	}()
+	eventually(t, convergeTimeout, "every logged write to be delivered to every replica", func() bool {
+		for _, n := range c.Nodes {
+			logged, err := n.DB.Query(ctx, `SELECT hlc FROM mutation_log WHERE origin = ?`, n.Name)
+			if err != nil {
+				lastErr = err
+				return false
+			}
+			for _, m := range c.Nodes {
+				if m == n {
+					continue
+				}
+				for _, r := range logged {
+					seen, err := m.DB.Query(ctx, `SELECT 1 FROM mutation_seen WHERE origin = ? AND hlc = ?`, n.Name, r.String("hlc"))
+					if err != nil {
+						lastErr = err
+						return false
+					}
+					if len(seen) == 0 {
+						return false
+					}
+				}
+			}
+		}
+		return true
+	})
+}
+
 // concurrentStateAndVersion has a write the coordinator owns (a's drain of
 // subject) and one the subject's daemon owns (b's version report) cross on the
 // wire: every link is down while both are made, b's strictly later, and then
@@ -86,6 +127,11 @@ func concurrentStateAndVersion(t *testing.T, split bool) map[string][2]string {
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 267})
 	a, b, subject := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	c.WaitConverged(t, convergeTimeout)
+	// Agreeing digests do not mean every node's registration has arrived: a
+	// losing one still on the wire is absorbed by a node that latched before
+	// it, at the entry's time, and that row stays apart (see
+	// AStaleDualWrittenStateNeverComesBack).
+	waitEveryWriteApplied(t, c)
 	if split {
 		for _, n := range c.Nodes {
 			splitMembership(t, n)
@@ -107,11 +153,19 @@ func concurrentStateAndVersion(t *testing.T, split bool) map[string][2]string {
 	c.ClearLinkFaults()
 
 	if split {
+		// The version report travels slower than the drain, as it may under
+		// load: host_membership agrees before hosts has the report.
+		c.SetLinkFault(b, a, LinkFault{Delay: time.Second})
+		c.SetLinkFault(b, subject, LinkFault{Delay: time.Second})
 		// hosts itself still diverges: its state column is the previous
 		// release's copy, dual-written for a rolled-back reader, and it keeps
 		// the previous release's shared clock and the #267 loss with it. The
 		// membership copy is the one that must converge.
 		c.WaitConvergedExcept(t, convergeTimeout, []string{"hosts"})
+		// That wait says nothing about hosts, and the version report is a
+		// hosts-only write: host_membership can agree while it is still on
+		// the wire. Read only once it has been applied everywhere.
+		waitEveryWriteApplied(t, c)
 	} else {
 		// Without the split the replicas never converge — that is the bug — so
 		// wait for both writes to have been delivered everywhere instead: the
@@ -395,13 +449,16 @@ func TestFleet_HostMembership_AStaleDualWrittenStateNeverComesBack(t *testing.T)
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2673})
 	a, b, r := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	// Every node's hosts rows must have arrived before the latch. The harness
-	// registers each host on every node with a hosts-only INSERT. One that
-	// reaches a node before that node holds ANY membership row for the host is
-	// not absorbed there, and when a peer's older copy arrives afterwards the
-	// two nodes' rows differ in updated_at until anti-entropy, which this
-	// harness does not run on a timer (host_membership.go names the gap). The
-	// state is the same on both; only the digest differs.
+	// registers each host on every node with a hosts-only INSERT, and the
+	// digests agree as soon as every node holds the WINNING copy of each row;
+	// a losing copy can still be on the wire. A node that latched before it
+	// arrives absorbs it into host_membership at the entry's own time, while a
+	// node that latched after it holds the split pass's floor copy. The state
+	// is the same on both, the updated_at is not, and only anti-entropy, which
+	// this harness does not run on a timer, reconciles them (host_membership.go
+	// names the gap). So wait for delivery, not for agreement.
 	c.WaitConverged(t, convergeTimeout)
+	waitEveryWriteApplied(t, c)
 	for _, n := range c.Nodes {
 		splitMembership(t, n)
 	}

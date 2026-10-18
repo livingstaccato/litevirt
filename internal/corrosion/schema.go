@@ -551,14 +551,11 @@ import (
 //	     anti-entropy rows from this build (unknown column) and still applies
 //	     its WAL entries. Existing rows migrate with no retirement, so a
 //	     tombstone from before the upgrade still beats a password set after
-//	     it (docs/migration-failover.md). Additive. The number is
-//	     schemaVersionCredentialRetirement's, and may be renumbered when this
-//	     merges after other schema bumps.
-const CurrentSchemaVersion = schemaVersionCredentialRetirement
+//	     it (docs/migration-failover.md). Additive.
+const CurrentSchemaVersion = 68
 
 // schemaVersionCredentialRetirement is the version
-// host_fence_credentials.after_retirement was added in. The one place to
-// renumber it.
+// host_fence_credentials.after_retirement was added in.
 const schemaVersionCredentialRetirement = 68
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the

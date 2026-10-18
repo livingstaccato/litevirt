@@ -1690,6 +1690,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// dnsmasq's host reservations in step with the NICs guarded on its
 	// networks.
 	go svc.SeedFirewallEnforcementLoop(ctx, 0, filepath.Join(d.cfg.DataDir, firewallInitialModeName))
+	go svc.SeedFirewallSynfloodLoop(ctx, 0, filepath.Join(d.cfg.DataDir, firewallSynfloodDecisionName))
 	svc.StartDHCPReservations(ctx, 0)
 
 	// Converge this host's network devices on the replicated networks table
@@ -3025,6 +3026,11 @@ const genesisMarkerName = "genesis-pending"
 // (grpcapi.SeedFirewallEnforcementLoop).
 const firewallInitialModeName = "firewall-initial-mode"
 
+// firewallSynfloodDecisionName is the founder's genesis decision to protect
+// guest NICs from SYN floods, in data_dir, consumed once recorded
+// (grpcapi.SeedFirewallSynfloodLoop).
+const firewallSynfloodDecisionName = "firewall-synflood-decision"
+
 // wireActivationMarker points the health checker at this node's durable
 // capability latches (health.ActivationMarkerBase), loading any already there.
 // They are written only after a daemon has run as a member and survive a
@@ -3160,6 +3166,13 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 	if err := os.WriteFile(filepath.Join(d.cfg.DataDir, firewallInitialModeName),
 		[]byte(corrosion.FirewallEnforce+"\n"), 0o600); err != nil {
 		slog.Warn("could not record the new cluster's initial firewall mode; it observes until `lv firewall enforce on`",
+			"error", err)
+	}
+	// And that it protects guest NICs from SYN floods (spec §1.4): its own
+	// decision, recorded by its own loop once the release latch forms.
+	if err := os.WriteFile(filepath.Join(d.cfg.DataDir, firewallSynfloodDecisionName),
+		[]byte(corrosion.SynfloodOn+"\n"), 0o600); err != nil {
+		slog.Warn("could not record the new cluster's SYN-flood protection; it stays off until `lv firewall synflood on`",
 			"error", err)
 	}
 

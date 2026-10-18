@@ -310,3 +310,72 @@ func TestFirewallSynflood_HostNamedClusterHasItsOwnRow(t *testing.T) {
 		t.Errorf("cluster row = %+v recorded %v, %v; want on, set by alice, stamped", p, recorded, err)
 	}
 }
+
+// The founder's SYN-flood seed (spec §1.4): on at the defaults, stamped
+// seedTS, set by "litevirt (initial)"; written only with the grant, while no
+// cluster row is recorded, and from a replica that has caught up or is the
+// cluster's only host.
+//
+// Mutations: drop the caught-up guard — the stale replica seeds: red; drop
+// the recorded check — an operator row is overwritten: red.
+func TestSeedFirewallSynflood_Guards(t *testing.T) {
+	ctx := context.Background()
+	if _, err := SeedFirewallSynflood(ctx, testClient(t), capabilities.FeatureGrant{}, "h1"); !errors.Is(err, capabilities.ErrNoFeatureGrant) {
+		t.Errorf("no grant: %v, want ErrNoFeatureGrant", err)
+	}
+
+	stale := testClient(t)
+	openClusterPolicyGate(stale)
+	for _, h := range []string{"h1", "h2"} {
+		if err := InsertHost(ctx, stale, HostRecord{Name: h, Address: "10.0.0.1", State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if wrote, err := SeedFirewallSynflood(ctx, stale, synfloodGrant(t), "h1"); err != nil || wrote {
+		t.Errorf("a replica that has not caught up with a cluster of two seeded (%v, %v)", wrote, err)
+	}
+
+	sole := testClient(t)
+	openClusterPolicyGate(sole)
+	if err := InsertHost(ctx, sole, HostRecord{Name: "h1", Address: "10.0.0.1", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if wrote, err := SeedFirewallSynflood(ctx, sole, synfloodGrant(t), "h1"); err != nil || !wrote {
+		t.Fatalf("sole host: %v, %v; want a seed", wrote, err)
+	}
+	p, recorded, err := GetFirewallSynflood(ctx, sole, "")
+	if err != nil || !recorded || !p.On() || p.Rate != SynfloodDefaultRate || p.Burst != SynfloodDefaultBurst ||
+		p.UpdatedAt != seedTS(FirewallEnforce) || p.SetBy != "litevirt (initial)" {
+		t.Errorf("seed = %+v (recorded %v, %v)", p, recorded, err)
+	}
+	if wrote, err := SeedFirewallSynflood(ctx, sole, synfloodGrant(t), "h1"); err != nil || wrote {
+		t.Errorf("a second seed over a recorded row: %v, %v", wrote, err)
+	}
+
+	closed := testClient(t)
+	if wrote, err := SeedFirewallSynflood(ctx, closed, synfloodGrant(t), "h1"); err != nil || wrote {
+		t.Errorf("gate closed: %v, %v; want nothing", wrote, err)
+	}
+}
+
+// An operator's `lv firewall synflood off`, written anywhere at any time,
+// outranks the seed on every replica: the seed is stamped before any real
+// write could be.
+//
+// Mutation: stamp the seed NowTS — red.
+func TestSeedFirewallSynflood_AnyOperatorWriteWins(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	openClusterPolicyGate(c)
+	earlier := c.NowTS() // an operator's off on another host, before the seed
+	if wrote, err := SeedFirewallSynflood(ctx, c, synfloodGrant(t), ""); err != nil || !wrote {
+		t.Fatalf("seed: %v, %v", wrote, err)
+	}
+	p, _, err := GetFirewallSynflood(ctx, c, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lwwOrder(p.UpdatedAt, earlier) >= 0 {
+		t.Errorf("the seed (%s) outranks an operator write made before it (%s)", p.UpdatedAt, earlier)
+	}
+}

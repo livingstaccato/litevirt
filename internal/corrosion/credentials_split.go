@@ -217,9 +217,10 @@ type CredentialSplitReport struct {
 // sensitive-lane merge with a peer (SensitiveLaneMerged), or holds no other
 // host at all (a cluster of one, where no peer holds a row to pull). Until
 // then the old column stays as it is, and readers still serve it (READ RULE).
-// Receivers also refuse an unpaired revive of a tombstone on the WAL lane
-// (credentials_revive_guard.go), which is the only defence against a previous
-// build's pass during a rolling upgrade.
+// Every node also orders host credential rows by the retirement they were
+// set after (credentials_revive_guard.go), so a copy without that evidence —
+// this pass's, or a previous build's during a rolling upgrade — never beats a
+// tombstone on any lane.
 const (
 	hostCredentialSplitScanSQL = `SELECT h.name AS pk, h.ipmi_pass AS old_val, h.updated_at AS src_ts,
 		       c.host_name AS cred_key, c.ipmi_pass AS cred_val, c.updated_at AS cred_ts,

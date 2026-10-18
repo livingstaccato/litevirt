@@ -951,13 +951,26 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 			skipped++
 			continue
 		}
-		// A live host credential row never revives one retired here
-		// (credentials_revive_guard.go).
-		if keep, kerr := mergeKeepsRetiredCredential(tx, table, row); kerr != nil {
+		// A fence credential row is ordered by the retirement it was set after
+		// before its clock (credentials_revive_guard.go).
+		switch order, oerr := mergeCredentialOrder(tx, table, row); {
+		case oerr != nil:
 			_ = tx.Rollback()
-			return merged, skipped, kerr
-		} else if keep {
+			return merged, skipped, oerr
+		case order == credentialMergeKeepLocal:
 			skipped++
+			continue
+		case order == credentialMergeApply:
+			rejected, execErr := c.applyMergeRow(tx, insertSQL, row, table.Name)
+			if execErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, execErr
+			}
+			if rejected {
+				skipped++
+			} else {
+				merged++
+			}
 			continue
 		}
 		// Workload create commits carry child rows whose schemas predate owner

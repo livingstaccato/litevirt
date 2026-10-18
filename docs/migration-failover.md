@@ -677,11 +677,14 @@ fence of that host fails at once with `no IPMI password` and sends nothing to
 the BMC. A password that was never set is sent empty, for a BMC user with no
 password, and the fence result says so.
 
-A host re-added while it still runs a build older than this one can write its
-old IPMI password back. Nodes on this build keep the credential retired
-whichever way that write reaches them, and a node that missed a later
-`lv host config --ipmi-pass` keeps it retired too. Run
-`lv host config <host> --ipmi-pass` again once every node runs this build.
+A password set with `lv host config <host> --ipmi-pass` after the removal or
+re-admission reaches every node, by replication or by anti-entropy. A copy of
+the old password, from any node, never replaces the retired one. During a
+rolling upgrade, a node still on the previous build records no retirement with
+the passwords it writes: a password written there after the host was removed
+or re-admitted loses to the retirement on this build's nodes, so set it again
+once the roll completes. Passwords it writes for hosts that were never retired
+replicate as before.
 
 ### Redfish
 

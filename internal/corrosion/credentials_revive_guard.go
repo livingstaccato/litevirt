@@ -5,72 +5,186 @@ import (
 	"database/sql"
 	"log/slog"
 	"strings"
+	"sync"
+	"time"
 )
 
-// Refusing an unpaired revive of a retired host credential.
+// Retirement evidence on host_fence_credentials.
 //
 // A host's credential row is retired (a tombstone) by its removal or
-// re-admission (host_readmit.go). Only an operator legitimately brings it back:
-// `lv host config --ipmi-pass` (or --clear-ipmi), whose entry always carries
-// the hosts write of the password beside the credential upsert. The split
-// passes write the upsert alone, or beside the old-column clear, and on a
-// stale node they write the OLD machine's password, stamped with a hosts row
-// newer than the tombstone, so it would win LWW everywhere.
+// re-admission (host_readmit.go), at the admission's own instant T. Only an
+// operator legitimately sets a password for the host after that: `lv host
+// config --ipmi-pass` (or --clear-ipmi), whose entry always carries the hosts
+// write of the password beside the credential upsert. Every other writer of a
+// live row — the split passes, and a previous build's split passes mid-roll —
+// writes the upsert alone (or beside the empty old-column clear), and on a
+// stale node it writes the OLD machine's password under a clock newer than T.
 //
-// This build's passes never revive a tombstone (credentials_split.go), but a
-// node still on the previous build does, mid-roll, and its writer cannot be
-// fixed. So, as with the unlatched-origin absorbs, the entry decides: a
-// credential upsert over a LOCAL tombstone whose entry carries no other hosts
-// write of that host's password is not applied here. It is checked on the WAL
-// apply path and on the local write path alike, and every node on this build
-// keeps the same tombstone.
+// So each row carries the retirement it is ordered after: a tombstone's is its
+// own deleted_at, and a live row's is after_retirement — the retirement this
+// node held when the operator's write set it, '' when none. Rows are ordered
+// by (retirement, updated_at), retirement first. The order is total, so the
+// result does not depend on which row a node saw first, on the WAL lane or in
+// anti-entropy:
 //
-// THE SENSITIVE LANE. The origin of such a revive holds the live row itself,
-// and anti-entropy would carry it to every node as a ROW, newer than the
-// tombstone, with no entry to judge. A row cannot say whether an operator
-// wrote it, so a row merge never turns a retired host credential live
-// (mergeKeepsRetiredCredential). The operator's write still reaches every node
-// by its entry. What a row merge cannot deliver is an operator revive that a
-// node missed on the WAL lane altogether; that node keeps the credential
-// retired, fences that host with "no IPMI password" until the password is set
-// again, and its digest for host_fence_credentials differs from its peers'
-// until then. That is the fail-closed side, chosen over letting any previous
-// build's stale copy back in.
+//   - a live row set by an operator after T carries T, and beats the
+//     tombstone by its newer updated_at;
+//   - a live row with no evidence — a split-pass copy, a previous build's
+//     revive, a write from before T — never beats the tombstone, however new
+//     its clock;
+//   - a later retirement beats every row set before it.
+//
+// THE EVIDENCE IS DERIVED, never sent. A credential upsert's wire shape does
+// not change: on the WAL apply path and the local write path, an upsert whose
+// entry also writes that host's password in hosts (an operator's write) takes
+// the retirement of the row it lands on; any other upsert carries none
+// (planCredentialUpsert). Rows carry the column to anti-entropy, where the
+// order decides (mergeCredentialOrder). A previous-release row has no column:
+// a tombstone's retirement is still its deleted_at, and a live row's is ''.
+//
+// The cost, stated in docs/migration-failover.md: a password a previous build
+// writes after a retirement loses to the tombstone, and to any password this
+// build set after it, until it is written again on this build.
 
 var (
 	hostCredentialUpsertFingerprint = mustStatementFingerprint(HostFenceCredentialUpsertSQL)
 	hostsClearIPMIPassFingerprint   = mustStatementFingerprint(hostsClearIPMIPassSQL)
 )
 
-// refuseUnpairedCredentialRevive reports whether s is a host credential upsert
-// that would turn this node's retired row live without an operator's password
-// write in the same entry.
-func refuseUnpairedCredentialRevive(ctx context.Context, tx *sql.Tx, s Statement, entry []Statement) (bool, error) {
-	if !strings.Contains(s.SQL, "host_fence_credentials") {
-		return false, nil
+// credentialOrder is a host_fence_credentials row's place in the order.
+type credentialOrder struct {
+	retirement, updatedAt string
+}
+
+// cmpEvidence orders two retirements; the empty one (none) is the lowest.
+func cmpEvidence(a, b string) int {
+	switch {
+	case a == b:
+		return 0
+	case a == "":
+		return -1
+	case b == "":
+		return 1
 	}
-	if fp, err := FingerprintSQL(s.SQL); err != nil || fp != hostCredentialUpsertFingerprint {
-		return false, nil
+	return lwwOrder(a, b)
+}
+
+// cmp orders o against p: retirement first, then updated_at.
+func (o credentialOrder) cmp(p credentialOrder) int {
+	if c := cmpEvidence(o.retirement, p.retirement); c != 0 {
+		return c
 	}
-	host, ok := paramString(s.Params, 0)
-	if !ok || host == "" || entryWritesHostPassword(entry, host) {
-		return false, nil
+	return lwwOrder(o.updatedAt, p.updatedAt)
+}
+
+// rowRetirement is a row's retirement: a tombstone's own deleted_at, a live
+// row's after_retirement.
+func rowRetirement(deletedAt, afterRetirement string) string {
+	if deletedAt != "" {
+		return deletedAt
 	}
+	return afterRetirement
+}
+
+// localCredential is this node's row for host, if any.
+type localCredential struct {
+	exists           bool
+	pass, deletedAt  string
+	updatedAt, after string
+}
+
+func (l localCredential) order() credentialOrder {
+	return credentialOrder{retirement: rowRetirement(l.deletedAt, l.after), updatedAt: l.updatedAt}
+}
+
+func readLocalCredential(ctx context.Context, tx *sql.Tx, host string) (localCredential, error) {
+	var pass, updated, after string
 	var deleted sql.NullString
 	err := tx.QueryRowContext(ctx,
-		`SELECT deleted_at FROM host_fence_credentials WHERE host_name = ?`, host).Scan(&deleted)
+		`SELECT ipmi_pass, updated_at, deleted_at, after_retirement FROM host_fence_credentials WHERE host_name = ?`,
+		host).Scan(&pass, &updated, &deleted, &after)
 	switch {
 	case err == sql.ErrNoRows:
-		return false, nil
+		return localCredential{}, nil
 	case err != nil:
-		return false, err
+		return localCredential{}, err
 	}
-	if !deleted.Valid || deleted.String == "" {
-		return false, nil
+	return localCredential{exists: true, pass: pass, deletedAt: deleted.String, updatedAt: updated, after: after}, nil
+}
+
+// credentialUpsertPlan is what one statement does to host_fence_credentials.
+type credentialUpsertPlan struct {
+	skip  bool   // not applied here
+	stamp bool   // applied: set after_retirement to evidence if it landed
+	host  string // the row
+	pass  string // the statement's password and updated_at, to tell
+	ts    string // whether what landed is this statement's
+	// evidence is the retirement the row carries if it lands.
+	evidence string
+}
+
+// planCredentialUpsert decides a HostFenceCredentialUpsertSQL statement on
+// this node, on the WAL apply path and the local write path alike.
+//
+//   - An operator's write (its entry writes the host's password in hosts)
+//     takes the retirement of the row it lands on, and is then ordered by its
+//     clock as any write is.
+//   - Any other upsert carries no retirement, so it is not applied over a row
+//     that carries one, unless it is that row's own re-emission (same password
+//     and clock: the clear pass hands its row to its stream ahead of the
+//     clear).
+func planCredentialUpsert(ctx context.Context, tx *sql.Tx, s Statement, entry []Statement) (credentialUpsertPlan, error) {
+	if !strings.Contains(s.SQL, "host_fence_credentials") {
+		return credentialUpsertPlan{}, nil
 	}
-	slog.Warn("not reviving a retired fence credential from an entry with no operator password write",
-		"host", host)
-	return true, nil
+	if fp, err := FingerprintSQL(s.SQL); err != nil || fp != hostCredentialUpsertFingerprint {
+		return credentialUpsertPlan{}, nil
+	}
+	host, hok := paramString(s.Params, 0)
+	pass, pok := paramString(s.Params, 1)
+	ts, tok := paramString(s.Params, 2)
+	if !hok || !pok || !tok || host == "" {
+		return credentialUpsertPlan{}, nil
+	}
+	local, err := readLocalCredential(ctx, tx, host)
+	if err != nil {
+		return credentialUpsertPlan{}, err
+	}
+	plan := credentialUpsertPlan{stamp: true, host: host, pass: pass, ts: ts}
+	if !local.exists {
+		return plan, nil
+	}
+	held := local.order().retirement
+	if entryWritesHostPassword(entry, host) {
+		plan.evidence = held
+		return plan, nil
+	}
+	if held == "" {
+		return plan, nil
+	}
+	if local.deletedAt == "" && local.pass == pass && local.updatedAt == ts {
+		return credentialUpsertPlan{}, nil // its own re-emission: a no-op here
+	}
+	noteRetiredCredentialKept(host, "an entry with no operator password write")
+	return credentialUpsertPlan{skip: true}, nil
+}
+
+// apply records the plan's evidence on the row its statement landed.
+func (p credentialUpsertPlan) apply(ctx context.Context, tx *sql.Tx) error {
+	if !p.stamp {
+		return nil
+	}
+	return stampCredentialEvidence(ctx, tx, p.host, p.pass, p.ts, p.evidence)
+}
+
+// stampCredentialEvidence sets after_retirement on host's row if it is live
+// and holds pass at updatedAt — the write that just landed, not a newer one.
+// Local and never logged, like every derivation of the evidence.
+func stampCredentialEvidence(ctx context.Context, tx *sql.Tx, host, pass, updatedAt, evidence string) error {
+	_, err := tx.ExecContext(ctx, `UPDATE host_fence_credentials SET after_retirement = ?
+		WHERE host_name = ? AND deleted_at IS NULL AND ipmi_pass = ? AND updated_at = ?`,
+		evidence, host, pass, updatedAt)
+	return err
 }
 
 // entryWritesHostPassword reports whether the entry sets host's password in
@@ -92,31 +206,58 @@ func entryWritesHostPassword(entry []Statement, host string) bool {
 	return false
 }
 
-// mergeKeepsRetiredCredential reports whether an anti-entropy row for
-// host_fence_credentials would turn a credential retired on this node live.
-// It is refused whatever its updated_at: see THE SENSITIVE LANE above. A
-// retired incoming row, or one for a host with no local row or a live one,
-// merges as usual.
-func mergeKeepsRetiredCredential(tx *sql.Tx, table syncTable, row []interface{}) (bool, error) {
+// Anti-entropy decisions for one incoming host_fence_credentials row.
+const (
+	credentialMergeDefault   = iota // same retirement: the ordinary LWW merge
+	credentialMergeKeepLocal        // the local row is later in the order
+	credentialMergeApply            // the incoming row is later in the order
+)
+
+// mergeCredentialOrder orders an incoming anti-entropy row against the local
+// one when their retirements differ. With the same retirement the ordinary
+// merge (LWW and its tie chain) decides, as for any table.
+func mergeCredentialOrder(tx *sql.Tx, table syncTable, row []interface{}) (int, error) {
 	if table.Name != "host_fence_credentials" {
-		return false, nil
+		return credentialMergeDefault, nil
 	}
-	hi, di := indexOf(table.Columns, "host_name"), indexOf(table.Columns, "deleted_at")
-	if hi < 0 || di < 0 || hi >= len(row) || di >= len(row) || coerceString(row[di]) != "" {
-		return false, nil
+	idx := columnIndexMap(table.Columns)
+	host := cellStr(row, idx, "host_name")
+	if host == "" {
+		return credentialMergeDefault, nil
 	}
-	host := coerceString(row[hi])
-	var deleted sql.NullString
-	err := tx.QueryRow(`SELECT deleted_at FROM host_fence_credentials WHERE host_name = ?`, host).Scan(&deleted)
-	switch {
-	case err == sql.ErrNoRows:
-		return false, nil
-	case err != nil:
-		return false, err
+	local, err := readLocalCredential(context.Background(), tx, host)
+	if err != nil || !local.exists {
+		return credentialMergeDefault, err
 	}
-	if !deleted.Valid || deleted.String == "" {
-		return false, nil
+	in := rowRetirement(cellStr(row, idx, "deleted_at"), cellStr(row, idx, "after_retirement"))
+	switch cmpEvidence(in, local.order().retirement) {
+	case 1:
+		return credentialMergeApply, nil
+	case -1:
+		noteRetiredCredentialKept(host, "a peer's row set before this node's retirement")
+		return credentialMergeKeepLocal, nil
 	}
-	slog.Warn("anti-entropy: not reviving a retired fence credential from a peer's row", "host", host)
-	return true, nil
+	return credentialMergeDefault, nil
+}
+
+// noteRetiredCredentialKept logs, at most once per host per interval, that a
+// write lost to a retirement it was not set after.
+func noteRetiredCredentialKept(host, what string) {
+	retiredKeptLog.mu.Lock()
+	defer retiredKeptLog.mu.Unlock()
+	now := time.Now()
+	if at, ok := retiredKeptLog.at[host]; ok && now.Sub(at) < driftRepeatInterval {
+		return
+	}
+	if retiredKeptLog.at == nil {
+		retiredKeptLog.at = map[string]time.Time{}
+	}
+	retiredKeptLog.at[host] = now
+	slog.Warn("a fence credential write lost to a retirement it was not set after; keeping the retired row",
+		"host", host, "from", what)
+}
+
+var retiredKeptLog struct {
+	mu sync.Mutex
+	at map[string]time.Time
 }

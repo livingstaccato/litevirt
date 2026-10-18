@@ -540,7 +540,24 @@ import (
 //	     SSH, so nothing writes it, or a 'redfish' fence strategy, without the
 //	     release feature redfish_fence (release_2026_11_v1, ReplicationGated).
 //	     One new table.
-const CurrentSchemaVersion = 67
+//	v68: host_fence_credentials.after_retirement (TEXT NOT NULL DEFAULT '')
+//	     — the retirement a live fence credential was set after
+//	     (credentials_retirement.go). A tombstone's own retirement is its
+//	     deleted_at. Rows are ordered by (retirement, updated_at), so a live
+//	     row that carries no retirement, written by a previous build or by a
+//	     stale copy, never beats a tombstone. Derived on each node from the
+//	     entry and never written by a replicated statement, so no statement
+//	     shape changes; a previous-release node refuses this table's
+//	     anti-entropy rows from this build (unknown column) and still applies
+//	     its WAL entries. Additive. The number is
+//	     schemaVersionCredentialRetirement's, and may be renumbered when this
+//	     merges after other schema bumps.
+const CurrentSchemaVersion = schemaVersionCredentialRetirement
+
+// schemaVersionCredentialRetirement is the version
+// host_fence_credentials.after_retirement was added in. The one place to
+// renumber it.
+const schemaVersionCredentialRetirement = 68
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -2789,7 +2806,8 @@ var schemaDDL = []string{
 		host_name  TEXT PRIMARY KEY,
 		ipmi_pass  TEXT NOT NULL DEFAULT '',
 		updated_at TEXT NOT NULL,
-		deleted_at TEXT
+		deleted_at TEXT,
+		after_retirement TEXT NOT NULL DEFAULT ''
 	)`,
 	`CREATE TABLE IF NOT EXISTS user_credentials (
 		username      TEXT PRIMARY KEY,
@@ -3470,6 +3488,9 @@ var schemaMigrations = []string{
 	// field: '' reads as "no certificate", which a destination enforcing
 	// recovery_claim_v1 refuses.
 	`ALTER TABLE runtime_action_proofs ADD COLUMN claim_certificate TEXT NOT NULL DEFAULT ''`,
+	// The retirement a live fence credential was set after (see History,
+	// schemaVersionCredentialRetirement).
+	`ALTER TABLE host_fence_credentials ADD COLUMN after_retirement TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -3558,10 +3579,11 @@ var alterVersions = []int{
 	45, 45, 45, // audit_log.key_id/signature/seq
 	49, 49, // hosts.isolation_epoch/isolation_reason
 	51, 51, // ip_allocations.netbox_ip_id/netbox_prefix_id
-	51, // netbox_bindings.netbox_cluster
-	53, // runtime_action_proofs.lease_term
-	54, // runtime_action_proofs.lease_key
-	60, // runtime_action_proofs.claim_certificate
+	51,                                // netbox_bindings.netbox_cluster
+	53,                                // runtime_action_proofs.lease_term
+	54,                                // runtime_action_proofs.lease_key
+	60,                                // runtime_action_proofs.claim_certificate
+	schemaVersionCredentialRetirement, // host_fence_credentials.after_retirement
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

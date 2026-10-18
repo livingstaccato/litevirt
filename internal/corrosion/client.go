@@ -1455,11 +1455,12 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 		relay := make([]Statement, 0, len(stmts))
 		for _, s := range stmts {
 			// See executeBatchInternal (credentials_revive_guard.go).
-			if refuse, err := refuseUnpairedCredentialRevive(ctx, tx, s, stmts); err != nil {
+			credPlan, err := planCredentialUpsert(ctx, tx, s, stmts)
+			if err != nil {
 				tx.Rollback()
 				c.mu.Unlock()
 				return false, err
-			} else if refuse {
+			} else if credPlan.skip {
 				continue
 			}
 			if s.Guard != nil {
@@ -1487,6 +1488,11 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 				tx.Rollback()
 				c.mu.Unlock()
 				return false, invalidf("guarded workload transition matched authority but changed no row")
+			}
+			if err := credPlan.apply(ctx, tx); err != nil {
+				tx.Rollback()
+				c.mu.Unlock()
+				return false, err
 			}
 			changed := false
 			if n, e := res.RowsAffected(); e == nil && n > 0 {
@@ -1651,13 +1657,14 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	var parks []func()      // updates that met no row because it has not arrived yet
 	relay := make([]Statement, 0, len(stmts))
 	for _, s := range stmts {
-		// Never revive a retired host credential without an operator's
-		// password write (credentials_revive_guard.go).
-		if refuse, err := refuseUnpairedCredentialRevive(ctx, tx, s, stmts); err != nil {
+		// A fence credential carries the retirement it was set after
+		// (credentials_revive_guard.go).
+		credPlan, err := planCredentialUpsert(ctx, tx, s, stmts)
+		if err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
 			return 0, err
-		} else if refuse {
+		} else if credPlan.skip {
 			continue
 		}
 		// A live-row update runs here through the same guarded form every
@@ -1667,6 +1674,11 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 			tx.Rollback()
 			c.mu.Unlock()
 			return 0, fmt.Errorf("exec batch: %w", err)
+		}
+		if err := credPlan.apply(ctx, tx); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return 0, err
 		}
 		changed := false
 		if n, e := res.RowsAffected(); e == nil {

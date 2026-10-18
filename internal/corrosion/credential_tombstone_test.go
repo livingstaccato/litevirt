@@ -149,7 +149,7 @@ func TestSplitCredentials_ClearPassDoesNotReviveARetiredCredential(t *testing.T)
 		t.Errorf("clear pass report %+v, want Copied 0 Cleared 1", rep)
 	}
 	if got := readHostSettings(t, c); got.ipmiPass != "''" {
-		t.Errorf("hosts.ipmi_pass = %s after the clear pass, want ''", got.ipmiPass)
+		t.Errorf("hosts.ipmi_pass = %s after the clear pass, want empty", redactedPass(got.ipmiPass))
 	}
 }
 
@@ -380,5 +380,147 @@ func TestSplitCredentials_OneEmptyPeerDoesNotOpenTheHostCopy(t *testing.T) {
 	}
 	if !c.CredentialsLive() {
 		t.Error("a complete pass did not make this node live")
+	}
+}
+
+// ── Round 3: retirement evidence (credentials_revive_guard.go) ──────────────
+
+// credRow is one host_fence_credentials row as anti-entropy carries it.
+// withEvidence false leaves the after_retirement column out, as a previous
+// build's dump does.
+type credRow struct {
+	pass, updatedAt, deletedAt, after string
+	withEvidence                      bool
+}
+
+func (r credRow) table() syncTable {
+	var del interface{}
+	if r.deletedAt != "" {
+		del = r.deletedAt
+	}
+	if !r.withEvidence {
+		return syncTable{Name: "host_fence_credentials",
+			Columns: []string{"host_name", "ipmi_pass", "updated_at", "deleted_at"},
+			Rows:    [][]interface{}{{"host-x", r.pass, r.updatedAt, del}}}
+	}
+	return syncTable{Name: "host_fence_credentials",
+		Columns: []string{"host_name", "ipmi_pass", "updated_at", "deleted_at", "after_retirement"},
+		Rows:    [][]interface{}{{"host-x", r.pass, r.updatedAt, del, r.after}}}
+}
+
+func mergeCredRows(t *testing.T, rows ...credRow) (pass string, live bool) {
+	t.Helper()
+	c := newTestDB(t)
+	for _, r := range rows {
+		if err := c.MergeSensitiveStateBytesLWW(encodeSyncPayload(t, &syncPayload{Tables: []syncTable{r.table()}})); err != nil {
+			t.Fatalf("merge: %v", err)
+		}
+	}
+	return liveCredential(t, c)
+}
+
+const (
+	evRetired  = "2026-10-01T00:00:00.000001Z" // the retirement (T_a)
+	evStale    = "2026-10-02T00:00:00.000001Z" // a stale copy's clock (T_b)
+	evOperator = "2026-10-03T00:00:00.000001Z" // the operator's set (T_c)
+	evEarlier  = "2026-09-01T00:00:00.000001Z" // a retirement before T_a
+)
+
+// The anti-entropy merge of a host credential is the same whichever row a node
+// saw first: rows are ordered by the retirement they were set after, then by
+// their clock. Mutations: drop the order from the merge (plain LWW) — the
+// stale and previous-build cases go red; refuse every live row over a
+// tombstone (round 2) — the operator case goes red in one order.
+func TestCredentialMerge_TheOrderDoesNotDependOnArrival(t *testing.T) {
+	tomb := credRow{pass: "", updatedAt: evRetired, deletedAt: evRetired, withEvidence: true}
+	for _, tc := range []struct {
+		name     string
+		other    credRow
+		wantLive bool
+	}{
+		{"an operator's set after the retirement", credRow{pass: "New-Pass", updatedAt: evOperator, after: evRetired, withEvidence: true}, true},
+		{"a newer copy with no evidence", credRow{pass: staleOldPass, updatedAt: evStale, withEvidence: true}, false},
+		{"a previous build's row with no column", credRow{pass: staleOldPass, updatedAt: evStale}, false},
+		{"a set after an earlier retirement", credRow{pass: staleOldPass, updatedAt: evOperator, after: evEarlier, withEvidence: true}, false},
+		{"a previous build's tombstone", credRow{pass: "", updatedAt: evRetired, deletedAt: evRetired}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p1, live1 := mergeCredRows(t, tomb, tc.other)
+			p2, live2 := mergeCredRows(t, tc.other, tomb)
+			if live1 != live2 || p1 != p2 {
+				t.Errorf("the merge depends on arrival: tombstone first -> live %v %s; other first -> live %v %s",
+					live1, redactedPass(p1), live2, redactedPass(p2))
+			}
+			if live1 != tc.wantLive {
+				t.Errorf("merged row live %v, want %v", live1, tc.wantLive)
+			}
+		})
+	}
+}
+
+// Review m-11: the order touches only host_fence_credentials, and inside it
+// only rows whose retirements differ. Mutations: apply the order to every
+// table, or keep the local row whenever retirements are equal — red.
+func TestCredentialMerge_TheOrderLeavesOrdinaryMergesAlone(t *testing.T) {
+	// Same retirement: plain LWW, either way.
+	older := credRow{pass: "Older", updatedAt: evStale, after: evRetired, withEvidence: true}
+	newer := credRow{pass: "Newer", updatedAt: evOperator, after: evRetired, withEvidence: true}
+	for _, order := range [][]credRow{{older, newer}, {newer, older}} {
+		if p, live := mergeCredRows(t, order...); !live || p != "Newer" {
+			t.Errorf("same retirement: got %s live %v, want the newer row", redactedPass(p), live)
+		}
+	}
+	// No local row: the incoming row lands.
+	if p, live := mergeCredRows(t, newer); !live || p != "Newer" {
+		t.Errorf("no local row: got %s live %v, want the incoming row", redactedPass(p), live)
+	}
+	// Another credential table is not ordered: a newer live user credential
+	// beats an older tombstone there by LWW.
+	c := newTestDB(t)
+	for _, row := range [][]interface{}{
+		{"alice", "", evRetired, evRetired},
+		{"alice", "$2a$10$x", evOperator, nil},
+	} {
+		if err := c.MergeSensitiveStateBytesLWW(encodeSyncPayload(t, &syncPayload{Tables: []syncTable{{
+			Name: "user_credentials", Columns: []string{"username", "password_hash", "updated_at", "deleted_at"},
+			Rows: [][]interface{}{row}}}})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := c.Query(context.Background(), `SELECT deleted_at FROM user_credentials WHERE username = 'alice'`)
+	if err != nil || len(rows) != 1 || rows[0].String("deleted_at") != "" {
+		t.Errorf("user_credentials: a newer live row did not beat an older tombstone by LWW (%d rows, %v)", len(rows), err)
+	}
+}
+
+// The operator's write, applied from a peer over a local tombstone, carries
+// that retirement; a peer that pulls it later orders it after the tombstone.
+// Mutation: an operator's write carries no evidence — red.
+func TestApply_AnOperatorWriteCarriesTheRetirement(t *testing.T) {
+	c := newTestDB(t)
+	staleDBAfterReadmission(t, c)
+	applyRemote(t, c, "2026000000003-0000-peer",
+		Statement{SQL: operatorConfigureHostSQL,
+			Params: []interface{}{"ipmi", nil, nil, "", nil, nil, nil, nil, nil, nil, nil, evOperator, "host-x"}},
+		Statement{SQL: HostFenceCredentialUpsertSQL, Params: []interface{}{"host-x", "New-Machine-Pass", evOperator}})
+	rows, err := c.Query(context.Background(), `SELECT after_retirement FROM host_fence_credentials WHERE host_name = 'host-x'`)
+	if err != nil || len(rows) != 1 || rows[0].String("after_retirement") != staleAdmission {
+		t.Fatalf("after_retirement = %v (%v); want the retirement it was set after, %s", rows, err, staleAdmission)
+	}
+}
+
+// A retirement reaching a node that already took a stale revive retires it,
+// however new the revive's clock: the revive carries no evidence. Mutation:
+// keep a live row newer than the retirement (the old rule) — red.
+func TestRetire_AStaleReviveFirstIsStillRetired(t *testing.T) {
+	c := newTestDB(t)
+	configuredHost(t, c)
+	if _, err := c.DB().Exec(HostFenceCredentialUpsertSQL, "host-x", staleOldPass, staleBoot); err != nil {
+		t.Fatal(err)
+	}
+	applyRemote(t, c, "2026000000000-0000-peer", Statement{SQL: readmitHostSQL, Params: []interface{}{
+		"10.0.0.15", "root", 22, 7443, HostStateJoining, "02new", staleAdmission, "host-x", "02new"}})
+	if pass, ok := liveCredential(t, c); ok {
+		t.Errorf("a revive with no evidence stood over the retirement (ipmi_pass %s)", redactedPass(pass))
 	}
 }

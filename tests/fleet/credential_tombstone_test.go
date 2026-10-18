@@ -7,6 +7,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -243,31 +244,34 @@ func TestFleet_AJoinerWithoutTheTombstoneDoesNotRevive(t *testing.T) {
 	assertRetiredEverywhere(t, c.Nodes, d)
 }
 
-// TestFleet_APreviousBuildsReviveIsRefused (review I-1(b)): d runs the
-// previous build, whose split pass reads the tombstone as "no row" and copies
-// the old column back: its own row goes live, and it logs the credential upsert
-// alone, stamped with its stale hosts row's newer updated_at. Every receiver
-// on this build must keep its tombstone. That build's writer cannot be fixed;
-// the entry, which carries no operator password write, is what is refused.
+// TestFleet_APreviousBuildsReviveIsRefused (review I-1(b), re-review 2 I-3
+// sequence C): d runs the previous build, whose split pass reads the
+// tombstone as "no row" and copies the old column back: its own row goes live
+// with no retirement evidence (that build has no column), and it logs the
+// credential upsert alone, stamped with its stale hosts row's newer
+// updated_at.
 //
-// Then anti-entropy runs: d still holds the live row, newer than the
-// tombstone, and every survivor's sensitive pull from d finds it. A row
-// carries no entry to judge, so no row merge turns a retired credential live.
+// The WAL lane: every survivor keeps its tombstone. The sensitive lane: a
+// joiner whose first pull is from d takes d's live row, and its next pull
+// from a survivor retires it, since a row with no evidence never beats the
+// tombstone. Then anti-entropy runs everywhere, and every node, d included,
+// ends retired with equal digests.
 //
-// Mutations: remove the receiver's WAL revive guard — red at the WAL-lane
-// check; remove the anti-entropy merge guard — red after the pulls.
+// Mutations: an unpaired upsert takes the row's evidence — red at the WAL
+// check; the merge ignores the evidence (plain LWW) — red at the joiner and
+// after the pulls.
 func TestFleet_APreviousBuildsReviveIsRefused(t *testing.T) {
 	ctx := context.Background()
 	const oldPass = "Old-Machine-Pass-5104"
-	c, d := staleReaddedHost(t, 3, false, 5104, oldPass)
-	a := c.Nodes[0]
-	survivors := c.Nodes[:2]
+	c, d := staleReaddedHost(t, 4, false, 5104, oldPass)
+	a, j := c.Nodes[0], c.Nodes[2]
+	survivors := []*Node{c.Nodes[0], c.Nodes[1]}
 
 	// The previous build's pass on d: its own row revived in place, and the
 	// entry it logs.
 	stale := hostsRowOf(t, d, d.Name)["updated_at"]
-	if _, err := d.DB.DB().Exec(`UPDATE host_fence_credentials SET ipmi_pass = ?, deleted_at = NULL, updated_at = ?
-		WHERE host_name = ?`, oldPass, stale, d.Name); err != nil {
+	if _, err := d.DB.DB().Exec(`UPDATE host_fence_credentials SET ipmi_pass = ?, deleted_at = NULL, updated_at = ?,
+		after_retirement = '' WHERE host_name = ?`, oldPass, stale, d.Name); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.DB.Execute(ctx, corrosion.HostFenceCredentialUpsertSQL, d.Name, oldPass, stale); err != nil {
@@ -291,15 +295,138 @@ func TestFleet_APreviousBuildsReviveIsRefused(t *testing.T) {
 	})
 	assertRetiredEverywhere(t, survivors, d)
 
-	// The sensitive lane: every survivor pulls from d (and from each other)
-	// several times over.
-	for range 3 {
-		for _, n := range c.Nodes {
-			corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(ctx)
+	// A joiner with no credential row pulls from d first, then from a.
+	if _, err := j.DB.DB().Exec(`DELETE FROM host_fence_credentials WHERE host_name = ?`, d.Name); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.DB.MergeSensitiveStateBytesLWW(d.DB.DumpSensitiveStateBytes()); err != nil {
+		t.Fatal(err)
+	}
+	if fs := fenceSettingsOf(t, j, d.Name); !fs.hasCredRow {
+		t.Fatalf("fixture: %s did not take %s's live row from its first pull", j.Name, d.Name)
+	}
+	if err := j.DB.MergeSensitiveStateBytesLWW(a.DB.DumpSensitiveStateBytes()); err != nil {
+		t.Fatal(err)
+	}
+	assertRetiredEverywhere(t, []*Node{j}, d)
+
+	convergeByAntiEntropy(t, c, 2*convergeTimeout)
+	assertRetiredEverywhere(t, c.Nodes, d)
+}
+
+// TestFleet_AMissedPasswordSetArrivesByAntiEntropy (re-review 2 I-3
+// sequences A and B): a host is re-admitted, so every node holds its
+// credential retired. Node n is cut off from every push, and the operator
+// sets the new machine's password on a. n never receives the entry; it
+// catches up by anti-entropy alone, and must end with the new password, every
+// digest equal. A joiner whose first pull is from n (still retired) and whose
+// next is from a ends with the new password too.
+//
+// Mutations: the operator's write carries no evidence — red, the tombstone
+// wins everywhere; the merge refuses every live row over a tombstone (round
+// 2) — red, n and the joiner stay retired.
+func TestFleet_AMissedPasswordSetArrivesByAntiEntropy(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 5, IndependentReplicas: true, FaultSeed: 5105})
+	a, b, n, j, d := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3], c.Nodes[4]
+	live := []*Node{a, b, n, j}
+	for _, x := range c.Nodes {
+		x.DB.SetCredentialsSplitGate(func() bool { return true })
+	}
+	c.WaitConverged(t, convergeTimeout)
+	const oldPass, newPass = "Old-Machine-Pass-5105", "New-Machine-Pass-5105"
+	if _, err := c.SelfClient(a).ConfigureHost(ctx, &pb.ConfigureHostRequest{
+		Name: d.Name, FenceStrategy: "ipmi", IpmiAddress: "10.77.1.15", IpmiUser: "probe", IpmiPass: oldPass,
+	}); err != nil {
+		t.Fatalf("configure IPMI on %s: %v", d.Name, err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+
+	// d goes for good; it is removed and its name admitted again.
+	c.Crash(d)
+	if err := corrosion.DeleteHost(ctx, a.DB, d.Name); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.AdmitHost(ctx, a.DB, corrosion.HostRecord{
+		Name: d.Name, Address: d.Address, SSHUser: "root", SSHPort: 22, GRPCPort: d.Port,
+		State: corrosion.HostStateJoining, CertSerial: "0a0b0c0d5105",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, convergeTimeout, "the re-admission on every live node", func() bool {
+		for _, x := range live {
+			h, err := corrosion.GetHost(ctx, x.DB, d.Name)
+			if err != nil || h == nil || h.CertSerial != "0a0b0c0d5105" || !h.IPMIPassRetired {
+				return false
+			}
+		}
+		return true
+	})
+
+	// n hears no push from anyone from now on.
+	for _, x := range live {
+		if x != n {
+			c.SetLinkFault(x, n, LinkFault{Drop: 1})
 		}
 	}
-	if fs := fenceSettingsOf(t, d, d.Name); !fs.hasCredRow {
-		t.Fatalf("fixture: %s no longer holds the previous build's live row; the pulls proved nothing", d.Name)
+	if _, err := c.SelfClient(a).ConfigureHost(ctx, &pb.ConfigureHostRequest{
+		Name: d.Name, FenceStrategy: "ipmi", IpmiAddress: "10.77.1.25", IpmiUser: "probe", IpmiPass: newPass,
+	}); err != nil {
+		t.Fatalf("set %s's new password: %v", d.Name, err)
 	}
-	assertRetiredEverywhere(t, survivors, d)
+	eventually(t, convergeTimeout, "the new password on a, b and j", func() bool {
+		for _, x := range []*Node{a, b, j} {
+			if fenceSettingsOf(t, x, d.Name).pass != newPass {
+				return false
+			}
+		}
+		return true
+	})
+	if h, _ := corrosion.GetHost(ctx, n.DB, d.Name); h == nil || !h.IPMIPassRetired {
+		t.Fatalf("fixture: %s received the new password by WAL", n.Name)
+	}
+
+	// Sequence B: j (as a joiner) pulls from n first, then from a.
+	if _, err := j.DB.DB().Exec(`DELETE FROM host_fence_credentials WHERE host_name = ?`, d.Name); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.DB.MergeSensitiveStateBytesLWW(n.DB.DumpSensitiveStateBytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.DB.MergeSensitiveStateBytesLWW(a.DB.DumpSensitiveStateBytes()); err != nil {
+		t.Fatal(err)
+	}
+	if fs := fenceSettingsOf(t, j, d.Name); fs.pass != newPass {
+		t.Errorf("the joiner that pulled from %s first reads %s's password as %s, want the new one",
+			n.Name, d.Name, redacted(fs.pass))
+	}
+
+	// Sequence A: anti-entropy only, every live node.
+	deadline := time.Now().Add(2 * convergeTimeout)
+	for {
+		for _, x := range live {
+			corrosion.NewAntiEntropy(x.DB, x.PKIDir, 0).RunOnce(ctx)
+		}
+		apart, err := divergence(live)
+		if err != nil {
+			t.Fatalf("divergence: %v", err)
+		}
+		if len(apart) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the live nodes did not converge by anti-entropy; tables still apart: %v", apart)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	for _, x := range live {
+		h, err := corrosion.GetHost(ctx, x.DB, d.Name)
+		if err != nil || h == nil {
+			t.Fatalf("%s: GetHost(%s): %v", x.Name, d.Name, err)
+		}
+		if h.IPMIPass != newPass || h.IPMIPassRetired {
+			t.Errorf("%s reads %s's password as %s (retired %v), want the new one",
+				x.Name, d.Name, redacted(h.IPMIPass), h.IPMIPassRetired)
+		}
+	}
 }

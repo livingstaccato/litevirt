@@ -592,6 +592,14 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 
 	// §6.1 steps 2 and 3: the marker, the target's hold (Prepare), stage B.
 	if fwLive {
+		// The marker records the admission lease, which a recovery releases
+		// if this process dies holding it (lab2-D2-proof F8).
+		if migLease != nil {
+			fwElig.lease, fwElig.leaseHolder = migLease.id, migLease.hostHolder
+			if fwElig.leaseHolder == "" && migLease.id != "" {
+				fwElig.leaseHolder = s.hostName
+			}
+		}
 		if fwl, err = s.beginLiveFirmwareMove(ctx, vm, targetHost, fwElig); err != nil {
 			return err
 		}

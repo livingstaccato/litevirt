@@ -245,6 +245,7 @@ func (s *Server) beginLiveFirmwareMove(ctx context.Context, vm *corrosion.VMReco
 		VM: vm.Name, Binding: fwmig.Binding{UUID: elig.uuid, CreatedAt: vm.CreatedAt, Attempt: newLiveFirmwareAttemptID()},
 		Target: target.Name, Route: route, Phase: fwmig.PhasePreparing,
 		TPM: elig.applicability.GetTpm(), UEFI: elig.applicability.GetUefi(), Since: time.Now().UTC(),
+		CapacityLease: elig.lease, CapacityLeaseHolder: elig.leaseHolder,
 	}}
 	var nvram []byte
 	if r.marker.UEFI {

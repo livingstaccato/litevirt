@@ -54,7 +54,7 @@ workload; the amounts and state are shown to every viewer.
 |---|---|---|
 | `in-flight` | the VM's or container's mutation barrier names the operation | the operation, when it finishes |
 | `admitting` | younger than 15 minutes, no barrier: an admission that may still be committing | the operation |
-| `auto-expires` | an admission lease (`kind` `admission-lease`, or `transfer-lease` for a migration or drain); `detail` names the expiry instant | the stale-lease sweep: 15 minutes after creation, 6 hours for a transfer lease |
+| `auto-expires` | an admission lease (`kind` `admission-lease`, or `transfer-lease` for a migration or drain); `detail` names the expiry instant | the stale-lease sweep: 15 minutes after creation, 6 hours for a transfer lease. A live migration of a Secure Boot / vTPM VM whose source daemon died holding its transfer lease has it released by that daemon's recovery of the move, once it restarts |
 | `journal` | a `vm_replace` or `drain_cold_move` journal | its own recovery; never released by hand |
 | `releasable` | the operation finished at a later owner epoch than its header's, or the VM it was for no longer exists (or was re-created after it began) | the reservation sweep on the target host |
 | `stale` | no barrier, past the admission window, and nothing proves the operation finished | `lv operation release-reservation <operation-id> --force` |

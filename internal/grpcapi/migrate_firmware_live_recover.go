@@ -27,6 +27,9 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fwmig"
@@ -423,6 +426,13 @@ func (s *Server) recoverFirmwareMoveLocked(ctx context.Context, vm string, start
 	if m.Phase == fwmig.PhaseCleaning && !startup {
 		return // RetryLiveFirmwareCleanupsOnce takes it
 	}
+	if m.CapacityLease != "" && (startup || !m.Phase.Parked()) {
+		// The process that took the move's admission lease died holding it
+		// (an unparked marker whose lock is free was left by one): this pass
+		// holds it in that process's place, and releases it when it ends, as
+		// the move releases it when it returns (lab2-D2-proof F8).
+		defer s.releaseDeadMoveLease(ctx, m)
+	}
 	r := s.recoveredFirmwareRun(ctx, m)
 	r.waitCtx = waitCtx
 	if noRetryPark(m.Phase) {
@@ -462,6 +472,38 @@ func (s *Server) recoverFirmwareMoveLocked(ctx context.Context, vm string, start
 	// a committed one redoes the whole finish, the target's VF attach with it
 	// (review D2-13 N-4).
 	s.recoverFirmwareMoveFrom(ctx, r, m.Phase, true)
+}
+
+// releaseDeadMoveLease releases m's admission lease on its holder, which the
+// process that took it can no longer release, and drops it from the marker
+// when the marker of m's attempt is still there. A lease already gone is
+// released. One that cannot be released stays in the marker for the next
+// start, and the stale-lease sweep collects it in any case.
+func (s *Server) releaseDeadMoveLease(ctx context.Context, m fwmig.Marker) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+	defer cancel()
+	var err error
+	if m.CapacityLeaseHolder == "" || m.CapacityLeaseHolder == s.hostName {
+		err = corrosion.AppendOperationStep(rctx, s.db, corrosion.OperationStepRecord{
+			OperationID: m.CapacityLease, StepName: corrosion.OpStepCompleted})
+	} else {
+		err = s.releaseRemoteHostLease(rctx, m.CapacityLeaseHolder, m.CapacityLease)
+	}
+	if err != nil && status.Code(err) != codes.NotFound {
+		slog.Warn("live firmware move recovery: the admission lease of a move whose process died was not released; it is tried again at the next start, and the stale-lease sweep collects it",
+			"vm", m.VM, "attempt", m.Attempt, "lease", m.CapacityLease, "holder", m.CapacityLeaseHolder, "error", err)
+		return
+	}
+	slog.Info("live firmware move recovery: released the admission lease of a move whose process died",
+		"vm", m.VM, "attempt", m.Attempt, "lease", m.CapacityLease, "holder", m.CapacityLeaseHolder)
+	cur, ok, gerr := s.fwRecords().GetMarker(m.VM)
+	if gerr != nil || !ok || cur.Attempt != m.Attempt || cur.CapacityLease == "" {
+		return
+	}
+	cur.CapacityLease, cur.CapacityLeaseHolder = "", ""
+	if perr := s.fwRecords().PutMarker(cur); perr != nil {
+		slog.Warn("live firmware move recovery: the released lease stays named in the marker", "vm", m.VM, "error", perr)
+	}
 }
 
 // noRetryPark reports a park that takes no further step (§8.1 amendment

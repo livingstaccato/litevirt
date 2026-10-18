@@ -92,6 +92,9 @@ type liveFirmwareEligible struct {
 	applicability *pb.FirmwareApplicability
 	// storage: the move copies the host-local disks (every disk is one).
 	storage bool
+	// lease and leaseHolder are the move's admission lease on the target,
+	// recorded in its marker (fwmig.Marker.CapacityLease).
+	lease, leaseHolder string
 }
 
 // liveFirmwareRefusal is a refusal of the live move of vm to target: the

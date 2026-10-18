@@ -1228,3 +1228,58 @@ func TestFleet_FwLiveRestart_RecoveryReleaseWaitsForTheCommit(t *testing.T) {
 	}
 	fwliveMoved(t, src, dst)
 }
+
+// fwliveRestartMigrateLeases lists the MigrateVM admission leases still
+// counted against n.
+func fwliveRestartMigrateLeases(t *testing.T, n *Node) []string {
+	t.Helper()
+	views, err := corrosion.HostReservations(context.Background(), n.DB, n.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, v := range views {
+		if v.Op.Method == "MigrateVM" && v.Op.ResourceKind == corrosion.CapacityResourceKind {
+			out = append(out, v.Op.ID)
+		}
+	}
+	return out
+}
+
+// lab2-D2-proof F8. The source daemon dies holding the move's admission lease
+// on the target (a MigrateVM transfer lease, which the stale-lease sweep
+// keeps for 6 h, and `lv operation release-reservation` refuses). The marker
+// records the lease, and the recovery that finishes the move in the dead
+// process's place releases it, so the target's capacity is free again.
+//
+// Mutation: drop the release from the recovery — the lease stays counted on
+// the target, red.
+func TestFleet_FwLiveRestart_RecoveryReleasesTheDeadMovesLease(t *testing.T) {
+	c, src, dst, _ := fwliveCluster(t)
+	// A killed daemon releases nothing: the old server's move, which its
+	// stop cancels here, never reaches the target with its release.
+	var restarted atomic.Bool
+	for i := 0; i < 4; i++ {
+		dst.HookUnary("ReleaseHostCapacity", func(hctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
+			if !restarted.Load() {
+				return nil, fwliveRestartStoppedHere
+			}
+			return h(hctx, req)
+		})
+	}
+	m := fwliveRestartCrashMigrating(t, c, src, dst, fwliveRestartLand(t, src, dst, "migrated"))
+	if m.CapacityLease == "" || m.CapacityLeaseHolder != dst.Name {
+		t.Fatalf("the marker records lease %q on %q, want the move's lease on %s", m.CapacityLease, m.CapacityLeaseHolder, dst.Name)
+	}
+	if got := fwliveRestartMigrateLeases(t, dst); len(got) != 1 || got[0] != m.CapacityLease {
+		t.Fatalf("fixture: %s counts MigrateVM leases %v, want the move's %s", dst.Name, got, m.CapacityLease)
+	}
+	time.Sleep(200 * time.Millisecond) // the stopped server's move unwinds
+	restarted.Store(true)
+	fwliveRestartUp(t, c, src)
+	fwliveRestartRecovered(src)
+	fwliveMoved(t, src, dst)
+	eventually(t, 30*time.Second, "the dead move's lease to be released on the target", func() bool {
+		return len(fwliveRestartMigrateLeases(t, dst)) == 0
+	})
+}

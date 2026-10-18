@@ -244,6 +244,12 @@ type Marker struct {
 	// the marker becomes committed: the D-5 return writer's guard (§17 D-5).
 	// Absent before the commit, and on a marker an earlier build wrote.
 	CommitDisks []CommitDisk `json:"commit_disks,omitempty"`
+	// CapacityLease is the id of the admission lease the move holds on
+	// CapacityLeaseHolder (the target's MigrateVM transfer lease), so a
+	// recovery after the process that took it died releases it. Absent on a
+	// move that holds none, and on a marker an earlier build wrote.
+	CapacityLease       string `json:"capacity_lease,omitempty"`
+	CapacityLeaseHolder string `json:"capacity_lease_holder,omitempty"`
 }
 
 // CommitDisk is one disk row's placement as the commit left it.
@@ -750,9 +756,10 @@ func (r *Records) get(path string, v interface{ Validate() error }) (bool, error
 var nullableKeys = map[string]bool{"created_stubs": true}
 
 // optionalKeys may be absent: a field written only by an operator's D-5
-// action (a hold's adoption) or only from the commit on (a marker's commit
-// disks). A record written before the field existed reads as it did.
-var optionalKeys = map[string]bool{"adoption": true, "commit_disks": true}
+// action (a hold's adoption), only from the commit on (a marker's commit
+// disks), or only by a move that holds an admission lease (a marker's
+// capacity lease). A record written before the field existed reads as it did.
+var optionalKeys = map[string]bool{"adoption": true, "commit_disks": true, "capacity_lease": true, "capacity_lease_holder": true}
 
 // requireKeys fails unless the object b carries every key of v's type,
 // non-null: a missing key must not decode as a zero value

@@ -510,6 +510,13 @@ func (s *Server) RecordExistingTrunkVLANsLoop(ctx context.Context, every time.Du
 	}
 	t := time.NewTicker(every)
 	defer t.Stop()
+	s.recordExistingTrunkVLANsLoop(ctx, t.C)
+}
+
+// recordExistingTrunkVLANsLoop is RecordExistingTrunkVLANsLoop with its
+// ticks handed in: a pass now, then one per tick, until a pass reports done
+// or ctx ends.
+func (s *Server) recordExistingTrunkVLANsLoop(ctx context.Context, tick <-chan time.Time) {
 	for {
 		done, err := s.recordExistingTrunkVLANs(ctx)
 		if err != nil {
@@ -521,7 +528,7 @@ func (s *Server) RecordExistingTrunkVLANsLoop(ctx context.Context, every time.Du
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-tick:
 		}
 	}
 }

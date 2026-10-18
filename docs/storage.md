@@ -1335,11 +1335,13 @@ without a restart.
 `lv rebuild <vm>` stops and replaces a domain of the VM's name only when it
 is the VM's own: it carries the VM's uuid, or it runs on a disk the VM's row
 records on that host. An rbd disk counts as the recorded one only on the same
-Ceph cluster, meaning the domain's `<host>` monitors and the pool's (its
-current ones on that host, its `mon_host`, its conf's) share a monitor. A
-domain with no `<host>` uses the default `/etc/ceph/ceph.conf`, and one that
-names a `<config file>` of its own and no monitor is on a cluster that cannot
-be told. Otherwise the rebuild is refused with nothing changed, and the
+Ceph cluster, meaning the domain's `<host>` monitors and the pool's share a
+monitor. The pool's monitors are the one source a domain defined now is
+given: its current ones on that host, else the disk's `mon_host`, else its
+conf's; a source behind the one used never counts. A domain with no `<host>`
+uses the default `/etc/ceph/ceph.conf`, and one that names a `<config file>`
+of its own and no monitor is on a cluster that cannot be told, as is a disk
+whose conf cannot be read or names no monitor. Otherwise the rebuild is refused with nothing changed, and the
 refusal names the domain's monitors. A domain defined under a uuid libvirt
 chose (an older promotion or restore) that still names monitors that were all
 replaced is refused this way: undefine it, or give it the current monitors,

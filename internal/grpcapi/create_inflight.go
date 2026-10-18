@@ -534,39 +534,28 @@ func rbdClusterMismatch(spec string, dom []cephMon, domConf string) string {
 
 // rbdSameCluster reports whether a domain's rbd source, on monitors dom,
 // and the "rbd:" locator l name the same Ceph cluster, positively: they
-// share a monitor. l's monitors are its litevirt pool's on this host, its
-// mon_host, and its conf's; a side that names none uses the default
-// ceph.conf, whose monitors stand in for it, and two sides that both name
-// none read the same file. A cluster that cannot be known (a conf or the
-// default ceph.conf unreadable, or naming no monitor, or a domain that names
-// a <config file> of its own and no monitor) is not the same.
+// share a monitor. l's monitors are the ONE source a domain defined for it
+// now is given (rbdLocatorMonitors), never a source that order passes over;
+// a side that names none uses the default ceph.conf, whose monitors stand in
+// for it, and two sides that both name none read the same file. A cluster
+// that cannot be known (a conf or the default ceph.conf unreadable, or naming
+// no monitor, or a domain that names a <config file> of its own and no
+// monitor) is not the same.
 func rbdSameCluster(dom []cephMon, domConf string, l storage.CephLocator) bool {
 	if len(dom) == 0 && domConf != "" {
 		// The domain reads its cluster from a conf of its own, which says
 		// nothing this host can compare.
 		return false
 	}
+	ms, known := rbdLocatorMonitors(l)
+	if !known {
+		return false
+	}
 	var want []cephMon
-	add := func(ms []string) {
-		for _, m := range ms {
-			want = append(want, parseCephMon(m))
-		}
+	for _, m := range ms {
+		want = append(want, parseCephMon(m))
 	}
-	explicit := false
-	if ms, ok := lv.CephPoolMonitors(l.Opts["lvpool"]); ok {
-		explicit = true
-		add(ms)
-	}
-	if v, ok := l.Opts["mon_host"]; ok {
-		explicit = true
-		add(storage.ParseMonHost(v))
-	}
-	if conf := l.Opts["conf"]; conf != "" && !storage.IsDefaultCephConf(conf) {
-		explicit = true
-		if ms, err := storage.CephMonHosts(conf); err == nil {
-			add(ms)
-		}
-	}
+	explicit := len(want) > 0
 	if !explicit && len(dom) == 0 {
 		return true
 	}
@@ -593,6 +582,35 @@ func rbdSameCluster(dom []cephMon, domConf string, l storage.CephLocator) bool {
 		}
 	}
 	return false
+}
+
+// rbdLocatorMonitors is the monitor list a domain defined now for l is given,
+// in rbdDomainSource's order: the litevirt pool's current monitors on this
+// host, else l's mon_host, else its conf's. Only that one source names the
+// VM's cluster; a lower one it passes over may name another. known is false
+// when the domain could not be given one (rbdDomainSource refuses such a
+// locator): a conf other than the default that cannot be read, or that names
+// no monitor while nothing stands before it. An empty list with known true
+// is the default ceph.conf's cluster.
+func rbdLocatorMonitors(l storage.CephLocator) (mons []string, known bool) {
+	conf := l.Opts["conf"]
+	ownConf := conf != "" && !storage.IsDefaultCephConf(conf)
+	mons, ok := lv.CephPoolMonitors(l.Opts["lvpool"])
+	if !ok {
+		if v, has := l.Opts["mon_host"]; has {
+			mons = storage.ParseMonHost(v)
+		} else if conf != "" {
+			m, err := storage.CephMonHosts(conf)
+			if err != nil && ownConf {
+				return nil, false
+			}
+			mons = m
+		}
+	}
+	if len(mons) == 0 && ownConf {
+		return nil, false
+	}
+	return mons, true
 }
 
 // domainNIC is one <interface> of a domain definition: its MAC (lower

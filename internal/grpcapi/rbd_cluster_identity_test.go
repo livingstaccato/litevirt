@@ -246,3 +246,158 @@ func TestDomainIsVMsOwn_NamesTheCephClusterMismatch(t *testing.T) {
 		}
 	}
 }
+
+// The VM's cluster is the ONE monitor source its domain is given
+// (rbdDomainSource): the litevirt pool's current monitors, else the
+// locator's mon_host, else its conf's. A source that order passes over names
+// no cluster of the VM's, so a domain on it is not the VM's: a locator on A
+// whose conf names B, or a pool now on A whose locator still names B, is not
+// on B.
+//
+// Mutation: add the passed-over sources to the accepted monitors (the
+// union) — both "on B" cases red.
+func TestDomainRunsOnAny_RBDOnlyTheRenderedMonitorSource(t *testing.T) {
+	withDefaultCephConf(t, "")
+	bConf := filepath.Join(t.TempDir(), "b.conf")
+	if err := os.WriteFile(bConf, []byte("[global]\nmon_host = 10.0.9.1:6789\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(lv.SetCephMonitorResolver(func(pool string) ([]string, bool) {
+		if pool != "ceph1" {
+			return nil, false
+		}
+		return []string{"10.0.0.1:6789"}, true
+	}))
+	monAConfB := `rbd:lv/vm1-root:mon_host=10.0.0.1\:6789:conf=` + bConf
+	poolAMonB := `rbd:lv/vm1-root:id=litevirt:keyring=/k:lvpool=ceph1:mon_host=10.0.9.1\:6789`
+	for _, tc := range []struct {
+		name     string
+		hosts    []string
+		recorded string
+		want     bool
+	}{
+		{"mon_host A, conf B: on B", []string{"10.0.9.1:6789"}, monAConfB, false},
+		{"mon_host A, conf B: on A", []string{"10.0.0.1:6789"}, monAConfB, true},
+		{"pool A, mon_host B: on B", []string{"10.0.9.1:6789"}, poolAMonB, false},
+		{"pool A, mon_host B: on A", []string{"10.0.0.1:6789"}, poolAMonB, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := domainRunsOnAny(rbdDomain("u", "lv/vm1-root", tc.hosts...), []string{tc.recorded})
+			if err != nil || got != tc.want {
+				t.Errorf("domainRunsOnAny = %v, %v; want %v", got, err, tc.want)
+			}
+		})
+	}
+}
+
+// A locator whose monitors cannot be known as its domain would be given them
+// — a conf that cannot be read, or names no monitor, with no pool and no
+// mon_host to stand before it — is on no cluster this host can tell, so no
+// domain is on it, not even one on the default ceph.conf's monitors.
+//
+// Mutation: read such a locator as the default ceph.conf's — red.
+func TestDomainRunsOnAny_RBDUnknowableLocatorIsNoCluster(t *testing.T) {
+	withDefaultCephConf(t, "10.0.0.1:6789")
+	empty := filepath.Join(t.TempDir(), "empty.conf")
+	if err := os.WriteFile(empty, []byte("[global]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, recorded string
+		hosts          []string
+	}{
+		{"unreadable conf", "rbd:lv/vm1-root:conf=/nonexistent/b.conf", []string{"10.0.0.1:6789"}},
+		{"unreadable conf, no host", "rbd:lv/vm1-root:conf=/nonexistent/b.conf", nil},
+		{"conf naming no monitor", "rbd:lv/vm1-root:conf=" + empty, []string{"10.0.0.1:6789"}},
+		{"conf naming no monitor, no host", "rbd:lv/vm1-root:conf=" + empty, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := domainRunsOnAny(rbdDomain("u", "lv/vm1-root", tc.hosts...), []string{tc.recorded})
+			if err != nil || got {
+				t.Errorf("domainRunsOnAny = %v, %v; want false", got, err)
+			}
+		})
+	}
+}
+
+// A rebuild never stops or undefines a domain on cluster B because a source
+// the VM's own domain is NOT given names B: the locator's conf behind its
+// mon_host, or its mon_host behind its pool's current monitors.
+//
+// Mutation: the union of sources — the foreign guest is destroyed and
+// undefined, red.
+func TestRebuildVM_NeverDestroysAnRBDDomainOnAPassedOverSource(t *testing.T) {
+	const foreign = "eeeeeeee-0000-0000-0000-000000000043"
+	withDefaultCephConf(t, "")
+	bConf := filepath.Join(t.TempDir(), "b.conf")
+	if err := os.WriteFile(bConf, []byte("[global]\nmon_host = 10.0.9.1:6789\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(lv.SetCephMonitorResolver(func(pool string) ([]string, bool) {
+		if pool != "ceph1" {
+			return nil, false
+		}
+		return []string{"10.0.0.1:6789"}, true
+	}))
+	var ran []string
+	t.Cleanup(storage.OverrideCephRunnerForTest(func(_ context.Context, name string, args ...string) ([]byte, error) {
+		ran = append(ran, name+" "+strings.Join(args, " "))
+		return nil, errors.New("no ceph in this test")
+	}))
+	for _, tc := range []struct{ name, recorded string }{
+		{"mon_host A, conf B", `rbd:lv/vm1-root:id=litevirt:keyring=/k:mon_host=10.0.0.1\:6789:conf=` + bConf},
+		{"pool A, mon_host B", `rbd:lv/vm1-root:id=litevirt:keyring=/k:lvpool=ceph1:mon_host=10.0.9.1\:6789`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ran = nil
+			s, fake := promoteFixture(t)
+			if err := s.db.Execute(adminCtx(), `UPDATE vm_disks SET path = ?, storage_type = 'ceph' WHERE vm_name = 'vm1'`, tc.recorded); err != nil {
+				t.Fatal(err)
+			}
+			if err := fake.DefineDomain(rbdDomain(foreign, "lv/vm1-root", "10.0.9.1:6789")); err != nil {
+				t.Fatal(err)
+			}
+			if err := fake.StartDomain("vm1"); err != nil {
+				t.Fatal(err)
+			}
+			err := func() (err error) {
+				defer func() {
+					if r := recover(); r != nil {
+						err = fmt.Errorf("the rebuild went past the identity check: %v", r)
+					}
+				}()
+				_, err = s.RebuildVM(adminCtx(), &pb.RebuildVMRequest{Name: "vm1"})
+				return err
+			}()
+			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(fmt.Sprint(err), foreign) {
+				t.Errorf("rebuild over a domain on cluster B: %v, want FailedPrecondition naming it", err)
+			}
+			if u, d := undefinesOf(fake, "vm1"); u != 0 || d != 0 {
+				t.Errorf("the foreign guest was undefined %d and destroyed %d times", u, d)
+			}
+			if len(ran) != 0 {
+				t.Errorf("the rebuild ran ceph commands on the VM's image: %q", ran)
+			}
+			if active, _ := fake.DomainIsActive("vm1"); !active {
+				t.Error("the foreign guest no longer runs")
+			}
+			if !fake.DomainExists("vm1") {
+				t.Error("the foreign guest is no longer defined")
+			}
+		})
+	}
+	t.Run("the rendered source's cluster is still the VM's", func(t *testing.T) {
+		s, fake := promoteFixture(t)
+		if err := s.db.Execute(adminCtx(), `UPDATE vm_disks SET path = ?, storage_type = 'ceph' WHERE vm_name = 'vm1'`,
+			`rbd:lv/vm1-root:id=litevirt:keyring=/k:mon_host=10.0.0.1\:6789:conf=`+bConf); err != nil {
+			t.Fatal(err)
+		}
+		if err := fake.DefineDomain(rbdDomain(foreign, "lv/vm1-root", "10.0.0.1:6789")); err != nil {
+			t.Fatal(err)
+		}
+		own, _, why, err := s.domainIsVMsOwn(adminCtx(), "vm1", "aaaaaaaa-0000-0000-0000-000000000001", "vm1")
+		if err != nil || !own {
+			t.Errorf("domainIsVMsOwn = %v, %q, %v; want the VM's own", own, why, err)
+		}
+	})
+}

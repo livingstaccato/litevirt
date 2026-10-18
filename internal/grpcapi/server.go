@@ -1118,6 +1118,9 @@ type Server struct {
 	// it so `lv cluster converge` kicks an immediate (debounced) pass instead of waiting
 	// for the periodic tick. Same synchronous-push pattern as fwReconciler.
 	antiEntropy AntiEntropyTrigger
+	// hostWriteCurrency turns on the caught-up check for the operator's hosts
+	// writes (host_incarnation.go). The daemon turns it on.
+	hostWriteCurrency atomic.Bool
 
 	// tenancy gates CreateVM/stack admission against project quotas
 	// and emits metered billing events. Optional — nil means

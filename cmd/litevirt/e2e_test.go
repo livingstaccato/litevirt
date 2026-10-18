@@ -195,8 +195,11 @@ func (m *mockClient) FenceHost(_ context.Context, in *pb.FenceHostRequest, _ ...
 func (m *mockClient) GetClusterHealth(_ context.Context, _ *pb.GetClusterHealthRequest, _ ...grpc.CallOption) (*pb.ClusterHealth, error) {
 	return &pb.ClusterHealth{Overall: "HEALTHY"}, nil
 }
-func (m *mockClient) RemoveHost(_ context.Context, in *pb.RemoveHostRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+func (m *mockClient) RemoveHost(_ context.Context, in *pb.RemoveHostRequest, _ ...grpc.CallOption) (*pb.RemoveHostResponse, error) {
 	m.removedHost = in.Name
+	return &pb.RemoveHostResponse{}, nil
+}
+func (m *mockClient) PreflightRemoveHost(_ context.Context, _ *pb.RemoveHostRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil
 }
 func (m *mockClient) PublishCRL(_ context.Context, _ *pb.PublishCRLRequest, _ ...grpc.CallOption) (*pb.PublishCRLResponse, error) {

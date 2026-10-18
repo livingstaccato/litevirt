@@ -552,11 +552,23 @@ import (
 //	     its WAL entries. Existing rows migrate with no retirement, so a
 //	     tombstone from before the upgrade still beats a password set after
 //	     it (docs/migration-failover.md). Additive.
-const CurrentSchemaVersion = 68
+//	v69: hosts.incarnation (INTEGER NOT NULL DEFAULT 0) — the host
+//	     incarnation counter (host_incarnation.go). 0 on every row written
+//	     before the release feature host_incarnation is first used; a
+//	     re-admission over a tombstone at N writes N+1, and nothing else
+//	     raises it. Rows are ordered by (incarnation, created_at,
+//	     cert_serial) ahead of their clock. A previous-release node does not
+//	     write the column and cannot decode the re-admission that raises it,
+//	     which is written only through the feature (ReplicationGated).
+//	     Additive.
+const CurrentSchemaVersion = 69
 
 // schemaVersionCredentialRetirement is the version
 // host_fence_credentials.after_retirement was added in.
 const schemaVersionCredentialRetirement = 68
+
+// schemaVersionHostIncarnation is the version hosts.incarnation was added in.
+const schemaVersionHostIncarnation = 69
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -1235,7 +1247,8 @@ var schemaDDL = []string{
 		deleted_at   TEXT,
 		version      TEXT DEFAULT '',
 		region       TEXT NOT NULL DEFAULT 'default',
-		capacity_policy_hash TEXT NOT NULL DEFAULT ''
+		capacity_policy_hash TEXT NOT NULL DEFAULT '',
+		incarnation  INTEGER NOT NULL DEFAULT 0
 	)`,
 
 	`CREATE TABLE IF NOT EXISTS host_labels (
@@ -3490,6 +3503,8 @@ var schemaMigrations = []string{
 	// The retirement a live fence credential was set after (see History,
 	// schemaVersionCredentialRetirement).
 	`ALTER TABLE host_fence_credentials ADD COLUMN after_retirement TEXT NOT NULL DEFAULT ''`,
+	// The host incarnation counter (see History, schemaVersionHostIncarnation).
+	`ALTER TABLE hosts ADD COLUMN incarnation INTEGER NOT NULL DEFAULT 0`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -3583,6 +3598,7 @@ var alterVersions = []int{
 	54,                                // runtime_action_proofs.lease_key
 	60,                                // runtime_action_proofs.claim_certificate
 	schemaVersionCredentialRetirement, // host_fence_credentials.after_retirement
+	schemaVersionHostIncarnation,      // hosts.incarnation
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

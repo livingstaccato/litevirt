@@ -1104,6 +1104,13 @@ restarted daemon's first pass, and `lv cluster converge` pull regardless.
 Resolve an unresolved row by making one side authoritative with a fresh write —
 which clears the tracking and lets the table converge.
 
+A `control_plane` tie on a `hosts` row is not cleared by `lv host config` or
+any other write to the row: each applies to both copies. Once
+`release_2026_11_v1` has latched, run `lv host rm <name>` and then `lv host add`
+for the machine; the re-admission is a later incarnation of the row and every
+node keeps it ([upgrades.md](upgrades.md)). The host does not need to be
+reachable.
+
 ### VM ownership ties — automatic and manual repair
 
 A `vms.host_name` split is the runtime-owned category: the resolver keeps it
@@ -2044,6 +2051,99 @@ itself. If no node will ever hold the history, removing `<pki_dir>/audit-rejoin.
 on the host and restarting its daemon ends the hold at the cost of a permanent
 fork finding for that host
 ([audit-log.md](audit-log.md#rebuilding-a-host-under-its-old-name)).
+
+### Own row held (`own_row_held`)
+
+A daemon raises `own_row_held` about **itself** while it makes no write to its
+own `hosts` row, because that row is not the cluster's admission for the
+certificate the daemon serves ([upgrades.md](upgrades.md)). Its boot report,
+address correction and certificate re-record wait; replication and its gRPC
+server run.
+
+| Raised when | Clears when |
+|---|---|
+| At start or at runtime, the host's own row is live and names a serial other than the installed certificate's (evidence `arm` `a`), or is removed (`arm` `b`). Re-raised once a minute while held. **Warning**. The evidence carries `reason` (`at_start`; `superseded`: another admission replaced the row; `removed`), `held_for`, `timed_out`, `installed_serial` and `recorded_serial`. | The host's own row is live and names the installed certificate's serial. |
+
+A host whose installed certificate renewed the recorded one (`lv host
+renew-cert`, live or while the host was down) is not held: it records the new
+serial at once. Neither is a host whose certificate was reissued outside
+`lv host renew-cert` while its row is still the admission it was last admitted
+under, which it records in `<pki_dir>/own-admission.json`: it records the
+reissued serial when the daemon starts, so `auth.trust_rotated_peer_certs`
+converges it.
+
+At incarnation 1 or higher, a certificate swapped in while the daemon runs that
+is not a renewal of the recorded one is not recorded until the daemon restarts,
+and peers refuse it until then. The host raises `certificate/cert_swapped_at_runtime`
+about itself (**warning**; evidence `recorded_serial`, `serving_serial` and
+`remedy`). Restart the daemon on that host (`systemctl restart litevirt`); the
+condition clears once the serial is recorded.
+
+A hold raised at start over a row at incarnation 0 reports `timed_out` after
+ten minutes, and the daemon then makes the writes the previous release makes.
+A hold over a row at incarnation 1 or higher, and a hold raised at runtime
+(`superseded`, `removed`), never times out. A held row that becomes another
+admission while held is reported as `superseded`.
+
+**`reason` `at_start`** is raised at start, for one of two causes:
+
+- the host was re-added while its data directory still held its old database,
+  so its replica still holds its own old row. This clears once the host's
+  replica receives the re-admission from a peer;
+- the host is at incarnation 1 or higher, its certificate was reissued outside
+  `lv host renew-cert` (its PKI directory was regenerated or restored), and its
+  `<pki_dir>/own-admission.json` is missing or records another admission. This
+  does not clear by itself.
+
+If it does not clear:
+
+1. Check that a peer is reachable from the host.
+2. On another node, run `lv host inspect <name>` and note the serial it shows.
+   That is the cluster's admission for the name, and it is the serial every
+   step below means. Do not use `recorded_serial` from `lv health` on this
+   host: it is this host's own replica, which may be stale. If the serial from
+   `lv host inspect` equals this host's `installed_serial`, the re-admission
+   has not reached the host yet: go back to step 1.
+3. Find out whether any machine **holds** the serial from step 2, running or
+   powered off: its `<pki_dir>/host.crt` carries that serial
+   (`openssl x509 -noout -serial -in <pki_dir>/host.crt` prints it in upper
+   case). If a machine other than this host holds it, this host is superseded:
+   follow the `superseded` procedure below, and do not remove the name. A
+   machine that is powered off still holds its admission.
+4. If this host holds a certificate and key with the serial from step 2 (for
+   example in a backup of its PKI directory), put them back as
+   `<pki_dir>/host.crt` and `<pki_dir>/host.key`. The hold then opens by
+   itself.
+5. Only when step 3 found no machine, running or powered off, that holds the
+   serial from step 2, and step 4 did not apply: stop the daemon on this host,
+   then remove the host and add it again.
+
+**`reason` `superseded`** is a host whose admission another `lv host add` of
+the same name replaced. Peers no longer accept its certificate. To recover:
+
+1. On another node, run `lv host inspect <name>` and note the serial it shows.
+   That is the cluster's admission for the name, and it is the serial every
+   step below means. Do not use `recorded_serial` from `lv health` on the
+   superseded machine: it is that machine's own replica, which may be stale.
+2. Stop the litevirt daemon on the superseded machine, outside the cluster,
+   and confirm that its workloads are stopped.
+3. Find the machine that **holds** the serial from step 1, running or powered
+   off: its `<pki_dir>/host.crt` carries that serial
+   (`openssl x509 -noout -serial -in <pki_dir>/host.crt` prints it in upper
+   case). A machine that is powered off still holds its admission. If it is
+   the machine to keep, leave the name alone: wipe the superseded machine's
+   data directory before adding it under any name.
+4. Run `lv host rm --dead <name>` only when step 3 found no machine, running
+   or powered off, that holds the serial from step 1, or when the operator has
+   decided to retire the machine that holds it, after stopping that machine's
+   daemon and confirming its workloads are stopped. Run it only after step 2
+   is confirmed, then run `lv host add` for the machine to
+   keep. `lv host add` is refused while workloads are still recorded on the
+   name; `lv health` shows `ha.claim.stranded` for any the failover
+   coordinator cannot recover.
+
+**`reason` `removed`** is a host removed while its daemon runs. It clears if
+the host is re-added and its re-admission reaches it.
 
 ### Audit replica not seeded (`audit_not_seeded`)
 

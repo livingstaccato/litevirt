@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -48,19 +49,9 @@ func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force
 	// deliberately hides the row and there is no supported way to recover its
 	// certificate serial. A mint or publish failure must therefore leave the row
 	// intact so the operator can repair the cause and retry this command.
-	serial, err := hostCertSerial(ctx, c, hostName)
+	serial, version, err := revokeAndPublish(ctx, c, &pb.RemoveHostRequest{Name: hostName, Force: force})
 	if err != nil {
-		return fmt.Errorf("read %s's certificate serial before removal: %w", hostName, err)
-	}
-
-	if err := revokeHostCert(PKIDir(), hostName, serial); err != nil {
-		return fmt.Errorf("refusing to remove %s before its certificate is revoked: %w", hostName, err)
-	}
-
-	version, err := publishClusterCRL(ctx, c, PKIDir())
-	if err != nil {
-		return fmt.Errorf("refusing to remove %s before its certificate revocation is published: %w",
-			hostName, err)
+		return err
 	}
 
 	// Close the host's audit signing contract while removal still has the CA
@@ -74,10 +65,15 @@ func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force
 	// available as `lv host retire-audit-key`.
 	closeRemovedHostAuditContract(ctx, c, hostName)
 
-	if _, err := c.RemoveHost(ctx, &pb.RemoveHostRequest{Name: hostName, Force: force}); err != nil {
-		return fmt.Errorf("remove host after publishing its certificate revocation: %w", err)
+	rerun := "lv host rm " + hostName
+	if force {
+		rerun = "lv host rm --force " + hostName
 	}
-	fmt.Printf("Host %s removed from cluster.\n", hostName)
+	removed, err := removeAfterRevoke(ctx, c, &pb.RemoveHostRequest{Name: hostName, Force: force, ExpectedCertSerial: serial}, rerun)
+	if err != nil {
+		return err
+	}
+	printRemoved(hostName, removed, "Host %s removed from cluster.\n")
 	fmt.Printf("  revoked certificate %s in CRL %d before removing the host\n", serial, version)
 	fmt.Println("  `lv health` warns for as long as any peer's CRL version is behind another's")
 	return nil
@@ -108,7 +104,24 @@ func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, d
 		return fmt.Errorf("%s is not fenced proof-grade (%s): power it off, then run `%s` — `lv host rm --dead` "+
 			"removes only a host proven off", hostName, orDash(plan.GetFenceDetail()), plan.GetFenceCommand())
 	}
+	if dryRun && plan.GetVoter() {
+		// The daemon refuses to remove a voter's host, so its preflight can
+		// only answer once the real run has removed the vote.
+		fmt.Println("  removal check: runs after the voter removal, so not in a dry run")
+		fmt.Println("Dry run: nothing was changed.")
+		return nil
+	}
 	if dryRun {
+		// Ask the daemon whether it would make the removal, as the real run
+		// does before it revokes, so the plan is not one it would refuse.
+		serial, err := hostCertSerial(ctx, c, hostName)
+		if err != nil {
+			return fmt.Errorf("read %s's certificate serial: %w", hostName, err)
+		}
+		pre := &pb.RemoveHostRequest{Name: hostName, Dead: true, ExpectedCertSerial: serial}
+		if _, err := c.PreflightRemoveHost(ctx, pre); err != nil && status.Code(err) != codes.Unimplemented {
+			return fmt.Errorf("the removal of %s would be refused: %w", hostName, err)
+		}
 		fmt.Println("Dry run: nothing was changed.")
 		return nil
 	}
@@ -123,15 +136,17 @@ func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, d
 		}
 		fmt.Printf("  removed %s from the voter set (it was a member of generation %d)\n", hostName, plan.GetVoterGeneration())
 	}
-	serial, version, err := revokeAndPublish(ctx, c, hostName)
+	serial, version, err := revokeAndPublish(ctx, c, &pb.RemoveHostRequest{Name: hostName, Dead: true})
 	if err != nil {
 		return err
 	}
 	closeRemovedHostAuditContract(ctx, c, hostName)
-	if _, err := c.RemoveHost(ctx, &pb.RemoveHostRequest{Name: hostName, Dead: true}); err != nil {
-		return fmt.Errorf("remove host after publishing its certificate revocation: %w", err)
+	removed, err := removeAfterRevoke(ctx, c, &pb.RemoveHostRequest{Name: hostName, Dead: true, ExpectedCertSerial: serial},
+		"lv host rm --dead "+hostName)
+	if err != nil {
+		return err
 	}
-	fmt.Printf("Host %s removed from the cluster for good.\n", hostName)
+	printRemoved(hostName, removed, "Host %s removed from the cluster for good.\n")
 	fmt.Printf("  revoked certificate %s in CRL %d before removing the host\n", serial, version)
 	n := 0
 	for _, s := range plan.GetStranded() {
@@ -177,13 +192,56 @@ func orDash(s string) string {
 	return s
 }
 
-// revokeAndPublish revokes hostName's certificate in this machine's CRL and
+// removeAfterRevoke is RemoveHost once the host's certificate is revoked and
+// the CRL published. The preflight passed moments before, so an Unavailable
+// now is most likely a voter's link or the currency pull failing for a
+// moment: it is retried after each removeRetryBackoff wait, and one that is
+// still Unavailable names rerun, which finishes it (the revocation is already
+// in place). Any other refusal is returned at once.
+func removeAfterRevoke(ctx context.Context, c pb.LiteVirtClient, req *pb.RemoveHostRequest, rerun string) (*pb.RemoveHostResponse, error) {
+	for attempt := 0; ; attempt++ {
+		removed, err := c.RemoveHost(ctx, req)
+		if err == nil {
+			return removed, nil
+		}
+		if status.Code(err) != codes.Unavailable {
+			return nil, fmt.Errorf("remove host after publishing its certificate revocation: %w", err)
+		}
+		if attempt >= len(removeRetryBackoff) {
+			return nil, fmt.Errorf("remove host after publishing its certificate revocation: %w\n"+
+				"the certificate is revoked; run `%s` to finish the removal", err, rerun)
+		}
+		fmt.Printf("  removal unavailable (%v); retrying in %s\n", err, removeRetryBackoff[attempt])
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("remove host after publishing its certificate revocation: %w\n"+
+				"the certificate is revoked; run `%s` to finish the removal", ctx.Err(), rerun)
+		case <-time.After(removeRetryBackoff[attempt]):
+		}
+	}
+}
+
+// removeRetryBackoff are the waits before each retry of a RemoveHost that
+// failed Unavailable after the revocation. A var so tests can shorten it.
+var removeRetryBackoff = []time.Duration{10 * time.Second, 20 * time.Second}
+
+// revokeAndPublish revokes the certificate of req's host in this machine's
+// CRL, once the daemon has said it would make the removal req asks for, and
 // publishes the CRL to the cluster: the part of a removal only the machine
 // holding the CA key can do.
-func revokeAndPublish(ctx context.Context, c pb.LiteVirtClient, hostName string) (string, int64, error) {
+func revokeAndPublish(ctx context.Context, c pb.LiteVirtClient, req *pb.RemoveHostRequest) (string, int64, error) {
+	hostName := req.GetName()
 	serial, err := hostCertSerial(ctx, c, hostName)
 	if err != nil {
 		return "", 0, fmt.Errorf("read %s's certificate serial before removal: %w", hostName, err)
+	}
+	// Ask the daemon whether it would remove the host BEFORE revoking: a
+	// refusal after the revocation leaves a member cut off from its peers
+	// while its row stays live. A daemon from before this check answers
+	// Unimplemented, and makes none of the refusals it covers.
+	pre := &pb.RemoveHostRequest{Name: hostName, Force: req.GetForce(), Dead: req.GetDead(), ExpectedCertSerial: serial}
+	if _, err := c.PreflightRemoveHost(ctx, pre); err != nil && status.Code(err) != codes.Unimplemented {
+		return "", 0, fmt.Errorf("refusing to revoke %s's certificate: the removal would be refused: %w", hostName, err)
 	}
 	if err := revokeHostCert(PKIDir(), hostName, serial); err != nil {
 		return "", 0, fmt.Errorf("refusing to remove %s before its certificate is revoked: %w", hostName, err)
@@ -302,4 +360,15 @@ func refuseVoterRemoval(ctx context.Context, c pb.LiteVirtClient, hostName strin
 		}
 	}
 	return nil
+}
+
+// printRemoved prints what a removal tombstoned: the incarnation and serial
+// the daemon reports, or, from a daemon too old to report them, plain.
+func printRemoved(hostName string, removed *pb.RemoveHostResponse, plain string) {
+	if removed.GetCertSerial() == "" {
+		fmt.Printf(plain, hostName)
+		return
+	}
+	fmt.Printf("Host %s removed (incarnation %d, serial %s).\n", hostName,
+		removed.GetIncarnation(), removed.GetCertSerial())
 }

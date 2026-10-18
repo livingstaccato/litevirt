@@ -569,14 +569,16 @@ data, yet it advertises the token, counts toward its latch and is accepted as a
 sender: the first use would not be refused, and every such host would
 acknowledge it and then quarantine itself. So a feature added after a release
 ships — in a patch release too — is declared under the next release token,
-never a shipped one, and a test pins every release token's list. All twenty
-features of `release_2026_11_v1` are declared in this release (`lv cluster
-upgrade-status` lists them): `vm_limits`, `vm_disk_nic_io`,
+never a shipped one, and a test pins every release token's list. All
+twenty-one features of `release_2026_11_v1` are declared in this release (`lv
+cluster upgrade-status` lists them): `vm_limits`, `vm_disk_nic_io`,
 `email_target_secret`, `login_policy`, `drain_failback`, `firewall_ipv6`,
 `nic_guards`, `usb_mounts_memory`, `backup_zstd`, `container_replication`,
 `iscsi_lun_claim`, `pit_overlay`, `redfish_fence`, `ha_disarm`, `nic_mtu`,
-`replication_rate`, `returning_boot`, `firewall_synflood`, `firewall_log` and
-`firewall_tag_groups`.
+`replication_rate`, `returning_boot`, `firewall_synflood`, `firewall_log`,
+`firewall_tag_groups` and `host_incarnation`. `host_incarnation` is used the
+first time a removed host is re-added with `lv host add` after the latch
+(below).
 
 One feature is one used bit: the first write of any of its data marks it used,
 and a rollback below the release then quarantines. So a feature written by
@@ -1241,6 +1243,54 @@ stamped, the tie stays as it was.
 The two `created_at` values come from two hosts' clocks. If the host's
 original `created_at` is later than the re-admission's — a clock skew larger
 than its whole first membership — the stale row wins whole, on every host.
+
+**The host incarnation counter (`host_incarnation`).** Once the release token
+has latched, `hosts.incarnation` numbers a host's admissions instead. A host is
+at incarnation 0 until a removed host is re-added; `lv host add` of a host
+whose tombstone is at N then records it at N+1. Every node orders two copies of
+a host's row by incarnation first, then by the re-admission's `created_at`,
+then by certificate serial, whatever their `updated_at`: a write made against an
+earlier incarnation is refused (`litevirt_merge_apply_rejected_total`, reason
+`older_incarnation`), and anti-entropy keeps the later incarnation's row. The
+five-minute rule above still decides between two rows that are both at
+incarnation 0. A re-admission that issues a number needs:
+
+- the release token latched on the node `lv host add` runs against;
+- a live voter majority on that node, counted without the host being re-added;
+- a peer it can pull the host's row from first;
+- an `lv` of this release or later, which installs its own build on the host.
+  A previous release's `lv host add` would install a build that cannot keep an
+  incarnation, and the host would stay joining, refused by every peer.
+  Removing the last previous-build host latches the release, so re-add such a
+  host with this release's `lv`; a host already admitted on an older build
+  joins after `lv host upgrade <host>`. The daemon takes `lv`'s word for the
+  build: `lv host add` pushes the `litevirt` beside its own executable, or
+  `/usr/local/bin/litevirt` when there is none, so an `lv` run without this
+  release's `litevirt` beside it can install an older build; that host also
+  stays joining until `lv host upgrade <host>`.
+
+Otherwise `lv host add` is refused with the reason. Over a tombstone at 1 or
+higher it is never written the way the previous release writes it. `lv host rm`
+takes the same majority and pull, and is refused when the row names another
+certificate than the one it revoked. This release's `lv host rm` asks the
+daemon before it revokes, and revokes nothing when the removal would be
+refused; once it has revoked, it retries a removal that fails `Unavailable`
+twice, over about 30 seconds, then prints the command that finishes it. A
+previous release's `lv host rm` does not ask: against this release's daemon it
+still revokes the certificate and publishes the CRL first, and a refusal then
+leaves the host revoked with its row live. Run `lv host rm` with this
+release's `lv`. On a node that has not caught up with the
+cluster since it started, `lv host rm`, `lv host config`, `lv host label`,
+`lv host drain`, `lv host undrain` and `lv host isolate` are refused; `lv host
+fence` is not, and its result names the incarnation, serial, strategy and BMC
+it fenced through. A daemon whose own row names another certificate than the
+one installed (and not its renewal), or whose own row is removed, makes no
+write to that row until the cluster's row for its certificate reaches it
+(`own_row_held`, [diagnostics.md](diagnostics.md#own-row-held-own_row_held)).
+An `lv host add` of a host removed at incarnation 0 that cannot use
+`host_incarnation` at that moment (not every host runs the release yet, or a
+host has not acknowledged its first use) re-admits the host as the previous
+release does, and prints why.
 
 The re-added host publishes a missing capability label again (`litevirt.lxc`,
 `litevirt.tpm`, `litevirt.secureboot`) within a minute of the re-admitted row

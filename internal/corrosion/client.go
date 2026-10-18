@@ -122,6 +122,8 @@ type Client struct {
 	// incarnationRefusals rate-limits the hosts merge floor's warning, per
 	// row (host_incarnation_floor.go). Its zero value is ready.
 	incarnationRefusals refusalLogLimiter
+	// ownHold is the own-row hold (own_row_hold.go).
+	ownHold ownRowHold
 	// dsn is what db was opened with; tableGens counts the row changes every
 	// connection of that database reports (digest_cache.go), and digests is
 	// the anti-entropy digest cache they invalidate. tableGens is nil for a
@@ -965,6 +967,43 @@ func (c *Client) NowWallTS() string {
 	return t.Format(nowTSLayout)
 }
 
+// nowTSAfter is NowTS taken once this node's clocks have observed every stamp
+// of floor, so it orders strictly after each. A stamp more than the skew
+// cutoff ahead of this node's clock is not adopted, and the write is refused.
+func (c *Client) nowTSAfter(floor ...string) (string, error) {
+	skewed := map[string]bool{}
+	for _, f := range floor {
+		if f == "" {
+			continue
+		}
+		if tsFutureSkewed(f, c.now()) {
+			skewed[f] = true
+			continue
+		}
+		ObserveStamp(c, f)
+		if at, ok := tsInstant(f); ok {
+			c.tsMu.Lock()
+			if at.After(c.lastTS) {
+				c.lastTS = at
+			}
+			c.tsMu.Unlock()
+		}
+	}
+	ts := c.NowTS()
+	for _, f := range floor {
+		if f == "" || lwwOrder(ts, f) > 0 {
+			continue
+		}
+		if skewed[f] {
+			return "", fmt.Errorf("the stored stamp %s on this node is more than %s ahead of its clock, so this "+
+				"node does not adopt it and cannot stamp after it; run the command through another node, or "+
+				"here once this node's clock has passed %s", f, skewCutoff, f)
+		}
+		return "", fmt.Errorf("this node's clock cannot be stamped after %s; retry once the nodes' clocks agree", f)
+	}
+	return ts, nil
+}
+
 // advanceDurableLWWLocked commits a new LWW ceiling (t + persist-ahead) BEFORE NowTS
 // returns a value beyond the last durable one, then returns the timestamp NowTS may
 // safely emit. On a persistence failure it FAILS CLOSED: it never returns a value past
@@ -1291,6 +1330,11 @@ type Statement struct {
 	// transaction before executing the statement. Nil preserves the historical
 	// statement wire format and behavior.
 	Guard *MutationGuard `json:",omitempty"`
+	// HostIncarnation is the ordering key of the hosts row this statement was
+	// written against (host_incarnation.go). Set only by stampHostIncarnation,
+	// only on hosts statements, and nil at incarnation 0, which preserves the
+	// historical wire format.
+	HostIncarnation *HostIncarnation `json:",omitempty"`
 }
 
 // Query executes a read query against the local SQLite database.
@@ -1451,11 +1495,23 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 	var mutated []Statement
 	var parks []func() // see executeBatchInternal
 	relays := make([][]Statement, 0, len(entries))
+	var allCredHosts entryHostRows // every entry's, for the absorb below
 	for _, stmts := range entries {
 		relay := make([]Statement, 0, len(stmts))
+		// See executeBatchInternal.
+		credHosts, err := readEntryHostRows(ctx, tx, stmts)
+		if err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return false, err
+		}
+		allCredHosts = allCredHosts.addMissing(credHosts)
 		for _, s := range stmts {
 			// See executeBatchInternal (credentials_revive_guard.go).
-			credPlan, err := planCredentialUpsert(ctx, tx, s, stmts)
+			credPlan, err := planCredentialUpsert(ctx, tx, s, stmts, credHosts)
+			if err == nil && credPlan.behind {
+				err = hostRowBehindAdmission(credPlan.host)
+			}
 			if err != nil {
 				tx.Rollback()
 				c.mu.Unlock()
@@ -1475,6 +1531,20 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 					c.mu.Unlock()
 					return false, nil
 				}
+			}
+			// The hosts row's key, as it stands just before this statement
+			// runs (host_incarnation.go).
+			if err := stampHostIncarnation(ctx, tx, &s); err != nil {
+				tx.Rollback()
+				c.mu.Unlock()
+				return false, fmt.Errorf("stamp host incarnation: %w", err)
+			}
+			// This host's own row is not written while its own-row hold holds
+			// (own_row_hold.go).
+			if err := c.ownRowStatementRefused(ctx, tx, s); err != nil {
+				tx.Rollback()
+				c.mu.Unlock()
+				return false, err
 			}
 			// A live-row update runs here through the same guarded form every
 			// receiver uses; what is logged is the wire form (live_row_update.go).
@@ -1517,7 +1587,7 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 	// nothing locally.
 	// A secret this node writes without its credential statement (its gate is
 	// closed) also refreshes the credential row it holds (credentials_absorb.go).
-	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables()); err != nil {
+	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables(), true, allCredHosts); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return false, err
@@ -1656,16 +1726,43 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	var mutated []Statement // statements that changed ≥1 row (for unresolved-clear)
 	var parks []func()      // updates that met no row because it has not arrived yet
 	relay := make([]Statement, 0, len(stmts))
+	// The credential upserts' hosts rows, before the batch
+	// (planCredentialUpsert).
+	credHosts, err := readEntryHostRows(ctx, tx, stmts)
+	if err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return 0, err
+	}
 	for _, s := range stmts {
 		// A fence credential carries the retirement it was set after
 		// (credentials_revive_guard.go).
-		credPlan, err := planCredentialUpsert(ctx, tx, s, stmts)
+		credPlan, err := planCredentialUpsert(ctx, tx, s, stmts, credHosts)
+		if err == nil && credPlan.behind {
+			// An operator's password write this node cannot carry: refused,
+			// not dropped (credentials_revive_guard.go).
+			err = hostRowBehindAdmission(credPlan.host)
+		}
 		if err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
 			return 0, err
 		} else if credPlan.skip {
 			continue
+		}
+		// The hosts row's key, as it stands just before this statement runs
+		// (host_incarnation.go).
+		if err := stampHostIncarnation(ctx, tx, &s); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return 0, fmt.Errorf("stamp host incarnation: %w", err)
+		}
+		// This host's own row is not written while its own-row hold holds
+		// (own_row_hold.go).
+		if err := c.ownRowStatementRefused(ctx, tx, s); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return 0, err
 		}
 		// A live-row update runs here through the same guarded form every
 		// receiver uses; what is logged is the wire form (live_row_update.go).
@@ -1707,7 +1804,7 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	// must not be replayed by a peer. See relayStatement.
 	// A secret this node writes without its credential statement (its gate is
 	// closed) also refreshes the credential row it holds (credentials_absorb.go).
-	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables()); err != nil {
+	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables(), true, credHosts); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return 0, err

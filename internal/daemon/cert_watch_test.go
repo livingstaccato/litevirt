@@ -224,3 +224,67 @@ func TestCertWatch_RetriesAKeyFileReportThatFailedToWrite(t *testing.T) {
 		t.Fatalf("the report that failed to write was never retried: %v %v", ok, err)
 	}
 }
+
+// Re-review m-1: a certificate swapped while the daemon runs, over a counted
+// row this host remembers being admitted under, is not re-recorded until the
+// daemon restarts (corrosion.ErrCertSwappedAtRuntime), and peers refuse it in
+// the meantime. The watch raises certificate/cert_swapped_at_runtime naming the
+// restart as the remedy, and resolves it once the serial is recorded.
+//
+// Mutations: drop the reportSwap call on ErrCertSwappedAtRuntime — no
+// condition is raised; drop the resolve on a recorded serial — the condition
+// stays open after the restart.
+func TestCertWatch_RaisesARuntimeSwapUntilRestart(t *testing.T) {
+	ctx := context.Background()
+	host := corrosion.NewTestClientT(t).HostName()
+	w, db, pkiDir := certWatchFixture(t, host)
+	if _, err := db.DB().Exec(`UPDATE hosts SET incarnation = 1, created_at = '2026-01-01T00:00:00.000000000Z' WHERE name = ?`, host); err != nil {
+		t.Fatal(err)
+	}
+	installed := func() (string, string) {
+		c, err := pki.ServedHostCertificate(pkiDir)
+		if err != nil {
+			return "", ""
+		}
+		prev, _ := pki.RenewedFromSerial(c)
+		return strings.ToLower(c.SerialNumber.Text(16)), prev
+	}
+	db.SetOwnAdmissionMemory(&admissionFile{path: filepath.Join(t.TempDir(), OwnAdmissionFileName), host: host})
+	if st, err := db.ConfigureOwnRowHold(ctx, installed); err != nil || st.Held {
+		t.Fatalf("hold at start = %+v, %v", st, err)
+	}
+	w.tick(ctx, time.Now())
+	cond := func() (corrosion.HealthCondition, bool) {
+		c, ok, err := corrosion.GetHealthCondition(ctx, db, certEvaluatorName, condCertSwappedAtRuntime, "host", host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c, ok && c.Lifecycle != corrosion.ConditionResolved
+	}
+	if _, open := cond(); open {
+		t.Fatal("raised before any swap")
+	}
+	// An unrelated certificate (not a renewal) is installed while running.
+	caCert, caKey := filepath.Join(pkiDir, "ca.crt"), filepath.Join(pkiDir, "ca.key")
+	if err := pki.GenerateHostCert(caCert, caKey, filepath.Join(pkiDir, "host.crt"),
+		filepath.Join(pkiDir, "host.key"), host, net.IPv4(127, 0, 0, 1)); err != nil {
+		t.Fatal(err)
+	}
+	swapped, _ := installed()
+	w.tick(ctx, time.Now())
+	c, open := cond()
+	if !open || !strings.Contains(c.Evidence, "systemctl restart litevirt") || !strings.Contains(c.Evidence, swapped) {
+		t.Fatalf("no condition names the runtime swap and the restart: %+v (open %v)", c, open)
+	}
+	if got := recordedSerial(t, db, host); got == swapped {
+		t.Fatal("the swapped serial was re-recorded at runtime")
+	}
+	// The restart: its registration records the serial; a fresh watch resolves.
+	if _, err := db.DB().Exec(`UPDATE hosts SET cert_serial = ? WHERE name = ?`, swapped, host); err != nil {
+		t.Fatal(err)
+	}
+	newCertWatch(host, pkiDir, db, nil, nil).tick(ctx, time.Now())
+	if _, open := cond(); open {
+		t.Fatal("the condition stayed open after the restart recorded the serial")
+	}
+}

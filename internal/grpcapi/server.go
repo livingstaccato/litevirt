@@ -371,6 +371,10 @@ type Server struct {
 	// drainCondMu serialises the judging of drain_move_timed_out with a
 	// background move's leaving it (judgeDrainTimeouts, forgetDrainTimeout).
 	drainCondMu sync.Mutex
+	// drainCommitFault, set only by tests (SetDrainCommitFaultForTest), makes
+	// a drain's ownership commit after a live cut-over fail. nil in
+	// production, where it is never consulted for anything else.
+	drainCommitFault func(vm string) error
 	// migrationNetwork is migration.network: the IPv4 CIDR a migration's data
 	// should travel on (migration_network.go). Empty means the host's cluster
 	// address. localIPs is a test seam for the host's own addresses.
@@ -1925,6 +1929,10 @@ func (s *Server) SetMigrationCAFingerprint(fn func() (string, error)) { s.migrat
 // SetDrainAbortGraceForTest shortens how long a drain waits for libvirt to
 // answer the abort of a timed-out live move.
 func (s *Server) SetDrainAbortGraceForTest(d time.Duration) { s.drainAbortGrace = d }
+
+// SetDrainCommitFaultForTest makes the ownership commit a drain writes after
+// a completed live move fail with fn's error (nil fn: no fault). Tests only.
+func (s *Server) SetDrainCommitFaultForTest(fn func(vm string) error) { s.drainCommitFault = fn }
 
 // localMigrationCA is this host's migration CA fingerprint, "" when it has
 // none (or no hook is set). An error is a CA file that cannot be read: the

@@ -523,3 +523,42 @@ func TestFleet_DrainRecordsAMoveThatCompletesAfterTheClientLeft(t *testing.T) {
 		return okA && okB
 	})
 }
+
+// A live drain move completes, but the ownership commit that follows fails.
+// The guest runs on the target only, so the fallback re-points the VM row
+// there (as `lv migrate` does): one copy, owned where it runs. The source's
+// reconciler starts nothing, and post_migrate runs once, naming the target.
+//
+// Mutation: drop the re-point fallback — the row stays migrating on the
+// source, and goes red.
+func TestFleet_DrainLiveMoveWhoseCommitFailsIsRepointedToTheTarget(t *testing.T) {
+	sc := newStuckLiveDrain(t, false)
+	sc.src.Virt.FailMigrateToTarget = func(name, _ string) error {
+		if name == "slow" {
+			cutOver(t, sc) // completes well inside its 1s timeout
+		}
+		return nil
+	}
+	sc.src.Server.SetDrainCommitFaultForTest(func(vm string) error {
+		if vm == "slow" {
+			return errors.New("test: the ownership commit failed")
+		}
+		return nil
+	})
+
+	if _, err := sc.drain(t); err != nil {
+		t.Logf("drain: %v", err)
+	}
+	waitRow(t, sc.src, sc.dst.Name, "running")
+	if reconcileSource(t, sc) {
+		t.Fatalf("the source's reconciler started slow on %s while it runs on %s: two copies", sc.src.Name, sc.dst.Name)
+	}
+	wantHooks := []string{"pre_migrate_" + sc.src.Name + "_running", "post_migrate_" + sc.dst.Name + "_running"}
+	eventually(t, 10*time.Second, "one post_migrate, naming the target", func() bool {
+		return slices.Equal(sc.hooks(t), wantHooks)
+	})
+	time.Sleep(200 * time.Millisecond)
+	if got := sc.hooks(t); !slices.Equal(got, wantHooks) {
+		t.Fatalf("migrate hooks = %q, want exactly %q", got, wantHooks)
+	}
+}

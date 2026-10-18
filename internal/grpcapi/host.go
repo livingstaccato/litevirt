@@ -896,12 +896,19 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		// detached from the drain's request — a client that went away (Ctrl-C)
 		// must not leave the row migrating on the source, which nothing heals.
 		dctx := context.WithoutCancel(ctx)
-		// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).
-		//runningcheck:allow ownership handoff — this commit names the TARGET host while
-		// running on the source, whose domain MigrateToTarget has already undefined
-		// (MigrateUndefineSource). A marker written here would describe a runtime that
-		// no longer exists; the destination's convergence marks the one that does.
-		if err := corrosion.TransferVMOwnerFresh(dctx, s.db, vm.Name, target.Name, "running"); err != nil {
+		var err error
+		if s.drainCommitFault != nil {
+			err = s.drainCommitFault(vm.Name)
+		}
+		if err == nil {
+			// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).
+			//runningcheck:allow ownership handoff — this commit names the TARGET host while
+			// running on the source, whose domain MigrateToTarget has already undefined
+			// (MigrateUndefineSource). A marker written here would describe a runtime that
+			// no longer exists; the destination's convergence marks the one that does.
+			err = corrosion.TransferVMOwnerFresh(dctx, s.db, vm.Name, target.Name, "running")
+		}
+		if err != nil {
 			// The re-point `lv migrate` falls back to: the VM row only, from
 			// this move's own (source, migrating).
 			//runningcheck:allow ownership handoff after cutover, as above.

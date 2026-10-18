@@ -404,13 +404,15 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 // it never names a container.
 const fetchDirName = ".litevirt+fetch"
 
-// fetchedName is the container name FetchImage builds under, and
-// fetchedImageFile the file in its directory naming the image it was built
-// from (fetchSignature).
-const (
-	fetchedName      = "fetch"
-	fetchedImageFile = "image"
-)
+// fetchedImageFile is the file in a fetch stage naming the image its
+// container was built from (fetchSignature); its "+" keeps it apart from
+// the container's own directory, whatever its name.
+const fetchedImageFile = ".litevirt+image"
+
+// fetchStageTTL is how long a staged fetch is reused and adopted: one left
+// by a recreate that did not go ahead is not taken by a later, unrelated
+// create of the name, which fetches anew.
+const fetchStageTTL = time.Hour
 
 var fetchLocks sync.Map // container name → *sync.Mutex
 
@@ -427,8 +429,10 @@ func fetchSignature(opts CreateOpts) string {
 }
 
 // fetchStage is where FetchImage keeps the container it built for name:
-// <lxcpath>/.litevirt+fetch/<name>, an lxcpath holding one container named
-// fetchedName.
+// <lxcpath>/.litevirt+fetch/<name>, an lxcpath holding one container, also
+// named name, so the download template writes the container's own name into
+// the guest (/etc/hostname, /etc/hosts), and it is never the live member's
+// directory.
 func (r *LxcRunner) fetchStage(name string) string {
 	return filepath.Join(r.lxcpath(), fetchDirName, name)
 }
@@ -469,10 +473,8 @@ func (r *LxcRunner) FetchImage(ctx context.Context, opts CreateOpts) error {
 	unlock := lockFetch(opts.Name)
 	defer unlock()
 	stage := r.fetchStage(opts.Name)
-	if b, err := os.ReadFile(filepath.Join(stage, fetchedImageFile)); err == nil && string(b) == fetchSignature(opts) {
-		if _, err := os.Stat(filepath.Join(stage, fetchedName, "config")); err == nil {
-			return nil // already fetched and kept
-		}
+	if r.freshFetch(stage, opts) {
+		return nil // already fetched and kept
 	}
 	if err := os.RemoveAll(stage); err != nil {
 		return fmt.Errorf("fetch image: %w", err)
@@ -480,7 +482,7 @@ func (r *LxcRunner) FetchImage(ctx context.Context, opts CreateOpts) error {
 	if err := os.MkdirAll(stage, 0o700); err != nil {
 		return fmt.Errorf("fetch image: %w", err)
 	}
-	args := []string{"-P", stage, "-n", fetchedName, "-t", opts.Template}
+	args := []string{"-P", stage, "-n", opts.Name, "-t", opts.Template}
 	if opts.Template == "download" {
 		args = append(args, "--", "-d", opts.Distro, "-r", opts.Release, "-a", opts.Arch)
 	}
@@ -506,14 +508,10 @@ func (r *LxcRunner) adoptFetched(opts CreateOpts) (bool, error) {
 	unlock := lockFetch(opts.Name)
 	defer unlock()
 	stage := r.fetchStage(opts.Name)
-	b, err := os.ReadFile(filepath.Join(stage, fetchedImageFile))
-	if err != nil || string(b) != fetchSignature(opts) {
+	if !r.freshFetch(stage, opts) {
 		return false, nil
 	}
-	built := filepath.Join(stage, fetchedName)
-	if _, err := os.Stat(filepath.Join(built, "config")); err != nil {
-		return false, nil
-	}
+	built := filepath.Join(stage, opts.Name)
 	dst := filepath.Join(r.lxcpath(), opts.Name)
 	if _, err := os.Lstat(dst); err == nil {
 		return false, fmt.Errorf("container %q already exists at %s", opts.Name, dst)
@@ -522,27 +520,42 @@ func (r *LxcRunner) adoptFetched(opts CreateOpts) (bool, error) {
 		return false, fmt.Errorf("move the fetched container into place as %q: %w", opts.Name, err)
 	}
 	_ = os.RemoveAll(stage)
-	if err := rewriteFetchedConfig(filepath.Join(dst, "config"), built, dst, opts.Name); err != nil {
-		_ = os.RemoveAll(dst)
-		return false, err
+	for _, f := range []string{"config", "fstab"} {
+		if err := repointFetched(filepath.Join(dst, f), built, dst); err != nil {
+			_ = os.RemoveAll(dst)
+			return false, err
+		}
 	}
 	return true, nil
 }
 
-// rewriteFetchedConfig points a moved container's config at its new
-// directory (every mention of from becomes to) and names it name.
-func rewriteFetchedConfig(cfg, from, to, name string) error {
-	b, err := os.ReadFile(cfg)
+// freshFetch reports whether stage holds a container built for opts within
+// fetchStageTTL.
+func (r *LxcRunner) freshFetch(stage string, opts CreateOpts) bool {
+	sig := filepath.Join(stage, fetchedImageFile)
+	b, err := os.ReadFile(sig)
+	if err != nil || string(b) != fetchSignature(opts) {
+		return false
+	}
+	if fi, err := os.Stat(sig); err != nil || time.Since(fi.ModTime()) > fetchStageTTL {
+		return false
+	}
+	_, err = os.Stat(filepath.Join(stage, opts.Name, "config"))
+	return err == nil
+}
+
+// repointFetched points a file of a moved container (its config, its
+// fstab) at its new directory: every mention of from becomes to. A file
+// the template did not write is left alone.
+func repointFetched(f, from, to string) error {
+	b, err := os.ReadFile(f)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	lines := strings.Split(strings.ReplaceAll(string(b), from, to), "\n")
-	for i, l := range lines {
-		if k, _, ok := strings.Cut(l, "="); ok && strings.TrimSpace(k) == "lxc.uts.name" {
-			lines[i] = "lxc.uts.name = " + name
-		}
-	}
-	return os.WriteFile(cfg, []byte(strings.Join(lines, "\n")), 0o644)
+	return os.WriteFile(f, []byte(strings.ReplaceAll(string(b), from, to)), 0o644)
 }
 
 // SweepFetchDir removes, at daemon start, every container FetchImage left

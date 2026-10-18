@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -753,7 +754,11 @@ func (f *CTFake) RootfsReferences(_ context.Context, dir string) ([]string, erro
 	var out []string
 	for name := range f.state {
 		b, err := os.ReadFile(filepath.Join(f.dir(name), "config"))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
 		if err != nil {
+			out = append(out, name) // unreadable: cannot be shown not to use it
 			continue
 		}
 		for _, l := range strings.Split(string(b), "\n") {

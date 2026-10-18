@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeLxcCreate puts an lxc-create on PATH that records its arguments in
@@ -26,7 +27,9 @@ while [ $# -gt 0 ]; do
   shift
 done
 if [ -z "$p" ]; then p="$LXCPATH_DEFAULT"; fi
-mkdir -p "$p/$n/rootfs/etc" && printf 'lxc.rootfs.path = dir:%s/%s/rootfs\nlxc.uts.name = %s\n' "$p" "$n" "$n" > "$p/$n/config"
+mkdir -p "$p/$n/rootfs/etc" && printf 'lxc.rootfs.path = dir:%s/%s/rootfs\nlxc.uts.name = %s\nlxc.mount.fstab = %s/%s/fstab\n' "$p" "$n" "$n" "$p" "$n" > "$p/$n/config"
+echo "$n" > "$p/$n/rootfs/etc/hostname"; printf '127.0.0.1 localhost\n127.0.1.1 %s\n' "$n" > "$p/$n/rootfs/etc/hosts"
+echo "proc $p/$n/rootfs/proc proc defaults 0 0" > "$p/$n/fstab"
 if [ ` + map[bool]string{true: "1", false: "0"}[rc != 0] + ` = 1 ]; then echo "ERROR: Failed to download the image index" >&2; exit 1; fi
 exit 0
 `
@@ -101,6 +104,18 @@ func TestFetchImage_TheCreateAdoptsTheFetchedContainer(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(store, fetchDirName, "web")); err == nil {
 		t.Errorf("the staging directory was left behind")
 	}
+	// The guest is the container it became, not the staging name: the
+	// download template wrote its name into /etc/hostname and /etc/hosts.
+	if b, _ := os.ReadFile(filepath.Join(store, "web", "rootfs", "etc", "hostname")); strings.TrimSpace(string(b)) != "web" {
+		t.Errorf("the guest's /etc/hostname is %q, want web", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(store, "web", "rootfs", "etc", "hosts")); !strings.Contains(string(b), "127.0.1.1 web") {
+		t.Errorf("the guest's /etc/hosts is %q, want 127.0.1.1 web", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(store, "web", "fstab")); strings.Contains(string(b), fetchDirName) ||
+		!strings.Contains(string(b), filepath.Join(store, "web", "rootfs")) {
+		t.Errorf("the fstab does not name the container in place: %q", b)
+	}
 	// Another image for the name is not adopted: lxc-create builds it.
 	other := opts
 	other.Name, other.Release = "db", "3.23"
@@ -120,7 +135,7 @@ func TestFetchImage_TheCreateAdoptsTheFetchedContainer(t *testing.T) {
 // SweepFetchDir clears what an earlier run left staged.
 func TestSweepFetchDir(t *testing.T) {
 	store := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(store, fetchDirName, "web", fetchedName, "rootfs"), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(store, fetchDirName, "web", "web", "rootfs"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(store, "web"), 0o700); err != nil {
@@ -155,5 +170,29 @@ func TestFetchImage_RootfsPathIsResolvedAsCreateResolvesIt(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(log); len(b) != 0 {
 		t.Errorf("lxc-create ran for a rootfs path: %q", b)
+	}
+}
+
+// A staged fetch is adopted only while fresh: one left by a recreate that
+// did not proceed is not taken, weeks later, by an unrelated create of the
+// name, which fetches anew.
+func TestFetchImage_AStaleStageIsNotAdopted(t *testing.T) {
+	store := t.TempDir()
+	log := fakeLxcCreate(t, 0)
+	r := &LxcRunner{Lxcpath: store}
+	opts := CreateOpts{Name: "web", Template: "download", Distro: "alpine", Release: "3.22", Arch: "amd64"}
+	if err := r.FetchImage(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * fetchStageTTL)
+	if err := os.Chtimes(filepath.Join(store, fetchDirName, "web", fetchedImageFile), old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Create(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	args, _ := os.ReadFile(log)
+	if n := strings.Count(string(args), "-t download"); n != 2 {
+		t.Fatalf("lxc-create ran %d times (%q), want twice: the stale stage is not adopted", n, args)
 	}
 }

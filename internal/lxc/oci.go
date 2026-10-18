@@ -86,11 +86,14 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	// fresh directory beside it that then replaces it.
 	bundle := opts.Dest
 	if exists {
-		stage, err := os.MkdirTemp(filepath.Dir(opts.Dest), "."+filepath.Base(opts.Dest)+unpackInfix)
+		stage, err := stageUnpack(opts.Dest)
 		if err != nil {
-			return fmt.Errorf("stage the unpack beside %s: %w", opts.Dest, err)
+			return err
 		}
-		defer func() { _ = os.RemoveAll(stage) }()
+		defer func() {
+			_ = os.RemoveAll(stage)
+			_ = os.Remove(filepath.Dir(stage)) // the staging directory, once empty
+		}()
 		bundle = stage
 	}
 	tmpLayout := opts.Dest + ".oci"

@@ -33,6 +33,13 @@ const rootfsMeasureBudget = 10 * time.Second
 // there. If that host cannot be reached, the cluster view is returned with
 // host_detail=false and those fields unknown, rather than nothing.
 func (s *Server) InspectContainer(ctx context.Context, req *pb.InspectContainerRequest) (*pb.ContainerDetail, error) {
+	// A recreate's pre-delete probe from a peer (probeRecreateOnMember).
+	if handled, err := s.answerRecreateProbe(ctx, req); handled {
+		if err != nil {
+			return nil, err
+		}
+		return &pb.ContainerDetail{}, nil
+	}
 	if err := s.requirePermPrecheck(ctx, "viewer"); err != nil {
 		return nil, err
 	}

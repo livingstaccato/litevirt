@@ -163,8 +163,9 @@ func (s *Server) recreatePinnedImage(ctx context.Context, pf recreatePreflight, 
 	if cur := lxc.ReadImageGen(lxc.BundleDir(p)); cur != pf.pinGen {
 		s.audit(ctx, "ct.recreate-security", name, "image under "+pf.template+" replaced since the member was built", "denied")
 		return status.Errorf(codes.PermissionDenied,
-			"recreating container %q: it is privileged or legacy-confined, and the image under %q on %s was replaced since it was built "+
-				"(a pull over the item), so this recreate would run a new image as root on the host; that needs the Admin role "+
+			"recreating container %q: it is privileged or legacy-confined, and the image under %q on %s is not the pull it was built from "+
+				"(the item was replaced since by a pull over it, or the member was built on another host, whose items are its own), "+
+				"so this recreate would run another image as root on the host; that needs the Admin role "+
 				"or the ContainerRoot role on it (lv role grant ContainerRoot <principal> --path %s). The member was left as it is",
 			name, pf.template, s.hostName, ctRBACPathFor(pf.project, name))
 	}
@@ -229,12 +230,12 @@ func (s *Server) recreateTemplateChecks(ctx context.Context, template, project, 
 // the caller's context, so a caller who gives up during a slow fetch, or a
 // refusal, leaves the member as it is before anything is detached; then
 // again at the delete, where the fetch finds the image it kept
-// (lxc.LxcRunner.FetchImage). The probe is a DeleteContainer for the name
-// "." — which every build refuses as a path traversal, deleting nothing —
-// carrying the real name in recreateProbeMDKey. A host that knows the probe
-// answers it, and says so in the recreateProbeMDKey response header; a host
-// that predates it refuses the name, and the checks run at the delete only,
-// as before.
+// (lxc.LxcRunner.FetchImage). The probe rides InspectContainer for the
+// member, with the real name and recreateProbeMDKey: a host that knows the
+// probe answers it and says so in the recreateProbeMDKey response header;
+// a host that predates it serves the plain read InspectContainer always
+// was, and its checks run at the delete only, as before. Whatever the
+// build, the worst a probe can do is a read.
 const recreateProbeMDKey = "x-litevirt-recreate-probe-bin"
 
 // probeRecreateOnMember runs the member host's recreate checks for name
@@ -247,9 +248,9 @@ func (s *Server) probeRecreateOnMember(ctx context.Context, host, name string, p
 		return nil
 	}
 	defer closer()
-	out := metadata.AppendToOutgoingContext(s.recreatePreflightOutgoing(withRecreatePreflight(ctx, pf)), recreateProbeMDKey, name)
+	out := metadata.AppendToOutgoingContext(s.recreatePreflightOutgoing(withRecreatePreflight(ctx, pf)), recreateProbeMDKey, "1")
 	var hdr metadata.MD
-	_, err = c.DeleteContainer(out, &pb.DeleteContainerRequest{Name: ".", HostName: host}, grpc.Header(&hdr))
+	_, err = c.InspectContainer(out, &pb.InspectContainerRequest{Name: name, HostName: host}, grpc.Header(&hdr))
 	if len(hdr.Get(recreateProbeMDKey)) == 0 {
 		if ctx.Err() != nil {
 			return status.Errorf(codes.Canceled, "recreating container %q: %v; the member was left as it is", name, ctx.Err())
@@ -261,18 +262,17 @@ func (s *Server) probeRecreateOnMember(ctx context.Context, host, name string, p
 
 // answerRecreateProbe answers a recreate probe (probeRecreateOnMember) from
 // a peer: handled reports whether req was one.
-func (s *Server) answerRecreateProbe(ctx context.Context, req *pb.DeleteContainerRequest) (handled bool, err error) {
-	if req.Name != "." || !s.isRemotePeer(ctx) {
+func (s *Server) answerRecreateProbe(ctx context.Context, req *pb.InspectContainerRequest) (handled bool, err error) {
+	if !s.isRemotePeer(ctx) {
 		return false, nil
 	}
 	md, _ := metadata.FromIncomingContext(ctx)
-	v := md.Get(recreateProbeMDKey)
-	if len(v) == 0 {
+	if len(md.Get(recreateProbeMDKey)) == 0 {
 		return false, nil
 	}
 	_ = grpc.SetHeader(ctx, metadata.Pairs(recreateProbeMDKey, "1"))
-	if err := safename.ValidateContainerName(v[0]); err != nil {
+	if err := safename.ValidateContainerName(req.Name); err != nil {
 		return true, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	return true, s.recreateDeleteCheck(ctx, v[0])
+	return true, s.recreateDeleteCheck(ctx, req.Name)
 }

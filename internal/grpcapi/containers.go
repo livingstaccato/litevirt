@@ -595,14 +595,6 @@ func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest
 }
 
 func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerRequest) (*emptypb.Empty, error) {
-	// A recreate's pre-delete probe from a peer deletes nothing
-	// (probeRecreateOnMember).
-	if handled, err := s.answerRecreateProbe(ctx, req); handled {
-		if err != nil {
-			return nil, err
-		}
-		return &emptypb.Empty{}, nil
-	}
 	if err := safename.ValidateContainerName(req.Name); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}

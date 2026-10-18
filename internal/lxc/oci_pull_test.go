@@ -38,6 +38,7 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+[ -n "$FAKE_UMOCI_LOG" ] && echo "$bundle" >> "$FAKE_UMOCI_LOG"
 if [ ` + fail + ` = 1 ]; then echo "umoci: get manifest: blob not found" >&2; exit 1; fi
 mkdir -p "$bundle"
 if [ -e "$bundle/config.json" ]; then echo "create runtime bundle: config.json already exists" >&2; exit 1; fi
@@ -165,7 +166,9 @@ func TestPullOCI_WithoutReplaceAnExistingItemIsRefused(t *testing.T) {
 
 // What a crash leaves of a replacing pull is finished at start: an old
 // bundle whose item is missing goes back, one whose item is there and every
-// unpack directory are removed, and nothing else is touched.
+// unpack directory are removed. The leftovers live in a directory whose name
+// no item can have, so an item named like one (a pull --dest
+// .web.unpack-1) is never touched.
 func TestRecoverOCILibrary(t *testing.T) {
 	lib := t.TempDir()
 	mk := func(rel, marker string) {
@@ -176,12 +179,13 @@ func TestRecoverOCILibrary(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	mk(".web.unpack-1.old", "web-old") // crash between the renames: web missing
-	mk(".web.unpack-2", "web-stage")   // a staged unpack
-	mk("db", "db-new")                 // swap finished
-	mk(".db.unpack-3.old", "db-old")   // ...but the old one was not removed
-	mk("notes", "keep")                // anything else
-	mk(".hidden", "keep")
+	mk(filepath.Join(unpackDirName, "web+1+old"), "web-old") // crash between the renames: web missing
+	mk(filepath.Join(unpackDirName, "web+2"), "web-stage")   // a staged unpack
+	mk("db", "db-new")                                       // swap finished
+	mk(filepath.Join(unpackDirName, "db+3+old"), "db-old")   // ...but the old one was not removed
+	mk(".web.unpack-1", "user item")                         // an item a user named like a leftover
+	mk(".x.unpack-2.old", "user item 2")
+	mk("notes", "keep")
 	if err := RecoverOCILibrary(lib); err != nil {
 		t.Fatal(err)
 	}
@@ -189,14 +193,33 @@ func TestRecoverOCILibrary(t *testing.T) {
 	if read("web") != "web-old" {
 		t.Errorf("web holds %q, want the old bundle put back", read("web"))
 	}
-	if read("db") != "db-new" || read("notes") != "keep" || read(".hidden") != "keep" {
-		t.Errorf("an item or another directory was changed: db=%q notes=%q hidden=%q", read("db"), read("notes"), read(".hidden"))
+	if read("db") != "db-new" || read("notes") != "keep" || read(".web.unpack-1") != "user item" || read(".x.unpack-2.old") != "user item 2" {
+		t.Errorf("an item was changed: db=%q notes=%q .web.unpack-1=%q .x.unpack-2.old=%q",
+			read("db"), read("notes"), read(".web.unpack-1"), read(".x.unpack-2.old"))
 	}
-	ents, _ := os.ReadDir(lib)
-	for _, e := range ents {
-		if strings.Contains(e.Name(), unpackInfix) {
-			t.Errorf("%s survived the recovery", e.Name())
-		}
+	if ents, _ := os.ReadDir(filepath.Join(lib, unpackDirName)); len(ents) != 0 {
+		t.Errorf("leftovers survived the recovery: %v", ents)
+	}
+}
+
+// A replacing pull stages in the reserved directory, never beside the item
+// under a name an item could have.
+func TestPullOCI_ReplaceStagesInTheReservedDir(t *testing.T) {
+	fakeOCITools(t, false)
+	lib := t.TempDir()
+	dest := filepath.Join(lib, "web")
+	ctx := context.Background()
+	if err := PullOCI(ctx, PullOCIOptions{Image: "alpine:3.21", Dest: dest}); err != nil {
+		t.Fatal(err)
+	}
+	umoci := filepath.Join(t.TempDir(), "umoci-args")
+	t.Setenv("FAKE_UMOCI_LOG", umoci)
+	if err := PullOCI(ctx, PullOCIOptions{Image: "alpine:3.22", Dest: dest, Replace: true}); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(umoci)
+	if !strings.Contains(string(b), filepath.Join(lib, unpackDirName)+"/web+") {
+		t.Fatalf("the replacing pull unpacked into %q, want under %s", b, unpackDirName)
 	}
 }
 
@@ -289,4 +312,41 @@ func TestCreateFromAnItem_HoldsTheLockAndRecordsTheGeneration(t *testing.T) {
 	if got.c.ImageGen == "" || got.c.ImageGen != ReadImageGen(dest) {
 		t.Fatalf("the create recorded generation %q, want the item's %q", got.c.ImageGen, ReadImageGen(dest))
 	}
+}
+
+// A container created through another path to the item (a symlinked data
+// directory) uses it in place too, and is named; a pull through either path
+// takes the same lock.
+func TestRootfsReferences_ThroughAnAlias(t *testing.T) {
+	store, real := t.TempDir(), t.TempDir()
+	item := filepath.Join(real, "web")
+	if err := os.MkdirAll(filepath.Join(item, "rootfs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "data")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(store, "old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store, "old", "config"), []byte("lxc.rootfs.path = dir:"+filepath.Join(alias, "web", "rootfs")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := &LxcRunner{Lxcpath: store}
+	got, err := r.RootfsReferences(item)
+	if err != nil || strings.Join(got, ",") != "old" {
+		t.Fatalf("RootfsReferences through an alias = %v (%v), want [old]", got, err)
+	}
+	unlock := LockOCIItem(item)
+	done := make(chan struct{})
+	go func() { LockOCIItem(filepath.Join(alias, "web"))(); close(done) }()
+	select {
+	case <-done:
+		unlock()
+		t.Fatal("the lock taken through an alias is another lock")
+	case <-time.After(200 * time.Millisecond):
+	}
+	unlock()
+	<-done
 }

@@ -188,3 +188,36 @@ func TestExecContainer_TheOwnerRechecksAForwardedExec(t *testing.T) {
 		}
 	}
 }
+
+// The pre-delete recreate probe is a read: it rides InspectContainer, which
+// on any build only reads, never DeleteContainer, which on v1.0.3–v1.0.25
+// would hand "." to lxc-destroy.
+func TestRecreateProbe_RidesInspectNeverDelete(t *testing.T) {
+	s := testServer(t)
+	rt := &fakeCTRuntime{fetchErr: errFetchForTest}
+	s.containerRuntime = rt
+	seedExecCT(t, s, "web", unprivDefault)
+	peer := context.WithValue(context.WithValue(peerCtxFor(t, s, "host-b"), ctxKeyUsername, "host-b"), ctxKeyRole, "admin")
+	probe := metadata.NewIncomingContext(peer, metadata.Pairs(
+		recreateProbeMDKey, "web", recreateTemplateMDKey, "download", recreateProjectMDKey, "acme",
+		recreateDistroMDKey, "alpine", recreateReleaseMDKey, "3.99", recreateArchMDKey, "amd64"))
+	if _, err := s.InspectContainer(probe, &pb.InspectContainerRequest{Name: "web", HostName: s.hostName}); status.Code(err) != codes.FailedPrecondition ||
+		!strings.Contains(err.Error(), "left as it is") {
+		t.Fatalf("the probe on InspectContainer: %v, want the fetch refusal", err)
+	}
+	if len(rt.fetchCalls) != 1 {
+		t.Fatalf("fetch calls %d, want 1", len(rt.fetchCalls))
+	}
+	if _, err := s.DeleteContainer(probe, &pb.DeleteContainerRequest{Name: ".", HostName: s.hostName}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("a probe on DeleteContainer: %v, want the name refused", err)
+	}
+	if len(rt.fetchCalls) != 1 || len(rt.deleteCalls) != 0 {
+		t.Fatalf("DeleteContainer acted on a probe: fetch %d delete %v", len(rt.fetchCalls), rt.deleteCalls)
+	}
+	// Without the probe key Inspect is the plain read it always was.
+	if _, err := s.InspectContainer(peer, &pb.InspectContainerRequest{Name: "web", HostName: s.hostName}); err != nil {
+		t.Fatalf("a plain inspect from a peer: %v", err)
+	}
+}
+
+var errFetchForTest = status.Error(codes.Unavailable, "no image alpine 3.99")

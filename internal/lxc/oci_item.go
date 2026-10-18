@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/litevirt/litevirt/internal/randid"
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // ErrOCIItemExists is a pull into a Dest that already holds an unpacked
@@ -24,13 +25,28 @@ var ErrOCIItemExists = errors.New("an OCI image is already unpacked there")
 // A bundle pulled before generations were written has none ("").
 const ImageGenFile = ".litevirt-image-gen"
 
-// unpackInfix names the directory a replacing pull unpacks into, beside the
-// item: ".<item>.unpack-<random>"; the old bundle is set aside as that name
-// plus oldSuffix while the two are swapped (replaceBundle).
+// unpackDirName is the directory in the item's parent where a replacing pull
+// stages: "<item>+<random>" for the new bundle, and that name plus oldPlus
+// for the old one while the two are swapped (replaceBundle). "+" is outside
+// every item name's charset (safename), so nothing in or named like this
+// directory is ever an item, and RecoverOCILibrary touches nothing else.
 const (
-	unpackInfix = ".unpack-"
-	oldSuffix   = ".old"
+	unpackDirName = ".litevirt+unpack"
+	oldPlus       = "+old"
 )
+
+// stageUnpack makes the directory a replacing pull of dest unpacks into.
+func stageUnpack(dest string) (string, error) {
+	dir := filepath.Join(filepath.Dir(dest), unpackDirName)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("stage the unpack of %s: %w", dest, err)
+	}
+	stage, err := os.MkdirTemp(dir, filepath.Base(dest)+"+")
+	if err != nil {
+		return "", fmt.Errorf("stage the unpack of %s: %w", dest, err)
+	}
+	return stage, nil
+}
 
 func writeImageGen(bundle string) error {
 	if err := os.WriteFile(filepath.Join(bundle, ImageGenFile), []byte(randid.New()+"\n"), 0o644); err != nil {
@@ -64,7 +80,7 @@ var ociItemLocks sync.Map // bundle dir → *sync.Mutex
 // the bundle at dir (a replacing pull, a create copying it, a fetch judging
 // it), so a create never copies a bundle half replaced. It returns the unlock.
 func LockOCIItem(dir string) func() {
-	m, _ := ociItemLocks.LoadOrStore(filepath.Clean(dir), &sync.Mutex{})
+	m, _ := ociItemLocks.LoadOrStore(canonPath(dir), &sync.Mutex{})
 	mu := m.(*sync.Mutex)
 	mu.Lock()
 	return mu.Unlock
@@ -87,10 +103,10 @@ func IsBundle(dir string) (bool, error) {
 // replaceBundle puts the bundle unpacked at stage in dest's place, and
 // removes the bundle dest held. Both are in one directory, so each step is a
 // rename; if the second fails, the old bundle is put back. A crash between
-// the two leaves the old bundle at stage+oldSuffix, which
+// the two leaves the old bundle at stage+oldPlus, which
 // RecoverOCILibrary puts back.
 func replaceBundle(stage, dest string) error {
-	old := stage + oldSuffix
+	old := stage + oldPlus
 	if err := os.Rename(dest, old); err != nil {
 		return fmt.Errorf("replace %s: set the old image aside: %w", dest, err)
 	}
@@ -103,16 +119,18 @@ func replaceBundle(stage, dest string) error {
 	if err := os.RemoveAll(old); err != nil {
 		return fmt.Errorf("pulled into %s, but removing the old image at %s failed: %w", dest, old, err)
 	}
+	_ = os.Remove(filepath.Dir(stage)) // the staging directory, once empty
 	return nil
 }
 
 // RecoverOCILibrary finishes, at daemon start, what a crash left of a
-// replacing pull in the OCI library lib: an old bundle set aside whose item
-// is missing goes back in its place (the swap never finished), one whose
-// item is there is removed (it finished), and an unpack directory is
-// removed. Nothing else in lib is touched.
+// replacing pull in the OCI library lib (its unpackDirName): an old bundle
+// set aside whose item is missing goes back in its place (the swap never
+// finished), one whose item is there is removed (it finished), and an
+// unpack directory is removed. Nothing outside unpackDirName is touched.
 func RecoverOCILibrary(lib string) error {
-	ents, err := os.ReadDir(lib)
+	dir := filepath.Join(lib, unpackDirName)
+	ents, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -122,13 +140,10 @@ func RecoverOCILibrary(lib string) error {
 	var errs []error
 	for _, e := range ents {
 		n := e.Name()
-		if !e.IsDir() || !strings.HasPrefix(n, ".") || !strings.Contains(n, unpackInfix) {
-			continue
-		}
-		item := strings.TrimPrefix(n[:strings.LastIndex(n, unpackInfix)], ".")
-		p := filepath.Join(lib, n)
-		if strings.HasSuffix(n, oldSuffix) {
-			if _, serr := os.Lstat(filepath.Join(lib, item)); errors.Is(serr, os.ErrNotExist) && item != "" {
+		p := filepath.Join(dir, n)
+		item, _, _ := strings.Cut(n, "+")
+		if strings.HasSuffix(n, oldPlus) && item != "" && safeItemName(item) {
+			if _, serr := os.Lstat(filepath.Join(lib, item)); errors.Is(serr, os.ErrNotExist) {
 				slog.Warn("oci library: a replacing pull was interrupted; putting the old image back", "item", item)
 				if rerr := os.Rename(p, filepath.Join(lib, item)); rerr != nil {
 					errs = append(errs, rerr)
@@ -143,13 +158,16 @@ func RecoverOCILibrary(lib string) error {
 	return errors.Join(errs...)
 }
 
+// safeItemName reports whether item is a library item name (safename).
+func safeItemName(item string) bool { return safename.ValidateName(item) == nil }
+
 // RootfsReferences names the containers in this runner's store whose config
 // points lxc.rootfs.path at dir or anything under it. A container created
 // by v1.0.5 to v1.1.0 from a library item used the item's rootfs in place,
 // so the item cannot be replaced while one exists. A config that cannot be
 // read is named too: it cannot be shown not to.
 func (r *LxcRunner) RootfsReferences(dir string) ([]string, error) {
-	dir = filepath.Clean(dir)
+	dir = canonPath(dir)
 	ents, err := os.ReadDir(r.lxcpath())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -171,7 +189,7 @@ func (r *LxcRunner) RootfsReferences(dir string) ([]string, error) {
 			out = append(out, e.Name())
 			continue
 		}
-		if ref != "" && (ref == dir || strings.HasPrefix(ref, dir+string(filepath.Separator))) {
+		if ref = canonPath(ref); ref != "" && (ref == dir || strings.HasPrefix(ref, dir+string(filepath.Separator))) {
 			out = append(out, e.Name())
 		}
 	}
@@ -201,4 +219,19 @@ func configRootfsPath(cfg string) (string, error) {
 		return filepath.Clean(v), nil
 	}
 	return "", sc.Err()
+}
+
+// canonPath is p with every symlink resolved, so two paths to one directory
+// (a symlinked data directory) compare equal; for a path that does not exist
+// yet, its nearest existing parent is resolved and the rest kept.
+func canonPath(p string) string {
+	p = filepath.Clean(p)
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	parent := filepath.Dir(p)
+	if parent == p {
+		return p
+	}
+	return filepath.Join(canonPath(parent), filepath.Base(p))
 }

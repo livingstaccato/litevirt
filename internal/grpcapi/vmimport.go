@@ -148,7 +148,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	space.begin()
 
 	// Resolve foreign networks → bridges + MAC policy (also surfaced by --inspect).
-	if err := s.applyImportNetworks(fv, first); err != nil {
+	if err := s.applyImportNetworks(ctx, fv, first); err != nil {
 		return err
 	}
 
@@ -843,8 +843,14 @@ func (s *Server) parseImportSource(ctx context.Context, format, srcPath, importD
 // the "*" wildcard from --network, or the name as-is) and applies the MAC policy.
 // Two NICs on the same resolved bridge collide on vm_interfaces (vm_name,
 // network_name) — rejected here (v1 limitation).
-func (s *Server) applyImportNetworks(fv *vmimport.ForeignVM, meta *pb.ImportVMRequest) error {
+func (s *Server) applyImportNetworks(ctx context.Context, fv *vmimport.ForeignVM, meta *pb.ImportVMRequest) error {
 	seen := map[string]bool{}
+	macs := s.newMACAllocator()
+	if meta.PreserveMac {
+		for _, n := range fv.NICs {
+			macs.reserve(n.MAC)
+		}
+	}
 	for i := range fv.NICs {
 		n := &fv.NICs[i]
 		bridge := meta.NetMap[n.Network]
@@ -865,7 +871,11 @@ func (s *Server) applyImportNetworks(fv *vmimport.ForeignVM, meta *pb.ImportVMRe
 		seen[bridge] = true
 		n.Network = bridge
 		if !meta.PreserveMac || n.MAC == "" {
-			n.MAC = lv.GenerateMAC()
+			m, err := macs.next(ctx)
+			if err != nil {
+				return err
+			}
+			n.MAC = m
 		}
 	}
 	return nil

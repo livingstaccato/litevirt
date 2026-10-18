@@ -20,7 +20,6 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/opjournal"
@@ -246,7 +245,10 @@ func (s *Server) attachNICOwner(ctx context.Context, req *pb.AttachDeviceRequest
 	spec := req.Nic
 	mac := spec.Mac
 	if mac == "" {
-		mac = lv.GenerateMAC()
+		var merr error
+		if mac, merr = s.newMACAllocator().next(ctx); merr != nil {
+			return nil, merr
+		}
 	}
 	model := spec.Model
 	if model == "" {

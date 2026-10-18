@@ -511,8 +511,13 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	var seedNICs []cloudinit.NIC
 	var isoPicks []isoPick
 	defer func() { s.releaseHostIsolatedPicks(isoPicks) }()
+	macs := s.newMACAllocator()
 	for i, n := range srcSpec.Network {
-		mac := lv.GenerateMAC()
+		mac, merr := macs.next(ctx)
+		if merr != nil {
+			cleanup()
+			return nil, merr
+		}
 		bridge := network.FlatBridgeName(n.Name)
 		if pb, perr := s.provisionForVM(ctx, n.Name); perr == nil && pb != "" {
 			bridge = pb

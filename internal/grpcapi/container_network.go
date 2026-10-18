@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"log/slog"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -138,6 +139,26 @@ type containerNICPlan struct {
 func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName string, nics []*pb.ContainerNetwork) (*containerNICPlan, error) {
 	p := &containerNICPlan{}
 	haveGateway := false // one default route: the first managed NIC with a subnet
+	// A MAC the request names must be its NIC's own: one another live NIC
+	// records would put two NICs on one MAC, and the guard keyed by it would
+	// admit the other's traffic.
+	owner := corrosion.ContainerGuardOwner(s.hostName, ctName)
+	seenMAC := map[string]bool{}
+	var explicit []string
+	for _, n := range nics {
+		if m := strings.ToLower(n.GetMac()); m != "" {
+			if seenMAC[m] {
+				return nil, status.Errorf(codes.InvalidArgument, "MAC %s is given to two NICs of this request", m)
+			}
+			seenMAC[m] = true
+			explicit = append(explicit, m)
+		}
+	}
+	if mac, holder, herr := s.macHolderOtherThan(ctx, explicit, owner); herr != nil {
+		return nil, herr
+	} else if holder != "" {
+		return nil, status.Errorf(codes.AlreadyExists, "MAC %s is already used by %s", mac, holder)
+	}
 	for i, n := range nics {
 		netName := n.NetworkName
 		var def *compose.NetworkDef
@@ -240,6 +261,16 @@ func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName strin
 			// CTs on different hosts (shared L2) don't collide. (GenerateMAC's 24-bit
 			// 52:54:00 space is VM-shared; CTs get the wider scheme.)
 			mac = corrosion.ContainerMAC(s.hostName, ctName, i)
+			if seenMAC[mac] {
+				return nil, status.Errorf(codes.InvalidArgument,
+					"the MAC %s derived for NIC %d is also given to another NIC of this request; name another mac for one of them", mac, i)
+			}
+			if _, holder, herr := s.macHolderOtherThan(ctx, []string{mac}, owner); herr != nil {
+				return nil, herr
+			} else if holder != "" {
+				return nil, status.Errorf(codes.AlreadyExists,
+					"the MAC %s derived for NIC %d of container %q is already used by %s; name a mac for the NIC", mac, i, ctName, holder)
+			}
 		}
 		veth := containerVethName(ctName, i)
 		// Allocate the IP NOW (writing the lease) — tombstone- and race-safe. A

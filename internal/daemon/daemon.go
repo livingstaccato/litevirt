@@ -286,7 +286,13 @@ const localMaxRecvMsgSize = 256 << 20
 // On a WAL-quarantined daemon both writes are refused by the replicated write
 // path, as every write is: the host stays as the cluster recorded it.
 func (d *Daemon) writeBootState(ctx context.Context, cpus, memMiB, diskGiB int, hasResources bool) {
-	boot := hostboot.BootState(ctx, d.db, d.cfg.HostName, d.cfg.DataDir, d.upgradePending, time.Now())
+	d.writeBootStateWith(ctx, cpus, memMiB, diskGiB, hasResources, d.upgradePending)
+}
+
+// writeBootStateWith is writeBootState with the post-upgrade sentinel given:
+// a boot passes d.upgradePending, the own-row reconcile false.
+func (d *Daemon) writeBootStateWith(ctx context.Context, cpus, memMiB, diskGiB int, hasResources, upgradePending bool) {
+	boot := hostboot.BootState(ctx, d.db, d.cfg.HostName, d.cfg.DataDir, upgradePending, time.Now())
 	slog.Info("boot state", "state", boot.State, "await_serving", boot.AwaitServing, "deferred", boot.Deferred, "from", boot.From, "reason", boot.Reason)
 	r := hostboot.Report{Version: d.cfg.Version, CPUs: cpus, MemMiB: memMiB, DiskGiB: diskGiB, HasResources: hasResources}
 	reportOnServing := func(from string) confirmFunc {

@@ -319,3 +319,29 @@ func TestAdmissionFile_StoreSyncsTheDirectory(t *testing.T) {
 		t.Errorf("syncDir(%s): %v", dir, err)
 	}
 }
+
+// Lab test 26, F6: an own-row reconcile in a process a post-upgrade re-exec
+// started, after its watchdog confirmed the upgrade, keeps the host active.
+// Re-running the boot's decision wrote 'upgrading' again, and nothing
+// confirmed it a second time.
+func TestReconcileBootReport_APostUpgradeProcessStaysActive(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "h", Address: "127.0.0.1", SSHUser: "root", CertSerial: "s", State: "active", Version: "v1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	d := &Daemon{cfg: &Config{HostName: "h", DataDir: t.TempDir(), Version: "v2"}, db: db, upgradePending: true}
+	d.reconcileBootReport(ctx)
+	h, err := corrosion.GetHost(ctx, db, "h")
+	if err != nil || h == nil {
+		t.Fatalf("GetHost: %v", err)
+	}
+	if h.State != "active" || h.Version != "v2" {
+		t.Errorf("after the reconcile the host is (%s, %s), want (active, v2)", h.State, h.Version)
+	}
+}

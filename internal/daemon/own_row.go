@@ -191,10 +191,47 @@ func (d *Daemon) reconcileOwnRow(ctx context.Context) {
 	if err := d.reconcileOwnEndpoint(ctx); err != nil {
 		slog.Warn("own-row reconcile: address and port", "error", err)
 	}
+	d.reconcileBootReport(ctx)
+}
+
+// reconcileBootReport writes this running daemon's boot report on its row
+// without re-running the boot's own decision for a host the boot already
+// brought up. That decision belongs to the boot: a post-upgrade boot's
+// 'upgrading', whose watchdog confirms it once, would otherwise be written
+// again for the life of the process, and nothing would confirm it twice.
+//
+//   - recorded 'active': its version and resources, keeping the state and
+//     when it became active;
+//   - recorded 'upgrading': nothing; the boot's serving check or the upgrade
+//     watchdog records it active, with the report;
+//   - recorded anything else (joining after a re-admission, fenced, offline,
+//     draining, maintenance): it returns to service as a boot's would
+//     (writeBootState), without the post-upgrade sentinel.
+func (d *Daemon) reconcileBootReport(ctx context.Context) {
 	d.bootRes.mu.Lock()
 	cpus, mem, disk, has := d.bootRes.cpus, d.bootRes.memMiB, d.bootRes.diskGiB, d.bootRes.hasResources
 	d.bootRes.mu.Unlock()
-	d.writeBootState(ctx, cpus, mem, disk, has)
+	h, err := corrosion.GetHost(ctx, d.db, d.cfg.HostName)
+	if err != nil || h == nil {
+		slog.Warn("own-row reconcile: read this host's row for its boot report", "error", err)
+		return
+	}
+	switch h.State {
+	case "upgrading":
+	case "active":
+		if d.cfg.Version != "" {
+			if err := corrosion.UpdateHostVersion(ctx, d.db, d.cfg.HostName, d.cfg.Version); err != nil {
+				slog.Warn("own-row reconcile: version", "error", err)
+			}
+		}
+		if has {
+			if err := corrosion.UpdateHostResources(ctx, d.db, d.cfg.HostName, cpus, mem, disk); err != nil {
+				slog.Warn("own-row reconcile: resources", "error", err)
+			}
+		}
+	default:
+		d.writeBootStateWith(ctx, cpus, mem, disk, has, false)
+	}
 }
 
 // reconcileOwnEndpoint corrects this host's recorded address and gRPC port.

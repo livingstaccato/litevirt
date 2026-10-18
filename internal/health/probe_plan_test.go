@@ -378,3 +378,24 @@ func TestPeerUp_ProbesAPeerOutsideThePlan(t *testing.T) {
 		t.Errorf("PeerUp(%s) = false for a peer probed healthy this cycle", inside)
 	}
 }
+
+// SetVoterSetForTests may be called while the checker's loop is probing:
+// the hook and the plan's read of it share the checker's lock (run under
+// -race).
+func TestSetVoterSetForTests_IsSafeDuringACycle(t *testing.T) {
+	db := testCheckHostDB(t)
+	ctx := context.Background()
+	c := NewChecker("self", t.TempDir(), db)
+	c.writeFn = func(context.Context, string, ...interface{}) error { return nil }
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 50 {
+			c.checkAllPeers(ctx)
+		}
+	}()
+	for range 50 {
+		c.SetVoterSetForTests(func(context.Context) (map[string]bool, error) { return nil, nil })
+	}
+	<-done
+}

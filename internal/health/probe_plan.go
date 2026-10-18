@@ -103,8 +103,11 @@ func ObserverPlan(observer string, hosts []corrosion.HostRecord, voters map[stri
 // voters reads the voter set the plan protects: corrosion.VoterSet unless a
 // test replaced it.
 func (c *Checker) voters(ctx context.Context) (map[string]bool, error) {
-	if c.voterSet != nil {
-		return c.voterSet(ctx)
+	c.mu.Lock()
+	fn := c.voterSet
+	c.mu.Unlock()
+	if fn != nil {
+		return fn(ctx)
 	}
 	return corrosion.VoterSet(ctx, c.db)
 }
@@ -140,7 +143,9 @@ func (c *Checker) PeerUp(ctx context.Context, host string) bool {
 func (c *Checker) CheckAllPeersForTests(ctx context.Context) bool { return c.checkAllPeers(ctx) }
 
 // SetVoterSetForTests replaces corrosion.VoterSet as the voter set the probe
-// plan reads.
+// plan reads. Safe while the checker runs.
 func (c *Checker) SetVoterSetForTests(fn func(context.Context) (map[string]bool, error)) {
+	c.mu.Lock()
 	c.voterSet = fn
+	c.mu.Unlock()
 }

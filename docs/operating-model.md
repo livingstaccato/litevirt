@@ -1413,7 +1413,8 @@ leadership churn or a partition.
   voter and fence and recovery quorums see the same rows as a full mesh.
   `TestProbesPerCycle_Scale` in `internal/health/` counts real probe cycles,
   and `TestFleet_ProbeMesh_CostPerCycle` in `tests/fleet/` counts the Ready
-  probes real daemons answer over mTLS across consecutive cycles, per 2 s
+  probes real daemons answer over mTLS across consecutive cycles
+  (`LITEVIRT_FLEET_PROBE_NODES=50` selects the 50-node size), per 2 s
   cycle: with every host voting (today's voter set, where every host
   not `offline`, `maintenance` or `fenced` votes) the cost is unchanged at 20,
   380 and 2,450 probes for 5, 20 and 50 nodes (2,450 is 1,225 probes/s).

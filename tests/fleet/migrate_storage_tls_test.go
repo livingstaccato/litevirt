@@ -126,3 +126,75 @@ func TestFleet_StorageMigrationFallsBackToPlaintextOnlyWhenAllowed(t *testing.T)
 		t.Fatalf("libvirt migrate = %q; want tls=false (the target cannot do TLS)", note)
 	}
 }
+
+// migrationCA makes n report fp as the fingerprint of the migration CA its
+// QEMU credentials chain to ("" for none known, as an older build reports).
+func migrationCA(n *Node, fp string) {
+	n.Server.SetMigrationCAFingerprint(func() (string, error) { return fp, nil })
+}
+
+// Both hosts are ready, but their credentials come from different migration
+// CAs: QEMU's TLS handshake would fail mid-copy. The readiness check compares
+// the CAs and refuses first, naming both hosts and the command that reissues
+// their credentials from one CA; the stubs the attempt created are removed.
+//
+// Mutation: skip the comparison — the migration reaches libvirt (a migrate
+// call is recorded) and goes red.
+func TestFleet_StorageMigrationIsRefusedWhenTheHostsHaveDifferentMigrationCAs(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	defer c.Stop()
+	src, dst := c.Nodes[0], c.Nodes[1]
+	migrationTLSReady(src, true)
+	migrationTLSReady(dst, true)
+	migrationCA(src, "aaaa1111")
+	migrationCA(dst, "bbbb2222")
+	// An allowed plaintext fallback does not excuse it: the hosts are
+	// provisioned, wrongly, and the copy is not sent unencrypted instead.
+	src.Server.SetAllowUnencryptedStorageMigration(true)
+
+	path := filepath.Join(c.tmpRoot, dst.Name, "data", "disks", "pp1-root.qcow2")
+	storageMigrationVM(t, src, path, 1<<30)
+	err := runStorageMigration(t, c, src, dst.Name)
+	if err == nil {
+		t.Fatal("the migration ran although the hosts' migration credentials come from different CAs")
+	}
+	msg := err.Error()
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(msg, src.Name) || !strings.Contains(msg, dst.Name) ||
+		!strings.Contains(msg, "aaaa1111") || !strings.Contains(msg, "bbbb2222") ||
+		!strings.Contains(msg, "lv host install-migration-tls --reissue") {
+		t.Fatalf("refusal = %v; want FailedPrecondition naming %s and %s, both fingerprints, and `lv host install-migration-tls --reissue`",
+			err, src.Name, dst.Name)
+	}
+	if n := migrateCalls(src); n != 0 {
+		t.Fatalf("the refused migration reached libvirt %d time(s)", n)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Errorf("the refused migration left its disk stub %s on the target (stat err %v)", path, statErr)
+	}
+}
+
+// The same migration CA on both hosts, or a target that does not say which
+// (an older build): the encrypted copy runs, as before.
+//
+// Mutation: refuse when the target names no CA — the second case goes red.
+func TestFleet_StorageMigrationRunsWhenTheMigrationCAsMatchOrTheTargetDoesNotSay(t *testing.T) {
+	for _, tc := range []struct{ name, dstCA string }{{"same CA", "aaaa1111"}, {"target does not say", ""}} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := New(t, Options{Nodes: 2, SharedCRDT: true})
+			defer c.Stop()
+			src, dst := c.Nodes[0], c.Nodes[1]
+			migrationTLSReady(src, true)
+			migrationTLSReady(dst, true)
+			migrationCA(src, "aaaa1111")
+			migrationCA(dst, tc.dstCA)
+
+			storageMigrationVM(t, src, filepath.Join(c.tmpRoot, dst.Name, "data", "disks", "pp1-root.qcow2"), 1<<30)
+			if err := runStorageMigration(t, c, src, dst.Name); err != nil {
+				t.Fatalf("the storage migration was refused: %v", err)
+			}
+			if note := lastMigrateNote(src); !strings.Contains(note, "tls=true") {
+				t.Fatalf("libvirt migrate = %q; want tls=true", note)
+			}
+		})
+	}
+}

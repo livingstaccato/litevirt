@@ -360,6 +360,10 @@ type Server struct {
 	// (internal/pki InstallQemuMigrationTLS) and reports whether they are in
 	// place. nil means never: a storage copy then falls to the plaintext guard.
 	migrationTLS func() (bool, error)
+	// migrationCAFingerprint reports the SHA-256 fingerprint of the migration
+	// CA this host's migration-TLS credentials chain to ("" when it has
+	// none). nil means unknown, and no comparison is made.
+	migrationCAFingerprint func() (string, error)
 	// migrationNetwork is migration.network: the IPv4 CIDR a migration's data
 	// should travel on (migration_network.go). Empty means the host's cluster
 	// address. localIPs is a test seam for the host's own addresses.
@@ -1905,6 +1909,26 @@ func (s *Server) SetAllowUnencryptedStorageMigration(on bool) { s.allowPlaintext
 // credentials for QEMU and reports whether they are ready. It runs on the
 // source before a storage copy and on the target in EnsureDisks.
 func (s *Server) SetMigrationTLS(fn func() (bool, error)) { s.migrationTLS = fn }
+
+// SetMigrationCAFingerprint sets the hook that reports the fingerprint of the
+// migration CA this host's migration-TLS credentials chain to. A storage
+// copy's readiness check compares the source's with the target's.
+func (s *Server) SetMigrationCAFingerprint(fn func() (string, error)) { s.migrationCAFingerprint = fn }
+
+// localMigrationCA is this host's migration CA fingerprint, "" when it has
+// none or it cannot be read (logged): no comparison is made then, and a
+// mismatch is left to the TLS handshake, as before.
+func (s *Server) localMigrationCA() string {
+	if s.migrationCAFingerprint == nil {
+		return ""
+	}
+	fp, err := s.migrationCAFingerprint()
+	if err != nil {
+		slog.Warn("cannot read this host's migration CA; a storage migration's CA check is skipped", "error", err)
+		return ""
+	}
+	return fp
+}
 
 // AnswerEnsureDisksAsAnOlderTargetForTest makes this host's EnsureDisks return
 // no installer_iso_resolved, as a target on main does.

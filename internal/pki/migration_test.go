@@ -1,7 +1,9 @@
 package pki
 
 import (
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
 	"net"
 	"os"
@@ -143,5 +145,41 @@ func TestInstallQemuMigrationTLS_RefusesADirectoryItDoesNotOwn(t *testing.T) {
 	}
 	if data, _ := os.ReadFile(foreign); string(data) != "the operator's own CA\n" {
 		t.Error("the refusal still overwrote the operator's ca-cert.pem")
+	}
+}
+
+// MigrationCAFingerprint is the SHA-256 of the installed migration CA's DER:
+// two hosts provisioned from one CA agree, two from different CAs differ, and
+// a host with no credentials reports none.
+//
+// Mutation: hash the PEM file instead of the DER — the want below goes red.
+func TestMigrationCAFingerprint(t *testing.T) {
+	if fp, err := MigrationCAFingerprint(t.TempDir()); err != nil || fp != "" {
+		t.Fatalf("no credentials: fingerprint %q, err %v; want none", fp, err)
+	}
+	a, b := t.TempDir(), t.TempDir()
+	provisionMigration(t, a)
+	provisionMigration(t, b)
+	fa, err := MigrationCAFingerprint(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fb, err := MigrationCAFingerprint(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := readCert(t, filepath.Join(MigrationDir(a), MigrationCAName))
+	sum := sha256.Sum256(cert.Raw)
+	if want := hex.EncodeToString(sum[:]); fa != want {
+		t.Fatalf("fingerprint = %q, want %q (sha256 of the CA's DER)", fa, want)
+	}
+	if fa == fb {
+		t.Fatal("two different migration CAs have one fingerprint")
+	}
+	if err := os.WriteFile(filepath.Join(MigrationDir(a), MigrationCAName), []byte("not pem"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := MigrationCAFingerprint(a); err == nil {
+		t.Fatal("a CA file with no certificate gave a fingerprint")
 	}
 }

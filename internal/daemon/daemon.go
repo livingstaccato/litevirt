@@ -1198,6 +1198,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetMigrationAddress(d.cfg.Migration.Address)
 	migrationTLS := d.migrationTLSInstaller()
 	svc.SetMigrationTLS(migrationTLS)
+	svc.SetMigrationCAFingerprint(func() (string, error) { return pki.MigrationCAFingerprint(d.cfg.PKIDir) })
 	// Install once at start so the operator sees the state in the log; it runs
 	// again before each storage migration.
 	if ok, err := migrationTLS(); err != nil {

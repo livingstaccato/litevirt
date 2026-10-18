@@ -4,8 +4,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -88,6 +91,27 @@ func GenerateMigrationCA(certPath, keyPath string) error {
 		return fmt.Errorf("marshal migration CA key: %w", err)
 	}
 	return writePEM(keyPath, "EC PRIVATE KEY", keyDER)
+}
+
+// MigrationCAFingerprint is the SHA-256 fingerprint (hex, of the DER) of the
+// migration CA in this host's credential set under pkiDir: the CA its QEMU
+// trusts and its migration certificate was issued from. "" with no error
+// when the host has no migration credentials.
+func MigrationCAFingerprint(pkiDir string) (string, error) {
+	path := filepath.Join(MigrationDir(pkiDir), MigrationCAName)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read migration CA: %w", err)
+	}
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return "", fmt.Errorf("%s holds no PEM certificate", path)
+	}
+	sum := sha256.Sum256(block.Bytes)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // InstallQemuMigrationTLS copies this host's migration credentials from

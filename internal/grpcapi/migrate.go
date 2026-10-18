@@ -587,6 +587,14 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		stripVNC, targetNetDevs = ens.vncPasswordUnavailable, ens.netDevices
 		abort.createdStubs = createdStubs
 		useTLS = srcTLS && dstTLS
+		// Both ready is not enough: their credentials must chain to one
+		// migration CA. A mismatch is refused, never sent in plaintext
+		// instead. The abort undoes the stubs.
+		if useTLS {
+			if err := migrationCAMismatch(req.VmName, s.hostName, s.localMigrationCA(), req.TargetHost, ens.migrationCA); err != nil {
+				return err
+			}
+		}
 		kind := routeStorage
 		if fwVM || coldStopped {
 			kind = routeCold
@@ -1403,8 +1411,13 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 	}
 	if req.WantMigrationTls {
 		// The source can encrypt the copy; tell it whether this host's QEMU can
-		// take the other end.
+		// take the other end, and, in a response header, which migration CA
+		// its credentials chain to, so the source can refuse a mismatch
+		// before the copy rather than at QEMU's TLS handshake.
 		resp.MigrationTlsReady = s.migrationTLSReady()
+		if fp := s.localMigrationCA(); resp.MigrationTlsReady && fp != "" {
+			_ = grpc.SetHeader(ctx, metadata.Pairs(MigrationCAMD, fp))
+		}
 	}
 	s.answerMigrationNetwork(ctx, req, resp)
 	return resp, nil
@@ -2244,11 +2257,35 @@ func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName 
 	return o.created, o.tlsReady, o.remap, o.cgroupMode, err
 }
 
+// MigrationCAMD is the EnsureDisks response header in which a target that is
+// ready for migration TLS names the SHA-256 fingerprint of the migration CA
+// its credentials chain to. An older target sends none.
+const MigrationCAMD = "x-litevirt-migration-ca-sha256"
+
+// migrationCAMismatch refuses a storage copy between hosts whose migration
+// credentials chain to different migration CAs: QEMU's TLS handshake would
+// fail mid-copy. Either fingerprint unknown (an older build, or none could be
+// read) compares nothing.
+func migrationCAMismatch(vmName, source, sourceCA, target, targetCA string) error {
+	if sourceCA == "" || targetCA == "" || sourceCA == targetCA {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"refusing to migrate VM %q with a storage copy: the migration-TLS credentials of %s and %s come from "+
+			"different migration CAs (%s: %s, %s: %s), so QEMU's TLS handshake between them would fail. "+
+			"Reissue every host's credentials from one migration CA with `lv host install-migration-tls --reissue` "+
+			"(run where the cluster's migration CA lives)",
+		vmName, source, target, source, sourceCA, target, targetCA)
+}
+
 // ensureOutcome is what the target's EnsureDisks answered.
 type ensureOutcome struct {
-	created  []string          // disk stubs this call made
-	tlsReady bool              // wantTLS and the target has migration-TLS credentials
-	remap    map[string]string // installer CD-ROM source path -> the target's file
+	created  []string // disk stubs this call made
+	tlsReady bool     // wantTLS and the target has migration-TLS credentials
+	// migrationCA is the fingerprint of the migration CA the target's
+	// credentials chain to (MigrationCAMD), "" when it did not say.
+	migrationCA string
+	remap       map[string]string // installer CD-ROM source path -> the target's file
 	// migAddr is the target's address inside migration.network, "" when none
 	// was asked for or the target gave none (migration_network.go).
 	migAddr string
@@ -2307,6 +2344,7 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 	}
 	defer conn.Close()
 
+	var hdr metadata.MD
 	resp, err := client.EnsureDisks(ctx, &pb.EnsureDisksRequest{
 		VmName: vmName, Disks: stubs, WantMigrationTls: wantTLS,
 		InstallerIsoListed: true, InstallerIsoPaths: isoPaths, InstallerIsoRuntime: runtime && len(isoPaths) > 0,
@@ -2314,7 +2352,7 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 		MigrationNetwork:   s.migrationNetwork,
 		NicMtu:             mtus,
 		WantNetworkDevices: wantNetDevs,
-	})
+	}, grpc.Header(&hdr))
 	if err != nil && shareOnly {
 		slog.Warn("migration: the target did not answer the migration preflight; cpu-shares, VNC password and NICs move as defined",
 			"vm", vmName, "target", targetHost, "error", err)
@@ -2355,7 +2393,11 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 			slog.Info("migration: the target opens the installer ISO at its own file", "vm", vmName, "target", targetHost, "here", from, "there", to)
 		}
 	}
-	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode(), vncPasswordUnavailable: resp.GetVncPasswordUnavailable(), netDevices: resp.GetNetworkDevices()}, nil
+	var targetCA string
+	if v := hdr.Get(MigrationCAMD); len(v) > 0 {
+		targetCA = v[0]
+	}
+	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), migrationCA: targetCA, remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode(), vncPasswordUnavailable: resp.GetVncPasswordUnavailable(), netDevices: resp.GetNetworkDevices()}, nil
 }
 
 // olderTargetISORemap points, for a move to an older target, the CD-ROM that

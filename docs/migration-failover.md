@@ -98,6 +98,13 @@ migration-TLS credentials:
   the first, and every storage migration with the new host would fail its TLS
   handshake. Copy `migration-ca.crt` and `migration-ca.key` (mode 0600) from the
   machine that holds them, or run the command there.
+- Before the copy, the source compares the fingerprint of the migration CA its
+  credentials chain to with the target's, and refuses a mismatch, naming both
+  hosts and both fingerprints, instead of failing at the TLS handshake
+  mid-copy. `migration.allow_unencrypted_storage` does not excuse it. Reissue
+  every host's credentials from one CA with
+  `lv host install-migration-tls --reissue`. A target on an older build does
+  not report its CA, and nothing is compared.
 - Each daemon installs its host's credentials into `/etc/pki/qemu`, with the key
   readable only by the QEMU user, at start and again before each storage
   migration, so no restart is needed. It refuses to touch `/etc/pki/qemu` if

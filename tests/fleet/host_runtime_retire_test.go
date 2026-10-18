@@ -44,7 +44,7 @@ func concurrentConfigAndReport(t *testing.T, retire, boot bool, seed int64) (map
 			splitRuntime(t, n)
 		}
 	}
-	c.WaitConverged(t, convergeTimeout)
+	settleByAntiEntropy(t, c, true)
 
 	c.Isolate(a)
 	c.Isolate(subject)

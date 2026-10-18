@@ -15,7 +15,9 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-const convergeTimeout = 20 * time.Second
+// convergeTimeout bounds a wait for the replicas to agree: 20 s, scaled
+// under the race detector (race_budget_on.go).
+const convergeTimeout = 20 * time.Second * raceBudgetScale
 
 func insertVM(t *testing.T, n *Node, name, host string) {
 	t.Helper()

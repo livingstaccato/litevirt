@@ -51,6 +51,9 @@ type cephWorld struct {
 	down map[string]bool
 	// watchers: images a live client has open (`rbd status` lists it).
 	watchers map[string]bool
+	// statusHook, when set, runs before each `rbd status`, outside the lock,
+	// with its arguments.
+	statusHook func(args []string)
 	// probeLeft: the time each probe's context had left when it ran.
 	probeLeft []time.Duration
 	// downImages: images whose probe gets no answer (an inactive PG under
@@ -96,6 +99,9 @@ func (w *cephWorld) count(prefix string) int {
 }
 
 func (w *cephWorld) run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	if w.statusHook != nil && slices.Contains(args, "status") {
+		w.statusHook(args)
+	}
 	if slices.Contains(args, "info") && slices.Contains(args, "--client_mount_timeout") {
 		w.mu.Lock()
 		if dl, ok := ctx.Deadline(); ok {

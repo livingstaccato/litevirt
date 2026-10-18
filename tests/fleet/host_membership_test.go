@@ -24,6 +24,14 @@ import (
 // and the node runs its first pass, as the daemon's split loop would.
 func splitMembership(t *testing.T, n *Node) corrosion.HostMembershipReport {
 	t.Helper()
+	// Latch only once every entry already logged has been applied
+	// everywhere (waitDelivered): one still on the wire is absorbed by a
+	// node that latched before it arrived, at its own time, and held as a
+	// floor copy by one that latched after, and the two differ until
+	// anti-entropy (settleByAntiEntropy).
+	if n.cluster != nil {
+		n.cluster.waitDelivered(t, convergeTimeout)
+	}
 	n.DB.SetHostMembershipGate(func() bool { return true })
 	rep, err := n.DB.SplitHostMembership(context.Background())
 	if err != nil {
@@ -82,7 +90,7 @@ func concurrentStateAndVersion(t *testing.T, split bool) map[string][2]string {
 		for _, n := range c.Nodes {
 			splitMembership(t, n)
 		}
-		c.WaitConverged(t, convergeTimeout)
+		settleByAntiEntropy(t, c, true)
 	}
 
 	// No relay either: with three nodes every node relays, so a's drain could

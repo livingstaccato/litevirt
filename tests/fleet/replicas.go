@@ -531,6 +531,91 @@ func (c *Cluster) WaitConvergedExcept(t *testing.T, timeout time.Duration, excep
 	}
 }
 
+// anyBlocked reports whether any link has its Block fault set.
+func (c *Cluster) anyBlocked() bool {
+	for _, n := range c.Nodes {
+		n.faults.mu.Lock()
+		for _, ls := range n.faults.links {
+			if ls != nil && ls.fault.Block {
+				n.faults.mu.Unlock()
+				return true
+			}
+		}
+		n.faults.mu.Unlock()
+	}
+	return false
+}
+
+// undelivered counts, over every pair of the given nodes, the entries a node
+// logged as their origin that the other has not applied (mutation_seen).
+// Digests can agree while an entry that lost last-write-wins everywhere is
+// still on the wire; this says whether one is.
+func undelivered(nodes []*Node) (int, error) {
+	ctx := context.Background()
+	missing := 0
+	for _, n := range nodes {
+		rows, err := n.DB.Query(ctx, `SELECT hlc FROM mutation_log WHERE origin = ?`, n.Name)
+		if err != nil {
+			return 0, err
+		}
+		for _, m := range nodes {
+			if m == n {
+				continue
+			}
+			seen, err := m.DB.Query(ctx, `SELECT hlc FROM mutation_seen WHERE origin = ?`, n.Name)
+			if err != nil {
+				return 0, err
+			}
+			got := make(map[string]bool, len(seen))
+			for _, r := range seen {
+				got[r.String("hlc")] = true
+			}
+			for _, r := range rows {
+				if !got[r.String("hlc")] {
+					missing++
+				}
+			}
+		}
+	}
+	return missing, nil
+}
+
+// waitDelivered waits, up to timeout, for every entry any node has logged to
+// have been applied on every other node. It does not fail the test: a
+// scenario may latch a node behind a fault on purpose, and is then judged as
+// before; it says so in the log.
+func (c *Cluster) waitDelivered(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	if !c.opts.IndependentReplicas || c.anyBlocked() {
+		// No push loops to wait on, or a partition on purpose: nothing behind
+		// it is delivered yet.
+		return
+	}
+	// Only nodes whose push loop runs deliver or receive anything: a crashed
+	// or not yet started one would hold every wait to its timeout.
+	var live []*Node
+	for _, n := range c.Nodes {
+		if n.replStarted {
+			live = append(live, n)
+		}
+	}
+	if len(live) < 2 {
+		return
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		n, err := undelivered(live)
+		if err == nil && n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Logf("fleet: %d logged entries still undelivered after %s (err %v); latching anyway", n, timeout, err)
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // ── coordinators and virtual time ───────────────────────────────────────────
 
 // VirtualClock is a settable time source shared by a set of coordinators. It is

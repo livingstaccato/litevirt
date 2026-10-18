@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -87,8 +88,13 @@ func lbStandIns(t *testing.T) string {
 		}
 	}
 	t.Setenv("PATH", dir+":/usr/bin:/bin")
-	// The stand-ins' command lines name this test's temp dirs.
-	t.Cleanup(func() { exec.Command("pkill", "-f", "sleep 600; : .*"+t.Name()).Run() }) //nolint:errcheck
+	// The stand-ins' command lines name this test's temp dirs, under one root
+	// unique to this run. Matched by the test's name instead, the cleanup
+	// killed the stand-ins of the same test running in another process (a
+	// second worktree's gate on the same host), whose next apply then found
+	// keepalived dead and started it again: "keepalived started 3 times".
+	root := regexp.QuoteMeta(filepath.Dir(dir))
+	t.Cleanup(func() { exec.Command("pkill", "-f", "sleep 600; : .*"+root).Run() }) //nolint:errcheck
 	return dir
 }
 
@@ -192,9 +198,11 @@ func TestFleet_LBSNATNoFlapAcrossApplyPaths(t *testing.T) {
 	// One keepalived start and one conntrackd start per host, over every
 	// apply: nothing restarted them.
 	if got := countLines(filepath.Join(bin, "keepalived.calls"), "-f "); got != 2 {
-		t.Errorf("keepalived started %d times on two hosts, want 2 (once each)", got)
+		b, _ := os.ReadFile(filepath.Join(bin, "keepalived.calls"))
+		t.Errorf("keepalived started %d times on two hosts, want 2 (once each):\n%s", got, b)
 	}
 	if got := countLines(filepath.Join(bin, "conntrackd.calls"), "-d"); got != 2 {
-		t.Errorf("conntrackd started %d times on two hosts, want 2 (once each)", got)
+		b, _ := os.ReadFile(filepath.Join(bin, "conntrackd.calls"))
+		t.Errorf("conntrackd started %d times on two hosts, want 2 (once each):\n%s", got, b)
 	}
 }

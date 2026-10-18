@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,7 +34,10 @@ import (
 //
 // Mutations: the inventory read on s.virt, unbounded: the first inventory
 // does not return: red. No single flight (each inventory asks anew): the
-// second takes a wait: red. DumpXML or DomainState asked on s.virt: calls
+// second takes a wait: red. A joiner that finds the flight stalled and
+// starts its own while answering at once: the flight-identity check, red. A
+// joiner that waits one wall-clock tick, or the stall, before its first
+// look: within, red. DumpXML or DomainState asked on s.virt: calls
 // naming ok on the daemon's connection: red. (A stalled flight answered from
 // the cache is pinned by TestRuntimeInventory_AStalledReadIsNotFilledFromTheCache:
 // here the list itself hangs, so there is no list to fill.)
@@ -48,23 +52,63 @@ func TestRuntimeInventory_AListLibvirtDoesNotAnswerIsIncompleteAndOffTheDaemonsC
 	release := f.HangDomain("st")
 	t.Cleanup(release)
 
+	// The inventory's clock moves while the first caller waits, so the hung
+	// list stalls; it stands still after, so a later caller that waited
+	// anew for a stall would never return (within's bound), however slowly
+	// or quickly this host runs them.
+	clock := newInvTestClock(s)
+	ticking := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-ticking:
+				return
+			case <-time.After(5 * time.Millisecond):
+				clock.Advance(20 * time.Millisecond)
+			}
+		}
+	}()
 	inv := within(t, 5*time.Second, "an inventory while libvirt hangs on st", func() runtimeInventory {
 		return s.collectRuntimeInventory(context.Background())
 	})
+	close(ticking)
 	if inv.Complete || !strings.Contains(strings.Join(inv.Errors, ";"), "has not answered") {
 		t.Fatalf("inventory: complete %v, errors %v; want incomplete saying libvirt has not answered", inv.Complete, inv.Errors)
 	}
 	if snap := snapshotFromInventory(inv); !snap.partial {
 		t.Error("the dual-run snapshot of an incomplete inventory is not partial")
 	}
-	t0 := time.Now()
-	for i := 0; i < 3; i++ {
-		if inv := s.collectRuntimeInventory(context.Background()); inv.Complete {
-			t.Fatal("a later inventory read complete while libvirt still hangs on st")
-		}
+	// Later callers join the hung list's flight and answer from their first
+	// look. The stall becomes two minutes and the inventory clock moves five
+	// past the flight's last progress, then stands still: the flight is
+	// stalled, well inside its cap, and a joiner's wall-clock tick is now 12 s.
+	// One that waited a tick, or the stall, on the wall clock before it looked
+	// misses within's 5 s; one that looks at once returns. (The flight
+	// goroutine never reads liveStateWait, and no caller is waiting now.)
+	s.liveStateWait = 2 * time.Minute
+	clock.Advance(5 * time.Minute)
+	// One flight answers them all: the hung list's flight is still the
+	// current one after each later caller, and none starts its own.
+	flight := func() *inventoryFlight {
+		s.invFlights.mu.Lock()
+		defer s.invFlights.mu.Unlock()
+		return s.invFlights.cur
 	}
-	if took := time.Since(t0); took >= s.liveStateWaitOrDefault() {
-		t.Errorf("three later inventories took %v: they waited again instead of answering at once", took)
+	hung := flight()
+	if hung == nil {
+		t.Fatal("fixture: no flight in progress while libvirt hangs on st")
+	}
+	for i := 0; i < 3; i++ {
+		later := within(t, 5*time.Second, "a later inventory while the clock stands still", func() runtimeInventory {
+			return s.collectRuntimeInventory(context.Background())
+		})
+		if later.Complete || !strings.Contains(strings.Join(later.Errors, ";"), "has not answered") {
+			t.Fatalf("later inventory %d: complete %v, errors %v; want incomplete saying libvirt has not answered",
+				i+1, later.Complete, later.Errors)
+		}
+		if cur := flight(); cur != hung {
+			t.Fatalf("later inventory %d is not answered from the hung list's flight: it started its own", i+1)
+		}
 	}
 	if n := f.MainConnCallsFor(""); n != 0 {
 		t.Errorf("domain lists on the daemon's connection: %d, want 0", n)
@@ -259,7 +303,20 @@ func slowDomains(t *testing.T, n int) (*Server, *libvirtfake.Fake) {
 func TestRuntimeInventory_ASlowButHealthyHostCompletes(t *testing.T) {
 	s, f := slowDomains(t, 25)
 	s.liveStateWait = 150 * time.Millisecond // stall 150 ms (reads 40 ms: 3.75x), cap 3 s
-	f.FailDomainState = func(string) error { time.Sleep(40 * time.Millisecond); return nil }
+	clock := newInvTestClock(s)
+	// 25 x 40 ms = 1 s: past any bound fixed from the flight's start. The
+	// flight is held at vm10, 400 ms in on its clock, until the caller has
+	// looked at it there: the flight reads no clock while held, so each read
+	// is the caller's, and a look reads it twice (the stall, the cap).
+	steppedSequence(f, clock, 40*time.Millisecond, func(n string) {
+		if n != "vm10" {
+			return
+		}
+		base := clock.Reads()
+		for deadline := time.Now().Add(10 * time.Second); clock.Reads() < base+2 && time.Now().Before(deadline); {
+			time.Sleep(time.Millisecond)
+		}
+	})
 	inv := within(t, 10*time.Second, "an inventory of a slow host", func() runtimeInventory {
 		return s.collectRuntimeInventory(context.Background())
 	})
@@ -315,6 +372,58 @@ func TestRuntimeInventory_AStalledReadIsNoAnswer(t *testing.T) {
 	}
 }
 
+// invTestClock is the inventory's clock in a test (Server.invClock): it
+// moves only when the test says time passed, so a read "takes" its step
+// however fast or slow this host runs it. On the real clock these tests read
+// "stalled" whenever the host paused a goroutine longer than the stall (150
+// ms) between two reads, as a host at a load of 300 did, and "past the cap"
+// without the flight having been slow.
+type invTestClock struct {
+	mu    sync.Mutex
+	now   time.Time
+	reads int // how many times Now was called
+}
+
+func newInvTestClock(s *Server) *invTestClock {
+	c := &invTestClock{now: time.Unix(1_000_000_000, 0)}
+	s.invClock = c.Now
+	return c
+}
+
+func (c *invTestClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reads++
+	return c.now
+}
+
+// Reads is how many times Now has been called.
+func (c *invTestClock) Reads() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reads
+}
+
+func (c *invTestClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
+
+// steppedSequence makes every state read of the fake take step on clock,
+// with hook called first for each domain (nil: none). A hook that blocks
+// holds the flight with the clock where it is: not answering, but not
+// stalled either until the test advances the clock.
+func steppedSequence(f *libvirtfake.Fake, clock *invTestClock, step time.Duration, hook func(string)) {
+	f.FailDomainState = func(n string) error {
+		if hook != nil {
+			hook(n)
+		}
+		clock.Advance(step)
+		return nil
+	}
+}
+
 // slowSequence makes every state read of the fake take delay, with hook
 // called first for each domain (nil: none).
 func slowSequence(f *libvirtfake.Fake, delay time.Duration, hook func(string)) {
@@ -325,6 +434,24 @@ func slowSequence(f *libvirtfake.Fake, delay time.Duration, hook func(string)) {
 		time.Sleep(delay)
 		return nil
 	}
+}
+
+// pastTheCapAt has every state read take 50 ms on clock and holds the flight
+// at domain at, past the 3 s cap, so a caller is answered while it is past
+// its cap and still making progress, never after it finished. The returned
+// func lets the flight go and waits for it to end.
+func pastTheCapAt(t *testing.T, f *libvirtfake.Fake, clock *invTestClock, at string) func() {
+	t.Helper()
+	hold := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(hold) }) }
+	t.Cleanup(release)
+	steppedSequence(f, clock, 50*time.Millisecond, func(n string) {
+		if n == at {
+			<-hold
+		}
+	})
+	return release
 }
 
 // Re-review 2, C-1: past the inventory's cap, the domains not yet read were
@@ -339,6 +466,7 @@ func slowSequence(f *libvirtfake.Fake, delay time.Duration, hook func(string)) {
 func TestRuntimeInventory_ADomainStartedSinceNeverReadsAsNotHoldingItsDisks(t *testing.T) {
 	s, f := slowDomains(t, 70)
 	s.liveStateWait = 150 * time.Millisecond // stall 150 ms, cap 3 s
+	clock := newInvTestClock(s)
 	_ = f.DestroyDomain("vm69")
 	if inv := s.collectRuntimeInventory(context.Background()); !inv.Complete {
 		t.Fatalf("the first inventory: incomplete: %v", inv.Errors)
@@ -346,10 +474,13 @@ func TestRuntimeInventory_ADomainStartedSinceNeverReadsAsNotHoldingItsDisks(t *t
 	if err := f.StartDomain("vm69"); err != nil {
 		t.Fatal(err)
 	}
-	slowSequence(f, 50*time.Millisecond, nil) // 70 x 50 ms (3x under the stall): past the cap
+	// 50 ms a read (3x under the stall): vm62 is reached at 3.1 s, past the
+	// cap, and held there until the caller has its answer.
+	pastCap := pastTheCapAt(t, f, clock, "vm62")
 	inv := within(t, 15*time.Second, "an inventory past its cap", func() runtimeInventory {
 		return s.collectRuntimeInventory(context.Background())
 	})
+	pastCap()
 	snap := snapshotFromInventory(inv)
 	holds := false
 	for _, n := range snap.diskHolderVMs {
@@ -377,14 +508,16 @@ func TestRuntimeInventory_ADomainStartedSinceNeverReadsAsNotHoldingItsDisks(t *t
 func TestRuntimeInventory_ADestinationStoppedSinceNeverReadsRunning(t *testing.T) {
 	s, f := slowDomains(t, 70)
 	s.liveStateWait = 150 * time.Millisecond
+	clock := newInvTestClock(s)
 	if inv := s.collectRuntimeInventory(context.Background()); !inv.Complete {
 		t.Fatalf("the first inventory: incomplete: %v", inv.Errors)
 	}
-	_ = f.DestroyDomain("vm69")               // shut off, still defined: still listed
-	slowSequence(f, 50*time.Millisecond, nil) // 70 x 50 ms: past the 3 s cap
+	_ = f.DestroyDomain("vm69")                  // shut off, still defined: still listed
+	pastCap := pastTheCapAt(t, f, clock, "vm62") // 50 ms a read: past the 3 s cap
 	inv := within(t, 15*time.Second, "an inventory past its cap", func() runtimeInventory {
 		return s.collectRuntimeInventory(context.Background())
 	})
+	pastCap()
 	got := runtimeStateIn(inventoryFromProto(inventoryToProto(inv)), corrosion.WorkloadVM, "vm69")
 	if got == health.RuntimeRunning {
 		t.Fatalf("vm69, stopped on the destination, reads %s to a peer's settle", got)
@@ -401,15 +534,26 @@ func TestRuntimeInventory_ADestinationStoppedSinceNeverReadsRunning(t *testing.T
 // Mutation: no ctx in the wait: the caller waits for the cap: red.
 func TestRuntimeInventory_ACallerStopsWaitingWhenItsContextIsDone(t *testing.T) {
 	s, f := slowDomains(t, 30)
-	s.liveStateWait = 300 * time.Millisecond   // stall 300 ms, cap 6 s
-	slowSequence(f, 100*time.Millisecond, nil) // 30 x 100 ms = 3 s
+	s.liveStateWait = 300 * time.Millisecond // stall 300 ms, cap 6 s
+	clock := newInvTestClock(s)
+	// The flight makes progress, 100 ms a read, and is held at vm05: neither
+	// stalled nor past its cap on its clock, so only the caller's context can
+	// end the wait.
+	hold := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(hold) }) }
+	t.Cleanup(release)
+	steppedSequence(f, clock, 100*time.Millisecond, func(n string) {
+		if n == "vm05" {
+			<-hold
+		}
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	t0 := time.Now()
-	inv := s.collectRuntimeInventory(ctx)
-	if took := time.Since(t0); took > 2*time.Second {
-		t.Errorf("the inventory took %v with a 300 ms context: it waited past its caller", took)
-	}
+	inv := within(t, 10*time.Second, "an inventory whose caller's context is done", func() runtimeInventory {
+		return s.collectRuntimeInventory(ctx)
+	})
+	release()
 	if inv.Complete || !strings.Contains(strings.Join(inv.Errors, ";"), "stopped waiting") {
 		t.Errorf("complete %v, errors %v; want incomplete saying its caller stopped waiting", inv.Complete, inv.Errors)
 	}
@@ -445,16 +589,19 @@ func TestLocalInventoryCached_DoesNotHoldItsLockAcrossTheCollect(t *testing.T) {
 func TestRuntimeInventory_PastTheCapAndStalledSaysStalled(t *testing.T) {
 	s, f := slowDomains(t, 70)
 	s.liveStateWait = 150 * time.Millisecond // stall 150 ms, cap 3 s
+	clock := newInvTestClock(s)
 	hang := make(chan struct{})
 	t.Cleanup(func() { close(hang) })
-	slowSequence(f, 50*time.Millisecond, func(n string) {
-		if n == "vm65" { // reached at about 3.25 s: past the cap
+	atHang := make(chan struct{})
+	steppedSequence(f, clock, 50*time.Millisecond, func(n string) {
+		if n == "vm65" { // reached at 3.25 s: past the cap
+			close(atHang)
 			<-hang
 		}
 	})
-	t0 := time.Now()
 	_ = s.collectRuntimeInventory(context.Background()) // answered at the cap
-	time.Sleep(time.Until(t0.Add(4000 * time.Millisecond)))
+	<-atHang
+	clock.Advance(750 * time.Millisecond) // 4 s in: vm65 unanswered for 750 ms
 	inv := within(t, 5*time.Second, "an inventory past its cap and stalled", func() runtimeInventory {
 		return s.collectRuntimeInventory(context.Background())
 	})

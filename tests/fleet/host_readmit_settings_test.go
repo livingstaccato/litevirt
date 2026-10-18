@@ -35,6 +35,16 @@ import (
 // see bootRebuiltNode.
 func rebuildWithEmptyDB(t *testing.T, c *Cluster, n, peer *Node) string {
 	t.Helper()
+	return rebuildWithEmptyDBLinks(t, c, n, peer, true)
+}
+
+// rebuildWithEmptyDBLinks is rebuildWithEmptyDB, healing n's links when heal
+// is set. A scenario whose rebuilt node must receive nothing yet blocks its
+// links first and passes false: healed here, the peers' push loops reach the
+// new database before the scenario can block them again (a peer whose rows
+// reached n by relay still owes it its own log).
+func rebuildWithEmptyDBLinks(t *testing.T, c *Cluster, n, peer *Node, heal bool) string {
+	t.Helper()
 	ctx := context.Background()
 	if n.replStarted {
 		n.repl.Stop()
@@ -49,7 +59,7 @@ func rebuildWithEmptyDB(t *testing.T, c *Cluster, n, peer *Node) string {
 		t.Fatalf("read %s's new certificate serial: %v", n.Name, err)
 	}
 
-	db, err := corrosion.NewSharedTestClient("fleet-rebuilt-"+n.Name, n.Name)
+	db, err := corrosion.NewSharedTestClient(c.dbName("rebuilt-"+n.Name), n.Name)
 	if err != nil {
 		t.Fatalf("open %s's new database: %v", n.Name, err)
 	}
@@ -91,7 +101,7 @@ func rebuildWithEmptyDB(t *testing.T, c *Cluster, n, peer *Node) string {
 	}
 	c.buildServer(n)
 	for _, o := range c.Nodes {
-		if o != n {
+		if o != n && heal {
 			c.SetLinkFaultBoth(n, o, LinkFault{})
 		}
 	}

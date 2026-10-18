@@ -83,6 +83,17 @@ func (s *Server) streamRecheckInterval() time.Duration {
 	return StreamRecheckInterval
 }
 
+// streamNow is the clock the watcher measures its fail-closed bound on:
+// streamClock in tests (nil: time.Now). A test drives "the credential could
+// not be re-checked for the bound" by the time it says passed, not by how
+// late this host fired a timer.
+func (s *Server) streamNow() time.Time {
+	if s.streamClock != nil {
+		return s.streamClock()
+	}
+	return time.Now()
+}
+
 // streamRecheckBound is StreamRecheckBound, or 2.5 test intervals.
 func (s *Server) streamRecheckBound() time.Duration {
 	if s.streamRecheckEvery > 0 {
@@ -142,7 +153,7 @@ func (s *Server) watchStream(ctx context.Context) (context.Context, func()) {
 	wctx, cancel := context.WithCancelCause(ctx)
 	stopped := make(chan struct{})
 	go func() {
-		lastOK := time.Now()
+		lastOK := s.streamNow()
 		wait := s.streamRecheckInterval()
 		for {
 			kick := s.kickChan()
@@ -158,15 +169,15 @@ func (s *Server) watchStream(ctx context.Context) (context.Context, func()) {
 			case <-kick:
 				timer.Stop()
 			}
-			remaining := s.streamRecheckBound() - time.Since(lastOK)
+			remaining := s.streamRecheckBound() - s.streamNow().Sub(lastOK)
 			err := s.recheckWithTimeout(wctx, remaining)
 			var transient errTransientRecheck
 			switch {
 			case err == nil:
-				lastOK = time.Now()
+				lastOK = s.streamNow()
 				wait = s.streamRecheckInterval()
 			case errors.As(err, &transient):
-				if time.Since(lastOK) < s.streamRecheckBound() {
+				if s.streamNow().Sub(lastOK) < s.streamRecheckBound() {
 					// Unknown, not refused: try again at once, inside the
 					// bound (m-1).
 					wait = s.streamRecheckInterval() / 8

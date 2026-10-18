@@ -24,8 +24,8 @@ import (
 const (
 	clusterPolicyFirewallSynflood = "firewall_synflood"
 
-	// FirewallSynfloodScopeCluster is the cluster-wide scope; any other scope
-	// is a host name.
+	// FirewallSynfloodScopeCluster names the cluster-wide scope in the API.
+	// In this package the cluster is host "": a host may be named "cluster".
 	FirewallSynfloodScopeCluster = "cluster"
 
 	// SynfloodOn and SynfloodOff are the policy's modes.
@@ -52,16 +52,20 @@ type FirewallSynflood struct {
 	Mode  string `json:"mode"`
 	Rate  int    `json:"rate"`
 	Burst int    `json:"burst"`
-	// Scope is the scope whose row decided a resolved policy: "cluster", a
-	// host name, or "" when no row did. It is not stored.
-	Scope string `json:"-"`
+	// Not stored: where a read policy came from. Recorded is whether a row
+	// decided; Host is the host whose own row did ("" for the cluster's
+	// row); SetBy and UpdatedAt are that row's.
+	Recorded  bool   `json:"-"`
+	Host      string `json:"-"`
+	SetBy     string `json:"-"`
+	UpdatedAt string `json:"-"`
 }
 
 // On reports whether the policy limits SYNs.
 func (p FirewallSynflood) On() bool { return p.Mode == SynfloodOn }
 
-func synfloodDefaultOn(scope string) FirewallSynflood {
-	return FirewallSynflood{Mode: SynfloodOn, Rate: SynfloodDefaultRate, Burst: SynfloodDefaultBurst, Scope: scope}
+func synfloodDefaultOn(host string) FirewallSynflood {
+	return FirewallSynflood{Mode: SynfloodOn, Rate: SynfloodDefaultRate, Burst: SynfloodDefaultBurst, Recorded: true, Host: host}
 }
 
 func synfloodInRange(n int) bool { return n >= SynfloodMin && n <= SynfloodMax }
@@ -88,25 +92,26 @@ func (p FirewallSynflood) validate() error {
 	return nil
 }
 
-// FirewallSynfloodKey is the cluster_policies key of scope's policy.
-func FirewallSynfloodKey(scope string) string {
-	if scope == FirewallSynfloodScopeCluster {
+// FirewallSynfloodKey is the cluster_policies key of host's policy, the
+// cluster's for host "". No host name maps to the cluster's key.
+func FirewallSynfloodKey(host string) string {
+	if host == "" {
 		return clusterPolicyFirewallSynflood
 	}
-	return clusterPolicyFirewallSynflood + "/" + scope
+	return clusterPolicyFirewallSynflood + "/" + host
 }
 
-// SetFirewallSynflood writes scope's policy ("cluster" or a host name); a
+// SetFirewallSynflood writes host's policy, the cluster's for host ""; a
 // policy with Mode "" writes "", clearing it. It takes the firewall_synflood
 // grant and refuses with ErrClusterPolicyGateClosed until failover_scope_v1
 // has latched. The caller owns the operator-facing preconditions (role, a
 // known host).
-func SetFirewallSynflood(ctx context.Context, c *Client, g capabilities.FeatureGrant, scope string, p FirewallSynflood, setBy string) error {
+func SetFirewallSynflood(ctx context.Context, c *Client, g capabilities.FeatureGrant, host string, p FirewallSynflood, setBy string) error {
 	if err := g.Check(capabilities.FeatureFirewallSynflood); err != nil {
 		return err
 	}
-	if scope == "" || strings.Contains(scope, "/") {
-		return fmt.Errorf("SYN-flood scope %q: want %s or a host name", scope, FirewallSynfloodScopeCluster)
+	if strings.Contains(host, "/") {
+		return fmt.Errorf("SYN-flood host %q: a host name holds no /", host)
 	}
 	if err := p.validate(); err != nil {
 		return err
@@ -122,16 +127,17 @@ func SetFirewallSynflood(ctx context.Context, c *Client, g capabilities.FeatureG
 		}
 		v = string(b)
 	}
-	return c.Execute(ctx, clusterPolicyUpsertSQL, FirewallSynfloodKey(scope), v, setBy, c.NowTS())
+	return c.Execute(ctx, clusterPolicyUpsertSQL, FirewallSynfloodKey(host), v, setBy, c.NowTS())
 }
 
-// GetFirewallSynflood reads scope's own policy from this node's replica.
-// recorded is false for no row or "". A row this build cannot read returns
-// on at the defaults, recorded, and ErrUnreadableFirewallPolicy naming the key.
-func GetFirewallSynflood(ctx context.Context, c *Client, scope string) (p FirewallSynflood, recorded bool, err error) {
-	key := FirewallSynfloodKey(scope)
+// GetFirewallSynflood reads host's own policy (the cluster's for host "")
+// from this node's replica. recorded is false for no row or "". A row this
+// build cannot read returns on at the defaults, recorded, and
+// ErrUnreadableFirewallPolicy naming the key.
+func GetFirewallSynflood(ctx context.Context, c *Client, host string) (p FirewallSynflood, recorded bool, err error) {
+	key := FirewallSynfloodKey(host)
 	rows, err := c.Query(ctx,
-		`SELECT value FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`, key)
+		`SELECT value, set_by, updated_at FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`, key)
 	if err != nil {
 		return FirewallSynflood{}, false, err
 	}
@@ -140,24 +146,27 @@ func GetFirewallSynflood(ctx context.Context, c *Client, scope string) (p Firewa
 	}
 	raw := rows[0].String("value")
 	if err := json.Unmarshal([]byte(raw), &p); err != nil || p.Mode == "" || p.validate() != nil {
-		return synfloodDefaultOn(scope), true, fmt.Errorf("%w: %s holds %q", ErrUnreadableFirewallPolicy, key, raw)
+		p = synfloodDefaultOn(host)
+		p.SetBy, p.UpdatedAt = rows[0].String("set_by"), rows[0].String("updated_at")
+		return p, true, fmt.Errorf("%w: %s holds %q", ErrUnreadableFirewallPolicy, key, raw)
 	}
-	p.Scope = scope
+	p.Recorded, p.Host = true, host
+	p.SetBy, p.UpdatedAt = rows[0].String("set_by"), rows[0].String("updated_at")
 	return p, true, nil
 }
 
 // ResolveFirewallSynflood is host's policy: its own row, else the cluster's,
-// else off. An unreadable row decides as on at the defaults, with
-// ErrUnreadableFirewallPolicy; a host's unreadable row does not fall through
-// to the cluster's.
+// else off; host "" reads the cluster's alone. An unreadable row decides as
+// on at the defaults, with ErrUnreadableFirewallPolicy; a host's unreadable
+// row does not fall through to the cluster's.
 func ResolveFirewallSynflood(ctx context.Context, c *Client, host string) (FirewallSynflood, error) {
-	if host != "" && host != FirewallSynfloodScopeCluster {
+	if host != "" {
 		p, recorded, err := GetFirewallSynflood(ctx, c, host)
 		if recorded || (err != nil && !errors.Is(err, ErrUnreadableFirewallPolicy)) {
 			return p, err
 		}
 	}
-	p, recorded, err := GetFirewallSynflood(ctx, c, FirewallSynfloodScopeCluster)
+	p, recorded, err := GetFirewallSynflood(ctx, c, "")
 	if recorded || err != nil {
 		return p, err
 	}

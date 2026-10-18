@@ -56,7 +56,7 @@ func TestLoader_SynFloodFillsPlan(t *testing.T) {
 	if got := loadSynFloodPlan(t, db, "host-a", nil).SynFlood; got.On {
 		t.Errorf("no policy: SynFlood = %+v, want off", got)
 	}
-	setSynFloodPolicy(t, db, corrosion.FirewallSynfloodScopeCluster, corrosion.FirewallSynflood{Mode: corrosion.SynfloodOn, Rate: 300, Burst: 1500})
+	setSynFloodPolicy(t, db, "", corrosion.FirewallSynflood{Mode: corrosion.SynfloodOn, Rate: 300, Burst: 1500})
 	if got := loadSynFloodPlan(t, db, "host-a", nil).SynFlood; got != (SynFlood{On: true, Rate: 300, Burst: 1500}) {
 		t.Errorf("cluster on: SynFlood = %+v, want on 300/1500", got)
 	}
@@ -75,7 +75,7 @@ func TestLoader_SynFloodFillsPlan(t *testing.T) {
 func TestLoader_SynFloodProbeRefused(t *testing.T) {
 	db := synFloodLoaderDB(t)
 	refused := func() error { return errors.New("nft refused probe table: no nft_limit") }
-	setSynFloodPolicy(t, db, corrosion.FirewallSynfloodScopeCluster, corrosion.FirewallSynflood{Mode: corrosion.SynfloodOn, Rate: 200, Burst: 1000})
+	setSynFloodPolicy(t, db, "", corrosion.FirewallSynflood{Mode: corrosion.SynfloodOn, Rate: 200, Burst: 1000})
 	plan := loadSynFloodPlan(t, db, "host-a", refused)
 	if plan.SynFlood.On {
 		t.Errorf("refused probe: SynFlood = %+v, want off", plan.SynFlood)
@@ -92,11 +92,11 @@ func TestLoader_SynFloodProbeRefused(t *testing.T) {
 		t.Error("refused probe: the ruleset still carries SYN-flood lines")
 	}
 
-	setSynFloodPolicy(t, db, corrosion.FirewallSynfloodScopeCluster, corrosion.FirewallSynflood{Mode: corrosion.SynfloodOff})
+	setSynFloodPolicy(t, db, "", corrosion.FirewallSynflood{Mode: corrosion.SynfloodOff})
 	if plan := loadSynFloodPlan(t, db, "host-a", refused); plan.SynFloodUnavailable != "" || plan.SynFlood.On {
 		t.Errorf("policy off: SynFlood = %+v, unavailable %q; want off and nothing to report", plan.SynFlood, plan.SynFloodUnavailable)
 	}
-	setSynFloodPolicy(t, db, corrosion.FirewallSynfloodScopeCluster, corrosion.FirewallSynflood{Mode: corrosion.SynfloodOn, Rate: 200, Burst: 1000})
+	setSynFloodPolicy(t, db, "", corrosion.FirewallSynflood{Mode: corrosion.SynfloodOn, Rate: 200, Burst: 1000})
 	if plan := loadSynFloodPlan(t, db, "host-a", func() error { return nil }); !plan.SynFlood.On || plan.SynFloodUnavailable != "" {
 		t.Errorf("accepted probe: SynFlood = %+v, unavailable %q", plan.SynFlood, plan.SynFloodUnavailable)
 	}
@@ -106,15 +106,15 @@ func TestLoader_SynFloodProbeRefused(t *testing.T) {
 // pass, and is reported naming its key.
 func TestLoader_SynFloodUnreadable(t *testing.T) {
 	db := synFloodLoaderDB(t)
-	putSynFloodRaw(t, db, corrosion.FirewallSynfloodKey(corrosion.FirewallSynfloodScopeCluster), "on please")
+	putSynFloodRaw(t, db, corrosion.FirewallSynfloodKey(""), "on please")
 	plan := loadSynFloodPlan(t, db, "host-a", nil)
 	if plan.SynFlood != (SynFlood{On: true, Rate: corrosion.SynfloodDefaultRate, Burst: corrosion.SynfloodDefaultBurst}) {
 		t.Errorf("unreadable row: SynFlood = %+v, want on at the defaults", plan.SynFlood)
 	}
-	if len(plan.UnreadablePolicies) != 1 || !strings.Contains(plan.UnreadablePolicies[0], corrosion.FirewallSynfloodKey(corrosion.FirewallSynfloodScopeCluster)) {
-		t.Errorf("unreadable row: UnreadablePolicies = %q, want one naming %s", plan.UnreadablePolicies, corrosion.FirewallSynfloodKey(corrosion.FirewallSynfloodScopeCluster))
+	if len(plan.UnreadablePolicies) != 1 || !strings.Contains(plan.UnreadablePolicies[0], corrosion.FirewallSynfloodKey("")) {
+		t.Errorf("unreadable row: UnreadablePolicies = %q, want one naming %s", plan.UnreadablePolicies, corrosion.FirewallSynfloodKey(""))
 	}
-	putSynFloodRaw(t, db, corrosion.FirewallSynfloodKey(corrosion.FirewallSynfloodScopeCluster), `{"mode":"off"}`)
+	putSynFloodRaw(t, db, corrosion.FirewallSynfloodKey(""), `{"mode":"off"}`)
 	if plan := loadSynFloodPlan(t, db, "host-a", nil); len(plan.UnreadablePolicies) != 0 {
 		t.Errorf("readable again: UnreadablePolicies = %q", plan.UnreadablePolicies)
 	}
@@ -133,23 +133,23 @@ func TestLoader_SynFloodEveryPathValidates(t *testing.T) {
 	}{
 		{"no row", func(*testing.T, *corrosion.Client) {}, nil},
 		{"cluster on", func(t *testing.T, db *corrosion.Client) {
-			setSynFloodPolicy(t, db, corrosion.FirewallSynfloodScopeCluster, corrosion.FirewallSynflood{Mode: corrosion.SynfloodOn, Rate: 1, Burst: 100000})
+			setSynFloodPolicy(t, db, "", corrosion.FirewallSynflood{Mode: corrosion.SynfloodOn, Rate: 1, Burst: 100000})
 		}, nil},
 		{"cluster off with numbers", func(t *testing.T, db *corrosion.Client) {
-			setSynFloodPolicy(t, db, corrosion.FirewallSynfloodScopeCluster, corrosion.FirewallSynflood{Mode: corrosion.SynfloodOff, Rate: 5, Burst: 6})
+			setSynFloodPolicy(t, db, "", corrosion.FirewallSynflood{Mode: corrosion.SynfloodOff, Rate: 5, Burst: 6})
 		}, nil},
 		{"host inherit", func(t *testing.T, db *corrosion.Client) {
-			setSynFloodPolicy(t, db, corrosion.FirewallSynfloodScopeCluster, corrosion.FirewallSynflood{Mode: corrosion.SynfloodOn, Rate: 100000, Burst: 1})
+			setSynFloodPolicy(t, db, "", corrosion.FirewallSynflood{Mode: corrosion.SynfloodOn, Rate: 100000, Burst: 1})
 			setSynFloodPolicy(t, db, "host-a", corrosion.FirewallSynflood{})
 		}, nil},
 		{"refused probe", func(t *testing.T, db *corrosion.Client) {
-			setSynFloodPolicy(t, db, corrosion.FirewallSynfloodScopeCluster, corrosion.FirewallSynflood{Mode: corrosion.SynfloodOn, Rate: 200, Burst: 1000})
+			setSynFloodPolicy(t, db, "", corrosion.FirewallSynflood{Mode: corrosion.SynfloodOn, Rate: 200, Burst: 1000})
 		}, refused},
 	}
 	for _, raw := range []string{"{}", "null", "x", `{"mode":"on"}`, `{"mode":"on","rate":0,"burst":1000}`,
 		`{"mode":"on","rate":200,"burst":100001}`, `{"mode":"on","rate":-1,"burst":5}`, `{"mode":"off","rate":0,"burst":7}`,
 		`{"mode":"strict","rate":200,"burst":1000}`, `[]`, `{"mode":"on","rate":"200","burst":1000}`} {
-		for _, key := range []string{corrosion.FirewallSynfloodKey(corrosion.FirewallSynfloodScopeCluster), corrosion.FirewallSynfloodKey("host-a")} {
+		for _, key := range []string{corrosion.FirewallSynfloodKey(""), corrosion.FirewallSynfloodKey("host-a")} {
 			cases = append(cases, struct {
 				name  string
 				setup func(t *testing.T, db *corrosion.Client)

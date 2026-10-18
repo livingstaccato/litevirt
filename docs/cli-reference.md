@@ -1495,6 +1495,15 @@ lv firewall tag-group rm <name> [--force]
   # before sending a tag: cidr (a rule, a compose file, or a gitops file that may hold one) and
   # refuses unless the daemon shows it knows tag groups.
   # A member leaving a group does not cut its open connections (docs/firewall.md, "Tag groups").
+
+# SYN-flood protection on guest NICs (docs/firewall.md, "SYN-flood protection")
+lv firewall synflood status                     # cluster policy, then per host: policy, in force (on/off/unavailable), rate, burst
+lv firewall synflood on [--rate 200] [--burst 1000] [--scope <host>]   # no --scope = cluster-wide
+lv firewall synflood off [--scope <host>]
+lv firewall synflood inherit --scope <host>     # clear a host's own policy; the cluster's applies
+  # on, off and inherit need the operator role, are audited (firewall.synflood) and are refused
+  # until the cluster upgrade has finished. --rate is new SYNs per second per guest NIC and source
+  # address, --burst packets; each 1-100000.
 ```
 
 See `docs/firewall.md` for the three-tier model, where each tier is enforced

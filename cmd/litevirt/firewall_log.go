@@ -84,6 +84,11 @@ func newFirewallLogPolicyCmd() *cobra.Command {
 					if p.GetDefaultPolicy() {
 						def = "on"
 					}
+					if p.GetRate() == 0 && p.GetBurst() == 0 && !p.GetInherited() {
+						// The daemon could not read the row (no readable
+						// row has rate or burst 0).
+						def = "unreadable (read as off at 5/10)"
+					}
 					from := "own"
 					switch {
 					case p.GetInherited():
@@ -126,7 +131,7 @@ func newFirewallLogPolicyCmd() *cobra.Command {
 				})
 			},
 		}
-		c.Flags().StringVar(&scope, "scope", "", "host to scope the policy to (default: cluster-wide)")
+		c.Flags().StringVar(&scope, "scope", "", "host to scope the policy to; leave it out for the cluster-wide policy")
 		if mode != "inherit" {
 			c.Flags().Uint32Var(&rate, "rate", 0, "log records per second per NIC side, 1-10000 (default 5)")
 			c.Flags().Uint32Var(&burst, "burst", 0, "log burst per NIC side, packets, 1-10000 (default 10)")

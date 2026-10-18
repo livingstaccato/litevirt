@@ -75,11 +75,20 @@ func TestSetFirewallLogPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantAudit(t, s, "firewall.log_policy", "admin", "node-1", "before=off rate=50 burst=100 after=unset")
+	// Round 1 m-10 (Track B4's rule): "" is the cluster; every other scope,
+	// "cluster" included, is a host, so a host named cluster is reachable.
 	if _, err := set(ctx, "cluster", "off", 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if got, _, _ := corrosion.GetFirewallLogPolicy(context.Background(), s.db, ""); got.On() {
-		t.Errorf("scope \"cluster\" did not set the cluster row: %+v", got)
+	if got, _, _ := corrosion.GetFirewallLogPolicy(context.Background(), s.db, ""); !got.On() {
+		t.Errorf("scope \"cluster\" changed the cluster row: %+v", got)
+	}
+	if got, rec, _ := corrosion.GetFirewallLogPolicy(context.Background(), s.db, "cluster"); !rec || got.On() {
+		t.Errorf("scope \"cluster\" did not set host cluster's row: %+v %v", got, rec)
+	}
+	wantAudit(t, s, "firewall.log_policy", "admin", "cluster", "before=unset after=off rate=5 burst=10")
+	if _, err := set(ctx, "cluster", "inherit", 0, 0); err != nil {
+		t.Errorf("inherit for host cluster: %v", err)
 	}
 
 	for _, bad := range []struct {
@@ -130,5 +139,18 @@ func TestGetFirewallLogPolicy(t *testing.T) {
 	}
 	if n := ps[2]; n.GetScope() != "node-1" || n.GetInherited() || n.GetDefaultPolicy() || n.GetRate() != 5 {
 		t.Errorf("node-1 = %+v, want its own off at the default budget", n)
+	}
+
+	// Round 1 m-8: an unreadable row is shown as rate 0 burst 0 (no readable
+	// row has either), and is not inherited.
+	if err := s.db.Execute(context.Background(), `UPDATE cluster_policies SET value = '{' WHERE key = 'firewall_log/node-1'`); err != nil {
+		t.Fatal(err)
+	}
+	resp, err = s.GetFirewallLogPolicy(viewerCtx(), &pb.GetFirewallLogPolicyRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := resp.GetPolicies()[2]; n.GetRate() != 0 || n.GetBurst() != 0 || n.GetInherited() || n.GetDefaultPolicy() {
+		t.Errorf("unreadable node-1 = %+v, want rate 0 burst 0, not inherited", n)
 	}
 }

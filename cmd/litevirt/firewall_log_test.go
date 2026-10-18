@@ -334,3 +334,21 @@ type tagAnswering struct{ *logSpy }
 func (t *tagAnswering) ListFirewallTagGroups(context.Context, *pb.ListFirewallTagGroupsRequest, ...grpc.CallOption) (*pb.ListFirewallTagGroupsResponse, error) {
 	return &pb.ListFirewallTagGroupsResponse{}, nil
 }
+
+// Round 1 m-8: status marks a row the daemon could not read (rate and burst
+// 0, which no readable row has) as unreadable, with what it is read as.
+//
+// Mutation: print the row as an ordinary off row — red.
+func TestFirewallLogPolicyCLI_UnreadableRow(t *testing.T) {
+	spy := &logSpy{policies: []*pb.FirewallLogPolicy{
+		{Scope: "cluster", DefaultPolicy: true, Rate: 7, Burst: 20},
+		{Scope: "h1"},
+	}}
+	out, err := runMacroCLIWith(t, spy, "firewall", "log-policy", "status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "unreadable") || !strings.Contains(out, "off at 5/10") {
+		t.Errorf("status does not mark h1 unreadable:\n%s", out)
+	}
+}

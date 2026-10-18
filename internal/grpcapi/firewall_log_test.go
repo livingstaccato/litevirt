@@ -165,3 +165,23 @@ func TestListFirewallLog_FanOutMergesByTime(t *testing.T) {
 		t.Errorf("after seq 1: %v, %+v", err, resp.GetEntries())
 	}
 }
+
+// Round 1 m-9: the verb counts only at "/". A custom role holding
+// firewall.log.view bound at a project path, and an admin token scoped to a
+// project, are both refused: a record names every tenant's addresses.
+//
+// Mutation: resolve the check at the caller's project path — red.
+func TestListFirewallLog_RBACProjectScopes(t *testing.T) {
+	s, _, _ := logServer(t)
+	if err := corrosion.InsertRole(context.Background(), s.db, corrosion.RoleRecord{Name: "LogReader", Verbs: []string{auth.VerbFirewallLogView}}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := boundAtCtx(t, s, "carol", "operator", "LogReader", "/projects/x")
+	if _, err := s.ListFirewallLog(ctx, &pb.ListFirewallLogRequest{LocalOnly: true}); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("a firewall.log.view binding at /projects/x: %v, want PermissionDenied", err)
+	}
+	tok := context.WithValue(adminCtx(), ctxKeyScopePaths, []string{"/projects/x"})
+	if _, err := s.ListFirewallLog(tok, &pb.ListFirewallLogRequest{LocalOnly: true}); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("an admin token scoped to /projects/x: %v, want PermissionDenied", err)
+	}
+}

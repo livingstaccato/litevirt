@@ -19,14 +19,10 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// logPolicyHost is the corrosion scope of an API scope: "" for the cluster
-// ("" or "cluster"), else the host name.
-func logPolicyHost(scope string) string {
-	if scope == corrosion.LogPolicyScopeCluster {
-		return ""
-	}
-	return scope
-}
+// logPolicyHost is the corrosion scope of an API scope: "" is the cluster,
+// and every other scope, "cluster" included, is a host (Track B4's rule), so
+// a host named cluster has a reachable row.
+func logPolicyHost(scope string) string { return scope }
 
 // logPolicyState is a scope's policy for an audit row.
 func logPolicyState(p corrosion.FirewallLogPolicy, recorded bool, err error) string {
@@ -78,7 +74,7 @@ func (s *Server) SetFirewallLogPolicy(ctx context.Context, req *pb.SetFirewallLo
 			return nil, status.Errorf(codes.Internal, "read host %s: %v", host, err)
 		}
 		if h == nil {
-			return nil, status.Errorf(codes.InvalidArgument, "scope %q: want cluster or a host name (lv host ls)", req.GetScope())
+			return nil, status.Errorf(codes.InvalidArgument, "no host named %q: --scope takes a host (lv host ls); leave it out for the cluster-wide policy", req.GetScope())
 		}
 	}
 	target := corrosion.LogPolicyScopeCluster
@@ -134,6 +130,12 @@ func (s *Server) logPolicyOf(ctx context.Context, host string, cluster *pb.Firew
 		}
 		return &pb.FirewallLogPolicy{Scope: scope, DefaultPolicy: cluster.GetDefaultPolicy(), Rate: cluster.GetRate(),
 			Burst: cluster.GetBurst(), Inherited: true}, nil
+	}
+	if err != nil {
+		// Unreadable: rate and burst 0, which no readable row has, so a
+		// reader can tell it from an off row (read as off at the default
+		// budget; the condition firewall.policy.unreadable names the key).
+		return &pb.FirewallLogPolicy{Scope: scope, SetBy: row.SetBy, UpdatedAt: row.UpdatedAt}, nil
 	}
 	p := row.Policy
 	return &pb.FirewallLogPolicy{Scope: scope, DefaultPolicy: p.On(), Rate: uint32(p.Rate), Burst: uint32(p.Burst),

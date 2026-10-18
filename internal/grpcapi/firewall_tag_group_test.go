@@ -13,6 +13,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/firewall"
 )
 
 // D6 (spec §4.2, §4.8): the tag-group RPCs.
@@ -562,5 +563,37 @@ func TestSetFirewallTags_NamesTheNetworksAMemberHasNoAddressOn(t *testing.T) {
 	}
 	if got := set(); !slices.Equal(got, []string{"dev"}) {
 		t.Fatalf("a group covering every network: unaddressed = %v, want [dev]", got)
+	}
+}
+
+// Round 1 m-5: a tag-group refusal names a referencing rule's action as the
+// API shows it (verdict plus "log"), never the stored "+log" suffix.
+//
+// Mutation: print the stored action — red.
+func TestTagGroupRefs_ShowPlainVerdictAndLog(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	if err := s.db.Execute(ctx, `INSERT INTO cluster_firewall_rules
+		(id, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)
+		VALUES ('c1', 'ingress', 'tcp', '22', 'tag:web', 'accept+log', 100, '', '', 't', '1')`); err != nil {
+		t.Fatal(err)
+	}
+	refs, err := s.tagGroupRefs(ctx, "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 || strings.Contains(refs[0].what, "+log") || !strings.Contains(refs[0].what, "(accept log)") || !refs[0].accept {
+		t.Errorf("refs = %+v, want one accept shown as (accept log)", refs)
+	}
+}
+
+// Round 1 m-5: the tag-group condition names a logged rule's action as
+// "accept log", not the stored suffix.
+//
+// Mutation: print r.Action — red.
+func TestTagRefsText_ShowsPlainVerdict(t *testing.T) {
+	txt := tagRefsText("x", []firewall.TagGroupRef{{Table: "cluster_firewall_rules", ID: "c1", Group: "web", Action: "drop+log", Handling: "h"}})
+	if strings.Contains(txt, "+log") || !strings.Contains(txt, `action "drop log"`) {
+		t.Errorf("text = %q", txt)
 	}
 }

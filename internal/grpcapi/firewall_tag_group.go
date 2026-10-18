@@ -267,6 +267,15 @@ func acceptsAction(action string) bool { return firewall.AcceptsAction(action) }
 
 // tagGroupRefs lists every live rule, in every tier and on every host, that
 // references group.
+// shownAction is a stored action as operator text shows it: the plain
+// verdict, and "log" for a logged rule (spec m-13).
+func shownAction(stored string) string {
+	if v, logged := corrosion.SplitLoggedAction(stored); logged {
+		return v + " log"
+	}
+	return stored
+}
+
 func (s *Server) tagGroupRefs(ctx context.Context, group string) ([]tagGroupRef, error) {
 	var refs []tagGroupRef
 	cluster, err := corrosion.ListClusterFirewallRules(ctx, s.db)
@@ -275,7 +284,7 @@ func (s *Server) tagGroupRefs(ctx context.Context, group string) ([]tagGroupRef,
 	}
 	for _, r := range cluster {
 		if refersToTagGroup(r.CIDR, group) {
-			refs = append(refs, tagGroupRef{what: "cluster rule " + r.ID + " (" + r.Action + ")", accept: acceptsAction(r.Action)})
+			refs = append(refs, tagGroupRef{what: "cluster rule " + r.ID + " (" + shownAction(r.Action) + ")", accept: acceptsAction(r.Action)})
 		}
 	}
 	host, err := corrosion.ListHostFirewallRules(ctx, s.db, "")
@@ -284,7 +293,7 @@ func (s *Server) tagGroupRefs(ctx context.Context, group string) ([]tagGroupRef,
 	}
 	for _, r := range host {
 		if refersToTagGroup(r.CIDR, group) {
-			refs = append(refs, tagGroupRef{what: "host rule " + r.ID + " on " + r.HostName + " (" + r.Action + ")", accept: acceptsAction(r.Action)})
+			refs = append(refs, tagGroupRef{what: "host rule " + r.ID + " on " + r.HostName + " (" + shownAction(r.Action) + ")", accept: acceptsAction(r.Action)})
 		}
 	}
 	sgRules, err := corrosion.ListAllSGRules(ctx, s.db)
@@ -293,7 +302,7 @@ func (s *Server) tagGroupRefs(ctx context.Context, group string) ([]tagGroupRef,
 	}
 	for _, r := range sgRules {
 		if refersToTagGroup(r.CIDR, group) {
-			refs = append(refs, tagGroupRef{what: "security-group rule " + r.ID + " in " + r.SGID + " (" + r.Action + ")", accept: acceptsAction(r.Action)})
+			refs = append(refs, tagGroupRef{what: "security-group rule " + r.ID + " in " + r.SGID + " (" + shownAction(r.Action) + ")", accept: acceptsAction(r.Action)})
 		}
 	}
 	return refs, nil

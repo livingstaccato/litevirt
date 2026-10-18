@@ -2077,20 +2077,38 @@ A hold over a row at incarnation 1 or higher, and a hold raised at runtime
 (`superseded`, `removed`), never times out. A held row that becomes another
 admission while held is reported as `superseded`.
 
-**`reason` `at_start`** is a host re-added while its data directory still held
-its old database. It clears once the host's replica receives the re-admission
-from a peer. If it does not clear:
+**`reason` `at_start`** is raised at start, for one of two causes:
+
+- the host was re-added while its data directory still held its old database,
+  so its replica still holds its own old row. This clears once the host's
+  replica receives the re-admission from a peer;
+- the host is at incarnation 1 or higher, its certificate was reissued outside
+  `lv host renew-cert` (its PKI directory was regenerated or restored), and its
+  `<pki_dir>/own-admission.json` is missing or records another admission. This
+  does not clear by itself.
+
+If it does not clear:
 
 1. Check that a peer is reachable from the host.
-2. On another node, run `lv host inspect <name>`. If it shows the
-   `installed_serial`, the re-admission has not reached the host yet.
-3. If a machine serves the recorded serial, this host is superseded: follow
-   the `superseded` procedure below.
-4. If this host's own recorded certificate and key still exist, put them back
-   as `<pki_dir>/host.crt` and `<pki_dir>/host.key`. The hold then opens by
+2. On another node, run `lv host inspect <name>` and note the serial it shows.
+   That is the cluster's admission for the name, and it is the serial every
+   step below means. Do not use `recorded_serial` from `lv health` on this
+   host: it is this host's own replica, which may be stale. If the serial from
+   `lv host inspect` equals this host's `installed_serial`, the re-admission
+   has not reached the host yet: go back to step 1.
+3. Find out whether any machine **holds** the serial from step 2, running or
+   powered off: its `<pki_dir>/host.crt` carries that serial
+   (`openssl x509 -noout -serial -in <pki_dir>/host.crt` prints it in upper
+   case). If a machine other than this host holds it, this host is superseded:
+   follow the `superseded` procedure below, and do not remove the name. A
+   machine that is powered off still holds its admission.
+4. If this host holds a certificate and key with the serial from step 2 (for
+   example in a backup of its PKI directory), put them back as
+   `<pki_dir>/host.crt` and `<pki_dir>/host.key`. The hold then opens by
    itself.
-5. Otherwise, stop the daemon on the host, then remove the host and add it
-   again.
+5. Only when step 3 found no machine, running or powered off, that holds the
+   serial from step 2, and step 4 did not apply: stop the daemon on this host,
+   then remove the host and add it again.
 
 **`reason` `superseded`** is a host whose admission another `lv host add` of
 the same name replaced. Peers no longer accept its certificate. To recover:

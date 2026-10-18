@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/pki"
+	"github.com/litevirt/litevirt/internal/secretfile"
 )
 
 // The own-row hold (corrosion/own_row_hold.go), the daemon's side: it is
@@ -250,18 +252,36 @@ func (f *admissionFile) Load() (int64, string, bool) {
 	return r.Incarnation, r.CreatedAt, true
 }
 
+// Store makes the record durable before it returns: secretfile.Write writes a
+// uniquely named temporary file, fsyncs it and renames it over the record, and
+// the directory is then fsynced so the rename itself survives a power loss.
+// Every step's error is returned, and the hold logs it. A record that did not
+// reach the file is stored again at the next evaluation; one whose directory
+// sync failed is in the file but may not survive a power loss, which fails
+// closed (the host is held as if it had no record).
 func (f *admissionFile) Store(n int64, createdAt string) error {
 	data, err := json.MarshalIndent(admissionRecord{Host: f.host, Incarnation: n, CreatedAt: createdAt}, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := f.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := secretfile.Write(f.path, data, 0o600); err != nil {
 		return err
 	}
-	if fh, err := os.Open(tmp); err == nil {
-		_ = fh.Sync()
-		fh.Close()
+	return syncDir(filepath.Dir(f.path))
+}
+
+// syncDir fsyncs a directory, so a rename into it is durable. A var for tests.
+var syncDir = func(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", dir, err)
 	}
-	return os.Rename(tmp, f.path)
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return fmt.Errorf("sync %s: %w", dir, err)
+	}
+	if err := d.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", dir, err)
+	}
+	return nil
 }

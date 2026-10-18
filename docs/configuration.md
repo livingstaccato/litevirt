@@ -604,7 +604,22 @@ auth:
   #
   # Peer trust binds a live host row to the certificate serial recorded in it. A
   # node re-records its own serial at startup, so an ordinary certificate rotation
-  # converges by replication and needs nothing here. But if those recorded serials
+  # converges by replication and needs nothing here. That re-record is
+  # conditional (docs/diagnostics.md, own_row_held):
+  #   - a certificate that renewed the recorded one (lv host renew-cert) is
+  #     re-recorded at once;
+  #   - otherwise, over a row at incarnation 0, the node first holds its own-row
+  #     writes for ten minutes (reason at_start) and re-records when that hold
+  #     times out;
+  #   - otherwise, over a row at incarnation 1 or higher (a host re-added since
+  #     host_incarnation latched), it re-records only when the row is the
+  #     admission recorded in <pki_dir>/own-admission.json. A host without that
+  #     record, or with another admission's, is held and never re-records: it
+  #     needs `lv host rm` then `lv host add`;
+  #   - a certificate swapped while the daemon runs, not by a renewal, is held
+  #     until the daemon restarts, and then as above.
+  # Leave this switch on until every such host has re-recorded or been re-added.
+  # But if those recorded serials
   # have ALREADY gone stale fleet-wide, every daemon refuses every peer
   # ("replication RPC requires peer mTLS") and the cluster cannot repair itself:
   # the correction has to replicate, and replication is what is being refused.

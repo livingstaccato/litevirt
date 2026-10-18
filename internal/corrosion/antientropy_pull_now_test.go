@@ -51,3 +51,33 @@ func TestPullTableNow_InProbationNamesThisNode(t *testing.T) {
 		t.Errorf("in probation: %v", err)
 	}
 }
+
+// Re-review 3, m-5: a voter set that cannot be read fails closed. Without it a
+// skipped voter cannot be told from a skipped non-voter, so the "nobody to
+// confirm with" answer that lets a lone coordinator proceed is not given.
+func TestPullTableNow_AnUnreadableVoterSetRefuses(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	for _, h := range []string{c.hostName, "target"} {
+		if err := InsertHost(ctx, c, HostRecord{Name: h, Address: "10.0.0.1", State: "active", CertSerial: "s-" + h}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.SetMembersForTests(func() []PeerInfo { return []PeerInfo{{Name: "target"}} })
+	ae := NewAntiEntropy(c, "", 0)
+	// Precondition: alone with the target, the pull proceeds.
+	if peer, _, err := ae.PullTableNow(ctx, "hosts", "target"); err != nil || peer != "" {
+		t.Fatalf("precondition, alone with the target: (%q, %v), want to proceed", peer, err)
+	}
+	// An adopted generation with no voter_configs row: VoterSet errors.
+	if err := RecordVoterAdoption(ctx, c, 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VoterSet(ctx, c); err == nil {
+		t.Fatal("precondition: VoterSet read an adopted generation that has no row")
+	}
+	_, _, err := ae.PullTableNow(ctx, "hosts", "target")
+	if !errors.Is(err, ErrNoPeerConfirmed) || !strings.Contains(err.Error(), "read the voter set") {
+		t.Errorf("unreadable voter set: %v, want ErrNoPeerConfirmed naming the voter set", err)
+	}
+}

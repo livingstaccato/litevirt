@@ -2,9 +2,12 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -238,5 +241,81 @@ func TestAdmissionFile_RoundTrip(t *testing.T) {
 	}
 	if _, _, ok := (&admissionFile{path: f.path, host: "node-b"}).Load(); ok {
 		t.Error("another host's record loaded")
+	}
+}
+
+// Re-review 3, m-5: the daemon installs its admission record. With PKIDir set,
+// configureOwnRowHold stores the own counted row's key in own-admission.json,
+// and a certificate reissued outside the renewal flow over that admission is
+// not held. Without the wiring the record is never written, and the
+// trust_rotated_peer_certs recovery at a counted incarnation is held again.
+func TestOwnRow_TheDaemonInstallsItsAdmissionRecord(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	host := db.HostName()
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{Name: host, Address: "10.0.0.15", SSHUser: "root",
+		SSHPort: 22, GRPCPort: 7443, State: "active", CertSerial: "01cur"}); err != nil {
+		t.Fatal(err)
+	}
+	const at = "2026-01-01T00:00:00.000000000Z"
+	if _, err := db.DB().Exec(`UPDATE hosts SET incarnation = 1, created_at = ? WHERE name = ?`, at, host); err != nil {
+		t.Fatal(err)
+	}
+	pkiDir := t.TempDir()
+	cert := [2]string{"01cur", ""}
+	d := &Daemon{cfg: &Config{HostName: host, PKIDir: pkiDir}, db: db}
+	d.ownRowCertSource = func() (string, string) { return cert[0], cert[1] }
+	d.ownRowReconciler = func(context.Context) {}
+	d.configureOwnRowHold(ctx)
+
+	rec := &admissionFile{path: filepath.Join(pkiDir, OwnAdmissionFileName), host: host}
+	if n, got, ok := rec.Load(); !ok || n != 1 || got != at {
+		t.Fatalf("own-admission.json = (%d, %q, %v), want (1, %q)", n, got, ok, at)
+	}
+	// The PKI directory is regenerated: an unrelated serial, not a renewal.
+	cert = [2]string{"09reissued", ""}
+	st, err := d.db.EvaluateOwnRowHold(ctx, corrosion.OwnRowHeldSuperseded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Held {
+		t.Errorf("held over its own remembered admission: %+v", st)
+	}
+}
+
+// Re-review 3, m-2: Store returns the directory fsync's error, so a record
+// whose rename may not survive a power loss is not reported as stored.
+func TestAdmissionFile_StoreSyncsTheDirectory(t *testing.T) {
+	dir := t.TempDir()
+	f := &admissionFile{path: filepath.Join(dir, OwnAdmissionFileName), host: "node-a"}
+	var synced []string
+	old := syncDir
+	t.Cleanup(func() { syncDir = old })
+	syncDir = func(d string) error { synced = append(synced, d); return nil }
+	if err := f.Store(1, "2026-01-01T00:00:00.000000000Z"); err != nil {
+		t.Fatal(err)
+	}
+	if len(synced) != 1 || synced[0] != dir {
+		t.Errorf("directories synced = %v, want [%s]", synced, dir)
+	}
+	boom := errors.New("eio")
+	syncDir = func(string) error { return boom }
+	if err := f.Store(2, "2026-02-01T00:00:00.000000000Z"); !errors.Is(err, boom) {
+		t.Errorf("Store with a failing directory sync = %v, want it returned", err)
+	}
+	// No temporary file is left beside the record.
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 1 || ents[0].Name() != OwnAdmissionFileName {
+		t.Errorf("directory holds %v, want only %s", ents, OwnAdmissionFileName)
+	}
+	// The real directory sync works on a real directory.
+	if err := old(dir); err != nil {
+		t.Errorf("syncDir(%s): %v", dir, err)
 	}
 }

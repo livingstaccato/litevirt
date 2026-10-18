@@ -166,6 +166,8 @@ vms:
 		t.Fatalf("the value never reached %s on %s: grep says %q", vars, victim, out)
 	}
 	stat := l.mustSSH(victim, 20*time.Second, "stat -c '%y %s' "+shellQuote(vars))
+	// The guarantee rests on the filesystem the vars file is on: record it.
+	mount := strings.TrimSpace(l.mustSSH(victim, 20*time.Second, "findmnt -no SOURCE,FSTYPE,OPTIONS -T "+shellQuote(vars)))
 
 	// 3. The power cut.
 	if wait := cutAfter - time.Since(written) - time.Second; wait > 0 {
@@ -177,7 +179,7 @@ vms:
 	}
 	cut := l.powerOff(victim)
 	gap := cut.Sub(written)
-	l.mark("nvd: %s powered off %v after the write (vars %s: %s)", victim, gap.Round(time.Millisecond), vars, strings.TrimSpace(stat))
+	l.mark("nvd: %s powered off %v after the write (vars %s: %s; on %s)", victim, gap.Round(time.Millisecond), vars, strings.TrimSpace(stat), mount)
 	if gap > 5*time.Second {
 		t.Fatalf("the power cut came %v after the write; it must come within 5 s to prove anything", gap)
 	}
@@ -187,8 +189,8 @@ vms:
 		t.Fatalf("power on %s: %v", victim, err)
 	}
 	after := l.mustSSH(victim, 20*time.Second, "stat -c '%y %s' "+shellQuote(vars)+"; "+grepVars+" || true")
-	l.saveEvidence("nvd-vars-after-cut.txt", fmt.Sprintf("vm %s secure-boot+tpm %v expect-loss %v\nvars %s\nbefore cut: %s\nmeminfo before cut:\n%s\nafter power-on: %s\nwrite→cut %v\n",
-		vm, secureBoot, expectLoss, vars, stat, meminfo, after, gap))
+	l.saveEvidence("nvd-vars-after-cut.txt", fmt.Sprintf("vm %s secure-boot+tpm %v expect-loss %v\nvars %s\nmount: %s\nbefore cut: %s\nmeminfo before cut:\n%s\nafter power-on: %s\nwrite→cut %v\n",
+		vm, secureBoot, expectLoss, vars, mount, stat, meminfo, after, gap))
 	lines := strings.Split(strings.TrimSpace(after), "\n")
 	onDisk := strings.TrimSpace(lines[len(lines)-1]) != "0"
 	switch {

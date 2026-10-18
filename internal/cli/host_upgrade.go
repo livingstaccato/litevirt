@@ -173,7 +173,8 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 	var others []*pb.Host        // members left on their binary — pre-staged only
 
 	for _, h := range resp.Hosts {
-		current := targetVersion != "" && h.Version == targetVersion
+		// Current only when the version names one build: never dev or -dirty.
+		current := sameBuild(targetVersion, h.Version)
 		if named && !filterSet[h.Name] {
 			// A member already on the version of the binary has its schema.
 			// Only a probed version says so: the connected daemon's says

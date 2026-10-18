@@ -496,3 +496,76 @@ func TestHostUpgrade_ProbesInParallelWithABound(t *testing.T) {
 		t.Fatalf("pre-staged %d hosts, want %d", len(client.preStaged), len(hosts))
 	}
 }
+
+// In all-hosts mode a member on a version that names no one build (dev, or
+// a -dirty tree) is not current: it is upgraded, so pre-staged too, not left
+// on its schema to refuse every upgraded host.
+func TestHostUpgrade_AllModeDevOrDirtyMemberIsNotCurrent(t *testing.T) {
+	for _, v := range []string{"dev", "v1.9.0-3-gabc1234-dirty"} {
+		t.Run(v, func(t *testing.T) {
+			bin := writeVersionedBinary(t, v)
+			activate := &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok", NewVersion: v}}
+			client := &perHostPreStageClient{mockUpgradeClient: &mockUpgradeClient{
+				stream: activate,
+				hosts: []*pb.Host{
+					{Name: "node1", Address: "10.0.0.1", Version: "v0.9.0"},
+					{Name: "node2", Address: "10.0.0.2", Version: v},
+				},
+			}}
+			if err := HostUpgrade(context.Background(), client, UpgradeOpts{BinaryPath: bin, Yes: true}); err != nil {
+				t.Fatalf("HostUpgrade: %v", err)
+			}
+			slices.Sort(client.preStaged)
+			if want := []string{"node1", "node2"}; !slices.Equal(client.preStaged, want) {
+				t.Fatalf("pre-staged %v, want %v", client.preStaged, want)
+			}
+		})
+	}
+}
+
+// hangingProbeClient's probe of one host never answers until its context
+// ends, like a peer forward that hangs.
+type hangingProbeClient struct {
+	*perHostPreStageClient
+	hung string
+}
+
+func (c *hangingProbeClient) PreflightUpgrade(ctx context.Context, req *pb.PreflightUpgradeRequest, opts ...grpc.CallOption) (*pb.PreflightUpgradeResponse, error) {
+	if req.GetTargetHost() == c.hung {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return c.perHostPreStageClient.PreflightUpgrade(ctx, req, opts...)
+}
+
+// A probe that does not answer within probeTimeout is a refusal: one hung
+// peer cannot hold the upgrade, and nothing is pre-staged.
+func TestHostUpgrade_HungProbeTimesOut(t *testing.T) {
+	old := probeTimeout
+	probeTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { probeTimeout = old })
+
+	bin := writeFakeBinary(t)
+	client := &hangingProbeClient{hung: "node2", perHostPreStageClient: &perHostPreStageClient{mockUpgradeClient: &mockUpgradeClient{
+		stream: &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok"}},
+		hosts: []*pb.Host{
+			{Name: "node1", Address: "10.0.0.1", Version: "v0.9.0"},
+			{Name: "node2", Address: "10.0.0.2", Version: "v0.9.0"},
+		},
+	}}}
+	done := make(chan error, 1)
+	go func() {
+		done <- HostUpgrade(context.Background(), client, UpgradeOpts{BinaryPath: bin, HostNames: []string{"node1"}, Yes: true})
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "node2") {
+			t.Fatalf("err %v, want a refusal naming node2", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a hung probe held the upgrade")
+	}
+	if len(client.preStaged) != 0 {
+		t.Fatalf("pre-staged %v after a probe timed out", client.preStaged)
+	}
+}

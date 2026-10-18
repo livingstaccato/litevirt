@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -161,7 +162,12 @@ func probeAll(ctx context.Context, client pb.LiteVirtClient, hosts []*pb.Host) [
 // through the same forwarding path PreStageUpgrade takes. PreflightUpgrade
 // is read-only, and every daemon that has it has PreStageUpgrade.
 func probeMember(ctx context.Context, client pb.LiteVirtClient, h *pb.Host) error {
-	_, err := client.PreflightUpgrade(ctx, &pb.PreflightUpgradeRequest{TargetHost: h.Name})
+	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	_, err := client.PreflightUpgrade(pctx, &pb.PreflightUpgradeRequest{TargetHost: h.Name})
+	if err != nil && pctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+		return fmt.Errorf("no answer within %s: %w", probeTimeout, err)
+	}
 	return err
 }
 
@@ -292,3 +298,6 @@ func sendUpgradeStream(stream grpc.ClientStreamingClient[pb.UpgradeHostRequest, 
 
 // probeParallelism bounds the probes in flight at once.
 const probeParallelism = 8
+
+// probeTimeout bounds one probe.
+var probeTimeout = 30 * time.Second

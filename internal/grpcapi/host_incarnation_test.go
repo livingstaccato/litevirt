@@ -67,11 +67,16 @@ func TestAdmitHost_ShapeFollowsTheTombstone(t *testing.T) {
 	t.Run("tombstone at 0, feature unavailable: legacy", func(t *testing.T) {
 		s := incServer(t, 0)
 		s.SetReleaseFeatureGate(unavailableFeatureGate{})
-		if _, err := admit(s, "host-x"); err != nil {
+		resp, err := admit(s, "host-x")
+		if err != nil {
 			t.Fatal(err)
 		}
 		if n, deleted := incOf(t, s, "host-x"); n != 0 || deleted {
 			t.Errorf("row = (%d, deleted %v), want live at 0", n, deleted)
+		}
+		// Lab test 26, F1: the response says why no incarnation was issued.
+		if why := resp.GetIncarnationNotIssued(); !strings.Contains(why, "host_incarnation") {
+			t.Errorf("incarnation_not_issued = %q, want the reason naming host_incarnation", why)
 		}
 	})
 	t.Run("tombstone at 0, feature available: V2 at 1", func(t *testing.T) {

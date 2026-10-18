@@ -1897,10 +1897,10 @@ func parseTimestamp(s string) *timestamppb.Timestamp {
 //
 // Over a tombstone at incarnation 1 or higher a failure to issue refuses: the
 // legacy statement is never written there. Over a tombstone at 0, where the
-// legacy statement is exactly the previous release's re-admission, a grant the
-// gate cannot give right now (a host has not acknowledged the feature's first
-// use, or not every host advertises the release yet) falls back to it, and
-// notIssued says why.
+// legacy statement is exactly the previous release's re-admission, it falls
+// back to it when the feature is not available here (not every host runs the
+// release yet) or the gate cannot grant it right now (a host has not
+// acknowledged the feature's first use), and notIssued says why.
 func (s *Server) admitHostRow(ctx context.Context, h corrosion.HostRecord) (notIssued string, err error) {
 	if err := s.pullHostsNow(ctx, "re-add", h.Name); err != nil {
 		return "", err
@@ -1918,8 +1918,20 @@ func (s *Server) admitHostRow(ctx context.Context, h corrosion.HostRecord) (notI
 		}
 		return nil
 	}
-	if !found || !deleted || (n == 0 && !s.ReleaseFeatureAvailable(capabilities.FeatureHostIncarnation)) {
+	if !found || !deleted {
 		return "", legacy()
+	}
+	if n == 0 && !s.ReleaseFeatureAvailable(capabilities.FeatureHostIncarnation) {
+		why := "the host_incarnation release feature is not available yet"
+		if rerr := s.ReleaseFeatureRefusal(ctx, capabilities.FeatureHostIncarnation); rerr != nil {
+			why = status.Convert(rerr).Message()
+		}
+		slog.Warn("re-admitting a host without an incarnation: the host_incarnation feature is not available",
+			"host", h.Name, "why", why)
+		if err := legacy(); err != nil {
+			return "", err
+		}
+		return why, nil
 	}
 	if err := s.requireVoterMajority(ctx, "re-add", h.Name); err != nil {
 		return "", err

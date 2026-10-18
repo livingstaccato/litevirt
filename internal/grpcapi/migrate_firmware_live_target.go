@@ -420,8 +420,9 @@ func writeFileDurable(p string, data []byte) error {
 
 // answerOwedLeftover is a DISCARD (an owed one: the caller took the VM back
 // after the commit) that finds no hold here. A domain of the owed uuid while
-// the VM's row names the caller for the owed incarnation is the leftover the
-// DISCARD names: it is put under a leftover record, which the guard and the
+// the VM's row does not name this host for the owed incarnation (it names
+// the caller, another host, another incarnation, or nothing) is the leftover
+// the DISCARD names: it is put under a leftover record, which the guard and the
 // reconciler honour, and the DISCARD is refused until an operator's
 // --discard-target quarantines it. Once that domain is gone the record goes.
 // handled false is the ordinary no-hold answer. The caller holds
@@ -449,7 +450,9 @@ func (s *Server) answerOwedLeftover(ctx context.Context, req *pb.AbortLiveFirmwa
 	if err != nil {
 		return true, status.Errorf(codes.Unavailable, "VM %q: its row cannot be read: %v", req.VmName, err)
 	}
-	if row == nil || row.HostName != caller || !b.SameIncarnation(fwmig.Binding{UUID: parseFirmwareSpec(row.Spec).UUID, CreatedAt: row.CreatedAt}) {
+	if row != nil && row.HostName == s.hostName && b.SameIncarnation(fwmig.Binding{UUID: parseFirmwareSpec(row.Spec).UUID, CreatedAt: row.CreatedAt}) {
+		// The row names this host for the owed incarnation: the return may
+		// not have landed here yet, and the domain may be the VM's own.
 		return false, nil
 	}
 	if !lok || !l.Binding.Matches(b) {

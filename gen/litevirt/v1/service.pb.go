@@ -33441,7 +33441,8 @@ type FirmwareMoveHostRecords struct {
 	Domain        *TargetDomain          `protobuf:"bytes,7,opt,name=domain,proto3" json:"domain,omitempty"`
 	Hashes        map[string]string      `protobuf:"bytes,8,rep,name=hashes,proto3" json:"hashes,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // permall_now, nvram_now
 	Paths         map[string]string      `protobuf:"bytes,9,rep,name=paths,proto3" json:"paths,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Error         string                 `protobuf:"bytes,10,opt,name=error,proto3" json:"error,omitempty"` // a record or the domain that cannot be read
+	Error         string                 `protobuf:"bytes,10,opt,name=error,proto3" json:"error,omitempty"`                                   // a record or the domain that cannot be read
+	LeftoverJson  string                 `protobuf:"bytes,11,opt,name=leftover_json,json=leftoverJson,proto3" json:"leftover_json,omitempty"` // the target's leftover record of an owed DISCARD; empty with none
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -33542,6 +33543,13 @@ func (x *FirmwareMoveHostRecords) GetPaths() map[string]string {
 func (x *FirmwareMoveHostRecords) GetError() string {
 	if x != nil {
 		return x.Error
+	}
+	return ""
+}
+
+func (x *FirmwareMoveHostRecords) GetLeftoverJson() string {
+	if x != nil {
+		return x.LeftoverJson
 	}
 	return ""
 }
@@ -46652,7 +46660,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x1aFirmwareMoveDoctorResponse\x12:\n" +
 	"\x05hosts\x18\x01 \x03(\v2$.litevirt.v1.FirmwareMoveHostRecordsR\x05hosts\x12\x18\n" +
 	"\aoutcome\x18\x02 \x01(\tR\aoutcome\x12 \n" +
-	"\vunreachable\x18\x03 \x03(\tR\vunreachable\"\x9d\x04\n" +
+	"\vunreachable\x18\x03 \x03(\tR\vunreachable\"\xc2\x04\n" +
 	"\x17FirmwareMoveHostRecords\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x1f\n" +
 	"\vmarker_json\x18\x02 \x01(\tR\n" +
@@ -46665,7 +46673,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x06hashes\x18\b \x03(\v20.litevirt.v1.FirmwareMoveHostRecords.HashesEntryR\x06hashes\x12E\n" +
 	"\x05paths\x18\t \x03(\v2/.litevirt.v1.FirmwareMoveHostRecords.PathsEntryR\x05paths\x12\x14\n" +
 	"\x05error\x18\n" +
-	" \x01(\tR\x05error\x1a9\n" +
+	" \x01(\tR\x05error\x12#\n" +
+	"\rleftover_json\x18\v \x01(\tR\fleftoverJson\x1a9\n" +
 	"\vHashesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a8\n" +

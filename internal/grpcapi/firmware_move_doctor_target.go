@@ -638,8 +638,10 @@ func (s *Server) noteAdoptedVFsMissing(ctx context.Context, h fwmig.Hold) {
 // doctorDiscardOwedLeftover is --discard-target on a target that holds no
 // hold of the VM, while another host owes this one a DISCARD of it (the hold
 // went with a release, and the source took the VM back after the commit). The
-// owing host answered with the owed record, and the VM's row names it for the
-// owed incarnation; the domain here has the owed uuid. Under
+// owing host answered with the owed record, or, when none owes it any more,
+// this host's leftover record stands in for it (a guest that runs is then
+// never stopped). The VM's row does not name this host for the owed
+// incarnation; the domain here has the owed uuid. Under
 // firmwareTargets.op: the leftover record is written first (the guard and the
 // reconciler then leave the domain alone), a guest that runs is stopped
 // (--stop-target), the swtpm tree and NVRAM go into
@@ -664,16 +666,27 @@ func (s *Server) doctorDiscardOwedLeftover(ctx context.Context, vm, actor string
 			}
 		}
 	}
+	// localOnly: no host that answered owes the DISCARD any more, and this
+	// host's own leftover record is the authority; a running guest is never
+	// stopped on it.
+	localOnly := false
 	if !found {
-		return "", status.Errorf(codes.FailedPrecondition, "VM %q: no move record names it on %s, and no host that answered owes %s a DISCARD of it", vm, s.hostName, s.hostName)
+		l, ok, err := s.fwRecords().GetLeftover(vm)
+		if err != nil {
+			return "", status.Errorf(codes.FailedPrecondition, "VM %q: its leftover record on %s cannot be read: %v", vm, s.hostName, err)
+		}
+		if !ok {
+			return "", status.Errorf(codes.FailedPrecondition, "VM %q: no move record names it on %s, and no host that answered owes %s a DISCARD of it", vm, s.hostName, s.hostName)
+		}
+		o, owner, localOnly = fwmig.OwedDiscard{VM: vm, Binding: l.Binding, Target: s.hostName, Since: l.Since}, l.Source, true
 	}
 	row, err := corrosion.GetVM(ctx, s.db, vm)
 	if err != nil {
 		return "", status.Errorf(codes.Unavailable, "VM %q: its row cannot be read: %v", vm, err)
 	}
-	if row == nil || row.HostName != owner || !o.Binding.SameIncarnation(fwmig.Binding{UUID: parseFirmwareSpec(row.Spec).UUID, CreatedAt: row.CreatedAt}) {
-		return "", status.Errorf(codes.FailedPrecondition, "VM %q: its row (on %s) does not name %s, which owes the DISCARD, for its incarnation; the leftover here is not discarded",
-			vm, rowHost(row), owner)
+	if row != nil && row.HostName == s.hostName && o.Binding.SameIncarnation(fwmig.Binding{UUID: parseFirmwareSpec(row.Spec).UUID, CreatedAt: row.CreatedAt}) {
+		return "", status.Errorf(codes.FailedPrecondition, "VM %q: its row names %s for the owed incarnation: the domain here is the VM's own, and it is not discarded",
+			vm, s.hostName)
 	}
 	if s.virt == nil {
 		return "", status.Errorf(codes.Unavailable, "VM %q: no libvirt connection", vm)
@@ -695,6 +708,11 @@ func (s *Server) doctorDiscardOwedLeftover(ctx context.Context, vm, actor string
 		return "", status.Errorf(codes.Internal, "VM %q: record the leftover of attempt %s: %v", vm, o.Attempt, err)
 	}
 	if td.Present && td.State != "shutoff" {
+		if localOnly {
+			return "", status.Errorf(codes.FailedPrecondition,
+				"VM %q: its leftover domain on %s is %s, and no host that answered owes a DISCARD of it any more; it is kept under its leftover record, and only a guest that is shut off is discarded on that record alone",
+				vm, s.hostName, td.State)
+		}
 		if !stop {
 			return "", status.Errorf(codes.FailedPrecondition,
 				"VM %q: its leftover domain on %s is %s, and the VM's row names %s; it is kept under a leftover record: add --stop-target",
@@ -722,6 +740,13 @@ func (s *Server) doctorDiscardOwedLeftover(ctx context.Context, vm, actor string
 	if err := writeFileDurable(filepath.Join(dir, "reason.txt"), []byte(reason)); err != nil {
 		return "", status.Errorf(codes.Internal, "VM %q: quarantine reason.txt: %v", vm, err)
 	}
+	if err := s.raiseQuarantineCondition(ctx, fwmigCondition{
+		VM: vm, Attempt: o.Attempt, Source: owner, Target: s.hostName, Paths: []string{dir},
+		Detail: fmt.Sprintf("an operator discarded the leftover of attempt %s on %s; its state is quarantined in %s", o.Attempt, s.hostName, dir),
+		Action: "inspect it and remove the directory by hand when it is no longer needed; `lv doctor firmware-move <vm> --resolve quarantine` closes this",
+	}); err != nil {
+		slog.Warn("firmware-move doctor: raise the quarantine condition", "vm", vm, "error", err)
+	}
 	if h := fwDoctorLeftoverHook; h != nil {
 		if err := h(); err != nil {
 			return "", err
@@ -734,13 +759,6 @@ func (s *Server) doctorDiscardOwedLeftover(ctx context.Context, vm, actor string
 	}
 	if err := recs.RemoveLeftover(vm); err != nil {
 		return "", status.Errorf(codes.Internal, "VM %q: remove the leftover record: %v", vm, err)
-	}
-	if err := s.raiseQuarantineCondition(ctx, fwmigCondition{
-		VM: vm, Attempt: o.Attempt, Source: owner, Target: s.hostName, Paths: []string{dir},
-		Detail: fmt.Sprintf("an operator discarded the leftover of attempt %s on %s; its state is quarantined in %s", o.Attempt, s.hostName, dir),
-		Action: "inspect it and remove the directory by hand when it is no longer needed; `lv doctor firmware-move <vm> --resolve quarantine` closes this",
-	}); err != nil {
-		slog.Warn("firmware-move doctor: raise the quarantine condition", "vm", vm, "error", err)
 	}
 	return fmt.Sprintf("VM %q: the leftover of attempt %s on %s is undefined, its state quarantined in %s; nothing was deleted", vm, o.Attempt, s.hostName, dir), nil
 }

@@ -1336,6 +1336,13 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 			// domain to start between that check and now, undefining leaves
 			// the running copy alone, where a destroy would kill it.
 			//
+			// A leftover that holds firmware state here (NVRAM, swtpm tree)
+			// is never wiped: an owed DISCARD of a live firmware move may name
+			// it before its record reaches this host. Its state is quarantined
+			// and the domain undefined keeping state.
+			if r.quarantineLeftoverFirmware(domName, vm) {
+				continue
+			}
 			// wipe by design: a stopped/defined leftover whose VM now lives on
 			// another host (the authoritative firmware state travels with it).
 			if err := r.virt.UndefineDomain(domName, false); err != nil {
@@ -1343,6 +1350,50 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// quarantineLeftoverFirmware takes a clearly-dead leftover that holds
+// firmware state here: the NVRAM and the swtpm tree of its domain's uuid go
+// into <data_dir>/fwmig-quarantine/<vm>-reconciled-<unix>/ with a reason.txt,
+// as a firmware move's quarantine, and the domain is undefined keeping state.
+// true when the domain was taken here (done, or left for a later pass on an
+// error); false when it holds no firmware state, so the ordinary cleanup runs.
+func (r *Reconciler) quarantineLeftoverFirmware(domName string, vm *corrosion.VMRecord) bool {
+	if r.fwStore == nil {
+		return false
+	}
+	xml, err := r.virt.DumpXMLInactive(domName)
+	if err != nil {
+		slog.Warn("reconciler: leftover kept: its definition cannot be read to find its firmware state", "vm", domName, "error", err)
+		return true
+	}
+	uuid := lv.UUIDFromXML(xml)
+	has := func(p string) bool { _, err := os.Lstat(p); return err == nil }
+	nvram := r.fwStore.NvramPath(domName)
+	swtpm := ""
+	if uuid != "" {
+		swtpm = r.fwStore.SwtpmDir(uuid)
+	}
+	if !has(nvram) && (swtpm == "" || !has(swtpm)) {
+		return false
+	}
+	dir := filepath.Join(r.fwStore.DataDir, fwmig.QuarantineDir, fmt.Sprintf("%s-reconciled-%d", domName, time.Now().Unix()))
+	if err := r.fwStore.QuarantineFirmwareState(domName, uuid, dir); err != nil {
+		slog.Warn("reconciler: leftover kept: its firmware state cannot be quarantined", "vm", domName, "dir", dir, "error", err)
+		return true
+	}
+	reason := fmt.Sprintf("vm: %s\nuuid: %s\nhost: %s\nrow_host: %s\nquarantined_at: %s\n"+
+		"reason: the reconciler cleaned a shut-off leftover whose row names another host; its firmware state is kept here\n",
+		domName, uuid, r.hostName, vm.HostName, time.Now().UTC().Format(time.RFC3339))
+	if err := os.WriteFile(filepath.Join(dir, "reason.txt"), []byte(reason), 0o600); err != nil {
+		slog.Warn("reconciler: quarantine reason.txt", "vm", domName, "dir", dir, "error", err)
+	}
+	if err := r.virt.UndefineDomainPreservingState(domName); err != nil {
+		slog.Warn("reconciler: undefine the quarantined leftover keeping its state", "vm", domName, "error", err)
+		return true
+	}
+	slog.Warn("reconciler: a leftover's firmware state was quarantined, not wiped", "vm", domName, "row_host", vm.HostName, "dir", dir)
+	return true
 }
 
 // cleanableLeftover reports whether a local domain is a CLEARLY-DEAD leftover —

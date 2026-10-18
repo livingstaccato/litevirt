@@ -60,13 +60,14 @@ func TestRenderFirmwareMoveReport(t *testing.T) {
 			{Host: "node-2", HoldJson: `{"state":"verified","source":"node-1","nvram_t0_sha256":"ccc"}`,
 				Domain: &pb.TargetDomain{Present: true, State: "running"}, Quarantines: []string{"/q/os1-x"}},
 			{Host: "node-3"},
+			{Host: "node-5", LeftoverJson: `{"source":"node-1","attempt":"a1","uuid":"u1"}`},
 		},
 		Unreachable: []string{"node-4 (active): connection refused"},
 	})
 	out := b.String()
 	for _, want := range []string{"done", "host node-1:", "phase=target_ran", "parked_from=cutover", "src_permall_sha256=aaa",
 		"permall_now:", "nvram_now:", "host node-2:", "state=verified", "nvram_t0_sha256=ccc", "domain:       running",
-		"quarantine:   /q/os1-x", "NOT READ: node-4"} {
+		"quarantine:   /q/os1-x", "NOT READ: node-4", "host node-5:", "leftover:     source=node-1 attempt=a1"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("report lacks %q:\n%s", want, out)
 		}

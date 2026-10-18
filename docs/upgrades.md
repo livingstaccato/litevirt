@@ -440,6 +440,11 @@ with that VM.
 A target rolled back mid-move answers the source's calls as unknown; the
 source parks the move `target_unreachable` and keeps both copies.
 
+A target rolled back below the leftover record ignores
+`<data_dir>/fwmig-leftover/`; its reconciler may then wipe the NVRAM and TPM
+state of a leftover an owed DISCARD names. Check `ls <data_dir>/fwmig-leftover/`
+first, and resolve each file with `lv doctor firmware-move <vm> --discard-target`.
+
 ### Rolling back after a release token latched
 
 A rolled-back binary that finds a durable activation marker for a capability

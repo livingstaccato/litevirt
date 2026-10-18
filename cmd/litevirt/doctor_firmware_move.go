@@ -149,7 +149,7 @@ func renderFirmwareMoveReport(w io.Writer, vm string, resp *pb.FirmwareMoveDocto
 	}
 	found := false
 	for _, h := range resp.GetHosts() {
-		recs := h.GetMarkerJson() != "" || h.GetHoldJson() != "" || len(h.GetOwedDiscards()) > 0 ||
+		recs := h.GetMarkerJson() != "" || h.GetHoldJson() != "" || h.GetLeftoverJson() != "" || len(h.GetOwedDiscards()) > 0 ||
 			len(h.GetQuarantines()) > 0 || len(h.GetRetained()) > 0 || h.GetError() != ""
 		if !recs && !h.GetDomain().GetPresent() {
 			continue
@@ -166,6 +166,9 @@ func renderFirmwareMoveReport(w io.Writer, vm string, resp *pb.FirmwareMoveDocto
 		if j := h.GetHoldJson(); j != "" {
 			fmt.Fprintf(w, "  hold:         %s\n", recordLine(j, "state", "source", "attempt", "nvram_materialised", "nvram_t0_sha256",
 				"verified_permall_sha256", "since", "adoption"))
+		}
+		if j := h.GetLeftoverJson(); j != "" {
+			fmt.Fprintf(w, "  leftover:     %s\n", recordLine(j, "source", "attempt", "uuid", "since"))
 		}
 		for _, o := range h.GetOwedDiscards() {
 			fmt.Fprintf(w, "  owed discard: %s\n", recordLine(o, "target", "attempt", "since"))

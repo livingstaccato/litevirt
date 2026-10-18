@@ -3820,6 +3820,7 @@ message FirmwareMoveHostRecords {
     map<string, string> hashes        = 8;  // permall_now, nvram_now
     map<string, string> paths         = 9;
     string              error         = 10; // a record or the domain that cannot be read
+    string              leftover_json = 11; // the target's leftover record of an owed DISCARD; empty with none
 }
 
 // FirmwareMoveDoctorTargetOp is a target's part of an operator's resolution,

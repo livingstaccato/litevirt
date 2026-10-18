@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -729,6 +730,203 @@ func TestDoctorFirmwareMove_R2(t *testing.T) {
 		}
 		if got := auditRows(t, r); len(got) != 1 || got[0] != "error" {
 			t.Errorf("audit rows %v, want one error (the target's)", got)
+		}
+	})
+}
+
+// Re-review 2 of D2-18 (round 3): the leftover record whenever the row does
+// not name the target (I-1 a), the reconciler that quarantines instead of
+// wiping a leftover's firmware state (I-1 b), the doctor's exit once the row
+// left the owing host or no host owes it (I-2), and the minors.
+func TestDoctorFirmwareMove_R3(t *testing.T) {
+	ctx := context.Background()
+	returnedReleased := func(t *testing.T) (*fwlRig, fwmig.OwedDiscard) {
+		r := newFwdRig(t, fwlOpts{})
+		run := r.crashAt(fwmig.PhaseReleased)
+		r.park(run, fwmig.PhaseTargetUnreachable, "Release was not answered")
+		r.fenceTarget()
+		if _, err := r.doctor(actAcceptSource, withAck); err != nil {
+			t.Fatalf("accept-source: %v", err)
+		}
+		owed, _ := r.src.fwRecords().ListOwedDiscards()
+		if len(owed) != 1 {
+			t.Fatalf("owed discards %+v, want one", owed)
+		}
+		r.dstFake.SetState(fwlVM, libvirtfake.StateShutdown)
+		r.dstFake.SetStateReason(fwlVM, "destroyed")
+		return r, owed[0]
+	}
+	reconcileDst := func(r *fwlRig) {
+		rc := health.NewReconciler(r.dst.hostName, r.dst.dataDir, r.dst.db, r.dstFake)
+		rc.SetFirmwareStore(r.dstStore)
+		rc.ReconcileOnce(ctx)
+	}
+	exec := func(t *testing.T, r *fwlRig, q string, args ...any) {
+		t.Helper()
+		if err := r.src.db.Execute(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	leftoverKept := func(t *testing.T, r *fwlRig) {
+		t.Helper()
+		if _, ok := r.dstFake.RawState(fwlVM); !ok {
+			t.Fatal("the leftover domain is gone")
+		}
+		if b, _ := os.ReadFile(r.dstStore.NvramPath(fwlVM)); len(b) == 0 {
+			t.Fatal("the leftover's NVRAM is gone")
+		}
+		if b, _ := os.ReadFile(filepath.Join(r.dstStore.SwtpmDir(fwLiveUUID), "tpm2", "tpm2-00.permall")); len(b) == 0 {
+			t.Fatal("the leftover's TPM state is gone")
+		}
+	}
+	resolvedOnSource := func(t *testing.T, r *fwlRig) {
+		t.Helper()
+		r.src.RetryOwedFirmwareDiscardsOnce(ctx)
+		if left, _ := r.src.fwRecords().ListOwedDiscards(); len(left) != 0 {
+			t.Errorf("owed discards %+v after the leftover went", left)
+		}
+		if c, found, _ := corrosion.GetHealthCondition(ctx, r.src.db, firmwareMigrationEvaluator, condFwmigDiscardOwed, "vm", fwlVM); found && c.Lifecycle != corrosion.ConditionResolved {
+			t.Errorf("discard_owed %s, want resolved", c.Lifecycle)
+		}
+	}
+	discarded := func(t *testing.T, r *fwlRig, attempt string) {
+		t.Helper()
+		if st, ok := r.dstFake.RawState(fwlVM); ok {
+			t.Errorf("the leftover domain is still defined (%s)", st)
+		}
+		dir, _ := r.dst.fwRecords().QuarantinePath(fwlVM, attempt)
+		if b, _ := os.ReadFile(filepath.Join(dir, "swtpm", "tpm2", "tpm2-00.permall")); len(b) == 0 {
+			t.Error("the leftover's TPM state is not in the quarantine")
+		}
+		if _, ok, _ := r.dst.fwRecords().GetLeftover(fwlVM); ok {
+			t.Error("the leftover record stays")
+		}
+	}
+
+	// I-1 (a), deterministic: the row on a third host. Mutation: record only
+	// a row naming the caller — red.
+	t.Run("released_target_back_row_on_third_host/discard_records_leftover", func(t *testing.T) {
+		r, o := returnedReleased(t)
+		exec(t, r, `UPDATE vms SET host_name = ? WHERE name = ?`, "third-host", fwlVM)
+		r.src.RetryOwedFirmwareDiscardsOnce(ctx)
+		if _, ok, _ := r.dst.fwRecords().GetLeftover(fwlVM); !ok {
+			t.Fatal("no leftover record for a row on a third host")
+		}
+		reconcileDst(r)
+		leftoverKept(t, r)
+		// m-3: the doctor shows it.
+		rep, err := r.doctor(pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_UNSPECIFIED)
+		if err != nil {
+			t.Fatal(err)
+		}
+		shown := false
+		for _, h := range rep.GetHosts() {
+			shown = shown || (h.GetHost() == "dst-host" && strings.Contains(h.GetLeftoverJson(), o.Attempt))
+		}
+		if !shown {
+			t.Errorf("the doctor does not show the leftover record: %+v", rep.GetHosts())
+		}
+		// I-2: the row left the owing host; the doctor still discards it.
+		if _, err := r.doctor(actDiscard); err != nil {
+			t.Fatalf("discard: %v", err)
+		}
+		discarded(t, r, o.Attempt)
+		resolvedOnSource(t, r)
+	})
+	// I-1 (b), the race: the reconciler runs before any DISCARD reaches the
+	// target. Mutation: wipe instead of quarantine — red.
+	t.Run("released_target_back_reconciler_first/state_quarantined", func(t *testing.T) {
+		r, _ := returnedReleased(t)
+		nv, _ := os.ReadFile(r.dstStore.NvramPath(fwlVM))
+		reconcileDst(r)
+		ents, _ := os.ReadDir(filepath.Join(r.dst.dataDir, fwmig.QuarantineDir))
+		var dir string
+		for _, e := range ents {
+			if strings.HasPrefix(e.Name(), fwlVM+"-reconciled-") {
+				dir = filepath.Join(r.dst.dataDir, fwmig.QuarantineDir, e.Name())
+			}
+		}
+		if dir == "" {
+			t.Fatalf("no reconciled quarantine (entries %v)", ents)
+		}
+		if b, _ := os.ReadFile(filepath.Join(dir, "nvram")); !bytes.Equal(b, nv) || len(b) == 0 {
+			t.Errorf("quarantined NVRAM %q, want %q", b, nv)
+		}
+		if b, _ := os.ReadFile(filepath.Join(dir, "swtpm", "tpm2", "tpm2-00.permall")); len(b) == 0 {
+			t.Error("the leftover's TPM state is not in the quarantine")
+		}
+		if _, err := os.Stat(filepath.Join(dir, "reason.txt")); err != nil {
+			t.Errorf("no reason.txt: %v", err)
+		}
+		resolvedOnSource(t, r)
+	})
+	// I-2: the VM deleted after the record was written. Mutation: require the
+	// row on the owing host — red.
+	t.Run("leftover_vm_deleted/discard", func(t *testing.T) {
+		r, o := returnedReleased(t)
+		r.src.RetryOwedFirmwareDiscardsOnce(ctx)
+		exec(t, r, `DELETE FROM vms WHERE name = ?`, fwlVM)
+		if _, err := r.doctor(actDiscard); err != nil {
+			t.Fatalf("discard: %v", err)
+		}
+		discarded(t, r, o.Attempt)
+		resolvedOnSource(t, r)
+	})
+	// I-2: no host owes the DISCARD any more; the local record is the exit,
+	// for a guest that is not running only. Mutation: refuse without an
+	// owing host — red; stop a running guest on the local record — red.
+	t.Run("leftover_no_owner/discard_local_record", func(t *testing.T) {
+		r, o := returnedReleased(t)
+		r.src.RetryOwedFirmwareDiscardsOnce(ctx)
+		if err := r.src.fwRecords().RemoveOwedDiscard(fwlVM, o.Attempt); err != nil {
+			t.Fatal(err)
+		}
+		r.dstFake.SetState(fwlVM, libvirtfake.StateRunning)
+		if _, err := r.doctor(actDiscard, withStop); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "no host that answered owes") {
+			t.Fatalf("running leftover on the local record: %v", err)
+		}
+		if st, _ := r.dstFake.RawState(fwlVM); st != libvirtfake.StateRunning {
+			t.Fatalf("the leftover is %s, want it left running", st)
+		}
+		r.dstFake.SetState(fwlVM, libvirtfake.StateShutdown)
+		if _, err := r.doctor(actDiscard); err != nil {
+			t.Fatalf("discard: %v", err)
+		}
+		discarded(t, r, o.Attempt)
+	})
+	// m-2: a run stopped before the undefine has already announced the
+	// quarantine. Mutation: raise it only at the end — red.
+	t.Run("leftover_discard_interrupted/quarantine_announced", func(t *testing.T) {
+		r, o := returnedReleased(t)
+		old := fwDoctorLeftoverHook
+		fwDoctorLeftoverHook = func() error { return errors.New("daemon died") }
+		_, err := r.doctor(actDiscard)
+		fwDoctorLeftoverHook = old
+		if err == nil {
+			t.Fatal("the run did not stop")
+		}
+		dir, _ := r.dst.fwRecords().QuarantinePath(fwlVM, o.Attempt)
+		c, found, _ := corrosion.GetHealthCondition(ctx, r.src.db, firmwareMigrationEvaluator, condFwmigQuarantine, "vm", fwlVM)
+		if !found || c.Lifecycle == corrosion.ConditionResolved || !strings.Contains(c.Evidence, dir) {
+			t.Errorf("quarantine condition %+v (found %v), want it open naming %s", c, found, dir)
+		}
+	})
+	// m-1: a refused return drops its owed record, and a discard_owed raised
+	// on it meanwhile goes with it. Mutation: drop the resolve — red.
+	t.Run("refused_return_resolves_stale_discard_owed", func(t *testing.T) {
+		r := newFwdRig(t, fwlOpts{})
+		run := r.crashAt(fwmig.PhaseCommitted)
+		r.dstFake.SetState(fwlVM, libvirtfake.StateRunning)
+		m := r.park(run, fwmig.PhaseTargetRan, "TARGET_RAN")
+		if err := r.src.raiseFirmwareMigrationCondition(ctx, fwmigCondition{Code: condFwmigDiscardOwed, VM: fwlVM, Attempt: m.Attempt,
+			Source: "src-host", Target: "dst-host", Severity: corrosion.SeverityCritical, Detail: "raised by a retry during the action"}); err != nil {
+			t.Fatal(err)
+		}
+		before := r.snap()
+		_, err := r.doctor(actAcceptSource, withAck)
+		r.refused(err, "add --stop-target", before)
+		if c, found, _ := corrosion.GetHealthCondition(ctx, r.src.db, firmwareMigrationEvaluator, condFwmigDiscardOwed, "vm", fwlVM); found && c.Lifecycle != corrosion.ConditionResolved {
+			t.Errorf("discard_owed %s with no owed record left, want resolved", c.Lifecycle)
 		}
 	})
 }

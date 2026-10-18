@@ -241,8 +241,11 @@ func (s *Server) gatherFirmwareMoveRecords(ctx context.Context, vm, actor string
 // names the VM (the move's source drives every action it has a record for),
 // else the one whose hold does.
 func firmwareMoveDoctorHost(report *pb.FirmwareMoveDoctorResponse, vm string, action pb.FirmwareMoveDoctorAction) (string, error) {
-	var markers, holds, owedTo []string
+	var markers, holds, owedTo, leftovers []string
 	for _, h := range report.GetHosts() {
+		if h.GetLeftoverJson() != "" {
+			leftovers = append(leftovers, h.GetHost())
+		}
 		if h.GetMarkerJson() != "" {
 			markers = append(markers, h.GetHost())
 		}
@@ -261,6 +264,11 @@ func firmwareMoveDoctorHost(report *pb.FirmwareMoveDoctorResponse, vm string, ac
 		// An owed DISCARD whose target holds no hold any more: the discard
 		// of the leftover runs on that target.
 		return owedTo[0], nil
+	}
+	if len(markers) == 0 && len(holds) == 0 && len(owedTo) == 0 && len(leftovers) == 1 &&
+		action == pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_DISCARD_TARGET {
+		// A leftover record no host owes a DISCARD for any more.
+		return leftovers[0], nil
 	}
 	switch {
 	case len(markers) == 1:
@@ -281,8 +289,9 @@ func firmwareMoveDoctorHost(report *pb.FirmwareMoveDoctorResponse, vm string, ac
 	return "", status.Errorf(codes.FailedPrecondition, "VM %q: no host that answered holds a live firmware move marker or hold%s", vm, unreach)
 }
 
-// fwRecordNameRe is <vm>-<attempt> with its suffix, the attempt a UUID.
-var fwRecordNameRe = regexp.MustCompile(`^(.+)-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(\.tar)?$`)
+// fwRecordNameRe is <vm>-<attempt> with its suffix, the attempt a UUID, or
+// <vm>-reconciled-<unix> (a quarantine the reconciler made of a leftover).
+var fwRecordNameRe = regexp.MustCompile(`^(.+)-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|reconciled-[0-9]+)(\.tar)?$`)
 
 // localFirmwareMoveRecords is this host's records of vm, the VM's domain here
 // and its state's hashes now. Whatever cannot be read is named in Error.
@@ -302,6 +311,14 @@ func (s *Server) localFirmwareMoveRecords(ctx context.Context, vm string) *pb.Fi
 		out.HoldJson = fwDoctorJSON(h)
 		if uuid == "" {
 			uuid = h.UUID
+		}
+	}
+	if l, ok, err := recs.GetLeftover(vm); err != nil {
+		errs = append(errs, "leftover: "+err.Error())
+	} else if ok {
+		out.LeftoverJson = fwDoctorJSON(l)
+		if uuid == "" {
+			uuid = l.UUID
 		}
 	}
 	if owed, err := recs.ListOwedDiscards(); err != nil {
@@ -477,6 +494,10 @@ func (s *Server) firmwareMoveDoctorAct(ctx context.Context, req *pb.FirmwareMove
 	}
 	if req.GetAction() == pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_DISCARD_TARGET {
 		return s.doctorDiscardOwedLeftover(ctx, vm, actor, req.GetStopTarget())
+	}
+	if l, ok, err := recs.GetLeftover(vm); err == nil && ok {
+		return "", status.Errorf(codes.FailedPrecondition, "VM %q: %s keeps the leftover of attempt %s from %s under a leftover record; %s does not resolve it: `lv doctor firmware-move %s --discard-target`",
+			vm, s.hostName, l.Attempt, l.Source, fwDoctorFlagOf(req.GetAction()), vm)
 	}
 	return "", status.Errorf(codes.FailedPrecondition, "VM %q: no live firmware move record names it on %s", vm, s.hostName)
 }
@@ -1324,10 +1345,17 @@ func (s *Server) doctorAcceptSourceAfterCommit(ctx context.Context, m fwmig.Mark
 	}
 	landed := false
 	defer func() {
-		if owedPut && !landed {
-			if rerr := recs.RemoveOwedDiscard(m.VM, m.Attempt); rerr != nil {
-				slog.Warn("firmware-move doctor: a refused return leaves its owed-discard record", "vm", m.VM, "error", rerr)
-			}
+		if !owedPut || landed {
+			return
+		}
+		if rerr := recs.RemoveOwedDiscard(m.VM, m.Attempt); rerr != nil {
+			slog.Warn("firmware-move doctor: a refused return leaves its owed-discard record", "vm", m.VM, "error", rerr)
+			return
+		}
+		// An owed-discard retry may have raised discard_owed on the record
+		// while the action ran; with no record of the VM left, it goes too.
+		if owed, err := recs.ListOwedDiscards(); err == nil && !slices.ContainsFunc(owed, func(o fwmig.OwedDiscard) bool { return o.VM == m.VM }) {
+			_ = s.resolveFirmwareMigrationCondition(ctx, condFwmigDiscardOwed, m.VM)
 		}
 	}()
 	off, err := corrosion.HostProvedOff(ctx, s.db, m.Target)

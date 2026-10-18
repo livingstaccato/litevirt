@@ -17,7 +17,11 @@ import (
 	"strings"
 	"syscall"
 
+	"google.golang.org/grpc/metadata"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/apimeta"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netutil"
 	"gopkg.in/yaml.v3"
@@ -343,7 +347,9 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	if err != nil {
 		return fmt.Errorf("read generated host certificate serial: %w", err)
 	}
-	admitted, err := c.AdmitHost(ctx, &pb.AdmitHostRequest{
+	// This command installs its own build, which keeps a host incarnation.
+	admitCtx := metadata.AppendToOutgoingContext(ctx, apimeta.AdmitInstallsReleaseHeader, capabilities.ReleaseToken)
+	admitted, err := c.AdmitHost(admitCtx, &pb.AdmitHostRequest{
 		Name: hostName, Address: hostAddr, CertSerial: serial,
 	})
 	if err != nil {

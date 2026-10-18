@@ -1257,7 +1257,13 @@ incarnation 0. A re-admission that issues a number needs:
 
 - the release token latched on the node `lv host add` runs against;
 - a live voter majority on that node, counted without the host being re-added;
-- a peer it can pull the host's row from first.
+- a peer it can pull the host's row from first;
+- an `lv` of this release or later, which installs its own build on the host.
+  A previous release's `lv host add` would install a build that cannot keep an
+  incarnation, and the host would stay joining, refused by every peer.
+  Removing the last previous-build host latches the release, so re-add such a
+  host with this release's `lv`; a host already admitted on an older build
+  joins after `lv host upgrade <host>`.
 
 Otherwise `lv host add` is refused with the reason. Over a tombstone at 1 or
 higher it is never written the way the previous release writes it. `lv host rm`
@@ -1271,8 +1277,9 @@ one installed (and not its renewal), or whose own row is removed, makes no
 write to that row until the cluster's row for its certificate reaches it
 (`own_row_held`, [diagnostics.md](diagnostics.md#own-row-held-own_row_held)).
 An `lv host add` of a host removed at incarnation 0 that cannot use
-`host_incarnation` at that moment (a host has not acknowledged its first use
-yet) re-admits the host as the previous release does, and prints why.
+`host_incarnation` at that moment (not every host runs the release yet, or a
+host has not acknowledged its first use) re-admits the host as the previous
+release does, and prints why.
 
 The re-added host publishes a missing capability label again (`litevirt.lxc`,
 `litevirt.tpm`, `litevirt.secureboot`) within a minute of the re-admitted row

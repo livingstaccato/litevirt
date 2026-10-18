@@ -154,6 +154,31 @@ func TestAdmitHost_ShapeFollowsTheTombstone(t *testing.T) {
 	})
 }
 
+// Lab test 26, F2: a re-admission that would issue an incarnation, made by a
+// previous release's lv (it names no release it installs), is refused with
+// the commands that bring the host in; the tombstone is left alone. Over a
+// tombstone at 0 with the feature unavailable it is the previous release's
+// re-admission, which that build keeps, and is not refused.
+func TestAdmitHost_APreviousReleaseLvIsNotGivenAnIncarnation(t *testing.T) {
+	for _, n := range []int{0, 1} {
+		s := incServer(t, n)
+		s.SetReleaseFeatureGate(&scriptedFeatureGate{t: t})
+		_, err := admitFrom(s, "host-x", false)
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "lv host upgrade host-x") ||
+			!strings.Contains(err.Error(), "this release's CLI") {
+			t.Errorf("tombstone at %d: admission from a previous release's lv = %v, want FailedPrecondition naming the fix", n, err)
+		}
+		if got, deleted := incOf(t, s, "host-x"); got != int64(n) || !deleted {
+			t.Errorf("tombstone at %d: row = (%d, deleted %v), want the tombstone untouched", n, got, deleted)
+		}
+	}
+	s := incServer(t, 0)
+	s.SetReleaseFeatureGate(unavailableFeatureGate{})
+	if _, err := admitFrom(s, "host-x", false); err != nil {
+		t.Errorf("a previous-release re-admission at 0 before the feature: %v, want the legacy admission", err)
+	}
+}
+
 // quorumGate is a gate whose quorum a test sets, counted with or without the
 // target as excluded says.
 type quorumGate struct {

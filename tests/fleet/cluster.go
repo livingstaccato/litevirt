@@ -80,10 +80,13 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/apimeta"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
@@ -623,6 +626,8 @@ func (c *Cluster) SelfClient(n *Node) pb.LiteVirtClient {
 		cc, err := grpc.NewClient(
 			fmt.Sprintf("%s:%d", n.Address, n.Port),
 			grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
+			// An AdmitHost from this client is this release's lv host add.
+			grpc.WithUnaryInterceptor(currentLvAdmit),
 		)
 		if err != nil {
 			c.t.Fatalf("dial self %s: %v", n.Name, err)
@@ -630,6 +635,16 @@ func (c *Cluster) SelfClient(n *Node) pb.LiteVirtClient {
 		n.selfConn = cc
 	}
 	return pb.NewLiteVirtClient(n.selfConn)
+}
+
+// currentLvAdmit marks an AdmitHost as made by this release's lv host add,
+// which names the release it installs (apimeta.AdmitInstallsReleaseHeader).
+func currentLvAdmit(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn,
+	invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+	if strings.HasSuffix(method, "/AdmitHost") {
+		ctx = metadata.AppendToOutgoingContext(ctx, apimeta.AdmitInstallsReleaseHeader, capabilities.ReleaseToken)
+	}
+	return invoker(ctx, method, req, reply, cc, opts...)
 }
 
 // PeerClient returns a gRPC client dialed at target while presenting source's

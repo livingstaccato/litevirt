@@ -12,10 +12,12 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/apimeta"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
@@ -1933,6 +1935,9 @@ func (s *Server) admitHostRow(ctx context.Context, h corrosion.HostRecord) (notI
 		}
 		return why, nil
 	}
+	if err := admitInstallsIncarnationBuild(ctx, h.Name, n+1); err != nil {
+		return "", err
+	}
 	if err := s.requireVoterMajority(ctx, "re-add", h.Name); err != nil {
 		return "", err
 	}
@@ -1959,6 +1964,21 @@ func (s *Server) admitHostRow(ctx context.Context, h corrosion.HostRecord) (notI
 		return "", status.Errorf(st.Code(), "re-adding %s at incarnation %d: %s", h.Name, n+1, st.Message())
 	}
 	return "", status.Errorf(codes.FailedPrecondition, "admit host: %v", err)
+}
+
+// admitInstallsIncarnationBuild refuses an admission that would issue
+// incarnation next when the `lv host add` making it is from a previous
+// release (it names no release it installs): the build it installs cannot
+// keep an incarnation, and the host would stay joining, refused by every peer.
+func admitInstallsIncarnationBuild(ctx context.Context, name string, next int64) error {
+	if md, ok := metadata.FromIncomingContext(ctx); ok && len(md.Get(apimeta.AdmitInstallsReleaseHeader)) > 0 {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"re-adding %s issues host incarnation %d, and the client that ran this is from a previous release: "+
+			"its `lv host add` installs a build that cannot keep one, so the host would stay joining, refused by "+
+			"every peer. Re-run `lv host add` with this release's CLI, which installs its own build. A host "+
+			"already admitted on an older build joins after `lv host upgrade %s`", name, next, name)
 }
 
 // fenceTargetNote is the incarnation, serial, strategy and BMC a fence of h

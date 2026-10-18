@@ -296,8 +296,8 @@ func (w *settleRecorder) stopRecorded(ctx context.Context, rec settlePending, st
 		return err
 	}
 	rec.Phase = settlePhaseStopped
-	w.markProven(rec)
 	if stored {
+		w.markProven(rec)
 		if err := w.putStopped(store, rec); err != nil {
 			slog.Warn("partition-settle: could not mark the pending-settle record stopped", "kind", rec.Kind, "name", rec.Name, "error", err)
 		}

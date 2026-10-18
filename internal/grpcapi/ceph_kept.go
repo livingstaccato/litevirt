@@ -62,6 +62,9 @@ type cephKeptRecord struct {
 	Volume string `json:"volume"` // the litevirt pool it was on
 	Reason string `json:"reason"`
 	Since  string `json:"since"`
+	// Incarnation is the deleting VM's created_at, when it could be read: a
+	// VM created again under the name is another VM.
+	Incarnation string `json:"incarnation,omitempty"`
 }
 
 type cephKeptImages struct {
@@ -168,10 +171,18 @@ func (s *Server) recordKeptCephImage(vmName string, d *corrosion.DiskRecord, err
 		return KeptCephImage{}, false
 	}
 	k := KeptCephImage{Image: l.Spec, Disk: d.DiskName, Reason: err.Error()}
+	incarnation := ""
+	if s.db != nil {
+		rctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if vm, verr := corrosion.GetVM(rctx, s.db, vmName); verr == nil && vm != nil {
+			incarnation = vm.CreatedAt
+		}
+		cancel()
+	}
 	s.cephKept.mu.Lock()
 	m := s.keptLocked()
 	m[l.Spec] = cephKeptRecord{Image: l.Spec, VM: vmName, Disk: d.DiskName, Path: d.Path, Volume: d.StorageVolume,
-		Reason: k.Reason, Since: time.Now().UTC().Format(time.RFC3339)}
+		Reason: k.Reason, Since: time.Now().UTC().Format(time.RFC3339), Incarnation: incarnation}
 	s.saveKeptLocked()
 	s.cephKept.mu.Unlock()
 	slog.Warn("ceph: a VM delete left an image in its pool; named by "+condCephImageLeftover,
@@ -307,7 +318,7 @@ func (s *Server) judgeCephImages(ctx context.Context) {
 		// and named once those rows are gone. A failed read keeps it named.
 		if rows, err := corrosion.DisksNamingRBDImage(ctx, s.db, r.Image); err == nil && len(rows) > 0 {
 			for _, d := range rows {
-				if d.VMName != r.VM {
+				if d.VMName != r.VM || s.anotherIncarnation(ctx, r) {
 					s.forgetKeptIf(r)
 					break
 				}
@@ -368,6 +379,18 @@ func (s *Server) judgeCephImages(ctx context.Context) {
 	if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
 		slog.Warn("ceph: raise the kept image condition", "error", err)
 	}
+}
+
+// anotherIncarnation reports whether a live VM of r.VM's name is a VM created
+// again since the delete that left r (its created_at differs). A record
+// written before incarnations were kept, or a VM that cannot be read, says
+// no: the record is kept.
+func (s *Server) anotherIncarnation(ctx context.Context, r cephKeptRecord) bool {
+	if r.Incarnation == "" {
+		return false
+	}
+	vm, err := corrosion.GetVM(ctx, s.db, r.VM)
+	return err == nil && vm != nil && vm.CreatedAt != "" && vm.CreatedAt != r.Incarnation
 }
 
 // forgetKeptIf drops r's record if it is still the one recorded.

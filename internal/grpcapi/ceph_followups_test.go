@@ -226,3 +226,37 @@ func TestCephTrashLeftover_AnUnmovedQueueFileIsNotCalledSetAside(t *testing.T) {
 		t.Fatalf("evidence %s, want an unmoved file described as left in place", row.Evidence)
 	}
 }
+
+// Re-review m-D. A kept record whose VM name has a VM again — created anew
+// and using the image — is that VM's disk now: the record goes, though the
+// rows naming it carry the deleted VM's name.
+//
+// Mutation "name only" (anotherIncarnation always false): red.
+func TestCephImageLeftover_AReCreatedVMOfTheNameForgetsIt(t *testing.T) {
+	f := newCephPoolFixture(t)
+	ctx := context.Background()
+	vm := f.insertCephVM(t, "again", "test-host")
+	disks, _ := corrosion.GetVMDisks(ctx, f.s.db, vm.Name)
+	var data corrosion.DiskRecord
+	for _, d := range disks {
+		if d.DiskName == "data" {
+			data = d
+		}
+	}
+	if _, ok := f.s.recordKeptCephImage(vm.Name, &data, errors.New("in use")); !ok {
+		t.Fatal("fixture: not recorded")
+	}
+	if err := corrosion.DeleteVM(ctx, f.s.db, vm.Name); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond) // a new created_at
+	data.VMName = vm.Name
+	if err := corrosion.InsertVM(ctx, f.s.db, corrosion.VMRecord{Name: vm.Name, HostName: "test-host", State: "stopped",
+		Spec: `{"name":"again","cpu":1,"memory_mib":256}`}, nil, []corrosion.DiskRecord{data}); err != nil {
+		t.Fatal(err)
+	}
+	f.s.judgeCephImages(ctx)
+	if recs := f.s.keptRecords(); len(recs) != 0 {
+		t.Fatalf("records %+v: a re-created VM using the image kept the old delete's record", recs)
+	}
+}

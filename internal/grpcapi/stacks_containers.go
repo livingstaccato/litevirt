@@ -279,18 +279,21 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 		return nil, nil, status.Errorf(status.Code(err), "recreating container %q: %s; the member was left as it is", a.VMName, status.Convert(err).Message())
 	}
 	// The create's host-side checks (the protected-place check and the
-	// image-owner check), on the disk of the host that holds the member,
-	// before anything is deleted: here when that is this host; otherwise
-	// that host runs them at the delete, from the preflight its forwarded
-	// delete carries (recreate_preflight.go).
+	// image-owner check) and the fetch of its image, on the host that holds
+	// the member, before anything is deleted: here when that is this host;
+	// otherwise that host runs them at the delete, from the preflight its
+	// forwarded delete carries (recreate_preflight.go).
+	pf := &recreatePreflight{template: req.Template, project: req.Project, distro: req.Distro, release: req.Release, arch: req.Arch}
 	if a.TargetHost == "" || a.TargetHost == s.hostName {
-		if err := s.recreateHostChecks(createCtx, req.Template, req.Project, req.Name); err != nil {
-			s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
+		if err := s.recreateHostChecks(createCtx, *pf, req.Name); err != nil {
+			if status.Code(err) != codes.FailedPrecondition {
+				s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
+			}
 			return nil, nil, err
 		}
 		return dec, nil, nil
 	}
-	return dec, &recreatePreflight{template: req.Template, project: req.Project}, nil
+	return dec, pf, nil
 }
 
 // recordedSecurity is a container record's privilege mode and confinement;

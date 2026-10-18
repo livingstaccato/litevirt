@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
@@ -11,14 +12,16 @@ import (
 
 // A compose recreate deletes its member and then creates it again. The
 // create's host-side checks — the protected-place check of its template
-// (checkContainerTemplate) and the OCI image-owner check
-// (refuseForeignOCIItem) — read the disk of the host the member lives on.
+// (checkContainerTemplate), the OCI image-owner check (refuseForeignOCIItem),
+// and the fetch of the image it is built from (FetchContainerImage) — read
+// the disk, or reach the image server, of the host the member lives on.
 // When the deploy entered on that host the recreate judgment runs them
 // before the delete (judgeContainerRecreate). When it entered on another
 // host, the delete forwarded to the member's host carries the recreate's
-// template and project, and that host runs the same checks on its own disk
-// before it deletes anything (recreateDeleteCheck): a recreate whose create
-// would be refused is refused at its delete, and the member is kept.
+// template, project and download image, and that host runs the same checks,
+// and the fetch, before it deletes anything (recreateDeleteCheck): a
+// recreate whose create would be refused, or whose image it cannot fetch, is
+// refused at its delete, and the member is kept.
 //
 // The metadata is honoured only from an authenticated cluster peer
 // (isRemotePeer, as for the owner-strict marker): a client cannot set it,
@@ -27,12 +30,17 @@ import (
 const (
 	recreateTemplateMDKey = "x-litevirt-recreate-template-bin"
 	recreateProjectMDKey  = "x-litevirt-recreate-project-bin"
+	recreateDistroMDKey   = "x-litevirt-recreate-distro-bin"
+	recreateReleaseMDKey  = "x-litevirt-recreate-release-bin"
+	recreateArchMDKey     = "x-litevirt-recreate-arch-bin"
 )
 
 // recreatePreflight is the create a recreate's delete is followed by, as far
 // as the member's host needs it to judge that create before the delete.
 type recreatePreflight struct {
 	template, project string
+	// distro, release and arch are the download template's image.
+	distro, release, arch string
 }
 
 type recreatePreflightKey struct{}
@@ -55,7 +63,8 @@ func (s *Server) recreatePreflightOutgoing(ctx context.Context) context.Context 
 		return ctx
 	}
 	ctx = s.ownerStrictOutgoing(ctx)
-	return metadata.AppendToOutgoingContext(ctx, recreateTemplateMDKey, pf.template, recreateProjectMDKey, pf.project)
+	return metadata.AppendToOutgoingContext(ctx, recreateTemplateMDKey, pf.template, recreateProjectMDKey, pf.project,
+		recreateDistroMDKey, pf.distro, recreateReleaseMDKey, pf.release, recreateArchMDKey, pf.arch)
 }
 
 // recreatePreflightIncoming is the preflight a forwarded recreate delete
@@ -72,11 +81,16 @@ func (s *Server) recreatePreflightIncoming(ctx context.Context) *recreatePreflig
 	if len(t) == 0 {
 		return nil
 	}
-	pf := &recreatePreflight{template: t[0]}
-	if p := md.Get(recreateProjectMDKey); len(p) > 0 {
-		pf.project = p[0]
+	first := func(k string) string {
+		if v := md.Get(k); len(v) > 0 {
+			return v[0]
+		}
+		return ""
 	}
-	return pf
+	return &recreatePreflight{
+		template: t[0], project: first(recreateProjectMDKey),
+		distro: first(recreateDistroMDKey), release: first(recreateReleaseMDKey), arch: first(recreateArchMDKey),
+	}
 }
 
 // recreateDeleteCheck runs, on the member's host and before its delete, the
@@ -87,7 +101,7 @@ func (s *Server) recreateDeleteCheck(ctx context.Context, name string) error {
 	if pf == nil {
 		return nil
 	}
-	if err := s.recreateHostChecks(ctx, pf.template, pf.project, name); err != nil {
+	if err := s.recreateHostChecks(ctx, *pf, name); err != nil {
 		s.audit(ctx, "ct.delete", name, "recreate of template="+pf.template, "denied")
 		return err
 	}
@@ -101,8 +115,47 @@ func (s *Server) recreateDeleteCheck(ctx context.Context, name string) error {
 // create's project owns, passes as on main; another project's is refused).
 // No grant skips the owner check: library items and their owner records are
 // per host, so the template string a member recorded does not make the item
-// under it the member's.
-func (s *Server) recreateHostChecks(ctx context.Context, template, project, name string) error {
+// under it the member's. Then the image the create is built from is fetched
+// and verified here (recreateFetchImage).
+func (s *Server) recreateHostChecks(ctx context.Context, pf recreatePreflight, name string) error {
+	if err := s.recreateTemplateChecks(ctx, pf.template, pf.project, name); err != nil {
+		return err
+	}
+	return s.recreateFetchImage(ctx, pf, name)
+}
+
+// recreateFetchImage fetches and verifies, on the member's host and before
+// its delete, the image the recreate's create is built from: an image this
+// host cannot fetch (a release the image server does not have, a server it
+// cannot reach, a rootfs path that is not one here) refuses the recreate,
+// and the member is left as it is. A download preflight without its image
+// (from an entry host that predates sending it) cannot be fetched here, and
+// is left to the create, as before.
+func (s *Server) recreateFetchImage(ctx context.Context, pf recreatePreflight, name string) error {
+	if pf.template == "" || (pf.template == "download" && pf.distro == "") {
+		return nil
+	}
+	if s.containerRuntime == nil {
+		return status.Errorf(codes.Unavailable,
+			"recreating container %q: no container runtime on %s to fetch its image; the member was left as it is", name, s.hostName)
+	}
+	opts := CreateContainerOpts{Name: name, Template: pf.template, Distro: pf.distro, Release: pf.release, Arch: pf.arch}
+	if err := s.containerRuntime.FetchContainerImage(ctx, opts); err != nil {
+		image := pf.template
+		if pf.template == "download" {
+			image = pf.distro + ":" + pf.release
+		}
+		s.audit(ctx, "ct.create", name, "recreate cannot fetch image="+image, "error")
+		return status.Errorf(codes.FailedPrecondition,
+			"recreating container %q: %s cannot fetch its new image %q: %v; the member was left as it is",
+			name, s.hostName, image, err)
+	}
+	return nil
+}
+
+// recreateTemplateChecks is the protected-place and image-owner half of
+// recreateHostChecks.
+func (s *Server) recreateTemplateChecks(ctx context.Context, template, project, name string) error {
 	if err := s.checkContainerTemplate(template, name); err != nil {
 		return status.Errorf(status.Code(err), "recreating container %q: %s; the member was left as it is", name, status.Convert(err).Message())
 	}

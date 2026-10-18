@@ -384,6 +384,60 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 	}, nil
 }
 
+// fetchDirName is the directory in LXC's store under which FetchImage builds
+// its throwaway containers. "+" is outside every container name's charset
+// (safename), so it never names a container.
+const fetchDirName = ".litevirt+fetch"
+
+// FetchImage fetches and verifies, on this host, the rootfs a Create with
+// opts would be built from, and creates nothing: a caller about to replace a
+// container (a compose recreate) runs it before the delete, so an image this
+// host cannot fetch leaves the container as it is.
+//
+// A rootfs path is resolved as Create resolves it (an existing directory that
+// looks like a root filesystem). Any other template — "download" above all —
+// is run by lxc-create into a throwaway lxcpath under fetchDirName, which is
+// removed afterwards: the download template fetches the image into LXC's
+// cache (/var/cache/lxc) and verifies its signature, so the create that
+// follows unpacks the same image from that cache.
+func (r *LxcRunner) FetchImage(ctx context.Context, opts CreateOpts) error {
+	if opts.Name == "" {
+		opts.Name = "fetch"
+	}
+	if err := opts.Validate(); err != nil {
+		return err
+	}
+	if opts.Template != "download" {
+		_, ok, err := resolveRootfs(opts.Template)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+	}
+	parent := filepath.Join(r.lxcpath(), fetchDirName)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return fmt.Errorf("fetch image: %w", err)
+	}
+	scratch, err := os.MkdirTemp(parent, "f-")
+	if err != nil {
+		return fmt.Errorf("fetch image: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(scratch) }()
+	args := []string{"-P", scratch, "-n", "fetch", "-t", opts.Template}
+	if opts.Template == "download" {
+		args = append(args, "--", "-d", opts.Distro, "-r", opts.Release, "-a", opts.Arch)
+	}
+	cmd := exec.CommandContext(ctx, "lxc-create", args...)
+	var stderr strings.Builder
+	cmd.Stderr = stringWriter{&stderr}
+	if _, err := cmd.Output(); err != nil {
+		return cmdErr("lxc-create (fetch image)", opts.Name, []byte(stderr.String()), err)
+	}
+	return nil
+}
+
 // createFromRootfs materialises a container around an already-extracted rootfs
 // by writing <lxcpath>/<name>/config — no lxc-create. The config mirrors what
 // the download template produces (common.conf + apparmor + a veth NIC) so the

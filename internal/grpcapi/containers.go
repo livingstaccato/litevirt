@@ -683,6 +683,14 @@ func (s *Server) deleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
 	}
+	// A compose recreate's delete forwarded from another entry host: the
+	// create that follows it is judged on this host first, its image
+	// fetched included, so a recreate refused there keeps its member
+	// (recreate_preflight.go). Before the container's lock: a fetch can take
+	// minutes, and judges nothing about the container itself.
+	if err := s.recreateDeleteCheck(ctx, req.Name); err != nil {
+		return nil, err
+	}
 	// Serialize with the other operations on this container and with the
 	// container checker's sweep (LockContainer), so a sweep never reconciles a
 	// container that is half deleted.
@@ -694,12 +702,6 @@ func (s *Server) deleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// (lab 2 run c2, P-3). Dropping the cache only makes the next admission
 	// read the runtime afresh; it never admits anything unread.
 	defer s.invalidateInventoryCache()
-	// A compose recreate's delete forwarded from another entry host: the
-	// create that follows it is judged on this host's disk first, so a
-	// recreate refused there keeps its member (recreate_preflight.go).
-	if err := s.recreateDeleteCheck(ctx, req.Name); err != nil {
-		return nil, err
-	}
 	// The runtime delete is lxc-destroy -f, which stops a running container
 	// first, so without force a running one is refused. A remote peer's call is
 	// exempt: a current entry node judged it before forwarding, and an older

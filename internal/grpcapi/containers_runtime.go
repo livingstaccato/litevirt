@@ -139,6 +139,21 @@ func (a *LXCRuntimeAdapter) PullOCIImage(ctx context.Context, image, dest, tag, 
 	})
 }
 
+// FetchContainerImage fetches the image a create with opts is built from
+// (lxc.LxcRunner.FetchImage). A runtime that cannot fetch without creating
+// refuses: a recreate must not delete what it cannot show it can rebuild.
+func (a *LXCRuntimeAdapter) FetchContainerImage(ctx context.Context, opts CreateContainerOpts) error {
+	f, ok := a.Inner.(interface {
+		FetchImage(ctx context.Context, opts lxc.CreateOpts) error
+	})
+	if !ok {
+		return errors.New("this host's container runtime cannot fetch an image before a create")
+	}
+	return f.FetchImage(ctx, lxc.CreateOpts{
+		Name: opts.Name, Template: opts.Template, Distro: opts.Distro, Release: opts.Release, Arch: opts.Arch,
+	})
+}
+
 func (a *LXCRuntimeAdapter) ContainerLimits(ctx context.Context, name string) (int, ContainerMemoryLimit, error) {
 	cpu, mem, err := a.Inner.Limits(ctx, name)
 	return cpu, ContainerMemoryLimit{MiB: mem.MiB, Unlimited: mem.Unlimited}, err

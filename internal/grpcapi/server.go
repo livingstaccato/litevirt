@@ -2483,6 +2483,11 @@ type ContainerRuntime interface {
 	// (B4 templates/clones).
 	CloneContainer(ctx context.Context, src, dst string) error
 	PullOCIImage(ctx context.Context, image, dest, tag, username, password string) error
+	// FetchContainerImage fetches and verifies, on this host, the image a
+	// create with opts would be built from (its Template, Distro, Release
+	// and Arch), and creates nothing. A compose recreate runs it on the
+	// member's host before the delete (recreateHostChecks).
+	FetchContainerImage(ctx context.Context, opts CreateContainerOpts) error
 }
 
 // CreateContainerOpts mirrors lxc.CreateOpts at the gRPC boundary so

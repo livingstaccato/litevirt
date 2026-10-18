@@ -118,6 +118,10 @@ type fakeCTRuntime struct {
 	createHook func()
 	importHook func()
 	stopHook   func()
+
+	// fetchCalls records FetchContainerImage calls; fetchErr fails them.
+	fetchCalls []CreateContainerOpts
+	fetchErr   error
 }
 
 func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerOpts) (*ContainerInfo, error) {
@@ -135,6 +139,14 @@ func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerO
 		return f.createOut, nil
 	}
 	return &ContainerInfo{Name: opts.Name, State: "stopped"}, nil
+}
+
+// FetchContainerImage records the fetch and fails with fetchErr.
+func (f *fakeCTRuntime) FetchContainerImage(_ context.Context, opts CreateContainerOpts) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fetchCalls = append(f.fetchCalls, opts)
+	return f.fetchErr
 }
 func (f *fakeCTRuntime) StartContainer(_ context.Context, name string) error {
 	f.mu.Lock()

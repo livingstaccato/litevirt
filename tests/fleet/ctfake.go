@@ -86,6 +86,12 @@ type CTFake struct {
 	ensureIDRangeErr error
 	ensuredRanges    []int64
 
+	// unfetchable is the images this host cannot fetch (Unfetchable): a
+	// create from one fails, as a real lxc-create whose download fails does,
+	// and so does a fetch of one.
+	unfetchable map[string]error
+	fetchCalls  []grpcapi.CreateContainerOpts
+
 	// access is the host-access policy the real lxc renderer judges mounts
 	// and devices against (SetHostAccessPolicy).
 	access lxc.HostAccess
@@ -256,6 +262,55 @@ func (f *CTFake) FailDelete(err error) {
 	f.deleteErr = err
 }
 
+// Unfetchable makes image (a download "distro:release", or a rootfs path
+// template) one this host cannot fetch: a create from it fails, as a real
+// lxc-create whose download fails, and so does a fetch of it.
+func (f *CTFake) Unfetchable(image string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.unfetchable == nil {
+		f.unfetchable = map[string]error{}
+	}
+	f.unfetchable[image] = err
+}
+
+// FetchCalls is every FetchContainerImage call, in order.
+func (f *CTFake) FetchCalls() []grpcapi.CreateContainerOpts {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]grpcapi.CreateContainerOpts(nil), f.fetchCalls...)
+}
+
+// fetchErrLocked is what fetching the image opts names fails with here: an
+// Unfetchable image, or a rootfs path template that is not a directory on
+// this node's disk. The caller holds mu.
+func (f *CTFake) fetchErrLocked(opts grpcapi.CreateContainerOpts) error {
+	key := opts.Template
+	if opts.Template == "download" {
+		key = opts.Distro + ":" + opts.Release
+	}
+	if err := f.unfetchable[key]; err != nil {
+		return err
+	}
+	if p, isPath, err := lxc.TemplatePath(opts.Template); err != nil {
+		return err
+	} else if isPath {
+		if st, serr := os.Stat(p); serr != nil || !st.IsDir() {
+			return fmt.Errorf("rootfs template %q is not an existing directory", opts.Template)
+		}
+	}
+	return nil
+}
+
+// FetchContainerImage fetches the image a create with opts is built from,
+// creating nothing: it fails as the create would.
+func (f *CTFake) FetchContainerImage(_ context.Context, opts grpcapi.CreateContainerOpts) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fetchCalls = append(f.fetchCalls, opts)
+	return f.fetchErrLocked(opts)
+}
+
 // OnExport registers fn to run inside the next ExportContainer call. See the
 // onExport field: this is the mid-migrate window.
 func (f *CTFake) OnExport(fn func()) {
@@ -309,6 +364,9 @@ func (f *CTFake) CreateContainer(_ context.Context, opts grpcapi.CreateContainer
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.createCalls = append(f.createCalls, opts)
+	if err := f.fetchErrLocked(opts); err != nil {
+		return nil, fmt.Errorf("ctfake: create %s: %w", opts.Name, err)
+	}
 	f.seedLocked(opts.Name, "created-by-"+opts.Name)
 	// The security block a real create writes, in the config that travels
 	// with the container through export and import.

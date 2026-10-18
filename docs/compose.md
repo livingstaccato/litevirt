@@ -409,7 +409,10 @@ container of the same name is refused, not replaced. These refusals, and the
 create's own checks — `ct.create`, the host-path authority a rootfs-path
 `image:` needs, and the protected-place and image-owner checks of that path
 on the member's host — come before anything is deleted, whichever host the
-deploy entered on: the member keeps running as it was. (When the member is
+deploy entered on: the member keeps running as it was. So does the fetch of
+the new image: the member's host downloads and verifies it (or, for a
+rootfs path, checks that it is a root filesystem there) first, and an image
+it cannot fetch refuses the recreate with the member left as it is. (When the member is
 on another host, that host runs its checks when it is asked to delete the
 member, and refuses the delete; a host still on an earlier release runs
 them at the create, after the delete.) A member redeployed from the rootfs

@@ -953,7 +953,7 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		}
 		// A fence credential row is ordered by the retirement it was set after
 		// before its clock (credentials_revive_guard.go).
-		switch order, oerr := mergeCredentialOrder(tx, table, row); {
+		switch order, oerr := c.mergeCredentialOrder(tx, table, row, skewGuardOn, skewNow); {
 		case oerr != nil:
 			_ = tx.Rollback()
 			return merged, skipped, oerr
@@ -970,6 +970,10 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				skipped++
 			} else {
 				merged++
+				if c.anyUnresolved() {
+					pk := pkKeyAt(row, pkIdx)
+					c.deferAfterCommit(tx, func() { c.clearUnresolved(table.Name, pk) })
+				}
 			}
 			continue
 		}
@@ -1349,6 +1353,15 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		if c.anyUnresolved() {
 			pk := pkKeyAt(row, pkIdx)
 			c.deferAfterCommit(tx, func() { c.clearUnresolved(table.Name, pk) })
+		}
+	}
+
+	// A fence credential tombstone carries no retirement evidence, whichever
+	// build's dump it came from (credentials_revive_guard.go).
+	if table.Name == "host_fence_credentials" && merged > 0 {
+		if err := clearTombstoneEvidence(tx); err != nil {
+			_ = tx.Rollback()
+			return 0, len(rows), fmt.Errorf("clear tombstone evidence: %w", err)
 		}
 	}
 

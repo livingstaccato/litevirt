@@ -542,14 +542,16 @@ import (
 //	     One new table.
 //	v68: host_fence_credentials.after_retirement (TEXT NOT NULL DEFAULT '')
 //	     — the retirement a live fence credential was set after
-//	     (credentials_retirement.go). A tombstone's own retirement is its
+//	     (credentials_revive_guard.go). A tombstone's own retirement is its
 //	     deleted_at. Rows are ordered by (retirement, updated_at), so a live
 //	     row that carries no retirement, written by a previous build or by a
 //	     stale copy, never beats a tombstone. Derived on each node from the
 //	     entry and never written by a replicated statement, so no statement
 //	     shape changes; a previous-release node refuses this table's
 //	     anti-entropy rows from this build (unknown column) and still applies
-//	     its WAL entries. Additive. The number is
+//	     its WAL entries. Existing rows migrate with no retirement, so a
+//	     tombstone from before the upgrade still beats a password set after
+//	     it (docs/migration-failover.md). Additive. The number is
 //	     schemaVersionCredentialRetirement's, and may be renumbered when this
 //	     merges after other schema bumps.
 const CurrentSchemaVersion = schemaVersionCredentialRetirement

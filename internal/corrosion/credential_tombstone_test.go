@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 )
 
 // A retired host_fence_credentials row stays retired.
@@ -155,7 +156,9 @@ func TestSplitCredentials_ClearPassDoesNotReviveARetiredCredential(t *testing.T)
 
 // A neighbour that has not latched sets the new machine's password in the old
 // column alone; the absorb revives the retired row with it, gate open or
-// closed.
+// closed. The revived row carries the retirement it was set after (review
+// m-14), so a node still holding only the tombstone takes it by anti-entropy.
+// Mutation: the absorb writes no evidence — red.
 func TestRetiredCredential_AnUnlatchedWriteIsStillAbsorbed(t *testing.T) {
 	for _, gate := range []bool{true, false} {
 		c := newTestDB(t)
@@ -166,6 +169,20 @@ func TestRetiredCredential_AnUnlatchedWriteIsStillAbsorbed(t *testing.T) {
 		h, err := GetHost(context.Background(), c, "host-x")
 		if err != nil || h == nil || h.IPMIPass != "Unlatched-New-Pass" || h.IPMIPassRetired {
 			t.Errorf("gate %v: GetHost = %s; want the unlatched write's password, not retired", gate, hostPassState(h, err))
+		}
+		rows, err := c.Query(context.Background(), `SELECT after_retirement FROM host_fence_credentials WHERE host_name = 'host-x'`)
+		if err != nil || len(rows) != 1 || rows[0].String("after_retirement") != staleAdmission {
+			t.Errorf("gate %v: after_retirement = %v (%v); want the retirement it was set after, %s", gate, rows, err, staleAdmission)
+		}
+		// A node that holds only the tombstone pulls the absorbing node's row.
+		holder := newTestDB(t)
+		staleDBAfterReadmission(t, holder)
+		if err := holder.MergeSensitiveStateBytesLWW(c.DumpSensitiveStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if pass, ok := liveCredential(t, holder); !ok || pass != "Unlatched-New-Pass" {
+			t.Errorf("gate %v: a tombstone holder pulled the absorbed row and holds %s (live %v); want the unlatched write's password",
+				gate, redactedPass(pass), ok)
 		}
 	}
 }
@@ -522,5 +539,150 @@ func TestRetire_AStaleReviveFirstIsStillRetired(t *testing.T) {
 		"10.0.0.15", "root", 22, 7443, HostStateJoining, "02new", staleAdmission, "host-x", "02new"}})
 	if pass, ok := liveCredential(t, c); ok {
 		t.Errorf("a revive with no evidence stood over the retirement (ipmi_pass %s)", redactedPass(pass))
+	}
+}
+
+// ── Round 4 ─────────────────────────────────────────────────────────────────
+
+const evLaterRetired = "2026-10-04T00:00:00.000001Z" // a retirement after T_c (T_d)
+
+// credentialRowCells is host-x's whole credential row, secrets redacted, for
+// comparing two nodes' rows.
+func credentialRowCells(t *testing.T, c *Client) string {
+	t.Helper()
+	rows, err := c.Query(context.Background(),
+		`SELECT ipmi_pass, updated_at, deleted_at, after_retirement FROM host_fence_credentials WHERE host_name = 'host-x'`)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("read credential row: %d rows, %v", len(rows), err)
+	}
+	r := rows[0]
+	return fmt.Sprintf("pass %s updated %s deleted %q after %q", redactedPass(r.String("ipmi_pass")),
+		r.String("updated_at"), r.String("deleted_at"), r.String("after_retirement"))
+}
+
+func credentialDigest(t *testing.T, c *Client) TableDigest {
+	t.Helper()
+	ds, err := c.SensitiveStateDigest(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range ds {
+		if d.Name == "host_fence_credentials" {
+			return d
+		}
+	}
+	t.Fatal("no host_fence_credentials digest")
+	return TableDigest{}
+}
+
+func mergeInto(t *testing.T, c *Client, rows ...credRow) {
+	t.Helper()
+	for _, r := range rows {
+		if err := c.MergeSensitiveStateBytesLWW(encodeSyncPayload(t, &syncPayload{Tables: []syncTable{r.table()}})); err != nil {
+			t.Fatalf("merge: %v", err)
+		}
+	}
+}
+
+// Review m-12: a previous build's tombstone (its dump has no after_retirement)
+// pulled by anti-entropy over a live row set after an earlier retirement
+// leaves the row a node would hold had it retired the row itself: a tombstone
+// carries no evidence. Otherwise the two tombstones differ only in
+// after_retirement, tie on updated_at, and the tie is unresolved for good.
+// Mutation: keep the local after_retirement on the merged tombstone — red.
+func TestCredentialMerge_APreviousBuildsTombstoneConvergesWithNoTie(t *testing.T) {
+	live := credRow{pass: "New-Pass", updatedAt: evOperator, after: evRetired, withEvidence: true}
+	prevTomb := credRow{pass: "", updatedAt: evLaterRetired, deletedAt: evLaterRetired}
+
+	// x pulls the previous build's tombstone before the removal's WAL entry.
+	x := newTestDB(t)
+	mergeInto(t, x, live, prevTomb)
+	// y applies the removal itself.
+	y := newTestDB(t)
+	mergeInto(t, y, live)
+	tx, err := y.DB().BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := retireFenceCredential(context.Background(), tx, "host-x", evLaterRetired); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	// The removal's WAL entry reaches x afterwards: nothing to do.
+	tx, err = x.DB().BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := retireFenceCredential(context.Background(), tx, "host-x", evLaterRetired); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	gx, gy := credentialRowCells(t, x), credentialRowCells(t, y)
+	if gx != gy {
+		t.Errorf("rows differ:\n x (pulled the tombstone) %s\n y (retired it)          %s", gx, gy)
+	}
+	if dx, dy := credentialDigest(t, x), credentialDigest(t, y); dx != dy {
+		t.Errorf("digests differ: x %+v, y %+v", dx, dy)
+	}
+	// Each pulls the other: no tie is left unresolved.
+	xd, yd := x.DumpSensitiveStateBytes(), y.DumpSensitiveStateBytes()
+	if err := x.MergeSensitiveStateBytesLWW(yd); err != nil {
+		t.Fatal(err)
+	}
+	if err := y.MergeSensitiveStateBytesLWW(xd); err != nil {
+		t.Fatal(err)
+	}
+	if nx, ny := x.UnresolvedTieCount(), y.UnresolvedTieCount(); nx != 0 || ny != 0 {
+		t.Errorf("unresolved ties after the exchange: x %d, y %d; want none", nx, ny)
+	}
+	if _, ok := liveCredential(t, x); ok {
+		t.Error("x: the later retirement did not retire the row")
+	}
+}
+
+// Review m-13: a row the retirement order would apply over the local one is
+// still set aside when its clock, or the retirement it carries, is
+// future-dated, as any other anti-entropy row is. Mutation: apply the ordered
+// row before the skew check — red.
+func TestCredentialMerge_AnOrderedRowIsStillSkewQuarantined(t *testing.T) {
+	future := time.Now().Add(365 * 24 * time.Hour).UTC().Format(time.RFC3339Nano)
+	live := credRow{pass: "New-Pass", updatedAt: evOperator, after: evRetired, withEvidence: true}
+	tomb := credRow{pass: "", updatedAt: evRetired, deletedAt: evRetired, withEvidence: true}
+	for _, tc := range []struct {
+		name          string
+		local, in     credRow
+		wantLocalPass string
+		wantLocalLive bool
+	}{
+		{"a future-dated tombstone over a live row",
+			live, credRow{pass: "", updatedAt: future, deletedAt: future, withEvidence: true}, "New-Pass", true},
+		{"a live row set after a future-dated retirement",
+			tomb, credRow{pass: "Skewed-Pass", updatedAt: evOperator, after: future, withEvidence: true}, "", false},
+		{"a live row with a future-dated clock",
+			tomb, credRow{pass: "Skewed-Pass", updatedAt: future, after: evOperator, withEvidence: true}, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, guard := range []bool{true, false} {
+				c := newTestDB(t)
+				c.SetHLCSkewGuard(func() bool { return guard })
+				mergeInto(t, c, tc.local)
+				before := c.SkewQuarantinedCount()
+				mergeInto(t, c, tc.in)
+				pass, live := liveCredential(t, c)
+				kept := pass == tc.wantLocalPass && live == tc.wantLocalLive
+				if guard && (!kept || c.SkewQuarantinedCount() == before) {
+					t.Errorf("guard on: got %s live %v (quarantined %d); want the local row kept and the row quarantined",
+						redactedPass(pass), live, c.SkewQuarantinedCount()-before)
+				}
+				if !guard && kept {
+					t.Errorf("guard off: the ordered row did not apply (got %s live %v)", redactedPass(pass), live)
+				}
+			}
+		})
 	}
 }

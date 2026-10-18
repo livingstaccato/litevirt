@@ -679,12 +679,19 @@ password, and the fence result says so.
 
 A password set with `lv host config <host> --ipmi-pass` after the removal or
 re-admission reaches every node, by replication or by anti-entropy. A copy of
-the old password, from any node, never replaces the retired one. During a
-rolling upgrade, a node still on the previous build records no retirement with
-the passwords it writes: a password written there after the host was removed
-or re-admitted loses to the retirement on this build's nodes, so set it again
-once the roll completes. Passwords it writes for hosts that were never retired
-replicate as before.
+the old password, from any node, never replaces the retired one.
+
+A password only beats a retirement if this build recorded it as set after
+that retirement. The upgrade gives every existing password no such record,
+and a node still on the previous build records none with the passwords it
+writes. So any password set after a host's removal or re-admission before
+every node ran this build can lose to that retirement: a node that still
+holds the retirement (it was down when the password was set, or applies the
+removal late) retires the password on every node, and an `ipmi` fence of the
+host then fails with `no IPMI password`. If you removed or re-admitted a host
+and set its password again before or during the roll, set it again with
+`lv host config <host> --ipmi-pass` once the roll completes. Passwords for
+hosts that were never removed or re-admitted replicate as before.
 
 ### Redfish
 

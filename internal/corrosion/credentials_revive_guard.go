@@ -42,9 +42,11 @@ import (
 // order decides (mergeCredentialOrder). A previous-release row has no column:
 // a tombstone's retirement is still its deleted_at, and a live row's is ''.
 //
-// The cost, stated in docs/migration-failover.md: a password a previous build
-// writes after a retirement loses to the tombstone, and to any password this
-// build set after it, until it is written again on this build.
+// The cost, stated in docs/migration-failover.md: a live row the migration
+// carried over has no evidence, and neither has a password a previous build
+// writes, so either loses to a tombstone of a retirement it was in fact set
+// after, and to any password this build set after it, until it is written
+// again on this build.
 
 var (
 	hostCredentialUpsertFingerprint = mustStatementFingerprint(HostFenceCredentialUpsertSQL)
@@ -216,7 +218,13 @@ const (
 // mergeCredentialOrder orders an incoming anti-entropy row against the local
 // one when their retirements differ. With the same retirement the ordinary
 // merge (LWW and its tie chain) decides, as for any table.
-func mergeCredentialOrder(tx *sql.Tx, table syncTable, row []interface{}) (int, error) {
+//
+// A row the order would apply is first held to the future-skew quarantine the
+// ordinary merge applies (skewQuarantinesIncoming), on its clock and on the
+// retirement it carries: a clock-corrupt peer's future-dated tombstone, or a
+// live row set after a future-dated retirement, would otherwise stand over
+// every later operator write until the wall clock passed it.
+func (c *Client) mergeCredentialOrder(tx *sql.Tx, table syncTable, row []interface{}, skewGuardOn bool, skewNow time.Time) (int, error) {
 	if table.Name != "host_fence_credentials" {
 		return credentialMergeDefault, nil
 	}
@@ -229,15 +237,41 @@ func mergeCredentialOrder(tx *sql.Tx, table syncTable, row []interface{}) (int, 
 	if err != nil || !local.exists {
 		return credentialMergeDefault, err
 	}
-	in := rowRetirement(cellStr(row, idx, "deleted_at"), cellStr(row, idx, "after_retirement"))
-	switch cmpEvidence(in, local.order().retirement) {
+	in := credentialOrder{
+		retirement: rowRetirement(cellStr(row, idx, "deleted_at"), cellStr(row, idx, "after_retirement")),
+		updatedAt:  cellStr(row, idx, "updated_at"),
+	}
+	held := local.order()
+	switch cmpEvidence(in.retirement, held.retirement) {
 	case 1:
+		if c.skewQuarantinesIncoming(skewGuardOn, held.updatedAt, in.updatedAt, skewNow) ||
+			c.skewQuarantinesIncoming(skewGuardOn, held.retirement, in.retirement, skewNow) {
+			slog.Warn("sync: quarantined future-skewed incoming row (not applied)",
+				"table", table.Name, "reason", "future_skew", "first_seen", false)
+			return credentialMergeKeepLocal, nil
+		}
 		return credentialMergeApply, nil
 	case -1:
 		noteRetiredCredentialKept(host, "a peer's row set before this node's retirement")
 		return credentialMergeKeepLocal, nil
 	}
 	return credentialMergeDefault, nil
+}
+
+// clearTombstoneEvidence leaves every host_fence_credentials tombstone with no
+// after_retirement, after an anti-entropy chunk of the table. A tombstone's
+// place in the order is its deleted_at; after_retirement means nothing on it,
+// and every tombstone this build writes (retireFenceCredential) carries none.
+// A previous build's dump has no such column, and the merge upsert updates
+// only the columns a dump carries, so its tombstone applied over a live row
+// set after an earlier retirement would keep that row's after_retirement. Its
+// content would then differ from the same tombstone on every other node, the
+// digests would never agree, and the exact-clock tie between the two would be
+// unresolved for good (lww_tie_unresolved). Local and never logged.
+func clearTombstoneEvidence(tx *sql.Tx) error {
+	_, err := tx.ExecContext(context.Background(), `UPDATE host_fence_credentials SET after_retirement = ''
+		WHERE deleted_at IS NOT NULL AND after_retirement != ''`)
+	return err
 }
 
 // noteRetiredCredentialKept logs, at most once per host per interval, that a
@@ -253,7 +287,7 @@ func noteRetiredCredentialKept(host, what string) {
 		retiredKeptLog.at = map[string]time.Time{}
 	}
 	retiredKeptLog.at[host] = now
-	slog.Warn("a fence credential write lost to a retirement it was not set after; keeping the retired row",
+	slog.Warn("a fence credential write lost to a retirement it was not set after; keeping the local row",
 		"host", host, "from", what)
 }
 

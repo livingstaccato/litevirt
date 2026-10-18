@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -38,7 +39,9 @@ import (
 //
 // One drill covers a plain UEFI VM, whose vars file is libvirt's
 // (/var/lib/libvirt/qemu/nvram); the other a Secure Boot + vTPM VM, whose
-// vars file is litevirt's (<data_dir>/nvram).
+// vars file is litevirt's (<data_dir>/nvram). Both are created plain with
+// onboot, so the VM starts again on its host once it is back; the second is
+// then stopped, given Secure Boot and a vTPM with lv update, and started.
 func TestDrill_UEFIVariableSurvivesHostPowerCut(t *testing.T) {
 	uefiVariablePowerCutDrill(t, false)
 }
@@ -67,10 +70,6 @@ func uefiVariablePowerCutDrill(t *testing.T, secureBoot bool) {
 	stack := uniqueName("nvd")
 	vm := stack + "-1"
 	const guestUser, guestPassword = "ubuntu", "nvd-e2e-pw"
-	firmware := ""
-	if secureBoot {
-		firmware = "    secure-boot: true\n    tpm: true\n"
-	}
 	yaml := fmt.Sprintf(`name: %[1]s
 networks:
   nvd:
@@ -82,7 +81,8 @@ vms:
   %[2]s:
     image: %[3]s
     firmware: uefi
-%[8]s    machine: q35
+    onboot: true
+    machine: q35
     cpu: 1
     memory: %[4]s
     disks:
@@ -101,7 +101,7 @@ vms:
           expire: false
           users:
             - {name: %[6]s, password: %[7]s, type: text}
-`, stack, vm, envOr("E2E_UEFI_IMAGE", "ubuntu-ga"), envOr("E2E_UEFI_MEMORY", "768"), victim, guestUser, guestPassword, firmware)
+`, stack, vm, envOr("E2E_UEFI_IMAGE", "ubuntu-ga"), envOr("E2E_UEFI_MEMORY", "768"), victim, guestUser, guestPassword)
 	file := "/tmp/" + stack + ".yaml"
 	l.putFile(q, file, yaml)
 	l.onRestore(func() { l.deleteVMs(stack, map[string]string{victim: vm}) })
@@ -131,6 +131,29 @@ vms:
 		t.Fatalf("%s never accepted a login: %v", vm, last)
 	}
 	waitGuest()
+	if secureBoot {
+		l.mustLV(q, "stop", vm)
+		if !l.waitDomainState(victim, vm, "shut off", 3*time.Minute) {
+			t.Fatalf("%s never stopped on %s (virsh)", vm, victim)
+		}
+		l.mustLV(q, "update", vm, "--secure-boot", "--tpm", "--force")
+		// A build without fix/update-firmware-nvram-dir leaves the vars
+		// file's directory unmade on a host where no Secure Boot VM was ever
+		// created, and the start then fails. Make it as the daemon does, and
+		// say so: this drill measures the flush, not that fix.
+		sbXML := l.mustSSH(victim, 30*time.Second, "virsh -c qemu:///system dumpxml --inactive "+shellQuote(vm))
+		if p := lvirt.NvramPathFromXML(sbXML); p != "" {
+			dir := shellQuote(filepath.Dir(p))
+			if out, _ := l.ssh(victim, 20*time.Second, "test -d "+dir+" && echo present || { install -d -m 0711 "+dir+" && echo made; }"); strings.TrimSpace(out) == "made" {
+				l.mark("nvd: lv update left no %s on %s; made it 0711 (a build without fix/update-firmware-nvram-dir)", filepath.Dir(p), victim)
+			}
+		}
+		l.mustLV(q, "start", vm)
+		if !l.waitDomainState(victim, vm, "running", 4*time.Minute) {
+			t.Fatalf("%s never ran on %s with Secure Boot and a vTPM (virsh)", vm, victim)
+		}
+		waitGuest()
+	}
 
 	xml := l.mustSSH(victim, 30*time.Second, "virsh -c qemu:///system dumpxml "+shellQuote(vm))
 	vars := lvirt.NvramPathFromXML(xml)
@@ -144,7 +167,13 @@ vms:
 
 	// 1. Only an fsync can persist the write: periodic writeback off, after
 	// a sync that cleans what boot dirtied. The power cut resets the sysctl;
-	// restore puts it back if the drill fails before that.
+	// restore puts it back if the drill fails before that. The guest syncs
+	// first: cloud-init does not fsync the SSH host keys it writes at first
+	// boot, so a cut seconds after it leaves them empty and sshd never
+	// answers again. That sync comes before the measured write.
+	if out, ok, err := guest("sudo sync"); err != nil || !ok {
+		t.Fatalf("sync in %s: ok=%v err=%v %s", vm, ok, err, out)
+	}
 	orig := strings.TrimSpace(l.mustSSH(victim, 20*time.Second, "cat /proc/sys/vm/dirty_writeback_centisecs"))
 	if _, err := strconv.Atoi(orig); err != nil {
 		t.Fatalf("vm.dirty_writeback_centisecs on %s: %q", victim, orig)

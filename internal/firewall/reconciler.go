@@ -236,6 +236,30 @@ func (r *Reconciler) AppliedState() AppliedState {
 	return r.state
 }
 
+// loadLogPolicy is the firewall logging block of a pass: the host's log
+// policy, rendered only where the kernel loads the forms and the daemon's
+// listener holds the group (opts.Logging, LogGate). An unreadable policy row
+// is appended to p.UnreadablePolicies (every policy block appends; the pass
+// resets the list once) naming its effect.
+func loadLogPolicy(ctx context.Context, db *corrosion.Client, hostName string, opts LoaderOptions, p *Plan) error {
+	p.LogPolicy = LogPolicy{}
+	if opts.Logging == nil {
+		return nil
+	}
+	lp, err := corrosion.ResolveFirewallLogPolicy(ctx, db, hostName)
+	if err != nil && !errors.Is(err, corrosion.ErrUnreadableFirewallPolicy) {
+		return err
+	}
+	if err != nil {
+		p.UnreadablePolicies = append(p.UnreadablePolicies,
+			fmt.Sprintf("%s: read as logging off at %d/%d", strings.TrimPrefix(err.Error(), corrosion.ErrUnreadableFirewallPolicy.Error()+": "), lp.Rate, lp.Burst))
+	}
+	if avail, group := opts.Logging(); avail {
+		p.LogPolicy = LogPolicy{Available: true, Group: group, Default: lp.On(), Rate: lp.Rate, Burst: lp.Burst}
+	}
+	return nil
+}
+
 // ResolveLogDevice names the workload and MAC of a guest device through the
 // plan in force; "" for a device it does not cover. The firewall log
 // listener resolves each record's device with it.
@@ -497,6 +521,8 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		// reference to a set that does not exist matches nothing (see
 		// quarantine). Each is reported (Plan.InvalidRows).
 		plan.InvalidRows = plan.InvalidRows[:0:0]
+		// Every policy block of the pass appends here (once reset, here).
+		plan.UnreadablePolicies = plan.UnreadablePolicies[:0:0]
 		ipsets, err := corrosion.ListIPSets(ctx, db)
 		if err != nil {
 			return plan, err
@@ -857,20 +883,8 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		if opts.BridgeConntrack != nil && !opts.BridgeConntrack() {
 			plan.NICMode = NICModeGuardsOnly
 		}
-		// Firewall logging: the host's log policy, rendered only where the
-		// kernel loads the forms and the daemon listens.
-		plan.LogPolicy, plan.UnreadablePolicies = LogPolicy{}, nil
-		if opts.Logging != nil {
-			lp, lerr := corrosion.ResolveFirewallLogPolicy(ctx, db, hostName)
-			if lerr != nil && !errors.Is(lerr, corrosion.ErrUnreadableFirewallPolicy) {
-				return plan, lerr
-			}
-			if lerr != nil {
-				plan.UnreadablePolicies = append(plan.UnreadablePolicies, lerr.Error())
-			}
-			if avail, group := opts.Logging(); avail {
-				plan.LogPolicy = LogPolicy{Available: true, Group: group, Default: lp.On(), Rate: lp.Rate, Burst: lp.Burst}
-			}
+		if err := loadLogPolicy(ctx, db, hostName, opts, &plan); err != nil {
+			return plan, err
 		}
 		// The addresses of litevirt's own dnsmasq on the guest networks: only
 		// where litevirt is the network's router (re-review I-9).

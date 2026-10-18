@@ -17,8 +17,9 @@ const CondFirewallLogListener = "firewall.log.listener"
 func (s *Server) RecordFirewallLogListener(ctx context.Context, err error) {
 	detail := ""
 	if err != nil {
-		detail = "the firewall log listener cannot read its NFLOG group, so logged packets are discarded by the kernel " +
-			"(another program may hold the group: set firewall.log_group to a free one): " + err.Error()
+		detail = "the firewall log listener cannot hold its NFLOG group (another program may hold it), so packets are not logged on " +
+			"this host: no log line is rendered while the listener is not bound, and no record goes to that program; " +
+			"set firewall.log_group to a free group and restart the daemon: " + err.Error()
 	}
 	s.setFirewallCondition(ctx, CondFirewallLogListener, err != nil, corrosion.SeverityWarning, detail)
 }
@@ -47,6 +48,6 @@ func unreadablePoliciesText(rows []string) string {
 	if len(rows) == 0 {
 		return ""
 	}
-	return "firewall policy rows this build cannot read, each read as its documented fallback " +
-		"(the log policy as off at the default budget); set the policy again to replace the row: " + strings.Join(rows, "; ")
+	return "firewall policy rows this host cannot read, each read as the fallback it names; set the policy again to replace the row: " +
+		strings.Join(rows, "; ")
 }

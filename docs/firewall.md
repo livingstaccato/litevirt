@@ -1147,8 +1147,9 @@ A rule added with `--log` (compose `log: true`) logs each packet it matches,
 and `lv firewall log-policy on` logs each guest NIC's default verdict. The
 records go to the daemon, never to the kernel log or the journal: every log
 line is `log group <G> snaplen 96`, sending the packet's first 96 bytes to
-NFLOG group `firewall.log_group` (default 27), which the daemon reads. With no
-reader the kernel discards them.
+NFLOG group `firewall.log_group` (default 27), which the daemon reads. Log
+lines are rendered only while the daemon's own listener holds that group, so
+no other program bound to it ever receives a record.
 
 ```
 lv sg rule-add web --direction ingress --proto tcp --port 22 --action drop --log
@@ -1203,8 +1204,10 @@ lv firewall log [--host <h>] [--workload <name>] [--since 15m] [--limit 200] [--
 loads a named limit and a log line to its group (`nft_log`,
 `nfnetlink_log`, `nft_limit`). A host that refuses them renders no log line,
 keeps its per-NIC table, and raises `firewall.log.unavailable`; loading the
-modules later takes a daemon restart. A group the daemon cannot read (another
-program holds it) raises `firewall.log.listener`.
+modules later takes a daemon restart. A group the daemon cannot hold (another
+program holds it) raises `firewall.log.listener`, and no log line is rendered
+until the daemon holds it: packets are not logged on that host. Losing the
+group removes the lines at once, and holding it again restores them.
 
 **Data at rest.** Records name any tenant's addresses and ports.
 

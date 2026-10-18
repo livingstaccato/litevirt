@@ -14,11 +14,12 @@ import (
 // use leaves a store that keeps records in memory only.
 func openFirewallLogStore(cfg *Config, counter firewall.LogCounter) *firewall.LogStore {
 	opts := firewall.LogStoreOptions{
-		Dir:         filepath.Join(cfg.DataDir, "firewall-log"),
-		MaxRate:     cfg.Firewall.LogMaxRate,
-		RetainBytes: int64(cfg.Firewall.LogRetainMiB) << 20,
-		RetainAge:   time.Duration(cfg.Firewall.LogRetainDays) * 24 * time.Hour,
-		Counter:     counter,
+		Dir:          filepath.Join(cfg.DataDir, "firewall-log"),
+		MaxRate:      cfg.Firewall.LogMaxRate,
+		RetainBytes:  int64(cfg.Firewall.LogRetainMiB) << 20,
+		RetainAge:    time.Duration(cfg.Firewall.LogRetainDays) * 24 * time.Hour,
+		Counter:      counter,
+		SeqFromClock: true,
 	}
 	s, err := firewall.OpenLogStore(opts)
 	if err == nil {

@@ -1214,8 +1214,11 @@ group removes the lines at once, and holding it again restores them.
 - The daemon keeps the newest 10,000 in memory and writes JSON lines under
   `<data_dir>/firewall-log/` (directory 0700, files 0600), rotated so the
   directory never holds more than `firewall.log_retain_mib` (default 64; 0
-  keeps memory only). Records older than `firewall.log_retain_days` (default
-  7; 0 for no age bound) are removed, on disk and in memory.
+  keeps memory only), checked by size, so lowering the cap takes effect at the
+  next start. Records older than `firewall.log_retain_days` (default 7; 0 for
+  no age bound) are removed, on disk and in memory, within about an hour of
+  passing it: a file spans at most an hour (or a 24th of the bound, when
+  shorter) and goes once its newest record is past the bound.
 - No litevirt backup includes `<data_dir>`. `lv uninstall` removes it unless
   `--keep-data` is given. `lv host rm` does not touch the removed host's disk:
   delete `<data_dir>/firewall-log/` there.

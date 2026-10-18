@@ -700,7 +700,8 @@ firewall:
   log_max_rate: 200      # records a second this host keeps (0-100000); the rest are counted
                          # (litevirt_firewall_log_records_total{outcome="rate_limited"}) and discarded
   log_retain_mib: 64     # cap on <data_dir>/firewall-log/; 0 keeps records in memory only
-  log_retain_days: 7     # records older than this are removed, on disk and in memory; 0 = no age bound
+  log_retain_days: 7     # records older than this are removed, on disk and in memory, within about
+                         # an hour of passing it; 0 = no age bound
 
 # Single-file restore (lv backup file-ls / file-restore). The backup is read
 # inside a throwaway restore VM booted from this host's own kernel; every key

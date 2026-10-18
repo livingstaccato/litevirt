@@ -80,6 +80,11 @@ type LogStoreOptions struct {
 	Now func() time.Time
 	// Counter counts records by outcome (none when nil).
 	Counter LogCounter
+	// SeqFromClock starts the sequence at the clock in microseconds (or the
+	// files' newest, if higher), so it never restarts below a sequence an
+	// earlier run handed out: the store keeps at most 100,000 records a
+	// second, fewer than a microsecond clock advances.
+	SeqFromClock bool
 }
 
 // LogFilter selects records for List.
@@ -129,6 +134,13 @@ func OpenLogStore(opts LogStoreOptions) (*LogStore, error) {
 		opts.Now = time.Now
 	}
 	s := &LogStore{opts: opts, tokens: float64(max(opts.MaxRate, 0)), lastAt: opts.Now(), newest: map[string]time.Time{}}
+	if opts.SeqFromClock {
+		defer func() {
+			if c := uint64(max(opts.Now().UnixMicro(), 0)); c > s.seq {
+				s.seq = c
+			}
+		}()
+	}
 	if opts.Dir == "" || opts.RetainBytes <= 0 {
 		s.opts.Dir = ""
 		return s, nil
@@ -295,7 +307,14 @@ func (s *LogStore) rotateDue(n int64, now time.Time) bool {
 	if err != nil || fi.Size()+n > s.segSize {
 		return true
 	}
-	return s.opts.RetainAge > 0 && now.Sub(s.segAt) > s.opts.RetainAge/logSegments
+	return s.opts.RetainAge > 0 && now.Sub(s.segAt) > s.segAge()
+}
+
+// segAge is how long the current file may span with an age bound: an hour,
+// or RetainAge/24 when shorter, so a record outlives the bound on disk by at
+// most that (plus the one-minute prune tick).
+func (s *LogStore) segAge() time.Duration {
+	return min(s.opts.RetainAge/24, time.Hour)
 }
 
 func (s *LogStore) openFile(firstSeq uint64, now time.Time) error {
@@ -346,15 +365,37 @@ func (s *LogStore) Prune() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.opts.Now()
-	if s.file != nil && s.opts.RetainAge > 0 && now.Sub(s.segAt) > s.opts.RetainAge/logSegments {
+	if s.file != nil && s.opts.RetainAge > 0 && now.Sub(s.segAt) > s.segAge() {
 		s.closeFile()
 	}
 	s.pruneLocked(now)
+	s.pruneRing(now)
 }
 
-// pruneLocked keeps the newest files within the byte cap (the current one
-// counts as full) and, with an age bound, removes every closed file whose
-// newest record is older than it.
+// pruneRing drops the ring's records older than the age bound.
+func (s *LogStore) pruneRing(now time.Time) {
+	if s.opts.RetainAge <= 0 || len(s.ring) == 0 {
+		return
+	}
+	floor := now.Add(-s.opts.RetainAge)
+	n := len(s.ring)
+	drop := 0
+	for drop < n && s.ring[(s.start+drop)%n].Time.Before(floor) {
+		drop++
+	}
+	if drop == 0 {
+		return
+	}
+	kept := make([]LogRecord, 0, n-drop)
+	for i := drop; i < n; i++ {
+		kept = append(kept, s.ring[(s.start+i)%n])
+	}
+	s.ring, s.start = kept, 0
+}
+
+// pruneLocked keeps the newest files whose sizes sum within the byte cap
+// (the current one counts as full) and, with an age bound, removes every
+// closed file whose newest record is older than it.
 func (s *LogStore) pruneLocked(now time.Time) {
 	if s.opts.Dir == "" {
 		return
@@ -367,19 +408,32 @@ func (s *LogStore) pruneLocked(now time.Time) {
 	if s.file != nil {
 		current = filepath.Base(s.file.Name())
 	}
-	keep := int(max(s.opts.RetainBytes/s.segSize, 1))
-	if current != "" {
-		keep-- // the current file may still grow to segSize
-	}
 	var closed []string
 	for _, n := range names {
 		if n != current {
 			closed = append(closed, n)
 		}
 	}
-	for i, n := range closed {
+	// Newest first, by size: the current file may still grow to segSize.
+	var used int64
+	if current != "" {
+		used = s.segSize
+	}
+	overCap := map[string]bool{}
+	for i := len(closed) - 1; i >= 0; i-- {
+		var size int64
+		if fi, err := os.Stat(filepath.Join(s.opts.Dir, closed[i])); err == nil {
+			size = fi.Size()
+		}
+		if used+size > s.opts.RetainBytes {
+			overCap[closed[i]] = true
+			continue
+		}
+		used += size
+	}
+	for _, n := range closed {
 		p := filepath.Join(s.opts.Dir, n)
-		drop := i < len(closed)-keep
+		drop := overCap[n]
 		if !drop && s.opts.RetainAge > 0 {
 			last, ok := s.newest[n]
 			if !ok {
@@ -412,10 +466,16 @@ func (s *LogStore) List(f LogFilter) []LogRecord {
 	if s.opts.RetainAge > 0 {
 		floor = s.opts.Now().Add(-s.opts.RetainAge)
 	}
+	after := f.AfterSeq
+	if after > s.seq {
+		// A cursor ahead of this store's newest is from before a restart
+		// whose sequence could not carry on: read from the start.
+		after = 0
+	}
 	var out []LogRecord
 	for i := len(s.ring) - 1; i >= 0 && len(out) < limit; i-- {
 		r := s.ring[(s.start+i)%len(s.ring)]
-		if r.Seq <= f.AfterSeq {
+		if r.Seq <= after {
 			break
 		}
 		if (f.Workload != "" && r.Workload != f.Workload) || r.Time.Before(f.Since) || r.Time.Before(floor) {

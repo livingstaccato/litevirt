@@ -1496,6 +1496,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// started (re-review I-10).
 	d.virt.SetStartGuard(svc.NICStartGuard(ctx))
 	d.fwReconciler.SetStateHook(svc.RecordFirewallState)
+	// Firewall logging: the listener reads the NFLOG group every rendered log
+	// line sends to into a bounded store (docs/firewall.md, "Logging").
+	fwLogStore := openFirewallLogStore(d.cfg, fwMetrics)
+	go (&firewall.LogListener{Group: uint16(d.cfg.Firewall.LogGroup), Store: fwLogStore,
+		Resolve: d.fwReconciler.ResolveLogDevice,
+		OnBind:  func(err error) { svc.RecordFirewallLogListener(ctx, err) }}).Run(ctx)
+	go pruneFirewallLog(ctx, fwLogStore)
 	// Whether this host enforces NIC guards, after every pass, the boot pass
 	// included (re-review m8, m2, m5): the label carries this build's
 	// version while the last pass put the per-NIC table in force, so a host

@@ -1013,7 +1013,7 @@ func LoadConfig() (*Config, error) {
 		// `spare_pcie_root_ports: 0` in config overrides this and is honored.
 		PCI: PCIConfig{SparePCIeRootPorts: 4},
 
-		Firewall: FirewallConfig{LogMaxRate: 200, LogRetainMiB: 64, LogRetainDays: 7},
+		Firewall: FirewallConfig{LogGroup: 27, LogMaxRate: 200, LogRetainMiB: 64, LogRetainDays: 7},
 
 		// The enforcement flags that default ON — see EnforcementConfig.
 		// AuditSignature, PartitionPause, RecoveryClaim, ConsolePassword, VRRPUnicast
@@ -1460,6 +1460,9 @@ func (c *Config) BackupBandwidthLimits() (map[string]int64, error) {
 // (docs/firewall.md, "Logging"). Records hold tenant flow metadata, so the
 // store is bounded in rate, size and age.
 type FirewallConfig struct {
+	// LogGroup is the NFLOG group the daemon's log listener reads and every
+	// rendered log line sends to (default 27, 0-65535).
+	LogGroup int `yaml:"log_group"`
 	// LogMaxRate is the log records a second this host keeps (default 200);
 	// the rest are counted and discarded. 0 keeps none.
 	LogMaxRate int `yaml:"log_max_rate"`
@@ -1475,6 +1478,9 @@ type FirewallConfig struct {
 const maxFirewallLogRate = 100000
 
 func (f FirewallConfig) validate() error {
+	if f.LogGroup < 0 || f.LogGroup > 65535 {
+		return fmt.Errorf("config firewall.log_group %d: want an NFLOG group 0-65535", f.LogGroup)
+	}
 	if f.LogMaxRate < 0 || f.LogMaxRate > maxFirewallLogRate {
 		return fmt.Errorf("config firewall.log_max_rate %d: want 0-%d", f.LogMaxRate, maxFirewallLogRate)
 	}

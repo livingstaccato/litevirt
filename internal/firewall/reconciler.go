@@ -184,6 +184,8 @@ type AppliedState struct {
 	NICTableError string
 	// NICs is the guest devices the per-NIC table covers.
 	NICs map[string]string // device → workload
+	// MACs is each of those devices' MAC, where known.
+	MACs map[string]string // device → MAC
 	// Guarded is, per workload, the MACs whose guard the per-NIC table in
 	// force holds; empty when the table was refused.
 	Guarded map[string]map[string]bool
@@ -231,14 +233,26 @@ func (r *Reconciler) AppliedState() AppliedState {
 	return r.state
 }
 
+// ResolveLogDevice names the workload and MAC of a guest device through the
+// plan in force; "" for a device it does not cover. The firewall log
+// listener resolves each record's device with it.
+func (r *Reconciler) ResolveLogDevice(dev string) (workload, mac string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.state.NICs[dev], r.state.MACs[dev]
+}
+
 func (r *Reconciler) recordState(ctx context.Context, p Plan, applyErr error) {
-	st := AppliedState{NICs: map[string]string{}, Guarded: map[string]map[string]bool{}, BlockedTrunks: p.BlockedTrunks,
+	st := AppliedState{NICs: map[string]string{}, MACs: map[string]string{}, Guarded: map[string]map[string]bool{}, BlockedTrunks: p.BlockedTrunks,
 		InvalidRows: p.InvalidRows, TagGroups: p.TagGroups}
 	if len(p.NICs) > 0 {
 		st.Mode = p.nicMode()
 	}
 	for _, n := range p.NICs {
 		st.NICs[n.NICDev] = n.VMName
+		if n.MAC != "" {
+			st.MACs[n.NICDev] = strings.ToLower(n.MAC)
+		}
 		if n.Guard != nil && applyErr == nil {
 			if st.Guarded[n.VMName] == nil {
 				st.Guarded[n.VMName] = map[string]bool{}

@@ -695,6 +695,8 @@ backup_bwlimits:
 # metadata: kept in memory (the newest 10,000) and under <data_dir>/firewall-log/
 # (directory 0700, files 0600), never in the journal.
 firewall:
+  log_group: 27          # the NFLOG group the daemon's log listener reads (0-65535); every
+                         # rendered log line sends to it. Raises firewall.log.listener if taken.
   log_max_rate: 200      # records a second this host keeps (0-100000); the rest are counted
                          # (litevirt_firewall_log_records_total{outcome="rate_limited"}) and discarded
   log_retain_mib: 64     # cap on <data_dir>/firewall-log/; 0 keeps records in memory only

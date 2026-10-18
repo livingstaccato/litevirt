@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
 func repointFixture(t *testing.T) (*Client, context.Context) {
@@ -77,5 +79,44 @@ func TestRepointNetBoxLeaseLeavesAReleasedLeaseAlone(t *testing.T) {
 	}
 	if got := leaseNetBoxID(t, c); got != 41 {
 		t.Fatalf("a released lease was re-pointed to %d", got)
+	}
+}
+
+// TestRepointGuardedOutIsNotRelayedToALaggingPeer: the origin has already
+// applied the lease's release, so its re-point matches nothing. A peer that has
+// not received the release yet still holds the lease live under the dead id,
+// and would apply a relayed re-point, after which LWW keeps it over the
+// release. A guarded-out re-point must therefore never reach mutation_log.
+func TestRepointGuardedOutIsNotRelayedToALaggingPeer(t *testing.T) {
+	ctx := context.Background()
+	origin, _ := repointFixture(t)
+	if _, err := origin.db.Exec(`UPDATE ip_allocations SET deleted_at = '2026-10-18T00:00:01Z'
+		WHERE network = 'bound' AND ip = '10.0.5.9'`); err != nil {
+		t.Fatal(err)
+	}
+	origin.SetNetBoxRepointGate(func() bool { return true })
+	if moved, err := RepointNetBoxLease(ctx, origin, "bound", "10.0.5.9", 41, 77); err != nil || moved {
+		t.Fatalf("re-point of a released lease: moved=%v err=%v, want false", moved, err)
+	}
+
+	lagging, _ := repointFixture(t) // still holds the lease live, under 41
+	rows, err := origin.Query(ctx, `SELECT seq, hlc, origin, stmts FROM mutation_log ORDER BY seq`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []*pb.MutationEntry
+	for _, r := range rows {
+		entries = append(entries, &pb.MutationEntry{
+			Seq: int64(r.Int("seq")), Hlc: r.String("hlc"), Origin: r.String("origin"), Stmts: r.String("stmts"),
+		})
+	}
+	if len(entries) > 0 {
+		if _, err := NewReplicator(lagging, "", RelayConfig{}).ApplyRemoteMutations(ctx, entries); err != nil {
+			t.Fatalf("apply the origin's stream on the lagging peer: %v", err)
+		}
+	}
+	if got := leaseNetBoxID(t, lagging); got != 41 {
+		t.Fatalf("the lagging peer's lease names %d: a re-point its origin reported as not made "+
+			"was relayed and applied (%d mutation_log row(s))", got, len(entries))
 	}
 }

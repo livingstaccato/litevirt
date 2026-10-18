@@ -57,11 +57,18 @@ func RepointNetBoxLease(ctx context.Context, c *Client, network, ip string, from
 	if fromID == 0 || toID == 0 || fromID == toID {
 		return false, fmt.Errorf("re-point lease %s on %s: invalid address ids %d -> %d", ip, network, fromID, toID)
 	}
-	if err := c.Execute(ctx, netboxRepointSQL, toID, c.NowTS(), network, ip, fromID); err != nil {
+	// STRICT: a re-point whose guard matched nothing must not be relayed. A peer
+	// that has not yet received the release that moved this row past the guard
+	// still holds it live under fromID, would apply the re-point, and LWW would
+	// then carry it over the older release — a released lease brought back.
+	n, err := c.ExecuteRowsStrict(ctx, netboxRepointSQL, toID, c.NowTS(), network, ip, fromID)
+	if err != nil {
 		return false, fmt.Errorf("re-point lease %s on %s: %w", ip, network, err)
 	}
-	// A guarded UPDATE that matched nothing is a no-op, not an error; only the
-	// read-back says whether the lease now names the new object.
+	if n == 0 {
+		return false, nil
+	}
+	// The read-back is what says the lease now names the new object.
 	rows, err := c.Query(ctx,
 		`SELECT 1 AS ok FROM ip_allocations
 		 WHERE network = ? AND ip = ? AND netbox_ip_id = ? AND deleted_at IS NULL`,

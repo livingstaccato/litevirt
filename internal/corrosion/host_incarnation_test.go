@@ -923,3 +923,60 @@ func TestHostIncarnation_AReadmissionRetiresACredentialThisNodeNeverHeld(t *test
 		}
 	}
 }
+
+// N-2, the paired path on its own: an operator's paired password write that
+// this node's lagging hosts row cannot carry is planned as a skip marked
+// behind, and the local write path refuses it for that reason alone. The
+// entry also sets another host's credential, so the credential table is
+// written and the absorb, the other refusal, does not run for host-x.
+func TestCredential_APairedWriteOnALaggingRowIsRefusedWithoutTheAbsorb(t *testing.T) {
+	ctx := context.Background()
+	a, _ := admittedV2(t)
+	retired := retirementOf(t, a)
+	const ts = "2999-01-01T00:00:00.000000000Z"
+	for _, n := range []int64{0, 1} {
+		t.Run(fmt.Sprintf("hosts row at %d", n), func(t *testing.T) {
+			c := newTestDB(t)
+			oldIncarnation(t, c)
+			if _, err := c.DB().Exec(`UPDATE hosts SET deleted_at = NULL, incarnation = ?,
+				created_at = '2026-01-01T00:00:00.000000000Z', updated_at = '2026-01-02T00:00:00.000000000Z'
+				WHERE name = 'host-x'`, n); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.DB().Exec(`UPDATE host_fence_credentials SET ipmi_pass = '', deleted_at = ?, updated_at = ?,
+				after_retirement = '' WHERE host_name = 'host-x'`, retired, retired); err != nil {
+				t.Fatal(err)
+			}
+			entry := append(laggingConfigure("old-pass", ts),
+				Statement{SQL: HostFenceCredentialUpsertSQL, Params: []interface{}{"host-y", "y-pass", ts}})
+
+			// The plan itself.
+			tx, err := c.DB().Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			pre, err := readEntryHostRows(ctx, tx, entry)
+			if err != nil {
+				tx.Rollback()
+				t.Fatal(err)
+			}
+			plan, err := planCredentialUpsert(ctx, tx, entry[1], entry, pre)
+			tx.Rollback()
+			if err != nil || !plan.skip || !plan.behind {
+				t.Fatalf("plan = %+v (%v); want a skip marked behind", plan, err)
+			}
+
+			// The local write path, with the absorb not reached for host-x.
+			err = c.ExecuteBatch(ctx, entry)
+			if !errors.Is(err, ErrHostRowBehindAdmission) {
+				t.Fatalf("a paired password write this node cannot carry returned %v, want ErrHostRowBehindAdmission", err)
+			}
+			if got := oneString(t, c, `SELECT ipmi_pass FROM hosts WHERE name = 'host-x'`, "ipmi_pass"); got == "old-pass" {
+				t.Error("the refused write's hosts half was committed")
+			}
+			if pass, live, _ := incCredentialRow(t, c); live || pass != "" {
+				t.Errorf("credential row = (%q, live %v); want the tombstone", pass, live)
+			}
+		})
+	}
+}

@@ -419,14 +419,32 @@ func printRemoved(hostName string, removed *pb.RemoveHostResponse, plain string)
 
 // removeStagedAdmission removes, over SSH as root, the admitted pair a
 // stranded `lv host add` left staged on the host at addr, when the staged
-// certificate is serial's. A seam so the removal can be tested without a host.
+// certificate is serial's. The host is often dead or half set up, so the
+// connection is bounded (stagedCleanupTimeout). A seam so the removal can be
+// tested without a host.
 var removeStagedAdmission = func(addr, serial string) error {
-	sc, err := ssh.NewClient("root@" + addr)
+	sc, err := ssh.NewClientTimeout("root@"+addr, stagedCleanupTimeout)
 	if err != nil {
-		return fmt.Errorf("SSH connect: %w", err)
+		return fmt.Errorf("SSH connect (skipped after %s): %w", stagedCleanupTimeout, err)
 	}
 	defer sc.Close()
-	r := &sshRemotePKI{sc: sc}
+	return removeStagedPair(&sshAddRemote{sshRemotePKI{sc: sc}}, serial)
+}
+
+// stagedCleanupTimeout bounds removeStagedAdmission's connect and handshake.
+const stagedCleanupTimeout = 10 * time.Second
+
+// stagedPairHost is what removeStagedPair needs of the host.
+type stagedPairHost interface {
+	ReadFile(path string) ([]byte, bool, error)
+	Run(cmd string) error
+}
+
+// removeStagedPair deletes the staged host.crt and host.key on r only when
+// the staged certificate's serial is serial: the one this removal revoked.
+// Serials are unique to the CA, so another machine at a reused address never
+// matches, and nothing there is touched.
+func removeStagedPair(r stagedPairHost, serial string) error {
 	crt := addStagedPath(filepath.Join(remotePKIDir, "host.crt"))
 	b, ok, err := r.ReadFile(crt)
 	if err != nil || !ok {
@@ -435,5 +453,5 @@ var removeStagedAdmission = func(addr, serial string) error {
 	if !strings.EqualFold(installedSerial(b), serial) {
 		return nil
 	}
-	return sc.Run("rm -f -- " + ssh.ShellQuote(crt) + " " + ssh.ShellQuote(addStagedPath(filepath.Join(remotePKIDir, "host.key"))))
+	return r.Run("rm -f -- " + ssh.ShellQuote(crt) + " " + ssh.ShellQuote(addStagedPath(filepath.Join(remotePKIDir, "host.key"))))
 }

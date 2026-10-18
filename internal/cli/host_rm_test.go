@@ -642,3 +642,60 @@ func TestHostRemove_RemovesAStrandedAddsStagedPair(t *testing.T) {
 		})
 	}
 }
+
+// fakeStagedHost is a host holding a staged certificate (or none).
+type fakeStagedHost struct {
+	staged []byte
+	ran    []string
+}
+
+func (h *fakeStagedHost) ReadFile(path string) ([]byte, bool, error) {
+	if path != "/etc/litevirt/pki/.host.crt.add" || h.staged == nil {
+		return nil, false, nil
+	}
+	return h.staged, true, nil
+}
+
+func (h *fakeStagedHost) Run(cmd string) error { h.ran = append(h.ran, cmd); return nil }
+
+// fd re-review 2 N2-m2: the cleanup deletes the staged pair only when the
+// staged certificate is the one this removal revoked, which is what makes a
+// dial to a reused address harmless.
+//
+// Mutation: delete whatever the serial — "another serial" removes files.
+func TestRemoveStagedPair_OnlyTheRevokedSerial(t *testing.T) {
+	dir := t.TempDir()
+	if err := pki.GenerateCA(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key")); err != nil {
+		t.Fatal(err)
+	}
+	crt := filepath.Join(dir, "h.crt")
+	if err := pki.GenerateHostCert(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"), crt,
+		filepath.Join(dir, "h.key"), "node-9", nil); err != nil {
+		t.Fatal(err)
+	}
+	pem, _ := os.ReadFile(crt)
+	serial, _ := pki.CertSerial(crt)
+	for _, tc := range []struct {
+		name   string
+		staged []byte
+		serial string
+		rm     bool
+	}{
+		{"the revoked serial", pem, strings.ToUpper(serial), true},
+		{"another serial", pem, "deadbeef", false},
+		{"nothing staged", nil, serial, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &fakeStagedHost{staged: tc.staged}
+			if err := removeStagedPair(h, tc.serial); err != nil {
+				t.Fatal(err)
+			}
+			if tc.rm != (len(h.ran) == 1) {
+				t.Fatalf("ran %v, want a removal: %v", h.ran, tc.rm)
+			}
+			if tc.rm && (!strings.Contains(h.ran[0], ".host.crt.add") || !strings.Contains(h.ran[0], ".host.key.add")) {
+				t.Errorf("removed %q, want the staged pair", h.ran[0])
+			}
+		})
+	}
+}

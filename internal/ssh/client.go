@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -26,7 +27,16 @@ type Client struct {
 
 // NewClient connects to a remote host via SSH.
 // target format: "user@host" or "user@host:port"
-func NewClient(target string) (*Client, error) {
+func NewClient(target string) (*Client, error) { return newClient(target, 0) }
+
+// NewClientTimeout is NewClient with the connect and the handshake bounded
+// by timeout together, for a best-effort connection to a host that may be
+// dead or silent.
+func NewClientTimeout(target string, timeout time.Duration) (*Client, error) {
+	return newClient(target, timeout)
+}
+
+func newClient(target string, timeout time.Duration) (*Client, error) {
 	sshUser, host, port := parseTarget(target)
 
 	auth, err := authMethods()
@@ -55,7 +65,12 @@ func NewClient(target string) (*Client, error) {
 	}
 
 	addr := net.JoinHostPort(host, port)
-	conn, err := ssh.Dial("tcp", addr, config)
+	var conn *ssh.Client
+	if timeout > 0 {
+		conn, err = dialTimeout(addr, config, timeout)
+	} else {
+		conn, err = ssh.Dial("tcp", addr, config)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("SSH dial %s: %w", addr, err)
 	}
@@ -422,4 +437,28 @@ func (r *bytesReaderWrapper) Read(p []byte) (n int, err error) {
 	n = copy(p, r.data[r.pos:])
 	r.pos += n
 	return
+}
+
+// dialTimeout is ssh.Dial with one bound on the TCP connect and the SSH
+// handshake together: ssh.Dial bounds neither the handshake nor, without
+// ClientConfig.Timeout, the connect.
+var dialTimeout = func(addr string, config *ssh.ClientConfig, timeout time.Duration) (*ssh.Client, error) {
+	conn, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return nil, err
+	}
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	c, chans, reqs, err := ssh.NewClientConn(conn, addr, config)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		c.Close()
+		return nil, err
+	}
+	return ssh.NewClient(c, chans, reqs), nil
 }

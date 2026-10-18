@@ -22,8 +22,9 @@ import (
 // group tables in-process, because no RPC listed them. Any logged-in session
 // therefore saw every group and rule in the cluster, a scoped API token and a
 // project-only grant included. They now read through ListSecurityGroups with
-// the session's bearer, which checks sg.read at the cluster root as the writes
-// check sg.write there.
+// the session's bearer, which shows a global group only to sg.read at the
+// cluster root, and a project's group only to sg.read on that project
+// (docs/design/security-group-projects.md).
 
 const (
 	sgSecretName = "sg-secret-name"
@@ -57,10 +58,9 @@ func TestUISecurityGroups_AScopedTokenSessionCannotReadThem(t *testing.T) {
 	seedSecretSG(t, db)
 	scopeUISession(t, db, `["/projects/teamA"]`)
 
+	// The page renders, listing teamA's groups (none) and no global one.
 	w := serveRequest(s, uiSessionReq(t, "GET", "/security-groups", nil))
-	if w.Code != http.StatusForbidden {
-		t.Errorf("a scoped token reading security groups: status = %d, want %d", w.Code, http.StatusForbidden)
-	}
+	assertStatus(t, w, http.StatusOK)
 	assertNoSGLeak(t, "/security-groups", w.Body.String())
 }
 
@@ -69,9 +69,7 @@ func TestUISecurityGroups_AProjectScopedGrantCannotReadThem(t *testing.T) {
 	seedSecretSG(t, db)
 
 	w := serveRequest(s, uiSessionReq(t, "GET", "/security-groups", nil))
-	if w.Code != http.StatusForbidden {
-		t.Errorf("a project-scoped grant reading security groups: status = %d, want %d", w.Code, http.StatusForbidden)
-	}
+	assertStatus(t, w, http.StatusOK)
 	assertNoSGLeak(t, "/security-groups", w.Body.String())
 }
 

@@ -25,8 +25,8 @@ import (
 // The reads went the same way for the same reason. Read in-process, the page
 // showed every group and rule to any session — a token scoped to one project,
 // or a session whose Whoami had failed and been let through as a read.
-// ListSecurityGroups checks sg.read at the cluster root, so the daemon refuses
-// those on the read itself.
+// ListSecurityGroups decides per group: sg.read at the cluster root sees
+// every group, a project-scoped session only its projects' groups.
 
 // sgRuleView is one rule as the page template prints it.
 type sgRuleView struct {

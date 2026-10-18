@@ -2707,7 +2707,7 @@ message SetFirewallTagsRequest {
 // `lv sg create/rm/rule-add/rule-rm`. These used to write the host's database
 // straight from the CLI process, which skipped the daemon's authorization and
 // left no audit row (colonelpanik/litevirt#182).
-message CreateSecurityGroupRequest     { string name = 1; string stack_name = 2; }
+message CreateSecurityGroupRequest     { string name = 1; string stack_name = 2; string project = 3; }  // project: owner; empty = global
 message DeleteSecurityGroupRequest     { string id = 1; }  // tombstones the group and its rules
 message AddSecurityGroupRuleRequest    { SecurityGroupRule rule = 1; }  // rule.id is ignored
 message RemoveSecurityGroupRuleRequest { string id = 1; }  // the RULE id
@@ -2718,6 +2718,7 @@ message RemoveSecurityGroupRuleRequest { string id = 1; }  // the RULE id
 message ListSecurityGroupsRequest {
     string stack_name    = 1;  // empty = every group
     bool   include_rules = 2;  // also return every rule of the listed groups
+    string project       = 3;  // that project's groups plus the global ones; empty = every group the caller may read
 }
 message ListSecurityGroupsResponse {
     repeated SecurityGroup     groups = 1;

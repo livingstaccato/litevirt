@@ -1187,7 +1187,15 @@ wrote the host's Corrosion database straight from the CLI process, which
 skipped authorization and left no audit row. Each RPC checks the `sg.write`
 verb at `/` (Admin and NetworkAdmin hold it; Operator holds only `sg.read`; a
 cluster with no role bindings falls back to the operator role), and re-renders
-the connected host's ruleset at once, as the other tiers do. Against a daemon
+the connected host's ruleset at once, as the other tiers do. A group created
+with `lv sg create <name> --project <p>` belongs to project `p`: its writes
+check `sg.write` on `/projects/<p>/security_groups/<name>` instead, so a
+NetworkAdmin bound on `/projects/<p>` manages it, and only `p`'s workloads may
+bind it. A NIC of any other project that names it is refused where the binding
+is written (create, NIC attach, `lv sg bind`, clone, restore) and is rendered
+without it. Group names stay unique across projects. Project groups need the
+`sg_projects_v1` capability token, which latches once every host runs this
+release (see [design/security-group-projects.md](design/security-group-projects.md)). Against a daemon
 older than these RPCs the four commands fail with an error saying to upgrade
 litevirtd; they do not fall back to writing the database.
 
@@ -1197,11 +1205,12 @@ node's local database instead only when no daemon answered: the CLI has no
 credentials to connect with, the daemon is down, it predates the RPC, or it
 does not accept the credential (a revoked session). It says so on stderr when
 it does. A caller the daemon authenticated and refused gets the refusal; that
-is never routed around. The RPC checks the `sg.read` verb
-at `/` (every built-in role with `*.read` or `sg.read` holds it; with no role
-bindings, any viewer), so a token scoped to a project, or a grant below the
-cluster root, gets a 403 on `/security-groups`, no group names in the
-Add-NIC dialog, and a permission error from `lv sg ls` and `lv sg rule-ls`.
+is never routed around. `sg.read` at `/` (every built-in role with `*.read` or
+`sg.read` holds it; with no role bindings, any viewer) lists every group and
+rule. A token scoped to a project, or a grant below the cluster root, lists
+only the groups of projects it holds `sg.read` on; `lv sg ls --project <p>`
+adds the global groups, without their rules, since `p`'s workloads may bind
+them.
 
 ## Default-deny rollout
 

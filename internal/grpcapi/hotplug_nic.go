@@ -189,6 +189,9 @@ func (s *Server) attachNICEntry(ctx context.Context, req *pb.AttachDeviceRequest
 	if err := s.admitNetworkAttach(ctx, vmRec.Project, spec.Name); err != nil {
 		return nil, err
 	}
+	if err := s.admitSecurityGroupRefs(ctx, vmRec.Project, spec.GetSecurityGroups()); err != nil {
+		return nil, err
+	}
 
 	// Cross-host race: push the network's provisioning to the VM's owning host
 	// before this attach reaches it, so a forwarded attachNIC there doesn't find an

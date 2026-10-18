@@ -515,6 +515,7 @@ message SecurityGroup {
     string name       = 2;
     string stack_name = 3;  // empty = cluster-wide
     string created_at = 4;
+    string project    = 5;  // owning project; empty = global (docs/design/security-group-projects.md)
 }
 
 // SecurityGroupRule is one rule of a security group.

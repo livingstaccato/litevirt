@@ -84,14 +84,14 @@ var openClusterDB = func() (*corrosion.Client, error) {
 }
 
 func newSGCreateCmd() *cobra.Command {
-	var stack string
+	var stack, project string
 	cmd := &cobra.Command{
 		Use:   "create <name>",
 		Short: "Create a security group",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				sg, err := c.CreateSecurityGroup(ctx, &pb.CreateSecurityGroupRequest{Name: args[0], StackName: stack})
+				sg, err := c.CreateSecurityGroup(ctx, &pb.CreateSecurityGroupRequest{Name: args[0], StackName: stack, Project: project})
 				if err != nil {
 					return sgRPCError("create", err)
 				}
@@ -101,6 +101,7 @@ func newSGCreateCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&stack, "stack", "", "Limit the SG to one stack (default: cluster-wide)")
+	cmd.Flags().StringVar(&project, "project", "", "Project that owns the SG; only its workloads may bind it (default: global)")
 	return cmd
 }
 
@@ -117,25 +118,26 @@ func sgRPCError(sub string, err error) error {
 }
 
 func newSGListCmd() *cobra.Command {
-	var stack string
+	var stack, project string
 	cmd := &cobra.Command{
 		Use:   "ls",
 		Short: "List security groups",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			resp, err := listSecurityGroups(cmd, &pb.ListSecurityGroupsRequest{StackName: stack, IncludeRules: true})
+			resp, err := listSecurityGroups(cmd, &pb.ListSecurityGroupsRequest{StackName: stack, Project: project, IncludeRules: true})
 			if err != nil {
 				return err
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "ID\tNAME\tSTACK\tCREATED")
+			fmt.Fprintln(w, "ID\tNAME\tPROJECT\tSTACK\tCREATED")
 			for _, sg := range resp.GetGroups() {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", sg.GetId(), sg.GetName(), sg.GetStackName(), sg.GetCreatedAt())
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", sg.GetId(), sg.GetName(), sg.GetProject(), sg.GetStackName(), sg.GetCreatedAt())
 			}
 			warnUnattributedRules(cmd, resp)
 			return w.Flush()
 		},
 	}
 	cmd.Flags().StringVar(&stack, "stack", "", "Filter to one stack")
+	cmd.Flags().StringVar(&project, "project", "", "List one project's SGs and the global ones")
 	return cmd
 }
 
@@ -228,7 +230,10 @@ func listSecurityGroupsLocal(ctx context.Context, req *pb.ListSecurityGroupsRequ
 		}
 	}
 	for _, g := range groups {
-		resp.Groups = append(resp.Groups, &pb.SecurityGroup{Id: g.ID, Name: g.Name, StackName: g.StackName, CreatedAt: g.CreatedAt})
+		if p := req.GetProject(); p != "" && g.Project != "" && g.Project != p {
+			continue
+		}
+		resp.Groups = append(resp.Groups, &pb.SecurityGroup{Id: g.ID, Name: g.Name, StackName: g.StackName, CreatedAt: g.CreatedAt, Project: g.Project})
 		if !req.GetIncludeRules() {
 			continue
 		}

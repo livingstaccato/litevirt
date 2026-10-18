@@ -1426,6 +1426,20 @@ host must resolve one conflict the same way. A binary rolled back below the
 latched token enters WAL quarantine, as below every latched token. Roll
 forward.
 
+### Project security groups wait for the roll
+
+`lv sg create <name> --project <p>` creates a group only `p`'s workloads may
+bind (docs/firewall.md). Its row carries a column a host on the previous
+release cannot decode, so it is refused with FailedPrecondition until the
+`sg_projects_v1` capability token has latched — on its own, once every host the
+cluster replicates to, including one parked in `maintenance`, runs this
+release. Global groups are created as before throughout. Every existing group
+stays global.
+
+`sg_projects_v1` is mandatory and replication-gated, with no flag. A binary
+rolled back below the latched token enters WAL quarantine, as below every
+latched token. Roll forward.
+
 ### Console passwords start after the roll
 
 This release gives each VM's VNC and SPICE consoles a per-VM password

@@ -340,3 +340,28 @@ func DeleteSGRule(ctx context.Context, c *Client, ruleID string) error {
 		nowRFC3339(), now, ruleID,
 	)
 }
+
+// WorkloadProjects returns the project of every live VM, and of every live
+// container on hostName, keyed by name ("" is the default project). The
+// firewall reconciler reads it to keep a NIC off another project's security
+// group.
+func WorkloadProjects(ctx context.Context, c *Client, hostName string) (vms, cts map[string]string, err error) {
+	rows, err := c.Query(ctx, `SELECT name, COALESCE(project, '') AS project FROM vms WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, nil, err
+	}
+	vms = make(map[string]string, len(rows))
+	for _, r := range rows {
+		vms[r.String("name")] = r.String("project")
+	}
+	rows, err = c.Query(ctx, `SELECT name, COALESCE(project, '') AS project FROM containers
+		WHERE host_name = ? AND deleted_at IS NULL`, hostName)
+	if err != nil {
+		return nil, nil, err
+	}
+	cts = make(map[string]string, len(rows))
+	for _, r := range rows {
+		cts[r.String("name")] = r.String("project")
+	}
+	return vms, cts, nil
+}

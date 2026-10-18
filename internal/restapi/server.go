@@ -1349,7 +1349,9 @@ func grpcHTTPStatus(fallbackCode int, err error) (int, string) {
 			return http.StatusNotFound, st.Message()
 		case codes.InvalidArgument:
 			return http.StatusBadRequest, st.Message()
-		case codes.AlreadyExists, codes.FailedPrecondition:
+		case codes.AlreadyExists, codes.FailedPrecondition, codes.Aborted:
+			// Aborted: a conflict with an operation in flight (a create of
+			// the name in progress), which the message says to retry.
 			return http.StatusConflict, st.Message()
 		}
 	}

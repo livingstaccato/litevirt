@@ -1110,12 +1110,19 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 
 	// Split-brain guard. Taking over the original name while the original is
 	// still on a healthy host (and not force) would double-run the VM.
+	// A promotion to a new name never replaces another VM, --force or not:
+	// --force is for a same-name takeover of a VM still on a healthy host.
+	// With it, a rename onto a live VM's name stopped and undefined that VM's
+	// domain here and then failed on its row (dupcreate re-review). Checked
+	// under this promotion's create flight of the name (above).
+	if renamed {
+		if rec, _ := corrosion.GetVM(ctx, s.db, targetName); rec != nil {
+			return status.Errorf(codes.AlreadyExists,
+				"vm %q already exists; choose another --new-name (--force never replaces another VM); nothing was changed", targetName)
+		}
+	}
 	if !req.Force {
-		if renamed {
-			if rec, _ := corrosion.GetVM(ctx, s.db, targetName); rec != nil {
-				return status.Errorf(codes.AlreadyExists, "vm %q already exists; choose another --new-name", targetName)
-			}
-		} else if vm.HostName != "" && vm.HostName != s.hostName {
+		if !renamed && vm.HostName != "" && vm.HostName != s.hostName {
 			if h, _ := corrosion.GetHost(ctx, s.db, vm.HostName); h != nil && h.State == "active" {
 				return status.Errorf(codes.FailedPrecondition,
 					"vm %q still owned by healthy host %q; fence it or pass --force/--new-name to avoid split-brain", vm.Name, vm.HostName)
@@ -1200,6 +1207,18 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	if s.virt.DomainExists(targetName) && !started {
 		if !req.Force {
 			return status.Errorf(codes.AlreadyExists, "domain %q already defined on %q; pass --force or --new-name", targetName, s.hostName)
+		}
+		// --force replaces only this VM's own domain: one of the name with
+		// another uuid is another guest, never this promotion's to stop.
+		// Judged when both uuids can be read.
+		x, xerr := s.virt.DumpXMLInactive(targetName)
+		if xerr != nil {
+			x, _ = s.virt.DumpXML(targetName)
+		}
+		if du := domainUUIDFromXML(x); du != "" && spec.Uuid != "" && du != spec.Uuid {
+			return status.Errorf(codes.FailedPrecondition,
+				"domain %q on %s is not this VM's (uuid %s, the VM's is %s); --force replaces only the VM's own domain; nothing was changed",
+				targetName, s.hostName, du, spec.Uuid)
 		}
 		replaceDomain = true
 	}

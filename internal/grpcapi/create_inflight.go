@@ -154,39 +154,87 @@ func (s *Server) refuseLiveDomainOfName(name, self string) error {
 // foreignDomainDiskPaths reports, for a path, whether the domain of name names
 // it when that domain is not the one a create of uuid self defined (libvirt
 // reads a stopped domain's sources from its definition): a failed create
-// removes none of those. A source is matched by its spelling and by the file
-// it is (a symlinked pool directory names one file two ways). A domain whose
-// uuid cannot be read is foreign. Nothing matches when no domain of the name
-// exists.
+// removes none of those. Every source form a create makes is read — a file,
+// a block device, an rbd image (by pool/image, on any cluster) — from the
+// domain's persistent and live definitions and from DomainDiskSources, and a
+// file is matched by its spelling and by the file it is (a symlinked pool
+// directory names one file two ways), looked at within
+// sharedDiskStatTimeout. A domain whose uuid cannot be read is foreign.
+// Nothing matches only when libvirt says no domain of the name exists; when
+// what the domain names cannot be known (its definition or its sources
+// unreadable, a source of another form, a file that cannot be looked at),
+// every path matches and the failed create leaves its disks.
 func (s *Server) foreignDomainDiskPaths(name, self string) func(string) bool {
 	none := func(string) bool { return false }
-	if s.virt == nil || !s.virt.DomainExists(name) {
+	all := func(string) bool { return true }
+	if s.virt == nil {
 		return none
 	}
-	x, err := s.virt.DumpXMLInactive(name)
-	if err != nil {
-		x, _ = s.virt.DumpXML(name)
+	inactive, ierr := s.virt.DumpXMLInactive(name)
+	live, lerr := s.virt.DumpXML(name)
+	switch {
+	case ierr != nil && lerr != nil:
+		if lv.IsNotFound(ierr) && lv.IsNotFound(lerr) {
+			return none
+		}
+		return all
+	case lerr != nil:
+		// A running domain's live definition can name a disk its
+		// persistent one does not (a hot-plugged one).
+		return all
+	case ierr != nil:
+		inactive = live
 	}
-	if u := domainUUIDFromXML(x); u != "" && u == self {
+	if u := domainUUIDFromXML(inactive); u != "" && u == self {
 		return none
 	}
 	byName := map[string]bool{}
+	rbd := map[string]bool{}
+	for _, x := range []string{inactive, live} {
+		if x == "" {
+			continue
+		}
+		files, specs, ok := domainDiskSourcesFromXML(x)
+		if !ok {
+			return all
+		}
+		for _, f := range files {
+			byName[f] = true
+		}
+		for _, sp := range specs {
+			rbd[sp] = true
+		}
+	}
+	src, err := s.virt.DomainDiskSources(name)
+	if err != nil {
+		return all
+	}
+	for _, p := range src {
+		byName[p] = true
+	}
 	var files []os.FileInfo
-	if src, err := s.virt.DomainDiskSources(name); err == nil {
-		for _, p := range src {
-			byName[p] = true
-			if fi, serr := os.Stat(p); serr == nil {
-				files = append(files, fi)
-			}
+	for p := range byName {
+		fi, serr := statInfoWithin(p, sharedDiskStatTimeout)
+		switch {
+		case serr == nil:
+			files = append(files, fi)
+		case errors.Is(serr, fs.ErrNotExist), errors.Is(serr, syscall.ENOTDIR), errors.Is(serr, syscall.ELOOP):
+		default:
+			return all
 		}
 	}
 	return func(p string) bool {
 		if byName[p] {
 			return true
 		}
-		fi, err := os.Stat(p)
+		if l, ok := storage.ParseCephLocator(p); ok {
+			return rbd[l.Spec]
+		}
+		fi, err := statInfoWithin(p, sharedDiskStatTimeout)
 		if err != nil {
-			return false
+			// Nothing there is no file of the domain's; a path that cannot
+			// be looked at may be.
+			return !(errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.ELOOP))
 		}
 		for _, f := range files {
 			if os.SameFile(fi, f) {
@@ -195,6 +243,49 @@ func (s *Server) foreignDomainDiskPaths(name, self string) func(string) bool {
 		}
 		return false
 	}
+}
+
+// domainDiskSourcesFromXML reads every <disk> source of a domain definition:
+// files and block devices by path, rbd images by pool/image. ok is false
+// when the definition cannot be parsed, or a disk has a source of another
+// form (a libvirt volume, another network protocol), which could name
+// anything.
+func domainDiskSourcesFromXML(domXML string) (paths, rbdSpecs []string, ok bool) {
+	var dom struct {
+		Devices struct {
+			Disks []struct {
+				Type   string `xml:"type,attr"`
+				Source *struct {
+					File     string `xml:"file,attr"`
+					Dev      string `xml:"dev,attr"`
+					Protocol string `xml:"protocol,attr"`
+					Name     string `xml:"name,attr"`
+				} `xml:"source"`
+			} `xml:"disk"`
+		} `xml:"devices"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &dom); err != nil {
+		return nil, nil, false
+	}
+	for _, d := range dom.Devices.Disks {
+		src := d.Source
+		if src == nil {
+			continue // an empty drive
+		}
+		switch {
+		case src.Protocol == "rbd" && src.Name != "":
+			rbdSpecs = append(rbdSpecs, src.Name)
+		case src.File != "":
+			paths = append(paths, src.File)
+		case src.Dev != "":
+			paths = append(paths, src.Dev)
+		case src.Protocol == "" && (d.Type == "file" || d.Type == "block" || d.Type == ""):
+			// A file or block drive with no medium.
+		default:
+			return nil, nil, false
+		}
+	}
+	return paths, rbdSpecs, true
 }
 
 // domainIsVMsOwn reports whether the domain of name on this host is the

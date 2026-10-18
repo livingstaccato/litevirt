@@ -104,6 +104,13 @@ func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, d
 		return fmt.Errorf("%s is not fenced proof-grade (%s): power it off, then run `%s` — `lv host rm --dead` "+
 			"removes only a host proven off", hostName, orDash(plan.GetFenceDetail()), plan.GetFenceCommand())
 	}
+	if dryRun && plan.GetVoter() {
+		// The daemon refuses to remove a voter's host, so its preflight can
+		// only answer once the real run has removed the vote.
+		fmt.Println("  removal check: runs after the voter removal, so not in a dry run")
+		fmt.Println("Dry run: nothing was changed.")
+		return nil
+	}
 	if dryRun {
 		// Ask the daemon whether it would make the removal, as the real run
 		// does before it revokes, so the plan is not one it would refuse.

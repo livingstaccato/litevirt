@@ -31,10 +31,11 @@ type hostRemoveTestClient struct {
 	preflightReq *pb.RemoveHostRequest
 	// removeErrs are RemoveHost's answers, one per call, before it succeeds.
 	removeErrs []error
+	planVoter  bool
 }
 
 func (c *hostRemoveTestClient) PlanDeadHostRemoval(_ context.Context, req *pb.PlanDeadHostRemovalRequest, _ ...grpc.CallOption) (*pb.PlanDeadHostRemovalResponse, error) {
-	return &pb.PlanDeadHostRemovalResponse{Host: req.GetName(), Fenced: true, FenceDetail: "ipmi power off"}, nil
+	return &pb.PlanDeadHostRemovalResponse{Host: req.GetName(), Fenced: true, FenceDetail: "ipmi power off", Voter: c.planVoter}, nil
 }
 
 func (c *hostRemoveTestClient) PreflightRemoveHost(_ context.Context, req *pb.RemoveHostRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
@@ -533,5 +534,11 @@ func TestHostRemoveDead_TheDryRunRunsThePreflight(t *testing.T) {
 	ok := &hostRemoveTestClient{}
 	if err := HostRemoveDead(context.Background(), ok, "node-9", true); err != nil || ok.preflightReq == nil || len(ok.calls) != 0 {
 		t.Errorf("a dry run the removal would make: %v (preflight %v, calls %v)", err, ok.preflightReq, ok.calls)
+	}
+	// A voter: the daemon refuses to remove a voter's host until the real
+	// run has removed the vote, so the dry run does not ask.
+	voter := &hostRemoveTestClient{planVoter: true, preflightErr: status.Error(codes.FailedPrecondition, "node-9 is a member of voter generation 1")}
+	if err := HostRemoveDead(context.Background(), voter, "node-9", true); err != nil || voter.preflightReq != nil || len(voter.calls) != 0 {
+		t.Errorf("a voter's dry run: %v (preflight %v, calls %v), want no preflight and no change", err, voter.preflightReq, voter.calls)
 	}
 }

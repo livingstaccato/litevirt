@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"strings"
 	"testing"
@@ -15,12 +16,12 @@ func TestConfirmOverwriteNewer_OnlyATypedYesOnATerminal(t *testing.T) {
 	prev := stdinIsTerminal
 	defer func() { stdinIsTerminal = prev }()
 	stdinIsTerminal = func() bool { return false }
-	if confirmOverwriteNewer(strings.NewReader("yes\n"), io.Discard) {
+	if ok, _ := confirmOverwriteNewer(context.Background(), strings.NewReader("yes\n"), io.Discard); ok {
 		t.Error("a non-terminal stdin confirmed the overwrite")
 	}
 	stdinIsTerminal = func() bool { return true }
 	for in, want := range map[string]bool{"yes\n": true, "y\n": false, "\n": false, "no\n": false} {
-		if got := confirmOverwriteNewer(strings.NewReader(in), io.Discard); got != want {
+		if got, _ := confirmOverwriteNewer(context.Background(), strings.NewReader(in), io.Discard); got != want {
 			t.Errorf("answer %q confirmed = %v, want %v", in, got, want)
 		}
 	}

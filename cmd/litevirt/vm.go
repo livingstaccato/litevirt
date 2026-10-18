@@ -373,8 +373,9 @@ func newConsoleCmd() *cobra.Command {
 func newVNCCmd() *cobra.Command {
 	var listen string
 	cmd := &cobra.Command{
-		Use:   "vnc <vm>",
-		Short: "Fetch VNC address for a VM, or open its console on a local port",
+		Use:         "vnc <vm>",
+		Annotations: map[string]string{ownSignalsAnnotation: "true"},
+		Short:       "Fetch VNC address for a VM, or open its console on a local port",
 		Long: `Without --listen, prints the VM's VNC address. The listener is bound to the
 host's 127.0.0.1 and, once console passwords are in force (docs/ui.md
 "Console passwords"), requires a password only litevirt presents.

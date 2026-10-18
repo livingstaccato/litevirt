@@ -40,14 +40,19 @@ type interrupts struct {
 	grace  time.Duration
 	die    func(os.Signal)
 
-	mu    sync.Mutex
-	first os.Signal
-	timer *time.Timer
+	mu      sync.Mutex
+	first   os.Signal
+	timer   *time.Timer
+	held    int  // holdInterruptGrace calls not yet released
+	expired bool // the grace ran out while held
 }
 
+type interruptsKey struct{}
+
 func newInterrupts(parent context.Context, grace time.Duration, die func(os.Signal)) *interrupts {
-	ctx, cancel := context.WithCancel(parent)
-	return &interrupts{ctx: ctx, cancel: cancel, grace: grace, die: die}
+	in := &interrupts{grace: grace, die: die}
+	in.ctx, in.cancel = context.WithCancel(context.WithValue(parent, interruptsKey{}, in))
+	return in
 }
 
 // deliver handles one signal: the first cancels the context and arms the
@@ -57,7 +62,7 @@ func (in *interrupts) deliver(sig os.Signal) {
 	first := in.first == nil
 	if first {
 		in.first = sig
-		in.timer = time.AfterFunc(in.grace, func() { in.die(sig) })
+		in.timer = time.AfterFunc(in.grace, func() { in.graceOver(sig) })
 	}
 	in.mu.Unlock()
 	if first {
@@ -65,6 +70,53 @@ func (in *interrupts) deliver(sig os.Signal) {
 		return
 	}
 	in.die(sig)
+}
+
+// graceOver dies by sig, unless a bounded cleanup holds the grace: then the
+// death waits for its release or for its budget.
+func (in *interrupts) graceOver(sig os.Signal) {
+	in.mu.Lock()
+	held := in.held > 0
+	if held {
+		in.expired = true
+	}
+	in.mu.Unlock()
+	if !held {
+		in.die(sig)
+	}
+}
+
+// holdInterruptGrace lets a bounded cleanup the command runs after an
+// interrupt (a rollback of what it already did) finish within budget instead
+// of the grace: until release is called, or budget runs out, the grace does
+// not end the process. A second signal still does. It is a no-op outside an
+// interrupt-handled command.
+func holdInterruptGrace(ctx context.Context, budget time.Duration) (release func()) {
+	in, ok := ctx.Value(interruptsKey{}).(*interrupts)
+	if !ok {
+		return func() {}
+	}
+	in.mu.Lock()
+	in.held++
+	in.mu.Unlock()
+	var once sync.Once
+	unhold := func() {
+		once.Do(func() {
+			in.mu.Lock()
+			in.held--
+			die := in.held == 0 && in.expired
+			sig := in.first
+			in.mu.Unlock()
+			if die {
+				in.die(sig)
+			}
+		})
+	}
+	t := time.AfterFunc(budget, unhold)
+	return func() {
+		t.Stop()
+		unhold()
+	}
 }
 
 // caught is the first signal delivered, nil if none.

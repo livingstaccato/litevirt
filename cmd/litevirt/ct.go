@@ -528,7 +528,7 @@ func newCTPullCmd() *cobra.Command {
 			}
 			var pw string
 			if username != "" {
-				p, err := readRegistryPassword(password, passwordStdin)
+				p, err := readRegistryPassword(cmd.Context(), password, passwordStdin)
 				if err != nil {
 					return err
 				}

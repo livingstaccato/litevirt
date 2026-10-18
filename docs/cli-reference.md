@@ -286,19 +286,25 @@ libvirt and storage calls are not cut short. `lv ct rm` behaves the same from
 the container's runtime delete on. A command interrupted by Ctrl-C or SIGTERM
 reports that the delete may still complete on its host, names `lv ls` (`lv ct
 ls` for a container, `lv compose ls` for a stack) to see the outcome, and then
-ends by the signal (the shell sees 130, or 143 for SIGTERM). Any command still
-running 2 seconds after the signal (one waiting at a prompt, or on an ssh
-step) ends then, and a second Ctrl-C ends it at once, without the report.
+ends by the signal (the shell sees 130, or 143 for SIGTERM). A command waiting
+at a prompt ends at once. Any other command still running 2 seconds after the
+signal (one on an ssh step) ends then, except while it undoes what it already
+did (a firewall macro's rollback, up to 30 seconds), and a second Ctrl-C ends
+it at once, without the report. `lv daemon`, `lv gitops`, `lv top`, `lv spice`
+and `lv vnc` handle Ctrl-C themselves.
 
 `lv rebuild` and a `lv compose up` that re-creates a VM work the same way.
 Interrupted before the re-create sends its delete (a rebuild: before its
 teardown), nothing is deleted. From then on the replace runs to its create
 whatever becomes of the client, so an interrupted replace does not end with no
-VM; the command reports that it may still complete, and names `lv ls`. A
-create that replaces nothing (the delete found no VM) stays cancellable. A
-`lv compose up` interrupted after it has torn a VM down to re-create it still
-records the stack's new compose file, with the stack `degraded`: the rest of
-its plan did not run, and running `lv compose up` again finishes it.
+VM; the command reports that it may still complete, and names `lv ls`. A VM
+being re-created is not listed until its create finishes, which can take
+minutes: wait until `lv ls` shows it before running the command again, or the
+second run creates it again. A create that replaces nothing (the delete found
+no VM) stays cancellable. A `lv compose up` interrupted after it has torn a VM
+down to re-create it still records the stack's new compose file, with the
+stack `degraded`: the rest of its plan did not run, and once `lv ls` shows the
+re-created VM, running `lv compose up` again finishes it.
 
 **CPU mode.** The default, `host-model`, gives the guest the host's modern
 instruction set — SSE4.2, AVX, AVX2, AVX-512 as the host has them — while keeping

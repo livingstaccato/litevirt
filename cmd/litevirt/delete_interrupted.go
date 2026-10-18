@@ -33,3 +33,15 @@ func interruptedOp(what, op string, err error, checks ...string) error {
 	return fmt.Errorf("%s: %s (%s); the %s may still complete on its host: check `%s`",
 		what, how, status.Convert(err).Message(), op, strings.Join(checks, "` and `"))
 }
+
+// interruptedReplace is interruptedOp for an operation that re-creates a VM
+// (a rebuild, a deploy's re-creates). A VM being re-created is not listed
+// until its create finishes, so running the operation again before then
+// would create it a second time.
+func interruptedReplace(what, op, rerun string, err error) error {
+	ierr := interruptedOp(what, op, err, "lv ls")
+	if ierr == nil {
+		return nil
+	}
+	return fmt.Errorf("%w. A VM being re-created is not listed until its create finishes: wait until `lv ls` shows it before running `%s` again", ierr, rerun)
+}

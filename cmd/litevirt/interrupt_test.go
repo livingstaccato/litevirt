@@ -77,7 +77,7 @@ func TestInterrupt_AnInFlightCommandReportsWhatMayStillCompleteAndDies(t *testin
 		{"lv rm, SIGINT", []string{"rm", "vm1"}, syscall.SIGINT, "the delete may still complete", "`lv ls`"},
 		{"lv rm, SIGTERM", []string{"rm", "vm1"}, syscall.SIGTERM, "the delete may still complete", "`lv ls`"},
 		{"lv ct rm", []string{"ct", "rm", "ct1"}, syscall.SIGINT, "the delete may still complete", "`lv ct ls`"},
-		{"lv rebuild", []string{"rebuild", "vm1"}, syscall.SIGINT, "the rebuild may still complete", "`lv ls`"},
+		{"lv rebuild", []string{"rebuild", "vm1"}, syscall.SIGINT, "the rebuild may still complete", "wait until `lv ls` shows it before running `lv rebuild` again"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			started := make(chan struct{}, 1)
@@ -315,16 +315,84 @@ func TestInterrupt_WatchCancelsTheContextOnSIGINT(t *testing.T) {
 	}
 }
 
-// The daemon shuts down on SIGINT/SIGTERM itself; every other command gets
-// the interrupt handler.
-func TestInterrupt_OnlyTheDaemonHandlesItsOwnSignals(t *testing.T) {
+// The daemon, gitops, top, spice and vnc handle SIGINT/SIGTERM themselves;
+// every other command gets the interrupt handler.
+//
+// Mutation: drop gitops's annotation — red.
+func TestInterrupt_OnlyCommandsWithTheirOwnHandlersSkipIt(t *testing.T) {
 	root := newRootCmd()
-	if !handlesOwnSignals(root, []string{"daemon"}) {
-		t.Error("the daemon would get the CLI's interrupt handler")
+	for _, args := range [][]string{{"daemon"}, {"gitops", "--repo", "x"}, {"top"}, {"spice", "vm1"}, {"vnc", "vm1", "--listen", ":5900"}} {
+		if !handlesOwnSignals(root, args) {
+			t.Errorf("%v handles its signals itself but would get the CLI's interrupt handler", args)
+		}
 	}
 	for _, args := range [][]string{{"rm", "vm1"}, {"compose", "up", "-f", "x.yaml"}, {"rebuild", "vm1"}, {}} {
 		if handlesOwnSignals(root, args) {
 			t.Errorf("%v would run without the interrupt handler", args)
 		}
+	}
+}
+
+// A Ctrl-C that fails a firewall macro part way gives the rollback of the
+// rows already created its own budget: the grace does not end the process
+// while the rollback runs, and does once it is done.
+//
+// Mutation: drop the grace hold around the rollback — red.
+func TestInterrupt_AMacroRollbackOutlivesTheGrace(t *testing.T) {
+	die, died := dieRecorder()
+	in := newInterrupts(context.Background(), 50*time.Millisecond, die)
+	defer in.close()
+	spy := &macroSpy{failAt: 2}
+	spy.onAdd = func() {
+		if spy.adds == 2 {
+			in.deliver(syscall.SIGINT)
+		}
+	}
+	diedDuringRollback := false
+	spy.onRemove = func() {
+		time.Sleep(300 * time.Millisecond) // well past the grace
+		select {
+		case <-died:
+			diedDuringRollback = true
+		default:
+		}
+	}
+	_, err := runMacroCLICtx(t, in.ctx, spy, newSGRuleAddCmd(), "web", "--macro", "DNS")
+	if err == nil {
+		t.Fatal("the interrupted macro answered OK")
+	}
+	if diedDuringRollback {
+		t.Error("the grace ended the process during the macro's rollback")
+	}
+	if len(spy.removed) != 1 {
+		t.Errorf("rolled back %v, want the one row already created", spy.removed)
+	}
+	select {
+	case got := <-died:
+		if got != syscall.SIGINT {
+			t.Errorf("died by %v after the rollback, want SIGINT", got)
+		}
+	case <-time.After(time.Second):
+		t.Error("the grace, held by the rollback, did not end the process once it was done")
+	}
+}
+
+// A grace hold is bounded by its budget: a cleanup that never finishes does
+// not keep the process alive.
+func TestInterrupt_AGraceHoldEndsAtItsBudget(t *testing.T) {
+	die, died := dieRecorder()
+	in := newInterrupts(context.Background(), 10*time.Millisecond, die)
+	defer in.close()
+	release := holdInterruptGrace(in.ctx, 200*time.Millisecond)
+	defer release()
+	start := time.Now()
+	in.deliver(syscall.SIGINT)
+	select {
+	case <-died:
+		if d := time.Since(start); d < 150*time.Millisecond {
+			t.Errorf("died %v after the signal, inside the hold's budget", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a hold whose cleanup never finished kept the process alive")
 	}
 }

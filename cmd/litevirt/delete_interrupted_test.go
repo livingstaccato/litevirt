@@ -56,3 +56,18 @@ func TestInterruptedOp(t *testing.T) {
 		t.Errorf("a refusal reported as interrupted: %v", got)
 	}
 }
+
+// An interrupted re-create does not send the operator to run it again while
+// its create may still be in flight: the VM is not listed until it finishes.
+//
+// Mutation: drop the wait note — red.
+func TestInterruptedReplace_SaysToWaitForTheVMBeforeARerun(t *testing.T) {
+	err := interruptedReplace("compose up st", "deploy", "lv compose up", status.Error(codes.Canceled, "context canceled"))
+	if err == nil || !strings.Contains(err.Error(), "the deploy may still complete") ||
+		!strings.Contains(err.Error(), "wait until `lv ls` shows it before running `lv compose up` again") {
+		t.Fatalf("interrupted compose up: %v", err)
+	}
+	if got := interruptedReplace("rebuild web", "rebuild", "lv rebuild", status.Error(codes.FailedPrecondition, "no")); got != nil {
+		t.Errorf("a refusal reported as interrupted: %v", got)
+	}
+}

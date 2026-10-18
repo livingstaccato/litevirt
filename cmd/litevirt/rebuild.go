@@ -22,7 +22,7 @@ func newRebuildCmd() *cobra.Command {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				vm, err := c.RebuildVM(ctx, &pb.RebuildVMRequest{Name: args[0]})
 				if err != nil {
-					if ierr := interruptedOp("rebuild "+args[0], "rebuild", err, "lv ls"); ierr != nil {
+					if ierr := interruptedReplace("rebuild "+args[0], "rebuild", "lv rebuild", err); ierr != nil {
 						return ierr
 					}
 					return fmt.Errorf("rebuild: %w", err)

@@ -31,8 +31,9 @@ func newSpiceCmd() *cobra.Command {
 	var launch, showPassword bool
 	var listen string
 	cmd := &cobra.Command{
-		Use:   "spice <vm>",
-		Short: "Print SPICE connection info for a running VM, or open its console here",
+		Use:         "spice <vm>",
+		Annotations: map[string]string{ownSignalsAnnotation: "true"},
+		Short:       "Print SPICE connection info for a running VM, or open its console here",
 		Long: `Without --launch or --listen, prints where the VM's SPICE console is. The
 listener is bound to the VM host's 127.0.0.1, so a client cannot connect to
 it at the host's address.

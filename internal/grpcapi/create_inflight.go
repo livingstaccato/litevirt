@@ -3,14 +3,18 @@ package grpcapi
 import (
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // createFlight is one create of a VM running on this host as the VM's owner,
@@ -198,29 +202,30 @@ func (s *Server) foreignDomainDiskPaths(name, self string) func(string) bool {
 // restore defined under a uuid libvirt chose). The owner-epoch stamp is no
 // identity: healers write it by name onto whatever domain of the name runs on
 // the owner, and epochs repeat across VMs and incarnations. du is the
-// domain's uuid; err is set when what the domain is cannot be read, and then
+// domain's uuid; why says, when the disk rule matched nothing, what it
+// compared; err is set when what the domain is cannot be read, and then
 // nothing about it is known.
-func (s *Server) domainIsVMsOwn(ctx context.Context, name, specUUID, diskOwner string) (own bool, du string, err error) {
+func (s *Server) domainIsVMsOwn(ctx context.Context, name, specUUID, diskOwner string) (own bool, du, why string, err error) {
 	x, xerr := s.virt.DumpXMLInactive(name)
 	if xerr != nil {
 		var lerr error
 		if x, lerr = s.virt.DumpXML(name); lerr != nil {
-			return false, "", fmt.Errorf("%v; live: %v", xerr, lerr)
+			return false, "", "", fmt.Errorf("%v; live: %v", xerr, lerr)
 		}
 	}
 	du = domainUUIDFromXML(x)
 	if du == "" {
-		return false, "", fmt.Errorf("its definition names no uuid")
+		return false, "", "", fmt.Errorf("its definition names no uuid")
 	}
 	if specUUID != "" && du == specUUID {
-		return true, du, nil
+		return true, du, "", nil
 	}
 	if diskOwner == "" {
-		return false, du, nil
+		return false, du, "", nil
 	}
 	recorded, rerr := corrosion.GetVMDisks(ctx, s.db, diskOwner)
 	if rerr != nil {
-		return false, du, fmt.Errorf("the VM's disks cannot be read: %v", rerr)
+		return false, du, "", fmt.Errorf("the VM's disks cannot be read: %v", rerr)
 	}
 	var mine []string
 	for _, d := range recorded {
@@ -228,50 +233,145 @@ func (s *Server) domainIsVMsOwn(ctx context.Context, name, specUUID, diskOwner s
 			mine = append(mine, d.Path)
 		}
 	}
-	return domainRunsOnAny(x, mine), du, nil
+	if len(mine) == 0 {
+		return false, du, fmt.Sprintf("the VM's row records no disk on %s", s.hostName), nil
+	}
+	on, derr := domainRunsOnAny(x, mine)
+	if derr != nil {
+		return false, du, "", derr
+	}
+	if !on {
+		why = fmt.Sprintf("none of its disks is one of the %d the VM's row records on %s", len(mine), s.hostName)
+	}
+	return on, du, why, nil
 }
 
 // domainRunsOnAny reports whether a domain's own disks (not its CD-ROMs, not
-// their backing chains) name one of paths, by spelling or by the file it is.
-func domainRunsOnAny(domXML string, paths []string) bool {
+// their backing chains) name one of paths: a file or block device by
+// spelling, then by the file it is; a Ceph RBD network disk by its
+// pool/image against an "rbd:" path. A file is looked at within
+// sharedDiskStatTimeout, and one that cannot be looked at (a hard mount whose
+// server is gone) is an error: whether the domain runs on it is not known.
+func domainRunsOnAny(domXML string, paths []string) (bool, error) {
 	if len(paths) == 0 {
-		return false
+		return false, nil
 	}
 	var dom struct {
 		Devices struct {
 			Disks []struct {
 				Device string `xml:"device,attr"`
 				Source struct {
-					File string `xml:"file,attr"`
-					Dev  string `xml:"dev,attr"`
+					File     string `xml:"file,attr"`
+					Dev      string `xml:"dev,attr"`
+					Protocol string `xml:"protocol,attr"`
+					Name     string `xml:"name,attr"`
 				} `xml:"source"`
 			} `xml:"disk"`
 		} `xml:"devices"`
 	}
 	if err := xml.Unmarshal([]byte(domXML), &dom); err != nil {
-		return false
+		return false, nil
 	}
+	var srcs []string
 	for _, d := range dom.Devices.Disks {
 		if d.Device != "" && d.Device != "disk" {
+			continue
+		}
+		if d.Source.Protocol == "rbd" {
+			if d.Source.Name == "" {
+				continue
+			}
+			for _, p := range paths {
+				if l, ok := storage.ParseCephLocator(p); ok && l.Spec == d.Source.Name {
+					return true, nil
+				}
+			}
 			continue
 		}
 		for _, src := range []string{d.Source.File, d.Source.Dev} {
 			if src == "" {
 				continue
 			}
-			sfi, serr := os.Stat(src)
 			for _, p := range paths {
 				if p == src {
-					return true
+					return true, nil
 				}
-				if serr != nil {
-					continue
-				}
-				if pfi, perr := os.Stat(p); perr == nil && os.SameFile(sfi, pfi) {
-					return true
-				}
+			}
+			srcs = append(srcs, src)
+		}
+	}
+	// No spelling matched: compare the files themselves.
+	var local []string
+	for _, p := range paths {
+		if !strings.HasPrefix(p, "rbd:") {
+			local = append(local, p)
+		}
+	}
+	if len(srcs) == 0 || len(local) == 0 {
+		return false, nil
+	}
+	look := func(p string) (os.FileInfo, bool, error) {
+		fi, err := statInfoWithin(p, sharedDiskStatTimeout)
+		switch {
+		case err == nil:
+			return fi, true, nil
+		case errors.Is(err, fs.ErrNotExist):
+			return nil, false, nil
+		default:
+			return nil, false, fmt.Errorf("disk %s cannot be looked at: %v", p, err)
+		}
+	}
+	var pfis []os.FileInfo
+	for _, p := range local {
+		fi, ok, err := look(p)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			pfis = append(pfis, fi)
+		}
+	}
+	if len(pfis) == 0 {
+		return false, nil
+	}
+	for _, src := range srcs {
+		sfi, ok, err := look(src)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			continue
+		}
+		for _, pfi := range pfis {
+			if os.SameFile(sfi, pfi) {
+				return true, nil
 			}
 		}
 	}
-	return false
+	return false, nil
+}
+
+// domainMACsFromXML is the MAC of each <interface> of a domain definition,
+// in order. An interface with no MAC is an error: positions would shift.
+func domainMACsFromXML(domXML string) ([]string, error) {
+	var dom struct {
+		Devices struct {
+			Interfaces []struct {
+				MAC struct {
+					Address string `xml:"address,attr"`
+				} `xml:"mac"`
+			} `xml:"interface"`
+		} `xml:"devices"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &dom); err != nil {
+		return nil, err
+	}
+	macs := make([]string, 0, len(dom.Devices.Interfaces))
+	for i, n := range dom.Devices.Interfaces {
+		if n.MAC.Address == "" {
+			return nil, fmt.Errorf("interface %d names no MAC", i)
+		}
+		macs = append(macs, strings.ToLower(n.MAC.Address))
+	}
+	return macs, nil
 }

@@ -4824,7 +4824,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		// minted, or a non-firmware import, whose uuid libvirt chose) has
 		// nothing to compare, and is judged as before.
 		if spec.Uuid != "" {
-			own, du, ierr := s.domainIsVMsOwn(ctx, req.Name, spec.Uuid, req.Name)
+			own, du, why, ierr := s.domainIsVMsOwn(ctx, req.Name, spec.Uuid, req.Name)
 			switch {
 			case ierr != nil:
 				// libvirt cannot say what the domain is: stopping it would
@@ -4834,9 +4834,9 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 					req.Name, s.hostName, ierr)
 			case !own:
 				return nil, status.Errorf(codes.FailedPrecondition,
-					"cannot rebuild %q: the domain of the name on %s is not this VM's (uuid %s, the VM's is %s, and it runs "+
-						"on none of the VM's disks there); nothing was changed",
-					req.Name, s.hostName, du, spec.Uuid)
+					"cannot rebuild %q: the domain of the name on %s is not this VM's (uuid %s, the VM's is %s, and %s); "+
+						"nothing was changed",
+					req.Name, s.hostName, du, spec.Uuid, why)
 			}
 		}
 		active, aerr := s.virt.DomainIsActive(req.Name)

@@ -170,7 +170,8 @@ func TestPromoteReplica_ForceNeverStopsAForeignDomainStartedDuringTheBuild(t *te
 func TestPromoteReplica_ARenamedRetryAdoptsTheRunningDomainsUUID(t *testing.T) {
 	s, fake := promoteFixture(t)
 	const first = "eeeeeeee-0000-0000-0000-000000000015"
-	if err := fake.DefineDomain(fmt.Sprintf("<domain type='kvm'><name>vm1-p</name><uuid>%s</uuid></domain>", first)); err != nil {
+	if err := fake.DefineDomain(fmt.Sprintf("<domain type='kvm'><name>vm1-p</name><uuid>%s</uuid><devices>"+
+		"<interface type='bridge'><mac address='52:54:00:aa:bb:15'/></interface></devices></domain>", first)); err != nil {
 		t.Fatal(err)
 	}
 	if err := fake.StartDomain("vm1-p"); err != nil {

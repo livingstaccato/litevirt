@@ -1115,19 +1115,33 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 	}
 	started := promoteDomainAlreadyStarted(stepDone("started"), stepDone("start_attempted"), s.promoteMarkerPresent(targetName), domExists, domRunning)
-	// A renamed promotion mints its uuid on every attempt, so a retry that
-	// adopts the domain an earlier attempt started takes that domain's uuid
-	// for the row and the NIC guards: the row and the domain never name two
-	// identities. One whose uuid cannot be read is not adopted.
+	// A renamed promotion mints its uuid and MACs on every attempt, so a
+	// retry that adopts the domain an earlier attempt started takes that
+	// domain's uuid, and its MACs by position (the spec's NICs, in order, are
+	// the domain's), for the row, the NIC rows and the NIC guards: the row and
+	// the domain never name two identities. One whose uuid or MACs cannot be
+	// read, or whose NICs are not the spec's in number, is not adopted.
+	var adoptedMACs []string
 	if renamed && started {
 		x, xerr := s.virt.DumpXML(targetName)
 		du := domainUUIDFromXML(x)
-		if xerr != nil || du == "" {
+		macs, merr := domainMACsFromXML(x)
+		switch {
+		case xerr != nil || du == "":
 			return status.Errorf(codes.Unavailable,
 				"promote of %s to %s: the domain an earlier attempt started cannot be identified (%v); nothing was changed",
 				vm.Name, targetName, xerr)
+		case merr != nil:
+			return status.Errorf(codes.Unavailable,
+				"promote of %s to %s: the NICs of the domain an earlier attempt started cannot be read (%v); nothing was changed",
+				vm.Name, targetName, merr)
+		case len(macs) != len(spec.Network):
+			return status.Errorf(codes.Unavailable,
+				"promote of %s to %s: the domain an earlier attempt started has %d NICs, the VM's spec %d; nothing was changed",
+				vm.Name, targetName, len(macs), len(spec.Network))
 		}
 		spec.Uuid = du
+		adoptedMACs = macs
 	}
 
 	// Split-brain guard. Taking over the original name while the original is
@@ -1227,7 +1241,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// prior promotion — never destroy it on resume; fall through to persist.)
 	replaceDomain := false
 	replaceVerdict := func() (bool, error) {
-		own, du, ierr := s.domainIsVMsOwn(ctx, targetName, spec.Uuid, "")
+		own, du, _, ierr := s.domainIsVMsOwn(ctx, targetName, spec.Uuid, "")
 		if spec.Uuid == "" && ierr == nil && !renamed {
 			own = true // a VM from before uuids were minted: judged as before
 		}
@@ -1245,9 +1259,19 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		if ierr != nil {
 			du = fmt.Sprintf("unidentified: %v", ierr)
 		}
+		// The way out: stop the domain, then retry.
+		out := fmt.Sprintf("no VM of the name exists, so stop it with `virsh destroy %s` on %s", targetName, s.hostName)
+		switch {
+		case renamed:
+		case vm.HostName == s.hostName:
+			out = fmt.Sprintf("stop it with `lv stop %s`", targetName)
+		default:
+			out = fmt.Sprintf("%s owns the VM: this host's reconciler stops the local domain on its own once a "+
+				"recovery claim certifies the move there, or stop it with `virsh destroy %s` on %s", vm.HostName, targetName, s.hostName)
+		}
 		return false, status.Errorf(codes.FailedPrecondition,
 			"domain %q on %s is not this VM's (uuid %s, the VM's is %s) and %s; --force replaces only the VM's own "+
-				"domain or a stopped one; nothing was changed", targetName, s.hostName, du, spec.Uuid, why)
+				"domain or a stopped one; %s, then retry; nothing was changed", targetName, s.hostName, du, spec.Uuid, why, out)
 	}
 	if s.virt.DomainExists(targetName) && !started {
 		if !req.Force {
@@ -1594,6 +1618,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	}
 	for i, n := range renamedNICs {
 		mac := lv.GenerateMAC()
+		if adoptedMACs != nil {
+			mac = adoptedMACs[i] // the running guest's NIC
+		}
 		// The spec records the NIC's real MAC (as a clone does), so its queues
 		// are matched at every later redefine, not lost to the source's MAC.
 		n.Mac = mac

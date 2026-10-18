@@ -121,8 +121,11 @@ func loadSynFlood(ctx context.Context, db *corrosion.Client, host string, probe 
 	pol, err := corrosion.ResolveFirewallSynflood(ctx, db, host)
 	switch {
 	case errors.Is(err, corrosion.ErrUnreadableFirewallPolicy):
-		unreadable = append(unreadable, fmt.Sprintf("%v; SYN-flood protection is on at %d/second burst %d until it is set again with lv firewall synflood",
-			err, corrosion.SynfloodDefaultRate, corrosion.SynfloodDefaultBurst))
+		// <key> holds "<value>": <what is enforced>, the shape every
+		// policy block appends for firewall.policy.unreadable's one raiser.
+		held := strings.TrimPrefix(err.Error(), corrosion.ErrUnreadableFirewallPolicy.Error()+": ")
+		unreadable = append(unreadable, fmt.Sprintf("%s: read as on at %d/%d",
+			held, corrosion.SynfloodDefaultRate, corrosion.SynfloodDefaultBurst))
 	case err != nil:
 		return SynFlood{}, "", unreadable, err
 	}

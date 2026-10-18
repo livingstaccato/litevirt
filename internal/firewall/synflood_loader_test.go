@@ -111,9 +111,19 @@ func TestLoader_SynFloodUnreadable(t *testing.T) {
 	if plan.SynFlood != (SynFlood{On: true, Rate: corrosion.SynfloodDefaultRate, Burst: corrosion.SynfloodDefaultBurst}) {
 		t.Errorf("unreadable row: SynFlood = %+v, want on at the defaults", plan.SynFlood)
 	}
-	if len(plan.UnreadablePolicies) != 1 || !strings.Contains(plan.UnreadablePolicies[0], corrosion.FirewallSynfloodKey("")) {
-		t.Errorf("unreadable row: UnreadablePolicies = %q, want one naming %s", plan.UnreadablePolicies, corrosion.FirewallSynfloodKey(""))
+	// The shape every policy block writes, which firewall.policy.unreadable's
+	// one raiser reports as it is: <key> holds "<value>": <what is enforced>.
+	if want := `firewall_synflood holds "on please": read as on at 200/1000`; len(plan.UnreadablePolicies) != 1 || plan.UnreadablePolicies[0] != want {
+		t.Errorf("unreadable row: UnreadablePolicies = %q, want [%q]", plan.UnreadablePolicies, want)
 	}
+	putSynFloodRaw(t, db, corrosion.FirewallSynfloodKey("host-a"), "{")
+	if want := `firewall_synflood/host-a holds "{": read as on at 200/1000`; func() bool {
+		p := loadSynFloodPlan(t, db, "host-a", nil)
+		return len(p.UnreadablePolicies) != 1 || p.UnreadablePolicies[0] != want
+	}() {
+		t.Errorf("host row: want [%q]", want)
+	}
+	putSynFloodRaw(t, db, corrosion.FirewallSynfloodKey("host-a"), "")
 	putSynFloodRaw(t, db, corrosion.FirewallSynfloodKey(""), `{"mode":"off"}`)
 	if plan := loadSynFloodPlan(t, db, "host-a", nil); len(plan.UnreadablePolicies) != 0 {
 		t.Errorf("readable again: UnreadablePolicies = %q", plan.UnreadablePolicies)

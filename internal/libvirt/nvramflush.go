@@ -33,8 +33,10 @@ const nvramStallAfter = 10 * time.Second
 var errNvramEntryChanged = errors.New("the entry is no longer the regular file listed")
 
 // NvramFlushFailure is a vars file whose fsync failed. It stays failed until
-// the file is removed or replaced: after a writeback error the kernel reports it to one
-// fsync, and a later fsync returns 0 although the data never reached disk.
+// the guest writes the file again and that is fsynced, or the file is removed
+// or replaced: after a writeback error the kernel reports it to one fsync, and
+// a later fsync with nothing written since returns 0 although the data never
+// reached disk.
 type NvramFlushFailure struct {
 	Path  string `json:"path"`
 	VM    string `json:"vm,omitempty"`
@@ -42,6 +44,10 @@ type NvramFlushFailure struct {
 	At    string `json:"at"`
 	Dev   uint64 `json:"dev"`
 	Ino   uint64 `json:"ino"`
+	// Mtime is the file's mtime when its fsync failed. A later fsync that
+	// succeeds on a file the guest has written since (a later mtime) clears
+	// the failure: the store is then on disk as the guest last wrote it.
+	Mtime time.Time `json:"mtime"`
 }
 
 type nvramFlushed struct {
@@ -74,6 +80,8 @@ type NvramFlusher struct {
 
 	mu     sync.Mutex
 	failed map[string]NvramFlushFailure
+
+	done chan struct{}
 }
 
 // NewNvramFlusher flushes the vars files in dirs. A directory that does not
@@ -88,6 +96,7 @@ func NewNvramFlusher(dirs ...string) *NvramFlusher {
 		listed:     map[string]map[string]bool{},
 		warned:     map[string]bool{},
 		failed:     map[string]NvramFlushFailure{},
+		done:       make(chan struct{}),
 	}
 	f.onStall = func(path string, elapsed time.Duration) {
 		slog.Warn("UEFI vars flush is stalled; until it returns, no vars file on this host is flushed",
@@ -96,8 +105,10 @@ func NewNvramFlusher(dirs ...string) *NvramFlusher {
 	return f
 }
 
-// Run sweeps every interval until ctx ends, and once more then.
+// Run sweeps every interval until ctx ends, and once more then; Done closes
+// after that last sweep.
 func (f *NvramFlusher) Run(ctx context.Context, interval time.Duration) {
+	defer close(f.done)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -177,13 +188,21 @@ func (f *NvramFlusher) Sweep() {
 			f.current.Store(p)
 			err = f.sync(p, info)
 			f.current.Store("")
+			var syncErr *nvramSyncError
 			switch {
+			case err == nil:
+				f.flushed[p] = nvramFlushed{mtime: mt, syncStart: start}
+				f.clearIfRewritten(p, mt)
+			case errors.As(err, &syncErr):
+				f.fail(p, info, err)
+			case os.IsNotExist(err):
+				// Gone since the listing; the next sweep sees it gone.
 			case errors.Is(err, errNvramEntryChanged) || errors.Is(err, syscall.ELOOP):
 				f.warnOnce(p, "UEFI vars entry changed under the flusher; skipped", err)
-			case err != nil:
-				f.fail(p, info, err)
 			default:
-				f.flushed[p] = nvramFlushed{mtime: mt, syncStart: start}
+				// Not opened, so nothing was flushed and nothing is known lost:
+				// retried on the next sweep.
+				f.warnOnce(p, "UEFI vars file could not be opened to flush it; retried on the next sweep", err)
 			}
 		}
 		prev := f.listed[dir]
@@ -212,6 +231,22 @@ func (f *NvramFlusher) Sweep() {
 	}
 }
 
+// clearIfRewritten clears the failure of a file fsynced cleanly at mtime mt,
+// if the guest wrote it after the failed fsync.
+func (f *NvramFlusher) clearIfRewritten(p string, mt time.Time) {
+	f.mu.Lock()
+	v, ok := f.failed[p]
+	cleared := ok && mt.After(v.Mtime)
+	if cleared {
+		delete(f.failed, p)
+	}
+	f.mu.Unlock()
+	if cleared {
+		slog.Info("UEFI vars file whose flush failed was written again and flushed; its failure is cleared",
+			"path", p, "vm", nvramVMName(p))
+	}
+}
+
 func (f *NvramFlusher) fail(p string, info os.FileInfo, err error) {
 	dev, ino := fileIdentity(info)
 	f.mu.Lock()
@@ -219,7 +254,7 @@ func (f *NvramFlusher) fail(p string, info os.FileInfo, err error) {
 	f.failed[p] = NvramFlushFailure{
 		Path: p, VM: nvramVMName(p), Error: err.Error(),
 		At:  f.now().UTC().Format(time.RFC3339),
-		Dev: dev, Ino: ino,
+		Dev: dev, Ino: ino, Mtime: info.ModTime(),
 	}
 	f.mu.Unlock()
 	if !already {
@@ -264,8 +299,10 @@ func nvramVMName(p string) string {
 
 // fsyncListed fsyncs path. With want nil it is a directory, opened without
 // following a link. Otherwise it must still be the regular file want was
-// listed as: opened without following a link and without blocking (a FIFO
-// put in its place), and confirmed by fstat to be that same file.
+// listed as: opened without following a link, without blocking (a FIFO put
+// in its place) and never as a controlling terminal, and confirmed by fstat
+// to be that same file. Only an error of the fsync itself is an
+// *nvramSyncError.
 func fsyncListed(path string, want os.FileInfo) error {
 	if want == nil {
 		d, err := os.OpenFile(path, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
@@ -275,7 +312,7 @@ func fsyncListed(path string, want os.FileInfo) error {
 		defer d.Close()
 		return d.Sync()
 	}
-	fh, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	fh, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_NOCTTY, 0)
 	if err != nil {
 		return err
 	}
@@ -287,7 +324,10 @@ func fsyncListed(path string, want os.FileInfo) error {
 	if !got.Mode().IsRegular() || !os.SameFile(got, want) {
 		return fmt.Errorf("%s: %w", path, errNvramEntryChanged)
 	}
-	return fh.Sync()
+	if err := fh.Sync(); err != nil {
+		return &nvramSyncError{err}
+	}
+	return nil
 }
 
 // Seed carries failures over from before a restart (the host condition's
@@ -302,6 +342,9 @@ func (f *NvramFlusher) Seed(failures []NvramFlushFailure) {
 		}
 		if dev, ino := fileIdentity(info); dev != v.Dev || ino != v.Ino {
 			continue
+		}
+		if v.Mtime.IsZero() { // recorded before failures carried an mtime
+			v.Mtime, _ = time.Parse(time.RFC3339, v.At)
 		}
 		if _, ok := f.failed[v.Path]; !ok {
 			f.failed[v.Path] = v
@@ -328,3 +371,13 @@ func (f *NvramFlusher) replaced(p string, info os.FileInfo) bool {
 	dev, ino := fileIdentity(info)
 	return dev != v.Dev || ino != v.Ino
 }
+
+// nvramSyncError is an error from the fsync itself, as opposed to the open:
+// only it can mean written data was lost.
+type nvramSyncError struct{ err error }
+
+func (e *nvramSyncError) Error() string { return "fsync: " + e.err.Error() }
+func (e *nvramSyncError) Unwrap() error { return e.err }
+
+// Done closes once Run has made its last sweep.
+func (f *NvramFlusher) Done() <-chan struct{} { return f.done }

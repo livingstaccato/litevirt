@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirt"
@@ -93,5 +94,26 @@ func TestNvramDirs(t *testing.T) {
 	}
 	if got := nvramDirs(""); len(got) != 1 {
 		t.Fatalf("no data dir: nvramDirs = %v, want libvirt's only", got)
+	}
+}
+
+// Stopping the flusher waits for its last sweep, but not forever.
+func TestStopAndWait_WaitsForDoneWithinTheBound(t *testing.T) {
+	done := make(chan struct{})
+	cancelled := false
+	go func() { time.Sleep(100 * time.Millisecond); close(done) }()
+	start := time.Now()
+	stopAndWait(func() { cancelled = true }, done, 5*time.Second)
+	if !cancelled {
+		t.Fatal("stopAndWait did not cancel")
+	}
+	if el := time.Since(start); el < 100*time.Millisecond {
+		t.Fatalf("returned after %v, before the last sweep finished", el)
+	}
+
+	start = time.Now()
+	stopAndWait(func() {}, make(chan struct{}), 50*time.Millisecond)
+	if el := time.Since(start); el > 2*time.Second {
+		t.Fatalf("a stuck sweep held the stop for %v", el)
 	}
 }

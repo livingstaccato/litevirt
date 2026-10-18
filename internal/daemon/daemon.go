@@ -392,7 +392,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// qemu writes UEFI vars files with no flush and libvirt has no cache mode
 	// for <nvram>: flush them from the first moment, so a host power cut
 	// loses at most about a second of a guest's UEFI variable writes.
-	nvramFlusher := d.startNvramFlusher(ctx)
+	nvramFlusher, stopNvramFlusher := d.startNvramFlusher(ctx)
+	defer stopNvramFlusher()
 	if err := d.checkMigrationNetwork(); err != nil {
 		return err
 	}

@@ -17,8 +17,9 @@ import (
 const nvramFlushEvaluator = "uefi-vars"
 
 // CondNvramFlushFailed is raised by a node about itself while an fsync of a
-// UEFI vars file on it has failed. It resolves only when every such file is
-// removed or replaced: a later fsync that succeeds proves nothing, because the
+// UEFI vars file on it has failed. A file stops counting once the guest has
+// written it again and that write is fsynced, or once it is removed or
+// replaced. A later fsync with nothing written since proves nothing: the
 // kernel reports a writeback error once and the lost pages are clean.
 const CondNvramFlushFailed = "nvram_flush_failed"
 
@@ -27,9 +28,9 @@ const nvramFlushConditionEvery = 10 * time.Second
 
 const nvramFlushRemedy = "the listed vars files may be missing UEFI variable writes their guests made; " +
 	"qemu still holds the whole store in memory while the VM runs, but a stop does not rewrite it. " +
-	"Check the disk (dmesg, smartctl). Then have the guest write its variables again, " +
-	"or restore the VM's firmware state from a backup. " +
-	"The condition clears when each file is removed or replaced"
+	"Check the disk (dmesg, smartctl). Then have the guest write its variables again " +
+	"(the file's next clean fsync after that write clears it), " +
+	"or restore the VM's firmware state from a backup, or remove the VM"
 
 type nvramFlushEvidence struct {
 	Files  []libvirt.NvramFlushFailure `json:"files"`
@@ -46,13 +47,18 @@ func nvramDirs(dataDir string) []string {
 	return dirs
 }
 
+// nvramFinalSweepWait bounds how long a stopping daemon waits for the
+// flusher's last sweep.
+const nvramFinalSweepWait = 5 * time.Second
+
 // startNvramFlusher starts flushing this host's UEFI vars files. It needs
-// nothing but the data directory, so it runs from the start of Run, and it
-// sweeps once more when ctx ends.
-func (d *Daemon) startNvramFlusher(ctx context.Context) *libvirt.NvramFlusher {
-	f := libvirt.NewNvramFlusher(nvramDirs(d.cfg.DataDir)...)
-	go f.Run(ctx, libvirt.NvramFlushInterval)
-	return f
+// nothing but the data directory, so it runs from the start of Run. stop
+// ends it with one last sweep and waits for that, bounded.
+func (d *Daemon) startNvramFlusher(ctx context.Context) (f *libvirt.NvramFlusher, stop func()) {
+	f = libvirt.NewNvramFlusher(nvramDirs(d.cfg.DataDir)...)
+	fctx, cancel := context.WithCancel(ctx)
+	go f.Run(fctx, libvirt.NvramFlushInterval)
+	return f, func() { stopAndWait(cancel, f.Done(), nvramFinalSweepWait) }
 }
 
 // runNvramFlushCondition keeps nvram_flush_failed in step with the flusher's
@@ -97,4 +103,14 @@ func (d *Daemon) syncNvramFlushCondition(ctx context.Context, failures []libvirt
 	d.writeSelfConditionAs(ctx, nvramFlushEvaluator, CondNvramFlushFailed, len(failures) > 0,
 		corrosion.SeverityCritical, nvramFlushEvidence{Files: failures, Remedy: nvramFlushRemedy})
 	*last = string(b)
+}
+
+// stopAndWait cancels and waits up to bound for done.
+func stopAndWait(cancel func(), done <-chan struct{}, bound time.Duration) {
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(bound):
+		slog.Warn("UEFI vars flusher's last sweep did not finish in time; exiting without it", "waited", bound)
+	}
 }

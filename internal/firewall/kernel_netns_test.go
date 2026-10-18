@@ -111,7 +111,7 @@ func TestKernel_NICGuard(t *testing.T) {
 		"TestKernelChild_VLANToNICAndTrunk", "TestKernelChild_SynFloodShapeLoads",
 		"TestKernelChild_IsolatedNetworkStaysOnHost", "TestKernelChild_HostIsolationAnswersTheHost",
 		"TestKernelChild_HostIsolatedGatewayRoutesWithSNAT", "TestKernelChild_GuestVRRPNeverReachesTheHost",
-		"TestKernelChild_TagGroupsHoldOnTheWire"} {
+		"TestKernelChild_TagGroupsHoldOnTheWire", "TestKernelChild_SynFloodWireHarness"} {
 		if !strings.Contains(string(out), "--- PASS: "+child) {
 			t.Errorf("%s did not pass in the namespace", child)
 		}
@@ -120,7 +120,8 @@ func TestKernel_NICGuard(t *testing.T) {
 	// missing (saying which); they must not fail or vanish. Under
 	// LITEVIRT_NFT_REQUIRE=1 they fail instead, so only a pass counts.
 	for _, child := range []string{"TestKernelChild_CompatCorpusLoads", "TestKernelChild_MainEraLvSetStillDrops",
-		"TestKernelChild_SynFloodLoads", "TestKernelChild_LogFormsLoad"} {
+		"TestKernelChild_SynFloodLoads", "TestKernelChild_LogFormsLoad",
+		"TestKernelChild_SynFloodOnTheWire", "TestKernelChild_SynFloodProbeAccepted"} {
 		if !strings.Contains(string(out), "--- PASS: "+child) &&
 			(os.Getenv(nftRequire) == "1" || !strings.Contains(string(out), "--- SKIP: "+child)) {
 			t.Errorf("%s neither passed nor skipped in the namespace", child)

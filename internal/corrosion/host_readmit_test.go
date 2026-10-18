@@ -187,13 +187,18 @@ func TestReplicatedReadmission_RetiresTheCredentialWithTheGateClosed(t *testing.
 
 // The retirement is stamped with the admission's own updated_at, so every node
 // writes the same tombstone, and a credential written after the admission —
-// the new machine's, set through `lv host config` — is not touched by a
-// re-admission that reaches this node late.
+// the new machine's, set through `lv host config` on a node that held the
+// admission, so it carries that retirement — is not touched by a re-admission
+// that reaches this node late.
 func TestReplicatedReadmission_KeepsANewerCredential(t *testing.T) {
 	c := newTestDB(t)
 	oldIncarnation(t, c)
 	const newer = "2999-06-01T00:00:00.000001Z"
 	if _, err := c.DB().Exec(HostFenceCredentialUpsertSQL, "host-x", "new-machine", newer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.DB().Exec(`UPDATE host_fence_credentials SET after_retirement = '2999-01-01T00:00:00.000001Z'
+		WHERE host_name = 'host-x'`); err != nil {
 		t.Fatal(err)
 	}
 	applyRemote(t, c, "2999000000000-0000-peer", Statement{SQL: readmitHostSQL, Params: []interface{}{

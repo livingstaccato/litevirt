@@ -145,3 +145,41 @@ func BenchmarkReplicaPoolDir(b *testing.B) {
 	}
 	b.ReportMetric(float64(n.Load())/float64(b.N), "mountinfo-reads/op")
 }
+
+// An NFS replica pool's resolution reads the mount table once, through the
+// mount table cache, where it read it seven times (the pool check's snapshot,
+// the NFS mount checks' own reads, and the probe's), and not at all while the
+// table has not changed since.
+//
+// Mutation "no cache" (storage mounts reads the table on every use): 7 reads,
+// then 7 more; red.
+func TestReplicaPoolDir_NFSPoolReadsTheMountTableOnce(t *testing.T) {
+	s := multiPoolServer(t)
+	m := installHostMounts(t)
+	nfsPoolRow(t, s, "nfsdr")
+	ctx := context.Background()
+	if _, err := s.replicaPoolDir(ctx, "nfsdr"); err != nil { // mounts the export
+		t.Fatalf("replicaPoolDir (first, mounting): %v", err)
+	}
+	var reads atomic.Int64
+	var changed atomic.Bool
+	changed.Store(true)
+	t.Cleanup(storage.OverrideMountTableSourceForTest(func() ([]byte, error) {
+		reads.Add(1)
+		return m.info()
+	}, func() bool { return changed.Swap(false) }))
+
+	if _, err := s.replicaPoolDir(ctx, "nfsdr"); err != nil {
+		t.Fatalf("replicaPoolDir: %v", err)
+	}
+	if got := reads.Load(); got != 1 {
+		t.Errorf("an NFS replica pool's resolution read the mount table %d times, want 1", got)
+	}
+	reads.Store(0)
+	if _, err := s.replicaPoolDir(ctx, "nfsdr"); err != nil {
+		t.Fatalf("replicaPoolDir (again): %v", err)
+	}
+	if got := reads.Load(); got != 0 {
+		t.Errorf("with the table unchanged, it read it %d times, want 0", got)
+	}
+}

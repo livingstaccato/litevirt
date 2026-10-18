@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -225,5 +226,35 @@ func TestKernelChild_SynFloodProbeAccepted(t *testing.T) {
 	skipUnlessModules(t, "the SYN-flood probe", synFloodModules...)
 	if err := ProbeSynFlood(context.Background()); err != nil {
 		t.Errorf("the kernel refused the SYN-flood probe: %v", err)
+	}
+}
+
+// TestKernelChild_SynFloodDropsReadsTheTable: SynFloodDrops reads a real
+// kernel's per-NIC table. With no table it is zero and no error; with the
+// SYN-flood ruleset loaded (its limit taken out, so nft_limit is not needed)
+// and each lv-sf counter preset, it sums them per family over forward and
+// output.
+//
+// Mutation: read the counter from the wrong JSON place (the rule's handle) —
+// red.
+func TestKernelChild_SynFloodDropsReadsTheTable(t *testing.T) {
+	inNetns(t)
+	skipUnlessModules(t, "the SYN-flood counters", "nf_tables", "nf_conntrack", "nft_ct", "nf_conntrack_bridge", "nft_meta_bridge", "bridge")
+	_ = exec.Command("nft", "delete", "table", "bridge", NICTableName).Run()
+	if v4, v6, err := SynFloodDrops(context.Background()); err != nil || v4 != 0 || v6 != 0 {
+		t.Fatalf("no table: %d, %d, %v; want 0, 0, nil", v4, v6, err)
+	}
+	script := synFloodScripts(t)[NICModeEnforce]
+	script = regexp.MustCompile(` limit rate over [0-9]+/second burst [0-9]+ packets`).ReplaceAllString(script, "")
+	script = strings.ReplaceAll(script, `counter drop comment "lv-sf 4"`, `counter packets 5 bytes 300 drop comment "lv-sf 4"`)
+	script = strings.ReplaceAll(script, `counter drop comment "lv-sf 6"`, `counter packets 3 bytes 240 drop comment "lv-sf 6"`)
+	cmd := exec.Command("nft", "-f", "-")
+	cmd.Stdin = strings.NewReader(script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("load: %v\n%s", err, out)
+	}
+	t.Cleanup(func() { _ = exec.Command("nft", "delete", "table", "bridge", NICTableName).Run() })
+	if v4, v6, err := SynFloodDrops(context.Background()); err != nil || v4 != 10 || v6 != 6 {
+		t.Errorf("preset counters: %d, %d, %v; want 10, 6", v4, v6, err)
 	}
 }

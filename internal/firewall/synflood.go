@@ -2,10 +2,13 @@ package firewall
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 
+	"github.com/litevirt/litevirt/internal/cmdbound"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -127,4 +130,73 @@ func loadSynFlood(ctx context.Context, db *corrosion.Client, host string, probe 
 		}
 	}
 	return sf, "", unreadable, nil
+}
+
+// nftListNICTable lists the per-NIC table as JSON: nft's stdout, or its
+// stderr when it fails. Tests replace it.
+var nftListNICTable = func(ctx context.Context) ([]byte, error) {
+	out, err := cmdbound.Output(ctx, cmdbound.Command(ctx, "nft", "-j", "list", "table", "bridge", NICTableName))
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.Stderr, err
+	}
+	return out, err
+}
+
+// SynFloodDrops reads this host's SYN-flood drops per family since the per-NIC
+// table was last loaded: the lv-sf 4 and lv-sf 6 counters. A host with no
+// per-NIC table has dropped nothing; any other failure is an error, so a
+// count that could not be read is never reported as zero.
+func SynFloodDrops(ctx context.Context) (v4, v6 uint64, err error) {
+	out, err := nftListNICTable(ctx)
+	if err != nil {
+		if strings.Contains(string(out), "No such file or directory") {
+			return 0, 0, nil
+		}
+		return 0, 0, fmt.Errorf("list the per-NIC table: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return parseSynFloodDrops(out)
+}
+
+// parseSynFloodDrops sums the lv-sf counters of `nft -j` output per family.
+func parseSynFloodDrops(js []byte) (v4, v6 uint64, err error) {
+	var doc struct {
+		Nftables []map[string]json.RawMessage `json:"nftables"`
+	}
+	if err := json.Unmarshal(js, &doc); err != nil {
+		return 0, 0, fmt.Errorf("parse nft json: %w", err)
+	}
+	for _, obj := range doc.Nftables {
+		raw, ok := obj["rule"]
+		if !ok {
+			continue
+		}
+		var rule struct {
+			Comment string            `json:"comment"`
+			Expr    []json.RawMessage `json:"expr"`
+		}
+		if json.Unmarshal(raw, &rule) != nil {
+			continue
+		}
+		var total *uint64
+		switch rule.Comment {
+		case SynFloodComment + " 4":
+			total = &v4
+		case SynFloodComment + " 6":
+			total = &v6
+		default:
+			continue
+		}
+		for _, e := range rule.Expr {
+			var c struct {
+				Counter *struct {
+					Packets uint64 `json:"packets"`
+				} `json:"counter"`
+			}
+			if json.Unmarshal(e, &c) == nil && c.Counter != nil {
+				*total += c.Counter.Packets
+			}
+		}
+	}
+	return v4, v6, nil
 }

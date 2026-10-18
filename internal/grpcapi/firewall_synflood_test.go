@@ -2,9 +2,11 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -160,5 +162,81 @@ func TestGetFirewallSynflood_PerHost(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("policy %d = %+v, want %+v", i, got[i], want[i])
 		}
+	}
+}
+
+// synfloodPeer answers the local_only leg of the fan-out with its own drops,
+// and refuses a call without local_only (which would fan out again).
+type synfloodPeer struct {
+	pb.LiteVirtClient
+	v4, v6 uint64
+}
+
+func (p synfloodPeer) GetFirewallSynflood(_ context.Context, in *pb.GetFirewallSynfloodRequest, _ ...grpc.CallOption) (*pb.GetFirewallSynfloodResponse, error) {
+	if !in.GetLocalOnly() {
+		return nil, status.Error(codes.FailedPrecondition, "a fan-out leg without local_only")
+	}
+	return &pb.GetFirewallSynfloodResponse{Policies: []*pb.FirewallSynfloodPolicy{{DropsV4: p.v4, DropsV6: p.v6}}}, nil
+}
+
+// status asks every active host for its own lv-sf 4 and lv-sf 6 counters
+// (local_only=true) and reads this host's from its kernel. A host that cannot
+// be asked, or is not active, shows why in error, never a zero; this host's
+// counters failing to read shows the same way.
+//
+// Mutations: fan out without local_only — h1 shows an error: red; report an
+// unreachable host as zero drops with no error — red; drop this host's read
+// error — red.
+func TestGetFirewallSynflood_DropsPerHost(t *testing.T) {
+	ctx := context.Background()
+	s := synfloodServer(t, true, "test-host", "h1", "h2")
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "h3", Address: "10.0.0.3", State: "maintenance"}); err != nil {
+		t.Fatal(err)
+	}
+	s.peerClientOverride = func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
+		if host == "h1" {
+			return synfloodPeer{v4: 7, v6: 2}, func() {}, nil
+		}
+		return nil, nil, errors.New("connection refused")
+	}
+	s.synFloodDrops = func(context.Context) (uint64, uint64, error) { return 11, 4, nil }
+	r, err := s.GetFirewallSynflood(viewerCtx(), &pb.GetFirewallSynfloodRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	by := map[string]*pb.FirewallSynfloodPolicy{}
+	for _, p := range r.GetPolicies()[1:] {
+		by[p.GetScope()] = p
+	}
+	check := func(host string, v4, v6 uint64, errHas string) {
+		t.Helper()
+		p := by[host]
+		if p == nil {
+			t.Fatalf("no entry for %s", host)
+		}
+		if errHas == "" && (p.GetError() != "" || p.GetDropsV4() != v4 || p.GetDropsV6() != v6) {
+			t.Errorf("%s: drops %d/%d error %q, want %d/%d", host, p.GetDropsV4(), p.GetDropsV6(), p.GetError(), v4, v6)
+		}
+		if errHas != "" && !strings.Contains(p.GetError(), errHas) {
+			t.Errorf("%s: error %q, want it to say %q", host, p.GetError(), errHas)
+		}
+	}
+	check("test-host", 11, 4, "")
+	check("h1", 7, 2, "")
+	check("h2", 0, 0, "connection refused")
+	check("h3", 0, 0, "maintenance")
+	if c := r.GetPolicies()[0]; c.GetError() != "" || c.GetDropsV4() != 0 {
+		t.Errorf("the cluster entry carries counters: %+v", c)
+	}
+
+	// The fan-out leg: this host's entry alone, with its own counters.
+	r, err = s.GetFirewallSynflood(viewerCtx(), &pb.GetFirewallSynfloodRequest{LocalOnly: true})
+	if err != nil || len(r.GetPolicies()) != 1 || r.GetPolicies()[0].GetScope() != "test-host" || r.GetPolicies()[0].GetDropsV4() != 11 {
+		t.Fatalf("local_only = %+v, %v; want this host's entry with its drops", r, err)
+	}
+	s.synFloodDrops = func(context.Context) (uint64, uint64, error) { return 0, 0, errors.New("nft: Operation not permitted") }
+	r, err = s.GetFirewallSynflood(viewerCtx(), &pb.GetFirewallSynfloodRequest{LocalOnly: true})
+	if err != nil || !strings.Contains(r.GetPolicies()[0].GetError(), "Operation not permitted") {
+		t.Errorf("unreadable local counters: %+v, %v; want the error", r, err)
 	}
 }

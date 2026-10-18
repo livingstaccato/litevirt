@@ -94,13 +94,15 @@ func TestSynfloodCLI_Writes(t *testing.T) {
 // from and what is in force: a host whose kernel refused the probe shows
 // unavailable.
 //
-// Mutation: ignore the condition — h2 shows on: red.
+// Mutations: ignore the condition — h2 shows on: red; print an unreadable
+// count as 0 — red.
 func TestSynfloodCLI_Status(t *testing.T) {
 	spy := &synfloodSpy{
 		get: &pb.GetFirewallSynfloodResponse{Policies: []*pb.FirewallSynfloodPolicy{
 			{Scope: "cluster", Mode: "on", Rate: 200, Burst: 1000, SetBy: "olga", UpdatedAt: "t1"},
 			{Scope: "h1", Mode: "off", SetBy: "olga", UpdatedAt: "t2"},
-			{Scope: "h2", Mode: "on", Rate: 200, Burst: 1000, Inherited: true},
+			{Scope: "h2", Mode: "on", Rate: 200, Burst: 1000, Inherited: true, DropsV4: 17, DropsV6: 3},
+			{Scope: "h3", Mode: "on", Rate: 200, Burst: 1000, Inherited: true, Error: "unreachable"},
 		}},
 		health: &pb.ClusterHealth{Conditions: []*pb.HealthCondition{
 			{Code: "firewall.synflood.unavailable", SubjectKind: "host", SubjectId: "h2", Lifecycle: "confirmed"},
@@ -112,13 +114,16 @@ func TestSynfloodCLI_Status(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 4 || lines[0] != "cluster: on, 200/second burst 1000 (set by olga at t1)" {
+	if len(lines) != 5 || lines[0] != "cluster: on, 200/second burst 1000 (set by olga at t1)" {
 		t.Fatalf("status output:\n%s", out)
 	}
-	if f := strings.Fields(lines[2]); strings.Join(f, " ") != "h1 off off - - host olga t2" {
+	if f := strings.Fields(lines[2]); strings.Join(f, " ") != "h1 off off - - host 0 0 olga t2" {
 		t.Errorf("h1 row = %q", lines[2])
 	}
-	if f := strings.Fields(lines[3]); strings.Join(f, " ") != "h2 on unavailable 200 1000 cluster -" {
+	if f := strings.Fields(lines[3]); strings.Join(f, " ") != "h2 on unavailable 200 1000 cluster 17 3 -" {
 		t.Errorf("h2 row = %q", lines[3])
+	}
+	if f := strings.Fields(lines[4]); strings.Join(f, " ") != "h3 on on 200 1000 cluster - - - unreachable" {
+		t.Errorf("h3 row = %q (a count that could not be read must not show as 0)", lines[4])
 	}
 }

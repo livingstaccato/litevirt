@@ -1071,8 +1071,10 @@ lv firewall synflood inherit --scope <host>                       # clear a host
 
 - A host's own policy (`--scope <host>`) wins over the cluster's; with
   neither, protection is off. `status` shows, per host, the policy, where it
-  comes from (`host` or `cluster`) and what is in force: `unavailable` for a
-  host whose kernel refused SYN-flood rules.
+  comes from (`host` or `cluster`), what is in force (`unavailable` for a
+  host whose kernel refused SYN-flood rules), and its drops per address
+  family since its last reload, asked of each active host. A host that cannot
+  be asked, or is not active, shows `-` and why in ERROR, never a 0.
 - `on`, `off` and `inherit` need the operator role, are audited
   (`firewall.synflood`) and are refused until the cluster upgrade has
   finished. `--rate` and `--burst` are each 1-100000; the defaults, 200 and

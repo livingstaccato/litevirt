@@ -539,6 +539,12 @@ message FirewallSynfloodPolicy {
     string set_by     = 5;
     string updated_at = 6;
     bool   inherited  = 7;  // a host with no row of its own: the cluster policy applies
+    // A host's entry only: its SYN-flood drops per family since its last
+    // reload (the lv-sf 4 and lv-sf 6 counters), asked of the host itself.
+    // error says why they could not be read; then the counts mean nothing.
+    uint64 drops_v4   = 8;
+    uint64 drops_v6   = 9;
+    string error      = 10;
 }
 
 // FirewallLogPolicy is the firewall log policy of one scope.

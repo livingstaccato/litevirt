@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -16,6 +17,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/firewall"
 )
 
 // synfloodModeInherit clears a host's own policy (SetFirewallSynfloodRequest).
@@ -113,10 +115,22 @@ func synfloodAuditText(p corrosion.FirewallSynflood, recorded bool, err error) s
 
 // GetFirewallSynflood reports the cluster's policy, always first (a host may
 // be named "cluster" too), then each host's as this replica resolves it — its
-// own row, else the cluster's (inherited), else off — sorted by host name.
-func (s *Server) GetFirewallSynflood(ctx context.Context, _ *pb.GetFirewallSynfloodRequest) (*pb.GetFirewallSynfloodResponse, error) {
+// own row, else the cluster's (inherited), else off — sorted by host name,
+// with the host's SYN-flood drops since its last reload: this host's read from
+// its kernel, every other active host's asked of it (local_only). A host that
+// cannot be asked, or is not active, says why in error and carries no count.
+// With local_only, only this host's entry.
+func (s *Server) GetFirewallSynflood(ctx context.Context, req *pb.GetFirewallSynfloodRequest) (*pb.GetFirewallSynfloodResponse, error) {
 	if err := RequireRole(ctx, "viewer"); err != nil {
 		return nil, err
+	}
+	if req.GetLocalOnly() {
+		p, err := s.synfloodPolicy(ctx, s.hostName)
+		if err != nil {
+			return nil, err
+		}
+		s.localSynfloodDrops(ctx, p)
+		return &pb.GetFirewallSynfloodResponse{Policies: []*pb.FirewallSynfloodPolicy{p}}, nil
 	}
 	cluster, err := s.synfloodPolicy(ctx, "")
 	if err != nil {
@@ -133,9 +147,55 @@ func (s *Server) GetFirewallSynflood(ctx context.Context, _ *pb.GetFirewallSynfl
 		if err != nil {
 			return nil, err
 		}
+		switch {
+		case h.Name == s.hostName:
+			s.localSynfloodDrops(ctx, p)
+		case h.State != "active":
+			p.Error = fmt.Sprintf("not asked: the host is %s", h.State)
+		default:
+			s.peerSynfloodDrops(ctx, h.Name, p)
+		}
 		out.Policies = append(out.Policies, p)
 	}
 	return out, nil
+}
+
+// localSynfloodDrops fills p with this host's drop counters, or why they
+// could not be read.
+func (s *Server) localSynfloodDrops(ctx context.Context, p *pb.FirewallSynfloodPolicy) {
+	read := s.synFloodDrops
+	if read == nil {
+		read = firewall.SynFloodDrops
+	}
+	v4, v6, err := read(ctx)
+	if err != nil {
+		p.Error = err.Error()
+		return
+	}
+	p.DropsV4, p.DropsV6 = v4, v6
+}
+
+// peerSynfloodDrops asks host for its own drop counters (local_only) and
+// fills p with them, or with why it could not.
+func (s *Server) peerSynfloodDrops(ctx context.Context, host string, p *pb.FirewallSynfloodPolicy) {
+	hctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	client, closeFn, err := s.dialPeer(hctx, host)
+	if err != nil {
+		p.Error = "unreachable: " + err.Error()
+		return
+	}
+	defer closeFn()
+	r, err := client.GetFirewallSynflood(hctx, &pb.GetFirewallSynfloodRequest{LocalOnly: true})
+	switch {
+	case err != nil:
+		p.Error = "unreachable: " + err.Error()
+	case len(r.GetPolicies()) == 0:
+		p.Error = "no answer"
+	default:
+		got := r.GetPolicies()[0]
+		p.DropsV4, p.DropsV6, p.Error = got.GetDropsV4(), got.GetDropsV6(), got.GetError()
+	}
 }
 
 // synfloodPolicy is host's policy for the API, the cluster's own row for

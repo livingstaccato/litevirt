@@ -168,4 +168,21 @@ func TestFleet_Synflood_RefusedUntilEveryHostRunsThisBuild(t *testing.T) {
 			t.Errorf("%s does not hold the firewall_synflood use although the policy was written", n.Name)
 		}
 	}
+
+	// status asks every host for its own counters over the peer path
+	// (local_only): each answers for itself, so no entry is an unreachable
+	// peer. (The fleet has no per-NIC table in a kernel, so each host's
+	// answer is its own counters or its own read error.)
+	r, err := cl.GetFirewallSynflood(ctx, &pb.GetFirewallSynfloodRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.GetPolicies()) != len(c.Nodes)+1 {
+		t.Fatalf("status = %d entries, want the cluster's and %d hosts'", len(r.GetPolicies()), len(c.Nodes))
+	}
+	for _, p := range r.GetPolicies()[1:] {
+		if strings.HasPrefix(p.GetError(), "unreachable") || p.GetError() == "no answer" {
+			t.Errorf("%s was not asked for its counters: %q", p.GetScope(), p.GetError())
+		}
+	}
 }

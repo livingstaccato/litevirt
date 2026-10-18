@@ -136,7 +136,8 @@ func synfloodUnavailableHosts(h *pb.ClusterHealth) map[string]bool {
 
 // printSynflood prints the cluster's policy (the reply's first entry: a host
 // may be named "cluster" too) and each host's, with what the host has in
-// force: off, on, or unavailable (its kernel refused the probe).
+// force (off, on, or unavailable: its kernel refused the probe) and its
+// SYN-flood drops per family since its last reload.
 func printSynflood(out io.Writer, r *pb.GetFirewallSynfloodResponse, unavailable map[string]bool) error {
 	ps := r.GetPolicies()
 	if len(ps) == 0 {
@@ -149,7 +150,7 @@ func printSynflood(out io.Writer, r *pb.GetFirewallSynfloodResponse, unavailable
 	}
 	fmt.Fprintln(out)
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "HOST\tPOLICY\tIN FORCE\tRATE\tBURST\tFROM\tSET BY")
+	fmt.Fprintln(w, "HOST\tPOLICY\tIN FORCE\tRATE\tBURST\tFROM\tDROPS V4\tDROPS V6\tSET BY\tERROR")
 	for _, p := range ps[1:] {
 		from := "host"
 		if p.GetInherited() {
@@ -167,7 +168,12 @@ func printSynflood(out io.Writer, r *pb.GetFirewallSynfloodResponse, unavailable
 		if inForce == "on" && unavailable[p.GetScope()] {
 			inForce = "unavailable"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", p.GetScope(), p.GetMode(), inForce, rate, burst, from, setBy)
+		// A count that could not be read is "-", with why, never a 0.
+		d4, d6 := "-", "-"
+		if p.GetError() == "" {
+			d4, d6 = fmt.Sprint(p.GetDropsV4()), fmt.Sprint(p.GetDropsV6())
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", p.GetScope(), p.GetMode(), inForce, rate, burst, from, d4, d6, setBy, p.GetError())
 	}
 	return w.Flush()
 }

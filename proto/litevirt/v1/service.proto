@@ -2656,7 +2656,9 @@ message ListFirewallDefaultsResponse     { repeated FirewallDefault defaults = 1
 
 // ── Firewall extras: SYN-flood protection, logging, tag groups ──
 // An older daemon answers each of these RPCs Unimplemented.
-message GetFirewallSynfloodRequest {}
+message GetFirewallSynfloodRequest {
+    bool local_only = 1;  // this host's entry only (a peer's fan-out leg)
+}
 message GetFirewallSynfloodResponse { repeated FirewallSynfloodPolicy policies = 1; }
 message SetFirewallSynfloodRequest {
     string scope = 1;  // empty = cluster

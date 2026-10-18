@@ -3429,14 +3429,20 @@ func (x *SecurityGroupRule) GetLog() bool {
 
 // FirewallSynfloodPolicy is the SYN-flood protection policy of one scope.
 type FirewallSynfloodPolicy struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Scope         string                 `protobuf:"bytes,1,opt,name=scope,proto3" json:"scope,omitempty"`  // "cluster" | <host name>
-	Mode          string                 `protobuf:"bytes,2,opt,name=mode,proto3" json:"mode,omitempty"`    // on | off
-	Rate          uint32                 `protobuf:"varint,3,opt,name=rate,proto3" json:"rate,omitempty"`   // new SYNs per second per (guest NIC, source address)
-	Burst         uint32                 `protobuf:"varint,4,opt,name=burst,proto3" json:"burst,omitempty"` // packets
-	SetBy         string                 `protobuf:"bytes,5,opt,name=set_by,json=setBy,proto3" json:"set_by,omitempty"`
-	UpdatedAt     string                 `protobuf:"bytes,6,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
-	Inherited     bool                   `protobuf:"varint,7,opt,name=inherited,proto3" json:"inherited,omitempty"` // a host with no row of its own: the cluster policy applies
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Scope     string                 `protobuf:"bytes,1,opt,name=scope,proto3" json:"scope,omitempty"`  // "cluster" | <host name>
+	Mode      string                 `protobuf:"bytes,2,opt,name=mode,proto3" json:"mode,omitempty"`    // on | off
+	Rate      uint32                 `protobuf:"varint,3,opt,name=rate,proto3" json:"rate,omitempty"`   // new SYNs per second per (guest NIC, source address)
+	Burst     uint32                 `protobuf:"varint,4,opt,name=burst,proto3" json:"burst,omitempty"` // packets
+	SetBy     string                 `protobuf:"bytes,5,opt,name=set_by,json=setBy,proto3" json:"set_by,omitempty"`
+	UpdatedAt string                 `protobuf:"bytes,6,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	Inherited bool                   `protobuf:"varint,7,opt,name=inherited,proto3" json:"inherited,omitempty"` // a host with no row of its own: the cluster policy applies
+	// A host's entry only: its SYN-flood drops per family since its last
+	// reload (the lv-sf 4 and lv-sf 6 counters), asked of the host itself.
+	// error says why they could not be read; then the counts mean nothing.
+	DropsV4       uint64 `protobuf:"varint,8,opt,name=drops_v4,json=dropsV4,proto3" json:"drops_v4,omitempty"`
+	DropsV6       uint64 `protobuf:"varint,9,opt,name=drops_v6,json=dropsV6,proto3" json:"drops_v6,omitempty"`
+	Error         string `protobuf:"bytes,10,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3518,6 +3524,27 @@ func (x *FirewallSynfloodPolicy) GetInherited() bool {
 		return x.Inherited
 	}
 	return false
+}
+
+func (x *FirewallSynfloodPolicy) GetDropsV4() uint64 {
+	if x != nil {
+		return x.DropsV4
+	}
+	return 0
+}
+
+func (x *FirewallSynfloodPolicy) GetDropsV6() uint64 {
+	if x != nil {
+		return x.DropsV6
+	}
+	return 0
+}
+
+func (x *FirewallSynfloodPolicy) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
 }
 
 // FirewallLogPolicy is the firewall log policy of one scope.
@@ -7618,7 +7645,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x04cidr\x18\x06 \x01(\tR\x04cidr\x12\x16\n" +
 	"\x06action\x18\a \x01(\tR\x06action\x12\x1a\n" +
 	"\bpriority\x18\b \x01(\x05R\bpriority\x12\x10\n" +
-	"\x03log\x18\t \x01(\bR\x03log\"\xc0\x01\n" +
+	"\x03log\x18\t \x01(\bR\x03log\"\x8c\x02\n" +
 	"\x16FirewallSynfloodPolicy\x12\x14\n" +
 	"\x05scope\x18\x01 \x01(\tR\x05scope\x12\x12\n" +
 	"\x04mode\x18\x02 \x01(\tR\x04mode\x12\x12\n" +
@@ -7627,7 +7654,11 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x06set_by\x18\x05 \x01(\tR\x05setBy\x12\x1d\n" +
 	"\n" +
 	"updated_at\x18\x06 \x01(\tR\tupdatedAt\x12\x1c\n" +
-	"\tinherited\x18\a \x01(\bR\tinherited\"\xce\x01\n" +
+	"\tinherited\x18\a \x01(\bR\tinherited\x12\x19\n" +
+	"\bdrops_v4\x18\b \x01(\x04R\adropsV4\x12\x19\n" +
+	"\bdrops_v6\x18\t \x01(\x04R\adropsV6\x12\x14\n" +
+	"\x05error\x18\n" +
+	" \x01(\tR\x05error\"\xce\x01\n" +
 	"\x11FirewallLogPolicy\x12\x14\n" +
 	"\x05scope\x18\x01 \x01(\tR\x05scope\x12%\n" +
 	"\x0edefault_policy\x18\x02 \x01(\bR\rdefaultPolicy\x12\x12\n" +

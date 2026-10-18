@@ -3,6 +3,7 @@ package capabilities
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"sync/atomic"
 	"testing"
@@ -122,11 +123,14 @@ var releaseFeatures = map[Feature]FeatureInfo{
 		Writers: []string{"internal/corrosion.SetHAPolicy"}},
 	FeatureNICMTU:          {Token: Release202611V1, Description: "Per-NIC MTU", Writers: []string{"internal/corrosion.InsertVMWithReleaseFeatures", "internal/corrosion.MutateDesiredSpecWithReleaseFeatures"}},
 	FeatureReplicationRate: {Token: Release202611V1, Description: "Per-schedule replication bandwidth limits", Writers: []string{"internal/corrosion.SetReplicationRate"}},
+	FeatureReturningBoot: {Token: Release202611V1, Description: "A host booting from fenced, offline, maintenance, draining or joining is recorded upgrading until its daemon serves (used by default once the release latches)",
+		Writers: []string{"internal/hostboot.WriteReturningBoot"}},
 
 	// The firewall extras.
-	FeatureFirewallSynflood:  {Token: Release202611V1, Description: "SYN-flood protection on guest NICs: the cluster and per-host policy (recorded on for a cluster founded by this release)"},
+	FeatureFirewallSynflood: {Token: Release202611V1, Description: "SYN-flood protection on guest NICs: the cluster and per-host policy (recorded on for a cluster founded by this release)",
+		Writers: []string{"internal/corrosion.SetFirewallSynflood"}},
 	FeatureFirewallLog:       {Token: Release202611V1, Description: "Firewall logging: logged rules and the cluster and per-host log policy", Writers: firewallRuleWriters},
-	FeatureFirewallTagGroups: {Token: Release202611V1, Description: "Firewall tag groups, per-workload firewall tags, and rules matching a tag group's addresses", Writers: firewallRuleWriters},
+	FeatureFirewallTagGroups: {Token: Release202611V1, Description: "Firewall tag groups, per-workload firewall tags, and rules matching a tag group's addresses", Writers: firewallTagGroupWriters},
 }
 
 // firewallRuleWriters write the three rule tables. Each takes one grant per
@@ -137,6 +141,16 @@ var firewallRuleWriters = []string{
 	"internal/corrosion.InsertClusterFirewallRuleWithGrant",
 	"internal/corrosion.InsertHostFirewallRuleWithGrant",
 }
+
+// firewallTagGroupWriters write firewall_tag_groups' data: the rule tables
+// (a rule matching a tag group), the tag-group rows, a workload's firewall
+// identity, and its firewall-tags row.
+var firewallTagGroupWriters = append(slices.Clone(firewallRuleWriters),
+	"internal/corrosion.SetFirewallTagGroup",
+	"internal/corrosion.MintFirewallID",
+	"internal/corrosion.SetFirewallTags",
+	"internal/corrosion.ClearFirewallTags",
+)
 
 // containerReplicationWriters write container_replication's data: a container's
 // replication schedule row, its direction switch, and a run's replica.
@@ -187,6 +201,7 @@ const (
 	FeatureHADisarm             Feature = "ha_disarm"
 	FeatureNICMTU               Feature = "nic_mtu"
 	FeatureReplicationRate      Feature = "replication_rate"
+	FeatureReturningBoot        Feature = "returning_boot"
 
 	FeatureFirewallSynflood  Feature = "firewall_synflood"
 	FeatureFirewallLog       Feature = "firewall_log"

@@ -40,7 +40,7 @@ history cannot outgrow the gRPC message limit. When more proposals match than
 fit on one page, the footer says so; use --limit and --offset to page through
 the rest.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return withClient(context.Background(), func(ctx context.Context, c pb.LiteVirtClient) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				resp, err := c.ListRebalanceProposals(ctx,
 					&pb.ListRebalanceProposalsRequest{
 						StatusFilter: statusFilter,
@@ -95,7 +95,7 @@ engine still respects each VM's resolved rebalance.mode (so VMs with mode=off
 are still skipped). With --dry-run, all proposals are
 recorded as pending regardless of mode.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return withClient(context.Background(), func(ctx context.Context, c pb.LiteVirtClient) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				resp, err := c.RunRebalance(ctx,
 					&pb.RunRebalanceRequest{DryRun: dryRun})
 				if err != nil {
@@ -120,7 +120,7 @@ result (applied / failed) — subject to the cluster rebalance budget. Track
 progress with 'lv rebalance list'.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return withClient(context.Background(), func(ctx context.Context, c pb.LiteVirtClient) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				p, err := c.ApproveRebalanceProposal(ctx,
 					&pb.ApproveRebalanceProposalRequest{Id: args[0]})
 				if err != nil {
@@ -141,7 +141,7 @@ func newRebalanceRejectCmd() *cobra.Command {
 		Short: "Reject a pending proposal",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return withClient(context.Background(), func(ctx context.Context, c pb.LiteVirtClient) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				p, err := c.RejectRebalanceProposal(ctx,
 					&pb.RejectRebalanceProposalRequest{Id: args[0], Reason: reason})
 				if err != nil {

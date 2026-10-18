@@ -405,7 +405,7 @@ func (d *d6) addBack() bool {
 			l.t.Errorf("install %s on %s: %v", pkgs, h, err)
 		}
 		if d.lxc[h] {
-			if err := l.restartDaemon(h); err != nil {
+			if err := l.restartDaemon(h, anyState); err != nil { // a host still joining
 				l.t.Errorf("%v", err)
 			}
 		}

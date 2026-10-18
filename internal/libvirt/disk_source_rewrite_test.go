@@ -4,7 +4,7 @@ import "testing"
 
 // srcOf re-parses domain XML and returns the <source file> for a target dev — used
 // to assert RewriteDiskSourceFile's effect without depending on quote style or
-// formatting (the encoder re-canonicalizes).
+// formatting.
 func srcOf(t *testing.T, domXML, dev string) string {
 	t.Helper()
 	infos, err := parseDiskSourceInfos(domXML)
@@ -154,7 +154,7 @@ func TestRewriteDiskSourceFile_Idempotent(t *testing.T) {
 
 func TestRewriteDiskSourceFile_RefusesNamespaces(t *testing.T) {
 	in := `<domain type="kvm" xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0"><devices>` +
-		`<disk><source file="/old/root.qcow2"/><target dev="vda"/></disk>` +
+		`<disk><source file="/old/root.qcow2"/><target dev="vda"/><qemu:x/></disk>` +
 		`</devices></domain>`
 	if _, _, err := RewriteDiskSourceFile(in, "vda", "/old/root.qcow2", "/new/root.qcow2"); err == nil {
 		t.Fatal("expected refusal for namespaced domain xml")

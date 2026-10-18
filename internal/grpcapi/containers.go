@@ -597,6 +597,24 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	if err := safename.ValidateContainerName(req.Name); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
+	// A plain delete ends the container's own schedules (deleteContainerSchedules),
+	// by the entry host only, as DeleteVM's: never on a host a peer called (the
+	// owner of a forward, an older entry's unmarked compose re-create), and
+	// never for a delete that keeps them (withSchedulesKept).
+	dropSchedules := false
+	var dropProject, dropHost string
+	if !schedulesKept(ctx) && !s.forwardedByEntry(ctx) && !s.isRemotePeer(ctx) {
+		dropProject, dropSchedules = s.containerProject(ctx, req.HostName, req.Name)
+		dropHost = s.deletedContainerHost(ctx, req.HostName, req.Name)
+	}
+	out, err := s.deleteContainer(ctx, req)
+	if err == nil && dropSchedules {
+		s.deleteContainerSchedules(context.WithoutCancel(ctx), dropHost, dropProject, req.Name)
+	}
+	return out, err
+}
+
+func (s *Server) deleteContainer(ctx context.Context, req *pb.DeleteContainerRequest) (*emptypb.Empty, error) {
 	project, known := s.containerProject(ctx, req.HostName, req.Name)
 	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), ctRBACPathFor("", req.Name), "ct.delete", "operator", containerWhat(req.Name)); err != nil {
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "denied")
@@ -618,12 +636,30 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 		}
 		targetHost = h
 	}
+	// A delete ends the container's firewall identity, so its tags row is
+	// cleared once the delete succeeds (spec §4.3), by the entry host only:
+	// a forward to the owner says so (entryForwardCtx). Moves and
+	// relocations retire their source row without this RPC.
+	var fwID string
+	if !s.forwardedByEntry(ctx) {
+		if rec, _ := corrosion.GetContainer(ctx, s.db, targetHost, req.Name); rec != nil {
+			fwID = corrosion.FirewallIDOf(corrosion.TagMemberCT, rec.CreateSpec)
+		}
+	}
 	// A removed host is not dialled: its rows are deleted here
 	// (removed_host_delete.go).
 	if removed, err := s.workloadHostRemoved(ctx, targetHost); err != nil {
 		return nil, err
 	} else if removed {
-		return s.deleteContainerOnRemovedHost(ctx, targetHost, req.Name, project)
+		out, err := s.deleteContainerOnRemovedHost(ctx, targetHost, req.Name, project)
+		if err == nil {
+			// The delete has happened: its tags go whatever becomes of the
+			// caller.
+			pctx, pcancel := context.WithTimeout(context.WithoutCancel(ctx), deletePostStepsTimeout)
+			s.clearDeletedFirewallTags(pctx, corrosion.TagMemberCT, targetHost, req.Name, fwID)
+			pcancel()
+		}
+		return out, err
 	}
 	// A running container is deleted only with force (see refuseDeleteRunning).
 	// Judged here from the row when the owner is remote — the owner then trusts
@@ -634,12 +670,13 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 		}
 	}
 	if forwarded, err := s.forwardSimpleCT(ctx, targetHost, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
-		return c.DeleteContainer(s.recreatePreflightOutgoing(ctx), &pb.DeleteContainerRequest{Name: req.Name, HostName: targetHost, Force: req.Force})
+		return c.DeleteContainer(entryForwardCtx(s.recreatePreflightOutgoing(ctx)), &pb.DeleteContainerRequest{Name: req.Name, HostName: targetHost, Force: req.Force})
 	}); err != nil || forwarded != nil {
 		if err == nil {
 			// Report the delete once this node no longer lists the row (see
 			// awaitForwardedContainer).
 			s.awaitForwardedContainer(ctx, targetHost, req.Name, "deleted", containerRowGone)
+			s.clearDeletedFirewallTags(ctx, corrosion.TagMemberCT, targetHost, req.Name, fwID)
 		}
 		return forwarded, err
 	}
@@ -683,6 +720,15 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// Its NICs' MACs, for retiring their guard records below: the tombstone
 	// takes the NIC rows with it.
 	ctMACs := s.containerNICMACs(ctx, req.Name)
+	// From the runtime delete on, the delete runs to its tombstone whatever
+	// becomes of its caller: a client gone between the two would leave a live
+	// row over a container that no longer exists (detachDelete). A caller
+	// already gone refuses it with nothing done.
+	if err := refuseIfCancelled(ctx); err != nil {
+		return nil, err
+	}
+	ctx, cancelFinish := s.detachDelete(ctx)
+	defer cancelFinish()
 	// A runtime "not found" is acceptable (idempotent) — proceed to the row
 	// tombstone so a retry after "runtime gone but DB write failed" can clear the
 	// ghost row. A real runtime failure still aborts.
@@ -727,6 +773,7 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "error")
 		return nil, status.Errorf(codes.Internal, "delete: release managed NICs: %v", nicErr)
 	}
+	s.clearDeletedFirewallTags(ctx, corrosion.TagMemberCT, targetHost, req.Name, fwID)
 	if errors.Is(derr, corrosion.ErrNoRowsAffected) {
 		// Idempotent: the row was already gone. Audited distinctly, not a silent "ok".
 		s.audit(ctx, "ct.delete", req.Name, "project="+project+" already-absent", "ok")

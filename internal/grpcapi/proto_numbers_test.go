@@ -32,6 +32,8 @@ func TestProtoNumbers_TheIntegratedBranchesDoNotCollide(t *testing.T) {
 		{&pb.StoragePoolContent{}, 6, "replica_vm"},
 		{&pb.StoragePoolContent{}, 7, "replica_disk"},
 		{&pb.StoragePoolContent{}, 8, "replica_taken"},
+		{&pb.UpdateVMRequest{}, 43, "nic_by_list_position"},
+		{&pb.PingResponse{}, 14, "nic_list_position"},
 	}
 	for _, f := range fields {
 		md := f.msg.ProtoReflect().Descriptor()
@@ -95,6 +97,8 @@ func TestProtoNumbers_OpsBundle(t *testing.T) {
 		{&pb.NICMTUExpectation{}, 2, "mtu"},
 		{&pb.NICMTUExpectation{}, 3, "ordinal"},
 		{&pb.EnsureDisksResponse{}, 8, "nic_mtu_problem"},
+		{&pb.EnsureDisksRequest{}, 10, "want_network_devices"},
+		{&pb.EnsureDisksResponse{}, 9, "network_devices"},
 		{&pb.SetHAPolicyRequest{}, 1, "state"},
 		{&pb.SetHAPolicyRequest{}, 2, "reason"},
 		{&pb.SetHAPolicyRequest{}, 3, "fence_down_hosts"},
@@ -266,6 +270,10 @@ func TestProtoNumbers_FirewallExtras(t *testing.T) {
 		{&pb.FirewallTags{}, 5, "tags"},
 		{&pb.FirewallTags{}, 6, "set_by"},
 		{&pb.FirewallTags{}, 7, "updated_at"},
+		{&pb.FirewallTags{}, 8, "orphan"},
+		{&pb.FirewallTags{}, 9, "replaced_fw_id"},
+		{&pb.FirewallTags{}, 10, "dropped_tags"},
+		{&pb.FirewallTags{}, 11, "unreadable"},
 
 		{&pb.SetFirewallTagsRequest{}, 1, "kind"},
 		{&pb.SetFirewallTagsRequest{}, 2, "workload"},
@@ -505,5 +513,26 @@ func TestProto_LiveFirmwareRoundTrip(t *testing.T) {
 	}
 	if m := (&pb.AbortLiveFirmwareTargetRequest{}).GetMode(); m != pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_UNSPECIFIED {
 		t.Errorf("zero abort mode = %v, want UNSPECIFIED", m)
+	}
+}
+
+// The scoped operation abort and the Ping bit that gates it keep their numbers;
+// abort_scoped follows delete_force, the last PingResponse feature bit.
+func TestProtoNumbers_ScopedOperationAbort(t *testing.T) {
+	fields := []struct {
+		msg  protoreflect.ProtoMessage
+		num  protoreflect.FieldNumber
+		name protoreflect.Name
+	}{
+		{&pb.AbortVMOperationRequest{}, 3, "operation_id"},
+		{&pb.PingResponse{}, 12, "delete_force"},
+		{&pb.PingResponse{}, 13, "abort_scoped"},
+	}
+	for _, f := range fields {
+		md := f.msg.ProtoReflect().Descriptor()
+		fd := md.Fields().ByNumber(f.num)
+		if fd == nil || fd.Name() != f.name {
+			t.Errorf("%s field %d is %v, want %s", md.FullName(), f.num, fd, f.name)
+		}
 	}
 }

@@ -238,6 +238,11 @@ const (
 		       WHERE name = ? AND active_operation_id = ? AND vm_owner_epoch = ? AND spec_generation = ?`
 )
 
+// beginVMOperationInterleaveHook is a TEST-ONLY seam between
+// BeginVMOperation's read of the firewall identity and its write. Production
+// leaves it nil.
+var beginVMOperationInterleaveHook func()
+
 // BeginVMOperation atomically claims a VM for an operation. In ONE transaction
 // it verifies the VM's expected owner epoch + spec generation and that no OTHER
 // operation holds the barrier, then sets the desired spec, bumps spec_generation,
@@ -252,13 +257,49 @@ func (c *Client) BeginVMOperation(ctx context.Context, op OperationRecord, desir
 	if err := validateReservationProject(op.ReservationJSON, op.Project); err != nil {
 		return false, err
 	}
+	// The desired spec keeps the firewall identity of the row the CAS below
+	// binds, read at the expected owner epoch and generation. Only
+	// MintFirewallID changes a live row's identity, and it bumps the
+	// generation, so the CAS refuses a row that changed since. No such row
+	// means the CAS matches nothing either.
+	current, err := c.Query(ctx,
+		`SELECT spec FROM vms WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ? AND spec_generation = ?`,
+		op.ResourceID, expectedOwnerEpoch, expectedSpecGen)
+	if err != nil {
+		return false, err
+	}
+	keep := ""
+	if len(current) > 0 {
+		keep = firewallIDOf(TagMemberVM, current[0].String("spec"))
+	}
+	if desiredSpec, err = keepFirewallID(TagMemberVM, desiredSpec, keep); err != nil {
+		return false, err
+	}
+	if beginVMOperationInterleaveHook != nil {
+		beginVMOperationInterleaveHook()
+	}
 	now := c.NowTS()
+	if c.SpecConflictOn() {
+		// The claim stamps the spec with when it was edited and the content
+		// it was made from (spec_stamp.go). Read here, outside the guard: a
+		// row that moved to another generation meanwhile fails the guard. A
+		// sibling taken at the same generation in between is not caught, and
+		// the lineage then names the version the caller computed the claim
+		// from — the one the claim does replace on receivers.
+		rows, err := c.Query(ctx, `SELECT spec FROM vms WHERE name = ? AND deleted_at IS NULL`, op.ResourceID)
+		if err != nil {
+			return false, err
+		}
+		if len(rows) > 0 {
+			desiredSpec = stampSpec(desiredSpec, rows[0].String("spec"), now)
+		}
+	}
 	guard := func(tx *sql.Tx) (bool, error) {
 		var ownerEpoch, specGen int64
-		var activeOp string
+		var activeOp, spec string
 		err := tx.QueryRowContext(ctx,
-			`SELECT vm_owner_epoch, spec_generation, active_operation_id FROM vms WHERE name = ? AND deleted_at IS NULL`,
-			op.ResourceID).Scan(&ownerEpoch, &specGen, &activeOp)
+			`SELECT vm_owner_epoch, spec_generation, active_operation_id, spec FROM vms WHERE name = ? AND deleted_at IS NULL`,
+			op.ResourceID).Scan(&ownerEpoch, &specGen, &activeOp, &spec)
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
 		}
@@ -271,7 +312,11 @@ func (c *Client) BeginVMOperation(ctx context.Context, op OperationRecord, desir
 		if activeOp != "" {
 			return false, nil // barrier held by another operation
 		}
-		return ownerEpoch == expectedOwnerEpoch && specGen == expectedSpecGen, nil
+		// The row must still hold the identity the desired spec keeps: a VM
+		// deleted and re-created at the same epoch and generation since the
+		// read above would otherwise receive the old VM's.
+		return ownerEpoch == expectedOwnerEpoch && specGen == expectedSpecGen &&
+			firewallIDOf(TagMemberVM, spec) == keep, nil
 	}
 	stmts := []Statement{
 		// Self-contained CAS so a retry (active_operation_id already set) is a no-op.
@@ -329,13 +374,24 @@ func (c *Client) CompleteVMOperation(ctx context.Context, vmName, operationID st
 // the WAL/AE repair horizon so no in-flight step can still arrive. Local-
 // deterministic (safe to run on every node); the replicated tombstone converges.
 // Returns the number of operations reaped.
-func ReapTerminalOperations(ctx context.Context, c *Client, retention time.Duration) (int, error) {
+//
+// An operation that cannot be reaped (its steps cannot be read or its tombstone
+// cannot be written) does not stop the pass: it is returned in failures and the
+// pass goes on to the next operation, so one bad row cannot hold every later
+// operation, and the reservation it carries, forever. err is reserved for the
+// pass itself: the opening reads failed, the context ended, or this node's
+// writes are quarantined.
+//
+// Reaping soft-deletes and never removes a header: DetachedNICMACs reads
+// reaped NIC-detach headers to tell a NIC attached again under a MAC from the
+// one the spec recorded (TestOperationHeadersAreNeverHardDeleted).
+func ReapTerminalOperations(ctx context.Context, c *Client, retention time.Duration) (reaped int, failures []OperationReapFailure, err error) {
 	cutoff := time.Now().Add(-retention)
 
 	arows, err := c.Query(ctx,
 		`SELECT DISTINCT active_operation_id FROM vms WHERE active_operation_id != '' AND deleted_at IS NULL`)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	active := make(map[string]bool, len(arows))
 	for _, r := range arows {
@@ -345,9 +401,21 @@ func ReapTerminalOperations(ctx context.Context, c *Client, retention time.Durat
 	orows, err := c.Query(ctx,
 		`SELECT id, operation_kind FROM operations WHERE deleted_at IS NULL`)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
-	reaped := 0
+	// fail records one operation's failure and reports whether the pass can go
+	// on: a cancelled context or a quarantined node fails every operation after
+	// this one too, so that ends the pass instead of being blamed on each.
+	fail := func(id string, ferr error) error {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		if reason := c.quarantineReason(); reason != "" {
+			return errQuarantined(reason)
+		}
+		failures = append(failures, OperationReapFailure{OperationID: id, Err: ferr})
+		return nil
+	}
 	for _, r := range orows {
 		id := r.String("id")
 		if active[id] {
@@ -358,7 +426,10 @@ func ReapTerminalOperations(ctx context.Context, c *Client, retention time.Durat
 		srows, err := c.Query(ctx,
 			`SELECT step_name, updated_at FROM operation_steps WHERE operation_id = ? AND deleted_at IS NULL`, id)
 		if err != nil {
-			return reaped, err
+			if perr := fail(id, fmt.Errorf("read steps: %w", err)); perr != nil {
+				return reaped, failures, perr
+			}
+			continue
 		}
 		names := make([]string, 0, len(srows))
 		var last time.Time
@@ -379,11 +450,21 @@ func ReapTerminalOperations(ctx context.Context, c *Client, retention time.Durat
 			{SQL: `UPDATE operation_steps SET deleted_at = ?, updated_at = ? WHERE operation_id = ? AND deleted_at IS NULL`,
 				Params: []interface{}{marker, now, id}},
 		}); err != nil {
-			return reaped, err
+			if perr := fail(id, fmt.Errorf("write tombstone: %w", err)); perr != nil {
+				return reaped, failures, perr
+			}
+			continue
 		}
 		reaped++
 	}
-	return reaped, nil
+	return reaped, failures, nil
+}
+
+// OperationReapFailure is one operation ReapTerminalOperations was due to reap
+// and could not, with why.
+type OperationReapFailure struct {
+	OperationID string
+	Err         error
 }
 
 // VMOperationView is a VM's active-operation snapshot for admin inspection.

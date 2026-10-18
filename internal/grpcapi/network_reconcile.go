@@ -38,6 +38,10 @@ type netReconcileState struct {
 type appliedNetwork struct {
 	sig string
 	def compose.NetworkDef
+	// vtepSwitched is whether a vxlan network was provisioned on the host
+	// address (Server.vtepSwitched). The release token latching flips it,
+	// and the network is provisioned once more on the new endpoint.
+	vtepSwitched bool
 }
 
 type networkRow struct {
@@ -137,7 +141,7 @@ func (s *Server) ReconcileNetworksOnce(ctx context.Context) error {
 	}
 
 	prov := s.networkProvisioner()
-	localIP := getLocalIP()
+	switched := s.vtepSwitched()
 	changed := false
 
 	// Tear down first, so a device a tombstone shares with nothing live is
@@ -169,7 +173,7 @@ func (s *Server) ReconcileNetworksOnce(ctx context.Context) error {
 		if s.teardownWaitsForLocalUse(ctx, st, r.name, network.BridgeName(r.name, def)) {
 			continue // not torn: retried next pass
 		}
-		if err := prov.Deprovision(ctx, s.db, r.name, def, s.hostName); err != nil {
+		if err := s.deprovisionDevice(ctx, r.name, def); err != nil {
 			slog.Warn("network reconcile: tear down deleted network failed (will retry)",
 				"network", r.name, "error", err)
 			continue
@@ -191,7 +195,7 @@ func (s *Server) ReconcileNetworksOnce(ctx context.Context) error {
 		if s.teardownWaitsForLocalUse(ctx, st, name, network.BridgeName(name, a.def)) {
 			continue
 		}
-		if err := prov.Deprovision(ctx, s.db, name, a.def, s.hostName); err != nil {
+		if err := s.deprovisionDevice(ctx, name, a.def); err != nil {
 			slog.Warn("network reconcile: tear down vanished network failed (will retry)",
 				"network", name, "error", err)
 			continue
@@ -200,33 +204,49 @@ func (s *Server) ReconcileNetworksOnce(ctx context.Context) error {
 		changed = true
 	}
 
+	// A device a network moved off that nothing here uses any more, and a
+	// bridge litevirt made that nothing names any more, go before any network
+	// is provisioned: one still holding a moved network's gateway address
+	// would stop its new device's dnsmasq.
+	s.retirePendingDevices(ctx)
+	s.sweepOrphanedBridges(ctx, st, dead)
+
 	for _, r := range live {
 		sig := r.typ + "\x00" + r.config
 		if a, ok := st.applied[r.name]; ok && a.sig == sig {
 			// Unchanged and set up by this process. Provision again only if the
-			// host lost it since: a dnsmasq that died, a bridge someone deleted.
-			if prov.Provisioned(r.name, a.def) {
+			// host lost it since: a dnsmasq that died, a bridge someone deleted
+			// — or, for a vxlan network, if the release token has latched since,
+			// which moves its tunnel to the host address.
+			switch {
+			case a.def.Type == "vxlan" && a.vtepSwitched != switched:
+				slog.Info("network reconcile: the release token latched; moving the vxlan network's tunnel to this host's address",
+					"network", r.name)
+			case prov.Provisioned(r.name, a.def):
+				// Keep its forwarding entries on the replicated state: a peer
+				// whose VTEP row arrived after its push, a NIC that moved.
+				if err := prov.SyncFDB(ctx, s.db, r.name, a.def, s.hostName); err != nil {
+					slog.Warn("network reconcile: sync vxlan forwarding entries", "network", r.name, "error", err)
+				}
 				continue
+			default:
+				slog.Warn("network reconcile: this host lost the network's bridge or dnsmasq; provisioning it again",
+					"network", r.name)
 			}
-			slog.Warn("network reconcile: this host lost the network's bridge or dnsmasq; provisioning it again",
-				"network", r.name)
 		}
 		def, err := networkRowDef(r)
 		if err != nil {
 			s.noteNetworkReconcileErr(st, r.name, fmt.Errorf("parse config: %w", err))
 			continue
 		}
-		if _, err := prov.Provision(ctx, s.db, r.name, def, localIP, s.hostName); err != nil {
+		if _, _, err := s.provisionHere(ctx, r.name, def); err != nil {
 			s.noteNetworkReconcileErr(st, r.name, s.explainProvisionFailure(ctx, r.name, def, err))
 			continue
 		}
 		delete(st.lastErr, r.name)
-		st.applied[r.name] = appliedNetwork{sig: sig, def: def}
+		st.applied[r.name] = appliedNetwork{sig: sig, def: def, vtepSwitched: switched}
 		changed = true
-		slog.Info("network reconciled", "network", r.name, "type", r.typ)
-		if def.Type == "vxlan" && def.VNI != 0 {
-			s.notifyVTEPPeers(ctx, r.name, def.VNI, localIP)
-		}
+		slog.Info("network reconciled", "network", r.name, "type", r.typ) // provisionHere pushed a vxlan VTEP
 	}
 
 	if changed {

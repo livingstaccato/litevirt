@@ -155,6 +155,9 @@ type Fake struct {
 	FailHostCPUXML   func() error
 	FailDefineDomain func(xml string) error
 	FailStartDomain  func(name string) error
+	// FillDefine, when set, rewrites a definition as DefineDomain stores it:
+	// what libvirt fills in at define, such as the vars path of a UEFI domain.
+	FillDefine func(xml string) string
 	// startGuard mirrors libvirt.Client.SetStartGuard; guardReady and
 	// guardWait mirror RequireStartGuard.
 	startGuard libvirt.StartGuard
@@ -223,6 +226,8 @@ type Fake struct {
 	// FailAttachNIC / FailDetachNIC are the NIC-hotplug equivalent.
 	FailAttachNIC func(domain, bridge, model, mac string) error
 	FailDetachNIC func(domain, mac string) error
+	// FailReloadCDROM injects a live cdrom media reload failure.
+	FailReloadCDROM func(domain, path string) error
 	// SkipConfigOnDiskMutation, when true, makes AttachDisk/DetachDisk update ONLY the
 	// live view (diskSources) and NOT the persistent (inactive) config — modeling a
 	// libvirt DomainDeviceModifyLive-succeeded-but-Config-not-applied divergence so a
@@ -535,6 +540,9 @@ func (f *Fake) DefineDomain(xmlConfig string) error {
 		// A new persistent definition of an inactive domain is what its next
 		// start opens: it stays on an overlay only if it names it.
 		f.dropPITLocked(name, xmlConfig)
+	}
+	if f.FillDefine != nil {
+		xmlConfig = f.FillDefine(xmlConfig)
 	}
 	f.domains[name] = StateDefined
 	f.xml[name] = xmlConfig
@@ -1164,6 +1172,13 @@ func (f *Fake) undefinePreservingState(name string) error {
 // DomainIsActive mirrors libvirt's activity question. StateRunning and
 // StatePaused are both ACTIVE; only an undefined or shut-off domain is not.
 func (f *Fake) DomainIsActive(name string) (bool, error) {
+	var active bool
+	var err error
+	_ = f.mainConn().callAs(false, "", name, func() { active, err = f.domainIsActive(name) })
+	return active, err
+}
+
+func (f *Fake) domainIsActive(name string) (bool, error) {
 	if f.FailDomainState != nil {
 		if err := f.FailDomainState(name); err != nil {
 			return false, err
@@ -1222,9 +1237,12 @@ func (f *Fake) SetPaused(name string) {
 }
 
 func (f *Fake) DomainExists(name string) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	_, ok := f.domains[name]
+	var ok bool
+	_ = f.mainConn().callAs(false, "", name, func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		_, ok = f.domains[name]
+	})
 	return ok
 }
 
@@ -1314,6 +1332,13 @@ func (f *Fake) domainStateReason(name string) (libvirt.DomainStatus, error) {
 }
 
 func (f *Fake) ListDomains() ([]string, error) {
+	var names []string
+	var err error
+	_ = f.mainConn().callAs(false, "", "", func() { names, err = f.listDomains() })
+	return names, err
+}
+
+func (f *Fake) listDomains() ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.FailListDomains != nil {
@@ -1325,6 +1350,7 @@ func (f *Fake) ListDomains() ([]string, error) {
 	for n := range f.domains {
 		out = append(out, n)
 	}
+	sort.Strings(out) // a test can tell which domain a list reaches last
 	return out, nil
 }
 
@@ -1334,6 +1360,13 @@ func (f *Fake) ListDomains() ([]string, error) {
 // diverges them). Disk hotplug's live view is tracked separately (diskSources) and
 // never touches activeXML, so this default is unaffected by disk attach/detach.
 func (f *Fake) DumpXML(name string) (string, error) {
+	var x string
+	var err error
+	_ = f.mainConn().callAs(false, "", name, func() { x, err = f.dumpXML(name) })
+	return x, err
+}
+
+func (f *Fake) dumpXML(name string) (string, error) {
 	if f.FailDumpXML != nil {
 		if err := f.FailDumpXML(name); err != nil {
 			return "", err
@@ -1450,6 +1483,13 @@ func (f *Fake) WaitForShutdown(name string, timeout time.Duration) bool {
 // VNC / SPICE / console — return deterministic placeholders.
 
 func (f *Fake) GetVMVNCPort(name string) (int, error) {
+	port := -1
+	var err error
+	_ = f.mainConn().callAs(false, CallVNCPort, name, func() { port, err = f.vncPort(name) })
+	return port, err
+}
+
+func (f *Fake) vncPort(name string) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if p, ok := f.vncPorts[name]; ok {
@@ -1558,6 +1598,13 @@ func (f *Fake) stripConsoleForBackstop(name string, cause error) bool {
 // running guest started with, else its definition's. A domain the fake has
 // never heard of has none (its console placeholders answer for any name).
 func (f *Fake) ConsolePassword(name, kind string) (string, error) {
+	var pw string
+	var err error
+	_ = f.mainConn().callAs(false, CallConsolePassword, name, func() { pw, err = f.consolePassword(name, kind) })
+	return pw, err
+}
+
+func (f *Fake) consolePassword(name, kind string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if pw, ok := f.liveConsolePw[name]; ok {
@@ -1907,6 +1954,37 @@ func (f *Fake) SetNICBridge(domainName, mac, bridge string) error {
 		}
 	}
 	f.record("set-nic-bridge", domainName, fmt.Sprintf("mac=%s bridge=%s", mac, bridge))
+	return nil
+}
+
+// SetNICBridgeConfig retargets the NIC in the persistent definition only.
+func (f *Fake) SetNICBridgeConfig(domainName, mac, bridge string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	x, ok := libvirt.RetargetDomainXML(f.xml[domainName], mac, bridge)
+	if !ok {
+		return fmt.Errorf("domain %s has no bridge interface with MAC %s", domainName, mac)
+	}
+	f.xml[domainName] = x
+	f.record("set-nic-bridge-config", domainName, fmt.Sprintf("mac=%s bridge=%s", mac, bridge))
+	return nil
+}
+
+// ReloadCDROMMedia records a live media reload of the domain's cdrom whose
+// source is path ("reload-cdrom", note "path=<path>"). Like libvirt, it
+// refuses a domain that is not active (running or paused).
+func (f *Fake) ReloadCDROMMedia(domainName, path string) error {
+	if f.FailReloadCDROM != nil {
+		if err := f.FailReloadCDROM(domainName, path); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if st := f.domains[domainName]; st != StateRunning && st != StatePaused {
+		return fmt.Errorf("domain %s is not active", domainName)
+	}
+	f.record("reload-cdrom", domainName, "path="+path)
 	return nil
 }
 
@@ -2268,14 +2346,22 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 		sort.Strings(names)
 		note += " rbd=" + strings.Join(names, ",")
 	}
+	if len(p.NICBridges) > 0 {
+		var pairs []string
+		for mac, b := range p.NICBridges {
+			pairs = append(pairs, mac+"->"+b)
+		}
+		sort.Strings(pairs)
+		note += " nic_bridges=" + strings.Join(pairs, ",")
+	}
 	f.record("migrate", name, note)
 	// The destination and persistent definitions libvirt.Client.MigrateToTarget
 	// would hand libvirt (from the secure migratable XML), so a hook can land
 	// exactly those. Empty: libvirt carries the domain as it is. Only for a
-	// move that strips the VNC password: the other rewrites resolve against
-	// the host (rbd monitors, the cgroup scale).
-	if p.DestXML == "" && p.StripVNCPassword {
-		dest, persist, err := libvirt.MigrationDefinitionsFor(libvirt.MigrateParams{StripVNCPassword: true},
+	// move that strips the VNC password or moves NICs: the other rewrites
+	// resolve against the host (rbd monitors, the cgroup scale).
+	if p.DestXML == "" && (p.StripVNCPassword || len(p.NICBridges) > 0) {
+		dest, persist, err := libvirt.MigrationDefinitionsFor(libvirt.MigrateParams{StripVNCPassword: p.StripVNCPassword, NICBridges: p.NICBridges},
 			f.liveXMLLocked(name), f.xml[name])
 		if err != nil {
 			return err
@@ -3018,7 +3104,20 @@ func (f *Fake) FireEvent(domainName string, event libvirt.DomainEventType, detai
 	cb(domainName, event, detail)
 }
 
-func (f *Fake) Close() error { return nil }
+// Close marks the Fake closed (Closing); its calls go on answering.
+func (f *Fake) Close() error {
+	f.conns.mu.Lock()
+	f.conns.closing = true
+	f.conns.mu.Unlock()
+	return nil
+}
+
+// Closing mirrors libvirt.Client.Closing: whether Close has been called.
+func (f *Fake) Closing() bool {
+	f.conns.mu.Lock()
+	defer f.conns.mu.Unlock()
+	return f.conns.closing
+}
 
 // SetDomainOwnerEpoch / GetDomainOwnerEpoch mirror the Phase 4 runtime marker
 // stored in domain metadata. The fake records them per domain so fleet and

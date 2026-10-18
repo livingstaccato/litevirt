@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -363,8 +364,9 @@ func (s *Server) freeReplacedVMResources(ctx context.Context, cl corrosion.VMRep
 			return nil
 		}
 		s.fw().WipeNameKeyedFirmwareState(m.ReplacedVM)
+		// The paths are the replaced VM's seed: its stamp goes with it.
 		for _, p := range m.Paths {
-			if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if err := cloudinit.RemoveSeed(p); err != nil {
 				return fmt.Errorf("remove %s: %w", p, err)
 			}
 		}
@@ -593,6 +595,22 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 					return failed("seed rename", e)
 				}
 			}
+			// Its stamp goes with it (cloudinit/seed_owner.go); one left at
+			// the new name from another seed would not be this one's.
+			if _, e := os.Stat(cloudinit.SeedOwnerPath(oldSeed)); e == nil {
+				if e := os.Rename(cloudinit.SeedOwnerPath(oldSeed), cloudinit.SeedOwnerPath(newSeed)); e != nil {
+					return failed("seed stamp rename", e)
+				}
+			} else if os.IsNotExist(e) {
+				_ = os.Remove(cloudinit.SeedOwnerPath(newSeed))
+			}
+			// So does its stale mark, best effort: a mark lost only has a
+			// NIC the seed does not list left unnamed there.
+			if _, e := os.Stat(cloudinit.SeedStalePath(oldSeed)); e == nil {
+				_ = os.Rename(cloudinit.SeedStalePath(oldSeed), cloudinit.SeedStalePath(newSeed))
+			} else if os.IsNotExist(e) {
+				_ = os.Remove(cloudinit.SeedStalePath(newSeed))
+			}
 		}
 		if e := s.virt.DefineDomain(xml); e != nil {
 			return failed("redefine", e)
@@ -654,6 +672,9 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 		if e := s.verifyVMISOForStart(rec); e != nil {
 			return failed("start", e)
 		}
+		// This start runs outside the start hook: a stale seed is rebuilt
+		// here as there, never refusing it.
+		s.retryStaleSeedForStart(ctx, rec)
 	}
 	releaseGuard, gerr := s.guardSharedDiskStart(ctx, m.ReplacedVM, "")
 	if gerr != nil {

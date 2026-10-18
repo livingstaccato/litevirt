@@ -26,7 +26,7 @@ func apServer(t *testing.T) *Server {
 	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
-	return &Server{db: db, hostName: "host-a"}
+	return &Server{dataDir: t.TempDir(), db: db, hostName: "host-a"}
 }
 
 func TestClaimCarriedProof(t *testing.T) {

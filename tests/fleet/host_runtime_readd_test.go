@@ -4,10 +4,8 @@ package fleet
 
 import (
 	"context"
-	"net"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"testing"
 	"time"
 
@@ -33,11 +31,7 @@ func restartWithNewCert(t *testing.T, c *Cluster, n *Node) string {
 	if err != nil {
 		t.Fatalf("read %s's new certificate serial: %v", n.Name, err)
 	}
-	l, err := net.Listen("tcp", net.JoinHostPort(n.Address, strconv.Itoa(n.Port)))
-	if err != nil {
-		t.Fatalf("rebind %s on port %d: %v", n.Name, n.Port, err)
-	}
-	n.Listener = l
+	n.rebindPort(t)
 	if n.stopServerLoops != nil {
 		n.stopServerLoops()
 	}
@@ -66,11 +60,22 @@ func TestFleet_HostRuntime_AStaleDBReaddReadsItsRealReport(t *testing.T) {
 		retireMembership(t, n)
 		retireRuntime(t, n)
 	}
-	c.WaitConverged(t, convergeTimeout)
+	settleByAntiEntropy(t, c, true)
 	if err := corrosion.UpdateHostStartup(ctx, d.DB, d.Name, "active", "v-before-rm", 16, 32, 48, true); err != nil {
 		t.Fatal(err)
 	}
 	c.WaitConverged(t, convergeTimeout)
+	// d joined long before it was removed, as in
+	// TestFleet_StaleDBReaddConvergesOnTheReadmission: its row's created_at
+	// says so on every node (written in place, never logged). Re-admitted
+	// within seconds of its first admission instead, d sat inside the
+	// incarnation rule's MaxSkewMS grace, the documented edge where its stale
+	// row and the re-admission's tie on hosts for good.
+	for _, n := range c.Nodes {
+		if _, err := n.DB.DB().Exec(`UPDATE hosts SET created_at = '2026-01-01T00:00:00Z' WHERE name = ?`, d.Name); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	// d goes down; it is removed and re-added while it cannot hear either.
 	c.Crash(d)

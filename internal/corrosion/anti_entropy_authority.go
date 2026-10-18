@@ -31,6 +31,12 @@ type workloadMergeAuthority struct {
 	// terminal for it at ANY authority.
 	createdAt      string
 	deleted, valid bool
+	// spec and updatedAt are the row's desired spec and clock (VMs only), and
+	// finishedOps the operations the same payload records a terminal step
+	// for: what an equal-generation spec conflict is resolved on
+	// (spec_conflict_ae.go).
+	spec, updatedAt string
+	finishedOps     map[string]bool
 }
 
 type operationMergeAuthority struct {
@@ -90,6 +96,13 @@ func buildMergeAuthorityManifest(payload *syncPayload) *mergeAuthorityManifest {
 		containers: make(map[string]workloadMergeAuthority),
 		operations: make(map[string]operationMergeAuthority),
 	}
+	finished := finishedOperationsInPayload(payload)
+	defer func() {
+		for k, a := range m.vms {
+			a.finishedOps = finished
+			m.vms[k] = a
+		}
+	}()
 	for _, table := range payload.Tables {
 		for _, row := range table.Rows {
 			if len(row) != len(table.Columns) {
@@ -147,8 +160,13 @@ func vmAuthorityFromDump(cols []string, row []interface{}) (workloadMergeAuthori
 	}
 	ownerEpoch, ownerOK := coerceInt64OK(row[idx["vm_owner_epoch"]])
 	generation, generationOK := coerceInt64OK(row[idx["spec_generation"]])
+	updatedAt := ""
+	if i := indexOf(cols, "updated_at"); i >= 0 {
+		updatedAt = coerceString(row[i])
+	}
 	return workloadMergeAuthority{
 		kind: "vm", name: vm.Name, host: vm.HostName,
+		spec: vm.Spec, updatedAt: updatedAt,
 		project:           projectOrDefault(vm.Project),
 		state:             coerceString(row[idx["state"]]),
 		activeOperationID: coerceString(row[idx["active_operation_id"]]),
@@ -289,7 +307,13 @@ func (c *Client) antiEntropyAuthorityDecision(tx *sql.Tx, table syncTable, row [
 		if !a.valid {
 			return mergeAuthorityKeepLocal, nil
 		}
-		return c.workloadParentAuthorityDecision(tx, a)
+		decision, err := c.workloadParentAuthorityDecision(tx, a)
+		if err != nil || !c.SpecConflictOn() {
+			return decision, err
+		}
+		// Two versions of the spec are ordered as on the WAL, not by the
+		// row's clock (spec_conflict_ae.go).
+		return c.specConflictAE(tx, table, row, a, decision)
 	case table.Name == "containers":
 		hostIdx, nameIdx := indexOf(table.Columns, "host_name"), indexOf(table.Columns, "name")
 		if hostIdx < 0 || nameIdx < 0 {
@@ -675,6 +699,13 @@ func (c *Client) operationStepAuthorityKeepsLocal(tx *sql.Tx, table syncTable, r
 		!sameOperationMergeAuthority(local, sourceOp) {
 		return true, nil
 	}
+	// Known gap: a step is taken from a peer only while the source holds a
+	// live workload at the header's owner epoch. A reservation release row
+	// (ReservationReleasedFacts) on a create whose workload is gone, or on a
+	// legacy epoch-0 create, therefore never converges by anti-entropy, only by
+	// the live stream; a replica that missed it keeps counting the reservation
+	// until the operation is reaped. Only legacy rows have this shape: no
+	// production path begins a workload_create operation in this build.
 	a, ok := sourceOperationWorkloadAuthority(sourceOp, m)
 	if !ok || !a.valid {
 		return true, nil

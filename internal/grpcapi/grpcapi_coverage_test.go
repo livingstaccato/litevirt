@@ -834,6 +834,7 @@ func TestInspectLoadBalancer_Found(t *testing.T) {
 // back the persisted config, so `lv lb ls` never shows a phantom "active" LB.
 func TestCreateLoadBalancer_ApplyFailureRollsBack(t *testing.T) {
 	s := testServerCov(t)
+	s.db.SetClusterPolicyGate(func() bool { return true }) // failover_scope_v1 latched: the LB's snat is recordable
 	s.lbApplyOverride = func(context.Context, lb.Config) error {
 		return fmt.Errorf("simulated provisioning failure")
 	}
@@ -857,6 +858,7 @@ func TestCreateLoadBalancer_ApplyFailureRollsBack(t *testing.T) {
 
 func TestCreateLoadBalancer(t *testing.T) {
 	s := testServerCov(t)
+	s.db.SetClusterPolicyGate(func() bool { return true })                    // failover_scope_v1 latched: the LB's snat is recordable
 	s.lbApplyOverride = func(context.Context, lb.Config) error { return nil } // no root/haproxy in unit tests
 	ctx := adminCtx()
 	createLBTable(t, ctx, s.db)
@@ -900,6 +902,7 @@ func TestCreateLoadBalancer(t *testing.T) {
 // is persisted or applied.
 func TestCreateLoadBalancer_RejectsUnsafeNames(t *testing.T) {
 	s := testServerCov(t)
+	s.db.SetClusterPolicyGate(func() bool { return true }) // failover_scope_v1 latched: the LB's snat is recordable
 	s.lbApplyOverride = func(context.Context, lb.Config) error { return nil }
 	ctx := adminCtx()
 	createLBTable(t, ctx, s.db)
@@ -931,6 +934,7 @@ func TestCreateLoadBalancer_RejectsUnsafeNames(t *testing.T) {
 
 func TestCreateLoadBalancer_DuplicateName(t *testing.T) {
 	s := testServerCov(t)
+	s.db.SetClusterPolicyGate(func() bool { return true }) // failover_scope_v1 latched: the LB's snat is recordable
 	ctx := adminCtx()
 	createLBTable(t, ctx, s.db)
 
@@ -951,6 +955,7 @@ func TestCreateLoadBalancer_DuplicateName(t *testing.T) {
 
 func TestCreateLoadBalancer_DuplicateVIP(t *testing.T) {
 	s := testServerCov(t)
+	s.db.SetClusterPolicyGate(func() bool { return true }) // failover_scope_v1 latched: the LB's snat is recordable
 	ctx := adminCtx()
 	createLBTable(t, ctx, s.db)
 
@@ -971,6 +976,7 @@ func TestCreateLoadBalancer_DuplicateVIP(t *testing.T) {
 
 func TestCreateLoadBalancer_Validation(t *testing.T) {
 	s := testServerCov(t)
+	s.db.SetClusterPolicyGate(func() bool { return true }) // failover_scope_v1 latched: the LB's snat is recordable
 	ctx := adminCtx()
 	createLBTable(t, ctx, s.db)
 
@@ -1076,6 +1082,7 @@ func TestLB_DeleteHidesAndAllowsReuse(t *testing.T) {
 // resurrected, via SoftDeleteLBBackends-on-create).
 func TestLB_RecreateAfterDeleteThroughAPI(t *testing.T) {
 	s := testServerCov(t)
+	s.db.SetClusterPolicyGate(func() bool { return true })                    // failover_scope_v1 latched: the LB's snat is recordable
 	s.lbApplyOverride = func(context.Context, lb.Config) error { return nil } // no root/haproxy in unit tests
 	ctx := adminCtx()
 	createLBTable(t, ctx, s.db)
@@ -2275,16 +2282,16 @@ vms:
 	}
 }
 
-// ─── provisionNetworkForVM ──────────────────────────────────────────────────
+// ─── provisionForVM ────────────────────────────────────────────────────────
 
 func TestProvisionNetworkForVM_NoRecord(t *testing.T) {
 	s := testServerCov(t)
 	ctx := adminCtx()
 
 	// Network not in DB — should return empty string (flat bridge mode).
-	bridge, err := provisionNetworkForVM(ctx, s.db, "production", "test-host")
+	bridge, err := s.provisionForVM(ctx, "production")
 	if err != nil {
-		t.Fatalf("provisionNetworkForVM: %v", err)
+		t.Fatalf("provisionForVM: %v", err)
 	}
 	if bridge != "" {
 		t.Errorf("bridge = %q, want empty", bridge)
@@ -2300,9 +2307,9 @@ func TestProvisionNetworkForVM_NonVXLAN(t *testing.T) {
 		`INSERT INTO networks (name, type, config, updated_at)
 		 VALUES ('flat-net', 'bridge', '{}', '2024-01-01T00:00:00Z')`)
 
-	bridge, err := provisionNetworkForVM(ctx, s.db, "flat-net", "test-host")
+	bridge, err := s.provisionForVM(ctx, "flat-net")
 	if err != nil {
-		t.Fatalf("provisionNetworkForVM: %v", err)
+		t.Fatalf("provisionForVM: %v", err)
 	}
 	if bridge != "" {
 		t.Errorf("bridge = %q, want empty for non-vxlan", bridge)
@@ -2679,9 +2686,9 @@ func TestHostStateToPB_AllStates(t *testing.T) {
 		{"maintenance", pb.HostState_HOST_MAINTENANCE},
 		{"suspect", pb.HostState_HOST_SUSPECT},
 		{"offline", pb.HostState_HOST_OFFLINE},
-		{"fenced", pb.HostState_HOST_OFFLINE},     // fenced ⇒ down, never ACTIVE
-		{"upgrading", pb.HostState_HOST_DRAINING}, // transient, never ACTIVE
-		{"random", pb.HostState_HOST_OFFLINE},     // default fails safe (not ACTIVE)
+		{"fenced", pb.HostState_HOST_FENCED},       // fenced ⇒ down, never ACTIVE
+		{"upgrading", pb.HostState_HOST_UPGRADING}, // transient, never ACTIVE
+		{"random", pb.HostState_HOST_OFFLINE},      // default fails safe (not ACTIVE)
 	}
 	for _, tt := range tests {
 		got := hostStateToPB(tt.input)
@@ -3841,6 +3848,7 @@ func TestMigrateVM_VMNotFound(t *testing.T) {
 // self-demote heal once quorum lets the gated apply through.
 func TestReconcileDeadLBs_OnlyReappliesDead(t *testing.T) {
 	s := testServerCov(t)
+	s.db.SetClusterPolicyGate(func() bool { return true }) // failover_scope_v1 latched: the LB's snat is recordable
 	applies := 0
 	s.lbApplyOverride = func(context.Context, lb.Config) error { applies++; return nil }
 	ctx := adminCtx()

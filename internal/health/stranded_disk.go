@@ -47,7 +47,14 @@ import (
 //     (superseded_retention.go): only an operator removes it
 //     (`lv host superseded-disks <host> --remove <copy>`) or puts it back
 //     (`--restore <copy>`, RestoreSupersededDisk), which sets the disk it
-//     replaces aside in turn, so nothing is ever deleted by the swap.
+//     replaces aside in turn, so nothing is ever deleted by the swap;
+//   - once the VM is deleted, the host sets aside a disk of it still at its
+//     path, which enters the same retention, removes the VM's own cloud-init
+//     seed when this release stamped it, and resolves the record
+//     (deleted_vm_residue.go). A disk the delete kept (--keep-disks,
+//     delete_with_vm=false) stays at its path. A VM of the name created on
+//     the host first moves such a disk off a path its debris sweep clears
+//     (SetAsideBeforeCreate).
 //
 // The record is a health condition, one row per VM and host, written by the
 // coordinator while the host is down and by the host itself afterwards. It
@@ -70,6 +77,10 @@ type StrandedDisk struct {
 	// the file is still at Path, which is while the host is down.
 	Copy  string `json:"copy,omitempty"`
 	Since string `json:"since"` // RFC3339: when it was left behind or set aside
+	// Incarnation is the created_at of the VM whose disk it is, when it was
+	// recorded; "" when that could not be read, or by an older release. Only
+	// that incarnation's delete sets it aside (deleted_vm_residue.go).
+	Incarnation string `json:"incarnation,omitempty"`
 }
 
 // StrandedDisks is the evidence of one vm_disk_stranded condition: the
@@ -81,6 +92,24 @@ type StrandedDisks struct {
 	Disks   []StrandedDisk `json:"disks"`
 	Detail  string         `json:"detail"`
 	Fix     string         `json:"fix"`
+
+	// KeptByDelete: the VM's delete was `lv rm --keep-disks`, written by
+	// the deleting host before its tombstone (MarkStrandedForDelete). The
+	// host leaves a disk still at its path there (deleted_vm_residue.go).
+	KeptByDelete bool `json:"kept_by_delete,omitempty"`
+	// DeleteDecided is the created_at of the VM whose delete wrote
+	// KeptByDelete, beside it; "" when no delete did (one by an earlier
+	// release, a write lost to a later one, a replica without the record).
+	// A disk still at its path is set aside for the retention only once
+	// the deleted incarnation's delete said it keeps nothing; otherwise it
+	// is left there, as a kept one (deleted_vm_residue.go).
+	DeleteDecided string `json:"delete_decided,omitempty"`
+}
+
+// deleteKeptNothing reports whether the delete of the incarnation created at
+// createdAt recorded on ev that it keeps none of its disks.
+func deleteKeptNothing(ev StrandedDisks, createdAt string) bool {
+	return createdAt != "" && ev.DeleteDecided == createdAt && !ev.KeptByDelete
 }
 
 func strandedSubject(vm, host string) string { return vm + "@" + host }
@@ -190,6 +219,7 @@ func RecordStrandedDisks(ctx context.Context, db *corrosion.Client, reporter, vm
 	}
 	ev.VM, ev.Host, ev.MovedTo = vmName, host, movedTo
 	since := now.UTC().Format(time.RFC3339)
+	inc := incarnationOf(ctx, db, vmName)
 	for _, d := range local {
 		listed := false
 		for _, e := range ev.Disks {
@@ -199,13 +229,23 @@ func RecordStrandedDisks(ctx context.Context, db *corrosion.Client, reporter, vm
 			}
 		}
 		if !listed {
-			ev.Disks = append(ev.Disks, StrandedDisk{Disk: d.DiskName, Path: d.Path, Since: since})
+			ev.Disks = append(ev.Disks, StrandedDisk{Disk: d.DiskName, Path: d.Path, Since: since, Incarnation: inc})
 		}
 	}
 	if err := writeStranded(ctx, db, reporter, row, had, ev, now); err != nil {
 		return "", err
 	}
 	return strandedDetail(ev), nil
+}
+
+// incarnationOf is the created_at of vmName's live row, "" when it has none or
+// the read fails: an entry recorded without one is never removed with a VM.
+func incarnationOf(ctx context.Context, db *corrosion.Client, vmName string) string {
+	vm, err := corrosion.GetVM(ctx, db, vmName)
+	if err != nil || vm == nil {
+		return ""
+	}
+	return vm.CreatedAt
 }
 
 // noteStrandedCopy records that host set the disk of vmName at path aside to
@@ -229,12 +269,52 @@ func noteStrandedCopy(ctx context.Context, db *corrosion.Client, reporter, vmNam
 		}
 	}
 	if !noted {
-		ev.Disks = append(ev.Disks, StrandedDisk{Disk: disk, Path: path, Copy: copyPath, Since: since})
+		ev.Disks = append(ev.Disks, StrandedDisk{Disk: disk, Path: path, Copy: copyPath, Since: since,
+			Incarnation: incarnationOf(ctx, db, vmName)})
 	}
 	if err := writeStranded(ctx, db, reporter, row, had, ev, now); err != nil {
 		return "", err
 	}
 	return strandedDetail(ev), nil
+}
+
+// MarkStrandedForDelete records, on every open vm_disk_stranded record of
+// vmName, whether the delete about to tombstone it keeps the VM's disks
+// (`lv rm --keep-disks`), and that this delete, of the incarnation the live
+// row names, decided it (DeleteDecided). The caller writes it before the
+// tombstone, so a host that applies the tombstone has it. A record already
+// saying so is not written again.
+func MarkStrandedForDelete(ctx context.Context, db *corrosion.Client, reporter, vmName string, keep bool, now time.Time) error {
+	open, err := StrandedDisksOf(ctx, db, vmName)
+	if err != nil {
+		return err
+	}
+	if len(open) == 0 {
+		return nil
+	}
+	vm, err := corrosion.GetVM(ctx, db, vmName)
+	if err != nil {
+		return err
+	}
+	inc := ""
+	if vm != nil {
+		inc = vm.CreatedAt
+	}
+	for _, o := range open {
+		row, ev, had, err := readStranded(ctx, db, vmName, o.Host)
+		if err != nil {
+			return err
+		}
+		if !had || row.Lifecycle == corrosion.ConditionResolved || len(ev.Disks) == 0 ||
+			(ev.KeptByDelete == keep && ev.DeleteDecided == inc) {
+			continue
+		}
+		ev.KeptByDelete, ev.DeleteDecided = keep, inc
+		if err := writeStranded(ctx, db, reporter, row, true, ev, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // StrandedDisksOf returns the open vm_disk_stranded records of vmName, one
@@ -354,8 +434,7 @@ func (r *Reconciler) tendStrandedDisks(ctx context.Context) {
 		changed := false
 		var kept []StrandedDisk
 		if vm == nil {
-			slog.Info("reconciler: vm_disk_stranded resolved — the VM was deleted; its disk copies here follow the retention for a deleted VM's",
-				"vm", name)
+			kept = r.tendDeletedVMStranded(ctx, name, ev)
 		} else {
 			for _, d := range ev.Disks {
 				keep, set := r.tendStrandedDisk(ctx, vm, d)
@@ -416,8 +495,8 @@ func (r *Reconciler) tendStrandedDisk(ctx context.Context, vm *corrosion.VMRecor
 		// The VM runs here again on the disk at that path.
 		return false, d
 	}
-	fi, err := r.lstatDisk(d.Path)
-	if err != nil {
+	set, outcome := r.setAsideStrandedFile(ctx, vm.Name, d, nil)
+	if outcome != setAsideDone {
 		// Missing is not deleted: a volume not mounted (yet) — its mount
 		// point absent, or present and empty — reads exactly like a file
 		// gone. Nothing confirms a deletion, so the entry is kept and looked
@@ -426,50 +505,97 @@ func (r *Reconciler) tendStrandedDisk(ctx context.Context, vm *corrosion.VMRecor
 		// hold the pass on it.
 		return true, d
 	}
+	slog.Warn("reconciler: set aside the real disk of a VM a failover restarted elsewhere; it is kept while the VM exists",
+		"vm", vm.Name, "disk", d.Disk, "path", d.Path, "set_aside_to", set.Copy, "vm_host", vm.HostName)
+	r.surfaceSetAsideEventOnly(ctx, vm.Name, set)
+	return true, set
+}
+
+// setAsideOutcome is what setAsideStrandedFile did.
+type setAsideOutcome int
+
+const (
+	setAsideDone    setAsideOutcome = iota // renamed to its copy
+	setAsideMissing                        // no file at the path (which may be a volume not mounted yet)
+	setAsideAbsent                         // not a regular file there
+	setAsideBlocked                        // kept for now: in use, or its storage or a record cannot be read
+)
+
+// setAsideStrandedFile renames the file at d.Path, a disk of vmName a
+// failover left on this host, to <path>.superseded-<time>, and returns the
+// entry with its copy. It does not when:
+//   - nothing is there (setAsideMissing), or it is not a regular file
+//     (setAsideAbsent);
+//   - its storage does not answer (setAsideBlocked);
+//   - a domain of vmName is live here, or holds resumable state: the disk is
+//     open, or a resume would need it, and the ownership repair decides that
+//     case, not this. Only a domain shut off with nothing to resume — the
+//     leftover a fenced host comes back with — or none at all;
+//   - a workload on this host still uses the file: a linked clone's base or
+//     another VM's disk at the same path;
+//   - stillMay, when given, answers no: the caller's own last check, read
+//     immediately before the rename.
+func (r *Reconciler) setAsideStrandedFile(ctx context.Context, vmName string, d StrandedDisk, stillMay func() bool) (StrandedDisk, setAsideOutcome) {
+	fi, err := r.lstatDisk(d.Path)
+	if os.IsNotExist(err) {
+		return d, setAsideMissing
+	}
+	if err != nil {
+		return d, setAsideBlocked
+	}
 	if !fi.Mode().IsRegular() {
-		return true, d
+		return d, setAsideAbsent
 	}
-	// Never under a domain that is live here, or holds resumable state: the
-	// disk is open, or a resume would need it, and the ownership repair
-	// decides that case, not this. Only a domain shut off with nothing to
-	// resume — the leftover a fenced host comes back with — or none at all.
-	if r.virt != nil && r.virt.DomainExists(vm.Name) {
-		st, serr := r.virt.DomainStateReason(vm.Name)
-		if serr != nil {
-			return true, d
-		}
-		if !cleanableLeftover(st) {
-			if !unknownShutoff(st) {
-				return true, d
-			}
-			if saved, merr := r.virt.HasManagedSaveImage(vm.Name); merr != nil || saved {
-				return true, d
-			}
-		}
+	if r.virt != nil && !r.domainAbsentOrDeadLeftover(vmName) {
+		return d, setAsideBlocked
 	}
-	// Never a file a workload on this host still uses: a linked clone's base
-	// or another VM's disk at the same path.
 	refs, err := corrosion.DisksReferencingPath(ctx, r.db, d.Path)
 	if err != nil {
-		return true, d
+		return d, setAsideBlocked
 	}
 	for _, ref := range refs {
 		other, gerr := corrosion.GetVM(ctx, r.db, ref.VMName)
 		if gerr != nil || (other != nil && other.HostName == r.hostName) {
-			return true, d
+			return d, setAsideBlocked
 		}
+	}
+	if stillMay != nil && !stillMay() {
+		return d, setAsideBlocked
 	}
 	aside := supersededName(d.Path, r.now())
 	if err := renameSetAside(d.Path, aside); err != nil {
 		slog.Error("reconciler: could not set aside a disk a failover left on this host; it stays at its path",
-			"vm", vm.Name, "path", d.Path, "error", err)
-		return true, d
+			"vm", vmName, "path", d.Path, "error", err)
+		return d, setAsideBlocked
 	}
-	slog.Warn("reconciler: set aside the real disk of a VM a failover restarted elsewhere; it is kept while the VM exists",
-		"vm", vm.Name, "disk", d.Disk, "path", d.Path, "set_aside_to", aside, "vm_host", vm.HostName)
 	d.Copy, d.Since = aside, r.now().UTC().Format(time.RFC3339)
-	r.surfaceSetAsideEventOnly(ctx, vm.Name, d)
-	return true, d
+	return d, setAsideDone
+}
+
+// domainAbsentOrDeadLeftover reports whether no domain of name is defined
+// here, or the one that is is shut off with nothing to resume: shut off for a
+// reason that keeps no state (cleanableLeftover), or for an unknown reason
+// with no managed-save image. Anything else, or a state that cannot be read,
+// answers no. r.virt must be set.
+func (r *Reconciler) domainAbsentOrDeadLeftover(name string) bool {
+	if !r.domainAnswers(name) {
+		return false // libvirt has not answered for it: kept, looked at again next pass
+	}
+	if !r.virt.DomainExists(name) {
+		return true
+	}
+	st, err := r.virt.DomainStateReason(name)
+	if err != nil {
+		return false
+	}
+	if cleanableLeftover(st) {
+		return true
+	}
+	if !unknownShutoff(st) {
+		return false
+	}
+	saved, err := r.virt.HasManagedSaveImage(name)
+	return err == nil && !saved
 }
 
 // surfaceSetAsideEventOnly is surfaceSetAside for a copy whose record the
@@ -524,7 +650,7 @@ func RestoreSupersededDisk(ctx context.Context, db *corrosion.Client, dataDir, h
 		}
 	}
 	if c == nil {
-		return RestoredCopy{}, fmt.Errorf("%w: %s is not a superseded disk copy on %s (lv host superseded-disks lists them)", ErrRestoreRefused, copyPath, hostName)
+		return RestoredCopy{}, fmt.Errorf("%w: %s is not a superseded disk copy on %s (lv host superseded-disks lists them)%s", ErrRestoreRefused, copyPath, hostName, keptHint(copyPath))
 	}
 	if c.VM == "" {
 		return RestoredCopy{}, fmt.Errorf("%w: no VM has a disk at %s any more", ErrRestoreRefused, c.DiskPath)
@@ -862,9 +988,10 @@ func (r *Reconciler) resolveHeld(ctx context.Context, name string) {
 	}
 }
 
-// domainRunningHere reports whether name's domain runs on this host.
+// domainRunningHere reports whether name's domain runs on this host; not
+// when libvirt has not answered for it (domain_gate.go).
 func (r *Reconciler) domainRunningHere(name string) bool {
-	if r.virt == nil || !r.virt.DomainExists(name) {
+	if r.virt == nil || !r.domainAnswers(name) || !r.virt.DomainExists(name) {
 		return false
 	}
 	st, err := r.virt.DomainStateReason(name)

@@ -9,13 +9,14 @@ package firewall
 //
 //	prerouting (-300)  VLAN rule for every NIC, then each guarded NIC's guard.
 //	forward            guest ↔ guest / guest ↔ another port: sender nic_out_*, then receiver nic_in_*.
-//	input              guest → host, or → routed: sender nic_out_*; what passes is marked judged.
+//	input              guest → host, or → routed: VRRP marked, then sender nic_out_*; what passes is marked judged.
 //	output             host or routed → guest: receiver nic_in_*; routed → another port: routed_to_port.
 //
 // Modes (Plan.NICMode): enforce drops; observe replaces every drop with a
-// counter carrying an "lv-wd" comment and drops nothing (WouldDrops reads
-// them); guards-only renders prerouting only, because the rest needs
-// nf_conntrack_bridge.
+// counter carrying an "lv-wd" comment and drops nothing it judges per NIC
+// (WouldDrops reads them; the guards, and the drop of a guest's VRRP to the
+// host, hold in both); guards-only renders prerouting only, because the rest
+// needs nf_conntrack_bridge.
 
 import (
 	"fmt"
@@ -25,8 +26,8 @@ import (
 	"strings"
 )
 
-// Packet marks the bridge table sets for the inet forward chain. Two high bits
-// of skb->mark; a host that routes by fwmark must not use them.
+// Packet marks the bridge table sets for the inet chains. Three high bits of
+// skb->mark; a host that routes by fwmark must not use them.
 const (
 	// judgedMark: a guest's frame passed its NIC's egress rules (bridge
 	// input), so inet forward need not judge it again.
@@ -34,6 +35,14 @@ const (
 	// deferMark: inet forward handed routed traffic toward a guest bridge to
 	// that bridge's output hook to judge.
 	deferMark = 0x20000000
+	// guestVRRPMark: a guest sent this VRRP (IP protocol 112) to the host, or
+	// to be routed (bridge input). The inet input hook drops it
+	// (renderGuestVRRPInput) in every mode that renders the bridge input
+	// chain: no litevirt function takes VRRP from a guest, and a guest's
+	// adverts could take a load balancer's VIP off its holder. Routed VRRP
+	// (keepalived unicast between guests on two networks) never reaches the
+	// input hook, and VRRP between guests on one bridge is bridged.
+	guestVRRPMark = 0x40000000
 )
 
 // WouldDropComment prefixes the comment of every observe-mode counter:
@@ -71,7 +80,7 @@ func renderAddrSet(b *strings.Builder, name, typ string, elems []string) {
 // itself, or a named counter that lets the frame on.
 func verdict(p Plan, dev, side, label string) string {
 	if p.nicMode() == NICModeObserve {
-		return fmt.Sprintf("counter comment %q", fmt.Sprintf("%s %s %s %s", WouldDropComment, dev, side, label))
+		return "counter comment " + quoteComment(fmt.Sprintf("%s %s %s %s", WouldDropComment, dev, side, label))
 	}
 	return "drop"
 }
@@ -107,6 +116,8 @@ func renderNICTable(b *strings.Builder, p Plan, sgs map[string]SecurityGroup, v6
 	renderIfnameSet(b, setVLANOK, vlanOK)
 	if mode != NICModeGuardsOnly {
 		renderNICTableSets(b, p, dhcpSrv, gw4, gw6)
+		renderSynFloodSets(b, p)
+		renderNICLogLimits(b, p, nics)
 	}
 
 	// prerouting: before anything else, conntrack included.
@@ -159,6 +170,7 @@ func renderNICTable(b *strings.Builder, p Plan, sgs map[string]SecurityGroup, v6
 	fmt.Fprintf(b, "        iifname != @%s ip saddr @%s ip daddr . tcp dport @%s accept\n", setNICDevs, setLBSrc4, setLB4)
 	fmt.Fprintf(b, "        ct state invalid %s\n", verdict(p, "-", "state", "invalid"))
 	dispatchNICs(b, nics, "iifname", "nic_out_")
+	renderSynFloodLines(b, p)
 	dispatchNICs(b, nics, "oifname", "nic_in_")
 	fmt.Fprintf(b, "    }\n\n")
 
@@ -166,6 +178,9 @@ func renderNICTable(b *strings.Builder, p Plan, sgs map[string]SecurityGroup, v6
 	fmt.Fprintf(b, "    chain input {\n")
 	fmt.Fprintf(b, "        type filter hook input priority filter; policy accept;\n")
 	fmt.Fprintf(b, "        iifname != @%s accept\n", setNICDevs)
+	// A guest's VRRP, marked here and dropped at the inet input hook if it
+	// is for the host itself (guestVRRPMark).
+	fmt.Fprintf(b, "        meta l4proto 112 meta mark set meta mark | %#x\n", guestVRRPMark)
 	bridgeCommon(b, p)
 	// litevirt's own services on the guest networks: dnsmasq's DHCP and DNS
 	// at the network's gateway address, and nowhere else.
@@ -199,6 +214,7 @@ func renderNICTable(b *strings.Builder, p Plan, sgs map[string]SecurityGroup, v6
 	// The built-in load balancer's haproxy, on this host, reaching a backend.
 	fmt.Fprintf(b, "        ip saddr @%s ip daddr . tcp dport @%s accept\n", setLBSrc4, setLB4)
 	fmt.Fprintf(b, "        ct state invalid %s\n", verdict(p, "-", "state", "invalid"))
+	renderSynFloodLines(b, p)
 	dispatchNICs(b, nics, "oifname", "nic_in_")
 	fmt.Fprintf(b, "    }\n\n")
 
@@ -212,6 +228,9 @@ func renderNICTable(b *strings.Builder, p Plan, sgs map[string]SecurityGroup, v6
 			for _, r := range rules {
 				if r.Action == Reject {
 					r.Action = Drop
+				}
+				for _, line := range renderRoutedLog(r, v6Sets, p.LogPolicy) {
+					fmt.Fprintf(b, "        %s\n", line)
 				}
 				for _, line := range renderRules(r, "", v6Sets) {
 					fmt.Fprintf(b, "        %s\n", line)
@@ -372,6 +391,13 @@ func renderNICChain(b *strings.Builder, p Plan, n NICBinding, dir Direction, sgs
 			if r.Direction != dir {
 				continue
 			}
+			if r.Log && p.LogPolicy.Available {
+				// Its own line, ahead of the verdict (spec §3.4).
+				stmt := logStmt(p.LogPolicy, nicLogLimit(n.NICDev, side), logPrefix(n.NICDev, side, logRuleID(r.ID), logVerdict(r.Action, observe)))
+				for _, line := range renderLogLines(r, n.NICDev, v6Sets, stmt) {
+					fmt.Fprintf(b, "        %s\n", line)
+				}
+			}
 			switch {
 			case r.Action == Accept || r.Action == "":
 				if dir == Egress {
@@ -408,10 +434,151 @@ func renderNICChain(b *strings.Builder, p Plan, n NICBinding, dir Direction, sgs
 		emit("sg:"+truncate(sg.Name, 40), sg.Rules)
 	}
 	emit("nic", n.ExtraRules)
+	if p.LogPolicy.Available && p.LogPolicy.Default {
+		word := "accept"
+		if p.DefaultDeny {
+			word = logVerdict(Drop, observe)
+		}
+		fmt.Fprintf(b, "        %s\n", logStmt(p.LogPolicy, nicLogLimit(n.NICDev, side), logPrefix(n.NICDev, side, "default", word)))
+	}
 	if p.DefaultDeny {
 		fmt.Fprintf(b, "        %s\n", verdict(p, n.NICDev, side, "default"))
 	}
 	fmt.Fprintf(b, "    }\n\n")
+}
+
+// Firewall logging (spec §3.4). DECISION L-1: every log line sends to the
+// daemon's NFLOG group, never to the kernel log. DECISION L-4: every log line
+// of one guest NIC side shares that side's named limit, so a guest can cause
+// at most the budget's records per second per side, whatever it sends; the
+// tiers' routed log lines share lv_lg_routed, one per table. A log line is its
+// own rule ahead of the verdict it logs: a limit that does not match stops
+// its rule, so a verdict on the same line would be skipped.
+const (
+	logLimitRouted = "lv_lg_routed"
+	logSnaplen     = 96
+	// maxLogPrefix is the kernel's NF_LOG_PREFIXLEN less its NUL.
+	maxLogPrefix = 127
+	maxLogRuleID = 32
+)
+
+// budget is the policy's rate and burst, each the default when outside its
+// range: the renderer never writes a limit nft refuses.
+func (lp LogPolicy) budget() (rate, burst int) {
+	rate, burst = lp.Rate, lp.Burst
+	if rate < 1 || rate > MaxLogRate {
+		rate = DefaultLogRate
+	}
+	if burst < 1 || burst > MaxLogBurst {
+		burst = DefaultLogBurst
+	}
+	return rate, burst
+}
+
+func renderLogLimit(b *strings.Builder, name string, lp LogPolicy) {
+	rate, burst := lp.budget()
+	fmt.Fprintf(b, "    limit %s {\n        rate %d/second burst %d packets\n    }\n\n", name, rate, burst)
+}
+
+// renderNICLogLimits declares the bridge table's log budgets when anything
+// in it logs: one per guest NIC and side, and lv_lg_routed for
+// routed_to_port. Two devices whose names sanitise alike share one (as they
+// share their chains): nft refuses a limit declared twice.
+func renderNICLogLimits(b *strings.Builder, p Plan, nics []NICBinding) {
+	if !p.LogPolicy.Available {
+		return
+	}
+	if p.LogPolicy.Default || anyLogged(allRules(p)) {
+		seen := map[string]bool{}
+		for _, n := range nics {
+			for _, side := range []string{"in", "out"} {
+				if name := nicLogLimit(n.NICDev, side); !seen[name] {
+					seen[name] = true
+					renderLogLimit(b, name, p.LogPolicy)
+				}
+			}
+		}
+	}
+	if p.nicMode() == NICModeEnforce && (anyLogged(p.ClusterRules) || anyLogged(p.HostRules)) {
+		renderLogLimit(b, logLimitRouted, p.LogPolicy)
+	}
+}
+
+func anyLogged(rules []Rule) bool {
+	for _, r := range rules {
+		if r.Log {
+			return true
+		}
+	}
+	return false
+}
+
+// nicLogLimit names a guest NIC side's log budget: lv_lg_<i|o>_<dev>.
+func nicLogLimit(dev, side string) string {
+	return "lv_lg_" + side[:1] + "_" + sanitiseChain(dev)
+}
+
+// logStmt is one log line's statement.
+func logStmt(lp LogPolicy, limit, prefix string) string {
+	return fmt.Sprintf("limit name %q log group %d snaplen %d prefix %q", limit, lp.Group, logSnaplen, prefix)
+}
+
+// logPrefix is `lv-log <dev> <in|out|-> <rule-id|default> <verdict>`. Every
+// piece is a safe interface name, `-`, a logRuleID or a fixed word, so it
+// needs no escaping and is at most 7+15+1+3+1+32+1+10 bytes; the cut is a
+// backstop.
+func logPrefix(dev, side, id, verdict string) string {
+	p := "lv-log " + dev + " " + side + " " + id + " " + verdict
+	if len(p) > maxLogPrefix {
+		p = p[:maxLogPrefix]
+	}
+	return p
+}
+
+// logRuleID is how a rule's id prints in its log prefix: as stored when it is
+// [0-9a-z-]{1,32}, else `rule` (and `default`, which names the default
+// verdict, likewise).
+func logRuleID(id string) string {
+	if id == "" || len(id) > maxLogRuleID || id == "default" {
+		return "rule"
+	}
+	for _, c := range id {
+		if !(c == '-' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z')) {
+			return "rule"
+		}
+	}
+	return id
+}
+
+// logVerdict is the verdict a log line names for a rule's action: reject is
+// a drop wherever it renders as one or not, and in observe mode a drop is a
+// would-drop.
+func logVerdict(a Action, observe bool) string {
+	switch {
+	case a == Accept || a == "":
+		return "accept"
+	case observe:
+		return "would-drop"
+	}
+	return "drop"
+}
+
+// renderLogLines renders the log lines of rule r: its match (one line per
+// family where the rule splits) with stmt in place of the verdict, and no
+// comment.
+func renderLogLines(r Rule, nicDev string, v6Sets map[string]bool, stmt string) []string {
+	r.Action, r.Comment = Action(stmt), ""
+	return renderRules(r, nicDev, v6Sets)
+}
+
+// renderRoutedLog renders a tier rule's log lines, as dev `-` under
+// lv_lg_routed, or none.
+func renderRoutedLog(r Rule, v6Sets map[string]bool, lp LogPolicy) []string {
+	if !r.Log || !lp.Available {
+		return nil
+	}
+	stmt := logStmt(lp, logLimitRouted, logPrefix("-", "-", logRuleID(r.ID), logVerdict(r.Action, false)))
+	return renderLogLines(r, "", v6Sets, stmt)
 }
 
 func truncate(s string, n int) string {

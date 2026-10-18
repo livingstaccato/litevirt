@@ -20,6 +20,10 @@ import (
 // password, how to reach it without one (docs/ui.md "Console passwords").
 func printVNCInfo(w io.Writer, vmName string, vm *pb.VM) {
 	fmt.Fprintf(w, "VNC: %s (bound to that host's 127.0.0.1)\n", vm.VncAddress)
+	if vm.VncUnknown != "" {
+		fmt.Fprintf(w, "Password: %s. `lv vnc %s --listen 127.0.0.1:5900` reaches the console either way.\n", vm.VncUnknown, vmName)
+		return
+	}
 	if vm.VncPasswordRequired {
 		fmt.Fprintf(w, "Password: required, and presented only by litevirt. Open the console in the web UI, or run\n"+
 			"  lv vnc %s --listen 127.0.0.1:5900\n"+

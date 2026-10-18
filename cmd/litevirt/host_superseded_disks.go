@@ -66,7 +66,13 @@ upgrading if it booted into a pending upgrade; one that
 answered again without restarting stays fenced or offline until
 ` + "`lv host undrain <host>`" + `), stop the VM, move it there with
 ` + "`lv migrate <vm> <host> --cold`" + `, restore the copy and start it. The disk
-the copy replaces is not deleted: it is set aside and retained in turn.`,
+the copy replaces is not deleted: it is set aside and retained in turn.
+
+It also lists, read-only and marked kept, each disk a deleted VM was kept
+with (` + "`lv rm --keep-disks`" + `, or a disk recorded delete_with_vm=false)
+that a create of the same name moved to <disk path>.kept-<time>. The host never
+removes one, and --purge, --remove and --restore never take one: only an
+operator removes it, by hand.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if olderThan < 0 {
@@ -151,6 +157,12 @@ func printSupersededDisks(out io.Writer, resp *pb.SupersededDisksResponse, purge
 		}
 		st := "kept"
 		switch {
+		case d.Kept && d.Seed:
+			st = "kept: a cloud-init seed a deleted VM was kept with, which can hold user-data; never purged, removed or restored here (only an operator removes it, by hand)"
+		case d.Kept && d.UefiVars:
+			st = "kept: the UEFI vars of a deleted VM's superseded definition this host undefined; never purged, removed or restored here (only an operator removes it, by hand)"
+		case d.Kept:
+			st = "kept: a disk a deleted VM was kept with; never purged, removed or restored here (only an operator removes it, by hand)"
 		case d.Removed:
 			st = "removed"
 			removed++
@@ -163,6 +175,9 @@ func printSupersededDisks(out io.Writer, resp *pb.SupersededDisksResponse, purge
 			if at, err := time.Parse(time.RFC3339, d.SetAsideAt); err == nil {
 				st = "removed after " + at.Add(time.Duration(resp.RetentionDays)*24*time.Hour).Format(time.RFC3339)
 			}
+		}
+		if d.Kept && d.EarlierVm {
+			st += fmt.Sprintf("; it is an earlier VM %s's, not the VM %s that exists now", d.VmName, d.VmName)
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", d.Path, vm, age, d.SizeBytes, st)
 	}

@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cli"
@@ -114,4 +116,9 @@ func TestCTInspect_BadOutputFormat(t *testing.T) {
 	if _, err := runCTInspect(t, &ctInspectMock{}, "ct", "inspect", "blct", "-o", "yaml"); err == nil {
 		t.Fatal("-o yaml accepted")
 	}
+}
+
+// ListFirewallTags: a daemon that predates firewall tags.
+func (m *ctInspectMock) ListFirewallTags(context.Context, *pb.ListFirewallTagsRequest, ...grpc.CallOption) (*pb.ListFirewallTagsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "ListFirewallTags is not implemented")
 }

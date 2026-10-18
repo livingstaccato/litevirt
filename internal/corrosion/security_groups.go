@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 )
 
 // SecurityGroup represents a security group.
@@ -118,6 +119,11 @@ func InsertSGRule(ctx context.Context, c *Client, rule SGRule) error {
 // reason. g, gLog and gTag must be their grants (FirewallRowFeatures). A
 // malformed one is never written.
 func InsertSGRuleWithGrant(ctx context.Context, c *Client, g, gLog, gTag capabilities.FeatureGrant, rule SGRule) error {
+	// proto, port and cidr are written into every host's nft script as text.
+	rule.Proto, rule.PortRange, rule.Action = rulefield.NormaliseRule(rule.Proto, rule.PortRange, rule.Action)
+	if err := rulefield.StoredRule(rule.Direction, rule.Proto, rule.PortRange, rule.CIDR, rule.Action, ""); err != nil {
+		return err
+	}
 	need, err := firewallRowFeatures(rule.CIDR, rule.Proto, rule.Action)
 	if err != nil {
 		return err
@@ -186,6 +192,31 @@ func ListSGRules(ctx context.Context, c *Client, sgID string) ([]SGRule, error) 
 		return nil, err
 	}
 
+	rules := make([]SGRule, len(rows))
+	for i, r := range rows {
+		rules[i] = SGRule{
+			ID:        r.String("id"),
+			SGID:      r.String("sg_id"),
+			Direction: r.String("direction"),
+			Proto:     r.String("proto"),
+			PortRange: r.String("port_range"),
+			CIDR:      r.String("cidr"),
+			Action:    r.String("action"),
+			Priority:  r.Int("priority"),
+		}
+	}
+	return rules, nil
+}
+
+// ListAllSGRules returns every live security-group rule, whatever group (or
+// legacy name) its sg_id names.
+func ListAllSGRules(ctx context.Context, c *Client) ([]SGRule, error) {
+	rows, err := c.Query(ctx,
+		`SELECT id, sg_id, direction, proto, port_range, cidr, action, priority
+		 FROM sg_rules WHERE deleted_at IS NULL ORDER BY sg_id, priority, id`)
+	if err != nil {
+		return nil, err
+	}
 	rules := make([]SGRule, len(rows))
 	for i, r := range rows {
 		rules[i] = SGRule{

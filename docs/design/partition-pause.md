@@ -534,15 +534,87 @@ All of this is in the failover coordinator (`internal/failover`).
      itself when it is a voter, must not be a majority of the adopted voter
      set (the host's region's under region scope) nor of any newer
      generation: a host that has come back is refused. The rule needs an
-     explicit voter set. A derived one, or a newer generation that is a
+     explicit voter set, and on it the deadline is quiet only when, besides
+     no latest verdict being an answer, no observer's failing run began after
+     the wait started and this node has not probed the host healthy since;
+     otherwise the host's own condition, dated to this outage, decides as
+     for an answer (a refusal on these alone is not reported as a bridge).
+     Neither of those two holds the deadline when this node can prove that
+     the host has not held a majority since the fence by its own count:
+     over every voter set the host may be counting over, `n−q+1` voters
+     other than the host have failing runs that span the fence, so the
+     answer was a bridge's, and the deadline is quiet. The proof rests on
+     the host's replica having held every change of a member's voting
+     state decided more than 30 s before the outage began; a change stamped
+     within those 30 s, or since, or that cannot be dated, is one the host
+     may lack. The configuration must then be pinned, or the rule stands:
+     at most one generation, and no reset, decided within that window (none
+     at all on a derived set). A generation is dated by the later of its
+     proposal's stamp and its row's, since a value another proposer
+     completes keeps its proposal's stamp. The row's stamp is that of
+     whichever writer's row won the merge (the greater certificate wins),
+     which can be earlier than this node first held it: it shows that some
+     node wrote the generation then, not that the host held it, which only
+     the host's report below shows. The sets counted are the adopted
+     generation, each newer one, and the one before the adopted one, all
+     from one read of the voter configurations; when this node has adopted
+     a generation since the cycle read its voter set, the deadline holds for
+     that cycle and is counted again on the next. The
+     host must have reported, in a Ping (`voter_generation`) this node
+     received before the outage began, that it had adopted the oldest of
+     these or a later one that this node holds; with no such report (an
+     older build, a host whose adoption is stuck, a restart of this node,
+     which keeps the reports in memory) the rule stands. The proof also
+     rests on this node's replica holding every generation the host may be
+     counting over. The rule stands when this node does not hold every
+     generation from the oldest counted one to the newest, and when a voter
+     of a counted set has reported, in any Ping this node received, a
+     generation newer than the newest this node holds. A report of 0 after
+     an earlier one (a restart of the host before its first adoption pass,
+     or a host re-provisioned under the same name) forgets the earlier
+     ones. A report's receipt is dated on this node's wall clock, as the
+     outage's start is: a backward step of this node's own clock during the
+     outage can date a report received since as received before, the same
+     residual as a clock that steps within the hour a skew is kept. A stamp is the
+     writer's clock, moved later by the largest skew of any host, the fenced
+     one and deleted ones included. A run spans only when it began
+     `fenceSkewMargin` plus its observer's clock skew from this node before
+     the fence. A skew is this node's own measurement, kept in memory for an
+     hour (a clock that steps within that hour is not seen), or any
+     `clock_skew` row naming the peer, the largest of these; a row paired
+     with the fenced host counts for the fenced host alone. One measured
+     nowhere is taken as 30 s. This node's own run is left out once it has
+     probed the host since the wait began.
+     A derived one, or a newer generation that is a
      reset, is read from each node's own replica of host state, and then
      any observer that has seen the host answer since the fence refuses
-     (`fenceStillStands`). So does any observer once the pause can no longer
+     (`fenceStillStands`), except that a failing run begun after the fence
+     does not refuse under the same proof, counted over the derived set as
+     the host's replica held it when the outage began: the host itself,
+     though it is fenced here; a host whose voting state changed since, or
+     within 30 s before, or cannot be dated, or reads `unknown`, in the set
+     but not counted as spanning; and the explicit generation a reset
+     replaced. A read error keeps the rule. So does
+     any observer once the pause can no longer
      be relied on (§4.3: the host has since reported
      `partition_pause_failed`), since a host that answered was never
      stopped. When one of these deadlines passes quiet while this
      coordinator already keeps the host to a list, it keeps to the list as
      above.
+
+     The proof fails open, and the deadline can go ahead while the host
+     holds a majority, in these cases:
+     - a peer's clock steps within the hour this node keeps its measured
+       skew;
+     - a peer measured nowhere is skewed by more than the 30 s assumed for
+       it;
+     - this node's wall clock steps back during the outage;
+     - on the derived set, the host's replica lacks a change of a member's
+       voting state decided more than 30 s before the outage began;
+     - a host's row was purged outright, so its skew is left out of the
+       largest skew a stamp is moved by;
+     - this node's replica lacks a generation newer than the newest it holds,
+       and no voter of a counted set has reported it.
 
    If the host is no longer `fenced` or `offline`, the wait is dropped and
    nothing is recovered. The host came back, it will resume itself (§3.5), and
@@ -553,7 +625,24 @@ All of this is in the failover coordinator (`internal/failover`).
    Meanwhile only an operator confirmation or a newer fence reaches the host,
    and either ends the wait (a fence that relies on the pause starts its own).
    A claim retry does not run while a wait is pending or refused, and one owed
-   to an earlier outage or an older fence is dropped with it.
+   to an earlier outage or an older fence is dropped with it. Nor does one run
+   for a host that is not `fenced` or `offline` (it is held until the host is
+   again; the hold is the stall reason, and the stall alert names it while a
+   quorum still fails the host), or whose recovery's moment no longer stands:
+   an observer has seen the host answer since, an observer's failing run began
+   after it, or this node has probed the host healthy since. A pending
+   partition-pause wait an owed retry is waiting out is judged the same way,
+   less the latest verdicts (a bridge's answer is the deadline's to weigh):
+   one whose start no observer's unbroken run spans, or that an observer's
+   failing run began after, is started afresh. A run from an older build
+   carries no start and is never read as begun after the moment, so during a
+   rolling upgrade only the newer observers' runs, and this node's own probes,
+   show such an answer. A host whose pause is relied on
+   then waits out a fresh deadline, one partition-pause wait per retry, and
+   under a bridge that sees the host answer each retry waits again. Any other
+   host has its retry dropped and goes down the successor's path (step 4): a
+   verified fence is fenced again, and an unverified one is declined, so its
+   workloads wait for `lv host undrain` or `lv host fence-confirm`.
    The stall alert names the refusal and its reason.
 4. A successor coordinator, or a restarted one, has no `pauseWait` entry.
    Nor has one that takes the lease back after a gap (it stopped holding it,
@@ -564,7 +653,13 @@ All of this is in the failover coordinator (`internal/failover`).
    the record. That is later than the original `t_d`, so it is safe. It
    resumes while an observer has watched the host stay down since the fence,
    whoever has seen the paused host answer; the deadline then applies step
-   3.
+   3. That holds only while the host's pause may still be relied on (§4.3).
+   Once it may not, the record is an unverified fence: it is resumed only
+   while it still stands, and is otherwise declined.
+   A restarted coordinator has no probe answer from the host yet, so it
+   does not rely on the pause, and its own observer run began after the
+   fence: it declines the record, and logs the hint to run
+   `lv host undrain <host>`, which lets it fence the host afresh.
 
 The recovery itself (claim, proof, destination start) is unchanged. It merely
 starts after the deadline. A verified fence (IPMI) or an operator confirmation
@@ -908,7 +1003,7 @@ container (`split_brain`), so a certified relocation can only lead to a stop.
 | F7 | A fleet-wide blip | Everything pauses, then everything resumes. `partition_paused` is raised on every host and resolved. After the heal, every coordinator holds failure rows its peers wrote during the blip, about every host, and replication delivers them before the observers' first successful probes overwrite them. A coordinator therefore decides no new fence while the quorum its fence rests on is lost, or within `QuorumRegainGrace` (`StallGrace`, 10 s) of that quorum's own No→Yes transition (`error_class=quorum_regain`), as after a stall of its own. The scope is the quorum the decision rests on — the cluster-wide one, or under region scope the target's region's — never the cluster-wide quorum for a regional decision: a region majority cut off from the rest of the cluster lacks the cluster-wide quorum for as long as the cut lasts, and is exactly the side that must fence. "Lost" is read fresh inside the grace check, never taken from the last recorded reading: a remote region's quorum is read only by a fence decision about one of its hosts, which the grace runs ahead of, so a recorded No would otherwise defer that region's fences for as long as nothing re-read it. A fresh Yes is the No→Yes transition and opens the grace from that moment. | Workloads lose execution time for the blip plus about one probe cycle. Accepted by the user. A fence decided anyway (a grace too short for a slow re-probe) waits out the pause and is then refused by `selfPauseStillStands`, and the host stays paused until `recoverHosts` reactivates it (F6). |
 | F8 | A resume answer is missing | The workload stays paused and is retried every tick. | An unreachable minority of voters delays the resume. It never makes the pauser resume wrongly. |
 | F10 | One host's flag is turned off (a restart) while its peers keep theirs on | The first health probe that reaches the restarted daemon records that it does not pause, and from then on no coordinator relies on its pause. It is fenced `assumed` and recovered as before partition pause (§4.3). | If the partition begins before any probe reaches the new run, the coordinator still holds the old run's answer, relies, waits `W` and recovers while the host keeps running. This is F3 with the flag off: the window is at most one probe cycle after the new daemon starts serving. Layer 3 settles it on return. |
-| F9 | Recovery claims off | Resume relies on the fence-state check alone (§3.5). | Without claims, two coordinators can still each recover (recovery-claims.md §1). Layer 3 needs a certificate, so it does nothing without claims. |
+| F9 | Recovery claims off | Resume relies on the fence-state check alone (§3.5). | Without claims, two coordinators can still each recover (recovery-claims.md §1). Layer 3 needs a certificate, so it does nothing without claims. A copy the host paused stays paused after the heal, and settle declines it with `reason_class=proof_uncertified` (the recovery's proof completed with no certificate, as on a derived voter set) until an operator stops it. |
 
 ## 8. Testing
 

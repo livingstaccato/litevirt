@@ -188,23 +188,23 @@ func retireReadmittedCredentials(ctx context.Context, tx *sql.Tx, stmts []Statem
 // retireFenceCredential stamps the tombstone with updatedAt, the admission's
 // own updated_at (which its origin took from NowTS), never a clock of this
 // node's: every node must derive the same row from the same statement.
+//
+// It retires every row that comes before the tombstone in the credential
+// order (credentials_revive_guard.go): a row set after an EARLIER retirement,
+// or after none, is retired however new its clock — that is the stale copy
+// the order exists to stop. Only a row an operator set after this retirement
+// (or a later one) stands.
 func retireFenceCredential(ctx context.Context, tx *sql.Tx, host, updatedAt string) error {
-	var cur string
-	var deleted sql.NullString
-	err := tx.QueryRowContext(ctx,
-		`SELECT updated_at, deleted_at FROM host_fence_credentials WHERE host_name = ?`, host).Scan(&cur, &deleted)
-	switch {
-	case err == sql.ErrNoRows:
-		return nil
-	case err != nil:
+	local, err := readLocalCredential(ctx, tx, host)
+	if err != nil || !local.exists {
 		return err
-	case deleted.Valid && deleted.String != "":
-		return nil // already retired
-	case lwwOrder(cur, updatedAt) >= 0:
-		return nil // set after the admission: the new machine's
+	}
+	if local.order().cmp(credentialOrder{retirement: updatedAt, updatedAt: updatedAt}) >= 0 {
+		return nil // already retired at it, or set after it
 	}
 	_, err = tx.ExecContext(ctx,
-		`UPDATE host_fence_credentials SET ipmi_pass = '', deleted_at = ?, updated_at = ? WHERE host_name = ?`,
+		`UPDATE host_fence_credentials SET ipmi_pass = '', deleted_at = ?, updated_at = ?, after_retirement = ''
+		 WHERE host_name = ?`,
 		updatedAt, updatedAt, host)
 	return err
 }

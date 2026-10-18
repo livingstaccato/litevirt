@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/storage"
 )
@@ -19,7 +20,8 @@ import (
 // A failover start sets an old copy of a host-local disk aside as
 // <path>.superseded-<time> (superseded_disk.go) rather than deleting it, and
 // a host that comes back after a failover moved its VM elsewhere sets the
-// VM's real disk aside the same way (stranded_disk.go). Each copy is an
+// VM's real disk aside the same way (stranded_disk.go), also once the VM is
+// deleted (deleted_vm_residue.go). Each copy is an
 // independent line of the VM's data — every failover rebuilds the disk from
 // its image — so any one of them can be the only copy of what the VM held
 // before a failover.
@@ -230,6 +232,77 @@ func listSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir stri
 	return out, noAnswer, nil
 }
 
+// KeptCopy is a disk an earlier VM of a name was deleted with and its delete
+// kept, which a create of the name moved off its path (<path>.kept-<time>,
+// SetAsideBeforeCreate), or that VM's cloud-init seed, moved the same way
+// (Seed). Nothing on the host removes it, and no purge, removal or restore
+// of set-aside copies takes it.
+type KeptCopy struct {
+	Path      string    // the file
+	DiskPath  string    // the path it was moved from
+	MovedAt   time.Time // when
+	SizeBytes int64
+	Seed      bool // a cloud-init seed (it can hold user-data), not a disk
+}
+
+// ListKeptDisks lists the .kept- files on this host, where set-aside copies
+// can be (supersededDirs), the .kept- seeds in <data_dir>/cloudinit, and the
+// seeds of deleted VMs kept where they were (keptSeedsInPlace), oldest
+// first. Storage that does not answer fails the listing, as it fails
+// ListSupersededDisks.
+func ListKeptDisks(ctx context.Context, db *corrosion.Client, dataDir string) ([]KeptCopy, error) {
+	dirs, err := supersededDirs(ctx, db, dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("list disk directories: %w", err)
+	}
+	seedDir := filepath.Join(dataDir, "cloudinit")
+	dirs = append(dirs, seedDir)
+	glob := supersededGlob
+	var out []KeptCopy
+	for _, dir := range dirs {
+		pattern := filepath.Join(dir, "*"+keptInfix+"*")
+		matches, err := storage.Bounded("list the kept disks in", dir, func() ([]string, error) { return glob(pattern) })
+		if err != nil {
+			return nil, fmt.Errorf("list kept disks: %w", err)
+		}
+		for _, p := range matches {
+			i := strings.LastIndex(p, keptInfix)
+			at, perr := time.Parse(supersededTimeLayout, p[i+len(keptInfix):])
+			if i <= 0 || perr != nil {
+				continue
+			}
+			fi, err := lstatSetAside(p)
+			if storage.IsFSNoAnswer(err) {
+				return nil, fmt.Errorf("list kept disks: %w", err)
+			}
+			if err != nil || !fi.Mode().IsRegular() {
+				continue
+			}
+			out = append(out, KeptCopy{Path: p, DiskPath: p[:i], MovedAt: at, SizeBytes: fi.Size(), Seed: dir == seedDir})
+		}
+	}
+	inPlace, err := keptSeedsInPlace(ctx, db, seedDir)
+	if err != nil {
+		return nil, fmt.Errorf("list kept seeds: %w", err)
+	}
+	out = append(out, inPlace...)
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].MovedAt.Equal(out[j].MovedAt) {
+			return out[i].MovedAt.Before(out[j].MovedAt)
+		}
+		return out[i].Path < out[j].Path
+	})
+	return out, nil
+}
+
+// keptHint is what a refusal adds for a .kept- file named as a copy.
+func keptHint(p string) string {
+	if !strings.Contains(filepath.Base(p), keptInfix) {
+		return ""
+	}
+	return "; it is a disk a deleted VM was kept with, which only an operator removes, by hand"
+}
+
 // PurgeSupersededDisks removes the set-aside copies on this host that are
 // older than olderThan at now and neither retained nor held, and returns
 // them. olderThan 0 removes every such copy. It is both the hourly sweep and
@@ -295,7 +368,7 @@ func RemoveSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir st
 	for _, p := range paths {
 		c, ok := byPath[filepath.Clean(p)]
 		if !ok {
-			return removed, fmt.Errorf("%s is not a superseded disk copy on this host (lv host superseded-disks lists them)", p)
+			return removed, fmt.Errorf("%s is not a superseded disk copy on this host (lv host superseded-disks lists them)%s", p, keptHint(p))
 		}
 		if c.Held != "" {
 			return removed, fmt.Errorf("%s is held (%s): a failed or unfinished start may need it", p, c.Held)
@@ -309,4 +382,59 @@ func RemoveSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir st
 		removed = append(removed, c)
 	}
 	return removed, nil
+}
+
+// keptSeedsInPlace lists the seeds in seedDir (<data_dir>/cloudinit/<vm>.iso)
+// of VMs that no longer exist: no live row of the name here, and a tombstone
+// of it. A seed stamped for another VM of the name is not the deleted VM's
+// and is left out; an unstamped one (written before seeds were stamped), one
+// whose stamp is empty or cannot be read, and one stamped for the deleted
+// incarnation are listed. Such a seed is one a
+// delete kept (`lv rm --keep-disks`, or a disk left at its path on a
+// failover's old host), or one an earlier release left; it can hold
+// user-data, and nothing on the host removes it. MovedAt is its mtime.
+func keptSeedsInPlace(ctx context.Context, db *corrosion.Client, seedDir string) ([]KeptCopy, error) {
+	matches, err := storage.Bounded("list the seeds in", seedDir, func() ([]string, error) {
+		return supersededGlob(filepath.Join(seedDir, "*.iso"))
+	})
+	if err != nil {
+		return nil, err
+	}
+	var out []KeptCopy
+	for _, iso := range matches {
+		name := strings.TrimSuffix(filepath.Base(iso), ".iso")
+		if name == "" || strings.HasPrefix(name, ".") {
+			continue
+		}
+		fi, err := lstatSetAside(iso)
+		if storage.IsFSNoAnswer(err) {
+			return nil, err
+		}
+		if err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		live, err := corrosion.GetVM(ctx, db, name)
+		if err != nil {
+			return nil, err
+		}
+		if live != nil {
+			continue
+		}
+		createdAt, spec, err := corrosion.GetTombstonedVM(ctx, db, name)
+		if err != nil {
+			return nil, err
+		}
+		if createdAt == "" {
+			continue
+		}
+		// Left out only when the stamp names another VM: an empty or
+		// unreadable stamp (a power cut while it was written) is an owner
+		// not known, and the seed stays listed (lab 2, abort proof).
+		stamp, stamped, err := cloudinit.SeedOwner(iso)
+		if err == nil && stamped && stamp != "" && stamp != cloudinit.SpecUUID(spec) {
+			continue
+		}
+		out = append(out, KeptCopy{Path: iso, DiskPath: iso, MovedAt: fi.ModTime(), SizeBytes: fi.Size(), Seed: true})
+	}
+	return out, nil
 }

@@ -34,10 +34,14 @@ package firewall
 import (
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"net"
 	"net/netip"
 	"sort"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/compose"
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 )
 
 // TableName is the single nftables table litevirt owns. Every chain we
@@ -65,7 +69,7 @@ const NICTableName = "litevirt-nic"
 
 // ipv6SetSuffix names the ipv6_addr companion of a named ip set that holds
 // IPv6 elements: nft sets are typed, so one name cannot hold both families.
-const ipv6SetSuffix = "_v6"
+const ipv6SetSuffix = rulefield.IPv6SetSuffix
 
 // Direction selects which side of a NIC a rule applies to. The
 // semantics match Proxmox / AWS / GCP / OpenStack:
@@ -117,6 +121,13 @@ type Rule struct {
 	CIDR      string // "10.0.0.0/24" | "" (any) | "@<ipset-name>"
 	Action    Action
 	Comment   string // human-readable; emitted as `# …` on the rule line
+
+	// ID is the stored row's id. It names the rule in its log prefix.
+	ID string
+	// Log logs each packet the rule matches to the daemon (NFLOG), on a line
+	// of its own ahead of the rule's verdict (spec §3.4). It renders only
+	// where Plan.LogPolicy is Available.
+	Log bool
 }
 
 // SecurityGroup is a named set of Rules. NICs reference SGs by name;
@@ -272,12 +283,21 @@ type Plan struct {
 	IPSets         []IPSet
 	NICs           []NICBinding
 
+	// TagGroups is what the loader could not render as the tag groups ask.
+	TagGroups TagGroupReport
+
 	// NAT (postrouting masquerade + SNAT) and HostIsolation (input drops) are
 	// per-host infra rules folded in from the old out-of-band paths. They render
 	// into their own hook chains in the same table, so the atomic replace keeps
 	// them in lockstep with the filter rules.
 	NAT           []NATRule
 	HostIsolation []IsolationChain
+
+	// IsolatedBridges are the host bridges of the live `isolated` networks.
+	// Forwarded traffic between one and any other device is dropped
+	// (renderIsolatedForward); with or without any listed, every device in
+	// compose.IsolatedBridgeGroup is held to the host the same way.
+	IsolatedBridges []string
 
 	// NICMode is how per-NIC rules are applied: NICModeEnforce,
 	// NICModeObserve (count what would be dropped, drop nothing) or
@@ -300,6 +320,19 @@ type Plan struct {
 	// BlockedTrunks are the trunk VLANs the loader left out because the NIC's
 	// network does not allow them (not rendered; reported as a condition).
 	BlockedTrunks []BlockedTrunk
+
+	// LogPolicy is how the host logs: whether it can, to which NFLOG group,
+	// whether the default verdict is logged, and the per-NIC budget.
+	LogPolicy LogPolicy
+
+	// InvalidRows are the stored rows the loader did not render as written
+	// because they fail the rule grammar (not rendered; reported as a
+	// condition). See quarantineRule.
+	InvalidRows []InvalidRow
+
+	// SynFlood limits new TCP connections toward guest NICs per (NIC,
+	// source address) in the per-NIC table (synflood.go).
+	SynFlood SynFlood
 }
 
 // BlockedTrunk is a trunk NIC's VLANs its network does not allow.
@@ -315,6 +348,32 @@ type LBBackend struct {
 	Port  int
 	Proto string // "tcp" (default) or "udp"
 }
+
+// LogPolicy is a host's firewall logging (spec §3.4). The zero value renders
+// no log line at all.
+type LogPolicy struct {
+	// Available says the host renders log lines: its kernel loads a named
+	// limit and `log group`, and the daemon listens. When false nothing is
+	// logged and no limit is declared, whatever the rules and Default say.
+	Available bool
+	// Group is the NFLOG group every log line sends to (firewall.log_group).
+	Group uint16
+	// Default logs each NIC side's default verdict (DECISION L-7: off until
+	// an operator turns the policy on).
+	Default bool
+	// Rate and Burst are the per-NIC-side budget, records per second and
+	// burst. A value outside 1..MaxLogRate (1..MaxLogBurst) renders the
+	// default.
+	Rate, Burst int
+}
+
+// The per-NIC-side log budget (DECISION L-4).
+const (
+	DefaultLogRate  = 5
+	DefaultLogBurst = 10
+	MaxLogRate      = 10000
+	MaxLogBurst     = 10000
+)
 
 // Per-NIC enforcement modes (Plan.NICMode).
 const (
@@ -379,6 +438,9 @@ func RenderParts(p Plan, nicActive bool) (inet, nic string, err error) {
 	// snapshots the length at call time. Always close before returning.
 	fmt.Fprintf(&b, "table inet %s {\n", TableName)
 	renderIPSets(&b, p.IPSets)
+	if p.LogPolicy.Available && (anyLogged(p.ClusterRules) || anyLogged(p.HostRules)) {
+		renderLogLimit(&b, logLimitRouted, p.LogPolicy)
+	}
 
 	defaultPolicy := "accept"
 	if p.DefaultDeny {
@@ -416,14 +478,18 @@ func RenderParts(p Plan, nicActive bool) (inet, nic string, err error) {
 	fmt.Fprintf(&b, "        jump host_overrides\n")
 	fmt.Fprintf(&b, "    }\n\n")
 
-	renderTierChain(&b, "cluster_default", p.ClusterRules, v6Sets)
-	renderTierChain(&b, "host_overrides", p.HostRules, v6Sets)
+	renderTierChain(&b, "cluster_default", p.ClusterRules, v6Sets, p.LogPolicy)
+	renderTierChain(&b, "host_overrides", p.HostRules, v6Sets, p.LogPolicy)
 
 	// Infra chains on their own hooks. Emitted only when non-empty so a plan with
 	// no NAT / isolation renders byte-identically to before this feature (and so
 	// removing the last rule drops the whole chain on the next atomic replace).
 	renderNAT(&b, p.NAT)
+	if nicTable && nicActive && p.nicMode() != NICModeGuardsOnly {
+		renderGuestVRRPInput(&b)
+	}
 	renderHostIsolation(&b, p.HostIsolation)
+	renderIsolatedForward(&b, p.IsolatedBridges)
 	b.WriteString("}\n")
 	inet = b.String()
 
@@ -499,10 +565,71 @@ func renderNAT(b *strings.Builder, rules []NATRule) {
 	fmt.Fprintf(b, "    }\n\n")
 }
 
+// isolationMarkMask is the part of a connection's ct mark that names the
+// host-isolated bridge the host opened it onto (isolationMark). No other
+// litevirt rule uses ct mark.
+const isolationMarkMask = 0x0fff0000
+
+// isolationMark is bridge's preferred value in isolationMarkMask: a stable
+// 12-bit hash of its name, never zero.
+func isolationMark(bridge string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(bridge))
+	return (h.Sum32()%0xfff + 1) << 16
+}
+
+// isolationMarks gives each bridge its own value in isolationMarkMask: its
+// isolationMark, or, when a bridge earlier by name already holds that value,
+// the next free one (linear probing). A shared value would let a guest on one
+// bridge forge replies into the host's connections onto the other.
+//
+// A bridge's value can move when the set of host-isolated bridges on the host
+// changes: when a bridge whose hash collides with it comes or goes, or when
+// one earlier by name probes into its slot. The host's connections onto it
+// that are open then lose their replies, and its old value may now be another
+// bridge's: until those connections close, that bridge's guests can forge
+// replies into them. Both need a 12-bit collision among one host's
+// host-isolated bridges, and last only as long as the connections.
+func isolationMarks(sortedBridges []string) map[string]uint32 {
+	out := make(map[string]uint32, len(sortedBridges))
+	used := map[uint32]bool{}
+	for _, br := range sortedBridges {
+		if _, done := out[br]; done {
+			continue
+		}
+		v := isolationMark(br) >> 16
+		for i := 0; i < 0xfff && used[v]; i++ {
+			v = v%0xfff + 1
+		}
+		used[v] = true
+		out[br] = v << 16
+	}
+	return out
+}
+
+// renderGuestVRRPInput drops, at the input hook, VRRP the bridge table marked
+// as a guest's (guestVRRPMark): what a guest sent the host itself. Rendered
+// while the bridge table that sets the mark is in force. Its own chain, so it
+// holds whatever the host-isolation input chain accepts (that chain's VRRP
+// exception is for the host's LB peers on the uplink).
+func renderGuestVRRPInput(b *strings.Builder) {
+	fmt.Fprintf(b, "    chain guest_vrrp {\n")
+	fmt.Fprintf(b, "        type filter hook input priority filter; policy accept;\n")
+	fmt.Fprintf(b, "        meta mark & %#x == %#x meta l4proto 112 drop\n", guestVRRPMark, guestVRRPMark)
+	fmt.Fprintf(b, "    }\n\n")
+}
+
 // renderHostIsolation emits a single `input` filter chain that drops guest→host
 // traffic per isolated bridge, punching through VRRP + declared LB VIP ports
 // first. Policy is accept — only the explicit iifname-<bridge> drops bite, so
 // non-isolated bridges and host-local traffic are untouched.
+//
+// Replies to connections the host opened onto the bridge (haproxy to a
+// backend there) pass too: an `output` chain marks every connection the host
+// opens out of the bridge with the bridge's isolationMark, and the input chain
+// accepts only reply-direction packets of a connection carrying it. A guest
+// cannot open anything, and cannot ride a connection the host has with
+// anything else (a peer's gossip, a resolver) by forging its source.
 func renderHostIsolation(b *strings.Builder, chains []IsolationChain) {
 	if len(chains) == 0 {
 		return
@@ -510,10 +637,17 @@ func renderHostIsolation(b *strings.Builder, chains []IsolationChain) {
 	sorted := make([]IsolationChain, len(chains))
 	copy(sorted, chains)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Bridge < sorted[j].Bridge })
+	names := make([]string, len(sorted))
+	for i, c := range sorted {
+		names[i] = c.Bridge
+	}
+	marks := isolationMarks(names)
 
 	fmt.Fprintf(b, "    chain input {\n")
 	fmt.Fprintf(b, "        type filter hook input priority filter; policy accept;\n")
 	for _, c := range sorted {
+		fmt.Fprintf(b, "        iifname %s ct direction reply ct mark and %#x == %#x ct state established,related accept\n",
+			c.Bridge, isolationMarkMask, marks[c.Bridge])
 		if len(c.Exceptions) > 0 {
 			// VRRP (keepalived) once per bridge, then each VIP:port.
 			fmt.Fprintf(b, "        iifname %s ip protocol 112 accept\n", c.Bridge)
@@ -525,6 +659,46 @@ func renderHostIsolation(b *strings.Builder, chains []IsolationChain) {
 		}
 		fmt.Fprintf(b, "        iifname %s drop\n", c.Bridge)
 	}
+	fmt.Fprintf(b, "    }\n\n")
+
+	fmt.Fprintf(b, "    chain isolation_output {\n")
+	fmt.Fprintf(b, "        type filter hook output priority filter; policy accept;\n")
+	for _, c := range sorted {
+		fmt.Fprintf(b, "        oifname %s ct state new ct mark set ct mark and %#x or %#x\n",
+			c.Bridge, ^uint32(isolationMarkMask), marks[c.Bridge])
+	}
+	fmt.Fprintf(b, "    }\n\n")
+}
+
+// renderIsolatedForward emits the forward-hook chain that keeps an isolated
+// network on its host: nothing is routed from its bridge to any other device,
+// or from any other device to it. Guests on one bridge still reach each other
+// (bridged traffic stays on the bridge, and the input and output hooks — the
+// host's dnsmasq — are not touched).
+//
+// It is rendered on every host whatever the plan says. The group lines hold
+// every device in compose.IsolatedBridgeGroup — the group litevirt gives the
+// bridges it creates for isolated networks — from the first pass, including a
+// bridge no network row names any more. A listed bridge also gets its own
+// pair: that holds it before its group is set, and keeps it from routing to
+// another isolated bridge (the group lines cannot tell them apart). A bridge
+// is never matched by its name alone, so a `bridge` network whose bridge is
+// named br-iso-* routes as it always did.
+func renderIsolatedForward(b *strings.Builder, bridges []string) {
+	sorted := append([]string(nil), bridges...)
+	sort.Strings(sorted)
+	fmt.Fprintf(b, "    chain isolated_forward {\n")
+	fmt.Fprintf(b, "        type filter hook forward priority filter; policy accept;\n")
+	for i, br := range sorted {
+		if i > 0 && br == sorted[i-1] {
+			continue
+		}
+		fmt.Fprintf(b, "        iifname %q oifname != %q drop\n", br, br)
+		fmt.Fprintf(b, "        oifname %q iifname != %q drop\n", br, br)
+	}
+	g := compose.IsolatedBridgeGroup
+	fmt.Fprintf(b, "        iifgroup %d oifgroup != %d drop\n", g, g)
+	fmt.Fprintf(b, "        oifgroup %d iifgroup != %d drop\n", g, g)
 	fmt.Fprintf(b, "    }\n\n")
 }
 
@@ -609,6 +783,10 @@ func isIPv6Literal(s string) bool {
 // changing what the set matches. An element that does not parse is kept
 // verbatim and never used to drop another: the renderer does not second-guess
 // input it cannot read.
+//
+// A range can overlap a prefix or another range, and nft refuses two elements
+// that share even one address. A set where that remains renders its elements
+// merged (mergeIntervals); every other set renders exactly as before.
 func collapseSetElements(in []string) []string {
 	type elem struct {
 		s  string
@@ -651,16 +829,136 @@ func collapseSetElements(in []string) []string {
 		seen[e.s] = true
 		out = append(out, e.s)
 	}
+	if overlapping(out) {
+		out = mergeIntervals(out)
+	}
 	sort.Strings(out)
 	return out
 }
 
+// interval is the addresses lo..hi an element (or a piece of a stored element
+// that holds commas) matches.
+type interval struct{ lo, hi netip.Addr }
+
+// elementIntervals parses each piece of elems as an address, a prefix (nft
+// masks an unmasked one) or a range A-B; rest is every piece that does not
+// parse (a DNS name), as written.
+func elementIntervals(elems []string) (ivs []interval, rest []string) {
+	for _, e := range elems {
+		for _, piece := range strings.Split(e, ",") {
+			piece = strings.Trim(piece, " \t")
+			if piece == "" {
+				continue
+			}
+			if iv, ok := parseInterval(piece); ok {
+				ivs = append(ivs, iv)
+			} else {
+				rest = append(rest, piece)
+			}
+		}
+	}
+	sort.Slice(ivs, func(i, j int) bool {
+		if c := ivs[i].lo.Compare(ivs[j].lo); c != 0 {
+			return c < 0
+		}
+		return ivs[i].hi.Less(ivs[j].hi)
+	})
+	return ivs, rest
+}
+
+func parseInterval(s string) (interval, bool) {
+	if lo, hi, ok := strings.Cut(s, "-"); ok {
+		a, err1 := netip.ParseAddr(strings.Trim(lo, " \t"))
+		b, err2 := netip.ParseAddr(strings.Trim(hi, " \t"))
+		if err1 != nil || err2 != nil || a.BitLen() != b.BitLen() || b.Less(a) || a.Zone() != "" || b.Zone() != "" {
+			return interval{}, false
+		}
+		return interval{a, b}, true
+	}
+	if p, err := netip.ParsePrefix(s); err == nil && p.Addr().Zone() == "" {
+		p = p.Masked()
+		return interval{p.Addr(), lastAddr(p)}, true
+	}
+	if a, err := netip.ParseAddr(s); err == nil && a.Zone() == "" {
+		return interval{a, a}, true
+	}
+	return interval{}, false
+}
+
+// lastAddr is the highest address in p.
+func lastAddr(p netip.Prefix) netip.Addr {
+	b := p.Addr().AsSlice()
+	for i := p.Bits(); i < len(b)*8; i++ {
+		b[i/8] |= 0x80 >> (i % 8)
+	}
+	a, _ := netip.AddrFromSlice(b)
+	return a
+}
+
+// overlapping reports whether two different elements of an interval set share
+// an address. nft refuses such a set ("conflicting intervals specified"), the
+// same interval written twice it accepts.
+func overlapping(elems []string) bool {
+	ivs, _ := elementIntervals(elems)
+	// Sorted, an interval overlaps an earlier one exactly when it starts at or
+	// below the highest end so far; a repeat of the previous one does not.
+	var maxHi netip.Addr
+	for i, iv := range ivs {
+		if i > 0 && iv != ivs[i-1] && !maxHi.Less(iv.lo) {
+			return true
+		}
+		if i == 0 || maxHi.Less(iv.hi) {
+			maxHi = iv.hi
+		}
+	}
+	return false
+}
+
+// mergeIntervals renders a set whose elements overlap as the union of what
+// they match: intervals that share at least one address (an endpoint
+// included) become one element, written as an address, a prefix or a range
+// A-B; adjacent ones (hi+1 == lo), which nft accepts, stay apart. A piece
+// that does not parse is kept as written.
+func mergeIntervals(elems []string) []string {
+	ivs, out := elementIntervals(elems)
+	var merged []interval
+	for _, iv := range ivs {
+		if n := len(merged); n > 0 && !merged[n-1].hi.Less(iv.lo) {
+			if merged[n-1].hi.Less(iv.hi) {
+				merged[n-1].hi = iv.hi
+			}
+			continue
+		}
+		merged = append(merged, iv)
+	}
+	for _, iv := range merged {
+		out = append(out, intervalString(iv))
+	}
+	return out
+}
+
+func intervalString(iv interval) string {
+	if iv.lo == iv.hi {
+		return iv.lo.String()
+	}
+	for bits := 0; bits <= iv.lo.BitLen(); bits++ {
+		if p := netip.PrefixFrom(iv.lo, bits); p.Masked().Addr() == iv.lo && lastAddr(p) == iv.hi {
+			return p.String()
+		}
+	}
+	return iv.lo.String() + "-" + iv.hi.String()
+}
+
 // renderTierChain emits a chain whose rules apply to every packet
 // entering it (cluster + host tiers don't filter by NIC). The chain
-// name is the tier name.
-func renderTierChain(b *strings.Builder, name string, rules []Rule, v6Sets map[string]bool) {
+// name is the tier name. A logged rule logs as dev `-` under
+// lv_lg_routed.
+func renderTierChain(b *strings.Builder, name string, rules []Rule, v6Sets map[string]bool, lp LogPolicy) {
 	fmt.Fprintf(b, "    chain %s {\n", name)
 	for _, r := range rules {
+		for _, line := range renderRoutedLog(r, v6Sets, lp) {
+			fmt.Fprintf(b, "        %s\n", line)
+		}
 		for _, line := range renderRules(r, "", v6Sets) {
 			fmt.Fprintf(b, "        %s\n", line)
 		}
@@ -696,8 +994,12 @@ func ruleFamily(proto string) string {
 // one line, except for a rule referencing a set that holds IPv6 elements: nft
 // sets are typed, so it becomes one line per family, either of which matches.
 // A family the rule's protocol excludes gets no line.
+//
+// A negated or ==-prefixed reference (`!= @x`, `ne @x`) splits the same way:
+// a negated rule must hold IPv6 traffic to the set's IPv6 elements too, not
+// leave it untouched.
 func renderRules(r Rule, nicDev string, v6Sets map[string]bool) []string {
-	if !strings.HasPrefix(r.CIDR, "@") || !v6Sets[strings.TrimPrefix(r.CIDR, "@")] {
+	if name, ok := rulefield.SetRef(r.CIDR); !ok || !v6Sets[name] {
 		return []string{renderRule(r, nicDev, "")}
 	}
 	var out []string
@@ -706,7 +1008,7 @@ func renderRules(r Rule, nicDev string, v6Sets map[string]bool) []string {
 	}
 	if ruleFamily(r.Proto) != "ip" {
 		r6 := r
-		r6.CIDR = r.CIDR + ipv6SetSuffix
+		r6.CIDR = strings.TrimRight(r.CIDR, " \t") + ipv6SetSuffix
 		out = append(out, renderRule(r6, nicDev, "ip6"))
 	}
 	return out
@@ -749,8 +1051,11 @@ func renderRule(r Rule, nicDev, family string) string {
 			//   Ingress: dport (the destination port on the VM)
 			//   Egress:  dport too (the destination port at the remote)
 			// Both are dport — sport is rarely what a security group
-			// wants. nftables port-range syntax is N-M; pass through.
-			parts = append(parts, "dport", r.PortRange)
+			// wants. nftables port-range syntax is N-M; pass through,
+			// lower case: nft resolves a service name only in lower case
+			// (`dport SSH` is refused), and a peer on an older build can
+			// store one as sent.
+			parts = append(parts, "dport", strings.ToLower(r.PortRange))
 		}
 	case "icmp":
 		parts = append(parts, "ip", "protocol", "icmp")
@@ -795,7 +1100,7 @@ func renderRule(r Rule, nicDev, family string) string {
 
 	out := strings.Join(parts, " ")
 	if r.Comment != "" {
-		out += fmt.Sprintf(" comment %q", r.Comment)
+		out += " comment " + quoteComment(r.Comment)
 	}
 	return out
 }
@@ -816,6 +1121,15 @@ func validate(p Plan) error {
 		if ipset.Name == "" {
 			return errors.New("ipset with empty name")
 		}
+		// The name and every element are written into the script as text.
+		if err := rulefield.RenderSetName(ipset.Name); err != nil {
+			return fmt.Errorf("ipset %q: %w", ipset.Name, err)
+		}
+		for _, e := range ipset.CIDRs {
+			if err := rulefield.RenderSetElement(e); err != nil {
+				return fmt.Errorf("ipset %q: %w", ipset.Name, err)
+			}
+		}
 		ipsets[ipset.Name] = true
 		for _, cidr := range ipset.CIDRs {
 			if isIPv6Literal(cidr) && !validAddrOrPrefix(cidr, true) {
@@ -833,6 +1147,16 @@ func validate(p Plan) error {
 	}
 
 	for i, r := range allRules(p) {
+		// proto, port and an IPv4 CIDR are written into the script verbatim:
+		// text that is not nft words would add nft syntax of its own (finding
+		// F-1). Only that is refused here, so a rule that applies today renders
+		// as it did; the comment is quoted safely wherever it is written
+		// (quoteComment).
+		for _, err := range []error{rulefield.RenderProto(r.Proto), rulefield.RenderPort(r.Proto, r.PortRange), rulefield.RenderCIDR(r.CIDR)} {
+			if err != nil {
+				return fmt.Errorf("rule %d: %w", i, err)
+			}
+		}
 		switch r.Direction {
 		case Ingress, Egress:
 		default:
@@ -856,11 +1180,17 @@ func validate(p Plan) error {
 				return fmt.Errorf("rule %d: proto %q is IPv4-only and cannot match IPv6 CIDR %q (use icmpv6)", i, r.Proto, r.CIDR)
 			}
 		}
-		if strings.HasPrefix(r.CIDR, "@") {
-			name := strings.TrimPrefix(r.CIDR, "@")
+		// "!= @name" references a set too; nft refuses the whole ruleset on
+		// one that is not declared.
+		if name, op, ok := rulefield.SetRefOp(r.CIDR); ok {
 			if name == "" || !ipsets[name] {
 				return fmt.Errorf("rule %d: unknown ipset reference %q", i, r.CIDR)
 			}
+			if !rulefield.SetRefOpOK(op) {
+				return fmt.Errorf("rule %d: %q compares a set with %s, which nft refuses", i, r.CIDR, op)
+			}
+		} else if strings.Contains(r.CIDR, "@") {
+			return fmt.Errorf("rule %d: %q references a set other than as @name, != @name or == @name", i, r.CIDR)
 		}
 	}
 	for _, sg := range p.SecurityGroups {
@@ -889,27 +1219,37 @@ func validate(p Plan) error {
 			}
 		}
 	}
+	if err := validateSynFlood(p.SynFlood); err != nil {
+		return err
+	}
 	// NAT / isolation are IPv4-only (same as the filter rules) and must be
 	// complete — a blank field would emit a malformed rule that poisons the whole
 	// atomic ruleset at apply time.
+	// Every field is written into the script as text, so each must be an
+	// interface name or an IPv4 address or prefix, nothing more.
 	for i, r := range p.NAT {
-		if r.Subnet == "" || strings.Contains(r.Subnet, ":") {
+		if !validAddrOrPrefix(r.Subnet, false) {
 			return fmt.Errorf("nat rule %d: subnet %q must be a non-empty IPv4 CIDR", i, r.Subnet)
 		}
 		if r.SNATTo != "" {
-			if r.OutIface == "" || strings.Contains(r.SNATTo, ":") {
+			if !safeIfName(r.OutIface) || !validAddrOrPrefix(r.SNATTo, false) {
 				return fmt.Errorf("nat rule %d: SNAT needs an out-iface and an IPv4 target (got iface=%q to=%q)", i, r.OutIface, r.SNATTo)
 			}
-		} else if r.Bridge == "" {
-			return fmt.Errorf("nat rule %d: masquerade needs a bridge", i)
+		} else if !safeIfName(r.Bridge) {
+			return fmt.Errorf("nat rule %d: masquerade needs a bridge (got %q)", i, r.Bridge)
+		}
+	}
+	for _, br := range p.IsolatedBridges {
+		if !safeIfName(br) {
+			return fmt.Errorf("isolated bridge %q is not a safe interface name", br)
 		}
 	}
 	for i, c := range p.HostIsolation {
-		if c.Bridge == "" {
-			return fmt.Errorf("isolation chain %d: empty bridge", i)
+		if !safeIfName(c.Bridge) {
+			return fmt.Errorf("isolation chain %d: bridge %q is not a safe interface name", i, c.Bridge)
 		}
 		for _, exc := range c.Exceptions {
-			if exc.VIP == "" || strings.Contains(exc.VIP, ":") {
+			if !validAddrOrPrefix(exc.VIP, false) {
 				return fmt.Errorf("isolation chain %q: exception VIP %q must be a non-empty IPv4 address", c.Bridge, exc.VIP)
 			}
 		}

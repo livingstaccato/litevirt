@@ -78,12 +78,19 @@ type Server struct {
 	// defaultReplacedTombstoneWait.
 	replacedTombstoneWait time.Duration
 
+	// capacityResampleCheck is how often RunCapacitySampler checks this host's
+	// workloads for a change. Zero is defaultCapacityResampleCheck.
+	capacityResampleCheck time.Duration
+
 	// Admission-gate local-inventory cache (see localInventoryCached).
 	invCacheMu sync.Mutex
 	invCache   runtimeInventory
 	invCacheAt time.Time
-	pkiDir     string
-	db         *corrosion.Client
+	// invCacheGen counts invalidations: a collect that began before one is
+	// not cached.
+	invCacheGen uint64
+	pkiDir      string
+	db          *corrosion.Client
 
 	// dependsOnWaitTimeout, when > 0, overrides waitForCondition's timeout.
 	// Test seam only (SetDependsOnWaitTimeoutForTests); zero in production.
@@ -157,6 +164,11 @@ type Server struct {
 	// path uses to find the address a MAC is answering on. nil in production;
 	// see SetNICIPDiscovery.
 	nicIPDiscovery func(mac, bridge string) string
+
+	// dhcpLeaseLookup replaces the read of this host's dnsmasq lease for a
+	// MAC on a bridge (lv.LeaseOnBridge) that GetVMIPRemote's lease_only
+	// answer comes from. Test-only seam, nil in production.
+	dhcpLeaseLookup func(mac, bridge string) (string, int64)
 
 	// nbSweepUnreachable / nbUnreachableStreak carry the orphan sweep's
 	// consecutive-blocked-pass state for the NetBox health evaluator, which
@@ -336,6 +348,10 @@ type Server struct {
 	// host gives the consoles of each domain it defines a password, once
 	// console_password_v1 has latched (ConsolePasswordPolicy).
 	enfConsolePassword atomic.Bool
+	// enfVRRPUnicast is enforcement.vrrp_unicast (default on). Off withholds
+	// vrrp_unicast_v1 until it has latched; it never decides the transport an
+	// LB renders, which is cluster-wide (vrrpUnicastActive).
+	enfVRRPUnicast atomic.Bool
 	// allowPlaintextStorageMigration is this node's
 	// migration.allow_unencrypted_storage. A storage-copying migration sends RAM
 	// and disk blocks over a direct, unencrypted QEMU stream, so MigrateVM refuses
@@ -349,8 +365,10 @@ type Server struct {
 	// should travel on (migration_network.go). Empty means the host's cluster
 	// address. localIPs is a test seam for the host's own addresses.
 	migrationNetwork                       string
-	pingWithoutMigratePreconditionsForTest bool // Ping answers as a release that does not check migration preconditions
-	cloneAsOlderBuildForTest               bool // CloneVM ignores destination_host and target_pool, as an older release does
+	pingWithoutMigratePreconditionsForTest bool   // Ping answers as a release that does not check migration preconditions
+	pingWithoutNICListPositionForTest      bool   // Ping answers as a release that reads every NIC number as a spec index
+	updateVMNICsHookForTest                func() // runs in UpdateVM's redefine just before it reads the NIC list it defines
+	cloneAsOlderBuildForTest               bool   // CloneVM ignores destination_host and target_pool, as an older release does
 	migrationDial                          func(ctx context.Context, host, addr string) (pb.LiteVirtClient, func(), error)
 	migrationAddress                       string // migration.address: this host's own answer, when set
 	localIPs                               func() ([]localAddr, error)
@@ -383,10 +401,17 @@ type Server struct {
 	enfProjectAuthority atomic.Bool
 	// commitFenceHook is a test-only seam; see SetCommitFenceHook.
 	commitFenceHook func(op string)
+	// createCommittedHook is a test-only seam; see SetCreateCommittedHook.
+	createCommittedHook func(name string) error
+	// createReturnedHook is a test-only seam; see SetCreateReturnedHook.
+	createReturnedHook func(name string, err error)
 	// stackMemberDeleteHook is a test-only seam: DeleteStack calls it with
 	// each member's name right before deleting it, where a test re-creates
 	// the VM as another incarnation.
 	stackMemberDeleteHook func(name string)
+	// deleteLeaseTakenHook is a test-only seam: deleteVM calls it with the
+	// VM's name once it holds the start lease, before it re-reads the row.
+	deleteLeaseTakenHook func(name string)
 	// restoreClaimedHook is a test-only seam; see SetRestoreClaimedHook.
 	restoreClaimedHook func(name string)
 	// restoreTargetResolvedHook is a test-only seam run after RestoreFromBackup
@@ -474,6 +499,27 @@ type Server struct {
 	// recreateTornDown is a test seam: it runs in a rebuild and a rolling
 	// recreate once the old VM is torn down, before it is created again.
 	recreateTornDown func(name string)
+	// recreateDeleted is a test seam: it runs in a rolling or inline
+	// recreate once its delete has returned, whether or not it removed
+	// anything, before the create.
+	recreateDeleted func(name string)
+	// testClearFirewallTags is a test seam: when set, a firewall-tags clear (a
+	// delete's, or a tag set's of a copied identity) calls it instead of
+	// corrosion.ClearFirewallTags.
+	testClearFirewallTags func(ctx context.Context, kind, fwID string) error
+	// testClearFirewallTagsLive is the same seam for a hook set on a running
+	// server (SetClearFirewallTagsForTest), read by concurrent deletes.
+	testClearFirewallTagsLive atomic.Pointer[func(ctx context.Context, kind, fwID string) error]
+	// fwTagLocks serializes tag sets of one workload on its owner, so two
+	// concurrent read-merge-writes of its tags row do not lose one
+	// (lockFirewallTags).
+	fwTagLocks [32]sync.Mutex
+	// testFirewallTagsBeforeWrite is a test seam: a tag set calls it between
+	// reading the workload's tags and writing them.
+	testFirewallTagsBeforeWrite func()
+	// testFirewallTagsBeforeMint is a test seam: a tag set calls it between
+	// its copied-identity check (and clear) and the mint.
+	testFirewallTagsBeforeMint func()
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
@@ -541,11 +587,31 @@ type Server struct {
 	// haproxy). Production leaves it nil so apply failures surface + roll back.
 	lbApplyOverride func(context.Context, lb.Config) error
 
+	// lbListSNATOverride is a test seam for the snat lookup ListLoadBalancers
+	// makes per LB. Nil in production.
+	lbListSNATOverride func(ctx context.Context, name, stackName, generation string) (bool, error)
+
 	// netProvisioner is the host network provisioner seam (see
 	// NetworkProvisioner). Production leaves it nil: package network directly.
 	netProvisioner NetworkProvisioner
+	// hostAddr is this host's cluster address (SetHostAddress), its VXLAN
+	// tunnel endpoint once the release token latches. '' = unwired: a vxlan
+	// network is refused.
+	hostAddr string
+	// vtepResolver resolves a vxlan tunnel endpoint (SetVTEPResolver); nil =
+	// network.ResolveVTEP.
+	vtepResolver VTEPResolver
+	// vtepRefused is the last refusal published per network (resolveVTEP).
+	vtepRefusedMu sync.Mutex
+	vtepRefused   map[string]string
 	// netReconcile is what ReconcileNetworksOnce has done on this host.
 	netReconcile netReconcileState
+	// netDevs is the definition each network was last provisioned with here
+	// (provisionDevice).
+	netDevs provisionedDevices
+	// gatewayAnnouncer announces a gateway after a live migration lands here
+	// (SetGatewayAnnouncer); nil = network.AnnounceGateway.
+	gatewayAnnouncer GatewayAnnouncer
 
 	// leftoverBridgeWarned holds the bridge names whose leftover-removal failure
 	// was already logged, so the 30s reconcile pass does not repeat it.
@@ -559,6 +625,15 @@ type Server struct {
 	// bridgeExists is a test seam for "does this bridge already exist on this
 	// host". Production leaves it nil, preserving network.BridgeExists.
 	bridgeExists func(name string) bool
+
+	// isBridge is a test seam for "is this link a bridge on this host" (not a
+	// NIC, bond or VLAN). Production leaves it nil, preserving network.IsBridge.
+	isBridge func(name string) bool
+
+	// linkAddrs replaces the read of a device's IP addresses (lbVIPInterface
+	// tells whose bridge a shared short name is by them). Test-only seam,
+	// nil in production.
+	linkAddrs func(name string) []netip.Prefix
 
 	// bridgeUplink is a test seam for "does this bridge carry anything off this
 	// host". Production leaves it nil, preserving network.BridgeHasUplink. Like
@@ -598,6 +673,54 @@ type Server struct {
 	// lbKeepalivedOverride is a test seam for the VIP-health (degraded) check:
 	// when non-nil it reports whether this host's keepalived for an LB is running.
 	lbKeepalivedOverride func(name string) bool
+
+	// lbRenderedTransportOverride is a test seam for the reconciler's read of
+	// the VRRP transport an LB's keepalived config on disk renders (lb.Manager
+	// KeepalivedTransport); lbIfaceForIPOverride for the device holding an
+	// address (lb.InterfaceHoldingIP). Nil in production.
+	lbRenderedTransportOverride func(name string) (lb.Transport, bool)
+	lbIfaceForIPOverride        func(ip string) string
+	// lbIfaceRunningOverride is a test seam for whether a device is up and
+	// has carrier (lb.InterfaceUpRunning). Nil in production.
+	lbIfaceRunningOverride func(dev string) bool
+	// vrrpPeerCapsOverride is a test seam for noteVRRPSplit's Ping of an LB
+	// peer (PeerCapabilities). Nil in production.
+	vrrpPeerCapsOverride func(ctx context.Context, host string) (caps []string, walQuarantined bool, err error)
+	// lbDemoteOverride is a test seam for stopping an LB's keepalived here
+	// (lb.Manager.DemoteByName). Nil in production.
+	lbDemoteOverride func(name string) error
+	// vrrpMu guards vrrpLastEvent (the last value each LB's VRRP events said,
+	// so each is published on a change only) and vrrpRefusedLBs (the LBs
+	// whose transport this host cannot render, for CondLBVRRPRefused).
+	vrrpMu         sync.Mutex
+	vrrpLastEvent  map[string]string
+	vrrpRefusedLBs map[string]string
+	// vrrpServing is checkVRRPServing's last answer per refused LB: another
+	// LB host serves it on unicast. It is dropped when the refusal clears, and
+	// written only for the refusal it was asked for (vrrpRefusedEpoch), so no
+	// answer outlives its refusal. vrrpLatchErr is the last latch-row write
+	// error (noteVRRPLatch logs a change of it only).
+	vrrpServing map[string]bool
+	// vrrpRefusedEpoch numbers each refusal of an LB (from vrrpEpoch, never
+	// reused) while it lasts.
+	vrrpRefusedEpoch map[string]uint64
+	vrrpEpoch        uint64
+	// vrrpRefusedHosts is each refused LB's hosts, as its last apply had them.
+	vrrpRefusedHosts map[string][]string
+	vrrpLatchErr     string
+	// vrrpAskKick asks checkVRRPServing for a pass now.
+	vrrpAskKick chan struct{}
+	// lbServingOverride is a test seam for asking a peer whether it serves an
+	// LB on unicast (CheckLBPresent). Nil in production.
+	lbServingOverride func(ctx context.Context, host, lbName string) bool
+	// lbKick asks the LB reconciler for a pass now (kickLBReconcile).
+	lbKick chan struct{}
+	// vrrpRowLatched: vrrp_unicast_v1 has latched on some host (its latch
+	// row) or durably here, as vrrpUnicastActive last read it.
+	vrrpRowLatched atomic.Bool
+	// lbMgr is the LB manager the keepalived reads (running, transport) go
+	// to. Nil: lb.NewManager(), the production paths. Test-only (SetLBManager).
+	lbMgr *lb.Manager
 
 	// migrateRestoreOverride is a test seam for container cold migration + failover
 	// relocation: when non-nil it replaces the real "dial the target peer + drive
@@ -706,6 +829,14 @@ type Server struct {
 	smartMetrics     *metrics.SMARTMetrics
 	smartRunner      smart.Runner // test seam; nil = real smartctl
 
+	// reservationMetrics and resSweep belong to the reservation sweep
+	// (reservation_recovery.go).
+	reservationMetrics *metrics.ReservationMetrics
+	resSweep           reservationSweepState
+	// resRelease belongs to the manual reservation release
+	// (reservation_release_admin.go).
+	resRelease reservationReleaseState
+
 	// gatherRuntimeOverride is a test seam for the dual-run detector's per-host runtime
 	// gather (self-local + peer GetRuntimeInventory): when non-nil it replaces the real probes,
 	// returning the snapshot per successfully-gathered host, the hosts that could not be
@@ -808,6 +939,13 @@ type Server struct {
 	// lease another holder has (SetDeleteLeaseWaitForTest). Zero in
 	// production means deleteLeaseWaitDefault.
 	deleteLeaseWait time.Duration
+	// deleteFinish is a TEST SEAM for how long a delete runs once it has
+	// started acting (detachDelete). Zero, as in production, means
+	// deleteFinishTimeout.
+	deleteFinish time.Duration
+	// deleteStep is a TEST SEAM run at named steps of a VM delete
+	// (SetDeleteStepHookForTest). Nil in production.
+	deleteStep func(vm, step string)
 	// diskSpaceOverride is a TEST SEAM for the free-space checks of a cold
 	// migration's disk copy (diskSpace). Nil in production.
 	diskSpaceOverride func(dir string) (avail, total uint64, err error)
@@ -850,6 +988,11 @@ type Server struct {
 	startFlightsMu  sync.Mutex
 	startFlights    map[string]*startFlight
 	startDomainWait time.Duration
+	// invFlights is the runtime inventory's libvirt single flight
+	// (runtime_inventory.go).
+	invFlights inventoryFlights
+	// invClock, when set, is the inventory's clock (invNow). Test seam only.
+	invClock func() time.Time
 	// liveStateCalls holds each live-state read of a local domain libvirt
 	// has not answered yet (vm_live_state.go); liveStateWait is how long a
 	// read waits for one (zero: defaultLiveStateWait).
@@ -958,12 +1101,29 @@ type Server struct {
 	// (nic_identity.go): network → address → reservation.
 	dhcpResMu   sync.Mutex
 	dhcpPending map[string]map[string]dhcpPendingRes
+	// Addresses given to NICs on host-isolated networks whose rows are not
+	// written yet (hostIsolatedAddress): network → address → when. Under
+	// dhcpResMu.
+	isoPending map[string]map[string]time.Time
+	// isoOffset, when set (tests), replaces where a host-isolated address
+	// scan starts (isoScanOffset).
+	isoOffset func(netName string) uint64
 	// Host-local DHCP facts a reservation depends on; nil = the real host
 	// (network.DHCPServedHere, network.BridgeHasUplink, network.AddDHCPHost).
 	// Test seams: SetDHCPReservationBackend.
 	dhcpServedHere  func(bridge string) bool
 	bridgeHasUplink func(bridge string) bool
 	addDHCPHost     func(bridge, mac, ip string) error
+	// syncDHCPHosts, when set (tests), replaces network.SyncDHCPHosts.
+	syncDHCPHosts func(bridge string, hosts map[string]network.DHCPHost) (bool, error)
+	// noRouterPending: NICs of VMs whose rows are not written yet
+	// (pendingNICs), vm → MAC → network, which SyncDHCPReservations counts
+	// with the rows. Under dhcpResMu.
+	noRouterPending map[string]map[string]noRouterPendingNIC
+	// dhcpSyncMu serialises SyncDHCPReservations, so a pass that read the
+	// state before a NIC was registered never writes after one that read it
+	// after.
+	dhcpSyncMu sync.Mutex
 
 	// antiEntropy is the daemon's anti-entropy loop. TriggerAntiEntropy calls RunOnce on
 	// it so `lv cluster converge` kicks an immediate (debounced) pass instead of waiting
@@ -1001,6 +1161,9 @@ type Server struct {
 	// streamRecheckEvery is how often an open user-authenticated stream
 	// re-checks its credential (stream_watch.go); 0 = StreamRecheckInterval.
 	streamRecheckEvery time.Duration
+	// streamClock, when set, is the stream watcher's clock (streamNow).
+	// Test seam only.
+	streamClock func() time.Time
 	// streamKick wakes every open stream's watcher to re-check now; replaced
 	// (closed) on each kick. Guarded by streamKickMu.
 	streamKickMu sync.Mutex
@@ -1070,7 +1233,10 @@ type Server struct {
 	// adoptedVoterGen is the voter generation AdoptVoterConfigs last found
 	// adopted, which Ping reports (PingResponse.voter_generation).
 	adoptedVoterGen atomic.Int64
-	onGateRefused   func(action, reason string)
+	// peerVoterGens is each peer's reported voter_generation
+	// (PeerVoterGeneration), from PeerCapabilities' Pings.
+	peerVoterGens peerVoterGens
+	onGateRefused func(action, reason string)
 	// vmStartObserver is told of every guest start (SetVMStartObserver).
 	vmStartObserver VMStartObserver
 
@@ -1079,6 +1245,14 @@ type Server struct {
 	// one reached on a complete sweep, and it is the shape that can miss a
 	// superseding term — so it is counted rather than left to a log line.
 	onLeaseBarrierIncomplete func(key string, answered, peers int)
+
+	// onLeaseClaimNoMajority feeds litevirt_lease_term_claim_no_majority_total
+	// (nil-safe); leaseClaimStall drives ha.lease.claim_no_majority
+	// (lease_term_claim.go).
+	onLeaseClaimNoMajority func(lease string)
+	leaseClaimStall        leaseClaimStall
+	// leaseClaimsAsOlderBuild is SetLeaseClaimsAsAnOlderBuildForTest's seam.
+	leaseClaimsAsOlderBuild atomic.Bool
 
 	// leaseBarrierFullProbe remembers which peers have already been given the
 	// full budget in a repair pass and still said nothing, so a dead peer is
@@ -1118,6 +1292,9 @@ type Server struct {
 	// hwAuditDeferred names the VMs whose hardware audit the backfill left
 	// for their owed cutover handoff to complete (auditAfterVMReplaceHandoff).
 	hwAuditDeferred sync.Map // vm name -> true
+	// creatingIncarnations names the VMs a create on this host is bringing
+	// up, with the uuid of the incarnation it creates (noteCreatingIncarnation).
+	creatingIncarnations sync.Map // vm name -> uuid
 
 	// readyRead is Ready's one local read; nil means the real hosts-table
 	// query. A seam so a test can stand in for a read blocked on the client
@@ -1373,6 +1550,16 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfPartitionPause.Load() {
 		caps = withoutCapability(caps, capabilities.PartitionPauseV1)
 	}
+	// vrrp_unicast_v1 is withheld while enforcement.vrrp_unicast is off and
+	// it has not latched: before the latch an LB host and its peers hear each
+	// other only on the same VRRP transport, so the latch has to mean every
+	// host opted in. After it the transport is cluster-wide, whatever the
+	// flag, and this host renders unicast too, so it says so: a host that does
+	// not advertise it is one on an earlier build (CondLBVRRPSplit). See
+	// TestAdvertise_VRRPUnicastWithheldWhileOff.
+	if !s.enfVRRPUnicast.Load() && !s.vrrpRowLatched.Load() {
+		caps = withoutCapability(caps, capabilities.VRRPUnicastV1)
+	}
 	return caps
 }
 
@@ -1513,11 +1700,43 @@ func (s *Server) SetDHCPReservationBackend(served, uplink func(bridge string) bo
 	s.dhcpServedHere, s.bridgeHasUplink, s.addDHCPHost = served, uplink, add
 }
 
+// SetDHCPHostsSync replaces the write of a bridge's DHCP hosts file
+// (network.SyncDHCPHosts) — a test seam.
+func (s *Server) SetDHCPHostsSync(fn func(bridge string, hosts map[string]network.DHCPHost) (bool, error)) {
+	s.syncDHCPHosts = fn
+}
+
 // SetBridgeExists injects the "does this bridge already exist here" seam (see
 // bridgeExists). It is the host-local fact the NetBox bind-time DHCP refusal
 // reads, so a test that exercises that refusal must fix it rather than inherit
 // whatever interfaces the machine running the test happens to have.
 func (s *Server) SetBridgeExists(fn func(name string) bool) { s.bridgeExists = fn }
+
+// SetIsBridge injects the "is this link a bridge here" seam (see isBridge).
+// A deploy puts a stack network named after a host bridge on it, so a test
+// must fix the answer rather than inherit the test machine's links.
+func (s *Server) SetIsBridge(fn func(name string) bool) { s.isBridge = fn }
+
+// SetLinkAddrs replaces the read of a device's addresses (linkAddrs).
+// Test-only seam, nil in production.
+func (s *Server) SetLinkAddrs(fn func(name string) []netip.Prefix) { s.linkAddrs = fn }
+
+// SetLBApply replaces the haproxy/keepalived apply of a load balancer on this
+// host (lbApplyOverride). Test-only seam, nil in production.
+func (s *Server) SetLBApply(fn func(context.Context, lb.Config) error) { s.lbApplyOverride = fn }
+
+// SetLBManager points this host's reads of its LBs' keepalived — whether it
+// runs, which VRRP transport its config renders — at m instead of the
+// production paths. Test-only seam, nil in production.
+func (s *Server) SetLBManager(m *lb.Manager) { s.lbMgr = m }
+
+// lbManager is the manager the keepalived reads go to (SetLBManager).
+func (s *Server) lbManager() *lb.Manager {
+	if s.lbMgr != nil {
+		return s.lbMgr
+	}
+	return lb.NewManager()
+}
 
 // SetBridgeHasUplink injects the "does this bridge carry anything off the host"
 // seam (see bridgeUplink). It is the fact that tells an operator's
@@ -1622,6 +1841,10 @@ func (s *Server) SetLiveResize(on bool) { s.enfLiveResize.Store(on) }
 // gives the consoles of each domain it defines a password (once
 // console_password_v1 has latched).
 func (s *Server) SetConsolePassword(on bool) { s.enfConsolePassword.Store(on) }
+
+// SetVRRPUnicast sets enforcement.vrrp_unicast: whether this host advertises
+// vrrp_unicast_v1 before it has latched.
+func (s *Server) SetVRRPUnicast(on bool) { s.enfVRRPUnicast.Store(on) }
 
 // ConsolePasswordPolicy is what this host's defines do to a domain's console
 // passwords. Until console_password_v1 has latched, nothing (PolicyLeave):
@@ -1741,6 +1964,17 @@ func (s *Server) SetProjectAuthorityEnforce(on bool) { s.enfProjectAuthority.Sto
 // cannot fail. Production never calls this; the hook must be set before the
 // operation starts and cleared after.
 func (s *Server) SetCommitFenceHook(h func(op string)) { s.commitFenceHook = h }
+
+// SetCreateCommittedHook is a test-only seam: CreateVM calls h with the VM's
+// name right after its row has committed, and fails with the error h returns
+// — a step after the commit failing, or (h cancelling the caller's context) a
+// client that stopped waiting. Production never calls this.
+func (s *Server) SetCreateCommittedHook(h func(name string) error) { s.createCommittedHook = h }
+
+// SetCreateReturnedHook is a test-only seam: CreateVM calls h with the VM's
+// name and its result once everything it defers has run. Production never
+// calls this.
+func (s *Server) SetCreateReturnedHook(h func(name string, err error)) { s.createReturnedHook = h }
 
 // SetRestoreClaimedHook is a test-only seam: RestoreContainer calls h with the
 // container's name right after it has claimed a carried relocation proof, and
@@ -1896,12 +2130,18 @@ func (s *Server) tokenEnabled(token string) bool {
 		// when it elects relays, and every node relies on every other
 		// electing the same set.
 		return true
+	case capabilities.SpecConflictV1:
+		// No kill switch: it says how this build resolves two edits of one
+		// spec at one generation, and every replica must resolve them alike.
+		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm.Load()
 	case capabilities.RecoveryClaimV1:
 		return s.enfRecoveryClaim.Load()
 	case capabilities.PartitionPauseV1:
 		return s.enfPartitionPause.Load()
+	case capabilities.VRRPUnicastV1:
+		return s.enfVRRPUnicast.Load()
 	case capabilities.IsolationEpochV1:
 		return s.enfIsolationEpoch.Load()
 	case capabilities.NetBoxIPAMV1:
@@ -2345,6 +2585,8 @@ type StoragePoolRef struct {
 // NewServer creates a new gRPC service handler.
 func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt LibvirtBackend, images *image.Store) *Server {
 	s := &Server{
+		lbKick:         make(chan struct{}, 1),
+		vrrpAskKick:    make(chan struct{}, 1),
 		startedAt:      time.Now(),
 		hostName:       hostName,
 		dataDir:        dataDir,

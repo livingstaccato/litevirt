@@ -209,9 +209,16 @@ func (c *Cluster) openGossipDB(n *Node) {
 	if err := mkdirAll(cfg.DataDir); err != nil {
 		c.t.Fatalf("mkdir corrosion dir for %s: %v", n.Name, err)
 	}
-	db, err := corrosion.NewClient(cfg, hlc.NewClock(n.Name))
+	clock := hlc.NewClock(n.Name)
+	if c.opts.ClockSeam {
+		clock.SetNowForTests(n.Now)
+	}
+	db, err := corrosion.NewClient(cfg, clock)
 	if err != nil {
 		c.t.Fatalf("open gossiping DB for %s: %v", n.Name, err)
+	}
+	if c.opts.ClockSeam {
+		db.SetWallClockForTests(n.Now)
 	}
 	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		c.t.Fatalf("InitSchema for %s: %v", n.Name, err)
@@ -277,6 +284,18 @@ func (c *Cluster) SplitGossip(left, right []*Node) {
 			c.gossip.set(a.Name, b.Name, true)
 			c.gossip.set(b.Name, a.Name, true)
 			c.SetLinkFaultBoth(a, b, LinkFault{Block: true, BlockAll: true})
+		}
+	}
+}
+
+// HealGossipBetween undoes SplitGossip between left and right only: gossip
+// and every RPC flow again between each pair, and every other cut stays.
+func (c *Cluster) HealGossipBetween(left, right []*Node) {
+	for _, a := range left {
+		for _, b := range right {
+			c.gossip.set(a.Name, b.Name, false)
+			c.gossip.set(b.Name, a.Name, false)
+			c.SetLinkFaultBoth(a, b, LinkFault{})
 		}
 	}
 }

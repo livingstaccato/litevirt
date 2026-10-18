@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 
-	"golang.org/x/term"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -26,6 +25,12 @@ func PrintHostInspect(ctx context.Context, c pb.LiteVirtClient, name string) err
 		return err
 	}
 	if n := hostUpdatesNote(name, host.GetLabels()); n != "" {
+		fmt.Fprintln(os.Stderr, n)
+	}
+	if n := hostReservationsNote(host); n != "" {
+		fmt.Fprintln(os.Stderr, n)
+	}
+	if n := hostStaleReservationsNote(host); n != "" {
 		fmt.Fprintln(os.Stderr, n)
 	}
 	// Ops-visibility hint (stderr — leaves the JSON on stdout intact): a host whose
@@ -82,15 +87,4 @@ func printJSON(v proto.Message) error {
 	}
 	_, err = os.Stdout.Write(append(b, '\n'))
 	return err
-}
-
-// ReadPassword prompts for a password without echoing input.
-func ReadPassword(prompt string) (string, error) {
-	fmt.Fprint(os.Stderr, prompt)
-	pw, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Fprintln(os.Stderr)
-	if err != nil {
-		return "", err
-	}
-	return string(pw), nil
 }

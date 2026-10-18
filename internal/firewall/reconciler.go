@@ -190,6 +190,11 @@ type AppliedState struct {
 	// BlockedTrunks are trunk VLANs left out because their network does not
 	// allow them (Plan.BlockedTrunks).
 	BlockedTrunks []BlockedTrunk
+	// InvalidRows are stored rows not rendered as written (Plan.InvalidRows).
+	InvalidRows []InvalidRow
+	// TagGroups is what the pass could not render as the tag groups ask
+	// (Plan.TagGroups).
+	TagGroups TagGroupReport
 }
 
 // SetStateHook registers fn to receive the applied state after every pass
@@ -227,7 +232,8 @@ func (r *Reconciler) AppliedState() AppliedState {
 }
 
 func (r *Reconciler) recordState(ctx context.Context, p Plan, applyErr error) {
-	st := AppliedState{NICs: map[string]string{}, Guarded: map[string]map[string]bool{}, BlockedTrunks: p.BlockedTrunks}
+	st := AppliedState{NICs: map[string]string{}, Guarded: map[string]map[string]bool{}, BlockedTrunks: p.BlockedTrunks,
+		InvalidRows: p.InvalidRows, TagGroups: p.TagGroups}
 	if len(p.NICs) > 0 {
 		st.Mode = p.nicMode()
 	}
@@ -401,9 +407,25 @@ type LoaderOptions struct {
 	// litevirt_firewall_sg_duplicate_name_nics.
 	OnDuplicateSGs func(nicsByName map[string]int)
 
+	// OnTagGroupMembers, when set, receives after every pass the number of
+	// member workloads of each tag group this replica holds
+	// (litevirt_firewall_tag_group_members).
+	OnTagGroupMembers func(membersByGroup map[string]int)
+
+	// OnDuplicateAddresses, when set, receives after every pass the
+	// addresses on host-isolated networks that live NIC rows of more than one
+	// workload hold (corrosion.HostIsolatedDuplicateAddrs); nil or empty
+	// means none. A failure to read them is logged and does not fail the
+	// pass. The daemon reports them with DuplicateAddressReporter.
+	OnDuplicateAddresses func(ctx context.Context, dups []corrosion.DuplicateAddress)
+
 	// Arming, when set, names VMs rendered here whatever host their row
 	// names and NICs whose rows are not written yet (see Arming).
 	Arming *Arming
+
+	// Now is the loader's clock (time.Now when nil): how long a rule has
+	// referenced a missing set (emptySetGrace).
+	Now func() time.Time
 }
 
 // CorrosionPlanLoader builds a Plan from the cluster's
@@ -427,6 +449,12 @@ type LoaderOptions struct {
 // nodes racing, since the CRDT has no UNIQUE.
 func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, opts LoaderOptions) PlanLoader {
 	taps := &tapFetcher{}
+	memory := &rowMemory{}
+	tagMem := &tagMemory{}
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
 	tapBridge := opts.TapBridge
 	if tapBridge == nil {
 		tapBridge = sysfsMaster
@@ -438,32 +466,60 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		// dead in production before v21 (the loader only filled SecurityGroups
 		// + NICs); now they come from the cluster_firewall_rules /
 		// host_firewall_rules / ip_sets / firewall_defaults tables.
+		//
+		// A row that cannot be rendered safely (written by a peer on an older
+		// build) is never rendered as written and never fails the pass: one
+		// bad row would otherwise stop every host's firewall from applying,
+		// leaving whatever it last applied — and no chain at all for a NIC
+		// that started since. That row alone is held fail-static, and a
+		// reference to a set that does not exist matches nothing (see
+		// quarantine). Each is reported (Plan.InvalidRows).
+		plan.InvalidRows = plan.InvalidRows[:0:0]
+		ipsets, err := corrosion.ListIPSets(ctx, db)
+		if err != nil {
+			return plan, err
+		}
+		// Tag groups (tag_groups.go): their sets are declared beside the
+		// user's, and a rule's tag:<name> is resolved before it is judged.
+		passNow := now()
+		// Every host's host tier: a deny on a tag group there matches this
+		// host's workloads too (tagPass.noteDeny).
+		allHostRules, err := corrosion.ListHostFirewallRules(ctx, db, "")
+		if err != nil {
+			return plan, err
+		}
+		tg, err := loadTagGroups(ctx, db, hostName, passNow, tagMem, allHostRules)
+		if err != nil {
+			return plan, err
+		}
+		// A user set named for one of litevirt's own, a tag group's lv_tg_*
+		// included, is left out there (userSetName).
+		var badSets []InvalidRow
+		var degraded map[string]bool
+		plan.IPSets, badSets, degraded = quarantineIPSets(ipsets)
+		plan.IPSets = append(plan.IPSets, tg.sets()...)
+		prevRules, emptySince := memory.snapshot()
+		q := newQuarantine(plan.IPSets, degraded, prevRules, emptySince, passNow)
+
 		clusterRules, err := corrosion.ListClusterFirewallRules(ctx, db)
 		if err != nil {
 			return plan, err
 		}
-		plan.ClusterRules = toFWRules(clusterRules)
+		plan.ClusterRules = toFWRules(q, tg, clusterRules, "cluster_firewall_rules")
 
-		hostRules, err := corrosion.ListHostFirewallRules(ctx, db, hostName)
-		if err != nil {
-			return plan, err
+		var hostRules []corrosion.FirewallRule
+		for _, r := range allHostRules {
+			if r.HostName == hostName {
+				hostRules = append(hostRules, r)
+			}
 		}
-		plan.HostRules = toFWRules(hostRules)
+		plan.HostRules = toFWRules(q, tg, hostRules, "host_firewall_rules")
 
 		deny, err := corrosion.ResolveDefaultDeny(ctx, db, hostName)
 		if err != nil {
 			return plan, err
 		}
 		plan.DefaultDeny = deny
-
-		ipsets, err := corrosion.ListIPSets(ctx, db)
-		if err != nil {
-			return plan, err
-		}
-		plan.IPSets = plan.IPSets[:0:0]
-		for _, s := range ipsets {
-			plan.IPSets = append(plan.IPSets, IPSet{Name: s.Name, CIDRs: s.CIDRs})
-		}
 
 		sgs, err := corrosion.ListSecurityGroups(ctx, db, "")
 		if err != nil {
@@ -491,9 +547,9 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			}
 			out := SecurityGroup{Name: sg.Name}
 			for _, r := range rules {
-				out.Rules = append(out.Rules, FromCorrosionRule(
-					r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action,
-				))
+				if rule, ok := tg.rule(q, "sg_rules", r.ID, r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action, ""); ok {
+					out.Rules = append(out.Rules, rule)
+				}
 			}
 			plan.SecurityGroups = append(plan.SecurityGroups, out)
 		}
@@ -507,10 +563,20 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			valid[sg.Name] = true
 		}
 		ambiguous := map[string]int{} // duplicate name → this host's NICs held at drop for it
-		// bind resolves one NIC's bound names: the known ones, or, when any of
-		// them is a duplicate, none at all plus the drop rules.
-		bind := func(dev, owner string, names []string) NICBinding {
+		// bind resolves one NIC's bound names — its own and those its tag
+		// groups bind on its network, merged first so the ambiguity check
+		// sees them all: the known ones, or, when any of them is a
+		// duplicate, none at all plus the drop rules. A NIC whose tag-group
+		// membership cannot be proven is held at drop instead.
+		bind := func(dev, owner, kind, ctHost, network string, own []string) NICBinding {
 			nb := NICBinding{NICDev: dev, VMName: owner}
+			if why := tg.hold(kind, ctHost, owner, network, dev); why != "" {
+				slog.Warn("firewall: NIC of a workload whose tag-group membership cannot be proven; holding it at drop",
+					"workload", owner, "nic", dev, "reason", why)
+				nb.ExtraRules = failClosedFor(why)
+				return nb
+			}
+			names := tg.bound(kind, ctHost, owner, network, own)
 			var dups []string
 			for _, name := range names {
 				if holders[name] > 1 {
@@ -563,9 +629,15 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		// NIC guards. A read failure fails the pass like any other, keeping
 		// the applied ruleset: dropping the guards instead would unguard every
 		// NIC on the host while the database is unreadable.
-		guards, err := corrosion.ListNICGuards(ctx, db)
+		allGuards, err := corrosion.ListNICGuardsWithDeleted(ctx, db)
 		if err != nil {
 			return plan, err
+		}
+		guards := make(map[string]corrosion.NICGuardRecord, len(allGuards))
+		for k, r := range allGuards {
+			if !r.Deleted {
+				guards[k] = r
+			}
 		}
 		nets, err := corrosion.NetworkGuardInfos(ctx, db)
 		if err != nil {
@@ -574,6 +646,13 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		assigned, err := corrosion.NetworkAssignedAddrs(ctx, db)
 		if err != nil {
 			return plan, err
+		}
+		if opts.OnDuplicateAddresses != nil {
+			if dups, derr := corrosion.HostIsolatedDuplicateAddrs(ctx, db); derr != nil {
+				slog.Warn("firewall: could not check host-isolated networks for duplicate addresses", "error", derr)
+			} else {
+				opts.OnDuplicateAddresses(ctx, dups)
+			}
 		}
 		// The trunk VLANs recorded at upgrade (re-review R3-I1): once the
 		// recording has run, a trunk carries only what its network allows,
@@ -598,9 +677,18 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		// recordOf is the NIC's guard record — only one written for the
 		// incarnation that runs now: a record an earlier VM of the same name
 		// and MAC left guards nothing (re-review m1).
+		//
+		// A NIC rendered here has a live row (or is pending): a retired
+		// record of its incarnation over it is a write order this replica
+		// saw out of order, and guards it by default
+		// (corrosion.RetiredGuardOver).
 		recordOf := func(ifc corrosion.HostVMNIC) (corrosion.NICGuardRecord, bool) {
-			rec, ok := guards[corrosion.NICGuardKey(ifc.VMName, ifc.MAC)]
-			if ok && rec.VMUUID != "" && ifc.VMUUID != "" && rec.VMUUID != ifc.VMUUID {
+			key := corrosion.NICGuardKey(ifc.VMName, ifc.MAC)
+			rec, ok := guards[key]
+			if !ok {
+				return corrosion.RetiredGuardOver(allGuards[key], ifc.VMUUID, nets[ifc.NetworkName].Type, ifc.NetworkName)
+			}
+			if rec.VMUUID != "" && ifc.VMUUID != "" && rec.VMUUID != ifc.VMUUID {
 				return corrosion.NICGuardRecord{}, false
 			}
 			return rec, ok
@@ -638,7 +726,7 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 				continue
 			}
 			claimed[tap] = ifc.VMName
-			nb := bind(tap, ifc.VMName, ifc.SecurityGroups)
+			nb := bind(tap, ifc.VMName, corrosion.TagMemberVM, "", ifc.NetworkName, ifc.SecurityGroups)
 			nb.Bridge = tapBridge(tap)
 			nb.MAC = strings.ToLower(ifc.MAC)
 			nb.TrunkVIDs = ifc.TrunkVIDs
@@ -697,7 +785,7 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			if ifc.VethDevice == "" {
 				continue
 			}
-			nb := bind(ifc.VethDevice, ifc.CtName, ifc.SecurityGroups)
+			nb := bind(ifc.VethDevice, ifc.CtName, corrosion.TagMemberCT, hostName, ifc.NetworkName, ifc.SecurityGroups)
 			nb.Bridge = tapBridge(ifc.VethDevice)
 			nb.MAC = strings.ToLower(ifc.MAC)
 			if rec, ok := ContainerGuard(guards, hostName, ifc.CtName, ifc.MAC); ok {
@@ -708,6 +796,21 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		if opts.OnDuplicateSGs != nil {
 			opts.OnDuplicateSGs(ambiguous)
 		}
+		plan.TagGroups = tg.finish()
+		if opts.OnTagGroupMembers != nil {
+			opts.OnTagGroupMembers(plan.TagGroups.Members)
+		}
+		plan.IPSets = append(plan.IPSets, q.sets()...)
+		for _, s := range tg.emptySets() {
+			// A rendering kept from an earlier pass may have declared a gone
+			// group's empty set already (quarantine.judgingKept); nft refuses
+			// a ruleset that declares a set twice.
+			if !q.emptySets[s.Name] {
+				plan.IPSets = append(plan.IPSets, s)
+			}
+		}
+		plan.InvalidRows = append(append(plan.InvalidRows, badSets...), q.invalid...)
+		warnInvalidRows(plan.InvalidRows)
 
 		// NAT / SNAT / host-isolation infra: read this host's resolved intent
 		// (written by network provisioning + LB apply) and fold it into the same
@@ -741,6 +844,22 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			}
 		}
 		sort.Strings(plan.Gateways)
+		// Every live isolated network's bridge: forwarding off it is dropped
+		// (renderIsolatedForward), as it is for every bridge in the group.
+		isolated := map[string]bool{}
+		for _, info := range nets {
+			if info.IsolatedBridge != "" {
+				isolated[info.IsolatedBridge] = true
+			}
+		}
+		plan.IsolatedBridges = plan.IsolatedBridges[:0:0]
+		for br := range isolated {
+			// The group lines still hold a name the renderer would refuse.
+			if safeIfName(br) {
+				plan.IsolatedBridges = append(plan.IsolatedBridges, br)
+			}
+		}
+		sort.Strings(plan.IsolatedBridges)
 		var lbHosts map[string]bool
 		if plan.LBBackends, plan.LBSources, lbHosts, err = loadLBBackends(ctx, db); err != nil {
 			return plan, err
@@ -766,6 +885,7 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 				}
 			}
 		}
+		memory.store(q)
 		return plan, nil
 	}
 }
@@ -1047,7 +1167,11 @@ func guardEntryString(p netip.Prefix) string {
 // chain). The nft comment is fixed text, because nft caps a comment at 128
 // bytes and a group name is unbounded; the names go to the log and the metric.
 func failClosed() []Rule {
-	const why = "ambiguous security group name: held at drop"
+	return failClosedFor("ambiguous security group name: held at drop")
+}
+
+// failClosedFor is failClosed with why as the rules' comment.
+func failClosedFor(why string) []Rule {
 	return []Rule{
 		{Direction: Ingress, Proto: "all", Action: Drop, Comment: why},
 		{Direction: Egress, Proto: "all", Action: Drop, Comment: why},
@@ -1160,14 +1284,15 @@ func intentToNATIsolation(intents []corrosion.HostFWIntent) ([]NATRule, []Isolat
 	return nat, iso
 }
 
-// toFWRules converts the on-disk cluster/host-tier rows into renderer Rules,
-// preserving the operator-supplied comment.
-func toFWRules(in []corrosion.FirewallRule) []Rule {
+// toFWRules converts the on-disk cluster/host-tier rows of table into
+// renderer Rules, preserving the operator-supplied comment. A row that cannot
+// be rendered as written is handled by q.
+func toFWRules(q *quarantine, tg *tagPass, in []corrosion.FirewallRule, table string) []Rule {
 	out := make([]Rule, 0, len(in))
 	for _, r := range in {
-		rule := FromCorrosionRule(r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action)
-		rule.Comment = r.Comment
-		out = append(out, rule)
+		if rule, ok := tg.rule(q, table, r.ID, r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action, r.Comment); ok {
+			out = append(out, rule)
+		}
 	}
 	return out
 }

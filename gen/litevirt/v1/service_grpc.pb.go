@@ -79,6 +79,7 @@ const (
 	LiteVirt_UpdateVM_FullMethodName                   = "/litevirt.v1.LiteVirt/UpdateVM"
 	LiteVirt_SetVMMemory_FullMethodName                = "/litevirt.v1.LiteVirt/SetVMMemory"
 	LiteVirt_SetVMLabels_FullMethodName                = "/litevirt.v1.LiteVirt/SetVMLabels"
+	LiteVirt_PatchVMSpec_FullMethodName                = "/litevirt.v1.LiteVirt/PatchVMSpec"
 	LiteVirt_AttachDevice_FullMethodName               = "/litevirt.v1.LiteVirt/AttachDevice"
 	LiteVirt_DetachDevice_FullMethodName               = "/litevirt.v1.LiteVirt/DetachDevice"
 	LiteVirt_ResizeDisk_FullMethodName                 = "/litevirt.v1.LiteVirt/ResizeDisk"
@@ -158,6 +159,7 @@ const (
 	LiteVirt_NormalizeRoleBindings_FullMethodName      = "/litevirt.v1.LiteVirt/NormalizeRoleBindings"
 	LiteVirt_GetVMOperation_FullMethodName             = "/litevirt.v1.LiteVirt/GetVMOperation"
 	LiteVirt_AbortVMOperation_FullMethodName           = "/litevirt.v1.LiteVirt/AbortVMOperation"
+	LiteVirt_ReleaseHostReservation_FullMethodName     = "/litevirt.v1.LiteVirt/ReleaseHostReservation"
 	LiteVirt_BeginWebAuthnRegistration_FullMethodName  = "/litevirt.v1.LiteVirt/BeginWebAuthnRegistration"
 	LiteVirt_FinishWebAuthnRegistration_FullMethodName = "/litevirt.v1.LiteVirt/FinishWebAuthnRegistration"
 	LiteVirt_BeginWebAuthnLogin_FullMethodName         = "/litevirt.v1.LiteVirt/BeginWebAuthnLogin"
@@ -290,6 +292,7 @@ const (
 	LiteVirt_FirmwareMoveDoctorTarget_FullMethodName   = "/litevirt.v1.LiteVirt/FirmwareMoveDoctorTarget"
 	LiteVirt_ReceiveMigrationDisk_FullMethodName       = "/litevirt.v1.LiteVirt/ReceiveMigrationDisk"
 	LiteVirt_CheckCPUCompatibility_FullMethodName      = "/litevirt.v1.LiteVirt/CheckCPUCompatibility"
+	LiteVirt_AnnounceMigratedGuest_FullMethodName      = "/litevirt.v1.LiteVirt/AnnounceMigratedGuest"
 	LiteVirt_GetStateDigest_FullMethodName             = "/litevirt.v1.LiteVirt/GetStateDigest"
 	LiteVirt_AcknowledgeLeaseTermTie_FullMethodName    = "/litevirt.v1.LiteVirt/AcknowledgeLeaseTermTie"
 	LiteVirt_GetLeaseTermHighWater_FullMethodName      = "/litevirt.v1.LiteVirt/GetLeaseTermHighWater"
@@ -333,6 +336,8 @@ const (
 	LiteVirt_CrossRegionMigrate_FullMethodName         = "/litevirt.v1.LiteVirt/CrossRegionMigrate"
 	LiteVirt_GetFailoverScope_FullMethodName           = "/litevirt.v1.LiteVirt/GetFailoverScope"
 	LiteVirt_SetFailoverScope_FullMethodName           = "/litevirt.v1.LiteVirt/SetFailoverScope"
+	LiteVirt_GetVRRPTransport_FullMethodName           = "/litevirt.v1.LiteVirt/GetVRRPTransport"
+	LiteVirt_SetVRRPTransport_FullMethodName           = "/litevirt.v1.LiteVirt/SetVRRPTransport"
 	LiteVirt_GetHAPolicy_FullMethodName                = "/litevirt.v1.LiteVirt/GetHAPolicy"
 	LiteVirt_SetHAPolicy_FullMethodName                = "/litevirt.v1.LiteVirt/SetHAPolicy"
 	LiteVirt_RestoreRelay_FullMethodName               = "/litevirt.v1.LiteVirt/RestoreRelay"
@@ -489,6 +494,10 @@ type LiteVirtClient interface {
 	// SetVMLabels replaces a VM's labels/tags. Metadata-only (not in the domain
 	// XML), so it applies to running VMs without a redefine.
 	SetVMLabels(ctx context.Context, in *SetVMLabelsRequest, opts ...grpc.CallOption) (*VM, error)
+	// PatchVMSpec writes named fields of a desired spec onto a VM's stored
+	// spec, on the host that answers. Peer only: the owner of a VM serialises
+	// its spec edits, so a deploy entering elsewhere forwards its patch here.
+	PatchVMSpec(ctx context.Context, in *PatchVMSpecRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	AttachDevice(ctx context.Context, in *AttachDeviceRequest, opts ...grpc.CallOption) (*VM, error)
 	DetachDevice(ctx context.Context, in *DetachDeviceRequest, opts ...grpc.CallOption) (*VM, error)
 	ResizeDisk(ctx context.Context, in *ResizeDiskRequest, opts ...grpc.CallOption) (*VM, error)
@@ -616,6 +625,7 @@ type LiteVirtClient interface {
 	NormalizeRoleBindings(ctx context.Context, in *NormalizeRoleBindingsRequest, opts ...grpc.CallOption) (*NormalizeRoleBindingsResponse, error)
 	GetVMOperation(ctx context.Context, in *GetVMOperationRequest, opts ...grpc.CallOption) (*GetVMOperationResponse, error)
 	AbortVMOperation(ctx context.Context, in *AbortVMOperationRequest, opts ...grpc.CallOption) (*AbortVMOperationResponse, error)
+	ReleaseHostReservation(ctx context.Context, in *ReleaseHostReservationRequest, opts ...grpc.CallOption) (*ReleaseHostReservationResponse, error)
 	BeginWebAuthnRegistration(ctx context.Context, in *BeginWebAuthnRegistrationRequest, opts ...grpc.CallOption) (*BeginWebAuthnRegistrationResponse, error)
 	FinishWebAuthnRegistration(ctx context.Context, in *FinishWebAuthnRegistrationRequest, opts ...grpc.CallOption) (*FinishWebAuthnRegistrationResponse, error)
 	BeginWebAuthnLogin(ctx context.Context, in *BeginWebAuthnLoginRequest, opts ...grpc.CallOption) (*BeginWebAuthnLoginResponse, error)
@@ -823,6 +833,9 @@ type LiteVirtClient interface {
 	// being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
 	ReceiveMigrationDisk(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse], error)
 	CheckCPUCompatibility(ctx context.Context, in *CheckCPUCompatibilityRequest, opts ...grpc.CallOption) (*CheckCPUCompatibilityResponse, error)
+	// Peer only: a live migration of vm_name to this host has completed;
+	// announce the gateway of each of its networks from this host's bridge.
+	AnnounceMigratedGuest(ctx context.Context, in *AnnounceMigratedGuestRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// ── Internal: State Sync ──
 	GetStateDigest(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDigestResponse, error)
 	// AcknowledgeLeaseTermTie records that an operator has seen a contested
@@ -971,6 +984,14 @@ type LiteVirtClient interface {
 	// and while any voter is unreachable from the answering host.
 	GetFailoverScope(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*FailoverScopeStatus, error)
 	SetFailoverScope(ctx context.Context, in *SetFailoverScopeRequest, opts ...grpc.CallOption) (*FailoverScopeStatus, error)
+	// GetVRRPTransport reports the load balancers' VRRP transport as the
+	// answering host renders it, and the cluster-wide policy behind it.
+	// SetVRRPTransport records the operator's choice (admin), "unicast" or
+	// "multicast", which every host then renders. It refuses until
+	// failover_scope_v1 has durably latched, "unicast" refuses until
+	// vrrp_unicast_v1 has, and both refuse while any voter is unreachable.
+	GetVRRPTransport(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*VRRPTransportStatus, error)
+	SetVRRPTransport(ctx context.Context, in *SetVRRPTransportRequest, opts ...grpc.CallOption) (*VRRPTransportStatus, error)
 	// GetHAPolicy reports the cluster HA policy (armed or disarmed) and its
 	// confirmation; SetHAPolicy changes it (admin). While disarmed, no host is
 	// fenced and no workload is recovered automatically.
@@ -1762,6 +1783,16 @@ func (c *liteVirtClient) SetVMLabels(ctx context.Context, in *SetVMLabelsRequest
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(VM)
 	err := c.cc.Invoke(ctx, LiteVirt_SetVMLabels_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) PatchVMSpec(ctx context.Context, in *PatchVMSpecRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_PatchVMSpec_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2654,6 +2685,16 @@ func (c *liteVirtClient) AbortVMOperation(ctx context.Context, in *AbortVMOperat
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(AbortVMOperationResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_AbortVMOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ReleaseHostReservation(ctx context.Context, in *ReleaseHostReservationRequest, opts ...grpc.CallOption) (*ReleaseHostReservationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseHostReservationResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ReleaseHostReservation_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4076,6 +4117,16 @@ func (c *liteVirtClient) CheckCPUCompatibility(ctx context.Context, in *CheckCPU
 	return out, nil
 }
 
+func (c *liteVirtClient) AnnounceMigratedGuest(ctx context.Context, in *AnnounceMigratedGuestRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_AnnounceMigratedGuest_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) GetStateDigest(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDigestResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StateDigestResponse)
@@ -4572,6 +4623,26 @@ func (c *liteVirtClient) SetFailoverScope(ctx context.Context, in *SetFailoverSc
 	return out, nil
 }
 
+func (c *liteVirtClient) GetVRRPTransport(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*VRRPTransportStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VRRPTransportStatus)
+	err := c.cc.Invoke(ctx, LiteVirt_GetVRRPTransport_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) SetVRRPTransport(ctx context.Context, in *SetVRRPTransportRequest, opts ...grpc.CallOption) (*VRRPTransportStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VRRPTransportStatus)
+	err := c.cc.Invoke(ctx, LiteVirt_SetVRRPTransport_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) GetHAPolicy(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*HAPolicyStatus, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(HAPolicyStatus)
@@ -5059,6 +5130,10 @@ type LiteVirtServer interface {
 	// SetVMLabels replaces a VM's labels/tags. Metadata-only (not in the domain
 	// XML), so it applies to running VMs without a redefine.
 	SetVMLabels(context.Context, *SetVMLabelsRequest) (*VM, error)
+	// PatchVMSpec writes named fields of a desired spec onto a VM's stored
+	// spec, on the host that answers. Peer only: the owner of a VM serialises
+	// its spec edits, so a deploy entering elsewhere forwards its patch here.
+	PatchVMSpec(context.Context, *PatchVMSpecRequest) (*emptypb.Empty, error)
 	AttachDevice(context.Context, *AttachDeviceRequest) (*VM, error)
 	DetachDevice(context.Context, *DetachDeviceRequest) (*VM, error)
 	ResizeDisk(context.Context, *ResizeDiskRequest) (*VM, error)
@@ -5186,6 +5261,7 @@ type LiteVirtServer interface {
 	NormalizeRoleBindings(context.Context, *NormalizeRoleBindingsRequest) (*NormalizeRoleBindingsResponse, error)
 	GetVMOperation(context.Context, *GetVMOperationRequest) (*GetVMOperationResponse, error)
 	AbortVMOperation(context.Context, *AbortVMOperationRequest) (*AbortVMOperationResponse, error)
+	ReleaseHostReservation(context.Context, *ReleaseHostReservationRequest) (*ReleaseHostReservationResponse, error)
 	BeginWebAuthnRegistration(context.Context, *BeginWebAuthnRegistrationRequest) (*BeginWebAuthnRegistrationResponse, error)
 	FinishWebAuthnRegistration(context.Context, *FinishWebAuthnRegistrationRequest) (*FinishWebAuthnRegistrationResponse, error)
 	BeginWebAuthnLogin(context.Context, *BeginWebAuthnLoginRequest) (*BeginWebAuthnLoginResponse, error)
@@ -5393,6 +5469,9 @@ type LiteVirtServer interface {
 	// being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
 	ReceiveMigrationDisk(grpc.ClientStreamingServer[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse]) error
 	CheckCPUCompatibility(context.Context, *CheckCPUCompatibilityRequest) (*CheckCPUCompatibilityResponse, error)
+	// Peer only: a live migration of vm_name to this host has completed;
+	// announce the gateway of each of its networks from this host's bridge.
+	AnnounceMigratedGuest(context.Context, *AnnounceMigratedGuestRequest) (*emptypb.Empty, error)
 	// ── Internal: State Sync ──
 	GetStateDigest(context.Context, *emptypb.Empty) (*StateDigestResponse, error)
 	// AcknowledgeLeaseTermTie records that an operator has seen a contested
@@ -5541,6 +5620,14 @@ type LiteVirtServer interface {
 	// and while any voter is unreachable from the answering host.
 	GetFailoverScope(context.Context, *emptypb.Empty) (*FailoverScopeStatus, error)
 	SetFailoverScope(context.Context, *SetFailoverScopeRequest) (*FailoverScopeStatus, error)
+	// GetVRRPTransport reports the load balancers' VRRP transport as the
+	// answering host renders it, and the cluster-wide policy behind it.
+	// SetVRRPTransport records the operator's choice (admin), "unicast" or
+	// "multicast", which every host then renders. It refuses until
+	// failover_scope_v1 has durably latched, "unicast" refuses until
+	// vrrp_unicast_v1 has, and both refuse while any voter is unreachable.
+	GetVRRPTransport(context.Context, *emptypb.Empty) (*VRRPTransportStatus, error)
+	SetVRRPTransport(context.Context, *SetVRRPTransportRequest) (*VRRPTransportStatus, error)
 	// GetHAPolicy reports the cluster HA policy (armed or disarmed) and its
 	// confirmation; SetHAPolicy changes it (admin). While disarmed, no host is
 	// fenced and no workload is recovered automatically.
@@ -5880,6 +5967,9 @@ func (UnimplementedLiteVirtServer) SetVMMemory(context.Context, *SetVMMemoryRequ
 func (UnimplementedLiteVirtServer) SetVMLabels(context.Context, *SetVMLabelsRequest) (*VM, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetVMLabels not implemented")
 }
+func (UnimplementedLiteVirtServer) PatchVMSpec(context.Context, *PatchVMSpecRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method PatchVMSpec not implemented")
+}
 func (UnimplementedLiteVirtServer) AttachDevice(context.Context, *AttachDeviceRequest) (*VM, error) {
 	return nil, status.Error(codes.Unimplemented, "method AttachDevice not implemented")
 }
@@ -6116,6 +6206,9 @@ func (UnimplementedLiteVirtServer) GetVMOperation(context.Context, *GetVMOperati
 }
 func (UnimplementedLiteVirtServer) AbortVMOperation(context.Context, *AbortVMOperationRequest) (*AbortVMOperationResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AbortVMOperation not implemented")
+}
+func (UnimplementedLiteVirtServer) ReleaseHostReservation(context.Context, *ReleaseHostReservationRequest) (*ReleaseHostReservationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseHostReservation not implemented")
 }
 func (UnimplementedLiteVirtServer) BeginWebAuthnRegistration(context.Context, *BeginWebAuthnRegistrationRequest) (*BeginWebAuthnRegistrationResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method BeginWebAuthnRegistration not implemented")
@@ -6513,6 +6606,9 @@ func (UnimplementedLiteVirtServer) ReceiveMigrationDisk(grpc.ClientStreamingServ
 func (UnimplementedLiteVirtServer) CheckCPUCompatibility(context.Context, *CheckCPUCompatibilityRequest) (*CheckCPUCompatibilityResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckCPUCompatibility not implemented")
 }
+func (UnimplementedLiteVirtServer) AnnounceMigratedGuest(context.Context, *AnnounceMigratedGuestRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method AnnounceMigratedGuest not implemented")
+}
 func (UnimplementedLiteVirtServer) GetStateDigest(context.Context, *emptypb.Empty) (*StateDigestResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetStateDigest not implemented")
 }
@@ -6641,6 +6737,12 @@ func (UnimplementedLiteVirtServer) GetFailoverScope(context.Context, *emptypb.Em
 }
 func (UnimplementedLiteVirtServer) SetFailoverScope(context.Context, *SetFailoverScopeRequest) (*FailoverScopeStatus, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetFailoverScope not implemented")
+}
+func (UnimplementedLiteVirtServer) GetVRRPTransport(context.Context, *emptypb.Empty) (*VRRPTransportStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetVRRPTransport not implemented")
+}
+func (UnimplementedLiteVirtServer) SetVRRPTransport(context.Context, *SetVRRPTransportRequest) (*VRRPTransportStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetVRRPTransport not implemented")
 }
 func (UnimplementedLiteVirtServer) GetHAPolicy(context.Context, *emptypb.Empty) (*HAPolicyStatus, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetHAPolicy not implemented")
@@ -7768,6 +7870,24 @@ func _LiteVirt_SetVMLabels_Handler(srv interface{}, ctx context.Context, dec fun
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).SetVMLabels(ctx, req.(*SetVMLabelsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_PatchVMSpec_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PatchVMSpecRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PatchVMSpec(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PatchVMSpec_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PatchVMSpec(ctx, req.(*PatchVMSpecRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -9076,6 +9196,24 @@ func _LiteVirt_AbortVMOperation_Handler(srv interface{}, ctx context.Context, de
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).AbortVMOperation(ctx, req.(*AbortVMOperationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ReleaseHostReservation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseHostReservationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReleaseHostReservation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReleaseHostReservation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReleaseHostReservation(ctx, req.(*ReleaseHostReservationRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -11338,6 +11476,24 @@ func _LiteVirt_CheckCPUCompatibility_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_AnnounceMigratedGuest_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AnnounceMigratedGuestRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).AnnounceMigratedGuest(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_AnnounceMigratedGuest_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).AnnounceMigratedGuest(ctx, req.(*AnnounceMigratedGuestRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_GetStateDigest_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(emptypb.Empty)
 	if err := dec(in); err != nil {
@@ -12048,6 +12204,42 @@ func _LiteVirt_SetFailoverScope_Handler(srv interface{}, ctx context.Context, de
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).SetFailoverScope(ctx, req.(*SetFailoverScopeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_GetVRRPTransport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetVRRPTransport(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetVRRPTransport_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetVRRPTransport(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SetVRRPTransport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetVRRPTransportRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SetVRRPTransport(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SetVRRPTransport_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SetVRRPTransport(ctx, req.(*SetVRRPTransportRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -12909,6 +13101,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_SetVMLabels_Handler,
 		},
 		{
+			MethodName: "PatchVMSpec",
+			Handler:    _LiteVirt_PatchVMSpec_Handler,
+		},
+		{
 			MethodName: "AttachDevice",
 			Handler:    _LiteVirt_AttachDevice_Handler,
 		},
@@ -13167,6 +13363,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AbortVMOperation",
 			Handler:    _LiteVirt_AbortVMOperation_Handler,
+		},
+		{
+			MethodName: "ReleaseHostReservation",
+			Handler:    _LiteVirt_ReleaseHostReservation_Handler,
 		},
 		{
 			MethodName: "BeginWebAuthnRegistration",
@@ -13641,6 +13841,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_CheckCPUCompatibility_Handler,
 		},
 		{
+			MethodName: "AnnounceMigratedGuest",
+			Handler:    _LiteVirt_AnnounceMigratedGuest_Handler,
+		},
+		{
 			MethodName: "GetStateDigest",
 			Handler:    _LiteVirt_GetStateDigest_Handler,
 		},
@@ -13779,6 +13983,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetFailoverScope",
 			Handler:    _LiteVirt_SetFailoverScope_Handler,
+		},
+		{
+			MethodName: "GetVRRPTransport",
+			Handler:    _LiteVirt_GetVRRPTransport_Handler,
+		},
+		{
+			MethodName: "SetVRRPTransport",
+			Handler:    _LiteVirt_SetVRRPTransport_Handler,
 		},
 		{
 			MethodName: "GetHAPolicy",

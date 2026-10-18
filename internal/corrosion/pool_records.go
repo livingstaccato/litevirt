@@ -58,8 +58,12 @@ const (
 )
 
 // SetPoolRecord writes one pool-file record row. It refuses with
-// ErrClusterPolicyGateClosed until failover_scope_v1 has latched.
+// ErrClusterPolicyGateClosed until failover_scope_v1 has latched, and refuses
+// a firewall-tags or tag-group key (refuseReservedPolicyKey).
 func SetPoolRecord(ctx context.Context, c *Client, key, value, setBy string) error {
+	if err := refuseReservedPolicyKey(key); err != nil {
+		return err
+	}
 	if !c.MayWriteClusterPolicy() {
 		return ErrClusterPolicyGateClosed
 	}

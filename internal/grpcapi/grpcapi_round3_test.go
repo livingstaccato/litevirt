@@ -1899,9 +1899,9 @@ func TestR3_HostStateToPB_AllStates(t *testing.T) {
 		{"maintenance", pb.HostState_HOST_MAINTENANCE},
 		{"suspect", pb.HostState_HOST_SUSPECT},
 		{"offline", pb.HostState_HOST_OFFLINE},
-		{"fenced", pb.HostState_HOST_OFFLINE},     // fenced ⇒ down, never ACTIVE
-		{"upgrading", pb.HostState_HOST_DRAINING}, // transient, never ACTIVE
-		{"unknown", pb.HostState_HOST_OFFLINE},    // default fails safe (not ACTIVE)
+		{"fenced", pb.HostState_HOST_FENCED},       // fenced ⇒ down, never ACTIVE
+		{"upgrading", pb.HostState_HOST_UPGRADING}, // transient, never ACTIVE
+		{"unknown", pb.HostState_HOST_OFFLINE},     // default fails safe (not ACTIVE)
 	}
 	for _, tt := range tests {
 		got := hostStateToPB(tt.input)

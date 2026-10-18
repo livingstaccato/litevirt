@@ -320,7 +320,16 @@ func newHostUndrainCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "undrain <host>",
 		Short: "Return host to active scheduling",
-		Long: `Return a draining or maintenance host to active scheduling.
+		Long: `Return a draining, maintenance, fenced or offline host to active scheduling.
+
+It records the host active whatever it is recorded as now, except a host
+recorded upgrading (a restart): that one only if its daemon answers a Ping,
+and otherwise the undrain is refused, since the host turns active by itself
+once its daemon serves. For a fenced or
+offline host that ends the fence: the failover leader no longer resumes a
+recovery from it, and the host may run workloads again. Confirm it should
+first. A host whose own boot kept its fence (condition boot_kept_fence) needs
+this to return.
 
 By itself this moves nothing back. VMs a drain moved away return when they opted
 in (placement.failback in compose) or the cluster policy is on (lv cluster

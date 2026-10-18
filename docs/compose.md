@@ -148,6 +148,11 @@ alone, logged at WARN, and reported as `kept <name>: ...`, naming the stack it
 belongs to. Such a VM is not counted as a deletion. A stack network that such a VM (or a
 container the stack did not create) is attached to is kept too, reported as
 `kept network <name>: used by ...`, so it is not pulled out from under it.
+In a stack whose last deploy failed (`degraded`), a member the stored file
+names that no host has, because its create failed, is reported as
+`absent <name>: never created; nothing to delete`, and is neither a deletion
+nor a failure. It is taken as absent only when this host has no record of it
+and every other host was asked and answered that it has none.
 
 `compose down` follows the same rule. It ends with `Stack "<name>" torn down.`
 and exit status 0 only when every VM and container was deleted, every stack
@@ -157,9 +162,20 @@ not even be listed — each failure is printed, named for what was left (a VM or
 container name, `network <name>`, `containers (list failed)`, `firewall rows`
 or `backup repos`), the success line is withheld, and the command
 exits non-zero with a summary such as `stack "web": 1 of 3 deletions failed
-(web-2)`. The stack is then left in state `deleting`, the daemon keeps retrying
-the teardown in the background, and the `stack.delete` audit entry has result
-`error` and names what was not removed. While any of the stack's VMs or
+(web-2)`. A member VM that another delete removed first (`lv rm`, or the
+background retry) counts as deleted. The stack is then left in state
+`deleting`, the daemon keeps retrying the teardown in the background (it takes
+a teardown up no sooner than a minute after it began, leaving a `compose down`
+still running to finish, and keeps the VMs' disks when the teardown was asked
+to keep them, `keep_disks` on the REST or gRPC stack delete, or was begun by a
+host that did not record whether it was; disks kept for that last reason are
+named by `disk_leftover`), and
+the `stack.delete` audit entry has result
+`error` and names what was not removed. A `compose up` of a stack in state
+`deleting` is refused until the teardown has finished: wait until
+`lv compose ls` no longer lists it, then run `lv compose up` again. If the
+teardown does not finish, `lv compose down --name <stack>` retries it, and
+`lv rm <vm> --force` clears a member that is stuck. While any of the stack's VMs or
 containers is left, none of its networks is deprovisioned: a deleted network
 is torn down on every host, and would be pulled out from under that workload.
 The background retry deletes the remaining VMs and containers first, and
@@ -812,7 +828,7 @@ Defining a `loadbalancer` section automatically provisions HAProxy + keepalived 
 designated hosts. The VIP floats between hosts using VRRP (keepalived), and HAProxy
 handles traffic distribution to backend VMs.
 
-Standalone load balancers (not tied to a stack) can also be created with `lv lb create`.
+Standalone load balancers (not tied to a stack) can also be created with `lv lb create`. Its `--snat` flag is this section's `snat:`, off unless given (see [SNAT via VIP](#snat-via-vip)).
 
 ```yaml
     loadbalancer:
@@ -829,19 +845,43 @@ Standalone load balancers (not tied to a stack) can also be created with `lv lb 
         - listen: 80                    # VIP listener port
           target: 8080                  # Backend VM port
           protocol: "tcp"               # tcp | http
-          redirect-https: false         # Redirect HTTP to HTTPS
+          redirect-https: false         # Redirect HTTP to HTTPS (see below)
         - listen: 443
           target: 8443
           protocol: "tcp"
-          tls:                          # TLS termination (optional)
-            cert: "/path/to/cert.pem"
-            key: "/path/to/key.pem"
+          tls:                          # TLS termination (optional; see below)
+            cert: "/etc/litevirt/lb-certs/web.crt"
+            key: "/etc/litevirt/lb-certs/web.key"
       health:
         use-vm-healthcheck: true        # Reuse VM healthcheck for backend health
         type: "http"                    # tcp | http
         path: "/health"                 # HTTP health check path
         interval-ms: 2000               # Check interval in milliseconds
 ```
+
+A stack has one load balancer. Copies of one definition, from a base the VMs `extends` or a YAML anchor, are that one load balancer; two different definitions are refused. The stack's `name` must use only letters, digits, `_`, `.` and `-`.
+
+Values are checked before anything is deployed:
+
+- `algorithm` is `roundrobin`, `leastconn` or `source`.
+- `protocol` and `health.type` are `tcp` or `http`.
+- `health.path` is one absolute path of visible ASCII, without spaces, quotes, `#`, `\` or braces, at most 512 characters.
+- `redirect-https` needs `protocol: http`, no `tls` on the same port, and a `tls` port on the same load balancer to redirect to. A spec stored before this check with any other redirect is served without that redirect, and a `lb.redirect_ignored` event says so.
+
+**TLS files** are read as root on every LB host, from `/etc/litevirt/lb-certs/`. Naming a file anywhere else needs the admin role. A symlink is followed (Let's Encrypt's `live/` names work, for example a symlink in `/etc/litevirt/lb-certs/` to them), and every check applies to the file it reaches: a regular file of at most 1 MiB, never under the PKI directory, the data directory or `/etc/litevirt/lb`. A path in `/etc/litevirt/lb-certs/` is read only while that directory, and every directory below it on the way to the file, is a real directory owned by root and writable by no one else. A file that is not a regular file is refused without being opened for reading, including one swapped in after the path was checked. An LB stored before this rule with files elsewhere keeps working, and each apply raises a `lb.tls_outside_cert_dir` event that names the file.
+
+**Where the VIP goes**: a VIP inside a network's subnet is put on that network's
+bridge on each LB host (a stack LB considers only its own stack's networks and
+networks of no stack; when several subnets hold it: its own stack's network
+first, then the most specific subnet), whether
+or not the bridge carries an address in the subnet. A stack's `bridge` network
+may be on its scoped name (`<stack>_<name>`) or on its own name on a given host;
+the scoped name is tried first, and the own name is taken only when no other
+network may be on it, or when it carries an address in the network's subnet.
+If that bridge is not on the host, or which network a shared name belongs to
+cannot be told, the LB is refused there with the network and bridge named. The
+LB's VIP ports and SNAT are recorded for that same network. A VIP in no network's subnet goes on the host device
+whose subnet holds it, else on the default-route device.
 
 All VMs in the stack automatically become backends. Backend IPs are discovered via
 ARP/DHCP after boot and persisted in the cluster database. **Containers in the stack
@@ -897,11 +937,66 @@ How it works:
 
 Requirements:
 
+- `snat:` applies on every LB host; with it unset or `false`, no LB host rewrites the network's egress
+- A load balancer made with `lv lb create` SNATs only with `--snat`, and `lv lb update <name> --snat` or `--snat=false` changes it later; `lv lb inspect` shows the setting and `lv lb ls`, inspect and the web UI show it as on, off, or unknown when the daemon could not read it (the LB may be SNATting). The web UI's create form has a "SNAT (outbound NAT via the VIP)" checkbox, unticked by default. One created before this setting existed keeps SNATting until it is set. Until every host runs a release with this setting (`failover_scope_v1` latched, as `lv cluster upgrade-status` shows), `lv lb create` without `--snat` is refused, `lv lb create --snat` works, and `lv lb update --snat` is refused. An LB host on an earlier build SNATs for every load balancer it serves, so during a rolling upgrade inspect shows the setting, not what each LB host applied. A host rolled back below this release does the same ([upgrades.md](upgrades.md#manual-rollback-anytime))
 - The VIP must be routable from the upstream network
 - IP forwarding is enabled automatically
-- The IRB gateway on the bridge is set up by the VXLAN provisioner
+- The network's bridge carries the VMs' gateway (see [Host isolation](#host-isolation)): a `vxlan` network, or a `bridge` network on a bridge litevirt created, with no `vlan`
+- It does not apply to an `isolated` network: nothing is routed off its bridge
 
-**Conntrackd for failover**: When `snat: true` is set, litevirt automatically runs `conntrackd` alongside keepalived to replicate conntrack state between VRRP peers. On failover, the new MASTER imports synced entries so existing SNAT'd connections survive. This is managed automatically — no additional configuration is needed.
+**VRRP transport**: once every host runs a release with `vrrp_unicast_v1`, each LB
+host sends its VRRP adverts as unicast from its recorded address to the other LB
+hosts' recorded addresses, over the device that holds its own, and accepts adverts
+only from them. The VIP stays on its network's bridge; nothing VRRP is sent on that
+bridge, and there is no password for a guest to read. Before that, the adverts are
+multicast on the VIP's bridge with a password derived from the LB's name, as on
+earlier releases, and any guest on that bridge can read them.
+
+The transport is one value for the whole cluster, read by every LB host from the
+replicated `cluster_policies` table, whatever its own configuration or latch: what an
+admin sets with `lv cluster vrrp-transport unicast` or
+`lv cluster vrrp-transport multicast`, else unicast once the latch has been
+recorded there, else multicast. The first host whose `vrrp_unicast_v1` latch is
+durable records it, which also needs `failover_scope_v1` latched on that host
+(the table is not writable before), so on an upgrade the switch waits for both
+tokens. Until the record exists every host stays multicast. Each host re-applies
+its LBs within 2 seconds of the record (or an admin's change) reaching it, so an
+LB is held by both its hosts for about as long as the record takes to replicate
+between them plus 2 seconds — seconds on a healthy cluster, longer only while
+replication to one of them is lagging. `lv cluster vrrp-transport` with no
+argument shows what the connected host renders.
+
+Requirements and edges of the unicast transport:
+
+- Hosts must pass IP protocol 112 between their recorded addresses. Where something
+  between them does not, run `lv cluster vrrp-transport multicast`.
+- A host must hold its recorded address (`advertise_address`) on a local device
+  that is up and is not loopback. Otherwise it cannot render unicast for its LBs:
+  it raises the critical health condition `lb.vrrp.transport_refused` naming each
+  LB. When another host of the LB reports serving it on unicast, it stops its own
+  keepalived for the LB, so that host holds the VIP alone; when none does (they
+  are refused too, down, unreachable, or cannot hold the VIP because its device
+  is down or has no carrier), it runs the LB on multicast, so the LB always keeps
+  a holder, and stops it again once one serves. Fix the address or the device; where
+  the address cannot be on a local device — 1:1 NAT, an address routed to `lo` —
+  run `lv cluster vrrp-transport multicast`. A failed read of the policy or an
+  address is not a refusal: what runs is kept, and the next pass retries.
+- A host in an LB's `hosts` that has no recorded address (it was removed with
+  `lv host rm`) is not a VRRP peer, and the event `lb.vrrp_peer_dropped` names it.
+  With no peer left the remaining host serves the VIP alone. Correct the list with
+  `lv lb update <name> --host <host>` (repeated for each host).
+- An LB host on an earlier build (or rolled back) that is back in the cluster
+  renders multicast, and both hold the VIP. Each LB host that renders unicast
+  raises the critical health condition `lb.vrrp.transport_split`, naming the LB and
+  the host. Upgrade that host, or run `lv cluster vrrp-transport multicast` until
+  it is.
+- keepalived 2.1 or later. On 2.0 the instance's source check and a single LB
+  host's TTL range are ignored (litevirt also renders the global
+  `vrrp_check_unicast_src`, which 2.0 honours).
+
+A guest's VRRP to its own host is dropped either way ([firewall.md](firewall.md)).
+
+**Conntrackd for failover**: When `snat: true` is set and the LB has two or more `hosts`, litevirt automatically runs `conntrackd` alongside keepalived to replicate conntrack state between VRRP peers, over the hosts' recorded addresses. Each LB host syncs with the first other host in `hosts`. On failover, the new MASTER imports synced entries so existing SNAT'd connections survive. This is managed automatically — no additional configuration is needed.
 
 ## Health checks
 
@@ -1248,6 +1343,24 @@ networks:
     external: true          # Use pre-existing network, don't create/destroy
 ```
 
+A stack `bridge` network with no `interface` is on its scoped bridge
+`<stack>_<name>` (the hashed `lvf-<11 hex>` form when that is over 15
+characters), the same on every host, so two stacks that each declare a bridge
+network of one name are never on one bridge. A network already deployed keeps
+the bridge its record names. A network named after a bridge the deploying host
+already has, which litevirt did not create and no stack network is on, is put
+on that bridge; to attach to a host bridge in any other case, name it with
+`interface:`. A NIC, bond or VLAN of the network's name is not a bridge and is
+not used. A host bridge a stack network (of another stack or of this one) is
+already on is not shared by name: the network gets its scoped bridge and the
+deploy warns, naming what is on it (event `network.host_bridge_not_shared`); to
+share it, set `interface:` to it and redeploy. A `direct` network with no `interface` uses the host NIC of its
+own name. When a stack's bridge network is on the same bridge as another
+stack's network, the deploy warns, naming both stacks and the bridge (the entry
+host also publishes a `network.bridge_shared` event); if that is not intended,
+set `interface:` to the scoped name and redeploy to move the network to its own
+bridge.
+
 ### `netbox-prefix-id` is parsed and refused
 
 `netbox-prefix-id` is a real key on a compose network definition — the parser
@@ -1280,10 +1393,10 @@ Setting `host-isolation: true` on a network blocks all traffic from VMs to the h
 This follows the cloud provider model (AWS, DigitalOcean, GCP): the hypervisor is invisible to VMs. When host isolation is enabled:
 
 - **No dnsmasq** — DHCP/DNS does not run on the bridge. No host process listens.
-- **Static IPs via cloud-init** — IPAM still allocates IPs, but they are delivered via cloud-init V1 network-config (distro-agnostic: works on Ubuntu, CentOS, Debian, Arch, Alpine).
+- **Static IPs via cloud-init** — IPAM still allocates IPs, but they are delivered via cloud-init network-config (MAC-matched, distro-agnostic: works on Ubuntu, CentOS, Debian, Arch, Alpine). A VM NIC that names no `ip:` is given a free address in the network's IPv4 subnet; never the gateway, a `reserved-addresses` entry, a live load balancer's VIP, or a VIP named by the VM's own `loadbalancer:` or by a VM of its stack created before it. A VIP named by a VM of the stack that is created later is not known yet: list it in `reserved-addresses`. The address is recorded on the NIC (`lv inspect`). Each host starts its search at a different point of the subnet. Two VMs created on two hosts at the same instant can still be given the same address; each host then records a `network.duplicate_address` event on its VMs that hold it (`lv events`). Name `ip:` explicitly where that matters. A network without a subnet, or with an IPv6 one, gives no address: name one with `ip:`.
 - **DNS from config** — resolvers come from the `dns` field (defaults to `["1.1.1.1", "8.8.8.8"]`).
-- **IRB gateway stays** — the host keeps a gateway IP on the bridge for routing (FORWARD). VMs still have a default route. But no host *services* are reachable (INPUT is dropped).
-- **No implicit NAT** — outbound internet access requires explicit `snat: true` on a load balancer (see below).
+- **Gateway stays** — the host keeps the subnet's first address on the bridge as the VMs' gateway, for routing (FORWARD): always on a `vxlan` network (its IRB anycast gateway), and on a `bridge` network when litevirt created the bridge on that host and the network has no `vlan`. A bridge litevirt did not create, a VLAN bridge, and a host-isolated `isolated` network get no gateway address; so does a bridge an earlier build created (litevirt keeps no record of it), until the bridge is created again, for example at a reboot. Either way no host *services* are reachable (INPUT is dropped), the gateway address included. Forwarding through the gateway to the host's other networks is not blocked: host isolation keeps guests off the host, not off other networks.
+- **No implicit NAT** — outbound internet access requires explicit `snat: true` on a load balancer, or `--snat` on one made with `lv lb create` (see below; one made before that flag existed SNATs until it is set).
 
 Under the hood, litevirt creates a per-bridge nftables chain on the `input` hook that drops all traffic from the bridge interface. VM-to-VM traffic uses the `forward` hook and is unaffected. VXLAN underlay (UDP 4789) arrives on the physical NIC, not the bridge, so it is also unaffected.
 
@@ -1306,7 +1419,7 @@ When a load balancer VIP lives on an isolated network, litevirt automatically ad
 - **VRRP** (IP protocol 112) — keepalived peer communication
 - **VIP ports** — only the declared listener ports on the VIP address
 
-All other traffic from VMs to the host remains blocked. These exceptions are managed automatically when LBs are applied or removed.
+Replies to connections the host opens onto the bridge (HAProxy's health checks and proxied connections to backends there) are accepted too; a reply to any other connection of the host's is not. All other traffic from VMs to the host remains blocked. These exceptions are managed automatically when LBs are applied or removed.
 
 ### External networks
 
@@ -1476,6 +1589,14 @@ force throughout: a default-deny the new file asks for is set before the old
 rows go, and the stack's default is removed only once the new rows are written
 and only when the new file drops it. A redeploy that fails part way leaves the
 cluster denying, with fewer accepts, until the next one succeeds.
+
+A security-group rule or a `firewall.cluster-rules` entry takes
+`cidr: "tag:<group>"`, naming a tag group (`lv firewall tag-group set`). The
+group must already exist, and a stack deploy that holds one is refused until
+the cluster upgrade has finished. A group's members come from firewall tags,
+which a compose file does not set (`lv firewall tag set`, docs/firewall.md,
+"Tag groups"). `lv compose up` asks the daemon first and refuses against one
+that does not know tag groups.
 
 Per-NIC security groups can also be bound at runtime with
 `lv sg bind <vm> --network <name> --sg <name>`. See

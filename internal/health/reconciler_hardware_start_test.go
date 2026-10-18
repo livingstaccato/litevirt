@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
@@ -194,5 +195,37 @@ func TestReconciler_HardwarePreStart_Unwired_Unchanged(t *testing.T) {
 	vm, _ := corrosion.GetVM(ctx, db, "vm1")
 	if vm == nil || vm.State != "running" {
 		t.Fatalf("VM should be running, got %+v", vm)
+	}
+}
+
+// F4 (lab 2 seed hot-plug proof): the start hook tries a stale seed's rebuild
+// again before every start (grpcapi retryStaleSeedForStart). The reconciler's
+// start has already tried the VM's own seed (domainXMLFor, refreshOwnSeed), so
+// it marks the hook's context: a seed whose rebuild fails is tried, and
+// warned about, once per start.
+//
+// Mutation: pass the hook the context unmarked — red.
+func TestReconciler_HardwarePreStart_TheSeedIsTriedOnce(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db,
+		corrosion.VMRecord{Name: "vm1", HostName: "node-a", Spec: "{}", State: "pending"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	fake := libvirtfake.New()
+	r := NewReconciler("node-a", t.TempDir(), db, fake)
+	called, tried := false, false
+	r.SetHardwareStartPreparer(func(hctx context.Context, _ *corrosion.VMRecord) (func(), error) {
+		called, tried = true, cloudinit.SeedTriedForStart(hctx)
+		return func() {}, nil
+	})
+
+	r.startPendingVM(ctx, corrosion.VMRecord{Name: "vm1", HostName: "node-a", Spec: "{}", State: "pending"})
+
+	if !called || !hwStarted(fake, "vm1") {
+		t.Fatalf("setup: hook called=%v, started=%v", called, hwStarted(fake, "vm1"))
+	}
+	if !tried {
+		t.Error("the reconciler's start, which has tried the VM's seed, does not say so to the start hook")
 	}
 }

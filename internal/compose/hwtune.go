@@ -127,6 +127,12 @@ func ApplyDiskTuning(disks []libvirt.DiskConfig, spec *pb.VMSpec) {
 // compose left it unset, and is not always written back to the spec). A NIC
 // whose MAC the spec does not hold at its position is another device and is
 // left alone.
+//
+// A NIC rendered with another model than its entry records takes only the
+// tuning that model can take: no MTU and no multiqueue unless it is virtio.
+// That is a NIC of a stack VM attached again under a detached NIC's MAC with
+// another model, whose entry the attach leaves as the compose file wrote it
+// (rewritten, it would read as a topology change and recreate the VM).
 func ApplyNICTuning(nets []libvirt.NetworkConfig, spec *pb.VMSpec) {
 	if spec == nil || len(spec.Network) == 0 {
 		return
@@ -159,8 +165,24 @@ func ApplyNICTuning(nets []libvirt.NetworkConfig, spec *pb.VMSpec) {
 		if match != nil {
 			nets[i].Queues = int(match.Queues)
 			nets[i].MTU = int(match.Mtu)
+			if model := nicModelOrVirtio(nets[i].Model); model != nicModelOrVirtio(match.Model) {
+				if ValidateNICMTU(model, match.Mtu) != nil {
+					nets[i].MTU = 0
+				}
+				if ValidateQueues(model, match.Queues) != nil {
+					nets[i].Queues = 0
+				}
+			}
 		}
 	}
+}
+
+// nicModelOrVirtio is the model a NIC renders with: virtio when unset.
+func nicModelOrVirtio(model string) string {
+	if model == "" {
+		return "virtio"
+	}
+	return model
 }
 
 // ApplyNICTuningByPosition is ApplyNICTuning for a caller that built its NICs

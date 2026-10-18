@@ -59,7 +59,7 @@ go test ./tests/e2e/ -v -timeout 10m -run TestError
 | `E2E_REST_URL` | `http://<first-host>:7446` | REST API base URL |
 | `E2E_REST_TOKEN` | (skip REST tests) | API token for REST tests |
 | `LV_E2E_DR_REPO` | (skip container replication test) | A backup repo name the second host has in `backup_repos`, initialised, to hold container replicas (`container_replication_test.go`). |
-| `E2E_KNOWN_AUDIT_FORK` | (none) | Comma-separated `<row-id>@<host>` of the audit-log forks already present on the cluster (lab 1: `b9fbdd30d8a95d0c@node-3,9bcb8393aec73858@node-4`; a row is one `lv audit verify` prints under "forked chain" or on a `repeats seq` line, the host the one named on that fork's `repeats seq` lines). `TestAuditVerifyReportsSigningState` then skips only when the first broken row is one of the named rows and every duplicate is on a named host: a fork on another host, any other break or any tampering still fails it |
+| `E2E_KNOWN_AUDIT_FORK` | (none) | Comma-separated `<row-id>@<host>` of the audit-log forks already present on the cluster (lab 1, one entry per forked host, node-5's last: `b9fbdd30d8a95d0c@node-3,9bcb8393aec73858@node-4,1863b6419d3362ee@node-5`; a row is one `lv audit verify` prints under "forked chain" or on a `repeats seq` line, the host the one named on that fork's `repeats seq` lines). `TestAuditVerifyReportsSigningState` then skips only when the first broken row is one of the named rows and every duplicate is on a named host: a fork on another host, any other break or any tampering still fails it |
 | `E2E_SKIP_SLOW` | `0` | Set to `1` to skip migration/backup tests |
 | `E2E_CERT_RENEW` | `0` | Set to `1` to run `TestCert_RenewHostCertificateInPlace`: renews a peer's cluster certificate with `lv host renew-cert` (revoking the old one) and checks gRPC (7443) and libvirt (16514) present the successor and the host stays active. Run on the machine holding the cluster CA key |
 | `E2E_UI_CERT` | `0` | Set to `1` to run `TestCert_UICertificateSetAndClear`: installs a custom UI certificate on this node, checks 127.0.0.1:7445 serves it without a restart, then clears it |
@@ -151,6 +151,7 @@ drive a local `lv`).
 | `E2E_LAB_NODES` | `5` | nodes are `node-1`..`node-N` |
 | `E2E_LAB_EXCLUDE` | (none) | comma-separated node numbers (`3`, `2,4`) the harness leaves alone: they are not baselined, restored, powered on or picked, and are ignored in the voter-set check. For a lab with a node deliberately frozen or wedged |
 | `E2E_LAB_SOCKET_DIR` | `<user cache dir>/litevirt-e2e-ssh` | where the SSH control sockets are made, outside the lab checkout; keep it short, since unix socket paths cap near 100 characters |
+| `E2E_LAB_PREFIX` | `10.77.0` | the first three octets of the lab's IPv4 /24; node N is `<prefix>.(10+N)`. Lab 2 is `10.78.0`, lab 3 `10.79.0`. A malformed value fails the run |
 | `E2E_LAB_PORT_BASE` | `2230` | node N's SSH is `127.0.0.1:(base+N)` |
 | `E2E_EVIDENCE_DIR` | (none) | per drill: `samples.log` (every sample), `timeline.txt`, extra evidence |
 | `E2E_DRILL_IMAGE` / `E2E_DRILL_MEMORY` | `cirros` / `128M` | the drills' own test VMs |
@@ -178,11 +179,25 @@ probe constants drift from them.
 | `TestDrill5_LegacyRecoveryWithClaimsOff` | `recovery_claim: false` on every host (rolling restarts): a powered-off host's workloads recover once, by a proof without a claim certificate; the flag is restored | ~12 min |
 | `TestDrill_RedfishFenceRecordsFencedAndRecovers` | opt-in (`E2E_REDFISH_*`): a node set to `--fence-strategy redfish` whose daemon is frozen is powered off through the real Redfish BMC; the fence is verified (`redfish`/`fenced` row, host recorded `fenced`, the BMC reads `Off`), its workloads recover once, and it is powered back on through the BMC with no second copy. Uses the release feature `redfish_fence`, so the lab must not be rolled back below the release afterwards | ~6 min |
 | `TestDrill6_ForceReconfigureAndRebuild` | destructive: three of five hosts lost, fences confirmed, `lv cluster voter force-reconfigure` to the two survivors, recovery with no workaround, `lv host rm --dead`, the workloads still recorded on the removed hosts recovered or removed, rebuild with `lab.sh destroy/create/up`, `lv host add` (a host fenced during its join fails the drill), `lv cluster voter add` back to five, the removed lab workloads put back | ~40 min |
-| `TestDrillW1_WitnessBridgedStall` | witness drills (lab 1: five voting workers, a non-voting witness outside `E2E_LAB_NODES`, else skipped). On a derived voter set (`lv cluster voter reset`, put back with `lv cluster voter init`): a victim nobody can SSH-fence is held, with `ha.recovery.bridged` in its before-fence and its deadline form, the stall alert and its Mailpit notification, `lv host fence-confirm` refused; recovered within two polls of the witness losing it, never before | ~20 min |
+| `TestDrillW1_WitnessBridgedStall` | witness drills (lab 1: five voting workers, a non-voting witness outside `E2E_LAB_NODES`, else skipped). On a derived voter set (`lv cluster voter reset`, put back with `lv cluster voter init`): a victim nobody can SSH-fence is held, with `ha.recovery.bridged` in its before-fence and its deadline form, the stall alert and its Mailpit notification, `lv host fence-confirm` refused; recovered within two polls of the witness losing it, never before; after the heal the paused copy stays paused with `vm_settle_declined` (`proof_uncertified`) until the drill applies its remedy | ~20 min |
 | `TestDrillW3_LeaseChurnDuringAPausedManualHold` | a manual-fence victim, fully isolated and paused, while the failover lease is moved by a daemon stop and then by freezing each holder (every host manual for the drill): each tenure re-alerts the stall at a higher term, and a node retaking the lease in the same process re-alerts within 15 s (fewer than 10 min after its last); the witness's failing row reaches the holder but does not vote; nothing minted; the victim resumes in place. No regain in six rounds: skipped, inconclusive | 15–25 min |
 | `TestDrillW4a_PartialAcceptAdoptedAfterALeaseChange` | drill 4's refused claim leaves one voter's accepted value; after a heal, a lease-term change and the owner's power-off (one other voter frozen), the VM recovers exactly once, by that value adopted or a fresh one; a stranded value refused by the lease-term gate fails it. No accepted value: skipped | ~25 min |
 | `TestDrillW4b_ClaimRetryOwedToTheLastOutage` | drill 4's refused claim, a 30 s heal with the owner still offline, then its power-off: the same holder retries the claim at the same lease term, with the accepted value's proof when there was one, exactly once | ~15 min |
-| `TestDrillW5_ClockSteps` | node clocks stepped inside the nodes (time sync off, never to the RTC, restored after): the lease holder −20 s mid-wait, a majority voter +45 s, the victim −60 s with the witness bridging it; one proof each, no replacement before the pause wait, exactly once | ~32 min |
+| `TestDrillW5_ClockSteps` | node clocks stepped inside the nodes (time sync off, never to the RTC, restored after): the lease holder −20 s mid-wait, a majority voter +32 s (never the lease holder; restored before the recovery wait), the victim −60 s with the witness bridging it; one proof each, no replacement before the pause wait, exactly once | ~32 min |
+
+The witness drills run with `enforcement.lease_term` off (the default) and on.
+Each reads the mode from every host's own `litevirt_enforcement_config_enabled`
+and `litevirt_enforcement_latched` gauges for `lease_term_v1` (enforcing is
+both), records it in the timeline and `lease-term-mode.txt`, and skips when the
+hosts disagree or while a host has the flag on and no latch yet; a mode that
+changes during the drill fails it. Both modes assert the same safety:
+sampling, never twice, one proof, the pause bounds. Off, no host may log a
+lease-term refusal during the drill or raise
+`litevirt_runtime_action_refused_total{reason="lease_term_unconfirmed"}`, W4a's stranded value cannot be the lease-term gate, and W5a logs rather
+than fails a proof whose term is not its coordinator's tenure. To run the on
+mode, set `enforcement.lease_term: true` on every host, restart each, and wait
+for `lease_term_v1` in `lv cluster upgrade-status`; the latch stays, and
+setting the flag back to false on every host returns the drills to off.
 
 Findings the drills used to skip or work around are fixed on main, and the
 drills now assert them directly: N3 (recovery on a forced 2-voter generation)

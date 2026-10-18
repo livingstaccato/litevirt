@@ -172,20 +172,26 @@ func requestSetsNICMTU(req *pb.UpdateVMRequest) bool {
 
 // applyNICMTURequest merges an UpdateVM's NIC MTUs into spec, validated, and
 // checks each against its bridge on this host, so a refusal comes before
-// anything is stopped. A NIC the stored spec does not list (a hot-plugged
-// one) gets its entry, as does every unlisted NIC before it, each made from
-// its NIC record — except on a VM of a stack (stack non-empty), whose NIC list
-// is its compose file's: a longer list would read as a topology change and
-// recreate the VM at the next deploy, so such a NIC is refused.
-func (s *Server) applyNICMTURequest(ctx context.Context, spec *pb.VMSpec, req *pb.UpdateVMRequest, stack string) error {
-	nics, err := corrosion.MergedVMNICs(ctx, s.db, req.GetName())
+// anything is stopped. Each update names a NIC by spec index, or by its
+// position in the VM's NIC list (nicIndex). A NIC the stored spec does not describe (a hot-plugged
+// one) gets an entry made from its NIC record, carrying its MAC, as does
+// every such NIC before it in the list — except on a VM of a stack (stack
+// non-empty), whose NIC list is its compose file's: a longer list would read
+// as a topology change and recreate the VM at the next deploy, so such a NIC
+// is refused.
+func (s *Server) applyNICMTURequest(ctx context.Context, spec *pb.VMSpec, req *pb.UpdateVMRequest, stack string, ix nicIndex) error {
+	nics := ix.nics
+	// An entry made for an unlisted NIC takes its recorded model: the merged
+	// row reads virtio when a newer vm_interfaces row wins the merge.
+	rowModels, reattached, err := corrosion.NICModelSources(ctx, s.db, req.GetName(), nics, compose.SpecNICModelsByMAC(spec))
 	if err != nil {
-		return status.Errorf(codes.Internal, "list NICs of %q: %v", req.GetName(), err)
+		return status.Errorf(codes.Internal, "read NIC models of %q: %v", req.GetName(), err)
 	}
-	byOrdinal := make(map[int]corrosion.NICRecord, len(nics))
-	for _, ic := range nics {
-		byOrdinal[ic.Ordinal] = ic
-	}
+	// The model each live NIC renders with: an MTU is judged against it as
+	// well as against the spec entry, which on a VM of a stack can be a
+	// detached NIC's (a NIC attached again under its MAC with another model
+	// leaves the entry as the compose file wrote it).
+	nicModels := compose.NewNICModels(spec, rowModels, reattached)
 	seen := map[int]bool{}
 	for _, u := range req.GetNicMtu() {
 		o := int(u.GetOrdinal())
@@ -193,24 +199,34 @@ func (s *Server) applyNICMTURequest(ctx context.Context, spec *pb.VMSpec, req *p
 			return status.Errorf(codes.InvalidArgument, "NIC %d named twice", o)
 		}
 		seen[o] = true
-		if o < 0 {
-			return status.Errorf(codes.NotFound, "VM %q has no NIC %d", req.GetName(), o)
+		if !ix.byListPosition && o >= len(spec.Network) && stack == "" {
+			// By spec index (an older client): main's entries for the unlisted
+			// NICs up to o, made from the rows at the ordinals they stand for.
+			if err := appendNICEntriesByOrdinal(spec, nics, o, rowModels, req.GetName()); err != nil {
+				return err
+			}
 		}
-		if o >= len(spec.Network) && stack != "" {
+		e, nic, ok := ix.resolve(spec, o)
+		if (!ok || e < 0) && stack != "" {
 			return status.Errorf(codes.FailedPrecondition,
 				"VM %q belongs to stack %q, whose compose file does not list NIC %d; set mtu: in the stack's compose file",
 				req.GetName(), stack, o)
 		}
-		for len(spec.Network) <= o {
-			ic, ok := byOrdinal[len(spec.Network)]
-			if !ok {
-				return status.Errorf(codes.NotFound, "VM %q has no NIC %d", req.GetName(), len(spec.Network))
-			}
-			spec.Network = append(spec.Network, &pb.NetworkAttachment{Name: ic.NetworkName, Model: ic.Model, Mac: ic.MAC})
+		if !ok {
+			return status.Errorf(codes.NotFound, "VM %q has no NIC %d", req.GetName(), o)
 		}
-		n := spec.Network[o]
+		if e < 0 {
+			e = appendNICEntries(spec, nics, nic, rowModels)
+		}
+		n := spec.Network[e]
 		if err := compose.ValidateNICMTU(n.GetModel(), u.GetMtu()); err != nil {
 			return status.Errorf(codes.InvalidArgument, "NIC %d: %v", o, err)
+		}
+		if nic != nil {
+			m := nicModels.Model(nic.MAC, nic.NetworkName, nic.Ordinal, nic.Model)
+			if err := compose.ValidateNICMTU(m, u.GetMtu()); err != nil {
+				return status.Errorf(codes.InvalidArgument, "NIC %d: %v", o, err)
+			}
 		}
 		n.Mtu = u.GetMtu()
 		if n.Mtu == 0 {
@@ -228,23 +244,75 @@ func (s *Server) applyNICMTURequest(ctx context.Context, spec *pb.VMSpec, req *p
 	return nil
 }
 
+// appendNICEntries gives target, a live NIC the spec does not describe, a
+// spec entry made from its NIC record, and does the same for every NIC
+// before it in the list that has none, so a VM whose ordinals run 0, 1, 2, ...
+// keeps one entry per NIC at the NIC's own position. Each entry records its
+// NIC's MAC, so it is found by that from then on. It returns target's entry.
+func appendNICEntries(spec *pb.VMSpec, nics []corrosion.NICRecord, target *corrosion.NICRecord, rowModels map[string]string) int {
+	for i := range nics {
+		ic := &nics[i]
+		e := compose.SpecEntryIndexForNIC(spec, ic.MAC, ic.Ordinal)
+		if e < 0 {
+			model := rowModels[strings.ToLower(ic.MAC)]
+			if model == "" {
+				model = ic.Model
+			}
+			spec.Network = append(spec.Network, &pb.NetworkAttachment{Name: ic.NetworkName, Model: model, Mac: ic.MAC})
+			e = len(spec.Network) - 1
+		}
+		if ic == target {
+			return e
+		}
+	}
+	return -1
+}
+
+// appendNICEntriesByOrdinal is main's reading of an MTU update by spec index
+// past the spec's end: an entry for each NIC from the spec's length up to o,
+// made from the NIC row whose ordinal is that index. A missing row is
+// NotFound, as on main.
+func appendNICEntriesByOrdinal(spec *pb.VMSpec, nics []corrosion.NICRecord, o int, rowModels map[string]string, vm string) error {
+	byOrdinal := make(map[int]corrosion.NICRecord, len(nics))
+	for _, ic := range nics {
+		byOrdinal[ic.Ordinal] = ic
+	}
+	for len(spec.Network) <= o {
+		ic, ok := byOrdinal[len(spec.Network)]
+		if !ok {
+			return status.Errorf(codes.NotFound, "VM %q has no NIC %d", vm, len(spec.Network))
+		}
+		model := rowModels[strings.ToLower(ic.MAC)]
+		if model == "" {
+			model = ic.Model
+		}
+		spec.Network = append(spec.Network, &pb.NetworkAttachment{Name: ic.NetworkName, Model: model, Mac: ic.MAC})
+	}
+	return nil
+}
+
 // patchNICMTUInPlace applies an update's NIC MTUs (merged into spec) to the
 // persistent definition by patching it, so the addresses libvirt assigned
-// are not reshuffled. nets are the VM's NICs on this host.
-func (s *Server) patchNICMTUInPlace(x string, req *pb.UpdateVMRequest, spec *pb.VMSpec, nets []lv.NetworkConfig) (string, error) {
+// are not reshuffled. nets are the VM's NICs on this host; each update's NIC
+// is found among them by its MAC.
+func (s *Server) patchNICMTUInPlace(x string, req *pb.UpdateVMRequest, spec *pb.VMSpec, nets []lv.NetworkConfig, ix nicIndex) (string, error) {
 	for _, u := range req.GetNicMtu() {
 		o := int(u.GetOrdinal())
+		e, nic, ok := ix.resolve(spec, o)
+		if !ok || e < 0 || nic == nil {
+			return "", fmt.Errorf("NIC %d not found for an in-place patch", o)
+		}
 		var nc *lv.NetworkConfig
 		for i := range nets {
-			if nets[i].SpecOrdinal == o+1 {
+			if strings.EqualFold(nets[i].MAC, nic.MAC) {
 				nc = &nets[i]
 			}
 		}
-		if nc == nil || o >= len(spec.Network) {
+		if nc == nil {
 			return "", fmt.Errorf("NIC %d not found for an in-place patch", o)
 		}
 		size := 0
-		if mtu := int(spec.Network[o].GetMtu()); mtu != 0 {
+		if mtu := int(spec.Network[e].GetMtu()); mtu != 0 {
 			if nc.Direct != "" {
 				return "", fmt.Errorf("NIC %d: an MTU needs a bridged network (macvtap and SR-IOV networks are not supported)", o)
 			}
@@ -375,12 +443,7 @@ func (s *Server) nicMTUPreflight(ctx context.Context, vm *corrosion.VMRecord, ta
 	if err != nil || len(mtus) == 0 {
 		return err
 	}
-	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
-	for _, ic := range ifaces {
-		if ic.NetworkName != "" {
-			s.provisionNetworkOnRemote(ctx, targetHost, ic.NetworkName)
-		}
-	}
+	s.provisionVMNetworksOnRemote(ctx, vm.Name, targetHost)
 	client, conn, err := s.peerClient(ctx, targetHost)
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "cannot reach %s to check the NIC MTUs of VM %q: %v", targetHost, vm.Name, err)

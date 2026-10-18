@@ -5,8 +5,6 @@ import (
 	"slices"
 	"testing"
 	"time"
-
-	"github.com/litevirt/litevirt/internal/hlc"
 )
 
 // An isolated node has to be able to find the cluster again.
@@ -141,12 +139,10 @@ func TestRejoiner_NoTargetsIsNotAnAttempt(t *testing.T) {
 // exiting the process, taking a whole test binary (or a daemon mid-shutdown)
 // down with it.
 func TestClose_StopsTheMembershipLoop(t *testing.T) {
-	c, err := NewClient(Config{
+	c, err := newClientOnFreePort(t, Config{
 		HostName: "node-a",
-		DataDir:  t.TempDir(),
 		BindAddr: "127.0.0.1",
-		BindPort: freePort(t),
-	}, hlc.NewClock("node-a"))
+	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}

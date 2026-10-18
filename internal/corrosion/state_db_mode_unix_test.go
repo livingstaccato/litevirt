@@ -12,7 +12,6 @@ import (
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/diskmode"
-	"github.com/litevirt/litevirt/internal/hlc"
 )
 
 func stateDBUmask022(t *testing.T) {
@@ -152,8 +151,7 @@ func TestStateDB_TheDaemonsOpenNarrowsAnExistingDatabase(t *testing.T) {
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	c, err := NewClient(Config{HostName: "node-1", DataDir: dir, BindAddr: "127.0.0.1", BindPort: freePort(t)},
-		hlc.NewClock("node-1"))
+	c, err := newClientOnFreePort(t, Config{HostName: "node-1", DataDir: dir, BindAddr: "127.0.0.1"})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}

@@ -19,4 +19,10 @@ table inet litevirt-fw {
         tcp dport 22 ip saddr 192.0.2.0/24 accept comment "ssh from jump"
     }
 
+    chain isolated_forward {
+        type filter hook forward priority filter; policy accept;
+        iifgroup 27766 oifgroup != 27766 drop
+        oifgroup 27766 iifgroup != 27766 drop
+    }
+
 }

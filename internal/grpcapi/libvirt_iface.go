@@ -103,6 +103,13 @@ type LibvirtBackend interface {
 	// — same device and MAC, no detach, no redefine — persistently and, for a
 	// running domain, live.
 	SetNICBridge(domainName, mac, bridge string) error
+	// SetNICBridgeConfig is SetNICBridge on the persistent definition only;
+	// a running domain's live NIC is left as it is.
+	SetNICBridgeConfig(domainName, mac, bridge string) error
+	// ReloadCDROMMedia makes the running domain open its cdrom whose source
+	// is path again (an eject and an insert), so the guest reads a file
+	// rewritten at that path — a rebuilt cloud-init seed.
+	ReloadCDROMMedia(domainName, path string) error
 	AttachHostdev(domainName, pciAddress string) error
 	// AttachHostdevWithAlias hot-attaches a PCI passthrough device carrying a stable
 	// user alias (ua-<device>-<member>) so the topology-preserving reconcile can key

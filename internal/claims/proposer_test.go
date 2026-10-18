@@ -55,10 +55,21 @@ var dbSeq atomic.Int64
 
 func newMemCluster(t *testing.T, names ...string) (*memTransport, []*memVoter) {
 	t.Helper()
+	tr, voters, _ := newMemClusterWithMembers(t, len(names), names...)
+	return tr, voters
+}
+
+// newMemClusterWithMembers also creates prospective voters outside genesis.
+func newMemClusterWithMembers(t *testing.T, memberCount int, names ...string) (*memTransport, []*memVoter, *corrosion.ClaimVerifier) {
+	t.Helper()
 	ctx := context.Background()
 	caDir := t.TempDir()
 	caCert, caKey := filepath.Join(caDir, "ca.crt"), filepath.Join(caDir, "ca.key")
 	if err := pki.GenerateCA(caCert, caKey); err != nil {
+		t.Fatal(err)
+	}
+	verifier, err := corrosion.LoadClaimVerifier(caDir)
+	if err != nil {
 		t.Fatal(err)
 	}
 	tr := &memTransport{voters: map[string]*memVoter{}, rng: rand.New(rand.NewPCG(1, 2)), down: map[string]bool{}}
@@ -94,7 +105,7 @@ func newMemCluster(t *testing.T, names ...string) (*memTransport, []*memVoter) {
 		out = append(out, v)
 	}
 	var members []corrosion.VoterMember
-	for _, v := range out {
+	for _, v := range out[:memberCount] {
 		members = append(members, corrosion.VoterMember{Name: v.name, Incarnation: v.inc})
 	}
 	members = corrosion.SortMembers(members)
@@ -107,7 +118,7 @@ func newMemCluster(t *testing.T, names ...string) (*memTransport, []*memVoter) {
 			t.Fatal(err)
 		}
 	}
-	return tr, out
+	return tr, out, verifier
 }
 
 var errDropped = errors.New("dropped")
@@ -241,8 +252,12 @@ func (m *memTransport) chosen(key corrosion.ClaimKey, n int) map[string]bool {
 // proposer ignore accepted values in promises. Either one produces a second
 // chosen value within the schedules below.
 func TestProposer_SafetyUnderRandomSchedules(t *testing.T) {
-	for _, n := range []int{3, 5} {
-		t.Run(fmt.Sprintf("%d voters", n), func(t *testing.T) {
+	for _, tc := range []struct {
+		n        int
+		atQuorum bool // Spec.ReturnAtQuorum, as lease-term claims run
+	}{{3, false}, {5, false}, {3, true}, {5, true}} {
+		n := tc.n
+		t.Run(fmt.Sprintf("%d voters, return at quorum %v", n, tc.atQuorum), func(t *testing.T) {
 			var vnames []string
 			for i := 0; i < n; i++ {
 				vnames = append(vnames, fmt.Sprintf("v%d", i))
@@ -268,7 +283,9 @@ func TestProposer_SafetyUnderRandomSchedules(t *testing.T) {
 						p.Backoff = func(int) time.Duration { return time.Duration(rand.Int64N(int64(2 * time.Millisecond))) }
 						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 						defer cancel()
-						out, err := p.Decide(ctx, workloadSpec(key, all, fmt.Sprintf("dest-%d", pi)))
+						spec := workloadSpec(key, all, fmt.Sprintf("dest-%d", pi))
+						spec.ReturnAtQuorum = tc.atQuorum
+						out, err := p.Decide(ctx, spec)
 						if err == nil {
 							mu.Lock()
 							certs[out.Digest] = true

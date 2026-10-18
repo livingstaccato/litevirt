@@ -1498,6 +1498,14 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 			r.client.deferAfterCommit(tx, func() { r.client.noteRemintCredentialRefused(pathWAL) })
 			continue
 		}
+		// A fence credential carries the retirement it was set after
+		// (credentials_revive_guard.go).
+		credPlan, err := planCredentialUpsert(ctx, tx, s, stmts)
+		if err != nil {
+			return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+		} else if credPlan.skip {
+			continue
+		}
 		if err := r.applyStatementLWW(ctx, tx, s, entry.Hlc); err != nil {
 			// A held entry's periodic retry is not a new refusal: counting it
 			// would keep the rejected-rate alert firing while it is held.
@@ -1522,6 +1530,9 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 			slog.Error("replicator: apply failed — back-pressuring replication",
 				"sql", s.SQL, "origin", entry.Origin, "seq", entry.Seq, "error", err)
 			return wrapped
+		}
+		if err := credPlan.apply(ctx, tx); err != nil {
+			return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
 		}
 		// A row this statement created may be one an earlier update
 		// is parked on. Replayed here, inside the batch, so the rest of
@@ -1881,6 +1892,12 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 			r.client.deferAfterCommit(tx, park)
 		}
 		return nil
+
+	case DispSpecGeneration:
+		// A VM desired-spec edit: DispLiveRowUpdate, but an edit that meets
+		// another at its generation is resolved, not dropped
+		// (spec_conflict_apply.go).
+		return r.applySpecGeneration(ctx, tx, s, sh, tableName, pkCols, incomingHLC)
 
 	case DispHostReadmit:
 		// Exactly DispFullPKUpdate, through the reset form: the re-admitted

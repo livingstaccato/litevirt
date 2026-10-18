@@ -100,6 +100,12 @@ func TestReplicatedHostDelete_KeepsANewerCredential(t *testing.T) {
 	if _, err := c.DB().Exec(HostFenceCredentialUpsertSQL, "host-x", "new-machine", newer); err != nil {
 		t.Fatal(err)
 	}
+	// Set by an operator after the machine's own admission, a retirement
+	// later than the removal that reaches this node late.
+	if _, err := c.DB().Exec(`UPDATE host_fence_credentials SET after_retirement = '2999-03-01T00:00:00.000001Z'
+		WHERE host_name = 'host-x'`); err != nil {
+		t.Fatal(err)
+	}
 	applyRemote(t, c, "2999000000000-0000-peer", Statement{SQL: deleteHostSQL,
 		Params: []interface{}{"2999-01-01T00:00:00Z", "2999-01-01T00:00:00.000001Z", "host-x"}})
 	if pass, ok := liveCredential(t, c); !ok || pass != "new-machine" {

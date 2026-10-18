@@ -82,7 +82,8 @@ gossip_port: 7946
 # Address peers reach this host on. Sets BOTH the gossip advertise address and
 # the host record this daemon self-registers — they must agree, or peers dial an
 # address the host certificate does not cover and every replication push fails
-# the TLS hostname check.
+# the TLS hostname check. It is also this host's VXLAN tunnel endpoint (VTEP)
+# once every host runs a release that knows it (docs/networking.md, VXLAN).
 #
 # Empty (default) auto-detects, which is only safe on an unambiguously
 # single-homed host: the host record takes the source IP toward the DEFAULT
@@ -463,6 +464,13 @@ enforcement:
                               # passwords (FIPS mode) sets none, keeps SPICE ones, never fails
                               # a start over them, and reports console_password_v1 in
                               # not_enforcing. See ui.md "Console passwords".
+  vrrp_unicast: true          # DEFAULT ON. Whether this host advertises vrrp_unicast_v1 before
+                              # it has latched. The token moves the load balancers' VRRP off the
+                              # VIP's bridge, where any guest can read and answer it, to unicast
+                              # between the LB hosts' recorded addresses; false holds that off for
+                              # the whole cluster. Once latched it decides nothing: the transport
+                              # is cluster-wide, and its stand-down is
+                              # `lv cluster vrrp-transport multicast`. See upgrades.md.
   gossip_encryption: false    # encrypt and authenticate gossip (memberlist, gossip_port)
                               # with the cluster key in <pki_dir>/gossip.key. false is
                               # plaintext; true is encrypted-only (anything unencrypted or
@@ -1035,6 +1043,13 @@ is `true`. The network carries live moves and the disk stream of cold moves and
 clone copies, and an unencrypted storage copy stays on the cluster address. See
 [migration](migration-failover.md#a-dedicated-migration-network).
 
+Migrations of VMs on shared storage copy no disks, and only their memory moves.
+When both hosts hold migration-TLS credentials, that memory stream goes to the
+target's address in the network over TLS. When either host has none, it stays
+in libvirt's TLS tunnel on the cluster address. A migration that cannot use the
+network (this host or the target has no address in it) also stays on the
+cluster address, with a `vm.migrate.network_fallback` event on the VM.
+
 `live_firmware` lets this node take part in live moves of vTPM and Secure Boot
 VMs. The daemon publishes the host label `litevirt.fw_live_migrate=true` only
 when it is on, the host has vTPM and Secure Boot support (`litevirt.tpm` and
@@ -1044,9 +1059,6 @@ restore guests (the unit enabled or active with `ON_SHUTDOWN=suspend` or
 `ON_BOOT=start`; read from `/etc/default/libvirt-guests`, else `/etc/sysconfig/libvirt-guests`; keys the file does not set, and values that cannot be read as a plain shell assignment, count as unsafe). A version
 that cannot be read counts as below the floor. The label is advisory: each
 condition is checked again when a move starts.
-
-Migrations of VMs on shared storage copy no disks. litevirt tunnels them through
-libvirt's TLS connection, and this setting does not affect them.
 
 ## Capacity and overcommit
 

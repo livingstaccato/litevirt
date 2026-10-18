@@ -2,7 +2,9 @@ package corrosion
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -29,6 +31,10 @@ type HostRecord struct {
 	IPMIAddress string
 	IPMIUser    string
 	IPMIPass    string
+	// IPMIPassRetired reports that the host's fence credential row is a
+	// tombstone: retired by a removal or re-admission and not set since.
+	// IPMIPass is then empty, never the old hosts.ipmi_pass column.
+	IPMIPassRetired bool
 	// Redfish — only used when fence_strategy = "redfish". Read from the
 	// host's live host_fence_redfish row (host_fence_redfish.go), never from
 	// the hosts row.
@@ -325,7 +331,8 @@ func ListHosts(ctx context.Context, c *Client) ([]HostRecord, error) {
 
 // HostStateJoining is the state `lv host add` admits a host in (AdmitHost):
 // its identity is recorded, its daemon has not yet started. The daemon's boot
-// write (UpdateHostStartup) records it 'active'. Until then it is not a fence
+// write (UpdateHostStartup) records it 'upgrading', and 'active' once the
+// daemon serves (hostboot). Until then it is not a fence
 // candidate, so a coordinator does not power off a machine part-way through its
 // setup, and like every state but 'active' it is no placement target.
 //
@@ -391,9 +398,19 @@ func VoterSet(ctx context.Context, c *Client) (map[string]bool, error) {
 // the only source of the uncounted set: every quorum count takes it from here
 // or from VoterRegions, which calls it.
 func VoterSetWithUncounted(ctx context.Context, c *Client) (voters, uncounted map[string]bool, err error) {
+	voters, uncounted, _, err = voterSetRead(ctx, c)
+	return voters, uncounted, err
+}
+
+// voterSetRead is VoterSetWithUncounted, with the adopted voter generation
+// the set was read from (0 when none is adopted).
+func voterSetRead(ctx context.Context, c *Client) (voters, uncounted map[string]bool, gen int64, err error) {
 	cfg, err := AdoptedVoterConfig(ctx, c)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
+	}
+	if cfg != nil {
+		gen = cfg.Generation
 	}
 	uncounted = map[string]bool{}
 	if cfg.Explicit() {
@@ -401,11 +418,11 @@ func VoterSetWithUncounted(ctx context.Context, c *Client) (voters, uncounted ma
 		for _, m := range cfg.Members {
 			voters[m.Name] = true
 		}
-		return voters, uncounted, nil
+		return voters, uncounted, gen, nil
 	}
 	states, err := resolvedHostStates(ctx, c)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	voters = make(map[string]bool, len(states))
 	for name, state := range states {
@@ -416,7 +433,7 @@ func VoterSetWithUncounted(ctx context.Context, c *Client) (voters, uncounted ma
 			uncounted[name] = true
 		}
 	}
-	return voters, uncounted, nil
+	return voters, uncounted, gen, nil
 }
 
 // DerivedVoterSet is the voter set as it was before any explicit generation:
@@ -450,7 +467,8 @@ func GetHost(ctx context.Context, c *Client, name string) (*HostRecord, error) {
 }
 
 // hostSelectSQL is the column list scanHost reads, joined to the host's fence
-// credential so IPMIPass is resolved new-first (credentials_split.go), to its
+// credential row, live or retired, so IPMIPass is resolved new-first and a
+// retired row reads as no password (credentials_split.go, READ RULE), to its
 // live Redfish row (host_fence_redfish.go), to its membership row so State is
 // too (host_membership.go), and to its runtime row so the self-reported columns
 // are (host_runtime.go). Columns the tables
@@ -464,17 +482,23 @@ const hostSelectSQL = `SELECT h.name, h.address, h.ssh_user, h.ssh_port, h.grpc_
 			h.capacity_policy_hash,
 			h.created_at, h.updated_at,
 			c.host_name AS cred_key, c.ipmi_pass AS cred_val, c.updated_at AS cred_ts,
+			c.deleted_at AS cred_deleted,
 			rf.endpoint AS rf_endpoint, rf.username AS rf_username, rf.password AS rf_password,
 			rf.system_id AS rf_system_id, rf.auth AS rf_auth, rf.ca_pem AS rf_ca_pem,
 			` + membershipCols + `,
 			` + runtimeCols + `
-		 FROM hosts h LEFT JOIN host_fence_credentials c ON c.host_name = h.name AND c.deleted_at IS NULL
+		 FROM hosts h LEFT JOIN host_fence_credentials c ON c.host_name = h.name
 		 LEFT JOIN host_fence_redfish rf ON rf.host_name = h.name AND rf.deleted_at IS NULL` +
 	membershipJoins + runtimeJoins
 
 func scanHost(r Row, hostsCopyFrozen bool) HostRecord {
 	name := r.String("name")
 	rt := runtimeRowFrom(r, name).resolve()
+	credRetired := r.String("cred_key") != "" && r.String("cred_deleted") != ""
+	ipmiPass := ""
+	if !credRetired {
+		ipmiPass = resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("ipmi_pass"))
+	}
 	return HostRecord{
 		Name:               name,
 		Address:            r.String("address"),
@@ -489,7 +513,8 @@ func scanHost(r Row, hostsCopyFrozen bool) HostRecord {
 		FenceStrategy:      r.String("fence_strategy"),
 		IPMIAddress:        r.String("ipmi_address"),
 		IPMIUser:           r.String("ipmi_user"),
-		IPMIPass:           resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("ipmi_pass")),
+		IPMIPass:           ipmiPass,
+		IPMIPassRetired:    credRetired,
 		Redfish:            redfishFromRow(r, "rf_"),
 		WatchdogDev:        r.String("watchdog_dev"),
 		Labels:             decodeLabels(r.String("labels")),
@@ -589,33 +614,86 @@ func decodeLabels(raw string) map[string]string {
 // longer shares a clock with the host's own reports.
 func UpdateHostState(ctx context.Context, c *Client, name, state string) error {
 	return c.withMembershipWrite(ctx, func(live bool) error {
-		uts := c.NowTS()
-		if !live {
-			return c.Execute(ctx, updateHostStateSQL, state, uts, name)
-		}
-		missing, err := membershipRowMissingFrozen(ctx, c, name)
+		stmts, err := hostStateStatements(ctx, c, name, state, live)
 		if err != nil {
 			return err
 		}
-		if missing {
-			return c.ExecuteBatch(ctx, []Statement{
-				{SQL: hostMembershipStateOnlySQL, Params: []interface{}{state, uts, name}},
-			})
-		}
-		epoch, reason, err := currentIsolation(ctx, c, name)
-		if err != nil {
-			return err
-		}
-		if c.hostsCopyRetired(live) {
-			return c.ExecuteBatch(ctx, []Statement{
-				{SQL: hostMembershipStateSQL, Params: []interface{}{name, state, epoch, reason, uts}},
-			})
-		}
-		return c.ExecuteBatch(ctx, []Statement{
-			{SQL: updateHostStateSQL, Params: []interface{}{state, uts, name}},
-			{SQL: hostMembershipStateSQL, Params: []interface{}{name, state, epoch, reason, uts}},
-		})
+		return c.ExecuteBatch(ctx, stmts)
 	})
+}
+
+// UpdateHostStateFrom is UpdateHostState only while host is recorded `from`,
+// checked inside the write's transaction (ExecuteBatchGuarded): a state
+// another writer recorded between a caller's read and this write — a fence
+// landing on a host that is turning active — is not overwritten. The
+// statements are UpdateHostState's; the guard is local only. applied=false,
+// with no error, when the host is recorded as something else (or absent).
+func UpdateHostStateFrom(ctx context.Context, c *Client, name, from, to string) (bool, error) {
+	var applied bool
+	err := c.withMembershipWrite(ctx, func(live bool) error {
+		stmts, err := hostStateStatements(ctx, c, name, to, live)
+		if err != nil {
+			return err
+		}
+		applied, err = c.ExecuteBatchGuarded(ctx, hostStateIs(ctx, c, name, from), stmts)
+		return err
+	})
+	return applied, err
+}
+
+// hostStateIs is the guard of a write made only while host is recorded
+// `from`: it reads the state inside the write's transaction, as
+// membershipRow.resolve does. Build it inside withMembershipWrite.
+func hostStateIs(ctx context.Context, c *Client, name, from string) func(tx *sql.Tx) (bool, error) {
+	frozen := c.hostsCopyFrozen()
+	return func(tx *sql.Tx) (bool, error) {
+		var hState string
+		var mKey, mState sql.NullString
+		err := tx.QueryRowContext(ctx, `SELECT h.state, m.host_name, m.state FROM hosts h`+membershipJoins+
+			` WHERE h.name = ? AND h.deleted_at IS NULL`, name).Scan(&hState, &mKey, &mState)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		// As membershipRow.resolve: the membership row when it exists.
+		cur := hState
+		switch {
+		case mKey.Valid && mKey.String != "":
+			cur = mState.String
+		case frozen:
+			cur = HostStateUnknown
+		}
+		return cur == from, nil
+	}
+}
+
+// hostStateStatements is the batch that records host `state`: the hosts
+// column and, after the membership split, the host_membership row.
+func hostStateStatements(ctx context.Context, c *Client, name, state string, live bool) ([]Statement, error) {
+	uts := c.NowTS()
+	if !live {
+		return []Statement{{SQL: updateHostStateSQL, Params: []interface{}{state, uts, name}}}, nil
+	}
+	missing, err := membershipRowMissingFrozen(ctx, c, name)
+	if err != nil {
+		return nil, err
+	}
+	if missing {
+		return []Statement{{SQL: hostMembershipStateOnlySQL, Params: []interface{}{state, uts, name}}}, nil
+	}
+	epoch, reason, err := currentIsolation(ctx, c, name)
+	if err != nil {
+		return nil, err
+	}
+	if c.hostsCopyRetired(live) {
+		return []Statement{{SQL: hostMembershipStateSQL, Params: []interface{}{name, state, epoch, reason, uts}}}, nil
+	}
+	return []Statement{
+		{SQL: updateHostStateSQL, Params: []interface{}{state, uts, name}},
+		{SQL: hostMembershipStateSQL, Params: []interface{}{name, state, epoch, reason, uts}},
+	}, nil
 }
 
 const updateHostStateSQL = `UPDATE hosts SET state = ?, updated_at = ? WHERE name = ?`
@@ -700,75 +778,103 @@ const updateHostVersionSQL = `UPDATE hosts SET version = ?, updated_at = ? WHERE
 // whenever available, including the fresh-insert case, so startup state is
 // single-source rather than relying on a later write.
 func UpdateHostStartup(ctx context.Context, c *Client, name, state, version string, cpu, mem, disk int, hasResources bool) error {
+	return c.withMembershipWrite(ctx, func(live bool) error {
+		return c.withRuntimeWrite(ctx, func(liveRuntime bool) error {
+			stmts, err := hostStartupStatements(ctx, c, name, state, version, cpu, mem, disk, hasResources, live, liveRuntime)
+			if err != nil || len(stmts) == 0 {
+				return err // none: no live hosts row, nothing a previous release would have written either
+			}
+			return c.ExecuteBatch(ctx, stmts)
+		})
+	})
+}
+
+// UpdateHostStartupFrom is UpdateHostStartup only while host is recorded
+// `from`, checked inside the write's transaction (ExecuteBatchGuarded), as
+// UpdateHostStateFrom is: a boot report deferred until the daemon serves does
+// not overwrite a fence, drain or maintenance recorded meanwhile. The
+// statements are UpdateHostStartup's; the guard is local only. applied=false,
+// with no error, when the host is recorded as something else (or absent).
+func UpdateHostStartupFrom(ctx context.Context, c *Client, name, from, state, version string, cpu, mem, disk int, hasResources bool) (bool, error) {
+	var applied bool
+	err := c.withMembershipWrite(ctx, func(live bool) error {
+		return c.withRuntimeWrite(ctx, func(liveRuntime bool) error {
+			stmts, err := hostStartupStatements(ctx, c, name, state, version, cpu, mem, disk, hasResources, live, liveRuntime)
+			if err != nil || len(stmts) == 0 {
+				return err
+			}
+			applied, err = c.ExecuteBatchGuarded(ctx, hostStateIs(ctx, c, name, from), stmts)
+			return err
+		})
+	})
+	return applied, err
+}
+
+// hostStartupStatements is the boot report's batch: build it inside
+// withMembershipWrite and withRuntimeWrite, whose live flags it takes.
+func hostStartupStatements(ctx context.Context, c *Client, name, state, version string, cpu, mem, disk int, hasResources, live, liveRuntime bool) ([]Statement, error) {
 	// COALESCE(NULLIF(?, ''), version) keeps the existing version when the daemon
 	// reports an empty one (dev builds), so a blank version can't clobber a good one.
 	// schema_version is this running binary's supported schema (CurrentSchemaVersion),
 	// matching what Ping advertises — the self-upgrade watcher reads it from here.
 	sv := CurrentSchemaVersion
-	return c.withMembershipWrite(ctx, func(live bool) error {
-		return c.withRuntimeWrite(ctx, func(liveRuntime bool) error {
-			uts := c.NowTS()
-			// The hosts statement carries the runtime columns until
-			// host_runtime_retire_v1 has latched, and the boot state until
-			// host_membership_retire_v1 has. With only the runtime copy
-			// retired it is the plain state write; with both, there is none
-			// (host_runtime_retire.go).
-			runtimeRetired := c.hostsRuntimeRetired(liveRuntime)
-			var stmts []Statement
-			switch {
-			case runtimeRetired && c.hostsCopyRetired(live):
-			case runtimeRetired:
-				stmts = append(stmts, Statement{SQL: updateHostStateSQL, Params: []interface{}{state, uts, name}})
-			case hasResources:
-				stmts = append(stmts, Statement{SQL: hostStartupResourcesSQL, Params: []interface{}{state, version, sv, cpu, mem, disk, uts, name}})
-			default:
-				stmts = append(stmts, Statement{SQL: hostStartupSQL, Params: []interface{}{state, version, sv, uts, name}})
+	uts := c.NowTS()
+	// The hosts statement carries the runtime columns until
+	// host_runtime_retire_v1 has latched, and the boot state until
+	// host_membership_retire_v1 has. With only the runtime copy
+	// retired it is the plain state write; with both, there is none
+	// (host_runtime_retire.go).
+	runtimeRetired := c.hostsRuntimeRetired(liveRuntime)
+	var stmts []Statement
+	switch {
+	case runtimeRetired && c.hostsCopyRetired(live):
+	case runtimeRetired:
+		stmts = append(stmts, Statement{SQL: updateHostStateSQL, Params: []interface{}{state, uts, name}})
+	case hasResources:
+		stmts = append(stmts, Statement{SQL: hostStartupResourcesSQL, Params: []interface{}{state, version, sv, cpu, mem, disk, uts, name}})
+	default:
+		stmts = append(stmts, Statement{SQL: hostStartupSQL, Params: []interface{}{state, version, sv, uts, name}})
+	}
+	if live {
+		// After the membership split the boot state is also written
+		// to host_membership, in the same batch under the same
+		// updated_at: the hosts statement is the previous release's,
+		// unchanged, so a node rolled back one release still reads it.
+		missing, err := membershipRowMissingFrozen(ctx, c, name)
+		if err != nil {
+			return nil, err
+		}
+		if missing {
+			stmts = append(stmts, Statement{SQL: hostMembershipStateOnlySQL, Params: []interface{}{state, uts, name}})
+		} else {
+			epoch, reason, err := currentIsolation(ctx, c, name)
+			if err != nil {
+				return nil, err
 			}
-			if live {
-				// After the membership split the boot state is also written
-				// to host_membership, in the same batch under the same
-				// updated_at: the hosts statement is the previous release's,
-				// unchanged, so a node rolled back one release still reads it.
-				missing, err := membershipRowMissingFrozen(ctx, c, name)
-				if err != nil {
-					return err
-				}
-				if missing {
-					stmts = append(stmts, Statement{SQL: hostMembershipStateOnlySQL, Params: []interface{}{state, uts, name}})
-				} else {
-					epoch, reason, err := currentIsolation(ctx, c, name)
-					if err != nil {
-						return err
-					}
-					stmts = append(stmts, Statement{SQL: hostMembershipStateSQL, Params: []interface{}{name, state, epoch, reason, uts}})
-				}
+			stmts = append(stmts, Statement{SQL: hostMembershipStateSQL, Params: []interface{}{name, state, epoch, reason, uts}})
+		}
+	}
+	if liveRuntime {
+		// And after the runtime split the report goes to host_runtime
+		// too (host_runtime.go). An empty version keeps the one the
+		// host already has, as the hosts statement's COALESCE does.
+		rt, ok, err := runtimeStatement(ctx, c, name, reportBoot, func(v *runtimeVals) {
+			if version != "" {
+				v.Version = version
 			}
-			if liveRuntime {
-				// And after the runtime split the report goes to host_runtime
-				// too (host_runtime.go). An empty version keeps the one the
-				// host already has, as the hosts statement's COALESCE does.
-				rt, ok, err := runtimeStatement(ctx, c, name, reportBoot, func(v *runtimeVals) {
-					if version != "" {
-						v.Version = version
-					}
-					v.SchemaVersion = int64(sv)
-					if hasResources {
-						v.CPU, v.Mem, v.Disk = someInt(cpu), someInt(mem), someInt(disk)
-					}
-				}, uts)
-				if err != nil {
-					return err
-				}
-				if ok {
-					stmts = append(stmts, rt)
-				}
+			v.SchemaVersion = int64(sv)
+			if hasResources {
+				v.CPU, v.Mem, v.Disk = someInt(cpu), someInt(mem), someInt(disk)
 			}
-			if len(stmts) == 0 {
-				return nil // no live hosts row: nothing a previous release would have written either
-			}
-			return c.ExecuteBatch(ctx, stmts)
-		})
-	})
+		}, uts)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			stmts = append(stmts, rt)
+		}
+	}
+	return stmts, nil
 }
 
 // The boot report's hosts statements, in their previous-release shapes.

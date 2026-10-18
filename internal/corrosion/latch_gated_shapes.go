@@ -17,6 +17,7 @@ var latchGatedShapes = map[string][]string{
 		replicationRepointSQL,     // RepointReplicationTarget (backup and container replication switch)
 		containerPlacementMintSQL, // MintContainerPlacement
 		imageHostReviveSQL,        // ReviveImageHost
+		deleteNetworkVTEPsSQL,     // DeleteNetworkAndVTEPs
 	},
 }
 

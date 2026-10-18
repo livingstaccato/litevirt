@@ -15,12 +15,98 @@ operation can be inspected and force-cleared manually:
 ```
 lv operation show <vm>            # inspect the operation holding the barrier + its steps
 lv operation abort <vm> --force   # force-clear the barrier so the VM is mutable again
+lv operation abort <vm> --operation <id> --force   # the same, only if <id> is the active operation
+lv operation release-reservation <operation-id> --force   # release a host reservation no running operation holds
 ```
 
 `show` is read-only. `abort` is admin-only, requires `--force`, is audited, and
 clears the barrier only via the exact owner-epoch + spec-generation
 compare-and-swap — so it can never clear a newer operation's barrier, and an
-ordinary mutation's `--force` never bypasses the barrier.
+ordinary mutation's `--force` never bypasses the barrier. Without
+`--operation`, `abort` clears whichever operation is active when it runs;
+with `--operation <id>` it is refused unless `<id>` is that operation, so an
+operation that finished, or one that began, after you ran `show` is never
+the one cleared. A daemon too old to honour `--operation` is refused before
+anything is sent. The commands act on the host the CLI targets (`LV_HOST`).
+
+## Host reservations
+
+Admission counts every in-flight capacity claim against its target host until
+the operation that made it is terminal at its header's owner epoch. A claim
+left counted after its operation stopped running shrinks the host's free
+capacity until it is released.
+
+`lv host inspect <host>` lists them under `reservations`, and reports their sum
+as `reservedCpu` and `reservedMemMib`: the figures admission subtracts from the
+host's free capacity. A reservation whose data cannot be read is left out of
+the list and named in `reservationsError`, and `reservationsPartial` is then
+true: the reserved figures count only the listed reservations. `lv host inspect`
+prints it as a warning on stderr, and the rest of the host is still shown.
+`reservationsError` gives the reason only to a caller who may `vm.read` across
+the cluster; anyone else sees the operation ids, and the daemon log has the
+reason. Each row carries the operation id, the RPC that made it
+(`method`), `kind`, the vCPU and MiB it holds, its age, its header owner epoch,
+a `state` and a one-sentence `detail`. The `vm` and `project` fields, and the
+workload name in `detail`, are shown only to a caller who may `vm.read` that
+workload; the amounts and state are shown to every viewer.
+
+| `state` | meaning | released by |
+|---|---|---|
+| `in-flight` | the VM's or container's mutation barrier names the operation | the operation, when it finishes |
+| `admitting` | younger than 15 minutes, no barrier: an admission that may still be committing | the operation |
+| `auto-expires` | an admission lease (`kind` `admission-lease`, or `transfer-lease` for a migration or drain); `detail` names the expiry instant | the stale-lease sweep: 15 minutes after creation, 6 hours for a transfer lease |
+| `journal` | a `vm_replace` or `drain_cold_move` journal | its own recovery; never released by hand |
+| `releasable` | the operation finished at a later owner epoch than its header's, or the VM it was for no longer exists (or was re-created after it began) | the reservation sweep on the target host |
+| `stale` | no barrier, past the admission window, and nothing proves the operation finished | `lv operation release-reservation <operation-id> --force` |
+| `release-blocked` | a `releasable` or `stale` reservation whose release key is held by a tombstoned release row (`releaseBlocked` is true; `detail` starts `still counted; release blocked:`). A reservation in any other state keeps that state, with `releaseBlocked` true | `lv operation release-reservation <operation-id> --force`, which writes a `failed` step at the header owner epoch instead |
+
+The reservation sweep runs on every host, once at startup after resize
+recovery and then every 60 seconds. It releases each `releasable` reservation
+targeting that host within 60 seconds of the evidence reaching it, by writing a
+`cancelled` step at the operation's header owner epoch. A finished operation
+whose target host has been removed or is not active is released by the
+lexically smallest active host instead; a reservation for a VM that no longer
+exists is released only by its target host. The sweep releases nothing while
+the host's replica has not caught up, and skips a VM whose lock is held until
+the next pass. A reservation whose data cannot be read is never released; the
+sweep logs `reservation sweep: a reservation could not be read` once per
+operation and goes on with the rest.
+
+`lv host inspect` prints a note on stderr when the host holds `stale` or
+`release-blocked` reservations.
+
+### Releasing a reservation by hand
+
+```
+lv operation release-reservation <operation-id> --force
+```
+
+It releases the reservation of an operation that is no longer running: a
+`stale`, `release-blocked` or `releasable` one. The release is decided on the
+reservation's target host, under the VM's (or container's) lock there, so a
+request to another node is forwarded to that host; a target host that has been
+removed (`lv host rm`) is decided on the node called. It needs the
+`host.reservation.release` permission (built-in Admin) and `--force`, and every
+request, released or refused, is audited once, as
+`operation.reservation.release`, on the node called. Asking again for a
+reservation already released answers `already released`. A refusal names the
+VM or container only to a caller who may `vm.read` it.
+
+| Refusal | Code |
+|---|---|
+| No `--force` | `FailedPrecondition` |
+| No such operation, or it was reaped | `NotFound` |
+| The operation holds no counted reservation | `FailedPrecondition` |
+| The operation's reservation data cannot be read | `FailedPrecondition` |
+| A `vm_replace` or `drain_cold_move` journal | `InvalidArgument` |
+| An admission or transfer lease; the message names the instant the stale-lease sweep releases it | `FailedPrecondition` |
+| The operation holds the VM's or container's mutation barrier | `FailedPrecondition` |
+| Younger than 15 minutes with no barrier: it may still be admitting | `FailedPrecondition` |
+| The VM's or container's lock is held on the target host | `Unavailable` |
+| The target host's replica has not caught up | `Unavailable` |
+| The target host is unreachable, or refused the request before handling it (a forwarded login it has not replicated yet, or WAL quarantine) | `Unavailable` |
+| The same, for a finished operation (`releasable`, not `release-blocked`) on a fenced, offline or maintenance host: the message says the sweep's deputy releases it within a pass | `Unavailable` |
+| The target host runs a build without the release (`lv host upgrade <host>`) | `FailedPrecondition` |
 
 ## `hardware_v2` — typed hardware, with no kill switch of its own
 
@@ -943,6 +1029,15 @@ converge the row, so the two paths can never disagree.
   *attempts*, a permanent fault re-increments every cycle — so alert on its **rate**, correlated
   with replication backlog (`litevirt_replication_min_watermark_seq`) and `lv doctor
   divergence`, **not** on its absolute value.
+  `reason="spec_edit_dropped"` (table `vms`) is different in kind: a VM spec edit that met
+  another made from the same generation and lost (see
+  [operating-model.md](operating-model.md#replication)). Each one is also a
+  `vm.spec_edit_dropped` event on the VM, quoting the dropped spec.
+- `litevirt_spec_edit_held_total` — **monotonic counter** of lines of VM spec edits this node
+  holds off a VM because an operation on it has not finished, counted once per VM and
+  operation when the hold is confirmed (a second consecutive pass); each
+  raises `vm.spec_edit_held` (see
+  [the condition](#a-line-of-spec-edits-is-held-off-by-a-running-operation-vmspec_edit_held)).
 - `litevirt_replication_parked_entries{origin}` — **gauge**: received changes this node
   holds because a constraint refuses them, per sender (see
   [`replication_entry_parked`](#a-received-change-this-node-cannot-apply-replication_entry_parked)).
@@ -1162,6 +1257,19 @@ observed → confirmed → resolved lifecycle:
 - leadership changes and restarts preserve counts and confirmed state;
 - resolved conditions stay readable for 30 days (`lv health --resolved`),
   then are tombstoned;
+- a condition whose subject is gone resolves on the next reconciler pass of
+  any node whose replica has caught up: a VM or container that was deleted
+  (a tombstoned row and no live one; a name with no row at all is not
+  proof), or a host removed with `lv host rm`, whether the subject names the
+  host itself, a pool on it (`<pool>@<host>`) or a workload on it
+  (`<name>@<host>`). These outlive their subject and stay: the dual-run
+  detector's (it resolves its own), `vm_orphan_runtime` /
+  `ct_orphan_runtime`, the certificate and audit conditions,
+  `vm_disk_stranded`, `vm_failover_held`, `vm_start_cancelled`,
+  `ct_rootfs_stranded`, `reservation_stale`, the `iscsi_lun_hold_*` pair,
+  `ceph_image_leftover`, `ceph_trash_leftover`,
+  and the inputs failover recovery reads (`partition_paused`,
+  `partition_pause_failed`, `partition_one_way`, evaluator `failover`);
 - remove the cause, and the evaluator proves the resolution. For a
   condition it can no longer prove, an admin can resolve it by hand:
   `lv health resolve <code> <kind>/<id> --reason "..."`, with the code and
@@ -1181,7 +1289,12 @@ observed → confirmed → resolved lifecycle:
 `lv health` prints the overall state (HEALTHY / DEGRADED / CRITICAL /
 UNKNOWN), every active condition with its involved hosts, evaluator
 coverage, peer connectivity, and per-host effective capacity — and exits
-0 / 1 / 2 so scripts can gate on it.
+0 / 1 / 2 so scripts can gate on it. Under any state but HEALTHY it lists
+each cause on its own `- ` line beneath the overall state, including the ones
+that are not conditions: an evaluator whose last scan is more than 5 minutes
+old (stale: its scan has stopped, or no node holds its lease), an evaluator
+with incomplete coverage, an incomplete capacity sample, and a link not
+proven good.
 
 Peer connectivity counts toward that state: a link the checker cannot prove
 good is a coverage gap, so a `suspect` or `failing` edge reads DEGRADED
@@ -1203,11 +1316,15 @@ and exactly equal to the DB epoch being superseded — missing, corrupt,
 unreadable, or unequal evidence refuses with a distinct reason.
 
 Effective capacity: every host samples the union of its database and
-runtime workloads each minute into `host_capacity_observations` — a rogue
+runtime workloads each minute into `host_capacity_observations`, and again
+within a few seconds of any change to the database's record of the host's
+workloads (one arriving, leaving, changing state or being resized) — a rogue
 runtime the database does not know about still consumes headroom in
 placement, and an uncapped rogue container makes the host's capacity
 explicitly *incomplete*, which disqualifies it as a placement target until
-resolved.
+resolved. A VM that is migrating is charged by neither placement nor
+admission, so its qemu counts in EXTRA on the host it runs on until the move
+commits.
 
 The `capacity:` table in `lv health` has one row per host that has sampled:
 
@@ -1218,8 +1335,9 @@ capacity:
 ```
 
 - **DB** is what the database holds on the host now, read at request time
-  with the rules placement charges by: running VMs at their recorded vCPU and
-  memory, then (`+… ct`) the memory of running containers. A container is
+  with the rules both placement and admission charge by: running and
+  starting VMs at their recorded vCPU and memory (placement also charges a
+  VM still `creating`, which is not shown here), then (`+… ct`) the memory of running containers. A container is
   charged its memory and nothing else — its cpu is a cap in cores, not a
   reservation — and carries no qemu overhead.
 - **EXTRA** is the sampler's finding: runtime usage beyond the database (a
@@ -1270,6 +1388,31 @@ evidence names each such member and the command that clears it:
 for one that should stay a host but stop voting, and `lv cluster voter rm`
 then `lv cluster voter add` for an abstaining one.
 
+### A lease with no claim majority (`ha.lease.claim_no_majority`)
+
+Evaluator `lease_term_claim`, subject `cluster/<lease key>`, severity warning.
+Raised by a node that has seen a lease with no live holder and could not take
+it over for want of a voter majority for longer than one of the lease's TTLs,
+so nobody holds the lease (docs/operating-model.md, "Two nodes taking a lease
+over at once record one term"). That covers a node that has lost the voter
+majority and stands down from the lease, a quorum high-water read that no
+quorum answered, and a claim no majority of the voter generation could
+decide. Resolved once the lease is no longer contested: a
+claim for it is decided, a term is recorded without a claim, or a node sees a
+live holder renewing it. During a split, a node that cannot see the holder may
+raise it again, and the row then alternates between observed and resolved
+without reaching confirmed. `litevirt_lease_term_claim_no_majority_total{lease}`
+counts each such poll. A claim lost to another claimant of the same term, with
+a majority there to decide it, is not counted. The evidence names the reason,
+and for a claim the refusing voters.
+Voter changes are decided by the same majority, so `lv cluster voter rm`,
+`add` and `reset` may not be able to run while this is raised. Repair a voter
+while `ha.voter.unavailable` names it, before it is needed. Once this is
+raised, the exits are restoring the lost voter, or fencing proof-grade every
+member that cannot vote, abstaining ones included, and naming each in
+`lv cluster voter force-reconfigure --lost <host>[,<host>...]`. `lv cluster voter reset`
+returns lease takeovers to the two-holder race.
+
 ### A forced voter reconfiguration (`ha.voter.forced`)
 
 Evaluator `voter_config`, subject `cluster/voters`, severity warning. Raised
@@ -1296,16 +1439,20 @@ failover lease holder. A host's recoverable workloads stay paused, and nothing
 recovers them, because observers outside the voter majority still see the host
 answer: a host that reaches both halves of a split of the voters (a witness,
 or a host in maintenance) relays the minority's view. Nothing runs twice. It
-is raised in one of two forms:
+is raised in one of three forms:
 
 - **At the deadline.** The host was fenced relying on its partition pause, the
   wait passed, and its workloads were not recovered because observers had
   seen it answer since the fence. On a derived voter set (no generation
   adopted) any such observer holds the recovery; on an adopted generation it
-  is held while the host has not reported its pause. A store error reading
-  that report is not a bridge and raises nothing; the
-  `host.recovery.stalled` notification names it. The deadline is re-checked
-  every cycle; the condition resolves when it goes ahead, or when the refusal
+  is held while the host has not reported its pause during this outage. A
+  report stamped more than 5 s before the voters first lost the host counts
+  as an earlier outage's, so a host whose clock runs that far behind is held
+  for as long as the bridge lasts, though it paused; once no observer sees it
+  answer, the deadline recovers it. A store error reading that report is not
+  a bridge and raises nothing; the `host.recovery.stalled` notification names
+  it. The deadline is re-checked every cycle while a quorum of voters fails
+  the host (while fewer do, the notification says so); the condition resolves when it goes ahead, or when the refusal
   is no longer a bridge (a voter majority sees the host answer), and
   workloads its limit leaves on the host are named by the
   `host.recovery.stalled` notification instead.
@@ -1314,6 +1461,12 @@ is raised in one of two forms:
   the observers that see it answer leave too few voters failing it for a
   quorum. This is a witness bridge on a derived voter set, where the witness
   votes. Nothing is fenced or recovered.
+- **After a failed fence.** The host's fence failed (an `ipmi` or `redfish`
+  BMC that did not answer, say), and its retry is refused on every cycle
+  because observers saw the host answer after the attempt. Those observers
+  hold no voter majority, and the host has `partition_paused` open, so its
+  workloads are paused and held by the bridge rather than coming back. The
+  `host.recovery.stalled` notification names the refused retry too.
 
 The evidence names the paused `workloads`, the `observers` that see the host
 answer, whether the cluster is on a `derived_voter_set`, and the `remedy`:
@@ -1611,6 +1764,41 @@ on` keeps it as the operator's; a stack deployed later that asks for
 default-deny takes it over. The condition resolves on the next pass after
 either.
 
+### A VM that outlived its stack's teardown (`stack.vm_outlived_stack`)
+
+Evaluator `stack_reconciler`, subject kind `vm`, subject the VM's name,
+severity warning. Raised by the stack reconciler on the VM's host, once that
+host's replica has caught up, for a live VM whose record names a compose
+stack that was torn down while the VM existed; a VM recorded on a removed
+host is not reported. A teardown deletes the VMs it listed, each as the
+incarnation it listed, so a VM of a member's name created during
+`compose down` (a `compose up` running beside it, or the member re-created
+on another host) is left, and nothing else deletes it. The evidence names the stack, the VM's host and when each was
+created and torn down. `lv rm <vm>` removes the VM; deploying the stack again
+(`lv compose up`) makes it the stack's again. The condition resolves on the
+next pass after either. A VM created after the stack was torn down is a
+deploy of that stack name in progress, and is not reported.
+
+### Tag-group conditions (`firewall.tag_group.*`)
+
+Raised per host by its firewall reconciler, and resolved on the next pass that
+no longer finds the cause. Each names the rules, groups or workloads involved
+(at most ten, then a count) and the command that fixes them. docs/firewall.md,
+"Tag groups", says what each one holds back.
+
+| Condition | Severity | Raised when |
+|---|---|---|
+| `firewall.tag_group.missing` | critical | a rule has named a tag group this host's replica does not hold for a minute: an accept matches nothing, a drop or reject loses its address match |
+| `firewall.tag_group.unreadable` | critical | a group's row cannot be read here, or its set cannot be declared (`<x>_v6` beside `<x>`) |
+| `firewall.tag_group.tags_unreadable` | critical | a workload's tags row cannot be read: its NICs are held at drop |
+| `firewall.tag_group.identity_shared` | critical | two live workloads hold one firewall identity (a copy): every NIC of each is held at drop |
+| `firewall.tag_group.identity_lost` | critical | a workload has no firewall identity while a tags row of an earlier incarnation of its name remains: its NICs are held at drop as for an unreadable tags row; the evidence gives the `lv firewall tag set` command |
+
+`litevirt_firewall_tag_group_members{group}` is a gauge of each group's members
+in this host's view, 0 for a group this host cannot read. Hosts can differ for
+up to one replication lag plus the 30 second reconcile tick;
+`lv firewall tag-group ls --members` shows the members.
+
 ### Deferred out-of-band stop sync after a restart or rejoin
 
 When a VM's domain is found shut off out of band (a crash, an external
@@ -1707,6 +1895,45 @@ network heals. It logs what came back and what did not, but raises no condition.
 See [Gossip membership heals itself after a
 partition](operating-model.md#gossip-membership-heals-itself-after-a-partition).
 
+### A host whose boot kept its fence (`boot_kept_fence`)
+
+A host recorded `fenced` or `offline` returns to service on its own when its
+daemon boots ([migration-failover.md](migration-failover.md), "A graceful
+restart stays `upgrading` until it serves"), except when that boot cannot
+write `boot-unclean-history` in its `data_dir` (a full or read-only disk). It
+then keeps the fence: its daemon runs and serves, and the host stays `fenced` or
+`offline`, unplaceable. Evaluator `host_boot`; the host writes the row about
+**itself**, and logs the same at warning level.
+
+| Raised when | Clears when |
+|---|---|
+| The boot of a host recorded `fenced` or `offline` could not record its unclean-boot history and kept the fence. **Warning** severity. The evidence names the state kept, the cause and the remedy. | The host is recorded as anything but `fenced` or `offline` (`lv host undrain <host>`). One left open by an earlier daemon process is resolved by the next boot once that holds. |
+
+Fix what the cause names, confirm the host should run workloads again, then
+run `lv host undrain <host>`.
+
+### A host stuck `upgrading` while its daemon runs (`upgrading_unconfirmed`)
+
+After a restart the host stays `upgrading` until its daemon answers its own
+Ping and records it `active` ([migration-failover.md](migration-failover.md),
+"A graceful restart stays `upgrading` until it serves"). Peers that cannot
+reach such a host fence it once it has been `upgrading` for 2 minutes. Peers
+that reach it do not, so a daemon that runs but never records itself `active`
+leaves its host unplaceable, listed as draining, and nothing else shows why.
+Evaluator `host_boot`; the host writes the row about **itself**.
+
+| Raised when | Clears when |
+|---|---|
+| The host has been recorded `upgrading` for 2 minutes or more, and its daemon's serving check still has not recorded it `active`: its own Ping does not answer, or the write that records it `active` fails (that write is retried with backoff, 1 s doubling to 1 min, until it lands). **Warning** severity. The evidence names the cause, the time the host turned `upgrading` and the remedy. | The check records the host `active`, or finds it recorded as something else (fenced, drained, undrained), whether or not its own Ping answers yet. One left open by an earlier daemon process is resolved too. While it stays open its row is written again only when the cause changes, and otherwise every 10 minutes. |
+
+While it is open the host also exports `litevirt_host_upgrading_unconfirmed 1`,
+and logs the cause and the remedy at error level. Fix what the cause names:
+the daemon's own mTLS client or its listener on 127.0.0.1, or the write (a
+WAL-quarantined node writes nothing, this condition included, so there only
+the log and the metric show it). The host then records itself `active`. Or run
+`lv host undrain <host>` to record it `active` now; it does so only if the
+host's daemon answers a Ping from the node handling the undrain.
+
 ### Partition pause (`partition_paused`, `partition_pause_failed`, `partition_one_way`, `vm_settled`, `vm_settle_declined`)
 
 Evaluator `partition_pause` (design/partition-pause.md). Every row is written by
@@ -1743,6 +1970,12 @@ holder writes.
   host while the host's own rows, written after those failures began, still
   mark a majority healthy. That is a one-way partition, in which the host may
   never pause. Nothing is recovered differently; find the asymmetric link.
+  The lease holder resolves it once the quorum reaches the host again or the
+  host no longer counts a majority, whichever holder raised it (a row
+  another holder raised stands for one lease, 45 s, first). It is not
+  raised for a host restarting (`upgrading`) within its allowance. A host
+  booting back from a fence comes up `fenced` or `offline`, not `upgrading`,
+  and can still raise it for the 15-25 s before its gRPC server serves.
 - `vm_settled` / `ct_settled` (`<name>@<host>`, warning): a host came back
   holding a copy of a workload that a decided recovery claim, whose
   certificate verifies, gave to another host at the same incarnation and an
@@ -1750,6 +1983,8 @@ holder writes.
   the destination's own runtime reports the workload running. The host
   stopped its copy (a VM is destroyed, which keeps its definition and disks)
   and wrote a `partition.settle` audit row. The leftover cleanup then handles the shut-off domain as usual.
+  The host resolves `vm_settled` on the pass that finds no domain of that
+  name defined there, or the VM's row naming it again.
 - `vm_settle_declined` (`<name>@<host>`, warning): the host runs a copy of a
   VM whose row names another host, and settle declined to stop it for two
   passes in a row. The evidence carries the `reason` (the clause of the proof
@@ -1765,6 +2000,15 @@ holder writes.
   build defined the domain, so it carries no incarnation stamp. Settle does
   not fall back to the domain UUID, because a live restore or a renamed
   promote gives a new incarnation an earlier one's UUID.
+
+  `proof_uncertified` means the recovery completed on the destination, but
+  its proof carries no certificate: it was minted while recovery claims were
+  not enforced, as on a derived voter set. It is reported only for a live
+  proof at an owner epoch at least the local copy's, and only when no
+  certified proof gave a reason of its own. Settle acts only on a certificate,
+  so a paused copy stays paused. There is no claim for `lv cluster claim` to
+  show. Confirm with `virsh domstate <vm>` on the destination that it runs
+  there, then stop the copy on this host with `virsh destroy <vm>`, as below.
 
   The row naming another host is not proof on its own: a converged-wrong
   `host_name` looks exactly the same. Before stopping anything, confirm which
@@ -1846,6 +2090,68 @@ naming the prefix and the tree; the daemon log says the same at start.
 |---|---|
 | The daemon starts with such a prefix configured. | The daemon starts with no such prefix (the prefix moved to a filesystem of its own, or removed). |
 
+### Operation not reapable (`operation_unreapable`)
+
+Every node runs the operation reaper hourly. It tombstones each finished
+operation, and its steps, once the last step is older than
+`tombstone_gc_retention_hours` (default 24) and no VM barrier names it. A node
+raises `operation_unreapable` (warning) about **itself** when a pass could not
+reap one or more of those operations. The reaper goes on to the next operation,
+so one failure does not hold the others. Each failure is logged once per pass as
+`operation reaper: could not reap an operation`, with `operation_id` and
+`error`, for up to 20 operations; past that, one line,
+`operation reaper: could not reap more operations`, carries `more` and `total`.
+The evidence carries `count`, `operations` (up to 20, each with `id`
+and `error`) and `remedy`.
+
+| Raised when | Clears when |
+|---|---|
+| A reaper pass could not read an operation's steps or write its tombstone. | A complete pass has no failures. A pass that ends early never clears it: WAL quarantine, shutdown, or a failure of the pass's opening reads. A pass that ends early after failures raises it with only the operations reached, so `count` can be low until the next complete pass. |
+
+**If it does not clear,** the `error` of each listed operation says why its
+steps could not be read or its tombstone could not be written. Fix that cause;
+the next pass retries every listed operation.
+
+### Reservation not released (`reservation_stale`)
+
+Evaluator `reservation-sweep`, subject kind `host`, subject the host the
+reservations are counted against, severity warning. Each node's reservation
+sweep runs at startup and every 60 seconds. It releases a reservation whose
+operation finished at an owner epoch past its header's, or whose VM no longer
+exists, and logs `released a host reservation whose operation is no longer
+running`. A node raises `reservation_stale` about **itself** while a
+reservation counted against it is older than 15 minutes, no operation holds it
+in flight, and the sweep cannot release it, or while a reservation counted
+against it cannot be read. The evidence carries `count` and
+`reservations` (up to 20), each with `operation_id`, `method`, `vm`, `vcpu`,
+`memory_mib`, `created_at`, `class` and `remedy`.
+
+| `class` | Why the sweep does not release it | Remedy |
+|---|---|---|
+| `no_running_operation` | Nothing proves its operation stopped: no VM or container barrier names it, and it has no terminal step at an owner epoch past its header's. | Check with `lv operation show <vm>` (`lv ct inspect <container>` for a container) that nothing is running, then `lv operation release-reservation <operation-id> --force`. |
+| `terminal_past_header` or `vm_gone` | Its release row (a `cancelled` step at the header's owner epoch) is tombstoned and cannot be written again. | `lv operation release-reservation <operation-id> --force`, which writes a `failed` step at the header's owner epoch instead. |
+| `terminal_past_header` or `vm_gone` | The release write failed. | The write is retried every pass, and the daemon logs `reservation sweep: could not release a reservation` once per operation with the error. |
+| `unreadable` | Its reservation data (vector, project binding or authority facts) cannot be read, so it is not classified. The entry carries only `operation_id`. | The daemon logs `reservation sweep: a reservation could not be read` once per operation with the error; `lv host inspect <host>` names it under `reservationsError`. `lv operation release-reservation` refuses it. |
+
+| Raised when | Clears when |
+|---|---|
+| A sweep pass finds such a reservation. | A sweep pass finds none: each one was released, or its operation was reaped. |
+
+When the target host is removed or not active, its `terminal_past_header`
+reservations are released by the smallest active host instead. While that host
+runs an older build or its replica is untrusted, nobody releases them, and a
+release it cannot write is logged there but raises no condition; the operation
+reaper still removes the operation about a day after its last step.
+
+A removed host (`lv host rm`) raises nothing about itself, so the smallest
+active host keeps its `reservation_stale` instead, under the removed host's
+subject, and resolves it, along with any the host left open, once none is
+left. It lists what no sweep releases there: `no_running_operation`, `vm_gone`
+(released only by its target), blocked, and `unreadable` reservations. Each
+still counts against its project quota until `lv operation release-reservation
+<operation-id> --force` releases it; for a removed host that is decided on the
+node called.
+
 ### Observer stalled (`observer_stalled`)
 
 A node that was itself not running — its VM suspended, swapped out, or starved
@@ -1858,6 +2164,14 @@ and never blocks admission.
 | Raised when | Clears when |
 |---|---|
 | The health checker's heartbeat (every 250 ms) sees a gap longer than one probe interval (2 s), on either the monotonic or the wall clock. Confirmed at once: it is a measurement of the node's own scheduling, not an inference from a scan. **Warning** severity. The evidence carries `gap_seconds` and `grace_until`. A further stall inside the window extends the same episode, and `gap_seconds` keeps its longest pause: a long pause is often followed by a short one as the node catches up. | The grace window closes: 5 probe intervals (10 s) after the stall, the time a normal fence verdict takes to build. A condition left open by a previous daemon process is resolved on start. |
+
+After the window, the evidence may also carry `silent_runs`: for each peer
+whose first failing run after the stall began without the node having seen
+the peer answer since it stopped, the run's start (`run_start`, as its
+`host_health` verdict carries it) and `silent_since`, when the node stopped.
+Failover reads a failing run that began after a fence as the observer having
+seen the host answer, and refuses the recovery; a run recorded here is not
+read that way.
 
 **What you see.** A host that died while its observers were stalled is fenced
 up to one grace window later than usual. `lv doctor fence` lists the stalled
@@ -1974,7 +2288,10 @@ the LUN; the involved hosts are the hosts those VMs are on.
 | A scan of the replica's `vm_disks` finds two or more live disks of live VMs whose recorded paths are one LUN (the target compared case-insensitively, the portal ignored), or such a disk and an older linked clone layered on it. Observed (warning) on the first such scan, confirmed (critical) on the second. | Two consecutive scans find no such use, under a valid decision gate. |
 
 It runs once a minute on whichever node holds its own lease
-(`shared_lun_detector`). It is detection only: the voter-majority LUN claim
+(`shared_lun_detector`). A survivor takes that lease over once a quorum of
+voters runs a build that answers for the key; until then the scan stops when
+its holder does, and `lv health` lists `shared_lun` as stale after 5 minutes.
+It is detection only: the voter-majority LUN claim
 at create time is the prevention ([storage.md](storage.md#iscsi-one-lun-one-disk)).
 It **changes nothing**: no disk is touched, and it is not an ownership code, so
 admission — starting either VM included — does not read it. Refusing the start
@@ -2175,7 +2492,16 @@ max by (host, name) (litevirt_orphan_runtime{row="tombstoned"}) > 0
 max by (host, name) (litevirt_orphan_runtime{row="missing"}) > 0
 ```
 
-**Nothing reaps an orphan automatically.** The only tombstone that could prove a
+**One orphan is undefined automatically:** a shut-off domain (no managed-save
+image) recognised by its owner-epoch element, whose tombstoned record names
+another host at a strictly newer owner epoch than the domain's and the host's
+`<data_dir>/vms/<vm>/owner_epoch`. Its host undefines it on the second
+sighting, or when the delete asks it, and removes that marker: disks and TPM
+state stay, its UEFI vars are renamed to `<vars>.superseded-<time>` (listed by
+`lv host superseded-disks`, never removed by the host), and a
+`vm.leftover.undefined` event records it.
+
+**Nothing else reaps an orphan automatically.** The only tombstone that could prove a
 running workload is unwanted is one naming this host at the runtime's own owner
 epoch. The delete paths remove the runtime before they write that tombstone, so
 such a pair only appears after a crash or a replication anomaly, which is
@@ -2218,6 +2544,36 @@ migration onto a host whose key differs from the source host's is refused
 before libvirt is asked. Install the cluster's keyring for the client on the
 odd host; the next reconcile (30 s) resolves the condition.
 See [storage.md](storage.md#ceph-rbd-pools).
+
+### A line of spec edits is held off by a running operation (`vm.spec_edit_held`)
+
+After a partition, one side can hold a longer line of out-of-band edits to a
+VM's spec (labels, a deploy's metadata) while the owner runs an operation on
+the VM from an earlier generation (a hotplug, a resize). The line waits until
+the operation has finished, so the operation can complete
+([operating-model.md](operating-model.md#replication)). Meanwhile the hosts
+disagree: the owner, and those that saw the operation first, show the
+operation and its spec; the others show the line and no operation. Each host
+that holds the line raises `vm.spec_edit_held` (evaluator `spec_conflict`,
+subject `vm/<name>@<host>`, warning): observed at the end of the first
+anti-entropy pass that holds, confirmed at the end of the second consecutive
+one for the same operation, each time only if the operation still has not
+finished once the whole pass has merged. A pass that brings the
+operation's terminal step therefore does not confirm it; it resolves the
+condition at its end. On
+confirmation the host logs a warning and counts
+`litevirt_spec_edit_held_total`, once per VM and operation. The evidence
+names the operation, the owner host it shows on (the VM's host as of the
+latest pass) and the remedy: on that host, check `lv operation show <vm>`;
+if that operation is wedged there, run
+`lv operation abort <vm> --operation <id> --force`, which is refused if
+another operation is active by then. On a host that kept the line,
+`lv operation show <vm>` reports no operation. The condition resolves when
+the operation turns terminal there, the held line applies, or the VM is
+deleted; anti-entropy carries the line on its next pass after that. A host
+removed with `lv host rm` never resolves its own, so the removal resolves
+them. Nothing ends an operation that never reaches a terminal step on its
+own.
 
 ### A cancelled start is still recorded (`cancelled_start_kept`)
 
@@ -2315,6 +2671,11 @@ reason. The VM gets a `vm.disk_kept` event and an audit entry. The host the
 delete ran on records it in `<data_dir>/kept-disks.json` and raises
 `disk_leftover` (evaluator `vm_delete`, subject `host/<host>`, warning), whose
 evidence gives each path, its host, the VM and disk, when, and the reason.
+The stack reconciler records there too, on its own host, the disks of a stack
+member it deleted while keeping them because it could not prove the teardown
+let them go (the teardown recorded no disk choice, or another teardown's); the
+reason names the stack. Unless that stack delete asked to keep disks, they are
+leftovers.
 litevirt removes none of them: check that nothing uses each one (another VM's
 disk, a process holding it open), then remove it by hand. A file on that host
 is forgotten once it is gone; a disk is not named while another VM's disk
@@ -2424,7 +2785,7 @@ old copy it found at a failover start records it the same way. `lv inspect
 
 | Raised when | Clears when |
 |---|---|
-| A failover restarts the VM elsewhere and leaves a host-local disk on the failed host, or a host sets a copy of the VM's disk aside. | Nothing is left to keep: every copy was removed (`--remove`) or restored (`--restore`), or the VM was deleted. A record for a host removed from the cluster clears once the VM is deleted. |
+| A failover restarts the VM elsewhere and leaves a host-local disk on the failed host, or a host sets a copy of the VM's disk aside. | Nothing is left to keep: every copy was removed (`--remove`) or restored (`--restore`), or the VM was deleted. After a delete the host clears it once it has set aside the disk still at its path, or left a disk the delete kept (`--keep-disks`, `delete_with_vm=false`, or a record that does not say what the delete decided) where it is. It waits while a domain of the VM's name runs there, or while the path is missing and its directory is absent, empty or cannot be listed (as a volume not mounted yet reads). A path missing from a directory that lists other files is gone, and does not hold the record open. A record for a host removed from the cluster clears once the VM is deleted. |
 
 Every copy is kept while the VM exists. To run the VM on its real disk again,
 or to give the data up, see the commands in
@@ -2443,7 +2804,7 @@ down host that no other host runs.
 
 | Raised when | Clears when |
 |---|---|
-| Failover leaves a restart-same VM with a host-local disk on its failed host. | The host is back and the VM runs there again (a host that boots again turns `active` on its own, after `upgrading` if it booted into a pending upgrade; one that answered again without restarting and stays `fenced` or `offline` needs `lv host undrain <host>` first), or, once the host is back, the VM is on another host or deleted. A record for a host removed from the cluster clears once the VM is deleted or on another host. |
+| Failover leaves a restart-same VM with a host-local disk on its failed host. | The host is back and the VM runs there again (a host that boots again turns `active` on its own, after `upgrading` until its daemon serves; one that answered again without restarting and stays `fenced` or `offline` needs `lv host undrain <host>` first), or, once the host is back, the VM is on another host or deleted. A record for a host removed from the cluster clears once the VM is deleted or on another host. |
 
 ### A start an operator cancelled (`vm_start_cancelled`)
 

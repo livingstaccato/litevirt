@@ -226,6 +226,22 @@ func GetPlacementGen(ctx context.Context, c *Client, vm string) (int64, error) {
 	return n, nil
 }
 
+// GetPlacementGenChecked is GetPlacementGen that says whether it READ a
+// generation: known is false when the read failed, the row is absent on this
+// replica, or its value does not parse. A caller that acts on the generation
+// being different (spending a record) must not treat that as 0.
+func GetPlacementGenChecked(ctx context.Context, c *Client, vm string) (n int64, known bool) {
+	rows, err := c.Query(ctx,
+		`SELECT value FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`, placementGenKeyPrefix+vm)
+	if err != nil || len(rows) == 0 {
+		return 0, false
+	}
+	if _, serr := fmt.Sscanf(rows[0].String("value"), "%d", &n); serr != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
 // placementGenStmts is the statement that advances vm's placement generation,
 // for the batch that changes its host; none while the gate is closed.
 func placementGenStmts(ctx context.Context, c *Client, vm string) []Statement {

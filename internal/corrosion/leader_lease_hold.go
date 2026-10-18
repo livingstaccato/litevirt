@@ -58,6 +58,94 @@ const maxLeaseAttempts = 3
 // "not held", which is the same shape as losing the race and is what the callers
 // already handle.
 func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, ttl time.Duration, now time.Time) (bool, int64, error) {
+	// A key outside leaseKeys is one no peer answers the quorum high-water read
+	// for, so a term minted for it could never be taken over. Refused here, on
+	// the first acquire, rather than discovered on the first restart.
+	if !ValidLeaseKey(key) {
+		return false, 0, fmt.Errorf("lease key %q is not in corrosion.leaseKeys: peers refuse its "+
+			"high-water read, so no node could take it over", key)
+	}
+	held, term, err := acquireLeaseWithTerm(ctx, c, key, holder, ttl, now)
+	if err == nil && c.leaseLiveObserver != nil {
+		live := held
+		if !held {
+			// Not ours: live for someone else? One local read, so the
+			// observer hears of a lease that is no longer contested.
+			cur, exp, rerr := leaseRow(ctx, c, key)
+			live = rerr == nil && cur != "" && cur != holder &&
+				exp >= now.UTC().Format(time.RFC3339)
+		}
+		if live {
+			c.leaseLiveObserver(ctx, key)
+		}
+	}
+	return held, term, err
+}
+
+// SetLeaseLiveObserver injects what AcquireLeaseWithTerm tells when it finds
+// the lease key held — by this node (a renewal or a mint) or live for a peer.
+// Wired at daemon start to grpcapi.Server.NoteLeaseLive, which resolves the
+// no-majority condition a stalled takeover raised. Nil tells nobody.
+func (c *Client) SetLeaseLiveObserver(fn func(ctx context.Context, key string)) {
+	c.leaseLiveObserver = fn
+}
+
+// LeaseNoMajority is one poll on which this node would take a lease over and
+// cannot, because no voter majority is available to it: the health voter
+// quorum is lost (NoteLeaseNoQuorum), the quorum high-water read found no
+// quorum, or the term's claim reached no majority of the voter generation
+// (grpcapi lease_term_claim.go).
+type LeaseNoMajority struct {
+	Key string
+	// TTL is the lease's; the stall is reported once it has lasted one.
+	TTL time.Duration
+	// Now is the caller's clock for this poll.
+	Now time.Time
+	// Why is the stand-down's reason, for the condition's evidence.
+	Why string
+	// Live is set when the poll stood down over a lease this replica shows
+	// live: no takeover is due, so the report ends this node's stall for Key
+	// rather than counting one. It writes no condition (a node at the gate
+	// may hold a stale view) and is not a no-majority poll.
+	Live bool
+}
+
+// SetLeaseNoMajorityObserver injects what NoteLeaseNoQuorum tells. Wired at
+// daemon start to grpcapi.Server.NoteLeaseNoMajority, which counts the poll
+// and raises ha.lease.claim_no_majority once a lease has gone a TTL without a
+// takeover. Nil tells nobody.
+func (c *Client) SetLeaseNoMajorityObserver(fn func(ctx context.Context, ev LeaseNoMajority)) {
+	c.leaseNoMajorityObserver = fn
+}
+
+// NoteLeaseNoQuorum is called by a lease's poll loop that stood down without
+// calling AcquireLeaseWithTerm because this node has lost the voter majority
+// (the failover coordinator, the dual-run detector, the rebalancer). The
+// stand-down is a takeover that cannot happen only when this replica shows no
+// live holder: the lease row is expired or absent. A holder that cannot renew
+// its own live lease, and a lease live for a peer, are not takeovers: they are
+// reported with Live set, which only ends this node's stall. A node that stays
+// at the gate never renews or takes the lease, so this is the only place it
+// learns the lease was held since its stall began; without it the next brief
+// expiry at an ordinary holder change raised the condition at once, with a
+// stall start from before that holder. One local read.
+func NoteLeaseNoQuorum(ctx context.Context, c *Client, key, holder string, ttl time.Duration, now time.Time) {
+	if c == nil || c.leaseNoMajorityObserver == nil {
+		return
+	}
+	cur, exp, err := leaseRow(ctx, c, key)
+	if err != nil {
+		return
+	}
+	if cur != "" && exp >= now.UTC().Format(time.RFC3339) {
+		c.leaseNoMajorityObserver(ctx, LeaseNoMajority{Key: key, TTL: ttl, Now: now, Live: true})
+		return
+	}
+	c.leaseNoMajorityObserver(ctx, LeaseNoMajority{Key: key, TTL: ttl, Now: now,
+		Why: "this node has lost the voter majority, so it neither takes the lease over nor records a term"})
+}
+
+func acquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, ttl time.Duration, now time.Time) (bool, int64, error) {
 	// The clock is re-sampled on EVERY attempt, not once at entry.
 	//
 	// A holder that enters before its expiry and then stalls past the TTL -- a
@@ -142,7 +230,7 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 				// still records. Retire it: mint above it, atomically with the
 				// renewal, so the term we act under is one no replica attributes to
 				// anyone else and the contested one falls below every threshold.
-				held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, cur, newest.Term, false)
+				held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, cur, ttl, newest.Term, false)
 				if err != nil {
 					return false, 0, err
 				}
@@ -240,7 +328,7 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 		if ourTenure && newest.Term > 0 && newest.Holder == holder && c.termBelongsToEarlierTenure(key, newest.Term) {
 			supersede = newest.Term
 		}
-		held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, cur, supersede, !ourTenure)
+		held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, cur, ttl, supersede, !ourTenure)
 		if err != nil {
 			return false, 0, err
 		}
@@ -523,20 +611,28 @@ func renewLease(ctx context.Context, c *Client, key, holder, expires, nowRFC str
 // our own lease is live (0 for an ordinary acquisition); see leaseAcquirableTx.
 // takeover is true when our own replica shows no live tenure of ours: the
 // clearance must then also confirm that no peer sees the lease live (see
-// leader_lease_clearance.go).
-func takeLeaseAndMintTerm(ctx context.Context, c *Client, key, holder, expires, nowRFC string, now time.Time, supersede int64, takeover bool) (bool, int64, error) {
+// leader_lease_clearance.go). ttl is the lease's: a term this node learned was
+// decided for another node is that node's lease for one ttl (decidedElsewhere).
+func takeLeaseAndMintTerm(ctx context.Context, c *Client, key, holder, expires, nowRFC string, now time.Time, ttl time.Duration, supersede int64, takeover bool) (bool, int64, error) {
 	acquiredAt := now.UTC().Format(time.RFC3339)
 
 	next, err := nextLeaseTerm(ctx, c, key)
 	if err != nil {
 		return false, 0, err
 	}
+	// A term decided for another node is not ours to claim again: its holder
+	// may be recording and acting under it while this replica has not seen
+	// it yet. Not held until its lease would have lapsed, then the next term.
+	next, wait := c.decidedElsewhere(key, holder, next, now, ttl)
+	if wait {
+		return false, 0, nil
+	}
 	// Confirm the cluster has not already minted `next` before claiming it from
 	// this replica's view. Withheld is "not held", never contended: retrying
 	// inside this call would ask the same peers the same question. See
 	// leader_lease_clearance.go.
 	if !c.clearLeaseMint(ctx, LeaseMintRequest{
-		Key: key, Term: next, Holder: holder, Takeover: takeover, Now: nowRFC,
+		Key: key, Term: next, Holder: holder, Takeover: takeover, Now: nowRFC, TTL: ttl,
 	}) {
 		return false, 0, nil
 	}

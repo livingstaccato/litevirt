@@ -167,6 +167,46 @@ func TestRelayHealthV1Registered(t *testing.T) {
 	}
 }
 
+// TestVRRPUnicastV1Registered: advertised (the grpcapi filter withholds it
+// while enforcement.vrrp_unicast is off), known, flag-gated rather than
+// mandatory, and confirmed against every replication recipient.
+func TestVRRPUnicastV1Registered(t *testing.T) {
+	if VRRPUnicastV1 != "vrrp_unicast_v1" {
+		t.Fatalf("VRRPUnicastV1 = %q, want %q", VRRPUnicastV1, "vrrp_unicast_v1")
+	}
+	if !slices.Contains(Supported(), VRRPUnicastV1) || !slices.Contains(All(), VRRPUnicastV1) {
+		t.Fatalf("vrrp_unicast_v1 missing from Supported() or All()")
+	}
+	if Mandatory(VRRPUnicastV1) {
+		t.Fatal("vrrp_unicast_v1 has a kill switch (enforcement.vrrp_unicast); it is not mandatory")
+	}
+	if !ReplicationGated(VRRPUnicastV1) {
+		t.Fatal("vrrp_unicast_v1 must wait for every replication recipient: a maintenance host may run an LB")
+	}
+}
+
+// TestSpecConflictV1Registered pins spec_conflict_v1: advertised, known,
+// mandatory (a fact about the binary — how it resolves two edits of one spec
+// at one generation) and replication-gated (every recipient decodes the
+// epoch-carrying edit and resolves as the rest do).
+func TestSpecConflictV1Registered(t *testing.T) {
+	if SpecConflictV1 != "spec_conflict_v1" {
+		t.Fatalf("SpecConflictV1 = %q, want %q", SpecConflictV1, "spec_conflict_v1")
+	}
+	if !slices.Contains(Supported(), SpecConflictV1) {
+		t.Fatalf("Supported() = %v, want it to contain %q", Supported(), SpecConflictV1)
+	}
+	if !slices.Contains(All(), SpecConflictV1) {
+		t.Fatalf("All() = %v, want it to contain %q", All(), SpecConflictV1)
+	}
+	if !Mandatory(SpecConflictV1) {
+		t.Fatal("spec_conflict_v1 must be mandatory: a flag would let one node keep a different version of a spec")
+	}
+	if !ReplicationGated(SpecConflictV1) {
+		t.Fatal("spec_conflict_v1 must be replication-gated: every recipient decodes the epoch-carrying edit")
+	}
+}
+
 // TestReleaseTokenRegistered pins the release token's registration. Every one
 // of these sets matters: Supported is what peers latch on, All is what the
 // checker loads markers for and what the rollback preflight treats as known,
@@ -326,6 +366,7 @@ var frozenReleaseFeatures = map[string][]Feature{
 		"pit_overlay",
 		"redfish_fence",
 		"replication_rate",
+		"returning_boot",
 		"usb_mounts_memory",
 		"vm_disk_nic_io",
 		"vm_limits",

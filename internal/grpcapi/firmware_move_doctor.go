@@ -39,7 +39,6 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fwmig"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
-	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/safename"
 )
 
@@ -1490,17 +1489,18 @@ func (s *Server) doctorAcceptSourceAfterCommit(ctx context.Context, m fwmig.Mark
 
 // convergeMovedGuest is the part of a migration's finish that does not need
 // the other host, for a VM whose copy now lives on `on` (this host) after
-// living on `from`: each VXLAN NIC's FDB entry pointed at on's VTEP, a
-// gratuitous ARP for a guest that runs here, and the stack's LB backends
-// refreshed.
+// living on `from`: each VXLAN NIC's FDB entry pointed at on's VTEP, the
+// gateways of a guest that runs here announced out of this host's bridges
+// (announceGatewaysOf, what AnnounceMigratedGuest does on a live move's
+// target), and the stack's LB backends refreshed.
 func (s *Server) convergeMovedGuest(ctx context.Context, vm *corrosion.VMRecord, from, on string, running bool) {
 	ctx = context.WithoutCancel(ctx)
 	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
 	for _, iface := range ifaces {
 		s.updateFDBForMigration(ctx, iface, from, on)
-		if running && iface.IP != "" {
-			go network.SendGARPBestEffort(iface.NetworkName, iface.IP)
-		}
+	}
+	if running {
+		go s.announceGatewaysOf(ctx, vm.Name)
 	}
 	go s.refreshLBForStack(context.Background(), vm.StackName)
 	s.fwLiveStep("converge:" + from + "->" + on)

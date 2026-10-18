@@ -92,6 +92,7 @@ func (s *Server) armWorkload(ctx context.Context, display string, macs func() ([
 // its NIC firewall in force first: a guarded container whose guards are not
 // is not started (re-review m10). Every container start goes through it.
 func (s *Server) startContainerArmed(ctx context.Context, name string) error {
+	s.followNetworkDevicesCT(ctx, name)
 	if err := s.armWorkload(ctx, name, func() ([]string, error) { return s.containerGuardedMACs(ctx, name) }); err != nil {
 		return status.Errorf(codes.FailedPrecondition, "%v", err)
 	}
@@ -144,9 +145,34 @@ func (s *Server) vmGuarded(ctx context.Context, vm string) (bool, error) {
 }
 
 // guardedMACs is the MACs of owner's NICs whose guard is on
-// (corrosion.GuardedMACsOf).
+// (corrosion.GuardedMACsOf) — of the incarnation a create on this host is
+// bringing up, while one is (CreatingIncarnation).
 func (s *Server) guardedMACs(ctx context.Context, owner string) ([]string, error) {
-	return corrosion.GuardedMACsOf(ctx, s.db, owner)
+	return corrosion.GuardedMACsOfIncarnation(ctx, s.db, owner, s.CreatingIncarnation(owner))
+}
+
+// noteCreatingIncarnation records that a create on this host is bringing VM
+// vm up as the incarnation uuid, until the returned func runs: a start of vm
+// meanwhile is that create's, and demands its guards only. A second create of
+// the name on this host does not take the note over from the first.
+func (s *Server) noteCreatingIncarnation(vm, uuid string) func() {
+	if vm == "" || uuid == "" {
+		return func() {}
+	}
+	if _, taken := s.creatingIncarnations.LoadOrStore(vm, uuid); taken {
+		return func() {}
+	}
+	return func() { s.creatingIncarnations.CompareAndDelete(vm, uuid) }
+}
+
+// CreatingIncarnation is the uuid a create on this host is bringing VM vm up
+// as, or "" when none is.
+func (s *Server) CreatingIncarnation(vm string) string {
+	if v, ok := s.creatingIncarnations.Load(vm); ok {
+		u, _ := v.(string)
+		return u
+	}
+	return ""
 }
 
 // needsPausedStart reports whether vm has a guarded NIC whose definition names
@@ -204,12 +230,14 @@ func (s *Server) NICStartGuard(ctx context.Context) lv.StartGuard {
 }
 
 // pendingNICs registers NICs of vm whose rows are not written yet, so the
-// firewall renders them from the moment the domain starts; the returned func
-// forgets them (call it once the rows are written, or the create failed).
+// firewall renders them from the moment the domain starts and the DHCP hosts
+// files tag them (pendingDHCPNICs); the returned func forgets them (call it
+// once the rows are written, or the create failed).
 func (s *Server) pendingNICs(vm, uuid string, recs []corrosion.InterfaceRecord, trunks map[int][]int) func() {
+	forgetDHCP := s.pendingDHCPNICs(vm, recs)
 	a, ok := s.fwRec().(nicArmer)
 	if !ok || len(recs) == 0 {
-		return func() {}
+		return forgetDHCP
 	}
 	nics := make([]corrosion.HostVMNIC, 0, len(recs))
 	for _, r := range recs {
@@ -219,7 +247,10 @@ func (s *Server) pendingNICs(vm, uuid string, recs []corrosion.InterfaceRecord, 
 		})
 	}
 	a.SetPending(vm, nics)
-	return func() { a.ClearPending(vm) }
+	return func() {
+		a.ClearPending(vm)
+		forgetDHCP()
+	}
 }
 
 // ArmNICFirewall is the RPC a migration source calls on the target before

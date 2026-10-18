@@ -15,7 +15,9 @@ func TestCurrentLedgerCategories(t *testing.T) {
 	// Back to 33: the rebalance executor's stale reap stopped being a bulk update
 	// (its lexical updated_at cutoff misread HLC). It now reaps by primary key, and
 	// the bulk shape lives on, receive-only, in the historical ledger.
-	const wantBulk = 33 // user_identity_bindings clears per row (t1-auth rereview-3 m-8)
+	// 34: a network delete tombstones its network_vteps rows by network name
+	// (deleteNetworkVTEPsSQL), the shape DeleteHost already uses by host name.
+	const wantBulk = 34 // user_identity_bindings clears per row (t1-auth rereview-3 m-8)
 	bulk := 0
 	for fp, e := range stmtLedger {
 		if e.Disposition == DispBulkUpdate {

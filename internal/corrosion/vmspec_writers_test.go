@@ -24,7 +24,7 @@ var sanctionedSpecWriters = map[string]string{
 	"CommitVMCreateOperation":   "commits the provisional row's desired/observed fields under operation+owner+generation fencing",
 	"execVMRekey":               "structural rename — changes the primary key, can't use a name-keyed CAS",
 	"BeginVMOperation":          "F1 op-start: sets desired spec + bumps generation + claims the barrier atomically",
-	"MutateDesiredSpec":         "THE sanctioned desired-spec writer",
+	"mutateDesiredSpec":         "THE sanctioned desired-spec writer (MutateDesiredSpec, MintFirewallID)",
 	"UpdateObservedActuals":     "THE sanctioned cpu_actual/mem_actual writer",
 	"migrateVMSpecNetworkNames": "one-time schema migration, runs before serving (no barrier to honor)",
 	"isGuardedTransitionSQL":    "fingerprints audited transition constants; it does not execute a write",
@@ -43,6 +43,13 @@ var sanctionedSpecWriters = map[string]string{
 		"because the row being written is not the row being read",
 	"validateGuardedVMReplaceEntry": "fingerprints the exact guarded-replace batch envelope; " +
 		"it does not execute a write",
+	"specConflictAE": "the anti-entropy merge's resolution of two versions of a spec at one generation " +
+		"(spec_conflict_ae.go): it writes the version both lanes keep, one a stamped writer made, " +
+		"holding the firewall identity siblingFirewallID gives it",
+	"takeSiblingSpecEdit": "the WAL apply of a received spec edit over a sibling at its generation " +
+		"(spec_conflict_apply.go): it replays an edit MutateDesiredSpec or BeginVMOperation made on " +
+		"its origin, under that edit's own generation and barrier guards, or keeps the local one; " +
+		"either holds the firewall identity siblingFirewallID gives it",
 }
 
 // TestSpecWritersAreSanctioned fails if any function in the corrosion package

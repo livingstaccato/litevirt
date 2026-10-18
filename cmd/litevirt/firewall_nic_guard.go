@@ -94,7 +94,15 @@ prefix).`,
 						guardFamily(g.Mode, g.EffectiveIpv4, g.Ipv4Unrestricted), guardFamily(g.Mode, g.EffectiveIpv6, g.Ipv6Unrestricted),
 						strings.Join(g.AllowedAddresses, ","), g.AllowDhcpServer, g.AllowRouterAdvertisement)
 				}
-				return w.Flush()
+				if err := w.Flush(); err != nil {
+					return err
+				}
+				for _, g := range resp.Guards {
+					if g.Note != "" {
+						fmt.Printf("%s %s: %s\n", g.VmName, g.Mac, g.Note)
+					}
+				}
+				return nil
 			})
 		},
 	}

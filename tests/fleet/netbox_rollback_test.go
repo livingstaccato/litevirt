@@ -4,17 +4,19 @@
 //
 // Both properties are about a window, not a value, so they need the failure to
 // happen INSIDE the daemon's own transaction with every earlier step really
-// having run — which is what the cluster.go trigger seams provide. The one
-// scenario that needs no seam at all (two NICs on one network) is the natural
-// repro: vm_interfaces is keyed (vm_name, network_name), so the second NIC's
-// row collides and the create's persistence fails on its own.
+// having run — which is what the cluster.go trigger seams provide.
 
 package fleet
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -82,19 +84,12 @@ func TestCreateAbortsWhenRowPersistFailsAfterClaim(t *testing.T) {
 	}
 }
 
-// TestUnboundCreateKeepsLogAndContinue is the behaviour-preservation guard for
-// every deployment that has no external IPAM at all.
-//
-// With no claim in play there is nothing a stranded row can leak, so the
-// pre-existing handling stands unchanged: the persistence error is LOGGED and
-// the running domain is left alone. The RPC still fails — it ends with a
-// read-back of the row that was never written — but that is today's behaviour
-// and it is emphatically not the abort: nothing is torn down.
-//
-// Asserting on the surviving domain rather than on the error is what makes this
-// non-vacuous. Both the old path and a wrongly-broadened abort return an error
-// here; only one of them leaves the VM running.
-func TestUnboundCreateKeepsLogAndContinue(t *testing.T) {
+// TestUnboundCreateAbortsWhenRowPersistFails: with no claim in play the
+// create is undone all the same. A running domain with no VM row is a copy of
+// the VM that litevirt neither lists, stops nor deletes (lab 2, F-A), so the domain is
+// torn down and the client gets the persistence error, not a read-back
+// NotFound.
+func TestUnboundCreateAbortsWhenRowPersistFails(t *testing.T) {
 	c := New(t, Options{Nodes: 1})
 	n := c.Nodes[0]
 	// CreateVM preflights the resolved bridge with `ip link add`, EPERM for an
@@ -106,11 +101,11 @@ func TestUnboundCreateKeepsLogAndContinue(t *testing.T) {
 	n.FailVMRowWrites(t)
 
 	_, err := createVMOnNetwork(c, n, "vm-1", ctNetName)
-	if err != nil && strings.Contains(err.Error(), "persist VM state") {
-		t.Fatalf("an unbound create must not take the claim-abort path, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "persist VM state") {
+		t.Fatalf("an unbound create whose row cannot be written must fail with the persistence error, got %v", err)
 	}
-	if !n.Virt.DomainExists("vm-1") {
-		t.Fatal("an unbound create must keep today's log-and-continue behaviour: the domain stays running")
+	if n.Virt.DomainExists("vm-1") {
+		t.Fatal("the domain must be torn down, not left running without a row")
 	}
 }
 
@@ -152,10 +147,9 @@ func TestNetBoxDeleteSkippedWhenTombstoneFails(t *testing.T) {
 // in NetBox forever — invisible locally, because the VM row is gone, and
 // unreclaimable by the sweeper, because the identity still resolves.
 //
-// Two networks rather than two NICs on one: vm_interfaces is keyed
-// (vm_name, network_name), so a VM with two NICs on ONE network cannot persist
-// at all today (see TestTwoNICsOnOneNetworkAbortsAndReleasesBoth, which pins
-// what happens instead). The per-NIC detach variant belongs with NIC hotplug.
+// Two networks rather than two NICs on one: a VM is created with at most one
+// NIC per network (see TestTwoNICsOnOneNetworkRefusedBeforeAnyClaim). The
+// per-NIC detach variant belongs with NIC hotplug.
 func TestEveryNICLeaseIsReleasedOnDelete(t *testing.T) {
 	nb := NewNetBoxFake()
 	t.Cleanup(nb.Close)
@@ -191,17 +185,13 @@ func TestEveryNICLeaseIsReleasedOnDelete(t *testing.T) {
 	}
 }
 
-// TestTwoNICsOnOneNetworkAbortsAndReleasesBoth is the same window as
-// TestCreateAbortsWhenRowPersistFailsAfterClaim reached with NO test seam at
-// all, which is what makes it worth keeping separately: vm_interfaces is keyed
-// (vm_name, network_name), so the second NIC's row collides and the whole
-// persistence batch fails — after both addresses have been claimed and the
-// domain is running.
-//
-// Before this change that create returned an error while leaving a running,
-// row-less VM holding two NetBox addresses: the precise state the sweeper would
-// later reclaim out from under a live guest.
-func TestTwoNICsOnOneNetworkAbortsAndReleasesBoth(t *testing.T) {
+// TestTwoNICsOnOneNetworkRefusedBeforeAnyClaim: a create with two NICs on one
+// bound network is refused as invalid before anything is claimed or created.
+// vm_interfaces is keyed (vm_name, network_name), so the second NIC's row
+// would collide with the first's after both addresses were claimed and the
+// domain was running. The release of claims a failed create took is
+// TestCreateAbortsWhenRowPersistFailsAfterClaim's.
+func TestTwoNICsOnOneNetworkRefusedBeforeAnyClaim(t *testing.T) {
 	nb := NewNetBoxFake()
 	t.Cleanup(nb.Close)
 	nb.AddPrefix(7, "10.0.5.0/24", 3, true)
@@ -213,17 +203,54 @@ func TestTwoNICsOnOneNetworkAbortsAndReleasesBoth(t *testing.T) {
 	n := c.Nodes[0]
 	mustCreateBoundNetwork(t, c, n, "bound", "10.0.5.0/24", 7)
 
-	if _, err := createVMWithNICs(c, n, "vm-1", "bound", "bound"); err == nil {
-		t.Fatal("two NICs on one network cannot persist — the create must fail")
+	if _, err := createVMWithNICs(c, n, "vm-1", "bound", "bound"); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("two NICs on one network: got %v, want InvalidArgument", err)
 	}
 	if n.Virt.DomainExists("vm-1") {
-		t.Fatal("the domain must be torn down, not left running without a row")
+		t.Fatal("a domain was defined for the refused create")
 	}
 	if ids := nb.Identities(); len(ids) != 0 {
-		t.Fatalf("both claims must be released, still held: %v", ids)
+		t.Fatalf("the refused create claimed addresses: %v", ids)
 	}
 	if got := leaseCount(t, n, "bound"); got != 0 {
-		t.Fatalf("both local leases must be tombstoned, %d still live", got)
+		t.Fatalf("the refused create took %d lease(s)", got)
+	}
+}
+
+// TestCreateThatCannotStopItsDomainKeepsClaimsAndDisks (review M5): a failed
+// create whose domain cannot be stopped leaves the guest's address claimed
+// and its disks in place — the guest still runs on them.
+func TestCreateThatCannotStopItsDomainKeepsClaimsAndDisks(t *testing.T) {
+	nb := NewNetBoxFake()
+	t.Cleanup(nb.Close)
+	nb.AddPrefix(7, "10.0.5.0/24", 3, true)
+
+	c := NewClusterWithNetBox(t, 1, nb)
+	gates := gateAll(t, c)
+	latchNetBoxIPAM(t, c, gates)
+
+	n := c.Nodes[0]
+	mustCreateBoundNetwork(t, c, n, "bound", "10.0.5.0/24", 7)
+	n.FailVMRowWrites(t)
+	n.Virt.FailDestroyDomain = func(string) error { return errors.New("induced destroy failure") }
+
+	_, err := c.SelfClient(n).CreateVM(context.Background(), &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "vm-1", Cpu: 1, MemoryMib: 512,
+		Placement: &pb.PlacementSpec{Host: n.Name},
+		Disks:     []*pb.DiskSpec{{Name: "data", Size: "64M"}},
+		Network:   []*pb.NetworkAttachment{{Name: "bound"}},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "could not be stopped") {
+		t.Fatalf("got %v, want the domain left running named", err)
+	}
+	if !n.Virt.DomainExists("vm-1") {
+		t.Fatal("the running domain was undefined")
+	}
+	if files := diskFilesOf(t, n, "vm-1"); len(files) == 0 {
+		t.Error("the disks of the still-running guest were removed")
+	}
+	if ids := nb.Identities(); len(ids) != 1 {
+		t.Errorf("the still-running guest's address claim: %v, want it kept", ids)
 	}
 }
 
@@ -299,5 +326,53 @@ func TestDeleteVMTombstonesLeaseWhenBindingSuspended(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("the deferred NetBox object must be queued as an orphan check for %q, queue = %+v", ids[0], items)
+	}
+}
+
+// TestCreateAbortedAfterTheClientGaveUpReleasesItsClaim (re-review N2): a
+// create the client stopped waiting for, which then fails after its claim,
+// gives the address back all the same — the release does not run on the
+// caller's dead context.
+func TestCreateAbortedAfterTheClientGaveUpReleasesItsClaim(t *testing.T) {
+	nb := NewNetBoxFake()
+	t.Cleanup(nb.Close)
+	nb.AddPrefix(7, "10.0.5.0/24", 3, true)
+
+	c := NewClusterWithNetBox(t, 1, nb)
+	gates := gateAll(t, c)
+	latchNetBoxIPAM(t, c, gates)
+
+	n := c.Nodes[0]
+	mustCreateBoundNetwork(t, c, n, "bound", "10.0.5.0/24", 7)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	n.Virt.FailStartDomain = func(string) error {
+		cancel()
+		// Let the cancellation reach the server's handler context.
+		time.Sleep(500 * time.Millisecond)
+		return errors.New("induced start failure")
+	}
+	done := make(chan struct{})
+	n.Server.SetCreateReturnedHook(func(name string, _ error) {
+		if name == "vm-1" {
+			close(done)
+		}
+	})
+	_, _ = c.SelfClient(n).CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "vm-1", Cpu: 1, MemoryMib: 512,
+		Placement: &pb.PlacementSpec{Host: n.Name},
+		Network:   []*pb.NetworkAttachment{{Name: "bound"}},
+	}})
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the create did not return on the server")
+	}
+	if ids := nb.Identities(); len(ids) != 0 {
+		t.Errorf("the failed create's NetBox address is still held: %v", ids)
+	}
+	if got := leaseCount(t, n, "bound"); got != 0 {
+		t.Errorf("the failed create's lease is still live: %d", got)
 	}
 }

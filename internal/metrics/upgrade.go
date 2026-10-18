@@ -28,3 +28,28 @@ func UpgradeWatchdogOutcome(outcome string) {
 	})
 	upgradeWatchdogTotal.WithLabelValues(outcome).Inc()
 }
+
+var (
+	upgradingUnconfirmedOnce  sync.Once
+	upgradingUnconfirmedGauge prometheus.Gauge
+)
+
+// SetUpgradingUnconfirmed sets litevirt_host_upgrading_unconfirmed: 1 while
+// this host is recorded 'upgrading' past its upgrading window although its
+// daemon runs, and the boot's serving check has not recorded it active
+// (hostboot.CondUpgradingUnconfirmed). Registered lazily, as
+// UpgradeWatchdogOutcome.
+func SetUpgradingUnconfirmed(on bool) {
+	upgradingUnconfirmedOnce.Do(func() {
+		upgradingUnconfirmedGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "litevirt_host_upgrading_unconfirmed",
+			Help: "1 while this host is recorded upgrading past its upgrading window although its daemon runs, and has not recorded itself active.",
+		})
+		prometheus.DefaultRegisterer.MustRegister(upgradingUnconfirmedGauge)
+	})
+	v := 0.0
+	if on {
+		v = 1
+	}
+	upgradingUnconfirmedGauge.Set(v)
+}

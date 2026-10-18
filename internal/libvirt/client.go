@@ -2,11 +2,14 @@ package libvirt
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
@@ -69,32 +72,54 @@ type Client struct {
 	vncProbedOnce sync.Once
 
 	// stateReader asks for domain states on connections of its own
-	// (state_reader.go); made on first use.
+	// (state_reader.go); made on first use. secureReader is the same on the
+	// read-write socket, for the reads a read-only connection is refused.
 	stateReaderMu sync.Mutex
 	stateReader   *StateReader
+	secureReader  *StateReader
+	// closed is set by Close (under stateReaderMu): a reader asked for after
+	// it is a closed one, and Closing reports it.
+	closed bool
+
+	// conn is the socket under virt, closed by Close when the connection
+	// does not close in time. connMu guards it (not mu, which a call that
+	// libvirt does not answer can hold).
+	connMu sync.Mutex
+	conn   net.Conn
 }
+
+// clientCloseTimeout bounds how long Close waits for the daemon's connection
+// to close: go-libvirt's Disconnect asks libvirtd first, and a connection
+// libvirtd stopped reading (max_client_requests calls it does not answer)
+// never answers, which would hold the daemon's shutdown short of closing its
+// database. A variable for the tests.
+var clientCloseTimeout = time.Second
 
 // NewClient connects to the local libvirtd daemon.
 func NewClient() (*Client, error) {
-	virt, err := dialLibvirt()
+	return newClientOn(defaultSocket)
+}
+
+func newClientOn(socket string) (*Client, error) {
+	virt, conn, err := dialLibvirt(socket)
 	if err != nil {
 		return nil, err
 	}
-	return &Client{virt: virt, vncProbed: make(chan struct{})}, nil
+	return &Client{virt: virt, conn: conn, vncProbed: make(chan struct{})}, nil
 }
 
-func dialLibvirt() (*golibvirt.Libvirt, error) {
-	conn, err := net.DialTimeout("unix", defaultSocket, 5*time.Second)
+func dialLibvirt(socket string) (*golibvirt.Libvirt, net.Conn, error) {
+	conn, err := net.DialTimeout("unix", socket, 5*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("connect to libvirtd: %w", err)
+		return nil, nil, fmt.Errorf("connect to libvirtd: %w", err)
 	}
 
 	virt := golibvirt.New(conn)
 	if err := virt.Connect(); err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("libvirt handshake: %w", err)
+		return nil, nil, fmt.Errorf("libvirt handshake: %w", err)
 	}
-	return virt, nil
+	return virt, conn, nil
 }
 
 // Reconnect re-establishes the libvirt connection. Used after libvirtd restarts (#42).
@@ -107,11 +132,14 @@ func (c *Client) Reconnect() error {
 		c.virt.Disconnect() //nolint:errcheck
 	}
 
-	virt, err := dialLibvirt()
+	virt, conn, err := dialLibvirt(defaultSocket)
 	if err != nil {
 		return err
 	}
 	c.virt = virt
+	c.connMu.Lock()
+	c.conn = conn
+	c.connMu.Unlock()
 	slog.Info("libvirt: reconnected to libvirtd")
 	return nil
 }
@@ -185,19 +213,71 @@ func (c *Client) RegisterDomainEventCallback(cb DomainEventCallback) {
 	c.mu.Unlock()
 }
 
-// Close disconnects from libvirtd.
+// Close disconnects from libvirtd. It returns within about
+// clientCloseTimeout (and the readers' own bound) whatever libvirt does: a
+// connection that does not close in time has its socket closed under it,
+// which fails every call still waiting on it, and Close reports that.
 func (c *Client) Close() error {
 	c.stateReaderMu.Lock()
-	if c.stateReader != nil {
-		c.stateReader.Close() //nolint:errcheck // best effort; the main connection's answer is the one returned
-	}
+	c.closed = true
+	readers := []*StateReader{c.stateReader, c.secureReader}
 	c.stateReaderMu.Unlock()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.virt == nil {
-		return nil
+	var wg sync.WaitGroup
+	for _, r := range readers {
+		if r == nil {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r.Close() //nolint:errcheck // best effort; the main connection's answer is the one returned
+		}()
 	}
-	return c.virt.Disconnect()
+	wg.Wait()
+	// mu is taken in a goroutine of its own: a call libvirt does not answer
+	// can hold it (the reconnect loop's liveness check holds it for reading).
+	done := make(chan error, 1)
+	go func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.virt == nil {
+			done <- nil
+			return
+		}
+		done <- c.virt.Disconnect()
+	}()
+	timer := time.NewTimer(clientCloseTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+	}
+	c.connMu.Lock()
+	conn := c.conn
+	c.connMu.Unlock()
+	if conn != nil {
+		conn.Close() //nolint:errcheck // what is waiting on it fails; that is the point
+	}
+	return fmt.Errorf("libvirt: the connection to libvirtd did not close within %s; its socket was closed", clientCloseTimeout)
+}
+
+// Closing reports whether Close has been called: a call that fails from now
+// on may have failed because Close closed its connection, which says nothing
+// about what libvirt did with it.
+func (c *Client) Closing() bool {
+	c.stateReaderMu.Lock()
+	defer c.stateReaderMu.Unlock()
+	return c.closed
+}
+
+// IsConnectionLost reports whether err is a call's connection to libvirtd
+// going away under it (closed by Close, or libvirtd gone), rather than an
+// answer of libvirt's: what libvirt did with the call is unknown.
+func IsConnectionLost(err error) bool {
+	return errors.Is(err, golibvirt.ErrInterrupted) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET)
 }
 
 // Libvirt returns the underlying go-libvirt handle for advanced operations.

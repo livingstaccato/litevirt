@@ -134,3 +134,18 @@ func TestPrintVNCInfo_SaysAPasswordIsNeededAndHow(t *testing.T) {
 		t.Errorf("a console with no password prints a password note:\n%s", open.String())
 	}
 }
+
+// A password whose read libvirt did not answer (vnc_unknown) is printed as
+// unknown, never as "no password" by leaving the note out.
+//
+// Mutation "vnc_unknown ignored": no note: red.
+func TestPrintVNCInfo_SaysWhenThePasswordIsUnknown(t *testing.T) {
+	var b strings.Builder
+	printVNCInfo(&b, "web", &pb.VM{VncAddress: "vnc://10.0.0.5:5900",
+		VncUnknown: "whether the VNC console asks for a password is unknown: libvirt on h has not answered for this VM (waited 3s)"})
+	for _, want := range []string{"Password: whether the VNC console asks for a password is unknown", "lv vnc web --listen 127.0.0.1:5900"} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("lv vnc output lacks %q:\n%s", want, b.String())
+		}
+	}
+}

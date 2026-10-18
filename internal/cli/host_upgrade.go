@@ -162,10 +162,11 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 
 	// Confirm unless --yes.
 	if !opts.Yes {
-		fmt.Print("Proceed? [y/N] ")
-		var answer string
-		fmt.Scanln(&answer)
-		if answer != "y" && answer != "Y" {
+		ok, err := Confirm(ctx, os.Stdin, os.Stdout, "Proceed?")
+		if err != nil {
+			return err
+		}
+		if !ok {
 			fmt.Println("Aborted.")
 			return nil
 		}

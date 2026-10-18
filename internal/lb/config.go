@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"text/template"
@@ -29,19 +30,63 @@ type Config struct {
 	Name      string // e.g. "app-server"
 	VIP       string // e.g. "10.0.100.100"
 	VIPPrefix int    // CIDR prefix length
-	Interface string // network interface for VRRP (e.g. "eth0")
+	Interface string // the device the VIP goes on (and, unless VRRPUnicast, VRRP's)
 	VRID      int    // VRRP virtual router ID (1–255, unique per VIP)
 	Priority  int    // 100 = master, 50 = backup
 	Backends  []Backend
 	Ports     []Port
 	Algorithm string        // roundrobin | leastconn | source
 	Health    *HealthConfig // backend health check (nil = default tcp-check)
+	Sticky    bool          // keep a client on one backend by its source address
+
+	// VRRPUnicast sends this LB's VRRP adverts as unicast from UnicastSrc to
+	// UnicastPeers over VRRPInterface, the device holding this host's own
+	// address, and accepts adverts only from those peers. The VIP still goes
+	// on Interface, named on its line, and Interface is tracked, so nothing
+	// VRRP is sent on, or taken from, the segment the VIP's guests are on.
+	// Off: adverts are multicast on Interface with a PASS password, as every
+	// LB was before vrrp_unicast_v1, which guests on that segment can read and
+	// answer.
+	VRRPUnicast   bool
+	VRRPInterface string
+	UnicastSrc    string
+	// UnicastPeers are the other LB hosts' addresses. None: a sole host,
+	// which names itself (see the template).
+	UnicastPeers []string
 
 	// SNAT fields — set when LB provides outbound NAT for host-isolated VMs.
 	SNATEnabled bool   // enable SNAT + conntrackd
 	LocalIP     string // this host's IP for conntrackd sync
 	PeerIP      string // VRRP peer IP for conntrackd sync
 	Subnet      string // VM subnet CIDR for SNAT rule (e.g. "10.100.0.0/24")
+	// SyncInterface is the device holding LocalIP, which conntrackd syncs
+	// over. Empty: Interface.
+	SyncInterface string
+	// KeepSNAT leaves this LB's SNAT side as the last apply that set it left
+	// it: conntrackd and its files untouched, and keepalived's notify hooks
+	// rendered exactly when the notify script is there. For an apply that
+	// does not know the LB's snat (a peer on an earlier build).
+	KeepSNAT bool
+
+	// ConfigDir is the directory the manager writes this LB's files to, which
+	// the rendered configs name (TLS PEMs, the notify script, conntrackd's
+	// config). Empty: DefaultConfigDir.
+	ConfigDir string
+}
+
+// DefaultConfigDir is where the manager writes LB configs in production.
+const DefaultConfigDir = "/etc/litevirt/lb"
+
+// withDefaults returns cfg ready to render, or an error when it may not be
+// rendered at all (checkRender).
+func withDefaults(cfg Config) (Config, error) {
+	if cfg.ConfigDir == "" {
+		cfg.ConfigDir = DefaultConfigDir
+	}
+	if err := checkRender(cfg); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
 }
 
 // HealthConfig configures HAProxy backend health checking.
@@ -64,6 +109,9 @@ type Port struct {
 	Target   int    // backend port
 	Protocol string // tcp | http
 	TLS      *TLSConfig
+	// RedirectHTTPS answers every request on this listener with a redirect
+	// to https. Ignored on a TLS listener.
+	RedirectHTTPS bool
 }
 
 // TLSConfig holds cert/key paths for TLS termination.
@@ -94,14 +142,23 @@ defaults
 {{- range .Ports}}
 frontend {{$.Name}}-{{.Listen}}
     {{- if .TLS}}
-    bind {{$.VIP}}:{{.Listen}} ssl crt /etc/litevirt/lb/{{$.Name}}-{{.Listen}}.pem
+    bind {{$.VIP}}:{{.Listen}} ssl crt {{$.ConfigDir}}/{{$.Name}}-{{.Listen}}.pem
     {{- else}}
     bind {{$.VIP}}:{{.Listen}}
     {{- end}}
+    {{- if and .RedirectHTTPS (not .TLS)}}
+    mode http
+    http-request redirect scheme https code 301
+    {{- else}}
     default_backend {{$.Name}}-{{.Listen}}-be
+    {{- end}}
 
 backend {{$.Name}}-{{.Listen}}-be
     balance {{$.Algorithm}}
+    {{- if $.Sticky}}
+    stick-table type ip size 100k expire 30m
+    stick on src
+    {{- end}}
     {{- if and $.Health (eq $.Health.Type "http")}}
     option httpchk GET {{or $.Health.Path "/"}}
     http-check expect status 200
@@ -114,10 +171,22 @@ backend {{$.Name}}-{{.Listen}}-be
 {{- end}}
 `
 
+// keepalivedTmpl renders one vrrp_instance. With VRRPUnicast, the source check
+// is rendered twice: check_unicast_src in the instance (keepalived 2.1 on) and
+// vrrp_check_unicast_src in global_defs, which 2.0 also honours (it has no
+// instance keyword). With VRRPUnicast and no peers (a
+// sole LB host) it names the host itself as its peer, with a TTL range no
+// packet is in: keepalived cannot run unicast with no peers (it falls back to
+// multicast on the interface), and this way its adverts go only to itself over
+// loopback and are discarded, nothing is accepted from anyone, and it becomes
+// master on its own.
 var keepalivedTmpl = template.Must(template.New("keepalived").Parse(`
 global_defs {
     enable_script_security
     script_user root
+{{- if .VRRPUnicast}}
+    vrrp_check_unicast_src
+{{- end}}
 }
 
 vrrp_script chk_haproxy {
@@ -130,6 +199,32 @@ vrrp_script chk_haproxy {
 
 vrrp_instance {{.Name}} {
     state {{if eq .Priority 100}}MASTER{{else}}BACKUP{{end}}
+{{- if .VRRPUnicast}}
+    interface {{.VRRPInterface}}
+    virtual_router_id {{.VRID}}
+    priority {{.Priority}}
+    advert_int 1
+
+    unicast_src_ip {{.UnicastSrc}}
+    unicast_peer {
+{{- range .UnicastPeers}}
+        {{.}}
+{{- else}}
+        {{.UnicastSrc}} min_ttl 0 max_ttl 0
+{{- end}}
+    }
+    check_unicast_src
+{{- if ne .Interface .VRRPInterface}}
+
+    track_interface {
+        {{.Interface}}
+    }
+{{- end}}
+
+    virtual_ipaddress {
+        {{.VIP}}/{{.VIPPrefix}} dev {{.Interface}}
+    }
+{{- else}}
     interface {{.Interface}}
     virtual_router_id {{.VRID}}
     priority {{.Priority}}
@@ -143,21 +238,26 @@ vrrp_instance {{.Name}} {
     virtual_ipaddress {
         {{.VIP}}/{{.VIPPrefix}}
     }
+{{- end}}
 
     track_script {
         chk_haproxy
     }
 {{- if .SNATEnabled}}
 
-    notify_master "/etc/litevirt/lb/{{.Name}}-notify.sh MASTER"
-    notify_backup "/etc/litevirt/lb/{{.Name}}-notify.sh BACKUP"
-    notify_fault  "/etc/litevirt/lb/{{.Name}}-notify.sh FAULT"
+    notify_master "{{.ConfigDir}}/{{.Name}}-notify.sh MASTER"
+    notify_backup "{{.ConfigDir}}/{{.Name}}-notify.sh BACKUP"
+    notify_fault  "{{.ConfigDir}}/{{.Name}}-notify.sh FAULT"
 {{- end}}
 }
 `))
 
 // RenderHAProxy produces an haproxy.cfg content string.
 func RenderHAProxy(cfg Config) (string, error) {
+	cfg, err := withDefaults(cfg)
+	if err != nil {
+		return "", err
+	}
 	if cfg.Algorithm == "" {
 		cfg.Algorithm = "roundrobin"
 	}
@@ -190,6 +290,14 @@ func RenderHAProxy(cfg Config) (string, error) {
 // multiple VIPs per instance, parseKeepalivedVIP + DemoteAll must be revisited to
 // enumerate all of them (today "one LB ⇒ one VIP" makes single-address parsing exact).
 func RenderKeepalived(cfg Config) (string, error) {
+	cfg, err := withDefaults(cfg)
+	if err != nil {
+		return "", err
+	}
+	// One order whatever order the hosts came in, so the same peers render the
+	// same config (and keepalived is not restarted over a reorder).
+	cfg.UnicastPeers = append([]string(nil), cfg.UnicastPeers...)
+	sort.Strings(cfg.UnicastPeers)
 	var buf bytes.Buffer
 	// Augment cfg with a derived, per-LB VRRP auth password (F6).
 	data := struct {
@@ -204,6 +312,10 @@ func RenderKeepalived(cfg Config) (string, error) {
 
 // RenderConntrackd produces a conntrackd.conf for SNAT conntrack sync between VRRP peers.
 func RenderConntrackd(cfg Config) (string, error) {
+	cfg, err := withDefaults(cfg)
+	if err != nil {
+		return "", err
+	}
 	if cfg.LocalIP == "" || cfg.PeerIP == "" {
 		return "", fmt.Errorf("conntrackd requires LocalIP and PeerIP")
 	}
@@ -216,6 +328,10 @@ func RenderConntrackd(cfg Config) (string, error) {
 
 // RenderNotifyScript produces the keepalived notify script for conntrackd state transitions.
 func RenderNotifyScript(cfg Config) (string, error) {
+	cfg, err := withDefaults(cfg)
+	if err != nil {
+		return "", err
+	}
 	var buf bytes.Buffer
 	if err := notifyTmpl.Execute(&buf, cfg); err != nil {
 		return "", fmt.Errorf("render notify script: %w", err)
@@ -229,7 +345,7 @@ var conntrackdTmpl = template.Must(template.New("conntrackd").Parse(`Sync {
         IPv4_address {{.LocalIP}}
         IPv4_Destination_Address {{.PeerIP}}
         Port 3780
-        Interface {{.Interface}}
+        Interface {{or .SyncInterface .Interface}}
     }
 }
 
@@ -249,15 +365,23 @@ General {
 }
 `))
 
+// notifyTmpl drives this LB's conntrackd on a VRRP transition. conntrackd's
+// -C names its CONFIG file, which says where its control socket is.
 var notifyTmpl = template.Must(template.New("notify").Parse(`#!/bin/bash
-CTL="/var/run/conntrackd-{{.Name}}.ctl"
+CONF="{{.ConfigDir}}/{{.Name}}-conntrackd.conf"
 case "$1" in
     MASTER)
-        conntrackd -C "$CTL" -c -C commit
-        conntrackd -C "$CTL" -c -f internal
+        conntrackd -C "$CONF" -c
+        conntrackd -C "$CONF" -f
+        conntrackd -C "$CONF" -R
+        conntrackd -C "$CONF" -B
         ;;
-    BACKUP|FAULT)
-        conntrackd -C "$CTL" -c -f external
+    BACKUP)
+        conntrackd -C "$CONF" -t
+        conntrackd -C "$CONF" -n
+        ;;
+    FAULT)
+        conntrackd -C "$CONF" -t
         ;;
 esac
 `))

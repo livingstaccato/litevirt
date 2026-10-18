@@ -7,9 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -23,6 +26,8 @@ import (
 	"github.com/litevirt/litevirt/internal/compose/planner"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
+	"github.com/litevirt/litevirt/internal/events"
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/network"
@@ -50,6 +55,14 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "parse compose: %v", err)
 	}
+	// A stack being torn down is not deployed over: the teardown would take
+	// down the networks under what this deploy creates (review m2).
+	if st, gErr := corrosion.GetStack(ctx, s.db, f.Name); !req.DryRun && gErr == nil && st != nil && st.State == stackStateDeleting {
+		return status.Errorf(codes.FailedPrecondition,
+			"stack %q is being torn down (state %q): wait until `lv compose ls` no longer lists it, then run `lv compose up` again; "+
+				"if the teardown does not finish, `lv compose down --name %s` retries it, and `lv rm <vm> --force` clears a member that is stuck",
+			f.Name, stackStateDeleting, f.Name)
+	}
 
 	// Disk/NIC tuning in the file is refused before anything is deployed, rather
 	// than by the Nth VM's create after the first N-1 are up (the disk/NIC feature gate).
@@ -70,6 +83,13 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// is pulled, provisioned or registered.
 	if err := s.authorizeComposeHostPaths(ctx, f); err != nil {
 		return err
+	}
+	// An LB's TLS files are read as root on every LB host: outside
+	// lb.CertDir, naming one needs the admin role (requireAdminForLBTLS).
+	for _, name := range slices.Sorted(maps.Keys(f.VMs)) {
+		if err := requireAdminForLBTLS(ctx, compose.BuildLBSpec(f.VMs[name].LoadBalancer)); err != nil {
+			return err
+		}
 	}
 
 	// Auto-pull images defined in the compose images: section that are missing locally.
@@ -232,6 +252,17 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// From here on the deploy issues workload actions, on this host and on
 	// peers, and its firewall rows stay whatever happens (see above).
 	workloadPhase = true
+	// A deploy whose client went away after it tore a VM down to re-create
+	// it has replaced that VM with the new file's, whatever becomes of the
+	// client: the file is recorded, degraded, since the rest of the plan did
+	// not run. A deploy that tore nothing down, or that stopped for another
+	// reason (a rolling update's fail-fast), leaves the record as it was.
+	ctx, replaced := withReplaceMark(ctx)
+	defer func() {
+		if err != nil && replaced.Load() && ctx.Err() != nil {
+			s.recordStackDeploy(ctx, f, req.ComposeYaml, stackStateDegraded)
+		}
+	}()
 	if err := s.applyNICRetargets(ctx, resolved, stream, failures); err != nil {
 		return err
 	}
@@ -277,25 +308,7 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	if len(failures.names) > 0 {
 		stackState = stackStateDegraded
 	}
-	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(req.ComposeYaml)))
-	if dbErr := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{
-		Name:        f.Name,
-		ComposeHash: hash,
-		ComposeYAML: req.ComposeYaml,
-		State:       stackState,
-	}); dbErr != nil {
-		slog.Warn("upsert stack record failed", "stack", f.Name, "error", dbErr)
-	}
-	// The deny this file asks for is re-asserted now that its record is
-	// written: the persist above left a deny another stack owned as it was,
-	// and that owner may have gone down (or dropped it) since, seeing no
-	// record of this stack asking for it. The cluster must not end this
-	// deploy default-allow. A deny in force stays with its owner.
-	if fd := f.FirewallDefaults; fd != nil && fd.DefaultDeny {
-		if dbErr := corrosion.EnsureClusterDefaultDeny(ctx, s.db, f.Name); dbErr != nil {
-			slog.Warn("re-assert the stack's cluster default-deny failed; the stack reconciler retries", "stack", f.Name, "error", dbErr)
-		}
-	}
+	s.recordStackDeploy(ctx, f, req.ComposeYaml, stackState)
 
 	if len(failures.names) > 0 {
 		detail := fmt.Sprintf("%d of %d VM ops failed (%s)",
@@ -308,6 +321,52 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 		vmOps, len(resolved.Networks), len(resolved.LBs)))
 	s.audit(ctx, "stack.deploy", f.Name, fmt.Sprintf("%d VM ops", vmOps), "ok")
 	return nil
+}
+
+// replaceMarkKey carries a deploy's record that one of its re-creates tore
+// a VM down.
+type replaceMarkKey struct{}
+
+func withReplaceMark(ctx context.Context) (context.Context, *atomic.Bool) {
+	b := &atomic.Bool{}
+	return context.WithValue(ctx, replaceMarkKey{}, b), b
+}
+
+// markReplaced records in the deploy carrying ctx, if any, that a re-create
+// tore its VM down.
+func markReplaced(ctx context.Context) {
+	if b, ok := ctx.Value(replaceMarkKey{}).(*atomic.Bool); ok {
+		b.Store(true)
+	}
+}
+
+// stackRecordTimeout bounds recordStackDeploy.
+const stackRecordTimeout = 30 * time.Second
+
+// recordStackDeploy writes the stack record of a deploy that has acted, and
+// re-asserts the default-deny its file asks for: the persist left a deny
+// another stack owned as it was, and that owner may have gone down (or
+// dropped it) since, seeing no record of this stack asking for it. The
+// cluster must not end this deploy default-allow. A deny in force stays with
+// its owner. It runs whatever becomes of the deploy's client, on its own
+// bounded context.
+func (s *Server) recordStackDeploy(ctx context.Context, f *compose.File, composeYAML, state string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stackRecordTimeout)
+	defer cancel()
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(composeYAML)))
+	if dbErr := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{
+		Name:        f.Name,
+		ComposeHash: hash,
+		ComposeYAML: composeYAML,
+		State:       state,
+	}); dbErr != nil {
+		slog.Warn("upsert stack record failed", "stack", f.Name, "error", dbErr)
+	}
+	if fd := f.FirewallDefaults; fd != nil && fd.DefaultDeny {
+		if dbErr := corrosion.EnsureClusterDefaultDeny(ctx, s.db, f.Name); dbErr != nil {
+			slog.Warn("re-assert the stack's cluster default-deny failed; the stack reconciler retries", "stack", f.Name, "error", dbErr)
+		}
+	}
 }
 
 // stackFirewallWrites records the firewall rows one persistStackFirewall
@@ -373,17 +432,23 @@ func (s *Server) withStackDefaultDenyNote(ctx context.Context, stack string, err
 const (
 	stackStateActive   = "active"
 	stackStateDegraded = "degraded"
+	stackStateDeleting = "deleting"
 )
 
 // stackFirewallErr is a stack's firewall failure as its deploy returns it: a
-// status error — the release gate's refusal — keeps its code and message
-// under "firewall config:", with no rpc error nested in it (switch review
-// m5); anything else is FailedPrecondition, as before.
+// status error — the release gate's refusal, an unknown tag group — keeps its
+// code, and its message under "firewall config:" with whatever the deploy
+// wrapped around it (which security group or rule), with no rpc error nested
+// in it (switch review m5); anything else is FailedPrecondition, as before.
 func stackFirewallErr(err error) error {
-	var se interface{ GRPCStatus() *status.Status }
+	var se interface {
+		GRPCStatus() *status.Status
+		Error() string
+	}
 	if errors.As(err, &se) {
 		st := se.GRPCStatus()
-		return status.Errorf(st.Code(), "firewall config: %s", st.Message())
+		msg := strings.Replace(err.Error(), se.Error(), st.Message(), 1)
+		return status.Errorf(st.Code(), "firewall config: %s", msg)
 	}
 	return status.Errorf(codes.FailedPrecondition, "firewall config: %v", err)
 }
@@ -402,6 +467,13 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.File, w *stackFirewallWrites) error {
 	if w == nil {
 		w = &stackFirewallWrites{}
+	}
+	// A rule that still names a macro (the parser expands them; a File built
+	// another way may not) is expanded first: refuse-form, then the write
+	// grammar, then the release features below, all before any gate is asked
+	// or anything is torn down. A macro that does not expand writes no row.
+	if err := compose.ExpandMacros(f); err != nil {
+		return err
 	}
 	hasFirewall := len(f.SecurityGroups) > 0 || len(f.IPSets) > 0 || f.FirewallDefaults != nil
 	if !hasFirewall {
@@ -433,7 +505,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 	needed := map[capabilities.Feature]bool{}
 	for name, sg := range f.SecurityGroups {
 		for _, r := range sg.Rules {
-			need, err := corrosion.FirewallRowFeatures(r.CIDR, r.Proto, r.Action)
+			need, err := ruleRowFeatures(r.Direction, r.Proto, r.Port, r.CIDR, r.Action, "")
 			if err != nil {
 				return fmt.Errorf("security-group %q rule: %w", name, err)
 			}
@@ -442,18 +514,24 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 			}
 		}
 	}
+	var stackSets []corrosion.IPSet
 	for name, set := range f.IPSets {
-		need, err := ipSetFeatures(set.CIDRs)
+		need, err := ipSetRowFeatures(name, rulefield.NormaliseSetElements(set.CIDRs))
 		if err != nil {
 			return fmt.Errorf("ipset %q: %w", name, err)
 		}
 		for _, nf := range need {
 			needed[nf] = true
 		}
+		stackSets = append(stackSets, corrosion.IPSet{Name: name, CIDRs: rulefield.NormaliseSetElements(set.CIDRs)})
+	}
+	// Against every live set but this stack's own, which the deploy replaces.
+	if err := corrosion.IPSetCompanionClash(ctx, s.db, f.Name, stackSets); err != nil {
+		return fmt.Errorf("ipset: %w", err)
 	}
 	if fd := f.FirewallDefaults; fd != nil {
 		for _, r := range fd.ClusterRules {
-			need, err := corrosion.FirewallRowFeatures(r.CIDR, r.Proto, r.Action)
+			need, err := ruleRowFeatures(r.Direction, r.Proto, r.Port, r.CIDR, r.Action, r.Comment)
 			if err != nil {
 				return fmt.Errorf("cluster rule: %w", err)
 			}
@@ -475,6 +553,25 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 			return nil
 		}); err != nil {
 			return err
+		}
+	}
+	// A rule naming a tag group that does not exist is refused before
+	// anything is torn down, once the gate has granted (so before the latch
+	// the refusal is the release text). Compose cannot declare a group (T-4).
+	if needed[capabilities.FeatureFirewallTagGroups] {
+		for name, sg := range f.SecurityGroups {
+			for _, r := range sg.Rules {
+				if err := s.refuseUnknownTagGroup(ctx, r.CIDR); err != nil {
+					return fmt.Errorf("security-group %q rule: %w", name, err)
+				}
+			}
+		}
+		if fd := f.FirewallDefaults; fd != nil {
+			for _, r := range fd.ClusterRules {
+				if err := s.refuseUnknownTagGroup(ctx, r.CIDR); err != nil {
+					return fmt.Errorf("cluster rule: %w", err)
+				}
+			}
 		}
 	}
 	// The stack's default never fails open (switch re-review 2, R1): a
@@ -520,9 +617,10 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 			// arbitrarily and could drop traffic an earlier rule meant to allow.
 			row := corrosion.SGRule{
 				ID: randid.New(), SGID: sgID, Direction: r.Direction, Proto: r.Proto,
-				PortRange: r.Port, CIDR: r.CIDR, Action: r.Action, Priority: (i + 1) * 10,
+				PortRange: r.Port, CIDR: r.CIDR, Action: r.Action, Priority: rulePriority(r, i),
 			}
-			need, invalid := corrosion.FirewallRowFeatures(row.CIDR, row.Proto, row.Action)
+			row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
+			need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, "")
 			if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
 				return corrosion.InsertSGRuleWithGrant(ctx, s.db, g.IPv6, g.Log, g.Tag, row)
 			}); err != nil {
@@ -533,8 +631,8 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 
 	// IP sets.
 	for name, set := range f.IPSets {
-		row := corrosion.IPSet{ID: randid.New(), Name: name, CIDRs: set.CIDRs, StackName: f.Name}
-		need, invalid := ipSetFeatures(row.CIDRs)
+		row := corrosion.IPSet{ID: randid.New(), Name: name, CIDRs: rulefield.NormaliseSetElements(set.CIDRs), StackName: f.Name}
+		need, invalid := ipSetRowFeatures(row.Name, row.CIDRs)
 		if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
 			return corrosion.InsertIPSetWithGrant(ctx, s.db, g.IPv6, row)
 		}); err != nil {
@@ -548,9 +646,10 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 		for i, r := range fd.ClusterRules {
 			row := corrosion.FirewallRule{
 				ID: randid.New(), Direction: r.Direction, Proto: r.Proto, PortRange: r.Port,
-				CIDR: r.CIDR, Action: r.Action, Comment: r.Comment, StackName: f.Name, Priority: (i + 1) * 10,
+				CIDR: r.CIDR, Action: r.Action, Comment: r.Comment, StackName: f.Name, Priority: rulePriority(r, i),
 			}
-			need, invalid := corrosion.FirewallRowFeatures(row.CIDR, row.Proto, row.Action)
+			row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
+			need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, row.Comment)
 			if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
 				return corrosion.InsertClusterFirewallRuleWithGrant(ctx, s.db, g.IPv6, g.Log, g.Tag, row)
 			}); err != nil {
@@ -565,6 +664,15 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 		}
 	}
 	return nil
+}
+
+// rulePriority is the priority of the rule at position i: the one macro
+// expansion set (every row of a macro shares it), else (i+1)*10.
+func rulePriority(r compose.FirewallRuleDef, i int) int {
+	if r.Priority != 0 {
+		return r.Priority
+	}
+	return (i + 1) * 10
 }
 
 // streamResolvedPlan sends the full resolved plan over the deploy progress stream.
@@ -741,6 +849,21 @@ func (s *Server) deployCreatePlanned(ctx context.Context, action planner.VMActio
 // provisionPlannedNetworks provisions networks only on hosts where VMs are placed,
 // instead of broadcasting to all cluster hosts.
 func (s *Server) provisionPlannedNetworks(ctx context.Context, f *compose.File, plan *planner.ResolvedPlan, stream grpc.ServerStreamingServer[pb.DeployProgress]) error {
+	shared, err := s.defaultStackNetworkDevices(ctx, f)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "network provisioning: %v", err)
+	}
+	for _, w := range shared {
+		slog.Warn("deploy: stack network device", "stack", f.Name, "event", w.Event, "detail", w.Detail)
+		if s.events != nil {
+			s.events.Publish(events.Event{Action: w.Event, Target: f.Name, Detail: w.Detail})
+		}
+		if stream != nil {
+			if err := stream.Send(&pb.DeployProgress{Phase: "warning", Detail: w.Detail}); err != nil {
+				return err
+			}
+		}
+	}
 	// Build the set of hosts that actually need network provisioning.
 	targetHosts := map[string]bool{}
 	for _, na := range plan.Networks {
@@ -949,33 +1072,21 @@ func (s *Server) applyLBActions(ctx context.Context, f *compose.File, plan *plan
 			Detail: fmt.Sprintf("applying %s", la.Detail),
 		})
 
-		// Build a stub VMSpec with LB config for the existing apply logic.
+		// The LB's spec comes from its compose definition through the same
+		// conversion a VM's spec uses, so the apply carries everything the
+		// file asked for (sticky sessions, health, TLS, redirects, snat), not
+		// a subset that each deploy would re-apply over the LB.
 		// applyLBFromSpecWithRetry reads spec.Loadbalancer and spec.StackName.
-		for _, vmDef := range f.VMs {
-			if vmDef.LoadBalancer == nil || !vmDef.LoadBalancer.Enabled {
-				continue
-			}
-			var ports []*pb.LBPort
-			for _, p := range la.Ports {
-				ports = append(ports, &pb.LBPort{
-					Listen:   int32(p.Listen),
-					Target:   int32(p.Target),
-					Protocol: p.Protocol,
-				})
-			}
-			stubSpec := &pb.VMSpec{
-				StackName: f.Name,
-				Loadbalancer: &pb.LBSpec{
-					Enabled:   true,
-					Vip:       la.VIP,
-					Algorithm: la.Algorithm,
-					Ports:     ports,
-					Hosts:     la.TargetHosts,
-				},
-			}
-			s.applyLBFromSpecWithRetry(ctx, stubSpec)
-			break
+		vmDef, ok := f.VMs[la.VMName]
+		if !ok {
+			continue
 		}
+		lbSpec := compose.BuildLBSpec(vmDef.LoadBalancer)
+		if lbSpec == nil {
+			continue
+		}
+		lbSpec.Hosts = la.TargetHosts
+		s.applyLBFromSpecWithRetry(ctx, &pb.VMSpec{StackName: f.Name, Loadbalancer: lbSpec})
 	}
 }
 
@@ -1099,6 +1210,15 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	// it deletes (fanoutDeleteVM).
 	var notMembers []corrosion.VMRecord
 	var unknown []string
+	// A stack recorded "degraded" finished its last deploy with failed
+	// actions: a name its file lists that no host has may be a member whose
+	// create failed (vmNeverCreated). Read before the state becomes
+	// "deleting" below.
+	degraded := false
+	if st, gErr := corrosion.GetStack(ctx, s.db, req.Name); gErr == nil && st != nil {
+		degraded = st.State == stackStateDegraded
+	}
+	fileOnly := map[string]bool{}
 	stored, storedErr := s.storedStackFile(ctx, req.Name)
 	if stored != nil {
 		for baseName, vmDef := range stored.VMs {
@@ -1122,6 +1242,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 					// Listed above when it named this stack; so not.
 					notMembers = append(notMembers, *row)
 				default:
+					fileOnly[instName] = true
 					vms = append(vms, corrosion.VMRecord{
 						Name:      instName,
 						StackName: req.Name,
@@ -1132,8 +1253,10 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	}
 
 	// Mark stack as "deleting" first — this is durable and survives crashes.
-	// The background StackReconciler will pick up stacks stuck in this state.
-	if err := corrosion.SetStackState(ctx, s.db, req.Name, "deleting"); err != nil {
+	// The background StackReconciler will pick up stacks stuck in this state,
+	// and keeps the disks when this teardown does (keep_disks): the choice
+	// is recorded with the state, in the same write.
+	if err := corrosion.MarkStackDeleting(ctx, s.db, req.Name, req.KeepDisks, s.hostName); err != nil {
 		return status.Errorf(codes.Internal, "set stack state: %v", err)
 	}
 
@@ -1191,7 +1314,14 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 		if h := s.stackMemberDeleteHook; h != nil {
 			h(vm.Name)
 		}
-		delErr := s.deleteVMWithFanout(ctx, stackMember{Name: vm.Name, Stack: req.Name, CreatedAt: vm.CreatedAt}, req.KeepDisks)
+		delErr := s.deleteVMWithFanout(ctx, stackMember{Name: vm.Name, Stack: req.Name, CreatedAt: vm.CreatedAt,
+			MayHaveFailedCreate: degraded && fileOnly[vm.Name]}, req.KeepDisks)
+		if errors.Is(delErr, errMemberNeverCreated) {
+			if err := stream.Send(&pb.DeleteProgress{VmName: vm.Name, Status: "absent", Error: delErr.Error()}); err != nil {
+				return err
+			}
+			continue
+		}
 		if errors.Is(delErr, errNotStackMember) {
 			keptAtDelete = append(keptAtDelete, vm.Name)
 			if err := stream.Send(&pb.DeleteProgress{VmName: vm.Name, Status: "kept", Error: delErr.Error()}); err != nil {
@@ -1475,6 +1605,9 @@ func (s *Server) deleteVMWithFanout(ctx context.Context, m stackMember, keepDisk
 			peerErr := s.fanoutDeleteVM(ctx, vmName, stackName, keepDisks)
 			switch {
 			case peerErr == nil:
+				// The peer that deleted the member was called by a peer, so
+				// it left the member's schedules; this teardown is their entry.
+				s.deleteVMSchedules(context.WithoutCancel(ctx), vmName)
 				return nil
 			case errors.Is(peerErr, errNotStackMember):
 				return peerErr
@@ -1483,6 +1616,11 @@ func (s *Server) deleteVMWithFanout(ctx context.Context, m stackMember, keepDisk
 				// is removed, and the stack's teardown goes on.
 				slog.Info("stack delete: member was already deleted", "stack", stackName, "vm", vmName)
 				return nil
+			case errors.Is(peerErr, errNoPeerHasVM) && s.vmNeverCreated(ctx, m):
+				// A member the stored file names whose create failed (lab 2,
+				// O4): no host has it, so there is nothing to delete.
+				slog.Info("stack delete: member was never created; nothing to delete", "stack", stackName, "vm", vmName)
+				return errMemberNeverCreated
 			}
 			return err
 		}
@@ -1491,6 +1629,7 @@ func (s *Server) deleteVMWithFanout(ctx context.Context, m stackMember, keepDisk
 		// locally won't fix that. Try fanout to other peers instead.
 		if code == codes.Unavailable {
 			if peerErr := s.fanoutDeleteVM(ctx, vmName, stackName, keepDisks); peerErr == nil {
+				s.deleteVMSchedules(context.WithoutCancel(ctx), vmName)
 				return nil
 			} else if errors.Is(peerErr, errNotStackMember) {
 				return peerErr
@@ -1535,11 +1674,34 @@ func (s *Server) vmAlreadyDeleted(ctx context.Context, m stackMember) bool {
 	return m.CreatedAt == "" || rows[0].String("created_at") == m.CreatedAt
 }
 
+// vmNeverCreated reports a member whose create failed: the stack's last
+// deploy finished with failed actions ("degraded") and the teardown listed
+// the member from the stored file alone (MayHaveFailedCreate: no row here,
+// so no incarnation), this host still has no live row of the name, and every
+// peer that may hold the VM answered that it has none (errNoPeerHasVM, the
+// caller's). The StackReconciler, acting on rows only, already treats such a
+// name as nothing to delete. A name with no row in a stack recorded "active"
+// is not taken as gone: nothing says its create ran and failed.
+func (s *Server) vmNeverCreated(ctx context.Context, m stackMember) bool {
+	if !m.MayHaveFailedCreate || m.CreatedAt != "" {
+		return false
+	}
+	live, err := corrosion.GetVM(ctx, s.db, m.Name)
+	return err == nil && live == nil
+}
+
+// errMemberNeverCreated: a stack member the stored file names that no host
+// has (vmNeverCreated). The teardown reports it and goes on.
+var errMemberNeverCreated = errors.New("never created; nothing to delete")
+
 // stackMember is a stack's VM as the teardown saw it: its name, the stack
 // its row records, and its incarnation (the row's created_at; "" for a name
 // the stored file lists that has no row here yet).
 type stackMember struct {
 	Name, Stack, CreatedAt string
+	// MayHaveFailedCreate: listed from the stored file of a stack whose
+	// last deploy failed some action (vmNeverCreated).
+	MayHaveFailedCreate bool
 }
 
 // isDeleteBindingMismatch reports a DeleteVM refused because the VM is not
@@ -1713,6 +1875,35 @@ func (s *Server) DeleteVMForStackCleanup(ctx context.Context, req *pb.DeleteVMRe
 	authCtx := context.WithValue(ctx, ctxKeyRole, "admin")
 	authCtx = context.WithValue(authCtx, ctxKeyUsername, "system:stack-reconciler")
 	return s.DeleteVM(authCtx, req)
+}
+
+// NameStackTeardownKeptDisks names, by disk_leftover on this host, the disks
+// of vm, a stack member the stack reconciler deleted keeping its disks because
+// it could not prove the teardown let them go (why): no disk choice recorded,
+// another teardown's, or one it cannot read. Disks a delete keeps by their
+// own record (delete_with_vm=false) are not named here.
+func (s *Server) NameStackTeardownKeptDisks(ctx context.Context, stack string, vm corrosion.VMRecord, why string) {
+	disks, err := corrosion.VMIncarnationDisks(ctx, s.db, vm.Name, vm.CreatedAt)
+	if err != nil {
+		slog.Warn("stack-reconciler: the disks it kept could not be read, so they are not named",
+			"stack", stack, "vm", vm.Name, "reason", why, "error", err)
+		return
+	}
+	var kept []KeptDisk
+	for _, d := range disks {
+		if !d.DeleteWithVM || d.Path == "" {
+			continue
+		}
+		kept = append(kept, KeptDisk{Path: d.Path, Disk: d.DiskName, Host: d.HostName,
+			Reason: fmt.Sprintf("the stack reconciler finished stack %q's teardown and kept this disk, as it could not prove "+
+				"the teardown let it go: %s. Remove it by hand unless the stack delete asked to keep disks", stack, why)})
+	}
+	// As at every other record site: a disk on this host that is positively
+	// gone (the other deleter removed it) has nothing left to name.
+	kept = s.keptThere(kept)
+	authCtx := context.WithValue(ctx, ctxKeyRole, "admin")
+	authCtx = context.WithValue(authCtx, ctxKeyUsername, "system:stack-reconciler")
+	s.recordKeptDisks(authCtx, vm.Name, kept)
 }
 
 // DeleteContainerForStackCleanup is DeleteVMForStackCleanup for a stack's
@@ -2586,9 +2777,6 @@ func (s *Server) provisionComposeNetworks(ctx context.Context, f *compose.File) 
 			errs = append(errs, msg)
 			continue
 		}
-		if netDef.Interface == "" {
-			netDef.Interface = name
-		}
 		scopedName := compose.ScopedNetworkName(f.Name, name)
 		// Stack networks remain GLOBAL/shared ("") — preserving pre-v37 behavior;
 		// project-scoping stack-defined networks is a separate follow-up.
@@ -2599,42 +2787,4 @@ func (s *Server) provisionComposeNetworks(ctx context.Context, f *compose.File) 
 		}
 	}
 	return errs
-}
-
-// forwardProvisionNetworks sends ProvisionNetwork RPCs to all remote hosts
-// so that networks are ready before VMs are placed there.
-func (s *Server) forwardProvisionNetworks(ctx context.Context, f *compose.File) {
-	hosts, err := corrosion.ListHosts(ctx, s.db)
-	if err != nil {
-		return
-	}
-
-	for _, h := range hosts {
-		if h.Name == s.hostName {
-			continue
-		}
-		for name, netDef := range f.Networks {
-			if netDef.External {
-				continue
-			}
-			if netDef.Interface == "" {
-				netDef.Interface = name
-			}
-			cfgJSON, _ := json.Marshal(netDef)
-			client, conn, err := s.peerClient(ctx, h.Name)
-			if err != nil {
-				slog.Warn("forwardProvisionNetworks: cannot reach host", "host", h.Name, "error", err)
-				break // skip remaining networks for this host
-			}
-			ntype := netDef.Type
-			if ntype == "" {
-				ntype = "bridge"
-			}
-			scopedName := compose.ScopedNetworkName(f.Name, name)
-			if _, err := client.ProvisionNetwork(ctx, provisionNetworkRequest(scopedName, string(cfgJSON), ntype, f.Name)); err != nil {
-				slog.Warn("forwardProvisionNetworks: provision failed", "host", h.Name, "network", scopedName, "error", err)
-			}
-			conn.Close()
-		}
-	}
 }

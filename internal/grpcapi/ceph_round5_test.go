@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -219,14 +220,46 @@ func TestDeleteVMDisks_InUseWaitsRunTogether(t *testing.T) {
 	if err != nil || len(disks) != 3 {
 		t.Fatalf("disks %v %v", disks, err)
 	}
-	start := time.Now()
+	// Together, not in turn: each wait's first `rbd status` is held until all
+	// three disks have been asked once. Waits that run one after another
+	// never get there. (A wall-clock bound of three budgets stood in for
+	// this, and a loaded host took 7.1 s with the waits together.)
+	var mu sync.Mutex
+	asked := map[string]bool{}
+	all := make(chan struct{})
+	var alone []string // disks asked while the others never came
+	f.world.statusHook = func(args []string) {
+		for _, a := range args {
+			if !f.world.watchers[a] {
+				continue
+			}
+			mu.Lock()
+			asked[a] = true
+			if len(asked) == len(f.world.watchers) {
+				select {
+				case <-all:
+				default:
+					close(all)
+				}
+			}
+			mu.Unlock()
+			select {
+			case <-all:
+			case <-time.After(10 * time.Second):
+				mu.Lock()
+				alone = append(alone, a)
+				mu.Unlock()
+			}
+		}
+	}
 	err = f.s.deleteRecordedVMDiskVolumeRecords(ctx, "busy", disks)
-	el := time.Since(start)
 	if err == nil || !strings.Contains(err.Error(), "in use") {
 		t.Fatalf("got %v, want an in-use refusal", err)
 	}
-	if el > 6*time.Second {
-		t.Fatalf("three in-use disks took %v to refuse: waited for one after another", el)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(alone) > 0 {
+		t.Fatalf("the in-use waits ran one after another: %v waited 10 s for the others to be asked", alone)
 	}
 	for _, d := range []string{"lv/busy-da", "lv/busy-db", "lv/busy-dc"} {
 		if !f.world.has(d) {

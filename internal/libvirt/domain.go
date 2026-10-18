@@ -115,11 +115,15 @@ func (c *Client) UndefineDomain(name string, removeStorage bool) error {
 // transient domain still holding its UUID — so any caller about to undefine has
 // to ask this, not infer it from a state string.
 func (c *Client) DomainIsActive(name string) (bool, error) {
-	dom, err := c.virt.DomainLookupByName(name)
+	return domainIsActive(c.virt, name)
+}
+
+func domainIsActive(virt *golibvirt.Libvirt, name string) (bool, error) {
+	dom, err := virt.DomainLookupByName(name)
 	if err != nil {
 		return false, fmt.Errorf("lookup domain %s: %w", name, err)
 	}
-	active, err := c.virt.DomainIsActive(dom)
+	active, err := virt.DomainIsActive(dom)
 	if err != nil {
 		return false, fmt.Errorf("domain %s is-active: %w", name, err)
 	}
@@ -318,11 +322,17 @@ func parseConsolePTYPath(xmlStr, name string) (string, error) {
 // DomainExists checks if a domain is defined.
 // DumpXML returns the full XML description of a domain.
 func (c *Client) DumpXML(name string) (string, error) {
-	dom, err := c.virt.DomainLookupByName(name)
+	return dumpXML(c.virt, name)
+}
+
+// dumpXML is DumpXML on virt: the live XML without its secrets, which a
+// read-only connection is allowed.
+func dumpXML(virt *golibvirt.Libvirt, name string) (string, error) {
+	dom, err := virt.DomainLookupByName(name)
 	if err != nil {
 		return "", fmt.Errorf("lookup domain %s: %w", name, err)
 	}
-	xml, err := c.virt.DomainGetXMLDesc(dom, 0)
+	xml, err := virt.DomainGetXMLDesc(dom, 0)
 	if err != nil {
 		return "", fmt.Errorf("get XML for %s: %w", name, err)
 	}
@@ -356,8 +366,12 @@ func (c *Client) DomainExists(name string) bool {
 
 // ListDomains returns the names of all defined domains.
 func (c *Client) ListDomains() ([]string, error) {
+	return listDomains(c.virt)
+}
+
+func listDomains(virt *golibvirt.Libvirt) ([]string, error) {
 	flags := golibvirt.ConnectListDomainsActive | golibvirt.ConnectListDomainsInactive
-	domains, _, err := c.virt.ConnectListAllDomains(1, flags)
+	domains, _, err := virt.ConnectListAllDomains(1, flags)
 	if err != nil {
 		return nil, fmt.Errorf("list domains: %w", err)
 	}
@@ -372,12 +386,18 @@ func (c *Client) ListDomains() ([]string, error) {
 // GetVMVNCPort returns the VNC port assigned to a running domain.
 // libvirt auto-assigns ports starting at 5900; returns -1 if VNC is not active.
 func (c *Client) GetVMVNCPort(name string) (int, error) {
-	dom, err := c.virt.DomainLookupByName(name)
+	return vncPort(c.virt, name)
+}
+
+// vncPort is GetVMVNCPort on virt. It reads the domain's XML without its
+// secrets, which a read-only connection is allowed.
+func vncPort(virt *golibvirt.Libvirt, name string) (int, error) {
+	dom, err := virt.DomainLookupByName(name)
 	if err != nil {
 		return -1, fmt.Errorf("lookup domain %s: %w", name, err)
 	}
 
-	xmlDesc, err := c.virt.DomainGetXMLDesc(dom, 0)
+	xmlDesc, err := virt.DomainGetXMLDesc(dom, 0)
 	if err != nil {
 		return -1, fmt.Errorf("get domain XML %s: %w", name, err)
 	}

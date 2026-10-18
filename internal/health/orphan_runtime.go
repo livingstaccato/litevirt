@@ -65,7 +65,9 @@ import (
 //
 // WHAT HAPPENS. A condition (evaluator orphan_runtime, code vm_orphan_runtime
 // or ct_orphan_runtime, subject <name>@<host>) and the litevirt_orphan_runtime
-// gauge. Nothing else. No path destroys the runtime.
+// gauge. No path destroys the runtime. The one exception to report-only is a
+// shut-off domain a newer generation of its deleted record superseded, which
+// is undefined (superseded_leftover.go).
 //
 // Why not reap automatically: the only tombstone that could prove a running
 // runtime is unwanted is one naming THIS host and THIS runtime's owner epoch.
@@ -139,6 +141,13 @@ type orphanEvidence struct {
 type orphanReporter struct {
 	mu        sync.Mutex
 	sightings map[string]int // kind/name → consecutive passes seen
+}
+
+// sightedBefore reports whether the last pass saw kind/name as an orphan.
+func (o *orphanReporter) sightedBefore(kind, name string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.sightings[kind+"/"+name] >= 1
 }
 
 func orphanCode(kind string) string {
@@ -287,7 +296,7 @@ func (r *Reconciler) reportOrphanRuntimes(ctx context.Context) {
 		slog.Debug("orphan-runtime: replica not caught up; not scanning", "cause", why)
 		return
 	}
-	domains, err := r.virt.ListDomains()
+	domains, err := r.listDomainsBounded("orphan-runtime: report")
 	if err != nil {
 		return
 	}
@@ -307,6 +316,13 @@ func (r *Reconciler) reportOrphanRuntimes(ctx context.Context) {
 		trace, err := corrosion.LookupVMRowAnyState(ctx, r.db, name)
 		if err != nil {
 			return
+		}
+		// A shut-off copy a newer generation of the deleted record superseded
+		// is undefined, on its second sighting (superseded_leftover.go).
+		if by == OrphanRecognisedByOwnerEpoch && r.orphans.sightedBefore("vm", name) {
+			if reaped, _ := ReapSupersededStoppedLeftover(ctx, r.db, r.virt, r.dataDir, r.hostName, name, "reconciler"); reaped {
+				continue
+			}
 		}
 		state, _ := r.virt.DomainState(name)
 		row, rowHost, rowEpoch, deletedAt := orphanRowOf(trace)
@@ -434,7 +450,7 @@ func (r *Reconciler) adoptManagedDomains(ctx context.Context) {
 		slog.Debug("orphan-runtime: replica not caught up; not adopting domains", "cause", why)
 		return
 	}
-	domains, err := r.virt.ListDomains()
+	domains, err := r.listDomainsBounded("orphan-runtime: adopt")
 	if err != nil {
 		return
 	}

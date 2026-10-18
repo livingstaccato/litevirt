@@ -242,7 +242,8 @@ func (s *Server) finishCrossHostClone(ctx context.Context, req *pb.CloneVMReques
 		// and the target-side files of the failed move were removed by the move's
 		// own abort. Remove it, so a failed clone leaves nothing on the source
 		// host's disks. If the delete itself fails, say where it is.
-		if _, derr := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: name}); derr != nil {
+		// A schedule added ahead for the clone's name stays, as it did.
+		if _, derr := s.DeleteVM(withSchedulesKept(ctx), &pb.DeleteVMRequest{Name: name}); derr != nil {
 			return nil, status.Errorf(code,
 				"VM %q was cloned on %s but could not be moved to %s: %s. The staged copy could not be removed (%s): "+
 					"it is a complete, stopped VM on %s; delete it with `lv rm %s`, or move it with `lv migrate %s %s --cold`",

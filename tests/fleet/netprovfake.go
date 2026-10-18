@@ -10,6 +10,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/network/fdbfake"
 )
 
 // NetProvFake is the fleet stand-in for the host network provisioner: one per
@@ -28,13 +29,38 @@ type NetProvFake struct {
 	flat         map[string]bool   // bridges EnsureBridge created (flat-bridge fallback)
 	busy         map[string]bool   // flat bridges a scenario says have a port attached
 	guestPorts   map[string][]string
-	subnets      map[string]string // network → subnet, while provisioned with one
+	// devSubnets is the subnet each device set up here serves (its gateway
+	// address and dnsmasq), keyed by DEVICE: a network re-provisioned on
+	// another device leaves the old one serving until something tears it
+	// down, as on a host.
+	devSubnets map[string]string
+	// devAddrs is the subnets whose gateway addresses each device carries
+	// here, keyed by DEVICE. It is not devSubnets: a host-isolated bridge
+	// litevirt made, and a vxlan network's IRB, get the gateway address with
+	// no dnsmasq behind it, as the real Provision gives them. A device holds
+	// one address per network provisioned on it, as the kernel's does, and a
+	// teardown removes only its own network's.
+	devAddrs map[string]map[string]bool
+	// created are the bridges Provision made here (litevirt's own, as the
+	// real EnsureBridge records them), minus those torn down or swept;
+	// operator bridges a scenario named (SetOperatorBridge) are never in it.
+	created  map[string]bool
+	operator map[string]bool
+	sweeps   map[string]int // bridge → RemoveOrphanedBridge removals
+	// intents makes Provision and Deprovision write and delete the network's
+	// host firewall intent (net:<name>) as the real ones do (SetIntents).
+	intents bool
+	retires map[string]int // device → RetireDevice calls
 	// dhcpConflicts makes Provision fail the way the real dnsmasq does when
 	// another network provisioned on this node already serves an overlapping
 	// subnet: both listen on the same gateway address, so the second one
 	// exits at once (exit status 2). Off by default; SetDHCPConflicts.
 	dhcpConflicts bool
-	failWith      map[string]error // network → the error its Provision returns (FailProvision)
+	failWith      map[string]error  // network → the error its Provision returns (FailProvision)
+	vteps         map[string]string // network → the VTEP address its last Provision was handed
+	fdbSyncs      map[string]int    // network → SyncFDB calls
+	kernel        *fdbfake.Kernel   // this node's vxlan forwarding table (SyncFDB)
+	vnis          map[string]int    // network → VNI, from SyncFDB
 }
 
 func NewNetProvFake() *NetProvFake {
@@ -43,7 +69,11 @@ func NewNetProvFake() *NetProvFake {
 		provisions:   map[string]int{},
 		deprovisions: map[string]int{},
 		flat:         map[string]bool{},
-		subnets:      map[string]string{},
+		devSubnets:   map[string]string{},
+		devAddrs:     map[string]map[string]bool{},
+		created:      map[string]bool{},
+		operator:     map[string]bool{},
+		sweeps:       map[string]int{},
 	}
 }
 
@@ -69,37 +99,227 @@ func (f *NetProvFake) SetDHCPConflicts(on bool) {
 	f.dhcpConflicts = on
 }
 
-func (f *NetProvFake) Provision(_ context.Context, _ *corrosion.Client, name string, def compose.NetworkDef, _, _ string) (string, error) {
+// Provision records the network as set up here. A vxlan network also
+// registers this node's VTEP in network_vteps, as the real Provision does, so
+// the rows replicate and a scenario can see which address each node chose.
+// A bridge network with no interface is refused as the real one refuses it.
+func (f *NetProvFake) Provision(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, localIP, hostName string) (string, error) {
 	dev := network.BridgeName(name, def)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.failWith[name]; err != nil {
 		return "", err
 	}
+	if (def.Type == "" || def.Type == "bridge") && def.Interface == "" {
+		return "", fmt.Errorf("bridge network requires interface name")
+	}
+	if def.Type == "vxlan" && def.VNI != 0 && db != nil {
+		if err := network.UpsertVTEP(ctx, db, name, hostName, localIP, def.VNI); err != nil {
+			return "", fmt.Errorf("upsert vtep: %w", err)
+		}
+	}
+	if f.vteps == nil {
+		f.vteps = map[string]string{}
+	}
+	f.vteps[name] = localIP
 	if f.dhcpConflicts && def.Subnet != "" {
 		if mine, err := netip.ParsePrefix(def.Subnet); err == nil {
-			for other, sub := range f.subnets {
-				if p, err := netip.ParsePrefix(sub); other != name && err == nil && p.Overlaps(mine) {
+			for other, sub := range f.devSubnets {
+				if p, err := netip.ParsePrefix(sub); other != dev && err == nil && p.Overlaps(mine) {
 					return "", fmt.Errorf("start DHCP on %s: dnsmasq on %s exited immediately: exit status 2", dev, dev)
 				}
 			}
 		}
 	}
+	if f.intents && db != nil {
+		if err := fakeRecordIntent(ctx, db, name, def, dev, hostName); err != nil {
+			return "", err
+		}
+	}
 	f.up[name] = dev
-	if def.Subnet != "" {
-		f.subnets[name] = def.Subnet
+	if def.Subnet != "" && fakeServes(def) {
+		f.devSubnets[dev] = def.Subnet
+	}
+	if (def.Type == "" || def.Type == "bridge" || def.Type == "isolated") && !f.operator[dev] {
+		f.created[dev] = true
+	}
+	if def.Subnet != "" && fakeGatewayAddr(def, f.created[dev]) {
+		if f.devAddrs[dev] == nil {
+			f.devAddrs[dev] = map[string]bool{}
+		}
+		f.devAddrs[dev][def.Subnet] = true
 	}
 	f.provisions[name]++
 	return dev, nil
 }
 
-func (f *NetProvFake) Deprovision(_ context.Context, _ *corrosion.Client, name string, _ compose.NetworkDef, _ string) error {
+// Deprovision tears down what Provision set up for def's device, and the
+// network's firewall intent.
+func (f *NetProvFake) Deprovision(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, hostName string) error {
+	dev := network.BridgeName(name, def)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.intents && db != nil {
+		if err := corrosion.DeleteHostFWIntent(ctx, db, hostName, "net:"+name); err != nil {
+			return err
+		}
+	}
 	delete(f.up, name)
-	delete(f.subnets, name)
+	delete(f.devSubnets, dev)
+	delete(f.devAddrs[dev], def.Subnet)
+	delete(f.created, dev)
 	f.deprovisions[name]++
 	return nil
+}
+
+// RetireDevice tears down what Provision set up for def's device and nothing
+// keyed by the network: its firewall intent stays, as with the real one.
+func (f *NetProvFake) RetireDevice(_ context.Context, _ *corrosion.Client, name string, def compose.NetworkDef, _ string) error {
+	dev := network.BridgeName(name, def)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.devSubnets, dev)
+	delete(f.devAddrs[dev], def.Subnet)
+	delete(f.created, dev)
+	if f.retires == nil {
+		f.retires = map[string]int{}
+	}
+	f.retires[dev]++
+	return nil
+}
+
+// ReleaseDeviceServices stops what def's device serves, keeping the device.
+func (f *NetProvFake) ReleaseDeviceServices(name string, def compose.NetworkDef) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	dev := network.BridgeName(name, def)
+	delete(f.devSubnets, dev)
+	delete(f.devAddrs[dev], def.Subnet)
+}
+
+// ServingGateway reports whether def's device serves a subnet here.
+func (f *NetProvFake) ServingGateway(name string, def compose.NetworkDef) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.devSubnets[network.BridgeName(name, def)]
+	return ok
+}
+
+// WouldServeGateway is the real gate on the definition alone: the fleet has
+// no host bridges for an operator to have made.
+func (f *NetProvFake) WouldServeGateway(_ context.Context, _ *corrosion.Client, _ string, def compose.NetworkDef, _ string) bool {
+	return fakeServes(def)
+}
+
+// fakeServes is network.DHCPWouldServe for a bridge litevirt makes, and for
+// a vxlan network's gateway host (the fleet's nodes all are).
+func fakeServes(def compose.NetworkDef) bool {
+	return network.DHCPWouldServe(def, network.DHCPHostFacts{IsGatewayHost: true})
+}
+
+// fakeGatewayAddr reports whether the real Provision puts def's gateway
+// address on its device: wherever dnsmasq serves (it adds the address), on a
+// host-isolated bridge litevirt made with no VLAN (no dnsmasq, but the host
+// routes for the guests), and on every vxlan network's IRB.
+func fakeGatewayAddr(def compose.NetworkDef, createdHere bool) bool {
+	switch {
+	case fakeServes(def):
+		return true
+	case def.Type == "vxlan":
+		return def.VNI != 0
+	case def.Type == "" || def.Type == "bridge":
+		return def.HostIsolation && def.VLAN == 0 && createdHere
+	}
+	return false
+}
+
+// fakeRecordIntent writes the intent the real Provision writes for def.
+func fakeRecordIntent(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, dev, hostName string) error {
+	scope := "net:" + name
+	switch {
+	case def.HostIsolation:
+		return corrosion.UpsertHostFWIntent(ctx, db, hostName, corrosion.HostFWIntent{ScopeKey: scope, Bridge: dev, Isolate: true})
+	case def.Subnet != "" && def.NATEnabled() && def.VLAN == 0:
+		return corrosion.UpsertHostFWIntent(ctx, db, hostName, corrosion.HostFWIntent{ScopeKey: scope, Bridge: dev, MasqueradeSubnet: def.Subnet})
+	}
+	return corrosion.DeleteHostFWIntent(ctx, db, hostName, scope)
+}
+
+// SetIntents turns on writing and deleting the network firewall intents.
+func (f *NetProvFake) SetIntents(on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.intents = on
+}
+
+// Retires counts RetireDevice calls for device dev.
+func (f *NetProvFake) Retires(dev string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.retires[dev]
+}
+
+// CreatedBridges lists the bridges litevirt made here and still has.
+func (f *NetProvFake) CreatedBridges() ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.created))
+	for b := range f.created {
+		out = append(out, b)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// RemoveOrphanedBridge removes a bridge litevirt made here, with what it
+// served, unless a guest port is on it.
+func (f *NetProvFake) RemoveOrphanedBridge(name string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.created[name] || len(f.guestPorts[name]) > 0 {
+		return false, nil
+	}
+	delete(f.created, name)
+	delete(f.devSubnets, name)
+	delete(f.devAddrs, name)
+	f.sweeps[name]++
+	return true, nil
+}
+
+// RecordCreatedBridge marks name as a bridge litevirt made here outside any
+// network's provisioning: a flat bridge a NIC fell back to.
+func (f *NetProvFake) RecordCreatedBridge(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.created[name] = true
+}
+
+// SetOperatorBridge marks name as a bridge an operator made: Provision on it
+// never counts it as litevirt's.
+func (f *NetProvFake) SetOperatorBridge(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.operator[name] = true
+}
+
+// Serving lists the devices that serve a subnet here (gateway address and
+// dnsmasq), sorted.
+func (f *NetProvFake) Serving() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.devSubnets))
+	for d := range f.devSubnets {
+		out = append(out, d)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Sweeps counts RemoveOrphanedBridge removals of bridge.
+func (f *NetProvFake) Sweeps(bridge string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sweeps[bridge]
 }
 
 // Provisioned answers whether network is still set up on this node.
@@ -115,8 +335,11 @@ func (f *NetProvFake) Provisioned(name string, _ compose.NetworkDef) bool {
 func (f *NetProvFake) Lose(network string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if dev, ok := f.up[network]; ok {
+		delete(f.devSubnets, dev)
+		delete(f.devAddrs, dev)
+	}
 	delete(f.up, network)
-	delete(f.subnets, network)
 }
 
 // EnsureBridge is a Server.SetBridgeEnsure seam that records the flat bridges
@@ -177,6 +400,44 @@ func (f *NetProvFake) Up(network string) (string, bool) {
 	return dev, ok
 }
 
+// HasDevice reports whether a provisioned network, or a flat bridge
+// EnsureBridge made, is on dev here.
+func (f *NetProvFake) HasDevice(dev string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.flat[dev] {
+		return true
+	}
+	for _, d := range f.up {
+		if d == dev {
+			return true
+		}
+	}
+	return false
+}
+
+// Addrs is the gateway addresses device dev carries here (each subnet's first
+// host), as the real provisioner gives them (fakeGatewayAddr) — with or without
+// dnsmasq serving behind it. A device keeps them after its networks moved
+// off it, until something tears them down.
+func (f *NetProvFake) Addrs(dev string) []netip.Prefix {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	subs := make([]string, 0, len(f.devAddrs[dev]))
+	for sub := range f.devAddrs[dev] {
+		subs = append(subs, sub)
+	}
+	sort.Strings(subs)
+	var out []netip.Prefix
+	for _, sub := range subs {
+		if p, err := netip.ParsePrefix(sub); err == nil {
+			p = p.Masked()
+			out = append(out, netip.PrefixFrom(p.Addr().Next(), p.Bits()))
+		}
+	}
+	return out
+}
+
 // Provisions and Deprovisions count calls for network on this node.
 func (f *NetProvFake) Provisions(network string) int {
 	f.mu.Lock()
@@ -200,4 +461,72 @@ func (f *NetProvFake) FlatBridges() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// VTEP is the VTEP address network's last Provision on this node was handed.
+func (f *NetProvFake) VTEP(network string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.vteps[network]
+}
+
+// SyncFDB counts the network reconciler's forwarding-entry syncs and runs
+// the real sync (network.SyncFDBWith) against this node's model of the
+// kernel's forwarding table (fdbfake), where a second `add` of the flood
+// entry is refused as it is on a host. Its own address is the VTEP its last
+// Provision of the network was handed.
+func (f *NetProvFake) SyncFDB(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, hostName string) error {
+	f.mu.Lock()
+	if f.fdbSyncs == nil {
+		f.fdbSyncs = map[string]int{}
+	}
+	if f.kernel == nil {
+		f.kernel = fdbfake.New()
+	}
+	f.fdbSyncs[name]++
+	k, self := f.kernel, f.vteps[name]
+	if f.vnis == nil {
+		f.vnis = map[string]int{}
+	}
+	f.vnis[name] = def.VNI
+	f.mu.Unlock()
+	return network.SyncFDBWith(ctx, db, name, def, hostName, k.Exec, []string{self})
+}
+
+// Flood is network's flood list in this node's kernel table, sorted.
+func (f *NetProvFake) Flood(network string) []string {
+	f.mu.Lock()
+	k, vni := f.kernel, f.vnis[network]
+	f.mu.Unlock()
+	if k == nil {
+		return nil
+	}
+	return k.Dsts(fmt.Sprintf("vxlan%d", vni), "00:00:00:00:00:00")
+}
+
+// FDBSyncs counts SyncFDB calls for network on this node.
+func (f *NetProvFake) FDBSyncs(network string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fdbSyncs[network]
+}
+
+// LegacyVTEP is the tunnel address every fleet node resolves before the
+// release token latches: the default-route source address, which the nodes
+// share — they run on one machine, as every lab node sits behind the same
+// qemu NAT (10.0.2.15).
+const LegacyVTEP = "10.0.2.15"
+
+// ResolveVTEP is the fleet stand-in for network.ResolveVTEP (the nodes have
+// no interfaces of their own to read): before the latch, the shared
+// LegacyVTEP on ens3; after it, the node's host address on net1, or a refusal
+// with none.
+func (f *NetProvFake) ResolveVTEP(name string, def compose.NetworkDef, hostAddress string, switched bool) (string, string, error) {
+	if !switched {
+		return LegacyVTEP, "ens3", nil
+	}
+	if hostAddress == "" {
+		return "", "", &network.VTEPRefusal{Network: name, Reason: "this host's address is not known yet"}
+	}
+	return hostAddress, "net1", nil
 }

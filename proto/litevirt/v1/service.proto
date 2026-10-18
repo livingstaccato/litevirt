@@ -179,6 +179,8 @@ message ClusterHealth {
     repeated ConnectivityEdge connectivity = 4;
     repeated HostCapacityAssessment capacity = 5;
     string generated_at = 6;   // RFC3339
+    // Why overall is not HEALTHY: one line per cause, empty when it is.
+    repeated string reasons = 7;
 }
 
 message RescanHostRequest  { string name = 1; }
@@ -215,6 +217,10 @@ message SupersededDisk {
     string held         = 7;  // why it is kept even from a named removal; "" when not held
     bool   removed      = 8;  // removed by this request
     string retained     = 9;  // why the sweep and a bare purge keep it (its VM exists); "" when not retained
+    bool   kept         = 10; // a disk a deleted VM was kept with, moved off its path by a create (<path>.kept-<time>): listed only, never purged, removed or restored
+    bool   seed         = 11; // with kept: a cloud-init seed (it can hold user-data), not a disk
+    bool   earlier_vm   = 12; // with kept and vm_name: the file is an earlier VM's of that name, not the VM of that name that exists now
+    bool   uefi_vars    = 13; // with kept: the UEFI vars of a deleted VM's superseded definition its host undefined (<vars>.superseded-<time>), not a disk
 }
 message SupersededDisksResponse {
     string                  host           = 1;
@@ -392,7 +398,16 @@ message RelayCheckVIPParticipantResponse { RelayVIPResult result = 1; }
 // CheckVIPParticipant but keyed by LB NAME (used to resolve the true participant set for
 // implicit/legacy hosts=[] LBs before a move). Peer-only (mTLS).
 message CheckLBPresentRequest  { string lb_name = 1; }
-message CheckLBPresentResponse { bool present = 1; }
+message CheckLBPresentResponse {
+    bool present = 1;
+    // vrrp_unicast_serving: the answering host runs keepalived for this LB
+    // from a unicast VRRP config, has not refused the LB's unicast
+    // transport, and can hold the VIP: it still holds its source address on
+    // the device it sends from, and the VIP's device is up with carrier. An
+    // earlier build leaves it false. A host that cannot render the transport
+    // stops its own keepalived only when a peer reports this.
+    bool vrrp_unicast_serving = 2;
+}
 
 // CheckContainerRuntime is the container analogue of CheckVMRuntime: it reports
 // the responding host's LOCAL LXC view of a container ({absent, defined_stopped,
@@ -670,18 +685,34 @@ message UpdateVMRequest    { string name = 1; int32 cpu = 2;
     // nic_mtu sets each listed NIC's MTU (NetworkAttachment.mtu). It takes
     // effect on the next define, like nic_queues.
     repeated NICMTUUpdate nic_mtu = 27;
+    // nic_by_list_position: the ordinal of every nic_queues, nic_rate and
+    // nic_mtu update names the NIC at that position in the VM's NIC list, not
+    // the entry at that position in its stored spec. lv update sets it. Unset
+    // (an older client, a stack deploy) every ordinal is a spec index, as it
+    // always was. An entry node forwards it only to an owner whose Ping
+    // advertises nic_list_position; for an older owner it translates each
+    // position to the spec index, or refuses where it cannot.
+    bool nic_by_list_position = 43;
 }
 // DiskTuningUpdate changes one disk's discard / detect_zeroes (an empty value
 // leaves it as stored).
 message DiskTuningUpdate { string name = 1; string discard = 2; string detect_zeroes = 3; }
-// NICQueuesUpdate changes the virtio-net queue count of the NIC at this position
-// in the VM's spec (1 turns multiqueue off).
+// The NIC of a NICQueuesUpdate, NICRateUpdate or NICMTUUpdate is named by
+// ordinal: the index of its entry in the VM's stored spec, or, with
+// UpdateVMRequest.nic_by_list_position, its 0-based position in the VM's NIC
+// list (the VM's live NICs in ordinal order, as `lv inspect` lists them under
+// spec.network). Neither is the NIC's ordinal, which is never reused: a NIC
+// detached and attached again takes a new one. By position, the owner finds
+// the NIC's spec entry by its MAC (an entry that records no MAC, by the NIC's
+// ordinal), and a position past the end of the list names the spec entry at
+// that index when no live NIC carries it.
+//
+// NICQueuesUpdate changes one NIC's virtio-net queue count (1 turns
+// multiqueue off).
 message NICQueuesUpdate  { int32 ordinal = 1; int32 queues = 2; }
-// NICRateUpdate sets (or, at 0, clears) one NIC's bandwidth cap in MB/s. The NIC
-// is named by its 0-based position in the VM's interface list.
+// NICRateUpdate sets (or, at 0, clears) one NIC's bandwidth cap in MB/s.
 message NICRateUpdate { int32 ordinal = 1; double rate_mb_sec = 2; }
-// NICMTUUpdate sets one NIC's MTU by its 0-based position in the VM's
-// interface list: 0 removes it, 1 means the bridge's MTU.
+// NICMTUUpdate sets one NIC's MTU: 0 removes it, 1 means the bridge's MTU.
 message NICMTUUpdate { int32 ordinal = 1; int32 mtu = 2; }
 // SetVMMemory (#4) sets the running balloon target (and persists it). target_mib
 // must be within [min_memory_mib, max_memory_mib] of the VM's spec; a live VM is
@@ -691,6 +722,16 @@ message SetVMMemoryRequest  { string name = 1; int32 target_mib = 2;
 // SetVMLabelsRequest replaces the full label set (the request is authoritative —
 // an empty map clears all tags).
 message SetVMLabelsRequest  { string name = 1; map<string, string> labels = 2; }
+// PatchVMSpecRequest names fields of desired to write onto a VM's stored spec.
+// Peer only: a deploy that entered on another host forwards its spec patch to
+// the VM's owner, so every edit of one VM's spec is made on one host.
+message PatchVMSpecRequest {
+    string name = 1;
+    VMSpec desired = 2;
+    // fields: the compose live-metadata field names, plus "cpu" and "memory"
+    // for a size a live resize already applied.
+    repeated string fields = 3;
+}
 message ResizeDiskRequest  { string vm_name = 1; string disk_name = 2;
     string size = 3; }  // size: new total size e.g. "40G"
 
@@ -1043,6 +1084,19 @@ message ApplyLBRequest {
     // nil pre-activation. The LB host validates it (dest==self, action==lb_apply) and
     // claims it single-use before applying.
     RuntimeActionProof proof = 7;
+    // snat: whether this LB rewrites its network's guest egress to the VIP
+    // (compose `snat:`). Absent — a caller on an earlier build — applies
+    // SNAT, as every ApplyLB did before the field existed.
+    optional bool snat = 8;
+    // stack_name: the stack whose LB this is ("" for an explicit LB), so the
+    // VIP goes on that stack's network when the LB's row has not replicated
+    // here yet.
+    string stack_name = 9;
+    // A stack LB's health check and sticky sessions, which a forwarded apply
+    // serves as the coordinator's own apply does (TLS and redirects travel in
+    // ports). Absent — a caller on an earlier build — none, as before.
+    LBHealthSpec health          = 10;
+    bool         sticky_sessions = 11;
 }
 
 // RemoveLBRequest tells a host to tear down a local LB instance.
@@ -1058,6 +1112,9 @@ message CreateLBRequest {
     repeated string             hosts        = 5;  // hosts to run HAProxy+keepalived on
     repeated LBBackendAddress   backends     = 6;  // explicit backend addresses
     repeated string             vm_backends  = 7;  // VM names to resolve to IPs
+    // snat: rewrite the guest egress of the host-isolated network the VIP is
+    // placed on to the VIP (compose `snat:`). Default false: no outbound NAT.
+    bool                        snat         = 8;
 }
 
 message UpdateLBRequest {
@@ -1070,6 +1127,9 @@ message UpdateLBRequest {
     repeated string             remove_backends   = 7;  // by name
     repeated string             add_vm_backends   = 8;
     repeated string             remove_vm_backends = 9;
+    // snat: set the explicit LB's outbound NAT (CreateLBRequest.snat).
+    // Absent = no change. A stack LB's comes from its compose file.
+    optional bool               snat              = 10;
 }
 
 message DeleteLBRequest {
@@ -2343,11 +2403,29 @@ message GetVMOperationResponse {
 message AbortVMOperationRequest {
     string vm_name = 1;
     bool   force   = 2; // required — an abort is never implicit
+    // operation_id, when set, scopes the abort: it is refused unless the VM's
+    // active operation is exactly this one. Empty aborts whatever is active.
+    string operation_id = 3;
 }
 message AbortVMOperationResponse {
     bool   aborted               = 1;
     string previous_operation_id = 2;
     string detail                = 3;
+}
+
+// ReleaseHostReservation releases a host capacity reservation whose operation
+// is no longer running (admin; see docs/diagnostics.md, "Host reservations").
+message ReleaseHostReservationRequest {
+    string operation_id = 1;
+    bool   force        = 2; // required — a release is never implicit
+}
+message ReleaseHostReservationResponse {
+    bool   released   = 1; // false with detail "already released" is idempotent success
+    string host       = 2; // the target host that released it
+    string vm         = 3; // empty when the caller may not vm.read it
+    int32  vcpu       = 4;
+    int32  memory_mib = 5;
+    string detail     = 6;
 }
 
 // Live restore from backup. The handler:
@@ -2975,8 +3053,8 @@ message GetLeaseTermHighWaterResponse {
 // ── Recovery claims and the voter set (docs/design/recovery-claims.md) ──
 
 message RecoveryClaimKey {
-    string target_kind = 1;  // vm | container | voter_config
-    string target_name = 2;  // workload name; "" for voter_config
+    string target_kind = 1;  // vm | container | voter_config | lun | lease_term
+    string target_name = 2;  // workload, LUN or lease name; "" for voter_config
     int64  owner_epoch = 3;  // generation being left; config generation for voter_config
     int64  attempt     = 4;
     // incarnation is the workload row's created_at: which incarnation of the
@@ -3021,6 +3099,15 @@ message RecoveryClaimValue {
     VoterConfigValue voter_config = 13;
     // An iSCSI LUN allocation: the value a key of target_kind "lun" decides.
     LUNAllocationValue lun = 14;
+    // A leader-lease term's holder: the value a key of target_kind
+    // "lease_term" decides (lease_term_claim_v1).
+    LeaseTermClaimValue lease_term_claim = 15;
+}
+// LeaseTermClaimValue is which node holds one term of one leader lease.
+message LeaseTermClaimValue {
+    string key    = 1;  // the lease key (failover, rebalancer, ...)
+    int64  term   = 2;
+    string holder = 3;
 }
 // LUNAllocationValue is which disk of which VM one allocation of a LUN is.
 message LUNAllocationValue {
@@ -3477,9 +3564,12 @@ message PingResponse {
   // probation compares it with its own: a peer that reports a newer one shows
   // that the voter set this node is counting is stale, so it adopts the newer
   // generation (which its probation pull has just merged) and counts against
-  // that instead. Read only for that; a generation is adopted only once its
-  // certificate verifies, never because a peer reports it. (Tag 10: 9 is taken
-  // on another branch too, see the merge checklist.)
+  // that instead. A failover coordinator also keeps each peer's reports as
+  // evidence of the generation the peer counts its majority over, for the
+  // bounded partition-pause hold (docs/design/partition-pause.md §4.2). Read
+  // only for those; a generation is adopted only once its certificate
+  // verifies, never because a peer reports it. (Tag 10: 9 is taken on another
+  // branch too, see the merge checklist.)
   int64 voter_generation = 10;
   // migrate_preconditions: this build checks MigrateVMRequest's expect_*
   // preconditions before it moves a VM. An older owner ignores them and moves the
@@ -3492,6 +3582,14 @@ message PingResponse {
   // so a caller that needs the stop first (lv rm --force, a forwarding entry
   // node) sends StopVM{force} itself when this is false.
   bool delete_force = 12;
+  // abort_scoped: this build honours AbortVMOperationRequest.operation_id. An
+  // older daemon ignores the field and aborts whatever operation is active, so
+  // lv operation abort --operation refuses to send it when this is false.
+  bool abort_scoped = 13;
+  // nic_list_position: this build reads UpdateVMRequest.nic_by_list_position.
+  // An older owner ignores the field and reads every NIC ordinal as a spec
+  // index, so an entry node translates the positions for it, or refuses.
+  bool nic_list_position = 14;
 }
 
 // Ready: application-level readiness. Ping answers "is this daemon's TLS
@@ -3552,10 +3650,17 @@ message ProvisionNetworkRequest {
 }
 
 // ── Internal: Migration helpers ──
+message AnnounceMigratedGuestRequest {
+    string vm_name = 1;
+}
+
 message EnsureCloudInitRequest {
     string vm_name       = 1;
     string userdata      = 2;
     string networkconfig = 3;
+    // The seed's vendor-data, as the source decided it. Unset (a source from
+    // before this field) leaves the target to derive it from the VM's spec.
+    optional string vendordata = 4;
 }
 
 message EnsureDisksRequest {
@@ -3589,6 +3694,10 @@ message EnsureDisksRequest {
     // The target answers nic_mtu_problem for any NIC whose bridge there has a
     // different MTU.
     repeated NICMTUExpectation nic_mtu = 9;
+    // want_network_devices asks for network_devices in the response: a live
+    // migration of a VM with a NIC on a managed network lands each such NIC on
+    // the device this host serves the network on.
+    bool want_network_devices = 10;
 }
 
 // NICMTUExpectation is one NIC's resolved MTU on the source and the network
@@ -3646,6 +3755,12 @@ message EnsureDisksResponse {
     // nic_mtu_problem names the NICs of the request's nic_mtu whose bridge on
     // this host has a different MTU. Empty when every one matches.
     string nic_mtu_problem = 8;
+    // network_devices: for want_network_devices, each managed network the
+    // VM has a NIC on → the device this host serves it on now (the one it
+    // was last provisioned on here; for a network whose move this host has
+    // refused, still the previous one). An older target never sets it, and
+    // the source then migrates the domain's NICs as they are.
+    map<string, string> network_devices = 9;
 }
 
 // EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle
@@ -3956,9 +4071,19 @@ message GetVMIPRequest {
     // container (lxc-info / its interface row). owner_name is the container name.
     string owner_kind = 3;
     string owner_name = 4;
+    // lease_only (owner_kind "" or "vm"): answer only from THIS host's dnsmasq
+    // lease for mac on network_name's bridge, never from ARP, and set
+    // GetVMIPResponse.lease. A VM's host asks the other hosts of a vxlan
+    // network, whose DHCP server may run on any of them. A peer on an earlier
+    // build ignores it and never sets lease, so its answer is not taken.
+    bool lease_only = 5;
 }
 message GetVMIPResponse {
     string ip = 1;
+    // lease: ip is this host's dnsmasq lease for the MAC (lease_only).
+    bool lease = 2;
+    // lease_expiry: that lease's expiry in Unix seconds; 0 = infinite.
+    int64 lease_expiry = 3;
 }
 
 message RefreshLBRequest {
@@ -4503,6 +4628,10 @@ service LiteVirt {
     // SetVMLabels replaces a VM's labels/tags. Metadata-only (not in the domain
     // XML), so it applies to running VMs without a redefine.
     rpc SetVMLabels(SetVMLabelsRequest)  returns (VM);
+    // PatchVMSpec writes named fields of a desired spec onto a VM's stored
+    // spec, on the host that answers. Peer only: the owner of a VM serialises
+    // its spec edits, so a deploy entering elsewhere forwards its patch here.
+    rpc PatchVMSpec(PatchVMSpecRequest) returns (google.protobuf.Empty);
     rpc AttachDevice(AttachDeviceRequest) returns (VM);
     rpc DetachDevice(DetachDeviceRequest) returns (VM);
     rpc ResizeDisk(ResizeDiskRequest)    returns (VM);
@@ -4639,6 +4768,7 @@ service LiteVirt {
     rpc NormalizeRoleBindings(NormalizeRoleBindingsRequest) returns (NormalizeRoleBindingsResponse);
     rpc GetVMOperation(GetVMOperationRequest) returns (GetVMOperationResponse);
     rpc AbortVMOperation(AbortVMOperationRequest) returns (AbortVMOperationResponse);
+    rpc ReleaseHostReservation(ReleaseHostReservationRequest) returns (ReleaseHostReservationResponse);
     rpc BeginWebAuthnRegistration(BeginWebAuthnRegistrationRequest)   returns (BeginWebAuthnRegistrationResponse);
     rpc FinishWebAuthnRegistration(FinishWebAuthnRegistrationRequest) returns (FinishWebAuthnRegistrationResponse);
     rpc BeginWebAuthnLogin(BeginWebAuthnLoginRequest)                 returns (BeginWebAuthnLoginResponse);
@@ -4864,6 +4994,9 @@ service LiteVirt {
     // being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
     rpc ReceiveMigrationDisk(stream ReceiveMigrationDiskRequest) returns (ReceiveMigrationDiskResponse);
     rpc CheckCPUCompatibility(CheckCPUCompatibilityRequest) returns (CheckCPUCompatibilityResponse);
+    // Peer only: a live migration of vm_name to this host has completed;
+    // announce the gateway of each of its networks from this host's bridge.
+    rpc AnnounceMigratedGuest(AnnounceMigratedGuestRequest) returns (google.protobuf.Empty);
 
     // ── Internal: State Sync ──
     rpc GetStateDigest(google.protobuf.Empty)      returns (StateDigestResponse);
@@ -5023,6 +5156,15 @@ service LiteVirt {
     // and while any voter is unreachable from the answering host.
     rpc GetFailoverScope(google.protobuf.Empty)       returns (FailoverScopeStatus);
     rpc SetFailoverScope(SetFailoverScopeRequest)     returns (FailoverScopeStatus);
+
+    // GetVRRPTransport reports the load balancers' VRRP transport as the
+    // answering host renders it, and the cluster-wide policy behind it.
+    // SetVRRPTransport records the operator's choice (admin), "unicast" or
+    // "multicast", which every host then renders. It refuses until
+    // failover_scope_v1 has durably latched, "unicast" refuses until
+    // vrrp_unicast_v1 has, and both refuse while any voter is unreachable.
+    rpc GetVRRPTransport(google.protobuf.Empty)       returns (VRRPTransportStatus);
+    rpc SetVRRPTransport(SetVRRPTransportRequest)     returns (VRRPTransportStatus);
 
     // GetHAPolicy reports the cluster HA policy (armed or disarmed) and its
     // confirmation; SetHAPolicy changes it (admin). While disarmed, no host is
@@ -5357,6 +5499,25 @@ message HARegionConfirmation {
 
 message SetFailoverScopeRequest {
     string scope = 1;  // "cluster" | "region"
+}
+
+// VRRPTransportStatus is the load balancers' VRRP transport as the answering
+// host renders it, and the cluster-wide policy it follows.
+message VRRPTransportStatus {
+    string transport  = 1;  // "unicast" | "multicast": what this host renders
+    string policy     = 2;  // the operator's choice; "" when never set
+    string set_by     = 3;  // principal of the last change; "" when never set
+    string updated_at = 4;  // "" when never set
+    // latched: vrrp_unicast_v1 has latched on some host (its latch row) or
+    // durably on the answering host.
+    bool   latched    = 5;
+    // settable is false until failover_scope_v1 has durably latched on the
+    // answering host.
+    bool   settable   = 6;
+}
+
+message SetVRRPTransportRequest {
+    string transport = 1;  // "unicast" | "multicast"
 }
 
 message RestoreRelayRequest {

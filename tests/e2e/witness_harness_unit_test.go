@@ -1,7 +1,10 @@
 package e2e
 
 import (
+	"fmt"
 	"reflect"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 )
@@ -109,7 +112,7 @@ func TestCutPlan(t *testing.T) {
 // TestHoldersBetween names the holder at the window's start and every later one.
 func TestHoldersBetween(t *testing.T) {
 	t0 := time.Date(2026, 10, 15, 10, 0, 0, 0, time.UTC)
-	lw := &leaseWatch{changes: []leaseChange{
+	lw := &leaseWatch{all: []leaseChange{
 		{At: t0, Holder: "node-2", Term: 4},
 		{At: t0.Add(time.Minute), Holder: "node-3", Term: 5},
 		{At: t0.Add(2 * time.Minute), Holder: "node-2", Term: 6},
@@ -171,5 +174,232 @@ func TestMintTime(t *testing.T) {
 	}
 	if got := mintTime(stepAt.Add(-time.Minute), "node-2", "node-2", stepAt, false); !got.Equal(stepAt.Add(-time.Minute)) {
 		t.Errorf("a time written before the step was shifted to %v", got)
+	}
+}
+
+// TestParseEnforcementGauges reads one feature's config and latch gauges from a
+// node's /metrics, and refuses a scrape that lacks either.
+func TestParseEnforcementGauges(t *testing.T) {
+	out := `litevirt_enforcement_config_enabled{feature="lease_term_ledger_v1"} 0
+litevirt_enforcement_config_enabled{feature="lease_term_v1"} 1
+litevirt_enforcement_latched{feature="lease_term_ledger_v1"} 1
+litevirt_enforcement_latched{feature="lease_term_v1"} 0
+`
+	cfg, latched, ok := parseEnforcementGauges(out, "lease_term_v1")
+	if !ok || !cfg || latched {
+		t.Errorf("lease_term_v1: config=%v latched=%v ok=%v, want true false true", cfg, latched, ok)
+	}
+	cfg, latched, ok = parseEnforcementGauges(out, "lease_term_ledger_v1")
+	if !ok || cfg || !latched {
+		t.Errorf("lease_term_ledger_v1: config=%v latched=%v ok=%v, want false true true", cfg, latched, ok)
+	}
+	if _, _, ok := parseEnforcementGauges("litevirt_enforcement_config_enabled{feature=\"lease_term_v1\"} 1\n", "lease_term_v1"); ok {
+		t.Errorf("a scrape with no latch gauge was read")
+	}
+}
+
+// TestLeaseTermModeOf takes the mode from every host's own flag and latch:
+// enforcing needs both, so a latch with the flag off is off, and a cluster
+// that disagrees is mixed.
+func TestLeaseTermModeOf(t *testing.T) {
+	p := func(h string, cfg, latched bool) leaseTermPosture {
+		return leaseTermPosture{Host: h, Config: cfg, Latched: latched}
+	}
+	for _, tc := range []struct {
+		name string
+		ps   []leaseTermPosture
+		want leaseTermMode
+	}{
+		{"default: flag off, not latched", []leaseTermPosture{p("node-1", false, false), p("node-6", false, false)}, leaseTermOff},
+		{"latched, then every flag turned off", []leaseTermPosture{p("node-1", false, true), p("node-6", false, true)}, leaseTermOff},
+		{"flag on everywhere, not latched yet", []leaseTermPosture{p("node-1", true, false), p("node-6", true, false)}, leaseTermPending},
+		{"one host still latching among enforcing ones", []leaseTermPosture{p("node-1", true, true), p("node-6", true, false)}, leaseTermPending},
+		{"flag on and latched everywhere", []leaseTermPosture{p("node-1", true, true), p("node-6", true, true)}, leaseTermOn},
+		{"the witness alone has its flag off", []leaseTermPosture{p("node-1", true, true), p("node-6", false, true)}, leaseTermMixed},
+	} {
+		got, err := leaseTermModeOf(tc.ps)
+		if err != nil || got != tc.want {
+			t.Errorf("%s: got %q (%v), want %q", tc.name, got, err, tc.want)
+		}
+	}
+	if _, err := leaseTermModeOf([]leaseTermPosture{p("node-1", true, true), {Host: "node-2", Err: "no gauge"}}); err == nil {
+		t.Errorf("a host whose posture could not be read did not fail the reading")
+	}
+	if _, err := leaseTermModeOf(nil); err == nil {
+		t.Errorf("no hosts did not fail the reading")
+	}
+}
+
+// TestLeaseTermExpectFor selects the drills' lease-term expectations by mode:
+// off, the regime is inert and a proof's term is not held to its tenure; on,
+// the reverse.
+func TestLeaseTermExpectFor(t *testing.T) {
+	off, on := leaseTermExpectFor(leaseTermOff), leaseTermExpectFor(leaseTermOn)
+	if off.Mode != leaseTermOff || !off.Inert || off.TenureStrict {
+		t.Errorf("off: %+v, want inert and not tenure-strict", off)
+	}
+	if on.Mode != leaseTermOn || on.Inert || !on.TenureStrict {
+		t.Errorf("on: %+v, want enforcing and tenure-strict", on)
+	}
+	if m := leaseTermExpectFor(leaseTermMixed); m.Inert || m.TenureStrict {
+		t.Errorf("mixed: %+v asserts a mode", m)
+	}
+}
+
+// TestW4aVerdict judges W4a's second outage under each mode. Outcome C (the
+// adopted earlier-tenure value refused by the lease-term gate) is design Q5
+// with lease_term on; off, the gate must not refuse at all.
+func TestW4aVerdict(t *testing.T) {
+	off, on := leaseTermExpectFor(leaseTermOff), leaseTermExpectFor(leaseTermOn)
+	for _, tc := range []struct {
+		name                        string
+		e                           leaseTermExpect
+		recovered, decided, gateRef bool
+		dp                          string
+		wantName, wantFail, mustSay string
+	}{
+		{"A on", on, true, true, false, "p1", "A", "", ""},
+		{"A off", off, true, true, false, "p1", "A", "", ""},
+		{"B off", off, true, true, false, "p2", "B", "", ""},
+		{"B undecided", on, true, false, false, "", "B", "fail", "no attempt reads decided"},
+		{"C on is Q5", on, false, true, true, "p1", "C", "fail", "design Q5"},
+		{"C off: the gate refused while not enforced", off, false, true, true, "p1", "C", "fail", "not enforced"},
+		{"stranded on, no gate line", on, false, true, false, "p1", "stranded", "fail", "no lease-term refusal"},
+		{"stranded off, gate inert", off, false, true, false, "p1", "stranded", "fail", "inert"},
+		{"not recovered", off, false, false, false, "", "not recovered", "fail", ""},
+	} {
+		v := w4aVerdict(tc.e, tc.recovered, tc.decided, tc.dp, "p1", tc.gateRef, w4aFresh{})
+		if v.Name != tc.wantName || (v.Fail != "") != (tc.wantFail != "") || !strings.Contains(v.Fail, tc.mustSay) {
+			t.Errorf("%s: got %+v, want outcome %q fail=%v saying %q", tc.name, v, tc.wantName, tc.wantFail != "", tc.mustSay)
+		}
+	}
+
+	// Recovered with no attempt decided at the owner's epoch after the
+	// recovery (lab 1 at f9bafd75): the stale-term sweep abandoned outage 1's
+	// value and a fresh claim decided. It passes only on that path's
+	// evidence: one proof since the power-off, fresh, completed, at a term
+	// above outage 1's, on the host the VM recovered on.
+	//
+	// Mutation: accept any recovery with no decided attempt — every arm but
+	// the first goes red.
+	good := proof{ID: "p2", Status: "completed", LeaseTerm: 81, Dest: "node-3"}
+	with := func(f func(*proof)) []proof { p := good; f(&p); return []proof{p} }
+	for _, tc := range []struct {
+		name    string
+		proofs  []proof
+		mustSay string
+	}{
+		{"abandoned, then a fresh claim", []proof{good}, ""},
+		{"no proof", nil, "0 recovery proofs"},
+		{"two proofs", []proof{good, {ID: "p3", Status: "completed", LeaseTerm: 81, Dest: "node-4"}}, "2 recovery proofs"},
+		{"outage 1's proof", with(func(p *proof) { p.ID = "p1" }), "outage 1's"},
+		{"not completed", with(func(p *proof) { p.Status = "pending" }), "not completed"},
+		{"outage 1's term", with(func(p *proof) { p.LeaseTerm = 80 }), "not above"},
+		{"another destination", with(func(p *proof) { p.Dest = "node-4" }), "recovered on node-3"},
+	} {
+		v := w4aVerdict(on, true, false, "", "p1", false, w4aFresh{Proofs: tc.proofs, T1: 80, Dest: "node-3"})
+		switch {
+		case tc.mustSay == "" && (v.Fail != "" || v.Name != "B-fresh"):
+			t.Errorf("%s: got %+v, want outcome B-fresh, passing", tc.name, v)
+		case tc.mustSay != "" && (v.Fail == "" || !strings.Contains(v.Fail, tc.mustSay)):
+			t.Errorf("%s: got %+v, want a failure saying %q", tc.name, v, tc.mustSay)
+		}
+	}
+	if v := w4aVerdict(on, false, false, "", "p1", false, w4aFresh{Proofs: []proof{good}, T1: 80, Dest: "node-3"}); v.Fail == "" {
+		t.Errorf("not recovered, with a fresh proof: got %+v, want a failure", v)
+	}
+}
+
+// TestFreshTenureAt requires the tenure in force at the mint to be the
+// holder's and taken since the loss; a re-take it lost again before the mint
+// does not count.
+func TestFreshTenureAt(t *testing.T) {
+	t0 := time.Date(2026, 10, 15, 10, 0, 0, 0, time.UTC)
+	h := []leaseChange{
+		{At: t0, Holder: "node-2", Term: 7},
+		{At: t0.Add(40 * time.Second), Holder: "node-3", Term: 8},
+		{At: t0.Add(100 * time.Second), Holder: "node-2", Term: 9},
+		{At: t0.Add(200 * time.Second), Holder: "node-4", Term: 10},
+	}
+	if !freshTenureAt(h, "node-2", t0.Add(30*time.Second), t0.Add(150*time.Second)) {
+		t.Errorf("node-2's term 9, in force at the mint, was missed")
+	}
+	if freshTenureAt(h, "node-2", t0.Add(30*time.Second), t0.Add(250*time.Second)) {
+		t.Errorf("node-2's term 9, lost to node-4 before the mint, counted")
+	}
+	if freshTenureAt(h, "node-2", t0.Add(30*time.Second), t0.Add(20*time.Second)) {
+		t.Errorf("node-2's term 7, taken before the loss, counted")
+	}
+	if !freshTenureAt(h, "node-2", t0.Add(30*time.Second), t0.Add(199*time.Second)) {
+		t.Errorf("a mint a second before a sampled takeover was refused")
+	}
+}
+
+// TestLeaseTermRefusalPattern pins the off-mode refusal pattern against every
+// message with which the product refuses on a lease term only while enforcing
+// (health/reconciler.go, failover/coordinator.go), and against a line that is
+// no refusal.
+func TestLeaseTermRefusalPattern(t *testing.T) {
+	re := regexp.MustCompile(leaseTermRefusalPattern)
+	for _, msg := range []string{
+		"reconciler: pending proof refused by the lease-term gate",
+		"reconciler: this host has already acted at this lease term for another coordinator — refusing start",
+		"failover: this coordinator holds no usable lease term — refusing to stamp (never acquired one, or holdLease cleared it on a loss path)",
+		"failover: this coordinator's lease term is superseded — refusing to stamp",
+		"failover: refusing to stamp an action proof — this coordinator's lease term is unusable, so the workload is ABANDONED (a fenced host is processed only once)",
+	} {
+		if !re.MatchString(`time=2026-10-15T10:00:00Z level=WARN msg="` + msg + `" vm=e2e-w4a-1`) {
+			t.Errorf("not matched: %s", msg)
+		}
+	}
+	if re.MatchString(`level=INFO msg="failover: lease acquired" term=9`) {
+		t.Errorf("a line that is no refusal matched")
+	}
+}
+
+// TestInertJournalVerdict: with lease_term off, a refusal line or an unread
+// journal fails; an empty read passes.
+func TestInertJournalVerdict(t *testing.T) {
+	if v := inertJournalVerdict("node-9", "", fmt.Errorf("ssh: no route to host")); !strings.Contains(v, "could not read") {
+		t.Errorf("an unread journal passed: %q", v)
+	}
+	if v := inertJournalVerdict("node-2", "reconciler: pending proof refused by the lease-term gate\n", nil); !strings.Contains(v, "refused on a lease term") {
+		t.Errorf("a refusal line passed: %q", v)
+	}
+	if v := inertJournalVerdict("node-2", "\n", nil); v != "" {
+		t.Errorf("a clean journal failed: %q", v)
+	}
+}
+
+// TestRefusalVerdict reads the refused-actions counter and judges its change:
+// lease_term_unconfirmed rising fails, stale_lease_term is noted, and a
+// restart or a reset is not compared.
+func TestRefusalVerdict(t *testing.T) {
+	snap := func(pid string, unconf, stale int) refusalSnap {
+		return parseRefusalSnap(fmt.Sprintf("PID=%s\n"+
+			`litevirt_runtime_action_refused_total{action="reschedule",reason="lease_term_unconfirmed"} %d`+"\n"+
+			`litevirt_runtime_action_refused_total{action="promote",reason="stale_lease_term"} %d`+"\n"+
+			`litevirt_runtime_action_refused_total{action="reschedule",reason="stale_lease_term"} 1`+"\n", pid, unconf, stale))
+	}
+	if s := snap("42", 2, 3); s.Err != "" || s.ByReason["lease_term_unconfirmed"] != 2 || s.ByReason["stale_lease_term"] != 4 {
+		t.Fatalf("parse: %+v", s)
+	}
+	if f, _ := refusalVerdict(snap("42", 0, 0), snap("42", 1, 0)); !strings.Contains(f, "lease_term_unconfirmed") {
+		t.Errorf("a rise in lease_term_unconfirmed passed: %q", f)
+	}
+	if f, n := refusalVerdict(snap("42", 0, 0), snap("42", 0, 2)); f != "" || !strings.Contains(n, "stale_lease_term +2") {
+		t.Errorf("stale_lease_term: fail %q note %q, want a note only", f, n)
+	}
+	if f, n := refusalVerdict(snap("42", 3, 0), snap("43", 5, 0)); f != "" || !strings.Contains(n, "restarted") {
+		t.Errorf("a restart: fail %q note %q", f, n)
+	}
+	if f, n := refusalVerdict(snap("42", 3, 0), snap("42", 1, 0)); f != "" || !strings.Contains(n, "reset") {
+		t.Errorf("a reset: fail %q note %q", f, n)
+	}
+	if f, _ := refusalVerdict(snap("42", 0, 0), refusalSnap{Err: "ssh: timeout"}); f == "" {
+		t.Errorf("an unread counter after the drill passed")
+	}
+	if s := parseRefusalSnap("PID=0\n"); s.Err == "" {
+		t.Errorf("a stopped daemon read as a snapshot")
 	}
 }

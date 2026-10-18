@@ -196,7 +196,7 @@ func (s *Server) registerTools(m *mcp.Server) {
 	s.addTool(m, "list_hosts", "List hosts with coarse capacity and placement information.", objectSchema(map[string]any{"limit": integerSchema("Maximum hosts to return.")}), s.handleListHosts)
 	s.addTool(m, "inspect_host", "Inspect one host with safe fields only.", objectSchema(map[string]any{"name": stringSchema("Host name.")}, "name"), s.handleInspectHost)
 	s.addTool(m, "host_stats", "Fetch live aggregate stats for one host.", objectSchema(map[string]any{"name": stringSchema("Host name.")}, "name"), s.handleHostStats)
-	s.addTool(m, "cluster_health", "Return the cluster health: overall state, active conditions, evaluator coverage, connectivity, and per-host capacity.", objectSchema(map[string]any{"include_resolved": booleanSchema("Include recently-resolved conditions (30-day history).")}), s.handleClusterHealth)
+	s.addTool(m, "cluster_health", "Return the cluster health: overall state with the reasons it is not HEALTHY, active conditions, evaluator coverage, connectivity, and per-host capacity.", objectSchema(map[string]any{"include_resolved": booleanSchema("Include recently-resolved conditions (30-day history).")}), s.handleClusterHealth)
 	s.addTool(m, "list_vms", "List VMs with safe placement and state fields; VM specs and cloud-init are never returned.", objectSchema(map[string]any{
 		"host_name":  stringSchema("Optional host filter."),
 		"stack_name": stringSchema("Optional stack filter."),

@@ -768,3 +768,40 @@ func currentIsolation(ctx context.Context, c *Client, host string) (int64, strin
 	}
 	return cur.Epoch, cur.Reason, nil
 }
+
+// HostMembershipStamp is one host's resolved membership state and the latest
+// moment this replica can date a change of it to (HostMembershipStamps).
+type HostMembershipStamp struct {
+	Name  string
+	State string
+	// Changed is the membership row's updated_at, or the hosts copy's when the
+	// host has no membership row. Every membership write bumps it, and the
+	// hosts copy is bumped by unrelated writes too, so the state last changed
+	// no later than this: a reader that needs "unchanged since t" gets a
+	// conservative answer from it.
+	Changed string
+	// DeletedAt is the hosts row's deleted_at, "" while the host is live.
+	DeletedAt string
+}
+
+// HostMembershipStamps reads every host row, deleted ones included, with its
+// resolved state (resolve) and the stamps that date its last change.
+func HostMembershipStamps(ctx context.Context, c *Client) ([]HostMembershipStamp, error) {
+	rows, err := c.Query(ctx, `SELECT h.name AS name, COALESCE(h.deleted_at, '') AS h_deleted, `+
+		membershipCols+` FROM hosts h`+membershipJoins)
+	if err != nil {
+		return nil, err
+	}
+	frozen := c.hostsCopyFrozen()
+	out := make([]HostMembershipStamp, 0, len(rows))
+	for _, r := range rows {
+		m := membershipRowFrom(r, r.String("name"))
+		ts := m.hostsTS
+		if m.memPresent {
+			ts = m.memTS
+		}
+		out = append(out, HostMembershipStamp{Name: m.name, State: m.resolve(frozen).State,
+			Changed: ts, DeletedAt: r.String("h_deleted")})
+	}
+	return out, nil
+}

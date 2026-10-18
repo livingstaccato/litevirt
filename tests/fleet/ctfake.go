@@ -46,6 +46,9 @@ type CTFake struct {
 	// cpu.max a real container would get and the runtime-inventory collector
 	// reads the limits the way it reads a real config. Absent = uncapped.
 	cgroup map[string]string
+	// links is the bridge each container NIC is linked to, by ordinal: what
+	// a real create writes as lxc.net.<N>.link.
+	links map[string]map[int]string
 
 	// Call counters/records. Read them with the accessors, never directly —
 	// the handlers write these from other goroutines.
@@ -62,6 +65,8 @@ type CTFake struct {
 	startErr  error
 	exportErr error
 	importErr error
+	deleteErr error
+	listErr   error
 
 	// onExport runs INSIDE ExportContainer, i.e. during a migrate's archive
 	// phase — after the source's preflight has passed but before the IPAM
@@ -73,6 +78,10 @@ type CTFake struct {
 	// called with, so a scenario can cancel the caller and wait for that
 	// cancellation to reach the source daemon mid-archive.
 	onExportCtx func(ctx context.Context)
+	// onDelete runs after DeleteContainer has removed a container, outside
+	// the lock: the window between the runtime delete and the row's
+	// tombstone.
+	onDelete func(name string)
 
 	ensureIDRangeErr error
 	ensuredRanges    []int64
@@ -215,6 +224,14 @@ func (f *CTFake) FailStart(err error) {
 	f.startErr = err
 }
 
+// FailList makes ListContainers fail with err: a host without the lxc-*
+// tooling fails every list at the binary lookup.
+func (f *CTFake) FailList(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listErr = err
+}
+
 // FailExport makes ExportContainer fail with err — the archive-phase failure
 // that must roll the source back untouched.
 func (f *CTFake) FailExport(err error) {
@@ -229,6 +246,14 @@ func (f *CTFake) FailImport(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.importErr = err
+}
+
+// FailDelete makes DeleteContainer fail with err: a migrate whose target
+// landed then parks its source.
+func (f *CTFake) FailDelete(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleteErr = err
 }
 
 // OnExport registers fn to run inside the next ExportContainer call. See the
@@ -247,6 +272,14 @@ func (f *CTFake) OnExportCtx(fn func(ctx context.Context)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.onExportCtx = fn
+}
+
+// OnDelete registers fn to run after each DeleteContainer that removed a
+// container. See the onDelete field.
+func (f *CTFake) OnDelete(fn func(name string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onDelete = fn
 }
 
 // Counter accessors. Each returns a copy taken under the lock.
@@ -293,7 +326,36 @@ func (f *CTFake) CreateContainer(_ context.Context, opts grpcapi.CreateContainer
 		f.cgroup = map[string]string{}
 	}
 	f.cgroup[opts.Name] = lxc.ResourceConfig(opts.CPULimit, opts.MemoryMiB)
+	if f.links == nil {
+		f.links = map[string]map[int]string{}
+	}
+	f.links[opts.Name] = map[int]string{}
+	for i, n := range opts.Networks {
+		f.links[opts.Name][i] = n.Bridge
+	}
 	return &grpcapi.ContainerInfo{Name: opts.Name, State: "stopped"}, nil
+}
+
+// ContainerNICLinks reports the bridge each NIC of name links to.
+func (f *CTFake) ContainerNICLinks(_ context.Context, name string) (map[int]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[int]string{}
+	for i, b := range f.links[name] {
+		out[i] = b
+	}
+	return out, nil
+}
+
+// SetContainerNICLink relinks NIC ordinal of name to bridge.
+func (f *CTFake) SetContainerNICLink(_ context.Context, name string, ordinal int, bridge string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.links[name][ordinal]; !ok {
+		return fmt.Errorf("container %s has no NIC %d", name, ordinal)
+	}
+	f.links[name][ordinal] = bridge
+	return nil
 }
 
 // ContainerLimits reports the limits recorded at create; a container seeded
@@ -349,15 +411,26 @@ func (f *CTFake) StopContainer(_ context.Context, name string, _ int) error {
 
 func (f *CTFake) DeleteContainer(_ context.Context, name string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.deleteCalls = append(f.deleteCalls, name)
+	if f.deleteErr != nil {
+		f.mu.Unlock()
+		return f.deleteErr
+	}
 	if _, ok := f.state[name]; !ok {
+		f.mu.Unlock()
 		// Idempotent: the migrate finaliser treats this as success on retry.
 		return lxc.ErrContainerNotFound
 	}
 	delete(f.state, name)
 	delete(f.ips, name)
-	return os.RemoveAll(f.dir(name))
+	delete(f.links, name)
+	err := os.RemoveAll(f.dir(name))
+	hook := f.onDelete
+	f.mu.Unlock()
+	if err == nil && hook != nil {
+		hook(name)
+	}
+	return err
 }
 
 func (f *CTFake) ExecContainer(_ context.Context, name string, argv []string) (grpcapi.ContainerExecResult, error) {
@@ -388,6 +461,9 @@ func (f *CTFake) IPContainer(_ context.Context, name string) (string, error) {
 func (f *CTFake) ListContainers(_ context.Context) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	out := make([]string, 0, len(f.state))
 	for n := range f.state {
 		out = append(out, n)

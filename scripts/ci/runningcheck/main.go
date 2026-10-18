@@ -668,7 +668,7 @@ var stateWritingStatements = []stateStatement{
 		sql: `UPDATE vms SET host_name = ?, state = 'pending', pending_action_id = ?, updated_at = ?
 	        WHERE name = ? AND deleted_at IS NULL`,
 		writers: nil,
-		note:    "WriteVMRescheduleProof - literal state='pending', never a runtime",
+		note:    "writeVMRescheduleProof (WriteVMRescheduleProof, ReplaceVMRescheduleProof) - literal state='pending', never a runtime",
 	},
 	{
 		sql: `UPDATE vms SET state = 'error', state_detail = ?, pending_action_id = '', updated_at = ?

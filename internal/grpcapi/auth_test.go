@@ -19,6 +19,7 @@ func testServer(t *testing.T) *Server {
 	return &Server{
 		hostName: "test-host",
 		pkiDir:   "/etc/litevirt/pki",
+		dataDir:  t.TempDir(),
 		db:       db,
 		events:   events.NewBus(),
 		bridgeEnsure: func(string) error {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -139,8 +140,24 @@ func settleDecide(self string, row *corrosion.VMRecord, local localCopyID, proof
 		return none, corrosion.ClaimCertificate{}, "no destination runtime check"
 	}
 	why := fmt.Sprintf("no verified recovery-claim certificate gives this incarnation to %s at owner epoch >= %d", row.HostName, local.Epoch)
+	initial, uncertified := why, ""
 	for _, p := range proofs {
 		if p.TargetKind != corrosion.ClaimKindVM || p.TargetName != row.Name || p.DestHost != row.HostName || p.DestHost == self {
+			continue
+		}
+		// Minted while recovery claims were not enforced (a derived voter
+		// set): no majority certified it, and settle acts on nothing weaker
+		// (F9). It is named as such — a remedy that stops the local copy —
+		// only when it can be THIS copy's move: live, completed by its
+		// destination, at an owner epoch at least the local copy's. Any other
+		// uncertified proof is no evidence either way and says nothing.
+		if p.ClaimCertificate == "" {
+			if e, err := strconv.ParseInt(p.OwnerEpoch, 10, 64); err == nil && e >= local.Epoch && !p.Tombstoned {
+				if _, ok := proofExecutedByDest(p); ok {
+					uncertified = fmt.Sprintf("proof %s completed on %s but carries no recovery-claim certificate "+
+						"(minted while recovery claims were not enforced, as on a derived voter set)", p.ID, p.DestHost)
+				}
+			}
 			continue
 		}
 		// A decided claim is not yet a running replacement: the proof must
@@ -175,6 +192,11 @@ func settleDecide(self string, row *corrosion.VMRecord, local localCopyID, proof
 			continue
 		}
 		return p, cert, ""
+	}
+	// Only when no certified proof gave a reason of its own: a certified
+	// proof's failure is the one an operator must see.
+	if why == initial && uncertified != "" {
+		why = uncertified
 	}
 	return none, corrosion.ClaimCertificate{}, why
 }
@@ -222,7 +244,7 @@ func (r *Reconciler) settleCertifiedMove(ctx context.Context, domName string, vm
 	}
 	lister := r.settleProofs
 	if lister == nil {
-		lister = corrosion.CertifiedTransferProofs
+		lister = corrosion.TransferProofs
 	}
 	proofs, err := lister(ctx, r.db, corrosion.ClaimKindVM, domName)
 	if err != nil {
@@ -273,6 +295,52 @@ func (r *Reconciler) raiseSettled(ctx context.Context, name string, p corrosion.
 		FirstSeen: ts, LastSeen: ts, ConfirmedAt: ts, Reporter: r.hostName,
 	}); err != nil {
 		slog.Warn("partition-settle: could not record vm_settled", "vm", name, "error", err)
+	}
+}
+
+// resolveSettled resolves this host's vm_settled conditions that no longer
+// hold. One says this host holds a stopped copy of a VM that a certified
+// claim gave to another host, so it holds while a domain of that name is
+// defined here AND the VM's row names another host. It resolves when the
+// domain is gone from localDomains (the leftover cleanup undefined it, or an
+// operator did), or when the row names this host again (the VM came back,
+// and the domain is its own). A row that cannot be read keeps it open.
+//
+// Only this host's own: its domain list says nothing about another host's
+// copy. localDomains must come from a successful list. An open row is
+// written once, so a resolved one is never rewritten.
+func (r *Reconciler) resolveSettled(ctx context.Context, localDomains []string) {
+	open, err := corrosion.ListOpenHealthConditionsByCode(ctx, r.db, corrosion.PartitionPauseEvaluator, corrosion.CondVMSettled)
+	if err != nil || len(open) == 0 {
+		return
+	}
+	defined := make(map[string]bool, len(localDomains))
+	for _, d := range localDomains {
+		defined[d] = true
+	}
+	suffix := "@" + r.hostName
+	for _, row := range open {
+		if row.SubjectKind != "vm" || !strings.HasSuffix(row.SubjectID, suffix) {
+			continue
+		}
+		name := strings.TrimSuffix(row.SubjectID, suffix)
+		why := ""
+		if !defined[name] {
+			why = "the stopped copy is no longer defined on this host"
+		} else if vm, err := corrosion.GetVM(ctx, r.db, name); err == nil && vm != nil && vm.HostName == r.hostName {
+			why = "the VM's row names this host again, so the domain here is its own"
+		}
+		if why == "" {
+			continue
+		}
+		ts := r.now().UTC().Format(time.RFC3339)
+		row.Lifecycle, row.ResolvedAt, row.LastSeen = corrosion.ConditionResolved, ts, ts
+		row.ObserveCount, row.CleanCount, row.Reporter = 0, 1, r.hostName
+		if err := corrosion.UpsertHealthCondition(ctx, r.db, row); err != nil {
+			slog.Warn("partition-settle: could not resolve vm_settled", "vm", name, "error", err)
+			continue
+		}
+		slog.Info("partition-settle: vm_settled resolved — "+why, "vm", name, "host", r.hostName)
 	}
 }
 

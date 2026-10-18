@@ -71,6 +71,10 @@ type VMRecord struct {
 	OwnerEpoch        int64
 	SpecGeneration    int64
 	ActiveOperationID string
+	// FirewallCarry lets a row-INSERT keep the firewall identity of the VM it
+	// re-creates (CarryFirewallID). Zero, the insert stores no identity,
+	// whatever Spec holds. Never read back.
+	FirewallCarry FirewallIDCarry
 }
 
 // InterfaceRecord represents a VM network interface.
@@ -162,6 +166,14 @@ func InsertVM(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRec
 func InsertVMWithHardware(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRecord, disks []DiskRecord, nics []NICRecord, pciIntents []PCIIntentRecord, adopt bool) error {
 	now := nowRFC3339Nano() // created_at — fresh incarnation stamp (see nowRFC3339Nano)
 	uts := c.NowTS()        // updated_at (monotonic LWW key)
+
+	// A new VM has no firewall identity unless the caller carries the one of
+	// the VM it re-creates; any value in the incoming spec is stripped.
+	spec, err := keepFirewallID(TagMemberVM, vm.Spec, vm.FirewallCarry.idFor(TagMemberVM))
+	if err != nil {
+		return err
+	}
+	vm.Spec = spec
 
 	stmts := []Statement{
 		// Purge any soft-deleted record with the same name so the INSERT succeeds.
@@ -671,12 +683,19 @@ func GetSoftDeletedVMDisks(ctx context.Context, c *Client, vmName string) ([]Sof
 // — the incarnation a delete removed — or "" when there is none (no row, or a
 // live one).
 func GetTombstonedVMCreatedAt(ctx context.Context, c *Client, name string) (string, error) {
+	createdAt, _, err := GetTombstonedVM(ctx, c, name)
+	return createdAt, err
+}
+
+// GetTombstonedVM returns the created_at and the spec of name's TOMBSTONED
+// vms row; both "" when it has none.
+func GetTombstonedVM(ctx context.Context, c *Client, name string) (createdAt, spec string, err error) {
 	rows, err := c.Query(ctx,
-		`SELECT created_at FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, name)
+		`SELECT created_at, spec FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, name)
 	if err != nil || len(rows) == 0 {
-		return "", err
+		return "", "", err
 	}
-	return rows[0].String("created_at"), nil
+	return rows[0].String("created_at"), rows[0].String("spec"), nil
 }
 
 // GetVMDisks returns all disks for a VM.
@@ -875,7 +894,8 @@ func LiveVMDiskUsesWithPathPrefix(ctx context.Context, c *Client, prefix string)
 // recreate has just deleted held.
 func VMIncarnationDisks(ctx context.Context, c *Client, name, createdAt string) ([]DiskRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT d.vm_name, d.disk_name, d.host_name, d.path
+		`SELECT d.vm_name, d.disk_name, d.host_name, d.path,
+			COALESCE(d.delete_with_vm, 1) AS delete_with_vm
 		 FROM vm_disks d JOIN vms v ON v.name = d.vm_name
 		 WHERE v.name = ? AND v.created_at = ?`, name, createdAt)
 	if err != nil {
@@ -884,7 +904,8 @@ func VMIncarnationDisks(ctx context.Context, c *Client, name, createdAt string) 
 	out := make([]DiskRecord, len(rows))
 	for i, r := range rows {
 		out[i] = DiskRecord{VMName: r.String("vm_name"), DiskName: r.String("disk_name"),
-			HostName: r.String("host_name"), Path: r.String("path")}
+			HostName: r.String("host_name"), Path: r.String("path"),
+			DeleteWithVM: r.Int("delete_with_vm") == 1}
 	}
 	return out, nil
 }
@@ -1377,6 +1398,11 @@ type VMDeleteSnapshot struct {
 	OwnerEpoch     int64
 	SpecGeneration int64
 	IdentityHash   string
+	// FirewallID is the firewall identity the row held (firewall_id.go): what
+	// a re-create of the VM that delete tombstoned carries
+	// (CarryFirewallIDOf). Covers does not compare it; IdentityHash already
+	// binds the spec that holds it.
+	FirewallID string
 }
 
 // SnapshotForDelete is vm as a delete of it sees it.
@@ -1384,6 +1410,7 @@ func SnapshotForDelete(vm VMRecord) VMDeleteSnapshot {
 	return VMDeleteSnapshot{
 		CreatedAt: vm.CreatedAt, HostName: vm.HostName, OwnerEpoch: vm.OwnerEpoch,
 		SpecGeneration: vm.SpecGeneration, IdentityHash: vmCreateIdentityHash(vm),
+		FirewallID: firewallIDOf(TagMemberVM, vm.Spec),
 	}
 }
 
@@ -1483,6 +1510,11 @@ func deleteVMGuardedFrom(ctx context.Context, c *Client, vm VMRecord) (deleteOut
 	if !applied {
 		return deleteContended, nil
 	}
+	// The VM is gone, so a drain record for it can never apply: spend it, as
+	// every writer that changes a VM's host does. This is a separate,
+	// best-effort write after the delete, like the other SpendDrainOrigin callers. An older node's delete leaves
+	// it, and the undrain's validity check keeps the count right.
+	SpendDrainOrigin(ctx, c, name)
 	return deleteApplied, nil
 }
 
@@ -1668,8 +1700,13 @@ func execVMRekey(ctx context.Context, c *Client, now string, passes ...vmRekeyPa
 			if json.Unmarshal([]byte(vm.Spec), &spec) == nil {
 				spec["name"] = p.newName
 				if b, mErr := json.Marshal(spec); mErr == nil {
+					// The renamed row is the same VM: it keeps its identity.
+					kept, kErr := keepFirewallID(TagMemberVM, string(b), firewallIDOf(TagMemberVM, vm.Spec))
+					if kErr != nil {
+						return kErr
+					}
 					parent = Statement{SQL: `UPDATE vms SET name = ?, spec = ?, updated_at = ? WHERE name = ?`,
-						Params: []interface{}{p.newName, string(b), now, p.oldName}}
+						Params: []interface{}{p.newName, kept, now, p.oldName}}
 				}
 			}
 		}
@@ -1737,13 +1774,79 @@ func RenameVM(ctx context.Context, c *Client, oldName, newName string) error {
 	return execVMRekey(ctx, c, c.NowTS(), vmRekeyPass{oldName: oldName, newName: newName})
 }
 
-// UpdateVMInterfaceIP sets the IP of a VM interface.
-func UpdateVMInterfaceIP(ctx context.Context, c *Client, vmName, networkName, ip string) error {
-	now := c.NowTS()
-	return c.Execute(ctx,
+// UpdateVMInterfaceIP records ip on the live NIC of vmName that it is for,
+// and reports whether it wrote.
+//
+// mac names that NIC. Empty means the caller knows only the network (SetVMIP):
+// the network's one live NIC, or, with several, the one its legacy row names —
+// where the old unfiltered UPDATE landed. No live NIC that fits writes nothing.
+//
+// It writes the legacy vm_interfaces row only, with the statement it always
+// used, and only while that row is live and names the target NIC's MAC. The
+// row is keyed by (vm, network) and a detach after the hardware_v2 latch
+// tombstones only vm_nics, so it can belong to a detached NIC, or be the
+// tombstone of a NIC since re-attached under the same MAC: an unfiltered
+// UPDATE revived the first and hid the second, and the hardware bridge then
+// made either permanent. The filter is applied by reading both tables first,
+// because a filtered UPDATE would be a new statement shape and stall this
+// node's stream to every peer on the previous release.
+//
+// vm_nics is never written. A vm_nics row is rewritten whole (UpsertNIC), and
+// BindSecurityGroups and nic_retarget rewrite it from any node unlocked, so an
+// IP write there could lose a security-group bind made elsewhere. A NIC that
+// exists only in vm_nics therefore gets no address here, as before.
+//
+// Mixed versions: a node on an older build still issues the unfiltered UPDATE
+// and still revives a NIC detached after the latch, or bumps a legacy
+// tombstone over a re-attached NIC, until every node runs this. The latch
+// proves a build at least as new as hardware_v2, not this one.
+func UpdateVMInterfaceIP(ctx context.Context, c *Client, vmName, networkName, mac, ip string) (bool, error) {
+	nics, err := GetVMNICsRaw(ctx, c, "vm_nics", vmName)
+	if err != nil {
+		return false, err
+	}
+	ifaces, err := GetVMNICsRaw(ctx, c, "vm_interfaces", vmName)
+	if err != nil {
+		return false, err
+	}
+
+	var legacy *NICRecord // the (vm, network) row; the PK allows one
+	for i := range ifaces {
+		if ifaces[i].NetworkName == networkName {
+			legacy = &ifaces[i]
+		}
+	}
+	if legacy == nil || legacy.DeletedAt != "" {
+		return false, nil
+	}
+
+	var candidates []NICRecord
+	for _, w := range nicRowWinners(ifaces, nics) {
+		if w.DeletedAt == "" && w.NetworkName == networkName && (mac == "" || strings.EqualFold(w.MAC, mac)) {
+			candidates = append(candidates, w)
+		}
+	}
+	var target *NICRecord
+	switch {
+	case len(candidates) == 1:
+		target = &candidates[0]
+	case len(candidates) > 1:
+		for i := range candidates {
+			if strings.EqualFold(candidates[i].MAC, legacy.MAC) {
+				target = &candidates[i]
+			}
+		}
+	}
+	if target == nil || !strings.EqualFold(legacy.MAC, target.MAC) {
+		return false, nil
+	}
+	if err := c.Execute(ctx,
 		`UPDATE vm_interfaces SET ip = ?, updated_at = ? WHERE vm_name = ? AND network_name = ?`,
-		ip, now, vmName, networkName,
-	)
+		ip, c.NowTS(), vmName, networkName,
+	); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // diskRowSQL writes one whole vm_disks row. It is InsertDisk's statement, and

@@ -41,9 +41,12 @@ func FuzzRender(f *testing.F) {
 	f.Add(uint8(0), uint8(0), uint8(0))
 	f.Add(uint8(3), uint8(2), uint8(1))
 	f.Add(uint8(7), uint8(7), uint8(7))
+	f.Add(uint8(15), uint8(12), uint8(5)) // logging on, default verdict logged, observe
+	f.Add(uint8(9), uint8(4), uint8(1))   // logging on, enforce
+	f.Add(uint8(1), uint8(12), uint8(1))  // logging on, only the default verdict logged
 	f.Fuzz(func(t *testing.T, ruleSeed, sgSeed, nicSeed uint8) {
 		// Cap structural growth so the fuzzer can't OOM.
-		nRules := int(ruleSeed%6) + 1
+		nRules := int(ruleSeed%16) + 1
 		nSGs := int(sgSeed % 4)
 		nNICs := int(nicSeed % 4)
 
@@ -63,10 +66,17 @@ func FuzzRender(f *testing.F) {
 			if i&4 == 4 {
 				r.Action = Drop
 			}
+			if i&8 == 8 {
+				r.Log, r.ID = true, "r"+string(rune('a'+i))
+			}
 			return r
 		}
 
 		plan := Plan{DefaultDeny: ruleSeed&1 == 1}
+		// Logging (spec §3.4): available, the default verdict, and the mode.
+		plan.LogPolicy = LogPolicy{Available: sgSeed&4 == 4, Default: sgSeed&8 == 8, Group: uint16(nicSeed),
+			Rate: int(ruleSeed) - 8, Burst: int(sgSeed) * 50}
+		plan.NICMode = []string{NICModeEnforce, NICModeObserve, NICModeGuardsOnly}[int(nicSeed/4)%3]
 		for i := 0; i < nRules; i++ {
 			plan.ClusterRules = append(plan.ClusterRules, mkRule(i))
 		}
@@ -99,5 +109,8 @@ func FuzzRender(f *testing.F) {
 		if !strings.Contains(out, "table inet "+TableName) {
 			t.Fatalf("Render output missing table header:\n%s", out)
 		}
+		// L-1: every log statement sends to an NFLOG group.
+		assertEveryLogHasGroup(t, out)
+		assertLimitsDeclared(t, out)
 	})
 }

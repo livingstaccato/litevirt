@@ -76,6 +76,15 @@ func (s *Server) autoDefineRestoredVM(
 	if err != nil {
 		return "", "", err
 	}
+	// A caller's spec or a manifest's is untrusted, as a create's is: its
+	// stack name and load balancer pass CreateVM's checks, and an LB TLS file
+	// outside lb.CertDir needs the admin role, as at CreateVM. Only the
+	// --from-existing spec, this cluster's own row, already passed them.
+	if req.Spec != nil || manifest.VMSpecJSON != "" {
+		if err := validateRestoredLB(ctx, spec); err != nil {
+			return "", "", err
+		}
+	}
 	// The spec is a manifest's or a caller's, never a validated create: its
 	// disk/NIC tuning is dropped before the gate opens and validated after.
 	ioR, rerr := s.restrictRestoredTuning(ctx, spec)
@@ -337,6 +346,8 @@ func (s *Server) autoDefineRestoredVM(
 		Disks:       diskCfg,
 		Networks:    netCfg,
 		Boot:        spec.Boot,
+		// A seed this host holds for the restored VM, as CreateVM attaches it.
+		CloudInitISO: s.stampedSeedFor(targetName, spec.Uuid),
 		// Memory hot-add, only as admitted above (admitRestoredUSBAndHotplug).
 		HotplugBaseMiB: int(spec.MemoryHotplugBaseMib),
 		HotplugMaxMiB:  int(spec.MemoryHotplugMaxMib),
@@ -469,6 +480,10 @@ func (s *Server) autoDefineRestoredVM(
 	// adopt=false: best-effort-populate vm_nics, but don't self-certify adoption —
 	// the backfill audit confirms/reconciles.
 	gs := vmSpecGrants{tuning: ioG, passthrough: passthroughG, limits: limitsG, mtu: mtuR.grant}
+	// The restored VM is a new one, with no firewall identity (the insert
+	// strips the backup's): what the deleted VM of this name left is read
+	// before the row takes its tombstone over.
+	tagsLeft := s.firewallTagsLeftNote(ctx, corrosion.TagMemberVM, project, targetName, "")
 	if err := s.insertVMWithGrants(ctx, spec, gs, vmRecord, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 		if fwVM {
 			// A running firmware domain with no DB row is unmanageable — lifecycle
@@ -478,6 +493,9 @@ func (s *Server) autoDefineRestoredVM(
 		}
 		slog.Error("live-restore: failed to write VM to corrosion", "vm", targetName, "error", err)
 	} else {
+		if tagsLeft != "" {
+			_ = send(&pb.RestoreLiveProgress{Status: tagsLeft})
+		}
 		// Graduates, marks, and only then publishes running; a failure leaves the
 		// row "creating" for the reconciler to finish.
 		//

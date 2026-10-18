@@ -197,40 +197,7 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 		}
 	}
 
-	if vm.LoadBalancer != nil && vm.LoadBalancer.Enabled {
-		lbSpec := &pb.LBSpec{
-			Enabled:        true,
-			Vip:            vm.LoadBalancer.VIP,
-			Algorithm:      vm.LoadBalancer.Algorithm,
-			StickySessions: vm.LoadBalancer.Sticky,
-			Hosts:          vm.LoadBalancer.Hosts,
-			Snat:           vm.LoadBalancer.SNAT,
-		}
-		for _, p := range vm.LoadBalancer.Ports {
-			pbPort := &pb.LBPort{
-				Listen:        int32(p.Listen),
-				Target:        int32(p.Target),
-				Protocol:      p.Protocol,
-				RedirectHttps: p.RedirectHTTPS,
-			}
-			if p.TLS != nil {
-				pbPort.Tls = &pb.LBTlsSpec{
-					Cert: p.TLS.Cert,
-					Key:  p.TLS.Key,
-				}
-			}
-			lbSpec.Ports = append(lbSpec.Ports, pbPort)
-		}
-		if vm.LoadBalancer.Health != nil {
-			lbSpec.Health = &pb.LBHealthSpec{
-				UseVmHealthcheck: vm.LoadBalancer.Health.UseVMHealthcheck,
-				Type:             vm.LoadBalancer.Health.Type,
-				Path:             vm.LoadBalancer.Health.Path,
-				Interval:         fmt.Sprintf("%dms", vm.LoadBalancer.Health.IntervalMS),
-			}
-		}
-		spec.Loadbalancer = lbSpec
-	}
+	spec.Loadbalancer = BuildLBSpec(vm.LoadBalancer)
 
 	if vm.HealthCheck != nil {
 		spec.Healthcheck = &pb.HealthCheckSpec{
@@ -365,6 +332,48 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 	return spec, nil
 }
 
+// BuildLBSpec converts a compose load balancer definition into its wire form,
+// or nil when the definition is absent or not enabled. It is the one
+// conversion: a VM's spec and a stack deploy's LB step both take their LB
+// from here, so neither applies an LB missing something the file asked for.
+func BuildLBSpec(def *LBDef) *pb.LBSpec {
+	if def == nil || !def.Enabled {
+		return nil
+	}
+	lbSpec := &pb.LBSpec{
+		Enabled:        true,
+		Vip:            def.VIP,
+		Algorithm:      def.Algorithm,
+		StickySessions: def.Sticky,
+		Hosts:          def.Hosts,
+		Snat:           def.SNAT,
+	}
+	for _, p := range def.Ports {
+		pbPort := &pb.LBPort{
+			Listen:        int32(p.Listen),
+			Target:        int32(p.Target),
+			Protocol:      p.Protocol,
+			RedirectHttps: p.RedirectHTTPS,
+		}
+		if p.TLS != nil {
+			pbPort.Tls = &pb.LBTlsSpec{
+				Cert: p.TLS.Cert,
+				Key:  p.TLS.Key,
+			}
+		}
+		lbSpec.Ports = append(lbSpec.Ports, pbPort)
+	}
+	if def.Health != nil {
+		lbSpec.Health = &pb.LBHealthSpec{
+			UseVmHealthcheck: def.Health.UseVMHealthcheck,
+			Type:             def.Health.Type,
+			Path:             def.Health.Path,
+			Interval:         fmt.Sprintf("%dms", def.Health.IntervalMS),
+		}
+	}
+	return lbSpec
+}
+
 // parseDurationSeconds converts a human-friendly duration string like "30s", "2m", "1h"
 // to seconds. Returns an error for malformed values.
 func parseDurationSeconds(s string) (int, error) {
@@ -451,16 +460,39 @@ func nicQueues(q NICQueues, cpu int) int32 {
 	return ResolveAutoQueues(cpu)
 }
 
+// SpecEntryIndexForNIC is the index of the spec entry that describes the NIC
+// with this MAC and ordinal: the entry that records its MAC (case folded),
+// else — only for an entry that records no MAC — the entry at its ordinal.
+// -1 when none does. A NIC's ordinal is not its entry's index once a NIC was
+// detached: an ordinal is never reused, so a NIC attached again takes a new
+// one while its MAC's entry keeps its place.
+func SpecEntryIndexForNIC(spec *pb.VMSpec, mac string, ordinal int) int {
+	if mac != "" {
+		for i, e := range spec.GetNetwork() {
+			if e != nil && e.Mac != "" && strings.EqualFold(e.Mac, mac) {
+				return i
+			}
+		}
+	}
+	if ordinal >= 0 && ordinal < len(spec.GetNetwork()) {
+		if e := spec.Network[ordinal]; e != nil && e.Mac == "" {
+			return ordinal
+		}
+	}
+	return -1
+}
+
 // NICRate is the bandwidth cap (MB/s, 0 = unlimited) a VM spec declares for
-// the NIC at ordinal, trusted only when the spec's NIC at that position names
-// the same network — a hot-plugged NIC, or one a retarget moved, carries no
-// cap rather than another NIC's.
-func NICRate(spec *pb.VMSpec, ordinal int, network string) float64 {
-	if spec == nil || ordinal < 0 || ordinal >= len(spec.Network) {
+// the NIC with this MAC and ordinal: its own entry's (SpecEntryIndexForNIC),
+// trusted only when that entry names the same network — a hot-plugged NIC,
+// or one a retarget moved, carries no cap rather than another NIC's.
+func NICRate(spec *pb.VMSpec, mac string, ordinal int, network string) float64 {
+	i := SpecEntryIndexForNIC(spec, mac, ordinal)
+	if i < 0 {
 		return 0
 	}
-	n := spec.Network[ordinal]
-	if n == nil || (network != "" && n.Name != network) {
+	n := spec.Network[i]
+	if network != "" && n.Name != network {
 		return 0
 	}
 	return n.RateMbSec

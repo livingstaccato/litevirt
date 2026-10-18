@@ -27,7 +27,9 @@ type releaseUseProbe struct {
 }
 
 // releaseUseProbes are the features the sweep looks for, one data probe each.
-var releaseUseProbes []releaseUseProbe
+var releaseUseProbes = []releaseUseProbe{
+	{feature: capabilities.FeatureFirewallTagGroups, present: corrosion.FirewallTagGroupsDataPresent},
+}
 
 // releaseUseSweepInterval is how often the lease holder sweeps.
 const releaseUseSweepInterval = 5 * time.Minute
@@ -38,9 +40,6 @@ func (s *Server) RunReleaseUseSweep(ctx context.Context) {
 }
 
 func (s *Server) runReleaseUseSweep(ctx context.Context, every time.Duration, probes []releaseUseProbe) {
-	if len(probes) == 0 {
-		return
-	}
 	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
@@ -49,6 +48,8 @@ func (s *Server) runReleaseUseSweep(ctx context.Context, every time.Duration, pr
 			return
 		case <-t.C:
 			s.sweepReleaseUses(ctx, probes)
+			s.sweepFirewallTagOrphans(ctx, time.Now())
+			s.sweepScheduleOrphans(ctx, time.Now())
 		}
 	}
 }
@@ -92,4 +93,79 @@ func (s *Server) sweepReleaseUses(ctx context.Context, probes []releaseUseProbe)
 		}
 		slog.Info("release use sweep: recorded a use found in replicated data", "feature", p.feature)
 	}
+}
+
+// firewallTagsOrphanGrace is how long a firewall-tags row whose identity no
+// live workload holds is kept: it covers a move or re-create in flight, which
+// leaves no live row for a moment (spec §4.3).
+const firewallTagsOrphanGrace = 24 * time.Hour
+
+// sweepFirewallTagOrphans is the firewall-tags orphan sweep (spec §4.3, m-4):
+// on the failover lease holder, once firewall_tag_groups is recorded used, it
+// clears every tags row corrosion.FirewallTagsOrphans selects at now — no live
+// workload holds its identity, and the newest tombstone holding it, or the
+// row itself when nothing holds it, is older than the grace. So every orphan
+// is cleared within the grace plus one sweep interval. A clear is hygiene: an
+// orphan row already matches no workload.
+func (s *Server) sweepFirewallTagOrphans(ctx context.Context, now time.Time) {
+	held, err := corrosion.IsLeaseHolder(ctx, s.db, corrosion.LeaseKeyFailover, s.hostName, time.Now())
+	if err != nil || !held {
+		return
+	}
+	info, _ := capabilities.LookupFeature(capabilities.FeatureFirewallTagGroups)
+	if used, err := corrosion.ReleaseFeatureUsed(ctx, s.db, info.Token, string(capabilities.FeatureFirewallTagGroups)); err != nil || !used {
+		return
+	}
+	orphans, err := corrosion.FirewallTagsOrphans(ctx, s.db, now, firewallTagsOrphanGrace)
+	if err != nil {
+		slog.Warn("firewall tags sweep: could not read the rows", "error", err)
+		return
+	}
+	if len(orphans) == 0 {
+		return
+	}
+	if err := s.WithReleaseFeature(ctx, capabilities.FeatureFirewallTagGroups, func(ctx context.Context, g capabilities.FeatureGrant) error {
+		for _, o := range orphans {
+			if err := corrosion.ClearFirewallTags(ctx, s.db, g, o.Kind, o.FWID); err != nil {
+				slog.Warn("firewall tags sweep: could not clear an orphan row", "kind", o.Kind, "fw_id", o.FWID, "error", err)
+				continue
+			}
+			slog.Info("firewall tags sweep: cleared the tags of an identity no workload holds",
+				"kind", o.Kind, "fw_id", o.FWID, "name", o.Name)
+		}
+		return nil
+	}); err != nil {
+		slog.Info("firewall tags sweep: the release gate refused; retrying next sweep", "error", err)
+	}
+}
+
+// sweepScheduleOrphans is the schedule orphan sweep: on the failover lease
+// holder, it tombstones every schedule corrosion.OrphanedStackSchedules selects
+// at now — a schedule of a VM or container of a torn-down stack, deleted more
+// than ScheduleOrphanGrace ago, written no later than its tombstone. A delete
+// removes the workload's schedules itself (deleteVMSchedules,
+// deleteContainerSchedules); this clears what a stack teardown left: one by an
+// older build, or one that could not tell it was the entry.
+func (s *Server) sweepScheduleOrphans(ctx context.Context, now time.Time) {
+	held, err := corrosion.IsLeaseHolder(ctx, s.db, corrosion.LeaseKeyFailover, s.hostName, time.Now())
+	if err != nil || !held {
+		return
+	}
+	orphans, err := corrosion.OrphanedStackSchedules(ctx, s.db, now, corrosion.ScheduleOrphanGrace)
+	if err != nil {
+		slog.Warn("schedule sweep: could not read the schedules of torn-down stacks' workloads", "error", err)
+		return
+	}
+	for _, o := range orphans {
+		if err := s.deleteScheduleRow(ctx, o.VMName, o.Repo); err != nil {
+			slog.Warn("schedule sweep: could not remove the schedule of a torn-down stack's workload", "schedule", o.VMName, "repo", o.Repo, "error", err)
+			continue
+		}
+		slog.Info("schedule sweep: removed the schedule of a torn-down stack's workload", "schedule", o.VMName, "repo", o.Repo)
+	}
+}
+
+// SweepScheduleOrphansForTest runs one pass of the schedule orphan sweep.
+func (s *Server) SweepScheduleOrphansForTest(ctx context.Context, now time.Time) {
+	s.sweepScheduleOrphans(ctx, now)
 }

@@ -67,6 +67,8 @@ lv cluster converge [--all]        # Kick an immediate anti-entropy pass + repor
                                    #   (`lv cluster sync` is a deprecated alias)
 lv cluster failover-scope [cluster|region]  # Show or set whether failover quorum is cluster-wide or
                                    #   per region (see federation.md → Regions and failure)
+lv cluster vrrp-transport [unicast|multicast]  # Show or set how load balancer hosts exchange VRRP,
+                                   #   cluster-wide (admin to set; see compose.md → Load balancer)
 lv cluster relay-restore            # List relay-health demotions and operator holds (since, until, reason)
 lv cluster relay-restore <host> [--hold 1h]  # Clear a relay-health demotion now; --hold keeps the lease
                                    #   holder from demoting it again (admin, audited; see operating-model.md → Replication)
@@ -116,10 +118,10 @@ lv host init --local --name <name>        # Bootstrap on localhost (standalone)
 lv host add <user@host> --name <name>     # Add host to cluster
 lv host ls                                # List hosts (UPDATES column: pending OS package updates, see upgrades.md)
 lv host ls --names                        # Print only host names, one per line (for scripts)
-lv host inspect <host>                    # Host details
+lv host inspect <host>                    # Host details, with the capacity reservations counted against it (see diagnostics.md)
 lv host drain <host> [--parallel 2]       # Evacuate VMs off host
 lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (honors stop-delay)
-lv host undrain <host> [--failback]       # Return host to scheduling (--failback: wait for the failback it started and print results)
+lv host undrain <host> [--failback]       # Return a draining, maintenance, fenced or offline host to scheduling (--failback: wait for the failback it started and print results)
 lv host failback <host> [--all] [--dry-run] [--follow]   # Live-migrate VMs a drain moved away back to the host
 lv host rm <host> [--force]               # Remove host (--force with running VMs); revokes its cert
 lv host rm --dead <host> [--dry-run]      # Remove a host fenced proof-grade and gone for good: checks the
@@ -147,7 +149,8 @@ lv host fence-confirm <host>              # Confirm an already-powered-off manua
                                           #   refused while the host still answers health probes
 lv host rescan [host]                     # Rescan PCI devices
 lv host devices <host> [--type gpu|network|nvme|infiniband]   # List PCI devices
-lv host superseded-disks <host>           # List the disk copies a failover set aside
+lv host superseded-disks <host>           # List the disk copies a failover set aside, and the
+                                          #   .kept- disks and seeds a create made (marked kept, list only)
   [--purge] [--older-than 72h]            #   remove the ones neither retained nor held (admin)
   [--remove <copy>]...                    #   remove exactly these copies, even retained (admin)
   [--restore <copy>]                      #   put a copy back as its stopped VM's disk (admin)
@@ -219,6 +222,30 @@ lv ssh <vm> [-u root] [-i key] [-- cmd]   # SSH into VM
 lv logs <vm> [-f] [-n 50]                 # VM logs (-f to follow)
 ```
 
+**A kept disk and a create of the same name.** After `lv rm --keep-disks
+<vm>`, the VM's disks stay where they were. A VM of the same name created later
+on the same host would take `<data_dir>/disks/<vm>-<disk>.qcow2`, so the create
+first renames a kept disk there to `<path>.kept-<time>`, and the kept VM's
+cloud-init seed (`cloudinit/<vm>.iso`) to `<seed>.kept-<time>`. Nothing removes
+those files; each rename is recorded as a `vm.disk.kept` event of the VM. A disk
+recorded `delete_with_vm=false` is handled the same way. The create renames
+nothing until the refusals it can judge up front have passed (Secure Boot or
+vTPM over kept UEFI vars, a USB device the host does not have, the image not
+available), and a create that fails
+after the rename puts each file back at the path the kept VM recorded, unless
+a file is there by then. The host that holds
+kept disks lists them in `<data_dir>/kept-disks/<vm>.json` until a create
+renames them. `lv host superseded-disks <host>` lists each `.kept-` file there
+as `kept`, the seeds in `<data_dir>/cloudinit` among them, and the seed a
+deleted VM was kept with where it was, while no VM of its name exists (a seed
+can hold user-data passwords); `--purge`, `--remove` and `--restore` never take one, so
+only an operator removes it, by hand. Each is listed under the VM of its name
+when that is known; while a VM of that name exists, one that is an earlier
+VM's (every kept disk, and a seed not stamped for the VM there now) says so.
+A seed whose owner stamp is empty or unreadable is listed as kept. A `--keep-disks` delete whose
+`<data_dir>/kept-disks/<vm>.json` cannot be read is refused, naming the file,
+with nothing deleted: repair or remove that file, then retry.
+
 **Delete keeps its handle on failure.** `lv rm` removes the VM's record only once
 its libvirt domain is gone. If the running (or paused) domain cannot be stopped,
 nothing is removed; if it is stopped but cannot be undefined — or its PCI
@@ -245,6 +272,39 @@ behind. Until the delete is retried, or the lease expires after 10 minutes,
 nothing restarts the VM: the reconciler and the restart policy do not take a
 lease over. A retried `lv rm` runs on the same host and is the same holder, so
 it takes the lease back at once and completes the delete.
+
+**An interrupted delete still completes.** A delete interrupted before it acts
+— `lv rm` or `lv compose down` killed, or the entry host's forward cancelled,
+during its checks, its wait for the start lease, or while the VM's host asks
+its peers whether one of them has the domain — is refused with nothing
+touched. Once it acts (it stops the VM, or for a VM with no domain left, it
+begins removing the record), the host that carries it out finishes it whatever
+becomes of the client: the record is tombstoned, or the delete fails with the
+VM recorded `stopped` (`operator-stop`) as above, unless its record has moved
+to another host meanwhile. Its cluster writes from that point have 10 minutes;
+libvirt and storage calls are not cut short. `lv ct rm` behaves the same from
+the container's runtime delete on. A command interrupted by Ctrl-C or SIGTERM
+reports that the delete may still complete on its host, names `lv ls` (`lv ct
+ls` for a container, `lv compose ls` for a stack) to see the outcome, and then
+ends by the signal (the shell sees 130, or 143 for SIGTERM). A command waiting
+at a prompt ends at once. Any other command still running 2 seconds after the
+signal (one on an ssh step) ends then, except while it undoes what it already
+did (a firewall macro's rollback, up to 30 seconds), and a second Ctrl-C ends
+it at once, without the report. `lv daemon`, `lv gitops`, `lv top`, `lv spice`
+and `lv vnc` handle Ctrl-C themselves.
+
+`lv rebuild` and a `lv compose up` that re-creates a VM work the same way.
+Interrupted before the re-create sends its delete (a rebuild: before its
+teardown), nothing is deleted. From then on the replace runs to its create
+whatever becomes of the client, so an interrupted replace does not end with no
+VM; the command reports that it may still complete, and names `lv ls`. A VM
+being re-created is not listed until its create finishes, which can take
+minutes: wait until `lv ls` shows it before running the command again, or the
+second run may create it again. A create that replaces nothing (the delete found
+no VM) stays cancellable. A `lv compose up` interrupted after it has torn a VM
+down to re-create it still records the stack's new compose file, with the
+stack `degraded`: the rest of its plan did not run, and once `lv ls` shows the
+re-created VM, running `lv compose up` again finishes it.
 
 **CPU mode.** The default, `host-model`, gives the guest the host's modern
 instruction set — SSE4.2, AVX, AVX2, AVX-512 as the host has them — while keeping
@@ -281,6 +341,15 @@ lv update <vm> [--cpu-limit CORES] [--cpu-shares N]   # noisy-neighbour limits (
 lv update <vm> --nic-rate 0=12.5 [--nic-rate 1=0]     # per-NIC bandwidth cap in MB/s, NIC numbered from 0 (live; 0 clears it)
 lv update <vm> --nic-mtu 0=9000 [--nic-mtu 1=bridge] # per-NIC MTU, NIC numbered from 0; must equal the
                                              # bridge's MTU (VM STOPPED or --restart-if-needed; 0 removes it)
+# The NIC number in --nic-rate and --nic-mtu is the NIC's position in the VM's
+# NIC list, from 0: its NICs in ordinal order, as `lv inspect <vm>` lists them
+# under spec.network. A NIC detached and attached again goes to the end of it.
+# --nic-rate needs the NIC's spec entry: give a NIC attached after the create
+# one with --nic-mtu <nic>=0. A host on an older build reads the numbers as
+# spec entries: an update reaching it through an upgraded node is translated,
+# or refused naming the host to upgrade; the CLI talking to it directly
+# refuses a number at or past the first gap in the VM's NIC numbering (a NIC
+# was detached) and sends the others.
 lv update <vm> [--cpu N] [--memory N]        # resources — VM must be STOPPED
   [--cpu-mode host-passthrough|host-model|custom] [--cpu-model <model>]
   [--disable-vnc]
@@ -1200,7 +1269,9 @@ lv lb create <name> --vip <cidr> --port <l:t/proto> --backend <name=addr>
   --algorithm roundrobin     # roundrobin | leastconn | source
   --host <name>              # Hosts to run LB on (repeatable)
   --vm-backend <vm-name>     # Use VM IP as backend (repeatable)
+  --snat                     # SNAT a host-isolated network's outbound guest traffic to the VIP (default off)
 lv lb update <name> [flags]                       # Update config (zero-downtime)
+lv lb update <name> --snat=false                  # Turn an explicit LB's outbound SNAT off (--snat turns it on)
 lv lb delete <name>
 lv lb stats <name>                                # Live backend metrics
 lv lb drain <name> --backend <vm>                 # Graceful drain
@@ -1347,6 +1418,8 @@ lv sg ls
 lv sg rm <id>
 lv sg rule-add <sg-id-or-name> --direction ingress|egress --proto tcp \
     --port <p> --cidr <c> [--action accept|drop|reject] [--priority N]
+lv sg rule-add <sg-id-or-name> --macro <name> [--cidr <c>] [--direction ingress|egress] \
+    [--action accept|drop|reject] [--priority N]    # one rule per macro row; prints every id
 lv sg rule-ls <sg-id-or-name>
 lv sg rule-rm <rule-id>       # Takes the RULE id from rule-ls, not the group id
 lv sg bind <vm> --network <name> --sg <name> [--sg <name>...]   # Bind SGs to a VM NIC
@@ -1363,18 +1436,21 @@ lv sg bind <vm> --network <name> --sg <name> [--sg <name>...]   # Bind SGs to a 
   # `lv sg rule-ls` warn, and the firewall reconciler logs it once per rule.
   # Deleting either group removes them (the sg.rm audit row records them).
 
+lv firewall macros            # List the rule macros and their rows
 lv firewall show              # Render the live nft ruleset for this host
 lv firewall reload            # Force the reconciler to re-read state and apply now
 
 # Cluster-tier rules (apply to every NIC on every host):
 lv firewall cluster-rule add --direction ingress|egress --proto tcp \
     --port <p> --cidr <c> [--action accept|drop|reject] [--comment <s>] [--priority N]
+lv firewall cluster-rule add --macro <name> [--direction ...] [--cidr <c>] [--action ...] [--comment <s>]
 lv firewall cluster-rule ls
 lv firewall cluster-rule rm <id>
 
 # Host-tier rules (apply to every NIC on one host):
 lv firewall host-rule add --host <name> --direction ingress|egress --proto tcp \
     --port <p> --cidr <c> [--action accept|drop|reject] [--comment <s>] [--priority N]
+lv firewall host-rule add --host <name> --macro <name> [--direction ...] [--cidr <c>] [--action ...] [--comment <s>]
 lv firewall host-rule ls [--host <name>]
 lv firewall host-rule rm <id>
 
@@ -1398,6 +1474,27 @@ lv firewall nic-guard resume <vm> # let a VM held paused for its guards run, gua
 lv firewall enforce status          # mode per host + would-drop totals per workload, NIC and rule, since <time>
 lv firewall enforce on              # enforce (admin, audited); off = observe
 lv firewall enforce reset-counters  # restart every host's would-drop totals from now (admin, audited)
+
+# Firewall tags: per-workload key/value pairs, kept apart from labels (sg.write to change; audited).
+lv firewall tag set <vm> <key>=<value>...                          # adds or replaces keys
+lv firewall tag set <ct> --container [--host <host>] <key>=<value>...
+lv firewall tag rm <vm> <key>...                                   # --container [--host <host>] for a container
+lv firewall tag ls [<workload>] [--container [--host <host>]]      # every tagged workload, or one
+
+# Tag groups: selectors over firewall tags; reference one from a rule with --cidr tag:<group>
+# (sg.write to change; audited; refused until the cluster upgrade has finished).
+lv firewall tag-group set <name> --match <k>=<v> [--match <k>] [--sg <sg>] [--network <net>]   # upsert; matches are ANDed
+lv firewall tag-group ls [--members]   # --members: each member's allocated addresses, or "no allocated address"
+lv firewall tag-group rm <name> [--force]
+  # rm is refused while a rule references tag:<name>, the group binds security groups to a
+  # member's NICs, or its row cannot be read; --force overrides accept rules and the binding, never a drop or reject rule.
+  # set is refused for a name ending in _v6, beside a group <name>_v6, over an ip set named
+  # lv_tg_<name> or lv_tg_<name>_v6, for an --sg or --network that does not exist (or an --sg name
+  # two groups hold), and for --match k= or a key matched twice. rm also asks --force while a
+  # workload whose tags cannot be read sits on a network the group binds. lv asks the daemon
+  # before sending a tag: cidr (a rule, a compose file, or a gitops file that may hold one) and
+  # refuses unless the daemon shows it knows tag groups.
+  # A member leaving a group does not cut its open connections (docs/firewall.md, "Tag groups").
 ```
 
 See `docs/firewall.md` for the three-tier model, where each tier is enforced

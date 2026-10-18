@@ -39,9 +39,12 @@ Six guarantees the upgrade pipeline enforces:
    restart isn't mistaken for a failure either. Failover coordinators on peer
    hosts skip fence candidacy for `upgrading` hosts, but only up to a timeout
    (2 min): a host that entered `upgrading` and never came back is still fenced,
-   so its VMs aren't stranded. The new daemon transitions back to `active` on
-   healthy startup, and a host left `offline` by a transient blip is
-   auto-recovered to `active` once a fresh quorum sees it healthy.
+   so its VMs aren't stranded. A failing run that began while the host was
+   `upgrading` keeps the rest of those 2 minutes even if the host is recorded
+   `active` before it serves, if the failover leader saw it `upgrading`. The
+   new daemon transitions back to `active` on healthy startup, and a host
+   left `offline` by a transient blip is auto-recovered to `active` once a
+   fresh quorum sees it healthy.
 
 3. **Auto-rollback on a panicking binary.** If the new daemon panics
    past systemd's `StartLimitBurst=10` within 5 minutes, the
@@ -419,6 +422,10 @@ systemctl reset-failed litevirt
 systemctl restart litevirt
 ```
 
+A host rolled back below the release that added `lv lb create --snat` SNATs
+every load balancer made with `lv lb create` that it serves, including one set
+to `--snat=false` ([compose.md](compose.md#snat-via-vip)).
+
 ### Rolling back a host in a live firmware move
 
 Do not roll back the litevirt binary on a host whose
@@ -588,13 +595,13 @@ data, yet it advertises the token, counts toward its latch and is accepted as a
 sender: the first use would not be refused, and every such host would
 acknowledge it and then quarantine itself. So a feature added after a release
 ships — in a patch release too — is declared under the next release token,
-never a shipped one, and a test pins every release token's list. All nineteen
+never a shipped one, and a test pins every release token's list. All twenty
 features of `release_2026_11_v1` are declared in this release (`lv cluster
 upgrade-status` lists them): `vm_limits`, `vm_disk_nic_io`,
 `email_target_secret`, `login_policy`, `drain_failback`, `firewall_ipv6`,
 `nic_guards`, `usb_mounts_memory`, `backup_zstd`, `container_replication`,
 `iscsi_lun_claim`, `pit_overlay`, `redfish_fence`, `ha_disarm`, `nic_mtu`,
-`replication_rate`, `firewall_synflood`, `firewall_log` and
+`replication_rate`, `returning_boot`, `firewall_synflood`, `firewall_log` and
 `firewall_tag_groups`.
 
 One feature is one used bit: the first write of any of its data marks it used,
@@ -626,6 +633,14 @@ coordinator, armed or not, decides no fence and no recovery for a scope (the
 cluster, or the host's region) in which it counts fewer than a majority of the
 voters live, and the skip is counted as `error_class="no_quorum"`
 ([migration-failover.md](migration-failover.md#disarming-ha-for-planned-maintenance)).
+`returning_boot` is used by default the same way: once the release token has
+latched, the failover lease holder records its use with no data write. From
+then on a host that boots while recorded `fenced`, `offline`, `maintenance`,
+`draining` or `joining` is recorded `upgrading` until its daemon serves, not
+`active` at once; until then it boots `active`, as on the previous release,
+whose failover leader clears a fenced host it has handled only once the host
+is `active`
+([migration-failover.md](migration-failover.md#resuming-a-recovery-from-a-recorded-fence)).
 
 **What this does not change.** A binary built before `release_2026_11_v1`
 understands no rollback rule. Rolled back below any token it does not know —
@@ -799,16 +814,20 @@ lv host upgrade host-01 --binary ./bin/litevirt --yes
 cp litevirt.new /usr/local/bin/litevirt && systemctl restart litevirt
 ```
 
-A bare `systemctl restart` bypasses the `upgrading` state that
-`lv host upgrade` sets. The failover **leader** sees the host vanish for a
-few seconds and opens a fence against it. The fence usually can't complete
-(SSH-poweroff fails), so it lingers as a stale `partial` record — and a
-stale fence record on the leader then *blocks the leader's own upgrade*
-(`leader-with-pending-fence`). Always upgrade through `lv host upgrade`,
-which marks the host `upgrading` (the coordinator skips `offline`,
-`maintenance`, `fenced`, and `upgrading` hosts). If you must hand-restart a
-host, put it in maintenance first (`lv host drain <host>`), restart, then
-return it.
+A bare `systemctl restart` gets only guarantee 2: the SIGTERM records the
+host `upgrading`, and the failover coordinators skip it for 2 minutes from
+that write. **A daemon stopped for longer than that without a drain gets its
+host fenced**: powered off, with its VMs recovered elsewhere. That holds
+whoever records the host `active` meanwhile: a failing run that began while
+the host was `upgrading` keeps the rest of those 2 minutes, and a host that
+still does not answer when they end is fenced. The run keeps them only if the
+failover leader saw the host `upgrading`; a leader that did not (it took over
+meanwhile) allows 13 s from the activation
+([migration-failover.md](migration-failover.md)). The restarted daemon records
+the host `active` itself once it serves; `lv host undrain` is refused while it
+does not answer. Always upgrade through `lv host upgrade`. If you must
+hand-restart a host, or stop its daemon for longer, put it in maintenance
+first (`lv host drain <host>`), restart, then return it.
 
 **Overriding a stale block.** `--force` is sent to the daemon, so a
 genuinely-stale server-side block can be overridden:
@@ -1314,7 +1333,8 @@ off (colonelpanik/litevirt#253). Two things change:
 What an operator sees after the latch: the host's recorded state (the
 `host_membership` row, and the assurance `lv doctor fence` and `lv host fence`
 print) is `offline` for an SSH-fenced host. `lv host ls` shows `HOST_OFFLINE`
-for both `offline` and `fenced`, so it looks as before. Bring the host back
+for `offline` and `HOST_FENCED` for `fenced` (a server on an earlier release
+shows `HOST_OFFLINE` for both, and `HOST_DRAINING` for `upgrading`). Bring the host back
 with `lv host undrain <host>` as before. An
 `offline` host whose newest fence **failed** is still put back in service
 when a quorum sees it healthy again, as before; one whose newest fence
@@ -1422,6 +1442,27 @@ the lease holder from demoting the host again until the hold runs out. A
 binary rolled back below the latched token enters WAL quarantine, as below
 every latched token. Roll forward.
 
+### Concurrent spec edits are resolved after the roll
+
+Two edits of one VM's spec made from the same generation, one on each side of
+a partition, used to leave each host holding whichever reached it first until
+anti-entropy kept the newer one. A spec edit entering on a host that does not
+own the VM is now made on the owner, which serialises them; an owner that
+cannot be reached still takes the edit where it entered. Once the
+`spec_conflict_v1` capability token has latched — on its own, once every host
+the cluster replicates to, including one parked in `maintenance`, runs this
+release — an edit also carries the owner epoch it was made at, a statement a
+host on the previous release cannot decode, records in the spec (`spec_edit`)
+when it was made and the content it was made from, and every host resolves
+two edits at one generation the same way (see
+[operating-model.md](operating-model.md#replication)). Until then edits are
+replicated exactly as before.
+
+`spec_conflict_v1` is mandatory and replication-gated, with no flag: every
+host must resolve one conflict the same way. A binary rolled back below the
+latched token enters WAL quarantine, as below every latched token. Roll
+forward.
+
 ### Console passwords start after the roll
 
 This release gives each VM's VNC and SPICE consoles a per-VM password
@@ -1450,6 +1491,39 @@ guest, so their next start has no password.
 A FIPS-mode host (whose QEMU has no DES for VNC authentication) sets no VNC
 passwords, takes incoming live migrations without them, and reports
 `console_password_v1` in `not_enforcing`; it never fails a start over one.
+
+### Load balancer VRRP moves off the guest network after the roll
+
+On earlier releases, each load balancer host multicasts its keepalived VRRP
+adverts on the bridge its VIP is on, with a password derived from the LB's
+name, so any guest on that bridge can read the password and answer with a
+higher priority, which takes the VIP off its holder. This release sends them
+as unicast between the LB hosts' recorded addresses, over the host network
+([compose.md](compose.md#load-balancer)). A host on the old transport and a
+host on the new one do not hear each other and would both hold the VIP, so
+nothing switches until the `vrrp_unicast_v1` capability token has latched. It
+latches once every host the cluster replicates to, including one parked in
+`maintenance`, runs this release; a host with `enforcement.vrrp_unicast: false`
+withholds it, so it holds the switch off. The first host whose latch is durable
+records it cluster-wide, once `failover_scope_v1` has latched there too (the
+record lives in `cluster_policies`), and until then every host stays multicast.
+Every LB host then re-applies its LBs within 2 seconds of that record reaching
+it, whatever its own flag says: an LB is held by both its hosts for about the
+replication delay between them plus 2 seconds. A host that cannot render unicast
+(its recorded address is on no up, non-loopback local device) raises
+`lb.vrrp.transport_refused`, stops its keepalived for each LB another host serves
+on unicast, and runs on multicast each LB no other host serves.
+Hosts must pass IP protocol 112 between their recorded addresses.
+
+The stand-down is cluster-wide: `lv cluster vrrp-transport multicast` (admin),
+which every host renders within 2 seconds of receiving it, and
+`lv cluster vrrp-transport unicast` undoes it. It can be set before the latch
+too, to keep the old transport. A host on an earlier build that comes back
+after the latch renders multicast while its LB peers render unicast; they raise
+`lb.vrrp.transport_split` naming it. A binary rolled back below the latched
+token enters WAL quarantine, as below every latched token, and renders the
+multicast transport its peers have left: roll forward, or set
+`lv cluster vrrp-transport multicast` first.
 
 ### SPICE through the daemon
 
@@ -1717,6 +1791,41 @@ roll, add `enforcement.recovery_claim: true` **explicitly** to its config; the
 older build honours an explicit key. Clusters founded with `lv host init` on
 this build already carry the explicit key. `lv doctor fence` warns when the
 token has latched and any host does not enforce it, and names the host.
+
+### Lease-term claims latch after the roll
+
+A node with an adopted voter generation that has members records a new
+leader-lease term only after a majority of that generation has decided it for
+the node. Before that, two nodes that took a lease over at the same moment
+could both record the next term and both act as its holder. See
+[Operating model](operating-model.md) → "Two nodes taking a lease over at once
+record one term". There is no schema change: voters keep these decisions in
+`local_recovery_claims`.
+
+During the roll, a host on the previous build refuses a lease-term claim as an
+unknown claim type and records terms without claiming them. An upgraded host
+claims anyway, and records a term from the quorum read alone only when so many
+voters give that refusal that the rest cannot form a majority. A voter that
+does not answer counts as one that could still accept, so an older-build
+minority plus one dead upgraded voter leaves a lease with no takeover until
+the roll finishes. Once the mandatory, replication-gated `lease_term_claim_v1`
+token has latched on a host, it always claims while a voter generation with
+members is adopted. The token cannot latch while any host the cluster replicates to runs
+the previous build, one parked in `maintenance` included.
+
+A takeover now needs a majority of voters that can vote, not only a majority
+that answers a read. `ha.lease.claim_no_majority` and
+`litevirt_lease_term_claim_no_majority_total` show a lease that cannot get one.
+There is no flag. Voter changes are decided by the same majority, so repair a
+voter while `ha.voter.unavailable` names it (`lv cluster voter rm <host>` then
+`lv cluster voter add <host>`). Once the claim itself has no majority, the
+exits are restoring the lost voter, or fencing proof-grade every member that
+cannot vote, abstaining ones included, and naming each in
+`lv cluster voter force-reconfigure --lost <host>[,<host>...]`. `lv cluster voter reset`
+returns hosts, as each adopts the reset generation, to recording terms from
+the quorum read alone — the two-holder race — and also ends recovery-claim
+protection. A binary rolled back below the
+token after it has latched enters WAL quarantine, as below every latched token.
 
 ## Schema upgrades: `litevirt schema-migrate`
 

@@ -475,3 +475,9 @@ func (s *Server) SetCloneAsOlderBuildForTest(on bool) { s.cloneAsOlderBuildForTe
 func (s *Server) SetPingWithoutMigratePreconditionsForTest(on bool) {
 	s.pingWithoutMigratePreconditionsForTest = on
 }
+
+// SetPingWithoutNICListPositionForTest makes Ping answer as a release that
+// reads every NIC number of an UpdateVM as a spec index.
+func (s *Server) SetPingWithoutNICListPositionForTest(on bool) {
+	s.pingWithoutNICListPositionForTest = on
+}

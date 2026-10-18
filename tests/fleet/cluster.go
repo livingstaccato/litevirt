@@ -73,6 +73,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -168,6 +169,10 @@ type Options struct {
 	// peers — a partition that heals, a re-join — which a seeded view cannot
 	// reach. Incompatible with SharedCRDT.
 	RealGossip bool
+	// ClockSeam gives every node a wall clock Node.StepClock can move, for its
+	// row stamps and its HLC (corrosion.Client.SetWallClockForTests). A
+	// scenario's coordinator reads it through Node.Now.
+	ClockSeam bool
 	// GossipKey, with RealGossip, runs every node at
 	// enforcement.gossip_encryption enforced under this one key. Nil is
 	// plaintext gossip.
@@ -201,6 +206,8 @@ type Cluster struct {
 	caCert  string
 	caKey   string
 	tmpRoot string
+	// dbPrefix names this cluster's in-memory databases (dbName).
+	dbPrefix string
 	// opts is the bootstrap request, kept so per-node wiring (buildServer) can
 	// read options the harness applies after the nodes exist.
 	opts Options
@@ -251,6 +258,9 @@ type Node struct {
 	Net      *NetProvFake      // per-node network provisioner: what this node set up, on which device
 	GRPCSrv  *grpc.Server
 	Listener net.Listener
+	// portHold keeps Port reserved while the node is stopped (port_hold.go).
+	portHold func()
+	heldPort int // the port portHold holds
 	// peerConn caches a self-loopback client for scenario assertions
 	// that want to call this node's RPCs from the test thread.
 	selfConn *grpc.ClientConn
@@ -262,6 +272,10 @@ type Node struct {
 	// cluster is the fleet this node belongs to, so a node-scoped helper can
 	// reach cluster-wide state (the self client, the reachability overlay).
 	cluster *Cluster
+
+	// clockOffset is how far StepClock moved this node's wall clock
+	// (Options.ClockSeam), in nanoseconds.
+	clockOffset atomic.Int64
 
 	// repl is the node's Replicator (wired into the server for PushMutations;
 	// background loop not started — see buildServer).
@@ -459,7 +473,8 @@ func New(t *testing.T, opts Options) *Cluster {
 	// between tests — and, worse, every node in a cluster shared one tail, so
 	// node B's first audit row linked to node A's. The state now hangs off each
 	// Client and is keyed by host_name, which is correct by construction here.
-	c := &Cluster{t: t, tmpRoot: t.TempDir(), opts: opts, reach: newReachSet()}
+	c := &Cluster{t: t, tmpRoot: t.TempDir(), opts: opts, reach: newReachSet(),
+		dbPrefix: fmt.Sprintf("fleet-%d", clusterSeq.Add(1))}
 	if opts.RealGossip {
 		c.gossip = &gossipCut{byAddr: map[string]string{}, blocked: map[string]map[string]bool{}}
 	}
@@ -562,7 +577,7 @@ func New(t *testing.T, opts Options) *Cluster {
 	if opts.RealGossip && opts.Joiners == 0 {
 		// Nodes opened early dialled seeds that were not up yet; the later
 		// joins and the membership loop close the mesh.
-		c.WaitGossip(t, 20*time.Second, "the gossip mesh to form", c.GossipConverged)
+		c.WaitGossip(t, 20*time.Second*raceBudgetScale, "the gossip mesh to form", c.GossipConverged)
 	}
 	if opts.IndependentReplicas && opts.Joiners == 0 {
 		// crossRegisterHosts wrote every node's copy of every hosts row on
@@ -571,8 +586,9 @@ func New(t *testing.T, opts Options) *Cluster {
 		// hosts column before then outruns a peer's late seed INSERT, which
 		// loses the LWW gate on that node and leaves its one-second created_at
 		// apart for good; only anti-entropy, which the fleet does not run,
-		// would settle it. Joiners start apart on purpose.
-		c.WaitConverged(t, 20*time.Second)
+		// would settle it. Joiners start apart on purpose. The budget is
+		// raceBudgetScale times longer under the race detector.
+		c.WaitConverged(t, 20*time.Second*raceBudgetScale)
 	}
 	return c
 }
@@ -601,6 +617,7 @@ func (c *Cluster) Stop() {
 		if n.Listener != nil {
 			_ = n.Listener.Close()
 		}
+		n.releasePortHold()
 		if n.DB != nil {
 			n.DB.Close()
 		}
@@ -726,18 +743,37 @@ func (c *Cluster) mintHostCert(n *Node) {
 	}
 }
 
+// clusterSeq numbers the clusters this process builds (dbName).
+var clusterSeq atomic.Int64
+
+// dbName is the name of this cluster's shared in-memory database for suffix
+// (a node's name, "shared", a rebuilt node's): unique to the cluster, so a
+// database opened by name is never another cluster's. An in-memory database
+// outlives its Close while any connection to it is still open, and one can be:
+// a background loop of the test before, under load, still in a query when its
+// cluster closed the database. Under one process-wide name per node
+// ("fleet-node-0") the next test's node-0 then opened that database, holding
+// the earlier cluster's hosts rows, ports and certificate serials: it dialed
+// ports nobody listened on, refused every peer whose serial it did not hold,
+// and the cluster never converged (its schema init healed nothing, the
+// earlier test having already healed it).
+func (c *Cluster) dbName(suffix string) string { return c.dbPrefix + "-" + suffix }
+
 func (c *Cluster) openDB(n *Node, shared bool) {
 	var (
 		db  *corrosion.Client
 		err error
 	)
 	if shared {
-		db, err = corrosion.NewSharedTestClient("fleet-shared", n.Name)
+		db, err = corrosion.NewSharedTestClient(c.dbName("shared"), n.Name)
 	} else {
-		db, err = corrosion.NewSharedTestClient("fleet-"+n.Name, n.Name)
+		db, err = corrosion.NewSharedTestClient(c.dbName(n.Name), n.Name)
 	}
 	if err != nil {
 		c.t.Fatalf("open DB for %s: %v", n.Name, err)
+	}
+	if c.opts.ClockSeam {
+		db.SetWallClockForTests(n.Now)
 	}
 	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		c.t.Fatalf("InitSchema for %s: %v", n.Name, err)
@@ -931,6 +967,10 @@ func (c *Cluster) buildServer(n *Node) {
 	// (bridgeEnsure) is left alone; see NetProvFake.EnsureBridge.
 	n.Net = NewNetProvFake()
 	n.Server.SetNetworkProvisioner(n.Net)
+	n.Server.SetVTEPResolver(n.Net.ResolveVTEP)
+	// The node has no host bridges of its own unless a scenario gives it one
+	// (SetIsBridge), whatever links the machine running the test has.
+	n.Server.SetIsBridge(func(string) bool { return false })
 
 	// External IPAM: a REAL netbox.Client (token file and all) pointed at the
 	// scenario's fake server, plus the config kill-switch that lets this node
@@ -1246,6 +1286,14 @@ func regionFor(by []string, i int) string {
 	}
 	return "default"
 }
+
+// Now is n's wall clock: real time plus whatever StepClock added.
+func (n *Node) Now() time.Time { return time.Now().Add(time.Duration(n.clockOffset.Load())) }
+
+// StepClock moves n's wall clock by d from where it is (Options.ClockSeam
+// carries it to the node's row stamps and HLC; a coordinator must be given
+// Node.Now itself).
+func (n *Node) StepClock(d time.Duration) { n.clockOffset.Add(int64(d)) }
 
 // HLCClock returns a node's HLC. Used by scenarios that need to
 // fabricate mutation entries with deterministic timestamps.

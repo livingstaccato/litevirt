@@ -27,13 +27,37 @@ func TestHostStateToPB_NeverMasqueradesAsActive(t *testing.T) {
 		{"suspect", pb.HostState_HOST_SUSPECT},
 		{"offline", pb.HostState_HOST_OFFLINE},
 		{"joining", pb.HostState_HOST_JOINING},           // admitted, daemon not started: not offline
-		{"fenced", pb.HostState_HOST_OFFLINE},            // fenced ⇒ down, not active
-		{"upgrading", pb.HostState_HOST_DRAINING},        // transient, not steady-active
+		{"fenced", pb.HostState_HOST_FENCED},             // fenced ⇒ down, not active
+		{"upgrading", pb.HostState_HOST_UPGRADING},       // transient, not steady-active
 		{"some-future-state", pb.HostState_HOST_OFFLINE}, // fail safe: unknown ≠ active
 	}
 	for _, c := range cases {
 		if got := hostStateToPB(c.in); got != c.want {
 			t.Errorf("hostStateToPB(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// TestHostStateToPB_NamesTheRealState: `lv host ls` prints the enum's name,
+// so each stored state must map to the value named after it. An upgrading
+// host printed HOST_DRAINING and a fenced one HOST_OFFLINE, which sent
+// operators after a drain nobody started and a host that was only fenced.
+//
+// Mutation: map "upgrading" back to HOST_DRAINING, or "fenced" back to
+// HOST_OFFLINE — this goes red.
+func TestHostStateToPB_NamesTheRealState(t *testing.T) {
+	for stored, want := range map[string]string{
+		"active":      "HOST_ACTIVE",
+		"draining":    "HOST_DRAINING",
+		"maintenance": "HOST_MAINTENANCE",
+		"suspect":     "HOST_SUSPECT",
+		"offline":     "HOST_OFFLINE",
+		"joining":     "HOST_JOINING",
+		"upgrading":   "HOST_UPGRADING",
+		"fenced":      "HOST_FENCED",
+	} {
+		if got := hostStateToPB(stored).String(); got != want {
+			t.Errorf("host state %q prints as %s, want %s", stored, got, want)
 		}
 	}
 }
@@ -456,5 +480,34 @@ func TestListHosts_ReturnsLabels(t *testing.T) {
 	}
 	if len(got["node-1"]) != 0 {
 		t.Errorf("node-1 labels = %v, want none", got["node-1"])
+	}
+}
+
+// A removed host never resolves the held-line conditions it raised, so its
+// removal does; another host's stay as they are.
+func TestRemoveHost_ResolvesTheHostsHeldLineConditions(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	insertTestHost(t, ctx, s.db, "gone-host", "active")
+	raise := func(subject string) {
+		t.Helper()
+		if err := corrosion.UpsertHealthCondition(ctx, s.db, corrosion.HealthCondition{
+			Evaluator: "spec_conflict", Code: corrosion.SpecEditHeldCode, SubjectKind: "vm", SubjectID: subject,
+			Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityWarning,
+			Evidence: `{"vm":"vm1","operation":"op-1","owner":"n1"}`, ObserveCount: 2,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raise("vm1@gone-host")
+	raise("vm1@other-host")
+	if _, err := s.RemoveHost(ctx, &pb.RemoveHostRequest{Name: "gone-host"}); err != nil {
+		t.Fatalf("RemoveHost: %v", err)
+	}
+	for subject, want := range map[string]string{"vm1@gone-host": corrosion.ConditionResolved, "vm1@other-host": corrosion.ConditionConfirmed} {
+		row, found, err := corrosion.GetHealthCondition(ctx, s.db, "spec_conflict", corrosion.SpecEditHeldCode, "vm", subject)
+		if err != nil || !found || row.Lifecycle != want {
+			t.Errorf("%s: %+v found=%v err=%v; want %s", subject, row.Lifecycle, found, err, want)
+		}
 	}
 }

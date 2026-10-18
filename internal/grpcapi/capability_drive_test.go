@@ -103,6 +103,10 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// incarnation and seals the legacy key". A coordinator relies on every
 		// voter keeping that format.
 		capabilities.ClaimIncarnationV1: true,
+		// lease_term_claim_v1: "this build answers lease-term claims and
+		// claims every term it records". Every claimant relies on every other
+		// claiming.
+		capabilities.LeaseTermClaimV1: true,
 		// fence_state_v1: "this build resumes from an unverified fence
 		// recorded 'offline' and does not auto-activate such a host". The
 		// failover lease holder relies on whichever node holds it next.
@@ -111,6 +115,10 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// elects relays". Every node relies on every other electing the same
 		// relay set.
 		capabilities.RelayHealthV1: true,
+		// spec_conflict_v1: "this build decodes the epoch-carrying spec edit
+		// and resolves a conflict at one generation as anti-entropy does".
+		// Every replica must resolve one conflict the same way.
+		capabilities.SpecConflictV1: true,
 		// release_2026_11_v1, the release token: "this build decodes, keeps
 		// and honours every field and shape of its release". Nothing changes
 		// when it latches; a feature is opened only through WithFeature,

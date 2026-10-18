@@ -71,6 +71,14 @@ type FirewallRuleDef struct {
 	CIDR      string `yaml:"cidr,omitempty"`   // CIDR or "@ipset"
 	Action    string `yaml:"action,omitempty"` // "accept" | "drop" | "reject"
 	Comment   string `yaml:"comment,omitempty"`
+	// Macro names a rule macro (internal/firewall.Macros) in place of proto
+	// and port. The parser expands it into one ordinary row per macro row,
+	// so no later stage sees a macro.
+	Macro string `yaml:"macro,omitempty"`
+	// Priority is set by macro expansion, never read from YAML: every row of
+	// the rule at index i has (i+1)*10. Zero means the deployer numbers the
+	// row by its position.
+	Priority int `yaml:"-"`
 }
 
 // FirewallDefaultsDef sets cluster-tier rules and the default policy.
@@ -140,6 +148,25 @@ type NetworkDef struct {
 	// mixed-version cluster safe is the netbox_ipam_v1 latch, because an older
 	// node would otherwise allocate from the builtin allocator across the prefix.
 	NetBoxPrefixID int `yaml:"netbox-prefix-id"`
+}
+
+// HostIsolatedAddressable reports whether litevirt itself gives the
+// addresses of the network's guests that name none: a host-isolated network
+// runs no DHCP server on any host, so its guests are addressed through
+// cloud-init from the network's subnet. IPv4 subnets on the types litevirt
+// addresses; sriov and direct attach guests to hardware litevirt does not
+// address, and a NetBox-bound network's addresses are NetBox's.
+func (n NetworkDef) HostIsolatedAddressable() bool {
+	if !n.HostIsolation || n.Subnet == "" || n.NetBoxPrefixID != 0 {
+		return false
+	}
+	switch n.Type {
+	case "", "bridge", "vxlan", "isolated":
+	default:
+		return false
+	}
+	p, err := netip.ParsePrefix(strings.TrimSpace(n.Subnet))
+	return err == nil && p.Addr().Is4()
 }
 
 // LitevirtGateway is the address litevirt itself puts on the network's bridge
@@ -704,6 +731,34 @@ func ScopedNetworkName(stackName, netName string) string {
 		return netName
 	}
 	return stackName + "_" + netName
+}
+
+// DefaultNetworkInterfaces gives every network f declares (and does not mark
+// external) with no interface a device: kept[name] when the caller keeps one
+// (the device a deployed network is recorded on, so a default never moves it,
+// or a host bridge the network is named after). Otherwise a bridge network
+// (no type, or "bridge") gets its stack-scoped flat bridge name,
+// FlatBridgeName(ScopedNetworkName(f.Name, name)), and any other type its own
+// name as written in the file (for "direct" that is the host NIC macvtap
+// attaches to). A deploy calls it once, before anything provisions or
+// persists a network, so the entry node, every peer and the network row name
+// the same device, and two stacks that each declare a bridge network of the
+// same name are never on one bridge by default.
+func (f *File) DefaultNetworkInterfaces(kept map[string]string) {
+	for name, nd := range f.Networks {
+		if nd.External || nd.Interface != "" {
+			continue
+		}
+		switch {
+		case kept[name] != "":
+			nd.Interface = kept[name]
+		case nd.Type == "" || nd.Type == "bridge":
+			nd.Interface = FlatBridgeName(ScopedNetworkName(f.Name, name))
+		default:
+			nd.Interface = name
+		}
+		f.Networks[name] = nd
+	}
 }
 
 // ResolveNetworkName returns the cluster network record a workload NIC

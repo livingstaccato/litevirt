@@ -29,7 +29,7 @@ func TestLab_OnbootStartsAnOperatorStoppedVMOnlyAtHostBoot(t *testing.T) {
 	victim := l.leastLoaded(q, l.except(q))
 	stack := uniqueName("obh")
 	vm := stack + "-1"
-	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    onboot: true\n    placement:\n      host: %s\n",
+	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    firmware: bios\n    onboot: true\n    placement:\n      host: %s\n",
 		stack, vm, drillImage(), drillMemory(), victim)
 	file := "/tmp/" + stack + ".yaml"
 	l.putFile(q, file, yaml)

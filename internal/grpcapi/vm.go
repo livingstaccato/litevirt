@@ -6,12 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/litevirt/litevirt/internal/netutil"
 	"io/fs"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -74,6 +73,34 @@ func validateSpecNames(spec *pb.VMSpec) error {
 			return fmt.Errorf("disk %q: %w", d.Name, err)
 		}
 	}
+	// The stack name names the stack's LB, whose root-owned config files and
+	// notify script are named after it.
+	if spec.StackName != "" {
+		if err := safename.ValidateStackName(spec.StackName); err != nil {
+			return err
+		}
+	}
+	return validateLBSpec(spec.Loadbalancer)
+}
+
+// postCommitReconcileTimeout bounds the firewall pass a create runs once its
+// row has committed; the periodic pass applies the guards anyway.
+const postCommitReconcileTimeout = 30 * time.Second
+
+// validateSpecNICNetworks refuses a VM spec with two NICs on one network.
+// A VM's NIC record (vm_interfaces) is keyed by VM and network, so the
+// create's record of the second NIC collides with the first's. It is checked
+// before anything is created. A further NIC on a network the VM already has
+// is attached with lv attach-nic, which allows it once hardware_v2 is active.
+func validateSpecNICNetworks(spec *pb.VMSpec) error {
+	seen := make(map[string]int, len(spec.GetNetwork()))
+	for i, n := range spec.GetNetwork() {
+		if j, dup := seen[n.GetName()]; dup {
+			return fmt.Errorf("NICs %d and %d are both on network %q: a VM is created with at most one NIC per network "+
+				"(attach another with lv attach-nic once hardware_v2 is active)", j, i, n.GetName())
+		}
+		seen[n.GetName()] = i
+	}
 	return nil
 }
 
@@ -87,6 +114,10 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision *resolvedCreateVMDecision) (resp *pb.VM, retErr error) {
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
+	}
+	if h := s.createReturnedHook; h != nil {
+		name := req.GetSpec().GetName()
+		defer func() { h(name, retErr) }()
 	}
 	// A re-create forwarded here by the host that tears the VM down carries
 	// the VM's own installer ISO grant; only a peer host's is honoured.
@@ -112,6 +143,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	if err := validateSpecTuning(spec); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if err := validateSpecNICNetworks(spec); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	if err := s.RequirePerm(ctx, vmRBACPathFor(spec.Project, spec.Name), "vm.create", "operator"); err != nil {
@@ -203,6 +237,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			return nil, status.Error(codes.PermissionDenied,
 				"defining VM lifecycle hooks requires the admin role (hooks execute as root on the target host)")
 		}
+	}
+	if err := requireAdminForLBTLS(ctx, spec.Loadbalancer); err != nil {
+		return nil, err
 	}
 
 	// Check if VM already exists. A rebuild or recreate whose replica here has
@@ -409,6 +446,31 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err := s.firmwareMoveNameRefusal("create", spec.Name); err != nil {
 		return nil, err
 	}
+	// This host owns the create. A create that fails here is logged with its
+	// cause, and with what its cleanup did (undone, noted as each step runs),
+	// so the owner's log shows both and not only "creating VM" (lab 2, O5).
+	var undone []string
+	noteUndo := func(what string) { undone = append(undone, what) }
+	rowCommitted, keepHeld := false, false
+	// leftDefined: the abort stopped this create's domain but could not
+	// undefine it, so a domain of the name still names the disk paths.
+	leftDefined := false
+	defer func() {
+		switch {
+		case retErr == nil:
+		case rowCommitted:
+			slog.Warn("vm create: the VM was created, and the create still failed after that; nothing is undone",
+				"name", spec.Name, "host", s.hostName, "error", retErr)
+		default:
+			slog.Warn("vm create failed", "name", spec.Name, "host", s.hostName, "cause", retErr)
+			result := "nothing to undo"
+			if len(undone) > 0 {
+				result = strings.Join(undone, "; ")
+			}
+			slog.Warn("vm create: cleanup after the failed create", "name", spec.Name, "host", s.hostName,
+				"result", result, "left_held", keepHeld)
+		}
+	}()
 	// Stable domain identity (G1): persisted in the spec so libvirt's default
 	// swtpm path (/var/lib/libvirt/swtpm/<uuid>/) is deterministic across the VM's
 	// life — letting vTPM state be located + carried without an explicit <source>.
@@ -419,8 +481,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// keyed by it (never by the name, which a deleted namesake may have used),
 	// and removed again if the create fails.
 	spec.Uuid = uuid.NewString()
+	// rowCommitted is set once the VM row has committed: from then on the VM
+	// exists and runs, and a later failure (reading it back, a step after it,
+	// a caller that stopped waiting) undoes nothing — no deferred cleanup
+	// below acts once it is set. keepHeld is set when the create failed with
+	// its domain still running: what that guest uses stays held. (Both are
+	// declared above, with the failure log that reads them.)
 	defer func() {
-		if retErr != nil {
+		if retErr != nil && !rowCommitted {
 			s.forgetISOIdentity(isoIdentityKey(spec.Name, spec))
 		}
 	}()
@@ -545,28 +613,47 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			createdSeed, createdSeedFile = path, fi
 		}
 	}
-	cleanupDisks := func() {
-		if createdSeed != "" {
-			if fi, err := os.Stat(createdSeed); err == nil && os.SameFile(fi, createdSeedFile) {
-				if rmErr := os.Remove(createdSeed); rmErr != nil && !os.IsNotExist(rmErr) {
-					slog.Warn("cleanup: failed to remove cloud-init seed", "path", createdSeed, "error", rmErr)
-				}
-			}
+	// removeSeed removes the seed this create placed, if it is still the
+	// file at that name.
+	removeSeed := func() {
+		if createdSeed == "" {
+			return
 		}
+		fi, err := os.Stat(createdSeed)
+		if err != nil || !os.SameFile(fi, createdSeedFile) {
+			noteUndo("seed " + createdSeed + " left: it is no longer the file this create placed")
+			return
+		}
+		if rmErr := cloudinit.RemoveSeed(createdSeed); rmErr != nil {
+			slog.Warn("cleanup: failed to remove cloud-init seed", "path", createdSeed, "error", rmErr)
+			noteUndo(fmt.Sprintf("seed %s not removed (%v)", createdSeed, rmErr))
+			return
+		}
+		noteUndo("removed seed " + createdSeed)
+	}
+	cleanupDisks := func() {
+		removeSeed()
 		for _, p := range createdDiskPaths {
 			if drv := createdBy[p]; drv != nil {
 				// The request may be what failed (cancelled, timed out); the
 				// image this create made is removed regardless.
 				rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
-				if rmErr := drv.DeleteDisk(rmCtx, p); rmErr != nil {
-					slog.Warn("cleanup: failed to remove disk", "path", p, "error", rmErr)
-				}
+				rmErr := drv.DeleteDisk(rmCtx, p)
 				cancel()
+				if rmErr != nil {
+					slog.Warn("cleanup: failed to remove disk", "path", p, "error", rmErr)
+					noteUndo(fmt.Sprintf("disk %s not removed (%v)", p, rmErr))
+					continue
+				}
+				noteUndo("removed disk " + p)
 				continue
 			}
 			if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
 				slog.Warn("cleanup: failed to remove disk", "path", p, "error", rmErr)
+				noteUndo(fmt.Sprintf("disk %s not removed (%v)", p, rmErr))
+				continue
 			}
+			noteUndo("removed disk " + p)
 		}
 	}
 
@@ -586,17 +673,56 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		s.virt.UndefineDomain(spec.Name, true)
 	}
 
-	// Clean up any orphaned disk files / cloud-init ISO left from a previous
-	// incomplete delete, even if the libvirt domain is already gone.
-	s.sweepVMDiskDebris(ctx, spec.Name)
-	os.Remove(lv.CloudInitISOPath(s.dataDir, spec.Name))
-
+	// The refusals the create would meet later that do not depend on what it
+	// makes, met before it moves a disk or seed a deleted VM of the name was
+	// kept with: a create refused for them leaves those where they are. After
+	// the orphan sweep above, which can remove a leftover domain's vars.
+	if err := s.firmwarePreflight(spec); err != nil {
+		return nil, err
+	}
+	// USB passthrough, resolved on this (the owning) host: a mapping's row
+	// for it, a bus-port read from its sysfs. A device it cannot resolve
+	// refuses the create rather than defining a VM without it.
+	usbDevs, usbErr := s.resolveUSBHostdevs(ctx, spec)
+	if usbErr != nil {
+		return nil, usbErr
+	}
 	// Auto-pull image from a peer if not available locally.
 	if spec.Image != "" && !s.images.ImageExists(spec.Image) {
 		if err := s.autoPullImage(ctx, spec.Image); err != nil {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"image %q not available locally and auto-pull failed: %v", spec.Image, err)
 		}
+	}
+
+	// Clean up any orphaned disk files / cloud-init ISO left from a previous
+	// incomplete delete, even if the libvirt domain is already gone. A disk
+	// a deleted VM of this name was kept with, or that a failover left here,
+	// is moved off its path first (clearDiskDebrisBeforeCreate), and so is
+	// the kept VM's seed (setAsideKeptSeed). A create that fails puts them
+	// back (create_kept.go).
+	setAt := time.Now()
+	moved, debrisErr := s.clearDiskDebrisBeforeCreate(ctx, spec.Name, setAt)
+	var seedKept keptSeed
+	defer func() {
+		switch {
+		case retErr == nil || rowCommitted || keepHeld:
+		case leftDefined:
+			// A kept disk linked back would be the disk of that domain's
+			// definition: it stays at its .kept- name.
+			if len(moved) > 0 || seedKept.to != "" {
+				noteUndo("kept disks and seed left at their .kept- names: the domain is still defined")
+			}
+		default:
+			s.restoreKeptAfterFailedCreate(context.WithoutCancel(ctx), spec.Name, moved, seedKept, noteUndo)
+		}
+	}()
+	if debrisErr != nil {
+		return nil, status.Errorf(codes.Unavailable, "create %s refused on %s: %v; nothing was created", spec.Name, s.hostName, debrisErr)
+	}
+	keptDisks := slices.ContainsFunc(moved, func(m health.MovedBeforeCreate) bool { return m.Kept })
+	if seedKept, err = s.setAsideKeptSeed(ctx, spec.Name, keptDisks, setAt); err != nil {
+		return nil, status.Errorf(codes.Unavailable, "create %s refused on %s: %v; nothing was created", spec.Name, s.hostName, err)
 	}
 
 	for i, d := range spec.Disks {
@@ -825,12 +951,41 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	var ifaceRecords []corrosion.InterfaceRecord
 	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
 	var guardRecords []corrosion.NICGuardRecord
-	dhcpReserved := map[int]bool{} // NIC index → address is a DHCP reservation, not a static one
+	boundNIC := map[int]bool{} // NIC index → address is a NetBox claim
+	// Host-isolated picks of this create: in flight until it returns, by
+	// which time its rows hold them or it failed (review m-4).
+	var isoPicks []isoPick
+	defer func() {
+		if !keepHeld {
+			s.releaseHostIsolatedPicks(isoPicks)
+		}
+	}()
+	// The VIPs this VM's own load balancer and its stack's will take
+	// (review I-2, R1-m2): their LB rows are written after the stack's VMs.
+	// Read only for a create that makes a host-isolated pick.
+	var specVIPs []string
+	specVIPsRead := false
+	pickVIPs := func() []string {
+		if !specVIPsRead {
+			specVIPsRead = true
+			specVIPs = s.stackVIPs(ctx, spec.GetStackName())
+			if lb := spec.GetLoadbalancer(); lb != nil && lb.GetVip() != "" {
+				specVIPs = append(specVIPs, lb.GetVip())
+			}
+		}
+		return specVIPs
+	}
 
 	// External-IPAM claims taken for this create. A NetBox claim is a synchronous
 	// REMOTE side-effect: it cannot join the local atomic write, so every failure
 	// path from here to the end of CreateVM compensates it explicitly.
-	claims := &claimSet{srv: s}
+	claims := &claimSet{srv: s, report: func(released, failed int) {
+		if failed > 0 {
+			noteUndo(fmt.Sprintf("released %d address claims, %d left to the orphan sweep", released, failed))
+			return
+		}
+		noteUndo(fmt.Sprintf("released %d address claims", released))
+	}}
 
 	// The cluster fingerprint is read at most ONCE, and only if some NIC is
 	// actually on a bound network. A VM on unbound networks must not gain a DB
@@ -972,6 +1127,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				return nil, status.Errorf(codes.FailedPrecondition, "claim address from NetBox: %v", cerr)
 			}
 			nicIP = res.IP
+			boundNIC[i] = true
 			claims.add(claimedAddr{
 				Network: n.Name, IP: res.IP, MAC: mac,
 				OwnerKind: "vm", OwnerHost: "", Name: spec.Name,
@@ -995,8 +1151,23 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				cleanupDisks()
 				return nil, status.Errorf(codes.ResourceExhausted, "reserve a DHCP address on %q: %v", n.Name, rerr)
 			default:
+				// A reservation, not a static address: the NIC still asks
+				// DHCP (cloudinit.NetworkConfig reads a recorded address as
+				// static only on a bound or host-isolated network).
 				nicIP = ip
-				dhcpReserved[i] = true
+			}
+		} else if def, _ := lookupNetworkDef(ctx, s.db, n.Name); n.Ip == "" && cloudinit.HostIsolatedAddressable(def) {
+			// A host-isolated network runs no DHCP server, so the address is
+			// litevirt's to give: recorded on the NIC row here, delivered to
+			// the guest by the seed's network-config below (docs/compose.md,
+			// "Host isolation"). A NIC that cannot be given one is created as
+			// it always was, with no address, rather than refused.
+			if ip, ierr := s.hostIsolatedAddress(ctx, n.Name, def, pickVIPs()); ierr != nil {
+				slog.Warn("host-isolated network: no address for the NIC; the guest gets none",
+					"vm", spec.Name, "network", n.Name, "error", ierr)
+			} else {
+				nicIP = ip
+				isoPicks = append(isoPicks, isoPick{network: n.Name, ip: ip})
 			}
 		}
 
@@ -1038,78 +1209,34 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// the first reconcile that sees the VM's row and its running tap, which
 	// this create triggers right after the row is written; until then the
 	// guest runs unguarded, as it does for the first seconds after any start
-	// or migration. A create that fails after this leaves records behind,
-	// which is harmless: they are keyed by VM name and MAC, and a NIC created
-	// under the same pair writes its own first.
+	// or migration. A create that fails from here on retires the records it
+	// wrote (those of its own incarnation only), so none outlives it.
+	defer func() {
+		if retErr != nil && !rowCommitted && !keepHeld {
+			s.retireFailedCreateGuards(ctx, spec.Name, spec.Uuid, guardRecords)
+		}
+	}()
 	if err := s.writeNewNICGuards(ctx, guardRecords); err != nil {
 		claims.releaseAll(ctx)
 		cleanupDisks()
 		return nil, err
 	}
 
-	// Build cloud-init network-config for interfaces with static IPs.
-	// Applies to any network type (bridge, vxlan, isolated) where the compose
-	// specifies an explicit IP. Uses V1 format for distro-agnostic MAC matching.
-	var staticNetCfg string
-	var staticIfaces []isolatedIface
+	// Build the seed's cloud-init network-config from the facts every later
+	// rebuild of the seed reads too (cloudinit.SeedNetworkConfig): the spec's
+	// NIC entries, the address each NIC row records, its network.
+	nicInputs := make([]cloudinit.NIC, 0, len(spec.Network))
 	for i, n := range spec.Network {
 		netDef, _ := lookupNetworkDef(ctx, s.db, n.Name)
-		ip := n.Ip
-		if ip == "" && i < len(ifaceRecords) && !dhcpReserved[i] {
-			ip = ifaceRecords[i].IP
-		}
-
-		// Skip interfaces without a static IP unless host-isolated (which
-		// always needs cloud-init config to avoid DHCP).
-		if ip == "" {
-			continue
-		}
-		needsConfig := ip != "" // explicit static IP in compose
-		if netDef != nil && netDef.HostIsolation {
-			needsConfig = true
-		}
-		if !needsConfig {
-			continue
-		}
-
-		// Determine subnet prefix and gateway from network def or attachment.
-		address, gateway := staticIfaceGatewayAddress(ip, n.Gateway, netDef)
-		var dnsServers []string
-		if netDef != nil {
-			dnsServers = netDef.DNS
-		}
-		if len(dnsServers) == 0 {
-			dnsServers = []string{"1.1.1.1", "8.8.8.8"}
-		}
-		mac := ""
+		in := cloudinit.NIC{Ordinal: i, Net: netDef, Bound: boundNIC[i],
+			IP: n.Ip, Gateway: n.Gateway, IPv6: n.Ipv6, IPv6Gateway: n.Ipv6Gateway}
 		if i < len(ifaceRecords) {
-			mac = ifaceRecords[i].MAC
+			in.MAC = ifaceRecords[i].MAC
+			in.RecordedIP = ifaceRecords[i].IP
 		}
-
-		// IPv6 handling: a NIC can carry an explicit `ipv6:` (with
-		// optional `ipv6-gateway:`); when omitted we fall through to
-		// SLAAC / RA, which dnsmasq emits when the network's subnet
-		// is IPv6. Static v6 assignment is rare but useful for
-		// well-known endpoints (DNS, mail) where SLAAC's privacy
-		// extensions are inconvenient.
-		address6 := n.Ipv6
-		gateway6 := n.Ipv6Gateway
-		if address6 != "" && !strings.Contains(address6, "/") {
-			address6 = address6 + "/64"
-		}
-
-		staticIfaces = append(staticIfaces, isolatedIface{
-			MAC:      mac,
-			Address:  address,
-			Gateway:  gateway,
-			DNS:      dnsServers,
-			Address6: address6,
-			Gateway6: gateway6,
-		})
+		nicInputs = append(nicInputs, in)
 	}
-	if len(staticIfaces) > 0 {
-		staticNetCfg = buildIsolatedNetworkConfig(staticIfaces)
-	}
+	staticNetCfg := cloudinit.NetworkConfig(nicInputs)
 
 	// Generate cloud-init ISO if this is a cloud image
 	var cloudInitISO string
@@ -1128,6 +1255,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			LocalHostname: spec.Name,
 			UserData:      userData,
 			NetworkConfig: netCfg,
+			VendorData:    cloudinit.SeedVendorData(spec, netCfg),
 		}, isoPath)
 		if err != nil {
 			claims.releaseAll(ctx)
@@ -1144,6 +1272,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			LocalHostname: spec.Name,
 			UserData:      "#cloud-config\n{}\n",
 			NetworkConfig: staticNetCfg,
+			VendorData:    cloudinit.SeedVendorData(nil, staticNetCfg),
 		}, isoPath)
 		if err != nil {
 			slog.Warn("failed to generate cloud-init ISO", "error", err)
@@ -1154,24 +1283,34 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 	}
 
+	// The seed is this VM's (cloudinit/seed_owner.go): a host that later finds
+	// it reuses it for this VM only.
+	if cloudInitISO != "" {
+		if err := cloudinit.StampSeed(cloudInitISO, spec.Uuid); err != nil {
+			slog.Warn("create: could not stamp the cloud-init seed with its VM; a later start writes it again",
+				"vm", spec.Name, "error", err)
+		}
+	}
+
 	// Generate libvirt domain XML from the shared builder (identical field mapping to
 	// a redefine — see baseDomainConfig). Cloud-init ISO is a create-time artifact set
 	// here, not in the shared builder.
 	vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, nil)
 	vmCfg.CloudInitISO = cloudInitISO
-	// USB passthrough, resolved on this (the owning) host: a mapping's row for
-	// it, a bus-port read from its sysfs. A device it cannot resolve refuses
-	// the create rather than defining a VM without it.
-	if usb, uerr := s.resolveUSBHostdevs(ctx, spec); uerr != nil {
-		claims.releaseAll(ctx)
-		cleanupDisks()
-		return nil, uerr
-	} else {
-		vmCfg.USBHostdevs = usb
-	}
+	vmCfg.USBHostdevs = usbDevs // resolved before anything was made
 	// Secure Boot + vTPM (G1). Use the host-resolved firmware paths and pin per-VM
 	// nvram + swtpm state under dataDir so they travel across the lifecycle. Refuse
 	// to silently adopt firmware state left by a prior `delete --keep-disks`.
+	//
+	// A failed create removes only firmware state it made. The swtpm tree of
+	// its own, fresh uuid is always its own. UEFI vars are written by libvirt
+	// at the first start, so only a create that started its own domain can
+	// have made vars, and only the abort of that domain removes them, and only
+	// when none were at that path before (abortDefined). Vars or a
+	// retained-firmware marker a `delete --keep-disks` left under the name are
+	// never its to remove.
+	_, statErr := os.Lstat(s.fw().NvramPath(spec.Name))
+	nvramBefore := !errors.Is(statErr, fs.ErrNotExist)
 	if err := s.applyFirmwareConfig(&vmCfg, spec); err != nil {
 		claims.releaseAll(ctx)
 		cleanupDisks()
@@ -1189,6 +1328,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		// Clear the durable device lease once create returns; a crash before the
 		// VM row is finalized leaves it for startup recovery to roll back.
+		// Cleared on every return, a failed create's too: the device stays
+		// owned and bound under the name, and a lease left behind would have
+		// startup recovery unbind it from a guest that could not be stopped.
 		defer devFinish()
 		for _, addr := range pciAddrs {
 			vmCfg.Hostdevs = append(vmCfg.Hostdevs, lv.HostdevConfig{Address: addr})
@@ -1247,7 +1389,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err := gs.refusal(spec); err != nil {
 		claims.releaseAll(ctx)
 		cleanupDisks()
-		s.fw().WipeFirmwareState(spec.Name, spec.Uuid)
+		s.fw().WipeFirmwareStateByUUID(spec.Uuid)
 		return nil, status.Errorf(codes.Internal, "vm create: %v", err)
 	}
 
@@ -1261,10 +1403,121 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		claims.releaseAll(ctx)
 		cleanupDisks()
-		s.fw().WipeFirmwareState(spec.Name, spec.Uuid) // no orphan nvram/swtpm (G1)
+		s.fw().WipeFirmwareStateByUUID(spec.Uuid) // no orphan swtpm (G1); no vars exist before a start
 		return nil, status.Errorf(codes.Internal, "define domain: %v", err)
 	}
 	s.ensureSparePCIeRootPorts(spec.Name)
+
+	// The vars file libvirt keeps for the domain (filled into its definition
+	// at the define), and whether something was there before this create's
+	// start: a failed create removes vars only when it made them.
+	domainVars, domainVarsBefore := "", true
+	if x, xerr := s.virt.DumpXMLInactive(spec.Name); xerr == nil {
+		if p := lv.NvramPathFromXML(x); p != "" {
+			_, verr := os.Lstat(p)
+			domainVars, domainVarsBefore = p, !errors.Is(verr, fs.ErrNotExist)
+		}
+	}
+
+	// abortDefined undoes this create once its domain is defined (and perhaps
+	// running) and the create cannot finish: a domain with no VM row is a copy
+	// of the VM that no command of litevirt sees. It stops and undefines the
+	// domain, keeping its firmware state, then removes the disks, seed and
+	// firmware state this create made and gives back its address claims (its
+	// guard records go in the deferred retire above).
+	//
+	// It acts only on the domain this create defined, told by its uuid: a
+	// concurrent create of the name may have replaced it, and then neither
+	// that domain nor the disks at this create's paths are this create's to
+	// remove. A domain still running after the stop, or one whose definition
+	// cannot be read or names no uuid, is left as it is with its disks,
+	// claims, LUNs and host-isolated addresses, and reported: removing them
+	// under a running guest is worse, and the next create of the name removes
+	// a leftover domain first. A domain gone by then is gone: its claims and
+	// swtpm tree are released, the disks are left (whatever removed the domain
+	// may have created at their paths since). Its seed is removed if it is
+	// still the file this create placed.
+	//
+	// The domain is undefined only after the disks, seed and vars at its
+	// name's paths are removed: while a domain of the name is defined, a
+	// concurrent create of the name cannot define its own, so it has not made
+	// files at those paths for this abort to remove (re-review N8).
+	abortDefined := func(cause error) error {
+		gone := func(why string) error {
+			slog.Error("vm create: the create failed and the domain of its name is not one it can undo; disks left as they are",
+				"name", spec.Name, "host", s.hostName, "why", why, "cause", cause)
+			noteUndo("domain not undone: " + why + "; disks left as they are")
+			claims.releaseAll(ctx)
+			removeSeed()
+			s.fw().WipeFirmwareStateByUUID(spec.Uuid)
+			return fmt.Errorf("%w; %s, so the disks at this create's paths were not touched", cause, why)
+		}
+		if !s.virt.DomainExists(spec.Name) {
+			return gone(fmt.Sprintf("domain %s no longer exists on %s", spec.Name, s.hostName))
+		}
+		x, xerr := s.virt.DumpXMLInactive(spec.Name)
+		if xerr != nil && lv.IsNotFound(xerr) && !s.virt.DomainExists(spec.Name) {
+			return gone(fmt.Sprintf("domain %s no longer exists on %s", spec.Name, s.hostName))
+		}
+		u := domainUUIDFromXML(x)
+		if xerr != nil || u == "" {
+			if xerr == nil {
+				xerr = errors.New("it names no uuid")
+			}
+			keepHeld, lunHold.committed = true, true
+			slog.Error("vm create: the create failed and its domain's definition cannot be read; it is left as it is",
+				"name", spec.Name, "host", s.hostName, "cause", cause, "error", xerr)
+			noteUndo(fmt.Sprintf("domain left as it is, with its disks: its definition could not be read (%v)", xerr))
+			return fmt.Errorf("%w; the definition of domain %s on %s could not be read (%v), so it is left as it is, "+
+				"with its disks and no VM record: the next create of %s removes it", cause, spec.Name, s.hostName, xerr, spec.Name)
+		}
+		if u != spec.Uuid {
+			return gone(fmt.Sprintf("domain %s on %s is no longer the one this create defined (uuid %s)", spec.Name, s.hostName, u))
+		}
+		if active, aerr := s.virt.DomainIsActive(spec.Name); aerr != nil || active {
+			derr := s.virt.DestroyDomain(spec.Name)
+			if still, serr := s.virt.DomainIsActive(spec.Name); derr != nil && (serr != nil || still) {
+				keepHeld, lunHold.committed = true, true
+				slog.Error("vm create: the create failed and its domain could not be stopped; it is left defined, with its disks",
+					"name", spec.Name, "host", s.hostName, "cause", cause, "error", derr)
+				noteUndo(fmt.Sprintf("domain left defined and running, with its disks: it could not be stopped (%v)", derr))
+				return fmt.Errorf("%w; its domain could not be stopped on %s (%v) and is left defined with its disks, "+
+					"with no VM record: the next create of %s removes it", cause, s.hostName, derr, spec.Name)
+			}
+		}
+		noteUndo("domain stopped")
+		// While the stopped domain is still defined: the disks and seed
+		// this create made, and the vars its start made, at the domain's
+		// path and at the name-keyed path a Secure Boot or vTPM domain uses.
+		cleanupDisks()
+		removeVars := func(p string) {
+			if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				noteUndo(fmt.Sprintf("vars %s not removed (%v)", p, err))
+			} else if err == nil {
+				noteUndo("removed vars " + p)
+			}
+		}
+		if domainVars != "" && !domainVarsBefore {
+			removeVars(domainVars)
+		}
+		if !nvramBefore {
+			removeVars(s.fw().NvramPath(spec.Name))
+		}
+		// Preserving: vars at the domain's path may be ones a
+		// `delete --keep-disks` kept; this create's own went above.
+		if uerr := s.virt.UndefineDomainPreservingState(spec.Name); uerr != nil {
+			slog.Warn("vm create: undefine after a failed create failed", "name", spec.Name, "error", uerr)
+			noteUndo(fmt.Sprintf("domain left defined: it could not be undefined (%v)", uerr))
+			leftDefined = true
+			cause = fmt.Errorf("%w; its domain is stopped but could not be undefined on %s (%v) and is left defined, "+
+				"with no VM record: the next create of %s removes it", cause, s.hostName, uerr, spec.Name)
+		} else {
+			noteUndo("domain undefined, firmware state kept")
+		}
+		claims.releaseAll(ctx)
+		s.fw().WipeFirmwareStateByUUID(spec.Uuid) // no orphan swtpm (G1)
+		return cause
+	}
 
 	// The NIC rows are written once the domain runs; until then the firewall
 	// renders the NICs from here, so their guards are in force when the
@@ -1278,13 +1531,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 	}
 	defer s.pendingNICs(spec.Name, spec.Uuid, ifaceRecords, trunks)()
+	// Its start is this incarnation's: the before-start hook demands this
+	// create's guards, not records an earlier one of the name left.
+	defer s.noteCreatingIncarnation(spec.Name, spec.Uuid)()
 
 	if err := s.virt.StartDomain(spec.Name); err != nil {
-		s.virt.UndefineDomain(spec.Name, false)
-		claims.releaseAll(ctx)
-		cleanupDisks()
-		s.fw().WipeFirmwareState(spec.Name, spec.Uuid) // failed first boot must not strand TPM/NVRAM (G1)
-		return nil, status.Errorf(codes.Internal, "start domain: %v", err)
+		// A failed first boot must not strand the domain, disks or TPM/NVRAM (G1).
+		return nil, status.Errorf(codes.Internal, "%v", abortDefined(fmt.Errorf("start domain: %w", err)))
 	}
 
 	// Configure VLAN tags on tap interfaces for any networks that need it.
@@ -1358,6 +1611,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		CPUActual: int(spec.Cpu),
 		MemActual: int(spec.MemoryMib),
 		Project:   project, // tenancy label
+		// A re-create keeps the firewall identity of the row its own delete
+		// tombstoned; any other create stores none, whatever its spec says.
+		FirewallCarry: replacedFirewallCarry(ctx, spec.Name),
 	}
 
 	// FENCE, immediately before the durable write: if project-quota authority moved
@@ -1370,57 +1626,44 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// without the explicit wipe (and cleanupDisks) an aborted create strands
 	// exactly the orphans the start-failure path above already cleans.
 	if ferr := createLease.allowCommit(ctx); ferr != nil {
-		if derr := s.virt.DestroyDomain(spec.Name); derr != nil {
-			slog.Warn("vm create: teardown after an aborted admission also failed",
-				"name", spec.Name, "error", derr)
+		if aerr := abortDefined(ferr); aerr != ferr {
+			return nil, status.Errorf(status.Code(ferr), "%v", aerr)
 		}
-		_ = s.virt.UndefineDomain(spec.Name, false)
-		claims.releaseAll(ctx)
-		cleanupDisks()
-		s.fw().WipeFirmwareState(spec.Name, spec.Uuid)
 		return nil, ferr
 	}
 	// The grants were checked before the define (gs.refusal above).
 	if err := s.insertVMWithGrants(ctx, spec, gs, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
-		// Scoped to creates that took an EXTERNAL-IPAM claim, so every existing
-		// deployment keeps today's behaviour exactly. With a claim in play, a
-		// running VM with no row is the one state that lets the orphan sweeper
-		// release a LIVE guest's address: the address carries our identity, and
-		// the proof the sweeper reclaims on is that no VM row anywhere in the
-		// cluster references it. Nothing later re-creates the row, so the only
-		// fail-closed answer is to undo the create — teardown, disks, firmware
-		// state, and the claims themselves, matching the admission fence above.
-		// The same for a create that took an iSCSI LUN: a guest left running on
-		// the LUN with no row is one no claim can see (review N-2). And for a
-		// grant the writer refused: it refuses before writing anything, so no
-		// row can exist, and the check before the define makes it unreachable
-		// unless the spec's needs changed since.
-		if !claims.empty() || len(keepLUNs) > 0 || len(lunHold.own) > 0 || errors.Is(err, capabilities.ErrNoFeatureGrant) {
-			slog.Error("vm create: row persistence failed after an address or LUN claim, or for a refused grant — aborting",
-				"name", spec.Name, "error", err)
-			if derr := s.virt.DestroyDomain(spec.Name); derr != nil {
-				slog.Warn("vm create: teardown after failed persistence also failed",
-					"name", spec.Name, "error", derr)
-			}
-			_ = s.virt.UndefineDomain(spec.Name, false)
-			cleanupDisks()
-			s.fw().WipeFirmwareState(spec.Name, spec.Uuid)
-			claims.releaseAll(ctx)
-			return nil, status.Errorf(codes.Internal, "persist VM state: %v", err)
+		// No row was written (the insert is one transaction), so the running
+		// domain is a copy of the VM nothing records: litevirt neither lists,
+		// stops nor deletes it, and with an address or LUN claim the orphan
+		// sweep would reclaim the address of a live guest. The create is
+		// undone — domain, disks, seed, firmware state, claims and guard
+		// records — and fails.
+		slog.Error("vm create: the VM record could not be written; undoing the create",
+			"name", spec.Name, "error", err)
+		return nil, status.Errorf(codes.Internal, "%v", abortDefined(fmt.Errorf("persist VM state: %w", err)))
+	}
+	lunHold.committed = true
+	rowCommitted = true
+	// The VM exists from here: nothing after this depends on the caller still
+	// waiting, and nothing after this is undone (rowCommitted).
+	ctx = context.WithoutCancel(ctx)
+	if h := s.createCommittedHook; h != nil {
+		if herr := h(spec.Name); herr != nil {
+			st := status.Convert(herr)
+			return nil, status.Errorf(st.Code(), "VM %q was created on %s and runs, but %s", spec.Name, s.hostName, st.Message())
 		}
-		slog.Error("failed to write VM to corrosion", "error", err)
-		// VM is running, but state may not be synced — log and continue
-	} else {
-		lunHold.committed = true
-		// Guarded on the insert having landed: with no row there is nothing to
-		// graduate or publish. The invariant it maintains lives on
-		// assignOwnerEpochAtCreate; do not restate it here, or the two copies drift.
-		s.assignOwnerEpochAtCreate(ctx, spec.Name, true)
-		// The guards apply from the first reconcile that sees the VM's row;
-		// run it now rather than on the next tick.
-		if len(guardRecords) > 0 {
-			s.reconcileLocal(ctx)
-		}
+	}
+	// After the insert has landed: with no row there is nothing to graduate or
+	// publish. The invariant it maintains lives on assignOwnerEpochAtCreate; do
+	// not restate it here, or the two copies drift.
+	s.assignOwnerEpochAtCreate(ctx, spec.Name, true)
+	// The guards apply from the first reconcile that sees the VM's row;
+	// run it now rather than on the next tick.
+	if len(guardRecords) > 0 {
+		rctx, cancel := context.WithTimeout(ctx, postCommitReconcileTimeout)
+		s.reconcileLocal(rctx)
+		cancel()
 	}
 
 	slog.Info("VM created successfully", "name", spec.Name, "host", s.hostName)
@@ -1439,7 +1682,22 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	stubVM.State = pb.VMState_VM_RUNNING
 	hooks.Run(ctx, hooks.PostStart, stubVM, spec.Hooks)
 
-	return s.vmToProto(ctx, spec.Name)
+	out, rerr := s.vmToProto(ctx, spec.Name)
+	switch {
+	case status.Code(rerr) == codes.NotFound:
+		// Its record went after the commit (a delete, or a create of the name
+		// elsewhere that won): it is not reported as existing.
+		return nil, status.Errorf(codes.NotFound, "VM %q was created on %s but its record is gone: %v",
+			spec.Name, s.hostName, rerr)
+	case rerr != nil:
+		// The VM was created; a read of it back failing does not change that.
+		// Its state is not known here (the publish may have left it creating).
+		slog.Warn("vm create: the created VM could not be read back; answering with what the create knows",
+			"name", spec.Name, "error", rerr)
+		return &pb.VM{Name: spec.Name, StackName: spec.StackName, HostName: s.hostName, State: pb.VMState_VM_UNKNOWN,
+			CpuActual: int32(spec.Cpu), MemActualMib: int32(spec.MemoryMib)}, nil
+	}
+	return out, nil
 }
 
 // assignOwnerEpochAtCreate finishes a freshly inserted VM row: it assigns the
@@ -1886,6 +2144,9 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	}
 	// The reservation must outlive startVMLocked's state write.
 	held.hold(func() { lease.release(ctx) })
+	// A guard record an earlier build left for a NIC the VM no longer has
+	// would refuse the start guard: retire it under the lock first.
+	s.retireOrphanNICGuards(ctx, vm.Name, "")
 	if rearmed, err := s.restartCancelledStartLocked(ctx, vm); err != nil {
 		return nil, err
 	} else if rearmed {
@@ -2101,7 +2362,8 @@ func (s *Server) hardwareAdoptionRefused(ctx context.Context, vmName string) err
 // whatever the latch, a start whose cutover runtime handoff is still owed on this host
 // (VMReplaceHandoffPending, one DB read) is refused as retryable Unavailable, and the
 // start checks below the hardware ones (installer ISO, disk chains and image bases,
-// USB passthrough, iSCSI sessions, NFS mounts) run.
+// USB passthrough, iSCSI sessions, NFS mounts) run, and a stale cloud-init seed here is
+// rebuilt again (retryStaleSeedForStart), never refusing the start.
 //
 // When latched it (1) applies the adoption gate — a "blocked" VM (hardware failed its
 // per-VM compatibility audit on this host) must not (re)start until the operator repairs
@@ -2209,6 +2471,11 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 			releasePreflight = release
 		}
 	}
+	// A seed here whose last rebuild failed (its stale mark) is tried again
+	// before the domain boots on it, on every start path, once nothing above
+	// refuses the start. Never a refusal: a rebuild that fails again leaves
+	// the seed as it is and warns again, and the VM starts on it.
+	s.retryStaleSeedForStart(ctx, vm)
 	return releasePreflight, nil
 }
 
@@ -2234,6 +2501,9 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 	if err := s.rejudgeSharedDisksForStart(ctx, vm); err != nil {
 		return nil, err
 	}
+	// A NIC whose network moved to another device since the domain was
+	// defined starts on the network's device now.
+	s.followNetworkDevices(ctx, vm.Name)
 	// Adoption gate + PCI start-preflight (shared with the automated restart paths).
 	// No-op pre-latch, so every start behaves byte-for-behavior as before until
 	// hardware_v2 latches.
@@ -2731,12 +3001,83 @@ func (s *Server) checkNoRemotePCIOwner(ctx context.Context, vmName string) error
 // claiming a running guest, and no restart policy may bring back a VM that is
 // being deleted. The audit row carries why the delete stopped.
 func (s *Server) abortDeleteAfterStop(ctx context.Context, name string, destroyed bool, why string) {
+	// Its own budget: the delete's may be what ran out, and a stop left
+	// unrecorded is a running row with no domain, which the reconciler
+	// restarts.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deleteAbortRecordTimeout)
+	defer cancel()
 	if destroyed {
 		if werr := s.persistVMState(ctx, name, "stopped", "operator-stop", corrosion.OpVMState); werr != nil {
 			slog.Warn("DeleteVM: recording the stop of a VM whose delete failed also failed", "vm", name, "error", werr)
 		}
 	}
 	s.audit(ctx, "vm.delete", name, why, "error")
+}
+
+// deleteFinishTimeout bounds the rest of a VM delete once it has started
+// acting (detachDelete).
+const deleteFinishTimeout = 10 * time.Minute
+
+// deleteAbortRecordTimeout bounds abortDeleteAfterStop's writes.
+const deleteAbortRecordTimeout = 30 * time.Second
+
+// detachDelete is the context a delete runs on from its first destructive
+// step: the request's values (identity, trace, the response header) without
+// its cancellation, bounded by deleteFinishTimeout. A client that goes away
+// after the domain is stopped or undefined, or a peer's forward or stack
+// teardown cancelled with it, must not stop the delete between that step and
+// the tombstone (lab 2 F1): the row would stay running over an undefined
+// domain, and the reconciler would start the VM again on the disks the
+// delete had set out to remove. Before this point a cancellation still
+// refuses the delete with nothing done.
+func (s *Server) detachDelete(ctx context.Context) (context.Context, context.CancelFunc) {
+	bound := s.deleteFinish
+	if bound <= 0 {
+		bound = deleteFinishTimeout
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), bound)
+}
+
+// refuseIfCancelled refuses a delete or a replace whose caller has gone,
+// before it acts: nothing is done yet, so nothing is left half done.
+func refuseIfCancelled(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return status.FromContextError(err).Err()
+	}
+	return nil
+}
+
+// replaceFinishTimeout bounds a rebuild or re-create once its teardown has
+// started (detachReplace).
+const replaceFinishTimeout = 30 * time.Minute
+
+// detachReplace is detachDelete for a rebuild or re-create: from its
+// teardown on, the delete and the create that follows it run whatever
+// becomes of the caller, so a replace that has started never ends with no
+// copy of the VM because its client went away.
+func detachReplace(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), replaceFinishTimeout)
+}
+
+// deletePostStepsTimeout bounds the steps DeleteVM runs on the entry host
+// once the delete has succeeded.
+const deletePostStepsTimeout = 30 * time.Second
+
+// SetDeleteFinishTimeoutForTest sets how long a delete runs once it has
+// started acting.
+func (s *Server) SetDeleteFinishTimeoutForTest(d time.Duration) { s.deleteFinish = d }
+
+// SetDeleteStepHookForTest sets a hook run at named steps of a VM delete:
+// "acting" once the no-domain cleanup has detached, "nics" before the NIC
+// read, "tombstone" before the tombstone (on either path); and for a
+// container on a removed host, "removed-host" once its delete has detached.
+func (s *Server) SetDeleteStepHookForTest(fn func(vm, step string)) { s.deleteStep = fn }
+
+// deleteStepHook runs the deleteStep test seam.
+func (s *Server) deleteStepHook(vm, step string) {
+	if fn := s.deleteStep; fn != nil {
+		fn(vm, step)
+	}
 }
 
 // without returns ss with every occurrence of drop removed (order preserved).
@@ -2793,6 +3134,27 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// the entry host, which knows what the delete is for.
 	var luns []string
 	var createdAt string
+	// A plain delete ends the VM's firewall identity, so its tags row is
+	// cleared once the delete succeeds (spec §4.3) — by the entry host only.
+	// Never for a rebuild's, rolling recreate's or inline recreate's delete
+	// (it carries a deleted-VM sink of either kind, D2b review I-4): the VM
+	// they re-create keeps the identity, and with it the tags. Never on the
+	// owner a delete was forwarded to, nor on a peer's probe.
+	var fwID string
+	if !deleteLocalOnly(ctx) && !hasDeletedVMSink(ctx) && !s.forwardedByEntry(ctx) {
+		if vm, err := corrosion.GetVM(ctx, s.db, req.Name); err == nil && vm != nil {
+			fwID = corrosion.FirewallIDOf(corrosion.TagMemberVM, vm.Spec)
+		}
+	}
+	// A plain delete ends the VM's own schedules too (deleteVMSchedules), on
+	// the same terms, and never on a host a peer called: an entry on an older
+	// build forwards a re-create's delete with no marker. A blue-green
+	// cutover's delete of the blue keeps them (withSchedulesKept).
+	dropSchedules := false
+	if !deleteLocalOnly(ctx) && !hasDeletedVMSink(ctx) && !schedulesKept(ctx) && !s.forwardedByEntry(ctx) && !s.isRemotePeer(ctx) {
+		vm, err := corrosion.GetVM(ctx, s.db, req.Name)
+		dropSchedules = err == nil && vm != nil
+	}
 	if !deleteLocalOnly(ctx) && !s.isRemotePeer(ctx) && !isRecreateDelete(ctx) {
 		if vm, err := corrosion.GetVM(ctx, s.db, req.Name); err == nil && vm != nil {
 			createdAt = vm.CreatedAt
@@ -2805,7 +3167,13 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			}
 		}
 	}
-	out, err := s.deleteVM(ctx, req)
+	sinkCtx, sink := withLeftoverSink(ctx)
+	out, err := s.deleteVM(sinkCtx, req)
+	if err == nil && sink != nil && sink.plan != nil {
+		// deleteVM has released the VM's lock and start lease: wait for the
+		// hosts the VM left here, bounded, holding neither.
+		setLeftoverDomainHeader(ctx, s.cleanupDeletedVMLeftovers(context.WithoutCancel(ctx), *sink.plan, true))
+	}
 	var noAnswer probeNoAnswer
 	if err != nil && deleteLocalOnly(ctx) && status.Code(err) != codes.NotFound && !errors.As(err, &noAnswer) {
 		// A probe that found the domain here and refused its delete: the
@@ -2814,8 +3182,17 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		_ = grpc.SetTrailer(ctx, metadata.Pairs(deleteProbeRefusedMD, "1"))
 	}
 	if err == nil {
+		// The delete has happened: what follows runs whatever becomes of
+		// the caller.
+		pctx, pcancel := context.WithTimeout(context.WithoutCancel(ctx), deletePostStepsTimeout)
+		defer pcancel()
+		ctx = pctx
 		// A deleted VM's partial-recovery marker goes with it (review N5).
 		s.clearPromotedPartial(ctx, req.Name)
+		s.clearDeletedFirewallTags(ctx, corrosion.TagMemberVM, "", req.Name, fwID)
+		if dropSchedules {
+			s.deleteVMSchedules(context.WithoutCancel(ctx), req.Name)
+		}
 	}
 	if err == nil && len(luns) > 0 && !s.lunPlainDeleteRecordable(ctx) &&
 		s.ReleaseFeatureAvailable(capabilities.FeatureISCSILUNClaim) {
@@ -2856,6 +3233,44 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	return out, err
 }
 
+// deleteOfNoLiveRow answers a delete that finds no live row of the name here.
+//
+// A delete bound to a stack member's incarnation (expected_stack and
+// expected_created_at: a stack teardown or the stack reconciler) that finds
+// that incarnation's tombstone here is done: the member was deleted, by
+// another deleter that got there first. Answered NotFound, the caller judged
+// it from its own replica, which can lag the tombstone written here: compose
+// down reported a member it had seen deleted as a failed deletion (lab 2
+// 2026-10-17, anomaly 2). Everything else is NotFound as before: an unbound
+// delete (lv rm), a peer-search probe, a delete bound to the stack only (the
+// stored file names a member the caller holds no row of, and a tombstone of
+// an older incarnation says nothing of a newer one a peer may hold), and a
+// tombstone of another incarnation or of another stack's VM.
+func (s *Server) deleteOfNoLiveRow(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
+	notFound := status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+	if req.GetExpectedStack() == "" || req.GetExpectedCreatedAt() == "" || deleteLocalOnly(ctx) {
+		return nil, notFound
+	}
+	rows, err := s.db.Query(ctx,
+		`SELECT COALESCE(stack_name, '') AS stack_name, COALESCE(created_at, '') AS created_at,
+		        COALESCE(project, '_default') AS project
+		 FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, req.Name)
+	if err != nil || len(rows) == 0 {
+		return nil, notFound
+	}
+	row := rows[0]
+	if row.String("stack_name") != req.GetExpectedStack() || row.String("created_at") != req.GetExpectedCreatedAt() {
+		return nil, notFound
+	}
+	if err := s.RequirePerm(ctx, vmRBACPathFor(row.String("project"), req.Name), "vm.delete", "operator"); err != nil {
+		s.audit(ctx, "vm.delete", req.Name, "permission denied", "denied")
+		return nil, err
+	}
+	slog.Info("delete: the stack member was already deleted", "vm", req.Name,
+		"stack", req.GetExpectedStack(), "created_at", req.GetExpectedCreatedAt())
+	return &emptypb.Empty{}, nil
+}
+
 func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
@@ -2876,8 +3291,11 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	defer s.invalidateInventoryCache()
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
-	if err != nil || vm == nil {
+	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+	}
+	if vm == nil {
+		return s.deleteOfNoLiveRow(ctx, req)
 	}
 	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.delete", "operator"); err != nil {
 		s.audit(ctx, "vm.delete", req.Name, "permission denied", "denied")
@@ -2921,7 +3339,9 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)
 		}
 		defer closePeer()
-		proxyCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		// The entry clears the firewall tags of a plain delete itself; the
+		// owner must not (entryForwardCtx).
+		proxyCtx, cancel := context.WithTimeout(entryForwardCtx(ctx), 2*time.Minute)
 		defer cancel()
 		// An owner that predates DeleteVMRequest.force ignores it, and would
 		// destroy a running VM without the stop hooks or the operator-stop
@@ -2955,11 +3375,17 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			return nil, lerr
 		}
 		defer releaseLease()
+		if h := s.deleteLeaseTakenHook; h != nil {
+			h(req.Name)
+		}
 		// A start that held the lease until a moment ago may have changed
 		// the row since it was read above: decide from the row as it is now.
 		vm, err = corrosion.GetVM(ctx, s.db, req.Name)
-		if err != nil || vm == nil {
+		if err != nil {
 			return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+		}
+		if vm == nil {
+			return s.deleteOfNoLiveRow(ctx, req)
 		}
 		if err := checkDeleteBinding(req, vm); err != nil {
 			return nil, err
@@ -3011,6 +3437,9 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			unknown = append(unknown, "the host list ("+herr.Error()+")")
 		}
 		for _, h := range hosts {
+			if ctx.Err() != nil {
+				break // refused below: the answers are lost with the caller
+			}
 			if h.Name == s.hostName || h.IsWitness() {
 				continue
 			}
@@ -3032,8 +3461,24 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			cancel()
 			conn.Close()
 			if peerErr == nil {
+				// The probe answers OK only from a delete that undefined
+				// its domain and tombstoned the row in its own replica; no
+				// domain, no live row and an unanswerable libvirt are each
+				// an error. This host's row names this host, so this host
+				// tombstones it too, as the incarnation read under the
+				// lease, before answering OK: a caller reading this
+				// replica must not see the VM live once its delete has
+				// answered (stack_vm_orphan.go).
 				forwardKeptImages(ctx, phdr)
 				slog.Info("DeleteVM: domain found and deleted on peer", "vm", req.Name, "peer", h.Name)
+				if terr := corrosion.DeleteVMIncarnation(ctx, s.db, req.Name, corrosion.SnapshotForDelete(*vm)); terr != nil {
+					if errors.Is(terr, corrosion.ErrVMIncarnationMismatch) {
+						return nil, status.Errorf(codes.Aborted,
+							"VM %q: host %s deleted its domain, but the row here changed mid-delete; retry", req.Name, h.Name)
+					}
+					return nil, status.Errorf(codes.Internal,
+						"VM %q: host %s deleted its domain, but its row here was not tombstoned; retry: %v", req.Name, h.Name, terr)
+				}
 				return &emptypb.Empty{}, nil
 			}
 			if len(ptrl.Get(deleteProbeRefusedMD)) > 0 || status.Code(peerErr) == codes.FailedPrecondition {
@@ -3060,7 +3505,42 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// ownership, and is a no-op when the host owns no devices for the VM. FAIL BEFORE the
 		// tombstone on its error (retryable; never leave a stale owner or an unowned-but-bound
 		// device).
+		// A caller gone during the probes took their answers with it — a
+		// peer that has the domain among them — so nothing is done.
+		if err := refuseIfCancelled(ctx); err != nil {
+			return nil, err
+		}
 		slog.Warn("DeleteVM: domain not found on any host — cleaning up stale record", "vm", req.Name)
+		// From here the delete acts: the stop record, devices, disks, then
+		// the tombstone. A cancellation must not stop it between them.
+		ctx, cancel := s.detachDelete(ctx)
+		defer cancel()
+		s.deleteStepHook(req.Name, "acting")
+		// A row being started (pending/starting: a failover's start, or
+		// one re-armed after a cancel) is one the reconciler starts, and
+		// a transfer start rebuilds a missing disk from its image; a
+		// running row with no domain is one the reconciler's self-heal
+		// starts again. A delete that removes some disks and then fails
+		// would leave it to boot the VM being deleted on missing or
+		// blank disks. So, before anything is done, the row is
+		// recorded stopped by its operator, as a delete that fails after
+		// its stop leaves it (abortDeleteAfterStop): no start path starts
+		// it, whatever this delete then manages. Nothing is done when
+		// that write fails, nor while libvirt does not confirm there is no
+		// domain here: stopped written over a live guest would not be
+		// synced back.
+		if (vm.State == "pending" || vm.State == "starting" || vm.State == "running") && vm.HostName == s.hostName {
+			if _, aerr := s.virt.DomainIsActive(req.Name); !lv.IsNoDomain(aerr) {
+				return nil, status.Errorf(codes.Unavailable,
+					"cannot delete VM %q: its row says %s, and libvirt does not confirm it has no domain on %s (%v); nothing was done (retry is safe)",
+					req.Name, vm.State, s.hostName, aerr)
+			}
+			if werr := s.persistVMState(ctx, req.Name, "stopped", "operator-stop", corrosion.OpVMState); werr != nil {
+				return nil, status.Errorf(codes.Internal,
+					"cannot delete VM %q: its row says %s, and recording its stop before cleaning up its record failed; nothing was done: %v",
+					req.Name, vm.State, werr)
+			}
+		}
 		if err := s.releaseDevices(ctx, req.Name); err != nil {
 			return nil, status.Errorf(codes.Internal,
 				"cannot clean up stale VM %q: its PCI device(s) could not be released (still bound to vfio-pci); resolve the device and retry: %v", req.Name, err)
@@ -3083,23 +3563,6 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// never removed on a guess. A disk whose removal fails fails the
 		// delete, and the record stays.
 		if !req.KeepDisks {
-			// A row being started (pending/starting: a failover's start, or
-			// one re-armed after a cancel) is one the reconciler starts, and
-			// a transfer start rebuilds a missing disk from its image. A
-			// delete that removes some disks and then fails would leave it
-			// to boot the VM being deleted on blank disks. So, before any
-			// disk is removed, the row is recorded stopped by its operator,
-			// as a delete that fails after its stop leaves it
-			// (abortDeleteAfterStop): no start path starts it, whatever
-			// this delete then manages. Nothing is removed when that write
-			// fails.
-			if (vm.State == "pending" || vm.State == "starting") && vm.HostName == s.hostName {
-				if werr := s.persistVMState(ctx, req.Name, "stopped", "operator-stop", corrosion.OpVMState); werr != nil {
-					return nil, status.Errorf(codes.Internal,
-						"cannot delete VM %q: it is being started (%s), and recording its stop before its disks are removed failed; nothing was removed: %v",
-						req.Name, vm.State, werr)
-				}
-			}
 			_, derr := s.virt.DomainIsActive(req.Name)
 			domainGone := lv.IsNoDomain(derr)
 			cephKept, keptDisks, leftovers := s.freeRecordedVMDisks(ctx, req.Name, func(d *corrosion.DiskRecord) (bool, string, string) {
@@ -3138,7 +3601,8 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// node keeps scheduling around. A failure is logged and every NIC named
 		// for the orphan sweep, never swallowed.
 		s.releaseNICLeasesBestEffort(ctx, vm, "delete-stale-record")
-		deleted, err := corrosion.DeleteVMReporting(ctx, s.db, req.Name)
+		s.deleteStepHook(req.Name, "tombstone")
+		deleted, err := s.tombstoneDeletedVM(ctx, req.Name, req.KeepDisks)
 		if err != nil {
 			// A declined delete means the stale row is still live cluster-wide;
 			// claiming OK here would hide it. Idempotent — retry.
@@ -3191,6 +3655,16 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	if err := s.settleKeptPITOverlays(ctx, vm, req.KeepDisks); err != nil {
 		return nil, err
 	}
+
+	// Every check that refuses the delete with nothing done has passed. From
+	// the stop on, the delete runs to its tombstone or to a recorded abort
+	// whatever becomes of its caller (detachDelete). A caller already gone
+	// refuses it with nothing done.
+	if err := refuseIfCancelled(ctx); err != nil {
+		return nil, err
+	}
+	ctx, cancelFinish := s.detachDelete(ctx)
+	defer cancelFinish()
 
 	// Stop it. Ask libvirt, not only the row: an ACTIVE domain (running, or
 	// paused — which the row does not call "running") survives the undefine
@@ -3317,6 +3791,10 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			"cannot delete VM %q: its libvirt domain could not be undefined, so its record and disks were kept (retry is safe): %v",
 			req.Name, undefErr)
 	}
+	// The domain is gone: a failure from here records the stop whatever the
+	// row said, so no start path brings back a VM whose disks may be freed
+	// (a pending or starting row included).
+	destroyed = destroyed || !s.virt.DomainExists(req.Name)
 
 	// Delete disks unless keep-disks. Free each disk at its RECORDED location
 	// (driver-dispatched, so non-default pools and block backends are released)
@@ -3337,7 +3815,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		s.removeOwnDiskLayers(ctx, req.Name, layers)
 		s.removeVMSnapshotRAMImages(ctx, req.Name)
 		// Remove cloud-init ISO
-		os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
+		_ = cloudinit.RemoveSeed(lv.CloudInitISOPath(s.dataDir, req.Name))
 		// Firmware state (G1): wipe nvram (name-keyed) + swtpm (uuid-keyed). With
 		// --keep-disks we deliberately KEEP it too — else a retained BitLocker disk
 		// would be unbootable (the swtpm tree at the stable uuid stays for restore).
@@ -3401,11 +3879,13 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// Reading the lease by its (network, ip) key is also what carries the NetBox
 	// join id, and without it a release could never delete the remote object.
 	var releaseErrs []string
+	s.deleteStepHook(req.Name, "nics")
 	nics, nerr := corrosion.MergedVMNICs(ctx, s.db, req.Name)
 	if nerr != nil {
 		// Fail closed: an unreadable NIC list means we do not know which
 		// addresses this VM holds, and tombstoning the row over that is what
 		// strands them. Retryable — nothing destructive is skipped by returning.
+		s.abortDeleteAfterStop(ctx, req.Name, destroyed, "NIC read failed: "+nerr.Error())
 		return nil, status.Errorf(codes.Internal,
 			"delete %s: could not read NICs to release their addresses (retry is safe): %v", req.Name, nerr)
 	}
@@ -3437,6 +3917,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		}
 	}
 	if len(releaseErrs) > 0 {
+		s.abortDeleteAfterStop(ctx, req.Name, destroyed, "address release failed: "+strings.Join(releaseErrs, "; "))
 		return nil, status.Errorf(codes.Internal,
 			"delete %s: address release failed, so the VM was NOT deleted: %s. "+
 				"Retrying the delete is safe and completes it; whether it also frees the "+
@@ -3463,15 +3944,28 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// row every node keeps serving, scheduling around and failing over — the
 	// exact stale-live state the mandatory tombstone exists to kill. The domain
 	// teardown above is idempotent, so the caller can simply retry.
-	deleted, err := corrosion.DeleteVMReporting(ctx, s.db, req.Name)
+	s.deleteStepHook(req.Name, "tombstone")
+	deleted, err := s.tombstoneDeletedVM(ctx, req.Name, req.KeepDisks)
 	if err != nil {
-		s.audit(ctx, "vm.delete", req.Name, "project="+tenancy.NormalizeProject(vm.Project), "error")
+		// The guarded tombstone declines when the row's authority moved
+		// under it: that row is no longer this delete's to record stopped.
+		why := "project=" + tenancy.NormalizeProject(vm.Project) + " tombstone failed: " + err.Error()
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), deleteAbortRecordTimeout)
+		defer rcancel()
+		cur, gerr := corrosion.GetVM(rctx, s.db, req.Name)
+		if gerr == nil && cur != nil &&
+			(cur.HostName != vm.HostName || cur.OwnerEpoch != vm.OwnerEpoch) {
+			s.audit(rctx, "vm.delete", req.Name, why+"; the row moved to "+cur.HostName+", its state is left as it is", "error")
+		} else {
+			s.abortDeleteAfterStop(ctx, req.Name, destroyed, why)
+		}
 		return nil, status.Errorf(codes.Internal, "delete: tombstone cluster row: %v", err)
 	}
 	// The row as this delete tombstoned it, for a re-create that follows
 	// (vm_recreate_replaces.go).
 	s.reportDeletedVM(ctx, deleted)
 	s.retireNICGuards(ctx, req.Name)
+	s.resyncDHCPHosts()
 
 	slog.Info("VM deleted", "name", req.Name)
 	// The mirror's latency shortcut, AFTER the mandatory tombstone: the VM is
@@ -3490,7 +3984,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	go s.refreshLBForStack(context.Background(), vm.StackName)
 
 	if len(leftovers.hosts) > 0 {
-		go s.cleanupDeletedVMLeftovers(context.WithoutCancel(ctx), leftovers)
+		s.deferLeftoverCleanup(ctx, leftovers)
 	}
 
 	return &emptypb.Empty{}, nil
@@ -3531,7 +4025,8 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	// graceful shutdown where libvirt still reports "running" briefly.
 	// The live state, as `lv ls` reads it (readVMState); the record's
 	// detail unless the read has its own.
-	state, stateDetail := s.readVMState(vm, s.newLiveStateBudget())
+	budget := s.newLiveStateBudget()
+	state, stateDetail := s.readVMState(vm, budget)
 	if stateDetail == "" {
 		stateDetail = vm.StateDetail
 	}
@@ -3561,12 +4056,29 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	// not proven off.
 	pbVM.SharedDiskWithheld = s.sharedDiskWithheldReason(ctx, vm.Name)
 
-	// Interfaces — run IP discovery fallback if IP is unknown.
+	// Interfaces — run IP discovery fallback if IP is unknown, every such NIC
+	// in one batch, so the wait on peers is bounded once for the VM.
 	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, name)
-	for _, iface := range ifaces {
+	discovered := map[int]string{}
+	if vm.HostName == s.hostName {
+		var idx []int
+		var queries []nicQuery
+		for i, iface := range ifaces {
+			if iface.IP == "" {
+				idx = append(idx, i)
+				queries = append(queries, nicQuery{mac: iface.MAC, network: iface.NetworkName})
+			}
+		}
+		if len(queries) > 0 {
+			for j, ip := range s.discoverNICAddressesWithPeers(ctx, queries, inspectPeerLeaseBudget) {
+				discovered[idx[j]] = ip
+			}
+		}
+	}
+	for i, iface := range ifaces {
 		ip := iface.IP
-		if ip == "" && vm.HostName == s.hostName {
-			ip = s.discoverNICAddress(ctx, iface.MAC, iface.NetworkName)
+		if ip == "" {
+			ip = discovered[i]
 		}
 		// If we discovered a new IP, persist it — through the same gate ListVMs
 		// uses, and for the same reason (netbox_discovery.go): on a bound network
@@ -3656,14 +4168,7 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 
 	// VNC address — only available for running VMs on this host
 	if vm.HostName == s.hostName && state == "running" && s.virt != nil {
-		if port, err := s.virt.GetVMVNCPort(name); err == nil && port >= 0 {
-			if host, err := corrosion.GetHost(ctx, s.db, s.hostName); err == nil && host != nil {
-				pbVM.VncAddress = fmt.Sprintf("vnc://%s", net.JoinHostPort(host.Address, strconv.Itoa(port)))
-			}
-			// Whether that listener asks for a password (docs/ui.md "Console
-			// passwords"); never the password itself.
-			pbVM.VncPasswordRequired = s.vmHasVNCPassword(name)
-		}
+		s.fillVNC(ctx, pbVM, name, budget)
 	}
 
 	// Project the authoritative device tables into the spec's device
@@ -4049,12 +4554,6 @@ func GenerateMAC() string {
 	return fmt.Sprintf("52:54:00:%02x:%02x:%02x", buf[0], buf[1], buf[2])
 }
 
-// provisionNetworkForVM delegates to network.ProvisionForVM.
-// Kept as a local wrapper for backward compatibility within this file.
-func provisionNetworkForVM(ctx context.Context, db *corrosion.Client, networkName, hostName string) (string, error) {
-	return network.ProvisionForVM(ctx, db, networkName, hostName)
-}
-
 // resolveBridge maps a compose network name to the actual host bridge interface.
 // Falls back to networkName itself if no network record exists (flat bridge mode).
 func resolveBridge(ctx context.Context, db *corrosion.Client, networkName string) string {
@@ -4103,87 +4602,15 @@ func lookupNetworkDef(ctx context.Context, db *corrosion.Client, networkName str
 	return &def, nil
 }
 
-// buildIsolatedNetworkConfig generates a cloud-init V1 network-config YAML
-// for VMs on host-isolated networks. Uses MAC matching for distro-agnostic
-// interface binding (works on Ubuntu, CentOS, Arch, Debian, Alpine, etc.).
-//
-// IPv6: when iface.Address6 is set we emit a second `static6` subnet on
-// the same interface (cloud-init's V1 schema accepts dual-stack via
-// repeated `subnets:` entries with type `static` for v4 and `static6`
-// for v6).
-func buildIsolatedNetworkConfig(ifaces []isolatedIface) string {
-	if len(ifaces) == 0 {
-		return ""
-	}
-	cfg := "version: 1\nconfig:\n"
-	for i, iface := range ifaces {
-		cfg += fmt.Sprintf("  - type: physical\n    name: eth%d\n    mac_address: %q\n    subnets:\n", i, iface.MAC)
-		if iface.Address != "" {
-			cfg += fmt.Sprintf("      - type: static\n        address: %s\n", iface.Address)
-			if iface.Gateway != "" {
-				cfg += fmt.Sprintf("        gateway: %s\n", iface.Gateway)
-			}
-			if len(iface.DNS) > 0 {
-				cfg += "        dns_nameservers:\n"
-				for _, ns := range iface.DNS {
-					cfg += fmt.Sprintf("          - %s\n", ns)
-				}
-			}
-		}
-		if iface.Address6 != "" {
-			cfg += fmt.Sprintf("      - type: static6\n        address: %s\n", iface.Address6)
-			if iface.Gateway6 != "" {
-				cfg += fmt.Sprintf("        gateway: %s\n", iface.Gateway6)
-			}
-		}
-	}
-	return cfg
-}
+// isolatedIface, buildIsolatedNetworkConfig and staticIfaceGatewayAddress
+// are the seed's network-config pieces, shared with the reconciler and the
+// migration path in package cloudinit.
+type isolatedIface = cloudinit.StaticIface
 
-type isolatedIface struct {
-	MAC      string
-	Address  string // IPv4 CIDR, e.g. "10.100.0.10/24"
-	Gateway  string
-	DNS      []string
-	Address6 string // IPv6 CIDR, e.g. "2001:db8::10/64"; empty = no static v6 (SLAAC/RA)
-	Gateway6 string
-}
+func buildIsolatedNetworkConfig(ifaces []isolatedIface) string { return cloudinit.BuildV1(ifaces) }
 
-// staticIfaceGatewayAddress derives the cloud-init network-config address (with
-// CIDR prefix) and the gateway for a NIC's static IP. An explicit gateway wins;
-// when the network has a subnet, the gateway defaults to the subnet's first host
-// as a BARE address — SubnetRange returns it with a prefix, which netplan/ENI
-// reject — and the address takes the subnet's prefix, but only when the caller
-// did NOT already supply one, so a submitted "10.0.1.50/24" is preserved rather
-// than doubled to "10.0.1.50/24/24". With no subnet def, a bare address gets a
-// family default (/64 for IPv6, /24 for IPv4).
 func staticIfaceGatewayAddress(ip, gateway string, netDef *compose.NetworkDef) (string, string) {
-	address := ip
-	if netDef != nil && netDef.Subnet != "" {
-		gw, _, _, _, err := network.SubnetRange(netDef.Subnet)
-		if err == nil {
-			if gateway == "" {
-				// SubnetRange returns the gateway WITH a prefix (10.0.1.1/24);
-				// the network-config gateway must be a bare host address, else
-				// netplan/ENI/sysconfig reject it and static addressing fails.
-				gateway = splitCIDR(gw)[0]
-			}
-			parts := splitCIDR(netDef.Subnet)
-			if parts[1] != "" && !strings.Contains(ip, "/") {
-				address = ip + "/" + parts[1]
-			}
-		}
-	} else if !strings.Contains(address, "/") {
-		// No subnet in network def — pick a sensible default based on address
-		// family. /24 for v4, /64 for v6 (the standard host prefix for end-user
-		// assignments).
-		if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
-			address = ip + "/64"
-		} else {
-			address = ip + "/24"
-		}
-	}
-	return address, gateway
+	return cloudinit.StaticAddress(ip, gateway, netDef)
 }
 
 // splitCIDR splits "10.0.0.0/24" into ["10.0.0.0", "24"].
@@ -4195,14 +4622,6 @@ func splitCIDR(cidr string) [2]string {
 		}
 	}
 	return [2]string{cidr, ""}
-}
-
-// getLocalIP returns the outbound IP of this host.
-func getLocalIP() string {
-	if ip := netutil.OutboundIP(); ip != "" {
-		return ip
-	}
-	return "127.0.0.1"
 }
 
 // SetVMIP updates the IP address of a VM interface in the state store.
@@ -4275,8 +4694,17 @@ func (s *Server) SetVMIP(ctx context.Context, req *pb.SetVMIPRequest) (*pb.VM, e
 			networkName, binding.PrefixID)
 	}
 
-	if err := corrosion.UpdateVMInterfaceIP(ctx, s.db, req.Name, networkName, req.Ip); err != nil {
+	// The request names a network, not a NIC, so the write is resolved to the
+	// network's live NIC (UpdateVMInterfaceIP). No live NIC there records
+	// nothing, as the unfiltered UPDATE this replaced recorded nothing visible;
+	// it is reported, not refused.
+	written, err := corrosion.UpdateVMInterfaceIP(ctx, s.db, req.Name, networkName, "", req.Ip)
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "update VM interface IP: %v", err)
+	}
+	if !written {
+		slog.Warn("SetVMIP: no single live NIC of the VM is on this network; no interface row records the address",
+			"vm", req.Name, "network", networkName, "ip", req.Ip)
 	}
 
 	// Update DNS record so VM is reachable by name.
@@ -4499,6 +4927,17 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		defer s.holdImage(spec.Image)()
 	}
 
+	// From the teardown on, the rebuild runs to its create whatever becomes
+	// of its caller (detachReplace); a caller already gone refuses it with
+	// nothing done.
+	if err := refuseIfCancelled(ctx); err != nil {
+		return nil, err
+	}
+	ctx, cancelTeardown := detachReplace(ctx)
+	defer cancelTeardown()
+	rctx, cancelCreate := detachReplace(rctx)
+	defer cancelCreate()
+
 	// Stop and undefine the current domain.
 	if vm.State == "running" {
 		s.virt.DestroyDomain(req.Name)
@@ -4513,7 +4952,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// Wipe the old firmware state — rebuild recreates with a FRESH identity, so the
 	// old name-keyed NVRAM + old-UUID swtpm tree would otherwise be orphaned (G1).
 	s.fw().WipeFirmwareState(req.Name, spec.Uuid)
-	os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
+	_ = cloudinit.RemoveSeed(lv.CloudInitISOPath(s.dataDir, req.Name))
 	// The rebuilt VM gets a fresh uuid: the ISO record of the old one goes.
 	s.forgetVMISOIdentity(req.Name, vm.Spec)
 
@@ -4551,7 +4990,9 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	if deleted != nil {
 		rctx = s.withReplacedLUNs(withReplacedVM(rctx, deleted), deleted)
 	} else {
-		rctx = s.withReplacedLUNs(withReplacedVM(rctx, vm), vm)
+		// No row was tombstoned here: another delete ended the incarnation,
+		// and with it its firewall identity.
+		rctx = withoutReplacedFirewallID(s.withReplacedLUNs(withReplacedVM(rctx, vm), vm), req.Name)
 	}
 	var out *pb.VM
 	if placed {
@@ -4636,7 +5077,12 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 				"cannot reach host %s that owns %q for cutover: %v", nextVM.HostName, nextName, err)
 		}
 		defer conn.Close()
-		return client.CutoverVM(ctx, req)
+		var hdr metadata.MD
+		out, err := client.CutoverVM(ctx, req, grpc.Header(&hdr))
+		if left := hdr.Get(firewallTagsLeftMD); err == nil && len(left) == 1 {
+			_ = grpc.SetHeader(ctx, metadata.Pairs(firewallTagsLeftMD, left[0]))
+		}
+		return out, err
 	}
 
 	// The cutover stops and deletes the replaced VM and renames the
@@ -4680,6 +5126,13 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// cutover retryable. It used to be the other way round, which is what made
 	// the rename's UNIQUE-constraint failure destroy the VM it was replacing.
 	oldVM, _ = corrosion.GetVM(ctx, s.db, req.VmName)
+	// The replaced VM keeps its firewall identity, and its tags stay with it
+	// (T-8): the name goes to a VM with an identity of its own. Read now,
+	// while its row is intact, to say so once the cutover is done.
+	var replacedFWID string
+	if oldVM != nil {
+		replacedFWID = corrosion.FirewallIDOf(corrosion.TagMemberVM, oldVM.Spec)
+	}
 	var replacedDisks []corrosion.DiskRecord
 	// An earlier attempt may have tombstoned the original and then failed the
 	// re-key. GetVM hides a tombstone, so without this the retry would read
@@ -4887,6 +5340,11 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 				"phases will be retried)", err)
 	}
 
+	if note := s.firewallTagsLeftForID(ctx, corrosion.TagMemberVM, replacedFWID, req.VmName, "",
+		"the replaced VM "+req.VmName+"'s firewall tags (fw_id %s) stay with it and do not follow the cutover to the VM now named "+req.VmName); note != "" {
+		slog.Info("cutover: the replaced VM's firewall tags stay with it", "vm", req.VmName, "fw_id", replacedFWID)
+		_ = grpc.SetHeader(ctx, metadata.Pairs(firewallTagsLeftMD, note))
+	}
 	slog.Info("cutover complete", "vm", req.VmName, "replaced_from", nextName)
 	s.recordVMEvent(ctx, req.VmName, "vm.cutover", "ok", "from="+nextName)
 	return s.vmToProto(ctx, req.VmName)
@@ -5318,11 +5776,23 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	}
 	// Forward to the owning host first — it has authoritative state.
 	if vm.HostName != s.hostName {
-		client, conn, err := s.peerClient(ctx, vm.HostName)
+		client, closePeer, err := s.dialPeer(ctx, vm.HostName)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)
 		}
-		defer conn.Close()
+		defer closePeer()
+		// An owner that predates nic_by_list_position reads every NIC number
+		// as a spec index: translate the positions for it, or refuse
+		// (nic_index.go).
+		if req.GetNicByListPosition() && requestNamesNICs(req) && !s.peerReadsNICListPosition(ctx, client) {
+			nics, nerr := corrosion.MergedVMNICs(ctx, s.db, req.Name)
+			if nerr != nil {
+				return nil, status.Errorf(codes.Internal, "list NICs of %q: %v", req.Name, nerr)
+			}
+			if req, err = nicPositionsForOlderOwner(vm, nics, req); err != nil {
+				return nil, err
+			}
+		}
 		return client.UpdateVM(ctx, req)
 	}
 	if err := s.firmwareMoveRefusal("update", vm); err != nil {
@@ -5371,8 +5841,14 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	limitsReq := limitsRequested(req)
 	var limitsUp limitsUpdate
 	var limitsErr error
+	// The NICs the request names by index: positions in the VM's NIC list
+	// (nic_index.go).
+	nicIx, err := s.loadNICIndex(ctx, req)
+	if err != nil {
+		return nil, err
+	}
 	if limitsReq || (req.Cpu > 0 && spec.CpuLimit > 0) {
-		limitsUp, limitsErr = mergeLimitUpdate(spec, req)
+		limitsUp, limitsErr = mergeLimitUpdate(spec, req, nicIx)
 	}
 
 	// This node writes the tuning, so the feature's gate runs here (the entry
@@ -5403,14 +5879,14 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// the setting, so it never claims what the domain lacks.
 	if len(req.DiskTuning) > 0 || len(req.NicQueues) > 0 {
 		tdisks, _ := corrosion.GetVMDisks(ctx, s.db, req.Name)
-		if err := applyTuningRequest(spec, tdisks, req); err != nil {
+		if err := applyTuningRequest(spec, tdisks, req, nicIx); err != nil {
 			return nil, err
 		}
 	}
 	// NIC MTUs likewise, each checked against its bridge here before anything
 	// is stopped.
 	if len(req.NicMtu) > 0 {
-		if err := s.applyNICMTURequest(ctx, spec, req, vm.StackName); err != nil {
+		if err := s.applyNICMTURequest(ctx, spec, req, vm.StackName, nicIx); err != nil {
 			return nil, err
 		}
 	}
@@ -5806,7 +6282,12 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				}
 			}
 			applyLiveMetadataFields(cur, req)
-			fup, lerr := mergeLimitUpdate(cur, req)
+			// The NIC list as the lock sees it, too.
+			curIx, ierr := s.loadNICIndex(ctx, req)
+			if ierr != nil {
+				return nil, ierr
+			}
+			fup, lerr := mergeLimitUpdate(cur, req, curIx)
 			if lerr != nil {
 				return nil, lerr
 			}
@@ -5952,16 +6433,36 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		})
 	}
 
-	// Build network configs from stored interfaces.
-	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, req.Name)
+	// Build network configs from the VM's live NICs (the vm_nics/vm_interfaces
+	// overlay): a NIC hot-attached or detached on a hardware_v2 cluster is
+	// recorded in vm_nics alone.
+	if s.updateVMNICsHookForTest != nil {
+		s.updateVMNICsHookForTest()
+	}
+	nicRows, err := corrosion.MergedVMNICs(ctx, s.db, req.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read NICs for %q: %v", req.Name, err)
+	}
+	// The NIC numbers were resolved against the list read before the stop
+	// (and the VM lock, when it restarts); a NIC attached or detached since
+	// moves the positions, so the update is not applied to another NIC.
+	if requestNamesNICs(req) && !nicIx.sameNICs(nicIndex{nics: nicRows}) {
+		return nil, status.Errorf(codes.Aborted, "the NICs of %q changed while the update was prepared; retry", req.Name)
+	}
+	rowModels, reattached, err := corrosion.NICModelSources(ctx, s.db, req.Name, nicRows, compose.SpecNICModelsByMAC(spec))
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read NIC models for %q: %v", req.Name, err)
+	}
+	nicModels := compose.NewNICModels(spec, rowModels, reattached)
 	var netConfigs []lv.NetworkConfig
-	for _, iface := range ifaces {
+	for _, iface := range nicRows {
 		bridge := resolveBridge(ctx, s.db, iface.NetworkName)
-		rate := compose.NICRate(spec, iface.Ordinal, iface.NetworkName)
+		rate := compose.NICRate(spec, iface.MAC, iface.Ordinal, iface.NetworkName)
+		model := nicModels.Model(iface.MAC, iface.NetworkName, iface.Ordinal, iface.Model)
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
 				Direct:      strings.TrimPrefix(bridge, "direct:"),
-				Model:       "virtio",
+				Model:       model,
 				MAC:         iface.MAC,
 				SpecOrdinal: iface.Ordinal + 1,
 				RateMBps:    rate,
@@ -5970,7 +6471,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		}
 		netConfigs = append(netConfigs, lv.NetworkConfig{
 			Bridge:      bridge,
-			Model:       "virtio",
+			Model:       model,
 			MAC:         iface.MAC,
 			SpecOrdinal: iface.Ordinal + 1,
 			RateMBps:    rate,
@@ -6014,11 +6515,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 					patched, perr = lv.PatchInactiveCPUTune(patched, spec.CpuLimit, int(spec.CpuShares))
 				}
 				if perr == nil {
-					for _, o := range limitsUp.nicOrdinals {
-						for _, iface := range ifaces {
-							if iface.Ordinal == o {
-								patched, _ = lv.PatchInterfaceBandwidth(patched, iface.MAC, spec.Network[o].RateMbSec)
-							}
+					for _, e := range limitsUp.nicEntries {
+						if nic := liveNICForEntry(spec, nicRows, e); nic != nil {
+							patched, _ = lv.PatchInterfaceBandwidth(patched, nic.MAC, spec.Network[e].RateMbSec)
 						}
 					}
 				}
@@ -6026,10 +6525,10 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			if perr == nil && (len(req.DiskTuning) > 0 || len(req.NicQueues) > 0) {
 				// discard / detect_zeroes / queues patch into the existing
 				// definition too, so the addresses libvirt assigned survive.
-				patched, perr = patchTuningInPlace(patched, req, spec, diskConfigs, ifaces)
+				patched, perr = patchTuningInPlace(patched, req, spec, diskConfigs, nicIx)
 			}
 			if perr == nil && len(req.NicMtu) > 0 {
-				patched, perr = s.patchNICMTUInPlace(patched, req, spec, netConfigs)
+				patched, perr = s.patchNICMTUInPlace(patched, req, spec, netConfigs, nicIx)
 			}
 			if perr == nil {
 				domXML = patched
@@ -6042,14 +6541,18 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// up after the define; a patched one keeps the ones it had.
 	regenerated := domXML == ""
 	if domXML == "" {
-		var hostdevs []lv.HostdevConfig
-		for _, addr := range liveDevs {
-			hostdevs = append(hostdevs, lv.HostdevConfig{Address: addr})
+		priorXML, derr := s.virt.DumpXMLInactive(req.Name)
+		if derr != nil && !domainAbsent(derr) {
+			slog.Warn("UpdateVM: the current definition could not be read; regenerating without what only it holds",
+				"vm", req.Name, "error", derr)
 		}
+		hostdevs := ownedHostdevConfigs(liveDevs, priorXML)
 		// Regenerate domain XML from the shared builder (MinMemoryMiB/MaxMemoryMiB +
 		// Hostdevs are populated here — the fields the old inline redefine builder
 		// dropped, collapsing the balloon ceiling and detaching passthrough).
 		vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, hostdevs)
+		// The seed and installer CD-ROMs are in neither the spec nor vm_disks.
+		s.keepCDROMs(&vmCfg, req.Name, spec.Uuid, priorXML)
 		usb, uerr := s.resolveUSBHostdevs(ctx, spec)
 		if uerr != nil {
 			return nil, uerr

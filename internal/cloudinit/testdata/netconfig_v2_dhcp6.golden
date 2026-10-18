@@ -1,0 +1,33 @@
+version: 2
+ethernets:
+  eth0:
+    match:
+      macaddress: "52:54:00:00:00:01"
+    set-name: eth0
+    dhcp4: true
+    dhcp4-overrides:
+      route-metric: 100
+  eth1:
+    match:
+      macaddress: "52:54:00:00:00:02"
+    set-name: eth1
+    dhcp4: true
+    dhcp4-overrides:
+      route-metric: 101
+      use-routes: false
+    dhcp6: true
+    dhcp6-overrides:
+      route-metric: 101
+      use-routes: false
+    optional: true
+  eth2:
+    match:
+      macaddress: "52:54:00:00:00:03"
+    set-name: eth2
+    dhcp4: true
+    dhcp4-overrides:
+      route-metric: 102
+    dhcp6: true
+    dhcp6-overrides:
+      route-metric: 102
+    optional: true

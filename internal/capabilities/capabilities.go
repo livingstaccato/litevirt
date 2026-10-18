@@ -367,6 +367,40 @@ const (
 	// (claims.Spec.AdoptLegacy, grpcapi Server.legacyValueExcluded).
 	ClaimIncarnationV1 = "claim_incarnation_v1"
 
+	// LeaseTermClaimV1 concerns SINGLE-CLAIMANT lease terms: a node with an
+	// adopted member voter generation records a new leader-lease term
+	// (internal/corrosion leader_lease.go) only after a majority of that
+	// generation has decided, by a
+	// recovery-claim style single-decree claim at key (lease_term, <lease key>,
+	// <term>, 0), that the term is its own. Two nodes that take a dead holder's
+	// lease over in the same instant both read the same high-water term and,
+	// before it, both recorded the next one — two holders for one term, each
+	// acting as the leader, and an immutable-ledger conflict only
+	// `lv cluster acknowledge-lease-term` cleared. A voter promises a term's
+	// key to one ballot at a time and accepts one value, so at most one
+	// claimant gets a majority; the loser learns the winner and records
+	// nothing. The claim does not wait for this node's latch, which forms at
+	// a different moment on each node. Before the latch, and only then, a
+	// claim that so many voters refuse as an unknown claim type (older builds)
+	// that the rest cannot form a majority falls back to the quorum read
+	// alone; once latched it never does (grpcapi lease_term_claim.go).
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build answers lease-term claims as a voter and
+	// claims every term it records. Every claimant relies on every OTHER
+	// claimant doing the same — a node that recorded a term without claiming
+	// it is the second holder the claim exists to prevent — so a flag would
+	// have to be withheld while off, and with it off anywhere the token could
+	// never latch. Standing down is the voter set's: with no adopted member
+	// generation (genesis pending, or after `lv cluster voter reset`) terms are
+	// recorded as before, because there is no fixed majority to decide them.
+	//
+	// ReplicationGated: any replication recipient can hold a lease, a
+	// maintenance host on the previous build included, and that build records
+	// terms without claiming them, so the claim must hold of every host this
+	// node replicates to.
+	LeaseTermClaimV1 = "lease_term_claim_v1"
+
 	// FenceStateV1 gates what an UNVERIFIED fence records as the host's state
 	// (colonelpanik/litevirt#253). Before it latches, a coordinator records
 	// 'fenced' for any successful fence, as every earlier build does. Once
@@ -418,6 +452,39 @@ const (
 	// write also needs the cluster_policies gate (failover_scope_v1), which
 	// proves the shape decodes.
 	RelayHealthV1 = "relay_health_v1"
+
+	// SpecConflictV1 gates how a VM's desired-spec edits are replicated
+	// (corrosion/spec_conflict.go). Every edit is a compare-and-swap on
+	// spec_generation, and two made from the same generation on two hosts —
+	// one on each side of a partition — used to leave every replica holding
+	// whichever reached it first: the losing statement applied as a silent
+	// zero-row no-op, and anti-entropy later kept the newer row by timestamp,
+	// even over an operation's barrier. Once latched:
+	//
+	//   - an out-of-band spec edit carries the owner epoch it was made at, a
+	//     statement shape a previous-release peer has no ledger entry for;
+	//   - the WAL resolves an edit that meets another at its generation as
+	//     anti-entropy does: the higher owner epoch, then an operation's
+	//     barrier over an out-of-band edit, then the later edit by the edit
+	//     time stamped inside the spec, then the greater content hash;
+	//   - every spec edit stamps that time, and the content it was made from,
+	//     into the spec document, so a version lost to a longer line of edits
+	//     on the other side is recognised and recorded too;
+	//   - neither path overwrites a row whose operation is in flight with an
+	//     out-of-band edit at the same generation;
+	//   - an edit dropped by either path is recorded (a vm_events row and
+	//     litevirt_merge_apply_rejected_total{reason="spec_edit_dropped"}).
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build decodes the epoch-carrying shape and resolves
+	// a conflict this way. Every replica must resolve one conflict the same
+	// way, so a flag would make one node keep a different version of a spec
+	// from its peers.
+	//
+	// ReplicationGated: the epoch-carrying shape must be decodable by every
+	// host still receiving replication, a maintenance host on the previous
+	// build included, and every such host must resolve as the rest do.
+	SpecConflictV1 = "spec_conflict_v1"
 
 	// RecoveryClaimV1 gates ENFORCEMENT of single-winner recovery claims
 	// (docs/design/recovery-claims.md §3, §5.1–§5.2,
@@ -799,6 +866,34 @@ const (
 	// by a migration once it returns, so the latch waits for it too.
 	ConsolePasswordV1 = "console_password_v1"
 
+	// VRRPUnicastV1 gates the load balancers' VRRP transport. Before it, each
+	// LB host multicasts its keepalived adverts on the bridge its VIP is on,
+	// with a PASS password derived from the LB's name: every guest on that
+	// segment reads the password and can answer with a higher priority,
+	// which takes the VIP off its holder. Once latched, each LB host sends
+	// them as unicast from its recorded address to the other LB hosts'
+	// recorded addresses, over the device holding its own, and accepts them
+	// only from those addresses (lb.Config.VRRPUnicast).
+	//
+	// A host on the old transport and a host on the new one do not hear each
+	// other, and both hold the VIP, so no host switches before the latch. The
+	// transport is then ONE cluster-wide value, never a host's own config: the
+	// first host whose latch is durable records it in cluster_policies, and
+	// every host renders unicast once that row reaches it, or once its own
+	// latch is durable; an operator's `lv cluster vrrp-transport` overrides
+	// both and is the stand-down (corrosion.GetVRRPTransport).
+	//
+	// Advertised CONDITIONALLY on enforcement.vrrp_unicast (DEFAULT ON) until
+	// it has latched: before the latch a host's peers rely on it rendering the
+	// same transport, so the latch must mean every host opted in. After it the
+	// flag decides nothing and the host advertises it: one that does not is an
+	// earlier build back in the cluster (grpcapi CondLBVRRPSplit).
+	//
+	// ReplicationGated: a host parked in maintenance on an older build may
+	// still run an LB, and is an LB peer once it returns, so the latch waits
+	// for it too.
+	VRRPUnicastV1 = "vrrp_unicast_v1"
+
 	// Release202611V1 is the RELEASE TOKEN of the 2026-11 release train: one
 	// mandatory, ReplicationGated token that every feature of the release
 	// gates on, in place of one token per feature. Its claim is the one
@@ -1029,6 +1124,23 @@ const ReleaseToken = Release202611V1
 //     intact, and the incarnation-scoped one is left unread until it is
 //     upgraded again.
 //
+//   - lease_term_claim_v1 has no flag either: every claimant relies on every
+//     other claiming the terms it records. It is inert without an adopted
+//     member voter generation, so `lv cluster voter reset` returns each node,
+//     as it adopts the reset generation, to recording terms from the quorum
+//     high-water read alone. While it is in force a takeover needs a majority
+//     of voters that can VOTE — durable, holding their signing key, at their
+//     admitted incarnation, not sealed — which is more than the read needed.
+//     Voter changes need that same majority: repair a voter while
+//     ha.voter.unavailable names it (`lv cluster voter rm` then `add`); once
+//     the claim has no majority the exits are restoring the lost voter or
+//     `lv cluster voter force-reconfigure --lost`, naming every member that
+//     cannot vote (abstaining ones included), each fenced proof-grade.
+//     `lv cluster voter reset` brings back the two-holder race. A binary
+//     rolled back below it
+//     enters WAL quarantine, as below every latched token; the lease-term
+//     claim rows its voters keep are node-local and left unread.
+//
 //   - fence_state_v1 has no flag either: it says this build resumes from an
 //     unverified fence recorded 'offline' and does not auto-activate such a
 //     host, which the lease holder relies on of every node. It changes only
@@ -1050,6 +1162,13 @@ const ReleaseToken = Release202611V1
 //     evaluator keeps re-deriving from a fault that is not the host's. A
 //     binary rolled back below it enters WAL quarantine, as below every
 //     latched token.
+//
+//   - spec_conflict_v1 has no flag either, and no stand-down of its own: it
+//     changes how replication resolves two edits of one spec made at one
+//     generation, and every replica must resolve them alike. A conflict it
+//     resolved is recorded as a vm.spec_edit_dropped event, from which the
+//     dropped edit can be made again. A binary rolled back below it enters
+//     WAL quarantine, as below every latched token.
 //
 //   - release_2026_11_v1 (the release token) has no flag and no stand-down of
 //     its own, and needs none: latching it changes nothing until a feature is
@@ -1170,6 +1289,10 @@ var supported = []string{
 	// keys claims by incarnation and seals the legacy key", a fact about the
 	// binary.
 	ClaimIncarnationV1,
+	// LeaseTermClaimV1 is advertised UNCONDITIONALLY: it says "this build
+	// answers lease-term claims and claims every term it records", a fact
+	// about the binary.
+	LeaseTermClaimV1,
 	// FenceStateV1 is advertised UNCONDITIONALLY: it says "this build resumes
 	// a recovery from an unverified fence recorded 'offline' and does not
 	// auto-activate such a host", a fact about the binary.
@@ -1177,6 +1300,10 @@ var supported = []string{
 	// RelayHealthV1 is advertised UNCONDITIONALLY: it says "this build reads
 	// the relay_demoted rows when it elects relays", a fact about the binary.
 	RelayHealthV1,
+	// SpecConflictV1 is advertised UNCONDITIONALLY: it says "this build
+	// decodes the epoch-carrying spec edit and resolves a conflict at one
+	// generation as anti-entropy does", a fact about the binary.
+	SpecConflictV1,
 	// RecoveryClaimV1 is advertised CONDITIONALLY: enforcement.recovery_claim
 	// (default on) on AND this node ready (split_brain_gate_v1 latched, voter_config_v1
 	// ready). Withheld while the flag is off because every flag-on node relies
@@ -1206,6 +1333,11 @@ var supported = []string{
 	// decides only whether this host SETS passwords, and no host relies on a
 	// peer setting them. See ConsolePasswordV1.
 	ConsolePasswordV1,
+	// VRRPUnicastV1 is advertised CONDITIONALLY on enforcement.vrrp_unicast
+	// (default on) until it has latched: each LB host relies on its peers
+	// rendering the same VRRP transport, so the latch must mean every host
+	// opted in. See VRRPUnicastV1.
+	VRRPUnicastV1,
 	// Release202611V1 is advertised UNCONDITIONALLY: it says "this build
 	// decodes, keeps and honours every field and shape of its release", a fact
 	// about the binary. What opens a feature is WithFeature, not a flag.
@@ -1215,7 +1347,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, Release202611V1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, LeaseTermClaimV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1, SpecConflictV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -1290,6 +1422,10 @@ var replicationGated = map[string]bool{
 	// Confirmed against every replication recipient: a v2 accept inside a
 	// replicated certificate must be verifiable by every host we stream to.
 	ClaimIncarnationV1: true,
+	// Confirmed against every replication recipient: any of them can hold a
+	// lease, and a build before this token records terms without claiming
+	// them. See LeaseTermClaimV1.
+	LeaseTermClaimV1: true,
 	// Confirmed against every replication recipient: any of them can hold the
 	// failover lease, a maintenance host on the previous build included, and
 	// that build resumes only from 'fenced'. See FenceStateV1.
@@ -1298,6 +1434,10 @@ var replicationGated = map[string]bool{
 	// relays from what it receives, so each must read the demotion rows. See
 	// RelayHealthV1.
 	RelayHealthV1: true,
+	// Confirmed against every replication recipient: each must decode the
+	// epoch-carrying spec edit and resolve a conflict as the rest do. See
+	// SpecConflictV1.
+	SpecConflictV1: true,
 	// Confirmed against every replication recipient: the claim_certificate
 	// column's statement shapes on runtime_action_proofs must be decodable by
 	// every host we stream to. Not mandatory: the flag is the opt-in.
@@ -1308,6 +1448,11 @@ var replicationGated = map[string]bool{
 	// to open its console. Holding the latch for it costs only time. See
 	// ConsolePasswordV1.
 	ConsolePasswordV1: true,
+	// Confirmed against every replication recipient: not a decode claim but a
+	// transport one — a host parked in maintenance on an older build may run
+	// an LB, and every LB host must render the transport its peers do. See
+	// VRRPUnicastV1.
+	VRRPUnicastV1: true,
 	// Confirmed against every replication recipient: a feature of the release
 	// may write what a previous-release peer cannot decode or would drop on a
 	// rewrite. See Release202611V1.
@@ -1370,6 +1515,10 @@ var mandatory = map[string]bool{
 	// legacy key), and a coordinator relies on every voter keeping that
 	// format. See ClaimIncarnationV1.
 	ClaimIncarnationV1: true,
+	// A fact about the binary (it answers lease-term claims and claims every
+	// term it records), and every claimant relies on every other doing so.
+	// See LeaseTermClaimV1.
+	LeaseTermClaimV1: true,
 	// A fact about the binary (it resumes from an unverified fence recorded
 	// 'offline' and does not auto-activate such a host), and the lease holder
 	// relies on whichever node holds the lease next. See FenceStateV1.
@@ -1378,6 +1527,10 @@ var mandatory = map[string]bool{
 	// elects relays), and every node relies on every other electing the same
 	// set. See RelayHealthV1.
 	RelayHealthV1: true,
+	// A fact about the binary (it decodes the epoch-carrying spec edit and
+	// resolves a conflict at one generation as every replica does). See
+	// SpecConflictV1.
+	SpecConflictV1: true,
 	// A fact about the binary (it decodes, keeps and honours its release's
 	// fields and shapes). Nothing changes until a feature is used, and every
 	// use is recorded first. See Release202611V1.

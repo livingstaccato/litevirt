@@ -71,14 +71,14 @@ func TestWriteFirewallRow_AsksEveryGateTheRowNeeds(t *testing.T) {
 	}
 }
 
-// A client's logged action or tag-group cidr is refused by every rule handler
-// at any latch state — InvalidArgument, "not supported yet" — before any gate
-// is asked, and nothing reaches storage: no renderer on this build renders
-// either. An IPv6 rule after the latch is written through its gate as before.
+// A client's logged action ("+" suffix), with or without a tag-group cidr,
+// is refused by every rule handler at any latch state — InvalidArgument, "not
+// supported yet" — before any gate is asked, and nothing reaches storage. An
+// IPv6 rule after the latch is written through its gate as before. (A plain
+// tag-group cidr is taken since D5a: TestTagRule_* in firewall_tag_rule_test.go.)
 //
-// Mutations: drop the "+" refusal in FirewallRowFeatures — after the latch
-// the logged rule is stored, red; drop the tag refusal — the tag rule is
-// stored, red.
+// Mutation: drop the "+" refusal in FirewallRowFeatures — after the latch
+// the logged rule is stored, red.
 func TestRuleHandlers_RefuseClientLogAndTagForms(t *testing.T) {
 	s := testServer(t)
 	g := &relGate{t: t}
@@ -115,7 +115,7 @@ func TestRuleHandlers_RefuseClientLogAndTagForms(t *testing.T) {
 		for _, form := range []struct{ cidr, action string }{
 			{"10.0.0.0/8", "drop+log"},
 			{"2001:db8::/32", "accept+log"},
-			{"tag:web", "accept"},
+			{"tag:web", "accept+log"},
 		} {
 			for what, w := range writes(form.cidr, form.action) {
 				if err := w(); status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "not supported") {
@@ -147,11 +147,11 @@ func TestRuleHandlers_RefuseClientLogAndTagForms(t *testing.T) {
 	}
 }
 
-// A compose stack holding a client logged action or a tag-group cidr is
-// refused before its old rows are torn down, at any latch state, and no gate
-// is asked; the stack's existing rows stay.
+// A compose stack holding a client logged action is refused before its old
+// rows are torn down, at any latch state, and no gate is asked; the stack's
+// existing rows stay.
 //
-// Mutation: drop either refusal — the stack is persisted (after the latch) or
+// Mutation: drop the refusal — the stack is persisted (after the latch) or
 // refused only by the gate after asking it, red.
 func TestStackFirewall_RefusesClientLogAndTagForms(t *testing.T) {
 	s := testServer(t)
@@ -160,7 +160,9 @@ func TestStackFirewall_RefusesClientLogAndTagForms(t *testing.T) {
 	bg := context.Background()
 	parse := func(cidr, action string) *compose.File {
 		t.Helper()
-		f, err := compose.ParseBytes([]byte(`
+		// ParseStored: the daemon's own refusal is under test; the compose
+		// validator refuses both forms first (its field grammar).
+		f, err := compose.ParseStored([]byte(`
 name: fwstack
 security-groups:
   web:
@@ -184,7 +186,7 @@ firewall:
 	}
 	for _, latched := range []bool{false, true} {
 		g.open = latched
-		for _, form := range []struct{ cidr, action string }{{"10.0.0.0/8", "drop+log"}, {"tag:web", "accept"}} {
+		for _, form := range []struct{ cidr, action string }{{"10.0.0.0/8", "drop+log"}, {"tag:web", "drop+log"}} {
 			err := s.persistStackFirewall(bg, parse(form.cidr, form.action))
 			if !errors.Is(err, corrosion.ErrFirewallRuleFormUnsupported) {
 				t.Errorf("latched=%v: stack with %s/%s: %v, want ErrFirewallRuleFormUnsupported", latched, form.cidr, form.action, err)

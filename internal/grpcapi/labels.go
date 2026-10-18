@@ -32,9 +32,23 @@ func (s *Server) SetVMLabels(ctx context.Context, req *pb.SetVMLabelsRequest) (*
 		return nil, err
 	}
 
+	// Made on the VM's owner, which serialises its spec edits; here when this
+	// host is the owner or the owner cannot be reached (spec_owner.go).
+	if vm.HostName != "" && vm.HostName != s.hostName && !s.forwardedByPeer(ctx) {
+		out, done, ferr := forwardSpecEdit(ctx, s, req.Name, vm.HostName, func(fctx context.Context, c pb.LiteVirtClient) (*pb.VM, error) {
+			return c.SetVMLabels(fctx, req)
+		})
+		if done {
+			if ferr == nil {
+				s.audit(ctx, "vm.set_labels", req.Name, "labels="+labelsSummary(req.Labels)+" on "+vm.HostName, "ok")
+			}
+			return out, ferr
+		}
+	}
+
 	// Merge the new labels into the stored spec and persist. Labels live in the
-	// replicated cluster state (corrosion), so we write directly — no host forward
-	// or libvirt call. MutateDesiredSpec applies the merge to the FRESH spec under
+	// replicated cluster state (corrosion), so there is no libvirt call.
+	// MutateDesiredSpec applies the merge to the FRESH spec under
 	// the mutation barrier (and touches only spec, not cpu/mem — this is a metadata
 	// edit that must not clobber a running VM's live actuals).
 	applied, _, err := corrosion.MutateDesiredSpec(ctx, s.db, req.Name, func(old string) (string, error) {

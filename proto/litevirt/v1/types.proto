@@ -35,6 +35,14 @@ enum HostState {
     // on a release before this value reports such a host HOST_OFFLINE; a
     // client before it shows the number 5.
     HOST_JOINING     = 5;
+    // Booted into a pending upgrade, or upgrading in place. A server on a
+    // release before this value reports such a host HOST_DRAINING; a client
+    // before it shows the number 6.
+    HOST_UPGRADING   = 6;
+    // Fenced by failover (or an operator) and not yet returned. A server on a
+    // release before this value reports such a host HOST_OFFLINE; a client
+    // before it shows the number 7.
+    HOST_FENCED      = 7;
 }
 
 enum MigrateStrategy {
@@ -595,6 +603,23 @@ message FirewallTags {
     map<string, string> tags       = 5;
     string              set_by     = 6;
     string              updated_at = 7;
+    // orphan: no live workload holds fw_id; the row an earlier incarnation of
+    // this name left, not applied (only listed when a workload is named).
+    bool                orphan     = 8;
+    // Set only in a tag set's answer when the workload's identity was a copy
+    // (another live workload held it too): the identity replaced, and the
+    // tags its row held, now cleared from both workloads.
+    string              replaced_fw_id = 9;
+    map<string, string> dropped_tags   = 10;
+    // unreadable: the workload's tags row cannot be read (malformed). It
+    // grants no membership, and its NICs are held at drop where a tag group
+    // binds security groups (tags shows none).
+    bool                unreadable     = 11;
+    // Set only in a tag set's answer: the networks on which the workload has
+    // no allocated address while a tag group it is a member of covers them.
+    // A tag: rule never matches its traffic there (a VM is leased an address
+    // only on a NetBox-bound network); the group's bindings still apply.
+    repeated string     unaddressed_networks = 12;
 }
 
 message PCIDevice {
@@ -692,6 +717,13 @@ message VM {
     // host's 127.0.0.1) requires a password (docs/ui.md "Console passwords").
     // Reach it through the web UI or `lv vnc <vm> --listen`, which present it.
     bool                           vnc_password_required = 22;
+    // vnc_unknown says, when it is not empty, that libvirt on the VM's host
+    // did not answer the read of its VNC console in time (or answered it
+    // with an error): vnc_address is then empty, or, when the address was
+    // read, vnc_password_required is false without saying the console has
+    // no password. Empty when both were read, or the VM has no console to
+    // read (not running, or on another host). Set by InspectVM/GetVM.
+    string                         vnc_unknown = 23;
 }
 
 message VMStrandedDisk {
@@ -815,6 +847,46 @@ message Host {
     // Whether a Redfish CA bundle is configured (the bundle itself is not
     // returned); false means the system roots.
     bool                           redfish_ca_configured = 28;
+    // Set by InspectHost only. Every in-flight capacity claim counted against
+    // this host, and their sums: reserved_cpu and reserved_mem_mib are the
+    // figures admission subtracts from this host's free capacity.
+    repeated HostReservation       reservations     = 29;
+    int32                          reserved_cpu     = 30;
+    int32                          reserved_mem_mib = 31;
+    // Set by InspectHost when some reservations could not be read: names each
+    // such operation, and why only to a caller who may vm.read cluster-wide.
+    // The readable reservations are still listed.
+    string                         reservations_error = 32;
+    // reserved_cpu and reserved_mem_mib cover only the listed reservations:
+    // true whenever reservations_error is set.
+    bool                           reservations_partial = 33;
+}
+
+// One in-flight capacity claim counted against a host.
+message HostReservation {
+    string                    operation_id       = 1;
+    string                    method             = 2;  // the RPC that made it: ResizeVMLive, CreateVM, MigrateVM, ...
+    // "resize", "create", "admission-lease", "transfer-lease", or the
+    // operation kind of a journal (vm_replace, drain_cold_move).
+    string                    kind               = 3;
+    // The workload name and its project; both empty when the caller may not
+    // vm.read it. The amounts, operation id and state are always shown.
+    string                    vm                 = 4;
+    string                    project            = 5;
+    int32                     vcpu               = 6;
+    int32                     memory_mib         = 7;
+    google.protobuf.Timestamp created_at         = 8;
+    int64                     age_seconds        = 9;
+    // in-flight, admitting, auto-expires, journal, releasable, stale, or
+    // release-blocked (see docs/diagnostics.md, "Host reservations").
+    string                    state              = 10;
+    string                    detail             = 11;
+    int64                     header_owner_epoch = 12;
+    bool                      admitted           = 13;
+    bool                      provisional        = 14;
+    // A tombstoned release row holds the key its release would be written at:
+    // it stays counted and nothing releases it.
+    bool                      release_blocked    = 15;
 }
 
 message Image {
@@ -875,6 +947,7 @@ message LoadBalancer {
     string            state       = 7;
     string            stack_name  = 8;  // empty for standalone LBs
     repeated LBPort   ports       = 9;  // port mappings
+    optional bool     snat        = 10; // rewrites its network's guest egress to the VIP; absent = unknown (the lookup failed)
 }
 
 message LBBackend {

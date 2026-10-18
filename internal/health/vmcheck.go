@@ -36,11 +36,17 @@ type VMChecker struct {
 	// SKIPS the file marker — so the path would be untested by construction.
 	dataDir string
 	db      *corrosion.Client
+	// followNetworks moves a stopped VM's NICs onto their networks' devices
+	// before a start (SetNetworkFollower).
+	followNetworks func(ctx context.Context, name string)
 	// virt is nil when there is no libvirt connection (most tests). An
 	// interface, not *lv.Client, so a test can drive a restart through
 	// libvirtfake; NewVMChecker keeps a nil *lv.Client a nil interface.
 	virt vmCheckBackend
-	bus  *events.Bus
+	// virtWait bounds the restart pass's reads of libvirt: a domain libvirt
+	// has not answered for is skipped, never decided on (domain_gate.go).
+	virtWait virtWait
+	bus      *events.Bus
 	// cancelledStart reports whether this host holds a cancelled start of a
 	// VM (SetCancelledStartProbe); nil: none.
 	cancelledStart func(name, state, detail string) bool
@@ -140,6 +146,14 @@ func (v *VMChecker) hwPrepareStart(ctx context.Context, vm *corrosion.VMRecord) 
 		return func() {}, nil
 	}
 	return v.prepareHardwareForStart(ctx, vm)
+}
+
+// SetNetworkFollower wires the hook that moves a stopped VM's NICs onto the
+// devices their networks are on now before the checker starts it
+// (grpcapi.Server.FollowNetworkDevices), as every start through the Server
+// does. nil-safe; unwired, the domain starts as defined.
+func (v *VMChecker) SetNetworkFollower(fn func(ctx context.Context, name string)) {
+	v.followNetworks = fn
 }
 
 // SetGate injects the split-brain safety gate (the health.Checker).
@@ -341,6 +355,12 @@ func (v *VMChecker) sweep(ctx context.Context) {
 			// cancelled-starts sweep, not recorded running or restarted.
 			continue
 		}
+		// A domain libvirt has not answered for is neither healed nor
+		// restarted this pass: both decide from libvirt's answer
+		// (domain_gate.go).
+		if v.virt != nil && !v.virtWait.domainAnswers(v.virt, "vmcheck", vm.Name) {
+			continue
+		}
 		// Reconcile a state desync first: if libvirt actually has the domain
 		// running, the cluster record is stale (an out-of-band start, or an
 		// RPC that mutated libvirt but failed before writing state). Heal it to
@@ -384,6 +404,7 @@ func (v *VMChecker) sweep(ctx context.Context) {
 // moved-away) VM stops leaking and stops counting toward isCorrelatedFailure. Also drops a
 // zero-valued activeActions entry for a stack that has no VMs mid-action (minor leak only).
 func (v *VMChecker) pruneVMState(current map[string]bool) {
+	v.virtWait.prune(current)
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	for name := range v.failures {
@@ -1239,6 +1260,9 @@ func (v *VMChecker) sharesWeightOf(vm corrosion.VMRecord) int {
 // startGuarded starts name's domain under the shared-disk release check
 // (GuardSharedDiskStart, review c2b).
 func (v *VMChecker) startGuarded(ctx context.Context, name string) error {
+	if v.followNetworks != nil {
+		v.followNetworks(ctx, name)
+	}
 	xml := ""
 	if d, ok := v.virt.(interface {
 		DumpXMLInactive(string) (string, error)

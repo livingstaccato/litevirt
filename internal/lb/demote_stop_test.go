@@ -30,7 +30,15 @@ func TestHelperKeepalivedHang(t *testing.T) {
 // invariant a leftover keepalived can't defeat. Uses a real SIGTERM-ignoring child so the
 // SIGTERM→timeout→SIGKILL→verify path is exercised end to end.
 func TestStopKeepalivedConfirmed_HungKeepalivedSIGKILLFallback(t *testing.T) {
-	m := &Manager{configDir: t.TempDir(), runDir: t.TempDir()}
+	// The confirm also sweeps every process's cmdline for a keepalived of
+	// this config, on every look. The helper is not one, so the sweep finds
+	// nothing here either way; on a host running thousands of busy processes
+	// each sweep took long enough that a confirm took 3-4 s against the
+	// bound below (96 of 1,200 runs under load on kvm003). This Manager's
+	// sweep reads an empty directory instead, and the bound times what this
+	// test is about: the ceiling, the SIGKILL, the reap.
+	m := &Manager{configDir: t.TempDir(), runDir: t.TempDir(),
+		procCmdlines: filepath.Join(t.TempDir(), "[0-9]*", "cmdline")}
 	const name = "hung"
 
 	helper := exec.Command(os.Args[0], "-test.run=^TestHelperKeepalivedHang$")

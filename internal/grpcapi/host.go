@@ -88,6 +88,7 @@ func (s *Server) InspectHost(ctx context.Context, req *pb.InspectHostRequest) (*
 	cpuUsed, memUsed, diskAllocated := s.hostAllocatedResources(ctx, h.Name)
 	pools := s.storagePoolsForHost(ctx, h.Name)
 	diskUsed, diskTotal := hostDiskFromPools(pools, int64(h.DiskTotal))
+	reservations, reservedCPU, reservedMem, reservationsErr := s.hostReservations(ctx, h.Name)
 
 	return &pb.Host{
 		Name:                h.Name,
@@ -115,6 +116,11 @@ func (s *Server) InspectHost(ctx context.Context, req *pb.InspectHostRequest) (*
 		CertSerial:          h.CertSerial,
 		CreatedAt:           parseTimestamp(h.CreatedAt),
 		UpdatedAt:           parseTimestamp(h.UpdatedAt),
+		Reservations:        reservations,
+		ReservedCpu:         reservedCPU,
+		ReservedMemMib:      reservedMem,
+		ReservationsError:   reservationsErr,
+		ReservationsPartial: reservationsErr != "",
 	}, nil
 }
 
@@ -188,6 +194,10 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		MigratePreconditions: !s.pingWithoutMigratePreconditionsForTest,
 		// This build force-stops inside DeleteVM (DeleteVMRequest.force).
 		DeleteForce: true,
+		// This build honours AbortVMOperationRequest.operation_id.
+		AbortScoped: true,
+		// This build reads UpdateVMRequest.nic_by_list_position (nic_index.go).
+		NicListPosition: !s.pingWithoutNICListPositionForTest,
 	}, nil
 }
 
@@ -318,7 +328,8 @@ func notEnforcingFrom(advertised []string, enabled func(string) bool) []string {
 // It also returns the peer's WALL clock so the health checker can detect NTP
 // drift without a second RPC. A peer that predates the field reports the zero
 // time, which the caller must read as "unknown", never as skew. Self returns the
-// zero time too: a node cannot be skewed against itself.
+// zero time too: a node cannot be skewed against itself. The peer's adopted
+// voter generation is recorded (PeerVoterGeneration).
 func (s *Server) PeerCapabilities(ctx context.Context, host string) ([]string, time.Time, error) {
 	if host == s.hostName {
 		return s.advertisedCapabilities(), time.Time{}, nil
@@ -333,6 +344,7 @@ func (s *Server) PeerCapabilities(ctx context.Context, host string) ([]string, t
 		return nil, time.Time{}, err
 	}
 	s.notePeerWALQuarantined(host, resp.GetWalQuarantined())
+	s.notePeerVoterGeneration(host, resp.GetVoterGeneration(), time.Now())
 	peerWall := time.Time{}
 	if s := resp.GetWallClock(); s != "" {
 		if parsed, perr := time.Parse(time.RFC3339Nano, s); perr == nil {
@@ -806,6 +818,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		SharesWeight: s.vmSharesWeight(ctx, vm.Name), TargetCgroup: targetCgroup,
 		StripVNCPassword: ens.vncPasswordUnavailable,
 		RBDLocators:      s.rbdLocatorsOf(ctx, vm.Name),
+		NICBridges:       s.migrationNICBridges(ctx, vm.Name, ens.netDevices),
 	}
 	if route.direct {
 		mp.Direct, mp.TLS = true, true
@@ -919,8 +932,8 @@ func (s *Server) UndrainHost(ctx context.Context, req *pb.UndrainHostRequest) (*
 		return nil, status.Errorf(codes.NotFound, "host %q not found", req.Name)
 	}
 
-	if err := corrosion.UpdateHostState(ctx, s.db, req.Name, "active"); err != nil {
-		return nil, status.Errorf(codes.Internal, "update host state: %v", err)
+	if err := s.undrainFrom(ctx, req.Name, h.State); err != nil {
+		return nil, err
 	}
 	s.publish("host.undrained", req.Name, "")
 	s.audit(ctx, "host.undrain", req.Name, "", "ok")
@@ -932,6 +945,102 @@ func (s *Server) UndrainHost(ctx context.Context, req *pb.UndrainHostRequest) (*
 	// to returning (failback.go), and says so in the reply.
 	s.autoFailback(ctx, req.Name, reply)
 	return reply, nil
+}
+
+// undrainPingTimeout bounds the Ping undrain sends a host recorded
+// 'upgrading'.
+const undrainPingTimeout = 5 * time.Second
+
+// undrainRestarting records active a host recorded 'upgrading', only if its
+// daemon answers a Ping. A host that answers serves but did not record itself
+// active (upgrading_unconfirmed), and recording it active is the remedy. One
+// that does not answer is still restarting: recording it active would end its
+// restart allowance, and the failover coordinator would fence it on the
+// failing run left from its stop (lab 1, 2026-10-17). It turns active by
+// itself once it serves (hostboot.ConfirmServing). The write is made only
+// while the host is still recorded 'upgrading'.
+func (s *Server) undrainRestarting(ctx context.Context, host string) error {
+	if host != s.hostName {
+		if err := s.pingHost(ctx, host); err != nil {
+			age := ""
+			if since, ok, serr := corrosion.HostStateSince(ctx, s.db, host); serr == nil && ok {
+				age = fmt.Sprintf(" (recorded upgrading %s ago)", time.Since(since).Round(time.Second))
+			}
+			return status.Errorf(codes.FailedPrecondition,
+				"%s is restarting%s and its daemon does not answer yet (%v); it turns active by itself once its daemon serves",
+				host, age, err)
+		}
+	}
+	applied, err := corrosion.UpdateHostStateFrom(ctx, s.db, host, "upgrading", "active")
+	if err != nil {
+		return status.Errorf(codes.Internal, "update host state: %v", err)
+	}
+	if applied {
+		return nil
+	}
+	h, err := corrosion.GetHost(ctx, s.db, host)
+	if err != nil || h == nil {
+		return status.Errorf(codes.NotFound, "host %q not found", host)
+	}
+	if h.State == "active" {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"%s is now recorded %s; run 'lv host undrain %s' again if it should be active", host, h.State, host)
+}
+
+// pingHost reports whether host's daemon answers a Ping as host. An answer
+// in another host's name (a misaddressed peer, or a node that dials itself
+// behind NAT) is not one.
+func (s *Server) pingHost(ctx context.Context, host string) error {
+	pctx, cancel := context.WithTimeout(ctx, undrainPingTimeout)
+	defer cancel()
+	c, closeConn, err := s.dialPeer(pctx, host)
+	if err != nil {
+		return err
+	}
+	defer closeConn()
+	resp, err := c.Ping(pctx, &pb.PingRequest{})
+	if err != nil {
+		return err
+	}
+	if got := resp.GetHostName(); got != host {
+		return fmt.Errorf("the daemon at its address answered as %q", got)
+	}
+	return nil
+}
+
+// undrainAttempts bounds how often undrainFrom re-reads a state that changed
+// under its write.
+const undrainAttempts = 3
+
+// undrainStateWrite is undrainFrom's conditional write; a var so a test can
+// make the state change under every write.
+var undrainStateWrite = corrosion.UpdateHostStateFrom
+
+// undrainFrom records host active, read as `from`. The write is made only
+// while the host is still recorded so, and on a miss the state is read again:
+// a SIGTERM's 'upgrading' write landing after the read is not overwritten,
+// and goes through undrainRestarting instead.
+func (s *Server) undrainFrom(ctx context.Context, host, from string) error {
+	for i := 0; i < undrainAttempts; i++ {
+		if from == "upgrading" {
+			return s.undrainRestarting(ctx, host)
+		}
+		applied, err := undrainStateWrite(ctx, s.db, host, from, "active")
+		if err != nil {
+			return status.Errorf(codes.Internal, "update host state: %v", err)
+		}
+		if applied {
+			return nil
+		}
+		h, err := corrosion.GetHost(ctx, s.db, host)
+		if err != nil || h == nil {
+			return status.Errorf(codes.NotFound, "host %q not found", host)
+		}
+		from = h.State
+	}
+	return status.Errorf(codes.Aborted, "%s's state kept changing while undrain wrote it; run 'lv host undrain %s' again", host, host)
 }
 
 // SetHostLabels sets or removes labels on a host.
@@ -1104,6 +1213,8 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 		IPMIPass:      h.IPMIPass,
 		Redfish:       h.Redfish,
 		WatchdogDev:   h.WatchdogDev,
+		// A retired credential is reported, never sent as an empty password.
+		IPMICredentialRetired: h.IPMIPassRetired,
 		// Only a fence aimed at THIS node may use the watchdog strategy; it arms
 		// the caller's own device. Everything else is unaffected.
 		IsSelf: h.Name == s.hostName,
@@ -1623,6 +1734,11 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*em
 
 	slog.Warn("host removed from cluster", "host", req.Name, "cert_serial", h.CertSerial)
 	s.publish("host.removed", req.Name, "cert_serial="+h.CertSerial)
+	// Only the raising host resolves its held-line conditions, and a removed
+	// one never will.
+	if err := corrosion.ResolveSpecEditHeldOfHost(ctx, s.db, req.Name); err != nil {
+		slog.Warn("could not resolve a removed host's held-spec-edit conditions", "host", req.Name, "error", err)
+	}
 
 	return &emptypb.Empty{}, nil
 }
@@ -1714,25 +1830,27 @@ func (s *Server) hostAllocatedResources(ctx context.Context, hostName string) (c
 }
 
 // hostStateToPB maps a stored hosts.state string to the wire enum for display.
-// Critically it must never report a non-active host as HOST_ACTIVE: a fenced
-// (forcibly isolated after failover) or upgrading host shown as ACTIVE would
-// hide a dead/transitioning node from operators. There is no HOST_FENCED /
-// HOST_UPGRADING enum yet (would need a proto bump), so fenced maps to the
-// honest "unavailable" state OFFLINE and upgrading to the transitional DRAINING.
-// The default fails safe to OFFLINE so an unknown/future state can't masquerade
-// as healthy.
+// Each state maps to the value named after it, since `lv host ls` prints that
+// name. Critically it must never report a non-active host as HOST_ACTIVE: a
+// fenced (forcibly isolated after failover) or upgrading host shown as ACTIVE
+// would hide a dead/transitioning node from operators. The default fails safe
+// to OFFLINE so an unknown/future state can't masquerade as healthy.
 func hostStateToPB(s string) pb.HostState {
 	switch s {
 	case "active":
 		return pb.HostState_HOST_ACTIVE
-	case "draining", "upgrading":
+	case "draining":
 		return pb.HostState_HOST_DRAINING
+	case "upgrading":
+		return pb.HostState_HOST_UPGRADING
 	case "maintenance":
 		return pb.HostState_HOST_MAINTENANCE
 	case "suspect":
 		return pb.HostState_HOST_SUSPECT
-	case "offline", "fenced":
+	case "offline":
 		return pb.HostState_HOST_OFFLINE
+	case "fenced":
+		return pb.HostState_HOST_FENCED
 	case corrosion.HostStateJoining:
 		// Admitted by `lv host add`, its daemon not yet started. Not OFFLINE:
 		// nothing has failed, and the coordinator never fences it.

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,9 @@ import (
 type Manager struct {
 	configDir string // base dir for generated configs
 	runDir    string // PID files
+	// procCmdlines, when set, replaces defaultProcCmdlines as the glob the
+	// keepalived sweep reads. Tests only.
+	procCmdlines string
 }
 
 // applyLocks serializes Apply/Remove per LB name. NewManager() is constructed
@@ -48,10 +52,13 @@ func lbLock(name string) *sync.Mutex {
 
 // NewManager returns a Manager.
 func NewManager() *Manager {
-	return &Manager{
-		configDir: "/etc/litevirt/lb",
-		runDir:    "/run/litevirt/lb",
-	}
+	return NewManagerAt(DefaultConfigDir, "/run/litevirt/lb")
+}
+
+// NewManagerAt returns a Manager writing configs to configDir and pidfiles to
+// runDir (tests that run the real apply against stand-in binaries).
+func NewManagerAt(configDir, runDir string) *Manager {
+	return &Manager{configDir: configDir, runDir: runDir}
 }
 
 // applyMarkerPath is the "an Apply started and did not finish" marker for an LB.
@@ -90,9 +97,20 @@ func (m *Manager) reloadDecision(name, haproxyCfg, keepalivedCfg string) (haprox
 // Apply writes HAProxy + keepalived configs and starts/reloads processes.
 // It is idempotent: calling Apply twice with the same config is safe.
 func (m *Manager) Apply(ctx context.Context, cfg Config) error {
+	// Before anything else: every file below is root-owned and named after
+	// cfg.Name, and the notify script keepalived runs as root names it too.
+	if err := ValidateName(cfg.Name); err != nil {
+		return err
+	}
+	cfg.ConfigDir = m.configDir
 	lk := lbLock(cfg.Name)
 	lk.Lock()
 	defer lk.Unlock()
+	notifyPath := filepath.Join(m.configDir, cfg.Name+"-notify.sh")
+	if cfg.KeepSNAT {
+		_, err := os.Stat(notifyPath)
+		cfg.SNATEnabled = err == nil
+	}
 
 	if err := os.MkdirAll(m.configDir, 0750); err != nil {
 		return fmt.Errorf("create lb config dir: %w", err)
@@ -119,6 +137,24 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 	}
 	haproxyChanged, keepalivedChanged := m.reloadDecision(cfg.Name, haproxyCfg, keepalivedCfg)
 
+	// Read every TLS listener's cert and key before writing anything, so a
+	// refused or unreadable file leaves the LB as it was.
+	pems := map[int][]byte{}
+	for _, p := range cfg.Ports {
+		if p.TLS == nil {
+			continue
+		}
+		cert, err := m.readTLSFile(p.TLS.Cert)
+		if err != nil {
+			return fmt.Errorf("read TLS cert: %w", err)
+		}
+		key, err := m.readTLSFile(p.TLS.Key)
+		if err != nil {
+			return fmt.Errorf("read TLS key: %w", err)
+		}
+		pems[p.Listen] = append(cert, key...)
+	}
+
 	// From here on the on-disk state can diverge from what is actually running,
 	// so mark the apply in flight. Cleared only by a complete pass at the end.
 	marker := m.applyMarkerPath(cfg.Name)
@@ -137,19 +173,11 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 
 	// Write combined PEM files for TLS-terminated ports.
 	for _, p := range cfg.Ports {
-		if p.TLS == nil {
+		combined, ok := pems[p.Listen]
+		if !ok {
 			continue
 		}
-		cert, err := os.ReadFile(p.TLS.Cert)
-		if err != nil {
-			return fmt.Errorf("read TLS cert %s: %w", p.TLS.Cert, err)
-		}
-		key, err := os.ReadFile(p.TLS.Key)
-		if err != nil {
-			return fmt.Errorf("read TLS key %s: %w", p.TLS.Key, err)
-		}
 		pemPath := filepath.Join(m.configDir, fmt.Sprintf("%s-%d.pem", cfg.Name, p.Listen))
-		combined := append(cert, key...)
 		// combined carries the private key, so it gets the same atomic,
 		// never-widening write as every other secret in the tree: os.WriteFile
 		// would inherit the mode of a PEM left loose by an earlier render.
@@ -158,15 +186,25 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 		}
 	}
 
-	// Write conntrackd + notify script if SNAT is enabled.
-	if cfg.SNATEnabled {
+	// Write conntrackd + notify script if SNAT is enabled. conntrackd is
+	// (re)started below only when its config changed or it is not running:
+	// a restart drops the state it has synced from its peer.
+	ctPath := filepath.Join(m.configDir, cfg.Name+"-conntrackd.conf")
+	startCT := false
+	switch {
+	case cfg.KeepSNAT:
+		// Leave conntrackd, its config and the notify script as they are.
+	case cfg.SNATEnabled:
 		conntrackdCfg, err := RenderConntrackd(cfg)
 		if err != nil {
 			slog.Warn("conntrackd config render failed (SNAT failover may not work)", "lb", cfg.Name, "error", err)
 		} else {
-			ctPath := filepath.Join(m.configDir, cfg.Name+"-conntrackd.conf")
+			// Not installed: warned once per process, not on every apply.
+			startCT = conntrackdInstalled() &&
+				(configChanged(ctPath, conntrackdCfg) || !procByConfigAlive("conntrackd", ctPath))
 			if err := os.WriteFile(ctPath, []byte(conntrackdCfg), 0640); err != nil {
 				slog.Warn("write conntrackd config failed", "error", err)
+				startCT = false
 			}
 		}
 
@@ -174,11 +212,15 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 		if err != nil {
 			slog.Warn("notify script render failed", "lb", cfg.Name, "error", err)
 		} else {
-			notifyPath := filepath.Join(m.configDir, cfg.Name+"-notify.sh")
 			if err := os.WriteFile(notifyPath, []byte(notifyScript), 0750); err != nil {
 				slog.Warn("write notify script failed", "error", err)
 			}
 		}
+	default:
+		// No SNAT (or no longer): this LB runs no conntrackd.
+		killProcByConfig("conntrackd", ctPath)
+		os.Remove(ctPath)     //nolint:errcheck
+		os.Remove(notifyPath) //nolint:errcheck
 	}
 
 	// Ensure ip_nonlocal_bind is enabled so HAProxy can bind to the VIP
@@ -191,10 +233,8 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 	}
 
 	// Start conntrackd before keepalived if SNAT is enabled.
-	if cfg.SNATEnabled {
-		ctPath := filepath.Join(m.configDir, cfg.Name+"-conntrackd.conf")
-		ctPid := filepath.Join(m.runDir, cfg.Name+"-conntrackd.pid")
-		if err := m.startConntrackd(ctx, ctPath, ctPid); err != nil {
+	if startCT {
+		if err := m.startConntrackd(ctx, cfg.Name, ctPath); err != nil {
 			slog.Warn("conntrackd start failed (SNAT failover may not work)", "lb", cfg.Name, "error", err)
 		}
 	}
@@ -269,6 +309,42 @@ func cmdlineMatchesBinaryConfig(cmdline, binary, cfgPath string) bool {
 	return hasBin && hasCfg
 }
 
+// conntrackdLockPath is the lock file conntrackd.conf names for an LB.
+func conntrackdLockPath(name string) string {
+	return "/var/lock/conntrack-" + name + ".lock"
+}
+
+var (
+	conntrackdOnce  sync.Once
+	conntrackdFound bool
+	lookConntrackd  = func() error { _, err := exec.LookPath("conntrackd"); return err }
+)
+
+// conntrackdInstalled reports whether conntrackd is on PATH, looked up once
+// per process; a missing one is warned about once rather than on every apply.
+func conntrackdInstalled() bool {
+	conntrackdOnce.Do(func() {
+		if err := lookConntrackd(); err != nil {
+			slog.Warn("lb: conntrackd is not installed; SNAT'd connections will not survive an LB failover", "error", err)
+			return
+		}
+		conntrackdFound = true
+	})
+	return conntrackdFound
+}
+
+// procByConfigAlive reports whether a `binary` process bound to cfgPath runs.
+func procByConfigAlive(binary, cfgPath string) bool {
+	matches, _ := filepath.Glob("/proc/[0-9]*/cmdline")
+	for _, cf := range matches {
+		data, err := os.ReadFile(cf)
+		if err == nil && cmdlineMatchesBinaryConfig(string(data), binary, cfgPath) {
+			return true
+		}
+	}
+	return false
+}
+
 // killProcByConfig SIGTERMs (then SIGKILLs) every `binary` process bound to
 // cfgPath. Used at teardown to catch reload/restart siblings the pidfile no
 // longer tracks (haproxy `-sf` reloads, racing keepalived restarts). Killing a
@@ -312,6 +388,9 @@ const removeKeepalivedStopTimeout = 5 * time.Second
 // tuple isn't lost) — the Phase-2 stand-down turns that error into a refused takeover, so
 // a surviving VRRP backup can never pass as "released". haproxy/conntrackd are best-effort.
 func (m *Manager) Remove(ctx context.Context, name string) error {
+	if err := ValidateName(name); err != nil {
+		return err
+	}
 	// Same key as Apply so teardown can't interleave with an in-flight apply
 	// (which would resurrect what we're tearing down / orphan a process).
 	lk := lbLock(name)
@@ -331,6 +410,7 @@ func (m *Manager) Remove(ctx context.Context, name string) error {
 	// Sweep any haproxy still bound to this LB's config file (reload/restart siblings the
 	// pidfile no longer tracks). keepalived was already handled with confirmation above.
 	killProcByConfig("haproxy", filepath.Join(m.configDir, name+"-haproxy.cfg"))
+	killProcByConfig("conntrackd", filepath.Join(m.configDir, name+"-conntrackd.conf"))
 
 	// Remove config files. Keep the keepalived config if it couldn't be confirmed
 	// stopped — deleting it would orphan the survivor (DemoteAll's glob wouldn't see it).
@@ -365,7 +445,7 @@ func (m *Manager) HasLB(name string) bool {
 	if _, err := os.Stat(cfgPath); err == nil {
 		return true
 	}
-	return len(keepalivedPidsForConfig(cfgPath)) > 0
+	return len(keepalivedPidsForConfig(m.cmdlineGlob(), cfgPath)) > 0
 }
 
 // SetBackendEnabled enables or disables a backend in HAProxy via its stats socket.
@@ -721,6 +801,95 @@ func (m *Manager) startOrReloadKeepalived(cfgPath, pidFile string) error {
 	return nil
 }
 
+// Transport is the VRRP transport a keepalived config renders.
+type Transport struct {
+	Unicast bool
+	Iface   string   // the vrrp_instance's interface
+	Src     string   // unicast_src_ip
+	Peers   []string // unicast_peer, sorted, without a sole host's self entry
+	// VIPDev is the VIP's device (the virtual_ipaddress line's dev). It is
+	// not part of the transport: Equal ignores it.
+	VIPDev string
+}
+
+// Equal reports whether t and o render the same transport (VIPDev aside).
+func (t Transport) Equal(o Transport) bool {
+	if t.Unicast != o.Unicast {
+		return false
+	}
+	if !t.Unicast {
+		return true
+	}
+	if t.Iface != o.Iface || t.Src != o.Src || len(t.Peers) != len(o.Peers) {
+		return false
+	}
+	a, b := append([]string(nil), t.Peers...), append([]string(nil), o.Peers...)
+	sort.Strings(a)
+	sort.Strings(b)
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TransportOf is the transport of cfg as RenderKeepalived renders it.
+func TransportOf(cfg Config) Transport {
+	if !cfg.VRRPUnicast {
+		return Transport{}
+	}
+	return Transport{Unicast: true, Iface: cfg.VRRPInterface, Src: cfg.UnicastSrc, Peers: cfg.UnicastPeers, VIPDev: cfg.Interface}
+}
+
+// KeepalivedTransport reads the VRRP transport of this LB's keepalived config
+// on disk; ok=false when there is no readable config.
+func (m *Manager) KeepalivedTransport(name string) (t Transport, ok bool) {
+	data, err := os.ReadFile(filepath.Join(m.configDir, name+"-keepalived.conf"))
+	if err != nil {
+		return Transport{}, false
+	}
+	return parseTransport(string(data)), true
+}
+
+// parseTransport reads a rendered config's transport. A sole host's self
+// entry (rendered with max_ttl 0) is not a peer.
+func parseTransport(conf string) Transport {
+	var t Transport
+	inPeers, inVIP := false, false
+	for _, line := range strings.Split(conf, "\n") {
+		f := strings.Fields(line)
+		switch {
+		case len(f) == 0:
+		case (inPeers || inVIP) && f[0] == "}":
+			inPeers, inVIP = false, false
+		case inPeers:
+			if !strings.Contains(line, "max_ttl 0") {
+				t.Peers = append(t.Peers, f[0])
+			}
+		case inVIP:
+			for i := 1; i+1 < len(f); i++ {
+				if f[i] == "dev" {
+					t.VIPDev = f[i+1]
+				}
+			}
+		case f[0] == "virtual_ipaddress":
+			inVIP = true
+		case f[0] == "interface" && len(f) == 2:
+			t.Iface = f[1]
+		case f[0] == "unicast_src_ip" && len(f) == 2:
+			t.Unicast, t.Src = true, f[1]
+		case f[0] == "unicast_peer":
+			inPeers = true
+		}
+	}
+	if !t.Unicast {
+		return Transport{}
+	}
+	sort.Strings(t.Peers)
+	return t
+}
+
 // KeepalivedRunning reports whether this LB's keepalived process is alive — the
 // real signal that its VIP is assigned. HAProxy binds the VIP non-locally even
 // when keepalived is down, so "haproxy is up" is NOT evidence the VIP works.
@@ -728,25 +897,16 @@ func (m *Manager) KeepalivedRunning(name string) bool {
 	return pidAlive(filepath.Join(m.runDir, name+"-keepalived.pid"))
 }
 
-// startConntrackd starts conntrackd for SNAT conntrack replication.
-func (m *Manager) startConntrackd(ctx context.Context, cfgPath, pidFile string) error {
-	// Kill existing if running.
-	if pid := readPid(pidFile); pid > 0 && processAlive(pid) {
-		syscall.Kill(pid, syscall.SIGTERM)
-		for i := 0; i < 20; i++ {
-			if !processAlive(pid) {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-		if processAlive(pid) {
-			syscall.Kill(pid, syscall.SIGKILL)
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-	os.Remove(pidFile) //nolint:errcheck
+// startConntrackd (re)starts this LB's conntrackd for SNAT conntrack
+// replication. conntrackd writes no pidfile, so the running one is found by the
+// config it was started with; its lock file would refuse a second instance.
+func (m *Manager) startConntrackd(ctx context.Context, name, cfgPath string) error {
+	killProcByConfig("conntrackd", cfgPath)
+	// No conntrackd runs on this config now, so a lock file left by one that
+	// died uncleanly is stale, and would refuse the start forever.
+	os.Remove(conntrackdLockPath(name)) //nolint:errcheck
 
-	cmd := exec.Command("conntrackd", "-C", cfgPath, "-d")
+	cmd := exec.CommandContext(ctx, "conntrackd", "-C", cfgPath, "-d")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("conntrackd start: %w: %s", err, out)
@@ -890,6 +1050,48 @@ func DetectInterfaceForIP(targetIP string) string {
 	}
 
 	return DetectInterface()
+}
+
+// InterfaceHoldingIP is the up, non-loopback device that holds ip as one of
+// its own addresses, or "" when none does. Unlike DetectInterfaceForIP it never
+// guesses: VRRP sent from an address the host does not own is never answered.
+func InterfaceHoldingIP(ip string) string {
+	want := net.ParseIP(ip)
+	if want == nil {
+		return ""
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		// A loopback device sends nothing off the host, and a down one
+		// sends nothing at all: the address is not held for VRRP's purpose.
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.Equal(want) {
+				return iface.Name
+			}
+		}
+	}
+	return ""
+}
+
+// InterfaceUpRunning reports whether dev exists, is up and has carrier
+// (IFF_RUNNING), as keepalived's track_interface requires: without it
+// keepalived enters FAULT and releases the VIP.
+func InterfaceUpRunning(dev string) bool {
+	iface, err := net.InterfaceByName(dev)
+	if err != nil {
+		return false
+	}
+	return iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagRunning != 0
 }
 
 // VRIDFromString converts a string to a stable VRID (helper for tests).

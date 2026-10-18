@@ -92,6 +92,8 @@ func NewServerForTests(opts TestServerOpts) *Server {
 		fetchBinarySem: make(chan struct{}, fetchBinaryMaxConcurrent),
 		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
 		fwStore:        lv.NewFirmwareStore(opts.DataDir),
+		lbKick:         make(chan struct{}, 1),
+		vrrpAskKick:    make(chan struct{}, 1),
 	}
 	s.wireCertificateVerifier()
 	s.wireReplicationReleaseGates()
@@ -120,6 +122,10 @@ func SetVNCHandshakeTimeoutForTests(d time.Duration) func() {
 	return func() { vncHandshakeTimeout = old }
 }
 
+// HoldVMLockForTest takes this server's per-VM lock on name, as a request in
+// flight for that VM holds it, and returns its release.
+func (s *Server) HoldVMLockForTest(name string) (release func()) { return s.lockVM(name) }
+
 // NotEnforcingTokensForTests is what this server would report in
 // PingResponse.not_enforcing, for a fleet scenario to assert on.
 func (s *Server) NotEnforcingTokensForTests() []string { return s.notEnforcingTokens() }
@@ -139,12 +145,17 @@ func (s *Server) SetDependsOnWaitTimeoutForTests(d time.Duration) {
 }
 
 // ForgetNetworkReconcileForTests drops everything ReconcileNetworksOnce
-// remembers about this host, as a daemon restart does: the next pass
+// remembers about this host, and the device each network was provisioned on
+// here as far as this process holds it in memory (a state file set with
+// SetNetworkDeviceStatePath is read again), as a daemon restart does: the next pass
 // provisions every live network and tears down every tombstoned one again.
 func (s *Server) ForgetNetworkReconcileForTests() {
 	s.netReconcile.mu.Lock()
 	defer s.netReconcile.mu.Unlock()
 	s.netReconcile.applied, s.netReconcile.torn, s.netReconcile.lastErr = nil, nil, nil
+	s.netDevs.mu.Lock()
+	s.netDevs.defs, s.netDevs.pending, s.netDevs.loaded = nil, nil, false
+	s.netDevs.mu.Unlock()
 }
 
 // RecreateVMForTest runs the rolling engine's recreate of name to desired
@@ -227,3 +238,31 @@ func (s *Server) SetImagePushUnmarkedForTest(unmarked bool) {
 func (s *Server) AutoPullFromPeerForTest(ctx context.Context, name, source string) error {
 	return s.pullImageFromPeer(ctx, name, source)
 }
+
+// SetClearFirewallTagsForTest replaces every firewall-tags clear this server
+// makes (a delete's, a copied identity's) with fn, so a fleet scenario can
+// make the clear fail; nil restores ClearFirewallTags.
+func (s *Server) SetClearFirewallTagsForTest(fn func(ctx context.Context, kind, fwID string) error) {
+	if fn == nil {
+		s.testClearFirewallTagsLive.Store(nil)
+		return
+	}
+	s.testClearFirewallTagsLive.Store(&fn)
+}
+
+// SweepReleaseUsesForTest runs one release use sweep pass on this server, as
+// the lease holder's ticker does every releaseUseSweepInterval.
+func (s *Server) SweepReleaseUsesForTest(ctx context.Context) {
+	s.sweepReleaseUses(ctx, releaseUseProbes)
+}
+
+// SweepFirewallTagOrphansForTest runs one firewall-tags orphan sweep pass on
+// this server with its clock at now (a fake clock: the grace is judged
+// against it).
+func (s *Server) SweepFirewallTagOrphansForTest(ctx context.Context, now time.Time) {
+	s.sweepFirewallTagOrphans(ctx, now)
+}
+
+// SetStackMemberDeleteHookForTest sets the seam DeleteStack calls with each
+// member's name right before deleting it.
+func (s *Server) SetStackMemberDeleteHookForTest(fn func(name string)) { s.stackMemberDeleteHook = fn }

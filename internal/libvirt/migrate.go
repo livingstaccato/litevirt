@@ -46,6 +46,11 @@ type MigrateParams struct {
 	// monitors that locator resolves to NOW (its pool's current mon_host or
 	// conf), not the ones the running domain was defined with.
 	RBDLocators map[string]string
+	// NICBridges moves NICs (by MAC) onto other bridges on the destination:
+	// a NIC whose network has moved to another device since the domain was
+	// defined lands on the network's device now, which the target has; the
+	// device it left there may be gone.
+	NICBridges map[string]string
 	// DestXML and PersistXML are the definitions MigrateToTarget builds from
 	// CDROMSources; callers leave them empty.
 	DestXML    string
@@ -350,7 +355,7 @@ func MigrationDomainXML(live, persist string, p MigrateParams) (dest, persistOut
 func migrationDefinitions(p MigrateParams, live, persist func() (string, error)) (string, string, error) {
 	v2 := cgroupV2()
 	retarget := shareRetargetNeeded(p, v2)
-	if len(p.CDROMSources) == 0 && len(p.RBDLocators) == 0 && !retarget && !p.StripVNCPassword {
+	if len(p.CDROMSources) == 0 && len(p.RBDLocators) == 0 && !retarget && !p.StripVNCPassword && len(p.NICBridges) == 0 {
 		return "", "", nil
 	}
 	l, err := live()
@@ -380,6 +385,11 @@ func migrationDefinitions(p MigrateParams, live, persist func() (string, error))
 		if persistOut, err = StripVNCPassword(persistOut); err != nil {
 			return "", "", err
 		}
+	}
+	// Each NIC whose network moved, on the network's device now.
+	for mac, bridge := range p.NICBridges {
+		dest, _ = RetargetDomainXML(dest, mac, bridge)
+		persistOut, _ = RetargetDomainXML(persistOut, mac, bridge)
 	}
 	return dest, persistOut, nil
 }

@@ -55,7 +55,22 @@ func DeterministicNICID(vmName, mac string) string {
 // Clears deleted_at — an upsert of a previously-tombstoned id resurrects it,
 // same as InsertInterface's re-attach semantics.
 func UpsertNIC(ctx context.Context, c *Client, r NICRecord) error {
+	// Just past the row this replaces when that one is newer than this host's
+	// clock (a tombstone from a host whose clock ran ahead), so a re-attach
+	// of a MAC is never older than its earlier detach on any replica.
+	floor := ""
+	if rows, err := c.Query(ctx, `SELECT updated_at FROM vm_nics WHERE vm_name = ? AND id = ?`, r.VMName, r.ID); err != nil {
+		return err
+	} else if len(rows) > 0 {
+		floor = rows[0].String("updated_at")
+	}
 	now := c.NowTS()
+	if floor != "" && !LWWNewer(now, floor) {
+		var err error
+		if now, err = c.nicStampAfter(r.VMName, r.MAC, floor, "vm_nics row"); err != nil {
+			return err
+		}
+	}
 	model := r.Model
 	if model == "" {
 		model = "virtio"
@@ -223,6 +238,19 @@ func MergedVMNICs(ctx context.Context, c *Client, vmName string) ([]NICRecord, e
 // greatest updated_at wins, vm_nics on an exact tie, and a tombstoned winner
 // hides the NIC. The result is unordered.
 func mergeNICRows(ifaces, nics []NICRecord) []NICRecord {
+	best := nicRowWinners(ifaces, nics)
+	out := make([]NICRecord, 0, len(best))
+	for _, w := range best {
+		if w.DeletedAt == "" {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// nicRowWinners is the overlay's winning row per (vm_name, mac), tombstoned
+// winners included (mergeNICRows).
+func nicRowWinners(ifaces, nics []NICRecord) map[nicKey]NICRecord {
 	type candidate struct {
 		rec      NICRecord
 		fromNics bool
@@ -248,15 +276,27 @@ func mergeNICRows(ifaces, nics []NICRecord) []NICRecord {
 	for _, r := range ifaces {
 		consider(r, false)
 	}
+	// A legacy row has no model column (it reads as virtio). When it wins over
+	// a LIVE vm_nics row for the same NIC — an IP or tap write bumped it — the
+	// NIC's model is still the vm_nics row's. A tombstoned vm_nics row is not
+	// consulted: a NIC attached again under that MAC is another NIC.
+	liveModel := make(map[nicKey]string)
 	for _, r := range nics {
 		consider(r, true)
+		if r.DeletedAt == "" && r.Model != "" {
+			liveModel[nicJoinKey(r)] = r.Model
+		}
 	}
 
-	out := make([]NICRecord, 0, len(best))
-	for _, cand := range best {
-		if cand.rec.DeletedAt == "" {
-			out = append(out, cand.rec)
+	out := make(map[nicKey]NICRecord, len(best))
+	for k, cand := range best {
+		rec := cand.rec
+		if !cand.fromNics {
+			if m, ok := liveModel[k]; ok {
+				rec.Model = m
+			}
 		}
+		out[k] = rec
 	}
 	return out
 }
@@ -303,12 +343,18 @@ func BridgeVMNICs(ctx context.Context, c *Client, vmName string) error {
 		}
 		if iface.DeletedAt == "" {
 			// Live legacy NIC → materialize into vm_nics. Fields come through
-			// GetVMNICsRaw's vm_interfaces projection (Model synthesized "virtio").
+			// GetVMNICsRaw's vm_interfaces projection (Model synthesized "virtio"),
+			// except the model: a live vm_nics row of the NIC keeps its own, the
+			// one only it records (an IP write bumps the legacy row alone).
+			model := iface.Model
+			if have && existing.DeletedAt == "" && existing.Model != "" {
+				model = existing.Model
+			}
 			if err := UpsertNIC(ctx, c, NICRecord{
 				VMName:         iface.VMName,
 				ID:             iface.ID,
 				NetworkName:    iface.NetworkName,
-				Model:          iface.Model,
+				Model:          model,
 				MAC:            iface.MAC,
 				Ordinal:        iface.Ordinal,
 				IP:             iface.IP,

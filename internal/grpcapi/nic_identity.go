@@ -10,7 +10,11 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
+	"hash/fnv"
+	"log/slog"
 	"net/netip"
+	"sort"
 	"strings"
 	"time"
 
@@ -262,6 +266,143 @@ func (s *Server) reserveDHCPAddress(ctx context.Context, netName, subnet, bridge
 	return ip, nil
 }
 
+// hostIsolatedAddress picks the address a new NIC on host-isolated network
+// netName is given. Free means: no live NIC row or lease on the network holds
+// it, it is not the network's gateway, one of its reserved addresses or a
+// load balancer's VIP (a live lb_configs row's, or one of vips, those of the
+// workload being created), and no create in flight on this host just took
+// it. The NIC row records it, and the seed's network-config delivers it to
+// the guest as a static address. The caller releases the pick
+// (releaseHostIsolatedPicks) once its rows are written or its create failed.
+//
+// The pick is decided from this node's replica, so two creates on two hosts
+// in the same moment could pick alike. The scan starts at an offset hashed
+// from this host and the network, which makes that unlikely short of a
+// nearly full subnet; a duplicate that happens anyway is reported by the
+// firewall reconciler (firewall.DuplicateAddressReporter).
+func (s *Server) hostIsolatedAddress(ctx context.Context, netName string, def *compose.NetworkDef, vips []string) (string, error) {
+	lbs, err := corrosion.ListLBConfigs(ctx, s.db)
+	if err != nil {
+		return "", err
+	}
+	s.dhcpResMu.Lock()
+	defer s.dhcpResMu.Unlock()
+	// Read under the lock: a container's lease on this host is written under
+	// it too (claimContainerAddress), so neither misses the other.
+	assigned, err := corrosion.NetworkAssignedAddrs(ctx, s.db)
+	if err != nil {
+		return "", err
+	}
+	s.pruneIsoPendingLocked()
+	used := append([]string(nil), assigned[netName]...)
+	for ip := range s.isoPending[netName] {
+		used = append(used, ip)
+	}
+	if def.Gateway != "" {
+		used = append(used, def.Gateway)
+	}
+	used = append(used, def.ReservedAddresses...)
+	for _, lb := range lbs {
+		used = append(used, lb.VIP)
+	}
+	used = append(used, vips...)
+	ip, err := network.NextFreeIPv4From(def.Subnet, used, s.isoScanOffset(netName))
+	if err != nil {
+		return "", err
+	}
+	if s.isoPending[netName] == nil {
+		s.isoPending[netName] = map[string]time.Time{}
+	}
+	s.isoPending[netName][ip] = time.Now()
+	return ip, nil
+}
+
+// stackVIPs are the load balancer VIPs the stack's VMs already recorded
+// name in their specs: an LB row is written only after its stack's VMs, so
+// a VM created after one that names a VIP must still pass over it. A VIP
+// named by a VM of the stack created later is not known yet
+// (docs/compose.md: list it in reserved-addresses). Read only; a read
+// failure gives none.
+func (s *Server) stackVIPs(ctx context.Context, stack string) []string {
+	if stack == "" {
+		return nil
+	}
+	vms, err := corrosion.ListVMs(ctx, s.db, stack, "")
+	if err != nil {
+		slog.Warn("host-isolated pick: could not read the stack's VMs for their VIPs", "stack", stack, "error", err)
+		return nil
+	}
+	var out []string
+	for _, vm := range vms {
+		var spec pb.VMSpec
+		if json.Unmarshal([]byte(vm.Spec), &spec) != nil {
+			continue
+		}
+		if lb := spec.GetLoadbalancer(); lb != nil && lb.GetVip() != "" {
+			out = append(out, lb.GetVip())
+		}
+	}
+	return out
+}
+
+// isoScanOffset is where this host's scan of netName's subnet starts.
+func (s *Server) isoScanOffset(netName string) uint64 {
+	if s.isoOffset != nil {
+		return s.isoOffset(netName)
+	}
+	h := fnv.New64a()
+	h.Write([]byte(s.hostName + "\x00" + netName))
+	return h.Sum64()
+}
+
+// isoPick is one address hostIsolatedAddress handed out.
+type isoPick struct{ network, ip string }
+
+// releaseHostIsolatedPicks drops picks from the in-flight set: their rows are
+// written (and now hold the address) or their create failed.
+func (s *Server) releaseHostIsolatedPicks(picks []isoPick) {
+	if len(picks) == 0 {
+		return
+	}
+	s.dhcpResMu.Lock()
+	defer s.dhcpResMu.Unlock()
+	for _, p := range picks {
+		delete(s.isoPending[p.network], p.ip)
+		if len(s.isoPending[p.network]) == 0 {
+			delete(s.isoPending, p.network)
+		}
+	}
+}
+
+// pruneIsoPendingLocked drops in-flight picks older than any create takes to
+// write its rows. Caller holds dhcpResMu.
+func (s *Server) pruneIsoPendingLocked() {
+	if s.isoPending == nil {
+		s.isoPending = map[string]map[string]time.Time{}
+	}
+	for n, m := range s.isoPending {
+		for ip, at := range m {
+			if time.Since(at) > 10*time.Minute {
+				delete(m, ip)
+			}
+		}
+		if len(m) == 0 {
+			delete(s.isoPending, n)
+		}
+	}
+}
+
+// isoPendingAddrs is a copy of netName's in-flight picks. Caller holds
+// dhcpResMu.
+func (s *Server) isoPendingAddrsLocked(netName string) []string {
+	s.pruneIsoPendingLocked()
+	out := make([]string, 0, len(s.isoPending[netName]))
+	for ip := range s.isoPending[netName] {
+		out = append(out, ip)
+	}
+	return out
+}
+
 // dhcpPendingRes is a reservation made for a NIC whose rows are not written
 // yet.
 type dhcpPendingRes struct {
@@ -287,21 +428,45 @@ func (s *Server) prunePendingLocked() {
 	}
 }
 
-// SyncDHCPReservations rewrites every local dnsmasq's reservations from the
-// NIC rows — the authority once they exist — plus reservations still in
-// flight. The daemon runs it periodically.
+// SyncDHCPReservations rewrites every local dnsmasq's hosts file from the
+// NIC rows — the authority once they exist — plus reservations and NICs still
+// in flight: each guarded NIC's reservation, and on an isolated network the
+// NICs offered no router (noRouterMACs). The daemon runs it periodically, and
+// a VM's create, NIC attach and detach, and delete run it at once.
 func (s *Server) SyncDHCPReservations(ctx context.Context) {
+	_ = s.syncDHCPReservations(ctx)
+}
+
+// syncDHCPReservations is SyncDHCPReservations, reporting a pass that could
+// not read what it needs (nothing is written then).
+func (s *Server) syncDHCPReservations(ctx context.Context) error {
+	s.dhcpSyncMu.Lock()
+	defer s.dhcpSyncMu.Unlock()
 	nets, err := corrosion.ListNetworks(ctx, s.db)
 	if err != nil {
-		return
+		return err
+	}
+	defs := map[string]*compose.NetworkDef{}
+	for _, nr := range nets {
+		// A network that cannot be read would count as no network: its VMs
+		// as not routed, its tags dropped. The pass writes nothing instead.
+		def, err := lookupNetworkDef(ctx, s.db, nr.Name)
+		if err != nil {
+			return err
+		}
+		defs[nr.Name] = def
+	}
+	noRouter, err := s.noRouterMACs(ctx, defs)
+	if err != nil {
+		return err
 	}
 	ids, err := corrosion.LiveNICIdentities(ctx, s.db)
 	if err != nil {
-		return
+		return err
 	}
 	guards, err := corrosion.ListNICGuards(ctx, s.db)
 	if err != nil {
-		return
+		return err
 	}
 	// Only guarded VM NICs are reserved; the address the NIC row records is
 	// the reservation.
@@ -338,20 +503,216 @@ func (s *Server) SyncDHCPReservations(ctx context.Context) {
 		}
 	}
 	s.dhcpResMu.Unlock()
+	sync := network.SyncDHCPHosts
+	if s.syncDHCPHosts != nil {
+		sync = s.syncDHCPHosts
+	}
 	for _, nr := range nets {
-		def, _ := lookupNetworkDef(ctx, s.db, nr.Name)
-		if def == nil || !def.DHCP || def.Subnet == "" {
+		def := defs[nr.Name]
+		if def == nil || def.Subnet == "" {
 			continue
 		}
-		bridge := network.BridgeName(nr.Name, *def)
-		hosts := byNet[nr.Name]
-		if hosts == nil {
-			hosts = map[string]string{}
-		}
-		if _, err := network.SyncDHCPHosts(bridge, hosts); err != nil {
+		tags := network.NoRouterNetwork(*def)
+		if !def.DHCP && !tags {
 			continue
+		}
+		hosts := map[string]network.DHCPHost{}
+		if def.DHCP {
+			for mac, ip := range byNet[nr.Name] {
+				hosts[mac] = network.DHCPHost{IP: ip}
+			}
+		}
+		if tags {
+			for mac := range noRouter[nr.Name] {
+				h := hosts[mac]
+				h.NoRouter = true
+				hosts[mac] = h
+			}
+		}
+		if _, err := sync(network.BridgeName(nr.Name, *def), hosts); err != nil {
+			slog.Debug("DHCP hosts file not rewritten", "network", nr.Name, "error", err)
 		}
 	}
+	return nil
+}
+
+// noRouterPendingNIC is a NIC registered by pendingNICs whose row is not
+// written yet.
+type noRouterPendingNIC struct {
+	network string
+	at      time.Time
+}
+
+// noRouterMACs is, per isolated network (network.NoRouterNetwork), the MACs
+// (lower-case) of the NICs its dnsmasq offers no router: every NIC on it of a
+// VM that also has a NIC on a network that carries a route (routedNetwork),
+// counting every live VM in the cluster (a VM that moves here finds its tag
+// already in place) and the NICs pendingNICs registered. Such a VM takes its
+// default route from that NIC, never through a bridge that leads nowhere —
+// which netplan's use-routes: false in its seed already says, and RHEL's
+// cloud-init renderers drop. A VM whose NICs are all isolated is offered the
+// bridge as before. Containers are not counted. With no such network nothing
+// is read.
+func (s *Server) noRouterMACs(ctx context.Context, defs map[string]*compose.NetworkDef) (map[string]map[string]bool, error) {
+	var isolated []string
+	for name, def := range defs {
+		if def != nil && network.NoRouterNetwork(*def) {
+			isolated = append(isolated, name)
+		}
+	}
+	if len(isolated) == 0 {
+		return nil, nil
+	}
+	sort.Strings(isolated)
+	rows, err := corrosion.VMNICsTouching(ctx, s.db, isolated)
+	if err != nil {
+		return nil, err
+	}
+	byVM := map[string]map[string]string{} // vm → mac → network
+	add := func(vm, mac, net string) {
+		if byVM[vm] == nil {
+			byVM[vm] = map[string]string{}
+		}
+		byVM[vm][strings.ToLower(mac)] = net
+	}
+	for _, n := range rows {
+		add(n.VMName, n.MAC, n.NetworkName)
+	}
+	s.dhcpResMu.Lock()
+	for vm, m := range s.noRouterPending {
+		for mac, p := range m {
+			if time.Since(p.at) > 10*time.Minute {
+				delete(m, mac)
+				continue
+			}
+			add(vm, mac, p.network)
+		}
+		if len(m) == 0 {
+			delete(s.noRouterPending, vm)
+		}
+	}
+	s.dhcpResMu.Unlock()
+	out := map[string]map[string]bool{}
+	for _, nics := range byVM {
+		routed := false
+		for _, net := range nics {
+			if routedNetwork(defs[net]) {
+				routed = true
+				break
+			}
+		}
+		if !routed {
+			continue
+		}
+		for mac, net := range nics {
+			if def := defs[net]; def == nil || !network.NoRouterNetwork(*def) {
+				continue
+			}
+			if out[net] == nil {
+				out[net] = map[string]bool{}
+			}
+			out[net][mac] = true
+		}
+	}
+	return out, nil
+}
+
+// routedNetwork reports whether a NIC on def can carry the VM's default
+// route: a bridge, VXLAN, SR-IOV or macvtap network, or a host-isolated one
+// (its seed gives the NIC the bridge as gateway) — anything but an isolated
+// network. A network with no record counts as not routed, which keeps the
+// router an isolated network's dnsmasq offers as it was.
+func routedNetwork(def *compose.NetworkDef) bool {
+	return def != nil && (def.Type != "isolated" || def.HostIsolation)
+}
+
+// pendingDHCPNICs registers vm's NICs whose rows are not written yet with
+// the DHCP hosts files and rewrites them at once, so a NIC that is to be
+// offered no router is tagged before its guest can ask; the returned func
+// forgets them and rewrites the files again (the rows written by then, or the
+// create failed).
+func (s *Server) pendingDHCPNICs(vm string, recs []corrosion.InterfaceRecord) func() {
+	if s.db == nil || len(recs) == 0 || !s.anyNoRouterNetwork(recs) {
+		return func() {}
+	}
+	s.dhcpResMu.Lock()
+	if s.noRouterPending == nil {
+		s.noRouterPending = map[string]map[string]noRouterPendingNIC{}
+	}
+	if s.noRouterPending[vm] == nil {
+		s.noRouterPending[vm] = map[string]noRouterPendingNIC{}
+	}
+	now := time.Now()
+	for _, r := range recs {
+		s.noRouterPending[vm][strings.ToLower(r.MAC)] = noRouterPendingNIC{network: r.NetworkName, at: now}
+	}
+	s.dhcpResMu.Unlock()
+	s.resyncDHCPHosts()
+	return func() {
+		s.dhcpResMu.Lock()
+		for _, r := range recs {
+			delete(s.noRouterPending[vm], strings.ToLower(r.MAC))
+		}
+		if len(s.noRouterPending[vm]) == 0 {
+			delete(s.noRouterPending, vm)
+		}
+		s.dhcpResMu.Unlock()
+		s.resyncDHCPHosts()
+	}
+}
+
+// anyNoRouterNetwork reports whether one of recs is on a network whose
+// dnsmasq can withhold its router (network.NoRouterNetwork): only then can
+// the NICs change a tag before their rows exist. A NIC on any other network
+// changes a tag only of a guest already running, which takes it at its next
+// lease; the rewrite after the rows are written covers that.
+func (s *Server) anyNoRouterNetwork(recs []corrosion.InterfaceRecord) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, r := range recs {
+		def, err := lookupNetworkDef(ctx, s.db, r.NetworkName)
+		if err != nil {
+			// Unknown: register, so a tag the NIC needs is not skipped.
+			slog.Warn("DHCP hosts files: network unreadable; registering the NICs", "network", r.NetworkName, "error", err)
+			return true
+		}
+		if def != nil && network.NoRouterNetwork(*def) {
+			return true
+		}
+	}
+	return false
+}
+
+// resyncDHCPHosts runs SyncDHCPReservations now: a VM's NICs changed. A pass
+// that cannot read what it needs is retried in the background, off the
+// request's path, and one that still fails is logged — a tag it would have
+// written is then missing until the periodic pass, and a guest that asks for
+// a lease before it takes the router.
+func (s *Server) resyncDHCPHosts() {
+	if s.db == nil {
+		return
+	}
+	err := s.syncDHCPReservationsOnce()
+	if err == nil {
+		return
+	}
+	slog.Warn("DHCP hosts files: rewrite after a NIC change failed; retrying in the background", "error", err)
+	go func() {
+		for attempt := 1; attempt < 3; attempt++ {
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+			if err = s.syncDHCPReservationsOnce(); err == nil {
+				return
+			}
+			slog.Warn("DHCP hosts files: rewrite after a NIC change failed; retrying", "attempt", attempt+1, "error", err)
+		}
+		slog.Error("DHCP hosts files: rewrite after a NIC change failed; the periodic pass retries every 30s, and a NIC on an isolated network may be offered the router until then", "error", err)
+	}()
+}
+
+func (s *Server) syncDHCPReservationsOnce() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return s.syncDHCPReservations(ctx)
 }
 
 // StartDHCPReservations runs SyncDHCPReservations every interval.

@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/cli"
 	"github.com/litevirt/litevirt/internal/compose"
 )
 
@@ -58,6 +59,9 @@ func newUpCmd() *cobra.Command {
 				return err
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if err := requireTagGroupSupport(ctx, c, composeRuleCIDRs(f)...); err != nil {
+					return err
+				}
 				// Dry-run via DeployStack to get the plan from the server.
 				dryStream, err := c.DeployStack(ctx, &pb.DeployStackRequest{
 					ComposeYaml: string(yamlData),
@@ -124,10 +128,11 @@ func newUpCmd() *cobra.Command {
 					if !stdinIsTerminal() {
 						return errNoTTYConfirm
 					}
-					fmt.Print("Apply? [y/N] ")
-					var ans string
-					fmt.Scanln(&ans)
-					if ans != "y" && ans != "Y" {
+					ok, err := cli.Confirm(ctx, os.Stdin, os.Stdout, "Apply?")
+					if err != nil {
+						return err
+					}
+					if !ok {
 						fmt.Println("Aborted.")
 						return nil
 					}
@@ -152,7 +157,9 @@ func newUpCmd() *cobra.Command {
 				for {
 					p, err := stream.Recv()
 					if err != nil {
-						if st, ok := status.FromError(err); ok && st.Code() != codes.OK {
+						if ierr := interruptedReplace("compose up "+f.Name, "deploy", "lv compose up", err); ierr != nil {
+							deployErr = ierr
+						} else if st, ok := status.FromError(err); ok && st.Code() != codes.OK {
 							deployErr = fmt.Errorf("deploy failed: %s", st.Message())
 						}
 						break
@@ -277,10 +284,11 @@ func newDownCmd() *cobra.Command {
 					if !stdinIsTerminal() {
 						return errNoTTYConfirm
 					}
-					fmt.Print("Confirm? [y/N] ")
-					var ans string
-					fmt.Scanln(&ans)
-					if ans != "y" && ans != "Y" {
+					ok, err := cli.Confirm(ctx, os.Stdin, os.Stdout, "Confirm?")
+					if err != nil {
+						return err
+					}
+					if !ok {
 						fmt.Println("Aborted.")
 						return nil
 					}
@@ -303,7 +311,9 @@ func newDownCmd() *cobra.Command {
 				for {
 					p, err := stream.Recv()
 					if err != nil {
-						if st, ok := status.FromError(err); ok && st.Code() != codes.OK {
+						if ierr := interruptedDelete("compose down "+name, err, "lv compose ls", "lv ls"); ierr != nil {
+							downErr = ierr
+						} else if st, ok := status.FromError(err); ok && st.Code() != codes.OK {
 							downErr = fmt.Errorf("delete failed: %s", st.Message())
 						}
 						break
@@ -337,6 +347,9 @@ func newDownCmd() *cobra.Command {
 					case "kept":
 						// A VM of a member's name the stack did not create.
 						fmt.Printf("  kept %s: %s\n", p.VmName, p.Error)
+					case "absent":
+						// A member whose create failed: nothing to delete.
+						fmt.Printf("  absent %s: %s\n", p.VmName, p.Error)
 					default:
 						fmt.Printf("  %s: %s\n", p.VmName, p.Status)
 					}

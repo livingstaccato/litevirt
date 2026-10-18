@@ -282,6 +282,17 @@ type Client struct {
 	// withholding once rather than every tick. Guarded by its own mutex.
 	mintWithheldMu sync.Mutex
 	mintWithheld   map[string]string
+	// leaseDecided is, per lease key, the newest term this node learned was
+	// decided for ANOTHER node by a lease-term claim (NoteLeaseTermDecided).
+	// Guarded by mintWithheldMu.
+	leaseDecided map[string]leaseTermDecision
+	// leaseLiveObserver is told when AcquireLeaseWithTerm finds a lease held
+	// (SetLeaseLiveObserver).
+	leaseLiveObserver func(ctx context.Context, key string)
+	// leaseNoMajorityObserver is told when a lease poll stands down for want
+	// of the voter majority over a lease with no live holder
+	// (SetLeaseNoMajorityObserver).
+	leaseNoMajorityObserver func(ctx context.Context, ev LeaseNoMajority)
 	// unresolvedTies records, per (table,PK), the last classified-unresolved tie:
 	// its sorted content-hash pair and its CATEGORY. The pair makes
 	// lww_tie_unresolved count DISTINCT rows (re-observing the same divergence is
@@ -421,6 +432,9 @@ type Client struct {
 	// credentialsLiveFile. credentialsLiveChecked makes the file read once.
 	credentialsLive        atomic.Bool
 	credentialsLiveChecked atomic.Bool
+	// sensitiveMerges records the peers this process has completed a
+	// sensitive-lane anti-entropy exchange with (credentials_sensitive_merged.go).
+	sensitiveMerges sensitiveMergeState
 	// The credentials baseline and the external-seen set
 	// (credentials_live.go), guarded by externalSeenMu.
 	externalSeenMu  sync.Mutex
@@ -447,6 +461,17 @@ type Client struct {
 	// CLOSED when unset: a previous-release peer ignores the key and would
 	// elect a different relay set. See relay_health.go.
 	relayHealthGate atomic.Pointer[func() bool]
+	// specConflictGate, when non-nil and returning true, says spec_conflict_v1
+	// has durably latched: spec edits carry their owner epoch and a conflict
+	// at one generation is resolved (spec_conflict.go). Unset reads false,
+	// the previous release's behaviour.
+	specConflictGate atomic.Pointer[func() bool]
+	// specDropsSeen is the spec-edit drops already noted (firstSpecDrop),
+	// with whether each one's event is recorded.
+	specDropsMu   sync.Mutex
+	specDropsSeen map[string]specDropState
+	// specHold is this node's held lines of spec edits (spec_hold.go).
+	specHold specHoldTracker
 	// voterConfigGate, when set and returning true, permits WRITING
 	// voter_configs. Injected via SetVoterConfigGate, wired to the durable
 	// voter_config_v1 latch. Fails CLOSED when unset: that table's shapes
@@ -646,6 +671,8 @@ func (c *Client) capabilityActive(name string) bool {
 		return c.canonicalIdentityOn()
 	case capabilities.VMReplaceV1:
 		return c.vmReplaceAcceptOn()
+	case capabilities.SpecConflictV1:
+		return c.SpecConflictOn()
 	default:
 		return false
 	}
@@ -1427,6 +1454,15 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 	for _, stmts := range entries {
 		relay := make([]Statement, 0, len(stmts))
 		for _, s := range stmts {
+			// See executeBatchInternal (credentials_revive_guard.go).
+			credPlan, err := planCredentialUpsert(ctx, tx, s, stmts)
+			if err != nil {
+				tx.Rollback()
+				c.mu.Unlock()
+				return false, err
+			} else if credPlan.skip {
+				continue
+			}
 			if s.Guard != nil {
 				matches, err := c.mutationGuardMatches(ctx, tx, s.Guard)
 				if err != nil {
@@ -1452,6 +1488,11 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 				tx.Rollback()
 				c.mu.Unlock()
 				return false, invalidf("guarded workload transition matched authority but changed no row")
+			}
+			if err := credPlan.apply(ctx, tx); err != nil {
+				tx.Rollback()
+				c.mu.Unlock()
+				return false, err
 			}
 			changed := false
 			if n, e := res.RowsAffected(); e == nil && n > 0 {
@@ -1616,6 +1657,16 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	var parks []func()      // updates that met no row because it has not arrived yet
 	relay := make([]Statement, 0, len(stmts))
 	for _, s := range stmts {
+		// A fence credential carries the retirement it was set after
+		// (credentials_revive_guard.go).
+		credPlan, err := planCredentialUpsert(ctx, tx, s, stmts)
+		if err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return 0, err
+		} else if credPlan.skip {
+			continue
+		}
 		// A live-row update runs here through the same guarded form every
 		// receiver uses; what is logged is the wire form (live_row_update.go).
 		res, err := tx.ExecContext(ctx, appliedForm(s).SQL, s.Params...)
@@ -1623,6 +1674,11 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 			tx.Rollback()
 			c.mu.Unlock()
 			return 0, fmt.Errorf("exec batch: %w", err)
+		}
+		if err := credPlan.apply(ctx, tx); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return 0, err
 		}
 		changed := false
 		if n, e := res.RowsAffected(); e == nil {
@@ -1884,6 +1940,17 @@ func (c *Client) Members() []PeerInfo {
 // admission — for tests that model what a node has already let in. Test-only;
 // production membership comes from memberlist.
 func (c *Client) SetMembersForTests(fn func() []PeerInfo) { c.membersForTests = fn }
+
+// SetWallClockForTests makes now this node's wall clock, for its row stamps
+// and its HLC alike: a node whose clock runs ahead or behind. It takes no lock
+// that its readers take, so call it before the client is in use; now itself
+// may vary over time. Test-only.
+func (c *Client) SetWallClockForTests(now func() time.Time) {
+	c.nowFn = now
+	if c.clock != nil {
+		c.clock.SetNowForTests(now)
+	}
+}
 
 // SetGossipForTests injects RAW memberlist membership, which Members() then
 // filters through gossip admission exactly as it filters memberlist's. Use it to

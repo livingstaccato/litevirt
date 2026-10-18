@@ -214,9 +214,10 @@ func (s *Server) observeDualRunWithoutLease(ctx context.Context) {
 // preserves observation counts and confirmed state: the new leader's first pass picks
 // up exactly where the old one stopped — no re-arm, no false `.cleared`, no re-page.
 // The per-peer timeout bounds the PEER probes, but not the pass: the self probe
-// goes through collectRuntimeInventory, whose libvirt calls (ListDomains,
-// DomainState, DumpXML) take no context and cannot be cut short, and the DB
-// reads are unbounded too. A pass CAN therefore outlive the lease TTL — which
+// goes through collectRuntimeInventory, whose libvirt calls wait as long as
+// libvirt keeps answering them (up to the inventory's cap; one it stops
+// answering ends the wait at the live-state bound, runtime_inventory.go), and
+// the DB reads are unbounded. A pass CAN therefore outlive the lease TTL — which
 // is why detectDualRunPass re-asserts leadership after the gather and discards
 // its findings if the tenure changed, rather than relying on a timing claim.
 func (s *Server) RunDualRunDetector(ctx context.Context, interval time.Duration) {
@@ -308,6 +309,7 @@ const dualRunLeaseProbeTTL = 60 * time.Second
 func (s *Server) acquireDualRunLease(ctx context.Context, interval time.Duration) bool {
 	if s.LeaseQuorumLost(ctx) {
 		s.dualRunLeaseTerm.Store(0)
+		corrosion.NoteLeaseNoQuorum(ctx, s.db, dualRunLeaseKey, s.hostName, 2*interval, time.Now())
 		return false
 	}
 	held, term, err := corrosion.AcquireLeaseWithTerm(

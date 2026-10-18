@@ -1,0 +1,19 @@
+version: 2
+ethernets:
+  eth0:
+    match:
+      macaddress: "52:54:00:00:05:01"
+    set-name: eth0
+    dhcp4: true
+    dhcp4-overrides:
+      route-metric: 100
+  eth1:
+    match:
+      macaddress: "52:54:00:00:05:02"
+    set-name: eth1
+    addresses:
+      - 10.201.0.20/24
+    nameservers:
+      addresses:
+        - 1.1.1.1
+        - 8.8.8.8

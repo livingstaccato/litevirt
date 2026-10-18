@@ -15,6 +15,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/daemon"
+	"github.com/litevirt/litevirt/internal/firewall"
 )
 
 // newSGCmd groups security-group subcommands. Every write goes through the
@@ -284,14 +285,32 @@ func newSGDeleteCmd() *cobra.Command {
 }
 
 func newSGRuleAddCmd() *cobra.Command {
-	var direction, proto, port, cidr, action string
+	var direction, proto, port, cidr, action, macro string
 	var priority int
 	cmd := &cobra.Command{
 		Use:   "rule-add <sg-id-or-name>",
 		Short: "Add a rule to a security group (by id or name)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if macro != "" {
+				return runMacroAdd(cmd, macro, direction, cidr, action, func(ctx context.Context, c pb.LiteVirtClient, _ string, row firewall.ExpandedRule) (string, error) {
+					rule, err := c.AddSecurityGroupRule(ctx, &pb.AddSecurityGroupRuleRequest{Rule: &pb.SecurityGroupRule{
+						SgId: args[0], Direction: row.Direction, Proto: row.Proto, Port: row.Port,
+						Cidr: row.CIDR, Action: row.Action, Priority: int32(priority),
+					}})
+					if err != nil {
+						return "", sgRPCError("rule-add", err)
+					}
+					return rule.Id, nil
+				}, func(ctx context.Context, c pb.LiteVirtClient, id string) error {
+					_, err := c.RemoveSecurityGroupRule(ctx, &pb.RemoveSecurityGroupRuleRequest{Id: id})
+					return err
+				}, func(id string) string { return fmt.Sprintf("Added rule %s\n", id) })
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if err := requireTagGroupSupport(ctx, c, cidr); err != nil {
+					return err
+				}
 				rule, err := c.AddSecurityGroupRule(ctx, &pb.AddSecurityGroupRuleRequest{Rule: &pb.SecurityGroupRule{
 					SgId: args[0], Direction: direction, Proto: proto, Port: port,
 					Cidr: cidr, Action: action, Priority: int32(priority),
@@ -310,6 +329,7 @@ func newSGRuleAddCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cidr, "cidr", "", "source/dest CIDR or @ipset-name (default: any)")
 	cmd.Flags().StringVar(&action, "action", "accept", "accept | drop | reject")
 	cmd.Flags().IntVar(&priority, "priority", 100, "lower runs first")
+	cmd.Flags().StringVar(&macro, "macro", "", "add the rules of a named macro instead of --proto/--port (see 'lv firewall macros')")
 	return cmd
 }
 

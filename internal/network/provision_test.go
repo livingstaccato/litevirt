@@ -73,7 +73,7 @@ func TestProvision_Bridge_PreExistingNAT_NoDHCP(t *testing.T) {
 	execCommand = func(name string, args ...string) ([]byte, error) { return nil, nil }
 	defer func() { execCommand = defaultExec }()
 	dhcpStarted := false
-	startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string) error {
+	startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string, noRouter bool) error {
 		dhcpStarted = true
 		return nil
 	}
@@ -167,7 +167,7 @@ func TestProvision_DnsmasqPidFilePaths(t *testing.T) {
 			execCommand = func(name string, args ...string) ([]byte, error) { return nil, nil }
 			defer func() { execCommand = defaultExec }()
 			var started []string
-			startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string) error {
+			startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string, noRouter bool) error {
 				started = append(started, pidFile)
 				return nil
 			}
@@ -258,7 +258,7 @@ func TestProvision_WithSubnet(t *testing.T) {
 		return nil, nil
 	}
 	defer func() { execCommand = defaultExec }()
-	startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string) error {
+	startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string, noRouter bool) error {
 		return nil
 	}
 	defer func() { startDHCPFunc = StartDHCP }()
@@ -447,18 +447,67 @@ func TestSyncFloodEntries(t *testing.T) {
 		t.Fatalf("SyncFloodEntries: %v", err)
 	}
 
-	// Should have called FloodEntry only for host2
-	if len(calls) != 1 {
-		t.Fatalf("expected 1 flood call (for host2 only), got %d: %v", len(calls), calls)
+	// Should have appended a flood destination only for host2 (the rest of
+	// the calls read the device's entries for pruning).
+	var adds [][]string
+	for _, c := range calls {
+		if len(c) > 2 && c[0] == "bridge" && c[2] == "append" {
+			adds = append(adds, c)
+		}
+	}
+	if len(adds) != 1 {
+		t.Fatalf("expected 1 flood add (for host2 only), got %d: %v", len(adds), calls)
 	}
 	// Verify it's for host2's VTEP
 	found := false
-	for _, a := range calls[0] {
+	for _, a := range adds[0] {
 		if a == "10.10.0.2" {
 			found = true
 		}
 	}
 	if !found {
 		t.Errorf("expected flood entry for 10.10.0.2; calls: %v", calls)
+	}
+}
+
+// TestProvision_IsolatedDHCPOffersNoRouter: Provision asks for a DHCP server
+// that withholds the router from the NICs its hosts file tags on an isolated
+// network, and for one that offers it to every NIC on a bridge or VXLAN
+// network, whose bridge address is the guests' gateway.
+func TestProvision_IsolatedDHCPOffersNoRouter(t *testing.T) {
+	cases := []struct {
+		name string
+		def  compose.NetworkDef
+		want bool
+	}{
+		{"bridge", compose.NetworkDef{Type: "bridge", Interface: "lv-nr-br0", Subnet: "10.88.0.0/24"}, false},
+		{"vxlan", compose.NetworkDef{Type: "vxlan", VNI: 4243, Underlay: "eth0", Subnet: "10.89.0.0/24"}, false},
+		{"isolated", compose.NetworkDef{Type: "isolated", Subnet: "10.90.0.0/24"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := corrosion.NewTestClientT(t)
+			if err := corrosion.InitSchema(context.Background(), db); err != nil {
+				t.Fatalf("InitSchema: %v", err)
+			}
+			execCommand = func(name string, args ...string) ([]byte, error) { return nil, nil }
+			defer func() { execCommand = defaultExec }()
+			var got []bool
+			startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string, noRouter bool) error {
+				got = append(got, noRouter)
+				return nil
+			}
+			defer func() { startDHCPFunc = StartDHCP }()
+
+			if _, err := Provision(context.Background(), db, "nrnet", tc.def, "10.0.0.1", "host1"); err != nil {
+				t.Fatalf("Provision: %v", err)
+			}
+			if len(got) != 1 {
+				t.Fatalf("expected exactly 1 DHCP start, got %d", len(got))
+			}
+			if got[0] != tc.want {
+				t.Errorf("Provision started DHCP with noRouter=%v, want %v", got[0], tc.want)
+			}
+		})
 	}
 }

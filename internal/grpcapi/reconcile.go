@@ -109,21 +109,23 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 	if err != nil {
 		return status.Errorf(codes.Internal, "read NICs for %q: %v", vm.Name, err)
 	}
+	rowModels, reattached, err := corrosion.NICModelSources(ctx, s.db, vm.Name, nics, compose.SpecNICModelsByMAC(spec))
+	if err != nil {
+		return status.Errorf(codes.Internal, "read NIC models for %q: %v", vm.Name, err)
+	}
+	nicModels := compose.NewNICModels(spec, rowModels, reattached)
 	var netConfigs []lv.NetworkConfig
 	var wantNICs []lv.WantNIC
 	for _, n := range nics {
-		model := n.Model
-		if model == "" {
-			model = "virtio"
-		}
+		model := nicModels.Model(n.MAC, n.NetworkName, n.Ordinal, n.Model)
 		bridge := resolveBridge(ctx, s.db, n.NetworkName)
 		if strings.HasPrefix(bridge, "direct:") {
 			direct := strings.TrimPrefix(bridge, "direct:")
-			netConfigs = append(netConfigs, lv.NetworkConfig{Direct: direct, Model: model, MAC: n.MAC, SpecOrdinal: n.Ordinal + 1, RateMBps: compose.NICRate(spec, n.Ordinal, n.NetworkName)})
+			netConfigs = append(netConfigs, lv.NetworkConfig{Direct: direct, Model: model, MAC: n.MAC, SpecOrdinal: n.Ordinal + 1, RateMBps: compose.NICRate(spec, n.MAC, n.Ordinal, n.NetworkName)})
 			wantNICs = append(wantNICs, lv.WantNIC{MAC: n.MAC, Direct: direct, Model: model})
 			continue
 		}
-		netConfigs = append(netConfigs, lv.NetworkConfig{Bridge: bridge, Model: model, MAC: n.MAC, SpecOrdinal: n.Ordinal + 1, RateMBps: compose.NICRate(spec, n.Ordinal, n.NetworkName)})
+		netConfigs = append(netConfigs, lv.NetworkConfig{Bridge: bridge, Model: model, MAC: n.MAC, SpecOrdinal: n.Ordinal + 1, RateMBps: compose.NICRate(spec, n.MAC, n.Ordinal, n.NetworkName)})
 		wantNICs = append(wantNICs, lv.WantNIC{MAC: n.MAC, Bridge: bridge, Model: model})
 	}
 
@@ -234,6 +236,8 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 		newXML = patched
 	} else {
 		vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, hostdevConfigs)
+		// The seed and installer CD-ROMs are in no table read above.
+		s.keepCDROMs(&vmCfg, vm.Name, spec.Uuid, priorXML)
 		usb, uerr := s.resolveUSBHostdevs(ctx, spec)
 		if uerr != nil {
 			return uerr
@@ -322,4 +326,15 @@ func (s *Server) checkRealizationCardinality(ctx context.Context, vmName string,
 		}
 	}
 	return nil
+}
+
+// liveVMInterfaces is vmName's live NICs (MergedVMNICs, in ordinal order) as
+// interface records, for a caller written against vm_interfaces rows. Their
+// security groups are not carried.
+func liveVMInterfaces(ctx context.Context, db *corrosion.Client, vmName string) ([]corrosion.InterfaceRecord, error) {
+	nics, err := corrosion.MergedVMNICs(ctx, db, vmName)
+	if err != nil {
+		return nil, err
+	}
+	return nicInterfaceRecords(nics), nil
 }

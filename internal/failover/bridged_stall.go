@@ -16,7 +16,7 @@ import (
 // ha.recovery.bridged (docs/diagnostics.md): a host's workloads stay paused,
 // and nothing recovers them, because observers outside the voter majority
 // still see the host answer — typically a host that reaches both halves of a
-// split of the voters relays the minority's view to the majority. It has two
+// split of the voters relays the minority's view to the majority. It has three
 // forms:
 //
 //   - at a self-pause fence's deadline the coordinator recovered nothing,
@@ -25,7 +25,10 @@ import (
 //   - before any fence: the host has kept its partition_paused open for longer
 //     than the pause wait, yet is no fence candidate, because the observers
 //     that see it answer leave too few voters failing it for a quorum (a
-//     witness bridge on a derived voter set, where the witness votes).
+//     witness bridge on a derived voter set, where the witness votes);
+//   - after a failed fence: its retry is refused on every cycle, because
+//     observers saw the host answer after the attempt, and the host reports
+//     its workloads paused (noteBridgedRetry).
 //
 // Visibility only. Written by the lease holder; a successor reads it back
 // from the replica and resolves it.
@@ -60,6 +63,43 @@ func (c *Coordinator) noteBridgedStall(ctx context.Context, h *corrosion.HostRec
 			"Observers outside the majority still see it answer, as a host reaching both halves of a split relays; "+
 			"the cluster is on %s. Nothing ran twice; the workloads stay paused on %s, and the deadline is re-checked every cycle",
 			h.Name, why, set, h.Name))
+}
+
+// noteBridgedRetry raises ha.recovery.bridged for h, a host whose failed
+// fence is not retried because observers saw it answer after the attempt
+// (retryStillDown), when those observers hold no voter majority and h reports
+// its workloads paused (its partition_paused open). A host reaching both
+// halves of a split relays the paused host's answers, so its failed fence is
+// never retried and nothing recovers its workloads while the bridge lasts:
+// the stall the condition names, which neither form above reaches — the
+// deadline form needs a self-pause fence, and the before-fence form skips an
+// offline host. It is raised once; resolveBridgedSettled resolves it.
+func (c *Coordinator) noteBridgedRetry(ctx context.Context, h *corrosion.HostRecord, failedAt time.Time) {
+	hr := c.readHostHealth(ctx, h.Name)
+	if hr.err != nil {
+		return
+	}
+	observers := answeredSinceObserversIn(hr, h.Name, failedAt)
+	if len(observers) == 0 {
+		return
+	}
+	if _, ok := c.answeredByAVoterMajorityIn(hr, h.Name, []map[string]bool{c.scope.voters(h.Name)}); !ok {
+		return // a voter majority sees it answer: it is coming back
+	}
+	paused, ok, err := corrosion.GetHealthCondition(ctx, c.db, corrosion.PartitionPauseEvaluator,
+		corrosion.CondPartitionPaused, "host", h.Name)
+	if err != nil || !ok || paused.Lifecycle == corrosion.ConditionResolved {
+		return
+	}
+	if row, found, err := corrosion.GetHealthCondition(ctx, c.db, RefenceEvaluator, CondRecoveryBridged, "host", h.Name); err != nil ||
+		(found && row.Lifecycle != corrosion.ConditionResolved) {
+		return // raised already, or unreadable
+	}
+	c.raiseBridged(ctx, h.Name, observers, c.derivedVoterSet(ctx),
+		fmt.Sprintf("the fence of %s failed at %s and is not retried, because observers %s saw it answer after the attempt; "+
+			"they hold no voter majority, and %s reports its workloads paused since %s. Nothing is fenced again or "+
+			"recovered while they see it; the workloads stay paused on %s",
+			h.Name, failedAt.UTC().Format(time.RFC3339), strings.Join(observers, ","), h.Name, paused.FirstSeen, h.Name))
 }
 
 // noteBridgedBeforeFence raises ha.recovery.bridged for each host held before

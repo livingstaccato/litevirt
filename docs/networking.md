@@ -39,24 +39,47 @@ networks:
 ```
 
 litevirt manages VTEP and forwarding-database (FDB) state itself — there is no
-BGP or EVPN control plane, and no routing daemon to install. When a host
-provisions the network it records its VTEP address in the replicated cluster
-database, then reads that table back and installs an all-zeros
-`00:00:00:00:00:00` flood entry for each peer VTEP already listed, so BUM
-traffic is head-end replicated to the peers it knows about; a peer that
-provisions later can also push its VTEP straight to this host, which adds the
-entry on the spot. Those kernel flood entries are only ever added — an
-individual entry is never withdrawn when a host leaves the network (they go away
-only with the local VXLAN device), and nothing re-derives the set from the
-database outside a provisioning pass. A newly-joined host gets into an existing
-peer's entries through that push, which it makes when its network reconcile
-pass provisions the network (see [Where a network is set up](#where-a-network-is-set-up));
-if the push is lost, it stays absent until that peer next provisions, which a
-daemon restart does. Unicast MAC→VTEP entries are programmed explicitly rather than
-learned: when a VM's address is discovered, and again when that VM migrates or
-is deleted, its host fans a `bridge fdb` add/delete out to every peer over the
-cluster's mTLS gRPC, so remote hosts point the MAC at whichever host now owns
-it. Setting `subnet:` also gives every host the same anycast gateway — the first
+BGP or EVPN control plane, and no routing daemon to install.
+
+A host's VTEP address is its cluster address — `advertise_address` when set,
+otherwise the source address of its default route — once every host runs a
+release that knows it (the release token has latched;
+`lv cluster upgrade-status`). Until then each host keeps the tunnel earlier releases built:
+the default-route source address over `underlay:` or the default-route
+interface. At the latch, each host's next network reconcile pass sets the
+network up again on the new address; a VXLAN device with a different local
+address or underlay is recreated in place, and the VNI bridge and the guests on
+it stay.
+
+Without `underlay:`, the tunnel runs over the interface that holds the host
+address, or over the default-route interface when that is a loopback or dummy
+device (a host address on `lo`, as in a routed-to-the-host fabric). With
+`underlay:`, the tunnel's local address is an address that device holds — the
+host address if it is one of them — rather than the host address. A host
+refuses to set up the tunnel, and leaves any existing device alone, when its
+address is not held by any interface or the named underlay holds no IPv4
+address; it publishes a `network.vtep_refused` event naming the network and
+the device.
+
+When a host provisions the network it records its VTEP address in the
+replicated cluster database, then reads that table back and appends each peer
+VTEP already listed to the device's all-zeros `00:00:00:00:00:00` flood entry
+(`bridge fdb append`: the kernel keeps one flood entry with a list of
+destinations), so BUM traffic is head-end replicated to every peer it knows
+about; a peer that
+provisions later can also push its VTEP straight to this host. Unicast
+MAC→VTEP entries are programmed explicitly rather than learned: one for every
+NIC on the network on another host, pointing the NIC's MAC at that host's VTEP.
+The same sync prunes: a flood entry for an address that is neither a listed
+VTEP nor a cluster host's address, a unicast entry pointing at an address that
+is no VTEP of the network, and any entry that points at one of this host's own
+addresses — such an entry is never installed. The sync runs when the network is
+provisioned, on each push, and on every network reconcile pass, so a recreated
+device gets its entries back and a peer whose VTEP moved is repointed. When a
+VM's address is discovered, migrates or is deleted, its host also fans a
+`bridge fdb` add/delete out to every peer over the cluster's mTLS gRPC.
+Deleting the network tombstones its VTEP rows once the release token has
+latched. Setting `subnet:` also gives every host the same anycast gateway — the first
 usable address in the subnet — on the VNI bridge, so a VM's default route is
 host-local.
 
@@ -91,9 +114,30 @@ failing once per bridge, not on every pass. The trunk VLANs a NIC on the
 docs/firewall.md, "VLAN tags".
 
 An isolated network does not span hosts. Every host gets its own copy: its own
-`br-iso-<name>`, the subnet's first address as gateway, and its own `dnsmasq`
+`br-iso-<name>`, the subnet's first address on the bridge, and its own `dnsmasq`
 leasing the same range. VMs on different hosts cannot reach each other over it,
 and two VMs on different hosts can be leased the same address.
+
+On an IPv4 subnet, that `dnsmasq` offers no router to a NIC of a VM that also
+has a NIC on a network that is not isolated (a bridge, VXLAN, SR-IOV, direct or
+host-isolated network). A VM whose NICs are all on isolated networks is offered
+the bridge as router. The NIC's MAC is tagged in the bridge's DHCP hosts file,
+rewritten when a VM is created or deleted and when a NIC is attached or
+detached. A tag change that an attach or detach makes for a NIC of a running
+guest reaches it when the guest next asks for a lease; restart the VM or renew
+its lease to apply it at once. A NIC with a static address keeps the gateway
+its seed gives it (see [VM IP addressing](#vm-ip-addressing)). Router
+advertisements on an IPv6 subnet still announce the bridge as a default router
+to every guest. A guest leased by an earlier release keeps that lease's default
+route until it renews the lease or restarts.
+
+The firewall drops everything the host would route off an isolated bridge or
+onto it, including to another isolated network on the same host, so a guest
+there has no path out even on a host that forwards and whose uplink NATs any
+source. litevirt puts every isolated bridge it creates in an interface group
+the firewall matches, so the drop also covers one whose network row is gone;
+a daemon marks bridges an earlier build made when it provisions them again
+on its first pass (see [firewall.md](firewall.md#nat-snat-and-host-isolation)).
 
 ### SR-IOV
 
@@ -165,6 +209,45 @@ with the cluster's network table every 30 seconds, and at startup:
 A deleted network whose bridge a live network still uses is left alone, so
 the live one keeps its bridge, gateway and `dnsmasq`.
 
+When a network's device changes (a new `interface:` in a redeploy, say), each
+host sets up the new device and retires the old one, unless another live
+network uses it. Retiring a device removes only what belongs to it (its
+`dnsmasq`, gateway address and bridge); the network's NAT and host-isolation
+rules follow it to the new device. A device something on the host still uses
+— a guest port on it, a VM whose domain definition names it (running or
+stopped), or a container whose config links to it (a host without the LXC
+tooling has none) — is kept until nothing does, and goes on the first pass
+after that. Each VM or container moves to the
+network's new device when it next starts (`lv start`, `lv restart`); a VM
+records a `vm.nic_moved` event. A VM live-migrated meanwhile lands on the
+device its target serves the network on: the new one, or the old one where
+the target has not moved yet. When the new device's subnet overlaps the old
+one's, both would serve it, and only stopped workloads are defined on the old
+device, the gateway and `dnsmasq` move to the new device at once, and every
+stopped VM and container defined on the old device is re-pointed with them
+(their persistent definitions only), so any later start, a health restart
+included, lands on the new device. While a workload still RUNS on the old
+device, the change is refused on that host, naming those workloads: stop them
+or migrate them off the host, and the change completes; each then starts on
+the new device. A
+network on a VLAN, a host-isolated one, an operator bridge without `--dhcp`
+and a vxlan host that is not the network's DHCP gateway carry no gateway
+there and are never refused. The record of the moved-off devices is kept
+under `/run/litevirt`, so a daemon restart still finishes them. Each pass also
+removes a bridge litevirt created on that host (recorded under
+`/run/litevirt/bridges`, see below) that no live network, pending teardown,
+VM or container on the host names any more, and that has nothing plugged into
+it, together with its `dnsmasq`. A bridge litevirt did not create is never
+removed.
+
+A bridge litevirt created for a network (recorded under
+`/run/litevirt/bridges`, below) and an isolated network's bridge get a MAC
+derived from the bridge's name, the same on every host and for every network
+sharing the bridge, unless the bridge is on a VLAN or has an uplink. Provisioning sets it on a bridge that has another
+MAC, so it reaches existing bridges on the daemon's first pass; an operator's
+bridge keeps its own. A guest that moves to another host then finds its
+gateway at the MAC it already has.
+
 Tearing down a bridge network removes the Linux bridge itself only when
 litevirt created it on that host. Each daemon records the bridges it creates
 under `/run/litevirt/bridges` (one file per bridge holding its interface index;
@@ -224,10 +307,32 @@ Multiple networks can be attached to a single VM:
         ip: "172.16.0.10"
 ```
 
+A VM is created with at most one NIC per network. A create, a rebuild or a
+stack update whose spec has two NICs on one network is refused before anything
+is created (`NICs 0 and 1 are both on network "lan"`). Once `hardware_v2` is
+active, `lv attach-nic` adds a further NIC on a network the VM already has.
+
+A create that fails after its domain is defined, and before its VM record is
+written, is undone: the domain is stopped and undefined, the disks, cloud-init
+seed and firmware state it made are removed, its address claims are released,
+and its NIC guard records are retired. UEFI vars and the retained-firmware
+marker a `delete --keep-disks` left under the name are kept. The client gets
+the error. If the domain cannot be stopped, is gone, or is no longer the one
+the create defined, the disks are left as they are, and so is any such domain,
+and the error says so; the next create of the same name removes a leftover
+domain. The host that ran the create logs it at WARN (`vm create failed`, with
+the cause), and what the cleanup did (`vm create: cleanup after the failed
+create`).
+Once the VM record is written the VM exists: a later failure, or a client that
+stops waiting, undoes nothing.
+
 ### Per-NIC MTU
 
 A VM NIC can carry a guest MTU: `mtu:` on its network entry in compose, or
-`lv update <vm> --nic-mtu <nic>=<MTU|bridge>`.
+`lv update <vm> --nic-mtu <nic>=<MTU|bridge>`. `<nic>` is the NIC's position
+in the VM's NIC list, from 0: its NICs in ordinal order, as `lv inspect <vm>`
+lists them under `spec.network`. A NIC detached and attached again goes to the
+end of the list.
 
 | Value | Meaning |
 |---|---|
@@ -307,6 +412,25 @@ How a VM gets its address depends on when and how you set it:
 
 - **Static IP at create.** Set a per-NIC IP (and optional gateway) when creating the VM. For a cloud image, litevirt writes a cloud-init NoCloud `network-config` (attached as a read-only cdrom) so the guest applies the static address at first boot. This requires a cloud-init-capable guest image; it is not applied to images that do not run cloud-init.
 - **DHCP.** Leave the IP blank to use the network's addressing. On a DHCP-enabled managed network the guest gets a dynamic lease; litevirt then observes the address (ARP / DHCP leases) and records it back for display.
+- **Host-isolated network.** A NIC on a `host-isolation: true` network that names no IP is given a free address in the network's IPv4 subnet at create or clone, recorded on the NIC and delivered as a static address in the seed. See [compose.md](compose.md#host-isolation).
+- **More than one NIC.** A cloud-image VM with a DHCP NIC and any other NIC gets a cloud-init version 2 `network-config` with one entry per NIC, matched by MAC and renamed `eth<position>` (`set-name`): `dhcp4` where it has no IP (and `dhcp6` where its network has an IPv6 subnet or no record), the static address where it has one. Each NIC's routes carry metric 100 + its position. Every DHCP NIC after the first is `optional`. A NIC on an `isolated` network (no router) takes no route from its DHCP lease (`use-routes: false` beside its `route-metric`), and a static one whose spec names no `gateway:` gets no default route. cloud-init's netplan and networkd renderers apply `use-routes`; its sysconfig and NetworkManager renderers (RHEL family) do not; on those the isolated network's `dnsmasq` keeps the default route off the NIC by offering it no router (see [Isolated](#isolated)). A VM with one NIC on DHCP gets no `network-config`, and a VM whose NICs are all static gets the version 1 document above. A `cloud-init.network-config` in the spec replaces litevirt's.
+- **Static gateway.** A static address's default route is the NIC's `gateway:`, else the network's `gateway:`, else the subnet's first host.
+- **When the seed is written.** At create and clone. A host that defines the VM without a seed written for it (failover, migration, a start) writes it again, and the VM's host rewrites the `network-config` of its seed after every `lv attach-nic` and `lv detach-nic`. A host that already holds the VM's own seed (a copy kept from an earlier stay, which a failover leaves behind) rewrites its `network-config` and `vendor-data` the same way when the VM starts or migrates there, keeping its `meta-data` and `user-data`; if that rewrite fails, the VM starts on the seed as it is and a `seed.rebuild_failed` warning names the seed, the host and the cause; a migration source of an earlier release sends no `vendor-data`, and its target then keeps the seed as it is. Every rebuild derives the `network-config` from the VM's live NICs (the NIC rows attach and detach maintain, on a cluster with `hardware_v2` latched or not), the spec's entry for each, and their networks: it lists exactly the NICs the VM has, in ordinal order. A detached NIC, its MAC and its address are not in it. An attached NIC is written from its row and network: DHCP, or static where litevirt gave the address (a NetBox claim, a host-isolated pick). An attached NIC takes an ordinal no NIC of the VM had before. The rebuilt `network-config` equals the one written at create when the VM, its NICs and its networks are unchanged since then and the VM was created by this release. It differs when:
+  - the VM was created by an earlier release: it gets the `network-config` this release writes for its NICs;
+  - a NIC was attached or detached since, or a network definition or NetBox binding changed;
+  - the VM is a clone with a NIC on a guarded DHCP network: the reserved address is written as static.
+
+  **Guest NIC names.** A NIC keeps the name its seed gave it (`set-name`, or `name:` in the version 1 document) across every rewrite, on every host: a detach renames no other NIC, and the one NIC a detach leaves keeps its name. A NIC the seed matched by MAC alone, or did not list (a VM with one DHCP NIC has no `network-config`, and its guest names that NIC itself, `enp1s0` say), stays matched by MAC alone with no `set-name`, so it keeps the name the guest gave it. An attached NIC takes `eth<ordinal>`: its ordinal is one no NIC of the VM ever had, above every spec NIC's position, so the name is never a detached NIC's nor the name a guest that numbers its NICs itself (`net.ifnames=0`) gives a NIC matched by MAC alone. A NIC whose ordinal another NIC of the VM had or has takes `lv<its MAC's 12 hex digits>` instead of `eth<ordinal>`. Only an earlier release's attach gives a NIC such an ordinal, or two attaches racing across a change of the VM's owner before the first reached the second's host; which of two such NICs came first is not recorded (a NIC row has no creation time, and its `updated_at` moves with every change to the row), so both take `lv<MAC>`, and the first, which the seed of its own host names `eth<n>`, is renamed in the guest once where that seed is not current. A seed written on a host that holds no current seed of the VM's (a failover or migration to a host without one, or with only a copy kept from an earlier stay, or a seed whose last rewrite failed) gives every NIC the same name from the VM's records: a spec NIC the name the VM's create gave it, an attached one `eth<ordinal>` (or `lv<MAC>` as above). A NIC an earlier release attached is named by no seed of that release, so such a host names it this way too, which renames it in the guest once. A start on the host the VM runs on, whose seed is current (the VM's domain there attaches it and has the VM's NICs, and its last rewrite did not fail), renames no NIC. The names a seedless host derives for spec NICs are the ones create gave only while the VM's networks are defined as they were at create: a network change since that changes how a NIC is configured (DHCP turned on or off, a NetBox binding added) can change whether the document is version 1 or 2, and so a version 1 name, on such a host.
+
+  The rewrite after an attach or detach is made only to the VM's own seed, and only for a VM whose spec has cloud-init (a cloud image, or a `cloud-init` section): one stamped for it, or one an earlier release wrote (unstamped) that the VM's domain on that host attaches as its cdrom and whose `instance-id` is one the VM's create wrote (its name, or `<name>-next` for a VM a cutover renamed) and whose `user-data` is byte for byte the one the VM's spec gives (its `cloud-init` user-data, or `#cloud-config` `{}` when it names none). It keeps its `meta-data` (its `instance-id`) and `user-data` byte for byte, so cloud-init does not treat the guest as a new instance; an unstamped one is stamped. Any other seed at the VM's path (a deleted VM of the same name left it, or the VM was renamed since) is left as it is, neither stamped nor written again under the running guest, and a `seed.not_rebuilt` VM event (`lv events`) names the file and says why it is not the VM's; the VM's next start writes its own. A VM whose spec has no cloud-init is started with no seed attached, whatever file is at its path. litevirt does not delete a seed that event says is not the VM's while a VM of that name exists: with the VM stopped, remove the file it names (and its `.owner` and `.stale` files beside it, if any) on that host. Do not remove it under a running domain of the VM that attaches it: a live migration of the VM then has no seed to copy to its target and fails until the VM is stopped and started again. A `seed.not_rebuilt` event that says the VM's NICs cannot be told from its spec names the VM's own seed, which is kept on purpose; it is not one to remove. A rewrite that fails leaves the seed as it was and records a `seed.rebuild_failed` event; the next attach or detach of a NIC of the VM, or the VM's next start on that host, tries again. Every rewrite that fails (after an attach or detach, before a start, or for a migration) also leaves a `<seed>.stale` file beside the seed, which the next rewrite that succeeds removes: until then the seed's NIC names are not trusted to be complete, and a NIC it does not list is named from the VM's records as on a host without the seed. While that file is there, a start of the VM on that host (`lv start`, `lv restart`, a failover or reschedule start, a health restart, a cutover's start under the VM's name) rewrites the seed before the domain boots; one that fails again still starts the VM, on the seed as it is, and records the `seed.rebuild_failed` warning again. A seed kept as it is because the VM's NICs cannot be told from its spec (a `seed.not_rebuilt` event) keeps its `.stale` file. For a VM whose domain is active (running or paused) the host then reloads the seed's cdrom (an eject and an insert of the same file), so the guest reads the new seed; if the reload fails, the attach or detach still succeeds and a `seed.reload_failed` event names the remedy, `lv restart <vm>`, which starts the domain on the new seed. A stopped VM reads the new seed when it starts.
+
+  A seed whose `network-config` litevirt writes also carries `vendor-data` that turns on cloud-init's network update events (`updates: network: when: [boot-new-instance, boot, hotplug]`), so the guest applies the seed's `network-config` again on every boot, not only on its first. A seed with no `network-config` (a VM with one DHCP NIC, on cloud-init's fallback) carries none. `updates:` in the user-data overrides it (cloud-init merges user-data over vendor-data); a spec that names its own `cloud-init.network-config` gets none. cloud-init reads this from the vendor-data it recorded on an earlier boot.
+
+  **When a hot-attached NIC is configured in the guest:** on the guest's next boot after the attach, for a VM whose seed carried this vendor-data at its previous boot (one created by this release with more than one NIC). A VM whose seed first gets it from the attach's rewrite (one created by an earlier release, or with one DHCP NIC) configures the NIC from its second boot after the attach. In either case before that boot, and on a guest without cloud-init, the NIC is configured only by whatever the guest does on its own (for example NetworkManager's automatic DHCP connection on the RHEL family).
+
+  A NIC that an earlier release left without a MAC in the spec is matched to the NIC row at its position on its network (its ordinal and network), as NIC rate limits are. An entry that names an `ip:` takes that row only when the row records the same IPv4 address. An entry with only an `ipv6:` is matched by position alone, as an entry with no address is. An entry whose position holds no live NIC row is a detached NIC and is left out. An entry whose position holds a row it cannot be told from (one recording another address, as `lv config --ip` leaves it, or a NIC an earlier release attached there) leaves the VM's NICs undecided. Then an attach or detach leaves the VM's own seed's `network-config` and `vendor-data` exactly as they are; a migration gives the target the source's own seed's, as they are; a failover host keeps those of the VM's own seed if it holds one. A host that holds no seed of the VM's writes `network: {config: disabled}` as its `network-config` — cloud-init then renders no network at all and the guest keeps the one it has, on every boot, whatever update events it recorded earlier — and `vendor-data` that turns the per-boot re-render off (`updates: network: when: [boot-new-instance]`). Each records a `seed.not_rebuilt` event, and the changed NIC is configured in the guest. While a seed carries `network: {config: disabled}`, cloud-init configures no NIC at all, a hot-attached one included, until a later rewrite can tell the VM's NICs apart again.
+
+  A rebuild whose database read fails writes no seed: on failover the start is retried; on migration the source sends the target no seed, as when it cannot reach the target.
 - **Recorded (post-create) IP.** `lv config <vm> --ip <ip>` records the IP in inventory and, when a DNS domain is configured, makes a best-effort attempt to publish a DNS record (a DNS failure is logged, not fatal). It does **not** reconfigure a running guest, take a DHCP reservation, or change the guest's actual address — to change a running VM's IP, reconfigure it in the guest (or recreate it with the desired static IP). It is **refused on a network bound to a NetBox prefix**: there the address of record is NetBox's — allocated by the binding and kept assigned by the inventory mirror — so a recorded value would describe an address litevirt does not hold.
 
 ```yaml
@@ -645,7 +769,14 @@ one wins; and every lookup — the IP scanner, the load-balancer render, `lv ls`
 `lv inspect`, a peer's backend lookup and the VM healthcheck — reads only the
 lease file of the bridge the NIC's network uses, so a lease another network
 holds for the same MAC is not taken for its address. Only a NIC whose network
-has no record to derive a bridge from is looked up across every bridge. Deleting a network removes its dnsmasq
+has no record to derive a bridge from is looked up across every bridge. A
+lease is preferred to the ARP cache. On a vxlan network litevirt serves DHCP
+for, the dnsmasq runs on one host of the network, so a VM on any other host has
+no lease on its own host: when the IP scanner and `lv inspect` find none there,
+they ask the network's other hosts for the lease they hold for the MAC (the
+latest-expiring one wins, and only an address in the subnet counts), and fall
+back to the ARP cache after that. The IP scanner records it on its next pass,
+within 30 seconds of the lease. Deleting a network removes its dnsmasq
 lease file along with the dnsmasq. On an unbound network that
 discovery is simply recorded, and that is how every DHCP guest's address reaches
 the inventory.
@@ -1672,7 +1803,7 @@ networks:
     nat: false
 ```
 
-NAT is ignored on isolated networks (no uplink) and on host-isolated networks (use `snat: true` on a load balancer instead — see [compose.md](compose.md#snat-via-vip)).
+NAT is ignored on isolated networks (no uplink) and on host-isolated networks (use `snat: true`, or `lv lb create --snat`, on a load balancer instead — see [compose.md](compose.md#snat-via-vip)).
 
 ## IPv6
 

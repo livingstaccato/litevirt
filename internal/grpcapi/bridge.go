@@ -29,6 +29,15 @@ func (s *Server) bridgeExistsHere(name string) bool {
 	return network.BridgeExists(name)
 }
 
+// isBridgeHere reports whether name is a bridge on this host: a link that
+// exists and is a bridge, not a NIC, bond or VLAN of that name.
+func (s *Server) isBridgeHere(name string) bool {
+	if s.isBridge != nil {
+		return s.isBridge(name)
+	}
+	return network.IsBridge(name)
+}
+
 // bridgeHasUplinkHere answers the second host-local fact the DHCP finding needs:
 // whether a bridge that DOES exist here carries anything off the host.
 //

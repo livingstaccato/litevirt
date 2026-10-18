@@ -112,6 +112,7 @@ func (s *Server) SetBackupRepos(repos map[string]string) { s.backupRepos = repos
 func NewServer(client pb.LiteVirtClient, clusterName string) (*Server, error) {
 	funcMap := template.FuncMap{
 		"vmStateBadge":   vmStateBadge,
+		"snatLabel":      snatLabel,
 		"hostStateBadge": hostStateBadge,
 		"firstIP":        firstIP,
 		"nicSettings":    nicSettings,
@@ -745,6 +746,10 @@ func hostStateBadge(state pb.HostState) template.HTML {
 		return `<span class="badge badge-red">offline</span>`
 	case pb.HostState_HOST_JOINING:
 		return `<span class="badge badge-blue">joining</span>`
+	case pb.HostState_HOST_UPGRADING:
+		return `<span class="badge badge-yellow">upgrading</span>`
+	case pb.HostState_HOST_FENCED:
+		return `<span class="badge badge-red">fenced</span>`
 	default:
 		return `<span class="badge badge-gray">unknown</span>`
 	}

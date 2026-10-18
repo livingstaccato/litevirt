@@ -348,7 +348,7 @@ func TestMergeLWW_FullDumpParity(t *testing.T) {
 	if err := InsertSecurityGroup(ctx, src, SecurityGroup{ID: "sg1", Name: "web", StackName: "default"}); err != nil {
 		t.Fatalf("InsertSecurityGroup: %v", err)
 	}
-	if err := InsertSGRule(ctx, src, SGRule{ID: "r1", SGID: "sg1", Direction: "ingress", Proto: "tcp", PortRange: "443", Action: "allow"}); err != nil {
+	if err := InsertSGRule(ctx, src, SGRule{ID: "r1", SGID: "sg1", Direction: "ingress", Proto: "tcp", PortRange: "443", Action: "accept"}); err != nil {
 		t.Fatalf("InsertSGRule: %v", err)
 	}
 	if err := InsertAuditLog(ctx, src, AuditRecord{ID: "a1", Username: "admin", Action: "create_vm", Target: "vm1", Result: "success"}); err != nil {

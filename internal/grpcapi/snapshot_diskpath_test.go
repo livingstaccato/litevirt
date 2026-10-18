@@ -19,7 +19,7 @@ func newDiskPathTestServer(t *testing.T) (*Server, *libvirtfake.Fake) {
 		t.Fatalf("InitSchema: %v", err)
 	}
 	fake := libvirtfake.New()
-	return &Server{db: db, hostName: "host-a", virt: fake}, fake
+	return &Server{dataDir: t.TempDir(), db: db, hostName: "host-a", virt: fake}, fake
 }
 
 // TestReconcileDiskPaths is the regression for the RAM-snapshot disk-divergence

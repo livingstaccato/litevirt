@@ -14,6 +14,7 @@ import (
 // update/reapply entering through another node can't tell who serves the VIP.
 func TestCreateLoadBalancer_PersistsDurableHolder(t *testing.T) {
 	s := testServerR2(t)
+	s.db.SetClusterPolicyGate(func() bool { return true }) // failover_scope_v1 latched: the LB's snat is recordable
 	ctx := adminCtx()
 	s.vipGateFlipped = func() bool { return true }
 	s.lbApplyOverride = func(context.Context, lb.Config) error { return nil } // no real haproxy

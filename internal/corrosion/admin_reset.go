@@ -135,7 +135,7 @@ func ResetAdminPasswordReport(ctx context.Context, c *Client, run FeatureRun, us
 		if err != nil {
 			return err
 		}
-		if err := c.ExecuteBatch(ctx, stmts); err != nil {
+		if err := c.executeLifecycleBatch(ctx, stmts, "principal", name, "rotate"); err != nil {
 			return fmt.Errorf("reset the admin account: %w", err)
 		}
 		corrected = g.Check(capabilities.FeatureLoginPolicy) == nil

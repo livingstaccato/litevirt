@@ -23,6 +23,8 @@ import (
 // nodeLocalClaimTables are the tables ExecuteLocal may write. Each is absent
 // from tableNames and sensitiveTableNames (TestNodeLocalClaimTablesAreNotReplicated).
 var nodeLocalClaimTables = map[string]bool{
+	"local_automation_credential_issuance":  true,
+	"local_automation_lifetimes":            true,
 	"local_automation_resources":            true,
 	"local_automation_names":                true,
 	"local_automation_bindings":             true,

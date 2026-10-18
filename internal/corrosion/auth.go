@@ -260,21 +260,21 @@ func ListBindingsForPrincipal(ctx context.Context, c *Client, principal string) 
 
 // SessionRecord is one active session for a logged-in user.
 type SessionRecord struct {
-	ID         string
-	Username   string
-	Realm      string
-	IP         string
-	UserAgent  string
-	CreatedAt  string
-	LastUsedAt string
-	ExpiresAt  string
-	RevokedAt  string
+	automationAuthentication *AutomationAccountAuthentication
+	ID                       string
+	Username                 string
+	Realm                    string
+	IP                       string
+	UserAgent                string
+	CreatedAt                string
+	LastUsedAt               string
+	ExpiresAt                string
+	RevokedAt                string
 }
 
 // InsertSession creates a session row.
 func InsertSession(ctx context.Context, c *Client, s SessionRecord) error {
-	return c.Execute(ctx, sessionsInsertSQL, s.ID, s.Username, s.Realm, s.IP, s.UserAgent,
-		s.CreatedAt, s.LastUsedAt, s.ExpiresAt)
+	return c.executeCredentialBatch(ctx, s.automationAuthentication, "session", s.ID, s.Username, []Statement{sessionInsertStatement(s)})
 }
 
 const sessionsInsertSQL = `INSERT INTO sessions

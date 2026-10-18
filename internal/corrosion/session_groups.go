@@ -96,7 +96,7 @@ func InsertSessionWithLoginData(ctx context.Context, c *Client, g capabilities.F
 			stmts = append(stmts, Statement{SQL: sessionGroupsInsertSQL, Params: []interface{}{s.ID, s.Realm, string(b), s.CreatedAt, now}})
 		}
 	}
-	return c.ExecuteBatch(ctx, stmts)
+	return c.executeCredentialBatch(ctx, s.automationAuthentication, "session", s.ID, s.Username, stmts)
 }
 
 // SessionGroups returns the directory groups session id's login verified, nil

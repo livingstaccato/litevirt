@@ -10,9 +10,11 @@ import (
 	"strings"
 )
 
-// These v1 sections are an exhaustive inventory of existing source evidence.
-// There is no automation use/retirement/custody schema yet. Adding one requires
-// an explicit codec/section update; absence here proves no cluster non-use.
+// These v1 sections inventory retained certified history, claims and membership.
+// Node-local lifecycle/credential observations (v74) are deliberately excluded:
+// they are neither transferable certified facts nor proof of cluster non-use.
+// Lifecycle source-proof transfer, use/retirement/custody authority and active
+// import each require an explicit inventory/provenance design, not this cut.
 // rowid is SQLite's indexed immutable scan cursor while this transaction owns
 // the snapshot. It is never a network cursor or part of an accepted key.
 type automationCutSection struct{ name, table, columns string }
@@ -142,7 +144,8 @@ func (c *Client) FreezeAutomationCut(ctx context.Context, generation int64, redu
 		if len(rows) != 1 || !supportedAutomationCutDescriptor(rows[0].Int("version"), automationCutCodec) {
 			return fmt.Errorf("unsupported automation cut source schema")
 		}
-		if rows[0].Int("version") == 73 {
+		switch rows[0].Int("version") {
+		case 73, 74:
 			if err := automationVerifySemanticSchemaTx(ctx, tx); err != nil {
 				return err
 			}

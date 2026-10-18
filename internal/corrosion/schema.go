@@ -553,7 +553,10 @@ import (
 // No active import, origin mode, replication or authority is introduced.
 // v73: typed node-local automation identity and owner projections, isolated
 // by reconstruction stage. No replication or admission authority is introduced.
-const CurrentSchemaVersion = 73
+// v74: node-local originating account/project lifecycle evidence and exact
+// credential issuance provenance, with atomic invalidate-only parent triggers.
+// These are source observations, never certified identities or class permits.
+const CurrentSchemaVersion = 74
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -2935,6 +2938,79 @@ var schemaDDL = []string{
 		cut_id TEXT NOT NULL, section INTEGER NOT NULL, ordinal INTEGER NOT NULL,
 		record BLOB NOT NULL, PRIMARY KEY(cut_id,section,ordinal)
 	)`,
+	`CREATE TABLE IF NOT EXISTS local_automation_credential_issuance (
+ kind TEXT NOT NULL, credential_id TEXT NOT NULL, username TEXT NOT NULL,
+ witness TEXT NOT NULL, principal_uid TEXT NOT NULL, cluster_uid TEXT NOT NULL,
+ credential_digest TEXT NOT NULL, valid INTEGER NOT NULL DEFAULT 1 CHECK(valid IN (0,1)),
+ PRIMARY KEY(kind,credential_id))`,
+	`CREATE TRIGGER IF NOT EXISTS automation_issuance_tokens_insert
+ AFTER INSERT ON tokens BEGIN
+ UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='token' AND credential_id=NEW.id;
+ END`,
+	`CREATE TRIGGER IF NOT EXISTS automation_issuance_tokens_update
+ AFTER UPDATE OF id,username,name,token_hash,expires_at,scope_paths,created_at,deleted_at ON tokens BEGIN
+ UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='token' AND credential_id=OLD.id;
+ END`,
+	`CREATE TRIGGER IF NOT EXISTS automation_issuance_tokens_delete
+ AFTER DELETE ON tokens BEGIN
+ UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='token' AND credential_id=OLD.id;
+ END`,
+	`CREATE TRIGGER IF NOT EXISTS automation_issuance_token_credentials_insert
+ AFTER INSERT ON token_credentials BEGIN
+ UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='token' AND credential_id=NEW.token_id;
+ END`,
+	`CREATE TRIGGER IF NOT EXISTS automation_issuance_token_credentials_update
+ AFTER UPDATE OF token_id,token_hash,deleted_at ON token_credentials BEGIN
+ UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='token' AND credential_id=OLD.token_id;
+ END`,
+	`CREATE TRIGGER IF NOT EXISTS automation_issuance_token_credentials_delete
+ AFTER DELETE ON token_credentials BEGIN
+ UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='token' AND credential_id=OLD.token_id;
+ END`,
+	`CREATE TRIGGER IF NOT EXISTS automation_issuance_sessions_insert
+ AFTER INSERT ON sessions BEGIN
+ UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='session' AND credential_id=NEW.id;
+ END`,
+	`CREATE TRIGGER IF NOT EXISTS automation_issuance_sessions_update
+ AFTER UPDATE OF id,username,realm,ip,user_agent,created_at,expires_at,revoked_at ON sessions BEGIN
+ UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='session' AND credential_id=OLD.id;
+ END`,
+	`CREATE TRIGGER IF NOT EXISTS automation_issuance_sessions_delete
+ AFTER DELETE ON sessions BEGIN
+ UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='session' AND credential_id=OLD.id;
+ END`,
+	`CREATE TABLE IF NOT EXISTS local_automation_lifetimes (
+ kind TEXT NOT NULL, name TEXT NOT NULL, witness TEXT NOT NULL,
+ origin TEXT NOT NULL CHECK(origin IN ('birth','enrollment')),
+ retired INTEGER NOT NULL DEFAULT 0 CHECK(retired IN (0,1)),
+ valid INTEGER NOT NULL DEFAULT 1 CHECK(valid IN (0,1)),
+ PRIMARY KEY(kind,name,witness))`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS automation_lifetime_current
+ ON local_automation_lifetimes(kind,name) WHERE retired=0 AND valid=1`,
+	`CREATE TRIGGER IF NOT EXISTS automation_lifetime_users_insert
+ AFTER INSERT ON users BEGIN
+ UPDATE local_automation_lifetimes SET valid=0 WHERE kind='principal' AND name=NEW.username;
+ END`,
+	`CREATE TRIGGER IF NOT EXISTS automation_lifetime_users_update
+ AFTER UPDATE ON users BEGIN
+ UPDATE local_automation_lifetimes SET valid=0 WHERE kind='principal' AND name=OLD.username;
+ END`,
+	`CREATE TRIGGER IF NOT EXISTS automation_lifetime_users_delete
+ AFTER DELETE ON users BEGIN
+ UPDATE local_automation_lifetimes SET valid=0 WHERE kind='principal' AND name=OLD.username;
+ END`,
+	`CREATE TRIGGER IF NOT EXISTS automation_lifetime_projects_insert
+ AFTER INSERT ON projects BEGIN
+ UPDATE local_automation_lifetimes SET valid=0 WHERE kind='project' AND name=NEW.name;
+ END`,
+	`CREATE TRIGGER IF NOT EXISTS automation_lifetime_projects_update
+ AFTER UPDATE ON projects BEGIN
+ UPDATE local_automation_lifetimes SET valid=0 WHERE kind='project' AND name=OLD.name;
+ END`,
+	`CREATE TRIGGER IF NOT EXISTS automation_lifetime_projects_delete
+ AFTER DELETE ON projects BEGIN
+ UPDATE local_automation_lifetimes SET valid=0 WHERE kind='project' AND name=OLD.name;
+ END`,
 	`CREATE TABLE IF NOT EXISTS local_automation_identities (
         stage TEXT NOT NULL, uid TEXT NOT NULL, cluster_uid TEXT NOT NULL,
         project_uid TEXT NOT NULL, kind TEXT NOT NULL, alias TEXT NOT NULL,
@@ -3789,6 +3865,7 @@ var createTableUnits = []struct {
 	{68, "local_automation_requests"}, {68, "local_automation_recovery"}, {68, "local_automation_staging"},
 	{69, "local_automation_cuts"}, {69, "local_automation_cut_records"},
 	{70, "local_automation_source_jobs"}, {70, "local_automation_publications"},
+	{74, "local_automation_lifetimes"}, {74, "local_automation_credential_issuance"},
 	{73, "local_automation_identities"}, {73, "local_automation_aliases"},
 	{73, "local_automation_owners"}, {73, "local_automation_semantic_heads"},
 	{73, "local_automation_resources"}, {73, "local_automation_names"}, {73, "local_automation_bindings"}, {73, "local_automation_admissions"},

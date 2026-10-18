@@ -47,7 +47,7 @@ func InsertSessionWithFactor(ctx context.Context, c *Client, g capabilities.Feat
 	if factor == "" || g.Check(capabilities.FeatureLoginPolicy) != nil {
 		return InsertSession(ctx, c, s)
 	}
-	return c.ExecuteBatch(ctx, []Statement{
+	return c.executeCredentialBatch(ctx, s.automationAuthentication, "session", s.ID, s.Username, []Statement{
 		sessionInsertStatement(s),
 		{SQL: sessionFactorInsertSQL, Params: []interface{}{s.ID, factor, s.CreatedAt, c.NowTS()}},
 	})

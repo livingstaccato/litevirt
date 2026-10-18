@@ -43,13 +43,14 @@ type UserRecord struct {
 
 // TokenRecord represents an API token.
 type TokenRecord struct {
-	ID         string
-	Username   string
-	Name       string
-	TokenHash  string
-	ExpiresAt  string
-	CreatedAt  string
-	ScopePaths []string // empty/nil = no scoping
+	automationAuthentication *AutomationAccountAuthentication
+	ID                       string
+	Username                 string
+	Name                     string
+	TokenHash                string
+	ExpiresAt                string
+	CreatedAt                string
+	ScopePaths               []string // empty/nil = no scoping
 }
 
 // usersReactivateSQL is InsertUser's reactivation shape, also reused by
@@ -80,12 +81,12 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 			ts = shadowReactivationTS(rows[0].String("updated_at"), rows[0].String("cred_ts"), now)
 		}
 		if split {
-			return c.ExecuteBatch(ctx, []Statement{
+			return c.executeLifecycleBatch(ctx, []Statement{
 				{SQL: usersReactivateSQL, Params: []interface{}{role, c.oldColumnValue(passwordHash), ts, username}},
 				{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, ts}},
-			})
+			}, "principal", username, "birth")
 		}
-		if err := c.Execute(ctx, usersReactivateSQL, role, passwordHash, ts, username); err != nil {
+		if err := c.executeLifecycleBatch(ctx, []Statement{{SQL: usersReactivateSQL, Params: []interface{}{role, passwordHash, ts, username}}}, "principal", username, "birth"); err != nil {
 			return err
 		}
 		if passwordHash == "" {
@@ -100,12 +101,12 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 		c.forgetExternalShadow(username)
 	}
 	if split {
-		return c.ExecuteBatch(ctx, []Statement{
+		return c.executeLifecycleBatch(ctx, []Statement{
 			{SQL: usersInsertSQL, Params: []interface{}{username, role, c.oldColumnValue(passwordHash), created, now}},
 			{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, now}},
-		})
+		}, "principal", username, "birth")
 	}
-	if err := c.Execute(ctx, usersInsertSQL, username, role, passwordHash, created, now); err != nil {
+	if err := c.executeLifecycleBatch(ctx, []Statement{{SQL: usersInsertSQL, Params: []interface{}{username, role, passwordHash, created, now}}}, "principal", username, "birth"); err != nil {
 		return err
 	}
 	if passwordHash == "" {
@@ -299,7 +300,7 @@ func UpdateUserPassword(ctx context.Context, c *Client, username, passwordHash s
 	if err != nil || len(stmts) == 0 {
 		return err
 	}
-	return c.ExecuteBatch(ctx, stmts)
+	return c.executeLifecycleBatch(ctx, stmts, "principal", username, "rotate")
 }
 
 // updateUserPasswordStatements is UpdateUserPassword's batch, for a caller that
@@ -407,7 +408,7 @@ func DeleteUserCounted(ctx context.Context, c *Client, g capabilities.FeatureGra
 	// back enabled when the admin floor reinstates it or a directory login
 	// re-creates its shadow. Only an explicit CreateUser starts a name afresh
 	// (ResetUserLifecycle).
-	if err := c.ExecuteBatch(ctx, stmts); err != nil {
+	if err := c.executeLifecycleBatch(ctx, stmts, "principal", username, "retire"); err != nil {
 		return 0, 0, err
 	}
 	return len(sessRows), len(tokRows), nil
@@ -443,14 +444,12 @@ func InsertToken(ctx context.Context, c *Client, t TokenRecord) error {
 		scope = string(b)
 	}
 	if c.MayWriteCredentialTables() {
-		return c.ExecuteBatch(ctx, []Statement{
+		return c.executeCredentialBatch(ctx, t.automationAuthentication, "token", t.ID, t.Username, []Statement{
 			{SQL: tokensInsertSQL, Params: []interface{}{t.ID, t.Username, t.Name, c.oldColumnValue(t.TokenHash), t.ExpiresAt, scope, nowRFC3339(), now}},
 			{SQL: tokenCredentialUpsertSQL, Params: []interface{}{t.ID, t.TokenHash, now}},
 		})
 	}
-	return c.Execute(ctx, tokensInsertSQL,
-		t.ID, t.Username, t.Name, t.TokenHash, t.ExpiresAt, scope, nowRFC3339(), now,
-	)
+	return c.executeCredentialBatch(ctx, t.automationAuthentication, "token", t.ID, t.Username, []Statement{{SQL: tokensInsertSQL, Params: []interface{}{t.ID, t.Username, t.Name, t.TokenHash, t.ExpiresAt, scope, nowRFC3339(), now}}})
 }
 
 const tokensInsertSQL = `INSERT INTO tokens (id, username, name, token_hash, expires_at, scope_paths, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
@@ -653,7 +652,7 @@ func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client, run FeatureRun) 
 		if err != nil {
 			return err
 		}
-		return c.ExecuteBatch(ctx, stmts)
+		return c.executeLifecycleBatch(ctx, stmts, "principal", victim, "birth")
 	}); err != nil {
 		return "", err
 	}

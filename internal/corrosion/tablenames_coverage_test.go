@@ -18,6 +18,9 @@ import (
 // (tableNames, sensitiveTableNames, or here) so coverage can't silently drift
 // and tests can't overstate what anti-entropy actually repairs.
 var antiEntropyExcluded = map[string]string{
+	"local_automation_lifetimes":           "v74 originating node-local observations, not certified lifecycle proof; never replicated or public cut content",
+	"local_automation_credential_issuance": "v74 private node-local credential observations/digests; never replicated, public cut content, or certified identity",
+
 	"local_automation_identities":     "v73 local derived projection; empty stage active, nonempty stage isolated; never replicated",
 	"local_automation_aliases":        "v73 local derived projection; empty stage active, nonempty stage isolated; never replicated",
 	"local_automation_owners":         "v73 local derived projection; empty stage active, nonempty stage isolated; never replicated",
@@ -83,6 +86,9 @@ var antiEntropyExcluded = map[string]string{
 // DB access, not the replicating Execute path). The updated_at→primary-key
 // invariant below doesn't apply to them.
 var localOnly = map[string]bool{
+	"local_automation_lifetimes":           true,
+	"local_automation_credential_issuance": true,
+
 	"local_automation_identities":     true,
 	"local_automation_aliases":        true,
 	"local_automation_owners":         true,

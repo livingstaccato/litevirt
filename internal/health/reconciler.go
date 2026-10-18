@@ -146,7 +146,9 @@ type Reconciler struct {
 	// settleProofs replaces corrosion.TransferProofs (tests).
 	settleProofs func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
 	// settleFault fails a settle record write (tests; settle_pending.go).
-	settleFault func(step string) error
+	settleFault    func(step string) error
+	settleRecOnce  sync.Once
+	settleRecorder *settleRecorder
 	// settleDeclines rate-limits the decline report (settle_declined.go).
 	settleDeclines   settleDeclineTracker
 	onVMStarted      func(ctx context.Context, stackName string)       // optional: called after VM starts (LB refresh)

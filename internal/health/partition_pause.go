@@ -292,9 +292,14 @@ func DecideResume(rec PauseRecord, answers []VoterAnswer, needOthers int) Resume
 
 // PartitionPauser is the minority-side monitor.
 type PartitionPauser struct {
-	host  string
-	db    *corrosion.Client
-	store pauseStore
+	host    string
+	db      *corrosion.Client
+	store   pauseStore
+	dataDir string
+	// settleFault fails a settle record write (tests; settle_pending.go).
+	settleFault    func(step string) error
+	settleRecOnce  sync.Once
+	settleRecorder *settleRecorder
 
 	quorum  func(context.Context) (QuorumState, int, int)
 	enabled func() bool
@@ -350,7 +355,7 @@ type PartitionPauser struct {
 // NewPartitionPauser builds the monitor for host, recording under dataDir.
 func NewPartitionPauser(host, dataDir string, db *corrosion.Client) *PartitionPauser {
 	return &PartitionPauser{
-		host: host, db: db, store: newPauseStore(dataDir),
+		host: host, db: db, store: newPauseStore(dataDir), dataDir: dataDir,
 		now: time.Now, after: PartitionPauseAfter, tick: partitionPauseTick, ctCapable: lxc.Available,
 		failed: map[string]string{}, heldWhy: map[string]string{}, inflight: map[string]bool{},
 	}
@@ -847,6 +852,9 @@ func (p *PartitionPauser) stillPausedByUs(rec PauseRecord) (bool, string) {
 
 // tryResume runs the resume checks over every record (§3.5).
 func (p *PartitionPauser) tryResume(ctx context.Context, now time.Time) {
+	// First, the record of any container settle not yet fully written: it
+	// may drop the pause record of the copy it settled.
+	p.retryPendingSettles(ctx)
 	recs, err := p.store.list()
 	if err != nil {
 		slog.Error("partition-pause: cannot read the pause records; nothing is resumed", "host", p.host, "error", err)

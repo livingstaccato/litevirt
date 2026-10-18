@@ -648,7 +648,8 @@ func TestCredentialMerge_APreviousBuildsTombstoneConvergesWithNoTie(t *testing.T
 // Review m-13: a row the retirement order would apply over the local one is
 // still set aside when its clock, or the retirement it carries, is
 // future-dated, as any other anti-entropy row is. Mutation: apply the ordered
-// row before the skew check — red.
+// row before the skew check, or skip the retirement check when there is no
+// local row — red.
 func TestCredentialMerge_AnOrderedRowIsStillSkewQuarantined(t *testing.T) {
 	future := time.Now().Add(365 * 24 * time.Hour).UTC().Format(time.RFC3339Nano)
 	live := credRow{pass: "New-Pass", updatedAt: evOperator, after: evRetired, withEvidence: true}
@@ -665,12 +666,19 @@ func TestCredentialMerge_AnOrderedRowIsStillSkewQuarantined(t *testing.T) {
 			tomb, credRow{pass: "Skewed-Pass", updatedAt: evOperator, after: future, withEvidence: true}, "", false},
 		{"a live row with a future-dated clock",
 			tomb, credRow{pass: "Skewed-Pass", updatedAt: future, after: evOperator, withEvidence: true}, "", false},
+		// Review m-16: with no local row, the retirement is checked as well as
+		// the clock; a first-seen row set after a future-dated retirement would
+		// otherwise outrank every removal until the wall clock passed it.
+		{"a first-seen live row set after a future-dated retirement",
+			credRow{}, credRow{pass: "Skewed-Pass", updatedAt: evOperator, after: future, withEvidence: true}, "", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, guard := range []bool{true, false} {
 				c := newTestDB(t)
 				c.SetHLCSkewGuard(func() bool { return guard })
-				mergeInto(t, c, tc.local)
+				if tc.local != (credRow{}) {
+					mergeInto(t, c, tc.local)
+				}
 				before := c.SkewQuarantinedCount()
 				mergeInto(t, c, tc.in)
 				pass, live := liveCredential(t, c)

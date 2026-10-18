@@ -690,8 +690,9 @@ holds the retirement (it was down when the password was set, or applies the
 removal late) retires the password on every node, and an `ipmi` fence of the
 host then fails with `no IPMI password`. If you removed or re-admitted a host
 and set its password again before or during the roll, set it again with
-`lv host config <host> --ipmi-pass` once the roll completes. Passwords for
-hosts that were never removed or re-admitted replicate as before.
+`lv host config <host> --ipmi-pass` once the roll completes and every node
+is up. Passwords for hosts that were never removed or re-admitted replicate
+as before.
 
 ### Redfish
 

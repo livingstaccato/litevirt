@@ -233,13 +233,24 @@ func (c *Client) mergeCredentialOrder(tx *sql.Tx, table syncTable, row []interfa
 	if host == "" {
 		return credentialMergeDefault, nil
 	}
-	local, err := readLocalCredential(context.Background(), tx, host)
-	if err != nil || !local.exists {
-		return credentialMergeDefault, err
-	}
 	in := credentialOrder{
 		retirement: rowRetirement(cellStr(row, idx, "deleted_at"), cellStr(row, idx, "after_retirement")),
 		updatedAt:  cellStr(row, idx, "updated_at"),
+	}
+	local, err := readLocalCredential(context.Background(), tx, host)
+	if err != nil {
+		return credentialMergeDefault, err
+	}
+	if !local.exists {
+		// First seen: the ordinary merge checks the clock; the retirement
+		// is checked here, or a row set after a future-dated retirement
+		// would outrank every removal until the wall clock passed it.
+		if c.skewQuarantinesIncoming(skewGuardOn, "", in.retirement, skewNow) {
+			slog.Warn("sync: quarantined future-skewed incoming row (not applied)",
+				"table", table.Name, "reason", "future_skew", "first_seen", true)
+			return credentialMergeKeepLocal, nil
+		}
+		return credentialMergeDefault, nil
 	}
 	held := local.order()
 	switch cmpEvidence(in.retirement, held.retirement) {
@@ -270,7 +281,7 @@ func (c *Client) mergeCredentialOrder(tx *sql.Tx, table syncTable, row []interfa
 // unresolved for good (lww_tie_unresolved). Local and never logged.
 func clearTombstoneEvidence(tx *sql.Tx) error {
 	_, err := tx.ExecContext(context.Background(), `UPDATE host_fence_credentials SET after_retirement = ''
-		WHERE deleted_at IS NOT NULL AND after_retirement != ''`)
+		WHERE COALESCE(deleted_at, '') != '' AND after_retirement != ''`)
 	return err
 }
 

@@ -238,6 +238,9 @@ func (s *Server) moveOneVolume(
 	// may have left the persistent config already booting from dstPath (with possibly
 	// newer guest writes than src.Path); re-copying src→dst would clobber it. So decide
 	// the cutover BEFORE the copy.
+	// defineErr holds a define error the move completed through (a double fault
+	// whose config names the copy), for the source-delete guard below.
+	var defineErr error
 	cs, _, perr := s.planCutover(vm, src, dstPath)
 	if perr != nil {
 		s.recordVMEvent(ctx, vm.Name, "disk.moved", "error",
@@ -291,10 +294,19 @@ func (s *Server) moveOneVolume(
 			// The stopped VM must be redefined or it fails to start with "Cannot access
 			// storage file" once the old path is removed.
 			if derr := s.virt.DefineDomain(newXML); derr != nil {
-				kept := s.undoFailedDefine(vm, src, dstPath)
-				s.recordVMEvent(ctx, vm.Name, "disk.moved", "error",
-					fmt.Sprintf("%s: cutover aborted (source preserved%s): %v", src.DiskName, kept, derr))
-				return status.Errorf(codes.Internal, "redefine inactive domain (cutover aborted, source preserved%s): %v", kept, derr)
+				if s.rollbackCutover(cutoverRedefined, vm, src, dstPath) {
+					_ = os.Remove(dstPath)
+					s.recordVMEvent(ctx, vm.Name, "disk.moved", "error",
+						fmt.Sprintf("%s: cutover aborted (source preserved): %v", src.DiskName, derr))
+					return status.Errorf(codes.Internal, "redefine inactive domain (cutover aborted, source preserved): %v", derr)
+				}
+				// A double fault: the define reported an error and the config could
+				// not be pointed back. The row must name the file the config names, so
+				// a later start, cold migration or backup reads the file the VM uses.
+				if err := s.offlineUnrolledDefine(ctx, vm, src, dstPath, derr); err != nil {
+					return err
+				}
+				defineErr = derr
 			}
 		}
 		if err := corrosion.UpdateDiskPlacement(ctx, s.db, vm.Name, src.DiskName, vm.HostName, dstPath, dstPool.Driver, targetPool); err != nil {
@@ -320,7 +332,16 @@ func (s *Server) moveOneVolume(
 	}
 
 	if deleteSource {
-		s.deleteSourceIfUnreferenced(ctx, vm, src, emit)
+		if defineErr != nil && s.persistentNamesPath(vm, src.Path) {
+			// This move saw a libvirt define error: delete the source only when the
+			// persistent config is read and does not name it.
+			_ = emit(&pb.MoveVolumeProgress{
+				Phase:  pb.MoveVolumeProgress_CLEANUP,
+				Status: "source kept: the persistent config may still name " + src.Path,
+			})
+		} else {
+			s.deleteSourceIfUnreferenced(ctx, vm, src, emit)
+		}
 	}
 
 	s.recordVMEvent(ctx, vm.Name, "disk.moved", "ok",
@@ -444,22 +465,39 @@ func (s *Server) keptCopyNote(vm *corrosion.VMRecord, path string) string {
 	return fmt.Sprintf("; the copy %s is kept because the persistent config names it", path)
 }
 
-// undoFailedDefine follows a define of the cutover that reported an error,
-// which libvirt may have stored anyway: it points the persistent config back
-// at the source and then removes the copy. When the config cannot be pointed
-// back, the copy is kept and the returned note names it.
-func (s *Server) undoFailedDefine(vm *corrosion.VMRecord, src *corrosion.DiskRecord, dstPath string) string {
-	if !s.rollbackCutover(cutoverRedefined, vm, src, dstPath) {
-		return unrolledCopyNote(src, dstPath)
+// offlineUnrolledDefine handles an offline double fault: the define of the
+// cutover reported an error and the config could not be pointed back at the
+// source. It reads the config again. When the config names the copy, it
+// returns nil and the caller completes the move onto it (the copy is complete
+// and the VM is stopped, so the row follows the config), with a warning. When
+// the config names the source after all, the copy is kept and an error says so.
+// When the config cannot be read or names neither file, the row stays on the
+// source, both files are kept, and the error says the two may disagree.
+func (s *Server) offlineUnrolledDefine(ctx context.Context, vm *corrosion.VMRecord, src *corrosion.DiskRecord, dstPath string, derr error) error {
+	cs, _, perr := s.planCutover(vm, src, dstPath)
+	switch {
+	case perr == nil && cs == cutoverAlreadyAtDst:
+		detail := fmt.Sprintf("%s: the define of the new path reported an error (%v) and could not be undone; the persistent config names %s, so the move completes onto it",
+			src.DiskName, derr, dstPath)
+		slog.Warn("move: "+detail, "vm", vm.Name)
+		s.recordVMEventSeverity(ctx, vm.Name, "disk.moved", "ok", "warning", detail)
+		return nil
+	case perr == nil && cs == cutoverRedefined:
+		s.recordVMEvent(ctx, vm.Name, "disk.moved", "error",
+			fmt.Sprintf("%s: cutover aborted; the persistent config names the source; the copy %s is kept: %v", src.DiskName, dstPath, derr))
+		return status.Errorf(codes.Internal,
+			"redefine inactive domain (cutover aborted; the persistent config and the disk row name %s; the copy %s is kept): %v", src.Path, dstPath, derr)
+	default:
+		slog.Error("move: define failed, the rollback failed, and the persistent config could not be read or names neither file — disk row left on the source, both files kept; operator must reconcile",
+			"vm", vm.Name, "disk", src.DiskName, "src", src.Path, "dest", dstPath, "define_error", derr, "read_error", perr)
+		s.recordVMEvent(ctx, vm.Name, "disk.moved", "error",
+			fmt.Sprintf("%s: cutover aborted; the persistent config could not be read or names neither file; the disk row names %s and the copy %s is kept: %v", src.DiskName, src.Path, dstPath, derr))
+		return status.Errorf(codes.Internal,
+			"redefine inactive domain failed (%v) and could not be pointed back at %s, and the persistent config could not be read or names neither file (%v): "+
+				"the disk row names %s, but the config may name the copy %s; both files are kept. Do not start the VM until this is resolved. "+
+				"Operator: read the config (virsh dumpxml --inactive %s) and point the disk row at the file it names",
+			derr, src.Path, perr, src.Path, dstPath, vm.Name)
 	}
-	_ = os.Remove(dstPath)
-	return ""
-}
-
-// unrolledCopyNote names a copy kept because the config could not be pointed
-// back at the source.
-func unrolledCopyNote(src *corrosion.DiskRecord, dstPath string) string {
-	return fmt.Sprintf("; the copy %s is kept because the persistent config may still name it and could not be pointed back at %s", dstPath, src.Path)
 }
 
 // persistentNamesPath reports whether the VM's persistent config names path. An

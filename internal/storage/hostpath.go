@@ -187,6 +187,7 @@ var dataDirOwned = []string{
 	"opjournal",                 // daemon.go: the operation journal
 	"acme",                      // daemon/acme.go: ACME cache_dir default
 	"partition-pause",           // health/partition_pause_store.go partitionPauseDir
+	"settle-pending",            // health/settle_pending.go settlePendingDir: VM settles whose record is not yet written
 	"onboot-boot-id",            // health/onboot_boot.go onbootBootFile (and its .tmp, dataDirOwnedPrefixes)
 	"pending-audit",             // corrosion/pending_audit.go PendingAuditDirName
 	"image-delete-skew.json",    // grpcapi/image_delete_skew.go imageSkewHistoryFile (its temp is a dot-name; an earlier build of it left a .tmp, dataDirOwnedPrefixes)

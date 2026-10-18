@@ -39,8 +39,9 @@ import (
 //     local copy's incarnation (or a legacy key), at an owner epoch at least
 //     the local copy's.
 //
-// It writes an audit row and the vm_settled condition, and leaves the shut-off
-// domain to the existing leftover cleanup. It deletes nothing.
+// It writes an audit row and the vm_settled condition, retried until both are
+// written (settle_pending.go), and leaves the shut-off domain to the existing
+// leftover cleanup. It deletes nothing.
 
 // SettleVerifier verifies a proof's recovery-claim certificate
 // (grpcapi.Server.VerifySettleProof).
@@ -256,19 +257,45 @@ func (r *Reconciler) settleCertifiedMove(ctx context.Context, domName string, vm
 	if why != "" {
 		return false, why, local
 	}
+	// The record of what is about to happen goes to disk first: the destroy
+	// cannot be undone, and once the copy is shut off no later pass settles
+	// it again, so a record written only after it is lost with the daemon or
+	// with one failed write (settle_pending.go). A record that cannot be
+	// saved does not hold the destroy back: the copy is superseded either
+	// way, and the record is then written once, as before.
+	store := newSettlePendingStore(r.dataDir)
+	rec := r.newSettlePending(domName, p, cert, local)
+	stored := true
+	if err := store.put(rec); err != nil {
+		stored = false
+		slog.Warn("partition-settle: could not save the pending-settle record; the settle's audit row and vm_settled "+
+			"are written once and not retried", "vm", domName, "error", err)
+	}
 	if err := r.virt.DestroyDomain(domName); err != nil {
+		if stored {
+			if rerr := store.remove(domName); rerr != nil {
+				slog.Warn("partition-settle: could not drop the pending-settle record of a failed destroy", "vm", domName, "error", rerr)
+			}
+		}
 		return false, "destroy failed: " + err.Error(), local
 	}
-	detail := fmt.Sprintf("stopped the local copy (%s: incarnation %s, owner epoch %d): superseded by proof %s for %s, "+
-		"certified at voter generation %d for owner epoch %d; definition and disks kept",
-		local.Source, local.Incarnation, local.Epoch, p.ID, p.DestHost, cert.ConfigGeneration, cert.Key.OwnerEpoch)
+	rec.Phase = settlePhaseStopped
+	if stored {
+		if err := store.put(rec); err != nil {
+			slog.Warn("partition-settle: could not mark the pending-settle record stopped", "vm", domName, "error", err)
+		}
+	}
 	slog.Warn("partition-settle: stopped a local copy that a certified recovery claim gave to another host",
 		"vm", domName, "host", r.hostName, "dest", p.DestHost, "proof", p.ID,
 		"claim_epoch", cert.Key.OwnerEpoch, "local_epoch", local.Epoch, "evidence", local.Source)
-	auditSettle(ctx, r.db, r.hostName, domName, detail)
-	r.raiseSettled(ctx, domName, p, cert, local)
+	done := r.writeSettleRecord(ctx, store, &rec, stored)
 	if err := RemovePauseRecord(r.dataDir, PauseKindVM, domName); err != nil {
 		slog.Warn("partition-settle: could not drop the pause record", "vm", domName, "error", err)
+	}
+	if done && stored {
+		if err := store.remove(domName); err != nil {
+			slog.Warn("partition-settle: could not drop the pending-settle record", "vm", domName, "error", err)
+		}
 	}
 	return true, "", local
 }
@@ -282,20 +309,22 @@ type settledEvidence struct {
 	Detail           string             `json:"detail"`
 }
 
-func (r *Reconciler) raiseSettled(ctx context.Context, name string, p corrosion.ProofRecord, cert corrosion.ClaimCertificate, local localCopyID) {
-	ts := r.now().UTC().Format(time.RFC3339)
-	b, _ := json.Marshal(settledEvidence{Proof: p.ID, Dest: p.DestHost, Key: cert.Key, ConfigGeneration: cert.ConfigGeneration,
-		Local:  map[string]any{"incarnation": local.Incarnation, "owner_epoch": local.Epoch, "evidence": local.Source},
-		Detail: "this host came back holding a copy a decided recovery claim gave to another host; it stopped its copy (definition and disks kept)"})
-	if err := corrosion.UpsertHealthCondition(ctx, r.db, corrosion.HealthCondition{
-		Evaluator: corrosion.PartitionPauseEvaluator, Code: corrosion.CondVMSettled,
-		SubjectKind: "vm", SubjectID: name + "@" + r.hostName,
-		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityWarning,
-		Hosts: []string{r.hostName, p.DestHost}, Evidence: string(b), ObserveCount: 1,
-		FirstSeen: ts, LastSeen: ts, ConfirmedAt: ts, Reporter: r.hostName,
-	}); err != nil {
-		slog.Warn("partition-settle: could not record vm_settled", "vm", name, "error", err)
+// raiseSettled raises rec's vm_settled, dated when the copy stopped.
+func (r *Reconciler) raiseSettled(ctx context.Context, rec settlePending) error {
+	ts := rec.At
+	if ts == "" {
+		ts = r.now().UTC().Format(time.RFC3339)
 	}
+	b, _ := json.Marshal(settledEvidence{Proof: rec.Proof, Dest: rec.Dest, Key: rec.Key, ConfigGeneration: rec.ConfigGeneration,
+		Local:  map[string]any{"incarnation": rec.LocalIncarnation, "owner_epoch": rec.LocalEpoch, "evidence": rec.LocalEvidence},
+		Detail: "this host came back holding a copy a decided recovery claim gave to another host; it stopped its copy (definition and disks kept)"})
+	return corrosion.UpsertHealthCondition(ctx, r.db, corrosion.HealthCondition{
+		Evaluator: corrosion.PartitionPauseEvaluator, Code: corrosion.CondVMSettled,
+		SubjectKind: "vm", SubjectID: rec.Name + "@" + r.hostName,
+		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityWarning,
+		Hosts: []string{r.hostName, rec.Dest}, Evidence: string(b), ObserveCount: 1,
+		FirstSeen: ts, LastSeen: ts, ConfirmedAt: ts, Reporter: r.hostName,
+	})
 }
 
 // resolveSettled resolves this host's vm_settled conditions that no longer
@@ -395,7 +424,7 @@ func (p *PartitionPauser) settleContainer(ctx context.Context, rec PauseRecord) 
 		cert.ConfigGeneration, cert.Key.OwnerEpoch)
 	slog.Warn("partition-settle: stopped a local copy that a certified recovery claim gave to another host",
 		"ct", rec.Name, "host", p.host, "dest", dest, "proof", pr.ID, "claim_epoch", cert.Key.OwnerEpoch, "local_epoch", rec.OwnerEpoch)
-	auditSettle(ctx, p.db, p.host, "container/"+rec.Name, detail)
+	_ = auditSettle(ctx, p.db, p.host, "container/"+rec.Name, detail, randid.New())
 	ts := p.now().UTC().Format(time.RFC3339)
 	b, _ := json.Marshal(settledEvidence{Proof: pr.ID, Dest: dest, Key: cert.Key, ConfigGeneration: cert.ConfigGeneration,
 		Local:  map[string]any{"incarnation": rec.Incarnation, "owner_epoch": rec.OwnerEpoch, "evidence": "partition-pause record"},
@@ -459,10 +488,11 @@ func settleDecideContainer(self, dest string, rec PauseRecord, proofs []corrosio
 
 // auditSettle writes the partition.settle audit row, the one writer both
 // settle paths share (signed like every audit row; see
-// TestAuditWriter_SettleRowsAreSigned).
-func auditSettle(ctx context.Context, db *corrosion.Client, host, target, detail string) {
-	_ = corrosion.InsertAuditLog(ctx, db, corrosion.AuditRecord{
-		ID: randid.New(), Username: "system", HostName: host,
+// TestAuditWriter_SettleRowsAreSigned). id is the caller's, so a retry of
+// the same settle writes no second row.
+func auditSettle(ctx context.Context, db *corrosion.Client, host, target, detail, id string) error {
+	return corrosion.InsertAuditLog(ctx, db, corrosion.AuditRecord{
+		ID: id, Username: "system", HostName: host,
 		Action: "partition.settle", Target: target, Detail: detail, Result: "ok",
 	})
 }

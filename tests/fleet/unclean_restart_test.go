@@ -153,12 +153,15 @@ func TestFleet_UncleanCrashLoopIsUpgradingOnce(t *testing.T) {
 	if b.State != "upgrading" || b.Deferred {
 		t.Fatalf("first boot after a crash decided %+v, want 'upgrading' written", b)
 	}
+	// The state and its since come from one read of the membership row. Read
+	// apart, the boot write could replicate between them: the since of the
+	// split pass's 'active' copy, then the 'upgrading' of the boot write.
 	var since time.Time
 	eventually(t, convergeTimeout, "the first boot write to reach the coordinator", func() bool {
-		at, ok, err := corrosion.HostStateSince(ctx, f.a.DB, f.d.Name)
-		h, herr := corrosion.GetHost(ctx, f.a.DB, f.d.Name)
-		since = at
-		return err == nil && ok && herr == nil && h != nil && h.State == "upgrading"
+		states, err := corrosion.HostsStateSince(ctx, f.a.DB)
+		s, ok := states[f.d.Name]
+		since = s.Since
+		return err == nil && ok && s.State == "upgrading"
 	})
 	time.Sleep(20 * time.Second) // it dies before serving; systemd starts it again
 	b, second := f.uncleanBoot(t, dir)

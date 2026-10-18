@@ -995,6 +995,17 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	if !validRestoreName(targetName) {
 		return status.Errorf(codes.InvalidArgument, "invalid promotion name %q", targetName)
 	}
+	// A promotion to a new name makes a VM of that name here: no create of
+	// the name runs on this host while it does (beginCreate).
+	setFlightUUID := func(string) {}
+	if renamed {
+		endFlight, set, ferr := s.beginCreate(targetName)
+		if ferr != nil {
+			return ferr
+		}
+		defer endFlight()
+		setFlightUUID = set
+	}
 
 	// Reconstruct the spec from the durable record BEFORE admission: the host
 	// lease must cover the spec's complete CPU and memory, and a record that
@@ -1624,6 +1635,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				Phase: pb.PromoteReplicaProgress_DEFINING, VmName: targetName, Host: s.hostName,
 				Replica: replica, DiskPath: livePath, Status: "defining domain" + multiDiskNote,
 			})
+			setFlightUUID(spec.Uuid)
 			if err := s.virt.DefineDomain(domXML); err != nil {
 				return "define domain", err
 			}

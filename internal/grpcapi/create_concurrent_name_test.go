@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -291,5 +292,80 @@ func TestCreateVM_AFailedCreateLeavesADiskAnotherDomainOfTheNameNames(t *testing
 	}
 	if _, err := os.Stat(disk); err != nil {
 		t.Errorf("the failed create removed the disk another domain of the name names: %v", err)
+	}
+}
+
+// The row check runs again once the create holds its flight: a create of the
+// name that committed and returned between the first check and the flight has
+// a row by then. Without the second check the orphan sweep took that VM's
+// stopped domain for a leftover and undefined it, and the debris sweep
+// removed its disks (dupcreate review I-2).
+//
+// Mutation: drop the check under the flight — the committed VM's domain is
+// undefined and its disk replaced, red.
+func TestCreateVM_ACreateThatCommittedBeforeTheFlightIsNotSwept(t *testing.T) {
+	stageGenisoimage(t)
+	s, fake, _ := isoServer(t)
+	const name = "ug7"
+	disk := s.images.DiskPath(name, "root")
+	var committed os.FileInfo
+	var firstErr error
+	s.createBeforeFlightHook = func(string) {
+		s.createBeforeFlightHook = nil
+		if _, firstErr = s.CreateVM(adminCtx(), seedCreateRequest(t, s, name, "")); firstErr != nil {
+			return
+		}
+		// The operator stops it.
+		if err := fake.DestroyDomain(name); err != nil {
+			t.Fatal(err)
+		}
+		committed, _ = os.Stat(disk)
+	}
+	_, err := s.CreateVM(adminCtx(), seedCreateRequest(t, s, name, ""))
+	if firstErr != nil || committed == nil {
+		t.Fatalf("setup: the create that commits first: %v (disk %v)", firstErr, committed)
+	}
+	if status.Code(err) != codes.AlreadyExists {
+		t.Errorf("the create that took its flight after the other committed: %v, want AlreadyExists", err)
+	}
+	if u, _ := undefinesOf(fake, name); u != 0 {
+		t.Errorf("the committed VM's domain was undefined %d times", u)
+	}
+	if !fake.DomainExists(name) {
+		t.Error("the committed VM's domain is gone")
+	}
+	if fi, serr := os.Stat(disk); serr != nil || !os.SameFile(fi, committed) {
+		t.Errorf("the committed VM's disk %s was removed or replaced (err=%v)", disk, serr)
+	}
+}
+
+// A leftover domain the sweep could not remove refuses the create before the
+// debris sweep: a domain still defined (the undefine failed, or it was started
+// in between and is now transient) still names the disks at the name's paths
+// (dupcreate review m-4).
+//
+// Mutation: drop the check after the undefine — the debris sweep removes the
+// disk under the leftover, red.
+func TestCreateVM_ALeftoverThatCannotBeRemovedRefusesBeforeTheDebrisSweep(t *testing.T) {
+	stageGenisoimage(t)
+	s, fake, _ := isoServer(t)
+	const name, uuid = "ug8", "11111111-2222-3333-4444-888888888888"
+	if err := fake.DefineDomain(fmt.Sprintf("<domain type='kvm'><name>%s</name><uuid>%s</uuid></domain>", name, uuid)); err != nil {
+		t.Fatal(err)
+	}
+	disk := s.images.DiskPath(name, "root")
+	if err := os.MkdirAll(filepath.Dir(disk), 0o711); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(disk, []byte("the leftover's disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake.FailUndefineDomain = func(string, bool) error { return errors.New("injected: undefine refused") }
+	_, err := s.CreateVM(adminCtx(), seedCreateRequest(t, s, name, ""))
+	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "nothing was created") {
+		t.Fatalf("create over a leftover that cannot be undefined: %v, want Unavailable, nothing was created", err)
+	}
+	if b, rerr := os.ReadFile(disk); rerr != nil || string(b) != "the leftover's disk" {
+		t.Errorf("the leftover's disk was swept: %q %v", b, rerr)
 	}
 }

@@ -2,6 +2,8 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -121,35 +123,69 @@ func (s *Server) refuseLiveDomainOfName(name, self string) error {
 				"nothing was created and the domain is left as it is", name, s.hostName, err)
 	}
 	if active {
+		// Say which domain, and whether litevirt ever stamped it as a VM's
+		// runtime, so the operator can tell a lost row from a hand-made guest.
+		u := domainUUIDFromXML(x)
+		if u == "" {
+			u = "unreadable"
+		}
+		stamp := "it carries no litevirt owner-epoch stamp"
+		if e, ok, gerr := s.virt.GetDomainOwnerEpoch(name); gerr != nil {
+			stamp = fmt.Sprintf("its litevirt owner-epoch stamp cannot be read (%v)", gerr)
+		} else if ok {
+			stamp = fmt.Sprintf("it carries litevirt's owner-epoch stamp %d, so it was a litevirt VM's runtime", e)
+		}
 		return status.Errorf(codes.FailedPrecondition,
-			"create %s refused on %s: a domain of the name is running there with no VM record; nothing was created and the "+
-				"domain is left as it is, with its disks. Find out what it is before it is stopped: once it is, the next create "+
-				"of %s removes it and the disks at its name's paths",
-			name, s.hostName, name)
+			"create %s refused on %s: a domain of the name (uuid %s) is running there with no VM record; %s. Nothing was "+
+				"created and the domain is left as it is, with its disks. Find out what it is before it is stopped: once it is, "+
+				"the next create of %s removes it and the disks at its name's paths",
+			name, s.hostName, u, stamp, name)
 	}
 	return nil
 }
 
-// foreignDomainDiskPaths is the disk sources of the domain of name when it is
-// not the one a create of uuid self defined (libvirt reads a stopped
-// domain's from its definition): a failed create removes none of them. A domain whose uuid
-// cannot be read is foreign. Empty when no domain of the name exists.
-func (s *Server) foreignDomainDiskPaths(name, self string) map[string]bool {
+// foreignDomainDiskPaths reports, for a path, whether the domain of name names
+// it when that domain is not the one a create of uuid self defined (libvirt
+// reads a stopped domain's sources from its definition): a failed create
+// removes none of those. A source is matched by its spelling and by the file
+// it is (a symlinked pool directory names one file two ways). A domain whose
+// uuid cannot be read is foreign. Nothing matches when no domain of the name
+// exists.
+func (s *Server) foreignDomainDiskPaths(name, self string) func(string) bool {
+	none := func(string) bool { return false }
 	if s.virt == nil || !s.virt.DomainExists(name) {
-		return nil
+		return none
 	}
 	x, err := s.virt.DumpXMLInactive(name)
 	if err != nil {
 		x, _ = s.virt.DumpXML(name)
 	}
 	if u := domainUUIDFromXML(x); u != "" && u == self {
-		return nil
+		return none
 	}
-	out := map[string]bool{}
+	byName := map[string]bool{}
+	var files []os.FileInfo
 	if src, err := s.virt.DomainDiskSources(name); err == nil {
 		for _, p := range src {
-			out[p] = true
+			byName[p] = true
+			if fi, serr := os.Stat(p); serr == nil {
+				files = append(files, fi)
+			}
 		}
 	}
-	return out
+	return func(p string) bool {
+		if byName[p] {
+			return true
+		}
+		fi, err := os.Stat(p)
+		if err != nil {
+			return false
+		}
+		for _, f := range files {
+			if os.SameFile(fi, f) {
+				return true
+			}
+		}
+		return false
+	}
 }

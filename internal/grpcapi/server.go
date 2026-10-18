@@ -402,6 +402,10 @@ type Server struct {
 	commitFenceHook func(op string)
 	// createCommittedHook is a test-only seam; see SetCreateCommittedHook.
 	createCommittedHook func(name string) error
+	// createBeforeFlightHook, when set, runs on the owner between a create's
+	// first existence check and its in-flight registration (beginCreate).
+	// Test seam only; nil in production.
+	createBeforeFlightHook func(name string)
 	// createReturnedHook is a test-only seam; see SetCreateReturnedHook.
 	createReturnedHook func(name string, err error)
 	// stackMemberDeleteHook is a test-only seam: DeleteStack calls it with

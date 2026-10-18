@@ -355,32 +355,8 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		s.audit(ctx, "vm.create", spec.Name,
 			fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 				targetHost, spec.Cpu, spec.MemoryMib), "allow-overcommit")
-		// Bypassing the CHECK does not mean hiding the DRAW: an overcommit create
-		// that reserved nothing would be invisible to the very next admission, so a
-		// normal create could be admitted against memory this one is already using.
-		// Reserved on the OWNING node only, for the same double-count reason the
-		// checked path reserves there.
-		if targetHost == s.hostName {
-			lease, aerr := s.reserveWithoutCheck(ctx, "CreateVM", targetHost, project,
-				"vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib))
-			if aerr != nil {
-				return nil, aerr
-			}
-			defer lease.release(ctx)
-			// --allow-overcommit bypasses HOST capacity only. Project quota is a
-			// tenancy limit, not a physical judgment call, so it goes through the
-			// SERIALIZED admission like any other create — the earlier tenancy
-			// fail-fast cannot see in-flight reservations, so relying on it here
-			// let concurrent overcommit creates all observe the same headroom.
-			createQuota := vmSpecQuotaAmount(spec)
-			qLease, qerr := s.admitQuotaWithReservation(ctx, "CreateVM", targetHost, project,
-				corrosion.WorkloadVM, spec.Name, createQuota, createQuota, intentVMResident)
-			if qerr != nil {
-				return nil, qerr
-			}
-			defer qLease.release(ctx)
-			createLease = qLease
-		}
+		// The draw is reserved on the owning node only, once this create holds
+		// its flight (below, after beginCreate).
 	} else if err := s.checkResourceAdmission(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
 		// Advisory fail-fast on the ENTRY node: read-only, so it costs nothing and
 		// rejects the hopeless case before we forward. The authoritative
@@ -436,6 +412,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// Taken before anything is reserved or made, so a refused create did
 	// nothing. The existence check above ran before the flight was taken: a
 	// create of the name that finished in between has a row by now.
+	if h := s.createBeforeFlightHook; h != nil {
+		h(spec.Name)
+	}
 	endFlight, setFlightUUID, err := s.beginCreate(spec.Name)
 	if err != nil {
 		return nil, err
@@ -443,6 +422,33 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	defer endFlight()
 	if err := s.refuseExistingVM(ctx, spec.Name); err != nil {
 		return nil, err
+	}
+	if req.AllowOvercommit {
+		// Bypassing the CHECK does not mean hiding the DRAW: an overcommit create
+		// that reserved nothing would be invisible to the very next admission, so a
+		// normal create could be admitted against memory this one is already using.
+		// Reserved on the OWNING node only, for the same double-count reason the
+		// checked path reserves there, and under the flight, so a create refused
+		// for another in flight reserved nothing.
+		lease, aerr := s.reserveWithoutCheck(ctx, "CreateVM", targetHost, project,
+			"vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib))
+		if aerr != nil {
+			return nil, aerr
+		}
+		defer lease.release(ctx)
+		// --allow-overcommit bypasses HOST capacity only. Project quota is a
+		// tenancy limit, not a physical judgment call, so it goes through the
+		// SERIALIZED admission like any other create — the earlier tenancy
+		// fail-fast cannot see in-flight reservations, so relying on it here
+		// let concurrent overcommit creates all observe the same headroom.
+		createQuota := vmSpecQuotaAmount(spec)
+		qLease, qerr := s.admitQuotaWithReservation(ctx, "CreateVM", targetHost, project,
+			corrosion.WorkloadVM, spec.Name, createQuota, createQuota, intentVMResident)
+		if qerr != nil {
+			return nil, qerr
+		}
+		defer qLease.release(ctx)
+		createLease = qLease
 	}
 	// This host owns the create. A create that fails here is logged with its
 	// cause, and with what its cleanup did (undone, noted as each step runs),
@@ -593,14 +599,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	var diskRecords []corrosion.DiskRecord
 	var createdDiskPaths []string
 	// createdDiskFile is the file each host-local disk this create made is
-	// (its identity, from the Stat right after it was made): a failed create
-	// removes a path only while that file is still there, never another
-	// create's or domain's file that took the path since.
-	createdDiskFile := map[string]os.FileInfo{}
+	// (its identity, read right after it was made; madeFileID): a failed
+	// create removes a path only while that file is still there, never
+	// another create's or domain's file that took the path since.
+	createdDiskFile := map[string]madeFileID{}
 	recordDisk := func(p string) {
 		createdDiskPaths = append(createdDiskPaths, p)
-		if fi, err := os.Stat(p); err == nil {
-			createdDiskFile[p] = fi
+		if id, ok := madeFileIdentity(p); ok {
+			createdDiskFile[p] = id
 		}
 	}
 	// A disk that is not a file (an rbd image) is removed by the driver that
@@ -647,7 +653,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		// failed create must leave, whoever made the file there.
 		foreign := s.foreignDomainDiskPaths(spec.Name, spec.Uuid)
 		for _, p := range createdDiskPaths {
-			if foreign[p] {
+			if foreign(p) {
 				noteUndo("disk " + p + " left: a domain of the name this create did not define names it")
 				continue
 			}
@@ -666,11 +672,10 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				continue
 			}
 			made, ok := createdDiskFile[p]
-			fi, serr := os.Stat(p)
-			switch {
-			case serr != nil && os.IsNotExist(serr):
+			if _, serr := os.Lstat(p); serr != nil && os.IsNotExist(serr) {
 				continue
-			case !ok || serr != nil || !os.SameFile(fi, made):
+			}
+			if !ok || !made.stillAt(p) {
 				noteUndo("disk " + p + " left: it is no longer the file this create made")
 				continue
 			}
@@ -697,7 +702,15 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		state, _ := s.virt.DomainState(spec.Name)
 		slog.Warn("cleaning up orphaned libvirt domain", "vm", spec.Name, "state", state)
-		s.virt.UndefineDomain(spec.Name, true)
+		uerr := s.virt.UndefineDomain(spec.Name, true)
+		// Still there (the undefine failed, or someone started it in between
+		// and it is now transient): the debris sweep below must not run under
+		// it.
+		if s.virt.DomainExists(spec.Name) {
+			return nil, status.Errorf(codes.Unavailable,
+				"create %s refused on %s: a leftover domain of the name could not be removed (undefine: %v); "+
+					"nothing was created and the domain is left as it is", spec.Name, s.hostName, uerr)
+		}
 	}
 
 	// The refusals the create would meet later that do not depend on what it
@@ -1386,8 +1399,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// VM with a unique name and no prior/other owner — there is no ownership contest
 	// to arbitrate, so it can't double-run. Gating it would only block new workloads
 	// on a quorum-degraded node with zero safety benefit. The one cross-partition
-	// hazard (two operators creating the SAME name on both sides) is an operator error
-	// caught by the vms PK + owner-assert on heal, not something a quorum gate closes.
+	// hazard (two creates of the SAME name placed on different owners, on both sides of
+	// a partition or not) is not something a quorum gate closes, and nothing here
+	// resolves it: the per-host flight (beginCreate) serialises only creates on ONE
+	// owner. The vms PK keeps one row by LWW, and owner-assert DETECTS the second
+	// runtime on heal and alerts (SPLIT-BRAIN); it does not stop either copy. A
+	// replicated per-name create claim is the known follow-up.
 
 	// The ISO was judged before admission; an image pull can run in between,
 	// and qemu opens it at this boot, so it is judged again now.
@@ -4792,9 +4809,27 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		defer s.holdImage(spec.Image)()
 	}
 
-	// Stop and undefine the current domain.
-	if vm.State == "running" {
-		s.virt.DestroyDomain(req.Name)
+	// Stop and undefine the current domain. Whether it runs is libvirt's to
+	// say, not the row's: a row still "creating" (not yet published) or
+	// lagging an out-of-band start names a running guest too, and undefining
+	// that one leaves a transient qemu on the disks deleted below, with no
+	// record, which the create would then refuse to replace. A domain that
+	// cannot be stopped refuses the rebuild with the VM as it is.
+	if s.virt.DomainExists(req.Name) {
+		active, aerr := s.virt.DomainIsActive(req.Name)
+		if aerr != nil || active {
+			derr := s.virt.DestroyDomain(req.Name)
+			if still, serr := s.virt.DomainIsActive(req.Name); serr != nil || still {
+				if derr == nil {
+					derr = serr
+				}
+				if derr == nil {
+					derr = errors.New("it is still running")
+				}
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"cannot rebuild %q: its domain on %s could not be stopped (%v); nothing was changed", req.Name, s.hostName, derr)
+			}
+		}
 	}
 	s.virt.UndefineDomain(req.Name, false)
 
@@ -4938,6 +4973,15 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 		}
 		return out, err
 	}
+
+	// The cutover gives the -next VM the name: no create of the name runs on
+	// this host while it does (beginCreate), so none can land in the window
+	// between the original's tombstone and the rename.
+	endFlight, _, ferr := s.beginCreate(req.VmName)
+	if ferr != nil {
+		return nil, ferr
+	}
+	defer endFlight()
 
 	// Resource pre-check: during the cutover overlap window, both the old and
 	// new VM may be running simultaneously. Verify the host has enough resources

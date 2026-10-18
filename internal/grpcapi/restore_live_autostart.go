@@ -167,6 +167,13 @@ func (s *Server) autoDefineRestoredVM(
 		return "", "", err
 	}
 
+	// No create of the name runs on this host while this restore does
+	// (beginCreate): they would share the name's domain and paths.
+	endFlight, setFlightUUID, ferr := s.beginCreate(targetName)
+	if ferr != nil {
+		return "", "", ferr
+	}
+	defer endFlight()
 	// Collision guard: never clobber a live VM. The operator passes
 	// --name to restore alongside the original.
 	if rec, _ := corrosion.GetVM(ctx, s.db, targetName); rec != nil {
@@ -388,6 +395,7 @@ func (s *Server) autoDefineRestoredVM(
 		}
 		limitsG = capabilities.FeatureGrant{}
 	}
+	setFlightUUID(spec.Uuid)
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		return "", "", status.Errorf(codes.Internal, "define domain: %v", err)
 	}

@@ -293,7 +293,10 @@ Interrupted before the re-create sends its delete (a rebuild: before its
 teardown), nothing is deleted. From then on the replace runs to its create
 whatever becomes of the client, so an interrupted replace does not end with no
 VM; the command reports that it may still complete, and names `lv ls`. A
-create that replaces nothing (the delete found no VM) stays cancellable.
+create that replaces nothing (the delete found no VM) stays cancellable. A
+`lv compose up` interrupted once it has begun acting on workloads still records
+the stack's new compose file, with the stack `degraded`: the rest of its plan
+did not run, and running `lv compose up` again finishes it.
 
 **CPU mode.** The default, `host-model`, gives the guest the host's modern
 instruction set — SSE4.2, AVX, AVX2, AVX-512 as the host has them — while keeping

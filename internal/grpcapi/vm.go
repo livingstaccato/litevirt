@@ -2484,6 +2484,12 @@ func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb
 // startInFlightError is returned; the caller must hold the VM lock until its
 // settled is closed (heldForStart), not let it go on return.
 func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord, wait time.Duration) (*pb.VM, error) {
+	// A volume move this host left unresolved points the disk row at the file
+	// the persistent config names before anything reads the rows, or refuses
+	// the start (move_unresolved.go).
+	if err := s.resolveUnresolvedMoves(ctx, vm.Name); err != nil {
+		return nil, err
+	}
 	// A VM with a shared disk whose row names another host (a partial
 	// promotion's, review R4-I2) has its domain redefined from its rows first,
 	// which judges that host again: a disk it withheld is attached once the
@@ -3577,6 +3583,10 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		return nil, status.Errorf(codes.Internal,
 			"cannot delete VM %q: its libvirt domain could not be undefined, so its record and disks were kept (retry is safe): %v",
 			req.Name, undefErr)
+	}
+	// The domain is gone: a volume move it left unresolved describes nothing.
+	if err := health.ClearUnresolvedMovesOf(s.dataDir, req.Name); err != nil {
+		slog.Warn("DeleteVM: removing the VM's unresolved volume-move records failed", "vm", req.Name, "error", err)
 	}
 
 	// Delete disks unless keep-disks. Free each disk at its RECORDED location
@@ -4695,6 +4705,9 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		s.virt.DestroyDomain(req.Name)
 	}
 	s.virt.UndefineDomain(req.Name, false)
+	if err := health.ClearUnresolvedMovesOf(s.dataDir, req.Name); err != nil {
+		slog.Warn("RebuildVM: removing the VM's unresolved volume-move records failed", "vm", req.Name, "error", err)
+	}
 
 	// Delete existing disks — at their recorded locations (driver-dispatched,
 	// so a rebuilt VM doesn't leak its old non-default-pool backing volume),

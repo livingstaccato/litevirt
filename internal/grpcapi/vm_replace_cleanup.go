@@ -676,6 +676,9 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 		// here as there, never refusing it.
 		s.retryStaleSeedForStart(ctx, rec)
 	}
+	if merr := s.resolveUnresolvedMoves(ctx, m.ReplacedVM); merr != nil {
+		return failed("start", merr)
+	}
 	releaseGuard, gerr := s.guardSharedDiskStart(ctx, m.ReplacedVM, "")
 	if gerr != nil {
 		return failed("start", gerr)

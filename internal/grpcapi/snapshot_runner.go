@@ -85,6 +85,9 @@ func (r *backupRunner) runBackupInner(ctx context.Context, sched corrosion.Backu
 	unlock := r.server.lockVM(sched.VMName)
 	defer unlock()
 
+	if err := r.server.resolveUnresolvedMoves(ctx, sched.VMName); err != nil {
+		return err
+	}
 	disk, derr := pickDisk(ctx, r.server.db, sched.VMName, "")
 	if derr != nil {
 		return fmt.Errorf("pick disk: %v", derr)

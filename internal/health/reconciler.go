@@ -1743,6 +1743,24 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 
 	slog.Info("reconciler: starting pending VM", "vm", vm.Name)
 
+	// A volume move this host left unresolved points the disk row at the file
+	// the persistent config names — read before the domain is undefined and
+	// rebuilt from the rows below — or the start is refused
+	// (move_unresolved.go). A domain already running is left to the branch
+	// below.
+	if r.virt == nil || !r.virt.DomainExists(vm.Name) || !domainRunningNow(r.virt, vm.Name) {
+		if merr := ResolveUnresolvedMoves(ctx, r.db, r.dataDir, r.hostName, vm.Name, func() (string, error) {
+			if r.virt == nil {
+				return "", errors.New("no libvirt backend")
+			}
+			return r.virt.DumpXMLInactive(vm.Name)
+		}); merr != nil {
+			slog.Warn("reconciler: start refused — an unresolved volume move", "vm", vm.Name, "error", merr)
+			r.failPendingStart(ctx, vm.Name, proofID, false, merr.Error())
+			return
+		}
+	}
+
 	// Check if a domain already exists locally from a partial migration (#14).
 	if r.virt != nil && r.virt.DomainExists(vm.Name) {
 		state, err := r.virt.DomainState(vm.Name)

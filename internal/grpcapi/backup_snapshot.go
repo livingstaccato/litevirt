@@ -76,6 +76,11 @@ func (s *Server) BackupSnapshot(req *pb.BackupSnapshotRequest, stream grpc.Serve
 	if err := s.settlePITOverlays(ctx, vm); err != nil {
 		return err
 	}
+	// A volume move left unresolved here: the row names the file the
+	// persistent config names before it is read (move_unresolved.go).
+	if err := s.resolveUnresolvedMoves(ctx, req.VmName); err != nil {
+		return err
+	}
 
 	disk, err := pickDisk(ctx, s.db, req.VmName, req.DiskName)
 	if err != nil {

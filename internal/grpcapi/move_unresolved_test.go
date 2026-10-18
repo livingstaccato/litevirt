@@ -1,0 +1,603 @@
+package grpcapi
+
+import (
+	"context"
+	"errors"
+	"os"
+	"strings"
+	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
+)
+
+// moveRecords returns the unresolved-move records this host keeps for vm.
+func moveRecords(t *testing.T, s *Server, vm string) []health.UnresolvedMove {
+	t.Helper()
+	ms, err := health.UnresolvedMovesOf(s.dataDir, vm)
+	if err != nil {
+		t.Fatalf("read unresolved-move records: %v", err)
+	}
+	return ms
+}
+
+// restoreDiskRow undoes SoftDeleteDisk, so a commit that failed once can
+// succeed on a retry.
+func restoreDiskRow(t *testing.T, s *Server, vm, disk string) {
+	t.Helper()
+	if err := s.db.Execute(context.Background(),
+		`UPDATE vm_disks SET deleted_at = NULL WHERE vm_name = ? AND disk_name = ?`, vm, disk); err != nil {
+		t.Errorf("restore disk row: %v", err)
+	}
+}
+
+// breakDefinesAfter lets the define naming path apply and succeed, runs after
+// (if any), and makes every later define fail, so a rollback cannot apply.
+func breakDefinesAfter(f *libvirtfake.Fake, path string, after func()) {
+	broken := false
+	f.FailDefineDomain = func(x string) error {
+		if broken {
+			return errors.New("libvirt connection lost")
+		}
+		if strings.Contains(x, path) {
+			broken = true
+			if after != nil {
+				after()
+			}
+		}
+		return nil
+	}
+}
+
+// startHookMover runs onStart when the block copy starts.
+type startHookMover struct {
+	fakeLiveMover
+	onStart func()
+}
+
+func (m *startHookMover) StartBlockCopy(dom, disk, xml string, flags uint32) error {
+	if m.onStart != nil {
+		m.onStart()
+	}
+	return m.fakeLiveMover.StartBlockCopy(dom, disk, xml, flags)
+}
+
+// pivotHookMover runs onPivot before each pivot.
+type pivotHookMover struct {
+	fakeLiveMover
+	onPivot func()
+}
+
+func (m *pivotHookMover) PivotBlockCopy(dom, disk string) error {
+	if m.onPivot != nil {
+		m.onPivot()
+	}
+	return m.fakeLiveMover.PivotBlockCopy(dom, disk)
+}
+
+// I-R1: the redefine applies, the disk row commit fails, and pointing the
+// config back fails. The mirror is not cancelled under a config that names the
+// copy: the guest is pivoted onto it and the row follows, so the guest, the
+// config and the row name the same file. Nothing is deleted.
+func TestMoveVolume_Live_CommitAndRollbackFailPivotsOntoTheCopy(t *testing.T) {
+	s, f, src, destPath, before := liveLitevirtMove(t)
+	mover := &pivotHookMover{fakeLiveMover: fakeLiveMover{jobEnd: 4096, progressBytesPerPoll: 4096}}
+	mover.onPivot = func() { restoreDiskRow(t, s, "vm-live", "root") }
+	s.SetLiveMover(mover)
+	breakDefinesAfter(f, destPath, func() {
+		if err := corrosion.SoftDeleteDisk(context.Background(), s.db, "vm-live", "root"); err != nil {
+			t.Errorf("SoftDeleteDisk: %v", err)
+		}
+	})
+	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+	if err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm-live", DiskName: "root", TargetPool: "warm"}, rec); err != nil {
+		t.Fatalf("MoveVolume: %v", err)
+	}
+	if mover.cancelCalls != 0 || mover.pivotCalls != 1 {
+		t.Fatalf("cancel = %d pivot = %d, want 0/1: the mirror must not stop under a config naming the copy", mover.cancelCalls, mover.pivotCalls)
+	}
+	if after, _ := f.DumpXMLInactive("vm-live"); after != strings.Replace(before, src, destPath, 1) {
+		t.Fatalf("the config does not name the copy:\n%s", after)
+	}
+	if got := diskRowPath(t, s, "vm-live"); got != destPath {
+		t.Fatalf("disk row names %s, want the copy %s", got, destPath)
+	}
+	if !exists(destPath) || !exists(src) {
+		t.Fatalf("dest exists=%v src exists=%v, want both", exists(destPath), exists(src))
+	}
+	requireWarningEvent(t, s, "vm-live")
+	if ms := moveRecords(t, s, "vm-live"); len(ms) != 0 {
+		t.Fatalf("a resolved move left its record: %+v", ms)
+	}
+}
+
+// I-R2: the pivot fails and pointing the config back fails. The mirror is left
+// running (the config names the copy, which it keeps current), both files are
+// kept, the row is back on the source, the error says what the operator does,
+// and the unresolved-move record stays.
+func TestMoveVolume_Live_PivotAndRollbackFailLeavesTheMirror(t *testing.T) {
+	s, f, src, destPath, before := liveLitevirtMove(t)
+	mover := &fakeLiveMover{jobEnd: 4096, progressBytesPerPoll: 4096, pivotErr: errors.New("pivot failed")}
+	s.SetLiveMover(mover)
+	breakDefinesAfter(f, destPath, nil)
+	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+	err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm-live", DiskName: "root", TargetPool: "warm"}, rec)
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("want Internal, got %v", err)
+	}
+	for _, want := range []string{
+		"the persistent config names " + destPath,
+		"the guest is writing " + src,
+		"Do not stop or restart the VM",
+		"virsh blockjob vm-live " + src + " --pivot",
+		"virsh blockjob vm-live " + src + " --abort",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error does not say %q: %v", want, err)
+		}
+	}
+	if mover.cancelCalls != 0 || mover.pivotCalls != 1 {
+		t.Fatalf("cancel = %d pivot = %d, want 0/1 (no cancel, no second pivot)", mover.cancelCalls, mover.pivotCalls)
+	}
+	if after, _ := f.DumpXMLInactive("vm-live"); after != strings.Replace(before, src, destPath, 1) {
+		t.Fatalf("the config does not name the copy:\n%s", after)
+	}
+	if got := diskRowPath(t, s, "vm-live"); got != src {
+		t.Fatalf("disk row names %s, want the source %s", got, src)
+	}
+	if !exists(destPath) || !exists(src) {
+		t.Fatalf("dest exists=%v src exists=%v, want both", exists(destPath), exists(src))
+	}
+	ms := moveRecords(t, s, "vm-live")
+	if len(ms) != 1 || !ms[0].Live || ms[0].Pivoted || ms[0].Dst != destPath || ms[0].Src != src {
+		t.Fatalf("want one live, unpivoted record of the move, got %+v", ms)
+	}
+
+	// The guest then stops on its own, before anyone pivots: the copy may lack
+	// its last writes, so no start boots it.
+	f.SetState("vm-live", libvirtfake.StateShutdown)
+	vm, _ := corrosion.GetVM(context.Background(), s.db, "vm-live")
+	_, serr := s.startVMLocked(adminCtx(), vm)
+	if status.Code(serr) != codes.FailedPrecondition || !strings.Contains(serr.Error(), destPath) || !strings.Contains(serr.Error(), src) ||
+		!strings.Contains(serr.Error(), "stopped before a pivot") {
+		t.Fatalf("want the start refused naming both files, got %v", serr)
+	}
+	if st, _ := f.DomainState("vm-live"); st == "running" {
+		t.Fatal("the domain was started")
+	}
+}
+
+// m-R2b: the pivot fails and the row cannot be pointed back, but the config
+// can: the copy is removed, and the error says the row names it and what
+// points the row back. The record stays, so the next start does.
+func TestMoveVolume_Live_PivotAndRowRollbackFailSaysTheRowNamesTheRemovedCopy(t *testing.T) {
+	s, _, src, destPath, _ := liveLitevirtMove(t)
+	mover := &pivotHookMover{fakeLiveMover: fakeLiveMover{jobEnd: 4096, progressBytesPerPoll: 4096, pivotErr: errors.New("pivot failed")}}
+	mover.onPivot = func() {
+		if err := corrosion.SoftDeleteDisk(context.Background(), s.db, "vm-live", "root"); err != nil {
+			t.Errorf("SoftDeleteDisk: %v", err)
+		}
+	}
+	s.SetLiveMover(mover)
+	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+	err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm-live", DiskName: "root", TargetPool: "warm"}, rec)
+	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "the disk row names "+destPath+", which was removed") ||
+		!strings.Contains(err.Error(), "points the row back at "+src) {
+		t.Fatalf("want Internal saying the row names the removed copy, got %v", err)
+	}
+	if exists(destPath) || !exists(src) {
+		t.Fatalf("dest exists=%v src exists=%v, want false/true", exists(destPath), exists(src))
+	}
+	if ms := moveRecords(t, s, "vm-live"); len(ms) != 1 {
+		t.Fatalf("want the record kept, got %+v", ms)
+	}
+}
+
+// m-R4: the redefine fails before any define (the config cannot be read): the
+// config never named the copy, so the mirror stops and the copy is removed,
+// with no double-fault advice.
+func TestMoveVolume_Live_UnreadableConfigBeforeDefineCancels(t *testing.T) {
+	s, f, src, destPath, _ := liveLitevirtMove(t)
+	mover := &startHookMover{fakeLiveMover: fakeLiveMover{jobEnd: 4096, progressBytesPerPoll: 4096}}
+	mover.onStart = func() {
+		f.FailDumpXMLInactive = func(string) error { return errors.New("libvirt connection lost") }
+	}
+	s.SetLiveMover(mover)
+	defined := false
+	f.FailDefineDomain = func(string) error { defined = true; return nil }
+	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+	err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm-live", DiskName: "root", TargetPool: "warm"}, rec)
+	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "nothing was defined") ||
+		strings.Contains(err.Error(), "Do not stop") {
+		t.Fatalf("want a plain aborted cutover, got %v", err)
+	}
+	if defined {
+		t.Fatal("a define was issued")
+	}
+	if mover.cancelCalls != 1 || mover.pivotCalls != 0 {
+		t.Fatalf("cancel = %d pivot = %d, want 1/0", mover.cancelCalls, mover.pivotCalls)
+	}
+	if exists(destPath) || !exists(src) {
+		t.Fatalf("dest exists=%v src exists=%v, want false/true", exists(destPath), exists(src))
+	}
+	if ms := moveRecords(t, s, "vm-live"); len(ms) != 0 {
+		t.Fatalf("an aborted cutover left a record: %+v", ms)
+	}
+}
+
+// m-R5: without libvirt, a job that ended before the copy caught up is not
+// pivoted onto and the row is not committed to it.
+func TestMoveVolume_LiveNoVirt_JobEndedBeforeReadyRemovesTheCopy(t *testing.T) {
+	s, src, _ := liveMoveTestServer(t, 4096)
+	mover := endedEarlyMover()
+	s.SetLiveMover(mover)
+	fastPoll(t)
+	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+	err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm-live", DiskName: "root", TargetPool: "warm"}, rec)
+	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "before the copy caught up") {
+		t.Fatalf("want Internal saying the job ended early, got %v", err)
+	}
+	if mover.pivotCalls != 0 {
+		t.Fatalf("pivot = %d, want 0", mover.pivotCalls)
+	}
+	if got := diskRowPath(t, s, "vm-live"); got != src {
+		t.Fatalf("disk row names %s, want the source %s", got, src)
+	}
+}
+
+// m-R6: the guest already writes the copy and the catch-up redefine fails: the
+// error says the config may still name the source and not to stop the VM, and
+// the record (pivoted) stays.
+func TestMoveVolume_Live_CatchUpRedefineFailureSaysTheGuestIsOnTheCopy(t *testing.T) {
+	s, f, src, destPath := liveMoveServerWithVirt(t, true)
+	f.FailDefineDomain = func(string) error { return errors.New("redefine rejected") }
+	s.SetLiveMover(&fakeLiveMover{jobEnd: 4096, progressBytesPerPoll: 4096})
+	fastPoll(t)
+	if err := os.WriteFile(destPath, []byte("copy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+	err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm-live", DiskName: "root", TargetPool: "warm"}, rec)
+	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "The guest is writing "+destPath) ||
+		!strings.Contains(err.Error(), "may still name "+src) || !strings.Contains(err.Error(), "Do not stop or restart the VM") ||
+		!strings.Contains(err.Error(), "lv move-volume vm-live root warm") {
+		t.Fatalf("want Internal saying the guest is on the copy, got %v", err)
+	}
+	ms := moveRecords(t, s, "vm-live")
+	if len(ms) != 1 || !ms[0].Pivoted {
+		t.Fatalf("want one pivoted record, got %+v", ms)
+	}
+}
+
+// m-R7: a stream that drops after a live move committed does not skip the
+// caller's completion: the move returns success and records its event.
+func TestMoveVolume_Live_DroppedStreamAfterCommitStillCompletes(t *testing.T) {
+	s, _, _, destPath, _ := liveLitevirtMove(t)
+	s.SetLiveMover(&fakeLiveMover{jobEnd: 4096, progressBytesPerPoll: 4096})
+	vm, _ := corrosion.GetVM(context.Background(), s.db, "vm-live")
+	disks, _ := corrosion.GetVMDisks(context.Background(), s.db, "vm-live")
+	send := func(p *pb.MoveVolumeProgress) error {
+		if p.Phase == pb.MoveVolumeProgress_DONE {
+			return errors.New("client went away")
+		}
+		return nil
+	}
+	if err := s.moveOneVolume(context.Background(), vm, &disks[0], "warm", false, send); err != nil {
+		t.Fatalf("moveOneVolume: %v", err)
+	}
+	if got := diskRowPath(t, s, "vm-live"); got != destPath {
+		t.Fatalf("disk row names %s, want %s", got, destPath)
+	}
+	evs, _ := corrosion.ListVMEvents(context.Background(), s.db, "vm-live", 50, "")
+	ok := false
+	for _, e := range evs {
+		if e.Type == "disk.moved" && e.Result == "ok" {
+			ok = true
+		}
+	}
+	if !ok {
+		t.Fatalf("no disk.moved ok event: %+v", evs)
+	}
+}
+
+// m-R3: offline, the define fails but was stored and cannot be undone, then the
+// row commit fails and the rollback fails: the error says the config may name
+// the copy while the row names the source; no "completes onto it" warning is
+// recorded for a move that did not complete; the record stays.
+func TestMoveVolume_Offline_UnrolledDefineThenCommitFailureNamesBoth(t *testing.T) {
+	s, f, srcFile, dstFile := offlineMoveServer(t)
+	defineThenFail(f, dstFile, true)
+	inner := f.FailDefineDomain
+	f.FailDefineDomain = func(x string) error {
+		err := inner(x)
+		if strings.Contains(x, dstFile) {
+			if derr := corrosion.SoftDeleteDisk(context.Background(), s.db, "vm1", "root"); derr != nil {
+				t.Errorf("SoftDeleteDisk: %v", derr)
+			}
+		}
+		return err
+	}
+	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+	err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm1", DiskName: "root", TargetPool: "warm"}, rec)
+	if err == nil || !strings.Contains(err.Error(), "may name "+dstFile) {
+		t.Fatalf("want an error saying the config may name the copy, got %v", err)
+	}
+	evs, _ := corrosion.ListVMEvents(context.Background(), s.db, "vm1", 50, "")
+	for _, e := range evs {
+		if e.Type == "disk.moved" && e.Severity == "warning" {
+			t.Fatalf("a completion warning was recorded for a move that failed: %+v", e)
+		}
+	}
+	if !exists(dstFile) || !exists(srcFile) {
+		t.Fatalf("dst exists=%v src exists=%v, want both", exists(dstFile), exists(srcFile))
+	}
+	if ms := moveRecords(t, s, "vm1"); len(ms) != 1 {
+		t.Fatalf("want the record kept, got %+v", ms)
+	}
+}
+
+// The offline double fault whose config cannot be read keeps the record, and a
+// later start, once the config reads again, points the row at the copy it
+// names and starts.
+func TestMoveVolume_Offline_UnreadableDoubleFaultIsHealedByTheNextStart(t *testing.T) {
+	s, f, srcFile, dstFile := offlineMoveServer(t)
+	armUnreadableAfterDefine(f, dstFile)
+	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+	if err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm1", DiskName: "root", TargetPool: "warm"}, rec); status.Code(err) != codes.Internal {
+		t.Fatalf("want Internal, got %v", err)
+	}
+	if ms := moveRecords(t, s, "vm1"); len(ms) != 1 || ms[0].Live {
+		t.Fatalf("want one offline record, got %+v", ms)
+	}
+	vm, _ := corrosion.GetVM(context.Background(), s.db, "vm1")
+
+	// Still unreadable: refused, naming both files and the check.
+	_, err := s.startVMLocked(adminCtx(), vm)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), srcFile) ||
+		!strings.Contains(err.Error(), dstFile) || !strings.Contains(err.Error(), "virsh dumpxml --inactive vm1") {
+		t.Fatalf("want the start refused naming both files, got %v", err)
+	}
+	if st, _ := f.DomainState("vm1"); st == "running" {
+		t.Fatal("the domain was started")
+	}
+
+	// libvirt answers again: the start points the row at the copy and runs.
+	f.FailDumpXMLInactive = nil
+	f.FailDefineDomain = nil
+	if _, err := s.startVMLocked(adminCtx(), vm); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if got := diskRowPath(t, s, "vm1"); got != dstFile {
+		t.Fatalf("disk row names %s, want the copy %s the config names", got, dstFile)
+	}
+	if st, _ := f.DomainState("vm1"); st != "running" {
+		t.Fatalf("domain state %q, want running", st)
+	}
+	if ms := moveRecords(t, s, "vm1"); len(ms) != 0 {
+		t.Fatalf("the record outlived its resolution: %+v", ms)
+	}
+}
+
+// crashAfterDefine leaves vm1 as a daemon that died mid-cutover leaves it: the
+// record written, the config pointed at configNames, the row on the source,
+// and a new process (nothing in flight).
+func crashAfterDefine(t *testing.T, s *Server, f *libvirtfake.Fake, srcFile, dstFile, configNames string, live, pivoted bool) {
+	t.Helper()
+	vm, _ := corrosion.GetVM(context.Background(), s.db, "vm1")
+	disks, _ := corrosion.GetVMDisks(context.Background(), s.db, "vm1")
+	mk, err := s.beginMoveMarker(vm, &disks[0], dstFile, "local", "warm", live, pivoted)
+	if err != nil {
+		t.Fatalf("beginMoveMarker: %v", err)
+	}
+	if err := copyMovedFile(srcFile, dstFile); err != nil {
+		t.Fatal(err)
+	}
+	if configNames != srcFile {
+		if err := f.DefineDomain(fakeDomainXML("vm1", "vda", configNames)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk.endFlight() // the process is gone; its record is not
+}
+
+func copyMovedFile(from, to string) error {
+	b, err := os.ReadFile(from)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(to, b, 0o600)
+}
+
+// A daemon that dies between writing the record and resolving the move: the
+// next start of the VM settles the row from the persistent config, or refuses
+// when booting either file could lose writes.
+func TestStartVM_SettlesAMoveACrashLeft(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		configDst     bool
+		live, pivoted bool
+		wantStart     bool
+		wantRowDst    bool
+		wantWhy       string
+	}{
+		{name: "offline, config names the copy", configDst: true, wantStart: true, wantRowDst: true},
+		{name: "offline, config names the source", configDst: false, wantStart: true, wantRowDst: false},
+		{name: "live before the pivot, config names the copy", configDst: true, live: true, wantWhy: "stopped before a pivot"},
+		{name: "live before the pivot, config names the source", configDst: false, live: true, wantStart: true, wantRowDst: false},
+		{name: "live after the pivot, config names the copy", configDst: true, live: true, pivoted: true, wantStart: true, wantRowDst: true},
+		{name: "live after the pivot, config names the source", configDst: false, live: true, pivoted: true, wantWhy: "was pivoted onto"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, f, srcFile, dstFile := offlineMoveServer(t)
+			names := srcFile
+			if tc.configDst {
+				names = dstFile
+			}
+			crashAfterDefine(t, s, f, srcFile, dstFile, names, tc.live, tc.pivoted)
+			vm, _ := corrosion.GetVM(context.Background(), s.db, "vm1")
+			_, err := s.startVMLocked(adminCtx(), vm)
+			st, _ := f.DomainState("vm1")
+			if !tc.wantStart {
+				if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), srcFile) || !strings.Contains(err.Error(), dstFile) ||
+					!strings.Contains(err.Error(), tc.wantWhy) {
+					t.Fatalf("want the start refused naming both files, got %v", err)
+				}
+				if st == "running" {
+					t.Fatal("the domain was started")
+				}
+				if got := diskRowPath(t, s, "vm1"); got != srcFile {
+					t.Fatalf("a refused start changed the row to %s", got)
+				}
+				if ms := moveRecords(t, s, "vm1"); len(ms) != 1 {
+					t.Fatalf("a refused start dropped the record: %+v", ms)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("start: %v", err)
+			}
+			want := srcFile
+			if tc.wantRowDst {
+				want = dstFile
+			}
+			if got := diskRowPath(t, s, "vm1"); got != want {
+				t.Fatalf("disk row names %s, want %s", got, want)
+			}
+			if st != "running" {
+				t.Fatalf("domain state %q, want running", st)
+			}
+			if ms := moveRecords(t, s, "vm1"); len(ms) != 0 {
+				t.Fatalf("the record outlived its resolution: %+v", ms)
+			}
+			if !exists(srcFile) || !exists(dstFile) {
+				t.Fatal("a file was removed")
+			}
+		})
+	}
+}
+
+// A move still under way in this process is not settled by a start.
+func TestStartVM_RefusesWhileTheMoveIsInFlight(t *testing.T) {
+	s, f, srcFile, dstFile := offlineMoveServer(t)
+	vm, _ := corrosion.GetVM(context.Background(), s.db, "vm1")
+	disks, _ := corrosion.GetVMDisks(context.Background(), s.db, "vm1")
+	mk, err := s.beginMoveMarker(vm, &disks[0], dstFile, "local", "warm", false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mk.done()
+	_, serr := s.startVMLocked(adminCtx(), vm)
+	if status.Code(serr) != codes.FailedPrecondition || !strings.Contains(serr.Error(), "in progress") {
+		t.Fatalf("want the start refused while the move runs, got %v", serr)
+	}
+	if got := diskRowPath(t, s, "vm1"); got != srcFile {
+		t.Fatalf("row changed to %s", got)
+	}
+	_ = f
+}
+
+// A record whose row no longer names either file describes nothing: it is
+// removed and the start runs.
+func TestStartVM_DropsAStaleMoveRecord(t *testing.T) {
+	s, f, srcFile, _ := offlineMoveServer(t)
+	if err := health.RecordUnresolvedMove(s.dataDir, health.UnresolvedMove{
+		VM: "vm1", Disk: "root", TargetDev: "vda", Src: "/elsewhere/a.qcow2", Dst: "/elsewhere/b.qcow2",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	vm, _ := corrosion.GetVM(context.Background(), s.db, "vm1")
+	if _, err := s.startVMLocked(adminCtx(), vm); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if got := diskRowPath(t, s, "vm1"); got != srcFile {
+		t.Fatalf("row changed to %s", got)
+	}
+	if ms := moveRecords(t, s, "vm1"); len(ms) != 0 {
+		t.Fatalf("stale record kept: %+v", ms)
+	}
+	if st, _ := f.DomainState("vm1"); st != "running" {
+		t.Fatalf("domain state %q, want running", st)
+	}
+}
+
+// A cold migration reads the disk rows only after the record is settled, and
+// is refused when it cannot be.
+func TestColdMoveDisks_HonoursAnUnresolvedMove(t *testing.T) {
+	s, f, srcFile, dstFile := offlineMoveServer(t)
+	crashAfterDefine(t, s, f, srcFile, dstFile, dstFile, false, false)
+	vm, _ := corrosion.GetVM(context.Background(), s.db, "vm1")
+
+	f.FailDumpXMLInactive = func(string) error { return errors.New("libvirt connection lost") }
+	if _, err := s.coldMoveDisks(context.Background(), vm); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("want a refusal while the config cannot be read, got %v", err)
+	}
+	f.FailDumpXMLInactive = nil
+	disks, err := s.coldMoveDisks(context.Background(), vm)
+	if err != nil {
+		t.Fatalf("coldMoveDisks: %v", err)
+	}
+	if len(disks) != 1 || disks[0].Path != dstFile {
+		t.Fatalf("cold migration would stream %+v, want the copy %s the config names", disks, dstFile)
+	}
+}
+
+// ClearUnresolvedMovesOf, which DeleteVM and RebuildVM run once the domain
+// is gone, drops every record of the VM.
+func TestClearUnresolvedMovesOf_DropsTheVMsRecords(t *testing.T) {
+	dir := t.TempDir()
+	if err := health.RecordUnresolvedMove(dir, health.UnresolvedMove{VM: "vm1", Disk: "root", Src: "/a", Dst: "/b"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := health.ClearUnresolvedMovesOf(dir, "vm1"); err != nil {
+		t.Fatal(err)
+	}
+	if ms, err := health.UnresolvedMovesOf(dir, "vm1"); err != nil || len(ms) != 0 {
+		t.Fatalf("records after clear: %+v %v", ms, err)
+	}
+}
+
+// lv move-volume retried after the operator pivoted by hand, with the row
+// already on the copy: the record goes once the config and the running guest
+// are on the copy too, and stays while the guest still writes the source.
+func TestMoveVolume_RetryAfterAManualPivotSettlesTheRecord(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		guestOnDst bool
+		wantKept   bool
+	}{
+		{"guest pivoted onto the copy", true, false},
+		{"guest still on the source", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, f, src, destPath := liveMoveServerWithVirt(t, tc.guestOnDst)
+			if err := f.DefineDomain(fakeDomainXML("vm-live", "vda", destPath)); err != nil {
+				t.Fatal(err)
+			}
+			f.SetState("vm-live", libvirtfake.StateRunning)
+			active := src
+			if tc.guestOnDst {
+				active = destPath
+			}
+			f.SetDiskSource("vm-live", "vda", active)
+			if err := corrosion.UpdateDiskPlacement(context.Background(), s.db, "vm-live", "root", "host-a", destPath, "local", "warm"); err != nil {
+				t.Fatal(err)
+			}
+			if err := health.RecordUnresolvedMove(s.dataDir, health.UnresolvedMove{VM: "vm-live", Disk: "root",
+				Src: src, SrcType: "local", SrcPool: "hot", Dst: destPath, DstType: "local", DstPool: "warm", Live: true}); err != nil {
+				t.Fatal(err)
+			}
+			rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+			if err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm-live", DiskName: "root", TargetPool: "warm"}, rec); err != nil {
+				t.Fatalf("MoveVolume: %v", err)
+			}
+			if got := len(moveRecords(t, s, "vm-live")); (got == 1) != tc.wantKept {
+				t.Fatalf("records = %d, want kept=%v", got, tc.wantKept)
+			}
+		})
+	}
+}

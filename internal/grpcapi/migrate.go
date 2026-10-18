@@ -1609,6 +1609,11 @@ func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vm
 // VM does, its disks streamed first and its firmware bundle carried with the
 // domain's define, and a failure before the handoff takes both back.
 func (s *Server) coldMoveDisks(ctx context.Context, vm *corrosion.VMRecord) ([]corrosion.DiskRecord, error) {
+	// A volume move left unresolved here: the rows name the file the persistent
+	// config names before one is streamed (move_unresolved.go).
+	if err := s.resolveUnresolvedMoves(ctx, vm.Name); err != nil {
+		return nil, err
+	}
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "query disks for %q: %v", vm.Name, err)

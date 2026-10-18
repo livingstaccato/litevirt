@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -126,50 +127,64 @@ func (c *Client) observePulledRows(rows map[string]int, pull []string, scope *pu
 // ErrNoPeerConfirmed is PullTableNow's answer when no peer completed the pull.
 var ErrNoPeerConfirmed = errors.New("no peer completed the pull")
 
-// PullTableNow pulls one replicated table from the first member that answers
-// and merges it, ahead of a decision read from that table: the currency pull
-// `lv host rm` and `lv host add` make before deciding a host's incarnation
-// (host_incarnation.go). It takes the same refusals a pass does (an isolated
-// peer, a peer that cannot keep a release feature in use, this node in
-// release probation) and is not debounced. peer is the member it pulled from;
-// a cluster this node is alone in has nobody to pull from and returns ("",
-// nil). Bounded by ctx.
-func (ae *AntiEntropy) PullTableNow(ctx context.Context, table string) (peer string, err error) {
+// PullTableNow pulls one replicated table from a member and merges it, ahead
+// of a decision read from that table: the currency pull `lv host rm` and `lv
+// host add` make before deciding a host's incarnation (host_incarnation.go).
+//
+// exclude (the host the decision is about) is never a candidate: its own
+// replica confirms nothing. Voters are tried first. A member is skipped when a
+// pass would skip it (isolated, or unable to keep a release feature in use).
+// When no candidate remains — a cluster this node is alone in, or one whose
+// only other members are excluded or skipped — it returns ("", skipped, nil):
+// there is nobody to confirm with, and the caller's voter-majority gate has
+// already decided whether this node may act. It is not debounced, and is
+// bounded by ctx.
+func (ae *AntiEntropy) PullTableNow(ctx context.Context, table, exclude string) (peer string, skipped []string, err error) {
 	if !replicatedTableSet[table] {
-		return "", fmt.Errorf("%s is not a replicated table", table)
+		return "", nil, fmt.Errorf("%s is not a replicated table", table)
 	}
-	members := ae.client.Members()
-	if len(members) == 0 {
-		return "", nil
+	voters, _ := VoterSet(ctx, ae.client)
+	var first, rest []string
+	for _, m := range ae.client.Members() {
+		switch {
+		case m.Name == "" || m.Name == exclude:
+			continue
+		case func() bool { e, _, ierr := HostIsolation(ctx, ae.client, m.Name); return ierr == nil && e > 0 }():
+			skipped = append(skipped, m.Name+" (isolated)")
+		case ae.client.ReplicationSourceAllowed(ctx, m.Name) != nil:
+			skipped = append(skipped, m.Name+" (cannot keep a release feature in use)")
+		case voters[m.Name]:
+			first = append(first, m.Name)
+		default:
+			rest = append(rest, m.Name)
+		}
 	}
-	var lastErr error
-	for _, m := range members {
+	candidates := append(first, rest...)
+	if len(candidates) == 0 {
+		return "", skipped, nil
+	}
+	var errs []string
+	for _, name := range candidates {
 		if ctx.Err() != nil {
 			break
 		}
-		if epoch, _, ierr := HostIsolation(ctx, ae.client, m.Name); ierr == nil && epoch > 0 {
-			continue
-		}
-		if ae.client.ReplicationSourceAllowed(ctx, m.Name) != nil {
-			continue
-		}
 		pctx, cancel := context.WithTimeout(ctx, antiEntropyPeerTimeout)
-		client, conn, cerr := ae.peerClient(pctx, m.Name)
+		client, conn, cerr := ae.peerClient(pctx, name)
 		if cerr != nil {
 			cancel()
-			lastErr = cerr
+			errs = append(errs, name+": "+cerr.Error())
 			continue
 		}
 		_, perr, merr := ae.pullAndMerge(pctx, client, []string{table}, nil, nil, nil)
 		conn.Close()
 		cancel()
 		if perr == nil && merr == nil {
-			return m.Name, nil
+			return name, skipped, nil
 		}
-		lastErr = errors.Join(perr, merr)
+		errs = append(errs, name+": "+errors.Join(perr, merr).Error())
 	}
-	if lastErr == nil {
-		lastErr = ctx.Err()
+	if len(errs) == 0 && ctx.Err() != nil {
+		errs = append(errs, ctx.Err().Error())
 	}
-	return "", fmt.Errorf("%w: %v", ErrNoPeerConfirmed, lastErr)
+	return "", skipped, fmt.Errorf("%w: %s", ErrNoPeerConfirmed, strings.Join(errs, "; "))
 }

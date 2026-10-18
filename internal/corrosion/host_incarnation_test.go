@@ -355,7 +355,9 @@ func TestHostsTieChain_KeyDecidesFirst(t *testing.T) {
 		{"higher incarnation local", []interface{}{"h", int64(2), ts, "a", nil, ts}, []interface{}{"h", int64(1), ts, "b", nil, ts}, "local"},
 		{"lower tombstone loses", []interface{}{"h", int64(1), ts, "a", nil, ts}, []interface{}{"h", int64(0), ts, "a", ts, ts}, "local"},
 		{"equal incarnation later stamp", []interface{}{"h", int64(1), "2026-01-01T00:00:00.000000000Z", "a", nil, ts}, []interface{}{"h", int64(1), "2026-01-02T00:00:00.000000000Z", "b", nil, ts}, "incoming"},
-		{"equal incarnation tombstone stands", []interface{}{"h", int64(1), "2026-01-01T00:00:00.000000000Z", "a", ts, ts}, []interface{}{"h", int64(1), "2026-01-02T00:00:00.000000000Z", "b", nil, ts}, "local"},
+		{"equal incarnation, a tombstone of the earlier admission loses", []interface{}{"h", int64(1), "2026-01-01T00:00:00.000000000Z", "a", ts, ts}, []interface{}{"h", int64(1), "2026-01-02T00:00:00.000000000Z", "b", nil, ts}, "incoming"},
+		{"same admission, the tombstone stands", []interface{}{"h", int64(1), ts, "a", ts, ts}, []interface{}{"h", int64(1), ts, "a", nil, ts}, "local"},
+		{"same admission, another serial (a renewal): the clock decides", []interface{}{"h", int64(1), ts, "ff", nil, ts}, []interface{}{"h", int64(1), ts, "00", nil, ts}, "pass"},
 		{"same admission", []interface{}{"h", int64(1), ts, "a", nil, ts}, []interface{}{"h", int64(1), ts, "a", nil, ts}, "pass"},
 		{"both legacy", []interface{}{"h", int64(0), ts, "a", nil, ts}, []interface{}{"h", int64(0), ts, "b", nil, ts}, "pass"},
 	} {
@@ -592,5 +594,38 @@ func TestWriteOwnEndpoint_OnlyOnACountedOwnRow(t *testing.T) {
 	}
 	if err := WriteOwnEndpoint(ctx, c, "other", "10.0.0.16", 37000, incGrant(t)); err == nil {
 		t.Error("WriteOwnEndpoint wrote another host's row")
+	}
+}
+
+// C-1: a certificate renewal of a re-added host is an ordinary later write.
+// Two copies of one admission that differ only by the renewal are ordered by
+// their clock, never by serial: anti-entropy never reverts the renewal, in
+// either direction, whichever serial is larger.
+func TestHostIncarnation_ARenewalIsNeverRevertedByAntiEntropy(t *testing.T) {
+	ctx := context.Background()
+	for _, renewed := range []string{"00aa", "ffaa"} { // below and above incSerialA
+		_, entry := admittedV2(t)
+		before, after := newTestDB(t), newTestDB(t)
+		for _, c := range []*Client{before, after} {
+			oldIncarnation(t, c)
+			applyRemote(t, c, "2999000000000-0000-admitter", entry...)
+		}
+		// The host renews its certificate; one replica has the re-record.
+		if err := after.Execute(ctx, recordOwnCertSerialSQL, renewed, after.NowTS(), "host-x"); err != nil {
+			t.Fatal(err)
+		}
+		if k := incKey(t, after); k.serial != renewed || k.n != 1 {
+			t.Fatalf("renewed=%s: the re-record did not apply: %+v", renewed, k)
+		}
+		// The renewed replica pulls the pre-renewal copy: keeps the renewal.
+		mergeHostsFrom(t, before, after)
+		if k := incKey(t, after); k.serial != renewed {
+			t.Errorf("renewed=%s: anti-entropy reverted the renewal to %s", renewed, k.serial)
+		}
+		// The other replica pulls the renewal: takes it.
+		mergeHostsFrom(t, after, before)
+		if k := incKey(t, before); k.serial != renewed {
+			t.Errorf("renewed=%s: anti-entropy did not carry the renewal (%s)", renewed, k.serial)
+		}
 	}
 }

@@ -36176,8 +36176,14 @@ type AdmitHostResponse struct {
 	// admission record already on the machine alone rather than remove it on a
 	// "no history" it cannot trust.
 	AuditPositionProven bool `protobuf:"varint,3,opt,name=audit_position_proven,json=auditPositionProven,proto3" json:"audit_position_proven,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// incarnation_not_issued is set when a re-admission was written the way
+	// the previous release writes it, without a host incarnation, and says
+	// why: the host_incarnation release feature could not be used on this
+	// node at the moment. Only ever over a tombstone at incarnation 0. Empty
+	// when an incarnation was issued, and for a first admission.
+	IncarnationNotIssued string `protobuf:"bytes,4,opt,name=incarnation_not_issued,json=incarnationNotIssued,proto3" json:"incarnation_not_issued,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *AdmitHostResponse) Reset() {
@@ -36229,6 +36235,13 @@ func (x *AdmitHostResponse) GetAuditPositionProven() bool {
 		return x.AuditPositionProven
 	}
 	return false
+}
+
+func (x *AdmitHostResponse) GetIncarnationNotIssued() string {
+	if x != nil {
+		return x.IncarnationNotIssued
+	}
+	return ""
 }
 
 // ── Host network configuration (schema v48, §O Tier 1) ──
@@ -46376,11 +46389,12 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12\x1f\n" +
 	"\vcert_serial\x18\x03 \x01(\tR\n" +
-	"certSerial\"\x95\x01\n" +
+	"certSerial\"\xcb\x01\n" +
 	"\x11AdmitHostResponse\x12$\n" +
 	"\x0eaudit_tail_seq\x18\x01 \x01(\x03R\fauditTailSeq\x12&\n" +
 	"\x0faudit_tail_hash\x18\x02 \x01(\tR\rauditTailHash\x122\n" +
-	"\x15audit_position_proven\x18\x03 \x01(\bR\x13auditPositionProven\"\xc2\x03\n" +
+	"\x15audit_position_proven\x18\x03 \x01(\bR\x13auditPositionProven\x124\n" +
+	"\x16incarnation_not_issued\x18\x04 \x01(\tR\x14incarnationNotIssued\"\xc2\x03\n" +
 	"\vHostNetwork\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x12\n" +

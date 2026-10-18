@@ -349,6 +349,9 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	if err != nil {
 		return fmt.Errorf("admit host identity to the cluster: %w", err)
 	}
+	if why := admitted.GetIncarnationNotIssued(); why != "" {
+		fmt.Printf("  re-admitted %s without a host incarnation: %s\n", hostName, why)
+	}
 	// The name's audit chain position, signed with the CA, so the new machine's
 	// daemon holds its own audit rows until that history has reached it instead
 	// of starting a second chain under an old name. Before setup, which starts

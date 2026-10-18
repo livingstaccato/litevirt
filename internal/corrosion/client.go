@@ -1478,6 +1478,13 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 				c.mu.Unlock()
 				return false, fmt.Errorf("stamp host incarnation: %w", err)
 			}
+			// This host's own row is not written while its own-row hold holds
+			// (own_row_hold.go).
+			if err := c.ownRowStatementRefused(s); err != nil {
+				tx.Rollback()
+				c.mu.Unlock()
+				return false, err
+			}
 			// A live-row update runs here through the same guarded form every
 			// receiver uses; what is logged is the wire form (live_row_update.go).
 			res, err := tx.ExecContext(ctx, appliedForm(s).SQL, s.Params...)
@@ -1660,6 +1667,13 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 			tx.Rollback()
 			c.mu.Unlock()
 			return 0, fmt.Errorf("stamp host incarnation: %w", err)
+		}
+		// This host's own row is not written while its own-row hold holds
+		// (own_row_hold.go).
+		if err := c.ownRowStatementRefused(s); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return 0, err
 		}
 		// A live-row update runs here through the same guarded form every
 		// receiver uses; what is logged is the wire form (live_row_update.go).

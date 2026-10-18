@@ -24,7 +24,7 @@ func TestOwnRowHold_Arms(t *testing.T) {
 	t.Run("a: live under another serial", func(t *testing.T) {
 		c := newTestDB(t)
 		ownRow(t, c, "01old")
-		st, err := c.ConfigureOwnRowHold(ctx, "02new")
+		st, err := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("02new", ""))
 		if err != nil || !st.Held || st.Arm != "a" || st.Reason != OwnRowHeldAtStart {
 			t.Fatalf("hold = %+v, %v; want held on arm a at start", st, err)
 		}
@@ -54,14 +54,14 @@ func TestOwnRowHold_Arms(t *testing.T) {
 		if err := DeleteHost(ctx, c, c.hostName); err != nil {
 			t.Fatal(err)
 		}
-		st, _ := c.ConfigureOwnRowHold(ctx, "02new")
+		st, _ := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("02new", ""))
 		if !st.Held || st.Arm != "b" {
 			t.Fatalf("hold = %+v, want arm b", st)
 		}
 	})
 	t.Run("a missing row does not hold", func(t *testing.T) {
 		c := newTestDB(t)
-		if st, _ := c.ConfigureOwnRowHold(ctx, "02new"); st.Held {
+		if st, _ := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("02new", "")); st.Held {
 			t.Fatalf("hold = %+v over a missing row", st)
 		}
 		if err := RegisterHost(ctx, c, HostRecord{Name: c.hostName, Address: "10.0.0.15", State: "active", CertSerial: "02new"}); err != nil {
@@ -71,7 +71,7 @@ func TestOwnRowHold_Arms(t *testing.T) {
 	t.Run("a restart after adoption starts open", func(t *testing.T) {
 		c := newTestDB(t)
 		ownRow(t, c, "02new")
-		if st, _ := c.ConfigureOwnRowHold(ctx, "02new"); st.Held {
+		if st, _ := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("02new", "")); st.Held {
 			t.Fatalf("hold = %+v on the admitted row", st)
 		}
 	})
@@ -83,7 +83,7 @@ func TestOwnRowHold_OpensOnlyOnTheInstalledSerial(t *testing.T) {
 	ctx := context.Background()
 	c := newTestDB(t)
 	ownRow(t, c, "01old")
-	if st, _ := c.ConfigureOwnRowHold(ctx, "02new"); !st.Held {
+	if st, _ := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("02new", "")); !st.Held {
 		t.Fatal("not held")
 	}
 	// Another admission's row at incarnation 1 (a superseding serial).
@@ -107,7 +107,7 @@ func TestOwnRowHold_ReengagesWhenSuperseded(t *testing.T) {
 	ctx := context.Background()
 	c := newTestDB(t)
 	ownRow(t, c, "02new")
-	if st, _ := c.ConfigureOwnRowHold(ctx, "02new"); st.Held {
+	if st, _ := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("02new", "")); st.Held {
 		t.Fatal("held at start")
 	}
 	var fired atomic.Int32
@@ -154,7 +154,7 @@ func TestOwnRowHold_TimesOut(t *testing.T) {
 	t.Cleanup(func() { OwnRowHoldTimeout = old })
 	c := newTestDB(t)
 	ownRow(t, c, "01old")
-	if st, _ := c.ConfigureOwnRowHold(ctx, "02new"); !st.Held {
+	if st, _ := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("02new", "")); !st.Held {
 		t.Fatal("not held")
 	}
 	time.Sleep(100 * time.Millisecond)
@@ -168,5 +168,119 @@ func TestOwnRowHold_TimesOut(t *testing.T) {
 	}
 	if got := oneString(t, c, `SELECT cert_serial FROM hosts WHERE name = ?`, "cert_serial", c.hostName); got != "02new" {
 		t.Errorf("the fallback did not re-record: %s", got)
+	}
+}
+
+// I-1: a renewal — live, or while the host was down — never raises a hold.
+func TestOwnRowHold_ARenewalIsNotAnArm(t *testing.T) {
+	ctx := context.Background()
+	t.Run("live", func(t *testing.T) {
+		c := newTestDB(t)
+		ownRow(t, c, "01old")
+		installed := "01old"
+		renewedFrom := ""
+		if st, _ := c.ConfigureOwnRowHold(ctx, func() (string, string) { return installed, renewedFrom }); st.Held {
+			t.Fatalf("held at start: %+v", st)
+		}
+		// `lv host renew-cert` installs a successor in place.
+		installed, renewedFrom = "02new", "01old"
+		if st, _ := c.EvaluateOwnRowHold(ctx, OwnRowHeldSuperseded); st.Held {
+			t.Fatalf("a live renewal raised the hold: %+v", st)
+		}
+		if _, err := RecordOwnCertSerial(ctx, c, c.hostName, "02new"); err != nil {
+			t.Fatalf("the re-record of a renewal: %v", err)
+		}
+		if st, _ := c.EvaluateOwnRowHold(ctx, OwnRowHeldSuperseded); st.Held {
+			t.Fatalf("held after the re-record: %+v", st)
+		}
+		if err := UpdateHostState(ctx, c, c.hostName, "draining"); err != nil {
+			t.Errorf("an own-row write after a live renewal: %v", err)
+		}
+	})
+	t.Run("while down", func(t *testing.T) {
+		c := newTestDB(t)
+		ownRow(t, c, "01old")
+		if st, _ := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("02new", "01old")); st.Held {
+			t.Fatalf("a boot after an offline renewal held: %+v", st)
+		}
+		if err := RegisterHost(ctx, c, HostRecord{Name: c.hostName, Address: "10.0.0.15", State: "active", CertSerial: "02new"}); err != nil {
+			t.Fatalf("RegisterHost after an offline renewal: %v", err)
+		}
+		if got := oneString(t, c, `SELECT cert_serial FROM hosts WHERE name = ?`, "cert_serial", c.hostName); got != "02new" {
+			t.Errorf("the renewal was not re-recorded at once: %s", got)
+		}
+	})
+}
+
+// I-2: a hold raised at runtime (superseded) never times out, and nor does one
+// over a counted row: the local row may be another machine's admission.
+func TestOwnRowHold_ASupersededHoldNeverTimesOut(t *testing.T) {
+	ctx := context.Background()
+	old := OwnRowHoldTimeout
+	OwnRowHoldTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { OwnRowHoldTimeout = old })
+	for _, tc := range []struct {
+		name   string
+		reason string
+		n      int
+	}{
+		{"superseded at runtime", OwnRowHeldSuperseded, 1},
+		{"at start over a counted row", OwnRowHeldAtStart, 1},
+	} {
+		c := newTestDB(t)
+		ownRow(t, c, "02new")
+		if _, err := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("02new", "")); err != nil {
+			t.Fatal(err)
+		}
+		// The winner's admission, under another serial.
+		if _, err := c.DB().Exec(`UPDATE hosts SET incarnation = ?, cert_serial = 'yy09' WHERE name = ?`, tc.n, c.hostName); err != nil {
+			t.Fatal(err)
+		}
+		if tc.reason == OwnRowHeldAtStart {
+			if _, err := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("02new", "")); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			c.EvaluateOwnRowHold(ctx, OwnRowHeldSuperseded)
+		}
+		time.Sleep(60 * time.Millisecond)
+		st := c.OwnRowHold()
+		if !st.Held || st.TimedOut {
+			t.Errorf("%s: hold = %+v, want held and never timed out", tc.name, st)
+		}
+		before := mutationLogText(t, c)
+		if err := RegisterHost(ctx, c, HostRecord{Name: c.hostName, Address: "10.0.0.15", State: "active", CertSerial: "02new"}); !errors.Is(err, ErrOwnRowHeld) {
+			t.Errorf("%s: RegisterHost past the timeout = %v, want ErrOwnRowHeld", tc.name, err)
+		}
+		if after := mutationLogText(t, c); after != before {
+			t.Errorf("%s: a superseded host re-recorded its serial at the winner's key", tc.name)
+		}
+	}
+}
+
+// I-3: the hold is enforced centrally, on every locally originated write to
+// the own row, whichever writer makes it.
+func TestOwnRowHold_EveryOwnRowWriterIsHeld(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	ownRow(t, c, "01old")
+	if st, _ := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("02new", "")); !st.Held {
+		t.Fatal("not held")
+	}
+	if err := SetHostLabel(ctx, c, c.hostName, "litevirt.lxc", "true"); !errors.Is(err, ErrOwnRowHeld) {
+		t.Errorf("a label write on a held host = %v", err)
+	}
+	if _, err := UpdateHostStateFrom(ctx, c, c.hostName, "active", "upgrading"); !errors.Is(err, ErrOwnRowHeld) {
+		t.Errorf("an activation on a held host = %v", err)
+	}
+	if err := UpdateHostVersion(ctx, c, c.hostName, "v9"); !errors.Is(err, ErrOwnRowHeld) {
+		t.Errorf("a version write on a held host = %v", err)
+	}
+	// Another host's row is not held.
+	if err := InsertHost(ctx, c, HostRecord{Name: "other", Address: "10.0.0.16", State: "active", CertSerial: "o1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetHostLabel(ctx, c, "other", "k", "v"); err != nil {
+		t.Errorf("another host's label write: %v", err)
 	}
 }

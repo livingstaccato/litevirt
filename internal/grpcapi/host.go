@@ -370,8 +370,15 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	if err != nil || h == nil {
 		return status.Errorf(codes.NotFound, "host %q not found", req.Name)
 	}
-	if err := s.hostOperatorWriteAllowed(ctx, "drain", req.Name); err != nil {
-		return err
+	// The entry node takes the caught-up check; the drained host itself, which
+	// every entry node forwards to, takes only its own-row hold — refusing
+	// there could not be helped by running it elsewhere.
+	if req.Name != s.hostName {
+		if err := s.hostOperatorWriteAllowed(ctx, "drain", req.Name); err != nil {
+			return err
+		}
+	} else if err := s.db.OwnRowWritable(req.Name); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "%s cannot drain itself: %v", s.hostName, err)
 	}
 
 	// Drain must run ON the host being drained: only there is this daemon the SOURCE
@@ -1787,7 +1794,7 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 	if err != nil {
 		return nil, err
 	}
-	if err := s.admitHostRow(ctx, corrosion.HostRecord{
+	notIssued, err := s.admitHostRow(ctx, corrosion.HostRecord{
 		Name:       req.Name,
 		Address:    req.Address,
 		SSHUser:    "root",
@@ -1795,11 +1802,13 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 		GRPCPort:   7443,
 		State:      corrosion.HostStateJoining,
 		CertSerial: req.CertSerial,
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, err
 	}
 	s.publish("host.admitted", req.Name, "cert_serial="+req.CertSerial)
-	return &pb.AdmitHostResponse{AuditTailSeq: tailSeq, AuditTailHash: tailHash, AuditPositionProven: true}, nil
+	return &pb.AdmitHostResponse{AuditTailSeq: tailSeq, AuditTailHash: tailHash, AuditPositionProven: true,
+		IncarnationNotIssued: notIssued}, nil
 }
 
 // hostAllocatedResources returns running-VM CPU and memory, and the DECLARED
@@ -1871,42 +1880,61 @@ func parseTimestamp(s string) *timestamppb.Timestamp {
 // and of any tombstone once the host_incarnation release feature is available
 // here, issues the next incarnation (corrosion.AdmitHostV2): on a node that
 // sees a voter majority, on the row a peer confirms, through the feature's
-// grant, and never downgraded to the legacy statement. Everything else — a
-// first admission, a re-admission before the feature, an idempotent retry —
-// is corrosion.AdmitHost, as before.
-func (s *Server) admitHostRow(ctx context.Context, h corrosion.HostRecord) error {
+// grant. Everything else — a first admission, a re-admission before the
+// feature, an idempotent retry — is corrosion.AdmitHost, as before.
+//
+// Over a tombstone at incarnation 1 or higher a failure to issue refuses: the
+// legacy statement is never written there. Over a tombstone at 0, where the
+// legacy statement is exactly the previous release's re-admission, a grant the
+// gate cannot give right now (a host has not acknowledged the feature's first
+// use, or not every host advertises the release yet) falls back to it, and
+// notIssued says why.
+func (s *Server) admitHostRow(ctx context.Context, h corrosion.HostRecord) (notIssued string, err error) {
 	if err := s.pullHostsNow(ctx, "re-add", h.Name); err != nil {
-		return err
+		return "", err
 	}
 	n, _, _, deleted, found, err := corrosion.HostIncarnationOf(ctx, s.db, h.Name)
 	if err != nil {
-		return status.Errorf(codes.Unavailable, "read %s's incarnation: %v", h.Name, err)
+		return "", status.Errorf(codes.Unavailable, "read %s's incarnation: %v", h.Name, err)
 	}
-	if !found || !deleted || (n == 0 && !s.ReleaseFeatureAvailable(capabilities.FeatureHostIncarnation)) {
+	legacy := func() error {
 		if err := corrosion.AdmitHost(ctx, s.db, h); err != nil {
 			if errors.Is(err, corrosion.ErrReadmitNeedsCounter) {
-				return status.Errorf(codes.FailedPrecondition, "admit host: %v; run `lv host add` against a node that has finished the upgrade", err)
+				return status.Errorf(codes.FailedPrecondition, "admit host: %v", err)
 			}
 			return status.Errorf(codes.FailedPrecondition, "admit host: %v", err)
 		}
 		return nil
 	}
+	if !found || !deleted || (n == 0 && !s.ReleaseFeatureAvailable(capabilities.FeatureHostIncarnation)) {
+		return "", legacy()
+	}
 	if err := s.requireVoterMajority(ctx, "re-add", h.Name); err != nil {
-		return err
+		return "", err
 	}
 	err = s.WithReleaseFeature(ctx, capabilities.FeatureHostIncarnation, func(ctx context.Context, g capabilities.FeatureGrant) error {
 		_, _, aerr := corrosion.AdmitHostV2(ctx, s.db, h, g)
 		return aerr
 	})
 	if err == nil {
-		return nil
+		return "", nil
 	}
-	if _, isStatus := status.FromError(err); isStatus && status.Code(err) != codes.Unknown {
-		return status.Errorf(status.Code(err),
-			"re-adding %s needs the host_incarnation release feature, which this node cannot use now (%v); "+
-				"run `lv host add` against a node that has finished the upgrade", h.Name, status.Convert(err).Message())
+	st, isStatus := status.FromError(err)
+	gateRefusal := isStatus && (st.Code() == codes.Unavailable || st.Code() == codes.FailedPrecondition) &&
+		!strings.HasPrefix(st.Message(), "admit host")
+	if n == 0 && gateRefusal {
+		why := st.Message()
+		slog.Warn("re-admitting a host without an incarnation: the host_incarnation feature could not be used now",
+			"host", h.Name, "why", why)
+		if lerr := legacy(); lerr != nil {
+			return "", lerr
+		}
+		return why, nil
 	}
-	return status.Errorf(codes.FailedPrecondition, "admit host: %v", err)
+	if isStatus && st.Code() != codes.Unknown {
+		return "", status.Errorf(st.Code(), "re-adding %s at incarnation %d: %s", h.Name, n+1, st.Message())
+	}
+	return "", status.Errorf(codes.FailedPrecondition, "admit host: %v", err)
 }
 
 // fenceTargetNote is the incarnation, serial, strategy and BMC a fence of h

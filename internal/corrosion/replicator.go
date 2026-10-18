@@ -4376,9 +4376,8 @@ func (r *Replicator) hostsIncarnationRefusalOf(ctx context.Context, tx *sql.Tx, 
 	if err != nil || sh.Table != "hosts" {
 		return "", nil
 	}
-	if isReadmitV2(s) {
-		return "", nil // decided by its own WHERE, in the apply
-	}
+	// A V2 re-admission is refused here only for an envelope that is not its
+	// parameters; its key is decided by its own WHERE, in the apply.
 	return hostsIncarnationRefusal(ctx, tx, s, sh)
 }
 

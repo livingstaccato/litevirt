@@ -88,8 +88,8 @@ func TestAdmitHost_ShapeFollowsTheTombstone(t *testing.T) {
 		s := incServer(t, 1)
 		s.SetReleaseFeatureGate(unavailableFeatureGate{err: status.Error(codes.FailedPrecondition, "release not latched")})
 		_, err := admit(s, "host-x")
-		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "finished the upgrade") {
-			t.Errorf("admission over a counted tombstone without the feature = %v, want a FailedPrecondition refusal", err)
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "release not latched") {
+			t.Errorf("admission over a counted tombstone without the feature = %v, want the gate's refusal passed through", err)
 		}
 		if n, deleted := incOf(t, s, "host-x"); n != 1 || !deleted {
 			t.Errorf("row = (%d, deleted %v), want the tombstone at 1 untouched", n, deleted)
@@ -105,17 +105,36 @@ func TestAdmitHost_ShapeFollowsTheTombstone(t *testing.T) {
 			t.Error("the tombstone was re-admitted by the legacy statement")
 		}
 	})
-	t.Run("feature available but the gate is Unavailable: refused, never downgraded", func(t *testing.T) {
+	t.Run("tombstone at 0, the gate is Unavailable: the legacy statement, and the response says why (I-5)", func(t *testing.T) {
 		s := incServer(t, 0)
 		g := &scriptedFeatureGate{t: t, fn: func(context.Context, int) error {
-			return status.Error(codes.Unavailable, "a recipient did not answer")
+			return status.Error(codes.Unavailable, "not yet acknowledged by node-9 — retry")
 		}}
 		s.SetReleaseFeatureGate(g)
-		if _, err := admit(s, "host-x"); status.Code(err) != codes.Unavailable {
-			t.Errorf("admission = %v, want Unavailable", err)
+		resp, err := admit(s, "host-x")
+		if err != nil {
+			t.Fatalf("admission = %v, want the legacy fallback", err)
+		}
+		if !strings.Contains(resp.GetIncarnationNotIssued(), "not yet acknowledged by node-9") {
+			t.Errorf("incarnation_not_issued = %q, want the gate's reason", resp.GetIncarnationNotIssued())
+		}
+		if n, deleted := incOf(t, s, "host-x"); n != 0 || deleted {
+			t.Errorf("row = (%d, deleted %v), want live at 0", n, deleted)
+		}
+	})
+	t.Run("tombstone at 1, the gate is Unavailable: refused, never downgraded, message passed through", func(t *testing.T) {
+		s := incServer(t, 1)
+		g := &scriptedFeatureGate{t: t, fn: func(context.Context, int) error {
+			return status.Error(codes.Unavailable, "not yet acknowledged by node-9 — retry")
+		}}
+		s.SetReleaseFeatureGate(g)
+		_, err := admit(s, "host-x")
+		if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "not yet acknowledged by node-9") ||
+			strings.Contains(err.Error(), "finished the upgrade") {
+			t.Errorf("admission = %v, want Unavailable with the gate's message", err)
 		}
 		if _, deleted := incOf(t, s, "host-x"); !deleted {
-			t.Error("a failed grant downgraded to the legacy re-admission")
+			t.Error("a failed grant downgraded to the legacy re-admission over a counted tombstone")
 		}
 	})
 	t.Run("tombstone at 1 with the grant: V2 at 2", func(t *testing.T) {
@@ -144,18 +163,23 @@ func (g *quorumGate) QuorumProofExcluding(context.Context, string) (health.Quoru
 
 // fakePuller is the anti-entropy a currency pull goes through.
 type fakePuller struct {
-	err   error
-	pulls int
-	pull  func()
+	err      error
+	pulls    int
+	pull     func()
+	excluded []string
 }
 
 func (p *fakePuller) RunOnce(context.Context) bool { return true }
-func (p *fakePuller) PullTableNow(context.Context, string) (string, error) {
+func (p *fakePuller) PullTableNow(_ context.Context, _, exclude string) (string, []string, error) {
 	p.pulls++
+	p.excluded = append(p.excluded, exclude)
 	if p.pull != nil {
 		p.pull()
 	}
-	return "peer-host", p.err
+	if p.err != nil {
+		return "", nil, p.err
+	}
+	return "peer-host", nil, nil
 }
 
 // Test 16 (I3, R-I1, R-I2, R-M1, R-M2): the operator's hosts writes.
@@ -274,6 +298,9 @@ func TestOperatorHostsWrites_RefuseWhenNotCaughtUp(t *testing.T) {
 		}
 		if p.pulls != 2 {
 			t.Errorf("pulls = %d, want one per decision", p.pulls)
+		}
+		if strings.Join(p.excluded, ",") != "host-x,peer-host" {
+			t.Errorf("pulls excluded %v, want the target of each decision", p.excluded)
 		}
 	})
 

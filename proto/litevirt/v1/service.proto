@@ -4297,6 +4297,12 @@ message AdmitHostResponse {
     // admission record already on the machine alone rather than remove it on a
     // "no history" it cannot trust.
     bool audit_position_proven = 3;
+    // incarnation_not_issued is set when a re-admission was written the way
+    // the previous release writes it, without a host incarnation, and says
+    // why: the host_incarnation release feature could not be used on this
+    // node at the moment. Only ever over a tombstone at incarnation 0. Empty
+    // when an incarnation was issued, and for a first admission.
+    string incarnation_not_issued = 4;
 }
 
 // ── Host network configuration (schema v48, §O Tier 1) ──

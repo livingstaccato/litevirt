@@ -164,7 +164,7 @@ func retireReadmittedCredentials(ctx context.Context, tx *sql.Tx, stmts []Statem
 		var ok bool
 		switch {
 		case isReadmitV2(s):
-			if len(s.Params) == 15 {
+			if len(s.Params) == 13 {
 				ts, _ = s.Params[8].(string)
 				host, _ = s.Params[9].(string)
 				ok = host != "" && ts != ""

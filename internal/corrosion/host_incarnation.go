@@ -23,9 +23,10 @@ import (
 // hosts.incarnation numbers a host's admissions. 0 is every row written before
 // the feature was first used. A re-admission over a tombstone at N writes N+1
 // (readmitHostV2SQL), and nothing else ever raises it. A row's ordering key is
-// (incarnation, created_at, lower(cert_serial)); at incarnation ≥ 1 created_at
-// is the admission's own stamp, bound by the admitter, so every node holds the
-// same key for the same admission.
+// (incarnation, created_at); at incarnation ≥ 1 created_at is the admission's
+// own stamp, bound by the admitter, so every node holds the same key for the
+// same admission. Two copies of one admission are ordered by their clock, as
+// before: a certificate renewal is an ordinary later write.
 //
 // Every hosts statement carries the key of the row it was written against
 // (Statement.HostIncarnation, stamped centrally just before it runs). A
@@ -49,19 +50,22 @@ type HostIncarnation struct {
 
 // readmitHostV2SQL re-admits a host at a new incarnation. Its WHERE is the
 // ordering key: it applies over any row of a lower incarnation, live or
-// tombstoned, and over a LIVE row of the same incarnation whose admission stamp
-// (then serial) is lower — a duplicate admission. A tombstone of the same
-// incarnation wins over a duplicate. Applied on the origin and on every
-// receiver through its reset form (readmitResetV2SQL), never through the
+// tombstoned, and over a row of the same incarnation whose admission stamp is
+// earlier — a duplicate admission. Two copies of one admission (the same
+// stamp) are never decided by it: they differ only by later writes, such as a
+// certificate renewal, which the clock orders. Applied on the origin and on
+// every receiver through its reset form (readmitResetV2SQL), never through the
 // timestamp gate: the key is the order.
 //
 // Params: address, ssh_user, ssh_port, grpc_port, state, cert_serial,
 // incarnation, created_at, updated_at, name, incarnation, incarnation,
-// created_at, created_at, cert_serial.
+// created_at.
+//
+// created_at is bound on the wire (the admitter's stamp), not derived by the
+// receiver: every node then holds the stamp the admitter wrote.
 const readmitHostV2SQL = `UPDATE hosts SET address = ?, ssh_user = ?, ssh_port = ?, grpc_port = ?,
 			state = ?, cert_serial = ?, incarnation = ?, created_at = ?, deleted_at = NULL, updated_at = ?
-		 WHERE name = ? AND (incarnation < ? OR (incarnation = ? AND deleted_at IS NULL
-			AND (created_at < ? OR (created_at = ? AND lower(cert_serial) < lower(?)))))`
+		 WHERE name = ? AND (incarnation < ? OR (incarnation = ? AND created_at < ?))`
 
 // hostOwnEndpointSQL is a re-admitted host's own correction of the address and
 // gRPC port its admission recorded. It is written only by the host itself, and
@@ -84,7 +88,7 @@ func isReadmitV2(s Statement) bool {
 
 // readmitV2Key is the key a V2 re-admission issues, from its parameters.
 func readmitV2Key(s Statement) (HostIncarnation, string, bool) {
-	if len(s.Params) != 15 {
+	if len(s.Params) != 13 {
 		return HostIncarnation{}, "", false
 	}
 	n, nok := paramInt64(s.Params[6])
@@ -106,7 +110,7 @@ func ReadmitStamp(updatedAt string) (string, bool) {
 // readmitV2Params binds readmitHostV2SQL.
 func readmitV2Params(h HostRecord, n int64, at, uts string) []interface{} {
 	return []interface{}{h.Address, h.SSHUser, h.SSHPort, h.GRPCPort, h.State, h.CertSerial,
-		n, at, uts, h.Name, n, n, at, at, h.CertSerial}
+		n, at, uts, h.Name, n, n, at}
 }
 
 func paramInt64(v interface{}) (int64, bool) {
@@ -131,9 +135,20 @@ type hostKey struct {
 	deleted bool
 }
 
-// compareHostKeys orders two rows' keys: > 0 when a is the later incarnation,
-// < 0 when b is, 0 when the key does not decide (the same admission, or two
-// legacy rows at 0).
+// compareHostKeys orders two rows' keys: > 0 when a is the later admission,
+// < 0 when b is, 0 when the key does not decide.
+//
+//   - a higher incarnation wins;
+//   - at the same incarnation (≥ 1), the later admission stamp wins: two
+//     admissions issued the same number, and the later one stands;
+//   - two copies of the SAME admission (same number, same stamp): a removal
+//     stands over a live copy; otherwise the key does not decide, and the
+//     clock (LWW, then the tie chain) orders them. The certificate serial
+//     orders nothing: a renewal changes it under an unchanged key, and must
+//     not be reverted by whichever copy has the larger serial;
+//   - two legacy rows at 0: the key does not decide.
+//
+// serial is kept for diagnostics only.
 func compareHostKeys(a, b hostKey) int {
 	switch {
 	case a.n != b.n:
@@ -143,19 +158,15 @@ func compareHostKeys(a, b hostKey) int {
 		return -1
 	case a.n == 0:
 		return 0
-	case a.at == b.at && strings.EqualFold(a.serial, b.serial):
-		return 0
+	case a.at != b.at:
+		return strings.Compare(a.at, b.at)
 	case a.deleted != b.deleted:
-		// The same incarnation, two admissions, one of them removed: the
-		// removal stands.
 		if a.deleted {
 			return 1
 		}
 		return -1
-	case a.at != b.at:
-		return strings.Compare(a.at, b.at)
 	default:
-		return strings.Compare(strings.ToLower(a.serial), strings.ToLower(b.serial))
+		return 0
 	}
 }
 

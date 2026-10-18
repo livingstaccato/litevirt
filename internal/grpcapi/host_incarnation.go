@@ -3,6 +3,9 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -36,7 +39,7 @@ var hostPullTimeout = 10 * time.Second
 
 // hostTablePuller is the corrosion.AntiEntropy method the currency pull uses.
 type hostTablePuller interface {
-	PullTableNow(ctx context.Context, table string) (string, error)
+	PullTableNow(ctx context.Context, table, exclude string) (string, []string, error)
 }
 
 // quorumExcluder is the health.Checker method the voter-majority check uses.
@@ -105,9 +108,12 @@ func (s *Server) requireVoterMajority(ctx context.Context, action, name string) 
 		s.hostName, action, name, live, needed)
 }
 
-// pullHostsNow pulls the hosts table from a peer before name's incarnation is
-// read. A failed or timed-out pull refuses: the decision is never made on the
-// unpulled row. A server without anti-entropy wired (a test, a tool) skips it.
+// pullHostsNow pulls the hosts table from a peer — a voter first, never name
+// itself — before name's incarnation is read. A failed or timed-out pull
+// refuses: the decision is never made on the unpulled row. When no peer can
+// confirm (this node is alone with name, or the others are isolated), it
+// proceeds and logs it: the voter-majority gate has decided whether this node
+// may act. A server without anti-entropy wired (a test, a tool) skips it.
 func (s *Server) pullHostsNow(ctx context.Context, action, name string) error {
 	p, ok := s.antiEntropy.(hostTablePuller)
 	if !ok || p == nil {
@@ -115,13 +121,20 @@ func (s *Server) pullHostsNow(ctx context.Context, action, name string) error {
 	}
 	pctx, cancel := context.WithTimeout(ctx, hostPullTimeout)
 	defer cancel()
-	if _, err := p.PullTableNow(pctx, "hosts"); err != nil {
+	peer, skipped, err := p.PullTableNow(pctx, "hosts", name)
+	if err != nil {
 		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 			return status.FromContextError(ctx.Err()).Err()
 		}
-		return status.Errorf(codes.Unavailable,
-			"%s could not confirm %s's row with a peer before it would %s it (%v); retry, or run it against another node",
-			s.hostName, name, action, err)
+		msg := fmt.Sprintf("%s could not confirm %s's row with a peer before it would %s it (%v)", s.hostName, name, action, err)
+		if len(skipped) > 0 {
+			msg += "; not asked: " + strings.Join(skipped, ", ")
+		}
+		return status.Error(codes.Unavailable, msg+"; retry, or run it against another node")
+	}
+	if peer == "" {
+		slog.Info("no peer to confirm a host's row with before deciding its incarnation; proceeding on this replica",
+			"host", name, "action", action, "not_asked", skipped)
 	}
 	return nil
 }

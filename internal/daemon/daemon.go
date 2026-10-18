@@ -71,6 +71,11 @@ type Daemon struct {
 	// bootRes keeps the boot report's figures (own_row.go).
 	ownRowWake chan struct{}
 	bootRes    bootResources
+	// ownRowReconciling single-flights the own-row reconcile; the two func
+	// fields replace the reconcile and the certificate source in tests.
+	ownRowReconciling atomic.Bool
+	ownRowReconciler  func(context.Context)
+	ownRowCertSource  corrosion.InstalledCert
 	// auditWired is closed once wireAuditKeyring has installed the keyring
 	// audit rows are signed with; runAuditHold lands nothing before it.
 	auditWiredOnce sync.Once

@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 )
 
 // Firewall logging (docs/firewall.md, "Logging"): `--log` on the rule-add
@@ -232,4 +233,23 @@ func hostPort(addr string, port uint32) string {
 		return "[" + addr + "]:" + strconv.Itoa(int(port))
 	}
 	return addr + ":" + strconv.Itoa(int(port))
+}
+
+// composeLogs reports whether a compose file holds a rule with `log: true`.
+func composeLogs(f *compose.File) bool {
+	for _, sg := range f.SecurityGroups {
+		for _, r := range sg.Rules {
+			if r.Log {
+				return true
+			}
+		}
+	}
+	if fd := f.FirewallDefaults; fd != nil {
+		for _, r := range fd.ClusterRules {
+			if r.Log {
+				return true
+			}
+		}
+	}
+	return false
 }

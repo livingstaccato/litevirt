@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -288,4 +290,47 @@ func TestFirewallLogCLI(t *testing.T) {
 	if c := spy.got[2].GetAfterSeq(); c["a"] != 5 || c["b"] != 9 {
 		t.Errorf("third request cursor = %v, want a:5 b:9", c)
 	}
+}
+
+// C7 (I-1): lv compose up with a rule holding `log: true` asks the daemon
+// first and refuses one that predates logging before anything is sent; a
+// gitops deploy of such a file likewise.
+//
+// Mutation: skip the compose probe — DeployStack is reached, red.
+func TestComposeUpLog_ProbesTheDaemon(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	body := "name: s\nsecurity-groups:\n  web:\n    rules:\n      - { direction: ingress, proto: tcp, port: \"22\", action: drop, log: true }\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := &logSpy{probeErr: status.Error(codes.Unimplemented, "unknown method")}
+	_, err := runMacroCLIWith(t, old, "compose", "up", "-f", path, "--yes")
+	if err == nil || !strings.Contains(err.Error(), "older than this lv") || old.probes != 1 {
+		t.Errorf("compose up against an old daemon: %v after %d probe(s), want the upgrade refusal", err, old.probes)
+	}
+	// gitops: a file lv parses is judged by its rules; one it does not, by
+	// its decoded YAML keys; one that is not YAML is probed.
+	for _, c := range []struct {
+		name, body string
+	}{
+		{"parses, logs", body},
+		{"does not parse, a LOG key", "name: s\nbogus: 1\nsecurity-groups:\n  web:\n    rules:\n      - { \"LOG\": true }\n"},
+		{"does not parse, not YAML", "name: s\nsecurity-groups: [unclosed\n"},
+	} {
+		old = &logSpy{probeErr: status.Error(codes.Unimplemented, "unknown method")}
+		err := gitopsDeploy(context.Background(), &tagAnswering{old}, path, c.body)
+		if err == nil || !strings.Contains(err.Error(), "older than this lv") || old.probes != 1 {
+			t.Errorf("gitops %s against an old daemon: %v after %d probe(s), want the upgrade refusal", c.name, err, old.probes)
+		}
+	}
+	if hit, ok := gitopsYAMLMayHoldLog("name: s\nbogus: 1\n"); !ok || hit {
+		t.Errorf("a file with no log key = %v, %v; want no probe", hit, ok)
+	}
+}
+
+// tagAnswering is a logSpy whose daemon knows tag groups.
+type tagAnswering struct{ *logSpy }
+
+func (t *tagAnswering) ListFirewallTagGroups(context.Context, *pb.ListFirewallTagGroupsRequest, ...grpc.CallOption) (*pb.ListFirewallTagGroupsResponse, error) {
+	return &pb.ListFirewallTagGroupsResponse{}, nil
 }

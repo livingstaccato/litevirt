@@ -62,6 +62,9 @@ func newUpCmd() *cobra.Command {
 				if err := requireTagGroupSupport(ctx, c, composeRuleCIDRs(f)...); err != nil {
 					return err
 				}
+				if err := requireLogSupport(ctx, c, composeLogs(f)); err != nil {
+					return err
+				}
 				// Dry-run via DeployStack to get the plan from the server.
 				dryStream, err := c.DeployStack(ctx, &pb.DeployStackRequest{
 					ComposeYaml: string(yamlData),

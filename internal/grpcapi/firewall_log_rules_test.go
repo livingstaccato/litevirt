@@ -10,6 +10,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -179,5 +180,76 @@ func TestReleaseUseSweep_LogProbe(t *testing.T) {
 	s.sweepReleaseUses(ctx, releaseUseProbes)
 	if !slices.Contains(g.used, capabilities.FeatureFirewallLog) {
 		t.Errorf("uses recorded = %v, want firewall_log", g.used)
+	}
+}
+
+// C7: a stack whose rules say `log: true` writes the server's "+log" suffix
+// under the firewall_log gate. The first use is taken before the stack's old
+// rows are torn down: refused before the latch, the old rows stay.
+//
+// Mutations: ignore log at deploy — stored without the suffix, red; take the
+// gate only at the row write — the old rows are torn down first, red.
+func TestStackFirewall_LogTrueWritesTheSuffixUnderTheGate(t *testing.T) {
+	s := testServer(t)
+	g := &relGate{t: t}
+	s.SetReleaseFeatureGate(g)
+	bg := context.Background()
+	parse := func(logged bool) *compose.File {
+		t.Helper()
+		l := ""
+		if logged {
+			l = ", log: true"
+		}
+		f, err := compose.ParseStored([]byte(`
+name: fwstack
+security-groups:
+  web:
+    rules:
+      - {direction: ingress, proto: tcp, port: "80", cidr: "10.0.0.0/8", action: drop` + l + `}
+firewall:
+  cluster-rules:
+    - {direction: ingress, proto: tcp, port: "22", cidr: "10.1.0.0/16", action: accept` + l + `}
+`))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		return f
+	}
+	if err := s.persistStackFirewall(bg, parse(false)); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := corrosion.ListClusterFirewallRules(bg, s.db)
+	if len(before) != 1 {
+		t.Fatalf("stack rules = %v", before)
+	}
+	g.open = false
+	if err := s.persistStackFirewall(bg, parse(true)); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("before the latch: %v, want FailedPrecondition", err)
+	}
+	if after, _ := corrosion.ListClusterFirewallRules(bg, s.db); len(after) != 1 || after[0].ID != before[0].ID {
+		t.Errorf("after a refused deploy the stack's rules = %v, want the old rule kept", after)
+	}
+	g.open = true
+	g.used = nil
+	if err := s.persistStackFirewall(bg, parse(true)); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(g.used, capabilities.FeatureFirewallLog) {
+		t.Errorf("uses = %v, want firewall_log", g.used)
+	}
+	cr, _ := corrosion.ListClusterFirewallRules(bg, s.db)
+	if len(cr) != 1 || cr[0].Action != "accept+log" {
+		t.Errorf("cluster rules = %+v, want accept+log", cr)
+	}
+	sgs, _ := corrosion.ListSecurityGroups(bg, s.db, "")
+	var actions []string
+	for _, sg := range sgs {
+		rules, _ := corrosion.ListSGRules(bg, s.db, sg.ID)
+		for _, r := range rules {
+			actions = append(actions, r.Action)
+		}
+	}
+	if len(actions) != 1 || actions[0] != "drop+log" {
+		t.Errorf("sg rule actions = %v, want drop+log", actions)
 	}
 }

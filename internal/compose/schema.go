@@ -71,6 +71,8 @@ type FirewallRuleDef struct {
 	CIDR      string `yaml:"cidr,omitempty"`   // CIDR or "@ipset"
 	Action    string `yaml:"action,omitempty"` // "accept" | "drop" | "reject"
 	Comment   string `yaml:"comment,omitempty"`
+	// Log logs each packet the rule matches (docs/firewall.md, "Logging").
+	Log bool `yaml:"log,omitempty"`
 	// Macro names a rule macro (internal/firewall.Macros) in place of proto
 	// and port. The parser expands it into one ordinary row per macro row,
 	// so no later stage sees a macro.

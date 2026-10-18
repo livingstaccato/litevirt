@@ -1393,7 +1393,7 @@ leadership churn or a partition.
 - **Even N**: only with a witness. 2-node with witness is fine for homelab.
 - **Beyond ~5 nodes**: no size is load-tested. The largest automated cluster in
   this repo that runs workload scenarios is 3 nodes (`tests/fleet/`), the only
-  larger one measures anti-entropy alone (below), and the largest by hand is
+  larger ones measure anti-entropy and the probe mesh alone (below), and the largest by hand is
   the 4-node lab. The relay-quorum protocol scales O(n) by design and there is no known
   ceiling, but a figure like "tested and supported at ~50 nodes" is not
   backed by a sustained load test and should not be planned
@@ -1412,7 +1412,9 @@ leadership churn or a partition.
   voter plus three other non-voters, so every host is still observed by every
   voter and fence and recovery quorums see the same rows as a full mesh.
   `TestProbesPerCycle_Scale` in `internal/health/` counts real probe cycles,
-  per 2 s cycle: with every host voting (today's voter set, where every host
+  and `TestFleet_ProbeMesh_CostPerCycle` in `tests/fleet/` counts the Ready
+  probes real daemons answer over mTLS across consecutive cycles, per 2 s
+  cycle: with every host voting (today's voter set, where every host
   not `offline`, `maintenance` or `fenced` votes) the cost is unchanged at 20,
   380 and 2,450 probes for 5, 20 and 50 nodes (2,450 is 1,225 probes/s).
   With 3, 5 and 5 voters it is 20, 215 and 605. The saving needs a voter set

@@ -134,3 +134,13 @@ func (c *Checker) PeerUp(ctx context.Context, host string) bool {
 	}
 	return c.probeHost(ctx, rec.Name, corrosion.PeerTarget(rec.Address, rec.GRPCPort)) == probeReady
 }
+
+// CheckAllPeersForTests runs one probe cycle now, as the checker's loop does
+// every checkInterval.
+func (c *Checker) CheckAllPeersForTests(ctx context.Context) bool { return c.checkAllPeers(ctx) }
+
+// SetVoterSetForTests replaces corrosion.VoterSet as the voter set the probe
+// plan reads.
+func (c *Checker) SetVoterSetForTests(fn func(context.Context) (map[string]bool, error)) {
+	c.voterSet = fn
+}

@@ -314,6 +314,8 @@ type Node struct {
 	faults faults
 	// aeMeter counts the anti-entropy RPCs this node served (see ae_meter.go).
 	aeMeter aeMeter
+	// probeMeter counts the health probes this node served (probe_meter.go).
+	probeMeter probeMeter
 	// replStarted records that repl's push loop was started (IndependentReplicas),
 	// so Stop stops it before the database closes under it.
 	replStarted bool
@@ -1002,7 +1004,7 @@ func (c *Cluster) buildServer(n *Node) {
 	}
 	srv := grpc.NewServer(append(trackOpts,
 		grpc.Creds(creds),
-		grpc.ChainUnaryInterceptor(n.peerAddrUnaryInterceptor, n.partitionUnaryInterceptor, n.aeMeterUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor, n.hookUnaryInterceptor),
+		grpc.ChainUnaryInterceptor(n.peerAddrUnaryInterceptor, n.partitionUnaryInterceptor, n.aeMeterUnaryInterceptor, n.probeMeterUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor, n.hookUnaryInterceptor),
 		grpc.ChainStreamInterceptor(n.peerAddrStreamInterceptor, n.partitionStreamInterceptor, n.aeMeterStreamInterceptor, n.Server.StreamAuthInterceptor, n.hookStreamInterceptor),
 	)...)
 	pb.RegisterLiteVirtServer(srv, n.Server)

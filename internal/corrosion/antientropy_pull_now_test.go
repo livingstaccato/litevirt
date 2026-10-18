@@ -39,3 +39,15 @@ func TestPullTableNow_Candidates(t *testing.T) {
 		t.Errorf("skipped = %v", skipped)
 	}
 }
+
+// Re-review 2, m-3: a coordinator in release probation names itself.
+func TestPullTableNow_InProbationNamesThisNode(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	c.EnterReleaseProbation([]string{"release_9999_01_v1"})
+	c.SetMembersForTests(func() []PeerInfo { return []PeerInfo{{Name: "peer"}} })
+	_, _, err := NewAntiEntropy(c, "", 0).PullTableNow(ctx, "hosts", "target")
+	if !errors.Is(err, ErrNoPeerConfirmed) || !strings.Contains(err.Error(), "this node is in release probation") {
+		t.Errorf("in probation: %v", err)
+	}
+}

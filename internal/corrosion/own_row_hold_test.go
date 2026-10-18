@@ -306,6 +306,10 @@ func TestOwnRowHold_AStartHoldWhoseRowIsReadmittedNeverTimesOut(t *testing.T) {
 	if st, _ := c.EvaluateOwnRowHold(ctx, OwnRowHeldSuperseded); !st.Held || st.TimedOut {
 		t.Fatalf("hold = %+v, want held and never timed out", st)
 	}
+	// Re-review 2, m-1: the reason follows the row.
+	if st := c.OwnRowHold(); st.Reason != OwnRowHeldSuperseded {
+		t.Errorf("reason = %q, want superseded once the row is another admission", st.Reason)
+	}
 	before := mutationLogText(t, c)
 	if err := RegisterHost(ctx, c, HostRecord{Name: c.hostName, Address: "10.0.0.15", State: "active", CertSerial: "02new"}); err == nil {
 		t.Error("RegisterHost re-recorded over another admission's row")
@@ -345,4 +349,143 @@ func TestReRecord_RefusedOverAnotherAdmissionsCountedRow(t *testing.T) {
 	if got := oneString(t, c, `SELECT cert_serial FROM hosts WHERE name = ?`, "cert_serial", c.hostName); got != "02new" {
 		t.Errorf("serial = %s, want the renewal", got)
 	}
+}
+
+// memAdmission is an in-memory AdmissionMemory.
+type memAdmission struct {
+	n  int64
+	at string
+	ok bool
+}
+
+func (m *memAdmission) Load() (int64, string, bool) { return m.n, m.at, m.ok }
+func (m *memAdmission) Store(n int64, at string) error {
+	m.n, m.at, m.ok = n, at, true
+	return nil
+}
+
+// Re-review 2, I-1: a certificate reissued outside the renewal flow, over the
+// admission this host remembers, is re-recorded (the trust_rotated_peer_certs
+// recovery converges); over another admission's key, or with no memory, it is
+// not.
+func TestOwnAdmission_AReissuedCertificateOverItsOwnAdmission(t *testing.T) {
+	ctx := context.Background()
+	setup := func(t *testing.T, mem *memAdmission) *Client {
+		c := newTestDB(t)
+		ownRow(t, c, "s1")
+		if _, err := c.DB().Exec(`UPDATE hosts SET incarnation = 1, created_at = '2026-01-01T00:00:00.000000000Z' WHERE name = ?`, c.hostName); err != nil {
+			t.Fatal(err)
+		}
+		if mem != nil {
+			c.SetOwnAdmissionMemory(mem)
+		}
+		// While the row named its certificate, the hold remembered it.
+		if _, err := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("s1", "")); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	t.Run("its own admission: re-recorded", func(t *testing.T) {
+		mem := &memAdmission{}
+		c := setup(t, mem)
+		if !mem.ok || mem.n != 1 {
+			t.Fatalf("the admission was not remembered: %+v", mem)
+		}
+		// The PKI directory is regenerated: s2, not a renewal of s1.
+		if st, _ := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("s2", "")); st.Held {
+			t.Fatalf("held over its own admission: %+v", st)
+		}
+		if err := RegisterHost(ctx, c, HostRecord{Name: c.hostName, Address: "10.0.0.15", State: "active", CertSerial: "s2"}); err != nil {
+			t.Fatalf("RegisterHost: %v", err)
+		}
+		if got := oneString(t, c, `SELECT cert_serial FROM hosts WHERE name = ?`, "cert_serial", c.hostName); got != "s2" {
+			t.Errorf("serial = %s, want the reissued s2", got)
+		}
+	})
+	t.Run("another admission's key: refused", func(t *testing.T) {
+		mem := &memAdmission{}
+		c := setup(t, mem)
+		if _, err := c.DB().Exec(`UPDATE hosts SET incarnation = 2, cert_serial = 'y9' WHERE name = ?`, c.hostName); err != nil {
+			t.Fatal(err)
+		}
+		if st, _ := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("s2", "")); !st.Held {
+			t.Fatalf("not held over another admission: %+v", st)
+		}
+		if _, err := RecordOwnCertSerial(ctx, c, c.hostName, "s2"); err == nil {
+			t.Error("re-recorded over another admission")
+		}
+		if err := c.reRecordRefused(c.hostName, "y9", "s2", 2, "2026-01-01T00:00:00.000000000Z"); !errors.Is(err, ErrReRecordAtCountedRow) {
+			t.Errorf("the writer check = %v", err)
+		}
+	})
+	t.Run("same incarnation, another stamp: refused", func(t *testing.T) {
+		mem := &memAdmission{}
+		c := setup(t, mem)
+		if _, err := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("s2", "")); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.reRecordRefused(c.hostName, "s1", "s2", 1, "2026-01-01T00:00:00.000000000Z"); err != nil {
+			t.Fatalf("precondition: its own admission is refused: %v", err)
+		}
+		if err := c.reRecordRefused(c.hostName, "y9", "s2", 1, "2026-02-01T00:00:00.000000000Z"); !errors.Is(err, ErrReRecordAtCountedRow) {
+			t.Errorf("the writer check = %v", err)
+		}
+	})
+	t.Run("no memory: refused", func(t *testing.T) {
+		c := setup(t, nil)
+		if st, _ := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("s2", "")); !st.Held {
+			t.Fatalf("not held without a memory: %+v", st)
+		}
+		if err := c.reRecordRefused(c.hostName, "s1", "s2", 1, "2026-01-01T00:00:00.000000000Z"); !errors.Is(err, ErrReRecordAtCountedRow) {
+			t.Errorf("the writer check = %v", err)
+		}
+	})
+}
+
+// Re-review 2, m-2: no own-row write lands on another admission's row, even
+// before the hold's next evaluation — after a timed-out hold, and with no hold
+// raised at all.
+func TestOwnRowHold_EveryWriteReadsTheRowItWrites(t *testing.T) {
+	ctx := context.Background()
+	old := OwnRowHoldTimeout
+	OwnRowHoldTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { OwnRowHoldTimeout = old })
+	t.Run("a timed-out hold", func(t *testing.T) {
+		c := newTestDB(t)
+		ownRow(t, c, "01old")
+		if st, _ := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("02new", "")); !st.Held {
+			t.Fatal("not held")
+		}
+		time.Sleep(40 * time.Millisecond)
+		if st := c.OwnRowHold(); !st.TimedOut {
+			t.Fatalf("hold = %+v, want timed out", st)
+		}
+		// Another admission lands; nothing evaluates the hold.
+		if _, err := c.DB().Exec(`UPDATE hosts SET incarnation = 1, cert_serial = 'yy09' WHERE name = ?`, c.hostName); err != nil {
+			t.Fatal(err)
+		}
+		before := mutationLogText(t, c)
+		if err := UpdateHostStartup(ctx, c, c.hostName, "active", "v", 1, 2, 3, true); !errors.Is(err, ErrOwnRowHeld) {
+			t.Errorf("a boot report over another admission's row = %v, want ErrOwnRowHeld", err)
+		}
+		if err := SetHostLabel(ctx, c, c.hostName, "k", "v"); !errors.Is(err, ErrOwnRowHeld) {
+			t.Errorf("a label write over another admission's row = %v, want ErrOwnRowHeld", err)
+		}
+		if after := mutationLogText(t, c); after != before {
+			t.Error("the mutation log changed")
+		}
+	})
+	t.Run("no hold yet", func(t *testing.T) {
+		c := newTestDB(t)
+		ownRow(t, c, "02new")
+		if st, _ := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("02new", "")); st.Held {
+			t.Fatal("held")
+		}
+		if _, err := c.DB().Exec(`UPDATE hosts SET incarnation = 1, cert_serial = 'yy09' WHERE name = ?`, c.hostName); err != nil {
+			t.Fatal(err)
+		}
+		if err := UpdateHostVersion(ctx, c, c.hostName, "v9"); !errors.Is(err, ErrOwnRowHeld) {
+			t.Errorf("a version write over another admission's row = %v, want ErrOwnRowHeld", err)
+		}
+	})
 }

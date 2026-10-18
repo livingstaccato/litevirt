@@ -109,11 +109,13 @@ func (s *Server) requireVoterMajority(ctx context.Context, action, name string) 
 }
 
 // pullHostsNow pulls the hosts table from a peer — a voter first, never name
-// itself — before name's incarnation is read. A failed or timed-out pull
-// refuses: the decision is never made on the unpulled row. When no peer can
-// confirm (this node is alone with name, or the others are isolated), it
-// proceeds and logs it: the voter-majority gate has decided whether this node
-// may act. A server without anti-entropy wired (a test, a tool) skips it.
+// itself — before name's incarnation is read. It refuses when the pull fails
+// or times out, when every other voter was skipped (isolated, or unable to
+// keep a release feature in use), when this node is in release probation, and
+// when the voter set cannot be read: the decision is never made on an
+// unconfirmed row it could have confirmed. It proceeds, logging at Warn, only
+// when no other voter exists to ask (this node is alone with name). A server
+// without anti-entropy wired (a test, a tool) skips it.
 func (s *Server) pullHostsNow(ctx context.Context, action, name string) error {
 	p, ok := s.antiEntropy.(hostTablePuller)
 	if !ok || p == nil {

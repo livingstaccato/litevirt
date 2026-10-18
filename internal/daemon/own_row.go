@@ -2,7 +2,10 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +53,9 @@ func (d *Daemon) configureOwnRowHold(ctx context.Context) {
 	src := d.installedCert
 	if d.ownRowCertSource != nil {
 		src = d.ownRowCertSource
+	}
+	if d.cfg.PKIDir != "" {
+		d.db.SetOwnAdmissionMemory(&admissionFile{path: filepath.Join(d.cfg.PKIDir, OwnAdmissionFileName), host: d.cfg.HostName})
 	}
 	st, err := d.db.ConfigureOwnRowHold(ctx, src)
 	if err != nil {
@@ -214,4 +220,48 @@ func (d *Daemon) reconcileOwnEndpoint(ctx context.Context) error {
 				"was_address", h.Address, "was_grpc_port", h.GRPCPort)
 			return corrosion.WriteOwnEndpoint(ctx, d.db, d.cfg.HostName, want, d.cfg.GRPCPort, g)
 		})
+}
+
+// OwnAdmissionFileName is this host's record of the admission it was last
+// admitted under, in its PKI directory (corrosion.AdmissionMemory).
+const OwnAdmissionFileName = "own-admission.json"
+
+// admissionFile is corrosion.AdmissionMemory kept in a file, written whole
+// through a temporary file and a rename.
+type admissionFile struct {
+	path, host string
+}
+
+type admissionRecord struct {
+	Host        string `json:"host"`
+	Incarnation int64  `json:"incarnation"`
+	CreatedAt   string `json:"created_at"`
+}
+
+func (f *admissionFile) Load() (int64, string, bool) {
+	data, err := os.ReadFile(f.path)
+	if err != nil {
+		return 0, "", false
+	}
+	var r admissionRecord
+	if json.Unmarshal(data, &r) != nil || r.Host != f.host || r.Incarnation < 1 || r.CreatedAt == "" {
+		return 0, "", false
+	}
+	return r.Incarnation, r.CreatedAt, true
+}
+
+func (f *admissionFile) Store(n int64, createdAt string) error {
+	data, err := json.MarshalIndent(admissionRecord{Host: f.host, Incarnation: n, CreatedAt: createdAt}, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := f.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	if fh, err := os.Open(tmp); err == nil {
+		_ = fh.Sync()
+		fh.Close()
+	}
+	return os.Rename(tmp, f.path)
 }

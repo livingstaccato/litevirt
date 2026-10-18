@@ -1480,7 +1480,7 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 			}
 			// This host's own row is not written while its own-row hold holds
 			// (own_row_hold.go).
-			if err := c.ownRowStatementRefused(s); err != nil {
+			if err := c.ownRowStatementRefused(ctx, tx, s); err != nil {
 				tx.Rollback()
 				c.mu.Unlock()
 				return false, err
@@ -1670,7 +1670,7 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 		}
 		// This host's own row is not written while its own-row hold holds
 		// (own_row_hold.go).
-		if err := c.ownRowStatementRefused(s); err != nil {
+		if err := c.ownRowStatementRefused(ctx, tx, s); err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
 			return 0, err

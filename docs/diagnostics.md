@@ -2066,21 +2066,31 @@ server run.
 
 A host whose installed certificate renewed the recorded one (`lv host
 renew-cert`, live or while the host was down) is not held: it records the new
-serial at once.
+serial at once. Neither is a host whose certificate was reissued outside
+`lv host renew-cert` while its row is still the admission it was last admitted
+under, which it records in `<pki_dir>/own-admission.json`: it records the
+reissued serial, so `auth.trust_rotated_peer_certs` converges it.
 
 A hold raised at start over a row at incarnation 0 reports `timed_out` after
 ten minutes, and the daemon then makes the writes the previous release makes.
 A hold over a row at incarnation 1 or higher, and a hold raised at runtime
-(`superseded`, `removed`), never times out.
+(`superseded`, `removed`), never times out. A held row that becomes another
+admission while held is reported as `superseded`.
 
 **`reason` `at_start`** is a host re-added while its data directory still held
-its old database, or a host whose certificate was renewed while it was down.
-It clears once the host's replica receives the re-admission from a peer. If it
-does not clear, check that a peer is reachable from the host and that the
-peer's `lv host inspect <name>` shows the installed serial. When
-`installed_serial` is neither the recorded serial nor a renewal of it, the
-cluster will never send that row: run `lv host renew-cert` from the recorded
-certificate, or remove the host and add it again.
+its old database. It clears once the host's replica receives the re-admission
+from a peer. If it does not clear:
+
+1. Check that a peer is reachable from the host.
+2. On another node, run `lv host inspect <name>`. If it shows the
+   `installed_serial`, the re-admission has not reached the host yet.
+3. If a machine serves the recorded serial, this host is superseded: follow
+   the `superseded` procedure below.
+4. If this host's own recorded certificate and key still exist, put them back
+   as `<pki_dir>/host.crt` and `<pki_dir>/host.key`. The hold then opens by
+   itself.
+5. Otherwise, stop the daemon on the host, then remove the host and add it
+   again.
 
 **`reason` `superseded`** is a host whose admission another `lv host add` of
 the same name replaced. Peers no longer accept its certificate. To recover:

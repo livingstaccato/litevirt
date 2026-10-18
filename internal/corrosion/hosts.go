@@ -341,7 +341,7 @@ func RegisterHost(ctx context.Context, c *Client, h HostRecord) error {
 	if err := c.ownRowWriteRefused(h.Name); err != nil {
 		return err
 	}
-	rows, err := c.Query(ctx, `SELECT cert_serial, deleted_at, incarnation FROM hosts WHERE name = ?`, h.Name)
+	rows, err := c.Query(ctx, `SELECT cert_serial, deleted_at, incarnation, created_at FROM hosts WHERE name = ?`, h.Name)
 	if err != nil {
 		return err
 	}
@@ -370,7 +370,7 @@ func RegisterHost(ctx context.Context, c *Client, h HostRecord) error {
 				"host", h.Name, "recorded_serial", recorded)
 			return nil
 		}
-		if err := c.reRecordRefused(h.Name, recorded, h.CertSerial, int64(rows[0].Int("incarnation"))); err != nil {
+		if err := c.reRecordRefused(h.Name, recorded, h.CertSerial, int64(rows[0].Int("incarnation")), rows[0].String("created_at")); err != nil {
 			slog.Error("not re-recording this host's serial over its own row", "host", h.Name, "error", err)
 			return err
 		}
@@ -404,7 +404,7 @@ func RecordOwnCertSerial(ctx context.Context, c *Client, name, serial string) (b
 	if err := c.ownRowWriteRefused(name); err != nil {
 		return false, err
 	}
-	rows, err := c.Query(ctx, `SELECT cert_serial, deleted_at, incarnation FROM hosts WHERE name = ?`, name)
+	rows, err := c.Query(ctx, `SELECT cert_serial, deleted_at, incarnation, created_at FROM hosts WHERE name = ?`, name)
 	if err != nil {
 		return false, err
 	}
@@ -415,7 +415,7 @@ func RecordOwnCertSerial(ctx context.Context, c *Client, name, serial string) (b
 	if strings.EqualFold(recorded, serial) {
 		return false, nil
 	}
-	if err := c.reRecordRefused(name, recorded, serial, int64(rows[0].Int("incarnation"))); err != nil {
+	if err := c.reRecordRefused(name, recorded, serial, int64(rows[0].Int("incarnation")), rows[0].String("created_at")); err != nil {
 		return false, err
 	}
 	slog.Info("re-recording this host's renewed certificate serial so peers pin the new certificate",

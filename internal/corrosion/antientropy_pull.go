@@ -145,7 +145,17 @@ func (ae *AntiEntropy) PullTableNow(ctx context.Context, table, exclude string) 
 	if !replicatedTableSet[table] {
 		return "", nil, fmt.Errorf("%s is not a replicated table", table)
 	}
-	voters, _ := VoterSet(ctx, ae.client)
+	// This node in release probation takes no state from any peer: say so,
+	// rather than name every peer as the one that cannot keep a feature.
+	if err := ae.client.ReleaseProbationRefusal(); err != nil {
+		return "", nil, fmt.Errorf("%w: this node is in release probation: %v", ErrNoPeerConfirmed, err)
+	}
+	voters, verr := VoterSet(ctx, ae.client)
+	if verr != nil {
+		// Without the voter set a skipped voter cannot be told from a
+		// skipped non-voter: fail closed.
+		return "", nil, fmt.Errorf("%w: read the voter set: %v", ErrNoPeerConfirmed, verr)
+	}
 	var first, rest, skippedVoters []string
 	skip := func(name, why string) {
 		skipped = append(skipped, name+" ("+why+")")

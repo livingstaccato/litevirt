@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -78,10 +79,23 @@ type OwnRowHoldStatus struct {
 // for a renewal, the serial it renewed ("" otherwise). Lower-case hex.
 type InstalledCert func() (serial, renewedFrom string)
 
+// AdmissionMemory is this host's durable, host-local record of the admission
+// it was last admitted under: the (incarnation, created_at) of its own row
+// while that row named its certificate. It is what tells this machine's own
+// admission from another machine's when its certificate was reissued outside
+// `lv host renew-cert` (the auth.trust_rotated_peer_certs recovery). The
+// daemon keeps it in its PKI directory (daemon/own_row.go). Load reports
+// ok=false when there is none.
+type AdmissionMemory interface {
+	Load() (incarnation int64, createdAt string, ok bool)
+	Store(incarnation int64, createdAt string) error
+}
+
 type ownRowHold struct {
 	mu        sync.Mutex
 	enabled   bool
 	installed InstalledCert
+	memory    AdmissionMemory
 	st        OwnRowHoldStatus
 	// onChange is called (outside mu) after an apply touched the own row.
 	onChange atomic.Pointer[func()]
@@ -99,6 +113,70 @@ func (c *Client) ConfigureOwnRowHold(ctx context.Context, installed InstalledCer
 	h.st = OwnRowHoldStatus{}
 	h.mu.Unlock()
 	return c.EvaluateOwnRowHold(ctx, OwnRowHeldAtStart)
+}
+
+// SetOwnAdmissionMemory installs the record of this host's own admission
+// (AdmissionMemory). Call before ConfigureOwnRowHold. Nil: no memory, and a
+// reissued certificate over a counted row is held, as for any other machine.
+func (c *Client) SetOwnAdmissionMemory(m AdmissionMemory) {
+	c.ownHold.mu.Lock()
+	c.ownHold.memory = m
+	c.ownHold.mu.Unlock()
+}
+
+// ownRowView is the own row as the hold judges it.
+type ownRowView struct {
+	found             bool
+	serial, createdAt string
+	deleted           bool
+	n                 int64
+}
+
+// ownRowArm is the hold's arm over row for a host serving installed (which
+// renewed renewedFrom), with mem the remembered own admission: "" when the row
+// is this machine's to write, "a" when it names another certificate, "b"
+// when it is removed. A missing row is not an arm.
+//
+// A row naming the installed certificate, or the one it renewed, is this
+// machine's. So is a counted row whose key is the admission this machine
+// remembers being admitted under: its certificate was reissued outside the
+// renewal flow, and the re-record is its own. Another admission always has
+// another key, so it is never mistaken for this one.
+func ownRowArm(row ownRowView, installed, renewedFrom string, mem AdmissionMemory) string {
+	switch {
+	case !row.found:
+		return ""
+	case row.deleted:
+		return "b"
+	case strings.EqualFold(row.serial, installed):
+		return ""
+	case renewedFrom != "" && strings.EqualFold(row.serial, renewedFrom):
+		return ""
+	case row.n >= 1 && rememberedAdmission(mem, row):
+		return ""
+	default:
+		return "a"
+	}
+}
+
+// rememberedAdmission reports whether row is the admission mem remembers.
+func rememberedAdmission(mem AdmissionMemory, row ownRowView) bool {
+	if mem == nil {
+		return false
+	}
+	n, at, ok := mem.Load()
+	return ok && n == row.n && at == row.createdAt
+}
+
+const ownRowSelectSQL = `SELECT cert_serial, deleted_at, incarnation, created_at FROM hosts WHERE name = ?`
+
+func ownRowFrom(rows []Row) ownRowView {
+	if len(rows) != 1 {
+		return ownRowView{}
+	}
+	r := rows[0]
+	return ownRowView{found: true, serial: r.String("cert_serial"), deleted: r.String("deleted_at") != "",
+		n: int64(r.Int("incarnation")), createdAt: r.String("created_at")}
 }
 
 // StaticInstalledCert is an InstalledCert that always reports serial.
@@ -126,23 +204,21 @@ func (c *Client) EvaluateOwnRowHold(ctx context.Context, reason string) (OwnRowH
 	if installed == "" || strings.EqualFold(installed, "unknown") {
 		return c.OwnRowHold(), nil // unreadable: change nothing
 	}
-	rows, err := c.Query(ctx, `SELECT cert_serial, deleted_at, incarnation FROM hosts WHERE name = ?`, c.hostName)
+	rows, err := c.Query(ctx, ownRowSelectSQL, c.hostName)
 	if err != nil {
 		return c.OwnRowHold(), err
 	}
-	arm, recorded := "", ""
-	var incarnation int64
-	if len(rows) == 1 {
-		recorded = rows[0].String("cert_serial")
-		incarnation = int64(rows[0].Int("incarnation"))
-		switch {
-		case rows[0].String("deleted_at") != "":
-			arm = "b"
-		case strings.EqualFold(recorded, installed):
-		case renewedFrom != "" && strings.EqualFold(recorded, renewedFrom):
-			// A renewal of the recorded certificate: re-recorded at once.
-		default:
-			arm = "a"
+	row := ownRowFrom(rows)
+	h.mu.Lock()
+	mem := h.memory
+	h.mu.Unlock()
+	arm := ownRowArm(row, installed, renewedFrom, mem)
+	// Remember the admission this machine holds: a live counted row naming
+	// its certificate (or the one it renewed).
+	if arm == "" && row.found && !row.deleted && row.n >= 1 && mem != nil && !rememberedAdmission(mem, row) &&
+		(strings.EqualFold(row.serial, installed) || (renewedFrom != "" && strings.EqualFold(row.serial, renewedFrom))) {
+		if err := mem.Store(row.n, row.createdAt); err != nil {
+			slog.Warn("could not record this host's own admission", "incarnation", row.n, "error", err)
 		}
 	}
 	h.mu.Lock()
@@ -158,14 +234,18 @@ func (c *Client) EvaluateOwnRowHold(ctx context.Context, reason string) (OwnRowH
 				r = OwnRowHeldRemoved
 			}
 		}
-		h.st = OwnRowHoldStatus{Held: true, Arm: arm, Reason: r, Since: time.Now(), Incarnation: incarnation}
+		h.st = OwnRowHoldStatus{Held: true, Arm: arm, Reason: r, Since: time.Now(), Incarnation: row.n}
 	}
 	if h.st.Held {
-		h.st.InstalledSerial, h.st.RecordedSerial = installed, recorded
+		h.st.InstalledSerial, h.st.RecordedSerial = installed, row.serial
 		// A held row whose incarnation rose is another machine's admission:
-		// the hold over it must never time out, whatever it was raised over.
-		if incarnation > h.st.Incarnation {
-			h.st.Incarnation = incarnation
+		// the hold over it is a supersession now, and never times out,
+		// whatever it was raised over.
+		if row.n > h.st.Incarnation {
+			h.st.Incarnation = row.n
+			if h.st.Arm == "a" {
+				h.st.Reason = OwnRowHeldSuperseded
+			}
 		}
 		h.st.TimedOut = h.st.timedOut()
 	}
@@ -250,16 +330,20 @@ var ownRowTables = map[string]string{
 }
 
 // ownRowStatementRefused refuses a locally originated statement about this
-// host's own row (hosts or a split copy) while the hold is engaged: every
-// own-row writer goes through the hold, wherever it is called from
-// (activation, capability labels, update labels, UpgradeHost, ...). Run by
-// both local write paths (client.go).
-func (c *Client) ownRowStatementRefused(s Statement) error {
+// host's own row (hosts or a split copy) unless the row, read now inside the
+// write's transaction, is this machine's to write: every own-row writer goes
+// through it, wherever it is called from (activation, capability labels,
+// update labels, UpgradeHost, ...), and whatever the hold's last evaluation
+// said. A timed-out hold lets through only a write over a row still at
+// incarnation 0. Run by both local write paths (client.go).
+func (c *Client) ownRowStatementRefused(ctx context.Context, tx *sql.Tx, s Statement) error {
 	if c.hostName == "" || !strings.Contains(s.SQL, "host") {
 		return nil
 	}
-	st := c.OwnRowHold()
-	if !st.Held || st.TimedOut {
+	c.ownHold.mu.Lock()
+	enabled, installedFn, mem := c.ownHold.enabled, c.ownHold.installed, c.ownHold.memory
+	c.ownHold.mu.Unlock()
+	if !enabled {
 		return nil
 	}
 	sh, pkCols, err := parseResolved(s.SQL)
@@ -274,14 +358,40 @@ func (c *Client) ownRowStatementRefused(s Statement) error {
 	if !ok || len(pk) != len(pkCols) {
 		return nil
 	}
+	mine := false
 	for i, c2 := range pkCols {
 		if c2 == col {
 			if name, _ := pk[i].(string); name == c.hostName {
-				return c.ownRowWriteRefused(name)
+				mine = true
 			}
 		}
 	}
-	return nil
+	if !mine {
+		return nil
+	}
+	installed, renewedFrom := installedFn()
+	if installed == "" || strings.EqualFold(installed, "unknown") {
+		return c.ownRowWriteRefused(c.hostName)
+	}
+	var row ownRowView
+	var serial, created, deleted sql.NullString
+	err = tx.QueryRowContext(ctx, ownRowSelectSQL, c.hostName).Scan(&serial, &deleted, &row.n, &created)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil // a missing row is not an arm
+	case err != nil:
+		return err
+	}
+	row.found, row.serial, row.createdAt, row.deleted = true, serial.String, created.String, deleted.Valid && deleted.String != ""
+	arm := ownRowArm(row, installed, renewedFrom, mem)
+	if arm == "" {
+		return nil
+	}
+	st := c.OwnRowHold()
+	if st.Held && st.TimedOut && row.n == 0 {
+		return nil // the timed-out fallback, over a row still at 0
+	}
+	return fmt.Errorf("%w (arm %s, row at incarnation %d names %s)", ErrOwnRowHeld, arm, row.n, row.serial)
 }
 
 // ErrReRecordAtCountedRow refuses re-recording this host's serial over a row
@@ -292,22 +402,29 @@ func (c *Client) ownRowStatementRefused(s Statement) error {
 var ErrReRecordAtCountedRow = errors.New("this host's own row is another admission's; its serial is not re-recorded over it")
 
 // reRecordRefused decides a re-record of serial over the own row naming
-// recorded at incarnation n. At incarnation 0 it is the previous release's
-// behaviour and always allowed. At n ≥ 1 only a renewal of the recorded
-// certificate (the installed certificate names recorded as the one it
-// renewed) is: without the own-row hold's certificate source nothing proves
-// that, and the re-record is refused.
-func (c *Client) reRecordRefused(name, recorded, serial string, n int64) error {
+// recorded at (n, createdAt). At incarnation 0 it is the previous release's
+// behaviour and always allowed. At n ≥ 1 it is allowed for a renewal of the
+// recorded certificate (the installed certificate names recorded as the one
+// it renewed), and over the admission this machine remembers being admitted
+// under (AdmissionMemory): a certificate reissued outside the renewal flow.
+// Without the own-row hold's certificate source nothing proves either, and
+// the re-record is refused.
+func (c *Client) reRecordRefused(name, recorded, serial string, n int64, createdAt string) error {
 	if n < 1 || name != c.hostName {
 		return nil
 	}
 	c.ownHold.mu.Lock()
-	src := c.ownHold.installed
+	src, mem := c.ownHold.installed, c.ownHold.memory
 	c.ownHold.mu.Unlock()
 	if src != nil {
 		installed, renewedFrom := src()
-		if strings.EqualFold(installed, serial) && renewedFrom != "" && strings.EqualFold(renewedFrom, recorded) {
-			return nil
+		if strings.EqualFold(installed, serial) {
+			if renewedFrom != "" && strings.EqualFold(renewedFrom, recorded) {
+				return nil
+			}
+			if rememberedAdmission(mem, ownRowView{found: true, n: n, createdAt: createdAt}) {
+				return nil
+			}
 		}
 	}
 	return fmt.Errorf("%w (recorded %s, installed %s, incarnation %d)", ErrReRecordAtCountedRow, recorded, serial, n)

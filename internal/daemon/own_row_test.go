@@ -220,3 +220,23 @@ func TestOwnRow_AStartHoldWhoseRowIsReadmittedNeverFallsBack(t *testing.T) {
 		t.Error("the fallback reconcile ran over another admission's row")
 	}
 }
+
+// Re-review 2, I-1: the admission record survives a restart and is this
+// host's alone.
+func TestAdmissionFile_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	f := &admissionFile{path: dir + "/" + OwnAdmissionFileName, host: "node-a"}
+	if _, _, ok := f.Load(); ok {
+		t.Fatal("a missing file loaded")
+	}
+	if err := f.Store(2, "2026-01-01T00:00:00.000000000Z"); err != nil {
+		t.Fatal(err)
+	}
+	again := &admissionFile{path: f.path, host: "node-a"}
+	if n, at, ok := again.Load(); !ok || n != 2 || at != "2026-01-01T00:00:00.000000000Z" {
+		t.Errorf("Load = (%d, %q, %v)", n, at, ok)
+	}
+	if _, _, ok := (&admissionFile{path: f.path, host: "node-b"}).Load(); ok {
+		t.Error("another host's record loaded")
+	}
+}

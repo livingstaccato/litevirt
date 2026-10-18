@@ -24,14 +24,24 @@ import (
 // are skipped, not failed: they migrate themselves on restart, and a
 // single-version skew is tolerated by the replication handshake. That makes the
 // very upgrade that introduces this feature a clean no-op fallback.
-func preStageSchema(ctx context.Context, client pb.LiteVirtClient, targets []*pb.Host, binaryPath string, force bool) error {
+//
+// others are the members the upgrade does not swap. Each receives replication
+// from the upgraded targets and refuses every push from a sender whose schema
+// is ahead of its own, so each is pre-staged too (its binary is left alone).
+// A member that cannot be pre-staged, for any reason, Unimplemented included,
+// refuses the upgrade before any binary is swapped, unless force is set.
+func preStageSchema(ctx context.Context, client pb.LiteVirtClient, targets, others []*pb.Host, binaryPath string, force bool) error {
 	data, err := os.ReadFile(binaryPath)
 	if err != nil {
 		return fmt.Errorf("read binary: %w", err)
 	}
 	checksum := sha256sum(data)
 
-	fmt.Println("Pre-staging schema on all targets (safe — no restart)...")
+	if len(others) > 0 {
+		fmt.Printf("Pre-staging schema on %d target(s) and %d other member(s) (safe — no restart)...\n", len(targets), len(others))
+	} else {
+		fmt.Println("Pre-staging schema on all targets (safe — no restart)...")
+	}
 
 	var prestaged, unsupported []string
 	failed := map[string]string{}
@@ -60,6 +70,39 @@ func preStageSchema(ctx context.Context, client pb.LiteVirtClient, targets []*pb
 		}
 		return fmt.Errorf("pre-stage failed on %d host(s); no binaries were swapped — resolve and re-run:%s",
 			len(failed), b.String())
+	}
+
+	var lagging []string
+	for _, h := range others {
+		resp, err := preStageOneHost(ctx, client, h, data, checksum, force)
+		if err != nil {
+			failed[h.Name] = err.Error()
+			lagging = append(lagging, h.Name)
+			continue
+		}
+		prestaged = append(prestaged, h.Name)
+		if resp != nil && resp.SchemaVersion > stagedSchema {
+			stagedSchema = resp.SchemaVersion
+		}
+	}
+	if len(lagging) > 0 {
+		var b strings.Builder
+		for _, name := range lagging {
+			fmt.Fprintf(&b, "\n    %s: %s", name, failed[name])
+		}
+		names := make([]string, 0, len(targets)+len(lagging))
+		for _, h := range targets {
+			names = append(names, h.Name)
+		}
+		names = append(names, lagging...)
+		msg := fmt.Sprintf("%d member(s) outside this upgrade could not be pre-staged, and each would refuse "+
+			"replication from every upgraded host until it is upgraded:%s\n"+
+			"  upgrade them with the rest (lv host upgrade %s), or bring them back and re-run",
+			len(lagging), b.String(), strings.Join(names, " "))
+		if !force {
+			return fmt.Errorf("%s; --force proceeds anyway. No binaries were swapped", msg)
+		}
+		fmt.Fprintf(os.Stderr, "  WARNING (--force): %s\n", msg)
 	}
 
 	switch {

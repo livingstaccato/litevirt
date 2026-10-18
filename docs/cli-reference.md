@@ -159,7 +159,7 @@ lv host lun-hold discard <lun> --yes      # Move a hold aside so the LUN can be 
   [--host <host>]                         #   on that host (default: the one host holding it)
 lv host upgrade --binary <path> [host...] # Rolling upgrade of litevirt
   [--yes]                                 # Skip confirmation prompt
-  [--force]                               # Skip preflight blocks (warnings still printed)
+  [--force]                               # Skip preflight blocks and members that cannot be pre-staged
   [--no-prestage]                         # Skip the cluster-wide schema pre-stage pass
 lv host preflight-upgrade <host>          # Report preflight findings without upgrading
 lv host label set <host> key=value ...    # Set labels on a host

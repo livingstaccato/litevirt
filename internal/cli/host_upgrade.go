@@ -114,9 +114,15 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 
 	var remoteTargets []*pb.Host // other hosts — upgraded first
 	var selfTarget *pb.Host      // the connected host — upgraded last
+	var others []*pb.Host        // members left on their binary — pre-staged only
 
 	for _, h := range resp.Hosts {
+		// A member already on the version being deployed has its schema.
+		current := targetVersion != "" && h.Version == targetVersion
 		if named && !filterSet[h.Name] {
+			if !current {
+				others = append(others, h)
+			}
 			continue
 		}
 		// In "all" mode, skip hosts already on the target (the --binary's)
@@ -125,7 +131,7 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 		// manual change), so a version match must not silently skip it — that
 		// no-op once forced the unsafe bare-restart workaround. See
 		// docs/upgrades.md.
-		if !named && targetVersion != "" && h.Version == targetVersion {
+		if !named && current {
 			continue
 		}
 		if h.Name == connectedHost {
@@ -158,6 +164,13 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n", h.Name, h.Address, versionLabel(h.Version), note)
 	}
 	tw.Flush()
+	if len(others) > 0 && !opts.NoPreStage {
+		names := make([]string, len(others))
+		for i, h := range others {
+			names[i] = h.Name
+		}
+		fmt.Printf("\n  schema also pre-staged, binary unchanged: %s\n", strings.Join(names, ", "))
+	}
 	fmt.Println()
 
 	// Confirm unless --yes.
@@ -172,7 +185,9 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 		}
 	}
 
-	// Phase 1 — pre-stage schema on every target BEFORE swapping any binary.
+	// Phase 1 — pre-stage schema on every member BEFORE swapping any binary:
+	// the targets, and every member this upgrade leaves on its binary, which
+	// would otherwise refuse each push from an upgraded target.
 	// This streams the new binary to each host and runs its `schema-migrate`
 	// against the live state.db (safe: WAL + busy-timeout, idempotent). After
 	// this pass every node's DB has the new schema, so the rolling restart in
@@ -181,7 +196,7 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 	// without the PreStageUpgrade RPC report Unimplemented and are skipped (they
 	// migrate themselves on restart; single-version skew self-heals).
 	if !opts.NoPreStage {
-		if err := preStageSchema(ctx, client, targets, opts.BinaryPath, opts.Force); err != nil {
+		if err := preStageSchema(ctx, client, targets, others, opts.BinaryPath, opts.Force); err != nil {
 			return err
 		}
 	}

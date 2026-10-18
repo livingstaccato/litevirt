@@ -931,7 +931,7 @@ holdings, replication backlog, and clock skew. The upgrade aborts on
 	}
 	cmd.Flags().StringVar(&binaryPath, "binary", "/usr/local/bin/litevirt", "Path to litevirtd binary to distribute")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation prompt")
-	cmd.Flags().BoolVar(&force, "force", false, "Skip preflight blocks (warnings still printed)")
+	cmd.Flags().BoolVar(&force, "force", false, "Skip preflight blocks, and proceed past members that cannot be pre-staged (warnings still printed)")
 	cmd.Flags().BoolVar(&noPreStage, "no-prestage", false, "Skip the cluster-wide schema pre-stage pass (not recommended for multi-version upgrades)")
 	return cmd
 }

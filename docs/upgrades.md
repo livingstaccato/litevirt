@@ -1827,7 +1827,17 @@ WAL + busy-timeout — safe while the old daemon is up). Only after every node's
 schema is forward-staged does it begin the rolling restart, so a freshly-
 upgraded node can never write a column a not-yet-upgraded peer is missing.
 If pre-staging fails on any host the upgrade aborts **before** any binary is
-swapped, so you can fix it and re-run. Daemons too old to support the
+swapped, so you can fix it and re-run.
+
+An upgrade of some hosts (`lv host upgrade host-b`) pre-stages **every other
+member** too, and leaves their binaries alone: a member left on the old
+schema refuses every push from an upgraded host. Members already on the
+version being deployed are skipped. If a member cannot be pre-staged
+(unreachable, or a daemon without the pre-stage RPC), the upgrade is refused
+before any binary is swapped, naming it; upgrade it with the rest, or bring
+it back and re-run. `--force` proceeds anyway, and that member then shows as
+[`replication_peer_schema_behind`](diagnostics.md#a-peer-refuses-replication-its-schema-is-behind-replication_peer_schema_behind)
+in `lv health` until `lv host upgrade <host>` reaches it. Daemons too old to support the
 pre-stage RPC report `Unimplemented` and are skipped (they migrate themselves
 on restart; a single-version skew self-heals) — so the very upgrade that
 introduces this feature still works as a plain rolling restart. Pass

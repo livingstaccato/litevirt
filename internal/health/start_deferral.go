@@ -44,15 +44,15 @@ var (
 	ErrStartProbeFailed error = &deferKind{"start deferred: its storage did not answer its probe", rankProbeFailed}
 )
 
-// The walk order of deferred starts: for time, then storage down, then a VM
-// whose own probe failed — last of the deferred, so a VM whose storage keeps
-// failing never holds the head of the walk and spends the budget the VMs on
-// healthy storage behind it need — and then every VM that was not deferred.
+// The walk order: deferred for time first, then every VM that was not
+// deferred, then storage down, then a VM whose own probe failed — last of
+// all, so a VM whose storage keeps failing never spends the budget the VMs
+// on healthy storage need, however many keys are down (R-3).
 const (
 	rankTime = iota
+	rankNotDeferred
 	rankStorageDown
 	rankProbeFailed
-	rankNotDeferred
 )
 
 type deferKind struct {
@@ -174,7 +174,8 @@ func (r *Reconciler) deferStart(ctx context.Context, vmName, proofID string, tra
 }
 
 // walkOrder is the order a reconcile pass walks this host's VMs in: the
-// deferred starts first, by rank (deferredFirst), and within each group the
+// deferred-for-time starts first and the failed-storage ones last, by rank
+// (deferredFirst), and within each group the
 // highest compose migrate.priority first, ties by name. A failover lands its
 // VMs here as "pending", so this is the order they start in on their new
 // host, and the walk's time budget runs out on the lowest priority. It only
@@ -190,9 +191,8 @@ func walkOrder(vms []corrosion.VMRecord, deferred map[string]int) []corrosion.VM
 	return deferredFirst(corrosion.SortVMsByMigratePriority(vms), deferred)
 }
 
-// deferredFirst orders a walk's VMs with the deferred ones first, by rank
-// (for time, storage down, own probe failed), then the rest; each group in
-// the walk's own order.
+// deferredFirst orders a walk's VMs by rank: deferred for time, the rest,
+// storage down, own probe failed; each group in the walk's own order.
 func deferredFirst(vms []corrosion.VMRecord, deferred map[string]int) []corrosion.VMRecord {
 	if len(deferred) == 0 {
 		return vms

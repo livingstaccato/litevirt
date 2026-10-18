@@ -38,11 +38,14 @@ func kindErr(vm string, kind error) error {
 	return fmt.Errorf("%w: %w", kind, status.Errorf(codes.Unavailable, "start %q: deferred", vm))
 }
 
-// I-R4-1. The next walk takes the VMs deferred for TIME first (they had no
-// chance to ask their storage), then those whose storage did not answer — a
-// VM whose own probe failed last of them — and then the rest. A VM whose
-// own probe keeps failing therefore never holds the head of the walk, where
-// it spent the budget that VMs on a healthy pool behind it needed.
+// I-R4-1, R-3. The next walk takes the VMs deferred for TIME first (they had
+// no chance to ask their storage), then the rest, and only then those whose
+// storage did not answer — a VM whose own probe failed last of all. A VM
+// whose storage keeps failing therefore never spends the budget the VMs
+// behind it need, however many keys are down: with two, a probe of one of
+// them in every pass used to leave the rest of the walk about 2 s.
+//
+// Mutation "failed storage before the rest" (the R-5 ranks): red.
 func TestReconciler_DeferredStartsAreOrderedByWhyTheyWaited(t *testing.T) {
 	db := testReconcilerDB(t)
 	ctx := context.Background()
@@ -72,8 +75,8 @@ func TestReconciler_DeferredStartsAreOrderedByWhyTheyWaited(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.reconcile(ctx)
-	if got := strings.Join(p.order[3:], ","); got != "vm-t,vm-s,vm-f,vm-a" {
-		t.Fatalf("second pass prepared %s, want time-deferred, then storage down, then own probe failed, then the rest", got)
+	if got := strings.Join(p.order[3:], ","); got != "vm-t,vm-a,vm-s,vm-f" {
+		t.Fatalf("second pass prepared %s, want time-deferred, then the rest, then storage down, then own probe failed", got)
 	}
 }
 

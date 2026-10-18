@@ -37,7 +37,7 @@ func TestWalkOrder_PriorityWithinDeferralRank(t *testing.T) {
 	for _, vm := range walkOrder(slices.Clone(in), deferred) {
 		got = append(got, vm.Name)
 	}
-	want := []string{"hi-time", "lo-time", "lo-probe", "hi-fresh", "mid-fresh", "a-zero", "b-zero"}
+	want := []string{"hi-time", "lo-time", "hi-fresh", "mid-fresh", "a-zero", "b-zero", "lo-probe"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("walk order = %v\nwant         %v", got, want)
 	}

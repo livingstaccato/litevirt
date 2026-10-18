@@ -1292,9 +1292,10 @@ pass's first probe, which runs on whatever time is left (from 2 s), so every
 pass makes progress. A probe Ceph did not answer is remembered for 15 s
 (about one pass): the reconcile pass defers the other VMs on that pool at
 once, without a probe each (an operator's `lv start` always probes). The next
-pass takes the deferred VMs first: those deferred for time, then those whose
-pool did not answer, the VM whose own probe failed last of them. So a pool
-that is down never holds up the VMs on a healthy pool. A live migration onto a host
+pass takes those deferred for time first, then every VM that was not
+deferred, and only then those whose pool did not answer, the VM whose own
+probe failed last of all. So a pool that is down, or several, never holds up
+the VMs on a healthy pool or on other storage. A live migration onto a host
 whose recorded key differs from the source host's is refused before libvirt
 is asked.
 

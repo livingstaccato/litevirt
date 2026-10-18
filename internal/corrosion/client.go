@@ -485,10 +485,6 @@ type Client struct {
 	// recovery_claim_v1 latch. Fails CLOSED when unset: those shapes
 	// back-pressure a previous-release peer. See recovery_claims_proof.go.
 	recoveryClaimGate atomic.Pointer[func() bool]
-	// sgProjectsGate, when set and returning true, permits writing a
-	// security group with a project (SetSGProjectsGate), wired to the durable
-	// sg_projects_v1 latch. Fails CLOSED when unset.
-	sgProjectsGate atomic.Pointer[func() bool]
 	// startedProofCheck reports whether this node has started a proof it
 	// holds no runtime_action_proofs row for — an operator's claimed
 	// promotion (SetStartedProofCheck). AbandonProof refuses such a proof.

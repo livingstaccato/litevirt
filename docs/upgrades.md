@@ -1480,15 +1480,10 @@ forward.
 
 `lv sg create <name> --project <p>` creates a group only `p`'s workloads may
 bind (docs/firewall.md). Its row carries a column a host on the previous
-release cannot decode, so it is refused with FailedPrecondition until the
-`sg_projects_v1` capability token has latched — on its own, once every host the
-cluster replicates to, including one parked in `maintenance`, runs this
-release. Global groups are created as before throughout. Every existing group
-stays global.
-
-`sg_projects_v1` is mandatory and replication-gated, with no flag. A binary
-rolled back below the latched token enters WAL quarantine, as below every
-latched token. Roll forward.
+release cannot decode, so it is the release feature `sg_projects`: refused
+with FailedPrecondition until `release_2026_11_v1` has latched, and its first
+use is recorded before the group is written. Global groups are created as
+before throughout, and every existing group stays global.
 
 ### Console passwords start after the roll
 

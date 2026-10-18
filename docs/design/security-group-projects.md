@@ -3,9 +3,9 @@
 | | |
 |---|---|
 | Status | **Implemented** |
-| Base | integration `458db618`, schema v68 |
-| Schema | one additive column, `security_groups.project` (v80, renumbered at merge) |
-| Token | `sg_projects_v1`: mandatory, replication-gated, no flag |
+| Base | integration `9eb7951f`, schema v69 |
+| Schema | one additive column, `security_groups.project` (v70, renumbered at merge) |
+| Gate | release feature `sg_projects` of `release_2026_11_v1` |
 
 ## 1. Data
 
@@ -15,8 +15,9 @@ only; nothing is rewritten or dropped).
 
 - `project = ''` is a **global** group. Every existing group migrates as
   global, and every group a stack creates is global.
-- `project = 'P'` is owned by project P. It is set at create and never
-  changed.
+- `project = 'P'` is owned by project P, which must exist; the group is stored
+  under the project's own name. It is set at create and never changed.
+- A project that still owns a group is not deleted (`lv project rm` refuses).
 - Group names stay unique cluster-wide, across projects. A NIC binds a group
   by name, so a name two groups hold is still held at drop (unchanged).
 
@@ -29,6 +30,8 @@ A group's path is `/` for a global group and
 |---|---|
 | `CreateSecurityGroup` | `sg.write` on the new group's path |
 | `DeleteSecurityGroup`, `AddSecurityGroupRule`, `RemoveSecurityGroupRule` | `sg.write` on the path of the group (for a rule, the rule's group); a rule no live group owns needs `/` |
+| `AddSecurityGroupRule` of an IPv6, logged or tag-group rule on a project group | also `sg.write` at `/`: it records a cluster-wide release-feature use, and a logged rule writes host logs |
+| `DeployStack` with a firewall block | `sg.write` at `/`: stack groups, ip sets and the default policy are global |
 | `ListSecurityGroups` | per row, below |
 
 `ListSecurityGroups`:
@@ -41,18 +44,20 @@ A group's path is `/` for a global group and
   rules stay readable only at `/`, as before. A caller with neither gets an
   empty list, not a refusal.
 
-`CreateSecurityGroup` refusing a duplicate name names the existing group's id
-only when the caller may read that group.
+`CreateSecurityGroup` and `DeployStack` refusing a duplicate name name the
+existing group's id only when the caller may read that group.
 
 ## 3. Which groups a workload may reference
 
 A workload in project W may bind a global group or a group owned by W, never
 another project's (`tenancy.AdmitAttach`, the network rule). Enforced twice:
 
-- **At write**, on the node that writes the binding: `CreateVM`,
-  `AttachDevice` (NIC), `BindSecurityGroups`, container create, VM import,
-  VM and container clone, and live restore refuse a foreign group with
-  `PermissionDenied`. A name no group holds is accepted, as before.
+- **At write**, on the node that writes the binding: `CreateVM`, VM
+  recreate, `AttachDevice` (NIC, at the entry and at the owner),
+  `BindSecurityGroups`, container create, VM and container clone, live
+  restore and container restore refuse a foreign group with
+  `PermissionDenied`. A name no group holds is accepted, as before. (VM import
+  carries no groups.)
 - **At render**, on every host: the firewall reconciler does not resolve a
   foreign project's group for a NIC; it is skipped like an unknown name and
   logged. This covers a binding made before the group existed (a name another
@@ -62,28 +67,14 @@ another project's (`tenancy.AdmitAttach`, the network rule). Enforced twice:
 
 The project-carrying insert is a new statement shape. A previous-release peer
 has no ledger entry for it and no `project` column, so its apply would fail
-closed and stall its stream. Corrosion therefore refuses to write a group with
-a project until `sg_projects_v1` has durably latched (`Client.SetSGProjectsGate`,
-wired to `Checker.DurablyLatched`); the RPC answers `FailedPrecondition`. A
-global group keeps the previous insert shape and is never gated.
-
-`sg_projects_v1`:
-
-- **Replication-gated** (`capabilities.replicationGated`): the claim is about
-  what every host still receiving replication can decode, a maintenance host
-  on the previous build included.
-- **Mandatory** (`capabilities.mandatory`), advertised unconditionally. It
-  states a fact about the binary: it decodes the column, refuses foreign
-  references at write and skips them at render. Both guarantees are enforced
-  on the node that writes or renders, so no node relies on a peer's config
-  and a flag would buy nothing; a flag-gated token withheld while off would
-  only keep the latch from forming.
-- Stand-down: none needed. Latching changes nothing until a project group is
-  created; removing such groups (`lv sg rm`) undoes the use.
-- Rollback below the latched token: WAL quarantine, as below every latched
-  token. Roll forward.
-- Retiring it later: move it from `All()` to `capabilities.retired` in the same
-  change, never delete the name, never reuse it.
+closed and stall its stream. A project group is therefore written only through
+the release feature `sg_projects` of `release_2026_11_v1`
+(`Server.WithReleaseFeature`, writer `corrosion.InsertProjectSecurityGroup`,
+which checks the feature's grant). Until the release token has latched the RPC
+answers `FailedPrecondition`; before the first project group the use is
+recorded and acknowledged by every replication recipient, so a rollback below
+the release quarantines only a cluster that created one. A global group keeps
+the previous insert shape and needs no feature.
 
 Before the latch, anti-entropy rows of `security_groups` sent from an upgraded
 node carry the `project` column, which a previous-release peer refuses as an
@@ -96,4 +87,8 @@ lv sg create <name> --project <P>   # owned by P; omit for a global group
 lv sg ls --project <P>              # P's groups and the global groups
 ```
 
-`lv sg ls` prints a PROJECT column (empty = global).
+`lv sg ls` prints a PROJECT column (empty = global). Against a daemon that
+does not declare the `sg_projects` feature (`GetUpgradeStatus`), `--project` is
+refused rather than creating a global group or listing unfiltered. The web UI
+takes a project on its create form and `?project=` on `/security-groups`, and
+the Add-NIC dialog lists the VM's project's groups and the global ones.

@@ -1193,9 +1193,12 @@ check `sg.write` on `/projects/<p>/security_groups/<name>` instead, so a
 NetworkAdmin bound on `/projects/<p>` manages it, and only `p`'s workloads may
 bind it. A NIC of any other project that names it is refused where the binding
 is written (create, NIC attach, `lv sg bind`, clone, restore) and is rendered
-without it. Group names stay unique across projects. Project groups need the
-`sg_projects_v1` capability token, which latches once every host runs this
-release (see [design/security-group-projects.md](design/security-group-projects.md)). Against a daemon
+without it. Group names stay unique across projects. A project's group must
+name an existing project, and an IPv6, logged or tag-group rule on one still
+needs `sg.write` at `/`. Project groups are the release feature `sg_projects`
+(see [design/security-group-projects.md](design/security-group-projects.md)).
+`lv compose up` of a stack with a firewall block needs `sg.write` at `/`: its
+groups, ip sets and default policy are global. Against a daemon
 older than these RPCs the four commands fail with an error saying to upgrade
 litevirtd; they do not fall back to writing the database.
 

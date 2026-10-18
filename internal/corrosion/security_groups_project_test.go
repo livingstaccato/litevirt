@@ -2,9 +2,10 @@ package corrosion
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 func sgProjectsDB(t *testing.T) *Client {
@@ -33,20 +34,22 @@ func loggedSGStatements(t *testing.T, db *Client) []string {
 }
 
 // A project group is a statement shape a previous-release peer cannot decode,
-// so it is refused, with nothing logged for replication, until sg_projects_v1
-// has latched. The gate fails closed when it was never wired.
-func TestInsertSecurityGroup_AProjectGroupWaitsForTheLatch(t *testing.T) {
+// so it is written only through the release feature sg_projects: without that
+// feature's grant it is refused with nothing logged for replication, and the
+// global writer never takes it.
+func TestInsertProjectSecurityGroup_NeedsTheFeaturesGrant(t *testing.T) {
 	ctx := context.Background()
 	db := sgProjectsDB(t)
+	row := SecurityGroup{ID: "sg-p", Name: "web", Project: "acme"}
 
-	err := InsertSecurityGroup(ctx, db, SecurityGroup{ID: "sg-p", Name: "web", Project: "acme"})
-	if !errors.Is(err, ErrSGProjectsNotLatched) {
-		t.Fatalf("project group with the gate unwired: %v, want ErrSGProjectsNotLatched", err)
+	if err := InsertProjectSecurityGroup(ctx, db, capabilities.FeatureGrant{}, row); err == nil {
+		t.Fatal("a project group was written with no grant")
 	}
-	db.SetSGProjectsGate(func() bool { return false })
-	err = InsertSecurityGroup(ctx, db, SecurityGroup{ID: "sg-p", Name: "web", Project: "acme"})
-	if !errors.Is(err, ErrSGProjectsNotLatched) {
-		t.Fatalf("project group with the gate closed: %v, want ErrSGProjectsNotLatched", err)
+	if err := InsertProjectSecurityGroup(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureFirewallLog), row); err == nil {
+		t.Fatal("a project group was written with another feature's grant")
+	}
+	if err := InsertSecurityGroup(ctx, db, row); err == nil {
+		t.Fatal("the global writer wrote a project group, bypassing the release feature")
 	}
 	if got, _ := GetSecurityGroup(ctx, db, "sg-p"); got != nil {
 		t.Fatalf("a refused project group was stored: %+v", got)
@@ -57,13 +60,13 @@ func TestInsertSecurityGroup_AProjectGroupWaitsForTheLatch(t *testing.T) {
 }
 
 // A global group keeps the previous release's statement shape, never names
-// the column and is never gated: a previous-release peer applies it.
+// the column and needs no feature: a previous-release peer applies it.
 func TestInsertSecurityGroup_AGlobalGroupKeepsThePreviousShape(t *testing.T) {
 	ctx := context.Background()
 	db := sgProjectsDB(t)
 
 	if err := InsertSecurityGroup(ctx, db, SecurityGroup{ID: "sg-g", Name: "base"}); err != nil {
-		t.Fatalf("global group with the gate unwired: %v", err)
+		t.Fatalf("global group: %v", err)
 	}
 	stmts := loggedSGStatements(t, db)
 	if len(stmts) != 1 {
@@ -78,14 +81,14 @@ func TestInsertSecurityGroup_AGlobalGroupKeepsThePreviousShape(t *testing.T) {
 	}
 }
 
-// Once latched, the project is stored and read back by every reader.
-func TestInsertSecurityGroup_AProjectGroupAfterTheLatch(t *testing.T) {
+// With the grant, the project is stored and read back by every reader.
+func TestInsertProjectSecurityGroup_StoresTheProject(t *testing.T) {
 	ctx := context.Background()
 	db := sgProjectsDB(t)
-	db.SetSGProjectsGate(func() bool { return true })
 
-	if err := InsertSecurityGroup(ctx, db, SecurityGroup{ID: "sg-p", Name: "web", Project: "acme"}); err != nil {
-		t.Fatalf("project group after the latch: %v", err)
+	if err := InsertProjectSecurityGroup(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureSGProjects),
+		SecurityGroup{ID: "sg-p", Name: "web", Project: "acme"}); err != nil {
+		t.Fatalf("project group with the grant: %v", err)
 	}
 	if got, err := GetSecurityGroup(ctx, db, "sg-p"); err != nil || got == nil || got.Project != "acme" {
 		t.Fatalf("GetSecurityGroup = %+v (%v), want project acme", got, err)
@@ -97,6 +100,29 @@ func TestInsertSecurityGroup_AProjectGroupAfterTheLatch(t *testing.T) {
 	stmts := loggedSGStatements(t, db)
 	if len(stmts) != 1 || !strings.Contains(stmts[0], "project") {
 		t.Fatalf("the project group's insert does not carry the project: %v", stmts)
+	}
+}
+
+// A project that still owns a security group is not deleted: a later project
+// of the same name would inherit the group and its rules.
+func TestDeleteProject_RefusesWhileItOwnsSecurityGroups(t *testing.T) {
+	ctx := context.Background()
+	db := sgProjectsDB(t)
+	if err := InsertProject(ctx, db, ProjectRecord{Name: "acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertProjectSecurityGroup(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureSGProjects),
+		SecurityGroup{ID: "sg-p", Name: "web", Project: "acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteProject(ctx, db, "acme"); err == nil || !strings.Contains(err.Error(), "security groups") {
+		t.Fatalf("DeleteProject with a live group: %v, want a refusal naming security groups", err)
+	}
+	if err := DeleteSecurityGroup(ctx, db, "sg-p"); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteProject(ctx, db, "acme"); err != nil {
+		t.Fatalf("DeleteProject once the group is gone: %v", err)
 	}
 }
 

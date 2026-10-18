@@ -13,7 +13,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// sgProjectsFixture is a server with sg_projects_v1 latched, a global group
+// sgProjectsFixture is a server with the sg_projects feature open, a global group
 // "base", a group "a-web" of project acme and "b-web" of project other, each
 // with one rule, and a real RBAC engine on which:
 //
@@ -30,7 +30,12 @@ func newSGProjectsFixture(t *testing.T) *sgProjectsFixture {
 	t.Helper()
 	ctx := context.Background()
 	s := testServer(t)
-	s.db.SetSGProjectsGate(func() bool { return true })
+	s.SetReleaseFeatureGate(fakeFeatureGate{t: t, grant: true})
+	for _, p := range []string{"acme", "other"} {
+		if err := corrosion.InsertProject(ctx, s.db, corrosion.ProjectRecord{Name: p}); err != nil {
+			t.Fatalf("InsertProject %s: %v", p, err)
+		}
+	}
 	if err := auth.SeedBuiltinRoles(ctx, s.db); err != nil {
 		t.Fatalf("SeedBuiltinRoles: %v", err)
 	}
@@ -117,6 +122,29 @@ func TestSGProjects_CreateIsAuthorizedOnTheGroupsProject(t *testing.T) {
 	wantSGCode(t, "a malformed project", err, codes.InvalidArgument)
 }
 
+// A project group names a project that exists, under the name its workloads
+// carry: a project nobody created, or another spelling of one, is refused.
+func TestSGProjects_CreateNeedsAnExistingProject(t *testing.T) {
+	f := newSGProjectsFixture(t)
+	for _, p := range []string{"ghost", "acme/", "/acme"} {
+		_, err := f.s.CreateSecurityGroup(f.root, &pb.CreateSecurityGroupRequest{Name: "g-" + strings.Trim(p, "/"), Project: p})
+		wantSGCode(t, "a group of project "+p, err, codes.NotFound)
+	}
+}
+
+// A rule that needs a release feature records that feature's cluster-wide
+// used bit, so on a project's group it needs sg.write at the root; a plain
+// rule does not.
+func TestSGProjects_AFeatureRuleOnAProjectGroupNeedsTheRoot(t *testing.T) {
+	f := newSGProjectsFixture(t)
+	v6 := &pb.SecurityGroupRule{SgId: f.aWeb.Id, Direction: "ingress", Proto: "tcp", Port: "443", Cidr: "2001:db8::/32", Action: "accept"}
+	_, err := f.s.AddSecurityGroupRule(f.alice, &pb.AddSecurityGroupRuleRequest{Rule: v6})
+	wantSGCode(t, "alice adds an IPv6 rule to her group", err, codes.PermissionDenied)
+	if _, err := f.s.AddSecurityGroupRule(f.root, &pb.AddSecurityGroupRuleRequest{Rule: v6}); err != nil {
+		t.Fatalf("root adds the IPv6 rule: %v", err)
+	}
+}
+
 // A duplicate name is refused across projects (a NIC binds by name), and the
 // refusal does not hand a caller the id of a group it may not read.
 func TestSGProjects_ADuplicateNameDoesNotLeakAnotherProjectsGroup(t *testing.T) {
@@ -133,14 +161,21 @@ func TestSGProjects_ADuplicateNameDoesNotLeakAnotherProjectsGroup(t *testing.T) 
 	}
 }
 
-// Until sg_projects_v1 latches a project group is refused as an upgrade still
-// in progress, and a global group is created as before.
+// Until the release feature sg_projects is available a project group is
+// refused as an upgrade still in progress, and a global group is created as
+// before.
 func TestSGProjects_AProjectGroupBeforeTheLatchIsFailedPrecondition(t *testing.T) {
 	s := testServer(t)
+	if err := corrosion.InsertProject(context.Background(), s.db, corrosion.ProjectRecord{Name: "acme"}); err != nil {
+		t.Fatal(err)
+	}
 	_, err := s.CreateSecurityGroup(adminCtx(), &pb.CreateSecurityGroupRequest{Name: "web", Project: "acme"})
 	wantSGCode(t, "a project group before the latch", err, codes.FailedPrecondition)
-	if !strings.Contains(err.Error(), "sg_projects_v1") {
-		t.Errorf("the refusal does not name the token: %v", err)
+	if !strings.Contains(err.Error(), "sg_projects") {
+		t.Errorf("the refusal does not name the feature: %v", err)
+	}
+	if g, _ := corrosion.ListSecurityGroups(context.Background(), s.db, ""); len(g) != 0 {
+		t.Fatalf("a refused project group was stored: %+v", g)
 	}
 	if _, err := s.CreateSecurityGroup(adminCtx(), &pb.CreateSecurityGroupRequest{Name: "web"}); err != nil {
 		t.Fatalf("a global group before the latch: %v", err)
@@ -264,5 +299,52 @@ func TestSGProjects_BindRefusesAnotherProjectsGroup(t *testing.T) {
 		VmName: "web", NetworkName: "lan", SecurityGroups: []string{"a-web", "base", "not-yet-created"},
 	}); err != nil {
 		t.Fatalf("alice binds her project's group and a global one: %v", err)
+	}
+}
+
+// A stack's firewall block writes global security groups and the cluster
+// default policy, so a deploy carrying one needs sg.write at the cluster root:
+// an Operator (sg.read only) is refused before anything is written; Admin is
+// not refused on that ground.
+func TestDeployStack_AFirewallBlockNeedsSGWriteAtTheRoot(t *testing.T) {
+	ctx := context.Background()
+	s := testServer(t)
+	if err := auth.SeedBuiltinRoles(ctx, s.db); err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range []struct{ user, role string }{{"opal", "Operator"}, {"ada", "Admin"}} {
+		if err := corrosion.InsertUser(ctx, s.db, g.user, "operator", "x"); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.InsertRoleBinding(ctx, s.db, corrosion.RoleBindingRecord{
+			ID: g.user, Path: "/", Role: g.role, Principal: "user:" + g.user + "@local", Propagate: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	engine := auth.NewEngine(s.db)
+	if err := engine.Reload(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s.SetAuthEngine(engine)
+	const yaml = `name: fwonly
+security-groups:
+  web:
+    rules:
+      - {direction: ingress, proto: tcp, port: "80", action: accept}
+firewall:
+  default-deny: true
+`
+	err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: yaml}, &mockDeployStreamR2{ctx: userCtx("opal", "operator")})
+	wantSGCode(t, "an Operator deploys a stack with a firewall", err, codes.PermissionDenied)
+	if !strings.Contains(err.Error(), "sg.write") {
+		t.Errorf("the refusal does not name sg.write: %v", err)
+	}
+	if g, _ := corrosion.ListSecurityGroups(ctx, s.db, ""); len(g) != 0 {
+		t.Fatalf("a refused deploy wrote security groups: %+v", g)
+	}
+	err = s.DeployStack(&pb.DeployStackRequest{ComposeYaml: yaml}, &mockDeployStreamR2{ctx: userCtx("ada", "operator")})
+	if status.Code(err) == codes.PermissionDenied {
+		t.Fatalf("Admin's deploy was refused: %v", err)
 	}
 }

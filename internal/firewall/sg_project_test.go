@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -18,14 +19,19 @@ func TestCorrosionPlanLoader_SkipsAnotherProjectsGroup(t *testing.T) {
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
-	db.SetSGProjectsGate(func() bool { return true })
 	for _, g := range []corrosion.SecurityGroup{
 		{ID: "sg-base", Name: "base"},
 		{ID: "sg-a", Name: "a-web", Project: "acme"},
 		{ID: "sg-b", Name: "b-web", Project: "other"},
 	} {
-		if err := corrosion.InsertSecurityGroup(ctx, db, g); err != nil {
-			t.Fatalf("InsertSecurityGroup %s: %v", g.Name, err)
+		insert := func() error { return corrosion.InsertSecurityGroup(ctx, db, g) }
+		if g.Project != "" {
+			insert = func() error {
+				return corrosion.InsertProjectSecurityGroup(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureSGProjects), g)
+			}
+		}
+		if err := insert(); err != nil {
+			t.Fatalf("insert %s: %v", g.Name, err)
 		}
 		if err := corrosion.InsertSGRule(ctx, db, corrosion.SGRule{ID: "r-" + g.ID, SGID: g.ID,
 			Direction: "ingress", Proto: "tcp", PortRange: "80", Action: "accept"}); err != nil {

@@ -24,22 +24,6 @@ type SecurityGroup struct {
 	UpdatedAt string
 }
 
-// ErrSGProjectsNotLatched refuses a project security group before
-// sg_projects_v1 has durably latched: its insert carries the project column,
-// which a previous-release peer cannot decode.
-var ErrSGProjectsNotLatched = errors.New("a project security group needs sg_projects_v1, which has not latched")
-
-// SetSGProjectsGate injects the predicate that permits writing a project
-// security group, wired to the durable sg_projects_v1 latch. Unset, it fails
-// closed.
-func (c *Client) SetSGProjectsGate(fn func() bool) { c.sgProjectsGate.Store(&fn) }
-
-// SGProjectsOn reports whether a project security group may be written here.
-func (c *Client) SGProjectsOn() bool {
-	fn := c.sgProjectsGate.Load()
-	return fn != nil && (*fn)()
-}
-
 // SGRule represents a security group rule.
 type SGRule struct {
 	ID        string
@@ -52,29 +36,43 @@ type SGRule struct {
 	Priority  int
 }
 
-// InsertSecurityGroup creates a new security group. A global group (no
-// project) is written in the previous release's shape; a project group names
-// the project column and is refused until sg_projects_v1 has latched
-// (ErrSGProjectsNotLatched).
+// InsertSecurityGroup creates a new GLOBAL security group, in the previous
+// release's statement shape. A project's group is written by
+// InsertProjectSecurityGroup.
 func InsertSecurityGroup(ctx context.Context, c *Client, sg SecurityGroup) error {
+	if sg.Project != "" {
+		return errors.New("a project security group is written by InsertProjectSecurityGroup, through the release feature sg_projects")
+	}
 	now := c.NowTS()
 	if sg.CreatedAt == "" {
 		sg.CreatedAt = nowRFC3339() // created_at is wall/display, never the HLC key
-	}
-	if sg.Project != "" {
-		if !c.SGProjectsOn() {
-			return ErrSGProjectsNotLatched
-		}
-		return c.Execute(ctx,
-			`INSERT INTO security_groups (id, name, stack_name, project, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
-			sg.ID, sg.Name, sg.StackName, sg.Project, sg.CreatedAt, now,
-		)
 	}
 	return c.Execute(ctx,
 		`INSERT INTO security_groups (id, name, stack_name, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?)`,
 		sg.ID, sg.Name, sg.StackName, sg.CreatedAt, now,
+	)
+}
+
+// InsertProjectSecurityGroup creates a security group owned by sg.Project
+// (docs/design/security-group-projects.md). Its insert names the project
+// column, which a previous-release peer cannot decode, so it is the release
+// feature sg_projects: g must be that feature's grant.
+func InsertProjectSecurityGroup(ctx context.Context, c *Client, g capabilities.FeatureGrant, sg SecurityGroup) error {
+	if err := g.Check(capabilities.FeatureSGProjects); err != nil {
+		return err
+	}
+	if sg.Project == "" {
+		return errors.New("a project security group needs a project")
+	}
+	now := c.NowTS()
+	if sg.CreatedAt == "" {
+		sg.CreatedAt = nowRFC3339() // created_at is wall/display, never the HLC key
+	}
+	return c.Execute(ctx,
+		`INSERT INTO security_groups (id, name, stack_name, project, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		sg.ID, sg.Name, sg.StackName, sg.Project, sg.CreatedAt, now,
 	)
 }
 

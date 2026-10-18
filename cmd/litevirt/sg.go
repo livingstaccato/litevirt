@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -11,8 +12,10 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/daemon"
 	"github.com/litevirt/litevirt/internal/firewall"
@@ -91,9 +94,18 @@ func newSGCreateCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if project != "" {
+					if err := requireSGProjects(ctx, c, "create"); err != nil {
+						return err
+					}
+				}
 				sg, err := c.CreateSecurityGroup(ctx, &pb.CreateSecurityGroupRequest{Name: args[0], StackName: stack, Project: project})
 				if err != nil {
 					return sgRPCError("create", err)
+				}
+				if sg.GetProject() != project {
+					return fmt.Errorf("lv sg create: asked for a group of project %q, and the daemon created %q (id %s) in project %q; "+
+						"remove it with `lv sg rm %s` and upgrade litevirtd on the host you are connected to", project, args[0], sg.GetId(), sg.GetProject(), sg.GetId())
 				}
 				fmt.Printf("Created security group %q (id=%s)\n", args[0], sg.Id)
 				return nil
@@ -103,6 +115,35 @@ func newSGCreateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&stack, "stack", "", "Limit the SG to one stack (default: cluster-wide)")
 	cmd.Flags().StringVar(&project, "project", "", "Project that owns the SG; only its workloads may bind it (default: global)")
 	return cmd
+}
+
+// errSGProjectsUnsupported is the refusal of --project against a daemon that
+// predates project security groups.
+type errSGProjectsUnsupported struct{ sub, why string }
+
+func (e errSGProjectsUnsupported) Error() string {
+	return fmt.Sprintf("lv sg %s --project: the daemon predates project security groups (%s); upgrade litevirtd on the host you are connected to", e.sub, e.why)
+}
+
+// requireSGProjects refuses --project against a daemon that predates project
+// security groups. Such a daemon drops the field it does not know: a create
+// would make a GLOBAL group every project may bind, and a listing would not be
+// filtered. The daemon's own release-feature list says whether it knows them.
+// A failure to ask is returned as it is.
+func requireSGProjects(ctx context.Context, c pb.LiteVirtClient, sub string) error {
+	st, err := c.GetUpgradeStatus(ctx, &emptypb.Empty{})
+	if err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			return errSGProjectsUnsupported{sub, "it has no upgrade status"}
+		}
+		return fmt.Errorf("lv sg %s --project: could not ask the daemon whether it supports project security groups: %w", sub, err)
+	}
+	for _, f := range st.GetFeatures() {
+		if f.GetName() == string(capabilities.FeatureSGProjects) && f.GetDeclared() {
+			return nil
+		}
+	}
+	return errSGProjectsUnsupported{sub, "it does not declare the " + string(capabilities.FeatureSGProjects) + " feature"}
 }
 
 // sgRPCError explains an Unimplemented reply. A daemon older than the
@@ -154,12 +195,26 @@ func newSGListCmd() *cobra.Command {
 func listSecurityGroups(cmd *cobra.Command, req *pb.ListSecurityGroupsRequest) (*pb.ListSecurityGroupsResponse, error) {
 	var resp *pb.ListSecurityGroupsResponse
 	asked := false
+	var unsupported error
 	err := withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+		if req.GetProject() != "" {
+			// A daemon that cannot be asked is handled below like any other.
+			if perr := requireSGProjects(ctx, c, "ls"); perr != nil {
+				var old errSGProjectsUnsupported
+				if errors.As(perr, &old) {
+					unsupported = perr
+					return perr
+				}
+			}
+		}
 		asked = true
 		var err error
 		resp, err = c.ListSecurityGroups(ctx, req)
 		return err
 	})
+	if unsupported != nil {
+		return nil, unsupported
+	}
 	var why string
 	switch {
 	case err == nil:

@@ -931,24 +931,6 @@ const (
 	// rewrite, so the latch is confirmed against every host this node
 	// replicates to, a maintenance host on the previous build included.
 	Release202611V1 = "release_2026_11_v1"
-
-	// SGProjectsV1 gates security groups owned by a project
-	// (docs/design/security-group-projects.md): the security_groups.project
-	// column (schema v80) and the insert shape that carries it, which a
-	// previous-release peer has no column or ledger entry for. Global groups
-	// keep the previous shape and are never gated.
-	//
-	// It states a fact about the BINARY, which is why it is mandatory and has
-	// no config flag: this build decodes the column, refuses a binding to
-	// another project's group where the binding is written, and skips one
-	// where the firewall is rendered. Both are enforced on the node that
-	// writes or renders, so no node relies on a peer's config; a flag would
-	// only keep the latch from forming.
-	//
-	// ReplicationGated: the insert must be decodable by every host still
-	// receiving replication, a maintenance host on the previous build
-	// included.
-	SGProjectsV1 = "sg_projects_v1"
 )
 
 // ReleaseToken is the release token of THIS build's release train: the token a
@@ -1188,11 +1170,6 @@ const ReleaseToken = Release202611V1
 //     dropped edit can be made again. A binary rolled back below it enters
 //     WAL quarantine, as below every latched token.
 //
-//   - sg_projects_v1 has no flag and needs no stand-down: latching it
-//     changes nothing until a project security group is created, and
-//     `lv sg rm` removes one. A binary rolled back below it enters WAL
-//     quarantine, as below every latched token.
-//
 //   - release_2026_11_v1 (the release token) has no flag and no stand-down of
 //     its own, and needs none: latching it changes nothing until a feature is
 //     USED, and every feature is opened through WithFeature, which records
@@ -1365,16 +1342,12 @@ var supported = []string{
 	// decodes, keeps and honours every field and shape of its release", a fact
 	// about the binary. What opens a feature is WithFeature, not a flag.
 	Release202611V1,
-	// SGProjectsV1 is advertised UNCONDITIONALLY: it says "this build decodes
-	// security_groups.project and keeps a workload off another project's
-	// group", a fact about the binary.
-	SGProjectsV1,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, LeaseTermClaimV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1, SpecConflictV1, SGProjectsV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, LeaseTermClaimV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1, SpecConflictV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -1484,10 +1457,6 @@ var replicationGated = map[string]bool{
 	// may write what a previous-release peer cannot decode or would drop on a
 	// rewrite. See Release202611V1.
 	Release202611V1: true,
-	// Confirmed against every replication recipient: the project-carrying
-	// security_groups insert must be decodable by every host we stream to.
-	// See SGProjectsV1.
-	SGProjectsV1: true,
 }
 
 // ReplicationGated reports whether token's latch must be confirmed by every
@@ -1566,9 +1535,6 @@ var mandatory = map[string]bool{
 	// fields and shapes). Nothing changes until a feature is used, and every
 	// use is recorded first. See Release202611V1.
 	Release202611V1: true,
-	// A fact about the binary (it decodes security_groups.project and keeps
-	// a workload off another project's group). See SGProjectsV1.
-	SGProjectsV1: true,
 }
 
 // Mandatory reports whether token is enforced with no config kill switch.

@@ -2,7 +2,6 @@ package grpcapi
 
 import (
 	"context"
-	"errors"
 	"sort"
 
 	"google.golang.org/grpc/codes"
@@ -10,6 +9,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -91,6 +91,20 @@ func (s *Server) CreateSecurityGroup(ctx context.Context, req *pb.CreateSecurity
 	if err := s.RequirePerm(ctx, sgRBACPath(project, req.Name), sgWriteVerb, "operator"); err != nil {
 		return nil, err
 	}
+	if project != "" {
+		// The group is stored under the project's own name, the one its
+		// workloads carry, so it must name a project that exists: a spelling
+		// such as "acme/" would bind no workload, and a group of a deleted
+		// project would pass to a later project of that name.
+		p, perr := corrosion.GetProject(ctx, s.db, project)
+		if perr != nil {
+			return nil, status.Errorf(codes.Unavailable, "look up project %q: %v", project, perr)
+		}
+		if p == nil {
+			return nil, status.Errorf(codes.NotFound, "project %q not found (lv project ls shows them)", project)
+		}
+		project = p.Name
+	}
 	// One live group per name. The firewall cannot tell which of two same-name
 	// groups a NIC meant, so it holds every NIC bound to such a name at drop;
 	// refusing here keeps that from being created. Best effort only — two
@@ -112,10 +126,18 @@ func (s *Server) CreateSecurityGroup(ctx context.Context, req *pb.CreateSecurity
 			req.Name, held.ID)
 	}
 	row := corrosion.SecurityGroup{ID: randid.New(), Name: req.Name, StackName: req.StackName, Project: project}
-	if err := corrosion.InsertSecurityGroup(ctx, s.db, row); err != nil {
-		if errors.Is(err, corrosion.ErrSGProjectsNotLatched) {
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"the cluster upgrade must finish first (a project security group needs sg_projects_v1, which latches once every host runs this release); a global group can be created now")
+	if project == "" {
+		if err := corrosion.InsertSecurityGroup(ctx, s.db, row); err != nil {
+			return nil, status.Errorf(codes.Internal, "create security group: %v", err)
+		}
+	} else if err := s.WithReleaseFeature(ctx, capabilities.FeatureSGProjects, func(ctx context.Context, g capabilities.FeatureGrant) error {
+		// The project column is a shape a previous-release peer cannot
+		// decode: the release feature waits for the release token and
+		// records the use first (docs/design/security-group-projects.md).
+		return corrosion.InsertProjectSecurityGroup(ctx, s.db, g, row)
+	}); err != nil {
+		if _, ok := status.FromError(err); ok && status.Code(err) != codes.Unknown {
+			return nil, err
 		}
 		return nil, status.Errorf(codes.Internal, "create security group: %v", err)
 	}
@@ -260,6 +282,17 @@ func (s *Server) AddSecurityGroupRule(ctx context.Context, req *pb.AddSecurityGr
 	}
 	row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
 	need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, "")
+	if sg.Project != "" && len(need) > 0 {
+		// A rule that needs a release feature (an IPv6, logged or tag-group
+		// rule) records that feature's cluster-wide used bit, and a logged
+		// rule writes host logs: both reach beyond the project, so they stay
+		// with sg.write at the cluster root.
+		if err := s.requireSGWrite(ctx); err != nil {
+			return nil, status.Errorf(codes.PermissionDenied,
+				"a rule that needs %v on a project's security group needs sg.write at the cluster root: %s",
+				need, status.Convert(err).Message())
+		}
+	}
 	if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
 		if err := s.refuseUnknownTagGroup(ctx, row.CIDR); err != nil {
 			return err

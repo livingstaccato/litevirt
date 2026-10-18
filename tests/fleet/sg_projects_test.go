@@ -6,7 +6,6 @@ package fleet
 import (
 	"context"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,19 +16,9 @@ import (
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/health"
 )
 
 const sgProjNet = "sgnet"
-
-// wireSGProjectsGates wires each node's corrosion gate to its own durable
-// sg_projects_v1 latch, as the daemon does (wireSGProjectsGate).
-func wireSGProjectsGates(c *Cluster, gates map[string]*health.Checker) {
-	for _, n := range c.Nodes {
-		g := gates[n.Name]
-		n.DB.SetSGProjectsGate(func() bool { return g.DurablyLatched(capabilities.SGProjectsV1) })
-	}
-}
 
 // projectNetworkAdminToken creates user with Operator and NetworkAdmin on
 // /projects/<project> only, reloads a real auth engine on every node, and
@@ -94,13 +83,7 @@ func TestFleet_SGProjects_AProjectCannotSeeUseOrAttachAnotherProjectsGroup(t *te
 		setHostCapacity(t, c, n.Name, 64, 65536)
 	}
 	gates := gateAll(t, c)
-	wireSGProjectsGates(c, gates)
 	latchOperationProtocol(t, c, gates)
-	for _, n := range c.Nodes {
-		if !gates[n.Name].Enforced(ctx, capabilities.SGProjectsV1) {
-			t.Fatalf("%s: sg_projects_v1 did not latch on a uniform fleet", n.Name)
-		}
-	}
 	src, entry := c.Nodes[0], c.Nodes[1]
 	admin := c.SelfClient(src)
 	if _, err := admin.CreateNetwork(ctx, &pb.CreateNetworkRequest{
@@ -194,48 +177,29 @@ func TestFleet_SGProjects_AProjectCannotSeeUseOrAttachAnotherProjectsGroup(t *te
 	}
 }
 
-// TestFleet_SGProjects_AMaintenanceHostOnThePreviousBuildHoldsProjectGroupsOff:
-// while one host this node replicates to — parked in maintenance, so it does
-// not vote but still receives every statement — runs a build without
-// sg_projects_v1, a project group is refused and nothing carrying the project
-// column reaches any replication stream; a global group is created as before
-// and reaches every host. Once that host is upgraded the token latches and the
-// project group is created and reaches every host, the former holdout included.
-func TestFleet_SGProjects_AMaintenanceHostOnThePreviousBuildHoldsProjectGroupsOff(t *testing.T) {
+// TestFleet_SGProjects_GatedOnTheReleaseToken drives the real
+// CreateSecurityGroup RPC against real checkers: while a host is on the
+// previous build the release token cannot latch, so a project group is refused
+// with the release text and nothing carrying the project column reaches any
+// replication stream, while a global group is created as before and reaches
+// every host. Once every host is on this build the use is recorded and
+// acknowledged by every replica, and the project group reaches every host.
+func TestFleet_SGProjects_GatedOnTheReleaseToken(t *testing.T) {
 	ctx := context.Background()
-	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 8008})
+	c, _ := latchedFleet(t, 3, 8008)
 	a, old := c.Nodes[0], c.Nodes[2]
-	if err := corrosion.UpdateHostState(ctx, a.DB, old.Name, "maintenance"); err != nil {
-		t.Fatal(err)
+	admin := c.SelfClient(a)
+	if _, err := admin.CreateProject(ctx, &pb.CreateProjectRequest{Name: "acme"}); err != nil {
+		t.Fatalf("CreateProject: %v", err)
 	}
 	c.WaitConverged(t, convergeTimeout)
 
-	var held atomic.Bool
-	held.Store(true)
-	gates := gateAll(t, c)
-	for _, n := range c.Nodes {
-		node := n
-		gates[node.Name].SetPeerPinger(func(ctx context.Context, host string) ([]string, time.Time, error) {
-			caps, wall, err := node.Server.PeerCapabilities(ctx, host)
-			if held.Load() && host == old.Name {
-				caps = withoutToken(caps, capabilities.SGProjectsV1)
-			}
-			return caps, wall, err
-		})
-	}
-	wireSGProjectsGates(c, gates)
-	ga := gates[a.Name]
-	if !ga.Enforced(ctx, capabilities.FailoverScopeV1) {
-		t.Fatal("failover_scope_v1 did not latch with every host advertising it; the rest is vacuous")
-	}
-	if ga.Enforced(ctx, capabilities.SGProjectsV1) {
-		t.Fatalf("sg_projects_v1 latched on %s while %s — in maintenance, still receiving replication — "+
-			"runs a build without it", a.Name, old.Name)
-	}
-
-	admin := c.SelfClient(a)
+	old.Server.SetWALQuarantined(func() bool { return true })
 	_, err := admin.CreateSecurityGroup(ctx, &pb.CreateSecurityGroupRequest{Name: "a-web", Project: "acme"})
-	wantSGFleetCode(t, "a project group mid-roll", err, codes.FailedPrecondition)
+	want := "the cluster upgrade must finish first (sg_projects needs " + capabilities.ReleaseToken + ")"
+	if status.Code(err) != codes.FailedPrecondition || err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("a project group with %s on the old build: %v, want %q", old.Name, err, want)
+	}
 	if _, err := admin.CreateSecurityGroup(ctx, &pb.CreateSecurityGroupRequest{Name: "base"}); err != nil {
 		t.Fatalf("a global group mid-roll: %v", err)
 	}
@@ -249,14 +213,20 @@ func TestFleet_SGProjects_AMaintenanceHostOnThePreviousBuildHoldsProjectGroupsOf
 	})
 	for _, n := range c.Nodes {
 		assertNoProjectSGStatement(t, n)
+		if featureUsedOn(t, n, capabilities.ReleaseToken, string(capabilities.FeatureSGProjects)) {
+			t.Fatalf("%s holds an sg_projects use that nothing wrote", n.Name)
+		}
 	}
 
-	held.Store(false) // the maintenance host is upgraded
-	eventually(t, 20*time.Second, "sg_projects_v1 latches once every recipient has rolled", func() bool {
-		return ga.Enforced(ctx, capabilities.SGProjectsV1)
+	old.Server.SetWALQuarantined(old.DB.WALQuarantined) // the host is upgraded
+	eventually(t, 15*time.Second, "the project group to be created on a uniform fleet", func() bool {
+		_, err = admin.CreateSecurityGroup(ctx, &pb.CreateSecurityGroupRequest{Name: "a-web", Project: "acme"})
+		return err == nil
 	})
-	if _, err := admin.CreateSecurityGroup(ctx, &pb.CreateSecurityGroupRequest{Name: "a-web", Project: "acme"}); err != nil {
-		t.Fatalf("a project group after the latch: %v", err)
+	for _, n := range c.Nodes {
+		if !featureUsedOn(t, n, capabilities.ReleaseToken, string(capabilities.FeatureSGProjects)) {
+			t.Fatalf("%s does not hold the sg_projects record although the group was written", n.Name)
+		}
 	}
 	eventually(t, convergeTimeout, "the project group on every host", func() bool {
 		for _, n := range c.Nodes {
@@ -287,5 +257,47 @@ func assertNoProjectSGStatement(t *testing.T, n *Node) {
 			t.Fatalf("%s put a project-carrying security_groups statement on its replication stream before "+
 				"the latch; a previous-release peer cannot decode it:\n%s", n.Name, s)
 		}
+	}
+}
+
+// TestFleet_SGProjects_AContainerRestoreRefusesAnotherProjectsGroup: a
+// container backup whose NIC names another project's group is not restored
+// into acme with that binding — the restore is refused where it is written,
+// as a clone is, rather than landing a binding only the firewall skips.
+func TestFleet_SGProjects_AContainerRestoreRefusesAnotherProjectsGroup(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	src, dst := c.Nodes[0], c.Nodes[1]
+	for _, n := range c.Nodes {
+		openNICGuards(t, n)
+		setHostCapacity(t, c, n.Name, 64, 65536)
+	}
+	admin := c.SelfClient(src)
+	for _, p := range []string{"acme", "other"} {
+		if _, err := admin.CreateProject(ctx, &pb.CreateProjectRequest{Name: p}); err != nil {
+			t.Fatalf("CreateProject %s: %v", p, err)
+		}
+	}
+	if _, err := admin.CreateSecurityGroup(ctx, &pb.CreateSecurityGroupRequest{Name: "b-web", Project: "other"}); err != nil {
+		t.Fatalf("create other's group: %v", err)
+	}
+	createSizedContainer(t, c, src, "ct", "acme", 0, 256)
+	// The archived NIC names other's group, as a backup taken before the
+	// group was created under that name would.
+	rec, _ := corrosion.GetContainer(ctx, src.DB, src.Name, "ct")
+	cs := corrosion.DecodeCreateSpec(rec.CreateSpec)
+	cs.Networks = []corrosion.ContainerNetwork{{Name: "eth0", Bridge: "br-raw", MAC: "02:00:00:00:00:31", SecurityGroups: []string{"b-web"}}}
+	rec.CreateSpec = corrosion.EncodeCreateSpec(cs)
+	if err := corrosion.UpsertContainer(ctx, src.DB, *rec); err != nil {
+		t.Fatal(err)
+	}
+	repo, ts := backupContainer(t, c, src, "ct")
+
+	err := restoreContainerAt(t, c, dst, repo, "ct", ts)
+	if status.Code(err) != codes.PermissionDenied || !strings.Contains(err.Error(), "b-web") {
+		t.Fatalf("restoring a container bound to other's group into acme: %v, want PermissionDenied naming b-web", err)
+	}
+	if row, _ := corrosion.GetContainer(ctx, dst.DB, dst.Name, "ct"); row != nil {
+		t.Fatalf("a refused restore landed a row on %s: %+v", dst.Name, row)
 	}
 }

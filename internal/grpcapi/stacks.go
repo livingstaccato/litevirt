@@ -64,6 +64,18 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 			f.Name, stackStateDeleting, f.Name)
 	}
 
+	// A firewall block writes global security groups, ip sets, cluster and host
+	// rules and the default policy, which a caller without sg.write at the
+	// cluster root may not write (lv sg create checks the same). Refused before
+	// anything is deployed.
+	if !req.DryRun && (len(f.SecurityGroups) > 0 || len(f.IPSets) > 0 || f.FirewallDefaults != nil) {
+		if err := s.requireSGWrite(ctx); err != nil {
+			return status.Errorf(codes.PermissionDenied,
+				"stack %q declares a firewall (security groups, ip sets or a default policy), which needs sg.write at the cluster root: %s",
+				f.Name, status.Convert(err).Message())
+		}
+	}
+
 	// Disk/NIC tuning in the file is refused before anything is deployed, rather
 	// than by the Nth VM's create after the first N-1 are up (the disk/NIC feature gate).
 	if err := s.refuseUnlatchedStackDiskNICIO(ctx, f); err != nil {
@@ -491,6 +503,11 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 			return fmt.Errorf("security-group %q: check for an existing group: %w", name, err)
 		}
 		if held != nil {
+			if !s.sgReadable(ctx, held) {
+				// Names are unique across projects; the holder of a group
+				// the caller may not read is not its to know.
+				return fmt.Errorf("security-group %q is already defined; names must be unique across projects", name)
+			}
 			owner := "lv sg create"
 			if held.StackName != "" {
 				owner = "stack " + strconv.Quote(held.StackName)

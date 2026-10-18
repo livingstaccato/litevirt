@@ -2319,7 +2319,7 @@ var schemaDDL = []string{
 		created_at  TEXT NOT NULL,
 		updated_at  TEXT NOT NULL,
 		deleted_at  TEXT,
-		-- project (v80) is LAST, for the v53 digest reason; '' = global.
+		-- project (v70) is LAST, for the v53 digest reason; '' = global.
 		project     TEXT NOT NULL DEFAULT ''
 	)`,
 

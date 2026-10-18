@@ -347,7 +347,8 @@ func TestGrantMinter_ClaimedOnce(t *testing.T) {
 // reviewed change to releaseFeatures and to this pin together.
 // (release_2026_11_v1 gained nic_guards and redfish_fence that way, and later
 // ha_disarm, nic_mtu and replication_rate, and then firewall_synflood, firewall_log
-// and firewall_tag_groups, and then host_incarnation, before it shipped.)
+// and firewall_tag_groups, and then host_incarnation, and then sg_projects,
+// before it shipped.)
 var frozenReleaseFeatures = map[string][]Feature{
 	Release202611V1: {
 		"backup_zstd",
@@ -368,6 +369,7 @@ var frozenReleaseFeatures = map[string][]Feature{
 		"redfish_fence",
 		"replication_rate",
 		"returning_boot",
+		"sg_projects",
 		"usb_mounts_memory",
 		"vm_disk_nic_io",
 		"vm_limits",
@@ -399,27 +401,5 @@ func TestReleaseFeatureSetIsFrozen(t *testing.T) {
 		if _, ok := frozenReleaseFeatures[tok]; !ok {
 			t.Errorf("features are declared under %s, which has no pinned list", tok)
 		}
-	}
-}
-
-// TestSGProjectsV1Registered pins sg_projects_v1: advertised, known,
-// mandatory (a fact about the binary — it decodes security_groups.project and
-// refuses or skips a foreign project's group itself) and replication-gated
-// (every recipient must decode the project-carrying insert).
-func TestSGProjectsV1Registered(t *testing.T) {
-	if SGProjectsV1 != "sg_projects_v1" {
-		t.Fatalf("SGProjectsV1 = %q, want %q: the marker name is frozen", SGProjectsV1, "sg_projects_v1")
-	}
-	if !slices.Contains(Supported(), SGProjectsV1) || !slices.Contains(All(), SGProjectsV1) {
-		t.Fatal("sg_projects_v1 missing from Supported() or All()")
-	}
-	if !Mandatory(SGProjectsV1) {
-		t.Fatal("sg_projects_v1 must be mandatory: it states what the binary decodes, and a flag would only keep it from latching")
-	}
-	if !ReplicationGated(SGProjectsV1) {
-		t.Fatal("sg_projects_v1 must be replication-gated: a maintenance host on the previous build still receives the insert")
-	}
-	if Retired(SGProjectsV1) {
-		t.Fatal("sg_projects_v1 is retired")
 	}
 }

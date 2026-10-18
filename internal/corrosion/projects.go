@@ -141,6 +141,16 @@ func DeleteProject(ctx context.Context, c *Client, name string) error {
 	if len(ctRows) > 0 {
 		return fmt.Errorf("project %q still owns containers; reassign or delete them first", name)
 	}
+	// Refuse if security groups still belong to it: a later project of the
+	// same name would otherwise inherit them and their rules.
+	sgRows, err := c.Query(ctx,
+		`SELECT 1 FROM security_groups WHERE project = ? AND deleted_at IS NULL LIMIT 1`, name)
+	if err != nil {
+		return err
+	}
+	if len(sgRows) > 0 {
+		return fmt.Errorf("project %q still owns security groups; delete them first (lv sg ls --project %s)", name, name)
+	}
 	// Retire the project's admission authority BEFORE tombstoning the project
 	// itself. Done in the other order, a delete that failed halfway would leave a
 	// gone project still holding live authority — the orphan state this prevents.

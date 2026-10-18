@@ -718,14 +718,12 @@ func (s *Server) requireSourceStateRecorded(m fwmig.Marker, action pb.FirmwareMo
 }
 
 // unmarkByOperator removes m's marker after an action resolved the move,
-// resolves the conditions its park and its cleanup raised, and records it.
+// resolves the conditions its parks and its cleanup raised, and records it.
 func (s *Server) unmarkByOperator(ctx context.Context, m fwmig.Marker, did string) error {
 	if err := s.fwRecords().RemoveMarker(m.VM); err != nil {
 		return status.Errorf(codes.Internal, "VM %q: %s, but its marker cannot be removed: %v", m.VM, did, err)
 	}
-	if code, ok := fwmigConditionFor[m.Phase]; ok {
-		_ = s.resolveFirmwareMigrationCondition(ctx, code, m.VM)
-	}
+	s.resolveFirmwareMoveParkConditions(ctx, m.VM)
 	_ = s.resolveFirmwareMigrationCondition(ctx, condFwmigCleanupFailed, m.VM)
 	s.recordVMEvent(ctx, m.VM, "vm.migrate.firmware", "ok", fmt.Sprintf("live firmware migration %s to %s: %s", m.Attempt, m.Target, did))
 	slog.Warn("firmware-move doctor: move resolved by an operator", "vm", m.VM, "attempt", m.Attempt, "target", m.Target, "how", did)
@@ -825,7 +823,8 @@ func (s *Server) doctorAcceptTarget(ctx context.Context, m fwmig.Marker) (string
 		if err := s.sourceDomainInactive(m, action); err != nil {
 			return "", err
 		}
-		dir, err := s.quarantineFirmwareMoveSource(ctx, m)
+		dir, err := s.quarantineFirmwareMoveSource(ctx, m,
+			"an operator took the target's copy (lv doctor firmware-move --accept-target); the source's state, changed after the cutover, is kept here")
 		if err != nil {
 			return "", err
 		}
@@ -850,7 +849,7 @@ func holdWord(h *fwmig.Hold) string {
 // leftover definition undefined (its state kept), the source state moved into
 // <data_dir>/fwmig-quarantine/<vm>-<attempt>/ with the marker and a reason
 // beside it. Nothing is deleted.
-func (s *Server) quarantineFirmwareMoveSource(ctx context.Context, m fwmig.Marker) (string, error) {
+func (s *Server) quarantineFirmwareMoveSource(ctx context.Context, m fwmig.Marker, why string) (string, error) {
 	if err := s.undefineLiveFirmwareLeftover(m); err != nil {
 		return "", status.Errorf(codes.FailedPrecondition, "VM %q: undefine the source's leftover definition: %v", m.VM, err)
 	}
@@ -858,15 +857,23 @@ func (s *Server) quarantineFirmwareMoveSource(ctx context.Context, m fwmig.Marke
 	if err != nil {
 		return "", status.Errorf(codes.Internal, "VM %q: %v", m.VM, err)
 	}
-	permall, nvram, _ := s.sourceStateHashes(m)
+	// Each part is hashed on its own: a missing NVRAM leaves the TPM
+	// state's hash recorded (lab2-D2-proof F6).
+	var permall, nvram string
+	if m.TPM {
+		permall, _ = s.fw().PermallSHA256(m.UUID)
+	}
+	if m.UEFI {
+		nvram, _ = s.fw().NvramSHA256(m.VM)
+	}
 	if err := s.fw().QuarantineFirmwareMoveSourceForOperator(m.VM, m.UUID, m.Attempt, dir); err != nil {
 		return "", status.Errorf(codes.Internal, "VM %q: quarantine the source's state: %v", m.VM, err)
 	}
 	mj, _ := json.MarshalIndent(m, "", "  ")
 	reason := fmt.Sprintf("vm: %s\nuuid: %s\ncreated_at: %s\nattempt: %s\nsource: %s\ntarget: %s\nphase: %s\nquarantined_at: %s\n"+
-		"reason: an operator took the target's copy (lv doctor firmware-move --accept-target); the source's state, changed after the cutover, is kept here\n"+
+		"reason: %s\n"+
 		"src_permall_sha256: %s\nsrc_nvram_sha256: %s\nquarantined_permall: %s\nquarantined_nvram: %s\n",
-		m.VM, m.UUID, m.CreatedAt, m.Attempt, s.hostName, m.Target, m.Phase, time.Now().UTC().Format(time.RFC3339),
+		m.VM, m.UUID, m.CreatedAt, m.Attempt, s.hostName, m.Target, m.Phase, time.Now().UTC().Format(time.RFC3339), why,
 		orNone(m.SrcPermallSHA256), orNone(m.SrcNvramSHA256), orNone(permall), orNone(nvram))
 	for name, data := range map[string][]byte{"marker.json": mj, "reason.txt": []byte(reason)} {
 		if err := writeFileDurable(filepath.Join(dir, name), data); err != nil {
@@ -998,7 +1005,8 @@ func (s *Server) doctorAdopt(ctx context.Context, m fwmig.Marker, actor string) 
 		// The source's state an adopted move leaves (missing, partial or
 		// suspect) is not the one the cutover recorded, so the cleanup cannot
 		// retain it: it is quarantined here instead, never wiped.
-		dir, err := s.quarantineFirmwareMoveSource(ctx, cur)
+		dir, err := s.quarantineFirmwareMoveSource(ctx, cur,
+			"an operator adopted the target's copy (lv doctor firmware-move --adopt-target-copy); what is left of the source's state is kept here")
 		if err != nil {
 			return "", err
 		}
@@ -1041,6 +1049,11 @@ func (s *Server) doctorAcceptSource(ctx context.Context, m fwmig.Marker, req *pb
 		return s.doctorAcceptSourcePaused(ctx, m)
 	case m.Phase == fwmig.PhaseNvramUnconfirmed:
 		return "", doctorRefuse(m, action, "the guest runs on the target: --confirm-target-nvram, or --push-source-nvram once it is powered off")
+	case m.Phase == fwmig.PhaseSourceStateMissing && fwPreCutover(from):
+		// The guest left the source: its copy is incomplete, and the target's
+		// may be the only complete one (lab2-D2-proof F7).
+		return "", doctorRefuse(m, action, "the source's final state is missing, so the target's copy may be the only complete one: "+
+			"--adopt-target-copy takes it; with the state back in place, the minute retry takes the move on")
 	case fwPreCutover(from):
 		return "", doctorRefuse(m, action, "before cutover the source's copy is current: `lv doctor firmware-move <vm> --discard-target`")
 	}

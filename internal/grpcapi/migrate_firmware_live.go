@@ -132,6 +132,21 @@ var fwmigConditionFor = map[fwmig.Phase]string{
 	fwmig.PhaseSourcePaused:   condFwmigSourcePaused,
 }
 
+// resolveFirmwareMoveParkConditions resolves every park condition of vm's
+// move, as the move ends: one raised for a park whose marker write failed,
+// or for a park the move left since, has no marker to resolve it later
+// (lab2-D2-proof F5).
+func (s *Server) resolveFirmwareMoveParkConditions(ctx context.Context, vm string) {
+	seen := map[string]bool{}
+	for _, code := range fwmigConditionFor {
+		if seen[code] {
+			continue
+		}
+		seen[code] = true
+		_ = s.resolveFirmwareMigrationCondition(ctx, code, vm)
+	}
+}
+
 // putLiveFirmwareMarker writes r's marker in phase p.
 func (s *Server) putLiveFirmwareMarker(r *liveFirmwareRun, p fwmig.Phase) error {
 	m := r.marker
@@ -421,6 +436,7 @@ func (s *Server) settleLiveFirmwareAbort(ctx context.Context, r *liveFirmwareRun
 // unmarkLiveFirmwareMove removes r's marker once nothing of the move is left
 // to resolve.
 func (s *Server) unmarkLiveFirmwareMove(r *liveFirmwareRun, how string) {
+	s.resolveFirmwareMoveParkConditions(context.Background(), r.marker.VM)
 	if err := s.fwRecords().RemoveMarker(r.marker.VM); err != nil {
 		slog.Error("live firmware move: resolved, but the marker cannot be removed; restart recovery removes it",
 			"vm", r.marker.VM, "attempt", r.marker.Attempt, "how", how, "error", err)
@@ -895,9 +911,7 @@ func (s *Server) resolveLiveFirmwareMoveByFenceLocked(ctx context.Context, m fwm
 	if err := s.fwRecords().RemoveMarker(vm); err != nil {
 		return false, err
 	}
-	if code, ok := fwmigConditionFor[m.Phase]; ok {
-		_ = s.resolveFirmwareMigrationCondition(ctx, code, vm)
-	}
+	s.resolveFirmwareMoveParkConditions(ctx, vm)
 	if cerr := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{
 		Code: condFwmigDiscardOwed, VM: vm, Attempt: m.Attempt, Source: s.hostName, Target: m.Target,
 		Detail: fmt.Sprintf("%s is proved off; the DISCARD of its copy is sent when it answers", m.Target),

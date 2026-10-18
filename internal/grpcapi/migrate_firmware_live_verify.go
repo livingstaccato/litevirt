@@ -385,7 +385,7 @@ func (s *Server) resumeReleased(ctx context.Context, resp *pb.ReleaseLiveFirmwar
 
 // confirmNvram is §6.6 step 6. UEFI: the NVRAM is hashed at once and every
 // releaseNvramPollEvery up to releaseNvramPollFor until it equals the
-// source's final NVRAM. Equal, or not UEFI, removes the hold (h, nil when a
+// source's final NVRAM, or the one an operator adopted with the hold. Equal, or not UEFI, removes the hold (h, nil when a
 // retry found none). Never equal sets it released_unconfirmed: the guest keeps
 // running, and the hold keeps refusing a start and a stop of it until an
 // operator resolves it. A caller gone mid-poll writes nothing: the hold stays
@@ -398,7 +398,7 @@ func (s *Server) confirmNvram(ctx context.Context, resp *pb.ReleaseLiveFirmwareT
 			sum, err := s.fw().NvramSHA256(vm)
 			if err == nil {
 				resp.NvramSha256 = sum
-				if sum == srcNvram {
+				if sum == srcNvram || adoptedNvram(h, sum) {
 					confirmed = true
 					break
 				}
@@ -434,6 +434,14 @@ func (s *Server) confirmNvram(ctx context.Context, resp *pb.ReleaseLiveFirmwareT
 		vm, s.hostName, orAbsent(resp.NvramSha256), srcNvram, releaseNvramPollFor)
 	slog.Warn("live firmware move: target NVRAM unconfirmed", "vm", vm, "detail", resp.Detail)
 	return resp, nil
+}
+
+// adoptedNvram: sum is the NVRAM an operator adopted with the hold (`lv
+// doctor firmware-move --adopt-target-copy`): the target's copy, which a
+// guest that ran there changed since the source's final NVRAM, is then the
+// VM's, and is what its release is confirmed against (lab2-D2-proof F4).
+func adoptedNvram(h *fwmig.Hold, sum string) bool {
+	return h != nil && h.Adoption != nil && h.Adoption.NvramSHA256 != "" && sum == h.Adoption.NvramSHA256
 }
 
 func orAbsent(sum string) string {

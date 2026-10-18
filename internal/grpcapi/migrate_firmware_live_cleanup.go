@@ -115,6 +115,7 @@ func (s *Server) fwmigCleanupSource(ctx context.Context, m fwmig.Marker) error {
 	// Resolved before the marker goes: a crash in between leaves the marker,
 	// which the retry finishes, never an open condition with no marker.
 	_ = s.resolveFirmwareMigrationCondition(ctx, condFwmigCleanupFailed, m.VM)
+	s.resolveFirmwareMoveParkConditions(ctx, m.VM)
 	if h := cleanupRemoveMarkerHook; h != nil {
 		h()
 	}

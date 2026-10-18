@@ -2,6 +2,9 @@ package grpcapi
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -98,4 +101,100 @@ func TestDoctorFirmwareMove_CleaningTargetFenced(t *testing.T) {
 		_, err := r.doctor(actAcceptSource, withAck)
 		r.refused(err, "recorded at cutover", before)
 	})
+}
+
+// lab2-D2-proof F4: --adopt-target-copy on target_ran, where the guest that
+// ran on the target wrote an EFI variable, so the target's NVRAM is no longer
+// the source's final one. The adopt records the target's NVRAM in the hold,
+// and the release is confirmed against it: the move resolves, with no
+// nvram_unconfirmed park after the adopt succeeded.
+//
+// Mutation: confirm against the source's final NVRAM only — the move parks
+// nvram_unconfirmed, red.
+func TestDoctorFirmwareMove_AdoptConfirmsTheAdoptedNvram(t *testing.T) {
+	r := newFwdRig(t, fwlOpts{})
+	run := r.crashAt(fwmig.PhaseCutover)
+	r.dstFake.SetState(fwlVM, libvirtfake.StateRunning)
+	r.write(r.dstStore.NvramPath(fwlVM), []byte("the target's guest wrote a variable"))
+	r.park(run, fwmig.PhaseTargetRan, "TARGET_RAN")
+	_, err := r.doctor(actAdopt)
+	r.resolved(err, "dst-host", "running")
+	if _, ok := r.hold(); ok {
+		t.Error("the target's hold is left")
+	}
+	requireNoFwmigCondition(t, r.src, condFwmigNvramUnconfirmed)
+}
+
+// lab2-D2-proof F5: a park whose marker write failed raises its condition
+// with the marker left in another phase; an operator exit then resolved only
+// the condition of the marker's phase, and the other stayed critical with no
+// move behind it. Every park condition of the VM is resolved when the move
+// ends.
+//
+// Mutation: resolve only the marker phase's condition on unmark — red.
+func TestDoctorFirmwareMove_ExitResolvesEveryParkCondition(t *testing.T) {
+	r := newFwdRig(t, fwlOpts{})
+	run := r.crashAt(fwmig.PhaseCommitted)
+	m := run.marker
+	if err := r.src.raiseFirmwareMigrationCondition(context.Background(), fwmigCondition{
+		Code: condFwmigNvramUnconfirmed, VM: fwlVM, Attempt: m.Attempt, Source: "src-host", Target: "dst-host",
+		Detail: "raised while the marker could not be written", Action: "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r.park(run, fwmig.PhaseTargetUnreachable, "Release was not answered")
+	r.fenceTarget()
+	_, err := r.doctor(actAcceptSource, withAck)
+	r.resolved(err, "src-host", "stopped")
+	requireNoFwmigCondition(t, r.src, condFwmigNvramUnconfirmed)
+	requireNoFwmigCondition(t, r.src, condFwmigTargetUnreachable)
+}
+
+// lab2-D2-proof F6: the source quarantine an adopt leaves names the adopt,
+// not --accept-target, and records the hash of each part that is there: a
+// missing NVRAM no longer drops the TPM state's hash.
+//
+// Mutations: the --accept-target reason text for the adopt — red; hash both
+// parts together (a missing NVRAM drops the permall hash) — red.
+func TestDoctorFirmwareMove_AdoptQuarantineRecordsTheAdopt(t *testing.T) {
+	r := newFwdRig(t, fwlOpts{})
+	run := r.crashAt(fwmig.PhaseMigrating)
+	r.land()
+	r.park(run, fwmig.PhaseSourceStateMissing, "the source's final NVRAM cannot be read")
+	if err := os.Remove(r.srcStore.NvramPath(fwlVM)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.doctor(actAdopt)
+	r.resolved(err, "dst-host", "running")
+	dir, _ := r.src.fwRecords().QuarantinePath(fwlVM, run.marker.Attempt)
+	b, err := os.ReadFile(filepath.Join(dir, "reason.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reason := string(b)
+	if !strings.Contains(reason, "--adopt-target-copy") || strings.Contains(reason, "--accept-target") {
+		t.Errorf("reason.txt names the wrong action:\n%s", reason)
+	}
+	if want := "quarantined_permall: " + fwtSHA(fwlPermall); !strings.Contains(reason, want) {
+		t.Errorf("reason.txt lacks %q:\n%s", want, reason)
+	}
+	if !strings.Contains(reason, "quarantined_nvram: none") {
+		t.Errorf("reason.txt does not record the missing NVRAM:\n%s", reason)
+	}
+}
+
+// lab2-D2-proof F7: --accept-source on a move parked source_state_missing
+// from migrating is refused, and the refusal no longer suggests
+// --discard-target, which would discard what may be the only complete copy.
+func TestDoctorFirmwareMove_SourceStateMissingAcceptSourceText(t *testing.T) {
+	r := newFwdRig(t, fwlOpts{})
+	run := r.crashAt(fwmig.PhaseMigrating)
+	r.land()
+	r.park(run, fwmig.PhaseSourceStateMissing, "the source's final NVRAM cannot be read")
+	before := r.snap()
+	_, err := r.doctor(actAcceptSource, withAck)
+	r.refused(err, "--adopt-target-copy", before)
+	if strings.Contains(err.Error(), "--discard-target") {
+		t.Errorf("the refusal suggests --discard-target: %v", err)
+	}
 }

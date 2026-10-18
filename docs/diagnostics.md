@@ -2681,6 +2681,16 @@ on the host that raised the condition; the file is re-read within 30 s. A file
 that cannot be read is never written over: the condition says so, the disks
 stay named from memory, and fixing or removing the file recovers.
 
+### A drain's live move timed out (`drain_move_timed_out`)
+
+`drain_move_timed_out` (evaluator `drain`, subject `host/<host>`, warning)
+names the VMs whose live move off a drained host did not finish within the
+VM's migration policy `timeout-sec` and was aborted. Each keeps running on
+that host; the drain did not shut it down for a cold move. Raise the VM's
+`timeout-sec`, move it with `lv migrate <vm> <target-host>`, or stop it with
+`lv stop <vm>` and run `lv host drain <host>` again. The condition is resolved
+by a drain of the host that has no such move, and by `lv host undrain <host>`.
+
 ### A VM's disk is missing on its own host (`vm_disk_missing`)
 
 A start on the VM's own host never boots it from a blank disk. This covers the

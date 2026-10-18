@@ -319,9 +319,14 @@ policy (bandwidth, auto-converge, maximum downtime) applies, and the
 `pre_migrate`/`post_migrate` hooks run: `post_migrate` runs once, naming the
 host the VM ended on — the target after the live move or after a cold move
 that a failed live attempt fell back to, or the drained host when the VM
-stayed there. Unlike `lv migrate`, a drain's live move applies no
-`timeout-sec`: it runs until libvirt finishes or fails it (bounding it is a
-tracked follow-up). After the cut-over the source's
+stayed there. A live move that outlives the VM's migration policy
+`timeout-sec` is aborted, as `lv migrate` aborts one, and is not followed by a
+cold move: the VM keeps running on the drained host, its result says so, and
+the drain goes on with the other VMs and ends incomplete, naming it. The host
+carries `drain_move_timed_out` (see [Diagnostics](diagnostics.md)) until a
+drain of it has no such move or `lv host undrain` runs. A move that libvirt
+completed before the abort took is recorded on the target, as any completed
+move. After the cut-over the source's
 cloud-init ISO is removed and DNS, load-balancer backends and VXLAN
 forwarding entries follow the VM, as for a migration. A live attempt that
 fails takes back the cloud-init ISO it put on the target before the cold move

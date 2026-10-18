@@ -80,8 +80,11 @@ func TestStrandedOn_AFirmwareVMIsNotPromisedARecovery(t *testing.T) {
 	}
 	for _, n := range []string{"fw-sb", "fw-tpm"} {
 		d := got[n]
+		// fd re-review N-I3: restore-from writes a bare disk and no firmware;
+		// restore-live --auto-start brings the NVRAM and TPM back.
 		if strings.Contains(d, "recovered at") || !strings.Contains(d, "never recovers") ||
-			!strings.Contains(d, "lv backup restore-from") {
+			!strings.Contains(d, "lv backup restore-live") || !strings.Contains(d, "--auto-start") ||
+			strings.Contains(d, "restore-from") {
 			t.Errorf("%s plan line = %q; want no promised recovery and the restore command", n, d)
 		}
 	}

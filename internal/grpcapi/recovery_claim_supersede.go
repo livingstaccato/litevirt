@@ -338,11 +338,12 @@ func stoppedOnDeadHostDetail(kind, name, host string) string {
 // Boot / vTPM VM on the host it removes. It carries no next attempt.
 func firmwareOnDeadHostDetail(name, host string) string {
 	return fmt.Sprintf("vm/%s uses Secure Boot / vTPM: failover never recovers it, because its firmware state "+
-		"(UEFI NVRAM, TPM) was kept on %s and is lost with it, and this removal does not change that. Restore it "+
-		"from a backup that carried its firmware (`lv backup restore-from --repo <repo> --vm %s --disk <disk> "+
-		"--timestamp <ts>`). If %s's disks survive, it returns with %s when the machine is added again under that "+
-		"name (`lv host add`). Otherwise remove it with `lv rm %s` and create it again",
-		name, host, name, host, host, name)
+		"(UEFI NVRAM, TPM) was kept on %s and is lost with it, and this removal does not change that. Restore it, "+
+		"firmware included, from a backup that carried it: `lv backup restore-live --repo <repo> --vm %s --disk "+
+		"<disk> --timestamp <ts> --auto-start --name <new>` (--name while this record still holds %s). If %s's "+
+		"disks survive, it returns with %s when the machine is added again under that name (`lv host add`). "+
+		"Otherwise remove it with `lv rm %s` and create it again",
+		name, host, name, name, host, host, name)
 }
 
 func (s *Server) strandedFor(ctx context.Context, kind, name, host, proofID string) *pb.StrandedRecovery {

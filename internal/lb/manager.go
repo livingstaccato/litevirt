@@ -25,6 +25,8 @@ type Manager struct {
 	lockDir    string
 	controlDir string
 	runtime    ProcessRuntime
+	// Nil in production; observes actual ownership boundaries in private fixtures.
+	ownershipObservation func(operation, event string)
 }
 
 // applyLocks serializes Apply/Remove per LB name. NewManager() is constructed
@@ -107,6 +109,9 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 	lk := lbLock(cfg.Name)
 	lk.Lock()
 	defer lk.Unlock()
+	if m.ownershipObservation != nil {
+		m.ownershipObservation("apply", "locked")
+	}
 	notifyPath := filepath.Join(m.configDir, cfg.Name+"-notify.sh")
 	if cfg.KeepSNAT {
 		_, err := os.Stat(notifyPath)
@@ -843,9 +848,16 @@ func TransportOf(cfg Config) Transport {
 	return Transport{Unicast: true, Iface: cfg.VRRPInterface, Src: cfg.UnicastSrc, Peers: cfg.UnicastPeers, VIPDev: cfg.Interface}
 }
 
-// KeepalivedTransport reads the VRRP transport of this LB's keepalived config
-// on disk; ok=false when there is no readable config.
+// KeepalivedTransport reads the last completed apply's VRRP transport while
+// serialized with Apply/Remove/Demote. An incomplete apply's candidate file
+// cannot prove the running transport; neither can an unreadable marker/config.
 func (m *Manager) KeepalivedTransport(name string) (t Transport, ok bool) {
+	lk := lbLock(name)
+	lk.Lock()
+	defer lk.Unlock()
+	if _, err := os.Stat(m.applyMarkerPath(name)); !os.IsNotExist(err) {
+		return Transport{}, false
+	}
 	data, err := os.ReadFile(filepath.Join(m.configDir, name+"-keepalived.conf"))
 	if err != nil {
 		return Transport{}, false

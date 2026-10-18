@@ -9,6 +9,14 @@ import (
 // ValidateAutomationState validates recovery data without live admission checks.
 // Historical imports preserve accepted decisions even when activation changed.
 func ValidateAutomationState(st ClaimVoterState) error {
+	// Structured values must be checked before any outbound representation can
+	// erase an empty-but-present legacy Proof. Historical pure Proof domains
+	// remain unchanged; Digest already defines these structured union rules.
+	if v := st.Value; v != nil && (v.Automation != nil || v.LeaseTerm != nil) {
+		if _, err := v.Digest(); err != nil {
+			return fmt.Errorf("corrupt structured claim state: %w", err)
+		}
+	}
 	if !st.Key.IsAutomation() {
 		if st.Value != nil && st.Value.Automation != nil {
 			return fmt.Errorf("automation state at another kind")

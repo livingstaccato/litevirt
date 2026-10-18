@@ -355,8 +355,12 @@ func (s *Server) remoteSignForced(ctx context.Context, host string, from int64, 
 		return corrosion.ForcedSignature{}, err
 	}
 	defer closer()
+	wireValue, err := valueToPB(&corrosion.ClaimValue{Config: &value})
+	if err != nil {
+		return corrosion.ForcedSignature{}, err
+	}
 	resp, err := cl.SignForcedVoterConfig(ctx, &pb.SignForcedVoterConfigRequest{FromGeneration: from,
-		Value: valueToPB(&corrosion.ClaimValue{Config: &value}).GetVoterConfig(), Lost: ev.Lost, Fences: fencesToPB(ev.Fences)})
+		Value: wireValue.GetVoterConfig(), Lost: ev.Lost, Fences: fencesToPB(ev.Fences)})
 	if err != nil {
 		return corrosion.ForcedSignature{}, err
 	}

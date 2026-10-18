@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -251,9 +252,21 @@ func (s *Server) vrrpRefused(ctx context.Context, cfg lb.Config, lbHosts []strin
 	if s.vrrpRefusedHosts == nil {
 		s.vrrpRefusedHosts = map[string][]string{}
 	}
-	s.vrrpRefusedHosts[name] = append([]string(nil), lbHosts...)
+	peers := canonicalVRRPPeers(lbHosts, s.hostName)
 	_, known := s.vrrpRefusedLBs[name]
+	changed := known && !slices.Equal(s.vrrpRefusedHosts[name], peers)
+	if changed {
+		// Answers authorize demotion only for the peers actually asked. A
+		// continuous refusal with a new set is a new evidence generation.
+		s.vrrpEpoch++
+		s.vrrpRefusedEpoch[name] = s.vrrpEpoch
+		delete(s.vrrpServing, name)
+	}
+	s.vrrpRefusedHosts[name] = peers
 	s.vrrpMu.Unlock()
+	if changed {
+		s.kickVRRPServing()
+	}
 	base := fmt.Sprintf("load balancer %q cannot run the cluster's unicast VRRP on %s: %v. "+
 		"Fix the host's recorded address (advertise_address) or the device holding it; where it cannot be on a local device (1:1 NAT, an address routed to lo), run `lv cluster vrrp-transport multicast`",
 		name, s.hostName, cause)
@@ -281,6 +294,21 @@ func (s *Server) vrrpRefused(ctx context.Context, cfg lb.Config, lbHosts []strin
 	}
 	s.setVRRPRefused(ctx, name, base+". No other LB host reports serving it on unicast (refused, down, unreachable or on an earlier build), so it runs here on multicast meanwhile")
 	return s.applyLBConfig(ctx, cfg)
+}
+
+// canonicalVRRPPeers identifies the question, independent of list order,
+// duplicate entries, or this host's position in the LB placement list.
+func canonicalVRRPPeers(hosts []string, self string) []string {
+	seen := map[string]bool{self: true}
+	var peers []string
+	for _, h := range hosts {
+		if !seen[h] {
+			seen[h] = true
+			peers = append(peers, h)
+		}
+	}
+	sort.Strings(peers)
+	return peers
 }
 
 // vrrpApplied resolves this LB's part of CondLBVRRPRefused.
@@ -584,12 +612,13 @@ func (s *Server) lbIfaceForIP(ip string) string {
 // lbVRRPStale reports whether an LB's keepalived config on disk renders
 // another transport from the one this host would render now: another mode,
 // device, source or set of peers (the policy changed, a peer was added or
-// removed, a host's address changed, an apply was missed). No readable config
-// is not stale: there is nothing to switch. It has no side effects.
+// removed, a host's address changed, an apply was missed). An unknown or
+// incomplete applied transport requires a retry even while the old child lives.
+// It has no side effects.
 func (s *Server) lbVRRPStale(ctx context.Context, rec corrosion.LBConfigRecord) bool {
 	have, ok := s.lbRenderedTransport(rec.Name)
 	if !ok {
-		return false
+		return true
 	}
 	hosts, _ := parseHostsJSON(rec.Hosts)
 	w, err := s.desiredVRRPTransport(ctx, hosts)

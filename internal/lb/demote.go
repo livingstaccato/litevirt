@@ -307,7 +307,19 @@ func parseKeepalivedVIP(config string) (vip string, prefix int, iface string, ok
 // DemoteByName demotes one LB by its rendered keepalived config: Demote with
 // the VIP and device that config assigns. No config is nothing to demote.
 func (m *Manager) DemoteByName(name string, keepalivedStopTimeout time.Duration) error {
+	if m.ownershipObservation != nil {
+		m.ownershipObservation("demote", "entry")
+	}
+	lk := lbLock(name)
+	if m.ownershipObservation != nil {
+		m.ownershipObservation("demote", "locking")
+	}
+	lk.Lock()
+	defer lk.Unlock()
 	data, err := os.ReadFile(filepath.Join(m.configDir, name+"-keepalived.conf"))
+	if m.ownershipObservation != nil {
+		m.ownershipObservation("demote", "read")
+	}
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -318,7 +330,7 @@ func (m *Manager) DemoteByName(name string, keepalivedStopTimeout time.Duration)
 	if !ok {
 		return fmt.Errorf("cannot parse the VIP of %s's keepalived config", name)
 	}
-	return m.Demote(Config{Name: name, VIP: vip, VIPPrefix: prefix, Interface: iface}, keepalivedStopTimeout)
+	return m.demoteLocked(Config{Name: name, VIP: vip, VIPPrefix: prefix, Interface: iface}, keepalivedStopTimeout)
 }
 
 // Demote drops this host's VIP for LB `name` when the host has lost quorum (Phase 2
@@ -338,9 +350,17 @@ func (m *Manager) DemoteByName(name string, keepalivedStopTimeout time.Duration)
 // "Address already absent" counts as success (we want the VIP GONE).
 func (m *Manager) Demote(cfg Config, keepalivedStopTimeout time.Duration) error {
 	lk := lbLock(cfg.Name)
+	if m.ownershipObservation != nil {
+		m.ownershipObservation("demote", "locking")
+	}
 	lk.Lock()
 	defer lk.Unlock()
+	return m.demoteLocked(cfg, keepalivedStopTimeout)
+}
 
+// demoteLocked retains the caller's per-LB ownership from tuple selection
+// through confirmed process exit and deletion of that exact tuple.
+func (m *Manager) demoteLocked(cfg Config, keepalivedStopTimeout time.Duration) error {
 	if err := m.stopKeepalivedConfirmed(cfg.Name, keepalivedStopTimeout); err != nil {
 		return fmt.Errorf("demote %s: %w", cfg.Name, err)
 	}

@@ -1022,6 +1022,7 @@ func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, n
 			Stage:          "planned",
 			Artifacts: map[string]string{
 				"mac":                    mac,
+				"vm_created_at":          vm.CreatedAt,
 				"nic_id":                 nicID,
 				"prior_active_xml":       priorActive,
 				"prior_inactive_xml":     priorInactive,
@@ -1117,7 +1118,7 @@ func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, n
 		return nil, status.Errorf(code, "nic detach for %q applied but its NIC guard record could not be retired; left recoverable: %v", vm.Name, err)
 	}
 
-	applied, cerr := s.db.CompleteVMOperation(ctx, vm.Name, opID, epoch, newGen)
+	applied, cerr := s.db.CompleteVMNICDetach(ctx, vm.Name, opID, epoch, newGen, vm.CreatedAt, mac)
 	if cerr != nil || !applied {
 		slog.Error("nic detach: completion could not be committed — left recoverable", "vm", vm.Name, "op", opID, "applied", applied, "error", cerr)
 		return nil, status.Errorf(codes.Internal, "nic detach for %q completed but could not be committed; left recoverable: %v", vm.Name, cerr)

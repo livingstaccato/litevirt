@@ -45,7 +45,25 @@ func TestLeaseAutomationMixedWireRefused(t *testing.T) {
 			if _, err := v.Digest(); err == nil {
 				t.Error("mixed durable union accepted")
 			}
-			raw, err := proto.Marshal(valueToPB(v))
+			if out, err := valueToPB(v); err == nil || out != nil {
+				t.Error("mixed outbound union was not explicitly refused")
+			}
+			// A peer can send malformed alternatives independently of our encoder.
+			// Preserve the original binary receive-side oracle using explicit fields.
+			incoming := &pb.RecoveryClaimValue{LeaseTermClaim: &pb.LeaseTermClaimValue{Key: "failover", Term: 7, Holder: "a"}}
+			switch name {
+			case "automation":
+				incoming.Automation = &pb.AutomationClaimValue{Envelope: a.Automation.Envelope}
+			case "lun":
+				incoming.Lun = &pb.LUNAllocationValue{}
+			case "config":
+				incoming.VoterConfig = &pb.VoterConfigValue{}
+			case "proof":
+				incoming.Id = "proof"
+			case "source":
+				incoming.SourceHost = "source"
+			}
+			raw, err := proto.Marshal(incoming)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -91,7 +109,7 @@ func TestLeaseAutomationMixedWireRefused(t *testing.T) {
 
 func TestLeaseAutomationWireEnvelopes(t *testing.T) {
 	for _, v := range []*corrosion.ClaimValue{wireAutomationValue(t), {LeaseTerm: &corrosion.LeaseTermValue{Key: "future_lease", Term: 17, Holder: "holder"}}} {
-		p := valueToPB(v)
+		p := mustValueToPB(t, v)
 		key := &pb.RecoveryClaimKey{TargetKind: "lease_term", TargetName: "future_lease", OwnerEpoch: 17}
 		if v.Automation != nil {
 			key = &pb.RecoveryClaimKey{TargetKind: "automation", TargetName: "cluster", OwnerEpoch: 1}
@@ -306,7 +324,7 @@ func TestLeaseWireImportRefusesWholeSource(t *testing.T) {
 				p.pingErr = errors.New("offline")
 			}
 			value := &corrosion.ClaimValue{LeaseTerm: &corrosion.LeaseTermValue{Key: "future_lease", Term: 7, Holder: "a"}}
-			p.messages = []*pb.RecoveryClaimState{{Header: true, Voter: "peer", Frozen: true, AdoptedGeneration: 1}, {Key: &pb.RecoveryClaimKey{TargetKind: "vm", TargetName: "ordinary", OwnerEpoch: 1}, Promised: &pb.ClaimBallot{Round: 1, Coordinator: "peer"}}, {Key: keyToPB(corrosion.LeaseTermClaimKey("future_lease", 7)), Value: valueToPB(value), ValueDigest: value.MustDigest(), Accepted: &pb.ClaimBallot{Round: 2, Coordinator: "a"}, Promised: &pb.ClaimBallot{Round: 9, Coordinator: "a"}}}
+			p.messages = []*pb.RecoveryClaimState{{Header: true, Voter: "peer", Frozen: true, AdoptedGeneration: 1}, {Key: &pb.RecoveryClaimKey{TargetKind: "vm", TargetName: "ordinary", OwnerEpoch: 1}, Promised: &pb.ClaimBallot{Round: 1, Coordinator: "peer"}}, {Key: keyToPB(corrosion.LeaseTermClaimKey("future_lease", 7)), Value: mustValueToPB(t, value), ValueDigest: value.MustDigest(), Accepted: &pb.ClaimBallot{Round: 2, Coordinator: "a"}, Promised: &pb.ClaimBallot{Round: 9, Coordinator: "a"}}}
 			s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) { return p, func() {}, nil }
 			out, err := s.fetchImportSource(context.Background(), "peer", 1)
 			if support == "v1" {
@@ -354,7 +372,7 @@ func TestLeaseWireInboundRefusesBeforeState(t *testing.T) {
 	if _, err = s.PrepareRecoveryClaim(peer, &pb.PrepareRecoveryClaimRequest{Key: keyToPB(k), Ballot: b, ConfigGeneration: 1}); status.Code(err) != codes.FailedPrecondition {
 		t.Fatal("inbound prepare wire refusal", err)
 	}
-	if _, err = s.AcceptRecoveryClaim(peer, &pb.AcceptRecoveryClaimRequest{Key: keyToPB(k), Ballot: b, Value: valueToPB(&v), ConfigGeneration: 1}); status.Code(err) != codes.FailedPrecondition {
+	if _, err = s.AcceptRecoveryClaim(peer, &pb.AcceptRecoveryClaimRequest{Key: keyToPB(k), Ballot: b, Value: mustValueToPB(t, &v), ConfigGeneration: 1}); status.Code(err) != codes.FailedPrecondition {
 		t.Fatal("inbound accept wire refusal", err)
 	}
 	nested, _ := proto.Marshal(&pb.LeaseTermClaimValue{Key: "failover", Term: 7, Holder: s.hostName})
@@ -484,11 +502,11 @@ func TestShippedLeaseField15Bytes(t *testing.T) {
 	if err != nil || got.LeaseTerm == nil || got.Automation != nil || got.LeaseTerm.Key != "failover" || got.LeaseTerm.Term != 17 || got.LeaseTerm.Holder != "a" {
 		t.Fatalf("shipped lease15 decoded incorrectly: %+v %v", got, err)
 	}
-	again, err := proto.Marshal(valueToPB(got))
+	again, err := proto.Marshal(mustValueToPB(t, got))
 	if err != nil || !bytes.Equal(raw, again) {
 		t.Fatalf("lease15 bytes changed: %x %v", again, err)
 	}
-	automation := valueToPB(wireAutomationValue(t))
+	automation := mustValueToPB(t, wireAutomationValue(t))
 	encoded, err := proto.Marshal(automation)
 	if err != nil {
 		t.Fatal(err)

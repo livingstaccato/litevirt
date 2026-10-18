@@ -279,9 +279,14 @@ func checkedValueFromPB(v *pb.RecoveryClaimValue) (*corrosion.ClaimValue, error)
 	return out, nil
 }
 
-func valueToPB(v *corrosion.ClaimValue) *pb.RecoveryClaimValue {
+func valueToPB(v *corrosion.ClaimValue) (*pb.RecoveryClaimValue, error) {
 	if v == nil {
-		return nil
+		return nil, nil
+	}
+	if v.Automation != nil || v.LeaseTerm != nil {
+		if _, err := v.Digest(); err != nil {
+			return nil, fmt.Errorf("invalid structured outbound claim value: %w", err)
+		}
 	}
 	out := &pb.RecoveryClaimValue{SourceHost: v.SourceHost}
 	if a := v.Automation; a != nil {
@@ -301,7 +306,7 @@ func valueToPB(v *corrosion.ClaimValue) *pb.RecoveryClaimValue {
 		out.DestHost, out.Coordinator, out.RelocationToken = p.DestHost, p.Coordinator, p.RelocationToken
 		out.FenceEpoch, out.OwnerEpoch, out.LeaseTerm, out.LeaseKey = p.FenceEpoch, p.OwnerEpoch, p.LeaseTerm, p.LeaseKey
 	}
-	return out
+	return out, nil
 }
 
 func acceptToPB(a *corrosion.ClaimAccept) *pb.ClaimAccept {
@@ -321,16 +326,24 @@ func acceptFromPB(a *pb.ClaimAccept) *corrosion.ClaimAccept {
 		CertPEM: a.GetCertPem(), Signature: a.GetSignature(), Key: keyFromPB(a.GetKey())}
 }
 
-func prepareToPB(r corrosion.PrepareResult) *pb.PrepareRecoveryClaimResponse {
+func prepareToPB(r corrosion.PrepareResult) (*pb.PrepareRecoveryClaimResponse, error) {
+	value, err := valueToPB(r.State.Value)
+	if err != nil {
+		return nil, err
+	}
 	out := &pb.PrepareRecoveryClaimResponse{
 		Promised: r.Promised, PromisedBallot: ballotToPB(r.PromisedBallot),
-		AcceptedBallot: ballotToPB(r.State.Accepted), AcceptedValue: valueToPB(r.State.Value),
+		AcceptedBallot: ballotToPB(r.State.Accepted), AcceptedValue: value,
 		Voter: r.Voter, VoterIncarnation: r.Incarnation, RefusalReason: r.Refusal, RefusalDetail: r.Detail,
 	}
 	if l := r.Legacy; l != nil {
-		out.LegacyAcceptedBallot, out.LegacyAcceptedValue = ballotToPB(l.Accepted), valueToPB(l.Value)
+		value, err := valueToPB(l.Value)
+		if err != nil {
+			return nil, err
+		}
+		out.LegacyAcceptedBallot, out.LegacyAcceptedValue = ballotToPB(l.Accepted), value
 	}
-	return out
+	return out, nil
 }
 
 func prepareFromPB(r *pb.PrepareRecoveryClaimResponse, key corrosion.ClaimKey) (corrosion.PrepareResult, error) {
@@ -502,7 +515,7 @@ func (s *Server) PrepareRecoveryClaim(ctx context.Context, req *pb.PrepareRecove
 	if err != nil {
 		return nil, err
 	}
-	return prepareToPB(res), nil
+	return prepareToPB(res)
 }
 
 // AcceptRecoveryClaim is phase 2 at this voter.
@@ -628,6 +641,10 @@ func (s *Server) localGetRecoveryClaim(ctx context.Context, key corrosion.ClaimK
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "read claim state: %v", err)
 	}
+	value, err := valueToPB(st.Value)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "encode claim state: %v", err)
+	}
 	inc, err := s.db.VoterIncarnation(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "read voter incarnation: %v", err)
@@ -640,7 +657,7 @@ func (s *Server) localGetRecoveryClaim(ctx context.Context, key corrosion.ClaimK
 	return &pb.GetRecoveryClaimResponse{
 		State: &pb.PrepareRecoveryClaimResponse{
 			PromisedBallot: ballotToPB(st.Promised), AcceptedBallot: ballotToPB(st.Accepted),
-			AcceptedValue: valueToPB(st.Value), Voter: s.hostName, VoterIncarnation: inc,
+			AcceptedValue: value, Voter: s.hostName, VoterIncarnation: inc,
 		},
 		Accept:            acceptToPB(st.Accept),
 		LastRefusalReason: reason, LastRefusalDetail: detail,
@@ -668,14 +685,23 @@ func (s *Server) ListRecoveryClaims(req *pb.ListRecoveryClaimsRequest, stream gr
 			break
 		}
 	}
+	// Validate every outbound value before sending even the import header.
+	values := make([]*pb.RecoveryClaimValue, len(src.States))
+	for i, st := range src.States {
+		value, err := valueToPB(st.Value)
+		if err != nil {
+			return status.Errorf(codes.Unavailable, "encode claim states: %v", err)
+		}
+		values[i] = value
+	}
 	if err := stream.Send(&pb.RecoveryClaimState{Header: true, Voter: src.Voter, Frozen: src.Frozen,
 		AdoptedGeneration: src.Adopted}); err != nil {
 		return err
 	}
-	for _, st := range src.States {
+	for i, st := range src.States {
 		if err := stream.Send(&pb.RecoveryClaimState{
 			Key: keyToPB(st.Key), Promised: ballotToPB(st.Promised), Accepted: ballotToPB(st.Accepted),
-			Value: valueToPB(st.Value), ValueDigest: st.ValueDigest,
+			Value: values[i], ValueDigest: st.ValueDigest,
 		}); err != nil {
 			return err
 		}
@@ -706,8 +732,12 @@ func (t serverClaimTransport) Prepare(ctx context.Context, voter string, key cor
 		return corrosion.PrepareResult{}, err
 	}
 	defer closer()
+	supersede, err := supersedeToPB(ev)
+	if err != nil {
+		return corrosion.PrepareResult{}, err
+	}
 	resp, err := cl.PrepareRecoveryClaim(ctx, &pb.PrepareRecoveryClaimRequest{
-		Key: keyToPB(key), Ballot: ballotToPB(b), ConfigGeneration: gen, Supersede: supersedeToPB(ev)})
+		Key: keyToPB(key), Ballot: ballotToPB(b), ConfigGeneration: gen, Supersede: supersede})
 	if err != nil {
 		return corrosion.PrepareResult{}, err
 	}
@@ -734,8 +764,12 @@ func (t serverClaimTransport) Accept(ctx context.Context, voter string, key corr
 		return corrosion.AcceptResult{}, err
 	}
 	defer closer()
+	value, err := valueToPB(&v)
+	if err != nil {
+		return corrosion.AcceptResult{}, err
+	}
 	resp, err := cl.AcceptRecoveryClaim(ctx, &pb.AcceptRecoveryClaimRequest{
-		Key: keyToPB(key), Ballot: ballotToPB(b), Value: valueToPB(&v), ConfigGeneration: gen})
+		Key: keyToPB(key), Ballot: ballotToPB(b), Value: value, ConfigGeneration: gen})
 	if err != nil {
 		return corrosion.AcceptResult{}, err
 	}

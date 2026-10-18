@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-// A NIC detach's header marks its MAC, and still does once the reaper has
-// tombstoned it: DetachedNICMACs reads reaped headers too.
+// A bound successful NIC detach marks its MAC after the reaper tombstones
+// both its header and completed step.
 //
 // Mutation: read live headers only (deleted_at IS NULL) — the reaped check
 // goes red.
@@ -29,7 +29,11 @@ func TestDetachedNICMACs_AReapedDetachStillMarksTheMAC(t *testing.T) {
 	if _, err := c.BeginVMOperation(ctx, op, "{}", 0, 0); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if _, err := c.CompleteVMOperation(ctx, "vm1", op.ID, 0, 1); err != nil {
+	vm, err := GetVM(ctx, c, "vm1")
+	if err != nil || vm == nil {
+		t.Fatal(vm, err)
+	}
+	if _, err := c.CompleteVMNICDetach(ctx, "vm1", op.ID, 0, 1, vm.CreatedAt, mac); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 	if got, err := DetachedNICMACs(ctx, c, "vm1", []string{strings.ToUpper(mac), "52:54:00:aa:dd:02"}); err != nil || !got[mac] || len(got) != 1 {
@@ -98,6 +102,13 @@ func TestNICModelSources_ReadsDetachesOnlyOnADisagreement(t *testing.T) {
 	const agree, differ = "52:54:00:aa:dd:01", "52:54:00:aa:dd:02"
 	ctx := context.Background()
 	c := testClient(t)
+	if err := InsertVM(ctx, c, VMRecord{Name: "vm1", HostName: "h1", State: "stopped", Spec: "{}"}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	vm, err := GetVM(ctx, c, "vm1")
+	if err != nil || vm == nil {
+		t.Fatal(vm, err)
+	}
 	for _, n := range []NICRecord{
 		{VMName: "vm1", ID: DeterministicNICID("vm1", agree), NetworkName: "lan", Model: "e1000", MAC: agree},
 		{VMName: "vm1", ID: DeterministicNICID("vm1", differ), NetworkName: "lan2", Model: "virtio", MAC: differ, Ordinal: 1},
@@ -107,9 +118,12 @@ func TestNICModelSources_ReadsDetachesOnlyOnADisagreement(t *testing.T) {
 		}
 	}
 	for i, mac := range []string{agree, differ} {
-		if err := InsertOperation(ctx, c, OperationRecord{ID: "op-" + mac, Method: "DetachDevice", ResourceKind: "vm",
-			ResourceID: "vm1", OperationKind: string(OpDeviceDetach), RequestHash: NICDetachRequestHash("vm1", mac)}); err != nil {
-			t.Fatalf("InsertOperation %d: %v", i, err)
+		op := OperationRecord{ID: "op-" + mac, Method: "DetachDevice", ResourceKind: "vm", ResourceID: "vm1", OperationKind: string(OpDeviceDetach), RequestHash: NICDetachRequestHash("vm1", mac)}
+		if applied, err := c.BeginVMOperation(ctx, op, vm.Spec, 0, int64(i)); err != nil || !applied {
+			t.Fatal(applied, err)
+		}
+		if applied, err := c.CompleteVMNICDetach(ctx, "vm1", op.ID, 0, int64(i+1), vm.CreatedAt, mac); err != nil || !applied {
+			t.Fatal(applied, err)
 		}
 	}
 	nics, err := MergedVMNICs(ctx, c, "vm1")

@@ -624,6 +624,12 @@ func (s *Server) recoverDiskDetach(ctx context.Context, vm *corrosion.VMRecord, 
 }
 
 func (s *Server) recoverNICDetach(ctx context.Context, vm *corrosion.VMRecord, view *corrosion.VMOperationView, entry *opjournal.Entry) {
+	// An old journal has no incarnation authority. In particular, a reused name,
+	// operation ID, and reset epoch cannot authorize detaching a replacement VM.
+	if entry.Kind != "device_detach" || entry.ResourceID != vm.Name || entry.OperationID != view.ActiveOperationID || entry.SpecGeneration != view.SpecGeneration || entry.Artifacts["vm_created_at"] == "" || entry.Artifacts["vm_created_at"] != vm.CreatedAt || view.Operation == nil || view.Operation.RequestHash != corrosion.NICDetachRequestHash(vm.Name, entry.Artifacts["mac"]) {
+		slog.Error("hardware op recovery: NIC provenance unresolved; explicit recovery required before detach", "vm", vm.Name, "op", view.ActiveOperationID)
+		return
+	}
 	disp := s.recoveryDomainDisposition(vm.Name)
 	if disp == dispDefer {
 		slog.Warn("hardware op recovery: domain not definitely running/shutoff; leaving nic detach recoverable, will retry", "vm", vm.Name, "op", view.ActiveOperationID)
@@ -674,7 +680,17 @@ func (s *Server) recoverNICDetach(ctx context.Context, vm *corrosion.VMRecord, v
 		slog.Error("hardware op recovery: nic detach guard record not retired — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", err)
 		return
 	}
-	s.completeRecoveredOp(ctx, vm.Name, view, corrosion.OpDeviceDetach)
+	s.appendOpStep(ctx, view.ActiveOperationID, view.OwnerEpoch, corrosion.OpDeviceDetach, corrosion.OpStepAttached)
+	applied, err := s.db.CompleteVMNICDetach(ctx, vm.Name, view.ActiveOperationID, view.OwnerEpoch, view.SpecGeneration, entry.Artifacts["vm_created_at"], mac)
+	if err != nil || !applied {
+		slog.Error("hardware op recovery: NIC provenance completion not committed; left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "applied", applied, "error", err)
+		return
+	}
+	if s.opJournal != nil {
+		if err := s.opJournal.Remove(view.ActiveOperationID); err != nil {
+			slog.Warn("hardware op recovery: clear NIC journal entry", "vm", vm.Name, "op", view.ActiveOperationID, "error", err)
+		}
+	}
 }
 
 func (s *Server) recoverPCIDetach(ctx context.Context, vm *corrosion.VMRecord, view *corrosion.VMOperationView, entry *opjournal.Entry) {

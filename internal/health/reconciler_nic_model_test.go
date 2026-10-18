@@ -99,12 +99,7 @@ func TestDomainXMLFor_AReattachedMACTakesItsNewModel(t *testing.T) {
 				t.Fatalf("InsertVM: %v", err)
 			}
 			if tc.detached {
-				if err := corrosion.InsertOperation(ctx, db, corrosion.OperationRecord{ID: "op-detach",
-					Method: "DetachDevice", ResourceKind: "vm", ResourceID: "vm1",
-					OperationKind: string(corrosion.OpDeviceDetach),
-					RequestHash:   corrosion.NICDetachRequestHash("vm1", mac)}); err != nil {
-					t.Fatalf("InsertOperation: %v", err)
-				}
+				recordBoundNICDetach(t, ctx, db, "vm1", mac)
 			}
 			spec := &pb.VMSpec{Name: "vm1", Cpu: 1, MemoryMib: 512,
 				Network: []*pb.NetworkAttachment{{Name: "br0", Model: tc.spec, Mac: mac}}}
@@ -176,12 +171,7 @@ func TestDomainXMLFor_AStackVMsSwappedNICDefinesWithoutTheOldTuning(t *testing.T
 			NetworkName: "br0", Model: "e1000", MAC: mac, Ordinal: 0}}, nil, false); err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
-	if err := corrosion.InsertOperation(ctx, db, corrosion.OperationRecord{ID: "op-detach",
-		Method: "DetachDevice", ResourceKind: "vm", ResourceID: "vm1",
-		OperationKind: string(corrosion.OpDeviceDetach),
-		RequestHash:   corrosion.NICDetachRequestHash("vm1", mac)}); err != nil {
-		t.Fatalf("InsertOperation: %v", err)
-	}
+	recordBoundNICDetach(t, ctx, db, "vm1", mac)
 	spec := &pb.VMSpec{Name: "vm1", Cpu: 2, MemoryMib: 512,
 		Network: []*pb.NetworkAttachment{{Name: "br0", Model: "virtio", Mac: mac, Mtu: 9000, Queues: 4}}}
 	x, _, failure := r.domainXMLFor(ctx, vm, spec, nil)
@@ -190,5 +180,23 @@ func TestDomainXMLFor_AStackVMsSwappedNICDefinesWithoutTheOldTuning(t *testing.T
 	}
 	if !strings.Contains(x, `"e1000"`) || strings.Contains(x, "<mtu") || strings.Contains(x, "queues=") {
 		t.Fatalf("want an e1000 NIC with no MTU and no queues:\n%s", x)
+	}
+}
+
+// The renderer fixture represents a successful detach, not merely admission.
+// Use the stored original incarnation and the same atomic completion as the
+// handler; no fixture timestamp or unbound completed step supplies authority.
+func recordBoundNICDetach(t *testing.T, ctx context.Context, db *corrosion.Client, name, mac string) {
+	t.Helper()
+	vm, err := corrosion.GetVM(ctx, db, name)
+	if err != nil || vm == nil || vm.CreatedAt == "" {
+		t.Fatalf("read original VM: vm=%v err=%v", vm, err)
+	}
+	op := corrosion.OperationRecord{ID: "op-detach", Method: "DetachDevice", ResourceKind: "vm", ResourceID: name, OperationKind: string(corrosion.OpDeviceDetach), RequestHash: corrosion.NICDetachRequestHash(name, mac)}
+	if applied, err := db.BeginVMOperation(ctx, op, vm.Spec, vm.OwnerEpoch, vm.SpecGeneration); err != nil || !applied {
+		t.Fatalf("begin detach: applied=%v err=%v", applied, err)
+	}
+	if applied, err := db.CompleteVMNICDetach(ctx, name, op.ID, vm.OwnerEpoch, vm.SpecGeneration+1, vm.CreatedAt, mac); err != nil || !applied {
+		t.Fatalf("complete bound detach: applied=%v err=%v", applied, err)
 	}
 }

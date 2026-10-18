@@ -146,14 +146,19 @@ func TestNICMTU_AStackVMsSwappedNICIsFoundByItsMAC(t *testing.T) {
 			NetworkName: "lan", Model: "e1000", MAC: mac, Ordinal: 1}}, nil, false); err != nil {
 		t.Fatalf("insert VM: %v", err)
 	}
-	if err := corrosion.InsertOperation(ctx, s.db, corrosion.OperationRecord{ID: "op-detach",
-		Method: "DetachDevice", ResourceKind: "vm", ResourceID: "app",
-		OperationKind: string(corrosion.OpDeviceDetach),
-		RequestHash:   corrosion.NICDetachRequestHash("app", mac)}); err != nil {
-		t.Fatalf("InsertOperation: %v", err)
+	current, err := corrosion.GetVM(ctx, s.db, "app")
+	if err != nil || current == nil {
+		t.Fatal(current, err)
+	}
+	op := corrosion.OperationRecord{ID: "op-detach", Method: "DetachDevice", ResourceKind: "vm", ResourceID: "app", OperationKind: string(corrosion.OpDeviceDetach), RequestHash: corrosion.NICDetachRequestHash("app", mac)}
+	if applied, err := s.db.BeginVMOperation(ctx, op, current.Spec, current.OwnerEpoch, current.SpecGeneration); err != nil || !applied {
+		t.Fatal(applied, err)
+	}
+	if applied, err := s.db.CompleteVMNICDetach(ctx, "app", op.ID, current.OwnerEpoch, current.SpecGeneration+1, current.CreatedAt, mac); err != nil || !applied {
+		t.Fatal(applied, err)
 	}
 
-	_, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "app", NicMtu: []*pb.NICMTUUpdate{{Ordinal: 0, Mtu: 9000}}})
+	_, err = s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "app", NicMtu: []*pb.NICMTUUpdate{{Ordinal: 0, Mtu: 9000}}})
 	if status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "this NIC is e1000") {
 		t.Fatalf("an MTU on the stack VM's e1000 NIC at ordinal 1: err %v, want InvalidArgument naming e1000", err)
 	}

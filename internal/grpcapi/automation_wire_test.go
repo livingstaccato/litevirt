@@ -24,7 +24,7 @@ func TestAutomationLUNBinaryRoundtrip(t *testing.T) {
 			v.LUN.Project = "project"
 			v.LUN.ReplacedCreatedAt = "created"
 		}
-		b, err := proto.Marshal(valueToPB(v))
+		b, err := proto.Marshal(mustValueToPB(t, v))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -69,7 +69,7 @@ func wireAutomationValue(t *testing.T) *corrosion.ClaimValue {
 // Mutation: drop complete bytes, silently select a legacy alternative, or swallow decode errors.
 func TestAutomationBinaryTransport(t *testing.T) {
 	v := wireAutomationValue(t)
-	b, err := proto.Marshal(valueToPB(v))
+	b, err := proto.Marshal(mustValueToPB(t, v))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,12 +147,12 @@ func TestAutomationLargestRecoveryMessages(t *testing.T) {
 	key := &pb.RecoveryClaimKey{TargetKind: "automation", TargetName: "cluster", OwnerEpoch: math.MaxInt64}
 	ballot := &pb.ClaimBallot{Round: math.MaxInt64, Coordinator: strings.Repeat("n", 4096), BootNonce: make([]byte, 256)}
 	accept := &pb.ClaimAccept{Voter: strings.Repeat("n", 4096), VoterIncarnation: strings.Repeat("i", 4096), ConfigGeneration: math.MaxInt64, Key: key, Ballot: ballot, ValueDigest: strings.Repeat("d", 64), CertPem: strings.Repeat("c", 64<<10), Signature: make([]byte, 256)}
-	prepare := &pb.PrepareRecoveryClaimResponse{Promised: true, PromisedBallot: ballot, AcceptedBallot: ballot, AcceptedValue: valueToPB(v), Voter: accept.Voter, VoterIncarnation: accept.VoterIncarnation}
+	prepare := &pb.PrepareRecoveryClaimResponse{Promised: true, PromisedBallot: ballot, AcceptedBallot: ballot, AcceptedValue: mustValueToPB(t, v), Voter: accept.Voter, VoterIncarnation: accept.VoterIncarnation}
 	for _, m := range []proto.Message{
-		&pb.AcceptRecoveryClaimRequest{Key: key, Ballot: ballot, Value: valueToPB(v), ConfigGeneration: math.MaxInt64},
+		&pb.AcceptRecoveryClaimRequest{Key: key, Ballot: ballot, Value: mustValueToPB(t, v), ConfigGeneration: math.MaxInt64},
 		prepare,
 		&pb.GetRecoveryClaimResponse{State: prepare, Accept: accept, Reattested: accept, AdoptedGeneration: math.MaxInt64},
-		&pb.RecoveryClaimState{Key: key, Promised: ballot, Accepted: ballot, Value: valueToPB(v), ValueDigest: accept.ValueDigest, Voter: accept.Voter, AdoptedGeneration: math.MaxInt64},
+		&pb.RecoveryClaimState{Key: key, Promised: ballot, Accepted: ballot, Value: mustValueToPB(t, v), ValueDigest: accept.ValueDigest, Voter: accept.Voter, AdoptedGeneration: math.MaxInt64},
 	} {
 		b, err := proto.Marshal(m)
 		t.Logf("%T: %d bytes (storage JSON %d bytes)", m, len(b), len(encoded))
@@ -259,4 +259,14 @@ func TestAutomationPrefixCombinedMessageBounds(t *testing.T) {
 	if _, err := decodeAutomationRecord(tooLarge); err == nil {
 		t.Fatal("oversize combined record decoded")
 	}
+}
+
+// Valid-fixture adapter; production conversion errors must never be ignored.
+func mustValueToPB(t *testing.T, v *corrosion.ClaimValue) *pb.RecoveryClaimValue {
+	t.Helper()
+	out, err := valueToPB(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
 }

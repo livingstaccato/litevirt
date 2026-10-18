@@ -2,6 +2,7 @@ package firewall
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -65,11 +66,51 @@ func (n NftBinary) Apply(ctx context.Context, ruleset string) (string, error) {
 	return string(out), err
 }
 
-// DropNICTable deletes the per-NIC bridge table if one exists. A failed
-// listing means there is none (or no bridge family to hold one), which is not
-// an error; a failed delete of a table that exists is.
+// DropNICTable deletes the per-NIC bridge table if a successful inventory
+// proves it exists. A failed listing cannot prove absence: the old table may
+// still mark guest packets, so the applier must retain its inet protection.
 func (n NftBinary) DropNICTable(ctx context.Context) error {
-	if err := cmdbound.Run(ctx, cmdbound.Command(ctx, n.bin(), "list", "table", "bridge", NICTableName)); err != nil {
+	out, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, n.bin(), "-j", "list", "tables"))
+	if err != nil {
+		return fmt.Errorf("inventory stale per-NIC table: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	var inventory struct {
+		NFTables []map[string]json.RawMessage `json:"nftables"`
+	}
+	if err := json.Unmarshal(out, &inventory); err != nil {
+		return fmt.Errorf("decode nft table inventory: %w", err)
+	}
+	if inventory.NFTables == nil {
+		return fmt.Errorf("nft table inventory omitted nftables")
+	}
+	present := false
+	for _, entry := range inventory.NFTables {
+		if len(entry) != 1 {
+			return fmt.Errorf("invalid nft table inventory entry")
+		}
+		if raw, ok := entry["metainfo"]; ok {
+			var metadata map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &metadata); err != nil || metadata == nil {
+				return fmt.Errorf("invalid nft inventory metadata")
+			}
+			continue
+		}
+		raw, ok := entry["table"]
+		if !ok {
+			return fmt.Errorf("unexpected nft table inventory entry")
+		}
+		var table struct {
+			Family string `json:"family"`
+			Name   string `json:"name"`
+		}
+		if err := json.Unmarshal(raw, &table); err != nil || table.Family == "" || table.Name == "" {
+			return fmt.Errorf("invalid nft table inventory record")
+		}
+		if table.Family == "bridge" && table.Name == NICTableName {
+			present = true
+		}
+	}
+	if !present {
 		return nil
 	}
 	if out, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, n.bin(), "delete", "table", "bridge", NICTableName)); err != nil {

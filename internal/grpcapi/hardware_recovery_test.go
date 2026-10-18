@@ -65,6 +65,13 @@ func beginWedgedDeviceOp(t *testing.T, ctx context.Context, s *Server, vmName st
 			t.Fatalf("append step %q: %v", st, err)
 		}
 	}
+	// Modern NIC detach journals record the original stamp before effects.
+	// Explicit empty stamps remain available to legacy-recovery refusal fixtures.
+	if kind == corrosion.OpDeviceDetach && artifacts["mac"] != "" {
+		if _, supplied := artifacts["vm_created_at"]; !supplied {
+			artifacts["vm_created_at"] = vm.CreatedAt
+		}
+	}
 	if err := s.opJournal.Write(opjournal.Entry{
 		OperationID: opID, OwnerEpoch: epoch, SpecGeneration: newGen, ResourceID: vmName,
 		Kind: journalKind, Stage: "planned", Artifacts: artifacts,

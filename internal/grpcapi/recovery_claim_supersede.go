@@ -22,12 +22,15 @@ import (
 // abandonment, the operator's `lv host rm --dead` plan, and the
 // ha.claim.stranded condition that points at it.
 
-func supersedeToPB(ev *corrosion.SupersedeEvidence) *pb.RecoveryClaimSupersede {
+func supersedeToPB(ev *corrosion.SupersedeEvidence) (*pb.RecoveryClaimSupersede, error) {
 	if ev == nil {
-		return nil
+		return nil, nil
 	}
-	return &pb.RecoveryClaimSupersede{PriorCertificate: ev.PriorCertificate, PriorValue: valueToPB(ev.PriorValue),
-		Abandonment: ev.Abandonment}
+	value, err := valueToPB(ev.PriorValue)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.RecoveryClaimSupersede{PriorCertificate: ev.PriorCertificate, PriorValue: value, Abandonment: ev.Abandonment}, nil
 }
 
 func supersedeFromPB(p *pb.RecoveryClaimSupersede) *corrosion.SupersedeEvidence {

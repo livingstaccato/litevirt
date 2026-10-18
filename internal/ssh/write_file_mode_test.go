@@ -1,6 +1,9 @@
 package ssh
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -69,5 +72,40 @@ func TestWriteFileCmd_RefusesToMoveIntoADirectory(t *testing.T) {
 	}
 	if !strings.Contains(cmd, "--") {
 		t.Errorf("mv is not given --, so a destination starting with '-' parses as options:\n  %s", cmd)
+	}
+}
+
+// A3: `lv host add` pushes /usr/local/bin/litevirt while the machine's daemon
+// may be running from it. Writing into a running executable fails with
+// ETXTBSY ("Text file busy"), which stopped an add on the lab; the staged
+// write replaces it by rename, which the running process does not prevent.
+//
+// Mutation: write with `cat > path` — the push fails with ETXTBSY.
+func TestWriteFileCmd_ReplacesARunningExecutable(t *testing.T) {
+	src, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("no sleep binary")
+	}
+	exe := filepath.Join(t.TempDir(), "litevirt")
+	b, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe, b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	running := exec.Command(exe, "30")
+	if err := running.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = running.Process.Kill(); _ = running.Wait() })
+
+	push := exec.Command("sh", "-c", writeFileCmd(exe, 0o755))
+	push.Stdin = strings.NewReader("new build")
+	if out, err := push.CombinedOutput(); err != nil {
+		t.Fatalf("pushing over a running executable: %v\n%s", err, out)
+	}
+	if got, _ := os.ReadFile(exe); string(got) != "new build" {
+		t.Errorf("the running executable was not replaced (it holds %d bytes, not the pushed build)", len(got))
 	}
 }

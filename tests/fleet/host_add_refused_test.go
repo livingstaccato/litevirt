@@ -1,0 +1,145 @@
+// Fleet scenario: an `lv host add` that the cluster refuses leaves the machine
+// it was pointed at untouched.
+//
+// On the kvm003-f3 lab (lab-eqts-test26, F8/A8), `lv host add` of a name that
+// was still active pushed host.crt and host.key to the machine and only then
+// asked AdmitHost, which refused. The machine was the live host under that
+// name: its daemon serves its identity from disk, so it was held as
+// superseded and cut off from its peers until it was re-added.
+package fleet
+
+import (
+	"bytes"
+	"context"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/litevirt/litevirt/internal/cli"
+	"github.com/litevirt/litevirt/internal/pki"
+)
+
+// operatorPKICopy points this process's `lv` at a pki directory holding the
+// cluster CA, copied from n: an operator machine.
+func operatorPKICopy(t *testing.T, n *Node) string {
+	t.Helper()
+	dir := t.TempDir()
+	op := filepath.Join(dir, "pki")
+	if err := os.MkdirAll(op, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"ca.crt", "ca.key"} {
+		if err := copyFile(filepath.Join(n.PKIDir, f), filepath.Join(op, f)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("LV_CONFIG_DIR", dir)
+	return op
+}
+
+func readFiles(t *testing.T, dir string, names ...string) map[string][]byte {
+	t.Helper()
+	out := map[string][]byte{}
+	for _, n := range names {
+		b, err := os.ReadFile(filepath.Join(dir, n))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[n] = b
+	}
+	return out
+}
+
+func TestFleet_HostAdd_ARefusedAddLeavesTheMachineAlone(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 4108})
+	a, b := c.Nodes[0], c.Nodes[1]
+	c.WaitConverged(t, convergeTimeout)
+	op := operatorPKICopy(t, a)
+	bin := filepath.Join(t.TempDir(), "litevirt")
+	if err := os.WriteFile(bin, []byte("build"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	identity := []string{"host.crt", "host.key", "ca.crt"}
+	serialOf := func() map[string]string {
+		got := map[string]string{}
+		for _, n := range c.Nodes {
+			got[n.Name] = hostsRowOf(t, n, b.Name)["cert_serial"]
+		}
+		return got
+	}
+	rowsBefore := serialOf()
+
+	// The live member itself, added again under its own name: the machine
+	// serves b's current certificate, so nothing is asked or pushed.
+	t.Run("the live member", func(t *testing.T) {
+		before := readFiles(t, b.PKIDir, identity...)
+		target := &cli.LocalAddTarget{Root: t.TempDir(), PKIDir: b.PKIDir, Binary: bin}
+		err := cli.HostAddOn(ctx, c.SelfClient(a), target, b.Name, b.Address)
+		if err == nil || !strings.Contains(err.Error(), "live member") {
+			t.Fatalf("add of the live %s = %v, want a refusal", b.Name, err)
+		}
+		if len(target.Wrote) != 0 || len(target.Commands) != 0 {
+			t.Errorf("a refused add reached %s: wrote %v, ran %v", b.Name, target.Wrote, target.Commands)
+		}
+		for n, want := range before {
+			if got := readFiles(t, b.PKIDir, n)[n]; !bytes.Equal(got, want) {
+				t.Errorf("%s's %s was replaced", b.Name, n)
+			}
+		}
+	})
+
+	// Another machine, holding an identity of its own, added under b's live
+	// name: the daemon refuses the admission, and the machine keeps its key.
+	t.Run("an active name", func(t *testing.T) {
+		other := filepath.Join(t.TempDir(), "pki")
+		if err := os.MkdirAll(other, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := pki.GenerateHostCert(filepath.Join(op, "ca.crt"), filepath.Join(op, "ca.key"),
+			filepath.Join(other, "host.crt"), filepath.Join(other, "host.key"), "spare", net.IPv4(127, 0, 0, 1)); err != nil {
+			t.Fatal(err)
+		}
+		before := readFiles(t, other, "host.crt", "host.key")
+		target := &cli.LocalAddTarget{Root: t.TempDir(), PKIDir: other, Binary: bin}
+		err := cli.HostAddOn(ctx, c.SelfClient(a), target, b.Name, b.Address)
+		if err == nil || !strings.Contains(err.Error(), "nothing was pushed") {
+			t.Fatalf("add under the active name %s = %v, want the daemon's refusal", b.Name, err)
+		}
+		if len(target.Wrote) != 0 || len(target.Commands) != 0 {
+			t.Errorf("a refused add reached the machine: wrote %v, ran %v", target.Wrote, target.Commands)
+		}
+		for n, want := range before {
+			if got := readFiles(t, other, n)[n]; !bytes.Equal(got, want) {
+				t.Errorf("the machine's %s was replaced", n)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(op, b.Name+".crt")); !os.IsNotExist(err) {
+			t.Errorf("a refused add left a minted %s.crt with the operator (stat: %v)", b.Name, err)
+		}
+	})
+
+	// b stays the cluster's admission for its name everywhere, and a member.
+	c.WaitConverged(t, convergeTimeout)
+	if got := serialOf(); !mapsEqual(got, rowsBefore) {
+		t.Errorf("%s's recorded serial changed: %v, was %v", b.Name, got, rowsBefore)
+	}
+	served, err := pki.CertSerial(filepath.Join(b.PKIDir, "host.crt"))
+	if err != nil || !strings.EqualFold(served, rowsBefore[a.Name]) {
+		t.Errorf("%s serves %s (%v), the cluster records %s", b.Name, served, err, rowsBefore[a.Name])
+	}
+}
+
+func mapsEqual(x, y map[string]string) bool {
+	if len(x) != len(y) {
+		return false
+	}
+	for k, v := range x {
+		if y[k] != v {
+			return false
+		}
+	}
+	return true
+}

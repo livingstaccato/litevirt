@@ -139,6 +139,13 @@ with `lv host rm` and added back under the same name starts with no failure
 history; every peer forgets the old machine's failed probes when it leaves the
 host table.
 
+`lv host add` asks the cluster to admit the host before it writes anything to
+the machine, so a refused add leaves the machine as it was. It also refuses a
+machine that serves a live member's current certificate. Each file the add
+replaces in `/etc/litevirt/pki` is kept beside it as `<file>.pre-add-<time>`,
+and put back if the add fails after the admission; run the same `lv host add`
+again to finish it.
+
 Such a host is a new machine to the cluster and inherits nothing the old one
 was configured with: its fencing and IPMI settings, labels, role, region and
 capacity overrides return to their defaults, and its IPMI password is retired

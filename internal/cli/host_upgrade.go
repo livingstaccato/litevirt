@@ -151,6 +151,19 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 		targetVersion = pingResp.Version
 	}
 
+	if len(opts.HostNames) == 0 && probedVersion == "" {
+		// All-hosts mode picks the outdated hosts by the binary's version.
+		// The connected daemon's says nothing about the binary: a member on
+		// it would be skipped, neither swapped nor pre-staged, while the
+		// others moved to the binary's schema. Refuse before anything is
+		// probed, pre-staged or swapped.
+		return fmt.Errorf("cannot tell which hosts are outdated: the version of %s could not be read "+
+			"(`%s --version` did not run here, e.g. a binary built for another architecture); "+
+			"check the path given to --binary, or name the hosts to upgrade (lv host upgrade <host>...), "+
+			"which pre-stages the schema on every other member",
+			opts.BinaryPath, opts.BinaryPath)
+	}
+
 	// List all hosts.
 	resp, err := client.ListHosts(ctx, nil)
 	if err != nil {
@@ -211,14 +224,6 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 		return err
 	}
 
-	if len(targets) == 0 && !named && probedVersion == "" {
-		// Every host matched only the connected daemon's version, which says
-		// nothing about the binary: no proof that any host is up to date.
-		return fmt.Errorf("cannot tell which hosts are outdated: the version of %s could not be read "+
-			"(`%s --version` did not run here, e.g. a binary built for another architecture); "+
-			"check the path given to --binary, or name the hosts to upgrade (lv host upgrade <host>...)",
-			opts.BinaryPath, opts.BinaryPath)
-	}
 	if len(targets) == 0 {
 		fmt.Println("All hosts are up-to-date.")
 		return nil

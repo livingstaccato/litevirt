@@ -1890,9 +1890,9 @@ time). Two builds that share one defeat it: a `VERSION=` override reused for
 different code, or a tree whose only change is an untracked file, which
 `--dirty` does not see. Build those with a distinct `VERSION`. When the
 binary cannot be probed (built for another architecture), every member is
-pre-staged, and `lv host upgrade` with no host names refuses rather than
-report every host up to date: check the path given to `--binary`, or name
-the hosts to upgrade.
+pre-staged, and `lv host upgrade` with no host names refuses before it
+changes anything, whatever versions the members run: check the path given
+to `--binary`, or name the hosts to upgrade.
 
 A pre-staged host advertises the new schema at once, so the upgrade first
 checks that every member answers (the read-only `lv host preflight-upgrade`

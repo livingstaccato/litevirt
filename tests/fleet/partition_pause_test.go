@@ -583,7 +583,11 @@ func TestFleet_PartitionSettle_DualRunSettlesToTheCertifiedCopy(t *testing.T) {
 	// pins when). A wait that first reads the row after that — a test
 	// goroutine descheduled for a second under load — finds it resolved, so
 	// the raise is read from ConfirmedAt, which the resolve keeps.
-	dest := runningOn(c, "pp-dual")[0]
+	runners := runningOn(c, "pp-dual")
+	if len(runners) != 1 {
+		t.Fatalf("pp-dual runs on %v, want exactly one host", runners)
+	}
+	dest := runners[0]
 	eventually(t, 30*time.Second, "vm_settled and the partition.settle audit row on "+owner.Name, func() bool {
 		cond, ok, err := corrosion.GetHealthCondition(ctx, owner.DB, corrosion.PartitionPauseEvaluator,
 			corrosion.CondVMSettled, "vm", "pp-dual@"+owner.Name)
@@ -599,7 +603,7 @@ func TestFleet_PartitionSettle_DualRunSettlesToTheCertifiedCopy(t *testing.T) {
 		if json.Unmarshal([]byte(cond.Evidence), &ev) != nil || ev.Dest != dest {
 			t.Fatalf("vm_settled names destination %q, want %s (the copy that runs): %s", ev.Dest, dest, cond.Evidence)
 		}
-		rows, err := owner.DB.Query(ctx, `SELECT detail FROM audit_log WHERE action = 'partition.settle' AND target = 'pp-dual'`)
+		rows, err := owner.DB.Query(ctx, `SELECT detail FROM audit_log WHERE action = 'partition.settle' AND target = 'pp-dual' AND host_name = ?`, owner.Name)
 		return err == nil && len(rows) > 0
 	})
 }

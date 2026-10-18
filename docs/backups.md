@@ -584,7 +584,16 @@ by the strongest method the host has, tried in this order:
    renames it `.<disk file>.lv-pit.orphan-<time>` (never over an earlier one
    or its sidecar), says where the file it was taken of went if the import
    moved that aside too, and reports it (`disk.pit_overlay_set_aside`);
-   inspect both, then delete them.
+   inspect both, then remove them with `lv pit-overlays rm`.
+
+   `lv pit-overlays ls [--host <h>] [--vm <vm>]` lists the set-aside overlays
+   of a host's VMs, answered on each VM's host, with their size and why one
+   is in use. `lv pit-overlays rm <vm> <disk> <name>` removes one and its
+   binding, on the VM's host (admin, audited, event
+   `disk.pit_overlay_removed`). It is refused while the overlay is in use: it
+   is the set-aside evidence of the disk's current window (above), a VM disk
+   references it, the VM's domain names it, the disk is held on its overlay,
+   or its storage does not answer.
    The start-up sweep waits until the host's replica is trusted (caught up
    with a peer, or the cluster's only host), and on a shared pool touches only
    disks of VMs this host owns and has defined (others are left to their owner
@@ -695,7 +704,10 @@ A replica a VM disk references, one a set-aside disk copy backs on, and a file
 with no record are never removed. The removal also retires the incremental
 chain's anchor (the `replication_checkpoints` row) that no remaining schedule
 uses, and `lv rm` retires all of the VM's; the failover lease holder retires,
-hourly, any other row no schedule uses that has not advanced for a day. Only
+hourly, any other row no schedule uses that has not advanced for a day.
+`lv replication checkpoints ls [--vm <vm>]` lists the rows, and
+`lv replication checkpoints rm <vm> --target-pool <pool>` removes one (admin,
+audited), refused while a live replication schedule uses it. Only
 records in the replica area are removed this way, not top-level
 `<vm>-<disk>-<time>.<ext>` files.
 

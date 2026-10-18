@@ -709,6 +709,8 @@ lv resolve-pit-overlay <vm> <disk>                       # Admin: the verdict on
 lv resolve-pit-overlay <vm> <disk> --commit --confirm    # Commit it; refused unless the verdict says it is safe (--force-commit overrides, experts only)
 lv resolve-pit-overlay <vm> <disk> --commit --force-commit --overwrite-newer-writes --confirm  # Expert only: commit an overlay already in the disk, over the guest's newer writes
 lv resolve-pit-overlay <vm> <disk> --discard --confirm   # Discard it; of a half-written disk only with --accept-torn-disk
+lv pit-overlays ls [--host <h>] [--vm <vm>]              # Set-aside overlays (.<disk file>.lv-pit.orphan-<time>) of a host's VMs, on their host; IN USE says why one is kept
+lv pit-overlays rm <vm> <disk> <name>                    # Admin, audited: remove one and its binding; refused while in use (see backups.md)
 
 # Migrate every VM's volumes in a stack to a different pool (rolling, online):
 lv stack migrate-volumes <stack> --to <pool>
@@ -1201,6 +1203,10 @@ lv replication replicas <container> --target-pool <repo> [--host <h>] [--project
   [--restore <timestamp>]  # lay that replica down as the container, stopped (never a second copy)
   [--remove <timestamp>]   # a SET-ASIDE or ORPHANED replica to remove (repeatable; asks first)
   [--yes]                  # remove without asking
+
+# Incremental-replication checkpoint rows (the anchor of each VM's chain into a pool).
+lv replication checkpoints ls [--vm <vm>]                # IN USE: a live schedule uses it; VM DELETED: the VM has no live row
+lv replication checkpoints rm <vm> --target-pool <pool>  # Admin, audited: refused while a live schedule uses it; the next run is a full copy
 
 # Disaster recovery: bring a VM up from its replica.
 lv replication promote <vm>

@@ -210,9 +210,26 @@ func SetGlobForTest(f func(string) ([]string, error)) (restore func()) {
 }
 
 func setAsideEvidenceWith(glob func(string) ([]string, error), disk string) bool {
+	orphans, err := orphansWith(glob, disk)
+	if err != nil || len(orphans) == 0 {
+		return false
+	}
+	for _, o := range orphans {
+		if orphanIsEvidence(disk, o) {
+			return true
+		}
+	}
+	return false
+}
+
+// Orphans returns the overlays of disk set aside beside it (SetAside), as
+// paths, without their bindings.
+func Orphans(disk string) ([]string, error) { return orphansWith(glob, disk) }
+
+func orphansWith(glob func(string) ([]string, error), disk string) ([]string, error) {
 	m, err := glob(Path(disk) + ".orphan-*")
 	if err != nil {
-		return false
+		return nil, err
 	}
 	var orphans []string
 	for _, p := range m {
@@ -220,9 +237,16 @@ func setAsideEvidenceWith(glob func(string) ([]string, error), disk string) bool
 			orphans = append(orphans, p)
 		}
 	}
-	if len(orphans) == 0 {
-		return false
-	}
+	return orphans, nil
+}
+
+// OrphanIsEvidence reports whether the set-aside overlay orphan of disk is
+// what SetAsideEvidence counts: every orphan when the disk carries no window
+// token, else only one whose binding recorded the disk's token. A token that
+// cannot be read makes no orphan evidence.
+func OrphanIsEvidence(disk, orphan string) bool { return orphanIsEvidence(disk, orphan) }
+
+func orphanIsEvidence(disk, orphan string) bool {
 	tok, err := getXattr(disk)
 	switch {
 	case errors.Is(err, errNoAttr):
@@ -230,17 +254,35 @@ func setAsideEvidenceWith(glob func(string) ([]string, error), disk string) bool
 	case err != nil || len(tok) == 0:
 		return false
 	}
-	for _, o := range orphans {
-		data, err := os.ReadFile(o + ".id")
-		if err != nil {
-			continue
-		}
-		var b Binding
-		if json.Unmarshal(data, &b) == nil && b.Token != "" && b.Token == string(tok) {
-			return true
+	data, err := os.ReadFile(orphan + ".id")
+	if err != nil {
+		return false
+	}
+	var b Binding
+	return json.Unmarshal(data, &b) == nil && b.Token != "" && b.Token == string(tok)
+}
+
+// OrphanPath is disk's set-aside overlay of base name name, or an error when
+// name is not one SetAside makes for disk.
+func OrphanPath(disk, name string) (string, error) {
+	prefix := filepath.Base(Path(disk)) + ".orphan-"
+	rest, ok := strings.CutPrefix(name, prefix)
+	if !ok || rest == "" || strings.HasSuffix(name, ".id") || strings.ContainsAny(rest, "/\x00") || rest == "." || rest == ".." {
+		return "", fmt.Errorf("%q is not a set-aside overlay of %s", name, disk)
+	}
+	return filepath.Join(filepath.Dir(disk), name), nil
+}
+
+// RemoveOrphan removes disk's set-aside overlay orphan and its binding: the
+// binding first, so a failure leaves an overlay with no binding, which is no
+// evidence of anything.
+func RemoveOrphan(orphan string) error {
+	for _, p := range []string{orphan + ".id", orphan} {
+		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
 		}
 	}
-	return false
+	return nil
 }
 
 // Command builds the qemu-img process. A variable so a test can see the

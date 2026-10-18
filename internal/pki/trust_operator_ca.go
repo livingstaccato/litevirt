@@ -49,34 +49,15 @@ func InitializeOperatorCA(ctx context.Context, dir string) (err error) {
 			o.dirty = err
 		}
 	}()
-	staging, err := os.MkdirTemp(o.dir, ".operator-ca-")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(staging)
-	if err := GenerateCA(filepath.Join(staging, "ca.crt"), filepath.Join(staging, "ca.key")); err != nil {
-		return err
-	}
-	cert, err := readBounded(filepath.Join(staging, "ca.crt"))
-	if err != nil {
-		return err
-	}
-	key, err := readBounded(filepath.Join(staging, "ca.key"))
-	if err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	// Publish the complete private key first, then its root certificate. A
-	// partial error leaves explicit evidence and is never guessed to be unused.
-	if err := writeTrustFile(filepath.Join(o.dir, "ca.key"), key, 0600); err != nil {
-		return err
-	}
-	return writeTrustFile(filepath.Join(o.dir, "ca.crt"), cert, 0644)
+	return o.publishNativeOperatorCALocked(ctx)
 }
 
 func (o *trustOwner) operatorCAAbsentLocked() (bool, error) {
+	if native, err := o.readNativeOperatorCALocked(); err != nil {
+		return false, err
+	} else if native != nil {
+		return o.nativeOperatorCAPendingLocked(native)
+	}
 	rootPath := filepath.Join(o.dir, "ca.crt")
 	if _, err := os.Lstat(rootPath); err == nil {
 		info, err := os.Stat(rootPath)

@@ -150,52 +150,12 @@ func (r *AutomationReceiver) auditAggregateEvidence(ctx context.Context, a *Auto
 				return err
 			}
 			local.store.prepared = reads
-			head, baseline := local.head, local.store
-			for _, s := range sources {
-				if s.head.Sequence > head.Sequence {
-					head, baseline = s.head, s.store
-				}
-			}
-			if err = aggregateCompatibleHistory(ctx, local.store, baseline); err != nil {
-				return err
-			}
-			if err = aggregateCoverage(ctx, local.store); err != nil {
-				return err
-			}
-			roster := make([]aggregateRosterEntry, 0, len(sources))
-			for _, s := range sources {
-				if err = aggregateCompatibleHistory(ctx, s.store, baseline); err != nil {
-					return err
-				}
-				if err = aggregateCoverage(ctx, s.store); err != nil {
-					return err
-				}
-				roster = append(roster, aggregateRosterEntry{s.member.Name, s.member.Incarnation, s.audit, s.publication.id, s.publication.manifest.Root, s.publication.manifest.Cut.ID, s.coverage})
-			}
-			rosterRaw, _ := json.Marshal(roster)
-			headRaw, _ := json.Marshal(head)
-			coverage := sourceDigest([]byte("litevirt/aggregate-coverage/v1"), []byte(local.coverage), rosterRaw)
-			id := sourceDigest([]byte("litevirt/receiver-aggregate/v1"), []byte(a.id), a.binding, []byte(local.id), []byte(local.dependency), headRaw, []byte(coverage), rosterRaw)
-			// Build maxima in a fresh namespace. A retry cannot temporarily overwrite
-			// even a winning or losing row of an already published immutable aggregate.
-			temporary, err := aggregateTemporaryTx(ctx, tx)
+			rebuilt, err := aggregateRebuildClaimsTx(ctx, tx, a.id, a.binding, sources, local)
 			if err != nil {
 				return err
 			}
-			stores := make([]aggregateEvidenceStore, 0, len(sources)+1)
-			for _, s := range sources {
-				stores = append(stores, aggregateEvidenceStore{"source", s.audit, s.store})
-			}
-			stores = append(stores, aggregateEvidenceStore{"local", local.id, local.store})
-			for _, s := range stores {
-				if err = aggregateClaimsTx(ctx, tx, temporary, s, stores, local); err != nil {
-					return err
-				}
-			}
-			if err = aggregateAcceptedBaselineTx(ctx, tx, temporary, stores, baseline, head); err != nil {
-				return err
-			}
-			if err = aggregatePublishTx(ctx, tx, temporary, id, a.id, local.id, headRaw, coverage, rosterRaw, roster); err != nil {
+			id := rebuilt.id
+			if err = aggregatePublishTx(ctx, tx, rebuilt.temporary, id, a.id, local.id, rebuilt.headRaw, rebuilt.coverage, rebuilt.rosterRaw, rebuilt.roster); err != nil {
 				return err
 			}
 			for _, namespace := range scratch {

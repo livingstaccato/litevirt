@@ -173,7 +173,7 @@ func TestAutomationCredentialCompositeIssuersAndSplitModes(t *testing.T) {
 				case "basic":
 					err = InsertSession(ctx, c, s)
 				case "factor":
-					err = InsertSessionWithFactor(ctx, c, lpGrant(t), s, "totp")
+					err = InsertSessionWithLoginData(ctx, c, lpGrant(t), s, "totp", nil)
 				case "groups":
 					err = InsertSessionWithLoginData(ctx, c, lpGrant(t), s, "totp", []string{"ops"})
 				case "no-grant":

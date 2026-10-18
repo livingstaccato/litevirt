@@ -197,7 +197,7 @@ func (s receiverEstablishmentState) checkTx(ctx context.Context, tx *LocalTx) er
 	return nil
 }
 func (r *AutomationReceiver) transactionEstablished(ctx context.Context, a *AutomationReceiverAttempt, lease *pki.HostCertificateLease, guard *receiverEstablishmentCommit, fn func(*LocalTx) error) error {
-	return r.transactionGuarded(ctx, a, lease, time.Time{}, nil, guard, func(tx *LocalTx) error {
+	return r.transactionGuarded(ctx, a, lease, time.Time{}, nil, guard, nil, func(tx *LocalTx) error {
 		if err := guard.before.checkTx(ctx, tx); err != nil {
 			return err
 		}

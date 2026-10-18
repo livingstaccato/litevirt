@@ -326,6 +326,12 @@ func (v *HostTrust) standing(cn, serial string, depth int) bool {
 }
 
 func (v *HostTrust) verifyHost(chain [][]byte, host string, served bool) ([32]byte, time.Time, time.Time, error) {
+	return v.verifyHostEvidence(chain, host, served, false)
+}
+
+// originalProvenance is only used after recorded original authorization. Live
+// validation always calls verifyHost and cannot opt into this exception.
+func (v *HostTrust) verifyHostEvidence(chain [][]byte, host string, served, originalProvenance bool) ([32]byte, time.Time, time.Time, error) {
 	fail := func(err error) ([32]byte, time.Time, time.Time, error) {
 		return [32]byte{}, time.Time{}, time.Time{}, err
 	}
@@ -355,24 +361,41 @@ func (v *HostTrust) verifyHost(chain [][]byte, host string, served bool) ([32]by
 	}
 	now := time.Now()
 	before, after := leaf.NotBefore, leaf.NotAfter
+	verificationLeaf := leaf
+	if originalProvenance {
+		// The original leaf's later expiry/retirement cannot erase previously
+		// verified provenance. Its NotBefore and every selected nonleaf predicate
+		// remain current; return only those required live intervals to the caller.
+		after = time.Time{}
+		if now.After(leaf.NotAfter) {
+			// Verify at actual now, relaxing only the parsed leaf's upper time bound.
+			// Raw/TBS/signature/public key stay unchanged, including signature checks.
+			copyLeaf := *leaf
+			copyLeaf.NotAfter = now.Add(time.Second)
+			verificationLeaf = &copyLeaf
+		}
+	}
 	for _, usage := range []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth} {
-		paths, err := leaf.Verify(x509.VerifyOptions{Roots: v.roots, Intermediates: intermediates, CurrentTime: now, KeyUsages: []x509.ExtKeyUsage{usage}})
+		paths, err := verificationLeaf.Verify(x509.VerifyOptions{Roots: v.roots, Intermediates: intermediates, CurrentTime: now, KeyUsages: []x509.ExtKeyUsage{usage}})
 		if err != nil {
 			return fail(err)
 		}
-		for _, cert := range paths[0] {
+		for i, cert := range paths[0] {
+			if originalProvenance && i == 0 {
+				continue
+			}
 			if v.revoked[cert.SerialNumber.Text(16)] {
 				return fail(errors.New("certificate is revoked"))
 			}
 			if cert.NotBefore.After(before) {
 				before = cert.NotBefore
 			}
-			if cert.NotAfter.Before(after) {
+			if after.IsZero() || cert.NotAfter.Before(after) {
 				after = cert.NotAfter
 			}
 		}
 	}
-	if (served || !v.policy) && v.standing(host, leaf.SerialNumber.Text(16), 0) {
+	if !originalProvenance && (served || !v.policy) && v.standing(host, leaf.SerialNumber.Text(16), 0) {
 		return fail(errors.New("certificate has a standing successor"))
 	}
 	return sha256.Sum256(leaf.Raw), before, after, nil

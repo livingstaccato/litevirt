@@ -179,7 +179,7 @@ func (s receiverAuditStore) history(ctx context.Context) (AutomationPrefix, int6
 		return head, 0, err
 	}
 	if s.localCursor != nil && s.localCursor.Sequence == 0 {
-		if err := aggregateLocalCompareSemantic(ctx, s.tx, stage); err != nil {
+		if err := s.compareLocalSemantic(ctx, stage); err != nil {
 			return head, 0, err
 		}
 	}
@@ -257,7 +257,7 @@ func (s receiverAuditStore) history(ctx context.Context) (AutomationPrefix, int6
 			if head != *s.localCursor {
 				return errors.New("local semantic cursor differs from certified history")
 			}
-			if err := aggregateLocalCompareSemantic(ctx, s.tx, stage); err != nil {
+			if err := s.compareLocalSemantic(ctx, stage); err != nil {
 				return err
 			}
 		}

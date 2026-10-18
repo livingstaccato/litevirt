@@ -19,6 +19,8 @@ type receiverAuditStore struct {
 	publication         receiverPublication
 	localID, ownedCutID string
 	localCursor         *AutomationPrefix
+	localProjectionID   string
+	retainedNative      bool
 }
 
 // Separate the retained evidence identity from a newly owned scratch namespace.

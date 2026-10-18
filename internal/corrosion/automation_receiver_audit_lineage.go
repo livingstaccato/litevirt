@@ -51,8 +51,17 @@ func (s receiverAuditStore) membership(ctx context.Context, g int64) (*VoterConf
 }
 
 func (s receiverAuditStore) lineage(ctx context.Context, a *AutomationReceiverAttempt) (string, error) {
+	if a == nil {
+		return "", errors.New("source audit context unavailable")
+	}
+	return s.lineageContext(ctx, receiverAuditContext{a.id, a.request, a.facts})
+}
+
+// Original immutable context is separate from current receiver capability.
+// Both ordinary and transferred provenance use these exact lineage predicates.
+func (s receiverAuditStore) lineageContext(ctx context.Context, a receiverAuditContext) (string, error) {
 	m := s.publication.manifest
-	if m.Cut.Generation != a.request.Generation || m.Cut.Incarnation != m.Incarnation || m.Cut.Source != s.source || (s.ownedCutID == "" && !receiverDigest(m.Lineage)) {
+	if m.Cut.Generation != a.request.Generation || m.Cut.Incarnation != m.Incarnation || m.Cut.Source != s.source || (s.ownedCutID == "" && !s.retainedNative && !receiverDigest(m.Lineage)) {
 		return "", errors.New("frozen source lineage binding")
 	}
 	var previous *VoterConfig
@@ -238,6 +247,13 @@ func (s receiverAuditStore) lineage(ctx context.Context, a *AutomationReceiverAt
 // localLineage validates current native storage without importing frozen-source
 // seal/adoption requirements. Begin remains the current membership/PKI owner.
 func (s receiverAuditStore) localLineage(ctx context.Context, a *AutomationReceiverAttempt, incarnation string) error {
+	if a == nil {
+		return errors.New("local audit context unavailable")
+	}
+	return s.localLineageContext(ctx, receiverAuditContext{a.id, a.request, a.facts}, incarnation)
+}
+
+func (s receiverAuditStore) localLineageContext(ctx context.Context, a receiverAuditContext, incarnation string) error {
 	var previous *VoterConfig
 	var configs, adopted int64
 	err := s.walk(ctx, 11, func(_ int64, row Row) error {

@@ -14,6 +14,7 @@ import (
 // FULL handoff. Serialized audit rows cannot construct it. Its fields and the
 // registry are private; copying its value does not copy its authority.
 type AutomationCurrentProof struct {
+	retained        *retainedPrivateProof
 	self            *AutomationCurrentProof
 	used, abandoned *atomic.Bool
 	owner           *AutomationReceiver
@@ -56,6 +57,9 @@ func (p *AutomationCurrentProof) exactBinding() string {
 			}{q.id, q.manifest, q.chain, q.notBefore, q.notAfter})
 			parts = append(parts, b)
 		}
+	}
+	if p.retained != nil {
+		parts = append(parts, []byte("litevirt/retained-private-variant/v1"), p.retainedBinding())
 	}
 	return sourceDigest(parts...)
 }
@@ -229,6 +233,11 @@ func (r *AutomationReceiver) revalidateCurrentTx(ctx context.Context, tx *LocalT
 		}
 		if host != s.host {
 			return errors.New("current source admission changed")
+		}
+	}
+	if p.retained != nil {
+		if err := r.revalidateRetainedTx(ctx, tx, p); err != nil {
+			return err
 		}
 	}
 	digest, err := r.currentDependencyDigestTx(ctx, tx, p.attempt)

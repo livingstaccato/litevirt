@@ -14,8 +14,8 @@ func TestAutomationIntegration69MigrationAndDescriptor(t *testing.T) {
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	if CurrentSchemaVersion != 79 || automationCutSourceSchema != 79 {
-		t.Fatalf("current SQL/source descriptor = %d/%d, want79/79", CurrentSchemaVersion, automationCutSourceSchema)
+	if CurrentSchemaVersion != 80 || automationCutSourceSchema != 80 {
+		t.Fatalf("current SQL/source descriptor = %d/%d, want80/80", CurrentSchemaVersion, automationCutSourceSchema)
 	}
 	units := 0
 	for _, m := range schemaMigrationLedger {
@@ -60,5 +60,21 @@ func TestAutomationIntegration69Archived78Reopen(t *testing.T) {
 	after, later := cutFixtureRead(t, a.c, id)
 	if !reflect.DeepEqual(before, after) || !reflect.DeepEqual(records, later) {
 		t.Fatal("migration reinterpreted archived78")
+	}
+}
+
+// Live local proof cannot reuse an older schema row. A retained original may
+// carry either accepted pre-metadata namespace without rewriting its frames.
+func TestAutomationIntegration80LocalSchemaProvenance(t *testing.T) {
+	for _, version := range []int64{77, 78, 79, 80, 81} {
+		for _, retained := range []bool{false, true} {
+			observation := aggregateLocalObservation{retained: retained}
+			row := Row{Columns: []string{"id", "version"}, Values: []interface{}{int64(1), version}}
+			err := observation.observe(&aggregateLocalAudit{}, 15, 1, row)
+			want := version == 80 || (retained && (version == 78 || version == 79))
+			if (err == nil) != want {
+				t.Fatalf("schema=%d retained=%t: %v", version, retained, err)
+			}
+		}
 	}
 }

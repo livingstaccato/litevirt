@@ -41,7 +41,7 @@ func TestOperatorCAFirstCreationAndDurability(t *testing.T) {
 			injected := errors.New("injected first CA " + stage)
 			trustDurabilitySeam = func(at string) error {
 				if at == stage {
-					if at == "directory-sync" {
+					if at != "rename" {
 						if _, err := os.Stat(filepath.Join(dir, "ca.key")); err != nil {
 							return nil
 						}
@@ -58,14 +58,10 @@ func TestOperatorCAFirstCreationAndDurability(t *testing.T) {
 				t.Fatal("failed key publication exposed a root")
 			}
 			trustDurabilitySeam = nil
-			if stage == "rename" {
-				if err := InitializeOperatorCA(ctx, dir); err != nil {
-					t.Fatal("pre-write retry did not progress", err)
-				}
-			} else {
-				if err := InitializeOperatorCA(ctx, dir); err == nil {
-					t.Fatal("partial CA key evidence was silently treated as unused")
-				}
+			// Post-key failures now have a positively committed exact operation;
+			// unlike an unrecorded legacy partial key, they must resume it.
+			if err := InitializeOperatorCA(ctx, dir); err != nil {
+				t.Fatal("owned publication retry did not progress", err)
 			}
 		})
 	}

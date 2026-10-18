@@ -43,7 +43,7 @@ func TestLifecycleWrappersTraceAndRefuseUnknownSQL(t *testing.T) {
 			t.Fatalf("%s: unsafe SQL hidden by wrapper", name)
 		}
 	}
-	for _, name := range []string{"InsertUser", "InsertToken", "InsertSessionWithFactor", "InsertSessionWithLoginData"} {
+	for _, name := range []string{"InsertUser", "InsertToken", "InsertSessionWithLoginData"} {
 		if len(found[name]) == 0 {
 			t.Fatalf("real emitting builder %s lost statement coverage", name)
 		}

@@ -262,6 +262,9 @@ func aggregateVerifySchemaTx(ctx context.Context, tx *LocalTx) error {
 		nullableID           bool
 	}
 	shapes := []shape{
+		{"local_automation_retained_deliveries", "id,attempt,envelope", "ttb", 1, true},
+		{"local_automation_retained_objects", "delivery,ordinal,namespace,descriptor", "titb", 2, false},
+		{"local_automation_retained_completions", "delivery,evidence_digest,candidate_ref,coverage_digest", "ttbt", 1, true},
 		{"local_automation_local_audits", "id,attempt,dependency,head,coverage,records,origin", "tttbtib", 1, true},
 		{"local_automation_local_rows", "local_id,section,ordinal,record", "tiib", 3, false},
 		{"local_automation_aggregates", "id,attempt,local_id,head,coverage,roster", "tttbtb", 1, true},
@@ -327,7 +330,7 @@ func aggregateVerifySchemaTx(ctx context.Context, tx *LocalTx) error {
 
 func aggregateVerifyIndexesTx(ctx context.Context, tx *LocalTx, table string, primary []string) error {
 	count := 1
-	if table == "local_automation_aggregate_sources" {
+	if table == "local_automation_aggregate_sources" || table == "local_automation_retained_objects" {
 		count = 2
 	}
 	for ordinal := 0; ordinal < count; ordinal++ {
@@ -354,6 +357,9 @@ func aggregateVerifyIndexesTx(ctx context.Context, tx *LocalTx, table string, pr
 				return errors.New("unsupported aggregate storage schema extra unique index")
 			}
 			keys = []string{"bundle", "incarnation"}
+			if table == "local_automation_retained_objects" {
+				keys = []string{"namespace"}
+			}
 		default:
 			return errors.New("unsupported aggregate storage schema index origin")
 		}

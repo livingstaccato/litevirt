@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/litevirt/litevirt/internal/automation/contract"
 	"hash"
 	"math"
 	"strings"
@@ -23,6 +22,7 @@ type aggregateLocalAudit struct {
 	records                  int64
 	store                    receiverAuditStore
 	attempt                  *AutomationReceiverAttempt
+	retained                 *retainedLocalContext
 }
 
 type aggregateLocalTable struct {
@@ -121,6 +121,12 @@ func walkAggregateBoundedTable(ctx context.Context, tx *LocalTx, d aggregateLoca
 // A private cursor may resume the same indexed one-body reader. The first probe
 // remains unbounded below, so malformed keys cannot disappear before a cursor.
 func walkAggregateBoundedTableFrom(ctx context.Context, tx *LocalTx, d aggregateLocalTable, stage string, limitFor func(string) int64, rowLimit int64, after []any, visit func(int64, Row) error) error {
+	return walkAggregateBoundedTableFiltered(ctx, tx, d, stage, limitFor, rowLimit, after, "", nil, visit)
+}
+
+// Scope is supplied only by closed internal storage adapters, never an API or
+// received descriptor. The ordinary stage/cursor path keeps its exact domain.
+func walkAggregateBoundedTableFiltered(ctx context.Context, tx *LocalTx, d aggregateLocalTable, stage string, limitFor func(string) int64, rowLimit int64, after []any, scope string, scopeArgs []any, visit func(int64, Row) error) error {
 	cols, keys := aggregateLocalColumns(d.columns), aggregateLocalColumns(d.keys)
 	if len(cols) != len(d.shape) {
 		return errors.New("local snapshot descriptor shape")
@@ -137,10 +143,13 @@ func walkAggregateBoundedTableFrom(ctx context.Context, tx *LocalTx, d aggregate
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		where := ""
-		args := []any{}
+		where := scope
+		args := append([]any(nil), scopeArgs...)
 		if d.stage {
-			where = "stage=?"
+			if where != "" {
+				where += " AND "
+			}
+			where += "stage=?"
 			args = append(args, stage)
 		}
 		if after != nil {
@@ -349,110 +358,20 @@ func auditAggregateLocalTx(ctx context.Context, tx *LocalTx, a *AutomationReceiv
 		return out, err
 	}
 	out.id = sourceDigest([]byte("litevirt/local-audit/v1"), []byte(a.id), []byte(out.dependency))
-	var cursor, prefix AutomationPrefix
-	var incarnation string
-	var inventory [9]int64
-	counts := make([]int64, len(aggregateLocalTables()))
+	var observation aggregateLocalObservation
 	_, err = aggregateLocalSnapshot(ctx, tx, a, c, func(section int, n int64, row Row, raw []byte) error {
-		counts[section] = n
-		if section < 9 {
-			inventory[section] = n
+		if err := observation.observe(&out, section, n, row); err != nil {
+			return err
 		}
-		switch section {
-		case 2:
-			value, _, err := receiverHistoryValue(row)
-			if err != nil {
-				return err
-			}
-			d, err := automationDecision(value)
-			if err != nil {
-				return err
-			}
-			cluster := d.Command.ClusterUID
-			if d.Sequence == 1 {
-				assignment, err := contract.DecodeAssignment(d)
-				if err != nil {
-					return err
-				}
-				cluster = assignment.ClusterUID
-			}
-			out.head = AutomationPrefix{ClusterUID: cluster, Sequence: d.Sequence, Digest: row.String("digest")}
-		case 9:
-			if n != 1 || row.Int64("id") != 1 {
-				return errors.New("local snapshot prefix singleton")
-			}
-			prefix = AutomationPrefix{ClusterUID: row.String("cluster_uid"), Sequence: uint64(row.Int64("sequence")), Digest: row.String("digest")}
-		case 10:
-			if n != 1 || row.Int64("id") != 1 {
-				return errors.New("local snapshot incarnation singleton")
-			}
-			incarnation = row.String("incarnation")
-		case 11, 12, 13:
-			return errors.New("local snapshot pending recovery or staging")
-		case 14:
-			if n != 1 || row.Int64("id") != 1 || row.Int64("generation") != 0 {
-				return errors.New("local snapshot reseed lineage unavailable")
-			}
-		case 15:
-			if n != 1 || row.Int64("id") != 1 || row.Int64("version") != 79 {
-				return errors.New("local snapshot schema unavailable")
-			}
-		case 21:
-			if n != 1 {
-				return errors.New("local snapshot semantic singleton")
-			}
-			cursor = AutomationPrefix{ClusterUID: row.String("cluster_uid"), Sequence: uint64(row.Int64("sequence")), Digest: row.String("digest")}
-		}
-		if out.records == math.MaxInt64 {
-			return errors.New("local snapshot record overflow")
-		}
-		out.records++
 		return aggregateLocalSaveRow(ctx, tx, out.id, section, n, raw)
 	})
 	if err != nil {
 		return out, err
 	}
-	if err = aggregateLocalStoredRows(ctx, tx, out.id, counts); err != nil {
+	if err = aggregateLocalStoredRows(ctx, tx, out.id, observation.counts); err != nil {
 		return out, err
 	}
-	if incarnation != a.facts.Incarnation {
-		return out, errors.New("local snapshot lifetime differs")
-	}
-	if cursor.Sequence > out.head.Sequence || prefix.Sequence > out.head.Sequence {
-		return out, errors.New("local snapshot cursor beyond certified head")
-	}
-	for _, p := range []AutomationPrefix{cursor, prefix} {
-		if p.Sequence == 0 && (p.ClusterUID != "" || p.Digest != "") {
-			return out, errors.New("local snapshot malformed empty cursor")
-		}
-	}
-	s := receiverAuditStore{tx: tx, attempt: a.id, source: c.hostName, id: namespace, evidenceID: out.id, localID: out.id, localCursor: &cursor}
-	s.publication.manifest.Cut.Head = out.head
-	s.publication.manifest.Cut.Generation = a.request.Generation
-	for i, n := range inventory {
-		s.publication.manifest.Cut.Inventory = append(s.publication.manifest.Cut.Inventory, automationCutInventory{Section: automationCutSections[i].name, Records: n})
-	}
-	out.store = s
-	if _, err = s.index(ctx); err != nil {
-		return out, err
-	}
-	if err = s.localLineage(ctx, a, incarnation); err != nil {
-		return out, err
-	}
-	if prefix.Sequence > 0 {
-		row, err := s.sequence(ctx, 5, int64(prefix.Sequence))
-		if err != nil {
-			return out, err
-		}
-		if prefix.Digest != row.String("digest") || prefix.ClusterUID != out.head.ClusterUID {
-			return out, errors.New("local prefix differs from certified history")
-		}
-	}
-	if _, _, err = s.history(ctx); err != nil {
-		return out, err
-	}
-	out.coverage, _, err = s.claimsAndCoverage(ctx, out.head)
-	if err != nil {
+	if err = observation.audit(ctx, tx, receiverAuditContext{a.id, a.request, a.facts}, c.hostName, namespace, out.id, false, &out); err != nil {
 		return out, err
 	}
 	head, _ := json.Marshal(out.head)
@@ -579,17 +498,29 @@ func walkAggregateStoredFrames(ctx context.Context, tx *LocalTx, table, idColumn
 	if table == "local_automation_local_rows" {
 		limit = maxAggregateLocalRecordBytes
 	}
+	return walkAutomationStoredFrames(ctx, tx, table, idColumn+"=?", []any{id}, "section", limit, visit)
+}
+
+// The concrete ordinary and retained address owners supply closed SQL names.
+// Share the same length-first one-body keyset reader across both storage routes.
+func walkAutomationStoredFrames(ctx context.Context, tx *LocalTx, table, scope string, scopeArgs []any, sectionColumn string, limit int64, visit func(int, int64, []byte) error) error {
+	return walkAutomationStoredFramesBounded(ctx, tx, table, scope, scopeArgs, sectionColumn, limit, nil, visit)
+}
+
+// frameBound restricts a probed tuple before its body is materialized. It supplies
+// only a numeric bound; semantic validation still belongs to the shared audits.
+func walkAutomationStoredFramesBounded(ctx context.Context, tx *LocalTx, table, scope string, scopeArgs []any, sectionColumn string, limit int64, frameBound func(int, int64) int64, visit func(int, int64, []byte) error) error {
 	var section, ordinal int64
 	first := true
 	for {
-		where := idColumn + "=?"
-		args := []any{id}
+		where := scope
+		args := append([]any(nil), scopeArgs...)
 		if !first {
-			where += " AND (section,ordinal)>(?,?)"
+			where += " AND (" + sectionColumn + ",ordinal)>(?,?)"
 			args = append(args, section, ordinal)
 		}
-		suffix := " FROM " + table + " WHERE " + where + " ORDER BY " + table + ".section," + table + ".ordinal LIMIT 1"
-		rows, err := tx.Query(ctx, `SELECT typeof(section) AS sk,typeof(ordinal) AS ok,typeof(record) AS rk,CASE WHEN typeof(section)='integer' THEN section ELSE NULL END AS section,CASE WHEN typeof(ordinal)='integer' THEN ordinal ELSE NULL END AS ordinal,length(record) AS size`+suffix, args...)
+		suffix := " FROM " + table + " WHERE " + where + " ORDER BY " + table + "." + sectionColumn + "," + table + ".ordinal LIMIT 1"
+		rows, err := tx.Query(ctx, `SELECT typeof(`+sectionColumn+`) AS sk,typeof(ordinal) AS ok,typeof(record) AS rk,CASE WHEN typeof(`+sectionColumn+`)='integer' THEN `+sectionColumn+` ELSE NULL END AS section,CASE WHEN typeof(ordinal)='integer' THEN ordinal ELSE NULL END AS ordinal,length(record) AS size`+suffix, args...)
 		if err != nil {
 			return err
 		}
@@ -600,16 +531,20 @@ func walkAggregateStoredFrames(ctx context.Context, tx *LocalTx, table, idColumn
 			return errors.New("local snapshot invalid stored frame key or bound")
 		}
 		section, ordinal = rows[0].Int64("section"), rows[0].Int64("ordinal")
+		if section > math.MaxInt32 {
+			return errors.New("local snapshot stored section exceeds bound")
+		}
+		if frameBound != nil && rows[0].Int64("size") > frameBound(int(section), ordinal) {
+			return errors.New("stored frame exceeds component or inventory bound")
+		}
 		first = false
-		rows, err = tx.Query(ctx, "SELECT record FROM "+table+" WHERE "+idColumn+"=? AND section=? AND ordinal=? LIMIT 1", id, section, ordinal)
+		bodyArgs := append(append([]any(nil), scopeArgs...), section, ordinal, rows[0].Int64("size"))
+		rows, err = tx.Query(ctx, "SELECT record FROM "+table+" WHERE "+scope+" AND "+sectionColumn+"=? AND ordinal=? AND typeof(record)='blob' AND length(CAST(record AS BLOB))=? LIMIT 1", bodyArgs...)
 		if err != nil {
 			return err
 		}
 		if len(rows) != 1 {
 			return errors.New("stored local frame disappeared")
-		}
-		if section > math.MaxInt32 {
-			return errors.New("local snapshot stored section exceeds bound")
 		}
 		if err = visit(int(section), ordinal, rows[0].Bytes("record")); err != nil {
 			return err
@@ -685,8 +620,7 @@ func aggregateLocalOriginsTx(ctx context.Context, tx *LocalTx, local aggregateLo
 				err = fmt.Errorf("local acceptance origin unavailable: %w", err)
 			}
 		}()
-		a := local.attempt
-		if a == nil || component < 3 || component > 4 {
+		if (local.attempt == nil && local.retained == nil) || component < 3 || component > 4 {
 			return nil, errors.New("invalid local acceptance reference")
 		}
 		key, acceptedIdentity, err := aggregateLocalRetainedAcceptance(ctx, local.store, component, ordinal)
@@ -747,6 +681,9 @@ func aggregateLocalOriginsTx(ctx context.Context, tx *LocalTx, local aggregateLo
 }
 
 func aggregateLocalOwnedStoreTx(ctx context.Context, tx *LocalTx, local aggregateLocalAudit) (receiverAuditStore, error) {
+	if local.retained != nil {
+		return retainedLocalOwnedStoreTx(ctx, tx, local)
+	}
 	a := local.attempt
 	// UNIQUE(generation,incarnation) is the actual owned-cut lookup index.
 	rows, err := tx.Query(ctx, `SELECT typeof(id) AS ik,length(CAST(id AS BLOB)) AS il,typeof(metadata) AS mk,length(metadata) AS ml,typeof(root) AS rk,length(CAST(root AS BLOB)) AS rl FROM local_automation_cuts WHERE generation=? AND incarnation=? LIMIT 1`, a.request.Generation, a.facts.Incarnation)

@@ -28,16 +28,6 @@ func InsertVMWithPassthrough(ctx context.Context, c *Client, g capabilities.Feat
 	return InsertVMWithHardware(ctx, c, vm, ifaces, disks, nics, pciIntents, adopt)
 }
 
-// MutateDesiredSpecPassthrough is MutateDesiredSpec for an UpdateVM that sets
-// USB devices or turns memory hot-add on.
-func MutateDesiredSpecPassthrough(ctx context.Context, c *Client, g capabilities.FeatureGrant, name string,
-	fn func(oldSpec string) (string, error)) (applied bool, newGen int64, err error) {
-	if err := g.Check(capabilities.FeatureUSBMountsMemory); err != nil {
-		return false, 0, err
-	}
-	return MutateDesiredSpec(ctx, c, name, fn)
-}
-
 // CreateContainerAtomicWithHostAccess is CreateContainerAtomic for a container
 // row whose create spec carries host mounts or devices (a create, an admin's
 // operator restore).

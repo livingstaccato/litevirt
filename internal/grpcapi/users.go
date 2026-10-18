@@ -565,7 +565,7 @@ func (s *Server) auditBindingConflict(ctx context.Context, subject, realm, what 
 // session semantics.
 //
 // factor is the second factor this login presented ("" for none); it is
-// recorded with the session (corrosion.InsertSessionWithFactor), and the
+// recorded with the session (corrosion.InsertSessionWithLoginData), and the
 // second-factor policy reads it back for the session's whole life.
 func (s *Server) mintSession(ctx context.Context, username, realm, clientIP, userAgent, factor string) (token, expiresAt, role string, err error) {
 	return s.mintSessionWithGroups(ctx, username, realm, clientIP, userAgent, factor, nil)

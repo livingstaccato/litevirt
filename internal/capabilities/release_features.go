@@ -103,7 +103,6 @@ var releaseFeatures = map[Feature]FeatureInfo{
 	FeatureUSBMountsMemory: {Token: Release202611V1, Description: "VM USB devices and memory hot-add; container host mounts and devices",
 		Writers: []string{
 			"internal/corrosion.InsertVMWithPassthrough",
-			"internal/corrosion.MutateDesiredSpecPassthrough",
 			"internal/corrosion.CreateContainerAtomicWithHostAccess",
 			"internal/corrosion.UpsertContainerWithHostAccess",
 			"internal/corrosion.InsertVMWithReleaseFeatures",
@@ -175,7 +174,6 @@ var loginPolicyWriters = []string{
 	"internal/corrosion.ResetUserLifecycle",
 	"internal/corrosion.enableUserStatements",
 	"internal/corrosion.SetTwoFactorPolicy",
-	"internal/corrosion.InsertSessionWithFactor",
 	"internal/corrosion.InsertSessionWithLoginData",
 	"internal/corrosion.IssueEnrollmentCode",
 	"internal/corrosion.ConsumeEnrollmentCode",

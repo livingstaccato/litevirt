@@ -598,3 +598,49 @@ func TestHostUpgrade_AllModeUnprobeableBinaryRefusesInsteadOfUpToDate(t *testing
 		t.Fatalf("changed hosts after refusing: swapped %d chunk(s), pre-staged %v", len(activate.sent), client.preStaged)
 	}
 }
+
+// probeCountingClient counts the preflight probes an upgrade sends.
+type probeCountingClient struct {
+	*perHostPreStageClient
+	probed []string
+}
+
+func (m *probeCountingClient) PreflightUpgrade(ctx context.Context, req *pb.PreflightUpgradeRequest, opts ...grpc.CallOption) (*pb.PreflightUpgradeResponse, error) {
+	m.probed = append(m.probed, req.GetTargetHost())
+	return m.perHostPreStageClient.PreflightUpgrade(ctx, req, opts...)
+}
+
+// The same holds when some member is on an older build: the connected
+// daemon's version is still no proof that a member on it runs the binary,
+// so skipping those members would leave them unswapped and un-pre-staged
+// while the older ones moved to the binary's schema. All-hosts mode refuses
+// before it probes, pre-stages or swaps anything.
+//
+// Mutation: refuse only when no target remains — node1 is skipped, node2 is
+// probed, pre-staged and swapped, red.
+func TestHostUpgrade_AllModeUnprobeableBinaryRefusesWithMixedVersions(t *testing.T) {
+	bin := writeFakeBinary(t)
+	activate := &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok"}}
+	client := &probeCountingClient{perHostPreStageClient: &perHostPreStageClient{mockUpgradeClient: &mockUpgradeClient{
+		stream: activate,
+		hosts: []*pb.Host{
+			// node1 on the connected daemon's version (the mock Ping's
+			// v1.0.0), node2 on an older build.
+			{Name: "node1", Address: "10.0.0.1", Version: "v1.0.0"},
+			{Name: "node2", Address: "10.0.0.2", Version: "v0.9.0"},
+		},
+	}}}
+	err := HostUpgrade(context.Background(), client, UpgradeOpts{BinaryPath: bin, Yes: true})
+	if err == nil {
+		t.Fatal("upgraded a subset of the members against a binary whose version could not be read")
+	}
+	for _, want := range []string{"could not be read", bin, "lv host upgrade <host>"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not contain %q", err, want)
+		}
+	}
+	if len(client.probed) != 0 || len(client.preStaged) != 0 || len(activate.sent) != 0 {
+		t.Fatalf("changed hosts after refusing: probed %v, pre-staged %v, swapped %d chunk(s)",
+			client.probed, client.preStaged, len(activate.sent))
+	}
+}

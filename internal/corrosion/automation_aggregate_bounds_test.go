@@ -50,6 +50,12 @@ func (c *aggregateBoundsConn) PrepareContext(ctx context.Context, query string) 
 }
 func (c *aggregateBoundsConn) observeQuery(ctx context.Context, q string, args []driver.NamedValue, execute func() (driver.Rows, error)) (driver.Rows, error) {
 	reader := c.Conn.(driver.QueryerContext)
+	if strings.HasPrefix(q, "SELECT record FROM local_automation_local_rows ") && len(args) >= 3 && args[len(args)-2].Value == int64(66) {
+		if evidence, ok := ctx.Value(retainedHeapTestKey{}).(*retainedHeapEvidence); ok {
+			evidence.beforeNextBody()
+		}
+	}
+
 	if strings.HasPrefix(q, "SELECT record FROM local_automation_receiver_records ") {
 		if evidence, ok := ctx.Value(aggregateHeapTestKey{}).(*aggregateHeapEvidence); ok {
 			evidence.beforeOriginalRead()
@@ -59,7 +65,8 @@ func (c *aggregateBoundsConn) observeQuery(ctx context.Context, q string, args [
 	c.state.mu.Lock()
 	enabled := c.state.enabled
 	c.state.mu.Unlock()
-	tracked := enabled && (strings.Contains(q, "FROM local_automation_aggregate_") || strings.Contains(q, "FROM local_automation_aggregates ") || strings.HasPrefix(q, "SELECT record FROM local_automation_receiver_records ") || strings.HasPrefix(q, "SELECT record FROM local_automation_local_rows ") || strings.HasPrefix(q, "SELECT record FROM local_automation_cut_records "))
+	retainedMetadata := strings.Contains(q, " FROM local_automation_retained_")
+	tracked := enabled && (retainedMetadata || strings.Contains(q, "FROM local_automation_aggregate_") || strings.Contains(q, "FROM local_automation_aggregates ") || strings.HasPrefix(q, "SELECT record FROM local_automation_receiver_records ") || strings.HasPrefix(q, "SELECT record FROM local_automation_local_rows ") || strings.HasPrefix(q, "SELECT record FROM local_automation_cut_records "))
 	if tracked {
 		rows, err := reader.QueryContext(ctx, "EXPLAIN QUERY PLAN "+q, args)
 		if err != nil {
@@ -84,12 +91,13 @@ func (c *aggregateBoundsConn) observeQuery(ctx context.Context, q string, args [
 		c.state.mu.Lock()
 		c.state.queries++
 		c.state.plans[q] = detail
-		if !strings.Contains(detail, "SEARCH ") || strings.Contains(detail, "SCAN ") || strings.Contains(detail, "TEMP B-TREE") || !strings.Contains(q, "LIMIT 1") {
+		indexedFirst := retainedMetadata && !strings.Contains(q, " WHERE ") && strings.Contains(q, " ORDER BY ") && (strings.Contains(detail, "USING INDEX") || strings.Contains(detail, "USING COVERING INDEX"))
+		if (!indexedFirst && (!strings.Contains(detail, "SEARCH ") || strings.Contains(detail, "SCAN "))) || strings.Contains(detail, "TEMP B-TREE") || !strings.Contains(q, "LIMIT 1") {
 			c.state.bad = append(c.state.bad, q+" => "+detail)
 		}
 		if strings.Contains(q, "typeof(") {
 			c.state.probes++
-		} else if strings.HasPrefix(q, "SELECT origin_kind,") || strings.HasPrefix(q, "SELECT claim_key,") {
+		} else if retainedMetadata || strings.HasPrefix(q, "SELECT origin_kind,") || strings.HasPrefix(q, "SELECT claim_key,") {
 			c.state.bodies++
 		}
 		c.state.mu.Unlock()

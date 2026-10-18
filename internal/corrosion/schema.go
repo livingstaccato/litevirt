@@ -581,7 +581,8 @@ import (
 // These rows confer no current proof, origin authority or active adoption.
 // v78: causal key epoch, recipient and payload wrapping projections.
 // v79: signed receiver-established floors and current-row complete inventory; never live proof.
-const CurrentSchemaVersion = 79
+// v80: immutable retained-origin delivery/object/completion pins; no active authority.
+const CurrentSchemaVersion = 80
 
 // schemaVersionCredentialRetirement is the version
 // host_fence_credentials.after_retirement was added in.
@@ -2927,6 +2928,18 @@ var schemaDDL = []string{
  local_id TEXT NOT NULL, section INTEGER NOT NULL, ordinal INTEGER NOT NULL,
  record BLOB NOT NULL, PRIMARY KEY(local_id,section,ordinal)
  )`,
+	`CREATE TABLE IF NOT EXISTS local_automation_retained_deliveries (
+ id TEXT PRIMARY KEY, attempt TEXT NOT NULL, envelope BLOB NOT NULL
+ );`,
+	`CREATE TABLE IF NOT EXISTS local_automation_retained_objects (
+ delivery TEXT NOT NULL, ordinal INTEGER NOT NULL CHECK(ordinal > 0),
+ namespace TEXT NOT NULL UNIQUE, descriptor BLOB NOT NULL,
+ PRIMARY KEY(delivery,ordinal)
+ );`,
+	`CREATE TABLE IF NOT EXISTS local_automation_retained_completions (
+ delivery TEXT PRIMARY KEY, evidence_digest TEXT NOT NULL,
+ candidate_ref BLOB NOT NULL, coverage_digest TEXT NOT NULL
+ );`,
 	`CREATE TABLE IF NOT EXISTS local_automation_aggregates (
  id TEXT PRIMARY KEY, attempt TEXT NOT NULL, local_id TEXT NOT NULL,
  head BLOB NOT NULL, coverage TEXT NOT NULL, roster BLOB NOT NULL
@@ -3991,6 +4004,7 @@ var createTableUnits = []struct {
 	{70, "local_automation_requests"}, {70, "local_automation_recovery"}, {70, "local_automation_staging"},
 	{71, "local_automation_cuts"}, {71, "local_automation_cut_records"},
 	{72, "local_automation_source_jobs"}, {72, "local_automation_publications"},
+	{80, "local_automation_retained_deliveries"}, {80, "local_automation_retained_objects"}, {80, "local_automation_retained_completions"},
 	{79, "local_automation_receiver_established"},
 	{78, "local_automation_key_epochs"}, {78, "local_automation_key_recipients"}, {78, "local_automation_payload_wrappings"},
 	{77, "local_automation_local_audits"},

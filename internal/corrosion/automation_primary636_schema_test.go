@@ -8,7 +8,7 @@ import (
 
 // Catch a collision that marks the retirement ALTER applied without executing
 // it, or omits/misclassifies an automation table when moving SQL versions.
-func TestAutomationPrimary636Upgrade67Through79(t *testing.T) {
+func TestAutomationPrimary636Upgrade67Through80(t *testing.T) {
 	c := NewTestClientT(t)
 	ctx := context.Background()
 	for _, ddl := range schemaDDL {
@@ -111,7 +111,7 @@ func TestAutomationPrimary636Upgrade67Through79(t *testing.T) {
 	if storedVersion(t, c) != CurrentSchemaVersion || appliedCount(t, c) != len(schemaMigrationLedger) {
 		t.Fatal("upgrade omitted current schema or ledger units")
 	}
-	want := map[int]int{70: 7, 71: 2, 72: 2, 73: 7, 74: 3, 75: 8, 76: 2, 77: 7, 78: 3, 79: 2}
+	want := map[int]int{70: 7, 71: 2, 72: 2, 73: 7, 74: 3, 75: 8, 76: 2, 77: 7, 78: 3, 79: 2, 80: 3}
 	for _, m := range schemaMigrationLedger {
 		if m.Version < 70 {
 			continue

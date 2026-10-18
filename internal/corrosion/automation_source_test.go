@@ -32,6 +32,10 @@ func sourcePreparationFixtureWithPeer(t *testing.T, dataDir string) (*Automation
 	return sourcePreparationFixtureWithSeed(t, dataDir, nil)
 }
 func sourcePreparationFixtureWithSeed(t *testing.T, dataDir string, seed func(*claimTestVoter)) (*AutomationSourcePreparer, AutomationSourceRequest, *claimTestVoter) {
+	return sourcePreparationFixtureWithInitialSeed(t, dataDir, nil, seed)
+}
+
+func sourcePreparationFixtureWithInitialSeed(t *testing.T, dataDir string, initial, seed func(*claimTestVoter)) (*AutomationSourcePreparer, AutomationSourceRequest, *claimTestVoter) {
 	t.Helper()
 	ctx := context.Background()
 	ca := newClaimTestCA(t)
@@ -54,6 +58,9 @@ func sourcePreparationFixtureWithSeed(t *testing.T, dataDir string, seed func(*c
 	}
 	if err := copyTestFile(ca.key, filepath.Join(a.pki, "ca.key")); err != nil {
 		t.Fatal(err)
+	}
+	if initial != nil {
+		initial(a)
 	}
 	choose := func(prev *VoterConfig, value VoterConfigValue) *VoterConfig {
 		key := ClaimKey{TargetKind: ClaimKindVoterConfig, OwnerEpoch: value.Generation - 1}

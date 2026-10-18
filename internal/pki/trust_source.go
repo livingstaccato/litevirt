@@ -76,3 +76,22 @@ func (v *HostCertificateValidation) Discard() {
 	delete(o.capabilities, v)
 	<-o.gate
 }
+
+// VerifyHostCertificate checks a chain against this exact immutable snapshot
+// without registering a live capability. It is suitable inside an existing
+// lease; callers still own current capability/lease and signature validation.
+func (v *HostTrust) VerifyHostCertificate(chain [][]byte, host string) (time.Time, time.Time, error) {
+	_, before, after, err := v.verifyHost(chain, host, false)
+	return before, after, err
+}
+
+// VerifyOriginalHostProvenance checks recorded-authorized original evidence
+// against this exact current snapshot. The original leaf's later retirement,
+// successor and expiry are historical; its signature, lower validity bound and
+// every selected nonleaf/root predicate remain strict. Returned bounds cover
+// all predicates that must remain current through the caller's final commit.
+// No capability is registered. Current holders must use strict live validation.
+func (v *HostTrust) VerifyOriginalHostProvenance(chain [][]byte, host string) (time.Time, time.Time, error) {
+	_, before, after, err := v.verifyHostEvidence(chain, host, false, true)
+	return before, after, err
+}

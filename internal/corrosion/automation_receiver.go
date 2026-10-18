@@ -448,10 +448,10 @@ func (r *AutomationReceiver) transaction(ctx context.Context, a *AutomationRecei
 }
 
 func (r *AutomationReceiver) transactionCurrent(ctx context.Context, a *AutomationReceiverAttempt, lease *pki.HostCertificateLease, observed time.Time, proof *AutomationCurrentProof, fn func(*LocalTx) error) error {
-	return r.transactionGuarded(ctx, a, lease, observed, proof, nil, fn)
+	return r.transactionGuarded(ctx, a, lease, observed, proof, nil, nil, fn)
 }
 
-func (r *AutomationReceiver) transactionGuarded(ctx context.Context, a *AutomationReceiverAttempt, lease *pki.HostCertificateLease, observed time.Time, proof *AutomationCurrentProof, established *receiverEstablishmentCommit, fn func(*LocalTx) error) error {
+func (r *AutomationReceiver) transactionGuarded(ctx context.Context, a *AutomationReceiverAttempt, lease *pki.HostCertificateLease, observed time.Time, proof *AutomationCurrentProof, established *receiverEstablishmentCommit, retained *retainedTransactionGuard, fn func(*LocalTx) error) error {
 	c := r.client
 	for !c.mu.TryLock() {
 		timer := time.NewTimer(5 * time.Millisecond)
@@ -505,6 +505,11 @@ func (r *AutomationReceiver) transactionGuarded(ctx context.Context, a *Automati
 	}
 	if proof != nil {
 		if err = r.revalidateCurrentTx(ctx, local, proof); err != nil {
+			return err
+		}
+	}
+	if retained != nil {
+		if err = retained.checkTx(ctx, local); err != nil {
 			return err
 		}
 	}

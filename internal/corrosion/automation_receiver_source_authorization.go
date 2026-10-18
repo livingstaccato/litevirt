@@ -41,6 +41,16 @@ func (r *AutomationReceiver) authorizeSource(ctx context.Context, a *AutomationR
 	if member.Name == "" {
 		return out, errors.New("receiver source is not in fixed old roster")
 	}
+	return r.authorizeMember(ctx, a, member, a.request.Generation)
+}
+
+// Membership selection remains with the concrete old-source/current-holder
+// owners. This shared transport/PKI reader does not select provenance mode.
+func (r *AutomationReceiver) authorizeMember(ctx context.Context, a *AutomationReceiverAttempt, member VoterMember, generation int64) (out receiverSourceAuthorization, err error) {
+	if a == nil || a.self != a || a.owner != r || member.Name == "" {
+		return out, errors.New("foreign receiver member authorization")
+	}
+	source := member.Name
 	// Read-only authorization before metadata/body loading or network acquisition.
 	if err = r.client.sourceExportReadLock(ctx); err != nil {
 		return out, err
@@ -74,7 +84,7 @@ func (r *AutomationReceiver) authorizeSource(ctx context.Context, a *AutomationR
 		fp := sha256.Sum256(a.pair.Certificate[0])
 		peer = sourceTarget{Host: host, Incarnation: a.facts.Incarnation, Chain: a.pair.Certificate, Fingerprint: hex.EncodeToString(fp[:]), Local: true}
 	} else {
-		_, peer, err = sourceQueryPeer(ctx, r.dir, host, a.request.Generation, false)
+		_, peer, err = sourceQueryPeer(ctx, r.dir, host, generation, false)
 		if err != nil {
 			return out, err
 		}

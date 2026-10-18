@@ -23,13 +23,16 @@ import (
 // nodeLocalClaimTables are the tables ExecuteLocal may write. Each is absent
 // from tableNames and sensitiveTableNames (TestNodeLocalClaimTablesAreNotReplicated).
 var nodeLocalClaimTables = map[string]bool{
-	"local_automation_local_audits":        true,
-	"local_automation_local_rows":          true,
-	"local_automation_aggregates":          true,
-	"local_automation_aggregate_sources":   true,
-	"local_automation_aggregate_copies":    true,
-	"local_automation_aggregate_maxima":    true,
-	"local_automation_aggregate_conflicts": true,
+	"local_automation_retained_deliveries":  true,
+	"local_automation_retained_objects":     true,
+	"local_automation_retained_completions": true,
+	"local_automation_local_audits":         true,
+	"local_automation_local_rows":           true,
+	"local_automation_aggregates":           true,
+	"local_automation_aggregate_sources":    true,
+	"local_automation_aggregate_copies":     true,
+	"local_automation_aggregate_maxima":     true,
+	"local_automation_aggregate_conflicts":  true,
 
 	"local_automation_credential_issuance":  true,
 	"local_automation_lifetimes":            true,

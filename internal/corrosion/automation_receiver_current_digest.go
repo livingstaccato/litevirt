@@ -15,6 +15,9 @@ type receiverAggregateEvidence struct{ aggregate, digest string }
 
 func currentEvidenceTables() []aggregateLocalTable {
 	tables := []aggregateLocalTable{
+		{"local_automation_retained_deliveries", "id,attempt,envelope", "id", "ttb", false},
+		{"local_automation_retained_objects", "delivery,ordinal,namespace,descriptor", "delivery,ordinal", "titb", false},
+		{"local_automation_retained_completions", "delivery,evidence_digest,candidate_ref,coverage_digest", "delivery", "ttbt", false},
 		receiverEstablishedTable(),
 		{"local_automation_receiver_jobs", "id,job,revision,binding,evidence", "id", "ttibb", false},
 		{"local_automation_receiver_current", "id,attempt,established_inventory", "id", "itb", false},
@@ -48,6 +51,12 @@ func currentEvidenceTables() []aggregateLocalTable {
 }
 func currentEvidenceLimit(column string) int64 {
 	switch column {
+	case "envelope":
+		return maxSourceArtifactBytes
+	case "descriptor", "candidate_ref":
+		return maxAutomationCutMetadataBytes
+	case "namespace":
+		return 96
 	case "established_inventory":
 		return maxReceiverInventoryBytes
 	case "artifact":

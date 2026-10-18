@@ -37,22 +37,6 @@ import (
 
 const sessionFactorInsertSQL = `INSERT INTO session_factors (session_id, method, presented_at, updated_at) VALUES (?, ?, ?, ?)`
 
-// InsertSessionWithFactor creates a session row and, when factor is not
-// empty, records in the same batch that its login presented that second
-// factor ("totp", "webauthn"). Without a grant for
-// capabilities.FeatureLoginPolicy the factor is not recorded: such a session
-// counts as password-only, which only ever confines it (no policy can be set
-// before the feature opens).
-func InsertSessionWithFactor(ctx context.Context, c *Client, g capabilities.FeatureGrant, s SessionRecord, factor string) error {
-	if factor == "" || g.Check(capabilities.FeatureLoginPolicy) != nil {
-		return InsertSession(ctx, c, s)
-	}
-	return c.executeCredentialBatch(ctx, s.automationAuthentication, "session", s.ID, s.Username, []Statement{
-		sessionInsertStatement(s),
-		{SQL: sessionFactorInsertSQL, Params: []interface{}{s.ID, factor, s.CreatedAt, c.NowTS()}},
-	})
-}
-
 // SessionFactor returns the second factor session id's login presented, "" if
 // it presented none. A read that fails is an error, never "".
 func SessionFactor(ctx context.Context, c *Client, id string) (string, error) {

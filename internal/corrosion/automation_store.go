@@ -52,11 +52,21 @@ func automationDecision(v ClaimValue) (contract.Decision, error) {
 	if err != nil {
 		return d, fmt.Errorf("invalid automation envelope")
 	}
-	b, err := json.Marshal(v)
-	if err != nil || len(b) > MaxAutomationClaimBytes {
+	if automationOuterSize(v.Automation.Envelope) > uint64(MaxAutomationClaimBytes) {
 		return d, fmt.Errorf("automation value exceeds storage limit")
 	}
 	return d, nil
+}
+
+// automationOuterSize is exact only for the shape protected by the alternative
+// guard in automationDecision and TestAutomationOuterSizeShape. A future field,
+// tag or marshaler change requires re-proving this contract or restoring Marshal.
+// Convert before arithmetic: even MaxInt64 slice length fits the uint64 result.
+func automationOuterSize(envelope []byte) uint64 {
+	if envelope == nil {
+		return uint64(len(`{"automation":{"envelope":null}}`))
+	}
+	return uint64(len(`{"automation":{"envelope":""}}`)) + ((uint64(len(envelope))+2)/3)*4
 }
 
 func validateAutomationValue(k ClaimKey, v ClaimValue) error {

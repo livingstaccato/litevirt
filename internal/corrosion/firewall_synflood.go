@@ -13,6 +13,7 @@ package corrosion
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -177,18 +178,17 @@ func ResolveFirewallSynflood(ctx context.Context, c *Client, host string) (Firew
 // cluster's policy, once, from the founder of a cluster this build created
 // (DECISION S-1). It takes the firewall_synflood grant, so it runs only once
 // release_2026_11_v1 has latched, and writes only while no cluster row is
-// recorded, the cluster_policies gate is open, and this replica has caught
-// up with a peer or knows no host but hostName (SeedFirewallEnforcement's
-// guard). The row is stamped seedTS, before any real write, so any
+// recorded (decided in the write's own transaction), the cluster_policies
+// gate is open, and this replica has caught up with a peer or knows no host
+// but hostName (SeedFirewallEnforcement's guard). The row is stamped seedTS, before any real write, so any
 // operator's write outranks it on every replica. It reports whether it
 // wrote.
 func SeedFirewallSynflood(ctx context.Context, c *Client, g capabilities.FeatureGrant, hostName string) (bool, error) {
 	if err := g.Check(capabilities.FeatureFirewallSynflood); err != nil {
 		return false, err
 	}
-	rows, err := c.Query(ctx, `SELECT 1 FROM cluster_policies WHERE key = ?`, FirewallSynfloodKey(""))
-	if err != nil || len(rows) > 0 || !c.MayWriteClusterPolicy() {
-		return false, err
+	if !c.MayWriteClusterPolicy() {
+		return false, nil
 	}
 	if caught, _ := c.ReplicaCaughtUp(); !caught {
 		rows, err := c.Query(ctx, `SELECT COUNT(*) AS n FROM hosts WHERE name != ?`, hostName)
@@ -203,9 +203,15 @@ func SeedFirewallSynflood(ctx context.Context, c *Client, g capabilities.Feature
 	if err != nil {
 		return false, err
 	}
-	if err := c.Execute(ctx, clusterPolicyUpsertSQL, FirewallSynfloodKey(""), string(v),
-		"litevirt (initial)", seedTS(FirewallEnforce)); err != nil {
-		return false, err
-	}
-	return true, nil
+	// Insert only if absent, decided inside the write's own transaction: an
+	// operator's row that arrives between a separate check and the write
+	// must never be overwritten by the 0001 seed stamp, even locally.
+	key := FirewallSynfloodKey("")
+	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var n int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM cluster_policies WHERE key = ?`, key).Scan(&n); err != nil {
+			return false, err
+		}
+		return n == 0, nil
+	}, []Statement{{SQL: clusterPolicyUpsertSQL, Params: []interface{}{key, string(v), "litevirt (initial)", seedTS(FirewallEnforce)}}})
 }

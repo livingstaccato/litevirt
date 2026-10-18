@@ -319,7 +319,7 @@ func (r *Reconciler) applyOne(ctx context.Context, a Action, idx desiredIndex, f
 		// IPID is only ever a litevirt-owned address — BuildActual admits no
 		// other into the set Diff clears from — so this branch cannot detach an
 		// operator's address even by mistake.
-		return r.nb.ClearIPAssignment(ctx, a.IPID)
+		return r.clearAddress(ctx, a)
 	case a.Kind == kindVM && (a.Op == opPrimaryIP || a.Op == opPrimaryIP6):
 		return r.setPrimaryIP(ctx, a)
 	case a.Op == "delete":
@@ -327,6 +327,35 @@ func (r *Reconciler) applyOne(ctx context.Context, a Action, idx desiredIndex, f
 	default:
 		return fmt.Errorf("netboxsync: unhandled action %s/%s for %s", a.Kind, a.Op, a.Key)
 	}
+}
+
+// clearAddress detaches one stale litevirt-owned address, nulling first the
+// primary of its VM that names it.
+//
+// NetBox refuses to detach an address while it is its VM's primary_ip4 or
+// primary_ip6 (IPAddress.clean: "Cannot reassign IP address while it is
+// designated as the primary IP for the parent object"), and the primary phase
+// that would move the primary off it runs after this one. Only the field that
+// names this address is nulled; the primary phase then writes the desired one.
+func (r *Reconciler) clearAddress(ctx context.Context, a Action) error {
+	if a.ClearsPrimary4 || a.ClearsPrimary6 {
+		if a.ParentNetBoxID == 0 {
+			return fmt.Errorf("netboxsync: clear of primary address %d names no VM", a.IPID)
+		}
+		if a.ClearsPrimary4 {
+			if err := r.nb.SetPrimaryIP4(ctx, a.ParentNetBoxID, 0); err != nil {
+				return fmt.Errorf("netboxsync: clear primary_ip4 of VM %d before detaching address %d: %w",
+					a.ParentNetBoxID, a.IPID, err)
+			}
+		}
+		if a.ClearsPrimary6 {
+			if err := r.nb.SetPrimaryIP6(ctx, a.ParentNetBoxID, 0); err != nil {
+				return fmt.Errorf("netboxsync: clear primary_ip6 of VM %d before detaching address %d: %w",
+					a.ParentNetBoxID, a.IPID, err)
+			}
+		}
+	}
+	return r.nb.ClearIPAssignment(ctx, a.IPID)
 }
 
 // createVM creates or ADOPTS one virtual machine.

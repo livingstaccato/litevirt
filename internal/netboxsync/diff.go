@@ -83,6 +83,12 @@ type Action struct {
 	// Record only — neither applier proof consults it — but it is what makes
 	// the log line and the refusals legible.
 	FreesName string
+
+	// ClearsPrimary4 and ClearsPrimary6 mark a "clear" of the address the
+	// owning VM's primary_ip4 / primary_ip6 currently names. NetBox refuses to
+	// detach a primary, so the applier nulls that primary first.
+	ClearsPrimary4 bool
+	ClearsPrimary6 bool
 }
 
 // ── vm/replace: the superseded incarnation of a reused name ─────────────────
@@ -499,9 +505,15 @@ func Diff(desired []DesiredVM, actual Actual, fingerprint string) []Action {
 			// list, whatever order the API returned.
 			sort.Ints(stale)
 			for _, id := range stale {
+				// A stale address that is still the VM's primary cannot be
+				// detached until the primary is moved off it, and the primary
+				// phase runs after this one: the clear carries which primary
+				// names it, and the applier nulls that one first.
 				out = append(out, Action{
 					Kind: "nic", Op: "clear", Key: nicID,
 					NetBoxID: an.ID, ParentNetBoxID: a.ID, IPID: id,
+					ClearsPrimary4: a.PrimaryIP4ID == id,
+					ClearsPrimary6: a.PrimaryIP6ID == id,
 				})
 			}
 		}

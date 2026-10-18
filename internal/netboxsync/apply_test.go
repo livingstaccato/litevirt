@@ -815,7 +815,9 @@ type stubVirt struct {
 	deletedInterfaces []int
 	ipAssignments     []ipAssignment
 	cleared           []int
-	deviceLookups     []string
+	// order records the primary and clear writes in sequence.
+	order         []string
+	deviceLookups []string
 
 	nextID int
 }
@@ -995,6 +997,7 @@ func (s *stubVirt) ClearIPAssignment(_ context.Context, ipID int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cleared = append(s.cleared, ipID)
+	s.order = append(s.order, "clear")
 	return nil
 }
 
@@ -1002,6 +1005,7 @@ func (s *stubVirt) SetPrimaryIP4(_ context.Context, vmID, ipID int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.primaryIPs = append(s.primaryIPs, [2]int{vmID, ipID})
+	s.order = append(s.order, "primary4")
 	return nil
 }
 
@@ -1042,6 +1046,7 @@ func (s *stubVirt) SetPrimaryIP6(_ context.Context, vmID, ipID int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.primaryIP6s = append(s.primaryIP6s, [2]int{vmID, ipID})
+	s.order = append(s.order, "primary6")
 	return nil
 }
 

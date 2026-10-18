@@ -1007,6 +1007,18 @@ func (f *NetBoxFake) VMPrimaryIP4(name string) int {
 	return 0
 }
 
+// VMPrimaryIP6 is the named VM's primary_ip6 address id, or 0 for none.
+func (f *NetBoxFake) VMPrimaryIP6(name string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, vm := range f.vms {
+		if vm.Name == name {
+			return vm.PrimaryIP6ID
+		}
+	}
+	return 0
+}
+
 // InterfaceAddressID is the id of the address assigned to one VM's named
 // interface, or 0. It is what "primary_ip4 points at this VM's own address" is
 // asserted against — comparing against a hard-coded id would pass with the

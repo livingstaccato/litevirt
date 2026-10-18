@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -55,18 +54,7 @@ func main() {
 			os.Exit(lxc.RunHook(os.Args[2:]))
 		}
 	}
-	root := newRootCmd()
-	args := os.Args[1:]
-	ctx, caught := context.Background(), func() os.Signal { return nil }
-	stop := func() {}
-	if !handlesOwnSignals(root, args) {
-		in := newInterrupts(ctx, os.Exit)
-		stop = in.watch()
-		ctx, caught = in.ctx, in.caught
-	}
-	code := runRoot(ctx, root, args, caught, os.Stderr)
-	stop()
-	os.Exit(code)
+	os.Exit(runProcess(newRootCmd(), os.Args[1:], os.Stderr))
 }
 
 // bootstrapDefaultLogger installs a plain, real slog handler as the

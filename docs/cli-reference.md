@@ -285,8 +285,10 @@ to another host meanwhile. Its cluster writes from that point have 10 minutes;
 libvirt and storage calls are not cut short. `lv ct rm` behaves the same from
 the container's runtime delete on. A command interrupted by Ctrl-C or SIGTERM
 reports that the delete may still complete on its host, names `lv ls` (`lv ct
-ls` for a container, `lv compose ls` for a stack) to see the outcome, and exits
-130 (143 for SIGTERM). A second Ctrl-C exits at once, without the report.
+ls` for a container, `lv compose ls` for a stack) to see the outcome, and then
+ends by the signal (the shell sees 130, or 143 for SIGTERM). Any command still
+running 2 seconds after the signal (one waiting at a prompt, or on an ssh
+step) ends then, and a second Ctrl-C ends it at once, without the report.
 
 `lv rebuild` and a `lv compose up` that re-creates a VM work the same way.
 Interrupted before the re-create sends its delete (a rebuild: before its

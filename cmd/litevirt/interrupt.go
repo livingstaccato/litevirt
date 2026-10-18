@@ -2,55 +2,69 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // ownSignalsAnnotation marks a command that handles SIGINT and SIGTERM
-// itself (the daemon's graceful shutdown): main installs no interrupt
-// handler for it.
+// itself (the daemon's graceful shutdown): it runs with no interrupt handler.
 const ownSignalsAnnotation = "litevirt/own-signals"
 
 // interruptSignals cancel a CLI command's context.
 var interruptSignals = []os.Signal{syscall.SIGINT, syscall.SIGTERM}
 
+// interruptGrace is how long a command has, after the first interrupt
+// signal cancelled its context, to return before the process dies by that
+// signal anyway: a prompt, a password read or an ssh step does not read the
+// context.
+const interruptGrace = 2 * time.Second
+
 // interrupts turns the first SIGINT or SIGTERM into a cancel of the command's
 // context, so an RPC in flight returns Canceled and the command reports what
-// may still complete on the server. A second signal exits at once.
+// may still complete on the server. The process dies by that signal once the
+// command returns, when the grace runs out, or at a second signal, whichever
+// comes first.
 type interrupts struct {
 	ctx    context.Context
 	cancel context.CancelFunc
-	exit   func(int)
+	grace  time.Duration
+	die    func(os.Signal)
 
 	mu    sync.Mutex
 	first os.Signal
+	timer *time.Timer
 }
 
-func newInterrupts(parent context.Context, exit func(int)) *interrupts {
+func newInterrupts(parent context.Context, grace time.Duration, die func(os.Signal)) *interrupts {
 	ctx, cancel := context.WithCancel(parent)
-	return &interrupts{ctx: ctx, cancel: cancel, exit: exit}
+	return &interrupts{ctx: ctx, cancel: cancel, grace: grace, die: die}
 }
 
-// deliver handles one signal: the first cancels the context, the next exits
-// with 128 + its number.
+// deliver handles one signal: the first cancels the context and arms the
+// grace, the next dies by the signal.
 func (in *interrupts) deliver(sig os.Signal) {
 	in.mu.Lock()
 	first := in.first == nil
 	if first {
 		in.first = sig
+		in.timer = time.AfterFunc(in.grace, func() { in.die(sig) })
 	}
 	in.mu.Unlock()
 	if first {
 		in.cancel()
 		return
 	}
-	in.exit(signalExitCode(sig))
+	in.die(sig)
 }
 
 // caught is the first signal delivered, nil if none.
@@ -58,6 +72,16 @@ func (in *interrupts) caught() os.Signal {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	return in.first
+}
+
+// close disarms the grace and cancels the context.
+func (in *interrupts) close() {
+	in.mu.Lock()
+	if in.timer != nil {
+		in.timer.Stop()
+	}
+	in.mu.Unlock()
+	in.cancel()
 }
 
 // watch delivers the process's interrupt signals until stop is called. A
@@ -88,8 +112,21 @@ func (in *interrupts) watch() (stop func()) {
 	return func() {
 		signal.Stop(ch)
 		close(done)
-		in.cancel()
+		in.close()
 	}
+}
+
+// dieBySignal ends the process by sig with its default action, as if the
+// signal had never been caught, so a shell loop or xargs running the command
+// stops: they stop only for a child that died by the signal. The exit is
+// a fallback only.
+func dieBySignal(sig os.Signal) {
+	if s, ok := sig.(syscall.Signal); ok {
+		signal.Reset(s)
+		_ = syscall.Kill(syscall.Getpid(), s)
+		time.Sleep(time.Second)
+	}
+	os.Exit(signalExitCode(sig))
 }
 
 func signalExitCode(sig os.Signal) int {
@@ -106,25 +143,52 @@ func handlesOwnSignals(root *cobra.Command, args []string) bool {
 	return err == nil && c.Annotations[ownSignalsAnnotation] == "true"
 }
 
+// runProcess runs root with args as the process does, with the interrupt
+// handler unless the command handles its signals itself, and returns the
+// exit code. After an interrupt signal it does not return: the process dies
+// by the signal.
+func runProcess(root *cobra.Command, args []string, stderr io.Writer) int {
+	if handlesOwnSignals(root, args) {
+		return runRoot(context.Background(), root, args, func() os.Signal { return nil }, dieBySignal, stderr)
+	}
+	in := newInterrupts(context.Background(), interruptGrace, dieBySignal)
+	stop := in.watch()
+	defer stop()
+	return runRoot(in.ctx, root, args, in.caught, dieBySignal, stderr)
+}
+
 // runRoot executes root with args on ctx and returns the process exit code.
-// A command that failed after an interrupt signal (caught) exits with
-// 128 + that signal's number, after its error is printed.
-func runRoot(ctx context.Context, root *cobra.Command, args []string, caught func() os.Signal, stderr io.Writer) int {
+// After an interrupt signal (caught) the command's error is printed, unless
+// it is only the cancellation itself, and then die is called with the
+// signal; when die returns (a test), the code is 128 + the signal's number.
+func runRoot(ctx context.Context, root *cobra.Command, args []string, caught func() os.Signal, die func(os.Signal), stderr io.Writer) int {
 	root.SetArgs(args)
 	err := root.ExecuteContext(ctx)
-	if err == nil {
-		return 0
+	sig := caught()
+	code := 0
+	if err != nil {
+		// A silent typed exit carries the code and has already said
+		// everything it wants to say (e.g. `lv health` printed its report;
+		// the code IS the answer). Printing a generic Error: line would bury
+		// the report.
+		var silent bool
+		code, silent = exitCodeOf(err)
+		if !silent {
+			code = 1
+			if sig == nil || !isBareCancel(err) {
+				fmt.Fprintf(stderr, "Error: %v\n", err)
+			}
+		}
 	}
-	// A silent typed exit carries the code and has already said everything
-	// it wants to say (e.g. `lv health` printed its report; the code IS the
-	// answer). Printing a generic Error: line would bury the report.
-	code, silent := exitCodeOf(err)
-	if !silent {
-		fmt.Fprintf(stderr, "Error: %v\n", err)
-		code = 1
-	}
-	if sig := caught(); sig != nil {
-		code = signalExitCode(sig)
+	if sig != nil {
+		die(sig)
+		return signalExitCode(sig)
 	}
 	return code
+}
+
+// isBareCancel reports whether err says only that the command's context was
+// cancelled (a stream ended by Ctrl-C), with nothing the operator needs.
+func isBareCancel(err error) bool {
+	return errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled
 }

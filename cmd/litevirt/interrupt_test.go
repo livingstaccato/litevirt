@@ -1,15 +1,20 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -47,15 +52,21 @@ func (c heldClient) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest, _ .
 	return &pb.VM{Name: req.Name}, c.hold(ctx)
 }
 
+// dieRecorder stands in for dying by a signal, recording each call.
+func dieRecorder() (func(os.Signal), <-chan os.Signal) {
+	ch := make(chan os.Signal, 8)
+	return func(s os.Signal) { ch <- s }, ch
+}
+
 // An interrupt while a delete or rebuild is in flight cancels the command's
 // context: the RPC returns Canceled, the command says the operation may still
-// complete and names the command that shows it, and the process exits with
-// 128 + the signal. A second signal exits at once.
+// complete and names the command that shows it, and the process then dies by
+// the signal. A second signal dies at once.
 //
 // Mutations: execute the root without the context (Execute()) — the RPC is
-// never cancelled and the command reports success; drop the signal's exit
-// code — exit 1; let a second signal do nothing — red.
-func TestInterrupt_AnInFlightCommandReportsWhatMayStillCompleteAndExits(t *testing.T) {
+// never cancelled and the command reports success; do not die after the
+// command returns — red; let a second signal do nothing — red.
+func TestInterrupt_AnInFlightCommandReportsWhatMayStillCompleteAndDies(t *testing.T) {
 	for _, c := range []struct {
 		name  string
 		args  []string
@@ -76,14 +87,15 @@ func TestInterrupt_AnInFlightCommandReportsWhatMayStillCompleteAndExits(t *testi
 			}
 			t.Cleanup(func() { cli.Connect = orig })
 
-			exited := make(chan int, 1)
-			in := newInterrupts(context.Background(), func(code int) { exited <- code })
+			die, died := dieRecorder()
+			in := newInterrupts(context.Background(), time.Minute, die)
+			defer in.close()
 			go func() {
 				<-started
 				in.deliver(c.sig)
 			}()
 			var stderr bytes.Buffer
-			code := runRoot(in.ctx, newRootCmd(), c.args, in.caught, &stderr)
+			code := runRoot(in.ctx, newRootCmd(), c.args, in.caught, die, &stderr)
 
 			if want := 128 + int(c.sig); code != want {
 				t.Errorf("exit code = %d, want %d; stderr:\n%s", code, want, stderr.String())
@@ -92,15 +104,190 @@ func TestInterrupt_AnInFlightCommandReportsWhatMayStillCompleteAndExits(t *testi
 				!strings.Contains(out, "interrupted before the answer arrived") {
 				t.Errorf("stderr = %q, want the interruption reported with %q and %s", out, c.want, c.check)
 			}
+			select {
+			case got := <-died:
+				if got != c.sig {
+					t.Errorf("died by %v after the command returned, want %v", got, c.sig)
+				}
+			default:
+				t.Error("the process did not die by the signal once the command returned")
+			}
 
 			in.deliver(c.sig)
 			select {
-			case got := <-exited:
-				if got != 128+int(c.sig) {
-					t.Errorf("a second signal exited with %d, want %d", got, 128+int(c.sig))
+			case got := <-died:
+				if got != c.sig {
+					t.Errorf("a second signal died by %v, want %v", got, c.sig)
 				}
 			case <-time.After(time.Second):
-				t.Error("a second signal did not exit")
+				t.Error("a second signal did not end the process")
+			}
+		})
+	}
+}
+
+// A command blocked on something that does not read its context (a y/N
+// prompt, a password read, an ssh step) is not left running by the first
+// Ctrl-C: the process dies by the signal once the grace runs out.
+//
+// Mutation: do not arm the grace — red.
+func TestInterrupt_ACommandThatIgnoresItsContextDiesAfterTheGrace(t *testing.T) {
+	die, died := dieRecorder()
+	in := newInterrupts(context.Background(), 100*time.Millisecond, die)
+	defer in.close()
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	root := &cobra.Command{Use: "lv", SilenceUsage: true, SilenceErrors: true}
+	root.AddCommand(&cobra.Command{Use: "stuck", RunE: func(*cobra.Command, []string) error {
+		close(blocked)
+		<-release // never reads its context
+		return nil
+	}})
+	go runRoot(in.ctx, root, []string{"stuck"}, in.caught, die, &bytes.Buffer{})
+	<-blocked
+	in.deliver(syscall.SIGINT)
+	select {
+	case got := <-died:
+		if got != syscall.SIGINT {
+			t.Errorf("died by %v, want SIGINT", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a command that ignores its context kept the process alive after Ctrl-C")
+	}
+}
+
+// A streaming command ended by Ctrl-C (`lv logs -f`, `lv events`) prints no
+// raw "context canceled": the cancellation is the operator's own.
+//
+// Mutation: print every error after a signal — red.
+func TestInterrupt_ABareCancellationPrintsNothing(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		err       error
+		wantPrint bool
+	}{
+		{"grpc Canceled", status.FromContextError(context.Canceled).Err(), false},
+		{"wrapped context.Canceled", fmt.Errorf("follow: %w", context.Canceled), false},
+		{"another failure", errors.New("permission denied"), true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			die, _ := dieRecorder()
+			in := newInterrupts(context.Background(), time.Minute, die)
+			defer in.close()
+			in.deliver(syscall.SIGINT)
+			root := &cobra.Command{Use: "lv", SilenceUsage: true, SilenceErrors: true}
+			root.AddCommand(&cobra.Command{Use: "follow", RunE: func(*cobra.Command, []string) error { return c.err }})
+			var stderr bytes.Buffer
+			runRoot(in.ctx, root, []string{"follow"}, in.caught, die, &stderr)
+			if got := stderr.Len() > 0; got != c.wantPrint {
+				t.Errorf("stderr = %q, want printed=%v", stderr.String(), c.wantPrint)
+			}
+		})
+	}
+}
+
+// interruptHelperEnv selects the helper process's command: "cancellable"
+// returns once its context ends, "clean" returns nil once it ends, "stuck"
+// ignores it.
+const interruptHelperEnv = "LV_INTERRUPT_HELPER"
+
+// TestInterruptHelperProcess is the process TestInterrupt_TheProcessDiesByTheSignal
+// signals: runProcess with a command that prints "ready" and then waits.
+func TestInterruptHelperProcess(t *testing.T) {
+	mode := os.Getenv(interruptHelperEnv)
+	if mode == "" {
+		t.Skip("helper process only")
+	}
+	root := &cobra.Command{Use: "lv", SilenceUsage: true, SilenceErrors: true}
+	root.AddCommand(&cobra.Command{Use: "wait", RunE: func(cmd *cobra.Command, _ []string) error {
+		fmt.Println("ready")
+		switch mode {
+		case "stuck":
+			time.Sleep(time.Hour) // never reads its context
+			return nil
+		case "clean":
+			<-cmd.Context().Done()
+			return nil
+		default:
+			<-cmd.Context().Done()
+			return cmd.Context().Err()
+		}
+	}})
+	os.Exit(runProcess(root, []string{"wait"}, os.Stderr))
+}
+
+// The process ends by the signal itself, not by exit 130/143: bash ends a
+// loop, and xargs a batch, only for a child the signal killed. That holds
+// for a command that returns an error, one that returns cleanly, and one
+// that never returns (after the grace). A SIGINT the process inherited as
+// ignored (a background job) stays ignored.
+//
+// Mutation: exit 128+n instead of re-raising — red.
+func TestInterrupt_TheProcessDiesByTheSignal(t *testing.T) {
+	for _, c := range []struct {
+		mode    string
+		sig     syscall.Signal
+		ignored bool // start with SIGINT ignored
+	}{
+		{"cancellable", syscall.SIGINT, false},
+		{"cancellable", syscall.SIGTERM, false},
+		{"clean", syscall.SIGINT, false},
+		{"stuck", syscall.SIGINT, false},
+		{"stuck", syscall.SIGTERM, false},
+		{"cancellable", syscall.SIGTERM, true},
+	} {
+		t.Run(fmt.Sprintf("%s %v ignored=%v", c.mode, c.sig, c.ignored), func(t *testing.T) {
+			if c.sig == syscall.SIGINT && signal.Ignored(syscall.SIGINT) {
+				t.Skip("SIGINT is ignored in this process, and a child would inherit that")
+			}
+			self := []string{os.Args[0], "-test.run=^TestInterruptHelperProcess$", "-test.count=1"}
+			var cmd *exec.Cmd
+			if c.ignored {
+				// trap '' sets SIG_IGN, which exec keeps.
+				cmd = exec.Command("/bin/sh", append([]string{"-c", `trap '' INT; exec "$@"`, "sh"}, self...)...)
+			} else {
+				cmd = exec.Command(self[0], self[1:]...)
+			}
+			cmd.Env = append(os.Environ(), interruptHelperEnv+"="+c.mode)
+			out, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			ready := make(chan bool, 1)
+			go func() {
+				sc := bufio.NewScanner(out)
+				for sc.Scan() {
+					if sc.Text() == "ready" {
+						ready <- true
+					}
+				}
+			}()
+			select {
+			case <-ready:
+			case <-time.After(30 * time.Second):
+				_ = cmd.Process.Kill()
+				t.Fatal("the helper never became ready")
+			}
+			if c.ignored {
+				_ = cmd.Process.Signal(syscall.SIGINT)
+				time.Sleep(300 * time.Millisecond)
+			}
+			_ = cmd.Process.Signal(c.sig)
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+			select {
+			case <-done:
+			case <-time.After(15 * time.Second):
+				_ = cmd.Process.Kill()
+				t.Fatal("the helper did not end after the signal")
+			}
+			ws := cmd.ProcessState.Sys().(syscall.WaitStatus)
+			if !ws.Signaled() || ws.Signal() != c.sig {
+				t.Errorf("helper ended with %v (signaled=%v), want killed by %v", cmd.ProcessState, ws.Signaled(), c.sig)
 			}
 		})
 	}
@@ -111,7 +298,8 @@ func TestInterrupt_WatchCancelsTheContextOnSIGINT(t *testing.T) {
 	if signal.Ignored(syscall.SIGINT) {
 		t.Skip("SIGINT is ignored in this process (started in the background); the watch leaves it so")
 	}
-	in := newInterrupts(context.Background(), func(int) { t.Error("a first signal exited") })
+	die, _ := dieRecorder()
+	in := newInterrupts(context.Background(), time.Minute, die)
 	stop := in.watch()
 	defer stop()
 	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {

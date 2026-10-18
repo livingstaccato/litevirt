@@ -604,9 +604,10 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		if len(armed) > 0 && opts.RunningTaps != nil {
 			// A VM that came here and has gone (its row names another host,
 			// libvirt has none of it running here) is not drawn any more.
+			gens := opts.Arming.Generations() // before the snapshots below
 			if live, terr := taps.fetch(ctx, opts.RunningTaps, opts.TapTimeout); terr == nil {
 				if hosts, herr := vmRowHosts(ctx, db, armed); herr == nil {
-					opts.Arming.Settle(hostName, hosts, func(vm string) bool { return len(live[vm]) > 0 })
+					opts.Arming.Settle(hostName, gens, hosts, func(vm string) bool { return len(live[vm]) > 0 })
 					armed = opts.Arming.Armed()
 				}
 			}

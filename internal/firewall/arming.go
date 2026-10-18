@@ -24,7 +24,9 @@ import (
 type Arming struct {
 	mu        sync.Mutex
 	armed     map[string]time.Time
-	arrived   map[string]bool // armed VMs whose row has named this host
+	arrived   map[string]bool   // armed VMs whose row named this host while they ran here
+	gen       map[string]uint64 // bumped by every Arm and SetPending of a VM
+	genSeq    uint64
 	pending   map[string][]corrosion.HostVMNIC
 	pendingCT map[string][]corrosion.ContainerInterfaceRecord
 	now       func() time.Time
@@ -34,7 +36,7 @@ const armTTL = 30 * time.Minute
 
 // NewArming returns an empty set.
 func NewArming() *Arming {
-	return &Arming{armed: map[string]time.Time{}, arrived: map[string]bool{}, pending: map[string][]corrosion.HostVMNIC{},
+	return &Arming{armed: map[string]time.Time{}, arrived: map[string]bool{}, gen: map[string]uint64{}, pending: map[string][]corrosion.HostVMNIC{},
 		pendingCT: map[string][]corrosion.ContainerInterfaceRecord{}, now: time.Now}
 }
 
@@ -77,7 +79,30 @@ func (a *Arming) Arm(vm string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.armed[vm] = a.now().Add(armTTL)
+	a.restampLocked(vm)
+}
+
+// restampLocked gives vm a new generation and forgets that it arrived: what a
+// pass read before this call says nothing about the arming made by it.
+func (a *Arming) restampLocked(vm string) {
+	a.genSeq++
+	a.gen[vm] = a.genSeq
 	delete(a.arrived, vm)
+}
+
+// Generations is each armed VM's generation now. Read it before the row and
+// tap snapshots Settle is given.
+func (a *Arming) Generations() map[string]uint64 {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make(map[string]uint64, len(a.gen))
+	for k, v := range a.gen {
+		out[k] = v
+	}
+	return out
 }
 
 // Disarm removes vm.
@@ -86,6 +111,7 @@ func (a *Arming) Disarm(vm string) {
 	defer a.mu.Unlock()
 	delete(a.armed, vm)
 	delete(a.arrived, vm)
+	delete(a.gen, vm)
 }
 
 // Settle disarms every armed VM that arrived here (a pass saw its row name
@@ -94,7 +120,11 @@ func (a *Arming) Disarm(vm string) {
 // and left alone); runsHere says whether libvirt has the VM's NICs running on
 // this host. A VM still running here, or one whose migration in has not landed
 // yet, stays armed until armTTL.
-func (a *Arming) Settle(here string, rowHost map[string]string, runsHere func(vm string) bool) {
+//
+// A VM is arrived only when its row names here AND it runs here. Settle skips
+// a VM armed again since gens was read (an Arm after the snapshots makes both
+// stale).
+func (a *Arming) Settle(here string, gens map[string]uint64, rowHost map[string]string, runsHere func(vm string) bool) {
 	if a == nil {
 		return
 	}
@@ -102,13 +132,20 @@ func (a *Arming) Settle(here string, rowHost map[string]string, runsHere func(vm
 	defer a.mu.Unlock()
 	for vm := range a.armed {
 		h, ok := rowHost[vm]
+		if g, seen := gens[vm]; !seen || g != a.gen[vm] {
+			continue
+		}
 		switch {
 		case !ok:
 		case h == here:
-			a.arrived[vm] = true
+			if runsHere(vm) {
+				a.arrived[vm] = true
+			}
 		case a.arrived[vm] && !runsHere(vm):
 			delete(a.armed, vm)
 			delete(a.arrived, vm)
+			delete(a.pending, vm)
+			delete(a.gen, vm)
 		}
 	}
 }
@@ -120,6 +157,7 @@ func (a *Arming) SetPending(vm string, nics []corrosion.HostVMNIC) {
 	defer a.mu.Unlock()
 	a.pending[vm] = append([]corrosion.HostVMNIC(nil), nics...)
 	a.armed[vm] = a.now().Add(armTTL)
+	a.restampLocked(vm)
 }
 
 // ClearPending forgets vm's pending NICs.
@@ -142,6 +180,7 @@ func (a *Arming) Armed() []string {
 		if now.After(until) {
 			delete(a.armed, vm)
 			delete(a.arrived, vm)
+			delete(a.gen, vm)
 			delete(a.pending, vm)
 			continue
 		}

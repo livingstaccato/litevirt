@@ -2,9 +2,11 @@ package firewall
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/nictap"
 )
 
 // TestCorrosionPlanLoader_DepartedVMIsDisarmed: a VM armed here that arrived
@@ -37,10 +39,16 @@ func TestCorrosionPlanLoader_DepartedVMIsDisarmed(t *testing.T) {
 	arm.Arm("mover")
 	arm.Arm("incoming")
 	running := map[string]map[string]string{}
+	fail := false
 	load := CorrosionPlanLoader(db, "host-a", Plan{}, LoaderOptions{
-		RunningTaps: func() (map[string]map[string]string, error) { return running, nil },
-		TapBridge:   func(string) string { return "" },
-		Arming:      arm,
+		RunningTaps: func() (map[string]map[string]string, error) {
+			if fail {
+				return nil, errors.New("libvirt down")
+			}
+			return running, nil
+		},
+		TapBridge: func(string) string { return "" },
+		Arming:    arm,
 	})
 	armed := func() map[string]bool {
 		m := map[string]bool{}
@@ -49,23 +57,38 @@ func TestCorrosionPlanLoader_DepartedVMIsDisarmed(t *testing.T) {
 		}
 		return m
 	}
-	if _, err := load(ctx); err != nil { // mover's row names here: it has arrived
+	running["mover"] = map[string]string{"52:54:00:00:00:11": "vnet9"}
+	if _, err := load(ctx); err != nil { // mover's row names here and it runs here: arrived
 		t.Fatal(err)
 	}
 	if a := armed(); !a["mover"] || !a["incoming"] {
 		t.Fatalf("after arrival pass armed = %v", a)
 	}
 	move("mover", "host-b")
-	running["mover"] = map[string]string{"52:54:00:00:00:11": "vnet9"}
 	if _, err := load(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if !armed()["mover"] {
 		t.Fatal("disarmed while the VM still runs here")
 	}
+	// libvirt cannot be asked: nothing is disarmed.
 	delete(running, "mover")
-	if _, err := load(ctx); err != nil {
+	fail = true
+	if _, err := load(ctx); err == nil {
+		t.Log("pass succeeded without taps")
+	}
+	if !armed()["mover"] {
+		t.Fatal("disarmed while libvirt could not be asked")
+	}
+	fail = false
+	plan, err := load(ctx)
+	if err != nil {
 		t.Fatal(err)
+	}
+	for _, n := range plan.NICs {
+		if n.NICDev == nictap.Name("52:54:00:00:00:11") {
+			t.Fatal("departed VM still drawn in the plan")
+		}
 	}
 	a := armed()
 	if a["mover"] {

@@ -16,6 +16,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -128,5 +129,48 @@ func TestMirrorRepointsADeadAddressOnlyOnceLatched(t *testing.T) {
 	}
 	if p := m.passes(); p[len(p)-1] != "ok" {
 		t.Fatalf("passes %v: the repaired pass must converge", p)
+	}
+}
+
+// TestMirrorRepairCreatesNothingOverTheSameHostUnderAnotherMask: in a VRF that
+// does not enforce uniqueness NetBox would take a second object at the leased
+// host, so the repair's own lookup is the only guard — and it has to find an
+// operator's /32 for a /24 lease.
+func TestMirrorRepairCreatesNothingOverTheSameHostUnderAnotherMask(t *testing.T) {
+	nb, c, gates := boundMirrorClusterGated(t, 1)
+	n := c.Nodes[0]
+	g := gates[n.Name]
+	n.DB.SetNetBoxRepointGate(func() bool { return g.DurablyLatched(capabilities.NetBoxIPRepointV1) })
+	if !g.Enforced(context.Background(), capabilities.NetBoxIPRepointV1) {
+		t.Fatal("precondition: netbox_ip_repoint_v1 did not latch")
+	}
+
+	mustCreateVM(t, n, "vm-1", orphanNetwork)
+	mustSyncAllNodes(t, c)
+	dead := nb.InterfaceAddressID("vm-1", "eth0")
+	mac := nb.InterfaceMAC("vm-1", "eth0")
+	leasedHost := ""
+	leases, err := corrosion.ListNetBoxLeases(context.Background(), n.DB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range leases {
+		if strings.EqualFold(l.MAC, mac) {
+			leasedHost = l.IP
+		}
+	}
+	nb.DeleteAddressDirect(dead)
+	nb.SetVRFEnforceUnique(orphanVRF, false)
+	nb.SeedIP(leasedHost+"/32", orphanVRF, "", time.Now().Add(-time.Hour))
+
+	posts := nb.AddressPOSTs()
+	if err := n.SyncNetBoxMirror(); err != nil {
+		t.Fatal(err)
+	}
+	if got := nb.AddressPOSTs(); got != posts {
+		t.Fatalf("%d address create(s) over %s/32, which an operator already holds", got-posts, leasedHost)
+	}
+	if got := leaseAddressOn(t, n, mac); got != dead {
+		t.Fatalf("lease re-pointed to %d", got)
 	}
 }

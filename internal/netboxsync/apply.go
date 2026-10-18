@@ -757,7 +757,11 @@ func (r *Reconciler) repairDeadAddress(ctx context.Context, deadID int, identity
 		// mid-repair may have created one already, and a VRF that does not
 		// enforce uniqueness would accept a second object at the address. Any
 		// object there refuses the repair.
-		held, lerr := r.nb.LookupByAddress(ctx, address, b.VRFID)
+		//
+		// By the bare HOST: NetBox's address filter compares the full inet when
+		// the value carries a mask, so the leased /24 would miss an operator's
+		// /32 of the same host, which NetBox's own uniqueness treats as one.
+		held, lerr := r.nb.LookupByAddress(ctx, host.String(), b.VRFID)
 		if lerr != nil {
 			return 0, fmt.Errorf("look up address %s: %w", address, lerr)
 		}

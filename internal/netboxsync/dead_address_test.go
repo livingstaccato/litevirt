@@ -238,7 +238,7 @@ func TestRepairCreatesNothingWhereAnyObjectHoldsTheAddress(t *testing.T) {
 	nb := &deadAddressVirt{stubVirt: &stubVirt{}, dead: map[int]bool{41: true}}
 	r, idx, key := repairFixture(t, nb)
 	nb.byAddressIPs = map[string][]netbox.IPAddress{
-		repairIP + "/24": {{ID: 88, Address: repairIP + "/24", VRFID: 3}},
+		repairIP: {{ID: 88, Address: repairIP + "/24", VRFID: 3}},
 	}
 	r.db.SetNetBoxRepointGate(func() bool { return true })
 	if err := r.apply(context.Background(), []Action{
@@ -254,5 +254,24 @@ func TestRepairCreatesNothingWhereAnyObjectHoldsTheAddress(t *testing.T) {
 	}
 	if !r.isDeadAddress(41) {
 		t.Fatal("an unrepaired address must still be reported dead")
+	}
+}
+
+func TestRepairFindsTheAddressUnderAnyMask(t *testing.T) {
+	// An operator's 10.0.5.9/32 is the same host as the leased 10.0.5.9/24.
+	// The lookup is by host, so it is found and nothing is created over it.
+	nb := &deadAddressVirt{stubVirt: &stubVirt{}, dead: map[int]bool{41: true}}
+	r, idx, key := repairFixture(t, nb)
+	nb.byAddressIPs = map[string][]netbox.IPAddress{
+		repairIP: {{ID: 88, Address: repairIP + "/32", VRFID: 3}},
+	}
+	r.db.SetNetBoxRepointGate(func() bool { return true })
+	if err := r.apply(context.Background(), []Action{
+		{Kind: kindNIC, Op: "assign", Key: key, NetBoxID: 21, IPID: 41},
+	}, idx, fp); err != nil {
+		t.Fatal(err)
+	}
+	if len(nb.claimed) != 0 {
+		t.Fatalf("created %v over the same host under another mask", nb.claimed)
 	}
 }

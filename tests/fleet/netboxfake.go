@@ -552,8 +552,10 @@ func (f *NetBoxFake) claimSpecific(w http.ResponseWriter, r *http.Request) {
 	}
 
 	f.mu.Lock()
+	// NetBox's uniqueness check: only in a VRF that enforces it, and on the
+	// HOST — 10.0.5.9/24 and 10.0.5.9/32 are one address.
 	for _, existing := range f.byID {
-		if existing.Address == body.Address && existing.VRFID == body.VRF {
+		if f.vrfs[body.VRF] && existing.VRFID == body.VRF && sameHostAddr(existing.Address, body.Address) {
 			f.mu.Unlock()
 			// The real duplicate refusal: a 400, which classifies as a DEFINITE
 			// answer even though our own earlier POST may be what created it.
@@ -690,8 +692,15 @@ func matchIP(ip *fakeIP, q map[string][]string, parent *net.IPNet, ifaceVM map[i
 		}
 		return v[0], true
 	}
-	if v, ok := get("address"); ok && ip.Address != v {
-		return false
+	// NetBox's address filter: a value with a prefix length matches that exact
+	// address, and a bare host matches the host under any mask.
+	if v, ok := get("address"); ok {
+		if strings.Contains(v, "/") && ip.Address != v {
+			return false
+		}
+		if !strings.Contains(v, "/") && !sameHostAddr(ip.Address, v) {
+			return false
+		}
 	}
 	if v, ok := get("vrf_id"); ok {
 		want, err := strconv.Atoi(v)
@@ -753,6 +762,19 @@ func matchIP(ip *fakeIP, q map[string][]string, parent *net.IPNet, ifaceVM map[i
 		}
 	}
 	return true
+}
+
+// sameHostAddr reports whether two addresses, each with or without a prefix
+// length, name the same host.
+func sameHostAddr(a, b string) bool {
+	host := func(s string) net.IP {
+		if i := strings.IndexByte(s, '/'); i >= 0 {
+			s = s[:i]
+		}
+		return net.ParseIP(s)
+	}
+	ha, hb := host(a), host(b)
+	return ha != nil && hb != nil && ha.Equal(hb)
 }
 
 // getPrefix is GET /api/ipam/prefixes/{id}/.

@@ -45,6 +45,13 @@ func (s *Server) deleteVMOnRemovedHost(ctx context.Context, vm *corrosion.VMReco
 	if err := s.checkNoRemotePCIOwner(ctx, vm.Name); err != nil {
 		return nil, err
 	}
+	// The leases go before the rows: from here the delete runs to its end
+	// whatever becomes of its caller (detachDelete).
+	if err := refuseIfCancelled(ctx); err != nil {
+		return nil, err
+	}
+	ctx, cancel := s.detachDelete(ctx)
+	defer cancel()
 	s.releaseNICLeasesBestEffort(ctx, vm, "delete-on-removed-host")
 	if err := corrosion.DeleteVM(ctx, s.db, vm.Name); err != nil {
 		s.audit(ctx, "vm.delete", vm.Name, "recorded on removed host "+vm.HostName+": "+err.Error(), "error")
@@ -92,6 +99,14 @@ func (s *Server) deleteContainerOnRemovedHost(ctx context.Context, host, name, p
 		}
 		dnsStack = containerStackLabel(*rec)
 	}
+	// From the row delete on, the rows go together whatever becomes of the
+	// caller (detachDelete).
+	if err := refuseIfCancelled(ctx); err != nil {
+		return nil, err
+	}
+	ctx, cancel := s.detachDelete(ctx)
+	defer cancel()
+	s.deleteStepHook(name, "removed-host")
 	derr := corrosion.DeleteContainerStrict(ctx, s.db, host, name)
 	if derr != nil && !errors.Is(derr, corrosion.ErrNoRowsAffected) {
 		s.audit(ctx, "ct.delete", name, "project="+project+" recorded on removed host "+host, "error")

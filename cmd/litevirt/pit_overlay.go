@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -11,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/cli"
 )
 
 // overwriteNewerWarning is printed, before anything is sent, when a forced
@@ -104,7 +104,11 @@ The VM must not be running. Admin only. Audited.`,
 					fmt.Fprint(os.Stderr, forceCommitWarning)
 					if dry.GetNeedsOverwriteNewerWrites() && !overwriteNewer {
 						fmt.Fprintf(os.Stderr, overwriteNewerWarning, dry.GetVerdict(), dry.GetIfCommit())
-						if !confirmOverwriteNewer(os.Stdin, os.Stderr) {
+						ok, cerr := confirmOverwriteNewer(ctx, os.Stdin, os.Stderr)
+						if cerr != nil {
+							return cerr
+						}
+						if !ok {
 							return fmt.Errorf("refused: the overlay is already in the disk; pass --overwrite-newer-writes (or answer yes) to overwrite the newer writes")
 						}
 						overwriteNewer = true
@@ -135,13 +139,16 @@ The VM must not be running. Admin only. Audited.`,
 }
 
 // confirmOverwriteNewer asks, on a terminal only, for a typed "yes".
-func confirmOverwriteNewer(in io.Reader, out io.Writer) bool {
+func confirmOverwriteNewer(ctx context.Context, in io.Reader, out io.Writer) (bool, error) {
 	if !stdinIsTerminal() {
-		return false
+		return false, nil
 	}
 	fmt.Fprint(out, "Type yes to overwrite the newer writes: ")
-	line, _ := bufio.NewReader(in).ReadString('\n')
-	return strings.TrimSpace(line) == "yes"
+	line, err := cli.ReadLine(ctx, in)
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	return err == nil && strings.TrimSpace(line) == "yes", nil
 }
 
 func printPITResolve(w io.Writer, resp *pb.ResolvePITOverlayResponse) {

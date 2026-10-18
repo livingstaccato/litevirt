@@ -34,7 +34,7 @@ loopback address that this command listens on
 						Out:       cmd.ErrOrStderr(),
 						UserAgent: "lv",
 						SecondFactor: func() (string, error) {
-							return cli.ReadPassword("2FA code (or recovery code): ")
+							return cli.ReadPassword(cmd.Context(), "2FA code (or recovery code): ")
 						},
 					}
 					if !noBrowser {
@@ -47,13 +47,20 @@ loopback address that this command listens on
 					return saveLogin(resp)
 				})
 			}
-			var username string
 			fmt.Fprint(cmd.ErrOrStderr(), "Username: ")
-			if _, err := fmt.Fscanln(cmd.InOrStdin(), &username); err != nil {
+			line, err := cli.ReadLine(cmd.Context(), cmd.InOrStdin())
+			if err != nil {
+				if cmd.Context().Err() != nil {
+					return err
+				}
 				return fmt.Errorf("read username: %w", err)
 			}
+			username := strings.TrimSpace(line)
+			if username == "" || strings.ContainsAny(username, " \t") {
+				return fmt.Errorf("read username: expected one word, got %q", line)
+			}
 
-			password, err := cli.ReadPassword("Password: ")
+			password, err := cli.ReadPassword(cmd.Context(), "Password: ")
 			if err != nil {
 				return err
 			}
@@ -71,7 +78,7 @@ loopback address that this command listens on
 				// 2FA gate: server returns Requires_2Fa with empty token; prompt
 				// for the second factor and re-call Login.
 				if resp.Requires_2Fa {
-					code, err := cli.ReadPassword("2FA code (or recovery code): ")
+					code, err := cli.ReadPassword(cmd.Context(), "2FA code (or recovery code): ")
 					if err != nil {
 						return err
 					}

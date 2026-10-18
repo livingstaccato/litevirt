@@ -498,6 +498,10 @@ type Server struct {
 	// recreateTornDown is a test seam: it runs in a rebuild and a rolling
 	// recreate once the old VM is torn down, before it is created again.
 	recreateTornDown func(name string)
+	// recreateDeleted is a test seam: it runs in a rolling or inline
+	// recreate once its delete has returned, whether or not it removed
+	// anything, before the create.
+	recreateDeleted func(name string)
 	// testClearFirewallTags is a test seam: when set, a firewall-tags clear (a
 	// delete's, or a tag set's of a copied identity) calls it instead of
 	// corrosion.ClearFirewallTags.
@@ -921,6 +925,13 @@ type Server struct {
 	// lease another holder has (SetDeleteLeaseWaitForTest). Zero in
 	// production means deleteLeaseWaitDefault.
 	deleteLeaseWait time.Duration
+	// deleteFinish is a TEST SEAM for how long a delete runs once it has
+	// started acting (detachDelete). Zero, as in production, means
+	// deleteFinishTimeout.
+	deleteFinish time.Duration
+	// deleteStep is a TEST SEAM run at named steps of a VM delete
+	// (SetDeleteStepHookForTest). Nil in production.
+	deleteStep func(vm, step string)
 	// diskSpaceOverride is a TEST SEAM for the free-space checks of a cold
 	// migration's disk copy (diskSpace). Nil in production.
 	diskSpaceOverride func(dir string) (avail, total uint64, err error)

@@ -22,6 +22,9 @@ func newRebuildCmd() *cobra.Command {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				vm, err := c.RebuildVM(ctx, &pb.RebuildVMRequest{Name: args[0]})
 				if err != nil {
+					if ierr := interruptedReplace("rebuild "+args[0], "rebuild", "lv rebuild", err); ierr != nil {
+						return ierr
+					}
 					return fmt.Errorf("rebuild: %w", err)
 				}
 				fmt.Printf("VM %s rebuilt on host %s (state: %s)\n", vm.Name, vm.HostName, vm.State)

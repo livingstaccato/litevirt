@@ -21,6 +21,8 @@ func newDaemonCmd() *cobra.Command {
 		Use:   "daemon",
 		Short: "Run the litevirt daemon (server)",
 		Args:  cobra.NoArgs,
+		// runDaemon shuts down on SIGINT/SIGTERM itself.
+		Annotations: map[string]string{ownSignalsAnnotation: "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runDaemon()
 		},

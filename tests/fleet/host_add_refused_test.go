@@ -158,24 +158,34 @@ func mapsEqual(x, y map[string]string) bool {
 	return true
 }
 
-// fleetAdmittedPort gives n's admitted row its real gRPC port on each of on,
-// as n's boot records it, once the admission (serial) has reached each of
-// them, so a late copy of it cannot put 7443 back on one and not another.
+// fleetAdmittedPort gives n's admitted row its real gRPC port, as n's boot
+// records it, through a replicated write on on[0] stamped by its HLC, once
+// the admission (serial) has reached every node in on; then it waits until
+// each of them holds the port. The write carries a newer stamp than the
+// admission, so no late copy of the admission can put 7443 back.
 // AdmitHost records 7443, the port every real host serves on; fleet nodes
 // share 127.0.0.1 and differ by port, so a second admission before the first
 // node boots would hold the same address and port, which AdmitHost refuses
 // (one machine, one name).
 func fleetAdmittedPort(t *testing.T, n *Node, serial string, on ...*Node) {
 	t.Helper()
+	ctx := context.Background()
 	for _, o := range on {
 		eventually(t, convergeTimeout, o.Name+" to hold "+n.Name+"'s admission", func() bool {
-			r, err := o.DB.Query(context.Background(), `SELECT cert_serial FROM hosts WHERE name = ?`, n.Name)
+			r, err := o.DB.Query(ctx, `SELECT cert_serial FROM hosts WHERE name = ?`, n.Name)
 			return err == nil && len(r) == 1 && strings.EqualFold(r[0].String("cert_serial"), serial)
 		})
 	}
+	via := on[0]
+	// The statement the daemon's own-endpoint write uses (a registered shape).
+	if err := via.DB.Execute(ctx, `UPDATE hosts SET address = ?, grpc_port = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
+		n.Address, n.Port, via.DB.NowTS(), n.Name); err != nil {
+		t.Fatalf("record %s's fleet port on %s: %v", n.Name, via.Name, err)
+	}
 	for _, o := range on {
-		if _, err := o.DB.DB().Exec(`UPDATE hosts SET grpc_port = ? WHERE name = ?`, n.Port, n.Name); err != nil {
-			t.Fatalf("record %s's fleet port on %s: %v", n.Name, o.Name, err)
-		}
+		eventually(t, convergeTimeout, o.Name+" to hold "+n.Name+"'s port", func() bool {
+			r, err := o.DB.Query(ctx, `SELECT grpc_port FROM hosts WHERE name = ?`, n.Name)
+			return err == nil && len(r) == 1 && r[0].Int64("grpc_port") == int64(n.Port)
+		})
 	}
 }

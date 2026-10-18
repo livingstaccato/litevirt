@@ -158,7 +158,7 @@ var firstShapeAcks = map[string]string{
 		"latch cannot form, and nothing is written, while a previous-release peer is listening. Their " +
 		"callers (SetFailoverScope, SetISOLibraryMode, SetNICGuard, and ISO library uploads, pulls and removals) refuse " +
 		"on the same gate first; NIC create, clone and attach record no guard while it is closed",
-	"session_factors": "the only writer is corrosion.InsertSessionWithFactor, which writes the row only with " +
+	"session_factors": "the only writer is corrosion.InsertSessionWithLoginData, which writes the row only with " +
 		"a capabilities.FeatureGrant for FeatureLoginPolicy, which only health.Checker.WithFeature mints: " +
 		"the release token release_2026_11_v1 DURABLY latched — mandatory, so advertised by every build carrying " +
 		"these tables and by none that does not, and in capabilities.replicationGated, so confirmed against every " +

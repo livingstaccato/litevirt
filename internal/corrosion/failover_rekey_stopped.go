@@ -67,7 +67,7 @@ func RekeyStoppedVM(ctx context.Context, c *Client, name, fromHost, destHost, st
 				continue // its unproven owner keeps the row (review I1)
 			}
 			moved = append(moved, d)
-			stmts = append(stmts, diskRowMove(d, destHost, now))
+			stmts = append(stmts, diskPlacementMove(d, destHost, now))
 		}
 		stmts = append(stmts, Statement{SQL: vmStateUpdateSQL, Params: []interface{}{state, StoppedRekeyDetail(fromHost), c.NowTS(), name}})
 		stmts = append(stmts, placementGenStmts(ctx, c, name)...)
@@ -117,7 +117,7 @@ func RekeyStoppedVMClaimed(ctx context.Context, c *Client, name, fromHost, destH
 				continue // its unproven owner keeps the row (review I1)
 			}
 			moved = append(moved, d)
-			stmts = append(stmts, diskRowMove(d, destHost, now))
+			stmts = append(stmts, diskPlacementMove(d, destHost, now))
 		}
 		stmts = append(stmts, Statement{SQL: vmStateAtEpochSQL,
 			Params: []interface{}{state, StoppedRekeyDetail(fromHost), c.NowTS(), name, expectedEpoch + 1}})

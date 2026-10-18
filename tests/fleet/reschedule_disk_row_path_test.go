@@ -1,5 +1,5 @@
-// A reschedule or an ownership transfer carries the disk row the coordinator
-// read, so every replica converges on the file the new owner boots, whatever
+// A reschedule or an ownership transfer carries the disk placement the
+// coordinator read, so every replica converges on the file the new owner boots, whatever
 // order the replicas received the move and an earlier commit of the row in.
 //
 // The sequence needs no operator action: a commits a move of the VM's disk
@@ -15,6 +15,7 @@ package fleet
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,21 +52,38 @@ func TestFleet_RescheduleCarriesTheDiskRowItRead(t *testing.T) {
 		}
 		return corrosion.TransferVMOwnerWithDisks(ctx, n.DB, vm, to, state, cur.OwnerEpoch)
 	}
+	// The failover coordinator's gated reschedule: the proof, the pending link
+	// and the disk rows in one entry.
+	proofReschedule := func(ctx context.Context, n *Node, vm, to, state string) error {
+		cur, err := corrosion.GetVM(ctx, n.DB, vm)
+		if err != nil || cur == nil {
+			t.Fatalf("read %s on %s: %+v %v", vm, n.Name, cur, err)
+		}
+		return corrosion.WriteVMRescheduleProof(ctx, n.DB, corrosion.ActionProof{
+			ID: "rsd-to-" + to, Action: corrosion.ActionReschedule, TargetKind: "vm", TargetName: vm,
+			DestHost: to, Coordinator: n.Name, OwnerEpoch: fmt.Sprint(cur.OwnerEpoch),
+		}, vm, to)
+	}
 	for _, tc := range []struct {
 		name          string
 		move          mover
 		failoverFirst bool // c receives the failover to b before a's commit
+		// gated: a proof-linked start needs the execution gate, which
+		// reconcileAll does not wire; the start builds from the row asserted.
+		gated bool
 	}{
+		{name: "reschedule proof, a's commit first", move: proofReschedule, gated: true},
+		{name: "reschedule proof, failover first", move: proofReschedule, failoverFirst: true, gated: true},
 		{name: "reschedule, a's commit first", move: reschedule},
 		{name: "reschedule, failover first", move: reschedule, failoverFirst: true},
 		{name: "transfer, a's commit first", move: transfer},
 		{name: "transfer, failover first", move: transfer, failoverFirst: true},
 	} {
-		t.Run(tc.name, func(t *testing.T) { rescheduleCarriesRow(t, tc.move, tc.failoverFirst) })
+		t.Run(tc.name, func(t *testing.T) { rescheduleCarriesRow(t, tc.move, tc.failoverFirst, tc.gated) })
 	}
 }
 
-func rescheduleCarriesRow(t *testing.T, move func(context.Context, *Node, string, string, string) error, failoverFirst bool) {
+func rescheduleCarriesRow(t *testing.T, move func(context.Context, *Node, string, string, string) error, failoverFirst, gated bool) {
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 3})
 	a, b, cn := c.Nodes[0], c.Nodes[1], c.Nodes[2]
@@ -126,12 +144,16 @@ func rescheduleCarriesRow(t *testing.T, move func(context.Context, *Node, string
 	if disks, _ := corrosion.GetVMDisks(ctx, cn.DB, vm); len(disks) != 1 || disks[0].Path != src || disks[0].HostName != cn.Name {
 		t.Fatalf("%s's disk row on %s = %+v, want the source on %s", vm, cn.Name, disks, cn.Name)
 	}
-	reconcileAll(t, c, cn)
-	if st, _ := cn.Virt.DomainState(vm); st != "running" {
-		t.Fatalf("%s on %s after its reconciler ran: %q, want running", vm, cn.Name, st)
-	}
-	if xml := cn.Virt.DefinedXML(vm); !strings.Contains(xml, src) || strings.Contains(xml, dst) {
-		t.Fatalf("%s booted %s from the wrong file, want %s:\n%s", cn.Name, vm, src, xml)
+	if !gated {
+		reconcileAll(t, c, cn)
+		if st, _ := cn.Virt.DomainState(vm); st != "running" {
+			t.Fatalf("%s on %s after its reconciler ran: %q, want running", vm, cn.Name, st)
+		}
+		if xml := cn.Virt.DefinedXML(vm); !strings.Contains(xml, src) || strings.Contains(xml, dst) {
+			t.Fatalf("%s booted %s from the wrong file, want %s:\n%s", cn.Name, vm, src, xml)
+		}
+	} else if v, _ := corrosion.GetVM(ctx, cn.DB, vm); v == nil || v.State != "pending" || v.PendingActionID != "rsd-to-"+cn.Name {
+		t.Fatalf("%s on %s = %+v, want pending on the proof that moved it", vm, cn.Name, v)
 	}
 	if got, err := os.ReadFile(src); err != nil || string(got) != bWrites {
 		t.Fatalf("%s = %q %v, want b's writes", src, got, err)

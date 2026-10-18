@@ -133,8 +133,8 @@ import (
 // disposition it already had. The current tree reaps by primary key with
 // markFailed's shape. An ADDITION; no previously accepted historical identity
 // was removed or changed.
-// Updated again when a disk row's move between hosts became a whole-row write
-// (diskRowMove, InsertDisk's shape): the host-only move (`UPDATE vm_disks SET
+// Updated again when a disk row's move between hosts began carrying the row's
+// placement (diskPlacementMove, UpdateDiskPlacement's shape): the host-only move (`UPDATE vm_disks SET
 // host_name = ?, updated_at = ?`) moved from the current ledger to the
 // vm_disk_host_move_v130 family, receive-only, with the full-PK update
 // disposition it already had. An ADDITION; no previously accepted historical
@@ -210,7 +210,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"credentials_split_clear_v56":           2,   // first credentials_split_v1 build's users/tokens old-column clears, before the split went dual-write
 	"canonical_registry_v1_retired":         2,   // retired canonical registry design: the canonical upsert (DispReject) + consolidation's by-id tombstone; never emitted
 	"rebalance_reap_stale_bulk_v130":        1,   // executor's bulk stale reap with a lexical updated_at cutoff, before updated_at became the LWW key
-	"vm_disk_host_move_v130":                1,   // a disk row's host-only move (migration commit, failover), before moves wrote the whole row
+	"vm_disk_host_move_v130":                1,   // a disk row's host-only move (migration commit, failover), before moves carried the placement
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

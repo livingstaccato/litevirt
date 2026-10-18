@@ -163,7 +163,7 @@ func writeVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmNam
 				continue // its unproven owner is judged at the destination's start (review I1)
 			}
 			moved = append(moved, d)
-			stmts = append(stmts, diskRowMove(d, destHost, now))
+			stmts = append(stmts, diskPlacementMove(d, destHost, now))
 		}
 		stmts = append(stmts, placementGenStmts(ctx, c, vmName)...)
 		// Guard: only mint the proof + stamp the pending link if the VM row still

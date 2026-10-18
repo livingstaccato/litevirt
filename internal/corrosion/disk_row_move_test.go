@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -73,15 +74,17 @@ func diskRowMoveFixture(t *testing.T) *Client {
 	return c
 }
 
-// I7-2: every mover publishes the disk row it moves whole — InsertDisk's
-// shape, carrying the path, pool and driver it read — never host_name alone.
-// A replica applies a row last-writer-wins whole, so after a host-only move
-// its path was whatever it held when the move arrived.
+// I7-2: every mover publishes the disk row's placement — host, path, driver
+// and pool, as it read them (vmDiskPlacementSQL, UpdateDiskPlacement's shape) —
+// never host_name alone. A replica applies a row last-writer-wins, so after a
+// host-only move its path was whatever it held when the move arrived. The
+// placement only: the move's read may be stale in the row's other columns.
 //
-// Mutation: emit the host-only UPDATE from diskRowMove — red on every mover.
-func TestDiskRowMove_PublishesTheWholeRowItRead(t *testing.T) {
+// Mutation: emit the host-only UPDATE from diskPlacementMove — red on every
+// mover. Emit the whole row (diskRowSQL) — red on every mover.
+func TestDiskPlacementMove_PublishesThePlacementItRead(t *testing.T) {
 	ctx := context.Background()
-	wholeRow := mustStatementFingerprint(diskRowSQL)
+	placement := mustStatementFingerprint(vmDiskPlacementSQL)
 	for name, move := range diskRowMovers(t) {
 		t.Run(name, func(t *testing.T) {
 			c := diskRowMoveFixture(t)
@@ -111,22 +114,17 @@ func TestDiskRowMove_PublishesTheWholeRowItRead(t *testing.T) {
 						continue
 					}
 					found++
-					if fp := stmtFingerprint(sh); fp != wholeRow {
-						t.Fatalf("%s published a vm_disks statement of shape %s, want the whole row (diskRowSQL):\n%s", name, fp, s.SQL)
+					if fp := stmtFingerprint(sh); fp != placement {
+						t.Fatalf("%s published a vm_disks statement of shape %s, want the placement (vmDiskPlacementSQL):\n%s", name, fp, s.SQL)
 					}
-					if cols, vals, ok := insertRowFromShape(sh, s); ok {
-						got := map[string]interface{}{}
-						for i, col := range cols {
-							got[col] = vals[i]
+					want := []interface{}{"dest", "/s/root", "nfs", "pool", nil, "db", "root"}
+					if len(s.Params) != len(want) {
+						t.Fatalf("%s: params %v", name, s.Params)
+					}
+					for i, w := range want {
+						if w != nil && coerceString(s.Params[i]) != w {
+							t.Errorf("%s: param %d = %v, want %v", name, i, s.Params[i], w)
 						}
-						for col, want := range map[string]interface{}{"host_name": "dest", "path": "/s/root",
-							"storage_volume": "pool", "storage_type": "nfs", "bus": "virtio"} {
-							if coerceString(got[col]) != want {
-								t.Errorf("%s: %s = %v, want %v", name, col, got[col], want)
-							}
-						}
-					} else {
-						t.Fatalf("%s: cannot read the published row", name)
 					}
 				}
 			}
@@ -137,19 +135,59 @@ func TestDiskRowMove_PublishesTheWholeRowItRead(t *testing.T) {
 	}
 }
 
-// A whole-row move never reverts a column written between its read of the row
-// and its transaction: it reads again and moves the row as it now is.
+// A move never reverts a placement written between its read of the row and its
+// transaction: it reads again and moves the row as it now is. (The migration
+// commit refuses a pool changed since cutover outright; its reread is
+// TestCommitMigrationOwnership_RereadsAHostWrittenSinceItsRead.)
 //
-// Mutation: drop disksStill from a mover's guard — that mover's resize is
-// reverted to the size it read.
-func TestDiskRowMove_RereadsARowWrittenSinceItsRead(t *testing.T) {
+// Mutation: drop disksStill from a mover's guard — that mover's pool change is
+// reverted to the pool it read.
+func TestDiskPlacementMove_RereadsAPlacementWrittenSinceItsRead(t *testing.T) {
+	ctx := context.Background()
+	for name, move := range diskRowMovers(t) {
+		if name == "migration commit" {
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			c := diskRowMoveFixture(t)
+			reads := 0
+			diskMoveAfterRead = func() {
+				if reads++; reads == 1 {
+					if _, err := c.DB().Exec(`UPDATE vm_disks SET storage_volume = 'pool2' WHERE disk_name = 'root'`); err != nil {
+						t.Error(err)
+					}
+				}
+			}
+			t.Cleanup(func() { diskMoveAfterRead = nil })
+			if err := move(c); err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if reads != 2 {
+				t.Errorf("%s read the disk rows %d times, want 2 (the second after the change)", name, reads)
+			}
+			disks, err := GetVMDisks(ctx, c, "db")
+			if err != nil || len(disks) != 1 {
+				t.Fatalf("disks = %+v %v", disks, err)
+			}
+			if d := disks[0]; d.HostName != "dest" || d.StorageVolume != "pool2" || d.Path != "/s/root" {
+				t.Errorf("%s: row = %+v, want it on dest in the new pool", name, d)
+			}
+		})
+	}
+}
+
+// A column a move does not publish never makes it read again.
+//
+// Mutation: compare every column in disksStill — a resize is "a change", and
+// the mover reads twice.
+func TestDiskPlacementMove_IgnoresAColumnItDoesNotWrite(t *testing.T) {
 	ctx := context.Background()
 	for name, move := range diskRowMovers(t) {
 		t.Run(name, func(t *testing.T) {
 			c := diskRowMoveFixture(t)
-			resized := 0
+			reads := 0
 			diskMoveAfterRead = func() {
-				if resized++; resized == 1 {
+				if reads++; reads == 1 {
 					if err := UpdateDiskSize(ctx, c, "db", "root", 2<<30); err != nil {
 						t.Error(err)
 					}
@@ -159,16 +197,106 @@ func TestDiskRowMove_RereadsARowWrittenSinceItsRead(t *testing.T) {
 			if err := move(c); err != nil {
 				t.Fatalf("%s: %v", name, err)
 			}
-			if resized != 2 {
-				t.Errorf("%s read the disk rows %d times, want 2 (the second after the resize)", name, resized)
+			if reads != 1 {
+				t.Errorf("%s read the disk rows %d times, want 1", name, reads)
 			}
-			disks, err := GetVMDisks(ctx, c, "db")
-			if err != nil || len(disks) != 1 {
-				t.Fatalf("disks = %+v %v", disks, err)
-			}
-			if d := disks[0]; d.HostName != "dest" || d.SizeBytes != 2<<30 || d.Path != "/s/root" {
-				t.Errorf("%s: row = %+v, want it on dest at the new size", name, d)
+			disks, _ := GetVMDisks(ctx, c, "db")
+			if len(disks) != 1 || disks[0].HostName != "dest" || disks[0].SizeBytes != 2<<30 {
+				t.Errorf("%s: row = %+v, want it on dest at the new size", name, disks)
 			}
 		})
+	}
+}
+
+// A migration commit that rereads a host change made since its read commits
+// on the reread row.
+func TestCommitMigrationOwnership_RereadsAHostWrittenSinceItsRead(t *testing.T) {
+	ctx := context.Background()
+	c := diskRowMoveFixture(t)
+	expected, err := GetVMDisks(ctx, c, "db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.DB().Exec(`UPDATE vms SET state = 'migrating' WHERE name = 'db'`); err != nil {
+		t.Fatal(err)
+	}
+	reads := 0
+	diskMoveAfterRead = func() {
+		if reads++; reads == 1 {
+			if _, err := c.DB().Exec(`UPDATE vm_disks SET host_name = 'dest' WHERE disk_name = 'root'`); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	t.Cleanup(func() { diskMoveAfterRead = nil })
+	ok, err := CommitMigrationOwnership(ctx, c, "db", "src", "dest", "running", expected)
+	if err != nil || !ok {
+		t.Fatalf("commit = %v %v, want committed", ok, err)
+	}
+	if reads != 2 {
+		t.Errorf("read the disk rows %d times, want 2", reads)
+	}
+}
+
+// m-5: a migration commit that keeps losing to writes between its read and its
+// transaction declines, so the caller's RepointMigratedVM moves the VM row to
+// where the guest runs. An error would leave the row `migrating` on the source
+// after the caller's retries, which nothing heals.
+//
+// Mutation: return the exhausted retry's error — red.
+func TestCommitMigrationOwnership_DeclinesWhenItKeepsLosingToWrites(t *testing.T) {
+	ctx := context.Background()
+	c := diskRowMoveFixture(t)
+	expected, err := GetVMDisks(ctx, c, "db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.DB().Exec(`UPDATE vms SET state = 'migrating' WHERE name = 'db'`); err != nil {
+		t.Fatal(err)
+	}
+	// Every read is followed by a write that flips the row between the hosts
+	// the commit accepts, so the row is never the one it read.
+	reads := 0
+	diskMoveAfterRead = func() {
+		reads++
+		if _, err := c.DB().Exec(`UPDATE vm_disks SET host_name = CASE host_name WHEN 'src' THEN 'dest' ELSE 'src' END WHERE disk_name = 'root'`); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { diskMoveAfterRead = nil })
+	ok, err := CommitMigrationOwnership(ctx, c, "db", "src", "dest", "running", expected)
+	if err != nil || ok {
+		t.Fatalf("commit = %v %v, want a decline (false, nil)", ok, err)
+	}
+	if reads < 2 {
+		t.Errorf("read the disk rows %d times, want it to have retried", reads)
+	}
+	moved, err := RepointMigratedVM(ctx, c, "db", "src", "dest", "running")
+	if err != nil || !moved {
+		t.Fatalf("the caller's fallback RepointMigratedVM = %v %v, want the VM row moved", moved, err)
+	}
+	if vm, _ := GetVM(ctx, c, "db"); vm == nil || vm.HostName != "dest" || vm.State != "running" {
+		t.Fatalf("vm = %+v, want running on dest", vm)
+	}
+}
+
+// m-1: the host-only move's historical entry may be removed only once the
+// newest release that emits it is unsupported, not the oldest.
+//
+// Mutation: register it with add() (v1.3.0's horizon) — red.
+func TestHistoricalLedger_HostOnlyDiskMoveHorizonIsItsNewestEmitter(t *testing.T) {
+	fp := mustStatementFingerprint(`UPDATE vm_disks SET host_name = ?, updated_at = ?
+		WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`)
+	e, ok := historicalLedger[fp]
+	if !ok {
+		t.Fatalf("%s is not in the historical ledger", fp)
+	}
+	if !strings.Contains(e.RemovalHorizon, "v1.9.0") {
+		t.Fatalf("RemovalHorizon = %q, want it to name v1.9.0, the newest release that emits it", e.RemovalHorizon)
+	}
+	for _, hs := range HistoricalShapes() {
+		if hs.Family == "vm_disk_host_move_v130" && !strings.Contains(hs.LastEmitter, "v1.9.0") {
+			t.Fatalf("LastEmitter = %q, want v1.9.0", hs.LastEmitter)
+		}
 	}
 }

@@ -645,8 +645,8 @@ type SoftDeletedDisk struct {
 // GetSoftDeletedVMDisks is GetDeletedVMDisks with each row's deleted_at.
 //
 // While the VM is live these rows are its DETACHED disks: detach soft-deletes
-// the row and keeps the file, and a migration repoints only live rows
-// (diskRowMove), so a detached row still names the host the file is on.
+// the row and keeps the file, and a move repoints only live rows
+// (diskPlacementMove), so a detached row still names the host the file is on.
 // deleted_at is what tells this incarnation's detaches from a previous VM of
 // the same name, while the VM is live: InsertVMWithHardware purges a name's
 // tombstoned rows, but BeginVMCreateOperation re-stamps them with deleted_at
@@ -1299,7 +1299,7 @@ func TransferVMOwnerWithDisks(ctx context.Context, c *Client, name, hostName, st
 				continue // its unproven owner keeps the row (review I1)
 			}
 			moved = append(moved, d)
-			stmts = append(stmts, diskRowMove(d, hostName, now))
+			stmts = append(stmts, diskPlacementMove(d, hostName, now))
 		}
 		stmts = append(stmts, placementGenStmts(ctx, c, name)...)
 		applied, err := c.ExecuteBatchGuarded(ctx, disksStill(ctx, moved, func(tx *sql.Tx) (bool, error) {
@@ -2020,9 +2020,7 @@ func UpdateDiskStorage(ctx context.Context, c *Client, vmName, diskName, storage
 // at the move sites (those remain for migration / snapshot reconcile).
 func UpdateDiskPlacement(ctx context.Context, c *Client, vmName, diskName, hostName, path, storageType, storageVolume string) error {
 	now := c.NowTS()
-	n, err := c.ExecuteRowsStrict(ctx,
-		`UPDATE vm_disks SET host_name = ?, path = ?, storage_type = ?, storage_volume = ?, updated_at = ?
-		 WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
+	n, err := c.ExecuteRowsStrict(ctx, vmDiskPlacementSQL,
 		hostName, path, storageType, storageVolume, now, vmName, diskName)
 	if err != nil {
 		return err
@@ -2032,6 +2030,11 @@ func UpdateDiskPlacement(ctx context.Context, c *Client, vmName, diskName, hostN
 	}
 	return nil
 }
+
+// vmDiskPlacementSQL sets a live disk row's placement: its host, path,
+// storage driver and pool.
+const vmDiskPlacementSQL = `UPDATE vm_disks SET host_name = ?, path = ?, storage_type = ?, storage_volume = ?, updated_at = ?
+		 WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`
 
 // CommitMigrationOwnership atomically repoints a VM and every one of its disks
 // from sourceHost to targetHost in ONE guarded transaction — the ownership commit
@@ -2056,8 +2059,8 @@ func UpdateDiskPlacement(ctx context.Context, c *Client, vmName, diskName, hostN
 // Returns committed=false (no error) when the preconditions no longer hold; the
 // caller MUST treat that as a hard abort, not success.
 //
-// Each disk row moves as the whole row read just before the transaction
-// (diskRowMove), and only while it is still that row (disksStill).
+// Each disk row moves with the placement read just before the transaction
+// (diskPlacementMove), and only while it still has it (disksStill).
 func CommitMigrationOwnership(ctx context.Context, c *Client, vmName, sourceHost, targetHost, finalState string, expected []DiskRecord) (bool, error) {
 	return retryDiskMoveCommit(func() (bool, error) {
 		current, err := disksToMove(ctx, c, vmName)
@@ -2079,7 +2082,7 @@ func CommitMigrationOwnership(ctx context.Context, c *Client, vmName, sourceHost
 				return false, nil // disk vanished → decline, as the guard would
 			}
 			moved = append(moved, current[i])
-			stmts = append(stmts, diskRowMove(current[i], targetHost, now))
+			stmts = append(stmts, diskPlacementMove(current[i], targetHost, now))
 		}
 
 		stmts = append(stmts, placementGenStmts(ctx, c, vmName)...)
@@ -2142,33 +2145,46 @@ func CommitMigrationOwnership(ctx context.Context, c *Client, vmName, sourceHost
 	})
 }
 
-// diskRowMove repoints disk row d, as this node read it, at host. Every site
-// that moves a VM between hosts emits it for each of the VM's disks in the
-// same batch as the VM row: a disk row naming a host the VM left breaks the
-// next migration's ownership commit and the per-host disk accounting.
+// diskPlacementMove repoints disk row d at host, carrying the placement this
+// node read: its path, storage driver and pool (vmDiskPlacementSQL,
+// UpdateDiskPlacement's statement). The sites that move a VM's disk rows with
+// it — the failover reschedule, the stopped re-key, an ownership transfer with
+// its disks, and a migration's ownership commit — emit it for each row they
+// move, in the same batch as the VM row.
 //
-// It writes the whole row (diskRowSQL), never host_name alone. A replica
-// applies a row last-writer-wins as a whole, so a host-only move left the
-// path, pool and driver on each replica as whatever it held when the move
-// arrived: one that had a move's earlier UpdateDiskPlacement named the copy,
-// one that had not named the source, both at the move's updated_at, and the
-// next owner booted whichever its replica named. The whole row makes every
-// replica hold the file the coordinator moved, and an older write to the row
-// loses to it everywhere. The caller guards the batch with disksStill, so the
-// row it publishes is the one it read.
-func diskRowMove(d DiskRecord, host, now string) Statement {
-	d.HostName = host
-	return Statement{SQL: diskRowSQL, Params: diskRowParams(d, now)}
+// Not host_name alone: replicas apply a row last-writer-wins, so a host-only
+// move left each replica's path as whatever it held when the move arrived —
+// the copy on one that had an earlier UpdateDiskPlacement, the source on one
+// that had not, both at the move's updated_at — and the next owner booted
+// whichever its replica named. The placement makes every replica name the file
+// the coordinator moved; an older placement loses to it everywhere.
+//
+// Not the whole row either. The coordinator's read can be stale: the old
+// owner's last writes may not have reached it. Its other columns — size, bus,
+// backing_disk and backing_image (a flattening move's ClearDiskBacking) — are
+// left to the replicas, so a move never puts back a value the owner cleared.
+// Those columns can still differ across replicas when the owner's write and
+// the move arrive in different orders; anti-entropy settles them as it always
+// has. And the statement applies to a live row only: a replica that already
+// applied the owner's detach keeps the disk detached, while the coordinator,
+// which had not, moves it live. The coordinator's copy stays live (the detach
+// is older than the move) until the operator detaches it again — the same
+// outcome as the host-only move, and never a detached disk booted on a
+// replica that knew of the detach.
+func diskPlacementMove(d DiskRecord, host, now string) Statement {
+	return Statement{SQL: vmDiskPlacementSQL, Params: []interface{}{
+		host, d.Path, d.StorageType, d.StorageVolume, now, d.VMName, d.DiskName}}
 }
 
 // errDiskRowChanged is disksStill's refusal: a disk row a move read changed
-// before the move's transaction. retryDiskMove reads again.
-var errDiskRowChanged = errors.New("a disk row changed between the move's read and its write")
+// its placement before the move's transaction. retryDiskMove reads again.
+var errDiskRowChanged = errors.New("a disk row's placement changed between the move's read and its write")
 
 // disksStill wraps a move's guard: after guard passes, every row in moved must
-// still be, inside the transaction, exactly the row read (diskRowStill), or the
-// move fails with errDiskRowChanged. A whole-row move from a stale read would
-// otherwise carry the stale columns cluster-wide.
+// still be live with the placement read (host, path, driver and pool), or the
+// move fails with errDiskRowChanged. A move from a stale read would otherwise
+// revert a placement this node wrote since. Other columns are not compared:
+// the move does not write them.
 func disksStill(ctx context.Context, moved []DiskRecord, guard func(tx *sql.Tx) (bool, error)) func(tx *sql.Tx) (bool, error) {
 	return func(tx *sql.Tx) (bool, error) {
 		ok, err := guard(tx)
@@ -2176,11 +2192,18 @@ func disksStill(ctx context.Context, moved []DiskRecord, guard func(tx *sql.Tx) 
 			return ok, err
 		}
 		for _, d := range moved {
-			still, err := diskRowStill(ctx, tx, d)
+			var host, path, storageType, storageVolume string
+			err := tx.QueryRowContext(ctx,
+				`SELECT host_name, path, storage_type, storage_volume FROM vm_disks
+				 WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
+				d.VMName, d.DiskName).Scan(&host, &path, &storageType, &storageVolume)
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, errDiskRowChanged
+			}
 			if err != nil {
 				return false, err
 			}
-			if !still {
+			if host != d.HostName || path != d.Path || storageType != d.StorageType || storageVolume != d.StorageVolume {
 				return false, errDiskRowChanged
 			}
 		}
@@ -2215,8 +2238,12 @@ func retryDiskMove(move func() error) error {
 	return err
 }
 
-// retryDiskMoveCommit is retryDiskMove for a move that reports whether it
-// committed.
+// retryDiskMoveCommit is retryDiskMove for a migration's ownership commit.
+// A commit that still loses to placement writes after its retries declines
+// (false, nil) rather than failing: its disks changed during the migration,
+// and the caller's fallback (RepointMigratedVM) then moves the VM row to the
+// host the guest runs on. An error would leave the row `migrating` on the
+// source once the caller's retries ran out, and nothing heals that row.
 func retryDiskMoveCommit(move func() (bool, error)) (bool, error) {
 	var committed bool
 	err := retryDiskMove(func() error {
@@ -2224,6 +2251,9 @@ func retryDiskMoveCommit(move func() (bool, error)) (bool, error) {
 		committed, err = move()
 		return err
 	})
+	if errors.Is(err, errDiskRowChanged) {
+		return false, nil
+	}
 	return committed, err
 }
 
@@ -2289,7 +2319,7 @@ func RescheduleVMHost(ctx context.Context, c *Client, name, hostName, state stri
 				continue // its unproven owner keeps the row (review I1)
 			}
 			moved = append(moved, d)
-			stmts = append(stmts, diskRowMove(d, hostName, now))
+			stmts = append(stmts, diskPlacementMove(d, hostName, now))
 		}
 		stmts = append(stmts, placementGenStmts(ctx, c, name)...)
 		applied, err := c.ExecuteBatchGuarded(ctx, disksStill(ctx, moved, func(tx *sql.Tx) (bool, error) {

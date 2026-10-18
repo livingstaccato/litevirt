@@ -118,7 +118,7 @@ func TestColdFirmwareHandoff_CancelMidHandoffKeepsVMAndDisksTogether(t *testing.
 		return errors.New("request cancelled mid-handoff")
 	})
 	if err := s.db.Execute(context.Background(),
-		`CREATE TRIGGER handoff_fault BEFORE INSERT ON vm_disks
+		`CREATE TRIGGER handoff_fault BEFORE UPDATE OF host_name ON vm_disks
 		 WHEN NEW.host_name = 't1'
 		 BEGIN SELECT lv_test_handoff_fault(); END;`); err != nil {
 		t.Fatalf("create trigger: %v", err)
@@ -146,9 +146,6 @@ func TestColdFirmwareHandoff_InterruptedHandoffKeepsVMAndDisksTogether(t *testin
 		 WHEN NEW.host_name = 't1'
 		 BEGIN SELECT RAISE(ABORT, 'daemon died before the VM row moved'); END;`,
 		`CREATE TRIGGER handoff_no_rollback BEFORE UPDATE OF host_name ON vm_disks
-		 WHEN NEW.host_name = '` + s.hostName + `'
-		 BEGIN SELECT RAISE(ABORT, 'daemon died before its rollback'); END;`,
-		`CREATE TRIGGER handoff_no_rollback_row BEFORE INSERT ON vm_disks
 		 WHEN NEW.host_name = '` + s.hostName + `'
 		 BEGIN SELECT RAISE(ABORT, 'daemon died before its rollback'); END;`,
 	} {

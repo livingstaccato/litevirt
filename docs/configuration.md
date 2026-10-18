@@ -1058,7 +1058,10 @@ QEMU 8.2.2, swtpm 0.7.3 and libtpms 0.9.3, and `libvirt-guests` does not save or
 restore guests (the unit enabled or active with `ON_SHUTDOWN=suspend` or
 `ON_BOOT=start`; read from `/etc/default/libvirt-guests`, else `/etc/sysconfig/libvirt-guests`; keys the file does not set, and values that cannot be read as a plain shell assignment, count as unsafe). A version
 that cannot be read counts as below the floor. The label is advisory: each
-condition is checked again when a move starts.
+condition is checked again when a move starts. A live move of a vTPM or Secure
+Boot VM does not use `network`: its data goes to the target's cluster address
+(its memory in libvirt's tunnel), with a `vm.migrate.network_fallback` event
+on the VM when `network` is set.
 
 ## Capacity and overcommit
 

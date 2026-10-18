@@ -441,11 +441,6 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		return s.forwardCreateVM(ctx, req, targetHost)
 	}
-	// The NVRAM is keyed by name: a live firmware move's record of this name
-	// here holds a domain and state the create would replace (spec §6.9).
-	if err := s.firmwareMoveNameRefusal("create", spec.Name); err != nil {
-		return nil, err
-	}
 	// This host owns the create. A create that fails here is logged with its
 	// cause, and with what its cleanup did (undone, noted as each step runs),
 	// so the owner's log shows both and not only "creating VM" (lab 2, O5).
@@ -471,6 +466,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				"result", result, "left_held", keepHeld)
 		}
 	}()
+	// The NVRAM is keyed by name: a live firmware move's record of this name
+	// here holds a domain and state the create would replace (spec §6.9).
+	// After the failure log is set up, so the owner logs the refusal too;
+	// nothing is made before it.
+	if err := s.firmwareMoveNameRefusal("create", spec.Name); err != nil {
+		return nil, err
+	}
 	// Stable domain identity (G1): persisted in the spec so libvirt's default
 	// swtpm path (/var/lib/libvirt/swtpm/<uuid>/) is deterministic across the VM's
 	// life — letting vTPM state be located + carried without an explicit <source>.
@@ -1490,8 +1492,17 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		// this create made, and the vars its start made, at the domain's
 		// path and at the name-keyed path a Secure Boot or vTPM domain uses.
 		cleanupDisks()
+		// The name-keyed vars go through the firmware store, which asks the
+		// firmware move guard first, as every write of that state does.
+		nameVars := s.fw().NvramPath(spec.Name)
 		removeVars := func(p string) {
-			if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			var err error
+			if filepath.Clean(p) == filepath.Clean(nameVars) {
+				err = s.fw().RemoveNvram(spec.Name)
+			} else {
+				err = os.Remove(p)
+			}
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
 				noteUndo(fmt.Sprintf("vars %s not removed (%v)", p, err))
 			} else if err == nil {
 				noteUndo("removed vars " + p)
@@ -1501,7 +1512,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			removeVars(domainVars)
 		}
 		if !nvramBefore {
-			removeVars(s.fw().NvramPath(spec.Name))
+			removeVars(nameVars)
 		}
 		// Preserving: vars at the domain's path may be ones a
 		// `delete --keep-disks` kept; this create's own went above.

@@ -366,6 +366,51 @@ func TestProtoNumbers_LiveFirmware(t *testing.T) {
 		{&pb.AbortLiveFirmwareTargetResponse{}, 2, "hold_state"},
 		{&pb.AbortLiveFirmwareTargetResponse{}, 3, "refused"},
 		{&pb.AbortLiveFirmwareTargetResponse{}, 4, "detail"},
+
+		// lv doctor firmware-move (D2-18). FirmwareMoveDoctorTarget crosses
+		// builds during a rolling upgrade.
+		{&pb.FirmwareMoveDoctorRequest{}, 1, "vm_name"},
+		{&pb.FirmwareMoveDoctorRequest{}, 2, "action"},
+		{&pb.FirmwareMoveDoctorRequest{}, 3, "acknowledge_rollback"},
+		{&pb.FirmwareMoveDoctorRequest{}, 4, "stop_target"},
+		{&pb.FirmwareMoveDoctorRequest{}, 5, "accept_nvram_hash"},
+		{&pb.FirmwareMoveDoctorRequest{}, 6, "resolve_condition"},
+		{&pb.FirmwareMoveDoctorRequest{}, 7, "host"},
+
+		{&pb.FirmwareMoveDoctorResponse{}, 1, "hosts"},
+		{&pb.FirmwareMoveDoctorResponse{}, 2, "outcome"},
+		{&pb.FirmwareMoveDoctorResponse{}, 3, "unreachable"},
+
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 1, "vm_name"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 2, "uuid"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 3, "created_at"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 4, "attempt_id"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 5, "op"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 6, "operator"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 7, "reason"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 8, "accept_nvram_hash"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 9, "nvram"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 10, "src_nvram_sha256"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 11, "acknowledge_rollback"},
+
+		{&pb.FirmwareMoveDoctorTargetResponse{}, 1, "target_domain"},
+		{&pb.FirmwareMoveDoctorTargetResponse{}, 2, "hold_state"},
+		{&pb.FirmwareMoveDoctorTargetResponse{}, 3, "detail"},
+		{&pb.FirmwareMoveDoctorTargetResponse{}, 4, "permall_sha256"},
+		{&pb.FirmwareMoveDoctorTargetResponse{}, 5, "nvram_sha256"},
+		{&pb.FirmwareMoveDoctorTargetResponse{}, 6, "nvram_t0_sha256"},
+
+		{&pb.FirmwareMoveHostRecords{}, 1, "host"},
+		{&pb.FirmwareMoveHostRecords{}, 2, "marker_json"},
+		{&pb.FirmwareMoveHostRecords{}, 3, "hold_json"},
+		{&pb.FirmwareMoveHostRecords{}, 4, "owed_discards"},
+		{&pb.FirmwareMoveHostRecords{}, 5, "quarantines"},
+		{&pb.FirmwareMoveHostRecords{}, 6, "retained"},
+		{&pb.FirmwareMoveHostRecords{}, 7, "domain"},
+		{&pb.FirmwareMoveHostRecords{}, 8, "hashes"},
+		{&pb.FirmwareMoveHostRecords{}, 9, "paths"},
+		{&pb.FirmwareMoveHostRecords{}, 10, "error"},
+		{&pb.FirmwareMoveHostRecords{}, 11, "leftover_json"},
 	}
 	for _, f := range fields {
 		md := f.msg.ProtoReflect().Descriptor()
@@ -389,6 +434,22 @@ func TestProtoNumbers_LiveFirmware(t *testing.T) {
 		{pb.FirmwareAbortMode(0).Descriptor(), 0, "FIRMWARE_ABORT_MODE_UNSPECIFIED"},
 		{pb.FirmwareAbortMode(0).Descriptor(), 1, "FIRMWARE_ABORT_MODE_PRE_CUTOVER"},
 		{pb.FirmwareAbortMode(0).Descriptor(), 2, "FIRMWARE_ABORT_MODE_DISCARD_UNVERIFIED"},
+		// Each value selects an operation, some of them destructive: a
+		// renumbered one would be read as another.
+		{pb.FirmwareMoveDoctorAction(0).Descriptor(), 0, "FIRMWARE_MOVE_DOCTOR_ACTION_UNSPECIFIED"},
+		{pb.FirmwareMoveDoctorAction(0).Descriptor(), 1, "FIRMWARE_MOVE_DOCTOR_ACTION_ACCEPT_TARGET"},
+		{pb.FirmwareMoveDoctorAction(0).Descriptor(), 2, "FIRMWARE_MOVE_DOCTOR_ACTION_ACCEPT_SOURCE"},
+		{pb.FirmwareMoveDoctorAction(0).Descriptor(), 3, "FIRMWARE_MOVE_DOCTOR_ACTION_ADOPT_TARGET_COPY"},
+		{pb.FirmwareMoveDoctorAction(0).Descriptor(), 4, "FIRMWARE_MOVE_DOCTOR_ACTION_DISCARD_TARGET"},
+		{pb.FirmwareMoveDoctorAction(0).Descriptor(), 5, "FIRMWARE_MOVE_DOCTOR_ACTION_CONFIRM_TARGET_NVRAM"},
+		{pb.FirmwareMoveDoctorAction(0).Descriptor(), 6, "FIRMWARE_MOVE_DOCTOR_ACTION_PUSH_SOURCE_NVRAM"},
+		{pb.FirmwareMoveDoctorAction(0).Descriptor(), 7, "FIRMWARE_MOVE_DOCTOR_ACTION_REVERIFY"},
+		{pb.FirmwareMoveDoctorAction(0).Descriptor(), 8, "FIRMWARE_MOVE_DOCTOR_ACTION_RESOLVE_CONDITION"},
+		{pb.FirmwareMoveDoctorTargetOp(0).Descriptor(), 0, "FIRMWARE_MOVE_DOCTOR_TARGET_OP_UNSPECIFIED"},
+		{pb.FirmwareMoveDoctorTargetOp(0).Descriptor(), 1, "FIRMWARE_MOVE_DOCTOR_TARGET_OP_STOP"},
+		{pb.FirmwareMoveDoctorTargetOp(0).Descriptor(), 2, "FIRMWARE_MOVE_DOCTOR_TARGET_OP_ADOPT"},
+		{pb.FirmwareMoveDoctorTargetOp(0).Descriptor(), 3, "FIRMWARE_MOVE_DOCTOR_TARGET_OP_CONFIRM_NVRAM"},
+		{pb.FirmwareMoveDoctorTargetOp(0).Descriptor(), 4, "FIRMWARE_MOVE_DOCTOR_TARGET_OP_PUSH_NVRAM"},
 	}
 	for _, e := range enums {
 		vd := e.ed.Values().ByNumber(e.num)
@@ -396,7 +457,8 @@ func TestProtoNumbers_LiveFirmware(t *testing.T) {
 			t.Errorf("%s value %d is %v, want %s", e.ed.FullName(), e.num, vd, e.name)
 		}
 	}
-	for _, ed := range []protoreflect.EnumDescriptor{pb.FirmwareVerdict(0).Descriptor(), pb.FirmwareAbortMode(0).Descriptor()} {
+	for _, ed := range []protoreflect.EnumDescriptor{pb.FirmwareVerdict(0).Descriptor(), pb.FirmwareAbortMode(0).Descriptor(),
+		pb.FirmwareMoveDoctorAction(0).Descriptor(), pb.FirmwareMoveDoctorTargetOp(0).Descriptor()} {
 		n := 0
 		for _, e := range enums {
 			if e.ed == ed {

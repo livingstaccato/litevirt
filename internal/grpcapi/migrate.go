@@ -2959,8 +2959,13 @@ func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRe
 	}
 
 	// The target announces each network's gateway to the guest from its own
-	// bridge, so the guest's cached gateway entry moves with it.
-	go s.announceOnTarget(ctx, f.target, vm.Name)
+	// bridge, so the guest's cached gateway entry moves with it. A guest that
+	// arrived paused is announced to once it runs: a live firmware move's by
+	// the target's Release (resumeReleased), a paused hand-over's below.
+	pausedHandOver := f.armed != nil && f.armed.paused
+	if f.fwLive == nil && !pausedHandOver {
+		go s.announceOnTarget(ctx, f.target, vm.Name)
+	}
 	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
 
 	// Update DNS records so VM names resolve correctly after migration.
@@ -3015,6 +3020,9 @@ func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRe
 	if err := f.armed.finish(ctx); err != nil {
 		s.recordVMEvent(ctx, vm.Name, "vm.held", "error", err.Error())
 		return err
+	}
+	if pausedHandOver {
+		go s.announceOnTarget(ctx, f.target, vm.Name)
 	}
 	return nil
 }

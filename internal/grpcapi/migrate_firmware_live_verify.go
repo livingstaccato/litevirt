@@ -374,6 +374,9 @@ func (s *Server) resumeReleased(ctx context.Context, resp *pb.ReleaseLiveFirmwar
 	}
 	s.endHeld(h.VM, "its live firmware move released it")
 	slog.Info("live firmware move: target guest released", "vm", h.VM, "attempt", h.Attempt, "source", h.Source)
+	// Once it runs, not while it was held paused: the guest reads the
+	// gratuitous ARPs now, so its cached gateway moves to this host's bridge.
+	go s.announceGatewaysOf(context.WithoutCancel(ctx), h.VM)
 	if td, err := s.targetDomain(h.VM); err == nil {
 		resp.TargetDomain = td
 	}

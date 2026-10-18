@@ -462,6 +462,14 @@ than silently breaking BitLocker. The explicit refusals:
 | replica promotion | refused — a disk replica carries no firmware |
 | `lv rm --keep-disks` then `lv run --name <same>` | refused — the retained NVRAM isn't inherited; restore the VM instead of recreating it |
 
+**UEFI variable writes and a host power cut.** qemu writes a guest's UEFI
+variables (any UEFI VM, not only Secure Boot) to its vars file without
+flushing it, and libvirt has no cache setting for that file. The daemon
+fsyncs every vars file that changed, in `<data_dir>/nvram/` and
+`/var/lib/libvirt/qemu/nvram/`, once a second. A host power cut can therefore
+lose a variable written in about the last second before it, or longer while
+the daemon is not running.
+
 ## Containers (LXC / OCI)
 
 ```bash

@@ -264,7 +264,9 @@ func ReadFirmwareBundle(r io.Reader, dataDir, vmName, uuid string) error {
 			return err
 		}
 	}
+	installedSwtpm := false
 	if swtpmStage != "" {
+		installedSwtpm = true
 		if _, e := os.Stat(swtpmRoot); e == nil {
 			swtpmBak = swtpmRoot + ".bak"
 			_ = os.RemoveAll(swtpmBak)
@@ -287,6 +289,20 @@ func ReadFirmwareBundle(r io.Reader, dataDir, vmName, uuid string) error {
 		if err := os.Chmod(swtpmRoot, 0o711); err != nil {
 			rollback()
 			return fmt.Errorf("set swtpm dir traversable: %w", err)
+		}
+	}
+	// The renames are on disk only once their directories are: a power cut
+	// before that can bring back the state this restore replaced.
+	if haveNvram {
+		if err := fsyncPath(filepath.Dir(nvramDst)); err != nil {
+			rollback()
+			return fmt.Errorf("flush the nvram directory: %w", err)
+		}
+	}
+	if installedSwtpm {
+		if err := fsyncPath(filepath.Dir(swtpmRoot)); err != nil {
+			rollback()
+			return fmt.Errorf("flush the swtpm directory: %w", err)
 		}
 	}
 	// Success — drop the backups.

@@ -4,10 +4,12 @@ import (
 	"archive/tar"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -227,21 +229,31 @@ func ReadFirmwareBundle(r io.Reader, dataDir, vmName, uuid string) error {
 	// install the staged ones, and on ANY failure restore the backups — so we
 	// never leave new NVRAM with stale/missing TPM (or vice-versa).
 	nvramDst := NvramPath(dataDir, vmName)
+	nvramDir, swtpmParent := filepath.Dir(nvramDst), filepath.Dir(swtpmRoot)
 	var nvramBak, swtpmBak string
 	rollback := func() {
 		if nvramBak != "" {
 			_ = os.Remove(nvramDst)
 			_ = os.Rename(nvramBak, nvramDst)
+			_ = fsyncDir(nvramDir)
 		}
 		if swtpmBak != "" {
 			_ = os.RemoveAll(swtpmRoot)
 			_ = os.Rename(swtpmBak, swtpmRoot)
+			_ = fsyncDir(swtpmParent)
 		}
 	}
 
 	if haveNvram {
-		if err := diskmode.MkdirAll(filepath.Dir(nvramDst)); err != nil {
+		_, statErr := os.Stat(nvramDir)
+		if err := diskmode.MkdirAll(nvramDir); err != nil {
 			return err
+		}
+		if os.IsNotExist(statErr) {
+			// The directory is new: its entry is on disk once its parent is.
+			if err := fsyncDir(filepath.Dir(nvramDir)); err != nil {
+				return fmt.Errorf("flush the directory of the new nvram directory: %w", err)
+			}
 		}
 		staged := nvramDst + ".staged"
 		if err := os.WriteFile(staged, nvramBytes, 0o600); err != nil {
@@ -253,6 +265,10 @@ func ReadFirmwareBundle(r io.Reader, dataDir, vmName, uuid string) error {
 		}
 		if _, e := os.Stat(nvramDst); e == nil {
 			nvramBak = nvramDst + ".bak"
+			if err := keepStaleBackup(nvramBak); err != nil {
+				_ = os.Remove(staged)
+				return err
+			}
 			if err := os.Rename(nvramDst, nvramBak); err != nil {
 				_ = os.Remove(staged)
 				return err
@@ -267,9 +283,18 @@ func ReadFirmwareBundle(r io.Reader, dataDir, vmName, uuid string) error {
 	installedSwtpm := false
 	if swtpmStage != "" {
 		installedSwtpm = true
+		// The staged tree's files are fsynced as written; its directories,
+		// deepest first, before it is renamed into place.
+		if err := fsyncTreeDirs(swtpmStage); err != nil {
+			rollback()
+			return fmt.Errorf("flush the staged swtpm state: %w", err)
+		}
 		if _, e := os.Stat(swtpmRoot); e == nil {
 			swtpmBak = swtpmRoot + ".bak"
-			_ = os.RemoveAll(swtpmBak)
+			if err := keepStaleBackup(swtpmBak); err != nil {
+				rollback()
+				return err
+			}
 			if err := os.Rename(swtpmRoot, swtpmBak); err != nil {
 				rollback()
 				return err
@@ -294,13 +319,13 @@ func ReadFirmwareBundle(r io.Reader, dataDir, vmName, uuid string) error {
 	// The renames are on disk only once their directories are: a power cut
 	// before that can bring back the state this restore replaced.
 	if haveNvram {
-		if err := fsyncPath(filepath.Dir(nvramDst)); err != nil {
+		if err := fsyncDir(nvramDir); err != nil {
 			rollback()
 			return fmt.Errorf("flush the nvram directory: %w", err)
 		}
 	}
 	if installedSwtpm {
-		if err := fsyncPath(filepath.Dir(swtpmRoot)); err != nil {
+		if err := fsyncDir(swtpmParent); err != nil {
 			rollback()
 			return fmt.Errorf("flush the swtpm directory: %w", err)
 		}
@@ -430,6 +455,47 @@ func writeFileFromTar(tr io.Reader, dst string) error {
 		return err
 	}
 	return f.Close()
+}
+
+// fsyncDir fsyncs a directory (a variable so tests can observe and fail it).
+var fsyncDir = fsyncPath
+
+// fsyncTreeDirs fsyncs every directory under root, deepest first, root last.
+func fsyncTreeDirs(root string) error {
+	var dirs []string
+	if err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			dirs = append(dirs, p)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for i := len(dirs) - 1; i >= 0; i-- { // WalkDir lists a parent before its children
+		if err := fsyncDir(dirs[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// keepStaleBackup moves aside a backup an interrupted earlier restore left at
+// bak. It holds the state from before that restore and may be its only copy,
+// so it is kept, under a new name, never overwritten.
+func keepStaleBackup(bak string) error {
+	if _, err := os.Lstat(bak); err != nil {
+		return nil
+	}
+	kept := bak + "-" + time.Now().UTC().Format("20060102T150405.000000000")
+	if err := os.Rename(bak, kept); err != nil {
+		return fmt.Errorf("keep the backup an earlier restore left: %w", err)
+	}
+	slog.Warn("firmware restore: kept the backup an earlier, interrupted restore left; only an operator removes it",
+		"path", kept)
+	return nil
 }
 
 // fsyncPath fsyncs a file at path (used after staging the nvram temp file).

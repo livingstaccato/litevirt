@@ -211,6 +211,14 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 		return err
 	}
 
+	if len(targets) == 0 && !named && probedVersion == "" {
+		// Every host matched only the connected daemon's version, which says
+		// nothing about the binary: no proof that any host is up to date.
+		return fmt.Errorf("cannot tell which hosts are outdated: the version of %s could not be read "+
+			"(`%s --version` did not run here, e.g. a binary built for another architecture); "+
+			"check the path given to --binary, or name the hosts to upgrade (lv host upgrade <host>...)",
+			opts.BinaryPath, opts.BinaryPath)
+	}
 	if len(targets) == 0 {
 		fmt.Println("All hosts are up-to-date.")
 		return nil

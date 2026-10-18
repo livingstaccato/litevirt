@@ -569,3 +569,32 @@ func TestHostUpgrade_HungProbeTimesOut(t *testing.T) {
 		t.Fatalf("pre-staged %v after a probe timed out", client.preStaged)
 	}
 }
+
+// In all-hosts mode an unprobeable binary leaves only the connected daemon's
+// version to compare with, which says nothing about the binary: "every host
+// matches" is no proof that every host is up to date, so the upgrade is
+// refused with the fix instead of reporting "All hosts are up-to-date".
+func TestHostUpgrade_AllModeUnprobeableBinaryRefusesInsteadOfUpToDate(t *testing.T) {
+	bin := writeFakeBinary(t)
+	activate := &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok"}}
+	client := &perHostPreStageClient{mockUpgradeClient: &mockUpgradeClient{
+		stream: activate,
+		hosts: []*pb.Host{
+			// Both on the connected daemon's version (the mock Ping's v1.0.0).
+			{Name: "node1", Address: "10.0.0.1", Version: "v1.0.0"},
+			{Name: "node2", Address: "10.0.0.2", Version: "v1.0.0"},
+		},
+	}}
+	err := HostUpgrade(context.Background(), client, UpgradeOpts{BinaryPath: bin, Yes: true})
+	if err == nil {
+		t.Fatal("reported every host up to date against a binary whose version could not be read")
+	}
+	for _, want := range []string{"could not be read", bin, "--binary", "lv host upgrade <host>"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not contain %q", err, want)
+		}
+	}
+	if len(activate.sent) != 0 || len(client.preStaged) != 0 {
+		t.Fatalf("changed hosts after refusing: swapped %d chunk(s), pre-staged %v", len(activate.sent), client.preStaged)
+	}
+}

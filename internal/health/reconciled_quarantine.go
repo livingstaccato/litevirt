@@ -39,35 +39,31 @@ import (
 //     not kept forever once nothing can use it.
 //
 // Its age is the time in its name. A <vm>-reconciling-<uuid> directory is a
-// quarantine the reconciler has not finished; it is listed, held, and never
-// removed by the sweep or a purge (the next pass finishes it, or an operator
-// removes it by name once the leftover is gone).
+// quarantine the reconciler has not finished, and a <vm>-restoring-<uuid> one
+// an interrupted restore (fwmig/staged.go). Both are listed and held: never
+// removed by the sweep, a purge or --remove, since either may hold the VM's
+// only firmware state while its own paths are empty (the guard refuses the
+// VM's start meanwhile). The reconciler finishes a reconciling stage on a
+// later pass: as the leftover's quarantine while the leftover domain is
+// defined, and, once no domain of the name with that uuid is defined here, as
+// an orphaned stage renamed to <vm>-reconciled-<unix>, which then takes the
+// rule above (and --remove). While the VM's own domain is defined here with
+// that uuid, `--restore <dir>` puts the state back; so does a rerun of an
+// interrupted restore.
 //
 // The doctor's own quarantines (<vm>-<attempt>/) are not covered: they raise
 // firmware_migration_quarantine and are removed by hand.
 
-// reconciledInfix and reconcilingInfix name a finished and an unfinished
-// reconciler quarantine.
-const (
-	reconciledInfix  = "-reconciled-"
-	reconcilingInfix = "-reconciling-"
-	// reconcilingNoUUID stands for the uuid of a definition that gives none.
-	reconcilingNoUUID = "nouuid"
-)
+// reconciledInfix names a finished reconciler quarantine.
+const reconciledInfix = "-reconciled-"
 
 // reconcilingName is the directory the reconciler gathers vm's state in
 // before it takes its final name.
 func reconcilingName(vm, uuid string) string {
-	if uuid == "" {
-		uuid = reconcilingNoUUID
-	}
-	return vm + reconcilingInfix + uuid
+	return fwmig.StageName(vm, fwmig.StageReconciling, uuid)
 }
 
-var (
-	reconciledNameRe  = regexp.MustCompile(`^(.+)-reconciled-([0-9]+)$`)
-	reconcilingNameRe = regexp.MustCompile(`^(.+)-reconciling-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|nouuid)$`)
-)
+var reconciledNameRe = regexp.MustCompile(`^(.+)-reconciled-([0-9]+)$`)
 
 // ReconciledQuarantine is one reconciler firmware quarantine on this host.
 type ReconciledQuarantine struct {
@@ -106,19 +102,27 @@ func ListReconciledQuarantines(ctx context.Context, db *corrosion.Client, dataDi
 				continue
 			}
 			q.VM, q.SetAsideAt = m[1], time.Unix(sec, 0).UTC()
-		} else if m := reconcilingNameRe.FindStringSubmatch(e.Name()); m != nil {
-			q.VM = m[1]
+		} else if vm, kind, _, ok := fwmig.ParseStageName(e.Name()); ok {
+			q.VM = vm
 			if fi, err := e.Info(); err == nil {
 				q.SetAsideAt = fi.ModTime().UTC()
 			}
-			q.Held = "the reconciler has not finished this quarantine; its next pass does, while the leftover domain is defined"
+			if kind == fwmig.StageRestoring {
+				q.Held = fmt.Sprintf("an interrupted restore of VM %s's firmware state; run --restore %s again (the VM's start is refused until it finishes)", vm, q.Path)
+			} else {
+				q.Held = fmt.Sprintf("an unfinished quarantine of VM %s's firmware state: the reconciler finishes it (as the leftover's, or, once no domain of it is defined here, as an orphaned stage that --remove then takes); while the VM's own domain is defined here its start is refused until --restore %s puts the state back", vm, q.Path)
+			}
 		} else {
 			continue
 		}
 		q.SizeBytes = treeSize(q.Path)
 		vm, err := corrosion.GetVM(ctx, db, q.VM)
 		if err != nil {
-			return nil, fmt.Errorf("read VM %s: %w", q.VM, err)
+			// That one entry is held, named with its error; the rest are
+			// listed (fail closed for it alone).
+			q.Held = fmt.Sprintf("VM %s's row cannot be read (%v); kept until it can", q.VM, err)
+			out = append(out, q)
+			continue
 		}
 		if vm != nil {
 			q.VMState = vm.State
@@ -274,7 +278,8 @@ func IsReconciledQuarantinePath(dataDir, p string) bool {
 		return false
 	}
 	b := filepath.Base(p)
-	return reconciledNameRe.MatchString(b) || reconcilingNameRe.MatchString(b)
+	_, _, _, staged := fwmig.ParseStageName(b)
+	return reconciledNameRe.MatchString(b) || staged
 }
 
 // removeReconciled removes a quarantine directory; a test can fail it.

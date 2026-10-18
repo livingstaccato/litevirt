@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
@@ -121,6 +122,112 @@ func TestQuarantineLeftoverFirmwareState(t *testing.T) {
 		}
 		if _, ok := e.nvram(fwTestVM); !ok || !e.hasSwtpm() {
 			t.Error("state moved under a hold")
+		}
+	})
+}
+
+// D2-18 re-review 4, m-2: a stage of the VM's firmware state (an unfinished
+// quarantine, an interrupted restore) refuses whatever would boot or redefine
+// the VM on blank firmware state, and allows what finishes or restores it.
+//
+// Mutation: let a staged record allow OpStart — red.
+func TestFirmwareMoveGuard_StagedRefusesBoot(t *testing.T) {
+	staged := FirmwareMoveRecord{Kind: FirmwareStaged, VM: fwTestVM, UUID: fwTestUUID, State: "reconciling", Path: "/q/vm1-reconciling-x"}
+	g := NewFirmwareMoveGuard(func(string, string) ([]FirmwareMoveRecord, error) { return []FirmwareMoveRecord{staged}, nil })
+	for op, allow := range map[FirmwareOp]bool{OpStart: false, OpResume: false, OpDefine: false,
+		OpStop: true, OpUndefine: true, OpWipe: true, OpWriteState: true} {
+		err := g.check(FirmwareCall{Op: op, Name: fwTestVM, UUID: fwTestUUID})
+		if (err == nil) != allow {
+			t.Errorf("%s under a stage: %v, want allowed=%v", op, err, allow)
+		}
+		if err != nil && !strings.Contains(err.Error(), "blank firmware state") {
+			t.Errorf("%s refusal does not say why: %v", op, err)
+		}
+	}
+}
+
+// D2-18 re-review 4, I-1/m-2: a quarantine is put back as the VM's own state;
+// what was in place is set aside whole first, and a restore stopped after the
+// set-aside finishes on a rerun without setting aside what it already moved
+// back. FinishOrphanedStage renames a stage whole with its reason.
+//
+// Mutations: skip the set-aside — red (replaced); set aside again on a rerun
+// — red (rerun).
+func TestRestoreFirmwareQuarantine(t *testing.T) {
+	setup := func(t *testing.T) (*fwEnv, string, string) {
+		e := newFWEnv(t, fwState{name: "none"}, golibvirt.DomainShutoff)
+		q := filepath.Join(e.store.DataDir, "fwmig-quarantine")
+		from := filepath.Join(q, "vm1-reconciled-100")
+		fwWriteFile(t, filepath.Join(from, "nvram"), "NEWER")
+		fwWriteFile(t, filepath.Join(from, "swtpm", "tpm2", "tpm2-00.permall"), "NEWERP")
+		fwWriteFile(t, filepath.Join(from, "reason.txt"), "x")
+		return e, q, from
+	}
+	permall := func(e *fwEnv) string {
+		b, _ := os.ReadFile(filepath.Join(e.store.SwtpmDir(fwTestUUID), "tpm2", "tpm2-00.permall"))
+		return string(b)
+	}
+	t.Run("replaced", func(t *testing.T) {
+		e, q, from := setup(t)
+		restoring, stage, final := filepath.Join(q, "vm1-restoring-"+fwTestUUID), filepath.Join(q, "vm1-reconciling-"+fwTestUUID), filepath.Join(q, "vm1-reconciled-200")
+		if err := e.store.RestoreFirmwareQuarantine(fwTestVM, fwTestUUID, from, restoring, stage, final, []byte("r")); err != nil {
+			t.Fatal(err)
+		}
+		if b, _ := e.nvram(fwTestVM); b != "NEWER" || permall(e) != "NEWERP" {
+			t.Errorf("restored nvram %q permall %q", b, permall(e))
+		}
+		if b, _ := os.ReadFile(filepath.Join(final, "nvram")); string(b) != "T0" {
+			t.Errorf("the replaced NVRAM is not set aside: %q", b)
+		}
+		if b, _ := os.ReadFile(filepath.Join(final, "swtpm", "tpm2", "tpm2-00.permall")); string(b) != "P0" {
+			t.Errorf("the replaced TPM state is not set aside: %q", b)
+		}
+		for _, p := range []string{from, restoring, stage} {
+			if _, err := os.Lstat(p); !os.IsNotExist(err) {
+				t.Errorf("%s left behind (%v)", p, err)
+			}
+		}
+	})
+	t.Run("rerun", func(t *testing.T) {
+		e, q, from := setup(t)
+		restoring, stage, final := filepath.Join(q, "vm1-restoring-"+fwTestUUID), filepath.Join(q, "vm1-reconciling-"+fwTestUUID), filepath.Join(q, "vm1-reconciled-200")
+		defer func(r func(string, string) error) { quarantineRename = r }(quarantineRename)
+		quarantineRename = func(o, n string) error {
+			if o == filepath.Join(restoring, "swtpm") {
+				return errors.New("injected crash after the NVRAM went back")
+			}
+			return os.Rename(o, n)
+		}
+		if err := e.store.RestoreFirmwareQuarantine(fwTestVM, fwTestUUID, from, restoring, stage, final, []byte("r")); err == nil {
+			t.Fatal("a stopped restore reported success")
+		}
+		quarantineRename = os.Rename
+		// As a cross-filesystem move a crash interrupted leaves it: the
+		// NVRAM is in place and its source not yet removed.
+		fwWriteFile(t, filepath.Join(restoring, "nvram"), "NEWER")
+		if err := e.store.RestoreFirmwareQuarantine(fwTestVM, fwTestUUID, restoring, restoring, stage, filepath.Join(q, "vm1-reconciled-300"), []byte("r")); err != nil {
+			t.Fatal(err)
+		}
+		if b, _ := e.nvram(fwTestVM); b != "NEWER" || permall(e) != "NEWERP" {
+			t.Errorf("restored nvram %q permall %q", b, permall(e))
+		}
+		if _, err := os.Lstat(filepath.Join(q, "vm1-reconciled-300")); !os.IsNotExist(err) {
+			t.Errorf("the rerun set aside state the restore had already put back (%v)", err)
+		}
+	})
+	t.Run("finish_orphaned_stage", func(t *testing.T) {
+		e, q, _ := setup(t)
+		stage := filepath.Join(q, "vm1-reconciling-"+fwTestUUID)
+		fwWriteFile(t, filepath.Join(stage, "nvram"), "T0")
+		final := filepath.Join(q, "vm1-reconciled-400")
+		if err := e.store.FinishOrphanedStage(stage, final, []byte("orphaned")); err != nil {
+			t.Fatal(err)
+		}
+		if b, _ := os.ReadFile(filepath.Join(final, "nvram")); string(b) != "T0" {
+			t.Errorf("finished nvram %q", b)
+		}
+		if b, _ := os.ReadFile(filepath.Join(final, "reason.txt")); string(b) != "orphaned" {
+			t.Errorf("reason %q", b)
 		}
 	})
 }

@@ -118,6 +118,14 @@ const (
 	// FirmwareLeftover is a target's record of a leftover an owed DISCARD
 	// names after its hold went (fwmig.Leftover).
 	FirmwareLeftover FirmwareRecordKind = "leftover"
+	// FirmwareStaged is a VM's own firmware state (NVRAM, swtpm tree) sitting
+	// in an unfinished quarantine of the reconciler
+	// (<data_dir>/fwmig-quarantine/<vm>-reconciling-<uuid>) or an interrupted
+	// restore (<vm>-restoring-<uuid>): the domain's own paths are empty, so a
+	// start, resume or define would boot the VM on blank firmware state. Those
+	// are refused; a stop, an undefine, a wipe (the quarantine finishing) and a
+	// state write (the restore moving it back) are not.
+	FirmwareStaged FirmwareRecordKind = "staged"
 )
 
 // The record states the rules name. They are fwmig's values; fwmig's tests
@@ -153,6 +161,8 @@ type FirmwareMoveRecord struct {
 	Parked bool
 	// RetainedBundle (marker): the attempt's retained bundle is on disk.
 	RetainedBundle bool
+	// Path (staged): the directory that holds the state.
+	Path string
 }
 
 // FirmwareMoveLookup returns every record that names the VM by name or by
@@ -231,6 +241,13 @@ func heldPaused(state string) bool {
 // op; a hold refuses every op, except that a released_unconfirmed hold (the
 // guest runs; its NVRAM is not yet confirmed) lets a paused guest resume.
 func ordinaryAllows(r FirmwareMoveRecord, op FirmwareOp) bool {
+	if r.Kind == FirmwareStaged {
+		switch op {
+		case OpStop, OpUndefine, OpWipe, OpWriteState:
+			return true
+		}
+		return false
+	}
 	return r.Kind == FirmwareHold && r.State == FirmwareHoldReleasedUnconfirmed && op == OpResume
 }
 
@@ -305,6 +322,11 @@ func refusal(r FirmwareMoveRecord, c FirmwareCall) error {
 	switch r.Kind {
 	case FirmwareHold:
 		dir, what = "from", "state"
+	case FirmwareStaged:
+		return fmt.Errorf("%w: VM %s: its firmware state (NVRAM, vTPM) is in %s, not in place, and the VM must not boot on blank firmware state; %s refused. "+
+			"The reconciler finishes a leftover's quarantine on its next pass; for the VM's own domain, "+
+			"`lv host superseded-disks <host> --restore %s` puts the state back",
+			ErrFirmwareMoveInFlight, r.VM, r.Path, refusedHow(c), r.Path)
 	case FirmwareLeftover:
 		return fmt.Errorf("%w: VM %s: the leftover of live firmware migration %s from %s, whose DISCARD is owed, is kept until `lv doctor firmware-move %s --discard-target` quarantines it; %s refused",
 			ErrFirmwareMoveInFlight, r.VM, r.Attempt, r.Peer, r.VM, refusedHow(c))

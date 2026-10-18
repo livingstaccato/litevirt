@@ -539,6 +539,7 @@ func (r *Reconciler) reconcilePass(ctx context.Context) {
 	cancel()
 
 	r.selfFence(ctx)
+	r.finishOrphanedStages()
 	r.assertRuntimeOwnership(ctx)
 	// Both sweeps above skip a domain with no live row. Stamp every domain that
 	// has one here, so it stays recognisable once its row is gone; then report
@@ -1404,6 +1405,78 @@ func (r *Reconciler) quarantineLeftoverFirmware(domName string, vm *corrosion.VM
 	}
 	slog.Warn("reconciler: a leftover's firmware state was quarantined, not wiped", "vm", domName, "row_host", vm.HostName, "dir", final)
 	return true
+}
+
+// finishOrphanedStages finishes every reconciler stage
+// (<vm>-reconciling-<uuid>) whose leftover domain is gone: no domain of the
+// name is defined here, or the one defined has another uuid. It writes the
+// stage's reason.txt ("orphaned stage") and renames it to
+// <vm>-reconciled-<unix>, so it takes the retention rule and --remove like
+// any other (D2-18 re-review 4, m-2). A stage whose domain is still defined
+// with its uuid is left: as a leftover the cleanup finishes it, and as the
+// VM's own domain the guard refuses its start until --restore puts the state
+// back. An interrupted restore (<vm>-restoring-<uuid>) is never touched.
+func (r *Reconciler) finishOrphanedStages() {
+	if r.fwStore == nil {
+		return
+	}
+	qdir := filepath.Join(r.fwStore.DataDir, fwmig.QuarantineDir)
+	ents, err := os.ReadDir(qdir)
+	if err != nil {
+		return
+	}
+	var defined map[string]bool
+	for _, e := range ents {
+		vm, kind, uuid, ok := fwmig.ParseStageName(e.Name())
+		if !e.IsDir() || !ok || kind != fwmig.StageReconciling {
+			continue
+		}
+		stage := filepath.Join(qdir, e.Name())
+		if defined == nil {
+			// A listing error is never read as "no domain": the stage stays.
+			names, err := r.virt.ListDomains()
+			if err != nil {
+				return
+			}
+			defined = map[string]bool{}
+			for _, n := range names {
+				defined[n] = true
+			}
+		}
+		why := ""
+		if !defined[vm] {
+			why = "no domain of the VM is defined on this host any more"
+		} else if uuid != "" {
+			xml, err := r.virt.DumpXMLInactive(vm)
+			if err != nil {
+				continue // unreadable: not known to be another domain
+			}
+			if du := lv.UUIDFromXML(xml); du != "" && !strings.EqualFold(du, uuid) {
+				why = fmt.Sprintf("the domain of the VM defined on this host has uuid %s, not this stage's", du)
+			}
+		}
+		if why == "" {
+			continue
+		}
+		now := time.Now()
+		final := filepath.Join(qdir, fmt.Sprintf("%s%s%d", vm, reconciledInfix, now.Unix()))
+		reason := fmt.Sprintf("vm: %s\nuuid: %s\nhost: %s\nquarantined_at: %s\n"+
+			"reason: orphaned stage: the reconciler had gathered this leftover's firmware state when %s; it is finished here as is\n"+
+			"retention: kept while VM %s exists; once it is gone, removed after superseded_disk_retention_days (lv host superseded-disks lists it)\n",
+			vm, uuidOrNone(uuid), r.hostName, now.UTC().Format(time.RFC3339), why, vm)
+		if err := r.fwStore.FinishOrphanedStage(stage, final, []byte(reason)); err != nil {
+			slog.Warn("reconciler: an orphaned firmware quarantine stage cannot be finished", "stage", stage, "error", err)
+			continue
+		}
+		slog.Warn("reconciler: finished an orphaned firmware quarantine stage", "vm", vm, "dir", final, "why", why)
+	}
+}
+
+func uuidOrNone(u string) string {
+	if u == "" {
+		return "(none)"
+	}
+	return u
 }
 
 // cleanableLeftover reports whether a local domain is a CLEARLY-DEAD leftover —

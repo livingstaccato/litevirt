@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -13,7 +15,10 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fwmig"
 	"github.com/litevirt/litevirt/internal/health"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/notify"
 )
 
@@ -73,8 +78,14 @@ func (s *Server) SupersededDisks(ctx context.Context, req *pb.SupersededDisksReq
 	removed := map[string]bool{}
 	switch {
 	case req.RestorePath != "" && health.IsReconciledQuarantinePath(s.dataDir, req.RestorePath):
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"%s is a firmware quarantine the reconciler made, not a disk copy; nothing restores it: inspect it by hand, or remove it with --remove", req.RestorePath)
+		vm, setAside, rerr := s.restoreReconciledQuarantine(ctx, req.RestorePath)
+		if rerr != nil {
+			return nil, rerr
+		}
+		resp.Restored, resp.RestoredTo, resp.SetAside = filepath.Clean(req.RestorePath), "the firmware state (NVRAM, vTPM) of VM "+vm, setAside
+		if quarantines, err = health.ListReconciledQuarantines(ctx, s.db, s.dataDir); err != nil {
+			quarantines = nil
+		}
 	case req.RestorePath != "":
 		got, rerr := s.restoreSupersededDisk(ctx, req.RestorePath)
 		if rerr != nil {
@@ -237,3 +248,109 @@ func (s *Server) NotifyCTRootfsStranded(ct, host, detail string) {
 
 // supersededRelist lists the copies again after a restore; tests make it fail.
 var supersededRelist = health.ListSupersededDisks
+
+var reconciledDirRe = regexp.MustCompile(`^(.+)-reconciled-[0-9]+$`)
+
+// restoreReconciledQuarantine puts a reconciler firmware quarantine (a
+// finished <vm>-reconciled-<unix>, an unfinished <vm>-reconciling-<uuid>, or
+// an interrupted <vm>-restoring-<uuid>) back as the VM's own NVRAM and vTPM
+// state on this host (D2-18 re-review 4, I-1, m-2), under the VM's lock: the
+// VM's row names this host, its incarnation's uuid is the quarantine's, and
+// its domain is not active. The state in place is set aside as another
+// reconciled quarantine first (FirmwareStore.RestoreFirmwareQuarantine).
+// It returns the VM and where the replaced state went ("" when there was none).
+func (s *Server) restoreReconciledQuarantine(ctx context.Context, path string) (string, string, error) {
+	p := filepath.Clean(path)
+	base := filepath.Base(p)
+	vm, uuid := "", ""
+	if svm, _, su, ok := fwmig.ParseStageName(base); ok {
+		vm, uuid = svm, su
+	} else if m := reconciledDirRe.FindStringSubmatch(base); m != nil {
+		vm = m[1]
+		b, err := os.ReadFile(filepath.Join(p, "reason.txt"))
+		if err != nil {
+			return "", "", status.Errorf(codes.FailedPrecondition, "%s: its reason.txt cannot be read (%v), so whose state it is is not known", p, err)
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			if v, ok := strings.CutPrefix(line, "uuid: "); ok && lv.ValidFirmwareUUID(strings.TrimSpace(v)) {
+				uuid = strings.TrimSpace(v)
+			}
+		}
+	}
+	refuse := func(format string, a ...any) error {
+		err := status.Errorf(codes.FailedPrecondition, "restore %s: "+format, append([]any{p}, a...)...)
+		s.audit(ctx, "host.superseded_disks.restore", s.hostName, err.Error(), "error")
+		return err
+	}
+	if vm == "" {
+		return "", "", refuse("not a reconciler firmware quarantine")
+	}
+	if fi, err := os.Lstat(p); err != nil || !fi.IsDir() {
+		return "", "", refuse("no such directory on %s (%v)", s.hostName, err)
+	}
+	defer s.lockVM(vm)()
+	row, err := corrosion.GetVM(ctx, s.db, vm)
+	if err != nil {
+		return "", "", status.Errorf(codes.Unavailable, "restore %s: VM %s's row cannot be read: %v", p, vm, err)
+	}
+	if row == nil {
+		return "", "", refuse("VM %s does not exist; nothing restores state for it", vm)
+	}
+	if row.HostName != s.hostName {
+		return "", "", refuse("VM %s is placed on %s, not %s: stop it, move it here with `lv migrate %s %s --cold`, then restore", vm, row.HostName, s.hostName, vm, s.hostName)
+	}
+	rowUUID := parseFirmwareSpec(row.Spec).UUID
+	if uuid != "" && !strings.EqualFold(uuid, rowUUID) {
+		return "", "", refuse("its state is of uuid %s, and VM %s's incarnation has uuid %s", uuid, vm, rowUUID)
+	}
+	switch row.State {
+	case "running", "starting", "migrating", "pending":
+		return "", "", refuse("VM %s is %s; stop it first", vm, row.State)
+	}
+	if s.virt != nil {
+		active, err := s.virt.DomainIsActive(vm)
+		if err != nil && !lv.IsNoDomain(err) {
+			return "", "", status.Errorf(codes.Unavailable, "restore %s: VM %s's domain state cannot be read: %v", p, vm, err)
+		}
+		if err == nil && active {
+			return "", "", refuse("VM %s's domain is active on %s; stop it first", vm, s.hostName)
+		}
+	}
+	qdir := filepath.Dir(p)
+	now := time.Now()
+	final := ""
+	for i := int64(0); ; i++ {
+		final = filepath.Join(qdir, fmt.Sprintf("%s-reconciled-%d", vm, now.Unix()+i))
+		if _, err := os.Lstat(final); os.IsNotExist(err) && final != p {
+			break
+		}
+	}
+	reason := fmt.Sprintf("vm: %s\nuuid: %s\nhost: %s\nquarantined_at: %s\n"+
+		"reason: the state VM %s had in place when an operator restored %s (lv host superseded-disks --restore)\n"+
+		"retention: kept while VM %s exists; once it is gone, removed after superseded_disk_retention_days (lv host superseded-disks lists it)\n",
+		vm, uuidOrNoneGRPC(uuid), s.hostName, now.UTC().Format(time.RFC3339), vm, p, vm)
+	restoring := filepath.Join(qdir, fwmig.StageName(vm, fwmig.StageRestoring, uuid))
+	stage := filepath.Join(qdir, fwmig.StageName(vm, fwmig.StageReconciling, uuid))
+	if err := s.fw().RestoreFirmwareQuarantine(vm, uuid, p, restoring, stage, final, []byte(reason)); err != nil {
+		s.audit(ctx, "host.superseded_disks.restore", s.hostName, fmt.Sprintf("restore %s: %v", p, err), "error")
+		return "", "", status.Errorf(codes.FailedPrecondition, "restore %s: %v", p, err)
+	}
+	setAside := ""
+	if _, err := os.Lstat(final); err == nil {
+		setAside = final
+	}
+	detail := fmt.Sprintf("restored %s as the firmware state of VM %s on %s", p, vm, s.hostName)
+	if setAside != "" {
+		detail += "; the state it replaced is kept as " + setAside
+	}
+	s.audit(ctx, "host.superseded_disks.restore", s.hostName, detail, "ok")
+	s.recordVMEvent(ctx, vm, "vm.firmware.restored", "ok", detail)
+	return vm, setAside, nil
+}
+
+func uuidOrNoneGRPC(u string) string {
+	if u == "" {
+		return "(none: NVRAM only)"
+	}
+	return u
+}

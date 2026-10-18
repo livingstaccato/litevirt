@@ -30,7 +30,7 @@ func Wire(virt Virt, store *lv.FirmwareStore) {
 		// would be refused at runtime.
 		panic("fwmig.Wire: the firmware store has no data dir")
 	}
-	g := lv.NewFirmwareMoveGuard(New(store.DataDir).Lookup)
+	g := lv.NewFirmwareMoveGuard(New(store.DataDir).guardLookup)
 	virt.SetFirmwareMoveGuard(g)
 	store.SetFirmwareMoveGuard(g)
 }

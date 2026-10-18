@@ -27,6 +27,8 @@ func TestFirmwareMoveFlags_Request(t *testing.T) {
 		{"push_ack", firmwareMoveFlags{pushNvram: true, ack: true}, pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_PUSH_SOURCE_NVRAM},
 		{"discard_stop", firmwareMoveFlags{discard: true, stopTarget: true}, pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_DISCARD_TARGET},
 		{"resolve", firmwareMoveFlags{resolve: "quarantine"}, pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_RESOLVE_CONDITION},
+		// D2-18 re-review 4, I-1: keeping a leftover as the VM's own takes it.
+		{"adopt_ack", firmwareMoveFlags{adopt: true, ack: true}, pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_ADOPT_TARGET_COPY},
 	}
 	for _, c := range ok {
 		req, err := c.f.request("os1")
@@ -38,7 +40,7 @@ func TestFirmwareMoveFlags_Request(t *testing.T) {
 		"two_actions":         {acceptTarget: true, acceptSource: true},
 		"hash_without_action": {nvramHash: strings.Repeat("a", 64)},
 		"confirm_no_hash":     {confirmNvram: true},
-		"ack_with_adopt":      {adopt: true, ack: true},
+		"ack_with_reverify":   {reverify: true, ack: true},
 		"stop_with_adopt":     {adopt: true, stopTarget: true},
 	}
 	for name, f := range bad {

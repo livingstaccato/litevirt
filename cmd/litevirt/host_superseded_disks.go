@@ -41,9 +41,17 @@ The firmware state (NVRAM, vTPM) the reconciler moved aside from a leftover
 domain whose VM now runs elsewhere is listed here too, as
 <data_dir>/fwmig-quarantine/<vm>-reconciled-<time> ("firmware state of VM
 <vm>"). It follows the same rule, and is also held while a live firmware move
-record or an open owed DISCARD names the VM, or while the reconciler has not
-finished moving it (<vm>-reconciling-<uuid>). --remove takes it by its path;
---restore does not.
+record or an open owed DISCARD names the VM. --remove takes it by its path.
+--restore <dir> puts its NVRAM and vTPM state back as the VM's own on this
+host; the VM must be stopped here, and the state it replaces is set aside as
+another such directory.
+
+A directory the reconciler has not finished (<vm>-reconciling-<uuid>), or a
+restore that was interrupted (<vm>-restoring-<uuid>), is held, and the VM's
+start on this host is refused while it exists. The reconciler finishes the
+first once its leftover domain is gone (it then becomes removable); while the
+VM's own domain is defined here, --restore <dir> puts the state back. Rerun
+--restore on an interrupted restore.
 
 --purge removes every copy that is neither retained nor held, whatever its
 age. Narrow it with --older-than.

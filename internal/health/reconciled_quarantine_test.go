@@ -128,3 +128,28 @@ func TestReconciledQuarantine_Retention(t *testing.T) {
 		t.Error("IsReconciledQuarantinePath")
 	}
 }
+
+// D2-18 re-review 4, n-1: a VM row that cannot be read holds that entry,
+// named with the error, and the listing goes on: it does not fail, and so does
+// not take the disk-copy listing with it.
+//
+// Mutation: fail the listing on the read error — red.
+func TestReconciledQuarantine_UnreadableRowHoldsThatEntry(t *testing.T) {
+	ctx := context.Background()
+	db := testReconcilerDB(t)
+	dataDir := t.TempDir()
+	p := reconciledAt(t, dataDir, "gone", time.Now().Add(-30*24*time.Hour))
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	qs, err := ListReconciledQuarantines(ctx, db, dataDir)
+	if err != nil {
+		t.Fatalf("the listing failed on one unreadable row: %v", err)
+	}
+	if len(qs) != 1 || qs[0].Path != p || !strings.Contains(qs[0].Held, "cannot be read") {
+		t.Fatalf("listing %+v, want the entry held naming the read error", qs)
+	}
+	if gone, _ := PurgeReconciledQuarantines(ctx, db, dataDir, 0, time.Now()); len(gone) != 0 || !exists(p) {
+		t.Fatalf("an entry whose VM row cannot be read was purged: %+v", gone)
+	}
+}

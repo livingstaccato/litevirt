@@ -1443,6 +1443,7 @@ lv doctor fence                              # Report whether a shared-disk VM's
 lv doctor privileged-containers              # Report privileged or legacy-confined containers (read-only)
 lv doctor firmware-move <vm> [--json]        # Show a live firmware migration's records on every host, with every hash and path (read-only)
 lv doctor firmware-move <vm> --accept-target | --reverify | --adopt-target-copy | --discard-target [--stop-target]
+lv doctor firmware-move <vm> --adopt-target-copy --acknowledge-rollback   # keep a leftover as the VM's own (older state)
 lv doctor firmware-move <vm> --accept-source [--acknowledge-rollback] [--stop-target]
 lv doctor firmware-move <vm> --confirm-target-nvram --accept-nvram-hash=<sha256>
 lv doctor firmware-move <vm> --push-source-nvram [--acknowledge-rollback] [--stop-target]

@@ -797,7 +797,16 @@ func (s *Server) putOwedLeftover(o fwmig.OwedDiscard, owner string) error {
 // the same leftover record; the domain, when defined, has the record's uuid,
 // carries no managed stamp of another incarnation, and is shut off (a guest
 // that runs or is paused is refused, never stopped).
-func (s *Server) doctorAdoptOwnLeftover(ctx context.Context, l fwmig.Leftover, actor string) (string, error) {
+//
+// The leftover is the state of the attempt as of the record's Since, when the
+// source took its own copy as current: whatever the VM wrote afterwards, on
+// the source or a later host, is newer (D2-18 re-review 4, I-1). So it takes
+// --acknowledge-rollback, and both the refusal and the outcome name the
+// leftover's age and every newer copy the answering hosts report (a domain of
+// the VM, a reconciler quarantine of it), which `lv host superseded-disks
+// <host> --restore <dir>` brings back. A host list that cannot be read
+// refuses: no host was asked.
+func (s *Server) doctorAdoptOwnLeftover(ctx context.Context, l fwmig.Leftover, actor string, ack bool) (string, error) {
 	vm := l.VM
 	row, err := corrosion.GetVM(ctx, s.db, vm)
 	if err != nil {
@@ -808,10 +817,22 @@ func (s *Server) doctorAdoptOwnLeftover(ctx context.Context, l fwmig.Leftover, a
 			"VM %q: its row does not name %s for the incarnation of the leftover of attempt %s; --adopt-target-copy keeps a leftover only as the VM's own: `lv doctor firmware-move %s --discard-target`",
 			vm, s.hostName, l.Attempt, vm)
 	}
-	report := s.gatherFirmwareMoveRecords(ctx, vm, actor)
+	report, unreachable, listErr := s.gatherFirmwareMoveRecordsChecked(ctx, vm, actor)
+	if listErr != nil {
+		return "", status.Errorf(codes.Unavailable, "VM %q: the host list cannot be read on %s (%v), so no other host was asked about the VM; run this again", vm, s.hostName, listErr)
+	}
+	var newer []string
 	for _, h := range report.GetHosts() {
+		for _, q := range h.GetQuarantines() {
+			if b := filepath.Base(q); strings.Contains(b, "-reconciled-") || strings.Contains(b, "-reconciling-") || strings.Contains(b, "-restoring-") {
+				newer = append(newer, fmt.Sprintf("%s:%s", h.GetHost(), q))
+			}
+		}
 		if h.GetHost() == s.hostName {
 			continue
+		}
+		if d := h.GetDomain(); d.GetPresent() {
+			newer = append(newer, fmt.Sprintf("%s: a domain of the VM (%s)", h.GetHost(), d.GetState()))
 		}
 		if h.GetMarkerJson() != "" || h.GetHoldJson() != "" {
 			return "", status.Errorf(codes.FailedPrecondition, "VM %q: %s holds a live firmware move record of it; resolve that move first", vm, h.GetHost())
@@ -825,8 +846,8 @@ func (s *Server) doctorAdoptOwnLeftover(ctx context.Context, l fwmig.Leftover, a
 			}
 		}
 	}
-	for _, u := range report.GetUnreachable() {
-		if !strings.HasPrefix(u, l.Source+" (") {
+	for _, u := range unreachable {
+		if u != l.Source {
 			continue
 		}
 		off, err := corrosion.HostProvedOff(ctx, s.db, l.Source)
@@ -834,6 +855,18 @@ func (s *Server) doctorAdoptOwnLeftover(ctx context.Context, l fwmig.Leftover, a
 			return "", status.Errorf(codes.FailedPrecondition,
 				"VM %q: the leftover's source %s did not answer and is not proved off (%v); it may still owe a DISCARD of it", vm, l.Source, err)
 		}
+	}
+	age := fmt.Sprintf("the state of attempt %s as of %s (%s ago), when %s took its own copy as current",
+		l.Attempt, l.Since.UTC().Format(time.RFC3339), time.Since(l.Since).Round(time.Minute), l.Source)
+	where := "no answering host reports one"
+	if len(newer) > 0 {
+		where = strings.Join(newer, "; ")
+	}
+	if !ack {
+		return "", status.Errorf(codes.FailedPrecondition,
+			"VM %q: the leftover on %s is %s; whatever the VM wrote since, on %s or a later host, is newer, and keeping the leftover rolls its TPM and NVRAM back to then. "+
+				"Newer copies: %s. Bring one back with `lv host superseded-disks <host> --restore <dir>` on the host the VM is placed on, or add --acknowledge-rollback to keep the leftover",
+			vm, s.hostName, age, l.Source, where)
 	}
 	if s.virt == nil {
 		return "", status.Errorf(codes.Unavailable, "VM %q: no libvirt connection", vm)
@@ -882,8 +915,8 @@ func (s *Server) doctorAdoptOwnLeftover(ctx context.Context, l fwmig.Leftover, a
 	if !td.Present {
 		kept = "no domain of it is defined here; its NVRAM and TPM state, if any, are kept"
 	}
-	return fmt.Sprintf("VM %q: the leftover record of attempt %s on %s is dropped, and %s as the VM's own (its row names %s for this incarnation); nothing was deleted: `lv start %s` starts it",
-		vm, l.Attempt, s.hostName, kept, s.hostName, vm), nil
+	return fmt.Sprintf("VM %q: the leftover record of attempt %s on %s is dropped, and %s as the VM's own (its row names %s for this incarnation); it is %s (rollback acknowledged; newer copies: %s); nothing was deleted: `lv start %s` starts it",
+		vm, l.Attempt, s.hostName, kept, s.hostName, age, where, vm), nil
 }
 
 // waitShutOff waits up to fwDoctorStopWait for vm's domain to shut off.

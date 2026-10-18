@@ -204,12 +204,25 @@ func (s *Server) forwardFirmwareMoveDoctorAudited(ctx context.Context, host stri
 // (a removed one excepted): no host's record is taken to be the only one
 // (D2-12c re-review: a VM's condition row may name another host's move).
 func (s *Server) gatherFirmwareMoveRecords(ctx context.Context, vm, actor string) *pb.FirmwareMoveDoctorResponse {
+	resp, _, _ := s.gatherFirmwareMoveRecordsChecked(ctx, vm, actor)
+	return resp
+}
+
+// gatherFirmwareMoveRecordsChecked is gatherFirmwareMoveRecords that also
+// returns, as data rather than text, the names of the hosts that did not
+// answer and the error of a host list that could not be read (then no other
+// host was asked).
+func (s *Server) gatherFirmwareMoveRecordsChecked(ctx context.Context, vm, actor string) (*pb.FirmwareMoveDoctorResponse, []string, error) {
 	resp := &pb.FirmwareMoveDoctorResponse{Hosts: []*pb.FirmwareMoveHostRecords{s.localFirmwareMoveRecords(ctx, vm)}}
 	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if hostListHook != nil {
+		err = hostListHook(s.hostName, err)
+	}
 	if err != nil {
 		resp.Unreachable = append(resp.Unreachable, fmt.Sprintf("(the host list cannot be read here: %v)", err))
-		return resp
+		return resp, nil, err
 	}
+	var unreachable []string
 	var (
 		mu sync.Mutex
 		wg sync.WaitGroup
@@ -226,6 +239,7 @@ func (s *Server) gatherFirmwareMoveRecords(ctx context.Context, vm, actor string
 			defer mu.Unlock()
 			if err != nil || len(r.GetHosts()) != 1 {
 				resp.Unreachable = append(resp.Unreachable, fmt.Sprintf("%s (%s): %v", h.Name, h.State, err))
+				unreachable = append(unreachable, h.Name)
 				return
 			}
 			resp.Hosts = append(resp.Hosts, r.GetHosts()[0])
@@ -234,8 +248,13 @@ func (s *Server) gatherFirmwareMoveRecords(ctx context.Context, vm, actor string
 	wg.Wait()
 	sort.Slice(resp.Hosts, func(i, j int) bool { return resp.Hosts[i].GetHost() < resp.Hosts[j].GetHost() })
 	sort.Strings(resp.Unreachable)
-	return resp
+	sort.Strings(unreachable)
+	return resp, unreachable, nil
 }
+
+// hostListHook, when set, replaces the host list read's error on the named
+// host; test-only.
+var hostListHook func(host string, err error) error
 
 // firmwareMoveDoctorHost is the host an action runs on: the one whose marker
 // names the VM (the move's source drives every action it has a record for),
@@ -350,6 +369,15 @@ func (s *Server) localFirmwareMoveRecords(ctx context.Context, vm string) *pb.Fi
 			continue
 		}
 		for _, e := range ents {
+			// A stage (<vm>-reconciling-<uuid>, <vm>-restoring-<uuid>) is
+			// matched first: the attempt pattern below would read it as a
+			// quarantine of VM "<vm>-reconciling".
+			if svm, _, _, ok := fwmig.ParseStageName(e.Name()); ok {
+				if svm == vm && !sub.tar {
+					sub.add(filepath.Join(dir, e.Name()))
+				}
+				continue
+			}
 			m := fwRecordNameRe.FindStringSubmatch(e.Name())
 			if m != nil && m[1] == vm && (m[3] == ".tar") == sub.tar {
 				sub.add(filepath.Join(dir, e.Name()))
@@ -499,7 +527,7 @@ func (s *Server) firmwareMoveDoctorAct(ctx context.Context, req *pb.FirmwareMove
 	}
 	if l, ok, err := recs.GetLeftover(vm); err == nil && ok {
 		if req.GetAction() == pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_ADOPT_TARGET_COPY {
-			return s.doctorAdoptOwnLeftover(ctx, l, actor)
+			return s.doctorAdoptOwnLeftover(ctx, l, actor, req.GetAcknowledgeRollback())
 		}
 		return "", status.Errorf(codes.FailedPrecondition, "VM %q: %s keeps the leftover of attempt %s from %s under a leftover record; %s does not resolve it: `lv doctor firmware-move %s --discard-target` "+
 			"(or --adopt-target-copy, once the VM's row names %s for the leftover's incarnation)",

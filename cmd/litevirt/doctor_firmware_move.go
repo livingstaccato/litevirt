@@ -45,7 +45,9 @@ refuses where it has no row for it:
                          source's state is suspect or missing, the target ran,
                          or the source host is lost and fenced); or keep a
                          shut-off leftover as the VM's own once its row names
-                         that host for the leftover's incarnation
+                         that host for the leftover's incarnation (with
+                         --acknowledge-rollback: it is older than whatever
+                         the VM ran since, and the refusal names those copies)
   --accept-source        take the source's copy: discard the target's; after
                          the commit return the VM and its disks to the source
   --discard-target       discard the target's copy while the source's guest
@@ -132,8 +134,9 @@ func (f firmwareMoveFlags) request(vm string) (*pb.FirmwareMoveDoctorRequest, er
 		return nil, fmt.Errorf("--confirm-target-nvram needs --accept-nvram-hash=<the target NVRAM's sha256 now>")
 	}
 	if f.ack && a != pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_ACCEPT_SOURCE &&
-		a != pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_PUSH_SOURCE_NVRAM {
-		return nil, fmt.Errorf("--acknowledge-rollback goes with --accept-source or --push-source-nvram")
+		a != pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_PUSH_SOURCE_NVRAM &&
+		a != pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_ADOPT_TARGET_COPY {
+		return nil, fmt.Errorf("--acknowledge-rollback goes with --accept-source, --push-source-nvram or --adopt-target-copy")
 	}
 	if f.stopTarget && a != pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_ACCEPT_SOURCE &&
 		a != pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_DISCARD_TARGET &&

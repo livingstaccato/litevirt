@@ -127,7 +127,7 @@ func TestDoctorFirmwareMove_R4(t *testing.T) {
 			t.Fatalf("discard of the VM's own domain: %v", err)
 		}
 		unchanged(t, r, before, true)
-		resp, err := r.doctor(actAdopt)
+		resp, err := r.doctor(actAdopt, withAck)
 		if err != nil {
 			t.Fatalf("adopt: %v", err)
 		}
@@ -147,7 +147,7 @@ func TestDoctorFirmwareMove_R4(t *testing.T) {
 		rowOnTarget(t, r)
 		r.dstFake.SetState(fwlVM, libvirtfake.StateRunning)
 		before := take(r)
-		if _, err := r.doctor(actAdopt); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "only a shut-off leftover") {
+		if _, err := r.doctor(actAdopt, withAck); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "only a shut-off leftover") {
 			t.Fatalf("adopt of a running leftover: %v", err)
 		}
 		unchanged(t, r, before, true)
@@ -161,7 +161,7 @@ func TestDoctorFirmwareMove_R4(t *testing.T) {
 			t.Fatal(err)
 		}
 		before := take(r)
-		if _, err := r.doctor(actAdopt); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "stamped incarnation") {
+		if _, err := r.doctor(actAdopt, withAck); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "stamped incarnation") {
 			t.Fatalf("adopt of a domain stamped another incarnation: %v", err)
 		}
 		unchanged(t, r, before, true)
@@ -172,7 +172,7 @@ func TestDoctorFirmwareMove_R4(t *testing.T) {
 		r.src.RetryOwedFirmwareDiscardsOnce(ctx)
 		rowOnTarget(t, r)
 		before := take(r)
-		if _, err := r.doctor(actAdopt); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "owes") {
+		if _, err := r.doctor(actAdopt, withAck); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "owes") {
 			t.Fatalf("adopt while the source owes a DISCARD: %v", err)
 		}
 		unchanged(t, r, before, true)
@@ -183,7 +183,7 @@ func TestDoctorFirmwareMove_R4(t *testing.T) {
 		noOwner(t, r, o)
 		exec(t, r, `UPDATE vms SET host_name = ? WHERE name = ?`, "third-host", fwlVM)
 		before := take(r)
-		if _, err := r.doctor(actAdopt); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "--discard-target") {
+		if _, err := r.doctor(actAdopt, withAck); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "--discard-target") {
 			t.Fatalf("adopt with the row on a third host: %v", err)
 		}
 		unchanged(t, r, before, true)
@@ -198,7 +198,7 @@ func TestDoctorFirmwareMove_R4(t *testing.T) {
 			return nil, nil, errors.New("connection refused")
 		}
 		before := take(r)
-		if _, err := r.doctor(actAdopt); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "not proved off") {
+		if _, err := r.doctor(actAdopt, withAck); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "not proved off") {
 			t.Fatalf("adopt with the source unreachable: %v", err)
 		}
 		unchanged(t, r, before, true)
@@ -206,7 +206,7 @@ func TestDoctorFirmwareMove_R4(t *testing.T) {
 			corrosion.FenceLogRecord{ID: "fc-src", HostName: "src-host", Method: "manual", Result: "manual-confirmed"}, "fenced"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := r.doctor(actAdopt); err != nil {
+		if _, err := r.doctor(actAdopt, withAck); err != nil {
 			t.Fatalf("adopt with the source proved off: %v", err)
 		}
 		unchanged(t, r, before, false)

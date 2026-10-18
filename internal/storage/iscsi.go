@@ -22,15 +22,19 @@ type iscsiDriver struct {
 
 func (d *iscsiDriver) String() string { return "iscsi" }
 
-// Teardown logs the host out of the iSCSI target on pool delete. Idempotent: a
-// "no matching"/"not found" logout is treated as already-gone. The caller is
-// responsible for the cross-pool refcount (don't log out a target another pool's
-// LUN still uses). Safe to call without a prior Prepare.
+// Teardown logs the host out of the iSCSI target on pool delete, and removes
+// the target's node record at the pool's portal, so nothing logs back in to
+// a removed target: iscsid logs in to every record with node.startup =
+// automatic when it starts, a host reboot included. Another target's record,
+// on that portal or any other, is not touched. Idempotent: a "no matching" /
+// "not found" logout is treated as already logged out, and "No records
+// found" as already removed. A failed logout keeps the record (iscsiadm
+// refuses to remove the record of a session still up) and is returned. The
+// caller is responsible for the cross-pool refcount (don't log out a target
+// another pool's LUN still uses). Safe to call without a prior Prepare.
 func (d *iscsiDriver) Teardown(ctx context.Context) error {
-	portal := d.opts["portal"]
-	if portal == "" {
-		portal = "127.0.0.1"
-	}
+	defer lockISCSITarget(d.target)()
+	portal := iscsiPortalOf(d.opts)
 	run := d.run
 	if run == nil {
 		run = realCmd
@@ -40,6 +44,11 @@ func (d *iscsiDriver) Teardown(ctx context.Context) error {
 		return fmt.Errorf("iscsi logout %s: %w: %s", d.target, err, out)
 	}
 	slog.Info("iSCSI logged out", "target", d.target)
+	out, err = run(ctx, "iscsiadm", "-m", "node", "-o", "delete", "-T", d.target, "-p", portal)
+	if err != nil && !strings.Contains(string(out), "No records found") {
+		return fmt.Errorf("iscsi remove the node record of %s at %s: %w: %s", d.target, portal, err, trimISCSIOutput(out))
+	}
+	slog.Info("iSCSI node record removed", "target", d.target, "portal", portal)
 	return nil
 }
 

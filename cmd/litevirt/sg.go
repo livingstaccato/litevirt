@@ -285,16 +285,20 @@ func newSGDeleteCmd() *cobra.Command {
 func newSGRuleAddCmd() *cobra.Command {
 	var direction, proto, port, cidr, action, macro string
 	var priority int
+	var logged bool
 	cmd := &cobra.Command{
 		Use:   "rule-add <sg-id-or-name>",
 		Short: "Add a rule to a security group (by id or name)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := refuseClientLogAction(action); err != nil {
+				return err
+			}
 			if macro != "" {
 				return runMacroAdd(cmd, macro, direction, cidr, action, func(ctx context.Context, c pb.LiteVirtClient, _ string, row firewall.ExpandedRule) (string, error) {
 					rule, err := c.AddSecurityGroupRule(ctx, &pb.AddSecurityGroupRuleRequest{Rule: &pb.SecurityGroupRule{
 						SgId: args[0], Direction: row.Direction, Proto: row.Proto, Port: row.Port,
-						Cidr: row.CIDR, Action: row.Action, Priority: int32(priority),
+						Cidr: row.CIDR, Action: row.Action, Priority: int32(priority), Log: logged,
 					}})
 					if err != nil {
 						return "", sgRPCError("rule-add", err)
@@ -309,9 +313,12 @@ func newSGRuleAddCmd() *cobra.Command {
 				if err := requireTagGroupSupport(ctx, c, cidr); err != nil {
 					return err
 				}
+				if err := requireLogSupport(ctx, c, logged); err != nil {
+					return err
+				}
 				rule, err := c.AddSecurityGroupRule(ctx, &pb.AddSecurityGroupRuleRequest{Rule: &pb.SecurityGroupRule{
 					SgId: args[0], Direction: direction, Proto: proto, Port: port,
-					Cidr: cidr, Action: action, Priority: int32(priority),
+					Cidr: cidr, Action: action, Priority: int32(priority), Log: logged,
 				}})
 				if err != nil {
 					return sgRPCError("rule-add", err)
@@ -328,6 +335,7 @@ func newSGRuleAddCmd() *cobra.Command {
 	cmd.Flags().StringVar(&action, "action", "accept", "accept | drop | reject")
 	cmd.Flags().IntVar(&priority, "priority", 100, "lower runs first")
 	cmd.Flags().StringVar(&macro, "macro", "", "add the rules of a named macro instead of --proto/--port (see 'lv firewall macros')")
+	cmd.Flags().BoolVar(&logged, "log", false, logFlagUsage)
 	return cmd
 }
 
@@ -375,7 +383,7 @@ func newSGRuleListCmd() *cobra.Command {
 						fmt.Fprintf(w, "%s\t", gid)
 					}
 					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-						r.GetId(), r.GetDirection(), r.GetProto(), r.GetPort(), r.GetCidr(), r.GetAction(),
+						r.GetId(), r.GetDirection(), r.GetProto(), r.GetPort(), r.GetCidr(), ruleAction(r.GetAction(), r.GetLog()),
 						strconv.Itoa(int(r.GetPriority())))
 				}
 			}

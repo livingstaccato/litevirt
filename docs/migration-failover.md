@@ -188,7 +188,9 @@ off it in the clear:
 - A memory-only move normally rides inside libvirt's tunnel on the cluster
   address. To use the migration network it leaves the tunnel for QEMU's own
   stream, which is used only when both hosts hold migration-TLS credentials
-  (`lv host install-migration-tls`); otherwise the move stays in the tunnel.
+  (`lv host install-migration-tls`) from the same migration CA; otherwise the
+  move stays in the tunnel. A target on an older build does not report its
+  CA, and nothing is compared.
 - A storage copy uses the network only when it is encrypted (migration TLS on
   both hosts). A copy you allowed unencrypted with
   `migration.allow_unencrypted_storage` stays on the cluster address, as it

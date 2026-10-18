@@ -623,7 +623,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		if fwVM || coldStopped {
 			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeCold, true)
 		} else {
-			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeMemory, srcTLS && ens.tlsReady)
+			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeMemory, s.memoryTLSReady(srcTLS, ens))
 		}
 	}
 	if route.onNetwork {
@@ -2267,7 +2267,7 @@ const MigrationCAMD = "x-litevirt-migration-ca-sha256"
 // fail mid-copy. Either fingerprint unknown (an older build, or none could be
 // read) compares nothing.
 func migrationCAMismatch(vmName, source, sourceCA, target, targetCA string) error {
-	if sourceCA == "" || targetCA == "" || sourceCA == targetCA {
+	if migrationCAsAgree(sourceCA, targetCA) {
 		return nil
 	}
 	return status.Errorf(codes.FailedPrecondition,
@@ -2276,6 +2276,21 @@ func migrationCAMismatch(vmName, source, sourceCA, target, targetCA string) erro
 			"Reissue every host's credentials from one migration CA with `lv host install-migration-tls --reissue` "+
 			"(run where the cluster's migration CA lives)",
 		vmName, source, target, source, sourceCA, target, targetCA)
+}
+
+// migrationCAsAgree reports whether two hosts' migration CAs (fingerprints,
+// "" when unknown) may be used together for QEMU's TLS stream: the same CA,
+// or either one unknown (an older build), which compares nothing.
+func migrationCAsAgree(a, b string) bool {
+	return a == "" || b == "" || a == b
+}
+
+// memoryTLSReady is whether a memory-only move to the target that answered
+// ens may use QEMU's own TLS stream: both hosts ready (srcTLS, ens.tlsReady)
+// and their migration CAs agree. A mismatch is not ready, so the move stays
+// in libvirt's tunnel instead of failing QEMU's handshake.
+func (s *Server) memoryTLSReady(srcTLS bool, ens ensureOutcome) bool {
+	return srcTLS && ens.tlsReady && migrationCAsAgree(s.localMigrationCA(), ens.migrationCA)
 }
 
 // ensureOutcome is what the target's EnsureDisks answered.

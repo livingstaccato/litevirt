@@ -1308,7 +1308,8 @@ under conditions ([diagnostics.md](diagnostics.md), `own_row_held`):
   with another admission's, is held and never re-records; it needs
   `lv host rm` then `lv host add`;
 - a certificate swapped while the daemon runs is held until the daemon
-  restarts, and then as above.
+  restarts, and then as above; `certificate/cert_swapped_at_runtime` names it
+  meanwhile.
 
 Turn the switch off only once every host has re-recorded, or been re-added.
 

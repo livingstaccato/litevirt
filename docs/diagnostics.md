@@ -2069,7 +2069,15 @@ renew-cert`, live or while the host was down) is not held: it records the new
 serial at once. Neither is a host whose certificate was reissued outside
 `lv host renew-cert` while its row is still the admission it was last admitted
 under, which it records in `<pki_dir>/own-admission.json`: it records the
-reissued serial, so `auth.trust_rotated_peer_certs` converges it.
+reissued serial when the daemon starts, so `auth.trust_rotated_peer_certs`
+converges it.
+
+At incarnation 1 or higher, a certificate swapped in while the daemon runs that
+is not a renewal of the recorded one is not recorded until the daemon restarts,
+and peers refuse it until then. The host raises `certificate/cert_swapped_at_runtime`
+about itself (**warning**; evidence `recorded_serial`, `serving_serial` and
+`remedy`). Restart the daemon on that host (`systemctl restart litevirt`); the
+condition clears once the serial is recorded.
 
 A hold raised at start over a row at incarnation 0 reports `timed_out` after
 ten minutes, and the daemon then makes the writes the previous release makes.

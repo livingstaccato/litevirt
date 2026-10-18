@@ -692,6 +692,19 @@ func (f *NetBoxFake) createIface(w http.ResponseWriter, r *http.Request) {
 
 func (f *NetBoxFake) ifaceObject(w http.ResponseWriter, r *http.Request, id int) {
 	switch r.Method {
+	case http.MethodGet:
+		f.mu.Lock()
+		iface, known := f.ifaces[id]
+		var out ifaceView
+		if known {
+			out = ifaceJSONOf(*iface)
+		}
+		f.mu.Unlock()
+		if !known {
+			writeErr(w, http.StatusNotFound, "no interface %d", id)
+			return
+		}
+		writeJSON(w, out)
 	case http.MethodPatch:
 		body, ok := decodeIfaceBody(w, r)
 		if !ok {

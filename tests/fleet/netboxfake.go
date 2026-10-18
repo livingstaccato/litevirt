@@ -942,8 +942,12 @@ func (f *NetBoxFake) patchIPAssignment(w http.ResponseWriter, body map[string]js
 		target = *objID
 	}
 	_, ifaceKnown := f.ifaces[target]
+	// NetBox's IPAddress.clean(): an address that is its VM's primary_ip4 or
+	// primary_ip6 may not move to another parent — and "no parent" is
+	// another parent, so a detach is refused too.
+	primaryHeld := known && f.primaryReassignLocked(ip, target)
 	var updated fakeIP
-	if known && (target == 0 || ifaceKnown) {
+	if known && (target == 0 || ifaceKnown) && !primaryHeld {
 		ip.AssignedObjectID = target
 		updated = *ip
 	}
@@ -952,12 +956,33 @@ func (f *NetBoxFake) patchIPAssignment(w http.ResponseWriter, body map[string]js
 		writeErr(w, http.StatusNotFound, "no ip-address %d", id)
 		return
 	}
+	if primaryHeld {
+		writeErr(w, http.StatusBadRequest,
+			`{"__all__":["Cannot reassign IP address while it is designated as the primary IP for the parent object"]}`)
+		return
+	}
 	if target != 0 && !ifaceKnown {
 		writeErr(w, http.StatusBadRequest,
 			`{"assigned_object_id":["Invalid pk %d - object does not exist."]}`, target)
 		return
 	}
 	writeJSON(w, ipJSON(updated))
+}
+
+// primaryReassignLocked reports whether moving ip to interface target (0 for
+// none) changes the parent of an address that is its current parent VM's
+// primary. Caller holds f.mu.
+func (f *NetBoxFake) primaryReassignLocked(ip *fakeIP, target int) bool {
+	cur, ok := f.ifaces[ip.AssignedObjectID]
+	if !ok {
+		return false
+	}
+	vm, ok := f.vms[cur.VMID]
+	if !ok || (vm.PrimaryIP4ID != ip.ID && vm.PrimaryIP6ID != ip.ID) {
+		return false
+	}
+	next, ok := f.ifaces[target]
+	return !ok || next.VMID != cur.VMID
 }
 
 // SetVRFEnforceUnique flips a VRF's enforce_unique flag. An operator can do this

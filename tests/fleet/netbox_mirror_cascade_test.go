@@ -103,3 +103,81 @@ func TestMirrorReplaceKeepsTheAddressesOnIt(t *testing.T) {
 	}
 	requireAddressSurvivesUnassigned(t, nb, id, "the superseded incarnation was replaced")
 }
+
+// operatorPrimaryIP6On plants an operator's IPv6 address on the interface and
+// makes it the VM's primary_ip6 by hand — a value the mirror keeps, since the
+// VM holds no leased IPv6. NetBox refuses to detach a primary, so a delete
+// that does not clear it first is refused on every sweep.
+func operatorPrimaryIP6On(t *testing.T, nb *NetBoxFake, vmName, ifaceName, address string) int {
+	t.Helper()
+	id := operatorAddressOn(t, nb, vmName, ifaceName, address)
+	if err := nb.SetVMPrimaryIP6Direct(vmName, id); err != nil {
+		t.Fatalf("precondition: hand-set primary_ip6: %v", err)
+	}
+	return id
+}
+
+// TestMirrorNICDeleteDetachesAPrimaryAddress: the detached NIC carries the
+// VM's primary_ip6.
+func TestMirrorNICDeleteDetachesAPrimaryAddress(t *testing.T) {
+	nb, c, gates := boundMirrorClusterGated(t, 1)
+	latchOperationProtocol(t, c, gates)
+	n := c.Nodes[0]
+
+	mustCreateVM(t, n, "vm-1", orphanNetwork)
+	mustSyncAllNodes(t, c)
+	id := operatorPrimaryIP6On(t, nb, "vm-1", "eth0", "2001:db8::50/64")
+	mustSyncAllNodes(t, c) // the mirror keeps a hand-set primary_ip6
+
+	mustDetachNIC(t, c, n, "vm-1", nb.InterfaceMAC("vm-1", "eth0"))
+	mustSyncAllNodes(t, c)
+
+	if nb.InterfaceID("vm-1", "eth0") != 0 {
+		t.Fatal("the detached interface is still in NetBox")
+	}
+	requireAddressSurvivesUnassigned(t, nb, id, "the NIC holding the primary was detached")
+}
+
+// TestMirrorVMDeleteDetachesAPrimaryAddress: the deleted VM's primary_ip6 is an
+// address on its interface.
+func TestMirrorVMDeleteDetachesAPrimaryAddress(t *testing.T) {
+	nb, c := boundMirrorCluster(t, 1)
+	n := c.Nodes[0]
+
+	mustCreateVM(t, n, "vm-1", orphanNetwork)
+	mustSyncAllNodes(t, c)
+	id := operatorPrimaryIP6On(t, nb, "vm-1", "eth0", "2001:db8::51/64")
+	mustSyncAllNodes(t, c)
+
+	mustDeleteVM(t, n, "vm-1")
+	mustSyncAllNodes(t, c)
+
+	if nb.VMCount("vm-1") != 0 {
+		t.Fatal("the deleted VM is still in NetBox")
+	}
+	requireAddressSurvivesUnassigned(t, nb, id, "the VM holding it as primary was deleted")
+}
+
+// TestMirrorReplaceDetachesAPrimaryAddress: a superseded incarnation goes with
+// one VM delete and no interface deletes, so DeleteVM itself must clear the
+// primary before it detaches.
+func TestMirrorReplaceDetachesAPrimaryAddress(t *testing.T) {
+	nb, c := boundMirrorCluster(t, 1)
+	n := c.Nodes[0]
+
+	mustCreateVM(t, n, "vm-1", orphanNetwork)
+	mustSyncAllNodes(t, c)
+	id := operatorPrimaryIP6On(t, nb, "vm-1", "eth0", "2001:db8::52/64")
+
+	mustDeleteVM(t, n, "vm-1")
+	mustCreateVM(t, n, "vm-1", orphanNetwork)
+	for i := 0; i < 3; i++ {
+		if err := n.SyncNetBoxMirror(); err != nil {
+			t.Fatalf("mirror pass %d: %v", i, err)
+		}
+	}
+	if got := nb.VMCount("vm-1"); got != 1 {
+		t.Fatalf("virtual_machine objects named vm-1 = %d, want 1", got)
+	}
+	requireAddressSurvivesUnassigned(t, nb, id, "the superseded incarnation holding it as primary was replaced")
+}

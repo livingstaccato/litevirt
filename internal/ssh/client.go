@@ -159,7 +159,10 @@ func ShellQuote(s string) string {
 //
 // mktemp in the destination's own directory keeps the rename on one filesystem.
 // The staged file is synced before the move and the directory after it, so a
-// power loss cannot leave the destination renamed over but empty.
+// power loss cannot leave the destination renamed over but empty. A failed
+// sync fails the write before the move (coreutils 8.24 or later syncs one
+// file; there is no fallback to a global sync, which reports success
+// whatever happened and blocks on a hung mount).
 //
 // -T is load-bearing, not tidiness. Without it, `mv src dest` where dest is a
 // DIRECTORY moves src INSIDE it — so a local user who can see the destination
@@ -173,8 +176,8 @@ func writeFileCmd(remotePath string, mode os.FileMode) string {
 	return fmt.Sprintf(
 		"set -e; d=$(dirname %s); t=$(mktemp \"$d/.litevirt.XXXXXX\"); "+
 			"trap 'rm -f \"$t\"' EXIT; cat > \"$t\"; chmod %o \"$t\"; "+
-			"{ sync -- \"$t\" 2>/dev/null || sync; }; "+
-			"mv -fT -- \"$t\" %s; trap - EXIT; { sync -- \"$d\" 2>/dev/null || sync; }",
+			"sync -- \"$t\"; "+
+			"mv -fT -- \"$t\" %s; trap - EXIT; sync -- \"$d\"",
 		q, mode.Perm(), q)
 }
 

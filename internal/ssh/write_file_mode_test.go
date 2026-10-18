@@ -125,3 +125,30 @@ func TestWriteFileCmd_SyncsAroundTheRename(t *testing.T) {
 		t.Errorf("the staged file is not synced before the move and its directory after:\n  %s", cmd)
 	}
 }
+
+// fd re-review N-m1: a failed sync of the staged file (EIO) was swallowed by
+// a fallback to a global `sync`, which reports success whatever happened (and
+// blocks on a hung mount), and the rename then put a file whose writeback
+// failed over a good one. A sync failure now fails the write, and the
+// destination is left as it was.
+//
+// Mutation: restore the `|| sync` fallback — the write succeeds.
+func TestWriteFileCmd_AFailedSyncDoesNotRename(t *testing.T) {
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "sync"), []byte("#!/bin/sh\n# fails a file sync (EIO); a global sync succeeds\n[ $# -gt 0 ] && exit 1\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "host.key")
+	if err := os.WriteFile(dst, []byte("good"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	push := exec.Command("sh", "-c", writeFileCmd(dst, 0o600))
+	push.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+	push.Stdin = strings.NewReader("new")
+	if err := push.Run(); err == nil {
+		t.Error("a write whose sync failed reported success")
+	}
+	if got, _ := os.ReadFile(dst); string(got) != "good" {
+		t.Errorf("the destination was replaced after a failed sync: %q", got)
+	}
+}

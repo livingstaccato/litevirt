@@ -564,9 +564,9 @@ func suffixed(paths []string, suffix string) []string {
 	return out
 }
 
-// syncCmd flushes path (a file or directory) to disk; a sync without
-// arguments where coreutils cannot sync one file.
-func syncCmd(q string) string { return fmt.Sprintf("{ sync -- %s 2>/dev/null || sync; }; ", q) }
+// syncCmd flushes q (a file or directory) to disk. Its failure fails the
+// command (set -e): there is no fallback to a global sync.
+func syncCmd(q string) string { return fmt.Sprintf("sync -- %s; ", q) }
 
 // existsCmd prints each of paths that exists, one per line.
 func existsCmd(r addRemote, paths []string) string {

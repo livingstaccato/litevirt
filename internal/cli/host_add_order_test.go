@@ -567,3 +567,30 @@ func TestSetupScript_LeavesAnInstalledConfigAlone(t *testing.T) {
 		t.Errorf("the template write is not guarded by CONFIG_INSTALLED")
 	}
 }
+
+// fd re-review N-m1: install fails, and moves nothing into place, when the
+// sync of a staged file fails.
+//
+// Mutation: restore the `|| sync` fallback in syncCmd — the install succeeds.
+func TestAddInstallCommands_AFailedSyncDoesNotRename(t *testing.T) {
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "sync"), []byte("#!/bin/sh\n# fails a file sync (EIO); a global sync succeeds\n[ $# -gt 0 ] && exit 1\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	dir := t.TempDir()
+	r := &LocalAddTarget{Root: "/", PKIDir: dir}
+	key := filepath.Join(dir, "host.key")
+	if err := os.WriteFile(key, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(addStagedPath(key), []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Shell("install", installCmd(r, []string{key}, ".pre-add-x")); err == nil {
+		t.Error("an install whose sync failed reported success")
+	}
+	if got := string(mustRead(t, key)); got != "old" {
+		t.Errorf("the key was replaced after a failed sync: %q", got)
+	}
+}

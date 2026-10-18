@@ -242,19 +242,8 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return nil, err
 	}
 
-	// Check if VM already exists. A rebuild or recreate whose replica here has
-	// not yet applied the tombstone of the VM it replaces sees that VM's row:
-	// exactly that incarnation is settled (settleReplacedVM), anything else
-	// still refuses.
-	if existing, _ := corrosion.GetVM(ctx, s.db, spec.Name); existing != nil {
-		replaced, serr := s.settleReplacedVM(ctx, existing)
-		if serr != nil {
-			return nil, status.Errorf(codes.Unavailable,
-				"VM %q: this host still holds the VM it re-creates and could not retire it: %v", spec.Name, serr)
-		}
-		if !replaced {
-			return nil, status.Errorf(codes.AlreadyExists, "VM %q already exists", spec.Name)
-		}
+	if err := s.refuseExistingVM(ctx, spec.Name); err != nil {
+		return nil, err
 	}
 
 	// Resource defaults BEFORE admission. Everything below — quota, placement,
@@ -441,6 +430,20 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		return s.forwardCreateVM(ctx, req, targetHost)
 	}
+	// This host owns the create, and no other create of the name runs here
+	// until it returns (beginCreate): two would share the name's domain and
+	// paths, and each one's sweeps and cleanup would act on the other's.
+	// Taken before anything is reserved or made, so a refused create did
+	// nothing. The existence check above ran before the flight was taken: a
+	// create of the name that finished in between has a row by now.
+	endFlight, setFlightUUID, err := s.beginCreate(spec.Name)
+	if err != nil {
+		return nil, err
+	}
+	defer endFlight()
+	if err := s.refuseExistingVM(ctx, spec.Name); err != nil {
+		return nil, err
+	}
 	// This host owns the create. A create that fails here is logged with its
 	// cause, and with what its cleanup did (undone, noted as each step runs),
 	// so the owner's log shows both and not only "creating VM" (lab 2, O5).
@@ -476,6 +479,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// keyed by it (never by the name, which a deleted namesake may have used),
 	// and removed again if the create fails.
 	spec.Uuid = uuid.NewString()
+	setFlightUUID(spec.Uuid)
 	// rowCommitted is set once the VM row has committed: from then on the VM
 	// exists and runs, and a later failure (reading it back, a step after it,
 	// a caller that stopped waiting) undoes nothing — no deferred cleanup
@@ -588,6 +592,17 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	var diskConfigs []lv.DiskConfig
 	var diskRecords []corrosion.DiskRecord
 	var createdDiskPaths []string
+	// createdDiskFile is the file each host-local disk this create made is
+	// (its identity, from the Stat right after it was made): a failed create
+	// removes a path only while that file is still there, never another
+	// create's or domain's file that took the path since.
+	createdDiskFile := map[string]os.FileInfo{}
+	recordDisk := func(p string) {
+		createdDiskPaths = append(createdDiskPaths, p)
+		if fi, err := os.Stat(p); err == nil {
+			createdDiskFile[p] = fi
+		}
+	}
 	// A disk that is not a file (an rbd image) is removed by the driver that
 	// created it: os.Remove of "rbd:pool/image" removes nothing, which is how a
 	// failed create left its ceph images behind.
@@ -628,7 +643,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	}
 	cleanupDisks := func() {
 		removeSeed()
+		// A domain of the name that is not this create's names paths a
+		// failed create must leave, whoever made the file there.
+		foreign := s.foreignDomainDiskPaths(spec.Name, spec.Uuid)
 		for _, p := range createdDiskPaths {
+			if foreign[p] {
+				noteUndo("disk " + p + " left: a domain of the name this create did not define names it")
+				continue
+			}
 			if drv := createdBy[p]; drv != nil {
 				// The request may be what failed (cancelled, timed out); the
 				// image this create made is removed regardless.
@@ -641,6 +663,15 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 					continue
 				}
 				noteUndo("removed disk " + p)
+				continue
+			}
+			made, ok := createdDiskFile[p]
+			fi, serr := os.Stat(p)
+			switch {
+			case serr != nil && os.IsNotExist(serr):
+				continue
+			case !ok || serr != nil || !os.SameFile(fi, made):
+				noteUndo("disk " + p + " left: it is no longer the file this create made")
 				continue
 			}
 			if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
@@ -656,15 +687,16 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return nil, status.Errorf(codes.Internal, "libvirt not connected on host %s", s.hostName)
 	}
 
-	// If a libvirt domain with this name exists but no active DB record does
-	// (we already checked above), it's an orphan from an incomplete delete.
-	// Only clean up if stopped — refuse if it's actually running.
+	// A libvirt domain of the name with no VM record (checked above, under
+	// this create's flight) is a leftover of an incomplete delete or a failed
+	// create, and is removed — only when it is stopped and no create in flight
+	// here defined it (refuseLiveDomainOfName).
 	if s.virt.DomainExists(spec.Name) {
+		if err := s.refuseLiveDomainOfName(spec.Name, spec.Uuid); err != nil {
+			return nil, err
+		}
 		state, _ := s.virt.DomainState(spec.Name)
 		slog.Warn("cleaning up orphaned libvirt domain", "vm", spec.Name, "state", state)
-		if state == "running" {
-			s.virt.DestroyDomain(spec.Name)
-		}
 		s.virt.UndefineDomain(spec.Name, true)
 	}
 
@@ -847,7 +879,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			return nil, status.Errorf(codes.Internal, "create disk %s: %v", d.Name, err)
 		}
 		if !fixedDevice {
-			createdDiskPaths = append(createdDiskPaths, diskPath)
+			recordDisk(diskPath)
 		}
 
 		// An unset discard becomes the storage type's default now, in the spec
@@ -900,7 +932,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			cleanupDisks()
 			return nil, status.Errorf(codes.Internal, "create default disk: %v", err)
 		}
-		createdDiskPaths = append(createdDiskPaths, diskPath)
+		recordDisk(diskPath)
 		diskConfigs = append(diskConfigs, lv.DiskConfig{
 			Name: "root",
 			Path: diskPath,
@@ -1428,10 +1460,11 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// cannot be read or names no uuid, is left as it is with its disks,
 	// claims, LUNs and host-isolated addresses, and reported: removing them
 	// under a running guest is worse, and the next create of the name removes
-	// a leftover domain first. A domain gone by then is gone: its claims and
-	// swtpm tree are released, the disks are left (whatever removed the domain
-	// may have created at their paths since). Its seed is removed if it is
-	// still the file this create placed.
+	// a leftover domain first once it is stopped (refuseLiveDomainOfName). A
+	// domain gone by then is gone: its claims and swtpm tree are released, the
+	// disks are left (whatever removed the domain may have created at their
+	// paths since). Its seed is removed if it is still the file this create
+	// placed.
 	//
 	// The domain is undefined only after the disks, seed and vars at its
 	// name's paths are removed: while a domain of the name is defined, a
@@ -1464,7 +1497,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				"name", spec.Name, "host", s.hostName, "cause", cause, "error", xerr)
 			noteUndo(fmt.Sprintf("domain left as it is, with its disks: its definition could not be read (%v)", xerr))
 			return fmt.Errorf("%w; the definition of domain %s on %s could not be read (%v), so it is left as it is, "+
-				"with its disks and no VM record: the next create of %s removes it", cause, spec.Name, s.hostName, xerr, spec.Name)
+				"with its disks and no VM record: the next create of %s removes it if it is stopped, and is refused while it runs", cause, spec.Name, s.hostName, xerr, spec.Name)
 		}
 		if u != spec.Uuid {
 			return gone(fmt.Sprintf("domain %s on %s is no longer the one this create defined (uuid %s)", spec.Name, s.hostName, u))
@@ -1477,7 +1510,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 					"name", spec.Name, "host", s.hostName, "cause", cause, "error", derr)
 				noteUndo(fmt.Sprintf("domain left defined and running, with its disks: it could not be stopped (%v)", derr))
 				return fmt.Errorf("%w; its domain could not be stopped on %s (%v) and is left defined with its disks, "+
-					"with no VM record: the next create of %s removes it", cause, s.hostName, derr, spec.Name)
+					"with no VM record: the next create of %s is refused while it runs", cause, s.hostName, derr, spec.Name)
 			}
 		}
 		noteUndo("domain stopped")

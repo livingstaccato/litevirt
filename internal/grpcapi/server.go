@@ -947,6 +947,11 @@ type Server struct {
 
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
+	// createFlights holds each create this host runs as the VM's owner until
+	// it returns: a second create of the name is refused while one is in
+	// flight (create_inflight.go).
+	createFlightsMu sync.Mutex
+	createFlights   map[*createFlight]struct{}
 	// vmLockQueues holds the callers waiting for a VM's lock through
 	// lockVMUnlessStartHeld (vm_start_bound.go).
 	vmLockQueuesMu sync.Mutex

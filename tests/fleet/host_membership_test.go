@@ -69,16 +69,24 @@ func assertNoMembershipStatements(t *testing.T, n *Node) {
 }
 
 // waitEveryWriteApplied waits until every entry any node has logged as its
-// own has been applied on every other node (mutation_seen). A digest wait that
+// own has been delivered to every other node (mutation_seen, which also
+// records an entry that was parked or refused there). A digest wait that
 // leaves a table out cannot say that a write to that table has arrived; this
 // can, whatever the write won or lost on arrival.
 func waitEveryWriteApplied(t *testing.T, c *Cluster) {
 	t.Helper()
 	ctx := context.Background()
-	eventually(t, convergeTimeout, "every logged write to be applied on every replica", func() bool {
+	var lastErr error
+	defer func() {
+		if t.Failed() && lastErr != nil {
+			t.Logf("last query error while waiting: %v", lastErr)
+		}
+	}()
+	eventually(t, convergeTimeout, "every logged write to be delivered to every replica", func() bool {
 		for _, n := range c.Nodes {
 			logged, err := n.DB.Query(ctx, `SELECT hlc FROM mutation_log WHERE origin = ?`, n.Name)
 			if err != nil {
+				lastErr = err
 				return false
 			}
 			for _, m := range c.Nodes {
@@ -87,7 +95,11 @@ func waitEveryWriteApplied(t *testing.T, c *Cluster) {
 				}
 				for _, r := range logged {
 					seen, err := m.DB.Query(ctx, `SELECT 1 FROM mutation_seen WHERE origin = ? AND hlc = ?`, n.Name, r.String("hlc"))
-					if err != nil || len(seen) == 0 {
+					if err != nil {
+						lastErr = err
+						return false
+					}
+					if len(seen) == 0 {
 						return false
 					}
 				}

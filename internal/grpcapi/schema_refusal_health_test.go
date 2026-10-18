@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -36,40 +37,92 @@ func writeResolved(t *testing.T, s *Server, peer string, refused, accepted int, 
 	}
 }
 
-// m2: a refusal this sender saw BEFORE another sender proved the peer takes
-// that schema is stale; re-raising it would flap the condition until this
-// sender's next push. A refusal after the resolution, or of a schema the
+// m2, m-d: a refusal this sender saw BEFORE it saw another node's
+// resolution is stale; re-raising it would flap the condition until this
+// sender's next push. "Before" is judged on this node's own clock: the
+// resolver's ResolvedAt is another host's wall clock, an hour off here either
+// way. A refusal after this node saw the resolution, or of a schema the
 // resolution did not cover, is news and raises.
-func TestReplicationSchemaHealth_StaleRefusalDoesNotReRaise(t *testing.T) {
+func TestReplicationSchemaHealth_StaleRefusalDoesNotReRaiseWhateverTheSkew(t *testing.T) {
 	ctx := context.Background()
-	resolvedAt := time.Now().Add(-5 * time.Second).Truncate(time.Second)
-
-	cases := []struct {
-		name      string
-		refusedAt time.Time
-		sender    int
-		wantOpen  bool
-	}{
-		{"refused before the resolution, schema covered", resolvedAt.Add(-20 * time.Second), 68, false},
-		{"refused after the resolution", resolvedAt.Add(3 * time.Second), 68, true},
-		{"refused before the resolution, newer schema", resolvedAt.Add(-20 * time.Second), 69, true},
+	for _, skew := range []time.Duration{-time.Hour, time.Hour} {
+		for _, tc := range []struct {
+			name     string
+			after    bool // refused after this node saw the resolution
+			sender   int
+			wantOpen bool
+		}{
+			{"refused before, schema covered", false, 68, false},
+			{"refused after", true, 68, true},
+			{"refused before, newer schema", false, 69, true},
+		} {
+			t.Run(fmt.Sprintf("resolver skew %v/%s", skew, tc.name), func(t *testing.T) {
+				s := testServer(t)
+				s.SetSchemaRefusalGraceForTest(0)
+				s.replicator = corrosion.NewReplicator(s.db, "", corrosion.RelayConfig{})
+				writeResolved(t, s, "node-2", 68, 68, time.Now().Add(skew))
+				if !tc.after {
+					s.replicator.NoteSchemaRefusalForTest("node-2", tc.sender, 67, time.Now().Add(-5*time.Second))
+				}
+				s.EvaluateReplicationSchemaHealth(ctx) // this node sees the resolution now
+				if tc.after {
+					s.replicator.NoteSchemaRefusalForTest("node-2", tc.sender, 67, time.Now().Add(time.Second))
+					s.EvaluateReplicationSchemaHealth(ctx)
+				}
+				h, ok := schemaBehindRow(t, s, "node-2")
+				if !ok {
+					t.Fatal("the condition row is gone")
+				}
+				if open := h.Lifecycle != corrosion.ConditionResolved; open != tc.wantOpen {
+					t.Fatalf("open=%v (lifecycle %s), want %v", open, h.Lifecycle, tc.wantOpen)
+				}
+			})
+		}
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			s := testServer(t)
-			s.replicator = corrosion.NewReplicator(s.db, "", corrosion.RelayConfig{})
-			writeResolved(t, s, "node-2", 68, 68, resolvedAt)
-			s.replicator.NoteSchemaRefusalForTest("node-2", tc.sender, 67, tc.refusedAt)
+}
 
-			s.EvaluateReplicationSchemaHealth(ctx)
-			h, ok := schemaBehindRow(t, s, "node-2")
-			if !ok {
-				t.Fatal("the condition row is gone")
-			}
-			if open := h.Lifecycle != corrosion.ConditionResolved; open != tc.wantOpen {
-				t.Fatalf("open=%v (lifecycle %s), want %v", open, h.Lifecycle, tc.wantOpen)
-			}
-		})
+// m-e: during a pre-stage pass every host not yet staged briefly refuses the
+// ones already staged. A refusal is raised only once its run outlasts the
+// grace, so a normal subset upgrade does not flash a WARNING; one that lasts
+// is raised.
+func TestReplicationSchemaHealth_RaisedOnlyAfterTheGrace(t *testing.T) {
+	ctx := context.Background()
+	s := testServer(t)
+	s.replicator = corrosion.NewReplicator(s.db, "", corrosion.RelayConfig{})
+	now := time.Now()
+	s.replicator.NoteSchemaRefusalForTest("node-2", 68, 67, now.Add(-schemaRefusalGrace/2))
+	s.replicator.NoteSchemaRefusalForTest("node-2", 68, 67, now)
+	s.EvaluateReplicationSchemaHealth(ctx)
+	if _, ok := schemaBehindRow(t, s, "node-2"); ok {
+		t.Fatal("raised a refusal younger than the grace")
+	}
+
+	s.replicator.NoteSchemaRefusalForTest("node-3", 68, 67, now.Add(-schemaRefusalGrace-time.Second))
+	s.replicator.NoteSchemaRefusalForTest("node-3", 68, 67, now)
+	s.EvaluateReplicationSchemaHealth(ctx)
+	if h, ok := schemaBehindRow(t, s, "node-3"); !ok || h.Lifecycle == corrosion.ConditionResolved {
+		t.Fatalf("a refusal that outlasted the grace is not raised: ok=%v %+v", ok, h)
+	}
+
+	// The same holds on the refusing node itself.
+	local := s.db.EffectiveDBSchema()
+	s.schemaRefusedMu.Lock()
+	s.schemaRefused = map[string]corrosion.SchemaRefusal{
+		"node-0": {Since: now.Add(-time.Second), At: now, SenderSchema: local + 1, PeerSchema: local},
+	}
+	s.schemaRefusedMu.Unlock()
+	s.EvaluateReplicationSchemaHealth(ctx)
+	if _, ok := schemaBehindRow(t, s, s.hostName); ok {
+		t.Fatal("the refusing node raised a refusal younger than the grace")
+	}
+	s.schemaRefusedMu.Lock()
+	s.schemaRefused["node-0"] = corrosion.SchemaRefusal{
+		Since: now.Add(-schemaRefusalGrace - time.Second), At: now, SenderSchema: local + 1, PeerSchema: local,
+	}
+	s.schemaRefusedMu.Unlock()
+	s.EvaluateReplicationSchemaHealth(ctx)
+	if h, ok := schemaBehindRow(t, s, s.hostName); !ok || h.Lifecycle == corrosion.ConditionResolved {
+		t.Fatalf("the refusing node did not raise a refusal past the grace: ok=%v %+v", ok, h)
 	}
 }
 
@@ -79,6 +132,7 @@ func TestReplicationSchemaHealth_StaleRefusalDoesNotReRaise(t *testing.T) {
 func TestReplicationSchemaHealth_OpenRowNotRewrittenByALesserRefusal(t *testing.T) {
 	ctx := context.Background()
 	s := testServer(t)
+	s.SetSchemaRefusalGraceForTest(0)
 	s.replicator = corrosion.NewReplicator(s.db, "", corrosion.RelayConfig{})
 	ev, _ := json.Marshal(schemaBehindEvidence{PeerDBSchema: 67, SenderDBSchema: 69, Fix: "lv host upgrade node-2"})
 	ts := time.Now().UTC().Format(time.RFC3339)
@@ -125,6 +179,7 @@ func TestReplicationSchemaHealth_OpenRowNotRewrittenByALesserRefusal(t *testing.
 func TestReplicationSchemaHealth_RefusingNodeReportsItself(t *testing.T) {
 	ctx := context.Background()
 	s := testServer(t)
+	s.SetSchemaRefusalGraceForTest(0)
 	local := s.db.EffectiveDBSchema()
 	s.noteSchemaRefusedPush("node-0", local+1, local)
 

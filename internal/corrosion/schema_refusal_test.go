@@ -32,3 +32,24 @@ func TestSyncPeers_DropsSchemaStateOfDepartedPeers(t *testing.T) {
 		t.Error("a departed peer's acceptance outlived its membership")
 	}
 }
+
+// A refusal records when its run began, so a refusal that lasts can be told
+// from the brief one every peer gives mid pre-stage. An accepted push ends
+// the run.
+func TestSchemaRefusal_RecordsWhenTheRunBegan(t *testing.T) {
+	c := NewTestClientT(t)
+	r := NewReplicator(c, "", RelayConfig{})
+	t0 := time.Now().Add(-time.Minute)
+	r.noteSchemaRefusal("p", 68, 67, t0)
+	r.noteSchemaRefusal("p", 68, 67, t0.Add(30*time.Second))
+	got := r.SchemaRefusals(t0.Add(30 * time.Second))["p"]
+	if !got.Since.Equal(t0) || !got.At.Equal(t0.Add(30*time.Second)) {
+		t.Fatalf("refusal %+v: want since %v, at %v", got, t0, t0.Add(30*time.Second))
+	}
+
+	r.noteSchemaAccepted("p", 68, t0.Add(40*time.Second))
+	r.noteSchemaRefusal("p", 69, 68, t0.Add(50*time.Second))
+	if got := r.SchemaRefusals(t0.Add(50 * time.Second))["p"]; !got.Since.Equal(t0.Add(50 * time.Second)) {
+		t.Fatalf("refusal after an accepted push %+v: want a new run from %v", got, t0.Add(50*time.Second))
+	}
+}

@@ -1717,7 +1717,9 @@ severity warning (it degrades the cluster's health). A node whose database
 schema is behind a sender's refuses every push from it (`sender DB schema
 version N, local M (receiver is missing migrations ...)`), so nothing that
 sender writes reaches it. Each sender that sees the refusal raises the
-condition on the peer, and the refusing node raises it on itself, so its own
+condition on the peer once its refusals have lasted a minute (each host not
+yet pre-staged refuses for a few seconds during a normal `lv host upgrade`),
+and the refusing node raises it on itself, so its own
 `lv health` says so too (a node on a release before this one does neither).
 The evidence records both schemas and the fix, `lv host upgrade <peer>`. The sender also logs, once per run of refusals, an
 ERROR `replication: a peer refuses this node's pushes: its database schema

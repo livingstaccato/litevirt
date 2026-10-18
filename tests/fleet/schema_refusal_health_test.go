@@ -33,6 +33,7 @@ func TestFleet_SchemaRefusalDegradesHealth(t *testing.T) {
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
 	c.WaitConverged(t, convergeTimeout)
 	a, behind := c.Nodes[0], c.Nodes[2]
+	a.Server.SetSchemaRefusalGraceForTest(0)
 
 	// One complete, fresh evaluator so the roll-up can read HEALTHY at all.
 	scan := func() {
@@ -100,6 +101,7 @@ func TestFleet_RefusingNodeReportsItselfFromTheMonitor(t *testing.T) {
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
 	c.WaitConverged(t, convergeTimeout)
 	a, behind := c.Nodes[0], c.Nodes[2]
+	behind.Server.SetSchemaRefusalGraceForTest(0)
 	go behind.Server.RunHAHealthMonitor(ctx, 100*time.Millisecond)
 
 	behind.DB.SetEffectiveDBSchemaForTest(corrosion.CurrentSchemaVersion - 1)

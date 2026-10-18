@@ -22,6 +22,7 @@ const SchemaRefusalWindow = 2 * time.Minute
 
 // SchemaRefusal is a peer's last refusal of this node's pushes for its schema.
 type SchemaRefusal struct {
+	Since        time.Time // the first refusal of this run (reset by an accepted push)
 	At           time.Time
 	SenderSchema int // this node's effective DB schema, which the peer refused
 	PeerSchema   int // the peer's own effective DB schema, as it reported it
@@ -68,7 +69,11 @@ func (r *Replicator) noteSchemaRefusal(peer string, sender, peerSchema int, at t
 		r.schemaPush[peer] = st
 	}
 	first := st.refused.At.IsZero()
-	st.refused = SchemaRefusal{At: at, SenderSchema: sender, PeerSchema: peerSchema}
+	since := st.refused.Since
+	if first || at.Sub(st.refused.At) >= SchemaRefusalWindow {
+		since = at
+	}
+	st.refused = SchemaRefusal{Since: since, At: at, SenderSchema: sender, PeerSchema: peerSchema}
 	r.mu.Unlock()
 	if first {
 		slog.Error("replication: a peer refuses this node's pushes: its database schema is behind",

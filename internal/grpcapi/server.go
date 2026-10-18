@@ -1214,6 +1214,12 @@ type Server struct {
 	// refused because its schema is ahead (schema_refusal_health.go).
 	schemaRefusedMu sync.Mutex
 	schemaRefused   map[string]corrosion.SchemaRefusal
+	// schemaResolvedSeen is, per subject, the resolution of its
+	// replication_peer_schema_behind row this node last saw and when, on its
+	// own clock. Guarded by schemaRefusedMu.
+	schemaResolvedSeen map[string]schemaResolutionSeen
+	// schemaRefusalGraceOverride replaces schemaRefusalGrace in tests.
+	schemaRefusalGraceOverride atomic.Pointer[time.Duration]
 	// adoptedVoterGen is the voter generation AdoptVoterConfigs last found
 	// adopted, which Ping reports (PingResponse.voter_generation).
 	adoptedVoterGen atomic.Int64

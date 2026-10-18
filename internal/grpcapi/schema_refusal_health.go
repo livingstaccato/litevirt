@@ -30,6 +30,46 @@ type schemaBehindEvidence struct {
 	AcceptedDBSchema int `json:"accepted_db_schema,omitempty"`
 }
 
+// schemaRefusalGrace is how long a run of refusals lasts before it is
+// raised: during a pre-stage pass each host not yet staged refuses the ones
+// already staged for a few seconds.
+const schemaRefusalGrace = 60 * time.Second
+
+// SetSchemaRefusalGraceForTest overrides schemaRefusalGrace. Test-only.
+func (s *Server) SetSchemaRefusalGraceForTest(d time.Duration) {
+	s.schemaRefusalGraceOverride.Store(&d)
+}
+
+func (s *Server) schemaRefusalGraceNow() time.Duration {
+	if d := s.schemaRefusalGraceOverride.Load(); d != nil {
+		return *d
+	}
+	return schemaRefusalGrace
+}
+
+// schemaResolutionSeen is a resolution this node saw, keyed by the row's
+// ResolvedAt (another host's clock: an identity, never compared), and when
+// this node first saw it, on its own clock.
+type schemaResolutionSeen struct {
+	resolvedAt string
+	seen       time.Time
+}
+
+// resolutionSeenAt returns when this node first saw prev's resolution,
+// recording now if this is the first time.
+func (s *Server) resolutionSeenAt(subject, resolvedAt string, now time.Time) time.Time {
+	s.schemaRefusedMu.Lock()
+	defer s.schemaRefusedMu.Unlock()
+	if s.schemaResolvedSeen == nil {
+		s.schemaResolvedSeen = map[string]schemaResolutionSeen{}
+	}
+	if e, ok := s.schemaResolvedSeen[subject]; ok && e.resolvedAt == resolvedAt {
+		return e.seen
+	}
+	s.schemaResolvedSeen[subject] = schemaResolutionSeen{resolvedAt: resolvedAt, seen: now}
+	return now
+}
+
 // noteSchemaRefusedPush records this node refusing sender's push, made at
 // senderSchema, because its own schema (localSchema) is behind: the refusing
 // node reports the condition on itself, so its own `lv health` says so too.
@@ -39,12 +79,17 @@ func (s *Server) noteSchemaRefusedPush(sender string, senderSchema, localSchema 
 	if s.schemaRefused == nil {
 		s.schemaRefused = map[string]corrosion.SchemaRefusal{}
 	}
-	s.schemaRefused[sender] = corrosion.SchemaRefusal{At: time.Now(), SenderSchema: senderSchema, PeerSchema: localSchema}
+	now := time.Now()
+	since := now
+	if prev, ok := s.schemaRefused[sender]; ok && now.Sub(prev.At) < corrosion.SchemaRefusalWindow {
+		since = prev.Since
+	}
+	s.schemaRefused[sender] = corrosion.SchemaRefusal{Since: since, At: now, SenderSchema: senderSchema, PeerSchema: localSchema}
 }
 
 // schemaRefusedSelf folds this node's refusals within the window whose
-// schema it still lacks into one: the newest schema refused, the latest
-// time, and this node's schema now. ok is false when there are none.
+// schema it still lacks into one: the newest schema refused, the earliest
+// start and latest time, and this node's schema now. ok is false when there are none.
 func (s *Server) schemaRefusedSelf(now time.Time) (corrosion.SchemaRefusal, bool) {
 	local := s.db.EffectiveDBSchema()
 	s.schemaRefusedMu.Lock()
@@ -59,6 +104,9 @@ func (s *Server) schemaRefusedSelf(now time.Time) (corrosion.SchemaRefusal, bool
 		if r.At.After(out.At) {
 			out.At = r.At
 		}
+		if out.Since.IsZero() || r.Since.Before(out.Since) {
+			out.Since = r.Since
+		}
 	}
 	out.PeerSchema = local
 	return out, out.SenderSchema > 0
@@ -72,9 +120,12 @@ func (s *Server) schemaRefusedSelf(now time.Time) (corrosion.SchemaRefusal, bool
 //   - an open row is rewritten only by a refusal that says more (a newer
 //     schema refused, or the peer's schema changed), so senders at different
 //     schemas do not trade it back and forth;
-//   - a resolved row is re-raised only by a refusal newer than the
-//     resolution, or of a schema it did not cover, so a sender whose last
-//     refusal predates another node's proof does not flap it;
+//   - a refusal is raised only once its run outlasts schemaRefusalGrace, so
+//     the brief refusals of a pre-stage pass raise nothing;
+//   - a resolved row is re-raised only by a refusal this node saw after it
+//     saw the resolution, or of a schema it did not cover, so a sender whose
+//     last refusal predates another node's proof does not flap it. Both times
+//     are this node's clock: the row's ResolvedAt is the resolver's;
 //   - it is resolved only on proof that the host takes the refused schema: a
 //     push accepted at it, or for this node its own schema reaching it.
 //     Having nothing to push does not resolve it.
@@ -91,7 +142,11 @@ func (s *Server) EvaluateReplicationSchemaHealth(ctx context.Context) {
 	if r, ok := s.schemaRefusedSelf(now); ok {
 		refusing[s.hostName] = r
 	}
+	grace := s.schemaRefusalGraceNow()
 	for peer, r := range refusing {
+		if r.At.Sub(r.Since) < grace {
+			continue
+		}
 		prev, exists, err := corrosion.GetHealthCondition(ctx, s.db, replicationSchemaEvaluator, condPeerSchemaBehind, "host", peer)
 		if err != nil {
 			continue
@@ -104,7 +159,7 @@ func (s *Server) EvaluateReplicationSchemaHealth(ctx context.Context) {
 		if open && pev.PeerDBSchema == r.PeerSchema && pev.SenderDBSchema >= r.SenderSchema {
 			continue
 		}
-		if exists && !open && resolutionCovers(prev, pev, r) {
+		if exists && !open && resolutionCovers(pev, r, s.resolutionSeenAt(peer, prev.ResolvedAt, now)) {
 			continue
 		}
 		ev := schemaBehindEvidence{PeerDBSchema: r.PeerSchema, SenderDBSchema: r.SenderSchema, Fix: "lv host upgrade " + peer}
@@ -157,17 +212,15 @@ func (s *Server) EvaluateReplicationSchemaHealth(ctx context.Context) {
 		h.Lifecycle, h.ResolvedAt, h.LastSeen, h.Reporter = corrosion.ConditionResolved, ts, ts, s.hostName
 		if err := corrosion.UpsertHealthCondition(ctx, s.db, h); err != nil {
 			slog.Debug("replication schema condition: resolve failed", "peer", h.SubjectID, "error", err)
+			continue
 		}
+		s.resolutionSeenAt(h.SubjectID, ts, now)
 	}
 }
 
-// resolutionCovers reports whether the resolved row prev already answers
-// refusal r: it was resolved no earlier than r was seen (to the second its
-// timestamp keeps), on proof that the host takes r's schema.
-func resolutionCovers(prev corrosion.HealthCondition, pev schemaBehindEvidence, r corrosion.SchemaRefusal) bool {
-	resolvedAt, err := time.Parse(time.RFC3339, prev.ResolvedAt)
-	if err != nil {
-		return false
-	}
-	return !r.At.Truncate(time.Second).After(resolvedAt) && pev.AcceptedDBSchema >= r.SenderSchema
+// resolutionCovers reports whether a resolution this node first saw at seen
+// (its own clock) already answers refusal r: r was seen no later, and the
+// resolution proved the host takes r's schema.
+func resolutionCovers(pev schemaBehindEvidence, r corrosion.SchemaRefusal, seen time.Time) bool {
+	return !r.At.After(seen) && pev.AcceptedDBSchema >= r.SenderSchema
 }

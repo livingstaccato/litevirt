@@ -84,8 +84,8 @@ func ctSettledRaised(t *testing.T, f *pauseFixture) bool {
 func TestPartitionPause_AContainerSettleRecordIsRetried(t *testing.T) {
 	f, rt, _, _, _ := relocatedCTFixture(t)
 	fail := true
-	f.p.settleFault = func(string) error {
-		if fail {
+	f.p.settleFault = func(step string) error {
+		if fail && step != "phase" {
 			return errors.New("injected write failure")
 		}
 		return nil

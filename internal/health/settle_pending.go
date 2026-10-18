@@ -228,8 +228,8 @@ type settleRecorder struct {
 	host    string
 	dataDir string
 	now     func() time.Time
-	// fault is a test seam: called before each record write with "audit" or
-	// "raise"; an error stands in for that write failing.
+	// fault is a test seam: called before each record write with "phase",
+	// "audit" or "raise"; an error stands in for that write failing.
 	fault func(step string) error
 	// foreignLogged rate-limits the line for a record another host name wrote
 	// (file name → last logged).
@@ -237,6 +237,11 @@ type settleRecorder struct {
 	// waitLogged rate-limits the line for a record waiting on a copy that is
 	// neither live nor shut off (file name → last logged).
 	waitLogged sync.Map
+	// provenStopped holds the records (file name: one per settle → the
+	// detail as proven) whose copy this run saw stopped, so a stopped phase
+	// that could not be saved does not let a later live copy of the name drop
+	// the record.
+	provenStopped sync.Map
 }
 
 // settleWaitLogEvery is how often a record still waiting on its copy is
@@ -291,17 +296,56 @@ func (w *settleRecorder) stopRecorded(ctx context.Context, rec settlePending, st
 		return err
 	}
 	rec.Phase = settlePhaseStopped
+	w.markProven(rec)
 	if stored {
-		if err := store.put(rec); err != nil {
+		if err := w.putStopped(store, rec); err != nil {
 			slog.Warn("partition-settle: could not mark the pending-settle record stopped", "kind", rec.Kind, "name", rec.Name, "error", err)
 		}
 	}
 	if w.write(ctx, store, &rec, stored) && stored {
-		if err := store.remove(rec); err != nil {
-			slog.Warn("partition-settle: could not drop the pending-settle record", "kind", rec.Kind, "name", rec.Name, "error", err)
-		}
+		w.dropRecord(store, rec)
 	}
 	return nil
+}
+
+// markProven notes that this run saw rec's copy stopped.
+func (w *settleRecorder) markProven(rec settlePending) {
+	if fn, err := settlePendingFile(rec); err == nil {
+		w.provenStopped.Store(fn, rec.Detail)
+	}
+}
+
+// provenThisRun reports whether this run saw rec's copy stopped, and the
+// record's detail as it was then.
+func (w *settleRecorder) provenThisRun(rec settlePending) (string, bool) {
+	fn, err := settlePendingFile(rec)
+	if err != nil {
+		return "", false
+	}
+	d, ok := w.provenStopped.Load(fn)
+	if !ok {
+		return "", false
+	}
+	return d.(string), true
+}
+
+// dropRecord removes rec's file, and its in-run proof once the file is gone.
+func (w *settleRecorder) dropRecord(store settlePendingStore, rec settlePending) {
+	if err := store.remove(rec); err != nil {
+		slog.Warn("partition-settle: could not drop the pending-settle record", "kind", rec.Kind, "name", rec.Name, "error", err)
+		return
+	}
+	if fn, err := settlePendingFile(rec); err == nil {
+		w.provenStopped.Delete(fn)
+	}
+}
+
+// putStopped saves rec in the stopped phase.
+func (w *settleRecorder) putStopped(store settlePendingStore, rec settlePending) error {
+	if err := w.injected("phase"); err != nil {
+		return err
+	}
+	return store.put(rec)
 }
 
 func (w *settleRecorder) injected(step string) error {
@@ -385,9 +429,9 @@ func (w *settleRecorder) raise(ctx context.Context, rec settlePending) error {
 // off, as cleanableLeftover decides: a live copy was not stopped, so its
 // record is dropped and the settle decides again; anything else waits. Once
 // proven, the record is saved in the stopped phase before anything is
-// written, so a later live copy of the name never drops a stop that happened.
-// A stopping-phase record that already wrote part of its record was proven
-// then.
+// written, so a later live copy of the name never drops a stop that happened;
+// a stop this run proved counts even when that save failed. A stopping-phase
+// record that already wrote part of its record was proven then.
 func (w *settleRecorder) retry(ctx context.Context, kind string, state func(name string) (settleCopyState, string)) {
 	store := w.store()
 	recs, err := store.list(kind)
@@ -401,7 +445,11 @@ func (w *settleRecorder) retry(ctx context.Context, kind string, state func(name
 			w.noteForeign(*rec)
 			continue
 		}
-		if rec.Phase != settlePhaseStopped && !rec.Audited && !rec.Raised {
+		proven := rec.Phase == settlePhaseStopped || rec.Audited || rec.Raised
+		if detail, ok := w.provenThisRun(*rec); ok && !proven {
+			rec.Phase, rec.Detail, proven = settlePhaseStopped, detail, true
+		}
+		if !proven {
 			st, seen := state(rec.Name)
 			switch st {
 			case copyLive:
@@ -415,11 +463,12 @@ func (w *settleRecorder) retry(ctx context.Context, kind string, state func(name
 				w.noteWaiting(*rec, seen)
 				continue
 			}
-			if seen != "" && !rec.Audited && !strings.Contains(rec.Detail, "; found ") {
+			if seen != "" && !strings.Contains(rec.Detail, "; found ") {
 				rec.Detail += "; found " + seen + " after a restart or a failed stop, so the settle's own stop may not be what stopped it"
 			}
 			rec.Phase = settlePhaseStopped
-			if err := store.put(*rec); err != nil {
+			w.markProven(*rec)
+			if err := w.putStopped(store, *rec); err != nil {
 				slog.Warn("partition-settle: could not mark the pending-settle record stopped", "kind", rec.Kind, "name", rec.Name, "error", err)
 			}
 		}
@@ -429,9 +478,7 @@ func (w *settleRecorder) retry(ctx context.Context, kind string, state func(name
 		slog.Info("partition-settle: wrote the record of an earlier settle", "kind", rec.Kind, "name", rec.Name,
 			"proof", rec.Proof, "stopped_at", rec.At)
 		w.dropMatchingPause(*rec)
-		if err := store.remove(*rec); err != nil {
-			slog.Warn("partition-settle: could not drop the pending-settle record", "kind", rec.Kind, "name", rec.Name, "error", err)
-		}
+		w.dropRecord(store, *rec)
 	}
 }
 

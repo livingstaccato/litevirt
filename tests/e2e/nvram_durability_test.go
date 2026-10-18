@@ -7,10 +7,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/health"
 	lvirt "github.com/litevirt/litevirt/internal/libvirt"
 )
 
-// Drill: a guest's UEFI variable write survives a hard power cut of its host
+// Drills: a guest's UEFI variable write survives a hard power cut of its host
 // a few seconds later.
 //
 // qemu writes the UEFI vars file with no flush and libvirt has no cache mode
@@ -18,19 +19,35 @@ import (
 // write waits in the host page cache for writeback (30 s by default) and the
 // power cut loses it (lab 2, 2026-10-18: a write 9 s before the cut was gone).
 //
-//	E2E_UEFI_IMAGE      a UEFI-bootable cloud image with efivarfs (default ubuntu-ga)
-//	E2E_UEFI_MEMORY     its memory (default 768)
-//	E2E_NVRAM_CUT_AFTER delay between the write and the power cut (default 3s)
+//	E2E_UEFI_IMAGE        a UEFI-bootable cloud image with efivarfs (default ubuntu-ga)
+//	E2E_UEFI_MEMORY       its memory (default 768)
+//	E2E_NVRAM_CUT_AFTER   delay between the write and the power cut (default 3s, 2s to 5s)
+//	E2E_NVRAM_EXPECT_LOSS 1 for the control run on a build without the flusher:
+//	                      the write must then be lost
 //
-// What it checks, on real qemu and the host's own disk:
+// What they check, on real qemu and the host's own disk:
 //
-//  1. a variable written in the guest through efivarfs reaches the host's
+//  1. periodic writeback is off on the host (vm.dirty_writeback_centisecs=0,
+//     after a sync), so only an fsync can put the write on disk before the
+//     cut;
+//  2. a variable written in the guest through efivarfs reaches the host's
 //     vars file (read on the host before the cut);
-//  2. the host is powered off E2E_NVRAM_CUT_AFTER (default 3 s, at most 5 s)
-//     after the write;
-//  3. once the host is back, its vars file on disk still holds the value, and
+//  3. the host is powered off E2E_NVRAM_CUT_AFTER after the write;
+//  4. once the host is back, its vars file on disk still holds the value, and
 //     the guest, started again there, reads it back from its firmware.
+//
+// One drill covers a plain UEFI VM, whose vars file is libvirt's
+// (/var/lib/libvirt/qemu/nvram); the other a Secure Boot + vTPM VM, whose
+// vars file is litevirt's (<data_dir>/nvram).
 func TestDrill_UEFIVariableSurvivesHostPowerCut(t *testing.T) {
+	uefiVariablePowerCutDrill(t, false)
+}
+
+func TestDrill_UEFIVariableSurvivesHostPowerCut_SecureBootVTPM(t *testing.T) {
+	uefiVariablePowerCutDrill(t, true)
+}
+
+func uefiVariablePowerCutDrill(t *testing.T, secureBoot bool) {
 	l := newLab(t)
 	b := l.requireBaseline()
 	l.restoreOnCleanup(b)
@@ -38,17 +55,22 @@ func TestDrill_UEFIVariableSurvivesHostPowerCut(t *testing.T) {
 	cutAfter := 3 * time.Second
 	if v := envOr("E2E_NVRAM_CUT_AFTER", ""); v != "" {
 		d, err := time.ParseDuration(v)
-		if err != nil || d < 0 || d > 5*time.Second {
-			t.Fatalf("E2E_NVRAM_CUT_AFTER=%q: want a duration from 0 to 5s", v)
+		if err != nil || d < 2*time.Second || d > 5*time.Second {
+			t.Fatalf("E2E_NVRAM_CUT_AFTER=%q: want a duration from 2s to 5s", v)
 		}
 		cutAfter = d
 	}
+	expectLoss := envOr("E2E_NVRAM_EXPECT_LOSS", "") == "1"
 
 	q := l.hosts[0]
 	victim := l.leastLoaded(q, l.except(q))
 	stack := uniqueName("nvd")
 	vm := stack + "-1"
 	const guestUser, guestPassword = "ubuntu", "nvd-e2e-pw"
+	firmware := ""
+	if secureBoot {
+		firmware = "    secure-boot: true\n    tpm: true\n"
+	}
 	yaml := fmt.Sprintf(`name: %[1]s
 networks:
   nvd:
@@ -60,7 +82,7 @@ vms:
   %[2]s:
     image: %[3]s
     firmware: uefi
-    machine: q35
+%[8]s    machine: q35
     cpu: 1
     memory: %[4]s
     disks:
@@ -79,7 +101,7 @@ vms:
           expire: false
           users:
             - {name: %[6]s, password: %[7]s, type: text}
-`, stack, vm, envOr("E2E_UEFI_IMAGE", "ubuntu-ga"), envOr("E2E_UEFI_MEMORY", "768"), victim, guestUser, guestPassword)
+`, stack, vm, envOr("E2E_UEFI_IMAGE", "ubuntu-ga"), envOr("E2E_UEFI_MEMORY", "768"), victim, guestUser, guestPassword, firmware)
 	file := "/tmp/" + stack + ".yaml"
 	l.putFile(q, file, yaml)
 	l.onRestore(func() { l.deleteVMs(stack, map[string]string{victim: vm}) })
@@ -115,8 +137,22 @@ vms:
 	if vars == "" {
 		t.Fatalf("%s's domain names no <nvram> file:\n%s", vm, xml)
 	}
+	inLibvirtDir := strings.HasPrefix(vars, health.LibvirtNvramDir+"/")
+	if secureBoot == inLibvirtDir {
+		t.Fatalf("%s's vars file is %s: want it under <data_dir>/nvram for Secure Boot + vTPM, under %s otherwise", vm, vars, health.LibvirtNvramDir)
+	}
 
-	// The variable: non-volatile, boot-service and runtime access (0x07).
+	// 1. Only an fsync can persist the write: periodic writeback off, after
+	// a sync that cleans what boot dirtied. The power cut resets the sysctl;
+	// restore puts it back if the drill fails before that.
+	orig := strings.TrimSpace(l.mustSSH(victim, 20*time.Second, "cat /proc/sys/vm/dirty_writeback_centisecs"))
+	if _, err := strconv.Atoi(orig); err != nil {
+		t.Fatalf("vm.dirty_writeback_centisecs on %s: %q", victim, orig)
+	}
+	l.onRestore(func() { l.ssh(victim, 20*time.Second, "sysctl -qw vm.dirty_writeback_centisecs="+orig) })
+	l.mustSSH(victim, 2*time.Minute, "sync && sysctl -qw vm.dirty_writeback_centisecs=0 && sync")
+
+	// 2. The variable: non-volatile, boot-service and runtime access (0x07).
 	marker := "lvnvd-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	efivar := "/sys/firmware/efi/efivars/LvNvramDurability-7a1c3d2e-0000-4d2e-9a1b-6e7672616d31"
 	read := "sudo cat " + efivar + " | tail -c +5"
@@ -126,13 +162,16 @@ vms:
 	written := l.mark("nvd: %s wrote %s=%s", vm, efivar, marker)
 
 	grepVars := "grep -a -c -F " + shellQuote(marker) + " " + shellQuote(vars)
-	// 1. It reached the host (from its page cache, at least).
 	if out, _ := l.ssh(victim, 20*time.Second, grepVars); strings.TrimSpace(out) == "0" || strings.TrimSpace(out) == "" {
 		t.Fatalf("the value never reached %s on %s: grep says %q", vars, victim, out)
 	}
 	stat := l.mustSSH(victim, 20*time.Second, "stat -c '%y %s' "+shellQuote(vars))
 
-	// 2. The power cut.
+	// 3. The power cut.
+	if wait := cutAfter - time.Since(written) - time.Second; wait > 0 {
+		time.Sleep(wait)
+	}
+	meminfo, _ := l.ssh(victim, 10*time.Second, "grep -E '^(Dirty|Writeback):' /proc/meminfo; cat /proc/sys/vm/dirty_writeback_centisecs")
 	if wait := cutAfter - time.Since(written); wait > 0 {
 		time.Sleep(wait)
 	}
@@ -143,14 +182,19 @@ vms:
 		t.Fatalf("the power cut came %v after the write; it must come within 5 s to prove anything", gap)
 	}
 
-	// 3. Back on: the file on disk holds it, and the firmware hands it back.
+	// 4. Back on: the file on disk holds it, and the firmware hands it back.
 	if err := l.powerOn(victim); err != nil {
 		t.Fatalf("power on %s: %v", victim, err)
 	}
 	after := l.mustSSH(victim, 20*time.Second, "stat -c '%y %s' "+shellQuote(vars)+"; "+grepVars+" || true")
-	l.saveEvidence("nvd-vars-after-cut.txt", fmt.Sprintf("vars %s\nbefore cut: %s\nafter power-on: %s\nwrite→cut %v\n", vars, stat, after, gap))
+	l.saveEvidence("nvd-vars-after-cut.txt", fmt.Sprintf("vm %s secure-boot+tpm %v expect-loss %v\nvars %s\nbefore cut: %s\nmeminfo before cut:\n%s\nafter power-on: %s\nwrite→cut %v\n",
+		vm, secureBoot, expectLoss, vars, stat, meminfo, after, gap))
 	lines := strings.Split(strings.TrimSpace(after), "\n")
-	if n := strings.TrimSpace(lines[len(lines)-1]); n == "0" {
+	onDisk := strings.TrimSpace(lines[len(lines)-1]) != "0"
+	switch {
+	case expectLoss && onDisk:
+		t.Fatalf("control run: the UEFI variable is in %s on %s's disk although no flusher ran; the drill cannot tell a fix from luck (stat/grep: %q)", vars, victim, after)
+	case !expectLoss && !onDisk:
 		t.Fatalf("the UEFI variable written %v before the power cut is not in %s on %s's disk: the write was lost (stat/grep: %q)", gap.Round(time.Millisecond), vars, victim, after)
 	}
 	l.waitAllActive(q, 6*time.Minute)
@@ -159,8 +203,15 @@ vms:
 		t.Fatalf("%s did not start on %s once it was back (virsh: %q)", vm, victim, strings.TrimSpace(st))
 	}
 	waitGuest()
-	if out, ok, err := guest(read); err != nil || !ok || strings.TrimSpace(out) != marker {
-		t.Fatalf("after the power cut %s reads %s as %q (ok=%v err=%v), want %q", vm, efivar, strings.TrimSpace(out), ok, err, marker)
+	out, ok, err := guest(read)
+	got := strings.TrimSpace(out)
+	switch {
+	case err != nil:
+		t.Fatalf("read %s in %s after the power cut: %v", efivar, vm, err)
+	case expectLoss && ok && got == marker:
+		t.Fatalf("control run: %s still reads %s as %q after the power cut", vm, efivar, got)
+	case !expectLoss && (!ok || got != marker):
+		t.Fatalf("after the power cut %s reads %s as %q (ok=%v), want %q", vm, efivar, got, ok, marker)
 	}
-	l.mark("nvd: %s reads %s back after a power cut %v after the write", vm, marker, gap.Round(time.Millisecond))
+	l.mark("nvd: %s after a power cut %v after the write: on disk %v, guest reads %q (expect loss %v)", vm, gap.Round(time.Millisecond), onDisk, got, expectLoss)
 }

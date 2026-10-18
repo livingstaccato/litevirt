@@ -432,6 +432,9 @@ type Client struct {
 	// credentialsLiveFile. credentialsLiveChecked makes the file read once.
 	credentialsLive        atomic.Bool
 	credentialsLiveChecked atomic.Bool
+	// sensitiveMerges records the peers this process has completed a
+	// sensitive-lane anti-entropy exchange with (credentials_sensitive_merged.go).
+	sensitiveMerges sensitiveMergeState
 	// The credentials baseline and the external-seen set
 	// (credentials_live.go), guarded by externalSeenMu.
 	externalSeenMu  sync.Mutex
@@ -1451,6 +1454,15 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 	for _, stmts := range entries {
 		relay := make([]Statement, 0, len(stmts))
 		for _, s := range stmts {
+			// See executeBatchInternal (credentials_revive_guard.go).
+			credPlan, err := planCredentialUpsert(ctx, tx, s, stmts)
+			if err != nil {
+				tx.Rollback()
+				c.mu.Unlock()
+				return false, err
+			} else if credPlan.skip {
+				continue
+			}
 			if s.Guard != nil {
 				matches, err := c.mutationGuardMatches(ctx, tx, s.Guard)
 				if err != nil {
@@ -1476,6 +1488,11 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 				tx.Rollback()
 				c.mu.Unlock()
 				return false, invalidf("guarded workload transition matched authority but changed no row")
+			}
+			if err := credPlan.apply(ctx, tx); err != nil {
+				tx.Rollback()
+				c.mu.Unlock()
+				return false, err
 			}
 			changed := false
 			if n, e := res.RowsAffected(); e == nil && n > 0 {
@@ -1640,6 +1657,16 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	var parks []func()      // updates that met no row because it has not arrived yet
 	relay := make([]Statement, 0, len(stmts))
 	for _, s := range stmts {
+		// A fence credential carries the retirement it was set after
+		// (credentials_revive_guard.go).
+		credPlan, err := planCredentialUpsert(ctx, tx, s, stmts)
+		if err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return 0, err
+		} else if credPlan.skip {
+			continue
+		}
 		// A live-row update runs here through the same guarded form every
 		// receiver uses; what is logged is the wire form (live_row_update.go).
 		res, err := tx.ExecContext(ctx, appliedForm(s).SQL, s.Params...)
@@ -1647,6 +1674,11 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 			tx.Rollback()
 			c.mu.Unlock()
 			return 0, fmt.Errorf("exec batch: %w", err)
+		}
+		if err := credPlan.apply(ctx, tx); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return 0, err
 		}
 		changed := false
 		if n, e := res.RowsAffected(); e == nil {

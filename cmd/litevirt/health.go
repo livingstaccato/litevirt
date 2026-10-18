@@ -103,14 +103,16 @@ over an IPMI power-off or an operator's lv host fence-confirm). It is refused
 otherwise: that host settles the move itself. 'lv health' lists each move's
 two files, whether the guest was pivoted, and its error: read them first.
 
---accept <path> names the file to keep of one disk's move, once per disk:
-the disk record is pointed at it first, run on the VM's owner or on the
-holding host, where that file is its own or on a mounted shared pool both
-hosts define alike. A move the disk record does not settle (a live move with
-no pivot recorded) is refused without one: nothing in the cluster knows which
-file the guest wrote last. On the holding host that owns the VM, with its
-domain defined, the domain must be shut off and its persistent config must
-name the file each disk record is left on.
+--accept <path> names the file to keep of one disk's move, once per disk.
+The disk record is pointed at it first, only on the VM's owner, where that
+file is its own or on a mounted shared pool it and the holding host define
+alike; on a holding host that does not own the VM, --accept may only name the
+file the disk record names. A move the disk record does not settle (a live
+move with no pivot recorded) is refused without one: nothing in the cluster
+knows which file the guest wrote last, unless the holding host owns the VM
+and its persistent config and disk record name the source. On the VM's owner,
+with its domain defined, its persistent config must name the file each disk
+record is left on, and no disk record is changed while it is active.
 
 Requires the cluster.health.resolve verb (Admin). The resolution is written
 to the audit log with your principal and --reason, and published as an

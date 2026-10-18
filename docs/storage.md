@@ -1502,7 +1502,8 @@ destination, or when the guest was pivoted but the config names the source. A re
 reported as "nothing to do" while the record remains. Another host (a failover onto
 shared storage) honours the condition by what it can prove: when the guest was
 pivoted, a start there points the disk record at the destination on a shared pool both
-hosts define alike; when no pivot was recorded, it is refused whichever file the disk
+hosts define alike, unless the VM's domain there is running or its persistent config
+names the source (that refusal names `lv stop` or `virsh edit`); when no pivot was recorded, it is refused whichever file the disk
 record names, since the record commit and the pivot may have happened before the holding
 host stopped. A refused VM whose holding host is gone is released with `lv health resolve
 vm.move_unresolved vm/<vm> --reason "…" --accept <path>`, naming the file to keep of each

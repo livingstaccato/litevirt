@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -43,10 +44,18 @@ func (s *Server) beginMoveMarker(ctx context.Context, vm *corrosion.VMRecord, sr
 		Src: src.Path, SrcType: src.StorageType, SrcPool: src.StorageVolume,
 		Dst: dstPath, DstType: dstType, DstPool: dstPool,
 		Live: live, Pivoted: pivoted,
+		At:             time.Now().UTC().Format(time.RFC3339Nano),
+		SrcBackingDisk: src.BackingDisk, SrcBackingImage: src.BackingImage,
 	}}
 	prior, hadPrior := s.moveRecordOf(vm.Name, src.DiskName)
 	if hadPrior && prior.Dst == dstPath && (prior.Src == src.Path || prior.Dst == src.Path) {
+		// The same move, retried: it keeps its identity (At, which a hand
+		// resolution matches) and what the first attempt knew.
 		mk.m.Src, mk.m.SrcType, mk.m.SrcPool = prior.Src, prior.SrcType, prior.SrcPool
+		mk.m.SrcBackingDisk, mk.m.SrcBackingImage = prior.SrcBackingDisk, prior.SrcBackingImage
+		if prior.At != "" {
+			mk.m.At = prior.At
+		}
 		mk.m.Live = mk.m.Live || prior.Live
 		mk.m.Pivoted = mk.m.Pivoted || prior.Pivoted
 		mk.m.CatchUp = mk.m.CatchUp || prior.CatchUp
@@ -214,6 +223,7 @@ func (s *Server) resolveUnresolvedMoves(ctx context.Context, vmName string) erro
 		dom = health.MoveDomain{
 			InactiveXML: func() (string, error) { return s.virt.DumpXMLInactive(vmName) },
 			State:       func() (string, error) { return s.virt.DomainState(vmName) },
+			Active:      func() (bool, error) { return s.virt.DomainIsActive(vmName) },
 		}
 	}
 	return health.ResolveUnresolvedMoves(ctx, s.db, s.dataDir, s.hostName, vmName, dom)

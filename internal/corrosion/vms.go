@@ -1961,6 +1961,19 @@ var clearDiskBackingAfterRead func()
 // not know, and only while the live row is still, column for column, the one
 // it read (diskRowStill). A row already without a backing is left alone.
 func ClearDiskBacking(ctx context.Context, c *Client, vmName, diskName, path string) error {
+	return setDiskBacking(ctx, c, vmName, diskName, path, "", "")
+}
+
+// RestoreDiskBacking is ClearDiskBacking's inverse: disk (vmName, diskName),
+// pointed back at path, an overlay whose backing record a move cleared, gets
+// that record back, so the base it reads is again counted as referenced.
+// Written the same way: only while the row names path and is still the one
+// read, in InsertDisk's whole-row shape.
+func RestoreDiskBacking(ctx context.Context, c *Client, vmName, diskName, path, backingDisk, backingImage string) error {
+	return setDiskBacking(ctx, c, vmName, diskName, path, backingDisk, backingImage)
+}
+
+func setDiskBacking(ctx context.Context, c *Client, vmName, diskName, path, backingDisk, backingImage string) error {
 	var cur DiskRecord
 	found := false
 	disks, err := GetVMDisks(ctx, c, vmName)
@@ -1972,14 +1985,14 @@ func ClearDiskBacking(ctx context.Context, c *Client, vmName, diskName, path str
 			cur, found = d, true
 		}
 	}
-	if !found || cur.Path != path || (cur.BackingDisk == "" && cur.BackingImage == "") {
+	if !found || cur.Path != path || (cur.BackingDisk == backingDisk && cur.BackingImage == backingImage) {
 		return nil
 	}
 	if clearDiskBackingAfterRead != nil {
 		clearDiskBackingAfterRead()
 	}
 	d := cur
-	d.BackingDisk, d.BackingImage = "", ""
+	d.BackingDisk, d.BackingImage = backingDisk, backingImage
 	// The whole row is re-written, so it is written only while the live row
 	// is still exactly the one read: a column changed in between is never
 	// reverted.
@@ -2016,9 +2029,18 @@ func UpdateDiskStorage(ctx context.Context, c *Client, vmName, diskName, storage
 func UpdateDiskPlacementIfStill(ctx context.Context, c *Client, cur DiskRecord, hostName, path, storageType, storageVolume string) (bool, error) {
 	d := cur
 	d.HostName, d.Path, d.StorageType, d.StorageVolume = hostName, path, storageType, storageVolume
+	return ReplaceDiskRowIfStill(ctx, c, cur, d)
+}
+
+// ReplaceDiskRowIfStill writes the disk row after, of cur's disk, only while
+// the live row is still, column for column, cur (diskRowStill), in
+// InsertDisk's whole-row shape. applied is false, with no error, when the row
+// changed or is gone.
+func ReplaceDiskRowIfStill(ctx context.Context, c *Client, cur, after DiskRecord) (bool, error) {
+	after.VMName, after.DiskName = cur.VMName, cur.DiskName
 	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		return diskRowStill(ctx, tx, cur)
-	}, []Statement{{SQL: diskRowSQL, Params: diskRowParams(d, c.NowTS())}})
+	}, []Statement{{SQL: diskRowSQL, Params: diskRowParams(after, c.NowTS())}})
 }
 
 // UpdateDiskPlacement atomically repoints a disk's full placement — host, path,

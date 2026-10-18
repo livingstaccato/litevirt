@@ -334,6 +334,14 @@ func (s *Server) liveMoveVolume(
 		// and remove the dest only if persistent no longer references it.
 		rowPath := src.Path
 		dbErr := corrosion.UpdateDiskPlacement(ctx, s.db, vm.Name, src.DiskName, src.HostName, src.Path, src.StorageType, src.StorageVolume)
+		if dbErr == nil && (src.BackingDisk != "" || src.BackingImage != "") {
+			// The commit cleared the backing record for the flattened copy;
+			// the source is still the overlay it was.
+			if berr := corrosion.RestoreDiskBacking(ctx, s.db, vm.Name, src.DiskName, src.Path, src.BackingDisk, src.BackingImage); berr != nil {
+				slog.Error("live move: pivot failed; the disk row is back on the source, but its backing record could not be restored",
+					"vm", vm.Name, "disk", src.DiskName, "backing_disk", src.BackingDisk, "backing_image", src.BackingImage, "error", berr)
+			}
+		}
 		if dbErr != nil {
 			rowPath = destPath
 			slog.Error("live move: pivot failed and DB rollback to src also failed — DB records dest but guest is on src; operator must reconcile",

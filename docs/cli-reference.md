@@ -106,7 +106,8 @@ lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH
                                    #   still holds; or a vm.move_unresolved (--reason required) on its holding
                                    #   host, or once that host is proven powered off; --accept picks the file
                                    #   to keep of one disk (repeat per disk; required for a move with no pivot
-                                   #   recorded, except on the holder that owns the VM)
+                                   #   recorded, unless the holder owns the VM and its config and record name
+                                   #   the source)
 ```
 
 ## Hosts
@@ -1501,11 +1502,12 @@ lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH
                                              #   with --reason: on the host holding its record, or once
                                              #   that host is proven powered off. --accept PATH points
                                              #   a disk record at one of its move's two files first, on
-                                             #   the VM's owner or the holder; once per disk, and
-                                             #   required for a move with no pivot recorded except on
-                                             #   the holder that owns the VM, whose shut-off domain's
-                                             #   config must name each file kept. `lv health` lists
-                                             #   the moves first (docs/diagnostics.md).
+                                             #   the VM's owner; once per disk, and required for a
+                                             #   move with no pivot recorded unless the holder owns
+                                             #   the VM and its config and record name the source.
+                                             #   On the owner the domain's config must name each file
+                                             #   kept, and a running domain's record is not changed.
+                                             #   `lv health` lists the moves first (docs/diagnostics.md).
 lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>] [--until <time>]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics
 lv stats <vm>                                # VM resource statistics

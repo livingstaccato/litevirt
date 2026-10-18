@@ -1773,27 +1773,38 @@ fence-confirm <host>` of its last life. `lv health` prints each move first:
 both files, whether the guest was pivoted (or the copy was named before the
 move), and the move's error.
 
-`--accept <path>` names the file to keep of one disk's move, once per disk,
-and points that disk record at it. It runs on the VM's owner or on the holding
-host, and only where that host reads the same file: its own file on a host
-that is both, or a file on a mounted shared pool both hosts define alike
-(the same export mounted at the same directory). A resolution never keeps a
-file the move proves stale: after a pivot only the copy is accepted. From any
-host but the holding host that owns the VM, a live move with no pivot recorded
-is refused without an `--accept` for its disk: nothing in the cluster knows
-which file the guest wrote last, and the disk record is no evidence of it.
-Judge it from the holding host's persistent config, or from the two files on
-the shared pool (the later modification time, `qemu-img compare`). On the
-holding host that owns the VM, with its domain defined, the domain must be
-shut off and its persistent config, which `lv start` boots, must name the
-file each disk record is left on; point it there with `virsh edit` or pass
-that file to `--accept`.
+`--accept <path>` names the file to keep of one disk's move, once per disk.
+A disk record is pointed at another file only on the VM's owner, and only
+where it reads the same file as the holding host: its own file on a host that
+is both, or a file on a mounted shared pool both hosts define alike (the same
+export mounted at the same directory, the pool's own source). On a holding
+host that does not own the VM, `--accept` may only name the file the disk
+record already names. A resolution never keeps a file the move proves stale:
+after a pivot only the copy is accepted. A live move with no pivot recorded is
+refused without an `--accept` for its disk: nothing in the cluster knows
+which file the guest wrote last, and neither the disk record nor a persistent
+config naming the copy is evidence of it (the move names the copy in the
+config before the pivot). The one exception is the holding host that owns the
+VM, whose persistent config and disk record both name the source: no pivot
+happened. Judge it from the holding host's persistent config, or from the two
+files on the shared pool (the later modification time, `qemu-img compare`).
+On the VM's owner, with its domain defined, the persistent config, which `lv
+start` boots, must name the file each disk record is left on (point it there
+with `virsh edit` or pass that file to `--accept`), and no disk record is
+changed while the domain is active (`lv stop` it first); on the holding host
+that owns the VM the domain must be shut off. A condition whose evidence
+cannot be read is resolved only on the VM's owner with its domain shut off,
+and keeps the disk records as they are.
 
 A holding host that rejoins after an admin resolved its move from another
 host drops its record of that move instead of raising the condition again,
-unless it now owns the VM. While it holds an open condition, run the
-resolution against it (`LV_HOST=<host>`). Removing a host does not resolve
-the condition.
+unless it now owns the VM. When its record knew more than the evidence the
+admin resolved (a pivot that never replicated, for example), the decision
+still stands, and the host logs a warning and writes a
+`health.condition.hand_diverged` audit row naming what it knew: check that the
+file the disk record names holds the guest's data. While it holds an open
+condition, run the resolution against it (`LV_HOST=<host>`). Removing a host
+does not resolve the condition.
 
 ### A cluster default-deny held by a torn-down stack (`firewall.default_deny_orphaned`)
 

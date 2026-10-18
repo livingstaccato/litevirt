@@ -993,9 +993,13 @@ func TestResolveHealthCondition_MoveUnresolved(t *testing.T) {
 		{"holder removed after a confirmation", "", [][2]string{{"manual", "manual-confirmed"}}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s, _, srcFile, dstFile := offlineMoveServer(t)
+			s, f, srcFile, dstFile := offlineMoveServer(t)
 			holderNodeA(t, s, tc.state, tc.fences...)
 			if err := corrosion.UpdateDiskPlacement(ctx, s.db, "vm1", "root", "test-host", dstFile, "local", "warm"); err != nil {
+				t.Fatal(err)
+			}
+			// This host owns the VM: its config names the row's file.
+			if err := f.DefineDomain(fakeDomainXML("vm1", "vda", dstFile)); err != nil {
 				t.Fatal(err)
 			}
 			publishForeignCondition(t, s, "node-a", srcFile, dstFile, true)
@@ -1117,8 +1121,11 @@ func TestResolveHealthCondition_MoveUnresolved(t *testing.T) {
 		mustRefuse(t, s, err, srcFile, "only `--accept "+dstFile+"`")
 	})
 	t.Run("elsewhere: --accept on a host that does not read the holder's file: refused", func(t *testing.T) {
-		s, _, srcFile, dstFile := offlineMoveServer(t)
+		s, f, srcFile, dstFile := offlineMoveServer(t)
 		provenOffNodeA(t, s)
+		if err := f.DefineDomain(fakeDomainXML("vm1", "vda", dstFile)); err != nil {
+			t.Fatal(err)
+		}
 		publishForeignCondition(t, s, "node-a", srcFile, dstFile, false)
 		_, err := s.ResolveHealthCondition(acceptCtx(dstFile), moveResolveReq("x"))
 		mustRefuse(t, s, err, srcFile, "does not read that file")
@@ -1294,7 +1301,7 @@ func TestResolveHealthCondition_AcceptOnTheOwnerAfterAFailover(t *testing.T) {
 		if r := diskRowOf(t, s, "root"); r.Path != src["root"] || r.StorageType != "ceph" {
 			t.Fatalf("row left at %+v", r)
 		}
-		rows, qerr := s.db.Query(ctx, `SELECT result, detail FROM audit_log WHERE action = 'health.condition.resolve'`)
+		rows, qerr := s.db.Query(ctx, `SELECT result, detail FROM audit_log WHERE action = 'health.condition.resolve' AND result != 'pending'`)
 		if qerr != nil || len(rows) != 1 || rows[0].String("result") != "failed" || !strings.Contains(rows[0].String("detail"), "pointed back") {
 			t.Fatalf("audit = %+v %v", rows, qerr)
 		}

@@ -39,7 +39,11 @@ import (
 //  4. After a clean `lv stop` and a start, the next run IS incremental: the
 //     bitmap persisted.
 //  5. After a live detach and reattach of the same file (virsh), the next
-//     run's replica is still exact, whichever way it was made.
+//     run IS incremental: the bitmap is saved on the detach and loaded again.
+//
+// Before each stop and the detach there is a write after the last
+// checkpoint (and one to the file while detached), so a chain wrongly
+// continued over a lost bitmap would miss it and fail the model.
 //  6. With the schedule removed and the VM shut off cleanly (a consistent
 //     state, no -U), the data disk equals the model, and so does the newest
 //     replica.
@@ -253,7 +257,10 @@ func TestReplication_IncrementalDataDisk(t *testing.T) {
 		t.Errorf("checkpoints after the third run: %v, want lvrepl-data-%s and not the superseded %s", cps, r3.taken, cp1)
 	}
 
-	// 3. An unclean stop: the next run is not incremental, and exact.
+	// 3. An unclean stop: the next run is not incremental, and exact. A write
+	// after the last checkpoint and before the stop: a chain wrongly
+	// continued over the lost bitmap would miss it.
+	write(36*mib, mib, 0x65)
 	flush()
 	restart(true)
 	at = write(16*mib, mib, 0x66)
@@ -266,7 +273,9 @@ func TestReplication_IncrementalDataDisk(t *testing.T) {
 	at = write(20*mib, mib, 0x67)
 	exact("chain re-established", waitRun(at))
 
-	// 4. A clean stop: the next run is incremental, and exact.
+	// 4. A clean stop: the next run is incremental, and exact. A write
+	// before the stop must survive in the persisted bitmap.
+	write(40*mib, mib, 0x76)
 	restart(false)
 	at = write(24*mib, mib, 0x77)
 	rc := waitRun(at)
@@ -275,7 +284,11 @@ func TestReplication_IncrementalDataDisk(t *testing.T) {
 	}
 	exact("after a clean restart", rc)
 
-	// 5. A live detach and reattach of the same file.
+	// 5. A live detach and reattach of the same file: the bitmap is persisted
+	// on the detach and loaded again on the reattach, so the chain continues
+	// (incremental), and every write — before the detach, to the file while
+	// detached (qemu-io, which keeps the image's bitmaps), and after the
+	// reattach — is in the replica.
 	blk := l.mustSSH(h, 30*time.Second, "virsh domblklist "+shellQuote(vm)+" --details")
 	target := ""
 	for _, line := range strings.Split(blk, "\n") {
@@ -286,13 +299,24 @@ func TestReplication_IncrementalDataDisk(t *testing.T) {
 	if target == "" {
 		t.Fatalf("no target for %s in %s", data, blk)
 	}
+	write(44*mib, mib, 0x86)
 	flush()
 	l.mustSSH(h, time.Minute, fmt.Sprintf("virsh detach-disk %s %s --live", shellQuote(vm), target))
 	time.Sleep(5 * time.Second)
+	if out := l.mustSSH(h, time.Minute, fmt.Sprintf("qemu-io -f qcow2 -c 'write -P 0x87 %d %d' %s", 52*mib, mib, shellQuote(data))); !strings.Contains(out, "wrote") {
+		t.Fatalf("qemu-io write to the detached disk: %s", out)
+	}
+	for i := 52 * mib; i < 53*mib; i++ {
+		model[i] = 0x87
+	}
 	l.mustSSH(h, time.Minute, fmt.Sprintf("virsh attach-disk %s %s %s --live --driver qemu --subdriver qcow2 --targetbus virtio",
 		shellQuote(vm), shellQuote(data), target))
 	at = write(28*mib, mib, 0x88)
-	exact("after a detach and reattach", waitRun(at))
+	ra := waitRun(at)
+	if d := detailOf(ra.taken); !strings.Contains(d, "incremental") {
+		t.Errorf("the run after a detach and reattach of the same file was not incremental: %s", d)
+	}
+	exact("after a detach and reattach", ra)
 
 	// 6. No more runs; the VM shut off cleanly; the disk and the newest
 	// replica both equal the model.

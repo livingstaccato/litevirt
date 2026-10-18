@@ -576,12 +576,28 @@ func TestFleet_PartitionSettle_DualRunSettlesToTheCertifiedCopy(t *testing.T) {
 		t.Fatalf("%s stopped pp-dual without a destroy", owner.Name)
 	}
 	// The settle writes its audit row and condition just after the destroy
-	// that the wait above observed.
+	// that the wait above observed. vm_settled is open only while the stopped
+	// copy is still defined: the leftover cleanup undefines it a reconcile
+	// pass (300 ms) later, and resolveSettled resolves the condition on the
+	// pass after that, by design (TestSettle_VMSettledResolvesOnceTheStoppedCopyIsGone
+	// pins when). A wait that first reads the row after that — a test
+	// goroutine descheduled for a second under load — finds it resolved, so
+	// the raise is read from ConfirmedAt, which the resolve keeps.
+	dest := runningOn(c, "pp-dual")[0]
 	eventually(t, 30*time.Second, "vm_settled and the partition.settle audit row on "+owner.Name, func() bool {
 		cond, ok, err := corrosion.GetHealthCondition(ctx, owner.DB, corrosion.PartitionPauseEvaluator,
 			corrosion.CondVMSettled, "vm", "pp-dual@"+owner.Name)
-		if err != nil || !ok || cond.Lifecycle != corrosion.ConditionConfirmed {
+		if err != nil || !ok || cond.ConfirmedAt == "" {
 			return false
+		}
+		if cond.Lifecycle != corrosion.ConditionConfirmed && cond.Lifecycle != corrosion.ConditionResolved {
+			return false
+		}
+		var ev struct {
+			Dest string `json:"dest"`
+		}
+		if json.Unmarshal([]byte(cond.Evidence), &ev) != nil || ev.Dest != dest {
+			t.Fatalf("vm_settled names destination %q, want %s (the copy that runs): %s", ev.Dest, dest, cond.Evidence)
 		}
 		rows, err := owner.DB.Query(ctx, `SELECT detail FROM audit_log WHERE action = 'partition.settle' AND target = 'pp-dual'`)
 		return err == nil && len(rows) > 0

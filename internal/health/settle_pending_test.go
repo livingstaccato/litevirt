@@ -1,8 +1,10 @@
 package health
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -448,5 +450,49 @@ func TestSettle_ARecordOfAnotherHostNameIsReportedNotWritten(t *testing.T) {
 	}
 	if _, ok := settlePendingFor(t, f); !ok {
 		t.Fatal("another host's record was removed")
+	}
+}
+
+// A record waiting on a copy that is neither live nor shut off says so, naming
+// the copy and the state observed, once per interval rather than every pass.
+//
+// Mutations: never log the wait — red; log on every pass — the count goes red.
+func TestSettle_AWaitingRecordIsReportedOncePerInterval(t *testing.T) {
+	f := newSettleFixture(t)
+	ctx := context.Background()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	now := time.Unix(1_800_000_000, 0)
+	o := &overrideState{Fake: f.virt, st: lv.DomainStatus{State: "stopping", Reason: "shutting-down"}}
+	r := NewReconciler("node-a", f.dataDir, f.db, o)
+	r.Now = func() time.Time { return now }
+	if err := newSettlePendingStore(f.dataDir).put(f.pendingFor(f.r)); err != nil {
+		t.Fatal(err)
+	}
+	waits := func() int {
+		n := 0
+		for _, line := range strings.Split(buf.String(), "\n") {
+			if strings.Contains(line, "wait until its copy is positively shut off") {
+				if !strings.Contains(line, "name=vm-a") || !strings.Contains(line, "observed=stopping/shutting-down") {
+					t.Fatalf("the wait line does not name the copy and its state: %s", line)
+				}
+				n++
+			}
+		}
+		return n
+	}
+	r.selfFence(ctx)
+	now = now.Add(time.Minute)
+	r.selfFence(ctx)
+	r.selfFence(ctx)
+	if n := waits(); n != 1 {
+		t.Fatalf("wait reported %d times within the interval, want 1", n)
+	}
+	now = now.Add(settleWaitLogEvery)
+	r.selfFence(ctx)
+	if n := waits(); n != 2 {
+		t.Fatalf("wait reported %d times after the interval, want 2", n)
 	}
 }

@@ -271,9 +271,7 @@ func (r *Reconciler) settleCertifiedMove(ctx context.Context, domName string, vm
 	slog.Warn("partition-settle: stopped a local copy that a certified recovery claim gave to another host",
 		"vm", domName, "host", r.hostName, "dest", p.DestHost, "proof", p.ID,
 		"claim_epoch", cert.Key.OwnerEpoch, "local_epoch", local.Epoch, "evidence", local.Source)
-	if err := RemovePauseRecord(r.dataDir, PauseKindVM, domName); err != nil {
-		slog.Warn("partition-settle: could not drop the pause record", "vm", domName, "error", err)
-	}
+	w.dropMatchingPause(rec)
 	return true, "", local
 }
 
@@ -387,9 +385,7 @@ func (p *PartitionPauser) settleContainer(ctx context.Context, rec PauseRecord) 
 	}
 	slog.Warn("partition-settle: stopped a local copy that a certified recovery claim gave to another host",
 		"ct", rec.Name, "host", p.host, "dest", dest, "proof", pr.ID, "claim_epoch", cert.Key.OwnerEpoch, "local_epoch", rec.OwnerEpoch)
-	if err := p.store.remove(rec.Kind, rec.Name); err != nil {
-		slog.Warn("partition-settle: could not drop the pause record", "ct", rec.Name, "error", err)
-	}
+	w.dropMatchingPause(pending)
 	return true, ""
 }
 

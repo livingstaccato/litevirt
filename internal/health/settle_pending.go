@@ -233,6 +233,27 @@ type settleRecorder struct {
 	// foreignLogged rate-limits the line for a record another host name wrote
 	// (file name → last logged).
 	foreignLogged sync.Map
+	// waitLogged rate-limits the line for a record waiting on a copy that is
+	// neither live nor shut off (file name → last logged).
+	waitLogged sync.Map
+}
+
+// settleWaitLogEvery is how often a record still waiting on its copy is
+// reported again.
+const settleWaitLogEvery = 10 * time.Minute
+
+// noteWaiting reports, at most once per settleWaitLogEvery per record, a
+// stopping-phase record whose copy is neither live nor positively shut off,
+// so an operator can see why its audit row has not arrived.
+func (w *settleRecorder) noteWaiting(rec settlePending, seen string) {
+	fn, _ := settlePendingFile(rec)
+	now := w.now()
+	if last, ok := w.waitLogged.Load(fn); ok && now.Sub(last.(time.Time)) < settleWaitLogEvery {
+		return
+	}
+	w.waitLogged.Store(fn, now)
+	slog.Warn("partition-settle: a settle's audit row and condition wait until its copy is positively shut off or gone",
+		"kind", rec.Kind, "name", rec.Name, "observed", seen, "proof", rec.Proof, "audit_id", rec.AuditID)
 }
 
 // foreignRecordLogEvery is how often a record left under another host name is
@@ -386,6 +407,7 @@ func (w *settleRecorder) retry(ctx context.Context, kind string, state func(name
 				}
 				continue
 			case copyUnproven:
+				w.noteWaiting(*rec, seen)
 				continue
 			}
 			if seen != "" && !rec.Audited && !strings.Contains(rec.Detail, "; found ") {
@@ -445,7 +467,7 @@ func vmSettleCopyState(defined map[string]bool, stateOf func(string) (lv.DomainS
 	}
 	st, err := stateOf(name)
 	if err != nil {
-		return copyUnproven, ""
+		return copyUnproven, "state unreadable: " + err.Error()
 	}
 	switch {
 	case st.State == RuntimeRunning || st.Reason == "paused" || st.Reason == "pmsuspended":
@@ -456,7 +478,7 @@ func vmSettleCopyState(defined map[string]bool, stateOf func(string) (lv.DomainS
 		}
 		return copyStopped, "shut off (reason " + st.Reason + ")"
 	}
-	return copyUnproven, ""
+	return copyUnproven, st.State + "/" + st.Reason
 }
 
 // retryPendingSettles completes this host's VM settle records
@@ -504,11 +526,11 @@ func (p *PartitionPauser) settleRec() *settleRecorder {
 // live; anything else, or a runtime that cannot be asked, is unproven.
 func (p *PartitionPauser) ctSettleCopyState(ctx context.Context, name string) (settleCopyState, string) {
 	if p.cts == nil {
-		return copyUnproven, ""
+		return copyUnproven, "no container runtime"
 	}
 	names, err := p.cts.List(ctx)
 	if err != nil {
-		return copyUnproven, ""
+		return copyUnproven, "runtime listing failed: " + err.Error()
 	}
 	listed := false
 	for _, n := range names {
@@ -522,7 +544,7 @@ func (p *PartitionPauser) ctSettleCopyState(ctx context.Context, name string) (s
 	}
 	st, err := p.cts.State(ctx, name)
 	if err != nil {
-		return copyUnproven, ""
+		return copyUnproven, "state unreadable: " + err.Error()
 	}
 	switch st {
 	case lxc.StateRunning:
@@ -530,7 +552,7 @@ func (p *PartitionPauser) ctSettleCopyState(ctx context.Context, name string) (s
 	case lxc.StateStopped:
 		return copyStopped, "stopped"
 	}
-	return copyUnproven, ""
+	return copyUnproven, "state " + string(st)
 }
 
 // retryPendingSettles completes this host's container settle records

@@ -189,3 +189,34 @@ func (s *Server) foreignDomainDiskPaths(name, self string) func(string) bool {
 		return false
 	}
 }
+
+// domainIsVMsOwn reports whether the domain of name on this host is the
+// runtime of the VM whose spec uuid is specUUID and whose row is at owner
+// epoch rowEpoch. Two positive identities count: the domain's uuid is the
+// VM's (every definer carries it), or its owner-epoch stamp is the row's
+// (a domain an older promotion or restore defined under a uuid libvirt chose
+// still carries the stamp its row's generation wrote). du is the domain's
+// uuid; err is set when the domain's uuid cannot be read at all, and then
+// nothing about it is known.
+func (s *Server) domainIsVMsOwn(name, specUUID string, rowEpoch int64) (own bool, du string, err error) {
+	x, xerr := s.virt.DumpXMLInactive(name)
+	if xerr != nil {
+		var lerr error
+		if x, lerr = s.virt.DumpXML(name); lerr != nil {
+			return false, "", fmt.Errorf("%v; live: %v", xerr, lerr)
+		}
+	}
+	du = domainUUIDFromXML(x)
+	if du == "" {
+		return false, "", fmt.Errorf("its definition names no uuid")
+	}
+	if specUUID != "" && du == specUUID {
+		return true, du, nil
+	}
+	if rowEpoch > 0 {
+		if e, ok, gerr := s.virt.GetDomainOwnerEpoch(name); gerr == nil && ok && e == rowEpoch {
+			return true, du, nil
+		}
+	}
+	return false, du, nil
+}

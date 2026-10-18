@@ -4817,18 +4817,27 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// cannot be stopped refuses the rebuild with the VM as it is.
 	if s.virt.DomainExists(req.Name) {
 		// Only this VM's own domain is stopped and undefined: a domain of the
-		// name with another uuid (a hand-made guest, or a runtime of another
-		// incarnation) is not this rebuild's to kill. Judged when both uuids
-		// can be read; a VM with no recorded uuid (a non-firmware import,
-		// whose uuid libvirt chose) has nothing to compare.
-		x, xerr := s.virt.DumpXMLInactive(req.Name)
-		if xerr != nil {
-			x, _ = s.virt.DumpXML(req.Name)
-		}
-		if du := domainUUIDFromXML(x); du != "" && spec.Uuid != "" && du != spec.Uuid {
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"cannot rebuild %q: the domain of the name on %s is not this VM's (uuid %s, the VM's is %s); nothing was changed",
-				req.Name, s.hostName, du, spec.Uuid)
+		// name that is another guest (hand-made, or a runtime of another
+		// incarnation) is not this rebuild's to kill. Its own is the one with
+		// its uuid, or with its row's owner-epoch stamp (domainIsVMsOwn). A VM
+		// with no recorded uuid (from before uuids were minted, or a
+		// non-firmware import, whose uuid libvirt chose) has nothing to
+		// compare, and is judged as before.
+		if spec.Uuid != "" {
+			own, du, ierr := s.domainIsVMsOwn(req.Name, spec.Uuid, vm.OwnerEpoch)
+			switch {
+			case ierr != nil:
+				// libvirt cannot say what the domain is: stopping it would
+				// stop whatever has the name.
+				return nil, status.Errorf(codes.Unavailable,
+					"cannot rebuild %q: the domain of the name on %s cannot be identified (%v); nothing was changed",
+					req.Name, s.hostName, ierr)
+			case !own:
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"cannot rebuild %q: the domain of the name on %s is not this VM's (uuid %s, the VM's is %s, and it carries "+
+						"no stamp of the VM's owner epoch %d); nothing was changed",
+					req.Name, s.hostName, du, spec.Uuid, vm.OwnerEpoch)
+			}
 		}
 		active, aerr := s.virt.DomainIsActive(req.Name)
 		if aerr != nil || active {

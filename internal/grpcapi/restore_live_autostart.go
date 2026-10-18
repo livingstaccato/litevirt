@@ -224,6 +224,13 @@ func (s *Server) autoDefineRestoredVM(
 	// the capability or the backup captured no firmware — booting a fresh-TPM VM
 	// would silently brick BitLocker.
 	fwVM := spec.SecureBoot || spec.Tpm
+	// A restore beside the original under a new name is a second VM, so it
+	// gets its own identity, as a clone does (a firmware VM always does,
+	// below); so does a spec that names none. A restore to the original's own
+	// name keeps it.
+	if !fwVM && (targetName != originalName || spec.Uuid == "") {
+		spec.Uuid = uuid.NewString()
+	}
 	// restoreOK gates the deferred firmware rollback below: a firmware VM that
 	// fails ANY step after materialization (bridge/XML/define/start/persist) must
 	// not strand name-keyed NVRAM + UUID-keyed swtpm that lifecycle code can't
@@ -362,8 +369,10 @@ func (s *Server) autoDefineRestoredVM(
 	// (name-keyed) + the fresh UUID whose swtpm dir we re-homed the state into.
 	if fwVM {
 		s.firmware.ApplyTo(&vmCfg, s.dataDir, targetName, spec.SecureBoot, spec.Tpm)
-		vmCfg.UUID = spec.Uuid
 	}
+	// The domain carries the VM's identity, firmware or not, as every definer
+	// does (a later rebuild knows it for the VM's own by it).
+	vmCfg.UUID = spec.Uuid
 	s.withNICMTU(&vmCfg)
 	domXML, err := lv.GenerateDomainXML(vmCfg)
 	if err != nil {

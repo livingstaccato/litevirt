@@ -16,6 +16,7 @@ package libvirtfake
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -455,6 +456,20 @@ func (f *Fake) DefineDomain(xmlConfig string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// libvirt gives every domain a uuid: one whose XML names none gets a
+	// generated one (the fake keeps an existing domain's on a redefine of
+	// the name, where libvirt would refuse the random one it generated). A
+	// test then sees the identity a real host would report.
+	if domainUUIDFromXML(xmlConfig) == "" {
+		u := ""
+		if _, ok := f.domains[name]; ok {
+			u = domainUUIDFromXML(f.liveXMLLocked(name))
+		}
+		if u == "" {
+			u = randomUUID()
+		}
+		xmlConfig = insertUUID(xmlConfig, name, u)
+	}
 	// libvirt refuses a definition whose UUID is already held by an ACTIVE domain
 	// under a different name. That is exactly what happens after undefining a
 	// RUNNING domain — it survives as a transient one, still holding its UUID — so
@@ -2938,4 +2953,24 @@ func (f *Fake) DropSecrets() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.secrets = nil
+}
+
+// randomUUID is a version-4 uuid, as libvirt generates for a domain whose XML
+// names none.
+func randomUUID() string {
+	var b [16]byte
+	_, _ = cryptorand.Read(b[:])
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// insertUUID puts <uuid>u</uuid> right after the domain's <name>.
+func insertUUID(xmlConfig, name, u string) string {
+	tag := "<name>" + name + "</name>"
+	if i := strings.Index(xmlConfig, tag); i >= 0 {
+		j := i + len(tag)
+		return xmlConfig[:j] + "<uuid>" + u + "</uuid>" + xmlConfig[j:]
+	}
+	return xmlConfig
 }

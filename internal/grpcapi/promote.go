@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -1018,6 +1019,13 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		return status.Errorf(codes.Internal, "parse vm spec: %v", err)
 	}
 	spec.Name = targetName
+	// A promotion to a new name is a second VM beside the original, so it
+	// gets its own identity, as a clone does: never the original's uuid,
+	// which NIC guards, the seed stamp and replicas key on, and which libvirt
+	// refuses for a second domain while the original's runs on this host.
+	if renamed {
+		spec.Uuid = uuid.NewString()
+	}
 	// The stored tuning is validated again (and dropped before the gate opens)
 	// so a record from before a rollback cannot define what the cluster refuses.
 	ioR, err := s.restrictRestoredTuning(ctx, &spec)
@@ -1208,17 +1216,37 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		if !req.Force {
 			return status.Errorf(codes.AlreadyExists, "domain %q already defined on %q; pass --force or --new-name", targetName, s.hostName)
 		}
-		// --force replaces only this VM's own domain: one of the name with
-		// another uuid is another guest, never this promotion's to stop.
-		// Judged when both uuids can be read.
-		x, xerr := s.virt.DumpXMLInactive(targetName)
-		if xerr != nil {
-			x, _ = s.virt.DumpXML(targetName)
+		// --force replaces the VM's own domain (its uuid, or its row's
+		// owner-epoch stamp: domainIsVMsOwn), running or not, and any other
+		// domain of the name only when it is positively stopped: undefining a
+		// stopped one keeps its storage, as a create removes a stopped domain
+		// with no record. One that runs, or whose state cannot be read, is
+		// another guest, never this promotion's to stop. For a renamed
+		// promotion no row of the name exists (checked above) and the VM's
+		// identity is the fresh uuid minted for it, so only a stopped leftover
+		// is replaced.
+		ownEpoch := int64(0)
+		if !renamed {
+			ownEpoch = vm.OwnerEpoch
 		}
-		if du := domainUUIDFromXML(x); du != "" && spec.Uuid != "" && du != spec.Uuid {
-			return status.Errorf(codes.FailedPrecondition,
-				"domain %q on %s is not this VM's (uuid %s, the VM's is %s); --force replaces only the VM's own domain; nothing was changed",
-				targetName, s.hostName, du, spec.Uuid)
+		own, du, ierr := s.domainIsVMsOwn(targetName, spec.Uuid, ownEpoch)
+		if spec.Uuid == "" && ierr == nil && !renamed {
+			own = true // a VM from before uuids were minted: judged as before
+		}
+		if !own {
+			active, aerr := s.virt.DomainIsActive(targetName)
+			if aerr != nil || active {
+				why := "it is running"
+				if aerr != nil {
+					why = fmt.Sprintf("whether it runs cannot be read (%v)", aerr)
+				}
+				if ierr != nil {
+					du = fmt.Sprintf("unidentified: %v", ierr)
+				}
+				return status.Errorf(codes.FailedPrecondition,
+					"domain %q on %s is not this VM's (uuid %s, the VM's is %s) and %s; --force replaces only the VM's own "+
+						"domain or a stopped one; nothing was changed", targetName, s.hostName, du, spec.Uuid, why)
+			}
 		}
 		replaceDomain = true
 	}
@@ -1637,6 +1665,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		attempt := func(disks []lv.DiskConfig) (string, error) {
 			cfg := lv.VMConfig{
 				Name: targetName, CPU: int(spec.Cpu), CPUMode: spec.CpuMode, CPUModel: spec.CpuModel,
+				// The domain carries the VM's identity, as every definer does,
+				// so a later rebuild or --force retry knows it for the VM's own.
+				UUID:      spec.Uuid,
 				MemoryMiB: int(spec.MemoryMib), Machine: spec.Machine, Firmware: spec.Firmware,
 				GuestAgent: spec.GuestAgent, EnableVNC: !spec.DisableVnc, EnableSPICE: spec.EnableSpice,
 				Disks: disks, Networks: netCfg, Boot: spec.Boot,

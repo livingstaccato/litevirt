@@ -2077,7 +2077,10 @@ A hold over a row at incarnation 1 or higher, and a hold raised at runtime
 its old database, or a host whose certificate was renewed while it was down.
 It clears once the host's replica receives the re-admission from a peer. If it
 does not clear, check that a peer is reachable from the host and that the
-peer's `lv host inspect <name>` shows the installed serial.
+peer's `lv host inspect <name>` shows the installed serial. When
+`installed_serial` is neither the recorded serial nor a renewal of it, the
+cluster will never send that row: run `lv host renew-cert` from the recorded
+certificate, or remove the host and add it again.
 
 **`reason` `superseded`** is a host whose admission another `lv host add` of
 the same name replaced. Peers no longer accept its certificate. To recover:

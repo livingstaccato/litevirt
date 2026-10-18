@@ -282,10 +282,12 @@ func incStaleCycle(t *testing.T, c *Cluster, gates map[string]*health.Checker, d
 
 	// d's daemon starts on its old database, before it has heard anything.
 	if noHold {
+		// Over a counted stale row (the second cycle) the writer itself
+		// refuses the re-record: that row is another admission's.
 		if err := corrosion.RegisterHost(ctx, d.DB, corrosion.HostRecord{
 			Name: d.Name, Address: d.Address, SSHUser: "root", SSHPort: 22, GRPCPort: d.Port,
 			State: "active", CertSerial: serial, FenceStrategy: "best-effort",
-		}); err != nil {
+		}); err != nil && !(want >= 2 && errors.Is(err, corrosion.ErrReRecordAtCountedRow)) {
 			t.Fatalf("register %s: %v", d.Name, err)
 		}
 		if err := corrosion.UpdateHostStartup(ctx, d.DB, d.Name, "active", "v-stale-db", 24, 48, 96, true); err != nil {
@@ -669,23 +671,37 @@ func TestFleet_HostIncarnation_RenewalOfAReaddedHost(t *testing.T) {
 		t.Fatal(err)
 	}
 	prev := strings.ToLower(prevCert.SerialNumber.Text(16))
+	// b hears neither d nor a while d renews, so it keeps the pre-renewal row.
 	c.SetLinkFaultBoth(d, b, LinkFault{Block: true})
-	if err := cli.RenewHostCertOn(ctx, c.SelfClient(a), &cli.LocalRemotePKI{Dir: d.PKIDir},
-		cli.GRPCProbe(d.Address, d.Port), d.Name, cli.RenewCertOptions{Wait: 20 * time.Second, Force: true}); err != nil {
-		t.Fatalf("renew-cert %s: %v", d.Name, err)
+	c.SetLinkFaultBoth(a, b, LinkFault{Block: true})
+	// Renew until b's pre-renewal serial sorts above the renewal: the order
+	// in which ordering rows by serial would revert it (m-2 of re-review 1).
+	var next string
+	for i := 0; i < 8; i++ {
+		if err := cli.RenewHostCertOn(ctx, c.SelfClient(a), &cli.LocalRemotePKI{Dir: d.PKIDir},
+			cli.GRPCProbe(d.Address, d.Port), d.Name, cli.RenewCertOptions{Wait: 20 * time.Second, Force: true}); err != nil {
+			t.Fatalf("renew-cert %s: %v", d.Name, err)
+		}
+		nextCert, err := pki.ServedHostCertificate(d.PKIDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		next = strings.ToLower(nextCert.SerialNumber.Text(16))
+		eventually(t, convergeTimeout, a.Name+" to record the renewal", func() bool {
+			_, rec, _, _ := hostRowOf(t, a, d.Name)
+			return strings.EqualFold(rec, next)
+		})
+		if strings.Compare(prev, next) > 0 {
+			break
+		}
 	}
-	nextCert, err := pki.ServedHostCertificate(d.PKIDir)
-	if err != nil {
-		t.Fatal(err)
+	if strings.Compare(prev, next) <= 0 {
+		t.Skipf("eight renewals never produced a serial below %s", prev)
 	}
-	next := strings.ToLower(nextCert.SerialNumber.Text(16))
-	if next == prev {
-		t.Fatal("the certificate did not change")
+	if _, rec, _, _ := hostRowOf(t, b, d.Name); !strings.EqualFold(rec, prev) {
+		t.Fatalf("precondition: %s already holds %s, want the pre-renewal %s", b.Name, rec, prev)
 	}
-	eventually(t, convergeTimeout, a.Name+" to record the renewal", func() bool {
-		_, rec, _, _ := hostRowOf(t, a, d.Name)
-		return strings.EqualFold(rec, next)
-	})
+	c.SetLinkFaultBoth(a, b, LinkFault{})
 	// b still holds the pre-renewal copy; anti-entropy both ways.
 	for i := 0; i < 3; i++ {
 		corrosion.NewAntiEntropy(a.DB, a.PKIDir, 0).RunOnce(ctx)

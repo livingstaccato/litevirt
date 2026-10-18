@@ -30,12 +30,17 @@ import (
 // litevirt:
 //
 //  1. The first run copies the data disk whole (a raw replica) and leaves a
-//     libvirt checkpoint lvrepl-data-<run> whose bitmap is on the data disk.
+//     libvirt checkpoint lvrepl-data-<run> whose persistent bitmap is on the
+//     data disk, as qemu reports it (query-block). A running qemu writes the
+//     bitmap into the qcow2 header only when it closes the image, so
+//     qemu-img info -U cannot see it yet.
 //  2. Two later runs are incremental (their disk.replicated events say so),
 //     each superseding the last checkpoint: only the newest is left.
-//  3. After `lv stop --force` (qemu killed; the writes flushed first) and a
+//  3. After qemu is killed with SIGKILL (the writes flushed first) and a
 //     start, the next run is not incremental: an unclean stop leaves the
-//     bitmap inconsistent, which libvirt refuses.
+//     bitmap inconsistent, which libvirt refuses. `lv stop --force` is not
+//     unclean enough: libvirt's destroy sends SIGTERM first, and qemu then
+//     closes the image and stores the bitmap.
 //  4. After a clean `lv stop` and a start, the next run IS incremental: the
 //     bitmap persisted.
 //  5. After a live detach and reattach of the same file (virsh), the next
@@ -199,13 +204,14 @@ func TestReplication_IncrementalDataDisk(t *testing.T) {
 	checkpoints := func() []string {
 		return strings.Fields(l.mustSSH(h, 30*time.Second, "virsh checkpoint-list "+shellQuote(vm)+" --name"))
 	}
-	restart := func(force bool) {
+	restart := func(kill bool) {
 		t.Helper()
 		args := []string{"stop", vm}
-		if force {
-			args = append(args, "--force")
-		}
-		if out, err := l.lv(h, args...); err != nil {
+		if kill {
+			args = []string{"kill -9 (qemu)"}
+			l.mustSSH(h, 30*time.Second, "kill -9 \"$(cat "+shellQuote("/run/libvirt/qemu/"+vm+".pid")+")\"")
+			l.mark("incr: killed the qemu of %s with SIGKILL", vm)
+		} else if out, err := l.lv(h, args...); err != nil {
 			t.Fatalf("lv %v: %v\n%s", args, err, out)
 		}
 		if !l.waitDomainState(h, vm, "shut off", 4*time.Minute) {
@@ -235,8 +241,8 @@ func TestReplication_IncrementalDataDisk(t *testing.T) {
 	if cps := checkpoints(); !containsString(cps, cp1) {
 		t.Fatalf("no checkpoint %s on %s after the first run (checkpoints %v)", cp1, vm, cps)
 	}
-	if info := l.mustSSH(h, 30*time.Second, "qemu-img info -U --output=json "+shellQuote(data)); !strings.Contains(info, cp1) {
-		t.Errorf("the data disk carries no bitmap %s: %s", cp1, info)
+	if info := l.mustSSH(h, 30*time.Second, "virsh qemu-monitor-command "+shellQuote(vm)+` '{"execute":"query-block"}' | tr -d ' \n'`); !strings.Contains(info, `"name":"`+cp1+`","recording":true,"persistent":true`) {
+		t.Errorf("the data disk carries no persistent bitmap %s: %s", cp1, info)
 	}
 
 	// 2. Two incremental runs.

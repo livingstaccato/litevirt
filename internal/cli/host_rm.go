@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -197,8 +198,8 @@ func orDash(s string) string {
 // now is most likely a voter's link or the currency pull failing for a
 // moment: it is retried after each removeRetryBackoff wait, and one that is
 // still Unavailable names rerun, which finishes it (the revocation is already
-// in place). A NotFound on a retry is the removal itself, made by an attempt
-// whose reply was lost. Any other refusal is returned at once.
+// in place). A NotFound on a retry, for a host no longer listed, is the
+// removal itself. Any other refusal is returned at once.
 func removeAfterRevoke(ctx context.Context, c pb.LiteVirtClient, req *pb.RemoveHostRequest, rerun string) (*pb.RemoveHostResponse, error) {
 	for attempt := 0; ; attempt++ {
 		removed, err := c.RemoveHost(ctx, req)
@@ -206,10 +207,17 @@ func removeAfterRevoke(ctx context.Context, c pb.LiteVirtClient, req *pb.RemoveH
 			return removed, nil
 		}
 		// The host was there when this command began, so a NotFound on a
-		// retry is an earlier attempt's removal whose reply was lost.
+		// retry may be an earlier attempt's removal whose reply was lost. A
+		// daemon also answers NotFound when it could not read the row, so
+		// the host must be absent from a fresh list to count as removed.
 		if attempt > 0 && status.Code(err) == codes.NotFound {
-			fmt.Printf("  an earlier attempt removed %s; its reply was lost\n", req.GetName())
-			return &pb.RemoveHostResponse{}, nil
+			if _, lerr := hostCertSerial(ctx, c, req.GetName()); errors.Is(lerr, errHostNotListed) {
+				fmt.Printf("  %s is no longer in the cluster: an earlier attempt whose reply was lost removed it, "+
+					"or another removal did\n", req.GetName())
+				return &pb.RemoveHostResponse{}, nil
+			}
+			return nil, fmt.Errorf("remove host after publishing its certificate revocation: %w\n"+
+				"the certificate is revoked; run `%s` to finish the removal", err, rerun)
 		}
 		if status.Code(err) != codes.Unavailable {
 			return nil, fmt.Errorf("remove host after publishing its certificate revocation: %w", err)
@@ -286,6 +294,10 @@ func publishClusterCRL(ctx context.Context, c pb.LiteVirtClient, pkiDir string) 
 	return resp.Version, nil
 }
 
+// errHostNotListed is hostCertSerial's answer for a host ListHosts does not
+// list (removed, or never there).
+var errHostNotListed = errors.New("host is not present")
+
 // hostCertSerial reads a host's certificate serial, best-effort: a removal must not
 // be blocked by a lookup, and a missing serial only costs the revocation.
 func hostCertSerial(ctx context.Context, c pb.LiteVirtClient, hostName string) (string, error) {
@@ -301,7 +313,7 @@ func hostCertSerial(ctx context.Context, c pb.LiteVirtClient, hostName string) (
 			return h.CertSerial, nil
 		}
 	}
-	return "", fmt.Errorf("host is not present")
+	return "", errHostNotListed
 }
 
 // closeRemovedHostAuditContract retires the removed host's live audit signing

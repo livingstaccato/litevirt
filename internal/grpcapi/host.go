@@ -1727,7 +1727,11 @@ func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostReques
 		return nil, 0, err
 	}
 	h, err := corrosion.GetHost(ctx, s.db, req.Name)
-	if err != nil || h == nil {
+	if err != nil {
+		// Not NotFound: `lv host rm` reads that on a retry as its own removal.
+		return nil, 0, status.Errorf(codes.Unavailable, "read host %q: %v", req.Name, err)
+	}
+	if h == nil {
 		return nil, 0, status.Errorf(codes.NotFound, "host %q not found", req.Name)
 	}
 	// A current voter keeps its vote whatever its hosts row says, so deleting
@@ -1748,7 +1752,9 @@ func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostReques
 	if err := s.pullHostsNow(ctx, "remove", req.Name); err != nil {
 		return nil, 0, err
 	}
-	if h, err = corrosion.GetHost(ctx, s.db, req.Name); err != nil || h == nil {
+	if h, err = corrosion.GetHost(ctx, s.db, req.Name); err != nil {
+		return nil, 0, status.Errorf(codes.Unavailable, "read host %q: %v", req.Name, err)
+	} else if h == nil {
 		return nil, 0, status.Errorf(codes.NotFound, "host %q not found", req.Name)
 	}
 	if want := req.GetExpectedCertSerial(); want != "" && !strings.EqualFold(want, h.CertSerial) {

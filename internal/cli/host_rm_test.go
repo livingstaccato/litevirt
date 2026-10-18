@@ -32,6 +32,8 @@ type hostRemoveTestClient struct {
 	// removeErrs are RemoveHost's answers, one per call, before it succeeds.
 	removeErrs []error
 	planVoter  bool
+	// goneAfterRemove lists no host once RemoveHost has been called.
+	goneAfterRemove bool
 }
 
 func (c *hostRemoveTestClient) PlanDeadHostRemoval(_ context.Context, req *pb.PlanDeadHostRemovalRequest, _ ...grpc.CallOption) (*pb.PlanDeadHostRemovalResponse, error) {
@@ -55,6 +57,9 @@ func (c *hostRemoveTestClient) GetVoterConfig(context.Context, *pb.GetVoterConfi
 }
 
 func (c *hostRemoveTestClient) ListHosts(context.Context, *pb.ListHostsRequest, ...grpc.CallOption) (*pb.ListHostsResponse, error) {
+	if c.goneAfterRemove && countCalls(c.calls, "remove") > 0 {
+		return &pb.ListHostsResponse{}, nil
+	}
 	return &pb.ListHostsResponse{Hosts: []*pb.Host{{Name: "node-9", CertSerial: "a1b2c3"}}}, nil
 }
 
@@ -514,9 +519,10 @@ func TestHostRemove_RetriesTheRemovalAfterTheRevocation(t *testing.T) {
 // the command reports success; a NotFound on the first attempt is still an
 // error, since nothing this command did removed the host.
 //
-// Mutation: treat NotFound as a refusal on every attempt — "reply lost"
+// Mutations: treat NotFound as a refusal on every attempt — "reply lost"
 // fails; on every attempt as success — "first attempt" passes a removal
-// this command never made.
+// this command never made; skip the ListHosts check — "still listed"
+// reports a live host removed.
 func TestHostRemove_ARetryAfterALostReplyIsTheRemoval(t *testing.T) {
 	old := removeRetryBackoff
 	removeRetryBackoff = []time.Duration{0, 0}
@@ -532,9 +538,19 @@ func TestHostRemove_ARetryAfterALostReplyIsTheRemoval(t *testing.T) {
 		}
 		t.Run(fmt.Sprintf("reply lost dead=%v", dead), func(t *testing.T) {
 			rmTestPKI(t)
-			c := &hostRemoveTestClient{removeErrs: []error{unavailable, notFound}}
+			c := &hostRemoveTestClient{removeErrs: []error{unavailable, notFound}, goneAfterRemove: true}
 			if err := run(c); err != nil {
 				t.Errorf("a removal whose first reply was lost: %v", err)
+			}
+		})
+		// fd review I2: the daemon also answers NotFound when it could not
+		// read the row. A host still listed is not removed.
+		t.Run(fmt.Sprintf("still listed dead=%v", dead), func(t *testing.T) {
+			rmTestPKI(t)
+			c := &hostRemoveTestClient{removeErrs: []error{unavailable, notFound}}
+			err := run(c)
+			if err == nil || !strings.Contains(err.Error(), "the certificate is revoked; run") {
+				t.Errorf("a NotFound for a host still listed = %v, want the rerun", err)
 			}
 		})
 		t.Run(fmt.Sprintf("first attempt dead=%v", dead), func(t *testing.T) {

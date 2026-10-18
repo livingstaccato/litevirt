@@ -197,7 +197,7 @@ func TestProbeSynFlood_ChecksTheRenderedShape(t *testing.T) {
 	var sets, lines strings.Builder
 	renderSynFloodSets(&sets, p)
 	renderSynFloodLines(&lines, p)
-	for _, want := range []string{sets.String(), lines.String(), "set " + setNICDevs, "set " + setLBSrc4} {
+	for _, want := range []string{sets.String(), lines.String(), "set " + setNICDevs} {
 		if !strings.Contains(got, want) {
 			t.Errorf("probe ruleset lacks %q:\n%s", want, got)
 		}

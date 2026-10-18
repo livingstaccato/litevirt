@@ -64,35 +64,40 @@ func renderSynFloodSets(b *strings.Builder, p Plan) {
 // immediately before its nic_in_ dispatch. `meta protocol` comes first, so
 // the bridge family adds no implicit `ether type` (which would miss a trunk's
 // tagged SYNs), and `meta l4proto tcp` finds TCP behind IPv6 extension
-// headers. The load balancer's sources are exempt. The comment ends the rule:
-// nft refuses a verdict after it.
+// headers. No source is exempt: the load balancer's flows to its backends are
+// accepted earlier in the chain, by (source, backend, port). An IPv6 source
+// is keyed by its /64, so one host rotating addresses within its prefix
+// shares one budget. The comment ends the rule: nft refuses a verdict after
+// it.
 func renderSynFloodLines(b *strings.Builder, p Plan) {
 	if !p.SynFlood.On {
 		return
 	}
 	limit := fmt.Sprintf("limit rate over %d/second burst %d packets", p.SynFlood.Rate, p.SynFlood.Burst)
-	for _, f := range []struct{ fam, ip, set, exempt, n string }{
-		{"ip", "ip", setSyn4, fmt.Sprintf(" ip saddr != @%s", setLBSrc4), "4"},
-		{"ip6", "ip6", setSyn6, "", "6"},
+	for _, f := range []struct{ fam, set, key, n string }{
+		{"ip", setSyn4, "ip saddr", "4"},
+		{"ip6", setSyn6, "ip6 saddr & " + synFloodV6Mask, "6"},
 	} {
 		action := "counter drop comment " + quoteComment(SynFloodComment+" "+f.n)
 		if p.nicMode() == NICModeObserve {
 			action = verdict(p, "-", "in", "synflood")
 		}
-		fmt.Fprintf(b, "        oifname @%s meta protocol %s meta l4proto tcp tcp flags & (fin|syn|rst|ack) == syn%s update @%s { oifname . %s saddr %s } %s\n",
-			setNICDevs, f.fam, f.exempt, f.set, f.ip, limit, action)
+		fmt.Fprintf(b, "        oifname @%s meta protocol %s meta l4proto tcp tcp flags & (fin|syn|rst|ack) == syn update @%s { oifname . %s %s } %s\n",
+			setNICDevs, f.fam, f.set, f.key, limit, action)
 	}
 }
 
+// synFloodV6Mask keys an IPv6 source by its /64.
+const synFloodV6Mask = "ffff:ffff:ffff:ffff::"
+
 // ProbeSynFlood asks the kernel, without loading anything, whether it accepts
-// the renderer's own SYN-flood sets and lines (ProbeRuleset): the sets they
+// the renderer's own SYN-flood sets and lines (ProbeRuleset): the set they
 // name, the meters, and one line per family in a forward chain. The daemon
 // runs it once at start (LoaderOptions.SynFloodProbe).
 func ProbeSynFlood(ctx context.Context) error {
 	p := Plan{SynFlood: SynFlood{On: true, Rate: corrosion.SynfloodDefaultRate, Burst: corrosion.SynfloodDefaultBurst}}
 	var b strings.Builder
 	renderIfnameSet(&b, setNICDevs, nil)
-	renderAddrSet(&b, setLBSrc4, "ipv4_addr", nil)
 	renderSynFloodSets(&b, p)
 	b.WriteString("    chain forward {\n        type filter hook forward priority 0; policy accept;\n")
 	renderSynFloodLines(&b, p)

@@ -50,22 +50,48 @@ type UpgradeOpts struct {
 	SkipPreStage []string
 }
 
-// checkSkipPreStage refuses a --skip-prestage name that is not a member, or
-// that is a target: a target is always pre-staged before its swap.
-func checkSkipPreStage(opts UpgradeOpts, hosts []*pb.Host, filterSet map[string]bool) error {
-	members := make(map[string]bool, len(hosts))
-	for _, h := range hosts {
-		members[h.Name] = true
+// checkSkipPreStage refuses --skip-prestage without the pre-stage pass, and
+// a name that is not a member this upgrade would pre-stage without swapping:
+// a target is always pre-staged before its swap, and a member already on the
+// binary's build is neither swapped nor pre-staged.
+func checkSkipPreStage(opts UpgradeOpts, hosts, targets, others []*pb.Host) error {
+	if len(opts.SkipPreStage) == 0 {
+		return nil
+	}
+	if opts.NoPreStage {
+		return fmt.Errorf("--skip-prestage has no effect with --no-prestage, which pre-stages no host; pass one or the other")
+	}
+	find := func(list []*pb.Host, name string) *pb.Host {
+		for _, h := range list {
+			if h.Name == name {
+				return h
+			}
+		}
+		return nil
 	}
 	for _, n := range opts.SkipPreStage {
+		h := find(hosts, n)
 		switch {
-		case !members[n]:
+		case h == nil:
 			return fmt.Errorf("--skip-prestage %s: %s is not a member (lv host ls)", n, n)
-		case len(filterSet) == 0 || filterSet[n]:
+		case find(targets, n) != nil:
 			return fmt.Errorf("--skip-prestage %s: %s is a target of this upgrade; only a member outside it can be skipped", n, n)
+		case find(others, n) == nil:
+			return fmt.Errorf("--skip-prestage %s: %s already runs %s, the binary's version, so this upgrade neither swaps nor pre-stages it",
+				n, n, versionLabel(h.Version))
 		}
 	}
 	return nil
+}
+
+// sameBuild reports whether a member running version runs the build probed
+// from the binary. Only a version that names one commit says so: not an
+// unprobed binary, not "dev", and not a -dirty tree.
+func sameBuild(probed, version string) bool {
+	if probed == "" || probed == "dev" || strings.HasSuffix(probed, "-dirty") {
+		return false
+	}
+	return version == probed
 }
 
 func skipSet(names []string) map[string]bool {
@@ -146,10 +172,6 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 	var selfTarget *pb.Host      // the connected host — upgraded last
 	var others []*pb.Host        // members left on their binary — pre-staged only
 
-	if err := checkSkipPreStage(opts, resp.Hosts, filterSet); err != nil {
-		return err
-	}
-
 	for _, h := range resp.Hosts {
 		current := targetVersion != "" && h.Version == targetVersion
 		if named && !filterSet[h.Name] {
@@ -157,7 +179,7 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 			// Only a probed version says so: the connected daemon's says
 			// nothing about the binary, so without one every member is
 			// pre-staged.
-			if probedVersion == "" || h.Version != probedVersion {
+			if !sameBuild(probedVersion, h.Version) {
 				others = append(others, h)
 			}
 			continue
@@ -182,6 +204,10 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 	targets := remoteTargets
 	if selfTarget != nil {
 		targets = append(targets, selfTarget)
+	}
+
+	if err := checkSkipPreStage(opts, resp.Hosts, targets, others); err != nil {
+		return err
 	}
 
 	if len(targets) == 0 {

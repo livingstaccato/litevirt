@@ -1832,8 +1832,9 @@ swapped, so you can fix it and re-run.
 An upgrade of some hosts (`lv host upgrade host-b`) pre-stages **every other
 member** too, and leaves their binaries alone: a member left on the old
 schema refuses every push from an upgraded host. A member is skipped only
-when it already runs the version `lv` probed from `--binary`; when the binary
-cannot be probed (built for another architecture), every member is
+when it already runs the version `lv` probed from `--binary`, and that
+version names one build: a `dev` build or a `-dirty` tree never matches. When
+the binary cannot be probed (built for another architecture), every member is
 pre-staged.
 
 A pre-staged host advertises the new schema at once, so the upgrade first
@@ -1851,11 +1852,18 @@ refuses replication from every upgraded host once it is back, until
 on every node running this release or later. `--force` only skips preflight
 blocks; it does not pass a member that cannot be pre-staged.
 
-If a pre-stage fails after every member answered, the hosts already
-pre-staged stay at the new schema (it cannot be undone), the rest are still
-pre-staged, and the refusal names them and the host that failed. That host
-refuses their pushes until it is pre-staged: fix it and re-run, or
-`lv host upgrade <host>`.
+Every member is probed in parallel, a few at a time.
+
+If a pre-stage fails after every member answered (a full disk, or a binary
+built for another architecture), the hosts already pre-staged stay at the new
+schema (it cannot be undone), the rest are still pre-staged, and the refusal
+names them and the host that failed. That host refuses their pushes until it
+is pre-staged: fix it and re-run, re-run with a binary built for that host,
+or, for a member outside the upgrade, proceed without it with
+`--skip-prestage <host>` and pre-stage it later. While it refuses, `lv health`
+reports `replication_peer_schema_behind` only on nodes running this release
+or later: on the rollout into this release every node still runs the old one,
+so the refusal printed by `lv host upgrade` is the only sign.
 
 A member pre-staged without its binary keeps running, and restarts safely,
 on its old binary: that binary starts on the newer schema. Two things stay

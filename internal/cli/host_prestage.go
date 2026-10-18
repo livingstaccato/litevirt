@@ -7,6 +7,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -45,8 +46,9 @@ func preStageSchema(ctx context.Context, client pb.LiteVirtClient, targets, othe
 	var unsupported, behind []string
 	refused := map[string]string{}
 	var refusedTargets, refusedOthers []string
-	for _, h := range targets {
-		switch err := probeMember(ctx, client, h); {
+	probes := probeAll(ctx, client, append(slices.Clone(targets), others...))
+	for i, h := range targets {
+		switch err := probes[i]; {
 		case err == nil:
 			stageTargets = append(stageTargets, h)
 		case status.Code(err) == codes.Unimplemented:
@@ -56,8 +58,8 @@ func preStageSchema(ctx context.Context, client pb.LiteVirtClient, targets, othe
 			refusedTargets = append(refusedTargets, h.Name)
 		}
 	}
-	for _, h := range others {
-		err := probeMember(ctx, client, h)
+	for i, h := range others {
+		err := probes[len(targets)+i]
 		switch {
 		case err == nil:
 			stageOthers = append(stageOthers, h)
@@ -112,7 +114,7 @@ func preStageSchema(ctx context.Context, client pb.LiteVirtClient, targets, othe
 		stage(h, false)
 	}
 	if len(failed) > 0 {
-		return stageFailure(failedOrder, failed, prestaged, stagedSchema)
+		return stageFailure(failedOrder, failed, prestaged, stagedSchema, targets)
 	}
 
 	switch {
@@ -134,6 +136,25 @@ func preStageSchema(ctx context.Context, client pb.LiteVirtClient, targets, othe
 	}
 	fmt.Println()
 	return nil
+}
+
+// probeAll probes hosts in parallel, at most probeParallelism at once, and
+// returns each one's error in the order given.
+func probeAll(ctx context.Context, client pb.LiteVirtClient, hosts []*pb.Host) []error {
+	errs := make([]error, len(hosts))
+	sem := make(chan struct{}, probeParallelism)
+	var wg sync.WaitGroup
+	for i, h := range hosts {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			errs[i] = probeMember(ctx, client, h)
+		}()
+	}
+	wg.Wait()
+	return errs
 }
 
 // probeMember checks, changing nothing, that h answers the upgrade RPCs
@@ -182,8 +203,13 @@ func probeRefusal(targets []*pb.Host, refusedTargets, refusedOthers []string, re
 }
 
 // stageFailure is the error for hosts whose pre-stage failed after every
-// probe answered. A pre-stage cannot be undone, so it says what is left.
-func stageFailure(failedOrder []string, failed map[string]string, prestaged []string, stagedSchema int32) error {
+// probe answered. A pre-stage cannot be undone, so it says what is left, and
+// the ways out that work: the same binary fails the same way on a re-run.
+func stageFailure(failedOrder []string, failed map[string]string, prestaged []string, stagedSchema int32, targets []*pb.Host) error {
+	isTarget := map[string]bool{}
+	for _, h := range targets {
+		isTarget[h.Name] = true
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "pre-stage failed on %d host(s); no binary was swapped:", len(failedOrder))
 	for _, name := range failedOrder {
@@ -192,16 +218,22 @@ func stageFailure(failedOrder []string, failed map[string]string, prestaged []st
 	if len(prestaged) > 0 {
 		sorted := slices.Clone(prestaged)
 		slices.Sort(sorted)
-		fmt.Fprintf(&b, "\n  %s are pre-staged at %s (they keep running, and restart safely, on their binary). ",
+		fmt.Fprintf(&b, "\n  %s are pre-staged at %s (they keep running, and restart safely, on their binary).",
 			strings.Join(sorted, ", "), schemaLabel(stagedSchema))
-		for _, name := range failedOrder {
-			fmt.Fprintf(&b, "%s refuses replication from them until it is pre-staged or upgraded "+
-				"(fix it and re-run, or lv host upgrade %s). ", name, name)
-		}
 	} else {
-		b.WriteString("\n  Nothing was pre-staged. Resolve and re-run.")
+		b.WriteString("\n  Nothing was pre-staged.")
 	}
-	return fmt.Errorf("%s", strings.TrimSpace(b.String()))
+	for _, name := range failedOrder {
+		if isTarget[name] {
+			fmt.Fprintf(&b, "\n  %s: fix it and re-run, re-run with a binary built for that host if the binary is "+
+				"the cause, or leave it out of this upgrade.", name)
+			continue
+		}
+		fmt.Fprintf(&b, "\n  %s refuses replication from every pre-staged host until it is pre-staged: fix it and "+
+			"re-run, re-run with a binary built for that host if the binary is the cause, or proceed without it "+
+			"(--skip-prestage %s) and pre-stage it later.", name, name)
+	}
+	return fmt.Errorf("%s", b.String())
 }
 
 func schemaLabel(v int32) string {
@@ -257,3 +289,6 @@ func sendUpgradeStream(stream grpc.ClientStreamingClient[pb.UpgradeHostRequest, 
 	}
 	return stream.CloseAndRecv()
 }
+
+// probeParallelism bounds the probes in flight at once.
+const probeParallelism = 8

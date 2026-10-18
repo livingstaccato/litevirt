@@ -2,11 +2,14 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -314,6 +317,33 @@ func TestHostUpgrade_SkipPreStage(t *testing.T) {
 		t.Fatalf("pre-staged %v, want %v: a named member that answers is pre-staged anyway", client.preStaged, want)
 	}
 
+	// A named member that answers its probe but fails its pre-stage is left
+	// behind with a warning, as one that does not answer is.
+	client = &perHostPreStageClient{
+		mockUpgradeClient: &mockUpgradeClient{
+			stream: &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok"}}, hosts: hosts(),
+		},
+		failStage: map[string]error{"node2": status.Error(codes.Internal, "exec format error")},
+	}
+	if err := HostUpgrade(context.Background(), client, UpgradeOpts{
+		BinaryPath: bin, HostNames: []string{"node1"}, Yes: true, SkipPreStage: []string{"node2"},
+	}); err != nil {
+		t.Fatalf("--skip-prestage node2 whose pre-stage fails: %v", err)
+	}
+	if want := []string{"node1"}; !slices.Equal(client.preStaged, want) {
+		t.Fatalf("pre-staged %v, want %v", client.preStaged, want)
+	}
+
+	// --skip-prestage means nothing without the pre-stage pass.
+	client = &perHostPreStageClient{mockUpgradeClient: &mockUpgradeClient{
+		stream: &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok"}}, hosts: hosts(),
+	}}
+	if err := HostUpgrade(context.Background(), client, UpgradeOpts{
+		BinaryPath: bin, HostNames: []string{"node1"}, Yes: true, NoPreStage: true, SkipPreStage: []string{"node2"},
+	}); err == nil || !strings.Contains(err.Error(), "--no-prestage") {
+		t.Errorf("--skip-prestage with --no-prestage: err %v, want a refusal naming --no-prestage", err)
+	}
+
 	for _, tc := range []struct{ skip, want string }{
 		{"node1", "node1 is a target"},
 		{"node9", "node9 is not a member"},
@@ -361,15 +391,108 @@ func TestHostUpgrade_PreStageFailureAfterProbeSaysWhatItLeft(t *testing.T) {
 	if want := []string{"node1", "node3"}; !slices.Equal(client.preStaged, want) {
 		t.Fatalf("pre-staged %v, want every other member %v", client.preStaged, want)
 	}
-	for _, want := range []string{"disk full", "node1, node3", "node2 refuses", "lv host upgrade node2"} {
+	for _, want := range []string{"disk full", "node1, node3", "node2 refuses", "--skip-prestage node2", "built for that host"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal %q does not contain %q", err, want)
 		}
+	}
+	// Upgrading node2 with this binary fails the same way: not an escape.
+	if strings.Contains(err.Error(), "lv host upgrade node2") {
+		t.Errorf("refusal %q offers lv host upgrade node2, which fails the same way", err)
 	}
 	if strings.Contains(err.Error(), "Nothing was pre-staged") {
 		t.Errorf("refusal %q claims nothing changed after hosts were pre-staged", err)
 	}
 	if len(activate.sent) != 0 {
 		t.Errorf("%d activate chunk(s) sent; no binary may be swapped", len(activate.sent))
+	}
+}
+
+// In all-hosts mode a host already on the binary's version is neither swapped
+// nor pre-staged; naming it in --skip-prestage says that, not "a target".
+func TestHostUpgrade_SkipPreStageCurrentHostInAllMode(t *testing.T) {
+	bin := writeVersionedBinary(t, "v2.0.0")
+	client := &perHostPreStageClient{mockUpgradeClient: &mockUpgradeClient{
+		stream: &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok"}},
+		hosts: []*pb.Host{
+			{Name: "node1", Address: "10.0.0.1", Version: "v1.0.0"},
+			{Name: "node2", Address: "10.0.0.2", Version: "v2.0.0"},
+		},
+	}}
+	err := HostUpgrade(context.Background(), client, UpgradeOpts{BinaryPath: bin, Yes: true, SkipPreStage: []string{"node2"}})
+	if err == nil || !strings.Contains(err.Error(), "node2 already runs v2.0.0") || strings.Contains(err.Error(), "is a target") {
+		t.Fatalf("err %v, want it to say node2 already runs v2.0.0", err)
+	}
+	if len(client.preStaged) != 0 {
+		t.Fatalf("pre-staged %v before refusing", client.preStaged)
+	}
+}
+
+// A version that does not name one build (a "dev" build, or a -dirty tree)
+// never marks a member current: it is pre-staged.
+func TestHostUpgrade_DevOrDirtyVersionPreStagesTheMember(t *testing.T) {
+	for _, v := range []string{"dev", "v1.9.0-3-gabc1234-dirty"} {
+		t.Run(v, func(t *testing.T) {
+			bin := writeVersionedBinary(t, v)
+			client := &perHostPreStageClient{mockUpgradeClient: &mockUpgradeClient{
+				stream: &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok"}},
+				hosts: []*pb.Host{
+					{Name: "node1", Address: "10.0.0.1", Version: "v0.9.0"},
+					{Name: "node2", Address: "10.0.0.2", Version: v},
+				},
+			}}
+			if err := HostUpgrade(context.Background(), client, UpgradeOpts{
+				BinaryPath: bin, HostNames: []string{"node1"}, Yes: true,
+			}); err != nil {
+				t.Fatalf("HostUpgrade: %v", err)
+			}
+			slices.Sort(client.preStaged)
+			if want := []string{"node1", "node2"}; !slices.Equal(client.preStaged, want) {
+				t.Fatalf("pre-staged %v, want %v: %q names no one build", client.preStaged, want, v)
+			}
+		})
+	}
+}
+
+// concurrentProbeClient measures how many probes are in flight at once.
+type concurrentProbeClient struct {
+	*perHostPreStageClient
+	mu            sync.Mutex
+	inflight, max int
+}
+
+func (c *concurrentProbeClient) PreflightUpgrade(ctx context.Context, req *pb.PreflightUpgradeRequest, opts ...grpc.CallOption) (*pb.PreflightUpgradeResponse, error) {
+	c.mu.Lock()
+	c.inflight++
+	c.max = max(c.max, c.inflight)
+	c.mu.Unlock()
+	time.Sleep(30 * time.Millisecond)
+	c.mu.Lock()
+	c.inflight--
+	c.mu.Unlock()
+	return c.perHostPreStageClient.PreflightUpgrade(ctx, req, opts...)
+}
+
+// The probes run in parallel, at most probeParallelism at once: a probe can
+// take seconds on a member with slow pools, and they change nothing.
+func TestHostUpgrade_ProbesInParallelWithABound(t *testing.T) {
+	bin := writeFakeBinary(t)
+	var hosts []*pb.Host
+	for i := range 3 * probeParallelism {
+		hosts = append(hosts, &pb.Host{Name: fmt.Sprintf("node%d", i), Version: "v0.9.0"})
+	}
+	client := &concurrentProbeClient{perHostPreStageClient: &perHostPreStageClient{mockUpgradeClient: &mockUpgradeClient{
+		stream: &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok"}}, hosts: hosts,
+	}}}
+	if err := HostUpgrade(context.Background(), client, UpgradeOpts{
+		BinaryPath: bin, HostNames: []string{"node0"}, Yes: true,
+	}); err != nil {
+		t.Fatalf("HostUpgrade: %v", err)
+	}
+	if client.max < 2 || client.max > probeParallelism {
+		t.Fatalf("%d probes in flight at most, want 2..%d", client.max, probeParallelism)
+	}
+	if len(client.preStaged) != len(hosts) {
+		t.Fatalf("pre-staged %d hosts, want %d", len(client.preStaged), len(hosts))
 	}
 }

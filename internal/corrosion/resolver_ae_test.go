@@ -14,6 +14,13 @@ func forceUpdatedAt(t *testing.T, c *Client, table, pkCol, pk, ts string) {
 	}
 }
 
+func forceCreatedAt(t *testing.T, c *Client, name, ts string) {
+	t.Helper()
+	if _, err := c.db.Exec("UPDATE images SET created_at = ? WHERE name = ?", ts, name); err != nil {
+		t.Fatalf("force created_at on images: %v", err)
+	}
+}
+
 // TestAntiEntropy_ContentTieConverges: two nodes hold the same image row at the
 // SAME updated_at but different content. After a full-state merge, content-max
 // converges deterministically (the lexically-greater row wins on both nodes).
@@ -31,6 +38,12 @@ func TestAntiEntropy_ContentTieConverges(t *testing.T) {
 	}
 	forceUpdatedAt(t, src, "images", "name", "img", ts)
 	forceUpdatedAt(t, dst, "images", "name", "img", ts)
+	// created_at is stamped from the wall clock at one-second resolution, and
+	// content-max compares the whole row by column name, where created_at sorts
+	// before format. Two inserts straddling a second boundary would decide the
+	// tie on created_at instead of the content this test is about, so pin it.
+	forceCreatedAt(t, src, "img", "2026-06-03T18:39:00Z")
+	forceCreatedAt(t, dst, "img", "2026-06-03T18:39:00Z")
 
 	dst.MergeStateBytesLWW(src.DumpStateBytes())
 

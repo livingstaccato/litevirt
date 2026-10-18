@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -54,11 +55,20 @@ func TestSetFirewallSynflood_RoleAndAudit(t *testing.T) {
 	if _, err := s.SetFirewallSynflood(op, &pb.SetFirewallSynfloodRequest{Scope: "h1", Mode: "off"}); err != nil {
 		t.Fatal(err)
 	}
-	wantAudit(t, s, "firewall.synflood", "olga", "h1", "before=unset after=off")
+	wantAudit(t, s, "firewall.synflood", "olga", "host/h1", "before=unset after=off")
 	if _, err := s.SetFirewallSynflood(op, &pb.SetFirewallSynfloodRequest{Scope: "h1", Mode: "inherit"}); err != nil {
 		t.Fatal(err)
 	}
-	wantAudit(t, s, "firewall.synflood", "olga", "h1", "before=off after=unset")
+	wantAudit(t, s, "firewall.synflood", "olga", "host/h1", "before=off after=unset")
+	// A host named cluster is audited as a host, never as the cluster scope
+	// (Track B review m-1).
+	if err := corrosion.InsertHost(context.Background(), s.db, corrosion.HostRecord{Name: "cluster", Address: "10.0.0.9", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetFirewallSynflood(op, &pb.SetFirewallSynfloodRequest{Scope: "cluster", Mode: "off"}); err != nil {
+		t.Fatal(err)
+	}
+	wantAudit(t, s, "firewall.synflood", "olga", "host/cluster", "before=unset after=off")
 }
 
 // The scope is the cluster (empty) or a host this replica knows; the mode is
@@ -151,9 +161,9 @@ func TestGetFirewallSynflood_PerHost(t *testing.T) {
 	}
 	want := []row{
 		{"cluster", "on", 300, 1500, false, "olga"},
-		{"cluster", "on", 7, 8, false, "olga"},
-		{"h1", "on", 300, 1500, true, ""},
-		{"h2", "off", 0, 0, false, "olga"},
+		{"host/cluster", "on", 7, 8, false, "olga"},
+		{"host/h1", "on", 300, 1500, true, ""},
+		{"host/h2", "off", 0, 0, false, "olga"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("policies = %+v, want %+v", got, want)
@@ -169,14 +179,24 @@ func TestGetFirewallSynflood_PerHost(t *testing.T) {
 // and refuses a call without local_only (which would fan out again).
 type synfloodPeer struct {
 	pb.LiteVirtClient
-	v4, v6 uint64
+	v4, v6  uint64
+	err     error  // the RPC fails
+	readErr string // the host could not read its own counters
+	block   bool   // answers only when the caller gives up
 }
 
-func (p synfloodPeer) GetFirewallSynflood(_ context.Context, in *pb.GetFirewallSynfloodRequest, _ ...grpc.CallOption) (*pb.GetFirewallSynfloodResponse, error) {
+func (p synfloodPeer) GetFirewallSynflood(ctx context.Context, in *pb.GetFirewallSynfloodRequest, _ ...grpc.CallOption) (*pb.GetFirewallSynfloodResponse, error) {
 	if !in.GetLocalOnly() {
 		return nil, status.Error(codes.FailedPrecondition, "a fan-out leg without local_only")
 	}
-	return &pb.GetFirewallSynfloodResponse{Policies: []*pb.FirewallSynfloodPolicy{{DropsV4: p.v4, DropsV6: p.v6}}}, nil
+	if p.block {
+		<-ctx.Done()
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
+	if p.err != nil {
+		return nil, p.err
+	}
+	return &pb.GetFirewallSynfloodResponse{Policies: []*pb.FirewallSynfloodPolicy{{DropsV4: p.v4, DropsV6: p.v6, Error: p.readErr}}}, nil
 }
 
 // status asks every active host for its own lv-sf 4 and lv-sf 6 counters
@@ -189,13 +209,18 @@ func (p synfloodPeer) GetFirewallSynflood(_ context.Context, in *pb.GetFirewallS
 // error — red.
 func TestGetFirewallSynflood_DropsPerHost(t *testing.T) {
 	ctx := context.Background()
-	s := synfloodServer(t, true, "test-host", "h1", "h2")
+	s := synfloodServer(t, true, "test-host", "h1", "h2", "h4", "h5")
 	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "h3", Address: "10.0.0.3", State: "maintenance"}); err != nil {
 		t.Fatal(err)
 	}
 	s.peerClientOverride = func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
-		if host == "h1" {
+		switch host {
+		case "h1":
 			return synfloodPeer{v4: 7, v6: 2}, func() {}, nil
+		case "h4":
+			return synfloodPeer{err: status.Error(codes.Unimplemented, "unknown method GetFirewallSynflood")}, func() {}, nil
+		case "h5":
+			return synfloodPeer{readErr: "nft: Operation not permitted"}, func() {}, nil
 		}
 		return nil, nil, errors.New("connection refused")
 	}
@@ -221,22 +246,65 @@ func TestGetFirewallSynflood_DropsPerHost(t *testing.T) {
 			t.Errorf("%s: error %q, want it to say %q", host, p.GetError(), errHas)
 		}
 	}
-	check("test-host", 11, 4, "")
-	check("h1", 7, 2, "")
-	check("h2", 0, 0, "connection refused")
-	check("h3", 0, 0, "maintenance")
+	check("host/test-host", 11, 4, "")
+	check("host/h1", 7, 2, "")
+	check("host/h2", 0, 0, "unreachable: connection refused")
+	check("host/h3", 0, 0, "not asked: the host is maintenance")
+	check("host/h4", 0, 0, "predates SYN-flood status")
+	check("host/h5", 0, 0, "reported by the host: nft: Operation not permitted")
 	if c := r.GetPolicies()[0]; c.GetError() != "" || c.GetDropsV4() != 0 {
 		t.Errorf("the cluster entry carries counters: %+v", c)
 	}
 
 	// The fan-out leg: this host's entry alone, with its own counters.
 	r, err = s.GetFirewallSynflood(viewerCtx(), &pb.GetFirewallSynfloodRequest{LocalOnly: true})
-	if err != nil || len(r.GetPolicies()) != 1 || r.GetPolicies()[0].GetScope() != "test-host" || r.GetPolicies()[0].GetDropsV4() != 11 {
+	if err != nil || len(r.GetPolicies()) != 1 || r.GetPolicies()[0].GetScope() != "host/test-host" || r.GetPolicies()[0].GetDropsV4() != 11 {
 		t.Fatalf("local_only = %+v, %v; want this host's entry with its drops", r, err)
 	}
 	s.synFloodDrops = func(context.Context) (uint64, uint64, error) { return 0, 0, errors.New("nft: Operation not permitted") }
 	r, err = s.GetFirewallSynflood(viewerCtx(), &pb.GetFirewallSynfloodRequest{LocalOnly: true})
 	if err != nil || !strings.Contains(r.GetPolicies()[0].GetError(), "Operation not permitted") {
 		t.Errorf("unreadable local counters: %+v, %v; want the error", r, err)
+	}
+}
+
+// The fan-out asks every peer at once under one deadline: hosts that never
+// answer cost the deadline once, not once each, and the hosts that answer
+// are still reported (Track B review m-3).
+//
+// Mutation: ask the peers one after another — the call takes the deadline
+// once per silent host: red.
+func TestGetFirewallSynflood_FanOutIsParallelAndBounded(t *testing.T) {
+	prev := synfloodFanoutTimeout
+	synfloodFanoutTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { synfloodFanoutTimeout = prev })
+	s := synfloodServer(t, true, "test-host", "s1", "s2", "s3", "s4", "ok")
+	s.peerClientOverride = func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
+		if host == "ok" {
+			return synfloodPeer{v4: 1}, func() {}, nil
+		}
+		return synfloodPeer{block: true}, func() {}, nil
+	}
+	s.synFloodDrops = func(context.Context) (uint64, uint64, error) { return 0, 0, nil }
+	start := time.Now()
+	r, err := s.GetFirewallSynflood(viewerCtx(), &pb.GetFirewallSynfloodRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 900*time.Millisecond {
+		t.Errorf("four silent hosts took %v; the fan-out must share one 300ms deadline", d)
+	}
+	for _, p := range r.GetPolicies()[1:] {
+		switch p.GetScope() {
+		case "host/ok":
+			if p.GetError() != "" || p.GetDropsV4() != 1 {
+				t.Errorf("the answering host = %+v", p)
+			}
+		case "host/test-host":
+		default:
+			if !strings.HasPrefix(p.GetError(), "unreachable") {
+				t.Errorf("%s = %q, want unreachable", p.GetScope(), p.GetError())
+			}
+		}
 	}
 }

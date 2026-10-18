@@ -411,9 +411,9 @@ func (s *Server) SetFirewallDefault(ctx context.Context, req *pb.SetFirewallDefa
 	if err := RequireRole(ctx, "operator"); err != nil {
 		return nil, err
 	}
-	scope := req.Scope
-	if scope == "" {
-		scope = "cluster"
+	scope, err := s.defaultDenyScope(ctx, req.GetScope())
+	if err != nil {
+		return nil, err
 	}
 	before := defaultState(corrosion.GetFirewallDefault(ctx, s.db, scope))
 	if err := corrosion.SetFirewallDefault(ctx, s.db, scope, req.DefaultDeny, ""); err != nil {
@@ -422,6 +422,33 @@ func (s *Server) SetFirewallDefault(ctx context.Context, req *pb.SetFirewallDefa
 	s.audit(ctx, "firewall.default-deny", scope, corrosion.AuditChange(before, verdictOf(req.DefaultDeny)), "ok")
 	s.reconcileLocal(ctx)
 	return &emptypb.Empty{}, nil
+}
+
+// defaultDenyScope is the firewall_defaults scope of a default-deny request:
+// "" is the cluster ("cluster"), and any other scope a host this replica
+// knows, as for `lv firewall synflood --scope`. "cluster" still means the
+// cluster (the web UI and older clients send it) until a host has that name: the
+// two then share one key, and the scope is refused rather than guessed.
+func (s *Server) defaultDenyScope(ctx context.Context, scope string) (string, error) {
+	if scope == "" {
+		return "cluster", nil
+	}
+	h, err := corrosion.GetHost(ctx, s.db, scope)
+	if err != nil {
+		return "", status.Errorf(codes.Unavailable, "look up host %s: %v", scope, err)
+	}
+	switch {
+	case scope == "cluster" && h != nil:
+		return "", status.Error(codes.FailedPrecondition,
+			"a host is named cluster, and default-deny cannot tell its policy from the cluster's: "+
+				"leave out --scope for the cluster-wide policy; host cluster cannot have its own")
+	case scope == "cluster":
+		return "cluster", nil
+	case h == nil:
+		return "", status.Errorf(codes.NotFound,
+			"no host named %q: --scope takes a host (lv host ls); leave it out for the cluster-wide policy", scope)
+	}
+	return scope, nil
 }
 
 func (s *Server) ListFirewallDefaults(ctx context.Context, _ *pb.ListFirewallDefaultsRequest) (*pb.ListFirewallDefaultsResponse, error) {

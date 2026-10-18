@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -32,10 +33,8 @@ func (s *Server) SetFirewallSynflood(ctx context.Context, req *pb.SetFirewallSyn
 		return nil, err
 	}
 	host := req.GetScope()
-	target := host
-	if host == "" {
-		target = corrosion.FirewallSynfloodScopeCluster
-	} else {
+	target := synfloodScope(host)
+	if host != "" {
 		h, err := corrosion.GetHost(ctx, s.db, host)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "look up host %s: %v", host, err)
@@ -113,13 +112,32 @@ func synfloodAuditText(p corrosion.FirewallSynflood, recorded bool, err error) s
 	return p.Mode
 }
 
-// GetFirewallSynflood reports the cluster's policy, always first (a host may
-// be named "cluster" too), then each host's as this replica resolves it — its
-// own row, else the cluster's (inherited), else off — sorted by host name,
-// with the host's SYN-flood drops since its last reload: this host's read from
-// its kernel, every other active host's asked of it (local_only). A host that
-// cannot be asked, or is not active, says why in error and carries no count.
-// With local_only, only this host's entry.
+// synfloodScope names a scope in the API and the audit log: "cluster" for the
+// cluster's own policy, "host/<name>" for a host's, so a host named cluster
+// is never read as the cluster.
+func synfloodScope(host string) string {
+	if host == "" {
+		return corrosion.FirewallSynfloodScopeCluster
+	}
+	return synfloodHostScopePrefix + host
+}
+
+// synfloodHostScopePrefix prefixes a host's scope in the API and audit log.
+const synfloodHostScopePrefix = "host/"
+
+// synfloodFanoutTimeout bounds the whole status fan-out: every peer is asked
+// at once under this one deadline.
+var synfloodFanoutTimeout = 10 * time.Second
+
+// GetFirewallSynflood reports the cluster's policy (scope "cluster"), then
+// each host's (scope "host/<name>") as this replica resolves it — its own
+// row, else the cluster's (inherited), else off — sorted by host name, with
+// the host's SYN-flood drops since its last reload: this host's read from its
+// kernel, every other active host's asked of it (local_only), all at once
+// under one deadline. A host that cannot be asked, or is not active, says why
+// in error and carries no count. With local_only, only this host's entry; a
+// failure to read its own policy or counters is reported in that entry's
+// error, not as a failed call.
 func (s *Server) GetFirewallSynflood(ctx context.Context, req *pb.GetFirewallSynfloodRequest) (*pb.GetFirewallSynfloodResponse, error) {
 	if err := RequireRole(ctx, "viewer"); err != nil {
 		return nil, err
@@ -127,9 +145,10 @@ func (s *Server) GetFirewallSynflood(ctx context.Context, req *pb.GetFirewallSyn
 	if req.GetLocalOnly() {
 		p, err := s.synfloodPolicy(ctx, s.hostName)
 		if err != nil {
-			return nil, err
+			p = &pb.FirewallSynfloodPolicy{Scope: synfloodScope(s.hostName), Error: status.Convert(err).Message()}
+		} else {
+			s.localSynfloodDrops(ctx, p)
 		}
-		s.localSynfloodDrops(ctx, p)
 		return &pb.GetFirewallSynfloodResponse{Policies: []*pb.FirewallSynfloodPolicy{p}}, nil
 	}
 	cluster, err := s.synfloodPolicy(ctx, "")
@@ -142,6 +161,9 @@ func (s *Server) GetFirewallSynflood(ctx context.Context, req *pb.GetFirewallSyn
 		return nil, status.Errorf(codes.Unavailable, "list hosts: %v", err)
 	}
 	sort.Slice(hosts, func(i, j int) bool { return hosts[i].Name < hosts[j].Name })
+	fctx, cancel := context.WithTimeout(ctx, synfloodFanoutTimeout)
+	defer cancel()
+	var wg sync.WaitGroup
 	for _, h := range hosts {
 		p, err := s.synfloodPolicy(ctx, h.Name)
 		if err != nil {
@@ -153,10 +175,15 @@ func (s *Server) GetFirewallSynflood(ctx context.Context, req *pb.GetFirewallSyn
 		case h.State != "active":
 			p.Error = fmt.Sprintf("not asked: the host is %s", h.State)
 		default:
-			s.peerSynfloodDrops(ctx, h.Name, p)
+			wg.Add(1)
+			go func(host string, p *pb.FirewallSynfloodPolicy) {
+				defer wg.Done()
+				s.peerSynfloodDrops(fctx, host, p)
+			}(h.Name, p)
 		}
 		out.Policies = append(out.Policies, p)
 	}
+	wg.Wait()
 	return out, nil
 }
 
@@ -176,25 +203,30 @@ func (s *Server) localSynfloodDrops(ctx context.Context, p *pb.FirewallSynfloodP
 }
 
 // peerSynfloodDrops asks host for its own drop counters (local_only) and
-// fills p with them, or with why it could not.
+// fills p with them, or with why not: the host's daemon predates the
+// counters, the host reported its own failure to read them, or it could not
+// be reached in time.
 func (s *Server) peerSynfloodDrops(ctx context.Context, host string, p *pb.FirewallSynfloodPolicy) {
-	hctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	client, closeFn, err := s.dialPeer(hctx, host)
+	client, closeFn, err := s.dialPeer(ctx, host)
 	if err != nil {
 		p.Error = "unreachable: " + err.Error()
 		return
 	}
 	defer closeFn()
-	r, err := client.GetFirewallSynflood(hctx, &pb.GetFirewallSynfloodRequest{LocalOnly: true})
+	r, err := client.GetFirewallSynflood(ctx, &pb.GetFirewallSynfloodRequest{LocalOnly: true})
 	switch {
+	case status.Code(err) == codes.Unimplemented:
+		p.Error = "the host's daemon predates SYN-flood status; upgrade litevirtd there"
 	case err != nil:
 		p.Error = "unreachable: " + err.Error()
 	case len(r.GetPolicies()) == 0:
 		p.Error = "no answer"
 	default:
 		got := r.GetPolicies()[0]
-		p.DropsV4, p.DropsV6, p.Error = got.GetDropsV4(), got.GetDropsV6(), got.GetError()
+		p.DropsV4, p.DropsV6 = got.GetDropsV4(), got.GetDropsV6()
+		if got.GetError() != "" {
+			p.DropsV4, p.DropsV6, p.Error = 0, 0, "reported by the host: "+got.GetError()
+		}
 	}
 }
 
@@ -202,10 +234,7 @@ func (s *Server) peerSynfloodDrops(ctx context.Context, host string, p *pb.Firew
 // host "". A row this build cannot read shows as what is enforced for it: on
 // at the defaults.
 func (s *Server) synfloodPolicy(ctx context.Context, host string) (*pb.FirewallSynfloodPolicy, error) {
-	out := &pb.FirewallSynfloodPolicy{Scope: host}
-	if host == "" {
-		out.Scope = corrosion.FirewallSynfloodScopeCluster
-	}
+	out := &pb.FirewallSynfloodPolicy{Scope: synfloodScope(host)}
 	p, err := corrosion.ResolveFirewallSynflood(ctx, s.db, host)
 	if err != nil && !errors.Is(err, corrosion.ErrUnreadableFirewallPolicy) {
 		return nil, status.Errorf(codes.Unavailable, "read the SYN-flood policy of %s: %v", out.Scope, err)

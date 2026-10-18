@@ -3430,7 +3430,7 @@ func (x *SecurityGroupRule) GetLog() bool {
 // FirewallSynfloodPolicy is the SYN-flood protection policy of one scope.
 type FirewallSynfloodPolicy struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
-	Scope     string                 `protobuf:"bytes,1,opt,name=scope,proto3" json:"scope,omitempty"`  // "cluster" | <host name>
+	Scope     string                 `protobuf:"bytes,1,opt,name=scope,proto3" json:"scope,omitempty"`  // "cluster" | "host/<name>"
 	Mode      string                 `protobuf:"bytes,2,opt,name=mode,proto3" json:"mode,omitempty"`    // on | off
 	Rate      uint32                 `protobuf:"varint,3,opt,name=rate,proto3" json:"rate,omitempty"`   // new SYNs per second per (guest NIC, source address)
 	Burst     uint32                 `protobuf:"varint,4,opt,name=burst,proto3" json:"burst,omitempty"` // packets

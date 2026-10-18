@@ -15,10 +15,11 @@ import (
 
 type synfloodSpy struct {
 	pb.LiteVirtClient
-	err    error
-	sets   []*pb.SetFirewallSynfloodRequest
-	get    *pb.GetFirewallSynfloodResponse
-	health *pb.ClusterHealth
+	err      error
+	sets     []*pb.SetFirewallSynfloodRequest
+	get      *pb.GetFirewallSynfloodResponse
+	health   *pb.ClusterHealth
+	deadline bool
 }
 
 func (s *synfloodSpy) SetFirewallSynflood(_ context.Context, in *pb.SetFirewallSynfloodRequest, _ ...grpc.CallOption) (*pb.FirewallSynfloodPolicy, error) {
@@ -29,7 +30,8 @@ func (s *synfloodSpy) SetFirewallSynflood(_ context.Context, in *pb.SetFirewallS
 	return &pb.FirewallSynfloodPolicy{Scope: in.GetScope(), Mode: in.GetMode(), Rate: in.GetRate(), Burst: in.GetBurst()}, nil
 }
 
-func (s *synfloodSpy) GetFirewallSynflood(context.Context, *pb.GetFirewallSynfloodRequest, ...grpc.CallOption) (*pb.GetFirewallSynfloodResponse, error) {
+func (s *synfloodSpy) GetFirewallSynflood(ctx context.Context, _ *pb.GetFirewallSynfloodRequest, _ ...grpc.CallOption) (*pb.GetFirewallSynfloodResponse, error) {
+	_, s.deadline = ctx.Deadline()
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -100,9 +102,9 @@ func TestSynfloodCLI_Status(t *testing.T) {
 	spy := &synfloodSpy{
 		get: &pb.GetFirewallSynfloodResponse{Policies: []*pb.FirewallSynfloodPolicy{
 			{Scope: "cluster", Mode: "on", Rate: 200, Burst: 1000, SetBy: "olga", UpdatedAt: "t1"},
-			{Scope: "h1", Mode: "off", SetBy: "olga", UpdatedAt: "t2"},
-			{Scope: "h2", Mode: "on", Rate: 200, Burst: 1000, Inherited: true, DropsV4: 17, DropsV6: 3},
-			{Scope: "h3", Mode: "on", Rate: 200, Burst: 1000, Inherited: true, Error: "unreachable"},
+			{Scope: "host/h1", Mode: "off", SetBy: "olga", UpdatedAt: "t2"},
+			{Scope: "host/h2", Mode: "on", Rate: 200, Burst: 1000, Inherited: true, DropsV4: 17, DropsV6: 3},
+			{Scope: "host/h3", Mode: "on", Rate: 200, Burst: 1000, Inherited: true, Error: "unreachable"},
 		}},
 		health: &pb.ClusterHealth{Conditions: []*pb.HealthCondition{
 			{Code: "firewall.synflood.unavailable", SubjectKind: "host", SubjectId: "h2", Lifecycle: "confirmed"},
@@ -125,5 +127,26 @@ func TestSynfloodCLI_Status(t *testing.T) {
 	}
 	if f := strings.Fields(lines[4]); strings.Join(f, " ") != "h3 on on 200 1000 cluster - - - unreachable" {
 		t.Errorf("h3 row = %q (a count that could not be read must not show as 0)", lines[4])
+	}
+}
+
+// --rate 0 and --burst 0 are refused, not read as "the default" (Track B
+// review m-5); nothing is sent. status runs under a deadline, so a cluster
+// with silent hosts cannot hang the CLI (m-3).
+//
+// Mutations: drop the zero check — a request is sent: red; drop the status
+// deadline — red.
+func TestSynfloodCLI_ZeroRefusedAndStatusBounded(t *testing.T) {
+	spy := &synfloodSpy{get: &pb.GetFirewallSynfloodResponse{Policies: []*pb.FirewallSynfloodPolicy{{Scope: "cluster", Mode: "off"}}}}
+	for _, args := range [][]string{{"on", "--rate", "0"}, {"on", "--burst", "0"}} {
+		if _, err := runSynfloodCLI(t, spy, args...); err == nil || !strings.Contains(err.Error(), "1-100000") {
+			t.Errorf("%v: %v, want refused with the range", args, err)
+		}
+	}
+	if len(spy.sets) != 0 {
+		t.Errorf("a zero rate or burst was sent: %v", spy.sets)
+	}
+	if _, err := runSynfloodCLI(t, spy, "status"); err != nil || !spy.deadline {
+		t.Errorf("status: %v, deadline %v; want a call under a deadline", err, spy.deadline)
 	}
 }

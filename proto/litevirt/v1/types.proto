@@ -532,7 +532,7 @@ message SecurityGroupRule {
 
 // FirewallSynfloodPolicy is the SYN-flood protection policy of one scope.
 message FirewallSynfloodPolicy {
-    string scope      = 1;  // "cluster" | <host name>
+    string scope      = 1;  // "cluster" | "host/<name>"
     string mode       = 2;  // on | off
     uint32 rate       = 3;  // new SYNs per second per (guest NIC, source address)
     uint32 burst      = 4;  // packets

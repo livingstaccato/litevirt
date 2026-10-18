@@ -1056,7 +1056,7 @@ condition:
 ## SYN-flood protection
 
 SYN-flood protection limits new TCP connections toward guest NICs: per guest
-NIC and source address, at most `--rate` SYNs per second after a burst of
+NIC and source address (an IPv6 source by its /64), at most `--rate` SYNs per second after a burst of
 `--burst`. A SYN past the limit is dropped and counted (`lv-sf 4`, `lv-sf 6` in
 `lv firewall show`). It is enforced in the per-NIC table (`bridge
 litevirt-nic`), immediately before each guest NIC's ingress rules, so it applies
@@ -1073,12 +1073,14 @@ lv firewall synflood inherit --scope <host>                       # clear a host
   neither, protection is off. `status` shows, per host, the policy, where it
   comes from (`host` or `cluster`), what is in force (`unavailable` for a
   host whose kernel refused SYN-flood rules), and its drops per address
-  family since its last reload, asked of each active host. A host that cannot
-  be asked, or is not active, shows `-` and why in ERROR, never a 0.
+  family since its last reload, asked of every active host at once. A host
+  without counts shows `-` and why in ERROR, never a 0: `unreachable` (no
+  answer within 10 seconds), `not asked` (not active), `predates` (its
+  litevirtd is older) or `reported by the host` (it could not read them).
 - `on`, `off` and `inherit` need the operator role, are audited
   (`firewall.synflood`) and are refused until the cluster upgrade has
-  finished. `--rate` and `--burst` are each 1-100000; the defaults, 200 and
-  1000, are Proxmox's.
+  finished. `--rate` and `--burst` are each 1-100000 (0 is refused); the
+  defaults, 200 and 1000, are Proxmox's.
 - A cluster founded by this release is created with protection on at 200/1000.
   A cluster that upgraded has it off until `lv firewall synflood on`, so the
   upgrade drops nothing that worked before.
@@ -1087,8 +1089,10 @@ lv firewall synflood inherit --scope <host>                       # clear a host
 - In observe mode (see "Observe and enforce") a SYN past the limit is not
   dropped: `lv firewall enforce status` counts it as a would-drop with rule
   `synflood`. Read it before enforcing.
-- Connections the load balancer's haproxy opens to its backends are not
-  limited.
+- Connections the load balancer's haproxy opens to its backends are accepted
+  before the limit, by source, backend address and port. No source is exempt
+  otherwise: SYNs from a routed network's gateway (a masqueraded guest) or
+  from the host are limited like any other source's.
 
 **The default is low for a proxy in front of backends.** 200 new connections
 per second from one source to one backend NIC is reachable by a reverse-proxy
@@ -1103,8 +1107,9 @@ where such traffic runs.
   alters the rendered ruleset reloads both tables on every host: a rule, an ip
   set, a tag-group member or an address anywhere in the cluster.
 - Each host keeps at most 65536 sources per address family. A flood from more
-  random sources than that passes the limiter once the meter is full; guests
-  keep their own SYN cookies.
+  random sources than that (IPv4 addresses, or IPv6 /64s) passes the limiter
+  once the meter is full; guests keep their own SYN cookies. Rotating
+  addresses within one IPv6 /64 does not escape it.
 - The kernel needs `nft_limit`. The daemon checks at start (`nft -c`, nothing
   loaded); where the kernel refuses, nothing SYN-flood is rendered on that host
   and it raises `firewall.synflood.unavailable` while the policy is on. Restart
@@ -1223,7 +1228,7 @@ the row names the user the session belongs to.
 | `firewall.enforcement` | `cluster` | `lv firewall enforce on/off` |
 | `firewall.tag.set` / `.rm` | VM name, or `<host>/<name>` for a container | `lv firewall tag set/rm` |
 | `firewall.tag_group.set` / `.rm` | group name | `lv firewall tag-group set/rm` |
-| `firewall.synflood` | the scope (`cluster` or a host name) | `lv firewall synflood on/off/inherit`; the genesis seed of a new cluster, by `litevirt` |
+| `firewall.synflood` | `cluster`, or `host/<name>` for a host's policy | `lv firewall synflood on/off/inherit`; the genesis seed of a new cluster, by `litevirt` |
 
 The row's user is the authenticated caller. Its detail records the policy
 before and after the change, in the form `before=<state> after=<state>`:

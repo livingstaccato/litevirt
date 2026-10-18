@@ -1461,6 +1461,8 @@ lv firewall ipset rm <id>
 
 # Default forward policy (deny = drop anything not explicitly accepted):
 lv firewall default-deny <on|off> [--scope <host>]   # no --scope = cluster-wide
+  # --scope names a host lv host ls shows (an unknown name is refused). A host named
+  # cluster cannot have its own default-deny: --scope cluster is then refused.
 
 # NIC guards (anti-spoofing). New NICs are guarded by default; relaxing one
 # needs network.update on its network. --allow replaces the list (repeatable).

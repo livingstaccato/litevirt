@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc/codes"
@@ -44,6 +45,16 @@ func newFirewallSynfloodCmd() *cobra.Command {
 			}
 			req := &pb.SetFirewallSynfloodRequest{Scope: scope, Mode: mode}
 			if mode == "on" {
+				// 0 on the wire means the default; on the command line
+				// it is out of range, not a quiet 200 or 1000.
+				for _, f := range []struct {
+					name string
+					v    uint32
+				}{{"rate", rate}, {"burst", burst}} {
+					if f.v < 1 || f.v > 100000 {
+						return fmt.Errorf("--%s %d: want 1-100000", f.name, f.v)
+					}
+				}
 				req.Rate, req.Burst = rate, burst
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
@@ -90,6 +101,10 @@ refused until the cluster upgrade has finished.`,
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				// The daemon asks every host under its own deadline; this
+				// bounds the whole call should it not.
+				ctx, cancel := context.WithTimeout(ctx, synfloodStatusTimeout)
+				defer cancel()
 				r, err := c.GetFirewallSynflood(ctx, &pb.GetFirewallSynfloodRequest{})
 				if err != nil {
 					return synfloodRPCError(err)
@@ -107,6 +122,9 @@ refused until the cluster upgrade has finished.`,
 	cmd.AddCommand(statusCmd, on, off, inherit)
 	return cmd
 }
+
+// synfloodStatusTimeout bounds `lv firewall synflood status`.
+const synfloodStatusTimeout = 30 * time.Second
 
 func synfloodScopeText(scope string) string {
 	if scope == "" {
@@ -164,8 +182,9 @@ func printSynflood(out io.Writer, r *pb.GetFirewallSynfloodResponse, unavailable
 		if setBy == "" {
 			setBy = "-"
 		}
+		host := strings.TrimPrefix(p.GetScope(), "host/")
 		inForce := p.GetMode()
-		if inForce == "on" && unavailable[p.GetScope()] {
+		if inForce == "on" && unavailable[host] {
 			inForce = "unavailable"
 		}
 		// A count that could not be read is "-", with why, never a 0.
@@ -173,7 +192,7 @@ func printSynflood(out io.Writer, r *pb.GetFirewallSynfloodResponse, unavailable
 		if p.GetError() == "" {
 			d4, d6 = fmt.Sprint(p.GetDropsV4()), fmt.Sprint(p.GetDropsV6())
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", p.GetScope(), p.GetMode(), inForce, rate, burst, from, d4, d6, setBy, p.GetError())
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", host, p.GetMode(), inForce, rate, burst, from, d4, d6, setBy, p.GetError())
 	}
 	return w.Flush()
 }

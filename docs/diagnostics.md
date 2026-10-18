@@ -2208,6 +2208,22 @@ naming the prefix and the tree; the daemon log says the same at start.
 |---|---|
 | The daemon starts with such a prefix configured. | The daemon starts with no such prefix (the prefix moved to a filesystem of its own, or removed). |
 
+### vTPM state not durable (`vtpm_state_not_durable`)
+
+Evaluator `vtpm`, subject kind `host`, severity warning. A node with swtpm
+installed and `vtpm_state_sync` on (the default, docs/configuration.md) sets
+the sync attribute on `/var/lib/libvirt/swtpm` at start and every minute, so
+each vTPM state write is on disk before the TPM command returns. The node
+raises `vtpm_state_not_durable` about **itself** when it cannot: the
+filesystem refuses the attribute (tmpfs, NFS), a file created there does not
+inherit it (btrfs), or setting it failed. A vTPM write made shortly before a
+power cut on that host can be lost. The evidence carries `state`
+(`unsupported`, `not_inherited` or `failed`), `path`, `error` and `remedy`.
+
+| Raised when | Clears when |
+|---|---|
+| A pass finds the tree cannot be made synchronous. | A pass makes it synchronous (the path moved to ext4 or xfs), or `vtpm_state_sync: false` is set and the daemon restarted. |
+
 ### Operation not reapable (`operation_unreapable`)
 
 Every node runs the operation reaper hourly. It tombstones each finished

@@ -1744,16 +1744,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 	//   - vTPM (G1): both swtpm_setup and swtpm are needed to START a vTPM VM —
 	//     libvirt runs swtpm_setup to initialize state, then swtpm. (The first
 	//     G1 drill failed in swtpm_setup with swtpm alone present.)
+	//     On such a host the probe first makes the swtpm tree synchronous
+	//     (vtpm_state_sync), so no vTPM VM is placed here before it is.
 	//   - Secure Boot: the secboot/MS OVMF pair (resolved above).
 	// Asserted now, before the container checker starts, and re-asserted every
 	// capabilityLabelInterval (keepCapabilityLabels says why).
+	vtpmSync := &vtpmStateSync{
+		on:   d.cfg.VTPMStateSyncEnabled(),
+		sync: libvirt.SyncSwtpmState,
+		report: func(open bool, evidence map[string]any) bool {
+			return d.writeSelfConditionAs(ctx, vtpmEvaluator, CondVTPMStateNotDurable, open, corrosion.SeverityWarning, evidence)
+		},
+	}
 	capabilityLabels := []capabilityLabel{
 		{key: corrosion.LabelLXCCapable, capable: lxc.Available},
-		{key: corrosion.LabelTPMCapable, capable: func() bool {
-			_, errSwtpm := exec.LookPath("swtpm")
-			_, errSetup := exec.LookPath("swtpm_setup")
-			return errSwtpm == nil && errSetup == nil
-		}},
+		{key: corrosion.LabelTPMCapable, capable: tpmCapableProbe(exec.LookPath, vtpmSync.ensure)},
 		{key: corrosion.LabelSecureBootCapable, capable: firmwarePaths.SecureBootAvailable},
 	}
 	asserted, err := assertCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels)

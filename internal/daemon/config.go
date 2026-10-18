@@ -208,6 +208,12 @@ type Config struct {
 	// than a real rootfs restore.
 	ContainerRestoreTimeoutSec int `yaml:"container_restore_timeout_sec"`
 
+	// VTPMStateSync makes vTPM state writes synchronous: the sync attribute
+	// (chattr +S) on /var/lib/libvirt/swtpm, which its files inherit. swtpm does
+	// not fsync its state, so without it a vTPM write made shortly before a
+	// power cut can be lost. Nil = on; false clears the attribute.
+	VTPMStateSync *bool `yaml:"vtpm_state_sync,omitempty"`
+
 	// Containers holds the defaults new and restarted containers get.
 	Containers ContainersConfig `yaml:"containers"`
 
@@ -535,6 +541,12 @@ type NotificationsConfig struct {
 // empty means the default (1h) and "0" or "off" disables the check.
 type SMARTConfig struct {
 	Interval string `yaml:"interval,omitempty"`
+}
+
+// VTPMStateSyncEnabled reports whether vTPM state writes are made synchronous
+// (default: yes).
+func (c Config) VTPMStateSyncEnabled() bool {
+	return c.VTPMStateSync == nil || *c.VTPMStateSync
 }
 
 // AutoUpgradeConfig controls peer self-upgrade. FromPeer is a pointer so an

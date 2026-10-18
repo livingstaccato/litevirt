@@ -384,19 +384,26 @@ func TestFenceIPMI_RetiredCredentialIsReportedNotSent(t *testing.T) {
 	}
 }
 
-// TestFenceIPMI_EmptyPasswordIsReportedNotSent: a host fenced by ipmi whose
-// password was never set is refused the same way, never sent an empty one.
-func TestFenceIPMI_EmptyPasswordIsReportedNotSent(t *testing.T) {
+// TestFenceIPMI_EmptyPasswordIsStillSent: a host fenced by ipmi whose password
+// was never set is fenced as before, with an empty password (a BMC user with a
+// null password authenticates that way), and the result says so. Only a
+// RETIRED credential is refused (TestFenceIPMI_RetiredCredentialIsReportedNotSent).
+//
+// Mutation: refuse an empty password — red.
+func TestFenceIPMI_EmptyPasswordIsStillSent(t *testing.T) {
+	shrinkVerifyKnobs(t, 2*time.Second, 10*time.Millisecond)
 	logPath := fakeIpmitool(t, "Chassis Power is off", 0, 0)
 	h := testIPMIHost()
 	h.IPMIPass = ""
 
 	r := Execute(context.Background(), h)
-	if r.Success || r.Method != "ipmi" || !strings.Contains(r.Detail, "no IPMI password") ||
-		!strings.Contains(r.Detail, "lv host config "+h.Name+" --ipmi-pass") {
-		t.Errorf("result = %+v; want an ipmi failure that says there is no password and how to set one", r)
+	if !r.Success || r.Method != "ipmi" {
+		t.Fatalf("result = %+v; a never-set password must be fenced with, as before", r)
 	}
-	if n := countInvocations(t, logPath); n != 0 {
-		t.Errorf("ipmitool ran %d time(s) with no password", n)
+	if !strings.Contains(r.Detail, "empty IPMI password") {
+		t.Errorf("detail = %q; want it to say the password sent was empty", r.Detail)
+	}
+	if n := countInvocations(t, logPath); n == 0 {
+		t.Error("ipmitool never ran")
 	}
 }

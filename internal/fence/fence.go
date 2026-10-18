@@ -280,8 +280,8 @@ func fenceIPMI(ctx context.Context, h HostConfig) Result {
 			Success: false,
 		}
 	}
-	// No password is never sent as an empty one: ipmitool would make an
-	// unauthenticated attempt and report whatever the BMC answers.
+	// A retired credential is never sent as an empty password: it means the
+	// machine's password went with its removal, not that it has none.
 	if h.IPMICredentialRetired {
 		return Result{
 			Method: "ipmi",
@@ -290,14 +290,23 @@ func fenceIPMI(ctx context.Context, h HostConfig) Result {
 			Success: false,
 		}
 	}
+	// A password that was never set is sent empty, as before: a BMC user with
+	// a null password authenticates that way. Said so, in the log and in the
+	// result, so a failure here can be read for what it is.
 	if h.IPMIPass == "" {
-		return Result{
-			Method:  "ipmi",
-			Detail:  "no IPMI password configured on host; set it with `lv host config " + h.Name + " --ipmi-pass <secret>`",
-			Success: false,
-		}
+		slog.Warn("fencing via IPMI with an empty password (no IPMI password is configured for this host)",
+			"host", h.Name, "bmc", h.IPMIAddress)
+		r := fenceIPMIRun(ctx, h)
+		r.Detail += " (sent with an empty IPMI password: none is configured; set one with `lv host config " +
+			h.Name + " --ipmi-pass <secret>` unless the BMC user has none)"
+		return r
 	}
+	return fenceIPMIRun(ctx, h)
+}
 
+// fenceIPMIRun is the IPMI power-off and its verification, once the
+// preconditions in fenceIPMI hold.
+func fenceIPMIRun(ctx context.Context, h HostConfig) Result {
 	slog.Info("fencing host via IPMI", "host", h.Name, "bmc", h.IPMIAddress)
 
 	cmd, cancel := ipmitoolCmd(ctx, h, "chassis", "power", "off")

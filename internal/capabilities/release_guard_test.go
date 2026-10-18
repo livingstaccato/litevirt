@@ -668,7 +668,23 @@ func init() { Uncalled() }
 import "github.com/litevirt/litevirt/internal/x"
 func f() { x.Called(); g := x.Valued; _ = g }
 `)
-	for name, want := range map[string]bool{"Called": true, "Valued": true, "Uncalled": false} {
+	// Same-named things elsewhere are not the writer: a client's method, a
+	// field, another package's function, and harness code under tests/.
+	write("cmd/z/z.go", `package z
+type c struct{ Uncalled int }
+func (c) Uncalled() {}
+func f(v c) { v.Uncalled(); _ = v.Uncalled; Uncalled() }
+func Uncalled() {}
+`)
+	write("tests/h/h.go", `package h
+import "github.com/litevirt/litevirt/internal/x"
+func f() { x.Uncalled() }
+`)
+	write("internal/x/same.go", `package x
+func g() { Bare() }
+func Bare() {}
+`)
+	for name, want := range map[string]bool{"Called": true, "Valued": true, "Uncalled": false, "Bare": true} {
 		n, err := writerReferences(dir, "internal/x."+name)
 		if err != nil {
 			t.Fatal(err)
@@ -680,11 +696,15 @@ func f() { x.Called(); g := x.Valued; _ = g }
 }
 
 // writerReferences counts the non-test references to writer w
-// ("internal/pkg.Func" or "internal/pkg.Type.Method") anywhere under root:
-// an identifier of its name that is not its own declaration.
+// ("internal/pkg.Func" or "internal/pkg.Type.Method") under root, outside
+// tests/: a package-qualified pkg.Func from a file that imports the writer's
+// package, or a bare Func in the writer's own package — never a same-named
+// method, field or function of another package. A method writer is counted
+// by its selector, whatever the receiver.
 func writerReferences(root, w string) (int, error) {
-	dot := strings.LastIndex(w, ".")
-	name := w[dot+1:]
+	pkgDir, sym, _ := strings.Cut(w, ".")
+	method := strings.Contains(sym, ".")
+	name := sym[strings.LastIndex(sym, ".")+1:]
 	fset := token.NewFileSet()
 	n := 0
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -694,7 +714,7 @@ func writerReferences(root, w string) (int, error) {
 		rel, _ := filepath.Rel(root, path)
 		rel = filepath.ToSlash(rel)
 		if d.IsDir() {
-			if rel == "gen" || rel == ".git" || strings.HasPrefix(rel, ".claude") || rel == "vendor" {
+			if rel == "gen" || rel == ".git" || strings.HasPrefix(rel, ".claude") || rel == "vendor" || rel == "tests" {
 				return filepath.SkipDir
 			}
 			return nil
@@ -706,18 +726,49 @@ func writerReferences(root, w string) (int, error) {
 		if perr != nil {
 			return perr
 		}
+		samePkg := filepath.ToSlash(filepath.Dir(rel)) == pkgDir
+		// The name the file imports the writer's package under, if it does.
+		qual := ""
+		for _, im := range f.Imports {
+			p, _ := strconv.Unquote(im.Path.Value)
+			if strings.HasSuffix(p, "/"+pkgDir) {
+				qual = filepath.Base(pkgDir)
+				if im.Name != nil {
+					qual = im.Name.Name
+				}
+			}
+		}
 		decl := map[*ast.Ident]bool{}
 		for _, dd := range f.Decls {
 			if fd, ok := dd.(*ast.FuncDecl); ok {
 				decl[fd.Name] = true
 			}
 		}
+		sel := map[*ast.Ident]bool{}
 		ast.Inspect(f, func(node ast.Node) bool {
-			if id, ok := node.(*ast.Ident); ok && id.Name == name && !decl[id] {
+			se, ok := node.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			sel[se.Sel] = true
+			if se.Sel.Name != name {
+				return true
+			}
+			if method {
+				n++
+			} else if x, ok := se.X.(*ast.Ident); ok && qual != "" && x.Name == qual {
 				n++
 			}
 			return true
 		})
+		if samePkg && !method {
+			ast.Inspect(f, func(node ast.Node) bool {
+				if id, ok := node.(*ast.Ident); ok && id.Name == name && !decl[id] && !sel[id] {
+					n++
+				}
+				return true
+			})
+		}
 		return nil
 	})
 	return n, err

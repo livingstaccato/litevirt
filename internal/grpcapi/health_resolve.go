@@ -259,9 +259,10 @@ func (s *Server) resolveMoveConditionByHand(ctx context.Context, req *pb.Resolve
 	}
 	holder := ev.Host
 	why := ""
+	var handDisks []string
 	switch {
 	case everr != nil:
-		if err := s.unreadableMoveGate(ctx, vm, row.Code); err != nil {
+		if handDisks, err = s.unreadableMoveGate(ctx, vm, row.Code); err != nil {
 			return nil, err
 		}
 		why = "its evidence is unreadable"
@@ -280,11 +281,12 @@ func (s *Server) resolveMoveConditionByHand(ctx context.Context, req *pb.Resolve
 		why = holder + " is proven powered off"
 	}
 	var changes []moveRowChange
+	var forks []string
 	if everr != nil {
 		if len(accepts) > 0 {
 			return nil, status.Errorf(codes.FailedPrecondition, "--accept: the evidence of vm/%s cannot be read to match %s against", vm, strings.Join(accepts, ", "))
 		}
-	} else if changes, err = s.planMoveHandResolve(ctx, vm, holder, ev, accepts); err != nil {
+	} else if changes, forks, err = s.planMoveHandResolve(ctx, vm, holder, ev, accepts); err != nil {
 		return nil, err
 	}
 
@@ -298,6 +300,9 @@ func (s *Server) resolveMoveConditionByHand(ctx context.Context, req *pb.Resolve
 	}
 	for _, c := range changes {
 		why += fmt.Sprintf("; the disk row of %s now names %s (was %s)", c.m.Disk, c.after.Path, c.cur.Path)
+	}
+	for _, f := range forks {
+		why += "; forked history: " + f
 	}
 	target := strings.Join([]string{row.Evaluator, row.Code, row.SubjectKind, vm}, "/")
 	detail := fmt.Sprintf("resolved by hand on %s (was %s; %s; moves %s): %s", s.hostName, row.Lifecycle, why, strings.Join(moves, "; "), reason)
@@ -318,9 +323,13 @@ func (s *Server) resolveMoveConditionByHand(ctx context.Context, req *pb.Resolve
 	row.Reporter = s.hostName
 	if everr == nil {
 		ev.Hand = true
-		if b, merr := json.Marshal(ev); merr == nil {
-			row.Evidence = string(b)
-		}
+	} else {
+		// Nothing in it can be matched against: mark the disks, so a holder
+		// returning with a record of a move begun before now drops it.
+		ev = health.MoveUnresolvedEvidence{Hand: true, HandDisks: handDisks, HandAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	}
+	if b, merr := json.Marshal(ev); merr == nil {
+		row.Evidence = string(b)
 	}
 	if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
 		undone := s.undoMoveRowChanges(ctx, applied)
@@ -342,6 +351,10 @@ func (s *Server) resolveMoveConditionByHand(ctx context.Context, req *pb.Resolve
 			detail += "; this host's records could not be removed (" + err.Error() + ")"
 		}
 	}
+	for _, f := range forks {
+		slog.Warn("health resolve: a forked move history was resolved by hand; the other file is kept on disk", "vm", vm, "detail", f)
+		s.audit(ctx, "health.condition.hand_diverged", target, "resolved by hand on "+s.hostName+": "+f+": "+reason, "ok")
+	}
 	s.audit(ctx, "health.condition.resolve", target, detail, "ok")
 	s.publish("ha.condition.resolved", row.Code+":"+row.SubjectKind+"/"+vm, detail)
 	s.notify(ctx, notify.Notification{
@@ -352,35 +365,66 @@ func (s *Server) resolveMoveConditionByHand(ctx context.Context, req *pb.Resolve
 
 // unreadableMoveGate admits a hand resolution of a condition whose evidence
 // cannot be read, so the host holding the move is not known: only on the VM's
-// owner, with its domain not active (or the VM gone). The disk rows are kept.
-func (s *Server) unreadableMoveGate(ctx context.Context, vm, code string) error {
+// owner, with its domain not active (or the VM gone), and with its persistent
+// config, which `lv start` boots, naming each disk row's file. The disk rows
+// are kept. It returns the VM's disks, which the resolution marks.
+func (s *Server) unreadableMoveGate(ctx context.Context, vm, code string) ([]string, error) {
 	rec, err := corrosion.GetVM(ctx, s.db, vm)
 	if err != nil {
-		return status.Errorf(codes.Unavailable, "read vm/%s: %v", vm, err)
+		return nil, status.Errorf(codes.Unavailable, "read vm/%s: %v", vm, err)
 	}
 	if rec == nil {
-		return nil
+		return nil, nil
 	}
 	if rec.HostName != s.hostName {
-		return status.Errorf(codes.FailedPrecondition,
+		return nil, status.Errorf(codes.FailedPrecondition,
 			"refusing to resolve %s on vm/%s: its evidence cannot be read, so which host holds the move is not known; "+
 				"run this against the VM's owner %s (LV_HOST=%s) with its domain shut off", code, vm, rec.HostName, rec.HostName)
 	}
+	disks, err := corrosion.GetVMDisks(ctx, s.db, vm)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read vm/%s's disk rows: %v", vm, err)
+	}
+	names := make([]string, 0, len(disks))
+	for _, d := range disks {
+		names = append(names, d.DiskName)
+	}
 	if s.virt == nil {
-		return nil
+		return names, nil
 	}
 	active, aerr := s.virt.DomainIsActive(vm)
 	switch {
 	case aerr != nil && libvirt.IsNoDomain(aerr):
-		return nil
+		return names, nil
 	case aerr != nil:
-		return status.Errorf(codes.Unavailable, "read the state of vm/%s's domain: %v", vm, aerr)
+		return nil, status.Errorf(codes.Unavailable, "read the state of vm/%s's domain: %v", vm, aerr)
 	case active:
-		return status.Errorf(codes.FailedPrecondition,
+		return nil, status.Errorf(codes.FailedPrecondition,
 			"refusing to resolve %s on vm/%s: its evidence cannot be read, and its domain is active on %s; `lv stop %s` first",
 			code, vm, s.hostName, vm)
 	}
-	return nil
+	x, xerr := s.virt.DumpXMLInactive(vm)
+	if xerr != nil {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"refusing to resolve %s on vm/%s: its evidence cannot be read, and its persistent config cannot be read (%v); "+
+				"make it readable (virsh dumpxml --inactive %s) and retry", code, vm, xerr, vm)
+	}
+	for _, d := range disks {
+		if d.Path == "" {
+			continue
+		}
+		// The config names the row's file when the cutover's own rule
+		// rewrites it (Src), not when it names anything else (an error).
+		n, nerr := health.MovedDiskNames(x, health.UnresolvedMove{VM: vm, Disk: d.DiskName, TargetDev: d.TargetDev,
+			Src: d.Path, Dst: d.Path + ".not-the-disk-row"})
+		if nerr != nil || n != d.Path {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"refusing to resolve %s on vm/%s: its evidence cannot be read, and its persistent config on %s does not name "+
+					"%s, the file the disk row of %s names; `lv start` boots the config and a rebuild boots the row, so they "+
+					"must name the same file. Point the config at it (virsh edit %s) and retry", code, vm, s.hostName, d.Path, d.DiskName, vm)
+		}
+	}
+	return names, nil
 }
 
 // planMoveHandResolve decides, per move ev lists, the file vm's disk row is
@@ -389,7 +433,9 @@ func (s *Server) unreadableMoveGate(ctx context.Context, vm, code string) error 
 // it is refused). Otherwise the file kept is the --accept for that disk, or
 // the row's, and the resolution is refused when:
 //   - the move proves another file holds every write (pivoted or caught up:
-//     the copy), so the one kept lacks some;
+//     the copy), so the one kept lacks some, unless the history forked after
+//     it: the owner has run the VM on the row's file since it changed hands,
+//     and that file is accepted (forkedHistory);
 //   - on the VM's owner with its domain defined: the persistent config (what
 //     `lv start` boots) does not name the file kept; the domain is active and
 //     the row would change; or, on the holder that owns the VM, the domain is
@@ -403,7 +449,7 @@ func (s *Server) unreadableMoveGate(ctx context.Context, vm, code string) error 
 //     the owner's domain), or the owner does not read the accepted file as
 //     the holder does: here, a regular file on the host that is owner and
 //     holder; otherwise a file on a shared pool both define alike.
-func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev health.MoveUnresolvedEvidence, accepts []string) ([]moveRowChange, error) {
+func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev health.MoveUnresolvedEvidence, accepts []string) ([]moveRowChange, []string, error) {
 	chosen := map[string]string{}
 	for _, a := range accepts {
 		var hit *health.UnresolvedMove
@@ -413,26 +459,26 @@ func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev 
 			}
 		}
 		if hit == nil {
-			return nil, status.Errorf(codes.InvalidArgument, "--accept %s: it is neither file of a move recorded for vm/%s", a, vm)
+			return nil, nil, status.Errorf(codes.InvalidArgument, "--accept %s: it is neither file of a move recorded for vm/%s", a, vm)
 		}
 		if prev, ok := chosen[hit.Disk]; ok && prev != a {
-			return nil, status.Errorf(codes.InvalidArgument, "--accept %s and --accept %s: both name disk %s of vm/%s; name the one file to keep", prev, a, hit.Disk, vm)
+			return nil, nil, status.Errorf(codes.InvalidArgument, "--accept %s and --accept %s: both name disk %s of vm/%s; name the one file to keep", prev, a, hit.Disk, vm)
 		}
 		chosen[hit.Disk] = a
 	}
 	rec, err := corrosion.GetVM(ctx, s.db, vm)
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "read vm/%s: %v", vm, err)
+		return nil, nil, status.Errorf(codes.Unavailable, "read vm/%s: %v", vm, err)
 	}
 	if rec == nil {
 		if len(accepts) > 0 {
-			return nil, status.Errorf(codes.NotFound, "--accept: vm %q not found", vm)
+			return nil, nil, status.Errorf(codes.NotFound, "--accept: vm %q not found", vm)
 		}
-		return nil, nil
+		return nil, nil, nil
 	}
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vm)
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "read vm/%s's disk rows: %v", vm, err)
+		return nil, nil, status.Errorf(codes.Unavailable, "read vm/%s's disk rows: %v", vm, err)
 	}
 	here, owner := s.hostName, rec.HostName
 	// On the VM's owner, its domain here is what a start boots: read whether
@@ -444,9 +490,9 @@ func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev 
 		case aerr != nil && libvirt.IsNoDomain(aerr):
 			// No domain: a start rebuilds it from the disk rows.
 		case aerr != nil:
-			return nil, status.Errorf(codes.Unavailable, "read the state of vm/%s's domain: %v", vm, aerr)
+			return nil, nil, status.Errorf(codes.Unavailable, "read the state of vm/%s's domain: %v", vm, aerr)
 		case act && holder == here:
-			return nil, status.Errorf(codes.FailedPrecondition,
+			return nil, nil, status.Errorf(codes.FailedPrecondition,
 				"refusing to resolve %s on vm/%s: its domain is active on %s. A hand resolution is accepted here only while "+
 					"it is shut off, so the file it was writing is the file it boots: with a block-copy mirror still running, "+
 					"finish it first (`virsh blockjob %s <disk> --pivot` or `--abort`, as a start's refusal says), then `lv stop %s` and retry",
@@ -455,7 +501,7 @@ func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev 
 			active = act
 			x, xerr := s.virt.DumpXMLInactive(vm)
 			if xerr != nil {
-				return nil, status.Errorf(codes.FailedPrecondition,
+				return nil, nil, status.Errorf(codes.FailedPrecondition,
 					"refusing to resolve %s on vm/%s: its persistent config cannot be read (%v); make it readable "+
 						"(virsh dumpxml --inactive %s) and retry", health.MoveUnresolvedCode, vm, xerr, vm)
 			}
@@ -463,6 +509,7 @@ func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev 
 		}
 	}
 	var out []moveRowChange
+	var forks []string
 	for _, m := range ev.Moves {
 		var row *corrosion.DiskRecord
 		for i := range disks {
@@ -477,7 +524,7 @@ func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev 
 				if row != nil {
 					now = "names " + row.Path
 				}
-				return nil, status.Errorf(codes.FailedPrecondition,
+				return nil, nil, status.Errorf(codes.FailedPrecondition,
 					"--accept %s: the disk row of vm/%s's disk %s %s, neither file of the move; it is not changed", a, vm, m.Disk, now)
 			}
 			continue
@@ -488,13 +535,19 @@ func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev 
 		}
 		path, proven := health.MoveCompleteFile(m)
 		if proven && path != "" && keep != path {
-			return nil, status.Errorf(codes.FailedPrecondition,
+			if f := forkedHistory(here, owner, holder, rec, m, row.Path, keep, path, accepted, config, xml); f != "" {
+				// The owner's own writes since the VM changed hands are in
+				// keep; the other file holds the holder's and stays on disk.
+				forks = append(forks, f)
+				continue
+			}
+			return nil, nil, status.Errorf(codes.FailedPrecondition,
 				"refusing to resolve %s on vm/%s: the guest was moved onto %s (or the config named it before the move), so "+
 					"%s lacks the writes made since; for disk %s only `--accept %s` is accepted",
 				health.MoveUnresolvedCode, vm, m.Dst, keep, m.Disk, m.Dst)
 		}
 		if active && keep != row.Path {
-			return nil, status.Errorf(codes.FailedPrecondition,
+			return nil, nil, status.Errorf(codes.FailedPrecondition,
 				"refusing to resolve %s on vm/%s: this would point the disk row of %s at %s while its domain is active on %s, "+
 					"writing the file it opened. Stop it first (`lv stop %s`), or pass --accept %s to keep the file the row names",
 				health.MoveUnresolvedCode, vm, m.Disk, keep, here, vm, row.Path)
@@ -503,12 +556,12 @@ func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev 
 		if config {
 			n, nerr := health.MovedDiskNames(xml, m)
 			if nerr != nil {
-				return nil, status.Errorf(codes.FailedPrecondition,
+				return nil, nil, status.Errorf(codes.FailedPrecondition,
 					"refusing to resolve %s on vm/%s: its persistent config names neither %s nor %s for disk %s (%v); name "+
 						"the file to keep in it (virsh edit %s) and retry", health.MoveUnresolvedCode, vm, m.Src, m.Dst, m.Disk, nerr, vm)
 			}
 			if names = n; names != keep {
-				return nil, status.Errorf(codes.FailedPrecondition,
+				return nil, nil, status.Errorf(codes.FailedPrecondition,
 					"refusing to resolve %s on vm/%s: its persistent config on %s names %s for disk %s, and this would leave "+
 						"the disk row on %s; `lv start` boots the config and a rebuild boots the row, so they must name the "+
 						"same file. Pass --accept %s to keep the file the config names, or point the config at %s (virsh edit %s) and retry",
@@ -522,7 +575,7 @@ func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev 
 		// the define ran.
 		configProvesSrc := config && holder == here && names == m.Src && keep == m.Src
 		if !accepted && !(proven && (path == "" || row.Path == path)) && !configProvesSrc {
-			return nil, status.Errorf(codes.FailedPrecondition,
+			return nil, nil, status.Errorf(codes.FailedPrecondition,
 				"refusing to resolve %s on vm/%s: the live move of disk %s on %s recorded no pivot, so whether the guest's "+
 					"last writes are in %s or %s is not known, and the disk row (%s) is no evidence of it, nor is a persistent "+
 					"config naming the copy (the move names it before the pivot). Name the file to keep with --accept, once "+
@@ -546,17 +599,17 @@ func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev 
 			reads = health.SharedPoolHolds(ctx, s.db, s.dataDir, here, holder, pool, typ, keep)
 		case here == holder:
 			// The owner's domain cannot be read from here: its row stays.
-			return nil, status.Errorf(codes.FailedPrecondition,
+			return nil, nil, status.Errorf(codes.FailedPrecondition,
 				"refusing to resolve %s on vm/%s: %s holds the move's record, but the VM is on its owner %s, whose domain this host "+
 					"cannot read, so the disk row of %s is not pointed at %s from here. Keep the file the row names "+
 					"(--accept %s), or point the row on the owner (LV_HOST=%s), once %s is %s, with its domain shut off",
 				health.MoveUnresolvedCode, vm, here, owner, m.Disk, keep, row.Path, owner, here, "proven powered off (an IPMI fence, or `lv host fence-confirm "+here+"`)")
 		default:
-			return nil, status.Errorf(codes.FailedPrecondition,
+			return nil, nil, status.Errorf(codes.FailedPrecondition,
 				"--accept points the disk row at a file: run it on the VM's owner %s (LV_HOST=%s), or on the move's holder %s", owner, owner, holder)
 		}
 		if !reads {
-			return nil, status.Errorf(codes.FailedPrecondition, "--accept %s: %s does not read that file as %s does (it is not "+
+			return nil, nil, status.Errorf(codes.FailedPrecondition, "--accept %s: %s does not read that file as %s does (it is not "+
 				"here as a regular file, or not on a mounted shared pool %s and %s define alike)", keep, here, holder, here, holder)
 		}
 		after := *row
@@ -568,7 +621,26 @@ func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev 
 		}
 		out = append(out, moveRowChange{m: m, cur: *row, after: after})
 	}
-	return out, nil
+	return out, forks, nil
+}
+
+// forkedHistory describes the forked history of move m that a hand resolution
+// keeps keep of ("" when it is not one): after the holder pivoted the guest
+// onto other, the VM changed hands (health.OwnerChangedSince) and its owner,
+// this host, ran it on the file its disk row names. Taken only with --accept
+// of the row's file, on the owner that does not hold the move (the holder is
+// proven powered off), whose persistent config, which `lv start` boots, names
+// that file. The row is not changed and other is never deleted.
+func forkedHistory(here, owner, holder string, rec *corrosion.VMRecord, m health.UnresolvedMove, rowPath, keep, other string, accepted, config bool, xml string) string {
+	if !accepted || !config || here != owner || here == holder || keep != rowPath || !health.OwnerChangedSince(rec, m) {
+		return ""
+	}
+	if names, err := health.MovedDiskNames(xml, m); err != nil || names != keep {
+		return ""
+	}
+	return fmt.Sprintf("disk %s keeps %s, which %s has run since the VM changed hands after the move began (owner %s at "+
+		"generation %d then, %s at %d now); %s, onto which %s pivoted the guest, holds its writes after the pivot and is "+
+		"kept on disk", m.Disk, keep, here, m.Owner, m.OwnerEpoch, rec.HostName, rec.OwnerEpoch, other, holder)
 }
 
 // applyMoveRowChanges writes changes, each only while its row is still the

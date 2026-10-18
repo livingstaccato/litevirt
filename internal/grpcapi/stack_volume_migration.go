@@ -452,11 +452,15 @@ func (s *Server) migrateVMVolumes(
 		var err error
 		if vp.vm.HostName == s.hostName {
 			vm := vp.vm
-			disk := dp.disk
 			// Under the VM's lock, as MoveVolume moves: a start, a backup or a
-			// hand resolution of the VM waits for the move.
+			// hand resolution of the VM waits for the move. The disk row is
+			// read again under it: the plan's copy may predate a hand
+			// resolution that repointed it.
 			unlock := s.lockVM(vm.Name)
-			err = s.moveOneVolume(ctx, &vm, &disk, dp.targetPool, deleteSource, sink)
+			var disk *corrosion.DiskRecord
+			if disk, err = s.diskRowOf(ctx, vm.Name, dp.disk.DiskName); err == nil {
+				err = s.moveOneVolume(ctx, &vm, disk, dp.targetPool, deleteSource, sink)
+			}
 			unlock()
 		} else {
 			err = s.moveRemoteVolume(ctx, vp.vm.HostName, vp.vm.Name, dp.disk.DiskName, dp.targetPool, deleteSource, sink)

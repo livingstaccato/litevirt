@@ -47,14 +47,23 @@ func (s *Server) beginMoveMarker(ctx context.Context, vm *corrosion.VMRecord, sr
 		At:             time.Now().UTC().Format(time.RFC3339Nano),
 		SrcBackingDisk: src.BackingDisk, SrcBackingImage: src.BackingImage,
 	}}
+	if cur, err := corrosion.GetVM(ctx, s.db, vm.Name); err == nil && cur != nil {
+		// Who owns the VM as the move begins: a later owner, or generation,
+		// shows it changed hands since (health.OwnerChangedSince).
+		mk.m.Owner, mk.m.OwnerEpoch = cur.HostName, cur.OwnerEpoch
+	}
 	prior, hadPrior := s.moveRecordOf(vm.Name, src.DiskName)
 	if hadPrior && prior.Dst == dstPath && (prior.Src == src.Path || prior.Dst == src.Path) {
 		// The same move, retried: it keeps its identity (At, which a hand
-		// resolution matches) and what the first attempt knew.
+		// resolution matches), the owner it began under, and what the first
+		// attempt knew.
 		mk.m.Src, mk.m.SrcType, mk.m.SrcPool = prior.Src, prior.SrcType, prior.SrcPool
 		mk.m.SrcBackingDisk, mk.m.SrcBackingImage = prior.SrcBackingDisk, prior.SrcBackingImage
 		if prior.At != "" {
 			mk.m.At = prior.At
+		}
+		if prior.Owner != "" {
+			mk.m.Owner, mk.m.OwnerEpoch = prior.Owner, prior.OwnerEpoch
 		}
 		mk.m.Live = mk.m.Live || prior.Live
 		mk.m.Pivoted = mk.m.Pivoted || prior.Pivoted

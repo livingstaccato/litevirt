@@ -333,15 +333,7 @@ func (s *Server) liveMoveVolume(
 		// back (only the redefined case can; already-at-dst keeps dest), keep the source,
 		// and remove the dest only if persistent no longer references it.
 		rowPath := src.Path
-		dbErr := corrosion.UpdateDiskPlacement(ctx, s.db, vm.Name, src.DiskName, src.HostName, src.Path, src.StorageType, src.StorageVolume)
-		if dbErr == nil && (src.BackingDisk != "" || src.BackingImage != "") {
-			// The commit cleared the backing record for the flattened copy;
-			// the source is still the overlay it was.
-			if berr := corrosion.RestoreDiskBacking(ctx, s.db, vm.Name, src.DiskName, src.Path, src.BackingDisk, src.BackingImage); berr != nil {
-				slog.Error("live move: pivot failed; the disk row is back on the source, but its backing record could not be restored",
-					"vm", vm.Name, "disk", src.DiskName, "backing_disk", src.BackingDisk, "backing_image", src.BackingImage, "error", berr)
-			}
-		}
+		dbErr := s.pointRowBackAtSource(ctx, vm.Name, src)
 		if dbErr != nil {
 			rowPath = destPath
 			slog.Error("live move: pivot failed and DB rollback to src also failed — DB records dest but guest is on src; operator must reconcile",
@@ -605,4 +597,24 @@ func buildDiskXML(destPath string) string {
 		`<disk type="file" device="disk"><driver name="qemu" type="qcow2"/><source file="%s"/></disk>`,
 		destPath,
 	)
+}
+
+// pointRowBackAtSource points the disk row the commit moved to the copy back
+// at src, with src's backing record (the commit cleared it for a flattened
+// copy, and the source is still the overlay it was), in one write made only
+// while the row is still the one read. A failure leaves the row on the copy,
+// never on the source without its backing.
+func (s *Server) pointRowBackAtSource(ctx context.Context, vm string, src *corrosion.DiskRecord) error {
+	cur, err := s.diskRowOf(ctx, vm, src.DiskName)
+	if err != nil {
+		return err
+	}
+	after := *cur
+	after.HostName, after.Path, after.StorageType, after.StorageVolume = src.HostName, src.Path, src.StorageType, src.StorageVolume
+	after.BackingDisk, after.BackingImage = src.BackingDisk, src.BackingImage
+	ok, err := corrosion.ReplaceDiskRowIfStill(ctx, s.db, *cur, after)
+	if err == nil && !ok {
+		err = errors.New("the disk row changed while it was being pointed back")
+	}
+	return err
 }

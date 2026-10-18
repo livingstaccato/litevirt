@@ -27,7 +27,7 @@ func TestResolveRemoteMove_NeverRepointsUnderTheOwnersDomain(t *testing.T) {
 	}{
 		{name: "running", define: "src", running: true, wantErr: "running"},
 		{name: "running on the copy", define: "dst", running: true, wantErr: "running"},
-		{name: "shut off, the config names the source", define: "src", wantErr: "virsh edit mv"},
+		{name: "shut off, the config names the source", define: "src", wantErr: "which a start boots"},
 		{name: "shut off, the config names the copy", define: "dst", wantRowOnDst: true},
 		{name: "no domain", wantRowOnDst: true},
 	} {
@@ -80,6 +80,19 @@ func TestResolveRemoteMove_NeverRepointsUnderTheOwnersDomain(t *testing.T) {
 			if tc.wantErr != "" && (!IsMoveUnresolved(err) || !strings.Contains(err.Error(), tc.wantErr) ||
 				!strings.Contains(err.Error(), src) || !strings.Contains(err.Error(), dst)) {
 				t.Fatalf("want a refusal saying %q and naming both files, got %v", tc.wantErr, err)
+			}
+			if tc.wantErr != "" && tc.define == "src" {
+				// I5-1: the guest may have run here on the source since the
+				// failover, so the source is not called stale, the config is not
+				// steered onto the copy, and the exit keeping it is named.
+				for _, bad := range []string{"lacks the writes", "virsh edit"} {
+					if strings.Contains(err.Error(), bad) {
+						t.Fatalf("the refusal says %q: %v", bad, err)
+					}
+				}
+				if !strings.Contains(err.Error(), resolveAcceptCmd("mv", src)) || !strings.Contains(err.Error(), resolveAcceptCmd("mv", dst)) {
+					t.Fatalf("the refusal does not name both exits: %v", err)
+				}
 			}
 			want := src
 			if tc.wantRowOnDst {

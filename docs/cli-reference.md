@@ -1507,6 +1507,9 @@ lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH
                                              #   the VM and its config and record name the source.
                                              #   On the owner the domain's config must name each file
                                              #   kept, and a running domain's record is not changed.
+                                             #   After a pivot only the copy is accepted, unless the VM
+                                             #   changed hands since the move began and the owner's
+                                             #   config names the record's file (a forked history).
                                              #   `lv health` lists the moves first (docs/diagnostics.md).
 lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>] [--until <time>]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics

@@ -1780,7 +1780,8 @@ is both, or a file on a mounted shared pool both hosts define alike (the same
 export mounted at the same directory, the pool's own source). On a holding
 host that does not own the VM, `--accept` may only name the file the disk
 record already names. A resolution never keeps a file the move proves stale:
-after a pivot only the copy is accepted. A live move with no pivot recorded is
+after a pivot only the copy is accepted, except in a forked history (below).
+A live move with no pivot recorded is
 refused without an `--accept` for its disk: nothing in the cluster knows
 which file the guest wrote last, and neither the disk record nor a persistent
 config naming the copy is evidence of it (the move names the copy in the
@@ -1793,8 +1794,30 @@ start` boots, must name the file each disk record is left on (point it there
 with `virsh edit` or pass that file to `--accept`), and no disk record is
 changed while the domain is active (`lv stop` it first); on the holding host
 that owns the VM the domain must be shut off. A condition whose evidence
-cannot be read is resolved only on the VM's owner with its domain shut off,
-and keeps the disk records as they are.
+cannot be read is resolved only on the VM's owner with its domain shut off and
+its persistent config naming the file each disk record names, and keeps the
+disk records as they are; a holding host that returns with a record of a move
+of one of those disks begun before the resolution drops it.
+
+**A forked history.** A pivoted move whose condition reached the VM's new
+owner only after a failover there (replication from the holding host was cut,
+or the condition was resolved over unreadable evidence) leaves two histories:
+the copy holds the writes the holding host made after the pivot, and the
+source, which the owner started the VM on, holds the writes made there since.
+Neither file is complete, and the owner's starts are refused with a text
+naming both exits. Once the holding host is proven powered off, on the owner:
+
+- `lv health resolve vm.move_unresolved vm/<vm> --accept <source> --reason
+  "…"` keeps the owner's writes. It is accepted when the owner's persistent
+  config names the file its disk record names and the VM changed hands after
+  the move began (another owner, or a later ownership generation, than the
+  move recorded); the domain may keep running. The disk record is not
+  changed, the copy is kept on disk, and a `health.condition.hand_diverged`
+  audit row names it.
+- `--accept <copy>` keeps the holding host's writes and discards every write
+  made on the source since the failover. It needs the domain stopped (`lv
+  stop`) and its persistent config pointed at the copy, as any other
+  `--accept` of the copy on the owner.
 
 A holding host that rejoins after an admin resolved its move from another
 host drops its record of that move instead of raising the condition again,

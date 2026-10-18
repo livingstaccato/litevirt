@@ -112,7 +112,11 @@ move with no pivot recorded) is refused without one: nothing in the cluster
 knows which file the guest wrote last, unless the holding host owns the VM
 and its persistent config and disk record name the source. On the VM's owner,
 with its domain defined, its persistent config must name the file each disk
-record is left on, and no disk record is changed while it is active.
+record is left on, and no disk record is changed while it is active. After a
+pivot only the copy is accepted, except on the VM's owner when the VM changed
+hands after the move began and its config names the file the disk record
+names: --accept of that file keeps the owner's writes since, and the copy is
+kept on disk (docs/diagnostics.md, "A forked history").
 
 Requires the cluster.health.resolve verb (Admin). The resolution is written
 to the audit log with your principal and --reason, and published as an

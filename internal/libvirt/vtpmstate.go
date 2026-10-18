@@ -191,8 +191,15 @@ func ReadFirmwareBundle(r io.Reader, dataDir, vmName, uuid string) error {
 				// The swtpm base dir must be world-traversable (libvirt uses 0711)
 				// so the dropped-privilege swtpm user can reach per-UUID state.
 				base := filepath.Dir(swtpmRoot)
+				_, statErr := os.Stat(base)
 				if err := os.MkdirAll(base, 0o711); err != nil {
 					return err
+				}
+				if os.IsNotExist(statErr) {
+					// The directory is new: its entry is on disk once its parent is.
+					if err := fsyncDir(filepath.Dir(base)); err != nil {
+						return fmt.Errorf("flush the directory of the new swtpm directory: %w", err)
+					}
 				}
 				_ = os.Chmod(base, 0o711) // MkdirAll won't fix an existing 0700
 				swtpmStage, err = os.MkdirTemp(base, ".swtpm-restore-*")
@@ -492,6 +499,9 @@ func keepStaleBackup(bak string) error {
 	kept := bak + "-" + time.Now().UTC().Format("20060102T150405.000000000")
 	if err := os.Rename(bak, kept); err != nil {
 		return fmt.Errorf("keep the backup an earlier restore left: %w", err)
+	}
+	if err := fsyncDir(filepath.Dir(bak)); err != nil {
+		return fmt.Errorf("flush the kept backup's directory: %w", err)
 	}
 	slog.Warn("firmware restore: kept the backup an earlier, interrupted restore left; only an operator removes it",
 		"path", kept)

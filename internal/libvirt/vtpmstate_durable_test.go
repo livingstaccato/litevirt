@@ -137,3 +137,46 @@ func TestReadFirmwareBundle_KeepsABackupLeftByAnEarlierAttempt(t *testing.T) {
 		t.Error("the earlier attempt's swtpm backup was overwritten or removed")
 	}
 }
+
+// A swtpm base directory the restore had to make is fsynced into its parent,
+// as the new nvram directory is.
+func TestReadFirmwareBundle_FsyncsANewSwtpmBase(t *testing.T) {
+	redirectSwtpmBase(t)
+	buf := bundleOf(t, true, true) // made under another base, so this one is new
+	parent := t.TempDir()
+	libvirtSwtpmBase = filepath.Join(parent, "swtpm")
+	calls := recordDirSyncs(t, nil)
+	if err := ReadFirmwareBundle(buf, t.TempDir(), "dst", "uuid-d"); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(*calls, parent) {
+		t.Fatalf("the new swtpm base was not fsynced into %s: %v", parent, *calls)
+	}
+}
+
+// Moving an earlier attempt's backup aside is fsynced at once, before
+// anything else in the restore can fail.
+func TestReadFirmwareBundle_KeptBackupRenameIsFsynced(t *testing.T) {
+	redirectSwtpmBase(t)
+	buf := bundleOf(t, true, false)
+	dst := t.TempDir()
+	seedFirmware(t, dst, "dst", "uuid-d", true, false)
+	nvBak := NvramPath(dst, "dst") + ".bak"
+	if err := os.WriteFile(nvBak, []byte("ORIGINAL-NVRAM"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nvramDir := filepath.Dir(NvramPath(dst, "dst"))
+	calls := recordDirSyncs(t, nil)
+	if err := ReadFirmwareBundle(buf, dst, "dst", "uuid-d"); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, c := range *calls {
+		if c == nvramDir {
+			n++
+		}
+	}
+	if n < 2 {
+		t.Fatalf("the nvram directory was fsynced %d time(s); want the kept-backup rename flushed on its own as well: %v", n, *calls)
+	}
+}

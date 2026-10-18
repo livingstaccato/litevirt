@@ -206,12 +206,11 @@ func SeedFirewallSynflood(ctx context.Context, c *Client, g capabilities.Feature
 	// Insert only if absent, decided inside the write's own transaction: an
 	// operator's row that arrives between a separate check and the write
 	// must never be overwritten by the 0001 seed stamp, even locally.
-	key := FirewallSynfloodKey("")
 	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		var n int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM cluster_policies WHERE key = ?`, key).Scan(&n); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM cluster_policies WHERE key = ?`, FirewallSynfloodKey("")).Scan(&n); err != nil {
 			return false, err
 		}
 		return n == 0, nil
-	}, []Statement{{SQL: clusterPolicyUpsertSQL, Params: []interface{}{key, string(v), "litevirt (initial)", seedTS(FirewallEnforce)}}})
+	}, []Statement{{SQL: clusterPolicyUpsertSQL, Params: []interface{}{FirewallSynfloodKey(""), string(v), "litevirt (initial)", seedTS(FirewallEnforce)}}})
 }

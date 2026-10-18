@@ -169,7 +169,6 @@ var loginPolicyWriters = []string{
 	"internal/corrosion.ResetUserLifecycle",
 	"internal/corrosion.enableUserStatements",
 	"internal/corrosion.SetTwoFactorPolicy",
-	"internal/corrosion.InsertSessionWithFactor",
 	"internal/corrosion.InsertSessionWithLoginData",
 	"internal/corrosion.IssueEnrollmentCode",
 	"internal/corrosion.ConsumeEnrollmentCode",

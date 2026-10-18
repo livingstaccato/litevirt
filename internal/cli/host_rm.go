@@ -14,6 +14,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pki"
+	"github.com/litevirt/litevirt/internal/ssh"
 )
 
 // HostRemove takes a host out of the cluster and revokes the certificate it holds.
@@ -46,6 +47,7 @@ func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force
 	if err := refuseVoterRemoval(ctx, c, hostName); err != nil {
 		return err
 	}
+	listed := listedHost(ctx, c, hostName)
 	// Read and revoke BEFORE the tombstone. Once RemoveHost succeeds, ListHosts
 	// deliberately hides the row and there is no supported way to recover its
 	// certificate serial. A mint or publish failure must therefore leave the row
@@ -77,6 +79,29 @@ func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force
 	printRemoved(hostName, removed, "Host %s removed from cluster.\n")
 	fmt.Printf("  revoked certificate %s in CRL %d before removing the host\n", serial, version)
 	fmt.Println("  `lv health` warns for as long as any peer's CRL version is behind another's")
+	// A joining host is often an add stranded after its admission, which left
+	// the admitted (now revoked) pair staged on the machine for a rerun.
+	if listed != nil && listed.GetState() == pb.HostState_HOST_JOINING && listed.GetAddress() != "" {
+		if err := removeStagedAdmission(listed.GetAddress(), serial); err != nil {
+			fmt.Printf("  could not remove the credentials an unfinished `lv host add` may have staged on %s "+
+				"(%v); they are revoked. Remove %s/.host.crt.add and .host.key.add there by hand\n",
+				listed.GetAddress(), err, remotePKIDir)
+		}
+	}
+	return nil
+}
+
+// listedHost is hostName's ListHosts entry, or nil when it cannot be read.
+func listedHost(ctx context.Context, c pb.LiteVirtClient, hostName string) *pb.Host {
+	resp, err := c.ListHosts(ctx, &pb.ListHostsRequest{})
+	if err != nil {
+		return nil
+	}
+	for _, h := range resp.GetHosts() {
+		if h.GetName() == hostName {
+			return h
+		}
+	}
 	return nil
 }
 
@@ -390,4 +415,25 @@ func printRemoved(hostName string, removed *pb.RemoveHostResponse, plain string)
 	}
 	fmt.Printf("Host %s removed (incarnation %d, serial %s).\n", hostName,
 		removed.GetIncarnation(), removed.GetCertSerial())
+}
+
+// removeStagedAdmission removes, over SSH as root, the admitted pair a
+// stranded `lv host add` left staged on the host at addr, when the staged
+// certificate is serial's. A seam so the removal can be tested without a host.
+var removeStagedAdmission = func(addr, serial string) error {
+	sc, err := ssh.NewClient("root@" + addr)
+	if err != nil {
+		return fmt.Errorf("SSH connect: %w", err)
+	}
+	defer sc.Close()
+	r := &sshRemotePKI{sc: sc}
+	crt := addStagedPath(filepath.Join(remotePKIDir, "host.crt"))
+	b, ok, err := r.ReadFile(crt)
+	if err != nil || !ok {
+		return err
+	}
+	if !strings.EqualFold(installedSerial(b), serial) {
+		return nil
+	}
+	return sc.Run("rm -f -- " + ssh.ShellQuote(crt) + " " + ssh.ShellQuote(addStagedPath(filepath.Join(remotePKIDir, "host.key"))))
 }

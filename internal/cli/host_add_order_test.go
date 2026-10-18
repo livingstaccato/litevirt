@@ -667,3 +667,33 @@ func TestAddInstallCommands_AFailedSyncDoesNotRename(t *testing.T) {
 		t.Errorf("the key was replaced after a failed sync: %q", got)
 	}
 }
+
+// fd re-review N-m3: a resumed add installs the admitted certificate with the
+// key beside it, so the key must be that certificate's: one left by another
+// partial attempt would leave a daemon that cannot load its pair while the
+// add reported success. The rerun refuses and names `lv host rm`.
+//
+// Mutation: skip the pair check — the rerun installs the mismatched key.
+func TestHostAdd_AResumeChecksTheKeyMatchesTheCertificate(t *testing.T) {
+	f := newAddFixture(t)
+	f.target.FailSetup = errors.New("setup failed")
+	if err := f.add(t); err == nil {
+		t.Fatal("the first add succeeded")
+	}
+	// Another attempt's key replaced the staged one.
+	other := t.TempDir()
+	if err := pki.GenerateHostCert(filepath.Join(f.opPKI, "ca.crt"), filepath.Join(f.opPKI, "ca.key"),
+		filepath.Join(other, "x.crt"), filepath.Join(other, "x.key"), "node-9", net.IPv4(10, 0, 0, 9)); err != nil {
+		t.Fatal(err)
+	}
+	staged := addStagedPath(filepath.Join(f.targetPKI, "host.key"))
+	if err := os.WriteFile(staged, mustRead(t, filepath.Join(other, "x.key")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.target.FailSetup = nil
+	err := f.add(t)
+	if err == nil || !strings.Contains(err.Error(), "does not match") || !strings.Contains(err.Error(), "lv host rm node-9") {
+		t.Fatalf("the resume over a mismatched key = %v, want a refusal naming lv host rm", err)
+	}
+	f.identityUnchanged(t)
+}

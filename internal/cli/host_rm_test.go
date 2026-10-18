@@ -34,6 +34,9 @@ type hostRemoveTestClient struct {
 	planVoter  bool
 	// goneAfterRemove lists no host once RemoveHost has been called.
 	goneAfterRemove bool
+	// hostState and hostAddr are node-9's listed state and address.
+	hostState pb.HostState
+	hostAddr  string
 }
 
 func (c *hostRemoveTestClient) PlanDeadHostRemoval(_ context.Context, req *pb.PlanDeadHostRemovalRequest, _ ...grpc.CallOption) (*pb.PlanDeadHostRemovalResponse, error) {
@@ -60,7 +63,7 @@ func (c *hostRemoveTestClient) ListHosts(context.Context, *pb.ListHostsRequest, 
 	if c.goneAfterRemove && countCalls(c.calls, "remove") > 0 {
 		return &pb.ListHostsResponse{}, nil
 	}
-	return &pb.ListHostsResponse{Hosts: []*pb.Host{{Name: "node-9", CertSerial: "a1b2c3"}}}, nil
+	return &pb.ListHostsResponse{Hosts: []*pb.Host{{Name: "node-9", CertSerial: "a1b2c3", State: c.hostState, Address: c.hostAddr}}}, nil
 }
 
 func (c *hostRemoveTestClient) PublishCRL(context.Context, *pb.PublishCRLRequest, ...grpc.CallOption) (*pb.PublishCRLResponse, error) {
@@ -594,5 +597,48 @@ func TestHostRemoveDead_TheDryRunRunsThePreflight(t *testing.T) {
 	voter := &hostRemoveTestClient{planVoter: true, preflightErr: status.Error(codes.FailedPrecondition, "node-9 is a member of voter generation 1")}
 	if err := HostRemoveDead(context.Background(), voter, "node-9", true); err != nil || voter.preflightReq != nil || len(voter.calls) != 0 {
 		t.Errorf("a voter's dry run: %v (preflight %v, calls %v), want no preflight and no change", err, voter.preflightReq, voter.calls)
+	}
+}
+
+// fd re-review N-m3: an add stranded after its admission leaves the admitted
+// pair staged on the host for a rerun. When the operator removes the joining
+// host instead, `lv host rm` removes that staged pair (only the one of the
+// serial it revoked), best-effort: a host it cannot reach does not fail the
+// removal. Nothing is attempted for a host that is not joining.
+//
+// Mutation: never call the cleanup — "joining" sees no call; call it for
+// every host — "active" sees one.
+func TestHostRemove_RemovesAStrandedAddsStagedPair(t *testing.T) {
+	type call struct{ addr, serial string }
+	for _, tc := range []struct {
+		name  string
+		state pb.HostState
+		fail  error
+		want  int
+	}{
+		{"joining", pb.HostState_HOST_JOINING, nil, 1},
+		{"joining unreachable", pb.HostState_HOST_JOINING, errors.New("no route to host"), 1},
+		{"active", pb.HostState_HOST_ACTIVE, nil, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rmTestPKI(t)
+			var calls []call
+			old := removeStagedAdmission
+			removeStagedAdmission = func(addr, serial string) error {
+				calls = append(calls, call{addr, serial})
+				return tc.fail
+			}
+			t.Cleanup(func() { removeStagedAdmission = old })
+			c := &hostRemoveTestClient{hostState: tc.state, hostAddr: "10.0.0.9"}
+			if err := HostRemove(context.Background(), c, "node-9", false); err != nil {
+				t.Fatalf("removal: %v", err)
+			}
+			if len(calls) != tc.want {
+				t.Fatalf("staged-pair cleanup called %d times, want %d", len(calls), tc.want)
+			}
+			if tc.want == 1 && (calls[0].addr != "10.0.0.9" || calls[0].serial != "a1b2c3") {
+				t.Errorf("cleanup asked for %+v, want 10.0.0.9 and the revoked serial", calls[0])
+			}
+		})
 	}
 }

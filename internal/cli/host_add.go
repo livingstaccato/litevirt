@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -212,6 +213,11 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 			return addedLocally(p)
 		case joining && (installed == admittedSerial || staged == admittedSerial):
 			serial, pairOnMachine = admittedSerial, true
+			if err := admittedPairMatches(r, installed == admittedSerial); err != nil {
+				return fmt.Errorf("the key %s holds beside its admitted certificate %s does not match it (%v), so "+
+					"its daemon could not load the pair. Undo the admission with `lv host rm %s`, then run `%s` again",
+					p.hostName, admittedSerial, err, p.hostName, p.rerun)
+			}
 		case joining:
 			return fmt.Errorf("%s is admitted (joining) with certificate %s, which the host holds neither installed "+
 				"nor staged. Undo the admission with `lv host rm %s`, then run `%s` again",
@@ -970,4 +976,26 @@ func hostConfig(r addRemote, p hostAddPlan) (*addFile, error) {
 		return nil, refuse(err)
 	}
 	return &addFile{path, merged, os.FileMode(mode)}, nil
+}
+
+// admittedPairMatches checks that the host's key is its admitted
+// certificate's: the installed pair, or the staged one an unfinished add left.
+func admittedPairMatches(r addRemote, installed bool) error {
+	crt, key := filepath.Join(remotePKIDir, "host.crt"), filepath.Join(remotePKIDir, "host.key")
+	if !installed {
+		crt, key = addStagedPath(crt), addStagedPath(key)
+	}
+	c, okc, err := r.ReadFile(crt)
+	if err != nil {
+		return err
+	}
+	k, okk, err := r.ReadFile(key)
+	if err != nil {
+		return err
+	}
+	if !okc || !okk {
+		return fmt.Errorf("%s or %s is missing", crt, key)
+	}
+	_, err = tls.X509KeyPair(c, k)
+	return err
 }

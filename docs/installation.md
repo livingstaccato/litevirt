@@ -148,7 +148,10 @@ installs, each file it replaces in `/etc/litevirt/pki` is kept beside it as
 the admission, and removed once it succeeds. A host admitted by an add that
 did not finish shows `HOST_JOINING`: run the same `lv host add` again, from
 any machine holding the cluster CA, to finish it, or `lv host rm <name>` to
-undo the admission.
+undo the admission. That removal also deletes the admitted credentials the add
+left staged on the machine, when it can reach the machine over SSH as root. A
+rerun refuses when the key staged or installed on the machine is not the
+admitted certificate's.
 
 A machine that already has `/etc/litevirt/config.yaml` keeps it. The add
 edits in place only `host_name`, `advertise_address`, `join_peers`, `pki_dir`

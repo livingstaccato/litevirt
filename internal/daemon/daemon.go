@@ -3268,18 +3268,18 @@ func (d *Daemon) runAuthEngineReload(ctx context.Context) {
 // aside on this host (<path>.superseded-<time>) once they are older than
 // superseded_disk_retention_days and the VM they came from no longer exists
 // (health.PurgeSupersededDisks): while it exists, only an operator removes
-// them. 0 keeps every copy.
+// them. 0 keeps every copy. The reconciler's firmware quarantines
+// (<data_dir>/fwmig-quarantine/<vm>-reconciled-<unix>/) follow the same rule
+// (health.SweepSetAside).
 func (d *Daemon) runSupersededDiskSweep(ctx context.Context) {
 	days := d.cfg.SupersededDiskRetentionDays
 	if days <= 0 {
-		slog.Info("superseded disk copies are kept until removed by hand (superseded_disk_retention_days: 0)")
+		slog.Info("superseded disk copies and reconciled firmware quarantines are kept until removed by hand (superseded_disk_retention_days: 0)")
 		return
 	}
 	retention := time.Duration(days) * 24 * time.Hour
 	sweep := func() {
-		if _, err := health.PurgeSupersededDisks(ctx, d.db, d.cfg.DataDir, retention, time.Now()); err != nil {
-			slog.Warn("superseded disk sweep", "error", err)
-		}
+		health.SweepSetAside(ctx, d.db, d.cfg.DataDir, retention, time.Now())
 	}
 	select {
 	case <-ctx.Done():

@@ -43,7 +43,9 @@ refuses where it has no row for it:
   --reverify             hash the source's final state again and resend Verify
   --adopt-target-copy    take the target's copy without a Verify match (the
                          source's state is suspect or missing, the target ran,
-                         or the source host is lost and fenced)
+                         or the source host is lost and fenced); or keep a
+                         shut-off leftover as the VM's own once its row names
+                         that host for the leftover's incarnation
   --accept-source        take the source's copy: discard the target's; after
                          the commit return the VM and its disks to the source
   --discard-target       discard the target's copy while the source's guest

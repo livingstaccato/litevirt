@@ -37,6 +37,14 @@ failed restart may need it, so not even --remove takes it. Once the VM is gone
 the host removes its copies when they are older than
 superseded_disk_retention_days (default 7; 0 keeps every copy).
 
+The firmware state (NVRAM, vTPM) the reconciler moved aside from a leftover
+domain whose VM now runs elsewhere is listed here too, as
+<data_dir>/fwmig-quarantine/<vm>-reconciled-<time> ("firmware state of VM
+<vm>"). It follows the same rule, and is also held while a live firmware move
+record or an open owed DISCARD names the VM, or while the reconciler has not
+finished moving it (<vm>-reconciling-<uuid>). --remove takes it by its path;
+--restore does not.
+
 --purge removes every copy that is neither retained nor held, whatever its
 age. Narrow it with --older-than.
 

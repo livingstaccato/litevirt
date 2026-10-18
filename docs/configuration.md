@@ -737,7 +737,11 @@ vm_event_prune_hours: 24
 # from exists, whatever its state: only `lv host superseded-disks <host>
 # --remove <copy>` removes one then. Once the VM is gone, its copies are
 # removed by their host when older than this. 0 keeps every copy until removed
-# with `lv host superseded-disks --purge` or `--remove`.
+# with `lv host superseded-disks --purge` or `--remove`. The firmware state
+# (NVRAM, vTPM) the reconciler moves aside from a leftover domain
+# (<data_dir>/fwmig-quarantine/<vm>-reconciled-<unix>/) follows the same rule,
+# and is also kept while a firmware move record or an open owed DISCARD names
+# the VM.
 superseded_disk_retention_days: 7
 
 # Pending OS package updates (docs/upgrades.md, "Pending OS updates"). A

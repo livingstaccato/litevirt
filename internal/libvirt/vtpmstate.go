@@ -642,14 +642,81 @@ func (f *FirmwareStore) QuarantineFirmwareMoveSourceForOperator(vmName, uuid, at
 	return f.quarantineMoveState(vmName, uuid, dir)
 }
 
-// QuarantineFirmwareState moves a VM's NVRAM and swtpm tree into dir when no
-// firmware move record names it here (an ordinary OpWipe): the reconciler's
-// cleanup of a leftover that holds firmware state. Nothing is deleted.
-func (f *FirmwareStore) QuarantineFirmwareState(vmName, uuid, dir string) error {
+// QuarantineLeftoverFirmwareState is the reconciler's cleanup of a leftover
+// that holds firmware state while no firmware move record names it here (an
+// ordinary OpWipe). The NVRAM, and the swtpm tree of uuid, move into stage;
+// reason is written there durably as reason.txt; then stage is renamed to
+// final in one step and that entry made durable. So a quarantine is never
+// split across two directories and never seen without its reason.txt: a pass
+// that stopped part way leaves stage, which the next pass of the same domain
+// finishes (each move is idempotent). With uuid "" (a definition that does not
+// give a canonical uuid, so no swtpm tree can be told to be the domain's)
+// only the NVRAM moves; libvirt's undefine keeping state leaves any swtpm tree
+// where it is. Nothing is deleted.
+func (f *FirmwareStore) QuarantineLeftoverFirmwareState(vmName, uuid, stage, final string, reason []byte) error {
 	if err := f.moveGuard().check(FirmwareCall{Op: OpWipe, Name: vmName, UUID: uuid}); err != nil {
 		return fmt.Errorf("quarantine firmware state of %s: %w", vmName, err)
 	}
-	return f.quarantineMoveState(vmName, uuid, dir)
+	if _, err := os.Lstat(final); err == nil {
+		return fmt.Errorf("quarantine firmware state of %s: %s already exists", vmName, final)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if uuid != "" {
+		if err := f.quarantineMoveState(vmName, uuid, stage); err != nil {
+			return err
+		}
+	} else {
+		if err := mkdirAllDurable(stage); err != nil {
+			return fmt.Errorf("quarantine %s: %w", vmName, err)
+		}
+		if err := moveIntoQuarantine(f.NvramPath(vmName), filepath.Join(stage, "nvram")); err != nil {
+			return fmt.Errorf("quarantine %s: %w", f.NvramPath(vmName), err)
+		}
+		for _, d := range []string{stage, filepath.Dir(stage), filepath.Dir(f.NvramPath(vmName))} {
+			if err := quarantineSync(d); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("quarantine %s: fsync %s: %w", vmName, d, err)
+			}
+		}
+	}
+	if err := writeQuarantineFile(filepath.Join(stage, "reason.txt"), reason); err != nil {
+		return fmt.Errorf("quarantine %s: reason.txt: %w", vmName, err)
+	}
+	if err := quarantineFinish(stage, final); err != nil {
+		return fmt.Errorf("quarantine %s: %w", vmName, err)
+	}
+	if err := quarantineSync(filepath.Dir(final)); err != nil {
+		return fmt.Errorf("quarantine %s: fsync %s: %w", vmName, filepath.Dir(final), err)
+	}
+	return nil
+}
+
+// writeQuarantineFile writes data to p (0600) durably: a temporary file,
+// fsynced, renamed into place, and the directory fsynced.
+func writeQuarantineFile(p string, data []byte) error {
+	tmp := p + ".tmp"
+	fh, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := fh.Write(data); err != nil {
+		fh.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := fh.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := quarantineSync(tmp); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return quarantineSync(filepath.Dir(p))
 }
 
 // QuarantineOwedFirmwareLeftover moves the NVRAM and swtpm tree of a leftover
@@ -697,6 +764,8 @@ var (
 	quarantineRename = os.Rename
 	quarantinePlace  = os.Rename
 	quarantineSync   = fsyncPath
+	// quarantineFinish renames a reconciler's staged quarantine to its name.
+	quarantineFinish = os.Rename
 )
 
 // mkdirAllDurable creates dir (0700) and every missing parent, then fsyncs

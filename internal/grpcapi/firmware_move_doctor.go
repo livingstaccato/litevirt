@@ -265,9 +265,11 @@ func firmwareMoveDoctorHost(report *pb.FirmwareMoveDoctorResponse, vm string, ac
 		// of the leftover runs on that target.
 		return owedTo[0], nil
 	}
-	if len(markers) == 0 && len(holds) == 0 && len(owedTo) == 0 && len(leftovers) == 1 &&
-		action == pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_DISCARD_TARGET {
-		// A leftover record no host owes a DISCARD for any more.
+	if len(markers) == 0 && len(holds) == 0 && len(leftovers) == 1 {
+		// A leftover record with no move left to drive: every action goes to
+		// the host that keeps it, which runs --discard-target or the
+		// --adopt-target-copy of its own domain, and refuses every other
+		// action naming the record.
 		return leftovers[0], nil
 	}
 	switch {
@@ -496,8 +498,12 @@ func (s *Server) firmwareMoveDoctorAct(ctx context.Context, req *pb.FirmwareMove
 		return s.doctorDiscardOwedLeftover(ctx, vm, actor, req.GetStopTarget())
 	}
 	if l, ok, err := recs.GetLeftover(vm); err == nil && ok {
-		return "", status.Errorf(codes.FailedPrecondition, "VM %q: %s keeps the leftover of attempt %s from %s under a leftover record; %s does not resolve it: `lv doctor firmware-move %s --discard-target`",
-			vm, s.hostName, l.Attempt, l.Source, fwDoctorFlagOf(req.GetAction()), vm)
+		if req.GetAction() == pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_ADOPT_TARGET_COPY {
+			return s.doctorAdoptOwnLeftover(ctx, l, actor)
+		}
+		return "", status.Errorf(codes.FailedPrecondition, "VM %q: %s keeps the leftover of attempt %s from %s under a leftover record; %s does not resolve it: `lv doctor firmware-move %s --discard-target` "+
+			"(or --adopt-target-copy, once the VM's row names %s for the leftover's incarnation)",
+			vm, s.hostName, l.Attempt, l.Source, fwDoctorFlagOf(req.GetAction()), vm, s.hostName)
 	}
 	return "", status.Errorf(codes.FailedPrecondition, "VM %q: no live firmware move record names it on %s", vm, s.hostName)
 }

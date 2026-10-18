@@ -780,6 +780,112 @@ func (s *Server) putOwedLeftover(o fwmig.OwedDiscard, owner string) error {
 	return recs.PutLeftover(fwmig.Leftover{VM: o.VM, Binding: o.Binding, Source: owner, Since: time.Now().UTC()})
 }
 
+// doctorAdoptOwnLeftover is --adopt-target-copy on a host that keeps a
+// leftover record while the VM's row names this host for the record's own
+// incarnation (D2-18 re-review 3, m-3). The source that owed the DISCARD no
+// longer owes it (it was lost, or its DISCARD found the row here and dropped
+// its record), and a failover or a re-key that kept the incarnation placed the
+// VM here: the leftover domain is the VM's own, and its NVRAM and TPM state
+// the newest copy that survives. The record still vetoes its define and start,
+// and --discard-target refuses a row naming this host. This drops the record
+// and keeps the domain and its state; nothing is stopped, moved or deleted.
+//
+// It never acts on a copy another host may hold as the live one: the row
+// names this host for the record's incarnation; no host that answered holds a
+// marker, a hold or an owed DISCARD of the VM; the record's source answered,
+// is proved off, or is no longer a host. Under firmwareTargets.op: no hold;
+// the same leftover record; the domain, when defined, has the record's uuid,
+// carries no managed stamp of another incarnation, and is shut off (a guest
+// that runs or is paused is refused, never stopped).
+func (s *Server) doctorAdoptOwnLeftover(ctx context.Context, l fwmig.Leftover, actor string) (string, error) {
+	vm := l.VM
+	row, err := corrosion.GetVM(ctx, s.db, vm)
+	if err != nil {
+		return "", status.Errorf(codes.Unavailable, "VM %q: its row cannot be read: %v", vm, err)
+	}
+	if row == nil || row.HostName != s.hostName || !l.Binding.SameIncarnation(fwmig.Binding{UUID: parseFirmwareSpec(row.Spec).UUID, CreatedAt: row.CreatedAt}) {
+		return "", status.Errorf(codes.FailedPrecondition,
+			"VM %q: its row does not name %s for the incarnation of the leftover of attempt %s; --adopt-target-copy keeps a leftover only as the VM's own: `lv doctor firmware-move %s --discard-target`",
+			vm, s.hostName, l.Attempt, vm)
+	}
+	report := s.gatherFirmwareMoveRecords(ctx, vm, actor)
+	for _, h := range report.GetHosts() {
+		if h.GetHost() == s.hostName {
+			continue
+		}
+		if h.GetMarkerJson() != "" || h.GetHoldJson() != "" {
+			return "", status.Errorf(codes.FailedPrecondition, "VM %q: %s holds a live firmware move record of it; resolve that move first", vm, h.GetHost())
+		}
+		for _, j := range h.GetOwedDiscards() {
+			var x fwmig.OwedDiscard
+			if json.Unmarshal([]byte(j), &x) == nil && x.VM == vm {
+				return "", status.Errorf(codes.FailedPrecondition,
+					"VM %q: %s owes %s a DISCARD of it (attempt %s), so it holds the VM's copy by its record; the leftover on %s is not kept as the VM's own while it does",
+					vm, x.Target, h.GetHost(), x.Attempt, s.hostName)
+			}
+		}
+	}
+	for _, u := range report.GetUnreachable() {
+		if !strings.HasPrefix(u, l.Source+" (") {
+			continue
+		}
+		off, err := corrosion.HostProvedOff(ctx, s.db, l.Source)
+		if err != nil || !off {
+			return "", status.Errorf(codes.FailedPrecondition,
+				"VM %q: the leftover's source %s did not answer and is not proved off (%v); it may still owe a DISCARD of it", vm, l.Source, err)
+		}
+	}
+	if s.virt == nil {
+		return "", status.Errorf(codes.Unavailable, "VM %q: no libvirt connection", vm)
+	}
+	s.firmwareTargets.op.Lock()
+	defer s.firmwareTargets.op.Unlock()
+	recs := s.fwRecords()
+	if _, ok, err := recs.GetHold(vm); err != nil || ok {
+		return "", status.Errorf(codes.FailedPrecondition, "VM %q: a hold appeared on %s under the action (%v); run this again", vm, s.hostName, err)
+	}
+	if cur, ok, err := recs.GetLeftover(vm); err != nil || !ok || !cur.Binding.Matches(l.Binding) {
+		return "", status.Errorf(codes.FailedPrecondition, "VM %q: its leftover record on %s changed under the action (%v); run this again", vm, s.hostName, err)
+	}
+	td, err := s.targetDomain(vm)
+	if err != nil {
+		return "", status.Errorf(codes.Unavailable, "VM %q: %v", vm, err)
+	}
+	if td.Present {
+		if !strings.EqualFold(td.Uuid, l.UUID) {
+			return "", status.Errorf(codes.FailedPrecondition, "VM %q: the domain here has uuid %q, not the leftover's %s; it is not touched", vm, td.Uuid, l.UUID)
+		}
+		if st, ok := s.virt.(interface {
+			GetDomainManagedIncarnation(string) (string, bool, error)
+		}); ok {
+			inc, has, err := st.GetDomainManagedIncarnation(vm)
+			if err != nil {
+				return "", status.Errorf(codes.Unavailable, "VM %q: its managed stamp cannot be read: %v", vm, err)
+			}
+			if has && inc != l.CreatedAt {
+				return "", status.Errorf(codes.FailedPrecondition, "VM %q: the domain here is stamped incarnation %s, not the leftover's %s; it is not touched", vm, inc, l.CreatedAt)
+			}
+		}
+		if td.State != "shutoff" {
+			return "", status.Errorf(codes.FailedPrecondition,
+				"VM %q: its leftover domain on %s is %s; only a shut-off leftover is kept as the VM's own on this record, and none is stopped by it",
+				vm, s.hostName, td.State)
+		}
+	}
+	if err := recs.RemoveLeftover(vm); err != nil {
+		return "", status.Errorf(codes.Internal, "VM %q: remove the leftover record: %v", vm, err)
+	}
+	if err := s.resolveFirmwareMigrationCondition(ctx, condFwmigDiscardOwed, vm); err != nil {
+		slog.Warn("firmware-move doctor: resolve discard_owed", "vm", vm, "error", err)
+	}
+	kept := "its domain (shut off) and its NVRAM and TPM state are kept"
+	if !td.Present {
+		kept = "no domain of it is defined here; its NVRAM and TPM state, if any, are kept"
+	}
+	return fmt.Sprintf("VM %q: the leftover record of attempt %s on %s is dropped, and %s as the VM's own (its row names %s for this incarnation); nothing was deleted: `lv start %s` starts it",
+		vm, l.Attempt, s.hostName, kept, s.hostName, vm), nil
+}
+
 // waitShutOff waits up to fwDoctorStopWait for vm's domain to shut off.
 func (s *Server) waitShutOff(vm, what string) error {
 	deadline := time.Now().Add(fwDoctorStopWait)

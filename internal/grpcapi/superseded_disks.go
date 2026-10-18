@@ -62,9 +62,19 @@ func (s *Server) SupersededDisks(ctx context.Context, req *pb.SupersededDisksReq
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list superseded disk copies: %v", err)
 	}
+	// The reconciler's firmware quarantines are listed, purged and removed by
+	// name beside the disk copies, under the same retention rule
+	// (health/reconciled_quarantine.go).
+	quarantines, err := health.ListReconciledQuarantines(ctx, s.db, s.dataDir)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list reconciled firmware quarantines: %v", err)
+	}
 	resp := &pb.SupersededDisksResponse{Host: s.hostName, RetentionDays: int32(s.supersededRetentionDays)}
 	removed := map[string]bool{}
 	switch {
+	case req.RestorePath != "" && health.IsReconciledQuarantinePath(s.dataDir, req.RestorePath):
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%s is a firmware quarantine the reconciler made, not a disk copy; nothing restores it: inspect it by hand, or remove it with --remove", req.RestorePath)
 	case req.RestorePath != "":
 		got, rerr := s.restoreSupersededDisk(ctx, req.RestorePath)
 		if rerr != nil {
@@ -82,16 +92,33 @@ func (s *Server) SupersededDisks(ctx context.Context, req *pb.SupersededDisksReq
 	case len(req.RemovePaths) > 0:
 		// Named copies only: the purge flag a client sends beside them is for
 		// older hosts (SupersededNamedOnlySec), never a bulk purge here.
-		gone, rerr := health.RemoveSupersededDisks(ctx, s.db, s.dataDir, req.RemovePaths)
+		var diskPaths, fwPaths []string
+		for _, p := range req.RemovePaths {
+			if health.IsReconciledQuarantinePath(s.dataDir, p) {
+				fwPaths = append(fwPaths, p)
+			} else {
+				diskPaths = append(diskPaths, p)
+			}
+		}
 		var bytes int64
 		var names []string
+		gone, rerr := health.RemoveSupersededDisks(ctx, s.db, s.dataDir, diskPaths)
 		for _, c := range gone {
 			removed[c.Path] = true
 			bytes += c.SizeBytes
 			names = append(names, c.Path)
 		}
-		result, detail := "ok", fmt.Sprintf("removed %d named superseded disk copies (%d bytes) on %s: %s",
-			len(gone), bytes, s.hostName, strings.Join(names, ", "))
+		if rerr == nil && len(fwPaths) > 0 {
+			var fwGone []health.ReconciledQuarantine
+			fwGone, rerr = health.RemoveReconciledQuarantines(ctx, s.db, s.dataDir, fwPaths)
+			for _, q := range fwGone {
+				removed[q.Path] = true
+				bytes += q.SizeBytes
+				names = append(names, q.Path)
+			}
+		}
+		result, detail := "ok", fmt.Sprintf("removed %d named superseded disk copies and firmware quarantines (%d bytes) on %s: %s",
+			len(names), bytes, s.hostName, strings.Join(names, ", "))
 		if rerr != nil {
 			result, detail = "error", detail+": "+rerr.Error()
 		}
@@ -106,7 +133,15 @@ func (s *Server) SupersededDisks(ctx context.Context, req *pb.SupersededDisksReq
 			removed[c.Path] = true
 			bytes += c.SizeBytes
 		}
-		result, detail := "ok", fmt.Sprintf("removed %d superseded disk copies (%d bytes) on %s", len(gone), bytes, s.hostName)
+		fwGone, qerr := health.PurgeReconciledQuarantines(ctx, s.db, s.dataDir, time.Duration(req.OlderThanSec)*time.Second, time.Now())
+		for _, q := range fwGone {
+			removed[q.Path] = true
+			bytes += q.SizeBytes
+		}
+		if perr == nil {
+			perr = qerr
+		}
+		result, detail := "ok", fmt.Sprintf("removed %d superseded disk copies and %d reconciled firmware quarantines (%d bytes) on %s", len(gone), len(fwGone), bytes, s.hostName)
 		if perr != nil {
 			result, detail = "error", detail+": "+perr.Error()
 		}
@@ -121,6 +156,17 @@ func (s *Server) SupersededDisks(ctx context.Context, req *pb.SupersededDisksReq
 			Path: c.Path, DiskPath: c.DiskPath, SetAsideAt: c.SetAsideAt.UTC().Format(time.RFC3339),
 			SizeBytes: c.SizeBytes, VmName: c.VM, VmState: c.VMState, Held: c.Held, Removed: removed[c.Path],
 			Retained: c.Retained,
+		})
+	}
+	for _, q := range quarantines {
+		vm := ""
+		if q.Retained != "" {
+			vm = q.VM // a VM of the name exists
+		}
+		resp.Disks = append(resp.Disks, &pb.SupersededDisk{
+			Path: q.Path, DiskPath: "firmware state of VM " + q.VM, SetAsideAt: q.SetAsideAt.UTC().Format(time.RFC3339),
+			SizeBytes: q.SizeBytes, VmName: vm, VmState: q.VMState, Held: q.Held, Removed: removed[q.Path],
+			Retained: q.Retained,
 		})
 	}
 	return resp, nil

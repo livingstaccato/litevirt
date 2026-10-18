@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"golang.org/x/term"
 )
@@ -71,6 +72,9 @@ var readPasswordFd = term.ReadPassword
 // without echoing it. It returns ctx.Err() as soon as ctx ends, with the
 // terminal's echo restored first.
 func ReadPassword(ctx context.Context, prompt string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	fd := int(os.Stdin.Fd())
 	fmt.Fprint(os.Stderr, prompt)
 	state, _ := term.GetState(fd) // nil when stdin is not a terminal
@@ -92,6 +96,10 @@ func ReadPassword(ctx context.Context, prompt string) (string, error) {
 		return string(r.pw), nil
 	case <-ctx.Done():
 		if state != nil {
+			_ = term.Restore(fd, state)
+			// The reader may turn echo off just after this; restore again
+			// once it has had the chance.
+			time.Sleep(20 * time.Millisecond)
 			_ = term.Restore(fd, state)
 		}
 		fmt.Fprintln(os.Stderr)

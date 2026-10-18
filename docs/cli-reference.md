@@ -300,7 +300,7 @@ whatever becomes of the client, so an interrupted replace does not end with no
 VM; the command reports that it may still complete, and names `lv ls`. A VM
 being re-created is not listed until its create finishes, which can take
 minutes: wait until `lv ls` shows it before running the command again, or the
-second run creates it again. A create that replaces nothing (the delete found
+second run may create it again. A create that replaces nothing (the delete found
 no VM) stays cancellable. A `lv compose up` interrupted after it has torn a VM
 down to re-create it still records the stack's new compose file, with the
 stack `degraded`: the rest of its plan did not run, and once `lv ls` shows the

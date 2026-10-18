@@ -583,26 +583,32 @@ func suffixed(paths []string, suffix string) []string {
 // command (set -e): there is no fallback to a global sync.
 func syncCmd(q string) string { return fmt.Sprintf("sync -- %s; ", q) }
 
-// existsCmd prints each of paths that exists, one per line.
+// existsCmd prints the mode and path of each of paths that exists, one per
+// line (a symlink's target's mode).
 func existsCmd(r addRemote, paths []string) string {
 	var b strings.Builder
 	for _, p := range paths {
 		q := ssh.ShellQuote(r.Path(p))
-		fmt.Fprintf(&b, "if [ -e %s ]; then printf '%%s\\n' %s; fi; ", q, q)
+		fmt.Fprintf(&b, "if [ -e %s ]; then printf '%%s %%s\\n' \"$(stat -L -c %%a -- %s)\" %s; fi; ", q, q, q)
 	}
 	return b.String()
 }
 
-// existsSet reads existsCmd's output back into paths.
-func existsSet(r addRemote, paths []string, out []byte) map[string]bool {
-	listed := map[string]bool{}
+// existsSet reads existsCmd's output back into paths: each existing path's
+// octal mode, which a restore puts back.
+func existsSet(r addRemote, paths []string, out []byte) map[string]string {
+	listed := map[string]string{}
 	for _, l := range strings.Split(string(out), "\n") {
-		listed[l] = true
+		if mode, path, ok := strings.Cut(l, " "); ok {
+			if _, err := strconv.ParseUint(mode, 8, 32); err == nil {
+				listed[path] = mode
+			}
+		}
 	}
-	got := map[string]bool{}
+	got := map[string]string{}
 	for _, p := range paths {
-		if listed[r.Path(p)] {
-			got[p] = true
+		if m, ok := listed[r.Path(p)]; ok {
+			got[p] = m
 		}
 	}
 	return got
@@ -638,9 +644,10 @@ func installCmd(r addRemote, paths []string, suffix string) string {
 
 // restoreCmd undoes installCmd. A path whose staged file is still there was
 // never replaced. Any other goes back to its staged path, so the admitted
-// file stays on the host for a rerun, and its copy back into place; one with
-// no copy did not exist.
-func restoreCmd(r addRemote, paths []string, existed map[string]bool, suffix string) string {
+// file stays on the host for a rerun, and its copy back into place at the
+// file's own mode (existed, from existsSet; the copy is 0600); one with no
+// copy did not exist.
+func restoreCmd(r addRemote, paths []string, existed map[string]string, suffix string) string {
 	var cmd strings.Builder
 	cmd.WriteString("rc=0; ")
 	for _, p := range paths {
@@ -648,8 +655,8 @@ func restoreCmd(r addRemote, paths []string, existed map[string]bool, suffix str
 		s, b := ssh.ShellQuote(r.Path(addStagedPath(p))), ssh.ShellQuote(r.Path(p)+suffix)
 		fmt.Fprintf(&cmd, "if [ -e %s ]; then rm -f -- %s || rc=1; else ", s, b)
 		fmt.Fprintf(&cmd, "if [ -e %s ]; then mv -fT -- %s %s || rc=1; fi; ", q, q, s)
-		if existed[p] {
-			fmt.Fprintf(&cmd, "if [ -e %s ]; then mv -fT -- %s %s || rc=1; fi; ", b, b, q)
+		if mode := existed[p]; mode != "" {
+			fmt.Fprintf(&cmd, "if [ -e %s ]; then mv -fT -- %s %s && chmod %s %s || rc=1; fi; ", b, b, q, mode, q)
 		}
 		cmd.WriteString("fi; ")
 	}
@@ -802,8 +809,14 @@ func mergeAddConfig(existing []byte, p hostAddPlan) ([]byte, error) {
 	}
 	for key, want := range addConfigPorts {
 		if v, ok := before[key]; ok && fmt.Sprint(v) != strconv.Itoa(want) {
-			return nil, fmt.Errorf("%s is %v: peers reach a host only on %d, so the host would be unreachable "+
-				"(set %s: %d, or remove the key)", key, v, want, key, want)
+			why := "peers dial the host at %d, so it would be unreachable"
+			if key == "gossip_port" {
+				// memberlist advertises its own port; what breaks is the
+				// seed lv host add writes into this node's and later hosts'
+				// join_peers.
+				why = "peers and later adds seed the host at %d"
+			}
+			return nil, fmt.Errorf("%s is %v: "+why+" (set %s: %d, or remove the key)", key, v, want, key, want)
 		}
 	}
 	edits := []struct {
@@ -845,7 +858,8 @@ func mergeAddConfig(existing []byte, p hostAddPlan) ([]byte, error) {
 	// keys it sets as it set them.
 	after, err := configMapping(merged)
 	if err != nil {
-		return nil, fmt.Errorf("the edited file does not parse (%v)", err)
+		return nil, fmt.Errorf("the edited file does not parse (%v): the add replaces the lines of the keys it "+
+			"sets, and a line it kept depends on one it replaced, such as an alias to an anchor there", err)
 	}
 	want, err := configMapping([]byte(strings.Join([]string{edits[0].text, edits[1].text, edits[2].text,
 		edits[3].text, edits[4].text}, "")))
@@ -858,7 +872,8 @@ func mergeAddConfig(existing []byte, p hostAddPlan) ([]byte, error) {
 	}
 	for k, v := range before {
 		if !set[k] && !reflect.DeepEqual(after[k], v) {
-			return nil, fmt.Errorf("editing it would change %s", k)
+			return nil, fmt.Errorf("editing it would change %s: its value depends on a key the add replaces, such "+
+				"as an alias to an anchor there, or the add could not tell where a replaced key's lines end", k)
 		}
 	}
 	for k := range set {
@@ -924,15 +939,23 @@ func topLevelKeySpan(lines []string, key string) (start, end int, found bool) {
 			continue
 		}
 		end = i + 1
+	span:
 		for j := i + 1; j < len(lines); j++ {
 			t := lines[j]
-			if strings.TrimSpace(t) == "" {
-				continue
+			trimmed := strings.TrimSpace(t)
+			switch {
+			case trimmed == "":
+			case continuesValue(t):
+				end = j + 1
+			case strings.HasPrefix(t, "#"):
+				// A column-0 comment belongs to the block when more of the
+				// block follows it, as a commented-out option does.
+				if !moreFollows(lines[j+1:]) {
+					break span
+				}
+			default:
+				break span
 			}
-			if t[0] != ' ' && t[0] != '\t' {
-				break
-			}
-			end = j + 1
 		}
 		return i, end, true
 	}
@@ -998,4 +1021,32 @@ func admittedPairMatches(r addRemote, installed bool) error {
 	}
 	_, err = tls.X509KeyPair(c, k)
 	return err
+}
+
+// continuesValue reports whether line, after a top-level key, is part of its
+// value: indented, a block sequence item at the key's own indent (as PyYAML
+// and Ansible write them), or a flow collection's closer at column 0.
+func continuesValue(line string) bool {
+	switch {
+	case line[0] == ' ' || line[0] == '\t':
+		return true
+	case line == "-\n" || strings.HasPrefix(line, "- "):
+		return true
+	case strings.HasPrefix(line, "]") || strings.HasPrefix(line, "}"):
+		return true
+	}
+	return false
+}
+
+// moreFollows reports whether the next line in lines that is neither blank
+// nor a comment continues a value.
+func moreFollows(lines []string) bool {
+	for _, l := range lines {
+		t := strings.TrimSpace(l)
+		if t == "" || strings.HasPrefix(l, "#") {
+			continue
+		}
+		return continuesValue(l)
+	}
+	return false
 }

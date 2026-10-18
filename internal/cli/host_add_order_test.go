@@ -418,7 +418,7 @@ func TestAddInstallCommands_KeepAndRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 	existed := existsSet(r, paths, out)
-	if !existed[key] || existed[added] {
+	if existed[key] != "644" || existed[added] != "" {
 		t.Fatalf("exists = %v, want only %s", existed, key)
 	}
 	for _, p := range paths {
@@ -450,6 +450,10 @@ func TestAddInstallCommands_KeepAndRestore(t *testing.T) {
 	}
 	if got := string(mustRead(t, key)); got != "old" {
 		t.Errorf("restored key = %q, want the old key", got)
+	}
+	// fd re-review 2 N2-m1: put back at its own mode, not the copy's 0600.
+	if st, err := os.Stat(key); err != nil || st.Mode().Perm() != 0o644 {
+		t.Errorf("the restored key: %v, %v; want its own 0644", st, err)
 	}
 	if _, err := os.Stat(added); !os.IsNotExist(err) {
 		t.Errorf("a file the add created is still in place (stat: %v)", err)
@@ -581,7 +585,7 @@ func TestHostAdd_KeepsTheMachinesConfig(t *testing.T) {
 	})
 	t.Run("failed", func(t *testing.T) {
 		f := newAddFixture(t)
-		cfg := writeTargetConfig(t, f, operatorConfig, 0o644)
+		cfg := writeTargetConfig(t, f, operatorConfig, 0o640)
 		f.target.FailSetup = errors.New("setup failed")
 		if err := f.add(t); err == nil {
 			t.Fatal("the add succeeded")
@@ -589,12 +593,19 @@ func TestHostAdd_KeepsTheMachinesConfig(t *testing.T) {
 		if got := string(mustRead(t, cfg)); got != operatorConfig {
 			t.Errorf("the config was not put back:\n%s", got)
 		}
+		if st, _ := os.Stat(cfg); st.Mode().Perm() != 0o640 {
+			t.Errorf("the config was put back at %o, want its own 0640", st.Mode().Perm())
+		}
 	})
 	for _, tc := range []struct{ name, body, want string }{
 		{"unparsable", "migration: [unclosed\n", "config.yaml"},
 		{"two documents", "host_name: a\n---\nhost_name: b\n", "document"},
-		{"gossip port", "host_name: a\ngossip_port: 7950\n", "gossip_port"},
-		{"grpc port", "host_name: a\ngrpc_port: 7500\n", "grpc_port"},
+		// N2-n1: gossip stays reachable (memberlist advertises its port); the
+		// 7946 seeds that later adds write are what break.
+		{"gossip port", "host_name: a\ngossip_port: 7950\n", "gossip_port is 7950: peers and later adds seed the host at 7946"},
+		{"grpc port", "host_name: a\ngrpc_port: 7500\n", "grpc_port is 7500: peers dial the host at 7443, so it would be unreachable"},
+		// The refusal says why another key would change.
+		{"alias into a replaced key", "enforcement: &e\n  audit_signature: true\nother: *e\n", "alias"},
 		{"too large", "host_name: a\n# " + strings.Repeat("x", 1<<20) + "\n", "1 MiB"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -696,4 +707,39 @@ func TestHostAdd_AResumeChecksTheKeyMatchesTheCertificate(t *testing.T) {
 		t.Fatalf("the resume over a mismatched key = %v, want a refusal naming lv host rm", err)
 	}
 	f.identityUnchanged(t)
+}
+
+// fd re-review 2 N2-m5: layouts PyYAML and Ansible emit, and commented-out
+// options at column 0, are merged rather than refused: a block sequence at
+// the key's own indent, a flow sequence closed at column 0, and a column-0
+// comment inside a block.
+//
+// Mutation: end a key's lines at any column-0 line again — each case is
+// refused.
+func TestMergeAddConfig_TakesCommonLayouts(t *testing.T) {
+	p := hostAddPlan{hostName: "node-9", hostAddr: "10.0.0.9", peersYAML: `["10.0.0.1:7946"]`,
+		enforcement: "enforcement:\n  audit_signature: true\n"}
+	tail := "host_name: \"node-9\"\nadvertise_address: \"10.0.0.9\"\npki_dir: /etc/litevirt/pki\n"
+	for _, tc := range []struct{ name, in, want string }{
+		{"block sequence at the key's indent",
+			"join_peers:\n- 10.0.0.5:7946\n- 10.0.0.6:7946\nmigration:\n  network: 10.78.1.0/24\n",
+			"join_peers: [\"10.0.0.1:7946\"]\nmigration:\n  network: 10.78.1.0/24\n" + tail + "enforcement:\n  audit_signature: true\n"},
+		{"flow sequence closed at column 0",
+			"join_peers: [\n  \"10.0.0.5:7946\",\n]\nmigration:\n  network: 10.78.1.0/24\n",
+			"join_peers: [\"10.0.0.1:7946\"]\nmigration:\n  network: 10.78.1.0/24\n" + tail + "enforcement:\n  audit_signature: true\n"},
+		{"commented-out option inside a block",
+			"enforcement:\n  audit_signature: false\n# partition_pause: false\n  recovery_claim: false\nmigration:\n  network: 10.78.1.0/24\n",
+			"enforcement:\n  audit_signature: true\nmigration:\n  network: 10.78.1.0/24\n" +
+				"host_name: \"node-9\"\nadvertise_address: \"10.0.0.9\"\njoin_peers: [\"10.0.0.1:7946\"]\npki_dir: /etc/litevirt/pki\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := mergeAddConfig([]byte(tc.in), p)
+			if err != nil {
+				t.Fatalf("refused: %v", err)
+			}
+			if string(got) != tc.want {
+				t.Errorf("merged:\n%s\nwant:\n%s", got, tc.want)
+			}
+		})
+	}
 }

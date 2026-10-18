@@ -3,9 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc/codes"
@@ -18,7 +22,7 @@ import (
 // commands, and `lv firewall log-policy`.
 
 // logFlagUsage is the --log flag's help on every rule-add command.
-const logFlagUsage = "log each packet the rule matches (docs/firewall.md, Logging)"
+const logFlagUsage = "log each packet the rule matches (read with 'lv firewall log')"
 
 // refuseClientLogAction refuses an --action holding "+": logging is asked
 // with --log, never in the action.
@@ -141,4 +145,91 @@ func logRPCError(err error) error {
 		return fmt.Errorf("the daemon you are connected to is older than this lv: upgrade it, or use a host that runs litevirt %s", version)
 	}
 	return err
+}
+
+// logFollowInterval is how often --follow asks for new records.
+var logFollowInterval = 2 * time.Second
+
+func newFirewallLogCmd() *cobra.Command {
+	var host, workload, since string
+	var limit uint32
+	var follow bool
+	cmd := &cobra.Command{
+		Use:   "log",
+		Short: "Show the firewall log: packets matched by logged rules and logged default verdicts (needs firewall.log.view)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			req := &pb.ListFirewallLogRequest{Host: host, Workload: workload, Limit: limit}
+			if since != "" {
+				d, err := time.ParseDuration(since)
+				if err != nil || d <= 0 {
+					return fmt.Errorf("--since %q: want a duration such as 15m or 2h", since)
+				}
+				req.Since = time.Now().Add(-d).UTC().Format(time.RFC3339)
+			}
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+				fmt.Fprintln(w, "TIME\tHOST\tWORKLOAD\tDEVICE\tSIDE\tRULE\tVERDICT\tPROTO\tSRC\tDST\tLEN")
+				cursor := map[string]uint64{}
+				reported := map[string]string{}
+				for {
+					resp, err := c.ListFirewallLog(ctx, &pb.ListFirewallLogRequest{Host: req.Host, Workload: req.Workload,
+						Since: req.Since, Limit: req.Limit, AfterSeq: maps.Clone(req.AfterSeq)})
+					if err != nil {
+						if follow && ctx.Err() != nil {
+							return w.Flush()
+						}
+						return logRPCError(err)
+					}
+					for _, e := range resp.GetEntries() {
+						fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\n", e.GetTime(), e.GetHost(), dash(e.GetWorkload()),
+							e.GetDevice(), e.GetSide(), e.GetRuleId(), e.GetVerdict(), dash(e.GetProto()),
+							hostPort(e.GetSrc(), e.GetSport()), hostPort(e.GetDst(), e.GetDport()), e.GetLength())
+						if e.GetSeq() > cursor[e.GetHost()] {
+							cursor[e.GetHost()] = e.GetSeq()
+						}
+					}
+					if err := w.Flush(); err != nil {
+						return err
+					}
+					for _, h := range slices.Sorted(maps.Keys(resp.GetErrors())) {
+						if msg := resp.GetErrors()[h]; reported[h] != msg {
+							fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s: %s\n", h, msg)
+							reported[h] = msg
+						}
+					}
+					if !follow {
+						return nil
+					}
+					req.AfterSeq = cursor
+					req.Limit = 10000
+					select {
+					case <-ctx.Done():
+						return nil
+					case <-time.After(logFollowInterval):
+					}
+				}
+			})
+		},
+	}
+	cmd.Flags().StringVar(&host, "host", "", "one host's log (default: every active host)")
+	cmd.Flags().StringVar(&workload, "workload", "", "one workload's records")
+	cmd.Flags().StringVar(&since, "since", "", "only records newer than this, e.g. 15m")
+	cmd.Flags().Uint32Var(&limit, "limit", 200, "the newest N records (at most 10000)")
+	cmd.Flags().BoolVar(&follow, "follow", false, "keep printing new records")
+	return cmd
+}
+
+// hostPort is an address with its port, when it has one.
+func hostPort(addr string, port uint32) string {
+	if addr == "" {
+		return "-"
+	}
+	if port == 0 {
+		return addr
+	}
+	if strings.Contains(addr, ":") {
+		return "[" + addr + "]:" + strconv.Itoa(int(port))
+	}
+	return addr + ":" + strconv.Itoa(int(port))
 }

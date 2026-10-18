@@ -1482,6 +1482,10 @@ lv firewall log-policy status                                          # the clu
 lv firewall log-policy on  [--scope <host>] [--rate N] [--burst N]     # log each NIC's default verdict
 lv firewall log-policy off [--scope <host>] [--rate N] [--burst N]     # logged rules still log
 lv firewall log-policy inherit --scope <host>                           # clear a host's own policy
+lv firewall log [--host <h>] [--workload <name>] [--since 15m] [--limit 200] [--follow]
+  # TIME HOST WORKLOAD DEVICE SIDE RULE VERDICT PROTO SRC DST LEN, merged by time across every
+  # active host (a host that does not answer is named on stderr); --follow polls from each
+  # host's newest sequence. Needs firewall.log.view at / (Admin; docs/auth.md).
   # --rate is log records per second per guest NIC side (1-10000, default 5); --burst is
   # packets (1-10000, default 10). Every logged line of one NIC side shares that budget.
   # Role operator; audited as firewall.log_policy; refused until the cluster upgrade has finished.

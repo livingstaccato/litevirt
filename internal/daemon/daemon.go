@@ -1499,6 +1499,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Firewall logging: the listener reads the NFLOG group every rendered log
 	// line sends to into a bounded store (docs/firewall.md, "Logging").
 	fwLogStore := openFirewallLogStore(d.cfg, fwMetrics)
+	svc.SetFirewallLogStore(fwLogStore)
 	go (&firewall.LogListener{Group: uint16(d.cfg.Firewall.LogGroup), Store: fwLogStore,
 		Resolve: d.fwReconciler.ResolveLogDevice,
 		OnBind:  func(err error) { svc.RecordFirewallLogListener(ctx, err) }}).Run(ctx)

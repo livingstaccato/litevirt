@@ -5,6 +5,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -182,5 +183,109 @@ func TestFirewallLogPolicyCLI(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("status output lacks %q:\n%s", want, out)
 		}
+	}
+}
+
+// logListSpy answers ListFirewallLog from a script of replies.
+type logListSpy struct {
+	logSpy
+	replies []*pb.ListFirewallLogResponse
+	got     []*pb.ListFirewallLogRequest
+	onCall  func(n int)
+}
+
+func (l *logListSpy) ListFirewallLog(_ context.Context, in *pb.ListFirewallLogRequest, _ ...grpc.CallOption) (*pb.ListFirewallLogResponse, error) {
+	l.got = append(l.got, in)
+	n := len(l.got)
+	if l.onCall != nil {
+		defer l.onCall(n)
+	}
+	if n <= len(l.replies) {
+		return l.replies[n-1], nil
+	}
+	return &pb.ListFirewallLogResponse{}, nil
+}
+
+func runLogListCLI(t *testing.T, ctx context.Context, spy *logListSpy, args ...string) (string, error) {
+	out, _, err := runLogListCLI2(t, ctx, spy, args...)
+	return out, err
+}
+
+func runLogListCLI2(t *testing.T, ctx context.Context, spy *logListSpy, args ...string) (string, string, error) {
+	t.Helper()
+	orig := withClient
+	withClient = func(ctx context.Context, fn func(context.Context, pb.LiteVirtClient) error) error {
+		return fn(ctx, spy)
+	}
+	t.Cleanup(func() { withClient = orig })
+	root := newRootCmd()
+	root.SetArgs(args)
+	root.SetOut(io.Discard)
+	var stderr strings.Builder
+	root.SetErr(&stderr)
+	var err error
+	out := captureStdout(t, func() { err = root.ExecuteContext(ctx) })
+	return out, stderr.String(), err
+}
+
+// C5: lv firewall log prints the columns, asks with --host, --workload,
+// --since (as a time) and --limit, and names a host that did not answer;
+// --follow polls from each host's newest sequence.
+//
+// Mutations: --follow resends no cursor — the second request has no
+// after_seq, red; drop the host errors — red.
+func TestFirewallLogCLI(t *testing.T) {
+	e := func(host string, seq uint64, wl string) *pb.FirewallLogEntry {
+		return &pb.FirewallLogEntry{Host: host, Seq: seq, Time: "2026-10-18T12:00:01Z", Workload: wl, Device: "lvt0", Side: "in",
+			RuleId: "r1", Verdict: "drop", Proto: "tcp", Src: "10.0.0.9", Sport: 40000, Dst: "10.0.0.1", Dport: 22, Length: 60}
+	}
+	spy := &logListSpy{replies: []*pb.ListFirewallLogResponse{
+		{Entries: []*pb.FirewallLogEntry{e("a", 4, "web-1"), e("b", 9, "db-1")}, Errors: map[string]string{"c": "connection refused"}},
+	}}
+	before := time.Now()
+	out, stderr, err := runLogListCLI2(t, context.Background(), spy, "firewall", "log", "--workload", "web-1", "--since", "15m", "--limit", "50", "--host", "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"TIME", "HOST", "WORKLOAD", "DEVICE", "SIDE", "RULE", "VERDICT", "PROTO", "SRC", "DST", "LEN",
+		"web-1", "10.0.0.9:40000", "10.0.0.1:22", "drop", "60"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(stderr, "c: connection refused") {
+		t.Errorf("stderr does not name the host that failed:\n%s", stderr)
+	}
+	r := spy.got[0]
+	since, perr := time.Parse(time.RFC3339, r.GetSince())
+	if r.GetHost() != "a" || r.GetWorkload() != "web-1" || r.GetLimit() != 50 || perr != nil ||
+		since.After(before.Add(-14*time.Minute)) || since.Before(before.Add(-16*time.Minute)) {
+		t.Errorf("request = %+v, want host a, web-1, limit 50, since 15 minutes ago", r)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	orig := logFollowInterval
+	logFollowInterval = time.Millisecond
+	t.Cleanup(func() { logFollowInterval = orig })
+	spy = &logListSpy{replies: []*pb.ListFirewallLogResponse{
+		{Entries: []*pb.FirewallLogEntry{e("a", 4, "web-1"), e("b", 9, "db-1")}},
+		{Entries: []*pb.FirewallLogEntry{e("a", 5, "web-1")}},
+	}, onCall: func(n int) {
+		if n == 3 {
+			cancel()
+		}
+	}}
+	if _, err := runLogListCLI(t, ctx, spy, "firewall", "log", "--follow"); err != nil {
+		t.Fatal(err)
+	}
+	if len(spy.got) < 3 {
+		t.Fatalf("follow made %d request(s)", len(spy.got))
+	}
+	if c := spy.got[1].GetAfterSeq(); c["a"] != 4 || c["b"] != 9 {
+		t.Errorf("second request cursor = %v, want a:4 b:9", c)
+	}
+	if c := spy.got[2].GetAfterSeq(); c["a"] != 5 || c["b"] != 9 {
+		t.Errorf("third request cursor = %v, want a:5 b:9", c)
 	}
 }

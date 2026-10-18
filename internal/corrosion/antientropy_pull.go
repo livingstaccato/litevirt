@@ -134,25 +134,33 @@ var ErrNoPeerConfirmed = errors.New("no peer completed the pull")
 // exclude (the host the decision is about) is never a candidate: its own
 // replica confirms nothing. Voters are tried first. A member is skipped when a
 // pass would skip it (isolated, or unable to keep a release feature in use).
-// When no candidate remains — a cluster this node is alone in, or one whose
-// only other members are excluded or skipped — it returns ("", skipped, nil):
-// there is nobody to confirm with, and the caller's voter-majority gate has
-// already decided whether this node may act. It is not debounced, and is
+// When no candidate remains and no other voter was skipped — a cluster this
+// node is alone in, or one whose only other member is the excluded host — it
+// returns ("", skipped, nil): there is nobody to confirm with, and the
+// caller's voter-majority gate has already decided whether this node may act.
+// When a voter was skipped (isolated, or unable to keep a release feature in
+// use) it refuses, naming them. It is not debounced, and is
 // bounded by ctx.
 func (ae *AntiEntropy) PullTableNow(ctx context.Context, table, exclude string) (peer string, skipped []string, err error) {
 	if !replicatedTableSet[table] {
 		return "", nil, fmt.Errorf("%s is not a replicated table", table)
 	}
 	voters, _ := VoterSet(ctx, ae.client)
-	var first, rest []string
+	var first, rest, skippedVoters []string
+	skip := func(name, why string) {
+		skipped = append(skipped, name+" ("+why+")")
+		if voters[name] {
+			skippedVoters = append(skippedVoters, name+" ("+why+")")
+		}
+	}
 	for _, m := range ae.client.Members() {
 		switch {
 		case m.Name == "" || m.Name == exclude:
 			continue
 		case func() bool { e, _, ierr := HostIsolation(ctx, ae.client, m.Name); return ierr == nil && e > 0 }():
-			skipped = append(skipped, m.Name+" (isolated)")
+			skip(m.Name, "isolated")
 		case ae.client.ReplicationSourceAllowed(ctx, m.Name) != nil:
-			skipped = append(skipped, m.Name+" (cannot keep a release feature in use)")
+			skip(m.Name, "cannot keep a release feature in use")
 		case voters[m.Name]:
 			first = append(first, m.Name)
 		default:
@@ -161,6 +169,13 @@ func (ae *AntiEntropy) PullTableNow(ctx context.Context, table, exclude string) 
 	}
 	candidates := append(first, rest...)
 	if len(candidates) == 0 {
+		// Nobody to confirm with. That is a decision this node may make
+		// alone only when no other voter exists to confirm it: a voter that
+		// was skipped is one the operator should know about first.
+		if len(skippedVoters) > 0 {
+			return "", skipped, fmt.Errorf("%w: every other voter was skipped: %s", ErrNoPeerConfirmed,
+				strings.Join(skippedVoters, ", "))
+		}
 		return "", skipped, nil
 	}
 	var errs []string

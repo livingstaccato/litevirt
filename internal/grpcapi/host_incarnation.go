@@ -133,7 +133,7 @@ func (s *Server) pullHostsNow(ctx context.Context, action, name string) error {
 		return status.Error(codes.Unavailable, msg+"; retry, or run it against another node")
 	}
 	if peer == "" {
-		slog.Info("no peer to confirm a host's row with before deciding its incarnation; proceeding on this replica",
+		slog.Warn("no peer to confirm a host's row with before deciding its incarnation; proceeding on this replica",
 			"host", name, "action", action, "not_asked", skipped)
 	}
 	return nil

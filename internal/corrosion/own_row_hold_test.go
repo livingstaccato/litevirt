@@ -284,3 +284,65 @@ func TestOwnRowHold_EveryOwnRowWriterIsHeld(t *testing.T) {
 		t.Errorf("another host's label write: %v", err)
 	}
 }
+
+// Re-review I-1 (a): a hold raised at start over a row at incarnation 0 that
+// then moves to a counted incarnation under the same arm never times out.
+func TestOwnRowHold_AStartHoldWhoseRowIsReadmittedNeverTimesOut(t *testing.T) {
+	ctx := context.Background()
+	old := OwnRowHoldTimeout
+	OwnRowHoldTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { OwnRowHoldTimeout = old })
+	c := newTestDB(t)
+	ownRow(t, c, "01old") // the stale row at 0, under another serial
+	if st, _ := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("02new", "")); !st.Held || st.Incarnation != 0 {
+		t.Fatalf("hold = %+v, want held at start over incarnation 0", st)
+	}
+	// Another machine's admission at 1, under a third serial: the arm stays a.
+	if _, err := c.DB().Exec(`UPDATE hosts SET incarnation = 1, cert_serial = 'yy09' WHERE name = ?`, c.hostName); err != nil {
+		t.Fatal(err)
+	}
+	c.EvaluateOwnRowHold(ctx, OwnRowHeldSuperseded)
+	time.Sleep(60 * time.Millisecond)
+	if st, _ := c.EvaluateOwnRowHold(ctx, OwnRowHeldSuperseded); !st.Held || st.TimedOut {
+		t.Fatalf("hold = %+v, want held and never timed out", st)
+	}
+	before := mutationLogText(t, c)
+	if err := RegisterHost(ctx, c, HostRecord{Name: c.hostName, Address: "10.0.0.15", State: "active", CertSerial: "02new"}); err == nil {
+		t.Error("RegisterHost re-recorded over another admission's row")
+	}
+	if after := mutationLogText(t, c); after != before {
+		t.Error("the mutation log changed")
+	}
+}
+
+// Re-review I-1 (b): the writers themselves never re-record over a counted row
+// that names neither the installed certificate nor the one it renewed,
+// whatever the hold says; a renewal of the recorded certificate is re-recorded.
+func TestReRecord_RefusedOverAnotherAdmissionsCountedRow(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	ownRow(t, c, "yy09")
+	if _, err := c.DB().Exec(`UPDATE hosts SET incarnation = 1 WHERE name = ?`, c.hostName); err != nil {
+		t.Fatal(err)
+	}
+	// No hold configured: nothing proves a renewal.
+	if err := RegisterHost(ctx, c, HostRecord{Name: c.hostName, Address: "10.0.0.15", State: "active", CertSerial: "02new"}); !errors.Is(err, ErrReRecordAtCountedRow) {
+		t.Errorf("RegisterHost = %v, want ErrReRecordAtCountedRow", err)
+	}
+	if _, err := RecordOwnCertSerial(ctx, c, c.hostName, "02new"); !errors.Is(err, ErrReRecordAtCountedRow) {
+		t.Errorf("RecordOwnCertSerial = %v, want ErrReRecordAtCountedRow", err)
+	}
+	if got := oneString(t, c, `SELECT cert_serial FROM hosts WHERE name = ?`, "cert_serial", c.hostName); got != "yy09" {
+		t.Fatalf("serial = %s", got)
+	}
+	// A renewal of the recorded certificate is re-recorded.
+	if _, err := c.ConfigureOwnRowHold(ctx, StaticInstalledCert("02new", "yy09")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RecordOwnCertSerial(ctx, c, c.hostName, "02new"); err != nil {
+		t.Errorf("the renewal's re-record: %v", err)
+	}
+	if got := oneString(t, c, `SELECT cert_serial FROM hosts WHERE name = ?`, "cert_serial", c.hostName); got != "02new" {
+		t.Errorf("serial = %s, want the renewal", got)
+	}
+}

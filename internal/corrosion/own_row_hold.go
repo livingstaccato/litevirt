@@ -162,6 +162,11 @@ func (c *Client) EvaluateOwnRowHold(ctx context.Context, reason string) (OwnRowH
 	}
 	if h.st.Held {
 		h.st.InstalledSerial, h.st.RecordedSerial = installed, recorded
+		// A held row whose incarnation rose is another machine's admission:
+		// the hold over it must never time out, whatever it was raised over.
+		if incarnation > h.st.Incarnation {
+			h.st.Incarnation = incarnation
+		}
 		h.st.TimedOut = h.st.timedOut()
 	}
 	return h.st, nil
@@ -277,4 +282,33 @@ func (c *Client) ownRowStatementRefused(s Statement) error {
 		}
 	}
 	return nil
+}
+
+// ErrReRecordAtCountedRow refuses re-recording this host's serial over a row
+// at a counted incarnation that names a certificate other than the installed
+// one or the one it renewed: that row is another machine's admission, and the
+// re-record, stamped with its key, would be accepted everywhere and move the
+// name to this machine.
+var ErrReRecordAtCountedRow = errors.New("this host's own row is another admission's; its serial is not re-recorded over it")
+
+// reRecordRefused decides a re-record of serial over the own row naming
+// recorded at incarnation n. At incarnation 0 it is the previous release's
+// behaviour and always allowed. At n ≥ 1 only a renewal of the recorded
+// certificate (the installed certificate names recorded as the one it
+// renewed) is: without the own-row hold's certificate source nothing proves
+// that, and the re-record is refused.
+func (c *Client) reRecordRefused(name, recorded, serial string, n int64) error {
+	if n < 1 || name != c.hostName {
+		return nil
+	}
+	c.ownHold.mu.Lock()
+	src := c.ownHold.installed
+	c.ownHold.mu.Unlock()
+	if src != nil {
+		installed, renewedFrom := src()
+		if strings.EqualFold(installed, serial) && renewedFrom != "" && strings.EqualFold(renewedFrom, recorded) {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w (recorded %s, installed %s, incarnation %d)", ErrReRecordAtCountedRow, recorded, serial, n)
 }

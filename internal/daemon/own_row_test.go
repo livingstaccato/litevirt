@@ -192,3 +192,31 @@ func TestDaemonWiresTheHostWriteChecksBeforeServing(t *testing.T) {
 		t.Error("Serve not found in daemon.go")
 	}
 }
+
+// Re-review I-1: a hold raised at start over a row at 0 that moves to another
+// admission at 1 never runs the fallback reconcile.
+func TestOwnRow_AStartHoldWhoseRowIsReadmittedNeverFallsBack(t *testing.T) {
+	ctx := context.Background()
+	old := corrosion.OwnRowHoldTimeout
+	corrosion.OwnRowHoldTimeout = 10 * time.Millisecond
+	t.Cleanup(func() { corrosion.OwnRowHoldTimeout = old })
+	cert := [2]string{"02new", ""}
+	d, reconciles := ownRowDaemon(t, "01old", &cert)
+	l := &ownRowLoop{wasHeld: d.db.OwnRowHold().Held}
+	if !l.wasHeld {
+		t.Fatal("not held at start")
+	}
+	if _, err := d.db.DB().Exec(`UPDATE hosts SET cert_serial = 'yy09', incarnation = 1 WHERE name = ?`, d.cfg.HostName); err != nil {
+		t.Fatal(err)
+	}
+	d.ownRowStep(ctx, l)
+	time.Sleep(30 * time.Millisecond)
+	d.ownRowStep(ctx, l)
+	d.ownRowStep(ctx, l)
+	if st := d.db.OwnRowHold(); !st.Held || st.TimedOut {
+		t.Fatalf("hold = %+v, want held and never timed out", st)
+	}
+	if reconciles.Load() != 0 {
+		t.Error("the fallback reconcile ran over another admission's row")
+	}
+}

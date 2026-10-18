@@ -45,6 +45,35 @@ type UpgradeOpts struct {
 	Yes        bool     // skip confirmation prompt
 	Force      bool     // skip preflight blocks (warnings still printed)
 	NoPreStage bool     // skip the cluster-wide schema pre-stage pass
+	// SkipPreStage names members outside the upgrade that are down: each is
+	// pre-staged if it answers, and otherwise left behind with a warning.
+	SkipPreStage []string
+}
+
+// checkSkipPreStage refuses a --skip-prestage name that is not a member, or
+// that is a target: a target is always pre-staged before its swap.
+func checkSkipPreStage(opts UpgradeOpts, hosts []*pb.Host, filterSet map[string]bool) error {
+	members := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		members[h.Name] = true
+	}
+	for _, n := range opts.SkipPreStage {
+		switch {
+		case !members[n]:
+			return fmt.Errorf("--skip-prestage %s: %s is not a member (lv host ls)", n, n)
+		case len(filterSet) == 0 || filterSet[n]:
+			return fmt.Errorf("--skip-prestage %s: %s is a target of this upgrade; only a member outside it can be skipped", n, n)
+		}
+	}
+	return nil
+}
+
+func skipSet(names []string) map[string]bool {
+	out := make(map[string]bool, len(names))
+	for _, n := range names {
+		out[n] = true
+	}
+	return out
 }
 
 // hostResult tracks the outcome of upgrading a single host.
@@ -90,7 +119,8 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 	// cluster (every host matches the connected daemon, so nothing looks
 	// "outdated", even though X is newer). Fall back to the connected daemon's
 	// version only if the binary can't be probed (e.g. cross-arch).
-	targetVersion := binaryVersion(ctx, opts.BinaryPath)
+	probedVersion := binaryVersion(ctx, opts.BinaryPath)
+	targetVersion := probedVersion
 	if targetVersion == "" && pingResp != nil {
 		targetVersion = pingResp.Version
 	}
@@ -116,11 +146,18 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 	var selfTarget *pb.Host      // the connected host — upgraded last
 	var others []*pb.Host        // members left on their binary — pre-staged only
 
+	if err := checkSkipPreStage(opts, resp.Hosts, filterSet); err != nil {
+		return err
+	}
+
 	for _, h := range resp.Hosts {
-		// A member already on the version being deployed has its schema.
 		current := targetVersion != "" && h.Version == targetVersion
 		if named && !filterSet[h.Name] {
-			if !current {
+			// A member already on the version of the binary has its schema.
+			// Only a probed version says so: the connected daemon's says
+			// nothing about the binary, so without one every member is
+			// pre-staged.
+			if probedVersion == "" || h.Version != probedVersion {
 				others = append(others, h)
 			}
 			continue
@@ -170,6 +207,9 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 			names[i] = h.Name
 		}
 		fmt.Printf("\n  schema also pre-staged, binary unchanged: %s\n", strings.Join(names, ", "))
+		if probedVersion == "" {
+			fmt.Println("  (the binary's version could not be probed, so every member is pre-staged)")
+		}
 	}
 	fmt.Println()
 
@@ -192,11 +232,14 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 	// against the live state.db (safe: WAL + busy-timeout, idempotent). After
 	// this pass every node's DB has the new schema, so the rolling restart in
 	// phase 2 never produces a peer that's missing columns — which is the only
-	// thing that makes a multi-version rolling upgrade unsafe. Older daemons
-	// without the PreStageUpgrade RPC report Unimplemented and are skipped (they
-	// migrate themselves on restart; single-version skew self-heals).
+	// thing that makes a multi-version rolling upgrade unsafe. Targets on older
+	// daemons without the PreStageUpgrade RPC report Unimplemented and are
+	// skipped (they migrate themselves on restart; single-version skew
+	// self-heals). Every member is probed first, and a member that cannot be
+	// pre-staged refuses the upgrade with nothing pre-staged, unless
+	// --skip-prestage names it.
 	if !opts.NoPreStage {
-		if err := preStageSchema(ctx, client, targets, others, opts.BinaryPath, opts.Force); err != nil {
+		if err := preStageSchema(ctx, client, targets, others, opts.BinaryPath, skipSet(opts.SkipPreStage)); err != nil {
 			return err
 		}
 	}

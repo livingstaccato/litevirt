@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 
 	"google.golang.org/grpc"
@@ -16,93 +17,102 @@ import (
 
 // preStageSchema runs phase 1 of a rolling upgrade: it streams the new binary
 // to every target and forward-migrates each one's schema WITHOUT swapping the
-// live binary. It returns a non-nil error only when a host fails to pre-stage
-// for a real reason (bad binary, locked DB, migration error) — in that case NO
-// binary has been swapped yet, so the operator can fix the host and re-run.
+// live binary. It returns a non-nil error when a host cannot be pre-staged; NO
+// binary has been swapped then, so the operator can fix the host and re-run.
 //
-// Hosts whose daemon predates the PreStageUpgrade RPC report Unimplemented and
-// are skipped, not failed: they migrate themselves on restart, and a
-// single-version skew is tolerated by the replication handshake. That makes the
-// very upgrade that introduces this feature a clean no-op fallback.
+// Targets whose daemon predates the PreStageUpgrade RPC report Unimplemented
+// and are skipped, not failed: they migrate themselves on restart, and a
+// single-version skew is tolerated by the replication handshake.
 //
 // others are the members the upgrade does not swap. Each receives replication
 // from the upgraded targets and refuses every push from a sender whose schema
 // is ahead of its own, so each is pre-staged too (its binary is left alone).
-// A member that cannot be pre-staged, for any reason, Unimplemented included,
-// refuses the upgrade before any binary is swapped, unless force is set.
-func preStageSchema(ctx context.Context, client pb.LiteVirtClient, targets, others []*pb.Host, binaryPath string, force bool) error {
+// A pre-staged host advertises the new schema at once, so every host is
+// probed before any is pre-staged: when a member cannot be reached, or does
+// not answer the upgrade RPCs, the upgrade is refused with nothing changed.
+// skip names members that are down: one that does not answer is left behind
+// with a warning; one that answers is pre-staged anyway.
+func preStageSchema(ctx context.Context, client pb.LiteVirtClient, targets, others []*pb.Host, binaryPath string, skip map[string]bool) error {
 	data, err := os.ReadFile(binaryPath)
 	if err != nil {
 		return fmt.Errorf("read binary: %w", err)
 	}
 	checksum := sha256sum(data)
 
+	// Probe every host first: nothing is pre-staged unless all can be.
+	fmt.Println("Probing every member before pre-staging...")
+	var stageTargets, stageOthers []*pb.Host
+	var unsupported, behind []string
+	refused := map[string]string{}
+	var refusedTargets, refusedOthers []string
+	for _, h := range targets {
+		switch err := probeMember(ctx, client, h); {
+		case err == nil:
+			stageTargets = append(stageTargets, h)
+		case status.Code(err) == codes.Unimplemented:
+			unsupported = append(unsupported, h.Name)
+		default:
+			refused[h.Name] = err.Error()
+			refusedTargets = append(refusedTargets, h.Name)
+		}
+	}
+	for _, h := range others {
+		err := probeMember(ctx, client, h)
+		switch {
+		case err == nil:
+			stageOthers = append(stageOthers, h)
+		case skip[h.Name]:
+			behind = append(behind, h.Name)
+			fmt.Fprintf(os.Stderr, "  WARNING (--skip-prestage): %s is not pre-staged (%v); when it returns it refuses "+
+				"replication from every upgraded host until `lv host upgrade %s`\n", h.Name, err, h.Name)
+		default:
+			refused[h.Name] = err.Error()
+			refusedOthers = append(refusedOthers, h.Name)
+		}
+	}
+	if len(refusedTargets)+len(refusedOthers) > 0 {
+		return probeRefusal(targets, refusedTargets, refusedOthers, refused)
+	}
+
 	if len(others) > 0 {
-		fmt.Printf("Pre-staging schema on %d target(s) and %d other member(s) (safe — no restart)...\n", len(targets), len(others))
+		fmt.Printf("Pre-staging schema on %d target(s) and %d other member(s) (safe — no restart)...\n", len(stageTargets), len(stageOthers))
 	} else {
 		fmt.Println("Pre-staging schema on all targets (safe — no restart)...")
 	}
 
-	var prestaged, unsupported []string
+	// Pre-stage every host that answered, even past a failure: a host left
+	// out refuses the pushes of every host pre-staged, so the fewer left out
+	// the better.
+	var prestaged, failedOrder []string
 	failed := map[string]string{}
 	stagedSchema := int32(0)
-
-	for _, h := range targets {
-		resp, err := preStageOneHost(ctx, client, h, data, checksum, force)
+	stage := func(h *pb.Host, isTarget bool) {
+		resp, err := preStageOneHost(ctx, client, h, data, checksum)
 		switch {
 		case err == nil:
 			prestaged = append(prestaged, h.Name)
 			if resp != nil && resp.SchemaVersion > stagedSchema {
 				stagedSchema = resp.SchemaVersion
 			}
-		case status.Code(err) == codes.Unimplemented:
+		case isTarget && status.Code(err) == codes.Unimplemented:
 			unsupported = append(unsupported, h.Name)
+		case !isTarget && skip[h.Name]:
+			behind = append(behind, h.Name)
+			fmt.Fprintf(os.Stderr, "  WARNING (--skip-prestage): %s could not be pre-staged (%v); it refuses "+
+				"replication from every upgraded host until `lv host upgrade %s`\n", h.Name, err, h.Name)
 		default:
 			failed[h.Name] = err.Error()
+			failedOrder = append(failedOrder, h.Name)
 		}
 	}
-
-	// Hard failures abort the whole upgrade before any binary is swapped.
+	for _, h := range stageTargets {
+		stage(h, true)
+	}
+	for _, h := range stageOthers {
+		stage(h, false)
+	}
 	if len(failed) > 0 {
-		var b strings.Builder
-		for name, msg := range failed {
-			fmt.Fprintf(&b, "\n    %s: %s", name, msg)
-		}
-		return fmt.Errorf("pre-stage failed on %d host(s); no binaries were swapped — resolve and re-run:%s",
-			len(failed), b.String())
-	}
-
-	var lagging []string
-	for _, h := range others {
-		resp, err := preStageOneHost(ctx, client, h, data, checksum, force)
-		if err != nil {
-			failed[h.Name] = err.Error()
-			lagging = append(lagging, h.Name)
-			continue
-		}
-		prestaged = append(prestaged, h.Name)
-		if resp != nil && resp.SchemaVersion > stagedSchema {
-			stagedSchema = resp.SchemaVersion
-		}
-	}
-	if len(lagging) > 0 {
-		var b strings.Builder
-		for _, name := range lagging {
-			fmt.Fprintf(&b, "\n    %s: %s", name, failed[name])
-		}
-		names := make([]string, 0, len(targets)+len(lagging))
-		for _, h := range targets {
-			names = append(names, h.Name)
-		}
-		names = append(names, lagging...)
-		msg := fmt.Sprintf("%d member(s) outside this upgrade could not be pre-staged, and each would refuse "+
-			"replication from every upgraded host until it is upgraded:%s\n"+
-			"  upgrade them with the rest (lv host upgrade %s), or bring them back and re-run",
-			len(lagging), b.String(), strings.Join(names, " "))
-		if !force {
-			return fmt.Errorf("%s; --force proceeds anyway. No binaries were swapped", msg)
-		}
-		fmt.Fprintf(os.Stderr, "  WARNING (--force): %s\n", msg)
+		return stageFailure(failedOrder, failed, prestaged, stagedSchema)
 	}
 
 	switch {
@@ -112,23 +122,97 @@ func preStageSchema(ctx context.Context, client pb.LiteVirtClient, targets, othe
 		fmt.Println("  no daemon supports pre-staging yet — proceeding with rolling upgrade")
 		fmt.Println("  (each node migrates its own schema on restart; single-version skew self-heals)")
 	default:
-		label := "schema"
-		if stagedSchema > 0 {
-			label = fmt.Sprintf("schema v%d", stagedSchema)
-		}
-		fmt.Printf("  pre-staged %s on %d host(s)", label, len(prestaged))
+		fmt.Printf("  pre-staged %s on %d host(s)", schemaLabel(stagedSchema), len(prestaged))
 		if len(unsupported) > 0 {
 			fmt.Printf("; %d on older daemons will migrate on restart (%s)",
 				len(unsupported), strings.Join(unsupported, ", "))
 		}
 		fmt.Println()
 	}
+	if len(behind) > 0 {
+		fmt.Printf("  not pre-staged (--skip-prestage): %s\n", strings.Join(behind, ", "))
+	}
 	fmt.Println()
 	return nil
 }
 
+// probeMember checks, changing nothing, that h answers the upgrade RPCs
+// through the same forwarding path PreStageUpgrade takes. PreflightUpgrade
+// is read-only, and every daemon that has it has PreStageUpgrade.
+func probeMember(ctx context.Context, client pb.LiteVirtClient, h *pb.Host) error {
+	_, err := client.PreflightUpgrade(ctx, &pb.PreflightUpgradeRequest{TargetHost: h.Name})
+	return err
+}
+
+// probeRefusal is the error for hosts that failed their probe. Nothing has
+// been pre-staged or swapped.
+func probeRefusal(targets []*pb.Host, refusedTargets, refusedOthers []string, refused map[string]string) error {
+	var b strings.Builder
+	if len(refusedTargets) > 0 {
+		fmt.Fprintf(&b, "%d target(s) cannot be reached:", len(refusedTargets))
+		for _, name := range refusedTargets {
+			fmt.Fprintf(&b, "\n    %s: %s", name, refused[name])
+		}
+		b.WriteString("\n")
+	}
+	if len(refusedOthers) > 0 {
+		fmt.Fprintf(&b, "%d member(s) outside this upgrade cannot be pre-staged, and each would refuse "+
+			"replication from every upgraded host until it is upgraded:", len(refusedOthers))
+		for _, name := range refusedOthers {
+			fmt.Fprintf(&b, "\n    %s: %s", name, refused[name])
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("  Nothing was pre-staged and no binary was swapped.")
+	if len(refusedOthers) > 0 {
+		names := make([]string, 0, len(targets)+len(refusedOthers))
+		for _, h := range targets {
+			names = append(names, h.Name)
+		}
+		names = append(names, refusedOthers...)
+		down := strings.Join(refusedOthers, ",")
+		fmt.Fprintf(&b, " Bring them back and re-run, upgrade them with the rest (lv host upgrade %s), "+
+			"skip the ones that are down with --skip-prestage %s (each refuses replication when it returns, "+
+			"until it is upgraded), or remove them (lv host rm %s)",
+			strings.Join(names, " "), down, strings.Join(refusedOthers, ", lv host rm "))
+	} else {
+		b.WriteString(" Bring the targets back, or leave them out, and re-run")
+	}
+	return fmt.Errorf("%s", b.String())
+}
+
+// stageFailure is the error for hosts whose pre-stage failed after every
+// probe answered. A pre-stage cannot be undone, so it says what is left.
+func stageFailure(failedOrder []string, failed map[string]string, prestaged []string, stagedSchema int32) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "pre-stage failed on %d host(s); no binary was swapped:", len(failedOrder))
+	for _, name := range failedOrder {
+		fmt.Fprintf(&b, "\n    %s: %s", name, failed[name])
+	}
+	if len(prestaged) > 0 {
+		sorted := slices.Clone(prestaged)
+		slices.Sort(sorted)
+		fmt.Fprintf(&b, "\n  %s are pre-staged at %s (they keep running, and restart safely, on their binary). ",
+			strings.Join(sorted, ", "), schemaLabel(stagedSchema))
+		for _, name := range failedOrder {
+			fmt.Fprintf(&b, "%s refuses replication from them until it is pre-staged or upgraded "+
+				"(fix it and re-run, or lv host upgrade %s). ", name, name)
+		}
+	} else {
+		b.WriteString("\n  Nothing was pre-staged. Resolve and re-run.")
+	}
+	return fmt.Errorf("%s", strings.TrimSpace(b.String()))
+}
+
+func schemaLabel(v int32) string {
+	if v > 0 {
+		return fmt.Sprintf("schema v%d", v)
+	}
+	return "the new schema"
+}
+
 // preStageOneHost streams the binary to one host's PreStageUpgrade RPC.
-func preStageOneHost(ctx context.Context, client pb.LiteVirtClient, h *pb.Host, data []byte, checksum string, force bool) (*pb.UpgradeHostResponse, error) {
+func preStageOneHost(ctx context.Context, client pb.LiteVirtClient, h *pb.Host, data []byte, checksum string) (*pb.UpgradeHostResponse, error) {
 	fmt.Printf("  %s: staging + migrating schema...\n", h.Name)
 	stream, err := client.PreStageUpgrade(ctx)
 	if err != nil {
@@ -137,7 +221,6 @@ func preStageOneHost(ctx context.Context, client pb.LiteVirtClient, h *pb.Host, 
 	first := &pb.UpgradeHostRequest{
 		Checksum:   checksum,
 		TargetHost: h.Name,
-		Force:      force,
 	}
 	return sendUpgradeStream(stream, data, first)
 }

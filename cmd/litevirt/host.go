@@ -900,6 +900,7 @@ func newHostUpgradeCmd() *cobra.Command {
 	var yes bool
 	var force bool
 	var noPreStage bool
+	var skipPreStage []string
 	cmd := &cobra.Command{
 		Use:   "upgrade [host-name...]",
 		Short: "Roll out a new litevirtd binary to cluster hosts",
@@ -916,23 +917,26 @@ holdings, replication backlog, and clock skew. The upgrade aborts on
   lv host upgrade host-b host-c             # specific hosts
   lv host upgrade --binary ./bin/litevirtd  # use a local binary
   lv host upgrade --force                   # skip preflight blocks
+  lv host upgrade host-b --skip-prestage host-d  # host-d is down: leave its schema behind
   lv host preflight-upgrade <host>          # check without upgrading`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				return cli.HostUpgrade(ctx, c, cli.UpgradeOpts{
-					BinaryPath: binaryPath,
-					HostNames:  args,
-					Yes:        yes,
-					Force:      force,
-					NoPreStage: noPreStage,
+					BinaryPath:   binaryPath,
+					HostNames:    args,
+					Yes:          yes,
+					Force:        force,
+					NoPreStage:   noPreStage,
+					SkipPreStage: skipPreStage,
 				})
 			})
 		},
 	}
 	cmd.Flags().StringVar(&binaryPath, "binary", "/usr/local/bin/litevirt", "Path to litevirtd binary to distribute")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation prompt")
-	cmd.Flags().BoolVar(&force, "force", false, "Skip preflight blocks, and proceed past members that cannot be pre-staged (warnings still printed)")
+	cmd.Flags().BoolVar(&force, "force", false, "Skip preflight blocks (warnings still printed)")
 	cmd.Flags().BoolVar(&noPreStage, "no-prestage", false, "Skip the cluster-wide schema pre-stage pass (not recommended for multi-version upgrades)")
+	cmd.Flags().StringSliceVar(&skipPreStage, "skip-prestage", nil, "Members outside the upgrade that are down: pre-stage each only if it answers, and otherwise leave it on its schema with a warning")
 	return cmd
 }
 

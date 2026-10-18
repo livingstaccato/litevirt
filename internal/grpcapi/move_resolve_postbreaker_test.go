@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -65,7 +66,28 @@ func forkedMoveServer(t *testing.T, owner string, ownerEpoch, vmEpoch int64, def
 			t.Fatal(err)
 		}
 	}
+	// The owner wrote the source after the holder's last write to the copy.
+	setModTimes(t, dst, src)
 	return s, src, dst
+}
+
+// setModTimes gives earlier an older modification time than later.
+func setModTimes(t *testing.T, earlier, later string) {
+	t.Helper()
+	e, l := time.Now().Add(-time.Hour), time.Now().Add(-time.Minute)
+	if err := os.Chtimes(earlier, e, e); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(later, l, l); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// forceCtx is acceptCtx with `lv health resolve --force`.
+func forceCtx(paths ...string) context.Context {
+	ctx := acceptCtx(paths...)
+	md, _ := metadata.FromIncomingContext(ctx)
+	return metadata.NewIncomingContext(ctx, metadata.Join(md, metadata.Pairs(MoveForceMDKey, "true")))
 }
 
 func forkWrites(src, dst string) map[string]string {
@@ -87,24 +109,48 @@ func TestResolveHealthCondition_ForkedHistoryKeepsTheOwnersFile(t *testing.T) {
 		ownerEp, vmEp int64
 		define        string
 		running       bool
+		copyLater     bool // the copy was modified after the source
+		force         bool
 		ok            bool
+		want          string
 	}{
 		{name: "another owner, running on the source", owner: "node-a", ownerEp: 3, vmEp: 3, define: "src", running: true, ok: true},
 		{name: "the same owner at a later generation, shut off", owner: "test-host", ownerEp: 3, vmEp: 4, define: "src", ok: true},
 		{name: "no change of hands since the move", owner: "test-host", ownerEp: 4, vmEp: 4, define: "src"},
 		{name: "the record names no owner", vmEp: 4, define: "src"},
 		{name: "the owner's config names the copy", owner: "node-a", ownerEp: 3, vmEp: 4, define: "dst"},
-		{name: "no domain on the owner", owner: "node-a", ownerEp: 3, vmEp: 4},
+		// I6-1: with no domain, a start rebuilds it from the disk row, so
+		// keeping the row's file needs no config.
+		{name: "no domain on the owner", owner: "node-a", ownerEp: 3, vmEp: 4, ok: true},
+		// m6-1: the copy modified after the source shows nothing was written
+		// here since the holder's last write.
+		{name: "the copy modified later", owner: "node-a", ownerEp: 3, vmEp: 4, define: "src", copyLater: true,
+			want: "--force"},
+		{name: "the copy modified later, no domain", owner: "node-a", ownerEp: 3, vmEp: 4, copyLater: true, want: "--force"},
+		{name: "the copy modified later, --force", owner: "node-a", ownerEp: 3, vmEp: 4, define: "src", copyLater: true,
+			force: true, ok: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, src, dst := forkedMoveServer(t, tc.owner, tc.ownerEp, tc.vmEp, tc.define, tc.running)
-			_, err := s.ResolveHealthCondition(acceptCtx(src), moveResolveReq("ran on the source since the failover"))
+			if tc.copyLater {
+				setModTimes(t, src, dst)
+			}
+			rctx := acceptCtx(src)
+			if tc.force {
+				rctx = forceCtx(src)
+			}
+			_, err := s.ResolveHealthCondition(rctx, moveResolveReq("ran on the source since the failover"))
 			for p, w := range forkWrites(src, dst) {
 				if b, rerr := os.ReadFile(p); rerr != nil || string(b) != w {
 					t.Fatalf("%s = %q %v, want it kept as it was", p, b, rerr)
 				}
 			}
 			if !tc.ok {
+				if tc.want != "" {
+					// Both files' sizes and times, and how to judge them.
+					mustRefuse(t, s, err, src, tc.want, "modified", "bytes", "lv audit ls --target vm1 --action vm.start")
+					return
+				}
 				mustRefuse(t, s, err, src, "--accept "+dst)
 				return
 			}
@@ -120,8 +166,9 @@ func TestResolveHealthCondition_ForkedHistoryKeepsTheOwnersFile(t *testing.T) {
 			}
 			rows, qerr := s.db.Query(ctx, `SELECT result, detail FROM audit_log WHERE action = 'health.condition.hand_diverged'`)
 			if qerr != nil || len(rows) != 1 || !strings.Contains(rows[0].String("detail"), dst) ||
-				!strings.Contains(rows[0].String("detail"), "kept on disk") {
-				t.Fatalf("divergence audit = %+v %v, want one row naming %s kept on disk", rows, qerr, dst)
+				!strings.Contains(rows[0].String("detail"), "kept on disk") ||
+				strings.Contains(rows[0].String("detail"), "--force") != tc.force {
+				t.Fatalf("divergence audit = %+v %v, want one row naming %s kept on disk (forced=%v)", rows, qerr, dst, tc.force)
 			}
 			if tc.running {
 				if st, _ := fakeOf(t, s).DomainState("vm1"); st != "running" {
@@ -303,13 +350,17 @@ func TestResolveHealthCondition_UnreadableEvidenceConfigAndHandMarker(t *testing
 		_, err := s.ResolveHealthCondition(adminCtx(), moveResolveReq("x"))
 		mustRefuse(t, s, err, srcFile, "cannot be read", srcFile, "virsh edit vm1")
 	})
+	before := func(r time.Time) string { return r.Add(-time.Hour).Format(time.RFC3339Nano) }
 	for _, tc := range []struct {
-		name   string
-		at     func(resolved time.Time) string
-		raised bool
+		name    string
+		at      func(resolved time.Time) string
+		pivoted bool
+		raised  bool
 	}{
-		{name: "a holder's record of a move begun before: dropped", at: func(r time.Time) string { return r.Add(-time.Hour).Format(time.RFC3339Nano) }},
-		{name: "a holder's record of a move begun after: kept", at: func(r time.Time) string { return r.Add(time.Hour).Format(time.RFC3339Nano) }, raised: true},
+		{name: "a holder's record of a move begun before: dropped", at: before},
+		// m6-3: the admin saw none of the pivot this record knew.
+		{name: "a holder's pivoted record of a move begun before: kept", at: before, pivoted: true, raised: true},
+		{name: "a holder's record of a move begun after: kept", at: func(r time.Time) string { return r.Add(time.Hour).Format(time.RFC3339Nano) }, pivoted: true, raised: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _, srcFile, dstFile := broken(t)
@@ -327,7 +378,7 @@ func TestResolveHealthCondition_UnreadableEvidenceConfigAndHandMarker(t *testing
 			// node-a returns with its record; the VM is test-host's.
 			holderDir := t.TempDir()
 			if err := health.RecordUnresolvedMove(holderDir, health.UnresolvedMove{VM: "vm1", Disk: "root", TargetDev: "vda",
-				Src: srcFile, Dst: dstFile, Live: true, Pivoted: true, At: tc.at(resolved)}); err != nil {
+				Src: srcFile, Dst: dstFile, Live: true, Pivoted: tc.pivoted, At: tc.at(resolved)}); err != nil {
 				t.Fatal(err)
 			}
 			if err := health.PublishUnresolvedMoves(ctx, s.db, holderDir, "node-a", "vm1"); err != nil {
@@ -340,11 +391,9 @@ func TestResolveHealthCondition_UnreadableEvidenceConfigAndHandMarker(t *testing
 			if (len(left) == 1) != tc.raised {
 				t.Fatalf("holder's records = %+v", left)
 			}
-			if !tc.raised {
-				rows, qerr := s.db.Query(ctx, `SELECT detail FROM audit_log WHERE action = 'health.condition.hand_diverged'`)
-				if qerr != nil || len(rows) != 1 || !strings.Contains(rows[0].String("detail"), "pivoted") {
-					t.Fatalf("the divergence was not recorded: %+v %v", rows, qerr)
-				}
+			rows, qerr := s.db.Query(ctx, `SELECT detail FROM audit_log WHERE action = 'health.condition.hand_diverged'`)
+			if qerr != nil || len(rows) != 0 {
+				t.Fatalf("a divergence was recorded: %+v %v", rows, qerr)
 			}
 		})
 	}

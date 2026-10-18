@@ -1797,7 +1797,8 @@ that owns the VM the domain must be shut off. A condition whose evidence
 cannot be read is resolved only on the VM's owner with its domain shut off and
 its persistent config naming the file each disk record names, and keeps the
 disk records as they are; a holding host that returns with a record of a move
-of one of those disks begun before the resolution drops it.
+of one of those disks begun before the resolution drops it, unless the record
+knew a pivot, a catch-up or an error: that one is raised again.
 
 **A forked history.** A pivoted move whose condition reached the VM's new
 owner only after a failover there (replication from the holding host was cut,
@@ -1809,15 +1810,33 @@ naming both exits. Once the holding host is proven powered off, on the owner:
 
 - `lv health resolve vm.move_unresolved vm/<vm> --accept <source> --reason
   "…"` keeps the owner's writes. It is accepted when the owner's persistent
-  config names the file its disk record names and the VM changed hands after
-  the move began (another owner, or a later ownership generation, than the
-  move recorded); the domain may keep running. The disk record is not
-  changed, the copy is kept on disk, and a `health.condition.hand_diverged`
-  audit row names it.
+  config names the file its disk record names, or the owner has no domain of
+  the VM (a start rebuilds it from the disk record), and the VM changed hands
+  after the move began (another owner, or a later ownership generation, than
+  the move recorded); the domain may keep running. It is refused while the
+  copy was modified after the source: the holding host wrote only the copy
+  after the pivot, so nothing was written to the source since. `--force`
+  takes it anyway, with the reason audited. The disk record is not changed,
+  the copy is kept on disk, and a `health.condition.hand_diverged` audit row
+  names it.
 - `--accept <copy>` keeps the holding host's writes and discards every write
   made on the source since the failover. It needs the domain stopped (`lv
   stop`) and its persistent config pointed at the copy, as any other
   `--accept` of the copy on the owner.
+
+The refusal prints both files' sizes and modification times. A source
+modified after the copy was written since the failover; `lv audit ls --target
+<vm> --action vm.start` lists the starts of the VM.
+
+With no domain of the VM on its owner, a start points the disk record at the
+copy by itself only when the VM came there straight from the holding host:
+the move recorded the holding host as the VM's owner, the VM is one ownership
+generation on, the owner has not started the VM since the move began (each
+host keeps a record of the generation it last started a VM at, under
+`move-started` in its data directory), and the copy was modified after the
+source. Otherwise the start is refused with the text above, and the
+condition stays open. Each such repoint writes a
+`health.condition.auto_repoint` audit row.
 
 A holding host that rejoins after an admin resolved its move from another
 host drops its record of that move instead of raising the condition again,

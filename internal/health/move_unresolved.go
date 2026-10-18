@@ -367,9 +367,11 @@ func handSettled(ctx context.Context, db *corrosion.Client, host string, row cor
 				decided = &ev.Moves[i]
 			}
 		}
-		if decided == nil && handDiskSettles(ev, m) {
+		if decided == nil && handDiskSettles(ev, m) && knewMore(m, UnresolvedMove{}) == "" {
 			// Resolved by hand over evidence that could not be read: the
-			// admin saw none of what this record holds.
+			// admin saw none of what this record holds. One that knew a
+			// pivot, a catch-up or an error is kept and raised again: the
+			// admin decided without it.
 			decided = &UnresolvedMove{}
 		}
 		if decided == nil || moveInFlight(vm, m.Disk) {
@@ -590,6 +592,7 @@ func ForgetUnresolvedMoves(ctx context.Context, db *corrosion.Client, dataDir, v
 	if err := ClearUnresolvedMovesOf(dataDir, vm); err != nil {
 		return err
 	}
+	forgetStartedHere(dataDir, vm)
 	if db == nil {
 		return nil
 	}
@@ -881,7 +884,7 @@ func resolveUnresolvedMove(ctx context.Context, db *corrosion.Client, dataDir, h
 			"disk row names %s and both files are kept. Operator: point the disk's source in the persistent config at %s "+
 			"(virsh edit %s) and retry", m.VM, m.Disk, m.Dst, m.Src, row.Path, m.Dst, m.VM)
 	}
-	if err := pointRow(ctx, db, m, row, host, path, typ, pool); err != nil {
+	if err := pointRow(ctx, db, m, row, host, path, typ, pool, "the persistent config here names it"); err != nil {
 		return false, err
 	}
 	return true, ClearUnresolvedMove(dataDir, m.VM, m.Disk)
@@ -926,30 +929,38 @@ func resolveRemoteMove(ctx context.Context, db *corrosion.Client, dataDir, host,
 			return nil
 		}
 		shared := SharedPoolHolds(ctx, db, dataDir, host, origin, m.DstPool, m.DstType, m.Dst)
+		// fork refuses the repoint, why: the VM may have run here on the
+		// source since it failed over, so each file may hold writes the
+		// other lacks, and neither is called stale.
+		fork := func(why string, noteShared bool) error {
+			where := ""
+			if noteShared && !shared {
+				where = fmt.Sprintf(" (%s is not on a shared pool %s mounts: keeping it is settled on %s)", m.Dst, host, origin)
+			}
+			return refuse(m, false, "%s: a volume move of its disk %s on %s did not finish: the guest was pivoted onto %s "+
+				"there, and the disk row names %s; the row is not pointed at %s because %s. If the VM has run here on %s "+
+				"since it failed over, the two files hold different writes: %s those %s made after the pivot, %s those "+
+				"made here since. Operator: once %s is %s, keep this host's writes with `%s` here (%s is kept on disk), "+
+				"or keep %s's with `%s`%s, which discards every write made on %s since the failover; %s. "+
+				"docs/diagnostics.md describes both",
+				m.VM, m.Disk, origin, m.Dst, row.Path, m.Dst, why, row.Path, m.Dst, origin, row.Path,
+				origin, provedOffText(origin), resolveAcceptCmd(m.VM, row.Path), m.Dst,
+				origin, resolveAcceptCmd(m.VM, m.Dst), where, row.Path, forkJudgeText(m.VM, row.Path, m.Dst))
+		}
 		if row.HostName == host && vmRec.HostName == host {
 			if why := barsRepoint(host, dom, m, m.Dst); why != "" {
-				// The VM may have run here on the source since it failed over:
-				// then each file holds writes the other lacks, and neither is
-				// called stale.
-				where := ""
-				if !shared {
-					where = fmt.Sprintf(" (%s is not on a shared pool %s mounts: keeping it is settled on %s)", m.Dst, host, origin)
-				}
-				return refuse(m, false, "%s: a volume move of its disk %s on %s did not finish: the guest was pivoted onto %s "+
-					"there, and the disk row names %s; the row is not pointed at %s because %s. If the VM has run here on %s "+
-					"since it failed over, the two files hold different writes: %s those %s made after the pivot, %s those "+
-					"made here since. Operator: once %s is %s, keep this host's writes with `%s` here (%s is kept on disk), "+
-					"or keep %s's with `%s`%s, which discards every write made on %s since the failover; "+
-					"docs/diagnostics.md describes both",
-					m.VM, m.Disk, origin, m.Dst, row.Path, m.Dst, why, row.Path, m.Dst, origin, row.Path,
-					origin, provedOffText(origin), resolveAcceptCmd(m.VM, row.Path), m.Dst,
-					origin, resolveAcceptCmd(m.VM, m.Dst), where, row.Path)
+				return fork(why, true)
 			}
 			if shared {
-				slog.Warn("move-volume condition: the disk row named the source, which lacks the writes made on the copy; pointed it at the copy",
-					"vm", m.VM, "disk", m.Disk, "origin", origin, "row_was", row.Path, "row_now", m.Dst)
-				return pointRow(ctx, db, m, row, host, m.Dst, m.DstType, m.DstPool)
+				if why := unprovenHandoff(dataDir, origin, vmRec, m, dom, row.Path); why != "" {
+					return fork(why, false)
+				}
+				return pointRow(ctx, db, m, row, host, m.Dst, m.DstType, m.DstPool,
+					fmt.Sprintf("%s pivoted the guest onto it, and the VM came here from %s with no start elsewhere", origin, origin))
 			}
+		}
+		if vmRec.HostName == host && OwnerChangedSince(vmRec, m) {
+			return fork(fmt.Sprintf("%s is not on a shared pool %s mounts", m.Dst, host), false)
 		}
 		return refuse(m, false, "%s: a volume move of its disk %s on %s did not finish: the guest was moved onto %s, but the "+
 			"disk row names %s, which lacks the writes made since, and %s is not on a shared pool %s mounts. %s",
@@ -965,6 +976,55 @@ func resolveRemoteMove(ctx context.Context, db *corrosion.Client, dataDir, host,
 	default:
 		return nil
 	}
+}
+
+// unprovenHandoff says why the disk row of origin's pivoted move m may not be
+// pointed at the copy by itself here, with no domain of the VM here to read
+// ("" when it may): a start rebuilds the domain from the row, so nothing here
+// shows whether the VM ran on the source since the move. It may only when the
+// VM came here straight from origin: the move began with origin owning the VM
+// at generation G, the VM is now at G+1, this host has not started it since
+// the move began, and the copy (rowPath being the source) was modified later.
+// A domain defined here whose config names the copy (barsRepoint passed) is
+// taken as it is.
+func unprovenHandoff(dataDir, origin string, vmRec *corrosion.VMRecord, m UnresolvedMove, dom MoveDomain, rowPath string) string {
+	if (dom.State != nil || dom.Active != nil) && !dom.missing() {
+		return ""
+	}
+	switch {
+	case m.Owner == "":
+		return fmt.Sprintf("its domain is not defined here and the move's record names no owner, so nothing shows the "+
+			"VM came here straight from %s", origin)
+	case m.Owner != origin:
+		return fmt.Sprintf("its domain is not defined here and the move began with %s owning the VM, not %s, which "+
+			"holds the move", m.Owner, origin)
+	case vmRec.OwnerEpoch != m.OwnerEpoch+1:
+		return fmt.Sprintf("its domain is not defined here and the VM is at ownership generation %d: only generation %d, "+
+			"one change of hands after the move began at %d, shows it came here straight from %s",
+			vmRec.OwnerEpoch, m.OwnerEpoch+1, m.OwnerEpoch, origin)
+	}
+	if g, ok, err := startedHereAt(dataDir, m.VM); err != nil {
+		return fmt.Sprintf("its domain is not defined here and this host's record of its own starts of the VM cannot be "+
+			"read (%v)", err)
+	} else if ok && g >= m.OwnerEpoch {
+		return fmt.Sprintf("this host started the VM at ownership generation %d, after the move began at %d, on the "+
+			"file its disk row names, and its domain is not defined here now", g, m.OwnerEpoch)
+	}
+	if !ModifiedLater(m.Dst, rowPath) {
+		return fmt.Sprintf("its domain is not defined here and %s is not proven to have been modified after %s",
+			m.Dst, rowPath)
+	}
+	return ""
+}
+
+// forkJudgeText gives what an operator judges a forked history by: both
+// files' sizes and modification times as read here, and where a start of
+// the VM is recorded.
+func forkJudgeText(vm, src, dst string) string {
+	return fmt.Sprintf("judge it from the two files (%s; %s: after the pivot the holder wrote only the copy, so a "+
+		"source modified after the copy was written since the failover, and `--accept` of the source is refused "+
+		"while the copy is the later one unless --force is given) and from the VM's starts "+
+		"(`lv audit ls --target %s --action vm.start`)", MoveFileFacts(src), MoveFileFacts(dst), vm)
 }
 
 // SharedPoolHolds reports whether path, a file origin wrote in its pool
@@ -1060,13 +1120,18 @@ func diskRow(ctx context.Context, db *corrosion.Client, m UnresolvedMove) (*corr
 	return nil, nil
 }
 
-func pointRow(ctx context.Context, db *corrosion.Client, m UnresolvedMove, row *corrosion.DiskRecord, host, path, typ, pool string) error {
+// pointRow points m's disk row at path, why being the evidence, and writes a
+// health.condition.auto_repoint audit row.
+func pointRow(ctx context.Context, db *corrosion.Client, m UnresolvedMove, row *corrosion.DiskRecord, host, path, typ, pool, why string) error {
 	if row.Path == path {
 		return nil
 	}
 	if err := corrosion.UpdateDiskPlacement(ctx, db, m.VM, m.Disk, host, path, typ, pool); err != nil {
 		return refuse(m, true, "%s: point the disk row of %s at %s: %v", m.VM, m.Disk, path, err)
 	}
+	auditSystem(ctx, db, host, "health.condition.auto_repoint", MoveUnresolvedCode+"/vm/"+m.VM,
+		fmt.Sprintf("%s pointed the disk row of %s from %s at %s (move %s → %s begun %s): %s", host, m.Disk, row.Path,
+			path, m.Src, m.Dst, m.At, why), "ok")
 	if path == m.Dst {
 		if info, ierr := qcow2.Info(path); ierr == nil && info.BackingFile == "" {
 			if cerr := corrosion.ClearDiskBacking(ctx, db, m.VM, m.Disk, path); cerr != nil {

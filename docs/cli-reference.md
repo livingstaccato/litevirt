@@ -101,13 +101,14 @@ lv cluster claim-release <kind>/<name>       # Release one workload ha.claim.leg
                                    #   legacy proof stuck in flight on a live destination; the
                                    #   destination confirms nothing runs it, then abandons it (admin)
 lv health [--resolved]             # Cluster health: overall + conditions + coverage (exit 0/1/2)
-lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH]  # Resolve one open
+lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH] [--force]  # Resolve one open
                                    #   dual-run condition by hand (admin, audited); re-raised next pass if it
                                    #   still holds; or a vm.move_unresolved (--reason required) on its holding
                                    #   host, or once that host is proven powered off; --accept picks the file
                                    #   to keep of one disk (repeat per disk; required for a move with no pivot
                                    #   recorded, unless the holder owns the VM and its config and record name
-                                   #   the source)
+                                   #   the source); --force keeps a forked history's source although the copy
+                                   #   was modified after it
 ```
 
 ## Hosts
@@ -1492,7 +1493,7 @@ lv health [--resolved]                       # Cluster health: overall state, ac
                                              #   evaluator coverage, connectivity, capacity.
                                              #   --resolved includes the 30-day resolved history.
                                              #   Exit code: 0 healthy · 1 degraded/unknown · 2 critical.
-lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH]
+lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH] [--force]
                                              # Resolve one open dual-run condition by hand, named as
                                              #   `lv health` prints it. Admin (cluster.health.resolve),
                                              #   audited, ha.condition.resolved event. Refused until a
@@ -1509,7 +1510,9 @@ lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH
                                              #   kept, and a running domain's record is not changed.
                                              #   After a pivot only the copy is accepted, unless the VM
                                              #   changed hands since the move began and the owner's
-                                             #   config names the record's file (a forked history).
+                                             #   config names the record's file, or it has no domain
+                                             #   (a forked history); refused while the copy was
+                                             #   modified later, unless --force.
                                              #   `lv health` lists the moves first (docs/diagnostics.md).
 lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>] [--until <time>]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics

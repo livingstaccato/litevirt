@@ -78,6 +78,7 @@ Exit code: 0 healthy · 1 degraded or unknown · 2 critical.`,
 func newHealthResolveCmd() *cobra.Command {
 	var evaluator, reason string
 	var accept []string
+	var force bool
 	cmd := &cobra.Command{
 		Use:   "resolve <code> <kind/subject>",
 		Short: "Resolve an open dual-run or move-volume health condition by hand (admin, audited)",
@@ -115,8 +116,10 @@ with its domain defined, its persistent config must name the file each disk
 record is left on, and no disk record is changed while it is active. After a
 pivot only the copy is accepted, except on the VM's owner when the VM changed
 hands after the move began and its config names the file the disk record
-names: --accept of that file keeps the owner's writes since, and the copy is
-kept on disk (docs/diagnostics.md, "A forked history").
+names, or it has no domain of the VM: --accept of that file keeps the owner's
+writes since, and the copy is kept on disk (docs/diagnostics.md, "A forked
+history"). That is refused while the copy was modified after the source,
+unless --force is given; the refusal prints both files' sizes and times.
 
 Requires the cluster.health.resolve verb (Admin). The resolution is written
 to the audit log with your principal and --reason, and published as an
@@ -130,9 +133,15 @@ ha.condition.resolved event.`,
 			if len(accept) > 0 && args[0] != moveUnresolvedCode {
 				return fmt.Errorf("--accept applies only to %s, not %s", moveUnresolvedCode, args[0])
 			}
+			if force && (args[0] != moveUnresolvedCode || len(accept) == 0) {
+				return fmt.Errorf("--force applies only to %s with --accept", moveUnresolvedCode)
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				for _, a := range accept {
 					ctx = metadata.AppendToOutgoingContext(ctx, moveAcceptMDKey, a)
+				}
+				if force {
+					ctx = metadata.AppendToOutgoingContext(ctx, moveForceMDKey, "true")
 				}
 				resp, err := c.ResolveHealthCondition(ctx, &pb.ResolveHealthConditionRequest{
 					Code: args[0], SubjectKind: kind, SubjectId: id,
@@ -156,6 +165,7 @@ ha.condition.resolved event.`,
 	cmd.Flags().StringVar(&evaluator, "evaluator", "", "the evaluator, when two hold an open condition under the same code and subject")
 	cmd.Flags().StringVar(&reason, "reason", "", "why, recorded in the audit log")
 	cmd.Flags().StringArrayVar(&accept, "accept", nil, "vm.move_unresolved only: the file to keep of one disk's move; once per disk")
+	cmd.Flags().BoolVar(&force, "force", false, "vm.move_unresolved only: in a forked history, keep the source --accept names although the copy was modified after it (audited)")
 	return cmd
 }
 
@@ -233,10 +243,11 @@ func capacityDBCell(c *pb.HostCapacityAssessment) string {
 	return cell
 }
 
-// moveAcceptMDKey and moveUnresolvedCode match grpcapi.MoveAcceptMDKey and
-// health.MoveUnresolvedCode.
+// moveAcceptMDKey, moveForceMDKey and moveUnresolvedCode match
+// grpcapi.MoveAcceptMDKey, grpcapi.MoveForceMDKey and health.MoveUnresolvedCode.
 const (
 	moveAcceptMDKey    = "x-litevirt-move-accept"
+	moveForceMDKey     = "x-litevirt-move-force"
 	moveUnresolvedCode = "vm.move_unresolved"
 )
 

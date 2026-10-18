@@ -266,6 +266,15 @@ func TestResolveUnresolvedMoves_AnotherHostsRecord(t *testing.T) {
 			if tc.originDrv != "" {
 				ms[0].DstType = tc.originDrv
 			}
+			// The VM came here straight from node-a: one generation on, and
+			// the copy written after the source (I6-1).
+			ms[0].Owner, ms[0].OwnerEpoch = "node-a", 5
+			if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 6 WHERE name = 'mv'`); err != nil {
+				t.Fatal(err)
+			}
+			if !tc.symlink {
+				copyLater(t, src, dst)
+			}
 			if err := RecordUnresolvedMove(originDir, ms[0]); err != nil {
 				t.Fatal(err)
 			}

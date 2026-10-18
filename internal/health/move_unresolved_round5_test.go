@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -22,6 +23,7 @@ func TestResolveRemoteMove_NeverRepointsUnderTheOwnersDomain(t *testing.T) {
 		name         string
 		define       string // "": no domain; "src" or "dst": the config names it
 		running      bool
+		epoch        int64 // the VM's generation now; 0: 6, one on from the move's 5
 		wantErr      string
 		wantRowOnDst bool
 	}{
@@ -29,20 +31,31 @@ func TestResolveRemoteMove_NeverRepointsUnderTheOwnersDomain(t *testing.T) {
 		{name: "running on the copy", define: "dst", running: true, wantErr: "running"},
 		{name: "shut off, the config names the source", define: "src", wantErr: "which a start boots"},
 		{name: "shut off, the config names the copy", define: "dst", wantRowOnDst: true},
-		{name: "no domain", wantRowOnDst: true},
+		// I6-1: with no domain, only a VM one generation on from the
+		// holder's is healed; a second change of hands holds.
+		{name: "no domain, one change of hands", wantRowOnDst: true},
+		{name: "no domain, two changes of hands", epoch: 7, wantErr: "generation 7"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := testReconcilerDB(t)
 			originDir := t.TempDir()
 			_, src, dst := seedMovedVM(t, db, originDir, "dst", true, true)
 			ms, _ := UnresolvedMovesOf(originDir, "mv")
-			ms[0].DstType = "nfs"
+			ms[0].DstType, ms[0].Owner, ms[0].OwnerEpoch = "nfs", "node-a", 5
 			if err := RecordUnresolvedMove(originDir, ms[0]); err != nil {
 				t.Fatal(err)
 			}
 			if err := PublishUnresolvedMoves(ctx, db, originDir, "node-a", "mv"); err != nil {
 				t.Fatal(err)
 			}
+			epoch := tc.epoch
+			if epoch == 0 {
+				epoch = 6
+			}
+			if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = ? WHERE name = 'mv'`, epoch); err != nil {
+				t.Fatal(err)
+			}
+			copyLater(t, src, dst)
 			for _, host := range []string{"node-a", "node-b"} {
 				if err := corrosion.UpsertStoragePool(ctx, db, corrosion.StoragePoolRecord{HostName: host, Name: "warm",
 					Driver: "nfs", Source: "nas:/vol", Target: filepath.Dir(dst)}); err != nil {
@@ -81,7 +94,7 @@ func TestResolveRemoteMove_NeverRepointsUnderTheOwnersDomain(t *testing.T) {
 				!strings.Contains(err.Error(), src) || !strings.Contains(err.Error(), dst)) {
 				t.Fatalf("want a refusal saying %q and naming both files, got %v", tc.wantErr, err)
 			}
-			if tc.wantErr != "" && tc.define == "src" {
+			if tc.wantErr != "" && tc.define != "dst" {
 				// I5-1: the guest may have run here on the source since the
 				// failover, so the source is not called stale, the config is not
 				// steered onto the copy, and the exit keeping it is named.
@@ -180,5 +193,18 @@ func TestPublishUnresolvedMoves_HandResolutionThatKnewLessIsAudited(t *testing.T
 	rows, err := db.Query(ctx, `SELECT detail FROM audit_log WHERE action = 'health.condition.hand_diverged'`)
 	if err != nil || len(rows) != 1 || !strings.Contains(rows[0].String("detail"), "pivoted") {
 		t.Fatalf("audit = %+v %v", rows, err)
+	}
+}
+
+// copyLater sets dst's modification time after src's: the holder wrote the
+// copy after the pivot, and nothing wrote the source since.
+func copyLater(t *testing.T, src, dst string) {
+	t.Helper()
+	early, late := time.Now().Add(-time.Hour), time.Now().Add(-time.Minute)
+	if err := os.Chtimes(src, early, early); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(dst, late, late); err != nil {
+		t.Fatal(err)
 	}
 }

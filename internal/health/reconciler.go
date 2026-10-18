@@ -1770,6 +1770,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			return
 		}
 	}
+	noteStartingHere(ctx, r.db, r.dataDir, vm.Name)
 
 	// Check if a domain already exists locally from a partial migration (#14).
 	if r.virt != nil && r.virt.DomainExists(vm.Name) {

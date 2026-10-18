@@ -1503,7 +1503,8 @@ reported as "nothing to do" while the record remains. Another host (a failover o
 shared storage) honours the condition by what it can prove: when the guest was
 pivoted, a start there points the disk record at the destination on a shared pool both
 hosts define alike, unless the VM's domain there is running or its persistent config
-names the source: the VM may then have run there on the source since a failover, so each
+names the source, or, with no domain there, the VM did not come there straight from the
+holding host (docs/diagnostics.md): the VM may then have run there on the source since a failover, so each
 file may hold writes the other lacks, and the refusal names both `--accept` exits
 (docs/diagnostics.md, "A forked history"); when no pivot was recorded, it is refused whichever file the disk
 record names, since the record commit and the pivot may have happened before the holding

@@ -1256,6 +1256,7 @@ func (v *VMChecker) startGuarded(ctx context.Context, name string) error {
 	}); err != nil {
 		return err
 	}
+	noteStartingHere(ctx, v.db, v.dataDir, name)
 	release, err := GuardSharedDiskStart(ctx, v.db, v.dataDir, v.hostName, name, xml)
 	if err != nil {
 		return err

@@ -2493,6 +2493,9 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 	if err := s.resolveUnresolvedMoves(ctx, vm.Name); err != nil {
 		return nil, err
 	}
+	if err := health.NoteStartingHere(ctx, s.db, s.dataDir, vm.Name); err != nil {
+		slog.Warn("recording this host's start of the VM failed", "vm", vm.Name, "error", err)
+	}
 	// A VM with a shared disk whose row names another host (a partial
 	// promotion's, review R4-I2) has its domain redefined from its rows first,
 	// which judges that host again: a disk it withheld is attached once the

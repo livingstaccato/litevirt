@@ -1565,6 +1565,9 @@ func (s *Server) deleteVMWithFanout(ctx context.Context, m stackMember, keepDisk
 			peerErr := s.fanoutDeleteVM(ctx, vmName, stackName, keepDisks)
 			switch {
 			case peerErr == nil:
+				// The peer that deleted the member was called by a peer, so
+				// it left the member's schedules; this teardown is their entry.
+				s.deleteVMSchedules(context.WithoutCancel(ctx), vmName)
 				return nil
 			case errors.Is(peerErr, errNotStackMember):
 				return peerErr
@@ -1586,6 +1589,7 @@ func (s *Server) deleteVMWithFanout(ctx context.Context, m stackMember, keepDisk
 		// locally won't fix that. Try fanout to other peers instead.
 		if code == codes.Unavailable {
 			if peerErr := s.fanoutDeleteVM(ctx, vmName, stackName, keepDisks); peerErr == nil {
+				s.deleteVMSchedules(context.WithoutCancel(ctx), vmName)
 				return nil
 			} else if errors.Is(peerErr, errNotStackMember) {
 				return peerErr

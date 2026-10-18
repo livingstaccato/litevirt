@@ -217,8 +217,11 @@ func (o *serverOps) ApplyLiveMetadata(ctx context.Context, name string, desired 
 	return o.s.applyLiveMetadata(ctx, name, desired, fields)
 }
 
+// DeleteVM is the blue-green cutover's delete (of the blue, or of a green
+// rolled back). It keeps the VM's schedules, as main did: the stack's VM
+// serves on under the other name.
 func (o *serverOps) DeleteVM(ctx context.Context, name string) error {
-	if _, err := o.s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: name}); err != nil && status.Code(err) != codes.NotFound {
+	if _, err := o.s.DeleteVM(withSchedulesKept(ctx), &pb.DeleteVMRequest{Name: name}); err != nil && status.Code(err) != codes.NotFound {
 		return err
 	}
 	return nil
@@ -504,6 +507,8 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 		// A member on another host judges the create's host-side checks
 		// itself, before it deletes (recreate_preflight.go).
 		deleteCtx = withRecreatePreflight(ctx, pf)
+		// The container comes back under its name: its schedules stay.
+		deleteCtx = withSchedulesKept(deleteCtx)
 	}
 	// A VM with a disk on an iSCSI LUN moves its claim before the delete, as
 	// a rolling recreate does (preflightLUNs): what the create would refuse

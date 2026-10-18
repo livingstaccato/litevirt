@@ -597,6 +597,24 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	if err := safename.ValidateContainerName(req.Name); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
+	// A plain delete ends the container's own schedules (deleteContainerSchedules),
+	// by the entry host only, as DeleteVM's: never on a host a peer called (the
+	// owner of a forward, an older entry's unmarked compose re-create), and
+	// never for a delete that keeps them (withSchedulesKept).
+	dropSchedules := false
+	var dropProject, dropHost string
+	if !schedulesKept(ctx) && !s.forwardedByEntry(ctx) && !s.isRemotePeer(ctx) {
+		dropProject, dropSchedules = s.containerProject(ctx, req.HostName, req.Name)
+		dropHost = s.deletedContainerHost(ctx, req.HostName, req.Name)
+	}
+	out, err := s.deleteContainer(ctx, req)
+	if err == nil && dropSchedules {
+		s.deleteContainerSchedules(context.WithoutCancel(ctx), dropHost, dropProject, req.Name)
+	}
+	return out, err
+}
+
+func (s *Server) deleteContainer(ctx context.Context, req *pb.DeleteContainerRequest) (*emptypb.Empty, error) {
 	project, known := s.containerProject(ctx, req.HostName, req.Name)
 	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), ctRBACPathFor("", req.Name), "ct.delete", "operator", containerWhat(req.Name)); err != nil {
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "denied")

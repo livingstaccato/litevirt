@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -409,4 +410,141 @@ func GetReplicationCheckpoint(ctx context.Context, c *Client, vmName, repo strin
 		return "", err
 	}
 	return rows[0].String("checkpoint"), nil
+}
+
+// ScheduleOrphanGrace is how long a workload's schedule is kept after the
+// workload's tombstone before the orphan sweep may remove it.
+const ScheduleOrphanGrace = 24 * time.Hour
+
+// OrphanedStackSchedules returns the live schedules of a workload of a
+// torn-down stack: a vm-scoped schedule (backup or replication) whose vms row
+// is a tombstone of a VM of a stack whose record is a tombstone, or a
+// container-scoped schedule whose container has no live row and whose newest
+// tombstone carries the label of such a stack. The tombstone's deletion must be
+// at least grace before now, and the schedule last written no later than that
+// tombstone (LWW order; an equal stamp is an orphan: a re-create's schedule is
+// written only after its create revived the row). Only VMName and Repo (and
+// Scope) are set.
+//
+// Nothing else is an orphan. A schedule of a VM or container that is not a
+// stack's, or of a stack still recorded live, stays dormant as it always has
+// (the scheduler skips a workload with no live row) and resumes when the name
+// comes back: a failed rebuild or re-create, or a blue-green cutover's blue,
+// leaves exactly that. A schedule of a name with no row at all — one
+// replicated ahead of its workload — is never one.
+//
+// A run that finished after the delete stamped the row later
+// (MarkBackupScheduleRun bumps updated_at), so that schedule reads as newer
+// than the tombstone; it is swept once nothing has written it for a full grace
+// (orphanTombstone). A redeploy of the stack is never touched: its stack row
+// and its workloads' rows are live again before the compose hook writes a
+// schedule. The one residual risk is a sweeper whose replica is more than a
+// grace behind the origin of a re-created stack's rows, which is not a state
+// a failover lease holder is in.
+func OrphanedStackSchedules(ctx context.Context, c *Client, now time.Time, grace time.Duration) ([]BackupScheduleRecord, error) {
+	out, err := orphanedStackVMSchedules(ctx, c, now, grace)
+	if err != nil {
+		return nil, err
+	}
+	cts, err := orphanedStackContainerSchedules(ctx, c, now, grace)
+	if err != nil {
+		return nil, err
+	}
+	return append(out, cts...), nil
+}
+
+// orphanTombstone reports whether a tombstone (its deleted_at and LWW key)
+// makes a schedule last written at scheduleAt an orphan at now.
+func orphanTombstone(deletedAt, tombAt, scheduleAt string, now time.Time, grace time.Duration) bool {
+	deleted, ok := ParseUpdatedAt(deletedAt)
+	if !ok || now.Sub(deleted) < grace {
+		return false
+	}
+	if lwwOrder(scheduleAt, tombAt) <= 0 {
+		return true
+	}
+	// Written after the tombstone, but not for a full grace since. Every
+	// config write needs a live workload, so with none since, that write was a
+	// run in flight at the delete (MarkBackupScheduleRun), not a schedule for a
+	// new incarnation; one for a new incarnation replicates with its revival
+	// well inside the grace.
+	written, ok := ParseUpdatedAt(scheduleAt)
+	return ok && now.Sub(written) >= grace
+}
+
+func orphanedStackVMSchedules(ctx context.Context, c *Client, now time.Time, grace time.Duration) ([]BackupScheduleRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT s.vm_name, s.repo, s.updated_at AS schedule_at, v.updated_at AS vm_at, v.deleted_at AS vm_deleted
+		 FROM backup_schedules s JOIN vms v ON v.name = s.vm_name
+		 WHERE s.deleted_at IS NULL AND v.deleted_at IS NOT NULL
+		   AND COALESCE(s.scope, 'vm') IN ('vm', '') AND COALESCE(s.pool_name, '') = ''
+		   AND COALESCE(v.stack_name, '') != ''
+		   AND EXISTS (SELECT 1 FROM stacks st WHERE st.name = v.stack_name AND st.deleted_at IS NOT NULL)`)
+	if err != nil {
+		return nil, fmt.Errorf("orphaned vm schedules: %w", err)
+	}
+	var out []BackupScheduleRecord
+	for _, r := range rows {
+		if orphanTombstone(r.String("vm_deleted"), r.String("vm_at"), r.String("schedule_at"), now, grace) {
+			out = append(out, BackupScheduleRecord{VMName: r.String("vm_name"), Repo: r.String("repo"), Scope: "vm"})
+		}
+	}
+	return out, nil
+}
+
+func orphanedStackContainerSchedules(ctx context.Context, c *Client, now time.Time, grace time.Duration) ([]BackupScheduleRecord, error) {
+	scheds, err := c.Query(ctx,
+		`SELECT vm_name, repo, project_name, updated_at FROM backup_schedules
+		 WHERE deleted_at IS NULL AND scope = 'container'`)
+	if err != nil {
+		return nil, fmt.Errorf("orphaned container schedules: %w", err)
+	}
+	var out []BackupScheduleRecord
+	for _, sr := range scheds {
+		rec := BackupScheduleRecord{VMName: sr.String("vm_name"), Repo: sr.String("repo"), ProjectName: sr.String("project_name"), Scope: "container"}
+		_, name, ok := ContainerScheduleName(rec.VMName)
+		if !ok {
+			continue
+		}
+		project := ContainerScheduleProject(rec)
+		rows, err := c.Query(ctx,
+			`SELECT COALESCE(project, '_default') AS project, COALESCE(labels, '') AS labels,
+			        updated_at, COALESCE(deleted_at, '') AS deleted_at
+			 FROM containers WHERE name = ?`, name)
+		if err != nil {
+			return nil, fmt.Errorf("orphaned container schedules: %w", err)
+		}
+		live := false
+		var newest map[string]string
+		for _, r := range rows {
+			if normalizeProject(r.String("project")) != project {
+				continue
+			}
+			if r.String("deleted_at") == "" {
+				live = true
+				break
+			}
+			if newest == nil || lwwOrder(newest["at"], r.String("updated_at")) < 0 {
+				newest = map[string]string{"at": r.String("updated_at"), "deleted": r.String("deleted_at"), "labels": r.String("labels")}
+			}
+		}
+		if live || newest == nil {
+			continue
+		}
+		var labels map[string]string
+		if json.Unmarshal([]byte(newest["labels"]), &labels) != nil || labels[LabelStack] == "" {
+			continue
+		}
+		torn, err := c.Query(ctx, `SELECT 1 FROM stacks WHERE name = ? AND deleted_at IS NOT NULL`, labels[LabelStack])
+		if err != nil {
+			return nil, fmt.Errorf("orphaned container schedules: %w", err)
+		}
+		if len(torn) == 0 {
+			continue
+		}
+		if orphanTombstone(newest["deleted"], newest["at"], sr.String("updated_at"), now, grace) {
+			out = append(out, BackupScheduleRecord{VMName: rec.VMName, Repo: rec.Repo, Scope: "container"})
+		}
+	}
+	return out, nil
 }

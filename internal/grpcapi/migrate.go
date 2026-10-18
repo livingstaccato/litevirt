@@ -1010,7 +1010,7 @@ poll:
 	if err := s.finishMigrationOnTarget(ctx, vm, migrationFinish{
 		target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec, armed: armed, fwLive: fwl,
 	}); err != nil {
-		return status.Errorf(codes.FailedPrecondition, "VM %q migrated to %s, but is %v", vm.Name, req.TargetHost, err)
+		return status.Errorf(codes.FailedPrecondition, "VM %q migrated to %s, but finishing the move failed: %s", vm.Name, req.TargetHost, status.Convert(err).Message())
 	}
 
 	return send(pb.MigratePhase_MIGRATE_DONE, 100, 0)

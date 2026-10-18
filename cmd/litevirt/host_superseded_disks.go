@@ -109,7 +109,7 @@ operator removes it, by hand.`,
 					}
 					fmt.Fprintf(cmd.OutOrStdout(), "Restored %s as %s on %s.\n", resp.Restored, resp.RestoredTo, resp.Host)
 					if resp.SetAside != "" {
-						fmt.Fprintf(cmd.OutOrStdout(), "The disk it replaced is kept as %s.\n", resp.SetAside)
+						fmt.Fprintf(cmd.OutOrStdout(), "What it replaced is kept as %s.\n", resp.SetAside)
 					}
 					return nil
 				}

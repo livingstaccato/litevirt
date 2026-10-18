@@ -98,60 +98,72 @@ func (c *Client) admitAutomationTx(ctx context.Context, tx *LocalTx, key ClaimKe
 		}
 	}
 
-	cfg, err := automationAuthorityTx(ctx, tx, c.hostName, gen)
+	// Classify exact retained history before considering fresh projection
+	// authority. A caller's lower sequence alone is never historical authority.
+	head, err := automationRetainedHeadTx(ctx, tx)
+	if err != nil {
+		return "", err
+	}
+	sequence := uint64(key.OwnerEpoch)
+	historical := false
+	if sequence <= head.Sequence {
+		digest, found, err := automationTrustedDigestTx(ctx, tx, sequence)
+		if err != nil {
+			return RefusalAutomationUnavailable, nil
+		}
+		if found {
+			historical = v == nil
+			if v != nil {
+				actual, err := v.Digest()
+				historical = err == nil && actual == digest
+			}
+		}
+	}
+	cfg, err := automationEstablishedAuthorityTx(ctx, tx, c.hostName, gen)
 	if errors.Is(err, errAutomationAuthority) || cfg == nil && err == nil {
 		return RefusalAutomationUnavailable, nil
 	}
 	if err != nil {
 		return "", err
 	}
-	head, err := automationHeadTx(ctx, tx)
-	if err != nil {
-		return "", err
-	}
-	sequence := uint64(key.OwnerEpoch)
-	if sequence > head.Sequence+1 {
-		return RefusalAutomationUnavailable, nil
-	}
-	if sequence == head.Sequence+1 && head.Sequence > 0 {
-		digest, found, err := automationTrustedDigestTx(ctx, tx, head.Sequence)
-		if err != nil {
+	if !historical {
+		if err := automationProjectionAuthorityTx(ctx, tx); err != nil {
+			if errors.Is(err, errAutomationAuthority) {
+				return RefusalAutomationUnavailable, nil
+			}
 			return "", err
 		}
-		if !found || digest != head.Digest {
-			return RefusalAutomationUnavailable, nil
+		if sequence <= head.Sequence {
+			return RefusalInvalidValue, nil
 		}
-	}
-
-	if sequence <= head.Sequence {
-		digest, found, err := automationTrustedDigestTx(ctx, tx, sequence)
-		if err != nil {
-			return "", err
-		}
-		if !found {
+		if sequence != head.Sequence+1 {
 			return RefusalAutomationUnavailable, nil
 		}
 		if v != nil {
-			actual, err := v.Digest()
-			if err != nil || actual != digest {
+			d, err := automationDecision(*v)
+			if err != nil || d.ParentDigest != head.Digest {
 				return RefusalInvalidValue, nil
 			}
-		}
-	} else if v != nil {
-		d, err := automationDecision(*v)
-		if err != nil || d.ParentDigest != head.Digest {
-			return RefusalInvalidValue, nil
-		}
-		if sequence == 1 {
-			rows, err := tx.Query(ctx, `SELECT bootstrap_principal,bootstrap_request FROM local_automation_authority WHERE id=1`)
-			if err != nil {
-				return "", err
+			if sequence == 1 {
+				rows, err := tx.Query(ctx, `SELECT bootstrap_principal,bootstrap_request FROM local_automation_authority WHERE id=1`)
+				if err != nil {
+					return "", err
+				}
+				if len(rows) != 1 || d.Command.PrincipalID != rows[0].String("bootstrap_principal") || d.Command.RequestID != rows[0].String("bootstrap_request") {
+					return RefusalAutomationUnavailable, nil
+				}
+			} else if d.Command.ClusterUID != head.ClusterUID {
+				return RefusalInvalidValue, nil
 			}
-			if len(rows) != 1 || d.Command.PrincipalID != rows[0].String("bootstrap_principal") || d.Command.RequestID != rows[0].String("bootstrap_request") {
+			// Assignment facts and generic membership/custody are not prepared
+			// business authority. Real class issuers must later bind exact value,
+			// electorate and semantic parent in this transaction before this
+			// branch can admit business work. Promise-only Prepare has no class.
+			switch d.Command.Kind {
+			case "initialize_cluster", "read_barrier":
+			default:
 				return RefusalAutomationUnavailable, nil
 			}
-		} else if d.Command.ClusterUID != head.ClusterUID {
-			return RefusalInvalidValue, nil
 		}
 	}
 	if err := requireAutomationFull(ctx, tx); err != nil {

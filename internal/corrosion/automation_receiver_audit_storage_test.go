@@ -182,7 +182,7 @@ func TestReceiverSourceAuditExistingResultIdentity(t *testing.T) {
 }
 
 func TestReceiverSourceAuditArchivedDescriptors(t *testing.T) {
-	for _, schema := range []int{69, 70, 71} {
+	for _, schema := range []int{69, 70, 71, 72, 73} {
 		t.Run(fmt.Sprint(schema), func(t *testing.T) {
 			p, r, q, peer, _ := receiverAuditFixture(t, 3, func(a *claimTestVoter, _ []*claimTestVoter) {
 				if _, err := a.c.db.Exec(`UPDATE schema_state SET version=? WHERE id=1`, schema); err != nil {
@@ -205,7 +205,7 @@ func TestReceiverSourceAuditArchivedDescriptors(t *testing.T) {
 			receiverThrough(t, p, r, a, q, peer, 11)
 			active := receiverActive(t, r.client)
 			if err = r.AuditSource(ctx, a, "a"); err != nil {
-				t.Fatal("original archived descriptor refused by schema72 audit", err)
+				t.Fatal("original archived descriptor refused by schema73 audit", err)
 			}
 			rows, err := r.client.Query(ctx, `SELECT metadata FROM local_automation_receiver_sources WHERE attempt=? AND source='a'`, a.id)
 			if err != nil || len(rows) != 1 || !bytes.Equal(rows[0].Bytes("metadata"), original[0].Bytes("metadata")) {

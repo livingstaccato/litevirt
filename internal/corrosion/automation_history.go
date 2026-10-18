@@ -553,7 +553,7 @@ func (c *Client) AutomationOperation(ctx context.Context, id string) (out contra
 }
 
 func automationTrustedDigestTx(ctx context.Context, tx *LocalTx, sequence uint64) (string, bool, error) {
-	rows, err := tx.Query(ctx, `SELECT h.digest,h.value_json,a.digest AS anchor_digest FROM local_automation_history h JOIN local_automation_anchors a ON a.sequence=h.sequence WHERE h.sequence=? LIMIT 1`, sequence)
+	rows, err := tx.Query(ctx, `SELECT h.digest,h.value_json,a.digest AS anchor_digest FROM local_automation_history h JOIN local_automation_anchors a ON a.sequence=h.sequence WHERE h.sequence=? AND typeof(h.value_json)='text' AND typeof(h.digest)='text' AND typeof(a.digest)='text' AND length(CAST(h.value_json AS BLOB))<=? AND length(CAST(h.digest AS BLOB))=64 AND length(CAST(a.digest AS BLOB))=64 LIMIT 1`, sequence, MaxAutomationClaimBytes)
 	if err != nil || len(rows) == 0 {
 		return "", false, err
 	}

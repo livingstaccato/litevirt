@@ -20,7 +20,7 @@ const automationCutCodec = 1
 
 // Deliberately independent of CurrentSchemaVersion: new provenance requires an
 // explicit inventory review. A future live schema cannot relabel an old cut.
-const automationCutSourceSchema = 72
+const automationCutSourceSchema = 73
 
 // Explicit source descriptors: 69/1 retains its original inventory and root.
 // 70/1 adds only outgoing job pins/publication wrappers/public trust evidence,
@@ -29,9 +29,12 @@ const automationCutSourceSchema = 72
 // establish no active import, anchor, membership or use authority. These are
 // receiver staging, NOT egress. 72/1 adds only inert semantic references and
 // causal audit results, introducing no active native/import origin mode.
+// 73/1 adds eight local derived projections: stage="" is active, nonempty
+// stages are isolated audit state. All are reconstructed from the unchanged
+// certified history inventory; no projection row confers import authority.
 // Future active import receipts need a new inventory and provenance audit.
 func supportedAutomationCutDescriptor(schema, codec int) bool {
-	return codec == 1 && (schema == 69 || schema == 70 || schema == 71 || schema == 72)
+	return codec == 1 && (schema == 69 || schema == 70 || schema == 71 || schema == 72 || schema == 73)
 }
 
 type automationCutInventory struct {

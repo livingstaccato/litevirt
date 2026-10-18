@@ -10,7 +10,7 @@ import (
 )
 
 func TestAutomationPartialReplayCannotAdmitAtRewoundHead(t *testing.T) {
-	for _, mode := range []string{"interior-anchor", "budget"} {
+	for _, mode := range []string{"interior-anchor", "budget", "missing-prefix"} {
 		t.Run(mode, func(t *testing.T) {
 			_, original, b, c := threeVoters(t)
 			dir := t.TempDir()
@@ -48,6 +48,10 @@ func TestAutomationPartialReplayCannotAdmitAtRewoundHead(t *testing.T) {
 				if _, err := tx.Exec(ctx, `DELETE FROM local_automation_semantic_heads WHERE stage=''`); err != nil {
 					return err
 				}
+				if mode == "missing-prefix" {
+					_, err := tx.Exec(ctx, `DELETE FROM local_automation_prefix WHERE id=1`)
+					return err
+				}
 				if mode == "interior-anchor" {
 					_, err := tx.Exec(ctx, `UPDATE local_automation_anchors SET digest=? WHERE sequence=6`, strings.Repeat("c", 64))
 					return err
@@ -65,7 +69,7 @@ func TestAutomationPartialReplayCannotAdmitAtRewoundHead(t *testing.T) {
 			}
 			before := permanent()
 			budget := 256
-			if mode == "budget" {
+			if mode != "interior-anchor" {
 				budget = 2
 			}
 			if err := a.c.AutomationReplay(ctx, contract.Reduce, budget); err == nil {
@@ -87,7 +91,7 @@ func TestAutomationPartialReplayCannotAdmitAtRewoundHead(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := uint64(5)
-			if mode == "budget" {
+			if mode != "interior-anchor" {
 				want = 2
 			}
 			if derived.Sequence != want {
@@ -108,6 +112,44 @@ func TestAutomationPartialReplayCannotAdmitAtRewoundHead(t *testing.T) {
 			}
 			if _, err := a.c.AutomationMembership(ctx); err == nil {
 				t.Error("partial replay exposed authoritative membership/read frontier")
+			}
+			retained, found, err := a.c.AutomationRecord(ctx, 2)
+			if err != nil || !found {
+				t.Fatal("retained historical fixture", err)
+			}
+			historicalKey, _ := AutomationClaimKey(2)
+			historical, err := a.c.ClaimAccept(ctx, historicalKey, testBallot(7, "a"), retained.Value, 1, a.signer, nil)
+			if err != nil || !historical.Accepted || historical.Accept == nil {
+				t.Errorf("exact retained history refused during partial replay: %+v %v", historical, err)
+			}
+			stateBefore, found, err := a.c.ClaimState(ctx, historicalKey)
+			if err != nil || !found {
+				t.Fatal("historical claim absent", err)
+			}
+			changed, err := automationDecision(retained.Value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed.Command.RequestID = "different-historical-request"
+			encoded, err := contract.EncodeDecision(changed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			altered, err := a.c.ClaimAccept(ctx, historicalKey, testBallot(8, "a"), ClaimValue{Automation: &AutomationClaimValue{Envelope: encoded}}, 1, a.signer, nil)
+			if err != nil || altered.Accepted || altered.Refusal != RefusalAutomationUnavailable {
+				t.Fatal("changed old value admitted during partial replay", altered, err)
+			}
+			stateAfter, found, err := a.c.ClaimState(ctx, historicalKey)
+			if err != nil || !found || !reflect.DeepEqual(stateBefore, stateAfter) {
+				t.Fatal("altered old value changed claim", err)
+			}
+			freshKey, freshValue := automationFixture(t, trusted.Sequence+1, trusted.Digest)
+			freshResult, err := a.c.ClaimAccept(ctx, freshKey, testBallot(8, "a"), freshValue, 1, a.signer, nil)
+			if err != nil || freshResult.Accepted || freshResult.Refusal != RefusalAutomationUnavailable {
+				t.Errorf("partial replay admitted fresh frontier: %+v %v", freshResult, err)
+			}
+			if _, found, err := a.c.ClaimState(ctx, freshKey); err != nil || found {
+				t.Errorf("fresh refusal mutated claim: %v %v", found, err)
 			}
 			key, value := automationFixture(t, derived.Sequence+1, derived.Digest)
 			result, err := a.c.ClaimAccept(ctx, key, testBallot(8, "a"), value, 1, a.signer, nil)

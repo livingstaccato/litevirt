@@ -216,116 +216,7 @@ func TestAutomationIdentityCertifiedReplayWithoutEnrollmentProvider(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	initial := sharedAutomationRecord(t, 1, "", "initialize", "initialize-op", a, b)
-	if _, err := applySharedAutomation(t, a.c, initial, contract.Reduce, automationFreshAnchor); err != nil {
-		t.Fatal(err)
-	}
-	parent := initial.Value.MustDigest()
-	appendDecision := func(d contract.Decision) {
-		t.Helper()
-		d.ParentDigest = parent
-		envelope, err := contract.EncodeDecision(d)
-		if err != nil {
-			t.Fatal(err)
-		}
-		value := ClaimValue{Automation: &AutomationClaimValue{Envelope: envelope}}
-		key, _ := AutomationClaimKey(d.Sequence)
-		ballot := testBallot(2, "a")
-		record := AutomationRecord{Value: value, Certificate: ClaimCertificate{Key: key, Ballot: ballot, ConfigGeneration: 1, ValueDigest: value.MustDigest()}}
-		for _, v := range []*claimTestVoter{a, b} {
-			signed, err := v.signer.Sign(key, 1, ballot, value.MustDigest(), v.inc)
-			if err != nil {
-				t.Fatal(err)
-			}
-			record.Certificate.Accepts = append(record.Certificate.Accepts, signed)
-		}
-		if err := verifier.Verify(record.Certificate, CertExpectation{Key: key, ValueDigest: value.MustDigest(), ConfigGeneration: 1, Electorate: membersOf(a, b, c), Quorum: 2}); err != nil {
-			t.Fatal(err)
-		}
-		if receipt, err := applySharedAutomation(t, a.c, record, contract.Reduce, automationFreshAnchor); err != nil || receipt.Code != "" {
-			t.Fatalf("typed certified history: %+v %v", receipt, err)
-		}
-		parent = value.MustDigest()
-	}
-	for i, kind := range []string{"project", "principal"} {
-		body := contract.IdentityEnrollment{Version: 1, Kind: kind, Alias: kind + "-alias", Witness: kind + "-source-lifetime", EvidenceID: "closed-cutover"}
-		bodyJSON, _ := json.Marshal(body)
-		assignment := contract.Assignment{Version: 1, ClusterUID: "established-cluster", OperationID: kind + "-op", RecordedAt: "2026-10-17T00:00:00Z", Identity: &contract.IdentityAssignment{UID: kind + "-uid", Generation: 1, Enrollment: &contract.IdentityEnrollmentFacts{Version: 1, EvidenceID: body.EvidenceID, ClusterUID: "established-cluster", Kind: kind, Alias: body.Alias, Witness: body.Witness, CoverageDigest: strings.Repeat("b", 64), FenceSequence: 1}}}
-		assignmentJSON, _ := json.Marshal(assignment)
-		appendDecision(contract.Decision{Sequence: uint64(i + 2), Command: contract.Command{Kind: "assign_identity", ClusterUID: "established-cluster", PrincipalID: "host", RequestID: kind + "-request", Body: bodyJSON}, Assignment: assignmentJSON})
-	}
-	for i, kind := range []string{"ensure_owner", "acquire_session", "handoff_session"} {
-		command := contract.Command{Kind: kind, ClusterUID: "established-cluster", ProjectUID: "project-uid", PrincipalID: "principal-uid", OwnerID: "owner", RequestID: kind + "-request", Body: []byte(`{"version":1}`)}
-		assignment := contract.Assignment{Version: 1, ClusterUID: "established-cluster", OperationID: kind + "-op", RecordedAt: "2026-10-17T00:00:00Z"}
-		if i > 0 {
-			assignment.Owner = &contract.OwnerAssignment{SessionID: fmt.Sprintf("session-%d", i)}
-		}
-		if i == 2 {
-			command.Session = 1
-			command.SessionID = "session-1"
-			command.Body = []byte(`{"version":1,"next_principal_uid":"principal-uid"}`)
-		}
-		assignmentJSON, _ := json.Marshal(assignment)
-		appendDecision(contract.Decision{Sequence: uint64(i + 4), Command: command, Assignment: assignmentJSON})
-	}
-	// The full decision certificate records prepared nonsecret configuration;
-	// this fixture supplies no production fresh create or migration permit.
-	maxCPU, maxMemory := uint32(2), uint64(1024)
-	desired := contract.VMIntent{Name: "machine", CPU: 2, MemoryMiB: 1024}
-	prepared := desired
-	prepared.MaxCPU = &maxCPU
-	prepared.MemoryHotplugMaxMiB = &maxMemory
-	prepared.RequestedState = "running"
-	prepared.Placement = &contract.PlacementIntent{Policy: "balanced"}
-	bodyJSON, _ := json.Marshal(contract.CreateBindingBody{Version: 1, Desired: desired})
-	assignmentJSON, _ := json.Marshal(contract.Assignment{Version: 1, ClusterUID: "established-cluster", OperationID: "create-op", RecordedAt: "2026-10-17T00:00:00Z", Binding: &contract.BindingAssignment{ResourceUID: "resource-uid", BindingGeneration: 1, NameGeneration: 1, Revision: "rev:opaque-alpha", DomainUUID: "domain-uuid", Incarnation: "incarnation", AdmittedGeneration: 1, Configuration: prepared}})
-	appendDecision(contract.Decision{Sequence: 7, Command: contract.Command{Kind: "admit_create", ClusterUID: "established-cluster", ProjectUID: "project-uid", PrincipalID: "principal-uid", OwnerID: "owner", ManagementKey: "key", SessionID: "session-2", Session: 2, RequestID: "create-request", Body: bodyJSON}, Assignment: assignmentJSON})
-	for offset, kind := range []string{"ensure_owner", "acquire_session"} {
-		assigned := contract.Assignment{Version: 1, ClusterUID: "established-cluster", OperationID: kind + "-target-op", RecordedAt: "2026-10-17T00:00:00Z"}
-		if offset == 1 {
-			assigned.Owner = &contract.OwnerAssignment{SessionID: "target-session"}
-		}
-		encoded, _ := json.Marshal(assigned)
-		appendDecision(contract.Decision{Sequence: uint64(8 + offset), Command: contract.Command{Kind: kind, ClusterUID: "established-cluster", ProjectUID: "project-uid", PrincipalID: "principal-uid", OwnerID: "target-owner", RequestID: kind + "-target-request", Body: []byte(`{"version":1}`)}, Assignment: encoded})
-	}
-	ownership := func(seq uint64, kind, uid, name, revision, incarnation, lastOperation, key string, source *contract.BindingReference) {
-		body := contract.OwnershipBody{Version: 1, Resource: contract.ResourceReference{ClusterUID: "established-cluster", ProjectUID: "project-uid", Kind: "vm", UID: uid}, ExpectedRevision: revision, Source: source, Target: contract.BindingKey{ClusterUID: "established-cluster", ProjectUID: "project-uid", OwnerID: "target-owner", ManagementKey: key}}
-		command := contract.Command{Kind: kind, ClusterUID: "established-cluster", ProjectUID: "project-uid", PrincipalID: "principal-uid", OwnerID: "target-owner", ManagementKey: key, ResourceUID: uid, Session: 1, SessionID: "target-session", RequestID: kind + "-request"}
-		if source != nil {
-			command.OwnerID = source.Key.OwnerID
-			command.ManagementKey = source.Key.ManagementKey
-			command.Generation = source.Generation
-			command.Session = 2
-			command.SessionID = "session-2"
-		}
-		command.Body, _ = json.Marshal(body)
-		assignment := contract.Assignment{Version: 1, ClusterUID: "established-cluster", OperationID: kind + "-op", RecordedAt: "2026-10-17T00:00:00Z", Ownership: &contract.OwnershipAssignment{Version: 1, TargetSession: contract.RecordedOwnerSession{ID: "target-session", Activation: 1, PrincipalUID: "principal-uid"}, TargetGeneration: 1, Revision: "new-opaque-" + uid, AdmittedGeneration: 1, Quiescence: contract.QuiescenceFacts{Version: 1, ResourceUID: uid, Revision: revision, Incarnation: incarnation, LastOperationID: lastOperation, FenceSequence: seq - 1, EvidenceID: "quiescence-reference", CoverageDigest: strings.Repeat("d", 64)}}}
-		for _, purpose := range []string{"source_owner", "target_owner", "resource"} {
-			if purpose == "source_owner" && source == nil {
-				continue
-			}
-			permission := contract.PermissionFacts{Purpose: purpose, PrincipalUID: command.PrincipalID, ClusterUID: command.ClusterUID, ProjectUID: command.ProjectUID, ProjectName: "project-alias", Verb: "vm.update", EvidenceID: "permission-reference", CoverageDigest: strings.Repeat("e", 64), FenceSequence: seq - 1}
-			switch purpose {
-			case "source_owner":
-				permission.OwnerID = source.Key.OwnerID
-			case "target_owner":
-				permission.OwnerID = "target-owner"
-			case "resource":
-				permission.ResourceUID = uid
-				permission.ResourceName = name
-			}
-			assignment.Ownership.Permissions = append(assignment.Ownership.Permissions, permission)
-		}
-		encoded, _ := json.Marshal(assignment)
-		appendDecision(contract.Decision{Sequence: seq, Command: command, Assignment: encoded})
-	}
-	ownership(10, "transfer_owner", "resource-uid", "machine", "rev:opaque-alpha", "incarnation", "create-op", "target-key", &contract.BindingReference{Key: contract.BindingKey{ClusterUID: "established-cluster", ProjectUID: "project-uid", OwnerID: "owner", ManagementKey: "key"}, Generation: 1})
-	migration := contract.IdentityEnrollment{Version: 1, Kind: "vm", Alias: "legacy-machine", Witness: "positive-legacy-witness", EvidenceID: "closed-cutover"}
-	encodedBody, _ := json.Marshal(migration)
-	migrationAssignment := contract.Assignment{Version: 1, ClusterUID: "established-cluster", OperationID: "migration-op", RecordedAt: "2026-10-17T00:00:00Z", Identity: &contract.IdentityAssignment{UID: "legacy-uid", Generation: 1, Enrollment: &contract.IdentityEnrollmentFacts{Version: 1, EvidenceID: migration.EvidenceID, ClusterUID: "established-cluster", ProjectUID: "project-uid", Kind: "vm", Alias: migration.Alias, Witness: migration.Witness, CoverageDigest: strings.Repeat("f", 64), FenceSequence: 1, VM: &contract.VMEnrollmentRuntime{Version: 1, DomainUUID: "legacy-domain", Incarnation: "legacy-incarnation", Revision: "legacy-revision"}}}}
-	encodedAssignment, _ := json.Marshal(migrationAssignment)
-	appendDecision(contract.Decision{Sequence: 11, Command: contract.Command{Kind: "assign_identity", ClusterUID: "established-cluster", ProjectUID: "project-uid", PrincipalID: "host", RequestID: "migration-request", Body: encodedBody}, Assignment: encodedAssignment})
-	ownership(12, "adopt_resource", "legacy-uid", "legacy-machine", "legacy-revision", "legacy-incarnation", "migration-op", "legacy-key", nil)
+	automationTypedHistoryFixture(t, a, b, c, verifier)
 	// Populate an isolated audit stage from actual applied rows. Active replay
 	// must rebuild every typed table without touching this retained stage.
 	if err := a.c.ExecuteLocal(ctx, func(tx *LocalTx) error {
@@ -420,4 +311,118 @@ func automationTypedSnapshot(t *testing.T, c *Client) map[string][]Row {
 		out[table] = rows
 	}
 	return out
+}
+
+func automationTypedHistoryFixture(t *testing.T, a, b, c *claimTestVoter, verifier *ClaimVerifier) {
+	t.Helper()
+	initial := sharedAutomationRecord(t, 1, "", "initialize", "initialize-op", a, b)
+	if _, err := applySharedAutomation(t, a.c, initial, contract.Reduce, automationFreshAnchor); err != nil {
+		t.Fatal(err)
+	}
+	parent := initial.Value.MustDigest()
+	appendDecision := func(d contract.Decision) {
+		t.Helper()
+		d.ParentDigest = parent
+		envelope, err := contract.EncodeDecision(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		value := ClaimValue{Automation: &AutomationClaimValue{Envelope: envelope}}
+		key, _ := AutomationClaimKey(d.Sequence)
+		ballot := testBallot(2, "a")
+		record := AutomationRecord{Value: value, Certificate: ClaimCertificate{Key: key, Ballot: ballot, ConfigGeneration: 1, ValueDigest: value.MustDigest()}}
+		for _, v := range []*claimTestVoter{a, b} {
+			signed, err := v.signer.Sign(key, 1, ballot, value.MustDigest(), v.inc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			record.Certificate.Accepts = append(record.Certificate.Accepts, signed)
+		}
+		if err := verifier.Verify(record.Certificate, CertExpectation{Key: key, ValueDigest: value.MustDigest(), ConfigGeneration: 1, Electorate: membersOf(a, b, c), Quorum: 2}); err != nil {
+			t.Fatal(err)
+		}
+		if receipt, err := applySharedAutomation(t, a.c, record, contract.Reduce, automationFreshAnchor); err != nil || receipt.Code != "" {
+			t.Fatalf("typed certified history: %+v %v", receipt, err)
+		}
+		parent = value.MustDigest()
+	}
+	for i, kind := range []string{"project", "principal"} {
+		body := contract.IdentityEnrollment{Version: 1, Kind: kind, Alias: kind + "-alias", Witness: kind + "-source-lifetime", EvidenceID: "closed-cutover"}
+		bodyJSON, _ := json.Marshal(body)
+		assignment := contract.Assignment{Version: 1, ClusterUID: "established-cluster", OperationID: kind + "-op", RecordedAt: "2026-10-17T00:00:00Z", Identity: &contract.IdentityAssignment{UID: kind + "-uid", Generation: 1, Enrollment: &contract.IdentityEnrollmentFacts{Version: 1, EvidenceID: body.EvidenceID, ClusterUID: "established-cluster", Kind: kind, Alias: body.Alias, Witness: body.Witness, CoverageDigest: strings.Repeat("b", 64), FenceSequence: 1}}}
+		assignmentJSON, _ := json.Marshal(assignment)
+		appendDecision(contract.Decision{Sequence: uint64(i + 2), Command: contract.Command{Kind: "assign_identity", ClusterUID: "established-cluster", PrincipalID: "host", RequestID: kind + "-request", Body: bodyJSON}, Assignment: assignmentJSON})
+	}
+	for i, kind := range []string{"ensure_owner", "acquire_session", "handoff_session"} {
+		command := contract.Command{Kind: kind, ClusterUID: "established-cluster", ProjectUID: "project-uid", PrincipalID: "principal-uid", OwnerID: "owner", RequestID: kind + "-request", Body: []byte(`{"version":1}`)}
+		assignment := contract.Assignment{Version: 1, ClusterUID: "established-cluster", OperationID: kind + "-op", RecordedAt: "2026-10-17T00:00:00Z"}
+		if i > 0 {
+			assignment.Owner = &contract.OwnerAssignment{SessionID: fmt.Sprintf("session-%d", i)}
+		}
+		if i == 2 {
+			command.Session = 1
+			command.SessionID = "session-1"
+			command.Body = []byte(`{"version":1,"next_principal_uid":"principal-uid"}`)
+		}
+		assignmentJSON, _ := json.Marshal(assignment)
+		appendDecision(contract.Decision{Sequence: uint64(i + 4), Command: command, Assignment: assignmentJSON})
+	}
+	// The full decision certificate records prepared nonsecret configuration;
+	// this fixture supplies no production fresh create or migration permit.
+	maxCPU, maxMemory := uint32(2), uint64(1024)
+	desired := contract.VMIntent{Name: "machine", CPU: 2, MemoryMiB: 1024}
+	prepared := desired
+	prepared.MaxCPU = &maxCPU
+	prepared.MemoryHotplugMaxMiB = &maxMemory
+	prepared.RequestedState = "running"
+	prepared.Placement = &contract.PlacementIntent{Policy: "balanced"}
+	bodyJSON, _ := json.Marshal(contract.CreateBindingBody{Version: 1, Desired: desired})
+	assignmentJSON, _ := json.Marshal(contract.Assignment{Version: 1, ClusterUID: "established-cluster", OperationID: "create-op", RecordedAt: "2026-10-17T00:00:00Z", Binding: &contract.BindingAssignment{PayloadID: "payload-reference", ResourceUID: "resource-uid", BindingGeneration: 1, NameGeneration: 1, Revision: "rev:opaque-alpha", DomainUUID: "domain-uuid", Incarnation: "incarnation", AdmittedGeneration: 1, Configuration: prepared}})
+	appendDecision(contract.Decision{Sequence: 7, Command: contract.Command{Kind: "admit_create", ClusterUID: "established-cluster", ProjectUID: "project-uid", PrincipalID: "principal-uid", OwnerID: "owner", ManagementKey: "key", SessionID: "session-2", Session: 2, RequestID: "create-request", Body: bodyJSON, Ciphertext: []byte("retained-encrypted-payload"), SecretIntentTag: []byte("equality-tag"), SecretKeyEpoch: "key-epoch"}, Assignment: assignmentJSON})
+	for offset, kind := range []string{"ensure_owner", "acquire_session"} {
+		assigned := contract.Assignment{Version: 1, ClusterUID: "established-cluster", OperationID: kind + "-target-op", RecordedAt: "2026-10-17T00:00:00Z"}
+		if offset == 1 {
+			assigned.Owner = &contract.OwnerAssignment{SessionID: "target-session"}
+		}
+		encoded, _ := json.Marshal(assigned)
+		appendDecision(contract.Decision{Sequence: uint64(8 + offset), Command: contract.Command{Kind: kind, ClusterUID: "established-cluster", ProjectUID: "project-uid", PrincipalID: "principal-uid", OwnerID: "target-owner", RequestID: kind + "-target-request", Body: []byte(`{"version":1}`)}, Assignment: encoded})
+	}
+	ownership := func(seq uint64, kind, uid, name, revision, incarnation, lastOperation, key string, source *contract.BindingReference) {
+		body := contract.OwnershipBody{Version: 1, Resource: contract.ResourceReference{ClusterUID: "established-cluster", ProjectUID: "project-uid", Kind: "vm", UID: uid}, ExpectedRevision: revision, Source: source, Target: contract.BindingKey{ClusterUID: "established-cluster", ProjectUID: "project-uid", OwnerID: "target-owner", ManagementKey: key}}
+		command := contract.Command{Kind: kind, ClusterUID: "established-cluster", ProjectUID: "project-uid", PrincipalID: "principal-uid", OwnerID: "target-owner", ManagementKey: key, ResourceUID: uid, Session: 1, SessionID: "target-session", RequestID: kind + "-request"}
+		if source != nil {
+			command.OwnerID = source.Key.OwnerID
+			command.ManagementKey = source.Key.ManagementKey
+			command.Generation = source.Generation
+			command.Session = 2
+			command.SessionID = "session-2"
+		}
+		command.Body, _ = json.Marshal(body)
+		assignment := contract.Assignment{Version: 1, ClusterUID: "established-cluster", OperationID: kind + "-op", RecordedAt: "2026-10-17T00:00:00Z", Ownership: &contract.OwnershipAssignment{Version: 1, TargetSession: contract.RecordedOwnerSession{ID: "target-session", Activation: 1, PrincipalUID: "principal-uid"}, TargetGeneration: 1, Revision: "new-opaque-" + uid, AdmittedGeneration: 1, Quiescence: contract.QuiescenceFacts{Version: 1, ResourceUID: uid, Revision: revision, Incarnation: incarnation, LastOperationID: lastOperation, FenceSequence: seq - 1, EvidenceID: "quiescence-reference", CoverageDigest: strings.Repeat("d", 64)}}}
+		for _, purpose := range []string{"source_owner", "target_owner", "resource"} {
+			if purpose == "source_owner" && source == nil {
+				continue
+			}
+			permission := contract.PermissionFacts{Purpose: purpose, PrincipalUID: command.PrincipalID, ClusterUID: command.ClusterUID, ProjectUID: command.ProjectUID, ProjectName: "project-alias", Verb: "vm.update", EvidenceID: "permission-reference", CoverageDigest: strings.Repeat("e", 64), FenceSequence: seq - 1}
+			switch purpose {
+			case "source_owner":
+				permission.OwnerID = source.Key.OwnerID
+			case "target_owner":
+				permission.OwnerID = "target-owner"
+			case "resource":
+				permission.ResourceUID = uid
+				permission.ResourceName = name
+			}
+			assignment.Ownership.Permissions = append(assignment.Ownership.Permissions, permission)
+		}
+		encoded, _ := json.Marshal(assignment)
+		appendDecision(contract.Decision{Sequence: seq, Command: command, Assignment: encoded})
+	}
+	ownership(10, "transfer_owner", "resource-uid", "machine", "rev:opaque-alpha", "incarnation", "create-op", "target-key", &contract.BindingReference{Key: contract.BindingKey{ClusterUID: "established-cluster", ProjectUID: "project-uid", OwnerID: "owner", ManagementKey: "key"}, Generation: 1})
+	migration := contract.IdentityEnrollment{Version: 1, Kind: "vm", Alias: "legacy-machine", Witness: "positive-legacy-witness", EvidenceID: "closed-cutover"}
+	encodedBody, _ := json.Marshal(migration)
+	migrationAssignment := contract.Assignment{Version: 1, ClusterUID: "established-cluster", OperationID: "migration-op", RecordedAt: "2026-10-17T00:00:00Z", Identity: &contract.IdentityAssignment{UID: "legacy-uid", Generation: 1, Enrollment: &contract.IdentityEnrollmentFacts{Version: 1, EvidenceID: migration.EvidenceID, ClusterUID: "established-cluster", ProjectUID: "project-uid", Kind: "vm", Alias: migration.Alias, Witness: migration.Witness, CoverageDigest: strings.Repeat("f", 64), FenceSequence: 1, VM: &contract.VMEnrollmentRuntime{Version: 1, DomainUUID: "legacy-domain", Incarnation: "legacy-incarnation", Revision: "legacy-revision"}}}}
+	encodedAssignment, _ := json.Marshal(migrationAssignment)
+	appendDecision(contract.Decision{Sequence: 11, Command: contract.Command{Kind: "assign_identity", ClusterUID: "established-cluster", ProjectUID: "project-uid", PrincipalID: "host", RequestID: "migration-request", Body: encodedBody}, Assignment: encodedAssignment})
+	ownership(12, "adopt_resource", "legacy-uid", "legacy-machine", "legacy-revision", "legacy-incarnation", "migration-op", "legacy-key", nil)
 }

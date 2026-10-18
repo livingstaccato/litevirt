@@ -142,6 +142,11 @@ func (c *Client) FreezeAutomationCut(ctx context.Context, generation int64, redu
 		if len(rows) != 1 || !supportedAutomationCutDescriptor(rows[0].Int("version"), automationCutCodec) {
 			return fmt.Errorf("unsupported automation cut source schema")
 		}
+		if rows[0].Int("version") == 73 {
+			if err := automationVerifySemanticSchemaTx(ctx, tx); err != nil {
+				return err
+			}
+		}
 		// Existing replay helpers perform nested anchor/request/membership reads.
 		// Bound every source row before invoking them, without loading payloads.
 		// This scan is only for a new cut; archived bytes never rescan live state.

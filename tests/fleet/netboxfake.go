@@ -821,7 +821,7 @@ func (f *NetBoxFake) release(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	_, known := f.byID[id]
 	if known {
-		delete(f.byID, id)
+		f.forgetAddressLocked(id)
 		f.released = append(f.released, id)
 	}
 	f.mu.Unlock()

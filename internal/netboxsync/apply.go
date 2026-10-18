@@ -184,6 +184,12 @@ type Reconciler struct {
 	// exclusive is the caller's INTRA-NODE critical section around one pass.
 	// Nil runs the pass directly. See Options.Exclusive.
 	exclusive func(context.Context, func(context.Context) error) error
+
+	// deadAddrs is the NetBox address ids THIS pass found gone: a lease still
+	// names each one, and NetBox answered 404 when it was assigned. Reset at the
+	// start of every sweep. See assignAddress.
+	deadMu    sync.Mutex
+	deadAddrs map[int]string
 }
 
 // sink returns the metrics sink, never nil.
@@ -293,7 +299,7 @@ func (r *Reconciler) applyOne(ctx context.Context, a Action, idx desiredIndex, f
 		// One address per action, so the set case needs no handling here: Diff
 		// emits one assign for the desired address plus one clear per stale
 		// litevirt-owned address.
-		return r.nb.AssignIPToInterface(ctx, a.IPID, a.NetBoxID)
+		return r.assignAddress(ctx, a.IPID, a.NetBoxID, a.Key)
 	case a.Kind == kindNIC && a.Op == "clear":
 		// IPID is only ever a litevirt-owned address — BuildActual admits no
 		// other into the set Diff clears from — so this branch cannot detach an
@@ -600,10 +606,69 @@ func (r *Reconciler) createNIC(ctx context.Context, a Action, idx desiredIndex, 
 	if dn.NIC.NetBoxIPID == 0 {
 		return nil
 	}
-	if err := r.nb.AssignIPToInterface(ctx, dn.NIC.NetBoxIPID, id); err != nil {
-		return fmt.Errorf("netboxsync: assign address %d to interface %d: %w", dn.NIC.NetBoxIPID, id, err)
+	return r.assignAddress(ctx, dn.NIC.NetBoxIPID, id, identity)
+}
+
+// assignAddress attaches one leased address to an interface.
+//
+// A 404 IS NOT A FAILED PASS. NetBox answers it when the address object the
+// lease names no longer exists — deleted by hand — and the lease goes on naming
+// it, so the same assignment 404s on every sweep. Returned as an error it failed
+// the whole pass before the primary and delete phases ran, so nothing else the
+// cluster did reached NetBox again for as long as that lease lived. It is
+// recorded instead: the primary phase skips the address, and the sweep reports
+// itself unconverged and names it (see sweep).
+//
+// Only a 404, which is NetBox saying the address is absent. Any other refusal
+// is a fault this pass cannot classify, and still fails it.
+func (r *Reconciler) assignAddress(ctx context.Context, ipID, ifaceID int, nicKey string) error {
+	err := r.nb.AssignIPToInterface(ctx, ipID, ifaceID)
+	switch {
+	case err == nil:
+		return nil
+	case isNotFound(err):
+		r.markDeadAddress(ipID, nicKey)
+		return nil
+	default:
+		return fmt.Errorf("netboxsync: assign address %d to interface %d: %w", ipID, ifaceID, err)
 	}
-	return nil
+}
+
+func (r *Reconciler) markDeadAddress(ipID int, nicKey string) {
+	r.deadMu.Lock()
+	defer r.deadMu.Unlock()
+	if r.deadAddrs == nil {
+		r.deadAddrs = map[int]string{}
+	}
+	r.deadAddrs[ipID] = nicKey
+}
+
+func (r *Reconciler) isDeadAddress(ipID int) bool {
+	r.deadMu.Lock()
+	defer r.deadMu.Unlock()
+	_, dead := r.deadAddrs[ipID]
+	return dead
+}
+
+func (r *Reconciler) resetDeadAddresses() {
+	r.deadMu.Lock()
+	defer r.deadMu.Unlock()
+	r.deadAddrs = nil
+}
+
+// deadAddresses is this pass's dead address ids, sorted, with the NIC identity
+// each one was being assigned to.
+func (r *Reconciler) deadAddresses() (ids []int, nics []string) {
+	r.deadMu.Lock()
+	defer r.deadMu.Unlock()
+	for id := range r.deadAddrs {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	for _, id := range ids {
+		nics = append(nics, r.deadAddrs[id])
+	}
+	return ids, nics
 }
 
 // updateNIC patches the interface the diff resolved. The identity is not
@@ -725,6 +790,12 @@ func (r *Reconciler) setPrimaryIP(ctx context.Context, a Action) error {
 			return nil
 		}
 		vmID = ref.NetBoxID
+	}
+	if a.IPID != 0 && r.isDeadAddress(a.IPID) {
+		// The interface phase found this address gone. NetBox refuses a primary
+		// that does not exist, and the refusal would fail the pass the 404 was
+		// kept from failing.
+		return nil
 	}
 	if a.Op == opPrimaryIP6 {
 		return r.nb.SetPrimaryIP6(ctx, vmID, a.IPID)

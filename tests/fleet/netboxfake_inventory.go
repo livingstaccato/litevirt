@@ -853,7 +853,7 @@ func (f *NetBoxFake) ifaceNameTakenLocked(vmID int, name string, exclude int) bo
 func (f *NetBoxFake) cascadeAddressesLocked(ifaceID int) {
 	for id, ip := range f.byID {
 		if ip.AssignedObjectID == ifaceID {
-			delete(f.byID, id)
+			f.forgetAddressLocked(id)
 			f.cascaded = append(f.cascaded, id)
 		}
 	}
@@ -892,6 +892,29 @@ func (f *NetBoxFake) AssignDirect(ipID, ifaceID int) {
 	defer f.mu.Unlock()
 	if ip, ok := f.byID[ipID]; ok {
 		ip.AssignedObjectID = ifaceID
+	}
+}
+
+// DeleteAddressDirect deletes one address object as an operator removing it in
+// NetBox by hand would: no litevirt path asked, so it is not recorded as
+// released.
+func (f *NetBoxFake) DeleteAddressDirect(id int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.forgetAddressLocked(id)
+}
+
+// forgetAddressLocked removes one address object, and — as NetBox's SET_NULL
+// does — every primary_ip4 or primary_ip6 that pointed at it. Caller holds f.mu.
+func (f *NetBoxFake) forgetAddressLocked(id int) {
+	delete(f.byID, id)
+	for _, vm := range f.vms {
+		if vm.PrimaryIP4ID == id {
+			vm.PrimaryIP4ID = 0
+		}
+		if vm.PrimaryIP6ID == id {
+			vm.PrimaryIP6ID = 0
+		}
 	}
 }
 

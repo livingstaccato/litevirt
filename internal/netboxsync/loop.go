@@ -468,6 +468,7 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("cluster fingerprint: %w", err)
 	}
+	r.resetDeadAddresses()
 	// BEFORE the reads: actualState is scoped to this cluster id, and
 	// createVM/updateVM write it onto every object.
 	clusterID, err := r.ensureCluster(ctx)
@@ -609,6 +610,16 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 
 	if err := r.applyPhases(ctx, actions, indexDesired(desired, fp), fp); err != nil {
 		return false, withheldReplacementCause(err, withheldNames, partialRead)
+	}
+	if ids, nics := r.deadAddresses(); len(ids) > 0 {
+		// Every other action ran; these NICs are left without their address in
+		// NetBox, and the pass is not converged while they are.
+		slog.Warn("netbox mirror: these NetBox address objects no longer exist, but a live "+
+			"lease still names each one, so its NIC could not be given its address. The rest "+
+			"of the pass ran; every pass reports itself unconverged until no live lease names "+
+			"a missing address object",
+			"netbox_address_ids", ids, "nics", nics)
+		return false, nil
 	}
 	return converged, nil
 }

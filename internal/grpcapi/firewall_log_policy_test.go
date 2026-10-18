@@ -65,7 +65,9 @@ func TestSetFirewallLogPolicy(t *testing.T) {
 	if !slices.Equal(g.used, []capabilities.Feature{capabilities.FeatureFirewallLog}) {
 		t.Errorf("gates asked %v, want firewall_log", g.used)
 	}
-	wantAudit(t, s, "firewall.log_policy", "admin", "cluster", "before=unset after=on rate=5 burst=10")
+	// Round 2 m-3: the cluster scope's audit target is "(cluster)", which no
+	// host name can be, so it cannot be read as host cluster's.
+	wantAudit(t, s, "firewall.log_policy", "admin", "(cluster)", "before=unset after=on rate=5 burst=10")
 
 	if _, err := set(ctx, "node-1", "off", 50, 100); err != nil {
 		t.Fatal(err)

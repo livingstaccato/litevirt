@@ -370,3 +370,30 @@ func TestFirewallLogCLI_EscapesControlCharacters(t *testing.T) {
 		t.Errorf("control characters reached the terminal:\n%q\n%q", out, stderr)
 	}
 }
+
+// Round 2 m-2: a host inheriting an unreadable cluster row (0/0 inherited) is
+// marked unreadable too, with what it is read as.
+//
+// Mutation: keep the !Inherited guard — the host prints "off 0 0", red.
+func TestFirewallLogPolicyCLI_InheritedUnreadable(t *testing.T) {
+	spy := &logSpy{policies: []*pb.FirewallLogPolicy{{Scope: "cluster"}, {Scope: "h1", Inherited: true}}}
+	out, err := runMacroCLIWith(t, spy, "firewall", "log-policy", "status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "unreadable (inherited; read as off at 5/10)") {
+		t.Errorf("status does not mark the inheriting host:\n%s", out)
+	}
+}
+
+// Round 2 m-4: format characters (bidi overrides and isolates, category Cf)
+// are escaped as control characters are, so a peer's text cannot reorder
+// what the terminal shows.
+//
+// Mutation: escape only unicode.IsControl — red.
+func TestTermSafe_EscapesFormatCharacters(t *testing.T) {
+	got := termSafe("a\u202eb\u2066c\u200bd")
+	if strings.ContainsAny(got, "\u202e\u2066\u200b") || got != `a\u202eb\u2066c\u200bd` {
+		t.Errorf("termSafe = %q", got)
+	}
+}

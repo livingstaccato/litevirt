@@ -24,6 +24,9 @@ import (
 // a host named cluster has a reachable row.
 func logPolicyHost(scope string) string { return scope }
 
+// logPolicyAuditCluster is the cluster scope's audit target.
+const logPolicyAuditCluster = "(cluster)"
+
 // logPolicyState is a scope's policy for an audit row.
 func logPolicyState(p corrosion.FirewallLogPolicy, recorded bool, err error) string {
 	switch {
@@ -77,7 +80,9 @@ func (s *Server) SetFirewallLogPolicy(ctx context.Context, req *pb.SetFirewallLo
 			return nil, status.Errorf(codes.InvalidArgument, "no host named %q: --scope takes a host (lv host ls); leave it out for the cluster-wide policy", req.GetScope())
 		}
 	}
-	target := corrosion.LogPolicyScopeCluster
+	// "(cluster)" is no host name, so the cluster scope's audit rows cannot
+	// be read as those of a host named cluster.
+	target := logPolicyAuditCluster
 	if host != "" {
 		target = host
 	}

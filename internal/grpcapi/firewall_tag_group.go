@@ -265,8 +265,6 @@ func refersToTagGroup(cidr, group string) bool {
 // not). Anything else is handled as a deny.
 func acceptsAction(action string) bool { return firewall.AcceptsAction(action) }
 
-// tagGroupRefs lists every live rule, in every tier and on every host, that
-// references group.
 // shownAction is a stored action as operator text shows it: the plain
 // verdict, and "log" for a logged rule (spec m-13).
 func shownAction(stored string) string {
@@ -276,6 +274,8 @@ func shownAction(stored string) string {
 	return stored
 }
 
+// tagGroupRefs lists every live rule, in every tier and on every host, that
+// references group.
 func (s *Server) tagGroupRefs(ctx context.Context, group string) ([]tagGroupRef, error) {
 	var refs []tagGroupRef
 	cluster, err := corrosion.ListClusterFirewallRules(ctx, s.db)

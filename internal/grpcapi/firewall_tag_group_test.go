@@ -3,6 +3,9 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"slices"
 	"strings"
 	"testing"
@@ -595,5 +598,25 @@ func TestTagRefsText_ShowsPlainVerdict(t *testing.T) {
 	txt := tagRefsText("x", []firewall.TagGroupRef{{Table: "cluster_firewall_rules", ID: "c1", Group: "web", Action: "drop+log", Handling: "h"}})
 	if strings.Contains(txt, "+log") || !strings.Contains(txt, `action "drop log"`) {
 		t.Errorf("text = %q", txt)
+	}
+}
+
+// Round 2 m-5: tagGroupRefs and shownAction each carry their own doc
+// comment, starting with their name.
+//
+// Mutation: put shownAction between tagGroupRefs's comment and its func — red.
+func TestTagGroupRefs_DocComments(t *testing.T) {
+	f, err := parser.ParseFile(token.NewFileSet(), "firewall_tag_group.go", nil, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range f.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok || (fd.Name.Name != "tagGroupRefs" && fd.Name.Name != "shownAction") {
+			continue
+		}
+		if fd.Doc == nil || !strings.HasPrefix(fd.Doc.Text(), fd.Name.Name+" ") || strings.Count(fd.Doc.Text(), " is a stored action")+strings.Count(fd.Doc.Text(), " lists every live rule") != 1 {
+			t.Errorf("%s doc comment = %q", fd.Name.Name, fd.Doc.Text())
+		}
 	}
 }

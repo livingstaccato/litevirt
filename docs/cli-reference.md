@@ -1490,7 +1490,8 @@ lv firewall log [--host <h>] [--workload <name>] [--since 15m] [--limit 200] [--
   # packets (1-10000, default 10). Every logged line of one NIC side shares that budget.
   # Role operator; audited as firewall.log_policy; refused until the cluster upgrade has finished.
   # --scope names a host, a host named "cluster" included; leave it out for the cluster-wide
-  # policy. status shows a row the daemon cannot read as "unreadable (read as off at 5/10)".
+  # policy. status shows a row the daemon cannot read, or a host inheriting one, as
+  # "unreadable (read as off at 5/10)"; the API returns such a row with rate 0 and burst 0.
 
 # Firewall tags: per-workload key/value pairs, kept apart from labels (sg.write to change; audited).
 lv firewall tag set <vm> <key>=<value>...                          # adds or replaces keys

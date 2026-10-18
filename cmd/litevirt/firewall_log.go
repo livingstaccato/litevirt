@@ -85,10 +85,14 @@ func newFirewallLogPolicyCmd() *cobra.Command {
 					if p.GetDefaultPolicy() {
 						def = "on"
 					}
-					if p.GetRate() == 0 && p.GetBurst() == 0 && !p.GetInherited() {
+					if p.GetRate() == 0 && p.GetBurst() == 0 {
 						// The daemon could not read the row (no readable
-						// row has rate or burst 0).
+						// row has rate or burst 0): the host's own, or the
+						// cluster's it inherits.
 						def = "unreadable (read as off at 5/10)"
+						if p.GetInherited() {
+							def = "unreadable (inherited; read as off at 5/10)"
+						}
 					}
 					from := "own"
 					switch {
@@ -228,19 +232,24 @@ func newFirewallLogCmd() *cobra.Command {
 	return cmd
 }
 
-// termSafe escapes control characters (a peer's answer is printed as is
-// otherwise, and could drive the terminal).
+// termSafe escapes control characters and format characters (bidi
+// overrides and isolates, zero-width marks): a peer's answer is printed as
+// is otherwise, and could drive the terminal or reorder what it shows.
 func termSafe(s string) string {
-	if !strings.ContainsFunc(s, unicode.IsControl) {
+	unsafe := func(r rune) bool { return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) }
+	if !strings.ContainsFunc(s, unsafe) {
 		return s
 	}
 	var b strings.Builder
 	for _, r := range s {
-		if unicode.IsControl(r) {
+		switch {
+		case !unsafe(r):
+			b.WriteRune(r)
+		case r <= 0xff:
 			fmt.Fprintf(&b, "\\x%02x", r)
-			continue
+		default:
+			fmt.Fprintf(&b, "\\u%04x", r)
 		}
-		b.WriteRune(r)
 	}
 	return b.String()
 }

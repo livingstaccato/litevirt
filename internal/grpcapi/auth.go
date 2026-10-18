@@ -400,6 +400,12 @@ func (s *Server) isTrustedHostCN(ctx context.Context, cn string) bool {
 		// still chains to the cluster CA. Falling through here would re-admit it on
 		// the one failure nobody watches. The pre-bootstrap code discarded this error
 		// and returned false; that direction was right.
+		if ctx.Err() != nil {
+			// The call's caller went away (a forward whose client was
+			// killed): the call is refused, and nothing failed to read.
+			slog.Debug("a peer's call ended before its host row was read; refusing it", "cn", cn, "error", err)
+			return false
+		}
 		slog.Error("could not read the host row for a peer; refusing it, because an "+
 			"unreadable row cannot rule out a removal", "cn", cn, "error", err)
 		return false

@@ -2645,9 +2645,14 @@ and raises `ceph_image_leftover` (evaluator `ceph_pool`, subject
 it came from, when the delete left it, the reason, and the check to run
 (`by_hand`: `rbd status <pool>/<image>; rbd info <pool>/<image>`).
 litevirt removes none of these images; decide by hand once you know who has
-the image open. An image stops being named as soon as a VM's disk names it
-again, and is forgotten once its pool answers without it (checked every 5
-minutes).
+the image open. A clone's parent, or a client outside litevirt, may still use
+an image no VM's disk names; the reason says what rbd answered. An image is
+forgotten as soon as a VM's disk names it again (it is that VM's disk from
+then on), and once its pool answers without it (checked every 5 minutes). A
+record file that cannot be read is set aside as
+`ceph-kept-images.json.unreadable-<time>`, never saved over; when it cannot
+be set aside either, the host records kept images in memory only until it
+restarts.
 
 ### A VM delete kept a disk file (`disk_leftover`)
 

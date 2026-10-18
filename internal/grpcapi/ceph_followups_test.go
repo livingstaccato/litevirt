@@ -2,10 +2,17 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 )
 
@@ -37,5 +44,129 @@ func TestPrepareHardwareForStart_AFailedVMsOwnRecordOutlastsTheProofTTL(t *testi
 	if f.world.probes() != before+1 || !errors.Is(err, health.ErrStartProbeFailed) {
 		t.Fatalf("x %s after its failure, y having proved the key: %v, %d new probes; want x probed itself, not started on y's proof",
 			cephKeyProofTTL+time.Minute, err, f.world.probes()-before)
+	}
+}
+
+// Labfix M2. A kept image a VM's disk named again (reattached) is no longer a
+// leftover, and its record goes: when that VM is later deleted keeping its
+// disks, the image is not named again with the first delete's VM and reason.
+//
+// Mutation "record kept" (judgeCephImages only skips a named image): red.
+func TestCephImageLeftover_AReattachedImageIsForgotten(t *testing.T) {
+	f := newCephPoolFixture(t)
+	ctx := context.Background()
+	if _, err := deleteKeptCephVM(t, f, "keep"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertDisk(ctx, f.s.db, corrosion.DiskRecord{
+		VMName: "adopter", DiskName: "data", HostName: "test-host", StorageType: "ceph", StorageVolume: "ceph",
+		Path: "rbd:lv/keep-data:id=litevirt:lvpool=ceph",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.s.judgeCephImages(ctx)
+	if err := f.s.db.Execute(ctx, `UPDATE vm_disks SET deleted_at = ? WHERE vm_name = 'adopter'`, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	f.s.judgeCephImages(ctx)
+	if open, _, ev := keptCondition(t, f); open {
+		t.Fatalf("an image its adopter kept is named again as the first delete's leftover: %s", ev)
+	}
+	if recs := f.s.keptRecords(); len(recs) != 0 {
+		t.Fatalf("records %+v, want the reattached image's record gone", recs)
+	}
+}
+
+// Labfix M4a. A record file that cannot be read is set aside, never saved
+// over: the names it held are kept for an operator.
+//
+// Mutation "overwrite" (no set-aside): red.
+func TestCephKeptImages_AnUnreadableRecordIsSetAside(t *testing.T) {
+	f := newCephPoolFixture(t)
+	path := filepath.Join(f.s.dataDir, cephKeptFile)
+	garbage := `[{"image":"lv/old-data","vm":"old"`
+	if err := os.WriteFile(path, []byte(garbage), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deleteKeptCephVM(t, f, "keep"); err != nil {
+		t.Fatal(err)
+	}
+	asides, _ := filepath.Glob(path + ".unreadable-*")
+	if len(asides) != 1 {
+		t.Fatalf("set aside %v, want the unreadable record kept under a name of its own", asides)
+	}
+	if raw, _ := os.ReadFile(asides[0]); string(raw) != garbage {
+		t.Fatalf("set-aside file %q, want the unreadable record as it was", raw)
+	}
+	if recs := f.s.keptRecords(); len(recs) != 1 || recs[0].Image != "lv/keep-data" {
+		t.Fatalf("records %+v, want the new kept image recorded", recs)
+	}
+}
+
+// Labfix M4b. A recheck that found an image gone forgets only the record it
+// checked: an image recorded again meanwhile (another delete left it) stays.
+//
+// Mutation "delete by key" (no compare): red.
+func TestCephKeptImages_ARecheckKeepsARecordWrittenMeanwhile(t *testing.T) {
+	f := newCephPoolFixture(t)
+	if _, err := deleteKeptCephVM(t, f, "gone"); err != nil {
+		t.Fatal(err)
+	}
+	f.world.mu.Lock()
+	delete(f.world.images, "lv/gone-data")
+	f.world.mu.Unlock()
+	cephKeptRecheckHook = func(image string) {
+		f.s.cephKept.mu.Lock()
+		r := f.s.keptLocked()[image]
+		r.VM, r.Reason, r.Since = "again", "in use (again)", time.Now().Add(time.Second).UTC().Format(time.RFC3339Nano)
+		f.s.keptLocked()[image] = r
+		f.s.cephKept.mu.Unlock()
+	}
+	t.Cleanup(func() { cephKeptRecheckHook = nil })
+	f.s.recheckKeptCephImages(context.Background())
+	if recs := f.s.keptRecords(); len(recs) != 1 || recs[0].VM != "again" {
+		t.Fatalf("records %+v, want the record written during the recheck kept", recs)
+	}
+}
+
+// Labfix M4d. The kept image's response header is ASCII and bounded, whatever
+// rbd answered: a non-ASCII or very long reason still decodes to its text.
+//
+// Mutation "raw JSON" (setKeptHeader without the escape and bound): red.
+func TestSetKeptHeader_IsASCIIAndBounded(t *testing.T) {
+	st := &headerStream{}
+	ctx := grpc.NewContextWithServerTransportStream(context.Background(), st)
+	reason := "rbd: übel " + strings.Repeat("x", 8000)
+	setKeptHeader(ctx, []KeptCephImage{{Image: "lv/a-data", Disk: "data", Reason: reason}})
+	vals := st.hdr.Get(KeptCephImageMD)
+	if len(vals) != 1 {
+		t.Fatalf("header %v", st.hdr)
+	}
+	v := vals[0]
+	for _, r := range v {
+		if r < 0x20 || r > 0x7e {
+			t.Fatalf("header value carries %q, not printable ASCII", r)
+		}
+	}
+	if len(v) > 2048 {
+		t.Fatalf("header value is %d bytes, want it bounded", len(v))
+	}
+	var k KeptCephImage
+	if err := json.Unmarshal([]byte(v), &k); err != nil || k.Image != "lv/a-data" || !strings.HasPrefix(k.Reason, "rbd: übel xxx") {
+		t.Fatalf("decoded %+v (%v)", k, err)
+	}
+}
+
+// Labfix M1. The condition does not claim nothing uses a kept image: a
+// clone's parent, or a client outside litevirt, may.
+func TestCephImageLeftover_DetailAllowsForAClonesParent(t *testing.T) {
+	f := newCephPoolFixture(t)
+	if _, err := deleteKeptCephVM(t, f, "keep"); err != nil {
+		t.Fatal(err)
+	}
+	f.s.judgeCephImages(context.Background())
+	_, _, ev := keptCondition(t, f)
+	if !strings.Contains(ev, "clone") {
+		t.Fatalf("detail %s, want it to allow for a clone's parent", ev)
 	}
 }

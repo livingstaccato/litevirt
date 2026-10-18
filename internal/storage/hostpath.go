@@ -211,7 +211,7 @@ var dataDirOwned = []string{
 	"nowts.hwm",                 // corrosion/hwm.go (and nowts.hwm.lock)
 	"split_brain_activated",     // health/capability.go ActivationMarkerBase (markers are .<token>)
 	"ceph-trash-purges.json",    // storage/ceph_trash.go cephPurgeStateFile (ResumeCephPurges(dir): set aside as .unreadable-<time>, dataDirOwnedPrefixes)
-	"ceph-kept-images.json",     // grpcapi/ceph_kept.go cephKeptFile
+	"ceph-kept-images.json",     // grpcapi/ceph_kept.go cephKeptFile (unreadable: set aside as .unreadable-<time>, dataDirOwnedPrefixes)
 	"kept-disks.json",           // grpcapi/disk_kept.go diskKeptFile
 	"cancelled-starts.json",     // grpcapi/cancelled_starts.go cancelledStartsFile
 	"firewall-would-drop.json",  // daemon.go: firewall.NewWouldDropTally (its .tmp, dataDirOwnedPrefixes)
@@ -230,7 +230,7 @@ var dataDirOwned = []string{
 // every dot-name, which is how the daemon names its temp files there
 // (secretfile.Write's .<name>.tmp, storage_pool_confine.go's
 // .pool-uploads.json-*).
-var dataDirOwnedPrefixes = []string{"state.db-", "split_brain_activated.", "nowts.hwm.", "ct-idmap-ledger.", "onboot-boot-id.", "ceph-trash-purges.json.", "firewall-would-drop.json.", "image-delete-skew.json.", "."}
+var dataDirOwnedPrefixes = []string{"state.db-", "split_brain_activated.", "nowts.hwm.", "ct-idmap-ledger.", "onboot-boot-id.", "ceph-trash-purges.json.", "ceph-kept-images.json.", "firewall-would-drop.json.", "image-delete-skew.json.", "."}
 
 // DataDirOwned returns the exact names of dataDirOwned.
 func DataDirOwned() []string { return slices.Clone(dataDirOwned) }

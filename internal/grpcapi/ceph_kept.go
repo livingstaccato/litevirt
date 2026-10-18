@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
@@ -66,6 +68,9 @@ type cephKeptImages struct {
 	mu     sync.Mutex
 	loaded bool
 	m      map[string]cephKeptRecord // image → record
+	// noSave: the record file could not be read nor set aside, so saving
+	// would overwrite the names it holds; the records are kept in memory.
+	noSave bool
 }
 
 // keptLocked loads the record file once; mu is held.
@@ -74,20 +79,32 @@ func (s *Server) keptLocked() map[string]cephKeptRecord {
 	if !k.loaded {
 		k.loaded, k.m = true, map[string]cephKeptRecord{}
 		if s.dataDir != "" {
-			raw, err := os.ReadFile(filepath.Join(s.dataDir, cephKeptFile))
+			path := filepath.Join(s.dataDir, cephKeptFile)
+			raw, err := os.ReadFile(path)
+			var list []cephKeptRecord
 			switch {
 			case err == nil:
-				var list []cephKeptRecord
-				if jerr := json.Unmarshal(raw, &list); jerr != nil {
-					slog.Warn("ceph: the record of kept images cannot be read", "file", cephKeptFile, "error", jerr)
+				err = json.Unmarshal(raw, &list)
+			case errors.Is(err, os.ErrNotExist):
+				err = nil
+			}
+			if err != nil {
+				// Never saved over: the names it holds are set aside for an
+				// operator (a data-dir file of the daemon's own).
+				aside := path + ".unreadable-" + time.Now().UTC().Format("20060102T150405.000000000Z")
+				if rerr := os.Rename(path, aside); rerr != nil {
+					k.noSave = true
+					slog.Warn("ceph: the record of kept images cannot be read nor set aside; it is not saved over, and kept images are recorded in memory only",
+						"file", path, "error", err, "set_aside_error", rerr)
+				} else {
+					slog.Warn("ceph: the record of kept images cannot be read; set aside", "file", aside, "error", err)
 				}
-				for _, r := range list {
-					if r.Image != "" {
-						k.m[r.Image] = r
-					}
+				list = nil
+			}
+			for _, r := range list {
+				if r.Image != "" {
+					k.m[r.Image] = r
 				}
-			case !errors.Is(err, os.ErrNotExist):
-				slog.Warn("ceph: the record of kept images cannot be read", "file", cephKeptFile, "error", err)
 			}
 		}
 	}
@@ -96,7 +113,7 @@ func (s *Server) keptLocked() map[string]cephKeptRecord {
 
 // saveKeptLocked writes the record file durably; mu is held.
 func (s *Server) saveKeptLocked() {
-	if s.dataDir == "" {
+	if s.dataDir == "" || s.cephKept.noSave {
 		return
 	}
 	list := make([]cephKeptRecord, 0, len(s.cephKept.m))
@@ -174,18 +191,50 @@ func (s *Server) keptRecords() []cephKeptRecord {
 	return out
 }
 
-// setKeptHeader names the kept images in the delete's response header.
+// keptReasonMax bounds the reason a kept image's header carries: rbd's
+// answer, which can be long. The condition's evidence keeps it whole.
+const keptReasonMax = 1024
+
+// setKeptHeader names the kept images in the delete's response header. A
+// header value is printable ASCII and bounded: the reason is cut to
+// keptReasonMax and every other rune is a JSON \u escape, which decodes to
+// the same text.
 func setKeptHeader(ctx context.Context, kept []KeptCephImage) {
 	if len(kept) == 0 {
 		return
 	}
 	md := metadata.MD{}
 	for _, k := range kept {
+		if len(k.Reason) > keptReasonMax {
+			cut := keptReasonMax
+			for cut > 0 && !utf8.RuneStart(k.Reason[cut]) {
+				cut--
+			}
+			k.Reason = k.Reason[:cut] + "..."
+		}
 		if b, err := json.Marshal(k); err == nil {
-			md.Append(KeptCephImageMD, string(b))
+			md.Append(KeptCephImageMD, asciiJSON(b))
 		}
 	}
 	_ = grpc.SetHeader(ctx, md)
+}
+
+// asciiJSON is JSON b with every rune outside printable ASCII written as a
+// \u escape (a surrogate pair above the BMP).
+func asciiJSON(b []byte) string {
+	var sb strings.Builder
+	for _, r := range string(b) {
+		switch {
+		case r >= 0x20 && r <= 0x7e:
+			sb.WriteRune(r)
+		case r > 0xffff:
+			r1, r2 := utf16.EncodeRune(r)
+			fmt.Fprintf(&sb, "\\u%04x\\u%04x", r1, r2)
+		default:
+			fmt.Fprintf(&sb, "\\u%04x", r)
+		}
+	}
+	return sb.String()
 }
 
 // forwardKeptImages hands the kept images, kept disks (KeptDiskMD) and
@@ -202,6 +251,10 @@ func forwardKeptImages(ctx context.Context, hdr metadata.MD) {
 		_ = grpc.SetHeader(ctx, metadata.MD{LeftoverDomainMD: vals})
 	}
 }
+
+// cephKeptRecheckHook runs between a recheck's look at an image and its
+// forgetting it; tests use it to record the image again meanwhile.
+var cephKeptRecheckHook func(image string)
 
 // recheckKeptCephImages forgets the kept images their pool, answering, no
 // longer has (an operator removed them). An image whose pool does not
@@ -222,8 +275,19 @@ func (s *Server) recheckKeptCephImages(ctx context.Context) {
 		if err != nil || exists {
 			continue
 		}
+		if cephKeptRecheckHook != nil {
+			cephKeptRecheckHook(r.Image)
+		}
+		// Only the record looked at: one written meanwhile (another delete
+		// left the image again) is checked on the next scan.
 		s.cephKept.mu.Lock()
-		delete(s.keptLocked(), r.Image)
+		m := s.keptLocked()
+		cur, ok := m[r.Image]
+		if !ok || cur != r {
+			s.cephKept.mu.Unlock()
+			continue
+		}
+		delete(m, r.Image)
 		s.saveKeptLocked()
 		s.cephKept.mu.Unlock()
 		slog.Info("ceph: an image a VM delete left in its pool is gone", "image", r.Image)
@@ -236,9 +300,11 @@ func (s *Server) recheckKeptCephImages(ctx context.Context) {
 func (s *Server) judgeCephImages(ctx context.Context) {
 	var left []cephKeptRecord
 	for _, r := range s.keptRecords() {
-		// Reattached: a VM's disk names it again. A failed read keeps it
-		// named.
+		// Reattached: a VM's disk names it again, so it is that VM's disk,
+		// and no longer this delete's leftover: its record goes. A failed
+		// read keeps it named.
 		if rows, err := corrosion.DisksNamingRBDImage(ctx, s.db, r.Image); err == nil && len(rows) > 0 {
+			s.forgetKeptIf(r)
 			continue
 		}
 		left = append(left, r)
@@ -285,7 +351,8 @@ func (s *Server) judgeCephImages(ctx context.Context) {
 	}
 	ev, _ := json.Marshal(map[string]any{
 		"host": s.hostName, "images": list,
-		"detail": fmt.Sprintf("%d ceph image(s) a VM delete on %s left in their pool still use its capacity and no VM's disk names them; "+
+		"detail": fmt.Sprintf("%d ceph image(s) a VM delete on %s left in their pool still use its capacity and no VM's disk names them, "+
+			"though a clone's parent or a client outside litevirt may still use one (the reason says what rbd answered); "+
 			"see who has each open (by_hand) — the client may be a VM still running on it — and decide by hand; litevirt removes none of them",
 			len(list), s.hostName),
 	})
@@ -293,6 +360,17 @@ func (s *Server) judgeCephImages(ctx context.Context) {
 	row.LastSeen, row.ResolvedAt, row.Reporter = now, "", s.hostName
 	if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
 		slog.Warn("ceph: raise the kept image condition", "error", err)
+	}
+}
+
+// forgetKeptIf drops r's record if it is still the one recorded.
+func (s *Server) forgetKeptIf(r cephKeptRecord) {
+	s.cephKept.mu.Lock()
+	defer s.cephKept.mu.Unlock()
+	m := s.keptLocked()
+	if cur, ok := m[r.Image]; ok && cur == r {
+		delete(m, r.Image)
+		s.saveKeptLocked()
 	}
 }
 

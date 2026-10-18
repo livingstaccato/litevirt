@@ -2,12 +2,16 @@ package grpcapi
 
 import (
 	"context"
+	"strings"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // A compose recreate deletes its member and then creates it again. The
@@ -33,6 +37,10 @@ const (
 	recreateDistroMDKey   = "x-litevirt-recreate-distro-bin"
 	recreateReleaseMDKey  = "x-litevirt-recreate-release-bin"
 	recreateArchMDKey     = "x-litevirt-recreate-arch-bin"
+	// recreatePinnedMDKey carries the item generation a privileged or
+	// legacy member was built from, for a deployer who may not change its
+	// image: "1:<gen>" (gen may be empty).
+	recreatePinnedMDKey = "x-litevirt-recreate-pinned-gen-bin"
 )
 
 // recreatePreflight is the create a recreate's delete is followed by, as far
@@ -41,6 +49,11 @@ type recreatePreflight struct {
 	template, project string
 	// distro, release and arch are the download template's image.
 	distro, release, arch string
+	// pinned says the deployer may not change the member's image (a
+	// privileged or legacy member, and neither Admin nor ContainerRoot), so
+	// the rootfs path's content must still be generation pinGen.
+	pinned bool
+	pinGen string
 }
 
 type recreatePreflightKey struct{}
@@ -63,8 +76,12 @@ func (s *Server) recreatePreflightOutgoing(ctx context.Context) context.Context 
 		return ctx
 	}
 	ctx = s.ownerStrictOutgoing(ctx)
-	return metadata.AppendToOutgoingContext(ctx, recreateTemplateMDKey, pf.template, recreateProjectMDKey, pf.project,
+	ctx = metadata.AppendToOutgoingContext(ctx, recreateTemplateMDKey, pf.template, recreateProjectMDKey, pf.project,
 		recreateDistroMDKey, pf.distro, recreateReleaseMDKey, pf.release, recreateArchMDKey, pf.arch)
+	if pf.pinned {
+		ctx = metadata.AppendToOutgoingContext(ctx, recreatePinnedMDKey, "1:"+pf.pinGen)
+	}
+	return ctx
 }
 
 // recreatePreflightIncoming is the preflight a forwarded recreate delete
@@ -87,10 +104,14 @@ func (s *Server) recreatePreflightIncoming(ctx context.Context) *recreatePreflig
 		}
 		return ""
 	}
-	return &recreatePreflight{
+	pf := &recreatePreflight{
 		template: t[0], project: first(recreateProjectMDKey),
 		distro: first(recreateDistroMDKey), release: first(recreateReleaseMDKey), arch: first(recreateArchMDKey),
 	}
+	if g, ok := strings.CutPrefix(first(recreatePinnedMDKey), "1:"); ok {
+		pf.pinned, pf.pinGen = true, g
+	}
+	return pf
 }
 
 // recreateDeleteCheck runs, on the member's host and before its delete, the
@@ -121,7 +142,33 @@ func (s *Server) recreateHostChecks(ctx context.Context, pf recreatePreflight, n
 	if err := s.recreateTemplateChecks(ctx, pf.template, pf.project, name); err != nil {
 		return err
 	}
+	if err := s.recreatePinnedImage(ctx, pf, name); err != nil {
+		return err
+	}
 	return s.recreateFetchImage(ctx, pf, name)
+}
+
+// recreatePinnedImage refuses a pinned recreate (recreatePreflight.pinned)
+// whose rootfs path no longer holds the generation the member was built
+// from: an Admin's pull replaced the item since, so the recreate would run
+// a new image as root, which the deployer may not choose.
+func (s *Server) recreatePinnedImage(ctx context.Context, pf recreatePreflight, name string) error {
+	if !pf.pinned {
+		return nil
+	}
+	p, isPath, _ := lxc.TemplatePath(pf.template)
+	if !isPath {
+		return nil
+	}
+	if cur := lxc.ReadImageGen(lxc.BundleDir(p)); cur != pf.pinGen {
+		s.audit(ctx, "ct.recreate-security", name, "image under "+pf.template+" replaced since the member was built", "denied")
+		return status.Errorf(codes.PermissionDenied,
+			"recreating container %q: it is privileged or legacy-confined, and the image under %q on %s was replaced since it was built "+
+				"(a pull over the item), so this recreate would run a new image as root on the host; that needs the Admin role "+
+				"or the ContainerRoot role on it (lv role grant ContainerRoot <principal> --path %s). The member was left as it is",
+			name, pf.template, s.hostName, ctRBACPathFor(pf.project, name))
+	}
+	return nil
 }
 
 // recreateFetchImage fetches and verifies, on the member's host and before
@@ -175,4 +222,57 @@ func (s *Server) recreateTemplateChecks(ctx context.Context, template, project, 
 			name, status.Convert(err).Message(), s.hostName)
 	}
 	return nil
+}
+
+// A recreate whose member is on another host runs that host's checks, and
+// the fetch of the new image, twice: first as a probe in the judgment, on
+// the caller's context, so a caller who gives up during a slow fetch, or a
+// refusal, leaves the member as it is before anything is detached; then
+// again at the delete, where the fetch finds the image it kept
+// (lxc.LxcRunner.FetchImage). The probe is a DeleteContainer for the name
+// "." — which every build refuses as a path traversal, deleting nothing —
+// carrying the real name in recreateProbeMDKey. A host that knows the probe
+// answers it, and says so in the recreateProbeMDKey response header; a host
+// that predates it refuses the name, and the checks run at the delete only,
+// as before.
+const recreateProbeMDKey = "x-litevirt-recreate-probe-bin"
+
+// probeRecreateOnMember runs the member host's recreate checks for name
+// (pf), before the delete, on ctx.
+func (s *Server) probeRecreateOnMember(ctx context.Context, host, name string, pf *recreatePreflight) error {
+	c, closer, err := s.dialPeer(ctx, host)
+	if err != nil {
+		// The delete forwards to the same host, and refuses when it cannot
+		// reach it either; its own checks run there.
+		return nil
+	}
+	defer closer()
+	out := metadata.AppendToOutgoingContext(s.recreatePreflightOutgoing(withRecreatePreflight(ctx, pf)), recreateProbeMDKey, name)
+	var hdr metadata.MD
+	_, err = c.DeleteContainer(out, &pb.DeleteContainerRequest{Name: ".", HostName: host}, grpc.Header(&hdr))
+	if len(hdr.Get(recreateProbeMDKey)) == 0 {
+		if ctx.Err() != nil {
+			return status.Errorf(codes.Canceled, "recreating container %q: %v; the member was left as it is", name, ctx.Err())
+		}
+		return nil // a host that predates the probe: it checks at the delete
+	}
+	return err
+}
+
+// answerRecreateProbe answers a recreate probe (probeRecreateOnMember) from
+// a peer: handled reports whether req was one.
+func (s *Server) answerRecreateProbe(ctx context.Context, req *pb.DeleteContainerRequest) (handled bool, err error) {
+	if req.Name != "." || !s.isRemotePeer(ctx) {
+		return false, nil
+	}
+	md, _ := metadata.FromIncomingContext(ctx)
+	v := md.Get(recreateProbeMDKey)
+	if len(v) == 0 {
+		return false, nil
+	}
+	_ = grpc.SetHeader(ctx, metadata.Pairs(recreateProbeMDKey, "1"))
+	if err := safename.ValidateContainerName(v[0]); err != nil {
+		return true, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	return true, s.recreateDeleteCheck(ctx, v[0])
 }

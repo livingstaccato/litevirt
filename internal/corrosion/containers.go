@@ -194,6 +194,12 @@ type ContainerCreateSpec struct {
 	// and let any node report them.
 	IDMapBase   int64  `json:"idmap_base,omitempty"`
 	Confinement string `json:"confinement,omitempty"`
+	// TemplateGen is the generation of the OCI library item Template named
+	// when the container was copied from it (lxc.ImageGenFile): a pull that
+	// replaces the item gives it a new one, so a recreate from the same path
+	// can tell the content changed. Empty for any other template, and for an
+	// item pulled before generations were written.
+	TemplateGen string `json:"template_gen,omitempty"`
 	// Placement names ONE placement of the container: a random id minted
 	// whenever its row is written onto a host by a create, clone, restore
 	// (including a migrate and a replica promotion), relocate-recreate or

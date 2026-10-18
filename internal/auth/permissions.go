@@ -81,8 +81,9 @@ func verbMatches(grants []string, verb string) bool {
 				return true
 			}
 		}
-		// "*.<verb>" — verb-wildcard across namespaces.
-		if strings.HasPrefix(g, "*.") && !strings.HasSuffix(g, ".*") {
+		// "*.<verb>" — verb-wildcard across namespaces; never a verb only
+		// granted by name (suffixWildcardExempt).
+		if strings.HasPrefix(g, "*.") && !strings.HasSuffix(g, ".*") && !suffixWildcardExempt(verb) {
 			suffix := g[1:] // "*.read" → ".read"
 			if strings.HasSuffix(verb, suffix) {
 				return true
@@ -102,8 +103,9 @@ const VerbPermModify = "perm.modify"
 // VerbContainerRoot is exec, and a compose image change, in a container that
 // runs as root on the host or with legacy confinement: a privileged one (no
 // user namespace) or a legacy-confined one. It is outside the ct namespace
-// so that ct.* (Operator) does not carry it; Admin holds it through "*", and
-// the ContainerRoot role grants it per container.
+// so that ct.* (Operator) does not carry it, and no "*.exec" grant carries
+// it (suffixWildcardExempt); Admin holds it through "*", and the
+// ContainerRoot role grants it per container.
 const VerbContainerRoot = "ctroot.exec"
 
 // GrantCovers reports whether holding grant `held` covers grant `requested`:
@@ -128,9 +130,17 @@ func GrantCovers(held, requested string) bool {
 		return strings.HasPrefix(requested, held[:len(held)-1]) // "ns.*" -> "ns."
 	}
 	if strings.HasPrefix(held, "*.") && !strings.HasSuffix(held, ".*") {
-		return strings.HasSuffix(requested, held[1:]) // "*.read" -> ".read"
+		return strings.HasSuffix(requested, held[1:]) && !suffixWildcardExempt(requested) // "*.read" -> ".read"
 	}
 	return false
+}
+
+// suffixWildcardExempt reports whether verb is outside every "*.<verb>"
+// grant: VerbContainerRoot's namespace. A role written as "*.exec" for
+// vm.exec and ct.exec must not become a root shell on the host in every
+// privileged container; ctroot.* is granted by name, "ctroot.*" or "*".
+func suffixWildcardExempt(verb string) bool {
+	return strings.HasPrefix(verb, "ctroot.")
 }
 
 // UncoveredGrants returns every grant in requested that no grant in held

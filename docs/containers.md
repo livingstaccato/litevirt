@@ -76,10 +76,14 @@ paths:
   Containers of any project may run from such an ownerless item, so claiming
   it with `--project` (a pull over an existing item that has no owner) needs
   the Admin role; pull without `--project`, or into a new name. The Admin may
-  use any image. A pull over an existing item replaces it with the image
-  pulled (it is unpacked beside the item first); a pull that fails leaves
-  the item as it was. Containers already created from it keep their own
-  copy.
+  use any image. A pull over an existing item is refused, except an Admin's
+  claim (`lv ct pull --project`), which replaces it with the image pulled
+  (unpacked beside the item first; a pull that fails leaves the item as it
+  was). Containers created from it keep their own copy. A claim is refused
+  while a container created by an earlier release uses the item's rootfs in
+  place, naming it. A privileged or legacy-confined stack member built from
+  an item whose content was replaced since counts as changing its image on
+  its next recreate (see compose.md).
 - Any other host path (`--template /srv/rootfs`, `rootfs:<path>`, a relative
   path, an absolute `lv ct pull --dest`, a local `oci:` source) needs
   `storage.hostpath` at the cluster root — the Admin role.

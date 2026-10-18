@@ -462,7 +462,10 @@ recreate that changes such a container's image, additionally require
 outside the `ct` namespace, so Operator's `ct.*` does not carry it: Admin holds
 it through `*`, and an Admin grants it for one container with
 `lv role grant ContainerRoot <principal> --path /projects/<p>/containers/<name>`.
-A delegated `PermissionAdmin` cannot grant it without holding it. Without
+No `*.<verb>` grant carries it (a role written as `*.exec` covers `vm.exec`
+and `ct.exec` only); `ctroot.*` does. A delegated `PermissionAdmin` cannot
+grant it without holding it. The container's own host checks a forwarded
+exec against its own record of the container as well. Without
 bindings the floor is `admin`. Exec in an unprivileged container with default
 confinement needs `ct.exec` only, as before. See
 [containers.md](containers.md).

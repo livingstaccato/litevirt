@@ -26,6 +26,9 @@ type PullOCIOptions struct {
 	// applied when the source is a remote (docker://) registry.
 	Username string
 	Password string
+	// Replace lets the pull replace a bundle already at Dest; without it
+	// such a pull fails with ErrOCIItemExists.
+	Replace bool
 }
 
 // PullOCI extracts an OCI image's flattened rootfs to disk via umoci.
@@ -42,11 +45,17 @@ type PullOCIOptions struct {
 // We choose --rootless so containers can run unprivileged when the
 // host config supports user namespaces.
 //
-// umoci refuses a bundle directory that already holds a config.json or a
-// rootfs, so a pull over an existing bundle (isBundle) (a re-pull, or an Admin claiming
-// an owner-less library item with --project) unpacks into a fresh directory
-// beside Dest and then replaces Dest with it (replaceBundle). A pull that
-// fails leaves the existing bundle as it was.
+// Every pull writes a fresh image generation into the bundle
+// (ImageGenFile), which a container created from it records, so a
+// later change of the content behind the same path is seen as a new image.
+//
+// A Dest that already holds an unpacked bundle (IsBundle) is refused with
+// ErrOCIItemExists unless opts.Replace is set, as umoci refused it before.
+// With Replace the image is unpacked into a fresh directory beside Dest,
+// which then takes Dest's place (replaceBundle); a pull that fails leaves
+// the existing bundle as it was. The caller decides who may replace an item
+// and that no container references it (RootfsReferences). The item's lock
+// (LockOCIItem) is held throughout, so no create copies it half replaced.
 func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	if opts.Image == "" {
 		return errors.New("oci: image required")
@@ -60,6 +69,15 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	if err := requireBinary("umoci"); err != nil {
 		return err
 	}
+	unlock := LockOCIItem(opts.Dest)
+	defer unlock()
+	exists, err := IsBundle(opts.Dest)
+	if err != nil {
+		return err
+	}
+	if exists && !opts.Replace {
+		return fmt.Errorf("%w: %s", ErrOCIItemExists, opts.Dest)
+	}
 	if err := os.MkdirAll(opts.Dest, 0750); err != nil {
 		return fmt.Errorf("mkdir dest: %w", err)
 	}
@@ -67,12 +85,8 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	// an empty or foreign directory umoci unpacks into as before), else a
 	// fresh directory beside it that then replaces it.
 	bundle := opts.Dest
-	replace, err := isBundle(opts.Dest)
-	if err != nil {
-		return err
-	}
-	if replace {
-		stage, err := os.MkdirTemp(filepath.Dir(opts.Dest), "."+filepath.Base(opts.Dest)+".unpack-")
+	if exists {
+		stage, err := os.MkdirTemp(filepath.Dir(opts.Dest), "."+filepath.Base(opts.Dest)+unpackInfix)
 		if err != nil {
 			return fmt.Errorf("stage the unpack beside %s: %w", opts.Dest, err)
 		}
@@ -115,43 +129,11 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	).CombinedOutput(); err != nil {
 		return fmt.Errorf("umoci unpack: %w: %s", err, out)
 	}
-	if replace {
+	if err := writeImageGen(bundle); err != nil {
+		return err
+	}
+	if exists {
 		return replaceBundle(bundle, opts.Dest)
-	}
-	return nil
-}
-
-// isBundle reports whether dir holds an unpacked OCI bundle: umoci's
-// config.json beside a rootfs. umoci will not unpack over one, so a pull
-// replaces it; a directory holding only one of them is left to umoci, which
-// refuses it as before, so nothing else in it is removed.
-func isBundle(dir string) (bool, error) {
-	for _, f := range []string{"config.json", "rootfs"} {
-		if _, err := os.Lstat(filepath.Join(dir, f)); errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		} else if err != nil {
-			return false, fmt.Errorf("read dest: %w", err)
-		}
-	}
-	return true, nil
-}
-
-// replaceBundle puts the bundle unpacked at stage in dest's place, and
-// removes the bundle dest held. Both are in one directory, so each step is a
-// rename; if the second fails, the old bundle is put back.
-func replaceBundle(stage, dest string) error {
-	old := stage + ".old"
-	if err := os.Rename(dest, old); err != nil {
-		return fmt.Errorf("replace %s: set the old image aside: %w", dest, err)
-	}
-	if err := os.Rename(stage, dest); err != nil {
-		if rerr := os.Rename(old, dest); rerr != nil {
-			return fmt.Errorf("replace %s: %w; and putting the old image back failed: %v (it is at %s)", dest, err, rerr, old)
-		}
-		return fmt.Errorf("replace %s: %w; the old image was kept", dest, err)
-	}
-	if err := os.RemoveAll(old); err != nil {
-		return fmt.Errorf("pulled into %s, but removing the old image at %s failed: %w", dest, old, err)
 	}
 	return nil
 }

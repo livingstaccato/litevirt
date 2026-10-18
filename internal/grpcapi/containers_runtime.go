@@ -41,7 +41,7 @@ func (a *LXCRuntimeAdapter) CreateContainer(ctx context.Context, opts CreateCont
 	if err != nil {
 		return nil, err
 	}
-	return &ContainerInfo{Name: c.Name, State: string(c.State), Image: c.Image}, nil
+	return &ContainerInfo{Name: c.Name, State: string(c.State), Image: c.Image, ImageGen: c.ImageGen}, nil
 }
 
 // ContainerNICLinks reads the bridge each NIC of container name links to, by
@@ -133,10 +133,23 @@ func (a *LXCRuntimeAdapter) ListContainers(ctx context.Context) ([]string, error
 	return a.Inner.List(ctx)
 }
 
-func (a *LXCRuntimeAdapter) PullOCIImage(ctx context.Context, image, dest, tag, username, password string) error {
+func (a *LXCRuntimeAdapter) PullOCIImage(ctx context.Context, image, dest, tag, username, password string, replace bool) error {
 	return lxc.PullOCI(ctx, lxc.PullOCIOptions{
-		Image: image, Dest: dest, Tag: tag, Username: username, Password: password,
+		Image: image, Dest: dest, Tag: tag, Username: username, Password: password, Replace: replace,
 	})
+}
+
+// RootfsReferences names the containers whose config uses dir as their
+// rootfs in place (lxc.LxcRunner.RootfsReferences). A runtime that cannot
+// tell refuses: an item must not be replaced under a container using it.
+func (a *LXCRuntimeAdapter) RootfsReferences(_ context.Context, dir string) ([]string, error) {
+	f, ok := a.Inner.(interface {
+		RootfsReferences(dir string) ([]string, error)
+	})
+	if !ok {
+		return nil, errors.New("this host's container runtime cannot tell which containers use an image in place")
+	}
+	return f.RootfsReferences(dir)
 }
 
 // FetchContainerImage fetches the image a create with opts is built from

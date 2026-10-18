@@ -403,7 +403,10 @@ container exists, records a `ct.recreate-security` audit event. A recreate
 that **changes the image** of such a member runs a rootfs of the deployer's
 choosing as root on the host, so it needs what exec in that member needs:
 the Admin role or the `ContainerRoot` role on it (`ct.exec` is not
-enough; see [auth.md](auth.md)). An opt-out the member did not already have
+enough; see [auth.md](auth.md)). So does a recreate from the same OCI
+library item path after an Admin's `lv ct pull --project` replaced the
+item's content: the member's host checks the item is still the pull the
+member was built from. An opt-out the member did not already have
 needs the Admin role. A recreate judges only the member on the host it
 targets, and only one that carries this stack's label; another stack's
 container of the same name is refused, not replaced. These refusals, and the

@@ -14,6 +14,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // CTFake is an in-process container runtime for the fleet harness — the
@@ -91,6 +92,9 @@ type CTFake struct {
 	// and so does a fetch of one.
 	unfetchable map[string]error
 	fetchCalls  []grpcapi.CreateContainerOpts
+	// onFetch runs inside FetchContainerImage, outside the lock, with the
+	// call's context; what it returns fails the fetch.
+	onFetch func(ctx context.Context) error
 
 	// access is the host-access policy the real lxc renderer judges mounts
 	// and devices against (SetHostAccessPolicy).
@@ -304,11 +308,27 @@ func (f *CTFake) fetchErrLocked(opts grpcapi.CreateContainerOpts) error {
 
 // FetchContainerImage fetches the image a create with opts is built from,
 // creating nothing: it fails as the create would.
-func (f *CTFake) FetchContainerImage(_ context.Context, opts grpcapi.CreateContainerOpts) error {
+func (f *CTFake) FetchContainerImage(ctx context.Context, opts grpcapi.CreateContainerOpts) error {
+	f.mu.Lock()
+	f.fetchCalls = append(f.fetchCalls, opts)
+	hook := f.onFetch
+	f.mu.Unlock()
+	if hook != nil {
+		if err := hook(ctx); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.fetchCalls = append(f.fetchCalls, opts)
 	return f.fetchErrLocked(opts)
+}
+
+// OnFetch registers fn to run inside every FetchContainerImage call: a slow
+// download, during which a scenario can cancel the caller.
+func (f *CTFake) OnFetch(fn func(ctx context.Context) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onFetch = fn
 }
 
 // OnExport registers fn to run inside the next ExportContainer call. See the
@@ -368,6 +388,15 @@ func (f *CTFake) CreateContainer(_ context.Context, opts grpcapi.CreateContainer
 		return nil, fmt.Errorf("ctfake: create %s: %w", opts.Name, err)
 	}
 	f.seedLocked(opts.Name, "created-by-"+opts.Name)
+	// A rootfs path's image is copied, as the real create copies it, so a
+	// later replace of the item does not reach this container.
+	var gen string
+	if p, isPath, _ := lxc.TemplatePath(opts.Template); isPath {
+		if b, err := os.ReadFile(filepath.Join(lxc.BundleDir(p), "rootfs", "etc", "image")); err == nil {
+			_ = os.WriteFile(filepath.Join(f.dir(opts.Name), "rootfs", "payload"), append([]byte("image "), b...), 0o644)
+		}
+		gen = lxc.ReadImageGen(lxc.BundleDir(p))
+	}
 	// The security block a real create writes, in the config that travels
 	// with the container through export and import.
 	var idmap *lxc.IDMap
@@ -391,7 +420,7 @@ func (f *CTFake) CreateContainer(_ context.Context, opts grpcapi.CreateContainer
 	for i, n := range opts.Networks {
 		f.links[opts.Name][i] = n.Bridge
 	}
-	return &grpcapi.ContainerInfo{Name: opts.Name, State: "stopped"}, nil
+	return &grpcapi.ContainerInfo{Name: opts.Name, State: "stopped", ImageGen: gen}, nil
 }
 
 // ContainerNICLinks reports the bridge each NIC of name links to.
@@ -679,11 +708,78 @@ func (f *CTFake) CloneContainer(_ context.Context, src, dst string) error {
 	return nil
 }
 
-func (f *CTFake) PullOCIImage(_ context.Context, _, dest, _, _, _ string) error {
+// PullOCIImage unpacks a bundle at dest as umoci does — config.json, a
+// rootfs whose etc/image names image, and a fresh generation — refusing a
+// dest that already holds one unless replace, as lxc.PullOCI does.
+func (f *CTFake) PullOCIImage(_ context.Context, image, dest, _, _, _ string, replace bool) error {
 	if dest == "" {
 		return fmt.Errorf("ctfake: empty OCI destination")
 	}
-	return os.MkdirAll(dest, 0o755)
+	unlock := lxc.LockOCIItem(dest)
+	defer unlock()
+	exists, err := lxc.IsBundle(dest)
+	if err != nil {
+		return err
+	}
+	if exists && !replace {
+		return fmt.Errorf("%w: %s", lxc.ErrOCIItemExists, dest)
+	}
+	stage := dest + ".ctfake-unpack"
+	_ = os.RemoveAll(stage)
+	if err := os.MkdirAll(filepath.Join(stage, "rootfs", "etc"), 0o755); err != nil {
+		return err
+	}
+	for p, b := range map[string]string{
+		filepath.Join(stage, "rootfs", "etc", "image"): image,
+		filepath.Join(stage, "config.json"):            "{}",
+		filepath.Join(stage, lxc.ImageGenFile):         randid.New(),
+	} {
+		if err := os.WriteFile(p, []byte(b), 0o644); err != nil {
+			return err
+		}
+	}
+	if err := os.RemoveAll(dest); err != nil {
+		return err
+	}
+	return os.Rename(stage, dest)
+}
+
+// RootfsReferences names the containers whose config's lxc.rootfs.path is
+// dir or under it, as the real runtime reads them.
+func (f *CTFake) RootfsReferences(_ context.Context, dir string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	dir = filepath.Clean(dir)
+	var out []string
+	for name := range f.state {
+		b, err := os.ReadFile(filepath.Join(f.dir(name), "config"))
+		if err != nil {
+			continue
+		}
+		for _, l := range strings.Split(string(b), "\n") {
+			k, v, ok := strings.Cut(l, "=")
+			if !ok || strings.TrimSpace(k) != "lxc.rootfs.path" {
+				continue
+			}
+			v = filepath.Clean(strings.TrimPrefix(strings.TrimSpace(v), "dir:"))
+			if v == dir || strings.HasPrefix(v, dir+"/") {
+				out = append(out, name)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// SeedByReference materialises a container whose config uses rootfs in
+// place, as one created from a library item by v1.0.5 to v1.1.0 does.
+func (f *CTFake) SeedByReference(name, rootfs string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	d := f.dir(name)
+	_ = os.MkdirAll(d, 0o755)
+	_ = os.WriteFile(filepath.Join(d, "config"), []byte("lxc.rootfs.path = dir:"+rootfs+"\n"), 0o644)
+	f.state[name] = "running"
 }
 
 // ── tar/dir helpers ─────────────────────────────────────────────────────

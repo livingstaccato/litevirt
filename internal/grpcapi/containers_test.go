@@ -122,6 +122,11 @@ type fakeCTRuntime struct {
 	// fetchCalls records FetchContainerImage calls; fetchErr fails them.
 	fetchCalls []CreateContainerOpts
 	fetchErr   error
+
+	// pullReplace records each PullOCIImage call's replace; rootfsRefs is
+	// what RootfsReferences reports, by directory.
+	pullReplace []bool
+	rootfsRefs  map[string][]string
 }
 
 func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerOpts) (*ContainerInfo, error) {
@@ -415,11 +420,19 @@ func (f *fakeCTRuntime) ReadOwner(name string) (*lxc.ContainerOwner, error) {
 	}
 	return nil, nil
 }
-func (f *fakeCTRuntime) PullOCIImage(_ context.Context, image, dest, tag, username, password string) error {
+func (f *fakeCTRuntime) PullOCIImage(_ context.Context, image, dest, tag, username, password string, replace bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pullCalls = append(f.pullCalls, struct{ Image, Dest, Tag, Username, Password string }{image, dest, tag, username, password})
+	f.pullReplace = append(f.pullReplace, replace)
 	return nil
+}
+
+// RootfsReferences reports rootfsRefs[dir].
+func (f *fakeCTRuntime) RootfsReferences(_ context.Context, dir string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rootfsRefs[dir], nil
 }
 
 // TestCreateContainer_LocalHost_PersistsRow verifies the happy path:

@@ -359,7 +359,8 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// restore can rebuild this container faithfully, not as a bare image recreate.
 	createSpec := corrosion.ContainerCreateSpec{
 		Template: req.Template, Distro: req.Distro, Release: req.Release, Arch: req.Arch,
-		Networks: plan.specNets,
+		TemplateGen: info.ImageGen,
+		Networks:    plan.specNets,
 		// A new lineage: the owner record its files are matched by.
 		OwnerID:     randid.New(),
 		IDMapBase:   idmapBase,
@@ -594,6 +595,14 @@ func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest
 }
 
 func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerRequest) (*emptypb.Empty, error) {
+	// A recreate's pre-delete probe from a peer deletes nothing
+	// (probeRecreateOnMember).
+	if handled, err := s.answerRecreateProbe(ctx, req); handled {
+		if err != nil {
+			return nil, err
+		}
+		return &emptypb.Empty{}, nil
+	}
 	if err := safename.ValidateContainerName(req.Name); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
@@ -821,9 +830,17 @@ func (s *Server) ExecContainer(ctx context.Context, req *pb.ExecContainerRequest
 		return nil, err
 	}
 	// In a privileged or legacy-confined container, exec is a host-level
-	// grant (requireContainerRoot), judged here from the resolved row: a
-	// forward runs on the owner as the peer.
+	// grant (requireContainerRoot), judged here from the resolved row, and
+	// again on the owner from its own row for a forward (execRootRefused):
+	// an entry whose replica lags may not know the container became one.
 	if mode := rootContainerMode(*rec); mode != "" {
+		if s.execRootRefused(ctx) {
+			s.audit(ctx, "ct.exec", req.Name, "permission denied on the owner ("+mode+"): "+strings.Join(req.Argv, " "), "denied")
+			return nil, status.Errorf(codes.PermissionDenied,
+				"container %q is %s on its host %s, so exec in it needs the Admin role or the ContainerRoot role on it "+
+					"(an Admin grants it with lv role grant ContainerRoot <principal> --path %s)",
+				req.Name, mode, s.hostName, ctRBACPathFor(rec.Project, req.Name))
+		}
 		if err := s.requireContainerRoot(ctx, *rec); err != nil {
 			s.audit(ctx, "ct.exec", req.Name, "permission denied ("+mode+"): "+strings.Join(req.Argv, " "), "denied")
 			return nil, status.Errorf(codes.PermissionDenied,
@@ -841,7 +858,7 @@ func (s *Server) ExecContainer(ctx context.Context, req *pb.ExecContainerRequest
 		defer conn.Close()
 		// Pin the resolved host on the forwarded request so the peer does not
 		// re-run the cluster-wide name resolution (same as StartContainer).
-		return c.ExecContainer(ctx, &pb.ExecContainerRequest{
+		return c.ExecContainer(s.execRootOutgoing(ctx, *rec), &pb.ExecContainerRequest{
 			Name: req.Name, HostName: host, Argv: req.Argv,
 		})
 	}
@@ -962,7 +979,7 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 	// Forward AFTER resolution so req carries the resolved secret to the host
 	// that actually runs skopeo (it cannot resolve per-user creds itself).
 	if forwarded, err := s.forwardSimpleCT(ctx, req.HostName, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
-		return c.PullOCIImage(s.ownerStrictOutgoing(ctx), req)
+		return c.PullOCIImage(s.ociReplaceOutgoing(ctx, req), req)
 	}); err != nil || forwarded != nil {
 		return forwarded, err
 	}
@@ -991,7 +1008,14 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 	if err := s.refuseClaimingOwnerlessItem(ctx, item, req.Dest, req.Project); err != nil {
 		return nil, err
 	}
-	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password); err != nil {
+	replace, err := s.judgeOCIReplace(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password, replace); err != nil {
+		if errors.Is(err, lxc.ErrOCIItemExists) {
+			return nil, ociItemExistsErr(req.Dest, s.hostName)
+		}
 		return nil, status.Errorf(codes.Internal, "pull oci: %v", err)
 	}
 	// Only an explicit --project makes the image a project's; without one it

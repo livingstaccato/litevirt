@@ -233,6 +233,8 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 	}
 	var dec *recreateDecision
 	var old corrosion.ContainerCreateSpec
+	var pinGen string
+	var pinned bool
 	oldPrivileged, oldConfinement := false, lxc.ConfinementDefault
 	if rec != nil {
 		old = corrosion.DecodeCreateSpec(rec.CreateSpec)
@@ -260,6 +262,12 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 			if err := s.mayChangePrivilegedImage(ctx, a.VMName, rec, d, privileged); err != nil {
 				return nil, nil, err
 			}
+		} else if _, isPath, _ := lxc.TemplatePath(old.Template); isPath && !s.callerMayRoot(ctx, *rec) {
+			// The same rootfs path, whose content an Admin's pull may have
+			// replaced since the member was built: the member's host checks
+			// the item is still the generation it was built from
+			// (recreateHostChecks), or this is an image change too.
+			pinGen, pinned = old.TemplateGen, true
 		}
 		dec.keep = true
 		dec.note = RequireRole(ctx, "admin") != nil
@@ -284,7 +292,8 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 	// the member, before anything is deleted: here when that is this host;
 	// otherwise that host runs them at the delete, from the preflight its
 	// forwarded delete carries (recreate_preflight.go).
-	pf := &recreatePreflight{template: req.Template, project: req.Project, distro: req.Distro, release: req.Release, arch: req.Arch}
+	pf := &recreatePreflight{template: req.Template, project: req.Project, distro: req.Distro, release: req.Release, arch: req.Arch,
+		pinned: pinned, pinGen: pinGen}
 	if a.TargetHost == "" || a.TargetHost == s.hostName {
 		if err := s.recreateHostChecks(createCtx, *pf, req.Name); err != nil {
 			if status.Code(err) != codes.FailedPrecondition {
@@ -293,6 +302,12 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 			return nil, nil, err
 		}
 		return dec, nil, nil
+	}
+	// The member's host runs the same checks, and the fetch, now, on the
+	// caller's context: a refusal, or a caller who gives up, leaves the
+	// member as it is (probeRecreateOnMember). The delete runs them again.
+	if err := s.probeRecreateOnMember(ctx, a.TargetHost, a.VMName, pf); err != nil {
+		return nil, nil, err
 	}
 	return dec, pf, nil
 }
@@ -340,10 +355,7 @@ func sameContainerImage(rec corrosion.ContainerRecord, old corrosion.ContainerCr
 // as root: neither Admin nor holding the ContainerRoot role on the member
 // (requireContainerRoot).
 func (s *Server) mayChangePrivilegedImage(ctx context.Context, name string, rec *corrosion.ContainerRecord, d *compose.VMDef, privileged bool) error {
-	if RequireRole(ctx, "admin") == nil {
-		return nil
-	}
-	if err := s.requireContainerRoot(ctx, *rec); err == nil {
+	if s.callerMayRoot(ctx, *rec) {
 		return nil
 	}
 	what := "legacy-confined"

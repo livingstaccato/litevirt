@@ -316,6 +316,10 @@ func (s *Server) deleteHoldState(h fwmig.Hold) error {
 	return nil
 }
 
+// quarantineHoldRemovedHook, test-only, runs in quarantineHold once the
+// hold is removed; an error stops it there, as a crash would.
+var quarantineHoldRemovedHook func() error
+
 // quarantineHold is rule Q: move the swtpm tree and the NVRAM into
 // fwmig-quarantine/<vm>-<attempt>/, write the hold and a reason.txt naming
 // every hash beside them, and only then remove the hold. Nothing is deleted.
@@ -351,10 +355,18 @@ func (s *Server) quarantineHold(ctx context.Context, h fwmig.Hold, reason string
 			return "", fmt.Errorf("quarantine %s of attempt %s: %w", name, h.Attempt, err)
 		}
 	}
+	// The seed goes before the hold: a crash after the hold's removal leaves
+	// nothing to retry from, and one before it retries all of this
+	// (re-review 3, m-3).
+	s.removeDiscardedCopySeed(ctx, h.VM, h.UUID)
 	if err := recs.RemoveHold(h.VM); err != nil {
 		return "", fmt.Errorf("remove the hold of attempt %s: %w", h.Attempt, err)
 	}
-	s.removeDiscardedCopySeed(ctx, h.VM, h.UUID)
+	if hk := quarantineHoldRemovedHook; hk != nil {
+		if err := hk(); err != nil {
+			return "", err
+		}
+	}
 	slog.Warn("live firmware move: target state quarantined (rule Q)", "vm", h.VM, "attempt", h.Attempt,
 		"source", h.Source, "state", h.State, "dir", dir, "reason", reason)
 	if err := s.raiseQuarantineCondition(ctx, fwmigCondition{

@@ -1519,12 +1519,47 @@ func (r *Reconciler) finishOrphanedStages() {
 			"reason: orphaned stage: the reconciler had gathered this leftover's firmware state when %s; it is finished here as is\n"+
 			"retention: kept while VM %s exists; once it is gone, removed after superseded_disk_retention_days (lv host superseded-disks lists it)\n",
 			vm, uuidOrNone(uuid), r.hostName, now.UTC().Format(time.RFC3339), why, vm)
+		staged := time.Time{}
+		if fi, err := os.Lstat(stage); err == nil {
+			staged = fi.ModTime()
+		}
 		if err := r.fwStore.FinishOrphanedStage(stage, final, []byte(reason)); err != nil {
 			slog.Warn("reconciler: an orphaned firmware quarantine stage cannot be finished", "stage", stage, "error", err)
 			continue
 		}
 		slog.Warn("reconciler: finished an orphaned firmware quarantine stage", "vm", vm, "dir", final, "why", why)
+		if !defined[vm] {
+			r.removeOrphanedStageSeed(vm, uuid, staged)
+		}
 	}
+}
+
+// removeOrphanedStageSeed removes the seed of the leftover whose orphaned
+// stage was just finished, as quarantineLeftoverFirmware does after its own
+// finish (re-review 3, m-3): only a seed stamped for the stage's uuid and
+// written no later than the stage was (a seed written since is another copy
+// of the VM arriving), and never while the VM's row names this host or
+// cannot be read.
+func (r *Reconciler) removeOrphanedStageSeed(vm, uuid string, staged time.Time) {
+	if uuid == "" || staged.IsZero() || r.db == nil {
+		return
+	}
+	row, err := corrosion.GetVM(context.Background(), r.db, vm)
+	if err != nil || (row != nil && row.HostName == r.hostName) {
+		return
+	}
+	iso, err := lv.SafeCloudInitISOPath(r.fwStore.DataDir, vm)
+	if err != nil || !cloudinit.SeedIsFor(iso, uuid) {
+		return
+	}
+	if fi, err := os.Stat(iso); err != nil || fi.ModTime().After(staged) {
+		return
+	}
+	if err := cloudinit.RemoveSeed(iso); err != nil {
+		slog.Warn("reconciler: the orphaned stage's seed was not removed", "vm", vm, "seed", iso, "error", err)
+		return
+	}
+	slog.Info("reconciler: removed the seed of an orphaned stage's leftover", "vm", vm, "seed", iso)
 }
 
 // stagedOwnFirmware reports whether a stage of vm's firmware state is on

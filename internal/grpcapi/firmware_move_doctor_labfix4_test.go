@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,8 +14,10 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fwmig"
+	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
@@ -211,6 +214,94 @@ func TestAdoptedFirmwareMigration_KeepsTheLeaseWhoseReleaseFailed(t *testing.T) 
 			m := requireMarker(t, r, fwmig.PhaseReleased, "")
 			if got := m.CapacityLease != ""; got != fail {
 				t.Fatalf("marker names lease %q (holder %q), want named = %v", m.CapacityLease, m.CapacityLeaseHolder, fail)
+			}
+		})
+	}
+}
+
+// Re-review 3, m-3 (2): a crash right after the hold quarantine removed the
+// hold leaves no hold, domain or record to retry from, so the discarded
+// copy's seed goes before the hold does.
+//
+// Mutation: remove the seed after the hold (the round-3 order) — the seed
+// outlives the crash, red.
+func TestDiscard_SeedGoesBeforeTheHold(t *testing.T) {
+	r := newFwdRig(t, fwlOpts{})
+	run := r.crashAt(fwmig.PhaseMigrating)
+	r.land()
+	r.srcFake.SetState(fwlVM, libvirtfake.StateRunning)
+	r.dstFake.SetState(fwlVM, libvirtfake.StateRunning)
+	r.park(run, fwmig.PhaseTargetRan, "the target holds a domain the abort could not account for")
+	iso := lv.CloudInitISOPath(r.dst.dataDir, fwlVM)
+	r.write(iso, []byte("seed"))
+	if err := cloudinit.StampSeed(iso, fwLiveUUID); err != nil {
+		t.Fatal(err)
+	}
+	o := quarantineHoldRemovedHook
+	quarantineHoldRemovedHook = func() error { return errors.New("the daemon died after the hold went") }
+	t.Cleanup(func() { quarantineHoldRemovedHook = o })
+	_, _ = r.doctor(actDiscard, withStop)
+	if _, ok := r.hold(); ok {
+		t.Fatal("fixture: the hold is still there, so the crash point was not reached")
+	}
+	if _, err := os.Stat(iso); !os.IsNotExist(err) {
+		t.Errorf("the discarded copy's seed outlived the hold (%v)", err)
+	}
+}
+
+// Re-review 3, m-3 (1): the reconciler finishing an orphaned stage (its
+// leftover undefined, then a crash before the stage was finished) removes
+// the leftover's seed, stamped for the stage's uuid; a seed written after
+// the stage (another copy of the VM arriving) is kept.
+//
+// Mutation: drop the seed removal from finishOrphanedStages — red; drop the
+// written-after-the-stage check — the late seed goes, red.
+func TestReconciler_OrphanedStageRemovesItsSeed(t *testing.T) {
+	for _, late := range []bool{false, true} {
+		t.Run(map[bool]string{false: "leftover_seed", true: "seed_written_after_the_stage"}[late], func(t *testing.T) {
+			ctx := context.Background()
+			r := newFwdRig(t, fwlOpts{})
+			run := r.crashAt(fwmig.PhaseReleased)
+			r.park(run, fwmig.PhaseTargetUnreachable, "Release was not answered")
+			r.fenceTarget()
+			if _, err := r.doctor(actAcceptSource, withAck); err != nil {
+				t.Fatalf("accept-source: %v", err)
+			}
+			r.dstFake.SetState(fwlVM, libvirtfake.StateShutdown)
+			_ = r.dst.fwRecords().RemoveHold(fwlVM)
+			_ = r.dst.fwRecords().RemoveLeftover(fwlVM)
+			iso := lv.CloudInitISOPath(r.dst.dataDir, fwlVM)
+			r.write(iso, []byte("seed"))
+			if err := cloudinit.StampSeed(iso, fwLiveUUID); err != nil {
+				t.Fatal(err)
+			}
+			past := time.Now().Add(-time.Hour)
+			if err := os.Chtimes(iso, past, past); err != nil {
+				t.Fatal(err)
+			}
+			// The reconciler's stage, then its undefine, then the crash.
+			stage := filepath.Join(r.dst.dataDir, fwmig.QuarantineDir, fwmig.StageName(fwlVM, fwmig.StageReconciling, fwLiveUUID))
+			if err := r.dstStore.StageLeftoverFirmwareState(fwlVM, fwLiveUUID, stage, []byte("reason")); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.dstFake.UndefineDomainPreservingState(fwlVM); err != nil {
+				t.Fatal(err)
+			}
+			if late {
+				future := time.Now().Add(time.Hour)
+				if err := os.Chtimes(iso, future, future); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rc := health.NewReconciler(r.dst.hostName, r.dst.dataDir, r.dst.db, r.dstFake)
+			rc.SetFirmwareStore(r.dstStore)
+			rc.ReconcileOnce(ctx)
+			if _, err := os.Stat(stage); !os.IsNotExist(err) {
+				t.Fatalf("fixture: the orphaned stage was not finished (%v)", err)
+			}
+			_, statErr := os.Stat(iso)
+			if gone := os.IsNotExist(statErr); gone == late {
+				t.Errorf("seed gone=%v, want %v", gone, !late)
 			}
 		})
 	}

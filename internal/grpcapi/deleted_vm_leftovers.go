@@ -452,6 +452,7 @@ func (s *Server) removeDeletedVMLeftoversHere(ctx context.Context, req *pb.Clean
 	if err := health.RemoveVMOwnerEpochMarker(s.dataDir, name); err != nil {
 		slog.Warn("deleted VM leftovers: owner-epoch marker not removed", "vm", name, "error", err)
 	}
+	s.forgetDeletedVMSeedRecord(ctx, name)
 
 	if len(req.DiskPaths) == 0 {
 		return &emptypb.Empty{}, nil

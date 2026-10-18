@@ -5,10 +5,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/safename"
 )
 
@@ -86,6 +89,7 @@ func (s *Server) DeletedVMMarkerSweepTick(ctx context.Context) {
 	s.markerSweepLastState, s.markerSweepSeen = h.State, true
 	if h.State == "active" && (!seen || prev != "active") {
 		s.sweepDeletedVMMarkers(ctx)
+		s.sweepDeletedVMSeedRecords(ctx)
 	}
 }
 
@@ -114,6 +118,55 @@ func (s *Server) sweepDeletedVMMarkers(ctx context.Context) {
 		}
 		s.removeDeletedVMMarker(ctx, name)
 	}
+}
+
+// sweepDeletedVMSeedRecords drops the record of a removed seed's instance-id
+// (<data_dir>/cloudinit/<vm>.iso.removed, written when a live move took the
+// seed away from this host) of every VM this host's replica records as
+// deleted, when the record was kept for that VM's uuid. Another VM's, or one
+// of a VM with a live row, is never touched.
+func (s *Server) sweepDeletedVMSeedRecords(ctx context.Context) {
+	if s.dataDir == "" {
+		return
+	}
+	ents, err := os.ReadDir(filepath.Join(s.dataDir, "cloudinit"))
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		name, ok := strings.CutSuffix(e.Name(), ".iso.removed")
+		if !ok || e.IsDir() || safename.ValidateVMName(name) != nil {
+			continue
+		}
+		unlock := s.lockVM(name)
+		s.forgetDeletedVMSeedRecord(ctx, name)
+		unlock()
+	}
+}
+
+// forgetDeletedVMSeedRecord drops name's removed-seed record here when its
+// VM is deleted (a tombstone and no live row) and the record was kept for
+// the deleted VM's uuid. The caller holds the VM's lock.
+func (s *Server) forgetDeletedVMSeedRecord(ctx context.Context, name string) {
+	if s.dataDir == "" {
+		return
+	}
+	if cur, err := corrosion.GetVM(ctx, s.db, name); err != nil || cur != nil {
+		return
+	}
+	createdAt, spec, err := corrosion.GetTombstonedVM(ctx, s.db, name)
+	if err != nil || createdAt == "" {
+		return
+	}
+	iso, err := lv.SafeCloudInitISOPath(s.dataDir, name)
+	if err != nil {
+		return
+	}
+	if cloudinit.RemovedSeedInstanceID(iso, cloudinit.SpecUUID(spec)) == "" {
+		return
+	}
+	cloudinit.ForgetRemovedSeed(iso)
+	slog.Info("deleted VM: removed its removed-seed record", "vm", name, "host", s.hostName)
 }
 
 // removeDeletedVMMarker removes name's marker if this host's replica records

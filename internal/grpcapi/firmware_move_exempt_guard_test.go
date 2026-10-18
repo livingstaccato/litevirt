@@ -50,8 +50,8 @@ var fwExemptOwners = map[string][]string{
 	// one wipe of its source state; the D-5 --accept-target on a stopped
 	// cleanup undefines the same way and quarantines instead of wiping.
 	"UndefineFirmwareMoveLeftover": {"internal/grpcapi.Server.undefineLiveFirmwareLeftover"},
-	"undefineLiveFirmwareLeftover": {"internal/grpcapi.Server.fwmigCleanupSource", "internal/grpcapi.Server.quarantineFirmwareMoveSource"},
-	"WipeFirmwareMoveSource":       {"internal/grpcapi.Server.fwmigCleanupSource"},
+	"undefineLiveFirmwareLeftover": {"internal/grpcapi.Server.fwmigCleanupSourceAs", "internal/grpcapi.Server.quarantineFirmwareMoveSource"},
+	"WipeFirmwareMoveSource":       {"internal/grpcapi.Server.fwmigCleanupSourceAs"},
 	// Prepare's materialisation; rule D and rule Q of the hold's disposal.
 	"MaterialiseFirmwareMoveNvram":      {"internal/grpcapi.Server.PrepareLiveFirmwareTarget"},
 	"RemoveFirmwareMoveTargetState":     {"internal/grpcapi.Server.deleteHoldState"},

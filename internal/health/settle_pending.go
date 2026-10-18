@@ -44,7 +44,8 @@ const (
 	// before it, or the stop may have failed or taken effect despite an
 	// error, so a retry asks the runtime whether the copy is shut off.
 	settlePhaseStopping = "stopping"
-	// settlePhaseStopped: the stop returned success.
+	// settlePhaseStopped: the stop returned success, or a retry proved the
+	// copy shut off.
 	settlePhaseStopped = "stopped"
 )
 
@@ -382,7 +383,11 @@ func (w *settleRecorder) raise(ctx context.Context, rec settlePending) error {
 //
 // A stopping-phase record completes only on POSITIVE proof the copy is shut
 // off, as cleanableLeftover decides: a live copy was not stopped, so its
-// record is dropped and the settle decides again; anything else waits.
+// record is dropped and the settle decides again; anything else waits. Once
+// proven, the record is saved in the stopped phase before anything is
+// written, so a later live copy of the name never drops a stop that happened.
+// A stopping-phase record that already wrote part of its record was proven
+// then.
 func (w *settleRecorder) retry(ctx context.Context, kind string, state func(name string) (settleCopyState, string)) {
 	store := w.store()
 	recs, err := store.list(kind)
@@ -396,7 +401,7 @@ func (w *settleRecorder) retry(ctx context.Context, kind string, state func(name
 			w.noteForeign(*rec)
 			continue
 		}
-		if rec.Phase != settlePhaseStopped {
+		if rec.Phase != settlePhaseStopped && !rec.Audited && !rec.Raised {
 			st, seen := state(rec.Name)
 			switch st {
 			case copyLive:
@@ -412,6 +417,10 @@ func (w *settleRecorder) retry(ctx context.Context, kind string, state func(name
 			}
 			if seen != "" && !rec.Audited && !strings.Contains(rec.Detail, "; found ") {
 				rec.Detail += "; found " + seen + " after a restart or a failed stop, so the settle's own stop may not be what stopped it"
+			}
+			rec.Phase = settlePhaseStopped
+			if err := store.put(*rec); err != nil {
+				slog.Warn("partition-settle: could not mark the pending-settle record stopped", "kind", rec.Kind, "name", rec.Name, "error", err)
 			}
 		}
 		if !w.write(ctx, store, rec, true) {

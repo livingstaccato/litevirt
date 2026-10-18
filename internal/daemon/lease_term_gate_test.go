@@ -53,7 +53,7 @@ func TestWireLeaseTermLedgerGate_TheMintTracksTheDurableLatch(t *testing.T) {
 	})
 
 	d := &Daemon{db: db, checker: checker, cfg: &Config{}}
-	d.wireLeaseTermLedgerGate()
+	d.wireCorrosionGates() // the set the daemon wires, so a lost call fails here
 
 	// Before the latch: the pre-ledger behaviour. A term would be a statement
 	// shape a previous-release peer cannot resolve.

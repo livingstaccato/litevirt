@@ -38,7 +38,7 @@ func TestWireRecoveryClaimGate_TracksTheDurableLatch(t *testing.T) {
 	})
 
 	d := &Daemon{db: db, checker: checker, cfg: &Config{DataDir: dataDir}}
-	d.wireRecoveryClaimGate()
+	d.wireCorrosionGates() // the set the daemon wires, so a lost call fails here
 
 	if db.MayEmitClaimCertificate() {
 		t.Fatal("the claim_certificate gate is open before recovery_claim_v1 has durably latched")

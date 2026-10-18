@@ -34,7 +34,10 @@ func TestWireNetBoxRepointGate_TracksTheDurableLatch(t *testing.T) {
 	})
 
 	d := &Daemon{db: db, checker: checker, cfg: &Config{DataDir: dataDir}}
-	d.wireNetBoxRepointGate()
+	// Through wireCorrosionGates, the set the daemon actually wires at start:
+	// calling the one wire function directly would stay green with its call
+	// removed from there.
+	d.wireCorrosionGates()
 
 	if db.MayRepointNetBoxLease() {
 		t.Fatal("a lease re-point is permitted before netbox_ip_repoint_v1 has durably latched")

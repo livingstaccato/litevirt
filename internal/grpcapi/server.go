@@ -1210,6 +1210,10 @@ type Server struct {
 	// releaseRollout: the HA monitor's cached rollout answers
 	// (releaseRolloutLagging). Guarded by releasePeerMu.
 	releaseRollout map[string]*rolloutAnswer
+	// schemaRefusedMu guards schemaRefused: each sender whose push this node
+	// refused because its schema is ahead (schema_refusal_health.go).
+	schemaRefusedMu sync.Mutex
+	schemaRefused   map[string]corrosion.SchemaRefusal
 	// adoptedVoterGen is the voter generation AdoptVoterConfigs last found
 	// adopted, which Ping reports (PingResponse.voter_generation).
 	adoptedVoterGen atomic.Int64

@@ -1717,17 +1717,19 @@ severity warning (it degrades the cluster's health). A node whose database
 schema is behind a sender's refuses every push from it (`sender DB schema
 version N, local M (receiver is missing migrations ...)`), so nothing that
 sender writes reaches it. Each sender that sees the refusal raises the
-condition on the peer; the evidence records both schemas and the fix,
-`lv host upgrade <peer>`. The sender also logs, once per run of refusals, an
+condition on the peer, and the refusing node raises it on itself, so its own
+`lv health` says so too (a node on a release before this one does neither).
+The evidence records both schemas and the fix, `lv host upgrade <peer>`. The sender also logs, once per run of refusals, an
 ERROR `replication: a peer refuses this node's pushes: its database schema
 is behind`, naming the peer and the fix.
 
 The usual cause is a member left on the old schema during a rollout, or one
 brought back from an old backup. `lv host upgrade` pre-stages every member's
 schema before it swaps any binary (see [upgrades.md](upgrades.md)), so a
-rollout that used it does not leave one. Run `lv host upgrade <peer>`; its
+rollout that used it leaves one only when `--skip-prestage` named it. Run `lv host upgrade <peer>`; its
 pre-stage brings the peer's schema forward and the refused writes then apply.
-The condition resolves once a sender's push at the refused schema is accepted.
+The condition resolves once a sender's push at the refused schema is
+accepted, or the refusing node's own schema reaches it.
 
 ### A VM held on its point-in-time overlay (`pit_overlay.held`)
 

@@ -89,3 +89,44 @@ func TestFleet_SchemaRefusalDegradesHealth(t *testing.T) {
 		return healthOf(t, c, a).GetOverall() == "HEALTHY"
 	})
 }
+
+// TestFleet_RefusingNodeReportsItselfFromTheMonitor: the node refusing the
+// pushes raises the condition on itself, so its own `lv health` is not
+// HEALTHY either (m6), and it does so from the HA health monitor the daemon
+// runs, with no direct evaluator call (m5). Pre-staged, it resolves it.
+func TestFleet_RefusingNodeReportsItselfFromTheMonitor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
+	c.WaitConverged(t, convergeTimeout)
+	a, behind := c.Nodes[0], c.Nodes[2]
+	go behind.Server.RunHAHealthMonitor(ctx, 100*time.Millisecond)
+
+	behind.DB.SetEffectiveDBSchemaForTest(corrosion.CurrentSchemaVersion - 1)
+	insertVM(t, a, "vm-refused-self", a.Name)
+
+	const evaluator, code = "replication_schema", "replication_peer_schema_behind"
+	row := func() (corrosion.HealthCondition, bool) {
+		h, ok, err := corrosion.GetHealthCondition(ctx, behind.DB, evaluator, code, "host", behind.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h, ok
+	}
+	eventually(t, convergeTimeout, behind.Name+" to report its own schema behind", func() bool {
+		h, ok := row()
+		return ok && h.Lifecycle != corrosion.ConditionResolved && h.Reporter == behind.Name
+	})
+	if h, _ := row(); h.Severity != corrosion.SeverityWarning || !strings.Contains(h.Evidence, "lv host upgrade "+behind.Name) {
+		t.Fatalf("condition %+v: want a warning whose evidence names `lv host upgrade %s`", h, behind.Name)
+	}
+
+	behind.DB.RefreshDBSchemaVersion(ctx)
+	eventually(t, 2*convergeTimeout, behind.Name+" to take the refused write once pre-staged", func() bool {
+		return vmOn(t, behind, "vm-refused-self") != nil
+	})
+	eventually(t, convergeTimeout, behind.Name+" to resolve its own condition", func() bool {
+		h, ok := row()
+		return ok && h.Lifecycle == corrosion.ConditionResolved
+	})
+}

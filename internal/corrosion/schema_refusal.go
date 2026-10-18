@@ -57,7 +57,7 @@ func parseSchemaRefusal(err error) (sender, peer int, ok bool) {
 
 // noteSchemaRefusal records peer refusing a push for its schema. It logs once
 // per run of refusals, naming the fix.
-func (r *Replicator) noteSchemaRefusal(peer string, sender, peerSchema int) {
+func (r *Replicator) noteSchemaRefusal(peer string, sender, peerSchema int, at time.Time) {
 	r.mu.Lock()
 	if r.schemaPush == nil {
 		r.schemaPush = map[string]*schemaPushState{}
@@ -68,7 +68,7 @@ func (r *Replicator) noteSchemaRefusal(peer string, sender, peerSchema int) {
 		r.schemaPush[peer] = st
 	}
 	first := st.refused.At.IsZero()
-	st.refused = SchemaRefusal{At: time.Now(), SenderSchema: sender, PeerSchema: peerSchema}
+	st.refused = SchemaRefusal{At: at, SenderSchema: sender, PeerSchema: peerSchema}
 	r.mu.Unlock()
 	if first {
 		slog.Error("replication: a peer refuses this node's pushes: its database schema is behind",
@@ -78,7 +78,7 @@ func (r *Replicator) noteSchemaRefusal(peer string, sender, peerSchema int) {
 }
 
 // noteSchemaAccepted records peer accepting a push made at schema.
-func (r *Replicator) noteSchemaAccepted(peer string, schema int) {
+func (r *Replicator) noteSchemaAccepted(peer string, schema int, at time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.schemaPush == nil {
@@ -94,7 +94,24 @@ func (r *Replicator) noteSchemaAccepted(peer string, schema int) {
 			"peer", peer, "local_db_schema", schema)
 	}
 	st.refused = SchemaRefusal{}
-	st.acceptedAt, st.acceptedSchema = time.Now(), schema
+	st.acceptedAt, st.acceptedSchema = at, schema
+}
+
+// pruneSchemaPush drops the schema answers of peers that are not members.
+// Called with r.mu held.
+func (r *Replicator) pruneSchemaPush(members []PeerInfo) {
+	if len(r.schemaPush) == 0 {
+		return
+	}
+	in := make(map[string]bool, len(members))
+	for _, m := range members {
+		in[m.Name] = true
+	}
+	for peer := range r.schemaPush {
+		if !in[peer] {
+			delete(r.schemaPush, peer)
+		}
+	}
 }
 
 // SchemaRefusals lists the peers refusing this node's pushes for their
@@ -121,4 +138,10 @@ func (r *Replicator) SchemaAccepted(peer string, now time.Time) (int, bool) {
 		return 0, false
 	}
 	return st.acceptedSchema, true
+}
+
+// NoteSchemaRefusalForTest records peer refusing a push made at sender, as
+// the replicator does on a refusal, at the given time. Test-only.
+func (r *Replicator) NoteSchemaRefusalForTest(peer string, sender, peerSchema int, at time.Time) {
+	r.noteSchemaRefusal(peer, sender, peerSchema, at)
 }

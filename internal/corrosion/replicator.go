@@ -403,6 +403,11 @@ func (r *Replicator) syncPeers() {
 			slog.Debug("replicator: started peer goroutine", "peer", name)
 		}
 	}
+	// A departed peer is pushed to no more, so its last schema answer would
+	// stand until the window ran out and re-raise a condition the gone-subject
+	// sweep resolved.
+	r.pruneSchemaPush(members)
+
 	// Stop goroutines for peers no longer in our target set.
 	for name, cancel := range r.peers {
 		if !targetSet[name] {
@@ -660,11 +665,11 @@ func (r *Replicator) replicateOnce(ctx context.Context, peerName string) (int, e
 	})
 	if err != nil {
 		if sender, peerSchema, ok := parseSchemaRefusal(err); ok {
-			r.noteSchemaRefusal(peerName, sender, peerSchema)
+			r.noteSchemaRefusal(peerName, sender, peerSchema, time.Now())
 		}
 		return 0, fmt.Errorf("push mutations: %w", err)
 	}
-	r.noteSchemaAccepted(peerName, schema)
+	r.noteSchemaAccepted(peerName, schema, time.Now())
 
 	// Update watermark: use the highest of peer's applied seq and our maxSeqSeen
 	// (to skip past filtered entries from the peer's origin).

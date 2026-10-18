@@ -294,3 +294,32 @@ func TestDeleteVMRefusesAnAddressWhoseVMItCannotRead(t *testing.T) {
 		t.Fatalf("VM deleted with an unverifiable address on it: %q", d.requests())
 	}
 }
+
+func TestDeleteInterfaceRefusesAnAddressItMayViewButNotChange(t *testing.T) {
+	// NetBox scopes a PATCH to the objects the token may CHANGE and a GET to
+	// those it may VIEW, so a token that sees an operator's address but may
+	// not change it gets a 404 on the detach. That is not the address being
+	// gone: it is still attached, and the interface DELETE would cascade it
+	// away. Only a GET that also 404s proves it gone.
+	gets := map[string]string{
+		vmInterfacesPath + "61/": `{"id":61,"name":"eth0","virtual_machine":{"id":40}}`,
+		vmsPath + "40/":          `{"id":40,"name":"vm-1"}`,
+		ipAddressesPath + "900/": `{"id":900,"address":"10.0.0.9/24","assigned_object_type":"virtualization.vminterface","assigned_object_id":61,"custom_fields":{}}`,
+	}
+	d := &detachRecorder{gets: gets, failPatch: "900", failStatus: http.StatusNotFound,
+		page: `{"results":[
+		{"id":900,"address":"10.0.0.9/24","assigned_object_type":"virtualization.vminterface","assigned_object_id":61,"custom_fields":{}}
+	],"next":null}`}
+	c := testClient(t, d.handler(t))
+	err := c.DeleteInterface(context.Background(), 61)
+	if err == nil {
+		t.Fatal("DeleteInterface went ahead although address 900 is still attached")
+	}
+	var ae *APIError
+	if errors.As(err, &ae) && ae.Status == http.StatusNotFound {
+		t.Fatalf("the refusal escaped as a 404 (%v); the caller would read the interface as gone", err)
+	}
+	if indexOf(d.requests(), "DELETE") >= 0 {
+		t.Fatalf("interface deleted with an address still attached: %q", d.requests())
+	}
+}

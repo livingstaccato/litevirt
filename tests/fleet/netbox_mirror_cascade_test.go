@@ -181,3 +181,28 @@ func TestMirrorReplaceDetachesAPrimaryAddress(t *testing.T) {
 	}
 	requireAddressSurvivesUnassigned(t, nb, id, "the superseded incarnation holding it as primary was replaced")
 }
+
+// TestMirrorNeverDeletesAnInterfaceHoldingAnAddressItCannotDetach: the token
+// may view the operator's address but not change it, so the detach answers
+// 404 while the address stays attached. Deleting the interface then would
+// cascade the address away; the delete is refused instead.
+func TestMirrorNeverDeletesAnInterfaceHoldingAnAddressItCannotDetach(t *testing.T) {
+	nb, c, gates := boundMirrorClusterGated(t, 1)
+	latchOperationProtocol(t, c, gates)
+	n := c.Nodes[0]
+
+	mustCreateVM(t, n, "vm-1", orphanNetwork)
+	mustSyncAllNodes(t, c)
+	id := operatorAddressOn(t, nb, "vm-1", "eth0", "192.0.2.53/32")
+	nb.SetViewOnly(id)
+	iface := nb.InterfaceID("vm-1", "eth0")
+
+	mustDetachNIC(t, c, n, "vm-1", nb.InterfaceMAC("vm-1", "eth0"))
+	if err := n.SyncNetBoxMirror(); err == nil {
+		t.Fatal("the pass succeeded although an address on the detached interface could not be detached")
+	}
+	if assigned, exists := nb.Address(id); !exists || assigned != iface {
+		t.Fatalf("operator address %d: exists=%v assigned=%d (cascaded %v), want it kept on interface %d",
+			id, exists, assigned, nb.Cascaded(), iface)
+	}
+}

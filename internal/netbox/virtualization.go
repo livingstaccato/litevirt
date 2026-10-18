@@ -688,9 +688,13 @@ const vmInterfaceType = "virtualization.vminterface"
 // addresses assigned elsewhere, and clearing those would detach somebody
 // else's address.
 //
-// An address that has disappeared since it was listed (404) is skipped: it is
-// not attached to anything any more, and its absence says nothing about the
-// object being deleted.
+// A 404 on the detach is skipped only once a GET of the address also answers
+// 404. NetBox scopes a PATCH to the objects the token may CHANGE and a GET to
+// those it may VIEW, so a token that sees an address but may not change it
+// gets a 404 on the PATCH while the address is still attached — and the
+// DELETE that followed would cascade it away. Anything short of a 404 on the
+// GET refuses the delete, and the refusal carries no status, so it is never
+// read as the object being gone.
 //
 // An address carrying no litevirt identity is an operator's. It is detached
 // all the same — the assignment cannot outlive the interface, and detaching
@@ -703,6 +707,11 @@ func (c *Client) detachAll(ctx context.Context, ips []IPAddress) error {
 		switch {
 		case err == nil:
 		case errors.As(err, &ae) && ae.Status == http.StatusNotFound:
+			if gone, gerr := c.addressGone(ctx, ip.ID); gerr != nil || !gone {
+				return fmt.Errorf("detach address %d (%s): NetBox answered 404 but the address is "+
+					"not confirmed gone, so it may still be attached — this token may view it but "+
+					"not change it; refusing to delete what holds it", ip.ID, ip.Address)
+			}
 			continue
 		default:
 			return fmt.Errorf("detach address %d (%s): %v", ip.ID, ip.Address, err)
@@ -714,6 +723,20 @@ func (c *Client) detachAll(ctx context.Context, ips []IPAddress) error {
 		}
 	}
 	return nil
+}
+
+// addressGone reports whether a GET of the address answers 404.
+func (c *Client) addressGone(ctx context.Context, id int) (bool, error) {
+	err := c.do(ctx, http.MethodGet, fmt.Sprintf(ipAddressesPath+"%d/", id), nil, nil)
+	var ae *APIError
+	switch {
+	case err == nil:
+		return false, nil
+	case errors.As(err, &ae) && ae.Status == http.StatusNotFound:
+		return true, nil
+	default:
+		return false, err
+	}
 }
 
 // AssignIPToInterface attaches an existing address to an interface. NetBox's

@@ -63,6 +63,10 @@ type NetBoxFake struct {
 	cascaded []int
 	// lastIPID is the highest address id ever handed out; see nextID.
 	lastIPID int
+	// viewOnly is the address ids the API token may view but not change, as
+	// a NetBox ObjectPermission scoped to view would make them: a GET
+	// returns the object, and a PATCH or DELETE answers 404.
+	viewOnly map[int]bool
 
 	// addrRequests counts EVERY request to the ipam address surface — the
 	// collection, the id-scoped routes and the per-prefix available-ips band —
@@ -446,7 +450,13 @@ func (f *NetBoxFake) handle(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/api/ipam/ip-addresses/") && r.Method == http.MethodDelete:
 		f.release(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/ipam/ip-addresses/") && r.Method == http.MethodPatch:
+		if f.isViewOnly(r.URL.Path) {
+			writeErr(w, http.StatusNotFound, `{"detail":"No IPAddress matches the given query."}`)
+			return
+		}
 		f.patchIdentity(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/ipam/ip-addresses/") && r.Method == http.MethodGet:
+		f.getAddress(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/ipam/prefixes/"):
 		f.getPrefix(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/ipam/vrfs/"):
@@ -834,6 +844,47 @@ func (f *NetBoxFake) release(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// SetViewOnly makes the API token able to view address id but not change it.
+func (f *NetBoxFake) SetViewOnly(id int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.viewOnly == nil {
+		f.viewOnly = map[int]bool{}
+	}
+	f.viewOnly[id] = true
+}
+
+func (f *NetBoxFake) isViewOnly(path string) bool {
+	id, ok := idFromPath(path, "/api/ipam/ip-addresses/")
+	if !ok {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.viewOnly[id]
+}
+
+// getAddress is GET /api/ipam/ip-addresses/{id}/.
+func (f *NetBoxFake) getAddress(w http.ResponseWriter, r *http.Request) {
+	id, ok := idFromPath(r.URL.Path, "/api/ipam/ip-addresses/")
+	if !ok {
+		writeErr(w, http.StatusNotFound, "unparseable ip id in %s", r.URL.Path)
+		return
+	}
+	f.mu.Lock()
+	ip, known := f.byID[id]
+	var out ipView
+	if known {
+		out = ipJSON(*ip)
+	}
+	f.mu.Unlock()
+	if !known {
+		writeErr(w, http.StatusNotFound, "no ip-address %d", id)
+		return
+	}
+	writeJSON(w, out)
 }
 
 // patchIdentity is PATCH /api/ipam/ip-addresses/{id}/ — the identity rewrite a

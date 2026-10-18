@@ -358,7 +358,8 @@ func TestOperatorHostsWrites_RefuseWhenNotCaughtUp(t *testing.T) {
 		// A first admission issues no number and is not gated.
 		s = incServer(t, 0)
 		s.SetGate(&quorumGate{full: health.QuorumNo, excluding: health.QuorumNo})
-		if _, err := admit(s, "brand-new"); err != nil {
+		// At its own address: host-x is admitted below at admit's.
+		if _, err := admitAt(s, "brand-new", "10.0.0.8"); err != nil {
 			t.Errorf("a first admission under no quorum: %v", err)
 		}
 		// Nor a re-admission before the feature.

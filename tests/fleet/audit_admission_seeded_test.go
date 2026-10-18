@@ -95,6 +95,7 @@ func TestFleet_AnAdmitterSeededOnlyByEmptyPeersRefuses(t *testing.T) {
 		if err != nil {
 			t.Fatalf("admit %s: %v", n.Name, err)
 		}
+		fleetAdmittedPort(t, n, serial, survivors...)
 		rejoin, _, err := cli.AuditRejoinFile(cli.PKIDir(), n.Name, serial, admitted)
 		if err != nil {
 			t.Fatal(err)

@@ -157,3 +157,25 @@ func mapsEqual(x, y map[string]string) bool {
 	}
 	return true
 }
+
+// fleetAdmittedPort gives n's admitted row its real gRPC port on each of on,
+// as n's boot records it, once the admission (serial) has reached each of
+// them, so a late copy of it cannot put 7443 back on one and not another.
+// AdmitHost records 7443, the port every real host serves on; fleet nodes
+// share 127.0.0.1 and differ by port, so a second admission before the first
+// node boots would hold the same address and port, which AdmitHost refuses
+// (one machine, one name).
+func fleetAdmittedPort(t *testing.T, n *Node, serial string, on ...*Node) {
+	t.Helper()
+	for _, o := range on {
+		eventually(t, convergeTimeout, o.Name+" to hold "+n.Name+"'s admission", func() bool {
+			r, err := o.DB.Query(context.Background(), `SELECT cert_serial FROM hosts WHERE name = ?`, n.Name)
+			return err == nil && len(r) == 1 && strings.EqualFold(r[0].String("cert_serial"), serial)
+		})
+	}
+	for _, o := range on {
+		if _, err := o.DB.DB().Exec(`UPDATE hosts SET grpc_port = ? WHERE name = ?`, n.Port, n.Name); err != nil {
+			t.Fatalf("record %s's fleet port on %s: %v", n.Name, o.Name, err)
+		}
+	}
+}

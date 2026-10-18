@@ -1786,6 +1786,9 @@ func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostReques
 	return h, incarnation, nil
 }
 
+// admitGRPCPort is the gRPC port AdmitHost records for an admitted host.
+const admitGRPCPort = 7443
+
 // AdmitHost records the CA-authorized identity produced by `lv host add`.
 // Running it on an existing member breaks the tombstone/authentication deadlock
 // when a removed machine is deliberately re-added with a fresh certificate.
@@ -1808,6 +1811,20 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 	}
 	if req.Name == "" || req.Address == "" || req.CertSerial == "" {
 		return nil, status.Error(codes.InvalidArgument, "name, address, and certificate serial are required")
+	}
+	// One machine, one name: an address another live or joining host is
+	// dialled at belongs to that host. Checked here, not only by `lv host
+	// add`, so two adds of one machine under two names cannot both pass.
+	held, err := s.db.Query(ctx, `SELECT name FROM hosts WHERE address = ? AND name <> ? AND deleted_at IS NULL
+		AND (grpc_port = ? OR grpc_port = 0 OR grpc_port IS NULL)`, req.Address, req.Name, admitGRPCPort)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read the hosts at %s: %v", req.Address, err)
+	}
+	if len(held) > 0 {
+		other := held[0].String("name")
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%s:%d is %s's address: a machine is admitted under one name. Remove %s first (`lv host rm %s`) "+
+				"to add the machine as %s", req.Address, admitGRPCPort, other, other, other, req.Name)
 	}
 	// A name whose removed machine still has workloads recorded on it is not
 	// given to a new machine: those rows are the old machine's, recovered by
@@ -1840,7 +1857,7 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 		Address:    req.Address,
 		SSHUser:    "root",
 		SSHPort:    22,
-		GRPCPort:   7443,
+		GRPCPort:   admitGRPCPort,
 		State:      corrosion.HostStateJoining,
 		CertSerial: req.CertSerial,
 	})

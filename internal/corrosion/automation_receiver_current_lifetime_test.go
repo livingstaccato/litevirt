@@ -186,11 +186,9 @@ func TestReceiverCurrentActualHostExpiry(t *testing.T) {
 			target := sha256.Sum256(f.attempt.pair.Certificate[0])
 			staging := time.Now()
 			for i := range f.producers {
-				if mode == "receiver" {
-					// Use the real exporter's native page size while retaining every
-					// original and the already signed target certificate binding.
-					f.requests[i].MaxRecords = AutomationExportMaxRecords
-				}
+				// Use the real exporter's native page size in both modes while
+				// retaining every original and the signed target certificate binding.
+				f.requests[i].MaxRecords = AutomationExportMaxRecords
 				f.stage(t, i, 11, true)
 			}
 			staged := time.Now()

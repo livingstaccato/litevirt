@@ -90,7 +90,7 @@ var releaseFeatures = map[Feature]FeatureInfo{
 		Writers: []string{"internal/grpcapi.admitLimitedSpec", "internal/grpcapi.admitLimitUpdate",
 			"internal/corrosion.InsertVMWithReleaseFeatures", "internal/corrosion.MutateDesiredSpecWithReleaseFeatures"}},
 	FeatureVMDiskNICIO: {Token: Release202611V1, Description: "Per-disk discard and I/O limits and per-NIC queues; discard defaults on for new disks",
-		Writers: []string{"internal/corrosion.InsertVMWithTuning", "internal/corrosion.MutateDesiredSpecTuning",
+		Writers: []string{"internal/corrosion.MutateDesiredSpecTuning",
 			"internal/corrosion.InsertVMWithReleaseFeatures", "internal/corrosion.MutateDesiredSpecWithReleaseFeatures"}},
 	FeatureEmailTargetSecret: {Token: Release202611V1, Description: "Email notification targets with a stored SMTP password",
 		Writers: []string{"internal/corrosion.InsertEmailTargetWithSecret"}},

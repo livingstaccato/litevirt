@@ -604,3 +604,121 @@ func checkedFeatures(body *ast.BlockStmt, grants []string, consts map[string]Fea
 	})
 	return out
 }
+
+// TestReleaseFeatureWriters_AreCalled: every listed writer is called (or
+// referenced) by non-test code. A writer nothing calls is retired: the feature's
+// data is written through another listed writer, and the stale name only keeps
+// a second, unused gate in the tree.
+//
+// uncalledWriters are the listed writers known to have no caller yet, each
+// with why. Delete an entry when the writer gains its caller or is retired.
+var uncalledWriters = map[string]string{
+	"internal/corrosion.SetFirewallSynflood":          "the SetFirewallSynflood RPC is still a stub (firewall_synflood_stubs.go)",
+	"internal/corrosion.InsertSessionWithFactor":      "not yet called by the login path; reported for its own follow-up",
+	"internal/corrosion.MutateDesiredSpecPassthrough": "not yet called; reported for its own follow-up",
+}
+
+func TestReleaseFeatureWriters_AreCalled(t *testing.T) {
+	root := filepath.Join("..", "..")
+	seen := map[string]bool{}
+	for _, f := range Features() {
+		info, _ := LookupFeature(f)
+		for _, w := range info.Writers {
+			if seen[w] {
+				continue
+			}
+			seen[w] = true
+			n, err := writerReferences(root, w)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch _, known := uncalledWriters[w]; {
+			case known && n > 0:
+				t.Errorf("writer %s is called now: delete it from uncalledWriters", w)
+			case !known && n == 0:
+				t.Errorf("feature %q lists writer %s, which no non-test code calls: retire it from the list (and the tree)", f, w)
+			}
+		}
+	}
+}
+
+// The reference check has teeth: a function only its declaration and a test
+// name is not referenced; a call or a function value from another package is.
+func TestReleaseFeatureWriters_ReferenceCheckFindsAnUncalledWriter(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel, src string) {
+		t.Helper()
+		path := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("internal/x/x.go", `package x
+func Called() {}
+func Valued() {}
+func Uncalled() {}
+`)
+	write("internal/x/x_test.go", `package x
+func init() { Uncalled() }
+`)
+	write("internal/y/y.go", `package y
+import "github.com/litevirt/litevirt/internal/x"
+func f() { x.Called(); g := x.Valued; _ = g }
+`)
+	for name, want := range map[string]bool{"Called": true, "Valued": true, "Uncalled": false} {
+		n, err := writerReferences(dir, "internal/x."+name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (n > 0) != want {
+			t.Errorf("%s: %d reference(s), want referenced=%v", name, n, want)
+		}
+	}
+}
+
+// writerReferences counts the non-test references to writer w
+// ("internal/pkg.Func" or "internal/pkg.Type.Method") anywhere under root:
+// an identifier of its name that is not its own declaration.
+func writerReferences(root, w string) (int, error) {
+	dot := strings.LastIndex(w, ".")
+	name := w[dot+1:]
+	fset := token.NewFileSet()
+	n := 0
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(root, path)
+		rel = filepath.ToSlash(rel)
+		if d.IsDir() {
+			if rel == "gen" || rel == ".git" || strings.HasPrefix(rel, ".claude") || rel == "vendor" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(rel, ".go") || strings.HasSuffix(rel, "_test.go") {
+			return nil
+		}
+		f, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			return perr
+		}
+		decl := map[*ast.Ident]bool{}
+		for _, dd := range f.Decls {
+			if fd, ok := dd.(*ast.FuncDecl); ok {
+				decl[fd.Name] = true
+			}
+		}
+		ast.Inspect(f, func(node ast.Node) bool {
+			if id, ok := node.(*ast.Ident); ok && id.Name == name && !decl[id] {
+				n++
+			}
+			return true
+		})
+		return nil
+	})
+	return n, err
+}

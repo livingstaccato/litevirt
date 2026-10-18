@@ -228,8 +228,9 @@ func TestDiskNICIOWriters_RefuseWithoutAGrant(t *testing.T) {
 	if _, _, err := corrosion.MutateDesiredSpecTuning(ctx, s.db, other, "w", func(old string) (string, error) { return old + " ", nil }); !errors.Is(err, capabilities.ErrNoFeatureGrant) {
 		t.Errorf("MutateDesiredSpecTuning with another feature's grant: %v", err)
 	}
-	if err := corrosion.InsertVMWithTuning(ctx, s.db, none, corrosion.VMRecord{Name: "x", HostName: "test-host", State: "stopped"}, nil, nil, nil, nil, false); !errors.Is(err, capabilities.ErrNoFeatureGrant) {
-		t.Errorf("InsertVMWithTuning without a grant: %v", err)
+	if err := corrosion.InsertVMWithReleaseFeatures(ctx, s.db, none, none, none, none, corrosion.VMSpecFeatures{Tuning: true},
+		corrosion.VMRecord{Name: "x", HostName: "test-host", State: "stopped"}, nil, nil, nil, nil, false); !errors.Is(err, capabilities.ErrNoFeatureGrant) {
+		t.Errorf("InsertVMWithReleaseFeatures with tuning and no grant: %v", err)
 	}
 	if vm, _ := corrosion.GetVM(ctx, s.db, "x"); vm != nil {
 		t.Error("a refused insert wrote a row")

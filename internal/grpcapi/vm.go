@@ -4819,12 +4819,12 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		// Only this VM's own domain is stopped and undefined: a domain of the
 		// name that is another guest (hand-made, or a runtime of another
 		// incarnation) is not this rebuild's to kill. Its own is the one with
-		// its uuid, or with its row's owner-epoch stamp (domainIsVMsOwn). A VM
-		// with no recorded uuid (from before uuids were minted, or a
-		// non-firmware import, whose uuid libvirt chose) has nothing to
-		// compare, and is judged as before.
+		// its uuid, or one that runs on the disks its row records here
+		// (domainIsVMsOwn). A VM with no recorded uuid (from before uuids were
+		// minted, or a non-firmware import, whose uuid libvirt chose) has
+		// nothing to compare, and is judged as before.
 		if spec.Uuid != "" {
-			own, du, ierr := s.domainIsVMsOwn(req.Name, spec.Uuid, vm.OwnerEpoch)
+			own, du, ierr := s.domainIsVMsOwn(ctx, req.Name, spec.Uuid, req.Name)
 			switch {
 			case ierr != nil:
 				// libvirt cannot say what the domain is: stopping it would
@@ -4834,9 +4834,9 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 					req.Name, s.hostName, ierr)
 			case !own:
 				return nil, status.Errorf(codes.FailedPrecondition,
-					"cannot rebuild %q: the domain of the name on %s is not this VM's (uuid %s, the VM's is %s, and it carries "+
-						"no stamp of the VM's owner epoch %d); nothing was changed",
-					req.Name, s.hostName, du, spec.Uuid, vm.OwnerEpoch)
+					"cannot rebuild %q: the domain of the name on %s is not this VM's (uuid %s, the VM's is %s, and it runs "+
+						"on none of the VM's disks there); nothing was changed",
+					req.Name, s.hostName, du, spec.Uuid)
 			}
 		}
 		active, aerr := s.virt.DomainIsActive(req.Name)

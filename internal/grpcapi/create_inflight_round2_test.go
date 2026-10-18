@@ -212,9 +212,12 @@ func TestPromoteReplica_ForceNeverStopsADomainOfAnotherUUID(t *testing.T) {
 }
 
 // A rebuild stops and undefines only its own domain: a domain of the name
-// with another uuid refuses it (dupcreate re-review m-A).
+// with another uuid refuses it (dupcreate re-review m-A), even once a healer
+// has stamped it with the row's owner epoch, which healers write by name onto
+// whatever domain of it runs on the owner (re-review 3, I-1).
 //
-// Mutation: drop the uuid check — the foreign domain is destroyed, red.
+// Mutations: drop the uuid check — the foreign domain is destroyed, red;
+// accept the owner-epoch stamp as identity — red.
 func TestRebuildVM_NeverStopsADomainOfAnotherUUID(t *testing.T) {
 	stageGenisoimage(t)
 	s, fake, _ := isoServer(t)
@@ -234,6 +237,18 @@ func TestRebuildVM_NeverStopsADomainOfAnotherUUID(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := fake.StartDomain(name); err != nil {
+		t.Fatal(err)
+	}
+	// What convergeOwnerEpochMarker or vmcheck's drift heal does on its next
+	// sweep: the row's epoch, stamped onto the domain that runs under the name.
+	if err := s.db.Execute(adminCtx(), `UPDATE vms SET vm_owner_epoch = 1 WHERE name = ? AND COALESCE(vm_owner_epoch, 0) = 0`, name); err != nil {
+		t.Fatal(err)
+	}
+	row, _ := corrosion.GetVM(adminCtx(), s.db, name)
+	if row == nil || row.OwnerEpoch < 1 {
+		t.Fatalf("the VM's row: %+v, want an owner epoch", row)
+	}
+	if err := fake.SetDomainOwnerEpoch(name, row.OwnerEpoch, true); err != nil {
 		t.Fatal(err)
 	}
 	baseU, baseD := undefinesOf(fake, name)

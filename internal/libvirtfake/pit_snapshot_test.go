@@ -23,8 +23,8 @@ func TestPITOverlay_TheDefinitionDecidesWhatAStartOpens(t *testing.T) {
 	if err := qcow2.Create(disk, 1<<20, nil); err != nil {
 		t.Fatal(err)
 	}
-	onBase := "<domain><name>vm</name><devices><disk type='file'><source file='" + disk + "'/></disk></devices></domain>"
-	onOverlay := "<domain><name>vm</name><devices><disk type='file'><source file='" + overlay + "'/></disk></devices></domain>"
+	onBase := "<domain><name>vm</name><uuid>0b7c6a8e-0000-4000-8000-0000000000aa</uuid><devices><disk type='file'><source file='" + disk + "'/></disk></devices></domain>"
+	onOverlay := "<domain><name>vm</name><uuid>0b7c6a8e-0000-4000-8000-0000000000aa</uuid><devices><disk type='file'><source file='" + overlay + "'/></disk></devices></domain>"
 	f := New()
 	strand := func() {
 		t.Helper()

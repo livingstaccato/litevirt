@@ -227,8 +227,10 @@ func (s *Server) autoDefineRestoredVM(
 	// A restore beside the original under a new name is a second VM, so it
 	// gets its own identity, as a clone does (a firmware VM always does,
 	// below); so does a spec that names none. A restore to the original's own
-	// name keeps it.
-	if !fwVM && (targetName != originalName || spec.Uuid == "") {
+	// name keeps it only when the spec is the backup's own or this cluster's
+	// row and no live VM holds the uuid: a caller's --spec gets a fresh one,
+	// as a create does, so no two live VMs share one.
+	if !fwVM && (targetName != originalName || spec.Uuid == "" || req.Spec != nil || s.liveVMHoldsUUID(ctx, spec.Uuid)) {
 		spec.Uuid = uuid.NewString()
 	}
 	// restoreOK gates the deferred firmware rollback below: a firmware VM that
@@ -580,4 +582,25 @@ func (s *Server) driveBlockpull(ctx context.Context, vmName, dev string, send fu
 			}
 		}
 	}
+}
+
+// liveVMHoldsUUID reports whether a live VM row carries uuid as its spec
+// uuid. A list that cannot be read answers yes.
+func (s *Server) liveVMHoldsUUID(ctx context.Context, u string) bool {
+	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
+	if err != nil {
+		return true
+	}
+	for _, v := range vms {
+		if v.Spec == "" {
+			continue
+		}
+		var sp struct {
+			UUID string `json:"uuid"`
+		}
+		if json.Unmarshal([]byte(v.Spec), &sp) == nil && sp.UUID == u {
+			return true
+		}
+	}
+	return false
 }

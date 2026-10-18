@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/xml"
 	"fmt"
 	"os"
 	"time"
@@ -191,14 +192,15 @@ func (s *Server) foreignDomainDiskPaths(name, self string) func(string) bool {
 }
 
 // domainIsVMsOwn reports whether the domain of name on this host is the
-// runtime of the VM whose spec uuid is specUUID and whose row is at owner
-// epoch rowEpoch. Two positive identities count: the domain's uuid is the
-// VM's (every definer carries it), or its owner-epoch stamp is the row's
-// (a domain an older promotion or restore defined under a uuid libvirt chose
-// still carries the stamp its row's generation wrote). du is the domain's
-// uuid; err is set when the domain's uuid cannot be read at all, and then
+// runtime of the VM whose spec uuid is specUUID. Its uuid is the VM's (every
+// definer carries it), or, when diskOwner names the VM, the domain runs on a
+// disk the VM's row records on this host (a domain an older promotion or
+// restore defined under a uuid libvirt chose). The owner-epoch stamp is no
+// identity: healers write it by name onto whatever domain of the name runs on
+// the owner, and epochs repeat across VMs and incarnations. du is the
+// domain's uuid; err is set when what the domain is cannot be read, and then
 // nothing about it is known.
-func (s *Server) domainIsVMsOwn(name, specUUID string, rowEpoch int64) (own bool, du string, err error) {
+func (s *Server) domainIsVMsOwn(ctx context.Context, name, specUUID, diskOwner string) (own bool, du string, err error) {
 	x, xerr := s.virt.DumpXMLInactive(name)
 	if xerr != nil {
 		var lerr error
@@ -213,10 +215,63 @@ func (s *Server) domainIsVMsOwn(name, specUUID string, rowEpoch int64) (own bool
 	if specUUID != "" && du == specUUID {
 		return true, du, nil
 	}
-	if rowEpoch > 0 {
-		if e, ok, gerr := s.virt.GetDomainOwnerEpoch(name); gerr == nil && ok && e == rowEpoch {
-			return true, du, nil
+	if diskOwner == "" {
+		return false, du, nil
+	}
+	recorded, rerr := corrosion.GetVMDisks(ctx, s.db, diskOwner)
+	if rerr != nil {
+		return false, du, fmt.Errorf("the VM's disks cannot be read: %v", rerr)
+	}
+	var mine []string
+	for _, d := range recorded {
+		if d.HostName == s.hostName && d.Path != "" && (d.DeviceKind == "" || d.DeviceKind == "disk") {
+			mine = append(mine, d.Path)
 		}
 	}
-	return false, du, nil
+	return domainRunsOnAny(x, mine), du, nil
+}
+
+// domainRunsOnAny reports whether a domain's own disks (not its CD-ROMs, not
+// their backing chains) name one of paths, by spelling or by the file it is.
+func domainRunsOnAny(domXML string, paths []string) bool {
+	if len(paths) == 0 {
+		return false
+	}
+	var dom struct {
+		Devices struct {
+			Disks []struct {
+				Device string `xml:"device,attr"`
+				Source struct {
+					File string `xml:"file,attr"`
+					Dev  string `xml:"dev,attr"`
+				} `xml:"source"`
+			} `xml:"disk"`
+		} `xml:"devices"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &dom); err != nil {
+		return false
+	}
+	for _, d := range dom.Devices.Disks {
+		if d.Device != "" && d.Device != "disk" {
+			continue
+		}
+		for _, src := range []string{d.Source.File, d.Source.Dev} {
+			if src == "" {
+				continue
+			}
+			sfi, serr := os.Stat(src)
+			for _, p := range paths {
+				if p == src {
+					return true
+				}
+				if serr != nil {
+					continue
+				}
+				if pfi, perr := os.Stat(p); perr == nil && os.SameFile(sfi, pfi) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }

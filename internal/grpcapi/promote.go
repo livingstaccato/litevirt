@@ -1115,6 +1115,20 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 	}
 	started := promoteDomainAlreadyStarted(stepDone("started"), stepDone("start_attempted"), s.promoteMarkerPresent(targetName), domExists, domRunning)
+	// A renamed promotion mints its uuid on every attempt, so a retry that
+	// adopts the domain an earlier attempt started takes that domain's uuid
+	// for the row and the NIC guards: the row and the domain never name two
+	// identities. One whose uuid cannot be read is not adopted.
+	if renamed && started {
+		x, xerr := s.virt.DumpXML(targetName)
+		du := domainUUIDFromXML(x)
+		if xerr != nil || du == "" {
+			return status.Errorf(codes.Unavailable,
+				"promote of %s to %s: the domain an earlier attempt started cannot be identified (%v); nothing was changed",
+				vm.Name, targetName, xerr)
+		}
+		spec.Uuid = du
+	}
 
 	// Split-brain guard. Taking over the original name while the original is
 	// still on a healthy host (and not force) would double-run the VM.
@@ -1212,41 +1226,44 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// (If this proof already reached "started", the existing domain is OUR OWN
 	// prior promotion — never destroy it on resume; fall through to persist.)
 	replaceDomain := false
+	replaceVerdict := func() (bool, error) {
+		own, du, ierr := s.domainIsVMsOwn(ctx, targetName, spec.Uuid, "")
+		if spec.Uuid == "" && ierr == nil && !renamed {
+			own = true // a VM from before uuids were minted: judged as before
+		}
+		if own {
+			return true, nil
+		}
+		active, aerr := s.virt.DomainIsActive(targetName)
+		if aerr == nil && !active {
+			return false, nil
+		}
+		why := "it is running"
+		if aerr != nil {
+			why = fmt.Sprintf("whether it runs cannot be read (%v)", aerr)
+		}
+		if ierr != nil {
+			du = fmt.Sprintf("unidentified: %v", ierr)
+		}
+		return false, status.Errorf(codes.FailedPrecondition,
+			"domain %q on %s is not this VM's (uuid %s, the VM's is %s) and %s; --force replaces only the VM's own "+
+				"domain or a stopped one; nothing was changed", targetName, s.hostName, du, spec.Uuid, why)
+	}
 	if s.virt.DomainExists(targetName) && !started {
 		if !req.Force {
 			return status.Errorf(codes.AlreadyExists, "domain %q already defined on %q; pass --force or --new-name", targetName, s.hostName)
 		}
-		// --force replaces the VM's own domain (its uuid, or its row's
-		// owner-epoch stamp: domainIsVMsOwn), running or not, and any other
-		// domain of the name only when it is positively stopped: undefining a
-		// stopped one keeps its storage, as a create removes a stopped domain
-		// with no record. One that runs, or whose state cannot be read, is
-		// another guest, never this promotion's to stop. For a renamed
-		// promotion no row of the name exists (checked above) and the VM's
-		// identity is the fresh uuid minted for it, so only a stopped leftover
-		// is replaced.
-		ownEpoch := int64(0)
-		if !renamed {
-			ownEpoch = vm.OwnerEpoch
-		}
-		own, du, ierr := s.domainIsVMsOwn(targetName, spec.Uuid, ownEpoch)
-		if spec.Uuid == "" && ierr == nil && !renamed {
-			own = true // a VM from before uuids were minted: judged as before
-		}
-		if !own {
-			active, aerr := s.virt.DomainIsActive(targetName)
-			if aerr != nil || active {
-				why := "it is running"
-				if aerr != nil {
-					why = fmt.Sprintf("whether it runs cannot be read (%v)", aerr)
-				}
-				if ierr != nil {
-					du = fmt.Sprintf("unidentified: %v", ierr)
-				}
-				return status.Errorf(codes.FailedPrecondition,
-					"domain %q on %s is not this VM's (uuid %s, the VM's is %s) and %s; --force replaces only the VM's own "+
-						"domain or a stopped one; nothing was changed", targetName, s.hostName, du, spec.Uuid, why)
-			}
+		// --force replaces the VM's own domain (its uuid: domainIsVMsOwn),
+		// running or not, and any other domain of the name only when it is
+		// positively stopped, keeping that one's NVRAM and vTPM state (its
+		// disks are not touched), as a create removes a stopped domain with
+		// no record. One that runs, or whose state cannot be read, is another
+		// guest, never this promotion's to stop. For a renamed promotion no
+		// row of the name exists (checked above) and the VM's identity is the
+		// fresh uuid minted for it, so only a stopped leftover is replaced.
+		// The verdict is taken again just before the replace (replaceVerdict).
+		if _, verr := replaceVerdict(); verr != nil {
+			return verr
 		}
 		replaceDomain = true
 	}
@@ -1657,8 +1674,23 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			// leaving the live domain to collide on UUID at DefineDomain. (In a
 			// real failover the VM ran on the fenced host, so the promotion
 			// host has no such domain and this is a no-op.)
-			_ = s.virt.DestroyDomain(targetName)
-			_ = s.virt.UndefineDomain(targetName, false)
+			// The verdict is taken again first: the build took time, and a
+			// stopped domain that is not the VM's may run by now. One that is
+			// not the VM's is never sent a stop, and keeps its NVRAM and vTPM
+			// state.
+			if s.virt.DomainExists(targetName) {
+				own, verr := replaceVerdict()
+				if verr != nil {
+					removeLive()
+					return verr
+				}
+				if own {
+					_ = s.virt.DestroyDomain(targetName)
+					_ = s.virt.UndefineDomain(targetName, false)
+				} else {
+					_ = s.virt.UndefineDomainPreservingState(targetName)
+				}
+			}
 		}
 		// attempt defines and starts the domain on disks; stage names the
 		// step that failed.

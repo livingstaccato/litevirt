@@ -457,18 +457,12 @@ func (f *Fake) DefineDomain(xmlConfig string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	// libvirt gives every domain a uuid: one whose XML names none gets a
-	// generated one (the fake keeps an existing domain's on a redefine of
-	// the name, where libvirt would refuse the random one it generated). A
-	// test then sees the identity a real host would report.
+	// generated one, so a redefine of an existing name with no uuid is
+	// refused there (the generated one is not the domain's: the name check
+	// below), and so it is here. A test then sees the identity a real host
+	// would report.
 	if domainUUIDFromXML(xmlConfig) == "" {
-		u := ""
-		if _, ok := f.domains[name]; ok {
-			u = domainUUIDFromXML(f.liveXMLLocked(name))
-		}
-		if u == "" {
-			u = randomUUID()
-		}
-		xmlConfig = insertUUID(xmlConfig, name, u)
+		xmlConfig = insertUUID(xmlConfig, name, randomUUID())
 	}
 	// libvirt refuses a definition whose UUID is already held by an ACTIVE domain
 	// under a different name. That is exactly what happens after undefining a
@@ -483,6 +477,13 @@ func (f *Fake) DefineDomain(xmlConfig string) error {
 			}
 			if domainUUIDFromXML(f.liveXMLLocked(other)) == uuid {
 				return fmt.Errorf("libvirtfake: domain %q is already active with uuid %s", other, uuid)
+			}
+		}
+		// An inactive domain of another name holds its uuid just as firmly:
+		// libvirt refuses it too ("already defined with uuid").
+		for other := range f.domains {
+			if other != name && domainUUIDFromXML(f.liveXMLLocked(other)) == uuid {
+				return fmt.Errorf("libvirtfake: domain %q is already defined with uuid %s", other, uuid)
 			}
 		}
 		// libvirt also refuses a definition that reuses an existing domain's NAME
@@ -2965,12 +2966,19 @@ func randomUUID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-// insertUUID puts <uuid>u</uuid> right after the domain's <name>.
+// insertUUID puts <uuid>u</uuid> right after the domain's <name>, or, where
+// that is not spelled so, right after the <domain> element's opening tag.
 func insertUUID(xmlConfig, name, u string) string {
 	tag := "<name>" + name + "</name>"
 	if i := strings.Index(xmlConfig, tag); i >= 0 {
 		j := i + len(tag)
 		return xmlConfig[:j] + "<uuid>" + u + "</uuid>" + xmlConfig[j:]
+	}
+	if i := strings.Index(xmlConfig, "<domain"); i >= 0 {
+		if j := strings.Index(xmlConfig[i:], ">"); j >= 0 {
+			k := i + j + 1
+			return xmlConfig[:k] + "<uuid>" + u + "</uuid>" + xmlConfig[k:]
+		}
 	}
 	return xmlConfig
 }

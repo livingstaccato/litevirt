@@ -660,6 +660,34 @@ func (f *FirmwareStore) QuarantineLeftoverFirmwareState(vmName, uuid, stage, fin
 	return f.quarantineStaged(vmName, uuid, stage, final, reason, true, uuid != "")
 }
 
+// StageLeftoverFirmwareState is the first half of
+// QuarantineLeftoverFirmwareState: the state moves into stage and reason.txt
+// is written there durably, and stage keeps its name. While it does, the
+// guard refuses the VM's start, resume and define (FirmwareStaged), so the
+// reconciler undefines the leftover between the two halves and a failed
+// undefine never leaves a defined domain with empty firmware paths unguarded
+// (D2-18 verify, m-A). FinishStage is the second half.
+func (f *FirmwareStore) StageLeftoverFirmwareState(vmName, uuid, stage string, reason []byte) error {
+	if err := f.moveGuard().check(FirmwareCall{Op: OpWipe, Name: vmName, UUID: uuid}); err != nil {
+		return fmt.Errorf("quarantine firmware state of %s: %w", vmName, err)
+	}
+	return f.stageParts(vmName, uuid, stage, reason, true, uuid != "")
+}
+
+// FinishStage renames a stage whose state and reason.txt are in place to
+// final in one step and makes that entry durable.
+func (f *FirmwareStore) FinishStage(stage, final string) error {
+	if _, err := os.Lstat(final); err == nil {
+		return fmt.Errorf("finish %s: %s already exists", stage, final)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := quarantineFinish(stage, final); err != nil {
+		return fmt.Errorf("finish %s: %w", stage, err)
+	}
+	return quarantineSync(filepath.Dir(final))
+}
+
 // quarantineStaged is QuarantineLeftoverFirmwareState once the guard allowed
 // it, for the parts named: the NVRAM and/or the swtpm tree of uuid.
 func (f *FirmwareStore) quarantineStaged(vmName, uuid, stage, final string, reason []byte, nvram, swtpm bool) error {
@@ -668,6 +696,21 @@ func (f *FirmwareStore) quarantineStaged(vmName, uuid, stage, final string, reas
 	} else if !os.IsNotExist(err) {
 		return err
 	}
+	if err := f.stageParts(vmName, uuid, stage, reason, nvram, swtpm); err != nil {
+		return err
+	}
+	if err := quarantineFinish(stage, final); err != nil {
+		return fmt.Errorf("quarantine %s: %w", vmName, err)
+	}
+	if err := quarantineSync(filepath.Dir(final)); err != nil {
+		return fmt.Errorf("quarantine %s: fsync %s: %w", vmName, filepath.Dir(final), err)
+	}
+	return nil
+}
+
+// stageParts moves the named parts into stage and writes reason.txt there
+// durably.
+func (f *FirmwareStore) stageParts(vmName, uuid, stage string, reason []byte, nvram, swtpm bool) error {
 	if nvram && swtpm {
 		if err := f.quarantineMoveState(vmName, uuid, stage); err != nil {
 			return err
@@ -703,12 +746,6 @@ func (f *FirmwareStore) quarantineStaged(vmName, uuid, stage, final string, reas
 	}
 	if err := writeQuarantineFile(filepath.Join(stage, "reason.txt"), reason); err != nil {
 		return fmt.Errorf("quarantine %s: reason.txt: %w", vmName, err)
-	}
-	if err := quarantineFinish(stage, final); err != nil {
-		return fmt.Errorf("quarantine %s: %w", vmName, err)
-	}
-	if err := quarantineSync(filepath.Dir(final)); err != nil {
-		return fmt.Errorf("quarantine %s: fsync %s: %w", vmName, filepath.Dir(final), err)
 	}
 	return nil
 }
@@ -807,6 +844,15 @@ func (f *FirmwareStore) RestoreFirmwareQuarantine(vmName, uuid, from, restoring,
 		}
 		if err := quarantineSync(filepath.Dir(mv.to)); err != nil {
 			return fmt.Errorf("restore firmware state of %s: fsync %s: %w", vmName, filepath.Dir(mv.to), err)
+		}
+	}
+	if swtpm != "" && has(swtpm) {
+		// As ReadFirmwareBundle: libvirt relabels the tpm2/ contents at
+		// start but not the per-uuid parent, and a copy across filesystems
+		// made it 0700; swtpm must traverse it (D2-18 verify, m-C). A rename
+		// kept libvirt's own mode, and this changes nothing then.
+		if err := os.Chmod(swtpm, 0o711); err != nil {
+			return fmt.Errorf("restore firmware state of %s: chmod %s: %w", vmName, swtpm, err)
 		}
 	}
 	for _, p := range []string{filepath.Join(restoring, "nvram"), filepath.Join(restoring, "swtpm")} {

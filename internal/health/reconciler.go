@@ -1395,12 +1395,22 @@ func (r *Reconciler) quarantineLeftoverFirmware(domName string, vm *corrosion.VM
 		"reason: the reconciler cleaned a shut-off leftover whose row names another host; its firmware state is kept here\n"+
 		"retention: kept while VM %s exists; once it is gone, removed after superseded_disk_retention_days (lv host superseded-disks lists it)\n",
 		domName, uuidLine, r.hostName, vm.HostName, now.UTC().Format(time.RFC3339), domName)
-	if err := r.fwStore.QuarantineLeftoverFirmwareState(domName, uuid, stage, final, []byte(reason)); err != nil {
-		slog.Warn("reconciler: leftover kept: its firmware state cannot be quarantined", "vm", domName, "dir", final, "error", err)
+	// Stage, undefine, then finish (D2-18 verify, m-A): while the stage
+	// exists the guard refuses the VM's start, so a failed or interrupted
+	// undefine leaves a defined domain whose start is refused, never one that
+	// boots on blank firmware state. The next pass retries the undefine; a
+	// crash after it leaves an orphaned stage, which finishOrphanedStages
+	// finishes.
+	if err := r.fwStore.StageLeftoverFirmwareState(domName, uuid, stage, []byte(reason)); err != nil {
+		slog.Warn("reconciler: leftover kept: its firmware state cannot be quarantined", "vm", domName, "dir", stage, "error", err)
 		return true
 	}
 	if err := r.virt.UndefineDomainPreservingState(domName); err != nil {
-		slog.Warn("reconciler: undefine the quarantined leftover keeping its state", "vm", domName, "error", err)
+		slog.Warn("reconciler: undefine the quarantined leftover keeping its state; its state stays staged", "vm", domName, "stage", stage, "error", err)
+		return true
+	}
+	if err := r.fwStore.FinishStage(stage, final); err != nil {
+		slog.Warn("reconciler: finish the leftover's quarantine; a later pass finishes it as an orphaned stage", "vm", domName, "stage", stage, "error", err)
 		return true
 	}
 	slog.Warn("reconciler: a leftover's firmware state was quarantined, not wiped", "vm", domName, "row_host", vm.HostName, "dir", final)
@@ -1470,6 +1480,26 @@ func (r *Reconciler) finishOrphanedStages() {
 		}
 		slog.Warn("reconciler: finished an orphaned firmware quarantine stage", "vm", vm, "dir", final, "why", why)
 	}
+}
+
+// stagedOwnFirmware reports whether a stage of vm's firmware state is on
+// this host (by name or by the spec's uuid), logging it. A quarantine
+// directory that cannot be read counts as one.
+func (r *Reconciler) stagedOwnFirmware(vm corrosion.VMRecord) bool {
+	if r.fwStore == nil {
+		return false
+	}
+	staged, err := fwmig.New(r.fwStore.DataDir).Staged(vm.Name, specUUIDOf(vm.Spec))
+	if err != nil {
+		slog.Warn("reconciler: not starting the VM: its firmware quarantine directory cannot be read", "vm", vm.Name, "error", err)
+		return true
+	}
+	if len(staged) == 0 {
+		return false
+	}
+	slog.Warn("reconciler: not starting the VM: its firmware state is in a stage, not in place; `lv host superseded-disks <host> --restore <dir>` puts it back",
+		"vm", vm.Name, "dir", staged[0].Path)
+	return true
 }
 
 func uuidOrNone(u string) string {
@@ -1605,6 +1635,13 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// A VM a live firmware move's record names here is not started (and its
 	// domain not redefined) by the reconciler (spec §6.9).
 	if r.firmwareMoveSkip(vm.Name, specUUIDOf(vm.Spec), "start") {
+		return
+	}
+	// The VM's own firmware state sits in a stage (an unfinished quarantine,
+	// an interrupted restore): its domain is neither started, destroyed nor
+	// undefined here, so the stage is never finished away as orphaned and the
+	// VM never boots on blank state (D2-18 verify, m-B). --restore ends it.
+	if r.stagedOwnFirmware(vm) {
 		return
 	}
 	// A start that would be deferred for want of time is left as it is

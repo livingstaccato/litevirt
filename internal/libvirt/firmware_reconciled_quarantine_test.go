@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
@@ -213,6 +214,33 @@ func TestRestoreFirmwareQuarantine(t *testing.T) {
 		}
 		if _, err := os.Lstat(filepath.Join(q, "vm1-reconciled-300")); !os.IsNotExist(err) {
 			t.Errorf("the rerun set aside state the restore had already put back (%v)", err)
+		}
+	})
+	// D2-18 verify, m-C: a swtpm tree restored across filesystems is
+	// recreated 0700; the per-uuid directory is made 0711 so swtpm can
+	// traverse it. Mutation: drop the chmod — red.
+	t.Run("cross_fs_swtpm_mode", func(t *testing.T) {
+		e, q, from := setup(t)
+		restoring, stage, final := filepath.Join(q, "vm1-restoring-"+fwTestUUID), filepath.Join(q, "vm1-reconciling-"+fwTestUUID), filepath.Join(q, "vm1-reconciled-200")
+		defer func(r func(string, string) error) { quarantineRename = r }(quarantineRename)
+		quarantineRename = func(o, n string) error {
+			if o == filepath.Join(restoring, "swtpm") {
+				return &os.LinkError{Op: "rename", Old: o, New: n, Err: syscall.EXDEV}
+			}
+			return os.Rename(o, n)
+		}
+		if err := e.store.RestoreFirmwareQuarantine(fwTestVM, fwTestUUID, from, restoring, stage, final, []byte("r")); err != nil {
+			t.Fatal(err)
+		}
+		fi, err := os.Stat(e.store.SwtpmDir(fwTestUUID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm() != 0o711 {
+			t.Fatalf("restored swtpm dir mode %v, want 0711", fi.Mode().Perm())
+		}
+		if permall(e) != "NEWERP" {
+			t.Errorf("restored permall %q", permall(e))
 		}
 	})
 	t.Run("finish_orphaned_stage", func(t *testing.T) {

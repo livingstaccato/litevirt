@@ -862,11 +862,16 @@ func (s *Server) doctorAdoptOwnLeftover(ctx context.Context, l fwmig.Leftover, a
 	if len(newer) > 0 {
 		where = strings.Join(newer, "; ")
 	}
+	// The sequence that brings another copy back (D2-18 verify, m-D): the
+	// restore is refused on this host while the leftover record stands, and
+	// on another host until the VM is placed there.
+	steps := fmt.Sprintf("to run another copy instead: (1) `lv doctor firmware-move %[1]s --adopt-target-copy --acknowledge-rollback` drops the record (do not start the VM); "+
+		"(2) for a directory on another host H, `lv migrate %[1]s H --cold`; (3) `lv host superseded-disks H --restore <dir>`; (4) `lv start %[1]s`", vm)
 	if !ack {
 		return "", status.Errorf(codes.FailedPrecondition,
 			"VM %q: the leftover on %s is %s; whatever the VM wrote since, on %s or a later host, is newer, and keeping the leftover rolls its TPM and NVRAM back to then. "+
-				"Newer copies: %s. Bring one back with `lv host superseded-disks <host> --restore <dir>` on the host the VM is placed on, or add --acknowledge-rollback to keep the leftover",
-			vm, s.hostName, age, l.Source, where)
+				"Other copies, possibly newer (check their dates): %s. To keep the leftover, add --acknowledge-rollback; %s",
+			vm, s.hostName, age, l.Source, where, steps)
 	}
 	if s.virt == nil {
 		return "", status.Errorf(codes.Unavailable, "VM %q: no libvirt connection", vm)
@@ -915,8 +920,12 @@ func (s *Server) doctorAdoptOwnLeftover(ctx context.Context, l fwmig.Leftover, a
 	if !td.Present {
 		kept = "no domain of it is defined here; its NVRAM and TPM state, if any, are kept"
 	}
-	return fmt.Sprintf("VM %q: the leftover record of attempt %s on %s is dropped, and %s as the VM's own (its row names %s for this incarnation); it is %s (rollback acknowledged; newer copies: %s); nothing was deleted: `lv start %s` starts it",
-		vm, l.Attempt, s.hostName, kept, s.hostName, age, where, vm), nil
+	next := fmt.Sprintf("`lv start %s` starts it", vm)
+	if len(newer) > 0 {
+		next = "do not start the VM until you have chosen between the leftover and the other copies; to run another copy, " + steps[strings.Index(steps, "(2)"):]
+	}
+	return fmt.Sprintf("VM %q: the leftover record of attempt %s on %s is dropped, and %s as the VM's own (its row names %s for this incarnation); it is %s (rollback acknowledged; other copies, possibly newer: %s); nothing was deleted: %s",
+		vm, l.Attempt, s.hostName, kept, s.hostName, age, where, next), nil
 }
 
 // waitShutOff waits up to fwDoctorStopWait for vm's domain to shut off.

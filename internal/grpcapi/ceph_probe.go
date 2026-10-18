@@ -268,8 +268,8 @@ func cephStorageDown(vm string, own bool) error {
 // managed to purge, which still uses the pool's capacity; one HELD because a
 // client has it open (it may be a running VM's disk: restore it); one a
 // failed move left both in the trash and under its name; a purge queue file
-// set aside as unreadable; and a litevirt image in a pool's trash that no
-// purge here tracks.
+// found unreadable (set aside, or left in place); and a litevirt image in a
+// pool's trash that no purge here tracks.
 const condCephTrashLeftover = "ceph_trash_leftover"
 
 // CephTrashScanInterval is how often the ceph secret loop scans the pools'
@@ -427,7 +427,7 @@ func (s *Server) judgeCephTrash(ctx context.Context) {
 	ev, _ := json.Marshal(map[string]any{
 		"host": s.hostName, "leftovers": list, "unreadable_queue_files": aside,
 		"detail": fmt.Sprintf("in the ceph pools' trash: %d image(s) moved there by %s and not purged yet (retried), %d held, or not yet settled, because a client may still use them (check, then restore them), "+
-			"%d litevirt image(s) no purge here tracks; and %d purge queue file(s) set aside as unreadable, whose images are no longer tracked (check the pools' trash with rbd trash ls --all --long)",
+			"%d litevirt image(s) no purge here tracks; and %d purge queue file(s) found unreadable and set aside (or left in place when they could not be moved), whose images are no longer tracked (check the pools' trash with rbd trash ls --all --long)",
 			retrying, s.hostName, held, len(untracked), len(aside)),
 	})
 	row.Evidence = string(ev)

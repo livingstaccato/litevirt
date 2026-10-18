@@ -14,6 +14,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // Breaker minor 1. A VM whose own probe got no answer keeps its own record
@@ -168,5 +169,60 @@ func TestCephImageLeftover_DetailAllowsForAClonesParent(t *testing.T) {
 	_, _, ev := keptCondition(t, f)
 	if !strings.Contains(ev, "clone") {
 		t.Fatalf("detail %s, want it to allow for a clone's parent", ev)
+	}
+}
+
+// Review I-1. A kept image the deleting VM's own rows still name — its delete
+// records before it tombstones them — is not forgotten: it is named once
+// those rows are gone.
+//
+// Mutation "any naming row forgets" (the round-0 rule): red.
+func TestCephImageLeftover_TheDeletingVMsOwnRowsDoNotForgetIt(t *testing.T) {
+	f := newCephPoolFixture(t)
+	ctx := context.Background()
+	vm := f.insertCephVM(t, "own", "test-host")
+	disks, _ := corrosion.GetVMDisks(ctx, f.s.db, vm.Name)
+	var data *corrosion.DiskRecord
+	for i := range disks {
+		if disks[i].DiskName == "data" {
+			data = &disks[i]
+		}
+	}
+	if _, ok := f.s.recordKeptCephImage(vm.Name, data, errors.New("in use")); !ok {
+		t.Fatal("fixture: not recorded")
+	}
+	f.s.judgeCephImages(ctx)
+	if recs := f.s.keptRecords(); len(recs) != 1 {
+		t.Fatalf("records %+v: the deleting VM's own row forgot the kept image", recs)
+	}
+	if err := f.s.db.Execute(ctx, `UPDATE vm_disks SET deleted_at = ? WHERE vm_name = ?`, time.Now().UTC().Format(time.RFC3339), vm.Name); err != nil {
+		t.Fatal(err)
+	}
+	f.s.judgeCephImages(ctx)
+	if open, images, ev := keptCondition(t, f); !open || images["lv/own-data"] == "" {
+		t.Fatalf("after the delete's tombstone: open %v, %s", open, ev)
+	}
+}
+
+// Review m-6. A queue file that could not be moved aside is not described
+// as set aside.
+func TestCephTrashLeftover_AnUnmovedQueueFileIsNotCalledSetAside(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root renames in a read-only directory")
+	}
+	f := newCephPoolFixture(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "ceph-trash-purges.json"), []byte("[{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	_ = storage.ResumeCephPurges(dir)
+	f.s.judgeCephTrash(context.Background())
+	row, _, _ := corrosion.GetHealthCondition(context.Background(), f.s.db, cephPoolEvaluator, condCephTrashLeftover, "host", "test-host")
+	if !strings.Contains(row.Evidence, "left in place") {
+		t.Fatalf("evidence %s, want an unmoved file described as left in place", row.Evidence)
 	}
 }

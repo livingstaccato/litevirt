@@ -300,11 +300,18 @@ func (s *Server) recheckKeptCephImages(ctx context.Context) {
 func (s *Server) judgeCephImages(ctx context.Context) {
 	var left []cephKeptRecord
 	for _, r := range s.keptRecords() {
-		// Reattached: a VM's disk names it again, so it is that VM's disk,
-		// and no longer this delete's leftover: its record goes. A failed
-		// read keeps it named.
+		// A live disk names it: not a leftover now. Reattached — another
+		// VM's disk names it — it is that VM's disk, and its record goes.
+		// Named only by the deleting VM's own rows, the delete is still
+		// running (it records before it tombstones): the record is kept,
+		// and named once those rows are gone. A failed read keeps it named.
 		if rows, err := corrosion.DisksNamingRBDImage(ctx, s.db, r.Image); err == nil && len(rows) > 0 {
-			s.forgetKeptIf(r)
+			for _, d := range rows {
+				if d.VMName != r.VM {
+					s.forgetKeptIf(r)
+					break
+				}
+			}
 			continue
 		}
 		left = append(left, r)

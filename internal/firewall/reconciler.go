@@ -601,6 +601,16 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			return nb
 		}
 		armed := opts.Arming.Armed()
+		if len(armed) > 0 && opts.RunningTaps != nil {
+			// A VM that came here and has gone (its row names another host,
+			// libvirt has none of it running here) is not drawn any more.
+			if live, terr := taps.fetch(ctx, opts.RunningTaps, opts.TapTimeout); terr == nil {
+				if hosts, herr := vmRowHosts(ctx, db, armed); herr == nil {
+					opts.Arming.Settle(hostName, hosts, func(vm string) bool { return len(live[vm]) > 0 })
+					armed = opts.Arming.Armed()
+				}
+			}
+		}
 		ifaces, err := corrosion.ListHostVMNICs(ctx, db, hostName, armed...)
 		if err != nil {
 			return plan, err
@@ -1326,4 +1336,23 @@ func sysfsMaster(dev string) string {
 		}
 	}
 	return name
+}
+
+// vmRowHosts is the host each live VM of names has on its row; a name with no
+// live VM row (a container, a VM not created yet) is absent.
+func vmRowHosts(ctx context.Context, db *corrosion.Client, names []string) (map[string]string, error) {
+	args := make([]interface{}, len(names))
+	for i, n := range names {
+		args[i] = n
+	}
+	rows, err := db.Query(ctx, `SELECT name, COALESCE(host_name, '') AS host_name FROM vms
+		 WHERE deleted_at IS NULL AND name IN (?`+strings.Repeat(", ?", len(names)-1)+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(rows))
+	for _, r := range rows {
+		out[r.String("name")] = r.String("host_name")
+	}
+	return out, nil
 }

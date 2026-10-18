@@ -18,10 +18,13 @@ import (
 // before the guest's first frame (re-review I-10).
 //
 // An armed VM stays armed for armTTL — long enough for any start or migration
-// to finish, after which its row says where it runs.
+// to finish, after which its row says where it runs. One that arrived here and
+// then left (its row names another host, nothing of it runs here) is disarmed
+// by Settle at once.
 type Arming struct {
 	mu        sync.Mutex
 	armed     map[string]time.Time
+	arrived   map[string]bool // armed VMs whose row has named this host
 	pending   map[string][]corrosion.HostVMNIC
 	pendingCT map[string][]corrosion.ContainerInterfaceRecord
 	now       func() time.Time
@@ -31,7 +34,7 @@ const armTTL = 30 * time.Minute
 
 // NewArming returns an empty set.
 func NewArming() *Arming {
-	return &Arming{armed: map[string]time.Time{}, pending: map[string][]corrosion.HostVMNIC{},
+	return &Arming{armed: map[string]time.Time{}, arrived: map[string]bool{}, pending: map[string][]corrosion.HostVMNIC{},
 		pendingCT: map[string][]corrosion.ContainerInterfaceRecord{}, now: time.Now}
 }
 
@@ -74,6 +77,7 @@ func (a *Arming) Arm(vm string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.armed[vm] = a.now().Add(armTTL)
+	delete(a.arrived, vm)
 }
 
 // Disarm removes vm.
@@ -81,6 +85,32 @@ func (a *Arming) Disarm(vm string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	delete(a.armed, vm)
+	delete(a.arrived, vm)
+}
+
+// Settle disarms every armed VM that arrived here (a pass saw its row name
+// here) and whose row now names another host, once it no longer runs here.
+// rowHost is the host each armed VM's row names (a VM with no row is absent
+// and left alone); runsHere says whether libvirt has the VM's NICs running on
+// this host. A VM still running here, or one whose migration in has not landed
+// yet, stays armed until armTTL.
+func (a *Arming) Settle(here string, rowHost map[string]string, runsHere func(vm string) bool) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for vm := range a.armed {
+		h, ok := rowHost[vm]
+		switch {
+		case !ok:
+		case h == here:
+			a.arrived[vm] = true
+		case a.arrived[vm] && !runsHere(vm):
+			delete(a.armed, vm)
+			delete(a.arrived, vm)
+		}
+	}
 }
 
 // SetPending records vm's NICs whose rows are not written yet; ClearPending
@@ -111,6 +141,7 @@ func (a *Arming) Armed() []string {
 	for vm, until := range a.armed {
 		if now.After(until) {
 			delete(a.armed, vm)
+			delete(a.arrived, vm)
 			delete(a.pending, vm)
 			continue
 		}

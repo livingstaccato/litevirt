@@ -138,3 +138,19 @@ func TestDesiredNICsCarryTheLeasedAddress(t *testing.T) {
 		t.Fatalf("desired NICs = %+v, want address 7 carrying the leased 2001:db8::5", nics)
 	}
 }
+
+func TestDiffNeverClearsAnOperatorsPrimaryIP6WithoutALeasedIPv6(t *testing.T) {
+	// The mirror manages primary_ip6 only for a VM holding a leased IPv6
+	// address. An operator who set one by hand on an IPv4-only VM keeps it.
+	d := DesiredVM{Name: "vm-1", UUID: "u1", NICs: []DesiredNIC{
+		{Name: "eth0", MAC: "52:54:00:00:00:01", NetBoxIPID: 9, NetBoxIP: "10.0.5.9"},
+	}}
+	got := primaryActions(Diff([]DesiredVM{d}, Actual{
+		VMs: map[string]netbox.VirtualMachine{
+			vmIdent("u1"): {ID: 11, Name: "vm-1", Identity: vmIdent("u1"), PrimaryIP4ID: 9, PrimaryIP6ID: 55},
+		},
+	}, fp))
+	if v6, ok := got[opPrimaryIP6]; ok {
+		t.Fatalf("the mirror rewrote an operator's primary_ip6 on a VM with no leased IPv6: %+v", v6)
+	}
+}

@@ -1057,7 +1057,8 @@ at create time, and clears it when the NIC that held it is detached. "First NIC"
 is by NIC ordinal then MAC — the same order the guest sees — so the choice is
 stable across sweeps rather than drifting with API ordering. NetBox refuses an
 address of the wrong family in either field, so the family is the leased
-address's.
+address's. `primary_ip6` is only written while the VM holds a leased IPv6
+address; on a VM without one, a value set by hand in NetBox is left alone.
 
 If a host is modelled as a DCIM device whose name matches the litevirt host **and
 that device belongs to the NetBox cluster litevirt mirrors into**, the VM links

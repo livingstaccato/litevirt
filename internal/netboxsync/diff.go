@@ -529,7 +529,11 @@ func Diff(desired []DesiredVM, actual Actual, fingerprint string) []Action {
 				ParentNetBoxID: a.ID, IPID: want,
 			})
 		}
-		if want := desiredPrimaryIP(d, 6); want != a.PrimaryIP6ID {
+		// primary_ip6 is managed ONLY while the VM holds a leased IPv6 address.
+		// Before primary_ip6 was mirrored at all, an operator could set it by
+		// hand, and a VM with no IPv6 lease gives the mirror nothing to put
+		// there — so it leaves the operator's value alone rather than clear it.
+		if want := desiredPrimaryIP(d, 6); want != 0 && want != a.PrimaryIP6ID {
 			out = append(out, Action{
 				Kind: "vm", Op: opPrimaryIP6, Key: vmID,
 				ParentNetBoxID: a.ID, IPID: want,

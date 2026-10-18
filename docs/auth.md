@@ -446,6 +446,7 @@ Built-in roles (seeded by `auth.SeedBuiltinRoles`):
 | Auditor | `*.read`, `audit.export` |
 | BackupOperator | `backup.*`, `snapshot.*`, `vm.read` |
 | NetworkAdmin | `network.*`, `lb.*`, `sg.*` |
+| ContainerRoot | `ct.exec`, `ctroot.exec` (exec in, and a compose image change of, a privileged or legacy-confined container; bind it on one container's path) |
 | PermissionAdmin | `perm.modify` (delegated administration; see below) |
 | NoAccess | (none): grants nothing and denies nothing (bindings are union-only); it keeps a principal bound, off its legacy-role fallback |
 
@@ -454,6 +455,17 @@ Built-in roles (seeded by `auth.SeedBuiltinRoles`):
 judgment call, so a binding granting only lifecycle verbs (e.g. VMOperator)
 cannot invoke it. Wildcard grants (`vm.*`, `*`) carry it; clusters on the
 legacy role model (no bindings) are unchanged — any operator may pass it.
+
+`lv ct exec` in a **privileged or legacy-confined container**, and a compose
+recreate that changes such a container's image, additionally require
+`ctroot.exec` on the container (`/projects/<p>/containers/<name>`). It is
+outside the `ct` namespace, so Operator's `ct.*` does not carry it: Admin holds
+it through `*`, and an Admin grants it for one container with
+`lv role grant ContainerRoot <principal> --path /projects/<p>/containers/<name>`.
+A delegated `PermissionAdmin` cannot grant it without holding it. Without
+bindings the floor is `admin`. Exec in an unprivileged container with default
+confinement needs `ct.exec` only, as before. See
+[containers.md](containers.md).
 
 A *binding* attaches a role to a principal at a path. With
 `--propagate` the binding applies to that path and all descendants —

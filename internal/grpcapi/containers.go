@@ -820,6 +820,19 @@ func (s *Server) ExecContainer(ctx context.Context, req *pb.ExecContainerRequest
 		s.audit(ctx, "ct.exec", req.Name, "permission denied: "+strings.Join(req.Argv, " "), "denied")
 		return nil, err
 	}
+	// In a privileged or legacy-confined container, exec is a host-level
+	// grant (requireContainerRoot), judged here from the resolved row: a
+	// forward runs on the owner as the peer.
+	if mode := rootContainerMode(*rec); mode != "" {
+		if err := s.requireContainerRoot(ctx, *rec); err != nil {
+			s.audit(ctx, "ct.exec", req.Name, "permission denied ("+mode+"): "+strings.Join(req.Argv, " "), "denied")
+			return nil, status.Errorf(codes.PermissionDenied,
+				"container %q is %s, so exec in it needs the Admin role or the ContainerRoot role on it "+
+					"(an Admin grants it with lv role grant ContainerRoot <principal> --path %s); "+
+					"or move it over first with lv ct convert --unprivileged --confinement default %s",
+				req.Name, mode, ctRBACPathFor(rec.Project, req.Name), req.Name)
+		}
+	}
 	if host != s.hostName {
 		c, conn, err := s.peerClient(ctx, host)
 		if err != nil {

@@ -181,8 +181,9 @@ var recreateMemberRead = corrosion.GetContainer
 //   - a privileged or legacy-confined mode the member already has is kept
 //     for whoever may deploy the stack when the recreate runs the same image
 //     (sameContainerImage), as on main; when the image changes, the deployer
-//     is choosing a new rootfs to run as host root, which needs the Admin
-//     role or ct.exec on the member (root inside it already).
+//     is choosing a new rootfs to run as host root, which needs what exec
+//     in the member needs: the Admin role or the ContainerRoot role on it
+//     (requireContainerRoot).
 //
 // The create's own caller-side checks (authorizeContainerCreate: ct.create,
 // the template's host-path authority, the opt-outs) run here too, on the
@@ -335,13 +336,14 @@ func sameContainerImage(rec corrosion.ContainerRecord, old corrosion.ContainerCr
 }
 
 // mayChangePrivilegedImage refuses a recreate that runs a new image in a
-// privileged or legacy-confined member for a caller who is neither Admin nor
-// holds ct.exec on the member (root inside it already).
+// privileged or legacy-confined member for a caller who may not exec in it
+// as root: neither Admin nor holding the ContainerRoot role on the member
+// (requireContainerRoot).
 func (s *Server) mayChangePrivilegedImage(ctx context.Context, name string, rec *corrosion.ContainerRecord, d *compose.VMDef, privileged bool) error {
 	if RequireRole(ctx, "admin") == nil {
 		return nil
 	}
-	if err := s.RequirePerm(ctx, ctRBACPathFor(rec.Project, name), "ct.exec", "operator"); err == nil {
+	if err := s.requireContainerRoot(ctx, *rec); err == nil {
 		return nil
 	}
 	what := "legacy-confined"
@@ -352,10 +354,10 @@ func (s *Server) mayChangePrivilegedImage(ctx context.Context, name string, rec 
 		fmt.Sprintf("project=%s %s image %q -> %q", rec.Project, what, rec.Image, d.Image), "denied")
 	return status.Errorf(codes.PermissionDenied,
 		"container %q is %s, and this deploy changes its image from %q to %q, which would run as root on the host; "+
-			"that needs the Admin role or ct.exec on it (root inside it already). The member was left as it is: "+
-			"deploy it with its current image, ask an Admin to deploy this change, or move it over first with "+
-			"lv ct convert --unprivileged --confinement default %s",
-		name, what, rec.Image, d.Image, name)
+			"that needs the Admin role or the ContainerRoot role on it (lv role grant ContainerRoot <principal> --path %s). "+
+			"The member was left as it is: deploy it with its current image, ask an Admin to deploy this change, "+
+			"or move it over first with lv ct convert --unprivileged --confinement default %s",
+		name, what, rec.Image, d.Image, ctRBACPathFor(rec.Project, name), name)
 }
 
 // noteKeptMemberSecurity records, as an audit event and a WARN, that a

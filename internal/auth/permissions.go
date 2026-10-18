@@ -99,6 +99,13 @@ func verbMatches(grants []string, verb string) bool {
 // (internal/grpcapi/role_delegation.go).
 const VerbPermModify = "perm.modify"
 
+// VerbContainerRoot is exec, and a compose image change, in a container that
+// runs as root on the host or with legacy confinement: a privileged one (no
+// user namespace) or a legacy-confined one. It is outside the ct namespace
+// so that ct.* (Operator) does not carry it; Admin holds it through "*", and
+// the ContainerRoot role grants it per container.
+const VerbContainerRoot = "ctroot.exec"
+
 // GrantCovers reports whether holding grant `held` covers grant `requested`:
 // every verb `requested` matches (verbMatches) is matched by `held` too. It
 // is the no-escalation test of a delegated grant, so it errs towards "no": a
@@ -643,6 +650,13 @@ var BuiltinRoles = []BuiltinRole{
 			"sg.*", // security groups
 		},
 		Description: "Networking and load balancing. No VM lifecycle access.",
+	},
+	{
+		Name:  "ContainerRoot",
+		Verbs: []string{"ct.exec", VerbContainerRoot},
+		Description: "Exec in, and a compose image change of, a privileged or legacy-confined container, which " +
+			"runs as root on the host or with nesting allowed. Bind it on one container's path, e.g. " +
+			"/projects/acme/containers/build; Operator's ct.* does not carry it.",
 	},
 	{
 		Name:  "PermissionAdmin",

@@ -669,9 +669,27 @@ so a stack that needs them says so; deploying it then needs the Admin role.
 A privileged stack member is a host-root grant to the image it runs: a compose
 recreate keeps its mode for anyone who may deploy the stack only while the
 image is unchanged (the image reference and the template, distro, release and
-arch it was built from). Changing the image needs the Admin role or `ct.exec`
-on the member, and is refused before the member is deleted (see
-[compose.md](compose.md)).
+arch it was built from). Changing the image needs the Admin role or the
+`ContainerRoot` role on the member, and is refused before the member is
+deleted (see [compose.md](compose.md)).
+
+**Exec in a privileged or legacy-confined container is the Admin's.** In a
+privileged container `lv ct exec` is a root shell on the host, and in a
+legacy-confined one it runs with nesting allowed, so it needs the Admin role
+or the `ContainerRoot` role on that container; `ct.exec`, which Operator
+holds, covers only an unprivileged container with default confinement. A
+container created before this release counts as privileged and legacy. An
+Admin grants one container to one principal:
+
+```bash
+lv role grant ContainerRoot user:pat@local --path /projects/acme/containers/build
+```
+
+or the container is moved over, after which Operators may exec in it again:
+
+```bash
+lv ct convert build --unprivileged --confinement default
+```
 
 **Existing containers keep their settings.** A container created before this
 release is privileged with legacy confinement and keeps running exactly as it

@@ -401,8 +401,9 @@ never given a silently unprivileged replacement; when the deployer is not an
 Admin, the daemon logs a WARN naming `lv ct convert` and, once the new
 container exists, records a `ct.recreate-security` audit event. A recreate
 that **changes the image** of such a member runs a rootfs of the deployer's
-choosing as root on the host, so it needs the Admin role or `ct.exec` on that
-member (root inside it already). An opt-out the member did not already have
+choosing as root on the host, so it needs what exec in that member needs:
+the Admin role or the `ContainerRoot` role on it (`ct.exec` is not
+enough; see [auth.md](auth.md)). An opt-out the member did not already have
 needs the Admin role. A recreate judges only the member on the host it
 targets, and only one that carries this stack's label; another stack's
 container of the same name is refused, not replaced. These refusals, and the

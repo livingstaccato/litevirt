@@ -515,7 +515,8 @@ func deleteSnapshot(v snapshotAPI, domainName, snapshotName string) error {
 			"so libvirt would unlink the disk it was taken of, under the VM's live layer; "+
 			"deleting its metadata only and keeping its files",
 			"vm", domainName, "snapshot", snapshotName)
-		return v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
+		return metadataOnlyDelete(v, snap, snapshotName,
+			"libvirt does not hold it as its current snapshot and it has no children, so libvirt would unlink the disk it was taken of")
 	}
 	// The other case libvirt cannot handle: a snapshot it would merge, whose
 	// overlay is not in the VM's live chain over the disk it was taken of.
@@ -530,9 +531,42 @@ func deleteSnapshot(v snapshotAPI, domainName, snapshotName string) error {
 		slog.Warn("snapshot delete: libvirt cannot merge this snapshot ("+why+"); "+
 			"deleting its metadata only and keeping its files",
 			"vm", domainName, "snapshot", snapshotName)
-		return v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
+		return metadataOnlyDelete(v, snap, snapshotName, "libvirt cannot merge it: "+why)
 	}
 	return v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteFlags(0))
+}
+
+// SnapshotFilesKeptError is what a snapshot delete that removed only the
+// snapshot's metadata returns once that delete succeeded: the delete is done,
+// and Files, the snapshot's overlays a merge would have removed, are all kept
+// (with the disks they were taken of), so their space is not reclaimed. No
+// data is lost. The caller reports it; it is not a failure.
+type SnapshotFilesKeptError struct {
+	Snapshot string
+	Reason   string
+	Files    []string
+}
+
+func (e *SnapshotFilesKeptError) Error() string {
+	return fmt.Sprintf("snapshot %q was deleted as metadata only (%s); its files are kept: %s",
+		e.Snapshot, e.Reason, strings.Join(e.Files, ", "))
+}
+
+// metadataOnlyDelete deletes snap's metadata only and, once that succeeds,
+// returns the SnapshotFilesKeptError naming its overlays (read before the
+// delete; none when its XML cannot be read).
+func metadataOnlyDelete(v snapshotAPI, snap golibvirt.DomainSnapshot, name, reason string) error {
+	var files []string
+	if x, err := v.DomainSnapshotGetXMLDesc(snap, 0); err == nil {
+		for _, f := range parseSnapshotOverlays(x) {
+			files = append(files, f)
+		}
+		sort.Strings(files)
+	}
+	if err := v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly); err != nil {
+		return err
+	}
+	return &SnapshotFilesKeptError{Snapshot: name, Reason: reason, Files: files}
 }
 
 // notInLiveChain says why libvirt cannot merge the snapshot — an external

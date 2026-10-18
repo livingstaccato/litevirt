@@ -1001,12 +1001,15 @@ rather than unlink. Two cases keep every file:
 - the delete is **refused**, naming the VMs, while another VM (a linked clone)
   backs on the snapshot's overlay or on the disk it was taken of;
 - a snapshot libvirt does not hold as current and that has no children — as
-  a restore by an earlier build left one — is deleted as metadata only, with a
-  warning in the log: the VM keeps its backing chain, and the space is not
-  reclaimed;
+  a restore by an earlier build left one — is deleted as metadata only: the VM
+  keeps its backing chain, and the space is not reclaimed;
 - so is a snapshot libvirt cannot merge because its overlay is no longer in
   the VM's live chain. Restoring an older snapshot while a later one exists
   leaves the restored one so: its overlay file stays on disk, unused.
+
+A metadata-only delete says so: `lv snapshot rm` prints a warning naming the
+files it kept and their size, and the VM gets the event `snapshot.files-kept`
+(`lv events <vm>`). Nothing is lost, and no `lv` command reclaims that space.
 
 Restoring an older snapshot while a later one exists puts the VM on a new
 overlay (`<disk>.<snapshot>-r<time>`) directly on the disk that snapshot was

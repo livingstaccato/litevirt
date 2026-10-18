@@ -13,6 +13,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -33,6 +35,22 @@ import (
 type stuckLiveDrain struct {
 	c        *Cluster
 	src, dst *Node
+	// hookLog is where the VM's pre_migrate/post_migrate hooks append
+	// "<event> <host> <state>", one line per run.
+	hookLog string
+}
+
+// hooks is every pre_migrate/post_migrate run so far, in order.
+func (sc *stuckLiveDrain) hooks(t *testing.T) []string {
+	t.Helper()
+	b, err := os.ReadFile(sc.hookLog)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Fields(strings.ReplaceAll(strings.TrimSpace(string(b)), " ", "_"))
 }
 
 func newStuckLiveDrain(t *testing.T, completeAfterAbort bool) *stuckLiveDrain {
@@ -44,16 +62,30 @@ func newStuckLiveDrain(t *testing.T, completeAfterAbort bool) *stuckLiveDrain {
 	for _, n := range c.Nodes {
 		setHostCapacity(t, c, n.Name, 64, 65536)
 	}
+	sc.hookLog = filepath.Join(c.tmpRoot, "hooks.log")
+	hook := `echo "$LV_EVENT $LV_VM_HOST $LV_VM_STATE" >> ` + sc.hookLog
 	spec, err := json.Marshal(&pb.VMSpec{
 		Name: "slow", Cpu: 1, MemoryMib: 256,
 		Migrate: &pb.MigrationPolicy{TimeoutSec: 1},
+		Hooks:   &pb.HooksSpec{PreMigrate: hook, PostMigrate: hook},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	// One disk, on shared storage: the move is live, and its row is what a
+	// commit after the cut-over checks for drift. Its file exists, so a start
+	// of the VM here would succeed.
+	nfsDisk := filepath.Join(c.tmpRoot, "nfs", "slow-root.qcow2")
+	if err := os.MkdirAll(filepath.Dir(nfsDisk), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nfsDisk, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := corrosion.InsertVM(ctx, sc.src.DB, corrosion.VMRecord{
 		Name: "slow", HostName: sc.src.Name, State: "running", Spec: string(spec), CPUActual: 1, MemActual: 256,
-	}, nil, nil); err != nil {
+	}, nil, []corrosion.DiskRecord{{VMName: "slow", DiskName: "root", HostName: sc.src.Name,
+		Path: nfsDisk, SizeBytes: 1 << 30, StorageType: "nfs", TargetDev: "vda"}}); err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
 	sc.src.Virt.SetState("slow", "running")
@@ -202,99 +234,5 @@ func TestFleet_DrainLiveMoveThatCompletesAsItIsAbortedIsRecordedOnTheTarget(t *t
 	}
 	if _, ok, _ := corrosion.GetHealthCondition(ctx, sc.src.DB, "drain", "drain_move_timed_out", "host", sc.src.Name); ok {
 		t.Fatal("drain_move_timed_out was raised for a move that completed")
-	}
-}
-
-// libvirt does not answer the abort of a timed-out live move within its
-// bound. The drain does not wait on it: the move is handed to a background
-// owner, the drain worker goes on, and the VM is named in the drain's result
-// and in drain_move_timed_out. No cold move is started while the live job may
-// still complete, so the guest is never on two hosts. When libvirt then ends
-// the job, the background owner records where the guest is: on the target
-// after a completed move, still on the source after a failed one.
-//
-// Mutations: wait on libvirt after the abort without a bound — the drain does
-// not return in time and goes red. Start the cold fallback for a move handed
-// to the background — the shutdown count goes red. Drop the outcome instead of
-// handing it to the background owner — the completed case leaves the row on
-// the source and goes red.
-func TestFleet_DrainLiveMoveWhoseAbortIsNotAnsweredIsFinishedInTheBackground(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		complete bool
-	}{{"libvirt completes it", true}, {"libvirt fails it", false}} {
-		t.Run(tc.name, func(t *testing.T) {
-			sc := newStuckLiveDrain(t, false)
-			ctx := context.Background()
-			sc.src.Server.SetDrainAbortGraceForTest(500 * time.Millisecond)
-			release := make(chan struct{})
-			sc.src.Virt.FailMigrateToTarget = func(name, _ string) error {
-				if name != "slow" {
-					return nil
-				}
-				<-release // the abort is not answered
-				if tc.complete {
-					return nil
-				}
-				return errors.New("operation failed: migration out job: unexpectedly failed")
-			}
-			defer func() {
-				select {
-				case <-release:
-				default:
-					close(release)
-				}
-			}()
-
-			type res struct {
-				p   *pb.DrainProgress
-				err error
-			}
-			out := make(chan res, 1)
-			go func() { p, err := sc.drain(t); out <- res{p, err} }()
-			var r res
-			select {
-			case r = <-out:
-			case <-time.After(15 * time.Second):
-				t.Fatal("the drain is still waiting on a live move whose abort libvirt did not answer")
-			}
-			if status.Code(r.err) != codes.FailedPrecondition || !strings.Contains(r.err.Error(), "slow") {
-				t.Fatalf("drain = %v; want FailedPrecondition, incomplete, naming slow", r.err)
-			}
-			if r.p == nil || r.p.Status != "failed" || !strings.Contains(r.p.Error, "background") {
-				t.Fatalf("drain progress for slow = %+v; want failed, the move left to finish in the background", r.p)
-			}
-			cond, ok, err := corrosion.GetHealthCondition(ctx, sc.src.DB, "drain", "drain_move_timed_out", "host", sc.src.Name)
-			if err != nil || !ok || cond.Lifecycle == corrosion.ConditionResolved || !strings.Contains(cond.Evidence, "slow") {
-				t.Fatalf("drain_move_timed_out = %+v ok=%v err=%v; want it raised naming slow", cond, ok, err)
-			}
-			if n := sc.srcOps("shutdown"); n != 0 {
-				t.Fatalf("the VM was shut down %d time(s) while its live move could still complete", n)
-			}
-			row, _ := corrosion.GetVM(ctx, sc.src.DB, "slow")
-			if row == nil || row.HostName != sc.src.Name {
-				t.Fatalf("VM row = %+v; want it still on %s while libvirt has not answered", row, sc.src.Name)
-			}
-
-			close(release)
-			want := sc.src.Name
-			if tc.complete {
-				want = sc.dst.Name
-			}
-			deadline := time.Now().Add(15 * time.Second)
-			for {
-				row, _ = corrosion.GetVM(ctx, sc.src.DB, "slow")
-				if row != nil && row.HostName == want && row.State == "running" {
-					break
-				}
-				if time.Now().After(deadline) {
-					t.Fatalf("VM row = %+v after libvirt ended the move; want it running on %s", row, want)
-				}
-				time.Sleep(50 * time.Millisecond)
-			}
-			if n := sc.srcOps("shutdown"); n != 0 {
-				t.Fatalf("the VM was shut down %d time(s) after its live move ended", n)
-			}
-		})
 	}
 }

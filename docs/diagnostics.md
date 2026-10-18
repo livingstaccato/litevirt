@@ -2689,10 +2689,13 @@ VM's migration policy `timeout-sec` and was aborted. Each keeps running on
 that host; the drain did not shut it down for a cold move. One whose abort
 libvirt did not answer is finished in the background and ends on that host or
 on its target (its drain result says which may happen; `lv events <vm>` shows
-where it ended). Raise the VM's
+where it ended); one that completes there leaves the condition. The evidence
+lists the VMs (`vms`) and what to do (`detail`). Raise the VM's
 `timeout-sec`, move it with `lv migrate <vm> <target-host>`, or stop it with
 `lv stop <vm>` and run `lv host drain <host>` again. The condition is resolved
-by a drain of the host that has no such move, and by `lv host undrain <host>`.
+by a drain of the host that has no such move, and by `lv host undrain <host>`;
+a VM whose move is still finishing in the background stays named until it
+ends.
 
 ### A VM's disk is missing on its own host (`vm_disk_missing`)
 

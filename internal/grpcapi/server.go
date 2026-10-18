@@ -368,6 +368,9 @@ type Server struct {
 	// abort of a timed-out live move before handing the move to a background
 	// owner (drainLiveMigrate). Zero means defaultDrainAbortGrace.
 	drainAbortGrace time.Duration
+	// drainCondMu serialises the judging of drain_move_timed_out with a
+	// background move's leaving it (judgeDrainTimeouts, forgetDrainTimeout).
+	drainCondMu sync.Mutex
 	// migrationNetwork is migration.network: the IPv4 CIDR a migration's data
 	// should travel on (migration_network.go). Empty means the host's cluster
 	// address. localIPs is a test seam for the host's own addresses.

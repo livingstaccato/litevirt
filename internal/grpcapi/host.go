@@ -423,13 +423,28 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 
 	// Collect migratable VMs.
 	var toMigrate []corrosion.VMRecord
+	var inFlight int
 	for _, vm := range vms {
-		if vm.State == "running" || vm.State == "stopped" {
+		switch vm.State {
+		case "running", "stopped":
 			toMigrate = append(toMigrate, vm)
+		case "migrating":
+			// A move of it is in flight — an earlier drain's finishing in the
+			// background, or an `lv migrate`. Nothing may start another.
+			inFlight++
+			if err := stream.Send(&pb.DrainProgress{VmName: vm.Name, Status: "skipped", Strategy: notMoved,
+				Error: "a move of this VM is in flight (an earlier drain's finishing in the background, or a migration); " +
+					"re-run drain once it ends (`lv events " + vm.Name + "`)"}); err != nil {
+				return err
+			}
 		}
 	}
 	if len(toMigrate) == 0 {
-		s.judgeDrainTimeouts(ctx, req.Name, nil)
+		s.judgeDrainTimeouts(ctx, req.Name, nil, true)
+		if inFlight > 0 {
+			return status.Errorf(codes.FailedPrecondition,
+				"drain incomplete: %d VM(s) on host %q have a move in flight; re-run drain once it ends", inFlight, req.Name)
+		}
 		return nil
 	}
 	// Highest compose migrate.priority first, ties in name order: targets are
@@ -476,7 +491,7 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	}
 
 	if len(drainJobs) == 0 {
-		s.judgeDrainTimeouts(ctx, req.Name, nil)
+		s.judgeDrainTimeouts(ctx, req.Name, nil, true)
 		return nil
 	}
 
@@ -525,18 +540,24 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	// timedOut: VMs whose live move was aborted at their migration policy's
 	// timeout. They keep running here.
 	var timedOut []string
+	// background: of timedOut, those whose move was handed to a background
+	// owner (libvirt did not answer the abort).
+	var background []string
 	// Drain records (failback.go) are written off this loop, after each frame:
 	// the release gate can take seconds, and a drain never waits for it.
 	addRecord, recordsQueued := s.startDrainRecords(ctx, len(drainJobs))
 	defer recordsQueued()
-	for range drainJobs {
+	for i := range drainJobs {
 		res := <-results
 		progress := res.progress
 		record := false
 		if progress.Status == "error" || progress.Status == "failed" {
 			failures++
-			if strings.HasPrefix(progress.Error, drainTimedOutPrefix) {
+			if isDrainTimedOut(progress) {
 				timedOut = append(timedOut, progress.VmName)
+				if strings.Contains(progress.Error, drainBackgroundMarker) {
+					background = append(background, progress.VmName)
+				}
 			}
 		} else if progress.Status == "done" && progress.Error != "" {
 			notStarted = append(notStarted, progress.VmName)
@@ -548,27 +569,46 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 			addRecord(res.record)
 		}
 		if serr != nil {
+			// The client went away; the moves already handed to the workers
+			// go on. Their outcomes are still judged, once all have ended.
+			left := len(drainJobs) - i - 1
+			go func(seen []string) {
+				for ; left > 0; left-- {
+					if r := <-results; isDrainTimedOut(r.progress) {
+						seen = append(seen, r.progress.VmName)
+					}
+				}
+				s.judgeDrainTimeouts(context.WithoutCancel(ctx), req.Name, seen, true)
+			}(timedOut)
 			return serr
 		}
 	}
 	recordsQueued()
-	s.judgeDrainTimeouts(ctx, req.Name, timedOut)
+	s.judgeDrainTimeouts(ctx, req.Name, timedOut, true)
 
 	// Check for VMs that were skipped (pinned, no placement target).
 	// If any VMs remain on the host, report a partial drain (#25).
 	remaining, _ := corrosion.ListVMs(ctx, s.db, "", req.Name)
 	var stillRunning int
 	for _, vm := range remaining {
-		if vm.State == "running" || vm.State == "stopped" {
+		if vm.State == "running" || vm.State == "stopped" || vm.State == "migrating" {
 			stillRunning++
 		}
 	}
 	if stillRunning > 0 {
 		if len(timedOut) > 0 {
+			var parts []string
+			if aborted := slices.DeleteFunc(slices.Clone(timedOut), func(v string) bool { return slices.Contains(background, v) }); len(aborted) > 0 {
+				parts = append(parts, "the live move of "+strings.Join(aborted, ", ")+
+					" reached its migration policy timeout and was aborted, and each keeps running here")
+			}
+			if len(background) > 0 {
+				parts = append(parts, "the timed-out move of "+strings.Join(background, ", ")+
+					" is finishing in the background, and each ends here or on its target")
+			}
 			return status.Errorf(codes.FailedPrecondition,
-				"drain incomplete: %d VM(s) remain on host %q; the live move of %s reached its migration policy timeout and was aborted, "+
-					"and each keeps running here (see each VM's result)",
-				stillRunning, req.Name, strings.Join(timedOut, ", "))
+				"drain incomplete: %d VM(s) remain on host %q; %s (see each VM's result)",
+				stillRunning, req.Name, strings.Join(parts, "; "))
 		}
 		return status.Errorf(codes.FailedPrecondition,
 			"drain incomplete: %d VM(s) remain on host %q (pinned, no eligible target, or not movable; see each VM's result)",
@@ -643,7 +683,14 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// It is MigrateVM's lock discipline: a migration that outlives this step
 	// takes the lock with it (migrateOwnedVM's adoption), and then this step
 	// must not release it.
-	unlock := releaseOnce(s.lockVM(vm.Name))
+	// Never waited for: a re-drain must not sit on a VM whose earlier move is
+	// finishing in the background (it holds this lock until libvirt ends it).
+	lockUnlock, locked := s.tryLockVM(vm.Name)
+	if !locked {
+		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped", Strategy: notMoved,
+			Error: "another operation on this VM is in progress (a move finishing in the background, or a backup); re-run drain once it ends"}
+	}
+	unlock := releaseOnce(lockUnlock)
 	adopted := false
 	defer func() {
 		if !adopted {
@@ -747,7 +794,13 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
 			Strategy: pb.MigrateStrategy_MIGRATE_LIVE, Error: "target admission refused: " + aerr.Error()}
 	}
-	defer migLease.release(ctx)
+	// The lease goes with a move handed to a background owner.
+	leaseHeld := true
+	defer func() {
+		if leaseHeld {
+			migLease.release(ctx)
+		}
+	}()
 
 	// Live migrate — every disk is on shared storage. (Ownership confirmed above.)
 	progress := &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Strategy: pb.MigrateStrategy_MIGRATE_LIVE}
@@ -798,6 +851,19 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	}
 	hspec := vmHooks(fresh)
 	pbVM := &pb.VM{Name: vm.Name, HostName: fresh.HostName, State: pb.VMState_VM_RUNNING}
+	// The row says migrating while libvirt may move the guest, as `lv migrate`
+	// writes it: the reconciler and the owner assertion leave such a row,
+	// and a commit after the cut-over that declines re-points it to the
+	// target (RepointMigratedVM). A `running` row whose domain libvirt has
+	// moved away would be restarted here — after a daemon restart, or a
+	// declined commit — while the guest runs on the target.
+	if err := corrosion.UpdateVMState(ctx, s.db, vm.Name, "migrating", "→ "+target.Name); err != nil {
+		s.noteStateWriteFail(corrosion.OpVMState, err)
+		s.cleanupFailedMigrationTarget(ctx, vm.Name, target.Name, nil)
+		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "error",
+			Strategy: pb.MigrateStrategy_MIGRATE_LIVE,
+			Error:    "could not record the move as in flight, so it was not started; the VM keeps running here: " + err.Error()}
+	}
 	hooks.Run(ctx, hooks.PreMigrate, pbVM, hspec)
 	// The target's NIC guards are armed for the guest (armMigrationTarget).
 	armed.apply(&mp)
@@ -810,12 +876,13 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		// as for an `lv migrate` that stopped waiting). Nothing here may act
 		// on the move — no target cleanup, no cold move — while it can still
 		// complete: the guest would then run on two hosts.
-		adopted = true
+		adopted, leaseHeld = true, false
 		s.adoptAbandonedMigration(context.WithoutCancel(ctx), fresh, target.Name, false, disks, pending, unlock,
-			migrationFinish{target: &target, pbVM: pbVM, hspec: hspec, armed: armed})
+			migrationFinish{target: &target, pbVM: pbVM, hspec: hspec, armed: armed, lease: migLease, drainFrom: s.hostName})
 		detail := fmt.Sprintf("%s%ds, the VM's migration policy timeout_sec, and libvirt did not answer its abort within %s; "+
-			"the move is left to finish in the background, and %s ends running on %s or on %s, never on both (watch `lv events %s`)",
-			drainTimedOutPrefix, tuning.policy.GetTimeoutSec(), s.drainAbortGraceOrDefault(), vm.Name, s.hostName, target.Name, vm.Name)
+			"the move is left to %s, and %s ends running on %s or on %s, never on both (watch `lv events %s`)",
+			drainTimedOutPrefix, tuning.policy.GetTimeoutSec(), s.drainAbortGraceOrDefault(), drainBackgroundMarker,
+			vm.Name, s.hostName, target.Name, vm.Name)
 		s.recordVMEvent(context.WithoutCancel(ctx), vm.Name, "vm.migrated", "error", "drain: "+detail)
 		return &pb.DrainProgress{
 			VmName: vm.Name, TargetHost: target.Name, Status: "failed", Strategy: pb.MigrateStrategy_MIGRATE_LIVE,
@@ -857,6 +924,10 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	}
 	slog.Warn("live migration failed during drain, falling back to a cold move",
 		"vm", vm.Name, "error", lerr)
+	// libvirt ended the move with the guest here: the row leaves migrating
+	// (running while its domain runs, else error), as a failed `lv migrate`.
+	s.restoreSourceStateAfterFailedMigration(context.WithoutCancel(ctx), vm.Name,
+		fmt.Sprintf("drain move to %s failed: %v", target.Name, lerr), lerr.Error())
 	// The guest stayed here: take back the ISO this attempt put on the target,
 	// which only the attempt that made it may remove. The cold move puts its
 	// own there, and one that fails before it does would otherwise leave this
@@ -910,6 +981,16 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 // drainTimedOutPrefix begins the Error of a drain frame for a live move
 // aborted at its migration policy's timeout (drainLiveMigrate).
 const drainTimedOutPrefix = "live move did not finish within "
+
+// drainBackgroundMarker is in the Error of such a frame when libvirt did not
+// answer the abort and the move was handed to a background owner.
+const drainBackgroundMarker = "finish in the background"
+
+// isDrainTimedOut reports whether p is the frame of a live move aborted at
+// its migration policy's timeout.
+func isDrainTimedOut(p *pb.DrainProgress) bool {
+	return (p.Status == "failed" || p.Status == "error") && strings.HasPrefix(p.Error, drainTimedOutPrefix)
+}
 
 // defaultDrainAbortGrace bounds how long a drain waits for libvirt to answer
 // the abort of a timed-out live move (Server.drainAbortGrace overrides it).
@@ -978,19 +1059,97 @@ const (
 	drainEvaluator        = "drain"
 )
 
-// judgeDrainTimeouts raises or resolves host's drain_move_timed_out for the
-// VMs a drain of it timed out.
-func (s *Server) judgeDrainTimeouts(ctx context.Context, host string, vms []string) {
-	detail := ""
-	if len(vms) > 0 {
-		sort.Strings(vms)
-		detail = fmt.Sprintf("the live move of %s off %s did not finish within its migration policy's timeout_sec and was aborted; "+
-			"each keeps running on %s, unless libvirt did not answer its abort and the move is finishing in the background "+
-			"(see its drain result and `lv events <vm>`). Raise the timeout, move each with `lv migrate <vm> <target-host>`, or stop it and drain again",
-			strings.Join(vms, ", "), host, host)
+// drainTimeoutEvidence is drain_move_timed_out's evidence: the VMs it names,
+// and what to do.
+type drainTimeoutEvidence struct {
+	VMs    []string `json:"vms"`
+	Detail string   `json:"detail"`
+}
+
+// drainTimeoutsNamed is the VMs host's drain_move_timed_out names now.
+func (s *Server) drainTimeoutsNamed(ctx context.Context, host string) []string {
+	row, ok, err := corrosion.GetHealthCondition(ctx, s.db, drainEvaluator, condDrainMoveTimedOut, "host", host)
+	if err != nil || !ok || row.Lifecycle == corrosion.ConditionResolved {
+		return nil
 	}
-	s.setHostConditionOf(context.WithoutCancel(ctx), drainEvaluator, condDrainMoveTimedOut, host, len(vms) > 0,
-		corrosion.SeverityWarning, detail)
+	var ev drainTimeoutEvidence
+	if json.Unmarshal([]byte(row.Evidence), &ev) != nil {
+		return nil
+	}
+	return ev.VMs
+}
+
+// judgeDrainTimeouts raises or resolves host's drain_move_timed_out after a
+// drain of it (or an undrain). seen are the VMs this drain's live move timed
+// out; full says the drain saw every move it started. A VM is named while its
+// row is still on host. One already named whose move is still finishing in the
+// background (its row migrating on host) stays named; a partial judgement
+// never removes a name.
+func (s *Server) judgeDrainTimeouts(ctx context.Context, host string, seen []string, full bool) {
+	if s.db == nil {
+		return
+	}
+	ctx = context.WithoutCancel(ctx)
+	s.drainCondMu.Lock()
+	defer s.drainCondMu.Unlock()
+	set := map[string]bool{}
+	for _, v := range s.drainTimeoutsNamed(ctx, host) {
+		if !full {
+			set[v] = true
+			continue
+		}
+		if row, err := corrosion.GetVM(ctx, s.db, v); err == nil && row != nil && row.HostName == host && row.State == "migrating" {
+			set[v] = true
+		}
+	}
+	for _, v := range seen {
+		if row, err := corrosion.GetVM(ctx, s.db, v); err == nil && row != nil && row.HostName == host {
+			set[v] = true
+		}
+	}
+	s.writeDrainTimeouts(ctx, host, set)
+}
+
+// forgetDrainTimeout takes vm out of host's drain_move_timed_out: its move
+// finished in the background and the guest left host.
+func (s *Server) forgetDrainTimeout(ctx context.Context, host, vm string) {
+	if s.db == nil {
+		return
+	}
+	ctx = context.WithoutCancel(ctx)
+	s.drainCondMu.Lock()
+	defer s.drainCondMu.Unlock()
+	named := s.drainTimeoutsNamed(ctx, host)
+	if !slices.Contains(named, vm) {
+		return
+	}
+	set := map[string]bool{}
+	for _, v := range named {
+		if v != vm {
+			set[v] = true
+		}
+	}
+	s.writeDrainTimeouts(ctx, host, set)
+}
+
+// writeDrainTimeouts writes host's drain_move_timed_out naming set (resolved
+// when empty). drainCondMu is held.
+func (s *Server) writeDrainTimeouts(ctx context.Context, host string, set map[string]bool) {
+	vms := make([]string, 0, len(set))
+	for v := range set {
+		vms = append(vms, v)
+	}
+	sort.Strings(vms)
+	evidence := ""
+	if len(vms) > 0 {
+		b, _ := json.Marshal(drainTimeoutEvidence{VMs: vms, Detail: fmt.Sprintf(
+			"the live move of %s off %s did not finish within its migration policy's timeout_sec and was aborted; "+
+				"each keeps running on %s, unless libvirt did not answer its abort and the move is finishing in the background "+
+				"(see its drain result and `lv events <vm>`). Raise the timeout, move each with `lv migrate <vm> <target-host>`, or stop it and drain again",
+			strings.Join(vms, ", "), host, host)})
+		evidence = string(b)
+	}
+	s.setHostConditionOf(ctx, drainEvaluator, condDrainMoveTimedOut, host, len(vms) > 0, corrosion.SeverityWarning, evidence)
 }
 
 // runDrainPostMigrate runs the post_migrate hook of a drain whose live attempt
@@ -1026,8 +1185,8 @@ func (s *Server) UndrainHost(ctx context.Context, req *pb.UndrainHostRequest) (*
 		return nil, err
 	}
 	// The host is no longer being drained: a move its drain timed out is no
-	// longer owed.
-	s.judgeDrainTimeouts(ctx, req.Name, nil)
+	// longer owed (one still finishing in the background stays named).
+	s.judgeDrainTimeouts(ctx, req.Name, nil, true)
 	s.publish("host.undrained", req.Name, "")
 	s.audit(ctx, "host.undrain", req.Name, "", "ok")
 	reply, err := s.InspectHost(ctx, &pb.InspectHostRequest{Name: req.Name})

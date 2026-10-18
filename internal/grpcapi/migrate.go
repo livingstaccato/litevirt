@@ -527,7 +527,14 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	if err != nil {
 		return err
 	}
-	defer migLease.release(ctx)
+	// The lease goes with an adopted migration (adoptAbandonedMigration): the
+	// target must keep counting the guest's room until libvirt ends the move.
+	leaseHeld := true
+	defer func() {
+		if leaseHeld {
+			migLease.release(ctx)
+		}
+	}()
 
 	if opts.beforeMove != nil {
 		if err := opts.beforeMove(ctx); err != nil {
@@ -812,10 +819,11 @@ poll:
 			// host_name=source/state=migrating while it ran on the target, and
 			// the reconciler skips `migrating`, so nothing ever healed it.
 			*adopted = true
+			leaseHeld = false
 			s.adoptAbandonedMigration(context.WithoutCancel(ctx), vm, req.TargetHost,
 				withStorage, disks, done, unlock, migrationFinish{
 					target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec, armed: armed,
-					createdStubs: createdStubs,
+					createdStubs: createdStubs, lease: migLease,
 				})
 			return status.Errorf(codes.DeadlineExceeded,
 				"stopped waiting for the migration of %q to %s (%v); it is still running in "+
@@ -931,6 +939,7 @@ func (s *Server) adoptAbandonedMigration(
 ) {
 	go func() {
 		defer unlock()
+		defer finish.lease.release(ctx)
 		defer s.invalidateInventoryCache()
 		defer func() {
 			if p := recover(); p != nil {
@@ -976,6 +985,11 @@ func (s *Server) adoptAbandonedMigration(
 				s.noteStateWriteFail(corrosion.OpVMState, werr)
 			}
 			s.cleanupFailedMigrationTarget(ctx, vm.Name, targetHost, finish.createdStubs)
+			if finish.drainFrom != "" && finish.pbVM != nil {
+				// The drain ran pre_migrate; post_migrate names where the VM is.
+				finish.pbVM.HostName, finish.pbVM.State = s.hostName, vmStateToPB(state)
+				hooks.Run(ctx, hooks.PostMigrate, finish.pbVM, finish.hspec)
+			}
 			slog.Warn("migrate: adopted migration failed", "vm", vm.Name, "target", targetHost, "error", err)
 			s.recordVMEvent(ctx, vm.Name, "vm.migrated", "error", "abandoned request; migration failed: "+err.Error())
 			return
@@ -984,6 +998,10 @@ func (s *Server) adoptAbandonedMigration(
 		// libvirt cut over. The commit is the only thing that makes the cluster
 		// agree with reality, and it cannot be skipped just because nobody is
 		// listening any more.
+		if finish.drainFrom != "" {
+			// The guest has left the drained host, whatever the commit does.
+			s.forgetDrainTimeout(ctx, finish.drainFrom, vm.Name)
+		}
 		if ferr := s.finalizeMigrationOwnership(ctx, vm, targetHost, withStorage, disks); ferr != nil {
 			finish.armed.uncommitted(ctx)
 			slog.Error("migrate: adopted migration cut over but ownership commit FAILED — "+
@@ -995,6 +1013,10 @@ func (s *Server) adoptAbandonedMigration(
 		}
 		s.releaseSourceVFsAfterCutover(ctx, vm.Name, finish.detachedVFs)
 		slog.Info("migrate: adopted migration completed", "vm", vm.Name, "target", targetHost)
+		if finish.drainFrom != "" {
+			// As a watched drain move: so that undrain can move it back.
+			s.recordDrainOriginBounded(ctx, s.drainRecordJobFor(ctx, vm.Name, finish.drainFrom, targetHost))
+		}
 		s.recordVMEvent(ctx, vm.Name, "vm.migrated", "ok",
 			"abandoned request; completed to "+targetHost)
 		// The same finish a watched migration gets. Committing ownership and
@@ -2762,6 +2784,14 @@ type migrationFinish struct {
 	// armed lets a guest handed over paused run once its NIC guards are in
 	// force on the target (armedMigration.finish).
 	armed *armedMigration
+	// lease is the target's capacity reservation for the move, released when
+	// an adopted migration ends, not when its request returns.
+	lease *reservationLease
+	// drainFrom is the drained host when a drain handed the move over: a
+	// failed move then runs post_migrate (the drain's one-pre/one-post
+	// pairing), and a completed one writes the drain record and leaves
+	// drain_move_timed_out.
+	drainFrom string
 }
 
 // adoptedMigrationCeiling bounds how long an adopted migration may run before

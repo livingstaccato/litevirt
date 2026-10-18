@@ -2,7 +2,7 @@ package daemon
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,44 +29,57 @@ func failedVars(t *testing.T, dir, vm string) libvirt.NvramFlushFailure {
 	return libvirt.NvramFlushFailure{Path: p, VM: vm, Error: "input/output error", Dev: uint64(st.Dev), Ino: st.Ino}
 }
 
-// A vars file whose fsync failed raises nvram_flush_failed (critical) about
-// this host, naming the file and its VM; the failure survives a daemon
-// restart through the condition's evidence; the condition resolves once the
-// file is gone.
-func TestNvramFlushCondition_RaisedSurvivesRestartAndResolves(t *testing.T) {
-	ctx := context.Background()
+func nvramTestDaemon(t *testing.T) (*Daemon, *corrosion.Client) {
+	t.Helper()
 	db := corrosion.NewTestClientT(t)
-	if err := corrosion.InitSchema(ctx, db); err != nil {
+	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
-	d := &Daemon{db: db, cfg: &Config{HostName: "h1"}}
+	return &Daemon{db: db, cfg: &Config{HostName: "h1"}}, db
+}
+
+func nvramCondition(t *testing.T, db *corrosion.Client, code string) (corrosion.HealthCondition, bool) {
+	t.Helper()
+	row, found, err := corrosion.GetHealthCondition(context.Background(), db, nvramFlushEvaluator, code, "host", "h1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return row, found && row.Lifecycle != corrosion.ConditionResolved
+}
+
+// A vars file whose fsync failed raises nvram_flush_failed (critical) about
+// this host, naming the file, its VM and a remedy that names real commands;
+// the failure survives a daemon restart through the condition's evidence; the
+// condition resolves once the file is gone.
+func TestNvramFlushCondition_RaisedSurvivesRestartAndResolves(t *testing.T) {
+	ctx := context.Background()
+	d, db := nvramTestDaemon(t)
 	dir := t.TempDir()
 	fail := failedVars(t, dir, "web-1")
 
 	f := libvirt.NewNvramFlusher(dir)
 	f.Seed([]libvirt.NvramFlushFailure{fail})
-	var last string
-	d.syncNvramFlushCondition(ctx, f.Failures(), &last)
+	var st nvramConditionState
+	d.nvramFlushTick(ctx, f, &st)
 
-	row, found, err := corrosion.GetHealthCondition(ctx, db, nvramFlushEvaluator, CondNvramFlushFailed, "host", "h1")
-	if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved {
-		t.Fatalf("condition after a failed flush: found=%v err=%v row=%+v", found, err, row)
+	row, open := nvramCondition(t, db, CondNvramFlushFailed)
+	if !open {
+		t.Fatalf("condition after a failed flush: %+v", row)
 	}
 	if row.Severity != corrosion.SeverityCritical {
 		t.Fatalf("severity %q, want critical", row.Severity)
 	}
-	if !strings.Contains(row.Evidence, fail.Path) || !strings.Contains(row.Evidence, `"vm":"web-1"`) || !strings.Contains(row.Evidence, "remedy") {
-		t.Fatalf("evidence does not name the file, its VM and the remedy: %s", row.Evidence)
-	}
-	var ev nvramFlushEvidence
-	if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil || len(ev.Files) != 1 {
-		t.Fatalf("evidence %s: %v", row.Evidence, err)
+	for _, want := range []string{fail.Path, `"vm":"web-1"`, "lv rm", "lv snapshot restore", "lv backup restore-from", "does not clear"} {
+		if !strings.Contains(row.Evidence, want) {
+			t.Fatalf("evidence lacks %q: %s", want, row.Evidence)
+		}
 	}
 
 	// A restart: the new flusher knows nothing until it is seeded from the
 	// open condition.
 	g := libvirt.NewNvramFlusher(dir)
-	d.seedNvramFlushFailures(ctx, g)
+	var st2 nvramConditionState
+	d.nvramFlushTick(ctx, g, &st2)
 	if got := g.Failures(); len(got) != 1 || got[0].Path != fail.Path {
 		t.Fatalf("after a restart the flusher holds %+v; want %s", got, fail.Path)
 	}
@@ -77,11 +90,110 @@ func TestNvramFlushCondition_RaisedSurvivesRestartAndResolves(t *testing.T) {
 		t.Fatal(err)
 	}
 	g.Sweep()
-	last = ""
-	d.syncNvramFlushCondition(ctx, g.Failures(), &last)
-	row, _, _ = corrosion.GetHealthCondition(ctx, db, nvramFlushEvaluator, CondNvramFlushFailed, "host", "h1")
-	if row.Lifecycle != corrosion.ConditionResolved {
+	d.nvramFlushTick(ctx, g, &st2)
+	if row, open := nvramCondition(t, db, CondNvramFlushFailed); open {
 		t.Fatalf("condition after the file was removed: %+v", row)
+	}
+}
+
+// A condition write that fails is retried on the next tick, although the
+// failures have not changed.
+func TestNvramFlushCondition_FailedWriteIsRetried(t *testing.T) {
+	ctx := context.Background()
+	d, db := nvramTestDaemon(t)
+	dir := t.TempDir()
+	f := libvirt.NewNvramFlusher(dir)
+	f.Seed([]libvirt.NvramFlushFailure{failedVars(t, dir, "web-1")})
+
+	for _, q := range []string{
+		`CREATE TRIGGER nvd_block_i BEFORE INSERT ON health_conditions BEGIN SELECT RAISE(ABORT, 'disk gone'); END`,
+		`CREATE TRIGGER nvd_block_u BEFORE UPDATE ON health_conditions BEGIN SELECT RAISE(ABORT, 'disk gone'); END`,
+	} {
+		if _, err := db.DB().Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var st nvramConditionState
+	d.nvramFlushTick(ctx, f, &st)
+	if _, open := nvramCondition(t, db, CondNvramFlushFailed); open {
+		t.Fatal("condition written through a failing database")
+	}
+	for _, q := range []string{`DROP TRIGGER nvd_block_i`, `DROP TRIGGER nvd_block_u`} {
+		if _, err := db.DB().Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d.nvramFlushTick(ctx, f, &st)
+	if row, open := nvramCondition(t, db, CondNvramFlushFailed); !open {
+		t.Fatalf("a failed condition write was not retried: %+v", row)
+	}
+}
+
+// A failure carried over a restart is not dropped by a database read that
+// fails at startup: nothing is resolved until the condition has been read,
+// and the seed is retried. Evidence that cannot be parsed keeps the
+// condition raised.
+func TestNvramFlushCondition_UnreadSeedNeverResolves(t *testing.T) {
+	ctx := context.Background()
+	d, db := nvramTestDaemon(t)
+	dir := t.TempDir()
+	fail := failedVars(t, dir, "web-1")
+	f := libvirt.NewNvramFlusher(dir)
+	f.Seed([]libvirt.NvramFlushFailure{fail})
+	var st nvramConditionState
+	d.nvramFlushTick(ctx, f, &st)
+
+	readErr := errors.New("database is locked")
+	old := readNvramFlushCondition
+	t.Cleanup(func() { readNvramFlushCondition = old })
+	readNvramFlushCondition = func(ctx context.Context, c *corrosion.Client, ev, code, kind, id string) (corrosion.HealthCondition, bool, error) {
+		if readErr != nil {
+			return corrosion.HealthCondition{}, false, readErr
+		}
+		return old(ctx, c, ev, code, kind, id)
+	}
+
+	g := libvirt.NewNvramFlusher(dir)
+	var st2 nvramConditionState
+	d.nvramFlushTick(ctx, g, &st2)
+	if _, open := nvramCondition(t, db, CondNvramFlushFailed); !open {
+		t.Fatal("a failed read at startup resolved the carried-over failure")
+	}
+	readErr = nil
+	d.nvramFlushTick(ctx, g, &st2)
+	if got := g.Failures(); len(got) != 1 {
+		t.Fatalf("seed not retried after the read recovered: %+v", got)
+	}
+
+	// Unparseable evidence: kept raised.
+	if _, err := db.DB().Exec(`UPDATE health_conditions SET evidence = 'not json' WHERE code = ?`, CondNvramFlushFailed); err != nil {
+		t.Fatal(err)
+	}
+	h := libvirt.NewNvramFlusher(dir)
+	var st3 nvramConditionState
+	d.nvramFlushTick(ctx, h, &st3)
+	d.nvramFlushTick(ctx, h, &st3)
+	if _, open := nvramCondition(t, db, CondNvramFlushFailed); !open {
+		t.Fatal("unparseable evidence resolved the condition")
+	}
+}
+
+// A vars file blocked from being flushed raises nvram_flush_blocked
+// (warning), naming it, and resolves once it is flushed again.
+func TestNvramFlushCondition_BlockedFileRaisesAWarning(t *testing.T) {
+	ctx := context.Background()
+	d, db := nvramTestDaemon(t)
+	var st nvramConditionState
+	st.seeded = true
+	d.syncNvramCondition(ctx, CondNvramFlushBlocked, corrosion.SeverityWarning,
+		[]libvirt.NvramFlushFailure{{Path: "/x/vm1_VARS.fd", VM: "vm1", Error: "permission denied"}}, nvramFlushBlockedRemedy, &st.lastBlocked)
+	row, open := nvramCondition(t, db, CondNvramFlushBlocked)
+	if !open || row.Severity != corrosion.SeverityWarning || !strings.Contains(row.Evidence, "vm1_VARS.fd") {
+		t.Fatalf("blocked condition: open=%v %+v", open, row)
+	}
+	d.syncNvramCondition(ctx, CondNvramFlushBlocked, corrosion.SeverityWarning, nil, nvramFlushBlockedRemedy, &st.lastBlocked)
+	if _, open := nvramCondition(t, db, CondNvramFlushBlocked); open {
+		t.Fatal("blocked condition not resolved once nothing is blocked")
 	}
 }
 

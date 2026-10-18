@@ -17,20 +17,30 @@ import (
 const nvramFlushEvaluator = "uefi-vars"
 
 // CondNvramFlushFailed is raised by a node about itself while an fsync of a
-// UEFI vars file on it has failed. A file stops counting once the guest has
-// written it again and that write is fsynced, or once it is removed or
-// replaced. A later fsync with nothing written since proves nothing: the
-// kernel reports a writeback error once and the lost pages are clean.
+// UEFI vars file on it has failed. A file stops counting only once it is
+// removed or replaced: the kernel reports a writeback error once and marks
+// the lost pages clean, and qemu writes back only the sectors a later guest
+// write changes, so no later fsync puts the lost pages back.
 const CondNvramFlushFailed = "nvram_flush_failed"
+
+// CondNvramFlushBlocked is raised by a node about itself while a UEFI vars
+// file on it has not been openable for its fsync for longer than a minute,
+// and resolved once every such file is flushed again (or gone).
+const CondNvramFlushBlocked = "nvram_flush_blocked"
 
 // nvramFlushConditionEvery is how often the condition follows the flusher.
 const nvramFlushConditionEvery = 10 * time.Second
 
-const nvramFlushRemedy = "the listed vars files may be missing UEFI variable writes their guests made; " +
-	"qemu still holds the whole store in memory while the VM runs, but a stop does not rewrite it. " +
-	"Check the disk (dmesg, smartctl). Then have the guest write its variables again " +
-	"(the file's next clean fsync after that write clears it), " +
-	"or restore the VM's firmware state from a backup, or remove the VM"
+const nvramFlushRemedy = "the listed vars files may be missing UEFI variable writes their guests made. " +
+	"Check the disk (dmesg, smartctl). Writing the variables again in the guest does not clear this, " +
+	"and stopping the VM does not write its store out again. " +
+	"Restore the VM's firmware from a snapshot or backup taken before the failure " +
+	"(lv snapshot restore <vm> <name>, or lv backup restore-from), or remove the VM (lv rm <vm>); " +
+	"the condition clears when each listed file is removed or replaced"
+
+const nvramFlushBlockedRemedy = "the listed vars files could not be opened to flush them, so their guests' " +
+	"UEFI variable writes are not being made durable; the error says why. Fix that cause " +
+	"(permissions, open-file limits, the entry's type); the condition clears once each file is flushed again"
 
 type nvramFlushEvidence struct {
 	Files  []libvirt.NvramFlushFailure `json:"files"`
@@ -61,15 +71,29 @@ func (d *Daemon) startNvramFlusher(ctx context.Context) (f *libvirt.NvramFlusher
 	return f, func() { stopAndWait(cancel, f.Done(), nvramFinalSweepWait) }
 }
 
-// runNvramFlushCondition keeps nvram_flush_failed in step with the flusher's
-// failures, after carrying over those an earlier run recorded.
+// readNvramFlushCondition reads this host's condition (a variable so tests
+// can fail it).
+var readNvramFlushCondition = corrosion.GetHealthCondition
+
+// nvramConditionState is what runNvramFlushCondition carries between ticks.
+type nvramConditionState struct {
+	seeded bool // the open condition's failures were handed to the flusher
+	// holdResolve: the open condition's evidence could not be parsed, so its
+	// failures are unknown; it is never resolved, only rewritten by a new
+	// failure.
+	holdResolve             bool
+	lastFailed, lastBlocked string // what each condition was last written as
+}
+
+// runNvramFlushCondition keeps nvram_flush_failed and nvram_flush_blocked in
+// step with the flusher, after carrying over the failures an earlier run
+// recorded.
 func (d *Daemon) runNvramFlushCondition(ctx context.Context, f *libvirt.NvramFlusher) {
-	d.seedNvramFlushFailures(ctx, f)
-	var last string
+	var st nvramConditionState
 	t := time.NewTicker(nvramFlushConditionEvery)
 	defer t.Stop()
 	for {
-		d.syncNvramFlushCondition(ctx, f.Failures(), &last)
+		d.nvramFlushTick(ctx, f, &st)
 		select {
 		case <-ctx.Done():
 			return
@@ -78,31 +102,71 @@ func (d *Daemon) runNvramFlushCondition(ctx context.Context, f *libvirt.NvramFlu
 	}
 }
 
+// nvramFlushTick is one pass: the seed until it has been read, then both
+// conditions. Nothing is resolved before the seed is read.
+func (d *Daemon) nvramFlushTick(ctx context.Context, f *libvirt.NvramFlusher, st *nvramConditionState) {
+	if !st.seeded {
+		if err := d.seedNvramFlushFailures(ctx, f, st); err != nil {
+			slog.Warn("could not read the nvram_flush_failed condition; retried before the condition is touched", "error", err)
+			return
+		}
+		st.seeded = true
+	}
+	failed := f.Failures()
+	if len(failed) > 0 {
+		st.holdResolve = false
+	}
+	if !st.holdResolve {
+		d.syncNvramCondition(ctx, CondNvramFlushFailed, corrosion.SeverityCritical, failed, nvramFlushRemedy, &st.lastFailed)
+	}
+	d.syncNvramCondition(ctx, CondNvramFlushBlocked, corrosion.SeverityWarning, f.Blocked(), nvramFlushBlockedRemedy, &st.lastBlocked)
+}
+
 // seedNvramFlushFailures hands the flusher the failures the open condition
-// names, so a restart does not forget a write that never reached disk.
-func (d *Daemon) seedNvramFlushFailures(ctx context.Context, f *libvirt.NvramFlusher) {
-	row, found, err := corrosion.GetHealthCondition(ctx, d.db, nvramFlushEvaluator, CondNvramFlushFailed, "host", d.cfg.HostName)
-	if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved {
-		return
+// names, so a restart does not forget a write that never reached disk. A
+// read error is returned, to be retried.
+func (d *Daemon) seedNvramFlushFailures(ctx context.Context, f *libvirt.NvramFlusher, st *nvramConditionState) error {
+	row, found, err := readNvramFlushCondition(ctx, d.db, nvramFlushEvaluator, CondNvramFlushFailed, "host", d.cfg.HostName)
+	if err != nil {
+		return err
+	}
+	if !found || row.Lifecycle == corrosion.ConditionResolved {
+		return nil
 	}
 	var ev nvramFlushEvidence
 	if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil {
-		slog.Warn("could not read the nvram_flush_failed evidence; its files are not carried over", "error", err)
-		return
+		slog.Error("the nvram_flush_failed evidence cannot be read; the condition is kept raised until a new failure rewrites it", "error", err)
+		st.holdResolve = true
+		return nil
 	}
 	f.Seed(ev.Files)
+	return nil
 }
 
-// syncNvramFlushCondition raises, rewrites or resolves the condition when the
-// failures differ from the last ones written.
-func (d *Daemon) syncNvramFlushCondition(ctx context.Context, failures []libvirt.NvramFlushFailure, last *string) {
-	b, _ := json.Marshal(failures)
-	if string(b) == *last {
+// syncNvramCondition raises, rewrites or resolves one condition when files
+// differ from what it was last written as. last moves only once the write
+// (or the finding that there is nothing to resolve) succeeded, so a failed
+// write is retried on the next tick.
+func (d *Daemon) syncNvramCondition(ctx context.Context, code, severity string, files []libvirt.NvramFlushFailure, remedy string, last *string) {
+	b, _ := json.Marshal(files)
+	key := string(b)
+	if key == *last {
 		return
 	}
-	d.writeSelfConditionAs(ctx, nvramFlushEvaluator, CondNvramFlushFailed, len(failures) > 0,
-		corrosion.SeverityCritical, nvramFlushEvidence{Files: failures, Remedy: nvramFlushRemedy})
-	*last = string(b)
+	open := len(files) > 0
+	if !open {
+		row, found, err := readNvramFlushCondition(ctx, d.db, nvramFlushEvaluator, code, "host", d.cfg.HostName)
+		if err != nil {
+			return
+		}
+		if !found || row.Lifecycle == corrosion.ConditionResolved {
+			*last = key
+			return
+		}
+	}
+	if d.writeSelfConditionAs(ctx, nvramFlushEvaluator, code, open, severity, nvramFlushEvidence{Files: files, Remedy: remedy}) {
+		*last = key
+	}
 }
 
 // stopAndWait cancels and waits up to bound for done.

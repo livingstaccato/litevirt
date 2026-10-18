@@ -2112,25 +2112,41 @@ files that changed, in `<data_dir>/nvram/` and `/var/lib/libvirt/qemu/nvram/`,
 once a second. A node raises `nvram_flush_failed` (critical) about **itself**
 when one of those fsyncs fails, and logs `UEFI vars flush failed` with `path`,
 `vm` and `error`. The evidence carries `files` (each with `path`, `vm`,
-`error`, `at`, `dev` and `ino`) and `remedy`.
+`error`, `at`, `dev`, `ino` and `mtime`) and `remedy`.
 
-A later fsync with nothing written since does not clear it. The kernel
-reports a writeback error to one fsync and marks the lost pages clean, so the
-next fsync returns success with the data still missing. The condition
-survives a daemon restart. An error opening a vars file is not a flush
-failure: it is logged once as `UEFI vars file could not be opened to flush
-it` and retried every second.
+No later fsync clears it, whether or not the guest wrote the file again. The
+kernel reports a writeback error to one fsync and marks the lost pages clean,
+and qemu writes back only the sectors a later guest write changes, so the lost
+pages stay stale on disk. The condition survives a daemon restart.
 
 | Raised when | Clears when |
 |---|---|
-| An fsync of a vars file failed. | For every listed file: the guest wrote it again after the failure and that write was fsynced cleanly, or the file was removed (`lv rm`) or replaced by another file (a firmware restore). |
+| An fsync of a vars file failed. | Every listed file is removed or replaced by another file. |
 
 **What to do.** The listed file may be missing UEFI variable writes the guest
-made. qemu holds the whole variable store in memory while the VM runs, but
-stopping the VM does not write it out again. Check the disk (`dmesg`,
-`smartctl`). Then have the guest write the variables it needs again, which
-clears the file once that write is flushed, or restore the VM's firmware state
-from a backup.
+made. Check the disk (`dmesg`, `smartctl`). Writing the variables again in the
+guest does not clear it, and stopping the VM does not write the store out
+again. Restore the VM's firmware from a snapshot or backup taken before the
+failure (`lv snapshot restore <vm> <name>`, or `lv backup restore-from`), which
+replaces the file, or remove the VM (`lv rm <vm>`).
+
+### UEFI vars file not flushed (`nvram_flush_blocked`)
+
+Evaluator `uefi-vars`, subject kind `host`. A vars file that could not be
+opened for its fsync is logged as `UEFI vars file could not be opened to flush
+it` and retried every second. A node raises `nvram_flush_blocked` (warning)
+about **itself** once a file has not been openable for a minute, logged at
+error. Nothing is known lost, but that file's writes are not being made
+durable. The evidence carries `files` (each with `path`, `vm`, `error` and
+`at`, when the episode began) and `remedy`.
+
+| Raised when | Clears when |
+|---|---|
+| A vars file has not been openable for its fsync for a minute. | Every listed file is flushed again (logged as `UEFI vars file flushed again after it could not be opened`), or is gone. |
+
+**What to do.** The `error` says why the file could not be opened: fix that
+cause (its permissions, the daemon's open-file limit, or what replaced the
+file).
 
 ### Reservation not released (`reservation_stale`)
 

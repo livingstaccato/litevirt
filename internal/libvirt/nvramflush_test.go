@@ -1,11 +1,14 @@
 package libvirt
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -445,52 +448,6 @@ func TestNvramFlusher_DefaultSyncOpenErrorIsNotAnFsyncError(t *testing.T) {
 	}
 }
 
-// A failed file the guest has written since its failure, and that has then
-// been fsynced, is clear: the store is on disk as the guest last wrote it. A
-// successful fsync with nothing written since proves nothing.
-func TestNvramFlusher_RewrittenAndFlushedClearsTheFailure(t *testing.T) {
-	dir := t.TempDir()
-	f, _, now := recordingFlusher(t, dir)
-	vars := filepath.Join(dir, "vm1_VARS.fd")
-	at := now.Add(-time.Hour)
-	writeAt(t, vars, "v1", at)
-	failing := true
-	f.sync = func(p string, _ os.FileInfo) error {
-		if failing && p == vars {
-			return &nvramSyncError{syscall.EIO}
-		}
-		return nil
-	}
-	f.Sweep()
-	failing = false
-	f.Sweep()
-	if len(f.Failures()) != 1 {
-		t.Fatalf("a clean fsync with nothing rewritten cleared the failure")
-	}
-	writeAt(t, vars, "v2", at.Add(time.Minute))
-	f.Sweep()
-	if got := f.Failures(); len(got) != 0 {
-		t.Fatalf("rewritten and flushed, still failed: %+v", got)
-	}
-
-	// Carried over a restart, the same holds.
-	failing = true
-	writeAt(t, vars, "v3", at.Add(2*time.Minute))
-	f.Sweep()
-	carried := f.Failures()
-	g, _, _ := recordingFlusher(t, dir)
-	g.Seed(carried)
-	g.Sweep()
-	if len(g.Failures()) != 1 {
-		t.Fatalf("seeded failure cleared by a clean fsync with nothing rewritten")
-	}
-	writeAt(t, vars, "v4", at.Add(3*time.Minute))
-	g.Sweep()
-	if got := g.Failures(); len(got) != 0 {
-		t.Fatalf("seeded failure, rewritten and flushed, still failed: %+v", got)
-	}
-}
-
 // Done closes once Run has made its last sweep.
 func TestNvramFlusher_DoneClosesAfterTheLastSweep(t *testing.T) {
 	dir := t.TempDir()
@@ -530,21 +487,119 @@ func TestNvramFlusher_DoneClosesAfterTheLastSweep(t *testing.T) {
 	}
 }
 
-// A failure recorded before failures carried the file's mtime is judged by
-// when it was recorded: a clean fsync of a file not written since keeps it.
-func TestNvramFlusher_SeededFailureWithoutMtimeUsesItsTime(t *testing.T) {
+// A clean fsync after the guest wrote the file again does not clear a
+// failure. qemu writes back only the sectors a guest write changed, and
+// OVMF appends records, so the pages lost to the failed fsync stay stale on
+// disk whatever the guest writes later. Only removing or replacing the file
+// clears it.
+func TestNvramFlusher_GuestRewriteAndCleanFsyncDoNotClearTheFailure(t *testing.T) {
 	dir := t.TempDir()
 	f, _, now := recordingFlusher(t, dir)
 	vars := filepath.Join(dir, "vm1_VARS.fd")
-	writeAt(t, vars, "v1", now.Add(-2*time.Hour))
-	info, err := os.Lstat(vars)
-	if err != nil {
-		t.Fatal(err)
+	at := now.Add(-time.Hour)
+	writeAt(t, vars, "v1", at)
+	failing := true
+	f.sync = func(p string, _ os.FileInfo) error {
+		if failing && p == vars {
+			return &nvramSyncError{syscall.EIO}
+		}
+		return nil
 	}
-	dev, ino := fileIdentity(info)
-	f.Seed([]NvramFlushFailure{{Path: vars, Error: "EIO", At: now.Add(-time.Hour).UTC().Format(time.RFC3339), Dev: dev, Ino: ino}})
 	f.Sweep()
-	if len(f.Failures()) != 1 {
-		t.Fatal("a failure recorded after the file's last write was cleared by a clean fsync")
+	failing = false
+	writeAt(t, vars, "v2", at.Add(time.Minute))
+	f.Sweep()
+	got := f.Failures()
+	if len(got) != 1 || got[0].Path != vars {
+		t.Fatalf("a guest rewrite and a clean fsync cleared the failure: %+v", got)
+	}
+	if !got[0].Mtime.Equal(at) {
+		t.Fatalf("failure records mtime %v, want the mtime at the failed fsync %v", got[0].Mtime, at)
+	}
+
+	// Carried over a restart, the same holds.
+	g, _, _ := recordingFlusher(t, dir)
+	g.Seed(got)
+	writeAt(t, vars, "v3", at.Add(2*time.Minute))
+	g.Sweep()
+	if len(g.Failures()) != 1 {
+		t.Fatal("a seeded failure was cleared by a guest rewrite and a clean fsync")
+	}
+}
+
+// A vars file that keeps failing to open is never flushed: past a bound it
+// is reported as blocked (and logged at error), and when it is flushed again
+// that is logged and it is no longer blocked.
+func TestNvramFlusher_PersistentOpenFailureIsReportedAndRecovers(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	dir := t.TempDir()
+	f, _, now := recordingFlusher(t, dir)
+	vars := filepath.Join(dir, "vm1_VARS.fd")
+	writeAt(t, vars, "v1", now.Add(-time.Hour))
+	blocked := true
+	f.sync = func(p string, _ os.FileInfo) error {
+		if blocked && p == vars {
+			return &os.PathError{Op: "open", Path: p, Err: syscall.EACCES}
+		}
+		return nil
+	}
+	f.Sweep()
+	if got := f.Blocked(); len(got) != 0 {
+		t.Fatalf("blocked at once: %+v", got)
+	}
+	*now = now.Add(nvramBlockedAfter + time.Second)
+	f.Sweep()
+	got := f.Blocked()
+	if len(got) != 1 || got[0].Path != vars || got[0].VM != "vm1" || got[0].Error == "" {
+		t.Fatalf("blocked past the bound = %+v; want vm1's file", got)
+	}
+	if !strings.Contains(logs.String(), "level=ERROR") {
+		t.Fatalf("no error logged for a file blocked past the bound:\n%s", logs.String())
+	}
+	if got := f.Failures(); len(got) != 0 {
+		t.Fatalf("an open failure became a flush failure: %+v", got)
+	}
+
+	blocked = false
+	f.Sweep()
+	if got := f.Blocked(); len(got) != 0 {
+		t.Fatalf("still blocked after it was flushed: %+v", got)
+	}
+	if !strings.Contains(logs.String(), "flushed again") {
+		t.Fatalf("recovery not logged:\n%s", logs.String())
+	}
+
+	// A second episode is reported again, not swallowed by the first one's
+	// warning.
+	logs.Reset()
+	blocked = true
+	writeAt(t, vars, "v2", now.Add(-time.Minute))
+	f.Sweep()
+	if !strings.Contains(logs.String(), "could not be opened") {
+		t.Fatalf("a second open failure was not logged:\n%s", logs.String())
+	}
+}
+
+// The failure log gives the same advice as the condition: stopping the VM
+// does not write the store out again.
+func TestNvramFlusher_FailureLogDoesNotAdviseAStop(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	dir := t.TempDir()
+	f, _, now := recordingFlusher(t, dir)
+	vars := filepath.Join(dir, "vm1_VARS.fd")
+	writeAt(t, vars, "v1", now.Add(-time.Hour))
+	f.sync = func(p string, _ os.FileInfo) error { return &nvramSyncError{syscall.EIO} }
+	f.Sweep()
+	out := logs.String()
+	if strings.Contains(out, "stop the VM") || !strings.Contains(out, "stopping the VM does not") {
+		t.Fatalf("failure log advice does not match the remedy:\n%s", out)
 	}
 }

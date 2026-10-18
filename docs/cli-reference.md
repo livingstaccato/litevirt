@@ -469,7 +469,8 @@ fsyncs every vars file that changed, in `<data_dir>/nvram/` and
 `/var/lib/libvirt/qemu/nvram/`, once a second, and once more as it stops. A
 host power cut can therefore lose a variable written in about the last second
 before it, or up to `vm.dirty_expire_centisecs` (30 s by default) while the
-daemon is not running. A failed fsync raises `nvram_flush_failed`
+daemon is not running. A failed fsync raises `nvram_flush_failed`, and a vars
+file that cannot be opened for a minute raises `nvram_flush_blocked`
 (docs/diagnostics.md).
 
 swtpm makes its own vTPM state durable: it renames each new state file into

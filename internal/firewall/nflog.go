@@ -129,6 +129,9 @@ func (l *LogListener) serve(ctx context.Context, open func(uint16) (nflogConn, e
 	case <-ctx.Done():
 		return ctx.Err()
 	case err := <-dead:
+		// Reported before the deferred close: the pass that removes the log
+		// lines is asked for while this socket still holds the group.
+		report(err)
 		return err
 	}
 }

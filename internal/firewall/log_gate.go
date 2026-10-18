@@ -11,6 +11,7 @@ type LogGate struct {
 	group    uint16
 	probeErr error
 	bound    atomic.Bool
+	stopped  atomic.Bool
 	changed  func()
 }
 
@@ -23,13 +24,22 @@ func NewLogGate(group uint16, probeErr error, changed func()) *LogGate {
 
 // Logging reports whether log lines are rendered, and their group.
 func (g *LogGate) Logging() (bool, uint16) {
-	return g.probeErr == nil && g.bound.Load(), g.group
+	return g.probeErr == nil && g.bound.Load() && !g.stopped.Load(), g.group
+}
+
+// Stop turns logging off for good (the daemon is stopping: once it exits,
+// nothing holds the group). It reports whether lines may have been rendered,
+// so the caller runs a pass that removes them only then.
+func (g *LogGate) Stop() bool {
+	was, _ := g.Logging()
+	g.stopped.Store(true)
+	return was
 }
 
 // OnBind is the listener's bind report (LogListener.OnBind): nil once bound,
 // an error when the group cannot be held or was lost.
 func (g *LogGate) OnBind(err error) {
-	if g.bound.Swap(err == nil) != (err == nil) && g.changed != nil {
+	if g.bound.Swap(err == nil) != (err == nil) && g.probeErr == nil && !g.stopped.Load() && g.changed != nil {
 		g.changed()
 	}
 }

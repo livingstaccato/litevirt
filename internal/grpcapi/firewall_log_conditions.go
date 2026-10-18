@@ -18,7 +18,8 @@ func (s *Server) RecordFirewallLogListener(ctx context.Context, err error) {
 	detail := ""
 	if err != nil {
 		detail = "the firewall log listener cannot hold its NFLOG group (another program may hold it), so packets are not logged on " +
-			"this host: no log line is rendered while the listener is not bound, and no record goes to that program; " +
+			"this host: no log line is rendered while the listener is not bound (one that held the group and lost it has its " +
+			"lines removed by the next pass, run at once); " +
 			"set firewall.log_group to a free group and restart the daemon: " + err.Error()
 	}
 	s.setFirewallCondition(ctx, CondFirewallLogListener, err != nil, corrosion.SeverityWarning, detail)

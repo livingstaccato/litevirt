@@ -108,3 +108,27 @@ func TestLoadLogPolicy_AppendsUnreadable(t *testing.T) {
 		t.Errorf("unreadable = %q, want the SYN-flood entry kept and the log entry naming its effect", p.UnreadablePolicies)
 	}
 }
+
+// Round 2 m-1 (window 1): a daemon that is stopping turns logging off for
+// good, whatever the listener reports after, and Stop says whether lines may
+// have been rendered (so the stop pass is run only then).
+//
+// Mutation: Stop leaves the bound flag — still available, red.
+func TestLogGate_StopTurnsLoggingOff(t *testing.T) {
+	g := NewLogGate(27, nil, func() {})
+	if g.Stop() {
+		t.Error("Stop on a never-bound gate says lines may be rendered")
+	}
+	g = NewLogGate(27, nil, func() {})
+	g.OnBind(nil)
+	if !g.Stop() {
+		t.Error("Stop on a bound gate says no line was rendered")
+	}
+	if ok, _ := g.Logging(); ok {
+		t.Error("logging still available after Stop")
+	}
+	g.OnBind(nil)
+	if ok, _ := g.Logging(); ok {
+		t.Error("a bind after Stop made logging available again")
+	}
+}

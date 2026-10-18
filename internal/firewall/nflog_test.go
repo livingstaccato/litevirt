@@ -274,3 +274,69 @@ func TestParseLogPrefix_ValidatesFields(t *testing.T) {
 		}
 	}
 }
+
+// closeWatch is an nflog connection that records whether the listener had
+// reported the loss when the socket was closed.
+type closeWatch struct {
+	fakeNflog
+	lostBeforeClose func() bool
+	sawLost         bool
+}
+
+func (c *closeWatch) Close() error {
+	c.sawLost = c.lostBeforeClose()
+	return c.fakeNflog.Close()
+}
+
+// Round 2 m-1 (window 2): a socket that dies is reported lost before it is
+// closed, so the pass that removes the log lines is asked for while the
+// group is still held, not after another program could take it.
+//
+// Mutation: report after the deferred close — red.
+func TestLogListener_ReportsLossBeforeClosing(t *testing.T) {
+	store := openStore(t, LogStoreOptions{MaxRate: 10})
+	var mu sync.Mutex
+	var lost bool
+	c := &closeWatch{lostBeforeClose: func() bool { mu.Lock(); defer mu.Unlock(); return lost }}
+	opened := make(chan struct{}, 1)
+	l := &LogListener{Group: 27, Store: store, retry: time.Hour,
+		OnBind: func(err error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				lost = true
+			}
+		},
+		open: func(uint16) (nflogConn, error) { opened <- struct{}{}; return c, nil },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go l.Run(ctx)
+	<-opened
+	for {
+		c.mu.Lock()
+		errfn := c.errfn
+		c.mu.Unlock()
+		if errfn != nil {
+			errfn(errors.New("socket closed"))
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c.mu.Lock()
+		closed := c.closed
+		c.mu.Unlock()
+		if closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the dead socket was never closed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !c.sawLost {
+		t.Error("the socket was closed before the loss was reported")
+	}
+}

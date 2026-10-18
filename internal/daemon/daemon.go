@@ -1493,21 +1493,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	svc.RecordFirewallLogAvailability(ctx, fwLogErr)
 	// Log lines are rendered only while this daemon's listener holds the
-	// group (firewall.LogGate); each bind transition runs a pass.
-	// The listener starts below, once d.fwReconciler exists.
-	fwLogGate := firewall.NewLogGate(fwLogGroup, fwLogErr, func() {
-		go func() {
-			if err := d.fwReconciler.Reconcile(ctx); err != nil {
-				slog.Warn("firewall: the pass after a log listener change failed; the next tick retries", "error", err)
-			}
-		}()
-	})
+	// group (firewallLogging); each bind change runs passes. The listener
+	// starts below, once d.fwReconciler exists.
+	fwLogging := newFirewallLogging(ctx, fwLogGroup, fwLogErr,
+		func(c context.Context) error { return d.fwReconciler.Reconcile(c) },
+		func(err error) { svc.RecordFirewallLogListener(ctx, err) })
 	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
 		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs,
 			OnTagGroupMembers:    fwMetrics.SetTagGroupMembers,
 			OnDuplicateAddresses: firewall.NewDuplicateAddressReporter(d.db, d.cfg.HostName).Report,
 			BridgeConntrack:      func() bool { return bridgeCT }, Arming: fwArming,
-			Logging: fwLogGate.Logging})
+			Logging: fwLogging.Logging})
 	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
 	d.fwReconciler.SetArming(fwArming)
 	// Every domain start — an API start, a restart policy, a failover
@@ -1523,10 +1519,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if fwLogErr == nil {
 		go (&firewall.LogListener{Group: fwLogGroup, Store: fwLogStore,
 			Resolve: d.fwReconciler.ResolveLogDevice,
-			OnBind: func(err error) {
-				fwLogGate.OnBind(err)
-				svc.RecordFirewallLogListener(ctx, err)
-			}}).Run(ctx)
+			OnBind:  fwLogging.OnBind}).Run(ctx)
 	}
 	go pruneFirewallLog(ctx, fwLogStore)
 	// Whether this host enforces NIC guards, after every pass, the boot pass
@@ -2195,6 +2188,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			svc.FinishDrainRecords(grpcapi.DrainRecordStopWait)
 		})
 		if d.fwReconciler != nil {
+			// No log line outlives the listener: once this process exits,
+			// another program could take the group.
+			stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			fwLogging.Stop(stopCtx)
+			cancel()
 			d.fwReconciler.Stop()
 		}
 		if d.snapScheduler != nil {

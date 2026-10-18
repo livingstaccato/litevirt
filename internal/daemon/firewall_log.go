@@ -45,3 +45,58 @@ func pruneFirewallLog(ctx context.Context, s *firewall.LogStore) {
 		}
 	}
 }
+
+// firewallLogging is the daemon's firewall-logging wiring: the loader's
+// Logging answers through a firewall.LogGate (available only while the
+// probe passed and the listener holds the group), the listener's bind report
+// feeds the gate and the condition, and each change runs a pass now and a
+// follow-up one, so a pass that loaded its plan before the change cannot
+// leave the old one applied.
+type firewallLogging struct {
+	gate      *firewall.LogGate
+	reconcile func(context.Context) error
+	record    func(error)
+	followUp  time.Duration
+}
+
+func newFirewallLogging(ctx context.Context, group uint16, probeErr error, reconcile func(context.Context) error, record func(error)) *firewallLogging {
+	f := &firewallLogging{reconcile: reconcile, record: record, followUp: 2 * time.Second}
+	f.gate = firewall.NewLogGate(group, probeErr, func() { go f.passes(ctx) })
+	return f
+}
+
+// Logging is LoaderOptions.Logging.
+func (f *firewallLogging) Logging() (bool, uint16) { return f.gate.Logging() }
+
+// OnBind is LogListener.OnBind.
+func (f *firewallLogging) OnBind(err error) {
+	f.gate.OnBind(err)
+	f.record(err)
+}
+
+func (f *firewallLogging) passes(ctx context.Context) {
+	for i := 0; i < 2; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(f.followUp):
+			}
+		}
+		if err := f.reconcile(ctx); err != nil {
+			slog.Warn("firewall: the pass after a log listener change failed; the next tick retries", "error", err)
+		}
+	}
+}
+
+// Stop turns logging off for good and, when lines may have been rendered,
+// runs one pass at once to remove them (a daemon that is stopping holds the
+// group no longer).
+func (f *firewallLogging) Stop(ctx context.Context) {
+	if !f.gate.Stop() {
+		return
+	}
+	if err := f.reconcile(ctx); err != nil {
+		slog.Warn("firewall: could not remove the log lines at stop; another program could take the NFLOG group while litevirtd is down", "error", err)
+	}
+}

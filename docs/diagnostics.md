@@ -1807,7 +1807,7 @@ Raised per host; each resolves when its cause goes. docs/firewall.md,
 | Condition | Severity | Raised when |
 |---|---|---|
 | `firewall.log.unavailable` | warning | at start the kernel or nft refused the logging forms (`nft_log`, `nfnetlink_log`, `nft_limit`): no packet is logged on this host; the per-NIC rules are unaffected. Load the modules and restart the daemon |
-| `firewall.log.listener` | warning | the daemon cannot hold its NFLOG group (another program holds it): no log line is rendered on this host, so packets are not logged and nothing reaches that program. Set `firewall.log_group` to a free group and restart |
+| `firewall.log.listener` | warning | the daemon cannot hold its NFLOG group (another program holds it): no log line is rendered on this host, so packets are not logged and nothing reaches that program (a listener that loses the group has its lines removed by the next pass, run at once). Set `firewall.log_group` to a free group and restart |
 | `firewall.policy.unreadable` | warning | a firewall policy row cannot be read here; the evidence names each row and the fallback it is read as (a log policy: logging off at the default budget). Set that policy again to replace the row |
 
 `litevirt_firewall_log_records_total{outcome}` counts log records `kept`,

@@ -1148,8 +1148,11 @@ and `lv firewall log-policy on` logs each guest NIC's default verdict. The
 records go to the daemon, never to the kernel log or the journal: every log
 line is `log group <G> snaplen 96`, sending the packet's first 96 bytes to
 NFLOG group `firewall.log_group` (default 27), which the daemon reads. Log
-lines are rendered only while the daemon's own listener holds that group, so
-no other program bound to it ever receives a record.
+lines are rendered only while the daemon's own listener holds that group. A
+stopping daemon removes them before it exits. They can outlive the listener
+only after a crash (until the next start's first pass) and, after the
+listener loses the group, for the length of the firewall pass that removes
+them; a program that binds the group in such a window receives records.
 
 ```
 lv sg rule-add web --direction ingress --proto tcp --port 22 --action drop --log
@@ -1207,7 +1210,8 @@ keeps its per-NIC table, and raises `firewall.log.unavailable`; loading the
 modules later takes a daemon restart. A group the daemon cannot hold (another
 program holds it) raises `firewall.log.listener`, and no log line is rendered
 until the daemon holds it: packets are not logged on that host. Losing the
-group removes the lines at once, and holding it again restores them.
+group removes the lines in the next pass, run at once, and holding it again
+restores them.
 
 **Data at rest.** Records name any tenant's addresses and ports.
 
@@ -1246,7 +1250,7 @@ the row names the user the session belongs to.
 | `firewall.enforcement` | `cluster` | `lv firewall enforce on/off` |
 | `firewall.tag.set` / `.rm` | VM name, or `<host>/<name>` for a container | `lv firewall tag set/rm` |
 | `firewall.tag_group.set` / `.rm` | group name | `lv firewall tag-group set/rm` |
-| `firewall.log_policy` | the scope (`cluster` or a host name) | `lv firewall log-policy on/off/inherit` |
+| `firewall.log_policy` | `(cluster)` for the cluster policy, or the host name | `lv firewall log-policy on/off/inherit` |
 
 The row's user is the authenticated caller. Its detail records the policy
 before and after the change, in the form `before=<state> after=<state>`:

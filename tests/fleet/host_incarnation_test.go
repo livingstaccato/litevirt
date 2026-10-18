@@ -15,8 +15,10 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/cli"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/pki"
 )
 
 // incFleet is a latched three-node fleet whose gates see every peer healthy,
@@ -26,6 +28,7 @@ func incFleet(t *testing.T, seed int64) (*Cluster, map[string]*health.Checker) {
 	c, gates := latchedFleet(t, 3, seed)
 	latchReleaseToken(t, c, gates)
 	seedIncPeers(c, gates)
+	useRawGossip(c)
 	return c, gates
 }
 
@@ -41,23 +44,18 @@ func seedIncPeers(c *Cluster, gates map[string]*health.Checker) {
 	}
 }
 
-// setIncMembers is every node's gossip membership with absent left out: a
-// crashed node leaves memberlist, and a node that cannot be reached is no
+// useRawGossip routes every node's membership through the gossip admission
+// filter (Client.Members), with every node — crashed and removed ones
+// included — in raw gossip, as memberlist keeps a dead node a while. The
+// admission filter, not the harness, keeps a removed host from counting as a
 // replication recipient.
-func setIncMembers(c *Cluster, absent ...*Node) {
-	out := map[string]bool{}
-	for _, n := range absent {
-		out[n.Name] = true
-	}
+func useRawGossip(c *Cluster) {
 	nodes := append([]*Node(nil), c.Nodes...)
 	for _, target := range nodes {
-		self := target.Name
-		target.DB.SetMembersForTests(func() []corrosion.PeerInfo {
+		target.DB.SetMembersForTests(nil)
+		target.DB.SetGossipForTests(func() []corrosion.PeerInfo {
 			var peers []corrosion.PeerInfo
 			for _, n := range nodes {
-				if n.Name == self || out[n.Name] {
-					continue
-				}
 				peers = append(peers, corrosion.PeerInfo{Name: n.Name, Addr: n.Address + ":7946"})
 			}
 			return peers
@@ -119,7 +117,7 @@ func convergeAll(t *testing.T, c *Cluster, what string, d *Node) {
 func ownRowBoot(t *testing.T, d *Node, serial string) corrosion.OwnRowHoldStatus {
 	t.Helper()
 	ctx := context.Background()
-	st, err := d.DB.ConfigureOwnRowHold(ctx, serial)
+	st, err := d.DB.ConfigureOwnRowHold(ctx, servedCert(d))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,6 +134,19 @@ func ownRowBoot(t *testing.T, d *Node, serial string) corrosion.OwnRowHoldStatus
 		t.Fatalf("%s boot: register %v, boot %v", d.Name, rerr, berr)
 	}
 	return st
+}
+
+// servedCert is d's served certificate, read at every evaluation, as the
+// daemon's own-row hold reads it.
+func servedCert(d *Node) corrosion.InstalledCert {
+	return func() (string, string) {
+		cert, err := pki.ServedHostCertificate(d.PKIDir)
+		if err != nil {
+			return "", ""
+		}
+		prev, _ := pki.RenewedFromSerial(cert)
+		return strings.ToLower(cert.SerialNumber.Text(16)), prev
+	}
 }
 
 // ownRowReconcile is the daemon's reconcile once the hold opens (own_row.go):
@@ -230,7 +241,6 @@ func incStaleCycle(t *testing.T, c *Cluster, gates map[string]*health.Checker, d
 	c.WaitConverged(t, convergeTimeout)
 
 	c.Crash(d)
-	setIncMembers(c, d)
 	if _, err := c.SelfClient(admitter).RemoveHost(ctx, &pb.RemoveHostRequest{Name: d.Name, Force: true}); err != nil {
 		t.Fatalf("remove %s: %v", d.Name, err)
 	}
@@ -284,7 +294,6 @@ func incStaleCycle(t *testing.T, c *Cluster, gates map[string]*health.Checker, d
 	} else if st := ownRowBoot(t, d, serial); !st.Held {
 		t.Fatalf("%s booted on its old database without the own-row hold: %+v", d.Name, st)
 	}
-	setIncMembers(c)
 	for _, o := range c.Nodes {
 		if o != d {
 			c.SetLinkFaultBoth(d, o, LinkFault{})
@@ -337,6 +346,10 @@ func incStaleCycle(t *testing.T, c *Cluster, gates map[string]*health.Checker, d
 		if k := n.DB.UnresolvedTieCount(); k != 0 {
 			t.Errorf("%s tracks %d unresolved tie(s)", n.Name, k)
 		}
+		// Test 28: no ownership tie holds owner_epoch_v1 off.
+		if ok, why := n.Server.OwnerEpochReadiness(ctx); !ok && strings.Contains(why, "tie") {
+			t.Errorf("%s: owner-epoch readiness withheld by a tie: %s", n.Name, why)
+		}
 	}
 }
 
@@ -348,7 +361,6 @@ func TestFleet_HostIncarnation_EmptyDBReadd(t *testing.T) {
 	c, gates := incFleet(t, 3680)
 	a, d := c.Nodes[0], c.Nodes[2]
 	c.Crash(d)
-	setIncMembers(c, d)
 	if _, err := c.SelfClient(a).RemoveHost(ctx, &pb.RemoveHostRequest{Name: d.Name, Force: true}); err != nil {
 		t.Fatalf("remove %s: %v", d.Name, err)
 	}
@@ -365,7 +377,6 @@ func TestFleet_HostIncarnation_EmptyDBReadd(t *testing.T) {
 	if st := ownRowBoot(t, d, serial); st.Held {
 		t.Fatalf("an empty database held: %+v", st)
 	}
-	setIncMembers(c)
 	for _, o := range c.Nodes {
 		if o != d {
 			c.SetLinkFaultBoth(d, o, LinkFault{})
@@ -373,12 +384,24 @@ func TestFleet_HostIncarnation_EmptyDBReadd(t *testing.T) {
 	}
 	d.repl.Start(c.ctx)
 	d.replStarted = true
+	// R-M4: sampled through the latch sweep, every node reads d as a member
+	// that is neither fenced nor offline.
+	sample := func() {
+		for _, n := range c.Nodes {
+			if h, _ := corrosion.GetHost(ctx, n.DB, d.Name); h != nil && (h.State == "fenced" || h.State == "offline") {
+				t.Errorf("%s reads %s as %s during its latch sweep", n.Name, d.Name, h.State)
+			}
+		}
+	}
 	eventually(t, convergeTimeout, d.Name+" to adopt the re-admission", func() bool {
+		sample()
 		corrosion.NewAntiEntropy(d.DB, d.PKIDir, 0).RunOnce(ctx)
 		n, _, _, _, _, err := corrosion.HostIncarnationOf(ctx, d.DB, d.Name)
 		return err == nil && n == 1
 	})
+	sample()
 	ownRowReconcile(t, d, serial)
+	sample()
 	convergeAll(t, c, "an empty-database re-add", d)
 	for _, n := range c.Nodes {
 		got := hostsRowOf(t, n, d.Name)
@@ -400,9 +423,9 @@ func TestFleet_HostIncarnation_DuplicateAdmissions(t *testing.T) {
 	c, gates := latchedFleet(t, 5, 3690)
 	latchReleaseToken(t, c, gates)
 	seedIncPeers(c, gates)
+	useRawGossip(c)
 	a, b, x, y, d := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3], c.Nodes[4]
 	c.Crash(d)
-	setIncMembers(c, d)
 	if _, err := c.SelfClient(a).RemoveHost(ctx, &pb.RemoveHostRequest{Name: d.Name, Force: true}); err != nil {
 		t.Fatalf("remove %s: %v", d.Name, err)
 	}
@@ -443,7 +466,6 @@ func TestFleet_HostIncarnation_DuplicateAdmissions(t *testing.T) {
 	if st := ownRowBoot(t, d, serial); !st.Held {
 		t.Fatalf("not held: %+v", st)
 	}
-	setIncMembers(c)
 	for _, o := range c.Nodes {
 		if o != d {
 			c.SetLinkFaultBoth(d, o, LinkFault{})
@@ -514,7 +536,6 @@ func TestFleet_HostIncarnation_HoldTimesOut(t *testing.T) {
 	c, gates := incFleet(t, 3700)
 	a, d := c.Nodes[0], c.Nodes[2]
 	c.Crash(d)
-	setIncMembers(c, d)
 	if _, err := c.SelfClient(a).RemoveHost(ctx, &pb.RemoveHostRequest{Name: d.Name, Force: true}); err != nil {
 		t.Fatalf("remove %s: %v", d.Name, err)
 	}
@@ -536,7 +557,6 @@ func TestFleet_HostIncarnation_HoldTimesOut(t *testing.T) {
 		SSHPort: 22, GRPCPort: d.Port, State: "active", CertSerial: serial}); err != nil {
 		t.Fatalf("fallback register: %v", err)
 	}
-	setIncMembers(c)
 	for _, o := range c.Nodes {
 		if o != d {
 			c.SetLinkFaultBoth(d, o, LinkFault{})
@@ -567,7 +587,6 @@ func TestFleet_HostIncarnation_BeforeTheLatch(t *testing.T) {
 			}
 			c.WaitConverged(t, convergeTimeout)
 			c.Crash(d)
-			setIncMembers(c, d)
 			if err := corrosion.DeleteHost(ctx, a.DB, d.Name); err != nil {
 				t.Fatal(err)
 			}
@@ -590,7 +609,6 @@ func TestFleet_HostIncarnation_BeforeTheLatch(t *testing.T) {
 			if st := ownRowBoot(t, d, serial); !st.Held {
 				t.Fatalf("not held: %+v", st)
 			}
-			setIncMembers(c)
 			for _, o := range c.Nodes {
 				if o != d {
 					c.SetLinkFaultBoth(d, o, LinkFault{})
@@ -632,4 +650,85 @@ func incMutationLog(t *testing.T, n *Node) string {
 		s += r.String("stmts") + "\n"
 	}
 	return s
+}
+
+// C-1 (fleet): a re-added host renews its certificate while one peer cannot
+// hear it; anti-entropy in both directions never reverts the renewal, and the
+// host's own-row hold, which reads the served certificate, is not raised.
+func TestFleet_HostIncarnation_RenewalOfAReaddedHost(t *testing.T) {
+	ctx := context.Background()
+	c, gates := incFleet(t, 3720)
+	a, b, d := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	incStaleCycle(t, c, gates, d, a, false, false, false, 1)
+	runGenesis(t, c)
+	withOperatorPKI(t, a)
+	stop := runCertWatches(c)
+	defer stop()
+	prevCert, err := pki.ServedHostCertificate(d.PKIDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := strings.ToLower(prevCert.SerialNumber.Text(16))
+	c.SetLinkFaultBoth(d, b, LinkFault{Block: true})
+	if err := cli.RenewHostCertOn(ctx, c.SelfClient(a), &cli.LocalRemotePKI{Dir: d.PKIDir},
+		cli.GRPCProbe(d.Address, d.Port), d.Name, cli.RenewCertOptions{Wait: 20 * time.Second, Force: true}); err != nil {
+		t.Fatalf("renew-cert %s: %v", d.Name, err)
+	}
+	nextCert, err := pki.ServedHostCertificate(d.PKIDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := strings.ToLower(nextCert.SerialNumber.Text(16))
+	if next == prev {
+		t.Fatal("the certificate did not change")
+	}
+	eventually(t, convergeTimeout, a.Name+" to record the renewal", func() bool {
+		_, rec, _, _ := hostRowOf(t, a, d.Name)
+		return strings.EqualFold(rec, next)
+	})
+	// b still holds the pre-renewal copy; anti-entropy both ways.
+	for i := 0; i < 3; i++ {
+		corrosion.NewAntiEntropy(a.DB, a.PKIDir, 0).RunOnce(ctx)
+		corrosion.NewAntiEntropy(b.DB, b.PKIDir, 0).RunOnce(ctx)
+		if _, rec, _, _ := hostRowOf(t, a, d.Name); !strings.EqualFold(rec, next) {
+			t.Fatalf("%s reverted %s's renewal to %s", a.Name, d.Name, rec)
+		}
+	}
+	c.SetLinkFaultBoth(d, b, LinkFault{})
+	convergeAll(t, c, "a renewal of a re-added host", d)
+	for _, n := range c.Nodes {
+		if _, rec, _, _ := hostRowOf(t, n, d.Name); !strings.EqualFold(rec, next) {
+			t.Errorf("%s records %s as %s, want the renewal %s", n.Name, d.Name, rec, next)
+		}
+	}
+	if st, _ := d.DB.EvaluateOwnRowHold(ctx, corrosion.OwnRowHeldSuperseded); st.Held {
+		t.Errorf("a live renewal raised %s's own-row hold: %+v", d.Name, st)
+	}
+}
+
+// I-4: `lv host isolate B; lv host rm B` on a two-node cluster keeps working:
+// the currency pull has no eligible peer (B is the target, and isolated) and
+// proceeds; the voter majority counted without B is A alone.
+func TestFleet_HostIncarnation_RemoveAnIsolatedPeerOfTwo(t *testing.T) {
+	ctx := context.Background()
+	c, gates := latchedFleet(t, 2, 3730)
+	seedIncPeers(c, gates)
+	useRawGossip(c)
+	a, b := c.Nodes[0], c.Nodes[1]
+	for _, n := range c.Nodes {
+		n.Server.SetAntiEntropy(corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0))
+	}
+	if err := corrosion.IsolateHost(ctx, a.DB, a.Name, b.Name, corrosion.IsolationManual); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := c.SelfClient(a).RemoveHost(ctx, &pb.RemoveHostRequest{Name: b.Name, Force: true})
+	if err != nil {
+		t.Fatalf("removing an isolated peer of a two-node cluster: %v", err)
+	}
+	if resp.GetCertSerial() == "" {
+		t.Errorf("RemoveHost reported nothing: %+v", resp)
+	}
+	if h, _ := corrosion.GetHost(ctx, a.DB, b.Name); h != nil {
+		t.Errorf("%s still lists %s", a.Name, b.Name)
+	}
 }

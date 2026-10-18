@@ -4,10 +4,9 @@ package fleet
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
-	"slices"
 	"testing"
-	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -96,8 +95,10 @@ func TestFleet_HostRuntime_AStaleDBReaddReadsItsRealReport(t *testing.T) {
 		return true
 	})
 
-	// d's daemon starts on its old database: its hosts row there is live, so
-	// it re-records its serial instead of re-admitting, then reports.
+	// d's daemon starts on its old database: its hosts row there is live and
+	// names the removed machine's serial, so the own-row hold (as the daemon
+	// configures it) holds its registration and boot report until the
+	// re-admission reaches it; then it reports.
 	for _, o := range c.Nodes {
 		if o != d {
 			c.SetLinkFaultBoth(d, o, LinkFault{})
@@ -105,43 +106,20 @@ func TestFleet_HostRuntime_AStaleDBReaddReadsItsRealReport(t *testing.T) {
 	}
 	d.repl.Start(c.ctx)
 	d.replStarted = true
-	if err := corrosion.RegisterHost(ctx, d.DB, corrosion.HostRecord{
-		Name: d.Name, Address: d.Address, SSHUser: "root", SSHPort: 22, GRPCPort: d.Port,
-		State: "active", CertSerial: serial, FenceStrategy: "best-effort",
-	}); err != nil {
-		t.Fatalf("register %s: %v", d.Name, err)
+	if st, err := d.DB.ConfigureOwnRowHold(ctx, corrosion.StaticInstalledCert(serial, "")); err != nil || !st.Held {
+		t.Fatalf("%s booted on its old database without the own-row hold: %+v %v", d.Name, st, err)
 	}
-	if err := corrosion.UpdateHostStartup(ctx, d.DB, d.Name, "active", "v-stale-db", 24, 48, 96, true); err != nil {
-		t.Fatalf("boot report of %s: %v", d.Name, err)
-	}
-	// Anti-entropy runs, as it does every minute: it is what spread a retired
-	// row's tombstone over d's own live one. hosts itself is not this test's
-	// subject (TestFleet_StaleDBReaddConvergesOnTheReadmission is);
-	// host_runtime must converge.
-	deadline := time.Now().Add(2 * convergeTimeout)
-	for {
-		for _, n := range c.Nodes {
-			corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(ctx)
+	ownRowReconcileLegacy(t, d, serial)
+	// Every table converges — hosts included, which used to stay apart as an
+	// unresolved control_plane tie, 10 runs out of 10 (eqts).
+	convergeAll(t, c, d.Name+" booted on its old database", d)
+	ref := hostsRowOf(t, a, d.Name)
+	for _, n := range c.Nodes {
+		if got := hostsRowOf(t, n, d.Name); fmt.Sprint(got) != fmt.Sprint(ref) || got["cert_serial"] != serial {
+			t.Errorf("%s holds %s's hosts row as %v, %s as %v", n.Name, d.Name, got, a.Name, ref)
 		}
-		apart, err := divergence(c.Nodes)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !slices.Contains(apart, "host_runtime") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("host_runtime did not converge; apart: %v", apart)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	if apart, _ := divergence(c.Nodes); len(apart) > 0 {
-		t.Logf("tables still apart after anti-entropy: %v", apart)
-		for _, n := range c.Nodes {
-			rows, _ := n.DB.Query(ctx, `SELECT * FROM hosts WHERE name = ?`, d.Name)
-			for _, r := range rows {
-				t.Logf("%s hosts row for %s: %v = %v", n.Name, d.Name, r.Columns, r.Values)
-			}
+		if k := n.DB.UnresolvedTieCount(); k != 0 {
+			t.Errorf("%s tracks %d unresolved tie(s)", n.Name, k)
 		}
 	}
 
@@ -155,5 +133,26 @@ func TestFleet_HostRuntime_AStaleDBReaddReadsItsRealReport(t *testing.T) {
 				"(v-stale-db, %d, 24, 96): its host_runtime row was left retired",
 				n.Name, d.Name, h.Version, h.SchemaVersion, h.CPUTotal, h.DiskTotal, corrosion.CurrentSchemaVersion)
 		}
+	}
+}
+
+// ownRowReconcileLegacy is ownRowReconcile before the release latches: the
+// hold opens on the re-admission, then registration and the boot report run.
+func ownRowReconcileLegacy(t *testing.T, d *Node, serial string) {
+	t.Helper()
+	ctx := context.Background()
+	eventually(t, convergeTimeout, d.Name+"'s own-row hold to open", func() bool {
+		corrosion.NewAntiEntropy(d.DB, d.PKIDir, 0).RunOnce(ctx)
+		st, err := d.DB.EvaluateOwnRowHold(ctx, corrosion.OwnRowHeldSuperseded)
+		return err == nil && !st.Held
+	})
+	if err := corrosion.RegisterHost(ctx, d.DB, corrosion.HostRecord{
+		Name: d.Name, Address: d.Address, SSHUser: "root", SSHPort: 22, GRPCPort: d.Port,
+		State: "active", CertSerial: serial, FenceStrategy: "best-effort",
+	}); err != nil {
+		t.Fatalf("register %s: %v", d.Name, err)
+	}
+	if err := corrosion.UpdateHostStartup(ctx, d.DB, d.Name, "active", "v-stale-db", 24, 48, 96, true); err != nil {
+		t.Fatalf("boot report of %s: %v", d.Name, err)
 	}
 }

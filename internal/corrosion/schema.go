@@ -552,21 +552,34 @@ import (
 //	     its WAL entries. Existing rows migrate with no retirement, so a
 //	     tombstone from before the upgrade still beats a password set after
 //	     it (docs/migration-failover.md). Additive.
-//	v80: security_groups.project (TEXT NOT NULL DEFAULT '') — the project that
+//	v69: hosts.incarnation (INTEGER NOT NULL DEFAULT 0) — the host
+//	     incarnation counter (host_incarnation.go). 0 on every row written
+//	     before the release feature host_incarnation is first used; a
+//	     re-admission over a tombstone at N writes N+1, and nothing else
+//	     raises it. Rows are ordered by (incarnation, created_at,
+//	     cert_serial) ahead of their clock. A previous-release node does not
+//	     write the column and cannot decode the re-admission that raises it,
+//	     which is written only through the feature (ReplicationGated).
+//	     Additive.
+//	v70: security_groups.project (TEXT NOT NULL DEFAULT '') — the project that
 //	     owns a security group; '' is a global group, which every existing
 //	     group migrates as (docs/design/security-group-projects.md). Only a
-//	     project group's insert names the column, and nothing writes one until
-//	     sg_projects_v1 has durably latched (ReplicationGated), so a
-//	     previous-release peer never sees that shape; a global group keeps the
-//	     previous insert. Appended LAST for the v53 digest reason. Additive.
-const CurrentSchemaVersion = 80
+//	     project group's insert names the column, and it is written only
+//	     through the release feature sg_projects (release_2026_11_v1,
+//	     ReplicationGated), so a previous-release peer never sees that shape;
+//	     a global group keeps the previous insert. Appended LAST for the v53
+//	     digest reason. Additive.
+const CurrentSchemaVersion = 70
 
 // schemaVersionSGProjects is the version security_groups.project was added in.
-const schemaVersionSGProjects = 80
+const schemaVersionSGProjects = 70
 
 // schemaVersionCredentialRetirement is the version
 // host_fence_credentials.after_retirement was added in.
 const schemaVersionCredentialRetirement = 68
+
+// schemaVersionHostIncarnation is the version hosts.incarnation was added in.
+const schemaVersionHostIncarnation = 69
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -748,6 +761,10 @@ func (c *Client) migrateAcknowledgedTiesPK(ctx context.Context) error {
 //   - present  → record it (mark-only; the ALTER/CREATE already happened)
 //   - missing  → apply its SQL + record it in ONE local transaction (heal)
 //
+// A missing unit newer than the database's stamped schema_state.version is
+// the upgrade's own step and logs at INFO; one at or below it is a silent gap
+// and logs a WARN.
+//
 // A real apply error aborts LOUDLY (no benign swallowing). Mark-applied is
 // gated on the presence predicate, NEVER on the version number, so a silent
 // gap from the old swallow-benign loop is healed rather than falsely claimed.
@@ -810,8 +827,16 @@ func InitSchema(ctx context.Context, c *Client) error {
 		return fmt.Errorf("load applied_migrations: %w", err)
 	}
 
+	// The version the database was stamped at before this run. A missing unit
+	// newer than it is this upgrade's own step; one at or below it is a gap a
+	// prior daemon left. A fresh database has no stamp, so nothing is a gap.
+	stamped := 0
+	if rows, err := c.Query(ctx, `SELECT version FROM schema_state WHERE id = 1`); err == nil && len(rows) > 0 {
+		stamped = rows[0].Int("version")
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339)
-	healed := 0
+	healed, upgraded := 0, 0
 	for _, m := range schemaMigrationLedger {
 		sum := sha256hex(m.SQL)
 		if stored, ok := applied[m.ID]; ok {
@@ -858,8 +883,14 @@ func InitSchema(ctx context.Context, c *Client) error {
 		if err := c.execBatchLocal(ctx, stmts); err != nil {
 			return fmt.Errorf("schema migration %q: %w", m.ID, err)
 		}
+		if m.Version > stamped {
+			slog.Info("schema ledger: applied a migration of this upgrade",
+				"id", m.ID, "target", m.Target, "migration_version", m.Version, "db_version", stamped)
+			upgraded++
+			continue
+		}
 		slog.Warn("schema ledger: healed a missing migration (silent gap from a prior daemon)",
-			"id", m.ID, "target", m.Target)
+			"id", m.ID, "target", m.Target, "migration_version", m.Version, "db_version", stamped)
 		healed++
 	}
 
@@ -883,7 +914,7 @@ func InitSchema(ctx context.Context, c *Client) error {
 	// Seed the effective DB-applied schema cache (handshake source of truth).
 	eff := c.RefreshDBSchemaVersion(ctx)
 	slog.Info("schema initialized",
-		"schema_version", eff, "ledger", len(schemaMigrationLedger), "healed", healed)
+		"schema_version", eff, "ledger", len(schemaMigrationLedger), "upgraded", upgraded, "healed", healed)
 	return nil
 }
 
@@ -1245,7 +1276,8 @@ var schemaDDL = []string{
 		deleted_at   TEXT,
 		version      TEXT DEFAULT '',
 		region       TEXT NOT NULL DEFAULT 'default',
-		capacity_policy_hash TEXT NOT NULL DEFAULT ''
+		capacity_policy_hash TEXT NOT NULL DEFAULT '',
+		incarnation  INTEGER NOT NULL DEFAULT 0
 	)`,
 
 	`CREATE TABLE IF NOT EXISTS host_labels (
@@ -3502,6 +3534,8 @@ var schemaMigrations = []string{
 	// The retirement a live fence credential was set after (see History,
 	// schemaVersionCredentialRetirement).
 	`ALTER TABLE host_fence_credentials ADD COLUMN after_retirement TEXT NOT NULL DEFAULT ''`,
+	// The host incarnation counter (see History, schemaVersionHostIncarnation).
+	`ALTER TABLE hosts ADD COLUMN incarnation INTEGER NOT NULL DEFAULT 0`,
 	// The project that owns a security group; '' = global (see History,
 	// schemaVersionSGProjects).
 	`ALTER TABLE security_groups ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
@@ -3598,6 +3632,7 @@ var alterVersions = []int{
 	54,                                // runtime_action_proofs.lease_key
 	60,                                // runtime_action_proofs.claim_certificate
 	schemaVersionCredentialRetirement, // host_fence_credentials.after_retirement
+	schemaVersionHostIncarnation,      // hosts.incarnation
 	schemaVersionSGProjects,           // security_groups.project
 }
 

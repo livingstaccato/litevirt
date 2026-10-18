@@ -18,6 +18,8 @@ var latchGatedShapes = map[string][]string{
 		containerPlacementMintSQL, // MintContainerPlacement
 		imageHostReviveSQL,        // ReviveImageHost
 		deleteNetworkVTEPsSQL,     // DeleteNetworkAndVTEPs
+		readmitHostV2SQL,          // AdmitHostV2 (host_incarnation)
+		hostOwnEndpointSQL,        // WriteOwnEndpoint (host_incarnation)
 	},
 }
 

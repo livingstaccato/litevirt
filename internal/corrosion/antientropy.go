@@ -43,6 +43,9 @@ type AntiEntropy struct {
 	// checkFrom answers OnUnknownReleaseToken's look; nil uses
 	// CheckReleaseUsesFrom. Tests replace it.
 	checkFrom func(ctx context.Context, peer string) error
+	// tablePull pulls and merges one table from one peer for PullTableNow;
+	// nil uses the real pull (pullTableFrom). Tests replace it.
+	tablePull func(ctx context.Context, peer, table string) error
 
 	// mu guards the trigger decision only (not the pass itself): a pass no-ops when one is
 	// already running or ran within antiEntropyCooldown. It never bypasses checkPeers's

@@ -402,6 +402,10 @@ type Server struct {
 	commitFenceHook func(op string)
 	// createCommittedHook is a test-only seam; see SetCreateCommittedHook.
 	createCommittedHook func(name string) error
+	// createBeforeFlightHook, when set, runs on the owner between a create's
+	// first existence check and its in-flight registration (beginCreate).
+	// Test seam only; nil in production.
+	createBeforeFlightHook func(name string)
 	// createReturnedHook is a test-only seam; see SetCreateReturnedHook.
 	createReturnedHook func(name string, err error)
 	// stackMemberDeleteHook is a test-only seam: DeleteStack calls it with
@@ -958,6 +962,11 @@ type Server struct {
 
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
+	// createFlights holds each create this host runs as the VM's owner until
+	// it returns: a second create of the name is refused while one is in
+	// flight (create_inflight.go).
+	createFlightsMu sync.Mutex
+	createFlights   map[*createFlight]struct{}
 	// vmLockQueues holds the callers waiting for a VM's lock through
 	// lockVMUnlessStartHeld (vm_start_bound.go).
 	vmLockQueuesMu sync.Mutex
@@ -1109,6 +1118,9 @@ type Server struct {
 	// it so `lv cluster converge` kicks an immediate (debounced) pass instead of waiting
 	// for the periodic tick. Same synchronous-push pattern as fwReconciler.
 	antiEntropy AntiEntropyTrigger
+	// hostWriteCurrency turns on the caught-up check for the operator's hosts
+	// writes (host_incarnation.go). The daemon turns it on.
+	hostWriteCurrency atomic.Bool
 
 	// tenancy gates CreateVM/stack admission against project quotas
 	// and emits metered billing events. Optional — nil means
@@ -1210,6 +1222,16 @@ type Server struct {
 	// releaseRollout: the HA monitor's cached rollout answers
 	// (releaseRolloutLagging). Guarded by releasePeerMu.
 	releaseRollout map[string]*rolloutAnswer
+	// schemaRefusedMu guards schemaRefused: each sender whose push this node
+	// refused because its schema is ahead (schema_refusal_health.go).
+	schemaRefusedMu sync.Mutex
+	schemaRefused   map[string]corrosion.SchemaRefusal
+	// schemaResolvedSeen is, per subject, the resolution of its
+	// replication_peer_schema_behind row this node last saw and when, on its
+	// own clock. Guarded by schemaRefusedMu.
+	schemaResolvedSeen map[string]schemaResolutionSeen
+	// schemaRefusalGraceOverride replaces schemaRefusalGrace in tests.
+	schemaRefusalGraceOverride atomic.Pointer[time.Duration]
 	// adoptedVoterGen is the voter generation AdoptVoterConfigs last found
 	// adopted, which Ping reports (PingResponse.voter_generation).
 	adoptedVoterGen atomic.Int64

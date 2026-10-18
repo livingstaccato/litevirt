@@ -161,6 +161,7 @@ lv host upgrade --binary <path> [host...] # Rolling upgrade of litevirt
   [--yes]                                 # Skip confirmation prompt
   [--force]                               # Skip preflight blocks (warnings still printed)
   [--no-prestage]                         # Skip the cluster-wide schema pre-stage pass
+  [--skip-prestage <host>[,<host>]]       # Members that are down: leave them on their schema
 lv host preflight-upgrade <host>          # Report preflight findings without upgrading
 lv host label set <host> key=value ...    # Set labels on a host
 lv host label rm <host> <key> ...         # Remove labels from a host

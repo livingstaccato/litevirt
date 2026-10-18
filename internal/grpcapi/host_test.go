@@ -511,3 +511,30 @@ func TestRemoveHost_ResolvesTheHostsHeldLineConditions(t *testing.T) {
 		}
 	}
 }
+
+// Lab test 26, F5: PreflightRemoveHost gives RemoveHost's refusals and
+// removes nothing, refused or not.
+func TestPreflightRemoveHost_RefusesAsRemoveHostAndRemovesNothing(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	insertTestHost(t, ctx, s.db, "busy-host3", "active")
+	corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "vm-on-busy3", HostName: "busy-host3", State: "running"}, nil, nil)
+	h, _ := corrosion.GetHost(ctx, s.db, "busy-host3")
+	if h == nil {
+		t.Fatal("fixture: no host")
+	}
+	_, err := s.PreflightRemoveHost(ctx, &pb.RemoveHostRequest{Name: "busy-host3"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("preflight of a host with VMs = %v, want RemoveHost's FailedPrecondition", err)
+	}
+	_, err = s.PreflightRemoveHost(ctx, &pb.RemoveHostRequest{Name: "busy-host3", ExpectedCertSerial: "ffff"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("preflight naming another serial = %v, want FailedPrecondition", err)
+	}
+	if _, err := s.PreflightRemoveHost(ctx, &pb.RemoveHostRequest{Name: "busy-host3", Force: true, ExpectedCertSerial: h.CertSerial}); err != nil {
+		t.Errorf("preflight of a removal RemoveHost would make: %v", err)
+	}
+	if h, _ := corrosion.GetHost(ctx, s.db, "busy-host3"); h == nil {
+		t.Error("a preflight removed the host")
+	}
+}

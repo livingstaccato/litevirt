@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -162,13 +163,65 @@ func (w *certWatch) recordHostSerial(ctx context.Context) {
 		return
 	}
 	if _, err := corrosion.RecordOwnCertSerial(ctx, w.db, w.host, serial); err != nil {
+		if errors.Is(err, corrosion.ErrCertSwappedAtRuntime) {
+			slog.Warn("this host's certificate was replaced while the daemon runs, not renewed; its serial is "+
+				"re-recorded when the daemon restarts", "serial", serial, "error", err)
+			w.reportSwap(ctx, serial)
+			return
+		}
 		slog.Warn("could not re-record this host's certificate serial; peers accept the renewed "+
 			"certificate by its predecessor until this succeeds", "serial", serial, "error", err)
 		return
 	}
+	if !w.reportSwap(ctx, "") {
+		return // resolve again on the next tick
+	}
 	w.mu.Lock()
 	w.recorded = serial
 	w.mu.Unlock()
+}
+
+type certSwapEvidence struct {
+	RecordedSerial string `json:"recorded_serial"`
+	ServingSerial  string `json:"serving_serial"`
+	Remedy         string `json:"remedy"`
+}
+
+// reportSwap raises cert_swapped_at_runtime for serving (a certificate the
+// daemon serves but may not record until it restarts), or resolves it when
+// serving is "". It reports whether the condition now says so.
+func (w *certWatch) reportSwap(ctx context.Context, serving string) bool {
+	cur, ok, err := corrosion.GetHealthCondition(ctx, w.db, certEvaluatorName, condCertSwappedAtRuntime, "host", w.host)
+	if err != nil {
+		return false
+	}
+	ts := time.Now().UTC().Format(time.RFC3339)
+	open := ok && cur.Lifecycle != corrosion.ConditionResolved
+	if serving == "" {
+		if !open {
+			return true
+		}
+		cur.Lifecycle, cur.ResolvedAt, cur.LastSeen, cur.Reporter = corrosion.ConditionResolved, ts, ts, w.host
+		return corrosion.UpsertHealthCondition(ctx, w.db, cur) == nil
+	}
+	_, _, recorded, _, _, rerr := corrosion.HostIncarnationOf(ctx, w.db, w.host)
+	if rerr != nil {
+		return false
+	}
+	ev, _ := json.Marshal(certSwapEvidence{RecordedSerial: strings.ToLower(recorded), ServingSerial: serving,
+		Remedy: "restart the daemon on this host (systemctl restart litevirt); its serial is recorded at start"})
+	if open && cur.Evidence == string(ev) {
+		return true
+	}
+	first := ts
+	if open && cur.FirstSeen != "" {
+		first = cur.FirstSeen
+	}
+	return nil == corrosion.UpsertHealthCondition(ctx, w.db, corrosion.HealthCondition{
+		Evaluator: certEvaluatorName, Code: condCertSwappedAtRuntime, SubjectKind: "host", SubjectID: w.host,
+		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityWarning, Hosts: []string{w.host},
+		Evidence: string(ev), ObserveCount: 1, FirstSeen: first, LastSeen: ts, ConfirmedAt: first, Reporter: w.host,
+	})
 }
 
 // certTier is 0 (fine), 1 (within certWarnBefore), 2 (within certCritBefore)
@@ -237,6 +290,12 @@ func CertWatchOnce(ctx context.Context, host, pkiDir string, db *corrosion.Clien
 // — so a degraded condition naming the file and the fix is how an operator
 // hears about it.
 const condKeyFileUnsafe = "key_file_unsafe"
+
+// condCertSwappedAtRuntime is raised while this host serves a certificate
+// swapped in while the daemon runs that is not a renewal of the one its
+// counted row records (corrosion.ErrCertSwappedAtRuntime): the serial is not
+// recorded, and peers refuse the certificate, until the daemon restarts.
+const condCertSwappedAtRuntime = "cert_swapped_at_runtime"
 
 type keyFileEvidence struct {
 	File     string   `json:"file"`

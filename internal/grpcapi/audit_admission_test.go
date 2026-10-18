@@ -5,14 +5,27 @@ import (
 	"testing"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/apimeta"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 func admit(s *Server, name string) (*pb.AdmitHostResponse, error) {
-	return s.AdmitHost(adminCtx(), &pb.AdmitHostRequest{Name: name, Address: "10.0.0.9", CertSerial: "0a0b0c"})
+	return admitFrom(s, name, true)
+}
+
+// admitFrom is admit from an lv that names the release it installs
+// (this release's), or, with current false, from a previous release's.
+func admitFrom(s *Server, name string, current bool) (*pb.AdmitHostResponse, error) {
+	ctx := adminCtx()
+	if current {
+		ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(apimeta.AdmitInstallsReleaseHeader, capabilities.ReleaseToken))
+	}
+	return s.AdmitHost(ctx, &pb.AdmitHostRequest{Name: name, Address: "10.0.0.9", CertSerial: "0a0b0c"})
 }
 
 // TestAdmitHost_AHeldAdmitterRefuses is I-A: a node that is itself holding its

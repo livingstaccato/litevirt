@@ -83,8 +83,11 @@ func ReadPassword(ctx context.Context, prompt string) (string, error) {
 		err error
 	}
 	ch := make(chan result, 1)
+	// Read the seam here, not in the goroutine: a cancelled prompt leaves the
+	// reader running, and it must not touch the package variable afterwards.
+	read := readPasswordFd
 	go func() {
-		pw, err := readPasswordFd(fd)
+		pw, err := read(fd)
 		ch <- result{pw, err}
 	}()
 	select {

@@ -131,6 +131,10 @@ var releaseFeatures = map[Feature]FeatureInfo{
 		Writers: []string{"internal/corrosion.SetFirewallSynflood"}},
 	FeatureFirewallLog:       {Token: Release202611V1, Description: "Firewall logging: logged rules and the cluster and per-host log policy", Writers: firewallRuleWriters},
 	FeatureFirewallTagGroups: {Token: Release202611V1, Description: "Firewall tag groups, per-workload firewall tags, and rules matching a tag group's addresses", Writers: firewallTagGroupWriters},
+
+	// Used only when a removed host is added again.
+	FeatureHostIncarnation: {Token: Release202611V1, Description: "Host incarnation counter: a removed host re-added under its name is a new incarnation that no copy of the removed machine's row overrides (used when a removed host is re-added)",
+		Writers: []string{"internal/corrosion.AdmitHostV2", "internal/corrosion.WriteOwnEndpoint"}},
 }
 
 // firewallRuleWriters write the three rule tables. Each takes one grant per
@@ -206,6 +210,7 @@ const (
 	FeatureFirewallSynflood  Feature = "firewall_synflood"
 	FeatureFirewallLog       Feature = "firewall_log"
 	FeatureFirewallTagGroups Feature = "firewall_tag_groups"
+	FeatureHostIncarnation   Feature = "host_incarnation"
 )
 
 // LookupFeature returns a declared feature's token and description.

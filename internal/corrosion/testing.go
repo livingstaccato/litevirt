@@ -141,7 +141,7 @@ func NewTestClient() (*Client, error) {
 	// Test clients start as replicas that have merged the sensitive lane, as
 	// they start converged; a test of the gate resets it
 	// (MarkSensitiveLaneUnmergedForTests).
-	c.sensitiveLaneMerged.Store(true)
+	c.sensitiveMerges.assumeForTests(true)
 	return c, nil
 }
 
@@ -218,7 +218,7 @@ func NewSharedTestClient(dsnSuffix, hostName string) (*Client, error) {
 	// Test clients start as replicas that have merged the sensitive lane, as
 	// they start converged; a test of the gate resets it
 	// (MarkSensitiveLaneUnmergedForTests).
-	c.sensitiveLaneMerged.Store(true)
+	c.sensitiveMerges.assumeForTests(true)
 	return c, nil
 }
 
@@ -413,4 +413,4 @@ func (c *Client) ResetAuditSeededForTests() {
 
 // MarkSensitiveLaneUnmergedForTests puts c back in the state of a process that
 // has not completed a sensitive-lane exchange with any peer yet.
-func (c *Client) MarkSensitiveLaneUnmergedForTests() { c.sensitiveLaneMerged.Store(false) }
+func (c *Client) MarkSensitiveLaneUnmergedForTests() { c.sensitiveMerges.assumeForTests(false) }

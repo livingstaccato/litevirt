@@ -23,9 +23,19 @@ import (
 // credential upsert over a LOCAL tombstone whose entry carries no other hosts
 // write of that host's password is not applied here. It is checked on the WAL
 // apply path and on the local write path alike, and every node on this build
-// keeps the same tombstone. Sensitive-lane anti-entropy carries rows, not
-// entries, so it is not covered here; the copy gate at the origin is
-// (SensitiveLaneMerged).
+// keeps the same tombstone.
+//
+// THE SENSITIVE LANE. The origin of such a revive holds the live row itself,
+// and anti-entropy would carry it to every node as a ROW, newer than the
+// tombstone, with no entry to judge. A row cannot say whether an operator
+// wrote it, so a row merge never turns a retired host credential live
+// (mergeKeepsRetiredCredential). The operator's write still reaches every node
+// by its entry. What a row merge cannot deliver is an operator revive that a
+// node missed on the WAL lane altogether; that node keeps the credential
+// retired, fences that host with "no IPMI password" until the password is set
+// again, and its digest for host_fence_credentials differs from its peers'
+// until then. That is the fail-closed side, chosen over letting any previous
+// build's stale copy back in.
 
 var (
 	hostCredentialUpsertFingerprint = mustStatementFingerprint(HostFenceCredentialUpsertSQL)
@@ -80,4 +90,33 @@ func entryWritesHostPassword(entry []Statement, host string) bool {
 		return true
 	}
 	return false
+}
+
+// mergeKeepsRetiredCredential reports whether an anti-entropy row for
+// host_fence_credentials would turn a credential retired on this node live.
+// It is refused whatever its updated_at: see THE SENSITIVE LANE above. A
+// retired incoming row, or one for a host with no local row or a live one,
+// merges as usual.
+func mergeKeepsRetiredCredential(tx *sql.Tx, table syncTable, row []interface{}) (bool, error) {
+	if table.Name != "host_fence_credentials" {
+		return false, nil
+	}
+	hi, di := indexOf(table.Columns, "host_name"), indexOf(table.Columns, "deleted_at")
+	if hi < 0 || di < 0 || hi >= len(row) || di >= len(row) || coerceString(row[di]) != "" {
+		return false, nil
+	}
+	host := coerceString(row[hi])
+	var deleted sql.NullString
+	err := tx.QueryRow(`SELECT deleted_at FROM host_fence_credentials WHERE host_name = ?`, host).Scan(&deleted)
+	switch {
+	case err == sql.ErrNoRows:
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	if !deleted.Valid || deleted.String == "" {
+		return false, nil
+	}
+	slog.Warn("anti-entropy: not reviving a retired fence credential from a peer's row", "host", host)
+	return true, nil
 }

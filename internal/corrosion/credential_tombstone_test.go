@@ -66,8 +66,8 @@ func TestGetHost_ARetiredCredentialIsNotReadFromTheOldColumn(t *testing.T) {
 		t.Fatalf("GetHost = %s", hostPassState(h, err))
 	}
 	if h.IPMIPass != "" {
-		t.Errorf("GetHost served IPMIPass %q from the old column over a retired credential row; want none",
-			h.IPMIPass)
+		t.Errorf("GetHost served IPMIPass %s from the old column over a retired credential row; want none",
+			redactedPass(h.IPMIPass))
 	}
 	if !h.IPMIPassRetired {
 		t.Error("GetHost did not report the credential row as retired; a fence cannot say why it has no password")
@@ -205,8 +205,9 @@ func TestSplitCredentials_NoHostCopyBeforeTheSensitiveLaneMerged(t *testing.T) {
 	if _, ok := liveCredential(t, c); ok || rep.Copied != 0 {
 		t.Fatalf("a node that has not merged the sensitive lane copied a host password (report %+v)", rep)
 	}
-	// Once merged (a peer had no row either), the copy proceeds.
-	c.markSensitiveLaneMerged("peer")
+	// Once merged with host-x, the only voter (a peer with no row either), the
+	// copy proceeds.
+	c.markSensitiveLaneMerged("host-x")
 	if rep, err = c.SplitCredentials(ctx); err != nil || rep.Copied != 1 {
 		t.Fatalf("after the sensitive lane merged: report %+v, err %v; want the copy", rep, err)
 	}
@@ -346,3 +347,38 @@ const operatorConfigureHostSQL = `UPDATE hosts SET ` +
 	`mem_reserve_mib = COALESCE(?, mem_reserve_mib), ` +
 	`updated_at = ? ` +
 	`WHERE name = ?`
+
+// Review m-5: merging with one peer that holds nothing either (another node
+// that joined on an empty database) does not open the copy. Only a majority of
+// the voter set does. Mutation: open the gate on any one merge — red.
+func TestSplitCredentials_OneEmptyPeerDoesNotOpenTheHostCopy(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	c.SetCredentialsSplitGate(func() bool { return true })
+	for _, n := range []string{c.HostName(), "p1", "p2", "p3", "p4"} {
+		if err := InsertHost(ctx, c, HostRecord{
+			Name: n, Address: "10.0.0.1", SSHUser: "root", SSHPort: 22, GRPCPort: 7443,
+			State: "active", CertSerial: "01-" + n, FenceStrategy: "ipmi",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := c.DB().Exec(`UPDATE hosts SET ipmi_pass = 'P4-Pass', updated_at = ? WHERE name = 'p4'`, credTS); err != nil {
+		t.Fatal(err)
+	}
+	c.MarkSensitiveLaneUnmergedForTests()
+	c.markSensitiveLaneMerged("p1")
+	if rep, err := c.SplitCredentials(ctx); err != nil || rep.Copied != 0 || rep.Deferred != 1 {
+		t.Fatalf("merged with one of four peers: report %+v, err %v; want the host copy deferred", rep, err)
+	}
+	if c.CredentialsLive() {
+		t.Error("a pass that deferred a host copy made this node live")
+	}
+	c.markSensitiveLaneMerged("p2")
+	if rep, err := c.SplitCredentials(ctx); err != nil || rep.Copied != 1 || rep.Deferred != 0 {
+		t.Fatalf("merged with a majority: report %+v, err %v; want the copy", rep, err)
+	}
+	if !c.CredentialsLive() {
+		t.Error("a complete pass did not make this node live")
+	}
+}

@@ -179,6 +179,10 @@ type CredentialSplitReport struct {
 	Copied int
 	// Cleared counts old columns emptied (credentials_clear_v1 only).
 	Cleared int
+	// Deferred counts host passwords with no credential row left as they are
+	// until this node may copy them (mayCopyHostCredentials). A pass that
+	// deferred any does not make this node live (credentials_live.go).
+	Deferred int
 }
 
 // The pass reads each parent together with its credential row, including
@@ -361,12 +365,20 @@ func (c *Client) SplitCredentials(ctx context.Context) (CredentialSplitReport, e
 		// clear cannot latch before this node is live (the advertisement
 		// gate), so this only orders a node whose gates opened together.
 		if !c.CredentialsLive() {
-			if _, err := c.copyCredentialColumns(ctx); err != nil {
+			copied, err := c.copyCredentialColumns(ctx)
+			if err != nil {
 				return rep, err
+			}
+			// Not live yet, and not until the deferred host copies are made:
+			// no clear may be in view of the first live pass.
+			if copied.Deferred > 0 {
+				return copied, nil
 			}
 		}
 		rep, err := c.clearCredentialColumns(ctx)
-		c.afterCredentialPass(ctx, err)
+		if rep.Deferred == 0 {
+			c.afterCredentialPass(ctx, err)
+		}
 		return rep, err
 	}
 	return c.copyCredentialColumns(ctx)
@@ -400,6 +412,7 @@ func (c *Client) copyCredentialColumns(ctx context.Context) (CredentialSplitRepo
 			// write, and a peer that holds the row repairs it here.
 			slog.Info("credentials split: a host's password has no credential row and this node has not "+
 				"merged the sensitive lane yet; not copied", "host", r.pk)
+			rep.Deferred++
 			continue
 		}
 		rep.note(c.copyHostCredential(ctx, r.pk, r.oldVal, c.copyTS(r)), "host_fence_credentials", note)
@@ -418,7 +431,11 @@ func (c *Client) copyCredentialColumns(ctx context.Context) (CredentialSplitRepo
 			rep.note(c.copyTokenCredential(ctx, r.pk, r.oldVal, c.copyTS(r)), "token_credentials", note)
 		}
 	}
-	c.afterCredentialPass(ctx, firstErr)
+	// Live means every old-column secret has a credential row; a deferred
+	// host copy is one that does not yet.
+	if rep.Deferred == 0 {
+		c.afterCredentialPass(ctx, firstErr)
+	}
 	return rep, firstErr
 }
 
@@ -496,6 +513,7 @@ func (c *Client) clearCredentialColumns(ctx context.Context) (CredentialSplitRep
 		if r.needsCopy() && !mayCopyHosts {
 			slog.Info("credentials clear: a host's password has no credential row and this node has not "+
 				"merged the sensitive lane yet; left uncleared until it has", "host", r.pk)
+			rep.Deferred++
 			continue
 		}
 		val, ts, copied := c.credentialFor(r)

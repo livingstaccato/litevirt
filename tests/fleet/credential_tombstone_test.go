@@ -232,7 +232,7 @@ func TestFleet_AJoinerWithoutTheTombstoneDoesNotRevive(t *testing.T) {
 	d.repl.Start(c.ctx)
 	d.replStarted = true
 	convergeByAntiEntropy(t, c, 2*convergeTimeout)
-	if !e.DB.SensitiveLaneMerged() {
+	if ok, err := e.DB.MayCopyHostCredentials(ctx); err != nil || !ok {
 		t.Fatalf("%s never recorded a sensitive-lane merge", e.Name)
 	}
 	// Its next pass, now merged, holds the tombstone and copies nothing.
@@ -250,11 +250,12 @@ func TestFleet_AJoinerWithoutTheTombstoneDoesNotRevive(t *testing.T) {
 // on this build must keep its tombstone. That build's writer cannot be fixed;
 // the entry, which carries no operator password write, is what is refused.
 //
-// Only the WAL lane is exercised: a row merge carries no entry, and the
-// previous build's live row reaches a sensitive pull as a row (the copy gate
-// at the origin is the defence there, on this build).
+// Then anti-entropy runs: d still holds the live row, newer than the
+// tombstone, and every survivor's sensitive pull from d finds it. A row
+// carries no entry to judge, so no row merge turns a retired credential live.
 //
-// Mutation: remove the receiver's revive guard — red on every survivor.
+// Mutations: remove the receiver's WAL revive guard — red at the WAL-lane
+// check; remove the anti-entropy merge guard — red after the pulls.
 func TestFleet_APreviousBuildsReviveIsRefused(t *testing.T) {
 	ctx := context.Background()
 	const oldPass = "Old-Machine-Pass-5104"
@@ -288,5 +289,17 @@ func TestFleet_APreviousBuildsReviveIsRefused(t *testing.T) {
 		}
 		return true
 	})
+	assertRetiredEverywhere(t, survivors, d)
+
+	// The sensitive lane: every survivor pulls from d (and from each other)
+	// several times over.
+	for range 3 {
+		for _, n := range c.Nodes {
+			corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(ctx)
+		}
+	}
+	if fs := fenceSettingsOf(t, d, d.Name); !fs.hasCredRow {
+		t.Fatalf("fixture: %s no longer holds the previous build's live row; the pulls proved nothing", d.Name)
+	}
 	assertRetiredEverywhere(t, survivors, d)
 }

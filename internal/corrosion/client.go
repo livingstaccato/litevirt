@@ -432,9 +432,9 @@ type Client struct {
 	// credentialsLiveFile. credentialsLiveChecked makes the file read once.
 	credentialsLive        atomic.Bool
 	credentialsLiveChecked atomic.Bool
-	// sensitiveLaneMerged is set once this process has completed a
-	// sensitive-lane anti-entropy exchange with a peer (SensitiveLaneMerged).
-	sensitiveLaneMerged atomic.Bool
+	// sensitiveMerges records the peers this process has completed a
+	// sensitive-lane anti-entropy exchange with (credentials_sensitive_merged.go).
+	sensitiveMerges sensitiveMergeState
 	// The credentials baseline and the external-seen set
 	// (credentials_live.go), guarded by externalSeenMu.
 	externalSeenMu  sync.Mutex

@@ -15,7 +15,8 @@ import (
 
 // "Credentials live": this node has completed a SplitCredentials pass with the
 // credentials_split_v1 gate open, so every secret it held in an old column has
-// a credential row.
+// a credential row. A pass that left a host password uncopied until the
+// sensitive lane merged (CredentialSplitReport.Deferred) does not count.
 //
 // Two things hang on it.
 //

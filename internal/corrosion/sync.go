@@ -951,6 +951,15 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 			skipped++
 			continue
 		}
+		// A live host credential row never revives one retired here
+		// (credentials_revive_guard.go).
+		if keep, kerr := mergeKeepsRetiredCredential(tx, table, row); kerr != nil {
+			_ = tx.Rollback()
+			return merged, skipped, kerr
+		} else if keep {
+			skipped++
+			continue
+		}
 		// Workload create commits carry child rows whose schemas predate owner
 		// epochs. Fence them against the source workload identity captured from
 		// this payload and the authority that actually landed locally. This runs

@@ -1643,6 +1643,12 @@ func isGuardedTransitionSQL(sql string) bool {
 // must replay. strict makes a statement that changed no row a refusal: it is
 // neither relayed nor parked (see ExecuteRowsStrict).
 func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, notify, strict bool) (int64, error) {
+	return c.executeBatchWithLifecycle(ctx, stmts, notify, strict, nil)
+}
+
+// executeBatchWithLifecycle adds only private originating source observations.
+// The replicated statement payload and existing atomic write path are unchanged.
+func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statement, notify, strict bool, life *lifecycleMutation) (int64, error) {
 	if reason := c.quarantineReason(); reason != "" {
 		return 0, errQuarantined(reason)
 	}
@@ -1656,6 +1662,14 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	if err != nil {
 		c.mu.Unlock()
 		return 0, fmt.Errorf("begin tx: %w", err)
+	}
+
+	if life != nil {
+		if err := life.before(ctx, tx); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return 0, err
+		}
 	}
 
 	var affected int64
@@ -1745,6 +1759,14 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 			tx.Rollback()
 			c.mu.Unlock()
 			return 0, fmt.Errorf("write mutation_log: %w", err)
+		}
+	}
+
+	if life != nil {
+		if err := life.after(ctx, tx); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return 0, err
 		}
 	}
 

@@ -511,9 +511,13 @@ func scanPkg(pkg *packages.Package) []finding {
 					if len(call.Args) >= 2 {
 						got = []finding{resolveSQL(pkg, call.Args[1])}
 					}
-				case "ExecuteBatch": // (ctx, stmts)
+				case "ExecuteBatch", "executeLifecycleBatch", "executeBatchWithLifecycle": // (ctx, stmts, ...)
 					if len(call.Args) >= 2 {
 						got = s.resolveBatchArg(call.Args[1])
+					}
+				case "executeCredentialBatch": // (ctx, authenticated, kind, id, username, stmts)
+					if len(call.Args) >= 6 {
+						got = s.resolveBatchArg(call.Args[5])
 					}
 				case "ExecuteBatchGuarded": // (ctx, guard, stmts)
 					if len(call.Args) >= 3 {
@@ -538,7 +542,7 @@ func scanPkg(pkg *packages.Package) []finding {
 func isReplicatingMethod(m string) bool {
 	switch m {
 	case "Execute", "ExecuteRows", "ExecuteRowsStrict", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchGuarded",
-		"ExecuteEntriesGuarded":
+		"ExecuteEntriesGuarded", "executeLifecycleBatch", "executeCredentialBatch", "executeBatchWithLifecycle":
 		return true
 	}
 	return false
@@ -556,7 +560,7 @@ func isPlumbingMethod(pkg *packages.Package, fd *ast.FuncDecl) bool {
 	}
 	switch fd.Name.Name {
 	case "Execute", "ExecuteRows", "ExecuteRowsStrict", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchGuarded",
-		"ExecuteEntriesGuarded", "executeBatchInternal", "execLocal", "execLocalRows", "execBatchLocal":
+		"ExecuteEntriesGuarded", "executeBatchInternal", "executeBatchWithLifecycle", "executeLifecycleBatch", "executeCredentialBatch", "execLocal", "execLocalRows", "execBatchLocal":
 		return true
 	}
 	return false

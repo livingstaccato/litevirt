@@ -73,8 +73,12 @@ func TestMirrorRepointsADeadAddressOnlyOnceLatched(t *testing.T) {
 	nb.DeleteAddressDirect(dead)
 
 	// Stage 1: not latched — a previous-release peer may be listening.
+	// On every node: whichever holds the `netbox` lease runs the pass, and a
+	// pass declined for want of the lease records nothing.
 	m := &mirrorSweepCounter{sweepMetrics: newSweepMetrics()}
-	n.Server.SetNetBoxMetrics(m)
+	for _, node := range c.Nodes {
+		node.Server.SetNetBoxMetrics(m)
+	}
 	posts := nb.AddressPOSTs()
 	mustSyncAllNodes(t, c)
 	if got := nb.AddressPOSTs(); got != posts {
@@ -112,7 +116,11 @@ func TestMirrorRepointsADeadAddressOnlyOnceLatched(t *testing.T) {
 			t.Fatalf("%s: the lease names %d, want the re-created %d", node.Name, got, repaired)
 		}
 	}
-	if !repointStatementLogged(t, n) {
+	var logged bool
+	for _, node := range c.Nodes {
+		logged = logged || repointStatementLogged(t, node)
+	}
+	if !logged {
 		t.Fatal("the re-point was applied without reaching the replication log")
 	}
 	if got := nb.VMPrimaryIP4("vm-1"); got != repaired {

@@ -183,6 +183,7 @@ rule maps to litevirt as follows:
 | `[OPTIONS] enable: 1; policy_in: DROP` | `firewall: { default-deny: true }` |
 | Security group `web` with rules | `security-groups: { web: { rules: [...] } }` |
 | NIC binding `IPFILTER, "+vmgroup"` | `network[].security-groups: [vmgroup]` |
+| `host.fw` `[OPTIONS] protection_synflood: 1` (`protection_synflood_rate`, `protection_synflood_burst`) | `lv firewall synflood on --scope <host> --rate <rate> --burst <burst>`, or without `--scope` for every host (not in compose) |
 
 Example translation:
 

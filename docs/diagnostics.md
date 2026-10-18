@@ -1779,6 +1779,17 @@ created and torn down. `lv rm <vm>` removes the VM; deploying the stack again
 next pass after either. A VM created after the stack was torn down is a
 deploy of that stack name in progress, and is not reported.
 
+### SYN-flood and policy conditions (`firewall.synflood.unavailable`, `firewall.policy.unreadable`)
+
+Raised per host by its firewall reconciler, severity warning, and resolved on
+the next pass that no longer finds the cause. docs/firewall.md, "SYN-flood
+protection".
+
+| Condition | Raised when |
+|---|---|
+| `firewall.synflood.unavailable` | the SYN-flood policy is on for this host, but its kernel refused the SYN-flood rules at daemon start (`nft_limit` missing): its guest NICs are not protected. Restart the daemon once the module loads |
+| `firewall.policy.unreadable` | a firewall policy row cannot be read here; the evidence names the key and what is enforced instead (SYN-flood: on at 200/1000). Set it again (`lv firewall synflood on`, `off` or `inherit`) |
+
 ### Tag-group conditions (`firewall.tag_group.*`)
 
 Raised per host by its firewall reconciler, and resolved on the next pass that

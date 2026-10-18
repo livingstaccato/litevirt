@@ -6630,6 +6630,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			}
 		}
 		s.firmware.ApplyTo(&vmCfg, s.dataDir, spec.Name, spec.SecureBoot, spec.Tpm)
+		if err := ensureNvramDir(&vmCfg); err != nil {
+			return nil, err
+		}
 
 		s.withNICMTU(&vmCfg)
 		var gerr error

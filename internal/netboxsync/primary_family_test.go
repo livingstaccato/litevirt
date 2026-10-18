@@ -154,3 +154,29 @@ func TestDiffNeverClearsAnOperatorsPrimaryIP6WithoutALeasedIPv6(t *testing.T) {
 		t.Fatalf("the mirror rewrote an operator's primary_ip6 on a VM with no leased IPv6: %+v", v6)
 	}
 }
+
+func TestDiffClearsAPrimaryIP6ThisClusterOwnsOnceItsLeaseIsGone(t *testing.T) {
+	// The mirror set primary_ip6 = 60 while the VM held an IPv6 lease. The
+	// lease is gone, but address 60 — carrying this cluster's identity — is
+	// still on the VM's interface. Leaving the primary naming it would have
+	// NetBox refuse every later write of the VM once 60 is detached.
+	const mac = "52:54:00:00:00:01"
+	d := DesiredVM{Name: "vm-1", UUID: "u1", NICs: []DesiredNIC{
+		{Name: "eth0", MAC: mac, NetBoxIPID: 9, NetBoxIP: "10.0.5.9"},
+	}}
+	got := primaryActions(Diff([]DesiredVM{d}, Actual{
+		VMs: map[string]netbox.VirtualMachine{
+			vmIdent("u1"): {ID: 11, Name: "vm-1", Identity: vmIdent("u1"), PrimaryIP4ID: 9, PrimaryIP6ID: 60},
+		},
+		NICs: map[string]netbox.VMInterface{
+			nicIdent("u1", mac): {ID: 21, VMID: 11, Name: "eth0", MAC: mac, Identity: nicIdent("u1", mac)},
+		},
+		OwnedIPsByIface: map[int][]netbox.IPAddress{
+			21: {{ID: 9, AssignedObjectID: 21, Identity: nicIdent("u1", mac)},
+				{ID: 60, AssignedObjectID: 21, Identity: nicIdent("u1", mac)}},
+		},
+	}, fp))
+	if v6, ok := got[opPrimaryIP6]; !ok || v6.IPID != 0 {
+		t.Fatalf("primary_ip6 action = %+v (present %v), want a clear of the owned address 60", v6, ok)
+	}
+}

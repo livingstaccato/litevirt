@@ -533,11 +533,13 @@ func Diff(desired []DesiredVM, actual Actual, fingerprint string) []Action {
 				ParentNetBoxID: a.ID, IPID: want,
 			})
 		}
-		// primary_ip6 is managed ONLY while the VM holds a leased IPv6 address.
-		// Before primary_ip6 was mirrored at all, an operator could set it by
-		// hand, and a VM with no IPv6 lease gives the mirror nothing to put
-		// there — so it leaves the operator's value alone rather than clear it.
-		if want := desiredPrimaryIP(d, 6); want != 0 && want != a.PrimaryIP6ID {
+		// primary_ip6 is written while the VM holds a leased IPv6 address, and
+		// CLEARED only when it names an address this cluster owns on the VM's
+		// own interfaces — one the mirror put there, whose lease is gone.
+		// Before primary_ip6 was mirrored at all an operator could set it by
+		// hand; a value naming anything else is that, and is left alone.
+		if want := desiredPrimaryIP(d, 6); want != a.PrimaryIP6ID &&
+			(want != 0 || ownsAddressOn(actual, a.ID, a.PrimaryIP6ID)) {
 			out = append(out, Action{
 				Kind: "vm", Op: opPrimaryIP6, Key: vmID,
 				ParentNetBoxID: a.ID, IPID: want,
@@ -986,6 +988,25 @@ func desiredPrimaryIP(d DesiredVM, family int) int {
 		}
 	}
 	return 0
+}
+
+// ownsAddressOn reports whether ipID is a litevirt-owned address of this
+// cluster assigned to one of VM vmID's interfaces.
+func ownsAddressOn(actual Actual, vmID, ipID int) bool {
+	if vmID == 0 || ipID == 0 {
+		return false
+	}
+	for _, nic := range actual.NICs {
+		if nic.VMID != vmID {
+			continue
+		}
+		for _, ip := range actual.OwnedIPsByIface[nic.ID] {
+			if ip.ID == ipID {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // addressFamily is 4 or 6 for a bare address, or 0 when it cannot be parsed.

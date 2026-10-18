@@ -333,6 +333,14 @@ type Plan struct {
 	// SynFlood limits new TCP connections toward guest NICs per (NIC,
 	// source address) in the per-NIC table (synflood.go).
 	SynFlood SynFlood
+	// SynFloodUnavailable is why SYN-flood protection the policy asks for is
+	// not rendered on this host: the kernel refused the start probe. Not
+	// rendered; reported as a condition.
+	SynFloodUnavailable string
+	// UnreadablePolicies names each firewall policy row this build cannot
+	// read, and what was rendered instead. Not rendered; reported as a
+	// condition.
+	UnreadablePolicies []string
 }
 
 // BlockedTrunk is a trunk NIC's VLANs its network does not allow.

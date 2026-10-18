@@ -195,6 +195,11 @@ type AppliedState struct {
 	// TagGroups is what the pass could not render as the tag groups ask
 	// (Plan.TagGroups).
 	TagGroups TagGroupReport
+	// SynFlood is the SYN-flood protection the pass rendered;
+	// SynFloodUnavailable and UnreadablePolicies are as in the Plan.
+	SynFlood            SynFlood
+	SynFloodUnavailable string
+	UnreadablePolicies  []string
 }
 
 // SetStateHook registers fn to receive the applied state after every pass
@@ -233,7 +238,8 @@ func (r *Reconciler) AppliedState() AppliedState {
 
 func (r *Reconciler) recordState(ctx context.Context, p Plan, applyErr error) {
 	st := AppliedState{NICs: map[string]string{}, Guarded: map[string]map[string]bool{}, BlockedTrunks: p.BlockedTrunks,
-		InvalidRows: p.InvalidRows, TagGroups: p.TagGroups}
+		InvalidRows: p.InvalidRows, TagGroups: p.TagGroups,
+		SynFlood: p.SynFlood, SynFloodUnavailable: p.SynFloodUnavailable, UnreadablePolicies: p.UnreadablePolicies}
 	if len(p.NICs) > 0 {
 		st.Mode = p.nicMode()
 	}
@@ -423,6 +429,11 @@ type LoaderOptions struct {
 	// names and NICs whose rows are not written yet (see Arming).
 	Arming *Arming
 
+	// SynFloodProbe reports whether the kernel accepted the SYN-flood
+	// probe (ProbeSynFlood), run once at start: an error renders no SYN-flood
+	// protection on this host, and the pass reports it. nil means accepted.
+	SynFloodProbe func() error
+
 	// Now is the loader's clock (time.Now when nil): how long a rule has
 	// referenced a missing set (emptySetGrace).
 	Now func() time.Time
@@ -520,6 +531,12 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			return plan, err
 		}
 		plan.DefaultDeny = deny
+
+		// SYN-flood protection (synflood.go).
+		plan.SynFlood, plan.SynFloodUnavailable, plan.UnreadablePolicies, err = loadSynFlood(ctx, db, hostName, opts.SynFloodProbe)
+		if err != nil {
+			return plan, err
+		}
 
 		sgs, err := corrosion.ListSecurityGroups(ctx, db, "")
 		if err != nil {

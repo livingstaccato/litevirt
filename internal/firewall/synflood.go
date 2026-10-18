@@ -1,8 +1,12 @@
 package firewall
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // SYN-flood protection on guest NICs (docs/firewall.md, "SYN-flood
@@ -75,4 +79,52 @@ func renderSynFloodLines(b *strings.Builder, p Plan) {
 		fmt.Fprintf(b, "        oifname @%s meta protocol %s meta l4proto tcp tcp flags & (fin|syn|rst|ack) == syn%s update @%s { oifname . %s saddr %s } %s\n",
 			setNICDevs, f.fam, f.exempt, f.set, f.ip, limit, action)
 	}
+}
+
+// ProbeSynFlood asks the kernel, without loading anything, whether it accepts
+// the renderer's own SYN-flood sets and lines (ProbeRuleset): the sets they
+// name, the meters, and one line per family in a forward chain. The daemon
+// runs it once at start (LoaderOptions.SynFloodProbe).
+func ProbeSynFlood(ctx context.Context) error {
+	p := Plan{SynFlood: SynFlood{On: true, Rate: corrosion.SynfloodDefaultRate, Burst: corrosion.SynfloodDefaultBurst}}
+	var b strings.Builder
+	renderIfnameSet(&b, setNICDevs, nil)
+	renderAddrSet(&b, setLBSrc4, "ipv4_addr", nil)
+	renderSynFloodSets(&b, p)
+	b.WriteString("    chain forward {\n        type filter hook forward priority 0; policy accept;\n")
+	renderSynFloodLines(&b, p)
+	b.WriteString("    }\n")
+	return ProbeRuleset(ctx, b.String())
+}
+
+// loadSynFlood is the loader's SYN-flood block: host's policy (its own row,
+// else the cluster's, else off) as this host renders it.
+//   - A row this build cannot read protects at the defaults, and is reported
+//     (unreadable).
+//   - A kernel that refused the probe renders nothing, and is reported
+//     (unavailable) while the policy asks for protection.
+//
+// Whatever the path, the result passes validateSynFlood, which would
+// otherwise refuse the whole plan.
+func loadSynFlood(ctx context.Context, db *corrosion.Client, host string, probe func() error) (sf SynFlood, unavailable string, unreadable []string, err error) {
+	pol, err := corrosion.ResolveFirewallSynflood(ctx, db, host)
+	switch {
+	case errors.Is(err, corrosion.ErrUnreadableFirewallPolicy):
+		unreadable = append(unreadable, fmt.Sprintf("%v; SYN-flood protection is on at %d/second burst %d until it is set again with lv firewall synflood",
+			err, corrosion.SynfloodDefaultRate, corrosion.SynfloodDefaultBurst))
+	case err != nil:
+		return SynFlood{}, "", nil, err
+	}
+	if !pol.On() {
+		return SynFlood{}, "", unreadable, nil
+	}
+	// The resolver reads an out-of-range row as unreadable (on at the
+	// defaults), so an on policy is always in range here.
+	sf = SynFlood{On: true, Rate: pol.Rate, Burst: pol.Burst}
+	if probe != nil {
+		if perr := probe(); perr != nil {
+			return SynFlood{}, perr.Error(), unreadable, nil
+		}
+	}
+	return sf, "", unreadable, nil
 }

@@ -213,6 +213,7 @@ func (s *Server) RecordFirewallState(ctx context.Context, st firewall.AppliedSta
 	s.setFirewallCondition(ctx, CondFirewallInvalidRows, len(st.InvalidRows) > 0, corrosion.SeverityCritical,
 		invalidRowsText(st.InvalidRows))
 	s.recordTagGroupState(ctx, st.TagGroups)
+	s.recordSynFloodState(ctx, st)
 }
 
 // invalidRowsText names each stored row the firewall does not render as

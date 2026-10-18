@@ -228,3 +228,31 @@ func TestRepairReleasesWhatItCreatedWhenTheLeaseMoved(t *testing.T) {
 		t.Fatal("an unrepaired address must still be reported dead")
 	}
 }
+
+func TestRepairCreatesNothingWhereAnyObjectHoldsTheAddress(t *testing.T) {
+	// A 404 is not proof the address is free: NetBox also answers it for an
+	// object outside the API token's permissions, and a VRF that does not
+	// enforce uniqueness would take a second object at the same address. So
+	// the address is looked up before the create, and any object there —
+	// here an operator's — refuses the repair.
+	nb := &deadAddressVirt{stubVirt: &stubVirt{}, dead: map[int]bool{41: true}}
+	r, idx, key := repairFixture(t, nb)
+	nb.byAddressIPs = map[string][]netbox.IPAddress{
+		repairIP + "/24": {{ID: 88, Address: repairIP + "/24", VRFID: 3}},
+	}
+	r.db.SetNetBoxRepointGate(func() bool { return true })
+	if err := r.apply(context.Background(), []Action{
+		{Kind: kindNIC, Op: "assign", Key: key, NetBoxID: 21, IPID: 41},
+	}, idx, fp); err != nil {
+		t.Fatal(err)
+	}
+	if len(nb.claimed) != 0 {
+		t.Fatalf("created %v at an address another object holds", nb.claimed)
+	}
+	if got := leaseAddressID(t, r); got != 41 {
+		t.Fatalf("lease re-pointed to %d", got)
+	}
+	if !r.isDeadAddress(41) {
+		t.Fatal("an unrepaired address must still be reported dead")
+	}
+}

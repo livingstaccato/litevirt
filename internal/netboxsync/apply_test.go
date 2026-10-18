@@ -774,6 +774,7 @@ type stubVirt struct {
 	primaryIP6s [][2]int
 	// The dead-address repair's address state; see LookupByIdentity.
 	byIdentityIPs map[string][]netbox.IPAddress
+	byAddressIPs  map[string][]netbox.IPAddress
 	claimed       [][2]string
 	claimErr      error
 	releasedIPs   []int
@@ -1011,6 +1012,12 @@ func (s *stubVirt) LookupByIdentity(_ context.Context, identity string, _ int, _
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]netbox.IPAddress(nil), s.byIdentityIPs[identity]...), nil
+}
+
+func (s *stubVirt) LookupByAddress(_ context.Context, address string, _ int) ([]netbox.IPAddress, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]netbox.IPAddress(nil), s.byAddressIPs[address]...), nil
 }
 
 func (s *stubVirt) ClaimSpecificIP(_ context.Context, address string, vrfID int, identity string) (netbox.IPAddress, error) {

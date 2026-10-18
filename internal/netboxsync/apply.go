@@ -61,6 +61,7 @@ type netboxWriter interface {
 	// object rather than duplicating it, then the create, and a release to
 	// compensate a create whose lease re-point did not land.
 	LookupByIdentity(ctx context.Context, identity string, vrfID int, prefixCIDR string) ([]netbox.IPAddress, error)
+	LookupByAddress(ctx context.Context, address string, vrfID int) ([]netbox.IPAddress, error)
 	ClaimSpecificIP(ctx context.Context, address string, vrfID int, identity string) (netbox.IPAddress, error)
 	ReleaseIP(ctx context.Context, id int) error
 
@@ -678,7 +679,8 @@ func (r *Reconciler) assignAddress(ctx context.Context, ipID, ifaceID int, nicKe
 // NIC's identity — the same identity the original claim carried — so the
 // result is the object the claim would have made, not a new decision.
 //
-// LOOKED UP FIRST. A repair that created the object and then lost its re-point
+// LOOKED UP FIRST, by identity and then by address. A repair that created the
+// object and then lost its re-point
 // (a crash, a lost response) leaves an object carrying this identity; finding
 // it adopts it instead of making a second. Anything at the address that is
 // NOT ours — an operator's object, another installation's — refuses the
@@ -720,6 +722,20 @@ func (r *Reconciler) repairDeadAddress(ctx context.Context, deadID int, identity
 	created := false
 	switch len(found) {
 	case 0:
+		// LOOKED UP BY ADDRESS before anything is created. The 404 that brought
+		// this here is not proof the address is free: NetBox answers it for an
+		// object outside the token's permissions too, a leader handing over
+		// mid-repair may have created one already, and a VRF that does not
+		// enforce uniqueness would accept a second object at the address. Any
+		// object there refuses the repair.
+		held, lerr := r.nb.LookupByAddress(ctx, address, b.VRFID)
+		if lerr != nil {
+			return 0, fmt.Errorf("look up address %s: %w", address, lerr)
+		}
+		if len(held) > 0 {
+			return 0, fmt.Errorf("address %s is already held in NetBox by object %d (identity %q); "+
+				"nothing is created over it", address, held[0].ID, held[0].Identity)
+		}
 		ip, err = r.nb.ClaimSpecificIP(ctx, address, b.VRFID, identity)
 		if err != nil {
 			return 0, fmt.Errorf("re-create address %s: %w", address, err)

@@ -1437,9 +1437,9 @@ address, under the NIC's identity and inside the bound prefix, then points the
 lease at the new object and assigns it. The token latches on its own once every
 host the cluster replicates to, including one parked in `maintenance`, runs
 this release. A host on the previous release cannot decode the statement that
-re-points the lease. If another object already holds the address, nothing is
-created. The mirror keeps reporting the pass unconverged until that object is
-removed in NetBox.
+re-points the lease. The address is looked up first: if NetBox shows any object
+at it, nothing is created, and the mirror keeps reporting the pass unconverged
+until that object is removed in NetBox.
 
 `netbox_ip_repoint_v1` is mandatory and replication-gated, with no flag. Its
 stand-down is the inventory mirror's own: `netbox.mirror_inventory` off on

@@ -372,6 +372,9 @@ func (f *recordingNetBox) ClaimSpecificIP(context.Context, string, int, string) 
 	return netbox.IPAddress{}, errors.New("recordingNetBox does not create addresses")
 }
 func (f *recordingNetBox) ReleaseIP(context.Context, int) error { return nil }
+func (f *recordingNetBox) LookupByAddress(context.Context, string, int) ([]netbox.IPAddress, error) {
+	return nil, nil
+}
 func (f *recordingNetBox) FindDeviceInCluster(context.Context, string, int) (int, error) {
 	return 0, nil
 }

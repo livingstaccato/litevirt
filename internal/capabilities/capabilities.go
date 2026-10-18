@@ -1192,7 +1192,7 @@ const ReleaseToken = Release202611V1
 //
 //   - netbox_ip_repoint_v1 has no flag either: it says this build decodes the
 //     lease re-point statement. What it licenses is bounded to a NetBox
-//     address object that is provably gone (NetBox answered 404) while a live
+//     address object NetBox answered 404 for while a live
 //     lease still names it, and the re-point is guarded on the dead id. Its
 //     stand-down is the inventory mirror's own: netbox.mirror_inventory off on
 //     every node stops the only writer. A binary rolled back below it enters

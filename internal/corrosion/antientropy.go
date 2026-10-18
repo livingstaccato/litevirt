@@ -17,7 +17,6 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/pki"
 )
 
 // antiEntropyCooldown debounces manual/scheduled triggers: a pass won't start if one ran
@@ -72,6 +71,7 @@ type AntiEntropy struct {
 	// drift rate-limits the drift-detected line for a drift that has not
 	// changed (antientropy_driftlog.go).
 	drift driftLog
+	conns aeConnPool
 }
 
 // probationPullFunc pulls a peer's used records and voter view for a probation
@@ -128,6 +128,7 @@ const catchUpRetry = 2 * time.Second
 // replica caught up is unchanged — only how soon the exchange is attempted.
 func (ae *AntiEntropy) Start(ctx context.Context) {
 	slog.Info("anti-entropy: starting", "interval", ae.interval)
+	defer ae.Close()
 	wake := ae.client.ReplicaStaleWake()
 	// A small spread on the first try: a whole cluster booting at once would
 	// otherwise send every node's first pass on one beat.
@@ -318,30 +319,75 @@ func (ae *AntiEntropy) checkPeerSet(ctx context.Context, choose func([]PeerInfo)
 		sensitiveMap[d.Name] = d
 	}
 
-	// Each peer gets a deadline of its own. The pass visits peers one at a time,
-	// and on the daemon's root context a peer that accepted the connection and
-	// then sat on GetStateDigest held the whole pass there indefinitely — every
-	// peer after it in the member list was never checked again, and whatever
-	// divergence anti-entropy exists to heal stayed unhealed. A dial timeout
-	// cannot catch that: the dial succeeded.
-	for _, peer := range targets {
+	// A peer that left the membership keeps no pooled connection.
+	members := make(map[string]bool, len(peers))
+	for _, p := range peers {
+		members[p.Name] = true
+	}
+	ae.conns.retain(members)
+
+	// The digests are asked of every target concurrently, at most
+	// antiEntropyPeerConcurrency at a time (#261): with peers asked one at a
+	// time a pass cost the sum of their round trips. What a digest disagreement
+	// leads to — the pulls and merges — then runs one peer at a time in target
+	// order, exactly as before, so the merge engine never sees two peers at once.
+	//
+	// Each peer gets a deadline of its own, for each half. On the daemon's root
+	// context a peer that accepted the connection and then sat on
+	// GetStateDigest held the whole pass there indefinitely — every peer after
+	// it in the member list was never checked again, and whatever divergence
+	// anti-entropy exists to heal stayed unhealed. A dial timeout cannot catch
+	// that: the dial succeeded.
+	exchanges := make([]*peerExchange, len(targets))
+	sem := make(chan struct{}, max(antiEntropyPeerConcurrency, 1))
+	var wg sync.WaitGroup
+	for i, peer := range targets {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			pctx, cancel := context.WithTimeout(ctx, antiEntropyPeerTimeout)
+			defer cancel()
+			exchanges[i] = ae.openExchange(pctx, peer, sensitiveMap, full)
+		}()
+	}
+	wg.Wait()
+	for _, ex := range exchanges {
+		if ex == nil {
+			continue
+		}
 		pctx, cancel := context.WithTimeout(ctx, antiEntropyPeerTimeout)
-		if ae.checkPeer(pctx, peer, localMap, sensitiveMap, full) {
-			ae.client.markReplicaCaughtUp(gen, peer)
+		if ae.finishExchange(pctx, ex, localMap, full) {
+			ae.client.markReplicaCaughtUp(gen, ex.peer)
 		}
 		cancel()
 	}
 	return true
 }
 
-// checkPeer runs one peer's exchange. It returns true only when the exchange
-// COMPLETED — the peer's digests were read and either matched ours or its copy
-// of every mismatched table was merged without error (the tables that matched
-// already agreed, so either way the local replica now holds what the peer
-// held) — which is what marks the local replica
-// caught up (see replicaFreshness). An isolated peer, an unreachable one, or a
-// failed dump/merge proves nothing and returns false.
-func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap, sensitiveMap map[string]TableDigest, full bool) bool {
+// peerExchange is one peer's half of a pass that runs concurrently with the
+// others' (openExchange): its pooled client and its two digests.
+type peerExchange struct {
+	peer   string
+	client pb.LiteVirtClient
+	// digest is the peer's public digest.
+	digest *pb.StateDigestResponse
+	// sensitive is the peer's sensitive digest; nil when it was not asked
+	// (this node has no sensitive digest) or the peer did not give one.
+	sensitive *sensitiveExchange
+}
+
+// mergeSourceRefused reports whether this node must not merge from peerName
+// now. A pass asks it before the digests and again before it merges, since a
+// merge from another peer in between may be what records the refusal.
+func (ae *AntiEntropy) mergeSourceRefused(ctx context.Context, peerName string) bool {
 	// The pull half of the isolation regime (§A). PushMutations refuses an
 	// isolated node's INJECTION server-side, but anti-entropy is a PULL: we
 	// would otherwise merge a quarantined node's state into ours voluntarily,
@@ -355,7 +401,7 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 		slog.Warn("anti-entropy: NOT merging from an isolated peer",
 			"peer", peerName, "isolation_epoch", epoch, "reason", reason,
 			"fix", "reseed "+peerName+" to bring it back into the compatibility regime")
-		return false
+		return true
 	}
 	// A peer that cannot keep the data of a release feature in use is not
 	// merged from either (release_features.go, SetReplicationSourceGate): its
@@ -364,18 +410,30 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 		if errors.Is(err, ErrReleaseProbation) {
 			// The refusal is this node's own state, not the peer's.
 			slog.Debug("anti-entropy: not merging; this node is in release probation", "peer", peerName)
-			return false
+			return true
 		}
 		slog.Warn("anti-entropy: NOT merging from a peer that cannot keep a release feature in use",
 			"peer", peerName, "error", err)
-		return false
+		return true
 	}
-	client, conn, err := ae.peerClient(ctx, peerName)
+	return false
+}
+
+// openExchange is the half of one peer's exchange a pass runs concurrently
+// with the other peers': the preflight refusals, the connection and both
+// digests. It returns nil when there is nothing to go on with — an isolated
+// peer, one this node may not merge from, an unreachable one, or a failed
+// public digest — and such a peer proves nothing about the local replica.
+func (ae *AntiEntropy) openExchange(ctx context.Context, peerName string, sensitiveMap map[string]TableDigest, full bool) *peerExchange {
+	if ae.mergeSourceRefused(ctx, peerName) {
+		return nil
+	}
+	pc, err := ae.pooledPeerClient(ctx, peerName)
 	if err != nil {
 		slog.Debug("anti-entropy: cannot reach peer", "peer", peerName, "error", err)
-		return false
+		return nil
 	}
-	defer conn.Close()
+	client := pc.client
 
 	dctx, dcancel := context.WithTimeout(ctx, antiEntropyDigestTimeout)
 	if full {
@@ -386,9 +444,31 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 	dcancel()
 	if err != nil {
 		slog.Debug("anti-entropy: digest RPC error", "peer", peerName, "error", err)
+		// The next pass dials afresh rather than wait out the connection's
+		// reconnect backoff on a peer that has come back.
+		ae.conns.drop(peerName, pc)
+		return nil
+	}
+	return &peerExchange{
+		peer:      peerName,
+		client:    client,
+		digest:    resp,
+		sensitive: ae.sensitiveDigest(ctx, client, peerName, sensitiveMap, full),
+	}
+}
+
+// finishExchange is the half of one peer's exchange a pass runs one peer at a
+// time: the pulls and merges its digests call for. It returns true only when
+// the exchange COMPLETED — the peer's digests were read and either matched
+// ours or its copy of every mismatched table was merged without error (the
+// tables that matched already agreed, so either way the local replica now
+// holds what the peer held) — which is what marks the local replica caught up
+// (see replicaFreshness). A failed dump/merge proves nothing and returns false.
+func (ae *AntiEntropy) finishExchange(ctx context.Context, ex *peerExchange, localMap map[string]TableDigest, full bool) bool {
+	peerName, client, resp := ex.peer, ex.client, ex.digest
+	if ae.mergeSourceRefused(ctx, peerName) {
 		return false
 	}
-
 	completed := true
 	// usersUnjudged: this peer's users rows differ from ours and the pull that
 	// would have judged them did not complete. See checkSensitivePeer.
@@ -451,7 +531,7 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 		}
 	}
 
-	ae.checkSensitivePeer(ctx, client, peerName, sensitiveMap, full, usersUnjudged, remints)
+	ae.checkSensitivePeer(ctx, client, peerName, ex.sensitive, full, usersUnjudged, remints)
 	// A completed exchange with a seeded peer that is not holding its own audit
 	// rows leaves this replica holding everything that peer held: seeded too
 	// (audit_seeded.go). An older peer does not say, and does not seed.
@@ -503,27 +583,16 @@ func digestMismatches(peer string, remote []*pb.TableDigest, localMap map[string
 // row is refused and its hash remembered (users_admin_guard.go). When that pull
 // did not complete this cycle, nothing may have judged the peer's accounts
 // since this process started, so its credentials wait for a cycle that has.
-func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVirtClient, peerName string, localMap map[string]TableDigest, full, usersUnjudged bool, remints *remintScope) {
-	if len(localMap) == 0 {
+//
+// remote is the peer's sensitive digest (sensitiveDigest); nil means there is
+// nothing to compare.
+func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVirtClient, peerName string, remote *sensitiveExchange, full, usersUnjudged bool, remints *remintScope) {
+	if remote == nil {
 		return
 	}
+	localMap := remote.local
 	req := &pb.SensitiveStateRequest{Sender: ae.client.HostName()}
-	dctx, dcancel := context.WithTimeout(ctx, antiEntropyDigestTimeout)
-	if full {
-		dctx = WithFreshDigest(dctx)
-	}
-	resp, err := client.GetSensitiveStateDigest(dctx, req)
-	dcancel()
-	if err != nil {
-		if status.Code(err) == codes.Unimplemented {
-			slog.Debug("anti-entropy: peer has no sensitive state digest RPC", "peer", peerName)
-			return
-		}
-		slog.Debug("anti-entropy: sensitive digest RPC error", "peer", peerName, "error", err)
-		return
-	}
-
-	mismatched := ae.drift.mismatches(peerName, resp.Tables, localMap)
+	mismatched := ae.drift.mismatches(peerName, remote.digest.Tables, localMap)
 	if len(mismatched) == 0 {
 		ae.client.markSensitiveLaneMerged(peerName)
 	}
@@ -560,6 +629,37 @@ func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVir
 	}
 	slog.Info("anti-entropy: sensitive merge complete", "peer", peerName, "tables", mismatched)
 	ae.client.markSensitiveLaneMerged(peerName)
+}
+
+// sensitiveExchange is a peer's sensitive digest and the local one it is
+// compared against.
+type sensitiveExchange struct {
+	digest *pb.StateDigestResponse
+	local  map[string]TableDigest
+}
+
+// sensitiveDigest asks peerName for its sensitive digest. It returns nil when
+// this node has no sensitive digest to compare, or the peer gave none.
+func (ae *AntiEntropy) sensitiveDigest(ctx context.Context, client pb.LiteVirtClient, peerName string, localMap map[string]TableDigest, full bool) *sensitiveExchange {
+	if len(localMap) == 0 {
+		return nil
+	}
+	req := &pb.SensitiveStateRequest{Sender: ae.client.HostName()}
+	dctx, dcancel := context.WithTimeout(ctx, antiEntropyDigestTimeout)
+	if full {
+		dctx = WithFreshDigest(dctx)
+	}
+	resp, err := client.GetSensitiveStateDigest(dctx, req)
+	dcancel()
+	if err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			slog.Debug("anti-entropy: peer has no sensitive state digest RPC", "peer", peerName)
+			return nil
+		}
+		slog.Debug("anti-entropy: sensitive digest RPC error", "peer", peerName, "error", err)
+		return nil
+	}
+	return &sensitiveExchange{digest: resp, local: localMap}
 }
 
 // fetchStateDump pulls a peer's full state dump, preferring the chunked
@@ -656,16 +756,14 @@ func fetchSensitiveStateDump(ctx context.Context, client pb.LiteVirtClient, req 
 	}
 }
 
+// peerClient dials a one-off connection to peerName, which the caller closes.
+// A pass takes its connections from the pool instead (pooledPeerClient).
 func (ae *AntiEntropy) peerClient(ctx context.Context, peerName string) (pb.LiteVirtClient, *grpc.ClientConn, error) {
 	target, err := resolvePeerTarget(ctx, ae.client, peerName)
 	if err != nil {
 		return nil, nil, err
 	}
-	// Raise the receive limit so the legacy unary GetStateDump fallback can
-	// pull a large full-state dump from an old peer. StreamStateDump chunks
-	// stay well under the 4 MiB default and don't need this.
-	conn, err := pki.PeerDial(ae.pkiDir, target,
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(antiEntropyMaxMsgSize)))
+	conn, err := ae.dialPeer(target)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -93,6 +94,10 @@ func TestAutomationTrustedHistoryCanonicalBoundary(t *testing.T) {
 				if tc.bad {
 					if e == nil || found || got != "" {
 						t.Errorf("corrupt original accepted: digest=%q found=%v err=%v", got, found, e)
+					}
+					var corrupt *automationProofCorruptionError
+					if !errors.As(e, &corrupt) || errors.Unwrap(e) == nil || e.Error() != errors.Unwrap(e).Error() {
+						t.Errorf("stored validation lost typed cause or changed error text: %T %v", e, e)
 					}
 				} else if tc.absent {
 					if e != nil || found || got != "" {

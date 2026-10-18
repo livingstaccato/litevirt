@@ -261,6 +261,7 @@ func (s *Server) StreamAuthInterceptor(
 //	Bearer "<hex>"    → legacy API token bcrypt match
 //	No bearer        → mTLS client cert (CLI/daemon) → treat as admin
 func (s *Server) authenticate(ctx context.Context) (context.Context, error) {
+	ctx = clearAutomationPrincipal(ctx)
 	md, ok := metadata.FromIncomingContext(ctx)
 	if ok {
 		if auth := md.Get("authorization"); len(auth) > 0 {
@@ -596,6 +597,7 @@ const forwardedIdentityNotVisible = "forwarded identity not yet visible on owner
 // denies surfaces as PermissionDenied from RequirePerm (normal — including a
 // just-granted role that hasn't replicated). It never falls back to peer=admin.
 func (s *Server) authenticateForwardedBearer(ctx context.Context, val string) (context.Context, error) {
+	ctx = clearAutomationPrincipal(ctx)
 	if !strings.HasPrefix(val, "Bearer ") {
 		return nil, status.Error(codes.Unauthenticated, "forwarded identity: malformed bearer")
 	}
@@ -724,6 +726,7 @@ func (s *Server) requirePeerOrRole(ctx context.Context, minRole string) error {
 // sessions table. Enforces revoke, hard expiry, and idle timeout, and
 // touches last_used_at on success.
 func (s *Server) authenticateSession(ctx context.Context, sid string) (context.Context, error) {
+	ctx = clearAutomationPrincipal(ctx)
 	if sid == "" {
 		return nil, status.Error(codes.Unauthenticated, "empty session id")
 	}
@@ -778,6 +781,23 @@ func (s *Server) authenticateSession(ctx context.Context, sid string) (context.C
 	groups, err := s.sessionGroups(ctx, sid, sess.Realm)
 	if err != nil {
 		return nil, err
+	}
+	if sess.Realm == "local" && !enrollOnly {
+		identity, proofErr := corrosion.AutomationSessionPrincipal(ctx, s.db, sid)
+		var failure *corrosion.AutomationCredentialError
+		switch {
+		case errors.Is(proofErr, corrosion.ErrAutomationCredentialUnstamped):
+			// An ordinary or replica-local unstamped session remains legacy-only.
+		case proofErr == nil:
+			if identity == nil || identity.Kind != "principal" || identity.Alias != user.Username || identity.UID == "" || identity.ClusterUID == "" {
+				return nil, status.Error(codes.Unauthenticated, "invalid automation session proof")
+			}
+			ctx = context.WithValue(ctx, automationPrincipalContextKey{}, verifiedAutomationPrincipal{clusterUID: identity.ClusterUID, principalUID: identity.UID})
+		case errors.As(proofErr, &failure):
+			return nil, status.Error(codes.Unauthenticated, "invalid automation session proof")
+		default:
+			return nil, automationCredentialUnavailable(proofErr)
+		}
 	}
 	_ = corrosion.TouchSession(ctx, s.db, sid)
 	role := user.Role

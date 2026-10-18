@@ -127,7 +127,7 @@ func automationSemanticHeadTx(ctx context.Context, tx *LocalTx, stage string) (c
 	}
 	row := rows[0]
 	if row.Int64("sequence") <= 0 || row.String("cluster_uid") == "" || row.String("digest") == "" {
-		return contract.Prefix{}, fmt.Errorf("invalid semantic projection head")
+		return contract.Prefix{}, &automationProofCorruptionError{cause: fmt.Errorf("invalid semantic projection head")}
 	}
 	return contract.Prefix{ClusterUID: row.String("cluster_uid"), Sequence: uint64(row.Int64("sequence")), Digest: row.String("digest")}, nil
 }

@@ -263,6 +263,10 @@ func TestAutomationLifecycleRollbackParentAndProof(t *testing.T) {
 // This fixture applies real signed certified history through the sole reducer.
 // It does not establish a fresh production closed-cut permit.
 func lifecycleCertifiedAccount(t *testing.T) (*Client, *AutomationAccountAuthentication) {
+	return lifecycleCertifiedAccountWithGates(t, false, false)
+}
+
+func lifecycleCertifiedAccountWithGates(t *testing.T, split, clear bool) (*Client, *AutomationAccountAuthentication) {
 	t.Helper()
 	ca, original, b, other := threeVoters(t)
 	file, err := NewLocalClient(t.TempDir(), "a")
@@ -285,6 +289,13 @@ func lifecycleCertifiedAccount(t *testing.T) (*Client, *AutomationAccountAuthent
 		t.Fatal(err)
 	}
 	ctx := context.Background()
+	if split {
+		a.c.SetCredentialsSplitGate(func() bool { return true })
+		a.c.SetCredentialsClearGate(func() bool { return clear })
+		if _, err := a.c.SplitCredentials(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte("correct-password"), bcrypt.MinCost)
 	if err != nil {
 		t.Fatal(err)
@@ -539,6 +550,9 @@ func TestAutomationLifecycleEnrollmentDoesNotBypassAuthenticationPolicy(t *testi
 					t.Fatal(err)
 				}
 			case "second_factor":
+				if _, err := c.db.ExecContext(ctx, `INSERT INTO user_2fa_sets(username,active_epoch,updated_at) VALUES('alice','','fixture')`); err != nil {
+					t.Fatal(err)
+				}
 				if _, err := c.db.ExecContext(ctx, `INSERT INTO user_2fa(username,method,label,secret,enrolled_at,updated_at) VALUES('alice','totp','factor','secret',?,?)`, nowRFC3339(), c.NowTS()); err != nil {
 					t.Fatal(err)
 				}

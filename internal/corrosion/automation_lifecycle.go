@@ -107,7 +107,7 @@ func (m *lifecycleMutation) before(ctx context.Context, tx *sql.Tx) error {
 		return ErrAutomationLifecycleUnavailable
 	}
 	m.previous, err = automationLifetimeTx(ctx, tx, m.kind, m.name)
-	if errors.Is(err, ErrAutomationLifecycleUnavailable) {
+	if errors.Is(err, ErrAutomationLifecycleUnavailable) && m.issuance == nil {
 		return nil
 	}
 	if err == nil && m.issuance != nil {
@@ -179,12 +179,14 @@ func (m *lifecycleMutation) after(ctx context.Context, tx *sql.Tx) error {
 }
 
 // AutomationAccountAuthentication is an opaque, locally authenticated account
-// observation. It carries no role, certified UID or business authority.
+// observation. Prepared session handles also pin an existing certified identity;
+// neither form carries permissions or business admission authority.
 func (*AutomationAccountAuthentication) String() string { return "automation-account-authentication" }
 
 type AutomationAccountAuthentication struct {
-	username, witness string
-	parent            lifecycleParent
+	username, witness        string
+	principalUID, clusterUID string
+	parent                   lifecycleParent
 }
 
 // EnrollAutomationLocalAccount establishes source evidence from this verified
@@ -257,25 +259,41 @@ func authenticateAutomationLocal(ctx context.Context, c *Client, username, passw
 }
 
 func automationPasswordAccountAllowedTx(ctx context.Context, tx *sql.Tx, name string) error {
+	if err := automationPasswordAccountCurrentTx(ctx, tx, name); err != nil {
+		return err
+	}
+	required, err := automationPasswordFactorRequiredTx(ctx, tx, name)
+	if err != nil {
+		return err
+	}
+	if required {
+		return ErrAutomationLifecycleUnavailable
+	}
+	return nil
+}
+
+func automationPasswordFactorRequiredTx(ctx context.Context, tx *sql.Tx, name string) (bool, error) {
+	var policy string
+	err := tx.QueryRowContext(ctx, `SELECT value FROM cluster_policies WHERE key=? AND deleted_at IS NULL`, LoginTwoFactorPolicyKey).Scan(&policy)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	p, parseErr := ParseTwoFactorPolicy(policy)
+	// Unknown stored values have the same fail-closed All semantics as Login.
+	required := parseErr != nil || p.Requires("local")
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM user_2fa WHERE username=? AND deleted_at IS NULL AND epoch=(SELECT active_epoch FROM user_2fa_sets WHERE username=? AND deleted_at IS NULL)`, name, name).Scan(&count); err != nil {
+		return false, err
+	}
+	return required || count != 0, nil
+}
+
+func automationPasswordAccountCurrentTx(ctx context.Context, tx *sql.Tx, name string) error {
 	var count int
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM users u WHERE `+usernameNormSQL+`=? AND u.deleted_at IS NULL`, NormalizeUsername(name)).Scan(&count); err != nil {
 		return err
 	}
 	if count != 1 {
-		return ErrAutomationLifecycleUnavailable
-	}
-	var policy string
-	err := tx.QueryRowContext(ctx, `SELECT value FROM cluster_policies WHERE key=? AND deleted_at IS NULL`, LoginTwoFactorPolicyKey).Scan(&policy)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	if policy != "" && policy != TwoFactorPolicyOff {
-		return ErrAutomationLifecycleUnavailable
-	}
-	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM user_2fa WHERE username=? AND deleted_at IS NULL`, name).Scan(&count); err != nil {
-		return err
-	}
-	if count != 0 {
 		return ErrAutomationLifecycleUnavailable
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT attribute,value FROM user_lifecycle WHERE username=? AND deleted_at IS NULL`, name)

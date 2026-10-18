@@ -17,6 +17,13 @@ const MaxAutomationRecordBytes = 3 << 20
 
 var errAutomationAuthority = errors.New("automation authority unavailable")
 
+// automationProofCorruptionError marks validation of a present stored proof.
+// Database and context errors must remain unwrapped at the read boundary.
+type automationProofCorruptionError struct{ cause error }
+
+func (e *automationProofCorruptionError) Error() string { return e.cause.Error() }
+func (e *automationProofCorruptionError) Unwrap() error { return e.cause }
+
 // AutomationPrefix is certified AND transactionally applied progress.
 type AutomationPrefix = contract.Prefix
 
@@ -638,39 +645,39 @@ func automationTrustedSummaryTx(ctx context.Context, tx *LocalTx, sequence uint6
 	var value ClaimValue
 	key, _ := AutomationClaimKey(sequence)
 	if err := decodeClaimValue(key, row.String("value_json"), &value); err != nil {
-		return AutomationPrefix{}, false, err
+		return AutomationPrefix{}, false, &automationProofCorruptionError{cause: err}
 	}
 	if sequence <= 1 {
 		// Digest-only genesis callers historically validate the envelope, not
 		// its typed assignment. Retained-head genesis still does both above.
 		if err := validateAutomationTrustedValue(sequence, value, digest, row.String("anchor_digest")); err != nil {
-			return AutomationPrefix{}, false, err
+			return AutomationPrefix{}, false, &automationProofCorruptionError{cause: err}
 		}
 		return AutomationPrefix{Sequence: sequence, Digest: digest}, true, nil
 	}
 	if digest != row.String("anchor_digest") {
-		return AutomationPrefix{}, false, fmt.Errorf("automation parent anchor mismatch")
+		return AutomationPrefix{}, false, &automationProofCorruptionError{cause: fmt.Errorf("automation parent anchor mismatch")}
 	}
 	if _, err := AutomationClaimKey(sequence); err != nil {
-		return AutomationPrefix{}, false, err
+		return AutomationPrefix{}, false, &automationProofCorruptionError{cause: err}
 	}
 	if value.Automation == nil || value.Proof != nil || value.Config != nil || value.LUN != nil || value.LeaseTerm != nil || value.SourceHost != "" {
-		return AutomationPrefix{}, false, fmt.Errorf("invalid automation alternative")
+		return AutomationPrefix{}, false, &automationProofCorruptionError{cause: fmt.Errorf("invalid automation alternative")}
 	}
 	// decodeClaimValue already checked the exact canonical outer bytes and
 	// storage bound. Validate the inner codec once, then hash those exact bytes.
 	decision, err := contract.DecodeDecision(value.Automation.Envelope)
 	if err != nil {
-		return AutomationPrefix{}, false, fmt.Errorf("invalid automation envelope")
+		return AutomationPrefix{}, false, &automationProofCorruptionError{cause: fmt.Errorf("invalid automation envelope")}
 	}
 	if decision.Sequence != sequence {
-		return AutomationPrefix{}, false, fmt.Errorf("automation value does not match key")
+		return AutomationPrefix{}, false, &automationProofCorruptionError{cause: fmt.Errorf("automation value does not match key")}
 	}
 	h := sha256.New()
 	claimField(h, "litevirt-automation-decision-v1")
 	claimField(h, string(value.Automation.Envelope))
 	if hex.EncodeToString(h.Sum(nil)) != digest {
-		return AutomationPrefix{}, false, fmt.Errorf("automation parent digest mismatch")
+		return AutomationPrefix{}, false, &automationProofCorruptionError{cause: fmt.Errorf("automation parent digest mismatch")}
 	}
 	return AutomationPrefix{Sequence: sequence, ClusterUID: decision.Command.ClusterUID, Digest: digest}, true, nil
 }

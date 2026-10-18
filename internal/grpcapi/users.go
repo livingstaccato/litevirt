@@ -217,6 +217,11 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// the stored name, so `ALICE` is checked as the account `alice` is (I2).
 	if u, uerr := corrosion.GetUser(ctx, s.db, principal.Subject); uerr != nil {
 		s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" account lookup failed ip="+clientIP, "denied")
+		if realmName == "local" && hasPassword && !principal.Requires2FA {
+			// Password authentication succeeded, but the current account can no
+			// longer be established. Never downgrade this to missing local proof.
+			return nil, automationCredentialUnavailable(uerr)
+		}
 		return nil, status.Errorf(codes.Internal, "look up account: %v", uerr)
 	} else if u != nil {
 		principal.Subject = u.Username
@@ -387,7 +392,25 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		slog.Warn("login: directory groups not recorded (empty, over-long or over the limit)",
 			"user", principal.Subject, "realm", realmName, "dropped", dropped, "limit", corrosion.MaxSessionGroups)
 	}
-	token, expiresAt, role, err := s.mintSessionWithGroups(ctx, principal.Subject, realmName, clientIP, req.UserAgent, presented, groups)
+	var authentication *corrosion.AutomationAccountAuthentication
+	if realmName == "local" && hasPassword && !principal.Requires2FA && !required && presented == "" {
+		var disposition corrosion.AutomationCredentialDisposition
+		authentication, disposition, err = corrosion.PrepareAutomationLocalSession(ctx, s.db, principal.Subject, req.Password)
+		if err != nil {
+			return nil, automationCredentialUnavailable(err)
+		}
+		switch disposition {
+		case corrosion.AutomationCredentialEligible:
+			if authentication == nil {
+				return nil, automationCredentialUnavailable(nil)
+			}
+		case corrosion.AutomationCredentialNoLocalProof, corrosion.AutomationCredentialUnsupportedFlow:
+			authentication = nil
+		default:
+			return nil, automationCredentialUnavailable(nil)
+		}
+	}
+	token, expiresAt, role, err := s.mintSessionWithAuthentication(ctx, principal.Subject, realmName, clientIP, req.UserAgent, presented, groups, authentication)
 	if err != nil {
 		return nil, err
 	}
@@ -554,6 +577,17 @@ func (s *Server) mintSession(ctx context.Context, username, realm, clientIP, use
 // passes, so `group:<realm>/<g>` bindings apply to this session. Without it
 // the session is minted without them, as before the release.
 func (s *Server) mintSessionWithGroups(ctx context.Context, username, realm, clientIP, userAgent, factor string, groups []string) (token, expiresAt, role string, err error) {
+	return s.mintSessionWithAuthentication(ctx, username, realm, clientIP, userAgent, factor, groups, nil)
+}
+
+func (s *Server) mintSessionWithAuthentication(ctx context.Context, username, realm, clientIP, userAgent, factor string, groups []string, a *corrosion.AutomationAccountAuthentication) (token, expiresAt, role string, err error) {
+	if a != nil {
+		defer func() {
+			if err != nil && ctx.Err() != nil {
+				err = automationCredentialUnavailable(ctx.Err())
+			}
+		}()
+	}
 	// Fail closed if a reseed ran while these credentials were being checked.
 	// See refuseIfReseedMovedSinceEntry: the interceptor's gate cannot drain a
 	// request that was already inside when the reseed started.
@@ -562,6 +596,9 @@ func (s *Server) mintSessionWithGroups(ctx context.Context, username, realm, cli
 	}
 	user, gerr := corrosion.GetUser(ctx, s.db, username)
 	if gerr != nil || user == nil {
+		if a != nil {
+			return "", "", "", automationCredentialUnavailable(gerr)
+		}
 		return "", "", "", status.Errorf(codes.Internal, "post-auth user lookup: %v", gerr)
 	}
 	// Every login path ends here, so this is the one check no path can skip —
@@ -608,6 +645,9 @@ func (s *Server) mintSessionWithGroups(ctx context.Context, username, realm, cli
 		if len(groups) > 0 && g.Check(capabilities.FeatureLoginPolicy) != nil && s.loginPolicyInUseOrUnknown(ctx) {
 			return errGroupsUnrecordable
 		}
+		if a != nil {
+			return corrosion.InsertAutomationSessionWithLoginData(ctx, s.db, g, a, rec, factor, groups)
+		}
 		return corrosion.InsertSessionWithLoginData(ctx, s.db, g, rec, factor, groups)
 	}
 	// Only a login that presented a factor or verified groups has login-rule
@@ -623,6 +663,9 @@ func (s *Server) mintSessionWithGroups(ctx context.Context, username, realm, cli
 			"retry: this node could not record the directory groups this login verified, and does not mint a session without them")
 	}
 	if serr != nil {
+		if a != nil {
+			return "", "", "", automationCredentialUnavailable(serr)
+		}
 		return "", "", "", status.Errorf(codes.Internal, "store session: %v", serr)
 	}
 	return SessionTokenPrefix + id, exp.Format(time.RFC3339), user.Role, nil

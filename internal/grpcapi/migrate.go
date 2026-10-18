@@ -554,7 +554,18 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	if err != nil {
 		return err
 	}
-	defer migLease.release(ctx)
+	// fwl is the live firmware move once the target may hold it: an exit
+	// before libvirt has the guest aborts it there first (§7 P2), and drops
+	// its marker once the target answered.
+	var fwl *liveFirmwareRun
+	defer func() {
+		// Released, it leaves the marker: a marker that still names the
+		// lease is a dead process's, or one whose release failed, which
+		// every recovery pass releases (review m4).
+		if migLease.released(ctx) && fwl != nil {
+			s.clearMarkerLease(fwl.marker.VM, fwl.marker.Attempt)
+		}
+	}()
 
 	if opts.beforeMove != nil {
 		if err := opts.beforeMove(ctx); err != nil {
@@ -572,10 +583,6 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// branch and the adopter own the outcome from then) and for the firmware
 	// cold move, which owns its own.
 	abort := &migrationAbort{armed: true}
-	// fwl is the live firmware move once the target may hold it: an exit
-	// before libvirt has the guest aborts it there first (§7 P2), and drops
-	// its marker once the target answered.
-	var fwl *liveFirmwareRun
 	defer func() {
 		if abort.armed {
 			var park fwmig.Phase
@@ -1287,8 +1294,19 @@ func (s *Server) cleanupPostMigration(vmName string) {
 	// Always clean up cloud-init ISO — target regenerates from stored spec if needed.
 	isoPath := filepath.Join(s.dataDir, "cloudinit", vmName+".iso")
 	if _, err := os.Stat(isoPath); err == nil {
+		// The instance-id the guest booted with is kept beside the path, for
+		// a seed written again here when the VM comes back
+		// (writeMissingSeedForStart).
+		owner, _, _ := cloudinit.SeedOwner(isoPath)
+		id := ""
+		if sd, rerr := cloudinit.ReadSeed(isoPath); rerr == nil {
+			id = sd.InstanceID()
+		}
 		if err := cloudinit.RemoveSeed(isoPath); err == nil {
 			slog.Info("post-migration: removed cloud-init ISO", "vm", vmName, "path", isoPath)
+			if rerr := cloudinit.RecordRemovedSeed(isoPath, owner, id); rerr != nil {
+				slog.Warn("post-migration: the removed seed's instance-id was not kept", "vm", vmName, "error", rerr)
+			}
 		}
 	}
 }
@@ -1451,7 +1469,7 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 	_, statErr := os.Lstat(isoPath)
 	existed := statErr == nil
 
-	if err := writeVMSeed(vm, req, isoPath); err != nil {
+	if err := writeVMSeed(vm, req, isoPath, req.VmName); err != nil {
 		return nil, status.Errorf(codes.Internal, "generate cloud-init ISO: %v", err)
 	}
 	if !existed {
@@ -1462,9 +1480,9 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 }
 
 // writeVMSeed writes vm's seed at isoPath from req (ensureCloudInitRequest)
-// and stamps it as the VM's: instance-id and hostname the VM's name, as
-// CreateVM wrote it, so the guest is not a new instance on it.
-func writeVMSeed(vm *corrosion.VMRecord, req *pb.EnsureCloudInitRequest, isoPath string) error {
+// and stamps it as the VM's: hostname the VM's name and instanceID its
+// instance-id, the one the guest booted with, so it is not a new instance.
+func writeVMSeed(vm *corrosion.VMRecord, req *pb.EnsureCloudInitRequest, isoPath, instanceID string) error {
 	userData := req.Userdata
 	if userData == "" {
 		userData = "#cloud-config\n{}\n"
@@ -1482,7 +1500,7 @@ func writeVMSeed(vm *corrosion.VMRecord, req *pb.EnsureCloudInitRequest, isoPath
 		}
 	}
 	if err := cloudinit.GenerateISO(cloudinit.Config{
-		InstanceID:    req.VmName,
+		InstanceID:    instanceID,
 		LocalHostname: req.VmName,
 		UserData:      userData,
 		NetworkConfig: req.Networkconfig,

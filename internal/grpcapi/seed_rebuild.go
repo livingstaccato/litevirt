@@ -89,6 +89,11 @@ func (s *Server) writeMissingSeedForStart(ctx context.Context, vm *corrosion.VMR
 	if s.virt == nil {
 		return
 	}
+	var spec pb.VMSpec
+	if json.Unmarshal([]byte(vm.Spec), &spec) != nil || !cloudinit.SpecHasCloudInit(&spec) {
+		// A VM whose spec has no cloud-init is given no seed (review m2).
+		return
+	}
 	iso, err := lv.SafeCloudInitISOPath(s.dataDir, vm.Name)
 	if err != nil {
 		return
@@ -107,11 +112,18 @@ func (s *Server) writeMissingSeedForStart(ctx context.Context, vm *corrosion.VMR
 	if err != nil || !slices.Contains(files, iso) {
 		return
 	}
+	// The instance-id the guest booted with, kept when the seed was removed
+	// (cleanupPostMigration): a VM a cutover renamed was created as
+	// <name>-next (review m3). Otherwise the VM's name, as create wrote it.
+	id := vm.Name
+	if kept := cloudinit.RemovedSeedInstanceID(iso, cloudinit.SpecUUID(vm.Spec)); kept == vm.Name+"-next" {
+		id = kept
+	}
 	req := s.ensureCloudInitRequest(ctx, vm)
 	if req == nil {
 		err = errors.New("its spec or its network-config cannot be read")
 	} else {
-		err = writeVMSeed(vm, req, iso)
+		err = writeVMSeed(vm, req, iso, id)
 	}
 	if err != nil {
 		detail := fmt.Sprintf("the VM's domain on %s boots from its seed at %s, which is missing, and it could not be written again: %v; the start goes on, and libvirt refuses it for the missing file; the next start on %s tries again", s.hostName, iso, err, s.hostName)
@@ -119,7 +131,8 @@ func (s *Server) writeMissingSeedForStart(ctx context.Context, vm *corrosion.VMR
 		s.recordVMEventSeverity(context.WithoutCancel(ctx), vm.Name, "seed.rebuild_failed", "error", "warning", detail)
 		return
 	}
-	slog.Info("seed missing before a start: written again from the VM's spec", "vm", vm.Name, "seed", iso)
+	cloudinit.ForgetRemovedSeed(iso)
+	slog.Info("seed missing before a start: written again from the VM's spec", "vm", vm.Name, "seed", iso, "instance_id", id)
 }
 
 // seedStartRebuildRaced, set only by tests, runs in a start's rebuild between

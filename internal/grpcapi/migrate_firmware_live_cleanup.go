@@ -78,6 +78,18 @@ func liveFirmwareCleanupAfterRelease(s *Server, ctx context.Context, m fwmig.Mar
 // A failed step raises firmware_migration_cleanup_failed and returns its
 // error; no later step is taken (§7 S1).
 func (s *Server) fwmigCleanupSource(ctx context.Context, m fwmig.Marker) error {
+	return s.fwmigCleanupSourceAs(ctx, m, false)
+}
+
+// fwmigCleanupSourceAs is fwmigCleanupSource; byOperator is a cleanup an
+// operator's doctor action asked for, having taken the target's copy, which
+// goes on while the target is proved off. Every other cleanup holds before
+// the undefine while the target is proved off: the source's copy may then
+// be the only one that can still run, and `lv doctor firmware-move
+// --accept-source` needs its definition (lab2-D2 review I2). Whoever asks, a
+// cleanup never takes the state of a VM whose row names this host for the
+// move's incarnation: the VM was returned here (review I1).
+func (s *Server) fwmigCleanupSourceAs(ctx context.Context, m fwmig.Marker, byOperator bool) error {
 	ctx = context.WithoutCancel(ctx)
 	switch m.Phase {
 	case fwmig.PhaseReleased:
@@ -93,8 +105,26 @@ func (s *Server) fwmigCleanupSource(ctx context.Context, m fwmig.Marker) error {
 	default:
 		return fmt.Errorf("VM %q: the source cleanup of live firmware migration %s runs from released or cleaning, not %s", m.VM, m.Attempt, m.Phase)
 	}
+	if s.db != nil {
+		row, ours, err := s.moveRow(ctx, m)
+		if err != nil {
+			return s.liveFirmwareCleanupStopped(ctx, m, "read the VM's row", err)
+		}
+		if ours && row.HostName == s.hostName {
+			return s.liveFirmwareCleanupStopped(ctx, m, "take the source's state", errFirmwareCleanupReturned)
+		}
+	}
 	if err := s.writeRetainedFirmwareBundle(m); err != nil {
 		return s.liveFirmwareCleanupStopped(ctx, m, "write the retained bundle", err)
+	}
+	if !byOperator && s.db != nil {
+		off, err := corrosion.HostProvedOff(ctx, s.db, m.Target)
+		if err != nil {
+			return s.liveFirmwareCleanupStopped(ctx, m, "read whether the target is proved off", err)
+		}
+		if off {
+			return s.liveFirmwareCleanupStopped(ctx, m, "undefine the leftover definition", errFirmwareCleanupTargetOff)
+		}
 	}
 	if err := s.undefineLiveFirmwareLeftover(m); err != nil {
 		return s.liveFirmwareCleanupStopped(ctx, m, "undefine the leftover definition", err)
@@ -149,6 +179,13 @@ func (s *Server) liveFirmwareCleanupStopped(ctx context.Context, m fwmig.Marker,
 		// firmware move recovery takes a released one, target check first.
 		action = "the VM runs on the target, and the move is finished there; the source's firmware state is kept and its marker stays released: " +
 			"each minute, and at daemon start, the firmware move recovery checks the target again and resumes the cleanup once the cause is fixed"
+	case errors.Is(cause, errFirmwareCleanupReturned):
+		action = "the VM was returned here, so its firmware state here is its own and the cleanup does not take it: " +
+			"`lv doctor firmware-move <vm> --accept-source --acknowledge-rollback` finishes the return"
+	case errors.Is(cause, errFirmwareCleanupTargetOff):
+		action = "the target is proved off, so the source's copy may be the only one that can still run: it is kept, defined and not wiped. " +
+			"`lv doctor firmware-move <vm> --accept-source --acknowledge-rollback` returns the VM here; `--accept-target` takes the target's copy " +
+			"(the source's state quarantined); the cleanup goes on by itself once the target answers again"
 	case errors.Is(cause, errFirmwareCleanupStateChanged):
 		action = "the VM runs on the target from the verified copy; the source's firmware state changed after the cutover, " +
 			"so it is kept and never wiped automatically, and a retry cannot heal it: `lv doctor firmware-move <vm> --accept-target` " +
@@ -201,6 +238,14 @@ var retainedTempNameRe = regexp.MustCompile(`(\.tar\.tmp-)[0-9]+`)
 // errFirmwareCleanupStateChanged: the source state, or the bundle already
 // there, is not what the cutover recorded. No retry heals it.
 var errFirmwareCleanupStateChanged = errors.New("changed after the cutover")
+
+// errFirmwareCleanupReturned: the VM's row names the source for the move's
+// incarnation; its state here is the VM's again.
+var errFirmwareCleanupReturned = errors.New("the VM was returned here: its row names this host")
+
+// errFirmwareCleanupTargetOff: the target is proved off, so the source's
+// copy may be the only one that can still run.
+var errFirmwareCleanupTargetOff = errors.New("the target is proved off")
 
 // writeRetainedFirmwareBundle is §6.7 step 2. A bundle of the attempt already
 // there is the one an earlier pass wrote (it is renamed into place only once

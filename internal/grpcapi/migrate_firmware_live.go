@@ -15,6 +15,7 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -132,17 +133,31 @@ var fwmigConditionFor = map[fwmig.Phase]string{
 	fwmig.PhaseSourcePaused:   condFwmigSourcePaused,
 }
 
-// resolveFirmwareMoveParkConditions resolves every park condition of vm's
-// move, as the move ends: one raised for a park whose marker write failed,
-// or for a park the move left since, has no marker to resolve it later
-// (lab2-D2-proof F5).
+// resolveFirmwareMoveParkConditions resolves, as the move ends, every park
+// condition of vm that this host raised as a move's source: one raised for
+// a park whose marker write failed, or for a park the move left since, has
+// no marker to resolve it later (lab2-D2-proof F5). A park another host
+// raised as the source of its own move of the VM is that move's (review m1).
 func (s *Server) resolveFirmwareMoveParkConditions(ctx context.Context, vm string) {
+	if s.db == nil {
+		return
+	}
 	seen := map[string]bool{}
 	for _, code := range fwmigConditionFor {
 		if seen[code] {
 			continue
 		}
 		seen[code] = true
+		row, found, err := corrosion.GetHealthCondition(ctx, s.db, firmwareMigrationEvaluator, code, "vm", vm)
+		if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved {
+			continue
+		}
+		var ev struct {
+			Source string `json:"source"`
+		}
+		if json.Unmarshal([]byte(row.Evidence), &ev) == nil && ev.Source != "" && ev.Source != s.hostName {
+			continue
+		}
 		_ = s.resolveFirmwareMigrationCondition(ctx, code, vm)
 	}
 }
@@ -793,10 +808,23 @@ func (s *Server) releaseLiveFirmwareMove(ctx context.Context, r *liveFirmwareRun
 		// Release (its row still names this host), and the guest would stay
 		// paused there until the next pass, a minute later (lab2-D2-proof
 		// F1). That refusal is waited out briefly here.
+		// The wait ends with the daemon (the recovery's waitCtx), which
+		// keeps the park as it is (review m7).
+		done := context.Background().Done()
+		if r.waitCtx != nil {
+			done = r.waitCtx.Done()
+		}
 		deadline := time.Now().Add(fwLiveRecoveryReleaseWait)
+	wait:
 		for wait := fwLiveRetryBackoff; status.Code(err) == codes.FailedPrecondition && time.Now().Add(wait).Before(deadline); wait *= 2 {
 			slog.Info("live firmware move: the target refused Release; retrying while the commit replicates", "vm", m.VM, "target", r.target.Name, "error", err)
-			time.Sleep(wait)
+			t := time.NewTimer(wait)
+			select {
+			case <-done:
+				t.Stop()
+				break wait
+			case <-t.C:
+			}
 			err = s.retryLiveFirmwareCall(ctx, r, "release", release)
 		}
 	}

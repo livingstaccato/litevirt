@@ -808,7 +808,7 @@ func (s *Server) doctorAcceptTarget(ctx context.Context, m fwmig.Marker) (string
 			return "", err
 		}
 		s.releaseSourceVFsAfterCutover(ctx, m.VM, r.vfs)
-		cerr := s.fwmigCleanupSource(ctx, r.marker)
+		cerr := s.fwmigCleanupSourceAs(ctx, r.marker, true)
 		s.settleRetriedPark(ctx, m)
 		if cerr != nil {
 			return "", status.Errorf(codes.FailedPrecondition, "VM %q: the source cleanup stopped: %v", m.VM, cerr)
@@ -1454,6 +1454,20 @@ func (s *Server) doctorAcceptSourceAfterCommit(ctx context.Context, m fwmig.Mark
 			}
 		}
 	}
+	if !returned && m.Phase == fwmig.PhaseCleaning {
+		// Out of cleaning before the return: the cleanup takes only a
+		// cleaning marker, and a run that stops between the return and its
+		// unmark must not leave it one to take (review I1). A re-run resumes
+		// from this park.
+		pm, perr := m.Park(fwmig.PhaseTargetUnreachable)
+		if perr == nil {
+			pm.Detail = fmt.Sprintf("an operator is returning the VM to %s (--accept-source --acknowledge-rollback); run it again if it did not finish", s.hostName)
+			perr = recs.PutMarker(pm)
+		}
+		if perr != nil {
+			return "", status.Errorf(codes.Internal, "VM %q: take the marker out of cleaning before the return: %v; nothing was returned", m.VM, perr)
+		}
+	}
 	if !returned {
 		ok, err := corrosion.ReturnMigratedVM(ctx, s.db, m.VM, m.Target, s.hostName, m.UUID, m.CreatedAt, "stopped", disks)
 		if err != nil {
@@ -1660,7 +1674,7 @@ func (s *Server) doctorReleasedThenClean(ctx context.Context, m fwmig.Marker, di
 		return "", err
 	}
 	s.releaseSourceVFsAfterCutover(ctx, m.VM, r.vfs)
-	cerr := s.fwmigCleanupSource(ctx, r.marker)
+	cerr := s.fwmigCleanupSourceAs(ctx, r.marker, true)
 	s.settleRetriedPark(ctx, m)
 	if cerr != nil {
 		return "", status.Errorf(codes.FailedPrecondition, "VM %q: %s, and the source cleanup stopped: %v", m.VM, did, cerr)

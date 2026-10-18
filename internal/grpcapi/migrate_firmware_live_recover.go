@@ -423,15 +423,17 @@ func (s *Server) recoverFirmwareMoveLocked(ctx context.Context, vm string, start
 	if !ok {
 		return
 	}
+	if m.CapacityLease != "" {
+		// The process that took the move's admission lease died holding it,
+		// or could not release it: a move clears it from the marker once it
+		// released it (review m4).
+		// This pass holds it in that process's place, and releases it when
+		// it ends, as the move releases it when it returns (lab2-D2-proof
+		// F8). One that cannot be released is tried again by the next pass.
+		defer s.releaseDeadMoveLease(ctx, m)
+	}
 	if m.Phase == fwmig.PhaseCleaning && !startup {
 		return // RetryLiveFirmwareCleanupsOnce takes it
-	}
-	if m.CapacityLease != "" && (startup || !m.Phase.Parked()) {
-		// The process that took the move's admission lease died holding it
-		// (an unparked marker whose lock is free was left by one): this pass
-		// holds it in that process's place, and releases it when it ends, as
-		// the move releases it when it returns (lab2-D2-proof F8).
-		defer s.releaseDeadMoveLease(ctx, m)
 	}
 	r := s.recoveredFirmwareRun(ctx, m)
 	r.waitCtx = waitCtx
@@ -478,7 +480,7 @@ func (s *Server) recoverFirmwareMoveLocked(ctx context.Context, vm string, start
 // process that took it can no longer release, and drops it from the marker
 // when the marker of m's attempt is still there. A lease already gone is
 // released. One that cannot be released stays in the marker for the next
-// start, and the stale-lease sweep collects it in any case.
+// pass, and the stale-lease sweep collects it in any case.
 func (s *Server) releaseDeadMoveLease(ctx context.Context, m fwmig.Marker) {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
 	defer cancel()
@@ -490,19 +492,25 @@ func (s *Server) releaseDeadMoveLease(ctx context.Context, m fwmig.Marker) {
 		err = s.releaseRemoteHostLease(rctx, m.CapacityLeaseHolder, m.CapacityLease)
 	}
 	if err != nil && status.Code(err) != codes.NotFound {
-		slog.Warn("live firmware move recovery: the admission lease of a move whose process died was not released; it is tried again at the next start, and the stale-lease sweep collects it",
+		slog.Warn("live firmware move recovery: the admission lease of a move whose process died was not released; the next pass tries again, and the stale-lease sweep collects it",
 			"vm", m.VM, "attempt", m.Attempt, "lease", m.CapacityLease, "holder", m.CapacityLeaseHolder, "error", err)
 		return
 	}
 	slog.Info("live firmware move recovery: released the admission lease of a move whose process died",
 		"vm", m.VM, "attempt", m.Attempt, "lease", m.CapacityLease, "holder", m.CapacityLeaseHolder)
-	cur, ok, gerr := s.fwRecords().GetMarker(m.VM)
-	if gerr != nil || !ok || cur.Attempt != m.Attempt || cur.CapacityLease == "" {
+	s.clearMarkerLease(m.VM, m.Attempt)
+}
+
+// clearMarkerLease drops the admission lease from vm's marker of attempt,
+// once it was released.
+func (s *Server) clearMarkerLease(vm, attempt string) {
+	cur, ok, gerr := s.fwRecords().GetMarker(vm)
+	if gerr != nil || !ok || cur.Attempt != attempt || cur.CapacityLease == "" {
 		return
 	}
 	cur.CapacityLease, cur.CapacityLeaseHolder = "", ""
 	if perr := s.fwRecords().PutMarker(cur); perr != nil {
-		slog.Warn("live firmware move recovery: the released lease stays named in the marker", "vm", m.VM, "error", perr)
+		slog.Warn("live firmware move: the released lease stays named in the marker", "vm", vm, "error", perr)
 	}
 }
 

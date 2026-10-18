@@ -1283,3 +1283,41 @@ func TestFleet_FwLiveRestart_RecoveryReleasesTheDeadMovesLease(t *testing.T) {
 		return len(fwliveRestartMigrateLeases(t, dst)) == 0
 	})
 }
+
+// Review m4. The recovery's release of a dead move's lease fails (the holder
+// does not answer), and the move parks: the marker keeps the lease, and a
+// later pass, not only the next daemon start, releases it once the holder
+// answers.
+//
+// Mutation: release only at start-up or from an unparked marker — the lease
+// stays counted after the later pass, red.
+func TestFleet_FwLiveRestart_ALaterPassReleasesTheDeadMovesLease(t *testing.T) {
+	c, src, dst, _ := fwliveCluster(t)
+	var down atomic.Bool
+	down.Store(true)
+	for _, method := range []string{"ReleaseHostCapacity", "ReleaseLiveFirmwareTarget"} {
+		for i := 0; i < 40; i++ {
+			dst.HookUnary(method, func(hctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
+				if down.Load() {
+					return nil, status.Error(codes.Unavailable, "the target does not answer")
+				}
+				return h(hctx, req)
+			})
+		}
+	}
+	m := fwliveRestartCrashMigrating(t, c, src, dst, fwliveRestartLand(t, src, dst, "migrated"))
+	time.Sleep(200 * time.Millisecond) // the stopped server's move unwinds
+	fwliveRestartUp(t, c, src)
+	fwliveRestartRecovered(src)
+	if cur, ok := fwliveMarker(t, src); !ok || !cur.Phase.Parked() || cur.CapacityLease != m.CapacityLease {
+		t.Fatalf("fixture: marker %+v (present %v), want parked and still naming the lease", cur, ok)
+	}
+	if got := fwliveRestartMigrateLeases(t, dst); len(got) != 1 {
+		t.Fatalf("fixture: %s counts MigrateVM leases %v, want the dead move's", dst.Name, got)
+	}
+	down.Store(false)
+	src.Server.FirmwareMoveRecoveryOnce(context.Background())
+	eventually(t, 30*time.Second, "a later pass to release the dead move's lease", func() bool {
+		return len(fwliveRestartMigrateLeases(t, dst)) == 0
+	})
+}

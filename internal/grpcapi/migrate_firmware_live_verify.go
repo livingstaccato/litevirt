@@ -283,7 +283,10 @@ func (s *Server) ReleaseLiveFirmwareTarget(ctx context.Context, req *pb.ReleaseL
 		if held {
 			hp = &h
 		}
-		return s.confirmNvram(ctx, resp, req.VmName, hp, uefi, req.SrcNvramSha256)
+		// An adopted copy whose guest runs here (target_ran) is the VM's as
+		// it is now: a variable it wrote since the adopt is its own (review
+		// m5).
+		return s.confirmNvramAs(ctx, resp, req.VmName, hp, uefi, req.SrcNvramSha256, held && h.Adoption != nil)
 	}
 	if !held {
 		resp.Verdict = verdictNotHeld
@@ -391,6 +394,12 @@ func (s *Server) resumeReleased(ctx context.Context, resp *pb.ReleaseLiveFirmwar
 // operator resolves it. A caller gone mid-poll writes nothing: the hold stays
 // resuming, and a retry (step 2) confirms again.
 func (s *Server) confirmNvram(ctx context.Context, resp *pb.ReleaseLiveFirmwareTargetResponse, vm string, h *fwmig.Hold, uefi bool, srcNvram string) (*pb.ReleaseLiveFirmwareTargetResponse, error) {
+	return s.confirmNvramAs(ctx, resp, vm, h, uefi, srcNvram, false)
+}
+
+// confirmNvramAs is confirmNvram; adoptedLive confirms whatever NVRAM the
+// running guest of an adopted hold has now.
+func (s *Server) confirmNvramAs(ctx context.Context, resp *pb.ReleaseLiveFirmwareTargetResponse, vm string, h *fwmig.Hold, uefi bool, srcNvram string, adoptedLive bool) (*pb.ReleaseLiveFirmwareTargetResponse, error) {
 	confirmed := !uefi
 	if uefi {
 		deadline := time.Now().Add(releaseNvramPollFor)
@@ -398,7 +407,7 @@ func (s *Server) confirmNvram(ctx context.Context, resp *pb.ReleaseLiveFirmwareT
 			sum, err := s.fw().NvramSHA256(vm)
 			if err == nil {
 				resp.NvramSha256 = sum
-				if sum == srcNvram || adoptedNvram(h, sum) {
+				if sum == srcNvram || adoptedNvram(h, sum) || adoptedLive {
 					confirmed = true
 					break
 				}

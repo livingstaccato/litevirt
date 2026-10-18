@@ -2,11 +2,18 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fwmig"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -196,5 +203,195 @@ func TestDoctorFirmwareMove_SourceStateMissingAcceptSourceText(t *testing.T) {
 	r.refused(err, "--adopt-target-copy", before)
 	if strings.Contains(err.Error(), "--discard-target") {
 		t.Errorf("the refusal suggests --discard-target: %v", err)
+	}
+}
+
+// Review I1: an --accept-source return from cleaning that stops after the
+// return landed and before its unmark (the daemon died) leaves no cleaning
+// marker: the doctor takes it out of cleaning before the return, so the
+// cleanup retry and the recovery never undefine and wipe the copy the VM was
+// returned to. A re-run of the doctor finishes the return.
+//
+// Mutation: drop the park before the return — the marker stays cleaning, red.
+func TestDoctorFirmwareMove_CleaningReturnInterruptedKeepsTheCopy(t *testing.T) {
+	r := newFwdRig(t, fwlOpts{})
+	run := r.crashAt(fwmig.PhaseReleased)
+	m := run.marker
+	m.Phase = fwmig.PhaseCleaning
+	if err := r.src.fwRecords().PutMarker(m); err != nil {
+		t.Fatal(err)
+	}
+	r.fenceTarget()
+	o := fwDoctorAfterReturnHook
+	fwDoctorAfterReturnHook = func() error { return errors.New("daemon died after the return") }
+	_, err := r.doctor(actAcceptSource, withAck)
+	fwDoctorAfterReturnHook = o
+	if err == nil {
+		t.Fatal("the interrupted return reported success")
+	}
+	cur, ok := r.marker()
+	if !ok || cur.Phase == fwmig.PhaseCleaning {
+		t.Fatalf("marker after the interrupted return: %s (present %v), want it out of cleaning", cur.Phase, ok)
+	}
+	r.src.RetryLiveFirmwareCleanupsOnce(context.Background())
+	r.src.FirmwareMoveRecoveryOnce(context.Background())
+	if st, ok := r.srcFake.RawState(fwlVM); !ok || st == libvirtfake.StateRunning {
+		t.Fatalf("source domain %s (defined %v) after the cleanup retry and recovery, want defined and shut off", st, ok)
+	}
+	r.requireSourceIntact("after the cleanup retry and recovery")
+	if _, ok := r.marker(); ok {
+		_, err = r.doctor(actAcceptSource, withAck)
+		r.resolved(err, "src-host", "stopped")
+	}
+	if row := r.row(); row.HostName != "src-host" || row.State != "stopped" {
+		t.Errorf("row %s on %s, want stopped on src-host", row.State, row.HostName)
+	}
+	r.requireSourceIntact("after the re-run")
+}
+
+// Review I1, the cleanup's own guard: a cleaning marker of a VM whose row
+// names the source for the move's incarnation (a return that left one) is
+// never cleaned up: the domain stays defined and the state in place, and
+// cleanup_failed names the doctor's exit.
+//
+// Mutation: drop the row check in the cleanup — the domain is undefined and
+// the state wiped, red.
+func TestFwmigCleanup_RefusesAVMReturnedHere(t *testing.T) {
+	r := newFwdRig(t, fwlOpts{})
+	run := r.crashAt(fwmig.PhaseReleased)
+	m := run.marker
+	m.Phase = fwmig.PhaseCleaning
+	if err := r.src.fwRecords().PutMarker(m); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpdateVMHost(context.Background(), r.src.db, fwlVM, "src-host", "stopped"); err != nil {
+		t.Fatal(err)
+	}
+	r.src.RetryLiveFirmwareCleanupsOnce(context.Background())
+	if st, ok := r.srcFake.RawState(fwlVM); !ok || st == libvirtfake.StateRunning {
+		t.Fatalf("source domain %s (defined %v), want defined and shut off", st, ok)
+	}
+	r.requireSourceIntact("after the cleanup retry")
+	requireMarker(t, r, fwmig.PhaseCleaning, "")
+	requireFwmigCondition(t, r.src, condFwmigCleanupFailed)
+}
+
+// Review I2: a stopped cleanup whose fault clears while its target is proved
+// off holds after the retained bundle: the source domain stays defined and
+// its state in place, so `--accept-source` stays open; cleanup_failed names
+// it. An operator's --accept-target cleanup is not held.
+//
+// Mutation: drop the proved-off hold — the domain is undefined and the state
+// wiped, red.
+func TestFwmigCleanup_HoldsWhileTheTargetIsProvedOff(t *testing.T) {
+	r := newFwdRig(t, fwlOpts{})
+	run := r.crashAt(fwmig.PhaseReleased)
+	m := run.marker
+	m.Phase = fwmig.PhaseCleaning
+	if err := r.src.fwRecords().PutMarker(m); err != nil {
+		t.Fatal(err)
+	}
+	r.fenceTarget()
+	r.src.RetryLiveFirmwareCleanupsOnce(context.Background())
+	if st, ok := r.srcFake.RawState(fwlVM); !ok || st == libvirtfake.StateRunning {
+		t.Fatalf("source domain %s (defined %v), want defined and shut off", st, ok)
+	}
+	r.requireSourceIntact("after the cleanup retry")
+	requireMarker(t, r, fwmig.PhaseCleaning, "")
+	requireFwmigCondition(t, r.src, condFwmigCleanupFailed)
+	// The exit stays open.
+	_, err := r.doctor(actAcceptSource, withAck)
+	r.resolved(err, "src-host", "stopped")
+	r.requireSourceIntact("after --accept-source")
+}
+
+// Review m1: the end of a move resolves only the park conditions this host
+// raised as the move's source; another host's park of its own move of the
+// VM (a later hop) stays open.
+//
+// Mutation: resolve every park code of the VM — red.
+func TestDoctorFirmwareMove_ExitLeavesAnotherSourcesPark(t *testing.T) {
+	r := newFwdRig(t, fwlOpts{})
+	run := r.crashAt(fwmig.PhaseCommitted)
+	// Raised as the later hop's source records it (the conditions replicate).
+	if err := r.src.raiseFirmwareMigrationCondition(context.Background(), fwmigCondition{
+		Code: condFwmigSourcePaused, VM: fwlVM, Attempt: "a-later-hop", Source: "dst-host", Target: "third-host",
+		Detail: "the later hop parked", Action: "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r.park(run, fwmig.PhaseTargetUnreachable, "Release was not answered")
+	r.fenceTarget()
+	_, err := r.doctor(actAcceptSource, withAck)
+	r.resolved(err, "src-host", "stopped")
+	requireFwmigCondition(t, r.src, condFwmigSourcePaused)
+}
+
+// Review m5: the guest of an adopted target_ran copy writes a variable
+// between the adopt and the release: the release confirms the adopted copy as
+// it is then, and does not park nvram_unconfirmed.
+//
+// Mutation: confirm the running adopted guest against the adopt-time hash
+// only — red.
+func TestDoctorFirmwareMove_AdoptVariableBeforeReleaseConfirms(t *testing.T) {
+	r := newFwdRig(t, fwlOpts{})
+	run := r.crashAt(fwmig.PhaseCutover)
+	r.dstFake.SetState(fwlVM, libvirtfake.StateRunning)
+	r.park(run, fwmig.PhaseTargetRan, "TARGET_RAN")
+	r.peerC.releaseAnswer = func(call func() (*pb.ReleaseLiveFirmwareTargetResponse, error)) (*pb.ReleaseLiveFirmwareTargetResponse, error) {
+		r.write(r.dstStore.NvramPath(fwlVM), []byte("a variable written after the adopt"))
+		return call()
+	}
+	_, err := r.doctor(actAdopt)
+	r.resolved(err, "dst-host", "running")
+	if _, ok := r.hold(); ok {
+		t.Error("the target's hold is left")
+	}
+	requireNoFwmigCondition(t, r.src, condFwmigNvramUnconfirmed)
+}
+
+// Review m7: a recovery's wait on a Release refusal ends with the daemon (its
+// waitCtx): one call, then the park, without waiting out the backoff.
+//
+// Mutation: sleep the backoff regardless of waitCtx — more calls and a
+// second or more, red.
+func TestRecoveryReleaseWait_EndsWithTheDaemon(t *testing.T) {
+	r := newFwdRig(t, fwlOpts{})
+	run := r.crashAt(fwmig.PhaseCommitted)
+	ob := fwLiveRetryBackoff
+	fwLiveRetryBackoff = 300 * time.Millisecond
+	t.Cleanup(func() { fwLiveRetryBackoff = ob })
+	var calls atomic.Int32
+	r.peerC.releaseAnswer = func(func() (*pb.ReleaseLiveFirmwareTargetResponse, error)) (*pb.ReleaseLiveFirmwareTargetResponse, error) {
+		calls.Add(1)
+		return nil, status.Error(codes.FailedPrecondition, "its row names src-host: the move has not committed")
+	}
+	rr := r.src.recoveredFirmwareRun(context.Background(), run.marker)
+	dctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rr.waitCtx = dctx
+	start := time.Now()
+	_ = r.src.releaseLiveFirmwareMove(context.Background(), rr)
+	if n, d := calls.Load(), time.Since(start); n != 1 || d > 250*time.Millisecond {
+		t.Errorf("Release asked %d times over %s with the daemon stopping, want once at once", n, d)
+	}
+}
+
+// lab2-D2-proof F11: a move whose finish fails says so, with the cause's
+// message, not "migrated to X, but is rpc error: ...".
+//
+// Mutation: the old "but is %v" text — red.
+func TestMigrate_FinishFailureText(t *testing.T) {
+	r := newFwlRig(t, fwlOpts{})
+	r.peerC.releaseAnswer = func(func() (*pb.ReleaseLiveFirmwareTargetResponse, error)) (*pb.ReleaseLiveFirmwareTargetResponse, error) {
+		return nil, status.Error(codes.Unavailable, "connection refused")
+	}
+	err := r.migrate()
+	if err == nil {
+		t.Fatal("the move reported success with Release unanswered")
+	}
+	msg := status.Convert(err).Message()
+	if !strings.Contains(msg, `migrated to dst-host, but finishing the move failed: VM "os1"`) || strings.Contains(msg, "failed: rpc error") {
+		t.Errorf("message: %s", msg)
 	}
 }

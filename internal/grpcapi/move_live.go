@@ -266,15 +266,12 @@ func (s *Server) liveMoveVolume(
 		// The define may have been stored despite the error. Point the persistent
 		// config back at src while the mirror still tracks it, then stop the mirror;
 		// the dest is removed only once the config is back on src.
-		safe := s.rollbackCutover(cutoverRedefined, vm, src, destPath)
-		_ = s.liveMover.CancelBlockCopy(vm.Name, src.Path)
-		kept := ""
-		if safe {
-			_ = os.Remove(destPath)
-		} else {
-			kept = unrolledCopyNote(src, destPath)
+		if !s.rollbackCutover(cutoverRedefined, vm, src, destPath) {
+			return s.liveUnrolledDefine(vm, src, destPath, commit, rerr)
 		}
-		return status.Errorf(codes.Internal, "redefine persistent config (cutover aborted%s): %v", kept, rerr)
+		_ = s.liveMover.CancelBlockCopy(vm.Name, src.Path)
+		_ = os.Remove(destPath)
+		return status.Errorf(codes.Internal, "redefine persistent config (cutover aborted): %v", rerr)
 	}
 	if err := commit(); err != nil {
 		// Roll persistent back; only remove the dest when it's no longer referenced
@@ -309,6 +306,70 @@ func (s *Server) liveMoveVolume(
 
 	// Pivot succeeded: live=dest, persistent=dest, DB=dest all agree.
 	return done()
+}
+
+// liveUnrolledDefine handles a double fault on the live path: the redefine
+// reported an error and pointing the persistent config back at src failed too,
+// so the config may name destPath. The running guest and the persistent config
+// must name the same file, and nothing is deleted here.
+//
+// The mirror is still in sync and still tracks src, so the job can be pivoted:
+// when the config names destPath, the guest is pivoted onto it and the disk row
+// follows. When the pivot fails, or the config cannot be read, the mirror is
+// left running rather than cancelled: it keeps destPath current with every
+// write the guest makes to src, so whichever file the config names holds the
+// guest's data. Cancelling it would leave a config that names a copy no longer
+// receiving writes, and the next cold start would boot stale data.
+func (s *Server) liveUnrolledDefine(vm *corrosion.VMRecord, src *corrosion.DiskRecord, destPath string, commit func() error, defineErr error) error {
+	disk := src.TargetDev
+	if disk == "" {
+		disk = src.Path
+	}
+	pivotCmd := fmt.Sprintf("virsh blockjob %s %s --pivot", vm.Name, disk)
+	abortCmd := fmt.Sprintf("virsh blockjob %s %s --abort", vm.Name, disk)
+
+	cs, _, perr := s.planCutover(vm, src, destPath)
+	switch {
+	case perr == nil && cs == cutoverAlreadyAtDst:
+		if err := s.liveMover.PivotBlockCopy(vm.Name, src.Path); err != nil {
+			slog.Error("live move: redefine failed, the rollback failed, and the pivot onto the copy the config names failed — mirror left running, both files kept; operator must pivot or roll back",
+				"vm", vm.Name, "disk", src.DiskName, "config_names", destPath, "guest_writes", src.Path, "define_error", defineErr, "pivot_error", err)
+			return status.Errorf(codes.Internal,
+				"redefine persistent config failed (%v) and could not be pointed back at %s, and the pivot onto the copy failed (%v): "+
+					"the persistent config names %s, but the guest is writing %s. The block-copy mirror into %s is left running so the copy stays current; "+
+					"both files are kept and the disk row still names %s. Operator: either run `%s` and then point the disk row at %s, "+
+					"or define the persistent config back to %s and then run `%s`",
+				defineErr, src.Path, err, destPath, src.Path, destPath, src.Path, pivotCmd, destPath, src.Path, abortCmd)
+		}
+		if err := commit(); err != nil {
+			slog.Error("live move: pivoted onto the copy the config names after a failed redefine and rollback, but the disk row could not follow; operator must point the disk row at the copy",
+				"vm", vm.Name, "disk", src.DiskName, "dest", destPath, "error", err)
+			return status.Errorf(codes.Internal,
+				"redefine persistent config failed (%v) and could not be pointed back at %s, so the guest was pivoted onto %s, which the persistent config names; "+
+					"the disk row could not be updated (%v) and still names %s: point it at %s. The source %s is kept",
+				defineErr, src.Path, destPath, err, src.Path, destPath, src.Path)
+		}
+		return status.Errorf(codes.Internal,
+			"redefine persistent config reported an error (%v) and could not be pointed back at %s, so the move was completed onto %s: "+
+				"the guest, the persistent config and the disk row name it. The source %s is kept",
+			defineErr, src.Path, destPath, src.Path)
+	case perr == nil && cs == cutoverRedefined:
+		// The config names src after all (the rollback failed to read or define
+		// it, not because it names the copy): the guest and the config agree, so
+		// the mirror can stop. The copy is kept.
+		_ = s.liveMover.CancelBlockCopy(vm.Name, src.Path)
+		return status.Errorf(codes.Internal,
+			"redefine persistent config (cutover aborted; the guest and the persistent config name %s; the copy %s is kept): %v",
+			src.Path, destPath, defineErr)
+	default:
+		slog.Error("live move: redefine failed, the rollback failed, and the persistent config could not be read — mirror left running, both files kept; operator must reconcile",
+			"vm", vm.Name, "disk", src.DiskName, "dest", destPath, "guest_writes", src.Path, "define_error", defineErr, "read_error", perr)
+		return status.Errorf(codes.Internal,
+			"redefine persistent config failed (%v) and could not be pointed back at %s, and the persistent config could not be read (%v), so it may name %s or %s: "+
+				"the guest is writing %s and the block-copy mirror into %s is left running so both files stay current; both are kept and the disk row still names %s. "+
+				"Operator: read the config (virsh dumpxml --inactive %s); if it names %s, run `%s` and point the disk row at %s, otherwise run `%s`",
+			defineErr, src.Path, perr, src.Path, destPath, src.Path, destPath, src.Path, vm.Name, destPath, pivotCmd, destPath, abortCmd)
+	}
 }
 
 // liveMovePlacementErr maps the strict UpdateDiskPlacement error to a deliberate gRPC

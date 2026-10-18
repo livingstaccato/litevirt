@@ -251,6 +251,9 @@ func TestMoveVolume_Offline_AppliedDefineFailureRepointsTheSource(t *testing.T) 
 	if exists(dstFile) || !exists(srcFile) {
 		t.Fatalf("dst exists=%v src exists=%v, want false/true", exists(dstFile), exists(srcFile))
 	}
+	if got := diskRowPath(t, s, "vm1"); got != srcFile {
+		t.Fatalf("disk row names %s, want the source %s", got, srcFile)
+	}
 }
 
 // The rollback of that define fails too: the config still names the copy, so
@@ -335,22 +338,114 @@ func TestMoveVolume_Live_AppliedDefineFailureRepointsTheSourceBeforeCancel(t *te
 	if mover.pivotCalls != 0 {
 		t.Fatalf("pivot = %d, want 0", mover.pivotCalls)
 	}
+	if got := diskRowPath(t, s, "vm-live"); got != src {
+		t.Fatalf("disk row names %s, want the source %s", got, src)
+	}
 }
 
-// The live rollback fails too: the copy is kept, the error names it, and
-// nothing is deleted.
-func TestMoveVolume_Live_UnrolledDefineKeepsAndNamesTheCopy(t *testing.T) {
-	s, f, src, destPath, _ := liveLitevirtMove(t)
+// diskRowPath returns the path the VM's only disk row names.
+func diskRowPath(t *testing.T, s *Server, vm string) string {
+	t.Helper()
+	disks, err := corrosion.GetVMDisks(context.Background(), s.db, vm)
+	if err != nil || len(disks) != 1 {
+		t.Fatalf("disk rows of %s: %+v, %v", vm, disks, err)
+	}
+	return disks[0].Path
+}
+
+// The live rollback fails too, so the config names the copy. The mirror is in
+// sync, so the guest is pivoted onto the copy and the disk row follows: the
+// guest, the config and the row all name the copy. Nothing is deleted and the
+// error says so.
+func TestMoveVolume_Live_UnrolledDefinePivotsOntoTheCopy(t *testing.T) {
+	s, f, src, destPath, before := liveLitevirtMove(t)
 	mover := &fakeLiveMover{jobEnd: 4096, progressBytesPerPoll: 4096}
 	s.SetLiveMover(mover)
 	defineThenFail(f, destPath, true)
 	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
 	err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm-live", DiskName: "root", TargetPool: "warm"}, rec)
-	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), destPath) ||
-		!strings.Contains(err.Error(), "could not be pointed back") {
-		t.Fatalf("want Internal naming the kept copy %s, got %v", destPath, err)
+	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "completed onto "+destPath) ||
+		!strings.Contains(err.Error(), "source "+src+" is kept") {
+		t.Fatalf("want Internal saying the move completed onto %s with the source kept, got %v", destPath, err)
+	}
+	if mover.pivotCalls != 1 || mover.cancelCalls != 0 {
+		t.Fatalf("pivot = %d cancel = %d, want 1/0", mover.pivotCalls, mover.cancelCalls)
+	}
+	if after, _ := f.DumpXMLInactive("vm-live"); after != strings.Replace(before, src, destPath, 1) {
+		t.Fatalf("the config does not name the copy:\n%s", after)
+	}
+	if got := diskRowPath(t, s, "vm-live"); got != destPath {
+		t.Fatalf("disk row names %s, want the copy %s", got, destPath)
 	}
 	if !exists(destPath) || !exists(src) {
 		t.Fatalf("dest exists=%v src exists=%v, want both", exists(destPath), exists(src))
+	}
+}
+
+// The double fault, and the pivot onto the copy fails as well. The mirror is
+// left running so the copy the config names stays current, both files are kept,
+// the row still names the source, and the error names the file the config
+// names, the file the guest writes, and what the operator does next.
+func TestMoveVolume_Live_UnrolledDefineFailedPivotLeavesTheMirror(t *testing.T) {
+	s, f, src, destPath, _ := liveLitevirtMove(t)
+	mover := &fakeLiveMover{jobEnd: 4096, progressBytesPerPoll: 4096, pivotErr: errors.New("pivot failed")}
+	s.SetLiveMover(mover)
+	defineThenFail(f, destPath, true)
+	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+	err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm-live", DiskName: "root", TargetPool: "warm"}, rec)
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("want Internal, got %v", err)
+	}
+	for _, want := range []string{
+		"the persistent config names " + destPath,
+		"the guest is writing " + src,
+		"virsh blockjob vm-live " + src + " --pivot",
+		"virsh blockjob vm-live " + src + " --abort",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error does not say %q: %v", want, err)
+		}
+	}
+	if mover.pivotCalls != 1 || mover.cancelCalls != 0 {
+		t.Fatalf("pivot = %d cancel = %d, want 1/0 (the mirror must stay)", mover.pivotCalls, mover.cancelCalls)
+	}
+	if !exists(destPath) || !exists(src) {
+		t.Fatalf("dest exists=%v src exists=%v, want both", exists(destPath), exists(src))
+	}
+	if got := diskRowPath(t, s, "vm-live"); got != src {
+		t.Fatalf("disk row names %s, want the source %s (the guest still writes it)", got, src)
+	}
+}
+
+// The double fault with the config unreadable afterwards: what the config
+// names is unknown, so the mirror is neither pivoted nor cancelled, both files
+// are kept, and the error says so.
+func TestMoveVolume_Live_UnrolledDefineUnreadableConfigLeavesTheMirror(t *testing.T) {
+	s, f, src, destPath, _ := liveLitevirtMove(t)
+	mover := &fakeLiveMover{jobEnd: 4096, progressBytesPerPoll: 4096}
+	s.SetLiveMover(mover)
+	defineThenFail(f, destPath, true)
+	inner := f.FailDefineDomain
+	f.FailDefineDomain = func(x string) error {
+		err := inner(x)
+		if strings.Contains(x, destPath) {
+			f.FailDumpXMLInactive = func(string) error { return errors.New("libvirt connection lost") }
+		}
+		return err
+	}
+	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+	err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm-live", DiskName: "root", TargetPool: "warm"}, rec)
+	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "could not be read") ||
+		!strings.Contains(err.Error(), "the guest is writing "+src) || !strings.Contains(err.Error(), destPath) {
+		t.Fatalf("want Internal naming both files and the unreadable config, got %v", err)
+	}
+	if mover.pivotCalls != 0 || mover.cancelCalls != 0 {
+		t.Fatalf("pivot = %d cancel = %d, want 0/0", mover.pivotCalls, mover.cancelCalls)
+	}
+	if !exists(destPath) || !exists(src) {
+		t.Fatalf("dest exists=%v src exists=%v, want both", exists(destPath), exists(src))
+	}
+	if got := diskRowPath(t, s, "vm-live"); got != src {
+		t.Fatalf("disk row names %s, want the source %s", got, src)
 	}
 }

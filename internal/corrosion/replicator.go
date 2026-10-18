@@ -48,7 +48,9 @@ type Replicator struct {
 	// not consuming our log, however recent its watermark row looks, so the
 	// prune stops counting it once the run outlasts UnreachablePeerGrace.
 	pushFailingSince map[string]time.Time
-	wg               sync.WaitGroup
+	// schemaPush is each peer's last schema answer to a push (schema_refusal.go).
+	schemaPush map[string]*schemaPushState
+	wg         sync.WaitGroup
 
 	// Fallback tracking for leaves: when was the last successful push to any relay?
 	lastRelayPush  atomic.Int64 // unix millis
@@ -637,6 +639,7 @@ func (r *Replicator) replicateOnce(ctx context.Context, peerName string) (int, e
 	}
 	defer conn.Close()
 
+	schema := r.client.EffectiveDBSchema()
 	resp, err := client.PushMutations(pctx, &pb.ReplicateRequest{
 		Sender:        r.client.HostName(),
 		AfterSeq:      lastSeq,
@@ -646,7 +649,7 @@ func (r *Replicator) replicateOnce(ctx context.Context, peerName string) (int, e
 		// has), not the binary const — so during a multi-version rolling upgrade
 		// a node whose DB was pre-staged forward but whose binary hasn't swapped
 		// yet still reports the real (forward) schema and replication keeps flowing.
-		SenderSchemaVersion: int32(r.client.EffectiveDBSchema()),
+		SenderSchemaVersion: int32(schema),
 		// This node's belief that the PEER is a relay, carried so the peer can
 		// fan out even if its own copy of hosts.state disagrees with ours. The
 		// relay set is read under the lock because syncPeers replaces it.
@@ -656,8 +659,12 @@ func (r *Replicator) replicateOnce(ctx context.Context, peerName string) (int, e
 		SenderCapabilities: r.advertisedCapabilities(),
 	})
 	if err != nil {
+		if sender, peerSchema, ok := parseSchemaRefusal(err); ok {
+			r.noteSchemaRefusal(peerName, sender, peerSchema)
+		}
 		return 0, fmt.Errorf("push mutations: %w", err)
 	}
+	r.noteSchemaAccepted(peerName, schema)
 
 	// Update watermark: use the highest of peer's applied seq and our maxSeqSeen
 	// (to skip past filtered entries from the peer's origin).

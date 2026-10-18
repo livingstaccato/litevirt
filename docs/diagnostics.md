@@ -1710,6 +1710,25 @@ names the way the [repair flow](#operational-repair-flow) describes; the held
 change then applies on its own. This is receiver-side only: an older receiver
 still back-pressures, and upgrading it is what releases the sender's stream.
 
+### A peer refuses replication: its schema is behind (`replication_peer_schema_behind`)
+
+Evaluator `replication_schema`, subject kind `host`, subject `<peer>`,
+severity warning (it degrades the cluster's health). A node whose database
+schema is behind a sender's refuses every push from it (`sender DB schema
+version N, local M (receiver is missing migrations ...)`), so nothing that
+sender writes reaches it. Each sender that sees the refusal raises the
+condition on the peer; the evidence records both schemas and the fix,
+`lv host upgrade <peer>`. The sender also logs, once per run of refusals, an
+ERROR `replication: a peer refuses this node's pushes: its database schema
+is behind`, naming the peer and the fix.
+
+The usual cause is a member left on the old schema during a rollout, or one
+brought back from an old backup. `lv host upgrade` pre-stages every member's
+schema before it swaps any binary (see [upgrades.md](upgrades.md)), so a
+rollout that used it does not leave one. Run `lv host upgrade <peer>`; its
+pre-stage brings the peer's schema forward and the refused writes then apply.
+The condition resolves once a sender's push at the refused schema is accepted.
+
 ### A VM held on its point-in-time overlay (`pit_overlay.held`)
 
 Evaluator `pit_overlay`, subject kind `disk`, subject `<vm>/<disk>`, severity

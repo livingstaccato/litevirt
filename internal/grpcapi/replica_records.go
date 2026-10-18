@@ -358,24 +358,31 @@ func (s *Server) replicaPoolDir(ctx context.Context, pool string) (string, error
 // scheduler and the failover coordinator run unauthenticated). Any failure is
 // an empty list.
 func (s *Server) replicaRecordsOn(ctx context.Context, pool, host, project, vm string) []replicaRecord {
+	recs, _ := s.replicaRecordsOnChecked(ctx, pool, host, project, vm)
+	return recs
+}
+
+// replicaRecordsOnChecked is replicaRecordsOn with the reason the records
+// could not be listed, when they could not: an empty list then says nothing
+// about what the pool holds.
+func (s *Server) replicaRecordsOnChecked(ctx context.Context, pool, host, project, vm string) ([]replicaRecord, error) {
 	if host == "" || host == s.hostName {
 		dir, err := s.replicaPoolDir(ctx, pool)
 		if err != nil {
-			return nil
+			return nil, err
 		}
-		recs, _ := listReplicaRecords(dir, project, vm)
-		return recs
+		return listReplicaRecords(dir, project, vm)
 	}
 	client, closeConn, err := s.dialPeer(ctx, host)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	defer closeConn()
 	resp, err := client.ListReplicas(ctx, &pb.ListReplicasRequest{
 		PoolName: pool, Host: host, Project: tenancy.NormalizeProject(project), Vm: vm,
 	})
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var out []replicaRecord
 	for _, p := range resp.GetReplicas() {
@@ -385,7 +392,7 @@ func (s *Server) replicaRecordsOn(ctx context.Context, pool, host, project, vm s
 		}
 		out = append(out, r)
 	}
-	return out
+	return out, nil
 }
 
 // pruneRecordedReplicas keeps the newest keep replicas that schedule recorded

@@ -370,12 +370,19 @@ whose chain is broken is copied in full, never by increments over content its
 bitmap did not see, and its chain starts again from that run. A chain is broken
 when:
 
-- the VM moved to another host, or moved away and back (its owner changed);
+- the VM moved to another host, or moved away and back (its owner changed),
+  or is a new VM of the same name;
 - the disk's file is another file: swapped, or restored in place;
 - the disk was resized;
-- the target no longer holds the replica the last run wrote;
+- the target no longer holds the replica this host's last run wrote;
 - the session cannot open: the VM is shut off, or libvirt no longer has the
   checkpoint or the disk its bitmap.
+
+The root disk's chain is guarded the same way, and a run on a host with an
+older build breaks it, so the next run is a full push. A target whose replicas
+cannot be listed for a moment breaks no chain: that run does not copy the data
+disks (the run reports it), and the next run continues them. A VM's delete
+drops its disks' chains.
 
 The disk's full point-in-time copy (below) is the fallback when no session can
 open; it is a `qcow2` replica, and the next run on a running VM starts the

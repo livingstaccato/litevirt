@@ -3173,6 +3173,13 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		ctx = pctx
 		// A deleted VM's partial-recovery marker goes with it (review N5).
 		s.clearPromotedPartial(ctx, req.Name)
+		// Its disks' replication chains go too, unless the name already has
+		// a VM again (a re-create): that one's incarnation breaks them.
+		if !deleteLocalOnly(ctx) {
+			if again, gerr := corrosion.GetVM(ctx, s.db, req.Name); gerr == nil && again == nil {
+				s.dropDiskChains(ctx, req.Name)
+			}
+		}
 		s.clearDeletedFirewallTags(ctx, corrosion.TagMemberVM, "", req.Name, fwID)
 		if dropSchedules {
 			s.deleteVMSchedules(context.WithoutCancel(ctx), req.Name)

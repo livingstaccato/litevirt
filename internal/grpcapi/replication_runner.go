@@ -547,6 +547,23 @@ func (s *Server) replicateIncremental(ctx context.Context, sched corrosion.Backu
 			base = s.rawReplicaTakenAt(ctx, sched.TargetPool, targetHost, vm.Project, sched.VMName, src.DiskName, key, anchor)
 		}
 	}
+	// The root's identity guard (replica_set_incremental.go): a row keyed
+	// diskChainRepo(pool, root) that names the same checkpoint as the bare
+	// row, written for the same host, incarnation, owner epoch and file. An
+	// older owner advances the bare row alone, so the two disagree and the
+	// chain breaks: a full push, never an increment over writes no bitmap
+	// here saw.
+	id, idErr := s.diskIdentityOf(vm, src)
+	var guard diskChainAnchor
+	if base != "" {
+		g, ok := s.rootChainGuard(ctx, sched.VMName, sched.TargetPool, src.DiskName)
+		switch {
+		case idErr != nil, !ok, g.Checkpoint != parentCP, diskChainBreak(g, id) != "":
+			base = ""
+		default:
+			guard = g
+		}
+	}
 	incrCP := ""
 	if base != "" {
 		incrCP = parentCP // the base its own checkpoint continues → real incremental
@@ -570,6 +587,9 @@ func (s *Server) replicateIncremental(ctx context.Context, sched corrosion.Backu
 	}()
 	if !session.Incremental() {
 		base = "" // session decided full (e.g. parent checkpoint vanished)
+	}
+	if base != "" && session.Size() != guard.Size {
+		return fmt.Errorf("the disk was resized since its checkpoint (%d → %d bytes)", guard.Size, session.Size())
 	}
 	extents, err := session.ChangedExtents()
 	if err != nil {
@@ -602,6 +622,13 @@ func (s *Server) replicateIncremental(ctx context.Context, sched corrosion.Backu
 		return err
 	}
 	committed = true // newCP is now the recorded anchor — keep it
+	if idErr == nil {
+		if err := corrosion.SetReplicationCheckpoint(ctx, s.db, sched.VMName, diskChainRepo(sched.TargetPool, src.DiskName),
+			anchorFor(newCP, id, totalSize).encode()); err != nil {
+			slog.Warn("incremental replication: the root chain's guard was not recorded; the next run is a full push",
+				"vm", sched.VMName, "pool", sched.TargetPool, "error", err)
+		}
+	}
 
 	pruned := 0
 	if !legacy {

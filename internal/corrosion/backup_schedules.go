@@ -412,6 +412,21 @@ func GetReplicationCheckpoint(ctx context.Context, c *Client, vmName, repo strin
 	return rows[0].String("checkpoint"), nil
 }
 
+// ReplicationCheckpointRepos lists the repo keys of vmName's live
+// replication_checkpoints rows.
+func ReplicationCheckpointRepos(ctx context.Context, c *Client, vmName string) ([]string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT repo FROM replication_checkpoints WHERE vm_name = ? AND deleted_at IS NULL`, vmName)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.String("repo"))
+	}
+	return out, nil
+}
+
 // ScheduleOrphanGrace is how long a workload's schedule is kept after the
 // workload's tombstone before the orphan sweep may remove it.
 const ScheduleOrphanGrace = 24 * time.Hour

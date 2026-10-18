@@ -3,6 +3,8 @@ package grpcapi
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -107,6 +109,10 @@ func (b *bitmapSource) BeginBackup(domain, diskPath, parentCP, newCP string) (Ba
 		}
 	}
 	if newCP != "" {
+		if _, dup := b.cps[newCP]; dup {
+			// libvirt refuses a checkpoint name the domain already has.
+			return nil, fmt.Errorf("checkpoint %q already exists", newCP)
+		}
 		b.cps[newCP] = &bitmapCheckpoint{path: diskPath, dirty: map[int64]bool{}}
 	}
 	return &fakeBackupReader{data: append([]byte(nil), data...), extents: extents, incr: parentCP != ""}, nil
@@ -344,5 +350,128 @@ func TestReplication_ADataDiskSessionFailureFallsBackToAFullCopy(t *testing.T) {
 func TestDiskChainRepo_NeverAPoolName(t *testing.T) {
 	if err := safename.ValidatePoolName(diskChainRepo("dr", "data1")); err == nil {
 		t.Fatal("a disk chain's repo key is a valid pool name: it could meet a root chain's row")
+	}
+}
+
+// lastParent is the parent checkpoint of disk's newest session.
+func (fx *incrFixture) lastParent(disk string) string {
+	p := fx.src.parents(fx.paths[disk])
+	if len(p) == 0 {
+		return "<none>"
+	}
+	return p[len(p)-1]
+}
+
+// m-1. A base replica on this host that another host wrote is not the
+// chain's base: the run is a full copy.
+//
+// Mutation "no source check" (chainBase ignores Source): red.
+func TestReplication_ADataDiskBaseFromAnotherHostIsNotForkedFrom(t *testing.T) {
+	fx := newIncrFixture(t, 16*bitmapBlock)
+	fx.run(t, "20261018-010000")
+	_, rec := fx.replicaOf(t, "data1", "20261018-010000")
+	rec.Source = "other-host"
+	b, _ := json.Marshal(rec)
+	if err := os.WriteFile(filepath.Join(replicaOwnerDir(fx.pool, "", "inc1"), rec.File+".json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fx.src.write(fx.paths["data1"], 0, []byte("changed"))
+	fx.run(t, "20261018-020000")
+	if p := fx.lastParent("data1"); p != "" {
+		t.Fatalf("forked from %q onto a replica another host wrote", p)
+	}
+	if got, _ := fx.replicaOf(t, "data1", "20261018-020000"); !bytes.Equal(got, fx.content("data1")) {
+		t.Fatal("replica is not the disk")
+	}
+}
+
+// m-2. A VM created again under the same name is another VM: its disks'
+// chains start again even where path and inode match. And a delete drops the
+// per-disk rows (and the root's guard), leaving the bare root row.
+//
+// Mutations: "no incarnation check" — red; "no drop on delete" — red.
+func TestReplication_ADataDiskChainIsTheVMIncarnations(t *testing.T) {
+	ctx := context.Background()
+	fx := newIncrFixture(t, 16*bitmapBlock)
+	fx.run(t, "20261018-010000")
+	if err := fx.s.db.Execute(ctx, `UPDATE vms SET created_at = ? WHERE name = ?`, "2030-01-01T00:00:00Z", "inc1"); err != nil {
+		t.Fatal(err)
+	}
+	fx.run(t, "20261018-020000")
+	for _, d := range []string{"data1", "root"} {
+		if p := fx.lastParent(d); p != "" {
+			t.Errorf("%s: a new incarnation forked from %q", d, p)
+		}
+	}
+	fx.s.dropDiskChains(ctx, "inc1")
+	for _, repo := range []string{diskChainRepo("dr", "data1"), diskChainRepo("dr", "root")} {
+		if raw, _ := corrosion.GetReplicationCheckpoint(ctx, fx.s.db, "inc1", repo); raw != "" {
+			t.Errorf("row %s survived the drop: %q", repo, raw)
+		}
+	}
+	if raw, _ := corrosion.GetReplicationCheckpoint(ctx, fx.s.db, "inc1", "dr"); raw == "" {
+		t.Error("the bare root row older builds read was dropped")
+	}
+}
+
+// m-3. The root chain continues only when its guard row agrees with the bare
+// row: an older owner, which advances the bare row alone, breaks it.
+//
+// Mutation "no guard" (replicateIncremental ignores rootChainGuard): red.
+func TestReplication_TheRootChainNeedsItsGuard(t *testing.T) {
+	ctx := context.Background()
+	fx := newIncrFixture(t, 16*bitmapBlock)
+	fx.run(t, "20261018-010000")
+	fx.run(t, "20261018-020000")
+	if p := fx.lastParent("root"); p != replCheckpointName("root", "20261018-010000") {
+		t.Fatalf("fixture: the root's second run forked from %q", p)
+	}
+	// An older owner ran meanwhile: the bare row moved, the guard did not.
+	if err := corrosion.SetReplicationCheckpoint(ctx, fx.s.db, "inc1", diskChainRepo("dr", "root"),
+		anchorFor(replCheckpointName("root", "20261018-010000"), diskIdentity{host: fx.s.hostName}, 1).encode()); err != nil {
+		t.Fatal(err)
+	}
+	fx.src.write(fx.paths["root"], 0, []byte("changed"))
+	fx.run(t, "20261018-030000")
+	if p := fx.lastParent("root"); p != "" {
+		t.Fatalf("the root forked from %q past a guard that disagrees", p)
+	}
+	if got, _ := fx.replicaOf(t, "root", "20261018-030000"); !bytes.Equal(got, fx.content("root")) {
+		t.Fatal("root replica is not the disk")
+	}
+}
+
+// m-5. A target whose replicas cannot be listed costs a run of that disk,
+// not its chain: no fallback copy, the anchor and its checkpoint are kept.
+//
+// Mutation "listing failure breaks the chain" (chainBase returns "", nil):
+// red.
+func TestReplication_AnUnlistableTargetKeepsTheDataDiskChain(t *testing.T) {
+	ctx := context.Background()
+	fx := newIncrFixture(t, 16*bitmapBlock)
+	fx.run(t, "20261018-010000")
+	before, _ := corrosion.GetReplicationCheckpoint(ctx, fx.s.db, "inc1", diskChainRepo("dr", "data1"))
+	vm, _ := corrosion.GetVM(ctx, fx.s.db, "inc1")
+	disks, _ := corrosion.GetVMDisks(ctx, fx.s.db, "inc1")
+	var d *corrosion.DiskRecord
+	for i := range disks {
+		if disks[i].DiskName == "data1" {
+			d = &disks[i]
+		}
+	}
+	fullRan := false
+	err := fx.s.replicateOtherDiskIncrementalOr(ctx, fx.sched, vm, d, "unreachable-host", "20261018-020000",
+		func() func() { return func() {} }, func() error { fullRan = true; return nil })
+	if !errors.Is(err, errChainListing) || fullRan {
+		t.Fatalf("err %v, full copy ran %v; want errChainListing and no fallback", err, fullRan)
+	}
+	if after, _ := corrosion.GetReplicationCheckpoint(ctx, fx.s.db, "inc1", diskChainRepo("dr", "data1")); after != before {
+		t.Fatalf("anchor %q → %q: the chain was touched", before, after)
+	}
+	fx.src.mu.Lock()
+	_, kept := fx.src.cps[replCheckpointName("data1", "20261018-010000")]
+	fx.src.mu.Unlock()
+	if !kept {
+		t.Fatal("the parent checkpoint was deleted")
 	}
 }

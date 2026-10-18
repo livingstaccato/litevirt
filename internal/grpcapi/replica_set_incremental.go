@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -28,12 +29,20 @@ import (
 //
 //   - the host is this one and the VM's owner epoch is unchanged: a VM that
 //     moved away and back has had writes no bitmap here saw;
+//   - the VM is the same incarnation (its created_at): a VM deleted and
+//     created again under the name, whose disk may even reuse the path and
+//     inode, is another VM;
 //   - the disk's path and file (inode) are unchanged: a swapped disk, or one
 //     restored in place (a restore places a new file), has none of the old
 //     file's content;
 //   - the guest-visible size is unchanged: a resize starts a new chain;
-//   - the base replica is the one the checkpoint's run wrote, from this host,
-//     at the anchor's size.
+//   - the base replica is the one the checkpoint's run wrote, from this host
+//     (a peer's listing does not carry the writer; the anchor's host stands
+//     for it), at the anchor's size.
+//
+// A target whose replicas cannot be listed (unreachable for a moment) breaks
+// nothing: the disk is not copied in that run (errChainListing), its chain is
+// kept, and the next run continues it.
 //
 // Anything else is a full copy of that disk: the run opens a session with no
 // parent, which reads every allocated extent into a new raw replica and
@@ -43,7 +52,9 @@ import (
 // is reset.
 
 // diskChainRepo is the replication_checkpoints repo key of disk's chain in
-// pool, for a disk other than the root.
+// pool, for a disk other than the root; for the root, of its chain's
+// identity guard (rootChainGuard), beside the bare (vm, pool) row every
+// build reads.
 func diskChainRepo(pool, disk string) string { return pool + "/" + disk }
 
 // diskChainAnchor is the stored anchor of a disk's chain.
@@ -54,7 +65,21 @@ type diskChainAnchor struct {
 	Path       string `json:"path"`
 	Inode      uint64 `json:"inode"`
 	Size       int64  `json:"size"`
+	// Incarnation is the VM's created_at.
+	Incarnation string `json:"incarnation"`
 }
+
+// diskIdentity is what a disk's chain is valid for, read now.
+type diskIdentity struct {
+	host, incarnation, path string
+	epoch                   int64
+	inode                   uint64
+}
+
+// errChainListing: the target's replicas could not be listed, so whether the
+// chain's base is there is unknown. The disk is not copied in this run and
+// its chain is kept for the next.
+var errChainListing = errors.New("the target's replicas could not be listed; the disk's chain is kept for the next run")
 
 func (a diskChainAnchor) encode() string {
 	b, _ := json.Marshal(a)
@@ -71,18 +96,88 @@ func decodeDiskChainAnchor(s string) (diskChainAnchor, bool) {
 
 // diskChainBreak says why a disk's stored anchor cannot be continued, "" when
 // it can.
-func diskChainBreak(a diskChainAnchor, host string, epoch int64, path string, inode uint64) string {
+func diskChainBreak(a diskChainAnchor, id diskIdentity) string {
 	switch {
-	case a.Host != host:
+	case a.Host != id.host:
 		return fmt.Sprintf("its checkpoint was taken on %s", a.Host)
-	case a.OwnerEpoch != epoch:
+	case a.Incarnation != id.incarnation:
+		return "the VM was created again since its checkpoint"
+	case a.OwnerEpoch != id.epoch:
 		return "the VM changed owner since its checkpoint"
-	case a.Path != path:
+	case a.Path != id.path:
 		return "the disk's file changed since its checkpoint"
-	case a.Inode != inode:
+	case a.Inode != id.inode:
 		return "the disk's file was replaced since its checkpoint"
 	}
 	return ""
+}
+
+// diskIdentityOf is d's identity now, in vm (read under the VM lock).
+func (s *Server) diskIdentityOf(vm *corrosion.VMRecord, d *corrosion.DiskRecord) (diskIdentity, error) {
+	fid, err := identityOf(s.hostDiskFile(d.Path))
+	if err != nil {
+		return diskIdentity{}, err
+	}
+	return diskIdentity{host: s.hostName, incarnation: vm.CreatedAt, path: d.Path, epoch: vm.OwnerEpoch, inode: fid.ino}, nil
+}
+
+// anchorFor is the anchor a run that took checkpoint cp of a disk of
+// guest-visible size writes.
+func anchorFor(cp string, id diskIdentity, size int64) diskChainAnchor {
+	return diskChainAnchor{Checkpoint: cp, Host: id.host, OwnerEpoch: id.epoch, Path: id.path, Inode: id.inode,
+		Size: size, Incarnation: id.incarnation}
+}
+
+// chainBase is the raw replica the run at taken wrote of disk for schedule key
+// on the target, written from this host at size; "" when there is none.
+// errChainListing when the target's replicas cannot be listed.
+func (s *Server) chainBase(ctx context.Context, pool, targetHost, project, vm, disk, key, taken string, size int64) (string, error) {
+	recs, err := s.replicaRecordsOnChecked(ctx, pool, targetHost, project, vm)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", errChainListing, err)
+	}
+	local := targetHost == "" || targetHost == s.hostName
+	for _, r := range recs {
+		if r.Disk != disk || r.Schedule != key || r.Format != "raw" || r.Taken != taken {
+			continue
+		}
+		// A local record says who wrote it; a peer's listing does not.
+		if local && r.Source != s.hostName {
+			continue
+		}
+		if r.SizeBytes != 0 && r.SizeBytes != size {
+			continue
+		}
+		return r.File, nil
+	}
+	return "", nil
+}
+
+// rootChainGuard is the identity guard of vm's root chain in pool.
+func (s *Server) rootChainGuard(ctx context.Context, vm, pool, root string) (diskChainAnchor, bool) {
+	raw, _ := corrosion.GetReplicationCheckpoint(ctx, s.db, vm, diskChainRepo(pool, root))
+	return decodeDiskChainAnchor(raw)
+}
+
+// dropDiskChains tombstones a deleted VM's per-disk anchors and root
+// guards (every row keyed diskChainRepo), through the reset statement each
+// row already has. The bare (vm, pool) rows older builds read are left as
+// they always were. Best effort: a row left behind is never continued, its
+// incarnation being another VM's.
+func (s *Server) dropDiskChains(ctx context.Context, vm string) {
+	repos, err := corrosion.ReplicationCheckpointRepos(ctx, s.db, vm)
+	if err != nil {
+		slog.Warn("delete: could not read the deleted VM's replication chains", "vm", vm, "error", err)
+		return
+	}
+	for _, repo := range repos {
+		if !strings.Contains(repo, "/") {
+			continue
+		}
+		if err := corrosion.SetReplicationCheckpoint(ctx, s.db, vm, repo, ""); err != nil {
+			slog.Warn("delete: could not drop a deleted VM's replication chain", "vm", vm, "repo", repo, "error", err)
+		}
+	}
 }
 
 // resetDiskChain drops disk's anchor, and its checkpoint when it was taken
@@ -122,7 +217,7 @@ func (s *Server) replicateDiskIncremental(ctx context.Context, sched corrosion.B
 	if err != nil || cur == nil {
 		return fmt.Errorf("%w: read the VM: %v", errVMNoLongerHere, err)
 	}
-	id, err := identityOf(s.hostDiskFile(d.Path))
+	id, err := s.diskIdentityOf(cur, d)
 	if err != nil {
 		return fmt.Errorf("examine the disk's file: %w", err)
 	}
@@ -131,16 +226,16 @@ func (s *Server) replicateDiskIncremental(ctx context.Context, sched corrosion.B
 	parent, haveParent := decodeDiskChainAnchor(raw)
 	base, parentCP, why := "", "", "no checkpoint yet"
 	if haveParent {
-		why = diskChainBreak(parent, s.hostName, cur.OwnerEpoch, d.Path, id.ino)
+		why = diskChainBreak(parent, id)
 		if why == "" {
 			why = "the target holds no replica its checkpoint continues"
 			if taken, ok := checkpointTaken(d.DiskName, parent.Checkpoint); ok {
-				for _, r := range s.replicaRecordsOn(ctx, sched.TargetPool, targetHost, vm.Project, vm.Name) {
-					if r.Disk == d.DiskName && r.Schedule == key && r.Format == "raw" && r.Taken == taken &&
-						(r.SizeBytes == 0 || r.SizeBytes == parent.Size) {
-						base, parentCP, why = r.File, parent.Checkpoint, ""
-						break
-					}
+				b, err := s.chainBase(ctx, sched.TargetPool, targetHost, vm.Project, vm.Name, d.DiskName, key, taken, parent.Size)
+				if err != nil {
+					return err // nothing touched: the chain is kept
+				}
+				if b != "" {
+					base, parentCP, why = b, parent.Checkpoint, ""
 				}
 			}
 		}
@@ -198,10 +293,7 @@ func (s *Server) replicateDiskIncremental(ctx context.Context, sched corrosion.B
 		return err
 	}
 
-	next := diskChainAnchor{
-		Checkpoint: newCP, Host: s.hostName, OwnerEpoch: cur.OwnerEpoch,
-		Path: d.Path, Inode: id.ino, Size: totalSize,
-	}
+	next := anchorFor(newCP, id, totalSize)
 	if err := corrosion.SetReplicationCheckpoint(ctx, s.db, vm.Name, repo, next.encode()); err != nil {
 		return fmt.Errorf("%w: record %q for %s/%s: %v", errCheckpointCommit, newCP, vm.Name, repo, err)
 	}
@@ -237,6 +329,10 @@ func (s *Server) replicateOtherDiskIncrementalOr(ctx context.Context, sched corr
 	case err == nil:
 		return nil
 	case errors.Is(err, errVMNoLongerHere):
+		return err
+	case errors.Is(err, errChainListing):
+		slog.Warn("incremental replication: the target's replicas could not be listed; the disk is copied next run, its chain kept",
+			"vm", vm.Name, "disk", d.DiskName, "pool", sched.TargetPool, "error", err)
 		return err
 	case errors.Is(err, errCheckpointCommit):
 		slog.Error("incremental replication: checkpoint commit failed; the parent anchor is kept for the next run",

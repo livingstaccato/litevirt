@@ -45,7 +45,11 @@ func (s *Server) tombstoneDeletedVM(ctx context.Context, name string, keepDisks 
 		slog.Warn("delete: could not record the disks this delete keeps; a create of the name may clear one recorded delete_with_vm=false",
 			"vm", name, "error", err)
 	}
-	return corrosion.DeleteVMReporting(ctx, s.db, name)
+	deleted, err := corrosion.DeleteVMReporting(ctx, s.db, name)
+	if err == nil {
+		s.dropDiskChains(ctx, name)
+	}
+	return deleted, err
 }
 
 // noteKeptDisks notes, on this host, the host-local files of name's disks

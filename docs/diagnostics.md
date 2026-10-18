@@ -2633,6 +2633,20 @@ held entry is forgotten once its trash no longer lists it.
 The condition resolves on the next reconcile (30 s) once nothing is listed.
 See [storage.md](storage.md#ceph-rbd-pools).
 
+### A replication target cannot be listed (`replica.chain_unlistable`)
+
+On an `--incremental` replication schedule each data disk continues its own
+chain only from the replica its last run left on the target, so a run first
+lists the target's replicas. When the listing fails (the target host does
+not answer, its pool cannot be read), the disk is not replicated in that run
+and its chain is kept for the next. After 3 such runs in a row the host
+raises `replica.chain_unlistable` (evaluator `replica_set`, subject
+`vm/<vm>`, warning). The evidence names each disk, its pool, the target host,
+how many runs in a row failed, and the last error. The first run that can
+list the target again copies each of those disks in full, starting its chain
+again, and resolves the condition. Check that the target host is up
+(`lv host ls`) and that its pool is mounted and readable there.
+
 ### A VM delete left a ceph image in its pool (`ceph_image_leftover`)
 
 A VM delete frees its disks best effort. A ceph image that a client still has

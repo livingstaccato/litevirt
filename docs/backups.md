@@ -381,7 +381,12 @@ when:
 The root disk's chain is guarded the same way, and a run on a host with an
 older build breaks it, so the next run is a full push. A target whose replicas
 cannot be listed for a moment breaks no chain: that run does not copy the data
-disks (the run reports it), and the next run continues them. A VM's delete
+disks (the run reports it), and the next run continues them. After 3 such runs
+in a row the health condition `replica.chain_unlistable` names the VM and each
+disk (see [diagnostics.md](diagnostics.md#a-replication-target-cannot-be-listed-replicachain_unlistable)),
+and the first run that can list the target again copies those disks in full
+and starts their chains again; the count is kept in memory, so a daemon
+restart starts it again. A VM's delete (any path that removes its record)
 drops its disks' chains.
 
 The disk's full point-in-time copy (below) is the fallback when no session can

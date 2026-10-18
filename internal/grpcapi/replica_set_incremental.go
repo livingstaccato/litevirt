@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -42,7 +45,10 @@ import (
 //
 // A target whose replicas cannot be listed (unreachable for a moment) breaks
 // nothing: the disk is not copied in that run (errChainListing), its chain is
-// kept, and the next run continues it.
+// kept, and the next run continues it. After chainListingEscalateAfter such
+// runs in a row the condition replica.chain_unlistable names the VM and disk,
+// and the first run that can list the target again copies the disk in full
+// and starts its chain again (a new target pool is a new chain anyway).
 //
 // Anything else is a full copy of that disk: the run opens a session with no
 // parent, which reads every allocated extent into a new raw replica and
@@ -153,6 +159,115 @@ func (s *Server) chainBase(ctx context.Context, pool, targetHost, project, vm, d
 	return "", nil
 }
 
+// chainListingEscalateAfter is how many runs in a row may fail to list a
+// disk's target before replica.chain_unlistable names it.
+const chainListingEscalateAfter = 3
+
+// The replica.chain_unlistable condition, one per VM.
+const (
+	chainUnlistableEvaluator = "replica_set"
+	chainUnlistableCode      = "replica.chain_unlistable"
+	chainUnlistableKind      = "vm"
+)
+
+// chainListFailures counts, in memory, the consecutive runs whose target's
+// replicas could not be listed, per VM, pool and disk. A restart of the
+// daemon starts the count again.
+type chainListFailures struct {
+	mu sync.Mutex
+	m  map[string]chainListFailure // vm \x00 pool \x00 disk
+}
+
+type chainListFailure struct {
+	vm, pool, disk, target, err string
+	runs                        int
+}
+
+// noteChainListing records whether a run could list disk's target (err nil)
+// or not, and raises or resolves replica.chain_unlistable for the VM. It
+// returns true when the target is listable again after the condition was
+// raised for this disk: its chain is then started again.
+func (s *Server) noteChainListing(ctx context.Context, vm, pool, disk, target string, err error) bool {
+	k := vm + "\x00" + pool + "\x00" + disk
+	c := &s.chainListing
+	c.mu.Lock()
+	if c.m == nil {
+		c.m = map[string]chainListFailure{}
+	}
+	prev := c.m[k]
+	escalatedBefore := prev.runs >= chainListingEscalateAfter
+	if err != nil {
+		c.m[k] = chainListFailure{vm: vm, pool: pool, disk: disk, target: target, err: err.Error(), runs: prev.runs + 1}
+	} else {
+		delete(c.m, k)
+	}
+	var open []chainListFailure
+	for _, f := range c.m {
+		if f.vm == vm && f.runs >= chainListingEscalateAfter {
+			open = append(open, f)
+		}
+	}
+	c.mu.Unlock()
+	if len(open) > 0 || escalatedBefore {
+		s.judgeChainUnlistable(ctx, vm, open)
+	}
+	return err == nil && escalatedBefore
+}
+
+// judgeChainUnlistable raises replica.chain_unlistable for vm while open
+// names a disk, and resolves it once none.
+func (s *Server) judgeChainUnlistable(ctx context.Context, vm string, open []chainListFailure) {
+	if s.db == nil {
+		return
+	}
+	row, found, err := corrosion.GetHealthCondition(ctx, s.db, chainUnlistableEvaluator, chainUnlistableCode, chainUnlistableKind, vm)
+	if err != nil {
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	if len(open) == 0 {
+		if !found || row.Lifecycle == corrosion.ConditionResolved {
+			return
+		}
+		row.Lifecycle, row.ResolvedAt, row.LastSeen, row.Reporter = corrosion.ConditionResolved, now, now, s.hostName
+		row.ObserveCount, row.CleanCount = 0, row.CleanCount+1
+		if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
+			slog.Warn("replication: resolve the unlistable-chain condition", "vm", vm, "error", err)
+		}
+		return
+	}
+	sort.Slice(open, func(i, j int) bool { return open[i].pool+open[i].disk < open[j].pool+open[j].disk })
+	type disk struct {
+		Disk   string `json:"disk"`
+		Pool   string `json:"pool"`
+		Target string `json:"target_host"`
+		Runs   int    `json:"runs"`
+		Error  string `json:"error"`
+	}
+	var list []disk
+	for _, f := range open {
+		list = append(list, disk{Disk: f.disk, Pool: f.pool, Target: f.target, Runs: f.runs, Error: f.err})
+	}
+	ev, _ := json.Marshal(map[string]any{
+		"vm": vm, "host": s.hostName, "disks": list,
+		"detail": fmt.Sprintf("the replicas of %d disk(s) of %s on their target could not be listed in %d or more replication runs in a row, so those disks were not replicated; "+
+			"their chains are kept, and the first run that can list the target again copies each in full", len(list), vm, chainListingEscalateAfter),
+	})
+	if !found || row.Lifecycle == corrosion.ConditionResolved {
+		row = corrosion.HealthCondition{Evaluator: chainUnlistableEvaluator, Code: chainUnlistableCode,
+			SubjectKind: chainUnlistableKind, SubjectID: vm, Lifecycle: corrosion.ConditionConfirmed, FirstSeen: now, ConfirmedAt: now}
+	}
+	row.ObserveCount++
+	row.CleanCount = 0
+	row.Severity = corrosion.SeverityWarning
+	row.Hosts = []string{s.hostName}
+	row.Evidence = string(ev)
+	row.LastSeen, row.ResolvedAt, row.Reporter = now, "", s.hostName
+	if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
+		slog.Warn("replication: raise the unlistable-chain condition", "vm", vm, "error", err)
+	}
+}
+
 // rootChainGuard is the identity guard of vm's root chain in pool.
 func (s *Server) rootChainGuard(ctx context.Context, vm, pool, root string) (diskChainAnchor, bool) {
 	raw, _ := corrosion.GetReplicationCheckpoint(ctx, s.db, vm, diskChainRepo(pool, root))
@@ -231,10 +346,13 @@ func (s *Server) replicateDiskIncremental(ctx context.Context, sched corrosion.B
 			why = "the target holds no replica its checkpoint continues"
 			if taken, ok := checkpointTaken(d.DiskName, parent.Checkpoint); ok {
 				b, err := s.chainBase(ctx, sched.TargetPool, targetHost, vm.Project, vm.Name, d.DiskName, key, taken, parent.Size)
-				if err != nil {
+				escalated := s.noteChainListing(ctx, vm.Name, sched.TargetPool, d.DiskName, targetHost, err)
+				switch {
+				case err != nil:
 					return err // nothing touched: the chain is kept
-				}
-				if b != "" {
+				case escalated:
+					why = fmt.Sprintf("the target's replicas could not be listed in %d runs or more in a row, so its chain is started again", chainListingEscalateAfter)
+				case b != "":
 					base, parentCP, why = b, parent.Checkpoint, ""
 				}
 			}

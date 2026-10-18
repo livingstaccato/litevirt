@@ -6,9 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -473,5 +477,97 @@ func TestReplication_AnUnlistableTargetKeepsTheDataDiskChain(t *testing.T) {
 	fx.src.mu.Unlock()
 	if !kept {
 		t.Fatal("the parent checkpoint was deleted")
+	}
+}
+
+// Re-review m-B. A target that stays unlistable is named after
+// chainListingEscalateAfter runs in a row (replica.chain_unlistable, naming
+// the VM and disk), and the first run that lists it again copies the disk in
+// full and resolves the condition.
+//
+// Mutations: "never escalate" (the condition is not raised) — red; "no full
+// copy after" (noteChainListing returns false) — red.
+func TestReplication_AnUnlistableTargetEscalatesThenCopiesInFull(t *testing.T) {
+	ctx := context.Background()
+	fx := newIncrFixture(t, 16*bitmapBlock)
+	fx.run(t, "20261018-010000")
+	vm, _ := corrosion.GetVM(ctx, fx.s.db, "inc1")
+	disks, _ := corrosion.GetVMDisks(ctx, fx.s.db, "inc1")
+	var d *corrosion.DiskRecord
+	for i := range disks {
+		if disks[i].DiskName == "data1" {
+			d = &disks[i]
+		}
+	}
+	open := func() (bool, string) {
+		row, found, err := corrosion.GetHealthCondition(ctx, fx.s.db, chainUnlistableEvaluator, chainUnlistableCode, chainUnlistableKind, "inc1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return found && row.Lifecycle != corrosion.ConditionResolved, row.Evidence
+	}
+	for i := 1; i <= chainListingEscalateAfter; i++ {
+		if was, ev := open(); was {
+			t.Fatalf("raised after %d failed run(s), before %d: %s", i-1, chainListingEscalateAfter, ev)
+		}
+		_ = fx.s.replicateOtherDiskIncrementalOr(ctx, fx.sched, vm, d, "unreachable-host", fmt.Sprintf("20261018-01%02d00", i),
+			func() func() { return func() {} }, func() error { return nil })
+	}
+	if was, ev := open(); !was || !strings.Contains(ev, `"disk":"data1"`) {
+		t.Fatalf("after %d failed runs: open %v, evidence %s; want the VM and disk named", chainListingEscalateAfter, was, ev)
+	}
+	fx.src.write(fx.paths["data1"], 0, []byte("meanwhile"))
+	fx.run(t, "20261018-020000")
+	if p := fx.lastParent("data1"); p != "" {
+		t.Fatalf("the first run after the target listed again forked from %q, want a full copy", p)
+	}
+	if got, _ := fx.replicaOf(t, "data1", "20261018-020000"); !bytes.Equal(got, fx.content("data1")) {
+		t.Fatal("replica is not the disk")
+	}
+	if was, ev := open(); was {
+		t.Fatalf("still open once listed again: %s", ev)
+	}
+}
+
+// Re-review m-A. Every path that tombstones a VM's row drops its disks'
+// chains (dropDiskChains), or is exempt here with the reason.
+func TestVMDeletePaths_DropTheDiskChains(t *testing.T) {
+	exempt := map[string]string{
+		"ImportVM":          "only its rollback of a failed import tombstones, and that VM never replicated",
+		"retireReplacedRow": "a re-create's: the new VM is another incarnation, which breaks every chain",
+	}
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool { return !strings.HasSuffix(fi.Name(), "_test.go") }, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pkg := range pkgs {
+		for _, f := range pkg.Files {
+			for _, decl := range f.Decls {
+				fd, ok := decl.(*ast.FuncDecl)
+				if !ok || fd.Body == nil {
+					continue
+				}
+				deletes, drops := false, false
+				ast.Inspect(fd.Body, func(n ast.Node) bool {
+					se, ok := n.(*ast.SelectorExpr)
+					if !ok {
+						return true
+					}
+					if x, ok := se.X.(*ast.Ident); ok && x.Name == "corrosion" && strings.HasPrefix(se.Sel.Name, "DeleteVM") {
+						deletes = true
+					}
+					if se.Sel.Name == "dropDiskChains" {
+						drops = true
+					}
+					return true
+				})
+				if deletes && !drops {
+					if _, ok := exempt[fd.Name.Name]; !ok {
+						t.Errorf("%s (%s) tombstones a VM's row and does not drop its disks' chains", fd.Name.Name, fset.Position(fd.Pos()))
+					}
+				}
+			}
+		}
 	}
 }

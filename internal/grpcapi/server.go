@@ -865,6 +865,9 @@ type Server struct {
 	// cephKept is the ceph images a VM delete left in their pool (a client
 	// still had one open), named until gone or reattached (ceph_kept.go).
 	cephKept cephKeptImages
+	// chainListing counts the consecutive runs whose target's replicas could
+	// not be listed, per VM, pool and disk (replica_set_incremental.go).
+	chainListing chainListFailures
 	// diskKept is the disk files a VM delete kept and named (disk_kept.go).
 	diskKept diskKeptFiles
 

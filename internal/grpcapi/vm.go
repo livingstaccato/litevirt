@@ -3462,6 +3462,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 					return nil, status.Errorf(codes.Internal,
 						"VM %q: host %s deleted its domain, but its row here was not tombstoned; retry: %v", req.Name, h.Name, terr)
 				}
+				s.dropDiskChains(ctx, req.Name)
 				return &emptypb.Empty{}, nil
 			}
 			if len(ptrl.Get(deleteProbeRefusedMD)) > 0 || status.Code(peerErr) == codes.FailedPrecondition {
@@ -4952,6 +4953,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "rebuild: tombstone old records: %v", err)
 	}
+	s.dropDiskChains(ctx, req.Name) // the rebuilt VM's disks are new files
 	s.retireNICGuards(ctx, req.Name)
 	if hook := s.recreateTornDown; hook != nil {
 		hook(req.Name)
@@ -5225,6 +5227,7 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 			if err := corrosion.DeleteVM(ctx, s.db, req.VmName); err != nil {
 				return nil, status.Errorf(codes.Internal, "cutover: tombstone replaced VM: %v", err)
 			}
+			s.dropDiskChains(ctx, req.VmName) // the replaced VM's disks
 		}
 	}
 	if hErr := s.fireCutoverCrashHook("before-commit"); hErr != nil {

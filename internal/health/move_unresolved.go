@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -21,6 +22,7 @@ import (
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/secretfile"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // An unresolved volume move (lv move-volume): a move records one before the
@@ -50,7 +52,10 @@ type UnresolvedMove struct {
 	// Live: a block-copy mirror ran, so the guest wrote Src until a pivot.
 	Live bool `json:"live,omitempty"`
 	// Pivoted: the guest was moved onto Dst, so Src lacks its later writes.
-	Pivoted bool   `json:"pivoted,omitempty"`
+	Pivoted bool `json:"pivoted,omitempty"`
+	// CatchUp: the config already named Dst before this move (an earlier move's
+	// pivot, or a define), so Dst may hold writes Src lacks.
+	CatchUp bool   `json:"catch_up,omitempty"`
 	Error   string `json:"error,omitempty"`
 	At      string `json:"at"`
 }
@@ -182,39 +187,64 @@ func movedDiskNames(domXML string, m UnresolvedMove) (string, error) {
 	return m.Dst, nil
 }
 
-// MoveUnresolvedError is the refusal of a start, a copy or a retried move
-// because of an unresolved volume move. Retryable marks a transient one (a
-// move still in flight, a read that failed); the rest need the operator.
+// MoveUnresolvedError is the refusal of a start, a copy or a move because of
+// an unresolved volume move. Retryable marks a transient one (a move still in
+// flight, a read that failed); the rest need the operator.
 type MoveUnresolvedError struct {
 	VM, Disk  string
 	Retryable bool
 	Detail    string
 }
 
-// moveUnresolvedPrefix starts every MoveUnresolvedError's text, so a caller
-// that received one over gRPC can recognise it (IsMoveUnresolved).
-const moveUnresolvedPrefix = "move-unresolved: "
+// MoveUnresolvedReason is the google.rpc.ErrorInfo reason the refusal carries
+// over gRPC, so a caller recognises it through any wrapping of its text.
+const MoveUnresolvedReason = "MOVE_UNRESOLVED"
 
-func (e *MoveUnresolvedError) Error() string { return moveUnresolvedPrefix + e.Detail }
+const moveUnresolvedDomain = "litevirt.dev"
+
+func (e *MoveUnresolvedError) Error() string { return "move-unresolved: " + e.Detail }
 
 // GRPCStatus maps the refusal to FailedPrecondition, or Unavailable when it
-// is transient.
+// is transient, with an ErrorInfo detail naming it.
 func (e *MoveUnresolvedError) GRPCStatus() *status.Status {
+	code := codes.FailedPrecondition
 	if e.Retryable {
-		return status.New(codes.Unavailable, e.Error())
+		code = codes.Unavailable
 	}
-	return status.New(codes.FailedPrecondition, e.Error())
+	st := status.New(code, e.Error())
+	retry := "false"
+	if e.Retryable {
+		retry = "true"
+	}
+	if d, err := st.WithDetails(&errdetails.ErrorInfo{Reason: MoveUnresolvedReason, Domain: moveUnresolvedDomain,
+		Metadata: map[string]string{"vm": e.VM, "disk": e.Disk, "retryable": retry}}); err == nil {
+		return d
+	}
+	return st
 }
 
-// IsMoveUnresolved reports whether err is a MoveUnresolvedError, in process or
-// received over gRPC.
+func moveUnresolvedInfo(err error) (*errdetails.ErrorInfo, bool) {
+	st, ok := status.FromError(err)
+	if !ok || st == nil {
+		return nil, false
+	}
+	for _, d := range st.Details() {
+		if info, ok := d.(*errdetails.ErrorInfo); ok && info.GetReason() == MoveUnresolvedReason && info.GetDomain() == moveUnresolvedDomain {
+			return info, true
+		}
+	}
+	return nil, false
+}
+
+// IsMoveUnresolved reports whether err is a MoveUnresolvedError, in process
+// (however wrapped) or received over gRPC.
 func IsMoveUnresolved(err error) bool {
 	var e *MoveUnresolvedError
 	if errors.As(err, &e) {
 		return true
 	}
-	st, ok := status.FromError(err)
-	return ok && strings.HasPrefix(st.Message(), moveUnresolvedPrefix)
+	_, ok := moveUnresolvedInfo(err)
+	return ok
 }
 
 // MoveUnresolvedRetryable reports whether err is a transient refusal.
@@ -223,32 +253,42 @@ func MoveUnresolvedRetryable(err error) bool {
 	if errors.As(err, &e) {
 		return e.Retryable
 	}
-	return status.Code(err) == codes.Unavailable && IsMoveUnresolved(err)
+	info, ok := moveUnresolvedInfo(err)
+	return ok && info.GetMetadata()["retryable"] == "true"
 }
 
 func refuse(m UnresolvedMove, retryable bool, format string, args ...any) error {
 	return &MoveUnresolvedError{VM: m.VM, Disk: m.Disk, Retryable: retryable, Detail: fmt.Sprintf(format, args...)}
 }
 
+// resolveCmd is the operator's exit from a condition only a person can settle.
+func resolveCmd(vm string) string {
+	return fmt.Sprintf("lv health resolve %s vm/%s --reason \"…\"", MoveUnresolvedCode, vm)
+}
+
 // The replicated twin of the host-local records: one health condition per VM
 // whose evidence lists the host that holds the records and the records, so a
 // host that does not hold them (a failover onto shared storage) honours them
-// too. Raised and resolved only by the host holding the records
-// (PublishUnresolvedMoves); cleared for every host when the VM is deleted or a
-// new VM takes its name.
+// too. Raised and updated only by the host holding the records; resolved by
+// it, by the VM's owner once every move is proven settled, by an admin
+// (`lv health resolve`, once the holding host is fenced or gone), and for
+// every host when the VM is deleted or a new VM takes its name.
 const (
 	MoveUnresolvedEvaluator = "move_volume"
 	MoveUnresolvedCode      = "vm.move_unresolved"
 	moveUnresolvedKind      = "vm"
 )
 
-type moveUnresolvedEvidence struct {
+// MoveUnresolvedEvidence is the condition's evidence.
+type MoveUnresolvedEvidence struct {
 	Host  string           `json:"host"`
 	Moves []UnresolvedMove `json:"moves"`
 }
 
-func openMoveCondition(ctx context.Context, db *corrosion.Client, vm string) (corrosion.HealthCondition, moveUnresolvedEvidence, bool, error) {
-	var ev moveUnresolvedEvidence
+// OpenMoveCondition reads vm's open condition. A condition whose evidence
+// cannot be read is returned open with an error.
+func OpenMoveCondition(ctx context.Context, db *corrosion.Client, vm string) (corrosion.HealthCondition, MoveUnresolvedEvidence, bool, error) {
+	var ev MoveUnresolvedEvidence
 	if db == nil {
 		return corrosion.HealthCondition{}, ev, false, nil
 	}
@@ -256,16 +296,64 @@ func openMoveCondition(ctx context.Context, db *corrosion.Client, vm string) (co
 	if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved {
 		return row, ev, false, err
 	}
-	if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil {
-		return row, ev, true, fmt.Errorf("unreadable %s evidence: %w", MoveUnresolvedCode, err)
+	if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil || ev.Host == "" {
+		return row, ev, true, fmt.Errorf("unreadable %s evidence: %v", MoveUnresolvedCode, err)
 	}
 	return row, ev, true, nil
 }
 
+// unreadableEvidence is the refusal for a condition whose evidence cannot be
+// read: a defect, not a transient state.
+func unreadableEvidence(vm string, err error) error {
+	return &MoveUnresolvedError{VM: vm, Detail: fmt.Sprintf("%s: the %s condition cannot be read (%v); this is a defect. "+
+		"Operator: check which file holds the VM's disk data, then `%s`", vm, MoveUnresolvedCode, err, resolveCmd(vm))}
+}
+
+// complete is the file of m that holds every acknowledged write, and whether
+// that is proven: dst after a pivot or a catch-up; src before a pivot (not
+// proven: a pivot may not have been recorded yet); either after an offline
+// move (proven: the two hold the same data), reported as "".
+func complete(m UnresolvedMove) (path string, proven bool) {
+	switch {
+	case m.Pivoted || m.CatchUp:
+		return m.Dst, true
+	case m.Live:
+		return m.Src, false
+	default:
+		return "", true
+	}
+}
+
+// entrySettled reports whether a recorded move no longer needs honouring:
+// its VM, its disk row or both its files are gone from the row, or the row
+// names the file proven to hold every acknowledged write.
+func entrySettled(ctx context.Context, db *corrosion.Client, m UnresolvedMove) (bool, error) {
+	vmRec, err := corrosion.GetVM(ctx, db, m.VM)
+	if err != nil {
+		return false, err
+	}
+	if vmRec == nil {
+		return true, nil
+	}
+	row, err := diskRow(ctx, db, m)
+	if err != nil {
+		return false, err
+	}
+	if row == nil || (row.Path != m.Src && row.Path != m.Dst) {
+		return true, nil
+	}
+	path, proven := complete(m)
+	return proven && (path == "" || row.Path == path), nil
+}
+
 // PublishUnresolvedMoves brings vm's condition in line with this host's
-// records of it: raised (or updated) while one exists, resolved when none is
-// left. A condition another host raised is left alone.
-func PublishUnresolvedMoves(ctx context.Context, db *corrosion.Client, dataDir, host, vm string) error {
+// records of it. Entries of the condition this host holds with no record here
+// are kept unless the caller settled them (settled) or they are proven settled
+// (entrySettled): a lost data dir, or a record cleared as stale because the
+// VM's row names another host, never resolves what that host has not healed.
+// A condition another host holds is never overwritten: publishing a record
+// against one is refused.
+func PublishUnresolvedMoves(ctx context.Context, db *corrosion.Client, dataDir, host, vm string, settled ...string) error {
 	if db == nil {
 		return nil
 	}
@@ -273,18 +361,51 @@ func PublishUnresolvedMoves(ctx context.Context, db *corrosion.Client, dataDir, 
 	if err != nil {
 		return err
 	}
-	row, ev, open, err := openMoveCondition(ctx, db, vm)
-	if err != nil && !open {
+	row, ev, open, err := OpenMoveCondition(ctx, db, vm)
+	if err != nil {
+		if open {
+			return unreadableEvidence(vm, err)
+		}
 		return err
 	}
+	if open && ev.Host != host {
+		if len(moves) == 0 {
+			return nil
+		}
+		return &MoveUnresolvedError{VM: vm, Detail: fmt.Sprintf("%s: %s holds an unresolved volume move of this VM "+
+			"(%s); it is settled there, by a start of the VM on its new owner, or by `%s` once %s is fenced or removed",
+			vm, ev.Host, MoveUnresolvedCode, resolveCmd(vm), ev.Host)}
+	}
+	keep := append([]UnresolvedMove(nil), moves...)
+	if open {
+		have := map[string]bool{}
+		for _, m := range moves {
+			have[m.Disk] = true
+		}
+		for _, d := range settled {
+			have[d] = true
+		}
+		for _, m := range ev.Moves {
+			if have[m.Disk] {
+				continue
+			}
+			done, serr := entrySettled(ctx, db, m)
+			if serr != nil {
+				return serr
+			}
+			if !done {
+				keep = append(keep, m)
+			}
+		}
+	}
 	ts := time.Now().UTC().Format(time.RFC3339)
-	if len(moves) == 0 {
-		if !open || (ev.Host != "" && ev.Host != host) {
+	if len(keep) == 0 {
+		if !open {
 			return nil
 		}
 		return resolveMoveCondition(ctx, db, row, host)
 	}
-	b, _ := json.Marshal(moveUnresolvedEvidence{Host: host, Moves: moves})
+	b, _ := json.Marshal(MoveUnresolvedEvidence{Host: host, Moves: keep})
 	if open && row.Evidence == string(b) {
 		return nil
 	}
@@ -308,14 +429,17 @@ func resolveMoveCondition(ctx context.Context, db *corrosion.Client, row corrosi
 }
 
 // ForgetUnresolvedMoves drops vm's records on this host and resolves its
-// condition whichever host raised it: the VM is deleted, or a new VM takes
-// its name.
+// condition whichever host raised it: the VM is deleted, a new VM takes its
+// name, or an admin resolved it by hand.
 func ForgetUnresolvedMoves(ctx context.Context, db *corrosion.Client, dataDir, vm string) error {
 	if err := ClearUnresolvedMovesOf(dataDir, vm); err != nil {
 		return err
 	}
-	row, _, open, err := openMoveCondition(ctx, db, vm)
-	if !open {
+	if db == nil {
+		return nil
+	}
+	row, found, err := corrosion.GetHealthCondition(ctx, db, MoveUnresolvedEvaluator, MoveUnresolvedCode, moveUnresolvedKind, vm)
+	if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved {
 		return err
 	}
 	return resolveMoveCondition(ctx, db, row, row.Reporter)
@@ -353,7 +477,7 @@ func (d MoveDomain) missing() bool {
 }
 
 // ResolveUnresolvedMoves settles vm's recorded moves before its domain is
-// started on this host, or its disk rows are read for a copy.
+// started on this host, or its disk rows are read for a copy or a move.
 //
 // For each record this host holds, the disk row is pointed at the file the
 // persistent config names and the record is removed. A record whose VM, disk
@@ -361,80 +485,127 @@ func (d MoveDomain) missing() bool {
 // naming both files and what the operator does, when the config cannot be read
 // or names neither file; when the guest wrote the source under a mirror and
 // was not pivoted, but the config names the copy (the copy may lack the guest's
-// last writes); and when the guest was pivoted onto the copy but the config
-// names the source (which lacks the writes made since).
+// last writes); and when the guest was pivoted onto the copy, or the copy was
+// already named before the move, but the config names the source.
 //
-// Records another host holds are seen through the VM's condition. That host's
-// config cannot be read here, so the file holding every acknowledged write
-// decides: the source before a pivot, the copy after one, either after an
-// offline move. A row naming the other file is refused, or, when the VM's row
-// names this host (it was failed over here) and the file is reachable, pointed
-// at it.
+// Moves the VM's condition lists that this host holds no record of — another
+// host's, or this host's with its record lost — are honoured by
+// resolveRemoteMove.
 func ResolveUnresolvedMoves(ctx context.Context, db *corrosion.Client, dataDir, host, vm string, dom MoveDomain) error {
 	moves, err := UnresolvedMovesOf(dataDir, vm)
 	if err != nil {
 		return &MoveUnresolvedError{VM: vm, Detail: fmt.Sprintf("%s: read this host's unresolved volume moves: %v", vm, err)}
 	}
+	// Disks settled here, or still recorded here, are this host's to honour;
+	// a record dropped only because the VM's row names another host is
+	// honoured by the remote rule below.
 	local := map[string]bool{}
+	var settled []string
 	for _, m := range moves {
-		local[m.Disk] = true
-		if err := resolveUnresolvedMove(ctx, db, dataDir, host, m, dom); err != nil {
-			_ = PublishUnresolvedMoves(ctx, db, dataDir, host, vm)
+		done, err := resolveUnresolvedMove(ctx, db, dataDir, host, m, dom)
+		if done {
+			settled = append(settled, m.Disk)
+		}
+		if err != nil {
+			if !IsMoveUnresolved(err) {
+				return err
+			}
+			_ = PublishUnresolvedMoves(ctx, db, dataDir, host, vm, settled...)
 			return err
 		}
 	}
-	_, ev, open, cerr := openMoveCondition(ctx, db, vm)
+	for _, d := range settled {
+		local[d] = true
+	}
+	if still, err := UnresolvedMovesOf(dataDir, vm); err == nil {
+		for _, m := range still {
+			local[m.Disk] = true
+		}
+	}
+	_, ev, open, cerr := OpenMoveCondition(ctx, db, vm)
 	if cerr != nil {
+		if open {
+			return unreadableEvidence(vm, cerr)
+		}
 		return &MoveUnresolvedError{VM: vm, Retryable: true, Detail: fmt.Sprintf("%s: read the %s condition: %v", vm, MoveUnresolvedCode, cerr)}
 	}
-	if open && ev.Host == host {
-		// This host's own condition: its records above are the truth.
-		if err := PublishUnresolvedMoves(ctx, db, dataDir, host, vm); err != nil {
+	if open {
+		for _, m := range ev.Moves {
+			if local[m.Disk] {
+				continue
+			}
+			if err := resolveRemoteMove(ctx, db, dataDir, host, ev.Host, m); err != nil {
+				return err
+			}
+		}
+	}
+	switch {
+	case open && ev.Host == host, !open && len(moves) > 0:
+		if err := PublishUnresolvedMoves(ctx, db, dataDir, host, vm, settled...); err != nil {
 			slog.Warn("move-volume record: publishing the settled state failed", "vm", vm, "error", err)
 		}
-		return nil
-	}
-	if !open {
-		return nil
-	}
-	for _, m := range ev.Moves {
-		if local[m.Disk] {
-			continue
-		}
-		if err := resolveRemoteMove(ctx, db, host, ev.Host, m); err != nil {
-			return err
-		}
+	case open:
+		ownerResolve(ctx, db, host, vm, ev)
 	}
 	return nil
 }
 
-func resolveUnresolvedMove(ctx context.Context, db *corrosion.Client, dataDir, host string, m UnresolvedMove, dom MoveDomain) error {
-	rec := UnresolvedMoveFile(dataDir, m.VM, m.Disk)
+// ownerResolve resolves another host's condition once this host owns the VM
+// and every move it lists is proven settled.
+func ownerResolve(ctx context.Context, db *corrosion.Client, host, vm string, ev MoveUnresolvedEvidence) {
+	vmRec, err := corrosion.GetVM(ctx, db, vm)
+	if err != nil || vmRec == nil || vmRec.HostName != host {
+		return
+	}
+	for _, m := range ev.Moves {
+		if done, err := entrySettled(ctx, db, m); err != nil || !done {
+			return
+		}
+	}
+	row, _, open, err := OpenMoveCondition(ctx, db, vm)
+	if err != nil || !open {
+		return
+	}
+	if err := resolveMoveCondition(ctx, db, row, host); err != nil {
+		slog.Warn("move-volume condition: resolving a settled condition failed", "vm", vm, "error", err)
+		return
+	}
+	slog.Info("move-volume condition: every move it listed is settled on the VM's owner; resolved", "vm", vm, "holder", ev.Host)
+}
+
+// resolveUnresolvedMove settles one record this host holds. done reports
+// whether the record is settled (removed because the row now matches the
+// config or no longer describes the disk), as opposed to removed only
+// because the VM's row names another host.
+func resolveUnresolvedMove(ctx context.Context, db *corrosion.Client, dataDir, host string, m UnresolvedMove, dom MoveDomain) (done bool, err error) {
 	if moveInFlight(m.VM, m.Disk) {
-		return refuse(m, true, "%s: a volume move of its disk %s is in progress on %s", m.VM, m.Disk, host)
+		return false, refuse(m, true, "%s: a volume move of its disk %s is in progress on %s", m.VM, m.Disk, host)
 	}
 	vmRec, err := corrosion.GetVM(ctx, db, m.VM)
 	if err != nil {
-		return refuse(m, true, "%s: read the VM to settle the volume move of its disk %s: %v", m.VM, m.Disk, err)
+		return false, refuse(m, true, "%s: read the VM to settle the volume move of its disk %s: %v", m.VM, m.Disk, err)
 	}
-	stale := func(why string) error {
-		slog.Info("move-volume record no longer describes the disk; removing it", "vm", m.VM, "disk", m.Disk, "why", why, "record", rec)
-		return ClearUnresolvedMove(dataDir, m.VM, m.Disk)
+	rec := UnresolvedMoveFile(dataDir, m.VM, m.Disk)
+	stale := func(why string, settles bool) (bool, error) {
+		slog.Info("move-volume record no longer describes the disk here; removing it", "vm", m.VM, "disk", m.Disk, "why", why, "record", rec)
+		return settles, ClearUnresolvedMove(dataDir, m.VM, m.Disk)
 	}
 	if vmRec == nil {
-		return stale("the VM is gone")
+		return stale("the VM is gone", true)
 	}
 	row, err := diskRow(ctx, db, m)
 	if err != nil {
-		return err
+		return false, err
 	}
 	switch {
 	case row == nil:
-		return stale("the disk row is gone")
-	case row.HostName != host:
-		return stale("the disk row names host " + row.HostName)
+		return stale("the disk row is gone", true)
 	case row.Path != m.Src && row.Path != m.Dst:
-		return stale("the disk row names " + row.Path)
+		return stale("the disk row names "+row.Path, true)
+	case row.HostName != host:
+		// The VM's row names another host: that host honours the move through
+		// the condition, which stays until it is settled there.
+		return stale("the disk row names host "+row.HostName, false)
 	}
 
 	x, xerr := "", errors.New("no libvirt backend")
@@ -447,49 +618,57 @@ func resolveUnresolvedMove(ctx context.Context, db *corrosion.Client, dataDir, h
 	}
 	if xerr != nil {
 		if dom.missing() {
-			return refuse(m, false, "%s: a volume move of its disk %s did not finish, and %s has no domain %s to read its "+
+			return false, refuse(m, false, "%s: a volume move of its disk %s did not finish, and %s has no domain %s to read its "+
 				"persistent config from (%v); the disk row names %s and both files (%s, %s) are kept. A start rebuilds the "+
-				"domain from the disk row, so it boots %s: if that is the file to keep, remove the record %s and retry",
-				m.VM, m.Disk, host, m.VM, xerr, row.Path, m.Src, m.Dst, row.Path, rec)
+				"domain from the disk row, so it boots %s: if that is the file to keep, `%s` (on %s) and retry",
+				m.VM, m.Disk, host, m.VM, xerr, row.Path, m.Src, m.Dst, row.Path, resolveCmd(m.VM), host)
 		}
-		return refuse(m, false, "%s: a volume move of its disk %s did not finish, and its persistent config could not be read or "+
+		return false, refuse(m, false, "%s: a volume move of its disk %s did not finish, and its persistent config could not be read or "+
 			"names neither %s nor %s (%v); the disk row names %s and both files are kept. Operator: make the config "+
 			"readable (virsh dumpxml --inactive %s) and name one of the two files in it, then retry; the disk row is "+
-			"then pointed at that file (the record is %s)", m.VM, m.Disk, m.Src, m.Dst, xerr, row.Path, m.VM, rec)
+			"then pointed at that file", m.VM, m.Disk, m.Src, m.Dst, xerr, row.Path, m.VM)
 	}
 	path, typ, pool := m.Src, m.SrcType, m.SrcPool
 	if names == m.Dst {
-		if m.Live && !m.Pivoted {
+		if m.Live && !m.Pivoted && !m.CatchUp {
 			if dom.running() {
-				return refuse(m, false, "%s: a live volume move of its disk %s did not finish: the persistent config names %s, "+
+				return false, refuse(m, false, "%s: a live volume move of its disk %s did not finish: the persistent config names %s, "+
 					"but the guest is writing %s with the block-copy mirror into %s still running; the disk row names %s and "+
 					"both files are kept. Do not stop or restart the VM until this is resolved. Operator: either run "+
 					"`virsh blockjob %s %s --pivot` and then retry `lv move-volume %s %s %s`, or point the disk's source in "+
-					"the persistent config back at %s (virsh edit %s) and run `virsh blockjob %s %s --abort` (the record is %s)",
-					m.VM, m.Disk, m.Dst, m.Src, m.Dst, row.Path, m.VM, devOr(m), m.VM, m.Disk, m.DstPool, m.Src, m.VM, m.VM, devOr(m), rec)
+					"the persistent config back at %s (virsh edit %s) and run `virsh blockjob %s %s --abort`",
+					m.VM, m.Disk, m.Dst, m.Src, m.Dst, row.Path, m.VM, devOr(m), m.VM, m.Disk, m.DstPool, m.Src, m.VM, m.VM, devOr(m))
 			}
-			return refuse(m, false, "%s: a live volume move of its disk %s did not finish: the guest was writing %s while a "+
+			return false, refuse(m, false, "%s: a live volume move of its disk %s did not finish: the guest was writing %s while a "+
 				"block-copy mirror kept %s current, and it stopped before a pivot, so %s may lack its last writes; the "+
 				"persistent config names %s and the disk row %s; both files are kept. Operator: point the disk's source in "+
 				"the persistent config back at %s (virsh edit %s) and retry. Only if the guest was pivoted onto %s before "+
-				"it stopped is %s complete: then remove the record %s and retry",
-				m.VM, m.Disk, m.Src, m.Dst, m.Dst, m.Dst, row.Path, m.Src, m.VM, m.Dst, m.Dst, rec)
+				"it stopped is %s complete: then `%s` and retry",
+				m.VM, m.Disk, m.Src, m.Dst, m.Dst, m.Dst, row.Path, m.Src, m.VM, m.Dst, m.Dst, resolveCmd(m.VM))
 		}
 		path, typ, pool = m.Dst, m.DstType, m.DstPool
-	} else if m.Pivoted {
-		return refuse(m, false, "%s: a live volume move of its disk %s did not finish: the guest was pivoted onto %s, but the "+
-			"persistent config names %s, which lacks the writes made since; the disk row names %s and both files are "+
-			"kept. Operator: point the disk's source in the persistent config at %s (virsh edit %s) and retry (the "+
-			"record is %s)", m.VM, m.Disk, m.Dst, m.Src, row.Path, m.Dst, m.VM, rec)
+	} else if m.Pivoted || m.CatchUp {
+		return false, refuse(m, false, "%s: a volume move of its disk %s did not finish: the guest was moved onto %s, or the "+
+			"config named it before the move, but the persistent config names %s, which lacks the writes made since; the "+
+			"disk row names %s and both files are kept. Operator: point the disk's source in the persistent config at %s "+
+			"(virsh edit %s) and retry", m.VM, m.Disk, m.Dst, m.Src, row.Path, m.Dst, m.VM)
 	}
 	if err := pointRow(ctx, db, m, row, host, path, typ, pool); err != nil {
-		return err
+		return false, err
 	}
-	return ClearUnresolvedMove(dataDir, m.VM, m.Disk)
+	return true, ClearUnresolvedMove(dataDir, m.VM, m.Disk)
 }
 
-// resolveRemoteMove honours a record another host holds (origin).
-func resolveRemoteMove(ctx context.Context, db *corrosion.Client, host, origin string, m UnresolvedMove) error {
+// resolveRemoteMove honours a move this host holds no record of (origin's,
+// seen through the condition). Only a direction that is proven is taken: a
+// pivoted (or catch-up) move's copy holds every write, so a row on the source
+// is pointed at the copy when this host owns the VM and the copy is on a
+// shared pool it mounts, and refused otherwise. A live move with no pivot
+// recorded may still have pivoted on origin (the record lags the pivot), so a
+// row on the copy is refused, never pointed back at the source; a row on the
+// source passes only when the move recorded no error. An offline move's two
+// files hold the same data.
+func resolveRemoteMove(ctx context.Context, db *corrosion.Client, dataDir, host, origin string, m UnresolvedMove) error {
 	vmRec, err := corrosion.GetVM(ctx, db, m.VM)
 	if err != nil {
 		return refuse(m, true, "%s: read the VM to honour the volume move %s recorded of its disk %s: %v", m.VM, origin, m.Disk, err)
@@ -499,28 +678,61 @@ func resolveRemoteMove(ctx context.Context, db *corrosion.Client, host, origin s
 		return err
 	}
 	if vmRec == nil || row == nil || (row.Path != m.Src && row.Path != m.Dst) {
-		return nil // the condition no longer describes the disk; its host resolves it
-	}
-	complete, typ, pool := m.Src, m.SrcType, m.SrcPool
-	switch {
-	case !m.Live:
-		return nil // an offline move: the two files hold the same data
-	case m.Pivoted:
-		complete, typ, pool = m.Dst, m.DstType, m.DstPool
-	}
-	if row.Path == complete {
 		return nil
 	}
-	if row.HostName == host && vmRec.HostName == host {
-		if _, serr := os.Stat(complete); serr == nil {
-			slog.Warn("move-volume condition: the disk row named a file that may lack the guest's last writes; pointed it at the one that holds them",
-				"vm", m.VM, "disk", m.Disk, "origin", origin, "row_was", row.Path, "row_now", complete)
-			return pointRow(ctx, db, m, row, host, complete, typ, pool)
+	exit := fmt.Sprintf("Operator: settle it on %s (start the VM or retry `lv move-volume %s %s %s` there), or, once %s is fenced or "+
+		"removed, `%s`; a start then boots the file the disk row names", origin, m.VM, m.Disk, m.DstPool, origin, resolveCmd(m.VM))
+	switch {
+	case m.Pivoted || m.CatchUp:
+		if row.Path == m.Dst {
+			return nil
+		}
+		if row.HostName == host && vmRec.HostName == host && sharedPoolHolds(ctx, db, dataDir, host, m.DstPool, m.Dst) {
+			slog.Warn("move-volume condition: the disk row named the source, which lacks the writes made on the copy; pointed it at the copy",
+				"vm", m.VM, "disk", m.Disk, "origin", origin, "row_was", row.Path, "row_now", m.Dst)
+			return pointRow(ctx, db, m, row, host, m.Dst, m.DstType, m.DstPool)
+		}
+		return refuse(m, false, "%s: a volume move of its disk %s on %s did not finish: the guest was moved onto %s, but the "+
+			"disk row names %s, which lacks the writes made since, and %s is not on a shared pool %s mounts. %s",
+			m.VM, m.Disk, origin, m.Dst, row.Path, m.Dst, host, exit)
+	case m.Live:
+		if row.Path == m.Src && m.Error == "" {
+			return nil
+		}
+		return refuse(m, false, "%s: a live volume move of its disk %s on %s did not finish, and the disk row names %s; "+
+			"whether the guest was pivoted onto %s before %s stopped is not known here, so either %s or %s may hold its "+
+			"last writes. %s", m.VM, m.Disk, origin, row.Path, m.Dst, origin, m.Src, m.Dst, exit)
+	default:
+		return nil
+	}
+}
+
+// sharedPoolHolds reports whether path lies in pool, configured on host with
+// a shared driver, and exists here: the same file the move's host wrote, not
+// a same-named file on a host-local pool.
+func sharedPoolHolds(ctx context.Context, db *corrosion.Client, dataDir, host, pool, path string) bool {
+	if pool == "" {
+		return false
+	}
+	p, ok, err := corrosion.GetStoragePool(ctx, db, host, pool)
+	if err != nil || !ok || !corrosion.DiskIsShared(corrosion.DiskRecord{StorageType: p.Driver}) {
+		return false
+	}
+	var dirs []string
+	if p.Target != "" {
+		dirs = append(dirs, p.Target)
+	} else if p.Source != "" {
+		dirs = append(dirs, filepath.Join(dataDir, "mounts", storage.NFSMountName(p.Source)),
+			filepath.Join(dataDir, "mounts", strings.NewReplacer("/", "_", ":", "_").Replace(p.Source)))
+	}
+	clean := filepath.Clean(path)
+	for _, d := range dirs {
+		if strings.HasPrefix(clean, filepath.Clean(d)+string(filepath.Separator)) {
+			_, serr := os.Stat(clean)
+			return serr == nil
 		}
 	}
-	return refuse(m, false, "%s: a live volume move of its disk %s on %s did not finish, and the disk row names %s, which may "+
-		"lack the guest's last writes; %s holds them. The move's record is on %s: start the VM or retry `lv move-volume "+
-		"%s %s %s` there to settle it", m.VM, m.Disk, origin, row.Path, complete, origin, m.VM, m.Disk, m.DstPool)
+	return false
 }
 
 func diskRow(ctx context.Context, db *corrosion.Client, m UnresolvedMove) (*corrosion.DiskRecord, error) {
@@ -550,7 +762,7 @@ func pointRow(ctx context.Context, db *corrosion.Client, m UnresolvedMove, row *
 			}
 		}
 	}
-	slog.Warn("move-volume record: the disk row named a file the persistent config does not; pointed it at the config's",
+	slog.Warn("move-volume record: pointed the disk row at the file holding the guest's writes",
 		"vm", m.VM, "disk", m.Disk, "row_was", row.Path, "row_now", path)
 	return nil
 }
@@ -573,7 +785,7 @@ func domainRunningNow(v interface {
 // MoveConditionCovers reports whether vm's replicated condition records an
 // unresolved move of disk (on any host). A read error counts as covering it.
 func MoveConditionCovers(ctx context.Context, db *corrosion.Client, vm, disk string) bool {
-	_, ev, open, err := openMoveCondition(ctx, db, vm)
+	_, ev, open, err := OpenMoveCondition(ctx, db, vm)
 	if err != nil {
 		return true
 	}

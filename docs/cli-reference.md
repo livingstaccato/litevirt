@@ -102,7 +102,9 @@ lv cluster claim-release <kind>/<name>       # Release one workload ha.claim.leg
                                    #   destination confirms nothing runs it, then abandons it (admin)
 lv health [--resolved]             # Cluster health: overall + conditions + coverage (exit 0/1/2)
 lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E]  # Resolve one open dual-run
-                                   #   condition by hand (admin, audited); re-raised next pass if it still holds
+                                   #   condition by hand (admin, audited); re-raised next pass if it still holds;
+                                   #   or a vm.move_unresolved (--reason required) once its holding host is
+                                   #   fenced or removed, or on that host
 ```
 
 ## Hosts
@@ -1493,6 +1495,9 @@ lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E]
                                              #   audited, ha.condition.resolved event. Refused until a
                                              #   detector scan after its last sighting probed every host
                                              #   it names; raised again next pass if it still holds.
+                                             #   Also vm.move_unresolved (an unresolved volume move),
+                                             #   with --reason: on the host holding its record, or once
+                                             #   that host is fenced or removed (docs/diagnostics.md).
 lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>] [--until <time>]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics
 lv stats <vm>                                # VM resource statistics

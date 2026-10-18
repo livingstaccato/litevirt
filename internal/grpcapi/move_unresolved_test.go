@@ -432,7 +432,7 @@ func TestStartVM_SettlesAMoveACrashLeft(t *testing.T) {
 		{name: "live before the pivot, config names the copy", configDst: true, live: true, wantWhy: "stopped before a pivot"},
 		{name: "live before the pivot, config names the source", configDst: false, live: true, wantStart: true, wantRowDst: false},
 		{name: "live after the pivot, config names the copy", configDst: true, live: true, pivoted: true, wantStart: true, wantRowDst: true},
-		{name: "live after the pivot, config names the source", configDst: false, live: true, pivoted: true, wantWhy: "was pivoted onto"},
+		{name: "live after the pivot, config names the source", configDst: false, live: true, pivoted: true, wantWhy: "was moved onto"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, f, srcFile, dstFile := offlineMoveServer(t)
@@ -735,7 +735,7 @@ func TestResolveUnresolvedMoves_RefusalDescribesTheDomain(t *testing.T) {
 		}
 		err := s.resolveUnresolvedMoves(context.Background(), "vm1")
 		if err == nil || !strings.Contains(err.Error(), "has no domain vm1") || !strings.Contains(err.Error(), "boots "+srcFile) ||
-			!strings.Contains(err.Error(), "remove the record") {
+			!strings.Contains(err.Error(), "lv health resolve vm.move_unresolved vm/vm1") {
 			t.Fatalf("want the missing-domain text, got %v", err)
 		}
 	})
@@ -820,4 +820,166 @@ func TestMoveVolume_CatchUpCommitsWhenTheRecordCannotBeWritten(t *testing.T) {
 			t.Fatalf("config changed: %s", after)
 		}
 	})
+}
+
+// publishForeignCondition raises vm1's condition as host holder would, with a
+// live, unpivoted move of its root disk to dstFile.
+func publishForeignCondition(t *testing.T, s *Server, holder, srcFile, dstFile string, pivoted bool) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := health.RecordUnresolvedMove(dir, health.UnresolvedMove{VM: "vm1", Disk: "root", TargetDev: "vda",
+		Src: srcFile, SrcType: "local", SrcPool: "hot", Dst: dstFile, DstType: "local", DstPool: "warm",
+		Live: true, Pivoted: pivoted}); err != nil {
+		t.Fatal(err)
+	}
+	if err := health.PublishUnresolvedMoves(context.Background(), s.db, dir, holder, "vm1"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func moveEvidence(t *testing.T, s *Server, vm string) health.MoveUnresolvedEvidence {
+	t.Helper()
+	_, ev, _, err := health.OpenMoveCondition(context.Background(), s.db, vm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ev
+}
+
+// N-4: on a host that does not hold the condition, a move of the disk honours
+// it (here: no pivot recorded, the row on the copy, so refused) and never
+// overwrites the holder's entries; a move of another disk of the VM is
+// refused rather than overwrite the holder's condition.
+func TestMoveVolume_NonHolderHonoursTheCondition(t *testing.T) {
+	s, _, srcFile, dstFile := offlineMoveServer(t)
+	if err := copyMovedFile(srcFile, dstFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpdateDiskPlacement(context.Background(), s.db, "vm1", "root", "test-host", dstFile, "local", "warm"); err != nil {
+		t.Fatal(err)
+	}
+	publishForeignCondition(t, s, "node-a", srcFile, dstFile, false)
+	before := moveEvidence(t, s, "vm1")
+
+	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+	err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm1", DiskName: "root", TargetPool: "hot"}, rec)
+	if !health.IsMoveUnresolved(err) || !strings.Contains(err.Error(), "node-a") {
+		t.Fatalf("want the move refused by node-a's condition, got %v", err)
+	}
+	if got := diskRowPath(t, s, "vm1"); got != dstFile {
+		t.Fatalf("row changed to %s", got)
+	}
+	if after := moveEvidence(t, s, "vm1"); after.Host != before.Host || len(after.Moves) != 1 || after.Moves[0].Dst != dstFile {
+		t.Fatalf("the holder's condition was overwritten: %+v", after)
+	}
+}
+
+// N-4: a covered disk already on the target pool, dispatched by a stack
+// migration to a non-holder owner whose condition entry is proven settled
+// (pivoted, row on the copy), is a DONE no-op, and the owner resolves the
+// condition — not a "same path" error.
+func TestMoveOneVolume_SettledForeignConditionIsANoOp(t *testing.T) {
+	s, _, srcFile, dstFile := offlineMoveServer(t)
+	if err := copyMovedFile(srcFile, dstFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpdateDiskPlacement(context.Background(), s.db, "vm1", "root", "test-host", dstFile, "local", "warm"); err != nil {
+		t.Fatal(err)
+	}
+	publishForeignCondition(t, s, "node-a", srcFile, dstFile, true)
+	vm, _ := corrosion.GetVM(context.Background(), s.db, "vm1")
+	disks, _ := corrosion.GetVMDisks(context.Background(), s.db, "vm1")
+	var frames []*pb.MoveVolumeProgress
+	err := s.moveOneVolume(context.Background(), vm, &disks[0], "warm", false, func(p *pb.MoveVolumeProgress) error {
+		frames = append(frames, p)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("moveOneVolume: %v", err)
+	}
+	if len(frames) != 1 || frames[0].Phase != pb.MoveVolumeProgress_DONE {
+		t.Fatalf("want one DONE frame, got %+v", frames)
+	}
+	if health.MoveConditionCovers(context.Background(), s.db, "vm1", "root") {
+		t.Fatal("the owner did not resolve a settled condition")
+	}
+}
+
+// N-2: `lv health resolve vm.move_unresolved` needs a reason, is refused
+// while the holder is a live member, is accepted once it is removed, and on
+// the holder itself also removes its records.
+func TestResolveHealthCondition_MoveUnresolved(t *testing.T) {
+	ctx := context.Background()
+	req := func(reason string) *pb.ResolveHealthConditionRequest {
+		return &pb.ResolveHealthConditionRequest{Code: health.MoveUnresolvedCode, SubjectKind: "vm", SubjectId: "vm1", Reason: reason}
+	}
+	t.Run("no reason", func(t *testing.T) {
+		s, _, srcFile, dstFile := offlineMoveServer(t)
+		publishForeignCondition(t, s, "node-a", srcFile, dstFile, false)
+		if _, err := s.ResolveHealthCondition(adminCtx(), req("")); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("want InvalidArgument, got %v", err)
+		}
+	})
+	t.Run("holder alive", func(t *testing.T) {
+		s, _, srcFile, dstFile := offlineMoveServer(t)
+		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "node-a", Address: "10.0.0.9", State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+		publishForeignCondition(t, s, "node-a", srcFile, dstFile, false)
+		_, err := s.ResolveHealthCondition(adminCtx(), req("disk checked"))
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "node-a holds") ||
+			!strings.Contains(err.Error(), "fence-confirm") {
+			t.Fatalf("want a refusal naming the live holder, got %v", err)
+		}
+		if !health.MoveConditionCovers(ctx, s.db, "vm1", "root") {
+			t.Fatal("resolved anyway")
+		}
+	})
+	t.Run("holder removed", func(t *testing.T) {
+		s, _, srcFile, dstFile := offlineMoveServer(t)
+		publishForeignCondition(t, s, "node-gone", srcFile, dstFile, false)
+		if _, err := s.ResolveHealthCondition(adminCtx(), req("node-gone was reinstalled")); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if health.MoveConditionCovers(ctx, s.db, "vm1", "root") {
+			t.Fatal("not resolved")
+		}
+	})
+	t.Run("on the holder", func(t *testing.T) {
+		s, f, srcFile, dstFile := offlineMoveServer(t)
+		crashAfterDefine(t, s, f, srcFile, dstFile, dstFile, true, false)
+		if _, err := s.ResolveHealthCondition(adminCtx(), req("guest was pivoted by hand")); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if ms := moveRecords(t, s, "vm1"); len(ms) != 0 {
+			t.Fatalf("records kept: %+v", ms)
+		}
+		vm, _ := corrosion.GetVM(ctx, s.db, "vm1")
+		if _, err := s.startVMLocked(adminCtx(), vm); err != nil {
+			t.Fatalf("the start after the resolve: %v", err)
+		}
+	})
+}
+
+// m-3: a VM created under a name an earlier VM's unresolved move was recorded
+// for starts clean: the record and the condition are dropped.
+func TestCreateVM_ForgetsAnEarlierVMsMoveRecords(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	if err := health.RecordUnresolvedMove(s.dataDir, health.UnresolvedMove{VM: "reborn", Disk: "root", Src: "/a/x", Dst: "/b/x", Live: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := health.PublishUnresolvedMoves(context.Background(), s.db, s.dataDir, s.hostName, "reborn"); err != nil {
+		t.Fatal(err)
+	}
+	req := disklessCreateRequest("reborn")
+	req.Spec.Network = nil
+	if _, err := s.CreateVM(adminCtx(), req); err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	if ms := moveRecords(t, s, "reborn"); len(ms) != 0 {
+		t.Fatalf("records kept: %+v", ms)
+	}
+	if health.MoveConditionCovers(context.Background(), s.db, "reborn", "root") {
+		t.Fatal("condition left open")
+	}
 }

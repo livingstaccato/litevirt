@@ -44,19 +44,36 @@ func (s *Server) beginMoveMarker(ctx context.Context, vm *corrosion.VMRecord, sr
 		Dst: dstPath, DstType: dstType, DstPool: dstPool,
 		Live: live, Pivoted: pivoted,
 	}}
-	if prior, ok := s.moveRecordOf(vm.Name, src.DiskName); ok && prior.Dst == dstPath && (prior.Src == src.Path || prior.Dst == src.Path) {
+	prior, hadPrior := s.moveRecordOf(vm.Name, src.DiskName)
+	if hadPrior && prior.Dst == dstPath && (prior.Src == src.Path || prior.Dst == src.Path) {
 		mk.m.Src, mk.m.SrcType, mk.m.SrcPool = prior.Src, prior.SrcType, prior.SrcPool
 		mk.m.Live = mk.m.Live || prior.Live
 		mk.m.Pivoted = mk.m.Pivoted || prior.Pivoted
+		mk.m.CatchUp = mk.m.CatchUp || prior.CatchUp
+	} else if catchUp && !live {
+		// The config named the copy before this move: it may hold writes the
+		// source lacks.
+		mk.m.CatchUp = true
 	}
 	mk.endFlight = health.MarkMoveInFlight(vm.Name, src.DiskName)
 	err := health.RecordUnresolvedMove(s.dataDir, mk.m)
 	if err == nil {
 		if err = health.PublishUnresolvedMoves(mk.ctx, s.db, s.dataDir, s.hostName, vm.Name); err != nil {
-			_ = health.ClearUnresolvedMove(s.dataDir, vm.Name, src.DiskName)
+			// Leave the record as it was before this move.
+			if hadPrior {
+				_ = health.RecordUnresolvedMove(s.dataDir, prior)
+			} else {
+				_ = health.ClearUnresolvedMove(s.dataDir, vm.Name, src.DiskName)
+			}
 		}
 	}
 	if err != nil {
+		if health.IsMoveUnresolved(err) {
+			// Another host's unresolved move of this VM is open: never
+			// overwritten, catch-up or not.
+			mk.endFlight()
+			return nil, err
+		}
 		if catchUp {
 			slog.Error("move: the unresolved-move record could not be written; committing the catch-up anyway, as it makes the config and the disk row agree",
 				"vm", vm.Name, "disk", src.DiskName, "error", err)
@@ -130,7 +147,7 @@ func (mk *moveMarker) done() {
 		slog.Warn("move: removing the unresolved-move record failed; the next start of the VM settles it", "vm", mk.m.VM, "disk", mk.m.Disk, "error", err)
 		return
 	}
-	if err := health.PublishUnresolvedMoves(mk.ctx, mk.s.db, mk.s.dataDir, mk.s.hostName, mk.m.VM); err != nil {
+	if err := health.PublishUnresolvedMoves(mk.ctx, mk.s.db, mk.s.dataDir, mk.s.hostName, mk.m.VM, mk.m.Disk); err != nil {
 		slog.Warn("move: resolving the unresolved-move condition failed; the next start of the VM settles it", "vm", mk.m.VM, "disk", mk.m.Disk, "error", err)
 	}
 }
@@ -148,7 +165,15 @@ func (s *Server) settleBeforeMove(ctx context.Context, vm *corrosion.VMRecord, r
 	}
 	m, ok := s.moveRecordOf(vm.Name, row.DiskName)
 	if !ok {
-		return nil, nil
+		// Another host's unresolved move of this disk (or this host's, its
+		// record lost): honoured by the rule a start on this host follows.
+		if !health.MoveConditionCovers(ctx, s.db, vm.Name, row.DiskName) {
+			return nil, nil
+		}
+		if err := s.resolveUnresolvedMoves(ctx, vm.Name); err != nil {
+			return nil, err
+		}
+		return s.diskRowOf(ctx, vm.Name, row.DiskName)
 	}
 	if m.Live && !m.Pivoted && !s.sourceClosedForPlainCopy(vm) {
 		was := *row
@@ -164,16 +189,21 @@ func (s *Server) settleBeforeMove(ctx context.Context, vm *corrosion.VMRecord, r
 	if err := s.resolveUnresolvedMoves(ctx, vm.Name); err != nil {
 		return nil, err
 	}
-	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
+	return s.diskRowOf(ctx, vm.Name, row.DiskName)
+}
+
+// diskRowOf re-reads one disk row.
+func (s *Server) diskRowOf(ctx context.Context, vm, disk string) (*corrosion.DiskRecord, error) {
+	disks, err := corrosion.GetVMDisks(ctx, s.db, vm)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list disks: %v", err)
 	}
 	for i := range disks {
-		if disks[i].DiskName == row.DiskName {
+		if disks[i].DiskName == disk {
 			return &disks[i], nil
 		}
 	}
-	return nil, status.Errorf(codes.NotFound, "vm %q has no disk %q", vm.Name, row.DiskName)
+	return nil, status.Errorf(codes.NotFound, "vm %q has no disk %q", vm, disk)
 }
 
 // resolveUnresolvedMoves is health.ResolveUnresolvedMoves for a VM on this

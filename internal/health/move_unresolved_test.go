@@ -2,10 +2,14 @@ package health
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -121,7 +125,7 @@ func TestStartGuarded_HonoursAnUnresolvedMove(t *testing.T) {
 	v := NewVMChecker("node-a", dataDir, db, nil)
 	v.virt = fake
 	err := v.startGuarded(context.Background(), "mv")
-	if err == nil || !strings.Contains(err.Error(), dst) || !strings.Contains(err.Error(), src) || !strings.Contains(err.Error(), "was pivoted onto") {
+	if err == nil || !strings.Contains(err.Error(), dst) || !strings.Contains(err.Error(), src) || !strings.Contains(err.Error(), "was moved onto") {
 		t.Fatalf("want the restart refused naming both files (the guest was pivoted, the config names the source), got %v", err)
 	}
 	if st, _ := fake.DomainState("mv"); st == "running" {
@@ -179,38 +183,71 @@ func TestStartPendingVM_InFlightMoveIsRetried(t *testing.T) {
 	}
 }
 
-// m-4: a host that does not hold the record honours it through the VM's
-// condition. The file holding every acknowledged write decides: a start of a
-// VM failed over to this host points the row at it; a reader on a host the
-// VM's row does not name is refused; a row already on it passes.
+// m-4, N-1, N-3: a host that does not hold the record honours it through the
+// VM's condition, taking only a direction it can prove. A recorded pivot (or a
+// catch-up) makes the copy complete: a start of a VM failed over here points a
+// row on the source at the copy, but only when the copy is on a shared pool
+// mounted here. With no pivot recorded the pivot may still have happened before
+// the holder stopped (the record lags it): a row on the copy is refused, never
+// pointed back at the source; a row on the source passes only when the move
+// recorded no error. The owner resolves the condition once every move is
+// proven settled.
 func TestResolveUnresolvedMoves_AnotherHostsRecord(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
-		name         string
-		pivoted      bool
-		rowOnDst     bool
-		rowHost      string
-		wantErr      bool
-		wantRowOnDst bool
+		name                   string
+		pivoted, catchUp       bool
+		moveErr                string
+		rowOnDst               bool
+		rowHost                string
+		poolShared             bool
+		wantErr                bool
+		wantRowOnDst, resolved bool
 	}{
-		{name: "never pivoted, row on the copy, failed over here: row to the source", rowOnDst: true, rowHost: "node-b", wantRowOnDst: false},
-		{name: "never pivoted, row on the copy, row elsewhere: refused", rowOnDst: true, rowHost: "node-c", wantErr: true, wantRowOnDst: true},
-		{name: "never pivoted, row on the source: passes", rowOnDst: false, rowHost: "node-c", wantRowOnDst: false},
-		{name: "pivoted, row on the source, failed over here: row to the copy", pivoted: true, rowHost: "node-b", wantRowOnDst: true},
-		{name: "pivoted, row on the copy: passes", pivoted: true, rowOnDst: true, rowHost: "node-c", wantRowOnDst: true},
+		{name: "crash after the pivot, before it replicated: row on the copy, no pivot recorded, failed over here: refused",
+			rowOnDst: true, rowHost: "node-b", poolShared: true, wantErr: true, wantRowOnDst: true},
+		{name: "no pivot recorded, row on the copy, row elsewhere: refused", rowOnDst: true, rowHost: "node-c", wantErr: true, wantRowOnDst: true},
+		{name: "no pivot recorded, row on the source, no error: passes", rowHost: "node-c"},
+		{name: "no pivot recorded, row on the source, the move recorded an error: refused", moveErr: "redefine failed", rowHost: "node-b", wantErr: true},
+		{name: "pivoted, row on the source, failed over here, copy on a shared pool: row to the copy, resolved",
+			pivoted: true, rowHost: "node-b", poolShared: true, wantRowOnDst: true, resolved: true},
+		{name: "pivoted, row on the source, failed over here, copy on a local pool: refused",
+			pivoted: true, rowHost: "node-b", wantErr: true},
+		{name: "catch-up, row on the source, failed over here, copy on a shared pool: row to the copy",
+			catchUp: true, rowHost: "node-b", poolShared: true, wantRowOnDst: true, resolved: true},
+		{name: "pivoted, row on the copy, owner here: passes and resolved", pivoted: true, rowOnDst: true, rowHost: "node-b", wantRowOnDst: true, resolved: true},
+		{name: "pivoted, row on the copy, owner elsewhere: passes, left open", pivoted: true, rowOnDst: true, rowHost: "node-c", wantRowOnDst: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := testReconcilerDB(t)
 			originDir := t.TempDir()
 			_, src, dst := seedMovedVM(t, db, originDir, "dst", true, tc.pivoted)
+			if tc.catchUp || tc.moveErr != "" {
+				ms, _ := UnresolvedMovesOf(originDir, "mv")
+				ms[0].CatchUp, ms[0].Error = tc.catchUp, tc.moveErr
+				if tc.catchUp {
+					ms[0].Live = false
+				}
+				if err := RecordUnresolvedMove(originDir, ms[0]); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if err := PublishUnresolvedMoves(ctx, db, originDir, "node-a", "mv"); err != nil {
+				t.Fatal(err)
+			}
+			driver := "local"
+			if tc.poolShared {
+				driver = "nfs"
+			}
+			if err := corrosion.UpsertStoragePool(ctx, db, corrosion.StoragePoolRecord{HostName: "node-b", Name: "warm",
+				Driver: driver, Target: filepath.Dir(dst)}); err != nil {
 				t.Fatal(err)
 			}
 			row := src
 			if tc.rowOnDst {
 				row = dst
 			}
-			if err := corrosion.UpdateDiskPlacement(ctx, db, "mv", "root", tc.rowHost, row, "nfs", "shared"); err != nil {
+			if err := corrosion.UpdateDiskPlacement(ctx, db, "mv", "root", tc.rowHost, row, "local", "hot"); err != nil {
 				t.Fatal(err)
 			}
 			if err := db.Execute(ctx, `UPDATE vms SET host_name = ? WHERE name = 'mv'`, tc.rowHost); err != nil {
@@ -220,8 +257,9 @@ func TestResolveUnresolvedMoves_AnotherHostsRecord(t *testing.T) {
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("err = %v, want refused=%v", err, tc.wantErr)
 			}
-			if err != nil && (!IsMoveUnresolved(err) || !strings.Contains(err.Error(), "node-a")) {
-				t.Fatalf("refusal does not name the host holding the record: %v", err)
+			if err != nil && (!IsMoveUnresolved(err) || !strings.Contains(err.Error(), "node-a") ||
+				!strings.Contains(err.Error(), "lv health resolve "+MoveUnresolvedCode+" vm/mv")) {
+				t.Fatalf("refusal does not name the holder and the operator exit: %v", err)
 			}
 			want := src
 			if tc.wantRowOnDst {
@@ -230,7 +268,97 @@ func TestResolveUnresolvedMoves_AnotherHostsRecord(t *testing.T) {
 			if got := movedRowPath(t, db); got != want {
 				t.Fatalf("row names %s, want %s", got, want)
 			}
+			if got := !MoveConditionCovers(ctx, db, "mv", "root"); got != tc.resolved {
+				t.Fatalf("condition resolved = %v, want %v", got, tc.resolved)
+			}
 		})
+	}
+}
+
+// N-2: the holder that comes back while the VM's row names another host and
+// the move is not proven settled drops its record but keeps the condition.
+func TestPublishUnresolvedMoves_HolderKeepsAnUnsettledEntry(t *testing.T) {
+	ctx := context.Background()
+	db := testReconcilerDB(t)
+	dir := t.TempDir()
+	_, _, dst := seedMovedVM(t, db, dir, "dst", true, false)
+	if err := PublishUnresolvedMoves(ctx, db, dir, "node-a", "mv"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpdateDiskPlacement(ctx, db, "mv", "root", "node-b", dst, "local", "warm"); err != nil {
+		t.Fatal(err)
+	}
+	err := ResolveUnresolvedMoves(ctx, db, dir, "node-a", "mv", MoveDomain{})
+	if err == nil || !IsMoveUnresolved(err) {
+		t.Fatalf("want the holder's own remote rule to refuse, got %v", err)
+	}
+	if ms, _ := UnresolvedMovesOf(dir, "mv"); len(ms) != 0 {
+		t.Fatalf("the stale record was kept: %+v", ms)
+	}
+	if !MoveConditionCovers(ctx, db, "mv", "root") {
+		t.Fatal("the holder resolved a condition its new owner has not settled")
+	}
+	// Publishing with no record left here (as a later move of another disk
+	// does) keeps the entry too.
+	if err := PublishUnresolvedMoves(ctx, db, dir, "node-a", "mv"); err != nil {
+		t.Fatal(err)
+	}
+	if !MoveConditionCovers(ctx, db, "mv", "root") {
+		t.Fatal("publishing without the record dropped an unsettled entry")
+	}
+}
+
+// N-5: a holder whose records are gone (a lost data dir) honours its own
+// condition by the remote rule instead of resolving it.
+func TestResolveUnresolvedMoves_LostRecordsKeepTheCondition(t *testing.T) {
+	ctx := context.Background()
+	db := testReconcilerDB(t)
+	dir := t.TempDir()
+	_, _, dst := seedMovedVM(t, db, dir, "dst", true, false)
+	if err := PublishUnresolvedMoves(ctx, db, dir, "node-a", "mv"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpdateDiskPlacement(ctx, db, "mv", "root", "node-a", dst, "local", "warm"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearUnresolvedMovesOf(dir, "mv"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ResolveUnresolvedMoves(ctx, db, dir, "node-a", "mv", MoveDomain{}); err == nil {
+		t.Fatal("a lost record let the start boot a copy that may lack the guest's last writes")
+	}
+	if !MoveConditionCovers(ctx, db, "mv", "root") {
+		t.Fatal("the condition was resolved")
+	}
+}
+
+// N-6: the refusal is recognised through wrapping and over the wire, and an
+// unreadable condition refuses as a defect, not as a transient state.
+func TestMoveUnresolvedError_Recognition(t *testing.T) {
+	base := &MoveUnresolvedError{VM: "mv", Disk: "root", Detail: "x"}
+	wrapped := fmt.Errorf("migrate mv/root: %w", base)
+	wire := status.FromProto(status.Convert(wrapped).Proto()).Err()
+	for _, err := range []error{base, wrapped, wire} {
+		if !IsMoveUnresolved(err) || MoveUnresolvedRetryable(err) {
+			t.Fatalf("not recognised: %v", err)
+		}
+	}
+	if !MoveUnresolvedRetryable(status.FromProto(status.Convert(fmt.Errorf("w: %w", &MoveUnresolvedError{Retryable: true})).Proto()).Err()) {
+		t.Fatal("retryable lost on the wire")
+	}
+	if IsMoveUnresolved(status.Error(codes.FailedPrecondition, "move-unresolved: forged text")) {
+		t.Fatal("recognised by its text")
+	}
+
+	ctx := context.Background()
+	db := testReconcilerDB(t)
+	if err := corrosion.UpsertHealthCondition(ctx, db, corrosion.HealthCondition{Evaluator: MoveUnresolvedEvaluator,
+		Code: MoveUnresolvedCode, SubjectKind: "vm", SubjectID: "mv", Lifecycle: corrosion.ConditionConfirmed, Evidence: "{"}); err != nil {
+		t.Fatal(err)
+	}
+	err := ResolveUnresolvedMoves(ctx, db, t.TempDir(), "node-a", "mv", MoveDomain{})
+	if !IsMoveUnresolved(err) || MoveUnresolvedRetryable(err) || !strings.Contains(err.Error(), "lv health resolve") {
+		t.Fatalf("want a non-transient refusal naming the exit, got %v", err)
 	}
 }
 

@@ -71,12 +71,13 @@ Exit code: 0 healthy · 1 degraded or unknown · 2 critical.`,
 	return cmd
 }
 
-// lv health resolve — mark one open dual-run condition resolved by hand.
+// lv health resolve — mark one open dual-run or move-volume condition
+// resolved by hand.
 func newHealthResolveCmd() *cobra.Command {
 	var evaluator, reason string
 	cmd := &cobra.Command{
 		Use:   "resolve <code> <kind/subject>",
-		Short: "Resolve an open dual-run health condition by hand (admin, audited)",
+		Short: "Resolve an open dual-run or move-volume health condition by hand (admin, audited)",
 		Long: `Mark one open condition resolved, named as 'lv health' prints it:
 its CODE and its SUBJECT (kind/id), for example
 
@@ -91,6 +92,13 @@ on its next pass. It is refused until the detector has looked and not seen
 the condition: a scan later than its last sighting that completely probed
 every host it names. Resolving proves nothing; use it for a condition the
 detector can no longer clear by itself.
+
+An unresolved volume move (vm.move_unresolved) can be resolved this way too,
+with --reason: run against the host holding the move's record, which removes
+it, or from any host once that host is fenced (lv host fence-confirm) or
+removed. It is refused while the holding host is a live member: that host
+settles the move itself. Resolving accepts the file the VM's disk record names
+as its data, and a start then boots it.
 
 Requires the cluster.health.resolve verb (Admin). The resolution is written
 to the audit log with your principal and --reason, and published as an

@@ -11,6 +11,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/notify"
 )
 
@@ -79,6 +80,9 @@ func (s *Server) ResolveHealthCondition(ctx context.Context, req *pb.ResolveHeal
 			len(matches), code, kind, id, strings.Join(evs, ", "))
 	}
 	row := matches[0]
+	if row.Evaluator == health.MoveUnresolvedEvaluator && row.Code == health.MoveUnresolvedCode {
+		return s.resolveMoveConditionByHand(ctx, req, row)
+	}
 	if row.Evaluator != dualRunEvaluator {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"%s on %s/%s is evaluator %q's: only the dual-run detector's conditions can be resolved by hand, "+
@@ -169,4 +173,83 @@ func (s *Server) dualRunScanCleared(ctx context.Context, row corrosion.HealthCon
 			st.LastScan, strings.Join(missing, ", "))
 	}
 	return st.LastScan, ""
+}
+
+// moveResolveFenceWindow is how recent an operator's `lv host fence-confirm`
+// of a move's holding host must be for `lv health resolve` to accept it.
+const moveResolveFenceWindow = 24 * time.Hour
+
+// resolveMoveConditionByHand resolves an unresolved volume move
+// (vm.move_unresolved) on an admin's word, with a reason. The host holding the
+// move's record settles it itself when it can, so the hand resolution is
+// refused while that host is a live member, unless it is this host (its
+// records are then removed too): it is for a holder that is fenced, removed or
+// gone, whose record nothing else can settle. It proves nothing about which
+// file holds the VM's data: a start then boots the file its disk row names.
+func (s *Server) resolveMoveConditionByHand(ctx context.Context, req *pb.ResolveHealthConditionRequest, row corrosion.HealthCondition) (*pb.ResolveHealthConditionResponse, error) {
+	vm := row.SubjectID
+	reason := strings.TrimSpace(req.GetReason())
+	if reason == "" {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"resolving %s on vm/%s accepts which file the VM's disk row names as its data: say why with --reason", row.Code, vm)
+	}
+	_, ev, _, everr := health.OpenMoveCondition(ctx, s.db, vm)
+	holder := ev.Host
+	why := ""
+	switch {
+	case everr != nil || holder == "":
+		why = "its evidence is unreadable"
+	case holder == s.hostName:
+		why = "this host holds the record"
+	default:
+		gone, state := s.moveHolderGone(ctx, holder)
+		if !gone {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"refusing to resolve %s on vm/%s: %s holds the move's record and is %s, so it settles it itself: start the VM "+
+					"or retry `lv move-volume` there, or run this command against %s (LV_HOST=%s). Resolve it from here "+
+					"only once %s is fenced (`lv host fence-confirm %s`) or removed", row.Code, vm, holder, state, holder, holder, holder, holder)
+		}
+		why = holder + " is " + state
+	}
+	if holder == s.hostName || holder == "" {
+		if err := health.ClearUnresolvedMovesOf(s.dataDir, vm); err != nil {
+			return nil, status.Errorf(codes.Internal, "remove this host's records of vm/%s: %v", vm, err)
+		}
+	}
+	prior := row.Lifecycle
+	now := time.Now().UTC().Format(time.RFC3339)
+	row.Lifecycle, row.ResolvedAt, row.LastSeen = corrosion.ConditionResolved, now, now
+	row.ObserveCount, row.CleanCount = 0, 0
+	row.Reporter = s.hostName
+	if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
+		return nil, status.Errorf(codes.Unavailable, "record the resolution: %v", err)
+	}
+	target := strings.Join([]string{row.Evaluator, row.Code, row.SubjectKind, vm}, "/")
+	detail := fmt.Sprintf("resolved by hand on %s (was %s; %s): %s", s.hostName, prior, why, reason)
+	s.audit(ctx, "health.condition.resolve", target, detail, "ok")
+	s.publish("ha.condition.resolved", row.Code+":"+row.SubjectKind+"/"+vm, detail)
+	s.notify(ctx, notify.Notification{
+		Kind: notifyKindForCondition(row.Code), Severity: notify.SevInfo, Subject: vm, Detail: detail,
+	})
+	return &pb.ResolveHealthConditionResponse{Condition: healthConditionToPB(row)}, nil
+}
+
+// moveHolderGone reports whether host can no longer settle a move it
+// recorded — removed (no membership row), fenced, or confirmed down by an
+// operator — and its state, for the message.
+func (s *Server) moveHolderGone(ctx context.Context, host string) (bool, string) {
+	h, err := corrosion.GetHost(ctx, s.db, host)
+	if err != nil {
+		return false, "unreadable (" + err.Error() + ")"
+	}
+	if h == nil {
+		return true, "removed"
+	}
+	if h.State == "fenced" {
+		return true, "fenced"
+	}
+	if ok, ferr := corrosion.HostManualFenceConfirmed(ctx, s.db, host, time.Now(), moveResolveFenceWindow); ferr == nil && ok {
+		return true, "confirmed down (lv host fence-confirm)"
+	}
+	return false, h.State
 }

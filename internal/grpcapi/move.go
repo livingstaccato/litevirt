@@ -150,14 +150,16 @@ func (s *Server) moveOneVolume(
 		return err
 	} else if settled != nil {
 		src = settled
-		if src.StorageVolume == targetPool {
-			return send(&pb.MoveVolumeProgress{
-				Phase:      pb.MoveVolumeProgress_DONE,
-				Status:     fmt.Sprintf("disk %q is already in pool %q — nothing to do", src.DiskName, targetPool),
-				CopyPct:    100,
-				BytesTotal: src.SizeBytes,
-			})
-		}
+	}
+	// Already there (a stack migration dispatches a disk whose move was
+	// recorded even when its row names the target pool): nothing to do.
+	if src.StorageVolume == targetPool {
+		return send(&pb.MoveVolumeProgress{
+			Phase:      pb.MoveVolumeProgress_DONE,
+			Status:     fmt.Sprintf("disk %q is already in pool %q — nothing to do", src.DiskName, targetPool),
+			CopyPct:    100,
+			BytesTotal: src.SizeBytes,
+		})
 	}
 	// A VM snapshot makes the disk an overlay over a (possibly host-local) backing
 	// base. qemu-img convert flattens the DATA, but the snapshot metadata and the

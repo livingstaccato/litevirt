@@ -390,13 +390,13 @@ func (m *Manager) stopKeepalivedConfirmed(name string, timeout time.Duration) er
 				syscall.Kill(pid, sig)
 			}
 		}
-		for _, pid := range keepalivedPidsForConfig(cfgPath) {
+		for _, pid := range keepalivedPidsForConfig(m.cmdlineGlob(), cfgPath) {
 			syscall.Kill(pid, sig)
 		}
 	}
 
 	stopped := func() bool {
-		return !pidAlive(keepalivedPid) && len(keepalivedPidsForConfig(cfgPath)) == 0
+		return !pidAlive(keepalivedPid) && len(keepalivedPidsForConfig(m.cmdlineGlob(), cfgPath)) == 0
 	}
 
 	signalAll(syscall.SIGTERM)
@@ -419,14 +419,26 @@ func (m *Manager) stopKeepalivedConfirmed(name string, timeout time.Duration) er
 		time.Sleep(50 * time.Millisecond)
 	}
 	return fmt.Errorf("keepalived not confirmed stopped for LB %q within %s (survivors: %v)",
-		name, timeout, keepalivedPidsForConfig(cfgPath))
+		name, timeout, keepalivedPidsForConfig(m.cmdlineGlob(), cfgPath))
+}
+
+// defaultProcCmdlines is where a Manager looks for processes by cmdline.
+const defaultProcCmdlines = "/proc/[0-9]*/cmdline"
+
+// cmdlineGlob is m's procCmdlines, or defaultProcCmdlines.
+func (m *Manager) cmdlineGlob() string {
+	if m.procCmdlines != "" {
+		return m.procCmdlines
+	}
+	return defaultProcCmdlines
 }
 
 // keepalivedPidsForConfig returns every keepalived pid whose cmdline binds cfgPath
-// (scanning /proc; mirrors killProcByConfig's matcher). Empty on a /proc-less host.
-func keepalivedPidsForConfig(cfgPath string) []int {
+// (scanning the cmdlines glob names, /proc in production; mirrors
+// killProcByConfig's matcher). Empty on a /proc-less host.
+func keepalivedPidsForConfig(glob, cfgPath string) []int {
 	var pids []int
-	matches, _ := filepath.Glob("/proc/[0-9]*/cmdline")
+	matches, _ := filepath.Glob(glob)
 	for _, cf := range matches {
 		data, err := os.ReadFile(cf)
 		if err != nil {

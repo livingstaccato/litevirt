@@ -9,6 +9,7 @@ type Command struct {
 	ClusterUID, ProjectUID, PrincipalID, OwnerID string
 	ManagementKey, RequestID, ResourceUID        string
 	Session, Generation, ExpectedRevision        uint64
+	SessionID                                    string `json:"SessionID,omitempty"`
 	// Body is a versioned nonsecret JSON object. Reducers define typed fields
 	// and defaults; the codec rejects ambiguous JSON and canonicalizes values.
 	Body       []byte
@@ -23,12 +24,16 @@ type Command struct {
 }
 
 type Receipt struct {
+	// ResourceRevision is the opaque equality token for business resources.
+	// Legacy numeric Revision remains zero and retains old control encoding.
+	ResourceRevision                          string `json:"ResourceRevision,omitempty"`
 	RequestID, OperationID, ResourceUID, Code string
 	Sequence, Generation, Revision            uint64
 	State                                     string
 }
 
 type View struct {
+	ResourceRevision                                 string `json:"ResourceRevision,omitempty"`
 	ClusterUID, ResourceUID, Name, State, DomainUUID string
 	Generation, Revision, AppliedSequence            uint64
 	Retired                                          bool

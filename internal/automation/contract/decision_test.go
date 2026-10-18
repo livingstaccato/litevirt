@@ -34,3 +34,31 @@ func TestDecisionCompleteCanonicalBytes(t *testing.T) {
 		}
 	}
 }
+
+// Adding a client authority handle must not change any previously certified
+// control bytes, including the enclosing byte-slice encodings.
+func TestAutomationSessionHandlePreservesControlEncoding(t *testing.T) {
+	const old = `{"Version":1,"Decision":{"Sequence":1,"ParentDigest":"","Command":{"Kind":"initialize_cluster","ClusterUID":"","ProjectUID":"","PrincipalID":"host","OwnerID":"","ManagementKey":"","RequestID":"request","ResourceUID":"","Session":0,"Generation":0,"ExpectedRevision":0,"Body":"eyJ2ZXJzaW9uIjoxfQ==","Ciphertext":null,"SecretIntentTag":null,"SecretKeyEpoch":""},"Assignment":"eyJ2ZXJzaW9uIjoxLCJjbHVzdGVyX3VpZCI6ImNsdXN0ZXIiLCJvcGVyYXRpb25faWQiOiJvcCIsInJlY29yZGVkX2F0IjoiMjAyNi0xMC0xN1QwMDowMDowMFoifQ=="}}`
+	d, err := DecodeDecision([]byte(old))
+	if err != nil {
+		t.Fatal("old certified bytes no longer decode", err)
+	}
+	b, err := EncodeDecision(d)
+	if err != nil || string(b) != old {
+		t.Fatal("old certified control bytes changed", err)
+	}
+	before, err := CanonicalCommand(d.Command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Command.SessionID = "successor-session"
+	d.Command.Session = 42
+	after, err := CanonicalCommand(d.Command)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatal("authority handoff changed immutable request identity", err)
+	}
+	withSession, err := EncodeDecision(d)
+	if err != nil || bytes.Equal(b, withSession) {
+		t.Fatal("certified decision did not bind session handle", err)
+	}
+}

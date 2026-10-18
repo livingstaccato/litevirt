@@ -68,8 +68,47 @@ func (f *restartFleet) waitForAnswers(t *testing.T) {
 	})
 }
 
+// unservedGap holds d unanswered from its boot at booted for at least min,
+// and then until every observer has counted it failing past the fence
+// threshold, failing the test if d is fenced meanwhile. A count past the
+// threshold is what makes the gap a test: without it there is nothing for the
+// coordinator to fence on. An observer whose own process stalls discards the
+// count it had and counts nothing for health.StallGrace (health's stall
+// rule), so on a loaded host one can still be short of it at min; the gap
+// then runs on, up to max, which stays inside the coordinator's upgrading
+// allowance so a fence in it is still one before d served.
+func (f *restartFleet) unservedGap(t *testing.T, booted time.Time, min, max time.Duration, b hostboot.Boot) {
+	t.Helper()
+	past := 5 + 2
+	counted := func() (string, int, bool) {
+		for _, n := range f.observers {
+			if got, _, ok := observedFailures(n, f.d.Name); !ok || got < past {
+				return n.Name, got, false
+			}
+		}
+		return "", 0, true
+	}
+	for {
+		if fs := f.fences(); len(fs) != 0 {
+			t.Fatalf("d was fenced %s after its boot, before it served: %+v", fs[0].Sub(booted).Round(time.Millisecond), b)
+		}
+		el := time.Since(booted)
+		if el >= min {
+			name, got, ok := counted()
+			if ok {
+				return
+			}
+			if el >= max {
+				t.Fatalf("fixture: %s counted d failing %d times %s after its boot, want past the fence threshold",
+					name, got, el.Round(time.Millisecond))
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // TestFleet_UncleanRestartIsUpgradingUntilItServes: d's daemon crashes while d
-// is active and starts again at once. 30 s pass between its boot write and
+// is active and starts again at once. At least 30 s pass between its boot write and
 // its gRPC server answering — longer than the cluster takes to fence a host
 // that stops answering. d is 'upgrading' throughout and is not fenced; once it
 // serves it is recorded active and still not fenced.
@@ -86,42 +125,18 @@ func TestFleet_UncleanRestartIsUpgradingUntilItServes(t *testing.T) {
 		t.Errorf("boot after a crash decided %+v, want 'upgrading' until it serves", b)
 	}
 
-	for deadline := booted.Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
-		if fs := f.fences(); len(fs) != 0 {
-			t.Fatalf("d was fenced %s after its boot write, before it served: %+v",
-				fs[0].Sub(booted).Round(time.Millisecond), b)
-		}
-	}
-	past := 5 + 2
-	for _, n := range f.observers {
-		if got, _, ok := observedFailures(n, f.d.Name); !ok || got < past {
-			t.Fatalf("fixture: %s counted d failing %d times (ok=%v), want past the fence threshold", n.Name, got, ok)
-		}
-	}
-	// Anchor before answers are enabled: healthy rows record transitions,
-	// not every probe. A valid first answer can precede ConfirmServing below.
-	served := time.Now()
-	f.down.Store(false)
-	// Force that ordering so the later assertion cannot rely on another
-	// healthy-row write after confirmation; unchanged healthy rows need none.
-	eventually(t, time.Minute, "every observer to hear the serving daemon before confirmation", func() bool {
-		for _, n := range f.observers {
-			got, _, ok := observedFailures(n, f.d.Name)
-			if !ok || got != 0 {
-				return false
-			}
-		}
-		return true
-	})
+	f.unservedGap(t, booted, 30*time.Second, 90*time.Second, b)
+	served := f.answer()
+	f.waitForAnswers(t)
 	hostboot.Served(dir)
 	if b.AwaitServing {
 		if flipped, state, err := hostboot.ConfirmServing(ctx, f.d.DB, f.d.Name); err != nil || !flipped {
 			t.Fatalf("confirm serving: flipped=%v state=%q err=%v", flipped, state, err)
 		}
 	}
-	// Generous: under -race on a loaded host the observers' next probes and
-	// the confirm's replication have taken longer than convergeTimeout. What
-	// is asserted is that d is never fenced, not how fast it settles.
+	// Generous: what is asserted is that d is never fenced, not how fast it
+	// settles. (The timeouts this was raised for were the stamp, not the
+	// settling: see restartFleet.answer.)
 	eventually(t, time.Minute, "every observer to see d answer, and d active", func() bool {
 		for _, n := range f.observers {
 			if got, at, ok := observedFailures(n, f.d.Name); !ok || got != 0 || !at.After(served) {
@@ -181,12 +196,15 @@ func TestFleet_UncleanCrashLoopIsUpgradingOnce(t *testing.T) {
 	if b.State != "upgrading" || b.Deferred {
 		t.Fatalf("first boot after a crash decided %+v, want 'upgrading' written", b)
 	}
+	// The state and its since come from one read of the membership row. Read
+	// apart, the boot write could replicate between them: the since of the
+	// split pass's 'active' copy, then the 'upgrading' of the boot write.
 	var since time.Time
 	eventually(t, convergeTimeout, "the first boot write to reach the coordinator", func() bool {
-		at, ok, err := corrosion.HostStateSince(ctx, f.a.DB, f.d.Name)
-		h, herr := corrosion.GetHost(ctx, f.a.DB, f.d.Name)
-		since = at
-		return err == nil && ok && herr == nil && h != nil && h.State == "upgrading"
+		states, err := corrosion.HostsStateSince(ctx, f.a.DB)
+		s, ok := states[f.d.Name]
+		since = s.Since
+		return err == nil && ok && s.State == "upgrading"
 	})
 	time.Sleep(20 * time.Second) // it dies before serving; systemd starts it again
 	b, second := f.uncleanBoot(t, dir)
@@ -257,19 +275,8 @@ func TestFleet_UncleanBootOfAStaleUpgradingHostIsNotFencedBeforeItServes(t *test
 	if b.State != "upgrading" || !b.AwaitServing || b.Deferred || b.From != "upgrading" {
 		t.Errorf("unclean boot of a host stuck 'upgrading' decided %+v, want a fresh 'upgrading' written from upgrading", b)
 	}
-	for deadline := booted.Add(22 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
-		if fs := f.fences(); len(fs) != 0 {
-			t.Fatalf("d was fenced %s after its boot, before it served: %+v", fs[0].Sub(booted).Round(time.Millisecond), b)
-		}
-	}
-	past := 5 + 2
-	for _, n := range f.observers {
-		if got, _, ok := observedFailures(n, f.d.Name); !ok || got < past {
-			t.Fatalf("fixture: %s counted d failing %d times (ok=%v), want past the fence threshold", n.Name, got, ok)
-		}
-	}
-	served := time.Now()
-	f.down.Store(false)
+	f.unservedGap(t, booted, 22*time.Second, timeout-3*time.Second, b)
+	served := f.answer()
 	f.waitForAnswers(t)
 	if flipped, state, err := hostboot.ConfirmServing(ctx, f.d.DB, f.d.Name); err != nil || !flipped {
 		t.Fatalf("confirm serving: flipped=%v state=%q err=%v", flipped, state, err)
@@ -297,8 +304,8 @@ func TestFleet_UncleanBootOfAStaleUpgradingHostIsNotFencedBeforeItServes(t *test
 // That boot followed a daemon that never served and recorded node-5 'active'
 // 0.1 s in; it listened 23 s later, and node-2 SSH-fenced it after 16 s.
 //
-// Here the last boot keeps d 'upgrading', and d is not fenced through a 30 s
-// gap before it serves, nor after it serves and is recorded active with its
+// Here the last boot keeps d 'upgrading', and d is not fenced through a gap
+// of at least 30 s before it serves, nor after it serves and is recorded active with its
 // boot report.
 //
 // Mutation: return 'active' for a boot that follows a never-served one
@@ -318,19 +325,8 @@ func TestFleet_BootAfterAQuarantinedStopIsNotFencedBeforeItServes(t *testing.T) 
 	if b.State != "upgrading" || !b.AwaitServing || !b.Deferred {
 		t.Errorf("the boot after a quarantined stop decided %+v, want the recorded 'upgrading' kept until it serves", b)
 	}
-	for deadline := booted.Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
-		if fs := f.fences(); len(fs) != 0 {
-			t.Fatalf("d was fenced %s after its boot, before it served: %+v", fs[0].Sub(booted).Round(time.Millisecond), b)
-		}
-	}
-	past := 5 + 2
-	for _, n := range f.observers {
-		if got, _, ok := observedFailures(n, f.d.Name); !ok || got < past {
-			t.Fatalf("fixture: %s counted d failing %d times (ok=%v), want past the fence threshold", n.Name, got, ok)
-		}
-	}
-	served := time.Now()
-	f.down.Store(false)
+	f.unservedGap(t, booted, 30*time.Second, 90*time.Second, b)
+	served := f.answer()
 	f.waitForAnswers(t)
 	hostboot.Served(dir)
 	if b.Deferred {

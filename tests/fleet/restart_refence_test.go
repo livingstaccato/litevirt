@@ -70,7 +70,7 @@ func newRestartFleet(t *testing.T, seed int64, tune ...func(*failover.Coordinato
 	for _, n := range c.Nodes {
 		splitMembership(t, n)
 	}
-	c.WaitConverged(t, convergeTimeout)
+	settleByAntiEntropy(t, c, true)
 	for _, n := range f.observers {
 		ch := health.NewChecker(n.Name, n.PKIDir, n.DB)
 		// The daemon's readiness prober, reduced to the one fact this
@@ -145,6 +145,19 @@ func (f *restartFleet) fences() []time.Time {
 	return append([]time.Time(nil), f.fencedAt...)
 }
 
+// answer has d's probes answered from now on, and returns the moment before
+// they were: an observer verdict published after it was made on a probe d
+// answered. Stamped BEFORE the flip, not after it. An observer publishes a
+// healthy verdict once, when its verdict changes, and never republishes it
+// unchanged, so a verdict made between the flip and a later stamp (under load,
+// an observer probes while the test is still confirming d serving) is older
+// than the stamp for good, and a wait for one newer never ends.
+func (f *restartFleet) answer() time.Time {
+	at := time.Now()
+	f.down.Store(false)
+	return at
+}
+
 // restart takes d down as a graceful stop does — its SIGTERM records it
 // 'upgrading' — and waits until every observer has counted it failing past
 // the fence threshold, then makes the boot write that records it 'active'
@@ -208,8 +221,7 @@ func TestFleet_RestartedHostIsNotFencedBeforeItServes(t *testing.T) {
 	// lab 1 measured 3 s from the boot write to the gRPC listener on every
 	// one of the three re-fenced restarts.
 	time.Sleep(3 * time.Second)
-	f.down.Store(false)
-	served := time.Now()
+	served := f.answer()
 
 	eventually(t, convergeTimeout, "every observer to see d answer", func() bool {
 		for _, n := range f.observers {

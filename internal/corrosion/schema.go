@@ -551,7 +551,9 @@ import (
 // v71: inert receiver attempts, pending metadata and bounded transport inventory.
 // v72: inert per-source audit results, spool references and causal request indexes.
 // No active import, origin mode, replication or authority is introduced.
-const CurrentSchemaVersion = 72
+// v73: typed node-local automation identity and owner projections, isolated
+// by reconstruction stage. No replication or admission authority is introduced.
+const CurrentSchemaVersion = 73
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -2933,6 +2935,60 @@ var schemaDDL = []string{
 		cut_id TEXT NOT NULL, section INTEGER NOT NULL, ordinal INTEGER NOT NULL,
 		record BLOB NOT NULL, PRIMARY KEY(cut_id,section,ordinal)
 	)`,
+	`CREATE TABLE IF NOT EXISTS local_automation_identities (
+        stage TEXT NOT NULL, uid TEXT NOT NULL, cluster_uid TEXT NOT NULL,
+        project_uid TEXT NOT NULL, kind TEXT NOT NULL, alias TEXT NOT NULL,
+        witness TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation>0),
+        retired INTEGER NOT NULL CHECK(retired IN (0,1)),
+        PRIMARY KEY(stage,uid))`,
+	`CREATE TABLE IF NOT EXISTS local_automation_aliases (
+        stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, project_scope TEXT NOT NULL,
+        kind TEXT NOT NULL, alias TEXT NOT NULL, uid TEXT NOT NULL,
+        generation INTEGER NOT NULL CHECK(generation>0),
+        PRIMARY KEY(stage,cluster_uid,project_scope,kind,alias))`,
+	`CREATE TABLE IF NOT EXISTS local_automation_owners (
+        stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, project_uid TEXT NOT NULL,
+        owner_id TEXT NOT NULL, founder_principal_uid TEXT NOT NULL,
+        session_id TEXT NOT NULL, session_principal_uid TEXT NOT NULL,
+        activation INTEGER NOT NULL CHECK(activation>=0),
+        PRIMARY KEY(stage,cluster_uid,project_uid,owner_id))`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS automation_owner_session ON local_automation_owners(stage,session_id) WHERE session_id<>''`,
+	`CREATE TABLE IF NOT EXISTS local_automation_semantic_heads (
+        stage TEXT PRIMARY KEY, cluster_uid TEXT NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence>=0), digest TEXT NOT NULL)`,
+
+	`CREATE TABLE IF NOT EXISTS local_automation_resources (
+  stage TEXT NOT NULL, uid TEXT NOT NULL, cluster_uid TEXT NOT NULL,
+  project_uid TEXT NOT NULL, name TEXT NOT NULL, domain_uuid TEXT NOT NULL,
+  incarnation TEXT NOT NULL, owner_id TEXT NOT NULL, management_key TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL CHECK(binding_generation>=0),
+  revision TEXT NOT NULL CHECK(length(CAST(revision AS BLOB)) BETWEEN 1 AND 4096), retired INTEGER NOT NULL CHECK(retired IN (0,1)),
+  last_operation_id TEXT NOT NULL, original_operation_id TEXT NOT NULL,
+  applied_sequence INTEGER NOT NULL CHECK(applied_sequence>0), PRIMARY KEY(stage,uid))`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS automation_resource_live_name ON local_automation_resources(stage,cluster_uid,name) WHERE retired=0`,
+	`CREATE TABLE IF NOT EXISTS local_automation_names (
+  stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, name TEXT NOT NULL,
+  resource_uid TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation>0),
+  disposition TEXT NOT NULL CHECK(disposition IN ('reserved','live','reusable')),
+  retirement_operation_id TEXT NOT NULL, PRIMARY KEY(stage,cluster_uid,name))`,
+	`CREATE TABLE IF NOT EXISTS local_automation_bindings (
+  stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, project_uid TEXT NOT NULL,
+  owner_id TEXT NOT NULL, management_key TEXT NOT NULL,
+  creation_generation INTEGER NOT NULL CHECK(creation_generation>0),
+  resource_uid TEXT NOT NULL, operation_id TEXT NOT NULL,
+  revision TEXT NOT NULL CHECK(length(CAST(revision AS BLOB)) BETWEEN 1 AND 4096), retired INTEGER NOT NULL CHECK(retired IN (0,1)),
+  PRIMARY KEY(stage,cluster_uid,project_uid,owner_id,management_key,creation_generation))`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS automation_binding_active_uid ON local_automation_bindings(stage,resource_uid) WHERE retired=0`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS automation_binding_active_key ON local_automation_bindings(stage,cluster_uid,project_uid,owner_id,management_key) WHERE retired=0`,
+	`CREATE TABLE IF NOT EXISTS local_automation_admissions (
+  stage TEXT NOT NULL, operation_id TEXT NOT NULL, cluster_uid TEXT NOT NULL,
+  project_uid TEXT NOT NULL, owner_id TEXT NOT NULL, management_key TEXT NOT NULL,
+  resource_uid TEXT NOT NULL, request_id TEXT NOT NULL, principal_uid TEXT NOT NULL,
+  method TEXT NOT NULL, payload_id TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL CHECK(binding_generation>0),
+  admitted_generation INTEGER NOT NULL CHECK(admitted_generation>0),
+  sequence INTEGER NOT NULL CHECK(sequence>0), configuration_json TEXT NOT NULL,
+  PRIMARY KEY(stage,operation_id))`,
 	`CREATE TABLE IF NOT EXISTS local_automation_recovery (
 		id INTEGER PRIMARY KEY CHECK(id=1),sequence INTEGER NOT NULL,digest TEXT NOT NULL,
 		next_sequence INTEGER NOT NULL,next_digest TEXT NOT NULL,
@@ -3733,6 +3789,9 @@ var createTableUnits = []struct {
 	{68, "local_automation_requests"}, {68, "local_automation_recovery"}, {68, "local_automation_staging"},
 	{69, "local_automation_cuts"}, {69, "local_automation_cut_records"},
 	{70, "local_automation_source_jobs"}, {70, "local_automation_publications"},
+	{73, "local_automation_identities"}, {73, "local_automation_aliases"},
+	{73, "local_automation_owners"}, {73, "local_automation_semantic_heads"},
+	{73, "local_automation_resources"}, {73, "local_automation_names"}, {73, "local_automation_bindings"}, {73, "local_automation_admissions"},
 	{72, "local_automation_receiver_audits"},
 	{72, "local_automation_receiver_refs"},
 	{72, "local_automation_receiver_requests"},

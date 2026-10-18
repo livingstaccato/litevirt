@@ -243,7 +243,7 @@ func TestReservationRecovery_DeputyReleasesForRemovedHost(t *testing.T) {
 	for _, n := range c.Nodes {
 		splitMembership(t, n)
 	}
-	c.WaitConverged(t, convergeTimeout)
+	settleByAntiEntropy(t, c, true)
 	gone.Stop()
 	c.Kill(gone)
 	// Its owned ephemeral endpoint is stopped. Remove it from the seeded

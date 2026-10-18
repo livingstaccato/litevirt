@@ -18,6 +18,15 @@ import (
 // (tableNames, sensitiveTableNames, or here) so coverage can't silently drift
 // and tests can't overstate what anti-entropy actually repairs.
 var antiEntropyExcluded = map[string]string{
+	"local_automation_identities":     "v73 local derived projection; empty stage active, nonempty stage isolated; never replicated",
+	"local_automation_aliases":        "v73 local derived projection; empty stage active, nonempty stage isolated; never replicated",
+	"local_automation_owners":         "v73 local derived projection; empty stage active, nonempty stage isolated; never replicated",
+	"local_automation_semantic_heads": "v73 local derived projection; empty stage active, nonempty stage isolated; never replicated",
+	"local_automation_resources":      "v73 local derived projection; empty stage active, nonempty stage isolated; never replicated",
+	"local_automation_names":          "v73 local derived projection; empty stage active, nonempty stage isolated; never replicated",
+	"local_automation_bindings":       "v73 local derived projection; empty stage active, nonempty stage isolated; never replicated",
+	"local_automation_admissions":     "v73 local derived projection; empty stage active, nonempty stage isolated; never replicated",
+
 	// Coordination / local / transient — must not be full-state-merged.
 	"clock_skew":                            "per-node clock observations, GC'd locally",
 	"crl_versions":                          "per-host CRL version tracking (gossiped)",
@@ -74,6 +83,15 @@ var antiEntropyExcluded = map[string]string{
 // DB access, not the replicating Execute path). The updated_at→primary-key
 // invariant below doesn't apply to them.
 var localOnly = map[string]bool{
+	"local_automation_identities":     true,
+	"local_automation_aliases":        true,
+	"local_automation_owners":         true,
+	"local_automation_semantic_heads": true,
+	"local_automation_resources":      true,
+	"local_automation_names":          true,
+	"local_automation_bindings":       true,
+	"local_automation_admissions":     true,
+
 	"local_automation_receiver_audits":      true,
 	"local_automation_receiver_refs":        true,
 	"local_automation_receiver_requests":    true,

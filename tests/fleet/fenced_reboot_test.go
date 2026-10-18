@@ -62,8 +62,7 @@ func TestFleet_FencedHostPoweredBackOnIsNotFencedBeforeItServes(t *testing.T) {
 				fs[len(fs)-1].Sub(booted).Round(time.Millisecond), len(fs))
 		}
 	}
-	f.down.Store(false)
-	served := time.Now()
+	served := f.answer()
 	eventually(t, convergeTimeout, "every observer to see d answer", func() bool {
 		for _, n := range f.observers {
 			if got, at, ok := observedFailures(n, f.d.Name); !ok || got != 0 || !at.After(served) {

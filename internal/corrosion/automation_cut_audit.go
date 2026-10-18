@@ -8,10 +8,9 @@ import (
 	"github.com/litevirt/litevirt/internal/automation/contract"
 )
 
-// Re-run the EXISTING strict application/replay owner from genesis inside the
-// cut transaction. Retained receipts remain immutable and are compared by
-// automationApplyTx; no parallel reducer or caller-supplied trusted flag exists.
-// Any failure rolls back prefix repair AND every inert snapshot record.
+// Reconstruct with the existing typed reader, reducer and effect writer in an
+// isolated stage. Active projections, prefix and permanent receipts never
+// change during a source audit, including failed audits.
 func auditAutomationCutTx(ctx context.Context, tx *LocalTx, reduce AutomationReducer) (AutomationPrefix, error) {
 
 	rows, err := tx.Query(ctx, `SELECT id FROM local_automation_prefix WHERE sequence<0 OR (sequence=0 AND (cluster_uid<>'' OR digest<>'')) OR length(CAST(cluster_uid AS BLOB))>4096 OR length(CAST(digest AS BLOB))>64 LIMIT 1`)
@@ -39,7 +38,8 @@ func auditAutomationCutTx(ctx context.Context, tx *LocalTx, reduce AutomationRed
 	if len(rows) != 0 {
 		return old, fmt.Errorf("orphaned automation staging")
 	}
-	if _, err = tx.Exec(ctx, `DELETE FROM local_automation_prefix WHERE id=1`); err != nil {
+	const stage = "source-cut-audit"
+	if err = automationResetSemanticProjectionTx(ctx, tx, stage); err != nil {
 		return old, err
 	}
 	var head AutomationPrefix
@@ -74,13 +74,56 @@ func auditAutomationCutTx(ctx context.Context, tx *LocalTx, reduce AutomationRed
 		if err = auditAutomationCutAnchorTx(ctx, tx, row); err != nil {
 			return err
 		}
-		if _, err = automationApplyTx(ctx, tx, r, d, digest, reduce, automationApplicationProvenance{kind: automationAnchoredReplay}); err != nil {
-			return err
-		}
-		head, err = automationHeadTx(ctx, tx)
+		existing, err := automationRequestTx(ctx, tx, AutomationScope(d), d.Command.RequestID)
 		if err != nil {
 			return err
 		}
+		assignment, err := contract.DecodeAssignment(d)
+		if err != nil {
+			return err
+		}
+		operation, err := automationOperationTx(ctx, tx, assignment.OperationID)
+		if err != nil {
+			return err
+		}
+		projection := AutomationProjection{Head: head, Existing: existing, Operation: operation, ReplayOriginal: existing != nil && existing.Receipt.Sequence == d.Sequence}
+		if err = automationSemanticProjectionTx(ctx, tx, stage, &projection, d); err != nil {
+			return err
+		}
+		var receipt contract.Receipt
+		if err = receiverAuditJSON([]byte(row.String("receipt_json")), &receipt); err != nil {
+			return err
+		}
+		result, next, err := evaluateAutomationHistory(automationHistoryInput{Projection: projection, Value: r.Value, Digest: digest, Expected: &receipt})
+		if err != nil {
+			return err
+		}
+		if result.SaveRequest || projection.ReplayOriginal {
+			// Every original must already have immutable evidence. Rebuilding
+			// typed effects never manufactures a missing request. Check the
+			// stored operation column too; the request reader alone omits it.
+			supplied, err := tx.Query(ctx, `SELECT scope,request_id,operation_id,identity,receipt_json FROM local_automation_requests WHERE scope=? AND request_id=? LIMIT 1`, result.Scope, d.Command.RequestID)
+			if err != nil {
+				return err
+			}
+			if len(supplied) != 1 {
+				return fmt.Errorf("source original request missing")
+			}
+			if err := receiverCompareRequest(supplied[0], AutomationRequest{Identity: result.Identity, Receipt: result.Receipt}, d); err != nil {
+				return err
+			}
+		}
+		callback, err := reduce(cloneAutomationProjection(projection), d)
+		if err != nil {
+			return err
+		}
+		if err = validateAutomationCallback(result, callback); err != nil {
+			return err
+		}
+		if err = automationApplySemanticEffectsTx(ctx, tx, stage, head, next, result); err != nil {
+			return err
+		}
+		head = next
 		if old.Sequence == head.Sequence && old != head {
 			return fmt.Errorf("source prefix conflicts with retained history")
 		}
@@ -89,8 +132,8 @@ func auditAutomationCutTx(ctx context.Context, tx *LocalTx, reduce AutomationRed
 	if err != nil {
 		return old, err
 	}
-	if old.Sequence > head.Sequence {
-		return old, fmt.Errorf("source prefix history missing")
+	if old != head {
+		return old, fmt.Errorf("source prefix differs from complete retained history")
 	}
 	// An anchor with no history must not disappear from the declared baseline.
 	rows, err = tx.Query(ctx, `SELECT a.sequence FROM local_automation_anchors a LEFT JOIN local_automation_history h ON h.sequence=a.sequence WHERE h.sequence IS NULL LIMIT 1`)
@@ -102,6 +145,12 @@ func auditAutomationCutTx(ctx context.Context, tx *LocalTx, reduce AutomationRed
 	}
 	err = walkAutomationCutRows(ctx, tx, automationCutSections[4], func(row Row) error { return auditAutomationCutRequestTx(ctx, tx, row, head) })
 	if err != nil {
+		return old, err
+	}
+	if err := automationVerifySemanticStageTx(ctx, tx, stage); err != nil {
+		return old, err
+	}
+	if err := automationResetSemanticProjectionTx(ctx, tx, stage); err != nil {
 		return old, err
 	}
 	return head, nil

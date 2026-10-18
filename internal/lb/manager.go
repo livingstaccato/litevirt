@@ -27,6 +27,9 @@ type Manager struct {
 	runtime    ProcessRuntime
 	// Nil in production; observes actual ownership boundaries in private fixtures.
 	ownershipObservation func(operation, event string)
+	// procCmdlines, when set, replaces defaultProcCmdlines as the glob the
+	// keepalived sweep reads. Tests only.
+	procCmdlines string
 }
 
 // applyLocks serializes Apply/Remove per LB name. NewManager() is constructed
@@ -451,7 +454,7 @@ func (m *Manager) HasLB(name string) bool {
 	if _, err := os.Stat(cfgPath); err == nil {
 		return true
 	}
-	return len(keepalivedPidsForConfig(cfgPath)) > 0
+	return len(keepalivedPidsForConfig(m.cmdlineGlob(), cfgPath)) > 0
 }
 
 // SetBackendEnabled enables or disables a backend in HAProxy via its stats socket.

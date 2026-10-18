@@ -156,6 +156,10 @@ func receiverCompareRequest(row Row, expected AutomationRequest, d contract.Deci
 
 func (s receiverAuditStore) history(ctx context.Context) (AutomationPrefix, int64, error) {
 	var head AutomationPrefix
+	stage := "receiver-audit:" + s.id
+	if err := automationResetSemanticProjectionTx(ctx, s.tx, stage); err != nil {
+		return head, 0, err
+	}
 	var requests int64
 	err := s.walk(ctx, 5, func(ordinal int64, row Row) error {
 		if head.Sequence >= math.MaxInt64 || row.Int64("sequence") != int64(head.Sequence)+1 {
@@ -184,8 +188,15 @@ func (s receiverAuditStore) history(ctx context.Context) (AutomationPrefix, int6
 		if err != nil {
 			return err
 		}
-		result, next, err := evaluateAutomationHistory(automationHistoryInput{Projection: AutomationProjection{Head: head, Existing: existing, Operation: operation}, Value: value, Digest: row.String("digest"), Expected: &receipt})
+		projection := AutomationProjection{Head: head, Existing: existing, Operation: operation}
+		if err := automationSemanticProjectionTx(ctx, s.tx, stage, &projection, d); err != nil {
+			return err
+		}
+		result, next, err := evaluateAutomationHistory(automationHistoryInput{Projection: projection, Value: value, Digest: row.String("digest"), Expected: &receipt})
 		if err != nil {
+			return err
+		}
+		if err := automationApplySemanticEffectsTx(ctx, s.tx, stage, head, next, result); err != nil {
 			return err
 		}
 		if result.SaveRequest {

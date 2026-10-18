@@ -984,6 +984,8 @@ type Server struct {
 	// invFlights is the runtime inventory's libvirt single flight
 	// (runtime_inventory.go).
 	invFlights inventoryFlights
+	// invClock, when set, is the inventory's clock (invNow). Test seam only.
+	invClock func() time.Time
 	// liveStateCalls holds each live-state read of a local domain libvirt
 	// has not answered yet (vm_live_state.go); liveStateWait is how long a
 	// read waits for one (zero: defaultLiveStateWait).
@@ -1157,6 +1159,9 @@ type Server struct {
 	// streamRecheckEvery is how often an open user-authenticated stream
 	// re-checks its credential (stream_watch.go); 0 = StreamRecheckInterval.
 	streamRecheckEvery time.Duration
+	// streamClock, when set, is the stream watcher's clock (streamNow).
+	// Test seam only.
+	streamClock func() time.Time
 	// streamKick wakes every open stream's watcher to re-check now; replaced
 	// (closed) on each kick. Guarded by streamKickMu.
 	streamKickMu sync.Mutex

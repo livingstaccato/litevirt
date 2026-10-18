@@ -1039,8 +1039,6 @@ func (s *Server) doctorAcceptSource(ctx context.Context, m fwmig.Marker, req *pb
 	switch {
 	case m.Phase == fwmig.PhaseSourcePaused:
 		return s.doctorAcceptSourcePaused(ctx, m)
-	case m.Phase == fwmig.PhaseCleaning || from == fwmig.PhaseCleaning:
-		return "", doctorRefuse(m, action, "the source cleanup has begun, and the target's copy runs")
 	case m.Phase == fwmig.PhaseNvramUnconfirmed:
 		return "", doctorRefuse(m, action, "the guest runs on the target: --confirm-target-nvram, or --push-source-nvram once it is powered off")
 	case fwPreCutover(from):
@@ -1052,13 +1050,16 @@ func (s *Server) doctorAcceptSource(ctx context.Context, m fwmig.Marker, req *pb
 		if from != fwmig.PhaseCutover {
 			return "", doctorRefuse(m, action, "the source's final state is missing: --adopt-target-copy takes the target's")
 		}
-	case fwmig.PhaseTargetUnreachable, fwmig.PhaseDiscardPending, fwmig.PhaseCommitted, fwmig.PhaseReleased:
+	case fwmig.PhaseTargetUnreachable, fwmig.PhaseDiscardPending, fwmig.PhaseCommitted, fwmig.PhaseReleased, fwmig.PhaseCleaning:
+		// A stopped source cleanup (cleaning) is a released move: the
+		// target's copy is the committed one, and the source's state is
+		// still its own until the wipe (lab2-D2-proof F3).
 		if !fwPostCommit(from) {
 			return "", doctorRefuse(m, action, "it is retried each minute, and resolved by fence when the target is proved off")
 		}
 	default:
 		return "", doctorRefuse(m, action, "it takes source_paused, source_state_suspect, target_ran, the V6 park before the commit, "+
-			"or a committed move whose target is proved off or lost its held domain")
+			"or a committed move (its source cleanup stopped or not) whose target is proved off or lost its held domain")
 	}
 	if !req.GetAcknowledgeRollback() {
 		return "", doctorRefuse(m, action, fwAckReason(m)+": add --acknowledge-rollback")
@@ -1351,6 +1352,14 @@ func (s *Server) doctorAcceptSourceAfterCommit(ctx context.Context, m fwmig.Mark
 			return "", err
 		}
 	}
+	if m.Phase == fwmig.PhaseCleaning && !returned {
+		// The cleanup undefines the source's leftover definition before it
+		// wipes the state: without one, there is nothing here to start.
+		if _, err := s.virt.DomainIsActive(m.VM); lv.IsNoDomain(err) {
+			return "", doctorRefuse(m, action, fmt.Sprintf("the source cleanup already undefined the VM's domain on %s, so it cannot be started here; "+
+				"its firmware state is kept, and the VM's copy is on %s: bring %s back", s.hostName, m.Target, m.Target))
+		}
+	}
 	if err := s.requireSourceCopy(m, action); err != nil {
 		return "", err
 	}
@@ -1405,6 +1414,14 @@ func (s *Server) doctorAcceptSourceAfterCommit(ctx context.Context, m fwmig.Mark
 		switch {
 		case returned && h == nil:
 			// An earlier run's return landed; its DISCARD may have too.
+		case m.Phase == fwmig.PhaseCleaning:
+			// The target released the guest: its copy is the VM's.
+			dom := "not defined"
+			if td.GetPresent() {
+				dom = td.GetState()
+			}
+			return "", doctorRefuse(m, action, fmt.Sprintf("%s answers, and its domain of the VM is %s: the VM's copy is there, and the source cleanup is retried each minute; "+
+				"if %s must not take the VM, once it is powered off, `lv host fence-confirm %s`, and run this again", m.Target, dom, m.Target, m.Target))
 		case h == nil:
 			return "", doctorRefuse(m, action, fmt.Sprintf("%s holds no hold of the attempt, so its copy cannot be discarded through the move: "+
 				"once %s is powered off, `lv host fence-confirm %s`, and run this again", m.Target, m.Target, m.Target))

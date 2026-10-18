@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"errors"
 	"net"
 	"slices"
 	"sort"
@@ -16,8 +17,27 @@ type SecurityGroup struct {
 	ID        string
 	Name      string
 	StackName string
+	// Project owns the group; "" is a global group
+	// (docs/design/security-group-projects.md).
+	Project   string
 	CreatedAt string
 	UpdatedAt string
+}
+
+// ErrSGProjectsNotLatched refuses a project security group before
+// sg_projects_v1 has durably latched: its insert carries the project column,
+// which a previous-release peer cannot decode.
+var ErrSGProjectsNotLatched = errors.New("a project security group needs sg_projects_v1, which has not latched")
+
+// SetSGProjectsGate injects the predicate that permits writing a project
+// security group, wired to the durable sg_projects_v1 latch. Unset, it fails
+// closed.
+func (c *Client) SetSGProjectsGate(fn func() bool) { c.sgProjectsGate.Store(&fn) }
+
+// SGProjectsOn reports whether a project security group may be written here.
+func (c *Client) SGProjectsOn() bool {
+	fn := c.sgProjectsGate.Load()
+	return fn != nil && (*fn)()
 }
 
 // SGRule represents a security group rule.
@@ -32,11 +52,24 @@ type SGRule struct {
 	Priority  int
 }
 
-// InsertSecurityGroup creates a new security group.
+// InsertSecurityGroup creates a new security group. A global group (no
+// project) is written in the previous release's shape; a project group names
+// the project column and is refused until sg_projects_v1 has latched
+// (ErrSGProjectsNotLatched).
 func InsertSecurityGroup(ctx context.Context, c *Client, sg SecurityGroup) error {
 	now := c.NowTS()
 	if sg.CreatedAt == "" {
 		sg.CreatedAt = nowRFC3339() // created_at is wall/display, never the HLC key
+	}
+	if sg.Project != "" {
+		if !c.SGProjectsOn() {
+			return ErrSGProjectsNotLatched
+		}
+		return c.Execute(ctx,
+			`INSERT INTO security_groups (id, name, stack_name, project, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			sg.ID, sg.Name, sg.StackName, sg.Project, sg.CreatedAt, now,
+		)
 	}
 	return c.Execute(ctx,
 		`INSERT INTO security_groups (id, name, stack_name, created_at, updated_at)
@@ -48,7 +81,7 @@ func InsertSecurityGroup(ctx context.Context, c *Client, sg SecurityGroup) error
 // GetSecurityGroup returns a security group by ID.
 func GetSecurityGroup(ctx context.Context, c *Client, id string) (*SecurityGroup, error) {
 	rows, err := c.Query(ctx,
-		`SELECT id, name, stack_name, created_at, updated_at
+		`SELECT id, name, stack_name, project, created_at, updated_at
 		 FROM security_groups WHERE id = ? AND deleted_at IS NULL`, id)
 	if err != nil {
 		return nil, err
@@ -61,6 +94,7 @@ func GetSecurityGroup(ctx context.Context, c *Client, id string) (*SecurityGroup
 		ID:        r.String("id"),
 		Name:      r.String("name"),
 		StackName: r.String("stack_name"),
+		Project:   r.String("project"),
 		CreatedAt: r.String("created_at"),
 		UpdatedAt: r.String("updated_at"),
 	}, nil
@@ -68,7 +102,7 @@ func GetSecurityGroup(ctx context.Context, c *Client, id string) (*SecurityGroup
 
 // ListSecurityGroups returns all security groups, optionally filtered by stack.
 func ListSecurityGroups(ctx context.Context, c *Client, stackName string) ([]SecurityGroup, error) {
-	sql := `SELECT id, name, stack_name, created_at, updated_at
+	sql := `SELECT id, name, stack_name, project, created_at, updated_at
 		FROM security_groups WHERE deleted_at IS NULL`
 	var params []interface{}
 	if stackName != "" {
@@ -90,6 +124,7 @@ func ListSecurityGroups(ctx context.Context, c *Client, stackName string) ([]Sec
 			ID:        r.String("id"),
 			Name:      r.String("name"),
 			StackName: r.String("stack_name"),
+			Project:   r.String("project"),
 			CreatedAt: r.String("created_at"),
 			UpdatedAt: r.String("updated_at"),
 		}

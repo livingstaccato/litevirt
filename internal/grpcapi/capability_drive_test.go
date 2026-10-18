@@ -124,6 +124,9 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// when it latches; a feature is opened only through WithFeature,
 		// which records the use first.
 		capabilities.Release202611V1: true,
+		// sg_projects_v1: "this build decodes security_groups.project and
+		// keeps a workload off another project's group".
+		capabilities.SGProjectsV1: true,
 	}
 
 	// Cross-check the hand-written list against the ONE declaration, so adding a

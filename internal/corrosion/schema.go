@@ -552,7 +552,17 @@ import (
 //	     its WAL entries. Existing rows migrate with no retirement, so a
 //	     tombstone from before the upgrade still beats a password set after
 //	     it (docs/migration-failover.md). Additive.
-const CurrentSchemaVersion = 68
+//	v80: security_groups.project (TEXT NOT NULL DEFAULT '') — the project that
+//	     owns a security group; '' is a global group, which every existing
+//	     group migrates as (docs/design/security-group-projects.md). Only a
+//	     project group's insert names the column, and nothing writes one until
+//	     sg_projects_v1 has durably latched (ReplicationGated), so a
+//	     previous-release peer never sees that shape; a global group keeps the
+//	     previous insert. Appended LAST for the v53 digest reason. Additive.
+const CurrentSchemaVersion = 80
+
+// schemaVersionSGProjects is the version security_groups.project was added in.
+const schemaVersionSGProjects = 80
 
 // schemaVersionCredentialRetirement is the version
 // host_fence_credentials.after_retirement was added in.
@@ -2276,7 +2286,9 @@ var schemaDDL = []string{
 		stack_name  TEXT,
 		created_at  TEXT NOT NULL,
 		updated_at  TEXT NOT NULL,
-		deleted_at  TEXT
+		deleted_at  TEXT,
+		-- project (v80) is LAST, for the v53 digest reason; '' = global.
+		project     TEXT NOT NULL DEFAULT ''
 	)`,
 
 	// idempotency_keys (v39): records a mutating RPC keyed by a client-supplied
@@ -3490,6 +3502,9 @@ var schemaMigrations = []string{
 	// The retirement a live fence credential was set after (see History,
 	// schemaVersionCredentialRetirement).
 	`ALTER TABLE host_fence_credentials ADD COLUMN after_retirement TEXT NOT NULL DEFAULT ''`,
+	// The project that owns a security group; '' = global (see History,
+	// schemaVersionSGProjects).
+	`ALTER TABLE security_groups ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -3583,6 +3598,7 @@ var alterVersions = []int{
 	54,                                // runtime_action_proofs.lease_key
 	60,                                // runtime_action_proofs.claim_certificate
 	schemaVersionCredentialRetirement, // host_fence_credentials.after_retirement
+	schemaVersionSGProjects,           // security_groups.project
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

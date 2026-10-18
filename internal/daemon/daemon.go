@@ -3764,6 +3764,7 @@ func (d *Daemon) wireCorrosionGates() {
 	d.wireVoterConfigGate()
 	d.wireRecoveryClaimGate()
 	d.wireSpecConflictGate()
+	d.wireSGProjectsGate()
 }
 
 // wireSpecConflictGate tells corrosion when spec_conflict_v1 has DURABLY
@@ -3970,4 +3971,14 @@ func fileRestoreRunDir(dataDir string) string {
 		return "/run/litevirt/file-restore"
 	}
 	return filepath.Join(dataDir, "file-restore", "run")
+}
+
+// wireSGProjectsGate lets corrosion write a project security group only once
+// sg_projects_v1 is DURABLY latched. The token is replication-gated, so the
+// latch proves every host this one replicates to decodes the project column;
+// unwired, the gate fails closed and only global groups can be created.
+func (d *Daemon) wireSGProjectsGate() {
+	d.db.SetSGProjectsGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.SGProjectsV1)
+	})
 }

@@ -227,8 +227,8 @@ func TestAutomationSchema73UpgradeAndSourceColumns(t *testing.T) {
 	if err := InitSchema(ctx, a.c); err != nil {
 		t.Fatal("schema72->73", err)
 	}
-	if storedVersion(t, a.c) != 73 {
-		t.Fatal("upgrade did not reach73")
+	if storedVersion(t, a.c) != CurrentSchemaVersion {
+		t.Fatal("typed schema73 upgrade did not reach current version")
 	}
 	if err := a.c.ExecuteLocal(ctx, func(tx *LocalTx) error { return automationVerifySemanticSchemaTx(ctx, tx) }); err != nil {
 		t.Fatal(err)

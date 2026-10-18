@@ -20,7 +20,7 @@ const automationCutCodec = 1
 
 // Deliberately independent of CurrentSchemaVersion: new provenance requires an
 // explicit inventory review. A future live schema cannot relabel an old cut.
-const automationCutSourceSchema = 73
+const automationCutSourceSchema = 74
 
 // Explicit source descriptors: 69/1 retains its original inventory and root.
 // 70/1 adds only outgoing job pins/publication wrappers/public trust evidence,
@@ -32,9 +32,14 @@ const automationCutSourceSchema = 73
 // 73/1 adds eight local derived projections: stage="" is active, nonempty
 // stages are isolated audit state. All are reconstructed from the unchanged
 // certified history inventory; no projection row confers import authority.
-// Future active import receipts need a new inventory and provenance audit.
+// 74/1 adds only originating local lifetime observations and private credential
+// issuance observations. Both tables and their fifteen invalidate-only triggers
+// are excluded: they cannot establish cross-node lifecycle or credential proof.
+// Credential digests are never public cut content or certified identity facts.
+// Future lifecycle source-proof transfer and active import receipts require a
+// new inventory and provenance audit; accepting74 does not provide that proof.
 func supportedAutomationCutDescriptor(schema, codec int) bool {
-	return codec == 1 && (schema == 69 || schema == 70 || schema == 71 || schema == 72 || schema == 73)
+	return codec == 1 && (schema == 69 || schema == 70 || schema == 71 || schema == 72 || schema == 73 || schema == 74)
 }
 
 type automationCutInventory struct {

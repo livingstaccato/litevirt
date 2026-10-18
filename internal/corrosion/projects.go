@@ -51,10 +51,8 @@ func InsertProject(ctx context.Context, c *Client, p ProjectRecord) error {
 		}
 	}
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`INSERT INTO projects (name, display, parent_name, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?)`,
-		p.Name, p.Display, p.ParentName, nowRFC3339(), now)
+	return c.executeLifecycleBatch(ctx, []Statement{{SQL: `INSERT INTO projects (name, display, parent_name, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?)`, Params: []interface{}{p.Name, p.Display, p.ParentName, nowRFC3339(), now}}}, "project", p.Name, "birth")
 }
 
 // GetProject returns the project by name (canonical path) or nil if
@@ -148,9 +146,7 @@ func DeleteProject(ctx context.Context, c *Client, name string) error {
 		return fmt.Errorf("retire project authority: %w", err)
 	}
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE projects SET deleted_at = ?, updated_at = ? WHERE name = ?`,
-		nowRFC3339(), now, name)
+	return c.executeLifecycleBatch(ctx, []Statement{{SQL: `UPDATE projects SET deleted_at = ?, updated_at = ? WHERE name = ?`, Params: []interface{}{nowRFC3339(), now, name}}}, "project", name, "retire")
 }
 
 // UpsertProjectQuota writes a quota row for the project. Zero in

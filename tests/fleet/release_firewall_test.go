@@ -12,6 +12,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/firewall"
 )
 
 // TestFleet_ReleaseSwitch_FirewallFeatures (merge checklist M8) runs the
@@ -112,3 +113,59 @@ func (g grantAllGate) WithFeature(ctx context.Context, f capabilities.Feature,
 }
 
 func (g grantAllGate) FeatureAvailable(capabilities.Feature) bool { return !g.lagging }
+
+// TestFleet_Synflood_RefusedUntilEveryHostRunsThisBuild (spec §1.6, §1.7):
+// while one host is on the previous build (WAL-quarantined, advertising
+// nothing) `lv firewall synflood on` is refused with the release text and
+// nothing is written anywhere. Once every host runs this build it is
+// accepted, and every node's firewall plan carries the policy: the cluster's
+// on every host, and a host's own off on that host alone.
+//
+// Mutation: write before the latch (skip WithReleaseFeature) — the first
+// write is accepted: red.
+func TestFleet_Synflood_RefusedUntilEveryHostRunsThisBuild(t *testing.T) {
+	ctx := context.Background()
+	c, _ := latchedFleet(t, 3, 1161)
+	a, b, old := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	cl := c.SelfClient(a)
+	on := &pb.SetFirewallSynfloodRequest{Mode: "on", Rate: 300, Burst: 1500}
+
+	old.Server.SetWALQuarantined(func() bool { return true }) // the previous build
+	_, err := cl.SetFirewallSynflood(ctx, on)
+	if status.Code(err) != codes.FailedPrecondition ||
+		!strings.Contains(err.Error(), "the cluster upgrade must finish first (firewall_synflood needs "+capabilities.ReleaseToken+")") {
+		t.Fatalf("synflood on mid-roll: %v, want the release refusal", err)
+	}
+	for _, n := range c.Nodes {
+		if _, recorded, err := corrosion.GetFirewallSynflood(ctx, n.DB, ""); err != nil || recorded {
+			t.Fatalf("%s holds a SYN-flood row (%v) although the write was refused", n.Name, err)
+		}
+		if featureUsedOn(t, n, capabilities.ReleaseToken, "firewall_synflood") {
+			t.Fatalf("%s holds a firewall_synflood use although the write was refused", n.Name)
+		}
+	}
+
+	old.Server.SetWALQuarantined(old.DB.WALQuarantined) // every host on this build
+	eventually(t, 10*time.Second, "synflood on to be accepted on a uniform fleet", func() bool {
+		_, err = cl.SetFirewallSynflood(ctx, on)
+		return err == nil
+	})
+	if _, err := cl.SetFirewallSynflood(ctx, &pb.SetFirewallSynfloodRequest{Scope: b.Name, Mode: "off"}); err != nil {
+		t.Fatalf("synflood off --scope %s: %v", b.Name, err)
+	}
+	want := map[string]firewall.SynFlood{a.Name: {On: true, Rate: 300, Burst: 1500}, b.Name: {}, old.Name: {On: true, Rate: 300, Burst: 1500}}
+	for _, n := range c.Nodes {
+		eventually(t, 15*time.Second, "both SYN-flood rows to reach "+n.Name, func() bool {
+			_, cl, _ := corrosion.GetFirewallSynflood(ctx, n.DB, "")
+			_, host, _ := corrosion.GetFirewallSynflood(ctx, n.DB, b.Name)
+			return cl && host
+		})
+		plan, err := firewall.CorrosionPlanLoader(n.DB, n.Name, firewall.Plan{}, firewall.LoaderOptions{})(ctx)
+		if err != nil || plan.SynFlood != want[n.Name] {
+			t.Errorf("%s's plan carries SYN-flood %+v (%v), want %+v", n.Name, plan.SynFlood, err, want[n.Name])
+		}
+		if !featureUsedOn(t, n, capabilities.ReleaseToken, "firewall_synflood") {
+			t.Errorf("%s does not hold the firewall_synflood use although the policy was written", n.Name)
+		}
+	}
+}

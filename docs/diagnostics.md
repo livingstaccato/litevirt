@@ -2064,9 +2064,14 @@ server run.
 |---|---|
 | At start or at runtime, the host's own row is live and names a serial other than the installed certificate's (evidence `arm` `a`), or is removed (`arm` `b`). Re-raised once a minute while held. **Warning**. The evidence carries `reason` (`at_start`; `superseded`: another admission replaced the row; `removed`), `held_for`, `timed_out`, `installed_serial` and `recorded_serial`. | The host's own row is live and names the installed certificate's serial. |
 
-After ten minutes the hold reports `timed_out` and the daemon makes the writes
-it made before the hold existed. A cluster that holds a later incarnation of
-the row refuses them.
+A host whose installed certificate renewed the recorded one (`lv host
+renew-cert`, live or while the host was down) is not held: it records the new
+serial at once.
+
+A hold raised at start over a row at incarnation 0 reports `timed_out` after
+ten minutes, and the daemon then makes the writes the previous release makes.
+A hold over a row at incarnation 1 or higher, and a hold raised at runtime
+(`superseded`, `removed`), never times out.
 
 **`reason` `at_start`** is a host re-added while its data directory still held
 its old database, or a host whose certificate was renewed while it was down.

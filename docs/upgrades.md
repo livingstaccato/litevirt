@@ -1267,9 +1267,12 @@ cluster since it started, `lv host rm`, `lv host config`, `lv host label`,
 `lv host drain`, `lv host undrain` and `lv host isolate` are refused; `lv host
 fence` is not, and its result names the incarnation, serial, strategy and BMC
 it fenced through. A daemon whose own row names another certificate than the
-one installed, or whose own row is removed, makes no write to that row until
-the cluster's row for its certificate reaches it, for at most ten minutes
+one installed (and not its renewal), or whose own row is removed, makes no
+write to that row until the cluster's row for its certificate reaches it
 (`own_row_held`, [diagnostics.md](diagnostics.md#own-row-held-own_row_held)).
+An `lv host add` of a host removed at incarnation 0 that cannot use
+`host_incarnation` at that moment (a host has not acknowledged its first use
+yet) re-admits the host as the previous release does, and prints why.
 
 The re-added host publishes a missing capability label again (`litevirt.lxc`,
 `litevirt.tpm`, `litevirt.secureboot`) within a minute of the re-admitted row

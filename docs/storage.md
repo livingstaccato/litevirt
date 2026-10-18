@@ -1505,8 +1505,9 @@ pivoted, a start there points the disk record at the destination on a shared poo
 hosts define alike; when no pivot was recorded, it is refused whichever file the disk
 record names, since the record commit and the pivot may have happened before the holding
 host stopped. A refused VM whose holding host is gone is released with `lv health resolve
-vm.move_unresolved vm/<vm> --reason "…" [--accept <path>]` once that host is proven
-powered off (docs/diagnostics.md).
+vm.move_unresolved vm/<vm> --reason "…" --accept <path>`, naming the file to keep of each
+such disk, once that host is proven powered off; `lv health` lists each move's files
+first (docs/diagnostics.md).
 
 > **Note:** `lv replicate-volume` copies a shut-off VM's disk plainly and a
 > running or paused one point-in-time — through a full backup session, or an

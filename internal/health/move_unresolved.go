@@ -89,6 +89,9 @@ func moveInFlight(vm, disk string) bool {
 	return ok
 }
 
+// MoveInFlight reports whether this process is moving vm's disk.
+func MoveInFlight(vm, disk string) bool { return moveInFlight(vm, disk) }
+
 // RecordUnresolvedMove durably records m, replacing an earlier record of the
 // same disk.
 func RecordUnresolvedMove(dataDir string, m UnresolvedMove) error {
@@ -174,8 +177,12 @@ func UnresolvedMovesOf(dataDir, vm string) ([]UnresolvedMove, error) {
 	return out, nil
 }
 
-// movedDiskNames reports which of m's two files the domain definition names
+// MovedDiskNames reports which of m's two files the domain definition names
 // for the disk, by the rule the move's own cutover uses.
+func MovedDiskNames(domXML string, m UnresolvedMove) (string, error) {
+	return movedDiskNames(domXML, m)
+}
+
 func movedDiskNames(domXML string, m UnresolvedMove) (string, error) {
 	_, changed, err := lv.RewriteDiskSource(domXML, m.TargetDev, m.Src, m.Dst)
 	if err != nil {
@@ -266,13 +273,39 @@ func resolveCmd(vm string) string {
 	return fmt.Sprintf("lv health resolve %s vm/%s --reason \"…\"", MoveUnresolvedCode, vm)
 }
 
+// resolveAcceptCmd is resolveCmd naming the file to keep (path, or a
+// placeholder when it is the operator's to choose).
+func resolveAcceptCmd(vm, path string) string {
+	if path == "" {
+		path = "<file to keep>"
+	}
+	return fmt.Sprintf("lv health resolve %s vm/%s --accept %s --reason \"…\"", MoveUnresolvedCode, vm, path)
+}
+
+// provedOffText says what proves a holder powered off for a hand resolution
+// from another host.
+func provedOffText(host string) string {
+	return fmt.Sprintf("proven powered off (an IPMI fence, or `lv host fence-confirm %s`)", host)
+}
+
+// chooseText says how an operator tells which of a live move's files holds
+// the guest's last writes when no pivot was recorded: nothing in the cluster
+// knows.
+func chooseText(holder string, m UnresolvedMove) string {
+	return fmt.Sprintf("Nothing in the cluster records which of %s and %s holds the guest's last writes: judge it from "+
+		"%s's persistent config (virsh dumpxml --inactive %s there, if it boots) or from the two files themselves "+
+		"(the later modification time, `qemu-img compare %s %s`); `lv health` lists the move", m.Src, m.Dst, holder, m.VM, m.Src, m.Dst)
+}
+
 // The replicated twin of the host-local records: one health condition per VM
 // whose evidence lists the host that holds the records and the records, so a
 // host that does not hold them (a failover onto shared storage) honours them
 // too. Raised and updated only by the host holding the records; resolved by
 // it, by the VM's owner once every move is proven settled, by an admin
-// (`lv health resolve`, once the holding host is fenced or gone), and for
-// every host when the VM is deleted or a new VM takes its name.
+// (`lv health resolve`: on the holding host, or from another once the holding
+// host is proven powered off, naming with --accept the file to keep of every
+// move not proven settled), and for every host when the VM is deleted or a
+// new VM takes its name.
 const (
 	MoveUnresolvedEvaluator = "move_volume"
 	MoveUnresolvedCode      = "vm.move_unresolved"
@@ -283,6 +316,50 @@ const (
 type MoveUnresolvedEvidence struct {
 	Host  string           `json:"host"`
 	Moves []UnresolvedMove `json:"moves"`
+	// Hand marks a condition an admin resolved by hand (`lv health resolve`):
+	// a record of one of its moves that the holder still keeps (it was away)
+	// is settled by that decision, not raised again.
+	Hand bool `json:"hand,omitempty"`
+}
+
+// handSettled drops the records among moves that a hand resolution of vm's
+// condition (row, resolved) settled while this host was away: the same disk,
+// files and record time, no move of the disk in flight here, and the VM owned
+// by another host (or gone). It returns the rest: on the VM's owner a record
+// is kept for its own settle, which makes its persistent config and the disk
+// row agree before its domain boots.
+func handSettled(ctx context.Context, db *corrosion.Client, host string, row corrosion.HealthCondition, dataDir, vm string, moves []UnresolvedMove) []UnresolvedMove {
+	if row.Lifecycle != corrosion.ConditionResolved || len(moves) == 0 {
+		return moves
+	}
+	var ev MoveUnresolvedEvidence
+	if json.Unmarshal([]byte(row.Evidence), &ev) != nil || !ev.Hand {
+		return moves
+	}
+	if rec, err := corrosion.GetVM(ctx, db, vm); err != nil || (rec != nil && rec.HostName == host) {
+		return moves
+	}
+	out := moves[:0:0]
+	for _, m := range moves {
+		decided := false
+		for _, e := range ev.Moves {
+			if e.Disk == m.Disk && e.Src == m.Src && e.Dst == m.Dst && e.At == m.At {
+				decided = true
+			}
+		}
+		if !decided || moveInFlight(vm, m.Disk) {
+			out = append(out, m)
+			continue
+		}
+		if err := ClearUnresolvedMove(dataDir, vm, m.Disk); err != nil {
+			slog.Warn("move-volume record: dropping a record an admin resolved by hand failed", "vm", vm, "disk", m.Disk, "error", err)
+			out = append(out, m)
+			continue
+		}
+		slog.Info("move-volume record: an admin resolved this move by hand while this host was away; record dropped",
+			"vm", vm, "disk", m.Disk, "src", m.Src, "dst", m.Dst)
+	}
+	return out
 }
 
 // OpenMoveCondition reads vm's open condition. A condition whose evidence
@@ -323,6 +400,10 @@ func complete(m UnresolvedMove) (path string, proven bool) {
 		return "", true
 	}
 }
+
+// MoveCompleteFile is complete for another package: the file of m that holds
+// every acknowledged write, and whether that is proven ("" and proven: both).
+func MoveCompleteFile(m UnresolvedMove) (string, bool) { return complete(m) }
 
 // entrySettled reports whether a recorded move no longer needs honouring:
 // its VM, its disk row or both its files are gone from the row, or the row
@@ -368,13 +449,17 @@ func PublishUnresolvedMoves(ctx context.Context, db *corrosion.Client, dataDir, 
 		}
 		return err
 	}
+	if !open {
+		moves = handSettled(ctx, db, host, row, dataDir, vm, moves)
+	}
 	if open && ev.Host != host {
 		if len(moves) == 0 {
 			return nil
 		}
 		return &MoveUnresolvedError{VM: vm, Detail: fmt.Sprintf("%s: %s holds an unresolved volume move of this VM "+
-			"(%s); it is settled there, by a start of the VM on its new owner, or by `%s` once %s is fenced or removed",
-			vm, ev.Host, MoveUnresolvedCode, resolveCmd(vm), ev.Host)}
+			"(%s); it is settled there, by a start of the VM on its new owner, or by `%s` run against %s (LV_HOST=%s), "+
+			"or from another host once %s is %s",
+			vm, ev.Host, MoveUnresolvedCode, resolveAcceptCmd(vm, ""), ev.Host, ev.Host, ev.Host, provedOffText(ev.Host))}
 	}
 	keep := append([]UnresolvedMove(nil), moves...)
 	if open {
@@ -495,6 +580,9 @@ func ResolveUnresolvedMoves(ctx context.Context, db *corrosion.Client, dataDir, 
 	moves, err := UnresolvedMovesOf(dataDir, vm)
 	if err != nil {
 		return &MoveUnresolvedError{VM: vm, Detail: fmt.Sprintf("%s: read this host's unresolved volume moves: %v", vm, err)}
+	}
+	if row, _, open, cerr := OpenMoveCondition(ctx, db, vm); cerr == nil && !open {
+		moves = handSettled(ctx, db, host, row, dataDir, vm, moves)
 	}
 	// Disks settled here, or still recorded here, are this host's to honour;
 	// a record dropped only because the VM's row names another host is
@@ -620,8 +708,9 @@ func resolveUnresolvedMove(ctx context.Context, db *corrosion.Client, dataDir, h
 		if dom.missing() {
 			return false, refuse(m, false, "%s: a volume move of its disk %s did not finish, and %s has no domain %s to read its "+
 				"persistent config from (%v); the disk row names %s and both files (%s, %s) are kept. A start rebuilds the "+
-				"domain from the disk row, so it boots %s: if that is the file to keep, `%s` (on %s) and retry",
-				m.VM, m.Disk, host, m.VM, xerr, row.Path, m.Src, m.Dst, row.Path, resolveCmd(m.VM), host)
+				"domain from the disk row, so it boots %s. Operator: name the file that holds the guest's last writes, "+
+				"`%s` (on %s), and retry",
+				m.VM, m.Disk, host, m.VM, xerr, row.Path, m.Src, m.Dst, row.Path, resolveAcceptCmd(m.VM, ""), host)
 		}
 		return false, refuse(m, false, "%s: a volume move of its disk %s did not finish, and its persistent config could not be read or "+
 			"names neither %s nor %s (%v); the disk row names %s and both files are kept. Operator: make the config "+
@@ -643,8 +732,8 @@ func resolveUnresolvedMove(ctx context.Context, db *corrosion.Client, dataDir, h
 				"block-copy mirror kept %s current, and it stopped before a pivot, so %s may lack its last writes; the "+
 				"persistent config names %s and the disk row %s; both files are kept. Operator: point the disk's source in "+
 				"the persistent config back at %s (virsh edit %s) and retry. Only if the guest was pivoted onto %s before "+
-				"it stopped is %s complete: then `%s` and retry",
-				m.VM, m.Disk, m.Src, m.Dst, m.Dst, m.Dst, row.Path, m.Src, m.VM, m.Dst, m.Dst, resolveCmd(m.VM))
+				"it stopped is %s complete: then `%s` (on %s) and retry",
+				m.VM, m.Disk, m.Src, m.Dst, m.Dst, m.Dst, row.Path, m.Src, m.VM, m.Dst, m.Dst, resolveAcceptCmd(m.VM, m.Dst), host)
 		}
 		path, typ, pool = m.Dst, m.DstType, m.DstPool
 	} else if m.Pivoted || m.CatchUp {
@@ -679,8 +768,18 @@ func resolveRemoteMove(ctx context.Context, db *corrosion.Client, dataDir, host,
 	if vmRec == nil || row == nil || (row.Path != m.Src && row.Path != m.Dst) {
 		return nil
 	}
-	exit := fmt.Sprintf("Operator: settle it on %s (start the VM or retry `lv move-volume %s %s %s` there), or, once %s is fenced or "+
-		"removed, `%s`; a start then boots the file the disk row names", origin, m.VM, m.Disk, m.DstPool, origin, resolveCmd(m.VM))
+	// exit names the file to keep when it is proven (keep), and how to
+	// choose it when it is not.
+	exit := func(keep string) string {
+		x := fmt.Sprintf("Operator: settle it on %s (start the VM or retry `lv move-volume %s %s %s` there, or run `%s` against "+
+			"it, LV_HOST=%s, also once it has rejoined after the VM failed over), or, once %s is %s, run `%s` here",
+			origin, m.VM, m.Disk, m.DstPool, resolveAcceptCmd(m.VM, keep), origin, origin, provedOffText(origin),
+			resolveAcceptCmd(m.VM, keep))
+		if keep == "" {
+			x += ". " + chooseText(origin, m)
+		}
+		return x
+	}
 	switch {
 	case m.Pivoted || m.CatchUp:
 		if row.Path == m.Dst {
@@ -693,7 +792,7 @@ func resolveRemoteMove(ctx context.Context, db *corrosion.Client, dataDir, host,
 		}
 		return refuse(m, false, "%s: a volume move of its disk %s on %s did not finish: the guest was moved onto %s, but the "+
 			"disk row names %s, which lacks the writes made since, and %s is not on a shared pool %s mounts. %s",
-			m.VM, m.Disk, origin, m.Dst, row.Path, m.Dst, host, exit)
+			m.VM, m.Disk, origin, m.Dst, row.Path, m.Dst, host, exit(m.Dst))
 	case m.Live:
 		// Whatever the row names: the commit is a local write that replicates
 		// later and the pivot follows it, so a row on the source proves no
@@ -701,7 +800,7 @@ func resolveRemoteMove(ctx context.Context, db *corrosion.Client, dataDir, host,
 		// persistent config.
 		return refuse(m, false, "%s: a live volume move of its disk %s on %s did not finish, and the disk row names %s; "+
 			"whether the guest was pivoted onto %s before %s stopped is not known here, so either %s or %s may hold its "+
-			"last writes. %s", m.VM, m.Disk, origin, row.Path, m.Dst, origin, m.Src, m.Dst, exit)
+			"last writes. %s", m.VM, m.Disk, origin, row.Path, m.Dst, origin, m.Src, m.Dst, exit(""))
 	default:
 		return nil
 	}
@@ -709,9 +808,13 @@ func resolveRemoteMove(ctx context.Context, db *corrosion.Client, dataDir, host,
 
 // SharedPoolHolds reports whether path, a file origin wrote in its pool
 // (of driver typ), is the same file on this host: typ is a shared driver;
-// origin's pool and this host's pool of that name are both shared and name the
-// same export (Source) or, without one, the same Target; the path lies in this
-// host's pool directory; and it is a regular file, not a symlink.
+// origin's pool and this host's pool of that name are both shared, name the
+// same export (Source) and are mounted at the same directory, so a path below
+// it is the same file of that export on both; the path lies below that
+// directory; the directory holds the export now (an nfs pool: the path is on
+// an NFS mount of that export, at the same place below it; another driver:
+// the directory is a mount point), not an empty mount point; and the path is a
+// regular file, not a symlink.
 func SharedPoolHolds(ctx context.Context, db *corrosion.Client, dataDir, host, origin, pool, typ, path string) bool {
 	if pool == "" || !corrosion.DiskIsShared(corrosion.DiskRecord{StorageType: typ}) {
 		return false
@@ -720,30 +823,62 @@ func SharedPoolHolds(ctx context.Context, db *corrosion.Client, dataDir, host, o
 	if err != nil || !ok || !corrosion.DiskIsShared(corrosion.DiskRecord{StorageType: p.Driver}) {
 		return false
 	}
+	dir := sharedPoolDir(dataDir, p)
 	if origin != host {
 		o, ok, err := corrosion.GetStoragePool(ctx, db, origin, pool)
 		if err != nil || !ok || !corrosion.DiskIsShared(corrosion.DiskRecord{StorageType: o.Driver}) {
 			return false
 		}
-		if o.Source != p.Source || (p.Source == "" && o.Target != p.Target) {
+		if o.Source != p.Source || sharedPoolDir(dataDir, o) != dir {
 			return false
 		}
 	}
-	var dirs []string
-	if p.Target != "" {
-		dirs = append(dirs, p.Target)
-	} else if p.Source != "" {
-		dirs = append(dirs, filepath.Join(dataDir, "mounts", storage.NFSMountName(p.Source)),
-			filepath.Join(dataDir, "mounts", strings.NewReplacer("/", "_", ":", "_").Replace(p.Source)))
-	}
 	clean := filepath.Clean(path)
-	for _, d := range dirs {
-		if strings.HasPrefix(clean, filepath.Clean(d)+string(filepath.Separator)) {
-			fi, serr := os.Lstat(clean)
-			return serr == nil && fi.Mode().IsRegular()
-		}
+	if dir == "" || !strings.HasPrefix(clean, dir+string(filepath.Separator)) {
+		return false
 	}
-	return false
+	if !sharedPoolMounted(p, dir, clean) {
+		return false
+	}
+	fi, serr := os.Lstat(clean)
+	return serr == nil && fi.Mode().IsRegular()
+}
+
+// sharedPoolDir is the directory a shared pool's files are under: its
+// Target, or the mount an nfs pool with none is given under the data dir.
+func sharedPoolDir(dataDir string, p corrosion.StoragePoolRecord) string {
+	switch {
+	case p.Target != "":
+		return filepath.Clean(p.Target)
+	case p.Source != "":
+		return filepath.Join(dataDir, "mounts", storage.NFSMountName(p.Source))
+	}
+	return ""
+}
+
+// sharedPoolMounted reports whether dir holds pool p's storage now, as seen
+// for path below it: for nfs, path is on an NFS mount of p's export at the
+// same place below the export as below dir; otherwise dir is a mount point. A
+// directory nothing is mounted on (its files are the local disk's) does not.
+func sharedPoolMounted(p corrosion.StoragePoolRecord, dir, path string) bool {
+	t, err := storage.ReadMountTable()
+	if err != nil {
+		return false
+	}
+	if !strings.EqualFold(p.Driver, "nfs") {
+		return storage.IsMountPoint(dir)
+	}
+	want, err := storage.ParseNFSExport(p.Source)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false
+	}
+	want.Path = filepath.Clean(filepath.Join(want.Path, rel))
+	b, err := t.NFSBackingOf(path)
+	return err == nil && b != nil && b.Export == want
 }
 
 func diskRow(ctx context.Context, db *corrosion.Client, m UnresolvedMove) (*corrosion.DiskRecord, error) {

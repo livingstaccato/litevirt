@@ -1764,18 +1764,36 @@ Starts, migrations, replications, clones, image builds, backups and moves
 settle it first or are refused (docs/storage.md, "A move that cannot be
 rolled back"). It is resolved by the host holding the record; by the VM's
 owner once every move it lists is proven settled there; and for every host
-when the VM is deleted or a new VM takes its name. When the host holding the
-record is gone, an admin resolves it by hand:
-`lv health resolve vm.move_unresolved vm/<vm> --reason "…"`, accepted on the
-holding host itself, where it also removes the record, and from any host once
-that host is proven powered off: fenced or removed over an IPMI power-off or an
-operator's `lv host fence-confirm <host>` of its last life. Without `--accept`
-the next start boots the file the VM's disk record names. `--accept <path>`
-names one of the move's two files instead (`lv health` and the resolve's
-output show each move's error, which says which file the guest was writing):
-run on the VM's owner, it points the disk record at that file first, accepted
-only where that host reads the same file — its own on the holding host, or on
-a shared pool both hosts define alike. Removing a host does not resolve it.
+when the VM is deleted or a new VM takes its name. An admin resolves it by
+hand with `lv health resolve vm.move_unresolved vm/<vm> --reason "…"
+[--accept <path> …]`, accepted on the holding host itself, where it also
+removes the record, and from any host once that host is proven powered off:
+fenced or removed over an IPMI power-off or an operator's `lv host
+fence-confirm <host>` of its last life. `lv health` prints each move first:
+both files, whether the guest was pivoted (or the copy was named before the
+move), and the move's error.
+
+`--accept <path>` names the file to keep of one disk's move, once per disk,
+and points that disk record at it. It runs on the VM's owner or on the holding
+host, and only where that host reads the same file: its own file on a host
+that is both, or a file on a mounted shared pool both hosts define alike
+(the same export mounted at the same directory). A resolution never keeps a
+file the move proves stale: after a pivot only the copy is accepted. From any
+host but the holding host that owns the VM, a live move with no pivot recorded
+is refused without an `--accept` for its disk: nothing in the cluster knows
+which file the guest wrote last, and the disk record is no evidence of it.
+Judge it from the holding host's persistent config, or from the two files on
+the shared pool (the later modification time, `qemu-img compare`). On the
+holding host that owns the VM, with its domain defined, the domain must be
+shut off and its persistent config, which `lv start` boots, must name the
+file each disk record is left on; point it there with `virsh edit` or pass
+that file to `--accept`.
+
+A holding host that rejoins after an admin resolved its move from another
+host drops its record of that move instead of raising the condition again,
+unless it now owns the VM. While it holds an open condition, run the
+resolution against it (`LV_HOST=<host>`). Removing a host does not resolve
+the condition.
 
 ### A cluster default-deny held by a torn-down stack (`firewall.default_deny_orphaned`)
 

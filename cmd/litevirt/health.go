@@ -76,7 +76,8 @@ Exit code: 0 healthy · 1 degraded or unknown · 2 critical.`,
 // lv health resolve — mark one open dual-run or move-volume condition
 // resolved by hand.
 func newHealthResolveCmd() *cobra.Command {
-	var evaluator, reason, accept string
+	var evaluator, reason string
+	var accept []string
 	cmd := &cobra.Command{
 		Use:   "resolve <code> <kind/subject>",
 		Short: "Resolve an open dual-run or move-volume health condition by hand (admin, audited)",
@@ -99,11 +100,17 @@ An unresolved volume move (vm.move_unresolved) can be resolved this way too,
 with --reason: run against the host holding the move's record, which removes
 it, or from any host once that host is proven powered off (fenced or removed
 over an IPMI power-off or an operator's lv host fence-confirm). It is refused
-otherwise: that host settles the move itself. Without --accept a start then
-boots the file the VM's disk record names. --accept <path> names one of the
-move's two files instead (read the moves' errors in 'lv health'): the disk
-record is pointed at it first, run on the VM's owner, where that file is its
-own or on a shared pool both hosts define alike.
+otherwise: that host settles the move itself. 'lv health' lists each move's
+two files, whether the guest was pivoted, and its error: read them first.
+
+--accept <path> names the file to keep of one disk's move, once per disk:
+the disk record is pointed at it first, run on the VM's owner or on the
+holding host, where that file is its own or on a mounted shared pool both
+hosts define alike. A move the disk record does not settle (a live move with
+no pivot recorded) is refused without one: nothing in the cluster knows which
+file the guest wrote last. On the holding host that owns the VM, with its
+domain defined, the domain must be shut off and its persistent config must
+name the file each disk record is left on.
 
 Requires the cluster.health.resolve verb (Admin). The resolution is written
 to the audit log with your principal and --reason, and published as an
@@ -114,9 +121,12 @@ ha.condition.resolved event.`,
 			if !ok || kind == "" || id == "" {
 				return fmt.Errorf("subject %q: want kind/id as `lv health` prints it, e.g. vm/web-1", args[1])
 			}
+			if len(accept) > 0 && args[0] != moveUnresolvedCode {
+				return fmt.Errorf("--accept applies only to %s, not %s", moveUnresolvedCode, args[0])
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				if accept != "" {
-					ctx = metadata.AppendToOutgoingContext(ctx, moveAcceptMDKey, accept)
+				for _, a := range accept {
+					ctx = metadata.AppendToOutgoingContext(ctx, moveAcceptMDKey, a)
 				}
 				resp, err := c.ResolveHealthCondition(ctx, &pb.ResolveHealthConditionRequest{
 					Code: args[0], SubjectKind: kind, SubjectId: id,
@@ -139,7 +149,7 @@ ha.condition.resolved event.`,
 	}
 	cmd.Flags().StringVar(&evaluator, "evaluator", "", "the evaluator, when two hold an open condition under the same code and subject")
 	cmd.Flags().StringVar(&reason, "reason", "", "why, recorded in the audit log")
-	cmd.Flags().StringVar(&accept, "accept", "", "vm.move_unresolved only: the move's file to point the disk record at")
+	cmd.Flags().StringArrayVar(&accept, "accept", nil, "vm.move_unresolved only: the file to keep of one disk's move; once per disk")
 	return cmd
 }
 
@@ -160,6 +170,12 @@ func printClusterHealth(h *pb.ClusterHealth) {
 				strings.Join(c.GetHosts(), ","), c.GetFirstSeen())
 		}
 		w.Flush()
+		for _, c := range conds {
+			if c.GetCode() == moveUnresolvedCode {
+				fmt.Printf("\n%s on %s/%s:\n", c.GetCode(), c.GetSubjectKind(), c.GetSubjectId())
+				printMoveEvidence(c.GetEvidence())
+			}
+		}
 	}
 
 	if evs := h.GetEvaluators(); len(evs) > 0 {
@@ -219,8 +235,8 @@ const (
 )
 
 // printMoveEvidence prints the moves a vm.move_unresolved condition recorded,
-// each with the error its move hit, so the operator sees what --accept chose
-// between.
+// each with what is known of it and the error its move hit, so the operator
+// sees what --accept chooses between before resolving.
 func printMoveEvidence(evidence string) {
 	var ev struct {
 		Host  string `json:"host"`
@@ -230,14 +246,24 @@ func printMoveEvidence(evidence string) {
 			Dst     string `json:"dst"`
 			Live    bool   `json:"live"`
 			Pivoted bool   `json:"pivoted"`
+			CatchUp bool   `json:"catch_up"`
 			Error   string `json:"error"`
 		} `json:"moves"`
 	}
 	if json.Unmarshal([]byte(evidence), &ev) != nil {
+		fmt.Println("  (evidence unreadable)")
 		return
 	}
 	for _, m := range ev.Moves {
-		fmt.Printf("  %s on %s: %s -> %s (live=%v pivoted=%v)\n", m.Disk, ev.Host, m.Src, m.Dst, m.Live, m.Pivoted)
+		fmt.Printf("  %s on %s: %s -> %s (live=%v pivoted=%v catch_up=%v)\n", m.Disk, ev.Host, m.Src, m.Dst, m.Live, m.Pivoted, m.CatchUp)
+		switch {
+		case m.Pivoted || m.CatchUp:
+			fmt.Printf("    holds every write: %s\n", m.Dst)
+		case m.Live:
+			fmt.Println("    no pivot recorded: either file may hold the guest's last writes")
+		default:
+			fmt.Println("    offline move: both files hold the same data")
+		}
 		if m.Error != "" {
 			fmt.Printf("    error: %s\n", m.Error)
 		}

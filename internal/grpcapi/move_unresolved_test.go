@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // moveRecords returns the unresolved-move records this host keeps for vm.
@@ -906,43 +908,77 @@ func TestMoveOneVolume_SettledForeignConditionIsANoOp(t *testing.T) {
 	}
 }
 
-// acceptCtx is adminCtx carrying `lv health resolve --accept path`.
-func acceptCtx(path string) context.Context {
+// acceptCtx is adminCtx carrying `lv health resolve --accept path`, once per
+// path.
+func acceptCtx(paths ...string) context.Context {
 	ctx := adminCtx()
 	md, _ := metadata.FromIncomingContext(ctx)
-	md = metadata.Join(md, metadata.Pairs(MoveAcceptMDKey, path))
+	for _, p := range paths {
+		md = metadata.Join(md, metadata.Pairs(MoveAcceptMDKey, p))
+	}
 	return metadata.NewIncomingContext(ctx, md)
 }
 
-// N-2, N2-2, N2-3: `lv health resolve vm.move_unresolved` needs a reason; from
-// another host it is accepted only once the holder is proven powered off
-// (corrosion.SharedDiskOwnerProvedOff); on the holder it also removes the
-// records; --accept points the disk row at one of the move's files first.
+func moveResolveReq(reason string) *pb.ResolveHealthConditionRequest {
+	return &pb.ResolveHealthConditionRequest{Code: health.MoveUnresolvedCode, SubjectKind: "vm", SubjectId: "vm1", Reason: reason}
+}
+
+// holderNodeA records node-a in state (none: removed) with fences.
+func holderNodeA(t *testing.T, s *Server, state string, fences ...[2]string) {
+	t.Helper()
+	ctx := context.Background()
+	if state != "" {
+		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "node-a", Address: "10.0.0.9", State: state}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, f := range fences {
+		if err := corrosion.InsertFenceLog(ctx, s.db, corrosion.FenceLogRecord{ID: fmt.Sprintf("f%d", i), HostName: "node-a", Method: f[0], Result: f[1]}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func provenOffNodeA(t *testing.T, s *Server) {
+	t.Helper()
+	holderNodeA(t, s, "fenced", [2]string{"manual", "manual-confirmed"})
+}
+
+// mustRefuse asserts err is a FailedPrecondition saying each of want, and that
+// vm1's root row still names row and its condition is open.
+func mustRefuse(t *testing.T, s *Server, err error, row string, want ...string) {
+	t.Helper()
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("want FailedPrecondition, got %v", err)
+	}
+	for _, w := range want {
+		if !strings.Contains(err.Error(), w) {
+			t.Fatalf("refusal does not say %q: %v", w, err)
+		}
+	}
+	if got := diskRowPath(t, s, "vm1"); got != row {
+		t.Fatalf("row changed to %s", got)
+	}
+	if !health.MoveConditionCovers(context.Background(), s.db, "vm1", "root") {
+		t.Fatal("resolved anyway")
+	}
+}
+
+// N-2, N2-2, N2-3, I3-1, I3-2, m3-1: `lv health resolve vm.move_unresolved`
+// needs a reason; from another host it is accepted only once the holder is
+// proven powered off, and never defaults a move the row does not settle to
+// the row; on the holder that owns the VM it is accepted only with the domain
+// shut off and its persistent config naming the file the row is left on.
 func TestResolveHealthCondition_MoveUnresolved(t *testing.T) {
 	ctx := context.Background()
-	req := func(reason string) *pb.ResolveHealthConditionRequest {
-		return &pb.ResolveHealthConditionRequest{Code: health.MoveUnresolvedCode, SubjectKind: "vm", SubjectId: "vm1", Reason: reason}
-	}
-	holder := func(t *testing.T, s *Server, state string, fences ...[2]string) {
-		t.Helper()
-		if state != "" {
-			if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "node-a", Address: "10.0.0.9", State: state}); err != nil {
-				t.Fatal(err)
-			}
-		}
-		for i, f := range fences {
-			if err := corrosion.InsertFenceLog(ctx, s.db, corrosion.FenceLogRecord{ID: fmt.Sprintf("f%d", i), HostName: "node-a", Method: f[0], Result: f[1]}); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
 	t.Run("no reason", func(t *testing.T) {
 		s, _, srcFile, dstFile := offlineMoveServer(t)
 		publishForeignCondition(t, s, "node-a", srcFile, dstFile, false)
-		if _, err := s.ResolveHealthCondition(adminCtx(), req("")); status.Code(err) != codes.InvalidArgument {
+		if _, err := s.ResolveHealthCondition(adminCtx(), moveResolveReq("")); status.Code(err) != codes.InvalidArgument {
 			t.Fatalf("want InvalidArgument, got %v", err)
 		}
 	})
+	// The gate, over a move the row settles (pivoted, row on the copy).
 	for _, tc := range []struct {
 		name   string
 		state  string
@@ -958,9 +994,12 @@ func TestResolveHealthCondition_MoveUnresolved(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _, srcFile, dstFile := offlineMoveServer(t)
-			holder(t, s, tc.state, tc.fences...)
-			publishForeignCondition(t, s, "node-a", srcFile, dstFile, false)
-			_, err := s.ResolveHealthCondition(adminCtx(), req("disk checked"))
+			holderNodeA(t, s, tc.state, tc.fences...)
+			if err := corrosion.UpdateDiskPlacement(ctx, s.db, "vm1", "root", "test-host", dstFile, "local", "warm"); err != nil {
+				t.Fatal(err)
+			}
+			publishForeignCondition(t, s, "node-a", srcFile, dstFile, true)
+			_, err := s.ResolveHealthCondition(adminCtx(), moveResolveReq("disk checked"))
 			if tc.ok {
 				if err != nil {
 					t.Fatalf("resolve: %v", err)
@@ -970,33 +1009,30 @@ func TestResolveHealthCondition_MoveUnresolved(t *testing.T) {
 				}
 				return
 			}
-			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "node-a holds") ||
-				!strings.Contains(err.Error(), "fence-confirm") {
-				t.Fatalf("want a refusal naming the holder, got %v", err)
-			}
-			if !health.MoveConditionCovers(ctx, s.db, "vm1", "root") {
-				t.Fatal("resolved anyway")
-			}
+			mustRefuse(t, s, err, dstFile, "node-a holds", "fence-confirm", "LV_HOST=node-a")
 		})
 	}
-	t.Run("on the holder", func(t *testing.T) {
+
+	// On the holder, which owns the VM: the persistent config decides.
+	t.Run("holder: the config names the copy, the row the source, no --accept: refused", func(t *testing.T) {
 		s, f, srcFile, dstFile := offlineMoveServer(t)
 		crashAfterDefine(t, s, f, srcFile, dstFile, dstFile, true, false)
-		if _, err := s.ResolveHealthCondition(adminCtx(), req("guest was pivoted by hand")); err != nil {
-			t.Fatalf("resolve: %v", err)
-		}
-		if ms := moveRecords(t, s, "vm1"); len(ms) != 0 {
-			t.Fatalf("records kept: %+v", ms)
-		}
-		vm, _ := corrosion.GetVM(ctx, s.db, "vm1")
-		if _, err := s.startVMLocked(adminCtx(), vm); err != nil {
-			t.Fatalf("the start after the resolve: %v", err)
+		_, err := s.ResolveHealthCondition(adminCtx(), moveResolveReq("guest was pivoted by hand"))
+		mustRefuse(t, s, err, srcFile, "names "+dstFile, "--accept "+dstFile, "virsh edit vm1")
+		if ms := moveRecords(t, s, "vm1"); len(ms) != 1 {
+			t.Fatalf("records: %+v", ms)
 		}
 	})
-	t.Run("--accept the copy on the holder", func(t *testing.T) {
+	t.Run("holder: --accept the source while the config names the copy: refused", func(t *testing.T) {
 		s, f, srcFile, dstFile := offlineMoveServer(t)
 		crashAfterDefine(t, s, f, srcFile, dstFile, dstFile, true, false)
-		if _, err := s.ResolveHealthCondition(acceptCtx(dstFile), req("guest was pivoted before the crash")); err != nil {
+		_, err := s.ResolveHealthCondition(acceptCtx(srcFile), moveResolveReq("guest was not pivoted"))
+		mustRefuse(t, s, err, srcFile, "names "+dstFile, "--accept "+dstFile)
+	})
+	t.Run("holder: --accept the copy the config names", func(t *testing.T) {
+		s, f, srcFile, dstFile := offlineMoveServer(t)
+		crashAfterDefine(t, s, f, srcFile, dstFile, dstFile, true, false)
+		if _, err := s.ResolveHealthCondition(acceptCtx(dstFile), moveResolveReq("guest was pivoted before the crash")); err != nil {
 			t.Fatalf("resolve: %v", err)
 		}
 		if got := diskRowPath(t, s, "vm1"); got != dstFile {
@@ -1005,29 +1041,278 @@ func TestResolveHealthCondition_MoveUnresolved(t *testing.T) {
 		if health.MoveConditionCovers(ctx, s.db, "vm1", "root") || len(moveRecords(t, s, "vm1")) != 0 {
 			t.Fatal("not resolved")
 		}
+		vm, _ := corrosion.GetVM(ctx, s.db, "vm1")
+		if _, err := s.startVMLocked(adminCtx(), vm); err != nil {
+			t.Fatalf("the start after the resolve: %v", err)
+		}
+		if x := mustInactive(t, f, "vm1"); !strings.Contains(x, dstFile) {
+			t.Fatalf("the config does not name the row's file: %s", x)
+		}
+	})
+	t.Run("holder: the config and the row name the source", func(t *testing.T) {
+		s, f, srcFile, dstFile := offlineMoveServer(t)
+		crashAfterDefine(t, s, f, srcFile, dstFile, srcFile, true, false)
+		if _, err := s.ResolveHealthCondition(adminCtx(), moveResolveReq("guest was not pivoted")); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if got := diskRowPath(t, s, "vm1"); got != srcFile || health.MoveConditionCovers(ctx, s.db, "vm1", "root") {
+			t.Fatalf("row %s / not resolved", got)
+		}
+	})
+	t.Run("holder: the domain is running: refused", func(t *testing.T) {
+		s, f, srcFile, dstFile := offlineMoveServer(t)
+		crashAfterDefine(t, s, f, srcFile, dstFile, srcFile, true, false)
+		f.SetState("vm1", libvirtfake.StateRunning)
+		_, err := s.ResolveHealthCondition(adminCtx(), moveResolveReq("x"))
+		mustRefuse(t, s, err, srcFile, "domain is active", "lv stop vm1")
+	})
+	t.Run("holder: a move of the disk in flight: refused", func(t *testing.T) {
+		s, _, srcFile, dstFile := offlineMoveServer(t)
+		vm, _ := corrosion.GetVM(ctx, s.db, "vm1")
+		disks, _ := corrosion.GetVMDisks(ctx, s.db, "vm1")
+		mk, err := s.beginMoveMarker(ctx, vm, &disks[0], dstFile, "local", "warm", false, false, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer mk.done()
+		_, rerr := s.ResolveHealthCondition(adminCtx(), moveResolveReq("x"))
+		if status.Code(rerr) != codes.Unavailable || !strings.Contains(rerr.Error(), "in progress") {
+			t.Fatalf("want a refusal while the move runs, got %v", rerr)
+		}
+		if !health.MoveConditionCovers(ctx, s.db, "vm1", "root") || diskRowPath(t, s, "vm1") != srcFile {
+			t.Fatal("changed while the move ran")
+		}
 	})
 	t.Run("--accept a file the move does not name", func(t *testing.T) {
 		s, f, srcFile, dstFile := offlineMoveServer(t)
 		crashAfterDefine(t, s, f, srcFile, dstFile, dstFile, true, false)
-		if _, err := s.ResolveHealthCondition(acceptCtx("/etc/passwd"), req("x")); status.Code(err) != codes.InvalidArgument {
+		if _, err := s.ResolveHealthCondition(acceptCtx("/etc/passwd"), moveResolveReq("x")); status.Code(err) != codes.InvalidArgument {
 			t.Fatalf("want InvalidArgument, got %v", err)
 		}
 		if got := diskRowPath(t, s, "vm1"); got != srcFile {
 			t.Fatalf("row changed to %s", got)
 		}
 	})
-	t.Run("--accept from a host that does not read the holder's file", func(t *testing.T) {
+
+	// From another host, node-a proven off.
+	t.Run("elsewhere: no pivot recorded, no --accept: refused", func(t *testing.T) {
 		s, _, srcFile, dstFile := offlineMoveServer(t)
-		holder(t, s, "fenced", [2]string{"manual", "manual-confirmed"})
+		provenOffNodeA(t, s)
 		publishForeignCondition(t, s, "node-a", srcFile, dstFile, false)
-		_, err := s.ResolveHealthCondition(acceptCtx(dstFile), req("x"))
-		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "does not read that file") {
-			t.Fatalf("want a refusal, got %v", err)
+		_, err := s.ResolveHealthCondition(adminCtx(), moveResolveReq("node-a is gone"))
+		mustRefuse(t, s, err, srcFile, "recorded no pivot", "--accept", "qemu-img compare")
+	})
+	t.Run("elsewhere: pivoted, the row on the source, no --accept: refused", func(t *testing.T) {
+		s, _, srcFile, dstFile := offlineMoveServer(t)
+		provenOffNodeA(t, s)
+		publishForeignCondition(t, s, "node-a", srcFile, dstFile, true)
+		_, err := s.ResolveHealthCondition(adminCtx(), moveResolveReq("node-a is gone"))
+		mustRefuse(t, s, err, srcFile, "only `--accept "+dstFile+"`")
+	})
+	t.Run("elsewhere: pivoted, --accept the source: refused", func(t *testing.T) {
+		s, _, srcFile, dstFile := offlineMoveServer(t)
+		provenOffNodeA(t, s)
+		publishForeignCondition(t, s, "node-a", srcFile, dstFile, true)
+		_, err := s.ResolveHealthCondition(acceptCtx(srcFile), moveResolveReq("node-a is gone"))
+		mustRefuse(t, s, err, srcFile, "only `--accept "+dstFile+"`")
+	})
+	t.Run("elsewhere: --accept on a host that does not read the holder's file: refused", func(t *testing.T) {
+		s, _, srcFile, dstFile := offlineMoveServer(t)
+		provenOffNodeA(t, s)
+		publishForeignCondition(t, s, "node-a", srcFile, dstFile, false)
+		_, err := s.ResolveHealthCondition(acceptCtx(dstFile), moveResolveReq("x"))
+		mustRefuse(t, s, err, srcFile, "does not read that file")
+	})
+	t.Run("elsewhere: --accept for a disk row that names neither file: refused", func(t *testing.T) {
+		s, _, srcFile, dstFile := offlineMoveServer(t)
+		provenOffNodeA(t, s)
+		publishForeignCondition(t, s, "node-a", srcFile, dstFile, false)
+		if err := corrosion.UpdateDiskPlacement(ctx, s.db, "vm1", "root", "test-host", "/srv/new/root.qcow2", "local", "hot"); err != nil {
+			t.Fatal(err)
 		}
-		if got := diskRowPath(t, s, "vm1"); got != srcFile || !health.MoveConditionCovers(ctx, s.db, "vm1", "root") {
-			t.Fatalf("row %s / condition changed", got)
+		_, err := s.ResolveHealthCondition(acceptCtx(srcFile), moveResolveReq("x"))
+		mustRefuse(t, s, err, "/srv/new/root.qcow2", "neither file of the move")
+	})
+}
+
+// sharedMoveServer is test-host owning vm1, whose disks were moving live,
+// with no pivot recorded, from pool hot (ceph) to pool warm (nfs) on node-a,
+// now proven powered off. Both hosts define both pools alike and both are
+// mounted here. src and dst map each disk to its files.
+func sharedMoveServer(t *testing.T, disks ...string) (s *Server, src, dst map[string]string) {
+	t.Helper()
+	ctx := context.Background()
+	s = testServer(t)
+	s.hostName = "test-host"
+	s.dataDir = t.TempDir()
+	s.virt = libvirtfake.New()
+	hot, warm := filepath.Join(s.dataDir, "mnt", "hot"), filepath.Join(s.dataDir, "mnt", "warm")
+	src, dst = map[string]string{}, map[string]string{}
+	var rows []corrosion.DiskRecord
+	var moves []health.UnresolvedMove
+	for i, d := range disks {
+		src[d], dst[d] = filepath.Join(hot, "vm1-"+d+".qcow2"), filepath.Join(warm, "vm1-"+d+".qcow2")
+		for _, p := range []string{src[d], dst[d]} {
+			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		dev := fmt.Sprintf("vd%c", 'a'+i)
+		rows = append(rows, corrosion.DiskRecord{VMName: "vm1", DiskName: d, HostName: "test-host", Path: src[d],
+			TargetDev: dev, StorageType: "ceph", StorageVolume: "hot", SizeBytes: 1})
+		moves = append(moves, health.UnresolvedMove{VM: "vm1", Disk: d, TargetDev: dev, Src: src[d], SrcType: "ceph", SrcPool: "hot",
+			Dst: dst[d], DstType: "nfs", DstPool: "warm", Live: true})
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "stopped"}, nil, rows); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []string{"test-host", "node-a"} {
+		for _, p := range []corrosion.StoragePoolRecord{
+			{HostName: h, Name: "hot", Driver: "ceph", Source: "mon:/vms", Target: hot},
+			{HostName: h, Name: "warm", Driver: "nfs", Source: "nas:/vol", Target: warm},
+		} {
+			if err := corrosion.UpsertStoragePool(ctx, s.db, p); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	tab := "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n" +
+		"2 1 0:40 / " + hot + " rw,nosuid,nodev - ceph mon:/vms rw\n" +
+		"3 1 0:41 / " + warm + " rw,nosuid,nodev,noexec,nosymfollow - nfs4 nas:/vol rw\n"
+	t.Cleanup(storage.OverrideMountInfoForTest(func() ([]byte, error) { return []byte(tab), nil }))
+	provenOffNodeA(t, s)
+	holderDir := t.TempDir()
+	for _, m := range moves {
+		if err := health.RecordUnresolvedMove(holderDir, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := health.PublishUnresolvedMoves(ctx, s.db, holderDir, "node-a", "vm1"); err != nil {
+		t.Fatal(err)
+	}
+	return s, src, dst
+}
+
+func diskRowOf(t *testing.T, s *Server, disk string) corrosion.DiskRecord {
+	t.Helper()
+	disks, err := corrosion.GetVMDisks(context.Background(), s.db, "vm1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range disks {
+		if d.DiskName == disk {
+			return d
+		}
+	}
+	t.Fatalf("no disk %s", disk)
+	return corrosion.DiskRecord{}
+}
+
+// I3-1, review concern 2: --accept on the VM's owner after a failover, the
+// holder proven off: the row takes the accepted file with that file's type
+// and pool and stays on the owner; every disk the row does not settle needs
+// its own --accept; a host that is neither the owner nor the holder, or one
+// whose pool is not the holder's, is refused; a resolution that cannot be
+// recorded points the row back and is audited.
+func TestResolveHealthCondition_AcceptOnTheOwnerAfterAFailover(t *testing.T) {
+	ctx := context.Background()
+	t.Run("--accept the copy", func(t *testing.T) {
+		s, _, dst := sharedMoveServer(t, "root")
+		if _, err := s.ResolveHealthCondition(acceptCtx(dst["root"]), moveResolveReq("the copy is newer")); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if r := diskRowOf(t, s, "root"); r.Path != dst["root"] || r.StorageType != "nfs" || r.StorageVolume != "warm" || r.HostName != "test-host" {
+			t.Fatalf("row = %+v", r)
+		}
+		if health.MoveConditionCovers(ctx, s.db, "vm1", "root") {
+			t.Fatal("not resolved")
+		}
+		if row, _, err := corrosion.GetHealthCondition(ctx, s.db, health.MoveUnresolvedEvaluator, health.MoveUnresolvedCode, "vm", "vm1"); err != nil ||
+			!strings.Contains(row.Evidence, `"hand":true`) {
+			t.Fatalf("the resolution is not marked as by hand, so a returning holder raises it again: %q %v", row.Evidence, err)
 		}
 	})
+	t.Run("--accept the source", func(t *testing.T) {
+		s, src, dst := sharedMoveServer(t, "root")
+		if err := corrosion.UpdateDiskPlacement(ctx, s.db, "vm1", "root", "test-host", dst["root"], "nfs", "warm"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ResolveHealthCondition(acceptCtx(src["root"]), moveResolveReq("the source is newer")); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if r := diskRowOf(t, s, "root"); r.Path != src["root"] || r.StorageType != "ceph" || r.StorageVolume != "hot" || r.HostName != "test-host" {
+			t.Fatalf("row = %+v", r)
+		}
+	})
+	t.Run("on a host that is neither the owner nor the holder: refused", func(t *testing.T) {
+		s, src, dst := sharedMoveServer(t, "root")
+		if err := s.db.Execute(ctx, `UPDATE vms SET host_name = 'node-b' WHERE name = 'vm1'`); err != nil {
+			t.Fatal(err)
+		}
+		_, err := s.ResolveHealthCondition(acceptCtx(dst["root"]), moveResolveReq("x"))
+		mustRefuse(t, s, err, src["root"], "run it on the VM's owner node-b")
+	})
+	t.Run("this host's pool of that name is local: refused", func(t *testing.T) {
+		s, src, dst := sharedMoveServer(t, "root")
+		if err := corrosion.UpsertStoragePool(ctx, s.db, corrosion.StoragePoolRecord{HostName: "test-host", Name: "warm",
+			Driver: "local", Target: filepath.Dir(dst["root"])}); err != nil {
+			t.Fatal(err)
+		}
+		_, err := s.ResolveHealthCondition(acceptCtx(dst["root"]), moveResolveReq("x"))
+		mustRefuse(t, s, err, src["root"], "does not read that file")
+	})
+	t.Run("two disks: one --accept each", func(t *testing.T) {
+		s, src, dst := sharedMoveServer(t, "root", "data")
+		_, err := s.ResolveHealthCondition(acceptCtx(dst["root"]), moveResolveReq("x"))
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "disk data") {
+			t.Fatalf("want the resolve refused for disk data, got %v", err)
+		}
+		if diskRowOf(t, s, "root").Path != src["root"] || diskRowOf(t, s, "data").Path != src["data"] ||
+			!health.MoveConditionCovers(ctx, s.db, "vm1", "root") {
+			t.Fatal("changed by a refused resolve")
+		}
+		if _, err := s.ResolveHealthCondition(acceptCtx(dst["root"], src["data"]), moveResolveReq("checked both")); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if diskRowOf(t, s, "root").Path != dst["root"] || diskRowOf(t, s, "data").Path != src["data"] {
+			t.Fatal("rows not as accepted")
+		}
+	})
+	t.Run("the resolution cannot be recorded: the row is pointed back, audited", func(t *testing.T) {
+		s, src, dst := sharedMoveServer(t, "root")
+		if err := s.db.Execute(ctx, `CREATE TRIGGER fail_condition_resolve BEFORE UPDATE ON health_conditions
+			BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
+			t.Fatal(err)
+		}
+		_, err := s.ResolveHealthCondition(acceptCtx(dst["root"]), moveResolveReq("x"))
+		if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "pointed back at "+src["root"]) {
+			t.Fatalf("want the failure, naming the row pointed back, got %v", err)
+		}
+		if r := diskRowOf(t, s, "root"); r.Path != src["root"] || r.StorageType != "ceph" {
+			t.Fatalf("row left at %+v", r)
+		}
+		rows, qerr := s.db.Query(ctx, `SELECT result, detail FROM audit_log WHERE action = 'health.condition.resolve'`)
+		if qerr != nil || len(rows) != 1 || rows[0].String("result") != "failed" || !strings.Contains(rows[0].String("detail"), "pointed back") {
+			t.Fatalf("audit = %+v %v", rows, qerr)
+		}
+	})
+}
+
+// m3-3: --accept on any other code is refused, not ignored.
+func TestResolveHealthCondition_AcceptOnlyOnMoveConditions(t *testing.T) {
+	s := testServer(t)
+	if err := corrosion.UpsertHealthCondition(context.Background(), s.db, corrosion.HealthCondition{Evaluator: dualRunEvaluator,
+		Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "vm1", Lifecycle: corrosion.ConditionConfirmed,
+		LastSeen: "2026-10-18T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.ResolveHealthCondition(acceptCtx("/x"), &pb.ResolveHealthConditionRequest{Code: "vm_dual_run", SubjectKind: "vm", SubjectId: "vm1", Reason: "x"})
+	if status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "--accept applies only") {
+		t.Fatalf("want InvalidArgument, got %v", err)
+	}
 }
 
 // m-3: a VM created under a name an earlier VM's unresolved move was recorded

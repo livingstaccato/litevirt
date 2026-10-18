@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // moveDomainXML is a stopped domain whose disk vda names path.
@@ -192,6 +194,17 @@ func TestStartPendingVM_InFlightMoveIsRetried(t *testing.T) {
 // happened and not replicated before the holder lost power: refused whatever
 // the row names. The owner resolves the condition once every move is proven
 // settled.
+// fakeNFSMount makes the mount table hold the root filesystem and source
+// mounted over NFS at each dir given (none: nothing but the root).
+func fakeNFSMount(t *testing.T, dirAndSource ...string) {
+	t.Helper()
+	tab := "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n"
+	for i := 0; i+1 < len(dirAndSource); i += 2 {
+		tab += fmt.Sprintf("%d 1 0:%d / %s rw,nosuid,nodev,noexec,nosymfollow - nfs4 %s rw\n", i+2, i+40, dirAndSource[i], dirAndSource[i+1])
+	}
+	t.Cleanup(storage.OverrideMountInfoForTest(func() ([]byte, error) { return []byte(tab), nil }))
+}
+
 func TestResolveUnresolvedMoves_AnotherHostsRecord(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
@@ -202,6 +215,8 @@ func TestResolveUnresolvedMoves_AnotherHostsRecord(t *testing.T) {
 		rowHost                string
 		hereDriver, originDrv  string
 		symlink, originOther   bool
+		originMountedElsewhere bool
+		unmounted              bool
 		wantErr                bool
 		wantRowOnDst, resolved bool
 	}{
@@ -221,6 +236,10 @@ func TestResolveUnresolvedMoves_AnotherHostsRecord(t *testing.T) {
 			pivoted: true, rowHost: "node-b", hereDriver: "nfs", originDrv: "nfs", originOther: true, wantErr: true},
 		{name: "pivoted, row on the source, the copy is a symlink: refused",
 			pivoted: true, rowHost: "node-b", hereDriver: "nfs", originDrv: "nfs", symlink: true, wantErr: true},
+		{name: "pivoted, row on the source, the holder mounts the same export elsewhere: refused",
+			pivoted: true, rowHost: "node-b", hereDriver: "nfs", originDrv: "nfs", originMountedElsewhere: true, wantErr: true},
+		{name: "pivoted, row on the source, the pool directory here has nothing mounted on it: refused",
+			pivoted: true, rowHost: "node-b", hereDriver: "nfs", originDrv: "nfs", unmounted: true, wantErr: true},
 		{name: "catch-up, row on the source, failed over here, copy on a shared pool: row to the copy",
 			catchUp: true, rowHost: "node-b", hereDriver: "nfs", originDrv: "nfs", wantRowOnDst: true, resolved: true},
 		{name: "pivoted, row on the copy, owner here: passes and resolved", pivoted: true, rowOnDst: true, rowHost: "node-b", wantRowOnDst: true, resolved: true},
@@ -257,14 +276,22 @@ func TestResolveUnresolvedMoves_AnotherHostsRecord(t *testing.T) {
 				if drv == "" {
 					continue
 				}
-				target := filepath.Dir(dst)
+				source, target := "nas:/vol", filepath.Dir(dst)
 				if host == "node-a" && tc.originOther {
-					target = "/srv/other-export"
+					source = "nas:/other"
+				}
+				if host == "node-a" && tc.originMountedElsewhere {
+					target = filepath.Dir(target)
 				}
 				if err := corrosion.UpsertStoragePool(ctx, db, corrosion.StoragePoolRecord{HostName: host, Name: "warm",
-					Driver: drv, Target: target}); err != nil {
+					Driver: drv, Source: source, Target: target}); err != nil {
 					t.Fatal(err)
 				}
+			}
+			if !tc.unmounted {
+				fakeNFSMount(t, filepath.Dir(dst), "nas:/vol")
+			} else {
+				fakeNFSMount(t, "")
 			}
 			row := src
 			if tc.rowOnDst {
@@ -434,5 +461,75 @@ func TestForgetUnresolvedMoves_ClearsRecordsAndCondition(t *testing.T) {
 	}
 	if ms, _ := UnresolvedMovesOf(dir, "mv"); len(ms) != 0 {
 		t.Fatalf("records left: %+v", ms)
+	}
+}
+
+// handResolve marks vm's open condition resolved by hand, as `lv health
+// resolve` does, keeping its moves in the evidence.
+func handResolve(t *testing.T, db *corrosion.Client, vm string, hand bool) {
+	t.Helper()
+	ctx := context.Background()
+	row, ev, open, err := OpenMoveCondition(ctx, db, vm)
+	if err != nil || !open {
+		t.Fatalf("condition: open=%v %v", open, err)
+	}
+	ev.Hand = hand
+	b, _ := json.Marshal(ev)
+	row.Evidence, row.Lifecycle, row.ResolvedAt = string(b), corrosion.ConditionResolved, "2026-10-18T00:00:00Z"
+	if err := corrosion.UpsertHealthCondition(ctx, db, row); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// m3-5: a holder that was away while an admin resolved its move by hand (on
+// the VM's new owner) drops its record of that move instead of raising the
+// condition again. A record the resolution did not cover (a later move: its
+// time differs), a condition resolved otherwise, or a VM this host owns (its
+// own settle reconciles the config first) is raised as before.
+func TestPublishUnresolvedMoves_HandResolvedRecordIsDropped(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name       string
+		hand       bool
+		otherMove  bool
+		ownerHere  bool
+		wantRaised bool
+	}{
+		{name: "resolved by hand on the new owner", hand: true},
+		{name: "a later move of the disk", hand: true, otherMove: true, wantRaised: true},
+		{name: "resolved, not by hand", wantRaised: true},
+		{name: "resolved by hand, the VM owned here", hand: true, ownerHere: true, wantRaised: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := testReconcilerDB(t)
+			dir := t.TempDir()
+			seedMovedVM(t, db, dir, "src", true, false)
+			if err := PublishUnresolvedMoves(ctx, db, dir, "node-a", "mv"); err != nil {
+				t.Fatal(err)
+			}
+			handResolve(t, db, "mv", tc.hand)
+			if !tc.ownerHere {
+				if err := db.Execute(ctx, `UPDATE vms SET host_name = 'node-b' WHERE name = 'mv'`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.otherMove {
+				ms, _ := UnresolvedMovesOf(dir, "mv")
+				ms[0].At = "2026-10-18T09:00:00Z"
+				if err := RecordUnresolvedMove(dir, ms[0]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := PublishUnresolvedMoves(ctx, db, dir, "node-a", "mv"); err != nil {
+				t.Fatal(err)
+			}
+			if got := MoveConditionCovers(ctx, db, "mv", "root"); got != tc.wantRaised {
+				t.Fatalf("condition open = %v, want %v", got, tc.wantRaised)
+			}
+			ms, _ := UnresolvedMovesOf(dir, "mv")
+			if (len(ms) != 0) != tc.wantRaised {
+				t.Fatalf("records here: %+v, want kept=%v", ms, tc.wantRaised)
+			}
+		})
 	}
 }

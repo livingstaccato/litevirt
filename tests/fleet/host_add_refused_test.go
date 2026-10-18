@@ -72,24 +72,31 @@ func TestFleet_HostAdd_ARefusedAddLeavesTheMachineAlone(t *testing.T) {
 	}
 	rowsBefore := serialOf()
 
-	// The live member itself, added again under its own name: the machine
-	// serves b's current certificate, so nothing is asked or pushed.
-	t.Run("the live member", func(t *testing.T) {
-		before := readFiles(t, b.PKIDir, identity...)
-		target := &cli.LocalAddTarget{Root: t.TempDir(), PKIDir: b.PKIDir, Binary: bin}
-		err := cli.HostAddOn(ctx, c.SelfClient(a), target, b.Name, b.Address)
-		if err == nil || !strings.Contains(err.Error(), "live member") {
-			t.Fatalf("add of the live %s = %v, want a refusal", b.Name, err)
-		}
-		if len(target.Wrote) != 0 || len(target.Commands) != 0 {
-			t.Errorf("a refused add reached %s: wrote %v, ran %v", b.Name, target.Wrote, target.Commands)
-		}
-		for n, want := range before {
-			if got := readFiles(t, b.PKIDir, n)[n]; !bytes.Equal(got, want) {
-				t.Errorf("%s's %s was replaced", b.Name, n)
+	// The live member b, added by mistake under a new name: refused before
+	// anything is asked or uploaded, by the certificate it serves (another
+	// address) or by its address (I3: a member whose served serial is not
+	// the recorded one is still caught).
+	for _, tc := range []struct{ name, addr, want string }{
+		{"by its certificate", "127.0.0.2", "serves " + b.Name + "'s current certificate"},
+		{"by its address", b.Address, "live member at that address"},
+	} {
+		t.Run("the live member "+tc.name, func(t *testing.T) {
+			before := readFiles(t, b.PKIDir, identity...)
+			target := &cli.LocalAddTarget{Root: t.TempDir(), PKIDir: b.PKIDir, Binary: bin}
+			err := cli.HostAddOn(ctx, c.SelfClient(a), target, "node-new", tc.addr)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("add of the live %s as node-new = %v, want %q", b.Name, err, tc.want)
 			}
-		}
-	})
+			if len(target.Events) != 0 {
+				t.Errorf("a refused add reached %s: %v", b.Name, target.Events)
+			}
+			for n, want := range before {
+				if got := readFiles(t, b.PKIDir, n)[n]; !bytes.Equal(got, want) {
+					t.Errorf("%s's %s was replaced", b.Name, n)
+				}
+			}
+		})
+	}
 
 	// Another machine, holding an identity of its own, added under b's live
 	// name: the daemon refuses the admission, and the machine keeps its key.
@@ -104,12 +111,19 @@ func TestFleet_HostAdd_ARefusedAddLeavesTheMachineAlone(t *testing.T) {
 		}
 		before := readFiles(t, other, "host.crt", "host.key")
 		target := &cli.LocalAddTarget{Root: t.TempDir(), PKIDir: other, Binary: bin}
-		err := cli.HostAddOn(ctx, c.SelfClient(a), target, b.Name, b.Address)
-		if err == nil || !strings.Contains(err.Error(), "nothing was pushed") {
+		err := cli.HostAddOn(ctx, c.SelfClient(a), target, b.Name, "127.0.0.3")
+		if err == nil || !strings.Contains(err.Error(), "already active") || !strings.Contains(err.Error(), "nothing was installed") {
 			t.Fatalf("add under the active name %s = %v, want the daemon's refusal", b.Name, err)
 		}
-		if len(target.Wrote) != 0 || len(target.Commands) != 0 {
-			t.Errorf("a refused add reached the machine: wrote %v, ran %v", target.Wrote, target.Commands)
+		// It uploaded to staged paths, and removed them on the refusal.
+		for _, e := range target.Events {
+			staged := strings.HasPrefix(e, "write ") && strings.HasSuffix(e, ".add")
+			if !staged && e != "sh unstage" && !strings.HasPrefix(e, "run mkdir -p") {
+				t.Errorf("a refused add changed the machine: %q", e)
+			}
+		}
+		if m, _ := filepath.Glob(filepath.Join(other, ".*.add")); len(m) != 0 {
+			t.Errorf("staged files left on the machine: %v", m)
 		}
 		for n, want := range before {
 			if got := readFiles(t, other, n)[n]; !bytes.Equal(got, want) {

@@ -158,6 +158,8 @@ func ShellQuote(s string) string {
 // destination wholesale, mode included, and does so atomically.
 //
 // mktemp in the destination's own directory keeps the rename on one filesystem.
+// The staged file is synced before the move and the directory after it, so a
+// power loss cannot leave the destination renamed over but empty.
 //
 // -T is load-bearing, not tidiness. Without it, `mv src dest` where dest is a
 // DIRECTORY moves src INSIDE it — so a local user who can see the destination
@@ -171,7 +173,8 @@ func writeFileCmd(remotePath string, mode os.FileMode) string {
 	return fmt.Sprintf(
 		"set -e; d=$(dirname %s); t=$(mktemp \"$d/.litevirt.XXXXXX\"); "+
 			"trap 'rm -f \"$t\"' EXIT; cat > \"$t\"; chmod %o \"$t\"; "+
-			"mv -fT -- \"$t\" %s; trap - EXIT",
+			"{ sync -- \"$t\" 2>/dev/null || sync; }; "+
+			"mv -fT -- \"$t\" %s; trap - EXIT; { sync -- \"$d\" 2>/dev/null || sync; }",
 		q, mode.Perm(), q)
 }
 

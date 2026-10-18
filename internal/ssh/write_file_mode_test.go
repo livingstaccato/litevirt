@@ -109,3 +109,19 @@ func TestWriteFileCmd_ReplacesARunningExecutable(t *testing.T) {
 		t.Errorf("the running executable was not replaced (it holds %d bytes, not the pushed build)", len(got))
 	}
 }
+
+// fd review m3: without a sync before the rename, a power loss soon after a
+// push can leave the destination renamed over but empty (XFS has no
+// replace-by-rename flush). The staged file is synced before the move and the
+// directory after it.
+//
+// Mutation: drop either sync — the order check fails.
+func TestWriteFileCmd_SyncsAroundTheRename(t *testing.T) {
+	cmd := writeFileCmd("/etc/litevirt/pki/host.key", 0o600)
+	mv := strings.Index(cmd, "mv -fT")
+	before := strings.Index(cmd, "sync -- \"$t\"")
+	after := strings.Index(cmd, "sync -- \"$d\"")
+	if before < 0 || before > mv || after < mv {
+		t.Errorf("the staged file is not synced before the move and its directory after:\n  %s", cmd)
+	}
+}

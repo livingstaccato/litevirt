@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -10,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -144,57 +144,123 @@ type addRemote interface {
 	ReadFile(path string) (data []byte, ok bool, err error)
 	Run(cmd string) error
 	RunWithInput(cmd string, input []byte) error
-	// WriteFile puts data at path by rename, so a running executable at path
-	// is replaced, not written into.
+	// WriteFile puts data at path by a synced rename.
 	WriteFile(path string, data []byte, mode os.FileMode) error
-	// Exists reports which of paths exist.
-	Exists(paths []string) (map[string]bool, error)
-	// InstallKeeping puts each file in place by rename, after copying each
-	// file it replaces to its path plus suffix.
-	InstallKeeping(files []installFile, suffix string) error
-	// Restore undoes InstallKeeping: a file that existed (existed[path]) gets
-	// its copy back, and one that did not is removed.
-	Restore(files []installFile, existed map[string]bool, suffix string) error
+	// Path is how the file commands below must name path.
+	Path(path string) string
+	// Shell runs one of the file commands (installCmd, restoreCmd, ...);
+	// kind names it.
+	Shell(kind, cmd string) ([]byte, error)
+}
+
+const remoteBinary = "/usr/local/bin/litevirt"
+
+// addFile is one file an add installs, from local bytes.
+type addFile struct {
+	path string
+	data []byte
+	mode os.FileMode
 }
 
 // hostAddTo is HostAdd once the new machine is reachable through r.
+//
+// Nothing live on the machine is written until the cluster has admitted the
+// host: every file is uploaded to a staged path beside its destination
+// first, and only moved into place after AdmitHost. A refused add, or one
+// that fails before the admission, removes what it staged and leaves no row.
 func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddPlan) error {
-	caPath := filepath.Join(p.pkiDir, "ca.crt")
-	caKeyPath := filepath.Join(p.pkiDir, "ca.key")
-	hostCertPath := filepath.Join(p.pkiDir, p.hostName+".crt")
-	hostKeyPath := filepath.Join(p.pkiDir, p.hostName+".key")
 	ip := net.ParseIP(p.hostAddr)
+	hostCrt, hostKey := filepath.Join(remotePKIDir, "host.crt"), filepath.Join(remotePKIDir, "host.key")
 
-	hosts, err := c.ListHosts(ctx, &pb.ListHostsRequest{})
+	hostsResp, err := c.ListHosts(ctx, &pb.ListHostsRequest{})
 	if err != nil {
 		return fmt.Errorf("list the cluster's hosts before adding %s: %w", p.hostName, err)
 	}
-	// The certificate of an earlier `lv host add` of this machine that was
-	// admitted and did not finish is used again: the daemon admits it again,
-	// where a new one is refused while the name is live.
-	serial, reused := unfinishedAdd(hosts.GetHosts(), p, hostCertPath, hostKeyPath)
-	if !reused {
-		// Minted beside the operator's copy and moved over it only once
-		// admitted: a refused add leaves a live host's copy alone.
-		stagedCert := filepath.Join(p.pkiDir, "."+p.hostName+".crt.add")
-		stagedKey := filepath.Join(p.pkiDir, "."+p.hostName+".key.add")
-		defer os.Remove(stagedCert)
-		defer os.Remove(stagedKey)
-		if err := pki.GenerateHostCert(caPath, caKeyPath, stagedCert, stagedKey, p.hostName, ip); err != nil {
-			return fmt.Errorf("generate host cert: %w", err)
-		}
-		if serial, err = pki.CertSerial(stagedCert); err != nil {
-			return fmt.Errorf("read generated host certificate serial: %w", err)
-		}
-		hostCertPath, hostKeyPath = stagedCert, stagedKey
+	hosts := hostsResp.GetHosts()
+	installed, err := remoteSerial(r, hostCrt)
+	if err != nil {
+		return err
 	}
-	if err := refuseLiveMember(r, hosts.GetHosts(), p.hostName, serial); err != nil {
+	staged, err := remoteSerial(r, addStagedPath(hostCrt))
+	if err != nil {
+		return err
+	}
+	if err := refuseAnotherMember(hosts, p, installed); err != nil {
 		return err
 	}
 
-	// Every check the daemon makes runs here, before anything reaches the
-	// machine: pushing first replaced the key of a machine whose add was then
-	// refused, and a live host's daemon serves its identity from disk.
+	// An earlier add of this machine under this name: finish it with the
+	// certificate it was admitted with, which the machine holds installed
+	// or staged, or say that it already finished.
+	serial, pairOnMachine := "", false
+	if row := liveHost(hosts, p.hostName); row != nil && row.GetAddress() == p.hostAddr {
+		admittedSerial := strings.ToLower(row.GetCertSerial())
+		joining := row.GetState() == pb.HostState_HOST_JOINING
+		switch {
+		case installed == admittedSerial && !joining:
+			fmt.Printf("Host %s is already a member at %s and serves the certificate it was admitted with; nothing to do\n",
+				p.hostName, p.hostAddr)
+			return addedLocally(p)
+		case joining && (installed == admittedSerial || staged == admittedSerial):
+			serial, pairOnMachine = admittedSerial, true
+		case joining:
+			return fmt.Errorf("%s is admitted (joining) with certificate %s, which the host holds neither installed "+
+				"nor staged. Undo the admission with `lv host rm %s`, then run `%s` again",
+				p.hostName, admittedSerial, p.hostName, p.rerun)
+		}
+	}
+
+	var files []addFile
+	var local []string // minted here, moved into place once admitted
+	if !pairOnMachine {
+		pair, s, err := mintStaged(p.pkiDir, p.hostName, ip, &local)
+		if err != nil {
+			removeAll(local)
+			return err
+		}
+		serial = s
+		files = append(files, addFile{hostCrt, pair[0], 0o644}, addFile{hostKey, pair[1], 0o600})
+	} else if installed != serial {
+		// The admitted pair waits at its staged paths from the earlier add.
+		files = append(files, addFile{path: hostCrt}, addFile{path: hostKey})
+	}
+	rest, err := addOtherFiles(p, ip, &local)
+	if err != nil {
+		removeAll(local)
+		return err
+	}
+	files = append(files, rest...)
+	bin, err := os.ReadFile(p.binPath)
+	if err != nil {
+		removeAll(local)
+		return fmt.Errorf("read the litevirt binary: %w", err)
+	}
+
+	// Upload everything to its staged path. Nothing it replaces yet.
+	var wrote []string
+	unstage := func() {
+		if _, err := r.Shell("unstage", removeCmd(r, stagedPaths(wrote))); err != nil {
+			slog.Warn("could not remove the files staged on the host", "error", err)
+		}
+		removeAll(local)
+	}
+	if err := r.Run("mkdir -p " + ssh.ShellQuote(remotePKIDir) + " && mkdir -p -m 0700 " + ssh.ShellQuote(remoteMigrationDir)); err != nil {
+		return fmt.Errorf("create remote PKI dir: %w", err)
+	}
+	for _, f := range append(files, addFile{remoteBinary, bin, 0o755}) {
+		if f.data == nil {
+			continue
+		}
+		wrote = append(wrote, f.path)
+		if err := r.WriteFile(addStagedPath(f.path), f.data, f.mode); err != nil {
+			unstage()
+			return fmt.Errorf("upload %s (nothing was admitted or installed): %w", filepath.Base(f.path), err)
+		}
+	}
+
+	// Every check the daemon makes runs here. A refusal leaves the host as
+	// it was: pushing first replaced the key of a live host whose add was
+	// then refused.
 	//
 	// The header is this command's claim that it installs its own build,
 	// which keeps a host incarnation; the daemon cannot check which binary
@@ -204,162 +270,178 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 		Name: p.hostName, Address: p.hostAddr, CertSerial: serial,
 	})
 	if err != nil {
-		return fmt.Errorf("admit host identity to the cluster (nothing was pushed to the host): %w", err)
+		unstage()
+		return fmt.Errorf("admit host identity to the cluster (nothing was installed on the host): %w", err)
 	}
 	if why := admitted.GetIncarnationNotIssued(); why != "" {
 		fmt.Printf("  re-admitted %s without a host incarnation: %s\n", p.hostName, why)
 	}
+	keepLocal(local)
 	failed := func(err error) error {
-		return fmt.Errorf("%w\n%s is admitted to the cluster (joining) with certificate %s; "+
-			"run `%s` to finish the add", err, p.hostName, serial, p.rerun)
+		return fmt.Errorf("%w\n%s is admitted to the cluster (joining) with certificate %s and counts as a voter "+
+			"until it starts. Run `%s` to finish the add, or `lv host rm %s` to undo the admission",
+			err, p.hostName, serial, p.rerun, p.hostName)
 	}
-	if !reused {
-		final := filepath.Join(p.pkiDir, p.hostName)
-		if err := os.Rename(hostKeyPath, final+".key"); err != nil {
-			return failed(fmt.Errorf("keep the admitted host key: %w", err))
-		}
-		if err := os.Rename(hostCertPath, final+".crt"); err != nil {
-			return failed(fmt.Errorf("keep the admitted host certificate: %w", err))
-		}
-		hostCertPath, hostKeyPath = final+".crt", final+".key"
-	}
-	migFiles, err := issueMigrationCredentials(p.pkiDir, p.hostName, ip, p.migHolder)
-	if err != nil {
-		return failed(err)
-	}
-	files, err := addIdentityFiles(p, hostCertPath, hostKeyPath, migFiles)
-	if err != nil {
-		return failed(err)
-	}
-	if err := r.Run("mkdir -p " + ssh.ShellQuote(remotePKIDir) + " && mkdir -p -m 0700 " + ssh.ShellQuote(remoteMigrationDir)); err != nil {
-		return failed(fmt.Errorf("create remote PKI dir: %w", err))
+
+	// A machine re-added while its old daemon still runs would serve the
+	// admitted identity from that stale process until setup restarts it.
+	if err := r.Run("systemctl stop litevirt 2>/dev/null || true"); err != nil {
+		return failed(fmt.Errorf("stop the host's daemon before installing: %w", err))
 	}
 	paths := make([]string, len(files))
 	for i, f := range files {
 		paths[i] = f.path
 	}
-	existed, err := r.Exists(paths)
+	existedOut, err := r.Shell("exists", existsCmd(r, paths))
 	if err != nil {
 		return failed(fmt.Errorf("check which identity files the host already has: %w", err))
 	}
+	existed := existsSet(r, paths, existedOut)
 	// Nothing the machine holds is overwritten without a copy, and the copies
 	// go back if the add does not finish.
 	suffix := ".pre-add-" + time.Now().UTC().Format("20060102T150405Z")
 	restore := func(err error) error {
-		if rerr := r.Restore(files, existed, suffix); rerr != nil {
+		if _, rerr := r.Shell("restore", restoreCmd(r, paths, existed, suffix)); rerr != nil {
 			return failed(fmt.Errorf("%w\nputting back the files it replaced failed too (%v): each one it "+
 				"replaced is kept beside it as <file>%s", err, rerr, suffix))
 		}
-		return failed(fmt.Errorf("%w\nthe host's previous identity files were put back", err))
+		return failed(fmt.Errorf("%w\nthe host's previous identity files were put back; the admitted ones are "+
+			"staged beside them for the rerun", err))
 	}
-	if err := r.InstallKeeping(files, suffix); err != nil {
-		return restore(fmt.Errorf("push the host identity: %w", err))
+	if _, err := r.Shell("install", installCmd(r, paths, suffix)); err != nil {
+		return restore(fmt.Errorf("install the host identity: %w", err))
 	}
-	if err := pushAddBinary(r, p.binPath); err != nil {
-		return restore(err)
+	if _, err := r.Shell("binary", installCmd(r, []string{remoteBinary}, "")); err != nil {
+		return restore(fmt.Errorf("install the litevirt binary: %w", err))
+	}
+	// `lv` stays available as a convenience symlink to the combined binary.
+	if err := r.Run("ln -sf /usr/local/bin/litevirt /usr/local/bin/lv"); err != nil {
+		return restore(fmt.Errorf("symlink lv: %w", err))
 	}
 	if err := finishAdd(r, p, serial, admitted); err != nil {
 		return restore(err)
 	}
-	for _, f := range files {
-		if existed[f.path] {
-			fmt.Printf("  kept the %s it replaced as %s\n", f.path, f.path+suffix)
-		}
+	if _, err := r.Shell("discard", removeCmd(r, suffixed(paths, suffix))); err != nil {
+		slog.Warn("could not remove the copies of the replaced identity files", "suffix", suffix, "error", err)
 	}
 	return addedLocally(p)
 }
 
-// unfinishedAdd returns the serial of this machine's copy of hostName's pair
-// when it is the certificate the cluster admitted for an add of this address
-// that has not finished: the row is joining and names it.
-func unfinishedAdd(hosts []*pb.Host, p hostAddPlan, certPath, keyPath string) (string, bool) {
-	if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
-		return "", false
-	}
-	serial, err := pki.CertSerial(certPath)
+// remoteSerial is the serial of the certificate at path on the machine, ""
+// when there is none.
+func remoteSerial(r addRemote, path string) (string, error) {
+	b, ok, err := r.ReadFile(path)
 	if err != nil {
-		return "", false
+		return "", fmt.Errorf("read the host's %s before adding it: %w", filepath.Base(path), err)
 	}
-	for _, h := range hosts {
-		if h.GetName() == p.hostName && h.GetState() == pb.HostState_HOST_JOINING &&
-			h.GetAddress() == p.hostAddr && strings.EqualFold(h.GetCertSerial(), serial) {
-			return serial, true
-		}
+	if !ok {
+		return "", nil
 	}
-	return "", false
+	return installedSerial(b), nil
 }
 
-// refuseLiveMember refuses a machine that serves a live member's current
-// certificate: adding it would replace that member's identity, whatever name
-// it is added under. The certificate of this add's own unfinished admission
-// (serial, under hostName) is not another member.
-func refuseLiveMember(r addRemote, hosts []*pb.Host, hostName, serial string) error {
-	b, ok, err := r.ReadFile(filepath.Join(remotePKIDir, "host.crt"))
-	if err != nil {
-		return fmt.Errorf("read the host's installed certificate before adding it: %w", err)
-	}
-	installed := installedSerial(b)
-	if !ok || installed == "" {
-		return nil
-	}
+// liveHost is the listed (live) row of name, or nil.
+func liveHost(hosts []*pb.Host, name string) *pb.Host {
 	for _, h := range hosts {
-		if !strings.EqualFold(h.GetCertSerial(), installed) {
-			continue
+		if h.GetName() == name {
+			return h
 		}
-		if h.GetName() == hostName && strings.EqualFold(installed, serial) {
-			return nil
-		}
-		return fmt.Errorf("the host serves %s's current certificate (serial %s): it is a live member of the "+
-			"cluster, and adding it would replace %s's identity on disk. Nothing was pushed. To add this "+
-			"machine again, remove it first (`lv host rm %s`)", h.GetName(), installed, h.GetName(), h.GetName())
 	}
 	return nil
 }
 
-// addIdentityFiles is the key material an add installs: the cluster CA, the
-// host's pair, the gossip key, and its migration credentials.
-func addIdentityFiles(p hostAddPlan, hostCertPath, hostKeyPath string, migFiles []migrationFile) ([]installFile, error) {
-	// The host KEY is 0600. It is the node's entire cluster identity: peer mTLS
-	// authenticates with it and audit rows are signed with it, so a local user
-	// who can read it can both impersonate the host to every peer and forge its
-	// audit history.
-	src := []migrationFile{
-		{filepath.Join(p.pkiDir, "ca.crt"), filepath.Join(remotePKIDir, "ca.crt"), 0o644},
-		{hostCertPath, filepath.Join(remotePKIDir, "host.crt"), 0o644},
-		{hostKeyPath, filepath.Join(remotePKIDir, "host.key"), 0o600},
+// refuseAnotherMember refuses a machine that is another live member: one
+// that serves another host's current certificate, or whose address another
+// host has. Adding it would replace that member's identity on disk. Removed
+// hosts are not listed, so a re-add after `lv host rm` passes.
+func refuseAnotherMember(hosts []*pb.Host, p hostAddPlan, installed string) error {
+	for _, h := range hosts {
+		if h.GetName() == p.hostName {
+			continue
+		}
+		var why string
+		switch {
+		case installed != "" && strings.EqualFold(h.GetCertSerial(), installed):
+			why = fmt.Sprintf("the host serves %s's current certificate (serial %s)", h.GetName(), installed)
+		case h.GetAddress() == p.hostAddr:
+			why = fmt.Sprintf("%s is a live member at that address", h.GetName())
+		default:
+			continue
+		}
+		return fmt.Errorf("refusing to add %s at %s: %s, and adding it would replace %s's identity on disk. "+
+			"Nothing was pushed. To add this machine under another name, remove it first (`lv host rm %s`)",
+			p.hostName, p.hostAddr, why, h.GetName(), h.GetName())
 	}
+	return nil
+}
+
+// mintStaged mints hostName's pair beside this machine's copy and returns
+// its contents and serial. The paths are appended to local.
+func mintStaged(pkiDir, hostName string, ip net.IP, local *[]string) ([2][]byte, string, error) {
+	crt := filepath.Join(pkiDir, "."+hostName+".crt.add")
+	key := filepath.Join(pkiDir, "."+hostName+".key.add")
+	*local = append(*local, crt, key)
+	var pair [2][]byte
+	if err := pki.GenerateHostCert(filepath.Join(pkiDir, "ca.crt"), filepath.Join(pkiDir, "ca.key"), crt, key, hostName, ip); err != nil {
+		return pair, "", fmt.Errorf("generate host cert: %w", err)
+	}
+	serial, err := pki.CertSerial(crt)
+	if err != nil {
+		return pair, "", fmt.Errorf("read generated host certificate serial: %w", err)
+	}
+	for i, f := range []string{crt, key} {
+		if pair[i], err = os.ReadFile(f); err != nil {
+			return pair, "", err
+		}
+	}
+	return pair, strings.ToLower(serial), nil
+}
+
+// addOtherFiles is the rest of the key material an add installs: the cluster
+// CA, the gossip key and the host's migration credentials (minted beside this
+// machine's copy; paths appended to local).
+func addOtherFiles(p hostAddPlan, ip net.IP, local *[]string) ([]addFile, error) {
+	crt := filepath.Join(p.pkiDir, "."+p.hostName+"-migration.crt.add")
+	key := filepath.Join(p.pkiDir, "."+p.hostName+"-migration.key.add")
+	*local = append(*local, crt, key)
+	mig, err := issueMigrationCredentialsAt(p.pkiDir, crt, key, p.hostName, net.ParseIP(p.hostAddr), p.migHolder)
+	if err != nil {
+		return nil, err
+	}
+	src := []migrationFile{{filepath.Join(p.pkiDir, "ca.crt"), filepath.Join(remotePKIDir, "ca.crt"), 0o644}}
 	if p.gossipKeyPath != "" {
-		// 0600 for the same reason as host.key: whoever reads it speaks gossip.
+		// 0600 like host.key: whoever reads it speaks gossip.
 		src = append(src, migrationFile{p.gossipKeyPath, filepath.Join(remotePKIDir, pki.GossipKeyName), 0o600})
 	}
-	src = append(src, migFiles...)
-	files := make([]installFile, 0, len(src))
+	src = append(src, mig...)
+	files := make([]addFile, 0, len(src))
 	for _, f := range src {
 		b, err := os.ReadFile(f.local)
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", f.local, err)
 		}
-		files = append(files, installFile{path: f.remote, data: b, mode: f.mode})
+		files = append(files, addFile{f.remote, b, f.mode})
 	}
 	return files, nil
 }
 
-// pushAddBinary installs the litevirt binary and the `lv` symlink. The write
-// is a rename, so a daemon running from the old binary does not stop it.
-func pushAddBinary(r addRemote, binPath string) error {
-	slog.Info("pushing litevirt binary", "path", binPath)
-	b, err := os.ReadFile(binPath)
-	if err != nil {
-		return fmt.Errorf("push litevirt binary: %w", err)
+func removeAll(paths []string) {
+	for _, p := range paths {
+		_ = os.Remove(p)
 	}
-	if err := r.WriteFile("/usr/local/bin/litevirt", b, 0o755); err != nil {
-		return fmt.Errorf("push litevirt binary: %w", err)
+}
+
+// keepLocal moves this machine's minted copies (".<name>.add") into place
+// once admitted. A failure leaves the staged copy where it is: the admitted
+// pair is also staged on the host, and the rerun takes it from there.
+func keepLocal(local []string) {
+	for _, s := range local {
+		dir, base := filepath.Split(s)
+		final := filepath.Join(dir, strings.TrimSuffix(strings.TrimPrefix(base, "."), ".add"))
+		if err := os.Rename(s, final); err != nil {
+			slog.Warn("could not keep this machine's copy of the admitted credentials", "path", s, "error", err)
+		}
 	}
-	// `lv` stays available as a convenience symlink to the combined binary.
-	if err := r.Run("ln -sf /usr/local/bin/litevirt /usr/local/bin/lv"); err != nil {
-		return fmt.Errorf("symlink lv: %w", err)
-	}
-	return nil
 }
 
 // finishAdd writes the audit admission record and runs setup, which starts
@@ -442,6 +524,115 @@ func installedSerial(b []byte) string {
 	return strings.ToLower(cert.SerialNumber.Text(16))
 }
 
+func addStagedPath(path string) string {
+	return filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".add")
+}
+
+func stagedPaths(paths []string) []string {
+	out := make([]string, len(paths))
+	for i, p := range paths {
+		out[i] = addStagedPath(p)
+	}
+	return out
+}
+
+func suffixed(paths []string, suffix string) []string {
+	out := make([]string, len(paths))
+	for i, p := range paths {
+		out[i] = p + suffix
+	}
+	return out
+}
+
+// syncCmd flushes path (a file or directory) to disk; a sync without
+// arguments where coreutils cannot sync one file.
+func syncCmd(q string) string { return fmt.Sprintf("{ sync -- %s 2>/dev/null || sync; }; ", q) }
+
+// existsCmd prints each of paths that exists, one per line.
+func existsCmd(r addRemote, paths []string) string {
+	var b strings.Builder
+	for _, p := range paths {
+		q := ssh.ShellQuote(r.Path(p))
+		fmt.Fprintf(&b, "if [ -e %s ]; then printf '%%s\\n' %s; fi; ", q, q)
+	}
+	return b.String()
+}
+
+// existsSet reads existsCmd's output back into paths.
+func existsSet(r addRemote, paths []string, out []byte) map[string]bool {
+	listed := map[string]bool{}
+	for _, l := range strings.Split(string(out), "\n") {
+		listed[l] = true
+	}
+	got := map[string]bool{}
+	for _, p := range paths {
+		if listed[r.Path(p)] {
+			got[p] = true
+		}
+	}
+	return got
+}
+
+// installCmd moves each path's staged file into place, synced before and
+// after the rename. With a suffix, every file it replaces is first copied to
+// path+suffix: its content (a symlinked key is followed) at 0600.
+func installCmd(r addRemote, paths []string, suffix string) string {
+	var cmd strings.Builder
+	cmd.WriteString("set -e; umask 077; ")
+	if suffix != "" {
+		for _, p := range paths {
+			q, b := ssh.ShellQuote(r.Path(p)), ssh.ShellQuote(r.Path(p)+suffix)
+			fmt.Fprintf(&cmd, "if [ -e %s ]; then rm -f -- %s; cp -L -- %s %s; chmod 600 %s; fi; ", q, b, q, b, b)
+		}
+	}
+	dirs := map[string]bool{}
+	for _, p := range paths {
+		q, s := ssh.ShellQuote(r.Path(p)), ssh.ShellQuote(r.Path(addStagedPath(p)))
+		cmd.WriteString(syncCmd(s))
+		fmt.Fprintf(&cmd, "mv -fT -- %s %s; ", s, q)
+		dirs[filepath.Dir(r.Path(p))] = true
+	}
+	for _, p := range paths {
+		if d := filepath.Dir(r.Path(p)); dirs[d] {
+			cmd.WriteString(syncCmd(ssh.ShellQuote(d)))
+			delete(dirs, d)
+		}
+	}
+	return cmd.String()
+}
+
+// restoreCmd undoes installCmd. A path whose staged file is still there was
+// never replaced. Any other goes back to its staged path, so the admitted
+// file stays on the host for a rerun, and its copy back into place; one with
+// no copy did not exist.
+func restoreCmd(r addRemote, paths []string, existed map[string]bool, suffix string) string {
+	var cmd strings.Builder
+	cmd.WriteString("rc=0; ")
+	for _, p := range paths {
+		q := ssh.ShellQuote(r.Path(p))
+		s, b := ssh.ShellQuote(r.Path(addStagedPath(p))), ssh.ShellQuote(r.Path(p)+suffix)
+		fmt.Fprintf(&cmd, "if [ -e %s ]; then rm -f -- %s || rc=1; else ", s, b)
+		fmt.Fprintf(&cmd, "if [ -e %s ]; then mv -fT -- %s %s || rc=1; fi; ", q, q, s)
+		if existed[p] {
+			fmt.Fprintf(&cmd, "if [ -e %s ]; then mv -fT -- %s %s || rc=1; fi; ", b, b, q)
+		}
+		cmd.WriteString("fi; ")
+	}
+	cmd.WriteString("exit $rc")
+	return cmd.String()
+}
+
+// removeCmd removes each of paths.
+func removeCmd(r addRemote, paths []string) string {
+	var cmd strings.Builder
+	cmd.WriteString("rc=0; ")
+	for _, p := range paths {
+		fmt.Fprintf(&cmd, "rm -f -- %s || rc=1; ", ssh.ShellQuote(r.Path(p)))
+	}
+	cmd.WriteString("exit $rc")
+	return cmd.String()
+}
+
 // sshAddRemote is addRemote over SSH.
 type sshAddRemote struct{ sshRemotePKI }
 
@@ -455,97 +646,28 @@ func (r *sshAddRemote) WriteFile(path string, data []byte, mode os.FileMode) err
 	return r.sc.WriteFile(path, data, mode)
 }
 
-func (r *sshAddRemote) Exists(paths []string) (map[string]bool, error) {
-	out, err := r.sc.RunOutput(existsCmd(paths))
-	if err != nil {
-		return nil, err
-	}
-	got := map[string]bool{}
-	for _, l := range strings.Split(string(out), "\n") {
-		if l != "" {
-			got[l] = true
-		}
-	}
-	return got, nil
-}
+func (r *sshAddRemote) Path(path string) string { return path }
 
-// existsCmd prints each of paths that exists, one per line.
-func existsCmd(paths []string) string {
-	var b strings.Builder
-	for _, p := range paths {
-		q := ssh.ShellQuote(p)
-		fmt.Fprintf(&b, "if [ -e %s ]; then printf '%%s\\n' %s; fi; ", q, q)
-	}
-	return b.String()
-}
-
-func (r *sshAddRemote) InstallKeeping(files []installFile, suffix string) error {
-	// Stage everything first: a dropped connection mid-transfer leaves the
-	// installed files untouched.
-	for _, f := range files {
-		if err := r.sc.WriteFile(addStagedPath(f.path), f.data, f.mode); err != nil {
-			return fmt.Errorf("stage %s: %w", filepath.Base(f.path), err)
-		}
-	}
-	return r.sc.Run(installKeepingCmd(files, suffix))
-}
-
-// installKeepingCmd copies every file it replaces (cp -p keeps a key's 0600)
-// before it moves any staged file into place.
-func installKeepingCmd(files []installFile, suffix string) string {
-	var cmd strings.Builder
-	cmd.WriteString("set -e; ")
-	for _, f := range files {
-		q := ssh.ShellQuote(f.path)
-		fmt.Fprintf(&cmd, "if [ -e %s ]; then cp -pP -- %s %s; fi; ", q, q, ssh.ShellQuote(f.path+suffix))
-	}
-	for _, f := range files {
-		fmt.Fprintf(&cmd, "mv -fT -- %s %s; ", ssh.ShellQuote(addStagedPath(f.path)), ssh.ShellQuote(f.path))
-	}
-	return cmd.String()
-}
-
-func (r *sshAddRemote) Restore(files []installFile, existed map[string]bool, suffix string) error {
-	return r.sc.Run(restoreCmd(files, existed, suffix))
-}
-
-// restoreCmd puts back each file that existed from its copy, and removes each
-// one that did not. A file whose copy is missing was never replaced.
-func restoreCmd(files []installFile, existed map[string]bool, suffix string) string {
-	var cmd strings.Builder
-	for _, f := range files {
-		q := ssh.ShellQuote(f.path)
-		if existed[f.path] {
-			b := ssh.ShellQuote(f.path + suffix)
-			fmt.Fprintf(&cmd, "if [ -e %s ]; then mv -fT -- %s %s; fi; ", b, b, q)
-		} else {
-			fmt.Fprintf(&cmd, "rm -f -- %s; ", q)
-		}
-		fmt.Fprintf(&cmd, "rm -f -- %s; ", ssh.ShellQuote(addStagedPath(f.path)))
-	}
-	return cmd.String()
-}
-
-func addStagedPath(path string) string {
-	return filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".add")
-}
+func (r *sshAddRemote) Shell(_, cmd string) ([]byte, error) { return r.sc.RunOutput(cmd) }
 
 // LocalAddTarget is addRemote over a directory tree this process can reach (a
 // test's): /etc/litevirt/pki maps to PKIDir and every other absolute path
-// under Root. Commands are recorded, not run.
+// under Root. The file commands run here under sh; the others are recorded,
+// not run.
 type LocalAddTarget struct {
 	Root, PKIDir string
 	// Binary is the file pushed as the litevirt binary.
 	Binary string
-	// FailSetup is what running setup returns.
+	// FailSetup is what running setup returns; FailWrite what writing a
+	// path (as the host names it) returns.
 	FailSetup error
-	// Commands are the commands run, in order; Wrote the paths written,
-	// moved or removed.
-	Commands []string
-	Wrote    []string
+	FailWrite map[string]error
+	// Events are what reached the host, in order: "write <path>",
+	// "run <cmd>" and "sh <kind>".
+	Events []string
 }
 
-func (d *LocalAddTarget) local(path string) string {
+func (d *LocalAddTarget) Path(path string) string {
 	if path == remotePKIDir || strings.HasPrefix(path, remotePKIDir+"/") {
 		return filepath.Join(d.PKIDir, strings.TrimPrefix(path, remotePKIDir))
 	}
@@ -553,7 +675,7 @@ func (d *LocalAddTarget) local(path string) string {
 }
 
 func (d *LocalAddTarget) ReadFile(path string) ([]byte, bool, error) {
-	b, err := os.ReadFile(d.local(path))
+	b, err := os.ReadFile(d.Path(path))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, false, nil
 	}
@@ -561,12 +683,12 @@ func (d *LocalAddTarget) ReadFile(path string) ([]byte, bool, error) {
 }
 
 func (d *LocalAddTarget) Run(cmd string) error {
-	d.Commands = append(d.Commands, cmd)
+	d.Events = append(d.Events, "run "+cmd)
 	return nil
 }
 
 func (d *LocalAddTarget) RunWithInput(cmd string, _ []byte) error {
-	d.Commands = append(d.Commands, cmd)
+	d.Events = append(d.Events, "run "+cmd)
 	if strings.HasSuffix(cmd, "bash -s") {
 		return d.FailSetup
 	}
@@ -574,57 +696,23 @@ func (d *LocalAddTarget) RunWithInput(cmd string, _ []byte) error {
 }
 
 func (d *LocalAddTarget) WriteFile(path string, data []byte, mode os.FileMode) error {
-	d.Wrote = append(d.Wrote, path)
-	if err := os.MkdirAll(filepath.Dir(d.local(path)), 0o700); err != nil {
+	d.Events = append(d.Events, "write "+path)
+	if err := d.FailWrite[path]; err != nil {
 		return err
 	}
-	return secretfile.Write(d.local(path), data, mode)
+	if err := os.MkdirAll(filepath.Dir(d.Path(path)), 0o755); err != nil {
+		return err
+	}
+	return secretfile.Write(d.Path(path), data, mode)
 }
 
-func (d *LocalAddTarget) Exists(paths []string) (map[string]bool, error) {
-	got := map[string]bool{}
-	for _, p := range paths {
-		if _, err := os.Lstat(d.local(p)); err == nil {
-			got[p] = true
-		}
+func (d *LocalAddTarget) Shell(kind, cmd string) ([]byte, error) {
+	d.Events = append(d.Events, "sh "+kind)
+	out, err := exec.Command("sh", "-c", cmd).Output()
+	if err != nil {
+		return out, fmt.Errorf("%s: %w", kind, err)
 	}
-	return got, nil
-}
-
-func (d *LocalAddTarget) InstallKeeping(files []installFile, suffix string) error {
-	for _, f := range files {
-		if b, err := os.ReadFile(d.local(f.path)); err == nil {
-			st, _ := os.Stat(d.local(f.path))
-			if err := secretfile.Write(d.local(f.path+suffix), b, st.Mode().Perm()); err != nil {
-				return err
-			}
-		}
-	}
-	for _, f := range files {
-		if err := d.WriteFile(f.path, f.data, f.mode); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (d *LocalAddTarget) Restore(files []installFile, existed map[string]bool, suffix string) error {
-	for _, f := range files {
-		d.Wrote = append(d.Wrote, f.path)
-		if existed[f.path] {
-			b := d.local(f.path + suffix)
-			if _, err := os.Stat(b); err == nil {
-				if err := os.Rename(b, d.local(f.path)); err != nil {
-					return err
-				}
-			}
-			continue
-		}
-		if err := os.Remove(d.local(f.path)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	return nil
+	return out, nil
 }
 
 // HostAddOn adds hostName at hostAddr to the cluster c reaches, on the

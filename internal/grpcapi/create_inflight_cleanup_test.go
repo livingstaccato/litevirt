@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -145,5 +146,55 @@ func TestForeignDomainDiskPaths_OnlyWhatTheDomainNames(t *testing.T) {
 	}
 	if s.foreignDomainDiskPaths("vm9", "11111111-2222-3333-4444-ababababab03")("/d/other.qcow2") {
 		t.Error("the create's own domain protects its disks from its own cleanup")
+	}
+}
+
+// Only libvirt's own "no such domain" means nothing of the name is there: a
+// failure whose text merely says "not found" (a transport error naming a
+// missing socket) leaves every disk.
+//
+// Mutation: classify by text (lv.IsNotFound) — red.
+func TestForeignDomainDiskPaths_AnUntypedNotFoundIsNoAbsence(t *testing.T) {
+	s, fake := promoteFixture(t)
+	if err := fake.DefineDomain("<domain type='kvm'><name>vm9</name><uuid>11111111-2222-3333-4444-ababababab04</uuid></domain>"); err != nil {
+		t.Fatal(err)
+	}
+	lost := errors.New("rpc: socket /run/libvirt/libvirt-sock not found")
+	fake.FailDumpXMLInactive = func(string) error { return lost }
+	fake.FailDumpXML = func(string) error { return lost }
+	if !s.foreignDomainDiskPaths("vm9", "self")("/d/vm9-root.qcow2") {
+		t.Error("an unreadable domain was taken for no domain; its disks would be deleted")
+	}
+}
+
+// What the domain names is looked at within sharedDiskStatTimeout: a file
+// that cannot be looked at (a hard mount whose server is gone) keeps every
+// disk, and the cleanup returns instead of hanging.
+//
+// Mutation: stat the domain's files unbounded — the call does not return, red.
+func TestForeignDomainDiskPaths_BoundedFileCheck(t *testing.T) {
+	s, fake := promoteFixture(t)
+	if err := fake.DefineDomain("<domain type='kvm'><name>vm9</name><uuid>11111111-2222-3333-4444-ababababab05</uuid><devices>" +
+		"<disk type='file' device='disk'><source file='/mnt/gone/vm9.qcow2'/></disk></devices></domain>"); err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	prevStat, prevTimeout := statShared, sharedDiskStatTimeout
+	statShared = func(string) (os.FileInfo, error) {
+		<-release
+		return nil, errors.New("released")
+	}
+	sharedDiskStatTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { statShared, sharedDiskStatTimeout = prevStat, prevTimeout })
+	done := make(chan bool, 1)
+	go func() { done <- s.foreignDomainDiskPaths("vm9", "self")("/d/vm9-root.qcow2") }()
+	select {
+	case kept := <-done:
+		if !kept {
+			t.Error("a file that could not be looked at did not keep the disks")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the foreign-disk check hung on an unreachable file")
 	}
 }

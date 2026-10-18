@@ -160,7 +160,8 @@ func (s *Server) refuseLiveDomainOfName(name, self string) error {
 // file is matched by its spelling and by the file it is (a symlinked pool
 // directory names one file two ways), looked at within
 // sharedDiskStatTimeout. A domain whose uuid cannot be read is foreign.
-// Nothing matches only when libvirt says no domain of the name exists; when
+// Nothing matches only when libvirt says no domain of the name exists (its
+// typed VIR_ERR_NO_DOMAIN, never an error's text); when
 // what the domain names cannot be known (its definition or its sources
 // unreadable, a source of another form, a file that cannot be looked at),
 // every path matches and the failed create leaves its disks.
@@ -174,7 +175,7 @@ func (s *Server) foreignDomainDiskPaths(name, self string) func(string) bool {
 	live, lerr := s.virt.DumpXML(name)
 	switch {
 	case ierr != nil && lerr != nil:
-		if lv.IsNotFound(ierr) && lv.IsNotFound(lerr) {
+		if lv.IsNoDomain(ierr) && lv.IsNoDomain(lerr) {
 			return none
 		}
 		return all
@@ -329,12 +330,15 @@ func (s *Server) domainIsVMsOwn(ctx context.Context, name, specUUID, diskOwner s
 	if len(mine) == 0 {
 		return false, du, fmt.Sprintf("the VM's row records no disk on %s", s.hostName), nil
 	}
-	on, derr := domainRunsOnAny(x, mine)
+	on, rbdWhy, derr := domainDiskMatch(x, mine)
 	if derr != nil {
 		return false, du, "", derr
 	}
 	if !on {
 		why = fmt.Sprintf("none of its disks is one of the %d the VM's row records on %s", len(mine), s.hostName)
+		if rbdWhy != "" {
+			why = rbdWhy
+		}
 	}
 	return on, du, why, nil
 }
@@ -350,8 +354,16 @@ func (s *Server) domainIsVMsOwn(ctx context.Context, name, specUUID, diskOwner s
 // cannot be looked at (a hard mount whose server is gone) is an error:
 // whether the domain runs on it is not known.
 func domainRunsOnAny(domXML string, paths []string) (bool, error) {
+	on, _, err := domainDiskMatch(domXML, paths)
+	return on, err
+}
+
+// domainDiskMatch is domainRunsOnAny, and, when it matched nothing, why an
+// rbd disk of the domain that is the pool/image of one of paths is not that
+// disk ("" when none is): its Ceph cluster is another, or cannot be told.
+func domainDiskMatch(domXML string, paths []string) (bool, string, error) {
 	if len(paths) == 0 {
-		return false, nil
+		return false, "", nil
 	}
 	var dom struct {
 		Devices struct {
@@ -366,14 +378,18 @@ func domainRunsOnAny(domXML string, paths []string) (bool, error) {
 						Name string `xml:"name,attr"`
 						Port string `xml:"port,attr"`
 					} `xml:"host"`
+					Config struct {
+						File string `xml:"file,attr"`
+					} `xml:"config"`
 				} `xml:"source"`
 			} `xml:"disk"`
 		} `xml:"devices"`
 	}
 	if err := xml.Unmarshal([]byte(domXML), &dom); err != nil {
-		return false, nil
+		return false, "", nil
 	}
 	var srcs []string
+	rbdWhy := ""
 	for _, d := range dom.Devices.Disks {
 		if d.Device != "" && d.Device != "disk" {
 			continue
@@ -387,8 +403,15 @@ func domainRunsOnAny(domXML string, paths []string) (bool, error) {
 				mons = append(mons, cephMon{host: strings.Trim(h.Name, "[]"), port: h.Port})
 			}
 			for _, p := range paths {
-				if l, ok := storage.ParseCephLocator(p); ok && l.Spec == d.Source.Name && rbdSameCluster(mons, l) {
-					return true, nil
+				l, ok := storage.ParseCephLocator(p)
+				if !ok || l.Spec != d.Source.Name {
+					continue
+				}
+				if rbdSameCluster(mons, d.Source.Config.File, l) {
+					return true, "", nil
+				}
+				if rbdWhy == "" {
+					rbdWhy = rbdClusterMismatch(d.Source.Name, mons, d.Source.Config.File)
 				}
 			}
 			continue
@@ -399,7 +422,7 @@ func domainRunsOnAny(domXML string, paths []string) (bool, error) {
 			}
 			for _, p := range paths {
 				if p == src {
-					return true, nil
+					return true, "", nil
 				}
 			}
 			srcs = append(srcs, src)
@@ -413,7 +436,7 @@ func domainRunsOnAny(domXML string, paths []string) (bool, error) {
 		}
 	}
 	if len(srcs) == 0 || len(local) == 0 {
-		return false, nil
+		return false, rbdWhy, nil
 	}
 	look := func(p string) (os.FileInfo, bool, error) {
 		fi, err := statInfoWithin(p, sharedDiskStatTimeout)
@@ -431,30 +454,30 @@ func domainRunsOnAny(domXML string, paths []string) (bool, error) {
 	for _, p := range local {
 		fi, ok, err := look(p)
 		if err != nil {
-			return false, err
+			return false, "", err
 		}
 		if ok {
 			pfis = append(pfis, fi)
 		}
 	}
 	if len(pfis) == 0 {
-		return false, nil
+		return false, rbdWhy, nil
 	}
 	for _, src := range srcs {
 		sfi, ok, err := look(src)
 		if err != nil {
-			return false, err
+			return false, "", err
 		}
 		if !ok {
 			continue
 		}
 		for _, pfi := range pfis {
 			if os.SameFile(sfi, pfi) {
-				return true, nil
+				return true, "", nil
 			}
 		}
 	}
-	return false, nil
+	return false, rbdWhy, nil
 }
 
 // cephMon is one Ceph monitor address: host, and port when one is named.
@@ -475,17 +498,38 @@ func parseCephMon(m string) cephMon {
 }
 
 // sameMon reports whether a and b are one monitor: one host, on one port or
-// on its two protocol ports (v2 3300, v1 6789); a monitor with no port is on
-// its default one.
+// on its two default protocol ports (v2 3300, v1 6789); a monitor named with
+// no port is on a default one, never on any other.
 func sameMon(a, b cephMon) bool {
 	if a.host == "" || a.host != b.host {
 		return false
 	}
-	if a.port == "" || b.port == "" || a.port == b.port {
+	if a.port == b.port {
 		return true
 	}
-	isMonPort := func(p string) bool { return p == "3300" || p == "6789" }
-	return isMonPort(a.port) && isMonPort(b.port)
+	isDefault := func(p string) bool { return p == "" || p == "3300" || p == "6789" }
+	return isDefault(a.port) && isDefault(b.port)
+}
+
+// rbdClusterMismatch says why an rbd disk of a domain that is a recorded
+// pool/image is not the recorded disk (rbdSameCluster), for an operator.
+func rbdClusterMismatch(spec string, dom []cephMon, domConf string) string {
+	on := "the default ceph.conf's monitors"
+	if len(dom) > 0 {
+		names := make([]string, len(dom))
+		for i, m := range dom {
+			names[i] = m.host
+			if m.port != "" {
+				names[i] += ":" + m.port
+			}
+		}
+		on = "monitors " + strings.Join(names, ", ")
+	} else if domConf != "" {
+		on = "the cluster of its own " + domConf
+	}
+	return fmt.Sprintf("its rbd disk %s is the VM's pool/image, but on %s, which share no monitor with the VM's Ceph cluster "+
+		"(another cluster, or one that cannot be told); if the cluster's monitors were all replaced, the domain still names the "+
+		"retired ones: undefine it, or give it the current ones, and rebuild again", spec, on)
 }
 
 // rbdSameCluster reports whether a domain's rbd source, on monitors dom,
@@ -494,8 +538,14 @@ func sameMon(a, b cephMon) bool {
 // mon_host, and its conf's; a side that names none uses the default
 // ceph.conf, whose monitors stand in for it, and two sides that both name
 // none read the same file. A cluster that cannot be known (a conf or the
-// default ceph.conf unreadable, or naming no monitor) is not the same.
-func rbdSameCluster(dom []cephMon, l storage.CephLocator) bool {
+// default ceph.conf unreadable, or naming no monitor, or a domain that names
+// a <config file> of its own and no monitor) is not the same.
+func rbdSameCluster(dom []cephMon, domConf string, l storage.CephLocator) bool {
+	if len(dom) == 0 && domConf != "" {
+		// The domain reads its cluster from a conf of its own, which says
+		// nothing this host can compare.
+		return false
+	}
 	var want []cephMon
 	add := func(ms []string) {
 		for _, m := range ms {

@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -149,4 +150,99 @@ func TestRebuildVM_NeverDestroysAnRBDDomainOnAnotherCephCluster(t *testing.T) {
 			t.Errorf("domainIsVMsOwn = %v, %q, %v; want the VM's own", own, why, err)
 		}
 	})
+}
+
+// The edges of the monitor rule: a domain that takes its cluster from a
+// <config file> of its own (and names no <host>) is on a cluster this host
+// cannot tell, never the default ceph.conf's; a monitor named with no port is
+// on a default port (6789 or 3300), not on any port.
+//
+// Mutations: read a <config file> domain as the default conf's — "own conf
+// file" red; let a port-less monitor match any port — "port-less against
+// another port" red.
+func TestDomainRunsOnAny_RBDIdentityEdges(t *testing.T) {
+	withConf := func(conf string, hosts ...string) string {
+		x := rbdDomain("u", "lv/vm1-root", hosts...)
+		return strings.Replace(x, "</source>", "<config file='"+conf+"'/></source>", 1)
+	}
+	for _, tc := range []struct {
+		name     string
+		xml      string
+		recorded string
+		defConf  string
+		want     bool
+	}{
+		{"own conf file", withConf("/etc/ceph/b.conf"), "rbd:lv/vm1-root", "10.0.0.1:6789", false},
+		{"own conf file, pinned locator", withConf("/etc/ceph/b.conf"), `rbd:lv/vm1-root:mon_host=10.0.0.1\:6789`, "10.0.0.1:6789", false},
+		{"own conf file and a shared monitor", withConf("/etc/ceph/b.conf", "10.0.0.1:6789"), `rbd:lv/vm1-root:mon_host=10.0.0.1\:6789`, "", true},
+		{"port-less against another port", rbdDomain("u", "lv/vm1-root", "10.0.0.1"), `rbd:lv/vm1-root:mon_host=10.0.0.1\:6790`, "", false},
+		{"port-less against the default port", rbdDomain("u", "lv/vm1-root", "10.0.0.1"), `rbd:lv/vm1-root:mon_host=10.0.0.1\:6789`, "", true},
+		{"port-less against the v2 port", rbdDomain("u", "lv/vm1-root", "10.0.0.1"), `rbd:lv/vm1-root:mon_host=10.0.0.1\:3300`, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withDefaultCephConf(t, tc.defConf)
+			got, err := domainRunsOnAny(tc.xml, []string{tc.recorded})
+			if err != nil || got != tc.want {
+				t.Errorf("domainRunsOnAny = %v, %v; want %v", got, err, tc.want)
+			}
+		})
+	}
+}
+
+// A locator that names its litevirt pool is on the monitors that pool has on
+// this host now, as a domain defined now is given them: after a rolling
+// monitor replacement the domain, still on an old monitor and a kept one, is
+// on the same cluster; one on retired monitors only is not.
+//
+// Mutation: ignore the pool's current monitors — "kept monitor" red.
+func TestDomainRunsOnAny_RBDUsesThePoolsCurrentMonitors(t *testing.T) {
+	withDefaultCephConf(t, "")
+	t.Cleanup(lv.SetCephMonitorResolver(func(pool string) ([]string, bool) {
+		if pool != "ceph1" {
+			return nil, false
+		}
+		return []string{"10.0.0.2:6789", "10.0.0.3:6789"}, true
+	}))
+	const recorded = "rbd:lv/vm1-root:id=litevirt:keyring=/k:lvpool=ceph1"
+	for _, tc := range []struct {
+		name  string
+		hosts []string
+		want  bool
+	}{
+		{"kept monitor", []string{"10.0.0.1:6789", "10.0.0.2:6789"}, true},
+		{"retired monitors only", []string{"10.0.0.1:6789"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := domainRunsOnAny(rbdDomain("u", "lv/vm1-root", tc.hosts...), []string{recorded})
+			if err != nil || got != tc.want {
+				t.Errorf("domainRunsOnAny = %v, %v; want %v", got, err, tc.want)
+			}
+		})
+	}
+}
+
+// A rebuild refused because the domain's rbd image is the VM's pool/image on
+// a cluster that is not the VM's says so, naming the monitors, and the way
+// out.
+//
+// Mutation: the generic "none of its disks" reason — red.
+func TestDomainIsVMsOwn_NamesTheCephClusterMismatch(t *testing.T) {
+	withDefaultCephConf(t, "")
+	s, fake := promoteFixture(t)
+	if err := s.db.Execute(adminCtx(), `UPDATE vm_disks SET path = ?, storage_type = 'ceph' WHERE vm_name = 'vm1'`,
+		`rbd:lv/vm1-root:mon_host=10.0.0.1\:6789`); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.DefineDomain(rbdDomain("eeeeeeee-0000-0000-0000-000000000042", "lv/vm1-root", "10.0.9.1:6789")); err != nil {
+		t.Fatal(err)
+	}
+	own, _, why, err := s.domainIsVMsOwn(adminCtx(), "vm1", "aaaaaaaa-0000-0000-0000-000000000001", "vm1")
+	if err != nil || own {
+		t.Fatalf("domainIsVMsOwn = %v, %v; want not the VM's", own, err)
+	}
+	for _, want := range []string{"lv/vm1-root", "Ceph cluster", "10.0.9.1:6789"} {
+		if !strings.Contains(why, want) {
+			t.Errorf("why %q does not name %q", why, want)
+		}
+	}
 }

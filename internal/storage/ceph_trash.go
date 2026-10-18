@@ -124,7 +124,7 @@ type cephPurgeQueue struct {
 	mu       sync.Mutex
 	m        map[string]*cephPurgeEntry // TrashRef → entry
 	dir      string                     // where the queue is kept ("" → memory only)
-	setAside []string                   // unreadable queue files, moved aside
+	setAside []string                   // unreadable queue files, moved aside (or where they are, when they could not be)
 	writeMu  sync.Mutex
 }
 
@@ -261,9 +261,10 @@ func attemptCephPurge(ref string) (done bool) {
 		return true
 	}
 	msg := fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out)))
-	if rbdErrno(err) == rbdEBUSY && !p.Claimed {
+	if rbdErrno(err) == rbdEBUSY {
 		// A client has the image open in the trash: it opened it before
-		// the move (rbd does not refuse to move an open image). It may be a
+		// the move (rbd does not refuse to move an open image), or before
+		// the interrupted `rbd rm` that left a claimed entry. It may be a
 		// running VM's disk: never purged automatically.
 		q.hold(ref, CephPurgeHeld, fmt.Sprintf("a client has the image open in the trash, so it is not purged (%s); "+
 			"it may be a running VM's disk: restore it with `rbd trash restore %s`, or remove it with `rbd trash rm %s` once nothing uses it", msg, ref, ref))
@@ -481,8 +482,9 @@ func CephPendingPurges() []CephPurge {
 }
 
 // CephPurgeQueueSetAside lists the queue files found unreadable (a torn
-// write) and moved aside: what they tracked is no longer purged, so they are
-// named for an operator until removed.
+// write) and moved aside, or left where they are when they could not be:
+// what they tracked is no longer purged, so they are named for an operator
+// until removed.
 func CephPurgeQueueSetAside() []string {
 	q := cephPurges
 	q.mu.Lock()
@@ -514,6 +516,10 @@ func ResumeCephPurges(dir string) error {
 		aside := path + cephPurgeSetAsideMarker + time.Now().UTC().Format("20060102T150405.000000000Z")
 		if rerr := os.Rename(path, aside); rerr != nil {
 			// Not kept under dir: saving would overwrite what it tracked.
+			// Named all the same, where it is (ceph_trash_leftover).
+			q.mu.Lock()
+			q.setAside = append(q.setAside, path)
+			q.mu.Unlock()
 			return fmt.Errorf("the ceph trash purge queue %s cannot be read (%v) nor moved aside (%v); purges are kept in memory only", path, unreadable, rerr)
 		}
 		resumeErr = fmt.Errorf("the ceph trash purge queue %s cannot be read (%v); moved aside as %s, and named by ceph_trash_leftover", path, unreadable, aside)
@@ -765,16 +771,16 @@ func (d *cephDriver) moveToTrash(ctx context.Context, pool, id, image string) (b
 	cancel()
 	out = strings.TrimSpace(string(raw))
 	if merr != nil {
-		if rbdErrno(merr) == rbdEBUSY {
-			cephPurges.forget(tref)
-			return true, out, nil
-		}
 		moveErr := fmt.Errorf("rbd trash mv %s: %w: %s", ref, merr, out)
-		// It may have moved the image anyway (killed part-way): settled by
-		// the image's id.
+		// It may have moved the image anyway (killed part-way, or a librbd
+		// check that refused after the entry was added): settled by the
+		// image's id, a busy refusal too.
 		switch d.settleMove(ctx, pool, id, image) {
 		case moveNotDone:
 			cephPurges.forget(tref)
+			if rbdErrno(merr) == rbdEBUSY {
+				return true, out, nil
+			}
 			return false, out, moveErr
 		case moveHalf:
 			cephPurges.hold(tref, CephPurgeHalfMoved, halfMovedWhy(pool, id, image))

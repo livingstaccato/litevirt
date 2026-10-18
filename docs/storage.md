@@ -1386,18 +1386,20 @@ every host. That is how such pools behaved before and is not recommended.
   refuses an image a client has open (exit 16), and such an image is
   **held**: it is never purged automatically, and `ceph_trash_leftover` names
   it with `rbd trash restore <pool>/<id>`. A move is recorded by the image's
-  id before it runs. A move that fails, or that a crash interrupts, is
-  settled by id: it is purged if the image went to the trash, forgotten if it
-  never moved, and held and named if it is in the trash and still under its
-  name. A queue file that cannot be read is moved aside
-  (`ceph-trash-purges.json.unreadable-<time>`) and named. The pools' trash is
+  id before it runs. A move that fails (a busy refusal too), or that a crash
+  interrupts, is settled by id: it is purged if the image went to the trash,
+  forgotten if it never moved, and held and named if it is in the trash and
+  still under its name. A queue file that cannot be read is moved aside
+  (`ceph-trash-purges.json.unreadable-<time>`) and named; one that cannot be
+  moved aside either is named where it is, and the host keeps its purges in
+  memory only until it restarts. The pools' trash is
   scanned every 5 minutes for litevirt images no purge on the host tracks,
   and those are named too. An image already gone is not an error —
   but only once the pool itself answers: a delete that cannot reach the
   cluster (a missing keyring or conf) fails instead of reporting success.
   If an interrupted `rbd rm` left the image in the trash, that leftover is
-  purged too; an image of that name someone moved to the trash by hand is
-  left for them.
+  purged too, and held like any other if a client has it open; an image of
+  that name someone moved to the trash by hand is left for them.
 - **Clone copies** are made under a private staging name and renamed into
   place, so a failed clone removes only its own copy, never an image that
   already had the destination's name.

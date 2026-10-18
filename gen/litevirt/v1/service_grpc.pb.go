@@ -34,6 +34,7 @@ const (
 	LiteVirt_ResolveHealthCondition_FullMethodName     = "/litevirt.v1.LiteVirt/ResolveHealthCondition"
 	LiteVirt_GetFenceReadiness_FullMethodName          = "/litevirt.v1.LiteVirt/GetFenceReadiness"
 	LiteVirt_RemoveHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RemoveHost"
+	LiteVirt_PreflightRemoveHost_FullMethodName        = "/litevirt.v1.LiteVirt/PreflightRemoveHost"
 	LiteVirt_AdmitHost_FullMethodName                  = "/litevirt.v1.LiteVirt/AdmitHost"
 	LiteVirt_ListHostNetworks_FullMethodName           = "/litevirt.v1.LiteVirt/ListHostNetworks"
 	LiteVirt_UpsertHostNetwork_FullMethodName          = "/litevirt.v1.LiteVirt/UpsertHostNetwork"
@@ -395,6 +396,10 @@ type LiteVirtClient interface {
 	ResolveHealthCondition(ctx context.Context, in *ResolveHealthConditionRequest, opts ...grpc.CallOption) (*ResolveHealthConditionResponse, error)
 	GetFenceReadiness(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*FenceReadiness, error)
 	RemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*RemoveHostResponse, error)
+	// PreflightRemoveHost runs every refusal RemoveHost would give the same
+	// request and removes nothing. `lv host rm` calls it before it revokes the
+	// host's certificate, so a refused removal leaves the certificate intact.
+	PreflightRemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	AdmitHost(ctx context.Context, in *AdmitHostRequest, opts ...grpc.CallOption) (*AdmitHostResponse, error)
 	// Host network configuration (v48): intent CRUD runs anywhere (replicated
 	// rows); Plan and Apply are forwarded to the OWNING host — they read and
@@ -1297,6 +1302,16 @@ func (c *liteVirtClient) RemoveHost(ctx context.Context, in *RemoveHostRequest, 
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RemoveHostResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_RemoveHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) PreflightRemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_PreflightRemoveHost_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4959,6 +4974,10 @@ type LiteVirtServer interface {
 	ResolveHealthCondition(context.Context, *ResolveHealthConditionRequest) (*ResolveHealthConditionResponse, error)
 	GetFenceReadiness(context.Context, *emptypb.Empty) (*FenceReadiness, error)
 	RemoveHost(context.Context, *RemoveHostRequest) (*RemoveHostResponse, error)
+	// PreflightRemoveHost runs every refusal RemoveHost would give the same
+	// request and removes nothing. `lv host rm` calls it before it revokes the
+	// host's certificate, so a refused removal leaves the certificate intact.
+	PreflightRemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error)
 	AdmitHost(context.Context, *AdmitHostRequest) (*AdmitHostResponse, error)
 	// Host network configuration (v48): intent CRUD runs anywhere (replicated
 	// rows); Plan and Apply are forwarded to the OWNING host — they read and
@@ -5741,6 +5760,9 @@ func (UnimplementedLiteVirtServer) GetFenceReadiness(context.Context, *emptypb.E
 }
 func (UnimplementedLiteVirtServer) RemoveHost(context.Context, *RemoveHostRequest) (*RemoveHostResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveHost not implemented")
+}
+func (UnimplementedLiteVirtServer) PreflightRemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method PreflightRemoveHost not implemented")
 }
 func (UnimplementedLiteVirtServer) AdmitHost(context.Context, *AdmitHostRequest) (*AdmitHostResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AdmitHost not implemented")
@@ -6992,6 +7014,24 @@ func _LiteVirt_RemoveHost_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).RemoveHost(ctx, req.(*RemoveHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_PreflightRemoveHost_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveHostRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PreflightRemoveHost(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PreflightRemoveHost_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PreflightRemoveHost(ctx, req.(*RemoveHostRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -12719,6 +12759,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RemoveHost",
 			Handler:    _LiteVirt_RemoveHost_Handler,
+		},
+		{
+			MethodName: "PreflightRemoveHost",
+			Handler:    _LiteVirt_PreflightRemoveHost_Handler,
 		},
 		{
 			MethodName: "AdmitHost",

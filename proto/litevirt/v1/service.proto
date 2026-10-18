@@ -4393,6 +4393,10 @@ service LiteVirt {
     rpc ResolveHealthCondition(ResolveHealthConditionRequest) returns (ResolveHealthConditionResponse);
     rpc GetFenceReadiness(google.protobuf.Empty)  returns (FenceReadiness);
     rpc RemoveHost(RemoveHostRequest)          returns (RemoveHostResponse);
+    // PreflightRemoveHost runs every refusal RemoveHost would give the same
+    // request and removes nothing. `lv host rm` calls it before it revokes the
+    // host's certificate, so a refused removal leaves the certificate intact.
+    rpc PreflightRemoveHost(RemoveHostRequest) returns (google.protobuf.Empty);
     rpc AdmitHost(AdmitHostRequest)            returns (AdmitHostResponse);
     // Host network configuration (v48): intent CRUD runs anywhere (replicated
     // rows); Plan and Apply are forwarded to the OWNING host — they read and

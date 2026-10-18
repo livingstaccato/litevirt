@@ -12,6 +12,9 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pki"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 type hostRemoveTestClient struct {
@@ -21,6 +24,17 @@ type hostRemoveTestClient struct {
 	voters     []string // members of the adopted voter generation
 	removeReq  *pb.RemoveHostRequest
 	removeResp *pb.RemoveHostResponse
+	// preflightErr is PreflightRemoveHost's answer; preflightReq the request.
+	preflightErr error
+	preflightReq *pb.RemoveHostRequest
+}
+
+func (c *hostRemoveTestClient) PreflightRemoveHost(_ context.Context, req *pb.RemoveHostRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	c.preflightReq = req
+	if c.preflightErr != nil {
+		return nil, c.preflightErr
+	}
+	return &emptypb.Empty{}, nil
 }
 
 func (c *hostRemoveTestClient) GetVoterConfig(context.Context, *pb.GetVoterConfigRequest, ...grpc.CallOption) (*pb.GetVoterConfigResponse, error) {
@@ -333,4 +347,64 @@ func captureStdout(t *testing.T, fn func()) string {
 	w.Close()
 	b, _ := io.ReadAll(r)
 	return string(b)
+}
+
+// Lab test 26, F5: a removal the daemon would refuse is refused before the
+// certificate is revoked, so the member is not cut off from its peers while
+// its row stays live. A daemon from before the check (Unimplemented) is not
+// asked again.
+func TestHostRemove_ARefusedRemovalRevokesNothing(t *testing.T) {
+	setup := func(t *testing.T) string {
+		configDir := t.TempDir()
+		t.Setenv("LV_CONFIG_DIR", configDir)
+		pkiDir := filepath.Join(configDir, "pki")
+		if err := os.MkdirAll(pkiDir, 0o700); err != nil {
+			t.Fatalf("mkdir pki: %v", err)
+		}
+		if err := pki.GenerateCA(filepath.Join(pkiDir, "ca.crt"), filepath.Join(pkiDir, "ca.key")); err != nil {
+			t.Fatalf("GenerateCA: %v", err)
+		}
+		return pkiDir
+	}
+	revoked := func(t *testing.T, pkiDir string) bool {
+		serials, err := pki.LoadCRL(filepath.Join(pkiDir, "crl.pem"))
+		if err != nil {
+			return false
+		}
+		for _, s := range serials {
+			if strings.EqualFold(s, "a1b2c3") {
+				return true
+			}
+		}
+		return false
+	}
+	for _, dead := range []bool{false, true} {
+		pkiDir := setup(t)
+		client := &hostRemoveTestClient{preflightErr: status.Error(codes.Unavailable, "no peer completed the pull")}
+		var err error
+		if dead {
+			err = revokeAndPublishOnly(client)
+		} else {
+			err = HostRemove(context.Background(), client, "node-9", true)
+		}
+		if err == nil || !strings.Contains(err.Error(), "no peer completed the pull") {
+			t.Errorf("dead=%v: a refused preflight returned %v, want the refusal", dead, err)
+		}
+		if len(client.calls) != 0 || revoked(t, pkiDir) {
+			t.Errorf("dead=%v: calls %v, revoked %v; want nothing revoked, published or removed", dead, client.calls, revoked(t, pkiDir))
+		}
+		if r := client.preflightReq; r == nil || r.GetExpectedCertSerial() != "a1b2c3" || r.GetDead() != dead || r.GetForce() == dead {
+			t.Errorf("dead=%v: preflight request %v, want the removal's own request with the serial", dead, r)
+		}
+	}
+	pkiDir := setup(t)
+	client := &hostRemoveTestClient{preflightErr: status.Error(codes.Unimplemented, "unknown method")}
+	if err := HostRemove(context.Background(), client, "node-9", false); err != nil || !revoked(t, pkiDir) {
+		t.Errorf("against a daemon without the preflight: %v (revoked %v), want the removal as before", err, revoked(t, pkiDir))
+	}
+}
+
+func revokeAndPublishOnly(c *hostRemoveTestClient) error {
+	_, _, err := revokeAndPublish(context.Background(), c, &pb.RemoveHostRequest{Name: "node-9", Dead: true})
+	return err
 }

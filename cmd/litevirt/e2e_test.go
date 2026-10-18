@@ -199,6 +199,9 @@ func (m *mockClient) RemoveHost(_ context.Context, in *pb.RemoveHostRequest, _ .
 	m.removedHost = in.Name
 	return &pb.RemoveHostResponse{}, nil
 }
+func (m *mockClient) PreflightRemoveHost(_ context.Context, _ *pb.RemoveHostRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
+}
 func (m *mockClient) PublishCRL(_ context.Context, _ *pb.PublishCRLRequest, _ ...grpc.CallOption) (*pb.PublishCRLResponse, error) {
 	return &pb.PublishCRLResponse{Version: 47}, nil
 }

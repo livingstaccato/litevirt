@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -1688,59 +1689,9 @@ const configureHostSQL = `UPDATE hosts SET ` +
 // RemoveHost removes a host from the cluster. If force is false and the host
 // has running VMs, the request is rejected. CRL revocation is handled here.
 func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*pb.RemoveHostResponse, error) {
-	if err := RequireRole(ctx, "admin"); err != nil {
-		return nil, err
-	}
-	h, err := corrosion.GetHost(ctx, s.db, req.Name)
-	if err != nil || h == nil {
-		return nil, status.Errorf(codes.NotFound, "host %q not found", req.Name)
-	}
-	// A current voter keeps its vote whatever its hosts row says, so deleting
-	// the row must not look like removing the voter (recovery-claims.md §4.3).
-	if err := s.voterRemovalRefusal(ctx, req.Name); err != nil {
-		return nil, err
-	}
-	// A removal decides the row a later re-admission counts from, so it is
-	// made on a caught-up node, by the voter majority, on the row a peer
-	// confirms, and only of the certificate the operator revoked
-	// (host_incarnation.go).
-	if err := s.hostOperatorWriteAllowed(ctx, "remove", req.Name); err != nil {
-		return nil, err
-	}
-	if err := s.requireVoterMajority(ctx, "remove", req.Name); err != nil {
-		return nil, err
-	}
-	if err := s.pullHostsNow(ctx, "remove", req.Name); err != nil {
-		return nil, err
-	}
-	if h, err = corrosion.GetHost(ctx, s.db, req.Name); err != nil || h == nil {
-		return nil, status.Errorf(codes.NotFound, "host %q not found", req.Name)
-	}
-	if want := req.GetExpectedCertSerial(); want != "" && !strings.EqualFold(want, h.CertSerial) {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"%s's row changed since its certificate was revoked (it now names %s, not %s); run `lv host rm` again",
-			req.Name, h.CertSerial, want)
-	}
-	incarnation, _, _, _, _, err := corrosion.HostIncarnationOf(ctx, s.db, req.Name)
+	h, incarnation, err := s.removeHostRefusal(ctx, req)
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "read %s's incarnation: %v", req.Name, err)
-	}
-
-	// `lv host rm --dead` (recovery-claims.md §3.12): a host fenced proof-grade
-	// and gone for good. Its workloads are not drained first — they are the
-	// stranded ones, and their rows stay in place for the recovery claims to
-	// supersede once this removal and the CRL have replicated.
-	if req.Dead {
-		if err := s.deadRemovalRefusal(ctx, h); err != nil {
-			return nil, err
-		}
-	} else {
-		// Check for VMs on this host.
-		vms, _ := corrosion.ListVMs(ctx, s.db, "", req.Name)
-		if len(vms) > 0 && !req.Force {
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"host %q has %d VMs — drain first or use --force", req.Name, len(vms))
-		}
+		return nil, err
 	}
 
 	// Soft-delete the host and clean up related records.
@@ -1757,6 +1708,76 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*pb
 	}
 
 	return &pb.RemoveHostResponse{CertSerial: h.CertSerial, Incarnation: incarnation}, nil
+}
+
+// PreflightRemoveHost runs every refusal RemoveHost would give req and
+// removes nothing. `lv host rm` asks it before it revokes the host's
+// certificate: the revocation is not undone by a refusal that follows it.
+func (s *Server) PreflightRemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*emptypb.Empty, error) {
+	if _, _, err := s.removeHostRefusal(ctx, req); err != nil {
+		return nil, err
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// removeHostRefusal is RemoveHost's checks: the host's row and incarnation
+// when it may be removed.
+func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostRequest) (*corrosion.HostRecord, int64, error) {
+	if err := RequireRole(ctx, "admin"); err != nil {
+		return nil, 0, err
+	}
+	h, err := corrosion.GetHost(ctx, s.db, req.Name)
+	if err != nil || h == nil {
+		return nil, 0, status.Errorf(codes.NotFound, "host %q not found", req.Name)
+	}
+	// A current voter keeps its vote whatever its hosts row says, so deleting
+	// the row must not look like removing the voter (recovery-claims.md §4.3).
+	if err := s.voterRemovalRefusal(ctx, req.Name); err != nil {
+		return nil, 0, err
+	}
+	// A removal decides the row a later re-admission counts from, so it is
+	// made on a caught-up node, by the voter majority, on the row a peer
+	// confirms, and only of the certificate the operator revoked
+	// (host_incarnation.go).
+	if err := s.hostOperatorWriteAllowed(ctx, "remove", req.Name); err != nil {
+		return nil, 0, err
+	}
+	if err := s.requireVoterMajority(ctx, "remove", req.Name); err != nil {
+		return nil, 0, err
+	}
+	if err := s.pullHostsNow(ctx, "remove", req.Name); err != nil {
+		return nil, 0, err
+	}
+	if h, err = corrosion.GetHost(ctx, s.db, req.Name); err != nil || h == nil {
+		return nil, 0, status.Errorf(codes.NotFound, "host %q not found", req.Name)
+	}
+	if want := req.GetExpectedCertSerial(); want != "" && !strings.EqualFold(want, h.CertSerial) {
+		return nil, 0, status.Errorf(codes.FailedPrecondition,
+			"%s's row changed since its certificate was revoked (it now names %s, not %s); run `lv host rm` again",
+			req.Name, h.CertSerial, want)
+	}
+	incarnation, _, _, _, _, err := corrosion.HostIncarnationOf(ctx, s.db, req.Name)
+	if err != nil {
+		return nil, 0, status.Errorf(codes.Unavailable, "read %s's incarnation: %v", req.Name, err)
+	}
+
+	// `lv host rm --dead` (recovery-claims.md §3.12): a host fenced proof-grade
+	// and gone for good. Its workloads are not drained first — they are the
+	// stranded ones, and their rows stay in place for the recovery claims to
+	// supersede once this removal and the CRL have replicated.
+	if req.Dead {
+		if err := s.deadRemovalRefusal(ctx, h); err != nil {
+			return nil, 0, err
+		}
+	} else {
+		// Check for VMs on this host.
+		vms, _ := corrosion.ListVMs(ctx, s.db, "", req.Name)
+		if len(vms) > 0 && !req.Force {
+			return nil, 0, status.Errorf(codes.FailedPrecondition,
+				"host %q has %d VMs — drain first or use --force", req.Name, len(vms))
+		}
+	}
+	return h, incarnation, nil
 }
 
 // AdmitHost records the CA-authorized identity produced by `lv host add`.

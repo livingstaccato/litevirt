@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -247,5 +248,29 @@ func TestReconciler_ResolveLogDevice(t *testing.T) {
 	}
 	if w, m := r.ResolveLogDevice("nope"); w != "" || m != "" {
 		t.Errorf("unknown dev = %q %q", w, m)
+	}
+}
+
+// Round 1 m-4: a prefix field the renderer could not have written is
+// refused: a device that is not an interface name (or "-"), a rule that is
+// not [0-9a-z-]{1,32} (which "rule" and "default" are).
+//
+// Mutation: accept any non-space field — red.
+func TestParseLogPrefix_ValidatesFields(t *testing.T) {
+	for _, p := range []string{
+		"lv-log tap-vm1.0 in Not_An_Id drop",
+		"lv-log tap\x1b[31m in r1 drop",
+		"lv-log 0123456789abcdefg in r1 drop",
+		"lv-log a/b in r1 drop",
+		"lv-log lvt0 in " + strings.Repeat("a", 33) + " drop",
+	} {
+		if _, ok := parseLogPrefix(p); ok {
+			t.Errorf("prefix %q parsed", p)
+		}
+	}
+	for _, p := range []string{"lv-log tap-vm1.0 in rule drop", "lv-log lvt0 out default accept", "lv-log - - c0ffee drop"} {
+		if _, ok := parseLogPrefix(p); !ok {
+			t.Errorf("prefix %q refused", p)
+		}
 	}
 }

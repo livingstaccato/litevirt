@@ -180,11 +180,45 @@ func parseLogPrefix(p string) (LogRecord, bool) {
 	default:
 		return LogRecord{}, false
 	}
+	// Only what the renderer writes (another program can send a prefix of
+	// this shape to the group): a device is an interface name or "-", a rule
+	// a logRuleID, "rule" or "default".
+	if (f[1] != "-" && !logDevName(f[1])) || !logRuleField(f[3]) {
+		return LogRecord{}, false
+	}
 	r := LogRecord{Device: f[1], Side: f[2], RuleID: f[3], Verdict: f[4], Tier: "nic"}
 	if f[1] == "-" {
 		r.Tier = "routed"
 	}
 	return r, true
+}
+
+// logDevName reports whether s can be an interface name as a prefix carries
+// it: 1-15 bytes of [A-Za-z0-9._@-].
+func logDevName(s string) bool {
+	if len(s) == 0 || len(s) > 15 {
+		return false
+	}
+	for _, c := range []byte(s) {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '@' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// logRuleField reports whether s is a rule as a prefix carries it:
+// [0-9a-z-]{1,32}, which "rule" and "default" are.
+func logRuleField(s string) bool {
+	if len(s) == 0 || len(s) > maxLogRuleID {
+		return false
+	}
+	for _, c := range []byte(s) {
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // ipv6ExtHeaders are the IPv6 extension headers parseLogPacket steps over to

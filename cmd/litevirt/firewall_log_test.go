@@ -352,3 +352,21 @@ func TestFirewallLogPolicyCLI_UnreadableRow(t *testing.T) {
 		t.Errorf("status does not mark h1 unreadable:\n%s", out)
 	}
 }
+
+// Round 1 m-4: a record's strings are printed with control characters
+// escaped: a peer's answer cannot drive the terminal.
+//
+// Mutation: print raw — red.
+func TestFirewallLogCLI_EscapesControlCharacters(t *testing.T) {
+	spy := &logListSpy{replies: []*pb.ListFirewallLogResponse{{
+		Entries: []*pb.FirewallLogEntry{{Host: "a\x1b[2J", Seq: 1, Time: "t", Workload: "w\r", Device: "d", Side: "in", RuleId: "r", Verdict: "drop"}},
+		Errors:  map[string]string{"b\x1b]0;x\x07": "boom\x1b[1m"},
+	}}}
+	out, stderr, err := runLogListCLI2(t, context.Background(), spy, "firewall", "log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsAny(out+stderr, "\x1b\r\x07") || !strings.Contains(out, `a\x1b[2J`) {
+		t.Errorf("control characters reached the terminal:\n%q\n%q", out, stderr)
+	}
+}

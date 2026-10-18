@@ -10,6 +10,7 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc/codes"
@@ -188,9 +189,10 @@ func newFirewallLogCmd() *cobra.Command {
 						return logRPCError(err)
 					}
 					for _, e := range resp.GetEntries() {
-						fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\n", e.GetTime(), e.GetHost(), dash(e.GetWorkload()),
-							e.GetDevice(), e.GetSide(), e.GetRuleId(), e.GetVerdict(), dash(e.GetProto()),
-							hostPort(e.GetSrc(), e.GetSport()), hostPort(e.GetDst(), e.GetDport()), e.GetLength())
+						fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\n", termSafe(e.GetTime()), termSafe(e.GetHost()),
+							termSafe(dash(e.GetWorkload())), termSafe(e.GetDevice()), termSafe(e.GetSide()), termSafe(e.GetRuleId()),
+							termSafe(e.GetVerdict()), termSafe(dash(e.GetProto())),
+							termSafe(hostPort(e.GetSrc(), e.GetSport())), termSafe(hostPort(e.GetDst(), e.GetDport())), e.GetLength())
 						if e.GetSeq() > cursor[e.GetHost()] {
 							cursor[e.GetHost()] = e.GetSeq()
 						}
@@ -200,7 +202,7 @@ func newFirewallLogCmd() *cobra.Command {
 					}
 					for _, h := range slices.Sorted(maps.Keys(resp.GetErrors())) {
 						if msg := resp.GetErrors()[h]; reported[h] != msg {
-							fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s: %s\n", h, msg)
+							fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s: %s\n", termSafe(h), termSafe(msg))
 							reported[h] = msg
 						}
 					}
@@ -224,6 +226,23 @@ func newFirewallLogCmd() *cobra.Command {
 	cmd.Flags().Uint32Var(&limit, "limit", 200, "the newest N records (at most 10000)")
 	cmd.Flags().BoolVar(&follow, "follow", false, "keep printing new records")
 	return cmd
+}
+
+// termSafe escapes control characters (a peer's answer is printed as is
+// otherwise, and could drive the terminal).
+func termSafe(s string) string {
+	if !strings.ContainsFunc(s, unicode.IsControl) {
+		return s
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			fmt.Fprintf(&b, "\\x%02x", r)
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // hostPort is an address with its port, when it has one.

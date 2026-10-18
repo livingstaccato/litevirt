@@ -281,7 +281,7 @@ func (s *Server) liveMoveVolume(
 	// The unresolved-move record goes down before the define: from here a fault
 	// can leave the guest, the persistent config and the disk row naming
 	// different files (moveMarker).
-	mk, merr := s.beginMoveMarker(vm, src, destPath, dstPool.Driver, targetPool, true, false)
+	mk, merr := s.beginMoveMarker(ctx, vm, src, destPath, dstPool.Driver, targetPool, true, false, false)
 	if merr != nil {
 		_ = s.liveMover.CancelBlockCopy(vm.Name, src.Path)
 		_ = os.Remove(destPath)
@@ -524,7 +524,7 @@ func liveMovePlacementErr(err error) error {
 // and NEVER touches destPath (the live disk) or rolls back to src. On a commit failure
 // it keeps dest and surfaces a reconcile error. No block-copy job runs here.
 func (s *Server) liveCatchUpAtDest(ctx context.Context, vm *corrosion.VMRecord, src *corrosion.DiskRecord, destPath, targetPool string, dstPool StoragePoolRef, deleteSource bool, send func(*pb.MoveVolumeProgress) error) error {
-	mk, merr := s.beginMoveMarker(vm, src, destPath, dstPool.Driver, targetPool, true, true)
+	mk, merr := s.beginMoveMarker(ctx, vm, src, destPath, dstPool.Driver, targetPool, true, true, false)
 	if merr != nil {
 		return merr
 	}

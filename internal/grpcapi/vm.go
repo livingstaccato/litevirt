@@ -1394,6 +1394,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	stubVM := &pb.VM{Name: spec.Name, HostName: s.hostName, State: pb.VMState_VM_STARTING}
 	hooks.Run(ctx, hooks.PreStart, stubVM, spec.Hooks)
 
+	// A new domain takes the name: a volume move recorded of an earlier VM
+	// by that name is not this one's.
+	s.forgetMoveRecords(ctx, spec.Name)
 	// Define and start in libvirt
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		claims.releaseAll(ctx)
@@ -3585,9 +3588,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			req.Name, undefErr)
 	}
 	// The domain is gone: a volume move it left unresolved describes nothing.
-	if err := health.ClearUnresolvedMovesOf(s.dataDir, req.Name); err != nil {
-		slog.Warn("DeleteVM: removing the VM's unresolved volume-move records failed", "vm", req.Name, "error", err)
-	}
+	s.forgetMoveRecords(ctx, req.Name)
 
 	// Delete disks unless keep-disks. Free each disk at its RECORDED location
 	// (driver-dispatched, so non-default pools and block backends are released)
@@ -4705,9 +4706,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		s.virt.DestroyDomain(req.Name)
 	}
 	s.virt.UndefineDomain(req.Name, false)
-	if err := health.ClearUnresolvedMovesOf(s.dataDir, req.Name); err != nil {
-		slog.Warn("RebuildVM: removing the VM's unresolved volume-move records failed", "vm", req.Name, "error", err)
-	}
+	s.forgetMoveRecords(ctx, req.Name)
 
 	// Delete existing disks — at their recorded locations (driver-dispatched,
 	// so a rebuilt VM doesn't leak its old non-default-pool backing volume),

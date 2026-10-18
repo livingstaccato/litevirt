@@ -77,6 +77,11 @@ func (s *Server) runVMReplication(ctx context.Context, sched corrosion.BackupSch
 	vmUnlock := s.lockVM(sched.VMName)
 	unlock := func() { unlockOnce.Do(vmUnlock) }
 	defer unlock()
+	// A volume move left unresolved: the rows name the file holding the
+	// guest's writes before one is copied (move_unresolved.go).
+	if err := s.resolveUnresolvedMoves(ctx, sched.VMName); err != nil {
+		return err
+	}
 
 	disks, err := corrosion.GetVMDisks(ctx, s.db, sched.VMName)
 	if err != nil {

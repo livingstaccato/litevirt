@@ -388,6 +388,7 @@ func (s *Server) autoDefineRestoredVM(
 		}
 		limitsG = capabilities.FeatureGrant{}
 	}
+	s.forgetMoveRecords(ctx, targetName) // the restored domain takes the name
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		return "", "", status.Errorf(codes.Internal, "define domain: %v", err)
 	}

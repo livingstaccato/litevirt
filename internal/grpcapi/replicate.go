@@ -71,6 +71,11 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 		return status.Errorf(codes.FailedPrecondition,
 			"vm %q lives on %q; run ReplicateVolume on that host", req.VmName, vm.HostName)
 	}
+	// A volume move left unresolved: the rows name the file holding the
+	// guest's writes before one is copied (move_unresolved.go).
+	if err := s.resolveUnresolvedMoves(ctx, req.VmName); err != nil {
+		return err
+	}
 
 	disks, err := corrosion.GetVMDisks(ctx, s.db, req.VmName)
 	if err != nil {

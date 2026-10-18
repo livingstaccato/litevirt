@@ -1489,14 +1489,20 @@ context-cancel or pivot failure.
 config cannot be pointed back at the source, a running VM's mirror is left running
 (nothing is cancelled or deleted) and the error names both files and the `virsh
 blockjob … --pivot` or `--abort` to run. The host keeps a record of such a move, and of
-one whose daemon stopped mid-cutover, under `<data_dir>/move-unresolved`. Before the VM
-next starts on that host (`lv start`, an HA restart or a health-check restart), and
-before a cold migration or a backup reads its disk, the disk record is pointed at the
-file the persistent config names and the record is removed. The operation is refused
-instead, with an error naming both files and the next step, when the config cannot be
-read or names neither file, when the guest stopped while a mirror ran and before a
-pivot but the config names the destination, or when the guest was pivoted but the
-config names the source. A retried `lv move-volume` also resolves it.
+one whose daemon stopped mid-cutover, under `<data_dir>/move-unresolved`, and the VM
+carries a `vm.move_unresolved` health condition while it lasts. Before the VM next
+starts on that host (`lv start`, an HA, onboot or health-check restart), and before a
+cold or live migration, a replication, a clone, an image build or a backup reads its
+disk, the disk record is pointed at the file the persistent config names and the record
+is removed. The operation is refused instead, with an error naming both files and the
+next step, when the config cannot be read or names neither file, when the guest was
+writing the source under a mirror and was not pivoted but the config names the
+destination, or when the guest was pivoted but the config names the source. A retried
+`lv move-volume` settles it the same way and is refused in the same cases; it is never
+reported as "nothing to do" while the record remains. Another host (a failover onto
+shared storage) honours the condition: a start there points the disk record at the
+source if the guest was never pivoted, or at the destination if it was, and other
+operations there are refused until the host holding the record settles it.
 
 > **Note:** `lv replicate-volume` copies a shut-off VM's disk plainly and a
 > running or paused one point-in-time — through a full backup session, or an

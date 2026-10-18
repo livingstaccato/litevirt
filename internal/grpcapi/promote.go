@@ -1624,6 +1624,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				Phase: pb.PromoteReplicaProgress_DEFINING, VmName: targetName, Host: s.hostName,
 				Replica: replica, DiskPath: livePath, Status: "defining domain" + multiDiskNote,
 			})
+			s.forgetMoveRecords(ctx, targetName) // the promoted domain takes the name
 			if err := s.virt.DefineDomain(domXML); err != nil {
 				return "define domain", err
 			}

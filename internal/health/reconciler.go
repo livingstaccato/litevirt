@@ -1749,13 +1749,23 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// (move_unresolved.go). A domain already running is left to the branch
 	// below.
 	if r.virt == nil || !r.virt.DomainExists(vm.Name) || !domainRunningNow(r.virt, vm.Name) {
-		if merr := ResolveUnresolvedMoves(ctx, r.db, r.dataDir, r.hostName, vm.Name, func() (string, error) {
-			if r.virt == nil {
-				return "", errors.New("no libvirt backend")
+		dom := MoveDomain{InactiveXML: func() (string, error) { return "", errors.New("no libvirt backend") }}
+		if r.virt != nil {
+			dom = MoveDomain{
+				InactiveXML: func() (string, error) { return r.virt.DumpXMLInactive(vm.Name) },
+				State:       func() (string, error) { return r.virt.DomainState(vm.Name) },
 			}
-			return r.virt.DumpXMLInactive(vm.Name)
-		}); merr != nil {
+		}
+		if merr := ResolveUnresolvedMoves(ctx, r.db, r.dataDir, r.hostName, vm.Name, dom); merr != nil {
 			slog.Warn("reconciler: start refused — an unresolved volume move", "vm", vm.Name, "error", merr)
+			if MoveUnresolvedRetryable(merr) {
+				// Transient (a move in flight, a read that failed): the row is
+				// left as it is and a later pass starts it again.
+				if proofID != "" {
+					r.failPendingStart(ctx, vm.Name, proofID, true, merr.Error())
+				}
+				return
+			}
 			r.failPendingStart(ctx, vm.Name, proofID, false, merr.Error())
 			return
 		}

@@ -1250,7 +1250,10 @@ func (v *VMChecker) startGuarded(ctx context.Context, name string) error {
 		xml, xerr = d.DumpXMLInactive(name)
 	}
 	// A volume move this host left unresolved (move_unresolved.go).
-	if err := ResolveUnresolvedMoves(ctx, v.db, v.dataDir, v.hostName, name, func() (string, error) { return xml, xerr }); err != nil {
+	if err := ResolveUnresolvedMoves(ctx, v.db, v.dataDir, v.hostName, name, MoveDomain{
+		InactiveXML: func() (string, error) { return xml, xerr },
+		State:       func() (string, error) { return v.virt.DomainState(name) },
+	}); err != nil {
 		return err
 	}
 	release, err := GuardSharedDiskStart(ctx, v.db, v.dataDir, v.hostName, name, xml)

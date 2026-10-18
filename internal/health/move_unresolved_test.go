@@ -150,8 +150,113 @@ func TestResolveUnresolvedMoves_UnreadableRecordRefuses(t *testing.T) {
 	if err := os.WriteFile(UnresolvedMoveFile(dataDir, "mv", "root"), []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err := ResolveUnresolvedMoves(context.Background(), db, dataDir, "node-a", "mv", func() (string, error) { return "", nil })
+	err := ResolveUnresolvedMoves(context.Background(), db, dataDir, "node-a", "mv", MoveDomain{InactiveXML: func() (string, error) { return "", nil }})
 	if err == nil {
 		t.Fatal("an unreadable record was ignored")
+	}
+}
+
+// m-2: a move still in flight refuses the reconciler's start as transient: the
+// VM is not parked in error, and a later pass starts it.
+func TestStartPendingVM_InFlightMoveIsRetried(t *testing.T) {
+	db := testReconcilerDB(t)
+	r, _, _ := sharedDiskReconciler(t, db)
+	fake, _, _ := seedMovedVM(t, db, r.dataDir, "dst", false, false)
+	r.virt = fake
+	end := MarkMoveInFlight("mv", "root")
+	fresh, _ := corrosion.GetVM(context.Background(), db, "mv")
+	r.startPendingVM(context.Background(), *fresh)
+	end()
+	vm, _ := corrosion.GetVM(context.Background(), db, "mv")
+	if vm.State == "error" {
+		t.Fatalf("a move in flight parked the VM in error: %s", vm.StateDetail)
+	}
+	if st, _ := fake.DomainState("mv"); st == "running" {
+		t.Fatal("the domain was started while the move ran")
+	}
+	if ms, _ := UnresolvedMovesOf(r.dataDir, "mv"); len(ms) != 1 {
+		t.Fatalf("record: %+v", ms)
+	}
+}
+
+// m-4: a host that does not hold the record honours it through the VM's
+// condition. The file holding every acknowledged write decides: a start of a
+// VM failed over to this host points the row at it; a reader on a host the
+// VM's row does not name is refused; a row already on it passes.
+func TestResolveUnresolvedMoves_AnotherHostsRecord(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name         string
+		pivoted      bool
+		rowOnDst     bool
+		rowHost      string
+		wantErr      bool
+		wantRowOnDst bool
+	}{
+		{name: "never pivoted, row on the copy, failed over here: row to the source", rowOnDst: true, rowHost: "node-b", wantRowOnDst: false},
+		{name: "never pivoted, row on the copy, row elsewhere: refused", rowOnDst: true, rowHost: "node-c", wantErr: true, wantRowOnDst: true},
+		{name: "never pivoted, row on the source: passes", rowOnDst: false, rowHost: "node-c", wantRowOnDst: false},
+		{name: "pivoted, row on the source, failed over here: row to the copy", pivoted: true, rowHost: "node-b", wantRowOnDst: true},
+		{name: "pivoted, row on the copy: passes", pivoted: true, rowOnDst: true, rowHost: "node-c", wantRowOnDst: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := testReconcilerDB(t)
+			originDir := t.TempDir()
+			_, src, dst := seedMovedVM(t, db, originDir, "dst", true, tc.pivoted)
+			if err := PublishUnresolvedMoves(ctx, db, originDir, "node-a", "mv"); err != nil {
+				t.Fatal(err)
+			}
+			row := src
+			if tc.rowOnDst {
+				row = dst
+			}
+			if err := corrosion.UpdateDiskPlacement(ctx, db, "mv", "root", tc.rowHost, row, "nfs", "shared"); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Execute(ctx, `UPDATE vms SET host_name = ? WHERE name = 'mv'`, tc.rowHost); err != nil {
+				t.Fatal(err)
+			}
+			err := ResolveUnresolvedMoves(ctx, db, t.TempDir(), "node-b", "mv", MoveDomain{})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, want refused=%v", err, tc.wantErr)
+			}
+			if err != nil && (!IsMoveUnresolved(err) || !strings.Contains(err.Error(), "node-a")) {
+				t.Fatalf("refusal does not name the host holding the record: %v", err)
+			}
+			want := src
+			if tc.wantRowOnDst {
+				want = dst
+			}
+			if got := movedRowPath(t, db); got != want {
+				t.Fatalf("row names %s, want %s", got, want)
+			}
+		})
+	}
+}
+
+// ForgetUnresolvedMoves (delete, rebuild, and a new VM taking the name) drops
+// the records here and resolves the condition whichever host raised it.
+func TestForgetUnresolvedMoves_ClearsRecordsAndCondition(t *testing.T) {
+	ctx := context.Background()
+	db := testReconcilerDB(t)
+	dir := t.TempDir()
+	seedMovedVM(t, db, dir, "dst", true, false)
+	if err := PublishUnresolvedMoves(ctx, db, dir, "node-a", "mv"); err != nil {
+		t.Fatal(err)
+	}
+	if !MoveConditionCovers(ctx, db, "mv", "root") {
+		t.Fatal("not published")
+	}
+	if err := ForgetUnresolvedMoves(ctx, db, t.TempDir(), "mv"); err != nil {
+		t.Fatal(err)
+	}
+	if MoveConditionCovers(ctx, db, "mv", "root") {
+		t.Fatal("condition left open")
+	}
+	if err := ForgetUnresolvedMoves(ctx, db, dir, "mv"); err != nil {
+		t.Fatal(err)
+	}
+	if ms, _ := UnresolvedMovesOf(dir, "mv"); len(ms) != 0 {
+		t.Fatalf("records left: %+v", ms)
 	}
 }

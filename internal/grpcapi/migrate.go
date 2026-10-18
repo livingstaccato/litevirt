@@ -193,6 +193,12 @@ func (s *Server) sourceGateRefused(ctx context.Context, vm *corrosion.VMRecord, 
 // its whole step, calls this directly for its cold moves (drainColdMove), with
 // the same lock discipline.
 func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, vm *corrosion.VMRecord, send func(pb.MigratePhase, float32, float32) error, unlock func(), adopted *bool, opts ownedMigrateOpts) error {
+	// A volume move left unresolved: the rows name the file holding the
+	// guest's writes before anything reads them for the migration
+	// (move_unresolved.go).
+	if err := s.resolveUnresolvedMoves(ctx, vm.Name); err != nil {
+		return err
+	}
 	// The VM leaves this host: the next admission here reads the runtime
 	// afresh, not a cached inventory that still charges the VM's memory as
 	// runtime-only load (invalidateInventoryCache; P-3 of lab 2 run c2). An

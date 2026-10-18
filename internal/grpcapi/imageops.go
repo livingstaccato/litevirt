@@ -495,6 +495,11 @@ func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb
 		defer conn.Close()
 		return client.BuildImage(ctx, req)
 	}
+	// A volume move left unresolved: the rows name the file holding the
+	// guest's writes before one is copied (move_unresolved.go).
+	if err := s.resolveUnresolvedMoves(ctx, req.VmName); err != nil {
+		return nil, err
+	}
 
 	// A build brings a deleted name back, as an import does; one whose row
 	// is deleted while it runs records nothing.

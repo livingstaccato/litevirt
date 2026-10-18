@@ -1752,6 +1752,19 @@ text as `sharedDiskWithheld`. It is notified (`vm.shared_disk_withheld` event
 and notification) when raised or when its text changes, and resolves when the
 next build of the VM's domain withholds nothing.
 
+### A volume move that did not finish (`vm.move_unresolved`)
+
+Evaluator `move_volume`, subject kind `vm`, subject the VM's name, severity
+warning. Raised by the host running an `lv move-volume` before its cutover
+changes the persistent config or the disk record, and resolved when the two
+agree again. It stays open after a move that could not be rolled back, or
+whose daemon stopped mid-cutover. The evidence names the host holding the
+move's record and, per disk, both files and whether the guest was pivoted.
+Starts, migrations, replications, clones, image builds and backups settle it
+first or are refused (docs/storage.md, "A move that cannot be rolled back").
+It is resolved by the host holding the record, and for every host when the VM
+is deleted or a new VM takes its name.
+
 ### A cluster default-deny held by a torn-down stack (`firewall.default_deny_orphaned`)
 
 Evaluator `stack_reconciler`, subject kind `cluster`, subject `cluster`,

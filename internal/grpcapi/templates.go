@@ -233,6 +233,11 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	if err := s.settlePITOverlays(ctx, src); err != nil {
 		return nil, err
 	}
+	// A volume move left unresolved: the rows name the file holding the
+	// guest's writes before one is copied (move_unresolved.go).
+	if err := s.resolveUnresolvedMoves(ctx, req.Source); err != nil {
+		return nil, err
+	}
 	srcDisks, err := corrosion.GetVMDisks(ctx, s.db, req.Source)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "load source disks: %v", err)

@@ -104,12 +104,18 @@ func (s *Server) MoveVolume(req *pb.MoveVolumeRequest, stream grpc.ServerStreami
 	if src == nil {
 		return status.Errorf(codes.NotFound, "vm %q has no disk %q", req.VmName, req.DiskName)
 	}
+	// An unresolved move of this disk this host recorded is settled first, or
+	// refuses the retry: a "nothing to do" must not hide it.
+	if settled, err := s.settleBeforeMove(ctx, vm, src); err != nil {
+		return err
+	} else if settled != nil {
+		src = settled
+	}
 	if src.StorageVolume == req.TargetPool {
 		// Idempotent no-op: the disk is already where the caller asked for it
 		// (e.g. re-running a move that already completed). Emit a terminal
 		// success frame instead of FailedPrecondition so the UI/CLI shows
 		// "done", not "failed", for a move whose desired end-state already holds.
-		s.settleMoveRecordAtDest(vm, src)
 		return stream.Send(&pb.MoveVolumeProgress{
 			Phase:      pb.MoveVolumeProgress_DONE,
 			Status:     fmt.Sprintf("disk %q is already in pool %q — nothing to do", req.DiskName, req.TargetPool),
@@ -137,6 +143,22 @@ func (s *Server) moveOneVolume(
 	deleteSource bool,
 	send func(*pb.MoveVolumeProgress) error,
 ) error {
+	// A caller that is not MoveVolume (MigrateStackVolumes) reaches here
+	// directly: an unresolved move of this disk is settled first, or refuses
+	// the move with a health.MoveUnresolvedError.
+	if settled, err := s.settleBeforeMove(ctx, vm, src); err != nil {
+		return err
+	} else if settled != nil {
+		src = settled
+		if src.StorageVolume == targetPool {
+			return send(&pb.MoveVolumeProgress{
+				Phase:      pb.MoveVolumeProgress_DONE,
+				Status:     fmt.Sprintf("disk %q is already in pool %q — nothing to do", src.DiskName, targetPool),
+				CopyPct:    100,
+				BytesTotal: src.SizeBytes,
+			})
+		}
+	}
 	// A VM snapshot makes the disk an overlay over a (possibly host-local) backing
 	// base. qemu-img convert flattens the DATA, but the snapshot metadata and the
 	// backing reference don't survive a pool move — the moved overlay can end up
@@ -271,7 +293,7 @@ func (s *Server) moveOneVolume(
 		// newer writes than src). Do NOT re-copy; just commit the DB to catch up. On
 		// failure keep dstPath (the VM boots from it) so a later retry can complete.
 		var merr error
-		if mk, merr = s.beginMoveMarker(vm, src, dstPath, dstPool.Driver, targetPool, false, false); merr != nil {
+		if mk, merr = s.beginMoveMarker(ctx, vm, src, dstPath, dstPool.Driver, targetPool, false, false, true); merr != nil {
 			return merr
 		}
 		if err := corrosion.UpdateDiskPlacement(ctx, s.db, vm.Name, src.DiskName, vm.HostName, dstPath, dstPool.Driver, targetPool); err != nil {
@@ -310,7 +332,7 @@ func (s *Server) moveOneVolume(
 		}
 		cs = cs2
 		var merr error
-		if mk, merr = s.beginMoveMarker(vm, src, dstPath, dstPool.Driver, targetPool, false, false); merr != nil {
+		if mk, merr = s.beginMoveMarker(ctx, vm, src, dstPath, dstPool.Driver, targetPool, false, false, false); merr != nil {
 			if kept := s.keptCopyNote(vm, dstPath); kept != "" {
 				return status.Errorf(codes.Internal, "%v%s", merr, kept)
 			}

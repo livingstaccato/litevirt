@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // TestAuditWriter_OwnerAssertRowsAreSigned: the health package's two audit
@@ -36,7 +37,7 @@ func TestAuditWriter_SettleRowsAreSigned(t *testing.T) {
 		t.Fatalf("InitSchema: %v", err)
 	}
 	corrosion.SignAuditRowsForTest(t, db, host)
-	auditSettle(ctx, db, host, "vm-a", "stopped the local copy")
+	_ = auditSettle(ctx, db, host, "vm-a", "stopped the local copy", randid.New())
 	corrosion.AssertAuditRowsSignedForTest(t, db, 1)
 }
 

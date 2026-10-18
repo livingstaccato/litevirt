@@ -184,6 +184,9 @@ type AppliedState struct {
 	NICTableError string
 	// NICs is the guest devices the per-NIC table covers.
 	NICs map[string]string // device → workload
+	// UnreadablePolicies are the firewall policy rows this build cannot read
+	// (Plan.UnreadablePolicies).
+	UnreadablePolicies []string
 	// MACs is each of those devices' MAC, where known.
 	MACs map[string]string // device → MAC
 	// Guarded is, per workload, the MACs whose guard the per-NIC table in
@@ -244,7 +247,7 @@ func (r *Reconciler) ResolveLogDevice(dev string) (workload, mac string) {
 
 func (r *Reconciler) recordState(ctx context.Context, p Plan, applyErr error) {
 	st := AppliedState{NICs: map[string]string{}, MACs: map[string]string{}, Guarded: map[string]map[string]bool{}, BlockedTrunks: p.BlockedTrunks,
-		InvalidRows: p.InvalidRows, TagGroups: p.TagGroups}
+		InvalidRows: p.InvalidRows, TagGroups: p.TagGroups, UnreadablePolicies: p.UnreadablePolicies}
 	if len(p.NICs) > 0 {
 		st.Mode = p.nicMode()
 	}
@@ -440,6 +443,11 @@ type LoaderOptions struct {
 	// Now is the loader's clock (time.Now when nil): how long a rule has
 	// referenced a missing set (emptySetGrace).
 	Now func() time.Time
+
+	// Logging reports whether this host renders log lines (its kernel loads
+	// the logging forms, ProbeLogging, and the daemon listens) and the NFLOG
+	// group they send to. nil renders none.
+	Logging func() (available bool, group uint16)
 }
 
 // CorrosionPlanLoader builds a Plan from the cluster's
@@ -848,6 +856,21 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		}
 		if opts.BridgeConntrack != nil && !opts.BridgeConntrack() {
 			plan.NICMode = NICModeGuardsOnly
+		}
+		// Firewall logging: the host's log policy, rendered only where the
+		// kernel loads the forms and the daemon listens.
+		plan.LogPolicy, plan.UnreadablePolicies = LogPolicy{}, nil
+		if opts.Logging != nil {
+			lp, lerr := corrosion.ResolveFirewallLogPolicy(ctx, db, hostName)
+			if lerr != nil && !errors.Is(lerr, corrosion.ErrUnreadableFirewallPolicy) {
+				return plan, lerr
+			}
+			if lerr != nil {
+				plan.UnreadablePolicies = append(plan.UnreadablePolicies, lerr.Error())
+			}
+			if avail, group := opts.Logging(); avail {
+				plan.LogPolicy = LogPolicy{Available: true, Group: group, Default: lp.On(), Rate: lp.Rate, Burst: lp.Burst}
+			}
 		}
 		// The addresses of litevirt's own dnsmasq on the guest networks: only
 		// where litevirt is the network's router (re-review I-9).

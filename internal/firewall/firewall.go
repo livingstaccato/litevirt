@@ -329,6 +329,10 @@ type Plan struct {
 	// because they fail the rule grammar (not rendered; reported as a
 	// condition). See quarantineRule.
 	InvalidRows []InvalidRow
+	// UnreadablePolicies names each firewall policy row this build cannot
+	// read, read instead as its documented fallback (the condition
+	// firewall.policy.unreadable).
+	UnreadablePolicies []string
 
 	// SynFlood limits new TCP connections toward guest NICs per (NIC,
 	// source address) in the per-NIC table (synflood.go).

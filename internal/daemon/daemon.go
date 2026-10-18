@@ -1483,11 +1483,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// that cannot load it renders the guards only and raises a health
 	// condition (firewall.nic.unavailable), never an empty firewall.
 	bridgeCT := firewall.BridgeConntrackAvailable(ctx, true)
+	// Firewall logging needs the kernel to load a named limit and a log line
+	// to an NFLOG group. Probed once here (nft -c, nothing committed); a host
+	// that refuses renders no log line and raises firewall.log.unavailable.
+	fwLogGroup := uint16(d.cfg.Firewall.LogGroup)
+	fwLogErr := firewall.ProbeLogging(ctx, fwLogGroup)
+	if fwLogErr != nil {
+		slog.Warn("firewall: logging is unavailable on this host; no packet is logged here", "error", fwLogErr)
+	}
+	svc.RecordFirewallLogAvailability(ctx, fwLogErr)
 	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
 		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs,
 			OnTagGroupMembers:    fwMetrics.SetTagGroupMembers,
 			OnDuplicateAddresses: firewall.NewDuplicateAddressReporter(d.db, d.cfg.HostName).Report,
-			BridgeConntrack:      func() bool { return bridgeCT }, Arming: fwArming})
+			BridgeConntrack:      func() bool { return bridgeCT }, Arming: fwArming,
+			Logging: func() (bool, uint16) { return fwLogErr == nil, fwLogGroup }})
 	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
 	d.fwReconciler.SetArming(fwArming)
 	// Every domain start — an API start, a restart policy, a failover
@@ -1500,9 +1510,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// line sends to into a bounded store (docs/firewall.md, "Logging").
 	fwLogStore := openFirewallLogStore(d.cfg, fwMetrics)
 	svc.SetFirewallLogStore(fwLogStore)
-	go (&firewall.LogListener{Group: uint16(d.cfg.Firewall.LogGroup), Store: fwLogStore,
-		Resolve: d.fwReconciler.ResolveLogDevice,
-		OnBind:  func(err error) { svc.RecordFirewallLogListener(ctx, err) }}).Run(ctx)
+	if fwLogErr == nil {
+		go (&firewall.LogListener{Group: fwLogGroup, Store: fwLogStore,
+			Resolve: d.fwReconciler.ResolveLogDevice,
+			OnBind:  func(err error) { svc.RecordFirewallLogListener(ctx, err) }}).Run(ctx)
+	}
 	go pruneFirewallLog(ctx, fwLogStore)
 	// Whether this host enforces NIC guards, after every pass, the boot pass
 	// included (re-review m8, m2, m5): the label carries this build's

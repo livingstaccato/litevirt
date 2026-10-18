@@ -212,6 +212,8 @@ func (s *Server) RecordFirewallState(ctx context.Context, st firewall.AppliedSta
 		s.blockedTrunksText(ctx, st.BlockedTrunks))
 	s.setFirewallCondition(ctx, CondFirewallInvalidRows, len(st.InvalidRows) > 0, corrosion.SeverityCritical,
 		invalidRowsText(st.InvalidRows))
+	s.setFirewallCondition(ctx, CondFirewallPolicyUnreadable, len(st.UnreadablePolicies) > 0, corrosion.SeverityWarning,
+		unreadablePoliciesText(st.UnreadablePolicies))
 	s.recordTagGroupState(ctx, st.TagGroups)
 }
 

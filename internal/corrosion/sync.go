@@ -1166,6 +1166,10 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 					skipped++
 					continue
 				}
+				if err := retireAdoptedAdmissionCredential(context.Background(), tx, table, row); err != nil {
+					_ = tx.Rollback()
+					return merged, skipped, err
+				}
 				merged++
 				pk := pkKeyAt(row, pkIdx)
 				if c.anyUnresolved() {

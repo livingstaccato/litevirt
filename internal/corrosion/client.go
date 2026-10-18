@@ -971,8 +971,13 @@ func (c *Client) NowWallTS() string {
 // of floor, so it orders strictly after each. A stamp more than the skew
 // cutoff ahead of this node's clock is not adopted, and the write is refused.
 func (c *Client) nowTSAfter(floor ...string) (string, error) {
+	skewed := map[string]bool{}
 	for _, f := range floor {
-		if f == "" || tsFutureSkewed(f, c.now()) {
+		if f == "" {
+			continue
+		}
+		if tsFutureSkewed(f, c.now()) {
+			skewed[f] = true
 			continue
 		}
 		ObserveStamp(c, f)
@@ -986,9 +991,15 @@ func (c *Client) nowTSAfter(floor ...string) (string, error) {
 	}
 	ts := c.NowTS()
 	for _, f := range floor {
-		if f != "" && lwwOrder(ts, f) <= 0 {
-			return "", fmt.Errorf("this node's clock cannot be stamped after %s; retry once the nodes' clocks agree", f)
+		if f == "" || lwwOrder(ts, f) > 0 {
+			continue
 		}
+		if skewed[f] {
+			return "", fmt.Errorf("the stored stamp %s on this node is more than %s ahead of its clock, so this "+
+				"node does not adopt it and cannot stamp after it; run the command through another node, or "+
+				"here once this node's clock has passed %s", f, skewCutoff, f)
+		}
+		return "", fmt.Errorf("this node's clock cannot be stamped after %s; retry once the nodes' clocks agree", f)
 	}
 	return ts, nil
 }

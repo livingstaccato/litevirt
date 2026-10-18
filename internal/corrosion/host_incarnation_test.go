@@ -980,3 +980,96 @@ func TestCredential_APairedWriteOnALaggingRowIsRefusedWithoutTheAbsorb(t *testin
 		})
 	}
 }
+
+// Re-review n-2: a removal stamped more than the skew cutoff ahead of this
+// node's clock is not adopted, so the re-admission is refused on this node;
+// the refusal names the stored stamp as the cause, not the clocks.
+//
+// Mutation: restore the old message — the test sees no "stored".
+func TestHostIncarnation_AFutureSkewedRemovalNamesTheStamp(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	oldIncarnation(t, c)
+	removed := time.Now().UTC().Add(skewCutoff + time.Hour).Format(nowTSLayout)
+	if _, err := c.DB().Exec(`UPDATE hosts SET deleted_at = ?, updated_at = ? WHERE name = 'host-x'`,
+		removed, removed); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := AdmitHostV2(ctx, c, HostRecord{
+		Name: "host-x", Address: "10.0.0.15", SSHUser: "root", SSHPort: 22, GRPCPort: 7443,
+		State: HostStateJoining, CertSerial: incSerialA,
+	}, incGrant(t))
+	if err == nil {
+		t.Fatal("a re-admission over a future-skewed removal was stamped")
+	}
+	for _, want := range []string{removed, "stored", "another node"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not name %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "clocks agree") {
+		t.Errorf("refusal %q blames the clocks", err)
+	}
+}
+
+// Re-review m-4: a node that adopts the counted re-admission's hosts row by
+// anti-entropy, not through its WAL entry, retires the credential as a node
+// that applied the entry does: a lagging node's live password from the
+// earlier admission does not fill the slot on the sensitive merge, whatever
+// its clock, and a password set for the new admission still lands.
+//
+// Mutation: drop the retirement on the anti-entropy adoption — the lagging
+// password becomes live.
+func TestHostIncarnation_AnAntiEntropyAdoptionRetiresTheCredential(t *testing.T) {
+	a, _ := admittedV2(t)
+	hosts, err := a.DumpTablesBytes([]string{"hosts"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, held := range []bool{false, true} {
+		for _, ts := range []string{"2026-01-01T00:00:00.000000000Z", "2999-01-01T00:00:00.000000000Z"} {
+			t.Run(fmt.Sprintf("held=%v lagging at %s", held, ts), func(t *testing.T) {
+				s := newTestDB(t)
+				oldIncarnation(t, s)
+				if !held {
+					if _, err := s.DB().Exec(`DELETE FROM host_fence_credentials WHERE host_name = 'host-x'`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := s.MergeStateBytesLWW(hosts); err != nil {
+					t.Fatal(err)
+				}
+				if n := oneString(t, s, `SELECT incarnation FROM hosts WHERE name = 'host-x'`, "incarnation"); n != "1" {
+					t.Fatalf("fixture: the anti-entropy merge left host-x at incarnation %s", n)
+				}
+				lagging := newTestDB(t)
+				oldIncarnation(t, lagging)
+				if _, err := lagging.DB().Exec(`UPDATE host_fence_credentials SET ipmi_pass = 'lag-pass', updated_at = ?,
+					deleted_at = NULL, after_retirement = '' WHERE host_name = 'host-x'`, ts); err != nil {
+					t.Fatal(err)
+				}
+				if err := s.MergeSensitiveStateBytesLWW(lagging.DumpSensitiveStateBytes()); err != nil {
+					t.Fatal(err)
+				}
+				if pass, ok := liveCredential(t, s); ok {
+					t.Errorf("the sensitive merge gave the re-admitted host the earlier admission's password %q", pass)
+				}
+			})
+		}
+	}
+	// A password set for the new admission still lands on such a node.
+	s := newTestDB(t)
+	oldIncarnation(t, s)
+	if err := s.MergeStateBytesLWW(hosts); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ExecuteBatch(context.Background(), laggingConfigure("new-pass", a.NowTS())); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MergeSensitiveStateBytesLWW(a.DumpSensitiveStateBytes()); err != nil {
+		t.Fatal(err)
+	}
+	if pass, ok := liveCredential(t, s); !ok || pass != "new-pass" {
+		t.Errorf("after adopting the re-admission by anti-entropy, the new admission's password is %q (live %v), want new-pass", pass, ok)
+	}
+}

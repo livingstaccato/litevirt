@@ -243,6 +243,36 @@ func ensureCredentialRow(ctx context.Context, tx *sql.Tx, host, updatedAt string
 	return err
 }
 
+// retireAdoptedAdmissionCredential is the credential half of a counted
+// re-admission for a node that adopts its hosts row by anti-entropy (a later
+// key than the local row's) rather than applying its entry: such a node runs
+// no retireReadmittedCredentials, and would otherwise hold no retirement for
+// the new admission, so a lagging node's live row from the earlier one would
+// fill the slot on the sensitive merge. It retires the credential at the
+// admission's created_at, the instant of the re-admission's own updated_at
+// (ReadmitStamp): not after a password written for the new admission, which
+// carries that updated_at as its retirement, and after the earlier
+// admission's retirement (the re-admission is stamped after it). A removal
+// adopted this way, and a row at incarnation 0, retire nothing here.
+func retireAdoptedAdmissionCredential(ctx context.Context, tx *sql.Tx, table syncTable, row []interface{}) error {
+	idx := columnIndexMap(table.Columns)
+	if _, ok := idx["incarnation"]; !ok {
+		return nil
+	}
+	in := rowHostKey(row, idx)
+	host := cellStr(row, idx, "name")
+	if in.n < 1 || in.deleted || in.at == "" || host == "" {
+		return nil
+	}
+	if err := ensureCredentialRow(ctx, tx, host, in.at); err != nil {
+		return fmt.Errorf("retire %s's fence credential: %w", host, err)
+	}
+	if err := retireFenceCredential(ctx, tx, host, in.at); err != nil {
+		return fmt.Errorf("retire %s's fence credential: %w", host, err)
+	}
+	return nil
+}
+
 // THE HOST'S OTHER ROWS. Four more tables are keyed by the host's name, and a
 // re-admission decides each one, as it decides each hosts column:
 //

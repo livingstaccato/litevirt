@@ -2485,7 +2485,9 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	// A seed here whose last rebuild failed (its stale mark) is tried again
 	// before the domain boots on it, on every start path, once nothing above
 	// refuses the start. Never a refusal: a rebuild that fails again leaves
-	// the seed as it is and warns again, and the VM starts on it.
+	// the seed as it is and warns again, and the VM starts on it. A seed the
+	// domain boots from that is missing here is written again first.
+	s.writeMissingSeedForStart(ctx, vm)
 	s.retryStaleSeedForStart(ctx, vm)
 	return releasePreflight, nil
 }

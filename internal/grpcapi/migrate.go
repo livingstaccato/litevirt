@@ -1443,6 +1443,20 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 	_, statErr := os.Lstat(isoPath)
 	existed := statErr == nil
 
+	if err := writeVMSeed(vm, req, isoPath); err != nil {
+		return nil, status.Errorf(codes.Internal, "generate cloud-init ISO: %v", err)
+	}
+	if !existed {
+		s.migrationISOs.add(req.VmName, isoPath)
+	}
+	slog.Info("cloud-init ISO generated for migration", "vm", req.VmName, "path", isoPath, "replaced", existed)
+	return &emptypb.Empty{}, nil
+}
+
+// writeVMSeed writes vm's seed at isoPath from req (ensureCloudInitRequest)
+// and stamps it as the VM's: instance-id and hostname the VM's name, as
+// CreateVM wrote it, so the guest is not a new instance on it.
+func writeVMSeed(vm *corrosion.VMRecord, req *pb.EnsureCloudInitRequest, isoPath string) error {
 	userData := req.Userdata
 	if userData == "" {
 		userData = "#cloud-config\n{}\n"
@@ -1466,17 +1480,13 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 		NetworkConfig: req.Networkconfig,
 		VendorData:    vendorData,
 	}, isoPath); err != nil {
-		return nil, status.Errorf(codes.Internal, "generate cloud-init ISO: %v", err)
+		return err
 	}
-	if err := cloudinit.StampSeed(isoPath, owner); err != nil {
-		slog.Warn("cloud-init ISO for migration: could not stamp it with its VM; a later start writes it again",
+	if err := cloudinit.StampSeed(isoPath, cloudinit.SpecUUID(vm.Spec)); err != nil {
+		slog.Warn("cloud-init ISO: could not stamp it with its VM; a later start writes it again",
 			"vm", req.VmName, "error", err)
 	}
-	if !existed {
-		s.migrationISOs.add(req.VmName, isoPath)
-	}
-	slog.Info("cloud-init ISO generated for migration", "vm", req.VmName, "path", isoPath, "replaced", existed)
-	return &emptypb.Empty{}, nil
+	return nil
 }
 
 // EnsureDisks creates empty qcow2 images at the requested paths so that

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"os"
+	"slices"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cloudinit"
@@ -71,6 +73,53 @@ func (s *Server) retryStaleSeedForStart(ctx context.Context, vm *corrosion.VMRec
 		return
 	}
 	s.rebuildOwnSeed(ctx, vm, "", true)
+}
+
+// writeMissingSeedForStart writes vm's seed again before a start of it on
+// this host when its domain here boots from the seed (a CD-ROM at the VM's
+// seed path) and the file is gone: a live move's commit removes the source's
+// seed, and a VM returned to that host afterwards (`lv doctor firmware-move
+// --accept-source`, or a cold move from it, which sends no seed it does not
+// have) would otherwise not start. It is written from the VM's spec and NIC
+// rows as a migration target's is (ensureCloudInitRequest), with the VM's
+// name as its instance-id, so the guest is not a new instance on it. Never a
+// refusal: a seed that cannot be written is a seed.rebuild_failed warning,
+// and the start goes on to libvirt, which names the missing file.
+func (s *Server) writeMissingSeedForStart(ctx context.Context, vm *corrosion.VMRecord) {
+	if s.virt == nil {
+		return
+	}
+	iso, err := lv.SafeCloudInitISOPath(s.dataDir, vm.Name)
+	if err != nil {
+		return
+	}
+	if _, err := os.Lstat(iso); !errors.Is(err, fs.ErrNotExist) {
+		return
+	}
+	if active, aerr := s.virt.DomainIsActive(vm.Name); aerr != nil || active {
+		return
+	}
+	domXML, err := s.virt.DumpXMLInactive(vm.Name)
+	if err != nil {
+		return
+	}
+	files, err := domainCDROMFiles(domXML)
+	if err != nil || !slices.Contains(files, iso) {
+		return
+	}
+	req := s.ensureCloudInitRequest(ctx, vm)
+	if req == nil {
+		err = errors.New("its spec or its network-config cannot be read")
+	} else {
+		err = writeVMSeed(vm, req, iso)
+	}
+	if err != nil {
+		detail := fmt.Sprintf("the VM's domain on %s boots from its seed at %s, which is missing, and it could not be written again: %v; the start goes on, and libvirt refuses it for the missing file; the next start on %s tries again", s.hostName, iso, err, s.hostName)
+		slog.Warn("seed missing before a start, and not written", "vm", vm.Name, "seed", iso, "error", err)
+		s.recordVMEventSeverity(context.WithoutCancel(ctx), vm.Name, "seed.rebuild_failed", "error", "warning", detail)
+		return
+	}
+	slog.Info("seed missing before a start: written again from the VM's spec", "vm", vm.Name, "seed", iso)
 }
 
 // seedStartRebuildRaced, set only by tests, runs in a start's rebuild between

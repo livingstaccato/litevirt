@@ -54,6 +54,16 @@ func TestFleet_NICGuard_DepartedVMStopsBeingDrawn(t *testing.T) {
 	}
 	carry(a, b)
 	carry(b, a)
+	// A's table sampled again once the guest has landed, before the commit.
+	afterCarry := true
+	inner := b.Virt.OnMigrateToTarget
+	b.Virt.OnMigrateToTarget = func(name, uri string, p lv.MigrateParams) error {
+		if err := inner(name, uri, p); err != nil {
+			return err
+		}
+		afterCarry = drawn(a)
+		return nil
+	}
 	if _, err := c.SelfClient(a).CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
 		Name: "web", Cpu: 1, MemoryMib: 256, Placement: &pb.PlacementSpec{Host: a.Name},
 		Network: []*pb.NetworkAttachment{{Name: "lan", Ip: "10.30.0.42", Mac: mac}},
@@ -86,6 +96,9 @@ func TestFleet_NICGuard_DepartedVMStopsBeingDrawn(t *testing.T) {
 	}
 	if !backInForce {
 		t.Errorf("the guard was not in force on the returning host when the guest arrived:\n%s", nfts[a.Name].nicTable())
+	}
+	if !afterCarry {
+		t.Errorf("A did not draw the guard after the guest landed:\n%s", nfts[a.Name].nicTable())
 	}
 	reload(a)
 	if !drawn(a) {

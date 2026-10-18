@@ -150,10 +150,16 @@ did not finish shows `HOST_JOINING`: run the same `lv host add` again, from
 any machine holding the cluster CA, to finish it, or `lv host rm <name>` to
 undo the admission.
 
-A machine that already has `/etc/litevirt/config.yaml` keeps it: the add sets
-`host_name`, `advertise_address`, `join_peers` and the cluster's `enforcement`
-block in it, keeps every other key (a `migration.network`, say), and installs
-it like the credentials above. An add refuses a config it cannot parse.
+A machine that already has `/etc/litevirt/config.yaml` keeps it. The add
+edits in place only `host_name`, `advertise_address`, `join_peers`, `pki_dir`
+(set to `/etc/litevirt/pki`, where it installs the credentials) and
+`enforcement`, which becomes the cluster's block, or is removed when the
+cluster has none. Every other line (a `migration.network`, say) is kept as it
+was, as are the file's mode and a symlink to it. The file as it was is kept
+beside it as `config.yaml.pre-add-<time>` (0600). The add refuses a config it
+cannot parse, one with more than one document, one of 1 MiB or more, and a
+`grpc_port` other than 7443 or a `gossip_port` other than 7946, on which
+peers would not reach the host.
 
 Such a host is a new machine to the cluster and inherits nothing the old one
 was configured with: its fencing and IPMI settings, labels, role, region and

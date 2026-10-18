@@ -1,16 +1,19 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -150,8 +153,10 @@ type addRemote interface {
 	RunWithInput(cmd string, input []byte) error
 	// WriteFile puts data at path by a synced rename.
 	WriteFile(path string, data []byte, mode os.FileMode) error
-	// Path is how the file commands below must name path.
+	// Path is how the file commands below must name path; Unpath maps a
+	// path they print back.
 	Path(path string) string
+	Unpath(path string) string
 	// Shell runs one of the file commands (installCmd, restoreCmd, ...);
 	// kind names it.
 	Shell(kind, cmd string) ([]byte, error)
@@ -235,19 +240,14 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 	}
 	files = append(files, rest...)
 	// A machine that already has a config (a re-added one) keeps it: the
-	// keys the add must set are merged in, and setup leaves the file alone.
-	if cur, ok, err := r.ReadFile(remoteConfig); err != nil {
+	// keys the add must set are edited in, and setup leaves the file alone.
+	cfg, err := hostConfig(r, p)
+	if err != nil {
 		removeAll(local)
-		return fmt.Errorf("read the host's %s: %w", remoteConfig, err)
-	} else if ok {
-		merged, err := mergeAddConfig(cur, p)
-		if err != nil {
-			removeAll(local)
-			return fmt.Errorf("refusing to add %s: its %s could not be merged (%v), and the add would drop "+
-				"the settings in it. Fix the file, or move it aside to have the add write a new one",
-				p.hostName, remoteConfig, err)
-		}
-		files = append(files, addFile{remoteConfig, merged, 0o644})
+		return err
+	}
+	if cfg != nil {
+		files = append(files, *cfg)
 		p.configInstalled = true
 	}
 	bin, err := os.ReadFile(p.binPath)
@@ -341,7 +341,16 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 	if err := finishAdd(r, p, serial, admitted); err != nil {
 		return restore(err)
 	}
-	if _, err := r.Shell("discard", removeCmd(r, suffixed(paths, suffix))); err != nil {
+	// The copies of replaced keys go; the operator's config is kept as it was.
+	var discard []string
+	for _, path := range paths {
+		if cfg != nil && path == cfg.path {
+			fmt.Printf("  kept the config it edited, as it was, in %s (0600)\n", path+suffix)
+			continue
+		}
+		discard = append(discard, path)
+	}
+	if _, err := r.Shell("discard", removeCmd(r, suffixed(discard, suffix))); err != nil {
 		slog.Warn("could not remove the copies of the replaced identity files", "suffix", suffix, "error", err)
 	}
 	return addedLocally(p)
@@ -668,6 +677,8 @@ func (r *sshAddRemote) WriteFile(path string, data []byte, mode os.FileMode) err
 
 func (r *sshAddRemote) Path(path string) string { return path }
 
+func (r *sshAddRemote) Unpath(path string) string { return path }
+
 func (r *sshAddRemote) Shell(_, cmd string) ([]byte, error) { return r.sc.RunOutput(cmd) }
 
 // LocalAddTarget is addRemote over a directory tree this process can reach (a
@@ -692,6 +703,17 @@ func (d *LocalAddTarget) Path(path string) string {
 		return filepath.Join(d.PKIDir, strings.TrimPrefix(path, remotePKIDir))
 	}
 	return filepath.Join(d.Root, path)
+}
+
+func (d *LocalAddTarget) Unpath(path string) string {
+	if rel, err := filepath.Rel(d.PKIDir, path); err == nil && !strings.HasPrefix(rel, "..") {
+		return filepath.Join(remotePKIDir, rel)
+	}
+	rel, err := filepath.Rel(d.Root, path)
+	if err != nil {
+		return path
+	}
+	return "/" + rel
 }
 
 func (d *LocalAddTarget) ReadFile(path string) ([]byte, bool, error) {
@@ -748,50 +770,204 @@ func HostAddOn(ctx context.Context, c pb.LiteVirtClient, t *LocalAddTarget, host
 
 const remoteConfig = "/etc/litevirt/config.yaml"
 
+// maxConfigRead is the most of a config.yaml the add reads (ReadFile over
+// SSH stops there); a file that size or larger is refused, never truncated.
+const maxConfigRead = 1 << 20
+
+// addConfigPorts are the ports an add assumes: peers dial the host's gRPC on
+// grpcPort (AdmitHost records it) and its gossip on gossipPort (join_peers).
+var addConfigPorts = map[string]int{"grpc_port": 7443, "gossip_port": 7946}
+
 // mergeAddConfig is the machine's existing config.yaml with the keys an add
-// must set replaced: host_name, advertise_address, join_peers and, when the
-// cluster has one, the enforcement block (its flags must match the peers').
-// Every other key, operator settings among them, and the comments are kept.
+// must set edited in place, line by line: host_name, advertise_address,
+// join_peers, pki_dir (the directory the add installs the credentials to)
+// and the enforcement block, which becomes the cluster's, or goes when the
+// cluster has none (its flags must equal the peers'). Every other byte is
+// kept. A key the file lacks is appended.
+//
+// It refuses what it cannot edit safely: more than one document, a mapping
+// that is not in block style, a port the add would not reach the host on, or
+// an edit that changes any other key's value (an alias into a replaced
+// block, say).
 func mergeAddConfig(existing []byte, p hostAddPlan) ([]byte, error) {
-	var doc yaml.Node
-	if err := yaml.Unmarshal(existing, &doc); err != nil {
+	before, err := configMapping(existing)
+	if err != nil {
 		return nil, err
 	}
-	if doc.Kind != yaml.DocumentNode || len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
-		return nil, fmt.Errorf("not a YAML mapping")
+	for key, want := range addConfigPorts {
+		if v, ok := before[key]; ok && fmt.Sprint(v) != strconv.Itoa(want) {
+			return nil, fmt.Errorf("%s is %v: peers reach a host only on %d, so the host would be unreachable "+
+				"(set %s: %d, or remove the key)", key, v, want, key, want)
+		}
 	}
-	root := doc.Content[0]
-	set := func(key string, v *yaml.Node) {
-		for i := 0; i+1 < len(root.Content); i += 2 {
-			if root.Content[i].Value == key {
-				root.Content[i+1] = v
-				return
+	edits := []struct {
+		key  string
+		text string // "" deletes the key
+	}{
+		{"host_name", fmt.Sprintf("host_name: %q\n", p.hostName)},
+		{"advertise_address", fmt.Sprintf("advertise_address: %q\n", p.hostAddr)},
+		{"join_peers", "join_peers: " + strings.TrimSpace(p.peersYAML) + "\n"},
+		{"pki_dir", "pki_dir: " + remotePKIDir + "\n"},
+		{"enforcement", strings.TrimRight(p.enforcement, "\n") + "\n"},
+	}
+	if strings.TrimSpace(p.enforcement) == "" {
+		edits[len(edits)-1].text = ""
+	}
+	lines := strings.SplitAfter(string(existing), "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if n := len(lines); n > 0 && !strings.HasSuffix(lines[n-1], "\n") {
+		lines[n-1] += "\n"
+	}
+	for _, e := range edits {
+		start, end, found := topLevelKeySpan(lines, e.key)
+		switch {
+		case found:
+			repl := []string{}
+			if e.text != "" {
+				repl = []string{e.text}
 			}
+			lines = append(lines[:start], append(repl, lines[end:]...)...)
+		case e.text != "":
+			lines = append(lines, e.text)
 		}
-		root.Content = append(root.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: key}, v)
 	}
-	quoted := func(s string) *yaml.Node {
-		return &yaml.Node{Kind: yaml.ScalarNode, Value: s, Style: yaml.DoubleQuotedStyle}
+	merged := []byte(strings.Join(lines, ""))
+
+	// Every key the add does not set must decode exactly as before, and the
+	// keys it sets as it set them.
+	after, err := configMapping(merged)
+	if err != nil {
+		return nil, fmt.Errorf("the edited file does not parse (%v)", err)
 	}
-	set("host_name", quoted(p.hostName))
-	set("advertise_address", quoted(p.hostAddr))
-	var peers yaml.Node
-	if err := yaml.Unmarshal([]byte(p.peersYAML), &peers); err != nil || len(peers.Content) != 1 {
-		return nil, fmt.Errorf("join_peers %q: %v", p.peersYAML, err)
+	want, err := configMapping([]byte(strings.Join([]string{edits[0].text, edits[1].text, edits[2].text,
+		edits[3].text, edits[4].text}, "")))
+	if err != nil {
+		return nil, fmt.Errorf("the keys to set: %w", err)
 	}
-	set("join_peers", peers.Content[0])
-	if strings.TrimSpace(p.enforcement) != "" {
-		var enf yaml.Node
-		if err := yaml.Unmarshal([]byte(p.enforcement), &enf); err != nil {
-			return nil, fmt.Errorf("the cluster's enforcement block: %w", err)
+	set := map[string]bool{}
+	for _, e := range edits {
+		set[e.key] = true
+	}
+	for k, v := range before {
+		if !set[k] && !reflect.DeepEqual(after[k], v) {
+			return nil, fmt.Errorf("editing it would change %s", k)
 		}
-		if len(enf.Content) == 1 && enf.Content[0].Kind == yaml.MappingNode {
-			for i := 0; i+1 < len(enf.Content[0].Content); i += 2 {
-				if enf.Content[0].Content[i].Value == "enforcement" {
-					set("enforcement", enf.Content[0].Content[i+1])
-				}
+	}
+	for k := range set {
+		if !reflect.DeepEqual(after[k], want[k]) {
+			return nil, fmt.Errorf("%s did not come out as set", k)
+		}
+	}
+	if len(after) != len(before)+countMissing(before, want) {
+		return nil, fmt.Errorf("editing it would add or drop a key")
+	}
+	return merged, nil
+}
+
+// countMissing is how many keys of want before lacks, minus the keys before
+// has that the merge removes (want lacks them and they are set keys): the
+// change in key count a correct merge makes.
+func countMissing(before, want map[string]interface{}) int {
+	n := 0
+	for k := range want {
+		if _, ok := before[k]; !ok {
+			n++
+		}
+	}
+	if _, ok := before["enforcement"]; ok {
+		if _, ok := want["enforcement"]; !ok {
+			n--
+		}
+	}
+	return n
+}
+
+// configMapping decodes a config that is one block-style YAML mapping.
+func configMapping(b []byte) (map[string]interface{}, error) {
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	var doc yaml.Node
+	if err := dec.Decode(&doc); err != nil {
+		if errors.Is(err, io.EOF) {
+			return map[string]interface{}{}, nil
+		}
+		return nil, err
+	}
+	var extra yaml.Node
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("it holds more than one YAML document")
+	}
+	if len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode || doc.Content[0].Style&yaml.FlowStyle != 0 {
+		return nil, fmt.Errorf("it is not a block-style YAML mapping")
+	}
+	m := map[string]interface{}{}
+	if err := doc.Decode(&m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// topLevelKeySpan finds key's lines among lines: its own line at column 0,
+// and every line after it that is indented, or blank before more indented
+// ones. end is one past the last.
+func topLevelKeySpan(lines []string, key string) (start, end int, found bool) {
+	for i, l := range lines {
+		rest, ok := strings.CutPrefix(l, key)
+		if !ok || !strings.HasPrefix(strings.TrimLeft(rest, " \t"), ":") {
+			continue
+		}
+		end = i + 1
+		for j := i + 1; j < len(lines); j++ {
+			t := lines[j]
+			if strings.TrimSpace(t) == "" {
+				continue
 			}
+			if t[0] != ' ' && t[0] != '\t' {
+				break
+			}
+			end = j + 1
 		}
+		return i, end, true
 	}
-	return yaml.Marshal(&doc)
+	return 0, 0, false
+}
+
+// hostConfig is the host's config.yaml with the add's keys edited in, as a
+// file to install at the path it resolves to (a symlinked config stays a
+// symlink) and at its own mode; nil when the host has none.
+func hostConfig(r addRemote, p hostAddPlan) (*addFile, error) {
+	q := ssh.ShellQuote(r.Path(remoteConfig))
+	out, err := r.Shell("config", fmt.Sprintf("if [ -e %s ]; then readlink -f -- %s; stat -L -c %%a -- %s; fi", q, q, q))
+	if err != nil {
+		return nil, fmt.Errorf("read the host's %s: %w", remoteConfig, err)
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return nil, nil
+	}
+	refuse := func(why error) error {
+		return fmt.Errorf("refusing to add %s: its %s could not be kept (%v), and the add would drop the settings "+
+			"in it. Fix the file, or move it aside to have the add write a new one", p.hostName, remoteConfig, why)
+	}
+	if len(fields) != 2 {
+		return nil, refuse(fmt.Errorf("unexpected stat output %q", out))
+	}
+	mode, err := strconv.ParseUint(fields[1], 8, 32)
+	if err != nil {
+		return nil, refuse(err)
+	}
+	path := r.Unpath(fields[0])
+	cur, ok, err := r.ReadFile(path)
+	if err != nil || !ok {
+		return nil, fmt.Errorf("read the host's %s (%s): %v", remoteConfig, path, err)
+	}
+	if len(cur) >= maxConfigRead {
+		return nil, refuse(fmt.Errorf("it is 1 MiB or larger, more than the add reads"))
+	}
+	merged, err := mergeAddConfig(cur, p)
+	if err != nil {
+		return nil, refuse(err)
+	}
+	return &addFile{path, merged, os.FileMode(mode)}, nil
 }

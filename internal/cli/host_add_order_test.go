@@ -127,7 +127,7 @@ func installedLive(events []string) []string {
 	for _, e := range events {
 		switch {
 		case strings.HasPrefix(e, "write ") && strings.HasSuffix(e, ".add"):
-		case strings.HasPrefix(e, "run mkdir -p"), e == "sh unstage":
+		case strings.HasPrefix(e, "run mkdir -p"), e == "sh unstage", e == "sh config":
 		default:
 			live = append(live, e)
 		}
@@ -467,20 +467,42 @@ func TestAddInstallCommands_KeepAndRestore(t *testing.T) {
 const operatorConfig = `# operator notes
 host_name: "node-2"
 grpc_port: 7443
-pki_dir: /etc/litevirt/pki
-data_dir: /var/lib/litevirt
+pki_dir: /srv/litevirt/pki
+
+data_dir: /var/lib/litevirt   # big disk
 advertise_address: "10.0.0.2"
 join_peers: ["10.0.0.5:7946"]
 migration:
-  network: 10.78.1.0/24
+    network: 10.78.1.0/24     # storage VLAN
 enforcement:
   audit_signature: false
+  partition_pause: false
+ui_tls: off
 `
 
-func writeTargetConfig(t *testing.T, f *addFixture) string {
+// What the add makes of operatorConfig in a cluster with no enforcement
+// block (HostAddOn): only the keys it must set change, in place; the
+// machine's own enforcement block goes; every other byte is the operator's.
+const mergedOperatorConfig = `# operator notes
+host_name: "node-9"
+grpc_port: 7443
+pki_dir: /etc/litevirt/pki
+
+data_dir: /var/lib/litevirt   # big disk
+advertise_address: "10.0.0.9"
+join_peers: []
+migration:
+    network: 10.78.1.0/24     # storage VLAN
+ui_tls: off
+`
+
+func writeTargetConfig(t *testing.T, f *addFixture, body string, mode os.FileMode) string {
 	t.Helper()
 	p := filepath.Join(f.target.Root, "etc", "litevirt", "config.yaml")
-	if err := os.WriteFile(p, []byte(operatorConfig), 0o644); err != nil {
+	if err := os.WriteFile(p, []byte(body), mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, mode); err != nil {
 		t.Fatal(err)
 	}
 	return p
@@ -488,32 +510,31 @@ func writeTargetConfig(t *testing.T, f *addFixture) string {
 
 // Lab recheck3 anomaly 4: `lv host add` wrote a re-added machine's
 // config.yaml afresh, and the operator's `migration.network` was lost. The
-// add now merges into the existing file only the keys it must set (name,
-// address, peers, the cluster's enforcement block), keeps every other key,
-// installs it like the identity files (a 0600 copy kept while it installs,
-// put back on a failure, removed on success), and setup leaves it alone.
+// add edits in place only the keys it must set, and keeps every other byte
+// (fd re-review N-m2). The machine's own enforcement block goes when the
+// cluster has none (N-I1: a re-added host must not keep its old kill
+// switches), and pki_dir is the directory the add installs to (N-I2). The
+// file keeps its mode, and a symlinked config stays a symlink. The copy of
+// the original is kept, 0600, after a successful add, and put back on a
+// failure.
 //
-// Mutations: drop the merge (setup writes the template) — the config is not
-// installed and keeps node-2; drop the setup guard — the script still
-// writes its template; drop the restore of config.yaml — "failed" keeps the
-// merged file.
+// Mutations: keep the machine's enforcement block when the cluster has none
+// — "merged" differs; leave pki_dir — "merged" differs; re-emit the whole
+// document — "merged" differs (indentation, blank line, comments); write
+// at 0644 — "mode" fails; replace the symlink — "symlink" fails; discard
+// the config's copy — "merged" finds none.
 func TestHostAdd_KeepsTheMachinesConfig(t *testing.T) {
 	t.Run("merged", func(t *testing.T) {
 		f := newAddFixture(t)
-		cfg := writeTargetConfig(t, f)
+		cfg := writeTargetConfig(t, f, operatorConfig, 0o640)
 		if err := f.add(t); err != nil {
 			t.Fatal(err)
 		}
-		got := string(mustRead(t, cfg))
-		for _, want := range []string{"network: 10.78.1.0/24", "node-9", "10.0.0.9", "# operator notes", "data_dir: /var/lib/litevirt"} {
-			if !strings.Contains(got, want) {
-				t.Errorf("the config lost or lacks %q:\n%s", want, got)
-			}
+		if got := string(mustRead(t, cfg)); got != mergedOperatorConfig {
+			t.Errorf("merged config:\n%s\nwant:\n%s", got, mergedOperatorConfig)
 		}
-		for _, gone := range []string{"node-2", "10.0.0.5", "10.0.0.2"} {
-			if strings.Contains(got, gone) {
-				t.Errorf("the config still names %q:\n%s", gone, got)
-			}
+		if st, _ := os.Stat(cfg); st.Mode().Perm() != 0o640 {
+			t.Errorf("the config is %o, want its own 0640", st.Mode().Perm())
 		}
 		setup := ""
 		for _, e := range f.target.Events {
@@ -524,13 +545,43 @@ func TestHostAdd_KeepsTheMachinesConfig(t *testing.T) {
 		if !strings.Contains(setup, "CONFIG_INSTALLED='1'") {
 			t.Errorf("setup is not told the config is installed: %q", setup)
 		}
-		if m, _ := filepath.Glob(filepath.Join(filepath.Dir(cfg), "*.pre-add-*")); len(m) != 0 {
-			t.Errorf("copies left after a successful add: %v", m)
+		m, _ := filepath.Glob(cfg + ".pre-add-*")
+		if len(m) != 1 || string(mustRead(t, m[0])) != operatorConfig {
+			t.Fatalf("the original config is not kept beside it: %v", m)
+		}
+		if st, _ := os.Stat(m[0]); st.Mode().Perm() != 0o600 {
+			t.Errorf("the kept config is %o, want 0600", st.Mode().Perm())
+		}
+		if k, _ := filepath.Glob(filepath.Join(f.targetPKI, "*.pre-add-*")); len(k) != 0 {
+			t.Errorf("copies of replaced keys left: %v", k)
+		}
+	})
+	t.Run("symlink", func(t *testing.T) {
+		f := newAddFixture(t)
+		managed := filepath.Join(f.target.Root, "srv", "cm", "litevirt.yaml")
+		if err := os.MkdirAll(filepath.Dir(managed), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(managed, []byte(operatorConfig), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(f.target.Root, "etc", "litevirt", "config.yaml")
+		if err := os.Symlink(managed, link); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.add(t); err != nil {
+			t.Fatal(err)
+		}
+		if st, err := os.Lstat(link); err != nil || st.Mode()&os.ModeSymlink == 0 {
+			t.Errorf("the config symlink was replaced by a file (%v)", err)
+		}
+		if got := string(mustRead(t, managed)); got != mergedOperatorConfig {
+			t.Errorf("the link's target was not merged:\n%s", got)
 		}
 	})
 	t.Run("failed", func(t *testing.T) {
 		f := newAddFixture(t)
-		cfg := writeTargetConfig(t, f)
+		cfg := writeTargetConfig(t, f, operatorConfig, 0o644)
 		f.target.FailSetup = errors.New("setup failed")
 		if err := f.add(t); err == nil {
 			t.Fatal("the add succeeded")
@@ -539,19 +590,41 @@ func TestHostAdd_KeepsTheMachinesConfig(t *testing.T) {
 			t.Errorf("the config was not put back:\n%s", got)
 		}
 	})
-	t.Run("unreadable", func(t *testing.T) {
-		f := newAddFixture(t)
-		p := filepath.Join(f.target.Root, "etc", "litevirt", "config.yaml")
-		if err := os.WriteFile(p, []byte("migration: [unclosed\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := f.add(t); err == nil || !strings.Contains(err.Error(), "config.yaml") {
-			t.Fatalf("add over an unparsable config = %v, want a refusal naming it", err)
-		}
-		if len(f.client.admitted) != 0 || len(f.target.Events) != 0 {
-			t.Errorf("an add that cannot keep the config went ahead: admitted %v, events %v", f.client.admitted, f.target.Events)
-		}
-	})
+	for _, tc := range []struct{ name, body, want string }{
+		{"unparsable", "migration: [unclosed\n", "config.yaml"},
+		{"two documents", "host_name: a\n---\nhost_name: b\n", "document"},
+		{"gossip port", "host_name: a\ngossip_port: 7950\n", "gossip_port"},
+		{"grpc port", "host_name: a\ngrpc_port: 7500\n", "grpc_port"},
+		{"too large", "host_name: a\n# " + strings.Repeat("x", 1<<20) + "\n", "1 MiB"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAddFixture(t)
+			writeTargetConfig(t, f, tc.body, 0o644)
+			if err := f.add(t); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("add = %v, want a refusal naming %q", err, tc.want)
+			}
+			// Only the read of the config reached the host.
+			if len(f.client.admitted) != 0 || len(f.target.Events) != 1 || f.target.Events[0] != "sh config" {
+				t.Errorf("the add went ahead: admitted %v, events %v", f.client.admitted, f.target.Events)
+			}
+		})
+	}
+}
+
+// With an enforcement block in the cluster, the machine's is replaced by it;
+// a key the file lacks is appended.
+func TestMergeAddConfig_ReplacesTheEnforcementBlock(t *testing.T) {
+	p := hostAddPlan{hostName: "node-9", hostAddr: "10.0.0.9", peersYAML: `["10.0.0.1:7946"]`,
+		enforcement: "enforcement:\n  audit_signature: true\n  partition_pause: true\n"}
+	got, err := mergeAddConfig([]byte("data_dir: /d\nenforcement:\n  audit_signature: false\n# tail\n"), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "data_dir: /d\nenforcement:\n  audit_signature: true\n  partition_pause: true\n# tail\n" +
+		"host_name: \"node-9\"\nadvertise_address: \"10.0.0.9\"\njoin_peers: [\"10.0.0.1:7946\"]\npki_dir: /etc/litevirt/pki\n"
+	if string(got) != want {
+		t.Errorf("merged:\n%s\nwant:\n%s", got, want)
+	}
 }
 
 // The setup script writes its template config only when the add did not

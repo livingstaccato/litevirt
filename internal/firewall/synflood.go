@@ -109,14 +109,17 @@ func ProbeSynFlood(ctx context.Context) error {
 //
 // Whatever the path, the result passes validateSynFlood, which would
 // otherwise refuse the whole plan.
-func loadSynFlood(ctx context.Context, db *corrosion.Client, host string, probe func() error) (sf SynFlood, unavailable string, unreadable []string, err error) {
+//
+// unreadable is the pass's list so far (Plan.UnreadablePolicies, shared with
+// the other policy blocks); the SYN-flood entry is appended to it.
+func loadSynFlood(ctx context.Context, db *corrosion.Client, host string, probe func() error, unreadable []string) (sf SynFlood, unavailable string, _ []string, err error) {
 	pol, err := corrosion.ResolveFirewallSynflood(ctx, db, host)
 	switch {
 	case errors.Is(err, corrosion.ErrUnreadableFirewallPolicy):
 		unreadable = append(unreadable, fmt.Sprintf("%v; SYN-flood protection is on at %d/second burst %d until it is set again with lv firewall synflood",
 			err, corrosion.SynfloodDefaultRate, corrosion.SynfloodDefaultBurst))
 	case err != nil:
-		return SynFlood{}, "", nil, err
+		return SynFlood{}, "", unreadable, err
 	}
 	if !pol.On() {
 		return SynFlood{}, "", unreadable, nil

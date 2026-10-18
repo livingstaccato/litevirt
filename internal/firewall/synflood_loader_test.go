@@ -209,3 +209,27 @@ func TestProbeSynFlood_ChecksTheRenderedShape(t *testing.T) {
 		t.Errorf("refused probe: err = %v, want nft's refusal", err)
 	}
 }
+
+// Plan.UnreadablePolicies is shared with the other policy blocks of the pass
+// (the log policy's): it is reset once at the top of the pass and each block
+// APPENDS, so the SYN-flood block keeps what came before it, and a stale
+// entry in the defaults plan never survives.
+//
+// Mutations: assign instead of append — the earlier entry is lost: red; drop
+// the reset at the top of the pass — the stale entry survives: red.
+func TestLoader_SynFloodAppendsUnreadable(t *testing.T) {
+	ctx := context.Background()
+	db := synFloodLoaderDB(t)
+	putSynFloodRaw(t, db, corrosion.FirewallSynfloodKey(""), "x")
+	_, _, got, err := loadSynFlood(ctx, db, "host-a", nil, []string{"earlier"})
+	if err != nil || len(got) != 2 || got[0] != "earlier" || !strings.Contains(got[1], corrosion.FirewallSynfloodKey("")) {
+		t.Fatalf("loadSynFlood unreadable = %q, %v; want the earlier entry kept and the SYN-flood key appended", got, err)
+	}
+	plan, err := CorrosionPlanLoader(db, "host-a", Plan{UnreadablePolicies: []string{"stale"}}, LoaderOptions{})(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.UnreadablePolicies) != 1 || plan.UnreadablePolicies[0] == "stale" {
+		t.Errorf("UnreadablePolicies = %q, want only this pass's SYN-flood entry", plan.UnreadablePolicies)
+	}
+}

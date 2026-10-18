@@ -486,6 +486,8 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		// reference to a set that does not exist matches nothing (see
 		// quarantine). Each is reported (Plan.InvalidRows).
 		plan.InvalidRows = plan.InvalidRows[:0:0]
+		// Each policy block of the pass appends the rows it cannot read.
+		plan.UnreadablePolicies = plan.UnreadablePolicies[:0:0]
 		ipsets, err := corrosion.ListIPSets(ctx, db)
 		if err != nil {
 			return plan, err
@@ -533,7 +535,7 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		plan.DefaultDeny = deny
 
 		// SYN-flood protection (synflood.go).
-		plan.SynFlood, plan.SynFloodUnavailable, plan.UnreadablePolicies, err = loadSynFlood(ctx, db, hostName, opts.SynFloodProbe)
+		plan.SynFlood, plan.SynFloodUnavailable, plan.UnreadablePolicies, err = loadSynFlood(ctx, db, hostName, opts.SynFloodProbe, plan.UnreadablePolicies)
 		if err != nil {
 			return plan, err
 		}

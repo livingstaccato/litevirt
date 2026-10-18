@@ -197,12 +197,19 @@ func orDash(s string) string {
 // now is most likely a voter's link or the currency pull failing for a
 // moment: it is retried after each removeRetryBackoff wait, and one that is
 // still Unavailable names rerun, which finishes it (the revocation is already
-// in place). Any other refusal is returned at once.
+// in place). A NotFound on a retry is the removal itself, made by an attempt
+// whose reply was lost. Any other refusal is returned at once.
 func removeAfterRevoke(ctx context.Context, c pb.LiteVirtClient, req *pb.RemoveHostRequest, rerun string) (*pb.RemoveHostResponse, error) {
 	for attempt := 0; ; attempt++ {
 		removed, err := c.RemoveHost(ctx, req)
 		if err == nil {
 			return removed, nil
+		}
+		// The host was there when this command began, so a NotFound on a
+		// retry is an earlier attempt's removal whose reply was lost.
+		if attempt > 0 && status.Code(err) == codes.NotFound {
+			fmt.Printf("  an earlier attempt removed %s; its reply was lost\n", req.GetName())
+			return &pb.RemoveHostResponse{}, nil
 		}
 		if status.Code(err) != codes.Unavailable {
 			return nil, fmt.Errorf("remove host after publishing its certificate revocation: %w", err)

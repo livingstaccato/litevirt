@@ -509,6 +509,44 @@ func TestHostRemove_RetriesTheRemovalAfterTheRevocation(t *testing.T) {
 	}
 }
 
+// eqts final check m-C: a retried RemoveHost whose earlier attempt removed
+// the host but lost its reply is answered NotFound. The removal completed, so
+// the command reports success; a NotFound on the first attempt is still an
+// error, since nothing this command did removed the host.
+//
+// Mutation: treat NotFound as a refusal on every attempt — "reply lost"
+// fails; on every attempt as success — "first attempt" passes a removal
+// this command never made.
+func TestHostRemove_ARetryAfterALostReplyIsTheRemoval(t *testing.T) {
+	old := removeRetryBackoff
+	removeRetryBackoff = []time.Duration{0, 0}
+	t.Cleanup(func() { removeRetryBackoff = old })
+	unavailable := status.Error(codes.Unavailable, "context deadline exceeded")
+	notFound := status.Error(codes.NotFound, `host "node-9" not found`)
+	for _, dead := range []bool{false, true} {
+		run := func(c *hostRemoveTestClient) error {
+			if dead {
+				return HostRemoveDead(context.Background(), c, "node-9", false)
+			}
+			return HostRemove(context.Background(), c, "node-9", false)
+		}
+		t.Run(fmt.Sprintf("reply lost dead=%v", dead), func(t *testing.T) {
+			rmTestPKI(t)
+			c := &hostRemoveTestClient{removeErrs: []error{unavailable, notFound}}
+			if err := run(c); err != nil {
+				t.Errorf("a removal whose first reply was lost: %v", err)
+			}
+		})
+		t.Run(fmt.Sprintf("first attempt dead=%v", dead), func(t *testing.T) {
+			rmTestPKI(t)
+			c := &hostRemoveTestClient{removeErrs: []error{notFound}}
+			if err := run(c); err == nil {
+				t.Error("a NotFound on the first attempt reported success")
+			}
+		})
+	}
+}
+
 // Re-review n-3: `lv host rm --dead --dry-run` asks the daemon whether it
 // would make the removal, so the dry run does not report a plan the removal
 // would refuse; it still revokes, publishes and removes nothing.

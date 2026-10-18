@@ -36,21 +36,19 @@ import (
 //     commits the row, pivots and writes the copy; nothing reaches b or c.
 //  2. a is proven powered off; fork fails over to b (one change of hands),
 //     which starts it on the source and writes it.
-//  3. a's condition reaches b late. b's domain is then lost; with the copy
-//     made the later file, only b's record of its own start holds b's next
-//     start back.
+//  3. a's condition reaches b late. b's domain is then lost; even with the
+//     copy made the later file, b's next start holds (no domain: the
+//     operator chooses), and names b's own start.
 //  4. b is lost; fork fails over to c, either by a transfer (a second change
 //     of hands) or by a reschedule that mints no generation (so it is one
-//     generation on from the move, and only the files' times show b wrote the
-//     source).
+//     generation on from the move).
 //  5. c, with no domain, refuses the start: the row stays on the source, both
 //     files keep their writes, the condition stays open, nothing is audited
 //     as an automatic repoint.
 //  6. On c, `--accept <src>` keeps b's writes with no domain defined.
 //
-// Mutations: drop the start record from the heal — step 3 boots the copy;
-// drop the modification-time check — the reschedule case boots the copy;
-// drop the whole check — both cases do.
+// Mutations: restore an automatic repoint with no domain — step 3 or 5
+// boots the copy; drop the start record from the refusal — step 3's text.
 func TestFleet_MoveUnresolved_SecondFailoverHoldsAForkedHistory(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -143,7 +141,7 @@ func secondFailover(t *testing.T, reschedule bool) {
 	modTimes(t, dst, src)
 
 	// 3. a's history reaches b late; b's domain is then lost. Even with the
-	// copy made the later file, b holds: it started the VM since the move.
+	// copy made the later file, b holds, naming its own start since the move.
 	pumpMutations(t, c, a, b)
 	if !health.MoveConditionCovers(ctx, b.DB, "fork", "root") {
 		t.Fatal("a's condition did not reach b")

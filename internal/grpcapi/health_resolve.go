@@ -447,8 +447,9 @@ func (s *Server) unreadableMoveGate(ctx context.Context, vm, code string) ([]str
 // the row's, and the resolution is refused when:
 //   - the move proves another file holds every write (pivoted or caught up:
 //     the copy), so the one kept lacks some, unless the history forked after
-//     it: the owner has run the VM on the row's file since it changed hands,
-//     and that file is accepted (forkedHistory);
+//     it: the VM changed hands and may have run on the source since, and the
+//     source is accepted (forkedHistory; a row on the copy is then pointed
+//     at the source);
 //   - on the VM's owner with its domain defined: the persistent config (what
 //     `lv start` boots) does not name the file kept; the domain is active and
 //     the row would change; or, on the holder that owns the VM, the domain is
@@ -553,16 +554,20 @@ func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev 
 			if ferr != nil {
 				return nil, nil, ferr
 			}
-			if f != "" {
-				// The owner's own writes since the VM changed hands are in
-				// keep; the other file holds the holder's and stays on disk.
-				forks = append(forks, f)
+			if f == "" {
+				return nil, nil, status.Errorf(codes.FailedPrecondition,
+					"refusing to resolve %s on vm/%s: the guest was moved onto %s (or the config named it before the move), so "+
+						"%s lacks the writes made since; for disk %s only `--accept %s` is accepted",
+					health.MoveUnresolvedCode, vm, m.Dst, keep, m.Disk, m.Dst)
+			}
+			// The writes made since the VM changed hands are in keep; the
+			// other file holds the holder's and stays on disk. A row on the
+			// copy (a replica that received the holder's commit) is pointed
+			// at keep below, under the same gates as any other change.
+			forks = append(forks, f)
+			if keep == row.Path {
 				continue
 			}
-			return nil, nil, status.Errorf(codes.FailedPrecondition,
-				"refusing to resolve %s on vm/%s: the guest was moved onto %s (or the config named it before the move), so "+
-					"%s lacks the writes made since; for disk %s only `--accept %s` is accepted",
-				health.MoveUnresolvedCode, vm, m.Dst, keep, m.Disk, m.Dst)
 		}
 		if active && keep != row.Path {
 			return nil, nil, status.Errorf(codes.FailedPrecondition,
@@ -644,16 +649,18 @@ func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev 
 
 // forkedHistory describes the forked history of move m that a hand resolution
 // keeps keep of ("" when it is not one): after the holder pivoted the guest
-// onto other, the VM changed hands (health.OwnerChangedSince) and its owner,
-// this host, ran it on the file its disk row names. Taken only with --accept
-// of the row's file, on the owner that does not hold the move (the holder is
-// proven powered off), whose persistent config, which `lv start` boots, names
-// that file, or which has no domain of the VM (a start rebuilds it from the
-// row). It is refused when other was modified after keep, which shows nothing
-// was written to keep since the holder's last write to other, unless force.
-// The row is not changed and other is never deleted.
+// onto other, the VM changed hands (health.OwnerChangedSince) and was run on
+// keep, the source: here, on the file its disk row names, or on a host whose
+// row named the source while this host's names the copy (a replica that
+// received the holder's commit). Taken only with --accept of keep, on the
+// owner that does not hold the move (the holder is proven powered off), whose
+// persistent config, which `lv start` boots, names keep, or which has no
+// domain of the VM (a start rebuilds it from the row). It is refused when
+// other was modified after keep, which shows nothing was written to keep
+// since the holder's last write to other, unless force. other is never
+// deleted; a row naming other is pointed at keep by the caller.
 func forkedHistory(here, owner, holder string, rec *corrosion.VMRecord, m health.UnresolvedMove, rowPath, keep, other string, accepted, config, noDomain, force bool, xml string) (string, error) {
-	if !accepted || (!config && !noDomain) || here != owner || here == holder || keep != rowPath || !health.OwnerChangedSince(rec, m) {
+	if !accepted || (!config && !noDomain) || here != owner || here == holder || !health.OwnerChangedSince(rec, m) {
 		return "", nil
 	}
 	if config {
@@ -676,9 +683,13 @@ func forkedHistory(here, owner, holder string, rec *corrosion.VMRecord, m health
 		}
 		forced = fmt.Sprintf("; taken with --force although %s was modified after it", other)
 	}
-	return fmt.Sprintf("disk %s keeps %s, which %s has run since the VM changed hands after the move began (owner %s at "+
+	ran := fmt.Sprintf("which %s has run", here)
+	if keep != rowPath {
+		ran = fmt.Sprintf("on which the VM may have run elsewhere (the disk row here named %s)", rowPath)
+	}
+	return fmt.Sprintf("disk %s keeps %s, %s since the VM changed hands after the move began (owner %s at "+
 		"generation %d then, %s at %d now); %s, onto which %s pivoted the guest, holds its writes after the pivot and is "+
-		"kept on disk (%s)%s", m.Disk, keep, here, m.Owner, m.OwnerEpoch, rec.HostName, rec.OwnerEpoch, other, holder,
+		"kept on disk (%s)%s", m.Disk, keep, ran, m.Owner, m.OwnerEpoch, rec.HostName, rec.OwnerEpoch, other, holder,
 		facts, forced), nil
 }
 

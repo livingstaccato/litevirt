@@ -1804,39 +1804,50 @@ knew a pivot, a catch-up or an error: that one is raised again.
 owner only after a failover there (replication from the holding host was cut,
 or the condition was resolved over unreadable evidence) leaves two histories:
 the copy holds the writes the holding host made after the pivot, and the
-source, which the owner started the VM on, holds the writes made there since.
-Neither file is complete, and the owner's starts are refused with a text
-naming both exits. Once the holding host is proven powered off, on the owner:
+source, which the VM may have been started on since, holds the writes made
+there. Neither file is complete, and the owner's starts are refused with a
+text naming both exits. Once the holding host is proven powered off, on the
+owner:
 
 - `lv health resolve vm.move_unresolved vm/<vm> --accept <source> --reason
-  "…"` keeps the owner's writes. It is accepted when the owner's persistent
-  config names the file its disk record names, or the owner has no domain of
-  the VM (a start rebuilds it from the disk record), and the VM changed hands
-  after the move began (another owner, or a later ownership generation, than
-  the move recorded); the domain may keep running. It is refused while the
-  copy was modified after the source: the holding host wrote only the copy
-  after the pivot, so nothing was written to the source since. `--force`
-  takes it anyway, with the reason audited. The disk record is not changed,
-  the copy is kept on disk, and a `health.condition.hand_diverged` audit row
-  names it.
+  "…"` keeps the writes made on the source. It is accepted when the owner's
+  persistent config names the source, or the owner has no domain of the VM
+  (a start rebuilds it from the disk record), and the VM changed hands after
+  the move began (another owner, or a later ownership generation, than the
+  move recorded); the domain may keep running when the disk record already
+  names the source. It is refused while the copy was modified after the
+  source: the holding host wrote only the copy after the pivot, so nothing
+  was written to the source since. `--force` takes it anyway, with the reason
+  audited. A disk record naming the copy is pointed at the source (the
+  domain must be shut off); the copy is kept on disk, and a
+  `health.condition.hand_diverged` audit row names it.
 - `--accept <copy>` keeps the holding host's writes and discards every write
-  made on the source since the failover. It needs the domain stopped (`lv
-  stop`) and its persistent config pointed at the copy, as any other
-  `--accept` of the copy on the owner.
+  made on the source since the failover. With the owner's domain defined it
+  needs the domain stopped (`lv stop`) and its persistent config pointed at
+  the copy, as any other `--accept` of the copy on the owner.
 
 The refusal prints both files' sizes and modification times. A source
 modified after the copy was written since the failover; `lv audit ls --target
-<vm> --action vm.start` lists the starts of the VM.
+<vm> --action vm.start` lists the starts of the VM. Each host also keeps a
+record of the ownership generation it last started a VM at, under
+`move-started` in its data directory, and the refusal names a start there
+since the move began.
 
-With no domain of the VM on its owner, a start points the disk record at the
-copy by itself only when the VM came there straight from the holding host:
-the move recorded the holding host as the VM's owner, the VM is one ownership
-generation on, the owner has not started the VM since the move began (each
-host keeps a record of the generation it last started a VM at, under
-`move-started` in its data directory), and the copy was modified after the
-source. Otherwise the start is refused with the text above, and the
-condition stays open. Each such repoint writes a
+With no domain of the VM on its owner, a start never points the disk record
+at the copy by itself: nothing there proves the VM did not run on the source
+since the move began. So a failover that lands between a pivot and the end
+of the move holds the VM even when nothing ran it since: once the holding
+host is proven powered off, `lv health resolve vm.move_unresolved vm/<vm>
+--accept <copy> --reason "…"` on the owner starts it on the copy. The one
+automatic repoint left is on an owner whose domain is shut off with a
+persistent config naming the copy on a shared pool; it writes a
 `health.condition.auto_repoint` audit row.
+
+A disk record that names the copy is no proof either once the VM changed
+hands after the move began: a host that missed the holding host's commit
+reads the source, and may have run the VM there since. The owner's start is
+then refused with both exits, as above; `--accept <copy>` keeps the record as
+it is, and `--accept <source>` points it at the source.
 
 A holding host that rejoins after an admin resolved its move from another
 host drops its record of that move instead of raising the condition again,

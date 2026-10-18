@@ -66,14 +66,13 @@ func seedRemotePivot(t *testing.T, db *corrosion.Client, owner string, vmEpoch i
 	return src, dst
 }
 
-// I6-1: with no domain of the VM here (a start rebuilds it from the disk
-// row), a pivoted move's row is pointed at the copy only when the VM came
-// here straight from the holder: the move recorded the holder as its owner,
-// the VM is one generation on, this host has not started it since the move
-// began, and the copy is the later-modified file. Anything else holds the
-// row on the source with the forked-history refusal, both files intact and
-// the condition open. Each automatic repoint is audited.
-func TestResolveRemoteMove_NoDomainRepointsOnlyAStraightHandoff(t *testing.T) {
+// I7-1 (was I6-1): with no domain of the VM here (a start rebuilds it from
+// the disk row), a pivoted move's row is never pointed at the copy by itself,
+// whatever the generation, the start record or the files' times say: those
+// are printed for the operator, who chooses with --accept. The row stays on
+// the source, both files intact, the condition open, nothing audited as an
+// automatic repoint.
+func TestResolveRemoteMove_NoDomainNeverRepoints(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
 		name       string
@@ -85,16 +84,16 @@ func TestResolveRemoteMove_NoDomainRepointsOnlyAStraightHandoff(t *testing.T) {
 		reader     bool // a domain reader that finds no domain, as on a real start
 		want       string
 	}{
-		{name: "straight from the holder, one generation on", vmEpoch: 6},
-		{name: "straight from the holder, a domain reader finding none", vmEpoch: 6, reader: true},
-		{name: "this host's start before the move began does not count", vmEpoch: 6, startedAt: 4},
-		{name: "two changes of hands", vmEpoch: 7, want: "generation 7"},
-		{name: "no change of generation", vmEpoch: 5, want: "generation 5"},
-		{name: "the record names no owner", owner: "-", vmEpoch: 6, want: "names no owner"},
-		{name: "the move began under another owner", owner: "node-c", vmEpoch: 6, want: "node-c"},
+		{name: "straight from the holder, one generation on, the copy later", vmEpoch: 6, want: "not defined here"},
+		{name: "straight from the holder, a domain reader finding none", vmEpoch: 6, reader: true, want: "not defined here"},
+		{name: "this host's start before the move began", vmEpoch: 6, startedAt: 4, want: "not defined here"},
+		{name: "two changes of hands", vmEpoch: 7, want: "not defined here"},
+		{name: "no change of generation", vmEpoch: 5, want: "not defined here"},
+		{name: "the record names no owner", owner: "-", vmEpoch: 6, want: "not defined here"},
+		{name: "the move began under another owner", owner: "node-c", vmEpoch: 6, want: "not defined here"},
 		{name: "this host started the VM since the move began", vmEpoch: 6, startedAt: 6, want: "started the VM"},
-		{name: "the source modified after the copy", vmEpoch: 6, srcLater: true, want: "not proven"},
-		{name: "the same modification times", vmEpoch: 6, equalTimes: true, want: "not proven"},
+		{name: "the source modified after the copy", vmEpoch: 6, srcLater: true, want: "not defined here"},
+		{name: "the same modification times", vmEpoch: 6, equalTimes: true, want: "not defined here"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := testReconcilerDB(t)
@@ -137,18 +136,6 @@ func TestResolveRemoteMove_NoDomainRepointsOnlyAStraightHandoff(t *testing.T) {
 			audits, qerr := db.Query(ctx, `SELECT detail FROM audit_log WHERE action = 'health.condition.auto_repoint'`)
 			if qerr != nil {
 				t.Fatal(qerr)
-			}
-			if tc.want == "" {
-				if err != nil {
-					t.Fatalf("heal: %v", err)
-				}
-				if got := movedRowPath(t, db); got != dst {
-					t.Fatalf("row names %s, want the copy %s", got, dst)
-				}
-				if len(audits) != 1 || !strings.Contains(audits[0].String("detail"), dst) {
-					t.Fatalf("auto-repoint audit = %+v, want one row naming %s", audits, dst)
-				}
-				return
 			}
 			if !IsMoveUnresolved(err) || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("want a refusal saying %q, got %v", tc.want, err)

@@ -1502,11 +1502,13 @@ destination, or when the guest was pivoted but the config names the source. A re
 reported as "nothing to do" while the record remains. Another host (a failover onto
 shared storage) honours the condition by what it can prove: when the guest was
 pivoted, a start there points the disk record at the destination on a shared pool both
-hosts define alike, unless the VM's domain there is running or its persistent config
-names the source, or, with no domain there, the VM did not come there straight from the
-holding host (docs/diagnostics.md): the VM may then have run there on the source since a failover, so each
-file may hold writes the other lacks, and the refusal names both `--accept` exits
-(docs/diagnostics.md, "A forked history"); when no pivot was recorded, it is refused whichever file the disk
+hosts define alike only when the VM's domain there is shut off and its persistent config
+names the destination. It is refused when the domain is running, when its config names
+the source, and when there is no domain there (a start would rebuild it from the disk
+record): the VM may then have run on the source since a failover, so each file may hold
+writes the other lacks, and the refusal names both `--accept` exits (docs/diagnostics.md,
+"A forked history"). A disk record naming the destination is refused too once the VM
+changed hands since the move began; when no pivot was recorded, it is refused whichever file the disk
 record names, since the record commit and the pivot may have happened before the holding
 host stopped. A refused VM whose holding host is gone is released with `lv health resolve
 vm.move_unresolved vm/<vm> --reason "…" --accept <path>`, naming the file to keep of each

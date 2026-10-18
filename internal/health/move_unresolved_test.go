@@ -226,8 +226,10 @@ func TestResolveUnresolvedMoves_AnotherHostsRecord(t *testing.T) {
 			rowHost: "node-b", hereDriver: "nfs", originDrv: "nfs", wantErr: true},
 		{name: "no pivot recorded, row on the copy, row elsewhere: refused", rowOnDst: true, rowHost: "node-c", wantErr: true, wantRowOnDst: true},
 		{name: "no pivot recorded, row on the source, the move recorded an error: refused", moveErr: "redefine failed", rowHost: "node-b", wantErr: true},
-		{name: "pivoted, row on the source, failed over here, copy on a shared pool both define: row to the copy, resolved",
-			pivoted: true, rowHost: "node-b", hereDriver: "nfs", originDrv: "nfs", wantRowOnDst: true, resolved: true},
+		// I7-1: with no domain here the row is never pointed at the copy by
+		// itself; the operator chooses with --accept.
+		{name: "pivoted, row on the source, failed over here, copy on a shared pool both define, no domain: refused",
+			pivoted: true, rowHost: "node-b", hereDriver: "nfs", originDrv: "nfs", wantErr: true},
 		{name: "pivoted, row on the source, copy on a local pool here: refused",
 			pivoted: true, rowHost: "node-b", hereDriver: "local", originDrv: "nfs", wantErr: true},
 		{name: "pivoted, row on the source, the holder's pool of that name is local: refused",
@@ -240,10 +242,12 @@ func TestResolveUnresolvedMoves_AnotherHostsRecord(t *testing.T) {
 			pivoted: true, rowHost: "node-b", hereDriver: "nfs", originDrv: "nfs", originMountedElsewhere: true, wantErr: true},
 		{name: "pivoted, row on the source, the pool directory here has nothing mounted on it: refused",
 			pivoted: true, rowHost: "node-b", hereDriver: "nfs", originDrv: "nfs", unmounted: true, wantErr: true},
-		{name: "catch-up, row on the source, failed over here, copy on a shared pool: row to the copy",
-			catchUp: true, rowHost: "node-b", hereDriver: "nfs", originDrv: "nfs", wantRowOnDst: true, resolved: true},
-		{name: "pivoted, row on the copy, owner here: passes and resolved", pivoted: true, rowOnDst: true, rowHost: "node-b", wantRowOnDst: true, resolved: true},
-		{name: "pivoted, row on the copy, owner elsewhere: passes, left open", pivoted: true, rowOnDst: true, rowHost: "node-c", wantRowOnDst: true},
+		{name: "catch-up, row on the source, failed over here, copy on a shared pool, no domain: refused",
+			catchUp: true, rowHost: "node-b", hereDriver: "nfs", originDrv: "nfs", wantErr: true},
+		// I7-2: the VM changed hands since the move began, so the row on the
+		// copy is no proof (a replica that missed the commit names the source).
+		{name: "pivoted, row on the copy, owner here: refused", pivoted: true, rowOnDst: true, rowHost: "node-b", wantErr: true, wantRowOnDst: true},
+		{name: "pivoted, row on the copy, owner elsewhere: refused", pivoted: true, rowOnDst: true, rowHost: "node-c", wantErr: true, wantRowOnDst: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := testReconcilerDB(t)
@@ -267,7 +271,7 @@ func TestResolveUnresolvedMoves_AnotherHostsRecord(t *testing.T) {
 				ms[0].DstType = tc.originDrv
 			}
 			// The VM came here straight from node-a: one generation on, and
-			// the copy written after the source (I6-1).
+			// the copy written after the source.
 			ms[0].Owner, ms[0].OwnerEpoch = "node-a", 5
 			if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 6 WHERE name = 'mv'`); err != nil {
 				t.Fatal(err)

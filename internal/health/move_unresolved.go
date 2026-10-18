@@ -893,12 +893,17 @@ func resolveUnresolvedMove(ctx context.Context, db *corrosion.Client, dataDir, h
 // resolveRemoteMove honours a move this host holds no record of (origin's,
 // seen through the condition). Only a direction that is proven is taken: a
 // pivoted (or catch-up) move's copy holds every write, so a row on the source
-// is pointed at the copy when this host owns the VM and the copy is on a
-// shared pool both hosts define alike, and refused otherwise. A live move with
-// no pivot recorded may still have committed and pivoted on origin (the
-// record and the row both lag the pivot), so it is refused whatever the row
-// names. An offline move's two files hold the same data. The row is never
-// pointed at the copy under this host's domain of the VM (barsRepoint).
+// is pointed at the copy when this host owns the VM, its domain is defined
+// here, shut off, with a persistent config naming the copy, and the copy is
+// on a shared pool both hosts define alike; it is refused otherwise. With no
+// domain here nothing shows whether the VM ran on the source since the move,
+// so the operator chooses. A row on the copy is no proof once the VM changed
+// hands since the move began: replicas can disagree on it, and a host that
+// read the source may have run the VM there. A live move with no pivot
+// recorded may still have committed and pivoted on origin (the record and
+// the row both lag the pivot), so it is refused whatever the row names. An
+// offline move's two files hold the same data. The row is never pointed at
+// the copy under this host's domain of the VM (barsRepoint).
 func resolveRemoteMove(ctx context.Context, db *corrosion.Client, dataDir, host, origin string, m UnresolvedMove, dom MoveDomain) error {
 	vmRec, err := corrosion.GetVM(ctx, db, m.VM)
 	if err != nil {
@@ -926,45 +931,73 @@ func resolveRemoteMove(ctx context.Context, db *corrosion.Client, dataDir, host,
 	switch {
 	case m.Pivoted || m.CatchUp:
 		if row.Path == m.Dst {
+			if OwnerChangedSince(vmRec, m) {
+				return refuse(m, false, "%s: a volume move of its disk %s on %s did not finish: the guest was pivoted onto %s "+
+					"there, and the disk row here names it, but the VM changed hands since the move began (owner %s at "+
+					"generation %d then, %s at %d now), so the row is no proof of which file the guest wrote last: a host "+
+					"that did not receive %s's commit reads %s, and may have run the VM on it since. Operator: once %s is "+
+					"%s, keep %s's writes after the pivot with `%s` here, or keep the writes made on %s since the "+
+					"failover with `%s`, which points the disk row at %s and keeps %s on disk; %s. "+
+					"docs/diagnostics.md describes both",
+					m.VM, m.Disk, origin, m.Dst, m.Owner, m.OwnerEpoch, vmRec.HostName, vmRec.OwnerEpoch, origin, m.Src,
+					origin, provedOffText(origin), origin, resolveAcceptCmd(m.VM, m.Dst), m.Src, resolveAcceptCmd(m.VM, m.Src),
+					m.Src, m.Dst, forkJudgeText(m.VM, m.Src, m.Dst))
+			}
 			return nil
 		}
 		shared := SharedPoolHolds(ctx, db, dataDir, host, origin, m.DstPool, m.DstType, m.Dst)
 		// fork refuses the repoint, why: the VM may have run here on the
 		// source since it failed over, so each file may hold writes the
 		// other lacks, and neither is called stale.
-		fork := func(why string, noteShared bool) error {
-			where := ""
-			if noteShared && !shared {
-				where = fmt.Sprintf(" (%s is not on a shared pool %s mounts: keeping it is settled on %s)", m.Dst, host, origin)
-			}
+		fork := func(why string) error {
 			return refuse(m, false, "%s: a volume move of its disk %s on %s did not finish: the guest was pivoted onto %s "+
 				"there, and the disk row names %s; the row is not pointed at %s because %s. If the VM has run here on %s "+
 				"since it failed over, the two files hold different writes: %s those %s made after the pivot, %s those "+
 				"made here since. Operator: once %s is %s, keep this host's writes with `%s` here (%s is kept on disk), "+
-				"or keep %s's with `%s`%s, which discards every write made on %s since the failover; %s. "+
+				"or keep %s's with `%s`, which discards every write made on %s since the failover; %s. "+
 				"docs/diagnostics.md describes both",
 				m.VM, m.Disk, origin, m.Dst, row.Path, m.Dst, why, row.Path, m.Dst, origin, row.Path,
 				origin, provedOffText(origin), resolveAcceptCmd(m.VM, row.Path), m.Dst,
-				origin, resolveAcceptCmd(m.VM, m.Dst), where, row.Path, forkJudgeText(m.VM, row.Path, m.Dst))
+				origin, resolveAcceptCmd(m.VM, m.Dst), row.Path, forkJudgeText(m.VM, row.Path, m.Dst))
+		}
+		// notHere is why the row cannot be pointed at the copy from this
+		// host at all: the VM or its row names another host, or the copy is
+		// not on a shared pool this host reads as origin does.
+		notHere := func() string {
+			var out []string
+			if vmRec.HostName != host {
+				out = append(out, fmt.Sprintf("the VM is on host %s, not %s", vmRec.HostName, host))
+			}
+			if row.HostName != host {
+				out = append(out, fmt.Sprintf("the disk row names host %s, not %s", row.HostName, host))
+			}
+			if !shared {
+				out = append(out, fmt.Sprintf("%s is not on a shared pool %s mounts", m.Dst, host))
+			}
+			return strings.Join(out, ", and ")
 		}
 		if row.HostName == host && vmRec.HostName == host {
 			if why := barsRepoint(host, dom, m, m.Dst); why != "" {
-				return fork(why, true)
+				if nh := notHere(); nh != "" {
+					why += " (and " + nh + ")"
+				}
+				return fork(why)
 			}
 			if shared {
-				if why := unprovenHandoff(dataDir, origin, vmRec, m, dom, row.Path); why != "" {
-					return fork(why, false)
+				if why := noDomainHere(dataDir, m, dom, row.Path); why != "" {
+					return fork(why)
 				}
 				return pointRow(ctx, db, m, row, host, m.Dst, m.DstType, m.DstPool,
-					fmt.Sprintf("%s pivoted the guest onto it, and the VM came here from %s with no start elsewhere", origin, origin))
+					fmt.Sprintf("%s pivoted the guest onto it; the domain here is shut off and its persistent config, which a "+
+						"start boots, names it; it is on a shared pool %s and %s define alike", origin, host, origin))
 			}
 		}
 		if vmRec.HostName == host && OwnerChangedSince(vmRec, m) {
-			return fork(fmt.Sprintf("%s is not on a shared pool %s mounts", m.Dst, host), false)
+			return fork(notHere())
 		}
 		return refuse(m, false, "%s: a volume move of its disk %s on %s did not finish: the guest was moved onto %s, but the "+
-			"disk row names %s, which lacks the writes made since, and %s is not on a shared pool %s mounts. %s",
-			m.VM, m.Disk, origin, m.Dst, row.Path, m.Dst, host, exit(m.Dst))
+			"disk row names %s, which lacks the writes made since, and %s. %s",
+			m.VM, m.Disk, origin, m.Dst, row.Path, notHere(), exit(m.Dst))
 	case m.Live:
 		// Whatever the row names: the commit is a local write that replicates
 		// later and the pivot follows it, so a row on the source proves no
@@ -978,43 +1011,25 @@ func resolveRemoteMove(ctx context.Context, db *corrosion.Client, dataDir, host,
 	}
 }
 
-// unprovenHandoff says why the disk row of origin's pivoted move m may not be
-// pointed at the copy by itself here, with no domain of the VM here to read
-// ("" when it may): a start rebuilds the domain from the row, so nothing here
-// shows whether the VM ran on the source since the move. It may only when the
-// VM came here straight from origin: the move began with origin owning the VM
-// at generation G, the VM is now at G+1, this host has not started it since
-// the move began, and the copy (rowPath being the source) was modified later.
-// A domain defined here whose config names the copy (barsRepoint passed) is
-// taken as it is.
-func unprovenHandoff(dataDir, origin string, vmRec *corrosion.VMRecord, m UnresolvedMove, dom MoveDomain, rowPath string) string {
+// noDomainHere says why the disk row of origin's pivoted move m may not be
+// pointed at the copy here by itself when no domain of the VM is defined here
+// to read ("" when one is: barsRepoint judged its config). A start rebuilds
+// the domain from the row, and nothing here proves whether the VM ran on the
+// row's file since the move began: no generation, start record or file time
+// is taken for that proof, as replicas and clocks can mislead each. This
+// host's record of its own start since the move is named for the operator.
+func noDomainHere(dataDir string, m UnresolvedMove, dom MoveDomain, rowPath string) string {
 	if (dom.State != nil || dom.Active != nil) && !dom.missing() {
 		return ""
 	}
-	switch {
-	case m.Owner == "":
-		return fmt.Sprintf("its domain is not defined here and the move's record names no owner, so nothing shows the "+
-			"VM came here straight from %s", origin)
-	case m.Owner != origin:
-		return fmt.Sprintf("its domain is not defined here and the move began with %s owning the VM, not %s, which "+
-			"holds the move", m.Owner, origin)
-	case vmRec.OwnerEpoch != m.OwnerEpoch+1:
-		return fmt.Sprintf("its domain is not defined here and the VM is at ownership generation %d: only generation %d, "+
-			"one change of hands after the move began at %d, shows it came here straight from %s",
-			vmRec.OwnerEpoch, m.OwnerEpoch+1, m.OwnerEpoch, origin)
-	}
+	why := fmt.Sprintf("its domain is not defined here, so a start would rebuild it from the disk row, and nothing here "+
+		"proves whether the VM ran on %s since the move began", rowPath)
 	if g, ok, err := startedHereAt(dataDir, m.VM); err != nil {
-		return fmt.Sprintf("its domain is not defined here and this host's record of its own starts of the VM cannot be "+
-			"read (%v)", err)
+		why += fmt.Sprintf("; this host's record of its own starts of the VM cannot be read (%v)", err)
 	} else if ok && g >= m.OwnerEpoch {
-		return fmt.Sprintf("this host started the VM at ownership generation %d, after the move began at %d, on the "+
-			"file its disk row names, and its domain is not defined here now", g, m.OwnerEpoch)
+		why += fmt.Sprintf("; this host started the VM at ownership generation %d, after the move began at %d", g, m.OwnerEpoch)
 	}
-	if !ModifiedLater(m.Dst, rowPath) {
-		return fmt.Sprintf("its domain is not defined here and %s is not proven to have been modified after %s",
-			m.Dst, rowPath)
-	}
-	return ""
+	return why
 }
 
 // forkJudgeText gives what an operator judges a forked history by: both

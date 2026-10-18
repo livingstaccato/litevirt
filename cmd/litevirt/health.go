@@ -115,11 +115,12 @@ and its persistent config and disk record name the source. On the VM's owner,
 with its domain defined, its persistent config must name the file each disk
 record is left on, and no disk record is changed while it is active. After a
 pivot only the copy is accepted, except on the VM's owner when the VM changed
-hands after the move began and its config names the file the disk record
-names, or it has no domain of the VM: --accept of that file keeps the owner's
-writes since, and the copy is kept on disk (docs/diagnostics.md, "A forked
-history"). That is refused while the copy was modified after the source,
-unless --force is given; the refusal prints both files' sizes and times.
+hands after the move began and its config names the source, or it has no
+domain of the VM: --accept of the source keeps the writes made on it since
+(a disk record naming the copy is pointed at it), and the copy is kept on
+disk (docs/diagnostics.md, "A forked history"). That is refused while the
+copy was modified after the source, unless --force is given; the refusal
+prints both files' sizes and times.
 
 Requires the cluster.health.resolve verb (Admin). The resolution is written
 to the audit log with your principal and --reason, and published as an

@@ -15,8 +15,8 @@ import (
 
 // I4-2: the owner's heal of another host's pivoted move never points the disk
 // row at the copy under the owner's domain: not while it runs, and not while
-// its persistent config names the source. A config naming the copy, or no
-// domain (a start rebuilds it from the row), is healed.
+// its persistent config names the source. A config naming the copy is healed;
+// no domain (a start rebuilds it from the row) holds (I7-1).
 func TestResolveRemoteMove_NeverRepointsUnderTheOwnersDomain(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
@@ -31,10 +31,10 @@ func TestResolveRemoteMove_NeverRepointsUnderTheOwnersDomain(t *testing.T) {
 		{name: "running on the copy", define: "dst", running: true, wantErr: "running"},
 		{name: "shut off, the config names the source", define: "src", wantErr: "which a start boots"},
 		{name: "shut off, the config names the copy", define: "dst", wantRowOnDst: true},
-		// I6-1: with no domain, only a VM one generation on from the
-		// holder's is healed; a second change of hands holds.
-		{name: "no domain, one change of hands", wantRowOnDst: true},
-		{name: "no domain, two changes of hands", epoch: 7, wantErr: "generation 7"},
+		// I7-1: with no domain nothing here shows whether the VM ran on the
+		// source since the move, so it holds whatever the generation.
+		{name: "no domain, one change of hands", wantErr: "not defined here"},
+		{name: "no domain, two changes of hands", epoch: 7, wantErr: "not defined here"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := testReconcilerDB(t)

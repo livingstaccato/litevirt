@@ -679,6 +679,9 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 	if merr := s.resolveUnresolvedMoves(ctx, m.ReplacedVM); merr != nil {
 		return failed("start", merr)
 	}
+	if nerr := health.NoteStartingHere(ctx, s.db, s.dataDir, m.ReplacedVM); nerr != nil {
+		slog.Warn("recording this host's start of the VM failed", "vm", m.ReplacedVM, "error", nerr)
+	}
 	releaseGuard, gerr := s.guardSharedDiskStart(ctx, m.ReplacedVM, "")
 	if gerr != nil {
 		return failed("start", gerr)

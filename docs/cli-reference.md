@@ -1510,9 +1510,10 @@ lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH
                                              #   kept, and a running domain's record is not changed.
                                              #   After a pivot only the copy is accepted, unless the VM
                                              #   changed hands since the move began and the owner's
-                                             #   config names the record's file, or it has no domain
-                                             #   (a forked history); refused while the copy was
-                                             #   modified later, unless --force.
+                                             #   config names the source, or it has no domain (a
+                                             #   forked history; a record on the copy is pointed at
+                                             #   the source); refused while the copy was modified
+                                             #   later, unless --force.
                                              #   `lv health` lists the moves first (docs/diagnostics.md).
 lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>] [--until <time>]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics

@@ -687,6 +687,18 @@ lv replication schedule rm web-1 --target-pool dr
 
 (RPCs `Create/List/DeleteReplicationSchedule`.)
 
+When a schedule is removed (`lv replication schedule rm`), or its VM deleted
+(`lv rm`), its replicas go too: each host removes, hourly, the recorded
+replicas in its own pools whose schedule or VM was removed more than a day
+ago. A schedule added again, or a VM re-created, within that day keeps them.
+A replica a VM disk references, one a set-aside disk copy backs on, and a file
+with no record are never removed. The removal also retires the incremental
+chain's anchor (the `replication_checkpoints` row) that no remaining schedule
+uses, and `lv rm` retires all of the VM's; the failover lease holder retires,
+hourly, any other row no schedule uses that has not advanced for a day. Only
+records in the replica area are removed this way, not top-level
+`<vm>-<disk>-<time>.<ext>` files.
+
 Target model: an explicit **target host**, a **shared pool** (nfs/ceph/iscsi),
 or — when neither is set — an auto-selected **healthy peer** that has the pool.
 **Cross-host replication to a peer's non-shared local pool is supported**: the

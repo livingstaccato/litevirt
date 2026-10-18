@@ -3176,6 +3176,7 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		s.clearDeletedFirewallTags(ctx, corrosion.TagMemberVM, "", req.Name, fwID)
 		if dropSchedules {
 			s.deleteVMSchedules(context.WithoutCancel(ctx), req.Name)
+			s.retireVMCheckpoints(context.WithoutCancel(ctx), req.Name)
 		}
 	}
 	if err == nil && len(luns) > 0 && !s.lunPlainDeleteRecordable(ctx) &&

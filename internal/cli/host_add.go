@@ -24,6 +24,7 @@ import (
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/secretfile"
 	"github.com/litevirt/litevirt/internal/ssh"
+	"gopkg.in/yaml.v3"
 )
 
 // HostAdd adds a new host to an existing cluster.
@@ -135,6 +136,9 @@ type hostAddPlan struct {
 	setupScript   string
 	// rerun is the command that finishes an add that failed after admission.
 	rerun string
+	// configInstalled says the add installs the host's merged config.yaml,
+	// which setup then leaves alone.
+	configInstalled bool
 }
 
 // addRemote is what `lv host add` does on the new machine. sshAddRemote runs
@@ -230,6 +234,22 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 		return err
 	}
 	files = append(files, rest...)
+	// A machine that already has a config (a re-added one) keeps it: the
+	// keys the add must set are merged in, and setup leaves the file alone.
+	if cur, ok, err := r.ReadFile(remoteConfig); err != nil {
+		removeAll(local)
+		return fmt.Errorf("read the host's %s: %w", remoteConfig, err)
+	} else if ok {
+		merged, err := mergeAddConfig(cur, p)
+		if err != nil {
+			removeAll(local)
+			return fmt.Errorf("refusing to add %s: its %s could not be merged (%v), and the add would drop "+
+				"the settings in it. Fix the file, or move it aside to have the add write a new one",
+				p.hostName, remoteConfig, err)
+		}
+		files = append(files, addFile{remoteConfig, merged, 0o644})
+		p.configInstalled = true
+	}
 	bin, err := os.ReadFile(p.binPath)
 	if err != nil {
 		removeAll(local)
@@ -476,7 +496,7 @@ func finishAdd(r addRemote, p hostAddPlan, serial string, admitted *pb.AdmitHost
 	// local database still contains its tombstone; starting it first lets its boot
 	// state update put a fresh timestamp on that tombstone and race the admission
 	// back out to the cluster.
-	if err := r.RunWithInput(remoteAddSetupCommand(p.hostName, p.hostAddr, p.peersYAML, p.enforcement), []byte(p.setupScript)); err != nil {
+	if err := r.RunWithInput(remoteAddSetupCommand(p.hostName, p.hostAddr, p.peersYAML, p.enforcement, p.configInstalled), []byte(p.setupScript)); err != nil {
 		return fmt.Errorf("run setup script after admitting the host identity: %w", err)
 	}
 	return nil
@@ -724,4 +744,54 @@ func HostAddOn(ctx context.Context, c pb.LiteVirtClient, t *LocalAddTarget, host
 		pkiDir: PKIDir(), hostName: hostName, hostAddr: hostAddr, peersYAML: "[]",
 		binPath: t.Binary, rerun: "lv host add --name " + hostName + " root@" + hostAddr,
 	})
+}
+
+const remoteConfig = "/etc/litevirt/config.yaml"
+
+// mergeAddConfig is the machine's existing config.yaml with the keys an add
+// must set replaced: host_name, advertise_address, join_peers and, when the
+// cluster has one, the enforcement block (its flags must match the peers').
+// Every other key, operator settings among them, and the comments are kept.
+func mergeAddConfig(existing []byte, p hostAddPlan) ([]byte, error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(existing, &doc); err != nil {
+		return nil, err
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("not a YAML mapping")
+	}
+	root := doc.Content[0]
+	set := func(key string, v *yaml.Node) {
+		for i := 0; i+1 < len(root.Content); i += 2 {
+			if root.Content[i].Value == key {
+				root.Content[i+1] = v
+				return
+			}
+		}
+		root.Content = append(root.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: key}, v)
+	}
+	quoted := func(s string) *yaml.Node {
+		return &yaml.Node{Kind: yaml.ScalarNode, Value: s, Style: yaml.DoubleQuotedStyle}
+	}
+	set("host_name", quoted(p.hostName))
+	set("advertise_address", quoted(p.hostAddr))
+	var peers yaml.Node
+	if err := yaml.Unmarshal([]byte(p.peersYAML), &peers); err != nil || len(peers.Content) != 1 {
+		return nil, fmt.Errorf("join_peers %q: %v", p.peersYAML, err)
+	}
+	set("join_peers", peers.Content[0])
+	if strings.TrimSpace(p.enforcement) != "" {
+		var enf yaml.Node
+		if err := yaml.Unmarshal([]byte(p.enforcement), &enf); err != nil {
+			return nil, fmt.Errorf("the cluster's enforcement block: %w", err)
+		}
+		if len(enf.Content) == 1 && enf.Content[0].Kind == yaml.MappingNode {
+			for i := 0; i+1 < len(enf.Content[0].Content); i += 2 {
+				if enf.Content[0].Content[i].Value == "enforcement" {
+					set("enforcement", enf.Content[0].Content[i+1])
+				}
+			}
+		}
+	}
+	return yaml.Marshal(&doc)
 }

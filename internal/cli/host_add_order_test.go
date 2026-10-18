@@ -463,3 +463,107 @@ func TestAddInstallCommands_KeepAndRestore(t *testing.T) {
 		t.Errorf("the copy survived the restore (stat: %v)", err)
 	}
 }
+
+const operatorConfig = `# operator notes
+host_name: "node-2"
+grpc_port: 7443
+pki_dir: /etc/litevirt/pki
+data_dir: /var/lib/litevirt
+advertise_address: "10.0.0.2"
+join_peers: ["10.0.0.5:7946"]
+migration:
+  network: 10.78.1.0/24
+enforcement:
+  audit_signature: false
+`
+
+func writeTargetConfig(t *testing.T, f *addFixture) string {
+	t.Helper()
+	p := filepath.Join(f.target.Root, "etc", "litevirt", "config.yaml")
+	if err := os.WriteFile(p, []byte(operatorConfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// Lab recheck3 anomaly 4: `lv host add` wrote a re-added machine's
+// config.yaml afresh, and the operator's `migration.network` was lost. The
+// add now merges into the existing file only the keys it must set (name,
+// address, peers, the cluster's enforcement block), keeps every other key,
+// installs it like the identity files (a 0600 copy kept while it installs,
+// put back on a failure, removed on success), and setup leaves it alone.
+//
+// Mutations: drop the merge (setup writes the template) — the config is not
+// installed and keeps node-2; drop the setup guard — the script still
+// writes its template; drop the restore of config.yaml — "failed" keeps the
+// merged file.
+func TestHostAdd_KeepsTheMachinesConfig(t *testing.T) {
+	t.Run("merged", func(t *testing.T) {
+		f := newAddFixture(t)
+		cfg := writeTargetConfig(t, f)
+		if err := f.add(t); err != nil {
+			t.Fatal(err)
+		}
+		got := string(mustRead(t, cfg))
+		for _, want := range []string{"network: 10.78.1.0/24", "node-9", "10.0.0.9", "# operator notes", "data_dir: /var/lib/litevirt"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("the config lost or lacks %q:\n%s", want, got)
+			}
+		}
+		for _, gone := range []string{"node-2", "10.0.0.5", "10.0.0.2"} {
+			if strings.Contains(got, gone) {
+				t.Errorf("the config still names %q:\n%s", gone, got)
+			}
+		}
+		setup := ""
+		for _, e := range f.target.Events {
+			if strings.HasSuffix(e, "bash -s") {
+				setup = e
+			}
+		}
+		if !strings.Contains(setup, "CONFIG_INSTALLED='1'") {
+			t.Errorf("setup is not told the config is installed: %q", setup)
+		}
+		if m, _ := filepath.Glob(filepath.Join(filepath.Dir(cfg), "*.pre-add-*")); len(m) != 0 {
+			t.Errorf("copies left after a successful add: %v", m)
+		}
+	})
+	t.Run("failed", func(t *testing.T) {
+		f := newAddFixture(t)
+		cfg := writeTargetConfig(t, f)
+		f.target.FailSetup = errors.New("setup failed")
+		if err := f.add(t); err == nil {
+			t.Fatal("the add succeeded")
+		}
+		if got := string(mustRead(t, cfg)); got != operatorConfig {
+			t.Errorf("the config was not put back:\n%s", got)
+		}
+	})
+	t.Run("unreadable", func(t *testing.T) {
+		f := newAddFixture(t)
+		p := filepath.Join(f.target.Root, "etc", "litevirt", "config.yaml")
+		if err := os.WriteFile(p, []byte("migration: [unclosed\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.add(t); err == nil || !strings.Contains(err.Error(), "config.yaml") {
+			t.Fatalf("add over an unparsable config = %v, want a refusal naming it", err)
+		}
+		if len(f.client.admitted) != 0 || len(f.target.Events) != 0 {
+			t.Errorf("an add that cannot keep the config went ahead: admitted %v, events %v", f.client.admitted, f.target.Events)
+		}
+	})
+}
+
+// The setup script writes its template config only when the add did not
+// install one.
+func TestSetupScript_LeavesAnInstalledConfigAlone(t *testing.T) {
+	script, err := getSetupScript()
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard := strings.Index(script, `"${CONFIG_INSTALLED:-}" = 1`)
+	write := strings.Index(script, "cat > /etc/litevirt/config.yaml")
+	if guard < 0 || write < 0 || guard > write {
+		t.Errorf("the template write is not guarded by CONFIG_INSTALLED")
+	}
+}

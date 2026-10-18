@@ -817,9 +817,15 @@ func remoteInitSetupCommand(hostName, hostAddr, targetCfg string) string {
 // column, and sshd runs this line through the login shell, so every value MUST
 // go through shellEnvPrefix. It is a function of its own so a test can run the
 // exact line HostAdd sends through a real shell.
-func remoteAddSetupCommand(hostName, hostAddr, peersYAML, enforcement string) string {
-	return fmt.Sprintf("%s bash -s",
-		shellEnvPrefix(setupScriptEnvWith(hostName, hostAddr, peersYAML, enforcement)))
+//
+// configInstalled says the add has installed the host's own config.yaml with
+// its keys merged in, so setup must not write its template over it.
+func remoteAddSetupCommand(hostName, hostAddr, peersYAML, enforcement string, configInstalled bool) string {
+	env := setupScriptEnvWith(hostName, hostAddr, peersYAML, enforcement)
+	if configInstalled {
+		env = append(env, "CONFIG_INSTALLED=1")
+	}
+	return fmt.Sprintf("%s bash -s", shellEnvPrefix(env))
 }
 
 // readPeerConfig reads an existing cluster node's daemon config over SSH. It
@@ -1143,6 +1149,10 @@ fi
 # Write litevirtd config
 CONFIG=/etc/litevirt/config.yaml
 ` + uiTLSScript + `
+if [ "${CONFIG_INSTALLED:-}" = 1 ] && [ -f /etc/litevirt/config.yaml ]; then
+    # lv host add installed this host's own config with its keys merged in.
+    echo "kept the host's config.yaml"
+else
 cat > /etc/litevirt/config.yaml << CONF
 host_name: "${HOST_NAME}"
 ui_tls: ${UI_TLS}
@@ -1168,6 +1178,7 @@ CONF
 if [ -n "${ENFORCEMENT_B64:-}" ]; then
     echo "${ENFORCEMENT_B64}" | base64 -d >> /etc/litevirt/config.yaml
     echo "enforcement config propagated from the adding node"
+fi
 fi
 
 # pci.udev_hook is deprecated: real-time PCI events are covered by

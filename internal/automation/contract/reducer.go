@@ -17,6 +17,9 @@ type Request struct {
 	Receipt  Receipt
 }
 type Projection struct {
+	Binding   *BindingProjection
+	Ownership *OwnershipProjection
+	Identity  *IdentityProjection
 	Head      Prefix
 	Existing  *Request
 	Operation *Receipt
@@ -26,11 +29,18 @@ type Projection struct {
 	ReplayOriginal bool
 }
 type Reduction struct {
-	ClusterUID  string
-	Scope       string
-	Identity    []byte
-	Receipt     Receipt
-	SaveRequest bool
+	ResourcePrevious *ResourceRecord
+	ResourceEffect   *ResourceRecord
+	NameEffect       *NameRecord
+	BindingEffects   []BindingRecord
+	AdmissionEffect  *AdmissionRecord
+	OwnerEffect      *OwnerRecord
+	IdentityEffect   *IdentityRecord
+	ClusterUID       string
+	Scope            string
+	Identity         []byte
+	Receipt          Receipt
+	SaveRequest      bool
 }
 
 func Scope(d Decision) string {
@@ -86,11 +96,27 @@ func Reduce(p Projection, d Decision) (Reduction, error) {
 		out.Receipt.State = "rejected"
 	} else {
 		switch d.Command.Kind {
+		case "adopt_resource", "transfer_owner":
+			if err := reduceOwnership(&out, p, d, a); err != nil {
+				return out, err
+			}
+		case "admit_create":
+			if err := reduceCreateBinding(&out, p, d, a); err != nil {
+				return out, err
+			}
 		case "initialize_cluster":
 			if p.Head.Sequence != 0 || d.Command.ClusterUID != "" {
 				return out, codedError(CodeValidation)
 			}
 			out.ClusterUID = a.ClusterUID
+		case "ensure_owner", "acquire_session", "handoff_session":
+			if err := reduceOwner(&out, p, d, a); err != nil {
+				return out, err
+			}
+		case "assign_identity":
+			if err := reduceIdentity(&out, p, d, a); err != nil {
+				return out, err
+			}
 		case "read_barrier":
 			if p.Head.Sequence == 0 || d.Command.ClusterUID != p.Head.ClusterUID || a.ClusterUID != p.Head.ClusterUID {
 				return out, codedError(CodeValidation)

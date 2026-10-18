@@ -44,7 +44,10 @@ func (c *Client) AutomationHead(ctx context.Context) (h AutomationPrefix, e erro
 	return
 }
 
-func automationAuthorityTx(ctx context.Context, tx *LocalTx, self string, gen int64) (*VoterConfig, error) {
+// Established membership/custody and fresh projection authority are separate.
+// The admission owner may use this helper for historical recertification only
+// after retained certified H and the exact anchored digest are checked.
+func automationEstablishedAuthorityTx(ctx context.Context, tx *LocalTx, self string, gen int64) (*VoterConfig, error) {
 	st, e := readStandingTx(ctx, tx, self)
 	if e != nil {
 		return nil, e
@@ -66,6 +69,16 @@ func automationAuthorityTx(ctx context.Context, tx *LocalTx, self string, gen in
 		return nil, errAutomationAuthority
 	}
 	return st.cfg, nil
+}
+func automationAuthorityTx(ctx context.Context, tx *LocalTx, self string, gen int64) (*VoterConfig, error) {
+	cfg, err := automationEstablishedAuthorityTx(ctx, tx, self, gen)
+	if err != nil {
+		return nil, err
+	}
+	if err := automationProjectionAuthorityTx(ctx, tx); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 func (c *Client) AutomationMembership(ctx context.Context) (cfg *VoterConfig, e error) {
 	e = c.ExecuteLocal(ctx, func(tx *LocalTx) error {
@@ -212,6 +225,16 @@ func automationApplyTx(ctx context.Context, tx *LocalTx, r AutomationRecord, d c
 	if err != nil {
 		return out, err
 	}
+	trusted := head
+	if source.kind == automationAnchoredReplay {
+		head, err = automationSemanticHeadTx(ctx, tx, "")
+		if err != nil {
+			return out, err
+		}
+		if head.Sequence > trusted.Sequence {
+			return out, fmt.Errorf("replay cursor exceeds retained certified prefix")
+		}
+	}
 	if d.Sequence <= head.Sequence {
 		rows, err := tx.Query(ctx, `SELECT digest,receipt_json FROM local_automation_history WHERE sequence=? LIMIT 1`, d.Sequence)
 		if err != nil {
@@ -226,6 +249,11 @@ func automationApplyTx(ctx context.Context, tx *LocalTx, r AutomationRecord, d c
 	if err := validateAutomationPredecessor(head, d); err != nil {
 		return out, err
 	}
+	if head.Sequence == 0 && source.kind == automationAnchoredReplay {
+		if err := automationResetSemanticProjectionTx(ctx, tx, ""); err != nil {
+			return out, err
+		}
+	}
 	projection, err := automationProjectionTx(ctx, tx, head, d)
 	if err != nil {
 		return out, err
@@ -235,16 +263,7 @@ func automationApplyTx(ctx context.Context, tx *LocalTx, r AutomationRecord, d c
 	if reduce == nil {
 		return out, fmt.Errorf("automation reducer unavailable")
 	}
-	callbackProjection := projection
-	if projection.Existing != nil {
-		existing := *projection.Existing
-		existing.Identity = append([]byte(nil), existing.Identity...)
-		callbackProjection.Existing = &existing
-	}
-	if projection.Operation != nil {
-		operation := *projection.Operation
-		callbackProjection.Operation = &operation
-	}
+	callbackProjection := cloneAutomationProjection(projection)
 	callback, err := reduce(callbackProjection, d)
 	if err != nil {
 		return out, err
@@ -298,10 +317,16 @@ func automationApplyTx(ctx context.Context, tx *LocalTx, r AutomationRecord, d c
 
 	}
 
+	if err := automationApplySemanticEffectsTx(ctx, tx, "", head, next, result); err != nil {
+		return out, err
+	}
 	if result.SaveRequest {
 		if _, err = tx.Exec(ctx, `INSERT INTO local_automation_requests (scope,request_id,identity,receipt_json,operation_id) VALUES (?,?,?,?,?)`, result.Scope, d.Command.RequestID, result.Identity, string(receipt), out.OperationID); err != nil {
 			return out, err
 		}
+	}
+	if source.kind == automationAnchoredReplay && next.Sequence <= trusted.Sequence {
+		return out, nil
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO local_automation_prefix (id,cluster_uid,sequence,digest) VALUES (1,?,?,?) ON CONFLICT(id) DO UPDATE SET cluster_uid=excluded.cluster_uid,sequence=excluded.sequence,digest=excluded.digest`, next.ClusterUID, next.Sequence, next.Digest)
 	return out, err
@@ -310,8 +335,55 @@ func automationApplyTx(ctx context.Context, tx *LocalTx, r AutomationRecord, d c
 // AutomationReplay rebuilds projections only from locally durable authenticated
 // anchors. Each query and transaction holds one bounded record, never history.
 func (c *Client) AutomationReplay(ctx context.Context, reduce AutomationReducer, budget int) error {
+	if budget <= 0 {
+		return fmt.Errorf("automation replay budget exhausted")
+	}
+	// Keep the certified frontier while rebuilding derived state. A partial
+	// semantic cursor is never a new genesis or a fresh admission frontier.
+	if err := c.ExecuteLocal(ctx, func(tx *LocalTx) error {
+		head, err := automationHeadTx(ctx, tx)
+		if err != nil {
+			return err
+		}
+		semantic, err := automationSemanticHeadTx(ctx, tx, "")
+		if err != nil {
+			return err
+		}
+		retained, err := automationRetainedHeadTx(ctx, tx)
+		if err != nil {
+			return err
+		}
+		for _, marker := range []AutomationPrefix{head, semantic} {
+			if marker.Sequence == 0 {
+				continue
+			}
+			digest, found, err := automationTrustedDigestTx(ctx, tx, marker.Sequence)
+			if err != nil {
+				return err
+			}
+			if !found || digest != marker.Digest || marker.ClusterUID != retained.ClusterUID {
+				return fmt.Errorf("unanchored semantic reconstruction boundary")
+			}
+		}
+		if head.Sequence > retained.Sequence || semantic.Sequence > retained.Sequence {
+			return fmt.Errorf("reconstruction beyond retained history")
+		}
+		if head != retained {
+			if _, err := tx.Exec(ctx, `INSERT INTO local_automation_prefix(id,cluster_uid,sequence,digest) VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET cluster_uid=excluded.cluster_uid,sequence=excluded.sequence,digest=excluded.digest`, retained.ClusterUID, retained.Sequence, retained.Digest); err != nil {
+				return err
+			}
+		}
+		if (semantic.Sequence == 0 || head != retained) && retained.Sequence > 0 {
+			return automationResetSemanticProjectionTx(ctx, tx, "")
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
 	for range budget {
-		h, e := c.AutomationHead(ctx)
+		var h AutomationPrefix
+		e := c.ExecuteLocal(ctx, func(tx *LocalTx) error { var err error; h, err = automationSemanticHeadTx(ctx, tx, ""); return err })
 		if e != nil {
 			return e
 		}
@@ -339,7 +411,7 @@ func (c *Client) AutomationReplay(ctx context.Context, reduce AutomationReducer,
 			return e
 		}
 		if !found {
-			return nil
+			return c.ExecuteLocal(ctx, func(tx *LocalTx) error { return automationProjectionAuthorityTx(ctx, tx) })
 		}
 		d, e := automationDecision(r.Value)
 		if e != nil {
@@ -353,7 +425,89 @@ func (c *Client) AutomationReplay(ctx context.Context, reduce AutomationReducer,
 			return e
 		}
 	}
+	if err := c.ExecuteLocal(ctx, func(tx *LocalTx) error { return automationProjectionAuthorityTx(ctx, tx) }); err == nil {
+		return nil
+	}
 	return fmt.Errorf("automation replay budget exhausted")
+}
+
+// Projection authority is independent of custody/class permits: a voter with
+// valid generic authority still cannot admit against incomplete derived state.
+func automationProjectionAuthorityTx(ctx context.Context, tx *LocalTx) error {
+	head, err := automationHeadTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	semantic, err := automationSemanticHeadTx(ctx, tx, "")
+	if err != nil {
+		return err
+	}
+	if head != semantic {
+		return errAutomationAuthority
+	}
+	rows, err := tx.Query(ctx, `SELECT sequence FROM local_automation_history ORDER BY sequence DESC LIMIT 1`)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		if head.Sequence != 0 {
+			return errAutomationAuthority
+		}
+		return nil
+	}
+	if rows[0].Int64("sequence") <= 0 || uint64(rows[0].Int64("sequence")) != head.Sequence {
+		return errAutomationAuthority
+	}
+	digest, found, err := automationTrustedDigestTx(ctx, tx, head.Sequence)
+	if err != nil {
+		return err
+	}
+	if !found || digest != head.Digest {
+		return errAutomationAuthority
+	}
+	return nil
+}
+func automationRetainedHeadTx(ctx context.Context, tx *LocalTx) (AutomationPrefix, error) {
+	rows, err := tx.Query(ctx, `SELECT sequence FROM local_automation_history ORDER BY sequence DESC LIMIT 1`)
+	if err != nil || len(rows) == 0 {
+		return AutomationPrefix{}, err
+	}
+	sequence := rows[0].Int64("sequence")
+	if sequence <= 0 {
+		return AutomationPrefix{}, fmt.Errorf("invalid retained automation sequence")
+	}
+	digest, found, err := automationTrustedDigestTx(ctx, tx, uint64(sequence))
+	if err != nil {
+		return AutomationPrefix{}, err
+	}
+	if !found {
+		return AutomationPrefix{}, fmt.Errorf("retained automation anchor missing")
+	}
+	rows, err = tx.Query(ctx, `SELECT value_json FROM local_automation_history WHERE sequence=? AND length(CAST(value_json AS BLOB))<=? LIMIT 1`, sequence, MaxAutomationClaimBytes)
+	if err != nil {
+		return AutomationPrefix{}, err
+	}
+	if len(rows) != 1 {
+		return AutomationPrefix{}, fmt.Errorf("retained automation value missing or oversized")
+	}
+	key, _ := AutomationClaimKey(uint64(sequence))
+	var value ClaimValue
+	if err := decodeClaimValue(key, rows[0].String("value_json"), &value); err != nil {
+		return AutomationPrefix{}, err
+	}
+	decision, err := automationDecision(value)
+	if err != nil {
+		return AutomationPrefix{}, err
+	}
+	cluster := decision.Command.ClusterUID
+	if sequence == 1 {
+		assigned, err := contract.DecodeAssignment(decision)
+		if err != nil {
+			return AutomationPrefix{}, err
+		}
+		cluster = assigned.ClusterUID
+	}
+	return AutomationPrefix{ClusterUID: cluster, Sequence: uint64(sequence), Digest: digest}, nil
 }
 func automationOperationTx(ctx context.Context, tx *LocalTx, id string) (*contract.Receipt, error) {
 	if id == "" {
@@ -377,7 +531,14 @@ func automationProjectionTx(ctx context.Context, tx *LocalTx, head AutomationPre
 		return AutomationProjection{}, err
 	}
 	op, err := automationOperationTx(ctx, tx, assigned.OperationID)
-	return AutomationProjection{Head: head, Existing: existing, Operation: op, ReplayOriginal: existing != nil && existing.Receipt.Sequence == d.Sequence}, err
+	if err != nil {
+		return AutomationProjection{}, err
+	}
+	p := AutomationProjection{Head: head, Existing: existing, Operation: op, ReplayOriginal: existing != nil && existing.Receipt.Sequence == d.Sequence}
+	if err := automationSemanticProjectionTx(ctx, tx, "", &p, d); err != nil {
+		return AutomationProjection{}, err
+	}
+	return p, nil
 }
 func (c *Client) AutomationOperation(ctx context.Context, id string) (out contract.Receipt, found bool, e error) {
 	e = c.ExecuteLocal(ctx, func(tx *LocalTx) error {
@@ -415,4 +576,127 @@ func validateAutomationRecordSize(r AutomationRecord) error {
 		return fmt.Errorf("automation record exceeds transport bound")
 	}
 	return nil
+}
+
+func cloneAutomationProjection(projection AutomationProjection) AutomationProjection {
+	callbackProjection := projection
+	if projection.Existing != nil {
+		existing := *projection.Existing
+		existing.Identity = append([]byte(nil), existing.Identity...)
+		callbackProjection.Existing = &existing
+	}
+	if projection.Operation != nil {
+		operation := *projection.Operation
+		callbackProjection.Operation = &operation
+	}
+	if projection.Identity != nil {
+		facts := *projection.Identity
+		if facts.Project != nil {
+			v := *facts.Project
+			facts.Project = &v
+		}
+		if facts.Alias != nil {
+			v := *facts.Alias
+			facts.Alias = &v
+		}
+		if facts.Assigned != nil {
+			v := *facts.Assigned
+			facts.Assigned = &v
+		}
+		if facts.Resource != nil {
+			v := *facts.Resource
+			facts.Resource = &v
+		}
+		if facts.AssignedResource != nil {
+			v := *facts.AssignedResource
+			facts.AssignedResource = &v
+		}
+		if facts.Name != nil {
+			v := *facts.Name
+			facts.Name = &v
+		}
+		callbackProjection.Identity = &facts
+	}
+	if projection.Ownership != nil {
+		facts := *projection.Ownership
+		if facts.Project != nil {
+			v := *facts.Project
+			facts.Project = &v
+		}
+		if facts.Principal != nil {
+			v := *facts.Principal
+			facts.Principal = &v
+		}
+		if facts.NextPrincipal != nil {
+			v := *facts.NextPrincipal
+			facts.NextPrincipal = &v
+		}
+		if facts.Owner != nil {
+			v := *facts.Owner
+			facts.Owner = &v
+		}
+		if facts.AssignedSession != nil {
+			v := *facts.AssignedSession
+			facts.AssignedSession = &v
+		}
+		callbackProjection.Ownership = &facts
+	}
+	if projection.Binding != nil {
+		facts := *projection.Binding
+		for _, field := range []**contract.IdentityRecord{&facts.Project, &facts.Principal, &facts.AssignedIdentity, &facts.NameIdentity} {
+			if *field != nil {
+				v := **field
+				*field = &v
+			}
+		}
+		if facts.Owner != nil {
+			v := *facts.Owner
+			facts.Owner = &v
+		}
+		if facts.Last != nil {
+			v := *facts.Last
+			facts.Last = &v
+		}
+		if facts.Name != nil {
+			v := *facts.Name
+			facts.Name = &v
+		}
+		if facts.Resource != nil {
+			v := *facts.Resource
+			facts.Resource = &v
+		}
+		if facts.AssignedResource != nil {
+			v := *facts.AssignedResource
+			facts.AssignedResource = &v
+		}
+		if facts.Dependencies != nil {
+			facts.Dependencies = make([]*contract.IdentityRecord, len(projection.Binding.Dependencies))
+			for i, record := range projection.Binding.Dependencies {
+				if record != nil {
+					v := *record
+					facts.Dependencies[i] = &v
+				}
+			}
+		}
+		if facts.TargetOwner != nil {
+			v := *facts.TargetOwner
+			facts.TargetOwner = &v
+		}
+		if facts.TargetPrincipal != nil {
+			v := *facts.TargetPrincipal
+			facts.TargetPrincipal = &v
+		}
+		if facts.TargetLast != nil {
+			v := *facts.TargetLast
+			facts.TargetLast = &v
+		}
+		if facts.OriginalAdmission != nil {
+			// Admission/VMIntent contains no unsupported or recursive JSON types.
+			encoded, _ := json.Marshal(facts.OriginalAdmission)
+			facts.OriginalAdmission = new(contract.AdmissionRecord)
+			_ = json.Unmarshal(encoded, facts.OriginalAdmission)
+		}
+		callbackProjection.Binding = &facts
+	}
+	return callbackProjection
 }

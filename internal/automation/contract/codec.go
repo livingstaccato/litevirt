@@ -29,7 +29,7 @@ func CanonicalCommand(c Command) ([]byte, error) {
 		return nil, codedError(CodeUnsupported)
 	}
 	for _, s := range []string{c.ClusterUID, c.ProjectUID, c.PrincipalID, c.OwnerID,
-		c.ManagementKey, c.RequestID, c.ResourceUID, c.SecretKeyEpoch} {
+		c.ManagementKey, c.RequestID, c.ResourceUID, c.SecretKeyEpoch, c.SessionID} {
 		if !utf8.ValidString(s) {
 			return nil, codedError(CodeValidation)
 		}

@@ -35,7 +35,7 @@ func EncodeDecision(d Decision) ([]byte, error) {
 		}
 	}
 	c := d.Command
-	for _, s := range []string{c.Kind, c.ClusterUID, c.ProjectUID, c.PrincipalID, c.OwnerID, c.ManagementKey, c.RequestID, c.ResourceUID, c.SecretKeyEpoch} {
+	for _, s := range []string{c.Kind, c.ClusterUID, c.ProjectUID, c.PrincipalID, c.OwnerID, c.ManagementKey, c.RequestID, c.ResourceUID, c.SecretKeyEpoch, c.SessionID} {
 		if len(s) > MaxStringBytes {
 			return nil, codedError(CodeValidation)
 		}

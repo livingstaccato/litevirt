@@ -348,3 +348,157 @@ firewall:
 		t.Fatalf("Admin's deploy was refused: %v", err)
 	}
 }
+
+const fwStackYAML = `name: fwonly
+security-groups:
+  web:
+    rules:
+      - {direction: ingress, proto: tcp, port: "80", action: accept}
+firewall:
+  default-deny: true
+`
+
+const fwStackNoBlockYAML = `name: fwonly
+`
+
+// stackFirewallFixture binds opal as Operator (sg.read only) and ada as Admin
+// at the root, and has ada deploy a stack whose firewall block holds a group
+// and the cluster default-deny.
+func stackFirewallFixture(t *testing.T) (s *Server, opal, ada context.Context) {
+	t.Helper()
+	ctx := context.Background()
+	s = testServer(t)
+	if err := auth.SeedBuiltinRoles(ctx, s.db); err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range []struct{ user, role string }{{"opal", "Operator"}, {"ada", "Admin"}} {
+		if err := corrosion.InsertUser(ctx, s.db, g.user, "operator", "x"); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.InsertRoleBinding(ctx, s.db, corrosion.RoleBindingRecord{
+			ID: g.user, Path: "/", Role: g.role, Principal: "user:" + g.user + "@local", Propagate: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	engine := auth.NewEngine(s.db)
+	if err := engine.Reload(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s.SetAuthEngine(engine)
+	opal, ada = userCtx("opal", "operator"), userCtx("ada", "operator")
+	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: fwStackYAML}, &mockDeployStreamR2{ctx: ada}); err != nil {
+		t.Fatalf("Admin deploys the firewall stack: %v", err)
+	}
+	assertStackFirewallIntact(t, s, "after the Admin's deploy")
+	return s, opal, ada
+}
+
+// assertStackFirewallIntact fails unless the stack's group is live and the
+// cluster default is deny.
+func assertStackFirewallIntact(t *testing.T, s *Server, when string) {
+	t.Helper()
+	ctx := context.Background()
+	if g, _ := corrosion.ListSecurityGroups(ctx, s.db, "fwonly"); len(g) != 1 || g[0].Name != "web" {
+		t.Fatalf("%s: the stack's groups are %+v, want web", when, g)
+	}
+	if d, err := corrosion.GetFirewallDefault(ctx, s.db, "cluster"); err != nil || d == nil || !d.DefaultDeny {
+		t.Fatalf("%s: the cluster default is %+v (%v), want deny", when, d, err)
+	}
+}
+
+func wantGrantHint(t *testing.T, what string, err error) {
+	t.Helper()
+	wantSGCode(t, what, err, codes.PermissionDenied)
+	if !strings.Contains(err.Error(), "lv role grant NetworkAdmin user:opal@local --path / --propagate") {
+		t.Errorf("%s: the refusal does not name the grant that fixes it: %v", what, err)
+	}
+}
+
+// Redeploying a stack without its firewall block tombstones its groups and
+// its default-deny, a write to the same global rows deploying them is, so an
+// Operator without sg.write at the root is refused before anything changes.
+func TestDeployStack_DroppingAStacksFirewallNeedsSGWriteAtTheRoot(t *testing.T) {
+	s, opal, ada := stackFirewallFixture(t)
+	err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: fwStackNoBlockYAML}, &mockDeployStreamR2{ctx: opal})
+	wantGrantHint(t, "an Operator redeploys the stack without its firewall", err)
+	assertStackFirewallIntact(t, s, "after the refused redeploy")
+
+	// A dry run is not refused, and says the real run would be.
+	st := &mockDeployStreamR2{ctx: opal}
+	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: fwStackNoBlockYAML, DryRun: true}, st); err != nil {
+		t.Fatalf("an Operator's dry run: %v", err)
+	}
+	warned := false
+	for _, p := range st.sent {
+		warned = warned || (p.GetPhase() == "warning" && strings.Contains(p.GetDetail(), "would be refused") &&
+			strings.Contains(p.GetDetail(), "lv role grant NetworkAdmin"))
+	}
+	if !warned {
+		t.Errorf("the dry run did not say the real run would be refused: %+v", st.sent)
+	}
+
+	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: fwStackNoBlockYAML}, &mockDeployStreamR2{ctx: ada}); err != nil {
+		t.Fatalf("the Admin drops the firewall: %v", err)
+	}
+	if g, _ := corrosion.ListSecurityGroups(context.Background(), s.db, "fwonly"); len(g) != 0 {
+		t.Fatalf("the Admin's redeploy left the stack's groups: %+v", g)
+	}
+}
+
+// `lv compose down` of a stack that owns firewall rows removes them, so it
+// needs sg.write at the root too, and a refused down leaves the whole stack.
+func TestDeleteStack_AStackThatOwnsAFirewallNeedsSGWriteAtTheRoot(t *testing.T) {
+	s, opal, ada := stackFirewallFixture(t)
+	err := s.DeleteStack(&pb.DeleteStackRequest{Name: "fwonly"}, &mockDeleteStream{ctx: opal})
+	wantGrantHint(t, "an Operator tears the stack down", err)
+	assertStackFirewallIntact(t, s, "after the refused down")
+	if st, _ := corrosion.GetStack(context.Background(), s.db, "fwonly"); st == nil || st.State == stackStateDeleting {
+		t.Fatalf("the refused down changed the stack row: %+v", st)
+	}
+	if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "fwonly"}, &mockDeleteStream{ctx: ada}); err != nil {
+		t.Fatalf("the Admin tears the stack down: %v", err)
+	}
+	if g, _ := corrosion.ListSecurityGroups(context.Background(), s.db, "fwonly"); len(g) != 0 {
+		t.Fatalf("the Admin's down left the stack's groups: %+v", g)
+	}
+}
+
+// A project's group is never a stack's: stack teardown would remove it.
+func TestSGProjects_AProjectGroupHasNoStack(t *testing.T) {
+	f := newSGProjectsFixture(t)
+	_, err := f.s.CreateSecurityGroup(f.alice, &pb.CreateSecurityGroupRequest{Name: "a-db", Project: "acme", StackName: "prod"})
+	wantSGCode(t, "a project group with a stack", err, codes.InvalidArgument)
+}
+
+// A project's group starts empty: rules an older client stored under the name
+// it takes are neither listed as its own nor removed with it.
+func TestSGProjects_AProjectGroupDoesNotAdoptNameKeyedRules(t *testing.T) {
+	f := newSGProjectsFixture(t)
+	ctx := context.Background()
+	if err := corrosion.InsertSGRule(ctx, f.s.db, corrosion.SGRule{ID: "legacy-r", SGID: "stranded",
+		Direction: "ingress", Proto: "tcp", PortRange: "23", Action: "accept"}); err != nil {
+		t.Fatal(err)
+	}
+	g, err := f.s.CreateSecurityGroup(f.alice, &pb.CreateSecurityGroupRequest{Name: "stranded", Project: "acme"})
+	if err != nil {
+		t.Fatalf("alice creates stranded: %v", err)
+	}
+	for who, c := range map[string]context.Context{"alice": f.alice, "root": f.root} {
+		resp, err := f.s.ListSecurityGroups(c, &pb.ListSecurityGroupsRequest{Project: "acme", IncludeRules: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range resp.GetRules() {
+			if r.GetId() == "legacy-r" && r.GetSgId() == g.Id {
+				t.Fatalf("%s sees the stranded rule as acme's group's own", who)
+			}
+		}
+	}
+	if _, err := f.s.DeleteSecurityGroup(f.alice, &pb.DeleteSecurityGroupRequest{Id: g.Id}); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := corrosion.GetSGRule(ctx, f.s.db, "legacy-r"); r == nil {
+		t.Fatal("deleting acme's group removed a rule it never owned")
+	}
+}

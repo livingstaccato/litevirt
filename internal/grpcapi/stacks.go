@@ -65,15 +65,17 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	}
 
 	// A firewall block writes global security groups, ip sets, cluster and host
-	// rules and the default policy, which a caller without sg.write at the
-	// cluster root may not write (lv sg create checks the same). Refused before
-	// anything is deployed.
-	if !req.DryRun && (len(f.SecurityGroups) > 0 || len(f.IPSets) > 0 || f.FirewallDefaults != nil) {
-		if err := s.requireSGWrite(ctx); err != nil {
-			return status.Errorf(codes.PermissionDenied,
-				"stack %q declares a firewall (security groups, ip sets or a default policy), which needs sg.write at the cluster root: %s",
-				f.Name, status.Convert(err).Message())
-		}
+	// rules and the default policy, and a redeploy without one removes those
+	// the stack already owns: either needs sg.write at the cluster root (lv sg
+	// create checks the same). Refused before anything is deployed; a dry run
+	// is not refused, and says the real run would be.
+	fwRefusal, fwErr := s.stackFirewallRefusal(ctx, f.Name,
+		len(f.SecurityGroups) > 0 || len(f.IPSets) > 0 || f.FirewallDefaults != nil, "deploying")
+	if fwErr != nil {
+		return fwErr
+	}
+	if fwRefusal != nil && !req.DryRun {
+		return fwRefusal
 	}
 
 	// Disk/NIC tuning in the file is refused before anything is deployed, rather
@@ -157,6 +159,12 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// ── Dry-run: stream the full resolved plan ──
 
 	if req.DryRun {
+		if fwRefusal != nil {
+			if err := stream.Send(&pb.DeployProgress{Phase: "warning",
+				Detail: "the real run would be refused: " + status.Convert(fwRefusal).Message()}); err != nil {
+				return err
+			}
+		}
 		return s.streamResolvedPlan(stream, resolved)
 	}
 
@@ -1200,6 +1208,15 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 		return err
 	}
 	ctx := stream.Context()
+	// A stack that owns firewall rows has them removed with it, which needs
+	// sg.write at the cluster root: refused before anything is torn down, so
+	// the stack stays whole rather than losing its VMs and keeping orphaned
+	// firewall rows.
+	if refusal, err := s.stackFirewallRefusal(ctx, req.Name, false, "removing"); err != nil {
+		return err
+	} else if refusal != nil {
+		return refusal
+	}
 
 	vms, err := corrosion.ListVMs(ctx, s.db, req.Name, "")
 	if err != nil {
@@ -2804,4 +2821,29 @@ func (s *Server) provisionComposeNetworks(ctx context.Context, f *compose.File) 
 		}
 	}
 	return errs
+}
+
+// stackFirewallRefusal is the refusal of a stack change that writes global
+// firewall state without sg.write at the cluster root, or nil when it may
+// proceed. The change writes that state when the new file declares a firewall
+// (declares) or the stack already owns firewall rows, which a redeploy
+// replaces or drops and a teardown removes. The refusal names the grant that
+// fixes it. A failure to read the stack's rows is returned as err.
+func (s *Server) stackFirewallRefusal(ctx context.Context, stack string, declares bool, verb string) (refusal, err error) {
+	owns, oerr := corrosion.StackOwnsFirewall(ctx, s.db, stack)
+	if oerr != nil {
+		return nil, status.Errorf(codes.Unavailable, "read the firewall rows of stack %q: %v", stack, oerr)
+	}
+	if !declares && !owns {
+		return nil, nil
+	}
+	perr := s.requireSGWrite(ctx)
+	if perr == nil {
+		return nil, nil
+	}
+	return status.Errorf(codes.PermissionDenied,
+		"%s stack %q writes its firewall (security groups, ip sets, cluster and host rules, the cluster default policy), "+
+			"which needs sg.write at the cluster root: %s. An administrator can grant it with "+
+			"`lv role grant NetworkAdmin %s --path / --propagate`, or run this as an Admin",
+		verb, stack, status.Convert(perr).Message(), "user:"+callerPrincipal(ctx)), nil
 }

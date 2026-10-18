@@ -18,6 +18,9 @@ only; nothing is rewritten or dropped).
 - `project = 'P'` is owned by project P, which must exist; the group is stored
   under the project's own name. It is set at create and never changed.
 - A project that still owns a group is not deleted (`lv project rm` refuses).
+- A project's group has no stack (create refuses both together), and it never
+  adopts rules an older client stored under its name: it starts empty, and
+  deleting it leaves such rules alone.
 - Group names stay unique cluster-wide, across projects. A NIC binds a group
   by name, so a name two groups hold is still held at drop (unchanged).
 
@@ -31,7 +34,8 @@ A group's path is `/` for a global group and
 | `CreateSecurityGroup` | `sg.write` on the new group's path |
 | `DeleteSecurityGroup`, `AddSecurityGroupRule`, `RemoveSecurityGroupRule` | `sg.write` on the path of the group (for a rule, the rule's group); a rule no live group owns needs `/` |
 | `AddSecurityGroupRule` of an IPv6, logged or tag-group rule on a project group | also `sg.write` at `/`: it records a cluster-wide release-feature use, and a logged rule writes host logs |
-| `DeployStack` with a firewall block | `sg.write` at `/`: stack groups, ip sets and the default policy are global |
+| `DeployStack` with a firewall block, or of a stack that owns firewall rows (a redeploy replaces or drops them) | `sg.write` at `/`: stack groups, ip sets and the default policy are global. Checked before anything changes; a dry run is not refused and reports that the real run would be |
+| `DeleteStack` (`lv compose down`) of a stack that owns firewall rows | `sg.write` at `/`, checked before anything is torn down, so a refused down leaves the stack whole |
 | `ListSecurityGroups` | per row, below |
 
 `ListSecurityGroups`:
@@ -89,6 +93,9 @@ lv sg ls --project <P>              # P's groups and the global groups
 
 `lv sg ls` prints a PROJECT column (empty = global). Against a daemon that
 does not declare the `sg_projects` feature (`GetUpgradeStatus`), `--project` is
-refused rather than creating a global group or listing unfiltered. The web UI
+refused rather than creating a global group or listing unfiltered. A token
+scoped below the root cannot read the upgrade status; its create is sent, a
+previous daemon refuses it (it checks `sg.write` at `/`), and the CLI checks
+the created group's project. The web UI
 takes a project on its create form and `?project=` on `/security-groups`, and
 the Add-NIC dialog lists the VM's project's groups and the global ones.

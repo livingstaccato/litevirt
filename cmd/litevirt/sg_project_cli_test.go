@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -56,5 +58,49 @@ func TestSGCLI_ProjectAgainstAnOldDaemonIsRefused(t *testing.T) {
 	// Without --project nothing changes.
 	if _, err := runSGCLI(t, "create", "base"); err != nil {
 		t.Fatalf("lv sg create without --project: %v", err)
+	}
+}
+
+// scopedSGDaemon answers GetUpgradeStatus as a daemon does a token scoped to a
+// project (it needs the root), and creates what it is asked. newBuild says
+// whether it is an upgraded daemon (keeps the project) or a previous one
+// (checks sg.write at the root, which the scoped token cannot pass).
+type scopedSGDaemon struct {
+	pb.UnimplementedLiteVirtServer
+	newBuild bool
+	created  int
+}
+
+func (d *scopedSGDaemon) GetUpgradeStatus(context.Context, *emptypb.Empty) (*pb.UpgradeStatus, error) {
+	return nil, status.Error(codes.PermissionDenied, `token scope does not cover "/"`)
+}
+
+func (d *scopedSGDaemon) CreateSecurityGroup(_ context.Context, req *pb.CreateSecurityGroupRequest) (*pb.SecurityGroup, error) {
+	if !d.newBuild {
+		return nil, status.Error(codes.PermissionDenied, `token scope does not cover "/"`)
+	}
+	d.created++
+	return &pb.SecurityGroup{Id: "sg-1", Name: req.GetName(), Project: req.GetProject()}, nil
+}
+
+// A token scoped to a project cannot read the upgrade status, so the create
+// is sent and the daemon's own answer decides: an upgraded daemon creates the
+// project's group; a previous one refuses the token at the root and nothing
+// is created (the post-create project check covers any other answer).
+func TestSGCLI_ProjectCreateWithAProjectScopedToken(t *testing.T) {
+	d := &scopedSGDaemon{newBuild: true}
+	sgCLIDaemon(t, d, nil, "")
+	noLocalDB(t)
+	if out, err := runSGCLI(t, "create", "a-web", "--project", "acme"); err != nil || !strings.Contains(out, "Created") {
+		t.Fatalf("a scoped token's create against an upgraded daemon: %v\n%s", err, out)
+	}
+	if d.created != 1 {
+		t.Fatalf("created %d groups, want 1", d.created)
+	}
+
+	old := &scopedSGDaemon{}
+	sgCLIDaemon(t, old, nil, "")
+	if _, err := runSGCLI(t, "create", "a-web", "--project", "acme"); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("a scoped token's create against a previous daemon: %v, want its PermissionDenied", err)
 	}
 }

@@ -88,6 +88,11 @@ func (s *Server) CreateSecurityGroup(ctx context.Context, req *pb.CreateSecurity
 			return nil, status.Errorf(codes.InvalidArgument, "invalid project %q: %v", project, err)
 		}
 	}
+	if project != "" && req.StackName != "" {
+		// A stack's groups are global and go with the stack; a project's
+		// group must not be removed by another stack's teardown.
+		return nil, status.Error(codes.InvalidArgument, "a project's security group cannot belong to a stack; give one or the other")
+	}
 	if err := s.RequirePerm(ctx, sgRBACPath(project, req.Name), sgWriteVerb, "operator"); err != nil {
 		return nil, err
 	}

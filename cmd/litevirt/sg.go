@@ -94,7 +94,11 @@ func newSGCreateCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				if project != "" {
-					if err := requireSGProjects(ctx, c, "create"); err != nil {
+					// A token scoped below the root cannot read the upgrade
+					// status. The create is then sent: a previous daemon checks
+					// sg.write at the root, which such a token cannot pass, and
+					// the project check below catches any other answer.
+					if err := requireSGProjects(ctx, c, "create"); err != nil && !errors.As(err, new(errSGProjectsDenied)) {
 						return err
 					}
 				}
@@ -124,6 +128,12 @@ func (e errSGProjectsUnsupported) Error() string {
 	return fmt.Sprintf("lv sg %s --project: the daemon predates project security groups (%s); upgrade litevirtd on the host you are connected to", e.sub, e.why)
 }
 
+// errSGProjectsDenied is the daemon refusing the caller its upgrade status
+// (it needs the cluster root), so whether it knows project groups is not known.
+type errSGProjectsDenied struct{ err error }
+
+func (e errSGProjectsDenied) Error() string { return e.err.Error() }
+
 // requireSGProjects refuses --project against a daemon that predates project
 // security groups. Such a daemon drops the field it does not know: a create
 // would make a GLOBAL group every project may bind, and a listing would not be
@@ -134,6 +144,9 @@ func requireSGProjects(ctx context.Context, c pb.LiteVirtClient, sub string) err
 	if err != nil {
 		if status.Code(err) == codes.Unimplemented {
 			return errSGProjectsUnsupported{sub, "it has no upgrade status"}
+		}
+		if status.Code(err) == codes.PermissionDenied {
+			return errSGProjectsDenied{err}
 		}
 		return fmt.Errorf("lv sg %s --project: could not ask the daemon whether it supports project security groups: %w", sub, err)
 	}

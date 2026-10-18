@@ -1198,7 +1198,12 @@ name an existing project, and an IPv6, logged or tag-group rule on one still
 needs `sg.write` at `/`. Project groups are the release feature `sg_projects`
 (see [design/security-group-projects.md](design/security-group-projects.md)).
 `lv compose up` of a stack with a firewall block needs `sg.write` at `/`: its
-groups, ip sets and default policy are global. Against a daemon
+groups, ip sets and default policy are global. So does `lv compose up` of a
+stack that already owns firewall rows (it replaces or drops them) and
+`lv compose down` of one; both are refused before anything changes, and the
+refusal names the grant (`lv role grant NetworkAdmin <principal> --path /
+--propagate`). The plan `lv compose up` shows before it applies lists the
+refusal as a warning. Against a daemon
 older than these RPCs the four commands fail with an error saying to upgrade
 litevirtd; they do not fall back to writing the database.
 

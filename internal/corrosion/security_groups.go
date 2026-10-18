@@ -283,7 +283,9 @@ func ListAllSGRules(ctx context.Context, c *Client) ([]SGRule, error) {
 // returned rule carries sg.ID in SGID, so callers filtering by group id see it.
 func ListSGRulesFor(ctx context.Context, c *Client, sg SecurityGroup, legacyByName bool) ([]SGRule, error) {
 	rules, err := ListSGRules(ctx, c, sg.ID)
-	if err != nil || !legacyByName || sg.Name == "" || sg.Name == sg.ID {
+	// A project's group never adopts them: it starts empty, and a rule stored
+	// under a name before the project took it is no project's.
+	if err != nil || !legacyByName || sg.Name == "" || sg.Name == sg.ID || sg.Project != "" {
 		return rules, err
 	}
 	legacy, err := ListSGRules(ctx, c, sg.Name)
@@ -319,7 +321,7 @@ func DeleteSecurityGroupWithLegacyRules(ctx context.Context, c *Client, sg Secur
 		SQL:    `UPDATE security_groups SET deleted_at = ?, updated_at = ? WHERE id = ?`,
 		Params: []interface{}{wall, now, sg.ID},
 	}}
-	if sg.Name != "" && sg.Name != sg.ID {
+	if sg.Name != "" && sg.Name != sg.ID && sg.Project == "" {
 		stmts = append(stmts, Statement{
 			SQL:    `UPDATE sg_rules SET deleted_at = ?, updated_at = ? WHERE sg_id = ?`,
 			Params: []interface{}{wall, now, sg.Name},
@@ -369,4 +371,23 @@ func WorkloadProjects(ctx context.Context, c *Client, hostName string) (vms, cts
 		cts[r.String("name")] = r.String("project")
 	}
 	return vms, cts, nil
+}
+
+// StackOwnsFirewall reports whether stack owns any live firewall row: a
+// security group, an ip set, a cluster or host rule, or a firewall default.
+// Removing or replacing them is a write to global firewall state.
+func StackOwnsFirewall(ctx context.Context, c *Client, stack string) (bool, error) {
+	if stack == "" {
+		return false, nil
+	}
+	for _, table := range []string{"security_groups", "ip_sets", "cluster_firewall_rules", "host_firewall_rules", "firewall_defaults"} {
+		rows, err := c.Query(ctx, `SELECT 1 FROM `+table+` WHERE stack_name = ? AND deleted_at IS NULL LIMIT 1`, stack)
+		if err != nil {
+			return false, err
+		}
+		if len(rows) > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }

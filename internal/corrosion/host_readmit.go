@@ -173,6 +173,13 @@ func retireReadmittedCredentials(ctx context.Context, tx *sql.Tx, stmts []Statem
 				if err := retireHostOwnedRows(ctx, tx, host, ts); err != nil {
 					return fmt.Errorf("reset %s's per-host rows on re-admission: %w", host, err)
 				}
+				// A counted re-admission retires the credential even where
+				// this node holds none, so a lagging node's live row from the
+				// earlier admission meets a retirement here on the sensitive
+				// merge, not an empty slot it would fill.
+				if err := ensureCredentialRow(ctx, tx, host, ts); err != nil {
+					return fmt.Errorf("retire %s's fence credential: %w", host, err)
+				}
 			}
 		case isReadmit(s):
 			host, ts, ok = readmitParams(s)
@@ -221,6 +228,18 @@ func retireFenceCredential(ctx context.Context, tx *sql.Tx, host, updatedAt stri
 		`UPDATE host_fence_credentials SET ipmi_pass = '', deleted_at = ?, updated_at = ?, after_retirement = ''
 		 WHERE host_name = ?`,
 		updatedAt, updatedAt, host)
+	return err
+}
+
+// ensureCredentialRow inserts host's credential tombstone at updatedAt when
+// this node holds no credential row for it; retireFenceCredential then finds
+// it already retired at that instant. Every node derives the same row from the
+// same statement.
+func ensureCredentialRow(ctx context.Context, tx *sql.Tx, host, updatedAt string) error {
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO host_fence_credentials (host_name, ipmi_pass, updated_at, deleted_at, after_retirement)
+		 VALUES (?, '', ?, ?, '') ON CONFLICT(host_name) DO NOTHING`,
+		host, updatedAt, updatedAt)
 	return err
 }
 

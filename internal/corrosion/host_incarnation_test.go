@@ -894,3 +894,32 @@ func TestHostIncarnation_AReadmissionIsStampedAfterTheRemoval(t *testing.T) {
 		t.Errorf("credential row = (%q, live %v, after %q); want new-pass carrying %s", pass, live, after, retired)
 	}
 }
+
+// Lab test 26, F3: a node that held no credential row for the host when the
+// counted re-admission reached it still holds its retirement afterwards, so a
+// lagging node's live password from the earlier admission, pulled on the
+// sensitive anti-entropy lane, does not fill the empty slot, whatever its
+// clock.
+func TestHostIncarnation_AReadmissionRetiresACredentialThisNodeNeverHeld(t *testing.T) {
+	_, entry := admittedV2(t)
+	for _, ts := range []string{"2026-01-01T00:00:00.000000000Z", "2999-01-01T00:00:00.000000000Z"} {
+		s := newTestDB(t)
+		oldIncarnation(t, s)
+		if _, err := s.DB().Exec(`DELETE FROM host_fence_credentials WHERE host_name = 'host-x'`); err != nil {
+			t.Fatal(err)
+		}
+		applyRemote(t, s, "2999000000000-0000-admitter", entry...)
+		lagging := newTestDB(t)
+		oldIncarnation(t, lagging)
+		if _, err := lagging.DB().Exec(`UPDATE host_fence_credentials SET ipmi_pass = 'lag-pass', updated_at = ?,
+			deleted_at = NULL, after_retirement = '' WHERE host_name = 'host-x'`, ts); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.MergeSensitiveStateBytesLWW(lagging.DumpSensitiveStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if pass, ok := liveCredential(t, s); ok {
+			t.Errorf("lagging password at %s: the sensitive merge gave the re-admitted host the earlier admission's password %q", ts, pass)
+		}
+	}
+}

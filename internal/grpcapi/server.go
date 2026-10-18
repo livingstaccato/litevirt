@@ -406,6 +406,9 @@ type Server struct {
 	// first existence check and its in-flight registration (beginCreate).
 	// Test seam only; nil in production.
 	createBeforeFlightHook func(name string)
+	// removeHostBeforeDeleteHook, when set, runs in RemoveHost between its
+	// checks and its delete. Test seam only; nil in production.
+	removeHostBeforeDeleteHook func(name string)
 	// createReturnedHook is a test-only seam; see SetCreateReturnedHook.
 	createReturnedHook func(name string, err error)
 	// stackMemberDeleteHook is a test-only seam: DeleteStack calls it with

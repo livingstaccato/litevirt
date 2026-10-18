@@ -80,14 +80,18 @@ func TestGenerateMAC_Format(t *testing.T) {
 	}
 }
 
+// GenerateMAC draws 24 random bits, so 100 draws repeat one about once in
+// 3,400 runs (the birthday bound), and asking for no repeat at all is a flaky
+// test. Three or more repeats in 100 draws happen less than once in 10^11 runs,
+// while a generator with only 8 random bits repeats about 17 times.
 func TestGenerateMAC_Uniqueness(t *testing.T) {
+	const draws, minDistinct = 100, 98
 	seen := make(map[string]bool)
-	for i := 0; i < 100; i++ {
-		mac := GenerateMAC()
-		if seen[mac] {
-			t.Errorf("duplicate MAC generated: %s", mac)
-		}
-		seen[mac] = true
+	for i := 0; i < draws; i++ {
+		seen[GenerateMAC()] = true
+	}
+	if len(seen) < minDistinct {
+		t.Errorf("%d distinct MACs in %d draws, want at least %d", len(seen), draws, minDistinct)
 	}
 }
 

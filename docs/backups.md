@@ -317,12 +317,16 @@ lv backup schedule rm --pool fast-ssd --repo main      # match the scope on remo
 Pool-mode is per-host, not leader-gated for the same reason per-VM
 mode isn't: each host fires for its own slice of the pool.
 
-A per-VM schedule, backup or replication, ends with its VM: `lv rm` and
-`lv compose down` remove the deleted VM's own schedules. A rebuild, a compose
-re-create and a blue-green cutover keep them, since the VM comes back under the
-same name. A per-VM schedule still live more than 24 hours after its VM was
-deleted (left by a delete on an older build) is removed by the failover lease
-holder's sweep, and does not keep a torn-down stack's backup repo registered.
+A workload's own schedules end with it: `lv rm`, `lv ct rm` and
+`lv compose down` remove the deleted VM's per-VM schedules (backup or
+replication) and the deleted container's replication schedules. A rebuild, a
+compose re-create, a blue-green or snapshot-and-replace cutover and a failed
+clone keep them, and a schedule whose VM or container is gone for any other
+reason stays dormant until the name comes back. A schedule left behind by a
+delete the entry could not attribute (one entered on an older build, or made
+with a host certificate) for a workload of a stack that has since been torn
+down is removed by the failover lease holder's sweep 24 hours after the
+workload was deleted, and does not keep that stack's backup repo registered.
 
 Repos referenced by schedules resolve through the cluster's repo map: a
 top-level compose `backup-repos:` block (see below) or daemon config

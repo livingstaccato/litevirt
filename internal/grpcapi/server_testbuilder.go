@@ -260,3 +260,7 @@ func (s *Server) SweepReleaseUsesForTest(ctx context.Context) {
 func (s *Server) SweepFirewallTagOrphansForTest(ctx context.Context, now time.Time) {
 	s.sweepFirewallTagOrphans(ctx, now)
 }
+
+// SetStackMemberDeleteHookForTest sets the seam DeleteStack calls with each
+// member's name right before deleting it.
+func (s *Server) SetStackMemberDeleteHookForTest(fn func(name string)) { s.stackMemberDeleteHook = fn }

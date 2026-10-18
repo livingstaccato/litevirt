@@ -507,6 +507,8 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 		// A member on another host judges the create's host-side checks
 		// itself, before it deletes (recreate_preflight.go).
 		deleteCtx = withRecreatePreflight(ctx, pf)
+		// The container comes back under its name: its schedules stay.
+		deleteCtx = withSchedulesKept(deleteCtx)
 	}
 	// A VM with a disk on an iSCSI LUN moves its claim before the delete, as
 	// a rolling recreate does (preflightLUNs): what the create would refuse

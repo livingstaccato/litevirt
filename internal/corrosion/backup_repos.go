@@ -148,14 +148,15 @@ func DeleteStackBackupRepos(ctx context.Context, c *Client, stack string, read S
 }
 
 // scheduledBackupRepos is the set of repo names a live backup schedule names,
-// leaving out the schedules of a deleted VM (OrphanedVMSchedules): those fire
-// for nothing, and the orphan sweep removes them.
+// leaving out the schedules of a deleted workload of a torn-down stack
+// (OrphanedStackSchedules): those fire for nothing, and the orphan sweep
+// removes them.
 func scheduledBackupRepos(ctx context.Context, c *Client) (map[string]bool, error) {
 	rows, err := c.Query(ctx, `SELECT vm_name, repo FROM backup_schedules WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
-	orphans, err := OrphanedVMSchedules(ctx, c, time.Now(), VMScheduleOrphanGrace)
+	orphans, err := OrphanedStackSchedules(ctx, c, time.Now(), ScheduleOrphanGrace)
 	if err != nil {
 		return nil, err
 	}

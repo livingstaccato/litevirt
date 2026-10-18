@@ -49,7 +49,7 @@ func (s *Server) runReleaseUseSweep(ctx context.Context, every time.Duration, pr
 		case <-t.C:
 			s.sweepReleaseUses(ctx, probes)
 			s.sweepFirewallTagOrphans(ctx, time.Now())
-			s.sweepVMScheduleOrphans(ctx, time.Now())
+			s.sweepScheduleOrphans(ctx, time.Now())
 		}
 	}
 }
@@ -139,32 +139,33 @@ func (s *Server) sweepFirewallTagOrphans(ctx context.Context, now time.Time) {
 	}
 }
 
-// sweepVMScheduleOrphans is the vm-schedule orphan sweep: on the failover
-// lease holder, it tombstones every schedule corrosion.OrphanedVMSchedules
-// selects at now — a schedule of a VM deleted more than
-// VMScheduleOrphanGrace ago, written no later than its tombstone. A delete
-// removes the VM's schedules itself (deleteVMSchedules); this clears what a
-// delete left: one by an older build, or one that failed to remove them.
-func (s *Server) sweepVMScheduleOrphans(ctx context.Context, now time.Time) {
+// sweepScheduleOrphans is the schedule orphan sweep: on the failover lease
+// holder, it tombstones every schedule corrosion.OrphanedStackSchedules selects
+// at now — a schedule of a VM or container of a torn-down stack, deleted more
+// than ScheduleOrphanGrace ago, written no later than its tombstone. A delete
+// removes the workload's schedules itself (deleteVMSchedules,
+// deleteContainerSchedules); this clears what a stack teardown left: one by an
+// older build, or one that could not tell it was the entry.
+func (s *Server) sweepScheduleOrphans(ctx context.Context, now time.Time) {
 	held, err := corrosion.IsLeaseHolder(ctx, s.db, corrosion.LeaseKeyFailover, s.hostName, time.Now())
 	if err != nil || !held {
 		return
 	}
-	orphans, err := corrosion.OrphanedVMSchedules(ctx, s.db, now, corrosion.VMScheduleOrphanGrace)
+	orphans, err := corrosion.OrphanedStackSchedules(ctx, s.db, now, corrosion.ScheduleOrphanGrace)
 	if err != nil {
-		slog.Warn("schedule sweep: could not read the schedules of deleted VMs", "error", err)
+		slog.Warn("schedule sweep: could not read the schedules of torn-down stacks' workloads", "error", err)
 		return
 	}
 	for _, o := range orphans {
 		if err := s.deleteScheduleRow(ctx, o.VMName, o.Repo); err != nil {
-			slog.Warn("schedule sweep: could not remove the schedule of a deleted VM", "vm", o.VMName, "repo", o.Repo, "error", err)
+			slog.Warn("schedule sweep: could not remove the schedule of a torn-down stack's workload", "schedule", o.VMName, "repo", o.Repo, "error", err)
 			continue
 		}
-		slog.Info("schedule sweep: removed the schedule of a deleted VM", "vm", o.VMName, "repo", o.Repo)
+		slog.Info("schedule sweep: removed the schedule of a torn-down stack's workload", "schedule", o.VMName, "repo", o.Repo)
 	}
 }
 
-// SweepVMScheduleOrphansForTest runs one pass of the vm-schedule orphan sweep.
-func (s *Server) SweepVMScheduleOrphansForTest(ctx context.Context, now time.Time) {
-	s.sweepVMScheduleOrphans(ctx, now)
+// SweepScheduleOrphansForTest runs one pass of the schedule orphan sweep.
+func (s *Server) SweepScheduleOrphansForTest(ctx context.Context, now time.Time) {
+	s.sweepScheduleOrphans(ctx, now)
 }

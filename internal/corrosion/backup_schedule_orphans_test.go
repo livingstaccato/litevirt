@@ -8,27 +8,61 @@ import (
 	"time"
 )
 
+// backdate sets a tombstone's display deletion two days back, locally.
+func backdate(t *testing.T, c *Client, table, name string) {
+	t.Helper()
+	old := time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339)
+	if _, err := c.DB().ExecContext(context.Background(), `UPDATE `+table+` SET deleted_at = ? WHERE name = ?`, old, name); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// tornDownStack records stack name and tombstones it.
+func tornDownStack(t *testing.T, c *Client, name string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := UpsertStack(ctx, c, StackRecord{Name: name, State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteStackRecord(ctx, c, name); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // orphanFixture is a replica holding a schedule of each kind the orphan rule
-// tells apart, every one naming repo "r":
+// tells apart. Stack "down" was torn down; stack "up" is live.
 //
-//   - gone:      its VM was deleted two days ago, the schedule written before;
-//   - recent:    its VM was deleted just now (inside the grace);
-//   - unborn:    no row of its VM at all (not replicated yet, or never made);
-//   - live:      its VM is live;
-//   - rewritten: its VM was deleted two days ago, the schedule written after
-//     the tombstone (a re-create of the name);
+// VMs (each with a schedule into repo "r"):
+//   - gone:      down's, deleted two days ago, the schedule written before;
+//   - tie:       as gone, the schedule's stamp equal to the tombstone's;
+//   - recent:    down's, deleted just now (inside the grace);
+//   - unborn:    no row of its VM at all;
+//   - live:      down's, still live;
+//   - rewritten: down's, deleted two days ago, the schedule written after;
+//   - plain:     no stack's, deleted two days ago (a failed rebuild leaves this);
+//   - upvm:      live stack up's, deleted two days ago (a blue-green blue);
 //   - @cluster:  a cluster-scoped schedule.
+//
+// Containers (each with a replication schedule into "r"):
+//   - ctgone:  down's, deleted two days ago;
+//   - ctplain: no stack's, deleted two days ago;
+//   - ctup:    live stack up's, deleted two days ago;
+//   - ctmoved: down's tombstone on h1 two days ago, but live on h2.
 func orphanFixture(t *testing.T) *Client {
 	t.Helper()
 	ctx := context.Background()
 	c := testClient(t)
-	old := time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339)
-	for _, vm := range []string{"gone", "recent", "live", "rewritten"} {
-		if err := InsertVM(ctx, c, VMRecord{Name: vm, HostName: "h1", Spec: "{}", State: "stopped"}, nil, nil); err != nil {
+	tornDownStack(t, c, "down")
+	if err := UpsertStack(ctx, c, StackRecord{Name: "up", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	stackOf := map[string]string{"gone": "down", "tie": "down", "recent": "down", "live": "down", "rewritten": "down", "upvm": "up"}
+	for _, vm := range []string{"gone", "tie", "recent", "live", "rewritten", "plain", "upvm"} {
+		if err := InsertVM(ctx, c, VMRecord{Name: vm, StackName: stackOf[vm], HostName: "h1", Spec: "{}", State: "stopped"}, nil, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, vm := range []string{"gone", "recent", "unborn", "live", "rewritten"} {
+	for _, vm := range []string{"gone", "tie", "recent", "unborn", "live", "rewritten", "plain", "upvm"} {
 		if err := UpsertBackupSchedule(ctx, c, BackupScheduleRecord{VMName: vm, Repo: "r", Cron: "0 4 * * *", Enabled: true}); err != nil {
 			t.Fatal(err)
 		}
@@ -36,25 +70,53 @@ func orphanFixture(t *testing.T) *Client {
 	if err := UpsertBackupSchedule(ctx, c, BackupScheduleRecord{VMName: "@cluster", Scope: "cluster", Repo: "r", Cron: "0 4 * * *", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	for _, vm := range []string{"gone", "recent", "rewritten"} {
+	for _, vm := range []string{"gone", "tie", "recent", "rewritten", "plain", "upvm"} {
 		if err := DeleteVM(ctx, c, vm); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, vm := range []string{"gone", "rewritten"} {
-		if err := c.Execute(ctx, `UPDATE vms SET deleted_at = ? WHERE name = ?`, old, vm); err != nil {
-			t.Fatal(err)
-		}
+	for _, vm := range []string{"gone", "tie", "rewritten", "plain", "upvm"} {
+		backdate(t, c, "vms", vm)
 	}
 	if err := UpsertBackupSchedule(ctx, c, BackupScheduleRecord{VMName: "rewritten", Repo: "r", Cron: "0 5 * * *", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
+	// The equal stamp: the schedule last written at the tombstone's own key.
+	if _, err := c.DB().ExecContext(ctx,
+		`UPDATE backup_schedules SET updated_at = (SELECT updated_at FROM vms WHERE name = 'tie') WHERE vm_name = 'tie'`); err != nil {
+		t.Fatal(err)
+	}
+
+	mkCT := func(host, name, stack string) {
+		r := ContainerRecord{HostName: host, Name: name, State: "stopped"}
+		if stack != "" {
+			r.Labels = map[string]string{LabelStack: stack}
+		}
+		if err := UpsertContainer(ctx, c, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mkCT("h1", "ctgone", "down")
+	mkCT("h1", "ctplain", "")
+	mkCT("h1", "ctmoved", "down")
+	mkCT("h1", "ctup", "up")
+	for _, ct := range []string{"ctgone", "ctplain", "ctmoved", "ctup"} {
+		if err := upsertBackupSchedule(ctx, c, BackupScheduleRecord{VMName: ContainerScheduleKey("", ct), Scope: "container",
+			Type: "replication", Repo: "r", TargetPool: "r", Cron: "0 4 * * *", Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := DeleteContainer(ctx, c, "h1", ct); err != nil {
+			t.Fatal(err)
+		}
+		backdate(t, c, "containers", ct)
+	}
+	mkCT("h2", "ctmoved", "down")
 	return c
 }
 
 func orphanNames(t *testing.T, c *Client, now time.Time) string {
 	t.Helper()
-	got, err := OrphanedVMSchedules(context.Background(), c, now, VMScheduleOrphanGrace)
+	got, err := OrphanedStackSchedules(context.Background(), c, now, ScheduleOrphanGrace)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,38 +128,43 @@ func orphanNames(t *testing.T, c *Client, now time.Time) string {
 	return strings.Join(names, ",")
 }
 
-// Only a schedule whose VM row is a tombstone older than the grace, and which
-// was written no later than that tombstone, is an orphan. A schedule of a VM
-// with no row, of a live VM, of a VM deleted inside the grace, one written
-// after the tombstone, and a fan-out scope's are not.
+// Only a schedule of a workload of a torn-down stack, whose tombstone is
+// older than the grace and not older than the schedule, is an orphan. A
+// schedule of a workload that is no stack's or a live stack's (a failed
+// rebuild, a blue-green blue) stays dormant, as it always has.
 //
 // Mutations: drop the grace — "recent" turns up; drop the LWW tie-break —
-// "rewritten" turns up; treat a missing VM row as an orphan — "unborn" turns
-// up.
-func TestOrphanedVMSchedules(t *testing.T) {
+// "rewritten" turns up; make an equal stamp not an orphan (> 0 to >= 0) —
+// "tie" goes; treat a missing VM row as an orphan — "unborn" turns up; drop
+// the torn-down-stack clause — "plain" and "upvm" turn up; drop the
+// container stack checks — "ctplain" or "ctup" turns up; drop the live-row check —
+// "ctmoved" turns up.
+func TestOrphanedStackSchedules(t *testing.T) {
 	c := orphanFixture(t)
-	if got := orphanNames(t, c, time.Now()); got != "gone/r" {
-		t.Fatalf("orphans now = %q, want gone/r", got)
+	want := "@ct:_default/ctgone/r,gone/r,tie/r"
+	if got := orphanNames(t, c, time.Now()); got != want {
+		t.Fatalf("orphans now = %q, want %q", got, want)
 	}
 	// Past the grace the recently deleted VM's schedule is one too.
-	if got := orphanNames(t, c, time.Now().Add(VMScheduleOrphanGrace+time.Hour)); got != "gone/r,recent/r" {
-		t.Fatalf("orphans past the grace = %q, want gone/r,recent/r", got)
+	want = "@ct:_default/ctgone/r,gone/r,recent/r,tie/r"
+	if got := orphanNames(t, c, time.Now().Add(ScheduleOrphanGrace+time.Hour)); got != want {
+		t.Fatalf("orphans past the grace = %q, want %q", got, want)
 	}
 }
 
-// A schedule of a deleted VM does not keep a torn-down stack's repo
-// registered (lab 2, e2e-brepo-59201-1: the warning repeated at every daemon
-// start), while a schedule of a VM with no row yet still does.
+// A schedule of a torn-down stack's deleted VM does not keep that stack's
+// repo registered (lab 2, e2e-brepo-59201-1: the warning repeated at every
+// daemon start), while a schedule of a VM with no row yet still does.
 //
 // Mutation: count every live schedule in scheduledBackupRepos — red.
 func TestDeleteStackBackupRepos_AnOrphanedScheduleDoesNotKeepTheRepo(t *testing.T) {
 	ctx := context.Background()
 	c := testClient(t)
-	old := time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339)
+	tornDownStack(t, c, "s1")
 	if err := UpsertBackupRepo(ctx, c, BackupRepo{Name: "e2erepo", Path: "/tmp/e2erepo", StackName: "s1"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := InsertVM(ctx, c, VMRecord{Name: "gone", HostName: "h1", Spec: "{}", State: "stopped"}, nil, nil); err != nil {
+	if err := InsertVM(ctx, c, VMRecord{Name: "gone", StackName: "s1", HostName: "h1", Spec: "{}", State: "stopped"}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := UpsertBackupSchedule(ctx, c, BackupScheduleRecord{VMName: "gone", Repo: "e2erepo", Cron: "0 4 * * *", Enabled: true}); err != nil {
@@ -106,9 +173,7 @@ func TestDeleteStackBackupRepos_AnOrphanedScheduleDoesNotKeepTheRepo(t *testing.
 	if err := DeleteVM(ctx, c, "gone"); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Execute(ctx, `UPDATE vms SET deleted_at = ? WHERE name = ?`, old, "gone"); err != nil {
-		t.Fatal(err)
-	}
+	backdate(t, c, "vms", "gone")
 	if err := DeleteStackBackupRepos(ctx, c, "s1", nil); err != nil {
 		t.Fatal(err)
 	}

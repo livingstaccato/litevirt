@@ -216,8 +216,10 @@ func (s *Server) DeleteBackupSchedule(ctx context.Context, req *pb.DeleteBackupS
 // (withSchedulesKept).
 type schedulesKeptKey struct{}
 
-// withSchedulesKept marks a delete that keeps the deleted VM's schedules: a
-// blue-green cutover's delete of the blue, whose green serves in its place.
+// withSchedulesKept marks a delete that keeps the deleted workload's
+// schedules: a blue-green cutover's delete of the blue, whose green serves in
+// its place; a failed clone's removal of its staged copy; a compose
+// container re-create's delete.
 func withSchedulesKept(ctx context.Context) context.Context {
 	return context.WithValue(ctx, schedulesKeptKey{}, true)
 }
@@ -233,8 +235,8 @@ func schedulesKept(ctx context.Context) bool {
 // succeeded, so no schedule is left firing for a VM that is gone, or keeping
 // a torn-down stack's backup repo registered (DeleteStackBackupRepos). A
 // rebuild, re-create or cutover keeps them: the VM of the name comes back. A
-// failure is logged and leaves the row to the orphan sweep
-// (sweepVMScheduleOrphans); the delete has happened.
+// failure is logged and leaves the row: the orphan sweep
+// (sweepScheduleOrphans) removes it when the VM was a torn-down stack's.
 func (s *Server) deleteVMSchedules(ctx context.Context, name string) {
 	rows, err := corrosion.ListBackupSchedules(ctx, s.db)
 	if err != nil {
@@ -250,6 +252,39 @@ func (s *Server) deleteVMSchedules(ctx context.Context, name string) {
 			continue
 		}
 		slog.Info("delete: removed the deleted VM's schedule", "vm", name, "repo", r.Repo, "type", r.Type)
+	}
+}
+
+// deleteContainerSchedules is deleteVMSchedules for a container: once a
+// plain delete of container name in project has succeeded, and no live
+// container of that project and name is left anywhere in this replica (a
+// container name is unique per host, not cluster-wide), it tombstones the
+// container's replication schedules, in either key form.
+func (s *Server) deleteContainerSchedules(ctx context.Context, project, name string) {
+	cts, err := corrosion.ListContainers(ctx, s.db, "")
+	if err != nil {
+		slog.Warn("container delete: could not read whether another container holds the name; its schedules stay", "container", name, "error", err)
+		return
+	}
+	for _, ct := range cts {
+		if ct.Name == name && tenancy.NormalizeProject(ct.Project) == tenancy.NormalizeProject(project) {
+			return
+		}
+	}
+	rows, err := corrosion.ListBackupSchedules(ctx, s.db)
+	if err != nil {
+		slog.Warn("container delete: could not read the deleted container's schedules", "container", name, "error", err)
+		return
+	}
+	for _, r := range rows {
+		if !corrosion.ContainerScheduleIs(r, project, name) {
+			continue
+		}
+		if err := s.deleteScheduleRow(ctx, r.VMName, r.Repo); err != nil {
+			slog.Warn("container delete: could not remove the deleted container's schedule", "container", name, "repo", r.Repo, "error", err)
+			continue
+		}
+		slog.Info("container delete: removed the deleted container's schedule", "container", name, "repo", r.Repo)
 	}
 }
 

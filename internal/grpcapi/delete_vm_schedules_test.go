@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/metadata"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/image"
 )
@@ -120,17 +121,26 @@ func TestDeleteVM_ARecreatesOrAForwardedDeleteKeepsTheSchedules(t *testing.T) {
 }
 
 // The orphan sweep: on the failover lease holder only, it tombstones a
-// schedule of a deleted VM once the tombstone is past the grace, and never a
-// schedule of a VM with no row (it may be one replicating ahead of its VM).
+// schedule of a torn-down stack's deleted VM once the tombstone is past the
+// grace. A schedule of a deleted VM that was no stack's (a failed rebuild
+// leaves exactly this: rebuild tombstones through DeleteVMReporting) stays
+// dormant, as does one of a VM with no row.
 //
-// Mutations: sweep without the grace — red; sweep on a non-holder — red.
-func TestSweepVMScheduleOrphans(t *testing.T) {
+// Mutations: sweep without the grace — red; sweep on a non-holder — red;
+// drop the torn-down-stack clause — red ("plain" swept).
+func TestSweepScheduleOrphans(t *testing.T) {
 	setup := func(t *testing.T, holder string) *Server {
 		s, _, _, _ := sweepServer(t, holder)
 		s.SetReleaseFeatureGate(&relGate{t: t, open: true})
 		ctx := context.Background()
-		insertTestVMWithSpec(t, ctx, s.db, "gone", "h", "stopped", "{}")
-		for _, vm := range []string{"gone", "unborn"} {
+		if err := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{Name: "down", State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "gone", StackName: "down", HostName: "h", Spec: "{}", State: "stopped"}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		insertTestVMWithSpec(t, ctx, s.db, "plain", "h", "stopped", "{}")
+		for _, vm := range []string{"gone", "plain", "unborn"} {
 			if err := corrosion.UpsertBackupSchedule(ctx, s.db, corrosion.BackupScheduleRecord{VMName: vm, Repo: "main", Cron: "0 4 * * *", Enabled: true}); err != nil {
 				t.Fatal(err)
 			}
@@ -138,22 +148,103 @@ func TestSweepVMScheduleOrphans(t *testing.T) {
 		if err := corrosion.DeleteVM(ctx, s.db, "gone"); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := corrosion.DeleteVMReporting(ctx, s.db, "plain"); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.DeleteStackRecord(ctx, s.db, "down"); err != nil {
+			t.Fatal(err)
+		}
 		return s
 	}
 	ctx := context.Background()
+	all := "gone/main,plain/main,unborn/main"
 
 	s := setup(t, "")
-	s.sweepVMScheduleOrphans(ctx, time.Now().Add(time.Hour))
-	if got := liveSchedules(t, s); got != "gone/main,unborn/main" {
+	s.sweepScheduleOrphans(ctx, time.Now().Add(time.Hour))
+	if got := liveSchedules(t, s); got != all {
 		t.Fatalf("swept inside the grace: %q", got)
 	}
 	other := setup(t, "someone-else")
-	other.sweepVMScheduleOrphans(ctx, time.Now().Add(48*time.Hour))
-	if got := liveSchedules(t, other); got != "gone/main,unborn/main" {
+	other.sweepScheduleOrphans(ctx, time.Now().Add(48*time.Hour))
+	if got := liveSchedules(t, other); got != all {
 		t.Fatalf("a host that does not hold the failover lease swept: %q", got)
 	}
-	s.sweepVMScheduleOrphans(ctx, time.Now().Add(48*time.Hour))
-	if got := liveSchedules(t, s); got != "unborn/main" {
-		t.Fatalf("after the sweep past the grace: %q, want unborn/main", got)
+	s.sweepScheduleOrphans(ctx, time.Now().Add(48*time.Hour))
+	if got := liveSchedules(t, s); got != "plain/main,unborn/main" {
+		t.Fatalf("after the sweep past the grace: %q, want plain/main,unborn/main", got)
 	}
+}
+
+// scheduledContainerServer is a container ct this host holds with a
+// replication schedule, plus another container's schedule.
+func scheduledContainerServer(t *testing.T) *Server {
+	t.Helper()
+	s, _ := tagsServer(t)
+	s.SetContainerRuntime(&fakeCTRuntime{})
+	ctx := context.Background()
+	for _, name := range []string{"ct", "other"} {
+		if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{HostName: s.hostName, Name: name, State: "stopped"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.UpsertContainerReplicationSchedule(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureContainerReplication),
+			corrosion.BackupScheduleRecord{VMName: corrosion.ContainerScheduleKey("", name), Scope: "container", Type: "replication",
+				Repo: "dr", TargetPool: "dr", Cron: "0 * * * *", Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return s
+}
+
+// A plain container delete tombstones that container's schedules and no
+// other's; a re-create's delete (withSchedulesKept), the owner of a
+// forwarded delete, and a delete of one of two containers holding the name
+// (a move's stale copy) keep them.
+//
+// Mutations: drop the drop call from DeleteContainer — the plain case goes
+// red; drop schedulesKept or isRemotePeer from its predicate — those cases go
+// red; drop the live-holder check in deleteContainerSchedules — the stale-copy
+// case goes red.
+func TestDeleteContainer_SchedulesEndWithAPlainDeleteOnly(t *testing.T) {
+	const both = "@ct:_default/ct/dr,@ct:_default/other/dr"
+	t.Run("plain", func(t *testing.T) {
+		s := scheduledContainerServer(t)
+		if _, err := s.DeleteContainer(adminCtx(), &pb.DeleteContainerRequest{Name: "ct", HostName: s.hostName, Force: true}); err != nil {
+			t.Fatalf("DeleteContainer: %v", err)
+		}
+		if got := liveSchedules(t, s); got != "@ct:_default/other/dr" {
+			t.Fatalf("live schedules after deleting ct = %q", got)
+		}
+	})
+	for what, mk := range map[string]func(t *testing.T, s *Server) context.Context{
+		"re-create": func(t *testing.T, s *Server) context.Context { return withSchedulesKept(adminCtx()) },
+		"forwarded by an older entry": func(t *testing.T, s *Server) context.Context {
+			ctx := context.WithValue(peerCtxFor(t, s, "entry-host"), ctxKeyUsername, "admin")
+			return context.WithValue(ctx, ctxKeyRole, "admin")
+		},
+	} {
+		t.Run(what, func(t *testing.T) {
+			s := scheduledContainerServer(t)
+			if _, err := s.DeleteContainer(mk(t, s), &pb.DeleteContainerRequest{Name: "ct", HostName: s.hostName, Force: true}); err != nil {
+				t.Fatalf("DeleteContainer: %v", err)
+			}
+			if ct, _ := corrosion.GetContainer(context.Background(), s.db, s.hostName, "ct"); ct != nil {
+				t.Fatal("premise: the delete did not happen")
+			}
+			if got := liveSchedules(t, s); got != both {
+				t.Fatalf("the %s delete changed the schedules: %q", what, got)
+			}
+		})
+	}
+	t.Run("stale copy", func(t *testing.T) {
+		s := scheduledContainerServer(t)
+		if err := corrosion.UpsertContainer(context.Background(), s.db, corrosion.ContainerRecord{HostName: "other-host", Name: "ct", State: "running"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.DeleteContainer(adminCtx(), &pb.DeleteContainerRequest{Name: "ct", HostName: s.hostName, Force: true}); err != nil {
+			t.Fatalf("DeleteContainer: %v", err)
+		}
+		if got := liveSchedules(t, s); got != both {
+			t.Fatalf("deleting the stale copy dropped the live container's schedule: %q", got)
+		}
+	})
 }

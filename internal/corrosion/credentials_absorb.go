@@ -66,7 +66,12 @@ type secretWrite struct {
 
 // absorbUnlatchedSecretWrite absorbs every secret the entry sets without a
 // paired credential statement. See the block comment above.
-func absorbUnlatchedSecretWrite(ctx context.Context, tx *sql.Tx, stmts []Statement, mayInsert bool) error {
+//
+// pre is the hosts rows as they stood before the entry (readEntryHostRows):
+// a host password takes the retirement it lands on only over the admission
+// that retirement belongs to, as an operator's paired write does
+// (planCredentialUpsert).
+func absorbUnlatchedSecretWrite(ctx context.Context, tx *sql.Tx, stmts []Statement, mayInsert bool, pre entryHostRows) error {
 	paired := map[string]bool{}
 	for _, sc := range secretColumns {
 		paired[sc.credTable] = entryWritesTable(stmts, sc.credTable)
@@ -76,7 +81,7 @@ func absorbUnlatchedSecretWrite(ctx context.Context, tx *sql.Tx, stmts []Stateme
 		if !ok || paired[w.col.credTable] || w.value == "" || w.ts == "" || w.key == "" {
 			continue
 		}
-		if err := absorbSecret(ctx, tx, w.col, w.key, w.value, w.ts, mayInsert); err != nil {
+		if err := absorbSecret(ctx, tx, w.col, w.key, w.value, w.ts, mayInsert, pre); err != nil {
 			return fmt.Errorf("absorb %s.%s: %w", w.col.parent, w.col.column, err)
 		}
 	}
@@ -87,7 +92,7 @@ func absorbUnlatchedSecretWrite(ctx context.Context, tx *sql.Tx, stmts []Stateme
 // with mayInsert false it only updates a row that already exists. The parent
 // must exist and be live: absorbing a deleted user's or revoked token's hash
 // would give it a credential no latched writer would.
-func absorbSecret(ctx context.Context, tx *sql.Tx, col secretColumn, key, value, updatedAt string, mayInsert bool) error {
+func absorbSecret(ctx context.Context, tx *sql.Tx, col secretColumn, key, value, updatedAt string, mayInsert bool, pre entryHostRows) error {
 	var live int
 	err := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM `+col.parent+` WHERE `+col.parentPK+` = ? AND deleted_at IS NULL`, key).Scan(&live)
@@ -117,6 +122,13 @@ func absorbSecret(ctx context.Context, tx *sql.Tx, col secretColumn, key, value,
 			return lerr
 		}
 		evidence = local.order().retirement
+		// Over a retirement whose admission this node's hosts row has not
+		// reached, the write is another admission's: it is not absorbed, and
+		// the row keeps its place in the order.
+		if evidence != "" && !pre[key].admissionAtOrAfter(evidence) {
+			noteRetiredCredentialKept(key, "a password write on a hosts row older than the retirement")
+			return nil
+		}
 	}
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO `+col.credTable+` (`+col.credPK+`, `+col.column+`, updated_at, deleted_at)

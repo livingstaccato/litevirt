@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -655,5 +656,156 @@ func TestHostIncarnation_ARefusedEntrysCredentialIsSkipped(t *testing.T) {
 		Statement{SQL: HostFenceCredentialUpsertSQL, Params: []interface{}{"host-x", "new-pass", ts}})
 	if got := oneString(t, c, `SELECT COALESCE((SELECT ipmi_pass FROM host_fence_credentials WHERE host_name = 'host-x'), '') AS p`, "p"); got != "new-pass" {
 		t.Errorf("a credential alone in its entry did not land: %q", got)
+	}
+}
+
+// incCredentialRow reads host-x's credential row: its password, whether it is
+// live, and its retirement evidence.
+func incCredentialRow(t *testing.T, c *Client) (pass string, live bool, after string) {
+	t.Helper()
+	rows, err := c.Query(context.Background(),
+		`SELECT ipmi_pass, deleted_at, after_retirement FROM host_fence_credentials WHERE host_name = 'host-x'`)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("read host-x's credential row: %d rows, %v", len(rows), err)
+	}
+	return rows[0].String("ipmi_pass"), rows[0].String("deleted_at") == "", rows[0].String("after_retirement")
+}
+
+// laggingConfigure is a `lv host config --ipmi-pass` entry from a node still
+// on host-x's old admission (no envelope: incarnation 0), at ts.
+func laggingConfigure(pass, ts string) []Statement {
+	return []Statement{
+		{SQL: `UPDATE hosts SET ipmi_pass = ?, updated_at = ? WHERE name = ?`, Params: []interface{}{pass, ts, "host-x"}},
+		{SQL: HostFenceCredentialUpsertSQL, Params: []interface{}{"host-x", pass, ts}},
+	}
+}
+
+func retirementOf(t *testing.T, c *Client) string {
+	t.Helper()
+	return oneString(t, c, `SELECT deleted_at FROM host_fence_credentials WHERE host_name = 'host-x'`, "deleted_at")
+}
+
+// Re-review 4, m-4: an up-to-date node that holds the re-admission's
+// tombstone skips a lagging configure's credential, whatever its clock, and
+// no row carries the re-admission's retirement as evidence.
+func TestHostIncarnation_ARefusedEntrysCredentialLeavesTheTombstone(t *testing.T) {
+	_, entry := admittedV2(t)
+	c := newTestDB(t)
+	oldIncarnation(t, c)
+	applyRemote(t, c, "2999000000000-0000-admitter", entry...)
+	retired := retirementOf(t, c)
+	if _, live, _ := incCredentialRow(t, c); live || retired == "" {
+		t.Fatal("fixture: the re-admission did not retire host-x's credential")
+	}
+	applyRemote(t, c, "2999000000001-0000-lagging", laggingConfigure("old-pass", "2999-01-01T00:00:00.000000000Z")...)
+	if pass, live, after := incCredentialRow(t, c); live || pass != "" || after == retired {
+		t.Errorf("credential row = (%q, live %v, after %q); want the tombstone, carrying no evidence", pass, live, after)
+	}
+}
+
+// Re-review 4, m-2: the skip does not depend on the order of the entry. The
+// clear pass writes the upsert ahead of its hosts clear; over no credential
+// row the upsert would otherwise land before the clear is refused.
+func TestHostIncarnation_ARefusedClearPassSkipsTheUpsertAheadOfIt(t *testing.T) {
+	_, entry := admittedV2(t)
+	c := newTestDB(t)
+	oldIncarnation(t, c)
+	applyRemote(t, c, "2999000000000-0000-admitter", entry...)
+	if _, err := c.DB().Exec(`DELETE FROM host_fence_credentials WHERE host_name = 'host-x'`); err != nil {
+		t.Fatal(err)
+	}
+	const ts = "2999-01-01T00:00:00.000000000Z"
+	applyRemote(t, c, "2999000000001-0000-lagging",
+		Statement{SQL: HostFenceCredentialUpsertSQL, Params: []interface{}{"host-x", "old-pass", ts}},
+		Statement{SQL: hostsClearIPMIPassSQL, Params: []interface{}{"", "2999-01-01T00:00:00.000000001Z", "host-x"}})
+	if pass, ok := liveCredential(t, c); ok {
+		t.Errorf("a refused clear pass's upsert landed: %q", pass)
+	}
+}
+
+// Re-review 4, m-1: a node whose hosts row lags the re-admission, while its
+// credential row already holds the re-admission's tombstone (its sensitive
+// pull ran, its public one did not), gives a lagging operator write no
+// evidence, on the WAL apply path and on its own write path. The same write
+// on the re-admission's row does carry it.
+func TestCredential_ALaggingHostsRowGivesAnOperatorWriteNoEvidence(t *testing.T) {
+	ctx := context.Background()
+	a, _ := admittedV2(t)
+	retired := retirementOf(t, a)
+	const ts = "2999-01-01T00:00:00.000000000Z"
+	// lagging is a node at host-x's old admission, live and older than the
+	// retirement, holding the re-admission's tombstone.
+	lagging := func(t *testing.T, n int64) *Client {
+		c := newTestDB(t)
+		oldIncarnation(t, c)
+		if _, err := c.DB().Exec(`UPDATE hosts SET deleted_at = NULL, incarnation = ?,
+			created_at = '2026-01-01T00:00:00.000000000Z', updated_at = '2026-01-02T00:00:00.000000000Z'
+			WHERE name = 'host-x'`, n); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.DB().Exec(`UPDATE host_fence_credentials SET ipmi_pass = '', deleted_at = ?, updated_at = ?,
+			after_retirement = '' WHERE host_name = 'host-x'`, retired, retired); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	for _, n := range []int64{0, 1} {
+		t.Run(fmt.Sprintf("apply, hosts row at %d", n), func(t *testing.T) {
+			c := lagging(t, n)
+			stmts := laggingConfigure("old-pass", ts)
+			if n > 0 {
+				// Written against the row this node holds, so only the
+				// evidence rule decides.
+				stmts[0].HostIncarnation = &HostIncarnation{N: n, At: "2026-01-01T00:00:00.000000000Z"}
+			}
+			applyRemote(t, c, "2999000000001-0000-lagging", stmts...)
+			if pass, live, after := incCredentialRow(t, c); live || after == retired {
+				t.Errorf("credential row = (%q, live %v, after %q); want the tombstone", pass, live, after)
+			}
+		})
+		t.Run(fmt.Sprintf("local write, hosts row at %d", n), func(t *testing.T) {
+			c := lagging(t, n)
+			if err := c.ExecuteBatch(ctx, laggingConfigure("old-pass", ts)); err != nil {
+				t.Fatal(err)
+			}
+			if pass, live, after := incCredentialRow(t, c); live || after == retired {
+				t.Errorf("credential row = (%q, live %v, after %q); want the tombstone", pass, live, after)
+			}
+		})
+	}
+	t.Run("the re-admission's own row", func(t *testing.T) {
+		if err := a.ExecuteBatch(ctx, laggingConfigure("new-pass", ts)); err != nil {
+			t.Fatal(err)
+		}
+		if pass, live, after := incCredentialRow(t, a); !live || pass != "new-pass" || after != retired {
+			t.Errorf("credential row = (%q, live %v, after %q); want new-pass carrying %s", pass, live, after, retired)
+		}
+	})
+}
+
+// Re-review 4, m-4: the skip never loses a legitimate write for good. A node
+// that has not applied the re-admission skips the new admission's password
+// (its hosts write is a newer incarnation's); once the re-admission and one
+// sensitive merge reach it, it holds the password.
+func TestHostIncarnation_ASkippedNewerPasswordArrivesByAntiEntropy(t *testing.T) {
+	ctx := context.Background()
+	a, entry := admittedV2(t)
+	const ts = "2999-01-01T00:00:00.000000000Z"
+	if err := a.ExecuteBatch(ctx, laggingConfigure("new-pass", ts)); err != nil {
+		t.Fatal(err)
+	}
+	set := incLastEntry(t, a)
+	c := newTestDB(t)
+	oldIncarnation(t, c)
+	applyRemote(t, c, "2999000000001-0000-admitter", set...)
+	if pass, ok := liveCredential(t, c); ok && pass == "new-pass" {
+		t.Fatal("fixture: a node at the old admission applied the new one's password")
+	}
+	applyRemote(t, c, "2999000000000-0000-admitter", entry...)
+	if err := c.MergeSensitiveStateBytesLWW(a.DumpSensitiveStateBytes()); err != nil {
+		t.Fatal(err)
+	}
+	if pass, ok := liveCredential(t, c); !ok || pass != "new-pass" {
+		t.Errorf("after the re-admission and a sensitive merge the password is %q (live %v), want new-pass", pass, ok)
 	}
 }

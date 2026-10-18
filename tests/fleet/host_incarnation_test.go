@@ -748,3 +748,89 @@ func TestFleet_HostIncarnation_RemoveAnIsolatedPeerOfTwo(t *testing.T) {
 		t.Errorf("%s still lists %s", a.Name, b.Name)
 	}
 }
+
+// Merge with credential retirement: a partitioned node that still holds d's
+// old admission runs `lv host config --ipmi-pass` after d's re-add. On every
+// node that holds the re-admission its hosts write is refused as another
+// incarnation's, and the credential that rides with it is skipped, so after
+// the heal and anti-entropy every node holds d's credential retired, with
+// equal digests. Mutation: drop the skip — the lagging password is live
+// everywhere.
+func TestFleet_HostIncarnation_ALaggingPasswordSetAfterAReaddStaysRetired(t *testing.T) {
+	ctx := context.Background()
+	c, gates := latchedFleet(t, 4, 3740)
+	latchReleaseToken(t, c, gates)
+	seedIncPeers(c, gates)
+	useRawGossip(c)
+	a, b, n, d := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3]
+	live := []*Node{a, b, n}
+	for _, x := range c.Nodes {
+		x.DB.SetCredentialsSplitGate(func() bool { return true })
+	}
+	const oldPass, laggingPass = "Old-Machine-Pass-3740", "Lagging-Pass-3740"
+	if _, err := c.SelfClient(a).ConfigureHost(ctx, &pb.ConfigureHostRequest{
+		Name: d.Name, FenceStrategy: "ipmi", IpmiAddress: "10.77.1.15", IpmiUser: "probe", IpmiPass: oldPass,
+	}); err != nil {
+		t.Fatalf("configure IPMI on %s: %v", d.Name, err)
+	}
+	c.WaitConverged(t, convergeTimeout, live...)
+
+	// d goes; n is cut off; a removes d and admits its name again at 1.
+	c.Crash(d)
+	c.Partition(n, a)
+	c.Partition(n, b)
+	if err := corrosion.DeleteHost(ctx, a.DB, d.Name); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := corrosion.AdmitHostV2(ctx, a.DB, corrosion.HostRecord{
+		Name: d.Name, Address: d.Address, SSHUser: "root", SSHPort: 22, GRPCPort: d.Port,
+		State: corrosion.HostStateJoining, CertSerial: "0a0b3740",
+	}, capabilities.GrantForTest(t, capabilities.FeatureHostIncarnation)); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, convergeTimeout, "the re-admission on b", func() bool {
+		h, err := corrosion.GetHost(ctx, b.DB, d.Name)
+		return err == nil && h != nil && h.CertSerial == "0a0b3740" && h.IPMIPassRetired
+	})
+
+	// n, still on d's old admission, sets a password for it.
+	if _, err := c.SelfClient(n).ConfigureHost(ctx, &pb.ConfigureHostRequest{Name: d.Name, IpmiPass: laggingPass}); err != nil {
+		t.Fatalf("the lagging configure on %s: %v", n.Name, err)
+	}
+	if fs := fenceSettingsOf(t, n, d.Name); fs.pass != laggingPass {
+		t.Fatalf("fixture: %s reads %s's password as %s, want the lagging one", n.Name, d.Name, redacted(fs.pass))
+	}
+
+	c.Heal(n, a)
+	c.Heal(n, b)
+	deadline := time.Now().Add(2 * convergeTimeout)
+	for {
+		for _, x := range live {
+			corrosion.NewAntiEntropy(x.DB, x.PKIDir, 0).RunOnce(ctx)
+		}
+		apart, err := divergence(live)
+		if err != nil {
+			t.Fatalf("divergence: %v", err)
+		}
+		if len(apart) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the live nodes did not converge; tables still apart: %v", apart)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	for _, x := range live {
+		h, err := corrosion.GetHost(ctx, x.DB, d.Name)
+		if err != nil || h == nil {
+			t.Fatalf("%s: GetHost(%s) = %v", x.Name, d.Name, err)
+		}
+		if !h.IPMIPassRetired || h.IPMIPass != "" {
+			t.Errorf("%s serves %s's password as %s (retired %v); want the re-admission's retirement",
+				x.Name, d.Name, redacted(h.IPMIPass), h.IPMIPassRetired)
+		}
+		if got := hostsRowOf(t, x, d.Name); got["incarnation"] != "1" || got["cert_serial"] != "0a0b3740" {
+			t.Errorf("%s holds %s as %v; want the re-admission at 1", x.Name, d.Name, got)
+		}
+	}
+}

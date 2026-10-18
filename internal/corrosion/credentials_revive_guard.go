@@ -135,7 +135,16 @@ type credentialUpsertPlan struct {
 //     that carries one, unless it is that row's own re-emission (same password
 //     and clock: the clear pass hands its row to its stream ahead of the
 //     clear).
-func planCredentialUpsert(ctx context.Context, tx *sql.Tx, s Statement, entry []Statement) (credentialUpsertPlan, error) {
+//
+// An operator's write takes the held retirement only when this node's hosts
+// row, as it stood before the entry (pre), is the admission that retirement
+// belongs to or a later one (admissionAtOrAfter). A node whose hosts row lags
+// the re-admission while its credential row already holds the re-admission's
+// tombstone (the sensitive anti-entropy pull ran, the public one did not)
+// would otherwise hand a lagging operator write from the OLD admission the
+// NEW retirement as evidence, and the old machine's password would then win
+// everywhere. Such a write is treated as carrying no evidence.
+func planCredentialUpsert(ctx context.Context, tx *sql.Tx, s Statement, entry []Statement, pre entryHostRows) (credentialUpsertPlan, error) {
 	if !strings.Contains(s.SQL, "host_fence_credentials") {
 		return credentialUpsertPlan{}, nil
 	}
@@ -157,7 +166,7 @@ func planCredentialUpsert(ctx context.Context, tx *sql.Tx, s Statement, entry []
 		return plan, nil
 	}
 	held := local.order().retirement
-	if entryWritesHostPassword(entry, host) {
+	if entryWritesHostPassword(entry, host) && (held == "" || pre[host].admissionAtOrAfter(held)) {
 		plan.evidence = held
 		return plan, nil
 	}
@@ -169,6 +178,104 @@ func planCredentialUpsert(ctx context.Context, tx *sql.Tx, s Statement, entry []
 	}
 	noteRetiredCredentialKept(host, "an entry with no operator password write")
 	return credentialUpsertPlan{skip: true}, nil
+}
+
+// entryHostRow is a host's hosts row as it stood before an entry applied.
+type entryHostRow struct {
+	found, deleted       bool
+	n                    int64
+	createdAt, updatedAt string
+}
+
+// entryHostRows are the hosts rows of the hosts an entry's credential upserts,
+// or its hosts password writes, name, read before any statement of the entry
+// runs.
+type entryHostRows map[string]entryHostRow
+
+// readEntryHostRows reads, before an entry applies, the hosts row of every
+// host one of its credential upserts or hosts password writes names.
+func readEntryHostRows(ctx context.Context, tx *sql.Tx, entry []Statement) (entryHostRows, error) {
+	var out entryHostRows
+	for _, s := range entry {
+		host := credentialUpsertHost(s)
+		if host == "" {
+			if w, ok := secretWriteOf(s); ok && w.col.parent == "hosts" {
+				host = w.key
+			}
+		}
+		if host == "" {
+			continue
+		}
+		if _, ok := out[host]; ok {
+			continue
+		}
+		if out == nil {
+			out = entryHostRows{}
+		}
+		var r entryHostRow
+		var created, updated, deleted sql.NullString
+		err := tx.QueryRowContext(ctx,
+			`SELECT incarnation, created_at, updated_at, deleted_at FROM hosts WHERE name = ?`, host).
+			Scan(&r.n, &created, &updated, &deleted)
+		switch {
+		case err == sql.ErrNoRows:
+		case err != nil:
+			return nil, err
+		default:
+			r.found = true
+			r.createdAt, r.updatedAt = created.String, updated.String
+			r.deleted = deleted.Valid && deleted.String != ""
+		}
+		out[host] = r
+	}
+	return out, nil
+}
+
+// addMissing adds every host of more that r does not hold yet: the row before
+// the first entry that named it.
+func (r entryHostRows) addMissing(more entryHostRows) entryHostRows {
+	for h, row := range more {
+		if r == nil {
+			r = entryHostRows{}
+		}
+		if _, ok := r[h]; !ok {
+			r[h] = row
+		}
+	}
+	return r
+}
+
+// admissionAtOrAfter reports whether the hosts row is the admission that
+// retirement held belongs to, or a later one.
+//
+//   - A re-admission's row starts at the retirement's own instant: a V2
+//     re-admission's created_at is ReadmitStamp of its updated_at, and a
+//     legacy one's is rewritten to it (stampReadmitIncarnation). So a row
+//     created at or after held is that admission or a later one.
+//   - At incarnation 0 a row re-admitted by a previous build kept its first
+//     created_at; its updated_at, which the re-admission set to held, is then
+//     what shows it has seen the retirement. (Not at 1 or higher: every such
+//     row was admitted by this build, with its created_at stamped.)
+//   - A removed row, or none, is no admission an operator writes for.
+func (r entryHostRow) admissionAtOrAfter(held string) bool {
+	if !r.found || r.deleted {
+		return false
+	}
+	if notBefore(r.createdAt, held) {
+		return true
+	}
+	return r.n == 0 && notBefore(r.updatedAt, held)
+}
+
+// notBefore reports whether ts is at or after held, by instant (a re-admission
+// stamps created_at in RFC3339 from an updated_at that may be an HLC).
+func notBefore(ts, held string) bool {
+	a, aok := tsInstant(ts)
+	b, bok := tsInstant(held)
+	if aok && bok {
+		return cmpInstants(a, b) >= 0
+	}
+	return lwwOrder(ts, held) >= 0
 }
 
 // credentialUpsertHost is the host a HostFenceCredentialUpsertSQL statement

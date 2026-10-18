@@ -618,15 +618,15 @@ auth:
   #     needs `lv host rm` then `lv host add`;
   #   - a certificate swapped while the daemon runs, not by a renewal, is held
   #     until the daemon restarts, and then as above.
-  # Leave this switch on until every such host has re-recorded or been re-added.
-  # But if those recorded serials
-  # have ALREADY gone stale fleet-wide, every daemon refuses every peer
-  # ("replication RPC requires peer mTLS") and the cluster cannot repair itself:
-  # the correction has to replicate, and replication is what is being refused.
+  # But if those recorded serials have ALREADY gone stale fleet-wide, every
+  # daemon refuses every peer ("replication RPC requires peer mTLS") and the
+  # cluster cannot repair itself: the correction has to replicate, and
+  # replication is what is being refused.
   #
   # Set true on EVERY node to break that deadlock — a mismatch is then logged and
   # admitted for CA-issued HOST certificates instead of refused — wait for the
-  # fleet to replicate, then set it back to false. It never relaxes the removal
+  # fleet to replicate, then set it back to false — only once every host above
+  # has re-recorded or been re-added. It never relaxes the removal
   # tombstone (a decommissioned host stays out) and never lets a distributable
   # client certificate act as a peer. While it is on it ALSO turns off the
   # recovery-claim serial pin (accepts signed with a renewal's replaced key

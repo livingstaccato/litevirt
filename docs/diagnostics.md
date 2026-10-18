@@ -2113,18 +2113,25 @@ If it does not clear:
 **`reason` `superseded`** is a host whose admission another `lv host add` of
 the same name replaced. Peers no longer accept its certificate. To recover:
 
-1. On the superseded machine, read `installed_serial` and `recorded_serial`
-   from `lv health`. On another node, `lv host inspect <name>` shows the
-   recorded serial.
+1. On another node, run `lv host inspect <name>` and note the serial it shows.
+   That is the cluster's admission for the name, and it is the serial every
+   step below means. Do not use `recorded_serial` from `lv health` on the
+   superseded machine: it is that machine's own replica, which may be stale.
 2. Stop the litevirt daemon on the superseded machine, outside the cluster,
    and confirm that its workloads are stopped.
-3. If the machine that holds the recorded serial is the one to keep, wipe the
-   superseded machine's data directory before adding it under any name.
-4. If no machine holds the recorded serial, or it is the machine to remove,
-   run `lv host rm --dead <name>` only after step 2 is confirmed, then run
-   `lv host add` for the machine to keep. `lv host add` is refused while
-   workloads are still recorded on the name; `lv health` shows
-   `ha.claim.stranded` for any the failover coordinator cannot recover.
+3. Find the machine that **holds** the serial from step 1, running or powered
+   off: its `<pki_dir>/host.crt` carries that serial
+   (`openssl x509 -noout -serial -in <pki_dir>/host.crt` prints it in upper
+   case). A machine that is powered off still holds its admission. If it is
+   the machine to keep, leave the name alone: wipe the superseded machine's
+   data directory before adding it under any name.
+4. Run `lv host rm --dead <name>` only when step 3 found no machine, running
+   or powered off, that holds the serial from step 1, or when the operator has
+   decided to retire the machine that holds it (stopped, as in step 2). Run it
+   only after step 2 is confirmed, then run `lv host add` for the machine to
+   keep. `lv host add` is refused while workloads are still recorded on the
+   name; `lv health` shows `ha.claim.stranded` for any the failover
+   coordinator cannot recover.
 
 **`reason` `removed`** is a host removed while its daemon runs. It clears if
 the host is re-added and its re-admission reaches it.

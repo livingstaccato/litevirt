@@ -1458,11 +1458,20 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 	var mutated []Statement
 	var parks []func() // see executeBatchInternal
 	relays := make([][]Statement, 0, len(entries))
+	var allCredHosts entryHostRows // every entry's, for the absorb below
 	for _, stmts := range entries {
 		relay := make([]Statement, 0, len(stmts))
+		// See executeBatchInternal.
+		credHosts, err := readEntryHostRows(ctx, tx, stmts)
+		if err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return false, err
+		}
+		allCredHosts = allCredHosts.addMissing(credHosts)
 		for _, s := range stmts {
 			// See executeBatchInternal (credentials_revive_guard.go).
-			credPlan, err := planCredentialUpsert(ctx, tx, s, stmts)
+			credPlan, err := planCredentialUpsert(ctx, tx, s, stmts, credHosts)
 			if err != nil {
 				tx.Rollback()
 				c.mu.Unlock()
@@ -1538,7 +1547,7 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 	// nothing locally.
 	// A secret this node writes without its credential statement (its gate is
 	// closed) also refreshes the credential row it holds (credentials_absorb.go).
-	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables()); err != nil {
+	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables(), allCredHosts); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return false, err
@@ -1677,10 +1686,18 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	var mutated []Statement // statements that changed ≥1 row (for unresolved-clear)
 	var parks []func()      // updates that met no row because it has not arrived yet
 	relay := make([]Statement, 0, len(stmts))
+	// The credential upserts' hosts rows, before the batch
+	// (planCredentialUpsert).
+	credHosts, err := readEntryHostRows(ctx, tx, stmts)
+	if err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return 0, err
+	}
 	for _, s := range stmts {
 		// A fence credential carries the retirement it was set after
 		// (credentials_revive_guard.go).
-		credPlan, err := planCredentialUpsert(ctx, tx, s, stmts)
+		credPlan, err := planCredentialUpsert(ctx, tx, s, stmts, credHosts)
 		if err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
@@ -1742,7 +1759,7 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	// must not be replayed by a peer. See relayStatement.
 	// A secret this node writes without its credential statement (its gate is
 	// closed) also refreshes the credential row it holds (credentials_absorb.go).
-	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables()); err != nil {
+	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables(), credHosts); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return 0, err

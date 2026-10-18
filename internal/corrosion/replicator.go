@@ -1488,7 +1488,21 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 	// (release_features.go).
 	r.client.noteReleaseUseStatements(stmts)
 	refusedIncarnation := map[int]bool{}
-	refusedHosts := map[string]bool{}
+	// The hosts writes this node refuses as another incarnation's, decided
+	// over the whole entry against the rows as they stand before it applies,
+	// so a credential upsert is skipped with one whichever comes first in the
+	// entry (the clear pass writes the upsert ahead of its hosts clear). No
+	// emitter puts a re-admission and a write of the same host in one entry,
+	// so the verdicts are the ones the loop reaches.
+	refusedHosts, err := r.refusedHostsInEntry(ctx, tx, stmts)
+	if err != nil {
+		return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+	}
+	// The credential upserts' hosts rows, before the entry (planCredentialUpsert).
+	credHosts, err := readEntryHostRows(ctx, tx, stmts)
+	if err != nil {
+		return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+	}
 	for i, s := range stmts {
 		if releaseUseApplyHook != nil {
 			releaseUseApplyHook(s)
@@ -1514,13 +1528,16 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 		}
 		// A fence credential carries the retirement it was set after
 		// (credentials_revive_guard.go). One that rides with a hosts write
-		// this node refused as another incarnation's is that admission's
-		// credential, not this one's: it is skipped with it, and an entry
-		// whose password write was refused is not an operator write here.
+		// this node refuses as another incarnation's — before or after it in
+		// the entry — is that admission's credential, not this one's: it is
+		// skipped with it, and an entry whose password write was refused is
+		// not an operator write here. What this cannot reach: an upsert alone
+		// in its entry (the copy pass), which credrevive decides by the row
+		// this node holds — over no row, it applies.
 		if host := credentialUpsertHost(s); host != "" && refusedHosts[host] {
 			continue
 		}
-		credPlan, err := planCredentialUpsert(ctx, tx, s, withoutIndexes(stmts, refusedIncarnation))
+		credPlan, err := planCredentialUpsert(ctx, tx, s, withoutRefusedHosts(stmts, refusedHosts), credHosts)
 		if err != nil {
 			return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
 		} else if credPlan.skip {
@@ -1564,7 +1581,7 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 	// credential row readers use (credentials_absorb.go). A users row the
 	// re-mint floor refused did not apply here, so it has nothing to absorb.
 	applied := withoutIndexes(stmts, refusedIncarnation)
-	if err := absorbUnlatchedSecretWrite(ctx, tx, withoutRefusedRemints(applied, refusedRemints), r.client.MayWriteCredentialTables()); err != nil {
+	if err := absorbUnlatchedSecretWrite(ctx, tx, withoutRefusedRemints(applied, refusedRemints), r.client.MayWriteCredentialTables(), credHosts); err != nil {
 		slog.Error("replicator: absorbing an unlatched secret write failed — back-pressuring replication",
 			"origin", entry.Origin, "seq", entry.Seq, "error", err)
 		return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
@@ -4400,6 +4417,43 @@ func (r *Replicator) hostsIncarnationRefusalOf(ctx context.Context, tx *sql.Tx, 
 	// A V2 re-admission is refused here only for an envelope that is not its
 	// parameters; its key is decided by its own WHERE, in the apply.
 	return hostsIncarnationRefusal(ctx, tx, s, sh)
+}
+
+// refusedHostsInEntry is the hosts whose hosts writes in the entry this node
+// refuses as another incarnation's, judged against the rows as they stand
+// before the entry applies.
+func (r *Replicator) refusedHostsInEntry(ctx context.Context, tx *sql.Tx, stmts []Statement) (map[string]bool, error) {
+	out := map[string]bool{}
+	for _, s := range stmts {
+		name := hostsStatementHost(s)
+		if name == "" {
+			continue
+		}
+		reason, err := r.hostsIncarnationRefusalOf(ctx, tx, s)
+		if err != nil {
+			return nil, err
+		}
+		if reason != "" {
+			out[name] = true
+		}
+	}
+	return out, nil
+}
+
+// withoutRefusedHosts is the entry without its hosts statements for the
+// refused hosts.
+func withoutRefusedHosts(stmts []Statement, refused map[string]bool) []Statement {
+	if len(refused) == 0 {
+		return stmts
+	}
+	out := make([]Statement, 0, len(stmts))
+	for _, s := range stmts {
+		if name := hostsStatementHost(s); name != "" && refused[name] {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 // hostsStatementHost is the host a single-row hosts statement writes, "" for

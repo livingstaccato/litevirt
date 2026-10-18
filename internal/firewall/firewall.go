@@ -1342,7 +1342,10 @@ func allRules(p Plan) []Rule {
 // FromCorrosionRule converts the on-disk SGRule struct into the typed
 // Rule the renderer consumes. Empty / default fields collapse to the
 // most permissive option — same convention the corrosion helpers use
-// when persisting.
+// when persisting. A stored action in the server's log form
+// ("drop+log") is its verdict with Log set; a bare "+log" names no verdict
+// and is kept as written, so it is judged unreadable rather than read as an
+// accept.
 func FromCorrosionRule(direction, proto, portRange, cidr, action string) Rule {
 	dir := Direction(strings.ToLower(direction))
 	if dir != Egress {
@@ -1350,6 +1353,10 @@ func FromCorrosionRule(direction, proto, portRange, cidr, action string) Rule {
 	}
 	if proto == "" {
 		proto = "all"
+	}
+	logged := false
+	if verdict, ok := rulefield.LogActionVerdict(action); ok && verdict != "" {
+		action, logged = verdict, true
 	}
 	act := Action(strings.ToLower(action))
 	if act == "" {
@@ -1361,5 +1368,6 @@ func FromCorrosionRule(direction, proto, portRange, cidr, action string) Rule {
 		PortRange: portRange,
 		CIDR:      cidr,
 		Action:    act,
+		Log:       logged,
 	}
 }

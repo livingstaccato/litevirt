@@ -24,11 +24,14 @@ import (
 // re-reconciles immediately so `lv firewall …` changes are visible at once;
 // every other host picks them up on its own 30s reconcile tick.
 
+// toPbFirewallRule is a stored rule as the API shows it: a logged rule's
+// plain verdict and log, never the stored suffix (spec m-13).
 func toPbFirewallRule(r corrosion.FirewallRule) *pb.FirewallRule {
+	action, logged := corrosion.SplitLoggedAction(r.Action)
 	return &pb.FirewallRule{
 		Id: r.ID, HostName: r.HostName, Direction: r.Direction, Proto: r.Proto,
-		Port: r.PortRange, Cidr: r.CIDR, Action: r.Action, Priority: int32(r.Priority),
-		Comment: r.Comment, StackName: r.StackName,
+		Port: r.PortRange, Cidr: r.CIDR, Action: action, Priority: int32(r.Priority),
+		Comment: r.Comment, StackName: r.StackName, Log: logged,
 	}
 }
 
@@ -118,6 +121,18 @@ func ruleRowFeatures(direction, proto, port, cidr, action, comment string) ([]ca
 		return nil, err
 	}
 	return corrosion.FirewallRowFeatures(cidr, proto, action)
+}
+
+// logRow is a client rule's stored action and release features once its log
+// field is applied: a rule asked to log (log=true) is stored with the
+// server's suffix (corrosion.LoggedAction) and needs firewall_log. It is
+// applied only to a rule ruleRowFeatures took, which refused a client's own
+// "+" suffix.
+func logRow(action string, log bool, need []capabilities.Feature, invalid error) (string, []capabilities.Feature) {
+	if !log || invalid != nil {
+		return action, need
+	}
+	return corrosion.LoggedAction(action), append(slices.Clone(need), capabilities.FeatureFirewallLog)
 }
 
 // ipSetRowFeatures is ruleRowFeatures for an ip set: the grammar, then
@@ -247,6 +262,7 @@ func (s *Server) CreateClusterFirewallRule(ctx context.Context, req *pb.CreateCl
 	}
 	row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
 	need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, row.Comment)
+	row.Action, need = logRow(row.Action, r.Log, need, invalid)
 	if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
 		if err := s.refuseUnknownTagGroup(ctx, row.CIDR); err != nil {
 			return err
@@ -307,6 +323,7 @@ func (s *Server) CreateHostFirewallRule(ctx context.Context, req *pb.CreateHostF
 	}
 	row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
 	need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, row.Comment)
+	row.Action, need = logRow(row.Action, r.Log, need, invalid)
 	if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
 		if err := s.refuseUnknownTagGroup(ctx, row.CIDR); err != nil {
 			return err

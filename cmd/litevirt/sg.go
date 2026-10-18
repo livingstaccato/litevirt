@@ -204,9 +204,10 @@ func listSecurityGroupsLocal(ctx context.Context, req *pb.ListSecurityGroupsRequ
 	resp := &pb.ListSecurityGroupsResponse{}
 	var unattributed []corrosion.SGRule
 	toPb := func(r corrosion.SGRule) *pb.SecurityGroupRule {
+		action, logged := corrosion.SplitLoggedAction(r.Action)
 		return &pb.SecurityGroupRule{
 			Id: r.ID, SgId: r.SGID, Direction: r.Direction, Proto: r.Proto,
-			Port: r.PortRange, Cidr: r.CIDR, Action: r.Action, Priority: int32(r.Priority),
+			Port: r.PortRange, Cidr: r.CIDR, Action: action, Priority: int32(r.Priority), Log: logged,
 		}
 	}
 	if req.GetIncludeRules() {
@@ -239,10 +240,7 @@ func listSecurityGroupsLocal(ctx context.Context, req *pb.ListSecurityGroupsRequ
 			return nil, err
 		}
 		for _, r := range rules {
-			resp.Rules = append(resp.Rules, &pb.SecurityGroupRule{
-				Id: r.ID, SgId: r.SGID, Direction: r.Direction, Proto: r.Proto,
-				Port: r.PortRange, Cidr: r.CIDR, Action: r.Action, Priority: int32(r.Priority),
-			})
+			resp.Rules = append(resp.Rules, toPb(r))
 		}
 	}
 	for _, r := range unattributed {

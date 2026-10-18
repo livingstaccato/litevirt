@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -905,13 +906,35 @@ func TestMoveOneVolume_SettledForeignConditionIsANoOp(t *testing.T) {
 	}
 }
 
-// N-2: `lv health resolve vm.move_unresolved` needs a reason, is refused
-// while the holder is a live member, is accepted once it is removed, and on
-// the holder itself also removes its records.
+// acceptCtx is adminCtx carrying `lv health resolve --accept path`.
+func acceptCtx(path string) context.Context {
+	ctx := adminCtx()
+	md, _ := metadata.FromIncomingContext(ctx)
+	md = metadata.Join(md, metadata.Pairs(MoveAcceptMDKey, path))
+	return metadata.NewIncomingContext(ctx, md)
+}
+
+// N-2, N2-2, N2-3: `lv health resolve vm.move_unresolved` needs a reason; from
+// another host it is accepted only once the holder is proven powered off
+// (corrosion.SharedDiskOwnerProvedOff); on the holder it also removes the
+// records; --accept points the disk row at one of the move's files first.
 func TestResolveHealthCondition_MoveUnresolved(t *testing.T) {
 	ctx := context.Background()
 	req := func(reason string) *pb.ResolveHealthConditionRequest {
 		return &pb.ResolveHealthConditionRequest{Code: health.MoveUnresolvedCode, SubjectKind: "vm", SubjectId: "vm1", Reason: reason}
+	}
+	holder := func(t *testing.T, s *Server, state string, fences ...[2]string) {
+		t.Helper()
+		if state != "" {
+			if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "node-a", Address: "10.0.0.9", State: state}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for i, f := range fences {
+			if err := corrosion.InsertFenceLog(ctx, s.db, corrosion.FenceLogRecord{ID: fmt.Sprintf("f%d", i), HostName: "node-a", Method: f[0], Result: f[1]}); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	t.Run("no reason", func(t *testing.T) {
 		s, _, srcFile, dstFile := offlineMoveServer(t)
@@ -920,31 +943,42 @@ func TestResolveHealthCondition_MoveUnresolved(t *testing.T) {
 			t.Fatalf("want InvalidArgument, got %v", err)
 		}
 	})
-	t.Run("holder alive", func(t *testing.T) {
-		s, _, srcFile, dstFile := offlineMoveServer(t)
-		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "node-a", Address: "10.0.0.9", State: "active"}); err != nil {
-			t.Fatal(err)
-		}
-		publishForeignCondition(t, s, "node-a", srcFile, dstFile, false)
-		_, err := s.ResolveHealthCondition(adminCtx(), req("disk checked"))
-		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "node-a holds") ||
-			!strings.Contains(err.Error(), "fence-confirm") {
-			t.Fatalf("want a refusal naming the live holder, got %v", err)
-		}
-		if !health.MoveConditionCovers(ctx, s.db, "vm1", "root") {
-			t.Fatal("resolved anyway")
-		}
-	})
-	t.Run("holder removed", func(t *testing.T) {
-		s, _, srcFile, dstFile := offlineMoveServer(t)
-		publishForeignCondition(t, s, "node-gone", srcFile, dstFile, false)
-		if _, err := s.ResolveHealthCondition(adminCtx(), req("node-gone was reinstalled")); err != nil {
-			t.Fatalf("resolve: %v", err)
-		}
-		if health.MoveConditionCovers(ctx, s.db, "vm1", "root") {
-			t.Fatal("not resolved")
-		}
-	})
+	for _, tc := range []struct {
+		name   string
+		state  string
+		fences [][2]string
+		ok     bool
+	}{
+		{"holder alive", "active", nil, false},
+		{"holder fenced, not proven off", "fenced", [][2]string{{"ssh", "fenced"}}, false},
+		{"holder fenced and confirmed down", "fenced", [][2]string{{"manual", "manual-confirmed"}}, true},
+		{"holder confirmed down, then rejoined", "active", [][2]string{{"manual", "manual-confirmed"}}, false},
+		{"holder removed, never proven off", "", nil, false},
+		{"holder removed after a confirmation", "", [][2]string{{"manual", "manual-confirmed"}}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, srcFile, dstFile := offlineMoveServer(t)
+			holder(t, s, tc.state, tc.fences...)
+			publishForeignCondition(t, s, "node-a", srcFile, dstFile, false)
+			_, err := s.ResolveHealthCondition(adminCtx(), req("disk checked"))
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("resolve: %v", err)
+				}
+				if health.MoveConditionCovers(ctx, s.db, "vm1", "root") {
+					t.Fatal("not resolved")
+				}
+				return
+			}
+			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "node-a holds") ||
+				!strings.Contains(err.Error(), "fence-confirm") {
+				t.Fatalf("want a refusal naming the holder, got %v", err)
+			}
+			if !health.MoveConditionCovers(ctx, s.db, "vm1", "root") {
+				t.Fatal("resolved anyway")
+			}
+		})
+	}
 	t.Run("on the holder", func(t *testing.T) {
 		s, f, srcFile, dstFile := offlineMoveServer(t)
 		crashAfterDefine(t, s, f, srcFile, dstFile, dstFile, true, false)
@@ -957,6 +991,41 @@ func TestResolveHealthCondition_MoveUnresolved(t *testing.T) {
 		vm, _ := corrosion.GetVM(ctx, s.db, "vm1")
 		if _, err := s.startVMLocked(adminCtx(), vm); err != nil {
 			t.Fatalf("the start after the resolve: %v", err)
+		}
+	})
+	t.Run("--accept the copy on the holder", func(t *testing.T) {
+		s, f, srcFile, dstFile := offlineMoveServer(t)
+		crashAfterDefine(t, s, f, srcFile, dstFile, dstFile, true, false)
+		if _, err := s.ResolveHealthCondition(acceptCtx(dstFile), req("guest was pivoted before the crash")); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if got := diskRowPath(t, s, "vm1"); got != dstFile {
+			t.Fatalf("row names %s, want the accepted %s", got, dstFile)
+		}
+		if health.MoveConditionCovers(ctx, s.db, "vm1", "root") || len(moveRecords(t, s, "vm1")) != 0 {
+			t.Fatal("not resolved")
+		}
+	})
+	t.Run("--accept a file the move does not name", func(t *testing.T) {
+		s, f, srcFile, dstFile := offlineMoveServer(t)
+		crashAfterDefine(t, s, f, srcFile, dstFile, dstFile, true, false)
+		if _, err := s.ResolveHealthCondition(acceptCtx("/etc/passwd"), req("x")); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("want InvalidArgument, got %v", err)
+		}
+		if got := diskRowPath(t, s, "vm1"); got != srcFile {
+			t.Fatalf("row changed to %s", got)
+		}
+	})
+	t.Run("--accept from a host that does not read the holder's file", func(t *testing.T) {
+		s, _, srcFile, dstFile := offlineMoveServer(t)
+		holder(t, s, "fenced", [2]string{"manual", "manual-confirmed"})
+		publishForeignCondition(t, s, "node-a", srcFile, dstFile, false)
+		_, err := s.ResolveHealthCondition(acceptCtx(dstFile), req("x"))
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "does not read that file") {
+			t.Fatalf("want a refusal, got %v", err)
+		}
+		if got := diskRowPath(t, s, "vm1"); got != srcFile || !health.MoveConditionCovers(ctx, s.db, "vm1", "root") {
+			t.Fatalf("row %s / condition changed", got)
 		}
 	})
 }

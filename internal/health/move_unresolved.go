@@ -663,11 +663,10 @@ func resolveUnresolvedMove(ctx context.Context, db *corrosion.Client, dataDir, h
 // seen through the condition). Only a direction that is proven is taken: a
 // pivoted (or catch-up) move's copy holds every write, so a row on the source
 // is pointed at the copy when this host owns the VM and the copy is on a
-// shared pool it mounts, and refused otherwise. A live move with no pivot
-// recorded may still have pivoted on origin (the record lags the pivot), so a
-// row on the copy is refused, never pointed back at the source; a row on the
-// source passes only when the move recorded no error. An offline move's two
-// files hold the same data.
+// shared pool both hosts define alike, and refused otherwise. A live move with
+// no pivot recorded may still have committed and pivoted on origin (the
+// record and the row both lag the pivot), so it is refused whatever the row
+// names. An offline move's two files hold the same data.
 func resolveRemoteMove(ctx context.Context, db *corrosion.Client, dataDir, host, origin string, m UnresolvedMove) error {
 	vmRec, err := corrosion.GetVM(ctx, db, m.VM)
 	if err != nil {
@@ -687,7 +686,7 @@ func resolveRemoteMove(ctx context.Context, db *corrosion.Client, dataDir, host,
 		if row.Path == m.Dst {
 			return nil
 		}
-		if row.HostName == host && vmRec.HostName == host && sharedPoolHolds(ctx, db, dataDir, host, m.DstPool, m.Dst) {
+		if row.HostName == host && vmRec.HostName == host && SharedPoolHolds(ctx, db, dataDir, host, origin, m.DstPool, m.DstType, m.Dst) {
 			slog.Warn("move-volume condition: the disk row named the source, which lacks the writes made on the copy; pointed it at the copy",
 				"vm", m.VM, "disk", m.Disk, "origin", origin, "row_was", row.Path, "row_now", m.Dst)
 			return pointRow(ctx, db, m, row, host, m.Dst, m.DstType, m.DstPool)
@@ -696,9 +695,10 @@ func resolveRemoteMove(ctx context.Context, db *corrosion.Client, dataDir, host,
 			"disk row names %s, which lacks the writes made since, and %s is not on a shared pool %s mounts. %s",
 			m.VM, m.Disk, origin, m.Dst, row.Path, m.Dst, host, exit)
 	case m.Live:
-		if row.Path == m.Src && m.Error == "" {
-			return nil
-		}
+		// Whatever the row names: the commit is a local write that replicates
+		// later and the pivot follows it, so a row on the source proves no
+		// more than a row on the copy. Only the holder can tell, from its own
+		// persistent config.
 		return refuse(m, false, "%s: a live volume move of its disk %s on %s did not finish, and the disk row names %s; "+
 			"whether the guest was pivoted onto %s before %s stopped is not known here, so either %s or %s may hold its "+
 			"last writes. %s", m.VM, m.Disk, origin, row.Path, m.Dst, origin, m.Src, m.Dst, exit)
@@ -707,16 +707,27 @@ func resolveRemoteMove(ctx context.Context, db *corrosion.Client, dataDir, host,
 	}
 }
 
-// sharedPoolHolds reports whether path lies in pool, configured on host with
-// a shared driver, and exists here: the same file the move's host wrote, not
-// a same-named file on a host-local pool.
-func sharedPoolHolds(ctx context.Context, db *corrosion.Client, dataDir, host, pool, path string) bool {
-	if pool == "" {
+// SharedPoolHolds reports whether path, a file origin wrote in its pool
+// (of driver typ), is the same file on this host: typ is a shared driver;
+// origin's pool and this host's pool of that name are both shared and name the
+// same export (Source) or, without one, the same Target; the path lies in this
+// host's pool directory; and it is a regular file, not a symlink.
+func SharedPoolHolds(ctx context.Context, db *corrosion.Client, dataDir, host, origin, pool, typ, path string) bool {
+	if pool == "" || !corrosion.DiskIsShared(corrosion.DiskRecord{StorageType: typ}) {
 		return false
 	}
 	p, ok, err := corrosion.GetStoragePool(ctx, db, host, pool)
 	if err != nil || !ok || !corrosion.DiskIsShared(corrosion.DiskRecord{StorageType: p.Driver}) {
 		return false
+	}
+	if origin != host {
+		o, ok, err := corrosion.GetStoragePool(ctx, db, origin, pool)
+		if err != nil || !ok || !corrosion.DiskIsShared(corrosion.DiskRecord{StorageType: o.Driver}) {
+			return false
+		}
+		if o.Source != p.Source || (p.Source == "" && o.Target != p.Target) {
+			return false
+		}
 	}
 	var dirs []string
 	if p.Target != "" {
@@ -728,8 +739,8 @@ func sharedPoolHolds(ctx context.Context, db *corrosion.Client, dataDir, host, p
 	clean := filepath.Clean(path)
 	for _, d := range dirs {
 		if strings.HasPrefix(clean, filepath.Clean(d)+string(filepath.Separator)) {
-			_, serr := os.Stat(clean)
-			return serr == nil
+			fi, serr := os.Lstat(clean)
+			return serr == nil && fi.Mode().IsRegular()
 		}
 	}
 	return false

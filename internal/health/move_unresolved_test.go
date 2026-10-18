@@ -183,15 +183,15 @@ func TestStartPendingVM_InFlightMoveIsRetried(t *testing.T) {
 	}
 }
 
-// m-4, N-1, N-3: a host that does not hold the record honours it through the
-// VM's condition, taking only a direction it can prove. A recorded pivot (or a
-// catch-up) makes the copy complete: a start of a VM failed over here points a
-// row on the source at the copy, but only when the copy is on a shared pool
-// mounted here. With no pivot recorded the pivot may still have happened before
-// the holder stopped (the record lags it): a row on the copy is refused, never
-// pointed back at the source; a row on the source passes only when the move
-// recorded no error. The owner resolves the condition once every move is
-// proven settled.
+// m-4, N-1, N-3, N2-1, N2-5: a host that does not hold the record honours it
+// through the VM's condition, taking only a direction it can prove. A
+// recorded pivot (or a catch-up) makes the copy complete: a start of a VM
+// failed over here points a row on the source at the copy, but only when the
+// copy is a regular file on a shared pool this host and the holder define
+// alike. With no pivot recorded the commit and the pivot may both have
+// happened and not replicated before the holder lost power: refused whatever
+// the row names. The owner resolves the condition once every move is proven
+// settled.
 func TestResolveUnresolvedMoves_AnotherHostsRecord(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
@@ -200,21 +200,29 @@ func TestResolveUnresolvedMoves_AnotherHostsRecord(t *testing.T) {
 		moveErr                string
 		rowOnDst               bool
 		rowHost                string
-		poolShared             bool
+		hereDriver, originDrv  string
+		symlink, originOther   bool
 		wantErr                bool
 		wantRowOnDst, resolved bool
 	}{
-		{name: "crash after the pivot, before it replicated: row on the copy, no pivot recorded, failed over here: refused",
-			rowOnDst: true, rowHost: "node-b", poolShared: true, wantErr: true, wantRowOnDst: true},
+		{name: "crash after the pivot, before it replicated: row on the copy, no pivot recorded: refused",
+			rowOnDst: true, rowHost: "node-b", hereDriver: "nfs", originDrv: "nfs", wantErr: true, wantRowOnDst: true},
+		{name: "power loss after the commit and the pivot, neither replicated: row on the source, no error: refused",
+			rowHost: "node-b", hereDriver: "nfs", originDrv: "nfs", wantErr: true},
 		{name: "no pivot recorded, row on the copy, row elsewhere: refused", rowOnDst: true, rowHost: "node-c", wantErr: true, wantRowOnDst: true},
-		{name: "no pivot recorded, row on the source, no error: passes", rowHost: "node-c"},
 		{name: "no pivot recorded, row on the source, the move recorded an error: refused", moveErr: "redefine failed", rowHost: "node-b", wantErr: true},
-		{name: "pivoted, row on the source, failed over here, copy on a shared pool: row to the copy, resolved",
-			pivoted: true, rowHost: "node-b", poolShared: true, wantRowOnDst: true, resolved: true},
-		{name: "pivoted, row on the source, failed over here, copy on a local pool: refused",
-			pivoted: true, rowHost: "node-b", wantErr: true},
+		{name: "pivoted, row on the source, failed over here, copy on a shared pool both define: row to the copy, resolved",
+			pivoted: true, rowHost: "node-b", hereDriver: "nfs", originDrv: "nfs", wantRowOnDst: true, resolved: true},
+		{name: "pivoted, row on the source, copy on a local pool here: refused",
+			pivoted: true, rowHost: "node-b", hereDriver: "local", originDrv: "nfs", wantErr: true},
+		{name: "pivoted, row on the source, the holder's pool of that name is local: refused",
+			pivoted: true, rowHost: "node-b", hereDriver: "nfs", originDrv: "local", wantErr: true},
+		{name: "pivoted, row on the source, the holder's pool of that name is another export: refused",
+			pivoted: true, rowHost: "node-b", hereDriver: "nfs", originDrv: "nfs", originOther: true, wantErr: true},
+		{name: "pivoted, row on the source, the copy is a symlink: refused",
+			pivoted: true, rowHost: "node-b", hereDriver: "nfs", originDrv: "nfs", symlink: true, wantErr: true},
 		{name: "catch-up, row on the source, failed over here, copy on a shared pool: row to the copy",
-			catchUp: true, rowHost: "node-b", poolShared: true, wantRowOnDst: true, resolved: true},
+			catchUp: true, rowHost: "node-b", hereDriver: "nfs", originDrv: "nfs", wantRowOnDst: true, resolved: true},
 		{name: "pivoted, row on the copy, owner here: passes and resolved", pivoted: true, rowOnDst: true, rowHost: "node-b", wantRowOnDst: true, resolved: true},
 		{name: "pivoted, row on the copy, owner elsewhere: passes, left open", pivoted: true, rowOnDst: true, rowHost: "node-c", wantRowOnDst: true},
 	} {
@@ -222,26 +230,41 @@ func TestResolveUnresolvedMoves_AnotherHostsRecord(t *testing.T) {
 			db := testReconcilerDB(t)
 			originDir := t.TempDir()
 			_, src, dst := seedMovedVM(t, db, originDir, "dst", true, tc.pivoted)
-			if tc.catchUp || tc.moveErr != "" {
-				ms, _ := UnresolvedMovesOf(originDir, "mv")
-				ms[0].CatchUp, ms[0].Error = tc.catchUp, tc.moveErr
-				if tc.catchUp {
-					ms[0].Live = false
-				}
-				if err := RecordUnresolvedMove(originDir, ms[0]); err != nil {
+			if tc.symlink {
+				real := dst + ".real"
+				if err := os.Rename(dst, real); err != nil {
 					t.Fatal(err)
 				}
+				if err := os.Symlink(real, dst); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ms, _ := UnresolvedMovesOf(originDir, "mv")
+			ms[0].CatchUp, ms[0].Error = tc.catchUp, tc.moveErr
+			if tc.catchUp {
+				ms[0].Live = false
+			}
+			if tc.originDrv != "" {
+				ms[0].DstType = tc.originDrv
+			}
+			if err := RecordUnresolvedMove(originDir, ms[0]); err != nil {
+				t.Fatal(err)
 			}
 			if err := PublishUnresolvedMoves(ctx, db, originDir, "node-a", "mv"); err != nil {
 				t.Fatal(err)
 			}
-			driver := "local"
-			if tc.poolShared {
-				driver = "nfs"
-			}
-			if err := corrosion.UpsertStoragePool(ctx, db, corrosion.StoragePoolRecord{HostName: "node-b", Name: "warm",
-				Driver: driver, Target: filepath.Dir(dst)}); err != nil {
-				t.Fatal(err)
+			for host, drv := range map[string]string{"node-b": tc.hereDriver, "node-a": tc.originDrv} {
+				if drv == "" {
+					continue
+				}
+				target := filepath.Dir(dst)
+				if host == "node-a" && tc.originOther {
+					target = "/srv/other-export"
+				}
+				if err := corrosion.UpsertStoragePool(ctx, db, corrosion.StoragePoolRecord{HostName: host, Name: "warm",
+					Driver: drv, Target: target}); err != nil {
+					t.Fatal(err)
+				}
 			}
 			row := src
 			if tc.rowOnDst {
@@ -272,6 +295,31 @@ func TestResolveUnresolvedMoves_AnotherHostsRecord(t *testing.T) {
 				t.Fatalf("condition resolved = %v, want %v", got, tc.resolved)
 			}
 		})
+	}
+}
+
+// N2-6: a host that does not hold the VM's condition cannot publish over it:
+// a move of another disk there is refused, and the holder and its entries stay.
+func TestPublishUnresolvedMoves_NeverOverwritesAnotherHolder(t *testing.T) {
+	ctx := context.Background()
+	db := testReconcilerDB(t)
+	aDir, bDir := t.TempDir(), t.TempDir()
+	if err := RecordUnresolvedMove(aDir, UnresolvedMove{VM: "mv", Disk: "root", Src: "/a/root", Dst: "/b/root", Live: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := PublishUnresolvedMoves(ctx, db, aDir, "node-a", "mv"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordUnresolvedMove(bDir, UnresolvedMove{VM: "mv", Disk: "data", Src: "/a/data", Dst: "/b/data", Live: true}); err != nil {
+		t.Fatal(err)
+	}
+	err := PublishUnresolvedMoves(ctx, db, bDir, "node-b", "mv")
+	if !IsMoveUnresolved(err) || !strings.Contains(err.Error(), "node-a holds") {
+		t.Fatalf("want the publish refused, got %v", err)
+	}
+	_, ev, open, rerr := OpenMoveCondition(ctx, db, "mv")
+	if rerr != nil || !open || ev.Host != "node-a" || len(ev.Moves) != 1 || ev.Moves[0].Disk != "root" {
+		t.Fatalf("the holder's condition changed: %+v open=%v %v", ev, open, rerr)
 	}
 }
 

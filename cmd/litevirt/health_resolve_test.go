@@ -9,6 +9,8 @@ import (
 	"google.golang.org/grpc"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/grpcapi"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 type captureResolveCondition struct {
@@ -70,5 +72,12 @@ func TestHealthResolve_RejectsASubjectWithoutKind(t *testing.T) {
 	}
 	if spy.req != nil {
 		t.Fatalf("a request was sent: %+v", spy.req)
+	}
+}
+
+// The CLI's --accept metadata key and condition code are the server's.
+func TestMoveAcceptKeyMatchesTheServer(t *testing.T) {
+	if moveAcceptMDKey != grpcapi.MoveAcceptMDKey || moveUnresolvedCode != health.MoveUnresolvedCode {
+		t.Fatalf("CLI %q/%q, server %q/%q", moveAcceptMDKey, moveUnresolvedCode, grpcapi.MoveAcceptMDKey, health.MoveUnresolvedCode)
 	}
 }

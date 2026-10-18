@@ -3,10 +3,12 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -175,43 +177,67 @@ func (s *Server) dualRunScanCleared(ctx context.Context, row corrosion.HealthCon
 	return st.LastScan, ""
 }
 
-// moveResolveFenceWindow is how recent an operator's `lv host fence-confirm`
-// of a move's holding host must be for `lv health resolve` to accept it.
-const moveResolveFenceWindow = 24 * time.Hour
+// MoveAcceptMDKey is the gRPC metadata key carrying `lv health resolve
+// --accept <path>` for vm.move_unresolved: the file of the move the operator
+// accepts as the VM's data, which the disk row is pointed at. Carried as
+// metadata so the request message is unchanged.
+const MoveAcceptMDKey = "x-litevirt-move-accept"
 
 // resolveMoveConditionByHand resolves an unresolved volume move
 // (vm.move_unresolved) on an admin's word, with a reason. The host holding the
 // move's record settles it itself when it can, so the hand resolution is
-// refused while that host is a live member, unless it is this host (its
-// records are then removed too): it is for a holder that is fenced, removed or
-// gone, whose record nothing else can settle. It proves nothing about which
-// file holds the VM's data: a start then boots the file its disk row names.
+// refused unless it runs on that host (its records are then removed too) or
+// that host is proven powered off (corrosion.SharedDiskOwnerProvedOff: fenced
+// or removed over a proof-grade fence of its last life). It proves nothing
+// about which file holds the VM's data: without --accept a start boots the
+// file the disk row names; with it, the row is first pointed at the accepted
+// file, one of the move's two, on the VM's owner and only where that host
+// reads the same file.
 func (s *Server) resolveMoveConditionByHand(ctx context.Context, req *pb.ResolveHealthConditionRequest, row corrosion.HealthCondition) (*pb.ResolveHealthConditionResponse, error) {
 	vm := row.SubjectID
 	reason := strings.TrimSpace(req.GetReason())
 	if reason == "" {
 		return nil, status.Errorf(codes.InvalidArgument,
-			"resolving %s on vm/%s accepts which file the VM's disk row names as its data: say why with --reason", row.Code, vm)
+			"resolving %s on vm/%s chooses which file the VM boots: say why with --reason", row.Code, vm)
 	}
-	_, ev, _, everr := health.OpenMoveCondition(ctx, s.db, vm)
+	accept := ""
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if v := md.Get(MoveAcceptMDKey); len(v) > 0 {
+			accept = strings.TrimSpace(v[0])
+		}
+	}
+	_, ev, open, everr := health.OpenMoveCondition(ctx, s.db, vm)
+	if everr != nil && !open {
+		return nil, status.Errorf(codes.Unavailable, "read the %s condition of vm/%s: %v", row.Code, vm, everr)
+	}
 	holder := ev.Host
 	why := ""
 	switch {
-	case everr != nil || holder == "":
+	case everr != nil:
 		why = "its evidence is unreadable"
 	case holder == s.hostName:
 		why = "this host holds the record"
 	default:
-		gone, state := s.moveHolderGone(ctx, holder)
-		if !gone {
+		h, provedOff, err := corrosion.SharedDiskOwnerProvedOff(ctx, s.db, holder)
+		if ok, whyNot := corrosion.SharedDiskOwnerVerdict(holder, h, provedOff, err); !ok {
 			return nil, status.Errorf(codes.FailedPrecondition,
-				"refusing to resolve %s on vm/%s: %s holds the move's record and is %s, so it settles it itself: start the VM "+
-					"or retry `lv move-volume` there, or run this command against %s (LV_HOST=%s). Resolve it from here "+
-					"only once %s is fenced (`lv host fence-confirm %s`) or removed", row.Code, vm, holder, state, holder, holder, holder, holder)
+				"refusing to resolve %s on vm/%s: %s holds the move's record, and %s. It settles the move itself: start the "+
+					"VM or retry `lv move-volume` there, or run this command against it (LV_HOST=%s). From another host it "+
+					"is accepted only once %s is proven powered off (`lv host fence-confirm %s`)",
+				row.Code, vm, holder, whyNot, holder, holder, holder)
 		}
-		why = holder + " is " + state
+		why = holder + " is proven powered off"
 	}
-	if holder == s.hostName || holder == "" {
+	if accept != "" {
+		if everr != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "--accept: the evidence of vm/%s cannot be read to match %s against", vm, accept)
+		}
+		if err := s.acceptMovedFile(ctx, vm, holder, ev, accept); err != nil {
+			return nil, err
+		}
+		why += "; the disk row now names " + accept
+	}
+	if holder == s.hostName || everr != nil {
 		if err := health.ClearUnresolvedMovesOf(s.dataDir, vm); err != nil {
 			return nil, status.Errorf(codes.Internal, "remove this host's records of vm/%s: %v", vm, err)
 		}
@@ -224,8 +250,16 @@ func (s *Server) resolveMoveConditionByHand(ctx context.Context, req *pb.Resolve
 	if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
 		return nil, status.Errorf(codes.Unavailable, "record the resolution: %v", err)
 	}
+	var moves []string
+	for _, m := range ev.Moves {
+		d := fmt.Sprintf("%s: %s → %s (live=%v pivoted=%v)", m.Disk, m.Src, m.Dst, m.Live, m.Pivoted)
+		if m.Error != "" {
+			d += ", error: " + m.Error
+		}
+		moves = append(moves, d)
+	}
 	target := strings.Join([]string{row.Evaluator, row.Code, row.SubjectKind, vm}, "/")
-	detail := fmt.Sprintf("resolved by hand on %s (was %s; %s): %s", s.hostName, prior, why, reason)
+	detail := fmt.Sprintf("resolved by hand on %s (was %s; %s; moves %s): %s", s.hostName, prior, why, strings.Join(moves, "; "), reason)
 	s.audit(ctx, "health.condition.resolve", target, detail, "ok")
 	s.publish("ha.condition.resolved", row.Code+":"+row.SubjectKind+"/"+vm, detail)
 	s.notify(ctx, notify.Notification{
@@ -234,22 +268,47 @@ func (s *Server) resolveMoveConditionByHand(ctx context.Context, req *pb.Resolve
 	return &pb.ResolveHealthConditionResponse{Condition: healthConditionToPB(row)}, nil
 }
 
-// moveHolderGone reports whether host can no longer settle a move it
-// recorded — removed (no membership row), fenced, or confirmed down by an
-// operator — and its state, for the message.
-func (s *Server) moveHolderGone(ctx context.Context, host string) (bool, string) {
-	h, err := corrosion.GetHost(ctx, s.db, host)
+// acceptMovedFile points vm's disk row at accept, one of a recorded move's two
+// files, on the VM's owner, where that host reads the same file the move's
+// host wrote: its own file on the holder, a file on a shared pool both define
+// alike elsewhere.
+func (s *Server) acceptMovedFile(ctx context.Context, vm, holder string, ev health.MoveUnresolvedEvidence, accept string) error {
+	var m *health.UnresolvedMove
+	for i := range ev.Moves {
+		if ev.Moves[i].Src == accept || ev.Moves[i].Dst == accept {
+			m = &ev.Moves[i]
+		}
+	}
+	if m == nil {
+		return status.Errorf(codes.InvalidArgument, "--accept %s: it is neither file of a move recorded for vm/%s", accept, vm)
+	}
+	rec, err := corrosion.GetVM(ctx, s.db, vm)
 	if err != nil {
-		return false, "unreadable (" + err.Error() + ")"
+		return status.Errorf(codes.Unavailable, "read vm/%s: %v", vm, err)
 	}
-	if h == nil {
-		return true, "removed"
+	if rec == nil {
+		return status.Errorf(codes.NotFound, "vm %q not found", vm)
 	}
-	if h.State == "fenced" {
-		return true, "fenced"
+	if rec.HostName != s.hostName {
+		return status.Errorf(codes.FailedPrecondition, "--accept points the disk row at a file: run it on the VM's owner %s (LV_HOST=%s)", rec.HostName, rec.HostName)
 	}
-	if ok, ferr := corrosion.HostManualFenceConfirmed(ctx, s.db, host, time.Now(), moveResolveFenceWindow); ferr == nil && ok {
-		return true, "confirmed down (lv host fence-confirm)"
+	typ, pool := m.SrcType, m.SrcPool
+	if accept == m.Dst {
+		typ, pool = m.DstType, m.DstPool
 	}
-	return false, h.State
+	reads := false
+	if holder == s.hostName {
+		fi, lerr := os.Lstat(accept)
+		reads = lerr == nil && fi.Mode().IsRegular()
+	} else {
+		reads = health.SharedPoolHolds(ctx, s.db, s.dataDir, s.hostName, holder, pool, typ, accept)
+	}
+	if !reads {
+		return status.Errorf(codes.FailedPrecondition, "--accept %s: %s does not read that file (it is not here as a regular file, "+
+			"or not on a shared pool %s and %s define alike)", accept, s.hostName, s.hostName, holder)
+	}
+	if err := corrosion.UpdateDiskPlacement(ctx, s.db, vm, m.Disk, s.hostName, accept, typ, pool); err != nil {
+		return status.Errorf(codes.Unavailable, "point the disk row of vm/%s at %s: %v", vm, accept, err)
+	}
+	return nil
 }

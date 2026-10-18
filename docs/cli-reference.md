@@ -101,10 +101,10 @@ lv cluster claim-release <kind>/<name>       # Release one workload ha.claim.leg
                                    #   legacy proof stuck in flight on a live destination; the
                                    #   destination confirms nothing runs it, then abandons it (admin)
 lv health [--resolved]             # Cluster health: overall + conditions + coverage (exit 0/1/2)
-lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E]  # Resolve one open dual-run
-                                   #   condition by hand (admin, audited); re-raised next pass if it still holds;
-                                   #   or a vm.move_unresolved (--reason required) once its holding host is
-                                   #   fenced or removed, or on that host
+lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH]  # Resolve one open
+                                   #   dual-run condition by hand (admin, audited); re-raised next pass if it
+                                   #   still holds; or a vm.move_unresolved (--reason required) on its holding
+                                   #   host, or once that host is proven powered off; --accept picks the file
 ```
 
 ## Hosts
@@ -1489,7 +1489,7 @@ lv health [--resolved]                       # Cluster health: overall state, ac
                                              #   evaluator coverage, connectivity, capacity.
                                              #   --resolved includes the 30-day resolved history.
                                              #   Exit code: 0 healthy · 1 degraded/unknown · 2 critical.
-lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E]
+lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH]
                                              # Resolve one open dual-run condition by hand, named as
                                              #   `lv health` prints it. Admin (cluster.health.resolve),
                                              #   audited, ha.condition.resolved event. Refused until a
@@ -1497,7 +1497,9 @@ lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E]
                                              #   it names; raised again next pass if it still holds.
                                              #   Also vm.move_unresolved (an unresolved volume move),
                                              #   with --reason: on the host holding its record, or once
-                                             #   that host is fenced or removed (docs/diagnostics.md).
+                                             #   that host is proven powered off. --accept PATH points
+                                             #   the disk record at one of the move's two files first,
+                                             #   on the VM's owner (docs/diagnostics.md).
 lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>] [--until <time>]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics
 lv stats <vm>                                # VM resource statistics

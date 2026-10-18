@@ -1766,11 +1766,16 @@ rolled back"). It is resolved by the host holding the record; by the VM's
 owner once every move it lists is proven settled there; and for every host
 when the VM is deleted or a new VM takes its name. When the host holding the
 record is gone, an admin resolves it by hand:
-`lv health resolve vm.move_unresolved vm/<vm> --reason "…"`, accepted once
-that host is fenced (`lv host fence-confirm <host>`) or removed, and on the
-holding host itself, where it also removes the record. Resolving accepts the
-file the VM's disk record names; the next start boots it. Removing a host
-does not resolve it.
+`lv health resolve vm.move_unresolved vm/<vm> --reason "…"`, accepted on the
+holding host itself, where it also removes the record, and from any host once
+that host is proven powered off: fenced or removed over an IPMI power-off or an
+operator's `lv host fence-confirm <host>` of its last life. Without `--accept`
+the next start boots the file the VM's disk record names. `--accept <path>`
+names one of the move's two files instead (`lv health` and the resolve's
+output show each move's error, which says which file the guest was writing):
+run on the VM's owner, it points the disk record at that file first, accepted
+only where that host reads the same file — its own on the holding host, or on
+a shared pool both hosts define alike. Removing a host does not resolve it.
 
 ### A cluster default-deny held by a torn-down stack (`firewall.default_deny_orphaned`)
 

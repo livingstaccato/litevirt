@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc/metadata"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
@@ -74,7 +76,7 @@ Exit code: 0 healthy · 1 degraded or unknown · 2 critical.`,
 // lv health resolve — mark one open dual-run or move-volume condition
 // resolved by hand.
 func newHealthResolveCmd() *cobra.Command {
-	var evaluator, reason string
+	var evaluator, reason, accept string
 	cmd := &cobra.Command{
 		Use:   "resolve <code> <kind/subject>",
 		Short: "Resolve an open dual-run or move-volume health condition by hand (admin, audited)",
@@ -95,10 +97,13 @@ detector can no longer clear by itself.
 
 An unresolved volume move (vm.move_unresolved) can be resolved this way too,
 with --reason: run against the host holding the move's record, which removes
-it, or from any host once that host is fenced (lv host fence-confirm) or
-removed. It is refused while the holding host is a live member: that host
-settles the move itself. Resolving accepts the file the VM's disk record names
-as its data, and a start then boots it.
+it, or from any host once that host is proven powered off (fenced or removed
+over an IPMI power-off or an operator's lv host fence-confirm). It is refused
+otherwise: that host settles the move itself. Without --accept a start then
+boots the file the VM's disk record names. --accept <path> names one of the
+move's two files instead (read the moves' errors in 'lv health'): the disk
+record is pointed at it first, run on the VM's owner, where that file is its
+own or on a shared pool both hosts define alike.
 
 Requires the cluster.health.resolve verb (Admin). The resolution is written
 to the audit log with your principal and --reason, and published as an
@@ -110,6 +115,9 @@ ha.condition.resolved event.`,
 				return fmt.Errorf("subject %q: want kind/id as `lv health` prints it, e.g. vm/web-1", args[1])
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if accept != "" {
+					ctx = metadata.AppendToOutgoingContext(ctx, moveAcceptMDKey, accept)
+				}
 				resp, err := c.ResolveHealthCondition(ctx, &pb.ResolveHealthConditionRequest{
 					Code: args[0], SubjectKind: kind, SubjectId: id,
 					Evaluator: evaluator, Reason: reason,
@@ -118,6 +126,11 @@ ha.condition.resolved event.`,
 					return fmt.Errorf("resolve %s on %s: %w", args[0], args[1], err)
 				}
 				h := resp.GetCondition()
+				if h.GetCode() == moveUnresolvedCode {
+					fmt.Printf("%s on %s/%s: %s.\n", h.GetCode(), h.GetSubjectKind(), h.GetSubjectId(), h.GetLifecycle())
+					printMoveEvidence(h.GetEvidence())
+					return nil
+				}
 				fmt.Printf("%s on %s/%s (%s): %s. If it still holds, the detector raises it again on its next pass.\n",
 					h.GetCode(), h.GetSubjectKind(), h.GetSubjectId(), h.GetEvaluator(), h.GetLifecycle())
 				return nil
@@ -126,6 +139,7 @@ ha.condition.resolved event.`,
 	}
 	cmd.Flags().StringVar(&evaluator, "evaluator", "", "the evaluator, when two hold an open condition under the same code and subject")
 	cmd.Flags().StringVar(&reason, "reason", "", "why, recorded in the audit log")
+	cmd.Flags().StringVar(&accept, "accept", "", "vm.move_unresolved only: the move's file to point the disk record at")
 	return cmd
 }
 
@@ -195,4 +209,37 @@ func capacityDBCell(c *pb.HostCapacityAssessment) string {
 		cell += fmt.Sprintf(" +%dMiB ct", ct)
 	}
 	return cell
+}
+
+// moveAcceptMDKey and moveUnresolvedCode match grpcapi.MoveAcceptMDKey and
+// health.MoveUnresolvedCode.
+const (
+	moveAcceptMDKey    = "x-litevirt-move-accept"
+	moveUnresolvedCode = "vm.move_unresolved"
+)
+
+// printMoveEvidence prints the moves a vm.move_unresolved condition recorded,
+// each with the error its move hit, so the operator sees what --accept chose
+// between.
+func printMoveEvidence(evidence string) {
+	var ev struct {
+		Host  string `json:"host"`
+		Moves []struct {
+			Disk    string `json:"disk"`
+			Src     string `json:"src"`
+			Dst     string `json:"dst"`
+			Live    bool   `json:"live"`
+			Pivoted bool   `json:"pivoted"`
+			Error   string `json:"error"`
+		} `json:"moves"`
+	}
+	if json.Unmarshal([]byte(evidence), &ev) != nil {
+		return
+	}
+	for _, m := range ev.Moves {
+		fmt.Printf("  %s on %s: %s -> %s (live=%v pivoted=%v)\n", m.Disk, ev.Host, m.Src, m.Dst, m.Live, m.Pivoted)
+		if m.Error != "" {
+			fmt.Printf("    error: %s\n", m.Error)
+		}
+	}
 }

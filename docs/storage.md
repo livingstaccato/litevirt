@@ -1501,11 +1501,12 @@ destination, or when the guest was pivoted but the config names the source. A re
 `lv move-volume` settles it the same way and is refused in the same cases; it is never
 reported as "nothing to do" while the record remains. Another host (a failover onto
 shared storage) honours the condition by what it can prove: when the guest was
-pivoted, a start there points the disk record at the destination on a shared pool it
-mounts; when no pivot was recorded and the disk record names the destination, it is
-refused, since the pivot may have happened before the holding host stopped. A refused
-VM whose holding host is gone is released with `lv health resolve vm.move_unresolved
-vm/<vm> --reason "…"` once that host is fenced or removed (docs/diagnostics.md).
+pivoted, a start there points the disk record at the destination on a shared pool both
+hosts define alike; when no pivot was recorded, it is refused whichever file the disk
+record names, since the record commit and the pivot may have happened before the holding
+host stopped. A refused VM whose holding host is gone is released with `lv health resolve
+vm.move_unresolved vm/<vm> --reason "…" [--accept <path>]` once that host is proven
+powered off (docs/diagnostics.md).
 
 > **Note:** `lv replicate-volume` copies a shut-off VM's disk plainly and a
 > running or paused one point-in-time — through a full backup session, or an

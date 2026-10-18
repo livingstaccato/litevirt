@@ -97,7 +97,20 @@ func TestReplicationSchemaHealth_RaisedOnlyAfterTheGrace(t *testing.T) {
 		t.Fatal("raised a refusal younger than the grace")
 	}
 
-	s.replicator.NoteSchemaRefusalForTest("node-3", 68, 67, now.Add(-schemaRefusalGrace-time.Second))
+	// A pre-stage pass over a large cluster: four minutes of refusals, one
+	// every 30 s (the push backoff ceiling), is still within the grace.
+	for at := now.Add(-4 * time.Minute); !at.After(now); at = at.Add(30 * time.Second) {
+		s.replicator.NoteSchemaRefusalForTest("node-4", 68, 67, at)
+	}
+	s.EvaluateReplicationSchemaHealth(ctx)
+	if _, ok := schemaBehindRow(t, s, "node-4"); ok {
+		t.Fatal("raised a four-minute refusal run, which a pre-stage pass can take")
+	}
+
+	// A run of refusals, one every 30 s, that outlasts the grace.
+	for at := now.Add(-schemaRefusalGrace - time.Second); !at.After(now); at = at.Add(30 * time.Second) {
+		s.replicator.NoteSchemaRefusalForTest("node-3", 68, 67, at)
+	}
 	s.replicator.NoteSchemaRefusalForTest("node-3", 68, 67, now)
 	s.EvaluateReplicationSchemaHealth(ctx)
 	if h, ok := schemaBehindRow(t, s, "node-3"); !ok || h.Lifecycle == corrosion.ConditionResolved {

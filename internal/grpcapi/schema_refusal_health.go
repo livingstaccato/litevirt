@@ -32,8 +32,8 @@ type schemaBehindEvidence struct {
 
 // schemaRefusalGrace is how long a run of refusals lasts before it is
 // raised: during a pre-stage pass each host not yet staged refuses the ones
-// already staged for a few seconds.
-const schemaRefusalGrace = 60 * time.Second
+// already staged until its own turn, which on a large cluster is minutes.
+const schemaRefusalGrace = 5 * time.Minute
 
 // SetSchemaRefusalGraceForTest overrides schemaRefusalGrace. Test-only.
 func (s *Server) SetSchemaRefusalGraceForTest(d time.Duration) {

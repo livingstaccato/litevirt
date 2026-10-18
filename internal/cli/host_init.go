@@ -347,7 +347,9 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	if err != nil {
 		return fmt.Errorf("read generated host certificate serial: %w", err)
 	}
-	// This command installs its own build, which keeps a host incarnation.
+	// The header is this command's claim that it installs its own build,
+	// which keeps a host incarnation; the daemon cannot check which binary
+	// findDaemonBinary pushed (docs/upgrades.md).
 	admitCtx := metadata.AppendToOutgoingContext(ctx, apimeta.AdmitInstallsReleaseHeader, capabilities.ReleaseToken)
 	admitted, err := c.AdmitHost(admitCtx, &pb.AdmitHostRequest{
 		Name: hostName, Address: hostAddr, CertSerial: serial,

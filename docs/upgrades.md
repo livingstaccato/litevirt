@@ -1263,12 +1263,23 @@ incarnation 0. A re-admission that issues a number needs:
   incarnation, and the host would stay joining, refused by every peer.
   Removing the last previous-build host latches the release, so re-add such a
   host with this release's `lv`; a host already admitted on an older build
-  joins after `lv host upgrade <host>`.
+  joins after `lv host upgrade <host>`. The daemon takes `lv`'s word for the
+  build: `lv host add` pushes the `litevirt` beside its own executable, or
+  `/usr/local/bin/litevirt` when there is none, so an `lv` run without this
+  release's `litevirt` beside it can install an older build; that host also
+  stays joining until `lv host upgrade <host>`.
 
 Otherwise `lv host add` is refused with the reason. Over a tombstone at 1 or
 higher it is never written the way the previous release writes it. `lv host rm`
 takes the same majority and pull, and is refused when the row names another
-certificate than the one it revoked. On a node that has not caught up with the
+certificate than the one it revoked. This release's `lv host rm` asks the
+daemon before it revokes, and revokes nothing when the removal would be
+refused; once it has revoked, it retries a removal that fails `Unavailable`
+twice, over about 30 seconds, then prints the command that finishes it. A
+previous release's `lv host rm` does not ask: against this release's daemon it
+still revokes the certificate and publishes the CRL first, and a refusal then
+leaves the host revoked with its row live. Run `lv host rm` with this
+release's `lv`. On a node that has not caught up with the
 cluster since it started, `lv host rm`, `lv host config`, `lv host label`,
 `lv host drain`, `lv host undrain` and `lv host isolate` are refused; `lv host
 fence` is not, and its result names the incarnation, serial, strategy and BMC

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -64,9 +65,13 @@ func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force
 	// available as `lv host retire-audit-key`.
 	closeRemovedHostAuditContract(ctx, c, hostName)
 
-	removed, err := c.RemoveHost(ctx, &pb.RemoveHostRequest{Name: hostName, Force: force, ExpectedCertSerial: serial})
+	rerun := "lv host rm " + hostName
+	if force {
+		rerun = "lv host rm --force " + hostName
+	}
+	removed, err := removeAfterRevoke(ctx, c, &pb.RemoveHostRequest{Name: hostName, Force: force, ExpectedCertSerial: serial}, rerun)
 	if err != nil {
-		return fmt.Errorf("remove host after publishing its certificate revocation: %w", err)
+		return err
 	}
 	printRemoved(hostName, removed, "Host %s removed from cluster.\n")
 	fmt.Printf("  revoked certificate %s in CRL %d before removing the host\n", serial, version)
@@ -100,6 +105,16 @@ func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, d
 			"removes only a host proven off", hostName, orDash(plan.GetFenceDetail()), plan.GetFenceCommand())
 	}
 	if dryRun {
+		// Ask the daemon whether it would make the removal, as the real run
+		// does before it revokes, so the plan is not one it would refuse.
+		serial, err := hostCertSerial(ctx, c, hostName)
+		if err != nil {
+			return fmt.Errorf("read %s's certificate serial: %w", hostName, err)
+		}
+		pre := &pb.RemoveHostRequest{Name: hostName, Dead: true, ExpectedCertSerial: serial}
+		if _, err := c.PreflightRemoveHost(ctx, pre); err != nil && status.Code(err) != codes.Unimplemented {
+			return fmt.Errorf("the removal of %s would be refused: %w", hostName, err)
+		}
 		fmt.Println("Dry run: nothing was changed.")
 		return nil
 	}
@@ -119,9 +134,10 @@ func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, d
 		return err
 	}
 	closeRemovedHostAuditContract(ctx, c, hostName)
-	removed, err := c.RemoveHost(ctx, &pb.RemoveHostRequest{Name: hostName, Dead: true, ExpectedCertSerial: serial})
+	removed, err := removeAfterRevoke(ctx, c, &pb.RemoveHostRequest{Name: hostName, Dead: true, ExpectedCertSerial: serial},
+		"lv host rm --dead "+hostName)
 	if err != nil {
-		return fmt.Errorf("remove host after publishing its certificate revocation: %w", err)
+		return err
 	}
 	printRemoved(hostName, removed, "Host %s removed from the cluster for good.\n")
 	fmt.Printf("  revoked certificate %s in CRL %d before removing the host\n", serial, version)
@@ -168,6 +184,39 @@ func orDash(s string) string {
 	}
 	return s
 }
+
+// removeAfterRevoke is RemoveHost once the host's certificate is revoked and
+// the CRL published. The preflight passed moments before, so an Unavailable
+// now is most likely a voter's link or the currency pull failing for a
+// moment: it is retried after each removeRetryBackoff wait, and one that is
+// still Unavailable names rerun, which finishes it (the revocation is already
+// in place). Any other refusal is returned at once.
+func removeAfterRevoke(ctx context.Context, c pb.LiteVirtClient, req *pb.RemoveHostRequest, rerun string) (*pb.RemoveHostResponse, error) {
+	for attempt := 0; ; attempt++ {
+		removed, err := c.RemoveHost(ctx, req)
+		if err == nil {
+			return removed, nil
+		}
+		if status.Code(err) != codes.Unavailable {
+			return nil, fmt.Errorf("remove host after publishing its certificate revocation: %w", err)
+		}
+		if attempt >= len(removeRetryBackoff) {
+			return nil, fmt.Errorf("remove host after publishing its certificate revocation: %w\n"+
+				"the certificate is revoked; run `%s` to finish the removal", err, rerun)
+		}
+		fmt.Printf("  removal unavailable (%v); retrying in %s\n", err, removeRetryBackoff[attempt])
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("remove host after publishing its certificate revocation: %w\n"+
+				"the certificate is revoked; run `%s` to finish the removal", ctx.Err(), rerun)
+		case <-time.After(removeRetryBackoff[attempt]):
+		}
+	}
+}
+
+// removeRetryBackoff are the waits before each retry of a RemoveHost that
+// failed Unavailable after the revocation. A var so tests can shorten it.
+var removeRetryBackoff = []time.Duration{10 * time.Second, 20 * time.Second}
 
 // revokeAndPublish revokes the certificate of req's host in this machine's
 // CRL, once the daemon has said it would make the removal req asks for, and

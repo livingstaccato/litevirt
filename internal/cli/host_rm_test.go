@@ -3,11 +3,13 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pki"
@@ -27,6 +29,12 @@ type hostRemoveTestClient struct {
 	// preflightErr is PreflightRemoveHost's answer; preflightReq the request.
 	preflightErr error
 	preflightReq *pb.RemoveHostRequest
+	// removeErrs are RemoveHost's answers, one per call, before it succeeds.
+	removeErrs []error
+}
+
+func (c *hostRemoveTestClient) PlanDeadHostRemoval(_ context.Context, req *pb.PlanDeadHostRemovalRequest, _ ...grpc.CallOption) (*pb.PlanDeadHostRemovalResponse, error) {
+	return &pb.PlanDeadHostRemovalResponse{Host: req.GetName(), Fenced: true, FenceDetail: "ipmi power off"}, nil
 }
 
 func (c *hostRemoveTestClient) PreflightRemoveHost(_ context.Context, req *pb.RemoveHostRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
@@ -65,6 +73,13 @@ func (c *hostRemoveTestClient) RetireAuditKey(context.Context, *pb.RetireAuditKe
 func (c *hostRemoveTestClient) RemoveHost(_ context.Context, req *pb.RemoveHostRequest, _ ...grpc.CallOption) (*pb.RemoveHostResponse, error) {
 	c.calls = append(c.calls, "remove")
 	c.removeReq = req
+	if len(c.removeErrs) > 0 {
+		err := c.removeErrs[0]
+		c.removeErrs = c.removeErrs[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	if c.removeResp != nil {
 		return c.removeResp, nil
 	}
@@ -407,4 +422,116 @@ func TestHostRemove_ARefusedRemovalRevokesNothing(t *testing.T) {
 func revokeAndPublishOnly(c *hostRemoveTestClient) error {
 	_, _, err := revokeAndPublish(context.Background(), c, &pb.RemoveHostRequest{Name: "node-9", Dead: true})
 	return err
+}
+
+// rmTestPKI stages a CA under a fresh LV_CONFIG_DIR and returns its pki dir.
+func rmTestPKI(t *testing.T) string {
+	t.Helper()
+	configDir := t.TempDir()
+	t.Setenv("LV_CONFIG_DIR", configDir)
+	pkiDir := filepath.Join(configDir, "pki")
+	if err := os.MkdirAll(pkiDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := pki.GenerateCA(filepath.Join(pkiDir, "ca.crt"), filepath.Join(pkiDir, "ca.key")); err != nil {
+		t.Fatal(err)
+	}
+	return pkiDir
+}
+
+func countCalls(calls []string, name string) int {
+	n := 0
+	for _, c := range calls {
+		if c == name {
+			n++
+		}
+	}
+	return n
+}
+
+// Re-review m-3(a): once the certificate is revoked and the CRL published, a
+// RemoveHost that fails Unavailable (a voter's link flapped between the
+// preflight and the removal) is retried, a bounded number of times; a refusal
+// of another kind is not; and a removal that still fails names the exact
+// command to re-run.
+//
+// Mutations: call RemoveHost once (no retry) — "transient" fails; retry every
+// code — "refused" sees more than one RemoveHost; drop the re-run line —
+// "persistent" fails.
+func TestHostRemove_RetriesTheRemovalAfterTheRevocation(t *testing.T) {
+	old := removeRetryBackoff
+	removeRetryBackoff = []time.Duration{0, 0}
+	t.Cleanup(func() { removeRetryBackoff = old })
+	unavailable := status.Error(codes.Unavailable, "no peer completed the pull")
+	for _, dead := range []bool{false, true} {
+		run := func(c *hostRemoveTestClient) error {
+			if dead {
+				return HostRemoveDead(context.Background(), c, "node-9", false)
+			}
+			return HostRemove(context.Background(), c, "node-9", true)
+		}
+		rerun := "lv host rm --force node-9"
+		if dead {
+			rerun = "lv host rm --dead node-9"
+		}
+		t.Run(fmt.Sprintf("transient dead=%v", dead), func(t *testing.T) {
+			rmTestPKI(t)
+			c := &hostRemoveTestClient{removeErrs: []error{unavailable, unavailable}}
+			if err := run(c); err != nil {
+				t.Fatalf("a removal that succeeds on its third attempt: %v", err)
+			}
+			if n := countCalls(c.calls, "remove"); n != 3 {
+				t.Errorf("RemoveHost called %d times, want 3", n)
+			}
+		})
+		t.Run(fmt.Sprintf("persistent dead=%v", dead), func(t *testing.T) {
+			rmTestPKI(t)
+			c := &hostRemoveTestClient{removeErrs: []error{unavailable, unavailable, unavailable, unavailable}}
+			err := run(c)
+			if err == nil || !strings.Contains(err.Error(), rerun) {
+				t.Errorf("a removal that never succeeds: %v, want the re-run command %q", err, rerun)
+			}
+			if n := countCalls(c.calls, "remove"); n != 3 {
+				t.Errorf("RemoveHost called %d times, want 3", n)
+			}
+		})
+		t.Run(fmt.Sprintf("refused dead=%v", dead), func(t *testing.T) {
+			rmTestPKI(t)
+			c := &hostRemoveTestClient{removeErrs: []error{status.Error(codes.FailedPrecondition, "host has VMs")}}
+			if err := run(c); err == nil {
+				t.Fatal("a refused removal reported success")
+			}
+			if n := countCalls(c.calls, "remove"); n != 1 {
+				t.Errorf("RemoveHost called %d times for a FailedPrecondition, want 1", n)
+			}
+		})
+	}
+}
+
+// Re-review n-3: `lv host rm --dead --dry-run` asks the daemon whether it
+// would make the removal, so the dry run does not report a plan the removal
+// would refuse; it still revokes, publishes and removes nothing.
+//
+// Mutation: return before the preflight in the dry-run branch — the refusal
+// is not reported and no preflight request is seen.
+func TestHostRemoveDead_TheDryRunRunsThePreflight(t *testing.T) {
+	pkiDir := rmTestPKI(t)
+	c := &hostRemoveTestClient{preflightErr: status.Error(codes.Unavailable, "no peer completed the pull")}
+	err := HostRemoveDead(context.Background(), c, "node-9", true)
+	if err == nil || !strings.Contains(err.Error(), "no peer completed the pull") {
+		t.Errorf("a dry run the removal would refuse: %v, want the refusal", err)
+	}
+	if r := c.preflightReq; r == nil || !r.GetDead() || r.GetExpectedCertSerial() != "a1b2c3" {
+		t.Errorf("preflight request %v, want the dead removal's own request with the serial", r)
+	}
+	if len(c.calls) != 0 {
+		t.Errorf("calls = %v; a dry run changes nothing", c.calls)
+	}
+	if _, err := os.Stat(filepath.Join(pkiDir, "crl.pem")); err == nil {
+		t.Error("a dry run revoked the certificate")
+	}
+	ok := &hostRemoveTestClient{}
+	if err := HostRemoveDead(context.Background(), ok, "node-9", true); err != nil || ok.preflightReq == nil || len(ok.calls) != 0 {
+		t.Errorf("a dry run the removal would make: %v (preflight %v, calls %v)", err, ok.preflightReq, ok.calls)
+	}
 }

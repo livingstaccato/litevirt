@@ -32,6 +32,7 @@ import (
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hooks"
@@ -2489,6 +2490,16 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	// domain boots from that is missing here is written again first.
 	s.writeMissingSeedForStart(ctx, vm)
 	s.retryStaleSeedForStart(ctx, vm)
+	// A UEFI VM with Secure Boot or a vTPM keeps its vars under
+	// <data_dir>/nvram, which libvirt does not create: a host that never
+	// created such a VM has none when one is first started there after `lv
+	// update --secure-boot` or `--tpm` (lab2-D2-proof A2).
+	if fs := parseFirmwareSpec(vm.Spec); (fs.SecureBoot || fs.Tpm) && fs.hasNvram() && s.dataDir != "" {
+		if err := diskmode.MkdirAll(filepath.Dir(lv.NvramPath(s.dataDir, vm.Name))); err != nil {
+			releasePreflight()
+			return func() {}, status.Errorf(codes.Internal, "start %q: create the NVRAM directory: %v", vm.Name, err)
+		}
+	}
 	return releasePreflight, nil
 }
 

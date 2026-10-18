@@ -84,6 +84,9 @@ func TestStrandedOn_AFirmwareVMIsNotPromisedARecovery(t *testing.T) {
 		// restore-live --auto-start brings the NVRAM and TPM back.
 		if strings.Contains(d, "recovered at") || !strings.Contains(d, "never recovers") ||
 			!strings.Contains(d, "lv backup restore-live") || !strings.Contains(d, "--auto-start") ||
+			// fd re-review 2 N2-m4: without --blockpull the guest's disk is
+			// served by the foreground command, which a Ctrl+C stops.
+			!strings.Contains(d, "--blockpull") ||
 			strings.Contains(d, "restore-from") {
 			t.Errorf("%s plan line = %q; want no promised recovery and the restore command", n, d)
 		}

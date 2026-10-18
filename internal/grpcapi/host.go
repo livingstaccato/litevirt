@@ -1823,8 +1823,9 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 	if len(held) > 0 {
 		other := held[0].String("name")
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"%s:%d is %s's address: a machine is admitted under one name. Remove %s first (`lv host rm %s`) "+
-				"to add the machine as %s", req.Address, admitGRPCPort, other, other, other, req.Name)
+			"%s:%d is %s's address: a machine is admitted under one name. Remove %s first (`lv host rm %s`, or "+
+				"`lv host rm --dead %s` if it is fenced and gone for good) to add the machine as %s",
+			req.Address, admitGRPCPort, other, other, other, other, req.Name)
 	}
 	// A name whose removed machine still has workloads recorded on it is not
 	// given to a new machine: those rows are the old machine's, recovered by

@@ -340,7 +340,8 @@ func firmwareOnDeadHostDetail(name, host string) string {
 	return fmt.Sprintf("vm/%s uses Secure Boot / vTPM: failover never recovers it, because its firmware state "+
 		"(UEFI NVRAM, TPM) was kept on %s and is lost with it, and this removal does not change that. Restore it, "+
 		"firmware included, from a backup that carried it: `lv backup restore-live --repo <repo> --vm %s --disk "+
-		"<disk> --timestamp <ts> --auto-start --name <new>` (--name while this record still holds %s). If %s's "+
+		"<disk> --timestamp <ts> --auto-start --blockpull --name <new>` (--blockpull localizes the disk, so the "+
+		"guest does not depend on the command staying up; --name while this record still holds %s). If %s's "+
 		"disks survive, it returns with %s when the machine is added again under that name (`lv host add`). "+
 		"Otherwise remove it with `lv rm %s` and create it again",
 		name, host, name, name, host, host, name)

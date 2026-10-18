@@ -217,7 +217,10 @@ func TestAdmitHost_RefusesAnAddressAnotherHostHolds(t *testing.T) {
 			}
 			_, err := admit(s, "node-1")
 			if tc.refuse {
-				if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "other") {
+				// N2-n2: a machine rebuilt under a new name usually replaces a dead
+				// host, which `lv host rm --dead` removes.
+				if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "lv host rm other") ||
+					!strings.Contains(err.Error(), "lv host rm --dead other") {
 					t.Fatalf("admit at an address other holds = %v, want a refusal naming it", err)
 				}
 				if h, _ := corrosion.GetHost(ctx, s.db, "node-1"); h != nil {

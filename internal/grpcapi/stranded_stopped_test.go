@@ -44,3 +44,48 @@ func TestStrandedOn_ListsStoppedVMsWithTheirFate(t *testing.T) {
 		t.Errorf("st-shared plan line = %q", d)
 	}
 }
+
+// Lab recheck3 anomaly 3: `lv host rm --dead` said a Secure Boot / vTPM VM
+// would be "recovered at its current claim attempt", while failover never
+// recovers one (its firmware state died with the host) and logged that it
+// skipped it every pass. The plan now says so, names what the operator can
+// do, and does not count it as a recovery that will retry.
+//
+// Mutation: drop the firmware case — the line promises a recovery.
+func TestStrandedOn_AFirmwareVMIsNotPromisedARecovery(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminCtx()
+	for name, spec := range map[string]string{
+		"fw-sb":  `{"on_host_failure":"restart-any","secure_boot":true}`,
+		"fw-tpm": `{"on_host_failure":"restart-any","tpm":true}`,
+		"plain":  `{"on_host_failure":"restart-any"}`,
+	} {
+		if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+			Name: name, HostName: "gone", State: "running", Spec: spec,
+		}, nil, []corrosion.DiskRecord{{VMName: name, DiskName: "root", HostName: "gone",
+			Path: "/d/" + name, StorageType: "nfs"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := s.strandedOn(ctx, "gone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, st := range out {
+		got[st.Name] = st.Detail
+		if strings.HasPrefix(st.Name, "fw-") && st.NextAttempt != 0 {
+			t.Errorf("%s is counted as a recovery that retries", st.Name)
+		}
+	}
+	for _, n := range []string{"fw-sb", "fw-tpm"} {
+		d := got[n]
+		if strings.Contains(d, "recovered at") || !strings.Contains(d, "never recovers") ||
+			!strings.Contains(d, "lv backup restore-from") {
+			t.Errorf("%s plan line = %q; want no promised recovery and the restore command", n, d)
+		}
+	}
+	if d := got["plain"]; !strings.Contains(d, "recovered at its current claim attempt") {
+		t.Errorf("plain plan line = %q", d)
+	}
+}

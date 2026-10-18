@@ -6,9 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -70,17 +71,29 @@ vms:
 // logging its arguments to <dir>/<name>.calls, and a conntrackd stand-in that
 // logs and leaves a process running whose command line names its config, as
 // conntrackd's does.
+//
+// Each process left running records its pid in <dir>/standins.pids, and the
+// cleanup kills those pids and nothing else. Its shell runs 'sleep 600; true',
+// never 'sleep 600; :': branches without this cleanup still end each LB test
+// with `pkill -f "sleep 600; : .*<test name>"`, and the stand-ins' command
+// lines name their temp dir, which names the test. One such cleanup anywhere
+// on the host killed the stand-ins of every process running the test at that
+// moment, and each one's next apply started keepalived and conntrackd again
+// (TestLBStandIns_AnotherRunsCleanupLeavesThemAlone).
 func lbStandIns(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
+	pids := filepath.Join(dir, "standins.pids")
 	for name, body := range map[string]string{
 		"haproxy": "",
 		// keepalived daemonizes and writes its pidfile (-p); the apply
 		// restarts one that is not alive.
 		"keepalived": "while [ $# -gt 0 ]; do [ \"$1\" = -p ] && pidf=$2; shift; done\n" +
-			"nohup sh -c 'sleep 600; :' keepalived-standin " + dir + " >/dev/null 2>&1 &\necho $! > \"$pidf\"\n",
-		"sysctl":     "",
-		"conntrackd": "nohup sh -c 'sleep 600; :' conntrackd \"$@\" >/dev/null 2>&1 &\n",
+			"nohup sh -c 'sleep 600; true' keepalived-standin " + dir + " >/dev/null 2>&1 &\n" +
+			"echo $! > \"$pidf\"\necho $! >> " + pids + "\n",
+		"sysctl": "",
+		"conntrackd": "nohup sh -c 'sleep 600; true' conntrackd \"$@\" >/dev/null 2>&1 &\n" +
+			"echo $! >> " + pids + "\n",
 	} {
 		script := fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %s\n%s", filepath.Join(dir, name+".calls"), body)
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
@@ -88,13 +101,17 @@ func lbStandIns(t *testing.T) string {
 		}
 	}
 	t.Setenv("PATH", dir+":/usr/bin:/bin")
-	// The stand-ins' command lines name this test's temp dirs, under one root
-	// unique to this run. Matched by the test's name instead, the cleanup
-	// killed the stand-ins of the same test running in another process (a
-	// second worktree's gate on the same host), whose next apply then found
-	// keepalived dead and started it again: "keepalived started 3 times".
-	root := regexp.QuoteMeta(filepath.Dir(dir))
-	t.Cleanup(func() { exec.Command("pkill", "-f", "sleep 600; : .*"+root).Run() }) //nolint:errcheck
+	t.Cleanup(func() {
+		b, _ := os.ReadFile(pids)
+		for _, f := range strings.Fields(string(b)) {
+			pid, err := strconv.Atoi(f)
+			if err != nil || pid <= 0 {
+				continue
+			}
+			exec.Command("pkill", "-KILL", "-P", f).Run() //nolint:errcheck // its sleep
+			syscall.Kill(pid, syscall.SIGKILL)            //nolint:errcheck // gone already when an apply restarted it
+		}
+	})
 	return dir
 }
 

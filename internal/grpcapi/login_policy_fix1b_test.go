@@ -133,6 +133,58 @@ func TestI1_LocalChangeCutsAtOnce(t *testing.T) {
 	wantStreamCut(t, "a local disable with an hour-long recheck interval", done, 2*time.Second)
 }
 
+// I1: a kick that arrives WHILE a recheck runs is not lost. The watcher used
+// to take the channel it waits on after the recheck, so a kickStreams during
+// the recheck closed a channel nobody held and the stream waited a full
+// interval (an hour here) before looking again.
+func TestI1_KickDuringRecheckIsNotLost(t *testing.T) {
+	s := loginPolicyServer(t)
+	s.streamRecheckEvery = time.Hour
+	seedUser(t, s, "bob", "operator", "bob-pw")
+	var calls atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	hook := func(context.Context) error {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		return nil
+	}
+	recheckHook.Store(&hook)
+	t.Cleanup(func() { recheckHook.Store(nil) })
+	done, started := openStream(s, login(t, s, "bob", "bob-pw").Token)
+	<-started
+	// Start the first recheck with a kick, repeated until it is running.
+	for waiting := true; waiting; {
+		s.kickStreams()
+		select {
+		case <-entered:
+			waiting = false
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	s.kickStreams() // during the recheck
+	close(release)
+	deadline := time.After(5 * time.Second)
+	for calls.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatalf("a kick during a recheck was lost: %d recheck(s) ran, want a second within 5s", calls.Load())
+		case err := <-done:
+			t.Fatalf("stream ended unexpectedly: %v", err)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	// A watcher left holding a closed channel would recheck in a hot loop;
+	// with no further kicks the count settles (one extra recheck at most, from
+	// a start-up kick that landed after the first one woke the watcher).
+	time.Sleep(200 * time.Millisecond)
+	if n := calls.Load(); n > 3 {
+		t.Fatalf("the watcher kept rechecking with no kick: %d rechecks", n)
+	}
+}
+
 // I1: a stream with nothing wrong is not cut, across several rechecks.
 //
 // The test interval scales the fail-closed bound too (2.5 intervals), and a

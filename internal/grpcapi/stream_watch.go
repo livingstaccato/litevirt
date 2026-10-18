@@ -152,11 +152,14 @@ func (e errStreamCut) Error() string { return e.err.Error() }
 func (s *Server) watchStream(ctx context.Context) (context.Context, func()) {
 	wctx, cancel := context.WithCancelCause(ctx)
 	stopped := make(chan struct{})
+	// The channel the watcher waits on is taken BEFORE anything that reads
+	// credential state, and before the goroutine exists: a kickStreams after
+	// this returns closes it whether or not the goroutine has run yet.
+	kick := s.kickChan()
 	go func() {
 		lastOK := s.streamNow()
 		wait := s.streamRecheckInterval()
 		for {
-			kick := s.kickChan()
 			timer := time.NewTimer(wait)
 			select {
 			case <-stopped:
@@ -169,6 +172,11 @@ func (s *Server) watchStream(ctx context.Context) (context.Context, func()) {
 			case <-kick:
 				timer.Stop()
 			}
+			// Retake the channel BEFORE the recheck reads state: a kick during
+			// the recheck closes this one, and the next select returns at
+			// once. (The transient-retry continue below keeps it, so it waits
+			// on a live, unclosed channel and cannot spin.)
+			kick = s.kickChan()
 			remaining := s.streamRecheckBound() - s.streamNow().Sub(lastOK)
 			err := s.recheckWithTimeout(wctx, remaining)
 			var transient errTransientRecheck

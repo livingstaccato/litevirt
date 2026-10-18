@@ -45,6 +45,61 @@ type UpgradeOpts struct {
 	Yes        bool     // skip confirmation prompt
 	Force      bool     // skip preflight blocks (warnings still printed)
 	NoPreStage bool     // skip the cluster-wide schema pre-stage pass
+	// SkipPreStage names members outside the upgrade that are down: each is
+	// pre-staged if it answers, and otherwise left behind with a warning.
+	SkipPreStage []string
+}
+
+// checkSkipPreStage refuses --skip-prestage without the pre-stage pass, and
+// a name that is not a member this upgrade would pre-stage without swapping:
+// a target is always pre-staged before its swap, and a member already on the
+// binary's build is neither swapped nor pre-staged.
+func checkSkipPreStage(opts UpgradeOpts, hosts, targets, others []*pb.Host) error {
+	if len(opts.SkipPreStage) == 0 {
+		return nil
+	}
+	if opts.NoPreStage {
+		return fmt.Errorf("--skip-prestage has no effect with --no-prestage, which pre-stages no host; pass one or the other")
+	}
+	find := func(list []*pb.Host, name string) *pb.Host {
+		for _, h := range list {
+			if h.Name == name {
+				return h
+			}
+		}
+		return nil
+	}
+	for _, n := range opts.SkipPreStage {
+		h := find(hosts, n)
+		switch {
+		case h == nil:
+			return fmt.Errorf("--skip-prestage %s: %s is not a member (lv host ls)", n, n)
+		case find(targets, n) != nil:
+			return fmt.Errorf("--skip-prestage %s: %s is a target of this upgrade; only a member outside it can be skipped", n, n)
+		case find(others, n) == nil:
+			return fmt.Errorf("--skip-prestage %s: %s already runs %s, the binary's version, so this upgrade neither swaps nor pre-stages it",
+				n, n, versionLabel(h.Version))
+		}
+	}
+	return nil
+}
+
+// sameBuild reports whether a member running version runs the build probed
+// from the binary. Only a version that names one commit says so: not an
+// unprobed binary, not "dev", and not a -dirty tree.
+func sameBuild(probed, version string) bool {
+	if probed == "" || probed == "dev" || strings.HasSuffix(probed, "-dirty") {
+		return false
+	}
+	return version == probed
+}
+
+func skipSet(names []string) map[string]bool {
+	out := make(map[string]bool, len(names))
+	for _, n := range names {
+		out[n] = true
+	}
+	return out
 }
 
 // hostResult tracks the outcome of upgrading a single host.
@@ -90,7 +145,8 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 	// cluster (every host matches the connected daemon, so nothing looks
 	// "outdated", even though X is newer). Fall back to the connected daemon's
 	// version only if the binary can't be probed (e.g. cross-arch).
-	targetVersion := binaryVersion(ctx, opts.BinaryPath)
+	probedVersion := binaryVersion(ctx, opts.BinaryPath)
+	targetVersion := probedVersion
 	if targetVersion == "" && pingResp != nil {
 		targetVersion = pingResp.Version
 	}
@@ -114,9 +170,19 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 
 	var remoteTargets []*pb.Host // other hosts — upgraded first
 	var selfTarget *pb.Host      // the connected host — upgraded last
+	var others []*pb.Host        // members left on their binary — pre-staged only
 
 	for _, h := range resp.Hosts {
+		// Current only when the version names one build: never dev or -dirty.
+		current := sameBuild(targetVersion, h.Version)
 		if named && !filterSet[h.Name] {
+			// A member already on the version of the binary has its schema.
+			// Only a probed version says so: the connected daemon's says
+			// nothing about the binary, so without one every member is
+			// pre-staged.
+			if !sameBuild(probedVersion, h.Version) {
+				others = append(others, h)
+			}
 			continue
 		}
 		// In "all" mode, skip hosts already on the target (the --binary's)
@@ -125,7 +191,7 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 		// manual change), so a version match must not silently skip it — that
 		// no-op once forced the unsafe bare-restart workaround. See
 		// docs/upgrades.md.
-		if !named && targetVersion != "" && h.Version == targetVersion {
+		if !named && current {
 			continue
 		}
 		if h.Name == connectedHost {
@@ -141,6 +207,18 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 		targets = append(targets, selfTarget)
 	}
 
+	if err := checkSkipPreStage(opts, resp.Hosts, targets, others); err != nil {
+		return err
+	}
+
+	if len(targets) == 0 && !named && probedVersion == "" {
+		// Every host matched only the connected daemon's version, which says
+		// nothing about the binary: no proof that any host is up to date.
+		return fmt.Errorf("cannot tell which hosts are outdated: the version of %s could not be read "+
+			"(`%s --version` did not run here, e.g. a binary built for another architecture); "+
+			"check the path given to --binary, or name the hosts to upgrade (lv host upgrade <host>...)",
+			opts.BinaryPath, opts.BinaryPath)
+	}
 	if len(targets) == 0 {
 		fmt.Println("All hosts are up-to-date.")
 		return nil
@@ -158,6 +236,16 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n", h.Name, h.Address, versionLabel(h.Version), note)
 	}
 	tw.Flush()
+	if len(others) > 0 && !opts.NoPreStage {
+		names := make([]string, len(others))
+		for i, h := range others {
+			names[i] = h.Name
+		}
+		fmt.Printf("\n  schema also pre-staged, binary unchanged: %s\n", strings.Join(names, ", "))
+		if probedVersion == "" {
+			fmt.Println("  (the binary's version could not be probed, so every member is pre-staged)")
+		}
+	}
 	fmt.Println()
 
 	// Confirm unless --yes.
@@ -172,16 +260,21 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 		}
 	}
 
-	// Phase 1 — pre-stage schema on every target BEFORE swapping any binary.
+	// Phase 1 — pre-stage schema on every member BEFORE swapping any binary:
+	// the targets, and every member this upgrade leaves on its binary, which
+	// would otherwise refuse each push from an upgraded target.
 	// This streams the new binary to each host and runs its `schema-migrate`
 	// against the live state.db (safe: WAL + busy-timeout, idempotent). After
 	// this pass every node's DB has the new schema, so the rolling restart in
 	// phase 2 never produces a peer that's missing columns — which is the only
-	// thing that makes a multi-version rolling upgrade unsafe. Older daemons
-	// without the PreStageUpgrade RPC report Unimplemented and are skipped (they
-	// migrate themselves on restart; single-version skew self-heals).
+	// thing that makes a multi-version rolling upgrade unsafe. Targets on older
+	// daemons without the PreStageUpgrade RPC report Unimplemented and are
+	// skipped (they migrate themselves on restart; single-version skew
+	// self-heals). Every member is probed first, and a member that cannot be
+	// pre-staged refuses the upgrade with nothing pre-staged, unless
+	// --skip-prestage names it.
 	if !opts.NoPreStage {
-		if err := preStageSchema(ctx, client, targets, opts.BinaryPath, opts.Force); err != nil {
+		if err := preStageSchema(ctx, client, targets, others, opts.BinaryPath, skipSet(opts.SkipPreStage)); err != nil {
 			return err
 		}
 	}

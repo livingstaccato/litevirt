@@ -1877,10 +1877,67 @@ WAL + busy-timeout — safe while the old daemon is up). Only after every node's
 schema is forward-staged does it begin the rolling restart, so a freshly-
 upgraded node can never write a column a not-yet-upgraded peer is missing.
 If pre-staging fails on any host the upgrade aborts **before** any binary is
-swapped, so you can fix it and re-run. Daemons too old to support the
-pre-stage RPC report `Unimplemented` and are skipped (they migrate themselves
-on restart; a single-version skew self-heals) — so the very upgrade that
-introduces this feature still works as a plain rolling restart. Pass
+swapped, so you can fix it and re-run.
+
+An upgrade of some hosts (`lv host upgrade host-b`) pre-stages **every other
+member** too, and leaves their binaries alone: a member left on the old
+schema refuses every push from an upgraded host. A member is skipped only
+when it already runs the version `lv` probed from `--binary`, and that
+version names one build: a `dev` build or a `-dirty` tree never matches, and
+neither is treated as up to date by `lv host upgrade` with no host names.
+"The same build" means the identical version string (`git describe` at build
+time). Two builds that share one defeat it: a `VERSION=` override reused for
+different code, or a tree whose only change is an untracked file, which
+`--dirty` does not see. Build those with a distinct `VERSION`. When the
+binary cannot be probed (built for another architecture), every member is
+pre-staged, and `lv host upgrade` with no host names refuses rather than
+report every host up to date: check the path given to `--binary`, or name
+the hosts to upgrade.
+
+A pre-staged host advertises the new schema at once, so the upgrade first
+checks that every member answers (the read-only `lv host preflight-upgrade`
+call) and pre-stages nothing until all do. A member that does not answer
+(down, unreachable, or a daemon without the upgrade RPCs) refuses the
+upgrade, naming it, with nothing changed on any host. Then bring it back and
+re-run, upgrade it with the rest, remove it with `lv host rm <host>`, or name
+it with `--skip-prestage <host>[,<host>]`. `--skip-prestage` pre-stages a
+named member anyway if it answers, and otherwise leaves it on its old schema
+with a warning; the targets' preflight blocks still apply. A skipped member
+refuses replication from every upgraded host once it is back, until
+`lv host upgrade <host>` reaches it, and while it does so `lv health` reports
+[`replication_peer_schema_behind`](diagnostics.md#a-peer-refuses-replication-its-schema-is-behind-replication_peer_schema_behind)
+on every node running this release or later. `--force` only skips preflight
+blocks; it does not pass a member that cannot be pre-staged.
+
+Every member is probed in parallel, a few at a time, and a member that does
+not answer within 30 seconds counts as one that does not answer.
+
+If a pre-stage fails after every member answered (a full disk, or a binary
+built for another architecture), the hosts already pre-staged stay at the new
+schema (it cannot be undone), the rest are still pre-staged, and the refusal
+names them and the host that failed. That host refuses their pushes until it
+is pre-staged: fix it and re-run, re-run with a binary built for that host,
+or, for a member outside the upgrade, proceed without it with
+`--skip-prestage <host>` and pre-stage it later. While it refuses, `lv health`
+reports `replication_peer_schema_behind` only on nodes running this release
+or later: on the rollout into this release every node still runs the old one,
+so the refusal printed by `lv host upgrade` is the only sign.
+
+A member pre-staged without its binary keeps running, and restarts safely,
+on its old binary: that binary starts on the newer schema. Two things stay
+until its own upgrade:
+
+- The staged binary is left at `<daemon binary>.new` (for example
+  `/usr/local/bin/litevirt.new`). Nothing starts it; the member's own upgrade
+  overwrites it.
+- A previous-release daemon on the new schema cannot record a tie
+  acknowledgement: `lv cluster acknowledge-lease-term` on that host fails
+  with `persist acknowledgement`. Upgrade the host first, then acknowledge.
+
+A **target** whose daemon is too old to support the pre-stage RPC reports
+`Unimplemented` and is skipped (it migrates itself on restart; a
+single-version skew self-heals) — so the very upgrade that introduces this
+feature still works as a plain rolling restart. Pass
 `--no-prestage` to skip the pass (not recommended for multi-version jumps).
 
 You generally do **not** need to run `schema-migrate` by hand. It

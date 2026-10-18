@@ -503,6 +503,7 @@ func (s *Server) PushMutations(ctx context.Context, req *pb.ReplicateRequest) (*
 				"sender_db_schema", req.SenderSchemaVersion,
 				"local_db_schema", localDB,
 				"sender_version", req.SenderVersion)
+			s.noteSchemaRefusedPush(req.Sender, int(req.SenderSchemaVersion), localDB)
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"sender DB schema version %d, local %d (receiver is missing migrations; pre-stage/upgrade this node)",
 				req.SenderSchemaVersion, localDB)

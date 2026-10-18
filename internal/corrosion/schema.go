@@ -750,6 +750,10 @@ func (c *Client) migrateAcknowledgedTiesPK(ctx context.Context) error {
 //   - present  → record it (mark-only; the ALTER/CREATE already happened)
 //   - missing  → apply its SQL + record it in ONE local transaction (heal)
 //
+// A missing unit newer than the database's stamped schema_state.version is
+// the upgrade's own step and logs at INFO; one at or below it is a silent gap
+// and logs a WARN.
+//
 // A real apply error aborts LOUDLY (no benign swallowing). Mark-applied is
 // gated on the presence predicate, NEVER on the version number, so a silent
 // gap from the old swallow-benign loop is healed rather than falsely claimed.
@@ -812,8 +816,16 @@ func InitSchema(ctx context.Context, c *Client) error {
 		return fmt.Errorf("load applied_migrations: %w", err)
 	}
 
+	// The version the database was stamped at before this run. A missing unit
+	// newer than it is this upgrade's own step; one at or below it is a gap a
+	// prior daemon left. A fresh database has no stamp, so nothing is a gap.
+	stamped := 0
+	if rows, err := c.Query(ctx, `SELECT version FROM schema_state WHERE id = 1`); err == nil && len(rows) > 0 {
+		stamped = rows[0].Int("version")
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339)
-	healed := 0
+	healed, upgraded := 0, 0
 	for _, m := range schemaMigrationLedger {
 		sum := sha256hex(m.SQL)
 		if stored, ok := applied[m.ID]; ok {
@@ -860,8 +872,14 @@ func InitSchema(ctx context.Context, c *Client) error {
 		if err := c.execBatchLocal(ctx, stmts); err != nil {
 			return fmt.Errorf("schema migration %q: %w", m.ID, err)
 		}
+		if m.Version > stamped {
+			slog.Info("schema ledger: applied a migration of this upgrade",
+				"id", m.ID, "target", m.Target, "migration_version", m.Version, "db_version", stamped)
+			upgraded++
+			continue
+		}
 		slog.Warn("schema ledger: healed a missing migration (silent gap from a prior daemon)",
-			"id", m.ID, "target", m.Target)
+			"id", m.ID, "target", m.Target, "migration_version", m.Version, "db_version", stamped)
 		healed++
 	}
 
@@ -885,7 +903,7 @@ func InitSchema(ctx context.Context, c *Client) error {
 	// Seed the effective DB-applied schema cache (handshake source of truth).
 	eff := c.RefreshDBSchemaVersion(ctx)
 	slog.Info("schema initialized",
-		"schema_version", eff, "ledger", len(schemaMigrationLedger), "healed", healed)
+		"schema_version", eff, "ledger", len(schemaMigrationLedger), "upgraded", upgraded, "healed", healed)
 	return nil
 }
 

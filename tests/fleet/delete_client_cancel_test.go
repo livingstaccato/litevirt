@@ -666,6 +666,11 @@ func TestFleet_ARollingRecreateWhoseClientLeavesStillCreatesTheVM(t *testing.T) 
 	})
 	node.Server.SetRecreateTornDownHookForTest(nil)
 	assertReplaced(t, node, "hb-1", `"image":"test2"`)
+	// The stack record holds the file that replaced hb-1, not the one it
+	// replaced (lab2-delcancel-proof N4).
+	if st, err := corrosion.GetStack(ctx, node.DB, "hb"); err != nil || st == nil || st.ComposeYAML != update {
+		t.Errorf("stack record after the client left mid re-create = %+v (%v), want the new file", st, err)
+	}
 }
 
 // The same for lv rebuild: torn down, then created again from its stored

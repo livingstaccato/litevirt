@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -251,12 +252,14 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// From here on the deploy issues workload actions, on this host and on
 	// peers, and its firewall rows stay whatever happens (see above).
 	workloadPhase = true
-	// A deploy that stops here on a failed progress send (its client went
-	// away) has acted already, and a re-create it started finishes whatever
-	// becomes of the client: the file is recorded, degraded, since the rest
-	// of the plan did not run.
+	// A deploy whose client went away after it tore a VM down to re-create
+	// it has replaced that VM with the new file's, whatever becomes of the
+	// client: the file is recorded, degraded, since the rest of the plan did
+	// not run. A deploy that tore nothing down, or that stopped for another
+	// reason (a rolling update's fail-fast), leaves the record as it was.
+	ctx, replaced := withReplaceMark(ctx)
 	defer func() {
-		if err != nil {
+		if err != nil && replaced.Load() && ctx.Err() != nil {
 			s.recordStackDeploy(ctx, f, req.ComposeYaml, stackStateDegraded)
 		}
 	}()
@@ -318,6 +321,23 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 		vmOps, len(resolved.Networks), len(resolved.LBs)))
 	s.audit(ctx, "stack.deploy", f.Name, fmt.Sprintf("%d VM ops", vmOps), "ok")
 	return nil
+}
+
+// replaceMarkKey carries a deploy's record that one of its re-creates tore
+// a VM down.
+type replaceMarkKey struct{}
+
+func withReplaceMark(ctx context.Context) (context.Context, *atomic.Bool) {
+	b := &atomic.Bool{}
+	return context.WithValue(ctx, replaceMarkKey{}, b), b
+}
+
+// markReplaced records in the deploy carrying ctx, if any, that a re-create
+// tore its VM down.
+func markReplaced(ctx context.Context) {
+	if b, ok := ctx.Value(replaceMarkKey{}).(*atomic.Bool); ok {
+		b.Store(true)
+	}
 }
 
 // stackRecordTimeout bounds recordStackDeploy.

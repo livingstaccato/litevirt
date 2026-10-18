@@ -127,20 +127,23 @@ func TestDeleteContainerOnRemovedHost_ClearsItsTagsWhenItsClientLeaves(t *testin
 	}
 }
 
-// goneClientDeployStream is a deploy stream whose client goes away once the
-// re-create of vm is done: that "done" and every send after it fail, and the
-// stream's context is cancelled.
-type goneClientDeployStream struct {
+// failingDeployStream is a deploy stream whose sends fail once the re-create
+// of vm is done: that "done" and every send after it. With cancel set the
+// client has gone (the stream's context is cancelled); without it the send
+// failed while the client is still there.
+type failingDeployStream struct {
 	mockDeployStream
 	vm     string
 	cancel context.CancelFunc
-	gone   bool
+	failed bool
 }
 
-func (m *goneClientDeployStream) Send(p *pb.DeployProgress) error {
-	if m.gone || (p.Phase == "done" && p.VmName == m.vm) {
-		m.gone = true
-		m.cancel()
+func (m *failingDeployStream) Send(p *pb.DeployProgress) error {
+	if m.failed || (p.Phase == "done" && p.VmName == m.vm) {
+		m.failed = true
+		if m.cancel != nil {
+			m.cancel()
+		}
 		return context.Canceled
 	}
 	return m.mockDeployStream.Send(p)
@@ -149,42 +152,61 @@ func (m *goneClientDeployStream) Send(p *pb.DeployProgress) error {
 // A compose up whose client goes away after a member's re-create (its "done"
 // cannot be sent) still records the file it deployed: the stack record
 // holds the new compose file, degraded, not the one the re-create replaced.
+// A deploy that stops there for another reason, its client still there,
+// leaves the record as the last deploy that ran to its end wrote it.
 //
-// Mutation: drop the record on a failed progress send — the record keeps the
-// old file.
+// Mutations: drop the record on a failed progress send, or write it on the
+// request context — "client gone" keeps the old file; drop the client-gone
+// condition — "client still there" records the new file.
 func TestDeployStack_AClientGoneAfterTheRecreateStillRecordsTheNewFile(t *testing.T) {
-	s := inlineStackServer(t, `{"name":"lan"}`)
-	createFakeImage(t, s, "img-b")
-	bg := context.Background()
-	oldYAML := "name: st\nnetworks:\n  lan:\n    external: true\nvms:\n  web:\n    image: img-a\n    cpu: 1\n" +
-		"    memory: 256\n    network:\n      - name: lan\n"
-	if err := corrosion.UpsertStack(bg, s.db, corrosion.StackRecord{Name: "st", ComposeHash: "old",
-		ComposeYAML: oldYAML, State: stackStateActive}); err != nil {
-		t.Fatal(err)
-	}
-	newYAML := strings.Replace(oldYAML, "img-a", "img-b", 1)
-	ctx, cancel := context.WithCancel(adminCtx())
-	defer cancel()
-	stream := &goneClientDeployStream{mockDeployStream: mockDeployStream{ctx: ctx}, vm: "web", cancel: cancel}
+	for _, c := range []struct {
+		name       string
+		clientGone bool
+	}{{"client gone", true}, {"client still there", false}} {
+		t.Run(c.name, func(t *testing.T) {
+			s := inlineStackServer(t, `{"name":"lan"}`)
+			createFakeImage(t, s, "img-b")
+			bg := context.Background()
+			oldYAML := "name: st\nnetworks:\n  lan:\n    external: true\nvms:\n  web:\n    image: img-a\n    cpu: 1\n" +
+				"    memory: 256\n    network:\n      - name: lan\n"
+			if err := corrosion.UpsertStack(bg, s.db, corrosion.StackRecord{Name: "st", ComposeHash: "old",
+				ComposeYAML: oldYAML, State: stackStateActive}); err != nil {
+				t.Fatal(err)
+			}
+			newYAML := strings.Replace(oldYAML, "img-a", "img-b", 1)
+			ctx, cancel := context.WithCancel(adminCtx())
+			defer cancel()
+			stream := &failingDeployStream{mockDeployStream: mockDeployStream{ctx: ctx}, vm: "web"}
+			if c.clientGone {
+				stream.cancel = cancel
+			}
 
-	err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: newYAML}, stream)
-	if !stream.gone {
-		t.Fatalf("the re-create never reported done; the scenario missed the window (err %v, sent %+v)", err, stream.sent)
-	}
-	if err == nil {
-		t.Fatal("a deploy whose progress could not be sent answered OK")
-	}
-	if vm, _ := corrosion.GetVM(bg, s.db, "web"); vm == nil || !strings.Contains(vm.Spec, `"img-b"`) {
-		t.Fatalf("premise: web is not the re-created VM: %+v", vm)
-	}
-	st, gerr := corrosion.GetStack(bg, s.db, "st")
-	if gerr != nil || st == nil {
-		t.Fatalf("stack record: %+v, %v", st, gerr)
-	}
-	if st.ComposeYAML != newYAML {
-		t.Errorf("the stack record holds the file the re-create replaced:\n%s", st.ComposeYAML)
-	}
-	if st.State != stackStateDegraded {
-		t.Errorf("stack state = %q, want %q: the rest of the plan did not run", st.State, stackStateDegraded)
+			err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: newYAML}, stream)
+			if !stream.failed {
+				t.Fatalf("the re-create never reported done; the scenario missed the window (err %v, sent %+v)", err, stream.sent)
+			}
+			if err == nil {
+				t.Fatal("a deploy whose progress could not be sent answered OK")
+			}
+			if vm, _ := corrosion.GetVM(bg, s.db, "web"); vm == nil || !strings.Contains(vm.Spec, `"img-b"`) {
+				t.Fatalf("premise: web is not the re-created VM: %+v", vm)
+			}
+			st, gerr := corrosion.GetStack(bg, s.db, "st")
+			if gerr != nil || st == nil {
+				t.Fatalf("stack record: %+v, %v", st, gerr)
+			}
+			if !c.clientGone {
+				if st.ComposeYAML != oldYAML || st.State != stackStateActive {
+					t.Errorf("a deploy that stopped with its client still there rewrote the record: state %q\n%s", st.State, st.ComposeYAML)
+				}
+				return
+			}
+			if st.ComposeYAML != newYAML {
+				t.Errorf("the stack record holds the file the re-create replaced:\n%s", st.ComposeYAML)
+			}
+			if st.State != stackStateDegraded {
+				t.Errorf("stack state = %q, want %q: the rest of the plan did not run", st.State, stackStateDegraded)
+			}
+		})
 	}
 }

@@ -145,6 +145,8 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 		// The delete removed nothing: the create is a fresh one, and stays
 		// the caller's to cancel.
 		ctx = callerCtx
+	} else {
+		markReplaced(ctx)
 	}
 	if hook := o.s.recreateDeleted; hook != nil {
 		hook(target)
@@ -656,6 +658,7 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 		return fmt.Errorf("delete before recreate: %w", delErr)
 	}
 	if tornDown {
+		markReplaced(ctx)
 		// Only a create that replaces what the delete removed runs whatever
 		// becomes of the caller; a fresh one stays the caller's to cancel.
 		var cancelCreate context.CancelFunc

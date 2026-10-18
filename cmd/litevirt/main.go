@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -54,16 +55,18 @@ func main() {
 			os.Exit(lxc.RunHook(os.Args[2:]))
 		}
 	}
-	if err := newRootCmd().Execute(); err != nil {
-		// A silent typed exit carries the code and has already said everything
-		// it wants to say (e.g. `lv health` printed its report; the code IS the
-		// answer). Printing a generic Error: line would bury the report.
-		if code, ok := exitCodeOf(err); ok {
-			os.Exit(code)
-		}
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+	root := newRootCmd()
+	args := os.Args[1:]
+	ctx, caught := context.Background(), func() os.Signal { return nil }
+	stop := func() {}
+	if !handlesOwnSignals(root, args) {
+		in := newInterrupts(ctx, os.Exit)
+		stop = in.watch()
+		ctx, caught = in.ctx, in.caught
 	}
+	code := runRoot(ctx, root, args, caught, os.Stderr)
+	stop()
+	os.Exit(code)
 }
 
 // bootstrapDefaultLogger installs a plain, real slog handler as the

@@ -283,9 +283,10 @@ becomes of the client: the record is tombstoned, or the delete fails with the
 VM recorded `stopped` (`operator-stop`) as above, unless its record has moved
 to another host meanwhile. Its cluster writes from that point have 10 minutes;
 libvirt and storage calls are not cut short. `lv ct rm` behaves the same from
-the container's runtime delete on. An interrupted command reports that the
-delete may still complete on its host, and names `lv ls` (`lv ct ls` for a
-container, `lv compose ls` for a stack) to see the outcome.
+the container's runtime delete on. A command interrupted by Ctrl-C or SIGTERM
+reports that the delete may still complete on its host, names `lv ls` (`lv ct
+ls` for a container, `lv compose ls` for a stack) to see the outcome, and exits
+130 (143 for SIGTERM). A second Ctrl-C exits at once, without the report.
 
 `lv rebuild` and a `lv compose up` that re-creates a VM work the same way.
 Interrupted before the re-create sends its delete (a rebuild: before its

@@ -70,3 +70,42 @@ func TestDeletedVM_RemovesItsRemovedSeedRecord(t *testing.T) {
 		})
 	}
 }
+
+// Re-review 3, m-4: a VM deleted while this host stays active (the delete's
+// request missed it) loses its removed-seed record at the sweep's next look,
+// not only at the host's next activation; a VM with a live row keeps its.
+//
+// Mutation: sweep the records only on an activation — red.
+func TestDeletedVM_ActiveHostSweepsRemovedSeedRecords(t *testing.T) {
+	s := testServerWithLocks(t)
+	s.virt = libvirtfake.New()
+	s.dataDir = t.TempDir()
+	ctx := adminCtx()
+	if err := os.MkdirAll(filepath.Join(s.dataDir, "cloudinit"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: s.hostName, Address: "10.0.0.1", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	s.db.MarkReplicaCaughtUpForTests("peer")
+	for _, name := range []string{"gone", "live"} {
+		if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: name, HostName: "owner-host", State: "stopped",
+			Spec: `{"name":"` + name + `","uuid":"uuid-` + name + `"}`}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := cloudinit.RecordRemovedSeed(lv.CloudInitISOPath(s.dataDir, name), "uuid-"+name, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.DeletedVMMarkerSweepTick(ctx) // the activation: nothing deleted yet
+	if err := corrosion.DeleteVM(ctx, s.db, "gone"); err != nil {
+		t.Fatal(err)
+	}
+	s.DeletedVMMarkerSweepTick(ctx) // still active
+	for name, want := range map[string]bool{"gone": false, "live": true} {
+		_, err := os.Stat(lv.CloudInitISOPath(s.dataDir, name) + ".removed")
+		if got := err == nil; got != want {
+			t.Errorf("%s: record present = %v, want %v", name, got, want)
+		}
+	}
+}

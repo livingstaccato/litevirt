@@ -60,7 +60,8 @@ func (s *Server) RunDeletedVMMarkerSweep(ctx context.Context) {
 
 // DeletedVMMarkerSweepTick is one look of RunDeletedVMMarkerSweep: it reads
 // this host's state and sweeps when the host is active and was not at the
-// previous look — or there was none, as at a daemon start.
+// previous look — or there was none, as at a daemon start. At every other
+// look that finds it active it sweeps the removed-seed records alone.
 //
 // A look that could not act changes nothing, so the next one that can still
 // sees the activation:
@@ -87,10 +88,18 @@ func (s *Server) DeletedVMMarkerSweepTick(ctx context.Context) {
 	defer s.markerSweepMu.Unlock()
 	prev, seen := s.markerSweepLastState, s.markerSweepSeen
 	s.markerSweepLastState, s.markerSweepSeen = h.State, true
-	if h.State == "active" && (!seen || prev != "active") {
-		s.sweepDeletedVMMarkers(ctx)
-		s.sweepDeletedVMSeedRecords(ctx)
+	if h.State != "active" {
+		return
 	}
+	if !seen || prev != "active" {
+		s.sweepDeletedVMMarkers(ctx)
+		s.sweepDeletedVMSeedRecords(ctx, true)
+		return
+	}
+	// A VM deleted while this host stayed active, by a request that missed
+	// it: its removed-seed records go at the next look, skipping a VM whose
+	// lock is held (re-review 3, m-4).
+	s.sweepDeletedVMSeedRecords(ctx, false)
 }
 
 // sweepDeletedVMMarkers removes the owner-epoch marker of every VM this
@@ -124,8 +133,9 @@ func (s *Server) sweepDeletedVMMarkers(ctx context.Context) {
 // (<data_dir>/cloudinit/<vm>.iso.removed, written when a live move took the
 // seed away from this host) of every VM this host's replica records as
 // deleted, when the record was kept for that VM's uuid. Another VM's, or one
-// of a VM with a live row, is never touched.
-func (s *Server) sweepDeletedVMSeedRecords(ctx context.Context) {
+// of a VM with a live row, is never touched. Without wait, a VM whose lock
+// is held is left for a later look.
+func (s *Server) sweepDeletedVMSeedRecords(ctx context.Context, wait bool) {
 	if s.dataDir == "" {
 		return
 	}
@@ -138,7 +148,10 @@ func (s *Server) sweepDeletedVMSeedRecords(ctx context.Context) {
 		if !ok || e.IsDir() || safename.ValidateVMName(name) != nil {
 			continue
 		}
-		unlock := s.lockVM(name)
+		unlock, ok := s.lockVMOrSkip(name, wait)
+		if !ok {
+			continue
+		}
 		s.forgetDeletedVMSeedRecord(ctx, name)
 		unlock()
 	}

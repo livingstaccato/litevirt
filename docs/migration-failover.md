@@ -335,7 +335,10 @@ the drain goes on with the other VMs and ends incomplete, naming it. The host
 carries `drain_move_timed_out` (see [Diagnostics](diagnostics.md)) until a
 drain of it has no such move or `lv host undrain` runs. A move that libvirt
 completed before the abort took is recorded on the target, as any completed
-move. After the cut-over the source's
+move. If libvirt does not answer the abort within 2 minutes, the drain goes
+on without it: the move is finished in the background, which records the VM
+on whichever host it ends on, and no cold move is tried while it can still
+complete. Watch it with `lv events <vm>`. After the cut-over the source's
 cloud-init ISO is removed and DNS, load-balancer backends and VXLAN
 forwarding entries follow the VM, as for a migration. A live attempt that
 fails takes back the cloud-init ISO it put on the target before the cold move

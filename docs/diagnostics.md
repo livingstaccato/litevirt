@@ -2686,7 +2686,10 @@ stay named from memory, and fixing or removing the file recovers.
 `drain_move_timed_out` (evaluator `drain`, subject `host/<host>`, warning)
 names the VMs whose live move off a drained host did not finish within the
 VM's migration policy `timeout-sec` and was aborted. Each keeps running on
-that host; the drain did not shut it down for a cold move. Raise the VM's
+that host; the drain did not shut it down for a cold move. One whose abort
+libvirt did not answer is finished in the background and ends on that host or
+on its target (its drain result says which may happen; `lv events <vm>` shows
+where it ended). Raise the VM's
 `timeout-sec`, move it with `lv migrate <vm> <target-host>`, or stop it with
 `lv stop <vm>` and run `lv host drain <host>` again. The condition is resolved
 by a drain of the host that has no such move, and by `lv host undrain <host>`.

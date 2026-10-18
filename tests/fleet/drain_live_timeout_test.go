@@ -204,3 +204,97 @@ func TestFleet_DrainLiveMoveThatCompletesAsItIsAbortedIsRecordedOnTheTarget(t *t
 		t.Fatal("drain_move_timed_out was raised for a move that completed")
 	}
 }
+
+// libvirt does not answer the abort of a timed-out live move within its
+// bound. The drain does not wait on it: the move is handed to a background
+// owner, the drain worker goes on, and the VM is named in the drain's result
+// and in drain_move_timed_out. No cold move is started while the live job may
+// still complete, so the guest is never on two hosts. When libvirt then ends
+// the job, the background owner records where the guest is: on the target
+// after a completed move, still on the source after a failed one.
+//
+// Mutations: wait on libvirt after the abort without a bound — the drain does
+// not return in time and goes red. Start the cold fallback for a move handed
+// to the background — the shutdown count goes red. Drop the outcome instead of
+// handing it to the background owner — the completed case leaves the row on
+// the source and goes red.
+func TestFleet_DrainLiveMoveWhoseAbortIsNotAnsweredIsFinishedInTheBackground(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		complete bool
+	}{{"libvirt completes it", true}, {"libvirt fails it", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			sc := newStuckLiveDrain(t, false)
+			ctx := context.Background()
+			sc.src.Server.SetDrainAbortGraceForTest(500 * time.Millisecond)
+			release := make(chan struct{})
+			sc.src.Virt.FailMigrateToTarget = func(name, _ string) error {
+				if name != "slow" {
+					return nil
+				}
+				<-release // the abort is not answered
+				if tc.complete {
+					return nil
+				}
+				return errors.New("operation failed: migration out job: unexpectedly failed")
+			}
+			defer func() {
+				select {
+				case <-release:
+				default:
+					close(release)
+				}
+			}()
+
+			type res struct {
+				p   *pb.DrainProgress
+				err error
+			}
+			out := make(chan res, 1)
+			go func() { p, err := sc.drain(t); out <- res{p, err} }()
+			var r res
+			select {
+			case r = <-out:
+			case <-time.After(15 * time.Second):
+				t.Fatal("the drain is still waiting on a live move whose abort libvirt did not answer")
+			}
+			if status.Code(r.err) != codes.FailedPrecondition || !strings.Contains(r.err.Error(), "slow") {
+				t.Fatalf("drain = %v; want FailedPrecondition, incomplete, naming slow", r.err)
+			}
+			if r.p == nil || r.p.Status != "failed" || !strings.Contains(r.p.Error, "background") {
+				t.Fatalf("drain progress for slow = %+v; want failed, the move left to finish in the background", r.p)
+			}
+			cond, ok, err := corrosion.GetHealthCondition(ctx, sc.src.DB, "drain", "drain_move_timed_out", "host", sc.src.Name)
+			if err != nil || !ok || cond.Lifecycle == corrosion.ConditionResolved || !strings.Contains(cond.Evidence, "slow") {
+				t.Fatalf("drain_move_timed_out = %+v ok=%v err=%v; want it raised naming slow", cond, ok, err)
+			}
+			if n := sc.srcOps("shutdown"); n != 0 {
+				t.Fatalf("the VM was shut down %d time(s) while its live move could still complete", n)
+			}
+			row, _ := corrosion.GetVM(ctx, sc.src.DB, "slow")
+			if row == nil || row.HostName != sc.src.Name {
+				t.Fatalf("VM row = %+v; want it still on %s while libvirt has not answered", row, sc.src.Name)
+			}
+
+			close(release)
+			want := sc.src.Name
+			if tc.complete {
+				want = sc.dst.Name
+			}
+			deadline := time.Now().Add(15 * time.Second)
+			for {
+				row, _ = corrosion.GetVM(ctx, sc.src.DB, "slow")
+				if row != nil && row.HostName == want && row.State == "running" {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("VM row = %+v after libvirt ended the move; want it running on %s", row, want)
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if n := sc.srcOps("shutdown"); n != 0 {
+				t.Fatalf("the VM was shut down %d time(s) after its live move ended", n)
+			}
+		})
+	}
+}

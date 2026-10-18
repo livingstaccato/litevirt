@@ -364,6 +364,10 @@ type Server struct {
 	// CA this host's migration-TLS credentials chain to ("" when it has
 	// none). nil means unknown, and no comparison is made.
 	migrationCAFingerprint func() (string, error)
+	// drainAbortGrace bounds how long a drain waits for libvirt to answer the
+	// abort of a timed-out live move before handing the move to a background
+	// owner (drainLiveMigrate). Zero means defaultDrainAbortGrace.
+	drainAbortGrace time.Duration
 	// migrationNetwork is migration.network: the IPv4 CIDR a migration's data
 	// should travel on (migration_network.go). Empty means the host's cluster
 	// address. localIPs is a test seam for the host's own addresses.
@@ -1914,6 +1918,10 @@ func (s *Server) SetMigrationTLS(fn func() (bool, error)) { s.migrationTLS = fn 
 // migration CA this host's migration-TLS credentials chain to. A storage
 // copy's readiness check compares the source's with the target's.
 func (s *Server) SetMigrationCAFingerprint(fn func() (string, error)) { s.migrationCAFingerprint = fn }
+
+// SetDrainAbortGraceForTest shortens how long a drain waits for libvirt to
+// answer the abort of a timed-out live move.
+func (s *Server) SetDrainAbortGraceForTest(d time.Duration) { s.drainAbortGrace = d }
 
 // localMigrationCA is this host's migration CA fingerprint, "" when it has
 // none or it cannot be read (logged): no comparison is made then, and a

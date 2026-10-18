@@ -409,6 +409,10 @@ type Server struct {
 	// removeHostBeforeDeleteHook, when set, runs in RemoveHost between its
 	// checks and its delete. Test seam only; nil in production.
 	removeHostBeforeDeleteHook func(name string)
+	// removeHostBetweenReadsHook, when set, runs in removeHostRefusal between
+	// its read of the host's row and its read of the row's admission key.
+	// Test seam only; nil in production.
+	removeHostBetweenReadsHook func(name string)
 	// createReturnedHook is a test-only seam; see SetCreateReturnedHook.
 	createReturnedHook func(name string, err error)
 	// stackMemberDeleteHook is a test-only seam: DeleteStack calls it with

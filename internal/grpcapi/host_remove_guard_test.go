@@ -191,3 +191,47 @@ func TestRemoveHost_ADelayedRemovalRefusesALaterAdmissionAtTheSameIncarnation(t 
 		t.Errorf("removals of host-x logged = %d, want %d (none by the delayed removal)", got, before)
 	}
 }
+
+// The checks themselves are made on one admission: a later admission of the
+// same certificate at the same incarnation that lands between the removal's
+// read of the row and its read of the row's key is not the row the checks
+// passed, and nothing is removed.
+//
+// Mutation: compare only the serial between the two reads (leave out
+// at != h.CreatedAt) — the key read is B's, DeleteHostIf passes, and B is
+// tombstoned, red.
+func TestRemoveHost_ALaterAdmissionBetweenTheChecksReadsIsRefused(t *testing.T) {
+	ctx := context.Background()
+	s := incServer(t, 0)
+	s.SetReleaseFeatureGate(&scriptedFeatureGate{t: t})
+	if _, err := admit(s, "host-x"); err != nil {
+		t.Fatalf("admission A: %v", err)
+	}
+	_, atA, serial, _, _, err := corrosion.HostIncarnationOf(ctx, s.db, "host-x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var atB string
+	s.removeHostBetweenReadsHook = func(name string) {
+		s.removeHostBetweenReadsHook = nil
+		uts := s.db.NowTS()
+		stamp, ok := corrosion.ReadmitStamp(uts)
+		if !ok || stamp <= atA {
+			t.Fatalf("admission B's stamp %q is not after A's %q", stamp, atA)
+		}
+		atB = stamp
+		if err := s.db.ExecuteBatch(ctx, []corrosion.Statement{{SQL: readmitSameKeySQL, Params: []interface{}{
+			"10.0.0.9", "root", 22, 9443, "joining", serial, int64(1), atB, uts, name, int64(1), int64(1), atB,
+		}}}); err != nil {
+			t.Fatalf("admission B: %v", err)
+		}
+	}
+	_, err = s.RemoveHost(adminCtx(), &pb.RemoveHostRequest{Name: "host-x", Force: true, ExpectedCertSerial: serial})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("the removal = %v, want FailedPrecondition", err)
+	}
+	n, at, _, deleted, _, err := corrosion.HostIncarnationOf(ctx, s.db, "host-x")
+	if err != nil || deleted || n != 1 || atB == "" || at != atB {
+		t.Errorf("admission B's row = (%d, %q, deleted %v), %v; want live (1, %q)", n, at, deleted, err, atB)
+	}
+}

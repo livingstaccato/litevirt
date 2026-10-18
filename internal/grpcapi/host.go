@@ -1772,13 +1772,17 @@ func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostReques
 			"%s's row changed since its certificate was revoked (it now names %s, not %s); run `lv host rm` again",
 			req.Name, h.CertSerial, want)
 	}
+	if hook := s.removeHostBetweenReadsHook; hook != nil {
+		hook(req.Name)
+	}
 	incarnation, at, keySerial, deleted, found, err := corrosion.HostIncarnationOf(ctx, s.db, req.Name)
 	if err != nil {
 		return nil, none, status.Errorf(codes.Unavailable, "read %s's incarnation: %v", req.Name, err)
 	}
 	// The key and the row checked are one admission: one that changed
-	// between the two reads is not the row checked.
-	if !found || deleted || !strings.EqualFold(keySerial, h.CertSerial) {
+	// between the two reads (another certificate, or a later admission of
+	// the same one) is not the row checked.
+	if !found || deleted || !strings.EqualFold(keySerial, h.CertSerial) || at != h.CreatedAt {
 		return nil, none, status.Errorf(codes.FailedPrecondition,
 			"%s's row changed while its removal was checked; run `lv host rm` again", req.Name)
 	}

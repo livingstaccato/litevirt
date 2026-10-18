@@ -58,6 +58,9 @@ type NetBoxFake struct {
 
 	// released records every id deleted through the REST API, in order.
 	released []int
+	// cascaded records every address id deleted because the interface it was
+	// assigned to was deleted, in order.
+	cascaded []int
 
 	// addrRequests counts EVERY request to the ipam address surface — the
 	// collection, the id-scoped routes and the per-prefix available-ips band —
@@ -562,6 +565,9 @@ var lookupParams = map[string]bool{
 	"cf_litevirt_identity":    true,
 	"cf_litevirt_identity__n": true,
 	"vminterface_id":          true,
+	"virtual_machine_id":      true,
+	"assigned_object_type":    true,
+	"assigned_object_id":      true,
 	"limit":                   true,
 	"offset":                  true,
 }
@@ -615,10 +621,17 @@ func (f *NetBoxFake) lookup(w http.ResponseWriter, r *http.Request) {
 		ids = append(ids, id)
 	}
 	sort.Ints(ids) // stable order so pagination is deterministic
+	// Which VM each interface belongs to: virtual_machine_id filters on it, and
+	// the nested assigned_object carries it, both resolved through the
+	// interface exactly as NetBox resolves them.
+	ifaceVM := make(map[int]int, len(f.ifaces))
+	for id, iface := range f.ifaces {
+		ifaceVM[id] = iface.VMID
+	}
 	var matched []*fakeIP
 	for _, id := range ids {
 		ip := f.byID[id]
-		if !matchIP(ip, q, parent) {
+		if !matchIP(ip, q, parent, ifaceVM) {
 			continue
 		}
 		copied := *ip
@@ -642,7 +655,12 @@ func (f *NetBoxFake) lookup(w http.ResponseWriter, r *http.Request) {
 		Results []ipView `json:"results"`
 	}{Count: total, Results: []ipView{}}
 	for _, ip := range page {
-		out.Results = append(out.Results, ipJSON(*ip))
+		v := ipJSON(*ip)
+		if ip.AssignedObjectID != 0 {
+			v.AssignedObject = &assignedRef{ID: ip.AssignedObjectID,
+				VirtualMachine: &objRef{ID: ifaceVM[ip.AssignedObjectID]}}
+		}
+		out.Results = append(out.Results, v)
 	}
 	if end < total {
 		out.Next = fmt.Sprintf("%s/api/ipam/ip-addresses/?limit=%d&offset=%d", f.srv.URL, limit, end)
@@ -652,7 +670,7 @@ func (f *NetBoxFake) lookup(w http.ResponseWriter, r *http.Request) {
 
 // matchIP applies every recognised filter. A filter that is present but matches
 // nothing yields an EMPTY result, never an unfiltered one.
-func matchIP(ip *fakeIP, q map[string][]string, parent *net.IPNet) bool {
+func matchIP(ip *fakeIP, q map[string][]string, parent *net.IPNet, ifaceVM map[int]int) bool {
 	get := func(k string) (string, bool) {
 		v, ok := q[k]
 		if !ok || len(v) == 0 {
@@ -693,6 +711,26 @@ func matchIP(ip *fakeIP, q map[string][]string, parent *net.IPNet) bool {
 			}
 		}
 		if !match {
+			return false
+		}
+	}
+	// Every address this fake holds is assigned to a VM interface or to
+	// nothing, so the content type matches only "virtualization.vminterface",
+	// and only on an assigned address.
+	if v, ok := get("assigned_object_type"); ok &&
+		(v != "virtualization.vminterface" || ip.AssignedObjectID == 0) {
+		return false
+	}
+	if v, ok := get("assigned_object_id"); ok {
+		want, err := strconv.Atoi(v)
+		if err != nil || ip.AssignedObjectID != want {
+			return false
+		}
+	}
+	if v, ok := get("virtual_machine_id"); ok {
+		want, err := strconv.Atoi(v)
+		vm, assigned := ifaceVM[ip.AssignedObjectID]
+		if err != nil || ip.AssignedObjectID == 0 || !assigned || vm != want {
 			return false
 		}
 	}
@@ -1053,12 +1091,27 @@ func (f *NetBoxFake) nextAddressIn(cidr string) (string, error) {
 
 // ipView is the ip-address JSON shape the real API returns.
 type ipView struct {
-	ID               int               `json:"id"`
-	Address          string            `json:"address"`
-	VRF              *vrfRef           `json:"vrf"`
-	AssignedObjectID *int              `json:"assigned_object_id"`
-	CustomFields     map[string]string `json:"custom_fields"`
-	Created          string            `json:"created"`
+	ID               int     `json:"id"`
+	Address          string  `json:"address"`
+	VRF              *vrfRef `json:"vrf"`
+	AssignedObjectID *int    `json:"assigned_object_id"`
+	// AssignedObjectType and AssignedObject are what NetBox serves beside the
+	// id: the content type of the generic relation, and the nested interface
+	// with the VM it belongs to. AssignedObject is filled by the list handler,
+	// which can resolve the interface.
+	AssignedObjectType *string           `json:"assigned_object_type"`
+	AssignedObject     *assignedRef      `json:"assigned_object"`
+	CustomFields       map[string]string `json:"custom_fields"`
+	Created            string            `json:"created"`
+}
+
+type assignedRef struct {
+	ID             int     `json:"id"`
+	VirtualMachine *objRef `json:"virtual_machine"`
+}
+
+type objRef struct {
+	ID int `json:"id"`
 }
 
 type vrfRef struct {
@@ -1083,6 +1136,8 @@ func ipJSON(ip fakeIP) ipView {
 	if ip.AssignedObjectID != 0 {
 		id := ip.AssignedObjectID
 		out.AssignedObjectID = &id
+		typ := "virtualization.vminterface"
+		out.AssignedObjectType = &typ
 	}
 	return out
 }

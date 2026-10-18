@@ -324,9 +324,28 @@ func (c *Client) SetPrimaryIP4(ctx context.Context, vmID, ipID int) error {
 	return c.do(ctx, http.MethodPatch, fmt.Sprintf(vmsPath+"%d/", vmID), body, nil)
 }
 
-// DeleteVM removes one virtual machine. Its interfaces and their IP assignments
-// go with it.
+// DeleteVM removes one virtual machine, after detaching every address assigned
+// to its interfaces.
+//
+// NetBox deletes a VM's interfaces with it, and deletes each interface's
+// addresses with THAT — see DeleteInterface — so a bare DELETE destroys every
+// address the VM holds. They are detached first, and survive unassigned.
+//
+// The VM is read first so a VM that is already gone answers 404 exactly as the
+// DELETE would, before any address query is made about it.
 func (c *Client) DeleteVM(ctx context.Context, id int) error {
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf(vmsPath+"%d/", id), nil, nil); err != nil {
+		return err
+	}
+	q := url.Values{}
+	q.Set("virtual_machine_id", strconv.Itoa(id))
+	ips, err := paginate(ctx, c, ipAddressesPath, q, ipJSON.toIP)
+	if err != nil {
+		return fmt.Errorf("netbox: list the addresses of virtual machine %d before deleting it: %w", id, err)
+	}
+	if err := c.detachAll(ctx, ips, func(ip IPAddress) bool { return ip.AssignedVMID == id }); err != nil {
+		return fmt.Errorf("netbox: virtual machine %d not deleted: %w", id, err)
+	}
 	return c.do(ctx, http.MethodDelete, fmt.Sprintf(vmsPath+"%d/", id), nil, nil)
 }
 
@@ -502,17 +521,64 @@ func (c *Client) SetInterfaceIdentity(ctx context.Context, id int, identity stri
 	return c.do(ctx, http.MethodPatch, fmt.Sprintf(vmInterfacesPath+"%d/", id), body, nil)
 }
 
-// DeleteInterface removes one VM interface. Without it a hotplug detach never
-// converges in NetBox.
+// DeleteInterface removes one VM interface, after detaching every address
+// assigned to it. Without it a hotplug detach never converges in NetBox.
+//
+// NetBox deletes the addresses assigned to an interface WITH the interface: the
+// vminterface's ip_addresses relation is a generic relation, and deleting the
+// interface cascades it. A bare DELETE would therefore destroy a leased address
+// litevirt still names, and an operator's own address on the same interface.
+// Each one is detached first and survives unassigned — litevirt's are released
+// or reclaimed through their lease, and an operator's are left for the operator.
+//
+// Every assignment is detached, not only litevirt-owned ones: detaching is the
+// least the delete can do to an address, and the cascade is the most.
+//
+// The query names the content type and the object id rather than
+// vminterface_id, which NetBox validates against existing interfaces: an
+// interface already gone would turn into a 400 instead of the 404 the DELETE
+// returns.
 func (c *Client) DeleteInterface(ctx context.Context, id int) error {
+	q := url.Values{}
+	q.Set("assigned_object_type", vmInterfaceType)
+	q.Set("assigned_object_id", strconv.Itoa(id))
+	ips, err := paginate(ctx, c, ipAddressesPath, q, ipJSON.toIP)
+	if err != nil {
+		return fmt.Errorf("netbox: list the addresses of interface %d before deleting it: %w", id, err)
+	}
+	if err := c.detachAll(ctx, ips, func(ip IPAddress) bool { return ip.AssignedObjectID == id }); err != nil {
+		return fmt.Errorf("netbox: interface %d not deleted: %w", id, err)
+	}
 	return c.do(ctx, http.MethodDelete, fmt.Sprintf(vmInterfacesPath+"%d/", id), nil, nil)
+}
+
+// vmInterfaceType is the content type of a VM interface in an address's
+// generic assignment.
+const vmInterfaceType = "virtualization.vminterface"
+
+// detachAll clears the assignment of every address in ips that is assigned to a
+// VM interface and that mine accepts, stopping at the first failure.
+//
+// Both tests are re-applied to what the server returned, not trusted from the
+// query: a server that ignored a filter would return addresses assigned
+// elsewhere, and clearing those would detach somebody else's address.
+func (c *Client) detachAll(ctx context.Context, ips []IPAddress, mine func(IPAddress) bool) error {
+	for _, ip := range ips {
+		if ip.AssignedObjectType != vmInterfaceType || !mine(ip) {
+			continue
+		}
+		if err := c.ClearIPAssignment(ctx, ip.ID); err != nil {
+			return fmt.Errorf("detach address %d (%s): %w", ip.ID, ip.Address, err)
+		}
+	}
+	return nil
 }
 
 // AssignIPToInterface attaches an existing address to an interface. NetBox's
 // convention is IPs on interfaces, not on the VM.
 func (c *Client) AssignIPToInterface(ctx context.Context, ipID, ifaceID int) error {
 	body := map[string]any{
-		"assigned_object_type": "virtualization.vminterface",
+		"assigned_object_type": vmInterfaceType,
 		"assigned_object_id":   ifaceID,
 	}
 	return c.do(ctx, http.MethodPatch, fmt.Sprintf(ipAddressesPath+"%d/", ipID), body, nil)

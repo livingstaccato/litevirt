@@ -13,10 +13,12 @@
 //
 //   - A MAC is echoed UPPER-cased, as NetBox does. A diff that compared MACs
 //     case-sensitively would see drift on every sweep and PATCH forever.
-//   - Deleting a virtual machine CASCADES to its interfaces, and the addresses
-//     those interfaces held are UNASSIGNED rather than deleted. That is what
-//     makes a VM delete a single request instead of a cascade the mirror has to
-//     drive itself.
+//   - Deleting a virtual machine CASCADES to its interfaces, and deleting an
+//     interface — directly or through that cascade — DELETES every address
+//     assigned to it. NetBox's vminterface carries its addresses through a
+//     generic relation, and Django cascades a generic relation on delete. A fake
+//     that merely unassigned them let a mirror destroy addresses it believed it
+//     was only detaching.
 //   - The two UNIQUENESS constraints are enforced: a VM name is unique within
 //     its cluster, and an interface name is unique within its virtual machine.
 //     Both are 400s, and both are constraints the mirror has code to avoid —
@@ -365,6 +367,19 @@ func (f *NetBoxFake) createVM(w http.ResponseWriter, r *http.Request) {
 
 func (f *NetBoxFake) vmObject(w http.ResponseWriter, r *http.Request, id int) {
 	switch r.Method {
+	case http.MethodGet:
+		f.mu.Lock()
+		vm, known := f.vms[id]
+		var out vmView
+		if known {
+			out = vmJSONOf(*vm)
+		}
+		f.mu.Unlock()
+		if !known {
+			writeErr(w, http.StatusNotFound, "no virtual-machine %d", id)
+			return
+		}
+		writeJSON(w, out)
 	case http.MethodPatch:
 		body, ok := decodeVMBody(w, r)
 		if !ok {
@@ -423,15 +438,13 @@ func (f *NetBoxFake) vmObject(w http.ResponseWriter, r *http.Request, id int) {
 		if known {
 			delete(f.vms, id)
 			// CASCADE, as NetBox does: the interfaces go, and every address
-			// they held is unassigned rather than deleted. An address is an IPAM
-			// object with a life of its own; only the assignment belonged to the
-			// interface.
+			// assigned to one of them goes with it.
 			for ifaceID, iface := range f.ifaces {
 				if iface.VMID != id {
 					continue
 				}
 				delete(f.ifaces, ifaceID)
-				f.unassignFromLocked(ifaceID)
+				f.cascadeAddressesLocked(ifaceID)
 			}
 		}
 		f.mu.Unlock()
@@ -671,7 +684,7 @@ func (f *NetBoxFake) ifaceObject(w http.ResponseWriter, r *http.Request, id int)
 		_, known := f.ifaces[id]
 		if known {
 			delete(f.ifaces, id)
-			f.unassignFromLocked(id)
+			f.cascadeAddressesLocked(id)
 		}
 		f.mu.Unlock()
 		if !known {
@@ -786,14 +799,63 @@ func (f *NetBoxFake) ifaceNameTakenLocked(vmID int, name string, exclude int) bo
 	return false
 }
 
-// unassignFromLocked detaches every address pointing at ifaceID. Caller holds
-// f.mu.
-func (f *NetBoxFake) unassignFromLocked(ifaceID int) {
-	for _, ip := range f.byID {
+// cascadeAddressesLocked deletes every address assigned to ifaceID, as NetBox
+// does when the interface goes. Recorded in cascaded, not released: nothing
+// asked for these deletions. Caller holds f.mu.
+func (f *NetBoxFake) cascadeAddressesLocked(ifaceID int) {
+	for id, ip := range f.byID {
 		if ip.AssignedObjectID == ifaceID {
-			ip.AssignedObjectID = 0
+			delete(f.byID, id)
+			f.cascaded = append(f.cascaded, id)
 		}
 	}
+}
+
+// Cascaded is every address id NetBox deleted because the interface it was
+// assigned to was deleted, in order. A mirror that detaches addresses before
+// deleting an interface leaves this empty.
+func (f *NetBoxFake) Cascaded() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.cascaded...)
+}
+
+// InterfaceID is the id of one VM's named interface, or 0.
+func (f *NetBoxFake) InterfaceID(vmName, ifaceName string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, vm := range f.vms {
+		if vm.Name != vmName {
+			continue
+		}
+		for _, iface := range f.ifaces {
+			if iface.VMID == vm.ID && iface.Name == ifaceName {
+				return iface.ID
+			}
+		}
+	}
+	return 0
+}
+
+// AssignDirect attaches an address to an interface as an operator editing it in
+// NetBox would, bypassing every litevirt path.
+func (f *NetBoxFake) AssignDirect(ipID, ifaceID int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if ip, ok := f.byID[ipID]; ok {
+		ip.AssignedObjectID = ifaceID
+	}
+}
+
+// Address reports one address object's assignment, and whether it exists.
+func (f *NetBoxFake) Address(id int) (assignedTo int, exists bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ip, ok := f.byID[id]
+	if !ok {
+		return 0, false
+	}
+	return ip.AssignedObjectID, true
 }
 
 // ── assertions ──────────────────────────────────────────────────────────────

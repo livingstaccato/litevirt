@@ -312,11 +312,12 @@ container's NIC, or an address lease), on create, `lv attach-nic`, clone,
 restore under a new name, a renamed promotion and import. A container NIC's
 MAC is derived from its host, name and NIC number; when another NIC holds it
 (a container of the same name that migrated away), create and `lv ct clone`
-draw a fresh one. A `mac` another live NIC holds is refused, for a VM and for
-a container NIC alike, and so is a restore that would bring back a MAC
-another NIC holds now: a VM restored under the backup's own name, or a
-container restored next to its original. Two hosts that draw one MAC at the
-same moment raise `mac_duplicate`
+draw a fresh one, and so does a container restore (`lv ct restore`) for a
+backed-up MAC another NIC holds now, such as a copy restored beside its live
+original. A `mac` another live NIC holds is refused, for a VM and for a
+container NIC alike, and so is a VM restored under the backup's own name
+whose MAC another NIC holds now. Two hosts that draw one MAC at the same
+moment raise `mac_duplicate`
 ([diagnostics.md](diagnostics.md#two-nics-on-one-mac-mac_duplicate)).
 
 A VM is created with at most one NIC per network. A create, a rebuild or a

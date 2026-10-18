@@ -415,3 +415,36 @@ func (s *Server) setContainerNICMACs(ctx context.Context, name string, macs map[
 	}
 	return nil
 }
+
+// redrawHeldContainerMACs gives each NIC of cs whose MAC another workload's
+// NIC or lease holds a fresh one (container scheme), returning the spec with
+// them. Container name on this host is the owner whose own rows do not count.
+func (s *Server) redrawHeldContainerMACs(ctx context.Context, name string, cs corrosion.ContainerCreateSpec) (corrosion.ContainerCreateSpec, error) {
+	set, err := s.loadMACSet(ctx)
+	if err != nil {
+		return cs, err
+	}
+	owner := corrosion.ContainerGuardOwner(s.hostName, name)
+	alloc := s.newMACAllocatorFrom(set)
+	for _, n := range cs.Networks {
+		alloc.reserve(n.MAC)
+	}
+	var nets []corrosion.ContainerNetwork
+	for i, n := range cs.Networks {
+		if n.MAC == "" || set.heldBy(n.MAC, owner) == "" {
+			continue
+		}
+		if nets == nil {
+			nets = append([]corrosion.ContainerNetwork(nil), cs.Networks...)
+		}
+		mac, derr := alloc.nextContainer(ctx)
+		if derr != nil {
+			return cs, derr
+		}
+		nets[i].MAC = mac
+	}
+	if nets != nil {
+		cs.Networks = nets
+	}
+	return cs, nil
+}

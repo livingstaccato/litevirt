@@ -14,12 +14,14 @@ package fleet
 //     (ContainerNameReusedAfterAMigrate, create and clone);
 //   - container holders are keyed by host and name, not lineage
 //     (ContainerNameReusedAfterAMigrate, the parked migrate);
-//   - RestoreContainer skips its MAC check (ContainerRestoreNextToItsOriginal).
+//   - RestoreContainer keeps a held MAC (ContainerRestoreBesideItsOriginal).
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -259,15 +261,17 @@ func TestFleet_MAC_ContainerNameReusedAfterAMigrate(t *testing.T) {
 	}
 }
 
-// An operator restore keeps the backed-up MACs, so one next to its live
-// original on another host is refused, naming the original.
-func TestFleet_MAC_ContainerRestoreNextToItsOriginalIsRefused(t *testing.T) {
+// An operator restore beside the live original on another host is a new
+// container: it lands with a MAC of its own, in its row and its config,
+// never the original's.
+func TestFleet_MAC_ContainerRestoreBesideItsOriginalGetsItsOwnMAC(t *testing.T) {
 	c := ctMigrateCluster(t)
 	a, b := c.Nodes[0], c.Nodes[1]
 	ctx := context.Background()
 	seedContainerNetwork(t, c)
 	const name = "ct-back"
 	createContainerOnNetwork(t, c, a, name)
+	orig := strings.ToLower(containerIfaces(t, a, name)[0].MAC)
 	repo, ts := backupContainer(t, c, a, name)
 	st, err := c.SelfClient(b).RestoreContainer(ctx, &pb.RestoreContainerRequest{
 		RepoPath: repo, Name: name, Timestamp: ts, HostName: b.Name,
@@ -279,10 +283,23 @@ func TestFleet_MAC_ContainerRestoreNextToItsOriginalIsRefused(t *testing.T) {
 			}
 		}
 	}
-	if status.Code(err) != codes.AlreadyExists || !strings.Contains(err.Error(), "ct:"+a.Name+":"+name) {
-		t.Fatalf("restore next to the original: got %v, want AlreadyExists naming ct:%s:%s", err, a.Name, name)
+	// The copy lands; it may not take the original's address.
+	if err != io.EOF && !strings.Contains(fmt.Sprint(err), "unavailable IPs") {
+		t.Fatalf("restore beside the original: %v", err)
 	}
-	if rec, _ := corrosion.GetContainer(ctx, b.DB, b.Name, name); rec != nil {
-		t.Fatalf("the refused restore wrote a row on %s", b.Name)
+	ifs := containerIfaces(t, b, name)
+	if len(ifs) != 1 {
+		t.Fatalf("the copy on %s has NICs %+v, want one", b.Name, ifs)
+	}
+	got := strings.ToLower(ifs[0].MAC)
+	if got == orig || got == "" {
+		t.Fatalf("the copy's MAC = %q, the original's %s: want one of its own", got, orig)
+	}
+	for _, n := range c.Nodes {
+		n.Server.ReconcileMACCollisions(ctx)
+		if row, ok, err := corrosion.GetHealthCondition(ctx, n.DB, grpcapi.NICIdentityEvaluator, grpcapi.CondMACDuplicate, "host", n.Name); err != nil ||
+			(ok && row.Lifecycle != corrosion.ConditionResolved) {
+			t.Errorf("%s raised mac_duplicate: %+v (err %v)", n.Name, row, err)
+		}
 	}
 }

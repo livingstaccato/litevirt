@@ -52,7 +52,7 @@ func TestPromoteReplica_ARenamedRetryAdoptsTheRunningDomainsMACs(t *testing.T) {
 	const mac = "52:54:00:aa:bb:31"
 	t.Run("adopted", func(t *testing.T) {
 		s, err := renamedRetry(t, fmt.Sprintf("<domain type='kvm'><name>vm1-p</name><uuid>%s</uuid><devices>"+
-			"<interface type='bridge'><mac address='%s'/><source bridge='br-lo'/></interface></devices></domain>", first, mac))
+			"<interface type='bridge'><mac address='%s'/><source bridge='lo'/></interface></devices></domain>", first, mac))
 		if err != nil {
 			t.Fatalf("renamed promotion retry: %v", err)
 		}
@@ -90,17 +90,31 @@ func TestPromoteReplica_ARenamedRetryAdoptsTheRunningDomainsMACs(t *testing.T) {
 			t.Errorf("%d NIC guards for vm1-p, want 1", n)
 		}
 	})
-	t.Run("NIC count differs", func(t *testing.T) {
-		s, err := renamedRetry(t, fmt.Sprintf("<domain type='kvm'><name>vm1-p</name><uuid>%s</uuid><devices>"+
-			"<interface type='bridge'><mac address='%s'/></interface>"+
-			"<interface type='bridge'><mac address='52:54:00:aa:bb:32'/></interface></devices></domain>", first, mac))
-		if status.Code(err) != codes.Unavailable {
-			t.Fatalf("retry adopting a domain of 2 NICs for a spec of 1: %v, want Unavailable", err)
-		}
-		if row, _ := corrosion.GetVM(adminCtx(), s.db, "vm1-p"); row != nil {
-			t.Error("a row was written for a domain that was not adopted")
-		}
-	})
+	// A domain that is not adopted for what does not clear on a retry is a
+	// FailedPrecondition that names the way out (dupcreate verify 5, m-1),
+	// and a NIC adopted by position is on the spec NIC's network (n-1).
+	for _, tc := range []struct{ name, ifaces string }{
+		{"NIC count differs", fmt.Sprintf("<interface type='bridge'><mac address='%s'/><source bridge='lo'/></interface>"+
+			"<interface type='bridge'><mac address='52:54:00:aa:bb:32'/><source bridge='lo'/></interface>", mac)},
+		{"an interface names no MAC", "<interface type='bridge'><source bridge='lo'/></interface>"},
+		{"a NIC on another network", fmt.Sprintf("<interface type='bridge'><mac address='%s'/><source bridge='other'/></interface>", mac)},
+		{"a NIC on no bridge", fmt.Sprintf("<interface type='network'><mac address='%s'/><source network='lo'/></interface>", mac)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := renamedRetry(t, fmt.Sprintf("<domain type='kvm'><name>vm1-p</name><uuid>%s</uuid><devices>%s</devices></domain>", first, tc.ifaces))
+			if status.Code(err) != codes.FailedPrecondition {
+				t.Fatalf("retry adopting a domain whose NICs are not the spec's: %v, want FailedPrecondition", err)
+			}
+			for _, w := range []string{"virsh destroy vm1-p", "virsh undefine vm1-p", "test-host", "--new-name"} {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("refusal %q does not name %q", err.Error(), w)
+				}
+			}
+			if row, _ := corrosion.GetVM(adminCtx(), s.db, "vm1-p"); row != nil {
+				t.Error("a row was written for a domain that was not adopted")
+			}
+		})
+	}
 }
 
 // The disk rule knows a Ceph RBD network disk by its pool/image against the
@@ -225,7 +239,7 @@ func TestPromoteReplica_ForceRefusalNamesTheWayOut(t *testing.T) {
 		wants []string
 	}{
 		{"owned here", false, []string{"lv stop vm1", "retry"}},
-		{"owned elsewhere", true, []string{"dead-host", "reconciler", "virsh destroy vm1", "retry"}},
+		{"owned elsewhere", true, []string{"dead-host", "a superseded copy of this VM", "reconciler", "virsh destroy vm1", "retry"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, fake := promoteFixture(t)
@@ -246,6 +260,45 @@ func TestPromoteReplica_ForceRefusalNamesTheWayOut(t *testing.T) {
 				if !strings.Contains(err.Error(), w) {
 					t.Errorf("refusal %q does not name %q", err.Error(), w)
 				}
+			}
+		})
+	}
+}
+
+// A recorded path or a domain's disk that cannot be a file (a component of
+// it is a file, or its symlinks loop) is not the file the other names: a
+// non-match, not an identification error (dupcreate verify 5, n-3).
+//
+// Mutation: count only ENOENT as a non-match — red.
+func TestDomainRunsOnAny_NotADirectoryOrALoopIsANonMatch(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "b"), filepath.Join(dir, "a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "a"), filepath.Join(dir, "b")); err != nil {
+		t.Fatal(err)
+	}
+	disk := filepath.Join(dir, "disk.qcow2")
+	if err := os.WriteFile(disk, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dom := func(src string) string {
+		return "<domain><devices><disk type='file' device='disk'><source file='" + src + "'/></disk></devices></domain>"
+	}
+	for _, tc := range []struct{ name, src, recorded string }{
+		{"recorded path not a directory", disk, filepath.Join(file, "x.qcow2")},
+		{"recorded path loops", disk, filepath.Join(dir, "a")},
+		{"domain's disk not a directory", filepath.Join(file, "x.qcow2"), disk},
+		{"domain's disk loops", filepath.Join(dir, "a"), disk},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := domainRunsOnAny(dom(tc.src), []string{tc.recorded})
+			if got || err != nil {
+				t.Errorf("domainRunsOnAny = %v, %v; want a non-match", got, err)
 			}
 		})
 	}

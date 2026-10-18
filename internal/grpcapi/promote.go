@@ -1119,29 +1119,48 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// retry that adopts the domain an earlier attempt started takes that
 	// domain's uuid, and its MACs by position (the spec's NICs, in order, are
 	// the domain's), for the row, the NIC rows and the NIC guards: the row and
-	// the domain never name two identities. One whose uuid or MACs cannot be
-	// read, or whose NICs are not the spec's in number, is not adopted.
+	// the domain never name two identities. One whose uuid or NICs cannot be
+	// read is not adopted now; one with a NIC that names no MAC, NICs not the
+	// spec's in number, or a NIC not on its spec NIC's bridge is never
+	// adopted, and the refusal names the way out.
 	var adoptedMACs []string
 	if renamed && started {
 		x, xerr := s.virt.DumpXML(targetName)
 		du := domainUUIDFromXML(x)
-		macs, merr := domainMACsFromXML(x)
-		switch {
-		case xerr != nil || du == "":
+		nics, nerr := domainNICsFromXML(x)
+		if xerr != nil || du == "" {
 			return status.Errorf(codes.Unavailable,
 				"promote of %s to %s: the domain an earlier attempt started cannot be identified (%v); nothing was changed",
 				vm.Name, targetName, xerr)
-		case merr != nil:
+		}
+		if nerr != nil {
 			return status.Errorf(codes.Unavailable,
 				"promote of %s to %s: the NICs of the domain an earlier attempt started cannot be read (%v); nothing was changed",
-				vm.Name, targetName, merr)
-		case len(macs) != len(spec.Network):
-			return status.Errorf(codes.Unavailable,
-				"promote of %s to %s: the domain an earlier attempt started has %d NICs, the VM's spec %d; nothing was changed",
-				vm.Name, targetName, len(macs), len(spec.Network))
+				vm.Name, targetName, nerr)
+		}
+		why := ""
+		if len(nics) != len(spec.Network) {
+			why = fmt.Sprintf("has %d NICs, the VM's spec %d", len(nics), len(spec.Network))
+		}
+		for i := 0; why == "" && i < len(nics); i++ {
+			want := network.FlatBridgeName(spec.Network[i].Name)
+			switch {
+			case nics[i].MAC == "":
+				why = fmt.Sprintf("names no MAC for NIC %d", i)
+			case nics[i].Bridge != want:
+				why = fmt.Sprintf("has NIC %d on bridge %q, the VM's spec on %q (network %s)", i, nics[i].Bridge, want, spec.Network[i].Name)
+			}
+		}
+		if why != "" {
+			return status.Errorf(codes.FailedPrecondition,
+				"promote of %s to %s: the domain an earlier attempt started %s, so it is not this promotion's to adopt; "+
+					"stop and remove it on %s (`virsh destroy %s`, then `virsh undefine %s`), or retry with another --new-name; nothing was changed",
+				vm.Name, targetName, why, s.hostName, targetName, targetName)
 		}
 		spec.Uuid = du
-		adoptedMACs = macs
+		for _, n := range nics {
+			adoptedMACs = append(adoptedMACs, n.MAC)
+		}
 	}
 
 	// Split-brain guard. Taking over the original name while the original is
@@ -1266,8 +1285,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		case vm.HostName == s.hostName:
 			out = fmt.Sprintf("stop it with `lv stop %s`", targetName)
 		default:
-			out = fmt.Sprintf("%s owns the VM: this host's reconciler stops the local domain on its own once a "+
-				"recovery claim certifies the move there, or stop it with `virsh destroy %s` on %s", vm.HostName, targetName, s.hostName)
+			out = fmt.Sprintf("%s owns the VM: if the domain is a superseded copy of this VM, this host's reconciler stops it "+
+				"once a recovery claim certifies the move there; otherwise stop it with `virsh destroy %s` on %s", vm.HostName, targetName, s.hostName)
 		}
 		return false, status.Errorf(codes.FailedPrecondition,
 			"domain %q on %s is not this VM's (uuid %s, the VM's is %s) and %s; --force replaces only the VM's own "+

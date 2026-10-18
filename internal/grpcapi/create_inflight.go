@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -250,8 +251,10 @@ func (s *Server) domainIsVMsOwn(ctx context.Context, name, specUUID, diskOwner s
 // their backing chains) name one of paths: a file or block device by
 // spelling, then by the file it is; a Ceph RBD network disk by its
 // pool/image against an "rbd:" path. A file is looked at within
-// sharedDiskStatTimeout, and one that cannot be looked at (a hard mount whose
-// server is gone) is an error: whether the domain runs on it is not known.
+// sharedDiskStatTimeout; a path at which no file can be (missing, a
+// component that is a file, a symlink loop) matches nothing, and one that
+// cannot be looked at (a hard mount whose server is gone) is an error:
+// whether the domain runs on it is not known.
 func domainRunsOnAny(domXML string, paths []string) (bool, error) {
 	if len(paths) == 0 {
 		return false, nil
@@ -315,7 +318,8 @@ func domainRunsOnAny(domXML string, paths []string) (bool, error) {
 		switch {
 		case err == nil:
 			return fi, true, nil
-		case errors.Is(err, fs.ErrNotExist):
+		case errors.Is(err, fs.ErrNotExist), errors.Is(err, syscall.ENOTDIR), errors.Is(err, syscall.ELOOP):
+			// Nothing is at the path that could be a file: no match.
 			return nil, false, nil
 		default:
 			return nil, false, fmt.Errorf("disk %s cannot be looked at: %v", p, err)
@@ -351,27 +355,38 @@ func domainRunsOnAny(domXML string, paths []string) (bool, error) {
 	return false, nil
 }
 
-// domainMACsFromXML is the MAC of each <interface> of a domain definition,
-// in order. An interface with no MAC is an error: positions would shift.
-func domainMACsFromXML(domXML string) ([]string, error) {
+// domainNIC is one <interface> of a domain definition: its MAC (lower
+// case, "" when it names none) and the bridge it is on ("" when it is on
+// none).
+type domainNIC struct {
+	MAC, Bridge string
+}
+
+// domainNICsFromXML is each <interface> of a domain definition, in order.
+func domainNICsFromXML(domXML string) ([]domainNIC, error) {
 	var dom struct {
 		Devices struct {
 			Interfaces []struct {
-				MAC struct {
+				Type string `xml:"type,attr"`
+				MAC  struct {
 					Address string `xml:"address,attr"`
 				} `xml:"mac"`
+				Source struct {
+					Bridge string `xml:"bridge,attr"`
+				} `xml:"source"`
 			} `xml:"interface"`
 		} `xml:"devices"`
 	}
 	if err := xml.Unmarshal([]byte(domXML), &dom); err != nil {
 		return nil, err
 	}
-	macs := make([]string, 0, len(dom.Devices.Interfaces))
-	for i, n := range dom.Devices.Interfaces {
-		if n.MAC.Address == "" {
-			return nil, fmt.Errorf("interface %d names no MAC", i)
+	nics := make([]domainNIC, 0, len(dom.Devices.Interfaces))
+	for _, n := range dom.Devices.Interfaces {
+		nic := domainNIC{MAC: strings.ToLower(n.MAC.Address)}
+		if n.Type == "bridge" {
+			nic.Bridge = n.Source.Bridge
 		}
-		macs = append(macs, strings.ToLower(n.MAC.Address))
+		nics = append(nics, nic)
 	}
-	return macs, nil
+	return nics, nil
 }

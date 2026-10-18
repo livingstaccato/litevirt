@@ -101,6 +101,14 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			return status.Errorf(codes.NotFound, "project %q not found", project)
 		}
 	}
+	// No create of the name runs on this host while this import does
+	// (beginCreate): they would share the name's domain and disk paths. The
+	// row is checked under the flight.
+	endFlight, setFlightUUID, ferr := s.beginCreate(name)
+	if ferr != nil {
+		return ferr
+	}
+	defer endFlight()
 	if existing, _ := corrosion.GetVM(ctx, s.db, name); existing != nil {
 		return status.Errorf(codes.AlreadyExists,
 			"VM %q already exists (on host %s) — choose a different --name or remove it first", name, existing.HostName)
@@ -422,13 +430,14 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return renderStatus("generate domain XML", err)
 	}
 
-	// Conditional orphan guard: never undefine a RUNNING same-name domain that
-	// has no DB row — fail clearly instead (cf. vm.go orphan handling).
+	// Conditional orphan guard: never undefine a same-name domain with no DB
+	// row that runs, or that a create in flight here defined — fail clearly
+	// instead (refuseLiveDomainOfName, as a create's sweep).
+	setFlightUUID(spec.Uuid)
 	if s.virt.DomainExists(name) {
-		if st, _ := s.virt.DomainState(name); st == "running" {
+		if err := s.refuseLiveDomainOfName(name, spec.Uuid); err != nil {
 			cleanupDisks()
-			return status.Errorf(codes.FailedPrecondition,
-				"a running libvirt domain %q already exists with no cluster record; resolve it before importing", name)
+			return err
 		}
 		_ = s.virt.UndefineDomain(name, false)
 	}

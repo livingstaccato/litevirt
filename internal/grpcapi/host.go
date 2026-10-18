@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,11 +12,13 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/apimeta"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
@@ -369,6 +372,16 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	h, err := corrosion.GetHost(ctx, s.db, req.Name)
 	if err != nil || h == nil {
 		return status.Errorf(codes.NotFound, "host %q not found", req.Name)
+	}
+	// The entry node takes the caught-up check; the drained host itself, which
+	// every entry node forwards to, takes only its own-row hold — refusing
+	// there could not be helped by running it elsewhere.
+	if req.Name != s.hostName {
+		if err := s.hostOperatorWriteAllowed(ctx, "drain", req.Name); err != nil {
+			return err
+		}
+	} else if err := s.db.OwnRowWritable(req.Name); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "%s cannot drain itself: %v", s.hostName, err)
 	}
 
 	// Drain must run ON the host being drained: only there is this daemon the SOURCE
@@ -889,6 +902,9 @@ func (s *Server) UndrainHost(ctx context.Context, req *pb.UndrainHostRequest) (*
 	if err != nil || h == nil {
 		return nil, status.Errorf(codes.NotFound, "host %q not found", req.Name)
 	}
+	if err := s.hostOperatorWriteAllowed(ctx, "undrain", req.Name); err != nil {
+		return nil, err
+	}
 
 	if err := s.undrainFrom(ctx, req.Name, h.State); err != nil {
 		return nil, err
@@ -1009,6 +1025,9 @@ func (s *Server) SetHostLabels(ctx context.Context, req *pb.SetHostLabelsRequest
 	h, err := corrosion.GetHost(ctx, s.db, req.Name)
 	if err != nil || h == nil {
 		return nil, status.Errorf(codes.NotFound, "host %q not found", req.Name)
+	}
+	if err := s.hostOperatorWriteAllowed(ctx, "label", req.Name); err != nil {
+		return nil, err
 	}
 
 	// Load existing labels from DB, merge, then remove requested keys.
@@ -1184,6 +1203,10 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 	if !fr.Success {
 		detail = fmt.Sprintf("fence failed (%s); host marked offline in state", fr.Detail)
 	}
+	// The physical fence went through THIS node's row, which may lag a
+	// re-admission: say which incarnation it aimed at, so an operator can
+	// re-run it on a caught-up node (host_incarnation.go).
+	detail += fenceTargetNote(ctx, s.db, h)
 
 	// Mark it offline regardless of fence success, and record the fence, in
 	// ONE replicated entry (RecordFenceWithState). A successful operator fence
@@ -1273,6 +1296,9 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 	h, err := corrosion.GetHost(ctx, s.db, req.Name)
 	if err != nil || h == nil {
 		return nil, status.Errorf(codes.NotFound, "host %q not found", req.Name)
+	}
+	if err := s.hostOperatorWriteAllowed(ctx, "configure", req.Name); err != nil {
+		return nil, err
 	}
 
 	// Validate fence strategy if provided.
@@ -1493,7 +1519,7 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 			if _, ok := status.FromError(err); ok {
 				return nil, err
 			}
-			return nil, status.Errorf(codes.Internal, "update host config: %v", err)
+			return nil, configureHostError(err)
 		}
 	case hostsProvided == 0:
 		// Only a --clear-redfish of a host with no Redfish settings: there is
@@ -1507,13 +1533,23 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 		err = s.db.Execute(ctx, configureHostSQL, args...)
 	}
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "update host config: %v", err)
+		return nil, configureHostError(err)
 	}
 
 	slog.Info("host configured", "host", req.Name)
 	s.audit(ctx, "host.configure", req.Name, fmt.Sprintf("fields=%d", provided), "ok")
 
 	return s.InspectHost(ctx, &pb.InspectHostRequest{Name: req.Name})
+}
+
+// configureHostError is the status of a failed ConfigureHost write. A
+// password this node's replica cannot set (its hosts row predates the host's
+// current admission) is the operator's to retry elsewhere or later.
+func configureHostError(err error) error {
+	if errors.Is(err, corrosion.ErrHostRowBehindAdmission) {
+		return status.Errorf(codes.FailedPrecondition, "update host config: %v", err)
+	}
+	return status.Errorf(codes.Internal, "update host config: %v", err)
 }
 
 // redfishChange is what one ConfigureHost does to a host's Redfish settings.
@@ -1654,18 +1690,77 @@ const configureHostSQL = `UPDATE hosts SET ` +
 
 // RemoveHost removes a host from the cluster. If force is false and the host
 // has running VMs, the request is rejected. CRL revocation is handled here.
-func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*emptypb.Empty, error) {
-	if err := RequireRole(ctx, "admin"); err != nil {
+func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*pb.RemoveHostResponse, error) {
+	h, incarnation, err := s.removeHostRefusal(ctx, req)
+	if err != nil {
 		return nil, err
+	}
+
+	// Soft-delete the host and clean up related records.
+	if err := corrosion.DeleteHost(ctx, s.db, req.Name); err != nil {
+		return nil, status.Errorf(codes.Internal, "delete host: %v", err)
+	}
+
+	slog.Warn("host removed from cluster", "host", req.Name, "cert_serial", h.CertSerial, "incarnation", incarnation)
+	s.publish("host.removed", req.Name, "cert_serial="+h.CertSerial)
+	// Only the raising host resolves its held-line conditions, and a removed
+	// one never will.
+	if err := corrosion.ResolveSpecEditHeldOfHost(ctx, s.db, req.Name); err != nil {
+		slog.Warn("could not resolve a removed host's held-spec-edit conditions", "host", req.Name, "error", err)
+	}
+
+	return &pb.RemoveHostResponse{CertSerial: h.CertSerial, Incarnation: incarnation}, nil
+}
+
+// PreflightRemoveHost runs every refusal RemoveHost would give req and
+// removes nothing. `lv host rm` asks it before it revokes the host's
+// certificate: the revocation is not undone by a refusal that follows it.
+func (s *Server) PreflightRemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*emptypb.Empty, error) {
+	if _, _, err := s.removeHostRefusal(ctx, req); err != nil {
+		return nil, err
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// removeHostRefusal is RemoveHost's checks: the host's row and incarnation
+// when it may be removed.
+func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostRequest) (*corrosion.HostRecord, int64, error) {
+	if err := RequireRole(ctx, "admin"); err != nil {
+		return nil, 0, err
 	}
 	h, err := corrosion.GetHost(ctx, s.db, req.Name)
 	if err != nil || h == nil {
-		return nil, status.Errorf(codes.NotFound, "host %q not found", req.Name)
+		return nil, 0, status.Errorf(codes.NotFound, "host %q not found", req.Name)
 	}
 	// A current voter keeps its vote whatever its hosts row says, so deleting
 	// the row must not look like removing the voter (recovery-claims.md §4.3).
 	if err := s.voterRemovalRefusal(ctx, req.Name); err != nil {
-		return nil, err
+		return nil, 0, err
+	}
+	// A removal decides the row a later re-admission counts from, so it is
+	// made on a caught-up node, by the voter majority, on the row a peer
+	// confirms, and only of the certificate the operator revoked
+	// (host_incarnation.go).
+	if err := s.hostOperatorWriteAllowed(ctx, "remove", req.Name); err != nil {
+		return nil, 0, err
+	}
+	if err := s.requireVoterMajority(ctx, "remove", req.Name); err != nil {
+		return nil, 0, err
+	}
+	if err := s.pullHostsNow(ctx, "remove", req.Name); err != nil {
+		return nil, 0, err
+	}
+	if h, err = corrosion.GetHost(ctx, s.db, req.Name); err != nil || h == nil {
+		return nil, 0, status.Errorf(codes.NotFound, "host %q not found", req.Name)
+	}
+	if want := req.GetExpectedCertSerial(); want != "" && !strings.EqualFold(want, h.CertSerial) {
+		return nil, 0, status.Errorf(codes.FailedPrecondition,
+			"%s's row changed since its certificate was revoked (it now names %s, not %s); run `lv host rm` again",
+			req.Name, h.CertSerial, want)
+	}
+	incarnation, _, _, _, _, err := corrosion.HostIncarnationOf(ctx, s.db, req.Name)
+	if err != nil {
+		return nil, 0, status.Errorf(codes.Unavailable, "read %s's incarnation: %v", req.Name, err)
 	}
 
 	// `lv host rm --dead` (recovery-claims.md §3.12): a host fenced proof-grade
@@ -1674,31 +1769,17 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*em
 	// supersede once this removal and the CRL have replicated.
 	if req.Dead {
 		if err := s.deadRemovalRefusal(ctx, h); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	} else {
 		// Check for VMs on this host.
 		vms, _ := corrosion.ListVMs(ctx, s.db, "", req.Name)
 		if len(vms) > 0 && !req.Force {
-			return nil, status.Errorf(codes.FailedPrecondition,
+			return nil, 0, status.Errorf(codes.FailedPrecondition,
 				"host %q has %d VMs — drain first or use --force", req.Name, len(vms))
 		}
 	}
-
-	// Soft-delete the host and clean up related records.
-	if err := corrosion.DeleteHost(ctx, s.db, req.Name); err != nil {
-		return nil, status.Errorf(codes.Internal, "delete host: %v", err)
-	}
-
-	slog.Warn("host removed from cluster", "host", req.Name, "cert_serial", h.CertSerial)
-	s.publish("host.removed", req.Name, "cert_serial="+h.CertSerial)
-	// Only the raising host resolves its held-line conditions, and a removed
-	// one never will.
-	if err := corrosion.ResolveSpecEditHeldOfHost(ctx, s.db, req.Name); err != nil {
-		slog.Warn("could not resolve a removed host's held-spec-edit conditions", "host", req.Name, "error", err)
-	}
-
-	return &emptypb.Empty{}, nil
+	return h, incarnation, nil
 }
 
 // AdmitHost records the CA-authorized identity produced by `lv host add`.
@@ -1750,7 +1831,7 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 	if err != nil {
 		return nil, err
 	}
-	err = corrosion.AdmitHost(ctx, s.db, corrosion.HostRecord{
+	notIssued, err := s.admitHostRow(ctx, corrosion.HostRecord{
 		Name:       req.Name,
 		Address:    req.Address,
 		SSHUser:    "root",
@@ -1760,10 +1841,11 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 		CertSerial: req.CertSerial,
 	})
 	if err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "admit host: %v", err)
+		return nil, err
 	}
 	s.publish("host.admitted", req.Name, "cert_serial="+req.CertSerial)
-	return &pb.AdmitHostResponse{AuditTailSeq: tailSeq, AuditTailHash: tailHash, AuditPositionProven: true}, nil
+	return &pb.AdmitHostResponse{AuditTailSeq: tailSeq, AuditTailHash: tailHash, AuditPositionProven: true,
+		IncarnationNotIssued: notIssued}, nil
 }
 
 // hostAllocatedResources returns running-VM CPU and memory, and the DECLARED
@@ -1829,4 +1911,115 @@ func parseTimestamp(s string) *timestamppb.Timestamp {
 		return nil
 	}
 	return timestamppb.New(t)
+}
+
+// admitHostRow writes an admission. The re-admission of a counted tombstone,
+// and of any tombstone once the host_incarnation release feature is available
+// here, issues the next incarnation (corrosion.AdmitHostV2): on a node that
+// sees a voter majority, on the row a peer confirms, through the feature's
+// grant. Everything else — a first admission, a re-admission before the
+// feature, an idempotent retry — is corrosion.AdmitHost, as before.
+//
+// Over a tombstone at incarnation 1 or higher a failure to issue refuses: the
+// legacy statement is never written there. Over a tombstone at 0, where the
+// legacy statement is exactly the previous release's re-admission, it falls
+// back to it when the feature is not available here (not every host runs the
+// release yet) or the gate cannot grant it right now (a host has not
+// acknowledged the feature's first use), and notIssued says why.
+func (s *Server) admitHostRow(ctx context.Context, h corrosion.HostRecord) (notIssued string, err error) {
+	if err := s.pullHostsNow(ctx, "re-add", h.Name); err != nil {
+		return "", err
+	}
+	n, _, _, deleted, found, err := corrosion.HostIncarnationOf(ctx, s.db, h.Name)
+	if err != nil {
+		return "", status.Errorf(codes.Unavailable, "read %s's incarnation: %v", h.Name, err)
+	}
+	legacy := func() error {
+		if err := corrosion.AdmitHost(ctx, s.db, h); err != nil {
+			if errors.Is(err, corrosion.ErrReadmitNeedsCounter) {
+				return status.Errorf(codes.FailedPrecondition, "admit host: %v", err)
+			}
+			return status.Errorf(codes.FailedPrecondition, "admit host: %v", err)
+		}
+		return nil
+	}
+	if !found || !deleted {
+		return "", legacy()
+	}
+	if n == 0 && !s.ReleaseFeatureAvailable(capabilities.FeatureHostIncarnation) {
+		why := "the host_incarnation release feature is not available yet"
+		if rerr := s.ReleaseFeatureRefusal(ctx, capabilities.FeatureHostIncarnation); rerr != nil {
+			why = status.Convert(rerr).Message()
+		}
+		slog.Warn("re-admitting a host without an incarnation: the host_incarnation feature is not available",
+			"host", h.Name, "why", why)
+		if err := legacy(); err != nil {
+			return "", err
+		}
+		return why, nil
+	}
+	if err := admitInstallsIncarnationBuild(ctx, h.Name, n+1); err != nil {
+		return "", err
+	}
+	if err := s.requireVoterMajority(ctx, "re-add", h.Name); err != nil {
+		return "", err
+	}
+	err = s.WithReleaseFeature(ctx, capabilities.FeatureHostIncarnation, func(ctx context.Context, g capabilities.FeatureGrant) error {
+		_, _, aerr := corrosion.AdmitHostV2(ctx, s.db, h, g)
+		return aerr
+	})
+	if err == nil {
+		return "", nil
+	}
+	st, isStatus := status.FromError(err)
+	gateRefusal := isStatus && (st.Code() == codes.Unavailable || st.Code() == codes.FailedPrecondition) &&
+		!strings.HasPrefix(st.Message(), "admit host")
+	if n == 0 && gateRefusal {
+		why := st.Message()
+		slog.Warn("re-admitting a host without an incarnation: the host_incarnation feature could not be used now",
+			"host", h.Name, "why", why)
+		if lerr := legacy(); lerr != nil {
+			return "", lerr
+		}
+		return why, nil
+	}
+	if isStatus && st.Code() != codes.Unknown {
+		return "", status.Errorf(st.Code(), "re-adding %s at incarnation %d: %s", h.Name, n+1, st.Message())
+	}
+	return "", status.Errorf(codes.FailedPrecondition, "admit host: %v", err)
+}
+
+// admitInstallsIncarnationBuild refuses an admission that would issue
+// incarnation next when the `lv host add` making it is from a previous
+// release (it names no release it installs): the build it installs cannot
+// keep an incarnation, and the host would stay joining, refused by every peer.
+func admitInstallsIncarnationBuild(ctx context.Context, name string, next int64) error {
+	if md, ok := metadata.FromIncomingContext(ctx); ok && len(md.Get(apimeta.AdmitInstallsReleaseHeader)) > 0 {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"re-adding %s issues host incarnation %d, and the client that ran this is from a previous release: "+
+			"its `lv host add` installs a build that cannot keep one, so the host would stay joining, refused by "+
+			"every peer. Re-run `lv host add` with this release's CLI, which installs its own build. A host "+
+			"already admitted on an older build joins after `lv host upgrade %s`", name, next, name)
+}
+
+// fenceTargetNote is the incarnation, serial, strategy and BMC a fence of h
+// went through, as this node's row records them.
+func fenceTargetNote(ctx context.Context, db *corrosion.Client, h *corrosion.HostRecord) string {
+	if h == nil {
+		return ""
+	}
+	n, _, _, _, _, err := corrosion.HostIncarnationOf(ctx, db, h.Name)
+	if err != nil {
+		return ""
+	}
+	bmc := h.IPMIAddress
+	if h.Redfish.Endpoint != "" {
+		bmc = h.Redfish.Endpoint
+	}
+	if bmc == "" {
+		bmc = "-"
+	}
+	return fmt.Sprintf(" [fenced %s as incarnation %d, serial %s, strategy %s at %s]", h.Name, n, h.CertSerial, h.FenceStrategy, bmc)
 }

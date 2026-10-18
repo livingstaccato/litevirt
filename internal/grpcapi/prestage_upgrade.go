@@ -30,9 +30,12 @@ import (
 // It is safe to run against a live cluster: `schema-migrate` opens state.db with
 // the same WAL + busy-timeout the daemon uses, and the migrations are additive
 // and idempotent (a no-op when the schema didn't change). The schema bump is
-// one-way per node, exactly like a normal upgrade — once staged, the running
-// (old) daemon keeps serving, but it can no longer be cold-restarted on the old
-// binary against the forward-migrated DB.
+// one-way per node, exactly like a normal upgrade. The running (old) daemon
+// keeps serving, and a restart on the old binary is safe: InitSchema starts on
+// a database forward of the binary (additive) and keeps advertising the staged
+// schema. A member `lv host upgrade` pre-stages without swapping its binary
+// stays in that state, with the staged binary left at <daemon binary>.new,
+// until its own upgrade.
 func (s *Server) PreStageUpgrade(stream grpc.ClientStreamingServer[pb.UpgradeHostRequest, pb.UpgradeHostResponse]) error {
 	if err := RequireRole(stream.Context(), "admin"); err != nil {
 		return err

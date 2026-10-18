@@ -8,13 +8,14 @@ import (
 
 // Catch a collision that marks the retirement ALTER applied without executing
 // it, or omits/misclassifies an automation table when moving SQL versions.
-func TestAutomationPrimary636Upgrade67Through76(t *testing.T) {
+func TestAutomationPrimary636Upgrade67Through79(t *testing.T) {
 	c := NewTestClientT(t)
 	ctx := context.Background()
 	for _, ddl := range schemaDDL {
 		if strings.Contains(ddl, "local_automation_") {
 			continue
 		}
+		ddl = strings.Replace(ddl, ",\n\t\tincarnation  INTEGER NOT NULL DEFAULT 0", "", 1)
 		ddl = strings.Replace(ddl, "deleted_at TEXT,\n\t\tafter_retirement TEXT NOT NULL DEFAULT ''", "deleted_at TEXT", 1)
 		if err := c.execLocal(ctx, ddl); err != nil {
 			t.Fatal("schema67 DDL", err)
@@ -77,18 +78,45 @@ func TestAutomationPrimary636Upgrade67Through76(t *testing.T) {
 	if err := c.execLocal(ctx, `INSERT INTO host_fence_credentials(host_name,ipmi_pass,updated_at) VALUES('retained','private','before68')`); err != nil {
 		t.Fatal(err)
 	}
+	// Apply the published host-incarnation migration before our relocated units.
+	if err := c.execLocal(ctx, `INSERT INTO hosts(name,address,ssh_user,cert_serial,created_at,updated_at) VALUES('legacy','127.0.0.1','root','legacy-cert','before69','before69')`); err != nil {
+		t.Fatal(err)
+	}
+	incarnationUnits := 0
+	for _, m := range schemaMigrationLedger {
+		if m.Version != 69 {
+			continue
+		}
+		incarnationUnits++
+		if m.Target != "hosts.incarnation" || m.Kind != kindAddColumn {
+			t.Fatalf("integration69 meaning changed: %+v", m)
+		}
+		if err := c.execBatchLocal(ctx, []Statement{{SQL: m.SQL}, {SQL: `INSERT INTO applied_migrations VALUES (?, 'fixture69', ?)`, Params: []interface{}{m.ID, sha256hex(m.SQL)}}}); err != nil {
+			t.Fatal("actual68->69 ALTER", err)
+		}
+	}
+	if incarnationUnits != 1 {
+		t.Fatal("schema69 unit count", incarnationUnits)
+	}
+	if err := reconcileSchemaVersion(ctx, c); err != nil || storedVersion(t, c) != 69 {
+		t.Fatal("ledger did not reach69", err)
+	}
+	rows69, err69 := c.Query(ctx, `SELECT incarnation FROM hosts WHERE name='legacy'`)
+	if err69 != nil || len(rows69) != 1 || rows69[0].Int64("incarnation") != 0 {
+		t.Fatal("published69 default lost", rows69, err69)
+	}
 	if err := InitSchema(ctx, c); err != nil {
-		t.Fatal("actual68->current upgrade", err)
+		t.Fatal("actual69->current upgrade", err)
 	}
 	if storedVersion(t, c) != CurrentSchemaVersion || appliedCount(t, c) != len(schemaMigrationLedger) {
 		t.Fatal("upgrade omitted current schema or ledger units")
 	}
-	want := map[int]int{69: 7, 70: 2, 71: 2, 72: 7, 73: 3, 74: 8, 75: 2, 76: 7, 77: 3, 78: 2}
+	want := map[int]int{70: 7, 71: 2, 72: 2, 73: 7, 74: 3, 75: 8, 76: 2, 77: 7, 78: 3, 79: 2}
 	for _, m := range schemaMigrationLedger {
-		if m.Version < 69 {
+		if m.Version < 70 {
 			continue
 		}
-		if !strings.HasPrefix(m.Target, "local_automation_") || (m.Kind != kindCreateTable && !(m.Version == 78 && m.Kind == kindAddColumn && m.Target == "local_automation_receiver_current.established_inventory")) {
+		if !strings.HasPrefix(m.Target, "local_automation_") || (m.Kind != kindCreateTable && !(m.Version == 79 && m.Kind == kindAddColumn && m.Target == "local_automation_receiver_current.established_inventory")) {
 			t.Fatalf("unexpected relocated migration %+v", m)
 		}
 		want[m.Version]--

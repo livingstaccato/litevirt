@@ -388,6 +388,11 @@ func buildV42DB(t *testing.T, c *Client) {
 	t.Helper()
 	ctx := context.Background()
 	for _, ddl := range schemaDDL {
+		// Private automation triggers did not exist at v42; retaining them
+		// after removing their newer tables makes SQLite reject ALTERs.
+		if strings.Contains(ddl, "CREATE TRIGGER IF NOT EXISTS automation_") {
+			continue
+		}
 		// Strip line comments: SQLite stores the CREATE text verbatim, and
 		// ALTER TABLE … DROP COLUMN re-parses it — a trailing “-- …” comment
 		// makes that re-parse fail with “incomplete input”. The fixture needs

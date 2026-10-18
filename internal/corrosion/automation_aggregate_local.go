@@ -394,7 +394,7 @@ func auditAggregateLocalTx(ctx context.Context, tx *LocalTx, a *AutomationReceiv
 				return errors.New("local snapshot reseed lineage unavailable")
 			}
 		case 15:
-			if n != 1 || row.Int64("id") != 1 || row.Int64("version") != 78 {
+			if n != 1 || row.Int64("id") != 1 || row.Int64("version") != 79 {
 				return errors.New("local snapshot schema unavailable")
 			}
 		case 21:

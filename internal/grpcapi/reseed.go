@@ -35,6 +35,9 @@ func (s *Server) IsolateHost(ctx context.Context, req *pb.IsolateHostRequest) (*
 	if req.GetName() == "" {
 		return nil, status.Error(codes.InvalidArgument, "host name required")
 	}
+	if err := s.hostOperatorWriteAllowed(ctx, "isolate", req.GetName()); err != nil {
+		return nil, err
+	}
 	reason := req.GetReason()
 	if reason == "" {
 		reason = corrosion.IsolationManual

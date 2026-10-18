@@ -1226,7 +1226,9 @@ could read as a failure:
    nothing, so nothing is undone on it. A successor that was signed but never
    used is revoked.
 6. The daemon re-records its own serial within a minute, so the record moves on
-   and the old certificate stops being accepted as that host.
+   and the old certificate stops being accepted as that host. A certificate
+   reissued any other way is re-recorded only under the conditions in
+   "Superseded certificates".
 7. Then the replaced certificate is **revoked, at once**. Every node on this
    build already refuses it — as a voter, as a claim signer and on every RPC
    (see "Superseded certificates") — so revoking it costs a pinning node
@@ -1294,6 +1296,22 @@ node that has not yet seen its successor, and as a TLS server to anything that
 dials it. Under `auth.trust_rotated_peer_certs` the supersession checks are off
 on that node — its serial pins and the stale-connection judge with them — so
 while that recovery switch is on, a replaced key's accepts DO count there.
+
+The recovery converges only on hosts that re-record their own serial, and a
+host re-records a certificate that is not a renewal of the recorded one only
+under conditions ([diagnostics.md](diagnostics.md), `own_row_held`):
+
+- over a row at incarnation 0, after its own-row writes have been held for ten
+  minutes from startup (reason `at_start`);
+- over a row at incarnation 1 or higher, only when the row is the admission
+  recorded in `<pki_dir>/own-admission.json`. A host without that record, or
+  with another admission's, is held and never re-records; it needs
+  `lv host rm` then `lv host add`;
+- a certificate swapped while the daemon runs is held until the daemon
+  restarts, and then as above; `certificate/cert_swapped_at_runtime` names it
+  meanwhile.
+
+Turn the switch off only once every host has re-recorded, or been re-added.
 
 #### Renewing a voter
 

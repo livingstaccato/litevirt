@@ -35,7 +35,7 @@ func TestAutomationSource74PublicationPrivacyAndReopen(t *testing.T) {
 	var permanentBefore []Row
 	p, r, q, peer, dir := receiverAuditFixture(t, 0, func(a *claimTestVoter, voters []*claimTestVoter) {
 		// Exercise the current SQL namespace, independent of archived descriptors.
-		if _, err := a.c.db.Exec(`UPDATE schema_state SET version=76 WHERE id=1`); err != nil {
+		if _, err := a.c.db.Exec(`UPDATE schema_state SET version=79 WHERE id=1`); err != nil {
 			t.Fatal(err)
 		}
 		verifier, err := LoadClaimVerifier(a.pki)
@@ -72,7 +72,7 @@ func TestAutomationSource74PublicationPrivacyAndReopen(t *testing.T) {
 		permanentBefore = sharedActiveRows(t, a.c)
 	})
 	if storedVersion(t, p.client) != CurrentSchemaVersion || storedVersion(t, r.client) != CurrentSchemaVersion {
-		t.Fatal("fixture is not current SQL schema76")
+		t.Fatal("fixture is not current SQL schema79")
 	}
 	if !reflect.DeepEqual(localBefore, source74LocalSnapshot(t, p.client)) || !reflect.DeepEqual(typedBefore, automationTypedSnapshot(t, p.client)) || !reflect.DeepEqual(permanentBefore, sharedActiveRows(t, p.client)) {
 		t.Fatal("freeze/publication changed source evidence")
@@ -189,8 +189,8 @@ func TestAutomationSource74PublicationPrivacyAndReopen(t *testing.T) {
 
 // An old supported descriptor keeps identical bytes/root even when live schema
 // is newer or malformed. Archive reuse must precede the live typed-schema gate.
-func TestAutomationSource76KeepsArchived69To75(t *testing.T) {
-	for _, schema := range []int{69, 70, 71, 72, 73, 74, 75} {
+func TestAutomationSource79KeepsArchived69To78(t *testing.T) {
+	for _, schema := range []int{69, 70, 71, 72, 73, 74, 75, 76, 77, 78} {
 		t.Run(fmt.Sprint(schema), func(t *testing.T) {
 			_, a, _, _ := threeVoters(t)
 			ctx := context.Background()
@@ -205,7 +205,7 @@ func TestAutomationSource76KeepsArchived69To75(t *testing.T) {
 				t.Fatal(err)
 			}
 			before, records := cutFixtureRead(t, a.c, id)
-			if _, err := a.c.db.Exec(`UPDATE schema_state SET version=76 WHERE id=1`); err != nil {
+			if _, err := a.c.db.Exec(`UPDATE schema_state SET version=79 WHERE id=1`); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := a.c.db.Exec(`ALTER TABLE local_automation_resources ADD COLUMN unknown_private_column TEXT GENERATED ALWAYS AS (uid) VIRTUAL`); err != nil {
@@ -213,7 +213,7 @@ func TestAutomationSource76KeepsArchived69To75(t *testing.T) {
 			}
 			again, err := a.c.FreezeAutomationCut(ctx, 1, nil)
 			if err != nil || again != id {
-				t.Fatal("live76 invalidated immutable archive", err)
+				t.Fatal("live79 invalidated immutable archive", err)
 			}
 			after, later := cutFixtureRead(t, a.c, id)
 			if before.SourceSchema != schema || !reflect.DeepEqual(before, after) || !reflect.DeepEqual(records, later) {

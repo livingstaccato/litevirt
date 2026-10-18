@@ -141,7 +141,7 @@ func TestReceiverEstablishedInventoryActualLegacyUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, q := range []string{`DROP TABLE local_automation_receiver_established`, `ALTER TABLE local_automation_receiver_current DROP COLUMN established_inventory`, `DELETE FROM applied_migrations WHERE id='t_local_automation_receiver_established' OR id LIKE '%local_automation_receiver_current_established_inventory'`, `UPDATE schema_state SET version=77`} {
+	for _, q := range []string{`DROP TABLE local_automation_receiver_established`, `ALTER TABLE local_automation_receiver_current DROP COLUMN established_inventory`, `DELETE FROM applied_migrations WHERE id='t_local_automation_receiver_established' OR id LIKE '%local_automation_receiver_current_established_inventory'`, `UPDATE schema_state SET version=78`} {
 		if _, err = f.local.c.db.Exec(q); err != nil {
 			t.Fatal("actual legacy shape", err)
 		}

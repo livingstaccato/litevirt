@@ -1160,8 +1160,55 @@ func (c *Client) mergeChunkTransaction(table syncTable, rows [][]interface{}, in
 				continue
 			}
 		}
+		// The incarnation counter first (host_incarnation.go): a row of a
+		// later incarnation is taken whole, whatever its updated_at, and one
+		// of an earlier incarnation never replaces the local row.
+		if table.Name == "hosts" {
+			verdict, vErr := hostsAEDecision(tx, table, row, pkCols, pkIdx)
+			if vErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, vErr
+			}
+			if verdict != aeIncarnationKeepLocal {
+				c.noteOwnRowMerged(tx, table, row)
+			}
+			switch verdict {
+			case aeIncarnationKeepLocal:
+				skipped++
+				pk := pkKeyAt(row, pkIdx)
+				c.deferAfterCommit(tx, func() {
+					c.observeMergeRejected("hosts", "ae", reasonOlderKey)
+					if c.incarnationRefusals.allow("ae|"+pk, time.Now()) {
+						slog.Warn("anti-entropy: kept the local hosts row; the peer's is of an earlier incarnation",
+							"table", "hosts", "pk", pk, "next_report_after", refusalLogInterval)
+					}
+				})
+				continue
+			case aeIncarnationTakeIncoming:
+				rejected, execErr := c.applyMergeRow(tx, insertSQL, row, table.Name)
+				if execErr != nil {
+					_ = tx.Rollback()
+					return merged, skipped, execErr
+				}
+				if rejected {
+					skipped++
+					continue
+				}
+				if err := retireAdoptedAdmissionCredential(ctx, tx, table, row); err != nil {
+					_ = tx.Rollback()
+					return merged, skipped, err
+				}
+				merged++
+				pk := pkKeyAt(row, pkIdx)
+				if c.anyUnresolved() {
+					c.deferAfterCommit(tx, func() { c.clearUnresolved(table.Name, pk) })
+				}
+				continue
+			}
+		}
 		// The hosts floor: a row of a host's previous incarnation never replaces
-		// the re-admitted one (host_incarnation_floor.go).
+		// the re-admitted one (host_incarnation_floor.go). It decides only
+		// between two rows at incarnation 0; the counter decided everything else.
 		if table.Name == "hosts" {
 			keepLocal, reason, kErr := hostsOlderIncarnationRefused(tx, table, row, pkCols, pkIdx)
 			if kErr != nil {

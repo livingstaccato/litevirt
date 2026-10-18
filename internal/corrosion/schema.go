@@ -552,31 +552,43 @@ import (
 //	     its WAL entries. Existing rows migrate with no retirement, so a
 //	     tombstone from before the upgrade still beats a password set after
 //	     it (docs/migration-failover.md). Additive.
-//	v69: node-local automation authority, applied prefix, certified history,
+//	v69: hosts.incarnation (INTEGER NOT NULL DEFAULT 0) — the host
+//	     incarnation counter (host_incarnation.go). 0 on every row written
+//	     before the release feature host_incarnation is first used; a
+//	     re-admission over a tombstone at N writes N+1, and nothing else
+//	     raises it. Rows are ordered by (incarnation, created_at,
+//	     cert_serial) ahead of their clock. A previous-release node does not
+//	     write the column and cannot decode the re-admission that raises it,
+//	     which is written only through the feature (ReplicationGated).
+//	     Additive.
+//	v70: node-local automation authority, applied prefix, certified history,
 //	     permanent request receipts, authenticated anchors and bounded on-disk
 //	     recovery staging. None participates in CRDT replication.
-//	v70: inert node-local audited automation content cuts and bounded immutable
+//	v71: inert node-local audited automation content cuts and bounded immutable
 //	     records. No transfer publication, adoption or capability authority.
-//	v71: completed node-local outgoing automation publications, immutable job
+//	v72: completed node-local outgoing automation publications, immutable job
 //	     pins and retained public trust evidence; excluded from source content.
 //
-// v72: inert receiver attempts, pending metadata and bounded transport inventory.
-// v73: inert per-source audit results, spool references and causal request indexes.
+// v73: inert receiver attempts, pending metadata and bounded transport inventory.
+// v74: inert per-source audit results, spool references and causal request indexes.
 // No active import, origin mode, replication or authority is introduced.
-// v74: typed node-local automation identity and owner projections, isolated
+// v75: typed node-local automation identity and owner projections, isolated
 // by reconstruction stage. No replication or admission authority is introduced.
-// v75: node-local originating account/project lifecycle evidence and exact
+// v76: node-local originating account/project lifecycle evidence and exact
 // credential issuance provenance, with atomic invalidate-only parent triggers.
 // These are source observations, never certified identities or class permits.
-// v76: immutable inert local snapshots and complete fixed-roster aggregates.
+// v77: immutable inert local snapshots and complete fixed-roster aggregates.
 // These rows confer no current proof, origin authority or active adoption.
-// v77: causal key epoch, recipient and payload wrapping projections.
-// v78: signed receiver-established floors and current-row complete inventory; never live proof.
-const CurrentSchemaVersion = 78
+// v78: causal key epoch, recipient and payload wrapping projections.
+// v79: signed receiver-established floors and current-row complete inventory; never live proof.
+const CurrentSchemaVersion = 79
 
 // schemaVersionCredentialRetirement is the version
 // host_fence_credentials.after_retirement was added in.
 const schemaVersionCredentialRetirement = 68
+
+// schemaVersionHostIncarnation is the version hosts.incarnation was added in.
+const schemaVersionHostIncarnation = 69
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -758,6 +770,10 @@ func (c *Client) migrateAcknowledgedTiesPK(ctx context.Context) error {
 //   - present  → record it (mark-only; the ALTER/CREATE already happened)
 //   - missing  → apply its SQL + record it in ONE local transaction (heal)
 //
+// A missing unit newer than the database's stamped schema_state.version is
+// the upgrade's own step and logs at INFO; one at or below it is a silent gap
+// and logs a WARN.
+//
 // A real apply error aborts LOUDLY (no benign swallowing). Mark-applied is
 // gated on the presence predicate, NEVER on the version number, so a silent
 // gap from the old swallow-benign loop is healed rather than falsely claimed.
@@ -820,8 +836,16 @@ func InitSchema(ctx context.Context, c *Client) error {
 		return fmt.Errorf("load applied_migrations: %w", err)
 	}
 
+	// The version the database was stamped at before this run. A missing unit
+	// newer than it is this upgrade's own step; one at or below it is a gap a
+	// prior daemon left. A fresh database has no stamp, so nothing is a gap.
+	stamped := 0
+	if rows, err := c.Query(ctx, `SELECT version FROM schema_state WHERE id = 1`); err == nil && len(rows) > 0 {
+		stamped = rows[0].Int("version")
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339)
-	healed := 0
+	healed, upgraded := 0, 0
 	for _, m := range schemaMigrationLedger {
 		sum := sha256hex(m.SQL)
 		if stored, ok := applied[m.ID]; ok {
@@ -868,8 +892,14 @@ func InitSchema(ctx context.Context, c *Client) error {
 		if err := c.execBatchLocal(ctx, stmts); err != nil {
 			return fmt.Errorf("schema migration %q: %w", m.ID, err)
 		}
+		if m.Version > stamped {
+			slog.Info("schema ledger: applied a migration of this upgrade",
+				"id", m.ID, "target", m.Target, "migration_version", m.Version, "db_version", stamped)
+			upgraded++
+			continue
+		}
 		slog.Warn("schema ledger: healed a missing migration (silent gap from a prior daemon)",
-			"id", m.ID, "target", m.Target)
+			"id", m.ID, "target", m.Target, "migration_version", m.Version, "db_version", stamped)
 		healed++
 	}
 
@@ -893,7 +923,7 @@ func InitSchema(ctx context.Context, c *Client) error {
 	// Seed the effective DB-applied schema cache (handshake source of truth).
 	eff := c.RefreshDBSchemaVersion(ctx)
 	slog.Info("schema initialized",
-		"schema_version", eff, "ledger", len(schemaMigrationLedger), "healed", healed)
+		"schema_version", eff, "ledger", len(schemaMigrationLedger), "upgraded", upgraded, "healed", healed)
 	return nil
 }
 
@@ -1255,7 +1285,8 @@ var schemaDDL = []string{
 		deleted_at   TEXT,
 		version      TEXT DEFAULT '',
 		region       TEXT NOT NULL DEFAULT 'default',
-		capacity_policy_hash TEXT NOT NULL DEFAULT ''
+		capacity_policy_hash TEXT NOT NULL DEFAULT '',
+		incarnation  INTEGER NOT NULL DEFAULT 0
 	)`,
 
 	`CREATE TABLE IF NOT EXISTS host_labels (
@@ -3811,6 +3842,8 @@ var schemaMigrations = []string{
 	// The retirement a live fence credential was set after (see History,
 	// schemaVersionCredentialRetirement).
 	`ALTER TABLE host_fence_credentials ADD COLUMN after_retirement TEXT NOT NULL DEFAULT ''`,
+	// The host incarnation counter (see History, schemaVersionHostIncarnation).
+	`ALTER TABLE hosts ADD COLUMN incarnation INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE local_automation_receiver_current ADD COLUMN established_inventory BLOB NOT NULL DEFAULT x''`,
 }
 
@@ -3905,7 +3938,8 @@ var alterVersions = []int{
 	54,                                // runtime_action_proofs.lease_key
 	60,                                // runtime_action_proofs.claim_certificate
 	schemaVersionCredentialRetirement, // host_fence_credentials.after_retirement
-	78,                                // local_automation_receiver_current.established_inventory
+	schemaVersionHostIncarnation,      // hosts.incarnation
+	79,                                // local_automation_receiver_current.established_inventory
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -3952,34 +3986,34 @@ var createTableUnits = []struct {
 	{65, "host_runtime"},
 	{66, "session_groups"},
 	{67, "host_fence_redfish"},
-	{69, "local_automation_authority"}, {69, "local_automation_prefix"},
-	{69, "local_automation_anchors"}, {69, "local_automation_history"},
-	{69, "local_automation_requests"}, {69, "local_automation_recovery"}, {69, "local_automation_staging"},
-	{70, "local_automation_cuts"}, {70, "local_automation_cut_records"},
-	{71, "local_automation_source_jobs"}, {71, "local_automation_publications"},
-	{78, "local_automation_receiver_established"},
-	{77, "local_automation_key_epochs"}, {77, "local_automation_key_recipients"}, {77, "local_automation_payload_wrappings"},
-	{76, "local_automation_local_audits"},
-	{76, "local_automation_local_rows"},
-	{76, "local_automation_aggregates"},
-	{76, "local_automation_aggregate_sources"},
-	{76, "local_automation_aggregate_copies"},
-	{76, "local_automation_aggregate_maxima"},
-	{76, "local_automation_aggregate_conflicts"},
-	{75, "local_automation_lifetimes"}, {75, "local_automation_credential_issuance"},
-	{74, "local_automation_identities"}, {74, "local_automation_aliases"},
-	{74, "local_automation_owners"}, {74, "local_automation_semantic_heads"},
-	{74, "local_automation_resources"}, {74, "local_automation_names"}, {74, "local_automation_bindings"}, {74, "local_automation_admissions"},
-	{73, "local_automation_receiver_audits"},
-	{73, "local_automation_receiver_refs"},
-	{73, "local_automation_receiver_requests"},
-	{72, "local_automation_receiver_jobs"},
-	{72, "local_automation_receiver_current"},
-	{72, "local_automation_receiver_validations"},
-	{72, "local_automation_receiver_sources"},
-	{72, "local_automation_receiver_components"},
-	{72, "local_automation_receiver_records"},
-	{72, "local_automation_receiver_pages"},
+	{70, "local_automation_authority"}, {70, "local_automation_prefix"},
+	{70, "local_automation_anchors"}, {70, "local_automation_history"},
+	{70, "local_automation_requests"}, {70, "local_automation_recovery"}, {70, "local_automation_staging"},
+	{71, "local_automation_cuts"}, {71, "local_automation_cut_records"},
+	{72, "local_automation_source_jobs"}, {72, "local_automation_publications"},
+	{79, "local_automation_receiver_established"},
+	{78, "local_automation_key_epochs"}, {78, "local_automation_key_recipients"}, {78, "local_automation_payload_wrappings"},
+	{77, "local_automation_local_audits"},
+	{77, "local_automation_local_rows"},
+	{77, "local_automation_aggregates"},
+	{77, "local_automation_aggregate_sources"},
+	{77, "local_automation_aggregate_copies"},
+	{77, "local_automation_aggregate_maxima"},
+	{77, "local_automation_aggregate_conflicts"},
+	{76, "local_automation_lifetimes"}, {76, "local_automation_credential_issuance"},
+	{75, "local_automation_identities"}, {75, "local_automation_aliases"},
+	{75, "local_automation_owners"}, {75, "local_automation_semantic_heads"},
+	{75, "local_automation_resources"}, {75, "local_automation_names"}, {75, "local_automation_bindings"}, {75, "local_automation_admissions"},
+	{74, "local_automation_receiver_audits"},
+	{74, "local_automation_receiver_refs"},
+	{74, "local_automation_receiver_requests"},
+	{73, "local_automation_receiver_jobs"},
+	{73, "local_automation_receiver_current"},
+	{73, "local_automation_receiver_validations"},
+	{73, "local_automation_receiver_sources"},
+	{73, "local_automation_receiver_components"},
+	{73, "local_automation_receiver_records"},
+	{73, "local_automation_receiver_pages"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

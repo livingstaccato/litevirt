@@ -17,7 +17,11 @@ import (
 	"strings"
 	"syscall"
 
+	"google.golang.org/grpc/metadata"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/apimeta"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netutil"
 	"gopkg.in/yaml.v3"
@@ -238,11 +242,18 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	if err != nil {
 		return fmt.Errorf("read generated host certificate serial: %w", err)
 	}
-	admitted, err := c.AdmitHost(ctx, &pb.AdmitHostRequest{
+	// The header is this command's claim that it installs its own build,
+	// which keeps a host incarnation; the daemon cannot check which binary
+	// findDaemonBinary pushed (docs/upgrades.md).
+	admitCtx := metadata.AppendToOutgoingContext(ctx, apimeta.AdmitInstallsReleaseHeader, capabilities.ReleaseToken)
+	admitted, err := c.AdmitHost(admitCtx, &pb.AdmitHostRequest{
 		Name: hostName, Address: hostAddr, CertSerial: serial,
 	})
 	if err != nil {
 		return fmt.Errorf("admit host identity to the cluster: %w", err)
+	}
+	if why := admitted.GetIncarnationNotIssued(); why != "" {
+		fmt.Printf("  re-admitted %s without a host incarnation: %s\n", hostName, why)
 	}
 	// The name's audit chain position, signed with the CA, so the new machine's
 	// daemon holds its own audit rows until that history has reached it instead

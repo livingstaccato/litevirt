@@ -602,13 +602,14 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// owner of a forward, an older entry's unmarked compose re-create), and
 	// never for a delete that keeps them (withSchedulesKept).
 	dropSchedules := false
-	var dropProject string
+	var dropProject, dropHost string
 	if !schedulesKept(ctx) && !s.forwardedByEntry(ctx) && !s.isRemotePeer(ctx) {
 		dropProject, dropSchedules = s.containerProject(ctx, req.HostName, req.Name)
+		dropHost = s.deletedContainerHost(ctx, req.HostName, req.Name)
 	}
 	out, err := s.deleteContainer(ctx, req)
 	if err == nil && dropSchedules {
-		s.deleteContainerSchedules(context.WithoutCancel(ctx), dropProject, req.Name)
+		s.deleteContainerSchedules(context.WithoutCancel(ctx), dropHost, dropProject, req.Name)
 	}
 	return out, err
 }

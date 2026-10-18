@@ -248,3 +248,26 @@ func TestDeleteContainer_SchedulesEndWithAPlainDeleteOnly(t *testing.T) {
 		}
 	})
 }
+
+// The deleted container's own row is not another holder: a forwarded delete
+// whose tombstone has not reached the entry's replica yet still drops the
+// schedules. Another host's live row of the name keeps them.
+//
+// Mutation: count the deleted container's own (host, name) row as a holder — red.
+func TestDeleteContainerSchedules_TheDeletedRowIsNoHolder(t *testing.T) {
+	s := scheduledContainerServer(t)
+	ctx := context.Background()
+	// ct is still live here, as on an entry whose replica lags the owner.
+	s.deleteContainerSchedules(ctx, s.hostName, "_default", "ct")
+	if got := liveSchedules(t, s); got != "@ct:_default/other/dr" {
+		t.Fatalf("schedules after the drop for ct on %s = %q, want only other's", s.hostName, got)
+	}
+	s2 := scheduledContainerServer(t)
+	if err := corrosion.UpsertContainer(ctx, s2.db, corrosion.ContainerRecord{HostName: "other-host", Name: "ct", State: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	s2.deleteContainerSchedules(ctx, s2.hostName, "_default", "ct")
+	if got := liveSchedules(t, s2); got != "@ct:_default/ct/dr,@ct:_default/other/dr" {
+		t.Fatalf("another host's live ct did not keep the schedules: %q", got)
+	}
+}

@@ -335,7 +335,10 @@ func TestFleet_ContainerRmTakesItsSchedules(t *testing.T) {
 // container deleted long ago — left by deletes on an older build, as on lab 2
 // — heals with no migration: the VM's schedule no longer keeps the stack's
 // repo registered, and the failover lease holder's sweep removes both on
-// every replica. A schedule of a VM whose row has not arrived is kept.
+// every replica, also when a run in flight at the delete stamped them after
+// it. A schedule of a VM whose row has not arrived is kept.
+//
+// Mutation: drop the quiet clause from orphanTombstone — red.
 //
 // Red before the fix: the repo stays registered and the schedule live.
 func TestFleet_ALeftoverScheduleOfADeletedVMHeals(t *testing.T) {
@@ -380,21 +383,34 @@ func TestFleet_ALeftoverScheduleOfADeletedVMHeals(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitHistoryApplied(t, c, 30*time.Second)
-	// The deletes were two days ago: past the grace.
+	// The deletes were two days ago: past the grace. Runs in flight at the
+	// deletes finished after them, stamping both schedules newer than the
+	// tombstones (MarkBackupScheduleRun).
 	ageTombstone(t, c, "vms", "e2e-br")
 	ageTombstone(t, c, "containers", "e2e-ct")
+	for _, r := range [][2]string{{"e2e-br", "e2erepo"}, {corrosion.ContainerScheduleKey("", "e2e-ct"), "dr"}} {
+		if err := corrosion.MarkBackupScheduleRun(ctx, n0.DB, r[0], r[1], "", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitHistoryApplied(t, c, 30*time.Second)
+
+	// Once nothing has written them for a full grace, the lease holder's
+	// sweep removes them everywhere.
+	if held, _, err := corrosion.AcquireLeaseWithTerm(ctx, holder.DB, corrosion.LeaseKeyFailover, holder.Name, time.Hour, time.Now()); err != nil || !held {
+		t.Fatalf("%s takes the failover lease: held=%v err=%v", holder.Name, held, err)
+	}
+	holder.Server.SweepScheduleOrphansForTest(ctx, time.Now().Add(48*time.Hour))
+	assertSchedulesEverywhere(t, c, "unborn/other")
 
 	// The stack's teardown, as the sweep of torn-down stacks' rows retries
-	// it on any node, no longer keeps the repo for the leftover.
+	// it on any node, then unregisters the repo.
 	if err := corrosion.DeleteStackBackupRepos(ctx, holder.DB, "gone-stack", nil); err != nil {
 		t.Fatal(err)
 	}
 	if r, err := corrosion.GetBackupRepo(ctx, holder.DB, "e2erepo"); err != nil || r != nil {
 		t.Errorf("e2erepo after the teardown is retried: %+v (%v), want it unregistered", r, err)
 	}
-
-	sweepAsLeaseHolder(t, holder)
-	assertSchedulesEverywhere(t, c, "unborn/other")
 }
 
 const scheduledContainerStack = `name: cts

@@ -41,12 +41,17 @@ func tornDownStack(t *testing.T, c *Client, name string) {
 //   - rewritten: down's, deleted two days ago, the schedule written after;
 //   - plain:     no stack's, deleted two days ago (a failed rebuild leaves this);
 //   - upvm:      live stack up's, deleted two days ago (a blue-green blue);
+//   - ran:       down's, deleted two days ago, then stamped by a run that
+//     finished after the delete (MarkBackupScheduleRun, now);
+//   - rdvm:      stack rd's, deleted two days ago; rd was torn down and
+//     deployed again (its record is live);
 //   - @cluster:  a cluster-scoped schedule.
 //
 // Containers (each with a replication schedule into "r"):
 //   - ctgone:  down's, deleted two days ago;
 //   - ctplain: no stack's, deleted two days ago;
 //   - ctup:    live stack up's, deleted two days ago;
+//   - ctran:   down's, deleted two days ago, then stamped by a late run;
 //   - ctmoved: down's tombstone on h1 two days ago, but live on h2.
 func orphanFixture(t *testing.T) *Client {
 	t.Helper()
@@ -56,13 +61,21 @@ func orphanFixture(t *testing.T) *Client {
 	if err := UpsertStack(ctx, c, StackRecord{Name: "up", State: "active"}); err != nil {
 		t.Fatal(err)
 	}
-	stackOf := map[string]string{"gone": "down", "tie": "down", "recent": "down", "live": "down", "rewritten": "down", "upvm": "up"}
-	for _, vm := range []string{"gone", "tie", "recent", "live", "rewritten", "plain", "upvm"} {
+	// rd: torn down, then deployed again.
+	tornDownStack(t, c, "rd")
+	if err := UpsertStack(ctx, c, StackRecord{Name: "rd", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := GetStack(ctx, c, "rd"); st == nil {
+		t.Fatal("premise: the redeployed stack's record is not live")
+	}
+	stackOf := map[string]string{"gone": "down", "tie": "down", "recent": "down", "live": "down", "rewritten": "down", "upvm": "up", "ran": "down", "rdvm": "rd"}
+	for _, vm := range []string{"gone", "tie", "recent", "live", "rewritten", "plain", "upvm", "ran", "rdvm"} {
 		if err := InsertVM(ctx, c, VMRecord{Name: vm, StackName: stackOf[vm], HostName: "h1", Spec: "{}", State: "stopped"}, nil, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, vm := range []string{"gone", "tie", "recent", "unborn", "live", "rewritten", "plain", "upvm"} {
+	for _, vm := range []string{"gone", "tie", "recent", "unborn", "live", "rewritten", "plain", "upvm", "ran", "rdvm"} {
 		if err := UpsertBackupSchedule(ctx, c, BackupScheduleRecord{VMName: vm, Repo: "r", Cron: "0 4 * * *", Enabled: true}); err != nil {
 			t.Fatal(err)
 		}
@@ -70,13 +83,16 @@ func orphanFixture(t *testing.T) *Client {
 	if err := UpsertBackupSchedule(ctx, c, BackupScheduleRecord{VMName: "@cluster", Scope: "cluster", Repo: "r", Cron: "0 4 * * *", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	for _, vm := range []string{"gone", "tie", "recent", "rewritten", "plain", "upvm"} {
+	for _, vm := range []string{"gone", "tie", "recent", "rewritten", "plain", "upvm", "ran", "rdvm"} {
 		if err := DeleteVM(ctx, c, vm); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, vm := range []string{"gone", "tie", "rewritten", "plain", "upvm"} {
+	for _, vm := range []string{"gone", "tie", "rewritten", "plain", "upvm", "ran", "rdvm"} {
 		backdate(t, c, "vms", vm)
+	}
+	if err := MarkBackupScheduleRun(ctx, c, "ran", "r", "", time.Now()); err != nil {
+		t.Fatal(err)
 	}
 	if err := UpsertBackupSchedule(ctx, c, BackupScheduleRecord{VMName: "rewritten", Repo: "r", Cron: "0 5 * * *", Enabled: true}); err != nil {
 		t.Fatal(err)
@@ -100,7 +116,8 @@ func orphanFixture(t *testing.T) *Client {
 	mkCT("h1", "ctplain", "")
 	mkCT("h1", "ctmoved", "down")
 	mkCT("h1", "ctup", "up")
-	for _, ct := range []string{"ctgone", "ctplain", "ctmoved", "ctup"} {
+	mkCT("h1", "ctran", "down")
+	for _, ct := range []string{"ctgone", "ctplain", "ctmoved", "ctup", "ctran"} {
 		if err := upsertBackupSchedule(ctx, c, BackupScheduleRecord{VMName: ContainerScheduleKey("", ct), Scope: "container",
 			Type: "replication", Repo: "r", TargetPool: "r", Cron: "0 4 * * *", Enabled: true}); err != nil {
 			t.Fatal(err)
@@ -109,6 +126,9 @@ func orphanFixture(t *testing.T) *Client {
 			t.Fatal(err)
 		}
 		backdate(t, c, "containers", ct)
+	}
+	if err := MarkBackupScheduleRun(ctx, c, ContainerScheduleKey("", "ctran"), "r", "", time.Now()); err != nil {
+		t.Fatal(err)
 	}
 	mkCT("h2", "ctmoved", "down")
 	return c
@@ -129,14 +149,17 @@ func orphanNames(t *testing.T, c *Client, now time.Time) string {
 }
 
 // Only a schedule of a workload of a torn-down stack, whose tombstone is
-// older than the grace and not older than the schedule, is an orphan. A
+// older than the grace, and which is not newer than the tombstone or has not
+// been written for a full grace (a run that finished after the delete), is an
+// orphan. A redeployed stack's workload is never one. A
 // schedule of a workload that is no stack's or a live stack's (a failed
 // rebuild, a blue-green blue) stays dormant, as it always has.
 //
 // Mutations: drop the grace — "recent" turns up; drop the LWW tie-break —
 // "rewritten" turns up; make an equal stamp not an orphan (> 0 to >= 0) —
 // "tie" goes; treat a missing VM row as an orphan — "unborn" turns up; drop
-// the torn-down-stack clause — "plain" and "upvm" turn up; drop the
+// the torn-down-stack clause — "plain", "upvm" and "rdvm" turn up; drop the
+// quiet clause — "ran", "ctran" and "rewritten" never turn up; drop the
 // container stack checks — "ctplain" or "ctup" turns up; drop the live-row check —
 // "ctmoved" turns up.
 func TestOrphanedStackSchedules(t *testing.T) {
@@ -146,7 +169,9 @@ func TestOrphanedStackSchedules(t *testing.T) {
 		t.Fatalf("orphans now = %q, want %q", got, want)
 	}
 	// Past the grace the recently deleted VM's schedule is one too.
-	want = "@ct:_default/ctgone/r,gone/r,recent/r,tie/r"
+	// So are the ones a late run (or a write after the tombstone) stamped,
+	// once nothing has written them for a full grace.
+	want = "@ct:_default/ctgone/r,@ct:_default/ctran/r,gone/r,ran/r,recent/r,rewritten/r,tie/r"
 	if got := orphanNames(t, c, time.Now().Add(ScheduleOrphanGrace+time.Hour)); got != want {
 		t.Fatalf("orphans past the grace = %q, want %q", got, want)
 	}

@@ -326,7 +326,8 @@ reason stays dormant until the name comes back. A schedule left behind by a
 delete the entry could not attribute (one entered on an older build, or made
 with a host certificate) for a workload of a stack that has since been torn
 down is removed by the failover lease holder's sweep 24 hours after the
-workload was deleted, and does not keep that stack's backup repo registered.
+workload was deleted, or after the last run that finished after it, and does
+not keep that stack's backup repo registered.
 
 Repos referenced by schedules resolve through the cluster's repo map: a
 top-level compose `backup-repos:` block (see below) or daemon config

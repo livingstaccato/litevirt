@@ -435,7 +435,12 @@ const ScheduleOrphanGrace = 24 * time.Hour
 //
 // A run that finished after the delete stamped the row later
 // (MarkBackupScheduleRun bumps updated_at), so that schedule reads as newer
-// than the tombstone and is kept; `lv backup schedule rm` removes it.
+// than the tombstone; it is swept once nothing has written it for a full grace
+// (orphanTombstone). A redeploy of the stack is never touched: its stack row
+// and its workloads' rows are live again before the compose hook writes a
+// schedule. The one residual risk is a sweeper whose replica is more than a
+// grace behind the origin of a re-created stack's rows, which is not a state
+// a failover lease holder is in.
 func OrphanedStackSchedules(ctx context.Context, c *Client, now time.Time, grace time.Duration) ([]BackupScheduleRecord, error) {
 	out, err := orphanedStackVMSchedules(ctx, c, now, grace)
 	if err != nil {
@@ -455,7 +460,16 @@ func orphanTombstone(deletedAt, tombAt, scheduleAt string, now time.Time, grace 
 	if !ok || now.Sub(deleted) < grace {
 		return false
 	}
-	return lwwOrder(scheduleAt, tombAt) <= 0
+	if lwwOrder(scheduleAt, tombAt) <= 0 {
+		return true
+	}
+	// Written after the tombstone, but not for a full grace since. Every
+	// config write needs a live workload, so with none since, that write was a
+	// run in flight at the delete (MarkBackupScheduleRun), not a schedule for a
+	// new incarnation; one for a new incarnation replicates with its revival
+	// well inside the grace.
+	written, ok := ParseUpdatedAt(scheduleAt)
+	return ok && now.Sub(written) >= grace
 }
 
 func orphanedStackVMSchedules(ctx context.Context, c *Client, now time.Time, grace time.Duration) ([]BackupScheduleRecord, error) {

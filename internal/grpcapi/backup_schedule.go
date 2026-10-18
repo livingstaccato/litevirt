@@ -260,14 +260,20 @@ func (s *Server) deleteVMSchedules(ctx context.Context, name string) {
 // container of that project and name is left anywhere in this replica (a
 // container name is unique per host, not cluster-wide), it tombstones the
 // container's replication schedules, in either key form.
-func (s *Server) deleteContainerSchedules(ctx context.Context, project, name string) {
+//
+// host is the deleted container's host: its own row is not another holder,
+// though this replica may still list it (a forwarded delete whose tombstone
+// has not arrived here yet).
+func (s *Server) deleteContainerSchedules(ctx context.Context, host, project, name string) {
 	cts, err := corrosion.ListContainers(ctx, s.db, "")
 	if err != nil {
 		slog.Warn("container delete: could not read whether another container holds the name; its schedules stay", "container", name, "error", err)
 		return
 	}
 	for _, ct := range cts {
-		if ct.Name == name && tenancy.NormalizeProject(ct.Project) == tenancy.NormalizeProject(project) {
+		if ct.Name == name && ct.HostName != host && tenancy.NormalizeProject(ct.Project) == tenancy.NormalizeProject(project) {
+			slog.Info("container delete: another live container holds the name; its schedules stay",
+				"container", name, "project", project, "deleted_on", host, "held_on", ct.HostName)
 			return
 		}
 	}
@@ -286,6 +292,25 @@ func (s *Server) deleteContainerSchedules(ctx context.Context, project, name str
 		}
 		slog.Info("container delete: removed the deleted container's schedule", "container", name, "repo", r.Repo)
 	}
+}
+
+// deletedContainerHost is the host a delete of container name acts on: the
+// one named, or the host of its live row when none is (as DeleteContainer
+// resolves it). "" when there is none.
+func (s *Server) deletedContainerHost(ctx context.Context, host, name string) string {
+	if host != "" {
+		return host
+	}
+	cts, err := corrosion.ListContainers(ctx, s.db, "")
+	if err != nil {
+		return ""
+	}
+	for _, ct := range cts {
+		if ct.Name == name {
+			return ct.HostName
+		}
+	}
+	return ""
 }
 
 func scheduleToPB(r corrosion.BackupScheduleRecord) *pb.BackupSchedule {

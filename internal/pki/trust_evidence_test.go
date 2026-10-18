@@ -3,8 +3,11 @@ package pki
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
 	"math/big"
@@ -241,5 +244,96 @@ func TestCompletedTrustRecordedPeerDistinctFromServedLeaf(t *testing.T) {
 	}
 	if err := evidence.VerifyRecordedPeer(other.Certificate, "test-host"); err == nil {
 		t.Fatal("foreign-domain peer accepted")
+	}
+}
+
+func TestRecordedLocalHostInertExactIdentity(t *testing.T) {
+	dir := setupPKI(t)
+	view, err := CaptureHostTrust(context.Background(), dir, "test-host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := view.PublicEvidence()
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := DecodeHostTrustEvidence(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := evidence.RecordedLocalHost("test-host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leaf.Subject.CommonName != "test-host" {
+		t.Fatal("wrong recorded identity")
+	}
+	if _, err = evidence.RecordedLocalHost("peer"); err == nil {
+		t.Fatal("peer substituted for local identity")
+	}
+	foreign := setupPKI(t)
+	pair, err := ServedHostKeyPair(foreign)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := *evidence
+	changed.leaf = pair.Certificate[0]
+	if _, err = changed.RecordedLocalHost("test-host"); err == nil {
+		t.Fatal("same-name foreign signed root accepted")
+	}
+	changed = *evidence
+	changed.leaf = bytes.Clone(evidence.leaf)
+	changed.leaf[len(changed.leaf)-1] ^= 1
+	if _, err = changed.RecordedLocalHost("test-host"); err == nil {
+		t.Fatal("changed leaf signature accepted")
+	}
+}
+
+func TestRecordedLocalHostRequiresCompleteLegacyChain(t *testing.T) {
+	dir := setupPKI(t)
+	view, err := CaptureHostTrust(context.Background(), dir, "test-host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := view.PublicEvidence()
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := DecodeHostTrustEvidence(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, key, err := loadCA(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	intermediateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{SerialNumber: big.NewInt(1234), Subject: pkix.Name{CommonName: "intermediate"}, NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	intermediateDER, err := x509.CreateCertificate(rand.Reader, template, ca, &intermediateKey.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intermediate, err := x509.ParseCertificate(intermediateDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := x509.ParseCertificate(evidence.leaf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf.NotBefore = template.NotBefore
+	leaf.NotAfter = template.NotAfter
+	evidence.leaf, err = x509.CreateCertificate(rand.Reader, leaf, intermediate, leaf.PublicKey, intermediateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = evidence.VerifyRecordedHost([][]byte{evidence.leaf, intermediateDER}, "test-host"); err != nil {
+		t.Fatal("genuine full original chain refused", err)
+	}
+	if _, err = evidence.RecordedLocalHost("test-host"); err == nil {
+		t.Fatal("legacy evidence silently invented missing intermediate")
 	}
 }

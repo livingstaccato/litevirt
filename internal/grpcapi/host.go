@@ -1171,6 +1171,8 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 		IPMIPass:      h.IPMIPass,
 		Redfish:       h.Redfish,
 		WatchdogDev:   h.WatchdogDev,
+		// A retired credential is reported, never sent as an empty password.
+		IPMICredentialRetired: h.IPMIPassRetired,
 		// Only a fence aimed at THIS node may use the watchdog strategy; it arms
 		// the caller's own device. Everything else is unaffected.
 		IsSelf: h.Name == s.hostName,

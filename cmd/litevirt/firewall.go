@@ -474,6 +474,8 @@ func runMacroAdd(
 				// (the bearer token) but not its cancellation.
 				rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), macroRollbackTimeout)
 				defer cancel()
+				// A Ctrl-C's grace waits for the rollback, within its budget.
+				defer holdInterruptGrace(ctx, macroRollbackTimeout)()
 				var rbErrs []string
 				for _, done := range ids {
 					if rerr := remove(rbCtx, c, done); rerr != nil {

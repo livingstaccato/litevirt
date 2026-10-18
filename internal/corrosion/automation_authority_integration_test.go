@@ -206,7 +206,7 @@ func TestAutomationReceiverTypedHistoryIsolated(t *testing.T) {
 	}
 }
 
-func TestAutomationSchema73UpgradeAndSourceColumns(t *testing.T) {
+func TestAutomationSchema74UpgradeAndSourceColumns(t *testing.T) {
 	_, a, _, _ := threeVoters(t)
 	ctx := context.Background()
 	for _, descriptor := range automationSemanticTables {
@@ -215,20 +215,20 @@ func TestAutomationSchema73UpgradeAndSourceColumns(t *testing.T) {
 		}
 	}
 	for _, migration := range schemaMigrationLedger {
-		if migration.Version == 73 {
+		if migration.Version == 74 {
 			if _, err := a.c.db.Exec(`DELETE FROM applied_migrations WHERE id=?`, migration.ID); err != nil {
 				t.Fatal(err)
 			}
 		}
 	}
-	if _, err := a.c.db.Exec(`UPDATE schema_state SET version=72 WHERE id=1`); err != nil {
+	if _, err := a.c.db.Exec(`UPDATE schema_state SET version=73 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	if err := InitSchema(ctx, a.c); err != nil {
-		t.Fatal("schema72->73", err)
+		t.Fatal("schema73->74", err)
 	}
 	if storedVersion(t, a.c) != CurrentSchemaVersion {
-		t.Fatal("typed schema73 upgrade did not reach current version")
+		t.Fatal("typed schema74 upgrade did not reach current version")
 	}
 	if err := a.c.ExecuteLocal(ctx, func(tx *LocalTx) error { return automationVerifySemanticSchemaTx(ctx, tx) }); err != nil {
 		t.Fatal(err)

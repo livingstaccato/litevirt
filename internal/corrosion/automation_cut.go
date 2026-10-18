@@ -43,7 +43,7 @@ func automationCutRowSize(section automationCutSection) string {
 	return strings.Join(sizes, "+")
 }
 
-func walkAutomationCutRows(ctx context.Context, tx *LocalTx, section automationCutSection, visit func(Row) error) error {
+func walkAutomationCutRowIDs(ctx context.Context, tx *LocalTx, section automationCutSection, visit func(int64) error) error {
 	size := automationCutRowSize(section)
 	var after int64
 	invalid, err := tx.Query(ctx, "SELECT rowid FROM "+section.table+" WHERE rowid<=0 LIMIT 1")
@@ -62,17 +62,30 @@ func walkAutomationCutRows(ctx context.Context, tx *LocalTx, section automationC
 		if rows[0].Int64("bytes") > maxAutomationCutRecordBytes {
 			return fmt.Errorf("oversized automation source row in %s", section.name)
 		}
-		rows, err = tx.Query(ctx, "SELECT "+section.columns+" FROM "+section.table+" WHERE rowid=? LIMIT 1", after)
-		if err != nil {
-			return err
-		}
-		if len(rows) != 1 {
-			return fmt.Errorf("source row disappeared")
-		}
-		if err = visit(rows[0]); err != nil {
+		if err = visit(after); err != nil {
 			return err
 		}
 	}
+}
+
+func automationCutRowTx(ctx context.Context, tx *LocalTx, section automationCutSection, rowid int64) (Row, error) {
+	rows, err := tx.Query(ctx, "SELECT "+section.columns+" FROM "+section.table+" WHERE rowid=? LIMIT 1", rowid)
+	if err != nil {
+		return Row{}, err
+	}
+	if len(rows) != 1 {
+		return Row{}, fmt.Errorf("source row disappeared")
+	}
+	return rows[0], nil
+}
+func walkAutomationCutRows(ctx context.Context, tx *LocalTx, section automationCutSection, visit func(Row) error) error {
+	return walkAutomationCutRowIDs(ctx, tx, section, func(rowid int64) error {
+		row, err := automationCutRowTx(ctx, tx, section, rowid)
+		if err != nil {
+			return err
+		}
+		return visit(row)
+	})
 }
 
 // FreezeAutomationCut creates only inert LOCAL content, not an authenticated
@@ -145,7 +158,7 @@ func (c *Client) FreezeAutomationCut(ctx context.Context, generation int64, redu
 			return fmt.Errorf("unsupported automation cut source schema")
 		}
 		switch rows[0].Int("version") {
-		case 73, 74:
+		case 73, 74, 75, 76, 77, 78:
 			if err := automationVerifySemanticSchemaTx(ctx, tx); err != nil {
 				return err
 			}

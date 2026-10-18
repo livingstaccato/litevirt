@@ -24,7 +24,7 @@ func automationApplySemanticEffectsTx(ctx context.Context, tx *LocalTx, stage st
 	if actual != head {
 		return fmt.Errorf("semantic projection predecessor unavailable")
 	}
-	if r.Receipt.Code != "" && (r.IdentityEffect != nil || r.OwnerEffect != nil || r.ResourcePrevious != nil || r.ResourceEffect != nil || r.NameEffect != nil || len(r.BindingEffects) != 0 || r.AdmissionEffect != nil) {
+	if r.Receipt.Code != "" && (r.EpochEffect != nil || len(r.RecipientEffects) > 0 || r.WrappingEffect != nil || r.WrappingPrevious != nil || r.IdentityEffect != nil || r.OwnerEffect != nil || r.ResourcePrevious != nil || r.ResourceEffect != nil || r.NameEffect != nil || len(r.BindingEffects) != 0 || r.AdmissionEffect != nil) {
 		return fmt.Errorf("rejected decision has semantic effects")
 	}
 	if v := r.IdentityEffect; v != nil {
@@ -73,6 +73,9 @@ func automationApplySemanticEffectsTx(ctx context.Context, tx *LocalTx, stage st
 	if err := automationApplyBindingEffectsTx(ctx, tx, stage, next, r); err != nil {
 		return err
 	}
+	if err := automationApplyKeyEffectsTx(ctx, tx, stage, next, r); err != nil {
+		return err
+	}
 	_, err = tx.Exec(ctx, `INSERT INTO local_automation_semantic_heads(stage,cluster_uid,sequence,digest) VALUES(?,?,?,?) ON CONFLICT(stage) DO UPDATE SET cluster_uid=excluded.cluster_uid,sequence=excluded.sequence,digest=excluded.digest`, stage, next.ClusterUID, next.Sequence, next.Digest)
 	return err
 }
@@ -81,6 +84,15 @@ func automationApplySemanticEffectsTx(ctx context.Context, tx *LocalTx, stage st
 // history remain intact. Call before replaying the first historical decision.
 func automationResetSemanticProjectionTx(ctx context.Context, tx *LocalTx, stage string) error {
 	if err := requireAutomationFull(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM local_automation_key_epochs WHERE stage=?`, stage); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM local_automation_key_recipients WHERE stage=?`, stage); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM local_automation_payload_wrappings WHERE stage=?`, stage); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM local_automation_bindings WHERE stage=?`, stage); err != nil {
@@ -170,6 +182,9 @@ func automationOwnerRecordTx(ctx context.Context, tx *LocalTx, stage, cluster, p
 // This bounded reader supplies the same typed predecessor facts for active
 // application and an isolated reconstruction stage. It supplies no permits.
 func automationSemanticProjectionTx(ctx context.Context, tx *LocalTx, stage string, p *contract.Projection, d contract.Decision) error {
+	return automationSemanticProjectionSourceTx(ctx, tx, stage, p, d, nil)
+}
+func automationSemanticProjectionSourceTx(ctx context.Context, tx *LocalTx, stage string, p *contract.Projection, d contract.Decision, source automationKeyHistorySource) error {
 	head, err := automationSemanticHeadTx(ctx, tx, stage)
 	if err != nil {
 		return err
@@ -179,6 +194,11 @@ func automationSemanticProjectionTx(ctx context.Context, tx *LocalTx, stage stri
 	}
 	c := d.Command
 	switch c.Kind {
+	case "rewrap_payload", "activate_key_epoch":
+		if p.KeyTransition == nil {
+			return fmt.Errorf("key transition causal projection was not prepared")
+		}
+		return nil
 	case "adopt_resource", "transfer_owner":
 		return automationOwnershipProjectionTx(ctx, tx, stage, p, d)
 	case "admit_create":

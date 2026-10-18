@@ -28,6 +28,7 @@ type macroSpy struct {
 	removeFail   map[string]bool
 	removeCtxErr []error
 	onAdd        func()
+	onRemove     func()
 }
 
 func (m *macroSpy) next() (string, error) {
@@ -52,6 +53,9 @@ func (m *macroSpy) AddSecurityGroupRule(_ context.Context, in *pb.AddSecurityGro
 
 func (m *macroSpy) remove(ctx context.Context, id string) (*emptypb.Empty, error) {
 	m.removeCtxErr = append(m.removeCtxErr, ctx.Err())
+	if m.onRemove != nil {
+		m.onRemove()
+	}
 	if m.removeFail[id] {
 		return nil, errors.New("remove refused")
 	}

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 
-	"golang.org/x/term"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -88,15 +87,4 @@ func printJSON(v proto.Message) error {
 	}
 	_, err = os.Stdout.Write(append(b, '\n'))
 	return err
-}
-
-// ReadPassword prompts for a password without echoing input.
-func ReadPassword(prompt string) (string, error) {
-	fmt.Fprint(os.Stderr, prompt)
-	pw, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Fprintln(os.Stderr)
-	if err != nil {
-		return "", err
-	}
-	return string(pw), nil
 }

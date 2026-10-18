@@ -78,6 +78,10 @@ type CTFake struct {
 	// called with, so a scenario can cancel the caller and wait for that
 	// cancellation to reach the source daemon mid-archive.
 	onExportCtx func(ctx context.Context)
+	// onDelete runs after DeleteContainer has removed a container, outside
+	// the lock: the window between the runtime delete and the row's
+	// tombstone.
+	onDelete func(name string)
 
 	ensureIDRangeErr error
 	ensuredRanges    []int64
@@ -270,6 +274,14 @@ func (f *CTFake) OnExportCtx(fn func(ctx context.Context)) {
 	f.onExportCtx = fn
 }
 
+// OnDelete registers fn to run after each DeleteContainer that removed a
+// container. See the onDelete field.
+func (f *CTFake) OnDelete(fn func(name string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onDelete = fn
+}
+
 // Counter accessors. Each returns a copy taken under the lock.
 
 func (f *CTFake) StartCalls() []string  { return f.snapshot(func() []string { return f.startCalls }) }
@@ -399,19 +411,26 @@ func (f *CTFake) StopContainer(_ context.Context, name string, _ int) error {
 
 func (f *CTFake) DeleteContainer(_ context.Context, name string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.deleteCalls = append(f.deleteCalls, name)
 	if f.deleteErr != nil {
+		f.mu.Unlock()
 		return f.deleteErr
 	}
 	if _, ok := f.state[name]; !ok {
+		f.mu.Unlock()
 		// Idempotent: the migrate finaliser treats this as success on retry.
 		return lxc.ErrContainerNotFound
 	}
 	delete(f.state, name)
 	delete(f.ips, name)
 	delete(f.links, name)
-	return os.RemoveAll(f.dir(name))
+	err := os.RemoveAll(f.dir(name))
+	hook := f.onDelete
+	f.mu.Unlock()
+	if err == nil && hook != nil {
+		hook(name)
+	}
+	return err
 }
 
 func (f *CTFake) ExecContainer(_ context.Context, name string, argv []string) (grpcapi.ContainerExecResult, error) {

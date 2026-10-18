@@ -979,6 +979,32 @@ func (c *Client) mergeChunkTransaction(table syncTable, rows [][]interface{}, in
 			skipped++
 			continue
 		}
+		// A fence credential row is ordered by the retirement it was set after
+		// before its clock (credentials_revive_guard.go).
+		switch order, oerr := c.mergeCredentialOrder(tx, table, row, skewGuardOn, skewNow); {
+		case oerr != nil:
+			_ = tx.Rollback()
+			return merged, skipped, oerr
+		case order == credentialMergeKeepLocal:
+			skipped++
+			continue
+		case order == credentialMergeApply:
+			rejected, execErr := c.applyMergeRow(tx, insertSQL, row, table.Name)
+			if execErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, execErr
+			}
+			if rejected {
+				skipped++
+			} else {
+				merged++
+				if c.anyUnresolved() {
+					pk := pkKeyAt(row, pkIdx)
+					c.deferAfterCommit(tx, func() { c.clearUnresolved(table.Name, pk) })
+				}
+			}
+			continue
+		}
 		// Workload create commits carry child rows whose schemas predate owner
 		// epochs. Fence them against the source workload identity captured from
 		// this payload and the authority that actually landed locally. This runs
@@ -1355,6 +1381,15 @@ func (c *Client) mergeChunkTransaction(table syncTable, rows [][]interface{}, in
 		if c.anyUnresolved() {
 			pk := pkKeyAt(row, pkIdx)
 			c.deferAfterCommit(tx, func() { c.clearUnresolved(table.Name, pk) })
+		}
+	}
+
+	// A fence credential tombstone carries no retirement evidence, whichever
+	// build's dump it came from (credentials_revive_guard.go).
+	if table.Name == "host_fence_credentials" && merged > 0 {
+		if err := clearTombstoneEvidence(tx); err != nil {
+			_ = tx.Rollback()
+			return 0, len(rows), fmt.Errorf("clear tombstone evidence: %w", err)
 		}
 	}
 

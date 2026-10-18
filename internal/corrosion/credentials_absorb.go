@@ -107,11 +107,27 @@ func absorbSecret(ctx context.Context, tx *sql.Tx, col secretColumn, key, value,
 	case cur.Valid && lwwOrder(cur.String, updatedAt) >= 0:
 		return nil // the credential row is as new or newer
 	}
+	// An unlatched writer's password is an operator's write: on a host
+	// credential it takes the retirement of the row it lands on, as a
+	// latched operator write does (credentials_revive_guard.go).
+	evidence := ""
+	if col.credTable == "host_fence_credentials" {
+		local, lerr := readLocalCredential(ctx, tx, key)
+		if lerr != nil {
+			return lerr
+		}
+		evidence = local.order().retirement
+	}
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO `+col.credTable+` (`+col.credPK+`, `+col.column+`, updated_at, deleted_at)
 		 VALUES (?, ?, ?, NULL)
 		 ON CONFLICT(`+col.credPK+`) DO UPDATE SET `+col.column+` = excluded.`+col.column+`,
 		   updated_at = excluded.updated_at, deleted_at = NULL`, key, value, updatedAt)
+	if err != nil || col.credTable != "host_fence_credentials" {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE host_fence_credentials SET after_retirement = ? WHERE host_name = ?`,
+		evidence, key)
 	return err
 }
 

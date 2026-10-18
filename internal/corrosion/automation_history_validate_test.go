@@ -57,7 +57,37 @@ func applySharedAutomation(t *testing.T, c *Client, r AutomationRecord, reduce A
 	var receipt contract.Receipt
 	err = c.ExecuteLocal(context.Background(), func(tx *LocalTx) error {
 		var err error
-		receipt, err = automationApplyTx(context.Background(), tx, r, d, r.Value.MustDigest(), reduce, automationApplicationProvenance{kind: kind, sequence: d.Sequence, generation: 1, membersHash: cfg.MembersHash})
+		sequence, digest := d.Sequence, r.Value.MustDigest()
+		source := automationApplicationProvenance{kind: kind, sequence: sequence, generation: 1, membersHash: cfg.MembersHash}
+		if kind == automationAnchoredReplay {
+			r = AutomationRecord{}
+			d = contract.Decision{}
+			receipt, err = automationApplyStoredTx(context.Background(), tx, sequence, digest, reduce, source, false)
+			return err
+		}
+		if d.Command.Kind == "rewrap_payload" || d.Command.Kind == "activate_key_epoch" {
+			value, e := json.Marshal(r.Value)
+			if e != nil {
+				return e
+			}
+			cert, e := r.Certificate.Encode()
+			if e != nil {
+				return e
+			}
+			if _, e = tx.Exec(context.Background(), `INSERT INTO local_automation_staging(sequence,digest,value_json,certificate) VALUES(?,?,?,?)`, sequence, digest, string(value), cert); e != nil {
+				return e
+			}
+			value = nil
+			cert = ""
+			r = AutomationRecord{}
+			d = contract.Decision{}
+			receipt, err = automationApplyStoredTx(context.Background(), tx, sequence, digest, reduce, source, true)
+			if err == nil {
+				_, err = tx.Exec(context.Background(), `DELETE FROM local_automation_staging WHERE sequence=?`, sequence)
+			}
+		} else {
+			receipt, err = automationApplyTx(context.Background(), tx, r, d, digest, reduce, source, nil)
+		}
 		return err
 	})
 	return receipt, err

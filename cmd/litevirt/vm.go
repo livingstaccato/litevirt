@@ -318,6 +318,9 @@ func newRmCmd() *cobra.Command {
 					Force:     daemonForces,
 				}, grpc.Header(&hdr))
 				if err != nil {
+					if ierr := interruptedDelete("delete VM "+args[0], err, "lv ls"); ierr != nil {
+						return ierr
+					}
 					return fmt.Errorf("delete VM: %w", err)
 				}
 				fmt.Printf("VM %s deleted\n", args[0])
@@ -384,8 +387,9 @@ func newConsoleCmd() *cobra.Command {
 func newVNCCmd() *cobra.Command {
 	var listen string
 	cmd := &cobra.Command{
-		Use:   "vnc <vm>",
-		Short: "Fetch VNC address for a VM, or open its console on a local port",
+		Use:         "vnc <vm>",
+		Annotations: map[string]string{ownSignalsAnnotation: "true"},
+		Short:       "Fetch VNC address for a VM, or open its console on a local port",
 		Long: `Without --listen, prints the VM's VNC address. The listener is bound to the
 host's 127.0.0.1 and, once console passwords are in force (docs/ui.md
 "Console passwords"), requires a password only litevirt presents.

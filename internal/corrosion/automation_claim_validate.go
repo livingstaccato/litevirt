@@ -2,6 +2,8 @@ package corrosion
 
 import (
 	"crypto/ecdsa"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"github.com/litevirt/litevirt/internal/automation/contract"
 )
@@ -12,8 +14,16 @@ func ValidateAutomationState(st ClaimVoterState) error {
 	// Structured values must be checked before any outbound representation can
 	// erase an empty-but-present legacy Proof. Historical pure Proof domains
 	// remain unchanged; Digest already defines these structured union rules.
+	var sequence uint64
+	var d string
 	if v := st.Value; v != nil && (v.Automation != nil || v.LeaseTerm != nil) {
-		if _, err := v.Digest(); err != nil {
+		var err error
+		if v.Automation != nil {
+			sequence, d, err = automationStateValueSummary(*v)
+		} else {
+			_, err = v.Digest()
+		}
+		if err != nil {
 			return fmt.Errorf("corrupt structured claim state: %w", err)
 		}
 	}
@@ -36,11 +46,10 @@ func ValidateAutomationState(st ClaimVoterState) error {
 		}
 		return nil
 	}
-	if st.Value == nil || validateAutomationValue(st.Key, *st.Value) != nil {
+	if st.Value == nil || sequence != uint64(st.Key.OwnerEpoch) {
 		return bad()
 	}
-	d, err := st.Value.Digest()
-	if err != nil || d != st.ValueDigest {
+	if d != st.ValueDigest {
 		return bad()
 	}
 	if a := st.Accept; a != nil {
@@ -53,6 +62,20 @@ func ValidateAutomationState(st ClaimVoterState) error {
 
 	}
 	return nil
+}
+
+// automationStateValueSummary validates the actual value on every invocation.
+// Only finite identity escapes the decoded body; callers never supply a prior
+// validation result, and a later save must independently validate its own state.
+func automationStateValueSummary(v ClaimValue) (uint64, string, error) {
+	decision, err := automationDecision(v)
+	if err != nil {
+		return 0, "", err
+	}
+	h := sha256.New()
+	claimField(h, "litevirt-automation-decision-v1")
+	claimField(h, string(v.Automation.Envelope))
+	return decision.Sequence, hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // validateRetainedClaimState validates retained full-key promise/acceptance

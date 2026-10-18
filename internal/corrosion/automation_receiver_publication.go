@@ -111,7 +111,7 @@ func (r *AutomationReceiver) authenticatePublication(ctx context.Context, a *Aut
 	}
 	next := *a.facts.Next
 	next.Certificate = membership.Certificate
-	if _, _, err = verifySourceTransition(a.view, a.facts.Old, &next); err != nil {
+	if result.notBefore, result.notAfter, err = verifySourceTransition(a.view, a.facts.Old, &next); err != nil {
 		return result, err
 	}
 	result.id = p.id

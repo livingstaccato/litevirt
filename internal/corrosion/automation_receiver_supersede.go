@@ -49,7 +49,14 @@ func receiverReadPredecessor(ctx context.Context, tx *LocalTx) (*receiverPredece
 	if err != nil || len(rows) != 1 {
 		return nil, errors.New("receiver predecessor binding unavailable")
 	}
-	p.binding = rows[0].Bytes("binding")
+	return decodeReceiverBinding(p.id, rows[0].String("job"), rows[0].Int64("revision"), rows[0].Bytes("binding"))
+}
+
+func decodeReceiverBinding(id, job string, revision int64, binding []byte) (*receiverPredecessor, error) {
+	p := &receiverPredecessor{id: id, binding: binding}
+	if !receiverDigest(id) || len(binding) > maxReceiverBindingBytes {
+		return nil, errors.New("receiver binding exceeds native bound")
+	}
 	if len(p.binding) == 0 || sourceDigest([]byte("litevirt/receiver-attempt/v1"), p.binding) != p.id || json.Unmarshal(p.binding, &p.value) != nil {
 		return nil, errors.New("receiver predecessor identity differs")
 	}
@@ -61,7 +68,7 @@ func receiverReadPredecessor(ctx context.Context, tx *LocalTx) (*receiverPredece
 	intent, err := sourceRequest(v.Intent)
 	normalized, _ := json.Marshal(intent)
 	original, _ := json.Marshal(v.Intent)
-	if err != nil || !bytes.Equal(normalized, original) || v.Version != 1 || v.Stream != "automation" || v.Intent.Job != rows[0].String("job") || v.Intent.Revision != rows[0].Int64("revision") || !receiverDigest(v.Root) || !receiverDigest(v.Facts.Chain) || !receiverDigest(v.Facts.Certificates) {
+	if err != nil || !bytes.Equal(normalized, original) || v.Version != 1 || v.Stream != "automation" || v.Intent.Job != job || v.Intent.Revision != revision || !receiverDigest(v.Root) || !receiverDigest(v.Facts.Chain) || !receiverDigest(v.Facts.Certificates) {
 		return nil, errors.New("invalid receiver predecessor binding")
 	}
 	f := v.Facts

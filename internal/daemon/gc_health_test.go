@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/metrics"
 )
 
 func TestRunSupersededGC_TombstonesOldResolvedHealthConditions(t *testing.T) {
@@ -55,7 +54,11 @@ func TestRunSupersededGC_TombstonesOldResolvedHealthConditions(t *testing.T) {
 
 	go func() {
 		defer close(gcDone)
-		d.runSupersededGC(gcCtx, metrics.NewGCMetrics())
+		// nil metrics (GCMetrics is nil-safe): metrics.NewGCMetrics registers
+		// on the process-wide default registry, which the daemon does once per
+		// process, so a second iteration under -count>1 panicked on a duplicate
+		// registration. This test asserts on rows, not on the counter.
+		d.runSupersededGC(gcCtx, nil)
 	}()
 	time.Sleep(121 * time.Second) // Wait for initial 2-minute sleep to complete, then GC to run
 

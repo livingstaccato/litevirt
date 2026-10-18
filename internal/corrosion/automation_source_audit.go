@@ -41,8 +41,16 @@ func sourceDigest(parts ...[]byte) string {
 // decodeSourceCutRow is the strict inverse of the unchanged schema69 codec1.
 // It owns at most one record. The exact field count excludes trailing frames.
 func decodeSourceCutRow(section int, ordinal int64, raw []byte) (Row, error) {
+	if section < 0 || section >= len(automationCutSections) {
+		return Row{}, errors.New("invalid source cut frame")
+	}
+	return decodeAutomationFramedRow(automationCutSections[section], ordinal, raw, maxAutomationCutRecordBytes)
+}
+
+// decodeAutomationFramedRow shares the exact codec, with an explicit local or archived descriptor.
+func decodeAutomationFramedRow(descriptor automationCutSection, ordinal int64, raw []byte, maxBytes int) (Row, error) {
 	fail := func() (Row, error) { return Row{}, errors.New("invalid source cut frame") }
-	if section < 0 || section >= len(automationCutSections) || ordinal <= 0 || len(raw) > maxAutomationCutRecordBytes || !bytes.HasPrefix(raw, []byte("LVCUT\x01")) {
+	if ordinal <= 0 || len(raw) > maxBytes || !bytes.HasPrefix(raw, []byte("LVCUT\x01")) {
 		return fail()
 	}
 	rest := raw[6:]
@@ -60,14 +68,14 @@ func decodeSourceCutRow(section int, ordinal int64, raw []byte) (Row, error) {
 		return p, true
 	}
 	domain, ok := take()
-	if !ok || string(domain) != automationCutSections[section].name {
+	if !ok || string(domain) != descriptor.name {
 		return fail()
 	}
 	ord, ok := take()
 	if !ok || len(ord) != 8 || binary.BigEndian.Uint64(ord) != uint64(ordinal) {
 		return fail()
 	}
-	cols := strings.Split(strings.ReplaceAll(strings.ReplaceAll(automationCutSections[section].columns, "\n", ""), "\t", ""), ",")
+	cols := strings.Split(strings.ReplaceAll(strings.ReplaceAll(descriptor.columns, "\n", ""), "\t", ""), ",")
 	for i := range cols {
 		cols[i] = strings.TrimSpace(cols[i])
 	}

@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/cli"
 )
 
 // lv cluster voter — the explicit voter set (colonelpanik/litevirt#251 step 2,
@@ -82,7 +83,7 @@ owners of one workload.
 					fmt.Println("Dry run: nothing was changed.")
 					return nil
 				}
-				if ok, err := confirmVoterChange(yes, "Force this reconfiguration? The lost hosts must be powered off."); !ok || err != nil {
+				if ok, err := confirmVoterChange(cmd.Context(), yes, "Force this reconfiguration? The lost hosts must be powered off."); !ok || err != nil {
 					return err
 				}
 				resp, err := c.ForceReconfigureVoters(ctx, &pb.ForceReconfigureVotersRequest{Lost: lost})
@@ -167,17 +168,18 @@ func printVoterConfig(resp *pb.GetVoterConfigResponse) {
 	w.Flush()
 }
 
-func confirmVoterChange(yes bool, prompt string) (bool, error) {
+func confirmVoterChange(ctx context.Context, yes bool, prompt string) (bool, error) {
 	if yes {
 		return true, nil
 	}
 	if !stdinIsTerminal() {
 		return false, errNoTTYConfirm
 	}
-	fmt.Print(prompt + " [y/N] ")
-	var ans string
-	fmt.Scanln(&ans)
-	if ans != "y" && ans != "Y" {
+	ok, err := cli.Confirm(ctx, os.Stdin, os.Stdout, prompt)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
 		fmt.Println("Aborted.")
 		return false, nil
 	}
@@ -224,7 +226,7 @@ unanimously, because no earlier generation has a majority that could decide it.
 				}
 				fmt.Println("Proposed voter generation:")
 				printVoterChange(preview)
-				if ok, err := confirmVoterChange(yes, "Propose it?"); !ok || err != nil {
+				if ok, err := confirmVoterChange(cmd.Context(), yes, "Propose it?"); !ok || err != nil {
 					return err
 				}
 				resp, err := c.ChangeVoterConfig(ctx, &pb.ChangeVoterConfigRequest{Op: "init", Members: members})
@@ -280,7 +282,7 @@ genesis never runs again, and only 'lv cluster voter init' starts a new member g
 It is the exit from explicit voting when the voter configuration itself is suspect, not a
 rollback tool.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if ok, err := confirmVoterChange(yes, "Return every node to the derived voter set?"); !ok || err != nil {
+			if ok, err := confirmVoterChange(cmd.Context(), yes, "Return every node to the derived voter set?"); !ok || err != nil {
 				return err
 			}
 			return voterChange(cmd.Context(), "reset", "")

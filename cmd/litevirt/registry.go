@@ -30,7 +30,7 @@ func newRegistryCmd() *cobra.Command {
 // readRegistryPassword resolves the password per the documented precedence:
 // --password-stdin (read one line, piped) > --password (argv-visible) >
 // interactive no-echo prompt.
-func readRegistryPassword(password string, fromStdin bool) (string, error) {
+func readRegistryPassword(ctx context.Context, password string, fromStdin bool) (string, error) {
 	if fromStdin {
 		r := bufio.NewReader(os.Stdin)
 		line, err := r.ReadString('\n')
@@ -42,7 +42,7 @@ func readRegistryPassword(password string, fromStdin bool) (string, error) {
 	if password != "" {
 		return password, nil
 	}
-	return cli.ReadPassword("Registry password: ")
+	return cli.ReadPassword(ctx, "Registry password: ")
 }
 
 func newRegistryAddCmd() *cobra.Command {
@@ -60,7 +60,7 @@ func newRegistryAddCmd() *cobra.Command {
 			if username == "" {
 				return fmt.Errorf("--username is required")
 			}
-			pw, err := readRegistryPassword(password, passwordStdin)
+			pw, err := readRegistryPassword(cmd.Context(), password, passwordStdin)
 			if err != nil {
 				return err
 			}

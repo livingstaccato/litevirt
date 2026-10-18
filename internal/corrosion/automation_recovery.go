@@ -29,6 +29,13 @@ func (c *Client) AutomationBeginRecovery(ctx context.Context, r AutomationRecord
 	if err = v.Verify(r.Certificate, CertExpectation{Key: key, ValueDigest: digest, ConfigGeneration: cfg.Generation, Electorate: cfg.Members, Quorum: MajorityOf(len(cfg.Members))}); err != nil {
 		return err
 	}
+	request, err := automationPrepareKeyLookup(ctx, d, r.Certificate)
+	if err != nil {
+		return err
+	}
+	if request != nil && request.configDigest != cfg.MembersHash {
+		return fmt.Errorf("key transition differs from original certified config")
+	}
 	return c.ExecuteLocal(ctx, func(tx *LocalTx) error {
 		if err := requireAutomationFull(ctx, tx); err != nil {
 			return err
@@ -128,7 +135,7 @@ func (c *Client) AutomationStagePredecessor(ctx context.Context, r AutomationRec
 }
 func (c *Client) AutomationFinishRecovery(ctx context.Context, reduce AutomationReducer, budget int) error {
 	for range budget {
-		var r AutomationRecord
+		var sequence uint64
 		var digest string
 		var anchorSeq, gen int64
 		var members, anchorCert string
@@ -166,7 +173,7 @@ func (c *Client) AutomationFinishRecovery(ctx context.Context, reduce Automation
 				done = true
 				return err
 			}
-			rows, err := tx.Query(ctx, `SELECT digest,value_json,certificate FROM local_automation_staging WHERE sequence=? LIMIT 1`, head.Sequence+1)
+			rows, err := tx.Query(ctx, `SELECT sequence,digest FROM local_automation_staging WHERE sequence=? LIMIT 1`, head.Sequence+1)
 			if err != nil {
 				return err
 			}
@@ -175,10 +182,7 @@ func (c *Client) AutomationFinishRecovery(ctx context.Context, reduce Automation
 			}
 			row := rows[0]
 			digest = row.String("digest")
-			if err = json.Unmarshal([]byte(row.String("value_json")), &r.Value); err != nil {
-				return err
-			}
-			r.Certificate, err = DecodeClaimCertificate(row.String("certificate"))
+			sequence = uint64(row.Int64("sequence"))
 			anchorSeq = job.Int64("sequence")
 			gen = job.Int64("generation")
 			members = job.String("members_hash")
@@ -191,24 +195,13 @@ func (c *Client) AutomationFinishRecovery(ctx context.Context, reduce Automation
 		if done {
 			return nil
 		}
-		if err := validateAutomationRecordSize(r); err != nil {
-			return err
-		}
-		d, err := automationDecision(r.Value)
-		if err != nil {
-			return err
-		}
-		actual, err := r.Value.Digest()
-		if err != nil || actual != digest {
-			return fmt.Errorf("automation staging digest mismatch")
-		}
 		// The verified head checkpoint supplies the ancestry provenance. Use the
 		// same FULL transaction-local application path as fresh admission/replay.
 		err = c.ExecuteLocal(ctx, func(tx *LocalTx) error {
-			_, err := automationApplyTx(ctx, tx, r, d, digest, reduce, automationApplicationProvenance{
+			_, err := automationApplyStoredTx(ctx, tx, sequence, digest, reduce, automationApplicationProvenance{
 				kind: automationStagedAnchor, sequence: uint64(anchorSeq), generation: gen,
 				membersHash: members, certificate: anchorCert,
-			})
+			}, true)
 			return err
 		})
 		if err != nil {

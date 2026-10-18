@@ -11,14 +11,15 @@ import (
 // implemented control handlers. New semantic handlers add their own typed
 // schema here and extend the one reducer; they never inherit generic success.
 type Assignment struct {
-	Ownership   *OwnershipAssignment `json:"ownership,omitempty"`
-	Binding     *BindingAssignment   `json:"binding,omitempty"`
-	Version     int                  `json:"version"`
-	ClusterUID  string               `json:"cluster_uid"`
-	OperationID string               `json:"operation_id"`
-	RecordedAt  string               `json:"recorded_at"`
-	Owner       *OwnerAssignment     `json:"owner,omitempty"`
-	Identity    *IdentityAssignment  `json:"identity,omitempty"`
+	KeyTransition *KeyTransitionAssignment `json:"key_transition,omitempty"`
+	Ownership     *OwnershipAssignment     `json:"ownership,omitempty"`
+	Binding       *BindingAssignment       `json:"binding,omitempty"`
+	Version       int                      `json:"version"`
+	ClusterUID    string                   `json:"cluster_uid"`
+	OperationID   string                   `json:"operation_id"`
+	RecordedAt    string                   `json:"recorded_at"`
+	Owner         *OwnerAssignment         `json:"owner,omitempty"`
+	Identity      *IdentityAssignment      `json:"identity,omitempty"`
 }
 type controlBody struct {
 	Version int `json:"version"`
@@ -100,6 +101,9 @@ func ValidateSupportedCommand(c Command) error {
 func DecodeAssignment(d Decision) (Assignment, error) {
 	var a Assignment
 	fields := []string{"version", "cluster_uid", "operation_id", "recorded_at"}
+	if keyTransitionKind(d.Command.Kind) {
+		fields = append(fields, "key_transition")
+	}
 	if d.Command.Kind == "adopt_resource" || d.Command.Kind == "transfer_owner" {
 		fields = append(fields, "ownership")
 	}
@@ -124,12 +128,17 @@ func DecodeAssignment(d Decision) (Assignment, error) {
 	return a, nil
 }
 func ValidateSupportedDecision(d Decision) error {
-	if err := ValidateSupportedCommand(d.Command); err != nil {
-		return err
+	if !keyTransitionKind(d.Command.Kind) {
+		if err := ValidateSupportedCommand(d.Command); err != nil {
+			return err
+		}
 	}
 	a, err := DecodeAssignment(d)
 	if err != nil {
 		return err
+	}
+	if keyTransitionKind(d.Command.Kind) {
+		return validateKeyTransition(d, a)
 	}
 	if d.Command.Kind == "adopt_resource" || d.Command.Kind == "transfer_owner" {
 		return validateOwnershipAssignment(d, a)

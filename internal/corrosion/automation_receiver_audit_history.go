@@ -41,20 +41,42 @@ func receiverHistoryValue(row Row) (ClaimValue, contract.Receipt, error) {
 	return value, receipt, nil
 }
 
-func (s receiverAuditStore) anchor(ctx context.Context, row Row, value ClaimValue) error {
-	seq, target := row.Int64("sequence"), row.Int64("anchor_sequence")
+// Validate the independent original certificate in a scope that returns no
+// full record. The checkpoint target may be a different, future history value.
+func (s receiverAuditStore) originalAnchor(ctx context.Context, ordinal int64) (seq, target int64, digest string, err error) {
+	row, err := s.record(ctx, 5, ordinal)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	seq, target, digest = row.Int64("sequence"), row.Int64("anchor_sequence"), row.String("digest")
 	if target < seq || uint64(target) > s.publication.manifest.Cut.Head.Sequence {
-		return errors.New("source anchor target outside complete history")
+		return 0, 0, "", errors.New("source anchor target outside complete history")
+	}
+	value, _, err := receiverHistoryValue(row)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	original, err := sourceCertificate(row.String("certificate"))
+	if err != nil {
+		return 0, 0, "", err
+	}
+	cfg, err := s.membership(ctx, original.ConfigGeneration)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	if err = validateAutomationRecordSize(AutomationRecord{Value: value, Certificate: original}); err != nil {
+		return 0, 0, "", err
+	}
+	err = validateAutomationAnchor(automationAnchorInput{Sequence: seq, AnchorSequence: seq, Digest: digest, AnchorDigest: digest, Generation: original.ConfigGeneration, MembersHash: cfg.MembersHash, Certificate: original, Target: value, TargetDigest: digest, Membership: cfg})
+	return seq, target, digest, err
+}
+
+func (s receiverAuditStore) anchor(ctx context.Context, ordinal int64) error {
+	seq, target, digest, err := s.originalAnchor(ctx, ordinal)
+	if err != nil {
+		return err
 	}
 	anchor, err := s.sequence(ctx, 6, seq)
-	if err != nil {
-		return err
-	}
-	targetRow, err := s.sequence(ctx, 5, target)
-	if err != nil {
-		return err
-	}
-	targetValue, _, err := receiverHistoryValue(targetRow)
 	if err != nil {
 		return err
 	}
@@ -66,28 +88,19 @@ func (s receiverAuditStore) anchor(ctx context.Context, row Row, value ClaimValu
 	if err != nil {
 		return err
 	}
-	if err = validateAutomationAnchor(automationAnchorInput{Sequence: seq, AnchorSequence: target, Digest: row.String("digest"), AnchorDigest: anchor.String("digest"), Generation: anchor.Int64("generation"), MembersHash: anchor.String("members_hash"), Certificate: cert, Target: targetValue, TargetDigest: targetRow.String("digest"), Membership: cfg}); err != nil {
-		return err
-	}
-	// The original record certificate is independent of the later recovery
-	// checkpoint certificate. Preserve and verify both; byte equality would
-	// incorrectly reject different valid certificates for the same full value.
-	original, err := sourceCertificate(row.String("certificate"))
+	targetRow, err := s.sequence(ctx, 5, target)
 	if err != nil {
 		return err
 	}
-	cfg, err = s.membership(ctx, original.ConfigGeneration)
+	targetValue, _, err := receiverHistoryValue(targetRow)
 	if err != nil {
 		return err
 	}
-	if err = validateAutomationRecordSize(AutomationRecord{Value: value, Certificate: original}); err != nil {
-		return err
-	}
-	return validateAutomationAnchor(automationAnchorInput{Sequence: seq, AnchorSequence: seq, Digest: row.String("digest"), AnchorDigest: row.String("digest"), Generation: original.ConfigGeneration, MembersHash: cfg.MembersHash, Certificate: original, Target: value, TargetDigest: row.String("digest"), Membership: cfg})
+	return validateAutomationAnchor(automationAnchorInput{Sequence: seq, AnchorSequence: target, Digest: digest, AnchorDigest: anchor.String("digest"), Generation: anchor.Int64("generation"), MembersHash: anchor.String("members_hash"), Certificate: cert, Target: targetValue, TargetDigest: targetRow.String("digest"), Membership: cfg})
 }
 
 func (s receiverAuditStore) request(ctx context.Context, scope, request string) (*AutomationRequest, error) {
-	rows, err := s.tx.Query(ctx, `SELECT length(CAST(identity AS BLOB)) AS identity,length(CAST(receipt AS BLOB)) AS receipt FROM local_automation_receiver_requests WHERE audit=? AND scope=? AND request_id=? LIMIT 1`, s.id, scope, request)
+	rows, err := s.query(ctx, `SELECT length(CAST(identity AS BLOB)) AS identity,length(CAST(receipt AS BLOB)) AS receipt FROM local_automation_receiver_requests WHERE audit=? AND scope=? AND request_id=? LIMIT 1`, s.id, scope, request)
 	if err != nil || len(rows) == 0 {
 		return nil, err
 	}
@@ -95,7 +108,7 @@ func (s receiverAuditStore) request(ctx context.Context, scope, request string) 
 	if i <= 0 || i > MaxAutomationClaimBytes || n <= 0 || n > maxAutomationCutMetadataBytes {
 		return nil, errors.New("derived request exceeds bound")
 	}
-	rows, err = s.tx.Query(ctx, `SELECT identity,receipt FROM local_automation_receiver_requests WHERE audit=? AND scope=? AND request_id=? AND length(CAST(identity AS BLOB))=? AND length(CAST(receipt AS BLOB))=? LIMIT 1`, s.id, scope, request, i, n)
+	rows, err = s.query(ctx, `SELECT identity,receipt FROM local_automation_receiver_requests WHERE audit=? AND scope=? AND request_id=? AND length(CAST(identity AS BLOB))=? AND length(CAST(receipt AS BLOB))=? LIMIT 1`, s.id, scope, request, i, n)
 	if err != nil {
 		return nil, err
 	}
@@ -110,7 +123,7 @@ func (s receiverAuditStore) request(ctx context.Context, scope, request string) 
 }
 
 func (s receiverAuditStore) operation(ctx context.Context, operation string) (*contract.Receipt, error) {
-	rows, err := s.tx.Query(ctx, `SELECT length(CAST(receipt AS BLOB)) AS size FROM local_automation_receiver_requests WHERE audit=? AND operation_id=? AND operation_id<>'' LIMIT 1`, s.id, operation)
+	rows, err := s.query(ctx, `SELECT length(CAST(receipt AS BLOB)) AS size FROM local_automation_receiver_requests WHERE audit=? AND operation_id=? AND operation_id<>'' LIMIT 1`, s.id, operation)
 	if err != nil || len(rows) == 0 {
 		return nil, err
 	}
@@ -118,7 +131,7 @@ func (s receiverAuditStore) operation(ctx context.Context, operation string) (*c
 	if n <= 0 || n > maxAutomationCutMetadataBytes {
 		return nil, errors.New("derived operation exceeds bound")
 	}
-	rows, err = s.tx.Query(ctx, `SELECT receipt FROM local_automation_receiver_requests WHERE audit=? AND operation_id=? AND operation_id<>'' AND length(CAST(receipt AS BLOB))=? LIMIT 1`, s.id, operation, n)
+	rows, err = s.query(ctx, `SELECT receipt FROM local_automation_receiver_requests WHERE audit=? AND operation_id=? AND operation_id<>'' AND length(CAST(receipt AS BLOB))=? LIMIT 1`, s.id, operation, n)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +146,7 @@ func (s receiverAuditStore) operation(ctx context.Context, operation string) (*c
 }
 
 func (s receiverAuditStore) suppliedRequest(ctx context.Context, scope, request string) (Row, error) {
-	rows, err := s.tx.Query(ctx, `SELECT ordinal FROM local_automation_receiver_refs WHERE audit=? AND component=7 AND scope=? AND request_id=? LIMIT 1`, s.id, scope, request)
+	rows, err := s.query(ctx, `SELECT ordinal FROM local_automation_receiver_refs WHERE audit=? AND component=7 AND scope=? AND request_id=? LIMIT 1`, s.id, scope, request)
 	if err != nil {
 		return Row{}, err
 	}
@@ -157,19 +170,43 @@ func receiverCompareRequest(row Row, expected AutomationRequest, d contract.Deci
 func (s receiverAuditStore) history(ctx context.Context) (AutomationPrefix, int64, error) {
 	var head AutomationPrefix
 	stage := "receiver-audit:" + s.id
+	if s.localCursor != nil {
+		if err := aggregateLocalFreshScratch(ctx, s.tx, s.id); err != nil {
+			return head, 0, err
+		}
+	}
 	if err := automationResetSemanticProjectionTx(ctx, s.tx, stage); err != nil {
 		return head, 0, err
 	}
+	if s.localCursor != nil && s.localCursor.Sequence == 0 {
+		if err := aggregateLocalCompareSemantic(ctx, s.tx, stage); err != nil {
+			return head, 0, err
+		}
+	}
+	// Anchor validation and replay share this immutable transaction but separate
+	// full-value read scopes. No current record survives a target read.
+	if err := s.ordinals(ctx, 5, func(ordinal int64) error { return s.anchor(ctx, ordinal) }); err != nil {
+		return head, 0, err
+	}
 	var requests int64
-	err := s.walk(ctx, 5, func(ordinal int64, row Row) error {
+	err := s.ordinals(ctx, 5, func(ordinal int64) error {
+		request, err := s.keyLookup(ctx, ordinal)
+		if err != nil {
+			return err
+		}
+		prepared := AutomationProjection{Head: head}
+		if err = automationResolveKeyProjectionTx(ctx, s.tx, stage, &prepared, request, receiverAutomationKeySource{s}); err != nil {
+			return err
+		}
+		row, err := s.record(ctx, 5, ordinal)
+		if err != nil {
+			return err
+		}
 		if head.Sequence >= math.MaxInt64 || row.Int64("sequence") != int64(head.Sequence)+1 {
 			return errors.New("complete source history gap")
 		}
 		value, receipt, err := receiverHistoryValue(row)
 		if err != nil {
-			return err
-		}
-		if err = s.anchor(ctx, row, value); err != nil {
 			return err
 		}
 		d, err := automationDecision(value)
@@ -188,8 +225,8 @@ func (s receiverAuditStore) history(ctx context.Context) (AutomationPrefix, int6
 		if err != nil {
 			return err
 		}
-		projection := AutomationProjection{Head: head, Existing: existing, Operation: operation}
-		if err := automationSemanticProjectionTx(ctx, s.tx, stage, &projection, d); err != nil {
+		projection := AutomationProjection{Head: head, Existing: existing, Operation: operation, KeyTransition: prepared.KeyTransition}
+		if err := automationSemanticProjectionSourceTx(ctx, s.tx, stage, &projection, d, receiverAutomationKeySource{s}); err != nil {
 			return err
 		}
 		result, next, err := evaluateAutomationHistory(automationHistoryInput{Projection: projection, Value: value, Digest: row.String("digest"), Expected: &receipt})
@@ -216,6 +253,14 @@ func (s receiverAuditStore) history(ctx context.Context) (AutomationPrefix, int6
 			requests++
 		}
 		head = next
+		if s.localCursor != nil && head.Sequence == s.localCursor.Sequence {
+			if head != *s.localCursor {
+				return errors.New("local semantic cursor differs from certified history")
+			}
+			if err := aggregateLocalCompareSemantic(ctx, s.tx, stage); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {

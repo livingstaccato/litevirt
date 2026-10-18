@@ -272,3 +272,19 @@ func ReconcileCompletedHostTrust(ctx context.Context, dir, host string, e *HostT
 	_, err = o.captureLocked(host)
 	return err
 }
+
+// RecordedLocalHost authenticates the original public leaf of legacy local
+// evidence under its original root, at their overlapping recorded interval.
+// Legacy evidence did not retain intermediates: only a complete direct-root
+// path is accepted. This authenticates inert provenance for storage-owned
+// reestablishment, never current standing, policy, expiry or a lease. Ordinary
+// Historical verification is deliberately unchanged.
+func (e *HostTrustEvidence) RecordedLocalHost(host string) (*x509.Certificate, error) {
+	if e == nil {
+		return nil, errors.New("missing recorded local evidence")
+	}
+	if err := e.VerifyRecordedHost([][]byte{e.leaf}, host); err != nil {
+		return nil, err
+	}
+	return x509.ParseCertificate(bytes.Clone(e.leaf))
+}

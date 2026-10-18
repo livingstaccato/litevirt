@@ -2,10 +2,12 @@ package corrosion
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/litevirt/litevirt/internal/automation/contract"
@@ -107,9 +109,15 @@ func (c *Client) admitAutomationTx(ctx context.Context, tx *LocalTx, key ClaimKe
 	sequence := uint64(key.OwnerEpoch)
 	historical := false
 	if sequence <= head.Sequence {
-		digest, found, err := automationTrustedDigestTx(ctx, tx, sequence)
-		if err != nil {
-			return RefusalAutomationUnavailable, nil
+		// The retained head was validated in this same FULL transaction.
+		// Older targets still require their own exact original and anchor.
+		digest, found := head.Digest, true
+		if sequence != head.Sequence {
+			var err error
+			digest, found, err = automationTrustedDigestTx(ctx, tx, sequence)
+			if err != nil {
+				return RefusalAutomationUnavailable, nil
+			}
 		}
 		if found {
 			historical = v == nil
@@ -197,6 +205,12 @@ func decodeClaimValue(key ClaimKey, s string, v *ClaimValue) error {
 	if len(s) > MaxAutomationClaimBytes {
 		return fmt.Errorf("corrupt automation claim value")
 	}
+	if v != nil && *v == (ClaimValue{}) {
+		if envelope, ok := decodeCanonicalAutomationOuter(s); ok {
+			v.Automation = &AutomationClaimValue{Envelope: envelope}
+			return nil
+		}
+	}
 	if err := json.Unmarshal([]byte(s), v); err != nil {
 		return fmt.Errorf("corrupt automation claim value")
 	}
@@ -205,4 +219,28 @@ func decodeClaimValue(key ClaimKey, s string, v *ClaimValue) error {
 		return fmt.Errorf("noncanonical automation claim value")
 	}
 	return nil
+}
+
+// decodeCanonicalAutomationOuter recognizes only the existing canonical pure
+// automation shell. Strict standard base64 (including zero padding bits) and
+// exact framing prove the outer roundtrip without materializing its encoding.
+// CR/LF need a separate check because even Strict base64 ignores them. No inner
+// validation is implied; callers retain their codec, binding and state checks.
+// Failure publishes nothing, so decodeClaimValue's original fallback preserves
+// partial destination mutations and errors, including legacy/nonzero values.
+func decodeCanonicalAutomationOuter(s string) ([]byte, bool) {
+	const prefix = `{"automation":{"envelope":"`
+	const suffix = `"}}`
+	if len(s) > MaxAutomationClaimBytes || len(s) <= len(prefix)+len(suffix) || !strings.HasPrefix(s, prefix) || !strings.HasSuffix(s, suffix) {
+		return nil, false
+	}
+	encoded := s[len(prefix) : len(s)-len(suffix)]
+	if strings.ContainsAny(encoded, "\r\n") {
+		return nil, false
+	}
+	envelope, err := base64.StdEncoding.Strict().DecodeString(encoded)
+	if err != nil {
+		return nil, false
+	}
+	return envelope, true
 }

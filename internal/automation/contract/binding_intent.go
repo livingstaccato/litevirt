@@ -145,11 +145,26 @@ func exactBindingJSON(b []byte, t reflect.Type) error {
 			}
 		}
 	case reflect.Slice:
+		if t.Elem().Kind() == reflect.Uint8 {
+			var value []byte
+			if json.Unmarshal(b, &value) != nil {
+				return codedError(CodeValidation)
+			}
+			canonical, _ := json.Marshal(value)
+			if !bytes.Equal(bytes.TrimSpace(b), canonical) {
+				return codedError(CodeValidation)
+			}
+			return nil
+		}
 		var values []json.RawMessage
 		if json.Unmarshal(b, &values) != nil {
 			return codedError(CodeValidation)
 		}
-		if len(values) > 128 {
+		limit := 128
+		if t.Elem() == reflect.TypeOf(RetainedPayload{}) || t.Elem() == reflect.TypeOf(PayloadCoverage{}) {
+			limit = MaxRetainedPayloads
+		}
+		if len(values) > limit {
 			return codedError(CodeValidation)
 		}
 		for _, value := range values {

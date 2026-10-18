@@ -540,23 +540,43 @@ import (
 //	     SSH, so nothing writes it, or a 'redfish' fence strategy, without the
 //	     release feature redfish_fence (release_2026_11_v1, ReplicationGated).
 //	     One new table.
-//	v68: node-local automation authority, applied prefix, certified history,
+//	v68: host_fence_credentials.after_retirement (TEXT NOT NULL DEFAULT '')
+//	     — the retirement a live fence credential was set after
+//	     (credentials_revive_guard.go). A tombstone's own retirement is its
+//	     deleted_at. Rows are ordered by (retirement, updated_at), so a live
+//	     row that carries no retirement, written by a previous build or by a
+//	     stale copy, never beats a tombstone. Derived on each node from the
+//	     entry and never written by a replicated statement, so no statement
+//	     shape changes; a previous-release node refuses this table's
+//	     anti-entropy rows from this build (unknown column) and still applies
+//	     its WAL entries. Existing rows migrate with no retirement, so a
+//	     tombstone from before the upgrade still beats a password set after
+//	     it (docs/migration-failover.md). Additive.
+//	v69: node-local automation authority, applied prefix, certified history,
 //	     permanent request receipts, authenticated anchors and bounded on-disk
 //	     recovery staging. None participates in CRDT replication.
-//	v69: inert node-local audited automation content cuts and bounded immutable
+//	v70: inert node-local audited automation content cuts and bounded immutable
 //	     records. No transfer publication, adoption or capability authority.
-//	v70: completed node-local outgoing automation publications, immutable job
+//	v71: completed node-local outgoing automation publications, immutable job
 //	     pins and retained public trust evidence; excluded from source content.
 //
-// v71: inert receiver attempts, pending metadata and bounded transport inventory.
-// v72: inert per-source audit results, spool references and causal request indexes.
+// v72: inert receiver attempts, pending metadata and bounded transport inventory.
+// v73: inert per-source audit results, spool references and causal request indexes.
 // No active import, origin mode, replication or authority is introduced.
-// v73: typed node-local automation identity and owner projections, isolated
+// v74: typed node-local automation identity and owner projections, isolated
 // by reconstruction stage. No replication or admission authority is introduced.
-// v74: node-local originating account/project lifecycle evidence and exact
+// v75: node-local originating account/project lifecycle evidence and exact
 // credential issuance provenance, with atomic invalidate-only parent triggers.
 // These are source observations, never certified identities or class permits.
-const CurrentSchemaVersion = 74
+// v76: immutable inert local snapshots and complete fixed-roster aggregates.
+// These rows confer no current proof, origin authority or active adoption.
+// v77: causal key epoch, recipient and payload wrapping projections.
+// v78: signed receiver-established floors and current-row complete inventory; never live proof.
+const CurrentSchemaVersion = 78
+
+// schemaVersionCredentialRetirement is the version
+// host_fence_credentials.after_retirement was added in.
+const schemaVersionCredentialRetirement = 68
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -2805,7 +2825,8 @@ var schemaDDL = []string{
 		host_name  TEXT PRIMARY KEY,
 		ipmi_pass  TEXT NOT NULL DEFAULT '',
 		updated_at TEXT NOT NULL,
-		deleted_at TEXT
+		deleted_at TEXT,
+		after_retirement TEXT NOT NULL DEFAULT ''
 	)`,
 	`CREATE TABLE IF NOT EXISTS user_credentials (
 		username      TEXT PRIMARY KEY,
@@ -2866,6 +2887,40 @@ var schemaDDL = []string{
 	// ExecuteLocal, one transaction per voter step, committed before the reply
 	// is built. Rows are never deleted or downgraded.
 	// Inert receiver evidence only: no adoption, voting, import or runtime authority.
+	// Schema76 inert audit storage; original source spool remains the evidence owner.
+	`CREATE TABLE IF NOT EXISTS local_automation_local_audits (
+ id TEXT PRIMARY KEY, attempt TEXT NOT NULL, dependency TEXT NOT NULL,
+ head BLOB NOT NULL, coverage TEXT NOT NULL, records INTEGER NOT NULL, origin BLOB NOT NULL
+ )`,
+	`CREATE TABLE IF NOT EXISTS local_automation_local_rows (
+ local_id TEXT NOT NULL, section INTEGER NOT NULL, ordinal INTEGER NOT NULL,
+ record BLOB NOT NULL, PRIMARY KEY(local_id,section,ordinal)
+ )`,
+	`CREATE TABLE IF NOT EXISTS local_automation_aggregates (
+ id TEXT PRIMARY KEY, attempt TEXT NOT NULL, local_id TEXT NOT NULL,
+ head BLOB NOT NULL, coverage TEXT NOT NULL, roster BLOB NOT NULL
+ )`,
+	`CREATE TABLE IF NOT EXISTS local_automation_aggregate_sources (
+ bundle TEXT NOT NULL, source TEXT NOT NULL, incarnation TEXT NOT NULL,
+ audit TEXT NOT NULL, publication TEXT NOT NULL, root TEXT NOT NULL, cut_id TEXT NOT NULL,
+ PRIMARY KEY(bundle,source), UNIQUE(bundle,incarnation)
+ )`,
+	`CREATE TABLE IF NOT EXISTS local_automation_aggregate_copies (
+ bundle TEXT NOT NULL, origin_kind TEXT NOT NULL, origin_id TEXT NOT NULL,
+ component INTEGER NOT NULL, ordinal INTEGER NOT NULL, claim_key BLOB NOT NULL,
+ promised_round INTEGER NOT NULL, promised_coord TEXT NOT NULL, promised_nonce BLOB NOT NULL,
+ accepted_round INTEGER NOT NULL, accepted_coord TEXT NOT NULL, accepted_nonce BLOB NOT NULL,
+ origin_ref BLOB NOT NULL, PRIMARY KEY(bundle,origin_kind,origin_id,component,ordinal)
+ )`,
+	`CREATE TABLE IF NOT EXISTS local_automation_aggregate_maxima (
+ bundle TEXT NOT NULL, claim_key BLOB NOT NULL,
+ promise_ref BLOB NOT NULL, accepted_ref BLOB NOT NULL, PRIMARY KEY(bundle,claim_key)
+ )`,
+	`CREATE TABLE IF NOT EXISTS local_automation_aggregate_conflicts (
+ bundle TEXT NOT NULL, claim_key BLOB NOT NULL,
+ round INTEGER NOT NULL, coord TEXT NOT NULL, nonce BLOB NOT NULL, first_ref BLOB NOT NULL,
+ PRIMARY KEY(bundle,claim_key,round,coord,nonce)
+ )`,
 	`CREATE TABLE IF NOT EXISTS local_automation_receiver_audits (
  id TEXT PRIMARY KEY, attempt TEXT NOT NULL, source TEXT NOT NULL,
  publication TEXT NOT NULL, root TEXT NOT NULL, head BLOB NOT NULL,
@@ -2896,7 +2951,12 @@ var schemaDDL = []string{
  binding BLOB NOT NULL, evidence BLOB NOT NULL, UNIQUE(job,revision)
  )`,
 	`CREATE TABLE IF NOT EXISTS local_automation_receiver_current (
- id INTEGER PRIMARY KEY CHECK(id=1), attempt TEXT NOT NULL
+ id INTEGER PRIMARY KEY CHECK(id=1), attempt TEXT NOT NULL,
+ established_inventory BLOB NOT NULL DEFAULT x''
+ )`,
+	`CREATE TABLE IF NOT EXISTS local_automation_receiver_established (
+ attempt TEXT NOT NULL, digest TEXT NOT NULL, artifact BLOB NOT NULL,
+ PRIMARY KEY(attempt,digest)
  )`,
 	`CREATE TABLE IF NOT EXISTS local_automation_receiver_validations (
  attempt TEXT NOT NULL, digest TEXT NOT NULL, evidence BLOB NOT NULL,
@@ -3065,6 +3125,32 @@ var schemaDDL = []string{
   admitted_generation INTEGER NOT NULL CHECK(admitted_generation>0),
   sequence INTEGER NOT NULL CHECK(sequence>0), configuration_json TEXT NOT NULL,
   PRIMARY KEY(stage,operation_id))`,
+
+	`CREATE TABLE IF NOT EXISTS local_automation_key_epochs (
+ stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, recipient_epoch TEXT NOT NULL,
+ membership_generation INTEGER NOT NULL CHECK(membership_generation>0), config_digest TEXT NOT NULL,
+ equality_epoch TEXT NOT NULL, predecessor_activation_sequence INTEGER NOT NULL CHECK(predecessor_activation_sequence>=0),
+ activation_sequence INTEGER NOT NULL CHECK(activation_sequence>predecessor_activation_sequence),
+ PRIMARY KEY(stage,cluster_uid,recipient_epoch))`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS automation_key_activation ON local_automation_key_epochs(stage,cluster_uid,activation_sequence)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS automation_key_equality ON local_automation_key_epochs(stage,cluster_uid,equality_epoch)`,
+	`CREATE TABLE IF NOT EXISTS local_automation_key_recipients (
+ stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, recipient_epoch TEXT NOT NULL,
+ membership_generation INTEGER NOT NULL CHECK(membership_generation>0), config_digest TEXT NOT NULL,
+ host TEXT NOT NULL, host_incarnation INTEGER NOT NULL CHECK(host_incarnation>0), admitted_at TEXT NOT NULL,
+ admission_serial TEXT NOT NULL, voter_incarnation TEXT NOT NULL, key_id TEXT NOT NULL, recipient TEXT NOT NULL,
+ enrollment_ref TEXT NOT NULL, recipient_ack_ref TEXT NOT NULL, equality_ack_ref TEXT NOT NULL,
+ first_sequence INTEGER NOT NULL CHECK(first_sequence>0), PRIMARY KEY(stage,cluster_uid,recipient_epoch,host))`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS automation_key_id ON local_automation_key_recipients(stage,cluster_uid,key_id)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS automation_key_recipient ON local_automation_key_recipients(stage,cluster_uid,recipient)`,
+	`CREATE TABLE IF NOT EXISTS local_automation_payload_wrappings (
+ stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, operation_id TEXT NOT NULL, payload_id TEXT NOT NULL,
+ admission_sequence INTEGER NOT NULL CHECK(admission_sequence>0), wrapping_sequence INTEGER NOT NULL CHECK(wrapping_sequence>admission_sequence),
+ wrapping_digest TEXT NOT NULL, recipient_epoch TEXT NOT NULL,
+ membership_generation INTEGER NOT NULL CHECK(membership_generation>0), config_digest TEXT NOT NULL,
+ PRIMARY KEY(stage,cluster_uid,operation_id,wrapping_sequence))`,
+	`CREATE INDEX IF NOT EXISTS automation_wrapping_coverage ON local_automation_payload_wrappings(stage,cluster_uid,recipient_epoch,operation_id,wrapping_sequence)`,
+	`CREATE INDEX IF NOT EXISTS automation_admission_inventory ON local_automation_admissions(stage,cluster_uid,sequence,operation_id)`,
 	`CREATE TABLE IF NOT EXISTS local_automation_recovery (
 		id INTEGER PRIMARY KEY CHECK(id=1),sequence INTEGER NOT NULL,digest TEXT NOT NULL,
 		next_sequence INTEGER NOT NULL,next_digest TEXT NOT NULL,
@@ -3722,6 +3808,10 @@ var schemaMigrations = []string{
 	// field: '' reads as "no certificate", which a destination enforcing
 	// recovery_claim_v1 refuses.
 	`ALTER TABLE runtime_action_proofs ADD COLUMN claim_certificate TEXT NOT NULL DEFAULT ''`,
+	// The retirement a live fence credential was set after (see History,
+	// schemaVersionCredentialRetirement).
+	`ALTER TABLE host_fence_credentials ADD COLUMN after_retirement TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE local_automation_receiver_current ADD COLUMN established_inventory BLOB NOT NULL DEFAULT x''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -3810,10 +3900,12 @@ var alterVersions = []int{
 	45, 45, 45, // audit_log.key_id/signature/seq
 	49, 49, // hosts.isolation_epoch/isolation_reason
 	51, 51, // ip_allocations.netbox_ip_id/netbox_prefix_id
-	51, // netbox_bindings.netbox_cluster
-	53, // runtime_action_proofs.lease_term
-	54, // runtime_action_proofs.lease_key
-	60, // runtime_action_proofs.claim_certificate
+	51,                                // netbox_bindings.netbox_cluster
+	53,                                // runtime_action_proofs.lease_term
+	54,                                // runtime_action_proofs.lease_key
+	60,                                // runtime_action_proofs.claim_certificate
+	schemaVersionCredentialRetirement, // host_fence_credentials.after_retirement
+	78,                                // local_automation_receiver_current.established_inventory
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -3860,25 +3952,34 @@ var createTableUnits = []struct {
 	{65, "host_runtime"},
 	{66, "session_groups"},
 	{67, "host_fence_redfish"},
-	{68, "local_automation_authority"}, {68, "local_automation_prefix"},
-	{68, "local_automation_anchors"}, {68, "local_automation_history"},
-	{68, "local_automation_requests"}, {68, "local_automation_recovery"}, {68, "local_automation_staging"},
-	{69, "local_automation_cuts"}, {69, "local_automation_cut_records"},
-	{70, "local_automation_source_jobs"}, {70, "local_automation_publications"},
-	{74, "local_automation_lifetimes"}, {74, "local_automation_credential_issuance"},
-	{73, "local_automation_identities"}, {73, "local_automation_aliases"},
-	{73, "local_automation_owners"}, {73, "local_automation_semantic_heads"},
-	{73, "local_automation_resources"}, {73, "local_automation_names"}, {73, "local_automation_bindings"}, {73, "local_automation_admissions"},
-	{72, "local_automation_receiver_audits"},
-	{72, "local_automation_receiver_refs"},
-	{72, "local_automation_receiver_requests"},
-	{71, "local_automation_receiver_jobs"},
-	{71, "local_automation_receiver_current"},
-	{71, "local_automation_receiver_validations"},
-	{71, "local_automation_receiver_sources"},
-	{71, "local_automation_receiver_components"},
-	{71, "local_automation_receiver_records"},
-	{71, "local_automation_receiver_pages"},
+	{69, "local_automation_authority"}, {69, "local_automation_prefix"},
+	{69, "local_automation_anchors"}, {69, "local_automation_history"},
+	{69, "local_automation_requests"}, {69, "local_automation_recovery"}, {69, "local_automation_staging"},
+	{70, "local_automation_cuts"}, {70, "local_automation_cut_records"},
+	{71, "local_automation_source_jobs"}, {71, "local_automation_publications"},
+	{78, "local_automation_receiver_established"},
+	{77, "local_automation_key_epochs"}, {77, "local_automation_key_recipients"}, {77, "local_automation_payload_wrappings"},
+	{76, "local_automation_local_audits"},
+	{76, "local_automation_local_rows"},
+	{76, "local_automation_aggregates"},
+	{76, "local_automation_aggregate_sources"},
+	{76, "local_automation_aggregate_copies"},
+	{76, "local_automation_aggregate_maxima"},
+	{76, "local_automation_aggregate_conflicts"},
+	{75, "local_automation_lifetimes"}, {75, "local_automation_credential_issuance"},
+	{74, "local_automation_identities"}, {74, "local_automation_aliases"},
+	{74, "local_automation_owners"}, {74, "local_automation_semantic_heads"},
+	{74, "local_automation_resources"}, {74, "local_automation_names"}, {74, "local_automation_bindings"}, {74, "local_automation_admissions"},
+	{73, "local_automation_receiver_audits"},
+	{73, "local_automation_receiver_refs"},
+	{73, "local_automation_receiver_requests"},
+	{72, "local_automation_receiver_jobs"},
+	{72, "local_automation_receiver_current"},
+	{72, "local_automation_receiver_validations"},
+	{72, "local_automation_receiver_sources"},
+	{72, "local_automation_receiver_components"},
+	{72, "local_automation_receiver_records"},
+	{72, "local_automation_receiver_pages"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

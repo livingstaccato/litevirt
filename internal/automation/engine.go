@@ -139,10 +139,16 @@ func (e *Engine) submit(ctx context.Context, c Command) (Receipt, error) {
 			return Receipt{}, fail(CodeUnavailable)
 		}
 		rec := corrosion.AutomationRecord{Value: out.Value, Certificate: out.Certificate}
-		if _, err = e.db.AutomationApply(ctx, rec, e.verifier, reduce); err != nil {
+		out.Value = corrosion.ClaimValue{}
+		out.Certificate = corrosion.ClaimCertificate{}
+		sequence := d.Sequence
+		d = Decision{}
+		encoded = nil
+		value = corrosion.ClaimValue{}
+		if _, err = e.db.AutomationApplyOwned(ctx, &rec, e.verifier, reduce); err != nil {
 			return Receipt{}, fmt.Errorf("apply automation: %w", err)
 		}
-		e.distribute(ctx, cfg, d.Sequence)
+		e.distribute(ctx, cfg, sequence)
 		select {
 		case <-ctx.Done():
 			return Receipt{}, fail(CodeUnavailable)
@@ -253,7 +259,9 @@ func (e *Engine) recover(ctx context.Context) error {
 			return err
 		}
 		record := corrosion.AutomationRecord{Value: out.Value, Certificate: out.Certificate}
-		if _, err = e.db.AutomationApply(ctx, record, e.verifier, reduce); err != nil {
+		out.Value = corrosion.ClaimValue{}
+		out.Certificate = corrosion.ClaimCertificate{}
+		if _, err = e.db.AutomationApplyOwned(ctx, &record, e.verifier, reduce); err != nil {
 			return err
 		}
 		e.distribute(ctx, cfg, 1)
@@ -272,14 +280,34 @@ func (e *Engine) recover(ctx context.Context) error {
 		return err
 	}
 	record := corrosion.AutomationRecord{Value: out.Value, Certificate: out.Certificate}
+	out.Value = corrosion.ClaimValue{}
+	out.Certificate = corrosion.ClaimCertificate{}
 	if err = e.db.AutomationBeginRecovery(ctx, record, e.verifier); err != nil {
 		return err
 	}
+	// The durable recovery owner now holds the authenticated value. Retain only
+	// its bounded certificate/identity while FinishRecovery opens originals;
+	// this Engine ancestor must not keep the current raw envelope reachable.
+	renewed := record.Certificate
+	record = corrosion.AutomationRecord{}
 	if err = e.resumeRecovery(ctx, cfg); err != nil {
 		return err
 	}
-	// Forward the renewed certificate, rather than reloading the original
-	// stored certificate whose leaf may have expired.
+	var found bool
+	record, found, err = e.db.AutomationRecord(ctx, target)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fail(CodeUnavailable)
+	}
+	digest, err := record.Value.Digest()
+	if err != nil || digest != renewed.ValueDigest {
+		return fail(CodeUnavailable)
+	}
+	// Forward the intended renewed certificate; the exact durable value may
+	// already have existed with an older certificate whose leaf has expired.
+	record.Certificate = renewed
 	e.distributeRecord(ctx, cfg, record)
 	return nil
 }
@@ -295,7 +323,9 @@ func (e *Engine) recoverIntermediate(ctx context.Context, cfg *corrosion.VoterCo
 			return err
 		}
 		record := corrosion.AutomationRecord{Value: out.Value, Certificate: out.Certificate}
-		if _, err = e.db.AutomationApply(ctx, record, e.verifier, reduce); err != nil {
+		out.Value = corrosion.ClaimValue{}
+		out.Certificate = corrosion.ClaimCertificate{}
+		if _, err = e.db.AutomationApplyOwned(ctx, &record, e.verifier, reduce); err != nil {
 			return err
 		}
 		e.distributeRecord(ctx, cfg, record)
@@ -337,8 +367,12 @@ func (e *Engine) resumeRecovery(ctx context.Context, cfg *corrosion.VoterConfig)
 // Install applies contiguous records directly; a certified ahead head supplies
 // a fresh anchor for bounded backward catch-up outside all DB transactions.
 func (e *Engine) Install(ctx context.Context, r corrosion.AutomationRecord) error {
-	if _, err := e.db.AutomationApply(ctx, r, e.verifier, reduce); err == nil {
+	if _, err := e.db.AutomationApplyOwned(ctx, &r, e.verifier, reduce); err == nil {
 		return nil
+	} else if r.Value.Automation == nil {
+		// The actual matching durable handoff consumed this record. Preserve its
+		// error and pending authenticated job for normal recovery on retry.
+		return err
 	}
 	if err := e.db.AutomationBeginRecovery(ctx, r, e.verifier); err != nil {
 		return err

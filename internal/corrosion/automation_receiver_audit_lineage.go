@@ -52,7 +52,7 @@ func (s receiverAuditStore) membership(ctx context.Context, g int64) (*VoterConf
 
 func (s receiverAuditStore) lineage(ctx context.Context, a *AutomationReceiverAttempt) (string, error) {
 	m := s.publication.manifest
-	if m.Cut.Generation != a.request.Generation || m.Cut.Incarnation != m.Incarnation || m.Cut.Source != s.source || !receiverDigest(m.Lineage) {
+	if m.Cut.Generation != a.request.Generation || m.Cut.Incarnation != m.Incarnation || m.Cut.Source != s.source || (s.ownedCutID == "" && !receiverDigest(m.Lineage)) {
 		return "", errors.New("frozen source lineage binding")
 	}
 	var previous *VoterConfig
@@ -98,7 +98,7 @@ func (s receiverAuditStore) lineage(ctx context.Context, a *AutomationReceiverAt
 		return "", errors.New("frozen source old lifetime differs")
 	}
 	h := sha256.New()
-	sourceHash(h, []byte("litevirt/receiver-frozen-lineage/v1"), []byte(s.id), []byte(m.Incarnation))
+	sourceHash(h, []byte("litevirt/receiver-frozen-lineage/v1"), []byte(s.evidenceIdentity()), []byte(m.Incarnation))
 	var adopted int64
 	err = s.walk(ctx, 9, func(_ int64, row Row) error {
 		g := row.Int64("generation")
@@ -233,4 +233,138 @@ func (s receiverAuditStore) lineage(ctx context.Context, a *AutomationReceiverAt
 		return "", errors.New("frozen history authority inventory missing")
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// localLineage validates current native storage without importing frozen-source
+// seal/adoption requirements. Begin remains the current membership/PKI owner.
+func (s receiverAuditStore) localLineage(ctx context.Context, a *AutomationReceiverAttempt, incarnation string) error {
+	var previous *VoterConfig
+	var configs, adopted int64
+	err := s.walk(ctx, 11, func(_ int64, row Row) error {
+		cfg, err := sourceConfigRow(row)
+		if err != nil {
+			return err
+		}
+		if cfg.Generation != configs+1 {
+			return errors.New("local membership lineage gap")
+		}
+		if err = receiverRetainedMembership(previous, cfg); err != nil {
+			return err
+		}
+		if cfg.Generation == a.request.Generation && sourceConfigDigest(cfg) != sourceConfigDigest(a.facts.Old) {
+			return errors.New("local old membership differs")
+		}
+		if cfg.Generation == a.request.Generation+1 && sourceConfigDigest(cfg) != sourceConfigDigest(a.facts.Next) {
+			return errors.New("local successor membership differs")
+		}
+		previous = cfg
+		configs++
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if configs < a.request.Generation+1 {
+		return errors.New("local membership inventory differs")
+	}
+	err = s.walk(ctx, 9, func(_ int64, row Row) error {
+		if row.Int64("generation") != adopted+1 || row.Int64("generation") > a.request.Generation || row.String("adopted_at") == "" {
+			return errors.New("local adoption lineage differs")
+		}
+		adopted++
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if adopted != a.facts.Adopted {
+		return errors.New("local adopted standing changed")
+	}
+	err = s.walk(ctx, 10, func(_ int64, row Row) error {
+		if row.Int64("generation") > adopted || row.String("reason") == "" || row.String("sealed_at") == "" {
+			return errors.New("invalid local seal")
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	var native, acceptedGenesis bool
+	var genesisPrincipal, genesisRequest string
+	err = s.walk(ctx, 3, func(_ int64, row Row) error {
+		if row.String("target_kind") == ClaimKindAutomation {
+			native = true
+			// At H=0 only an actual accepted genesis carries a candidate identity.
+			// Prepare-only state supplies none; losing candidates at H>0 are separate.
+			if s.publication.manifest.Cut.Head.Sequence == 0 && row.Int64("owner_epoch") == 1 && row.Int64("accepted_round") > 0 {
+				key, _ := AutomationClaimKey(1)
+				state, err := scanClaimRow(key, row)
+				if err != nil {
+					return err
+				}
+				if err = validateRetainedClaimState(state); err != nil {
+					return err
+				}
+				if state.Value == nil {
+					return errors.New("local native accepted genesis missing")
+				}
+				decision, err := automationDecision(*state.Value)
+				if err != nil {
+					return err
+				}
+				acceptedGenesis = true
+				genesisPrincipal = decision.Command.PrincipalID
+				genesisRequest = decision.Command.RequestID
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	var authorities int
+	err = s.walk(ctx, 8, func(_ int64, row Row) error {
+		authorities++
+		if authorities != 1 || row.Int64("id") != 1 || row.Int64("generation") != adopted || row.String("incarnation") != incarnation {
+			return errors.New("local authority lifetime differs")
+		}
+		cfg, err := s.membership(ctx, adopted)
+		if err != nil {
+			return err
+		}
+		member, ok := cfg.Member(s.source)
+		if !ok || member.Incarnation != incarnation || row.String("members_hash") != cfg.MembersHash {
+			return errors.New("local authority membership differs")
+		}
+		if s.publication.manifest.Cut.Head.Sequence > 0 {
+			genesis, err := s.sequence(ctx, 5, 1)
+			if err != nil {
+				return err
+			}
+			value, _, err := receiverHistoryValue(genesis)
+			if err != nil {
+				return err
+			}
+			decision, err := automationDecision(value)
+			if err != nil {
+				return err
+			}
+			if decision.Command.PrincipalID != row.String("bootstrap_principal") || decision.Command.RequestID != row.String("bootstrap_request") {
+				return errors.New("local native bootstrap identity differs")
+			}
+		}
+		if acceptedGenesis && (genesisPrincipal != row.String("bootstrap_principal") || genesisRequest != row.String("bootstrap_request")) {
+			return errors.New("local native accepted bootstrap identity differs")
+		}
+		// Retain provenance as opaque original bytes. It is never interpreted as an
+		// imported-origin receipt or current class/activation permission.
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if (native || s.publication.manifest.Cut.Head.Sequence > 0) && authorities != 1 {
+		return errors.New("local native history authority missing")
+	}
+	return nil
 }

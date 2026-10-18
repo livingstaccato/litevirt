@@ -12,6 +12,7 @@ import (
 // binding lifetime, global name lifetime, desired revision and original voters.
 // Prepared facts grant no authority without the fresh storage-owned class permit.
 type BindingAssignment struct {
+	RecipientEpoch     string   `json:"recipient_epoch,omitempty"`
 	ResourceUID        string   `json:"resource_uid"`
 	BindingGeneration  uint64   `json:"binding_generation"`
 	NameGeneration     uint64   `json:"name_generation"`
@@ -75,6 +76,9 @@ func validateBindingAssignment(d Decision, a Assignment) error {
 	}
 	var raw map[string]json.RawMessage
 	if json.Unmarshal(d.Assignment, &raw) != nil || exactBindingJSON(raw["binding"], reflect.TypeOf(BindingAssignment{})) != nil {
+		return codedError(CodeValidation)
+	}
+	if b.RecipientEpoch != "" && (!keyText(b.RecipientEpoch) || len(d.Command.Ciphertext) == 0) {
 		return codedError(CodeValidation)
 	}
 	if (len(d.Command.Ciphertext) > 0) != (b.PayloadID != "") || (b.PayloadID != "" && (len(d.Command.SecretIntentTag) == 0 || d.Command.SecretKeyEpoch == "")) {

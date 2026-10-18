@@ -171,7 +171,7 @@ func TestAutomationIdentityProjectionReadsOwnerLifetimes(t *testing.T) {
 			}
 		}
 		d := contract.Decision{Sequence: 2, ParentDigest: r.Value.MustDigest(), Command: contract.Command{Kind: "ensure_owner", ClusterUID: "established-cluster", ProjectUID: "project", PrincipalID: "principal", OwnerID: "owner", RequestID: "owner-request", Body: []byte(`{"version":1}`)}, Assignment: []byte(`{"version":1,"cluster_uid":"established-cluster","operation_id":"owner-op","recorded_at":"2026-10-17T00:00:00Z"}`)}
-		p, err := automationProjectionTx(ctx, tx, contract.Prefix{ClusterUID: "established-cluster", Sequence: 1, Digest: r.Value.MustDigest()}, d)
+		p, err := automationProjectionTx(ctx, tx, contract.Prefix{ClusterUID: "established-cluster", Sequence: 1, Digest: r.Value.MustDigest()}, d, nil)
 		if err != nil {
 			return err
 		}
@@ -314,6 +314,12 @@ func automationTypedSnapshot(t *testing.T, c *Client) map[string][]Row {
 }
 
 func automationTypedHistoryFixture(t *testing.T, a, b, c *claimTestVoter, verifier *ClaimVerifier) {
+	automationTypedHistoryFixtureWithDecision(t, a, b, c, verifier, nil)
+}
+
+// change is a test-only retained decision variation before signing and verifying
+// its certificate. It never supplies a fresh class permit or reducer result.
+func automationTypedHistoryFixtureWithDecision(t *testing.T, a, b, c *claimTestVoter, verifier *ClaimVerifier, change func(*contract.Decision)) {
 	t.Helper()
 	initial := sharedAutomationRecord(t, 1, "", "initialize", "initialize-op", a, b)
 	if _, err := applySharedAutomation(t, a.c, initial, contract.Reduce, automationFreshAnchor); err != nil {
@@ -323,6 +329,9 @@ func automationTypedHistoryFixture(t *testing.T, a, b, c *claimTestVoter, verifi
 	appendDecision := func(d contract.Decision) {
 		t.Helper()
 		d.ParentDigest = parent
+		if change != nil {
+			change(&d)
+		}
 		envelope, err := contract.EncodeDecision(d)
 		if err != nil {
 			t.Fatal(err)

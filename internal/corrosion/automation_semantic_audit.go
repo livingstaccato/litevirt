@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// These eight node-local projections are derived from certified history. The
+// These node-local projections are derived from certified history. The
 // empty stage is active state; every nonempty stage is isolated reconstruction.
 // Neither is exported as authority: source audits compare active state with a
 // causal reconstruction, and receivers build their own isolated projections.
@@ -19,6 +19,9 @@ var automationSemanticTables = []struct{ table, columns, integers, primaryKey, n
 	{"local_automation_names", "stage,cluster_uid,name,resource_uid,generation,disposition,retirement_operation_id", "generation", "stage,cluster_uid,name", ""},
 	{"local_automation_bindings", "stage,cluster_uid,project_uid,owner_id,management_key,creation_generation,resource_uid,operation_id,revision,retired", "creation_generation,retired", "stage,cluster_uid,project_uid,owner_id,management_key,creation_generation", ""},
 	{"local_automation_admissions", "stage,operation_id,cluster_uid,project_uid,owner_id,management_key,resource_uid,request_id,principal_uid,method,payload_id,binding_generation,admitted_generation,sequence,configuration_json", "binding_generation,admitted_generation,sequence", "stage,operation_id", ""},
+	{"local_automation_key_epochs", "stage,cluster_uid,recipient_epoch,membership_generation,config_digest,equality_epoch,predecessor_activation_sequence,activation_sequence", "membership_generation,predecessor_activation_sequence,activation_sequence", "stage,cluster_uid,recipient_epoch", ""},
+	{"local_automation_key_recipients", "stage,cluster_uid,recipient_epoch,membership_generation,config_digest,host,host_incarnation,admitted_at,admission_serial,voter_incarnation,key_id,recipient,enrollment_ref,recipient_ack_ref,equality_ack_ref,first_sequence", "membership_generation,host_incarnation,first_sequence", "stage,cluster_uid,recipient_epoch,host", ""},
+	{"local_automation_payload_wrappings", "stage,cluster_uid,operation_id,payload_id,admission_sequence,wrapping_sequence,wrapping_digest,recipient_epoch,membership_generation,config_digest", "admission_sequence,wrapping_sequence,membership_generation", "stage,cluster_uid,operation_id,wrapping_sequence", ""},
 }
 
 func automationVerifySemanticSchemaTx(ctx context.Context, tx *LocalTx) error {
@@ -54,7 +57,7 @@ func automationVerifySemanticSchemaTx(ctx context.Context, tx *LocalTx) error {
 			}
 		}
 	}
-	return nil
+	return automationVerifyKeyIndexesTx(ctx, tx)
 }
 
 func automationVerifySemanticStageTx(ctx context.Context, tx *LocalTx, stage string) error {

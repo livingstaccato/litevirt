@@ -22,6 +22,8 @@ type AutomationReceiver struct {
 	client *Client
 	dir    string
 	mu     sync.Mutex
+	closed bool
+	proofs map[*AutomationCurrentProof]bool
 	// Only tests pause the real transaction, never supply authorization results.
 	seams                   *localCommitSeams
 	afterMembershipLearning func() // test-only pause; never supplies facts or trust
@@ -58,15 +60,28 @@ type receiverFacts struct {
 	Old, Next                        *VoterConfig
 }
 type receiverPublication struct {
-	id              string
-	manifest        sourceManifest
-	chain           [][]byte
-	metadataBytes   [3]int64
-	metadataDigests [3][32]byte
+	id                  string
+	manifest            sourceManifest
+	chain               [][]byte
+	metadataBytes       [3]int64
+	metadataDigests     [3][32]byte
+	notBefore, notAfter time.Time
 }
 
 func NewAutomationReceiver(c *Client, dir string) *AutomationReceiver {
-	return &AutomationReceiver{client: c, dir: dir}
+	r := &AutomationReceiver{client: c, dir: dir}
+	if c != nil {
+		c.automationSourceMu.Lock()
+		r.closed = c.automationSourceClosed
+		if !r.closed {
+			if c.automationReceivers == nil {
+				c.automationReceivers = make(map[*AutomationReceiver]bool)
+			}
+			c.automationReceivers[r] = true
+		}
+		c.automationSourceMu.Unlock()
+	}
+	return r
 }
 func (r *AutomationReceiver) lock(ctx context.Context) error {
 	if r == nil || r.client == nil || r.dir == "" {
@@ -81,10 +96,15 @@ func (r *AutomationReceiver) lock(ctx context.Context) error {
 		case <-timer.C:
 		}
 	}
+	if r.closed {
+		r.mu.Unlock()
+		return errors.New("receiver owner closed")
+	}
 	if err := ctx.Err(); err != nil {
 		r.mu.Unlock()
 		return err
 	}
+	r.discardAbandonedLocked()
 	return nil
 }
 
@@ -231,6 +251,118 @@ func (r *AutomationReceiver) begin(ctx context.Context, intent AutomationSourceR
 			r.afterCurrentObservation()
 		}
 	}
+	if predecessor != nil {
+		observed, e := r.observePredecessor(ctx)
+		if e != nil || observed.id != predecessor.id || !bytes.Equal(observed.binding, predecessor.binding) {
+			return nil, errors.New("receiver observed predecessor changed")
+		}
+	}
+	floors, err := r.reconcileEstablished(ctx)
+	if err != nil {
+		return nil, err
+	}
+	a, err := r.authorizeReceiverAttempt(ctx, intent, predecessor)
+	if err != nil {
+		return nil, err
+	}
+	id, binding, view, pair := a.id, a.binding, a.view, a.pair
+	evidence, err := view.PublicEvidence()
+	if err != nil {
+		return nil, err
+	}
+	artifact, err := r.prepareEstablishment(ctx, a, evidence)
+	if err != nil {
+		return nil, err
+	}
+	inventory, err := r.prepareInventoryCommitment(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+	cap, err := view.ValidateServedHost(ctx, pair)
+	if err != nil {
+		return nil, err
+	}
+	defer cap.Discard()
+	lease, err := pki.AcquireHostCertificateLease(ctx, r.dir, cap)
+	if err != nil {
+		return nil, err
+	}
+	defer lease.Release()
+	err = r.transactionEstablished(ctx, a, lease, &receiverEstablishmentCommit{before: floors, inventory: inventory}, func(tx *LocalTx) error {
+		rows, err := tx.Query(ctx, `SELECT attempt FROM local_automation_receiver_current WHERE id=1 AND length(CAST(attempt AS BLOB))=64`)
+		if err != nil {
+			return err
+		}
+		if predecessor != nil {
+			observed, e := receiverReadPredecessor(ctx, tx)
+			if e != nil || observed.id != predecessor.id || !bytes.Equal(observed.binding, predecessor.binding) {
+				return errors.New("receiver observed predecessor changed")
+			}
+		} else if len(rows) == 0 {
+			// A corrupt/over-bound head cannot masquerade as no current selection.
+			count, e := tx.Query(ctx, `SELECT COUNT(*) AS n FROM local_automation_receiver_current`)
+			if e != nil || len(count) != 1 || count[0].Int64("n") != 0 {
+				return errors.New("invalid receiver current selection")
+			}
+			if previous != nil {
+				return errors.New("receiver predecessor no longer current")
+			}
+		} else if rows[0].String("attempt") != id {
+			if previous == nil || rows[0].String("attempt") != previous.id || intent.Revision <= previous.request.Revision {
+				return errors.New("receiver current selection conflict")
+			}
+			if err := r.currentTx(ctx, tx, previous); err != nil {
+				return err
+			}
+		}
+		rows, err = tx.Query(ctx, `SELECT CASE WHEN length(CAST(id AS BLOB))=64 THEN id END AS id FROM local_automation_receiver_jobs WHERE job=? AND revision=? LIMIT 1`, intent.Job, intent.Revision)
+		if err != nil {
+			return err
+		}
+		if len(rows) > 0 && rows[0].String("id") != id {
+			return errors.New("immutable receiver job/revision differs")
+		}
+		if len(rows) == 0 {
+			if _, err = tx.Exec(ctx, `INSERT INTO local_automation_receiver_jobs(id,job,revision,binding,evidence) VALUES(?,?,?,?,?)`, id, intent.Job, intent.Revision, binding, evidence); err != nil {
+				return err
+			}
+		} else {
+			rows, err = tx.Query(ctx, `SELECT binding FROM local_automation_receiver_jobs WHERE id=? AND length(CAST(binding AS BLOB))=? LIMIT 1`, id, len(binding))
+			if err != nil || len(rows) != 1 || !bytes.Equal(rows[0].Bytes("binding"), binding) {
+				return errors.New("receiver immutable binding unavailable")
+			}
+		}
+		digest := view.EvidenceDigest()
+		if _, err = tx.Exec(ctx, `INSERT OR IGNORE INTO local_automation_receiver_validations(attempt,digest,evidence) VALUES(?,?,?)`, id, hex.EncodeToString(digest[:]), evidence); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, `INSERT OR IGNORE INTO local_automation_receiver_established(attempt,digest,artifact) VALUES(?,?,?)`, id, hex.EncodeToString(digest[:]), artifact); err != nil {
+			return err
+		}
+		if predecessor != nil {
+			result, e := tx.Exec(ctx, `UPDATE local_automation_receiver_current SET attempt=? WHERE id=1 AND attempt=?`, id, predecessor.id)
+			if e != nil {
+				return e
+			}
+			n, e := result.RowsAffected()
+			if e != nil {
+				return e
+			}
+			if n != 1 {
+				return errors.New("receiver current compare-and-swap lost")
+			}
+			return nil
+		}
+		_, err = tx.Exec(ctx, `INSERT INTO local_automation_receiver_current(id,attempt) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET attempt=excluded.attempt`, id)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+func (r *AutomationReceiver) authorizeReceiverAttempt(ctx context.Context, intent AutomationSourceRequest, predecessor *receiverPredecessor) (*AutomationReceiverAttempt, error) {
 	// Learn CA-issued renewals before snapshot capture, without any held SQL/PKI
 	// lock inversion. No membership assertion is inferred from these certificates.
 	learned := sha256.New()
@@ -291,88 +423,6 @@ func (r *AutomationReceiver) begin(ctx context.Context, intent AutomationSourceR
 	id := sourceDigest([]byte("litevirt/receiver-attempt/v1"), binding)
 	a := &AutomationReceiverAttempt{owner: r, id: id, request: intent, facts: facts, binding: binding, view: view, pair: pair, at: time.Now(), notBefore: before, notAfter: after, publications: map[string]receiverPublication{}}
 	a.self = a
-	evidence, err := view.PublicEvidence()
-	if err != nil {
-		return nil, err
-	}
-	cap, err := view.ValidateServedHost(ctx, pair)
-	if err != nil {
-		return nil, err
-	}
-	defer cap.Discard()
-	lease, err := pki.AcquireHostCertificateLease(ctx, r.dir, cap)
-	if err != nil {
-		return nil, err
-	}
-	defer lease.Release()
-	err = r.transaction(ctx, a, lease, time.Time{}, func(tx *LocalTx) error {
-		rows, err := tx.Query(ctx, `SELECT attempt FROM local_automation_receiver_current WHERE id=1 AND length(CAST(attempt AS BLOB))=64`)
-		if err != nil {
-			return err
-		}
-		if predecessor != nil {
-			observed, e := receiverReadPredecessor(ctx, tx)
-			if e != nil || observed.id != predecessor.id || !bytes.Equal(observed.binding, predecessor.binding) {
-				return errors.New("receiver observed predecessor changed")
-			}
-		} else if len(rows) == 0 {
-			// A corrupt/over-bound head cannot masquerade as no current selection.
-			count, e := tx.Query(ctx, `SELECT COUNT(*) AS n FROM local_automation_receiver_current`)
-			if e != nil || len(count) != 1 || count[0].Int64("n") != 0 {
-				return errors.New("invalid receiver current selection")
-			}
-			if previous != nil {
-				return errors.New("receiver predecessor no longer current")
-			}
-		} else if rows[0].String("attempt") != id {
-			if previous == nil || rows[0].String("attempt") != previous.id || intent.Revision <= previous.request.Revision {
-				return errors.New("receiver current selection conflict")
-			}
-			if err := r.currentTx(ctx, tx, previous); err != nil {
-				return err
-			}
-		}
-		rows, err = tx.Query(ctx, `SELECT CASE WHEN length(CAST(id AS BLOB))=64 THEN id END AS id FROM local_automation_receiver_jobs WHERE job=? AND revision=? LIMIT 1`, intent.Job, intent.Revision)
-		if err != nil {
-			return err
-		}
-		if len(rows) > 0 && rows[0].String("id") != id {
-			return errors.New("immutable receiver job/revision differs")
-		}
-		if len(rows) == 0 {
-			if _, err = tx.Exec(ctx, `INSERT INTO local_automation_receiver_jobs(id,job,revision,binding,evidence) VALUES(?,?,?,?,?)`, id, intent.Job, intent.Revision, binding, evidence); err != nil {
-				return err
-			}
-		} else {
-			rows, err = tx.Query(ctx, `SELECT binding FROM local_automation_receiver_jobs WHERE id=? AND length(CAST(binding AS BLOB))=? LIMIT 1`, id, len(binding))
-			if err != nil || len(rows) != 1 || !bytes.Equal(rows[0].Bytes("binding"), binding) {
-				return errors.New("receiver immutable binding unavailable")
-			}
-		}
-		digest := view.EvidenceDigest()
-		if _, err = tx.Exec(ctx, `INSERT OR IGNORE INTO local_automation_receiver_validations(attempt,digest,evidence) VALUES(?,?,?)`, id, hex.EncodeToString(digest[:]), evidence); err != nil {
-			return err
-		}
-		if predecessor != nil {
-			result, e := tx.Exec(ctx, `UPDATE local_automation_receiver_current SET attempt=? WHERE id=1 AND attempt=?`, id, predecessor.id)
-			if e != nil {
-				return e
-			}
-			n, e := result.RowsAffected()
-			if e != nil {
-				return e
-			}
-			if n != 1 {
-				return errors.New("receiver current compare-and-swap lost")
-			}
-			return nil
-		}
-		_, err = tx.Exec(ctx, `INSERT INTO local_automation_receiver_current(id,attempt) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET attempt=excluded.attempt`, id)
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
 	return a, nil
 }
 
@@ -384,7 +434,7 @@ func (r *AutomationReceiver) currentTx(ctx context.Context, tx *LocalTx, a *Auto
 	if err != nil || len(rows) != 1 {
 		return errors.New("receiver attempt is not current")
 	}
-	rows, err = tx.Query(ctx, `SELECT binding FROM local_automation_receiver_jobs WHERE id=? AND length(CAST(binding AS BLOB))=? LIMIT 1`, a.id, len(a.binding))
+	rows, err = tx.Query(ctx, `SELECT binding FROM local_automation_receiver_jobs WHERE id=? AND job=? AND typeof(revision)='integer' AND revision=? AND length(CAST(binding AS BLOB))=? LIMIT 1`, a.id, a.request.Job, a.request.Revision, len(a.binding))
 	if err != nil || len(rows) != 1 || !bytes.Equal(rows[0].Bytes("binding"), a.binding) {
 		return errors.New("receiver attempt binding differs")
 	}
@@ -394,6 +444,14 @@ func (r *AutomationReceiver) currentTx(ctx context.Context, tx *LocalTx, a *Auto
 // The real PKI lease encloses the actual SQLite FULL commit, including every
 // SQL/mutex wait and the final locally timed guard. No callback supplies trust.
 func (r *AutomationReceiver) transaction(ctx context.Context, a *AutomationReceiverAttempt, lease *pki.HostCertificateLease, observed time.Time, fn func(*LocalTx) error) error {
+	return r.transactionCurrent(ctx, a, lease, observed, nil, fn)
+}
+
+func (r *AutomationReceiver) transactionCurrent(ctx context.Context, a *AutomationReceiverAttempt, lease *pki.HostCertificateLease, observed time.Time, proof *AutomationCurrentProof, fn func(*LocalTx) error) error {
+	return r.transactionGuarded(ctx, a, lease, observed, proof, nil, fn)
+}
+
+func (r *AutomationReceiver) transactionGuarded(ctx context.Context, a *AutomationReceiverAttempt, lease *pki.HostCertificateLease, observed time.Time, proof *AutomationCurrentProof, established *receiverEstablishmentCommit, fn func(*LocalTx) error) error {
 	c := r.client
 	for !c.mu.TryLock() {
 		timer := time.NewTimer(5 * time.Millisecond)
@@ -405,6 +463,9 @@ func (r *AutomationReceiver) transaction(ctx context.Context, a *AutomationRecei
 		}
 	}
 	defer c.mu.Unlock()
+	if err := lease.Check(); err != nil {
+		return err
+	}
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -441,6 +502,16 @@ func (r *AutomationReceiver) transaction(ctx context.Context, a *AutomationRecei
 	}
 	if !sameReceiverFacts(finalFacts, a.facts) {
 		return errors.New("receiver final authorization dependencies changed")
+	}
+	if proof != nil {
+		if err = r.revalidateCurrentTx(ctx, local, proof); err != nil {
+			return err
+		}
+	}
+	if established != nil {
+		if err = established.after.checkTx(ctx, local); err != nil {
+			return err
+		}
 	}
 	if err = ctx.Err(); err != nil {
 		return err

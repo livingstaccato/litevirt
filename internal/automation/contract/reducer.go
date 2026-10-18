@@ -17,18 +17,23 @@ type Request struct {
 	Receipt  Receipt
 }
 type Projection struct {
-	Binding   *BindingProjection
-	Ownership *OwnershipProjection
-	Identity  *IdentityProjection
-	Head      Prefix
-	Existing  *Request
-	Operation *Receipt
+	KeyTransition *KeyTransitionProjection
+	Binding       *BindingProjection
+	Ownership     *OwnershipProjection
+	Identity      *IdentityProjection
+	Head          Prefix
+	Existing      *Request
+	Operation     *Receipt
 	// ReplayOriginal distinguishes rebuilding the original admission from a
 	// later duplicate. Semantic owners must reset/stage their derived tables
 	// from certified history before replay, never read retained future state.
 	ReplayOriginal bool
 }
 type Reduction struct {
+	EpochEffect      *KeyEpochRecord
+	RecipientEffects []KeyRecipientRecord
+	WrappingEffect   *PayloadWrappingRecord
+	WrappingPrevious *HistoryReference
 	ResourcePrevious *ResourceRecord
 	ResourceEffect   *ResourceRecord
 	NameEffect       *NameRecord
@@ -96,6 +101,10 @@ func Reduce(p Projection, d Decision) (Reduction, error) {
 		out.Receipt.State = "rejected"
 	} else {
 		switch d.Command.Kind {
+		case "rewrap_payload", "activate_key_epoch":
+			if err := reduceKeyTransition(&out, p, d, a); err != nil {
+				return out, err
+			}
 		case "adopt_resource", "transfer_owner":
 			if err := reduceOwnership(&out, p, d, a); err != nil {
 				return out, err

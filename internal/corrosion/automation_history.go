@@ -2,6 +2,8 @@ package corrosion
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -138,6 +140,23 @@ func (c *Client) AutomationRequest(ctx context.Context, scope, request string) (
 // AutomationApply verifies fresh authority before creating a durable local
 // anchor. The transaction rechecks adopted membership and all affected keys.
 func (c *Client) AutomationApply(ctx context.Context, r AutomationRecord, v *ClaimVerifier, reduce AutomationReducer) (contract.Receipt, error) {
+	return c.AutomationApplyOwned(ctx, &r, v, reduce)
+}
+
+// AutomationApplyOwned transfers a certified historical transition to the
+// existing durable recovery owner before opening referenced originals. Callers
+// must release their other full-record/decoded aliases before entering. A value
+// caller of AutomationApply still owns its external input; this internal bound
+// does not claim to collect memory retained by an external caller.
+// Before handoff errors leave owned untouched. After handoff an error leaves
+// owned empty. The authenticated recovery job remains retryable until completion;
+// after completion, the original record is instead owned by durable history.
+// Success restores the record for callers that forward its certificate.
+func (c *Client) AutomationApplyOwned(ctx context.Context, owned *AutomationRecord, v *ClaimVerifier, reduce AutomationReducer) (contract.Receipt, error) {
+	if owned == nil {
+		return contract.Receipt{}, fmt.Errorf("missing owned automation record")
+	}
+	r := *owned
 	if err := validateAutomationRecordSize(r); err != nil {
 		return contract.Receipt{}, err
 	}
@@ -156,6 +175,65 @@ func (c *Client) AutomationApply(ctx context.Context, r AutomationRecord, v *Cla
 	key, _ := AutomationClaimKey(d.Sequence)
 	if e = v.Verify(r.Certificate, CertExpectation{Key: key, ValueDigest: digest, ConfigGeneration: cfg.Generation, Electorate: cfg.Members, Quorum: MajorityOf(len(cfg.Members))}); e != nil {
 		return contract.Receipt{}, e
+	}
+	if r.Value.Automation != nil {
+		automationObserveKeyBody(ctx, d.Sequence, r.Value.Automation.Envelope)
+	}
+	request, e := automationPrepareKeyLookup(ctx, d, r.Certificate)
+	if e != nil {
+		return contract.Receipt{}, e
+	}
+	if request != nil {
+		if request.configDigest != cfg.MembersHash {
+			return contract.Receipt{}, fmt.Errorf("key transition differs from original certified config")
+		}
+		head, e := c.AutomationHead(ctx)
+		if e != nil {
+			return contract.Receipt{}, e
+		}
+		if d.Sequence > head.Sequence {
+			if e = validateAutomationPredecessor(head, d); e != nil {
+				return contract.Receipt{}, e
+			}
+			sequence := d.Sequence
+			if e = c.AutomationBeginRecovery(ctx, r, v); e != nil {
+				return contract.Receipt{}, e
+			}
+			if e = c.automationMatchingRecovery(ctx, sequence, digest, cfg.Generation, cfg.MembersHash); e != nil {
+				return contract.Receipt{}, e
+			}
+			// The durable owner now survives cancellation, rollback and a closed DB.
+			// Drop all copies in this frame and the controlled caller before resolving.
+			*owned = AutomationRecord{}
+			r = AutomationRecord{}
+			d = contract.Decision{}
+			if e = c.AutomationFinishRecovery(ctx, reduce, 2); e != nil {
+				return contract.Receipt{}, e
+			}
+			var receipt contract.Receipt
+			e = c.ExecuteLocal(ctx, func(tx *LocalTx) error {
+				rows, e := tx.Query(ctx, `SELECT receipt_json FROM local_automation_history WHERE sequence=? AND digest=? LIMIT 1`, sequence, digest)
+				if e != nil {
+					return e
+				}
+				if len(rows) != 1 {
+					return fmt.Errorf("completed owned record missing")
+				}
+				return json.Unmarshal([]byte(rows[0].String("receipt_json")), &receipt)
+			})
+			if e != nil {
+				return contract.Receipt{}, e
+			}
+			restored, found, e := c.AutomationRecord(ctx, sequence)
+			if e != nil {
+				return contract.Receipt{}, e
+			}
+			if !found {
+				return contract.Receipt{}, fmt.Errorf("completed owned record unavailable")
+			}
+			*owned = restored
+			return receipt, nil
+		}
 	}
 	return c.automationApply(ctx, r, d, digest, cfg, reduce, false)
 }
@@ -193,7 +271,7 @@ func (c *Client) automationApply(ctx context.Context, r AutomationRecord, d cont
 			source = automationApplicationProvenance{kind: automationFreshAnchor, sequence: d.Sequence, generation: cfg.Generation, membersHash: MembersHash(cfg.Members)}
 		}
 		var err error
-		out, err = automationApplyTx(ctx, tx, r, d, digest, reduce, source)
+		out, err = automationApplyTx(ctx, tx, r, d, digest, reduce, source, nil)
 		return err
 	})
 	return
@@ -201,7 +279,7 @@ func (c *Client) automationApply(ctx context.Context, r AutomationRecord, d cont
 
 // automationApplyTx is the sole reducer/application persistence path. History,
 // anchors, permanent receipts, typed projections and prefix share this FULL tx.
-func automationApplyTx(ctx context.Context, tx *LocalTx, r AutomationRecord, d contract.Decision, digest string, reduce AutomationReducer, source automationApplicationProvenance) (out contract.Receipt, e error) {
+func automationApplyTx(ctx context.Context, tx *LocalTx, r AutomationRecord, d contract.Decision, digest string, reduce AutomationReducer, source automationApplicationProvenance, prepared *contract.KeyTransitionProjection) (out contract.Receipt, e error) {
 	if err := requireAutomationFull(ctx, tx); err != nil {
 		return out, err
 	}
@@ -254,7 +332,7 @@ func automationApplyTx(ctx context.Context, tx *LocalTx, r AutomationRecord, d c
 			return out, err
 		}
 	}
-	projection, err := automationProjectionTx(ctx, tx, head, d)
+	projection, err := automationProjectionTx(ctx, tx, head, d, prepared)
 	if err != nil {
 		return out, err
 	}
@@ -382,49 +460,34 @@ func (c *Client) AutomationReplay(ctx context.Context, reduce AutomationReducer,
 	}
 
 	for range budget {
-		var h AutomationPrefix
-		e := c.ExecuteLocal(ctx, func(tx *LocalTx) error { var err error; h, err = automationSemanticHeadTx(ctx, tx, ""); return err })
-		if e != nil {
-			return e
-		}
-		var r AutomationRecord
-		var digest string
-		found := false
-		e = c.ExecuteLocal(ctx, func(tx *LocalTx) error {
-			rs, err := tx.Query(ctx, `SELECT h.digest,h.value_json,h.certificate,a.digest AS anchor_digest FROM local_automation_history h JOIN local_automation_anchors a ON a.sequence=h.sequence WHERE h.sequence=? LIMIT 1`, h.Sequence+1)
-			if err != nil || len(rs) == 0 {
-				return err
+		complete := false
+		e := c.ExecuteLocal(ctx, func(tx *LocalTx) error {
+			head, e := automationSemanticHeadTx(ctx, tx, "")
+			if e != nil {
+				return e
 			}
-			row := rs[0]
-			digest = row.String("digest")
-			if digest != row.String("anchor_digest") {
+			rows, e := tx.Query(ctx, `SELECT h.digest,a.digest AS anchor_digest FROM local_automation_history h JOIN local_automation_anchors a ON a.sequence=h.sequence WHERE h.sequence=? LIMIT 1`, head.Sequence+1)
+			if e != nil {
+				return e
+			}
+			if len(rows) == 0 {
+				complete = true
+				return automationProjectionAuthorityTx(ctx, tx)
+			}
+			if rows[0].String("digest") != rows[0].String("anchor_digest") {
 				return fmt.Errorf("automation anchor mismatch")
 			}
-			if err = json.Unmarshal([]byte(row.String("value_json")), &r.Value); err != nil {
-				return err
-			}
-			r.Certificate, err = DecodeClaimCertificate(row.String("certificate"))
-			found = err == nil
-			return err
+			_, e = automationApplyStoredTx(ctx, tx, head.Sequence+1, rows[0].String("digest"), reduce, automationApplicationProvenance{kind: automationAnchoredReplay}, false)
+			return e
 		})
 		if e != nil {
 			return e
 		}
-		if !found {
-			return c.ExecuteLocal(ctx, func(tx *LocalTx) error { return automationProjectionAuthorityTx(ctx, tx) })
-		}
-		d, e := automationDecision(r.Value)
-		if e != nil {
-			return e
-		}
-		actual, e := r.Value.Digest()
-		if e != nil || actual != digest {
-			return fmt.Errorf("automation history digest mismatch")
-		}
-		if _, e = c.automationApply(ctx, r, d, digest, nil, reduce, true); e != nil {
-			return e
+		if complete {
+			return nil
 		}
 	}
+
 	if err := c.ExecuteLocal(ctx, func(tx *LocalTx) error { return automationProjectionAuthorityTx(ctx, tx) }); err == nil {
 		return nil
 	}
@@ -476,6 +539,16 @@ func automationRetainedHeadTx(ctx context.Context, tx *LocalTx) (AutomationPrefi
 	if sequence <= 0 {
 		return AutomationPrefix{}, fmt.Errorf("invalid retained automation sequence")
 	}
+	if sequence > 1 {
+		head, found, err := automationTrustedSummaryTx(ctx, tx, uint64(sequence))
+		if err != nil {
+			return AutomationPrefix{}, err
+		}
+		if !found {
+			return AutomationPrefix{}, fmt.Errorf("retained automation anchor missing")
+		}
+		return head, nil
+	}
 	digest, found, err := automationTrustedDigestTx(ctx, tx, uint64(sequence))
 	if err != nil {
 		return AutomationPrefix{}, err
@@ -521,7 +594,7 @@ func automationOperationTx(ctx context.Context, tx *LocalTx, id string) (*contra
 	err = json.Unmarshal([]byte(rows[0].String("receipt_json")), &out)
 	return &out, err
 }
-func automationProjectionTx(ctx context.Context, tx *LocalTx, head AutomationPrefix, d contract.Decision) (AutomationProjection, error) {
+func automationProjectionTx(ctx context.Context, tx *LocalTx, head AutomationPrefix, d contract.Decision, prepared *contract.KeyTransitionProjection) (AutomationProjection, error) {
 	existing, err := automationRequestTx(ctx, tx, AutomationScope(d), d.Command.RequestID)
 	if err != nil {
 		return AutomationProjection{}, err
@@ -534,7 +607,7 @@ func automationProjectionTx(ctx context.Context, tx *LocalTx, head AutomationPre
 	if err != nil {
 		return AutomationProjection{}, err
 	}
-	p := AutomationProjection{Head: head, Existing: existing, Operation: op, ReplayOriginal: existing != nil && existing.Receipt.Sequence == d.Sequence}
+	p := AutomationProjection{Head: head, Existing: existing, Operation: op, ReplayOriginal: existing != nil && existing.Receipt.Sequence == d.Sequence, KeyTransition: prepared}
 	if err := automationSemanticProjectionTx(ctx, tx, "", &p, d); err != nil {
 		return AutomationProjection{}, err
 	}
@@ -552,22 +625,59 @@ func (c *Client) AutomationOperation(ctx context.Context, id string) (out contra
 	return
 }
 
-func automationTrustedDigestTx(ctx context.Context, tx *LocalTx, sequence uint64) (string, bool, error) {
+// automationTrustedSummaryTx owns one original body for the duration of this
+// call. Only copied scalar identity escapes; no envelope, row or decoded body
+// survives into a subsequent original read. It does not confer fresh authority.
+func automationTrustedSummaryTx(ctx context.Context, tx *LocalTx, sequence uint64) (AutomationPrefix, bool, error) {
 	rows, err := tx.Query(ctx, `SELECT h.digest,h.value_json,a.digest AS anchor_digest FROM local_automation_history h JOIN local_automation_anchors a ON a.sequence=h.sequence WHERE h.sequence=? AND typeof(h.value_json)='text' AND typeof(h.digest)='text' AND typeof(a.digest)='text' AND length(CAST(h.value_json AS BLOB))<=? AND length(CAST(h.digest AS BLOB))=64 AND length(CAST(a.digest AS BLOB))=64 LIMIT 1`, sequence, MaxAutomationClaimBytes)
 	if err != nil || len(rows) == 0 {
-		return "", false, err
+		return AutomationPrefix{}, false, err
 	}
 	row := rows[0]
 	digest := row.String("digest")
 	var value ClaimValue
 	key, _ := AutomationClaimKey(sequence)
 	if err := decodeClaimValue(key, row.String("value_json"), &value); err != nil {
-		return "", false, err
+		return AutomationPrefix{}, false, err
 	}
-	if err := validateAutomationTrustedValue(sequence, value, digest, row.String("anchor_digest")); err != nil {
-		return "", false, err
+	if sequence <= 1 {
+		// Digest-only genesis callers historically validate the envelope, not
+		// its typed assignment. Retained-head genesis still does both above.
+		if err := validateAutomationTrustedValue(sequence, value, digest, row.String("anchor_digest")); err != nil {
+			return AutomationPrefix{}, false, err
+		}
+		return AutomationPrefix{Sequence: sequence, Digest: digest}, true, nil
 	}
-	return digest, true, nil
+	if digest != row.String("anchor_digest") {
+		return AutomationPrefix{}, false, fmt.Errorf("automation parent anchor mismatch")
+	}
+	if _, err := AutomationClaimKey(sequence); err != nil {
+		return AutomationPrefix{}, false, err
+	}
+	if value.Automation == nil || value.Proof != nil || value.Config != nil || value.LUN != nil || value.LeaseTerm != nil || value.SourceHost != "" {
+		return AutomationPrefix{}, false, fmt.Errorf("invalid automation alternative")
+	}
+	// decodeClaimValue already checked the exact canonical outer bytes and
+	// storage bound. Validate the inner codec once, then hash those exact bytes.
+	decision, err := contract.DecodeDecision(value.Automation.Envelope)
+	if err != nil {
+		return AutomationPrefix{}, false, fmt.Errorf("invalid automation envelope")
+	}
+	if decision.Sequence != sequence {
+		return AutomationPrefix{}, false, fmt.Errorf("automation value does not match key")
+	}
+	h := sha256.New()
+	claimField(h, "litevirt-automation-decision-v1")
+	claimField(h, string(value.Automation.Envelope))
+	if hex.EncodeToString(h.Sum(nil)) != digest {
+		return AutomationPrefix{}, false, fmt.Errorf("automation parent digest mismatch")
+	}
+	return AutomationPrefix{Sequence: sequence, ClusterUID: decision.Command.ClusterUID, Digest: digest}, true, nil
+}
+
+func automationTrustedDigestTx(ctx context.Context, tx *LocalTx, sequence uint64) (string, bool, error) {
+	summary, found, err := automationTrustedSummaryTx(ctx, tx, sequence)
+	return summary.Digest, found, err
 }
 
 func validateAutomationRecordSize(r AutomationRecord) error {
@@ -580,6 +690,11 @@ func validateAutomationRecordSize(r AutomationRecord) error {
 
 func cloneAutomationProjection(projection AutomationProjection) AutomationProjection {
 	callbackProjection := projection
+	if projection.KeyTransition != nil {
+		raw, _ := json.Marshal(projection.KeyTransition)
+		callbackProjection.KeyTransition = new(contract.KeyTransitionProjection)
+		_ = json.Unmarshal(raw, callbackProjection.KeyTransition)
+	}
 	if projection.Existing != nil {
 		existing := *projection.Existing
 		existing.Identity = append([]byte(nil), existing.Identity...)
@@ -699,4 +814,17 @@ func cloneAutomationProjection(projection AutomationProjection) AutomationProjec
 		callbackProjection.Binding = &facts
 	}
 	return callbackProjection
+}
+
+func (c *Client) automationMatchingRecovery(ctx context.Context, sequence uint64, digest string, generation int64, members string) error {
+	return c.ExecuteLocal(ctx, func(tx *LocalTx) error {
+		rows, e := tx.Query(ctx, `SELECT r.sequence,r.digest,r.generation,r.members_hash,s.digest AS staged_digest FROM local_automation_recovery r JOIN local_automation_staging s ON s.sequence=r.sequence WHERE r.id=1 LIMIT 1`)
+		if e != nil {
+			return e
+		}
+		if len(rows) != 1 || rows[0].Int64("sequence") != int64(sequence) || rows[0].String("digest") != digest || rows[0].String("staged_digest") != digest || rows[0].Int64("generation") != generation || rows[0].String("members_hash") != members {
+			return fmt.Errorf("automation recovery belongs to a different certified record")
+		}
+		return nil
+	})
 }

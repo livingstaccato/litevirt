@@ -274,3 +274,7 @@ func (s *Server) dbWorkerEvent(ctx context.Context, name, event string) {
 		s.testDBWorkerEvent(ctx, name, event)
 	}
 }
+
+// SetStackMemberDeleteHookForTest sets the seam DeleteStack calls with each
+// member's name right before deleting it.
+func (s *Server) SetStackMemberDeleteHookForTest(fn func(name string)) { s.stackMemberDeleteHook = fn }

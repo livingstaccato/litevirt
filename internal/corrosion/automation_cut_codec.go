@@ -20,7 +20,7 @@ const automationCutCodec = 1
 
 // Deliberately independent of CurrentSchemaVersion: new provenance requires an
 // explicit inventory review. A future live schema cannot relabel an old cut.
-const automationCutSourceSchema = 74
+const automationCutSourceSchema = 78
 
 // Explicit source descriptors: 69/1 retains its original inventory and root.
 // 70/1 adds only outgoing job pins/publication wrappers/public trust evidence,
@@ -36,10 +36,23 @@ const automationCutSourceSchema = 74
 // issuance observations. Both tables and their fifteen invalidate-only triggers
 // are excluded: they cannot establish cross-node lifecycle or credential proof.
 // Credential digests are never public cut content or certified identity facts.
+// 75/1 adds only inert local audit snapshots and fixed-roster aggregate indexes;
+// these are excluded from source content and confer no import or custody proof.
+// 69..75 above are archived descriptor meanings, independent of the relocated
+// unshipped SQL migration numbers. They must never be relabeled or re-encoded.
+// 76/1 explicitly inventories the current union: incoming credential retirement
+// ordering plus SQL automation69..76. Fence secrets/retirement observations,
+// local lifecycle/credential observations, projections and aggregate indexes
+// remain excluded; the certified section/field codec and archived roots stay
+// unchanged. Credential retirement does not certify a transferable identity.
 // Future lifecycle source-proof transfer and active import receipts require a
 // new inventory and provenance audit; accepting74 does not provide that proof.
+// 77/1 adds three causal key-transition projections, reconstructed from the
+// unchanged certified history sections. Archived69-76 bytes remain unchanged.
+// 78/1 adds node-local receiver-established signed floor artifacts, excluded
+// from public cut content. Archived69-77 descriptors and all bytes stay fixed.
 func supportedAutomationCutDescriptor(schema, codec int) bool {
-	return codec == 1 && (schema == 69 || schema == 70 || schema == 71 || schema == 72 || schema == 73 || schema == 74)
+	return codec == 1 && (schema == 69 || schema == 70 || schema == 71 || schema == 72 || schema == 73 || schema == 74 || schema == 75 || schema == 76 || schema == 77 || schema == 78)
 }
 
 type automationCutInventory struct {

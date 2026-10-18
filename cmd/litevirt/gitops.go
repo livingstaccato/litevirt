@@ -39,8 +39,9 @@ func newGitopsCmd() *cobra.Command {
 		webhook     string
 	)
 	cmd := &cobra.Command{
-		Use:   "gitops --repo <url> [flags]",
-		Short: "Reconcile a Git repo of compose YAMLs into the cluster (GitOps controller)",
+		Use:         "gitops --repo <url> [flags]",
+		Annotations: map[string]string{ownSignalsAnnotation: "true"},
+		Short:       "Reconcile a Git repo of compose YAMLs into the cluster (GitOps controller)",
 		Long: "Run the GitOps reconcile loop: clone --repo, and on every push (or --poll\n" +
 			"tick) diff each changed compose file against the cluster and deploy it.\n" +
 			"Auth to the daemon uses the same dialer as the CLI (LV_HOST / LV_TOKEN).",

@@ -13,12 +13,30 @@ import (
 // signed evidence. All reads are confined to one audit/source/component/key.
 type receiverAuditStore struct {
 	tx                  *LocalTx
+	prepared            *aggregatePreparedReads
 	attempt, source, id string
+	evidenceID          string
 	publication         receiverPublication
+	localID, ownedCutID string
+	localCursor         *AutomationPrefix
+}
+
+// Separate the retained evidence identity from a newly owned scratch namespace.
+func (s receiverAuditStore) evidenceIdentity() string {
+	if s.evidenceID != "" {
+		return s.evidenceID
+	}
+	return s.id
 }
 
 func (s receiverAuditStore) record(ctx context.Context, component int, ordinal int64) (Row, error) {
-	rows, err := s.tx.Query(ctx, `SELECT typeof(record) AS kind,length(CAST(record AS BLOB)) AS size FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component=? AND ordinal=? LIMIT 1`, s.attempt, s.source, component, ordinal)
+	if s.localID != "" {
+		return s.localRecord(ctx, component, ordinal)
+	}
+	if s.ownedCutID != "" {
+		return s.ownedRecord(ctx, component, ordinal)
+	}
+	rows, err := s.query(ctx, `SELECT typeof(record) AS kind,length(CAST(record AS BLOB)) AS size FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component=? AND ordinal=? LIMIT 1`, s.attempt, s.source, component, ordinal)
 	if err != nil {
 		return Row{}, err
 	}
@@ -26,7 +44,7 @@ func (s receiverAuditStore) record(ctx context.Context, component int, ordinal i
 		return Row{}, errors.New("audit record missing or over bound")
 	}
 	n := rows[0].Int64("size")
-	rows, err = s.tx.Query(ctx, `SELECT record FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component=? AND ordinal=? AND typeof(record)='blob' AND length(CAST(record AS BLOB))=? LIMIT 1`, s.attempt, s.source, component, ordinal, n)
+	rows, err = s.query(ctx, `SELECT record FROM local_automation_receiver_records WHERE attempt=? AND source=? AND component=? AND ordinal=? AND typeof(record)='blob' AND length(CAST(record AS BLOB))=? LIMIT 1`, s.attempt, s.source, component, ordinal, n)
 	if err != nil {
 		return Row{}, err
 	}
@@ -49,7 +67,7 @@ func (s receiverAuditStore) record(ctx context.Context, component int, ordinal i
 }
 
 func (s receiverAuditStore) sequence(ctx context.Context, component int, sequence int64) (Row, error) {
-	rows, err := s.tx.Query(ctx, `SELECT ordinal FROM local_automation_receiver_refs WHERE audit=? AND component=? AND sequence=? AND component IN (5,6,8,9,10,11) LIMIT 1`, s.id, component, sequence)
+	rows, err := s.query(ctx, `SELECT ordinal FROM local_automation_receiver_refs WHERE audit=? AND component=? AND sequence=? AND component IN (5,6,8,9,10,11) LIMIT 1`, s.id, component, sequence)
 	if err != nil {
 		return Row{}, err
 	}
@@ -59,10 +77,10 @@ func (s receiverAuditStore) sequence(ctx context.Context, component int, sequenc
 	return s.record(ctx, component, rows[0].Int64("ordinal"))
 }
 
-func (s receiverAuditStore) walk(ctx context.Context, component int, visit func(int64, Row) error) error {
+func (s receiverAuditStore) ordinals(ctx context.Context, component int, visit func(int64) error) error {
 	var ordinal int64
 	for {
-		rows, err := s.tx.Query(ctx, `SELECT ordinal FROM local_automation_receiver_refs WHERE audit=? AND component=? AND ordinal>? ORDER BY ordinal LIMIT 1`, s.id, component, ordinal)
+		rows, err := s.query(ctx, `SELECT ordinal FROM local_automation_receiver_refs WHERE audit=? AND component=? AND ordinal>? ORDER BY ordinal LIMIT 1`, s.id, component, ordinal)
 		if err != nil {
 			return err
 		}
@@ -74,14 +92,20 @@ func (s receiverAuditStore) walk(ctx context.Context, component int, visit func(
 			return errors.New("audit index ordinal gap")
 		}
 		ordinal = next
+		if err = visit(ordinal); err != nil {
+			return err
+		}
+	}
+}
+
+func (s receiverAuditStore) walk(ctx context.Context, component int, visit func(int64, Row) error) error {
+	return s.ordinals(ctx, component, func(ordinal int64) error {
 		row, err := s.record(ctx, component, ordinal)
 		if err != nil {
 			return err
 		}
-		if err = visit(ordinal, row); err != nil {
-			return err
-		}
-	}
+		return visit(ordinal, row)
+	})
 }
 
 func receiverAuditRowTypes(component int, row Row) error {

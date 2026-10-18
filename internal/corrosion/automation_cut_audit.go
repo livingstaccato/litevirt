@@ -43,7 +43,30 @@ func auditAutomationCutTx(ctx context.Context, tx *LocalTx, reduce AutomationRed
 		return old, err
 	}
 	var head AutomationPrefix
-	err = walkAutomationCutRows(ctx, tx, automationCutSections[2], func(row Row) error {
+	err = walkAutomationCutRowIDs(ctx, tx, automationCutSections[2], func(rowid int64) error {
+		// The anchor helper receives metadata only, never a current envelope.
+		metadata, e := tx.Query(ctx, `SELECT sequence,digest,anchor_sequence FROM local_automation_history WHERE rowid=? LIMIT 1`, rowid)
+		if e != nil {
+			return e
+		}
+		if len(metadata) != 1 {
+			return fmt.Errorf("source history disappeared")
+		}
+		if e = auditAutomationCutAnchorTx(ctx, tx, metadata[0]); e != nil {
+			return e
+		}
+		request, e := automationLocalKeyLookupTx(ctx, tx, uint64(metadata[0].Int64("sequence")))
+		if e != nil {
+			return e
+		}
+		prepared := AutomationProjection{Head: head}
+		if e = automationResolveKeyProjectionTx(ctx, tx, stage, &prepared, request, nil); e != nil {
+			return e
+		}
+		row, e := automationCutRowTx(ctx, tx, automationCutSections[2], rowid)
+		if e != nil {
+			return e
+		}
 		seq := row.Int64("sequence")
 		if seq <= 0 || uint64(seq) != head.Sequence+1 || reduce == nil {
 			return fmt.Errorf("source history incomplete or reducer unavailable")
@@ -71,9 +94,6 @@ func auditAutomationCutTx(ctx context.Context, tx *LocalTx, reduce AutomationRed
 		if err = validateAutomationRecordSize(r); err != nil {
 			return err
 		}
-		if err = auditAutomationCutAnchorTx(ctx, tx, row); err != nil {
-			return err
-		}
 		existing, err := automationRequestTx(ctx, tx, AutomationScope(d), d.Command.RequestID)
 		if err != nil {
 			return err
@@ -86,7 +106,7 @@ func auditAutomationCutTx(ctx context.Context, tx *LocalTx, reduce AutomationRed
 		if err != nil {
 			return err
 		}
-		projection := AutomationProjection{Head: head, Existing: existing, Operation: operation, ReplayOriginal: existing != nil && existing.Receipt.Sequence == d.Sequence}
+		projection := AutomationProjection{Head: head, Existing: existing, Operation: operation, ReplayOriginal: existing != nil && existing.Receipt.Sequence == d.Sequence, KeyTransition: prepared.KeyTransition}
 		if err = automationSemanticProjectionTx(ctx, tx, stage, &projection, d); err != nil {
 			return err
 		}

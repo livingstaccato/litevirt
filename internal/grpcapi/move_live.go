@@ -155,6 +155,10 @@ func (s *Server) liveMoveVolume(
 
 	// 3. Poll progress.
 	deadline := time.Now().Add(LiveMoverPivotTimeout)
+	// ready is set only when the job reported the copy caught up (cur >= end).
+	// A job that ended before that (aborted, or failed mid-copy) left a copy
+	// that may be partial, and no config may ever name it.
+	ready := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -194,6 +198,7 @@ func (s *Server) liveMoveVolume(
 		})
 		if st.Cur >= st.End && st.End > 0 {
 			// Caught up — drop out of the polling loop.
+			ready = true
 			break
 		}
 		time.Sleep(LiveMoverPollInterval)
@@ -215,12 +220,7 @@ func (s *Server) liveMoveVolume(
 		if deleteSource {
 			s.deleteSourceIfUnreferenced(ctx, vm, src, send)
 		}
-		return send(&pb.MoveVolumeProgress{
-			Phase:       pb.MoveVolumeProgress_DONE,
-			Status:      "live move complete",
-			BytesCopied: src.SizeBytes,
-			CopyPct:     100,
-		})
+		return sendLiveDone(src, send)
 	}
 
 	// No libvirt backend (libvirt-less test context): there is no persistent config
@@ -252,7 +252,15 @@ func (s *Server) liveMoveVolume(
 		// Auto-pivoted during this mirror — the guest is on dest. Catch up forward-only.
 		return s.liveCatchUpAtDest(ctx, vm, src, destPath, targetPool, dstPool, deleteSource, send)
 	case src.Path:
-		// Not pivoted yet — the safe ordering below.
+		// Not pivoted yet — the safe ordering below, but only for a copy that
+		// caught up. A job that ended before that left a copy that may be
+		// partial: remove it before any define can name it.
+		if !ready {
+			_ = s.liveMover.CancelBlockCopy(vm.Name, src.Path)
+			_ = os.Remove(destPath)
+			return status.Errorf(codes.Internal,
+				"block-copy job ended before the copy caught up; the guest is still on %s, the copy %s was removed and nothing was redefined", src.Path, destPath)
+		}
 	default:
 		// Can't prove which path is live — abort WITHOUT destructive cleanup (don't
 		// remove dst or src, don't roll back); the operator inspects.
@@ -261,8 +269,14 @@ func (s *Server) liveMoveVolume(
 	}
 
 	// Still on src. Redefine persistent → commit DB → pivot, rolling back on failure.
-	cs, origXML, rerr := s.redefineMovedDiskSource(vm, src, destPath)
+	cs, rerr := s.redefineMovedDiskSource(vm, src, destPath)
 	if rerr != nil {
+		// The define may have been stored despite the error. Point the persistent
+		// config back at src while the mirror still tracks it, then stop the mirror;
+		// the dest is removed only once the config is back on src.
+		if !s.rollbackCutover(cutoverRedefined, vm, src, destPath) {
+			return s.liveUnrolledDefine(ctx, vm, src, destPath, commit, deleteSource, send, rerr)
+		}
 		_ = s.liveMover.CancelBlockCopy(vm.Name, src.Path)
 		_ = os.Remove(destPath)
 		return status.Errorf(codes.Internal, "redefine persistent config (cutover aborted): %v", rerr)
@@ -270,7 +284,7 @@ func (s *Server) liveMoveVolume(
 	if err := commit(); err != nil {
 		// Roll persistent back; only remove the dest when it's no longer referenced
 		// (rollbackCutover keeps it for the already-at-dst / rollback-failed cases).
-		safe := s.rollbackCutover(cs, vm.Name, origXML)
+		safe := s.rollbackCutover(cs, vm, src, destPath)
 		_ = s.liveMover.CancelBlockCopy(vm.Name, src.Path)
 		if safe {
 			_ = os.Remove(destPath)
@@ -290,7 +304,7 @@ func (s *Server) liveMoveVolume(
 			slog.Error("live move: pivot failed and DB rollback to src also failed — DB records dest but guest is on src; operator must reconcile",
 				"vm", vm.Name, "disk", src.DiskName, "pivot_error", err, "db_rollback_error", dbErr)
 		}
-		safe := s.rollbackCutover(cs, vm.Name, origXML)
+		safe := s.rollbackCutover(cs, vm, src, destPath)
 		_ = s.liveMover.CancelBlockCopy(vm.Name, src.Path)
 		if safe {
 			_ = os.Remove(destPath)
@@ -300,6 +314,100 @@ func (s *Server) liveMoveVolume(
 
 	// Pivot succeeded: live=dest, persistent=dest, DB=dest all agree.
 	return done()
+}
+
+// sendLiveDone sends the terminal frame of a completed live move.
+func sendLiveDone(src *corrosion.DiskRecord, send func(*pb.MoveVolumeProgress) error) error {
+	return send(&pb.MoveVolumeProgress{
+		Phase:       pb.MoveVolumeProgress_DONE,
+		Status:      "live move complete",
+		BytesCopied: src.SizeBytes,
+		CopyPct:     100,
+	})
+}
+
+// liveUnrolledDefine handles a double fault on the live path: the redefine
+// reported an error and pointing the persistent config back at src failed too,
+// so the config may name destPath. The running guest and the persistent config
+// must name the same file. The caller reaches this only with a copy that caught
+// up (the job reported cur >= end), so the job can still be pivoted.
+//
+// When the config names destPath, the guest is pivoted onto it and the disk row
+// follows; the move then completes as a normal one does, with a warning, and the
+// source is deleted only when that was asked for and the config does not name it.
+// When the pivot fails, or the config cannot be read, the mirror is left running
+// rather than cancelled: it keeps destPath current with every write the guest
+// makes to src, so whichever file the config names holds the guest's data.
+// Cancelling it would leave a config that names a copy no longer receiving
+// writes, and the next cold start would boot stale data. Nothing is deleted
+// except a source the completed move was asked to delete.
+func (s *Server) liveUnrolledDefine(ctx context.Context, vm *corrosion.VMRecord, src *corrosion.DiskRecord, destPath string, commit func() error, deleteSource bool, send func(*pb.MoveVolumeProgress) error, defineErr error) error {
+	disk := src.TargetDev
+	if disk == "" {
+		disk = src.Path
+	}
+	pivotCmd := fmt.Sprintf("virsh blockjob %s %s --pivot", vm.Name, disk)
+	abortCmd := fmt.Sprintf("virsh blockjob %s %s --abort", vm.Name, disk)
+
+	cs, _, perr := s.planCutover(vm, src, destPath)
+	switch {
+	case perr == nil && cs == cutoverAlreadyAtDst:
+		if err := s.liveMover.PivotBlockCopy(vm.Name, src.Path); err != nil {
+			slog.Error("live move: redefine failed, the rollback failed, and the pivot onto the copy the config names failed — mirror left running, both files kept; operator must pivot or roll back",
+				"vm", vm.Name, "disk", src.DiskName, "config_names", destPath, "guest_writes", src.Path, "define_error", defineErr, "pivot_error", err)
+			return status.Errorf(codes.Internal,
+				"redefine persistent config failed (%v) and could not be pointed back at %s, and the pivot onto the copy failed (%v): "+
+					"the persistent config names %s, but the guest is writing %s. The block-copy mirror into %s is left running so the copy stays current; "+
+					"both files are kept and the disk row still names %s. Do not stop or restart the VM until this is resolved: the mirror ends with the guest. "+
+					"Operator: either run `%s` and then point the disk row at %s, or define the persistent config back to %s and then run `%s`",
+				defineErr, src.Path, err, destPath, src.Path, destPath, src.Path, pivotCmd, destPath, src.Path, abortCmd)
+		}
+		if err := commit(); err != nil {
+			slog.Error("live move: pivoted onto the copy the config names after a failed redefine and rollback, but the disk row could not follow; operator must point the disk row at the copy",
+				"vm", vm.Name, "disk", src.DiskName, "dest", destPath, "error", err)
+			return status.Errorf(codes.Internal,
+				"redefine persistent config failed (%v) and could not be pointed back at %s, so the guest was pivoted onto %s, which the persistent config names; "+
+					"the disk row could not be updated (%v) and still names %s: point it at %s. The source %s is kept",
+				defineErr, src.Path, destPath, err, src.Path, destPath, src.Path)
+		}
+		// Completed: the guest, the persistent config and the disk row name the
+		// copy. A libvirt define reported an error on the way, so say so.
+		detail := fmt.Sprintf("%s: the define of the new path reported an error (%v) and could not be undone, so the guest was pivoted onto %s, which the persistent config names; the move completed",
+			src.DiskName, defineErr, destPath)
+		slog.Warn("live move: "+detail, "vm", vm.Name)
+		s.recordVMEventSeverity(ctx, vm.Name, "disk.moved", "ok", "warning", detail)
+		_ = send(&pb.MoveVolumeProgress{Phase: pb.MoveVolumeProgress_CUTOVER, Status: "warning: " + detail})
+		if deleteSource {
+			// This path saw a libvirt define error: delete the source only when the
+			// persistent config is read and does not name it.
+			if s.persistentNamesPath(vm, src.Path) {
+				_ = send(&pb.MoveVolumeProgress{
+					Phase:  pb.MoveVolumeProgress_CLEANUP,
+					Status: "source kept: the persistent config may still name " + src.Path,
+				})
+			} else {
+				s.deleteSourceIfUnreferenced(ctx, vm, src, send)
+			}
+		}
+		return sendLiveDone(src, send)
+	case perr == nil && cs == cutoverRedefined:
+		// The config names src after all (the rollback failed to read or define
+		// it, not because it names the copy): the guest and the config agree, so
+		// the mirror can stop. The copy is kept.
+		_ = s.liveMover.CancelBlockCopy(vm.Name, src.Path)
+		return status.Errorf(codes.Internal,
+			"redefine persistent config (cutover aborted; the guest and the persistent config name %s; the copy %s is kept): %v",
+			src.Path, destPath, defineErr)
+	default:
+		slog.Error("live move: redefine failed, the rollback failed, and the persistent config could not be read or names neither file — mirror left running, both files kept; operator must reconcile",
+			"vm", vm.Name, "disk", src.DiskName, "dest", destPath, "guest_writes", src.Path, "define_error", defineErr, "read_error", perr)
+		return status.Errorf(codes.Internal,
+			"redefine persistent config failed (%v) and could not be pointed back at %s, and the persistent config could not be read or names neither file (%v), so it may name %s or %s: "+
+				"the guest is writing %s and the block-copy mirror into %s is left running so both files stay current; both are kept and the disk row still names %s. "+
+				"Do not stop or restart the VM until this is resolved: the mirror ends with the guest. "+
+				"Operator: read the config (virsh dumpxml --inactive %s); if it names %s, run `%s` and point the disk row at %s, otherwise run `%s`",
+			defineErr, src.Path, perr, src.Path, destPath, src.Path, destPath, src.Path, vm.Name, destPath, pivotCmd, destPath, abortCmd)
+	}
 }
 
 // liveMovePlacementErr maps the strict UpdateDiskPlacement error to a deliberate gRPC
@@ -317,7 +425,7 @@ func liveMovePlacementErr(err error) error {
 // and NEVER touches destPath (the live disk) or rolls back to src. On a commit failure
 // it keeps dest and surfaces a reconcile error. No block-copy job runs here.
 func (s *Server) liveCatchUpAtDest(ctx context.Context, vm *corrosion.VMRecord, src *corrosion.DiskRecord, destPath, targetPool string, dstPool StoragePoolRef, deleteSource bool, send func(*pb.MoveVolumeProgress) error) error {
-	if _, _, rerr := s.redefineMovedDiskSource(vm, src, destPath); rerr != nil {
+	if _, rerr := s.redefineMovedDiskSource(vm, src, destPath); rerr != nil {
 		return status.Errorf(codes.Internal, "redefine persistent config (guest already on dest): %v", rerr)
 	}
 	if err := corrosion.UpdateDiskPlacement(ctx, s.db, vm.Name, src.DiskName, vm.HostName, destPath, dstPool.Driver, targetPool); err != nil {

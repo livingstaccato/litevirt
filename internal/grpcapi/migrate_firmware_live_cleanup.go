@@ -118,15 +118,15 @@ func (s *Server) fwmigCleanupSourceAs(ctx context.Context, m fwmig.Marker, byOpe
 		return s.liveFirmwareCleanupStopped(ctx, m, "write the retained bundle", err)
 	}
 	if !byOperator && s.db != nil {
-		// Held while the target is proved off, fenced at all, or no longer
-		// a member (`lv host rm --dead` leaves no row to be fenced on):
-		// re-review 2, I-A.
+		// Held unless the target is positively alive: active, and answering
+		// a records call now. Offline, fenced, removed or unknown all hold
+		// (re-review 3, I-1).
 		h, off, err := s.fwTargetProvedOff(ctx, m.Target)
 		if err != nil {
 			return s.liveFirmwareCleanupStopped(ctx, m, "read whether the target is proved off", err)
 		}
-		if off || h == nil || h.State == "removed" || h.State == "fenced" {
-			return s.liveFirmwareCleanupStopped(ctx, m, "undefine the leftover definition", errFirmwareCleanupTargetOff)
+		if herr := s.cleanupTargetNotAlive(ctx, m, h, off); herr != nil {
+			return s.liveFirmwareCleanupStopped(ctx, m, "undefine the leftover definition", herr)
 		}
 	}
 	if err := s.undefineLiveFirmwareLeftover(m); err != nil {
@@ -186,9 +186,7 @@ func (s *Server) liveFirmwareCleanupStopped(ctx context.Context, m fwmig.Marker,
 		action = "the VM was returned here, so its firmware state here is its own and the cleanup does not take it: " +
 			"`lv doctor firmware-move <vm> --accept-source --acknowledge-rollback` finishes the return"
 	case errors.Is(cause, errFirmwareCleanupTargetOff):
-		action = "the target is fenced, proved off or removed, so the source's copy may be the only one that can still run: it is kept, defined and not wiped. " +
-			"`lv doctor firmware-move <vm> --accept-source --acknowledge-rollback` returns the VM here; `--accept-target` takes the target's copy " +
-			"(the source's state quarantined); the cleanup goes on by itself once the target is an active member again"
+		action = cleanupTargetHoldAction(m, cause)
 	case errors.Is(cause, errFirmwareCleanupStateChanged):
 		action = "the VM runs on the target from the verified copy; the source's firmware state changed after the cutover, " +
 			"so it is kept and never wiped automatically, and a retry cannot heal it: `lv doctor firmware-move <vm> --accept-target` " +
@@ -246,9 +244,55 @@ var errFirmwareCleanupStateChanged = errors.New("changed after the cutover")
 // incarnation; its state here is the VM's again.
 var errFirmwareCleanupReturned = errors.New("the VM was returned here: its row names this host")
 
-// errFirmwareCleanupTargetOff: the target is fenced, proved off or no longer
-// a member, so the source's copy may be the only one that can still run.
-var errFirmwareCleanupTargetOff = errors.New("the target is fenced, proved off or no longer a member")
+// errFirmwareCleanupTargetOff: the target is not positively alive, so the
+// source's copy may be the only one that can still run. A hold's cause is a
+// *cleanupTargetHold, which matches it.
+var errFirmwareCleanupTargetOff = errors.New("the target is not positively alive")
+
+// cleanupTargetHold is why an automatic cleanup holds before the undefine.
+type cleanupTargetHold struct {
+	provedOff bool // the doctor's --accept-source works now
+	why       string
+}
+
+func (e *cleanupTargetHold) Error() string        { return e.why }
+func (e *cleanupTargetHold) Is(target error) bool { return target == errFirmwareCleanupTargetOff }
+
+// cleanupTargetNotAlive is nil only when m's target is positively alive: its
+// state (h, as fwTargetProvedOff read it) is active and it answers a records
+// call for the VM now. Anything else, an unreadable answer included, is a
+// hold (re-review 3, I-1): a target lost but not yet fenced is offline, and
+// stays so until the fencer or an operator acts.
+func (s *Server) cleanupTargetNotAlive(ctx context.Context, m fwmig.Marker, h *corrosion.HostRecord, provedOff bool) error {
+	switch {
+	case provedOff:
+		return &cleanupTargetHold{provedOff: true, why: fmt.Sprintf("the target %s is proved off", m.Target)}
+	case h == nil || h.State == "removed":
+		return &cleanupTargetHold{why: fmt.Sprintf("the target %s is no longer a member, and is not proved off", m.Target)}
+	case h.State != "active":
+		return &cleanupTargetHold{why: fmt.Sprintf("the target %s is %s, not active", m.Target, h.State)}
+	}
+	if _, err := s.inspectFirmwareMoveHost(ctx, m.Target, m.VM); err != nil {
+		slog.Warn("live firmware move: the target does not answer; the source cleanup holds", "vm", m.VM, "attempt", m.Attempt, "target", m.Target, "error", err)
+		return &cleanupTargetHold{why: fmt.Sprintf("the target %s is active, but does not answer", m.Target)}
+	}
+	return nil
+}
+
+// cleanupTargetHoldAction is the action text of a hold: --accept-target
+// always works; --accept-source only once the target is proved off.
+func cleanupTargetHoldAction(m fwmig.Marker, cause error) string {
+	head := "the source's copy may be the only one that can still run: it is kept, defined and not wiped. "
+	resume := "The cleanup goes on by itself at the next pass once the target is active and answers again"
+	var h *cleanupTargetHold
+	if errors.As(cause, &h) && h.provedOff {
+		return head + "`lv doctor firmware-move <vm> --accept-source --acknowledge-rollback` returns the VM here; " +
+			"`lv doctor firmware-move <vm> --accept-target` takes the target's copy (the source's state quarantined). " + resume
+	}
+	return head + "`lv doctor firmware-move <vm> --accept-target` takes the target's copy (the source's state quarantined) and works now. " +
+		fmt.Sprintf("To return the VM here instead, power the target off and run `lv host fence-confirm %s` first; ", m.Target) +
+		"then `lv doctor firmware-move <vm> --accept-source --acknowledge-rollback` returns it. " + resume
+}
 
 // writeRetainedFirmwareBundle is §6.7 step 2. A bundle of the attempt already
 // there is the one an earlier pass wrote (it is renamed into place only once

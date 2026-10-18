@@ -164,6 +164,38 @@ func fwliveRestartResolve(t *testing.T, n *Node, code string) {
 // under the call: the caller sees its connection go.
 var fwliveRestartStoppedHere = status.Error(codes.Unavailable, "the daemon was restarted under this call")
 
+// fwliveRestartCleanupCrash runs the move until the source daemon dies in its
+// cleanup, about to undefine the leftover (§6.7 step 3): marker
+// cleaning, the retained bundle written, the leftover still defined.
+func fwliveRestartCleanupCrash(t *testing.T, c *Cluster, src, dst *Node, beforeDeath func()) fwmig.Marker {
+	t.Helper()
+	src.LandMigrationsOn(dst)
+	reached := make(chan struct{})
+	var once atomic.Bool
+	src.Virt.FailUndefinePreserv = func(name string) error {
+		if name == fwwVM && once.CompareAndSwap(false, true) {
+			close(reached)
+			<-fwliveRestartNever // the daemon died here
+			return errors.New("the daemon died in this call")
+		}
+		return nil
+	}
+	done := fwliveMigrate(t, c, src, dst)
+	fwliveRestartReach(t, reached, done, "the source cleanup's undefine")
+	if beforeDeath != nil {
+		beforeDeath()
+	}
+	fwliveRestartDown(src)
+	m, ok := fwliveMarker(t, src)
+	if !ok || m.Phase != fwmig.PhaseCleaning {
+		t.Fatalf("marker %+v (present %v), want cleaning", m, ok)
+	}
+	if st := fwliveState(src); st != string(libvirtfake.StateShutdown) {
+		t.Fatalf("%s's leftover is %s, want defined and shut off", src.Name, st)
+	}
+	return m
+}
+
 // ── F-5: source daemon restart at each phase ──
 
 // fwliveRestartCrashMigrating runs the move until the source daemon dies
@@ -482,37 +514,7 @@ func TestFleet_FwLiveRestart_F5_SourceRestartAtEachPhase(t *testing.T) {
 		fwliveMoved(t, src, dst)
 	})
 
-	// cleanupCrash runs the move until the source daemon dies in its
-	// cleanup, about to undefine the leftover (§6.7 step 3): marker
-	// cleaning, the retained bundle written, the leftover still defined.
-	cleanupCrash := func(t *testing.T, c *Cluster, src, dst *Node, beforeDeath func()) fwmig.Marker {
-		t.Helper()
-		src.LandMigrationsOn(dst)
-		reached := make(chan struct{})
-		var once atomic.Bool
-		src.Virt.FailUndefinePreserv = func(name string) error {
-			if name == fwwVM && once.CompareAndSwap(false, true) {
-				close(reached)
-				<-fwliveRestartNever // the daemon died here
-				return errors.New("the daemon died in this call")
-			}
-			return nil
-		}
-		done := fwliveMigrate(t, c, src, dst)
-		fwliveRestartReach(t, reached, done, "the source cleanup's undefine")
-		if beforeDeath != nil {
-			beforeDeath()
-		}
-		fwliveRestartDown(src)
-		m, ok := fwliveMarker(t, src)
-		if !ok || m.Phase != fwmig.PhaseCleaning {
-			t.Fatalf("marker %+v (present %v), want cleaning", m, ok)
-		}
-		if st := fwliveState(src); st != string(libvirtfake.StateShutdown) {
-			t.Fatalf("%s's leftover is %s, want defined and shut off", src.Name, st)
-		}
-		return m
-	}
+	cleanupCrash := fwliveRestartCleanupCrash
 	bundle := func(src *Node, m fwmig.Marker) string {
 		return filepath.Join(src.FW.DataDir, fwmig.RetainedDir, fwwVM+"-"+m.Attempt+".tar")
 	}

@@ -72,6 +72,10 @@ type AntiEntropy struct {
 	// changed (antientropy_driftlog.go).
 	drift driftLog
 	conns aeConnPool
+	// owned is set while Start's loop runs: the pool then persists across
+	// passes, and Start closes it when the loop ends. A pass no loop owns
+	// closes its connections when it ends.
+	owned atomic.Bool
 }
 
 // probationPullFunc pulls a peer's used records and voter view for a probation
@@ -128,6 +132,7 @@ const catchUpRetry = 2 * time.Second
 // replica caught up is unchanged — only how soon the exchange is attempted.
 func (ae *AntiEntropy) Start(ctx context.Context) {
 	slog.Info("anti-entropy: starting", "interval", ae.interval)
+	ae.owned.Store(true)
 	defer ae.Close()
 	wake := ae.client.ReplicaStaleWake()
 	// A small spread on the first try: a whole cluster booting at once would
@@ -283,6 +288,8 @@ func (ae *AntiEntropy) checkPeerSet(ctx context.Context, choose func([]PeerInfo)
 	gen := ae.client.replicaFreshnessGen()
 	peers := ae.client.Members()
 	if len(peers) == 0 {
+		// Every pooled connection is to a peer this node no longer sees.
+		ae.conns.closeAll()
 		ae.client.MarkReplicaStale("sees no gossip peers (anti-entropy)")
 		return false
 	}
@@ -369,6 +376,16 @@ func (ae *AntiEntropy) checkPeerSet(ctx context.Context, choose func([]PeerInfo)
 		}
 		cancel()
 	}
+	// Outside Start's loop, or once the pool is closed, nothing would close
+	// these connections later.
+	if !ae.poolPersists() {
+		for _, ex := range exchanges {
+			if ex != nil {
+				ex.pc.close()
+			}
+		}
+		ae.conns.closeAll()
+	}
 	return true
 }
 
@@ -376,6 +393,7 @@ func (ae *AntiEntropy) checkPeerSet(ctx context.Context, choose func([]PeerInfo)
 // others' (openExchange): its pooled client and its two digests.
 type peerExchange struct {
 	peer   string
+	pc     *aePooledConn
 	client pb.LiteVirtClient
 	// digest is the peer's public digest.
 	digest *pb.StateDigestResponse
@@ -426,22 +444,28 @@ func (ae *AntiEntropy) mergeSourceRefused(ctx context.Context, peerName string) 
 // public digest — and such a peer proves nothing about the local replica.
 func (ae *AntiEntropy) openExchange(ctx context.Context, peerName string, sensitiveMap map[string]TableDigest, full bool) *peerExchange {
 	if ae.mergeSourceRefused(ctx, peerName) {
+		// Nothing checks a refused peer's connection for age or a changed
+		// row while the refusal stands; it is dialled again once it lifts.
+		ae.conns.dropPeer(peerName)
 		return nil
 	}
-	pc, err := ae.pooledPeerClient(ctx, peerName)
+	pc, fresh, err := ae.pooledPeerClient(ctx, peerName)
 	if err != nil {
 		slog.Debug("anti-entropy: cannot reach peer", "peer", peerName, "error", err)
 		return nil
 	}
-	client := pc.client
-
-	dctx, dcancel := context.WithTimeout(ctx, antiEntropyDigestTimeout)
-	if full {
-		// The operator's pass compares what the peer holds now.
-		dctx = WithFreshDigest(dctx)
+	resp, err := ae.askDigest(ctx, pc, full)
+	if err != nil && !fresh && status.Code(err) == codes.Unavailable {
+		// A reused connection whose transport died under it — a peer that
+		// rebooted without closing it — is tried once more on a fresh dial,
+		// so the pass does not lose its exchange with that peer.
+		ae.conns.drop(peerName, pc)
+		if pc, _, err = ae.pooledPeerClient(ctx, peerName); err != nil {
+			slog.Debug("anti-entropy: cannot reach peer", "peer", peerName, "error", err)
+			return nil
+		}
+		resp, err = ae.askDigest(ctx, pc, full)
 	}
-	resp, err := client.GetStateDigest(dctx, &emptypb.Empty{})
-	dcancel()
 	if err != nil {
 		slog.Debug("anti-entropy: digest RPC error", "peer", peerName, "error", err)
 		// The next pass dials afresh rather than wait out the connection's
@@ -449,12 +473,25 @@ func (ae *AntiEntropy) openExchange(ctx context.Context, peerName string, sensit
 		ae.conns.drop(peerName, pc)
 		return nil
 	}
+	client := pc.client
 	return &peerExchange{
 		peer:      peerName,
+		pc:        pc,
 		client:    client,
 		digest:    resp,
 		sensitive: ae.sensitiveDigest(ctx, client, peerName, sensitiveMap, full),
 	}
+}
+
+// askDigest asks pc's peer for its public digest, under the digest budget.
+func (ae *AntiEntropy) askDigest(ctx context.Context, pc *aePooledConn, full bool) (*pb.StateDigestResponse, error) {
+	dctx, dcancel := context.WithTimeout(ctx, antiEntropyDigestTimeout)
+	defer dcancel()
+	if full {
+		// The operator's pass compares what the peer holds now.
+		dctx = WithFreshDigest(dctx)
+	}
+	return pc.client.GetStateDigest(dctx, &emptypb.Empty{})
 }
 
 // finishExchange is the half of one peer's exchange a pass runs one peer at a
@@ -467,6 +504,7 @@ func (ae *AntiEntropy) openExchange(ctx context.Context, peerName string, sensit
 func (ae *AntiEntropy) finishExchange(ctx context.Context, ex *peerExchange, localMap map[string]TableDigest, full bool) bool {
 	peerName, client, resp := ex.peer, ex.client, ex.digest
 	if ae.mergeSourceRefused(ctx, peerName) {
+		ae.conns.drop(peerName, ex.pc)
 		return false
 	}
 	completed := true
@@ -770,8 +808,10 @@ func (ae *AntiEntropy) peerClient(ctx context.Context, peerName string) (pb.Lite
 	return pb.NewLiteVirtClient(conn), conn, nil
 }
 
-// antiEntropyPeerTimeout bounds one peer's whole anti-entropy exchange: digest,
-// and when the digests disagree, the dump of the mismatched tables and its merge.
+// antiEntropyPeerTimeout bounds each half of one peer's anti-entropy exchange
+// on its own: the digests (openExchange), and, when they disagree, the dump of
+// the mismatched tables and its merge (finishExchange). A peer's exchange can
+// therefore take up to twice this.
 //
 // Generous on purpose. A total deadline cannot tell an idle hang from a slow
 // transfer, and cutting a legitimate dump short is worse than the hang — it

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -35,9 +36,15 @@ var antiEntropyConnMaxAge = 10 * time.Minute
 // A pass also drops the connection of every peer no longer a member, and of a
 // peer whose digest failed, so the next pass dials afresh instead of waiting
 // out gRPC's reconnect backoff.
+//
+// The pool persists across passes only under Start's loop (AntiEntropy.owned).
+// A pass no loop owns, or one that runs after Close, closes every connection
+// it used when it ends, so an AntiEntropy built for a pass or two leaks
+// nothing; a closed pool never takes a connection back.
 type aeConnPool struct {
-	mu    sync.Mutex
-	conns map[string]*aePooledConn
+	mu     sync.Mutex
+	conns  map[string]*aePooledConn
+	closed bool
 }
 
 type aePooledConn struct {
@@ -74,13 +81,15 @@ func (p *aeConnPool) lookup(peer string) *aePooledConn {
 }
 
 // get returns a connection to peer dialled against key, reusing the pooled one
-// when it was dialled against the same key and is young enough.
-func (p *aeConnPool) get(peer, key string, dial func() (*grpc.ClientConn, error)) (*aePooledConn, error) {
+// when it was dialled against the same key and is young enough. fresh is true
+// when it was dialled now. On a closed pool the connection is not pooled, and
+// the caller closes it.
+func (p *aeConnPool) get(peer, key string, dial func() (*grpc.ClientConn, error)) (pc *aePooledConn, fresh bool, err error) {
 	p.mu.Lock()
 	cur := p.conns[peer]
 	if cur != nil && cur.key == key && time.Since(cur.born) < antiEntropyConnMaxAge && !cur.isClosed() {
 		p.mu.Unlock()
-		return cur, nil
+		return cur, false, nil
 	}
 	delete(p.conns, peer)
 	p.mu.Unlock()
@@ -89,10 +98,14 @@ func (p *aeConnPool) get(peer, key string, dial func() (*grpc.ClientConn, error)
 	}
 	conn, err := dial()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	pc := &aePooledConn{key: key, born: time.Now(), conn: conn, client: pb.NewLiteVirtClient(conn), closed: make(chan struct{})}
+	pc = &aePooledConn{key: key, born: time.Now(), conn: conn, client: pb.NewLiteVirtClient(conn), closed: make(chan struct{})}
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return pc, true, nil
+	}
 	if p.conns == nil {
 		p.conns = make(map[string]*aePooledConn)
 	}
@@ -102,7 +115,25 @@ func (p *aeConnPool) get(peer, key string, dial func() (*grpc.ClientConn, error)
 	if prev != nil {
 		prev.close()
 	}
-	return pc, nil
+	return pc, true, nil
+}
+
+// isClosed reports whether Close has closed the pool.
+func (p *aeConnPool) isClosed() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.closed
+}
+
+// dropPeer closes and forgets peer's pooled connection, if any.
+func (p *aeConnPool) dropPeer(peer string) {
+	p.mu.Lock()
+	pc := p.conns[peer]
+	delete(p.conns, peer)
+	p.mu.Unlock()
+	if pc != nil {
+		pc.close()
+	}
 }
 
 // drop closes and forgets pc, if it is still peer's pooled connection.
@@ -134,16 +165,29 @@ func (p *aeConnPool) retain(keep map[string]bool) {
 // closeAll closes every pooled connection.
 func (p *aeConnPool) closeAll() { p.retain(nil) }
 
-// Close closes the connections anti-entropy keeps to its peers. Start calls it
-// when its loop ends; a pass run afterwards dials again.
-func (ae *AntiEntropy) Close() { ae.conns.closeAll() }
+// Close closes the connections anti-entropy keeps to its peers, and the pool
+// with them. Start calls it when its loop ends. A pass run afterwards still
+// dials its peers, and closes those connections when it ends.
+func (ae *AntiEntropy) Close() {
+	ae.conns.mu.Lock()
+	ae.conns.closed = true
+	ae.conns.mu.Unlock()
+	ae.conns.closeAll()
+}
+
+// poolPersists reports whether this pass's connections stay pooled after it:
+// only under Start's loop, and never once the pool is closed.
+func (ae *AntiEntropy) poolPersists() bool {
+	return ae.owned.Load() && !ae.conns.isClosed()
+}
 
 // pooledPeerClient returns a client for peer from the pool, dialling when the
-// pool holds none that is still valid (see aeConnPool).
-func (ae *AntiEntropy) pooledPeerClient(ctx context.Context, peer string) (*aePooledConn, error) {
+// pool holds none that is still valid (see aeConnPool). fresh is true when it
+// was dialled now.
+func (ae *AntiEntropy) pooledPeerClient(ctx context.Context, peer string) (pc *aePooledConn, fresh bool, err error) {
 	target, host, err := resolvePeerEndpoint(ctx, ae.client, peer)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	key := target
 	if host != nil {
@@ -153,13 +197,19 @@ func (ae *AntiEntropy) pooledPeerClient(ctx context.Context, peer string) (*aePo
 	return ae.conns.get(peer, key, func() (*grpc.ClientConn, error) { return ae.dialPeer(target) })
 }
 
-// pkiStamp identifies the state of this node's own PKI files: their sizes and
-// modification times. A change to any of them changes the stamp.
+// pkiStamp identifies the state of this node's own PKI files: their inodes,
+// sizes and modification times. A change to any of them changes the stamp —
+// the inode included, so two installs of the same size inside one mtime tick
+// are still told apart (crlChecker stamps the CRL the same way).
 func pkiStamp(dir string) string {
 	s := ""
 	for _, f := range []string{"ca.crt", "host.crt", "host.key", "crl.pem"} {
 		if fi, err := os.Stat(filepath.Join(dir, f)); err == nil {
-			s += fmt.Sprintf("%s:%d:%d;", f, fi.Size(), fi.ModTime().UnixNano())
+			var ino uint64
+			if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+				ino = uint64(st.Ino) //nolint:unconvert // Ino is uint32 on some platforms
+			}
+			s += fmt.Sprintf("%s:%d:%d:%d;", f, ino, fi.Size(), fi.ModTime().UnixNano())
 		} else {
 			s += f + ":-;"
 		}

@@ -47,12 +47,18 @@ type slowPeer struct {
 	f        *inflight
 	calls    atomic.Int32
 	failNext atomic.Bool
+	// failCode is the code failNext fails with; zero is Internal.
+	failCode atomic.Int32
 }
 
 func (p *slowPeer) GetStateDigest(ctx context.Context, _ *emptypb.Empty) (*pb.StateDigestResponse, error) {
 	p.calls.Add(1)
 	if p.failNext.CompareAndSwap(true, false) {
-		return nil, status.Error(codes.Internal, "injected failure")
+		code := codes.Code(p.failCode.Load())
+		if code == codes.OK {
+			code = codes.Internal
+		}
+		return nil, status.Error(code, "injected failure")
 	}
 	if p.f != nil {
 		p.f.enter()
@@ -66,18 +72,46 @@ func (p *slowPeer) GetStateDigest(ctx context.Context, _ *emptypb.Empty) (*pb.St
 	return &pb.StateDigestResponse{}, nil
 }
 
-// countingListener counts the TCP connections a peer accepted: one per dial.
+// countingListener counts the TCP connections a peer accepted (one per dial)
+// and how many of them are still open.
 type countingListener struct {
 	net.Listener
 	accepts atomic.Int32
+	closes  atomic.Int32
 }
 
 func (l *countingListener) Accept() (net.Conn, error) {
 	c, err := l.Listener.Accept()
-	if err == nil {
-		l.accepts.Add(1)
+	if err != nil {
+		return c, err
 	}
-	return c, err
+	l.accepts.Add(1)
+	return &countedConn{Conn: c, l: l}, nil
+}
+
+func (l *countingListener) open() int32 { return l.accepts.Load() - l.closes.Load() }
+
+type countedConn struct {
+	net.Conn
+	l    *countingListener
+	once sync.Once
+}
+
+func (c *countedConn) Close() error {
+	c.once.Do(func() { c.l.closes.Add(1) })
+	return c.Conn.Close()
+}
+
+// waitOpen waits for ln to have want connections open.
+func waitOpen(t *testing.T, ln *countingListener, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for ln.open() != want && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := ln.open(); got != want {
+		t.Errorf("%d connections open at the peer, want %d", got, want)
+	}
 }
 
 // servePeer serves p over mTLS on 127.0.0.1 and returns its port and its
@@ -121,11 +155,12 @@ func aeMembers(names ...string) func() []PeerInfo {
 	}
 }
 
-// newTestAE builds an AntiEntropy whose pooled connections are closed when the
-// test ends.
+// newTestAE builds an AntiEntropy whose pool persists across passes, as it
+// does under Start's loop, and is closed when the test ends.
 func newTestAE(t *testing.T, c *Client, pkiDir string) *AntiEntropy {
 	t.Helper()
 	ae := NewAntiEntropy(c, pkiDir, time.Minute)
+	ae.owned.Store(true)
 	t.Cleanup(ae.Close)
 	return ae
 }
@@ -320,11 +355,13 @@ func TestCheckPeers_RedialsWhenTheLocalPKIChanges(t *testing.T) {
 	}
 }
 
-// Close closes every pooled connection, and a pass after it still works.
+// Close closes every pooled connection. A pass after it still checks its
+// peers, and leaves no connection behind.
 func TestAntiEntropy_CloseClosesThePool(t *testing.T) {
 	pkiDir := testPKI(t, "self")
 	c := newPruneTestClient(t)
-	port, _ := servePeer(t, pkiDir, &slowPeer{})
+	p := &slowPeer{}
+	port, ln := servePeer(t, pkiDir, p)
 	addPeerHost(t, c, "peer-a", port, "")
 	c.SetMembersForTests(aeMembers("peer-a"))
 	ae := newTestAE(t, c, pkiDir)
@@ -337,12 +374,148 @@ func TestAntiEntropy_CloseClosesThePool(t *testing.T) {
 	if !pc.isClosed() {
 		t.Error("Close left a pooled connection open")
 	}
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() { defer wg.Done(); ae.checkPeers(context.Background()) }()
-	wg.Wait()
+	ae.checkPeers(context.Background())
+	if p.calls.Load() != 2 {
+		t.Errorf("%d digest calls, want 2: a pass after Close must still check its peers", p.calls.Load())
+	}
+	if ae.conns.lookup("peer-a") != nil {
+		t.Error("a pass after Close put a connection back into the closed pool")
+	}
+	waitOpen(t, ln, 0)
+}
+
+// An AntiEntropy whose pool no Start loop owns — a test's, or one built for a
+// single pass — closes its connections when the pass ends. Each exchange used
+// to close its own; a pool nobody closes holds an mTLS transport per peer,
+// both ends' descriptors and their goroutines, until gRPC's idle timeout.
+func TestAntiEntropy_APassWithoutStartLeavesNoConnection(t *testing.T) {
+	pkiDir := testPKI(t, "self")
+	c := newPruneTestClient(t)
+	var lns []*countingListener
+	var names []string
+	for _, name := range []string{"peer-a", "peer-b"} {
+		port, ln := servePeer(t, pkiDir, &slowPeer{})
+		addPeerHost(t, c, name, port, "")
+		lns = append(lns, ln)
+		names = append(names, name)
+	}
+	c.SetMembersForTests(aeMembers(names...))
+	ae := NewAntiEntropy(c, pkiDir, time.Minute)
+	if !ae.RunOnce(context.Background()) {
+		t.Fatal("precondition: the pass did not run")
+	}
+	for i, ln := range lns {
+		if ln.accepts.Load() != 1 {
+			t.Fatalf("precondition: %s accepted %d connections, want 1", names[i], ln.accepts.Load())
+		}
+		waitOpen(t, ln, 0)
+		if ae.conns.lookup(names[i]) != nil {
+			t.Errorf("%s is still pooled after a pass no Start loop owns", names[i])
+		}
+	}
+}
+
+// A node that loses every gossip peer closes its pooled connections; they
+// are all to peers it can no longer see.
+func TestCheckPeers_NoMembersClosesThePool(t *testing.T) {
+	pkiDir := testPKI(t, "self")
+	c := newPruneTestClient(t)
+	port, ln := servePeer(t, pkiDir, &slowPeer{})
+	addPeerHost(t, c, "peer-a", port, "")
+	c.SetMembersForTests(aeMembers("peer-a"))
+	ae := newTestAE(t, c, pkiDir)
+	ae.checkPeers(context.Background())
 	if ae.conns.lookup("peer-a") == nil {
-		t.Error("a pass after Close did not dial again")
+		t.Fatal("precondition: nothing pooled")
+	}
+	c.SetMembersForTests(aeMembers())
+	ae.checkPeers(context.Background())
+	if ae.conns.lookup("peer-a") != nil {
+		t.Error("a pass that sees no members kept its pooled connections")
+	}
+	waitOpen(t, ln, 0)
+}
+
+// A peer this node refuses to merge from keeps no pooled connection: the pass
+// never reaches the age and key checks for it, so the connection would
+// otherwise stand for as long as the refusal does.
+func TestCheckPeers_ARefusedPeerLosesItsConnection(t *testing.T) {
+	ctx := context.Background()
+	pkiDir := testPKI(t, "self")
+	c := newPruneTestClient(t)
+	port, ln := servePeer(t, pkiDir, &slowPeer{})
+	addPeerHost(t, c, "peer-a", port, "")
+	c.SetMembersForTests(aeMembers("peer-a"))
+	ae := newTestAE(t, c, pkiDir)
+	ae.checkPeers(ctx)
+	if ae.conns.lookup("peer-a") == nil {
+		t.Fatal("precondition: nothing pooled")
+	}
+	if err := IsolateHost(ctx, c, "self", "peer-a", "manual"); err != nil {
+		t.Fatalf("IsolateHost: %v", err)
+	}
+	ae.checkPeers(ctx)
+	if ae.conns.lookup("peer-a") != nil {
+		t.Error("an isolated peer kept its pooled connection")
+	}
+	waitOpen(t, ln, 0)
+}
+
+// A reused connection that answers Unavailable — a half-open transport to a
+// peer that rebooted — is retried once on a fresh dial in the same pass,
+// rather than losing the pass's exchange with that peer.
+func TestCheckPeers_RetriesAReusedConnectionOnUnavailable(t *testing.T) {
+	pkiDir := testPKI(t, "self")
+	c := newPruneTestClient(t)
+	p := &slowPeer{}
+	port, ln := servePeer(t, pkiDir, p)
+	addPeerHost(t, c, "peer-a", port, "")
+	c.SetMembersForTests(aeMembers("peer-a"))
+	ae := newTestAE(t, c, pkiDir)
+	ae.checkPeers(context.Background())
+
+	p.failCode.Store(int32(codes.Unavailable))
+	p.failNext.Store(true)
+	ae.checkPeers(context.Background())
+	if n := p.calls.Load(); n != 3 {
+		t.Errorf("%d digest calls over two passes, want 3: the Unavailable on a reused connection was not retried", n)
+	}
+	if n := ln.accepts.Load(); n != 2 {
+		t.Errorf("%d connections, want 2: the retry must dial afresh", n)
+	}
+	if ae.conns.lookup("peer-a") == nil {
+		t.Error("the retried exchange left nothing pooled")
+	}
+}
+
+// pkiStamp changes when a file is replaced by one of the same size and
+// modification time: two installs inside one mtime tick.
+func TestPKIStamp_SeesAReplacementWithTheSameSizeAndTime(t *testing.T) {
+	dir := t.TempDir()
+	crl := filepath.Join(dir, "crl.pem")
+	at := time.Unix(1_800_000_000, 0)
+	write := func(body string) {
+		tmp := crl + ".tmp"
+		if err := os.WriteFile(tmp, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(tmp, at, at); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(tmp, crl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("first-crl")
+	keep, err := os.Open(crl) // pin the first inode so it cannot be reused
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer keep.Close()
+	before := pkiStamp(dir)
+	write("other-crl")
+	if pkiStamp(dir) == before {
+		t.Error("pkiStamp did not change when crl.pem was replaced by a file of the same size and mtime")
 	}
 }
 
@@ -388,4 +561,32 @@ func TestFinishExchange_RefusesAPeerIsolatedAfterItsDigest(t *testing.T) {
 	if ae.finishExchange(ctx, ex, nil, false) {
 		t.Error("an exchange with a peer isolated since its digest was read completed; it must not be merged from")
 	}
+}
+
+// A closed pool takes no connection back, even from a pass that was already
+// running when Start's loop closed it: what that pass dials is the pass's to
+// close.
+func TestAEConnPool_AClosedPoolTakesNoConnection(t *testing.T) {
+	pkiDir := testPKI(t, "self")
+	c := newPruneTestClient(t)
+	port, ln := servePeer(t, pkiDir, &slowPeer{})
+	addPeerHost(t, c, "peer-a", port, "")
+	ae := newTestAE(t, c, pkiDir)
+	ae.Close()
+	pc, fresh, err := ae.pooledPeerClient(context.Background(), "peer-a")
+	if err != nil || !fresh {
+		t.Fatalf("pooledPeerClient on a closed pool: fresh=%v err=%v", fresh, err)
+	}
+	defer pc.close()
+	if _, err := pc.client.GetStateDigest(context.Background(), &emptypb.Empty{}); err != nil {
+		t.Fatalf("precondition: digest: %v", err)
+	}
+	if ae.conns.lookup("peer-a") != nil {
+		t.Error("a closed pool took a connection back")
+	}
+	ae.conns.closeAll()
+	if pc.isClosed() {
+		t.Error("closing the pool closed a connection it never held")
+	}
+	_ = ln
 }

@@ -136,6 +136,10 @@ func (ae *AntiEntropy) pullTableFrom(ctx context.Context, peer, table string) er
 	return errors.Join(perr, merr)
 }
 
+// pullPeerFloor is the least share of PullTableNow's budget a candidate is
+// given while twice that is left. A var so tests can shorten it.
+var pullPeerFloor = 3 * time.Second
+
 // ErrNoPeerConfirmed is PullTableNow's answer when no peer completed the pull.
 var ErrNoPeerConfirmed = errors.New("no peer completed the pull")
 
@@ -152,7 +156,8 @@ var ErrNoPeerConfirmed = errors.New("no peer completed the pull")
 // caller's voter-majority gate has already decided whether this node may act.
 // When a voter was skipped (isolated, or unable to keep a release feature in
 // use) it refuses, naming them. It is not debounced, and is
-// bounded by ctx, which it shares out among the candidates.
+// bounded by ctx, which it shares out among the voters, then the non-voters,
+// still left (pullPeerFloor).
 func (ae *AntiEntropy) PullTableNow(ctx context.Context, table, exclude string) (peer string, skipped []string, err error) {
 	if !replicatedTableSet[table] {
 		return "", nil, fmt.Errorf("%s is not a replicated table", table)
@@ -211,9 +216,23 @@ func (ae *AntiEntropy) PullTableNow(ctx context.Context, table, exclude string) 
 		}
 		// Each candidate gets its share of what is left of ctx's budget, so
 		// one that does not answer cannot spend the time of those behind it.
+		// A voter's share is among the voters still left: a non-voter is
+		// asked only once every voter has failed, so it does not shrink it.
+		// No share falls below pullPeerFloor, or half of what is left when
+		// that is less, so one that does not answer still leaves the next
+		// at least as long.
 		budget := antiEntropyPeerTimeout
 		if dl, ok := ctx.Deadline(); ok {
-			if share := time.Until(dl) / time.Duration(len(candidates)-i); share < budget {
+			left := len(candidates) - i
+			if i < len(first) {
+				left = len(first) - i
+			}
+			remaining := time.Until(dl)
+			share := remaining / time.Duration(left)
+			if floor := min(remaining/2, pullPeerFloor); share < floor {
+				share = floor
+			}
+			if share < budget {
 				budget = share
 			}
 		}

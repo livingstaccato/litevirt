@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -109,4 +110,68 @@ func TestPullTableNow_AnUnreachableVoterDoesNotStarveTheRest(t *testing.T) {
 	if err != nil || peer != "voter-b" {
 		t.Errorf("PullTableNow = (%q, %v) after asking %v; want voter-b to confirm", peer, err, asked)
 	}
+}
+
+// Re-review m-2: the budget is shared among the voters still left, not every
+// candidate, so non-voters (asked only once every voter has failed) do not
+// shrink it; and no candidate's share falls below the per-peer floor while
+// the budget lasts.
+//
+// Mutations: divide by every candidate left again — "many non-voters" fails;
+// drop the floor — "many voters" fails.
+func TestPullTableNow_TheBudgetIsSharedAmongTheVoters(t *testing.T) {
+	run := func(t *testing.T, voters, nonVoters int, budget, slow time.Duration) (string, error) {
+		c := newTestDB(t)
+		var members []PeerInfo
+		add := func(name, state string) {
+			if err := InsertHost(context.Background(), c, HostRecord{Name: name, Address: "10.0.0.1", State: state, CertSerial: "s-" + name}); err != nil {
+				t.Fatal(err)
+			}
+			if name != c.hostName {
+				members = append(members, PeerInfo{Name: name})
+			}
+		}
+		add(c.hostName, "active")
+		add("target", "active")
+		for i := 0; i < voters; i++ {
+			add(fmt.Sprintf("voter-%02d", i), "active")
+		}
+		for i := 0; i < nonVoters; i++ {
+			add(fmt.Sprintf("nonvoter-%02d", i), "maintenance")
+		}
+		c.SetMembersForTests(func() []PeerInfo { return members })
+		ae := NewAntiEntropy(c, "", 0)
+		ae.tablePull = func(ctx context.Context, peer, _ string) error {
+			if peer == "voter-00" {
+				<-ctx.Done() // no answer until its deadline
+				return ctx.Err()
+			}
+			select { // a healthy voter whose merge takes slow
+			case <-time.After(slow):
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), budget)
+		defer cancel()
+		peer, _, err := ae.PullTableNow(ctx, "hosts", "target")
+		return peer, err
+	}
+	t.Run("many non-voters", func(t *testing.T) {
+		old := pullPeerFloor
+		pullPeerFloor = 100 * time.Millisecond
+		t.Cleanup(func() { pullPeerFloor = old })
+		if peer, err := run(t, 2, 20, 2*time.Second, 300*time.Millisecond); err != nil || peer != "voter-01" {
+			t.Errorf("PullTableNow = (%q, %v); want voter-01 to confirm", peer, err)
+		}
+	})
+	t.Run("many voters", func(t *testing.T) {
+		old := pullPeerFloor
+		pullPeerFloor = 500 * time.Millisecond
+		t.Cleanup(func() { pullPeerFloor = old })
+		if peer, err := run(t, 10, 0, 2*time.Second, 300*time.Millisecond); err != nil || peer != "voter-01" {
+			t.Errorf("PullTableNow = (%q, %v); want voter-01 to confirm", peer, err)
+		}
+	})
 }

@@ -68,6 +68,18 @@ func (a *LXCRuntimeAdapter) SetContainerNICLink(_ context.Context, name string, 
 	return l.SetNetLink(name, ordinal, bridge)
 }
 
+// SetContainerNICMAC sets NIC ordinal's MAC in the stopped container
+// name's runtime config.
+func (a *LXCRuntimeAdapter) SetContainerNICMAC(_ context.Context, name string, ordinal int, mac string) error {
+	l, ok := a.Inner.(interface {
+		SetNetHWAddr(name string, n int, mac string) error
+	})
+	if !ok {
+		return fmt.Errorf("container runtime cannot set NIC MACs")
+	}
+	return l.SetNetHWAddr(name, ordinal, mac)
+}
+
 func (a *LXCRuntimeAdapter) StartContainer(ctx context.Context, name string) error {
 	return a.Inner.Start(ctx, name)
 }

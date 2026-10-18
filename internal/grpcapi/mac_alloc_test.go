@@ -47,6 +47,9 @@ func TestMACAllocator_RedrawsAMACTheClusterRecords(t *testing.T) {
 	ctx := context.Background()
 	const taken, ctTaken, free = "52:54:00:00:00:01", "52:54:00:00:00:02", "52:54:00:00:00:03"
 	seedNICOf(t, s, "other", taken)
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{HostName: "peer", Name: "ct1", State: "running"}); err != nil {
+		t.Fatal(err)
+	}
 	if err := corrosion.UpsertContainerInterface(ctx, s.db, corrosion.ContainerInterfaceRecord{
 		HostName: "peer", CtName: "ct1", NetworkName: "lan", MAC: ctTaken}); err != nil {
 		t.Fatal(err)
@@ -197,5 +200,87 @@ func TestApplyImportNetworks_GeneratedMACAvoidsTheCluster(t *testing.T) {
 	}
 	if fv.NICs[0].MAC != free {
 		t.Fatalf("imported NIC's MAC = %s, want %s", fv.NICs[0].MAC, free)
+	}
+}
+
+// A renamed promotion is a second VM: its NIC gets a MAC no NIC of the
+// cluster holds.
+func TestPromoteReplica_RenamedDrawsAFreeMAC(t *testing.T) {
+	s := testServer(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+	const srcMAC, taken, free = "52:54:00:00:09:01", "52:54:00:00:09:02", "52:54:00:00:09:03"
+	poolDir := t.TempDir()
+	s.SetStoragePoolsByName(map[string]StoragePoolRef{"replica-pool": {Driver: "local", Target: poolDir}})
+	specJSON, _ := json.Marshal(&pb.VMSpec{Name: "vm1", Cpu: 1, MemoryMib: 512,
+		Network: []*pb.NetworkAttachment{{Name: "lo", Mac: srcMAC}}})
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "running", Spec: string(specJSON)},
+		[]corrosion.InterfaceRecord{{VMName: "vm1", NetworkName: "lo", MAC: srcMAC}},
+		[]corrosion.DiskRecord{{VMName: "vm1", DiskName: "root", HostName: "test-host",
+			Path: "/nonexistent-source", SizeBytes: 1 << 20, StorageType: "local"}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	seedNICOf(t, s, "other", taken)
+	seedReplica(t, poolDir, "", "vm1", "root", "20260101-000000", "raw", 1<<20)
+	forceMACs(t, srcMAC, taken, free)
+	if err := s.PromoteReplica(&pb.PromoteReplicaRequest{
+		VmName: "vm1", NewName: "vm1-p", TargetPool: "replica-pool", NoLocalize: true,
+	}, &streamRecorder[pb.PromoteReplicaProgress]{ctx: ctx}); err != nil {
+		t.Fatalf("PromoteReplica: %v", err)
+	}
+	nics, err := corrosion.MergedVMNICs(ctx, s.db, "vm1-p")
+	if err != nil || len(nics) != 1 || nics[0].MAC != free {
+		t.Fatalf("vm1-p's NICs = %+v, %v; want one with %s", nics, err, free)
+	}
+}
+
+// A stopped VM whose NIC's MAC another VM holds is refused a start, naming
+// the holder and the way out; once the other is gone it starts.
+func TestStartVM_RefusedWhileItsMACIsShared(t *testing.T) {
+	s := testServer(t)
+	fake := libvirtfake.New()
+	s.virt = fake
+	ctx := adminCtx()
+	const dup = "52:54:00:00:0a:01"
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "mine", HostName: s.hostName, State: "stopped", StateDetail: "operator-stop"},
+		[]corrosion.InterfaceRecord{{VMName: "mine", NetworkName: "lan", MAC: dup}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	seedNICOf(t, s, "theirs", dup)
+	_, err := s.StartVM(ctx, &pb.StartVMRequest{Name: "mine"})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "theirs") || !strings.Contains(err.Error(), "lv detach-nic") {
+		t.Fatalf("start on a shared MAC: got %v, want FailedPrecondition naming theirs and lv detach-nic", err)
+	}
+	if err := s.refuseStartOnSharedMAC(ctx, "theirs"); err == nil {
+		t.Fatal("the other side of the collision is not refused either")
+	}
+	if err := corrosion.DeleteVM(ctx, s.db, "theirs"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.refuseStartOnSharedMAC(ctx, "mine"); err != nil {
+		t.Fatalf("after theirs is gone: %v", err)
+	}
+}
+
+// A MAC a latched cluster's detach freed — its vm_nics row tombstoned, the
+// legacy row left live — is free for another NIC.
+func TestMACAllocator_ADetachedNICsMACIsFree(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	const mac = "52:54:00:00:0b:01"
+	seedNICOf(t, s, "det", mac)
+	if err := corrosion.UpsertNIC(ctx, s.db, corrosion.NICRecord{VMName: "det", ID: corrosion.DeterministicNICID("det", mac), NetworkName: "lan", MAC: mac}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.TombstoneNIC(ctx, s.db, "det", corrosion.DeterministicNICID("det", mac)); err != nil {
+		t.Fatal(err)
+	}
+	if _, h, err := s.macHolderOtherThan(ctx, []string{mac}, "x"); err != nil || h != "" {
+		t.Fatalf("holder of the detached MAC = %q, %v; want none", h, err)
+	}
+	if err := s.checkNICIdentities(ctx, "", []*pb.NetworkAttachment{{Name: "lan", Mac: mac}}, "new"); err != nil {
+		t.Fatalf("an explicit MAC a detach freed: %v", err)
 	}
 }

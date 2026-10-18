@@ -2189,6 +2189,11 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 			return nil, status.Errorf(codes.Internal, "parse stored spec: %v", err)
 		}
 	}
+	if vm.State != "running" {
+		if err := s.refuseStartOnSharedMAC(ctx, vm.Name); err != nil {
+			return nil, err
+		}
+	}
 	lease, err := s.startGatesLocked(ctx, "StartVM", vm, int(spec.Cpu), int(spec.MemoryMib), req.AllowOvercommit)
 	if err != nil {
 		return nil, err

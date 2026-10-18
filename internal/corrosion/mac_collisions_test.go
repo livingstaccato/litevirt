@@ -83,3 +83,35 @@ func TestListMACCollisions(t *testing.T) {
 		t.Fatalf("after v is deleted: got %+v, %v; want none", cols, err)
 	}
 }
+
+// Both rows of a container a migrate is moving (or whose source it parked)
+// carry its lineage: one workload, not a collision. Another lineage of the
+// name on another host is.
+func TestListMACCollisions_AContainersTwoRowsAreOneWorkload(t *testing.T) {
+	ctx := context.Background()
+	c := NewTestClientT(t)
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	const mac = "52:aa:bb:cc:dd:01"
+	put := func(host, name, owner string) {
+		t.Helper()
+		if err := UpsertContainer(ctx, c, ContainerRecord{HostName: host, Name: name, State: "stopped",
+			CreateSpec: EncodeCreateSpec(ContainerCreateSpec{OwnerID: owner})}); err != nil {
+			t.Fatal(err)
+		}
+		if err := UpsertContainerInterface(ctx, c, ContainerInterfaceRecord{HostName: host, CtName: name, NetworkName: "lan", MAC: mac}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("h1", "web", "lineage-1")
+	put("h2", "web", "lineage-1")
+	if cols, err := ListMACCollisions(ctx, c); err != nil || len(cols) != 0 {
+		t.Fatalf("one container's two rows: %+v, %v; want none", cols, err)
+	}
+	put("h3", "web", "lineage-2")
+	cols, err := ListMACCollisions(ctx, c)
+	if err != nil || len(cols) != 1 || len(cols[0].Holders) != 2 {
+		t.Fatalf("a second lineage: %+v, %v; want one collision of two", cols, err)
+	}
+}

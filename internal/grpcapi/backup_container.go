@@ -935,6 +935,24 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			s.audit(ctx, "ct.restore", req.Name, "project="+project, "denied")
 			return err
 		}
+		// An operator restore brings the backed-up MACs back as they were
+		// (a move re-homes the same container and keeps them). One another
+		// NIC holds — the live original on another host, or a NIC that took
+		// it since — would put two NICs on one MAC.
+		var specMACs []string
+		for _, n := range corrosion.DecodeCreateSpec(spec.CreateSpec).Networks {
+			specMACs = append(specMACs, n.MAC)
+		}
+		mac, holder, herr := s.macHolderOtherThan(ctx, specMACs, corrosion.ContainerGuardOwner(s.hostName, req.Name))
+		if herr != nil {
+			return herr
+		}
+		if holder != "" {
+			s.audit(ctx, "ct.restore", req.Name, "project="+project+" MAC "+mac+" is used by "+holder, "denied")
+			return status.Errorf(codes.AlreadyExists,
+				"MAC %s of the backed-up container %q is used by %s; a restore keeps the backed-up MACs, so remove that NIC's workload first (for a container, `lv ct rm`)",
+				mac, req.Name, holder)
+		}
 	}
 
 	// Capacity + quota admission, the SAME two-scope split as CreateContainer.

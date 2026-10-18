@@ -2316,15 +2316,24 @@ a second VM off a LUN whose re-created VM's rows are still on their way.
 Each host looks, at start and every minute, for a MAC that the live NICs of
 two workloads record, one of them on this host: two hosts that drew one MAC
 at the same moment, each before seeing the other's NIC, or NICs an earlier
-build made. While one is there the host raises `mac_duplicate` (evaluator
-`nic_identity`, subject `host/<host>`, critical); the evidence names the MAC
-and each NIC (its VM or container, network and host). It resolves on the
-first look that finds none. Nothing is changed and nothing is refused: a
-running guest keeps its MAC. On one L2 segment the two NICs break each
-other's traffic and DHCP, and a guard keyed by the MAC admits the other's
-traffic, so give one a new MAC: for a VM, `lv detach-nic <vm> <mac>`, then
-`lv attach-nic <vm> <network>`; a container's NIC gets one only when the
-container is created again.
+build made. Both copies of a container a migrate is moving (or whose source
+it parked) are one workload, not two. While one is there the host raises
+`mac_duplicate` (evaluator `nic_identity`, subject `host/<host>`, critical);
+the evidence names the MAC and each NIC (its VM or container, network and
+host). It resolves on the first look that finds none.
+
+Nothing is rewritten: a running guest keeps its MAC. A stopped VM whose NIC's
+MAC another workload holds is refused `lv start` until it has a new one. On
+one network the two NICs receive each other's traffic: the MAC-keyed
+forwarding entries of a vxlan network and the DHCP reservation keyed by the
+MAC send one guest's unicast and DHCP replies to the other. Give one a new
+MAC: for a VM, `lv detach-nic <vm> <mac>`, then `lv attach-nic <vm>
+<network>`; for a container, create it again (`lv ct rm`, then `lv ct
+create`).
+
+During a rolling upgrade, only hosts on this build look: two colliding NICs
+whose hosts both still run an earlier build raise nothing until one of the
+hosts is upgraded.
 
 ### An iSCSI pool has no session (`iscsi_session_missing`)
 

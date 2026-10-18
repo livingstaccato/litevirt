@@ -8,14 +8,24 @@ package fleet
 //   - CreateVM draws with lv.GenerateMAC again (AvoidsAndConcurrentRaises:
 //     mc gets the taken MAC);
 //   - attachNICOwner draws with lv.GenerateMAC again (AttachAvoids);
-//   - ReconcileMACCollisions raises nothing (AvoidsAndConcurrentRaises).
+//   - ReconcileMACCollisions raises nothing (AvoidsAndConcurrentRaises);
+//   - StartVM skips refuseStartOnSharedMAC (AvoidsAndConcurrentRaises);
+//   - a container's derived MAC is used though another NIC holds it
+//     (ContainerNameReusedAfterAMigrate, create and clone);
+//   - container holders are keyed by host and name, not lineage
+//     (ContainerNameReusedAfterAMigrate, the parked migrate);
+//   - RestoreContainer skips its MAC check (ContainerRestoreNextToItsOriginal).
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -105,6 +115,14 @@ func TestFleet_MAC_AvoidsAndConcurrentRaises(t *testing.T) {
 		}
 	}
 
+	// A stopped guest on the shared MAC is refused a start.
+	if _, err := c.SelfClient(a).StopVM(ctx, &pb.StopVMRequest{Name: "ma", Force: true}); err != nil {
+		t.Fatalf("StopVM ma: %v", err)
+	}
+	if _, err := c.SelfClient(a).StartVM(ctx, &pb.StartVMRequest{Name: "ma"}); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "mb") {
+		t.Fatalf("start of ma on a MAC mb holds: got %v, want FailedPrecondition naming mb", err)
+	}
+
 	// A host that sees the MAC draws again.
 	forcedMACs(t, dup, next)
 	createOneNIC(t, c, a, "mc", "lan")
@@ -123,6 +141,9 @@ func TestFleet_MAC_AvoidsAndConcurrentRaises(t *testing.T) {
 		if err != nil || !ok || row.Lifecycle != corrosion.ConditionResolved {
 			t.Fatalf("%s after mb is deleted: condition %+v ok=%v err=%v; want resolved", n.Name, row, ok, err)
 		}
+	}
+	if _, err := c.SelfClient(a).StartVM(ctx, &pb.StartVMRequest{Name: "ma"}); err != nil {
+		t.Fatalf("start of ma once its MAC is its own: %v", err)
 	}
 }
 
@@ -170,5 +191,98 @@ func TestFleet_MAC_CloneAvoids(t *testing.T) {
 	}
 	if got := nicMACsOf(t, f.entry, "cl1"); len(got) != 1 || got[0] != free {
 		t.Fatalf("the clone's MACs = %v, want [%s]: holder's MAC was handed to the clone", got, free)
+	}
+}
+
+// A container's derived MAC repeats for its host, name and NIC: once a
+// container migrates away, a create or a clone of its name on the host it
+// left derives the MAC it holds. Each draws a fresh one, and the clone's
+// config gets it. A migrate whose source was parked leaves two rows of one
+// container, which is not a collision.
+func TestFleet_MAC_ContainerNameReusedAfterAMigrate(t *testing.T) {
+	c := ctMigrateCluster(t)
+	src, dst := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	seedContainerNetwork(t, c)
+	macOf := func(n *Node, name string) string {
+		t.Helper()
+		ifs := containerIfaces(t, n, name)
+		if len(ifs) != 1 {
+			t.Fatalf("%s on %s has NICs %+v, want one", name, n.Name, ifs)
+		}
+		return strings.ToLower(ifs[0].MAC)
+	}
+
+	// Create.
+	createContainerOnNetwork(t, c, src, "web")
+	moved := macOf(src, "web")
+	if err := runMigrate(t, c, src, dst, "web", stagingRepo(t)); err != nil {
+		t.Fatalf("migrate web: %v", err)
+	}
+	createContainerOnNetwork(t, c, src, "web")
+	if got := macOf(src, "web"); got == moved || got == "" {
+		t.Fatalf("the new web on %s has MAC %s; the migrated web holds %s", src.Name, got, moved)
+	}
+
+	// Clone.
+	createContainerOnNetwork(t, c, src, "tpl")
+	createContainerOnNetwork(t, c, src, "web2")
+	moved2 := macOf(src, "web2")
+	if err := runMigrate(t, c, src, dst, "web2", stagingRepo(t)); err != nil {
+		t.Fatalf("migrate web2: %v", err)
+	}
+	if _, err := c.SelfClient(src).CloneContainer(ctx, &pb.CloneContainerRequest{Source: "tpl", Target: "web2", HostName: src.Name}); err != nil {
+		t.Fatalf("clone tpl to web2: %v", err)
+	}
+	got := macOf(src, "web2")
+	if got == moved2 {
+		t.Fatalf("the clone web2 on %s has the migrated web2's MAC %s", src.Name, got)
+	}
+	if cfg := strings.ToLower(src.CT.NICMACSet("web2", 0)); cfg != got {
+		t.Fatalf("the clone's config MAC = %q, want its row's %s", cfg, got)
+	}
+
+	// A parked migrate: two live rows of one container.
+	createContainerOnNetwork(t, c, src, "park")
+	src.CT.FailDelete(errors.New("simulated source runtime delete failure"))
+	if err := runMigrate(t, c, src, dst, "park", stagingRepo(t)); err == nil || !strings.Contains(err.Error(), "source runtime cleanup failed") {
+		t.Fatalf("premise: the migrate was to land and park its source, got %v", err)
+	}
+	src.CT.FailDelete(nil)
+
+	for _, n := range c.Nodes {
+		n.Server.ReconcileMACCollisions(ctx)
+		if row, ok, err := corrosion.GetHealthCondition(ctx, n.DB, grpcapi.NICIdentityEvaluator, grpcapi.CondMACDuplicate, "host", n.Name); err != nil ||
+			(ok && row.Lifecycle != corrosion.ConditionResolved) {
+			t.Errorf("%s raised mac_duplicate: %+v (err %v)", n.Name, row, err)
+		}
+	}
+}
+
+// An operator restore keeps the backed-up MACs, so one next to its live
+// original on another host is refused, naming the original.
+func TestFleet_MAC_ContainerRestoreNextToItsOriginalIsRefused(t *testing.T) {
+	c := ctMigrateCluster(t)
+	a, b := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	seedContainerNetwork(t, c)
+	const name = "ct-back"
+	createContainerOnNetwork(t, c, a, name)
+	repo, ts := backupContainer(t, c, a, name)
+	st, err := c.SelfClient(b).RestoreContainer(ctx, &pb.RestoreContainerRequest{
+		RepoPath: repo, Name: name, Timestamp: ts, HostName: b.Name,
+	})
+	if err == nil {
+		for {
+			if _, err = st.Recv(); err != nil {
+				break
+			}
+		}
+	}
+	if status.Code(err) != codes.AlreadyExists || !strings.Contains(err.Error(), "ct:"+a.Name+":"+name) {
+		t.Fatalf("restore next to the original: got %v, want AlreadyExists naming ct:%s:%s", err, a.Name, name)
+	}
+	if rec, _ := corrosion.GetContainer(ctx, b.DB, b.Name, name); rec != nil {
+		t.Fatalf("the refused restore wrote a row on %s", b.Name)
 	}
 }

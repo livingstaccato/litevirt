@@ -64,6 +64,62 @@ func antiEntropyEverywhere(t *testing.T, c *Cluster) {
 	}
 }
 
+// settleByAntiEntropy runs anti-entropy passes on every node, as the
+// daemons' schedule does, until the replicas agree, failing the test after
+// convergeTimeout. whileApart looks first and runs a pass only while they
+// differ; otherwise a pass runs before the first look. Two uses:
+//
+//   - a tie only a pass settles: after an lv image rm that raced a record,
+//     three replicas can each hold a different row at the delete's one stamp,
+//     and one pass per node in turn does not always settle three (a node that
+//     pulled before its peers settled keeps a row they then move past);
+//   - right after a split pass latched on every node (whileApart): an entry
+//     still on the wire is absorbed, at its own time, by a node that latched
+//     before it arrived, and held as the pass's floor copy by one that latched
+//     after; the state is the same, the updated_at is not, and only
+//     anti-entropy carries the absorbed row to the others (host_membership.go
+//     names the gap). Under load that left host_membership or host_runtime
+//     apart for good; one round converged them in 25 ms.
+func settleByAntiEntropy(t *testing.T, c *Cluster, whileApart bool) {
+	t.Helper()
+	deadline := time.Now().Add(convergeTimeout)
+	for {
+		if whileApart {
+			apart, err := divergence(c.Nodes)
+			if err != nil {
+				t.Fatalf("divergence: %v", err)
+			}
+			if len(apart) == 0 {
+				return
+			}
+		}
+		// A pass that does not run (a node in release probation, or one
+		// already in progress) is not a failure here, as it was not in
+		// settleLatch: the next round asks again, and only the deadline fails.
+		for _, n := range c.Nodes {
+			corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(context.Background())
+		}
+		settle := time.Now().Add(2 * time.Second)
+		for {
+			apart, err := divergence(c.Nodes)
+			if err != nil {
+				t.Fatalf("divergence: %v", err)
+			}
+			if len(apart) == 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("replicas did not converge within %s of anti-entropy passes; tables apart: %s",
+					convergeTimeout, strings.Join(apart, ", "))
+			}
+			if time.Now().After(settle) {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+}
+
 // listedImage is image name as n's lv image ls lists it (nil when it is not).
 func listedImage(t *testing.T, c *Cluster, n *Node, name string) *pb.Image {
 	t.Helper()

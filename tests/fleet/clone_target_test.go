@@ -159,9 +159,25 @@ func TestFleet_Clone_FailedMoveRemovesTheStagedCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A schedule added ahead for the clone's name stays, as it did: the
+	// removal of the staged copy is not a delete of a VM the schedule served
+	// (here the source host runs the clone as a peer's forward; see
+	// TestFleet_Clone_FailedMoveEnteredOnTheSourceKeepsAScheduleAddedAhead).
+	for _, n := range []*Node{f.entry, f.src} {
+		if err := corrosion.UpsertBackupSchedule(context.Background(), n.DB, corrosion.BackupScheduleRecord{
+			VMName: "c3", Repo: "main", Cron: "0 4 * * *", Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	_, err := f.clone(t, &pb.CloneVMRequest{Target: "c3", DestinationHost: f.dst.Name})
 	if err == nil {
 		t.Fatal("the clone claimed success although the target refused the disk")
+	}
+	for _, n := range []*Node{f.entry, f.src} {
+		if got := schedulesOn(t, n); got != "c3/main" {
+			t.Errorf("schedules on %s after the failed clone = %q, want c3/main kept", n.Name, got)
+		}
 	}
 	for _, want := range []string{"could not be cloned onto " + f.dst.Name, "staged copy on " + f.src.Name + " was removed"} {
 		if !strings.Contains(err.Error(), want) {
@@ -316,5 +332,33 @@ func TestFleet_Clone_ASourceThatIgnoresThePoolIsReported(t *testing.T) {
 		if !found {
 			t.Errorf("the refusal of %s is not on its events: %+v", req.Target, evs)
 		}
+	}
+}
+
+// The failed move of a clone entered on the source host itself: its cleanup
+// is that host's own DeleteVM, which keeps a schedule added ahead for the
+// clone's name, as it always did.
+//
+// Mutation: drop withSchedulesKept from the cleanup's DeleteVM - red.
+func TestFleet_Clone_FailedMoveEnteredOnTheSourceKeepsAScheduleAddedAhead(t *testing.T) {
+	f := newCloneFleet(t)
+	store := image.NewStore(filepath.Join(f.c.tmpRoot, "shared-data"))
+	blocker := f.file(f.dst, store.DiskPath("c4", "root"))
+	if err := mkdirAll(filepath.Dir(blocker)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(blocker, []byte("not made by this clone"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertBackupSchedule(context.Background(), f.src.DB, corrosion.BackupScheduleRecord{
+		VMName: "c4", Repo: "main", Cron: "0 4 * * *", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := f.c.SelfClient(f.src).CloneVM(context.Background(), &pb.CloneVMRequest{Source: "tpl", Target: "c4", DestinationHost: f.dst.Name})
+	if err == nil || !strings.Contains(err.Error(), "staged copy on "+f.src.Name+" was removed") {
+		t.Fatalf("premise: the clone's move did not fail and remove its staged copy: %v", err)
+	}
+	if got := schedulesOn(t, f.src); got != "c4/main" {
+		t.Errorf("schedules on %s after the failed clone = %q, want c4/main kept", f.src.Name, got)
 	}
 }

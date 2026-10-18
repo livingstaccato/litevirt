@@ -20,8 +20,9 @@ func newTopCmd() *cobra.Command {
 	var interval time.Duration
 
 	cmd := &cobra.Command{
-		Use:   "top",
-		Short: "Live cluster resource dashboard",
+		Use:         "top",
+		Annotations: map[string]string{ownSignalsAnnotation: "true"},
+		Short:       "Live cluster resource dashboard",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				sigCh := make(chan os.Signal, 1)

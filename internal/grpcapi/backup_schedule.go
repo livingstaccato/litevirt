@@ -7,6 +7,7 @@ package grpcapi
 
 import (
 	"context"
+	"log/slog"
 	"strconv"
 
 	"google.golang.org/grpc/codes"
@@ -209,6 +210,107 @@ func (s *Server) DeleteBackupSchedule(ctx context.Context, req *pb.DeleteBackupS
 		return nil, status.Errorf(codes.Internal, "delete schedule: %v", err)
 	}
 	return &emptypb.Empty{}, nil
+}
+
+// schedulesKeptKey marks a DeleteVM whose VM's schedules stay
+// (withSchedulesKept).
+type schedulesKeptKey struct{}
+
+// withSchedulesKept marks a delete that keeps the deleted workload's
+// schedules: a blue-green cutover's delete of the blue, whose green serves in
+// its place; a failed clone's removal of its staged copy; a compose
+// container re-create's delete.
+func withSchedulesKept(ctx context.Context) context.Context {
+	return context.WithValue(ctx, schedulesKeptKey{}, true)
+}
+
+// schedulesKept reports whether ctx carries withSchedulesKept.
+func schedulesKept(ctx context.Context) bool {
+	kept, _ := ctx.Value(schedulesKeptKey{}).(bool)
+	return kept
+}
+
+// deleteVMSchedules tombstones the vm-scoped schedules, backup and
+// replication, of name: DeleteVM calls it once a plain delete of the VM has
+// succeeded, so no schedule is left firing for a VM that is gone, or keeping
+// a torn-down stack's backup repo registered (DeleteStackBackupRepos). A
+// rebuild, re-create or cutover keeps them: the VM of the name comes back. A
+// failure is logged and leaves the row: the orphan sweep
+// (sweepScheduleOrphans) removes it when the VM was a torn-down stack's.
+func (s *Server) deleteVMSchedules(ctx context.Context, name string) {
+	rows, err := corrosion.ListBackupSchedules(ctx, s.db)
+	if err != nil {
+		slog.Warn("delete: could not read the deleted VM's schedules; the orphan sweep removes them", "vm", name, "error", err)
+		return
+	}
+	for _, r := range rows {
+		if r.Scope != "vm" || r.VMName != name || r.PoolName != "" {
+			continue
+		}
+		if err := s.deleteScheduleRow(ctx, r.VMName, r.Repo); err != nil {
+			slog.Warn("delete: could not remove the deleted VM's schedule; the orphan sweep removes it", "vm", name, "repo", r.Repo, "error", err)
+			continue
+		}
+		slog.Info("delete: removed the deleted VM's schedule", "vm", name, "repo", r.Repo, "type", r.Type)
+	}
+}
+
+// deleteContainerSchedules is deleteVMSchedules for a container: once a
+// plain delete of container name in project has succeeded, and no live
+// container of that project and name is left anywhere in this replica (a
+// container name is unique per host, not cluster-wide), it tombstones the
+// container's replication schedules, in either key form.
+//
+// host is the deleted container's host: its own row is not another holder,
+// though this replica may still list it (a forwarded delete whose tombstone
+// has not arrived here yet).
+func (s *Server) deleteContainerSchedules(ctx context.Context, host, project, name string) {
+	cts, err := corrosion.ListContainers(ctx, s.db, "")
+	if err != nil {
+		slog.Warn("container delete: could not read whether another container holds the name; its schedules stay", "container", name, "error", err)
+		return
+	}
+	for _, ct := range cts {
+		if ct.Name == name && ct.HostName != host && tenancy.NormalizeProject(ct.Project) == tenancy.NormalizeProject(project) {
+			slog.Info("container delete: another live container holds the name; its schedules stay",
+				"container", name, "project", project, "deleted_on", host, "held_on", ct.HostName)
+			return
+		}
+	}
+	rows, err := corrosion.ListBackupSchedules(ctx, s.db)
+	if err != nil {
+		slog.Warn("container delete: could not read the deleted container's schedules", "container", name, "error", err)
+		return
+	}
+	for _, r := range rows {
+		if !corrosion.ContainerScheduleIs(r, project, name) {
+			continue
+		}
+		if err := s.deleteScheduleRow(ctx, r.VMName, r.Repo); err != nil {
+			slog.Warn("container delete: could not remove the deleted container's schedule", "container", name, "repo", r.Repo, "error", err)
+			continue
+		}
+		slog.Info("container delete: removed the deleted container's schedule", "container", name, "repo", r.Repo)
+	}
+}
+
+// deletedContainerHost is the host a delete of container name acts on: the
+// one named, or the host of its live row when none is (as DeleteContainer
+// resolves it). "" when there is none.
+func (s *Server) deletedContainerHost(ctx context.Context, host, name string) string {
+	if host != "" {
+		return host
+	}
+	cts, err := corrosion.ListContainers(ctx, s.db, "")
+	if err != nil {
+		return ""
+	}
+	for _, ct := range cts {
+		if ct.Name == name {
+			return ct.HostName
+		}
+	}
+	return ""
 }
 
 func scheduleToPB(r corrosion.BackupScheduleRecord) *pb.BackupSchedule {

@@ -629,3 +629,31 @@ func TestHostIncarnation_ARenewalIsNeverRevertedByAntiEntropy(t *testing.T) {
 		}
 	}
 }
+
+// Merge with credential retirement (credentials_revive_guard.go): a fence
+// credential that rides with a hosts write this node refused as another
+// incarnation's is that admission's credential, and is skipped with it —
+// whatever its clock, and whether or not this node holds a tombstone for it.
+func TestHostIncarnation_ARefusedEntrysCredentialIsSkipped(t *testing.T) {
+	_, entry := admittedV2(t)
+	c := newTestDB(t)
+	oldIncarnation(t, c)
+	applyRemote(t, c, "2999000000000-0000-admitter", entry...)
+	if _, err := c.DB().Exec(`DELETE FROM host_fence_credentials WHERE host_name = 'host-x'`); err != nil {
+		t.Fatal(err)
+	}
+	const ts = "2999-01-01T00:00:00.000000000Z"
+	// A lagging node's `lv host configure --ipmi-pass`, against incarnation 0.
+	applyRemote(t, c, "2999000000001-0000-lagging",
+		Statement{SQL: `UPDATE hosts SET ipmi_pass = ?, updated_at = ? WHERE name = ?`, Params: []interface{}{"old-pass", ts, "host-x"}},
+		Statement{SQL: HostFenceCredentialUpsertSQL, Params: []interface{}{"host-x", "old-pass", ts}})
+	if got := oneString(t, c, `SELECT COALESCE((SELECT ipmi_pass FROM host_fence_credentials WHERE host_name = 'host-x'), '') AS p`, "p"); got != "" {
+		t.Errorf("the credential of a refused incarnation-0 write landed over incarnation 1: %q", got)
+	}
+	// Precondition: the same credential, alone in its entry, is not refused.
+	applyRemote(t, c, "2999000000002-0000-lagging",
+		Statement{SQL: HostFenceCredentialUpsertSQL, Params: []interface{}{"host-x", "new-pass", ts}})
+	if got := oneString(t, c, `SELECT COALESCE((SELECT ipmi_pass FROM host_fence_credentials WHERE host_name = 'host-x'), '') AS p`, "p"); got != "new-pass" {
+		t.Errorf("a credential alone in its entry did not land: %q", got)
+	}
+}

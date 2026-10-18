@@ -498,6 +498,10 @@ type Server struct {
 	// recreateTornDown is a test seam: it runs in a rebuild and a rolling
 	// recreate once the old VM is torn down, before it is created again.
 	recreateTornDown func(name string)
+	// recreateDeleted is a test seam: it runs in a rolling or inline
+	// recreate once its delete has returned, whether or not it removed
+	// anything, before the create.
+	recreateDeleted func(name string)
 	// testClearFirewallTags is a test seam: when set, a firewall-tags clear (a
 	// delete's, or a tag set's of a copied identity) calls it instead of
 	// corrosion.ClearFirewallTags.
@@ -921,6 +925,13 @@ type Server struct {
 	// lease another holder has (SetDeleteLeaseWaitForTest). Zero in
 	// production means deleteLeaseWaitDefault.
 	deleteLeaseWait time.Duration
+	// deleteFinish is a TEST SEAM for how long a delete runs once it has
+	// started acting (detachDelete). Zero, as in production, means
+	// deleteFinishTimeout.
+	deleteFinish time.Duration
+	// deleteStep is a TEST SEAM run at named steps of a VM delete
+	// (SetDeleteStepHookForTest). Nil in production.
+	deleteStep func(vm, step string)
 	// diskSpaceOverride is a TEST SEAM for the free-space checks of a cold
 	// migration's disk copy (diskSpace). Nil in production.
 	diskSpaceOverride func(dir string) (avail, total uint64, err error)
@@ -960,6 +971,8 @@ type Server struct {
 	// invFlights is the runtime inventory's libvirt single flight
 	// (runtime_inventory.go).
 	invFlights inventoryFlights
+	// invClock, when set, is the inventory's clock (invNow). Test seam only.
+	invClock func() time.Time
 	// liveStateCalls holds each live-state read of a local domain libvirt
 	// has not answered yet (vm_live_state.go); liveStateWait is how long a
 	// read waits for one (zero: defaultLiveStateWait).
@@ -1131,6 +1144,9 @@ type Server struct {
 	// streamRecheckEvery is how often an open user-authenticated stream
 	// re-checks its credential (stream_watch.go); 0 = StreamRecheckInterval.
 	streamRecheckEvery time.Duration
+	// streamClock, when set, is the stream watcher's clock (streamNow).
+	// Test seam only.
+	streamClock func() time.Time
 	// streamKick wakes every open stream's watcher to re-check now; replaced
 	// (closed) on each kick. Guarded by streamKickMu.
 	streamKickMu sync.Mutex

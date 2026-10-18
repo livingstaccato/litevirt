@@ -12,7 +12,6 @@ package fleet
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -59,7 +58,7 @@ func reimage(t *testing.T, c *Cluster, n, via *Node, live ...*Node) {
 	n.movePort(l)
 
 	// A database of its own name: nothing of the old machine's survives.
-	db, err := corrosion.NewSharedTestClient(fmt.Sprintf("fleet-%s-rebuilt-%s", n.Name, t.Name()), n.Name)
+	db, err := corrosion.NewSharedTestClient(n.cluster.dbName(n.Name+"-rebuilt"), n.Name)
 	if err != nil {
 		t.Fatal(err)
 	}

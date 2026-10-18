@@ -1488,6 +1488,7 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 	// (release_features.go).
 	r.client.noteReleaseUseStatements(stmts)
 	refusedIncarnation := map[int]bool{}
+	refusedHosts := map[string]bool{}
 	for i, s := range stmts {
 		if releaseUseApplyHook != nil {
 			releaseUseApplyHook(s)
@@ -1505,7 +1506,24 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 			return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, rerr)
 		} else if reason != "" {
 			refusedIncarnation[i] = true
+			if name := hostsStatementHost(s); name != "" {
+				refusedHosts[name] = true
+			}
 			r.client.noteIncarnationRefusal(tx, s, reason)
+			continue
+		}
+		// A fence credential carries the retirement it was set after
+		// (credentials_revive_guard.go). One that rides with a hosts write
+		// this node refused as another incarnation's is that admission's
+		// credential, not this one's: it is skipped with it, and an entry
+		// whose password write was refused is not an operator write here.
+		if host := credentialUpsertHost(s); host != "" && refusedHosts[host] {
+			continue
+		}
+		credPlan, err := planCredentialUpsert(ctx, tx, s, withoutIndexes(stmts, refusedIncarnation))
+		if err != nil {
+			return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+		} else if credPlan.skip {
 			continue
 		}
 		if err := r.applyStatementLWW(ctx, tx, s, entry.Hlc); err != nil {
@@ -1532,6 +1550,9 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 			slog.Error("replicator: apply failed — back-pressuring replication",
 				"sql", s.SQL, "origin", entry.Origin, "seq", entry.Seq, "error", err)
 			return wrapped
+		}
+		if err := credPlan.apply(ctx, tx); err != nil {
+			return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
 		}
 		// A row this statement created may be one an earlier update
 		// is parked on. Replayed here, inside the batch, so the rest of
@@ -4379,6 +4400,24 @@ func (r *Replicator) hostsIncarnationRefusalOf(ctx context.Context, tx *sql.Tx, 
 	// A V2 re-admission is refused here only for an envelope that is not its
 	// parameters; its key is decided by its own WHERE, in the apply.
 	return hostsIncarnationRefusal(ctx, tx, s, sh)
+}
+
+// hostsStatementHost is the host a single-row hosts statement writes, "" for
+// any other statement.
+func hostsStatementHost(s Statement) string {
+	if !strings.Contains(s.SQL, "hosts") {
+		return ""
+	}
+	sh, _, err := parseResolved(s.SQL)
+	if err != nil || sh.Table != "hosts" {
+		return ""
+	}
+	pk, ok := pkValuesFromShape(sh, s)
+	if !ok || len(pk) != 1 {
+		return ""
+	}
+	name, _ := pk[0].(string)
+	return name
 }
 
 // withoutIndexes returns stmts without the ones at the given indexes.

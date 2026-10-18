@@ -389,6 +389,12 @@ func TestM7_AmbiguousAdminIsNotTheOneThatRemains(t *testing.T) {
 func TestM1_OneFailedRecheckIsRetried(t *testing.T) {
 	s := loginPolicyServer(t)
 	s.streamRecheckEvery = 50 * time.Millisecond
+	// The fail-closed bound is measured on a clock that stands still here:
+	// what is pinned is that one failure is retried, not how late this host
+	// fires the retry's timer. On the wall clock a loaded host used up the
+	// 125 ms bound before the retry ran, and cut the stream.
+	frozen := time.Now()
+	s.streamClock = func() time.Time { return frozen }
 	seedUser(t, s, "bob", "operator", "bob-pw")
 	done, started := openStream(s, login(t, s, "bob", "bob-pw").Token)
 	<-started
@@ -401,13 +407,20 @@ func TestM1_OneFailedRecheckIsRetried(t *testing.T) {
 	}
 	recheckHook.Store(&hook)
 	defer recheckHook.Store(nil)
+	deadline := time.After(30 * time.Second)
+	for calls.Load() < 3 {
+		select {
+		case err := <-done:
+			t.Fatalf("one failed recheck ended the stream: %v", err)
+		case <-deadline:
+			t.Fatalf("only %d rechecks ran in 30 s", calls.Load())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 	select {
 	case err := <-done:
 		t.Fatalf("one failed recheck ended the stream: %v", err)
-	case <-time.After(500 * time.Millisecond):
-	}
-	if calls.Load() < 3 {
-		t.Fatalf("only %d rechecks ran", calls.Load())
+	default:
 	}
 }
 

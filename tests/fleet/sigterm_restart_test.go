@@ -65,7 +65,9 @@ func (f *restartFleet) sigtermRestart(t *testing.T, dataDir string) (hostboot.Bo
 // recorded active and still not fenced.
 //
 // Mutation: have BootState return 'active' after a SIGTERM (the boot write
-// before this change) — d is fenced inside the gap.
+// before this change) — the decision is refused; with failover's
+// upgradingLifeGrace also giving every run only afreshRun, d is fenced about
+// 14 s after its boot write, inside the gap.
 func TestFleet_SIGTERMRestartIsUpgradingUntilItServes(t *testing.T) {
 	f := newRestartFleet(t, 3403)
 	ctx := context.Background()
@@ -80,13 +82,12 @@ func TestFleet_SIGTERMRestartIsUpgradingUntilItServes(t *testing.T) {
 				fs[0].Sub(booted).Round(time.Millisecond), b)
 		}
 	}
-	f.down.Store(false)
+	served := f.answer()
 	if b.AwaitServing {
 		if flipped, state, err := hostboot.ConfirmServing(ctx, f.d.DB, f.d.Name); err != nil || !flipped {
 			t.Fatalf("confirm serving: flipped=%v state=%q err=%v", flipped, state, err)
 		}
 	}
-	served := time.Now()
 	eventually(t, convergeTimeout, "every observer to see d answer, and d active", func() bool {
 		for _, n := range f.observers {
 			if got, at, ok := observedFailures(n, f.d.Name); !ok || got != 0 || !at.After(served) {

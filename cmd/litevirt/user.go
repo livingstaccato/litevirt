@@ -52,10 +52,10 @@ func newUserPasswdCmd() *cobra.Command {
 			}
 			if newPw == "" {
 				var err error
-				if newPw, err = cli.ReadPassword("New password: "); err != nil {
+				if newPw, err = cli.ReadPassword(cmd.Context(), "New password: "); err != nil {
 					return err
 				}
-				confirm, err := cli.ReadPassword("Confirm new password: ")
+				confirm, err := cli.ReadPassword(cmd.Context(), "Confirm new password: ")
 				if err != nil {
 					return err
 				}
@@ -67,7 +67,7 @@ func newUserPasswdCmd() *cobra.Command {
 			// resetting another user's password does not.
 			if username == "" && oldPw == "" {
 				var err error
-				if oldPw, err = cli.ReadPassword("Current password: "); err != nil {
+				if oldPw, err = cli.ReadPassword(cmd.Context(), "Current password: "); err != nil {
 					return err
 				}
 			}
@@ -97,7 +97,7 @@ func newUserCreateCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if password == "" {
 				var err error
-				password, err = cli.ReadPassword("Password: ")
+				password, err = cli.ReadPassword(cmd.Context(), "Password: ")
 				if err != nil {
 					return err
 				}

@@ -64,7 +64,11 @@ import (
 // included — runs a build that reads only the old columns.
 //
 // READ RULE. A reader takes the live credential row whenever one exists, and
-// the old column only when none does. It never compares the credential row's
+// the old column only when no credential row exists at all. A RETIRED row (a
+// tombstone, written only by retireFenceCredential on a host's removal or
+// re-admission) reads as no secret, never as the old column: a node whose
+// hosts row predates the re-admission still holds the old machine's password
+// there. It never compares the credential row's
 // updated_at with the PARENT row's: the parent's is bumped by every unrelated
 // write to the row, and when one of those reaches a replica ahead of a latched
 // rotation the LWW gate refuses the rotation's parent half there, leaving the
@@ -175,6 +179,10 @@ type CredentialSplitReport struct {
 	Copied int
 	// Cleared counts old columns emptied (credentials_clear_v1 only).
 	Cleared int
+	// Deferred counts host passwords with no credential row left as they are
+	// until this node may copy them (mayCopyHostCredentials). A pass that
+	// deferred any does not make this node live (credentials_live.go).
+	Deferred int
 }
 
 // The pass reads each parent together with its credential row, including
@@ -188,6 +196,31 @@ type CredentialSplitReport struct {
 // deleted_at = NULL, and the next pass would replicate the removed machine's BMC
 // password cluster-wide. Nothing reinstates a removed host's password: a
 // re-admission under the name resets ipmi_pass to NULL.
+//
+// RETIRED HOST CREDENTIALS. A LIVE host can hold a retired credential row too:
+// a host re-added while its disk survived boots on its old database,
+// re-records its serial (a hosts row newer than the re-admission, which
+// therefore does not reset it there), and keeps the old machine's ipmi_pass
+// while the re-admission retires the credential row. So the host passes never
+// copy over a tombstone, and the clear pass clears the old column beside one
+// without re-emitting it. A live old column over a tombstone is never a
+// legitimate secret: a latched writer pairs every password with the credential
+// upsert, which revives the row, and an unlatched writer's password is
+// absorbed from its entry, which revives it too (credentials_absorb.go).
+//
+// A node that holds such a stale hosts row and NO credential row cannot tell
+// "never had one" from "has not pulled the tombstone yet": a node that joined
+// on an empty database and took the stale row on its first public pull, before
+// any sensitive pull. Its copy would stamp the stale password with the stale
+// row's newer updated_at and beat the tombstone everywhere. So the host passes
+// copy a password with no credential row only once this node has completed a
+// sensitive-lane merge with a peer (SensitiveLaneMerged), or holds no other
+// host at all (a cluster of one, where no peer holds a row to pull). Until
+// then the old column stays as it is, and readers still serve it (READ RULE).
+// Every node also orders host credential rows by the retirement they were
+// set after (credentials_revive_guard.go), so a copy without that evidence —
+// this pass's, or a previous build's during a rolling upgrade — never beats a
+// tombstone on any lane.
 const (
 	hostCredentialSplitScanSQL = `SELECT h.name AS pk, h.ipmi_pass AS old_val, h.updated_at AS src_ts,
 		       c.host_name AS cred_key, c.ipmi_pass AS cred_val, c.updated_at AS cred_ts,
@@ -217,7 +250,8 @@ const (
 // credentialSplitRow is one parent row the pass looked at.
 type credentialSplitRow struct {
 	pk, oldVal, srcTS string
-	present           bool
+	present           bool // a live credential row exists
+	retired           bool // the credential row exists and is a tombstone
 	credVal, credTS   string
 }
 
@@ -233,6 +267,7 @@ func scanCredentialSplitRows(ctx context.Context, c *Client, query string) ([]cr
 			oldVal:  r.String("old_val"),
 			srcTS:   r.String("src_ts"),
 			present: r.String("cred_key") != "" && r.String("cred_deleted") == "",
+			retired: r.String("cred_key") != "" && r.String("cred_deleted") != "",
 			credVal: r.String("cred_val"),
 			credTS:  r.String("cred_ts"),
 		})
@@ -244,7 +279,8 @@ func scanCredentialSplitRows(ctx context.Context, c *Client, query string) ([]cr
 // must take: only when there is no live credential row. A credential row that
 // exists is never overwritten from the old column — the parent's updated_at
 // does not date the secret (READ RULE); an unlatched write that belongs in the
-// row is absorbed at apply time instead (credentials_absorb.go).
+// row is absorbed at apply time instead (credentials_absorb.go). The host
+// passes refuse a retired row as well (RETIRED HOST CREDENTIALS, above).
 func (r credentialSplitRow) needsCopy() bool {
 	return !r.present
 }
@@ -330,12 +366,20 @@ func (c *Client) SplitCredentials(ctx context.Context) (CredentialSplitReport, e
 		// clear cannot latch before this node is live (the advertisement
 		// gate), so this only orders a node whose gates opened together.
 		if !c.CredentialsLive() {
-			if _, err := c.copyCredentialColumns(ctx); err != nil {
+			copied, err := c.copyCredentialColumns(ctx)
+			if err != nil {
 				return rep, err
+			}
+			// Not live yet, and not until the deferred host copies are made:
+			// no clear may be in view of the first live pass.
+			if copied.Deferred > 0 {
+				return copied, nil
 			}
 		}
 		rep, err := c.clearCredentialColumns(ctx)
-		c.afterCredentialPass(ctx, err)
+		if rep.Deferred == 0 {
+			c.afterCredentialPass(ctx, err)
+		}
 		return rep, err
 	}
 	return c.copyCredentialColumns(ctx)
@@ -356,12 +400,23 @@ func (c *Client) copyCredentialColumns(ctx context.Context) (CredentialSplitRepo
 			firstErr = fmt.Errorf("%s: %w", what, err)
 		}
 	}
+	mayCopyHosts, err := c.mayCopyHostCredentials(ctx)
+	note("host_fence_credentials", err)
 	hosts, err := scanCredentialSplitRows(ctx, c, hostCredentialSplitScanSQL)
 	note("host_fence_credentials", err)
 	for _, r := range hosts {
-		if r.needsCopy() {
-			rep.note(c.copyHostCredential(ctx, r.pk, r.oldVal, c.copyTS(r)), "host_fence_credentials", note)
+		if r.retired || !r.needsCopy() {
+			continue
 		}
+		if !mayCopyHosts {
+			// Not an error: the pass is complete for what this node may
+			// write, and a peer that holds the row repairs it here.
+			slog.Info("credentials split: a host's password has no credential row and this node has not "+
+				"merged the sensitive lane yet; not copied", "host", r.pk)
+			rep.Deferred++
+			continue
+		}
+		rep.note(c.copyHostCredential(ctx, r.pk, r.oldVal, c.copyTS(r)), "host_fence_credentials", note)
 	}
 	users, err := scanCredentialSplitRows(ctx, c, userCredentialSplitScanSQL)
 	note("user_credentials", err)
@@ -377,7 +432,11 @@ func (c *Client) copyCredentialColumns(ctx context.Context) (CredentialSplitRepo
 			rep.note(c.copyTokenCredential(ctx, r.pk, r.oldVal, c.copyTS(r)), "token_credentials", note)
 		}
 	}
-	c.afterCredentialPass(ctx, firstErr)
+	// Live means every old-column secret has a credential row; a deferred
+	// host copy is one that does not yet.
+	if rep.Deferred == 0 {
+		c.afterCredentialPass(ctx, firstErr)
+	}
 	return rep, firstErr
 }
 
@@ -440,10 +499,22 @@ func (c *Client) clearCredentialColumns(ctx context.Context) (CredentialSplitRep
 		rep.Cleared++
 	}
 
+	mayCopyHosts, err := c.mayCopyHostCredentials(ctx)
+	note("host_fence_credentials", err)
 	hosts, err := scanCredentialSplitRows(ctx, c, hostCredentialSplitScanSQL)
 	note("host_fence_credentials", err)
 	for _, r := range hosts {
 		if skipped("host_fence_credentials", r) {
+			continue
+		}
+		if r.retired {
+			count("host_fence_credentials", false, c.clearHostPassAlone(ctx, r.pk, stamp(r)))
+			continue
+		}
+		if r.needsCopy() && !mayCopyHosts {
+			slog.Info("credentials clear: a host's password has no credential row and this node has not "+
+				"merged the sensitive lane yet; left uncleared until it has", "host", r.pk)
+			rep.Deferred++
 			continue
 		}
 		val, ts, copied := c.credentialFor(r)
@@ -474,7 +545,7 @@ func (c *Client) clearCredentialColumns(ctx context.Context) (CredentialSplitRep
 		if skipped("hosts", r) {
 			continue
 		}
-		count("hosts", false, c.clearRemovedHostPass(ctx, r.pk, stamp(r)))
+		count("hosts", false, c.clearHostPassAlone(ctx, r.pk, stamp(r)))
 	}
 	return rep, firstErr
 }
@@ -505,8 +576,9 @@ func (c *Client) clearTokenCredential(ctx context.Context, tokenID, hash, credTS
 	})
 }
 
-// clearRemovedHostPass clears a removed host's BMC password alone, stamped with
-// the updatedAt its caller computed (clearTS).
-func (c *Client) clearRemovedHostPass(ctx context.Context, host, updatedAt string) error {
+// clearHostPassAlone clears a host's BMC password in the old column with no
+// credential row beside it: a removed host's, or one whose credential row is
+// retired. updatedAt is the caller's clearTS.
+func (c *Client) clearHostPassAlone(ctx context.Context, host, updatedAt string) error {
 	return c.Execute(ctx, hostsClearIPMIPassSQL, "", updatedAt, host)
 }

@@ -68,47 +68,13 @@ func deletedEverywhere(t *testing.T, c *Cluster, name string) {
 	// Anti-entropy first: a bulk image_hosts tombstone expands over each
 	// replica's own rows, so replicas that held different rows can stay
 	// apart until a pass reconciles them.
-	settleByAntiEntropy(t, c)
+	settleByAntiEntropy(t, c, false)
 	for _, n := range c.Nodes {
 		if img := listedImage(t, c, n, name); img != nil {
 			t.Errorf("%s lists %s again after lv image rm: %+v", n.Name, name, img)
 		}
 		if d, err := corrosion.ImageDeletedAt(context.Background(), n.DB, name); err != nil || d == "" {
 			t.Errorf("%s: %s's row reads live (err %v)", n.Name, name, err)
-		}
-	}
-}
-
-// settleByAntiEntropy runs anti-entropy passes on every node, as the
-// daemons' schedule does, until the replicas agree. Only a pass settles a
-// tie; the push loops carry nothing that does. After an lv image rm that
-// raced a record, three replicas can each hold a different row at the
-// delete's one stamp (it rewrote only some columns of each), and one pass
-// per node in turn does not always settle three: a node that pulled before
-// its peers settled keeps a row they then move past, and only the next pass
-// takes it there.
-func settleByAntiEntropy(t *testing.T, c *Cluster) {
-	t.Helper()
-	deadline := time.Now().Add(convergeTimeout)
-	for {
-		antiEntropyEverywhere(t, c)
-		settle := time.Now().Add(2 * time.Second)
-		for {
-			apart, err := divergence(c.Nodes)
-			if err != nil {
-				t.Fatalf("divergence: %v", err)
-			}
-			if len(apart) == 0 {
-				return
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("replicas did not converge within %s of anti-entropy passes; tables apart: %s",
-					convergeTimeout, strings.Join(apart, ", "))
-			}
-			if time.Now().After(settle) {
-				break
-			}
-			time.Sleep(20 * time.Millisecond)
 		}
 	}
 }
@@ -258,9 +224,10 @@ func TestFleet_ImageRm_DuringAPullKeepsTheImageDeletedAndAPullAfterRevives(t *te
 		hosts, err := n0.DB.Query(context.Background(), `SELECT status FROM image_hosts WHERE image_name = 'imgp' AND host_name = ?`, n0.Name)
 		return err == nil && len(hosts) == 1 && hosts[0].String("status") == "ready"
 	})
-	antiEntropyEverywhere(t, c)
-	c.WaitConverged(t, convergeTimeout)
-	antiEntropyEverywhere(t, c)
+	// The revived copy's record ties with the delete's rows as the delete
+	// raced the record above: settled as deletedEverywhere settles it (8 of
+	// 24 runs under load stayed apart on image_hosts after one pass each).
+	settleByAntiEntropy(t, c, false)
 	for _, n := range c.Nodes {
 		if img := listedImage(t, c, n, "imgp"); img == nil {
 			t.Errorf("%s does not list imgp after a pull brought it back", n.Name)

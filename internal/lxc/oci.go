@@ -41,6 +41,12 @@ type PullOCIOptions struct {
 //
 // We choose --rootless so containers can run unprivileged when the
 // host config supports user namespaces.
+//
+// umoci refuses a bundle directory that already holds a config.json or a
+// rootfs, so a pull over an existing bundle (isBundle) (a re-pull, or an Admin claiming
+// an owner-less library item with --project) unpacks into a fresh directory
+// beside Dest and then replaces Dest with it (replaceBundle). A pull that
+// fails leaves the existing bundle as it was.
 func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	if opts.Image == "" {
 		return errors.New("oci: image required")
@@ -56,6 +62,22 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	}
 	if err := os.MkdirAll(opts.Dest, 0750); err != nil {
 		return fmt.Errorf("mkdir dest: %w", err)
+	}
+	// Where umoci unpacks: Dest itself when it holds no bundle yet (new, or
+	// an empty or foreign directory umoci unpacks into as before), else a
+	// fresh directory beside it that then replaces it.
+	bundle := opts.Dest
+	replace, err := isBundle(opts.Dest)
+	if err != nil {
+		return err
+	}
+	if replace {
+		stage, err := os.MkdirTemp(filepath.Dir(opts.Dest), "."+filepath.Base(opts.Dest)+".unpack-")
+		if err != nil {
+			return fmt.Errorf("stage the unpack beside %s: %w", opts.Dest, err)
+		}
+		defer func() { _ = os.RemoveAll(stage) }()
+		bundle = stage
 	}
 	tmpLayout := opts.Dest + ".oci"
 	tag := opts.Tag
@@ -89,9 +111,47 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	// Stage 2: umoci unpack flattens the layers into a usable rootfs.
 	if out, err := exec.CommandContext(ctx,
 		"umoci", "unpack", "--rootless", "--image", fmt.Sprintf("%s:%s", tmpLayout, tag),
-		opts.Dest,
+		bundle,
 	).CombinedOutput(); err != nil {
 		return fmt.Errorf("umoci unpack: %w: %s", err, out)
+	}
+	if replace {
+		return replaceBundle(bundle, opts.Dest)
+	}
+	return nil
+}
+
+// isBundle reports whether dir holds an unpacked OCI bundle: umoci's
+// config.json beside a rootfs. umoci will not unpack over one, so a pull
+// replaces it; a directory holding only one of them is left to umoci, which
+// refuses it as before, so nothing else in it is removed.
+func isBundle(dir string) (bool, error) {
+	for _, f := range []string{"config.json", "rootfs"} {
+		if _, err := os.Lstat(filepath.Join(dir, f)); errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		} else if err != nil {
+			return false, fmt.Errorf("read dest: %w", err)
+		}
+	}
+	return true, nil
+}
+
+// replaceBundle puts the bundle unpacked at stage in dest's place, and
+// removes the bundle dest held. Both are in one directory, so each step is a
+// rename; if the second fails, the old bundle is put back.
+func replaceBundle(stage, dest string) error {
+	old := stage + ".old"
+	if err := os.Rename(dest, old); err != nil {
+		return fmt.Errorf("replace %s: set the old image aside: %w", dest, err)
+	}
+	if err := os.Rename(stage, dest); err != nil {
+		if rerr := os.Rename(old, dest); rerr != nil {
+			return fmt.Errorf("replace %s: %w; and putting the old image back failed: %v (it is at %s)", dest, err, rerr, old)
+		}
+		return fmt.Errorf("replace %s: %w; the old image was kept", dest, err)
+	}
+	if err := os.RemoveAll(old); err != nil {
+		return fmt.Errorf("pulled into %s, but removing the old image at %s failed: %w", dest, old, err)
 	}
 	return nil
 }

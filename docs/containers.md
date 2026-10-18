@@ -76,7 +76,10 @@ paths:
   Containers of any project may run from such an ownerless item, so claiming
   it with `--project` (a pull over an existing item that has no owner) needs
   the Admin role; pull without `--project`, or into a new name. The Admin may
-  use any image.
+  use any image. A pull over an existing item replaces it with the image
+  pulled (it is unpacked beside the item first); a pull that fails leaves
+  the item as it was. Containers already created from it keep their own
+  copy.
 - Any other host path (`--template /srv/rootfs`, `rootfs:<path>`, a relative
   path, an absolute `lv ct pull --dest`, a local `oci:` source) needs
   `storage.hostpath` at the cluster root — the Admin role.

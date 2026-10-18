@@ -591,7 +591,17 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		// migration CA. A mismatch is refused, never sent in plaintext
 		// instead. The abort undoes the stubs.
 		if useTLS {
-			if err := migrationCAMismatch(req.VmName, s.hostName, s.localMigrationCA(), req.TargetHost, ens.migrationCA); err != nil {
+			localCA, caErr := s.localMigrationCA()
+			if caErr != nil {
+				// This host knows it is not an older build: an unreadable CA is
+				// a fault to fix, not a reason to skip the comparison.
+				return status.Errorf(codes.FailedPrecondition,
+					"refusing to migrate VM %q with a storage copy: %s cannot read its own migration CA (%v), so it cannot "+
+						"tell whether %s's migration-TLS credentials come from the same CA. Reissue its credentials with "+
+						"`lv host install-migration-tls --reissue` (run where the cluster's migration CA lives)",
+					req.VmName, s.hostName, caErr, req.TargetHost)
+			}
+			if err := migrationCAMismatch(req.VmName, s.hostName, localCA, req.TargetHost, ens.migrationCA); err != nil {
 				return err
 			}
 		}
@@ -1415,7 +1425,7 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		// its credentials chain to, so the source can refuse a mismatch
 		// before the copy rather than at QEMU's TLS handshake.
 		resp.MigrationTlsReady = s.migrationTLSReady()
-		if fp := s.localMigrationCA(); resp.MigrationTlsReady && fp != "" {
+		if fp, _ := s.localMigrationCA(); resp.MigrationTlsReady && fp != "" {
 			_ = grpc.SetHeader(ctx, metadata.Pairs(MigrationCAMD, fp))
 		}
 	}
@@ -2290,7 +2300,11 @@ func migrationCAsAgree(a, b string) bool {
 // and their migration CAs agree. A mismatch is not ready, so the move stays
 // in libvirt's tunnel instead of failing QEMU's handshake.
 func (s *Server) memoryTLSReady(srcTLS bool, ens ensureOutcome) bool {
-	return srcTLS && ens.tlsReady && migrationCAsAgree(s.localMigrationCA(), ens.migrationCA)
+	if !srcTLS || !ens.tlsReady {
+		return false
+	}
+	localCA, err := s.localMigrationCA()
+	return err == nil && migrationCAsAgree(localCA, ens.migrationCA)
 }
 
 // ensureOutcome is what the target's EnsureDisks answered.

@@ -2,6 +2,7 @@ package fleet
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -196,5 +197,33 @@ func TestFleet_StorageMigrationRunsWhenTheMigrationCAsMatchOrTheTargetDoesNotSay
 				t.Fatalf("libvirt migrate = %q; want tls=true", note)
 			}
 		})
+	}
+}
+
+// The source is ready for migration TLS but cannot read its own migration CA
+// (a corrupted ca.crt). It is not an older build, so it does not skip the
+// comparison: it refuses the storage copy, naming the problem and the fix,
+// rather than letting it fail at QEMU's handshake mid-copy.
+//
+// Mutation: read an unreadable CA as unknown — the copy runs, and goes red.
+func TestFleet_StorageMigrationIsRefusedWhenTheSourceCannotReadItsMigrationCA(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	defer c.Stop()
+	src, dst := c.Nodes[0], c.Nodes[1]
+	migrationTLSReady(src, true)
+	migrationTLSReady(dst, true)
+	src.Server.SetMigrationCAFingerprint(func() (string, error) { return "", errors.New("ca.crt holds no PEM certificate") })
+	migrationCA(dst, "bbbb2222")
+
+	path := filepath.Join(c.tmpRoot, dst.Name, "data", "disks", "pp1-root.qcow2")
+	storageMigrationVM(t, src, path, 1<<30)
+	err := runStorageMigration(t, c, src, dst.Name)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), src.Name) ||
+		!strings.Contains(err.Error(), "ca.crt holds no PEM certificate") ||
+		!strings.Contains(err.Error(), "lv host install-migration-tls --reissue") {
+		t.Fatalf("migration = %v; want FailedPrecondition naming %s, the CA error and `lv host install-migration-tls --reissue`", err, src.Name)
+	}
+	if n := migrateCalls(src); n != 0 {
+		t.Fatalf("the refused migration reached libvirt %d time(s)", n)
 	}
 }

@@ -1924,18 +1924,19 @@ func (s *Server) SetMigrationCAFingerprint(fn func() (string, error)) { s.migrat
 func (s *Server) SetDrainAbortGraceForTest(d time.Duration) { s.drainAbortGrace = d }
 
 // localMigrationCA is this host's migration CA fingerprint, "" when it has
-// none or it cannot be read (logged): no comparison is made then, and a
-// mismatch is left to the TLS handshake, as before.
-func (s *Server) localMigrationCA() string {
+// none (or no hook is set). An error is a CA file that cannot be read: the
+// source then fails closed (a storage copy is refused, a memory-only move
+// stays in libvirt's tunnel), and a target sends no fingerprint.
+func (s *Server) localMigrationCA() (string, error) {
 	if s.migrationCAFingerprint == nil {
-		return ""
+		return "", nil
 	}
 	fp, err := s.migrationCAFingerprint()
 	if err != nil {
-		slog.Warn("cannot read this host's migration CA; a storage migration's CA check is skipped", "error", err)
-		return ""
+		slog.Warn("cannot read this host's migration CA", "error", err)
+		return "", err
 	}
-	return fp
+	return fp, nil
 }
 
 // AnswerEnsureDisksAsAnOlderTargetForTest makes this host's EnsureDisks return

@@ -104,7 +104,8 @@ migration-TLS credentials:
   mid-copy. `migration.allow_unencrypted_storage` does not excuse it. Reissue
   every host's credentials from one CA with
   `lv host install-migration-tls --reissue`. A target on an older build does
-  not report its CA, and nothing is compared.
+  not report its CA, and nothing is compared. A source that cannot read its
+  own migration CA refuses the copy, naming the error and the same command.
 - Each daemon installs its host's credentials into `/etc/pki/qemu`, with the key
   readable only by the QEMU user, at start and again before each storage
   migration, so no restart is needed. It refuses to touch `/etc/pki/qemu` if

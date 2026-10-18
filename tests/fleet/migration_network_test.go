@@ -362,3 +362,26 @@ func drainAll(t *testing.T, c *Cluster, n *Node) ([]*pb.DrainProgress, error) {
 		all = append(all, p)
 	}
 }
+
+// A source that cannot read its own migration CA does not leave the tunnel:
+// it cannot tell the target's CA is its own.
+//
+// Mutation: read an unreadable CA as unknown — direct=true, red.
+func TestFleet_MigrationNetwork_MemoryOnlyStaysTunnelledWhenTheSourceCannotReadItsMigrationCA(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	defer c.Stop()
+	src, dst := c.Nodes[0], c.Nodes[1]
+	migrationTLSReady(src, true)
+	migrationTLSReady(dst, true)
+	src.Server.SetMigrationCAFingerprint(func() (string, error) { return "", errors.New("unreadable") })
+	migrationCA(dst, "bbbb2222")
+	onMigrationNet(src, 1, true)
+	onMigrationNet(dst, 2, false)
+	seedRunningVM(t, c, src, "mem4", "", 1, 256)
+	if err := migrateAt(t, c, src, "mem4", dst.Name); err != nil {
+		t.Fatalf("migration: %v", err)
+	}
+	if note := lastMigrateNote(src); !strings.Contains(note, "direct=false") {
+		t.Fatalf("libvirt migrate = %q; want the tunnel", note)
+	}
+}

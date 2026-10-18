@@ -466,9 +466,20 @@ than silently breaking BitLocker. The explicit refusals:
 variables (any UEFI VM, not only Secure Boot) to its vars file without
 flushing it, and libvirt has no cache setting for that file. The daemon
 fsyncs every vars file that changed, in `<data_dir>/nvram/` and
-`/var/lib/libvirt/qemu/nvram/`, once a second. A host power cut can therefore
-lose a variable written in about the last second before it, or longer while
-the daemon is not running.
+`/var/lib/libvirt/qemu/nvram/`, once a second, and once more as it stops. A
+host power cut can therefore lose a variable written in about the last second
+before it, or up to `vm.dirty_expire_centisecs` (30 s by default) while the
+daemon is not running. A failed fsync raises `nvram_flush_failed`
+(docs/diagnostics.md).
+
+swtpm makes its own vTPM state durable: it renames each new state file into
+place and fsyncs the directory before the TPM command completes. It does not
+fsync the file's data first, so this relies on ext4's defaults
+(`data=ordered`, `auto_da_alloc`) to write that data before the rename
+commits. Two cases are not covered: the state file's first creation, when
+nothing is replaced, and `/var/lib/libvirt/swtpm` on XFS or btrfs, or on ext4
+mounted `noauto_da_alloc`. In either, a power cut can leave the state file
+empty or old.
 
 ## Containers (LXC / OCI)
 

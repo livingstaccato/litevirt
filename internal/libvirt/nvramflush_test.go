@@ -1,10 +1,14 @@
 package libvirt
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -16,7 +20,7 @@ func recordingFlusher(t *testing.T, dirs ...string) (*NvramFlusher, *[]string, *
 	var synced []string
 	now := time.Now()
 	f := NewNvramFlusher(dirs...)
-	f.sync = func(p string) error { synced = append(synced, p); return nil }
+	f.sync = func(p string, _ os.FileInfo) error { synced = append(synced, p); return nil }
 	f.now = func() time.Time { return now }
 	return f, &synced, &now
 }
@@ -69,11 +73,11 @@ func TestNvramFlusher_SyncsChangedFilesAndNewEntries(t *testing.T) {
 	}
 }
 
-// Timestamps are coarse: a second write inside the same timestamp tick as the
-// one a sweep flushed leaves the mtime unchanged. A file whose mtime is
-// recent is therefore flushed again on the next sweep, whatever it read last
-// time, until its mtime is old enough that no write can hide behind it.
-func TestNvramFlusher_RecentMtimeIsFlushedAgain(t *testing.T) {
+// Timestamps are coarse: a second write inside the same timestamp tick as an
+// fsync that already started leaves the mtime unchanged. A file whose mtime is
+// that close to the start of its last fsync is flushed once more, then left
+// alone.
+func TestNvramFlusher_MtimeAtTheLastFsyncIsFlushedOnceMore(t *testing.T) {
 	dir := t.TempDir()
 	f, synced, now := recordingFlusher(t, dir)
 	vars := filepath.Join(dir, "vm1_VARS.fd")
@@ -81,21 +85,59 @@ func TestNvramFlusher_RecentMtimeIsFlushedAgain(t *testing.T) {
 
 	f.Sweep()
 	*synced = nil
+	*now = now.Add(time.Second)
 	f.Sweep()
 	if got := *synced; !slices.Equal(got, []string{vars}) {
-		t.Fatalf("recent, unchanged mtime: synced %v, want [%s]", got, vars)
+		t.Fatalf("mtime at the last fsync's start: synced %v, want [%s]", got, vars)
 	}
-
 	*synced = nil
-	*now = now.Add(nvramRecentWindow + time.Millisecond)
+	*now = now.Add(time.Second)
 	f.Sweep()
 	if len(*synced) != 0 {
-		t.Fatalf("mtime older than the window was flushed again: %v", *synced)
+		t.Fatalf("flushed again after a flush that started past its mtime: %v", *synced)
 	}
 }
 
-// A failed fsync is not recorded as done: the next sweep tries again.
-func TestNvramFlusher_FailedSyncIsRetried(t *testing.T) {
+// A slow sweep (many VMs writing at once, a slow disk) does not let a
+// same-tick write escape: the decision rests on when the last fsync started,
+// not on how long ago the clock says the write was.
+func TestNvramFlusher_SameTickWriteSurvivesASlowSweep(t *testing.T) {
+	dir := t.TempDir()
+	f, synced, now := recordingFlusher(t, dir)
+	vars := filepath.Join(dir, "vm1_VARS.fd")
+	writeAt(t, vars, "v1", *now)
+
+	f.Sweep()
+	*synced = nil
+	*now = now.Add(10 * time.Second) // the next sweep came late
+	f.Sweep()
+	if got := *synced; !slices.Equal(got, []string{vars}) {
+		t.Fatalf("after a late sweep: synced %v, want [%s]", got, vars)
+	}
+}
+
+// An mtime in the future (a clock stepped back) is flushed once, not on every
+// sweep until the clock passes it: any later write sets a different mtime.
+func TestNvramFlusher_FutureMtimeIsFlushedOnce(t *testing.T) {
+	dir := t.TempDir()
+	f, synced, now := recordingFlusher(t, dir)
+	vars := filepath.Join(dir, "vm1_VARS.fd")
+	writeAt(t, vars, "v1", now.Add(time.Hour))
+
+	f.Sweep()
+	*synced = nil
+	*now = now.Add(time.Second)
+	f.Sweep()
+	if len(*synced) != 0 {
+		t.Fatalf("future mtime flushed again: %v", *synced)
+	}
+}
+
+// An fsync error on a vars file is sticky. After a writeback EIO the kernel
+// reports the error once, and a later fsync on a fresh fd returns 0 with the
+// data still lost, so a later success proves nothing. The failure stays,
+// named by file and VM, until the file is removed.
+func TestNvramFlusher_FsyncErrorIsStickyUntilTheFileGoes(t *testing.T) {
 	dir := t.TempDir()
 	f, _, now := recordingFlusher(t, dir)
 	vars := filepath.Join(dir, "vm1_VARS.fd")
@@ -103,10 +145,10 @@ func TestNvramFlusher_FailedSyncIsRetried(t *testing.T) {
 
 	var tries []string
 	fail := true
-	f.sync = func(p string) error {
+	f.sync = func(p string, _ os.FileInfo) error {
 		tries = append(tries, p)
 		if fail && p == vars {
-			return errors.New("EIO")
+			return syscall.EIO
 		}
 		return nil
 	}
@@ -115,12 +157,19 @@ func TestNvramFlusher_FailedSyncIsRetried(t *testing.T) {
 	tries = nil
 	f.Sweep()
 	if !slices.Contains(tries, vars) {
-		t.Fatalf("file whose fsync failed was not retried: %v", tries)
+		t.Fatalf("file whose fsync failed was not tried again: %v", tries)
 	}
-	tries = nil
+	got := f.Failures()
+	if len(got) != 1 || got[0].Path != vars || got[0].VM != "vm1" || got[0].Error == "" {
+		t.Fatalf("after EIO then a clean retry, failures = %+v; want vm1's file, still failed", got)
+	}
+
+	if err := os.Remove(vars); err != nil {
+		t.Fatal(err)
+	}
 	f.Sweep()
-	if len(tries) != 0 {
-		t.Fatalf("after a successful retry it was synced again: %v", tries)
+	if got := f.Failures(); len(got) != 0 {
+		t.Fatalf("removed file still listed as failed: %+v", got)
 	}
 }
 
@@ -166,16 +215,179 @@ func TestNvramFlusher_RemovalSyncsDirAndOddEntriesAreSkipped(t *testing.T) {
 	}
 }
 
-// The real fsync is what the flusher uses unless a test replaces it.
-func TestNvramFlusher_DefaultSyncFsyncsTheFile(t *testing.T) {
+// The real fsync opens only the file the listing saw. The directory may be
+// writable by the qemu user, so between the listing and the open an entry can
+// be swapped for a FIFO (a plain open would block forever), a symlink (the
+// daemon would open whatever it names, as root) or another file.
+func TestNvramFlusher_DefaultSyncOpensOnlyTheListedRegularFile(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "x_VARS.fd")
 	writeAt(t, p, "x", time.Now())
-	f := NewNvramFlusher(dir)
-	if err := f.sync(p); err != nil {
-		t.Fatalf("fsync of a regular file: %v", err)
+	listed, err := os.Lstat(p)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := f.sync(dir); err != nil {
+	f := NewNvramFlusher(dir)
+	if err := f.sync(p, listed); err != nil {
+		t.Fatalf("fsync of the listed regular file: %v", err)
+	}
+	if err := f.sync(dir, nil); err != nil {
 		t.Fatalf("fsync of a directory: %v", err)
+	}
+
+	within := func(name string, fn func() error) error {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() { done <- fn() }()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: the fsync blocked", name)
+			return nil
+		}
+	}
+
+	// Swapped for a FIFO: must neither block nor succeed.
+	fifo := filepath.Join(dir, "fifo_VARS.fd")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := within("fifo", func() error { return f.sync(fifo, listed) }); err == nil {
+		t.Fatal("a FIFO in the listed file's place was fsynced")
+	}
+
+	// Swapped for a symlink to the very file listed: still refused, the link
+	// is not followed.
+	link := filepath.Join(dir, "link_VARS.fd")
+	if err := os.Symlink(p, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := within("symlink", func() error { return f.sync(link, listed) }); err == nil {
+		t.Fatal("a symlink in the listed file's place was followed")
+	}
+
+	// Swapped for another regular file: refused.
+	other := filepath.Join(dir, "other")
+	writeAt(t, other, "o", time.Now())
+	if err := os.Rename(other, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := within("swapped", func() error { return f.sync(p, listed) }); !errors.Is(err, errNvramEntryChanged) {
+		t.Fatalf("a different file in the listed file's place: err %v, want errNvramEntryChanged", err)
+	}
+}
+
+// A sweep stuck in one fsync is reported, with the file it is stuck on.
+func TestNvramFlusher_StalledSweepIsReported(t *testing.T) {
+	dir := t.TempDir()
+	f, _, now := recordingFlusher(t, dir)
+	vars := filepath.Join(dir, "vm1_VARS.fd")
+	writeAt(t, vars, "v1", now.Add(-time.Hour))
+
+	release := make(chan struct{})
+	f.sync = func(p string, _ os.FileInfo) error {
+		if p == vars {
+			<-release
+		}
+		return nil
+	}
+	f.stallAfter = 20 * time.Millisecond
+	var stalledOn atomic.Value
+	f.onStall = func(path string, _ time.Duration) { stalledOn.Store(path) }
+
+	done := make(chan struct{})
+	go func() { f.watchedSweep(); close(done) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for stalledOn.Load() == nil && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(release)
+	<-done
+	if got, _ := stalledOn.Load().(string); got != vars {
+		t.Fatalf("stall reported on %q, want %q", got, vars)
+	}
+}
+
+// Run sweeps once more when it is told to stop, so a write since the last
+// tick is flushed before the daemon exits.
+func TestNvramFlusher_RunSweepsOnceMoreAtShutdown(t *testing.T) {
+	dir := t.TempDir()
+	f := NewNvramFlusher(dir)
+	var mu sync.Mutex
+	var synced []string
+	f.sync = func(p string, _ os.FileInfo) error {
+		mu.Lock()
+		defer mu.Unlock()
+		synced = append(synced, p)
+		return nil
+	}
+	writeAt(t, filepath.Join(dir, "early_VARS.fd"), "e", time.Now().Add(-time.Hour))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { f.Run(ctx, time.Hour); close(done) }()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		if f.current.Load() != nil || time.Now().After(deadline) {
+			break // the first sweep has run (it stores the path it is on)
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	vars := filepath.Join(dir, "late_VARS.fd")
+	writeAt(t, vars, "v", time.Now().Add(-time.Hour))
+	cancel()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Contains(synced, vars) {
+		t.Fatalf("a file written before shutdown was not flushed by Run's last sweep: %v", synced)
+	}
+}
+
+// A failed file replaced by another (a firmware restore renames a new file
+// into place) is another file: its failure goes with the old one. A failure
+// carried over from before a restart is kept while the same file is there.
+func TestNvramFlusher_FailureFollowsTheFileNotTheName(t *testing.T) {
+	dir := t.TempDir()
+	f, _, now := recordingFlusher(t, dir)
+	vars := filepath.Join(dir, "vm1_VARS.fd")
+	writeAt(t, vars, "v1", now.Add(-time.Hour))
+	f.sync = func(p string, _ os.FileInfo) error {
+		if p == vars {
+			return syscall.EIO
+		}
+		return nil
+	}
+	f.Sweep()
+	carried := f.Failures()
+	if len(carried) != 1 || carried[0].Ino == 0 {
+		t.Fatalf("failure does not identify its file: %+v", carried)
+	}
+
+	// After a restart: the same file is still failed, a stale entry for a
+	// file that is gone is not.
+	other := filepath.Join(dir, "other_VARS.fd")
+	writeAt(t, other, "o", now.Add(-time.Hour))
+	g, _, _ := recordingFlusher(t, dir)
+	g.Seed(append(carried,
+		NvramFlushFailure{Path: filepath.Join(dir, "gone_VARS.fd"), Error: "EIO", Dev: 1, Ino: 1},
+		NvramFlushFailure{Path: other, Error: "EIO", Dev: 1, Ino: 1}, // another file at the name now
+	))
+	if got := g.Failures(); len(got) != 1 || got[0].Path != vars {
+		t.Fatalf("seeded failures = %+v; want only %s", got, vars)
+	}
+	g.Sweep()
+	if got := g.Failures(); len(got) != 1 || got[0].Path != vars {
+		t.Fatalf("after a restart, failures = %+v; want only %s", got, vars)
+	}
+
+	// The file is replaced: the failure is cleared and the new file flushed.
+	next := filepath.Join(dir, "next")
+	writeAt(t, next, "v2", now.Add(-time.Minute))
+	if err := os.Rename(next, vars); err != nil {
+		t.Fatal(err)
+	}
+	g.Sweep()
+	if got := g.Failures(); len(got) != 0 {
+		t.Fatalf("a replaced file is still failed: %+v", got)
 	}
 }

@@ -2105,6 +2105,29 @@ and `error`) and `remedy`.
 steps could not be read or its tombstone could not be written. Fix that cause;
 the next pass retries every listed operation.
 
+### UEFI vars flush failed (`nvram_flush_failed`)
+
+Evaluator `uefi-vars`, subject kind `host`. Each node fsyncs the UEFI vars
+files that changed, in `<data_dir>/nvram/` and `/var/lib/libvirt/qemu/nvram/`,
+once a second. A node raises `nvram_flush_failed` (critical) about **itself**
+when one of those fsyncs fails, and logs `UEFI vars flush failed` with `path`,
+`vm` and `error`. The evidence carries `files` (each with `path`, `vm`,
+`error`, `at`, `dev` and `ino`) and `remedy`.
+
+A later fsync that succeeds does not clear it. The kernel reports a writeback
+error to one fsync and marks the lost pages clean, so the next fsync returns
+success with the data still missing. The condition survives a daemon restart.
+
+| Raised when | Clears when |
+|---|---|
+| An fsync of a vars file failed. | Every listed file is removed (`lv rm`) or replaced by another file (a firmware restore). |
+
+**What to do.** The listed file may be missing UEFI variable writes the guest
+made. qemu holds the whole variable store in memory while the VM runs, but
+stopping the VM does not write it out again. Check the disk (`dmesg`,
+`smartctl`). Then have the guest write the variables it needs again, or
+restore the VM's firmware state from a backup.
+
 ### Reservation not released (`reservation_stale`)
 
 Evaluator `reservation-sweep`, subject kind `host`, subject the host the

@@ -389,6 +389,10 @@ func boundedTelemetryShutdown(shutdown func(context.Context) error, timeout time
 }
 
 func (d *Daemon) Run(ctx context.Context) error {
+	// qemu writes UEFI vars files with no flush and libvirt has no cache mode
+	// for <nvram>: flush them from the first moment, so a host power cut
+	// loses at most about a second of a guest's UEFI variable writes.
+	nvramFlusher := d.startNvramFlusher(ctx)
 	if err := d.checkMigrationNetwork(); err != nil {
 		return err
 	}
@@ -933,10 +937,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// past superseded_disk_retention_days (health/superseded_retention.go).
 	go d.runSupersededDiskSweep(ctx)
 
-	// qemu writes UEFI vars files with no flush and libvirt has no cache mode
-	// for <nvram>: flush them here so a host power cut loses at most about a
-	// second of a guest's UEFI variable writes (libvirt.NvramFlusher).
-	go libvirt.NewNvramFlusher(d.nvramDirs()...).Run(ctx, libvirt.NvramFlushInterval)
+	// A UEFI vars file whose flush failed is a host condition
+	// (nvram_flush_failed); the flusher itself started with Run.
+	go d.runNvramFlushCondition(ctx, nvramFlusher)
 
 	// Sample this host's aggregate disk/net rates into host_runtime_usage for the
 	// placement engine's DiskIOPS/NetBW dimensions.
@@ -3384,17 +3387,6 @@ func (d *Daemon) runAuthEngineReload(ctx context.Context) {
 // superseded_disk_retention_days and the VM they came from no longer exists
 // (health.PurgeSupersededDisks): while it exists, only an operator removes
 // them. 0 keeps every copy.
-// nvramDirs are where this host's UEFI vars files live: litevirt's own
-// (libvirt.NvramPath, Secure Boot and vTPM VMs) and libvirt's default (other
-// UEFI VMs).
-func (d *Daemon) nvramDirs() []string {
-	dirs := []string{health.LibvirtNvramDir}
-	if d.cfg.DataDir != "" {
-		dirs = append(dirs, filepath.Dir(libvirt.NvramPath(d.cfg.DataDir, "x")))
-	}
-	return dirs
-}
-
 func (d *Daemon) runSupersededDiskSweep(ctx context.Context) {
 	days := d.cfg.SupersededDiskRetentionDays
 	if days <= 0 {

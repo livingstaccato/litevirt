@@ -40,26 +40,37 @@ func GenerateISO(cfg Config, outputPath string) error {
 // once this returns nil; a rebuild (RebuildISO) rewrites a seed already
 // stamped as the VM's.
 func writeISO(seed Seed, outputPath string, fresh bool) error {
+	files := ExactSeed{MetaData: []byte(seed.MetaData), UserData: []byte(seed.UserData)}
+	if seed.NetworkConfig != "" {
+		files.NetworkConfig = []byte(seed.NetworkConfig)
+	}
+	if seed.VendorData != "" {
+		files.VendorData = []byte(seed.VendorData)
+	}
+	return writeExactISO(files, outputPath, fresh)
+}
+
+// writeExactISO is the shared install path. Legacy callers materialize their
+// defaults and optional-file rules before reaching it.
+func writeExactISO(seed ExactSeed, outputPath string, fresh bool) error {
 	tmpDir, err := os.MkdirTemp("", "litevirt-cloudinit-")
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
-	if err := os.WriteFile(filepath.Join(tmpDir, "meta-data"), []byte(seed.MetaData), 0644); err != nil {
-		return fmt.Errorf("write meta-data: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(tmpDir, "user-data"), []byte(seed.UserData), 0644); err != nil {
-		return fmt.Errorf("write user-data: %w", err)
-	}
-	if seed.NetworkConfig != "" {
-		if err := os.WriteFile(filepath.Join(tmpDir, "network-config"), []byte(seed.NetworkConfig), 0644); err != nil {
-			return fmt.Errorf("write network-config: %w", err)
+	for _, file := range []struct {
+		name string
+		data []byte
+	}{
+		{"meta-data", seed.MetaData}, {"user-data", seed.UserData},
+		{"network-config", seed.NetworkConfig}, {"vendor-data", seed.VendorData},
+	} {
+		if file.data == nil {
+			continue
 		}
-	}
-	if seed.VendorData != "" {
-		if err := os.WriteFile(filepath.Join(tmpDir, "vendor-data"), []byte(seed.VendorData), 0644); err != nil {
-			return fmt.Errorf("write vendor-data: %w", err)
+		if err := os.WriteFile(filepath.Join(tmpDir, file.name), file.data, 0600); err != nil {
+			return fmt.Errorf("write %s: %w", file.name, err)
 		}
 	}
 

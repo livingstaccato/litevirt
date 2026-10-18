@@ -24,7 +24,7 @@ type SecretBinding struct {
 
 // EffectiveBootstrap contains exact admitted files. Nil means absent and a
 // nonnil empty slice means an existing empty file. No defaults are applied here.
-type EffectiveBootstrap struct{ UserData, Metadata, NetworkConfig []byte }
+type EffectiveBootstrap struct{ UserData, Metadata, NetworkConfig, VendorData []byte }
 
 var errBootstrapSecret = errors.New("invalid bootstrap secret")
 

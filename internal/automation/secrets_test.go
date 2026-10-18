@@ -38,7 +38,7 @@ func encryptRawBootstrap(t *testing.T, plaintext []byte, recipient *age.X25519Re
 }
 func requireNoBootstrap(t *testing.T, files EffectiveBootstrap, err error) {
 	t.Helper()
-	if err == nil || files.UserData != nil || files.Metadata != nil || files.NetworkConfig != nil {
+	if err == nil || files.UserData != nil || files.Metadata != nil || files.NetworkConfig != nil || files.VendorData != nil {
 		t.Fatal("invalid payload returned data or success")
 	}
 	if err.Error() != "invalid bootstrap secret" {
@@ -145,7 +145,7 @@ func TestAutomationSecretCodecStrictFramingAndBounds(t *testing.T) {
 	// An independent reader pins version, field order, lengths and absence tags.
 	want := new(bytes.Buffer)
 	want.WriteString("litevirt/automation/effective-bootstrap\x00")
-	binary.Write(want, binary.BigEndian, uint32(1))
+	binary.Write(want, binary.BigEndian, uint32(2))
 	for _, s := range []string{binding.ClusterUID, binding.ProjectUID, binding.ResourceUID, binding.OperationID, binding.PayloadID} {
 		binary.Write(want, binary.BigEndian, uint32(len(s)))
 		want.WriteString(s)
@@ -156,6 +156,7 @@ func TestAutomationSecretCodecStrictFramingAndBounds(t *testing.T) {
 		binary.Write(want, binary.BigEndian, uint32(len(b)))
 		want.Write(b)
 	}
+	want.Write([]byte{0, 0, 0, 0, 0}) // v2 absent vendor-data
 	if !bytes.Equal(encoded, want.Bytes()) {
 		t.Fatal("versioned frame changed")
 	}
@@ -168,10 +169,10 @@ func TestAutomationSecretCodecStrictFramingAndBounds(t *testing.T) {
 		requireNoBootstrap(t, got, err)
 	}
 	badVersion := bytes.Clone(encoded)
-	badVersion[len("litevirt/automation/effective-bootstrap\x00")+3] = 2
+	badVersion[len("litevirt/automation/effective-bootstrap\x00")+3] = 3
 	got, err = decodeBootstrap(binding, badVersion)
 	requireNoBootstrap(t, got, err)
-	offset := len(encoded) - 5 - 2 - 5 - 1 - 5 // first file presence, known fixture lengths
+	offset := len(encoded) - 5 - 5 - 2 - 5 - 1 - 5 // first file presence, known fixture lengths
 	badPresence := bytes.Clone(encoded)
 	badPresence[offset] = 2
 	got, err = decodeBootstrap(binding, badPresence)
@@ -182,7 +183,7 @@ func TestAutomationSecretCodecStrictFramingAndBounds(t *testing.T) {
 	requireNoBootstrap(t, got, err)
 	// No absent field may smuggle bytes behind a zero presence marker.
 	badAbsent := bytes.Clone(encoded)
-	badAbsent[len(encoded)-7] = 0
+	badAbsent[len(encoded)-12] = 0
 	got, err = decodeBootstrap(binding, badAbsent)
 	requireNoBootstrap(t, got, err)
 	huge := EffectiveBootstrap{UserData: make([]byte, bootstrapPlaintextMaxBytes)}
@@ -212,7 +213,7 @@ func TestAutomationSecretCodecStrictFramingAndBounds(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(again, files) {
 		t.Fatal("decoded buffers alias input")
 	}
-	encoded[len(encoded)-1] ^= 1
+	encoded[len(encoded)-6] ^= 1
 	if !bytes.Equal(owned.NetworkConfig, files.NetworkConfig) {
 		t.Fatal("input mutation changed decoded files")
 	}

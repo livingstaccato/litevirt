@@ -3,6 +3,7 @@ package cloudinit
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -47,8 +48,10 @@ func buildISO(dir, out string) error {
 		}
 	}
 	cmd := exec.Command("genisoimage", "-output", out, "-volid", "cidata", "-joliet", "-rock", dir)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("genisoimage: %s: %w", string(output), err)
+	// Tool diagnostics can echo seed contents. Discard stdout/stderr and never
+	// expose either command output or a caller-supplied path through this error.
+	if err := cmd.Run(); err != nil {
+		return errors.New("genisoimage failed")
 	}
 	return nil
 }

@@ -9,7 +9,7 @@ import (
 )
 
 const effectiveBootstrapDomain = "litevirt/automation/effective-bootstrap\x00"
-const effectiveBootstrapVersion = uint32(1)
+const effectiveBootstrapVersion = uint32(2)
 
 func (binding SecretBinding) valid() bool {
 	for _, s := range []string{binding.ClusterUID, binding.ProjectUID, binding.ResourceUID, binding.OperationID, binding.PayloadID} {
@@ -64,7 +64,7 @@ func encodeBootstrap(binding SecretBinding, files EffectiveBootstrap) ([]byte, e
 		f.text(s)
 	}
 	f.u64(binding.AdmittedGeneration)
-	for _, b := range [][]byte{files.UserData, files.Metadata, files.NetworkConfig} {
+	for _, b := range [][]byte{files.UserData, files.Metadata, files.NetworkConfig, files.VendorData} {
 		f.optional(b)
 	}
 	if f.invalid {
@@ -84,7 +84,7 @@ func decodeBootstrap(binding SecretBinding, plaintext []byte) (EffectiveBootstra
 		return fail()
 	}
 	var version uint32
-	if binary.Read(r, binary.BigEndian, &version) != nil || version != effectiveBootstrapVersion {
+	if binary.Read(r, binary.BigEndian, &version) != nil || (version != 1 && version != effectiveBootstrapVersion) {
 		return fail()
 	}
 	for _, expected := range []string{binding.ClusterUID, binding.ProjectUID, binding.ResourceUID, binding.OperationID, binding.PayloadID} {
@@ -98,7 +98,13 @@ func decodeBootstrap(binding SecretBinding, plaintext []byte) (EffectiveBootstra
 		return fail()
 	}
 	var files EffectiveBootstrap
-	for _, dst := range []*[]byte{&files.UserData, &files.Metadata, &files.NetworkConfig} {
+	fields := []*[]byte{&files.UserData, &files.Metadata, &files.NetworkConfig}
+	// Version1 has exactly three fields. Its absent vendor-data is never inferred
+	// from newer defaults; original accepted bytes remain unchanged.
+	if version == 2 {
+		fields = append(fields, &files.VendorData)
+	}
+	for _, dst := range fields {
 		present, err := r.ReadByte()
 		if err != nil || present > 1 {
 			return fail()

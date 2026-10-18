@@ -121,11 +121,12 @@ func TestReceiverEstablishedArtifactExactOriginals(t *testing.T) {
 
 func TestReceiverEstablishedExpiredSignerRenewedOwner(t *testing.T) {
 	ctx := context.Background()
-	expires := time.Now().Truncate(time.Second).Add(6 * time.Second)
+	var expires time.Time
 	f := newAggregateFixture(t, aggregateFixtureOptions{Old: 3, Sources: 2, Heads: []int{1, 1}, Initial: func(t *testing.T, v *claimTestVoter, ca claimTestCA) {
 		if v.name != "receiver" {
 			return
 		}
+		expires = time.Now().Truncate(time.Second).Add(6 * time.Second)
 		v.signer = currentShortSigner(t, ca, v, expires)
 		if err := os.WriteFile(filepath.Join(v.pki, "host.crt"), []byte(v.signer.certPEM), 0600); err != nil {
 			t.Fatal(err)

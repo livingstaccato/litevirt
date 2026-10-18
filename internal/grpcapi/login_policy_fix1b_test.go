@@ -176,6 +176,13 @@ func TestI1_KickDuringRecheckIsNotLost(t *testing.T) {
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
+	// A watcher left holding a closed channel would recheck in a hot loop;
+	// with no further kicks the count settles (one extra recheck at most, from
+	// a start-up kick that landed after the first one woke the watcher).
+	time.Sleep(200 * time.Millisecond)
+	if n := calls.Load(); n > 3 {
+		t.Fatalf("the watcher kept rechecking with no kick: %d rechecks", n)
+	}
 }
 
 // I1: a stream with nothing wrong is not cut, across several rechecks.

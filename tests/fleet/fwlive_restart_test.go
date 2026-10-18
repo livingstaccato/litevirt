@@ -1202,3 +1202,29 @@ func TestFleet_FwLiveRestart_F3_TargetUnreachableFenceConfirmRejoin(t *testing.T
 		t.Errorf("%s's guest is %s after the discard, want still running", src.Name, st)
 	}
 }
+
+// lab2-D2-proof F1. The source daemon restarts with the guest landed on the
+// target, and its recovery verifies, commits and releases in one pass. The
+// target refuses the first Release as it does when the commit has not yet
+// replicated to it (its row still names the source). The recovery waits that
+// out briefly and releases in the same pass, so the guest does not stay
+// paused on the target until the next pass, a minute later.
+//
+// Mutation: drop the recovery's wait on the refusal — the move parks
+// target_unreachable after the pass, red.
+func TestFleet_FwLiveRestart_RecoveryReleaseWaitsForTheCommit(t *testing.T) {
+	c, src, dst, _ := fwliveCluster(t)
+	fwliveRestartCrashMigrating(t, c, src, dst, fwliveRestartLand(t, src, dst, "migrated"))
+	var releases atomic.Int32
+	dst.HookUnary("ReleaseLiveFirmwareTarget", func(hctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
+		releases.Add(1)
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"VM %q: its row names %s, not %s for this incarnation: the move has not committed, so the guest is not released", fwwVM, src.Name, dst.Name)
+	})
+	fwliveRestartUp(t, c, src)
+	fwliveRestartRecovered(src)
+	if releases.Load() != 1 {
+		t.Fatalf("the refusing Release was asked %d times, want once", releases.Load())
+	}
+	fwliveMoved(t, src, dst)
+}

@@ -110,6 +110,10 @@ var (
 	// not answer is retried with backoff for fwLiveRetryFor (§7 V3, R1).
 	fwLiveRetryBackoff = time.Second
 	fwLiveRetryFor     = 2 * time.Minute
+	// fwLiveRecoveryReleaseWait bounds how long a recovery's Release (one
+	// attempt per call, oneAttempt) waits out a target that refuses it
+	// because the commit has not replicated there yet.
+	fwLiveRecoveryReleaseWait = 15 * time.Second
 )
 
 // newLiveFirmwareAttemptID is a fresh attempt id (a UUID, spec §4).
@@ -759,12 +763,26 @@ func (s *Server) releaseLiveFirmwareMove(ctx context.Context, r *liveFirmwareRun
 		}
 	}
 	var resp *pb.ReleaseLiveFirmwareTargetResponse
-	err := s.retryLiveFirmwareCall(ctx, r, "release", func(cctx context.Context, c pb.LiteVirtClient) (err error) {
+	release := func(cctx context.Context, c pb.LiteVirtClient) (err error) {
 		resp, err = c.ReleaseLiveFirmwareTarget(cctx, &pb.ReleaseLiveFirmwareTargetRequest{
 			VmName: m.VM, Uuid: m.UUID, AttemptId: m.Attempt, CreatedAt: m.CreatedAt,
 			SrcNvramSha256: m.SrcNvramSHA256, NvramFinal: nvramFinal})
 		return err
-	})
+	}
+	err := s.retryLiveFirmwareCall(ctx, r, "release", release)
+	if r.oneAttempt {
+		// A recovery commits and releases in one pass, with one attempt per
+		// call; a target that has not yet received the commit refuses
+		// Release (its row still names this host), and the guest would stay
+		// paused there until the next pass, a minute later (lab2-D2-proof
+		// F1). That refusal is waited out briefly here.
+		deadline := time.Now().Add(fwLiveRecoveryReleaseWait)
+		for wait := fwLiveRetryBackoff; status.Code(err) == codes.FailedPrecondition && time.Now().Add(wait).Before(deadline); wait *= 2 {
+			slog.Info("live firmware move: the target refused Release; retrying while the commit replicates", "vm", m.VM, "target", r.target.Name, "error", err)
+			time.Sleep(wait)
+			err = s.retryLiveFirmwareCall(ctx, r, "release", release)
+		}
+	}
 	if err != nil {
 		return s.parkLiveFirmwareMove(ctx, r, fwmig.PhaseTargetUnreachable, fmt.Sprintf("Release was not answered by %s: %v", r.target.Name, err))
 	}

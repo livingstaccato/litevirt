@@ -39,8 +39,11 @@ type vtpmStateSync struct {
 	wait   time.Duration
 	sync   func(on bool) libvirt.SwtpmSyncReport
 	report func(open bool, evidence map[string]any) bool
+	// onFinish, for tests, runs after a pass's result is recorded.
+	onFinish func()
 
 	mu       sync.Mutex
+	gen      uint64        // bumped when swtpm is found gone; a pass from before is ignored
 	running  chan struct{} // closed when the pass in flight ends; nil when none runs
 	passed   bool          // a pass completed since swtpm was last seen installed
 	overran  bool          // the pass in flight ran past wait and was reported
@@ -82,18 +85,26 @@ func (v *vtpmStateSync) start() <-chan struct{} {
 	}
 	ch := make(chan struct{})
 	v.running = ch
+	gen := v.gen
 	go func() {
 		rep := v.sync(v.on)
-		v.finish(rep)
+		v.finish(rep, gen)
 		close(ch)
+		if v.onFinish != nil {
+			v.onFinish()
+		}
 	}()
 	return ch
 }
 
-func (v *vtpmStateSync) finish(rep libvirt.SwtpmSyncReport) {
+func (v *vtpmStateSync) finish(rep libvirt.SwtpmSyncReport, gen uint64) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.running, v.passed, v.overran = nil, true, false
+	v.running, v.overran = nil, false
+	if gen != v.gen {
+		return // swtpm went while it ran: its result is about a host that no longer runs vTPM
+	}
+	v.passed = true
 	open := v.on && rep.State != libvirt.SwtpmSyncOn
 	if rep.State != v.last || rep.Changed > 0 {
 		switch {
@@ -144,6 +155,7 @@ func (v *vtpmStateSync) absent() {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.passed = false
+	v.gen++
 	v.sync1("absent", false, nil)
 }
 

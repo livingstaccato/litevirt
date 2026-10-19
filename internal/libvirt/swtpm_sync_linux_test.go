@@ -28,6 +28,7 @@ type fakeFlags struct {
 	magic   int64
 	opts    []string
 	after   func(dir string)
+	before  func(path string)
 	t       *testing.T
 }
 
@@ -86,6 +87,11 @@ func (f *fakeFlags) ops() swtpmFDOps {
 		afterList: func(dir string) {
 			if f.after != nil {
 				f.after(dir)
+			}
+		},
+		beforeOpen: func(path string) {
+			if f.before != nil {
+				f.before(path)
 			}
 		},
 	}
@@ -292,7 +298,11 @@ func TestSwtpmSync_RenameNotSynchronousIsReported(t *testing.T) {
 		{fsMagicXFS, []string{"rw", "relatime", "attr2", "inode64"}, SwtpmSyncRenameNotSynchronous},
 		{fsMagicXFS, []string{"rw", "dirsync"}, SwtpmSyncOn},
 		{fsMagicXFS, []string{"rw", "wsync"}, SwtpmSyncOn},
-		{fsMagicXFS, []string{"rw", "sync"}, SwtpmSyncOn},
+		// A bare sync is what remount,sync leaves: the superblock says sync but
+		// xfs never set its wsync feature (lab 3: mountinfo shows "sync" with
+		// no "wsync"). A mount-time sync also shows wsync and is trusted for it.
+		{fsMagicXFS, []string{"rw", "sync"}, SwtpmSyncRenameNotSynchronous},
+		{fsMagicXFS, []string{"rw", "sync", "wsync"}, SwtpmSyncOn},
 		{0x12345678, []string{"rw"}, SwtpmSyncRenameNotSynchronous},
 		{fsMagicExt4, []string{"rw", "commit=30"}, SwtpmSyncOn},
 	} {
@@ -409,6 +419,81 @@ func TestSwtpmSync_ASymlinkSwappedInAfterListingIsNeverFollowed(t *testing.T) {
 	}
 }
 
+// The tightest window: tpm2 swapped for a symlink (or a hard link put in place
+// of the state file) after fstatat checked it and before the open. O_NOFOLLOW
+// refuses the symlink, and the open must be the inode fstatat saw.
+func TestSwtpmSync_ASwapBetweenTheCheckAndTheOpenIsNeverFollowed(t *testing.T) {
+	for _, swapFile := range []bool{false, true} {
+		base, _, tpm2, state := swtpmTree(t)
+		outside := filepath.Join(t.TempDir(), "images")
+		if err := os.MkdirAll(outside, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		outFile := filepath.Join(outside, "tpm2-00.permall")
+		if err := os.WriteFile(outFile, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		other := filepath.Join(filepath.Dir(base), "state.db")
+		if err := os.WriteFile(other, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ff := newFakeFlags(t)
+		swapped := false
+		ff.before = func(path string) {
+			switch {
+			case swapped:
+			case !swapFile && path == tpm2:
+				swapped = true
+				if err := os.Rename(tpm2, tpm2+".moved"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, tpm2); err != nil {
+					t.Fatal(err)
+				}
+			case swapFile && path == state:
+				swapped = true
+				if err := os.Remove(state); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Link(other, state); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		syncSwtpmTree(base, true, markerIn(t), ff.ops())
+		if !swapped {
+			t.Fatalf("swapFile=%v: the swap never ran", swapFile)
+		}
+		for _, p := range []string{outside, outFile, other} {
+			if ff.sets[pathIno(t, p)] {
+				t.Errorf("swapFile=%v: the pass changed %s, outside the tree, through a swap after its check", swapFile, p)
+			}
+		}
+	}
+}
+
+// A second name for the state file made after the check (the same inode,
+// now also reachable outside the tree): the open's own nlink says so.
+func TestSwtpmSync_ALinkAddedAfterTheCheckIsNotTouched(t *testing.T) {
+	base, _, _, state := swtpmTree(t)
+	outsideName := filepath.Join(filepath.Dir(base), "elsewhere")
+	ff := newFakeFlags(t)
+	ff.before = func(path string) {
+		if path == state {
+			if err := os.Link(state, outsideName); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	rep := syncSwtpmTree(base, true, markerIn(t), ff.ops())
+	if ff.sets[pathIno(t, outsideName)] {
+		t.Error("set the flags of an inode linked outside the tree after its check")
+	}
+	if rep.State != SwtpmSyncFailed || !strings.Contains(rep.Err.Error(), "hard link") {
+		t.Fatalf("report %+v, want %s naming the hard link", rep, SwtpmSyncFailed)
+	}
+}
+
 // A directory on another filesystem (a bind mount, a btrfs subvolume) is not
 // entered: the base's inheritance probe says nothing about it. It is reported.
 func TestSwtpmSync_AnotherFilesystemIsReportedNotEntered(t *testing.T) {
@@ -464,6 +549,144 @@ func TestSwtpmSync_Symlinks(t *testing.T) {
 	}
 }
 
+// N1: the swtpm user can nest directories without bound under <uuid>/. The
+// pass enters no directory deeper than libvirt's layout allows, so it holds a
+// bounded number of fds however deep the tree, and it reports the rest.
+func TestSwtpmSync_ADeepTreeIsNotEnteredAndHoldsBoundedFDs(t *testing.T) {
+	base, _, tpm2, _ := swtpmTree(t)
+	deep := tpm2
+	for i := 0; i < 60; i++ {
+		deep = filepath.Join(deep, "d")
+	}
+	if err := os.MkdirAll(deep, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bottom := filepath.Join(deep, "f")
+	if err := os.WriteFile(bottom, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	openFDs := func() int {
+		ents, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(ents)
+	}
+	before, peak := openFDs(), 0
+	ff := newFakeFlags(t)
+	ff.after = func(string) {
+		if n := openFDs(); n > peak {
+			peak = n
+		}
+	}
+	rep := syncSwtpmTree(base, true, markerIn(t), ff.ops())
+	if peak-before > 2*maxSwtpmDepth+4 {
+		t.Errorf("the pass held %d fds at once (%d before), want at most a few per level of libvirt's layout", peak, before)
+	}
+	if ff.sets[pathIno(t, bottom)] {
+		t.Error("the pass set a file 60 levels below tpm2")
+	}
+	if rep.State != SwtpmSyncFailed || !strings.Contains(rep.Err.Error(), "deeper than") {
+		t.Fatalf("report %+v, want %s naming the directory too deep to enter", rep, SwtpmSyncFailed)
+	}
+	if !ff.has(t, filepath.Join(tpm2, "tpm2-00.permall")) {
+		t.Error("the state file at libvirt's depth was not set")
+	}
+}
+
+// A directory with more entries than any host has VMs is reported, not
+// listed in full into the root daemon's memory.
+func TestSwtpmSync_AHugeDirectoryIsNotListedInFull(t *testing.T) {
+	base, _, tpm2, state := swtpmTree(t)
+	old := maxSwtpmDirEntries
+	maxSwtpmDirEntries = 8
+	defer func() { maxSwtpmDirEntries = old }()
+	for i := 0; i < 20; i++ {
+		if err := os.WriteFile(filepath.Join(tpm2, "f"+strconv.Itoa(i)), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ff := newFakeFlags(t)
+	rep := syncSwtpmTree(base, true, markerIn(t), ff.ops())
+	if rep.State != SwtpmSyncFailed || !strings.Contains(rep.Err.Error(), "more than 8 entries") {
+		t.Fatalf("report %+v, want %s naming the huge directory", rep, SwtpmSyncFailed)
+	}
+	if ff.sets[pathIno(t, state)] {
+		t.Error("entered a directory over the entry cap")
+	}
+}
+
+// N2: a hard link in the tree to a file outside it is a regular file to
+// openat; the pass must not touch its inode, on or off, and reports it.
+func TestSwtpmSync_AHardLinkIsNotTouched(t *testing.T) {
+	for _, on := range []bool{true, false} {
+		base, _, tpm2, _ := swtpmTree(t)
+		outside := filepath.Join(filepath.Dir(base), "state.db")
+		if err := os.WriteFile(outside, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(outside, filepath.Join(tpm2, "x")); err != nil {
+			t.Fatal(err)
+		}
+		ff := newFakeFlags(t)
+		marker := markerIn(t)
+		if !on {
+			if err := writeSwtpmMarker(marker); err != nil {
+				t.Fatal(err)
+			}
+			ff.flags[pathIno(t, outside)] = fsSyncFlag
+		}
+		rep := syncSwtpmTree(base, on, marker, ff.ops())
+		if ff.sets[pathIno(t, outside)] {
+			t.Errorf("on=%v: the pass changed the flags of a file outside the tree through a hard link", on)
+		}
+		if rep.State != SwtpmSyncFailed || !strings.Contains(rep.Err.Error(), "hard link") {
+			t.Errorf("on=%v: report %+v, want %s naming the hard link", on, rep, SwtpmSyncFailed)
+		}
+	}
+}
+
+// L-a: the type is checked before the open, so a fifo (or a device node the
+// swtpm user linked in) is never opened by the root daemon.
+func TestSwtpmSync_ANonRegularEntryIsNeverOpened(t *testing.T) {
+	base, _, tpm2, _ := swtpmTree(t)
+	fifo := filepath.Join(tpm2, "fifo")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	in, err := unix.InotifyInit1(unix.IN_NONBLOCK | unix.IN_CLOEXEC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(in)
+	if _, err := unix.InotifyAddWatch(in, fifo, unix.IN_OPEN); err != nil {
+		t.Fatal(err)
+	}
+	syncSwtpmTree(base, true, markerIn(t), newFakeFlags(t).ops())
+	buf := make([]byte, 4096)
+	if n, err := unix.Read(in, buf); err == nil && n > 0 {
+		t.Fatal("the pass opened a fifo")
+	}
+}
+
+// L-c: removing the marker is made durable, like writing it.
+func TestSwtpmSync_MarkerRemovalIsFsynced(t *testing.T) {
+	base, _, _, _ := swtpmTree(t)
+	marker := markerIn(t)
+	ff := newFakeFlags(t)
+	syncSwtpmTree(base, true, marker, ff.ops())
+	var synced []string
+	old := syncDirFn
+	syncDirFn = func(dir string) error { synced = append(synced, dir); return old(dir) }
+	defer func() { syncDirFn = old }()
+	if rep := syncSwtpmTree(base, false, marker, ff.ops()); rep.State != SwtpmSyncOff {
+		t.Fatalf("off: %+v", rep)
+	}
+	if len(synced) == 0 || synced[len(synced)-1] != filepath.Dir(marker) {
+		t.Fatalf("directory fsyncs %v, want %s after the marker's removal", synced, filepath.Dir(marker))
+	}
+}
+
 func TestSwtpmSync_MountOptions(t *testing.T) {
 	info := strings.Join([]string{
 		"22 1 252:1 / / rw,relatime shared:1 - ext4 /dev/vda1 rw,commit=30",
@@ -476,6 +699,11 @@ func TestSwtpmSync_MountOptions(t *testing.T) {
 	}
 	if got := mountOptions(bufio.NewScanner(strings.NewReader(info)), 252, 1, "/var/lib/libvirt/swtpm"); strings.Join(got, ",") != "rw,relatime,rw,commit=30" {
 		t.Fatalf("root options %v", got)
+	}
+	// A mount point with a space is written with an octal escape.
+	esc := "50 22 7:4 / /srv/vm\\040state rw shared:11 - xfs /dev/loop4 rw,dirsync"
+	if got := mountOptions(bufio.NewScanner(strings.NewReader(esc)), 7, 4, "/srv/vm state/swtpm"); strings.Join(got, ",") != "rw,rw,dirsync" {
+		t.Fatalf("escaped mount point: options %v", got)
 	}
 }
 

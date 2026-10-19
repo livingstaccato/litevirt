@@ -2220,9 +2220,12 @@ carries `state`, `path`, `fs`, `error` and `remedy`:
 - `unsupported`: the filesystem refuses the attribute (tmpfs, NFS, ZFS);
 - `not_inherited`: a file created there does not get it (btrfs);
 - `rename_not_synchronous`: the filesystem does not commit swtpm's rename of
-  the state file synchronously (xfs mounted without `dirsync`, `wsync` or `sync`,
+  the state file synchronously (xfs mounted without `dirsync` or `wsync`,
   or a filesystem not known to);
-- `failed`: some entries could not be read or set (`error` names them);
+- `failed`: some entries could not be read or set, or were left alone and
+  reported: a directory deeper than libvirt's layout or with more than
+  100000 entries, a directory on another filesystem, or a hard-linked file
+  (`error` names them);
 - `timed_out`: a pass has not finished within 10 seconds (a hung NFS server).
   The vTPM capability label stays false until a pass completes.
 

@@ -794,8 +794,9 @@ container_restore_timeout_sec: 600    # 0 → 600s (10m)
 # sets the sync attribute (chattr +S) on /var/lib/libvirt/swtpm and everything
 # under it, at start and every minute, and records that it did in
 # <data_dir>/vtpm-state-sync. Files swtpm creates there inherit it. On ext4,
-# and on xfs mounted with dirsync (or wsync, or sync), a vTPM command then
-# returns only once its state is on disk. Elsewhere (xfs without one of those,
+# and on xfs mounted with dirsync or wsync (a mount-time sync implies wsync; a
+# remount to sync does not), a vTPM command then returns only once its state
+# is on disk. Elsewhere (xfs without one of those,
 # btrfs, ZFS, NFS, tmpfs) the
 # host raises vtpm_state_not_durable (docs/diagnostics.md). The vTPM capability
 # label stays false until a pass has completed. false clears the attribute

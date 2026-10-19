@@ -186,6 +186,36 @@ func TestVTPMStateSync_AHungPassNeitherBlocksNorOffersVTPM(t *testing.T) {
 	}
 }
 
+// I-c: swtpm removed while a pass is in flight. The pass that finishes later
+// belongs to the host as it was: it neither offers vTPM nor reopens the
+// condition the removal resolved.
+func TestVTPMStateSync_APassFinishingAfterSwtpmWentIsIgnored(t *testing.T) {
+	release := make(chan struct{})
+	v, h := newTestVTPMSync(true, libvirt.SwtpmSyncReport{State: libvirt.SwtpmSyncNotInherited, FS: "btrfs", Err: errors.New("x")})
+	inner := v.sync
+	finished := make(chan struct{})
+	v.sync = func(on bool) libvirt.SwtpmSyncReport { <-release; r := inner(on); return r }
+	v.wait = 20 * time.Millisecond
+	v.onFinish = func() { close(finished) }
+	v.probe(true) // starts the pass, which hangs
+	v.probe(false)
+	close(release)
+	<-finished
+	v.mu.Lock()
+	passed := v.passed
+	v.mu.Unlock()
+	if passed {
+		t.Fatal("a pass that started before swtpm went counts as passed")
+	}
+	_, reports := h.snapshot()
+	if last := reports[len(reports)-1]; last.open {
+		t.Fatalf("reports %+v: the late pass reopened the condition after swtpm went", reports)
+	}
+	if v.probe(false) {
+		t.Fatal("capable without swtpm")
+	}
+}
+
 func TestVTPMStateSync_RemedyFitsTheFilesystem(t *testing.T) {
 	for fs, want := range map[string]string{
 		"zfs":   "zfs set sync=always",

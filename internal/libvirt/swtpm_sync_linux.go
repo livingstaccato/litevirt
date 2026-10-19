@@ -8,10 +8,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -59,7 +61,7 @@ func mountOptions(sc *bufio.Scanner, major, minor uint32, path string) []string 
 		if len(f) < 6 || sep < 0 || len(f) < sep+4 || f[2] != want {
 			continue
 		}
-		mp := f[4]
+		mp := unescapeMountinfo(f[4])
 		if mp != "/" && path != mp && !strings.HasPrefix(path, mp+"/") {
 			continue
 		}
@@ -69,6 +71,26 @@ func mountOptions(sc *bufio.Scanner, major, minor uint32, path string) []string 
 		}
 	}
 	return best
+}
+
+// unescapeMountinfo decodes the octal escapes (\040 for a space, \011,
+// \012, \134) mountinfo writes in a path.
+func unescapeMountinfo(s string) string {
+	if !strings.Contains(s, "\\") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) {
+			if v, err := strconv.ParseUint(s[i+1:i+4], 8, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 // openFlags opens an entry for the flag ioctls: never through a symlink, never
@@ -102,7 +124,7 @@ func syncSwtpmTree(base string, on bool, marker string, ops swtpmFDOps) SwtpmSyn
 	}
 	root, err := filepath.EvalSymlinks(base)
 	if !on && errors.Is(err, fs.ErrNotExist) {
-		if rerr := os.Remove(marker); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+		if rerr := removeSwtpmMarker(marker); rerr != nil {
 			return fail(SwtpmSyncFailed, rerr)
 		}
 		rep.State = SwtpmSyncOff
@@ -138,14 +160,14 @@ func syncSwtpmTree(base string, on bool, marker string, ops swtpmFDOps) SwtpmSyn
 		}
 		return fail(SwtpmSyncFailed, err)
 	}
-	if err := w.dir(bfd, root); err != nil {
+	if err := w.dir(bfd, root, 0); err != nil {
 		return fail(SwtpmSyncFailed, err)
 	}
 	if !on {
 		if err := w.errs.err(); err != nil {
 			return fail(SwtpmSyncFailed, err) // keep the marker: the next pass retries
 		}
-		if err := os.Remove(marker); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := removeSwtpmMarker(marker); err != nil {
 			return fail(SwtpmSyncFailed, err)
 		}
 		rep.State = SwtpmSyncOff
@@ -216,18 +238,22 @@ func (w *swtpmWalk) apply(fd int, path string, isBase bool) error {
 	return nil
 }
 
-// dir lists the directory dfd holds and handles each entry through an fd
-// opened relative to dfd.
-func (w *swtpmWalk) dir(dfd int, path string) error {
+// dir lists the directory dfd holds, depth levels below the base, and
+// handles each entry through an fd opened relative to dfd.
+func (w *swtpmWalk) dir(dfd int, path string, depth int) error {
 	dup, err := unix.Dup(dfd)
 	if err != nil {
 		return err
 	}
 	f := os.NewFile(uintptr(dup), path)
-	names, err := f.Readdirnames(-1)
+	names, err := f.Readdirnames(maxSwtpmDirEntries + 1)
 	f.Close()
-	if err != nil {
+	if err != nil && !errors.Is(err, io.EOF) {
 		w.errs.add(path, err)
+		return nil
+	}
+	if len(names) > maxSwtpmDirEntries {
+		w.errs.add(path, fmt.Errorf("more than %d entries; not entered", maxSwtpmDirEntries))
 		return nil
 	}
 	sort.Strings(names)
@@ -235,31 +261,34 @@ func (w *swtpmWalk) dir(dfd int, path string) error {
 		w.ops.afterList(path)
 	}
 	for _, name := range names {
-		if err := w.entry(dfd, path, name); err != nil {
+		if err := w.entry(dfd, path, name, depth+1); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (w *swtpmWalk) entry(dfd int, dir, name string) error {
+// entry handles one name in the directory dfd holds, depth levels below the
+// base. Its type comes from fstatat before anything is opened, so a fifo or
+// a device node is never opened; a directory deeper than libvirt's layout, a
+// directory on another filesystem and a hard-linked file are reported and
+// never opened; and what is opened must be the inode fstatat saw.
+func (w *swtpmWalk) entry(dfd int, dir, name string, depth int) error {
 	path := filepath.Join(dir, name)
-	fd, err := unix.Openat(dfd, name, openFlags, 0)
-	switch {
-	case errors.Is(err, unix.ENOENT), errors.Is(err, unix.ELOOP), errors.Is(err, unix.ENXIO):
-		return nil // renamed away, or a symlink or socket now: never followed
-	case err != nil:
-		w.errs.add(path, err)
-		return nil
-	}
-	defer unix.Close(fd)
 	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		w.errs.add(path, err)
+	if err := unix.Fstatat(dfd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if !errors.Is(err, unix.ENOENT) {
+			w.errs.add(path, err)
+		}
 		return nil
 	}
-	switch st.Mode & unix.S_IFMT {
+	kind := st.Mode & unix.S_IFMT
+	switch kind {
 	case unix.S_IFDIR:
+		if depth > maxSwtpmDepth {
+			w.errs.add(path, fmt.Errorf("deeper than %d levels below the base; not entered", maxSwtpmDepth))
+			return nil
+		}
 		dev := uint64(st.Dev)
 		if w.ops.devOf != nil {
 			dev = w.ops.devOf(st.Ino, dev)
@@ -268,14 +297,45 @@ func (w *swtpmWalk) entry(dfd int, dir, name string) error {
 			w.errs.add(path, errors.New("on another filesystem than the base; not entered"))
 			return nil
 		}
-		if err := w.apply(fd, path, false); err != nil {
-			return err
-		}
-		return w.dir(fd, path)
 	case unix.S_IFREG:
+		if st.Nlink != 1 {
+			w.errs.add(path, fmt.Errorf("hard link (%d links); not touched", st.Nlink))
+			return nil
+		}
+	default:
+		return nil // symlink, fifo, socket, device: not swtpm state, never opened
+	}
+	if w.ops.beforeOpen != nil {
+		w.ops.beforeOpen(path)
+	}
+	fd, err := unix.Openat(dfd, name, openFlags, 0)
+	switch {
+	case errors.Is(err, unix.ENOENT), errors.Is(err, unix.ELOOP), errors.Is(err, unix.ENXIO):
+		return nil // swapped or renamed away since fstatat: never followed
+	case err != nil:
+		w.errs.add(path, err)
+		return nil
+	}
+	defer unix.Close(fd)
+	var ost unix.Stat_t
+	if err := unix.Fstat(fd, &ost); err != nil {
+		w.errs.add(path, err)
+		return nil
+	}
+	if ost.Dev != st.Dev || ost.Ino != st.Ino || ost.Mode&unix.S_IFMT != kind {
+		return nil // swapped between fstatat and the open: not what was checked
+	}
+	if kind == unix.S_IFREG {
+		if ost.Nlink != 1 {
+			w.errs.add(path, fmt.Errorf("hard link (%d links); not touched", ost.Nlink))
+			return nil
+		}
 		return w.apply(fd, path, false)
 	}
-	return nil // fifo, device: not swtpm state
+	if err := w.apply(fd, path, false); err != nil {
+		return err
+	}
+	return w.dir(fd, path, depth)
 }
 
 // probeInherit creates a file in the directory dfd holds, the way swtpm

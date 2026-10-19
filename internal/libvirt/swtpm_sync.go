@@ -16,7 +16,7 @@ import (
 // tree, which a file or directory created there inherits, makes ext4 write the
 // file and commit the rename before the call returns, so a TPM command
 // completes only once its state is on disk. xfs honours it for the data but
-// commits a create or rename synchronously only on a dirsync, sync or wsync
+// commits a create or rename synchronously only on a dirsync or wsync
 // mount, so elsewhere it is reported, not trusted.
 
 // SyncSwtpmState's outcomes.
@@ -36,7 +36,7 @@ const (
 	SwtpmSyncNotInherited = "not_inherited"
 	// SwtpmSyncRenameNotSynchronous: the attribute is inherited and makes the
 	// data synchronous, but the filesystem does not commit the rename that
-	// replaces the state file synchronously (xfs without dirsync, sync or
+	// replaces the state file synchronously (xfs without dirsync or
 	// wsync; any filesystem not known to).
 	SwtpmSyncRenameNotSynchronous = "rename_not_synchronous"
 	// SwtpmSyncFailed: the pass could not read or set some entry, or could not
@@ -78,15 +78,18 @@ func swtpmFSName(magic int64) string {
 
 // renameSynchronous reports whether a filesystem with the inherited
 // attribute also commits a create and a rename before they return: ext4 does
-// for a directory with it (IS_DIRSYNC); xfs only on a dirsync, sync or wsync
-// mount (its transactions never look at the inode flag).
+// for a directory with it (IS_DIRSYNC); xfs only with its dirsync or wsync
+// feature (its transactions never look at the inode flag; a mount-time sync
+// sets wsync and shows it).
 func renameSynchronous(magic int64, mountOpts []string) bool {
 	switch magic {
 	case fsMagicExt4:
 		return true
 	case fsMagicXFS:
 		for _, o := range mountOpts {
-			if o == "dirsync" || o == "sync" || o == "wsync" {
+			// Not a bare "sync": remount,sync sets it on the superblock but
+			// not xfs's wsync feature, which mount-time sync also shows.
+			if o == "dirsync" || o == "wsync" {
 				return true
 			}
 		}
@@ -129,6 +132,8 @@ type swtpmFDOps struct {
 	fs func(fd int, path string) (int64, []string, error)
 	// afterList, for tests, runs once a directory's entries are listed.
 	afterList func(dir string)
+	// beforeOpen, for tests, runs between an entry's fstatat and its open.
+	beforeOpen func(path string)
 	// devOf, for tests, maps an opened directory's (inode, st_dev) to the
 	// device the walk compares with the base's.
 	devOf func(ino, dev uint64) uint64
@@ -163,8 +168,33 @@ func writeSwtpmMarker(path string) error {
 	if err != nil {
 		return err
 	}
-	return syncDir(filepath.Dir(path))
+	return syncDirFn(filepath.Dir(path))
 }
+
+// removeSwtpmMarker removes the marker and makes that durable.
+func removeSwtpmMarker(path string) error {
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	return syncDirFn(filepath.Dir(path))
+}
+
+// syncDirFn fsyncs a directory; tests wrap it to see which ones are.
+var syncDirFn = syncDir
+
+// maxSwtpmDepth is how many directory levels below the base the pass enters:
+// libvirt's layout is <base>/<uuid>/tpm2/<file>, two levels, plus one of
+// margin. A deeper directory is reported and never opened, so the pass holds
+// at most a few fds and a bounded path, however deep the swtpm user nests.
+const maxSwtpmDepth = 3
+
+// maxSwtpmDirEntries bounds what the pass lists of one directory: a host's
+// base holds one entry per vTPM VM, a VM's directories a handful. A var so
+// tests can lower it.
+var maxSwtpmDirEntries = 100000
 
 func syncDir(dir string) error {
 	d, err := os.Open(dir)

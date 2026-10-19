@@ -136,9 +136,10 @@ lv host rm --dead <host> [--dry-run]      # Remove a host fenced proof-grade and
                                           #   removes it, and reports the stranded recoveries that now retry
                                           #   at the next claim attempt. --dry-run changes nothing
 lv host rm <host> --serial <serial>       # Remove one admission by its certificate: the row of <host> if it
-  [--address <ip>]                        #   holds it, otherwise no row; then the serial is revoked and its
-                                          #   adds' staged files and record on the machine at --address go
-                                          #   (refused if the machine serves it as a finished install)
+  [--address <ip>]                        #   holds it, otherwise no row: once the daemon confirms no row
+                                          #   holds it and the machine at --address has its trace and does
+                                          #   not serve it, it is revoked and its adds' files there removed;
+                                          #   a failed step names this command again, which finishes it
 lv host publish-crl                       # Re-publish this machine's crl.pem if `host rm` could not
 lv host renew-cert <host>                 # Renew a host's cluster certificate in place: key made on
   [--ssh root@<addr>] [--keep-old]        #   the host, one atomic switch, served without a restart,

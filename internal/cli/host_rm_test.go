@@ -630,7 +630,9 @@ func TestHostRemove_RemovesAStrandedAddsStagedPair(t *testing.T) {
 			}
 			t.Cleanup(func() { removeStagedAdmission = old })
 			c := &hostRemoveTestClient{hostState: tc.state, hostAddr: "10.0.0.9"}
-			if err := HostRemove(context.Background(), c, "node-9", false); err != nil {
+			// A failed cleanup is an unfinished removal, reported as one
+			// (TestHostRemove_AJoiningHostsFailedCleanupNamesItsFinish).
+			if err := HostRemove(context.Background(), c, "node-9", false); (err != nil) != (tc.fail != nil) {
 				t.Fatalf("removal: %v", err)
 			}
 			if len(calls) != tc.want {

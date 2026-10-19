@@ -2,18 +2,25 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/apimeta"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/ssh"
 )
@@ -91,14 +98,35 @@ func hostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force
 	fmt.Println("  `lv health` warns for as long as any peer's CRL version is behind another's")
 	// A joining host is often an add stranded after its admission, which left
 	// the admitted (now revoked) pair staged on the machine for a rerun.
+	// Its cleanup is part of the removal: one that fails is reported as
+	// unfinished, with the command that finishes it (the row is gone, so
+	// it selects the admission by serial).
 	if listed != nil && listed.GetState() == pb.HostState_HOST_JOINING && listed.GetAddress() != "" {
 		if err := removeStagedAdmission(listed.GetAddress(), serial); err != nil {
-			fmt.Printf("  could not remove the credentials an unfinished `lv host add` may have staged on %s "+
-				"(%v); they are revoked. Remove %s/.host.crt.add-%s and .host.key.add-%s there by hand\n",
-				listed.GetAddress(), err, remotePKIDir, strings.ToLower(serial), strings.ToLower(serial))
+			return fmt.Errorf("%s is removed and its certificate %s revoked, but removing what its unfinished "+
+				"`lv host add` left on %s failed (%v). Run `%s` to finish it",
+				hostName, canonOr(serial), listed.GetAddress(), err, settleRmCmd(hostName, serial, listed.GetAddress()))
 		}
 	}
 	return nil
+}
+
+// settleRmCmd is `lv host rm <host> --serial <serial> [--address <addr>]`,
+// each word shell-safe.
+func settleRmCmd(hostName, serial, addr string) string {
+	cmd := fmt.Sprintf("lv host rm %s --serial %s", shellWord(hostName), shellWord(canonOr(serial)))
+	if addr != "" {
+		cmd += " --address " + shellWord(addr)
+	}
+	return cmd
+}
+
+// canonOr is serial's canonical form, or serial when it is not one.
+func canonOr(serial string) string {
+	if c := canonSerial(serial); c != "" {
+		return c
+	}
+	return serial
 }
 
 // listedHost is hostName's ListHosts entry, or nil when it cannot be read.
@@ -286,7 +314,7 @@ func revokeAndPublish(ctx context.Context, c pb.LiteVirtClient, req *pb.RemoveHo
 	if err != nil {
 		return "", 0, fmt.Errorf("read %s's certificate serial before removal: %w", hostName, err)
 	}
-	if want := req.GetExpectedCertSerial(); want != "" && !strings.EqualFold(want, serial) {
+	if want := req.GetExpectedCertSerial(); want != "" && (canonSerial(want) == "" || canonSerial(want) != canonSerial(serial)) {
 		return "", 0, fmt.Errorf("%s's row holds certificate %s now, not %s: nothing was revoked or removed", hostName, serial, want)
 	}
 	// Ask the daemon whether it would remove the host BEFORE revoking: a
@@ -436,16 +464,12 @@ func printRemoved(hostName string, removed *pb.RemoveHostResponse, plain string)
 // connection is bounded (stagedCleanupTimeout). A seam so the removal can be
 // tested without a host.
 var removeStagedAdmission = func(addr, serial string) error {
-	sc, err := ssh.NewClientDeadline("root@"+addr, stagedCleanupTimeout)
+	r, done, err := dialAdmissionMachine(addr)
 	if err != nil {
-		var ne net.Error
-		if errors.As(err, &ne) && ne.Timeout() {
-			return fmt.Errorf("SSH connect: gave up after %s: %w", stagedCleanupTimeout, err)
-		}
-		return fmt.Errorf("SSH connect: %w", err)
+		return err
 	}
-	defer sc.Close()
-	return removeStagedPair(&sshAddRemote{sshRemotePKI{sc: sc}}, serial)
+	defer done()
+	return removeStagedPair(r, serial)
 }
 
 // stagedCleanupTimeout bounds removeStagedAdmission's whole SSH session:
@@ -473,10 +497,22 @@ func addStagedTargets() []string {
 // Serials are unique to the CA, so another machine at a reused address never
 // matches, and nothing there is touched.
 func removeStagedPair(r addRemote, serial string) error {
-	serial = strings.ToLower(serial)
-	if !validAttemptTag(serial) {
-		return fmt.Errorf("serial %q is not one", serial)
+	serial = canonSerial(serial)
+	if serial == "" {
+		return fmt.Errorf("not a certificate serial")
 	}
+	if err := removeStagedFiles(r, serial); err != nil {
+		return err
+	}
+	if err := removeInstalledMarker(r, serial); err != nil {
+		return err
+	}
+	return removeLegacyStagedPair(r, serial)
+}
+
+// removeStagedFiles removes every attempt's staged files and records tagged
+// with serial (canonical), and nothing else.
+func removeStagedFiles(r addRemote, serial string) error {
 	targets := addStagedTargets()
 	q := ssh.ShellQuote(r.Path(remoteConfig))
 	if out, err := r.Shell("config", fmt.Sprintf("if [ -e %s ]; then readlink -f -- %s; fi", q, q)); err == nil {
@@ -492,13 +528,8 @@ func removeStagedPair(r addRemote, serial string) error {
 		fmt.Fprintf(&cmd, "rm -f -- %s* || rc=1; ", ssh.ShellQuote(r.Path(addStagedPath(t, serial+"-"))))
 	}
 	cmd.WriteString("exit $rc")
-	if _, err := r.Shell("unstage", cmd.String()); err != nil {
-		return err
-	}
-	if err := removeInstalledMarker(r, serial); err != nil {
-		return err
-	}
-	return removeLegacyStagedPair(r, serial)
+	_, err := r.Shell("unstage", cmd.String())
+	return err
 }
 
 // afterMarkerRead is a test seam: it runs between removeInstalledMarker's
@@ -517,7 +548,7 @@ func removeInstalledMarker(r addRemote, serial string) error {
 		return err
 	}
 	line := strings.TrimRight(string(b), "\n")
-	if f := strings.Fields(line); len(f) < 3 || !strings.EqualFold(f[1], serial) {
+	if f := markerFields(line); len(f) < 3 || canonSerial(f[1]) != canonSerial(serial) {
 		return nil
 	}
 	if afterMarkerRead != nil {
@@ -535,22 +566,17 @@ func removeInstalledMarker(r addRemote, serial string) error {
 
 // HostRemoveAdmission is `lv host rm <host> --serial <serial> [--address <ip>]`:
 // the removal of one admission, selected by its certificate rather than by
-// the row the name has now.
+// the row the name has now. The serial is taken in any spelling of the
+// number (case, leading zeroes, 0x) and compared only in its canonical form
+// (pki.CanonicalSerial), the one the CRL uses.
 //
-// When the row of hostName holds serial, it is HostRemove of that row, which
-// the daemon refuses if the row changes before the removal. Otherwise no row
-// is touched: the admission has no row (it was removed, or its add stopped
-// before or after admitting it on a replica this one has not heard from),
-// or hostName's row is another admission. Then serial is revoked and the
-// CRL published, and what its adds left on the machine at address (their
-// staged files and install record, never the installed identity) is
-// removed. The machine is checked first, and a finished install of serial
-// there (a completed add) is refused, as is a serial another name's row
-// holds.
-func HostRemoveAdmission(ctx context.Context, c pb.LiteVirtClient, hostName, serial, address string, force bool) error {
-	serial = strings.ToLower(strings.TrimSpace(serial))
-	if !validAttemptTag(serial) {
-		return fmt.Errorf("--serial %q is not a certificate serial (lower-case hex)", serial)
+// When the row of hostName holds the serial, it is HostRemove of that row,
+// with every gate of an ordinary removal and refused if the row changes
+// first. Otherwise no row is touched (settleAbsentAdmission).
+func HostRemoveAdmission(ctx context.Context, c pb.LiteVirtClient, hostName, serialArg, address string, force bool) error {
+	serial, err := pki.CanonicalSerial(serialArg)
+	if err != nil {
+		return fmt.Errorf("--serial: %w", err)
 	}
 	if address != "" {
 		if ip := net.ParseIP(address); ip == nil || ip.To4() == nil || strings.Contains(address, ":") {
@@ -561,85 +587,264 @@ func HostRemoveAdmission(ctx context.Context, c pb.LiteVirtClient, hostName, ser
 	if err != nil {
 		return fmt.Errorf("list the cluster's hosts: %w", err)
 	}
-	var named *pb.Host
+	var holder *pb.Host
 	for _, h := range resp.GetHosts() {
-		if h.GetName() == hostName {
-			named = h
+		if canonSerial(h.GetCertSerial()) != serial {
+			continue
 		}
-		if strings.EqualFold(h.GetCertSerial(), serial) && h.GetName() != hostName {
+		if h.GetName() != hostName {
 			return fmt.Errorf("certificate %s is %s's, not %s's: nothing was revoked or removed", serial, h.GetName(), hostName)
 		}
+		holder = h
 	}
-	if named != nil && strings.EqualFold(named.GetCertSerial(), serial) {
-		if address != "" && named.GetAddress() != address {
+	if holder != nil {
+		if address != "" && holder.GetAddress() != address {
 			return fmt.Errorf("%s (certificate %s) is at %s, not %s: nothing was revoked or removed",
-				hostName, serial, named.GetAddress(), address)
+				hostName, serial, holder.GetAddress(), address)
 		}
-		return hostRemove(ctx, c, hostName, force, serial)
+		return hostRemove(ctx, c, hostName, force, holder.GetCertSerial())
+	}
+	// With no row to check the name against, only a name the CLI takes.
+	if !validHostName(hostName) {
+		return fmt.Errorf("%q is not a host name (letters, digits, '_', '.', '-'); nothing was revoked", hostName)
 	}
 	if address == "" {
 		return fmt.Errorf("no host row holds certificate %s; pass --address with the machine its add was run "+
-			"against, which is checked for a finished install of it before anything is revoked", serial)
+			"against, which must hold that admission's staged files or record", serial)
 	}
-	if err := probeStagedAdmission(address, serial); err != nil {
-		return fmt.Errorf("refusing to revoke certificate %s: %w; nothing was revoked", serial, err)
+	return settleAbsentAdmission(ctx, c, hostName, serial, address)
+}
+
+// settleAbsentAdmission revokes serial, which no row holds, and removes what
+// its adds left on the machine at address: its staged files, records and
+// install record, never the installed identity. In order:
+//
+//  1. the daemon runs an ordinary removal's gates (admin, caught up, voter
+//     majority, a pull of the hosts table) and confirms that no row of
+//     hostName and no live row holds serial (PreflightRemoveHost);
+//  2. on the machine, under its add lock, the serial must have left a trace
+//     naming hostName (a record, an install record or a staged certificate),
+//     no add may hold the machine, and the machine must not serve serial,
+//     which could be a completed add (then only the serial's staged files
+//     go, and nothing is revoked); the command then claims the machine
+//     (addInstalledMarker, compared with what it checked), so no add of it
+//     runs until the revocation is published;
+//  3. serial is revoked and the CRL published;
+//  4. the cleanup.
+//
+// A step that fails names this same command, which finishes it: once the
+// serial is revoked here, a rerun publishes the CRL and cleans up.
+func settleAbsentAdmission(ctx context.Context, c pb.LiteVirtClient, hostName, serial, address string) error {
+	again := settleRmCmd(hostName, serial, address)
+	revoked := serialRevokedHere(PKIDir(), serial)
+	if !revoked {
+		if err := confirmAdmissionAbsent(ctx, c, hostName, serial); err != nil {
+			return err
+		}
 	}
-	if err := revokeHostCert(PKIDir(), hostName, serial); err != nil {
-		return err
+	r, done, err := dialAdmissionMachine(address)
+	if err != nil {
+		if revoked {
+			return fmt.Errorf("certificate %s is revoked, but %s could not be reached to remove what its adds left "+
+				"there (%v). Run `%s` to finish it", serial, address, err, again)
+		}
+		return fmt.Errorf("could not reach %s to check it before revoking certificate %s (%v); nothing was revoked",
+			address, serial, err)
+	}
+	defer done()
+	if !revoked {
+		if err := claimForSettle(r, hostName, serial, address); err != nil {
+			return err
+		}
+		if err := revokeHostCert(PKIDir(), hostName, serial); err != nil {
+			return err
+		}
 	}
 	version, err := publishClusterCRL(ctx, c, PKIDir())
 	if err != nil {
-		return fmt.Errorf("certificate %s is revoked in %s, but publishing the CRL failed (%w): run `lv host publish-crl`",
-			serial, filepath.Join(PKIDir(), "crl.pem"), err)
+		return fmt.Errorf("certificate %s is revoked in %s, but publishing the CRL failed (%v); the machine at %s stays "+
+			"claimed against adds for %s. Run `%s` to publish it and finish", serial,
+			filepath.Join(PKIDir(), "crl.pem"), err, address, staleClaim, again)
+	}
+	if err := removeStagedPair(r, serial); err != nil {
+		return fmt.Errorf("certificate %s is revoked and CRL %d published, but removing what its adds left on %s "+
+			"failed (%v). Run `%s` to finish it", serial, version, address, err, again)
 	}
 	fmt.Printf("Revoked certificate %s in CRL %d; no host row holds it, and none was removed.\n", serial, version)
-	if named != nil {
-		fmt.Printf("  %s (certificate %s) is another admission, and was left as it is\n", hostName, named.GetCertSerial())
-	}
-	if err := removeStagedAdmission(address, serial); err != nil {
-		fmt.Printf("  could not remove the files the adds of certificate %s left on %s (%v); they are revoked. "+
-			"Remove %s/.host.crt.add-%s-* and .host.key.add-%s-* there by hand\n",
-			serial, address, err, remotePKIDir, serial, serial)
-	}
+	fmt.Printf("  removed its adds' staged files and records on %s; the machine's installed identity is as it was\n", address)
 	return nil
 }
 
-// errFinishedInstall is probeAdmission's refusal: the machine serves the
-// serial under a finished install.
-var errFinishedInstall = errors.New("the machine serves it, and does not record its install as unfinished: it may " +
-	"be a completed add, which this command does not undo")
-
-// probeStagedAdmission checks, over SSH as root, that the machine at addr
-// holds no finished install of serial (probeAdmission). A seam so the
-// removal can be tested without a host.
-var probeStagedAdmission = func(addr, serial string) error {
-	sc, err := ssh.NewClientDeadline("root@"+addr, stagedCleanupTimeout)
-	if err != nil {
-		return fmt.Errorf("could not reach %s to check it: SSH connect: %w", addr, err)
+// confirmAdmissionAbsent asks the daemon, through an ordinary removal's
+// gates, that no row of hostName and no live row holds serial.
+func confirmAdmissionAbsent(ctx context.Context, c pb.LiteVirtClient, hostName, serial string) error {
+	_, err := c.PreflightRemoveHost(ctx, &pb.RemoveHostRequest{Name: hostName, ExpectedCertSerial: serial})
+	switch {
+	case err == nil:
+		return fmt.Errorf("%s's row holds certificate %s (it reached this replica just now); nothing was revoked. "+
+			"Run `%s` again, which removes it as `lv host rm` does", hostName, serial, settleRmCmd(hostName, serial, ""))
+	case admissionAbsent(err):
+		return nil
+	case status.Code(err) == codes.NotFound || status.Code(err) == codes.Unimplemented:
+		return fmt.Errorf("the daemon answering cannot confirm, after a pull of the hosts table, that no row holds "+
+			"certificate %s (it is an earlier release); nothing was revoked. Run this against an upgraded host", serial)
+	default:
+		return fmt.Errorf("refusing to revoke certificate %s: %w; nothing was revoked", serial, err)
 	}
-	defer sc.Close()
-	return probeAdmission(&sshAddRemote{sshRemotePKI{sc: sc}}, serial)
 }
 
-// probeAdmission refuses (errFinishedInstall) when r serves certificate
-// serial, unless its install record is an add's claim for serial that never
-// finished: a finished install, an earlier release's record (no state), or
-// no record at all may be a completed add.
-func probeAdmission(r addRemote, serial string) error {
-	_, now, err := remoteCert(r, filepath.Join(remotePKIDir, "host.crt"))
+// admissionAbsent reports whether err is PreflightRemoveHost's refusal
+// marked as decided after a pull (apimeta.AdmissionAbsentReason): no row of
+// the name, or another admission's, and no live row holding the serial.
+func admissionAbsent(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok || err == nil {
+		return false
+	}
+	for _, d := range st.Details() {
+		if info, ok := d.(*errdetails.ErrorInfo); ok && info.GetReason() == apimeta.AdmissionAbsentReason &&
+			info.GetDomain() == apimeta.AdmissionAbsentDomain {
+			return true
+		}
+	}
+	return false
+}
+
+// beforeSettleClaim is a test seam: it runs between claimForSettle's checks
+// and its claim.
+var beforeSettleClaim func()
+
+// claimForSettle checks the machine r for settleAbsentAdmission and claims
+// it, the claim compared under the add lock with the install record and the
+// certificate it checked.
+func claimForSettle(r addRemote, hostName, serial, address string) error {
+	crt := filepath.Join(remotePKIDir, "host.crt")
+	pemB, now, err := remoteCert(r, crt)
 	if err != nil {
 		return err
 	}
-	if now != serial {
-		return nil
+	if now == serial {
+		if err := removeStagedFiles(r, serial); err != nil {
+			return fmt.Errorf("the machine at %s serves certificate %s: a completed add cannot be ruled out, so nothing "+
+				"was revoked; removing its staged files failed too (%v)", address, serial, err)
+		}
+		return fmt.Errorf("the machine at %s serves certificate %s: a completed add cannot be ruled out, so nothing "+
+			"was revoked. Its staged files were removed; the machine's identity and install record are as they were. "+
+			"If its row is still to arrive, run `lv host rm %s` on a host that lists it", address, serial, hostName)
 	}
 	b, ok, err := r.ReadFile(addInstalledMarker)
 	if err != nil {
 		return err
 	}
-	f := strings.Fields(string(b))
-	if ok && len(f) >= 5 && strings.EqualFold(f[1], serial) && f[4] == "installing" {
-		return nil
+	prior := ""
+	if ok {
+		prior = strings.TrimRight(string(b), "\n")
 	}
-	return errFinishedInstall
+	f := markerFields(prior)
+	if len(f) >= 5 && f[4] == "installing" {
+		at, _ := strconv.ParseInt(f[2], 10, 64)
+		if time.Since(time.Unix(at, 0)) < staleClaim {
+			return fmt.Errorf("an `lv host add` holds the machine at %s (claimed less than %s ago); nothing was revoked. "+
+				"Run this again once it has finished", address, staleClaim)
+		}
+	}
+	trace, err := settleTrace(r, hostName, serial, f)
+	if err != nil {
+		return err
+	}
+	if !trace {
+		return fmt.Errorf("the machine at %s holds no staged file, record or install record of certificate %s for %s, "+
+			"so it is not where that admission's add ran; nothing was revoked", address, serial, hostName)
+	}
+	if beforeSettleClaim != nil {
+		beforeSettleClaim()
+	}
+	nonce, err := attemptNonce()
+	if err != nil {
+		return err
+	}
+	cond := markerAbsent(r)
+	if prior != "" {
+		cond = markerIs(r, prior)
+	}
+	q := ssh.ShellQuote(r.Path(crt))
+	if pemB == nil {
+		cond += fmt.Sprintf(" && [ ! -e %s ]", q)
+	} else {
+		sum := sha256.Sum256(pemB)
+		cond += fmt.Sprintf(" && [ \"$(sha256sum < %s | cut -d' ' -f1)\" = %s ]", q, hex.EncodeToString(sum[:]))
+	}
+	mine := markerLine(hostName, serial, time.Now().Unix(), nonce, "installing")
+	_, err = r.Shell("claim", lockedCmd(r, cond, setMarkerCmd(r, mine, nonce)))
+	if exitStatus(err) == notOurMachine {
+		return fmt.Errorf("the machine at %s changed while it was checked; nothing was revoked. Run `%s` again",
+			address, settleRmCmd(hostName, serial, address))
+	}
+	if err != nil {
+		return fmt.Errorf("claim the machine at %s before revoking: %w; nothing was revoked", address, err)
+	}
+	return nil
+}
+
+// settleTrace reports whether the machine holds a trace of serial's add for
+// hostName: a record of it naming hostName, an install record (fields f)
+// naming both, or a staged certificate of serial issued to hostName.
+func settleTrace(r addRemote, hostName, serial string, f []string) (bool, error) {
+	if len(f) >= 3 && f[0] == hostName && canonSerial(f[1]) == serial {
+		return true, nil
+	}
+	recs, err := addRecords(r, serial)
+	if err != nil {
+		return false, err
+	}
+	for _, rec := range recs {
+		if !rec.bad && rec.name == hostName {
+			return true, nil
+		}
+	}
+	crt := filepath.Join(remotePKIDir, "host.crt")
+	tags, err := stagedAttempts(r, crt, serial)
+	if err != nil {
+		return false, err
+	}
+	paths := []string{legacyStagedPath(crt)}
+	for _, t := range tags {
+		paths = append(paths, addStagedPath(crt, t))
+	}
+	for _, p := range paths {
+		b, ok, err := r.ReadFile(p)
+		if err != nil {
+			return false, err
+		}
+		if ok && installedSerial(b) == serial && certIssuedTo(b, hostName) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// certIssuedTo reports whether the PEM certificate b names hostName.
+func certIssuedTo(b []byte, hostName string) bool {
+	blk, _ := pem.Decode(b)
+	if blk == nil {
+		return false
+	}
+	cert, err := x509.ParseCertificate(blk.Bytes)
+	return err == nil && cert.Subject.CommonName == hostName
+}
+
+// dialAdmissionMachine opens the machine at addr, over SSH as root, for
+// `lv host rm`'s checks and cleanup; done closes it. The host is often dead
+// or half set up, so the connection is bounded (stagedCleanupTimeout). A
+// seam so the removal can be tested without a host.
+var dialAdmissionMachine = func(addr string) (addRemote, func(), error) {
+	sc, err := ssh.NewClientDeadline("root@"+addr, stagedCleanupTimeout)
+	if err != nil {
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return nil, nil, fmt.Errorf("SSH connect: gave up after %s: %w", stagedCleanupTimeout, err)
+		}
+		return nil, nil, fmt.Errorf("SSH connect: %w", err)
+	}
+	return &sshAddRemote{sshRemotePKI{sc: sc}}, func() { sc.Close() }, nil
 }

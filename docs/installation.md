@@ -173,14 +173,24 @@ refusal names the certificate the machine serves and
 unfinished admission and leaves that certificate in place.
 
 `lv host rm <name> --serial <serial> --address <ip>` selects an admission by
-its certificate. When the row of `<name>` holds it, this is `lv host rm
-<name>`, refused if the row changes first. When no row holds it (the
+its certificate, in any spelling of the number (case, leading zeroes, `0x`).
+When the row of `<name>` holds it, this is `lv host rm <name>`, with its
+checks, refused if the row changes first. When no row holds it (the
 admission's row is gone, or `<name>` is now another admission), no row is
-touched: the serial is revoked, the CRL published, and the staged files and
-install record of that serial removed from the machine at `--address`. It
-refuses a serial another name's row holds, and one the machine serves without
-an unfinished add's claim for it in `/etc/litevirt/.lv-add-installed` (it may
-be a completed add). A rerun refuses when the key staged or installed
+touched. The daemon first runs a removal's checks (admin, caught up, voter
+majority, a pull of the hosts table) and confirms no live row holds the
+serial; a daemon from an earlier release cannot, and the command refuses. On
+the machine at `--address`, under its add lock, the serial must have left a
+staged file, record or install record for `<name>`, and no add may hold the
+machine; a machine that serves the serial may be a completed add, so only the
+serial's staged files are removed and nothing is revoked. The command then
+claims the machine (`/etc/litevirt/.lv-add-installed`, compared with what it
+checked), revokes the serial, publishes the CRL, and removes that serial's
+staged files, records and install record, never the installed identity. A
+step that fails after the revocation, the publication or the cleanup, says so
+and names the same command, which finishes it. `lv host rm <name>` of a
+joining host whose cleanup on the machine fails does the same. Install and
+attempt records quote a host name that holds a blank. A rerun refuses when the key staged or installed
 on the machine is not the admitted certificate's. The machine running
 `lv host add` keeps its copy of the admitted credentials in
 `hosts/<name>/` under its pki directory.

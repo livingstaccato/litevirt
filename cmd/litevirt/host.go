@@ -476,16 +476,19 @@ func newHostRmCmd() *cobra.Command {
 		Short: "Remove host from cluster",
 		Long: `Removes a host: revokes its certificate, publishes the CRL, and deletes its row.
 
---serial removes one admission, selected by its certificate rather than by the
-row the name has now. When the row of <host> holds that certificate it is the
-removal above, refused if the row changes first. Otherwise no row is touched
-(the admission's row is gone, or <host> is now another admission): the serial
-is revoked and the CRL published, and what its adds left on the machine at
---address (staged files and install record, never the installed identity) is
-removed. --address is required then; the machine is checked first, and a
-certificate it serves without an unfinished add's claim for it is refused as a
-possibly completed add. 'lv host add' names this command when it refuses a
-machine it cannot prove is its own to install on.
+--serial removes one admission, selected by its certificate (any spelling of
+the number) rather than by the row the name has now. When the row of <host>
+holds that certificate it is the removal above, refused if the row changes
+first. Otherwise no row is touched (the admission's row is gone, or <host> is
+now another admission), and --address is required: the daemon runs a
+removal's checks and a pull and confirms no live row holds the serial; the
+machine at --address must hold a trace of it for <host>, no add may hold the
+machine, and a machine serving it may be a completed add (only its staged
+files go, nothing is revoked). Under the machine's add lock it is claimed,
+then the serial is revoked, the CRL published, and its adds' staged files and
+records removed, never the installed identity. A step that fails names this
+same command, which finishes it. 'lv host add' names this command when it
+refuses a machine it cannot prove is its own to install on.
 
 --dead removes a host that is fenced proof-grade and gone for good, so the
 recoveries decided for it can move on (recovery claims, docs/design/recovery-claims.md

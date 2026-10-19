@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -403,7 +404,12 @@ func TestFleet_MAC_ADrainResumeStartNeedsNoReplicatedJournal(t *testing.T) {
 	if _, err := peer.StartVM(ctx, &pb.StartVMRequest{Name: "rv"}); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("an unmarked start on a shared MAC: got %v, want FailedPrecondition", err)
 	}
-	mctx := metadata.AppendToOutgoingContext(ctx, grpcapi.DrainResumeFromMDKey, src.Name)
+	rv, err := corrosion.GetVM(ctx, dst.DB, "rv")
+	if err != nil || rv == nil {
+		t.Fatalf("rv on %s: %v", dst.Name, err)
+	}
+	mctx := metadata.AppendToOutgoingContext(ctx, grpcapi.DrainResumeFromMDKey, src.Name,
+		grpcapi.DrainResumeEpochMDKey, strconv.FormatInt(rv.OwnerEpoch, 10))
 	if _, err := peer.StartVM(mctx, &pb.StartVMRequest{Name: "rv"}); err != nil {
 		t.Fatalf("the drain source's resume start: %v", err)
 	}
@@ -424,10 +430,15 @@ func TestFleet_MAC_ADrainStartCarriesTheResumeMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	sc.dst.Server.SetBridgeEnsure(func(string) error { return nil })
-	var marker []string
+	var marker, epoch []string
+	var rowEpoch int64 = -1
 	sc.dst.HookUnary("StartVM", func(hctx context.Context, req any, handler grpc.UnaryHandler) (any, error) {
 		if md, ok := metadata.FromIncomingContext(hctx); ok {
 			marker = md.Get(grpcapi.DrainResumeFromMDKey)
+			epoch = md.Get(grpcapi.DrainResumeEpochMDKey)
+		}
+		if vm, _ := corrosion.GetVM(ctx, sc.dst.DB, "os1"); vm != nil {
+			rowEpoch = vm.OwnerEpoch
 		}
 		// A holder of os1's MAC appears after the preflight passed.
 		if err := corrosion.InsertVM(ctx, sc.dst.DB, corrosion.VMRecord{Name: "late", HostName: sc.dst.Name, State: "running"},
@@ -446,6 +457,9 @@ func TestFleet_MAC_ADrainStartCarriesTheResumeMarker(t *testing.T) {
 	}
 	if len(marker) != 1 || marker[0] != sc.src.Name {
 		t.Fatalf("the target's StartVM got drain-resume marker %v, want [%s]", marker, sc.src.Name)
+	}
+	if len(epoch) != 1 || epoch[0] != strconv.FormatInt(rowEpoch, 10) {
+		t.Fatalf("the marker's epoch = %v, want the handed-over row's %d", epoch, rowEpoch)
 	}
 	if active, _ := sc.dst.Virt.DomainIsActive("os1"); !active {
 		t.Fatalf("os1 is not running on %s", sc.dst.Name)

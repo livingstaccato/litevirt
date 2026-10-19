@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -413,7 +414,9 @@ func TestStartVM_ADrainResumeMarkerOnlyFromItsPeer(t *testing.T) {
 	}
 	seedNICOf(t, s, "theirs", dup)
 	marked := func(c context.Context, from string) context.Context {
-		return metadata.NewIncomingContext(c, metadata.Pairs(DrainResumeFromMDKey, from))
+		vm, _ := corrosion.GetVM(context.Background(), s.db, "moved")
+		return metadata.NewIncomingContext(c, metadata.Pairs(DrainResumeFromMDKey, from,
+			DrainResumeEpochMDKey, strconv.FormatInt(vm.OwnerEpoch, 10)))
 	}
 	srcPeer := peerCtxFor(t, s, "src-host")
 	if err := s.refuseStartOnSharedMAC(marked(srcPeer, "src-host"), "moved"); err != nil {

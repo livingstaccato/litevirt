@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -333,32 +334,47 @@ func describeMACHolder(h corrosion.MACHolder) string {
 
 // DrainResumeFromMDKey marks a StartVM as the end of a drain's cold move:
 // the source host, which shut the guest down for the move, asks the target
-// to start it again. Honoured only from that host as a peer
-// (drainResumeFromPeer); a client's, or this host's own, is ignored.
-const DrainResumeFromMDKey = "x-litevirt-drain-resume-from"
+// to start it again. DrainResumeEpochMDKey carries the VM owner epoch the
+// move handed the VM over at. Honoured only from that host as a peer, and
+// only for the VM still at that epoch (drainResumeFromPeer); a client's, this
+// host's own, or one with no epoch (an earlier build's source) is ignored.
+const (
+	DrainResumeFromMDKey  = "x-litevirt-drain-resume-from"
+	DrainResumeEpochMDKey = "x-litevirt-drain-resume-epoch"
+)
 
 // drainResumeFromPeer returns the host a StartVM says it ends a drain move
-// for, when the caller is that host: a peer principal (its transport a
-// cluster host certificate — kept when forwarded identity promotes the call
-// to the operator who drove the drain), whose certificate CN is the claimed
-// host, a trusted host that is not this one (a drain's source is never its
-// target). "" otherwise.
-func (s *Server) drainResumeFromPeer(ctx context.Context) string {
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return ""
+// for, and the owner epoch that move handed the VM over at, when the caller
+// is that host: a peer principal (its transport a cluster host certificate
+// — kept when forwarded identity promotes the call to the operator who drove
+// the drain), whose certificate CN is the claimed host, a trusted host that
+// is not this one (a drain's source is never its target). ok is false
+// otherwise, and when the marker names no epoch.
+func (s *Server) drainResumeFromPeer(ctx context.Context) (source string, epoch int64, ok bool) {
+	md, has := metadata.FromIncomingContext(ctx)
+	if !has {
+		return "", 0, false
 	}
 	v := md.Get(DrainResumeFromMDKey)
 	if len(v) == 0 || v[0] == "" {
-		return ""
+		return "", 0, false
 	}
 	claimed := v[0]
 	if callerPrincipalKind(ctx) != principalKindPeer || callerMTLSCommonName(ctx) != claimed ||
 		claimed == s.hostName || !s.isTrustedHostCN(ctx, claimed) {
 		slog.Warn("start: ignoring a drain-resume marker not sent by the claimed source host as a peer", "claimed_source", claimed)
-		return ""
+		return "", 0, false
 	}
-	return claimed
+	e := md.Get(DrainResumeEpochMDKey)
+	if len(e) == 0 {
+		return "", 0, false
+	}
+	n, err := strconv.ParseInt(e[0], 10, 64)
+	if err != nil {
+		slog.Warn("start: ignoring a drain-resume marker with an unreadable epoch", "claimed_source", claimed, "epoch", e[0])
+		return "", 0, false
+	}
+	return claimed, n, true
 }
 
 // refuseStartOnSharedMAC refuses an operator start of the stopped VM name
@@ -378,17 +394,17 @@ func (s *Server) refuseStartOnSharedMAC(ctx context.Context, name string) error 
 	if s.db == nil {
 		return nil
 	}
-	if src := s.drainResumeFromPeer(ctx); src != "" {
+	if src, epoch, ok := s.drainResumeFromPeer(ctx); ok {
 		vm, err := corrosion.GetVM(ctx, s.db, name)
-		if err != nil || vm == nil || (vm.State == "stopped" &&
+		if err != nil || vm == nil || (vm.OwnerEpoch == epoch && vm.State == "stopped" &&
 			(vm.StateDetail == "" || strings.HasPrefix(vm.StateDetail, health.DrainStopDetailPrefix))) {
-			// The shape a drain's move hands the VM over in: stopped, with
-			// no stop intent (or the drain's own). A row that cannot be
-			// read now may be one.
+			// The VM as the drain's move handed it over: at the epoch that
+			// transfer wrote, stopped, with no stop intent (or the drain's
+			// own). A row that cannot be read now may be one.
 			return nil
 		}
-		slog.Warn("start: a drain-resume marker for a VM no drain recorded stopped; checked as any start",
-			"vm", name, "source", src, "state_detail", vm.StateDetail)
+		slog.Warn("start: a drain-resume marker for a VM not as that drain's move handed it over; checked as any start",
+			"vm", name, "source", src, "marker_epoch", epoch, "owner_epoch", vm.OwnerEpoch, "state_detail", vm.StateDetail)
 	}
 	resuming, rerr := corrosion.DrainColdMoveOpenTo(ctx, s.db, name, s.hostName)
 	if rerr != nil {

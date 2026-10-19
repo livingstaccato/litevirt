@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -348,9 +349,17 @@ func (s *Server) startOnOwner(ctx context.Context, name, target string) error {
 			for _, v := range resp.GetVms() {
 				if v.GetName() == name && v.GetHostName() == target {
 					// The target is told this start ends this host's drain move
-					// (over peer mTLS), so its shared-MAC gate never leaves the
-					// guest stopped, whatever its replica of the journal holds.
-					sctx := metadata.AppendToOutgoingContext(ctx, DrainResumeFromMDKey, s.hostName)
+					// (over peer mTLS), bound to the owner epoch the move handed
+					// the VM over at (this host wrote that transfer), so its
+					// shared-MAC gate never leaves the guest stopped, whatever its
+					// replica of the journal holds. Without the epoch no marker
+					// is sent: the gate then applies as to any start.
+					sctx := ctx
+					if cur, gerr := corrosion.GetVM(ctx, s.db, name); gerr == nil && cur != nil && cur.HostName == target {
+						sctx = metadata.AppendToOutgoingContext(ctx,
+							DrainResumeFromMDKey, s.hostName,
+							DrainResumeEpochMDKey, strconv.FormatInt(cur.OwnerEpoch, 10))
+					}
 					_, serr := client.StartVM(sctx, &pb.StartVMRequest{Name: name})
 					return serr
 				}

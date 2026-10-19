@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"strconv"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -28,8 +29,15 @@ func macr3Setup(t *testing.T) *Server {
 	return s
 }
 
-func macr3Marked(c context.Context, from string) context.Context {
-	return metadata.NewIncomingContext(c, metadata.Pairs(DrainResumeFromMDKey, from))
+// macr3Marked is c carrying a drain-resume marker from host from, bound to
+// the owner epoch VM "moved" is at in s.
+func macr3Marked(s *Server, c context.Context, from string) context.Context {
+	vm, err := corrosion.GetVM(context.Background(), s.db, "moved")
+	if err != nil || vm == nil {
+		panic("macr3Marked: no VM moved")
+	}
+	return metadata.NewIncomingContext(c, metadata.Pairs(DrainResumeFromMDKey, from,
+		DrainResumeEpochMDKey, strconv.FormatInt(vm.OwnerEpoch, 10)))
 }
 
 // A drain's source host whose StartVM carried the operator's bearer
@@ -46,7 +54,7 @@ func TestStartVM_AForwardedIdentityDrainKeepsItsMarker(t *testing.T) {
 	ctx = context.WithValue(ctx, ctxKeyRole, "admin")
 	ctx = context.WithValue(ctx, ctxKeyPrincipalKind, principalKindPeer)
 	ctx = context.WithValue(ctx, ctxKeyMTLSCommonName, "src-host")
-	if err := s.refuseStartOnSharedMAC(macr3Marked(ctx, "src-host"), "moved"); err != nil {
+	if err := s.refuseStartOnSharedMAC(macr3Marked(s, ctx, "src-host"), "moved"); err != nil {
 		t.Fatalf("the source's marker on a forwarded-identity peer call was ignored: %v", err)
 	}
 }
@@ -57,7 +65,7 @@ func TestStartVM_AForwardedIdentityDrainKeepsItsMarker(t *testing.T) {
 func TestStartVM_LocalRootCannotClaimItsOwnDrain(t *testing.T) {
 	s := macr3Setup(t)
 	_ = peerCtxFor(t, s, s.hostName) // this host's own row
-	if err := s.refuseStartOnSharedMAC(macr3Marked(localRootCtx(s.hostName), s.hostName), "moved"); status.Code(err) != codes.FailedPrecondition {
+	if err := s.refuseStartOnSharedMAC(macr3Marked(s, localRootCtx(s.hostName), s.hostName), "moved"); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("on-node root with a marker naming this host: got %v, want FailedPrecondition", err)
 	}
 }
@@ -66,7 +74,7 @@ func TestStartVM_LocalRootCannotClaimItsOwnDrain(t *testing.T) {
 // ignored even when its CN equals the claim.
 func TestStartVM_AnUntrustedCNEqualToTheClaimIsIgnored(t *testing.T) {
 	s := macr3Setup(t)
-	if err := s.refuseStartOnSharedMAC(macr3Marked(mtlsCtx("ghost-host"), "ghost-host"), "moved"); status.Code(err) != codes.FailedPrecondition {
+	if err := s.refuseStartOnSharedMAC(macr3Marked(s, mtlsCtx("ghost-host"), "ghost-host"), "moved"); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("an untrusted CN equal to the claim: got %v, want FailedPrecondition", err)
 	}
 }
@@ -78,7 +86,7 @@ func TestStartVM_ARemovedHostsMarkerIsIgnored(t *testing.T) {
 	if err := s.db.Execute(context.Background(), `UPDATE hosts SET deleted_at = 't' WHERE name = 'gone-host'`); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.refuseStartOnSharedMAC(macr3Marked(ctx, "gone-host"), "moved"); status.Code(err) != codes.FailedPrecondition {
+	if err := s.refuseStartOnSharedMAC(macr3Marked(s, ctx, "gone-host"), "moved"); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("a removed host's marker: got %v, want FailedPrecondition", err)
 	}
 }
@@ -91,7 +99,56 @@ func TestStartVM_ADrainMarkerOnAnOperatorStoppedVMIsChecked(t *testing.T) {
 	if err := s.db.Execute(context.Background(), `UPDATE vms SET state_detail = 'operator-stop' WHERE name = 'moved'`); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.refuseStartOnSharedMAC(macr3Marked(ctx, "src-host"), "moved"); status.Code(err) != codes.FailedPrecondition {
+	if err := s.refuseStartOnSharedMAC(macr3Marked(s, ctx, "src-host"), "moved"); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("a marker on an operator-stopped VM: got %v, want FailedPrecondition", err)
+	}
+}
+
+// A host that dials its own advertise address arrives non-loopback, so it is
+// classified a peer with CN = this host. A drain's source is never its
+// target: its marker naming this host is no resume.
+func TestStartVM_APeerCallFromThisHostCannotClaimItsOwnDrain(t *testing.T) {
+	s := macr3Setup(t)
+	ctx := peerCtxFor(t, s, s.hostName)
+	if err := s.refuseStartOnSharedMAC(macr3Marked(s, ctx, s.hostName), "moved"); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a peer-classified call from this host with a self marker: got %v, want FailedPrecondition", err)
+	}
+}
+
+// An operator's direct bearer carries no principal kind, whatever CN its
+// transport presents: its marker naming the transport host is ignored.
+func TestStartVM_AnOperatorBearerCannotPoseAsAPeer(t *testing.T) {
+	s := macr3Setup(t)
+	_ = peerCtxFor(t, s, "src-host")
+	ctx := context.WithValue(context.Background(), ctxKeyAuthMethod, authMethodSession)
+	ctx = context.WithValue(ctx, ctxKeyUsername, "op")
+	ctx = context.WithValue(ctx, ctxKeyRole, "admin")
+	ctx = context.WithValue(ctx, ctxKeyMTLSCommonName, "src-host")
+	if err := s.refuseStartOnSharedMAC(macr3Marked(s, ctx, "src-host"), "moved"); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("an operator bearer's marker: got %v, want FailedPrecondition", err)
+	}
+}
+
+// The marker is bound to the move: it exempts the VM only at the owner epoch
+// the drain handed it over at. A VM that has moved since (an operator's cold
+// migrate of the stopped VM leaves it stopped with an empty detail, at a
+// later epoch), and a marker with no epoch (an earlier build's source), are
+// checked as any start.
+func TestStartVM_ADrainMarkerIsBoundToTheMovesEpoch(t *testing.T) {
+	s := macr3Setup(t)
+	ctx := peerCtxFor(t, s, "src-host")
+	if err := s.refuseStartOnSharedMAC(macr3Marked(s, ctx, "src-host"), "moved"); err != nil {
+		t.Fatalf("the marker at the VM's epoch: %v", err)
+	}
+	noEpoch := metadata.NewIncomingContext(ctx, metadata.Pairs(DrainResumeFromMDKey, "src-host"))
+	if err := s.refuseStartOnSharedMAC(noEpoch, "moved"); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a marker with no epoch: got %v, want FailedPrecondition", err)
+	}
+	stale := macr3Marked(s, ctx, "src-host")
+	if err := s.db.Execute(context.Background(), `UPDATE vms SET vm_owner_epoch = vm_owner_epoch + 1, state_detail = '' WHERE name = 'moved'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.refuseStartOnSharedMAC(stale, "moved"); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a marker from an earlier placement: got %v, want FailedPrecondition", err)
 	}
 }

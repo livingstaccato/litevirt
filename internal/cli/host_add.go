@@ -1729,6 +1729,10 @@ const staleClaim = 10 * time.Minute
 // here: long past the time an admission takes to reach every host.
 const freshInstall = time.Hour
 
+// addNow is the clock refuseSecondInstall reads an install record's age by.
+// A var so tests can fix it.
+var addNow = time.Now
+
 // notOurMachine is the exit status of a guarded command that found the
 // machine claimed by another (machineClaim.cmd).
 const notOurMachine = 97
@@ -1872,7 +1876,7 @@ func refuseSecondInstall(r addRemote, p hostAddPlan, serial string, exp addExpec
 	if len(f) >= 4 && validAttemptTag(f[3]) {
 		attempt = f[3]
 	}
-	if len(f) >= 5 && f[4] == "installing" && f[3] != nonce && time.Since(when) < staleClaim {
+	if len(f) >= 5 && f[4] == "installing" && f[3] != nonce && addNow().Sub(when) < staleClaim {
 		return "", fmt.Errorf("another `lv host add` holds this machine (attempt %s, for %s with certificate %s, since "+
 			"%s), and this one installs nothing. Run this again once it has finished; if it died, after %s",
 			attempt, name, shown, when.UTC().Format(time.RFC3339), when.Add(staleClaim).UTC().Format(time.RFC3339))
@@ -1883,7 +1887,7 @@ func refuseSecondInstall(r addRemote, p hostAddPlan, serial string, exp addExpec
 	// proven not to be it: nothing, this admission's own certificate, or one
 	// this cluster's CA issued and revoked. The record's serial being
 	// revoked proves nothing about the certificate installed.
-	if other == serial || time.Since(when) >= freshInstall || now == "" || now == serial || revokedHere(p.pkiDir, nowPEM) {
+	if other == serial || addNow().Sub(when) >= freshInstall || now == "" || now == serial || revokedHere(p.pkiDir, nowPEM) {
 		return prior, nil
 	}
 	return "", settled(fmt.Sprintf("another admission installed this machine as %s (certificate %s) at %s, and the "+

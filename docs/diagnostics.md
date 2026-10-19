@@ -1827,7 +1827,8 @@ it):
   made on the source since the failover. With the owner's domain defined it
   needs the domain stopped (`lv stop`) and its persistent config pointed at
   the copy, as any other `--accept` of the copy on the owner. Once the VM
-  changed hands it is refused while the source was modified after the copy,
+  changed hands it is taken only on the VM's owner, and refused while the
+  source was modified after the copy, or either file cannot be read there,
   unless `--force` is given, with the reason audited.
 
 With the domain running, only the file the running guest has open is kept,
@@ -1838,7 +1839,9 @@ modified after the copy was written since the failover) and the starts of the
 VM recorded since the move began. A start through `lv start`, an HA restart
 or failover, the reconciler, a health check's restart, a replacement's restart
 or a promotion leaves a replicated `vm.starting` event naming the host and the
-ownership generation, which `lv events <vm>` lists; `lv audit ls --target
+ownership generation, and a domain the reconciler finds already running a
+`vm.adopted_running` event; `lv events <vm>` lists both, and the refusal
+lists them; `lv audit ls --target
 <vm>` lists its failover reschedules (action `failover`). The list may be
 incomplete either way: an event stamped by a host whose clock runs behind,
 one pruned with the VM's old events or beyond the newest 1000, one that has

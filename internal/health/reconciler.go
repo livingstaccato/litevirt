@@ -1775,6 +1775,11 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		state, err := r.virt.DomainState(vm.Name)
 		if err == nil && state == "running" {
 			slog.Warn("reconciler: domain already running locally, updating state", "vm", vm.Name)
+			// Not a start, but the guest ran here: the evidence an operator
+			// judges a forked move history by (MoveStartsText).
+			if eerr := NoteAdoptedRunning(ctx, r.db, r.hostName, vm.Name); eerr != nil {
+				slog.Warn("reconciler: recording the running domain's adoption failed", "vm", vm.Name, "error", eerr)
+			}
 			// Idempotent retry: the domain is already up. Complete the proof
 			// (single-use) + clear pending_action_id in one guarded mutation. Do NOT
 			// downgrade to a plain running update on guard failure — that would bypass

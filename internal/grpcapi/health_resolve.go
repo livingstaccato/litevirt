@@ -589,10 +589,17 @@ func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev 
 						"cannot be read (%v). Stop it first (`lv stop %s`) and retry", health.MoveUnresolvedCode, vm, here, m.Disk, lerr, vm)
 			}
 			if lname != keep {
+				// --accept of the live file is an exit only when the row
+				// names it: otherwise keeping it moves the row under the
+				// running domain, which is refused below.
+				alt := ""
+				if lname == row.Path {
+					alt = fmt.Sprintf(", or pass --accept %s", lname)
+				}
 				return nil, nil, nil, status.Errorf(codes.FailedPrecondition,
 					"refusing to resolve %s on vm/%s: its domain is active on %s and the running guest has %s open for disk "+
-						"%s, not %s, which this would keep. Stop it first (`lv stop %s`) and retry, or pass --accept %s",
-					health.MoveUnresolvedCode, vm, here, lname, m.Disk, keep, vm, lname)
+						"%s, not %s, which this would keep. Stop it first (`lv stop %s`) and retry%s",
+					health.MoveUnresolvedCode, vm, here, lname, m.Disk, keep, vm, alt)
 			}
 		}
 		rewrite := false
@@ -629,30 +636,49 @@ func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev 
 				continue
 			}
 		}
-		if proven && path == m.Dst && keep == m.Dst && health.OwnerChangedSince(rec, m) && health.ModifiedLater(m.Src, m.Dst) {
-			// A forked history the other way: the source was written after
-			// the holder's last write to the copy, so the VM ran on it since
-			// it changed hands, and keeping the copy discards those writes.
-			facts := health.MoveFileFacts(m.Src) + "; " + health.MoveFileFacts(m.Dst)
-			if !force {
-				return nil, nil, nil, status.Errorf(codes.FailedPrecondition,
-					"refusing to resolve %s on vm/%s keeping %s: %s was modified after it (%s), and the VM changed hands "+
-						"since %s pivoted the guest onto %s, so it may have run on %s since, and keeping %s discards those "+
-						"writes. Check whether it did (%s); keep %s with `--accept %s` on the VM's owner %s, or, to keep %s "+
-						"all the same, pass --accept %s --force with --reason saying why",
-					health.MoveUnresolvedCode, vm, keep, m.Src, facts, holder, m.Dst, m.Src, keep,
-					health.MoveStartsText(ctx, s.db, m), m.Src, m.Src, owner, keep, keep)
-			}
-			forks = append(forks, fmt.Sprintf("disk %s keeps %s, taken with --force although %s was modified after it "+
-				"and the VM changed hands since the move began (owner %s at generation %d then, %s at %d now): what was "+
-				"written to %s since is discarded, and the file is kept on disk (%s)", m.Disk, keep, m.Src, m.Owner,
-				m.OwnerEpoch, rec.HostName, rec.OwnerEpoch, m.Src, facts))
-		}
 		if active && keep != row.Path {
+			// keep is the running guest's file (the gate above), so the row's
+			// file is not: stopping it is the exit.
 			return nil, nil, nil, status.Errorf(codes.FailedPrecondition,
 				"refusing to resolve %s on vm/%s: this would point the disk row of %s at %s while its domain is active on %s, "+
-					"writing the file it opened. Stop it first (`lv stop %s`), or pass --accept %s to keep the file the row names",
-				health.MoveUnresolvedCode, vm, m.Disk, keep, here, vm, row.Path)
+					"writing the file it opened. Stop it first (`lv stop %s`) and retry",
+				health.MoveUnresolvedCode, vm, m.Disk, keep, here, vm)
+		}
+		if proven && path == m.Dst && keep == m.Dst && health.OwnerChangedSince(rec, m) {
+			// A forked history the other way: the VM changed hands since the
+			// copy took every write, so it may have run on the source since,
+			// and keeping the copy discards those writes. Judged on the owner
+			// only, and closed when the files cannot be read.
+			moved := health.MovedOntoText(holder, m)
+			if here != owner {
+				return nil, nil, nil, status.Errorf(codes.FailedPrecondition,
+					"refusing to resolve %s on vm/%s keeping %s here: the VM changed hands since %s, and whether it ran "+
+						"on %s since is judged on the VM's owner %s, which reads both files: run it there (LV_HOST=%s)",
+					health.MoveUnresolvedCode, vm, keep, moved, m.Src, owner, owner)
+			}
+			facts := health.MoveFileFacts(m.Src) + "; " + health.MoveFileFacts(m.Dst)
+			why := ""
+			if rerr := health.FilesReadable(m.Src, m.Dst); rerr != nil {
+				why = fmt.Sprintf("the two files cannot both be read here (%s), so nothing here shows whether %s was "+
+					"written since", facts, m.Src)
+			} else if health.ModifiedLater(m.Src, m.Dst) {
+				why = fmt.Sprintf("%s was modified after it (%s)", m.Src, facts)
+			}
+			if why != "" {
+				if !force {
+					return nil, nil, nil, status.Errorf(codes.FailedPrecondition,
+						"refusing to resolve %s on vm/%s keeping %s: %s, and the VM changed hands since %s, so it may "+
+							"have run on %s since, and keeping %s discards those writes. Check whether it did (%s); keep %s "+
+							"with `--accept %s` here, or, to keep %s all the same, pass --accept %s --force with --reason "+
+							"saying why",
+						health.MoveUnresolvedCode, vm, keep, why, moved, m.Src, keep,
+						health.MoveStartsText(ctx, s.db, m), m.Src, m.Src, keep, keep)
+				}
+				forks = append(forks, fmt.Sprintf("disk %s keeps %s, taken with --force although %s, and the VM changed "+
+					"hands since the move began (owner %s at generation %d then, %s at %d now): what was written to %s "+
+					"since is discarded, and the file is kept on disk", m.Disk, keep, why, m.Owner, m.OwnerEpoch,
+					rec.HostName, rec.OwnerEpoch, m.Src))
+			}
 		}
 		names := ""
 		if config && !rewrite {
@@ -750,10 +776,10 @@ func forkedHistory(ctx context.Context, db *corrosion.Client, here, owner, holde
 	}
 	if here != owner {
 		return "", false, status.Errorf(codes.FailedPrecondition,
-			"refusing to resolve %s on vm/%s with --accept %s here: the VM changed hands since %s pivoted the guest onto %s, "+
+			"refusing to resolve %s on vm/%s with --accept %s here: the VM changed hands since %s, "+
 				"and such a forked history is resolved on the VM's owner %s, which reads its own domain: run it there "+
 				"(LV_HOST=%s), or keep the copy with `--accept %s`",
-			health.MoveUnresolvedCode, rec.Name, keep, holder, other, owner, owner, other)
+			health.MoveUnresolvedCode, rec.Name, keep, health.MovedOntoText(holder, m), owner, owner, other)
 	}
 	if !config && !noDomain {
 		return "", false, nil
@@ -781,9 +807,9 @@ func forkedHistory(ctx context.Context, db *corrosion.Client, here, owner, holde
 	if health.ModifiedLater(other, keep) {
 		if !force {
 			return "", false, status.Errorf(codes.FailedPrecondition,
-				"refusing to resolve %s on vm/%s with --accept %s: %s was modified after it (%s). After the pivot %s wrote "+
+				"refusing to resolve %s on vm/%s with --accept %s: %s was modified after it (%s). Since the move %s wrote "+
 					"only %s, so nothing was written to %s since %s's last write, and keeping it would discard %s's "+
-					"writes after the pivot. Check whether the VM ran since it changed hands (%s); keep %s with "+
+					"writes since the move. Check whether the VM ran since it changed hands (%s); keep %s with "+
 					"`--accept %s`, or, if %s does hold writes to keep, pass --force with --reason saying why",
 				health.MoveUnresolvedCode, rec.Name, keep, other, facts, holder, other, keep, holder, holder,
 				health.MoveStartsText(ctx, db, m), other, other, keep)
@@ -799,8 +825,8 @@ func forkedHistory(ctx context.Context, db *corrosion.Client, here, owner, holde
 		cfg = fmt.Sprintf("; the persistent config on %s, which named %s, is pointed at %s", here, other, keep)
 	}
 	return fmt.Sprintf("disk %s keeps %s, %s since the VM changed hands after the move began (owner %s at "+
-		"generation %d then, %s at %d now); %s, onto which %s pivoted the guest, holds its writes after the pivot and is "+
-		"kept on disk (%s)%s%s", m.Disk, keep, ran, m.Owner, m.OwnerEpoch, rec.HostName, rec.OwnerEpoch, other, holder,
+		"generation %d then, %s at %d now); %s holds the writes since %s and is kept on disk (%s)%s%s",
+		m.Disk, keep, ran, m.Owner, m.OwnerEpoch, rec.HostName, rec.OwnerEpoch, other, health.MovedOntoText(holder, m),
 		facts, cfg, forced), rewrite, nil
 }
 

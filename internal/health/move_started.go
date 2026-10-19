@@ -42,6 +42,11 @@ func startedHereFile(dataDir, vm string) string {
 // VM, an HA failover's included.
 const StartingEventType = "vm.starting"
 
+// AdoptedRunningEventType is the vm_events type a reconciler records when it
+// finds a VM's domain already running here instead of starting it: the guest
+// ran here, though no start was made.
+const AdoptedRunningEventType = "vm.adopted_running"
+
 // NoteStartingHere records that vm's domain is about to start on this host at
 // its current ownership generation; a later generation than one recorded
 // replaces it. Called after a start's move heal and before the domain starts,
@@ -94,6 +99,40 @@ func NoteStartEvent(ctx context.Context, db *corrosion.Client, host, vm string) 
 	return nil
 }
 
+// NoteAdoptedRunning appends the replicated AdoptedRunningEventType event of
+// vm's domain found running on host.
+func NoteAdoptedRunning(ctx context.Context, db *corrosion.Client, host, vm string) error {
+	if db == nil {
+		return nil
+	}
+	detail := fmt.Sprintf("found running on %s", host)
+	if rec, err := corrosion.GetVM(ctx, db, vm); err == nil && rec != nil {
+		detail += fmt.Sprintf(" at ownership generation %d", rec.OwnerEpoch)
+	}
+	return corrosion.InsertVMEvent(ctx, db, corrosion.VMEventRecord{VMName: vm, HostName: host,
+		Type: AdoptedRunningEventType, Detail: detail})
+}
+
+// FilesReadable reports the first of paths that cannot be read here.
+func FilesReadable(paths ...string) error {
+	for _, p := range paths {
+		if _, err := os.Stat(p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// MovedOntoText says how move m made its copy the file holding every write:
+// holder pivoted the guest onto it, or named it in the persistent config
+// before the move (a catch-up).
+func MovedOntoText(holder string, m UnresolvedMove) string {
+	if m.CatchUp && !m.Pivoted {
+		return fmt.Sprintf("%s named %s in the persistent config before the move", holder, m.Dst)
+	}
+	return fmt.Sprintf("%s pivoted the guest onto %s", holder, m.Dst)
+}
+
 // MoveStartsText lists the starts of m's VM recorded since m began (the
 // replicated StartingEventType events), for an operator choosing between a
 // move's two files. An empty list proves nothing, and says so.
@@ -108,7 +147,7 @@ func MoveStartsText(ctx context.Context, db *corrosion.Client, m UnresolvedMove)
 	}
 	var out []string
 	for _, e := range evs {
-		if e.Type == StartingEventType {
+		if e.Type == StartingEventType || e.Type == AdoptedRunningEventType {
 			out = append(out, e.Detail+" ("+e.TS+")")
 		}
 	}

@@ -436,6 +436,7 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 			if err := stream.Send(&pb.DrainProgress{VmName: vm.Name, Status: "skipped", Strategy: notMoved,
 				Error: "a move of this VM is in flight (an earlier drain's finishing in the background, or a migration); " +
 					"re-run drain once it ends (`lv events " + vm.Name + "`)"}); err != nil {
+				s.drainEndedBeforeAnyMove(ctx, req.Name, err)
 				return err
 			}
 		}
@@ -479,6 +480,7 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 				Strategy: notMoved,
 				Error:    fmt.Sprintf("no eligible target: %v", err),
 			}); err != nil {
+				s.drainEndedBeforeAnyMove(ctx, req.Name, err)
 				return err
 			}
 			continue
@@ -598,8 +600,10 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 				slog.Warn("drain: ended after its client went away", "host", req.Name, "outcomes", strings.Join(outcomes, "; "))
 				s.audit(dctx, "host.drain", req.Name, detail, "cancelled")
 			}(timedOut)
+			// This VM's move ended before the client was found gone: its
+			// outcome is the one the client did not receive.
 			s.recordVMEvent(dctx, progress.VmName, "vm.drain", drainEventResult(progress),
-				"after the drain's client left: "+drainOutcome(progress))
+				"not reported to the drain's client, which went away: "+drainOutcome(progress))
 			return serr
 		}
 	}
@@ -719,7 +723,11 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// rolled back as its own failure paths do — even if the drain's client
 	// goes away. A move on the request's context died with it: a cold move
 	// shut the guest down, failed its next read, and started it again here.
-	ctx = context.WithoutCancel(ctx)
+	// It is not unbounded: a stalled disk copy is aborted (streamColdDisk), and
+	// `lv operation abort <vm> --force` cancels the move (cancelDrainMove).
+	ctx, cancelMove := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelMove()
+	defer s.trackDrainMove(vm.Name, cancelMove)()
 	adopted := false
 	defer func() {
 		if !adopted {
@@ -1058,7 +1066,7 @@ func (s *Server) drainLockVM(ctx context.Context, vm, target string) (unlock fun
 		}
 		return nil
 	}
-	if u, ok := s.tryLockVM(vm); ok {
+	if u, ok := s.tryLockVMAs(vm, "drain"); ok {
 		return u, nil
 	}
 	if p := inFlight(); p != nil {
@@ -1082,7 +1090,7 @@ func (s *Server) drainLockVM(ctx context.Context, vm, target string) (unlock fun
 					drainLockWait, holder)}
 		case <-tick.C:
 		}
-		if u, ok := s.tryLockVM(vm); ok {
+		if u, ok := s.tryLockVMAs(vm, "drain"); ok {
 			return u, nil
 		}
 		if p := inFlight(); p != nil {
@@ -1118,6 +1126,43 @@ func (s *Server) undrainJudge(ctx context.Context, host string) {
 // drainBackgroundMarker is in the Error of such a frame when libvirt did not
 // answer the abort and the move was handed to a background owner.
 const drainBackgroundMarker = "finish in the background"
+
+// drainEndedBeforeAnyMove records a drain whose client went away before any
+// move was started: nothing was moved, and the drain does not end silently.
+func (s *Server) drainEndedBeforeAnyMove(ctx context.Context, host string, err error) {
+	dctx := context.WithoutCancel(ctx)
+	slog.Warn("drain: the client went away before any move started; nothing was moved", "host", host, "error", err)
+	s.publish("host.drain.cancelled", host, "the drain's client went away before any move started")
+	s.audit(dctx, "host.drain", host, "the drain's client went away before any move started; nothing was moved", "cancelled")
+}
+
+// trackDrainMove records cancel as vm's drain move in flight on this host,
+// and returns the func that forgets it.
+func (s *Server) trackDrainMove(vm string, cancel context.CancelFunc) func() {
+	s.drainMovesMu.Lock()
+	if s.drainMoves == nil {
+		s.drainMoves = map[string]context.CancelFunc{}
+	}
+	s.drainMoves[vm] = cancel
+	s.drainMovesMu.Unlock()
+	return func() {
+		s.drainMovesMu.Lock()
+		delete(s.drainMoves, vm)
+		s.drainMovesMu.Unlock()
+	}
+}
+
+// cancelDrainMove cancels vm's drain move in flight on this host, reporting
+// whether there was one.
+func (s *Server) cancelDrainMove(vm string) bool {
+	s.drainMovesMu.Lock()
+	cancel, ok := s.drainMoves[vm]
+	s.drainMovesMu.Unlock()
+	if ok {
+		cancel()
+	}
+	return ok
+}
 
 // drainOutcome is one VM's drain frame in words, for the record of a drain
 // whose client went away.

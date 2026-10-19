@@ -512,7 +512,7 @@ func (s *Server) resumeDrainColdMove(ctx context.Context, m corrosion.DrainColdM
 // resumeDrainColdMoveHere is resumeDrainColdMove for a VM still owned here at
 // the journaled epoch, under its lock.
 func (s *Server) resumeDrainColdMoveHere(ctx context.Context, m corrosion.DrainColdMove) (string, bool, error) {
-	unlock := s.lockVM(m.VM)
+	unlock := s.lockVMAs(m.VM, "drain cold-move recovery")
 	defer unlock()
 	vm, err := corrosion.GetVM(ctx, s.db, m.VM)
 	if err != nil {

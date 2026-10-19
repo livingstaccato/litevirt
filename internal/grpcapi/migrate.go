@@ -100,7 +100,7 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// released here UNLESS the migration outlives this request, in which case it
 	// travels with the adopter — dropping it while libvirt is still moving the
 	// guest is what lets a snapshot or delete run against a VM mid-flight.
-	unlock := releaseOnce(s.lockVM(req.VmName))
+	unlock := releaseOnce(s.lockVMAs(req.VmName, "migration"))
 	adopted := false
 	defer func() {
 		if !adopted {
@@ -1367,6 +1367,24 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 	if _, err := s.authorizeMigrationHelper(ctx, req.VmName); err != nil {
 		return nil, err
 	}
+	// Whether this host's QEMU can take an encrypted copy, settled once.
+	var tlsReady bool
+	var tlsErr error
+	if req.WantMigrationTls {
+		tlsReady, tlsErr = s.migrationTLSState()
+	}
+	// A storage copy (disk stubs) that asks for TLS while this host's own
+	// credentials are unusable is refused, before anything is created: an
+	// older source reads only migration_tls_ready, and with its plaintext
+	// opt-in it would send the copy in plaintext to a host that is merely
+	// misconfigured. A memory-only ask is answered "not ready" below, and
+	// that move stays in libvirt's tunnel.
+	if len(req.Disks) > 0 && errors.Is(tlsErr, pki.ErrInvalidMigrationCredentials) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%s holds migration-TLS credentials it cannot use (%s), so a storage copy to it cannot be encrypted. "+
+				"Reissue its credentials with `lv host install-migration-tls --reissue` (run where the cluster's migration CA lives)",
+			s.hostName, headerValue(tlsErr.Error()))
+	}
 	// A NIC whose MTU this host's bridge does not equal: answered before
 	// anything is created here, and the source refuses the move.
 	if p := s.nicMTUProblem(ctx, req.GetNicMtu()); p != "" {
@@ -1472,15 +1490,14 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		// take the other end, and, in a response header, which migration CA
 		// its credentials chain to, so the source can refuse a mismatch
 		// before the copy rather than at QEMU's TLS handshake.
-		ready, tlsErr := s.migrationTLSState()
-		resp.MigrationTlsReady = ready
+		resp.MigrationTlsReady = tlsReady
 		if fp, _ := s.localMigrationCA(); resp.MigrationTlsReady && fp != "" {
 			_ = grpc.SetHeader(ctx, metadata.Pairs(MigrationCAMD, fp))
 		}
 		if errors.Is(tlsErr, pki.ErrInvalidMigrationCredentials) {
 			// Not ready because the credentials here are unusable: say why, so
 			// the source can refuse with the fix rather than "no credentials".
-			_ = grpc.SetHeader(ctx, metadata.Pairs(MigrationTLSUnusableMD, tlsErr.Error()))
+			_ = grpc.SetHeader(ctx, metadata.Pairs(MigrationTLSUnusableMD, headerValue(tlsErr.Error())))
 		}
 	}
 	s.answerMigrationNetwork(ctx, req, resp)
@@ -2331,6 +2348,23 @@ const MigrationCAMD = "x-litevirt-migration-ca-sha256"
 // unusable (pki.ErrInvalidMigrationCredentials) says why. An older target, or
 // one that simply has none, sends none.
 const MigrationTLSUnusableMD = "x-litevirt-migration-tls-unusable"
+
+// headerValue makes text a valid gRPC (HTTP/2) header value: one line of
+// printable ASCII, at most 512 bytes. Anything else becomes '?'.
+func headerValue(text string) string {
+	const limit = 512
+	b := make([]byte, 0, min(len(text), limit))
+	for _, r := range text {
+		if len(b) >= limit {
+			break
+		}
+		if r < 0x20 || r > 0x7e {
+			r = '?'
+		}
+		b = append(b, byte(r))
+	}
+	return string(b)
+}
 
 // unusableMigrationCredentialsRefusal refuses a storage copy because host's
 // migration-TLS credentials are unusable (why), with the fix.

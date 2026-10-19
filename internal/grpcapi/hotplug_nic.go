@@ -221,7 +221,7 @@ func (s *Server) attachNICEntry(ctx context.Context, req *pb.AttachDeviceRequest
 // vm_nics/vm_interfaces overlay (MergedVMNICs, §4.2) so the duplicate/mac checks see
 // both tables' rows regardless of which one a given peer currently writes.
 func (s *Server) attachNICOwner(ctx context.Context, req *pb.AttachDeviceRequest, vmName, opID, reqHash, idemKey string) (*pb.VM, error) {
-	unlock := s.lockVM(vmName)
+	unlock := s.lockVMAs(vmName, "NIC attach")
 	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)
@@ -885,7 +885,7 @@ func (s *Server) detachNICEntry(ctx context.Context, req *pb.DetachDeviceRequest
 
 // detachNICOwner is the at-most-once owner path for a NIC detach.
 func (s *Server) detachNICOwner(ctx context.Context, req *pb.DetachDeviceRequest, vmName, opID, reqHash, idemKey string) (*pb.VM, error) {
-	unlock := s.lockVM(vmName)
+	unlock := s.lockVMAs(vmName, "NIC detach")
 	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)

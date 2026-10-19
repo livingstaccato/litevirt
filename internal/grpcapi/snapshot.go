@@ -37,7 +37,7 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 	// or another snapshot. The container twins in snapshot_container.go already
 	// take this lock; the VM ones did not. Taken before the row read so the
 	// state guards below cannot go stale underneath the work.
-	unlock := releaseOnce(s.lockVM(req.VmName))
+	unlock := releaseOnce(s.lockVMAs(req.VmName, "snapshot"))
 	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.VmName)
@@ -329,7 +329,7 @@ func (s *Server) restoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 	// or another snapshot. The container twins in snapshot_container.go already
 	// take this lock; the VM ones did not. Taken before the row read so the
 	// state guards below cannot go stale underneath the work.
-	unlock := releaseOnce(s.lockVM(req.VmName))
+	unlock := releaseOnce(s.lockVMAs(req.VmName, "snapshot restore"))
 	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.VmName)
@@ -536,7 +536,7 @@ func (s *Server) recordRestoredDiskPath(vmName, snapshotName string) {
 	deadline := time.Now().Add(pathRecordRetryFor)
 	for time.Now().Before(deadline) {
 		time.Sleep(pathRecordRetryEvery)
-		unlock := s.lockVM(vmName)
+		unlock := s.lockVMAs(vmName, "snapshot restore")
 		// Only while this host still owns the VM, and is itself an active
 		// member: after a failover, a delete or this host's fence, its live
 		// paths are not the VM's, and must not be written into the
@@ -615,7 +615,7 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	// or another snapshot. The container twins in snapshot_container.go already
 	// take this lock; the VM ones did not. Taken before the row read so the
 	// state guards below cannot go stale underneath the work.
-	unlock := releaseOnce(s.lockVM(req.VmName))
+	unlock := releaseOnce(s.lockVMAs(req.VmName, "snapshot delete"))
 	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.VmName)

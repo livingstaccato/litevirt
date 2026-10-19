@@ -8,8 +8,6 @@ import (
 	"log/slog"
 	"net/netip"
 	"os"
-	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -378,6 +376,13 @@ type Server struct {
 	// a drain's ownership commit after a live cut-over fail. nil in
 	// production, where it is never consulted for anything else.
 	drainCommitFault func(vm string) error
+	// coldDiskStall overrides the cold disk copy's stall bound (tests).
+	coldDiskStall time.Duration
+	// drainMoves cancels each VM's drain move in flight (drainOneVM), for
+	// `lv operation abort <vm> --force` (AbortVMOperation). Guarded by
+	// drainMovesMu.
+	drainMovesMu sync.Mutex
+	drainMoves   map[string]context.CancelFunc
 	// migrationNetwork is migration.network: the IPv4 CIDR a migration's data
 	// should travel on (migration_network.go). Empty means the host's cluster
 	// address. localIPs is a test seam for the host's own addresses.
@@ -2768,7 +2773,9 @@ func (s *Server) SetContainerRuntime(r ContainerRuntime) { s.containerRuntime = 
 // hold (create, start, stop, delete), and returns its unlock. The container
 // checker tries it too (TryLockContainer), so its
 // reconcile never interleaves with an operation on the same container.
-func (s *Server) LockContainer(name string) func() { return s.lockVM("ct/" + name) }
+func (s *Server) LockContainer(name string) func() {
+	return s.lockVMAs("ct/"+name, "container operation")
+}
 
 // SetCapacityPolicy wires the cluster-wide capacity policy (overcommit ratios and
 // host reserves) used by admission and placement.
@@ -2787,7 +2794,15 @@ func (s *Server) SetWebAuthnService(w *auth.WebAuthnService) { s.webauthn = w }
 // lockVM acquires a per-VM mutex. Returns an unlock function. Lazily
 // initialises the map so test servers built without NewServer don't
 // panic on first lock.
-func (s *Server) lockVM(vmName string) func() {
+func (s *Server) lockVM(vmName string) func() { return s.lockVMAs(vmName, defaultVMLockOwner) }
+
+// defaultVMLockOwner names a lock taken by a site that does not name itself.
+const defaultVMLockOwner = "an operation"
+
+// lockVMAs is lockVM for an operation that names itself (owner, in operator
+// words: "backup", "scheduled snapshot"), so a drain that gives up on the
+// lock can say what holds it.
+func (s *Server) lockVMAs(vmName, owner string) func() {
 	s.vmLocksMu.Lock()
 	if s.vmLocks == nil {
 		s.vmLocks = map[string]*sync.Mutex{}
@@ -2799,7 +2814,7 @@ func (s *Server) lockVM(vmName string) func() {
 	}
 	s.vmLocksMu.Unlock()
 	mu.Lock()
-	return s.holdVMLock(vmName, mu)
+	return s.holdVMLock(vmName, mu, owner)
 }
 
 // vmLockHolder is who holds a VM's lock, and since when.
@@ -2810,14 +2825,8 @@ type vmLockHolder struct {
 
 // holdVMLock records the caller that just took vmName's lock (mu) and returns
 // the unlock, which forgets it.
-func (s *Server) holdVMLock(vmName string, mu *sync.Mutex) func() {
-	h := vmLockHolder{who: vmLockCaller(), since: time.Now()}
-	s.vmLocksMu.Lock()
-	if s.vmLockHolders == nil {
-		s.vmLockHolders = map[string]vmLockHolder{}
-	}
-	s.vmLockHolders[vmName] = h
-	s.vmLocksMu.Unlock()
+func (s *Server) holdVMLock(vmName string, mu *sync.Mutex, owner string) func() {
+	s.setVMLockHolder(vmName, owner)
 	return func() {
 		s.vmLocksMu.Lock()
 		delete(s.vmLockHolders, vmName)
@@ -2834,36 +2843,26 @@ func (s *Server) vmLockHolderOf(vmName string) (vmLockHolder, bool) {
 	return h, ok
 }
 
-// vmLockCaller is the function that asked for a VM lock: the first caller
-// outside the lock helpers, as "Method" or "function".
-func vmLockCaller() string {
-	pcs := make([]uintptr, 12)
-	n := runtime.Callers(3, pcs)
-	frames := runtime.CallersFrames(pcs[:n])
-	for {
-		f, more := frames.Next()
-		name := f.Function
-		if i := strings.LastIndex(name, "/"); i >= 0 {
-			name = name[i+1:]
-		}
-		if i := strings.Index(name, "."); i >= 0 {
-			name = name[i+1:]
-		}
-		name = strings.TrimPrefix(name, "(*Server).")
-		lower := strings.ToLower(name)
-		if name != "" && !strings.Contains(lower, "lockvm") && !strings.Contains(lower, "lockcontainer") &&
-			!strings.HasPrefix(lower, "holdvmlock") {
-			return name
-		}
-		if !more {
-			return ""
-		}
+// setVMLockHolder records owner as the holder of vmName's lock, from now.
+// A lock handed over through a queue (lockVMUnlessStartHeld) is re-recorded
+// for the caller it was handed to.
+func (s *Server) setVMLockHolder(vmName, owner string) {
+	s.vmLocksMu.Lock()
+	if s.vmLockHolders == nil {
+		s.vmLockHolders = map[string]vmLockHolder{}
 	}
+	s.vmLockHolders[vmName] = vmLockHolder{who: owner, since: time.Now()}
+	s.vmLocksMu.Unlock()
 }
 
 // tryLockVM is lockVM without the wait: it returns the unlock function and
 // true when it took the lock, or nil and false when someone else holds it.
 func (s *Server) tryLockVM(vmName string) (func(), bool) {
+	return s.tryLockVMAs(vmName, defaultVMLockOwner)
+}
+
+// tryLockVMAs is tryLockVM for an operation that names itself (lockVMAs).
+func (s *Server) tryLockVMAs(vmName, owner string) (func(), bool) {
 	s.vmLocksMu.Lock()
 	if s.vmLocks == nil {
 		s.vmLocks = map[string]*sync.Mutex{}
@@ -2877,7 +2876,7 @@ func (s *Server) tryLockVM(vmName string) (func(), bool) {
 	if !mu.TryLock() {
 		return nil, false
 	}
-	return s.holdVMLock(vmName, mu), true
+	return s.holdVMLock(vmName, mu, owner), true
 }
 
 // markBackupActive / clearBackupActive bracket a backup operation so the

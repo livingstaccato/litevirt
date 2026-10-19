@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -165,9 +166,49 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 		allocated = sys.Blocks * 512
 	}
 
-	up, err := client.ReceiveMigrationDisk(ctx)
-	if err != nil {
+	// The copy is bounded by its progress, not by the request: a drain's
+	// move runs detached from its client, and a target that is alive but
+	// wedged (a hung write) takes no frame and never fails the stream. A copy
+	// with no accepted frame (or no answer after the last) for the stall
+	// bound is aborted, and the move rolls back as on any failed copy.
+	stall := s.coldDiskStallBound()
+	sctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	progressed := make(chan struct{}, 1)
+	tick := func() {
+		select {
+		case progressed <- struct{}{}:
+		default:
+		}
+	}
+	go func() {
+		t := time.NewTimer(stall)
+		defer t.Stop()
+		for {
+			select {
+			case <-sctx.Done():
+				return
+			case <-progressed:
+				if !t.Stop() {
+					<-t.C
+				}
+				t.Reset(stall)
+			case <-t.C:
+				cancel(errColdCopyStalled)
+				return
+			}
+		}
+	}()
+	stalled := func(err error) error {
+		if errors.Is(context.Cause(sctx), errColdCopyStalled) {
+			return status.Errorf(codes.DeadlineExceeded, "the copy of disk %s to the target made no progress for %s, so it was aborted: %v",
+				d.Path, stall, err)
+		}
 		return err
+	}
+	up, err := client.ReceiveMigrationDisk(sctx)
+	if err != nil {
+		return stalled(err)
 	}
 	// The caller (coldMigrateStoppedVM) confirmed the domain shut off before
 	// the first disk, and holds the VM's lock until the handoff.
@@ -175,8 +216,9 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 		VmName: vmName, Path: d.Path, SizeBytes: size, AllocatedBytes: allocated,
 		OwnerDomainShutOff: true,
 	}); err != nil {
-		return coldDiskSendErr(up, err)
+		return stalled(coldDiskSendErr(up, err))
 	}
+	tick()
 	h := sha256.New()
 	buf := make([]byte, coldDiskChunk)
 	for off := int64(0); off < size; {
@@ -188,8 +230,9 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 				coldDiskFrameDigest(h, off, buf[:n])
 				// Send serializes the frame before it returns, so buf can be reused.
 				if err := up.Send(&pb.ReceiveMigrationDiskRequest{Offset: off, Data: buf[:n]}); err != nil {
-					return coldDiskSendErr(up, err)
+					return stalled(coldDiskSendErr(up, err))
 				}
+				tick()
 			}
 			off += int64(n)
 		}
@@ -204,17 +247,36 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 		}
 	}
 	if err := up.Send(&pb.ReceiveMigrationDiskRequest{Sha256: hex.EncodeToString(h.Sum(nil))}); err != nil {
-		return coldDiskSendErr(up, err)
+		return stalled(coldDiskSendErr(up, err))
 	}
+	tick()
 	resp, err := up.CloseAndRecv()
 	if err != nil {
-		return err
+		return stalled(err)
 	}
 	if resp.GetSizeBytes() != size {
 		return status.Errorf(codes.Internal, "target holds %d bytes of disk %s, want %d", resp.GetSizeBytes(), d.Path, size)
 	}
 	return nil
 }
+
+// errColdCopyStalled is the cause of a cold disk copy cancelled for making no
+// progress (streamColdDisk).
+var errColdCopyStalled = errors.New("the cold disk copy made no progress")
+
+// defaultColdDiskStall bounds how long a cold disk copy may go without the
+// target taking a frame (or answering after the last) before it is aborted.
+const defaultColdDiskStall = 5 * time.Minute
+
+func (s *Server) coldDiskStallBound() time.Duration {
+	if s.coldDiskStall > 0 {
+		return s.coldDiskStall
+	}
+	return defaultColdDiskStall
+}
+
+// SetColdDiskStallForTest shortens the cold disk copy's stall bound.
+func (s *Server) SetColdDiskStallForTest(d time.Duration) { s.coldDiskStall = d }
 
 // flattenColdDisk writes a standalone copy of disk d's chain (its file src) to
 // flat with this package's qcow2 reader: every backing judged by
@@ -305,17 +367,29 @@ func (s *Server) checkColdDiskOnTarget(ctx context.Context, client pb.LiteVirtCl
 			allocated = sys.Blocks * 512
 		}
 	}
-	up, err := client.ReceiveMigrationDisk(ctx)
-	if err != nil {
+	// One question and its answer, bounded like a copy's progress: a target
+	// that is alive but wedged would otherwise hold the move here forever.
+	stall := s.coldDiskStallBound()
+	cctx, cancel := context.WithTimeout(ctx, stall)
+	defer cancel()
+	unanswered := func(err error) error {
+		if errors.Is(cctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+			return status.Errorf(codes.DeadlineExceeded, "%s did not answer whether it would take disk %s within %s: %v",
+				"the target", d.Path, stall, err)
+		}
 		return err
+	}
+	up, err := client.ReceiveMigrationDisk(cctx)
+	if err != nil {
+		return unanswered(err)
 	}
 	if err := up.Send(&pb.ReceiveMigrationDiskRequest{
 		VmName: vmName, Path: d.Path, SizeBytes: size, AllocatedBytes: allocated, CheckOnly: true,
 	}); err != nil {
-		return coldDiskSendErr(up, err)
+		return unanswered(coldDiskSendErr(up, err))
 	}
 	_, err = up.CloseAndRecv()
-	return err
+	return unanswered(err)
 }
 
 // nearestExistingDir is dir, or its closest ancestor that exists.

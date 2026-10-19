@@ -37,7 +37,7 @@ const (
 // unknown fields). Callers must NOT hold the VM lock. Returns nil when there is
 // nothing to do.
 func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSpec, idemKey string) error {
-	unlock := s.lockVM(name)
+	unlock := s.lockVMAs(name, "resize")
 	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, name)
@@ -549,7 +549,7 @@ func (s *Server) RecoverResourceOperations(ctx context.Context) {
 }
 
 func (s *Server) recoverOneResourceOperation(ctx context.Context, name string) {
-	unlock := s.lockVM(name)
+	unlock := s.lockVMAs(name, "resize recovery")
 	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, name)

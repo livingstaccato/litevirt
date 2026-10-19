@@ -195,7 +195,7 @@ func (s *Server) restoreSupersededDisk(ctx context.Context, copyPath string) (he
 		}
 	}
 	if vmName != "" {
-		defer s.lockVM(vmName)()
+		defer s.lockVMAs(vmName, "superseded-disk restore")()
 	}
 	running := func(name string) bool {
 		if s.virt == nil || !s.virt.DomainExists(name) {

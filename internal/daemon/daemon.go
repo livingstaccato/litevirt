@@ -2046,6 +2046,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// (migrate/failover/replicate) continues the caller's trace. Empty when off —
 	// no otel in the serve path unless an OTLP endpoint is configured.
 	grpcOpts = append(grpcOpts, obs.ServerOptions()...)
+	// Keepalive: permit the pings peers send (pki.PeerDial), and detect a
+	// client that died with a call open.
+	grpcOpts = append(grpcOpts, pki.PeerServerOptions()...)
 	d.grpcSrv = grpc.NewServer(grpcOpts...)
 
 	pb.RegisterLiteVirtServer(d.grpcSrv, svc)

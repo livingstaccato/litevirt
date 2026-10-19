@@ -82,7 +82,7 @@ func (r *backupRunner) runBackupInner(ctx context.Context, sched corrosion.Backu
 		return fmt.Errorf("vm %q migrated mid-tick (now on %q)", sched.VMName, vm.HostName)
 	}
 
-	unlock := r.server.lockVM(sched.VMName)
+	unlock := r.server.lockVMAs(sched.VMName, "scheduled snapshot")
 	defer unlock()
 
 	disk, derr := pickDisk(ctx, r.server.db, sched.VMName, "")

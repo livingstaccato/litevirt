@@ -194,7 +194,7 @@ func (s *Server) attachPCIEntry(ctx context.Context, req *pb.AttachDeviceRequest
 // desired spec passed to BeginVMOperation (the barrier claim atomically commits the
 // vms.spec dual-write; latched → the spec is unchanged, intent-only).
 func (s *Server) attachPCIOwner(ctx context.Context, req *pb.AttachDeviceRequest, vmName, opID, reqHash, idemKey string) (*pb.VM, error) {
-	unlock := s.lockVM(vmName)
+	unlock := s.lockVMAs(vmName, "PCI attach")
 	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)
@@ -675,7 +675,7 @@ func (s *Server) detachPCIEntry(ctx context.Context, req *pb.DetachDeviceRequest
 
 // detachPCIOwner is the at-most-once owner path for a concrete-address PCI detach.
 func (s *Server) detachPCIOwner(ctx context.Context, req *pb.DetachDeviceRequest, vmName, opID, reqHash, idemKey string) (*pb.VM, error) {
-	unlock := s.lockVM(vmName)
+	unlock := s.lockVMAs(vmName, "PCI detach")
 	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)

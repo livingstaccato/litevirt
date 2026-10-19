@@ -176,7 +176,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// later fails would run the lease-cleanup path (keyed on host+name) and tombstone
 	// the EXISTING container's leases + interface rows. The lock + preflight make the
 	// failure cleanup safe (this is the only live container of this name on the host).
-	unlock := s.lockVM("ct/" + req.Name)
+	unlock := s.lockVMAs("ct/"+req.Name, "container create")
 	defer unlock()
 	// Fail CLOSED on a read error: if we can't prove the name is free, a later
 	// cleanup keyed on (host, name) could release an existing container's managed
@@ -467,7 +467,7 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	// and both reserve its memory — so the second is refused for capacity the first
 	// is already accounting for. The row read has to be under the lock for the
 	// admission below to be based on a state that can't change underneath it.
-	unlock := s.lockVM("ct/" + req.Name)
+	unlock := s.lockVMAs("ct/"+req.Name, "container start")
 	defer unlock()
 	// Preflight the cluster row BEFORE touching the runtime: a missing/soft-deleted
 	// row means we'd start an UNTRACKED container, so refuse. (Also folds in the

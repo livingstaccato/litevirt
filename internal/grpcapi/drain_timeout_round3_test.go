@@ -280,11 +280,8 @@ func TestDrainOneVM_ACancelledDrainSaysSo(t *testing.T) {
 	}
 }
 
-// backupHoldsVMLock takes vm's lock as a long operation would.
-func backupHoldsVMLock(s *Server, vm string) func() { return s.lockVM(vm) }
-
-// A drain that gives up on a VM's lock names what holds it (the lock records
-// its holder), and since when.
+// A drain that gives up on a VM's lock names the operation that holds it, as
+// that operation named itself when it took the lock, and since when.
 //
 // Mutation: record no holder — the message says the holder is not recorded,
 // red.
@@ -292,10 +289,55 @@ func TestDrainOneVM_NamesTheLockHolder(t *testing.T) {
 	s := testServerR2(t)
 	setDrainLockWait(t, 300*time.Millisecond)
 	insertTestVMR2(t, adminCtx(), s.db, "named-vm", "test-host", "running")
-	unlock := backupHoldsVMLock(s, "named-vm")
+	unlock := s.lockVMAs("named-vm", "backup")
 	defer unlock()
 	p := <-drainOneVMAsync(s, corrosion.VMRecord{Name: "named-vm", HostName: "test-host", State: "running"})
-	if p.Status != "skipped" || !strings.Contains(p.Error, "backupHoldsVMLock") || !strings.Contains(p.Error, "since") {
-		t.Errorf("progress = %q %q, want skipped, naming backupHoldsVMLock and since when", p.Status, p.Error)
+	if p.Status != "skipped" || !strings.Contains(p.Error, "held by backup since") {
+		t.Errorf("progress = %q %q, want skipped, held by backup since when", p.Status, p.Error)
+	}
+}
+
+// A stop that queued for the lock (lockVMUnlessStartHeld, served by the
+// VM's lock pump) holds it as "stop" once it has it, not as the pump.
+//
+// Mutation: keep the pump's own name at the hand-over — red.
+func TestLockVMUnlessStartHeld_NamesTheQueuedCaller(t *testing.T) {
+	s := testServerR2(t)
+	first := s.lockVMAs("q-vm", "backup")
+	got := make(chan func(), 1)
+	go func() {
+		u, _, _ := s.lockVMUnlessStartHeld(nil, "q-vm", "stop")
+		got <- u
+	}()
+	time.Sleep(200 * time.Millisecond)
+	first()
+	var u func()
+	select {
+	case u = <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the queued stop never got the lock")
+	}
+	defer u()
+	if h, ok := s.vmLockHolderOf("q-vm"); !ok || h.who != "stop" {
+		t.Fatalf("holder = %+v ok=%v, want stop", h, ok)
+	}
+}
+
+// A free-form reason put in a gRPC header is made a valid header value: one
+// printable-ASCII line, bounded.
+//
+// Mutation: put the raw text in the header — red.
+func TestHeaderValueIsSanitised(t *testing.T) {
+	got := headerValue("read /srv/café/ca.crt:\nis a directory\x00" + strings.Repeat("x", 2000))
+	if len(got) > 512 {
+		t.Fatalf("header value is %d bytes, want at most 512", len(got))
+	}
+	for _, r := range got {
+		if r < 0x20 || r > 0x7e {
+			t.Fatalf("header value %q holds %q, not printable ASCII", got, r)
+		}
+	}
+	if !strings.Contains(got, "is a directory") {
+		t.Fatalf("header value %q lost the reason", got)
 	}
 }

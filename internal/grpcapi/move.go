@@ -87,7 +87,7 @@ func (s *Server) MoveVolume(req *pb.MoveVolumeRequest, stream grpc.ServerStreami
 		}
 	}
 
-	unlock := s.lockVM(req.VmName)
+	unlock := s.lockVMAs(req.VmName, "volume move")
 	defer unlock()
 
 	disks, err := corrosion.GetVMDisks(ctx, s.db, req.VmName)

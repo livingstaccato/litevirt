@@ -69,7 +69,7 @@ func (s *Server) BackupSnapshot(req *pb.BackupSnapshotRequest, stream grpc.Serve
 			req.VmName, vm.HostName)
 	}
 
-	unlock := s.lockVM(req.VmName)
+	unlock := s.lockVMAs(req.VmName, "backup")
 	defer unlock()
 	// A point-in-time overlay an earlier copy left holds writes the disk's
 	// file lacks: settle it before anything reads or starts the disk.

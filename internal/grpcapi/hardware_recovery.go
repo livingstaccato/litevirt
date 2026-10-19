@@ -64,7 +64,7 @@ func (s *Server) RunHardwareOperationRecovery(ctx context.Context) {
 // filters to device_attach/device_detach, loads the host-local journal artifacts,
 // and dispatches to the directional re-drive: attach → back, detach → forward.
 func (s *Server) recoverOneHardwareOperation(ctx context.Context, name string) {
-	unlock := s.lockVM(name)
+	unlock := s.lockVMAs(name, "hardware recovery")
 	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, name)

@@ -191,7 +191,7 @@ func (s *Server) SetDiskIO(ctx context.Context, req *pb.SetDiskIORequest) (*pb.V
 		return nil, status.Errorf(codes.Internal, "libvirt not connected on host %s", s.hostName)
 	}
 
-	unlock := s.lockVM(req.VmName)
+	unlock := s.lockVMAs(req.VmName, "disk I/O tuning")
 	defer unlock()
 	vm, err = corrosion.GetVM(ctx, s.db, req.VmName)
 	if err != nil || vm == nil {

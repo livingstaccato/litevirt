@@ -1,15 +1,22 @@
 package pki
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // provisionMigration lays out a host's migration credentials the way
@@ -237,4 +244,88 @@ func TestInstallQemuMigrationTLS_RefusesUnusableCredentials(t *testing.T) {
 			}
 		})
 	}
+}
+
+// writeLeaf writes a migration host certificate and key issued by the CA at
+// caCert/caKey, valid from notBefore to notAfter.
+func writeLeaf(t *testing.T, caCert, caKey, certPath, keyPath string, notBefore, notAfter time.Time) {
+	t.Helper()
+	ca, key, err := loadCA(caCert, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()), Subject: pkix.Name{CommonName: "node-1"},
+		NotBefore: notBefore, NotAfter: notAfter, IPAddresses: []net.IP{net.ParseIP("10.0.0.1")},
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &leafKey.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	kb, err := x509.MarshalECPrivateKey(leafKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// An expired (or not yet valid) host certificate is refused before anything
+// is installed: QEMU's handshake would reject it mid-copy. A CA bundle (an old
+// and a new CA, as during a rotation) whose second certificate issued the host
+// certificate is accepted.
+//
+// Mutations: no validity check — the expired case installs, red. Check only
+// the first certificate of the bundle — the bundle case is refused, red.
+func TestInstallQemuMigrationTLS_ChecksValidityAndReadsTheWholeBundle(t *testing.T) {
+	newSet := func(t *testing.T) (pkiDir, caCert, caKey string) {
+		pkiDir = t.TempDir()
+		caDir := t.TempDir()
+		caCert, caKey = filepath.Join(caDir, MigrationCACertName), filepath.Join(caDir, MigrationCAKeyName)
+		if err := GenerateMigrationCA(caCert, caKey); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(MigrationDir(pkiDir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	dir := func(pkiDir, name string) string { return filepath.Join(MigrationDir(pkiDir), name) }
+
+	t.Run("expired host certificate", func(t *testing.T) {
+		pkiDir, caCert, caKey := newSet(t)
+		writeLeaf(t, caCert, caKey, dir(pkiDir, MigrationHostCertName), dir(pkiDir, MigrationHostKeyName),
+			time.Now().Add(-48*time.Hour), time.Now().Add(-24*time.Hour))
+		data, _ := os.ReadFile(caCert)
+		if err := os.WriteFile(dir(pkiDir, MigrationCAName), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		ok, err := InstallQemuMigrationTLS(pkiDir, filepath.Join(t.TempDir(), "qemu"), -1, -1)
+		if ok || !errors.Is(err, ErrInvalidMigrationCredentials) || !strings.Contains(err.Error(), "expired") {
+			t.Fatalf("install = %v, %v; want refused, the host certificate expired", ok, err)
+		}
+	})
+	t.Run("bundle whose second CA issued the host certificate", func(t *testing.T) {
+		pkiDir, caCert, caKey := newSet(t)
+		writeLeaf(t, caCert, caKey, dir(pkiDir, MigrationHostCertName), dir(pkiDir, MigrationHostKeyName),
+			time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+		_, otherCA, _ := newSet(t)
+		a, _ := os.ReadFile(otherCA)
+		b, _ := os.ReadFile(caCert)
+		if err := os.WriteFile(dir(pkiDir, MigrationCAName), append(a, b...), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if ok, err := InstallQemuMigrationTLS(pkiDir, filepath.Join(t.TempDir(), "qemu"), -1, -1); !ok || err != nil {
+			t.Fatalf("install = %v, %v; want the bundle accepted", ok, err)
+		}
+	})
 }

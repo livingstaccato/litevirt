@@ -193,25 +193,73 @@ func InstallQemuMigrationTLS(pkiDir, qemuDir string, keyUID, keyGID int) (bool, 
 // it, and the key is the certificate's. Any failure is
 // ErrInvalidMigrationCredentials.
 func validateMigrationCredentials(caPEM, certPEM, keyPEM []byte) error {
-	ca, err := parsePEMCertificate(caPEM)
+	cas, err := parsePEMCertificates(caPEM)
 	if err != nil {
 		return fmt.Errorf("%w: %s: %v", ErrInvalidMigrationCredentials, MigrationCAName, err)
 	}
-	if !ca.IsCA {
-		return fmt.Errorf("%w: %s is not a CA certificate", ErrInvalidMigrationCredentials, MigrationCAName)
+	for _, ca := range cas {
+		if !ca.IsCA {
+			return fmt.Errorf("%w: %s holds a certificate that is not a CA (%s)", ErrInvalidMigrationCredentials, MigrationCAName, ca.Subject)
+		}
 	}
 	cert, err := parsePEMCertificate(certPEM)
 	if err != nil {
 		return fmt.Errorf("%w: %s: %v", ErrInvalidMigrationCredentials, MigrationHostCertName, err)
 	}
-	if err := cert.CheckSignatureFrom(ca); err != nil {
-		return fmt.Errorf("%w: %s was not issued by the migration CA in %s: %v",
-			ErrInvalidMigrationCredentials, MigrationHostCertName, MigrationCAName, err)
+	// Any CA of the bundle (an old and a new one during a rotation).
+	var issuer *x509.Certificate
+	var sigErr error
+	for _, ca := range cas {
+		if sigErr = cert.CheckSignatureFrom(ca); sigErr == nil {
+			issuer = ca
+			break
+		}
+	}
+	if issuer == nil {
+		return fmt.Errorf("%w: %s was not issued by a migration CA in %s: %v",
+			ErrInvalidMigrationCredentials, MigrationHostCertName, MigrationCAName, sigErr)
+	}
+	now := time.Now()
+	for _, c := range []struct {
+		name string
+		cert *x509.Certificate
+	}{{MigrationHostCertName, cert}, {MigrationCAName, issuer}} {
+		if now.Before(c.cert.NotBefore) {
+			return fmt.Errorf("%w: %s is not valid until %s", ErrInvalidMigrationCredentials, c.name, c.cert.NotBefore.UTC().Format(time.RFC3339))
+		}
+		if now.After(c.cert.NotAfter) {
+			return fmt.Errorf("%w: %s expired at %s", ErrInvalidMigrationCredentials, c.name, c.cert.NotAfter.UTC().Format(time.RFC3339))
+		}
 	}
 	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
 		return fmt.Errorf("%w: %s does not match %s: %v", ErrInvalidMigrationCredentials, MigrationHostKeyName, MigrationHostCertName, err)
 	}
 	return nil
+}
+
+// parsePEMCertificates parses every PEM CERTIFICATE block of data; there must
+// be at least one, and nothing else.
+func parsePEMCertificates(data []byte) ([]*x509.Certificate, error) {
+	var out []*x509.Certificate
+	for {
+		var block *pem.Block
+		block, data = pem.Decode(data)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			return nil, fmt.Errorf("holds a %s block, not a certificate", block.Type)
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("holds no PEM certificate")
+	}
+	return out, nil
 }
 
 // parsePEMCertificate parses the first PEM CERTIFICATE block of data.

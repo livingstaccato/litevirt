@@ -280,7 +280,7 @@ func (s *Server) inPlaceRestoreTarget(ctx context.Context, vmName, diskName, aut
 		return restoreDest{}, status.Errorf(codes.FailedPrecondition,
 			"in_place: vm %q lives on %q; run the restore there", vmName, vm.HostName)
 	}
-	unlock := s.lockVM(vmName)
+	unlock := s.lockVMAs(vmName, "restore")
 	d, err := s.inPlaceRestoreLocked(ctx, vmName, diskName)
 	if err != nil {
 		unlock()

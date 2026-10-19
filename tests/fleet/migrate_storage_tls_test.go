@@ -246,11 +246,22 @@ func migrationTLSInvalid(n *Node, why string) {
 // Mutation: read an unusable target as one with no credentials — the
 // refusal is the plain "no migration-TLS credentials" one, red.
 func TestFleet_StorageMigrationIsRefusedWhenTheTargetsMigrationCredentialsAreUnusable(t *testing.T) {
+	for _, allow := range []bool{false, true} {
+		t.Run(fmt.Sprintf("allow_unencrypted_storage=%t", allow), func(t *testing.T) {
+			targetUnusableRefused(t, allow)
+		})
+	}
+}
+
+// targetUnusableRefused: with or without the source's plaintext opt-in, an
+// unusable target is refused before the copy (M3).
+func targetUnusableRefused(t *testing.T, allowPlaintext bool) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
 	defer c.Stop()
 	src, dst := c.Nodes[0], c.Nodes[1]
 	migrationTLSReady(src, true)
 	migrationTLSInvalid(dst, "ca.crt holds no PEM certificate")
+	src.Server.SetAllowUnencryptedStorageMigration(allowPlaintext)
 
 	path := filepath.Join(c.tmpRoot, dst.Name, "data", "disks", "pp1-root.qcow2")
 	storageMigrationVM(t, src, path, 1<<30)
@@ -273,11 +284,20 @@ func TestFleet_StorageMigrationIsRefusedWhenTheTargetsMigrationCredentialsAreUnu
 //
 // Mutation: read an unusable source as one with no credentials — red.
 func TestFleet_StorageMigrationIsRefusedWhenTheSourcesMigrationCredentialsAreUnusable(t *testing.T) {
+	for _, allow := range []bool{false, true} {
+		t.Run(fmt.Sprintf("allow_unencrypted_storage=%t", allow), func(t *testing.T) {
+			sourceUnusableRefused(t, allow)
+		})
+	}
+}
+
+func sourceUnusableRefused(t *testing.T, allowPlaintext bool) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
 	defer c.Stop()
 	src, dst := c.Nodes[0], c.Nodes[1]
 	migrationTLSInvalid(src, "read ca.crt: is a directory")
 	migrationTLSReady(dst, true)
+	src.Server.SetAllowUnencryptedStorageMigration(allowPlaintext)
 
 	storageMigrationVM(t, src, filepath.Join(c.tmpRoot, dst.Name, "data", "disks", "pp1-root.qcow2"), 1<<30)
 	err := runStorageMigration(t, c, src, dst.Name)
@@ -288,5 +308,39 @@ func TestFleet_StorageMigrationIsRefusedWhenTheSourcesMigrationCredentialsAreUnu
 	}
 	if n := migrateCalls(src); n != 0 {
 		t.Fatalf("the refused migration reached libvirt %d time(s)", n)
+	}
+}
+
+// An older source with the plaintext opt-in reads only migration_tls_ready:
+// told "not ready", it would copy in plaintext to a target whose credentials
+// are merely unusable. The target therefore refuses a storage copy (one with
+// disk stubs) that asks for TLS while its own credentials are unusable,
+// naming the fix, so that source fails closed. A memory-only ask (no stubs)
+// is answered "not ready" as before: that move stays in libvirt's tunnel.
+//
+// Mutation: answer the storage ask "not ready" like the memory one — no
+// error, red.
+func TestFleet_TargetWithUnusableCredentialsRefusesAStorageCopyThatAsksForTLS(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	defer c.Stop()
+	src, dst := c.Nodes[0], c.Nodes[1]
+	migrationTLSInvalid(dst, "ca.crt holds no PEM certificate")
+	path := filepath.Join(c.tmpRoot, dst.Name, "data", "disks", "pp1-root.qcow2")
+	storageMigrationVM(t, src, path, 1<<30)
+	peer := c.PeerClient(src, dst)
+
+	_, err := peer.EnsureDisks(context.Background(), &pb.EnsureDisksRequest{
+		VmName: "pp1", WantMigrationTls: true,
+		Disks: []*pb.DiskStub{{Path: path, SizeBytes: 1 << 30}},
+	})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "lv host install-migration-tls --reissue") {
+		t.Fatalf("EnsureDisks of a storage copy asking for TLS = %v; want FailedPrecondition with the --reissue fix", err)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Errorf("the refused copy left a disk stub %s (stat err %v)", path, statErr)
+	}
+	resp, err := peer.EnsureDisks(context.Background(), &pb.EnsureDisksRequest{VmName: "pp1", WantMigrationTls: true})
+	if err != nil || resp.GetMigrationTlsReady() {
+		t.Fatalf("EnsureDisks of a memory-only move = %+v, %v; want answered, not ready", resp, err)
 	}
 }

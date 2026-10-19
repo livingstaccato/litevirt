@@ -29,7 +29,8 @@ func TestNoHandlerHoldsAVMLockAcrossAPeerForward(t *testing.T) {
 	// releaseOnce(...) wraps the lock in the handlers that release before a
 	// forward; without the optional group this scan never saw them lock at all,
 	// and passed them whatever they did afterwards.
-	lockRe := regexp.MustCompile(`unlock\s*:=\s*(releaseOnce\()?s\.lock(VM|Container)\(`)
+	// lockVMAs is lockVM naming its holder: the same lock.
+	lockRe := regexp.MustCompile(`unlock\s*:=\s*(releaseOnce\()?s\.lock(VM|VMAs|Container)\(`)
 	// One or two tabs: a STATEMENT-level release. The closure that defines
 	// releaseLock contains `unlock()` three tabs deep, and matching that would
 	// let a handler pass by merely declaring the helper it never calls.
@@ -119,7 +120,9 @@ func TestNoPerVMLockIsHeldAcrossAPeerForward(t *testing.T) {
 			if !ok || fn.Body == nil {
 				continue
 			}
-			lockPos := firstCallPos(fn, func(sel *ast.SelectorExpr) bool { return sel.Sel.Name == "lockVM" })
+			lockPos := firstCallPos(fn, func(sel *ast.SelectorExpr) bool {
+				return sel.Sel.Name == "lockVM" || sel.Sel.Name == "lockVMAs"
+			})
 			if !lockPos.IsValid() {
 				continue
 			}

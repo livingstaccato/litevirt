@@ -57,7 +57,7 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 		}
 	}
 
-	unlock := s.lockVM(req.VmName)
+	unlock := s.lockVMAs(req.VmName, "volume replication")
 	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.VmName)

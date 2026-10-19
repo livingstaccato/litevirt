@@ -1982,3 +1982,24 @@ this release. Two effects while the fleet is mixed:
   email target without a password is allowed at any time. The first such create
   after the latch marks the feature used, after which a rollback below this
   release quarantines the host.
+
+### Migration-TLS credentials checked on every host
+
+A host of this build checks its migration-TLS credentials before it reports
+itself ready for an encrypted storage copy: a CA file that is not a set of
+certificates (or not a file), a host certificate none of them issued, a key
+that is not the certificate's, or a certificate outside its validity is
+unusable. Such a host installs nothing for QEMU and is not ready.
+
+During the roll a source on an older build reads only "ready" or "not
+ready". With `migration.allow_unencrypted_storage: true` it would send a
+storage copy in plaintext to a host that is not ready. So a host of this
+build whose own credentials are unusable refuses a storage copy that asks for
+TLS, naming the fix (`lv host install-migration-tls --reissue`): the older
+source fails closed instead. A host that simply has no credentials answers
+"not ready" as before, and the older source's opt-in applies, as it always
+did.
+
+Peer connections of this build send gRPC keepalive pings while a call is
+open, every 6 minutes. That is longer than any daemon permits by default (5
+minutes), so a daemon on an older build never rejects them.

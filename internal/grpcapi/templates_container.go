@@ -195,7 +195,7 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 		return nil, err
 	}
 
-	unlock := s.lockVM("ct/" + req.Target)
+	unlock := s.lockVMAs("ct/"+req.Target, "container clone")
 	defer unlock()
 
 	// Quota fail-fast: the clone draws down the project's vCPU/Mem budget (like

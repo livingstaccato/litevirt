@@ -111,7 +111,11 @@ migration-TLS credentials:
   certificate's) is not ready for migration TLS, and its daemon installs
   nothing for QEMU. A storage copy from or to it is refused before it starts,
   naming the host, why, and `lv host install-migration-tls --reissue`, whatever
-  `migration.allow_unencrypted_storage` says.
+  `migration.allow_unencrypted_storage` says. A target in that state refuses
+  a storage copy that asks for TLS outright, so a source on an older build
+  fails closed rather than falling back to plaintext. Every certificate of
+  the CA file is read (an old and a new CA during a rotation), and an expired
+  or not-yet-valid certificate counts as unusable.
 - Each daemon installs its host's credentials into `/etc/pki/qemu`, with the key
   readable only by the QEMU user, at start and again before each storage
   migration, so no restart is needed. It refuses to touch `/etc/pki/qemu` if
@@ -357,6 +361,15 @@ drained host's audit log records the drain as `cancelled` with each VM's
 outcome (`lv audit`), and each VM gets a `vm.drain` event. A VM whose lock
 another operation holds (a scheduled snapshot, a replication run) is waited
 for, up to 10 minutes, then skipped, naming the operation that holds it.
+
+A started move is still bounded. A cold move's disk copy that the target
+stops taking (alive but wedged) for 5 minutes is aborted, and so is its check
+of the target that goes unanswered as long; the VM is then started again on
+the drained host, where its record still names it. To end a drain move sooner,
+without restarting the daemon, run `lv operation abort <vm> --force`: it
+cancels the VM's drain move on the drained host, which rolls it back the same
+way. Peers also detect a host that stops answering during a call within about
+6 minutes (gRPC keepalive).
 
 After the cut-over the source's cloud-init ISO is removed and DNS,
 load-balancer backends and VXLAN forwarding entries follow the VM, as for a

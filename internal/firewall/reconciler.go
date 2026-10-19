@@ -601,6 +601,20 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			return nb
 		}
 		armed := opts.Arming.Armed()
+		if len(armed) > 0 && opts.RunningTaps != nil {
+			// A VM that came here and has gone (its row names another host,
+			// libvirt has none of it running here) is not drawn any more.
+			gens := opts.Arming.Generations() // before the snapshots below
+			gensAt := time.Now()
+			// Only an answer from a call that started after gens were read
+			// counts: one joined from before may predate an Arm they reflect.
+			if live, startedAt, terr := taps.fetchStamped(ctx, opts.RunningTaps, opts.TapTimeout); terr == nil && !startedAt.Before(gensAt) {
+				if hosts, herr := vmRowHosts(ctx, db, armed); herr == nil {
+					opts.Arming.Settle(hostName, gens, hosts, func(vm string) bool { return len(live[vm]) > 0 })
+					armed = opts.Arming.Armed()
+				}
+			}
+		}
 		ifaces, err := corrosion.ListHostVMNICs(ctx, db, hostName, armed...)
 		if err != nil {
 			return plan, err
@@ -1205,6 +1219,13 @@ type tapCall struct {
 var errTapFetchOutstanding = errors.New("an earlier libvirt tap lookup overran its deadline and has not returned")
 
 func (f *tapFetcher) fetch(ctx context.Context, src RunningTaps, timeout time.Duration) (map[string]map[string]string, error) {
+	taps, _, err := f.fetchStamped(ctx, src, timeout)
+	return taps, err
+}
+
+// fetchStamped is fetch, also saying when the libvirt call that answered
+// started: a pass that joined an older call gets an older answer.
+func (f *tapFetcher) fetchStamped(ctx context.Context, src RunningTaps, timeout time.Duration) (map[string]map[string]string, time.Time, error) {
 	if timeout <= 0 {
 		timeout = defaultTapTimeout
 	}
@@ -1212,7 +1233,7 @@ func (f *tapFetcher) fetch(ctx context.Context, src RunningTaps, timeout time.Du
 	call := f.inflight
 	if call != nil && time.Since(call.started) > timeout {
 		f.mu.Unlock()
-		return nil, errTapFetchOutstanding
+		return nil, time.Time{}, errTapFetchOutstanding
 	}
 	if call == nil {
 		call = &tapCall{started: time.Now(), done: make(chan struct{})}
@@ -1232,11 +1253,11 @@ func (f *tapFetcher) fetch(ctx context.Context, src RunningTaps, timeout time.Du
 	defer t.Stop()
 	select {
 	case <-call.done:
-		return call.taps, call.err
+		return call.taps, call.started, call.err
 	case <-t.C:
-		return nil, fmt.Errorf("libvirt did not answer within %s", timeout)
+		return nil, time.Time{}, fmt.Errorf("libvirt did not answer within %s", timeout)
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, time.Time{}, ctx.Err()
 	}
 }
 
@@ -1326,4 +1347,23 @@ func sysfsMaster(dev string) string {
 		}
 	}
 	return name
+}
+
+// vmRowHosts is the host each live VM of names has on its row; a name with no
+// live VM row (a container, a VM not created yet) is absent.
+func vmRowHosts(ctx context.Context, db *corrosion.Client, names []string) (map[string]string, error) {
+	args := make([]interface{}, len(names))
+	for i, n := range names {
+		args[i] = n
+	}
+	rows, err := db.Query(ctx, `SELECT name, COALESCE(host_name, '') AS host_name FROM vms
+		 WHERE deleted_at IS NULL AND name IN (?`+strings.Repeat(", ?", len(names)-1)+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(rows))
+	for _, r := range rows {
+		out[r.String("name")] = r.String("host_name")
+	}
+	return out, nil
 }

@@ -39,6 +39,9 @@ var auditHoldWriteRPCs = map[string]bool{
 }
 
 func auditHoldReadOnly(fullMethod string) bool {
+	if automationPublicMethod(fullMethod) {
+		return automationPublicReadOnly(fullMethod)
+	}
 	name := methodShortName(fullMethod)
 	if auditHoldWriteRPCs[name] {
 		return false

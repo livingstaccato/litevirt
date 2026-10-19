@@ -11,6 +11,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/memberlist v0.5.4
 	github.com/klauspost/compress v1.19.1
+	github.com/livingstaccato/litevirt/api v0.0.0
 	github.com/miekg/dns v1.1.72
 	github.com/modelcontextprotocol/go-sdk v1.6.1
 	github.com/pquerna/otp v1.5.0
@@ -38,6 +39,8 @@ require (
 	modernc.org/sqlite v1.58.0
 	nhooyr.io/websocket v1.8.17
 )
+
+replace github.com/livingstaccato/litevirt/api => ./api
 
 require (
 	filippo.io/age v1.3.2

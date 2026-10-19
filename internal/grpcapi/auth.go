@@ -177,7 +177,13 @@ func (s *Server) UnaryAuthInterceptor(
 	req interface{},
 	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
-) (interface{}, error) {
+) (response interface{}, err error) {
+	// Public errors carry safe structural details, including refusals before
+	// the handler. Existing legacy error messages and classifications are kept.
+	publicAutomation := automationPublicMethod(info.FullMethod)
+	if publicAutomation {
+		defer func() { err = automationPublicError(err) }()
+	}
 	if err := s.connIdentityGate(ctx); err != nil {
 		return nil, err
 	}
@@ -193,12 +199,17 @@ func (s *Server) UnaryAuthInterceptor(
 		}
 		return handler(admitted, req)
 	}
-	ctx, err := s.authenticate(ctx)
+	ctx, err = s.authenticate(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if err := gateEnrollmentOnly(ctx, info.FullMethod); err != nil {
 		return nil, err
+	}
+	if publicAutomation {
+		if err := requireAutomationPublicPrincipal(ctx); err != nil {
+			return nil, err
+		}
 	}
 	if err := s.gateStaleReplica(ctx, info.FullMethod); err != nil {
 		return nil, err

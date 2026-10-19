@@ -134,85 +134,210 @@ func TestStopServing_MarksThenStopsThenFlushes(t *testing.T) {
 	})
 }
 
-// Run's shutdown goes through stopServing, before the replicator stops and
-// the database closes. (What stopServing does is TestStopServing_*; this
-// only pins that Run uses it there. Run opens libvirt and binds sockets, so
-// no behavioural test reaches it.)
-//
-// Mutation: Run without stopServing, or closing the database before it — red.
-// Closing libvirt before the database — red.
+// Run gives its actual worker coordinator distinct stop-serving and cleanup
+// callbacks. The coordinator stops serving, joins its owned work, then calls
+// cleanup (TestDaemonDBWorkers_AllStopTriggersHoldCleanup exercises that actual
+// lifecycle). Here pin the callback identities and direct dependency-close
+// order; bounded gRPC stopping alone is not permission to close a worker's DB.
 func TestRunStopsServingBeforeTheDatabaseCloses(t *testing.T) {
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "daemon.go", nil, 0)
-	if err != nil {
-		t.Fatalf("parse daemon.go: %v", err)
+	if err := daemonShutdownWiringError(parseRun(t)); err != nil {
+		t.Fatal(err)
 	}
-	var run *ast.FuncDecl
-	for _, decl := range file.Decls {
-		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv != nil && fn.Name.Name == "Run" {
-			run = fn
+}
+
+// Inspect actual parser-resolved variables and the actual callback arguments,
+// not an arbitrary function literal that happens to contain a matching call.
+func daemonShutdownWiringError(run *ast.FuncDecl) error {
+	var worker, repl *ast.Object
+	var workerContext, service ast.Expr
+	for _, statement := range run.Body.List {
+		assignment, ok := statement.(*ast.AssignStmt)
+		if !ok || assignment.Tok != token.DEFINE || len(assignment.Lhs) != 1 || len(assignment.Rhs) != 1 {
+			continue
+		}
+		id, ok := assignment.Lhs[0].(*ast.Ident)
+		if !ok {
+			continue
+		}
+		if id.Name == "repl" {
+			repl = runVar(id)
+		}
+		call, ok := assignment.Rhs[0].(*ast.CallExpr)
+		if !ok || !isFuncCall(call, "newDBWorkerCoordinator") {
+			continue
+		}
+		if worker != nil || len(call.Args) != 2 || runVar(id) == nil {
+			return fmt.Errorf("Run must create one worker coordinator with context and service")
+		}
+		worker, workerContext, service = runVar(id), call.Args[0], call.Args[1]
+	}
+	if worker == nil || repl == nil || runVar(workerContext) == nil || runVar(service) == nil {
+		return fmt.Errorf("Run's actual coordinator, context, service or replicator is missing")
+	}
+	var shutdown *ast.CallExpr
+	started := map[string]int{}
+	for _, statement := range run.Body.List {
+		if expression, ok := statement.(*ast.ExprStmt); ok {
+			if call, ok := expression.X.(*ast.CallExpr); ok {
+				if selector, ok := call.Fun.(*ast.SelectorExpr); ok && runVar(selector.X) == worker {
+					started[selector.Sel.Name]++
+				}
+			}
+		}
+		goroutine, ok := statement.(*ast.GoStmt)
+		if !ok {
+			continue
+		}
+		selector, ok := goroutine.Call.Fun.(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != "shutdown" {
+			continue
+		}
+		if shutdown != nil || runVar(selector.X) != worker {
+			return fmt.Errorf("shutdown must run once on the same worker coordinator")
+		}
+		shutdown = goroutine.Call
+	}
+	if started["startSweep"] != 1 || started["startLB"] != 1 || shutdown == nil || len(shutdown.Args) != 6 {
+		return fmt.Errorf("actual worker starts and direct shutdown goroutine must share one coordinator")
+	}
+	if runVar(shutdown.Args[0]) != runVar(workerContext) {
+		return fmt.Errorf("shutdown must use the coordinator's original context")
+	}
+	for i, name := range []string{"ReExecCh", "ShutdownCh"} {
+		selector, ok := shutdown.Args[i+1].(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != name || runVar(selector.X) != runVar(service) {
+			return fmt.Errorf("shutdown %s must belong to the coordinator's actual service", name)
 		}
 	}
-	if run == nil {
-		t.Fatal("no (*Daemon).Run in daemon.go")
+	callbacks := make([]*ast.FuncLit, 3)
+	for i := range callbacks {
+		callback, ok := shutdown.Args[i+3].(*ast.FuncLit)
+		if !ok {
+			return fmt.Errorf("shutdown callback %d must be its actual function literal", i)
+		}
+		callbacks[i] = callback
 	}
-	// The shutdown goroutine: the func literal that calls stopServing.
-	var shutdown *ast.FuncLit
-	ast.Inspect(run, func(n ast.Node) bool {
-		if fl, ok := n.(*ast.FuncLit); ok {
-			ast.Inspect(fl.Body, func(m ast.Node) bool {
-				if c, ok := m.(*ast.CallExpr); ok {
-					if id, ok := c.Fun.(*ast.Ident); ok && id.Name == "stopServing" && shutdown == nil {
-						shutdown = fl
-					}
-				}
-				return true
-			})
+	if run.Recv == nil || len(run.Recv.List) != 1 || len(run.Recv.List[0].Names) != 1 {
+		return fmt.Errorf("Run's daemon receiver is missing")
+	}
+	daemon := runVar(run.Recv.List[0].Names[0])
+	if daemon == nil {
+		return fmt.Errorf("Run's daemon receiver must resolve to its actual variable")
+	}
+	callName := func(call *ast.CallExpr) string {
+		if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "stopServing" && (id.Obj == nil || id.Obj.Kind == ast.Fun) {
+			return "stopServing"
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return ""
+		}
+		if selector.Sel.Name == "Stop" && runVar(selector.X) == repl {
+			return "repl.Stop"
+		}
+		field, ok := selector.X.(*ast.SelectorExpr)
+		if ok && selector.Sel.Name == "Close" && runVar(field.X) == daemon && (field.Sel.Name == "db" || field.Sel.Name == "virt") {
+			return field.Sel.Name + ".Close"
+		}
+		return ""
+	}
+	// Each dependency close must appear exactly once in Run and as a direct
+	// cleanup statement. A hidden earlier close in prepare/stop is unsafe too.
+	counts := map[string]int{}
+	ast.Inspect(run.Body, func(node ast.Node) bool {
+		if call, ok := node.(*ast.CallExpr); ok {
+			counts[callName(call)]++
 		}
 		return true
 	})
-	if shutdown == nil {
-		t.Fatal("Run never calls stopServing")
-	}
-	// Top-level statements of that goroutine, in order: stopServing must be
-	// a direct statement (not in a branch) before repl.Stop and db.Close.
-	idx := map[string]int{}
-	for i, st := range shutdown.Body.List {
-		es, ok := st.(*ast.ExprStmt)
-		if !ok {
-			continue
-		}
-		c, ok := es.X.(*ast.CallExpr)
-		if !ok {
-			continue
-		}
-		switch f := c.Fun.(type) {
-		case *ast.Ident:
-			idx[f.Name] = i
-		case *ast.SelectorExpr:
-			name := f.Sel.Name
-			switch x := f.X.(type) {
-			case *ast.Ident:
-				name = x.Name + "." + name
-			case *ast.SelectorExpr:
-				name = x.Sel.Name + "." + name
+	direct := func(body *ast.BlockStmt) (map[string]int, map[string]*ast.CallExpr) {
+		indices, calls := map[string]int{}, map[string]*ast.CallExpr{}
+		for i, statement := range body.List {
+			if expression, ok := statement.(*ast.ExprStmt); ok {
+				if call, ok := expression.X.(*ast.CallExpr); ok {
+					name := callName(call)
+					indices[name], calls[name] = i, call
+				}
 			}
-			idx[name] = i
+		}
+		return indices, calls
+	}
+	_, stopCalls := direct(callbacks[1].Body)
+	stop := stopCalls["stopServing"]
+	if stop == nil || counts["stopServing"] != 1 || len(stop.Args) != 6 || runVar(stop.Args[1]) != runVar(service) {
+		return fmt.Errorf("stopServing must be the sole direct stop callback call for the actual service")
+	}
+	grpcServer, ok := stop.Args[0].(*ast.SelectorExpr)
+	if !ok || grpcServer.Sel.Name != "grpcSrv" || runVar(grpcServer.X) != daemon {
+		return fmt.Errorf("stopServing must stop the actual daemon's gRPC server")
+	}
+	indices, _ := direct(callbacks[2].Body)
+	for _, name := range []string{"repl.Stop", "db.Close", "virt.Close"} {
+		if _, ok := indices[name]; !ok || counts[name] != 1 {
+			return fmt.Errorf("%s must occur once, directly in the actual cleanup callback", name)
 		}
 	}
-	for _, name := range []string{"stopServing", "repl.Stop", "db.Close"} {
-		if _, ok := idx[name]; !ok {
-			t.Fatalf("%s is not a direct statement of Run's shutdown goroutine", name)
-		}
+	if !(indices["repl.Stop"] < indices["db.Close"] && indices["db.Close"] < indices["virt.Close"]) {
+		return fmt.Errorf("cleanup must stop replication, close the database, then close libvirt")
 	}
-	if !(idx["stopServing"] < idx["repl.Stop"] && idx["repl.Stop"] < idx["db.Close"]) {
-		t.Fatalf("shutdown order: stopServing %d, repl.Stop %d, db.Close %d", idx["stopServing"], idx["repl.Stop"], idx["db.Close"])
-	}
-	// The database closes before libvirt (mainconn review I-2): closing
-	// libvirt fails the calls waiting on it, and their error paths must not
-	// write what that failure is not.
-	if v, ok := idx["virt.Close"]; !ok || v < idx["db.Close"] {
-		t.Fatalf("shutdown order: db.Close %d, virt.Close %d (present %v), want the database closed first", idx["db.Close"], v, ok)
+	return nil
+}
+
+func TestRunShutdownWiringRejectsUnsafeCallbacks(t *testing.T) {
+	const stop = "stopServing(d.grpcSrv, svc, 1, 1, stopped, func(){})"
+	const cleanup = "repl.Stop(); d.db.Close(); d.virt.Close()"
+	const fixture = `package daemon
+func (d *Daemon) Run(ctx context.Context) error {
+ repl := newReplicator()
+ svc := d.newServer()
+ workers := newDBWorkerCoordinator(ctx, svc)
+ workers.startSweep()
+ workers.startLB(1)
+ go workers.shutdown(ctx, svc.ReExecCh, svc.ShutdownCh, func(reason daemonStopReason){},
+  func(){ stopServing(d.grpcSrv, svc, 1, 1, stopped, func(){}) },
+  func(){ repl.Stop(); d.db.Close(); d.virt.Close() })
+ return nil
+}`
+	for _, tc := range []struct {
+		name, old, replacement string
+	}{
+		{name: "correct"},
+		{"wrong_coordinator", "go workers.shutdown", "go other.shutdown"},
+		{"wrong_context", "workers.shutdown(ctx,", "workers.shutdown(other,"},
+		{"wrong_service_channel", "svc.ReExecCh", "other.ReExecCh"},
+		{"missing_stop", stop, "doNothing()"},
+		{"conditional_stop", stop, "if condition { " + stop + " }"},
+		{"wrong_stop_service", "stopServing(d.grpcSrv, svc,", "stopServing(d.grpcSrv, other,"},
+		{"wrong_stop_server", "stopServing(d.grpcSrv, svc,", "stopServing(other.grpcSrv, svc,"},
+		{"swapped_callbacks", "func(){ " + stop + " },\n  func(){ " + cleanup + " }", "func(){ " + cleanup + " },\n  func(){ " + stop + " }"},
+		{"early_db_in_stop", stop, "d.db.Close(); " + stop},
+		{"early_db_in_prepare", "func(reason daemonStopReason){}", "func(reason daemonStopReason){ d.db.Close() }"},
+		{"conditional_db_cleanup", "d.db.Close()", "if condition { d.db.Close() }"},
+		{"db_before_repl", cleanup, "d.db.Close(); repl.Stop(); d.virt.Close()"},
+		{"virt_before_db", cleanup, "repl.Stop(); d.virt.Close(); d.db.Close()"},
+		{"wrong_daemon_close", "d.db.Close()", "other.db.Close()"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := fixture
+			if tc.old != "" {
+				if strings.Count(source, tc.old) != 1 {
+					t.Fatal("mutation does not target exactly one fixture site")
+				}
+				source = strings.Replace(source, tc.old, tc.replacement, 1)
+			}
+			file, err := parser.ParseFile(token.NewFileSet(), "shutdown-fixture.go", source, 0)
+			if err != nil {
+				t.Fatalf("mutation must remain valid Go syntax: %v", err)
+			}
+			run := file.Decls[0].(*ast.FuncDecl)
+			err = daemonShutdownWiringError(run)
+			if tc.name == "correct" && err != nil {
+				t.Fatalf("valid coordinator/callback wiring refused: %v", err)
+			}
+			if tc.name != "correct" && err == nil {
+				t.Fatal("unsafe coordinator/callback wiring escaped the guard")
+			}
+		})
 	}
 }
 

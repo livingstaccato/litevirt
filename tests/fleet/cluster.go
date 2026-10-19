@@ -1082,7 +1082,7 @@ func (c *Cluster) buildServer(n *Node) {
 		grpc.ChainUnaryInterceptor(n.peerAddrUnaryInterceptor, n.partitionUnaryInterceptor, n.aeMeterUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor, n.hookUnaryInterceptor, c.networkRPCServer(n)),
 		grpc.ChainStreamInterceptor(n.peerAddrStreamInterceptor, n.partitionStreamInterceptor, n.aeMeterStreamInterceptor, n.Server.StreamAuthInterceptor, n.hookStreamInterceptor),
 	)...)
-	pb.RegisterLiteVirtServer(srv, n.Server)
+	n.Server.RegisterServices(srv)
 	n.GRPCSrv = srv
 	serveDone := make(chan struct{})
 	n.serveDone = serveDone

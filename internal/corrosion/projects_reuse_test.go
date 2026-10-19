@@ -243,8 +243,16 @@ func TestDeleteProject_NeverLeavesAPrincipalUnbound(t *testing.T) {
 	if len(bob) != 1 || bob[0].Role != SentinelRole || bob[0].Path != "/" {
 		t.Fatalf("bob (bound only in the deleted project) has %+v, want exactly one NoAccess sentinel at /", bob)
 	}
-	if eve := perPrincipal["user:eve@local"]; len(eve) != 1 || eve[0].ID != "elsewhere" {
-		t.Fatalf("eve (bound elsewhere too) has %+v, want only her /projects/beta binding", eve)
+	// eve keeps her /projects/beta binding AND is left a sentinel: "keeps a
+	// binding elsewhere" cannot be decided from a snapshot (see
+	// TestFleet_ConcurrentProjectDeletesNeverUnbindAUser).
+	eveKept, eveSentinel := false, false
+	for _, b := range perPrincipal["user:eve@local"] {
+		eveKept = eveKept || b.ID == "elsewhere"
+		eveSentinel = eveSentinel || (b.Role == SentinelRole && b.Path == "/")
+	}
+	if !eveKept || !eveSentinel || len(perPrincipal["user:eve@local"]) != 2 {
+		t.Fatalf("eve has %+v, want her /projects/beta binding and one sentinel", perPrincipal["user:eve@local"])
 	}
 	// A re-create must not remove the sentinel (it is outside the project's root).
 	if err := InsertProject(ctx, c, ProjectRecord{Name: "/acme"}); err != nil {
@@ -388,5 +396,133 @@ func TestProject_OtherSpellingOfADeletedNameInheritsNothing(t *testing.T) {
 		if b.ID == "b" {
 			t.Fatal("a project created under another spelling inherited the old binding")
 		}
+	}
+}
+
+// I3: a create that loses the race must not have revoked the winner's state.
+// The hook is the pause between R reading the tombstone and its transaction.
+func TestProject_LosingRecreateRevokesNothingOfTheWinner(t *testing.T) {
+	ctx := context.Background()
+	c := newProjectTestClient(t)
+	if err := InsertProject(ctx, c, ProjectRecord{Name: "/acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteProject(ctx, c, "/acme"); err != nil {
+		t.Fatal(err)
+	}
+	fired := false
+	projectLifecycleInterleaveHook = func() {
+		if fired {
+			return
+		}
+		fired = true
+		projectLifecycleInterleaveHook = nil
+		// W: wins, then the operator installs the new incarnation's state.
+		if err := InsertProject(ctx, c, ProjectRecord{Name: "/acme"}); err != nil {
+			t.Errorf("winner: %v", err)
+			return
+		}
+		if err := InsertRoleBinding(ctx, c, RoleBindingRecord{ID: "new", Path: "/projects/acme", Role: "Admin", Principal: "user:carol@local", Propagate: true}); err != nil {
+			t.Error(err)
+		}
+		if err := UpsertProjectQuota(ctx, c, ProjectQuotaRecord{ProjectName: "/acme", VCPULimit: 11}); err != nil {
+			t.Error(err)
+		}
+		if ok, err := ClaimInitialProjectAuthority(ctx, c, "/acme", "node-2"); err != nil || !ok {
+			t.Errorf("claim: ok=%v err=%v", ok, err)
+		}
+	}
+	t.Cleanup(func() { projectLifecycleInterleaveHook = nil })
+	err := InsertProject(ctx, c, ProjectRecord{Name: "/acme"})
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("the losing create: err=%v, want already exists", err)
+	}
+	live := false
+	for _, b := range liveBindings(t, c) {
+		live = live || b.ID == "new"
+	}
+	if !live {
+		t.Fatal("the losing create retired the winner's role binding")
+	}
+	if q, _ := GetProjectQuota(ctx, c, "/acme"); q == nil || q.VCPULimit != 11 {
+		t.Fatalf("the losing create reset the winner's quota: %+v", q)
+	}
+	if a, ok, _ := CurrentProjectAuthority(ctx, c, "/acme"); !ok || a.Holder != "node-2" {
+		t.Fatalf("the losing create retired the winner's authority epoch: %+v ok=%v", a, ok)
+	}
+}
+
+// I3: the orphan reaper's scan and its retirement are not atomic; a re-create in
+// between must keep its new epoch.
+func TestReconcileOrphanedProjectAuthority_KeepsARecreatedProjectsEpoch(t *testing.T) {
+	ctx := context.Background()
+	c := newProjectTestClient(t)
+	if err := InsertProject(ctx, c, ProjectRecord{Name: "/acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := ClaimInitialProjectAuthority(ctx, c, "/acme", "node-1"); err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	// An older build's delete: tombstone only, authority left live.
+	if err := c.Execute(ctx, `UPDATE projects SET deleted_at = ?, updated_at = ? WHERE name = ?`, nowRFC3339(), c.NowTS(), "/acme"); err != nil {
+		t.Fatal(err)
+	}
+	fired := false
+	projectLifecycleInterleaveHook = func() {
+		if fired {
+			return
+		}
+		fired = true
+		projectLifecycleInterleaveHook = nil
+		if err := InsertProject(ctx, c, ProjectRecord{Name: "/acme"}); err != nil {
+			t.Errorf("recreate: %v", err)
+			return
+		}
+		if ok, err := ClaimInitialProjectAuthority(ctx, c, "/acme", "node-2"); err != nil || !ok {
+			t.Errorf("claim: ok=%v err=%v", ok, err)
+		}
+	}
+	t.Cleanup(func() { projectLifecycleInterleaveHook = nil })
+	if _, err := ReconcileOrphanedProjectAuthority(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	if a, ok, _ := CurrentProjectAuthority(ctx, c, "/acme"); !ok || a.Holder != "node-2" || a.Epoch != 2 {
+		t.Fatalf("the reaper retired the re-created project's epoch: %+v ok=%v", a, ok)
+	}
+}
+
+// I4: "/" and "/_default" canonicalise to RBAC roots that are not the row's own.
+// A row that already exists under such a name (nothing creates one now) must
+// delete without touching anyone else's grants.
+func TestDeleteProject_UnsafeNamesRetireNoPrefixGrants(t *testing.T) {
+	for _, name := range []string{"/", "//", "/_default"} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			c := newProjectTestClient(t)
+			if err := InsertProject(ctx, c, ProjectRecord{Name: name}); err != nil {
+				t.Fatal(err)
+			}
+			for _, b := range []RoleBindingRecord{
+				{ID: "other", Path: "/projects/beta/vms/x", Role: "Operator", Principal: "user:bob@local"},
+				{ID: "dflt", Path: "/projects/_default/vms/y", Role: "Operator", Principal: "user:carol@local", Propagate: true},
+				{ID: "dflt-root", Path: "/projects/_default", Role: "Viewer", Principal: "user:dave@local", Propagate: true},
+			} {
+				if err := InsertRoleBinding(ctx, c, b); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := DeleteProject(ctx, c, name); err != nil {
+				t.Fatalf("delete %q: %v", name, err)
+			}
+			got := map[string]bool{}
+			for _, b := range liveBindings(t, c) {
+				got[b.ID] = true
+			}
+			for _, id := range []string{"other", "dflt", "dflt-root"} {
+				if !got[id] {
+					t.Fatalf("deleting project %q retired the unrelated grant %q", name, id)
+				}
+			}
+		})
 	}
 }

@@ -49,6 +49,7 @@ keeps the old display name and parent, so a re-create with a different
 `--display` or `--parent` is refused; repeat the old display, or pass none.
 Project path segments named `vms`, `containers`, `networks`, `storage_pools`,
 `security_groups` or `stacks` are reserved below the first segment.
+The names `/` and `_default` (in any spelling, such as `//`) are refused: the first is the whole project namespace and the second the implicit default project.
 
 ## Quotas
 

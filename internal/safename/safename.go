@@ -117,6 +117,12 @@ func ValidateNewProjectName(in string) error {
 	if err != nil {
 		return err
 	}
+	// "/" is the whole project namespace (every spelling of it: "//" too) and
+	// "/_default" the implicit default project: neither is a tenant a caller may
+	// create, and a prefix derived from either would reach grants that are not its.
+	if canon == "/" || canon == "/_default" {
+		return fmt.Errorf("project %q names the project root or the default project; choose another name", in)
+	}
 	segs := strings.Split(strings.Trim(canon, "/"), "/")
 	for i, seg := range segs {
 		if i > 0 && reservedProjectSegments[seg] {

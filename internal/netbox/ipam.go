@@ -27,6 +27,14 @@ type IPAddress struct {
 	// interface can carry several addresses — so P2's mirror reads assignment
 	// from here rather than from a synthetic field on the interface.
 	AssignedObjectID int
+	// AssignedObjectType is the content type of what AssignedObjectID names
+	// ("virtualization.vminterface" for a VM interface), or "". Assignment is a
+	// generic relation in NetBox, so an id alone does not say which model's
+	// object holds the address.
+	AssignedObjectType string
+	// AssignedVMID is the virtual machine owning the interface this address is
+	// assigned to, when NetBox's nested assigned_object carries one, or 0.
+	AssignedVMID int
 	// Created is when NetBox first recorded this object, or the zero time when
 	// it could not be read.
 	//
@@ -59,8 +67,14 @@ type ipJSON struct {
 	VRF     *struct {
 		ID int `json:"id"`
 	} `json:"vrf"`
-	AssignedObjectID *int           `json:"assigned_object_id"`
-	CustomFields     map[string]any `json:"custom_fields"`
+	AssignedObjectID   *int   `json:"assigned_object_id"`
+	AssignedObjectType string `json:"assigned_object_type"`
+	AssignedObject     *struct {
+		VirtualMachine *struct {
+			ID int `json:"id"`
+		} `json:"virtual_machine"`
+	} `json:"assigned_object"`
+	CustomFields map[string]any `json:"custom_fields"`
 	// Created is NetBox's own creation timestamp. 4.x serializes a full RFC3339
 	// datetime; NetBox 3.x serialized a DATE ("2026-01-02"), which is NOT
 	// accepted — see createdLayouts. Anything else yields the zero time.
@@ -108,6 +122,10 @@ func (j ipJSON) toIP() IPAddress {
 	}
 	if j.AssignedObjectID != nil {
 		out.AssignedObjectID = *j.AssignedObjectID
+	}
+	out.AssignedObjectType = j.AssignedObjectType
+	if j.AssignedObject != nil && j.AssignedObject.VirtualMachine != nil {
+		out.AssignedVMID = j.AssignedObject.VirtualMachine.ID
 	}
 	if v, ok := j.CustomFields[IdentityField].(string); ok {
 		out.Identity = v
@@ -177,8 +195,10 @@ func (c *Client) ClaimSpecificIP(ctx context.Context, address string, vrfID int,
 	return out.toIP(), nil
 }
 
-// LookupByAddress finds addresses matching an exact address within one VRF.
-// Used only for EXPLICIT claims — a dynamic claim has no address to look up.
+// LookupByAddress finds addresses within one VRF matching address. NetBox's
+// filter matches a value WITH a prefix length exactly, and a bare host under
+// any mask. Used for EXPLICIT claims — a dynamic claim has no address to look
+// up — and by the mirror's dead-address repair, which passes the bare host.
 func (c *Client) LookupByAddress(ctx context.Context, address string, vrfID int) ([]IPAddress, error) {
 	q := url.Values{}
 	q.Set("address", address)

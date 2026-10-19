@@ -203,6 +203,9 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	// setting of the one removed under its name. The wire shape is unchanged
 	// (host_readmit.go explains why).
 	{SQL: readmitHostSQL, Disposition: DispHostReadmit},
+	// The counter-issuing re-admission (host_incarnation.go): the reset form
+	// too, applied by the ordering key in its WHERE, not by the clock.
+	{SQL: readmitHostV2SQL, Disposition: DispHostReadmit},
 	// audit_log hash-chain reseal: idempotent (recomputes the same hashes), and
 	// applied through the signature-guarded form on the receiver.
 	//

@@ -12,11 +12,15 @@ import (
 // with the zero grant, and not with another feature's. With it they write as
 // the plain writer does.
 //
+// An UpdateVM that adds USB devices or hot-add writes through
+// MutateDesiredSpecWithReleaseFeatures with needs.Passthrough.
+//
 // Mutation: drop the Check from any one writer — its case goes red (and the
 // capabilities guard's TestReleaseFeatureWriters_TakeAGrant still passes, so
 // this is the test that pins the check itself).
 func TestPassthroughWriters_RefuseWithoutTheFeaturesGrant(t *testing.T) {
 	ctx := context.Background()
+	var none capabilities.FeatureGrant
 	for _, g := range []struct {
 		name string
 		g    capabilities.FeatureGrant
@@ -36,11 +40,11 @@ func TestPassthroughWriters_RefuseWithoutTheFeaturesGrant(t *testing.T) {
 		if err := InsertVM(ctx, c, VMRecord{Name: "m", HostName: "h1", State: "stopped", Spec: `{"name":"m"}`}, nil, nil); err != nil {
 			t.Fatal(err)
 		}
-		applied, _, err := MutateDesiredSpecPassthrough(ctx, c, g.g, "m", func(string) (string, error) {
+		applied, _, err := MutateDesiredSpecWithReleaseFeatures(ctx, c, none, g.g, none, none, VMSpecFeatures{Passthrough: true}, "m", func(string) (string, error) {
 			return `{"name":"m","memory_hotplug_max_mib":4096}`, nil
 		})
 		if !errors.Is(err, capabilities.ErrNoFeatureGrant) || applied {
-			t.Errorf("%s: MutateDesiredSpecPassthrough = %v (applied %v), want ErrNoFeatureGrant", g.name, err, applied)
+			t.Errorf("%s: MutateDesiredSpecWithReleaseFeatures = %v (applied %v), want ErrNoFeatureGrant", g.name, err, applied)
 		}
 		if got, _ := GetVM(ctx, c, "m"); got == nil || got.Spec != `{"name":"m"}` {
 			t.Errorf("%s: a refused mutate changed the spec: %+v", g.name, got)
@@ -64,10 +68,10 @@ func TestPassthroughWriters_RefuseWithoutTheFeaturesGrant(t *testing.T) {
 	if err := InsertVMWithPassthrough(ctx, c, g, VMRecord{Name: "u", HostName: "h1", State: "stopped", Spec: `{"name":"u"}`}, nil, nil, nil, nil, true); err != nil {
 		t.Fatalf("InsertVMWithPassthrough with the grant: %v", err)
 	}
-	if applied, _, err := MutateDesiredSpecPassthrough(ctx, c, g, "u", func(string) (string, error) {
+	if applied, _, err := MutateDesiredSpecWithReleaseFeatures(ctx, c, none, g, none, none, VMSpecFeatures{Passthrough: true}, "u", func(string) (string, error) {
 		return `{"name":"u","memory_hotplug_max_mib":4096}`, nil
 	}); err != nil || !applied {
-		t.Fatalf("MutateDesiredSpecPassthrough with the grant: %v (applied %v)", err, applied)
+		t.Fatalf("MutateDesiredSpecWithReleaseFeatures with the grant: %v (applied %v)", err, applied)
 	}
 	if got, _ := GetVM(ctx, c, "u"); got == nil || got.Spec != `{"name":"u","memory_hotplug_max_mib":4096}` {
 		t.Fatalf("granted VM writes: %+v", got)

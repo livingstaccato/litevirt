@@ -696,3 +696,79 @@ func TestSettle_AStopProvenThisRunSurvivesAFailedPhaseSave(t *testing.T) {
 		check(t, f, f.r, o, &failing)
 	})
 }
+
+// A stop proven this run whose stopped-phase save failed is saved in the
+// stopped phase once the disk recovers, even while the audit row and the
+// condition still fail: the in-run proof dies with the daemon, so a restart
+// that finds the name live again must still see a stopped-phase record and
+// write the record of the earlier stop, for the settle's own stop and for a
+// retry that proved the copy shut off.
+//
+// Mutation: retry the phase save only when the copy is reclassified (not on
+// the cached proof) — the restart drops the record, red.
+func TestSettle_ACachedProofRetriesTheStoppedPhaseSave(t *testing.T) {
+	check := func(t *testing.T, f *settleFixture, r *Reconciler, o *overrideState, phaseFails *bool) {
+		t.Helper()
+		ctx := context.Background()
+		if got, ok := settlePendingFor(t, f); !ok || got.Phase != settlePhaseStopping {
+			t.Fatalf("pending-settle record = (%+v, %v), want it left stopping by the failed phase save", got, ok)
+		}
+		// The disk recovers; the audit row and the condition still fail.
+		*phaseFails = false
+		r.selfFence(ctx)
+		got, ok := settlePendingFor(t, f)
+		if !ok || got.Phase != settlePhaseStopped {
+			t.Fatalf("pending-settle record = (%+v, %v), want the cached proof saved in the stopped phase", got, ok)
+		}
+		if got.Audited || got.Raised {
+			t.Fatalf("pending-settle record = %+v wrote an output through injected failures", got)
+		}
+		// The name comes back live, and the daemon restarts with writes working.
+		f.virt.SetState("vm-a", libvirtfake.StateRunning)
+		o.st = lv.DomainStatus{State: RuntimeRunning, Reason: "booted"}
+		r = NewReconciler("node-a", f.dataDir, f.db, o)
+		r.selfFence(ctx)
+		r.selfFence(ctx)
+		if n := settleAuditRows(t, f); n != 1 {
+			t.Fatalf("partition.settle rows = %d, want 1", n)
+		}
+		if !settledRaised(t, f) {
+			t.Fatal("vm_settled not raised")
+		}
+		if _, ok := settlePendingFor(t, f); ok {
+			t.Fatal("the pending-settle record outlived a complete record")
+		}
+	}
+	faults := func(phaseFails *bool) func(string) error {
+		return failSteps(func(step string) bool { return step != "phase" || *phaseFails })
+	}
+	t.Run("retry proved it", func(t *testing.T) {
+		f := newSettleFixture(t)
+		o := &overrideState{Fake: f.virt, st: lv.DomainStatus{State: "stopped", Reason: "guest-shutdown"}}
+		r := NewReconciler("node-a", f.dataDir, f.db, o)
+		phaseFails := true
+		r.settleFault = faults(&phaseFails)
+		if err := newSettlePendingStore(f.dataDir).put(f.pendingFor(f.r)); err != nil {
+			t.Fatal(err)
+		}
+		r.selfFence(context.Background())
+		check(t, f, r, o, &phaseFails)
+		if d := settleAuditDetail(t, f); !strings.Contains(d, "found shut off (reason guest-shutdown)") {
+			t.Fatalf("detail %q does not say how the copy was found", d)
+		}
+	})
+	t.Run("the settle's own stop", func(t *testing.T) {
+		f := newSettleFixture(t)
+		phaseFails := true
+		f.r.settleFault = faults(&phaseFails)
+		if st := f.run(); st != libvirtfake.StateShutdown {
+			t.Fatalf("vm-a is %s; the settle must stop it", st)
+		}
+		f.r.settleProofs = func(context.Context, *corrosion.Client, string, string) ([]corrosion.ProofRecord, error) {
+			return nil, nil
+		}
+		o := &overrideState{Fake: f.virt, st: lv.DomainStatus{State: "stopped", Reason: "destroyed"}}
+		f.r.virt = o
+		check(t, f, f.r, o, &phaseFails)
+	})
+}

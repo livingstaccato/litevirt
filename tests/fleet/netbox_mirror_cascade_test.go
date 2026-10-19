@@ -10,8 +10,13 @@
 package fleet
 
 import (
+	"context"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // operatorAddressOn seeds an address with no litevirt identity and attaches it
@@ -185,24 +190,50 @@ func TestMirrorReplaceDetachesAPrimaryAddress(t *testing.T) {
 // TestMirrorNeverDeletesAnInterfaceHoldingAnAddressItCannotDetach: the token
 // may view the operator's address but not change it, so the detach answers
 // 404 while the address stays attached. Deleting the interface then would
-// cascade the address away; the delete is refused instead.
+// cascade the address away. That one removal is withheld — on every pass —
+// while the rest of the mirror runs, and the address is named in a finding.
 func TestMirrorNeverDeletesAnInterfaceHoldingAnAddressItCannotDetach(t *testing.T) {
 	nb, c, gates := boundMirrorClusterGated(t, 1)
 	latchOperationProtocol(t, c, gates)
 	n := c.Nodes[0]
 
 	mustCreateVM(t, n, "vm-1", orphanNetwork)
+	mustCreateVM(t, n, "vm-2", orphanNetwork)
 	mustSyncAllNodes(t, c)
 	id := operatorAddressOn(t, nb, "vm-1", "eth0", "192.0.2.53/32")
 	nb.SetViewOnly(id)
 	iface := nb.InterfaceID("vm-1", "eth0")
 
 	mustDetachNIC(t, c, n, "vm-1", nb.InterfaceMAC("vm-1", "eth0"))
-	if err := n.SyncNetBoxMirror(); err == nil {
-		t.Fatal("the pass succeeded although an address on the detached interface could not be detached")
+	mustDeleteVM(t, n, "vm-2") // work later phases still owe the cluster
+	for i := 0; i < 2; i++ {
+		if err := n.SyncNetBoxMirror(); err != nil {
+			t.Fatalf("pass %d: one address the token cannot change failed the whole mirror: %v", i, err)
+		}
 	}
+
 	if assigned, exists := nb.Address(id); !exists || assigned != iface {
 		t.Fatalf("operator address %d: exists=%v assigned=%d (cascaded %v), want it kept on interface %d",
 			id, exists, assigned, nb.Cascaded(), iface)
+	}
+	if nb.InterfaceID("vm-1", "eth0") != iface {
+		t.Fatal("the interface holding the address was deleted")
+	}
+	if got := nb.VMCount("vm-2"); got != 0 {
+		t.Fatalf("vm-2 objects = %d after its delete: the withheld removal stopped the later phases", got)
+	}
+	conds, err := corrosion.ListHealthConditions(context.Background(), n.DB, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var named bool
+	for _, h := range conds {
+		if h.Code == "netbox_address_not_changeable" && h.SubjectID == strconv.Itoa(id) &&
+			strings.Contains(h.Evidence, "change permission") {
+			named = true
+		}
+	}
+	if !named {
+		t.Fatalf("no netbox_address_not_changeable finding naming address %d: %+v", id, conds)
 	}
 }

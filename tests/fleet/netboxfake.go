@@ -448,6 +448,10 @@ func (f *NetBoxFake) handle(w http.ResponseWriter, r *http.Request) {
 	// prefixes below, and its DELETE before any collection handler, or a
 	// release would fall through to the 404.
 	case strings.HasPrefix(r.URL.Path, "/api/ipam/ip-addresses/") && r.Method == http.MethodDelete:
+		if f.isViewOnly(r.URL.Path) {
+			writeErr(w, http.StatusNotFound, `{"detail":"No IPAddress matches the given query."}`)
+			return
+		}
 		f.release(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/ipam/ip-addresses/") && r.Method == http.MethodPatch:
 		if f.isViewOnly(r.URL.Path) {

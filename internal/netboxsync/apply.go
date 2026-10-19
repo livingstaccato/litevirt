@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -197,6 +198,10 @@ type Reconciler struct {
 	// Nil runs the pass directly. See Options.Exclusive.
 	exclusive func(context.Context, func(context.Context) error) error
 
+	// blockedSink receives each completed pass's withheld removals. See
+	// Options.BlockedRemovals.
+	blockedSink func(context.Context, map[string]string)
+
 	// deadAddrs is the NetBox address ids THIS pass found gone: a lease still
 	// names each one, and NetBox answered 404 when it was assigned. Reset at the
 	// start of every sweep. See assignAddress.
@@ -205,6 +210,9 @@ type Reconciler struct {
 	// repointed maps a dead address id this pass repaired to the address that
 	// replaced it, so the primary phase points at the live one.
 	repointed map[int]int
+	// blocked is the removals this pass withheld because an address on the
+	// object could not be detached; see withholdBlockedRemoval.
+	blocked map[string]string
 }
 
 // sink returns the metrics sink, never nil.
@@ -452,6 +460,10 @@ func (r *Reconciler) replaceSuperseded(ctx context.Context, a Action, idx desire
 	switch {
 	case err == nil:
 		r.sink().IncMirrorObject(netboxKindVM, opDeleted)
+	case r.withholdBlockedRemoval(err, a):
+		// Nothing was removed; the create that needed the name collides
+		// with it and says so.
+		return nil
 	case isNotFound(err):
 		// Already gone IS the end state this action wants, so it falls through
 		// to the mapping retirement below.
@@ -851,11 +863,54 @@ func (r *Reconciler) isDeadAddress(ipID int) bool {
 	return dead
 }
 
+// withholdBlockedRemoval withholds a removal that NetBox could not make without
+// destroying an address — one the API token may view but not change, so it
+// could not be detached — and records it. Reports false for any other error.
+//
+// FAIL CLOSED FOR THAT ONE OBJECT ONLY. Its delete stays refused, on every
+// pass, until the token can change the address; failing the phase instead
+// would stop the primary and delete phases for every VM over one operator
+// address. The pass reports itself unconverged and names the address (see
+// sweep and Options.BlockedRemovals).
+func (r *Reconciler) withholdBlockedRemoval(err error, a Action) bool {
+	var nce *netbox.AddressNotChangeableError
+	if !errors.As(err, &nce) {
+		return false
+	}
+	detail := fmt.Sprintf("NetBox address %d (%s) is attached to interface %d, which the inventory "+
+		"mirror is removing (%s %d). The NetBox API token litevirt uses may view the address but "+
+		"not change it, so it cannot be detached, and removing what holds it would destroy it. "+
+		"The removal is withheld until the token is given change permission on ipam.ipaddress "+
+		"(or the address is detached in NetBox by hand)",
+		nce.ID, nce.Address, nce.AssignedTo, a.Kind, a.NetBoxID)
+	slog.Warn("netbox mirror: withholding one removal — "+detail, "identity", a.Key)
+	r.deadMu.Lock()
+	defer r.deadMu.Unlock()
+	if r.blocked == nil {
+		r.blocked = map[string]string{}
+	}
+	r.blocked[strconv.Itoa(nce.ID)] = detail
+	return true
+}
+
+// blockedRemovals is this pass's withheld removals, keyed by the NetBox
+// address id that blocked each one, with what to tell the operator.
+func (r *Reconciler) blockedRemovals() map[string]string {
+	r.deadMu.Lock()
+	defer r.deadMu.Unlock()
+	out := make(map[string]string, len(r.blocked))
+	for k, v := range r.blocked {
+		out[k] = v
+	}
+	return out
+}
+
 func (r *Reconciler) resetDeadAddresses() {
 	r.deadMu.Lock()
 	defer r.deadMu.Unlock()
 	r.deadAddrs = nil
 	r.repointed = nil
+	r.blocked = nil
 }
 
 // deadAddresses is this pass's dead address ids, sorted, with the NIC identity
@@ -927,6 +982,9 @@ func (r *Reconciler) deleteObject(ctx context.Context, a Action) error {
 		// delete, and nothing else prunes a netbox_objects row.
 		slog.Info("netbox: object already absent; retiring its mapping",
 			"kind", a.Kind, "netbox_id", a.NetBoxID)
+	case r.withholdBlockedRemoval(err, a):
+		// Nothing was removed, so the mapping stays.
+		return nil
 	default:
 		return fmt.Errorf("netboxsync: delete %s %d: %w", a.Kind, a.NetBoxID, err)
 	}

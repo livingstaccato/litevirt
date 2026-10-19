@@ -201,6 +201,13 @@ type Options struct {
 	// wired on its own: with no other writer on the node there is nothing to
 	// exclude.
 	Exclusive func(ctx context.Context, pass func(context.Context) error) error
+
+	// BlockedRemovals receives, at the end of every pass that ran all its
+	// phases, the removals that pass withheld because an address on the
+	// object could not be detached: keyed by the NetBox address id, with what
+	// the operator has to do. An empty map is a pass that withheld none, which
+	// is what lets a finding clear. Nil discards them; the log line remains.
+	BlockedRemovals func(ctx context.Context, blocked map[string]string)
 }
 
 // New builds a Reconciler.
@@ -229,6 +236,7 @@ func New(o Options) *Reconciler {
 		holdsLease:   o.HoldsLease,
 		latched:      o.Latched,
 		exclusive:    o.Exclusive,
+		blockedSink:  o.BlockedRemovals,
 
 		inventorySnapshot: o.InventorySnapshot,
 	}
@@ -610,6 +618,15 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 
 	if err := r.applyPhases(ctx, actions, indexDesired(desired, fp), fp); err != nil {
 		return false, withheldReplacementCause(err, withheldNames, partialRead)
+	}
+	// Reported whether or not anything was withheld: an empty set from a pass
+	// that ran every phase is what clears the finding.
+	blocked := r.blockedRemovals()
+	if r.blockedSink != nil {
+		r.blockedSink(ctx, blocked)
+	}
+	if len(blocked) > 0 {
+		converged = false
 	}
 	if ids, nics := r.deadAddresses(); len(ids) > 0 {
 		// Every other action ran; these NICs are left without their address in

@@ -29,12 +29,14 @@ type sharedAdmissions struct {
 }
 
 // operatorClient is one operator's connection to sharedAdmissions. before
-// runs when its AdmitHost arrives, after once the cluster has answered it.
+// runs when its first AdmitHost arrives, after once the cluster has answered
+// it (an add asks again before it installs; the hooks run once).
 type operatorClient struct {
 	pb.LiteVirtClient
 	s             *sharedAdmissions
 	before, after func()
 	admitted      string
+	asked         int
 }
 
 func (c *operatorClient) ListHosts(context.Context, *pb.ListHostsRequest, ...grpc.CallOption) (*pb.ListHostsResponse, error) {
@@ -48,14 +50,15 @@ func (c *operatorClient) ListHosts(context.Context, *pb.ListHostsRequest, ...grp
 }
 
 func (c *operatorClient) AdmitHost(_ context.Context, req *pb.AdmitHostRequest, _ ...grpc.CallOption) (*pb.AdmitHostResponse, error) {
-	if c.before != nil {
+	c.asked++
+	if c.before != nil && c.asked == 1 {
 		c.before()
 	}
 	resp, err := c.s.admit(req)
 	if err == nil {
 		c.admitted = req.GetCertSerial()
 	}
-	if c.after != nil {
+	if c.after != nil && c.asked == 1 {
 		c.after()
 	}
 	return resp, err
@@ -323,7 +326,7 @@ func TestHostAdd_ARerunFinishesAnEarlierReleasesStagedAdd(t *testing.T) {
 	if err := f.add(t); err != nil {
 		t.Fatalf("the rerun: %v", err)
 	}
-	if len(f.client.admitted) != 1 || f.client.admitted[0] != serial {
+	if !oneSerial(f.client.admitted) || f.client.admitted[0] != serial {
 		t.Errorf("admitted %v, want the earlier admission's %s", f.client.admitted, serial)
 	}
 	servesItsAdmittedPair(t, f.targetPKI, serial)
@@ -404,5 +407,170 @@ func TestHostAdd_ARerunWhileTheAdmittedAddIsInFlightLeavesItsFiles(t *testing.T)
 				t.Errorf("the admitted add's migration key is not in place: %v", err)
 			}
 		})
+	}
+}
+
+// twoOperators is a machine and two operators adding it through
+// independent admitters (two replicas that have not exchanged the
+// admissions), each with its own target over the one machine.
+func twoOperators(t *testing.T) (f *addFixture, a, b *operatorClient, ta, tb *LocalAddTarget, plan func(dir, name string) hostAddPlan, opB string) {
+	t.Helper()
+	f = newAddFixture(t)
+	if _, _, _, err := ensureLocalMigrationCA(f.opPKI, nil); err != nil {
+		t.Fatal(err)
+	}
+	opB = secondOperatorPKI(t, f.opPKI)
+	clone := func() []*pb.Host { return append([]*pb.Host(nil), f.client.hosts...) }
+	a = &operatorClient{s: &sharedAdmissions{hosts: clone()}}
+	b = &operatorClient{s: &sharedAdmissions{hosts: clone()}}
+	ta = &LocalAddTarget{Root: f.target.Root, PKIDir: f.targetPKI, Binary: f.target.Binary}
+	tb = &LocalAddTarget{Root: f.target.Root, PKIDir: f.targetPKI, Binary: f.target.Binary}
+	plan = func(dir, name string) hostAddPlan {
+		return hostAddPlan{pkiDir: dir, hostName: name, hostAddr: "10.0.0.9", peersYAML: "[]",
+			binPath: f.target.Binary, rerun: "lv host add --name " + name + " root@10.0.0.9"}
+	}
+	return
+}
+
+// Codex ec8 I1: two admissions of one machine under two names, each through
+// a replica the other had not reached, both stood, and the stamps decided
+// nothing at install time: B, admitted and paused, then A admitted and
+// installed, then B, whose stamp may be the older, installed too. The second
+// add to install installs nothing now, whatever its stamp: it finds, under
+// the machine's add lock, that the machine's certificate changed since it
+// began, or that another name was installed there.
+//
+// Mutations: drop the certificate check — "an earlier release's add
+// installed meanwhile" installs B; drop the record check — "B begins after A
+// installed" installs B.
+func TestHostAdd_TheSecondAddToInstallAMachineInstallsNothing(t *testing.T) {
+	t.Run("B admitted before A installs", func(t *testing.T) {
+		f, a, b, ta, tb, plan, opB := twoOperators(t)
+		bAdmitted, aDone := make(chan struct{}), make(chan struct{})
+		b.after = func() { close(bAdmitted); <-aDone }
+		var errA, errB error
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() { defer wg.Done(); errB = hostAddTo(context.Background(), b, tb, plan(opB, "node-b")) }()
+		<-bAdmitted
+		errA = hostAddTo(context.Background(), a, ta, plan(f.opPKI, "node-a"))
+		close(aDone)
+		wg.Wait()
+		if errA != nil {
+			t.Fatalf("A: %v", errA)
+		}
+		if errB == nil || !strings.Contains(errB.Error(), "installs nothing") {
+			t.Fatalf("B = %v, want the refusal of a second install", errB)
+		}
+		servesItsAdmittedPair(t, f.targetPKI, a.admitted)
+		for _, e := range tb.Events {
+			if e == "sh install" || strings.HasPrefix(e, "run systemctl stop") {
+				t.Errorf("B reached the install: %v", tb.Events)
+			}
+		}
+	})
+	t.Run("an earlier release's add installed meanwhile", func(t *testing.T) {
+		// It leaves no record: the certificate it installed says so.
+		f, _, b, _, tb, plan, opB := twoOperators(t)
+		other := t.TempDir()
+		if err := pki.GenerateHostCert(filepath.Join(f.opPKI, "ca.crt"), filepath.Join(f.opPKI, "ca.key"),
+			filepath.Join(other, "x.crt"), filepath.Join(other, "x.key"), "node-x", net.IPv4(10, 0, 0, 9)); err != nil {
+			t.Fatal(err)
+		}
+		b.after = func() {
+			for _, n := range []string{"crt", "key"} {
+				if err := os.WriteFile(filepath.Join(f.targetPKI, "host."+n), mustRead(t, filepath.Join(other, "x."+n)), 0o600); err != nil {
+					t.Error(err)
+				}
+			}
+		}
+		err := hostAddTo(context.Background(), b, tb, plan(opB, "node-b"))
+		if err == nil || !strings.Contains(err.Error(), "changed since this add began") {
+			t.Fatalf("B = %v, want the refusal of a second install", err)
+		}
+		if got := installedSerial(mustRead(t, filepath.Join(f.targetPKI, "host.crt"))); got != installedSerial(mustRead(t, filepath.Join(other, "x.crt"))) {
+			t.Errorf("B replaced the other add's certificate (serves %s)", got)
+		}
+	})
+	t.Run("B begins after A installed", func(t *testing.T) {
+		f, a, b, ta, tb, plan, opB := twoOperators(t)
+		if err := hostAddTo(context.Background(), a, ta, plan(f.opPKI, "node-a")); err != nil {
+			t.Fatalf("A: %v", err)
+		}
+		// B's replica has not heard of node-a.
+		err := hostAddTo(context.Background(), b, tb, plan(opB, "node-b"))
+		if err == nil || !strings.Contains(err.Error(), "node-a") || !strings.Contains(err.Error(), "installs nothing") {
+			t.Fatalf("B = %v, want the refusal naming node-a", err)
+		}
+		servesItsAdmittedPair(t, f.targetPKI, a.admitted)
+	})
+}
+
+// Codex ec8 I2: a rerun of the same admission installed while the first add
+// was in its setup, and the first add's rollback then moved the rerun's
+// active files aside and restored the old identity over them. The machine is
+// one add's from its lock to the end of its install, setup or rollback: the
+// rerun is refused while the first holds it, and installs nothing.
+//
+// Mutation: drop the lock — the rerun installs during A's setup.
+func TestHostAdd_ARerunWaitsOutAnAddInItsSetup(t *testing.T) {
+	f, _, _, ta, tb, plan, opB := twoOperators(t)
+	cluster := &sharedAdmissions{hosts: f.client.hosts}
+	a, b := &operatorClient{s: cluster}, &operatorClient{s: cluster}
+	inSetup, bDone := make(chan struct{}), make(chan struct{})
+	ta.OnSetup = func() error { close(inSetup); <-bDone; return errors.New("setup failed") }
+	var errA, errB error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); errA = hostAddTo(context.Background(), a, ta, plan(f.opPKI, "node-9")) }()
+	<-inSetup
+	errB = hostAddTo(context.Background(), b, tb, plan(opB, "node-9"))
+	close(bDone)
+	wg.Wait()
+	if errB == nil || !strings.Contains(errB.Error(), "holds this machine") {
+		t.Fatalf("the rerun during A's setup = %v, want the lock's refusal", errB)
+	}
+	for _, e := range tb.Events {
+		if e == "sh install" {
+			t.Errorf("the rerun installed while A held the machine: %v", tb.Events)
+		}
+	}
+	if errA == nil {
+		t.Fatal("A's failed setup reported success")
+	}
+	f.identityUnchanged(t)
+}
+
+// refusingAgain answers its first AdmitHost as the cluster does, and refuses
+// the second: an earlier admission at the address reached the admitter in
+// between.
+type refusingAgain struct{ *operatorClient }
+
+func (c *refusingAgain) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest, o ...grpc.CallOption) (*pb.AdmitHostResponse, error) {
+	if c.asked >= 1 {
+		c.asked++
+		return nil, status.Error(codes.FailedPrecondition, "10.0.0.9:7443 is node-0's address")
+	}
+	return c.operatorClient.AdmitHost(ctx, req, o...)
+}
+
+// Codex ec8 I1: the address is decided again right before the install, by
+// the cluster after a fresh pull (AdmitHost again, under the machine's lock):
+// a refusal then installs nothing.
+//
+// Mutation: drop the second AdmitHost — the add installs.
+func TestHostAdd_ARefusalAskedAgainBeforeTheInstallInstallsNothing(t *testing.T) {
+	f := newAddFixture(t)
+	c := &refusingAgain{&operatorClient{s: &sharedAdmissions{hosts: f.client.hosts}}}
+	err := hostAddTo(context.Background(), c, f.target, hostAddPlan{pkiDir: f.opPKI, hostName: "node-9",
+		hostAddr: "10.0.0.9", peersYAML: "[]", binPath: f.target.Binary, rerun: "lv host add --name node-9 root@10.0.0.9"})
+	if err == nil || !strings.Contains(err.Error(), "node-0") {
+		t.Fatalf("add = %v, want the refusal asked again", err)
+	}
+	f.identityUnchanged(t)
+	for _, e := range f.target.Events {
+		if e == "sh install" {
+			t.Errorf("installed after the refusal: %v", f.target.Events)
+		}
 	}
 }

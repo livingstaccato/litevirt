@@ -654,7 +654,8 @@ func TestHostRemove_RemovesAStrandedAddsStagedPair(t *testing.T) {
 // goes too.
 //
 // Mutations: delete untagged staged files whatever their serial — "another
-// serial" loses the legacy pair; delete every attempt's tagged files — the
+// serial" loses the legacy pair; drop the key check — "the revoked
+// certificate beside another key" loses the other key; delete every attempt's tagged files — the
 // other attempt's pair goes; leave the resolved config — its stage is left.
 func TestRemoveStagedPair_OnlyTheRevokedSerial(t *testing.T) {
 	dir := t.TempDir()
@@ -676,12 +677,15 @@ func TestRemoveStagedPair_OnlyTheRevokedSerial(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		// legacy is the untagged pair an earlier release staged, if any.
-		legacy     []byte
-		legacyGone bool
+		legacy, legacyKey []byte
+		legacyGone        bool
 	}{
-		{"tagged", nil, false},
-		{"the revoked serial untagged", revokedCrt, true},
-		{"another serial untagged", otherCrt, false},
+		{"tagged", nil, nil, false},
+		{"the revoked serial untagged", revokedCrt, revokedKey, true},
+		{"another serial untagged", otherCrt, otherKey, false},
+		// Codex ec8 I2: the certificate claimed before an older add staged a
+		// new pair, the key after: not one pair, so nothing goes.
+		{"the revoked certificate beside another key", revokedCrt, otherKey, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pkiDir := t.TempDir()
@@ -719,7 +723,7 @@ func TestRemoveStagedPair_OnlyTheRevokedSerial(t *testing.T) {
 			put(addStagedPath(key, revoked+"-0a"), revokedKey)
 			if tc.legacy != nil {
 				put(legacyStagedPath(crt), tc.legacy)
-				put(legacyStagedPath(key), []byte("legacy key"))
+				put(legacyStagedPath(key), tc.legacyKey)
 			}
 			if err := removeStagedPair(r, strings.ToUpper(revoked)); err != nil {
 				t.Fatal(err)
@@ -738,8 +742,9 @@ func TestRemoveStagedPair_OnlyTheRevokedSerial(t *testing.T) {
 			if !exists(crt) || !exists(key) || !exists(target) {
 				t.Error("the machine's installed identity or config was removed")
 			}
-			if tc.legacy != nil && exists(legacyStagedPath(crt)) == tc.legacyGone {
-				t.Errorf("the untagged staged pair: left %v, want removed %v", exists(legacyStagedPath(crt)), tc.legacyGone)
+			if tc.legacy != nil && (exists(legacyStagedPath(crt)) == tc.legacyGone || exists(legacyStagedPath(key)) == tc.legacyGone) {
+				t.Errorf("the untagged staged pair: crt left %v, key left %v, want removed %v",
+					exists(legacyStagedPath(crt)), exists(legacyStagedPath(key)), tc.legacyGone)
 			}
 		})
 	}

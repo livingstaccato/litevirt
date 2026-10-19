@@ -482,5 +482,14 @@ func removeStagedPair(r addRemote, serial string) error {
 	if _, err := r.Shell("unstage", cmd.String()); err != nil {
 		return err
 	}
+	// The record of an install of the revoked admission no longer holds the
+	// machine for it.
+	if b, ok, err := r.ReadFile(addInstalledMarker); err == nil && ok {
+		if f := strings.Fields(string(b)); len(f) == 3 && strings.EqualFold(f[1], serial) {
+			if _, err := r.Shell("unstage", removeCmd(r, []string{addInstalledMarker})); err != nil {
+				return err
+			}
+		}
+	}
 	return removeLegacyStagedPair(r, serial)
 }

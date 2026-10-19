@@ -164,12 +164,23 @@ on the machine is not the admitted certificate's. The machine running
 One machine is admitted under one name: an add is refused at an address
 another live or joining host holds at port 7443. Two adds made through two
 hosts at once can each be admitted before either admission reaches the
-other; the one admitted first (the lesser name on a tie) keeps the address.
-The other's `lv host add` is refused before it installs anything, naming
-`lv host rm` for its admission, and a host that loses its address this way is
-never activated: it stays `joining`, or `upgrading` once its daemon runs, until
-the other is removed (`lv health`
-shows `host.address_shared`).
+other. Of those, a host already `active` at the address keeps it, and
+otherwise the one admitted first (the lesser name on a tie); `lv host add`
+asks the cluster again right before it installs, and the other's is refused
+there, naming `lv host rm` for its admission. A host that does not keep its
+address is never activated: it stays `joining` (a restart of its daemon
+activates it once the other is removed), and `lv health` shows
+`host.address_shared`.
+
+From just before it installs to the end of its setup or rollback, an add
+holds the machine (`/etc/litevirt/.lv-add.lock`): another add of the machine
+is refused meanwhile, and a lock older than an hour, left by an add that died,
+is broken. The add records what it installed in `/etc/litevirt/.lv-add-installed`.
+An add that finds the machine's certificate changed since it began, or another
+name installed there in the last hour whose certificate this machine's CRL
+does not revoke, installs nothing: of two adds of one machine, the second to
+install is refused, whatever its admission. A rollback moves back only files
+that are what that add installed.
 
 A machine that already has `/etc/litevirt/config.yaml` keeps it. The add
 edits in place only `host_name`, `advertise_address`, `join_peers`, `pki_dir`

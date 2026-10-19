@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // The journal fallback exempts a start only for the VM exactly as that open
@@ -54,6 +55,24 @@ func TestStartVM_ADrainJournalExemptsOnlyTheMovesOwnHandoff(t *testing.T) {
 	})
 	t.Run("an operator stop after the handoff", func(t *testing.T) {
 		refused(t, context.Background(), setup(t, journaled+1, "operator-stop"))
+	})
+	t.Run("another drain's stop at the handoff's epoch", func(t *testing.T) {
+		// A later drain m1 of this host stopped the VM and failed: the row
+		// names m1's stop, at the epoch the open m0 handed over.
+		refused(t, context.Background(), setup(t, journaled+1, health.DrainStopDetail("m1-other")))
+	})
+	t.Run("the open move's own stop intent", func(t *testing.T) {
+		s := setup(t, journaled+1, "")
+		moves, err := corrosion.ListDrainColdMoves(context.Background(), s.db, "src-host")
+		if err != nil || len(moves) != 1 {
+			t.Fatalf("the open move: %v %v", moves, err)
+		}
+		if err := s.db.Execute(context.Background(), `UPDATE vms SET state_detail = ? WHERE name = 'moved'`, health.DrainStopDetail(moves[0].OperationID)); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.refuseStartOnSharedMAC(context.Background(), "moved"); err != nil {
+			t.Fatalf("the open move's own stop intent: %v", err)
+		}
 	})
 	t.Run("a later placement", func(t *testing.T) {
 		refused(t, context.Background(), setup(t, journaled+3, ""))

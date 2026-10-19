@@ -457,16 +457,30 @@ func inDrainHandoffShape(vm *corrosion.VMRecord) bool {
 
 // drainHandoffInJournal reports whether VM name, as this replica holds it,
 // is the handoff of an unfinished drain move to this host
-// (corrosion.DrainColdMoveHandedOver) in the handoff's shape.
+// (corrosion.DrainColdMovesHandedOver): stopped, with no stop intent or
+// that same move's own. Another drain's stop (a later drain of this host
+// that stopped the VM and failed) is not that move's handoff.
 func (s *Server) drainHandoffInJournal(ctx context.Context, name string) (bool, error) {
 	vm, err := corrosion.GetVM(ctx, s.db, name)
 	if err != nil {
 		return false, err
 	}
-	if vm == nil || !inDrainHandoffShape(vm) {
+	if vm == nil || vm.State != "stopped" {
 		return false, nil
 	}
-	return corrosion.DrainColdMoveHandedOver(ctx, s.db, *vm, s.hostName)
+	if vm.StateDetail != "" && !strings.HasPrefix(vm.StateDetail, health.DrainStopDetailPrefix) {
+		return false, nil
+	}
+	ids, err := corrosion.DrainColdMovesHandedOver(ctx, s.db, *vm, s.hostName)
+	if err != nil {
+		return false, err
+	}
+	for _, id := range ids {
+		if vm.StateDetail == "" || vm.StateDetail == health.DrainStopDetail(id) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // refuseColdMoveOnSharedMAC refuses, before the guest is shut down, a cold

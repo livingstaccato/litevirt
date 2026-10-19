@@ -35,6 +35,8 @@ type detachRecorder struct {
 	// failStatus (500 when unset).
 	failPatch  string
 	failStatus int
+	// failGet, when set, makes a GET of this path a 503.
+	failGet string
 }
 
 func (d *detachRecorder) handler(t *testing.T) http.HandlerFunc {
@@ -66,9 +68,13 @@ func (d *detachRecorder) handler(t *testing.T) http.HandlerFunc {
 			strings.HasSuffix(r.URL.Path, ipAddressesPath+d.failPatch+"/")
 		status := d.failStatus
 		body, known := d.gets[r.URL.Path]
+		getFails := d.failGet != "" && r.Method == http.MethodGet && r.URL.Path == d.failGet
 		d.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case getFails:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"detail":"unavailable"}`))
 		case failing:
 			if status == 0 {
 				status = http.StatusInternalServerError
@@ -321,5 +327,38 @@ func TestDeleteInterfaceRefusesAnAddressItMayViewButNotChange(t *testing.T) {
 	}
 	if indexOf(d.requests(), "DELETE") >= 0 {
 		t.Fatalf("interface deleted with an address still attached: %q", d.requests())
+	}
+	// A caller withholds just this delete, and says the token needs change
+	// permission, only when it can tell this refusal from any other.
+	var nce *AddressNotChangeableError
+	if !errors.As(err, &nce) || nce.ID != 900 {
+		t.Fatalf("err = %v, want an AddressNotChangeableError naming address 900", err)
+	}
+}
+
+func TestDeleteInterfaceDoesNotCallAFailedGETAPermissionProblem(t *testing.T) {
+	// The PATCH 404s and the confirming GET fails outright (a 5xx here, a
+	// transport error in general). Nothing is known about the address, so the
+	// delete is refused — but not as a permission problem, and the GET's
+	// failure is in the message.
+	d := &detachRecorder{gets: ifaceOn61, failPatch: "900", failStatus: http.StatusNotFound,
+		page: `{"results":[
+		{"id":900,"address":"10.0.0.9/24","assigned_object_type":"virtualization.vminterface","assigned_object_id":61,"custom_fields":{}}
+	],"next":null}`}
+	d.failGet = ipAddressesPath + "900/"
+	c := testClient(t, d.handler(t))
+	err := c.DeleteInterface(context.Background(), 61)
+	if err == nil {
+		t.Fatal("DeleteInterface went ahead although the address could not be read")
+	}
+	var nce *AddressNotChangeableError
+	if errors.As(err, &nce) {
+		t.Fatalf("a failed GET was reported as a permission problem: %v", err)
+	}
+	if !strings.Contains(err.Error(), "503") {
+		t.Fatalf("err = %v, want the GET's own failure in it", err)
+	}
+	if indexOf(d.requests(), "DELETE") >= 0 {
+		t.Fatalf("interface deleted: %q", d.requests())
 	}
 }

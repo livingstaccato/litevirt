@@ -195,8 +195,10 @@ func (c *Client) ClaimSpecificIP(ctx context.Context, address string, vrfID int,
 	return out.toIP(), nil
 }
 
-// LookupByAddress finds addresses matching an exact address within one VRF.
-// Used only for EXPLICIT claims — a dynamic claim has no address to look up.
+// LookupByAddress finds addresses within one VRF matching address. NetBox's
+// filter matches a value WITH a prefix length exactly, and a bare host under
+// any mask. Used for EXPLICIT claims — a dynamic claim has no address to look
+// up — and by the mirror's dead-address repair, which passes the bare host.
 func (c *Client) LookupByAddress(ctx context.Context, address string, vrfID int) ([]IPAddress, error) {
 	q := url.Values{}
 	q.Set("address", address)

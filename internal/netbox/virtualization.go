@@ -407,7 +407,9 @@ func (c *Client) DeleteVM(ctx context.Context, id int) error {
 		}
 	}
 	if err := c.detachAll(ctx, detach); err != nil {
-		return fmt.Errorf("netbox: virtual machine %d not deleted: %v", id, err)
+		// %w: detachAll's errors carry no NetBox status (see there), only an
+		// AddressNotChangeableError a caller may act on.
+		return fmt.Errorf("netbox: virtual machine %d not deleted: %w", id, err)
 	}
 	return c.do(ctx, http.MethodDelete, fmt.Sprintf(vmsPath+"%d/", id), nil, nil)
 }
@@ -648,7 +650,9 @@ func (c *Client) DeleteInterface(ctx context.Context, id int) error {
 		}
 	}
 	if err := c.detachAll(ctx, detach); err != nil {
-		return fmt.Errorf("netbox: interface %d not deleted: %v", id, err)
+		// %w: detachAll's errors carry no NetBox status (see there), only an
+		// AddressNotChangeableError a caller may act on.
+		return fmt.Errorf("netbox: interface %d not deleted: %w", id, err)
 	}
 	return c.do(ctx, http.MethodDelete, fmt.Sprintf(vmInterfacesPath+"%d/", id), nil, nil)
 }
@@ -722,10 +726,16 @@ func (c *Client) detachAll(ctx context.Context, ips []IPAddress) error {
 		switch {
 		case err == nil:
 		case errors.As(err, &ae) && ae.Status == http.StatusNotFound:
-			if gone, gerr := c.addressGone(ctx, ip.ID); gerr != nil || !gone {
-				return fmt.Errorf("detach address %d (%s): NetBox answered 404 but the address is "+
-					"not confirmed gone, so it may still be attached — this token may view it but "+
-					"not change it; refusing to delete what holds it", ip.ID, ip.Address)
+			gone, gerr := c.addressGone(ctx, ip.ID)
+			switch {
+			case gerr != nil:
+				// Nothing is known about the address, so the delete is refused —
+				// with the GET's own failure, which is not a permission problem.
+				return fmt.Errorf("detach address %d (%s): NetBox answered 404, and the GET that "+
+					"would confirm it gone failed (%v); refusing to delete what may still hold it",
+					ip.ID, ip.Address, gerr)
+			case !gone:
+				return &AddressNotChangeableError{ID: ip.ID, Address: ip.Address, AssignedTo: ip.AssignedObjectID}
 			}
 			continue
 		default:
@@ -738,6 +748,23 @@ func (c *Client) detachAll(ctx context.Context, ips []IPAddress) error {
 		}
 	}
 	return nil
+}
+
+// AddressNotChangeableError is a delete refused because an address on what is
+// being deleted could not be detached, and a GET shows it still exists: the API
+// token may view it but not change it. The DELETE would cascade it away, so
+// nothing is deleted. A caller can withhold just that delete and report it —
+// the fix is change permission on ipam.ipaddress for the token.
+type AddressNotChangeableError struct {
+	ID         int
+	Address    string
+	AssignedTo int // the interface it is assigned to
+}
+
+func (e *AddressNotChangeableError) Error() string {
+	return fmt.Sprintf("NetBox address %d (%s) on interface %d is still attached and this API token "+
+		"may view it but not change it, so it cannot be detached; deleting what holds it would "+
+		"destroy it", e.ID, e.Address, e.AssignedTo)
 }
 
 // addressGone reports whether a GET of the address answers 404.

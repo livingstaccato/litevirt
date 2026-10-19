@@ -18,7 +18,9 @@ func withStackRowInterleave(t *testing.T, fn func()) {
 // reads the other writer's row and writes the state over it.
 //
 // Mutations: a guard that always passes writes v1's compose back over the
-// redeploy (red); no retry leaves the stack "active" (red).
+// redeploy (the redeploy case red; the second case cannot tell, its other
+// writer leaves the row the stale write would); no retry leaves the state
+// unwritten (both red).
 func TestStackRowWrite_AWriteBetweenTheReadAndTheWriteIsKept(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

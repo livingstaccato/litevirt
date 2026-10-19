@@ -192,10 +192,16 @@ func HistoricalShapes() []HistoricalShape {
 	add("UPDATE network_vteps SET network_name = ?, updated_at = ? WHERE network_name = ? AND deleted_at IS NULL", "network_rename_v130")
 	add("UPDATE ip_allocations SET network = ?, updated_at = ? WHERE network = ? AND deleted_at IS NULL", "network_rename_v130")
 	add("UPDATE vm_interfaces SET network_name = ?, updated_at = ? WHERE network_name = ? AND deleted_at IS NULL", "network_rename_v130")
-	// The same pass's bare rewrite of a VM's spec, which every release through
-	// v1.9.0 emits; the current tree writes it as a desired-spec edit
-	// (MutateDesiredSpec).
-	add("UPDATE vms SET spec = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL", "vm_spec_rescope_v130")
+	// The same pass's bare rewrite of a VM's spec, which every release from
+	// v1.3.0 through v1.9.0 emits; the current tree writes it as a desired-spec
+	// edit (MutateDesiredSpec). Its horizon is its NEWEST emitter, v1.9.0.
+	out = append(out, HistoricalShape{
+		SQL:          "UPDATE vms SET spec = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL",
+		Family:       "vm_spec_rescope_v130",
+		FirstEmitter: emitterV130,
+		LastEmitter:  "v1.9.0",
+		Removal:      "after v1.9.0 unsupported",
+	})
 
 	// InsertDisk (v1.3.0..): the vm_disks hot-plug/create upsert BEFORE its column list widened
 	// to carry the per-disk hardware fields (bus, device_kind, delete_with_vm, controller_model).

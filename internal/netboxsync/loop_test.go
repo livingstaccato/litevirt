@@ -365,6 +365,7 @@ func (f *recordingNetBox) UpdateInterface(context.Context, int, netbox.VMInterfa
 func (f *recordingNetBox) DeleteInterface(context.Context, int) error                     { return nil }
 func (f *recordingNetBox) SetPrimaryIP4(context.Context, int, int) error                  { return nil }
 func (f *recordingNetBox) SetPrimaryIP6(context.Context, int, int) error                  { return nil }
+func (f *recordingNetBox) ClearPrimaryIPs(context.Context, int, bool, bool) error         { return nil }
 func (f *recordingNetBox) LookupByIdentity(context.Context, string, int, string) ([]netbox.IPAddress, error) {
 	return nil, nil
 }

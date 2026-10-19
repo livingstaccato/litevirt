@@ -412,6 +412,21 @@ func (c *Client) DeleteVM(ctx context.Context, id int) error {
 	return c.do(ctx, http.MethodDelete, fmt.Sprintf(vmsPath+"%d/", id), nil, nil)
 }
 
+// ClearPrimaryIPs nulls primary_ip4 and/or primary_ip6 of one VM in ONE
+// request. One request, because NetBox saves a PATCHed VM as the whole row it
+// read at the start of that request: two concurrent PATCHes that each null one
+// field can write the other field back.
+func (c *Client) ClearPrimaryIPs(ctx context.Context, vmID int, ip4, ip6 bool) error {
+	fields := map[string]any{}
+	if ip4 {
+		fields["primary_ip4"] = nil
+	}
+	if ip6 {
+		fields["primary_ip6"] = nil
+	}
+	return c.clearPrimaries(ctx, vmID, fields)
+}
+
 // clearPrimaries PATCHes the named primary fields of one VM to null. Nothing
 // is sent when there is nothing to clear.
 func (c *Client) clearPrimaries(ctx context.Context, vmID int, fields map[string]any) error {

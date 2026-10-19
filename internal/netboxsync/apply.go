@@ -74,6 +74,8 @@ type netboxWriter interface {
 	// SetPrimaryIP6 is the IPv6 counterpart. NetBox refuses an address of the
 	// wrong family in either field.
 	SetPrimaryIP6(ctx context.Context, vmID, ipID int) error
+	// ClearPrimaryIPs nulls the named primary fields of one VM in ONE request.
+	ClearPrimaryIPs(ctx context.Context, vmID int, ip4, ip6 bool) error
 
 	// The cluster every mirrored VM hangs off, resolved once per sweep. Both
 	// halves are here because a cluster cannot be created without its type, and
@@ -342,17 +344,13 @@ func (r *Reconciler) clearAddress(ctx context.Context, a Action) error {
 		if a.ParentNetBoxID == 0 {
 			return fmt.Errorf("netboxsync: clear of primary address %d names no VM", a.IPID)
 		}
-		if a.ClearsPrimary4 {
-			if err := r.nb.SetPrimaryIP4(ctx, a.ParentNetBoxID, 0); err != nil {
-				return fmt.Errorf("netboxsync: clear primary_ip4 of VM %d before detaching address %d: %w",
-					a.ParentNetBoxID, a.IPID, err)
-			}
-		}
-		if a.ClearsPrimary6 {
-			if err := r.nb.SetPrimaryIP6(ctx, a.ParentNetBoxID, 0); err != nil {
-				return fmt.Errorf("netboxsync: clear primary_ip6 of VM %d before detaching address %d: %w",
-					a.ParentNetBoxID, a.IPID, err)
-			}
+		// BOTH flagged fields in ONE request: Diff flags every clear of a VM
+		// with the union of its stale primaries, and two clears of one VM run
+		// at once — NetBox saves a PATCHed VM as a whole row, so per-field
+		// requests could write a field back that the other had nulled.
+		if err := r.nb.ClearPrimaryIPs(ctx, a.ParentNetBoxID, a.ClearsPrimary4, a.ClearsPrimary6); err != nil {
+			return fmt.Errorf("netboxsync: clear the primary address of VM %d before detaching address %d: %w",
+				a.ParentNetBoxID, a.IPID, err)
 		}
 	}
 	return r.nb.ClearIPAssignment(ctx, a.IPID)

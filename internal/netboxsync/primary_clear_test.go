@@ -42,7 +42,12 @@ func TestDiffMarksAClearOfTheVMsPrimary(t *testing.T) {
 	for _, c := range []struct {
 		id     int
 		p4, p6 bool
-	}{{50, true, false}, {60, false, true}, {70, false, false}} {
+	}{
+		// 50 and 60 are its primaries, so each of their clears nulls both
+		// (see TestDiffFlagsEveryPrimaryClearOfAVMWithBothFields); 70 is not a
+		// primary and its clear touches neither.
+		{50, true, true}, {60, true, true}, {70, false, false},
+	} {
 		a, ok := staleClear(got, c.id)
 		if !ok {
 			t.Fatalf("no clear for stale address %d in %+v", c.id, got)
@@ -63,16 +68,63 @@ func TestApplyClearNullsThePrimaryFirst(t *testing.T) {
 	}, indexDesired(nil, fp), fp); err != nil {
 		t.Fatal(err)
 	}
-	if len(nb.primaryIPs) != 1 || nb.primaryIPs[0] != [2]int{11, 0} {
-		t.Fatalf("primary_ip4 writes = %v, want VM 11 nulled", nb.primaryIPs)
-	}
-	if len(nb.primaryIP6s) != 0 {
-		t.Fatalf("primary_ip6 touched: %v", nb.primaryIP6s)
+	if len(nb.primaryClears) != 1 || nb.primaryClears[0] != [3]int{11, 1, 0} {
+		t.Fatalf("primary clears = %v, want VM 11's primary_ip4 only", nb.primaryClears)
 	}
 	if len(nb.cleared) != 1 || nb.cleared[0] != 50 {
 		t.Fatalf("cleared = %v, want 50", nb.cleared)
 	}
-	if nb.order[0] != "primary4" || nb.order[1] != "clear" {
+	if nb.order[0] != "primaries" || nb.order[1] != "clear" {
 		t.Fatalf("order = %v, want the primary nulled before the clear", nb.order)
+	}
+}
+
+// Two stale primaries on one VM — 50 its primary_ip4 on eth0, 60 its
+// primary_ip6 on eth1 — are two clears, which the worker pool runs at once.
+// NetBox saves a PATCHed VM as a whole row read at the start of the request, so
+// two concurrent PATCHes each nulling one field can write the other field back.
+// Every flagged clear of a VM therefore carries BOTH fields, and each one nulls
+// both in a single PATCH: any interleaving then leaves both null.
+func TestDiffFlagsEveryPrimaryClearOfAVMWithBothFields(t *testing.T) {
+	const mac0, mac1 = "52:54:00:00:00:01", "52:54:00:00:00:02"
+	d := DesiredVM{Name: "vm-1", UUID: "u1", NICs: []DesiredNIC{
+		{Name: "eth0", MAC: mac0, NetBoxIPID: 9, NetBoxIP: "10.0.5.9"},
+		{Name: "eth1", MAC: mac1, NetBoxIPID: 10, NetBoxIP: "10.0.5.10"},
+	}}
+	got := Diff([]DesiredVM{d}, Actual{
+		VMs: map[string]netbox.VirtualMachine{
+			vmIdent("u1"): {ID: 11, Name: "vm-1", Identity: vmIdent("u1"), PrimaryIP4ID: 50, PrimaryIP6ID: 60},
+		},
+		NICs: map[string]netbox.VMInterface{
+			nicIdent("u1", mac0): {ID: 21, VMID: 11, Name: "eth0", MAC: mac0, Identity: nicIdent("u1", mac0)},
+			nicIdent("u1", mac1): {ID: 22, VMID: 11, Name: "eth1", MAC: mac1, Identity: nicIdent("u1", mac1)},
+		},
+		OwnedIPsByIface: map[int][]netbox.IPAddress{
+			21: {{ID: 9, AssignedObjectID: 21}, {ID: 50, AssignedObjectID: 21}},
+			22: {{ID: 10, AssignedObjectID: 22}, {ID: 60, AssignedObjectID: 22}},
+		},
+	}, fp)
+	for _, id := range []int{50, 60} {
+		a, ok := staleClear(got, id)
+		if !ok || !a.ClearsPrimary4 || !a.ClearsPrimary6 {
+			t.Errorf("clear %d = %+v (present %v), want both primary fields flagged", id, a, ok)
+		}
+	}
+}
+
+func TestApplyClearNullsBothFlaggedPrimariesInOnePatch(t *testing.T) {
+	nb := &stubVirt{}
+	r := newTestReconciler(t, nb)
+	if err := r.apply(context.Background(), []Action{
+		{Kind: kindNIC, Op: "clear", Key: nicIdent("u1", "52:54:00:00:00:01"),
+			NetBoxID: 21, ParentNetBoxID: 11, IPID: 50, ClearsPrimary4: true, ClearsPrimary6: true},
+	}, indexDesired(nil, fp), fp); err != nil {
+		t.Fatal(err)
+	}
+	if len(nb.primaryClears) != 1 || nb.primaryClears[0] != [3]int{11, 1, 1} {
+		t.Fatalf("primary clears = %v, want ONE request nulling both of VM 11's primaries", nb.primaryClears)
+	}
+	if len(nb.primaryIPs)+len(nb.primaryIP6s) != 0 {
+		t.Fatalf("separate per-field writes %v %v, want none", nb.primaryIPs, nb.primaryIP6s)
 	}
 }

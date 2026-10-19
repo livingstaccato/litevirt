@@ -109,3 +109,96 @@ func TestTheSweepUnionsProvenPrimaryClears(t *testing.T) {
 		}
 	}
 }
+
+// primaryIP6Nulls returns the primary_ip6 nulls a sweep wrote for VM 11, by
+// either path: a standalone primary-ip6 action or a clear's primary null.
+func primaryIP6Nulls(nb *stubVirt) int {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	n := 0
+	for _, p := range nb.primaryIP6s {
+		if p == [2]int{11, 0} {
+			n++
+		}
+	}
+	for _, pc := range nb.primaryClears {
+		if pc[0] == 11 && pc[2] == 1 {
+			n++
+		}
+	}
+	return n
+}
+
+// vm-1's primary_ip6 names 60, an owned address on eth0 whose IPv6 lease this
+// replica has not received. The clear of 60 is withheld as unproven, and the
+// standalone primary-ip6 null Diff emits for the VM is the same removal: it
+// is withheld with it, not run on its own.
+func TestAStandalonePrimaryIP6NullNeedsTheAddressEvidence(t *testing.T) {
+	nb, r := addressJoinReconciler(t, leasedIP)
+	fingerprint := mustFingerprint(t, r)
+	owned := netbox.Identity(fingerprint, "uuid-1", macGuard)
+	nb.listIPs = append(nb.listIPs,
+		netbox.IPAddress{ID: 60, Address: "2001:db8::60/64", AssignedObjectID: 21, Identity: owned})
+	nb.listVMs[0].PrimaryIP4ID, nb.listVMs[0].PrimaryIP6ID = 41, 60
+
+	if err := r.SyncOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := cleared(nb); len(got) != 0 {
+		t.Fatalf("cleared %v, want the unproven 60 withheld", got)
+	}
+	if n := primaryIP6Nulls(nb); n != 0 {
+		t.Fatalf("primary_ip6 nulled %d time(s) while the removal of the address it names is unproven", n)
+	}
+}
+
+// The control: once the lease for 60 is known to be released, both the
+// detach and the primary null go.
+func TestAStandalonePrimaryIP6NullRunsOnceTheAddressIsProven(t *testing.T) {
+	nb, r := addressJoinReconciler(t, leasedIP)
+	fingerprint := mustFingerprint(t, r)
+	owned := netbox.Identity(fingerprint, "uuid-1", macGuard)
+	nb.listIPs = append(nb.listIPs,
+		netbox.IPAddress{ID: 60, Address: "2001:db8::60/64", AssignedObjectID: 21, Identity: owned})
+	nb.listVMs[0].PrimaryIP4ID, nb.listVMs[0].PrimaryIP6ID = 41, 60
+	seedReleasedJoinLease(t, r, "2001:db8::60", 60)
+
+	if err := r.SyncOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := cleared(nb); len(got) != 1 || got[0] != 60 {
+		t.Fatalf("cleared %v, want the proven 60", got)
+	}
+	if n := primaryIP6Nulls(nb); n == 0 {
+		t.Fatal("primary_ip6 still names the released 60")
+	}
+}
+
+// The IPv4 counterpart: vm-1's IPv4 lease has not reached this replica, so
+// nothing is desired for primary_ip4, which names the owned 41.
+func TestAStandalonePrimaryIP4NullNeedsTheAddressEvidence(t *testing.T) {
+	nb, r := addressJoinReconciler(t, leasedIP)
+	nb.listVMs[0].PrimaryIP4ID = 41
+	if _, err := r.db.DB().Exec(`DELETE FROM ip_allocations`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.SyncOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := cleared(nb); len(got) != 0 {
+		t.Fatalf("cleared %v, want the unproven 41 withheld", got)
+	}
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	for _, p := range nb.primaryIPs {
+		if p == [2]int{11, 0} {
+			t.Fatal("primary_ip4 nulled while the removal of the address it names is unproven")
+		}
+	}
+	for _, pc := range nb.primaryClears {
+		if pc[1] == 1 {
+			t.Fatal("primary_ip4 nulled by a clear while the removal of its address is unproven")
+		}
+	}
+}

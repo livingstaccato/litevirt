@@ -111,8 +111,8 @@ func TestAutomationKeyTransitionStrictHistoricalFacts(t *testing.T) {
 			{"body_duplicate", func(d *Decision) {
 				d.Command.Body = bytes.Replace(d.Command.Body, []byte(`"version":1`), []byte(`"version":1,"version":1`), 1)
 			}},
-			{"zero_host_lifetime", func(d *Decision) {
-				d.Assignment = bytes.Replace(d.Assignment, []byte(`"host_incarnation":17`), []byte(`"host_incarnation":0`), 1)
+			{"missing_host_lifetime", func(d *Decision) {
+				d.Assignment = bytes.Replace(d.Assignment, []byte(`"host_incarnation":17,`), nil, 1)
 			}},
 			{"missing_admission_stamp", func(d *Decision) {
 				d.Assignment = bytes.Replace(d.Assignment, []byte(`"admission_serial":"a1"`), []byte(`"admission_serial":""`), 1)

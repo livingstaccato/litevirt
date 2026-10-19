@@ -227,7 +227,7 @@ func validateKeyTransition(d Decision, a Assignment) error {
 	hosts, keys, recipients := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for _, r := range f.Recipients {
 		native, e := age.ParseX25519Recipient(r.Recipient)
-		if e != nil || native.String() != r.Recipient || r.ClusterUID != a.ClusterUID || r.MembershipGeneration != generation || r.ConfigDigest != config || r.RecipientEpoch != epoch || !keyText(r.Host) || !keyText(r.VoterIncarnation) || !keyText(r.KeyID) || !keyNumber(r.HostIncarnation) || !keyText(r.AdmissionSerial) || r.AdmissionSerial != strings.ToLower(r.AdmissionSerial) || !keyReference(r.Enrollment) || !keyReference(r.RecipientAck) || !keyReference(r.EqualityAck) || hosts[r.Host] || keys[r.KeyID] || recipients[r.Recipient] {
+		if e != nil || native.String() != r.Recipient || r.ClusterUID != a.ClusterUID || r.MembershipGeneration != generation || r.ConfigDigest != config || r.RecipientEpoch != epoch || !keyText(r.Host) || !keyText(r.VoterIncarnation) || !keyText(r.KeyID) || r.HostIncarnation > math.MaxInt64 || !keyText(r.AdmittedAt) || !keyText(r.AdmissionSerial) || r.AdmissionSerial != strings.ToLower(r.AdmissionSerial) || !keyReference(r.Enrollment) || !keyReference(r.RecipientAck) || !keyReference(r.EqualityAck) || hosts[r.Host] || keys[r.KeyID] || recipients[r.Recipient] {
 			return codedError(CodeValidation)
 		}
 		if _, e := time.Parse(time.RFC3339Nano, r.AdmittedAt); e != nil {

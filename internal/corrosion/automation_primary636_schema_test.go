@@ -111,12 +111,16 @@ func TestAutomationPrimary636Upgrade67Through80(t *testing.T) {
 	if storedVersion(t, c) != CurrentSchemaVersion || appliedCount(t, c) != len(schemaMigrationLedger) {
 		t.Fatal("upgrade omitted current schema or ledger units")
 	}
-	want := map[int]int{70: 7, 71: 2, 72: 2, 73: 7, 74: 3, 75: 8, 76: 2, 77: 7, 78: 3, 79: 2, 80: 3}
+	want := map[int]int{70: 7, 71: 2, 72: 2, 73: 7, 74: 3, 75: 8, 76: 2, 77: 7, 78: 3, 79: 2, 80: 3, 81: 1}
 	for _, m := range schemaMigrationLedger {
 		if m.Version < 70 {
 			continue
 		}
-		if !strings.HasPrefix(m.Target, "local_automation_") || (m.Kind != kindCreateTable && !(m.Version == 79 && m.Kind == kindAddColumn && m.Target == "local_automation_receiver_current.established_inventory")) {
+		custody81 := m.Version == 81 && m.Kind == kindRebuildAutomationCustody && m.ID == automationCustodyMigrationID && m.Target == "local_automation_key_recipients" && m.SQL == automationCustodyRebuildSQL
+		if m.Version == 81 && !custody81 {
+			t.Fatalf("unexpected custody81 migration %+v", m)
+		}
+		if !strings.HasPrefix(m.Target, "local_automation_") || (m.Kind != kindCreateTable && !(m.Version == 79 && m.Kind == kindAddColumn && m.Target == "local_automation_receiver_current.established_inventory") && !custody81) {
 			t.Fatalf("unexpected relocated migration %+v", m)
 		}
 		want[m.Version]--

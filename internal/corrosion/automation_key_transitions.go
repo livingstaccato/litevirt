@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"filippo.io/age"
 	"github.com/litevirt/litevirt/internal/automation/contract"
@@ -110,7 +112,7 @@ func automationKeyRowsTx(ctx context.Context, tx *LocalTx, table, stage string) 
 			integer := strings.Contains(","+d.integers+",", ","+c+",")
 			if integer {
 				bad = append(bad, "typeof("+c+")<>'integer' OR "+c+"<0")
-				if c != "predecessor_activation_sequence" {
+				if c != "predecessor_activation_sequence" && !(table == "local_automation_key_recipients" && c == "host_incarnation") {
 					bad = append(bad, c+"=0")
 				}
 			} else {
@@ -272,7 +274,16 @@ func automationResolveKeyProjectionTx(ctx context.Context, tx *LocalTx, stage st
 		return e
 	}
 	for _, r := range rows {
-		v := contract.RecipientBinding{ClusterUID: r.String("cluster_uid"), RecipientEpoch: r.String("recipient_epoch"), MembershipGeneration: uint64(r.Int64("membership_generation")), ConfigDigest: r.String("config_digest"), Host: r.String("host"), HostIncarnation: uint64(r.Int64("host_incarnation")), AdmittedAt: r.String("admitted_at"), AdmissionSerial: r.String("admission_serial"), VoterIncarnation: r.String("voter_incarnation"), KeyID: r.String("key_id"), Recipient: r.String("recipient")}
+		// The typed scalar preflight runs before row allocation; retain the
+		// signed-domain check here before converting the immutable host number.
+		n, at := r.Int64("host_incarnation"), r.String("admitted_at")
+		if n < 0 || at == "" || len(at) > contract.MaxStringBytes || !utf8.ValidString(at) || strings.ContainsRune(at, 0) {
+			return fmt.Errorf("invalid historical recipient lifetime")
+		}
+		if _, e := time.Parse(time.RFC3339Nano, at); e != nil {
+			return fmt.Errorf("invalid historical recipient admission timestamp: %w", e)
+		}
+		v := contract.RecipientBinding{ClusterUID: r.String("cluster_uid"), RecipientEpoch: r.String("recipient_epoch"), MembershipGeneration: uint64(r.Int64("membership_generation")), ConfigDigest: r.String("config_digest"), Host: r.String("host"), HostIncarnation: uint64(n), AdmittedAt: at, AdmissionSerial: r.String("admission_serial"), VoterIncarnation: r.String("voter_incarnation"), KeyID: r.String("key_id"), Recipient: r.String("recipient")}
 		if v.Enrollment, e = keyStoredReference(r.String("enrollment_ref")); e != nil {
 			return e
 		}

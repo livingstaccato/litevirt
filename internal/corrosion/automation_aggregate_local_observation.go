@@ -60,8 +60,8 @@ func (o *aggregateLocalObservation) observe(out *aggregateLocalAudit, section in
 		}
 	case 15:
 		// Current proof inventories the live schema. Retained originals keep
-		// their pre-metadata or host-incarnation union schema bytes.
-		if n != 1 || row.Int64("id") != 1 || (row.Int64("version") != 80 && !(o.retained && (row.Int64("version") == 78 || row.Int64("version") == 79))) {
+		// their pre-metadata, host-incarnation union or prior live80 bytes.
+		if n != 1 || row.Int64("id") != 1 || (row.Int64("version") != 81 && !(o.retained && (row.Int64("version") == 78 || row.Int64("version") == 79 || row.Int64("version") == 80))) {
 			return errors.New("local snapshot schema unavailable")
 		}
 	case 21:

@@ -119,7 +119,7 @@ func TestAutomationKeyTransitionSchemaIsClassified(t *testing.T) {
 			t.Fatal("used derived table missing", e)
 		}
 	}
-	if !supportedAutomationCutDescriptor(77, 1) || !supportedAutomationCutDescriptor(78, 1) || !supportedAutomationCutDescriptor(79, 1) || !supportedAutomationCutDescriptor(80, 1) || supportedAutomationCutDescriptor(81, 1) {
+	if !supportedAutomationCutDescriptor(77, 1) || !supportedAutomationCutDescriptor(78, 1) || !supportedAutomationCutDescriptor(79, 1) || !supportedAutomationCutDescriptor(80, 1) || !supportedAutomationCutDescriptor(81, 1) || supportedAutomationCutDescriptor(82, 1) {
 		t.Fatal("new schema descriptor not explicitly classified")
 	}
 }
@@ -383,7 +383,7 @@ func TestAutomationKeyTransitionArchived76Unchanged(t *testing.T) {
 	if before.SourceSchema != 76 {
 		t.Fatal("wrong archived descriptor")
 	}
-	if _, err = a.c.db.Exec(`UPDATE schema_state SET version=80 WHERE id=1`); err != nil {
+	if _, err = a.c.db.Exec(`UPDATE schema_state SET version=81 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	later, err := a.c.FreezeAutomationCut(ctx, 1, nil)

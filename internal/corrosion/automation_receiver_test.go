@@ -25,12 +25,12 @@ func TestReceiverSchemaInertInventory(t *testing.T) {
 			t.Fatalf("receiver evidence is not exclusively local: %s", table)
 		}
 	}
-	for _, schema := range []int{69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80} {
+	for _, schema := range []int{69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81} {
 		if !supportedAutomationCutDescriptor(schema, 1) {
 			t.Fatalf("explicit compatible descriptor %d/1 missing", schema)
 		}
 	}
-	if supportedAutomationCutDescriptor(81, 1) || supportedAutomationCutDescriptor(71, 2) {
+	if supportedAutomationCutDescriptor(82, 1) || supportedAutomationCutDescriptor(71, 2) {
 		t.Fatal("unknown source provenance accepted")
 	}
 }

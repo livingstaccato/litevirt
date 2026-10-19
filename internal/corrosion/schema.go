@@ -582,7 +582,8 @@ import (
 // v78: causal key epoch, recipient and payload wrapping projections.
 // v79: signed receiver-established floors and current-row complete inventory; never live proof.
 // v80: immutable retained-origin delivery/object/completion pins; no active authority.
-const CurrentSchemaVersion = 80
+// v81: preserve all recipient stages while allowing the host-incarnation zero domain.
+const CurrentSchemaVersion = 81
 
 // schemaVersionCredentialRetirement is the version
 // host_fence_credentials.after_retirement was added in.
@@ -790,6 +791,11 @@ func InitSchema(ctx context.Context, c *Client) error {
 	if err := refusePrereleaseTrustDatabase(ctx, c); err != nil {
 		return err
 	}
+	// Inspect an existing recipient table before CREATE IF NOT EXISTS can
+	// conceal a missing index or otherwise repair an unsupported old shape.
+	if err := preflightAutomationCustodySchema(ctx, c); err != nil {
+		return fmt.Errorf("schema custody preflight: %w", err)
+	}
 
 	// Tables first (CREATE TABLE IF NOT EXISTS — genuinely idempotent, and it
 	// guarantees every table exists before the ledger's presence checks run).
@@ -883,6 +889,11 @@ func InitSchema(ctx context.Context, c *Client) error {
 			// Not m.SQL: the ledger checksum covers it, and nodes that already
 			// applied it would see checksum drift. The heal copies the rows.
 			if stmts, err = rebuildClusterCRLStatements(ctx, c, now); err != nil {
+				return fmt.Errorf("schema migration %q: %w", m.ID, err)
+			}
+		}
+		if m.Kind == kindRebuildAutomationCustody {
+			if stmts, err = rebuildAutomationCustodyStatements(ctx, c); err != nil {
 				return fmt.Errorf("schema migration %q: %w", m.ID, err)
 			}
 		}
@@ -3181,7 +3192,7 @@ var schemaDDL = []string{
 	`CREATE TABLE IF NOT EXISTS local_automation_key_recipients (
  stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, recipient_epoch TEXT NOT NULL,
  membership_generation INTEGER NOT NULL CHECK(membership_generation>0), config_digest TEXT NOT NULL,
- host TEXT NOT NULL, host_incarnation INTEGER NOT NULL CHECK(host_incarnation>0), admitted_at TEXT NOT NULL,
+ host TEXT NOT NULL, host_incarnation INTEGER NOT NULL CHECK(host_incarnation>=0), admitted_at TEXT NOT NULL,
  admission_serial TEXT NOT NULL, voter_incarnation TEXT NOT NULL, key_id TEXT NOT NULL, recipient TEXT NOT NULL,
  enrollment_ref TEXT NOT NULL, recipient_ack_ref TEXT NOT NULL, equality_ack_ref TEXT NOT NULL,
  first_sequence INTEGER NOT NULL CHECK(first_sequence>0), PRIMARY KEY(stage,cluster_uid,recipient_epoch,host))`,
@@ -3875,6 +3886,8 @@ const (
 	kindRebuildClusterCRL                // v47 final shape; presence = composite primary key
 )
 
+const kindRebuildAutomationCustody migKind = 3 // v81 exact recipient shape and nonnegative host counter
+
 // migration is one ledgered schema unit.
 type migration struct {
 	ID      string // stable, frozen once shipped; never reorder/edit
@@ -3898,6 +3911,8 @@ func (m migration) present(ctx context.Context, c *Client) (bool, error) {
 	case kindRebuildClusterCRL:
 		cols, err := primaryKeyColumns(ctx, c.db, m.Target)
 		return err == nil && slices.Equal(cols, []string{"id", "crl_pem"}), err
+	case kindRebuildAutomationCustody:
+		return automationCustodyRecipientShape(ctx, c)
 	default:
 		return false, fmt.Errorf("migration %q: unknown kind %d", m.ID, m.Kind)
 	}
@@ -4067,5 +4082,12 @@ func init() {
 		Kind:    kindRebuildClusterCRL,
 		Target:  "cluster_crl",
 		SQL:     "DROP TABLE IF EXISTS cluster_crl;\n" + clusterCRLDDL,
+	})
+	schemaMigrationLedger = append(schemaMigrationLedger, migration{
+		ID:      automationCustodyMigrationID,
+		Version: 81,
+		Kind:    kindRebuildAutomationCustody,
+		Target:  "local_automation_key_recipients",
+		SQL:     automationCustodyRebuildSQL,
 	})
 }

@@ -20,7 +20,7 @@ const automationCutCodec = 1
 
 // Deliberately independent of CurrentSchemaVersion: new provenance requires an
 // explicit inventory review. A future live schema cannot relabel an old cut.
-const automationCutSourceSchema = 80
+const automationCutSourceSchema = 81
 
 // Explicit source descriptors: 69/1 retains its original inventory and root.
 // 70/1 adds only outgoing job pins/publication wrappers/public trust evidence,
@@ -58,8 +58,10 @@ const automationCutSourceSchema = 80
 // 80/1 adds inert supplemental delivery/object/completion pins after the
 // shipped host-incarnation/private-migration union. These pins are excluded
 // from source authority; archived69..79 meanings, bytes and roots stay fixed.
+// 81/1 corrects only the derived recipient host-number domain. Derived rows
+// remain excluded; the same nine sections/codec1 and archived69..80 stay fixed.
 func supportedAutomationCutDescriptor(schema, codec int) bool {
-	return codec == 1 && (schema == 69 || schema == 70 || schema == 71 || schema == 72 || schema == 73 || schema == 74 || schema == 75 || schema == 76 || schema == 77 || schema == 78 || schema == 79 || schema == 80)
+	return codec == 1 && (schema == 69 || schema == 70 || schema == 71 || schema == 72 || schema == 73 || schema == 74 || schema == 75 || schema == 76 || schema == 77 || schema == 78 || schema == 79 || schema == 80 || schema == 81)
 }
 
 type automationCutInventory struct {

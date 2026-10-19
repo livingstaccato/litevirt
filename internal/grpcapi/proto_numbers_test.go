@@ -321,3 +321,82 @@ func TestProtoNumbers_ScopedOperationAbort(t *testing.T) {
 		}
 	}
 }
+
+// Storage hygiene (older-17 #9, #11): the set-aside overlay and replication
+// checkpoint RPCs, and their messages' numbers.
+func TestProtoNumbers_StorageHygiene(t *testing.T) {
+	fields := []struct {
+		msg  protoreflect.ProtoMessage
+		num  protoreflect.FieldNumber
+		name protoreflect.Name
+	}{
+		{&pb.ListSetAsideOverlaysRequest{}, 1, "host"},
+		{&pb.ListSetAsideOverlaysRequest{}, 2, "vm_name"},
+		{&pb.SetAsideOverlay{}, 1, "vm_name"},
+		{&pb.SetAsideOverlay{}, 2, "disk_name"},
+		{&pb.SetAsideOverlay{}, 3, "name"},
+		{&pb.SetAsideOverlay{}, 4, "path"},
+		{&pb.SetAsideOverlay{}, 5, "disk_path"},
+		{&pb.SetAsideOverlay{}, 6, "set_aside_at"},
+		{&pb.SetAsideOverlay{}, 7, "size_bytes"},
+		{&pb.SetAsideOverlay{}, 8, "in_use"},
+		{&pb.SetAsideOverlay{}, 9, "detached"},
+		{&pb.SetAsideOverlay{}, 10, "owner_vm_uuid"},
+		{&pb.ListSetAsideOverlaysResponse{}, 1, "host"},
+		{&pb.ListSetAsideOverlaysResponse{}, 2, "overlays"},
+		{&pb.RemoveSetAsideOverlayRequest{}, 1, "vm_name"},
+		{&pb.RemoveSetAsideOverlayRequest{}, 2, "disk_name"},
+		{&pb.RemoveSetAsideOverlayRequest{}, 3, "name"},
+		{&pb.RemoveSetAsideOverlayRequest{}, 4, "host"},
+		{&pb.RemoveSetAsideOverlayRequest{}, 5, "path"},
+		{&pb.RemoveSetAsideOverlayResponse{}, 1, "host"},
+		{&pb.RemoveSetAsideOverlayResponse{}, 2, "path"},
+		{&pb.RemoveSetAsideOverlayResponse{}, 3, "size_bytes"},
+		{&pb.ListReplicationCheckpointsRequest{}, 1, "vm_name"},
+		{&pb.ReplicationCheckpointRow{}, 1, "vm_name"},
+		{&pb.ReplicationCheckpointRow{}, 2, "target_pool"},
+		{&pb.ReplicationCheckpointRow{}, 3, "checkpoint"},
+		{&pb.ReplicationCheckpointRow{}, 4, "updated_at"},
+		{&pb.ReplicationCheckpointRow{}, 5, "in_use"},
+		{&pb.ReplicationCheckpointRow{}, 6, "vm_deleted"},
+		{&pb.ListReplicationCheckpointsResponse{}, 1, "checkpoints"},
+		{&pb.DeleteReplicationCheckpointRequest{}, 1, "vm_name"},
+		{&pb.DeleteReplicationCheckpointRequest{}, 2, "target_pool"},
+		{&pb.DeleteReplicationCheckpointResponse{}, 1, "checkpoint"},
+		{&pb.DeleteReplicationCheckpointResponse{}, 2, "bitmap"},
+		{&pb.DeleteReplicationCheckpointResponse{}, 3, "host"},
+	}
+	for _, f := range fields {
+		md := f.msg.ProtoReflect().Descriptor()
+		fd := md.Fields().ByNumber(f.num)
+		if fd == nil || fd.Name() != f.name {
+			t.Errorf("%s field %d is %v, want %s", md.FullName(), f.num, fd, f.name)
+		}
+	}
+	kinds := []struct {
+		msg  protoreflect.ProtoMessage
+		name protoreflect.Name
+		kind protoreflect.Kind
+	}{
+		{&pb.SetAsideOverlay{}, "in_use", protoreflect.StringKind},
+		{&pb.SetAsideOverlay{}, "size_bytes", protoreflect.Int64Kind},
+		{&pb.SetAsideOverlay{}, "detached", protoreflect.BoolKind},
+		{&pb.ReplicationCheckpointRow{}, "in_use", protoreflect.BoolKind},
+		{&pb.ReplicationCheckpointRow{}, "vm_deleted", protoreflect.BoolKind},
+		{&pb.RemoveSetAsideOverlayResponse{}, "size_bytes", protoreflect.Int64Kind},
+		{&pb.ListSetAsideOverlaysResponse{}, "overlays", protoreflect.MessageKind},
+		{&pb.ListReplicationCheckpointsResponse{}, "checkpoints", protoreflect.MessageKind},
+	}
+	for _, k := range kinds {
+		fd := k.msg.ProtoReflect().Descriptor().Fields().ByName(k.name)
+		if fd == nil || fd.Kind() != k.kind {
+			t.Errorf("%s.%s is %v, want kind %v", k.msg.ProtoReflect().Descriptor().FullName(), k.name, fd, k.kind)
+		}
+	}
+	svc := pb.File_litevirt_v1_service_proto.Services().ByName("LiteVirt")
+	for _, rpc := range []protoreflect.Name{"ListSetAsideOverlays", "RemoveSetAsideOverlay", "ListReplicationCheckpoints", "DeleteReplicationCheckpoint"} {
+		if svc.Methods().ByName(rpc) == nil {
+			t.Errorf("RPC %s is missing", rpc)
+		}
+	}
+}

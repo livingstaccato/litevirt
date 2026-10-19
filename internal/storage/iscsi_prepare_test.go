@@ -26,17 +26,18 @@ import (
 // succeeds through one whose credentials the target accepts and whose portal
 // group tag is the target's current one.
 type recordISCSIAdm struct {
-	mu       sync.Mutex
-	db       string
-	conf     map[string]string        // iscsid.conf: the settings a new or rewritten record gets
-	adverts  map[string][]iscsiAdvert // portal (ip:port) -> what a sendtargets discovery returns
-	accept   map[string]string        // target -> the "user:password" it accepts
-	tpgt     map[string]int           // target -> the portal group tag it answers with
-	sessions map[string]bool          // "portal target"
-	timeout  bool                     // every login times out: the portal stopped answering mid-login
-	terse    bool                     // a refused login prints no reason, only its exit status says why
-	hook     func(args []string)      // runs before each call, outside mu: the test's scheduler
-	calls    []string
+	mu        sync.Mutex
+	db        string
+	conf      map[string]string        // iscsid.conf: the settings a new or rewritten record gets
+	adverts   map[string][]iscsiAdvert // portal (ip:port) -> what a sendtargets discovery returns
+	accept    map[string]string        // target -> the "user:password" it accepts
+	tpgt      map[string]int           // target -> the portal group tag it answers with
+	sessions  map[string]bool          // "portal target"
+	timeout   bool                     // every login times out: the portal stopped answering mid-login
+	terse     bool                     // a refused login prints no reason, only its exit status says why
+	logoutErr string                   // set: every logout fails with this output
+	hook      func(args []string)      // runs before each call, outside mu: the test's scheduler
+	calls     []string
 }
 
 type iscsiAdvert struct {
@@ -226,11 +227,27 @@ func (f *recordISCSIAdm) run(_ context.Context, name string, args ...string) ([]
 		}
 		return []byte(out.String()), nil
 
+	case strings.HasPrefix(a, "-m node") && strings.HasSuffix(a, "--logout"):
+		target, portal := at("-T"), fakePortal(at("-p"))
+		key := portal + " " + target
+		if f.logoutErr != "" {
+			return []byte(f.logoutErr), exitErr(8)
+		}
+		if !f.sessions[key] {
+			return []byte("iscsiadm: No matching sessions found"), exitErr(21)
+		}
+		delete(f.sessions, key)
+		return []byte("Logout of [sid: 1, target: " + target + ", portal: " + portal + "] successful."), nil
+
 	case strings.HasPrefix(a, "-m node") && has("delete"):
 		target, portal := at("-T"), at("-p")
 		rs := f.recs(target, portal)
 		if len(rs) == 0 {
 			return []byte("iscsiadm: No records found"), exitErr(21)
+		}
+		if f.sessions[fakePortal(portal)+" "+target] {
+			return []byte("iscsiadm: This command will remove the record [iface: default, target: " + target +
+				", portal: " + portal + "], but a session is using it. Logout session then rerun command to remove record."), exitErr(1)
 		}
 		for _, r := range rs {
 			_ = os.RemoveAll(f.recDir(target, portal, r.tpgt))

@@ -584,7 +584,29 @@ by the strongest method the host has, tried in this order:
    renames it `.<disk file>.lv-pit.orphan-<time>` (never over an earlier one
    or its sidecar), says where the file it was taken of went if the import
    moved that aside too, and reports it (`disk.pit_overlay_set_aside`);
-   inspect both, then delete them.
+   inspect both, then remove them with `lv pit-overlays rm`.
+
+   A set-aside overlay is kept when its disk is deleted or moved away too.
+   Only an orphan whose binding records the VM's own uuid, or none, counts as
+   evidence for a disk: a VM re-created at the same path does not inherit an
+   earlier VM's.
+
+   `lv pit-overlays ls [--host <h>] [--vm <vm>]` lists the set-aside overlays
+   of a host's VMs, answered on each VM's host, with their size and why one
+   is in use; with `--host`, also the DETACHED ones in that host's file pool
+   directories (no live disk where they were set aside; owner from their
+   binding; listed only to a reader at the cluster root). Each caller sees
+   only the VMs it may read. `lv pit-overlays rm <vm> <disk> <name>` removes
+   one and its binding, on the VM's host, and
+   `lv pit-overlays rm --host <h> --path <path>` a detached one (admin,
+   audited as the operator who ran it, asks first unless `--yes`; event
+   `disk.pit_overlay_removed`). It is refused while the overlay is in use: it
+   is the set-aside evidence of the disk's current window (above), a VM disk
+   references it, a domain defined on that host names it or backs on it
+   through its disks' qcow2 chains (domains on other hosts sharing the pool,
+   and image files no domain or VM disk uses, are not asked), the disk is held on its overlay, a live
+   disk sits where a detached one was set aside, or anything about it cannot
+   be read.
    The start-up sweep waits until the host's replica is trusted (caught up
    with a peer, or the cluster's only host), and on a shared pool touches only
    disks of VMs this host owns and has defined (others are left to their owner
@@ -686,6 +708,22 @@ lv replication schedule rm web-1 --target-pool dr
 ```
 
 (RPCs `Create/List/DeleteReplicationSchedule`.)
+
+When a schedule is removed (`lv replication schedule rm`), or its VM deleted
+(`lv rm`), its replicas go too: each host removes, hourly, the recorded
+replicas in its own pools whose schedule or VM was removed more than a day
+ago. A schedule added again, or a VM re-created, within that day keeps them.
+A replica a VM disk references, one a set-aside disk copy backs on, and a file
+with no record are never removed. The removal also retires the incremental
+chain's anchor (the `replication_checkpoints` row) that no remaining schedule
+uses, and `lv rm` retires all of the VM's; the failover lease holder retires,
+hourly, any other row no schedule uses that has not advanced for a day.
+`lv replication checkpoints ls [--vm <vm>]` lists the rows, and
+`lv replication checkpoints rm <vm> --target-pool <pool>` removes one (admin,
+audited), refused while a live replication schedule uses it; it runs on the
+VM's host, which drops the anchor's bitmap, and prints what became of it. Only
+records in the replica area are removed this way, not top-level
+`<vm>-<disk>-<time>.<ext>` files.
 
 Target model: an explicit **target host**, a **shared pool** (nfs/ceph/iscsi),
 or — when neither is set — an auto-selected **healthy peer** that has the pool.

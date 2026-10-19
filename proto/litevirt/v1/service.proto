@@ -3486,6 +3486,68 @@ message ResolvePITOverlayResponse {
     // overwrite the guest's newer writes, and needs overwrite_newer_writes.
     bool   needs_overwrite_newer_writes = 14;
 }
+message ListSetAsideOverlaysRequest {
+    string host    = 1; // "" = the host answering; ignored when vm_name is set
+    string vm_name = 2; // only this VM's, answered on its host
+}
+message SetAsideOverlay {
+    string vm_name      = 1;
+    string disk_name    = 2;
+    string name         = 3; // the file's base name (what removal takes)
+    string path         = 4;
+    string disk_path    = 5; // the disk it was set aside beside
+    string set_aside_at = 6; // from the name, RFC3339; "" when it cannot be read
+    int64  size_bytes   = 7;
+    string in_use       = 8; // why it cannot be removed now; "" when it can
+    // detached: no live disk is at disk_path any more (its VM was deleted,
+    // or the disk moved). vm_name, disk_name and owner_vm_uuid are then the
+    // owner its binding records, and removal goes by host and path.
+    bool   detached      = 9;
+    string owner_vm_uuid = 10;
+}
+message ListSetAsideOverlaysResponse {
+    string                   host     = 1;
+    repeated SetAsideOverlay overlays = 2;
+}
+message RemoveSetAsideOverlayRequest {
+    string vm_name   = 1;
+    string disk_name = 2;
+    string name      = 3; // SetAsideOverlay.name
+    // A detached overlay (SetAsideOverlay.detached) goes by its host and
+    // path instead, with vm_name, disk_name and name empty.
+    string host      = 4;
+    string path      = 5;
+}
+message RemoveSetAsideOverlayResponse {
+    string host       = 1;
+    string path       = 2;
+    int64  size_bytes = 3;
+}
+message ListReplicationCheckpointsRequest {
+    string vm_name = 1; // "" = every VM the caller may read
+}
+message ReplicationCheckpointRow {
+    string vm_name     = 1;
+    string target_pool = 2; // the row's repo key
+    string checkpoint  = 3;
+    string updated_at  = 4;
+    bool   in_use      = 5; // a live replication schedule uses it
+    bool   vm_deleted  = 6; // the VM has no live row
+}
+message ListReplicationCheckpointsResponse {
+    repeated ReplicationCheckpointRow checkpoints = 1;
+}
+message DeleteReplicationCheckpointRequest {
+    string vm_name     = 1;
+    string target_pool = 2;
+}
+message DeleteReplicationCheckpointResponse {
+    string checkpoint = 1; // the anchor retired
+    // bitmap: what became of the anchor's libvirt bitmap on the VM's host:
+    // "dropped", "none" (no VM or no anchor), or why it is left there.
+    string bitmap     = 2;
+    string host       = 3; // the host that answered (the VM's, when it is live)
+}
 message PromoteReplicaProgress {
     enum Phase {
         PHASE_UNKNOWN = 0;
@@ -5084,6 +5146,20 @@ service LiteVirt {
     // VM: commit it into the disk, or discard it. Without confirm it only says
     // what it would do. Audited. lv resolve-pit-overlay.
     rpc ResolvePITOverlay(ResolvePITOverlayRequest) returns (ResolvePITOverlayResponse);
+    // ListSetAsideOverlays lists the point-in-time overlays set aside
+    // (<overlay>.orphan-<time>) beside the disks of a host's VMs, answered on
+    // that host (the VM's host when vm_name is set). Per-VM read.
+    rpc ListSetAsideOverlays(ListSetAsideOverlaysRequest) returns (ListSetAsideOverlaysResponse);
+    // RemoveSetAsideOverlay removes one set-aside overlay and its binding, on
+    // the VM's host; refused while it is in use. Admin, audited.
+    rpc RemoveSetAsideOverlay(RemoveSetAsideOverlayRequest) returns (RemoveSetAsideOverlayResponse);
+    // ListReplicationCheckpoints lists the live incremental-replication
+    // checkpoint rows. Per-VM read.
+    rpc ListReplicationCheckpoints(ListReplicationCheckpointsRequest) returns (ListReplicationCheckpointsResponse);
+    // DeleteReplicationCheckpoint retires one checkpoint row (the next run of
+    // its chain is a full copy); refused while a live schedule uses it.
+    // Admin, audited.
+    rpc DeleteReplicationCheckpoint(DeleteReplicationCheckpointRequest) returns (DeleteReplicationCheckpointResponse);
 
     // ── tamper-evident audit log ──
     // VerifyAuditChain walks each host's audit sub-chain (a row's

@@ -1784,6 +1784,140 @@ text as `sharedDiskWithheld`. It is notified (`vm.shared_disk_withheld` event
 and notification) when raised or when its text changes, and resolves when the
 next build of the VM's domain withholds nothing.
 
+### A volume move that did not finish (`vm.move_unresolved`)
+
+Evaluator `move_volume`, subject kind `vm`, subject the VM's name, severity
+warning. Raised by the host running an `lv move-volume` before its cutover
+changes the persistent config or the disk record, and resolved when the two
+agree again. It stays open after a move that could not be rolled back, or
+whose daemon stopped mid-cutover. The evidence names the host holding the
+move's record and, per disk, both files and whether the guest was pivoted.
+Starts, migrations, replications, clones, image builds, backups and moves
+settle it first or are refused (docs/storage.md, "A move that cannot be
+rolled back"). It is resolved by the host holding the record; by the VM's
+owner once every move it lists is proven settled there; and for every host
+when the VM is deleted or a new VM takes its name. An admin resolves it by
+hand with `lv health resolve vm.move_unresolved vm/<vm> --reason "…"
+[--accept <path> …]`, accepted on the holding host itself, where it also
+removes the record, and from any host once that host is proven powered off:
+fenced or removed over an IPMI power-off or an operator's `lv host
+fence-confirm <host>` of its last life. `lv health` prints each move first:
+both files, whether the guest was pivoted (or the copy was named before the
+move), and the move's error.
+
+`--accept <path>` names the file to keep of one disk's move, once per disk.
+A disk record is pointed at another file only on the VM's owner, and only
+where it reads the same file as the holding host: its own file on a host that
+is both, or a file on a mounted shared pool both hosts define alike (the same
+export mounted at the same directory, the pool's own source). On a holding
+host that does not own the VM, `--accept` may only name the file the disk
+record already names. A resolution never keeps a file the move proves stale:
+after a pivot only the copy is accepted, except in a forked history (below).
+A live move with no pivot recorded is
+refused without an `--accept` for its disk: nothing in the cluster knows
+which file the guest wrote last, and neither the disk record nor a persistent
+config naming the copy is evidence of it (the move names the copy in the
+config before the pivot). The one exception is the holding host that owns the
+VM, whose persistent config and disk record both name the source: no pivot
+happened. Judge it from the holding host's persistent config, or from the two
+files on the shared pool (the later modification time, `qemu-img compare`).
+On the VM's owner, with its domain defined, the persistent config, which `lv
+start` boots, must name the file each disk record is left on (point it there
+with `virsh edit` or pass that file to `--accept`), and no disk record is
+changed while the domain is active (`lv stop` it first); on the holding host
+that owns the VM the domain must be shut off. A condition whose evidence
+cannot be read is resolved only on the VM's owner with its domain shut off and
+its persistent config naming the file each disk record names, and keeps the
+disk records as they are; a holding host that returns with a record of a move
+of one of those disks begun before the resolution drops it, unless the record
+knew a pivot, a catch-up or an error: that one is raised again.
+
+**A forked history.** A pivoted move whose condition reached the VM's new
+owner only after a failover there (replication from the holding host was cut,
+or the condition was resolved over unreadable evidence) leaves two histories:
+the copy holds the writes the holding host made after the pivot, and the
+source, which the VM may have been started on since, holds the writes made
+there. Neither file is complete, and the owner's starts are refused with a
+text naming both exits. Once the holding host is proven powered off, on the
+VM's owner (`LV_HOST=<owner>`; the holding host too, once the VM came back to
+it):
+
+- `lv health resolve vm.move_unresolved vm/<vm> --accept <source> --reason
+  "…"` keeps the writes made on the source. It is accepted when the VM
+  changed hands after the move began (another owner, or a later ownership
+  generation, than the move recorded); the domain may keep running when its
+  persistent config and the disk record already name the source. A persistent
+  config naming the copy is pointed at the source with the domain shut off;
+  with no domain of the VM a start rebuilds it from the disk record. It is
+  refused on any other host than the owner, and while the copy was modified after the
+  source: the holding host wrote only the copy after the pivot, so nothing
+  was written to the source since. `--force` takes it anyway, with the reason
+  audited. A disk record naming the copy is pointed at the source (the
+  domain must be shut off); the copy is kept on disk, and a
+  `health.condition.hand_diverged` audit row names it.
+- `--accept <copy>` keeps the holding host's writes and discards every write
+  made on the source since the failover. With the owner's domain defined it
+  needs the domain stopped (`lv stop`) and its persistent config pointed at
+  the copy, as any other `--accept` of the copy on the owner. Once the VM
+  changed hands it is taken only on the VM's owner, and refused while the
+  source was modified after the copy, or either file cannot be read there,
+  unless `--force` is given, with the reason audited.
+
+With the domain running, only the file the running guest has open is kept,
+whatever its persistent config and the disk record name.
+
+The refusal prints both files' sizes and modification times (a source
+modified after the copy was written since the failover) and the starts of the
+VM recorded since the move began. A start through `lv start`, an HA restart
+or failover, the reconciler, a health check's restart, a replacement's restart
+or a promotion leaves a replicated `vm.starting` event naming the host and the
+ownership generation, and a domain the reconciler finds already running a
+`vm.adopted_running` event; `lv events <vm>` lists both, and the refusal
+lists them; `lv audit ls --target
+<vm>` lists its failover reschedules (action `failover`). The list may be
+incomplete either way: an event stamped by a host whose clock runs behind,
+one pruned with the VM's old events or beyond the newest 1000, one that has
+not reached the host, and a start by a build that records none are not
+listed. Each host also keeps a record of the ownership generation it last
+started a VM at, under `move-started` in its data directory, and the refusal
+names a start there since the move began.
+
+With no domain of the VM on its owner, a start never points the disk record
+at the copy by itself: nothing there proves the VM did not run on the source
+since the move began. So a failover that lands between a pivot and the end
+of the move holds the VM even when nothing ran it since: once the holding
+host is proven powered off, `lv health resolve vm.move_unresolved vm/<vm>
+--accept <copy> --reason "…"` on the owner starts it on the copy. The one
+automatic repoint left is on an owner whose domain is shut off with a
+persistent config naming the copy on a shared pool; it writes a
+`health.condition.auto_repoint` audit row.
+
+A disk record that names the copy is no proof either once the VM changed
+hands after the move began: a host that missed the holding host's commit
+reads the source, and may have run the VM there since. The owner's start is
+then refused with both exits, as above; `--accept <copy>` keeps the record as
+it is, and `--accept <source>` points it at the source. The holding host that
+gets the VM back after it changed hands does not trust its own persistent
+config either: its start is refused with both exits, and an admin's
+resolution made while it was away stands only when its config names the file
+the resolution left the disk record on.
+
+These refusals do not hold an operation that cannot pick the wrong file while
+the VM's domain runs on its owner: a live migration without storage (`lv
+migrate`, a host drain), and a backup, replication, clone or image build
+reading the file the running guest has open. The condition stays open for the
+VM's next start.
+
+A holding host that rejoins after an admin resolved its move from another
+host drops its record of that move instead of raising the condition again,
+unless it now owns the VM. When its record knew more than the evidence the
+admin resolved (a pivot that never replicated, for example), the decision
+still stands, and the host logs a warning and writes a
+`health.condition.hand_diverged` audit row naming what it knew: check that the
+file the disk record names holds the guest's data. While it holds an open
+condition, run the resolution against it (`LV_HOST=<host>`). Removing a host
+does not resolve the condition.
+
 ### A cluster default-deny held by a torn-down stack (`firewall.default_deny_orphaned`)
 
 Evaluator `stack_reconciler`, subject kind `cluster`, subject `cluster`,

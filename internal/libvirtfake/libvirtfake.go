@@ -256,6 +256,10 @@ type Fake struct {
 	// RevertNotCurrent makes a revert succeed but report that libvirt would
 	// not take the snapshot back as current (libvirt.RestoredNotCurrentError).
 	RevertNotCurrent bool
+	// DeleteSnapshotKeeps, when set, makes a snapshot delete remove only the
+	// metadata and report these files kept (libvirt.SnapshotFilesKeptError),
+	// as a delete libvirt cannot merge safely does.
+	DeleteSnapshotKeeps []string
 	// snapshotFiles is, per domain and snapshot, the files the snapshot's
 	// overlay cutover named: each disk's overlay and the disk it was taken of.
 	snapshotFiles         map[string]map[string][]string
@@ -2108,6 +2112,10 @@ func (f *Fake) DeleteSnapshot(domainName, snapshotName string) error {
 	delete(f.snapshots[domainName], snapshotName)
 	delete(f.snapshotFiles[domainName], snapshotName)
 	f.record("snapshot-delete", domainName, snapshotName)
+	if len(f.DeleteSnapshotKeeps) > 0 {
+		return &libvirt.SnapshotFilesKeptError{Snapshot: snapshotName, Reason: "libvirtfake: metadata only",
+			Files: append([]string(nil), f.DeleteSnapshotKeeps...)}
+	}
 	return nil
 }
 func (f *Fake) FlattenSnapshot(domainName, snapshotName string) error {

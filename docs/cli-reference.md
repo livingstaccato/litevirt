@@ -101,9 +101,15 @@ lv cluster claim-release <kind>/<name>       # Release one workload ha.claim.leg
                                    #   legacy proof stuck in flight on a live destination; the
                                    #   destination confirms nothing runs it, then abandons it (admin)
 lv health [--resolved]             # Cluster health: overall + conditions + coverage (exit 0/1/2)
-lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept-stale-uefi-vars]
-                                   # Resolve one open dual-run condition by hand (admin, audited; re-raised next
-                                   #   pass if it still holds), or accept nvram_flush_failed's vars stores as stale
+lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH] [--force] [--accept-stale-uefi-vars]
+                                   # Resolve one open dual-run condition by hand (admin, audited); re-raised next
+                                   #   pass if it still holds; or a vm.move_unresolved (--reason required) on its
+                                   #   holding host, or once that host is proven powered off; --accept picks the
+                                   #   file to keep of one disk (repeat per disk; required for a move with no pivot
+                                   #   recorded, unless the holder owns the VM and its config and record name
+                                   #   the source); --force keeps a forked history's file although the other
+                                   #   was modified after it; or accept nvram_flush_failed's vars stores as stale
+                                   #   (--accept-stale-uefi-vars)
 ```
 
 ## Hosts
@@ -732,6 +738,9 @@ lv resolve-pit-overlay <vm> <disk>                       # Admin: the verdict on
 lv resolve-pit-overlay <vm> <disk> --commit --confirm    # Commit it; refused unless the verdict says it is safe (--force-commit overrides, experts only)
 lv resolve-pit-overlay <vm> <disk> --commit --force-commit --overwrite-newer-writes --confirm  # Expert only: commit an overlay already in the disk, over the guest's newer writes
 lv resolve-pit-overlay <vm> <disk> --discard --confirm   # Discard it; of a half-written disk only with --accept-torn-disk
+lv pit-overlays ls [--host <h>] [--vm <vm>]              # Set-aside overlays (.<disk file>.lv-pit.orphan-<time>) of a host's VMs, on their host; IN USE says why one is kept
+lv pit-overlays rm <vm> <disk> <name> [--yes]            # Admin, audited, asks first: remove one and its binding; refused while in use (see backups.md)
+lv pit-overlays rm --host <h> --path <path> [--yes]      # Admin, audited, asks first: remove a DETACHED one (no live disk where it was set aside)
 
 # Migrate every VM's volumes in a stack to a different pool (rolling, online):
 lv stack migrate-volumes <stack> --to <pool>
@@ -1024,12 +1033,15 @@ rather than unlink. Two cases keep every file:
 - the delete is **refused**, naming the VMs, while another VM (a linked clone)
   backs on the snapshot's overlay or on the disk it was taken of;
 - a snapshot libvirt does not hold as current and that has no children — as
-  a restore by an earlier build left one — is deleted as metadata only, with a
-  warning in the log: the VM keeps its backing chain, and the space is not
-  reclaimed;
+  a restore by an earlier build left one — is deleted as metadata only: the VM
+  keeps its backing chain, and the space is not reclaimed;
 - so is a snapshot libvirt cannot merge because its overlay is no longer in
   the VM's live chain. Restoring an older snapshot while a later one exists
   leaves the restored one so: its overlay file stays on disk, unused.
+
+A metadata-only delete says so: `lv snapshot rm` prints a warning naming the
+files it kept and their size, and the VM gets the event `snapshot.files-kept`
+(`lv events <vm>`). Nothing is lost, and no `lv` command reclaims that space.
 
 Restoring an older snapshot while a later one exists puts the VM on a new
 overlay (`<disk>.<snapshot>-r<time>`) directly on the disk that snapshot was
@@ -1221,6 +1233,10 @@ lv replication replicas <container> --target-pool <repo> [--host <h>] [--project
   [--restore <timestamp>]  # lay that replica down as the container, stopped (never a second copy)
   [--remove <timestamp>]   # a SET-ASIDE or ORPHANED replica to remove (repeatable; asks first)
   [--yes]                  # remove without asking
+
+# Incremental-replication checkpoint rows (the anchor of each VM's chain into a pool).
+lv replication checkpoints ls [--vm <vm>]                # IN USE: a live schedule uses it; VM DELETED: the VM has no live row
+lv replication checkpoints rm <vm> --target-pool <pool>  # Admin, audited: refused while a live schedule uses it; run on the VM's host, which drops its bitmap (printed); the next run is a full copy
 
 # Disaster recovery: bring a VM up from its replica.
 lv replication promote <vm>
@@ -1572,12 +1588,28 @@ lv health [--resolved]                       # Cluster health: overall state, ac
                                              #   evaluator coverage, connectivity, capacity.
                                              #   --resolved includes the 30-day resolved history.
                                              #   Exit code: 0 healthy · 1 degraded/unknown · 2 critical.
-lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E]
+lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH] [--force]
                                              # Resolve one open dual-run condition by hand, named as
                                              #   `lv health` prints it. Admin (cluster.health.resolve),
                                              #   audited, ha.condition.resolved event. Refused until a
                                              #   detector scan after its last sighting probed every host
                                              #   it names; raised again next pass if it still holds.
+                                             #   Also vm.move_unresolved (an unresolved volume move),
+                                             #   with --reason: on the host holding its record, or once
+                                             #   that host is proven powered off. --accept PATH points
+                                             #   a disk record at one of its move's two files first, on
+                                             #   the VM's owner; once per disk, and required for a
+                                             #   move with no pivot recorded unless the holder owns
+                                             #   the VM and its config and record name the source.
+                                             #   On the owner the domain's config must name each file
+                                             #   kept, and a running domain's record is not changed.
+                                             #   After a pivot only the copy is accepted, unless the VM
+                                             #   changed hands since the move began (a forked
+                                             #   history, on the owner): a record, and a shut-off
+                                             #   domain's config, on the copy are pointed at the
+                                             #   source; refused while the file not kept was
+                                             #   modified later, unless --force.
+                                             #   `lv health` lists the moves first (docs/diagnostics.md).
 lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars --reason R
                                              # Accept that the UEFI vars stores nvram_flush_failed names
                                              #   may be stale, for a VM kept as it is. Admin, audited

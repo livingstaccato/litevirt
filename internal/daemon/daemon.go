@@ -1637,6 +1637,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// failover lease holder, so a later rollback below the release still
 	// quarantines.
 	go svc.RunReleaseUseSweep(ctx)
+	// Remove the replicas, and retire the checkpoint rows, of a replication
+	// schedule removed or a VM deleted more than a day ago (replica_orphans.go).
+	go svc.RunReplicaOrphanSweep(ctx)
 	// Autostart onboot VMs once, in startup_order (#10). Runs only for VMs not
 	// already running in libvirt, so a daemon restart (qemu kept alive by
 	// KillMode=process) is a no-op while a host reboot brings them up in order;

@@ -602,7 +602,8 @@ by the strongest method the host has, tried in this order:
    audited as the operator who ran it, asks first unless `--yes`; event
    `disk.pit_overlay_removed`). It is refused while the overlay is in use: it
    is the set-aside evidence of the disk's current window (above), a VM disk
-   references it, a domain names it, the disk is held on its overlay, a live
+   references it, a domain defined on that host names it (domains on other
+   hosts sharing the pool are not asked), the disk is held on its overlay, a live
    disk sits where a detached one was set aside, or anything about it cannot
    be read.
    The start-up sweep waits until the host's replica is trusted (caught up

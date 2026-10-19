@@ -57,6 +57,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -250,13 +251,24 @@ func orphansWith(glob func(string) ([]string, error), disk string) ([]string, er
 		return nil, err
 	}
 	var orphans []string
+	prefix := filepath.Base(Path(disk)) + ".orphan-"
 	for _, p := range m {
-		if !strings.HasSuffix(p, ".id") {
+		if stamp, ok := strings.CutPrefix(filepath.Base(p), prefix); ok && orphanStampRE.MatchString(stamp) {
 			orphans = append(orphans, p)
 		}
 	}
 	return orphans, nil
 }
+
+// orphanStampRE is the stamp SetAside ends an orphan's name with: the time,
+// and a further -N when that name was taken.
+var orphanStampRE = regexp.MustCompile(`^[0-9]{8}-[0-9]{6}(-[0-9]+)?$`)
+
+// orphanNameRE is SetAside's whole name shape: ".<disk file>.lv-pit.orphan-"
+// and the stamp at the very end. A name that only contains the marker (a VM
+// or disk named "w.lv-pit.orphan-1" has a live overlay ending ".lv-pit") is
+// not an orphan.
+var orphanNameRE = regexp.MustCompile(`^\.(.+)` + regexp.QuoteMeta(Suffix+".orphan-") + `([0-9]{8}-[0-9]{6}(?:-[0-9]+)?)$`)
 
 // otherVM reports whether binding data records a VM uuid other than vmUUID.
 func otherVM(data []byte, vmUUID string) bool {
@@ -328,18 +340,19 @@ func OrphanInUse(disk, orphan, vmUUID string) string {
 	return ""
 }
 
-// IsOrphanName reports whether name is shaped as SetAside names an overlay it
-// set aside: ".<disk file>.lv-pit.orphan-<stamp>", not its binding. base is
-// the disk file's name.
+// IsOrphanName reports whether name is exactly the shape SetAside names an
+// overlay it set aside, ".<disk file>.lv-pit.orphan-<stamp>" with the stamp
+// YYYYMMDD-HHMMSS (or -N after it) at the end: never a live overlay, a
+// binding, or a disk. base is the disk file's name.
 func IsOrphanName(name string) (base string, ok bool) {
-	if !strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".id") || strings.ContainsAny(name, "/\x00") {
+	if strings.ContainsAny(name, "/\x00") {
 		return "", false
 	}
-	i := strings.Index(name, Suffix+".orphan-")
-	if i <= 1 || i+len(Suffix+".orphan-") == len(name) {
+	m := orphanNameRE.FindStringSubmatch(name)
+	if m == nil || m[1] == "" {
 		return "", false
 	}
-	return name[1:i], true
+	return m[1], true
 }
 
 // DiskOfOrphan is the disk file an orphan was set aside beside.
@@ -369,7 +382,7 @@ func OrphanOwner(orphan string) (Owner, error) {
 func OrphanPath(disk, name string) (string, error) {
 	prefix := filepath.Base(Path(disk)) + ".orphan-"
 	rest, ok := strings.CutPrefix(name, prefix)
-	if !ok || rest == "" || strings.HasSuffix(name, ".id") || strings.ContainsAny(rest, "/\x00") || rest == "." || rest == ".." {
+	if !ok || !orphanStampRE.MatchString(rest) {
 		return "", fmt.Errorf("%q is not a set-aside overlay of %s", name, disk)
 	}
 	return filepath.Join(filepath.Dir(disk), name), nil

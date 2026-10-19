@@ -11,6 +11,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -360,5 +361,140 @@ func TestDetachedPITOverlay_ListedAndRemovedByPathWithItsGuards(t *testing.T) {
 	}
 	if hygieneFileThere(o) || hygieneFileThere(o+".id") {
 		t.Error("the detached overlay or its binding is still there")
+	}
+}
+
+// R2 I-1, the reviewer's probe. VM "w.lv-pit.orphan-1" (a legal name) runs
+// on another host from a disk in this host's <data_dir>/disks; its LIVE
+// overlay and binding are beside the disk. The overlay is never listed as a
+// detached orphan, and removal by path is refused: it holds the guest's
+// newest writes.
+//
+// Mutation "prefix-only shape": it is listed detached and removed; red.
+func TestDetachedPITOverlay_ADottedVMsLiveOverlayIsNeverAnOrphan(t *testing.T) {
+	s, _, _ := setAsideServer(t)
+	dir := filepath.Join(s.dataDir, "disks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	disk := filepath.Join(dir, "w.lv-pit.orphan-1-root.qcow2")
+	if err := os.WriteFile(disk, []byte("disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{Name: "w.lv-pit.orphan-1", HostName: "other-host", State: "running", Spec: `{"name":"w.lv-pit.orphan-1"}`}, nil,
+		[]corrosion.DiskRecord{{VMName: "w.lv-pit.orphan-1", DiskName: "root", HostName: "other-host", StorageType: "local", Path: disk}}); err != nil {
+		t.Fatal(err)
+	}
+	live := pitoverlay.Path(disk)
+	b, _ := json.Marshal(pitoverlay.Binding{Owner: pitoverlay.Owner{VM: "w.lv-pit.orphan-1", Disk: "root"}, State: pitoverlay.StateWindow, Token: "t"})
+	if err := os.WriteFile(live, []byte("the guest's newest writes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pitoverlay.SidecarPath(disk), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := s.ListSetAsideOverlays(adminCtx(), &pb.ListSetAsideOverlaysRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range resp.GetOverlays() {
+		if o.GetPath() == live {
+			t.Errorf("the live overlay is listed as a set-aside one: %+v", o)
+		}
+	}
+	if _, err := s.RemoveSetAsideOverlay(adminCtx(), &pb.RemoveSetAsideOverlayRequest{Path: live}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("remove of the live overlay by path = %v, want InvalidArgument", err)
+	}
+	if !hygieneFileThere(live) || !hygieneFileThere(pitoverlay.SidecarPath(disk)) {
+		t.Fatal("the live overlay or its binding was deleted")
+	}
+}
+
+// R2 m-1. A detached overlay a domain names is kept whatever the database
+// says: every domain libvirt has defined is asked, a stray one with no VM
+// row included, and a domain list that cannot be read refuses.
+//
+// Mutation "only recorded VMs asked" (anyDomainNamesFile walks VMsOnHost):
+// the stray domain's reference is missed; red.
+func TestDetachedPITOverlay_EveryDefinedDomainIsAsked(t *testing.T) {
+	s, _, _ := setAsideServer(t)
+	dir := filepath.Join(s.dataDir, "disks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	o := pitoverlay.Path(filepath.Join(dir, "gone-root.qcow2")) + ".orphan-20261001-000000"
+	if err := os.WriteFile(o, []byte("o"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("inspect-by-hand", libvirtfake.StateDefined) // no VM row
+	snap := &fakePITSnapshotter{onOverlay: map[string]bool{o: true}}
+	s.SetPointInTimeSnapshotter(snap)
+	rm := func() error {
+		_, err := s.RemoveSetAsideOverlay(adminCtx(), &pb.RemoveSetAsideOverlayRequest{Path: o})
+		return err
+	}
+	if err := rm(); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("remove while a stray domain names it = %v, want FailedPrecondition", err)
+	}
+	snap.onOverlay = map[string]bool{}
+	fake.FailListDomains = func() error { return errors.New("libvirt: connection dropped") }
+	if err := rm(); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("remove while the domain list cannot be read = %v, want FailedPrecondition", err)
+	}
+	fake.FailListDomains = nil
+	if err := rm(); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+}
+
+// R2 N-2. A request a peer already forwarded is never forwarded again: a
+// host whose replica names yet another host for the VM answers Aborted
+// rather than passing it on, so two replicas that disagree cannot ping-pong.
+//
+// Mutation "no hop guard": it forwards (and fails to dial: Unavailable); red.
+func TestSetAsideAndCheckpointForwards_AreNeverForwardedTwice(t *testing.T) {
+	s, _, _ := setAsideServer(t)
+	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{Name: "away", HostName: "third-host", State: "running", Spec: `{"name":"away"}`}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	ctx := peerCtxFor(t, s, "node-x")
+	ctx = context.WithValue(context.WithValue(ctx, ctxKeyUsername, "admin"), ctxKeyRole, "admin")
+	ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(forwardedHopMDKey, "node-x"))
+	if _, err := s.RemoveSetAsideOverlay(ctx, &pb.RemoveSetAsideOverlayRequest{VmName: "away", DiskName: "root", Name: ".x.lv-pit.orphan-20261018-120000"}); status.Code(err) != codes.Aborted {
+		t.Errorf("a forwarded remove for a VM on a third host = %v, want Aborted", err)
+	}
+	if _, err := s.DeleteReplicationCheckpoint(ctx, &pb.DeleteReplicationCheckpointRequest{VmName: "away", TargetPool: "dr"}); status.Code(err) != codes.Aborted {
+		t.Errorf("a forwarded checkpoint rm for a VM on a third host = %v, want Aborted", err)
+	}
+	if _, err := s.ListSetAsideOverlays(ctx, &pb.ListSetAsideOverlaysRequest{VmName: "away"}); status.Code(err) != codes.Aborted {
+		t.Errorf("a forwarded listing for a VM on a third host = %v, want Aborted", err)
+	}
+}
+
+// R2 N-2. A detached overlay's removal holds the VM lock of the owner its
+// binding records from its checks to the unlink, so a re-create of that VM,
+// or an attach or a set-aside on its disk, cannot slip in between.
+//
+// Mutation "no lock": the removal completes while the lock is held; red.
+func TestDetachedPITOverlay_RemovalHoldsTheOwnersVMLock(t *testing.T) {
+	s, _, _ := setAsideServer(t)
+	dir := filepath.Join(s.dataDir, "disks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	o := pitoverlay.Path(filepath.Join(dir, "gone-root.qcow2")) + ".orphan-20261001-000000"
+	b, _ := json.Marshal(pitoverlay.Binding{Owner: pitoverlay.Owner{VM: "gone", Disk: "root"}})
+	if err := os.WriteFile(o, []byte("o"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(o+".id", b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertSerializedByVMLock(t, s, "gone", func() {
+		_, _ = s.RemoveSetAsideOverlay(adminCtx(), &pb.RemoveSetAsideOverlayRequest{Path: o})
+	})
+	if hygieneFileThere(o) {
+		t.Fatal("not removed once the lock was free")
 	}
 }

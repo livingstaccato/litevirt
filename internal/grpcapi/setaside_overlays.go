@@ -85,11 +85,17 @@ func (s *Server) domainNamesFile(vmName, path string) string {
 	return ""
 }
 
-// anyDomainNamesFile is domainNamesFile over every VM recorded on this host.
-func (s *Server) anyDomainNamesFile(ctx context.Context, path string) string {
-	names, err := corrosion.VMsOnHost(ctx, s.db, s.hostName)
+// anyDomainNamesFile is domainNamesFile over every domain libvirt has defined
+// on this host, whether or not a VM row names it (a domain defined by hand to
+// inspect the file, a VM whose row still names another host). A domain list
+// that cannot be read refuses.
+func (s *Server) anyDomainNamesFile(path string) string {
+	if s.virt == nil {
+		return "whether a domain on this host names it cannot be told: no libvirt connection"
+	}
+	names, err := s.virt.ListDomains()
 	if err != nil {
-		return "this host's VMs cannot be read: " + err.Error()
+		return "whether a domain on this host names it cannot be told: " + err.Error()
 	}
 	for _, n := range names {
 		if why := s.domainNamesFile(n, path); why != "" {
@@ -97,6 +103,28 @@ func (s *Server) anyDomainNamesFile(ctx context.Context, path string) string {
 		}
 	}
 	return ""
+}
+
+// forwardedHop reports whether ctx is a request an entry node already
+// forwarded here (forwardedHopMDKey, from a peer certificate only).
+func (s *Server) forwardedHop(ctx context.Context) bool {
+	if s.requirePeerCert(ctx) != nil {
+		return false
+	}
+	md, ok := metadata.FromIncomingContext(ctx)
+	return ok && len(md.Get(forwardedHopMDKey)) > 0
+}
+
+// refuseSecondHop is the answer of a host that received a forwarded request
+// for a VM its replica places on yet another host: never forwarded again, so
+// two replicas that disagree cannot pass it back and forth.
+func refuseSecondHop(vm, host string) error {
+	return status.Errorf(codes.Aborted, "this host's replica places vm %q on %s, not here: the forwarded request is not passed on again; retry once the cluster agrees", vm, host)
+}
+
+// forwardOnce marks ctx as forwarded, carrying the operator who asked.
+func (s *Server) forwardOnce(ctx context.Context, actor string) context.Context {
+	return metadata.AppendToOutgoingContext(ctx, repairActorMDKey, actor, forwardedHopMDKey, s.hostName)
 }
 
 // setAsideOverlayInUse says why orphan, set aside beside d's file disk, is in
@@ -141,7 +169,7 @@ func (s *Server) detachedOverlayInUse(ctx context.Context, orphan, base string) 
 	} else if len(owners) > 0 {
 		return fmt.Sprintf("VM %s's disk %s references it", owners[0].VMName, owners[0].DiskName)
 	}
-	return s.anyDomainNamesFile(ctx, orphan)
+	return s.anyDomainNamesFile(orphan)
 }
 
 // pitOverlayHeldOn reports whether vm's disk has an open point-in-time hold.
@@ -323,12 +351,15 @@ func (s *Server) ListSetAsideOverlays(ctx context.Context, req *pb.ListSetAsideO
 	}
 	var resp *pb.ListSetAsideOverlaysResponse
 	if target != "" && target != s.hostName {
+		if s.forwardedHop(ctx) {
+			return nil, refuseSecondHop(req.GetVmName(), target)
+		}
 		client, conn, err := s.peerClient(ctx, target)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", target, err)
 		}
 		defer conn.Close()
-		if resp, err = client.ListSetAsideOverlays(ctx, req); err != nil {
+		if resp, err = client.ListSetAsideOverlays(s.forwardOnce(ctx, s.repairActor(ctx)), req); err != nil {
 			return nil, err
 		}
 	} else {
@@ -361,20 +392,23 @@ func (s *Server) RemoveSetAsideOverlay(ctx context.Context, req *pb.RemoveSetAsi
 	// The operator who asked, carried to the host that removes, which writes
 	// the audit row (a forwarded call arrives as the peer).
 	actor := s.repairActor(ctx)
-	forward := func(host string) (*pb.RemoveSetAsideOverlayResponse, error) {
+	forward := func(what, host string) (*pb.RemoveSetAsideOverlayResponse, error) {
+		if s.forwardedHop(ctx) {
+			return nil, refuseSecondHop(what, host)
+		}
 		client, conn, err := s.peerClient(ctx, host)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "reach host %q: %v", host, err)
 		}
 		defer conn.Close()
-		return client.RemoveSetAsideOverlay(metadata.AppendToOutgoingContext(ctx, repairActorMDKey, actor), req)
+		return client.RemoveSetAsideOverlay(s.forwardOnce(ctx, actor), req)
 	}
 	if req.GetPath() != "" {
 		if req.GetVmName() != "" || req.GetDiskName() != "" || req.GetName() != "" {
 			return nil, status.Error(codes.InvalidArgument, "give a path (a detached overlay) or vm_name, disk_name and name, not both")
 		}
 		if h := req.GetHost(); h != "" && h != s.hostName {
-			return forward(h)
+			return forward(req.GetPath(), h)
 		}
 		return s.removeDetachedOverlay(ctx, actor, req.GetPath())
 	}
@@ -386,7 +420,7 @@ func (s *Server) RemoveSetAsideOverlay(ctx context.Context, req *pb.RemoveSetAsi
 		return nil, status.Errorf(codes.NotFound, "vm %q not found", req.GetVmName())
 	}
 	if vm.HostName != s.hostName {
-		return forward(vm.HostName)
+		return forward(vm.Name, vm.HostName)
 	}
 	unlock := s.lockVM(vm.Name)
 	defer unlock()
@@ -475,6 +509,14 @@ func (s *Server) removeDetachedOverlay(ctx context.Context, actor, path string) 
 	if !inPool {
 		return nil, status.Errorf(codes.InvalidArgument, "%s is not in a file-based pool directory of host %s", path, s.hostName)
 	}
+	// Held from the checks to the unlink: the VM lock of the disk's owner, as
+	// its binding records it (a re-create of that VM, or an attach or a
+	// set-aside on its disk, takes it), and of the disk file itself.
+	owner, oerr := storage.Bounded("read the binding of", path, func() (pitoverlay.Owner, error) { return pitoverlay.OrphanOwner(path) })
+	if oerr == nil && owner.VM != "" {
+		defer s.lockVM(owner.VM)()
+	}
+	defer s.lockVM("pit-orphan-base:" + base)()
 	fi, err := s.statOrphan(path, filepath.Base(path), "on host "+s.hostName)
 	if err != nil {
 		return nil, err
@@ -485,3 +527,8 @@ func (s *Server) removeDetachedOverlay(ctx context.Context, actor, path string) 
 	}
 	return s.removeOrphan(ctx, actor, path, path, fi)
 }
+
+// forwardedHopMDKey marks a request an entry node forwarded to the host it
+// acts on. Honoured only from a peer certificate: such a request is answered
+// where it lands and never forwarded again.
+const forwardedHopMDKey = "x-litevirt-forwarded-hop"

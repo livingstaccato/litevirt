@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -65,17 +64,19 @@ func (s *Server) DeleteReplicationCheckpoint(ctx context.Context, req *pb.Delete
 	}
 	bitmapLeft := ""
 	if vm != nil && vm.HostName != s.hostName {
-		client, conn, derr := s.peerClient(ctx, vm.HostName)
-		if derr == nil {
-			defer conn.Close()
-			resp, ferr := client.DeleteReplicationCheckpoint(metadata.AppendToOutgoingContext(ctx, repairActorMDKey, actor), req)
-			if status.Code(ferr) != codes.Unimplemented {
-				return resp, ferr
-			}
-			bitmapLeft = fmt.Sprintf("left on %s (it runs an older build)", vm.HostName)
-		} else {
-			bitmapLeft = fmt.Sprintf("left on %s (not reachable: %v)", vm.HostName, derr)
+		if s.forwardedHop(ctx) {
+			return nil, refuseSecondHop(vm.Name, vm.HostName)
 		}
+		client, conn, derr := s.peerClient(ctx, vm.HostName)
+		if derr != nil {
+			return nil, status.Errorf(codes.Unavailable, "reach host %q, the VM's: %v; nothing was retired", vm.HostName, derr)
+		}
+		defer conn.Close()
+		resp, ferr := client.DeleteReplicationCheckpoint(s.forwardOnce(ctx, actor), req)
+		if status.Code(ferr) != codes.Unimplemented {
+			return resp, ferr
+		}
+		bitmapLeft = fmt.Sprintf("left on %s (it runs an older build)", vm.HostName)
 	}
 	rows, err := corrosion.LiveReplicationCheckpoints(ctx, s.db, req.GetVmName())
 	if err != nil {

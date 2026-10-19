@@ -1538,6 +1538,29 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 			r.client.noteIncarnationRefusal(tx, s, reason)
 			continue
 		}
+		// A statement bound to an account's incarnation that this node's
+		// users row is not, and a re-create of an older incarnation than the
+		// one it holds, are skipped here and kept out of the absorbs below
+		// with them: a guard-skipped password change from a node that wrote
+		// the old column alone must not be absorbed into the credential row of
+		// whatever account holds the name now (user_incarnation.go).
+		if s.Guard != nil && s.Guard.Protocol == userIncarnationGuardV1 {
+			matches, gerr := userIncarnationGuardMatches(ctx, tx, s.Guard)
+			if gerr != nil {
+				return fmt.Errorf("apply mutation (origin=%s seq=%d): mutation guard: %w", entry.Origin, entry.Seq, gerr)
+			}
+			if !matches {
+				refusedIncarnation[i] = true
+				continue
+			}
+		}
+		if kept, kerr := userRecreateRefused(ctx, tx, s); kerr != nil {
+			return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, kerr)
+		} else if kept {
+			r.client.observeMergeRejected("users", "wal", "older_incarnation")
+			refusedIncarnation[i] = true
+			continue
+		}
 		// A fence credential carries the retirement it was set after
 		// (credentials_revive_guard.go). One that rides with a hosts write
 		// this node refuses as another incarnation's — before or after it in

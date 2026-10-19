@@ -1517,6 +1517,8 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 			return false, err
 		}
 		allCredHosts = allCredHosts.addMissing(credHosts)
+		// See executeBatchInternal (user_incarnation.go).
+		stampUsers := c.userStampPlan(stmts)
 		for _, s := range stmts {
 			// See executeBatchInternal (credentials_revive_guard.go).
 			credPlan, err := planCredentialUpsert(ctx, tx, s, stmts, credHosts)
@@ -1529,6 +1531,13 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 				return false, err
 			} else if credPlan.skip {
 				continue
+			}
+			if stampUsers {
+				if err := stampUserIncarnation(ctx, tx, &s); err != nil {
+					tx.Rollback()
+					c.mu.Unlock()
+					return false, fmt.Errorf("stamp user incarnation: %w", err)
+				}
 			}
 			if s.Guard != nil {
 				matches, err := c.mutationGuardMatches(ctx, tx, s.Guard)
@@ -1745,6 +1754,9 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 		c.mu.Unlock()
 		return 0, err
 	}
+	// The account a user-keyed statement names is bound to its incarnation
+	// here, in the write's own transaction (user_incarnation.go).
+	stampUsers := c.userStampPlan(stmts)
 	for _, s := range stmts {
 		// A fence credential carries the retirement it was set after
 		// (credentials_revive_guard.go).
@@ -1767,6 +1779,20 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 			tx.Rollback()
 			c.mu.Unlock()
 			return 0, fmt.Errorf("stamp host incarnation: %w", err)
+		}
+		// The account's incarnation, as its users row stands just before this
+		// statement runs, and a guard the writer set checked against it.
+		if stampUsers {
+			if err := stampUserIncarnation(ctx, tx, &s); err != nil {
+				tx.Rollback()
+				c.mu.Unlock()
+				return 0, fmt.Errorf("stamp user incarnation: %w", err)
+			}
+		}
+		if err := checkOwnUserGuard(ctx, tx, s); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return 0, err
 		}
 		// This host's own row is not written while its own-row hold holds
 		// (own_row_hold.go).

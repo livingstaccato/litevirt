@@ -1516,7 +1516,14 @@ lagging host revives it. `lv user create` of a deleted name makes a new
 account, which replaces the deleted one everywhere. Nor does a lagging
 host's password change, or its delete of the deleted account, reach the new
 account: its password, second factors, recovery codes, role bindings,
-enrollment code, directory bindings and session cut-offs stay its own. Two
+enrollment code, directory bindings and session cut-offs stay its own. The
+same holds for anything else a lagging host gives the deleted account: an API
+token or login session minted there, a role binding, a directory binding, an
+enrollment code, recovery codes, a second-factor change, or an enable or
+expiry change. A host that learns of the re-create drops the deleted
+account's tokens and sessions it holds. A write to an account that is deleted
+or re-created while the write is being made fails and changes nothing; run it
+again. Two
 things of the deleted account can still reach the new one from the lagging
 host itself, and both only take access away: its session cut-offs, which log
 the new account out once, and its clearing of a directory identity the new

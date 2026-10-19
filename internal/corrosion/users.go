@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -83,6 +84,7 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 		// new incarnation, which replaces the tombstone on every node
 		// (user_incarnation.go).
 		created := rows[0].String("created_at")
+		prev := created
 		oldColumn := passwordHash
 		if split {
 			oldColumn = c.oldColumnValue(passwordHash)
@@ -92,14 +94,38 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 			created = nextIncarnation(created)
 			reactivate = Statement{SQL: usersReactivateIncarnationSQL, Params: []interface{}{role, oldColumn, created, ts, username}}
 		}
+		// The re-create replaces the tombstone this node read, and nothing a
+		// peer wrote under the name since: another account of the name that
+		// replicated in between is left as it is, and the caller told to
+		// retry. The credential is bound to the NEW incarnation once
+		// user_incarnation_v1 has latched (stampUserIncarnation), so a
+		// receiver that keeps this re-create off — it still holds the old
+		// account live — takes none of it.
+		still := func(tx *sql.Tx) (bool, error) {
+			var cur string
+			err := tx.QueryRowContext(ctx, `SELECT created_at FROM users WHERE username = ? AND deleted_at IS NOT NULL`, username).Scan(&cur)
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+			return err == nil && cur == prev, err
+		}
+		var applied bool
 		if split {
-			return c.ExecuteBatch(ctx, []Statement{
+			applied, err = c.ExecuteBatchGuarded(ctx, still, []Statement{
 				reactivate,
 				{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, ts}},
 			})
+		} else {
+			applied, err = c.ExecuteBatchGuarded(ctx, still, []Statement{reactivate})
 		}
-		if err := c.ExecuteBatch(ctx, []Statement{reactivate}); err != nil {
+		if err != nil {
 			return err
+		}
+		if !applied {
+			return ErrUserAccountChanged
+		}
+		if split {
+			return nil
 		}
 		if passwordHash == "" {
 			c.noteExternalShadow(userIdentity{Username: username, CreatedAt: created, UpdatedAt: ts})
@@ -107,6 +133,11 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 		return nil
 	}
 	created := nowRFC3339()
+	if c.UserIncarnationOn() {
+		// An incarnation at nanosecond precision, so two creates of one name
+		// on partitioned nodes in the same second are two incarnations.
+		created = time.Now().UTC().Format(time.RFC3339Nano)
+	}
 	if passwordHash != "" {
 		// A local account under this name: any record that this node made
 		// an external shadow of it is about an earlier incarnation.
@@ -699,7 +730,20 @@ func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client, run FeatureRun) 
 		if err != nil {
 			return err
 		}
-		return c.ExecuteBatch(ctx, stmts)
+		// Over the tombstone read above only: an account of the name that
+		// replicated in since is not overwritten (user_incarnation.go).
+		applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+			var del sql.NullString
+			err := tx.QueryRowContext(ctx, `SELECT deleted_at FROM users WHERE username = ?`, victim).Scan(&del)
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+			return err == nil && del.Valid && del.String == deletedAt, err
+		}, stmts)
+		if err == nil && !applied {
+			err = ErrUserAccountChanged
+		}
+		return err
 	}); err != nil {
 		return "", err
 	}

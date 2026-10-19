@@ -54,6 +54,10 @@ const (
 	mergeAuthorityKeepLocal
 	mergeAuthorityApplyIncoming
 	mergeAuthorityApplyIncomingAndSweep
+	// mergeAuthorityApplyIncomingAndRetire applies a users row of a newer
+	// incarnation and then retires the older one's rows under the name
+	// (user_incarnation.go).
+	mergeAuthorityApplyIncomingAndRetire
 )
 
 var vmAuthorityChildTables = map[string]bool{

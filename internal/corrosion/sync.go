@@ -991,7 +991,8 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 			continue
 		}
 		if authorityDecision == mergeAuthorityApplyIncoming ||
-			authorityDecision == mergeAuthorityApplyIncomingAndSweep {
+			authorityDecision == mergeAuthorityApplyIncomingAndSweep ||
+			authorityDecision == mergeAuthorityApplyIncomingAndRetire {
 			// Workload owner/generation is the semantic ABA order. A higher
 			// authority applies even when an unrelated local wall/HLC clock is
 			// larger; children later in the payload are fenced against the
@@ -1005,6 +1006,16 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				skipped++
 			} else {
 				merged++
+				if authorityDecision == mergeAuthorityApplyIncomingAndRetire {
+					// The newer incarnation has landed: the older one's rows
+					// under the name go, here only (user_incarnation.go).
+					idx := columnIndexMap(table.Columns)
+					if retErr := retireOlderIncarnationRows(context.Background(), tx,
+						cellStr(row, idx, "username"), cellStr(row, idx, "created_at")); retErr != nil {
+						_ = tx.Rollback()
+						return merged, skipped, retErr
+					}
+				}
 				if authorityDecision == mergeAuthorityApplyIncomingAndSweep {
 					deletedIdx, updatedIdx := indexOf(table.Columns, "deleted_at"), indexOf(table.Columns, "updated_at")
 					if deletedIdx < 0 || updatedIdx < 0 {

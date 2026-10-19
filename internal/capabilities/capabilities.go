@@ -518,7 +518,14 @@ const (
 	//     that incarnation whatever later write a lagging node made to it,
 	//     keeping the later clock;
 	//   - anti-entropy never lets a live row beat a tombstone of its own
+	//     incarnation;
+	//   - a write that names the account by username alone (a password, a
+	//     token, a session, a grant, a delete's cascade) carries a
+	//     user_incarnation_v1 mutation guard, and applies only to that
 	//     incarnation.
+	//
+	// Retiring it later moves the two statement shapes to the historical
+	// ledger, not out of it: a retained entry still carries them.
 	//
 	// Before, a password change made on a node that had not yet seen the
 	// delete was newer than it, and last-write-wins brought the deleted

@@ -196,3 +196,43 @@ func TestNewClientTimeout_BoundsASilentHandshake(t *testing.T) {
 		t.Fatal("NewClientTimeout did not return within its bound")
 	}
 }
+
+// Codex cand30 M1: dialTimeout gave the TCP connect the whole timeout and
+// then set a fresh one for the handshake, so a slow connect followed by a
+// silent server took up to twice the bound `lv host rm` advertises for its
+// cleanup. One deadline, fixed before the dial, covers the connect, the
+// handshake and (keepDeadline) the session.
+//
+// Mutation: set the connection's deadline from time.Now() after the connect
+// — the call returns after the connect delay plus the whole timeout.
+func TestDialTimeout_OneDeadlineForTheConnectAndTheHandshake(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close() // accept, then say nothing
+		}
+	}()
+	const timeout, connectDelay = time.Second, 700 * time.Millisecond
+	old := dialConn
+	t.Cleanup(func() { dialConn = old })
+	dialConn = func(addr string, deadline time.Time) (net.Conn, error) {
+		time.Sleep(connectDelay) // a connect that takes most of the budget
+		return old(addr, deadline)
+	}
+	cfg := &gossh.ClientConfig{User: "root", HostKeyCallback: gossh.InsecureIgnoreHostKey()}
+	start := time.Now()
+	if _, err := dialTimeout(ln.Addr().String(), cfg, timeout, true); err == nil {
+		t.Fatal("a handshake with a silent server succeeded")
+	}
+	if took := time.Since(start); took > timeout+300*time.Millisecond {
+		t.Errorf("the dial took %s, past its %s bound", took, timeout)
+	}
+}

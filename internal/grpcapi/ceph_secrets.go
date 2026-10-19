@@ -599,10 +599,18 @@ func (s *Server) ReconcileCephSecrets(ctx context.Context) {
 
 // CephMonitorsForPool is the monitor list a domain's rbd disk on litevirt pool
 // `name` is given on this host now (lv.SetCephMonitorResolver): the pool's
-// mon_host option, else its conf's mon_host. ok is false when this host has no
-// such ceph pool, or its conf cannot be read.
+// mon_host option, else its conf's mon_host. A pool this host's table has
+// that the pool list has not loaded yet (right after a restart) is read from
+// the table: its locator's recorded monitors are never given in its place.
+// ok is false when this host has no such ceph pool, or its conf cannot be
+// read.
 func (s *Server) CephMonitorsForPool(name string) ([]string, bool) {
 	ref, ok := s.lookupStoragePool(name)
+	if !ok && name != "" && s.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), cephPoolTableReadTimeout)
+		ref, ok, _ = s.resolvePoolErr(ctx, name)
+		cancel()
+	}
 	if !ok || !strings.EqualFold(ref.Driver, "ceph") {
 		return nil, false
 	}
@@ -622,6 +630,10 @@ func (s *Server) CephMonitorsForPool(name string) ([]string, bool) {
 	}
 	return mons, true
 }
+
+// cephPoolTableReadTimeout bounds CephMonitorsForPool's read of a pool the
+// pool list has not loaded.
+const cephPoolTableReadTimeout = 5 * time.Second
 
 // refuseRBDDisk refuses an operation litevirt does not implement for ceph
 // (rbd) disks, with that reason, rather than letting it fail on a path that is

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -330,7 +331,39 @@ func (s *Server) domainIsVMsOwn(ctx context.Context, name, specUUID, diskOwner s
 	if len(mine) == 0 {
 		return false, du, fmt.Sprintf("the VM's row records no disk on %s", s.hostName), nil
 	}
-	on, rbdWhy, derr := domainDiskMatch(x, mine)
+	// An rbd disk's cluster is its pool's on this host when this host has
+	// that pool, read from the table when the pool list has not loaded it.
+	// A pool that cannot be read, or gives no monitors, makes that disk's
+	// cluster unknown, so it is not matched at all: never by the monitors
+	// its locator recorded.
+	var unknown string
+	mine = slices.DeleteFunc(mine, func(p string) bool {
+		l, ok := storage.ParseCephLocator(p)
+		if !ok || l.Opts["lvpool"] == "" {
+			return false
+		}
+		name := l.Opts["lvpool"]
+		ref, found, err := s.resolvePoolErr(ctx, name)
+		why := ""
+		switch {
+		case err != nil:
+			why = fmt.Sprintf("whether %s has pool %s cannot be read (%v)", s.hostName, name, err)
+		case found && !strings.EqualFold(ref.Driver, "ceph"):
+			why = fmt.Sprintf("pool %s on %s is a %s pool, not a ceph one", name, s.hostName, ref.Driver)
+		case found:
+			if _, ok := s.CephMonitorsForPool(name); !ok {
+				why = fmt.Sprintf("the monitors of pool %s on %s cannot be read", name, s.hostName)
+			}
+		}
+		if why != "" && unknown == "" {
+			unknown = fmt.Sprintf("the Ceph cluster of its rbd disk %s cannot be told: %s", l.Spec, why)
+		}
+		return why != ""
+	})
+	if len(mine) == 0 {
+		return false, du, unknown, nil
+	}
+	on, rbdWhy, derr := domainDiskMatch(x, mine, s.CephMonitorsForPool)
 	if derr != nil {
 		return false, du, "", derr
 	}
@@ -338,6 +371,8 @@ func (s *Server) domainIsVMsOwn(ctx context.Context, name, specUUID, diskOwner s
 		why = fmt.Sprintf("none of its disks is one of the %d the VM's row records on %s", len(mine), s.hostName)
 		if rbdWhy != "" {
 			why = rbdWhy
+		} else if unknown != "" {
+			why = unknown
 		}
 	}
 	return on, du, why, nil
@@ -354,14 +389,16 @@ func (s *Server) domainIsVMsOwn(ctx context.Context, name, specUUID, diskOwner s
 // cannot be looked at (a hard mount whose server is gone) is an error:
 // whether the domain runs on it is not known.
 func domainRunsOnAny(domXML string, paths []string) (bool, error) {
-	on, _, err := domainDiskMatch(domXML, paths)
+	on, _, err := domainDiskMatch(domXML, paths, lv.CephPoolMonitors)
 	return on, err
 }
 
 // domainDiskMatch is domainRunsOnAny, and, when it matched nothing, why an
 // rbd disk of the domain that is the pool/image of one of paths is not that
 // disk ("" when none is): its Ceph cluster is another, or cannot be told.
-func domainDiskMatch(domXML string, paths []string) (bool, string, error) {
+// poolMonitors is a litevirt pool's current monitors on this host
+// (Server.CephMonitorsForPool).
+func domainDiskMatch(domXML string, paths []string, poolMonitors func(string) ([]string, bool)) (bool, string, error) {
 	if len(paths) == 0 {
 		return false, "", nil
 	}
@@ -407,7 +444,7 @@ func domainDiskMatch(domXML string, paths []string) (bool, string, error) {
 				if !ok || l.Spec != d.Source.Name {
 					continue
 				}
-				if rbdSameCluster(mons, d.Source.Config.File, l) {
+				if rbdSameCluster(mons, d.Source.Config.File, l, poolMonitors) {
 					return true, "", nil
 				}
 				if rbdWhy == "" {
@@ -541,13 +578,13 @@ func rbdClusterMismatch(spec string, dom []cephMon, domConf string) string {
 // that cannot be known (a conf or the default ceph.conf unreadable, or naming
 // no monitor, or a domain that names a <config file> of its own and no
 // monitor) is not the same.
-func rbdSameCluster(dom []cephMon, domConf string, l storage.CephLocator) bool {
+func rbdSameCluster(dom []cephMon, domConf string, l storage.CephLocator, poolMonitors func(string) ([]string, bool)) bool {
 	if len(dom) == 0 && domConf != "" {
 		// The domain reads its cluster from a conf of its own, which says
 		// nothing this host can compare.
 		return false
 	}
-	ms, known := rbdLocatorMonitors(l, lv.CephPoolMonitors)
+	ms, known := rbdLocatorMonitors(l, poolMonitors)
 	if !known {
 		return false
 	}

@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/storage"
 )
@@ -356,6 +357,9 @@ func TestRebuildVM_NeverDestroysAnRBDDomainOnAPassedOverSource(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ran = nil
 			s, fake := promoteFixture(t)
+			// ceph1 is on this host, on cluster A, as the resolver says.
+			s.addStoragePoolRef("ceph1", StoragePoolRef{Driver: "ceph", Source: "lv",
+				Options: map[string]string{"id": "litevirt", "keyring": "/k", "mon_host": "10.0.0.1:6789"}})
 			if err := s.db.Execute(adminCtx(), `UPDATE vm_disks SET path = ?, storage_type = 'ceph' WHERE vm_name = 'vm1'`, tc.recorded); err != nil {
 				t.Fatal(err)
 			}
@@ -405,4 +409,105 @@ func TestRebuildVM_NeverDestroysAnRBDDomainOnAPassedOverSource(t *testing.T) {
 			t.Errorf("domainIsVMsOwn = %v, %q, %v; want the VM's own", own, why, err)
 		}
 	})
+}
+
+// Right after a restart this host's pool list may not hold a pool its table
+// has. The pool's current monitors are still the cluster a domain defined now
+// is given — read from the table — never the monitors the locator recorded:
+// a domain on those (cluster B) is not the VM's runtime, and one on the
+// pool's (cluster A) is.
+//
+// Mutation: read the pool from the loaded list only, in both
+// CephMonitorsForPool and domainIsVMsOwn's pool check — "on B" is taken for
+// the VM's, and "on A" is not, red. (Either table read alone keeps it green:
+// the pool check loads the list for CephMonitorsForPool.)
+func TestDomainIsVMsOwn_RBDPoolInTheTableNotYetLoaded(t *testing.T) {
+	withDefaultCephConf(t, "")
+	for _, tc := range []struct {
+		name string
+		mon  string
+		want bool
+	}{
+		{"on B, the locator's recorded monitor", "10.0.9.1:6789", false},
+		{"on A, the pool's monitor", "10.0.0.1:6789", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, fake := promoteFixture(t)
+			if err := corrosion.UpsertStoragePool(adminCtx(), s.db, corrosion.StoragePoolRecord{
+				HostName: s.hostName, Name: "ceph1", Driver: "ceph", Source: "lv", State: "active",
+				Options: map[string]string{"id": "litevirt", "keyring": "/k", "mon_host": "10.0.0.1:6789"},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.db.Execute(adminCtx(), `UPDATE vm_disks SET path = ?, storage_type = 'ceph' WHERE vm_name = 'vm1'`,
+				`rbd:lv/vm1-root:id=litevirt:keyring=/k:lvpool=ceph1:mon_host=10.0.9.1\:6789`); err != nil {
+				t.Fatal(err)
+			}
+			if err := fake.DefineDomain(rbdDomain("eeeeeeee-0000-0000-0000-000000000044", "lv/vm1-root", tc.mon)); err != nil {
+				t.Fatal(err)
+			}
+			own, _, why, err := s.domainIsVMsOwn(adminCtx(), "vm1", "aaaaaaaa-0000-0000-0000-000000000001", "vm1")
+			if err != nil || own != tc.want {
+				t.Errorf("domainIsVMsOwn = %v, %q, %v; want %v", own, why, err, tc.want)
+			}
+		})
+	}
+}
+
+// A pool of the locator's name that this host has but cannot give monitors
+// for (not a ceph pool, or its conf cannot be read) makes the cluster
+// unknown: no domain is the VM's by that disk, not even one on the monitors
+// the locator recorded.
+//
+// Mutation: fall back to the locator's mon_host when the pool gives no
+// monitors (the renderer's order alone) — both cases red.
+func TestDomainIsVMsOwn_RBDPoolWithoutMonitorsIsUnknown(t *testing.T) {
+	withDefaultCephConf(t, "")
+	for _, tc := range []struct {
+		name string
+		ref  StoragePoolRef
+	}{
+		{"not a ceph pool", StoragePoolRef{Driver: "dir", Target: "/var/lib/x"}},
+		{"conf unreadable", StoragePoolRef{Driver: "ceph", Source: "lv", Options: map[string]string{"conf": "/nonexistent/c.conf"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, fake := promoteFixture(t)
+			s.addStoragePoolRef("ceph1", tc.ref)
+			if err := s.db.Execute(adminCtx(), `UPDATE vm_disks SET path = ?, storage_type = 'ceph' WHERE vm_name = 'vm1'`,
+				`rbd:lv/vm1-root:id=litevirt:keyring=/k:lvpool=ceph1:mon_host=10.0.9.1\:6789`); err != nil {
+				t.Fatal(err)
+			}
+			if err := fake.DefineDomain(rbdDomain("eeeeeeee-0000-0000-0000-000000000045", "lv/vm1-root", "10.0.9.1:6789")); err != nil {
+				t.Fatal(err)
+			}
+			own, _, why, err := s.domainIsVMsOwn(adminCtx(), "vm1", "aaaaaaaa-0000-0000-0000-000000000001", "vm1")
+			if err != nil || own {
+				t.Errorf("domainIsVMsOwn = %v, %q, %v; want not the VM's", own, why, err)
+			}
+			if !strings.Contains(why, "ceph1") {
+				t.Errorf("why %q does not name the pool", why)
+			}
+		})
+	}
+}
+
+// The renderer's monitors for a litevirt pool (CephMonitorsForPool, the
+// daemon's lv.SetCephMonitorResolver) are the pool's from this host's table
+// when the pool list has not loaded it yet, as a domain defined right after
+// a restart must be given them.
+//
+// Mutation: the loaded list only — no monitors, and the renderer falls back
+// to the locator's recorded mon_host, red.
+func TestCephMonitorsForPool_ReadsAPoolNotYetLoaded(t *testing.T) {
+	s := testServerWithLocks(t)
+	if err := corrosion.UpsertStoragePool(context.Background(), s.db, corrosion.StoragePoolRecord{
+		HostName: "test-host", Name: "ceph1", Driver: "ceph", Source: "lv", State: "active",
+		Options: map[string]string{"mon_host": "10.0.0.1:6789"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mons, ok := s.CephMonitorsForPool("ceph1")
+	if !ok || len(mons) != 1 || mons[0] != "10.0.0.1:6789" {
+		t.Errorf("CephMonitorsForPool = %v, %v; want [10.0.0.1:6789]", mons, ok)
+	}
 }

@@ -470,10 +470,22 @@ the cluster has published.`,
 
 func newHostRmCmd() *cobra.Command {
 	var force, dead, dryRun bool
+	var serial, address string
 	cmd := &cobra.Command{
 		Use:   "rm <host>",
 		Short: "Remove host from cluster",
 		Long: `Removes a host: revokes its certificate, publishes the CRL, and deletes its row.
+
+--serial removes one admission, selected by its certificate rather than by the
+row the name has now. When the row of <host> holds that certificate it is the
+removal above, refused if the row changes first. Otherwise no row is touched
+(the admission's row is gone, or <host> is now another admission): the serial
+is revoked and the CRL published, and what its adds left on the machine at
+--address (staged files and install record, never the installed identity) is
+removed. --address is required then; the machine is checked first, and a
+certificate it serves without an unfinished add's claim for it is refused as a
+possibly completed add. 'lv host add' names this command when it refuses a
+machine it cannot prove is its own to install on.
 
 --dead removes a host that is fenced proof-grade and gone for good, so the
 recoveries decided for it can move on (recovery claims, docs/design/recovery-claims.md
@@ -488,9 +500,18 @@ anything.`,
 			if dryRun && !dead {
 				return fmt.Errorf("--dry-run applies to --dead")
 			}
+			if dead && serial != "" {
+				return fmt.Errorf("--serial does not apply to --dead")
+			}
+			if address != "" && serial == "" {
+				return fmt.Errorf("--address applies to --serial")
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				if dead {
 					return cli.HostRemoveDead(ctx, c, args[0], dryRun)
+				}
+				if serial != "" {
+					return cli.HostRemoveAdmission(ctx, c, args[0], serial, address, force)
 				}
 				return cli.HostRemove(ctx, c, args[0], force)
 			})
@@ -499,6 +520,8 @@ anything.`,
 	cmd.Flags().BoolVar(&force, "force", false, "Force removal even if VMs exist")
 	cmd.Flags().BoolVar(&dead, "dead", false, "Remove a host that is fenced proof-grade and gone for good, unblocking recoveries decided for it")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "With --dead: run every check and print the plan, changing nothing")
+	cmd.Flags().StringVar(&serial, "serial", "", "Remove only the admission of this certificate serial (hex)")
+	cmd.Flags().StringVar(&address, "address", "", "With --serial: the machine the admission's add was run against (IPv4)")
 	return cmd
 }
 

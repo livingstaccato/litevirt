@@ -200,7 +200,7 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 		return fmt.Errorf("list the cluster's hosts before adding %s: %w", p.hostName, err)
 	}
 	hosts := hostsResp.GetHosts()
-	installed, err := remoteSerial(r, hostCrt)
+	installedPEM, installed, err := remoteCert(r, hostCrt)
 	if err != nil {
 		return err
 	}
@@ -213,6 +213,10 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 		return err
 	}
 	var files []addFile
+	// What this attempt may replace: what it finds, for a new admission. A
+	// retry of an admission keeps what that admission's first attempt found
+	// (recordedExpect), never what the retry finds.
+	exp := addExpect{known: true, serial: installed}
 	// An earlier add of this machine under this name: finish it with the
 	// certificate it was admitted with, which the machine holds installed
 	// or staged, or say that it already finished.
@@ -233,13 +237,22 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 			pair, where, err := admittedPairOnMachine(r, admittedSerial, installed == admittedSerial)
 			if err != nil {
 				return fmt.Errorf("the key %s holds beside its admitted certificate %s does not match it (%v), so "+
-					"its daemon could not load the pair. Undo the admission with `lv host rm %s`, then run `%s` again",
-					p.hostName, admittedSerial, err, p.hostName, p.rerun)
+					"its daemon could not load the pair. Undo the admission with `%s`, then run `%s` again",
+					p.hostName, admittedSerial, err, settleCmd(p, admittedSerial), p.rerun)
 			}
 			if where == pairAbsent {
+				if installed != "" {
+					return settled(fmt.Sprintf("%s is admitted (joining) with certificate %s, which the host holds neither "+
+						"installed nor staged; it serves certificate %s, which is not that admission's, so this add changes "+
+						"nothing. `%s` undoes the admission and leaves %s in place",
+						p.hostName, admittedSerial, installed, settleCmd(p, admittedSerial), installed))
+				}
 				return fmt.Errorf("%s is admitted (joining) with certificate %s, which the host holds neither installed "+
-					"nor staged. Undo the admission with `lv host rm %s`, then run `%s` again",
-					p.hostName, admittedSerial, p.hostName, p.rerun)
+					"nor staged. Undo the admission with `%s`, then run `%s` again",
+					p.hostName, admittedSerial, settleCmd(p, admittedSerial), p.rerun)
+			}
+			if exp, err = recordedExpect(r, admittedSerial); err != nil {
+				return err
 			}
 			serial, pairOnMachine = admittedSerial, true
 			if where != pairInstalled {
@@ -250,6 +263,12 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 				legacyPair = where == pairStagedLegacy
 			}
 		}
+	}
+	// Checked again right before the install (refuseSecondInstall); here,
+	// so that a machine this add may not install on gets no admission and
+	// no staged file of it.
+	if err := refuseUnproven(r, p, serial, exp, installedPEM, installed); err != nil {
+		return err
 	}
 
 	// This machine's copies of what the add mints: in a private directory of
@@ -291,13 +310,24 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 
 	// Upload everything to its staged path. Nothing it replaces yet.
 	var wrote []string
+	record := addRecordPath(tag)
 	unstage := func() {
-		if _, err := r.Shell("unstage", removeCmd(r, stagedPaths(wrote, tag))); err != nil {
+		if _, err := r.Shell("unstage", removeCmd(r, append(stagedPaths(wrote, tag), record))); err != nil {
 			slog.Warn("could not remove the files staged on the host", "error", err)
 		}
 	}
 	if err := r.Run("mkdir -p " + ssh.ShellQuote(remotePKIDir) + " && mkdir -p -m 0700 " + ssh.ShellQuote(remoteMigrationDir)); err != nil {
 		return fmt.Errorf("create remote PKI dir: %w", err)
+	}
+	// The attempt's record of what the machine served before the admission,
+	// staged before its pair, so a retry of the admission finds it beside the
+	// pair it reuses. Unknown (an earlier release staged the pair without
+	// one) is recorded as nothing.
+	if exp.known {
+		if err := r.WriteFile(record, []byte(addRecordLine(p.hostName, exp.serial)), 0o600); err != nil {
+			unstage()
+			return fmt.Errorf("record what the host serves before adding it (nothing was admitted or installed): %w", err)
+		}
 	}
 	for _, f := range append(files, addFile{remoteBinary, bin, 0o755}) {
 		if f.data == nil {
@@ -330,9 +360,15 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 	}
 	keepLocal(minted, p.pkiDir, p.hostName)
 	failed := func(err error) error {
+		// A refusal over a machine state nothing proves is this add's names
+		// its own settling command, and no rerun.
+		var s *settleError
+		if errors.As(err, &s) {
+			return err
+		}
 		return fmt.Errorf("%w\n%s is admitted to the cluster (joining) with certificate %s and counts as a voter "+
-			"until it starts. Run `%s` to finish the add, or `lv host rm %s` to undo the admission",
-			err, p.hostName, serial, p.rerun, p.hostName)
+			"until it starts. Run `%s` to finish the add, or `%s` to undo the admission",
+			err, p.hostName, serial, p.rerun, settleCmd(p, serial))
 	}
 	// The pair it installs is the admitted one: its own attempt's, checked
 	// again now that the cluster has answered.
@@ -354,7 +390,7 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 	// Of two adds of this machine, the second to get here installs nothing,
 	// whatever its admission's stamp: the machine says another add installed
 	// since this one began, holds the machine, or installed another name.
-	prior, err := refuseSecondInstall(r, p, serial, installed, nonce)
+	prior, err := refuseSecondInstall(r, p, serial, exp, nonce)
 	if err != nil {
 		return failed(err)
 	}
@@ -433,7 +469,7 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 		}
 		discard = append(discard, path)
 	}
-	if _, err := r.Shell("discard", m.cmd(removeCmd(r, suffixed(discard, suffix)))); err != nil {
+	if _, err := r.Shell("discard", m.cmd(removeCmd(r, append(suffixed(discard, suffix), record)))); err != nil {
 		slog.Warn("could not remove the copies of the replaced identity files", "suffix", suffix, "error", err)
 	}
 	if err := m.give(fmt.Sprintf("%s %s %d %s installed", p.hostName, serial, claimedAt, nonce)); err != nil {
@@ -447,17 +483,211 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 	return addedLocally(p)
 }
 
-// remoteSerial is the serial of the certificate at path on the machine, ""
+// remoteCert is the certificate at path on the machine and its serial, ""
 // when there is none.
-func remoteSerial(r addRemote, path string) (string, error) {
+func remoteCert(r addRemote, path string) ([]byte, string, error) {
 	b, ok, err := r.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("read the host's %s before adding it: %w", filepath.Base(path), err)
+		return nil, "", fmt.Errorf("read the host's %s before adding it: %w", filepath.Base(path), err)
 	}
 	if !ok {
-		return "", nil
+		return nil, "", nil
 	}
-	return installedSerial(b), nil
+	return b, installedSerial(b), nil
+}
+
+// addExpect is what an add may find installed on the machine and replace:
+// the certificate serial ("" for none) the admission's first attempt found
+// there. known is false when no attempt recorded it (an earlier release's
+// staged add); recorded says it is that first attempt's record, not this
+// attempt's own finding.
+type addExpect struct {
+	known, recorded bool
+	serial          string
+}
+
+// addRecordPath is where the attempt tag records what the machine served
+// before it: beside its staged certificate, so `lv host rm` removes it with
+// the serial's staged files.
+func addRecordPath(tag string) string {
+	return addStagedPath(filepath.Join(remotePKIDir, "host.crt"), tag) + ".before"
+}
+
+// addRecordLine is an attempt record: the name it adds, and the serial the
+// machine served before it ("-" for none).
+func addRecordLine(name, before string) string {
+	if before == "" {
+		before = "-"
+	}
+	return name + " " + before + "\n"
+}
+
+// addRecord is one attempt record found on the machine.
+type addRecord struct {
+	tag, name, serial, before string
+}
+
+// addRecords lists every attempt record on the machine; with serial, only
+// that admission's.
+func addRecords(r addRemote, serial string) ([]addRecord, error) {
+	crt := filepath.Join(remotePKIDir, "host.crt")
+	prefix := addStagedPath(crt, "")
+	glob := prefix + serial
+	out, err := r.Shell("records", fmt.Sprintf("for f in %s*.before; do [ -e \"$f\" ] && printf '%%s\\n' \"$f\"; done; true",
+		ssh.ShellQuote(r.Path(glob))))
+	if err != nil {
+		return nil, fmt.Errorf("list the add records on the host: %w", err)
+	}
+	var recs []addRecord
+	for _, l := range strings.Split(string(out), "\n") {
+		if l == "" {
+			continue
+		}
+		tag, ok := strings.CutPrefix(r.Unpath(l), prefix)
+		if !ok {
+			continue
+		}
+		tag = strings.TrimSuffix(tag, ".before")
+		s, n, ok := strings.Cut(tag, "-")
+		if !ok || !validAttemptTag(s) || !validAttemptTag(n) || (serial != "" && s != serial) {
+			continue
+		}
+		b, ok, err := r.ReadFile(addRecordPath(tag))
+		if err != nil {
+			return nil, err
+		}
+		f := strings.Fields(string(b))
+		if !ok || len(f) != 2 || (f[1] != "-" && !validAttemptTag(f[1])) {
+			continue
+		}
+		rec := addRecord{tag: tag, name: f[0], serial: s, before: f[1]}
+		if rec.before == "-" {
+			rec.before = ""
+		}
+		recs = append(recs, rec)
+	}
+	return recs, nil
+}
+
+// recordedExpect is what the first attempt of the admission serial found on
+// the machine, from the records its attempts staged: unknown when there is
+// none, or when they disagree.
+func recordedExpect(r addRemote, serial string) (addExpect, error) {
+	recs, err := addRecords(r, serial)
+	if err != nil || len(recs) == 0 {
+		return addExpect{}, err
+	}
+	for _, rec := range recs[1:] {
+		if rec.before != recs[0].before {
+			return addExpect{}, nil
+		}
+	}
+	return addExpect{known: true, recorded: true, serial: recs[0].before}, nil
+}
+
+// revokedHere reports whether certificate (PEM) was issued by the cluster CA
+// in pkiDir and is revoked in its CRL: a host `lv host rm` removed. Another
+// CA's certificate of the same serial is not.
+func revokedHere(pkiDir string, certPEM []byte) bool {
+	blk, _ := pem.Decode(certPEM)
+	if blk == nil {
+		return false
+	}
+	cert, err := x509.ParseCertificate(blk.Bytes)
+	if err != nil {
+		return false
+	}
+	caPEM, err := os.ReadFile(filepath.Join(pkiDir, "ca.crt"))
+	if err != nil {
+		return false
+	}
+	cblk, _ := pem.Decode(caPEM)
+	if cblk == nil {
+		return false
+	}
+	ca, err := x509.ParseCertificate(cblk.Bytes)
+	if err != nil || cert.CheckSignatureFrom(ca) != nil {
+		return false
+	}
+	return pki.IsCertRevoked(pkiDir, cert.SerialNumber)
+}
+
+// serialRevokedHere reports whether the cluster CA's CRL in pkiDir revokes
+// serial (hex): the admission of that serial was removed.
+func serialRevokedHere(pkiDir, serial string) bool {
+	sn, ok := new(big.Int).SetString(serial, 16)
+	return ok && pki.IsCertRevoked(pkiDir, sn)
+}
+
+// settleError is a refusal over a machine state that nothing proves is this
+// add's. Its message names the one command that settles it, and no rerun.
+type settleError struct{ msg string }
+
+func (e *settleError) Error() string { return e.msg }
+
+func settled(msg string) error { return &settleError{msg} }
+
+// settleCmd is the command that undoes the admission of serial for p, and
+// only that admission: the row of p's name if it holds that certificate,
+// otherwise no row (its staged files on the machine and its revocation).
+func settleCmd(p hostAddPlan, serial string) string {
+	return fmt.Sprintf("lv host rm %s --serial %s --address %s", p.hostName, serial, p.hostAddr)
+}
+
+// refuseUnproven refuses an add that would replace what nothing proves it
+// may: the machine's certificate now (nowPEM, serial now) must be the
+// admission's own (serial), what exp says the admission's first attempt
+// found, nothing when that is unknown, or a certificate this cluster
+// revoked. Nor may another add's attempt record on the machine stand
+// unsettled over a certificate it did not find: the machine changed after
+// an add that neither finished nor was undone.
+func refuseUnproven(r addRemote, p hostAddPlan, serial string, exp addExpect, nowPEM []byte, now string) error {
+	ok := (serial != "" && now == serial) || (exp.known && now == exp.serial) || (!exp.known && now == "") ||
+		(now != "" && revokedHere(p.pkiDir, nowPEM))
+	if !ok {
+		found := "no certificate"
+		if exp.serial != "" {
+			found = "certificate " + exp.serial
+		}
+		var what string
+		switch {
+		case !exp.recorded && exp.known:
+			// This attempt's own finding, at its start.
+			return settled(fmt.Sprintf("the machine's certificate changed since this add began (it serves %s now, "+
+				"not %s): another add installed on it first, and this one installs nothing. `%s` undoes this add's "+
+				"admission and leaves %s in place", now, found, settleCmd(p, serial), now))
+		case exp.known:
+			what = fmt.Sprintf("its first attempt found %s there", found)
+		default:
+			what = "an earlier release's add staged it without recording what the machine served"
+		}
+		return settled(fmt.Sprintf("%s is admitted with certificate %s, and %s; the machine serves certificate %s "+
+			"now, which nothing proves is this admission's or revoked by this cluster, so this add stops nothing and "+
+			"installs nothing. `%s` undoes the admission and leaves %s in place",
+			p.hostName, serial, what, now, settleCmd(p, serial), now))
+	}
+	if now == "" || now == serial {
+		return nil
+	}
+	recs, err := addRecords(r, "")
+	if err != nil {
+		return err
+	}
+	for _, rec := range recs {
+		if rec.serial == serial || rec.serial == now || rec.before == now || serialRevokedHere(p.pkiDir, rec.serial) {
+			continue
+		}
+		found := "no certificate"
+		if rec.before != "" {
+			found = "certificate " + rec.before
+		}
+		other := hostAddPlan{hostName: rec.name, hostAddr: p.hostAddr}
+		return settled(fmt.Sprintf("an earlier add of this machine as %s (certificate %s, attempt %s) found %s here "+
+			"and was neither finished nor undone; the machine serves certificate %s now, which nothing proves is that "+
+			"add's, so this add changes nothing. `%s` settles that add and leaves %s in place",
+			rec.name, rec.serial, rec.tag, found, now, settleCmd(other, rec.serial), now))
+	}
+	return nil
 }
 
 // liveHost is the listed (live) row of name, or nil.
@@ -1413,21 +1643,21 @@ func exitStatus(err error) int {
 	return -1
 }
 
-// refuseSecondInstall refuses to install serial for p when another add has
-// the machine: its certificate is no longer the one this add found
-// (installed) nor serial; or its install record (addInstalledMarker) is
-// another add's claim younger than staleClaim, or an install of another name
-// less than freshInstall ago whose certificate this machine's CRL does not
-// revoke (`lv host rm` revokes it). It returns the record it read, which the
-// claim then replaces only if it is still there (machineClaim.take).
-func refuseSecondInstall(r addRemote, p hostAddPlan, serial, installed, nonce string) (string, error) {
-	now, err := remoteSerial(r, filepath.Join(remotePKIDir, "host.crt"))
+// refuseSecondInstall refuses to install serial for p when the machine is not
+// this add's to install on: its certificate is not one exp, serial or this
+// cluster's CRL proves it may replace (refuseUnproven); or its install record
+// (addInstalledMarker) is another add's claim younger than staleClaim, or
+// another admission's install (whatever its name) less than freshInstall ago
+// whose certificate this cluster's CRL does not revoke (`lv host rm` revokes
+// it). It returns the record it read, which the claim then replaces only if
+// it is still there (machineClaim.take).
+func refuseSecondInstall(r addRemote, p hostAddPlan, serial string, exp addExpect, nonce string) (string, error) {
+	nowPEM, now, err := remoteCert(r, filepath.Join(remotePKIDir, "host.crt"))
 	if err != nil {
 		return "", err
 	}
-	if now != installed && now != serial {
-		return "", fmt.Errorf("the machine's certificate changed since this add began (it serves %s now): another add "+
-			"installed on it first, and this one installs nothing", now)
+	if err := refuseUnproven(r, p, serial, exp, nowPEM, now); err != nil {
+		return "", err
 	}
 	b, ok, err := r.ReadFile(addInstalledMarker)
 	if err != nil || !ok {
@@ -1445,17 +1675,16 @@ func refuseSecondInstall(r addRemote, p hostAddPlan, serial, installed, nonce st
 			"%s), and this one installs nothing. Run this again once it has finished; if it died, after %s",
 			f[3], f[0], f[1], when.UTC().Format(time.RFC3339), when.Add(staleClaim).UTC().Format(time.RFC3339))
 	}
-	if f[0] == p.hostName || time.Since(when) >= freshInstall {
+	// The record's admission, not its name, decides: the same name may be
+	// another admission's (one this replica has not received, say).
+	other := strings.ToLower(f[1])
+	if other == serial || time.Since(when) >= freshInstall || serialRevokedHere(p.pkiDir, other) {
 		return prior, nil
 	}
-	if sn, ok := new(big.Int).SetString(f[1], 16); ok && pki.IsCertRevoked(p.pkiDir, sn) {
-		return prior, nil
-	}
-	return "", fmt.Errorf("another add installed this machine as %s (certificate %s) at %s, and this one installs "+
-		"nothing: a machine is admitted under one name. Remove the admission you do not want (`lv host rm %s` or "+
-		"`lv host rm %s`, which revokes its certificate); otherwise a later add of the machine under another name "+
-		"waits until %s, or until %s is removed from the host", f[0], f[1], when.UTC().Format(time.RFC3339),
-		p.hostName, f[0], when.Add(freshInstall).UTC().Format(time.RFC3339), addInstalledMarker)
+	return "", settled(fmt.Sprintf("another admission installed this machine as %s (certificate %s) at %s, and this "+
+		"cluster has not revoked that certificate, so this add installs nothing: a machine is admitted under one "+
+		"name. `%s` undoes this add's admission and leaves %s's in place",
+		f[0], f[1], when.UTC().Format(time.RFC3339), settleCmd(p, serial), f[0]))
 }
 
 // readPair reads the certificate at crt and the key at key on the host, and

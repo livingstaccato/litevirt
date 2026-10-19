@@ -152,11 +152,35 @@ installs, each file it replaces in `/etc/litevirt/pki` is kept beside it as
 `<file>.pre-add-<time>` (0600): the copies are put back if the add fails after
 the admission, and removed once it succeeds. A host admitted by an add that
 did not finish shows `HOST_JOINING`: run the same `lv host add` again, from
-any machine holding the cluster CA, to finish it, or `lv host rm <name>` to
-undo the admission. That removal also deletes the files every attempt left
+any machine holding the cluster CA, to finish it, or
+`lv host rm <name> --serial <serial> --address <ip>` to undo the admission.
+That removal also deletes the files every attempt left
 staged under the revoked serial on the machine (the config's beside the file
 `config.yaml` resolves to), when it can reach the machine over
-SSH as root within 10 seconds. A rerun refuses when the key staged or installed
+SSH as root within 10 seconds.
+
+Each attempt records, beside its staged certificate
+(`.host.crt.add-<serial>-<nonce>.before`), the certificate the machine served
+before it. A rerun of an admission keeps what its first attempt recorded: it
+installs only over that certificate, the admission's own, or one this
+cluster's CRL revokes, and otherwise stops nothing and installs nothing. An
+earlier release's staged add recorded nothing, so its rerun installs only on
+a machine serving no certificate, the admission's own, or a revoked one. Any add also refuses, before it is
+admitted, a machine on which another add's attempt was neither finished nor
+undone and that now serves a certificate that attempt did not find. Each
+refusal names the certificate the machine serves and
+`lv host rm <name> --serial <serial> --address <ip>`, which settles the
+unfinished admission and leaves that certificate in place.
+
+`lv host rm <name> --serial <serial> --address <ip>` selects an admission by
+its certificate. When the row of `<name>` holds it, this is `lv host rm
+<name>`, refused if the row changes first. When no row holds it (the
+admission's row is gone, or `<name>` is now another admission), no row is
+touched: the serial is revoked, the CRL published, and the staged files and
+install record of that serial removed from the machine at `--address`. It
+refuses a serial another name's row holds, and one the machine serves without
+an unfinished add's claim for it in `/etc/litevirt/.lv-add-installed` (it may
+be a completed add). A rerun refuses when the key staged or installed
 on the machine is not the admitted certificate's. The machine running
 `lv host add` keeps its copy of the admitted credentials in
 `hosts/<name>/` under its pki directory.
@@ -181,9 +205,9 @@ nothing, and never acts on a machine another add has claimed since. Without
 `flock` (util-linux) on the machine the add refuses. Another add of the machine
 is refused while the claim is younger than 10 minutes (setup holds the lock
 while it runs); an older claim is an add that died, and is taken over. An add
-that finds the machine's certificate changed since it began, or another name
-installed there in the last hour whose certificate this machine's CRL does not
-revoke, installs nothing: of two adds of one machine, the second to install is
+that finds the machine's certificate changed since it began, or another
+admission (under any name) installed there in the last hour whose certificate
+this machine's CRL does not revoke, installs nothing: of two adds of one machine, the second to install is
 refused, whatever its admission. A rollback moves back only files that are
 what that add installed. `lv host rm` removes the record of the admission it
 revoked only while it is still that record, in one locked command.

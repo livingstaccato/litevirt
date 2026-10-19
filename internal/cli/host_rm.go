@@ -42,6 +42,12 @@ import (
 // the cluster CA's private key, which lives with the operator and never on a
 // daemon. So this command produces the CRL and PublishCRL hands it to the cluster.
 func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force bool) error {
+	return hostRemove(ctx, c, hostName, force, "")
+}
+
+// hostRemove is HostRemove of the row of hostName, refused before anything
+// is revoked unless that row holds certificate want ("" for any).
+func hostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force bool, want string) error {
 	// A current voter keeps its vote whatever its hosts row says, so the daemon
 	// refuses to remove one. Ask BEFORE revoking: the revocation below is not
 	// undone by that refusal, and a revoked voter can no longer sign a vote.
@@ -53,7 +59,7 @@ func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force
 	// deliberately hides the row and there is no supported way to recover its
 	// certificate serial. A mint or publish failure must therefore leave the row
 	// intact so the operator can repair the cause and retry this command.
-	serial, version, err := revokeAndPublish(ctx, c, &pb.RemoveHostRequest{Name: hostName, Force: force})
+	serial, version, err := revokeAndPublish(ctx, c, &pb.RemoveHostRequest{Name: hostName, Force: force, ExpectedCertSerial: want})
 	if err != nil {
 		return err
 	}
@@ -72,6 +78,9 @@ func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force
 	rerun := "lv host rm " + hostName
 	if force {
 		rerun = "lv host rm --force " + hostName
+	}
+	if want != "" {
+		rerun += " --serial " + want
 	}
 	removed, err := removeAfterRevoke(ctx, c, &pb.RemoveHostRequest{Name: hostName, Force: force, ExpectedCertSerial: serial}, rerun)
 	if err != nil {
@@ -269,12 +278,16 @@ var removeRetryBackoff = []time.Duration{10 * time.Second, 20 * time.Second}
 // revokeAndPublish revokes the certificate of req's host in this machine's
 // CRL, once the daemon has said it would make the removal req asks for, and
 // publishes the CRL to the cluster: the part of a removal only the machine
-// holding the CA key can do.
+// holding the CA key can do. A request with an ExpectedCertSerial is refused,
+// before anything is revoked, unless the host's row holds that certificate.
 func revokeAndPublish(ctx context.Context, c pb.LiteVirtClient, req *pb.RemoveHostRequest) (string, int64, error) {
 	hostName := req.GetName()
 	serial, err := hostCertSerial(ctx, c, hostName)
 	if err != nil {
 		return "", 0, fmt.Errorf("read %s's certificate serial before removal: %w", hostName, err)
+	}
+	if want := req.GetExpectedCertSerial(); want != "" && !strings.EqualFold(want, serial) {
+		return "", 0, fmt.Errorf("%s's row holds certificate %s now, not %s: nothing was revoked or removed", hostName, serial, want)
 	}
 	// Ask the daemon whether it would remove the host BEFORE revoking: a
 	// refusal after the revocation leaves a member cut off from its peers
@@ -518,4 +531,115 @@ func removeInstalledMarker(r addRemote, serial string) error {
 		return fmt.Errorf("remove the record %s of the removed admission's install: %w", addInstalledMarker, err)
 	}
 	return nil
+}
+
+// HostRemoveAdmission is `lv host rm <host> --serial <serial> [--address <ip>]`:
+// the removal of one admission, selected by its certificate rather than by
+// the row the name has now.
+//
+// When the row of hostName holds serial, it is HostRemove of that row, which
+// the daemon refuses if the row changes before the removal. Otherwise no row
+// is touched: the admission has no row (it was removed, or its add stopped
+// before or after admitting it on a replica this one has not heard from),
+// or hostName's row is another admission. Then serial is revoked and the
+// CRL published, and what its adds left on the machine at address (their
+// staged files and install record, never the installed identity) is
+// removed. The machine is checked first, and a finished install of serial
+// there (a completed add) is refused, as is a serial another name's row
+// holds.
+func HostRemoveAdmission(ctx context.Context, c pb.LiteVirtClient, hostName, serial, address string, force bool) error {
+	serial = strings.ToLower(strings.TrimSpace(serial))
+	if !validAttemptTag(serial) {
+		return fmt.Errorf("--serial %q is not a certificate serial (lower-case hex)", serial)
+	}
+	if address != "" {
+		if ip := net.ParseIP(address); ip == nil || ip.To4() == nil || strings.Contains(address, ":") {
+			return fmt.Errorf("--address %q is not an IPv4 address", address)
+		}
+	}
+	resp, err := c.ListHosts(ctx, &pb.ListHostsRequest{})
+	if err != nil {
+		return fmt.Errorf("list the cluster's hosts: %w", err)
+	}
+	var named *pb.Host
+	for _, h := range resp.GetHosts() {
+		if h.GetName() == hostName {
+			named = h
+		}
+		if strings.EqualFold(h.GetCertSerial(), serial) && h.GetName() != hostName {
+			return fmt.Errorf("certificate %s is %s's, not %s's: nothing was revoked or removed", serial, h.GetName(), hostName)
+		}
+	}
+	if named != nil && strings.EqualFold(named.GetCertSerial(), serial) {
+		if address != "" && named.GetAddress() != address {
+			return fmt.Errorf("%s (certificate %s) is at %s, not %s: nothing was revoked or removed",
+				hostName, serial, named.GetAddress(), address)
+		}
+		return hostRemove(ctx, c, hostName, force, serial)
+	}
+	if address == "" {
+		return fmt.Errorf("no host row holds certificate %s; pass --address with the machine its add was run "+
+			"against, which is checked for a finished install of it before anything is revoked", serial)
+	}
+	if err := probeStagedAdmission(address, serial); err != nil {
+		return fmt.Errorf("refusing to revoke certificate %s: %w; nothing was revoked", serial, err)
+	}
+	if err := revokeHostCert(PKIDir(), hostName, serial); err != nil {
+		return err
+	}
+	version, err := publishClusterCRL(ctx, c, PKIDir())
+	if err != nil {
+		return fmt.Errorf("certificate %s is revoked in %s, but publishing the CRL failed (%w): run `lv host publish-crl`",
+			serial, filepath.Join(PKIDir(), "crl.pem"), err)
+	}
+	fmt.Printf("Revoked certificate %s in CRL %d; no host row holds it, and none was removed.\n", serial, version)
+	if named != nil {
+		fmt.Printf("  %s (certificate %s) is another admission, and was left as it is\n", hostName, named.GetCertSerial())
+	}
+	if err := removeStagedAdmission(address, serial); err != nil {
+		fmt.Printf("  could not remove the files the adds of certificate %s left on %s (%v); they are revoked. "+
+			"Remove %s/.host.crt.add-%s-* and .host.key.add-%s-* there by hand\n",
+			serial, address, err, remotePKIDir, serial, serial)
+	}
+	return nil
+}
+
+// errFinishedInstall is probeAdmission's refusal: the machine serves the
+// serial under a finished install.
+var errFinishedInstall = errors.New("the machine serves it, and does not record its install as unfinished: it may " +
+	"be a completed add, which this command does not undo")
+
+// probeStagedAdmission checks, over SSH as root, that the machine at addr
+// holds no finished install of serial (probeAdmission). A seam so the
+// removal can be tested without a host.
+var probeStagedAdmission = func(addr, serial string) error {
+	sc, err := ssh.NewClientDeadline("root@"+addr, stagedCleanupTimeout)
+	if err != nil {
+		return fmt.Errorf("could not reach %s to check it: SSH connect: %w", addr, err)
+	}
+	defer sc.Close()
+	return probeAdmission(&sshAddRemote{sshRemotePKI{sc: sc}}, serial)
+}
+
+// probeAdmission refuses (errFinishedInstall) when r serves certificate
+// serial, unless its install record is an add's claim for serial that never
+// finished: a finished install, an earlier release's record (no state), or
+// no record at all may be a completed add.
+func probeAdmission(r addRemote, serial string) error {
+	_, now, err := remoteCert(r, filepath.Join(remotePKIDir, "host.crt"))
+	if err != nil {
+		return err
+	}
+	if now != serial {
+		return nil
+	}
+	b, ok, err := r.ReadFile(addInstalledMarker)
+	if err != nil {
+		return err
+	}
+	f := strings.Fields(string(b))
+	if ok && len(f) >= 5 && strings.EqualFold(f[1], serial) && f[4] == "installing" {
+		return nil
+	}
+	return errFinishedInstall
 }

@@ -233,7 +233,13 @@ func TestHostAdd_InstallsOnlyThePairItWasAdmittedWith(t *testing.T) {
 	c := &operatorClient{s: cluster}
 	c.before = func() {
 		for _, n := range []string{"crt", "key"} {
-			m, _ := filepath.Glob(filepath.Join(f.targetPKI, ".host."+n+".add*"))
+			all, _ := filepath.Glob(filepath.Join(f.targetPKI, ".host."+n+".add*"))
+			var m []string
+			for _, p := range all {
+				if !strings.HasSuffix(p, ".before") { // the attempt's record
+					m = append(m, p)
+				}
+			}
 			if len(m) != 1 {
 				t.Errorf("staged host.%s: %v, want one", n, m)
 				continue
@@ -305,35 +311,69 @@ func TestHostAdd_AHostNamedLikeAPKIFileTouchesNone(t *testing.T) {
 // An add an earlier release's `lv host add` admitted, and left its pair
 // staged at the untagged .host.crt.add / .host.key.add, is finished by a
 // rerun from this release: the pair is staged again at the rerun's own paths
-// and installed, and the untagged copies go once it has.
+// and installed, and the untagged copies go once it has. That release
+// recorded nothing of what the machine served before it, so the rerun
+// finishes it only over what is no live admission's: no certificate, or one
+// this cluster revoked (the machine's removed identity). Over any other it
+// installs nothing and names the removal of that admission alone.
 //
-// Mutation: drop the legacy lookup — the rerun refuses, finding the pair
-// neither installed nor staged.
+// Mutations: drop the legacy lookup — the rerun refuses, finding the pair
+// neither installed nor staged; treat an unrecorded expectation as the
+// rerun's own finding — "unrevoked" installs.
 func TestHostAdd_ARerunFinishesAnEarlierReleasesStagedAdd(t *testing.T) {
-	f := newAddFixture(t)
-	tmp := t.TempDir()
-	if err := pki.GenerateHostCert(filepath.Join(f.opPKI, "ca.crt"), filepath.Join(f.opPKI, "ca.key"),
-		filepath.Join(tmp, "h.crt"), filepath.Join(tmp, "h.key"), "node-9", net.IPv4(10, 0, 0, 9)); err != nil {
-		t.Fatal(err)
-	}
-	crt := mustRead(t, filepath.Join(tmp, "h.crt"))
-	serial := installedSerial(crt)
-	for n, b := range map[string][]byte{".host.crt.add": crt, ".host.key.add": mustRead(t, filepath.Join(tmp, "h.key"))} {
-		if err := os.WriteFile(filepath.Join(f.targetPKI, n), b, 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	f.client.hosts = append(f.client.hosts, &pb.Host{Name: "node-9", Address: "10.0.0.9",
-		State: pb.HostState_HOST_JOINING, CertSerial: strings.ToUpper(serial)})
-	if err := f.add(t); err != nil {
-		t.Fatalf("the rerun: %v", err)
-	}
-	if !oneSerial(f.client.admitted) || f.client.admitted[0] != serial {
-		t.Errorf("admitted %v, want the earlier admission's %s", f.client.admitted, serial)
-	}
-	servesItsAdmittedPair(t, f.targetPKI, serial)
-	if left := stagedOnTarget(t, f.target.Root); len(left) != 0 {
-		t.Errorf("staged files left on the machine: %v", left)
+	for _, tc := range []struct {
+		name    string
+		machine func(t *testing.T, f *addFixture)
+		refused bool
+	}{
+		{"its identity revoked", func(t *testing.T, f *addFixture) {
+			revoke(t, f.opPKI, installedSerial(f.before["host.crt"]))
+		}, false},
+		{"no identity", func(t *testing.T, f *addFixture) {
+			for _, n := range []string{"host.crt", "host.key"} {
+				if err := os.Remove(filepath.Join(f.targetPKI, n)); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}, false},
+		{"unrevoked", func(*testing.T, *addFixture) {}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAddFixture(t)
+			tc.machine(t, f)
+			tmp := t.TempDir()
+			if err := pki.GenerateHostCert(filepath.Join(f.opPKI, "ca.crt"), filepath.Join(f.opPKI, "ca.key"),
+				filepath.Join(tmp, "h.crt"), filepath.Join(tmp, "h.key"), "node-9", net.IPv4(10, 0, 0, 9)); err != nil {
+				t.Fatal(err)
+			}
+			crt := mustRead(t, filepath.Join(tmp, "h.crt"))
+			serial := installedSerial(crt)
+			for n, b := range map[string][]byte{".host.crt.add": crt, ".host.key.add": mustRead(t, filepath.Join(tmp, "h.key"))} {
+				if err := os.WriteFile(filepath.Join(f.targetPKI, n), b, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.client.hosts = append(f.client.hosts, &pb.Host{Name: "node-9", Address: "10.0.0.9",
+				State: pb.HostState_HOST_JOINING, CertSerial: strings.ToUpper(serial)})
+			err := f.add(t)
+			if tc.refused {
+				if err == nil || !strings.Contains(err.Error(), "lv host rm node-9 --serial "+serial+" --address 10.0.0.9") {
+					t.Fatalf("the rerun = %v, want a refusal naming the removal of its admission", err)
+				}
+				f.identityUnchanged(t)
+				return
+			}
+			if err != nil {
+				t.Fatalf("the rerun: %v", err)
+			}
+			if !oneSerial(f.client.admitted) || f.client.admitted[0] != serial {
+				t.Errorf("admitted %v, want the earlier admission's %s", f.client.admitted, serial)
+			}
+			servesItsAdmittedPair(t, f.targetPKI, serial)
+			if left := stagedOnTarget(t, f.target.Root); len(left) != 0 {
+				t.Errorf("staged files left on the machine: %v", left)
+			}
+		})
 	}
 }
 
@@ -616,7 +656,7 @@ func TestMachineClaim_OneAddActsOnTheMachine(t *testing.T) {
 	r := f.target
 	pa := hostAddPlan{pkiDir: f.opPKI, hostName: "node-9"}
 	installed := installedSerial(f.before["host.crt"])
-	prior, err := refuseSecondInstall(r, pa, "0a", installed, "aaaa")
+	prior, err := refuseSecondInstall(r, pa, "0a", addExpect{known: true, serial: installed}, "aaaa")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -629,12 +669,12 @@ func TestMachineClaim_OneAddActsOnTheMachine(t *testing.T) {
 	if err := c.take(prior); err == nil {
 		t.Fatal("a claim from a record another add has since replaced succeeded")
 	}
-	if _, err := refuseSecondInstall(r, pa, "0a", installed, "bbbb"); err == nil || !strings.Contains(err.Error(), "holds this machine") {
+	if _, err := refuseSecondInstall(r, pa, "0a", addExpect{known: true, serial: installed}, "bbbb"); err == nil || !strings.Contains(err.Error(), "holds this machine") {
 		t.Fatalf("B while A's claim is fresh = %v, want refused", err)
 	}
 	// A died long ago: B takes over.
 	ageMarker(t, r)
-	prior, err = refuseSecondInstall(r, pa, "0a", installed, "bbbb")
+	prior, err = refuseSecondInstall(r, pa, "0a", addExpect{known: true, serial: installed}, "bbbb")
 	if err != nil {
 		t.Fatalf("B over a stale claim: %v", err)
 	}

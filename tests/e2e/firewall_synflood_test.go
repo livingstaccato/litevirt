@@ -117,7 +117,7 @@ vms:
     cpu: 1
     memory: %[3]s
     firmware: bios
-    network: [{name: sf}, {name: sf2, trunk: [100]}]
+    network: [{name: sf}, {name: sf2, trunk: [100, 101]}]
     placement: {host: %[4]s}
 `, stack, drillImage(), drillMemory(), host)
 	file := "/tmp/" + stack + ".yaml"

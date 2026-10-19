@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -123,6 +124,12 @@ func listedHost(ctx context.Context, c pb.LiteVirtClient, hostName string) *pb.H
 // changing anything. There is no command that asserts a decision away: an
 // operator only removes the host the decision named.
 func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, dryRun bool) error {
+	return HostRemoveDeadForce(ctx, c, hostName, dryRun, false)
+}
+
+// HostRemoveDeadForce is HostRemoveDead; force is `--dead --force`, sent
+// on every removal request the run makes, the preflights included.
+func HostRemoveDeadForce(ctx context.Context, c pb.LiteVirtClient, hostName string, dryRun, force bool) error {
 	plan, err := c.PlanDeadHostRemoval(ctx, &pb.PlanDeadHostRemovalRequest{Name: hostName})
 	if err != nil {
 		return fmt.Errorf("plan the removal of %s: %w", hostName, err)
@@ -132,15 +139,26 @@ func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, d
 		return fmt.Errorf("%s is not fenced proof-grade (%s): power it off, then run `%s` — `lv host rm --dead` "+
 			"removes only a host proven off", hostName, orDash(plan.GetFenceDetail()), plan.GetFenceCommand())
 	}
+	// pinned is the certificate serial the checks before the vote were
+	// made against: the run after the vote revokes only that one.
+	pinned := ""
 	if plan.GetVoter() {
 		// The vote is removed first and cannot be given back to a host that
 		// is off, so every refusal that does not depend on it is asked
 		// before it: a refused removal changes nothing.
-		if err := deadVoterPreflight(ctx, c, hostName); err != nil {
+		serial, complete, err := deadVoterPreflight(ctx, c, hostName, force)
+		if err != nil {
 			return err
 		}
+		pinned = serial
+		if complete {
+			fmt.Println("  removal check: every check the daemon asks before its voter refusal passed; " +
+				"the real run removes the vote first")
+		} else {
+			fmt.Println("  removal check: SKIPPED — this daemon is older and answers its voter refusal before its other " +
+				"removal checks, so those are asked only after the real run has removed the vote")
+		}
 		if dryRun {
-			fmt.Println("  removal check: passed up to the voter removal, which the real run makes first")
 			fmt.Println("Dry run: nothing was changed.")
 			return nil
 		}
@@ -152,7 +170,7 @@ func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, d
 		if err != nil {
 			return fmt.Errorf("read %s's certificate serial: %w", hostName, err)
 		}
-		pre := &pb.RemoveHostRequest{Name: hostName, Dead: true, ExpectedCertSerial: serial}
+		pre := &pb.RemoveHostRequest{Name: hostName, Dead: true, Force: force, ExpectedCertSerial: serial}
 		if _, err := c.PreflightRemoveHost(ctx, pre); err != nil && status.Code(err) != codes.Unimplemented {
 			return fmt.Errorf("the removal of %s would be refused: %w", hostName, err)
 		}
@@ -178,12 +196,13 @@ func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, d
 				err, hostName, resp.GetGeneration(), hostName)
 		}
 	}
-	serial, version, err := revokeAndPublishRetrying(ctx, c, &pb.RemoveHostRequest{Name: hostName, Dead: true}, plan.GetVoter())
+	serial, version, err := revokeAndPublishRetrying(ctx, c,
+		&pb.RemoveHostRequest{Name: hostName, Dead: true, Force: force, ExpectedCertSerial: pinned}, plan.GetVoter())
 	if err != nil {
 		return voteGone(err)
 	}
 	closeRemovedHostAuditContract(ctx, c, hostName)
-	removed, err := removeAfterRevoke(ctx, c, &pb.RemoveHostRequest{Name: hostName, Dead: true, ExpectedCertSerial: serial},
+	removed, err := removeAfterRevoke(ctx, c, &pb.RemoveHostRequest{Name: hostName, Dead: true, Force: force, ExpectedCertSerial: serial},
 		"lv host rm --dead "+hostName)
 	if err != nil {
 		return voteGone(err)
@@ -288,20 +307,46 @@ var removeRetryBackoff = []time.Duration{10 * time.Second, 20 * time.Second}
 // minted and thrown away), and the daemon must refuse nothing else. The
 // daemon asks its voter refusal last; one from before that order asks it
 // first, and its other refusals still come after the vote.
-func deadVoterPreflight(ctx context.Context, c pb.LiteVirtClient, hostName string) error {
-	serial, err := hostCertSerial(ctx, c, hostName)
+//
+// It returns the serial the checks were made against, and complete: false
+// when the daemon is older (it answered no preflight, or a voter refusal
+// without the error detail this order's daemons attach), so its other
+// checks were not asked.
+func deadVoterPreflight(ctx context.Context, c pb.LiteVirtClient, hostName string, force bool) (serial string, complete bool, err error) {
+	serial, err = hostCertSerial(ctx, c, hostName)
 	if err != nil {
-		return fmt.Errorf("read %s's certificate serial: %w; its vote is not removed", hostName, err)
+		return "", false, fmt.Errorf("read %s's certificate serial: %w; its vote is not removed", hostName, err)
 	}
 	if err := revocationRefusal(PKIDir(), hostName, serial); err != nil {
-		return fmt.Errorf("%s's certificate could not be revoked, so its vote is not removed either: %w", hostName, err)
+		return "", false, fmt.Errorf("%s's certificate could not be revoked, so its vote is not removed either: %w", hostName, err)
 	}
-	pre := &pb.RemoveHostRequest{Name: hostName, Dead: true, ExpectedCertSerial: serial}
-	if _, err := c.PreflightRemoveHost(ctx, pre); err != nil &&
-		status.Code(err) != codes.Unimplemented && !apimeta.IsVoterMemberRefusal(err) {
-		return fmt.Errorf("the removal of %s would be refused, so its vote is not removed either: %w", hostName, err)
+	pre := &pb.RemoveHostRequest{Name: hostName, Dead: true, Force: force, ExpectedCertSerial: serial}
+	_, err = c.PreflightRemoveHost(ctx, pre)
+	switch {
+	case err == nil:
+		return serial, true, nil
+	case status.Code(err) == codes.Unimplemented:
+		return serial, false, nil
+	case apimeta.IsVoterMemberRefusal(err):
+		return serial, hasErrorInfo(err), nil
 	}
-	return nil
+	return "", false, fmt.Errorf("the removal of %s would be refused, so its vote is not removed either: %w", hostName, err)
+}
+
+// hasErrorInfo reports whether err carries a google.rpc.ErrorInfo in the
+// daemon's domain: a daemon from before the voter refusal was asked last
+// attaches none.
+func hasErrorInfo(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	for _, d := range st.Details() {
+		if ei, ok := d.(*errdetails.ErrorInfo); ok && ei.GetDomain() == apimeta.ErrorDomain {
+			return true
+		}
+	}
+	return false
 }
 
 // revokeAndPublish revokes the certificate of req's host in this machine's
@@ -321,9 +366,15 @@ func revokeAndPublish(ctx context.Context, c pb.LiteVirtClient, req *pb.RemoveHo
 // a retry changes nothing.
 func revokeAndPublishRetrying(ctx context.Context, c pb.LiteVirtClient, req *pb.RemoveHostRequest, retry bool) (string, int64, error) {
 	hostName := req.GetName()
-	serial, err := hostCertSerial(ctx, c, hostName)
-	if err != nil {
-		return "", 0, fmt.Errorf("read %s's certificate serial before removal: %w", hostName, err)
+	// A serial in req pins the certificate: the checks are asked against it
+	// and only it is revoked, so a re-admission since it was read is refused
+	// before anything is revoked.
+	serial := req.GetExpectedCertSerial()
+	if serial == "" {
+		var err error
+		if serial, err = hostCertSerial(ctx, c, hostName); err != nil {
+			return "", 0, fmt.Errorf("read %s's certificate serial before removal: %w", hostName, err)
+		}
 	}
 	// Ask the daemon whether it would remove the host BEFORE revoking: a
 	// refusal after the revocation leaves a member cut off from its peers

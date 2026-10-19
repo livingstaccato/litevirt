@@ -490,7 +490,7 @@ anything.`,
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				if dead {
-					return cli.HostRemoveDead(ctx, c, args[0], dryRun)
+					return cli.HostRemoveDeadForce(ctx, c, args[0], dryRun, force)
 				}
 				return cli.HostRemove(ctx, c, args[0], force)
 			})

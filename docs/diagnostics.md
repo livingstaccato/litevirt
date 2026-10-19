@@ -2121,14 +2121,26 @@ pages stay stale on disk. The condition survives a daemon restart.
 
 | Raised when | Clears when |
 |---|---|
-| An fsync of a vars file failed. | Every listed file is removed or replaced by another file. |
+| An fsync of a vars file failed. | Every listed file is removed or replaced by another file, or an admin acknowledges that its store may be stale. |
 
 **What to do.** The listed file may be missing UEFI variable writes the guest
 made. Check the disk (`dmesg`, `smartctl`). Writing the variables again in the
 guest does not clear it, and stopping the VM does not write the store out
-again. Restore the VM's firmware from a snapshot or backup taken before the
-failure (`lv snapshot restore <vm> <name>`, or `lv backup restore-from`), which
-replaces the file, or remove the VM (`lv rm <vm>`).
+again. The ways out:
+
+- A Secure Boot or vTPM VM: `lv snapshot restore <vm> <name>` from a snapshot
+  taken before the failure replaces its vars file. A plain UEFI VM's snapshot
+  carries no firmware state, so this does not apply to it.
+- Any VM: `lv rm <vm>` removes its vars file. `lv rm --keep-disks` keeps it,
+  and the condition with it.
+- A VM kept as it is: an admin accepts that its vars store may be stale with
+  `lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars
+  --reason <why>`. It is audited, naming every file, and the host's daemon then
+  stops reporting those files. A new failed flush raises it again.
+
+`lv backup restore-from` restores a disk, not firmware state. `lv backup
+restore-live` restores firmware state only into a new VM (`--name`); the old
+VM still needs `lv rm` to clear this.
 
 ### UEFI vars file not flushed (`nvram_flush_blocked`)
 
@@ -2140,9 +2152,15 @@ error. Nothing is known lost, but that file's writes are not being made
 durable. The evidence carries `files` (each with `path`, `vm`, `error` and
 `at`, when the episode began) and `remedy`.
 
+It also covers what keeps a whole directory from being flushed: a vars
+directory that cannot be read, or whose fsync fails, for a minute (logged as
+`UEFI vars directory could not be read` or `UEFI vars directory fsync failed`,
+and when it recovers), and a sweep stuck in an fsync for more than 10 seconds,
+listed for as long as it is stuck (`UEFI vars flush is stalled`).
+
 | Raised when | Clears when |
 |---|---|
-| A vars file has not been openable for its fsync for a minute. | Every listed file is flushed again (logged as `UEFI vars file flushed again after it could not be opened`), or is gone. |
+| A vars file has not been openable for its fsync, or a vars directory not readable or fsyncable, for a minute; or a sweep has been stuck in an fsync for 10 seconds. | Every listed file or directory is flushed again (logged as `UEFI vars file flushed again after it could not be opened`, `UEFI vars directory readable again`, `UEFI vars directory fsync succeeded again`), or is gone, and no sweep is stuck. |
 
 **What to do.** The `error` says why the file could not be opened: fix that
 cause (its permissions, the daemon's open-file limit, or what replaced the

@@ -14,14 +14,16 @@ import (
 
 // nvramFlushEvaluator raises the conditions about this host's UEFI vars
 // flusher (libvirt.NvramFlusher).
-const nvramFlushEvaluator = "uefi-vars"
+const nvramFlushEvaluator = libvirt.NvramFlushEvaluator
 
 // CondNvramFlushFailed is raised by a node about itself while an fsync of a
 // UEFI vars file on it has failed. A file stops counting only once it is
-// removed or replaced: the kernel reports a writeback error once and marks
-// the lost pages clean, and qemu writes back only the sectors a later guest
-// write changes, so no later fsync puts the lost pages back.
-const CondNvramFlushFailed = "nvram_flush_failed"
+// removed or replaced, or an admin acknowledges that its store may be stale
+// (`lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars`):
+// the kernel reports a writeback error once and marks the lost pages clean,
+// and qemu writes back only the sectors a later guest write changes, so no
+// later fsync puts the lost pages back.
+const CondNvramFlushFailed = libvirt.CondNvramFlushFailed
 
 // CondNvramFlushBlocked is raised by a node about itself while a UEFI vars
 // file on it has not been openable for its fsync for longer than a minute,
@@ -33,14 +35,16 @@ const nvramFlushConditionEvery = 10 * time.Second
 
 const nvramFlushRemedy = "the listed vars files may be missing UEFI variable writes their guests made. " +
 	"Check the disk (dmesg, smartctl). Writing the variables again in the guest does not clear this, " +
-	"and stopping the VM does not write its store out again. " +
-	"Restore the VM's firmware from a snapshot or backup taken before the failure " +
-	"(lv snapshot restore <vm> <name>, or lv backup restore-from), or remove the VM (lv rm <vm>); " +
-	"the condition clears when each listed file is removed or replaced"
+	"and stopping the VM does not write its store out again. Ways out: " +
+	"for a Secure Boot or vTPM VM, lv snapshot restore <vm> <name> from a snapshot taken before the failure, " +
+	"which replaces its vars file; for any VM, lv rm <vm> without --keep-disks, which removes it; " +
+	"or, for a VM kept as it is, an admin's acknowledgement that its vars store may be stale: " +
+	"lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars --reason <why>"
 
-const nvramFlushBlockedRemedy = "the listed vars files could not be opened to flush them, so their guests' " +
-	"UEFI variable writes are not being made durable; the error says why. Fix that cause " +
-	"(permissions, open-file limits, the entry's type); the condition clears once each file is flushed again"
+const nvramFlushBlockedRemedy = "the listed vars files or directories could not be opened, read or fsynced, " +
+	"or an fsync has not returned, so the guests' UEFI variable writes are not being made durable; " +
+	"the error says why. Fix that cause (permissions, open-file limits, the entry's type, the disk); " +
+	"the condition clears once each is flushed again"
 
 type nvramFlushEvidence struct {
 	Files  []libvirt.NvramFlushFailure `json:"files"`
@@ -83,6 +87,9 @@ type nvramConditionState struct {
 	// failure.
 	holdResolve             bool
 	lastFailed, lastBlocked string // what each condition was last written as
+	// openFiles: the failures nvram_flush_failed was last written open with.
+	// If it is found resolved while they are, an admin acknowledged them.
+	openFiles []libvirt.NvramFlushFailure
 }
 
 // runNvramFlushCondition keeps nvram_flush_failed and nvram_flush_blocked in
@@ -112,12 +119,22 @@ func (d *Daemon) nvramFlushTick(ctx context.Context, f *libvirt.NvramFlusher, st
 		}
 		st.seeded = true
 	}
+	if len(st.openFiles) > 0 {
+		row, found, err := readNvramFlushCondition(ctx, d.db, nvramFlushEvaluator, CondNvramFlushFailed, "host", d.cfg.HostName)
+		if err == nil && found && row.Lifecycle == corrosion.ConditionResolved {
+			f.Acknowledge(st.openFiles)
+			st.openFiles, st.lastFailed = nil, ""
+		}
+	}
 	failed := f.Failures()
 	if len(failed) > 0 {
 		st.holdResolve = false
 	}
 	if !st.holdResolve {
 		d.syncNvramCondition(ctx, CondNvramFlushFailed, corrosion.SeverityCritical, failed, nvramFlushRemedy, &st.lastFailed)
+		if b, _ := json.Marshal(failed); string(b) == st.lastFailed {
+			st.openFiles = failed
+		}
 	}
 	d.syncNvramCondition(ctx, CondNvramFlushBlocked, corrosion.SeverityWarning, f.Blocked(), nvramFlushBlockedRemedy, &st.lastBlocked)
 }

@@ -15,6 +15,14 @@ import (
 	"time"
 )
 
+// The health conditions about a host's flusher: its evaluator, and the code of
+// a failed vars fsync (raised by the daemon, resolvable by an admin's
+// acknowledgement).
+const (
+	NvramFlushEvaluator  = "uefi-vars"
+	CondNvramFlushFailed = "nvram_flush_failed"
+)
+
 // NvramFlushInterval is how often the daemon flushes UEFI vars files that
 // changed: about the longest a guest's UEFI variable write waits in the host
 // page cache before it is on disk.
@@ -89,7 +97,8 @@ type NvramFlusher struct {
 
 	mu       sync.Mutex
 	failed   map[string]NvramFlushFailure
-	openFail map[string]nvramOpenFail
+	openFail map[string]nvramOpenFail // episodes, by file path or dirReadKey/dirFsyncKey
+	stall    *NvramFlushFailure       // the sweep stuck in an fsync, if one is
 
 	done chan struct{}
 }
@@ -138,9 +147,18 @@ func (f *NvramFlusher) watchedSweep() {
 	start := time.Now()
 	timer := time.AfterFunc(f.stallAfter, func() {
 		p, _ := f.current.Load().(string)
-		f.onStall(p, time.Since(start))
+		elapsed := time.Since(start)
+		f.mu.Lock()
+		f.stall = &NvramFlushFailure{Path: p, VM: nvramVMName(p),
+			Error: fmt.Sprintf("fsync has not returned for %s; no vars file on this host is flushed until it does", elapsed.Round(time.Second)),
+			At:    time.Now().UTC().Format(time.RFC3339)}
+		f.mu.Unlock()
+		f.onStall(p, elapsed)
 	})
 	f.Sweep()
+	f.mu.Lock()
+	f.stall = nil
+	f.mu.Unlock()
 	if !timer.Stop() {
 		slog.Info("UEFI vars flush finished after a stall", "elapsed", time.Since(start))
 	}
@@ -171,12 +189,15 @@ func (s nvramFlushed) settled(mt time.Time) bool {
 func (f *NvramFlusher) Sweep() {
 	for _, dir := range f.dirs {
 		entries, err := os.ReadDir(dir)
-		if err != nil {
-			if !os.IsNotExist(err) {
-				f.warnOnce(dir, "UEFI vars directory could not be read", err)
-			}
+		switch {
+		case os.IsNotExist(err):
+			f.episodeRecovered(dirReadKey(dir), "UEFI vars directory is gone; it is no longer read")
+			continue
+		case err != nil:
+			f.episodeFailed(dirReadKey(dir), dir, "UEFI vars directory could not be read", err)
 			continue
 		}
+		f.episodeRecovered(dirReadKey(dir), "UEFI vars directory readable again")
 		present := map[string]bool{}
 		for _, e := range entries {
 			if !e.Type().IsRegular() {
@@ -232,14 +253,11 @@ func (f *NvramFlusher) Sweep() {
 		err = f.sync(dir, nil)
 		f.current.Store("")
 		if err != nil {
-			f.warnOnce(dir, "UEFI vars directory flush failed; retried on the next sweep", err)
+			f.episodeFailed(dirFsyncKey(dir), dir, "UEFI vars directory fsync failed", fmt.Errorf("fsync: %w", err))
 			continue // the next sweep sees the change again
 		}
 		f.listed[dir] = present
-		if f.warned[dir] {
-			delete(f.warned, dir)
-			slog.Info("UEFI vars directory flush recovered", "dir", dir)
-		}
+		f.episodeRecovered(dirFsyncKey(dir), "UEFI vars directory fsync succeeded again")
 	}
 }
 
@@ -328,17 +346,32 @@ func fsyncListed(path string, want os.FileInfo) error {
 }
 
 // Seed carries failures over from before a restart (the host condition's
-// evidence). One whose file is gone, or is another file now, is dropped.
+// evidence). It fails closed: a failure is dropped, and logged, only when its
+// file is gone or is positively another file (another inode at the path).
+// The device number is not compared, since it can change across a reboot;
+// a kept failure takes the file's current one. A file that cannot be looked
+// at keeps its failure.
 func (f *NvramFlusher) Seed(failures []NvramFlushFailure) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, v := range failures {
 		info, err := os.Lstat(v.Path)
-		if err != nil || !info.Mode().IsRegular() {
+		switch {
+		case os.IsNotExist(err):
+			slog.Info("carried-over UEFI vars flush failure dropped: the file is gone", "path", v.Path, "vm", v.VM)
 			continue
-		}
-		if dev, ino := fileIdentity(info); dev != v.Dev || ino != v.Ino {
+		case err != nil:
+			slog.Warn("carried-over UEFI vars flush failure kept: its file cannot be looked at", "path", v.Path, "vm", v.VM, "error", err)
+		case !info.Mode().IsRegular():
+			slog.Info("carried-over UEFI vars flush failure dropped: the path is no longer a regular file", "path", v.Path, "vm", v.VM)
 			continue
+		default:
+			dev, ino := fileIdentity(info)
+			if ino != v.Ino {
+				slog.Info("carried-over UEFI vars flush failure dropped: another file is at the path", "path", v.Path, "vm", v.VM)
+				continue
+			}
+			v.Dev = dev
 		}
 		if _, ok := f.failed[v.Path]; !ok {
 			f.failed[v.Path] = v
@@ -354,7 +387,9 @@ func fileIdentity(info os.FileInfo) (dev, ino uint64) {
 	return 0, 0
 }
 
-// replaced reports whether the failed file at p has been replaced by another.
+// replaced reports whether the failed file at p has been replaced by another:
+// another inode at the path. The device number is not compared (it can change
+// across a reboot) but is kept current.
 func (f *NvramFlusher) replaced(p string, info os.FileInfo) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -363,7 +398,14 @@ func (f *NvramFlusher) replaced(p string, info os.FileInfo) bool {
 		return false
 	}
 	dev, ino := fileIdentity(info)
-	return dev != v.Dev || ino != v.Ino
+	if ino != v.Ino {
+		return true
+	}
+	if dev != v.Dev { // the same file under a device number changed since: keep it current
+		v.Dev = dev
+		f.failed[p] = v
+	}
+	return false
 }
 
 // nvramSyncError is an error from the fsync itself, as opposed to the open:
@@ -376,9 +418,11 @@ func (e *nvramSyncError) Unwrap() error { return e.err }
 // Done closes once Run has made its last sweep.
 func (f *NvramFlusher) Done() <-chan struct{} { return f.done }
 
-// Blocked lists the vars files that could not be opened to flush them for
-// longer than nvramBlockedAfter, by path. Nothing is known lost for them,
-// but nothing of theirs is being flushed either.
+// Blocked lists what has kept vars files from being flushed for longer than
+// nvramBlockedAfter (a file that cannot be opened, a directory that cannot be
+// read or fsynced), and a sweep stuck in an fsync for longer than
+// stallAfter, by path. Nothing is known lost for them, but nothing they cover
+// is being flushed either.
 func (f *NvramFlusher) Blocked() []NvramFlushFailure {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -388,19 +432,28 @@ func (f *NvramFlusher) Blocked() []NvramFlushFailure {
 			out = append(out, v.NvramFlushFailure)
 		}
 	}
+	if f.stall != nil {
+		out = append(out, *f.stall)
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out
 }
 
-// openFailed records that p could not be opened to flush it: logged when an
-// episode starts, and at error once it has lasted nvramBlockedAfter.
-func (f *NvramFlusher) openFailed(p string, err error) {
+// SetClock replaces the flusher's clock; for tests that drive it past
+// nvramBlockedAfter.
+func (f *NvramFlusher) SetClock(now func() time.Time) { f.now = now }
+
+// episodeFailed records a failure under key (a file that cannot be opened, a
+// directory that cannot be read or fsynced) for path: logged when an episode
+// starts, and at error once it has lasted nvramBlockedAfter, when Blocked
+// lists it.
+func (f *NvramFlusher) episodeFailed(key, path, startMsg string, err error) {
 	now := f.now()
 	f.mu.Lock()
-	v, ok := f.openFail[p]
+	v, ok := f.openFail[key]
 	if !ok {
 		v = nvramOpenFail{since: now}
-		v.Path, v.VM = p, nvramVMName(p)
+		v.Path, v.VM = path, nvramVMName(path)
 		v.At = now.UTC().Format(time.RFC3339)
 	}
 	v.Error = err.Error()
@@ -408,26 +461,51 @@ func (f *NvramFlusher) openFailed(p string, err error) {
 	if escalate {
 		v.escalated = true
 	}
-	f.openFail[p] = v
+	f.openFail[key] = v
 	f.mu.Unlock()
 	switch {
 	case !ok:
-		slog.Warn("UEFI vars file could not be opened to flush it; retried every sweep",
-			"path", p, "vm", nvramVMName(p), "error", err)
+		slog.Warn(startMsg+"; retried every sweep", "path", path, "vm", v.VM, "error", err)
 	case escalate:
-		slog.Error("UEFI vars file has not been flushed since it could not be opened; the guest's UEFI variable writes are not being made durable",
-			"path", p, "vm", nvramVMName(p), "since", v.At, "error", err)
+		slog.Error("UEFI vars have not been flushed since: "+startMsg+"; the guests' UEFI variable writes are not being made durable",
+			"path", path, "vm", v.VM, "since", v.At, "error", err)
 	}
 }
 
-// openRecovered ends p's open-failure episode, if it had one.
-func (f *NvramFlusher) openRecovered(p string) {
+// episodeRecovered ends key's episode, if it had one.
+func (f *NvramFlusher) episodeRecovered(key, msg string) {
 	f.mu.Lock()
-	v, ok := f.openFail[p]
-	delete(f.openFail, p)
+	v, ok := f.openFail[key]
+	delete(f.openFail, key)
 	f.mu.Unlock()
 	if ok {
-		slog.Info("UEFI vars file flushed again after it could not be opened",
-			"path", p, "vm", nvramVMName(p), "since", v.At)
+		slog.Info(msg, "path", v.Path, "vm", v.VM, "since", v.At)
+	}
+}
+
+func (f *NvramFlusher) openFailed(p string, err error) {
+	f.episodeFailed(p, p, "UEFI vars file could not be opened to flush it", err)
+}
+
+func (f *NvramFlusher) openRecovered(p string) {
+	f.episodeRecovered(p, "UEFI vars file flushed again after it could not be opened")
+}
+
+// Episode keys of a directory's read and fsync.
+func dirReadKey(dir string) string  { return "read\x00" + dir }
+func dirFsyncKey(dir string) string { return "fsync\x00" + dir }
+
+// Acknowledge drops the failures an admin acknowledged (the host condition
+// resolved by hand, accepting that those vars stores may be stale): each one
+// whose file is still the one named.
+func (f *NvramFlusher) Acknowledge(failures []NvramFlushFailure) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, v := range failures {
+		if cur, ok := f.failed[v.Path]; ok && cur.Ino == v.Ino {
+			delete(f.failed, v.Path)
+			slog.Warn("UEFI vars flush failure acknowledged by an admin; the vars store may be stale",
+				"path", v.Path, "vm", v.VM)
+		}
 	}
 }

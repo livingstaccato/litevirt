@@ -74,6 +74,7 @@ Exit code: 0 healthy · 1 degraded or unknown · 2 critical.`,
 // lv health resolve — mark one open dual-run condition resolved by hand.
 func newHealthResolveCmd() *cobra.Command {
 	var evaluator, reason string
+	var acceptStaleVars bool
 	cmd := &cobra.Command{
 		Use:   "resolve <code> <kind/subject>",
 		Short: "Resolve an open dual-run health condition by hand (admin, audited)",
@@ -92,6 +93,13 @@ the condition: a scan later than its last sighting that completely probed
 every host it names. Resolving proves nothing; use it for a condition the
 detector can no longer clear by itself.
 
+One other condition can be resolved: nvram_flush_failed. Resolving it, with
+--accept-stale-uefi-vars and a --reason, accepts that the UEFI vars stores it
+names may be stale (writes a failed fsync lost are not on disk), for a VM
+kept as it is; the host's daemon then stops reporting those files:
+
+  lv health resolve nvram_flush_failed host/node-1 --accept-stale-uefi-vars --reason "disk replaced"
+
 Requires the cluster.health.resolve verb (Admin). The resolution is written
 to the audit log with your principal and --reason, and published as an
 ha.condition.resolved event.`,
@@ -100,6 +108,15 @@ ha.condition.resolved event.`,
 			kind, id, ok := strings.Cut(args[1], "/")
 			if !ok || kind == "" || id == "" {
 				return fmt.Errorf("subject %q: want kind/id as `lv health` prints it, e.g. vm/web-1", args[1])
+			}
+			if args[0] == "nvram_flush_failed" {
+				if !acceptStaleVars {
+					return fmt.Errorf("resolving nvram_flush_failed accepts that the UEFI vars stores it names may be stale " +
+						"(the writes a failed fsync lost are not on disk); pass --accept-stale-uefi-vars to say so")
+				}
+				if strings.TrimSpace(reason) == "" {
+					return fmt.Errorf("resolving nvram_flush_failed needs a --reason, recorded in the audit log")
+				}
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				resp, err := c.ResolveHealthCondition(ctx, &pb.ResolveHealthConditionRequest{
@@ -110,6 +127,11 @@ ha.condition.resolved event.`,
 					return fmt.Errorf("resolve %s on %s: %w", args[0], args[1], err)
 				}
 				h := resp.GetCondition()
+				if args[0] == "nvram_flush_failed" {
+					fmt.Printf("%s on %s/%s: %s. The vars stores it named are accepted as possibly stale; a new failed flush raises it again.\n",
+						h.GetCode(), h.GetSubjectKind(), h.GetSubjectId(), h.GetLifecycle())
+					return nil
+				}
 				fmt.Printf("%s on %s/%s (%s): %s. If it still holds, the detector raises it again on its next pass.\n",
 					h.GetCode(), h.GetSubjectKind(), h.GetSubjectId(), h.GetEvaluator(), h.GetLifecycle())
 				return nil
@@ -118,6 +140,8 @@ ha.condition.resolved event.`,
 	}
 	cmd.Flags().StringVar(&evaluator, "evaluator", "", "the evaluator, when two hold an open condition under the same code and subject")
 	cmd.Flags().StringVar(&reason, "reason", "", "why, recorded in the audit log")
+	cmd.Flags().BoolVar(&acceptStaleVars, "accept-stale-uefi-vars", false,
+		"for nvram_flush_failed: accept that the UEFI vars stores it names may be stale (needs --reason)")
 	return cmd
 }
 

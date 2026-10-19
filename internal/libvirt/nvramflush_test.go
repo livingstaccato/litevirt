@@ -603,3 +603,193 @@ func TestNvramFlusher_FailureLogDoesNotAdviseAStop(t *testing.T) {
 		t.Fatalf("failure log advice does not match the remedy:\n%s", out)
 	}
 }
+
+// A carried-over failure survives a reboot that renumbered the device: on
+// seed the file is matched by path and inode, and the failure takes the
+// device number it has now, so the next sweep does not see it as replaced.
+func TestNvramFlusher_SeedMatchesByInodeAcrossADeviceRenumber(t *testing.T) {
+	dir := t.TempDir()
+	vars := filepath.Join(dir, "vm1_VARS.fd")
+	writeAt(t, vars, "v1", time.Now().Add(-time.Hour))
+	info, err := os.Lstat(vars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev, ino := fileIdentity(info)
+	f, _, _ := recordingFlusher(t, dir)
+	f.Seed([]NvramFlushFailure{{Path: vars, VM: "vm1", Error: "EIO", Dev: dev + 7, Ino: ino}})
+	f.Sweep()
+	if got := f.Failures(); len(got) != 1 || got[0].Dev != dev {
+		t.Fatalf("after a device renumber the carried-over failure is %+v; want it kept, with device %d", got, dev)
+	}
+}
+
+// A carried-over failure whose file cannot be looked at (anything but "it is
+// gone") is kept, not dropped: the seed fails closed. A dropped one is
+// logged.
+func TestNvramFlusher_SeedFailsClosed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a 000 directory")
+	}
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	locked := filepath.Join(t.TempDir(), "locked")
+	if err := os.Mkdir(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	vars := filepath.Join(locked, "vm1_VARS.fd")
+	writeAt(t, vars, "v1", time.Now().Add(-time.Hour))
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	gone := filepath.Join(t.TempDir(), "gone_VARS.fd")
+
+	f := NewNvramFlusher()
+	f.Seed([]NvramFlushFailure{
+		{Path: vars, VM: "vm1", Error: "EIO", Dev: 1, Ino: 1},
+		{Path: gone, VM: "gone", Error: "EIO", Dev: 1, Ino: 1},
+	})
+	got := f.Failures()
+	if len(got) != 1 || got[0].Path != vars {
+		t.Fatalf("seed = %+v; want the unreadable file's failure kept and the gone one dropped", got)
+	}
+	if !strings.Contains(logs.String(), "gone_VARS.fd") {
+		t.Fatalf("the dropped carried-over failure was not logged:\n%s", logs.String())
+	}
+
+	// Kept with the device number it was recorded with; once the directory
+	// can be read, the same file (by inode) is still the failed one.
+	if err := os.Chmod(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(vars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, ino := fileIdentity(info)
+	g, _, _ := recordingFlusher(t, locked)
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	g.Seed([]NvramFlushFailure{{Path: vars, VM: "vm1", Error: "EIO", Dev: 1, Ino: ino}})
+	if err := os.Chmod(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	g.Sweep()
+	if got := g.Failures(); len(got) != 1 || got[0].Path != vars {
+		t.Fatalf("a kept failure was dropped once its file could be read: %+v", got)
+	}
+}
+
+// A vars directory that cannot be read is an episode as a file is: logged
+// when it starts, blocked past the bound, logged when it recovers, and
+// logged again when it recurs.
+func TestNvramFlusher_UnreadableDirectoryIsReportedAndRecovers(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a 000 directory")
+	}
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	dir := filepath.Join(t.TempDir(), "nvram")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	f, _, now := recordingFlusher(t, dir)
+	if err := os.Chmod(dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	f.Sweep()
+	if !strings.Contains(logs.String(), "could not be read") {
+		t.Fatalf("an unreadable directory was not logged:\n%s", logs.String())
+	}
+	*now = now.Add(nvramBlockedAfter + time.Second)
+	f.Sweep()
+	if got := f.Blocked(); len(got) != 1 || got[0].Path != dir {
+		t.Fatalf("blocked = %+v; want the directory", got)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f.Sweep()
+	if got := f.Blocked(); len(got) != 0 {
+		t.Fatalf("still blocked once readable: %+v", got)
+	}
+	if !strings.Contains(logs.String(), "readable again") {
+		t.Fatalf("recovery not logged:\n%s", logs.String())
+	}
+	logs.Reset()
+	if err := os.Chmod(dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	f.Sweep()
+	if !strings.Contains(logs.String(), "could not be read") {
+		t.Fatalf("a second episode was not logged:\n%s", logs.String())
+	}
+}
+
+// A directory fsync that keeps failing is an episode too.
+func TestNvramFlusher_FailingDirectoryFsyncIsReportedAndRecovers(t *testing.T) {
+	dir := t.TempDir()
+	f, _, now := recordingFlusher(t, dir)
+	writeAt(t, filepath.Join(dir, "vm1_VARS.fd"), "v1", now.Add(-time.Hour))
+	failing := true
+	f.sync = func(p string, want os.FileInfo) error {
+		if want == nil && failing {
+			return syscall.EIO
+		}
+		return nil
+	}
+	f.Sweep()
+	*now = now.Add(nvramBlockedAfter + time.Second)
+	f.Sweep()
+	if got := f.Blocked(); len(got) != 1 || got[0].Path != dir || !strings.Contains(got[0].Error, "fsync") {
+		t.Fatalf("blocked = %+v; want the directory's fsync", got)
+	}
+	failing = false
+	f.Sweep()
+	if got := f.Blocked(); len(got) != 0 {
+		t.Fatalf("still blocked after the directory fsync succeeded: %+v", got)
+	}
+}
+
+// A sweep stuck in an fsync is reported as blocked, naming the file it is
+// stuck on, while it is stuck, and no longer once it returns.
+func TestNvramFlusher_StalledSweepIsBlocked(t *testing.T) {
+	dir := t.TempDir()
+	f, _, now := recordingFlusher(t, dir)
+	vars := filepath.Join(dir, "vm1_VARS.fd")
+	writeAt(t, vars, "v1", now.Add(-time.Hour))
+	release := make(chan struct{})
+	f.sync = func(p string, _ os.FileInfo) error {
+		if p == vars {
+			<-release
+		}
+		return nil
+	}
+	f.stallAfter = 20 * time.Millisecond
+	f.onStall = func(string, time.Duration) {}
+	done := make(chan struct{})
+	go func() { f.watchedSweep(); close(done) }()
+	var got []NvramFlushFailure
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if got = f.Blocked(); len(got) > 0 {
+			break
+		}
+	}
+	close(release)
+	<-done
+	if len(got) != 1 || got[0].Path != vars || !strings.Contains(got[0].Error, "has not returned") {
+		t.Fatalf("blocked while stalled = %+v; want the stuck file", got)
+	}
+	if got := f.Blocked(); len(got) != 0 {
+		t.Fatalf("still blocked after the sweep returned: %+v", got)
+	}
+}

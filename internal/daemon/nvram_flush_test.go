@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -69,10 +70,21 @@ func TestNvramFlushCondition_RaisedSurvivesRestartAndResolves(t *testing.T) {
 	if row.Severity != corrosion.SeverityCritical {
 		t.Fatalf("severity %q, want critical", row.Severity)
 	}
-	for _, want := range []string{fail.Path, `"vm":"web-1"`, "lv rm", "lv snapshot restore", "lv backup restore-from", "does not clear"} {
-		if !strings.Contains(row.Evidence, want) {
-			t.Fatalf("evidence lacks %q: %s", want, row.Evidence)
+	var ev nvramFlushEvidence
+	if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil {
+		t.Fatal(err)
+	}
+	if len(ev.Files) != 1 || ev.Files[0].Path != fail.Path || ev.Files[0].VM != "web-1" {
+		t.Fatalf("evidence files = %+v", ev.Files)
+	}
+	for _, want := range []string{"lv rm <vm> without --keep-disks", "lv snapshot restore <vm> <name>", "Secure Boot or vTPM",
+		"lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars --reason <why>", "does not clear"} {
+		if !strings.Contains(ev.Remedy, want) {
+			t.Fatalf("remedy lacks %q: %s", want, ev.Remedy)
 		}
+	}
+	if strings.Contains(ev.Remedy, "restore-from") {
+		t.Fatalf("evidence names lv backup restore-from, which writes no firmware: %s", row.Evidence)
 	}
 
 	// A restart: the new flusher knows nothing until it is seeded from the
@@ -227,5 +239,80 @@ func TestStopAndWait_WaitsForDoneWithinTheBound(t *testing.T) {
 	stopAndWait(func() {}, make(chan struct{}), 50*time.Millisecond)
 	if el := time.Since(start); el > 2*time.Second {
 		t.Fatalf("a stuck sweep held the stop for %v", el)
+	}
+}
+
+// The tick raises nvram_flush_blocked for a vars file that has not been
+// openable for longer than the bound, and resolves it once the file is
+// flushed again.
+func TestNvramFlushTick_RaisesAndResolvesBlocked(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root opens a 000 file")
+	}
+	ctx := context.Background()
+	d, db := nvramTestDaemon(t)
+	dir := t.TempDir()
+	vars := filepath.Join(dir, "web-1_VARS.fd")
+	if err := os.WriteFile(vars, []byte("v"), 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(vars, 0o600) })
+	now := time.Now()
+	f := libvirt.NewNvramFlusher(dir)
+	f.SetClock(func() time.Time { return now })
+	var st nvramConditionState
+	f.Sweep()
+	now = now.Add(2 * time.Minute)
+	f.Sweep()
+	d.nvramFlushTick(ctx, f, &st)
+	if row, open := nvramCondition(t, db, CondNvramFlushBlocked); !open || !strings.Contains(row.Evidence, "web-1_VARS.fd") {
+		t.Fatalf("blocked condition after the bound: open=%v %+v", open, row)
+	}
+	if err := os.Chmod(vars, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.Sweep()
+	d.nvramFlushTick(ctx, f, &st)
+	if _, open := nvramCondition(t, db, CondNvramFlushBlocked); open {
+		t.Fatal("blocked condition not resolved once the file was flushed")
+	}
+}
+
+// An admin's acknowledgement (the condition resolved by hand,
+// `lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars`)
+// is taken by the flusher: the files it named are dropped, so a later failure
+// of another file raises the condition for that file alone.
+func TestNvramFlushTick_TakesAnOperatorAcknowledgement(t *testing.T) {
+	ctx := context.Background()
+	d, db := nvramTestDaemon(t)
+	dir := t.TempDir()
+	first := failedVars(t, dir, "web-1")
+	f := libvirt.NewNvramFlusher(dir)
+	f.Seed([]libvirt.NvramFlushFailure{first})
+	var st nvramConditionState
+	d.nvramFlushTick(ctx, f, &st)
+
+	row, open := nvramCondition(t, db, CondNvramFlushFailed)
+	if !open {
+		t.Fatal("setup: condition not raised")
+	}
+	row.Lifecycle, row.ResolvedAt = corrosion.ConditionResolved, time.Now().UTC().Format(time.RFC3339)
+	if err := corrosion.UpsertHealthCondition(ctx, db, row); err != nil {
+		t.Fatal(err)
+	}
+	d.nvramFlushTick(ctx, f, &st)
+	if got := f.Failures(); len(got) != 0 {
+		t.Fatalf("after the acknowledgement the flusher still holds %+v", got)
+	}
+	if _, open := nvramCondition(t, db, CondNvramFlushFailed); open {
+		t.Fatal("the acknowledged condition was raised again")
+	}
+
+	second := failedVars(t, dir, "web-2")
+	f.Seed([]libvirt.NvramFlushFailure{second})
+	d.nvramFlushTick(ctx, f, &st)
+	row, open = nvramCondition(t, db, CondNvramFlushFailed)
+	if !open || !strings.Contains(row.Evidence, "web-2_VARS.fd") || strings.Contains(row.Evidence, "web-1_VARS.fd") {
+		t.Fatalf("a new failure after an acknowledgement: open=%v evidence %s; want web-2 alone", open, row.Evidence)
 	}
 }

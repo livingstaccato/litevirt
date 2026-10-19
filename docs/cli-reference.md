@@ -1546,6 +1546,10 @@ lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E]
                                              #   audited, ha.condition.resolved event. Refused until a
                                              #   detector scan after its last sighting probed every host
                                              #   it names; raised again next pass if it still holds.
+lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars --reason R
+                                             # Accept that the UEFI vars stores nvram_flush_failed names
+                                             #   may be stale, for a VM kept as it is. Admin, audited
+                                             #   naming every file; a new failed flush raises it again.
 lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>] [--until <time>]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics
 lv stats <vm>                                # VM resource statistics

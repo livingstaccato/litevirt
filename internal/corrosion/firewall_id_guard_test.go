@@ -399,7 +399,7 @@ func TestFirewallIDWriterGuard(t *testing.T) {
 	found := identityWriters(pkgs)["internal/corrosion"]
 	for _, want := range []string{
 		"InsertVMWithHardware", "Client.BeginVMCreateOperation", "Client.BeginContainerCreateOperation",
-		"mutateDesiredSpec", "Client.BeginVMOperation", "migrateVMSpecNetworkNames", "execVMRekey",
+		"mutateDesiredSpec", "Client.BeginVMOperation", "execVMRekey",
 		"vmReplaceStatements", "upsertContainerStmt", "rekeyContainerStmt", "legacyRekeyContainerStmt",
 		"RelocateContainerWithToken", "MintContainerPlacementSpec", "mintContainerFirewallID",
 	} {

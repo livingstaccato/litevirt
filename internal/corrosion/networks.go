@@ -365,22 +365,25 @@ func migrateVMSpecNetworkNames(ctx context.Context, c *Client, renamed map[strin
 	for _, r := range rows {
 		vmName := r.String("name")
 		stackName := r.String("stack_name")
-		spec := r.String("spec")
-
-		updated, changed := rescopeSpecNetworkNames(spec, stackName, renamed, existing)
-		if !changed {
+		if _, changed := rescopeSpecNetworkNames(r.String("spec"), stackName, renamed, existing); !changed {
 			continue
 		}
-
-		// The same VM: it keeps its firewall identity.
-		updated, err = keepFirewallID(TagMemberVM, updated, firewallIDOf(TagMemberVM, spec))
-		if err != nil {
-			return err
-		}
 		slog.Info("migrating VM spec network names", "vm", vmName)
-		_ = c.Execute(ctx,
-			`UPDATE vms SET spec = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
-			updated, c.NowTS(), vmName)
+		// A desired-spec edit like any other (MutateDesiredSpec): it bumps the
+		// generation and keeps the VM's firewall identity, so a receiver orders
+		// it by generation. Written as a bare spec update, it lost on the owner
+		// to a later state write the owner made before it arrived, while every
+		// other replica took it, and the spec stayed split for good.
+		applied, _, err := MutateDesiredSpec(ctx, c, vmName, func(old string) (string, error) {
+			updated, _ := rescopeSpecNetworkNames(old, stackName, renamed, existing)
+			return updated, nil
+		})
+		switch {
+		case err != nil:
+			slog.Warn("migrating VM spec network names", "vm", vmName, "error", err)
+		case !applied:
+			slog.Info("VM spec network names left for the next start: an operation holds the spec", "vm", vmName)
+		}
 	}
 	return nil
 }

@@ -72,7 +72,8 @@ Exit code: 0 healthy · 1 degraded or unknown · 2 critical.`,
 	return cmd
 }
 
-// lv health resolve — mark one open dual-run condition resolved by hand.
+// lv health resolve — mark one open dual-run condition resolved by hand, or
+// acknowledge nvram_flush_failed (--accept-stale-uefi-vars).
 func newHealthResolveCmd() *cobra.Command {
 	var evaluator, reason string
 	var acceptStaleVars bool
@@ -130,7 +131,7 @@ ha.condition.resolved event.`,
 				}
 				h := resp.GetCondition()
 				if args[0] == "nvram_flush_failed" {
-					fmt.Printf("%s on %s/%s: %s. These UEFI vars stores are accepted as possibly stale:\n",
+					fmt.Printf("%s on %s/%s: %s. These UEFI vars stores are accepted as possibly stale, each only while the host still holds that same file (path and inode):\n",
 						h.GetCode(), h.GetSubjectKind(), h.GetSubjectId(), h.GetLifecycle())
 					var ev struct {
 						Files []struct {
@@ -144,7 +145,7 @@ ha.condition.resolved event.`,
 					for _, f := range ev.Files {
 						fmt.Printf("  %s (vm %s)\n", f.Path, f.VM)
 					}
-					fmt.Println("Any other file of that host whose flush failed is raised again; so is a new failure.")
+					fmt.Println("A listed file the host has since replaced stays raised, as does any other failed file and any new failure.")
 					return nil
 				}
 				fmt.Printf("%s on %s/%s (%s): %s. If it still holds, the detector raises it again on its next pass.\n",

@@ -364,3 +364,37 @@ func TestNvramFlushTick_AcknowledgesOnlyWhatTheResolvedRowNamed(t *testing.T) {
 		t.Fatal("an unreadable resolved row was not raised again")
 	}
 }
+
+// A resolved row naming the failed file's path but another inode names
+// another file (the VM was re-created since): nothing is acknowledged, the
+// host's failure is kept and raised again.
+func TestNvramFlushTick_SamePathOtherInodeIsNotAcknowledged(t *testing.T) {
+	ctx := context.Background()
+	d, db := nvramTestDaemon(t)
+	dir := t.TempDir()
+	a := failedVars(t, dir, "web-1")
+	f := libvirt.NewNvramFlusher(dir)
+	f.Seed([]libvirt.NvramFlushFailure{a})
+	var st nvramConditionState
+	d.nvramFlushTick(ctx, f, &st)
+
+	row, open := nvramCondition(t, db, CondNvramFlushFailed)
+	if !open {
+		t.Fatal("setup: condition not raised")
+	}
+	other := a
+	other.Ino++
+	ev, _ := json.Marshal(nvramFlushEvidence{Files: []libvirt.NvramFlushFailure{other}})
+	row.Evidence = string(ev)
+	row.Lifecycle, row.ResolvedAt = corrosion.ConditionResolved, time.Now().UTC().Format(time.RFC3339)
+	if err := corrosion.UpsertHealthCondition(ctx, db, row); err != nil {
+		t.Fatal(err)
+	}
+	d.nvramFlushTick(ctx, f, &st)
+	if got := f.Failures(); len(got) != 1 || got[0].Path != a.Path || got[0].Ino != a.Ino {
+		t.Fatalf("after a resolve naming another inode, the flusher holds %+v; want A at inode %d", got, a.Ino)
+	}
+	if _, open := nvramCondition(t, db, CondNvramFlushFailed); !open {
+		t.Fatal("the unacknowledged failure was not raised again")
+	}
+}

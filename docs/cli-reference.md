@@ -101,8 +101,9 @@ lv cluster claim-release <kind>/<name>       # Release one workload ha.claim.leg
                                    #   legacy proof stuck in flight on a live destination; the
                                    #   destination confirms nothing runs it, then abandons it (admin)
 lv health [--resolved]             # Cluster health: overall + conditions + coverage (exit 0/1/2)
-lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E]  # Resolve one open dual-run
-                                   #   condition by hand (admin, audited); re-raised next pass if it still holds
+lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept-stale-uefi-vars]
+                                   # Resolve one open dual-run condition by hand (admin, audited; re-raised next
+                                   #   pass if it still holds), or accept nvram_flush_failed's vars stores as stale
 ```
 
 ## Hosts

@@ -1034,7 +1034,13 @@ func (s *stubVirt) ClaimSpecificIP(_ context.Context, address string, vrfID int,
 	}
 	s.claimed = append(s.claimed, [2]string{address, identity})
 	s.nextIP++
-	return netbox.IPAddress{ID: 9000 + s.nextIP, Address: address, Identity: identity, VRFID: vrfID}, nil
+	ip := netbox.IPAddress{ID: 9000 + s.nextIP, Address: address, Identity: identity, VRFID: vrfID}
+	// What NetBox holds afterwards: a lookup by the identity finds it.
+	if s.byIdentityIPs == nil {
+		s.byIdentityIPs = map[string][]netbox.IPAddress{}
+	}
+	s.byIdentityIPs[identity] = append(s.byIdentityIPs[identity], ip)
+	return ip, nil
 }
 
 func (s *stubVirt) ReleaseIP(_ context.Context, id int) error {

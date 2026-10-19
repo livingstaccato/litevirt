@@ -120,3 +120,29 @@ func TestRepointGuardedOutIsNotRelayedToALaggingPeer(t *testing.T) {
 			"was relayed and applied (%d mutation_log row(s))", got, len(entries))
 	}
 }
+
+// The update committed and the read that confirms it failed: that is not a
+// guard miss. It is reported as unconfirmed, never as "nothing moved", which a
+// caller would take as licence to release the new object.
+func TestRepointNetBoxLeaseReportsAFailedConfirmationAsUnconfirmed(t *testing.T) {
+	c, ctx := repointFixture(t)
+	c.SetNetBoxRepointGate(func() bool { return true })
+	orig := confirmNetBoxRepoint
+	t.Cleanup(func() { confirmNetBoxRepoint = orig })
+	confirmNetBoxRepoint = func(context.Context, *Client, string, string, int) (bool, error) {
+		return false, errors.New("injected read failure")
+	}
+	moved, err := RepointNetBoxLease(ctx, c, "bound", "10.0.5.9", 41, 77)
+	if moved || !errors.Is(err, ErrNetBoxRepointUnconfirmed) {
+		t.Fatalf("moved=%v err=%v, want ErrNetBoxRepointUnconfirmed", moved, err)
+	}
+	if got := leaseNetBoxID(t, c); got != 77 {
+		t.Fatalf("lease names %d, want the committed 77", got)
+	}
+	// A confirmation that finds the lease no longer naming the new object is
+	// unconfirmed too: this call's update did commit.
+	confirmNetBoxRepoint = func(context.Context, *Client, string, string, int) (bool, error) { return false, nil }
+	if moved, err := RepointNetBoxLease(ctx, c, "bound", "10.0.5.9", 77, 78); moved || !errors.Is(err, ErrNetBoxRepointUnconfirmed) {
+		t.Fatalf("moved=%v err=%v, want ErrNetBoxRepointUnconfirmed", moved, err)
+	}
+}

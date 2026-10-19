@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
@@ -14,7 +15,9 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/pitoverlay"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 func hygieneAuditCount(t *testing.T, s *Server, action, result string) int {
@@ -88,7 +91,7 @@ func setAsideServer(t *testing.T) (s *Server, current, older string) {
 	if err := unix.Setxattr(disk, "user.litevirt.pit_window", []byte("tok-now"), 0); err != nil {
 		t.Skipf("no user xattrs here: %v", err)
 	}
-	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "web", HostName: s.hostName, State: "stopped", Spec: `{"name":"web"}`}, nil,
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "web", HostName: s.hostName, State: "stopped", Spec: `{"name":"web","uuid":"u-web"}`}, nil,
 		[]corrosion.DiskRecord{{VMName: "web", DiskName: "root", HostName: s.hostName, StorageType: "local", Path: disk}}); err != nil {
 		t.Fatal(err)
 	}
@@ -163,5 +166,199 @@ func TestSetAsideOverlays_ListAndRemoveRefusesWhatIsInUse(t *testing.T) {
 	}
 	if hygieneAuditCount(t, s, "pit.overlay.remove", "ok") != 1 || hygieneAuditCount(t, s, "pit.overlay.remove", "denied") < 2 {
 		t.Error("removals and refusals are not audited")
+	}
+}
+
+func rmOverlay(s *Server, ctx context.Context, name string) error {
+	_, err := s.RemoveSetAsideOverlay(ctx, &pb.RemoveSetAsideOverlayRequest{VmName: "web", DiskName: "root", Name: filepath.Base(name)})
+	return err
+}
+
+// m-2, m-4. Removal is refused while another VM's disk references the
+// overlay, while web's domain names it, and while whether it does cannot be
+// told (a libvirt error is never read as "no domain").
+//
+// Mutations, each red: "disk reference not judged" (the boundedRefs check
+// skipped); "domain not judged" (domainNamesFile's `if used` made false);
+// "libvirt error read as no domain" (domainNamesFile returns "" on any
+// DomainIsActive error).
+func TestSetAsideOverlays_RefusesWhatADiskOrADomainNames(t *testing.T) {
+	s, _, older := setAsideServer(t)
+	ctx := adminCtx()
+	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{Name: "clone", HostName: s.hostName, State: "stopped", Spec: `{"name":"clone"}`}, nil,
+		[]corrosion.DiskRecord{{VMName: "clone", DiskName: "root", HostName: s.hostName, StorageType: "local", Path: older}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rmOverlay(s, ctx, older); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("remove while clone's disk references it = %v, want FailedPrecondition", err)
+	}
+	if err := corrosion.DeleteVM(context.Background(), s.db, "clone"); err != nil {
+		t.Fatal(err)
+	}
+	s.virt.(*libvirtfake.Fake).SetState("web", libvirtfake.StateDefined)
+	snap := &fakePITSnapshotter{onOverlay: map[string]bool{older: true}}
+	s.SetPointInTimeSnapshotter(snap)
+	if err := rmOverlay(s, ctx, older); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("remove while web's domain names it = %v, want FailedPrecondition", err)
+	}
+	snap.onOverlay = map[string]bool{}
+	s.virt.(*libvirtfake.Fake).FailDomainState = func(string) error { return errors.New("libvirt: connection dropped") }
+	if err := rmOverlay(s, ctx, older); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("remove while libvirt cannot answer = %v, want FailedPrecondition", err)
+	}
+	s.virt.(*libvirtfake.Fake).FailDomainState = nil
+	if err := rmOverlay(s, ctx, older); err != nil {
+		t.Fatalf("remove once nothing names it: %v", err)
+	}
+}
+
+// m-3. A binding that cannot be read keeps the overlay: removal needs a
+// positive answer that it is not the disk's evidence.
+//
+// Mutation "an unreadable binding is no evidence" (OrphanInUse returns ""
+// on a read error other than ENOENT): it is removed; red.
+func TestSetAsideOverlays_AnUnreadableBindingKeepsIt(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads any file")
+	}
+	s, _, older := setAsideServer(t)
+	if err := os.Chmod(older+".id", 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(older+".id", 0o600) })
+	if err := rmOverlay(s, adminCtx(), older); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("remove with its binding unreadable = %v, want FailedPrecondition", err)
+	}
+	if !hygieneFileThere(older) {
+		t.Fatal("removed")
+	}
+}
+
+// I-2. A disk with no window token (a VM re-created at the same path) does
+// not count an EARLIER VM's orphans as its evidence: one whose binding
+// records another VM's uuid is removable, while one recording web's own
+// uuid, or none, is still evidence.
+//
+// Mutation "uuid not judged" (otherVM always false): the earlier VM's orphan
+// is kept as evidence; red.
+func TestSetAsideOverlays_AnEarlierVMsOrphanIsNotEvidence(t *testing.T) {
+	s, current, _ := setAsideServer(t)
+	disk, _ := pitoverlay.DiskOfOrphan(current)
+	if err := unix.Removexattr(disk, "user.litevirt.pit_window"); err != nil {
+		t.Fatal(err)
+	}
+	mk := func(uuid, stamp string) string {
+		o := pitoverlay.Path(disk) + ".orphan-" + stamp
+		b, _ := json.Marshal(pitoverlay.Binding{Owner: pitoverlay.Owner{VM: "web", VMUUID: uuid, Disk: "root"}, State: pitoverlay.StateWindow, Token: "x"})
+		if err := os.WriteFile(o, []byte("o"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(o+".id", b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return o
+	}
+	earlier, own, unknown := mk("u-old", "20261001-000000"), mk("u-web", "20261002-000000"), mk("", "20261003-000000")
+	ctx := adminCtx()
+	for _, o := range []string{own, unknown} {
+		if err := rmOverlay(s, ctx, o); status.Code(err) != codes.FailedPrecondition {
+			t.Errorf("remove of %s = %v, want FailedPrecondition (evidence)", filepath.Base(o), err)
+		}
+	}
+	if err := rmOverlay(s, ctx, earlier); err != nil {
+		t.Fatalf("remove of the earlier VM's orphan: %v", err)
+	}
+	if pitoverlay.SetAsideEvidenceFor(disk, "u-web") != true || pitoverlay.SetAsideEvidenceFor(filepath.Join(filepath.Dir(disk), "none.qcow2"), "u-web") {
+		t.Error("SetAsideEvidenceFor disagrees")
+	}
+}
+
+// m-2. A listing whose storage does not answer is refused, bounded.
+func TestSetAsideOverlays_ListingRefusesStorageThatDoesNotAnswer(t *testing.T) {
+	s, _, _ := setAsideServer(t)
+	t.Cleanup(storage.OverrideFSCallBoundForTest(50 * time.Millisecond))
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) })
+	t.Cleanup(pitoverlay.SetGlobForTest(func(string) ([]string, error) { <-block; return nil, nil }))
+	_, err := s.ListSetAsideOverlays(adminCtx(), &pb.ListSetAsideOverlaysRequest{VmName: "web"})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("listing on storage that does not answer = %v, want Unavailable", err)
+	}
+}
+
+// I-2. A detached overlay (no live disk where it was set aside) is listed on
+// the host with its owner from the binding, and removed by path, admin only;
+// refused outside a pool directory, for a name that is not an overlay's,
+// while a live disk is at its base path, while a VM disk references it, and
+// while a domain on the host names it.
+//
+// Mutations, each red: "pool directory not required"; "live base not
+// judged"; "no domain check for detached".
+func TestDetachedPITOverlay_ListedAndRemovedByPathWithItsGuards(t *testing.T) {
+	s, _, _ := setAsideServer(t)
+	ctx := adminCtx()
+	dir := filepath.Join(s.dataDir, "disks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Join(dir, "gone-root.qcow2")
+	o := pitoverlay.Path(base) + ".orphan-20261001-000000"
+	b, _ := json.Marshal(pitoverlay.Binding{Owner: pitoverlay.Owner{VM: "gone", VMUUID: "u-gone", Disk: "root"}})
+	if err := os.WriteFile(o, []byte("o"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(o+".id", b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := s.ListSetAsideOverlays(ctx, &pb.ListSetAsideOverlaysRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, ov := range resp.GetOverlays() {
+		if ov.GetPath() == o {
+			found = ov.GetDetached() && ov.GetVmName() == "gone" && ov.GetOwnerVmUuid() == "u-gone" && ov.GetDiskPath() == base
+		}
+	}
+	if !found {
+		t.Fatalf("detached overlay not listed as such: %+v", resp.GetOverlays())
+	}
+	rm := func(ctx context.Context, p string) error {
+		_, err := s.RemoveSetAsideOverlay(ctx, &pb.RemoveSetAsideOverlayRequest{Path: p})
+		return err
+	}
+	if err := rm(userCtx("op", "operator"), o); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("an operator's remove = %v, want PermissionDenied", err)
+	}
+	outside := filepath.Join(t.TempDir(), filepath.Base(o))
+	_ = os.WriteFile(outside, []byte("x"), 0o600)
+	if err := rm(ctx, outside); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("remove outside a pool directory = %v, want InvalidArgument", err)
+	}
+	if err := rm(ctx, filepath.Join(dir, "gone-root.qcow2")); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("remove of a disk by path = %v, want InvalidArgument", err)
+	}
+	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{Name: "gone", HostName: s.hostName, State: "stopped", Spec: `{"name":"gone"}`}, nil,
+		[]corrosion.DiskRecord{{VMName: "gone", DiskName: "root", HostName: s.hostName, StorageType: "local", Path: base}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rm(ctx, o); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("remove while a live disk is at its base path = %v, want FailedPrecondition", err)
+	}
+	if err := corrosion.DeleteVM(context.Background(), s.db, "gone"); err != nil {
+		t.Fatal(err)
+	}
+	s.virt.(*libvirtfake.Fake).SetState("web", libvirtfake.StateDefined)
+	snap := &fakePITSnapshotter{onOverlay: map[string]bool{o: true}}
+	s.SetPointInTimeSnapshotter(snap)
+	if err := rm(ctx, o); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("remove while web's domain names it = %v, want FailedPrecondition", err)
+	}
+	snap.onOverlay = map[string]bool{}
+	if err := rm(ctx, o); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if hygieneFileThere(o) || hygieneFileThere(o+".id") {
+		t.Error("the detached overlay or its binding is still there")
 	}
 }

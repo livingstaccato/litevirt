@@ -185,17 +185,26 @@ var ErrLoneBinding = errors.New("a binding with no overlay beside it")
 //     a later window made (re-review 1 of the pit-restore branch, I-1).
 //   - The token cannot be read (no user xattrs here, or any other error):
 //     windows cannot be told apart, and nothing counts.
-func SetAsideEvidence(disk string) bool { return setAsideEvidenceWith(glob, disk) }
+func SetAsideEvidence(disk string) bool { return setAsideEvidenceWith(glob, disk, "") }
+
+// SetAsideEvidenceFor is SetAsideEvidence for the VM of uuid vmUUID: an
+// orphan whose binding records ANOTHER VM's uuid (an earlier VM of the name,
+// whose disk sat at the same path) is never evidence for it. An empty
+// vmUUID, or a binding that records none, is judged as SetAsideEvidence does.
+func SetAsideEvidenceFor(disk, vmUUID string) bool { return setAsideEvidenceWith(glob, disk, vmUUID) }
 
 // SetAsideEvidenceBounded is SetAsideEvidence under storage.Bounded: a disk
 // on a network filesystem whose server does not answer gets the
 // *storage.FSNoAnswerError (storage.IsFSNoAnswer), never false. The look
 // lists the disk's directory, which a hard NFS mount answers only from its
 // server, even where a stat of the disk is answered from the attribute cache.
-func SetAsideEvidenceBounded(disk string) (bool, error) {
+func SetAsideEvidenceBounded(disk string) (bool, error) { return SetAsideEvidenceBoundedFor(disk, "") }
+
+// SetAsideEvidenceBoundedFor is SetAsideEvidenceFor under storage.Bounded.
+func SetAsideEvidenceBoundedFor(disk, vmUUID string) (bool, error) {
 	g := glob // read here: the call below may outlive its caller
 	return storage.Bounded("look for set-aside point-in-time overlays of", disk, func() (bool, error) {
-		return setAsideEvidenceWith(g, disk), nil
+		return setAsideEvidenceWith(g, disk, vmUUID), nil
 	})
 }
 
@@ -209,13 +218,13 @@ func SetGlobForTest(f func(string) ([]string, error)) (restore func()) {
 	return func() { glob = prev }
 }
 
-func setAsideEvidenceWith(glob func(string) ([]string, error), disk string) bool {
+func setAsideEvidenceWith(glob func(string) ([]string, error), disk, vmUUID string) bool {
 	orphans, err := orphansWith(glob, disk)
 	if err != nil || len(orphans) == 0 {
 		return false
 	}
 	for _, o := range orphans {
-		if orphanIsEvidence(disk, o) {
+		if orphanIsEvidence(disk, o, vmUUID) {
 			return true
 		}
 	}
@@ -240,13 +249,19 @@ func orphansWith(glob func(string) ([]string, error), disk string) ([]string, er
 	return orphans, nil
 }
 
-// OrphanIsEvidence reports whether the set-aside overlay orphan of disk is
-// what SetAsideEvidence counts: every orphan when the disk carries no window
-// token, else only one whose binding recorded the disk's token. A token that
-// cannot be read makes no orphan evidence.
-func OrphanIsEvidence(disk, orphan string) bool { return orphanIsEvidence(disk, orphan) }
+// otherVM reports whether binding data records a VM uuid other than vmUUID.
+func otherVM(data []byte, vmUUID string) bool {
+	var b Binding
+	return vmUUID != "" && json.Unmarshal(data, &b) == nil && b.VMUUID != "" && b.VMUUID != vmUUID
+}
 
-func orphanIsEvidence(disk, orphan string) bool {
+// orphanIsEvidence is SetAsideEvidence's per-orphan rule, read in its
+// favour: anything that cannot be read is no evidence.
+func orphanIsEvidence(disk, orphan, vmUUID string) bool {
+	data, berr := os.ReadFile(orphan + ".id")
+	if berr == nil && otherVM(data, vmUUID) {
+		return false
+	}
 	tok, err := getXattr(disk)
 	switch {
 	case errors.Is(err, errNoAttr):
@@ -254,12 +269,90 @@ func orphanIsEvidence(disk, orphan string) bool {
 	case err != nil || len(tok) == 0:
 		return false
 	}
-	data, err := os.ReadFile(orphan + ".id")
-	if err != nil {
+	if berr != nil {
 		return false
 	}
 	var b Binding
 	return json.Unmarshal(data, &b) == nil && b.Token != "" && b.Token == string(tok)
+}
+
+// OrphanInUse says why the set-aside overlay orphan of disk, beside the disk
+// of the VM of uuid vmUUID, may not be removed as evidence; "" when it is not
+// evidence. It is SetAsideEvidenceFor's rule read the other way: removal
+// needs a positive answer, so a binding or a window token that cannot be read
+// (anything but "no such file", "no such attribute" or "no user xattrs
+// here") keeps it.
+func OrphanInUse(disk, orphan, vmUUID string) string {
+	data, berr := os.ReadFile(orphan + ".id")
+	switch {
+	case berr == nil:
+		var b Binding
+		if err := json.Unmarshal(data, &b); err != nil {
+			return "its binding cannot be read: " + err.Error()
+		}
+		if otherVM(data, vmUUID) {
+			return "" // an earlier VM's: no window of this disk
+		}
+	case !errors.Is(berr, fs.ErrNotExist):
+		return "its binding cannot be read: " + berr.Error()
+	}
+	const evidence = "it is the set-aside evidence of the disk's current point-in-time window"
+	tok, err := getXattr(disk)
+	switch {
+	case errors.Is(err, errNoAttr):
+		return evidence // a disk with no window token: every orphan counts
+	case xattrUnsupported(err):
+		return "" // no user xattrs here: nothing counts
+	case err != nil:
+		return "the disk's window token cannot be read: " + err.Error()
+	case len(tok) == 0:
+		return evidence
+	}
+	if berr != nil {
+		return "" // no binding: no token to match
+	}
+	var b Binding
+	_ = json.Unmarshal(data, &b)
+	if b.Token != "" && b.Token == string(tok) {
+		return evidence
+	}
+	return ""
+}
+
+// IsOrphanName reports whether name is shaped as SetAside names an overlay it
+// set aside: ".<disk file>.lv-pit.orphan-<stamp>", not its binding. base is
+// the disk file's name.
+func IsOrphanName(name string) (base string, ok bool) {
+	if !strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".id") || strings.ContainsAny(name, "/\x00") {
+		return "", false
+	}
+	i := strings.Index(name, Suffix+".orphan-")
+	if i <= 1 || i+len(Suffix+".orphan-") == len(name) {
+		return "", false
+	}
+	return name[1:i], true
+}
+
+// DiskOfOrphan is the disk file an orphan was set aside beside.
+func DiskOfOrphan(orphan string) (string, bool) {
+	base, ok := IsOrphanName(filepath.Base(orphan))
+	if !ok {
+		return "", false
+	}
+	return filepath.Join(filepath.Dir(orphan), base), true
+}
+
+// OrphanOwner is the owner the orphan's binding records.
+func OrphanOwner(orphan string) (Owner, error) {
+	data, err := os.ReadFile(orphan + ".id")
+	if err != nil {
+		return Owner{}, err
+	}
+	var b Binding
+	if err := json.Unmarshal(data, &b); err != nil {
+		return Owner{}, err
+	}
+	return b.Owner, nil
 }
 
 // OrphanPath is disk's set-aside overlay of base name name, or an error when

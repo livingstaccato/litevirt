@@ -22,3 +22,18 @@ func TestOlderDaemonError_SaysTheDaemonIsOlder(t *testing.T) {
 		t.Errorf("another error = %q", err)
 	}
 }
+
+// m-6. lv pit-overlays rm asks first: with no terminal and no --yes it
+// refuses before anything is sent.
+//
+// Mutation "--yes by default": it goes on to dial a daemon; red.
+func TestPITOverlaysRm_AsksFirst(t *testing.T) {
+	for _, args := range [][]string{{"web", "root", ".web-root.qcow2.lv-pit.orphan-20261018-120000"}, {"--path", "/srv/p/.x.lv-pit.orphan-1"}} {
+		cmd := newPITOverlaysRmCmd()
+		cmd.SetArgs(args)
+		cmd.SilenceUsage, cmd.SilenceErrors = true, true
+		if err := cmd.Execute(); !errors.Is(err, errNoTTYConfirm) {
+			t.Errorf("rm %v with no terminal and no --yes = %v, want %v", args, err, errNoTTYConfirm)
+		}
+	}
+}

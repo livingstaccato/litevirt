@@ -5,6 +5,7 @@ import (
 	"errors"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -123,6 +124,10 @@ func TestCorrosionPlanLoader_SettleIgnoresAJoinedOlderTapCall(t *testing.T) {
 	insert("mover", "host-b", "52:54:00:00:00:22")
 	arm := NewArming()
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	doRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	// Every exit path, a Fatal included, unblocks the stalled tap call.
+	defer doRelease()
 	entered := make(chan struct{}, 1)
 	var calls int32
 	load := CorrosionPlanLoader(db, "host-a", Plan{}, LoaderOptions{
@@ -150,7 +155,7 @@ func TestCorrosionPlanLoader_SettleIgnoresAJoinedOlderTapCall(t *testing.T) {
 	// Release only once both passes are parked in the join's select: a
 	// goroutine scheduled after the release would start a fresh, valid lookup.
 	waitParkedInFetch(t, 2)
-	close(release)
+	doRelease()
 	if err := <-first; err != nil {
 		t.Fatal(err)
 	}

@@ -254,3 +254,38 @@ echo "umoci: write failed" >&2; exit 1
 		t.Fatal("a failed pull removed a directory that existed before it")
 	}
 }
+
+// An empty item directory (an older build's failed first pull left one) is
+// treated as no item: the pull unpacks beside it and renames over it only on
+// success, so a failure partway leaves it empty, not a partial item.
+func TestPullOCI_AnEmptyDestIsTreatedAsMissing(t *testing.T) {
+	fakeOCITools(t, false)
+	bin := t.TempDir()
+	umoci := `#!/bin/sh
+for a in "$@"; do bundle="$a"; done
+mkdir -p "$bundle/rootfs/etc" && echo partial > "$bundle/rootfs/etc/image"
+echo "umoci: write failed" >&2; exit 1
+`
+	if err := os.WriteFile(filepath.Join(bin, "umoci"), []byte(umoci), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	dest := filepath.Join(t.TempDir(), "admdarchbad")
+	if err := os.MkdirAll(dest, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := PullOCI(context.Background(), PullOCIOptions{Image: "alpine:3.21", Dest: dest}); err == nil {
+		t.Fatal("a failing unpack reported success")
+	}
+	if ents, err := os.ReadDir(dest); err == nil && len(ents) != 0 {
+		t.Fatalf("a failed pull into an empty item directory left a partial item: %v", ents)
+	}
+	// A pull that succeeds there puts the bundle in place.
+	fakeOCITools(t, false)
+	if err := PullOCI(context.Background(), PullOCIOptions{Image: "alpine:3.21", Dest: dest}); err != nil {
+		t.Fatal(err)
+	}
+	if got := imageIn(t, dest); got != "3.21" {
+		t.Fatalf("the item holds %q", got)
+	}
+}

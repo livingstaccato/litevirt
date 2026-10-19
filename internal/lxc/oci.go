@@ -134,10 +134,12 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) (err error) {
 	// Where umoci unpacks: a fresh directory beside the item, which then
 	// takes its place (replaceBundle) or becomes it (a first pull, renamed
 	// in only when it succeeded, so a failure leaves no partial item). A
-	// directory already at Dest that holds no bundle (empty, or foreign) is
-	// unpacked into as before, and never removed.
+	// An empty directory at Dest (an earlier build's failed first pull left
+	// one) counts as no item: the rename replaces it. A non-empty directory
+	// that holds no bundle (foreign) is unpacked into as before, and never
+	// removed.
 	_, serr := os.Lstat(opts.Dest)
-	created = errors.Is(serr, os.ErrNotExist)
+	created = errors.Is(serr, os.ErrNotExist) || isEmptyDir(opts.Dest)
 	bundle := opts.Dest
 	if exists || created {
 		if err := os.MkdirAll(filepath.Dir(opts.Dest), 0750); err != nil {
@@ -242,7 +244,9 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) (err error) {
 		if err := os.Chmod(bundle, 0o750); err != nil {
 			return fmt.Errorf("oci: %w", err)
 		}
-		if err := os.Rename(bundle, opts.Dest); err != nil {
+		// rename(2) replaces an empty directory at Dest (os.Rename would
+		// refuse any directory there) and fails if Dest is not empty.
+		if err := syscall.Rename(bundle, opts.Dest); err != nil {
 			return fmt.Errorf("oci: put the pulled image in place at %s: %w", opts.Dest, err)
 		}
 	}
@@ -563,3 +567,14 @@ func checkStagingSpace(dir string, size uint64, what string) error {
 
 // openSourceRef is openNoFollow; a test replaces it.
 var openSourceRef = openNoFollow
+
+// isEmptyDir reports whether p is a directory with nothing in it (not a
+// link to one).
+func isEmptyDir(p string) bool {
+	fi, err := os.Lstat(p)
+	if err != nil || !fi.IsDir() {
+		return false
+	}
+	ents, err := os.ReadDir(p)
+	return err == nil && len(ents) == 0
+}

@@ -54,19 +54,12 @@ func InsertSecurityGroup(ctx context.Context, c *Client, sg SecurityGroup) error
 	)
 }
 
-// FeatureSGProjects is the release feature of release_2026_11_v1 that a
-// project security group is written through
-// (docs/design/security-group-projects.md). Its declaration in
-// capabilities.releaseFeatures lands with the release's shared catalog commit;
-// until then the name is fixed here.
-const FeatureSGProjects capabilities.Feature = "sg_projects"
-
 // InsertProjectSecurityGroup creates a security group owned by sg.Project
 // (docs/design/security-group-projects.md). Its insert names the project
 // column, which a previous-release peer cannot decode, so it is the release
 // feature sg_projects: g must be that feature's grant.
 func InsertProjectSecurityGroup(ctx context.Context, c *Client, g capabilities.FeatureGrant, sg SecurityGroup) error {
-	if err := g.Check(FeatureSGProjects); err != nil {
+	if err := g.Check(capabilities.FeatureSGProjects); err != nil {
 		return err
 	}
 	if sg.Project == "" {

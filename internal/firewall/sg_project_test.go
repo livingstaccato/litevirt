@@ -27,7 +27,7 @@ func TestCorrosionPlanLoader_SkipsAnotherProjectsGroup(t *testing.T) {
 		insert := func() error { return corrosion.InsertSecurityGroup(ctx, db, g) }
 		if g.Project != "" {
 			insert = func() error {
-				return corrosion.InsertProjectSecurityGroup(ctx, db, capabilities.GrantForTest(t, corrosion.FeatureSGProjects), g)
+				return corrosion.InsertProjectSecurityGroup(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureSGProjects), g)
 			}
 		}
 		if err := insert(); err != nil {
@@ -92,7 +92,7 @@ func TestCorrosionPlanLoader_AProjectGroupDoesNotAdoptNameKeyedRules(t *testing.
 		Direction: "ingress", Proto: "tcp", PortRange: "23", Action: "accept"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.InsertProjectSecurityGroup(ctx, db, capabilities.GrantForTest(t, corrosion.FeatureSGProjects),
+	if err := corrosion.InsertProjectSecurityGroup(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureSGProjects),
 		corrosion.SecurityGroup{ID: "sg-p", Name: "stranded", Project: "acme"}); err != nil {
 		t.Fatal(err)
 	}

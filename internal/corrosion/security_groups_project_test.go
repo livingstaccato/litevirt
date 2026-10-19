@@ -86,7 +86,7 @@ func TestInsertProjectSecurityGroup_StoresTheProject(t *testing.T) {
 	ctx := context.Background()
 	db := sgProjectsDB(t)
 
-	if err := InsertProjectSecurityGroup(ctx, db, capabilities.GrantForTest(t, FeatureSGProjects),
+	if err := InsertProjectSecurityGroup(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureSGProjects),
 		SecurityGroup{ID: "sg-p", Name: "web", Project: "acme"}); err != nil {
 		t.Fatalf("project group with the grant: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestDeleteProject_RefusesWhileItOwnsSecurityGroups(t *testing.T) {
 	if err := InsertProject(ctx, db, ProjectRecord{Name: "acme"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := InsertProjectSecurityGroup(ctx, db, capabilities.GrantForTest(t, FeatureSGProjects),
+	if err := InsertProjectSecurityGroup(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureSGProjects),
 		SecurityGroup{ID: "sg-p", Name: "web", Project: "acme"}); err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestSecurityGroupAuditState_AProjectGroupLeavesNameKeyedRulesOut(t *testing
 		Direction: "ingress", Proto: "tcp", PortRange: "23", Action: "accept"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := InsertProjectSecurityGroup(ctx, db, capabilities.GrantForTest(t, FeatureSGProjects),
+	if err := InsertProjectSecurityGroup(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureSGProjects),
 		SecurityGroup{ID: "sg-p", Name: "stranded", Project: "acme"}); err != nil {
 		t.Fatal(err)
 	}

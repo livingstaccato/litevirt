@@ -135,7 +135,7 @@ func (s *Server) CreateSecurityGroup(ctx context.Context, req *pb.CreateSecurity
 		if err := corrosion.InsertSecurityGroup(ctx, s.db, row); err != nil {
 			return nil, status.Errorf(codes.Internal, "create security group: %v", err)
 		}
-	} else if err := s.WithReleaseFeature(ctx, corrosion.FeatureSGProjects, func(ctx context.Context, g capabilities.FeatureGrant) error {
+	} else if err := s.WithReleaseFeature(ctx, capabilities.FeatureSGProjects, func(ctx context.Context, g capabilities.FeatureGrant) error {
 		// The project column is a shape a previous-release peer cannot
 		// decode: the release feature waits for the release token and
 		// records the use first (docs/design/security-group-projects.md).

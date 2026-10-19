@@ -21,31 +21,6 @@ import (
 
 const sgProjNet = "sgnet"
 
-// declareSGProjects declares the release feature sg_projects for the test,
-// as the release's shared catalog commit will in capabilities.releaseFeatures.
-// Once that commit has landed the feature is already declared and this is a
-// no-op.
-func declareSGProjects(t *testing.T) {
-	t.Helper()
-	set := map[capabilities.Feature]capabilities.FeatureInfo{}
-	for _, f := range capabilities.Features() {
-		info, _ := capabilities.LookupFeature(f)
-		set[f] = info
-	}
-	if _, ok := set[corrosion.FeatureSGProjects]; ok {
-		return
-	}
-	set[corrosion.FeatureSGProjects] = capabilities.FeatureInfo{
-		Token:       capabilities.ReleaseToken,
-		Description: sgProjectsDescription,
-		Writers:     []string{"internal/corrosion.InsertProjectSecurityGroup"},
-	}
-	t.Cleanup(capabilities.OverrideFeaturesForTest(set))
-}
-
-// sgProjectsDescription is the catalog line for sg_projects.
-const sgProjectsDescription = "Security groups owned by a project (used when a group is created with a project)"
-
 // projectNetworkAdminToken creates user with Operator and NetworkAdmin on
 // /projects/<project> only, reloads a real auth engine on every node, and
 // returns the user's token.
@@ -212,7 +187,6 @@ func TestFleet_SGProjects_AProjectCannotSeeUseOrAttachAnotherProjectsGroup(t *te
 // acknowledged by every replica, and the project group reaches every host.
 func TestFleet_SGProjects_GatedOnTheReleaseToken(t *testing.T) {
 	ctx := context.Background()
-	declareSGProjects(t)
 	c, _ := latchedFleet(t, 3, 8008)
 	a, old := c.Nodes[0], c.Nodes[2]
 	admin := c.SelfClient(a)
@@ -240,7 +214,7 @@ func TestFleet_SGProjects_GatedOnTheReleaseToken(t *testing.T) {
 	})
 	for _, n := range c.Nodes {
 		assertNoProjectSGStatement(t, n)
-		if featureUsedOn(t, n, capabilities.ReleaseToken, string(corrosion.FeatureSGProjects)) {
+		if featureUsedOn(t, n, capabilities.ReleaseToken, string(capabilities.FeatureSGProjects)) {
 			t.Fatalf("%s holds an sg_projects use that nothing wrote", n.Name)
 		}
 	}
@@ -251,7 +225,7 @@ func TestFleet_SGProjects_GatedOnTheReleaseToken(t *testing.T) {
 		return err == nil
 	})
 	for _, n := range c.Nodes {
-		if !featureUsedOn(t, n, capabilities.ReleaseToken, string(corrosion.FeatureSGProjects)) {
+		if !featureUsedOn(t, n, capabilities.ReleaseToken, string(capabilities.FeatureSGProjects)) {
 			t.Fatalf("%s does not hold the sg_projects record although the group was written", n.Name)
 		}
 	}

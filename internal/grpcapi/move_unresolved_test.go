@@ -1344,3 +1344,27 @@ func TestCreateVM_ForgetsAnEarlierVMsMoveRecords(t *testing.T) {
 		t.Fatal("condition left open")
 	}
 }
+
+// A deleted VM's unresolved volume-move records and condition go with its
+// domain: they describe nothing once it is gone.
+//
+// Mutation: drop deleteVM's forgetMoveRecords — the record and the condition
+// are kept, red.
+func TestDeleteVM_ForgetsTheVMsMoveRecords(t *testing.T) {
+	s, _ := deleteDiskServerWith(t, true)
+	if err := health.RecordUnresolvedMove(s.dataDir, health.UnresolvedMove{VM: "a", Disk: "root", Src: "/a/x", Dst: "/b/x", Live: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := health.PublishUnresolvedMoves(context.Background(), s.db, s.dataDir, s.hostName, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteVM(adminCtx(), &pb.DeleteVMRequest{Name: "a"}); err != nil {
+		t.Fatalf("DeleteVM: %v", err)
+	}
+	if ms := moveRecords(t, s, "a"); len(ms) != 0 {
+		t.Fatalf("records kept: %+v", ms)
+	}
+	if health.MoveConditionCovers(context.Background(), s.db, "a", "root") {
+		t.Fatal("condition left open")
+	}
+}

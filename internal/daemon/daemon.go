@@ -1965,7 +1965,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fc.Claimer = svc
 	fc.RecoveryClaimEnforced = svc.RecoveryClaimEnforced
 	// The recovery-claim health conditions (ha.claim.stranded,
-	// ha.voter.unavailable) are the lease holder's to write, like genesis.
+	// ha.voter.unavailable) and host.address_shared are the lease holder's to
+	// write, like genesis.
 	fc.ClaimHealth = svc.RecoveryClaimHealthTick
 	// Partition pause, the majority side: rely on a host's pause only with this
 	// node's flag on AND partition_pause_v1 latched (every voter pauses), and

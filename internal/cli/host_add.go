@@ -3,13 +3,17 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"os"
 	"os/exec"
@@ -178,6 +182,15 @@ type addFile struct {
 // host: every file is uploaded to a staged path beside its destination
 // first, and only moved into place after AdmitHost. A refused add, or one
 // that fails before the admission, removes what it staged and leaves no row.
+//
+// The staged paths are the attempt's own: tagged with the serial of the
+// certificate it asks the cluster to admit and a nonce of the attempt's
+// (addStagedPath, <serial>-<nonce>). Two adds of one machine at once, from
+// two operators, and a rerun while the admitted add is still running, never
+// write, install or remove each other's files: a rerun stages its own copy
+// of the admitted pair, and an attempt that fails or is refused removes, and
+// rolls back, only files that carry its nonce. `lv host rm` removes every
+// attempt's of the serial it revoked.
 func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddPlan) error {
 	ip := net.ParseIP(p.hostAddr)
 	hostCrt, hostKey := filepath.Join(remotePKIDir, "host.crt"), filepath.Join(remotePKIDir, "host.key")
@@ -191,65 +204,80 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 	if err != nil {
 		return err
 	}
-	staged, err := remoteSerial(r, addStagedPath(hostCrt))
-	if err != nil {
-		return err
-	}
 	if err := refuseAnotherMember(hosts, p, installed); err != nil {
 		return err
 	}
 
+	nonce, err := attemptNonce()
+	if err != nil {
+		return err
+	}
+	var files []addFile
 	// An earlier add of this machine under this name: finish it with the
 	// certificate it was admitted with, which the machine holds installed
 	// or staged, or say that it already finished.
-	serial, pairOnMachine := "", false
+	serial, pairOnMachine, legacyPair := "", false, false
 	if row := liveHost(hosts, p.hostName); row != nil && row.GetAddress() == p.hostAddr {
 		admittedSerial := strings.ToLower(row.GetCertSerial())
 		joining := row.GetState() == pb.HostState_HOST_JOINING
-		switch {
-		case installed == admittedSerial && !joining:
+		if installed == admittedSerial && !joining {
 			fmt.Printf("Host %s is already a member at %s and serves the certificate it was admitted with; nothing to do\n",
 				p.hostName, p.hostAddr)
 			return addedLocally(p)
-		case joining && (installed == admittedSerial || staged == admittedSerial):
-			serial, pairOnMachine = admittedSerial, true
-			if err := admittedPairMatches(r, installed == admittedSerial); err != nil {
+		}
+		if joining {
+			if !validAttemptTag(admittedSerial) {
+				return fmt.Errorf("%s is admitted (joining) with certificate serial %q, which is not a serial. Undo "+
+					"the admission with `lv host rm %s`, then run `%s` again", p.hostName, admittedSerial, p.hostName, p.rerun)
+			}
+			pair, where, err := admittedPairOnMachine(r, admittedSerial, installed == admittedSerial)
+			if err != nil {
 				return fmt.Errorf("the key %s holds beside its admitted certificate %s does not match it (%v), so "+
 					"its daemon could not load the pair. Undo the admission with `lv host rm %s`, then run `%s` again",
 					p.hostName, admittedSerial, err, p.hostName, p.rerun)
 			}
-		case joining:
-			return fmt.Errorf("%s is admitted (joining) with certificate %s, which the host holds neither installed "+
-				"nor staged. Undo the admission with `lv host rm %s`, then run `%s` again",
-				p.hostName, admittedSerial, p.hostName, p.rerun)
+			if where == pairAbsent {
+				return fmt.Errorf("%s is admitted (joining) with certificate %s, which the host holds neither installed "+
+					"nor staged. Undo the admission with `lv host rm %s`, then run `%s` again",
+					p.hostName, admittedSerial, p.hostName, p.rerun)
+			}
+			serial, pairOnMachine = admittedSerial, true
+			if where != pairInstalled {
+				// Staged by the earlier attempt (or an earlier release's add,
+				// untagged): this attempt stages a copy of its own, and leaves
+				// the earlier attempt's files to it.
+				files = append(files, addFile{hostCrt, pair[0], 0o644}, addFile{hostKey, pair[1], 0o600})
+				legacyPair = where == pairStagedLegacy
+			}
 		}
 	}
 
-	var files []addFile
-	var local []string // minted here, moved into place once admitted
+	// This machine's copies of what the add mints: in a private directory of
+	// the attempt's, never at a path derived from the host's name.
+	minted, err := os.MkdirTemp(p.pkiDir, ".add-")
+	if err != nil {
+		return fmt.Errorf("create a directory to mint %s's credentials in: %w", p.hostName, err)
+	}
+	defer os.RemoveAll(minted)
 	if !pairOnMachine {
-		pair, s, err := mintStaged(p.pkiDir, p.hostName, ip, &local)
+		pair, s, err := mintStaged(p.pkiDir, minted, p.hostName, ip)
 		if err != nil {
-			removeAll(local)
 			return err
 		}
 		serial = s
 		files = append(files, addFile{hostCrt, pair[0], 0o644}, addFile{hostKey, pair[1], 0o600})
-	} else if installed != serial {
-		// The admitted pair waits at its staged paths from the earlier add.
-		files = append(files, addFile{path: hostCrt}, addFile{path: hostKey})
 	}
-	rest, err := addOtherFiles(p, ip, &local)
+	rest, err := addOtherFiles(p, minted, ip)
 	if err != nil {
-		removeAll(local)
 		return err
 	}
 	files = append(files, rest...)
+	tag := serial + "-" + nonce
+	fmt.Printf("  attempt %s: staging as .<file>.add-%s\n", nonce, tag)
 	// A machine that already has a config (a re-added one) keeps it: the
 	// keys the add must set are edited in, and setup leaves the file alone.
 	cfg, err := hostConfig(r, p)
 	if err != nil {
-		removeAll(local)
 		return err
 	}
 	if cfg != nil {
@@ -258,17 +286,15 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 	}
 	bin, err := os.ReadFile(p.binPath)
 	if err != nil {
-		removeAll(local)
 		return fmt.Errorf("read the litevirt binary: %w", err)
 	}
 
 	// Upload everything to its staged path. Nothing it replaces yet.
 	var wrote []string
 	unstage := func() {
-		if _, err := r.Shell("unstage", removeCmd(r, stagedPaths(wrote))); err != nil {
+		if _, err := r.Shell("unstage", removeCmd(r, stagedPaths(wrote, tag))); err != nil {
 			slog.Warn("could not remove the files staged on the host", "error", err)
 		}
-		removeAll(local)
 	}
 	if err := r.Run("mkdir -p " + ssh.ShellQuote(remotePKIDir) + " && mkdir -p -m 0700 " + ssh.ShellQuote(remoteMigrationDir)); err != nil {
 		return fmt.Errorf("create remote PKI dir: %w", err)
@@ -278,7 +304,7 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 			continue
 		}
 		wrote = append(wrote, f.path)
-		if err := r.WriteFile(addStagedPath(f.path), f.data, f.mode); err != nil {
+		if err := r.WriteFile(addStagedPath(f.path, tag), f.data, f.mode); err != nil {
 			unstage()
 			return fmt.Errorf("upload %s (nothing was admitted or installed): %w", filepath.Base(f.path), err)
 		}
@@ -302,21 +328,60 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 	if why := admitted.GetIncarnationNotIssued(); why != "" {
 		fmt.Printf("  re-admitted %s without a host incarnation: %s\n", p.hostName, why)
 	}
-	keepLocal(local)
+	keepLocal(minted, p.pkiDir, p.hostName)
 	failed := func(err error) error {
 		return fmt.Errorf("%w\n%s is admitted to the cluster (joining) with certificate %s and counts as a voter "+
 			"until it starts. Run `%s` to finish the add, or `lv host rm %s` to undo the admission",
 			err, p.hostName, serial, p.rerun, p.hostName)
 	}
+	// The pair it installs is the admitted one: its own attempt's, checked
+	// again now that the cluster has answered.
+	if installed != serial {
+		if err := stagedPairIs(r, serial, tag); err != nil {
+			return failed(fmt.Errorf("the pair staged for certificate %s is not that certificate and its key (%v); "+
+				"nothing was installed", serial, err))
+		}
+	}
+
+	// From here to the end (install, setup, rollback) the machine is this
+	// attempt's: it claims it in the machine's install record
+	// (addInstalledMarker), and every command it then runs there checks,
+	// under the add lock and in the process that holds it, that the record is
+	// still its claim (machineClaim.cmd). A command of this attempt that runs
+	// late (its connection lost) after another add has claimed the machine
+	// does nothing.
+	//
+	// Of two adds of this machine, the second to get here installs nothing,
+	// whatever its admission's stamp: the machine says another add installed
+	// since this one began, holds the machine, or installed another name.
+	prior, err := refuseSecondInstall(r, p, serial, installed, nonce)
+	if err != nil {
+		return failed(err)
+	}
+	// And the cluster is asked again, after a fresh pull, right before the
+	// install: a host active at this address, or an earlier admission there
+	// that has reached it since, keeps the address (AdmitHost is idempotent).
+	if _, err := c.AdmitHost(admitCtx, &pb.AdmitHostRequest{Name: p.hostName, Address: p.hostAddr, CertSerial: serial}); err != nil {
+		return failed(fmt.Errorf("the cluster refused the admission when asked again before installing (nothing was "+
+			"installed): %w", err))
+	}
+	claimedAt := time.Now().Unix()
+	m := machineClaim{r: r, mine: fmt.Sprintf("%s %s %d %s installing", p.hostName, serial, claimedAt, nonce)}
+	if err := m.take(prior); err != nil {
+		return failed(fmt.Errorf("%w; nothing was installed", err))
+	}
 
 	// A machine re-added while its old daemon still runs would serve the
 	// admitted identity from that stale process until setup restarts it.
-	if err := r.Run("systemctl stop litevirt 2>/dev/null || true"); err != nil {
+	if err := r.Run(m.cmd("systemctl stop litevirt 2>/dev/null || true")); err != nil {
 		return failed(fmt.Errorf("stop the host's daemon before installing: %w", err))
 	}
 	paths := make([]string, len(files))
+	ours := map[string]string{} // what this attempt installs at each path, by hash
 	for i, f := range files {
 		paths[i] = f.path
+		sum := sha256.Sum256(f.data)
+		ours[f.path] = hex.EncodeToString(sum[:])
 	}
 	existedOut, err := r.Shell("exists", existsCmd(r, paths))
 	if err != nil {
@@ -325,27 +390,38 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 	existed := existsSet(r, paths, existedOut)
 	// Nothing the machine holds is overwritten without a copy, and the copies
 	// go back if the add does not finish.
-	suffix := ".pre-add-" + time.Now().UTC().Format("20060102T150405Z")
+	suffix := ".pre-add-" + time.Now().UTC().Format("20060102T150405Z") + "-" + nonce
 	restore := func(err error) error {
-		if _, rerr := r.Shell("restore", restoreCmd(r, paths, existed, suffix)); rerr != nil {
+		// Only this attempt's install is undone, and only while the machine
+		// still records its claim: checked by the rollback command itself.
+		_, rerr := r.Shell("restore", m.cmd(restoreCmd(r, paths, existed, ours, suffix, tag)))
+		switch {
+		case exitStatus(rerr) == notOurMachine:
+			return failed(fmt.Errorf("%w\nnothing was put back: the machine no longer records this attempt's claim "+
+				"(%s), so the files there may be another add's; each replaced file's copy is kept beside it as "+
+				"<file>%s", err, addInstalledMarker, suffix))
+		case rerr != nil:
 			return failed(fmt.Errorf("%w\nputting back the files it replaced failed too (%v): a file whose copy "+
 				"was not moved back is kept beside it as <file>%s, and one that was may be at 0600 rather than "+
 				"its own mode", err, rerr, suffix))
 		}
+		if err := m.give(prior); err != nil {
+			slog.Warn("could not put back the machine's install record", "record", addInstalledMarker, "error", err)
+		}
 		return failed(fmt.Errorf("%w\nthe host's previous identity files were put back; the admitted ones are "+
 			"staged beside them for the rerun", err))
 	}
-	if _, err := r.Shell("install", installCmd(r, paths, suffix)); err != nil {
+	if _, err := r.Shell("install", m.cmd(installCmd(r, paths, suffix, tag))); err != nil {
 		return restore(fmt.Errorf("install the host identity: %w", err))
 	}
-	if _, err := r.Shell("binary", installCmd(r, []string{remoteBinary}, "")); err != nil {
+	if _, err := r.Shell("binary", m.cmd(installCmd(r, []string{remoteBinary}, "", tag))); err != nil {
 		return restore(fmt.Errorf("install the litevirt binary: %w", err))
 	}
 	// `lv` stays available as a convenience symlink to the combined binary.
-	if err := r.Run("ln -sf /usr/local/bin/litevirt /usr/local/bin/lv"); err != nil {
+	if err := r.Run(m.cmd("ln -sf /usr/local/bin/litevirt /usr/local/bin/lv")); err != nil {
 		return restore(fmt.Errorf("symlink lv: %w", err))
 	}
-	if err := finishAdd(r, p, serial, admitted); err != nil {
+	if err := finishAdd(r, p, serial, tag, admitted, m.cmd); err != nil {
 		return restore(err)
 	}
 	// The copies of replaced keys go; the operator's config is kept as it was.
@@ -357,8 +433,16 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 		}
 		discard = append(discard, path)
 	}
-	if _, err := r.Shell("discard", removeCmd(r, suffixed(discard, suffix))); err != nil {
+	if _, err := r.Shell("discard", m.cmd(removeCmd(r, suffixed(discard, suffix)))); err != nil {
 		slog.Warn("could not remove the copies of the replaced identity files", "suffix", suffix, "error", err)
+	}
+	if err := m.give(fmt.Sprintf("%s %s %d %s installed", p.hostName, serial, claimedAt, nonce)); err != nil {
+		slog.Warn("could not record the finished install on the host", "record", addInstalledMarker, "error", err)
+	}
+	if legacyPair {
+		if err := removeLegacyStagedPair(r, serial); err != nil {
+			slog.Warn("could not remove the pair an earlier release's add left staged", "error", err)
+		}
 	}
 	return addedLocally(p)
 }
@@ -411,12 +495,12 @@ func refuseAnotherMember(hosts []*pb.Host, p hostAddPlan, installed string) erro
 	return nil
 }
 
-// mintStaged mints hostName's pair beside this machine's copy and returns
-// its contents and serial. The paths are appended to local.
-func mintStaged(pkiDir, hostName string, ip net.IP, local *[]string) ([2][]byte, string, error) {
-	crt := filepath.Join(pkiDir, "."+hostName+".crt.add")
-	key := filepath.Join(pkiDir, "."+hostName+".key.add")
-	*local = append(*local, crt, key)
+// mintStaged mints hostName's pair, with the CA in pkiDir, into the
+// attempt's directory minted (as host.crt and host.key, whatever the name)
+// and returns its contents and serial.
+func mintStaged(pkiDir, minted, hostName string, ip net.IP) ([2][]byte, string, error) {
+	crt := filepath.Join(minted, "host.crt")
+	key := filepath.Join(minted, "host.key")
 	var pair [2][]byte
 	if err := pki.GenerateHostCert(filepath.Join(pkiDir, "ca.crt"), filepath.Join(pkiDir, "ca.key"), crt, key, hostName, ip); err != nil {
 		return pair, "", fmt.Errorf("generate host cert: %w", err)
@@ -434,12 +518,11 @@ func mintStaged(pkiDir, hostName string, ip net.IP, local *[]string) ([2][]byte,
 }
 
 // addOtherFiles is the rest of the key material an add installs: the cluster
-// CA, the gossip key and the host's migration credentials (minted beside this
-// machine's copy; paths appended to local).
-func addOtherFiles(p hostAddPlan, ip net.IP, local *[]string) ([]addFile, error) {
-	crt := filepath.Join(p.pkiDir, "."+p.hostName+"-migration.crt.add")
-	key := filepath.Join(p.pkiDir, "."+p.hostName+"-migration.key.add")
-	*local = append(*local, crt, key)
+// CA, the gossip key and the host's migration credentials (minted into the
+// attempt's directory minted).
+func addOtherFiles(p hostAddPlan, minted string, ip net.IP) ([]addFile, error) {
+	crt := filepath.Join(minted, "migration.crt")
+	key := filepath.Join(minted, "migration.key")
 	mig, err := issueMigrationCredentialsAt(p.pkiDir, crt, key, p.hostName, net.ParseIP(p.hostAddr), p.migHolder)
 	if err != nil {
 		return nil, err
@@ -461,28 +544,53 @@ func addOtherFiles(p hostAddPlan, ip net.IP, local *[]string) ([]addFile, error)
 	return files, nil
 }
 
-func removeAll(paths []string) {
-	for _, p := range paths {
-		_ = os.Remove(p)
+// keptHostsDir is where, under the operator's pki directory, an add keeps
+// its copy of each host's credentials: hosts/<name>/, apart from the
+// cluster's own files, so no host name can reach ca.crt or this machine's
+// host pair.
+const keptHostsDir = "hosts"
+
+// keptHostDir is hostName's directory under pkiDir/hosts, or "" for a name
+// that is not one plain path element.
+func keptHostDir(pkiDir, hostName string) string {
+	if hostName == "" || hostName == "." || hostName == ".." || strings.ContainsAny(hostName, "/\\\x00") {
+		return ""
 	}
+	return filepath.Join(pkiDir, keptHostsDir, hostName)
 }
 
-// keepLocal moves this machine's minted copies (".<name>.add") into place
-// once admitted. A failure leaves the staged copy where it is: the admitted
-// pair is also staged on the host, and the rerun takes it from there.
-func keepLocal(local []string) {
-	for _, s := range local {
-		dir, base := filepath.Split(s)
-		final := filepath.Join(dir, strings.TrimSuffix(strings.TrimPrefix(base, "."), ".add"))
-		if err := os.Rename(s, final); err != nil {
-			slog.Warn("could not keep this machine's copy of the admitted credentials", "path", s, "error", err)
+// keepLocal moves this machine's minted copies, from the attempt's directory
+// minted, to keptHostDir once admitted. A failure leaves nothing kept: the
+// admitted pair is also staged on the host, and the rerun takes it from
+// there.
+func keepLocal(minted, pkiDir, hostName string) {
+	dir := keptHostDir(pkiDir, hostName)
+	if dir == "" {
+		slog.Warn("not keeping this machine's copy of the admitted credentials: the host name is not a file name",
+			"host", hostName)
+		return
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		slog.Warn("could not keep this machine's copy of the admitted credentials", "dir", dir, "error", err)
+		return
+	}
+	for _, n := range []string{"host.crt", "host.key", "migration.crt", "migration.key"} {
+		src := filepath.Join(minted, n)
+		if _, err := os.Stat(src); err != nil {
+			continue
+		}
+		if err := os.Rename(src, filepath.Join(dir, n)); err != nil {
+			slog.Warn("could not keep this machine's copy of the admitted credentials", "path", src, "error", err)
 		}
 	}
 }
 
 // finishAdd writes the audit admission record and runs setup, which starts
 // the daemon.
-func finishAdd(r addRemote, p hostAddPlan, serial string, admitted *pb.AdmitHostResponse) error {
+//
+// Each of its writes on the host is run through guard (machineClaim.cmd);
+// the rejoin record is staged at tag's path first.
+func finishAdd(r addRemote, p hostAddPlan, serial, tag string, admitted *pb.AdmitHostResponse, guard func(string) string) error {
 	// The name's audit chain position, signed with the CA, so the new machine's
 	// daemon holds its own audit rows until that history has reached it instead
 	// of starting a second chain under an old name. Before setup, which starts
@@ -494,11 +602,14 @@ func finishAdd(r addRemote, p hostAddPlan, serial string, admitted *pb.AdmitHost
 	}
 	rejoinPath := filepath.Join(remotePKIDir, corrosion.AuditRejoinFileName)
 	if rejoin != nil {
-		if err := r.WriteFile(rejoinPath, rejoin, 0644); err != nil {
+		if err := r.WriteFile(addStagedPath(rejoinPath, tag), rejoin, 0644); err != nil {
 			return fmt.Errorf("push %s: %w", corrosion.AuditRejoinFileName, err)
 		}
+		if _, err := r.Shell("rejoin", guard(installCmd(r, []string{rejoinPath}, "", tag))); err != nil {
+			return fmt.Errorf("put %s in place: %w", corrosion.AuditRejoinFileName, err)
+		}
 	} else if remove {
-		if err := r.Run("rm -f " + ssh.ShellQuote(rejoinPath)); err != nil {
+		if _, err := r.Shell("rejoin", guard(removeCmd(r, []string{rejoinPath}))); err != nil {
 			return fmt.Errorf("remove a stale %s: %w", corrosion.AuditRejoinFileName, err)
 		}
 	}
@@ -512,7 +623,7 @@ func finishAdd(r addRemote, p hostAddPlan, serial string, admitted *pb.AdmitHost
 	// local database still contains its tombstone; starting it first lets its boot
 	// state update put a fresh timestamp on that tombstone and race the admission
 	// back out to the cluster.
-	if err := r.RunWithInput(remoteAddSetupCommand(p.hostName, p.hostAddr, p.peersYAML, p.enforcement, p.configInstalled), []byte(p.setupScript)); err != nil {
+	if err := r.RunWithInput(guard(remoteAddSetupCommand(p.hostName, p.hostAddr, p.peersYAML, p.enforcement, p.configInstalled)), []byte(p.setupScript)); err != nil {
 		return fmt.Errorf("run setup script after admitting the host identity: %w", err)
 	}
 	return nil
@@ -560,16 +671,39 @@ func installedSerial(b []byte) string {
 	return strings.ToLower(cert.SerialNumber.Text(16))
 }
 
-func addStagedPath(path string) string {
+// addStagedPath is where the add attempt tagged tag (the serial it is
+// admitted with) stages the file it installs at path: .<name>.add-<tag>
+// beside it.
+func addStagedPath(path, tag string) string {
+	return filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".add-"+tag)
+}
+
+// legacyStagedPath is where an earlier release's add staged path, untagged.
+func legacyStagedPath(path string) string {
 	return filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".add")
 }
 
-func stagedPaths(paths []string) []string {
+func stagedPaths(paths []string, tag string) []string {
 	out := make([]string, len(paths))
 	for i, p := range paths {
-		out[i] = addStagedPath(p)
+		out[i] = addStagedPath(p, tag)
 	}
 	return out
+}
+
+// validAttemptTag reports whether tag, a certificate serial, can name staged
+// files: lower-case hex. A serial read from the cluster's hosts row is
+// replicated data, and must not carry a path.
+func validAttemptTag(tag string) bool {
+	if tag == "" || len(tag) > 64 {
+		return false
+	}
+	for _, c := range tag {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func suffixed(paths []string, suffix string) []string {
@@ -615,10 +749,11 @@ func existsSet(r addRemote, paths []string, out []byte) map[string]string {
 	return got
 }
 
-// installCmd moves each path's staged file into place, synced before and
-// after the rename. With a suffix, every file it replaces is first copied to
-// path+suffix: its content (a symlinked key is followed) at 0600.
-func installCmd(r addRemote, paths []string, suffix string) string {
+// installCmd moves each path's file staged by the attempt tag into place,
+// synced before and after the rename. With a suffix, every file it replaces
+// is first copied to path+suffix: its content (a symlinked key is followed)
+// at 0600.
+func installCmd(r addRemote, paths []string, suffix, tag string) string {
 	var cmd strings.Builder
 	cmd.WriteString("set -e; umask 077; ")
 	if suffix != "" {
@@ -629,7 +764,7 @@ func installCmd(r addRemote, paths []string, suffix string) string {
 	}
 	dirs := map[string]bool{}
 	for _, p := range paths {
-		q, s := ssh.ShellQuote(r.Path(p)), ssh.ShellQuote(r.Path(addStagedPath(p)))
+		q, s := ssh.ShellQuote(r.Path(p)), ssh.ShellQuote(r.Path(addStagedPath(p, tag)))
 		cmd.WriteString(syncCmd(s))
 		fmt.Fprintf(&cmd, "mv -fT -- %s %s; ", s, q)
 		dirs[filepath.Dir(r.Path(p))] = true
@@ -643,18 +778,22 @@ func installCmd(r addRemote, paths []string, suffix string) string {
 	return cmd.String()
 }
 
-// restoreCmd undoes installCmd. A path whose staged file is still there was
-// never replaced. Any other goes back to its staged path, so the admitted
-// file stays on the host for a rerun, and its copy back into place at the
-// file's own mode (existed, from existsSet; the copy is 0600); one with no
-// copy did not exist.
-func restoreCmd(r addRemote, paths []string, existed map[string]string, suffix string) string {
+// restoreCmd undoes installCmd, for the files this attempt installed and
+// only those. A path whose staged file is still there was never replaced. A
+// path whose content is what this attempt installed (ours, its sha256) goes
+// back to its staged path (the attempt tag's), so the admitted file stays on
+// the host for a rerun, and its copy back into place at the file's own mode
+// (existed, from existsSet; the copy is 0600); one with no copy did not
+// exist. A path holding anything else was not written by this attempt: it is
+// left as it is, with the copy beside it, and the command fails.
+func restoreCmd(r addRemote, paths []string, existed, ours map[string]string, suffix, tag string) string {
 	var cmd strings.Builder
 	cmd.WriteString("rc=0; ")
 	for _, p := range paths {
 		q := ssh.ShellQuote(r.Path(p))
-		s, b := ssh.ShellQuote(r.Path(addStagedPath(p))), ssh.ShellQuote(r.Path(p)+suffix)
-		fmt.Fprintf(&cmd, "if [ -e %s ]; then rm -f -- %s || rc=1; else ", s, b)
+		s, b := ssh.ShellQuote(r.Path(addStagedPath(p, tag))), ssh.ShellQuote(r.Path(p)+suffix)
+		fmt.Fprintf(&cmd, "if [ -e %s ]; then rm -f -- %s || rc=1; ", s, b)
+		fmt.Fprintf(&cmd, "elif [ -e %s ] && [ \"$(sha256sum < %s | cut -d' ' -f1)\" != %s ]; then rc=1; else ", q, q, ssh.ShellQuote(ours[p]))
 		fmt.Fprintf(&cmd, "if [ -e %s ]; then mv -fT -- %s %s || rc=1; fi; ", q, q, s)
 		if mode := existed[p]; mode != "" {
 			fmt.Fprintf(&cmd, "if [ -e %s ]; then mv -fT -- %s %s && chmod %s %s || rc=1; fi; ", b, b, q, mode, q)
@@ -704,9 +843,12 @@ type LocalAddTarget struct {
 	// Binary is the file pushed as the litevirt binary.
 	Binary string
 	// FailSetup is what running setup returns; FailWrite what writing a
-	// path (as the host names it) returns.
+	// path (as the host names it; a staged path untagged, .<name>.add)
+	// returns.
 	FailSetup error
 	FailWrite map[string]error
+	// OnSetup, when set, runs when setup does; its error is setup's.
+	OnSetup func() error
 	// Events are what reached the host, in order: "write <path>",
 	// "run <cmd>" and "sh <kind>".
 	Events []string
@@ -745,7 +887,10 @@ func (d *LocalAddTarget) Run(cmd string) error {
 
 func (d *LocalAddTarget) RunWithInput(cmd string, _ []byte) error {
 	d.Events = append(d.Events, "run "+cmd)
-	if strings.HasSuffix(cmd, "bash -s") {
+	if strings.Contains(cmd, "bash -s") {
+		if d.OnSetup != nil {
+			return d.OnSetup()
+		}
 		return d.FailSetup
 	}
 	return nil
@@ -753,7 +898,11 @@ func (d *LocalAddTarget) RunWithInput(cmd string, _ []byte) error {
 
 func (d *LocalAddTarget) WriteFile(path string, data []byte, mode os.FileMode) error {
 	d.Events = append(d.Events, "write "+path)
-	if err := d.FailWrite[path]; err != nil {
+	key := path
+	if i := strings.LastIndex(path, ".add-"); i >= 0 {
+		key = path[:i+len(".add")]
+	}
+	if err := d.FailWrite[key]; err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(d.Path(path)), 0o755); err != nil {
@@ -1006,26 +1155,331 @@ func hostConfig(r addRemote, p hostAddPlan) (*addFile, error) {
 	return &addFile{path, merged, os.FileMode(mode)}, nil
 }
 
-// admittedPairMatches checks that the host's key is its admitted
-// certificate's: the installed pair, or the staged one an unfinished add left.
-func admittedPairMatches(r addRemote, installed bool) error {
+// Where admittedPairOnMachine found the admitted pair.
+const (
+	pairAbsent = iota
+	pairInstalled
+	pairStaged       // at the paths an add tagged with the serial staged it to
+	pairStagedLegacy // at an earlier release's untagged staged paths
+)
+
+// admittedPairOnMachine finds the pair of the admitted certificate serial on
+// the host: installed (installed says the host serves it), staged by the add
+// that was admitted with it, or staged by an earlier release's add. It
+// checks the key there is the certificate's, and returns the legacy pair's
+// contents, which the add stages again at its own paths.
+func admittedPairOnMachine(r addRemote, serial string, installed bool) ([2][]byte, int, error) {
 	crt, key := filepath.Join(remotePKIDir, "host.crt"), filepath.Join(remotePKIDir, "host.key")
-	if !installed {
-		crt, key = addStagedPath(crt), addStagedPath(key)
+	var pair [2][]byte
+	if installed {
+		_, err := readPair(r, crt, key, serial)
+		return pair, pairInstalled, err
 	}
-	c, okc, err := r.ReadFile(crt)
+	staged, err := stagedAttempts(r, crt, serial)
+	if err != nil {
+		return pair, pairAbsent, err
+	}
+	var perr error
+	for _, tag := range staged {
+		p, err := readPair(r, addStagedPath(crt, tag), addStagedPath(key, tag), serial)
+		if err == nil {
+			return p, pairStaged, nil
+		}
+		perr = err
+	}
+	if perr != nil {
+		return pair, pairAbsent, perr
+	}
+	if b, ok, err := r.ReadFile(legacyStagedPath(crt)); err != nil {
+		return pair, pairAbsent, err
+	} else if ok && installedSerial(b) == serial {
+		pair, err := readPair(r, legacyStagedPath(crt), legacyStagedPath(key), serial)
+		return pair, pairStagedLegacy, err
+	}
+	return pair, pairAbsent, nil
+}
+
+// stagedPairIs checks that the pair the attempt tag staged is certificate
+// serial and its key: what the install moves into place.
+func stagedPairIs(r addRemote, serial, tag string) error {
+	crt, key := filepath.Join(remotePKIDir, "host.crt"), filepath.Join(remotePKIDir, "host.key")
+	_, err := readPair(r, addStagedPath(crt, tag), addStagedPath(key, tag), serial)
+	return err
+}
+
+// attemptNonce is a fresh attempt's nonce, which every file it stages
+// carries.
+func attemptNonce() (string, error) {
+	b := make([]byte, 6)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("draw an attempt nonce: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// stagedAttempts lists the attempt tags (<serial>-<nonce>) under which path
+// is staged for serial on the host.
+func stagedAttempts(r addRemote, path, serial string) ([]string, error) {
+	prefix := addStagedPath(path, serial+"-")
+	out, err := r.Shell("staged", fmt.Sprintf("for f in %s*; do [ -e \"$f\" ] && printf '%%s\\n' \"$f\"; done; true",
+		ssh.ShellQuote(r.Path(prefix))))
+	if err != nil {
+		return nil, err
+	}
+	var tags []string
+	for _, l := range strings.Split(string(out), "\n") {
+		if l == "" {
+			continue
+		}
+		rest, ok := strings.CutPrefix(r.Unpath(l), prefix)
+		if !ok || !validAttemptTag(rest) {
+			continue
+		}
+		tags = append(tags, serial+"-"+rest)
+	}
+	return tags, nil
+}
+
+// removeLegacyStagedPair removes the untagged pair an earlier release's add
+// staged, only when its certificate is serial's. It first claims the pair by
+// renaming it to a name of its own, so an older add staging a new pair there
+// meanwhile keeps it; a claimed pair of another serial goes back, unless a
+// new one has taken its place.
+func removeLegacyStagedPair(r addRemote, serial string) error {
+	crt := legacyStagedPath(filepath.Join(remotePKIDir, "host.crt"))
+	key := legacyStagedPath(filepath.Join(remotePKIDir, "host.key"))
+	nonce, err := attemptNonce()
 	if err != nil {
 		return err
+	}
+	ccrt, ckey := crt+".rm-"+nonce, key+".rm-"+nonce
+	q := func(p string) string { return ssh.ShellQuote(r.Path(p)) }
+	if _, err := r.Shell("claim", fmt.Sprintf("if [ -e %s ]; then mv -fT -- %s %s; if [ -e %s ]; then mv -fT -- %s %s; fi; fi",
+		q(crt), q(crt), q(ccrt), q(key), q(key), q(ckey))); err != nil {
+		return err
+	}
+	b, ok, err := r.ReadFile(ccrt)
+	if err != nil || !ok {
+		return err
+	}
+	// The two renames are not one: an older add may have staged a new pair
+	// between them. Only a claimed certificate of serial with its own key
+	// goes; anything else goes back where it was.
+	k, okk, err := r.ReadFile(ckey)
+	if err != nil {
+		return err
+	}
+	if installedSerial(b) == serial && okk {
+		if _, perr := tls.X509KeyPair(b, k); perr == nil {
+			_, err = r.Shell("unstage", removeCmd(r, []string{ccrt, ckey}))
+			return err
+		}
+	}
+	_, err = r.Shell("unclaim", fmt.Sprintf("rc=0; mv -nT -- %s %s || rc=1; if [ -e %s ]; then mv -nT -- %s %s || rc=1; fi; exit $rc",
+		q(ccrt), q(crt), q(ckey), q(ckey), q(key)))
+	return err
+}
+
+// addLock is the file whose flock(2) every command an add runs on a machine
+// it has claimed takes, in the shell that runs it (machineClaim.cmd), for as
+// long as that command runs: a command delayed past its add's lost
+// connection still runs under it, or not at all.
+const addLock = "/etc/litevirt/.lv-add.lock"
+
+// addInstalledMarker records which add holds the machine or installed it
+// last: "<name> <serial> <unix time> <nonce> <installing|installed>" (an
+// earlier form has three or four fields, and is an install). Changed only
+// under addLock, by a compare-and-swap.
+const addInstalledMarker = "/etc/litevirt/.lv-add-installed"
+
+// addLockWait is how long, in seconds, a command waits for addLock while
+// another command holds it (a setup can hold it for minutes). A var so tests
+// can shorten it.
+var addLockWait = 600
+
+// staleClaim is how long a claim of another add with no finished install
+// keeps a second add out: an add's commands after its claim are short, but
+// for setup, which holds addLock while it runs. A claim older than this is
+// an add that died; taking it over is safe, since a late command of that add
+// finds the claim is no longer its own and does nothing.
+const staleClaim = 10 * time.Minute
+
+// freshInstall is how long an install under another name keeps a second add
+// of the machine from installing when that name's certificate is not revoked
+// here: long past the time an admission takes to reach every host.
+const freshInstall = time.Hour
+
+// notOurMachine is the exit status of a guarded command that found the
+// machine claimed by another (machineClaim.cmd).
+const notOurMachine = 97
+
+// lockedCmd runs body in a shell that holds addLock while it runs, and only
+// when cond holds there. Without flock(1) on the host it refuses: an add does
+// not change a machine unlocked.
+func lockedCmd(r addRemote, cond, body string) string {
+	lock := ssh.ShellQuote(r.Path(addLock))
+	return fmt.Sprintf("command -v flock >/dev/null 2>&1 || { echo 'flock(1) is not installed on the host; "+
+		"lv host add does not change the machine without its lock' >&2; exit 98; }; "+
+		"mkdir -p -- %s || exit 1; exec 9>>%s || exit 1; "+
+		"flock -w %d 9 || { echo 'another command holds the add lock %s' >&2; exit 96; }; "+
+		"if %s; then ( %s ); else echo 'this add no longer holds the machine: %s records another' >&2; exit %d; fi",
+		ssh.ShellQuote(filepath.Dir(r.Path(addLock))), lock, addLockWait, addLock, cond, body, addInstalledMarker, notOurMachine)
+}
+
+// markerIs is the shell test that the install record is line exactly
+// (without its newline); markerAbsent that there is none.
+func markerIs(r addRemote, line string) string {
+	return fmt.Sprintf("[ \"$(cat -- %s 2>/dev/null)\" = %s ]", ssh.ShellQuote(r.Path(addInstalledMarker)), ssh.ShellQuote(line))
+}
+
+func markerAbsent(r addRemote) string {
+	return fmt.Sprintf("[ ! -e %s ]", ssh.ShellQuote(r.Path(addInstalledMarker)))
+}
+
+// setMarkerCmd writes line as the install record ("" removes it): the new
+// file synced, renamed into place, then its directory synced, so the record
+// is on disk before anything the add installs after it. A failed sync fails
+// the command (and a claim fails the add before it installs anything):
+// `sync DIR` needs coreutils 8.24 or later, as the add's other syncs do, and
+// an older sync refuses the operand rather than skip it.
+func setMarkerCmd(r addRemote, line, nonce string) string {
+	m := ssh.ShellQuote(r.Path(addInstalledMarker))
+	dir := ssh.ShellQuote(filepath.Dir(r.Path(addInstalledMarker)))
+	tmp := ssh.ShellQuote(r.Path(addInstalledMarker) + ".new-" + nonce)
+	if line == "" {
+		return fmt.Sprintf("rm -f -- %s && sync -- %s", m, dir)
+	}
+	return fmt.Sprintf("umask 077; printf '%%s\\n' %s > %s && sync -- %s && mv -fT -- %s %s && sync -- %s",
+		ssh.ShellQuote(line), tmp, tmp, tmp, m, dir)
+}
+
+// machineClaim is an add's claim of the machine: mine is its install record.
+type machineClaim struct {
+	r    addRemote
+	mine string
+}
+
+// cmd is body run under addLock, only while the machine records this claim.
+func (m machineClaim) cmd(body string) string {
+	return lockedCmd(m.r, markerIs(m.r, m.mine), body)
+}
+
+func (m machineClaim) nonce() string {
+	if f := strings.Fields(m.mine); len(f) >= 4 {
+		return f[3]
+	}
+	return "x"
+}
+
+// take claims the machine, from the record prior that refuseSecondInstall
+// read ("" when there was none): only if it is still that.
+func (m machineClaim) take(prior string) error {
+	cond := markerAbsent(m.r)
+	if prior != "" {
+		cond = markerIs(m.r, prior)
+	}
+	_, err := m.r.Shell("claim", lockedCmd(m.r, cond, setMarkerCmd(m.r, m.mine, m.nonce())))
+	if exitStatus(err) == notOurMachine {
+		return fmt.Errorf("another add claimed this machine since this one read %s: run this again once it has "+
+			"finished", addInstalledMarker)
+	}
+	if err != nil {
+		return fmt.Errorf("claim the machine in %s: %w", addInstalledMarker, err)
+	}
+	return nil
+}
+
+// give replaces this claim with line ("" removes the record), only while the
+// machine still records the claim.
+func (m machineClaim) give(line string) error {
+	_, err := m.r.Shell("claim", m.cmd(setMarkerCmd(m.r, line, m.nonce())))
+	return err
+}
+
+// exitStatus is the exit status of a remote command's err, -1 when it has
+// none.
+func exitStatus(err error) int {
+	if err == nil {
+		return 0
+	}
+	var s interface{ ExitStatus() int }
+	if errors.As(err, &s) {
+		return s.ExitStatus()
+	}
+	var e interface{ ExitCode() int }
+	if errors.As(err, &e) {
+		return e.ExitCode()
+	}
+	return -1
+}
+
+// refuseSecondInstall refuses to install serial for p when another add has
+// the machine: its certificate is no longer the one this add found
+// (installed) nor serial; or its install record (addInstalledMarker) is
+// another add's claim younger than staleClaim, or an install of another name
+// less than freshInstall ago whose certificate this machine's CRL does not
+// revoke (`lv host rm` revokes it). It returns the record it read, which the
+// claim then replaces only if it is still there (machineClaim.take).
+func refuseSecondInstall(r addRemote, p hostAddPlan, serial, installed, nonce string) (string, error) {
+	now, err := remoteSerial(r, filepath.Join(remotePKIDir, "host.crt"))
+	if err != nil {
+		return "", err
+	}
+	if now != installed && now != serial {
+		return "", fmt.Errorf("the machine's certificate changed since this add began (it serves %s now): another add "+
+			"installed on it first, and this one installs nothing", now)
+	}
+	b, ok, err := r.ReadFile(addInstalledMarker)
+	if err != nil || !ok {
+		return "", err
+	}
+	prior := strings.TrimRight(string(b), "\n")
+	f := strings.Fields(prior)
+	if len(f) < 3 {
+		return prior, nil
+	}
+	at, _ := strconv.ParseInt(f[2], 10, 64)
+	when := time.Unix(at, 0)
+	if len(f) >= 5 && f[4] == "installing" && f[3] != nonce && time.Since(when) < staleClaim {
+		return "", fmt.Errorf("another `lv host add` holds this machine (attempt %s, for %s with certificate %s, since "+
+			"%s), and this one installs nothing. Run this again once it has finished; if it died, after %s",
+			f[3], f[0], f[1], when.UTC().Format(time.RFC3339), when.Add(staleClaim).UTC().Format(time.RFC3339))
+	}
+	if f[0] == p.hostName || time.Since(when) >= freshInstall {
+		return prior, nil
+	}
+	if sn, ok := new(big.Int).SetString(f[1], 16); ok && pki.IsCertRevoked(p.pkiDir, sn) {
+		return prior, nil
+	}
+	return "", fmt.Errorf("another add installed this machine as %s (certificate %s) at %s, and this one installs "+
+		"nothing: a machine is admitted under one name. Remove the admission you do not want (`lv host rm %s` or "+
+		"`lv host rm %s`, which revokes its certificate); otherwise a later add of the machine under another name "+
+		"waits until %s, or until %s is removed from the host", f[0], f[1], when.UTC().Format(time.RFC3339),
+		p.hostName, f[0], when.Add(freshInstall).UTC().Format(time.RFC3339), addInstalledMarker)
+}
+
+// readPair reads the certificate at crt and the key at key on the host, and
+// checks the certificate's serial is serial and the key is its key.
+func readPair(r addRemote, crt, key, serial string) ([2][]byte, error) {
+	var pair [2][]byte
+	c, okc, err := r.ReadFile(crt)
+	if err != nil {
+		return pair, err
 	}
 	k, okk, err := r.ReadFile(key)
 	if err != nil {
-		return err
+		return pair, err
 	}
 	if !okc || !okk {
-		return fmt.Errorf("%s or %s is missing", crt, key)
+		return pair, fmt.Errorf("%s or %s is missing", crt, key)
 	}
-	_, err = tls.X509KeyPair(c, k)
-	return err
+	if got := installedSerial(c); got != serial {
+		return pair, fmt.Errorf("%s is certificate %q, not %s", crt, got, serial)
+	}
+	if _, err := tls.X509KeyPair(c, k); err != nil {
+		return pair, err
+	}
+	return [2][]byte{c, k}, nil
 }
 
 // continuesValue reports whether line, after a top-level key, is part of its

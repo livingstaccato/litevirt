@@ -152,7 +152,8 @@ func TestImportSpace_AReleasedReservationAdmitsNothing(t *testing.T) {
 }
 
 // Two imports of one VM name at once would write the same file in the pool:
-// the second is refused while the first is in flight.
+// the second is refused while the first is in flight, before it stages
+// anything.
 func TestImportVM_ASecondImportOfTheSameNameIsRefused(t *testing.T) {
 	gate := t.TempDir()
 	gatedQemuImg(t, gate)
@@ -174,8 +175,10 @@ func TestImportVM_ASecondImportOfTheSameNameIsRefused(t *testing.T) {
 	ctx, cancel := context.WithTimeout(adminCtx(), 10*time.Second)
 	defer cancel()
 	err := s.ImportVM(&fakeImportStream{ctx: ctx, frames: []*pb.ImportVMRequest{smallImportFrame(t, "web", false)}})
-	if status.Code(err) != codes.AlreadyExists {
-		t.Fatalf("a second import of a name in flight: %v, want AlreadyExists", err)
+	// Refused before it stages anything, as a second create of a name in
+	// flight is (beginCreate), not at the conversion.
+	if status.Code(err) != codes.Aborted || !strings.Contains(err.Error(), "in progress") {
+		t.Fatalf("a second import of a name in flight: %v, want Aborted, a create in progress", err)
 	}
 	opened = true
 	openGate(t, gate)

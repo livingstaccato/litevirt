@@ -224,6 +224,8 @@ vms:
     max-memory: "8G"          # Ballooning ceiling the guest may inflate to (0 = fixed at memory)
     machine: "q35"            # Machine type: q35 (default) or pc
     firmware: "uefi"          # Firmware: uefi (default) or bios
+    secure-boot: false        # UEFI Secure Boot, as lv run --secure-boot (uefi + q35; default false)
+    tpm: false                # vTPM, as lv run --tpm (default false)
     replicas: 1               # Number of instances (default 1)
     guest-agent: true         # QEMU guest agent (default true for images)
     ip-hint: "10.0.1.50"     # IP hint for non-cloud-init VMs (used by DHCP reservation)

@@ -165,8 +165,12 @@ func TestSchemaV44FreshAndUpgradedColumnOrderMatch(t *testing.T) {
 			t.Fatalf("simulate v43 drop containers.%s: %v", column, err)
 		}
 	}
-	if err := upgraded.execLocal(ctx, `ALTER TABLE hosts DROP COLUMN capacity_policy_hash`); err != nil {
-		t.Fatalf("simulate v43 drop hosts.capacity_policy_hash: %v", err)
+	// hosts.incarnation came later and is appended after it, so a v43 table
+	// lacks both.
+	for _, column := range []string{"capacity_policy_hash", "incarnation"} {
+		if err := upgraded.execLocal(ctx, `ALTER TABLE hosts DROP COLUMN `+column); err != nil {
+			t.Fatalf("simulate v43 drop hosts.%s: %v", column, err)
+		}
 	}
 	for _, column := range []string{"subject_pattern", "project"} {
 		if err := upgraded.execLocal(ctx, `ALTER TABLE notification_routes DROP COLUMN `+column); err != nil {
@@ -174,7 +178,7 @@ func TestSchemaV44FreshAndUpgradedColumnOrderMatch(t *testing.T) {
 		}
 	}
 	for _, m := range schemaMigrationLedger {
-		if m.Version == 44 {
+		if m.Version == 44 || m.Version == schemaVersionHostIncarnation {
 			if err := upgraded.execLocal(ctx, `DELETE FROM applied_migrations WHERE id = ?`, m.ID); err != nil {
 				t.Fatalf("remove v44 ledger %s: %v", m.ID, err)
 			}

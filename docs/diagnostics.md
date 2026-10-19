@@ -1104,6 +1104,13 @@ restarted daemon's first pass, and `lv cluster converge` pull regardless.
 Resolve an unresolved row by making one side authoritative with a fresh write —
 which clears the tracking and lets the table converge.
 
+A `control_plane` tie on a `hosts` row is not cleared by `lv host config` or
+any other write to the row: each applies to both copies. Once
+`release_2026_11_v1` has latched, run `lv host rm <name>` and then `lv host add`
+for the machine; the re-admission is a later incarnation of the row and every
+node keeps it ([upgrades.md](upgrades.md)). The host does not need to be
+reachable.
+
 ### VM ownership ties — automatic and manual repair
 
 A `vms.host_name` split is the runtime-owned category: the resolver keeps it
@@ -1710,6 +1717,31 @@ names the way the [repair flow](#operational-repair-flow) describes; the held
 change then applies on its own. This is receiver-side only: an older receiver
 still back-pressures, and upgrading it is what releases the sender's stream.
 
+### A peer refuses replication: its schema is behind (`replication_peer_schema_behind`)
+
+Evaluator `replication_schema`, subject kind `host`, subject `<peer>`,
+severity warning (it degrades the cluster's health). A node whose database
+schema is behind a sender's refuses every push from it (`sender DB schema
+version N, local M (receiver is missing migrations ...)`), so nothing that
+sender writes reaches it. Each sender that sees the refusal raises the
+condition on the peer, and the refusing node raises it on itself, so its own
+`lv health` says so too (a node on a release before this one does neither).
+Either raises it only once the refusals have lasted five minutes: during a
+normal `lv host upgrade` each host not yet pre-staged refuses the hosts
+already pre-staged until its own turn, so a pass that takes longer than that
+on a large cluster can show the condition until the pass ends. The evidence
+records both schemas and the fix, `lv host upgrade <peer>`. The sender also logs, once per run of refusals, an
+ERROR `replication: a peer refuses this node's pushes: its database schema
+is behind`, naming the peer and the fix.
+
+The usual cause is a member left on the old schema during a rollout, or one
+brought back from an old backup. `lv host upgrade` pre-stages every member's
+schema before it swaps any binary (see [upgrades.md](upgrades.md)), so a
+rollout that used it leaves one only when `--skip-prestage` named it. Run `lv host upgrade <peer>`; its
+pre-stage brings the peer's schema forward and the refused writes then apply.
+The condition resolves once a sender's push at the refused schema is
+accepted, or the refusing node's own schema reaches it.
+
 ### A VM held on its point-in-time overlay (`pit_overlay.held`)
 
 Evaluator `pit_overlay`, subject kind `disk`, subject `<vm>/<disk>`, severity
@@ -2045,6 +2077,104 @@ on the host and restarting its daemon ends the hold at the cost of a permanent
 fork finding for that host
 ([audit-log.md](audit-log.md#rebuilding-a-host-under-its-old-name)).
 
+### Own row held (`own_row_held`)
+
+A daemon raises `own_row_held` about **itself** while it makes no write to its
+own `hosts` row, because that row is not the cluster's admission for the
+certificate the daemon serves ([upgrades.md](upgrades.md)). Its boot report,
+address correction and certificate re-record wait; replication and its gRPC
+server run.
+
+| Raised when | Clears when |
+|---|---|
+| At start or at runtime, the host's own row is live and names a serial other than the installed certificate's (evidence `arm` `a`), or is removed (`arm` `b`). Re-raised once a minute while held. **Warning**. The evidence carries `reason` (`at_start`; `superseded`: another admission replaced the row; `removed`), `held_for`, `timed_out`, `installed_serial` and `recorded_serial`. | The host's own row is live and names the installed certificate's serial. |
+
+A host whose installed certificate renewed the recorded one (`lv host
+renew-cert`, live or while the host was down) is not held: it records the new
+serial at once. Neither is a host whose certificate was reissued outside
+`lv host renew-cert` while its row is still the admission it was last admitted
+under, which it records in `<pki_dir>/own-admission.json`: it records the
+reissued serial when the daemon starts, so `auth.trust_rotated_peer_certs`
+converges it.
+
+At incarnation 1 or higher, a certificate swapped in while the daemon runs that
+is not a renewal of the recorded one is not recorded until the daemon restarts,
+and peers refuse it until then. The host raises `certificate/cert_swapped_at_runtime`
+about itself (**warning**; evidence `recorded_serial`, `serving_serial` and
+`remedy`). Peers refuse that host's writes until then, so the condition is
+only on that host's own replica: run `lv health` against that host
+(`LV_HOST=<its address> lv health`). Restart the daemon on that host
+(`systemctl restart litevirt`); the condition clears once the serial is
+recorded. The restart records it only when the host remembers its admission;
+if the condition is still open after the restart, the restart was held, and
+`own_row_held` below says why.
+
+A hold raised at start over a row at incarnation 0 reports `timed_out` after
+ten minutes, and the daemon then makes the writes the previous release makes.
+A hold over a row at incarnation 1 or higher, and a hold raised at runtime
+(`superseded`, `removed`), never times out. A held row that becomes another
+admission while held is reported as `superseded`.
+
+**`reason` `at_start`** is raised at start, for one of two causes:
+
+- the host was re-added while its data directory still held its old database,
+  so its replica still holds its own old row. This clears once the host's
+  replica receives the re-admission from a peer;
+- the host is at incarnation 1 or higher, its certificate was reissued outside
+  `lv host renew-cert` (its PKI directory was regenerated or restored), and its
+  `<pki_dir>/own-admission.json` is missing or records another admission. This
+  does not clear by itself.
+
+If it does not clear:
+
+1. Check that a peer is reachable from the host.
+2. On another node, run `lv host inspect <name>` and note the serial it shows.
+   That is the cluster's admission for the name, and it is the serial every
+   step below means. Do not use `recorded_serial` from `lv health` on this
+   host: it is this host's own replica, which may be stale. If the serial from
+   `lv host inspect` equals this host's `installed_serial`, the re-admission
+   has not reached the host yet: go back to step 1.
+3. Find out whether any machine **holds** the serial from step 2, running or
+   powered off: its `<pki_dir>/host.crt` carries that serial
+   (`openssl x509 -noout -serial -in <pki_dir>/host.crt` prints it in upper
+   case). If a machine other than this host holds it, this host is superseded:
+   follow the `superseded` procedure below, and do not remove the name. A
+   machine that is powered off still holds its admission.
+4. If this host holds a certificate and key with the serial from step 2 (for
+   example in a backup of its PKI directory), put them back as
+   `<pki_dir>/host.crt` and `<pki_dir>/host.key`. The hold then opens by
+   itself.
+5. Only when step 3 found no machine, running or powered off, that holds the
+   serial from step 2, and step 4 did not apply: stop the daemon on this host,
+   then remove the host and add it again.
+
+**`reason` `superseded`** is a host whose admission another `lv host add` of
+the same name replaced. Peers no longer accept its certificate. To recover:
+
+1. On another node, run `lv host inspect <name>` and note the serial it shows.
+   That is the cluster's admission for the name, and it is the serial every
+   step below means. Do not use `recorded_serial` from `lv health` on the
+   superseded machine: it is that machine's own replica, which may be stale.
+2. Stop the litevirt daemon on the superseded machine, outside the cluster,
+   and confirm that its workloads are stopped.
+3. Find the machine that **holds** the serial from step 1, running or powered
+   off: its `<pki_dir>/host.crt` carries that serial
+   (`openssl x509 -noout -serial -in <pki_dir>/host.crt` prints it in upper
+   case). A machine that is powered off still holds its admission. If it is
+   the machine to keep, leave the name alone: wipe the superseded machine's
+   data directory before adding it under any name.
+4. Run `lv host rm --dead <name>` only when step 3 found no machine, running
+   or powered off, that holds the serial from step 1, or when the operator has
+   decided to retire the machine that holds it, after stopping that machine's
+   daemon and confirming its workloads are stopped. Run it only after step 2
+   is confirmed, then run `lv host add` for the machine to
+   keep. `lv host add` is refused while workloads are still recorded on the
+   name; `lv health` shows `ha.claim.stranded` for any the failover
+   coordinator cannot recover.
+
+**`reason` `removed`** is a host removed while its daemon runs. It clears if
+the host is re-added and its re-admission reaches it.
+
 ### Audit replica not seeded (`audit_not_seeded`)
 
 A node whose replica is not known to hold the cluster's history raises
@@ -2083,6 +2213,33 @@ naming the prefix and the tree; the daemon log says the same at start.
 |---|---|
 | The daemon starts with such a prefix configured. | The daemon starts with no such prefix (the prefix moved to a filesystem of its own, or removed). |
 
+### vTPM state not durable (`vtpm_state_not_durable`)
+
+Evaluator `vtpm`, subject kind `host`, severity warning. A node with swtpm
+installed and `vtpm_state_sync` on (the default, docs/configuration.md) sets
+the sync attribute on `/var/lib/libvirt/swtpm` at start and every minute, so
+each vTPM state write is on disk before the TPM command returns. The node
+raises `vtpm_state_not_durable` about **itself** when it cannot. The evidence
+carries `state`, `path`, `fs`, `error` and `remedy`:
+
+- `unsupported`: the filesystem refuses the attribute (tmpfs, NFS, ZFS);
+- `not_inherited`: a file created there does not get it (btrfs);
+- `rename_not_synchronous`: the filesystem does not commit swtpm's rename of
+  the state file synchronously (xfs mounted without `dirsync` or `wsync`,
+  or a filesystem not known to);
+- `failed`: some entries could not be read or set, or were left alone and
+  reported: a directory deeper than libvirt's layout or with more than
+  100000 entries, a directory on another filesystem, or a hard-linked file
+  (`error` names them);
+- `timed_out`: a pass has not finished within 10 seconds (a hung NFS server).
+  The vTPM capability label stays false until a pass completes.
+
+A vTPM write made shortly before a power cut on that host can be lost.
+
+| Raised when | Clears when |
+|---|---|
+| A pass finds the tree cannot be made synchronous, or does not finish. | A pass makes it synchronous, `vtpm_state_sync: false` is set and the daemon restarted, or swtpm is removed from the host. A node rolled back to a build without this check leaves the row as it was until it runs a build that checks again. |
+
 ### Operation not reapable (`operation_unreapable`)
 
 Every node runs the operation reaper hourly. It tombstones each finished
@@ -2104,6 +2261,71 @@ and `error`) and `remedy`.
 **If it does not clear,** the `error` of each listed operation says why its
 steps could not be read or its tombstone could not be written. Fix that cause;
 the next pass retries every listed operation.
+
+### UEFI vars flush failed (`nvram_flush_failed`)
+
+Evaluator `uefi-vars`, subject kind `host`. Each node fsyncs the UEFI vars
+files that changed, in `<data_dir>/nvram/` and `/var/lib/libvirt/qemu/nvram/`,
+once a second. A node raises `nvram_flush_failed` (critical) about **itself**
+when one of those fsyncs fails, and logs `UEFI vars flush failed` with `path`,
+`vm` and `error`. The evidence carries `files` (each with `path`, `vm`,
+`error`, `at`, `dev`, `ino` and `mtime`) and `remedy`.
+
+No later fsync clears it, whether or not the guest wrote the file again. The
+kernel reports a writeback error to one fsync and marks the lost pages clean,
+and qemu writes back only the sectors a later guest write changes, so the lost
+pages stay stale on disk. The condition survives a daemon restart.
+
+| Raised when | Clears when |
+|---|---|
+| An fsync of a vars file failed. | Every listed file is removed or replaced by another file, or an admin acknowledges that its store may be stale. |
+
+**What to do.** The listed file may be missing UEFI variable writes the guest
+made. Check the disk (`dmesg`, `smartctl`). Writing the variables again in the
+guest does not clear it, and stopping the VM does not write the store out
+again. The ways out:
+
+- A Secure Boot or vTPM VM: `lv snapshot restore <vm> <name>` from a snapshot
+  taken before the failure replaces its vars file. A plain UEFI VM's snapshot
+  carries no firmware state, so this does not apply to it.
+- Any VM: `lv rm <vm>` removes its vars file. `lv rm --keep-disks` keeps it,
+  and the condition with it.
+- A VM kept as it is: an admin accepts that its vars store may be stale with
+  `lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars
+  --reason <why>`, which prints the files accepted. It is audited, naming every
+  file the condition named, and the host's daemon then stops reporting exactly
+  those files; any other failed file is raised again, and so is a new failure.
+  A request without `--accept-stale-uefi-vars` (an older `lv`, or a script that
+  sends only a reason) is refused.
+
+`lv backup restore-from` restores a disk, not firmware state, and is not a way
+out. Nor is `lv backup restore-live` for this VM: it restores firmware state
+only for a Secure Boot or vTPM VM, only with `--auto-start`, and only into a
+new VM (`--name`), and the old VM still needs `lv rm`.
+
+### UEFI vars file not flushed (`nvram_flush_blocked`)
+
+Evaluator `uefi-vars`, subject kind `host`. A vars file that could not be
+opened for its fsync is logged as `UEFI vars file could not be opened to flush
+it` and retried every second. A node raises `nvram_flush_blocked` (warning)
+about **itself** once a file has not been openable for a minute, logged at
+error. Nothing is known lost, but that file's writes are not being made
+durable. The evidence carries `files` (each with `path`, `vm`, `error` and
+`at`, when the episode began) and `remedy`.
+
+It also covers what keeps a whole directory from being flushed: a vars
+directory that cannot be read, or whose fsync fails, for a minute (logged as
+`UEFI vars directory could not be read` or `UEFI vars directory fsync failed`,
+and when it recovers), and a sweep stuck in an fsync for more than 10 seconds,
+listed for as long as it is stuck (`UEFI vars flush is stalled`).
+
+| Raised when | Clears when |
+|---|---|
+| A vars file has not been openable for its fsync, or a vars directory not readable or fsyncable, for a minute; or a sweep has been stuck in an fsync for 10 seconds. | Every listed file or directory is flushed again (logged as `UEFI vars file flushed again after it could not be opened`, `UEFI vars directory readable again`, `UEFI vars directory fsync succeeded again`), or is gone, and no sweep is stuck. |
+
+**What to do.** The `error` says why the file could not be opened: fix that
+cause (its permissions, the daemon's open-file limit, or what replaced the
+file).
 
 ### Reservation not released (`reservation_stale`)
 
@@ -2649,6 +2871,20 @@ the image open. An image stops being named as soon as a VM's disk names it
 again, and is forgotten once its pool answers without it (checked every 5
 minutes).
 
+An image is also left, and named the same way, when its cluster cannot be
+told as its domain would be given it. Its litevirt pool is the host pool, or
+for a compose stack's volume the stored stack's volume, its locator names
+(`lvpool`). The image is left when that pool, the stack or the pool's
+monitors cannot be read, when the pool of its name here is not a ceph pool,
+when its locator carries an option a domain cannot be given, or when its pool
+is not on this host (or the stack no longer has the volume) and its locator
+recorded monitors (`mon_host`). Those recorded monitors may no longer be its
+cluster's, so no rbd command is run on them. The VM's delete does not come
+back for the image: find the Ceph cluster that holds it and remove it there
+by hand (`rbd -m <that cluster's monitors> rm <pool>/<image>`). A journaled
+cutover cleanup that kept one retries by itself, and succeeds once the pool
+is on this host.
+
 ### A VM delete kept a disk file (`disk_leftover`)
 
 A VM delete never removes a disk it cannot prove unused, and never leaves one
@@ -2832,14 +3068,15 @@ on every node whose config enables the NetBox integration.
 
 ### Health findings
 
-Seven NetBox failures are silent to everything else litevirt reports, so they are
+Eight NetBox failures are silent to everything else litevirt reports, so they are
 also durable `health_conditions` rows and appear in `lv health` (see
 [Cluster health](#cluster-health-durable-conditions-and-the-admission-gate-v50)).
-The first two are raised by the orphan sweep, which runs under the `netbox`
-leader lease, so the cluster has exactly one writer. The other five are
+The first two are raised by the orphan sweep and the last by the inventory
+mirror, both of which run under the `netbox` leader lease, so the cluster has
+exactly one writer. The other five are
 per-node — they are about one node's own configuration or its own runtime, which
 no peer can read — so every configured node raises them for itself, keyed on its
-own host name, and a node that agrees never clears a peer's finding. All seven
+own host name, and a node that agrees never clears a peer's finding. All eight
 are **warning** severity, so they show as DEGRADED and never as CRITICAL, and
 none gates admission.
 
@@ -2852,6 +3089,7 @@ none gates admission.
 | `netbox_cluster_name_unpublished` | the host | A **live** host has published no resolved `netbox.cluster_name` at all, so this node cannot establish that the setting is uniform and **declines to mirror**. The evidence names the hosts it is waiting for. Every node configured for NetBox publishes on its first maintenance pass, so this normally clears within one interval; the one shape that does not clear itself is a live **worker** running with `netbox.enabled` off, which never publishes because it runs no NetBox pass — enable NetBox there, or remove the host. A host with `role=witness` is excluded from the wait: it votes, never hosts a workload, and so has nothing to be uniform about, and must not be able to block mirroring forever. A witness that *is* configured for NetBox still mirrors like any other node — what makes excluding it safe is that it runs the same comparison itself and declines when it disagrees, which is also why a witness never excludes another witness. Mirroring stops rather than running against a set litevirt knows to be incomplete: a peer that has not spoken may be about to publish a different name, and one pass is enough to write the whole inventory under the wrong cluster. Address allocation is unaffected. | Two consecutive revalidation passes on **that node** in which every live host has published. |
 | `netbox_discovery_unclaimable` | the host | A guest **on this host** is using an address on a bound network that NetBox will not grant it, so litevirt refused to record it. `reason=not_ours` is the serious one: NetBox holds that address for something else, which means two things are using it — the collision the feature exists to prevent, arriving from the one direction litevirt cannot stop (a DHCP server it does not run). The evidence names every affected guest, its address and the bounded reason. The address is left off the NIC record rather than asserted as litevirt's, so it is also missing from cloud-init, from the inventory mirror and from every "is this address free" answer. Nothing repairs it automatically: find what else holds the address and move one of them off. | Two consecutive revalidation passes on **that node** after the address becomes claimable — the IP scanner re-attempts every 30 seconds, so a refusal that has resolved clears on its next tick. |
 | `netbox_cluster_name_disagreement` | the host | A **live** peer published a different resolved `netbox.cluster_name` than this node resolves, so this node refuses to mirror inventory. The evidence names both values and the peers holding the other one. This is the check a cluster with **no bound network** has — there is no binding row to pin, and mirroring is the only thing such a cluster does with NetBox — and it is raised on **every** disagreeing node, because with two nodes holding two values neither is authoritative. Only voting-eligible hosts count (`health.VotingEligible`), minus witnesses, so neither a host that is offline, in maintenance, fenced or decommissioned nor a `role=witness` host (which has nothing to be uniform about, and still gates itself) can block mirroring with a stale or absent published value. Address allocation is unaffected. Fix the config on the node that is wrong and restart it. | Two consecutive revalidation passes on **that node** see every live host publishing the same name. |
+| `netbox_address_not_changeable` | the NetBox address id | The inventory mirror withheld removing an interface or VM because an address on it could not be detached: the NetBox API token litevirt uses may view the address but not change it, and removing what holds an address destroys it in NetBox. The evidence names the address, the interface and the object being removed. Nothing else stops: every other action in the pass runs, and only that one removal is withheld, on every pass. Give the token change permission on `ipam.ipaddress`, or detach the address in NetBox by hand. | Two consecutive mirror passes that attempt every removal they plan and withhold none for that address. A pass that held back its removals for want of evidence (see the withholding warnings above) attempts none, so it neither raises nor clears this finding. |
 
 The three-pass threshold is deliberately per-process state held by the lease
 holder: a daemon restart or a lease handover re-arms it, and three fresh passes

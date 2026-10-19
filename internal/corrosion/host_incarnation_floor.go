@@ -102,8 +102,11 @@ func isReadmitStamp(s string) bool {
 }
 
 const hostsIncarnationAdvice = "A peer offered this host's row from before its re-admission (an older " +
-	"created_at): the host was re-added while its data directory still held its old database. The " +
-	"re-admitted row is kept; the host's own later writes still arrive by replication"
+	"created_at). Either that peer does not hold the re-admitted row yet (a peer of the previous release " +
+	"applies a re-admission without stamping its created_at, and offers the old one until the re-admitted " +
+	"row reaches it), or the host " +
+	"was re-added while its data directory still held its old database. The re-admitted row is kept; the " +
+	"host's own later writes still arrive by replication"
 
 // refusalLogInterval is how often the floor's warning names one row. The
 // refusal repeats every anti-entropy cycle on every node holding the

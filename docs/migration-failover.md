@@ -749,7 +749,12 @@ password, and the fence result says so.
 
 A password set with `lv host config <host> --ipmi-pass` after the removal or
 re-admission reaches every node, by replication or by anti-entropy. A copy of
-the old password, from any node, never replaces the retired one.
+the old password, from any node, never replaces the retired one. On a node
+that has not yet received the host's re-admission, `lv host config <host>
+--ipmi-pass` is refused with "this node's hosts row predates the host's
+current admission" and sets nothing: run it against a node that shows the
+re-admission in `lv host inspect <host>`, or retry once replication has
+caught up.
 
 A password only beats a retirement if this build recorded it as set after
 that retirement. The upgrade gives every existing password no such record,

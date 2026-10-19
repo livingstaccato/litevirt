@@ -22,7 +22,7 @@ const (
 )
 
 func litevirtDomainXML(name, dev, srcPath string) string {
-	return "<domain type='kvm'>\n  <name>" + name + "</name>\n  <metadata>\n    " +
+	return "<domain type='kvm'>\n  <name>" + name + "</name>\n  <uuid>" + libvirtfake.DomainUUIDFor(name) + "</uuid>\n  <metadata>\n    " +
 		mvManagedEl + "\n    " + mvOwnerEpochEl + "\n  </metadata>\n  <devices>\n" +
 		"    <disk type='file' device='disk'>\n      <driver name='qemu' type='qcow2'/>\n" +
 		"      <source file='" + srcPath + "'/>\n      <target dev='" + dev + "' bus='virtio'/>\n" +

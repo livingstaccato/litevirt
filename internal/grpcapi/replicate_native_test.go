@@ -199,16 +199,17 @@ func TestReplicateVolume_NativeTargetIsAdminOnly(t *testing.T) {
 // (info, import, image-meta) with the destination's.
 func TestReplicateVolume_NativeCephUsesEachSidesOwnCredentials(t *testing.T) {
 	log := fakeCLI(t)
+	aConf, bConf := cephConfAt(t, "10.0.0.1:6789"), cephConfAt(t, "10.0.7.1:6789")
 	s := testServer(t)
 	s.hostName = "test-host"
 	s.SetStoragePoolsByName(map[string]StoragePoolRef{
-		"src":    {Driver: "ceph", Source: "rbd", Options: map[string]string{"conf": "/etc/ceph/a.conf", "keyring": "/etc/ceph/a.keyring", "id": "a"}},
-		"copies": {Driver: "ceph", Source: "copies", Options: map[string]string{"conf": "/etc/ceph/b.conf", "keyring": "/etc/ceph/b.keyring", "id": "b"}},
+		"src":    {Driver: "ceph", Source: "rbd", Options: map[string]string{"conf": aConf, "keyring": "/etc/ceph/a.keyring", "id": "a"}},
+		"copies": {Driver: "ceph", Source: "copies", Options: map[string]string{"conf": bConf, "keyring": "/etc/ceph/b.keyring", "id": "b"}},
 	})
 	spec, _ := json.Marshal(&pb.VMSpec{Name: "vm1", Project: "a"})
 	if err := corrosion.InsertVM(context.Background(), s.db,
 		corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "stopped", Project: "a", Spec: string(spec)},
-		nil, []corrosion.DiskRecord{{VMName: "vm1", DiskName: "root", HostName: "test-host", Path: "rbd:rbd/vm1-root",
+		nil, []corrosion.DiskRecord{{VMName: "vm1", DiskName: "root", HostName: "test-host", Path: "rbd:rbd/vm1-root:lvpool=src",
 			SizeBytes: 1 << 20, StorageType: "ceph", StorageVolume: "src"}}); err != nil {
 		t.Fatal(err)
 	}
@@ -216,8 +217,8 @@ func TestReplicateVolume_NativeCephUsesEachSidesOwnCredentials(t *testing.T) {
 		&streamRecorder[pb.ReplicateVolumeProgress]{ctx: adminCtx()}); err != nil {
 		t.Fatalf("cross-cluster native ceph copy: %v", err)
 	}
-	srcCreds := "rbd --id a --conf /etc/ceph/a.conf --keyring /etc/ceph/a.keyring "
-	dstCreds := "rbd --id b --conf /etc/ceph/b.conf --keyring /etc/ceph/b.keyring "
+	srcCreds := "rbd --id a --conf " + aConf + " --keyring /etc/ceph/a.keyring "
+	dstCreds := "rbd --id b --conf " + bConf + " --keyring /etc/ceph/b.keyring "
 	seen := map[string]bool{}
 	for _, c := range calls(t, log) {
 		for _, sub := range []string{"snap create", "export", "snap rm"} {
@@ -304,23 +305,24 @@ exit 0
 // the copy's source side runs with those, never the destination's.
 func TestReplicateVolume_NativeCephPoolLessSourceUsesItsPathCredentials(t *testing.T) {
 	log := fakeCLI(t)
+	aConf, bConf := cephConfAt(t, "10.0.0.1:6789"), cephConfAt(t, "10.0.7.1:6789")
 	s := testServer(t)
 	s.hostName = "test-host"
 	s.SetStoragePoolsByName(map[string]StoragePoolRef{
-		"copies": {Driver: "ceph", Source: "copies", Options: map[string]string{"conf": "/etc/ceph/b.conf", "keyring": "/etc/ceph/b.keyring", "id": "b"}},
+		"copies": {Driver: "ceph", Source: "copies", Options: map[string]string{"conf": bConf, "keyring": "/etc/ceph/b.keyring", "id": "b"}},
 	})
 	spec, _ := json.Marshal(&pb.VMSpec{Name: "vm1", Project: "a"})
 	if err := corrosion.InsertVM(context.Background(), s.db,
 		corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "stopped", Project: "a", Spec: string(spec)},
 		nil, []corrosion.DiskRecord{{VMName: "vm1", DiskName: "root", HostName: "test-host",
-			Path: "rbd:rbd/vm1-root:conf=/etc/ceph/a.conf:keyring=/etc/ceph/a.keyring:id=a", SizeBytes: 1 << 20, StorageType: "ceph"}}); err != nil {
+			Path: "rbd:rbd/vm1-root:conf=" + aConf + ":keyring=/etc/ceph/a.keyring:id=a", SizeBytes: 1 << 20, StorageType: "ceph"}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.ReplicateVolume(&pb.ReplicateVolumeRequest{VmName: "vm1", DiskName: "root", TargetPool: "copies"},
 		&streamRecorder[pb.ReplicateVolumeProgress]{ctx: adminCtx()}); err != nil {
 		t.Fatalf("native ceph copy of a pool-less disk: %v", err)
 	}
-	srcCreds := "rbd --id a --conf /etc/ceph/a.conf --keyring /etc/ceph/a.keyring "
+	srcCreds := "rbd --id a --conf " + aConf + " --keyring /etc/ceph/a.keyring "
 	seen := false
 	for _, c := range calls(t, log) {
 		if strings.Contains(c, " snap create ") || strings.Contains(c, " export ") {
@@ -333,4 +335,84 @@ func TestReplicateVolume_NativeCephPoolLessSourceUsesItsPathCredentials(t *testi
 	if !seen {
 		t.Error("no source-side call ran")
 	}
+}
+
+// replicateFromRBD records vm1 with one root disk at path (row pool volume)
+// and a ceph target pool "copies" on cluster C, and runs a native copy.
+func replicateFromRBD(t *testing.T, pools map[string]StoragePoolRef, path, volume string) error {
+	t.Helper()
+	s := testServer(t)
+	s.hostName = "test-host"
+	pools["copies"] = StoragePoolRef{Driver: "ceph", Source: "copies", Options: map[string]string{"mon_host": "10.0.7.1:6789", "keyring": "/k", "id": "c"}}
+	s.SetStoragePoolsByName(pools)
+	spec, _ := json.Marshal(&pb.VMSpec{Name: "vm1", Project: "a"})
+	if err := corrosion.InsertVM(context.Background(), s.db,
+		corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "stopped", Project: "a", Spec: string(spec)},
+		nil, []corrosion.DiskRecord{{VMName: "vm1", DiskName: "root", HostName: "test-host", Path: path,
+			SizeBytes: 1 << 20, StorageType: "ceph", StorageVolume: volume}}); err != nil {
+		t.Fatal(err)
+	}
+	return s.ReplicateVolume(&pb.ReplicateVolumeRequest{VmName: "vm1", DiskName: "root", TargetPool: "copies"},
+		&streamRecorder[pb.ReplicateVolumeProgress]{ctx: adminCtx()})
+}
+
+// A native copy's source side (snap create, export, snap rm) runs on the
+// cluster the disk's domain is given — its litevirt pool's on this host —
+// never on monitors its locator recorded, where a same-named image of
+// another cluster would be snapshotted and copied out.
+//
+// Mutation: the old source options (the row's storage_volume pool, else the
+// locator's own, mon_host included) — the source side runs on B, red.
+func TestReplicateVolume_NativeCephSourceOnItsPoolsCluster(t *testing.T) {
+	log := fakeCLI(t)
+	err := replicateFromRBD(t, map[string]StoragePoolRef{
+		"ceph1": {Driver: "ceph", Source: "lv", Options: map[string]string{"mon_host": "10.0.0.1:6789", "keyring": "/k", "id": "litevirt"}},
+	}, `rbd:lv/vm1-root:id=litevirt:keyring=/k:lvpool=ceph1:mon_host=10.0.9.1\:6789`, "")
+	if err != nil {
+		t.Fatalf("native ceph copy: %v", err)
+	}
+	seen := false
+	for _, c := range calls(t, log) {
+		for _, sub := range []string{" snap create ", " export", " snap rm "} {
+			if strings.Contains(c, sub) {
+				seen = true
+				if strings.Contains(c, "10.0.9.1") || !strings.Contains(c, "-m 10.0.0.1:6789") {
+					t.Errorf("source-side %q ran as %q, want it on the pool's cluster A only", strings.TrimSpace(sub), c)
+				}
+			}
+		}
+	}
+	if !seen {
+		t.Error("no source-side call ran")
+	}
+}
+
+// A source whose cluster cannot be told as its domain would be given it —
+// here no litevirt pool on this host and a recorded mon_host — is refused
+// before anything runs.
+//
+// Mutation: the locator's own options — the source side runs on B, red.
+func TestReplicateVolume_NativeCephSourceOnAnUnknowableClusterIsRefused(t *testing.T) {
+	log := fakeCLI(t)
+	err := replicateFromRBD(t, map[string]StoragePoolRef{},
+		`rbd:lv/vm1-root:id=litevirt:keyring=/k:lvpool=gone:mon_host=10.0.9.1\:6789`, "")
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("copy = %v, want FailedPrecondition", err)
+	}
+	for _, c := range calls(t, log) {
+		if strings.Contains(c, "10.0.9.1") {
+			t.Errorf("rbd ran %q on the recorded monitors", c)
+		}
+	}
+}
+
+// cephConfAt writes a ceph.conf naming mon, as a pool's or a locator's conf
+// must for a domain to be given its cluster.
+func cephConfAt(t *testing.T, mon string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "ceph.conf")
+	if err := os.WriteFile(p, []byte("[global]\nmon_host = "+mon+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
 }

@@ -177,6 +177,20 @@ func (c *Checker) QuorumProof(ctx context.Context) (state QuorumState, live, nee
 	return state, live, needed
 }
 
+// QuorumProofExcluding is QuorumProof counted over the voter set without
+// exclude: the quorum a decision ABOUT exclude rests on, which exclude does
+// not vote in (`lv host rm` and `lv host add` of a removed host,
+// grpcapi/host_incarnation.go). It records nothing for the regain grace.
+func (c *Checker) QuorumProofExcluding(ctx context.Context, exclude string) (state QuorumState, live, needed int) {
+	voters, uncounted, err := corrosion.VoterSetWithUncounted(ctx, c.db)
+	if err != nil {
+		return QuorumUnknown, 0, 0
+	}
+	delete(voters, exclude)
+	delete(uncounted, exclude)
+	return c.quorumOver(voters, uncounted)
+}
+
 // QuorumRegainGrace is how long after this daemon regained a quorum its
 // coordinator decides no new fence on that quorum: StallGrace, the time a
 // fence verdict takes to build. A node that was itself cut off holds failure

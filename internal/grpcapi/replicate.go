@@ -242,16 +242,21 @@ func (s *Server) replicateVolumeNative(ctx context.Context, req *pb.ReplicateVol
 	if rep == nil {
 		return status.Errorf(codes.Unimplemented, "driver %q has no native replication", dstPool.Driver)
 	}
-	if err := stream.Send(&pb.ReplicateVolumeProgress{
-		Phase: pb.ReplicateVolumeProgress_SNAPSHOT, Status: fmt.Sprintf("native %s send/recv → %s", dstPool.Driver, dstRef),
-		BytesTotal: src.SizeBytes,
-	}); err != nil {
-		return err
-	}
 	// The source side runs with the SOURCE pool's own options (its ceph
-	// cluster and identity), never the destination's.
+	// cluster and identity), never the destination's. A ceph disk's are
+	// rbdDiskConfig's: the cluster its domain is given, never monitors its
+	// locator recorded, and refused when that cannot be told.
 	var srcOpts map[string]string
-	if src.StorageVolume != "" {
+	if strings.HasPrefix(src.Path, "rbd:") {
+		cfg, err := s.rbdDiskConfig(ctx, src)
+		if err != nil {
+			return status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
+		srcOpts = cfg.Options
+		if srcOpts == nil {
+			srcOpts = map[string]string{}
+		}
+	} else if src.StorageVolume != "" {
 		srcPool, ok := s.resolvePool(ctx, src.StorageVolume)
 		if !ok {
 			return status.Errorf(codes.FailedPrecondition, "the disk's pool %q is not configured on this host", src.StorageVolume)
@@ -260,12 +265,12 @@ func (s *Server) replicateVolumeNative(ctx context.Context, req *pb.ReplicateVol
 		if srcOpts == nil {
 			srcOpts = map[string]string{}
 		}
-	} else if o := rbdPathOptions(src.Path); len(o) > 0 {
-		// A pool-less ceph disk names its cluster and identity in its own
-		// path (rbd:<pool>/<image>:conf=…:keyring=…:id=…): its source side
-		// runs with those. With none there, it is the destination's cluster,
-		// as before.
-		srcOpts = o
+	}
+	if err := stream.Send(&pb.ReplicateVolumeProgress{
+		Phase: pb.ReplicateVolumeProgress_SNAPSHOT, Status: fmt.Sprintf("native %s send/recv → %s", dstPool.Driver, dstRef),
+		BytesTotal: src.SizeBytes,
+	}); err != nil {
+		return err
 	}
 	if err := rep.Replicate(ctx, storage.ReplicateOptions{
 		SrcRef: srcRef, DstRef: dstRef, SrcOptions: srcOpts,

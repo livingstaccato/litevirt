@@ -379,3 +379,26 @@ func TestSeedFirewallSynflood_AnyOperatorWriteWins(t *testing.T) {
 		t.Errorf("the seed (%s) outranks an operator write made before it (%s)", p.UpdatedAt, earlier)
 	}
 }
+
+// An operator's row that lands after the seed decided to write, and before
+// its write, is never overwritten by the 0001 seed (Track B review m-9): the
+// existence check runs inside the write's own transaction. The seam writes
+// the operator's off in exactly that window.
+//
+// Mutations: check for the row before the window and write unconditionally
+// (the old check-then-act) — the seed overwrites off: red.
+func TestSeedFirewallSynflood_OperatorRowInTheWindowWins(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	openClusterPolicyGate(c)
+	prev := seedFirewallSynfloodBeforeWrite
+	t.Cleanup(func() { seedFirewallSynfloodBeforeWrite = prev })
+	seedFirewallSynfloodBeforeWrite = func() { setSynflood(t, c, "", FirewallSynflood{Mode: SynfloodOff}) }
+	wrote, err := SeedFirewallSynflood(ctx, c, synfloodGrant(t), "")
+	if err != nil || wrote {
+		t.Fatalf("seed = %v, %v; want no write over the operator's row", wrote, err)
+	}
+	if p, _, err := GetFirewallSynflood(ctx, c, ""); err != nil || p.On() || p.SetBy != "alice" {
+		t.Errorf("cluster row = %+v, %v; want the operator's off", p, err)
+	}
+}

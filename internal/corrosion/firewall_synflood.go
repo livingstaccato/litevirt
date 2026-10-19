@@ -174,6 +174,10 @@ func ResolveFirewallSynflood(ctx context.Context, c *Client, host string) (Firew
 	return FirewallSynflood{Mode: SynfloodOff}, nil
 }
 
+// seedFirewallSynfloodBeforeWrite runs between the seed's preconditions and
+// its write (tests put an operator's row there).
+var seedFirewallSynfloodBeforeWrite = func() {}
+
 // SeedFirewallSynflood records SYN-flood protection on at the defaults as the
 // cluster's policy, once, from the founder of a cluster this build created
 // (DECISION S-1). It takes the firewall_synflood grant, so it runs only once
@@ -203,6 +207,7 @@ func SeedFirewallSynflood(ctx context.Context, c *Client, g capabilities.Feature
 	if err != nil {
 		return false, err
 	}
+	seedFirewallSynfloodBeforeWrite()
 	// Insert only if absent, decided inside the write's own transaction: an
 	// operator's row that arrives between a separate check and the write
 	// must never be overwritten by the 0001 seed stamp, even locally.

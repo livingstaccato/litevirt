@@ -16,7 +16,7 @@ func testServer(t *testing.T) *Server {
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
-	return &Server{
+	s := &Server{
 		hostName: "test-host",
 		pkiDir:   "/etc/litevirt/pki",
 		dataDir:  t.TempDir(),
@@ -26,6 +26,12 @@ func testServer(t *testing.T) *Server {
 			return nil
 		},
 	}
+	// A refresh's background prune logs through the process-wide slog default
+	// and reads s.db: it must finish before this test ends, or it logs into
+	// the next test's captured buffer. Registered after the db's cleanup, so
+	// it runs first.
+	t.Cleanup(s.waitImagePrunes)
+	return s
 }
 
 // adminCtx returns a context with admin role, for use in tests that call

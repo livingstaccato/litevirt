@@ -202,8 +202,10 @@ func warnNoNosymfollow(dir string) {
 		"mountpoint", dir)
 }
 
-// readMountInfo returns /proc/self/mountinfo; tests replace it.
-var readMountInfo = newTestHook(func() ([]byte, error) { return os.ReadFile("/proc/self/mountinfo") })
+// readMountInfo, when a test sets it, is the mount table's text, read on
+// every use. nil (always outside tests) is this host's table through the
+// mount table cache (mount_cache.go).
+var readMountInfo = newTestHook[func() ([]byte, error)](nil)
 
 // mountEntry is one line of mountinfo: where, the per-mount options, and what
 // is mounted there (filesystem type and source).
@@ -216,11 +218,21 @@ type mountEntry struct {
 }
 
 // mounts parses mountinfo, in order (a later mount on the same point is on top).
+// The entries are shared with the mount table cache: never modify them.
 func mounts() ([]mountEntry, error) {
-	data, err := readMountInfo.get()()
+	read := readMountInfo.get()
+	if read == nil {
+		return cachedMounts()
+	}
+	data, err := read()
 	if err != nil {
 		return nil, err
 	}
+	return parseMountInfo(data), nil
+}
+
+// parseMountInfo parses mountinfo's text, in order.
+func parseMountInfo(data []byte) []mountEntry {
 	var out []mountEntry
 	for _, line := range strings.Split(string(data), "\n") {
 		f := strings.Fields(line)
@@ -234,7 +246,7 @@ func mounts() ([]mountEntry, error) {
 		}
 		out = append(out, e)
 	}
-	return out, nil
+	return out
 }
 
 // mountAt returns the mount at dir (the top one, when mounts are stacked), and

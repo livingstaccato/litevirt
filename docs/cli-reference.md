@@ -738,6 +738,9 @@ lv resolve-pit-overlay <vm> <disk>                       # Admin: the verdict on
 lv resolve-pit-overlay <vm> <disk> --commit --confirm    # Commit it; refused unless the verdict says it is safe (--force-commit overrides, experts only)
 lv resolve-pit-overlay <vm> <disk> --commit --force-commit --overwrite-newer-writes --confirm  # Expert only: commit an overlay already in the disk, over the guest's newer writes
 lv resolve-pit-overlay <vm> <disk> --discard --confirm   # Discard it; of a half-written disk only with --accept-torn-disk
+lv pit-overlays ls [--host <h>] [--vm <vm>]              # Set-aside overlays (.<disk file>.lv-pit.orphan-<time>) of a host's VMs, on their host; IN USE says why one is kept
+lv pit-overlays rm <vm> <disk> <name> [--yes]            # Admin, audited, asks first: remove one and its binding; refused while in use (see backups.md)
+lv pit-overlays rm --host <h> --path <path> [--yes]      # Admin, audited, asks first: remove a DETACHED one (no live disk where it was set aside)
 
 # Migrate every VM's volumes in a stack to a different pool (rolling, online):
 lv stack migrate-volumes <stack> --to <pool>
@@ -1030,12 +1033,15 @@ rather than unlink. Two cases keep every file:
 - the delete is **refused**, naming the VMs, while another VM (a linked clone)
   backs on the snapshot's overlay or on the disk it was taken of;
 - a snapshot libvirt does not hold as current and that has no children — as
-  a restore by an earlier build left one — is deleted as metadata only, with a
-  warning in the log: the VM keeps its backing chain, and the space is not
-  reclaimed;
+  a restore by an earlier build left one — is deleted as metadata only: the VM
+  keeps its backing chain, and the space is not reclaimed;
 - so is a snapshot libvirt cannot merge because its overlay is no longer in
   the VM's live chain. Restoring an older snapshot while a later one exists
   leaves the restored one so: its overlay file stays on disk, unused.
+
+A metadata-only delete says so: `lv snapshot rm` prints a warning naming the
+files it kept and their size, and the VM gets the event `snapshot.files-kept`
+(`lv events <vm>`). Nothing is lost, and no `lv` command reclaims that space.
 
 Restoring an older snapshot while a later one exists puts the VM on a new
 overlay (`<disk>.<snapshot>-r<time>`) directly on the disk that snapshot was
@@ -1227,6 +1233,10 @@ lv replication replicas <container> --target-pool <repo> [--host <h>] [--project
   [--restore <timestamp>]  # lay that replica down as the container, stopped (never a second copy)
   [--remove <timestamp>]   # a SET-ASIDE or ORPHANED replica to remove (repeatable; asks first)
   [--yes]                  # remove without asking
+
+# Incremental-replication checkpoint rows (the anchor of each VM's chain into a pool).
+lv replication checkpoints ls [--vm <vm>]                # IN USE: a live schedule uses it; VM DELETED: the VM has no live row
+lv replication checkpoints rm <vm> --target-pool <pool>  # Admin, audited: refused while a live schedule uses it; run on the VM's host, which drops its bitmap (printed); the next run is a full copy
 
 # Disaster recovery: bring a VM up from its replica.
 lv replication promote <vm>

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 )
 
@@ -106,11 +107,15 @@ func TestISCSITeardown_Logout(t *testing.T) {
 	}
 }
 
-// iSCSI Teardown treats a "No matching sessions" logout as already-gone (idempotent).
+// iSCSI Teardown treats a "No matching sessions" logout as already-gone, and
+// a "No records found" record removal as already removed (idempotent).
 func TestISCSITeardown_ToleratesNoSession(t *testing.T) {
-	run, _ := stubRunner(func(sub string) ([]byte, error) {
-		return []byte("iscsiadm: No matching sessions found"), errors.New("exit status 21")
-	})
+	run := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if slices.Contains(args, "--logout") {
+			return []byte("iscsiadm: No matching sessions found"), errors.New("exit status 21")
+		}
+		return []byte("iscsiadm: No records found"), errors.New("exit status 21")
+	}
 	d := &iscsiDriver{target: "iqn.x:lun0", opts: map[string]string{"portal": "10.0.0.1"}, run: run}
 	if err := d.Teardown(context.Background()); err != nil {
 		t.Fatalf("Teardown should tolerate no-session logout: %v", err)

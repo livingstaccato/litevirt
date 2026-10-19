@@ -58,8 +58,9 @@ pre-existing pool) usable by all projects. Enforcement is at use time, across
 create and the day-2 storage paths. See [tenancy.md](tenancy.md).
 
 `lv pool delete` soft-deletes the row from cluster state. The
-driver is asked to tear down (unmount NFS, log out of iSCSI) on a
-best-effort basis but failure does not block the delete — operators
+driver is asked to tear down (unmount NFS; for iSCSI, log out of the target
+and remove its open-iscsi node record at the pool's portal, so iscsid does not
+log in to it again at its next start) on a best-effort basis but failure does not block the delete — operators
 who hit "rm" likely want the pool gone regardless. The underlying
 mount, if any, stays until manually cleaned up.
 

@@ -2,7 +2,12 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -539,24 +544,73 @@ func (s *Server) localDomainUsesPath(p string) (bool, string) {
 			return true, "cannot read the disks of domain " + d + ": " + serr.Error()
 		}
 		for _, src := range srcs {
-			cur := src
-			for depth := 0; cur != "" && depth < 32; depth++ {
-				if filepath.Clean(cur) == filepath.Clean(p) {
-					return true, "domain " + d + " uses it"
-				}
-				info, ierr := qcow2.Info(cur)
-				if ierr != nil || info.BackingFile == "" {
-					break
-				}
-				next := info.BackingFile
-				if !filepath.IsAbs(next) {
-					next = filepath.Join(filepath.Dir(cur), next)
-				}
-				cur = next
+			if reached, _ := qcow2ChainReaches(src, p, false, cleanPathsEqual); reached {
+				return true, "domain " + d + " uses it"
 			}
 		}
 	}
 	return false, ""
+}
+
+func cleanPathsEqual(a, b string) bool { return filepath.Clean(a) == filepath.Clean(b) }
+
+// qcow2ChainReaches reports whether p is src or anywhere in src's qcow2
+// backing chain (followed from each image's header, to depth 32), comparing
+// with same. A missing link, or one that is not qcow2 (a raw image), ends
+// the chain: it has nothing further to reach. Not strict, any other error
+// ends the chain too; strict, a header that cannot be read is an error, so a
+// caller about to delete p refuses rather than reads "not reached".
+func qcow2ChainReaches(src, p string, strict bool, same func(a, b string) bool) (bool, error) {
+	cur := src
+	for depth := 0; cur != "" && depth < 32; depth++ {
+		if same(cur, p) {
+			return true, nil
+		}
+		isQcow2, err := qcow2Magic(cur)
+		if errors.Is(err, fs.ErrNotExist) || (err == nil && !isQcow2) {
+			return false, nil
+		}
+		var info *qcow2.ImageInfo
+		if err == nil {
+			info, err = qcow2.Info(cur)
+		}
+		if err != nil {
+			if strict {
+				return false, fmt.Errorf("read the qcow2 header of %s: %w", cur, err)
+			}
+			return false, nil
+		}
+		if info.BackingFile == "" {
+			return false, nil
+		}
+		next := info.BackingFile
+		if !filepath.IsAbs(next) {
+			next = filepath.Join(filepath.Dir(cur), next)
+		}
+		cur = next
+	}
+	if strict && cur != "" {
+		return false, fmt.Errorf("the backing chain of %s is deeper than 32", src)
+	}
+	return false, nil
+}
+
+// qcow2Magic reports whether the file at p starts with the qcow2 magic. A
+// file shorter than the magic is not qcow2.
+func qcow2Magic(p string) (bool, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	var b [4]byte
+	if _, err := io.ReadFull(f, b[:]); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return false, nil
+		}
+		return false, err
+	}
+	return binary.BigEndian.Uint32(b[:]) == qcow2.Magic, nil
 }
 
 // modifiedAfter reports whether p's modification time is strictly after t.

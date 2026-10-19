@@ -419,6 +419,10 @@ func domainXMLReferences(domXML, path string) (bool, error) {
 	return false, nil
 }
 
+// SameFilePath reports whether a and b name one file: the same path, the
+// same path with symlinks resolved, or the same file (device and inode).
+func SameFilePath(a, b string) bool { return chainPathIdentity(a).same(chainPathIdentity(b)) }
+
 // identity is a path as given, with symlinks resolved, and the file it is.
 type identity struct {
 	clean, resolved string

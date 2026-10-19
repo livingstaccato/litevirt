@@ -19,6 +19,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/pitoverlay"
+	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -600,5 +601,137 @@ func TestForwardOnce_APathForwardIsRefusedByPath(t *testing.T) {
 	_, err := s.RemoveSetAsideOverlay(ctx, &pb.RemoveSetAsideOverlayRequest{Host: "third-host", Path: "/srv/p/.x.lv-pit.orphan-20261018-120000"})
 	if status.Code(err) != codes.Aborted || strings.Contains(err.Error(), "vm \"") || !strings.Contains(err.Error(), "/srv/p/.x.lv-pit.orphan-20261018-120000") {
 		t.Fatalf("a forwarded path removal for another host = %v; want Aborted naming the path, not a vm", err)
+	}
+}
+
+// gatedSnapshotter answers DomainUsesFile per domain: named holds the
+// domains that name a file, and gate, when set for a domain, holds its
+// answer until closed (entered is told when it starts waiting).
+type gatedSnapshotter struct {
+	fakePITSnapshotter
+	named   map[string]bool
+	gate    map[string]chan struct{}
+	entered chan string
+}
+
+func (g *gatedSnapshotter) DomainUsesFile(domain, path string) (bool, error) {
+	if ch := g.gate[domain]; ch != nil {
+		g.entered <- domain
+		<-ch
+	}
+	return g.named[domain], nil
+}
+
+// R4 I-1. Two domains asked about one file at the same time each get their
+// own answer: the bounded call that runs the question is keyed by the
+// domain too, so a removal asking y never joins a listing's question to x
+// and reads x's "not named" for y.
+//
+// Mutation "domain not in the op": y joins x's call and reads ""; red.
+func TestSetAsideOverlays_ConcurrentDomainQuestionsAreNotMerged(t *testing.T) {
+	s, _, _ := setAsideServer(t)
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("x", libvirtfake.StateDefined)
+	fake.SetState("y", libvirtfake.StateDefined)
+	release := make(chan struct{})
+	g := &gatedSnapshotter{named: map[string]bool{"y": true}, gate: map[string]chan struct{}{"x": release}, entered: make(chan string, 1)}
+	s.SetPointInTimeSnapshotter(g)
+	p := filepath.Join(t.TempDir(), ".d.lv-pit.orphan-20261018-120000")
+	xDone := make(chan string, 1)
+	go func() { xDone <- s.domainNamesFile("x", p) }()
+	<-g.entered
+	yWhy := make(chan string, 1)
+	go func() { yWhy <- s.domainNamesFile("y", p) }()
+	select {
+	case why := <-yWhy:
+		if !strings.Contains(why, "names it") {
+			t.Errorf("y asked while x's question runs = %q, want named", why)
+		}
+	case <-time.After(3 * time.Second):
+		t.Error("y's question waited on x's: it joined x's call")
+	}
+	close(release)
+	if why := <-xDone; why != "" {
+		t.Errorf("x = %q, want not named", why)
+	}
+	if t.Failed() {
+		<-yWhy
+	}
+}
+
+// R4 m-1. A stopped domain's definition need not list its backing chain:
+// the qcow2 headers of each disk source are walked too. An inspection
+// overlay made with `qemu-img create -b <orphan>` keeps the orphan, and a
+// header in the chain that cannot be read refuses.
+//
+// Mutations, each red: "no header walk"; "an unreadable header ends the
+// chain".
+func TestDetachedPITOverlay_AChainOnlyInQcow2HeadersKeepsIt(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads any file")
+	}
+	s, _, _ := setAsideServer(t)
+	dir := filepath.Join(s.dataDir, "disks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	o := pitoverlay.Path(filepath.Join(dir, "gone-root.qcow2")) + ".orphan-20261001-000000"
+	if err := qcow2.Create(o, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	inspect := filepath.Join(t.TempDir(), "inspect.qcow2")
+	if err := qcow2.CreateWithBackingFormat(inspect, o, "qcow2", 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("inspect", libvirtfake.StateDefined)
+	fake.SetDiskSource("inspect", "vda", inspect)
+	s.SetPointInTimeSnapshotter(&fakePITSnapshotter{onOverlay: map[string]bool{}}) // the XML names nothing
+	rm := func() error {
+		_, err := s.RemoveSetAsideOverlay(adminCtx(), &pb.RemoveSetAsideOverlayRequest{Path: o})
+		return err
+	}
+	if err := rm(); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("remove of an orphan backing a stopped domain's disk = %v, want FailedPrecondition", err)
+	}
+	other := filepath.Join(t.TempDir(), "other.qcow2")
+	if err := qcow2.Create(other, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetDiskSource("inspect", "vda", other)
+	if err := os.Chmod(other, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(other, 0o600) })
+	if err := rm(); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("remove while a domain's disk header cannot be read = %v, want FailedPrecondition", err)
+	}
+	_ = os.Chmod(other, 0o600)
+	if err := rm(); err != nil {
+		t.Fatalf("remove once no chain reaches it: %v", err)
+	}
+}
+
+// R4 n-1. The marker is honoured from a cluster peer only: an on-node
+// local-root caller (the host's own certificate on loopback) is not a peer,
+// and its marker is ignored too.
+//
+// Mutation R-fwd3 "peer-kind clause dropped" (requirePeerCert alone, which
+// accepts local-root): Aborted; red.
+func TestForwardOnce_ALocalRootMarkerIsIgnored(t *testing.T) {
+	s, _, _ := setAsideServer(t)
+	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{Name: "away", HostName: "third-host", State: "running", Spec: `{"name":"away"}`}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	ctx := peerCtxFor(t, s, s.hostName)
+	ctx = context.WithValue(ctx, ctxKeyPrincipalKind, principalKindLocalRoot)
+	ctx = context.WithValue(context.WithValue(ctx, ctxKeyUsername, "admin"), ctxKeyRole, "admin")
+	ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(forwardedHopMDKey, "forged"))
+	if s.requirePeerCert(ctx) != nil {
+		t.Fatal("setup: the local-root context does not pass requirePeerCert")
+	}
+	_, err := s.RemoveSetAsideOverlay(ctx, &pb.RemoveSetAsideOverlayRequest{VmName: "away", DiskName: "root", Name: ".x.lv-pit.orphan-20261018-120000"})
+	if status.Code(err) == codes.Aborted {
+		t.Fatalf("a local-root caller's marker was honoured: %v", err)
 	}
 }

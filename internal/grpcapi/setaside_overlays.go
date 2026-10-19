@@ -60,11 +60,16 @@ func (s *Server) boundedRefs(ctx context.Context, path string) ([]corrosion.Disk
 	})
 }
 
-// domainNamesFile says why the domain of vmName may name path; "" when it
-// positively does not (no such domain, or a definition read without it).
+// domainNamesFile says why the domain of vmName may name path; "" only when
+// it positively does not: no such domain, or every definition and every disk
+// source's qcow2 backing chain read without it. Any error, timeout or
+// missing reader refuses. The question runs as one bounded call keyed by the
+// domain AND the path, so a concurrent question about the same path to
+// another domain never shares its answer.
 func (s *Server) domainNamesFile(vmName, path string) string {
+	cannot := func(why string) string { return "whether VM " + vmName + "'s domain names it cannot be told: " + why }
 	if s.virt == nil {
-		return ""
+		return cannot("no libvirt connection")
 	}
 	_, err := s.virt.DomainIsActive(vmName)
 	switch {
@@ -72,21 +77,38 @@ func (s *Server) domainNamesFile(vmName, path string) string {
 	case lv.IsNoDomain(err):
 		return ""
 	default:
-		return "whether VM " + vmName + "'s domain names it cannot be told: " + err.Error()
+		return cannot(err.Error())
 	}
 	if s.pitSnapshotter == nil {
-		return "whether VM " + vmName + "'s domain names it cannot be told: no definition reader"
+		return cannot("no definition reader")
 	}
-	used, err := storage.Bounded("read whether a domain names", path, func() (bool, error) {
-		return s.pitSnapshotter.DomainUsesFile(vmName, path)
+	why, err := storage.Bounded("read whether domain "+vmName+" names", path, func() (string, error) {
+		used, err := s.pitSnapshotter.DomainUsesFile(vmName, path)
+		if err != nil {
+			return "", err
+		}
+		if used {
+			return "VM " + vmName + "'s domain definition names it", nil
+		}
+		srcs, err := s.virt.DomainDiskSources(vmName)
+		if err != nil {
+			return "", fmt.Errorf("read its disk sources: %w", err)
+		}
+		for _, src := range srcs {
+			reached, err := qcow2ChainReaches(src, path, true, lv.SameFilePath)
+			if err != nil {
+				return "", err
+			}
+			if reached {
+				return "VM " + vmName + "'s disk " + src + " backs on it (qcow2 header chain)", nil
+			}
+		}
+		return "", nil
 	})
 	if err != nil {
-		return "whether VM " + vmName + "'s domain names it cannot be told: " + err.Error()
+		return cannot(err.Error())
 	}
-	if used {
-		return "VM " + vmName + "'s domain definition names it"
-	}
-	return ""
+	return why
 }
 
 // anyDomainNamesFile is domainNamesFile over every domain libvirt has defined
@@ -140,7 +162,9 @@ func (s *Server) forwardOnce(ctx context.Context, actor string) context.Context 
 // use; "" when it may be removed.
 func (s *Server) setAsideOverlayInUse(ctx context.Context, vm *corrosion.VMRecord, d *corrosion.DiskRecord, disk, orphan string) string {
 	uuid, _ := vmSpecUUID(vm.Spec)
-	why, err := storage.Bounded("read the binding of", orphan, func() (string, error) {
+	// disk and uuid are in the op: the bound merges concurrent calls on one
+	// op and path, and the answer depends on both.
+	why, err := storage.Bounded("judge the set-aside evidence (disk "+disk+", vm uuid "+uuid+") of", orphan, func() (string, error) {
 		return pitoverlay.OrphanInUse(disk, orphan, uuid), nil
 	})
 	if err != nil {

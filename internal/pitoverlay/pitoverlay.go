@@ -204,7 +204,9 @@ func SetAsideEvidenceBounded(disk string) (bool, error) { return SetAsideEvidenc
 // SetAsideEvidenceBoundedFor is SetAsideEvidenceFor under storage.Bounded.
 func SetAsideEvidenceBoundedFor(disk, vmUUID string) (bool, error) {
 	g := glob // read here: the call below may outlive its caller
-	return storage.Bounded("look for set-aside point-in-time overlays of", disk, func() (bool, error) {
+	// The uuid is in the op: the bound merges concurrent calls on one op and
+	// path, and the answer depends on the VM asked for.
+	return storage.Bounded("look for set-aside point-in-time overlays (for vm uuid "+vmUUID+") of", disk, func() (bool, error) {
 		return setAsideEvidenceWith(g, disk, vmUUID), nil
 	})
 }

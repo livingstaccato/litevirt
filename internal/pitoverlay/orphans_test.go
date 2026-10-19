@@ -3,7 +3,9 @@ package pitoverlay
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 )
 
 // OrphanPath takes only a name SetAside makes for the disk: never a path,
@@ -83,4 +85,39 @@ func TestOrphans_ASiblingsLiveOverlayIsNotAnOrphan(t *testing.T) {
 	if _, err := OrphanPath(disk, filepath.Base(Path(sibling))); err == nil {
 		t.Fatal("OrphanPath took the sibling's live overlay as w's orphan")
 	}
+}
+
+// R4 I-1 audit. Two evidence questions about one disk for two VMs (uuid) at
+// the same time are not merged by the bound: the second runs its own look
+// rather than waiting for, and reading, the first one's answer.
+//
+// Mutation "uuid not in the op": the second joins the first and waits; red.
+func TestSetAsideEvidenceBoundedFor_DifferentVMsAreNotMerged(t *testing.T) {
+	disk := filepath.Join(t.TempDir(), "d")
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	var calls int32
+	var mu sync.Mutex
+	defer SetGlobForTest(func(string) ([]string, error) {
+		mu.Lock()
+		calls++
+		first := calls == 1
+		mu.Unlock()
+		if first {
+			entered <- struct{}{}
+			<-release
+		}
+		return nil, nil
+	})()
+	go func() { _, _ = SetAsideEvidenceBoundedFor(disk, "u-a") }()
+	<-entered
+	done := make(chan struct{})
+	go func() { _, _ = SetAsideEvidenceBoundedFor(disk, "u-b"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Error("the question for u-b waited on the one for u-a: it joined its call")
+	}
+	close(release)
+	<-done
 }

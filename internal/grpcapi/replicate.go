@@ -16,6 +16,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -73,7 +74,7 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 	}
 	// A volume move left unresolved: the rows name the file holding the
 	// guest's writes before one is copied (move_unresolved.go).
-	if err := s.resolveUnresolvedMoves(ctx, req.VmName); err != nil {
+	if err := s.resolveUnresolvedMovesFor(ctx, req.VmName, health.MoveUseReadsRunning); err != nil {
 		return err
 	}
 

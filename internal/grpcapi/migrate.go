@@ -24,6 +24,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/dns"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hooks"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/obs"
@@ -196,7 +197,13 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// A volume move left unresolved: the rows name the file holding the
 	// guest's writes before anything reads them for the migration
 	// (move_unresolved.go).
-	if err := s.resolveUnresolvedMoves(ctx, vm.Name); err != nil {
+	// Without storage a running domain migrates live with the files it has
+	// open, so a forked history it cannot get wrong does not hold it.
+	use := health.MoveUseBoots
+	if !req.WithStorage {
+		use = health.MoveUseMigratesRunning
+	}
+	if err := s.resolveUnresolvedMovesFor(ctx, vm.Name, use); err != nil {
 		return err
 	}
 	// The VM leaves this host: the next admission here reads the runtime

@@ -141,7 +141,7 @@ func TestResolveRemoteMove_NoDomainNeverRepoints(t *testing.T) {
 				t.Fatalf("want a refusal saying %q, got %v", tc.want, err)
 			}
 			for _, need := range []string{resolveAcceptCmd("mv", src), resolveAcceptCmd("mv", dst), "modified", "bytes",
-				"lv audit ls --target mv --action vm.start"} {
+				"lv events mv"} {
 				if !strings.Contains(err.Error(), need) {
 					t.Fatalf("the refusal does not say %q: %v", need, err)
 				}

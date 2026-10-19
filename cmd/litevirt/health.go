@@ -115,10 +115,10 @@ and its persistent config and disk record name the source. On the VM's owner,
 with its domain defined, its persistent config must name the file each disk
 record is left on, and no disk record is changed while it is active. After a
 pivot only the copy is accepted, except on the VM's owner when the VM changed
-hands after the move began and its config names the source, or it has no
-domain of the VM: --accept of the source keeps the writes made on it since
-(a disk record naming the copy is pointed at it), and the copy is kept on
-disk (docs/diagnostics.md, "A forked history"). That is refused while the
+hands after the move began: --accept of the source keeps the writes made on
+it since (a disk record, and a persistent config with its domain shut off,
+naming the copy are pointed at it), and the copy is kept on disk
+(docs/diagnostics.md, "A forked history"). That is refused while the
 copy was modified after the source, unless --force is given; the refusal
 prints both files' sizes and times.
 

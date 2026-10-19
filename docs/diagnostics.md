@@ -1807,15 +1807,17 @@ the copy holds the writes the holding host made after the pivot, and the
 source, which the VM may have been started on since, holds the writes made
 there. Neither file is complete, and the owner's starts are refused with a
 text naming both exits. Once the holding host is proven powered off, on the
-owner:
+VM's owner (`LV_HOST=<owner>`; the holding host too, once the VM came back to
+it):
 
 - `lv health resolve vm.move_unresolved vm/<vm> --accept <source> --reason
-  "…"` keeps the writes made on the source. It is accepted when the owner's
-  persistent config names the source, or the owner has no domain of the VM
-  (a start rebuilds it from the disk record), and the VM changed hands after
-  the move began (another owner, or a later ownership generation, than the
-  move recorded); the domain may keep running when the disk record already
-  names the source. It is refused while the copy was modified after the
+  "…"` keeps the writes made on the source. It is accepted when the VM
+  changed hands after the move began (another owner, or a later ownership
+  generation, than the move recorded); the domain may keep running when its
+  persistent config and the disk record already name the source. A persistent
+  config naming the copy is pointed at the source with the domain shut off;
+  with no domain of the VM a start rebuilds it from the disk record. It is
+  refused on any other host than the owner, and while the copy was modified after the
   source: the holding host wrote only the copy after the pivot, so nothing
   was written to the source since. `--force` takes it anyway, with the reason
   audited. A disk record naming the copy is pointed at the source (the
@@ -1826,12 +1828,16 @@ owner:
   needs the domain stopped (`lv stop`) and its persistent config pointed at
   the copy, as any other `--accept` of the copy on the owner.
 
-The refusal prints both files' sizes and modification times. A source
-modified after the copy was written since the failover; `lv audit ls --target
-<vm> --action vm.start` lists the starts of the VM. Each host also keeps a
-record of the ownership generation it last started a VM at, under
-`move-started` in its data directory, and the refusal names a start there
-since the move began.
+The refusal prints both files' sizes and modification times (a source
+modified after the copy was written since the failover) and the starts of the
+VM recorded since the move began. Each start of a VM leaves a replicated
+`vm.starting` event naming the host and the ownership generation, which `lv
+events <vm>` lists; `lv audit ls --target <vm>` lists its failover
+reschedules (action `failover`). A start whose event has not reached the host,
+or by a build that records none, is not listed, so no start listed proves
+nothing. Each host also keeps a record of the ownership generation it last
+started a VM at, under `move-started` in its data directory, and the refusal
+names a start there since the move began.
 
 With no domain of the VM on its owner, a start never points the disk record
 at the copy by itself: nothing there proves the VM did not run on the source
@@ -1847,7 +1853,17 @@ A disk record that names the copy is no proof either once the VM changed
 hands after the move began: a host that missed the holding host's commit
 reads the source, and may have run the VM there since. The owner's start is
 then refused with both exits, as above; `--accept <copy>` keeps the record as
-it is, and `--accept <source>` points it at the source.
+it is, and `--accept <source>` points it at the source. The holding host that
+gets the VM back after it changed hands does not trust its own persistent
+config either: its start is refused with both exits, and an admin's
+resolution made while it was away stands only when its config names the file
+the resolution left the disk record on.
+
+These refusals do not hold an operation that cannot pick the wrong file while
+the VM's domain runs on its owner: a live migration without storage (`lv
+migrate`, a host drain), and a backup, replication, clone or image build
+reading the file the running guest has open. The condition stays open for the
+VM's next start.
 
 A holding host that rejoins after an admin resolved its move from another
 host drops its record of that move instead of raising the condition again,

@@ -14,6 +14,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/region"
 )
 
@@ -133,7 +134,7 @@ func (s *Server) replicateDisksForCrossRegion(
 ) error {
 	// A volume move left unresolved: the rows name the file holding the
 	// guest's writes before one is copied (move_unresolved.go).
-	if err := s.resolveUnresolvedMoves(ctx, vmName); err != nil {
+	if err := s.resolveUnresolvedMovesFor(ctx, vmName, health.MoveUseReadsRunning); err != nil {
 		return err
 	}
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)

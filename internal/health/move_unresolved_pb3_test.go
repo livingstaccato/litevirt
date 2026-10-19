@@ -71,7 +71,7 @@ func TestResolveRemoteMove_RowOnTheCopyAfterAChangeOfHandsHolds(t *testing.T) {
 				t.Fatalf("want a refusal, got %v", err)
 			}
 			for _, need := range []string{resolveAcceptCmd("mv", src), resolveAcceptCmd("mv", dst), "changed hands",
-				"modified", "bytes", "lv audit ls --target mv --action vm.start"} {
+				"modified", "bytes", "lv events mv", "on the VM's owner " + tc.host + " (LV_HOST=" + tc.host + ")"} {
 				if !strings.Contains(err.Error(), need) {
 					t.Fatalf("the refusal does not say %q: %v", need, err)
 				}

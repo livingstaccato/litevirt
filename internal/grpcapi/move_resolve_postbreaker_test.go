@@ -118,7 +118,9 @@ func TestResolveHealthCondition_ForkedHistoryKeepsTheOwnersFile(t *testing.T) {
 		{name: "the same owner at a later generation, shut off", owner: "test-host", ownerEp: 3, vmEp: 4, define: "src", ok: true},
 		{name: "no change of hands since the move", owner: "test-host", ownerEp: 4, vmEp: 4, define: "src"},
 		{name: "the record names no owner", vmEp: 4, define: "src"},
-		{name: "the owner's config names the copy", owner: "node-a", ownerEp: 3, vmEp: 4, define: "dst"},
+		// I8-3: a config naming the copy is pointed at the source with the
+		// domain shut off, under the same gates.
+		{name: "the owner's config names the copy", owner: "node-a", ownerEp: 3, vmEp: 4, define: "dst", ok: true},
 		// I6-1: with no domain, a start rebuilds it from the disk row, so
 		// keeping the row's file needs no config.
 		{name: "no domain on the owner", owner: "node-a", ownerEp: 3, vmEp: 4, ok: true},
@@ -148,7 +150,7 @@ func TestResolveHealthCondition_ForkedHistoryKeepsTheOwnersFile(t *testing.T) {
 			if !tc.ok {
 				if tc.want != "" {
 					// Both files' sizes and times, and how to judge them.
-					mustRefuse(t, s, err, src, tc.want, "modified", "bytes", "lv audit ls --target vm1 --action vm.start")
+					mustRefuse(t, s, err, src, tc.want, "modified", "bytes", "lv events vm1")
 					return
 				}
 				mustRefuse(t, s, err, src, "--accept "+dst)
@@ -169,6 +171,12 @@ func TestResolveHealthCondition_ForkedHistoryKeepsTheOwnersFile(t *testing.T) {
 				!strings.Contains(rows[0].String("detail"), "kept on disk") ||
 				strings.Contains(rows[0].String("detail"), "--force") != tc.force {
 				t.Fatalf("divergence audit = %+v %v, want one row naming %s kept on disk (forced=%v)", rows, qerr, dst, tc.force)
+			}
+			if tc.define != "" {
+				// The persistent config, which `lv start` boots, names the file kept.
+				if x, _ := fakeOf(t, s).DumpXMLInactive("vm1"); !strings.Contains(x, src) || strings.Contains(x, dst) {
+					t.Fatalf("persistent config = %s, want it on %s", x, src)
+				}
 			}
 			if tc.running {
 				if st, _ := fakeOf(t, s).DomainState("vm1"); st != "running" {

@@ -26,6 +26,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/diskmode"
+	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/qcow2"
@@ -235,7 +236,7 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	}
 	// A volume move left unresolved: the rows name the file holding the
 	// guest's writes before one is copied (move_unresolved.go).
-	if err := s.resolveUnresolvedMoves(ctx, req.Source); err != nil {
+	if err := s.resolveUnresolvedMovesFor(ctx, req.Source, health.MoveUseReadsRunning); err != nil {
 		return nil, err
 	}
 	srcDisks, err := corrosion.GetVMDisks(ctx, s.db, req.Source)

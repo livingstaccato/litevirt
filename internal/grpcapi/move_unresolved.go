@@ -227,14 +227,24 @@ func (s *Server) diskRowOf(ctx context.Context, vm, disk string) (*corrosion.Dis
 // resolveUnresolvedMoves is health.ResolveUnresolvedMoves for a VM on this
 // host, before its domain starts or its disk rows are read for a copy.
 func (s *Server) resolveUnresolvedMoves(ctx context.Context, vmName string) error {
+	return s.resolveUnresolvedMovesFor(ctx, vmName, health.MoveUseBoots)
+}
+
+// resolveUnresolvedMovesFor is resolveUnresolvedMoves for an operation that
+// uses the VM as use says: a reader of a running domain's own file, or a live
+// migration without storage, is not held by a forked history it cannot get
+// wrong (health.MoveUse).
+func (s *Server) resolveUnresolvedMovesFor(ctx context.Context, vmName string, use health.MoveUse) error {
 	dom := health.MoveDomain{InactiveXML: func() (string, error) { return "", errors.New("no libvirt backend") }}
 	if s.virt != nil {
 		dom = health.MoveDomain{
 			InactiveXML: func() (string, error) { return s.virt.DumpXMLInactive(vmName) },
 			State:       func() (string, error) { return s.virt.DomainState(vmName) },
 			Active:      func() (bool, error) { return s.virt.DomainIsActive(vmName) },
+			LiveXML:     func() (string, error) { return s.virt.DumpXML(vmName) },
 		}
 	}
+	dom.Use = use
 	return health.ResolveUnresolvedMoves(ctx, s.db, s.dataDir, s.hostName, vmName, dom)
 }
 

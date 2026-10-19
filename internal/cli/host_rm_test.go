@@ -643,58 +643,85 @@ func TestHostRemove_RemovesAStrandedAddsStagedPair(t *testing.T) {
 	}
 }
 
-// fakeStagedHost is a host holding a staged certificate (or none).
-type fakeStagedHost struct {
-	staged []byte
-	ran    []string
-}
-
-func (h *fakeStagedHost) ReadFile(path string) ([]byte, bool, error) {
-	if path != "/etc/litevirt/pki/.host.crt.add" || h.staged == nil {
-		return nil, false, nil
-	}
-	return h.staged, true, nil
-}
-
-func (h *fakeStagedHost) Run(cmd string) error { h.ran = append(h.ran, cmd); return nil }
-
-// fd re-review 2 N2-m2: the cleanup deletes the staged pair only when the
-// staged certificate is the one this removal revoked, which is what makes a
-// dial to a reused address harmless.
+// fd re-review 2 N2-m2, Codex cand30 I2: the cleanup deletes only what the
+// add admitted with the revoked serial staged: the files tagged with it, and
+// an earlier release's untagged pair only when its certificate is that
+// serial. Another attempt's staged files on the machine, and the machine's
+// installed identity, are not touched, which is also what makes a dial to a
+// reused address harmless.
 //
-// Mutation: delete whatever the serial — "another serial" removes files.
+// Mutations: delete untagged staged files whatever their serial — "another
+// serial" loses the legacy pair; delete every attempt's tagged files — the
+// other attempt's pair goes.
 func TestRemoveStagedPair_OnlyTheRevokedSerial(t *testing.T) {
 	dir := t.TempDir()
 	if err := pki.GenerateCA(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key")); err != nil {
 		t.Fatal(err)
 	}
-	crt := filepath.Join(dir, "h.crt")
-	if err := pki.GenerateHostCert(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"), crt,
-		filepath.Join(dir, "h.key"), "node-9", nil); err != nil {
-		t.Fatal(err)
+	mint := func(name string) ([]byte, []byte, string) {
+		crt, key := filepath.Join(dir, name+".crt"), filepath.Join(dir, name+".key")
+		if err := pki.GenerateHostCert(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"), crt, key, "node-9", nil); err != nil {
+			t.Fatal(err)
+		}
+		c, _ := os.ReadFile(crt)
+		k, _ := os.ReadFile(key)
+		serial, _ := pki.CertSerial(crt)
+		return c, k, strings.ToLower(serial)
 	}
-	pem, _ := os.ReadFile(crt)
-	serial, _ := pki.CertSerial(crt)
+	revokedCrt, revokedKey, revoked := mint("revoked")
+	otherCrt, otherKey, other := mint("other")
 	for _, tc := range []struct {
-		name   string
-		staged []byte
-		serial string
-		rm     bool
+		name string
+		// legacy is the untagged pair an earlier release staged, if any.
+		legacy     []byte
+		legacyGone bool
 	}{
-		{"the revoked serial", pem, strings.ToUpper(serial), true},
-		{"another serial", pem, "deadbeef", false},
-		{"nothing staged", nil, serial, false},
+		{"tagged", nil, false},
+		{"the revoked serial untagged", revokedCrt, true},
+		{"another serial untagged", otherCrt, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h := &fakeStagedHost{staged: tc.staged}
-			if err := removeStagedPair(h, tc.serial); err != nil {
+			pkiDir := t.TempDir()
+			r := &LocalAddTarget{Root: t.TempDir(), PKIDir: pkiDir}
+			put := func(path string, b []byte) {
+				t.Helper()
+				if err := os.MkdirAll(filepath.Dir(r.Path(path)), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(r.Path(path), b, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			crt, key := filepath.Join(remotePKIDir, "host.crt"), filepath.Join(remotePKIDir, "host.key")
+			put(crt, otherCrt) // the machine's installed identity
+			put(key, otherKey)
+			for _, p := range addStagedTargets() {
+				put(addStagedPath(p, revoked), []byte("revoked attempt"))
+				put(addStagedPath(p, other), []byte("other attempt"))
+			}
+			put(addStagedPath(crt, revoked), revokedCrt)
+			put(addStagedPath(key, revoked), revokedKey)
+			if tc.legacy != nil {
+				put(legacyStagedPath(crt), tc.legacy)
+				put(legacyStagedPath(key), []byte("legacy key"))
+			}
+			if err := removeStagedPair(r, strings.ToUpper(revoked)); err != nil {
 				t.Fatal(err)
 			}
-			if tc.rm != (len(h.ran) == 1) {
-				t.Fatalf("ran %v, want a removal: %v", h.ran, tc.rm)
+			exists := func(path string) bool { _, err := os.Stat(r.Path(path)); return err == nil }
+			for _, p := range addStagedTargets() {
+				if exists(addStagedPath(p, revoked)) {
+					t.Errorf("the revoked attempt's %s is left staged", filepath.Base(p))
+				}
+				if !exists(addStagedPath(p, other)) {
+					t.Errorf("another attempt's staged %s was removed", filepath.Base(p))
+				}
 			}
-			if tc.rm && (!strings.Contains(h.ran[0], ".host.crt.add") || !strings.Contains(h.ran[0], ".host.key.add")) {
-				t.Errorf("removed %q, want the staged pair", h.ran[0])
+			if !exists(crt) || !exists(key) {
+				t.Error("the machine's installed identity was removed")
+			}
+			if tc.legacy != nil && exists(legacyStagedPath(crt)) == tc.legacyGone {
+				t.Errorf("the untagged staged pair: left %v, want removed %v", exists(legacyStagedPath(crt)), tc.legacyGone)
 			}
 		})
 	}

@@ -110,14 +110,12 @@ func (f *addFixture) identityUnchanged(t *testing.T) {
 // staged lists the files left at staged paths on the target.
 func (f *addFixture) staged(t *testing.T) []string {
 	t.Helper()
-	var out []string
-	_ = filepath.Walk(f.target.Root, func(p string, info os.FileInfo, err error) error {
-		if err == nil && !info.IsDir() && strings.HasSuffix(p, ".add") {
-			out = append(out, p)
-		}
-		return nil
-	})
-	return out
+	return stagedOnTarget(t, f.target.Root)
+}
+
+// isStagedWrite reports whether event e is an upload to a staged path.
+func isStagedWrite(e string) bool {
+	return strings.HasPrefix(e, "write ") && strings.Contains(filepath.Base(e), ".add-")
 }
 
 // installedLive reports whether anything was moved into place or run on the
@@ -126,7 +124,7 @@ func installedLive(events []string) []string {
 	var live []string
 	for _, e := range events {
 		switch {
-		case strings.HasPrefix(e, "write ") && strings.HasSuffix(e, ".add"):
+		case isStagedWrite(e):
 		case strings.HasPrefix(e, "run mkdir -p"), e == "sh unstage", e == "sh config":
 		default:
 			live = append(live, e)
@@ -201,10 +199,12 @@ func TestHostAdd_UploadsEverythingBeforeTheAdmission(t *testing.T) {
 		if err := f.add(t); err != nil {
 			t.Fatal(err)
 		}
-		want := map[string]bool{"write /usr/local/bin/.litevirt.add": false, "write /etc/litevirt/pki/.host.key.add": false}
+		want := map[string]bool{"write /usr/local/bin/.litevirt.add-": false, "write /etc/litevirt/pki/.host.key.add-": false}
 		for _, e := range f.client.atAdmit {
-			if _, ok := want[e]; ok {
-				want[e] = true
+			for w := range want {
+				if strings.HasPrefix(e, w) {
+					want[w] = true
+				}
 			}
 		}
 		for e, seen := range want {
@@ -422,12 +422,12 @@ func TestAddInstallCommands_KeepAndRestore(t *testing.T) {
 		t.Fatalf("exists = %v, want only %s", existed, key)
 	}
 	for _, p := range paths {
-		if err := os.WriteFile(addStagedPath(p), []byte("new "+filepath.Base(p)), 0o600); err != nil {
+		if err := os.WriteFile(addStagedPath(p, "ab"), []byte("new "+filepath.Base(p)), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 	const suffix = ".pre-add-x"
-	cmd := installCmd(r, paths, suffix)
+	cmd := installCmd(r, paths, suffix, "ab")
 	if strings.Index(cmd, "sync") < 0 || strings.Index(cmd, "sync") > strings.Index(cmd, "mv -fT") ||
 		strings.LastIndex(cmd, "sync") < strings.LastIndex(cmd, "mv -fT") {
 		t.Errorf("install does not sync before and after its renames:\n%s", cmd)
@@ -445,7 +445,7 @@ func TestAddInstallCommands_KeepAndRestore(t *testing.T) {
 	if got := string(mustRead(t, key+suffix)); got != "old" {
 		t.Fatalf("kept copy = %q, want the old key", got)
 	}
-	if _, err := r.Shell("restore", restoreCmd(r, paths, existed, suffix)); err != nil {
+	if _, err := r.Shell("restore", restoreCmd(r, paths, existed, suffix, "ab")); err != nil {
 		t.Fatal(err)
 	}
 	if got := string(mustRead(t, key)); got != "old" {
@@ -459,7 +459,7 @@ func TestAddInstallCommands_KeepAndRestore(t *testing.T) {
 		t.Errorf("a file the add created is still in place (stat: %v)", err)
 	}
 	for _, p := range paths {
-		if got := string(mustRead(t, addStagedPath(p))); got != "new "+filepath.Base(p) {
+		if got := string(mustRead(t, addStagedPath(p, "ab"))); got != "new "+filepath.Base(p) {
 			t.Errorf("the admitted %s is not back at its staged path: %q", filepath.Base(p), got)
 		}
 	}
@@ -674,10 +674,10 @@ func TestAddInstallCommands_AFailedSyncDoesNotRename(t *testing.T) {
 	if err := os.WriteFile(key, []byte("old"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(addStagedPath(key), []byte("new"), 0o600); err != nil {
+	if err := os.WriteFile(addStagedPath(key, "ab"), []byte("new"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Shell("install", installCmd(r, []string{key}, ".pre-add-x")); err == nil {
+	if _, err := r.Shell("install", installCmd(r, []string{key}, ".pre-add-x", "ab")); err == nil {
 		t.Error("an install whose sync failed reported success")
 	}
 	if got := string(mustRead(t, key)); got != "old" {
@@ -703,7 +703,7 @@ func TestHostAdd_AResumeChecksTheKeyMatchesTheCertificate(t *testing.T) {
 		filepath.Join(other, "x.crt"), filepath.Join(other, "x.key"), "node-9", net.IPv4(10, 0, 0, 9)); err != nil {
 		t.Fatal(err)
 	}
-	staged := addStagedPath(filepath.Join(f.targetPKI, "host.key"))
+	staged := addStagedPath(filepath.Join(f.targetPKI, "host.key"), f.client.admitted[0])
 	if err := os.WriteFile(staged, mustRead(t, filepath.Join(other, "x.key")), 0o600); err != nil {
 		t.Fatal(err)
 	}

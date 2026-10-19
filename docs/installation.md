@@ -141,17 +141,23 @@ host table.
 
 `lv host add` uploads the binary and the host's credentials to staged paths
 on the machine, and moves them into place only once the cluster has admitted
-the host, so a refused add leaves the machine as it was. It refuses a machine
-that serves another live member's certificate or has its address. While it
+the host, so a refused add leaves the machine as it was. Each attempt's
+staged files are its own, named for the serial of the certificate it asks the
+cluster to admit (`.host.crt.add-<serial>`), so two adds of one machine at once
+do not replace or remove each other's, and the install takes only the pair it
+was admitted with. It refuses a machine that serves another live member's
+certificate or has its address. While it
 installs, each file it replaces in `/etc/litevirt/pki` is kept beside it as
 `<file>.pre-add-<time>` (0600): the copies are put back if the add fails after
 the admission, and removed once it succeeds. A host admitted by an add that
 did not finish shows `HOST_JOINING`: run the same `lv host add` again, from
 any machine holding the cluster CA, to finish it, or `lv host rm <name>` to
-undo the admission. That removal also deletes the admitted credentials the add
-left staged on the machine, when it can reach the machine over SSH as root. A
-rerun refuses when the key staged or installed on the machine is not the
-admitted certificate's.
+undo the admission. That removal also deletes the files the add left staged
+under the revoked serial on the machine, when it can reach the machine over
+SSH as root within 10 seconds. A rerun refuses when the key staged or installed
+on the machine is not the admitted certificate's. The machine running
+`lv host add` keeps its copy of the admitted credentials in
+`hosts/<name>/` under its pki directory.
 
 A machine that already has `/etc/litevirt/config.yaml` keeps it. The add
 edits in place only `host_name`, `advertise_address`, `join_peers`, `pki_dir`

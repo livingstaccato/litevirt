@@ -120,6 +120,50 @@ func TestFleet_AnOperatorCannotRecreateAPrivilegedMemberFromAReplacedItem(t *tes
 	}
 }
 
+// An Admin's claim of the item between the member host's last judgment of
+// an Operator's recreate (its generation check) and the create's copy does
+// not reach the member: the item is pinned at the judged generation until
+// the copy, so the claim is refused, and the member is rebuilt from the
+// image it was judged on. Then the item is the Admin's to claim again.
+func TestFleet_AClaimDuringAnOperatorsRecreateDoesNotReachTheMember(t *testing.T) {
+	for _, entry := range []int{0, 1} {
+		t.Run([]string{"entered on the owner", "entered on a peer"}[entry], func(t *testing.T) {
+			c, rootfs, ops := newOCIItemFleet(t)
+			owner := c.Nodes[0]
+			ctx := context.Background()
+			deployClean(t, ctx, c.SelfClient(owner), ociBuildYAML(rootfs, "1"))
+			waitHistoryApplied(t, c, 20*time.Second)
+			claim := func() error {
+				_, err := c.SelfClient(c.Nodes[1]).PullOCIImage(ctx, &pb.PullOCIImageRequest{
+					Image: "ghcr.io/other/root:9", Dest: "build", HostName: owner.Name, Project: "_default"})
+				return err
+			}
+			var claimErr error
+			var claimed bool
+			owner.CT.OnDelete(func(name string) {
+				if name == "build" && !claimed {
+					claimed = true
+					claimErr = claim()
+				}
+			})
+			deployClean(t, ctx, ops[entry], ociBuildYAML(rootfs, "2"))
+			owner.CT.OnDelete(nil)
+			if !claimed {
+				t.Fatal("the member was not recreated")
+			}
+			if status.Code(claimErr) != codes.FailedPrecondition || !strings.Contains(claimErr.Error(), "build") {
+				t.Fatalf("the Admin's claim during the recreate: %v, want FailedPrecondition naming the member", claimErr)
+			}
+			if got := buildImage(t, owner); got != "image ghcr.io/acme/build:1" {
+				t.Fatalf("the member runs %q, want the image it was judged on", got)
+			}
+			if err := claim(); err != nil {
+				t.Fatalf("the Admin's claim after the recreate: %v", err)
+			}
+		})
+	}
+}
+
 // An Operator's pull over the item is refused, through any node; the item
 // is left as it was.
 func TestFleet_AnOperatorCannotPullOverAnExistingItem(t *testing.T) {

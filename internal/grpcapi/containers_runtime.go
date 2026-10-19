@@ -37,6 +37,7 @@ func (a *LXCRuntimeAdapter) CreateContainer(ctx context.Context, opts CreateCont
 		Network: nics, Labels: opts.Labels,
 		Confinement: opts.Confinement, IDMap: idmap,
 		Mounts: lxcMounts(opts.Mounts), Devices: lxcDevices(opts.Devices),
+		CheckItem: opts.CheckItem,
 	})
 	if err != nil {
 		return nil, err
@@ -145,10 +146,10 @@ func (a *LXCRuntimeAdapter) ListContainers(ctx context.Context) ([]string, error
 	return a.Inner.List(ctx)
 }
 
-func (a *LXCRuntimeAdapter) PullOCIImage(ctx context.Context, image, dest, tag, username, password string, replace bool, check func(transport, path string) error) error {
+func (a *LXCRuntimeAdapter) PullOCIImage(ctx context.Context, image, dest, tag, username, password string, replace bool, check func(transport, path string) error, publish func() error) error {
 	return lxc.PullOCI(ctx, lxc.PullOCIOptions{
 		Image: image, Dest: dest, Tag: tag, Username: username, Password: password, Replace: replace,
-		CheckSource: check,
+		CheckSource: check, Publish: publish,
 	})
 }
 

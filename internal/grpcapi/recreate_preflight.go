@@ -160,7 +160,9 @@ func (s *Server) recreatePinnedImage(ctx context.Context, pf recreatePreflight, 
 	if !isPath {
 		return nil
 	}
-	if cur := lxc.ReadImageGen(lxc.BundleDir(p)); cur != pf.pinGen {
+	// Pinned at the generation it was judged at: no replacing pull runs
+	// until the recreate's create has copied it (createItemCheck).
+	if !lxc.PinOCIItem(lxc.BundleDir(p), name, pf.pinGen) {
 		s.audit(ctx, "ct.recreate-security", name, "image under "+pf.template+" replaced since the member was built", "denied")
 		return status.Errorf(codes.PermissionDenied,
 			"recreating container %q: it is privileged or legacy-confined, and the image under %q on %s is not the pull it was built from "+

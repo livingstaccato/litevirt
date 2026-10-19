@@ -249,11 +249,18 @@ func replaceBundle(stage, dest string) error {
 		}
 		return fmt.Errorf("replace %s: %w; the old image was kept", dest, err)
 	}
-	if err := os.RemoveAll(old); err != nil {
-		return fmt.Errorf("pulled into %s, but removing the old image at %s failed: %w", dest, old, err)
+	// The new image is in place: the pull has succeeded, whatever becomes
+	// of the old one. One left behind is removed by the item's next pull,
+	// or at daemon start (recoverStaged).
+	if err := removeOldBundle(old); err != nil {
+		slog.Warn("oci library: pulled the new image, but removing the old one failed; the next pull of the item or daemon start removes it",
+			"item", dest, "path", old, "error", err)
 	}
 	return nil
 }
+
+// removeOldBundle is os.RemoveAll; a test seam.
+var removeOldBundle = os.RemoveAll
 
 // RecoverOCILibrary finishes, at daemon start, what a crash left of a
 // replacing pull in the OCI library lib (its unpackDirName), item by item.

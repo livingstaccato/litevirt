@@ -3,7 +3,10 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -129,11 +132,39 @@ type fakeCTRuntime struct {
 	rootfsRefs  map[string][]string
 	pullCheck   func(transport, path string) error
 	pullErr     error
+	// pullUnpack makes PullOCIImage lay the image down (fakeUnpack).
+	pullUnpack bool
+	// beforeCopy runs at the start of CreateContainer, before the item is
+	// judged and copied.
+	beforeCopy func()
+	// copied records, per created container, the rootfs/etc/image of the
+	// library item it was copied from.
+	copied map[string]string
 }
 
 func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerOpts) (*ContainerInfo, error) {
+	if f.beforeCopy != nil {
+		f.beforeCopy()
+	}
+	var image string
+	if p, isPath, _ := lxc.TemplatePath(opts.Template); isPath {
+		unlock := lxc.LockOCIItem(lxc.BundleDir(p))
+		if opts.CheckItem != nil {
+			if err := opts.CheckItem(lxc.ReadImageGen(lxc.BundleDir(p))); err != nil {
+				unlock()
+				return nil, err
+			}
+		}
+		b, _ := os.ReadFile(filepath.Join(lxc.BundleDir(p), "rootfs", "etc", "image"))
+		image = string(b)
+		unlock()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.copied == nil {
+		f.copied = map[string]string{}
+	}
+	f.copied[opts.Name] = image
 	f.createCalls = append(f.createCalls, opts)
 	f.setRunState(opts.Name, "stopped")
 	if f.createHook != nil {
@@ -422,13 +453,60 @@ func (f *fakeCTRuntime) ReadOwner(name string) (*lxc.ContainerOwner, error) {
 	}
 	return nil, nil
 }
-func (f *fakeCTRuntime) PullOCIImage(_ context.Context, image, dest, tag, username, password string, replace bool, check func(transport, path string) error) error {
+func (f *fakeCTRuntime) PullOCIImage(_ context.Context, image, dest, tag, username, password string, replace bool, check func(transport, path string) error, publish func() error) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.pullCheck = check
 	f.pullCalls = append(f.pullCalls, struct{ Image, Dest, Tag, Username, Password string }{image, dest, tag, username, password})
 	f.pullReplace = append(f.pullReplace, replace)
-	return f.pullErr
+	err, unpack := f.pullErr, f.pullUnpack
+	f.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if !unpack {
+		if publish != nil {
+			return publish()
+		}
+		return nil
+	}
+	return fakeUnpack(image, dest, replace, publish)
+}
+
+// fakeUnpack puts a bundle whose rootfs/etc/image names image at dest, with
+// a fresh generation, under the item's lock, as lxc.PullOCI does: an item
+// there already is replaced only with replace and while no recreate pins
+// it, and publish runs once it is in place.
+func fakeUnpack(image, dest string, replace bool, publish func() error) error {
+	unlock := lxc.LockOCIItem(dest)
+	defer unlock()
+	exists, err := lxc.IsBundle(dest)
+	if err != nil {
+		return err
+	}
+	if exists && !replace {
+		return fmt.Errorf("%w: %s", lxc.ErrOCIItemExists, dest)
+	}
+	if exists {
+		if h := lxc.OCIItemPinnedBy(dest); h != "" {
+			return fmt.Errorf("%w: %s (into container %s)", lxc.ErrOCIItemPinned, dest, h)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(dest, "rootfs", "etc"), 0o755); err != nil {
+		return err
+	}
+	for p, b := range map[string]string{
+		filepath.Join(dest, "rootfs", "etc", "image"): image,
+		filepath.Join(dest, "config.json"):            "{}",
+		filepath.Join(dest, lxc.ImageGenFile):         image + "-gen",
+	} {
+		if err := os.WriteFile(p, []byte(b), 0o644); err != nil {
+			return err
+		}
+	}
+	if publish != nil {
+		return publish()
+	}
+	return nil
 }
 
 // RootfsReferences reports rootfsRefs[dir].

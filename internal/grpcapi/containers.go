@@ -340,6 +340,8 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	}
 	specMounts, specDevices := hostAccessSpec(req.Mounts, req.Devices)
 	optMounts, optDevices := hostAccessOpts(corrosion.ContainerCreateSpec{Mounts: specMounts, Devices: specDevices})
+	checkItem, unpin := s.createItemCheck(ctx, req)
+	defer unpin()
 	info, err := s.containerRuntime.CreateContainer(ctx, CreateContainerOpts{
 		Name: req.Name, Template: req.Template,
 		Distro: req.Distro, Release: req.Release, Arch: req.Arch,
@@ -347,11 +349,15 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		Networks: plan.lxcNics, Labels: req.Labels,
 		Confinement: confinement, IDMapBase: idmapBase,
 		Mounts: optMounts, Devices: optDevices,
+		CheckItem: checkItem,
 	})
 	if err != nil {
 		_ = s.releaseContainerNICs(ctx, req.Name)
 		s.retireNICGuards(ctx, ctOwner)
 		s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")
+		if st, ok := status.FromError(err); ok && st.Code() == codes.PermissionDenied {
+			return nil, st.Err()
+		}
 		return nil, status.Errorf(codes.Internal, "create: %v", err)
 	}
 
@@ -1013,10 +1019,28 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 	if err != nil {
 		return nil, err
 	}
-	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password, replace, s.checkPullSource); err != nil {
+	// Only an explicit --project makes the image a project's; without one it
+	// is everyone's, as on main. The owner is recorded with the content,
+	// under the item's locks: a create judges the pair there
+	// (createItemCheck), and a concurrent claim cannot interleave its
+	// content with this claim's owner.
+	var publish func() error
+	if item != "" && s.dataDir != "" && req.Project != "" {
+		owner := tenancy.NormalizeProject(req.Project)
+		publish = func() error {
+			ociOwnerWriteHook(item, owner)
+			if err := s.writeOCIOwner(item, owner); err != nil {
+				return fmt.Errorf("recording its owner (project %s) failed: %w; until it is recorded, the project that owned it before may still use the new image, so run the same lv ct pull --project again", owner, err)
+			}
+			return nil
+		}
+	}
+	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password, replace, s.checkPullSource, publish); err != nil {
 		switch {
 		case errors.Is(err, lxc.ErrOCIItemExists):
 			return nil, ociItemExistsErr(req.Dest, s.hostName)
+		case errors.Is(err, lxc.ErrOCIItemPinned):
+			return nil, status.Errorf(codes.FailedPrecondition, "pull oci: %v", err)
 		case errors.Is(err, lxc.ErrSourceRefused):
 			return nil, status.Errorf(codes.InvalidArgument, "pull oci: %v", err)
 		case errors.Is(err, lxc.ErrStagingSpace):
@@ -1028,13 +1052,6 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 			return nil, st.Err()
 		}
 		return nil, status.Errorf(codes.Internal, "pull oci: %v", err)
-	}
-	// Only an explicit --project makes the image a project's; without one it
-	// is everyone's, as on main.
-	if item != "" && s.dataDir != "" && req.Project != "" {
-		if err := s.writeOCIOwner(item, tenancy.NormalizeProject(req.Project)); err != nil {
-			slog.Warn("oci pull: could not record the image's owner; it stays usable by every project", "image", item, "error", err)
-		}
 	}
 	return &emptypb.Empty{}, nil
 }

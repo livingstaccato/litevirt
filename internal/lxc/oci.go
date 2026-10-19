@@ -35,6 +35,11 @@ type PullOCIOptions struct {
 	// path of the object PullOCI opened (symlinks resolved), before
 	// anything reads it. nil judges nothing (lv ct pull --local, as root).
 	CheckSource func(transport, path string) error
+	// Publish runs once the pulled image is in place at Dest, under the
+	// item's locks, so what it records about the item (its owner) is
+	// recorded with the content it describes: nothing that takes the lock
+	// sees one without the other. Its error is the pull's.
+	Publish func() error
 }
 
 // PullOCI extracts an OCI image's flattened rootfs to disk via umoci.
@@ -130,6 +135,11 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) (err error) {
 	}
 	if exists && !opts.Replace {
 		return fmt.Errorf("%w: %s", ErrOCIItemExists, opts.Dest)
+	}
+	if exists {
+		if h := OCIItemPinnedBy(opts.Dest); h != "" {
+			return fmt.Errorf("%w: %s (into container %s); retry once it is done", ErrOCIItemPinned, opts.Dest, h)
+		}
 	}
 	// Where umoci unpacks: a fresh directory beside the item, which then
 	// takes its place (replaceBundle) or becomes it (a first pull, renamed
@@ -239,7 +249,9 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) (err error) {
 	}
 	switch {
 	case exists:
-		return replaceBundle(bundle, opts.Dest)
+		if err := replaceBundle(bundle, opts.Dest); err != nil {
+			return err
+		}
 	case created:
 		if err := os.Chmod(bundle, 0o750); err != nil {
 			return fmt.Errorf("oci: %w", err)
@@ -248,6 +260,11 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) (err error) {
 		// refuse any directory there) and fails if Dest is not empty.
 		if err := syscall.Rename(bundle, opts.Dest); err != nil {
 			return fmt.Errorf("oci: put the pulled image in place at %s: %w", opts.Dest, err)
+		}
+	}
+	if opts.Publish != nil {
+		if err := opts.Publish(); err != nil {
+			return fmt.Errorf("oci: the image is in place at %s, but %w", opts.Dest, err)
 		}
 	}
 	return nil

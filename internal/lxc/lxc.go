@@ -209,6 +209,10 @@ type CreateOpts struct {
 	// the caller has already required the admin role.
 	Mounts  []Mount
 	Devices []Device
+	// CheckItem, for a library item's rootfs path, judges the item as the
+	// create copies it: called under the item's lock, with the item's
+	// generation, before anything is copied; its error refuses the create.
+	CheckItem func(gen string) error
 }
 
 // Validate checks cross-field invariants before any shell-out.
@@ -360,6 +364,11 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 			return nil, err
 		}
 		if ok {
+			if opts.CheckItem != nil {
+				if err := opts.CheckItem(ReadImageGen(BundleDir(rootfs))); err != nil {
+					return nil, err
+				}
+			}
 			return r.createFromRootfs(ctx, opts, rootfs)
 		}
 	}

@@ -268,6 +268,7 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 			// the item is still the generation it was built from
 			// (recreateHostChecks), or this is an image change too.
 			pinGen, pinned = old.TemplateGen, true
+			dec.pinned, dec.pinGen = true, pinGen
 		}
 		dec.keep = true
 		dec.note = RequireRole(ctx, "admin") != nil
@@ -400,6 +401,10 @@ type recreateDecision struct {
 	project           string
 	keep, note        bool
 	template          string
+	// pinned: the create must copy generation pinGen of the item under
+	// template (recreatePinnedImage).
+	pinned bool
+	pinGen string
 }
 
 // recreateDecisionKey carries one recreate's decision from its judgment to
@@ -425,6 +430,9 @@ func recreateTemplateGranted(ctx context.Context, template string) bool {
 func (dec *recreateDecision) apply(ctx context.Context, d *compose.VMDef, req *pb.CreateContainerRequest) (context.Context, bool) {
 	if dec.template != "" {
 		ctx = context.WithValue(ctx, recreateTemplateKey{}, dec.template)
+	}
+	if dec.pinned {
+		ctx = withRecreatePin(ctx, req.Template, dec.pinGen)
 	}
 	if !dec.keep {
 		// Bound to this create, for its member's host when that is

@@ -384,6 +384,17 @@ func (f *CTFake) snapshot(get func() []string) []string {
 // ── grpcapi.ContainerRuntime ────────────────────────────────────────────
 
 func (f *CTFake) CreateContainer(_ context.Context, opts grpcapi.CreateContainerOpts) (*grpcapi.ContainerInfo, error) {
+	// A rootfs path is judged and copied under its item's lock, as the
+	// real create does.
+	if p, isPath, _ := lxc.TemplatePath(opts.Template); isPath {
+		unlock := lxc.LockOCIItem(lxc.BundleDir(p))
+		defer unlock()
+		if opts.CheckItem != nil {
+			if err := opts.CheckItem(lxc.ReadImageGen(lxc.BundleDir(p))); err != nil {
+				return nil, err
+			}
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.createCalls = append(f.createCalls, opts)
@@ -738,7 +749,7 @@ func (f *CTFake) CloneContainer(_ context.Context, src, dst string) error {
 // PullOCIImage unpacks a bundle at dest as umoci does — config.json, a
 // rootfs whose etc/image names image, and a fresh generation — refusing a
 // dest that already holds one unless replace, as lxc.PullOCI does.
-func (f *CTFake) PullOCIImage(_ context.Context, image, dest, _, _, _ string, replace bool, _ func(transport, path string) error) error {
+func (f *CTFake) PullOCIImage(_ context.Context, image, dest, _, _, _ string, replace bool, _ func(transport, path string) error, publish func() error) error {
 	if dest == "" {
 		return fmt.Errorf("ctfake: empty OCI destination")
 	}
@@ -750,6 +761,11 @@ func (f *CTFake) PullOCIImage(_ context.Context, image, dest, _, _, _ string, re
 	}
 	if exists && !replace {
 		return fmt.Errorf("%w: %s", lxc.ErrOCIItemExists, dest)
+	}
+	if exists {
+		if h := lxc.OCIItemPinnedBy(dest); h != "" {
+			return fmt.Errorf("%w: %s (into container %s)", lxc.ErrOCIItemPinned, dest, h)
+		}
 	}
 	stage := dest + ".ctfake-unpack"
 	_ = os.RemoveAll(stage)
@@ -768,7 +784,13 @@ func (f *CTFake) PullOCIImage(_ context.Context, image, dest, _, _, _ string, re
 	if err := os.RemoveAll(dest); err != nil {
 		return err
 	}
-	return os.Rename(stage, dest)
+	if err := os.Rename(stage, dest); err != nil {
+		return err
+	}
+	if publish != nil {
+		return publish()
+	}
+	return nil
 }
 
 // RootfsReferences names the containers whose config's lxc.rootfs.path is

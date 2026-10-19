@@ -1283,6 +1283,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		},
 	}
 	tpmCapable := tpmCapableProbe(exec.LookPath, vtpmSync.probe)
+	// The live firmware move label reads the pass the vTPM label's probe
+	// ran this cycle, so a cycle walks the swtpm tree once.
+	tpmReady := tpmReadyProbe(exec.LookPath, vtpmSync)
 	awaitFirstVTPMPass(tpmCapable)
 	// Finish any cutover cleanup a previous process left committed-but-unfinished.
 	// The replacement transition displaced the rows describing what the replaced VM
@@ -1859,11 +1862,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		{key: corrosion.LabelTPMCapable, capable: tpmCapable},
 		{key: corrosion.LabelSecureBootCapable, capable: firmwarePaths.SecureBootAvailable},
 		// The live firmware move label holds a target to vTPM's own label
-		// (tpmCapable: swtpm present and a vtpm_state_sync pass completed); a
+		// (tpmReady: swtpm present and this cycle's vtpm_state_sync pass completed); a
 		// move's Prepare re-checks presence only (tpmAvailable), since the
 		// label already gated it and a pass per Prepare would walk the tree
 		// on every move.
-		{key: corrosion.LabelFwLiveMigrate, capable: newFwLiveLabel(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmCapable)},
+		{key: corrosion.LabelFwLiveMigrate, capable: newFwLiveLabel(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmReady)},
 	}
 	// A live firmware move's target re-checks the label's conditions itself,
 	// live, in Prepare.

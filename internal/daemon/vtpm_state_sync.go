@@ -29,7 +29,7 @@ const vtpmPassWait = 10 * time.Second
 // stateTimedOut is the condition's state while a pass has run past its wait.
 const stateTimedOut = "timed_out"
 
-// vtpmStateSync keeps libvirt's swtpm tree synchronous (libvirt.SyncSwtpmState)
+// vtpmStateSync keeps libvirt's swtpm tree synchronous ((*libvirt.FirmwareStore).SyncSwtpmState)
 // and reports when it cannot. The vTPM capability probe drives it, at start
 // and every minute; a pass runs in its own goroutine, so a hung one blocks
 // neither daemon start nor the label loop.
@@ -192,6 +192,26 @@ func tpmCapableProbe(lookPath func(string) (string, error), probe func(present b
 		_, errSetup := lookPath("swtpm_setup")
 		return probe(errSwtpm == nil && errSetup == nil)
 	}
+}
+
+// tpmReadyProbe is the vTPM condition of the live firmware move label: swtpm
+// is installed and a pass over the swtpm tree has completed. It reads the
+// last pass and never starts one, so a label cycle walks the tree once, in
+// the vTPM label's own probe (tpmCapableProbe).
+func tpmReadyProbe(lookPath func(string) (string, error), v *vtpmStateSync) func() bool {
+	return func() bool {
+		_, errSwtpm := lookPath("swtpm")
+		_, errSetup := lookPath("swtpm_setup")
+		return errSwtpm == nil && errSetup == nil && v.ready()
+	}
+}
+
+// ready reports whether a pass has completed since swtpm was last seen
+// installed, without starting one.
+func (v *vtpmStateSync) ready() bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.passed
 }
 
 // syncVTPMCondition raises or resolves vtpm_state_not_durable about this

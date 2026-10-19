@@ -154,7 +154,7 @@ func fwLiveMigrateCheck(ctx context.Context, in fwLiveInputs) (libvirt.Installed
 	case !in.enabled:
 		return libvirt.InstalledFirmwareCode{}, errors.New("migration.live_firmware is off")
 	case !in.tpm():
-		return libvirt.InstalledFirmwareCode{}, errors.New("no vTPM support (swtpm and swtpm_setup)")
+		return libvirt.InstalledFirmwareCode{}, errors.New("no vTPM support (swtpm and swtpm_setup), or no vtpm_state_sync pass over the swtpm tree has completed yet")
 	case !in.secureBoot():
 		return libvirt.InstalledFirmwareCode{}, errors.New("no Secure Boot firmware")
 	}

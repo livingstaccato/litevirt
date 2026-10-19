@@ -2193,3 +2193,10 @@ any that were not intended:
 lv role ls --role ContainerRoot
 lv role revoke <binding-id>
 ```
+
+### Re-created project names during the roll
+
+During the roll, a host on the previous build can still retire a re-created
+project's admission authority, and anti-entropy spreads that to upgraded hosts.
+It recovers when the next admission claims a fresh authority epoch, and it
+heals once every host runs this release.

@@ -27,7 +27,7 @@ func (s *Server) CreateProject(ctx context.Context, req *pb.CreateProjectRequest
 	// The name is stored as given (the project identity used by VM/ct rows and
 	// quota lookups is the raw string); RBAC paths are canonicalized separately
 	// by projectRBACBase, so "/acme" and "acme" resolve to the same auth path.
-	if _, err := safename.CanonicalProjectName(req.Name); err != nil {
+	if err := safename.ValidateNewProjectName(req.Name); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	if req.ParentName != "" {

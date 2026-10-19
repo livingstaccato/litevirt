@@ -46,7 +46,7 @@ func TestCTPull_SaysWhatItPulled(t *testing.T) {
 }
 
 // `lv compose down` of a stack with no VMs does not call it a stack with
-// "no running VMs": DeleteStack removes its containers too.
+// "no running VMs": it may still hold containers.
 type noVMsClient struct{ *deployClient }
 
 func (noVMsClient) ListVMs(context.Context, *pb.ListVMsRequest, ...grpc.CallOption) (*pb.ListVMsResponse, error) {
@@ -61,7 +61,7 @@ func TestComposeDown_AStackWithoutVMsIsNotCalledEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compose down: %v\n%s", err, out)
 	}
-	if strings.Contains(out, "has no running VMs") || !strings.Contains(out, "container") {
+	if strings.Contains(out, "has no running VMs") {
 		t.Fatalf("compose down of a stack without VMs printed:\n%s", out)
 	}
 }

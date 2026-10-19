@@ -583,6 +583,15 @@ How it works and what to expect:
   the same name (`AlreadyExists`) — `lv ct rm` it first, or restore onto a host
   that doesn't have it. The restored container comes up `stopped` unless you
   pass `--start`.
+- **A MAC another NIC holds is replaced.** A backed-up NIC MAC that another
+  live NIC or address lease holds now (the original's, when the copy is
+  restored beside it) is not restored: the NIC gets a fresh MAC, and the
+  restore says so in its progress output and in its `ct.restore` audit entry
+  (`NIC eth0: MAC <old> is held by <holder>; restored with <new>`).
+  Configuration inside the guest or outside litevirt that matches the old MAC
+  does not match the new one. To keep the original MAC, remove its holder
+  first: `lv ct rm` the original (or let failover retire a dead host's row),
+  then `lv ct restore`.
 - **Host-local, like VM backup.** A container is archived on its owning host;
   run `lv ct backup`/`restore` against that host (`LV_HOST`). Restore runs on
   the **target** host (where the container will live). Running `lv` as root

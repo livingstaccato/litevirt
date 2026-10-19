@@ -121,3 +121,31 @@ func FailDrainColdMove(ctx context.Context, c *Client, m DrainColdMove, reason s
 		OperationID: m.OperationID, OwnerEpoch: m.OwnerEpoch, StepName: OpStepFailed, Facts: reason,
 	})
 }
+
+// DrainColdMoveOpenTo reports whether a drain cold move of vm to target is
+// journaled and not finished: a start of vm on target then resumes a guest
+// that was running before the drain.
+func DrainColdMoveOpenTo(ctx context.Context, c *Client, vm, target string) (bool, error) {
+	rows, err := c.Query(ctx,
+		`SELECT `+operationCols+` FROM operations
+		 WHERE operation_kind = ? AND resource_id = ? AND desired_ref = ? AND deleted_at IS NULL`,
+		string(OpDrainColdMove), vm, target)
+	if err != nil {
+		return false, err
+	}
+	for _, r := range rows {
+		op := scanOperation(r)
+		steps, sErr := ListOperationSteps(ctx, c, op.ID, op.VMOwnerEpoch)
+		if sErr != nil {
+			return false, sErr
+		}
+		names := make([]string, 0, len(steps))
+		for _, st := range steps {
+			names = append(names, st.StepName)
+		}
+		if state, _ := ReduceOperationState(OpDrainColdMove, names); state != "" && !IsOperationTerminal(state) {
+			return true, nil
+		}
+	}
+	return false, nil
+}

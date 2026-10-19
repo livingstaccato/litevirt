@@ -156,71 +156,74 @@ var dataDirPoolAreas = []string{"mounts", "pools"}
 // newHWMStore(dir)): those were found by sweeping every function the data
 // directory is passed to, and a new one needs adding here by hand.
 var dataDirOwned = []string{
-	"state.db",                  // corrosion/client.go NewClient, NewLocalClient (and -wal/-shm, dataDirOwnedPrefixes)
-	"pki",                       // the daemon's PKI when pki_dir is put in the data directory
-	"vms",                       // health/owner_marker.go: per-VM owner-epoch markers; deleted_vm_marker_sweep.go
-	"images",                    // image/store.go, imageops.go, restore_dest.go
-	"imports",                   // vmimport.go: import work dirs and imports/staging (--server-path)
-	"import-placements",         // vmimport_placement.go importPlacementDirName
-	"iso-identity",              // iso_identity.go isoIdentityDir
-	"cloudinit",                 // libvirt/xmlgen.go CloudInitISOPath; migrate.go, vm_iso.go
-	"nvram",                     // libvirt/xmlgen.go NvramPath; vtpmstate.go retainedMarkerPath
-	"vmstate",                   // libvirt/xmlgen.go VMStatePath (saved memory state)
-	"snapfw",                    // libvirt/vtpmstate.go snapshot firmware bundles
-	"oci",                       // grpcapi/containers.go OCI image cache
-	"oci-owners",                // grpcapi/container_paths.go ociOwnersDir
-	"ct-idmap-ledger",           // grpcapi/container_security.go idmapLedgerFile (and its .tmp)
-	"recreate-failed",           // grpcapi/vm_recreate_replaces.go: specs of failed recreates
-	"kept-disks",                // health/kept_disks.go: disks a --keep-disks delete kept, per VM
-	"iscsi-lun-holds",           // grpcapi/vm_lun_hold.go lunHoldDirName: moved iSCSI LUN holds
-	"containers",                // daemon.go: the LXC container root
-	"ct-snapshots",              // snapshot_container.go containerSnapshotDir
-	"ct-restore",                // backup_container.go container restore staging
-	"ct-restore-markers",        // backup_container.go
-	"ct-provenance",             // grpcapi/replication_container.go: container replica provenance
-	"promote-markers",           // promote.go
-	"restore-staging",           // peer_backup.go
-	"backup-staging",            // peer_backup.go
-	"backup-scratch",            // libvirt/backup_session.go sessScratchDir (hardcoded /var/lib/litevirt)
-	"backup-sock",               // libvirt/backup_session.go sessSocketDir (hardcoded /var/lib/litevirt)
-	"replicate-scratch",         // replication_runner.go
-	"opjournal",                 // daemon.go: the operation journal
-	"acme",                      // daemon/acme.go: ACME cache_dir default
-	"partition-pause",           // health/partition_pause_store.go partitionPauseDir
-	"settle-pending",            // health/settle_pending.go settlePendingDir: VM settles whose record is not yet written
-	"onboot-boot-id",            // health/onboot_boot.go onbootBootFile (and its .tmp, dataDirOwnedPrefixes)
-	"pending-audit",             // corrosion/pending_audit.go PendingAuditDirName
-	"vtpm-state-sync",           // daemon.go: records that vtpm_state_sync set the swtpm tree's sync attribute
-	"image-delete-skew.json",    // grpcapi/image_delete_skew.go imageSkewHistoryFile (its temp is a dot-name; an earlier build of it left a .tmp, dataDirOwnedPrefixes)
-	"audit-hold",                // corrosion/audit_hold.go AuditHoldDirName
-	"audit-seeded.json",         // corrosion/audit_seeded.go AuditSeededFileName
-	"audit-seeded-assert",       // corrosion/audit_seeded.go AuditSeededAssertFileName
-	"credentials_unhydrated",    // corrosion/isolation.go credentialsUnhydratedFile
-	"digest-invalidate",         // corrosion/digest_cache.go digestMarkerFile
-	"host_membership_live",      // corrosion/host_membership.go hostMembershipLiveFile
-	"host_runtime_live",         // corrosion/host_runtime.go hostRuntimeLiveFile
-	"credentials_split_live",    // corrosion/credentials_live.go credentialsLiveFile
-	"credentials_baseline",      // corrosion/credentials_live.go credentialsBaselineFile
-	"credentials_external_seen", // corrosion/credentials_live.go externalSeenFile
-	"genesis-pending",           // daemon.go genesisMarkerName; host_init.go genesisMarkerScript
-	"pool-uploads.json",         // storage_pool_confine.go poolUploadsFile
-	"host-updates.json",         // grpcapi/host_updates.go hostUpdateCountsPath
-	"file-restore",              // daemon.go fileRestoreCacheDir/fileRestoreRunDir (a non-root daemon only)
-	"restart-pending",           // hostboot/hostboot.go MarkerName: a graceful stop's time, for the next boot
-	"boot-awaiting-serving",     // hostboot/hostboot.go AwaitingName: a boot that awaits serving, until a daemon serves
-	"boot-unclean-history",      // hostboot/hostboot.go UncleanHistoryName: the last unclean boots' times
-	"nowts.hwm",                 // corrosion/hwm.go (and nowts.hwm.lock)
-	"split_brain_activated",     // health/capability.go ActivationMarkerBase (markers are .<token>)
-	"ceph-trash-purges.json",    // storage/ceph_trash.go cephPurgeStateFile (ResumeCephPurges(dir): set aside as .unreadable-<time>, dataDirOwnedPrefixes)
-	"ceph-kept-images.json",     // grpcapi/ceph_kept.go cephKeptFile
-	"kept-disks.json",           // grpcapi/disk_kept.go diskKeptFile
-	"cancelled-starts.json",     // grpcapi/cancelled_starts.go cancelledStartsFile
-	"firewall-would-drop.json",  // daemon.go: firewall.NewWouldDropTally (its .tmp, dataDirOwnedPrefixes)
-	"firewall-initial-mode",     // daemon.go firewallInitialModeName: the founder's enforcement decision
-	"nic-guard-held",            // grpcapi/nic_guard_held.go heldGuestDir: guests held paused for their guards
-	"promote-started",           // grpcapi/promote_serialize.go: an operator promotion's recorded start, per proof
-	"shared-disk-released",      // health/shared_disk_release.go sharedReleaseDir: shared disks released for a start
-	"vfio-host-drivers.json",    // vfio.HostDriversFileName (grpcapi/pci.go vfioHost): each bound device's previous host driver (its .tmp is a dot-name)
+	"state.db",                   // corrosion/client.go NewClient, NewLocalClient (and -wal/-shm, dataDirOwnedPrefixes)
+	"pki",                        // the daemon's PKI when pki_dir is put in the data directory
+	"vms",                        // health/owner_marker.go: per-VM owner-epoch markers; deleted_vm_marker_sweep.go
+	"images",                     // image/store.go, imageops.go, restore_dest.go
+	"imports",                    // vmimport.go: import work dirs and imports/staging (--server-path)
+	"import-placements",          // vmimport_placement.go importPlacementDirName
+	"iso-identity",               // iso_identity.go isoIdentityDir
+	"cloudinit",                  // libvirt/xmlgen.go CloudInitISOPath; migrate.go, vm_iso.go
+	"nvram",                      // libvirt/xmlgen.go NvramPath; vtpmstate.go retainedMarkerPath
+	"vmstate",                    // libvirt/xmlgen.go VMStatePath (saved memory state)
+	"snapfw",                     // libvirt/vtpmstate.go snapshot firmware bundles
+	"oci",                        // grpcapi/containers.go OCI image cache
+	"oci-owners",                 // grpcapi/container_paths.go ociOwnersDir
+	"ct-idmap-ledger",            // grpcapi/container_security.go idmapLedgerFile (and its .tmp)
+	"recreate-failed",            // grpcapi/vm_recreate_replaces.go: specs of failed recreates
+	"kept-disks",                 // health/kept_disks.go: disks a --keep-disks delete kept, per VM
+	"iscsi-lun-holds",            // grpcapi/vm_lun_hold.go lunHoldDirName: moved iSCSI LUN holds
+	"containers",                 // daemon.go: the LXC container root
+	"ct-snapshots",               // snapshot_container.go containerSnapshotDir
+	"ct-restore",                 // backup_container.go container restore staging
+	"ct-restore-markers",         // backup_container.go
+	"ct-provenance",              // grpcapi/replication_container.go: container replica provenance
+	"promote-markers",            // promote.go
+	"restore-staging",            // peer_backup.go
+	"backup-staging",             // peer_backup.go
+	"backup-scratch",             // libvirt/backup_session.go sessScratchDir (hardcoded /var/lib/litevirt)
+	"backup-sock",                // libvirt/backup_session.go sessSocketDir (hardcoded /var/lib/litevirt)
+	"replicate-scratch",          // replication_runner.go
+	"opjournal",                  // daemon.go: the operation journal
+	"acme",                       // daemon/acme.go: ACME cache_dir default
+	"partition-pause",            // health/partition_pause_store.go partitionPauseDir
+	"settle-pending",             // health/settle_pending.go settlePendingDir: VM settles whose record is not yet written
+	"onboot-boot-id",             // health/onboot_boot.go onbootBootFile (and its .tmp, dataDirOwnedPrefixes)
+	"pending-audit",              // corrosion/pending_audit.go PendingAuditDirName
+	"vtpm-state-sync",            // daemon.go: records that vtpm_state_sync set the swtpm tree's sync attribute
+	"nvram-flush-failures.json",  // libvirt/nvramflush.go NvramFlushStateFile: this host's failed UEFI vars flushes (its temp is a dot-name)
+	"image-delete-skew.json",     // grpcapi/image_delete_skew.go imageSkewHistoryFile (its temp is a dot-name; an earlier build of it left a .tmp, dataDirOwnedPrefixes)
+	"audit-hold",                 // corrosion/audit_hold.go AuditHoldDirName
+	"audit-seeded.json",          // corrosion/audit_seeded.go AuditSeededFileName
+	"audit-seeded-assert",        // corrosion/audit_seeded.go AuditSeededAssertFileName
+	"credentials_unhydrated",     // corrosion/isolation.go credentialsUnhydratedFile
+	"digest-invalidate",          // corrosion/digest_cache.go digestMarkerFile
+	"host_membership_live",       // corrosion/host_membership.go hostMembershipLiveFile
+	"host_runtime_live",          // corrosion/host_runtime.go hostRuntimeLiveFile
+	"credentials_split_live",     // corrosion/credentials_live.go credentialsLiveFile
+	"credentials_baseline",       // corrosion/credentials_live.go credentialsBaselineFile
+	"credentials_external_seen",  // corrosion/credentials_live.go externalSeenFile
+	"genesis-pending",            // daemon.go genesisMarkerName; host_init.go genesisMarkerScript
+	"pool-uploads.json",          // storage_pool_confine.go poolUploadsFile
+	"host-updates.json",          // grpcapi/host_updates.go hostUpdateCountsPath
+	"file-restore",               // daemon.go fileRestoreCacheDir/fileRestoreRunDir (a non-root daemon only)
+	"restart-pending",            // hostboot/hostboot.go MarkerName: a graceful stop's time, for the next boot
+	"boot-awaiting-serving",      // hostboot/hostboot.go AwaitingName: a boot that awaits serving, until a daemon serves
+	"boot-unclean-history",       // hostboot/hostboot.go UncleanHistoryName: the last unclean boots' times
+	"nowts.hwm",                  // corrosion/hwm.go (and nowts.hwm.lock)
+	"split_brain_activated",      // health/capability.go ActivationMarkerBase (markers are .<token>)
+	"ceph-trash-purges.json",     // storage/ceph_trash.go cephPurgeStateFile (ResumeCephPurges(dir): set aside as .unreadable-<time>, dataDirOwnedPrefixes)
+	"ceph-kept-images.json",      // grpcapi/ceph_kept.go cephKeptFile
+	"kept-disks.json",            // grpcapi/disk_kept.go diskKeptFile
+	"cancelled-starts.json",      // grpcapi/cancelled_starts.go cancelledStartsFile
+	"firewall-log",               // daemon/firewall_log.go: the firewall log store (tenant flow records)
+	"firewall-synflood-decision", // daemon.go firewallSynfloodDecisionName: the founder's SYN-flood decision
+	"firewall-would-drop.json",   // daemon.go: firewall.NewWouldDropTally (its .tmp, dataDirOwnedPrefixes)
+	"firewall-initial-mode",      // daemon.go firewallInitialModeName: the founder's enforcement decision
+	"nic-guard-held",             // grpcapi/nic_guard_held.go heldGuestDir: guests held paused for their guards
+	"promote-started",            // grpcapi/promote_serialize.go: an operator promotion's recorded start, per proof
+	"shared-disk-released",       // health/shared_disk_release.go sharedReleaseDir: shared disks released for a start
+	"vfio-host-drivers.json",     // vfio.HostDriversFileName (grpcapi/pci.go vfioHost): each bound device's previous host driver (its .tmp is a dot-name)
 }
 
 // dataDirOwnedPrefixes are owned by name prefix, each judged within one path

@@ -307,6 +307,19 @@ Multiple networks can be attached to a single VM:
         ip: "172.16.0.10"
 ```
 
+A generated MAC is one no live NIC of the cluster holds (a VM's or a
+container's NIC, or an address lease), on create, `lv attach-nic`, clone,
+restore under a new name, a renamed promotion and import. A container NIC's
+MAC is derived from its host, name and NIC number; when another NIC holds it
+(a container of the same name that migrated away), create and `lv ct clone`
+draw a fresh one, and so does a container restore (`lv ct restore`) for a
+backed-up MAC another NIC holds now, such as a copy restored beside its live
+original. A `mac` another live NIC holds is refused, for a VM and for a
+container NIC alike, and so is a VM restored under the backup's own name
+whose MAC another NIC holds now. Two hosts that draw one MAC at the same
+moment raise `mac_duplicate`
+([diagnostics.md](diagnostics.md#two-nics-on-one-mac-mac_duplicate)).
+
 A VM is created with at most one NIC per network. A create, a rebuild or a
 stack update whose spec has two NICs on one network is refused before anything
 is created (`NICs 0 and 1 are both on network "lan"`). Once `hardware_v2` is

@@ -53,6 +53,16 @@ func returningBoot(ctx context.Context, db *corrosion.Client, host, dataDir stri
 	if err != nil || h == nil || !returning(h.State) {
 		return Boot{}, false
 	}
+	// A joining host that does not keep its address (another host there is
+	// active, or was admitted first) stays joining: nothing is written, and
+	// serving does not activate it (ConfirmServingReport keeps the state).
+	if h.State == corrosion.HostStateJoining {
+		if lostTo, err := corrosion.AddressLostTo(ctx, db, host); err == nil && lostTo != "" {
+			why := addressNotKept(host, lostTo).Error()
+			return Boot{State: h.State, AwaitServing: true, Deferred: true, Cause: why,
+				Reason: "recorded joining, and " + why + "; it stays joining, and is activated by a restart of its daemon once " + lostTo + " is removed"}, true
+		}
+	}
 	if !marked && dataDir != "" {
 		// Counted like any boot without the marker, so a crash loop that
 		// follows is judged on its whole history.

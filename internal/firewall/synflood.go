@@ -1,8 +1,15 @@
 package firewall
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/cmdbound"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // SYN-flood protection on guest NICs (docs/firewall.md, "SYN-flood
@@ -14,9 +21,18 @@ import (
 // SynFlood is the SYN-flood policy in force on this host. Rate is new SYNs
 // per second per (guest NIC, source address), Burst packets; each 1-100000
 // when On.
+//
+// NoV4 and NoV6 leave out a family the kernel refused at start
+// (ProbeSynFlood): the other family is still limited.
 type SynFlood struct {
 	On          bool
 	Rate, Burst int
+	NoV4, NoV6  bool
+}
+
+// renders reports whether family fam ("4" or "6") is rendered.
+func (s SynFlood) renders(fam string) bool {
+	return s.On && !(fam == "4" && s.NoV4) && !(fam == "6" && s.NoV6)
 }
 
 const (
@@ -48,7 +64,10 @@ func renderSynFloodSets(b *strings.Builder, p Plan) {
 	if !p.SynFlood.On {
 		return
 	}
-	for _, s := range []struct{ name, addr string }{{setSyn4, "ipv4_addr"}, {setSyn6, "ipv6_addr"}} {
+	for _, s := range []struct{ name, addr, fam string }{{setSyn4, "ipv4_addr", "4"}, {setSyn6, "ipv6_addr", "6"}} {
+		if !p.SynFlood.renders(s.fam) {
+			continue
+		}
 		fmt.Fprintf(b, "    set %s {\n        type ifname . %s\n        size 65536\n        flags dynamic,timeout\n        timeout 60s\n    }\n\n", s.name, s.addr)
 	}
 }
@@ -57,22 +76,214 @@ func renderSynFloodSets(b *strings.Builder, p Plan) {
 // immediately before its nic_in_ dispatch. `meta protocol` comes first, so
 // the bridge family adds no implicit `ether type` (which would miss a trunk's
 // tagged SYNs), and `meta l4proto tcp` finds TCP behind IPv6 extension
-// headers. The load balancer's sources are exempt. The comment ends the rule:
-// nft refuses a verdict after it.
+// headers. No source is exempt: the load balancer's flows to its backends are
+// accepted earlier in the chain, by (source, backend, port). An IPv6 source
+// is keyed by its /64, so one host rotating addresses within its prefix
+// shares one budget. The comment ends the rule: nft refuses a verdict after
+// it.
 func renderSynFloodLines(b *strings.Builder, p Plan) {
 	if !p.SynFlood.On {
 		return
 	}
 	limit := fmt.Sprintf("limit rate over %d/second burst %d packets", p.SynFlood.Rate, p.SynFlood.Burst)
-	for _, f := range []struct{ fam, ip, set, exempt, n string }{
-		{"ip", "ip", setSyn4, fmt.Sprintf(" ip saddr != @%s", setLBSrc4), "4"},
-		{"ip6", "ip6", setSyn6, "", "6"},
+	for _, f := range []struct{ fam, set, key, n string }{
+		{"ip", setSyn4, "ip saddr", "4"},
+		{"ip6", setSyn6, "ip6 saddr & " + synFloodV6Mask, "6"},
 	} {
+		if !p.SynFlood.renders(f.n) {
+			continue
+		}
 		action := "counter drop comment " + quoteComment(SynFloodComment+" "+f.n)
 		if p.nicMode() == NICModeObserve {
 			action = verdict(p, "-", "in", "synflood")
 		}
-		fmt.Fprintf(b, "        oifname @%s meta protocol %s meta l4proto tcp tcp flags & (fin|syn|rst|ack) == syn%s update @%s { oifname . %s saddr %s } %s\n",
-			setNICDevs, f.fam, f.exempt, f.set, f.ip, limit, action)
+		fmt.Fprintf(b, "        oifname @%s meta protocol %s meta l4proto tcp tcp flags & (fin|syn|rst|ack) == syn update @%s { oifname . %s %s } %s\n",
+			setNICDevs, f.fam, f.set, f.key, limit, action)
 	}
+}
+
+// synFloodV6Mask keys an IPv6 source by its /64.
+const synFloodV6Mask = "ffff:ffff:ffff:ffff::"
+
+// SynFloodProbeResult is the kernel's answer to each family's SYN-flood
+// probe: nil accepted, else nft's refusal.
+type SynFloodProbeResult struct {
+	V4, V6 error
+}
+
+// ProbeSynFlood asks the kernel, without loading anything, whether it accepts
+// the renderer's own SYN-flood set and line (ProbeRuleset), one family at a
+// time: an nft or kernel that refuses one family's line (the IPv6 /64 key on
+// an older nft, say) leaves the other family's protection in place. The
+// daemon runs it once at start (LoaderOptions.SynFloodProbe).
+func ProbeSynFlood(ctx context.Context) SynFloodProbeResult {
+	probe := func(sf SynFlood) error {
+		p := Plan{SynFlood: sf}
+		var b strings.Builder
+		renderIfnameSet(&b, setNICDevs, nil)
+		renderSynFloodSets(&b, p)
+		b.WriteString("    chain forward {\n        type filter hook forward priority 0; policy accept;\n")
+		renderSynFloodLines(&b, p)
+		b.WriteString("    }\n")
+		return ProbeRuleset(ctx, b.String())
+	}
+	on := SynFlood{On: true, Rate: corrosion.SynfloodDefaultRate, Burst: corrosion.SynfloodDefaultBurst}
+	v4, v6 := on, on
+	v4.NoV6, v6.NoV4 = true, true
+	return SynFloodProbeResult{V4: probe(v4), V6: probe(v6)}
+}
+
+// loadSynFlood is the loader's SYN-flood block: host's policy (its own row,
+// else the cluster's, else off) as this host renders it.
+//   - A row this build cannot read protects at the defaults, and is reported
+//     (unreadable).
+//   - A family the kernel refused at start is left out, and reported
+//     (unavailable, naming it) while the policy asks for protection; with
+//     both refused nothing is rendered.
+//
+// Whatever the path, the result passes validateSynFlood, which would
+// otherwise refuse the whole plan.
+//
+// unreadable is the pass's list so far (Plan.UnreadablePolicies, shared with
+// the other policy blocks); the SYN-flood entry is appended to it.
+func loadSynFlood(ctx context.Context, db *corrosion.Client, host string, probe func() SynFloodProbeResult, unreadable []string) (sf SynFlood, unavailable string, _ []string, err error) {
+	pol, err := corrosion.ResolveFirewallSynflood(ctx, db, host)
+	switch {
+	case errors.Is(err, corrosion.ErrUnreadableFirewallPolicy):
+		// <key> holds "<value>": <what is enforced>, the shape every
+		// policy block appends for firewall.policy.unreadable's one raiser.
+		held := strings.TrimPrefix(err.Error(), corrosion.ErrUnreadableFirewallPolicy.Error()+": ")
+		unreadable = append(unreadable, fmt.Sprintf("%s: read as on at %d/%d",
+			held, corrosion.SynfloodDefaultRate, corrosion.SynfloodDefaultBurst))
+	case err != nil:
+		return SynFlood{}, "", unreadable, err
+	}
+	if !pol.On() {
+		return SynFlood{}, "", unreadable, nil
+	}
+	// The resolver reads an out-of-range row as unreadable (on at the
+	// defaults), so an on policy is always in range here.
+	sf = SynFlood{On: true, Rate: pol.Rate, Burst: pol.Burst}
+	if probe == nil {
+		return sf, "", unreadable, nil
+	}
+	r := probe()
+	var why []string
+	if r.V4 != nil {
+		sf.NoV4 = true
+		why = append(why, "IPv4: "+r.V4.Error())
+	}
+	if r.V6 != nil {
+		sf.NoV6 = true
+		why = append(why, "IPv6: "+r.V6.Error())
+	}
+	if sf.NoV4 && sf.NoV6 {
+		sf = SynFlood{}
+	}
+	return sf, strings.Join(why, "; "), unreadable, nil
+}
+
+// nftListNICTable lists the per-NIC table as JSON: nft's stdout, or its
+// stderr when it fails. Tests replace it.
+var nftListNICTable = func(ctx context.Context) ([]byte, error) {
+	out, err := cmdbound.Output(ctx, cmdbound.Command(ctx, "nft", "-j", "list", "table", "bridge", NICTableName))
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.Stderr, err
+	}
+	return out, err
+}
+
+// SynFloodDrops reads this host's SYN-flood drops per family since the per-NIC
+// table was last loaded: the lv-sf 4 and lv-sf 6 counters. A host with no
+// per-NIC table has dropped nothing; any other failure is an error, so a
+// count that could not be read is never reported as zero.
+func SynFloodDrops(ctx context.Context) (v4, v6 uint64, err error) {
+	out, err := nftListNICTable(ctx)
+	if err != nil {
+		if strings.Contains(string(out), "No such file or directory") {
+			return 0, 0, nil
+		}
+		return 0, 0, fmt.Errorf("list the per-NIC table: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return parseSynFloodDrops(out)
+}
+
+// parseSynFloodDrops sums the lv-sf counters of `nft -j` output per family.
+func parseSynFloodDrops(js []byte) (v4, v6 uint64, err error) {
+	var doc struct {
+		Nftables []map[string]json.RawMessage `json:"nftables"`
+	}
+	if err := json.Unmarshal(js, &doc); err != nil {
+		return 0, 0, fmt.Errorf("parse nft json: %w", err)
+	}
+	for _, obj := range doc.Nftables {
+		raw, ok := obj["rule"]
+		if !ok {
+			continue
+		}
+		var rule struct {
+			Comment string            `json:"comment"`
+			Expr    []json.RawMessage `json:"expr"`
+		}
+		if json.Unmarshal(raw, &rule) != nil {
+			continue
+		}
+		var total *uint64
+		switch rule.Comment {
+		case SynFloodComment + " 4":
+			total = &v4
+		case SynFloodComment + " 6":
+			total = &v6
+		default:
+			continue
+		}
+		for _, e := range rule.Expr {
+			var c struct {
+				Counter *struct {
+					Packets uint64 `json:"packets"`
+				} `json:"counter"`
+			}
+			if json.Unmarshal(e, &c) == nil && c.Counter != nil {
+				*total += c.Counter.Packets
+			}
+		}
+	}
+	return v4, v6, nil
+}
+
+// What a pass put in force of SYN-flood protection (AppliedState.SynFloodInForce).
+const (
+	SynFloodInForceOn          = "on"
+	SynFloodInForceObserve     = "observe"
+	SynFloodInForceGuardsOnly  = "guards-only"
+	SynFloodInForceUnavailable = "unavailable"
+	SynFloodInForceOff         = "off"
+	SynFloodInForceNoGuestNICs = "no-guest-nics"
+	SynFloodInForceIPv4Only    = "ipv4-only"
+	SynFloodInForceIPv6Only    = "ipv6-only"
+)
+
+// synFloodInForce is what a plan puts in force of SYN-flood protection: the
+// lines drop only in enforce mode; observe mode counts them; guards-only mode,
+// and a host with no guest NIC (no per-NIC table), render none.
+func synFloodInForce(p Plan) string {
+	switch {
+	case !p.SynFlood.On && p.SynFloodUnavailable != "":
+		return SynFloodInForceUnavailable
+	case !p.SynFlood.On:
+		return SynFloodInForceOff
+	case len(p.NICs) == 0:
+		// No per-NIC table is rendered: nothing to limit yet.
+		return SynFloodInForceNoGuestNICs
+	case p.nicMode() == NICModeGuardsOnly:
+		return SynFloodInForceGuardsOnly
+	case p.nicMode() == NICModeObserve:
+		return SynFloodInForceObserve
+	case p.SynFlood.NoV6:
+		return SynFloodInForceIPv4Only
+	case p.SynFlood.NoV4:
+		return SynFloodInForceIPv6Only
+	}
+	return SynFloodInForceOn
 }

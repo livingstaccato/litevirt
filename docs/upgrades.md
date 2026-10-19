@@ -1477,6 +1477,15 @@ host must resolve one conflict the same way. A binary rolled back below the
 latched token enters WAL quarantine, as below every latched token. Roll
 forward.
 
+### Project security groups wait for the roll
+
+`lv sg create <name> --project <p>` creates a group only `p`'s workloads may
+bind (docs/firewall.md). Its row carries a column a host on the previous
+release cannot decode, so it is the release feature `sg_projects`: refused
+with FailedPrecondition until `release_2026_11_v1` has latched, and its first
+use is recorded before the group is written. Global groups are created as
+before throughout, and every existing group stays global.
+
 ### A hand-deleted NetBox address is re-created after the roll
 
 A lease names its NetBox address object by id. When that object is deleted in

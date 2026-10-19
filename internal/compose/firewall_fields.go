@@ -139,7 +139,7 @@ func expandMacroRules(in []FirewallRuleDef, label, lenient bool) ([]FirewallRule
 		for _, x := range rows {
 			d := FirewallRuleDef{
 				Direction: x.Direction, Proto: x.Proto, Port: x.Port, CIDR: x.CIDR,
-				Action: x.Action, Comment: r.Comment, Priority: prio,
+				Action: x.Action, Comment: r.Comment, Priority: prio, Log: r.Log,
 			}
 			if label && d.Comment == "" {
 				d.Comment = "macro " + m.Name

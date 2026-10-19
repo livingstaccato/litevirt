@@ -12,6 +12,10 @@ import (
 // says it once per rule and not on every pass.
 var warnedLegacyRules sync.Map
 
+// warnedForeignSG remembers the (workload, group) bindings already reported as
+// naming another project's security group, so each is said once.
+var warnedForeignSG sync.Map
+
 // warnUnattributableLegacyRules reports rules an older client stored with a
 // group NAME in sg_id when two live groups hold that name: which group they
 // meant is not in the data, so they are applied to neither.

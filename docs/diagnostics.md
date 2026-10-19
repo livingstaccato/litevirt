@@ -1811,6 +1811,17 @@ created and torn down. `lv rm <vm>` removes the VM; deploying the stack again
 next pass after either. A VM created after the stack was torn down is a
 deploy of that stack name in progress, and is not reported.
 
+### SYN-flood condition (`firewall.synflood.unavailable`)
+
+Raised per host by its firewall reconciler, severity warning, and resolved on
+the next pass that no longer finds the cause. docs/firewall.md, "SYN-flood
+protection". An unreadable SYN-flood policy row raises
+`firewall.policy.unreadable` (see "Firewall logging and policy conditions").
+
+| Condition | Raised when |
+|---|---|
+| `firewall.synflood.unavailable` | the SYN-flood policy is on for this host, but its kernel refused the SYN-flood rules of one or both address families at daemon start (`nft_limit` missing, or an nft that cannot key a set by an IPv6 prefix): that family's SYNs to its guest NICs are not limited, and the evidence names it. Restart the daemon once it can |
+
 ### Tag-group conditions (`firewall.tag_group.*`)
 
 Raised per host by its firewall reconciler, and resolved on the next pass that
@@ -1830,6 +1841,20 @@ no longer finds the cause. Each names the rules, groups or workloads involved
 in this host's view, 0 for a group this host cannot read. Hosts can differ for
 up to one replication lag plus the 30 second reconcile tick;
 `lv firewall tag-group ls --members` shows the members.
+
+### Firewall logging and policy conditions
+
+Raised per host; each resolves when its cause goes. docs/firewall.md,
+"Logging", has the detail.
+
+| Condition | Severity | Raised when |
+|---|---|---|
+| `firewall.log.unavailable` | warning | at start the kernel or nft refused the logging forms (`nft_log`, `nfnetlink_log`, `nft_limit`): no packet is logged on this host; the per-NIC rules are unaffected. Load the modules and restart the daemon |
+| `firewall.log.listener` | warning | the daemon cannot hold its NFLOG group (another program holds it): no log line is rendered on this host, so packets are not logged and nothing reaches that program (a listener that loses the group has its lines removed by the next pass, run at once). Set `firewall.log_group` to a free group and restart |
+| `firewall.policy.unreadable` | warning | a firewall policy row cannot be read here; the evidence names each row and the fallback it is read as: a SYN-flood policy (`firewall_synflood`, `firewall_synflood/<host>`) as on at 200/1000, a log policy (`firewall_log`, `firewall_log/<host>`) as logging off at the default budget. Set that policy again to replace the row: `lv firewall synflood on`, `off` or `inherit --scope <host>`, or `lv firewall log-policy on`, `off` or `inherit --scope <host>` |
+
+`litevirt_firewall_log_records_total{outcome}` counts log records `kept`,
+`rate_limited` (over `firewall.log_max_rate`) and lost to `overflow`.
 
 ### Deferred out-of-band stop sync after a restart or rejoin
 
@@ -1943,6 +1968,30 @@ then keeps the fence: its daemon runs and serves, and the host stays `fenced` or
 
 Fix what the cause names, confirm the host should run workloads again, then
 run `lv host undrain <host>`.
+
+### Two hosts admitted at one address (`host.address_shared`)
+
+`lv host add` admits one name per machine: the admission write is refused, in
+its own transaction, while another live or joining host holds the address at
+gRPC port 7443. That check sees only the replica that admits. Two admissions
+made on two hosts at once, each before the other's row reached it, can both be
+written, and both names then point at one machine. Evaluator `host_admission`,
+subject `cluster/hosts`; the leader-lease holder writes it.
+
+| Raised when | Clears when |
+|---|---|
+| Two live or joining hosts hold one address at one gRPC port (a port of 0 matches any). **Warning** severity. The evidence names each pair and the address. | No two live hosts share an address and port. |
+
+A host recorded `active` there keeps the address; otherwise the one admitted
+first, or the lesser name when both were admitted at the same moment. The
+evidence names it. The other is never recorded `active`: the write that would
+record it checks the address in its own transaction, a joining host that does
+not keep its address stays `joining` at boot, one already `upgrading` stays so
+(`upgrading_unconfirmed` names the host that holds the address), and the
+`lv host add` that admitted it is refused before it installs anything. The
+machine serves the certificate of one of them. Remove the other with
+`lv host rm <host>`, or `lv host rm --dead <host>` if it is fenced and gone for
+good.
 
 ### A host stuck `upgrading` while its daemon runs (`upgrading_unconfirmed`)
 
@@ -2269,16 +2318,25 @@ files that changed, in `<data_dir>/nvram/` and `/var/lib/libvirt/qemu/nvram/`,
 once a second. A node raises `nvram_flush_failed` (critical) about **itself**
 when one of those fsyncs fails, and logs `UEFI vars flush failed` with `path`,
 `vm` and `error`. The evidence carries `files` (each with `path`, `vm`,
-`error`, `at`, `dev`, `ino` and `mtime`) and `remedy`.
+`error`, `at`, `dev`, `ino`, `mtime` and `episode`) and `remedy`. Each failed
+fsync is a new `episode`, even of a file already listed.
 
 No later fsync clears it, whether or not the guest wrote the file again. The
 kernel reports a writeback error to one fsync and marks the lost pages clean,
 and qemu writes back only the sectors a later guest write changes, so the lost
-pages stay stale on disk. The condition survives a daemon restart.
+pages stay stale on disk. The failure belongs to the file, not its name: a
+file renamed within or between those directories (a replacement's cutover
+renames the new VM's vars file) is listed under its new name. A file that
+cannot be looked at stays listed, and a removed file is dropped only once two
+sweeps in a row found it nowhere. The node also records its failures in
+`<data_dir>/nvram-flush-failures.json`, so they survive a daemon restart
+whatever the condition row says. A failure that file does not hold yet (its
+write failed) is named here only once `nvram_flush_unrecorded` holds it. If that file cannot be read, the node lists
+it as a failure of its own, since the failures it held are not known.
 
 | Raised when | Clears when |
 |---|---|
-| An fsync of a vars file failed. | Every listed file is removed or replaced by another file, or an admin acknowledges that its store may be stale. |
+| An fsync of a vars file failed. | Every listed file is removed or replaced by another file, or an admin acknowledges each listed failure episode. |
 
 **What to do.** The listed file may be missing UEFI variable writes the guest
 made. Check the disk (`dmesg`, `smartctl`). Writing the variables again in the
@@ -2293,8 +2351,10 @@ again. The ways out:
 - A VM kept as it is: an admin accepts that its vars store may be stale with
   `lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars
   --reason <why>`, which prints the files accepted. It is audited, naming every
-  file the condition named, and the host's daemon then stops reporting exactly
-  those files; any other failed file is raised again, and so is a new failure.
+  file the condition named with its inode and `episode`, and the host's daemon then stops reporting exactly
+  those failure episodes (path, inode and `episode`). Any other failed file is
+  raised again, and so is a new failure of a file it named, including one that
+  happened after the condition was read.
   A request without `--accept-stale-uefi-vars` (an older `lv`, or a script that
   sends only a reason) is refused.
 
@@ -2302,6 +2362,23 @@ again. The ways out:
 out. Nor is `lv backup restore-live` for this VM: it restores firmware state
 only for a Secure Boot or vTPM VM, only with `--auto-start`, and only into a
 new VM (`--name`), and the old VM still needs `lv rm`.
+
+### UEFI vars flush failure not recorded (`nvram_flush_unrecorded`)
+
+Evaluator `uefi-vars`, subject kind `host`, severity critical. A node raises
+it about **itself** while a failed vars fsync is not in
+`<data_dir>/nvram-flush-failures.json` because that file could not be
+written. The evidence carries `files` (as `nvram_flush_failed`) and `remedy`.
+The node names such a failure in `nvram_flush_failed` only once this
+condition holds it, and carries it over a restart from here. It cannot be
+resolved by hand.
+
+| Raised when | Clears when |
+|---|---|
+| The state file could not be written with a failure in it. | A write of the state file succeeds (or the failure is gone). |
+
+**What to do.** Fix the filesystem holding `<data_dir>` (`dmesg`, `df`), then
+follow `nvram_flush_failed`.
 
 ### UEFI vars file not flushed (`nvram_flush_blocked`)
 
@@ -2532,6 +2609,35 @@ The holds are checked every five seconds, and a condition is written only when
 it changes. `lv host lun-holds <host>` lists them. Discard one only after the
 check in [storage.md](storage.md#iscsi-one-lun-one-disk): a hold is what keeps
 a second VM off a LUN whose re-created VM's rows are still on their way.
+
+### Two NICs on one MAC (`mac_duplicate`)
+
+Each host looks, at start and every minute, for a MAC that the live NICs of
+two workloads record, one of them on this host: two hosts that drew one MAC
+at the same moment, each before seeing the other's NIC, or NICs an earlier
+build made. Both copies of a container a migrate is moving (or whose source
+it parked) are one workload, not two. While one is there the host raises
+`mac_duplicate` (evaluator `nic_identity`, subject `host/<host>`, critical);
+the evidence names the MAC and each NIC (its VM or container, network and
+host). It resolves on the first look that finds none.
+
+Nothing is rewritten: a running guest keeps its MAC. A stopped VM whose NIC's
+MAC another workload's NIC holds is refused `lv start` until it has a new one
+(an address lease alone holding the MAC raises nothing and refuses nothing);
+a start that resumes a guest a drain moved here is not refused. A drain does
+not cold-move a running VM whose NIC's MAC another NIC holds: it is refused
+before the shutdown and keeps running where it is. A container's start is not
+refused. On one network the two NICs receive each other's traffic: the
+MAC-keyed forwarding entries of a vxlan network and the DHCP reservation keyed
+by the MAC send one guest's unicast and DHCP replies to the other. Give one a
+new MAC: for a VM, `lv detach-nic <vm> <mac>`, then `lv attach-nic <vm>
+<network>`; for a container, clone it under a new name and remove the
+original (`lv ct clone <ct> <new-name>`, then `lv ct rm <ct>`), which keeps
+its data.
+
+During a rolling upgrade, only hosts on this build look: two colliding NICs
+whose hosts both still run an earlier build raise nothing until one of the
+hosts is upgraded.
 
 ### An iSCSI pool has no session (`iscsi_session_missing`)
 

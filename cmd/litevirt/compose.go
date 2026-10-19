@@ -62,6 +62,9 @@ func newUpCmd() *cobra.Command {
 				if err := requireTagGroupSupport(ctx, c, composeRuleCIDRs(f)...); err != nil {
 					return err
 				}
+				if err := requireLogSupport(ctx, c, composeLogs(f)); err != nil {
+					return err
+				}
 				// Dry-run via DeployStack to get the plan from the server.
 				dryStream, err := c.DeployStack(ctx, &pb.DeployStackRequest{
 					ComposeYaml: string(yamlData),
@@ -272,7 +275,7 @@ func newDownCmd() *cobra.Command {
 				}
 
 				if len(resp.Vms) == 0 {
-					fmt.Printf("Stack %q has no VMs; its containers and the stack record will be removed.\n", name)
+					fmt.Printf("Stack %q has no VMs listed here.\n", name)
 				} else {
 					fmt.Printf("Will delete %d VM(s) in stack %q:\n", len(resp.Vms), name)
 				}
@@ -308,6 +311,10 @@ func newDownCmd() *cobra.Command {
 				var downErr error
 				var failed, seen []string
 				seenFailed, seenVM := map[string]bool{}, map[string]bool{}
+				// localOnly: the daemon held no record of the stack and
+				// removed only the workloads it lists; its notice says what
+				// is left. Nothing retries a failure then.
+				localOnly := false
 				for {
 					p, err := stream.Recv()
 					if err != nil {
@@ -321,6 +328,11 @@ func newDownCmd() *cobra.Command {
 					// Not only VMs: a network that could not be deprovisioned or
 					// a failed container listing arrives named for itself, and
 					// an unnamed error still counts.
+					if p.Status == "local-only" {
+						localOnly = true
+						fmt.Printf("  local-only: %s\n", p.Error)
+						continue
+					}
 					item := p.VmName
 					if item == "" && p.Status == "error" {
 						item = "stack resource"
@@ -357,11 +369,19 @@ func newDownCmd() *cobra.Command {
 				if downErr != nil {
 					return downErr
 				}
+				if len(failed) > 0 && localOnly {
+					return fmt.Errorf("stack %q: local-only teardown: %d of %d deletions failed (%s); nothing will retry them: "+
+						"run `lv compose down --name %s` again, or `lv rm` / `lv ct rm` each one", name, len(failed), len(seen), strings.Join(failed, ", "), name)
+				}
 				if len(failed) > 0 {
 					return fmt.Errorf("stack %q: %d of %d deletions failed (%s); the stack is left in state \"deleting\" and the daemon retries the teardown",
 						name, len(failed), len(seen), strings.Join(failed, ", "))
 				}
 
+				if localOnly {
+					fmt.Printf("Stack %q: removed this node's workloads only (local-only); the rest is listed above.\n", name)
+					return nil
+				}
 				fmt.Printf("Stack %q torn down.\n", name)
 				return nil
 			})

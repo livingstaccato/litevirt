@@ -312,6 +312,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /ui/firewall/host-rules", s.requireAuthFunc(s.handleCreateFWHostRule))
 	mux.HandleFunc("DELETE /ui/firewall/host-rules/{id}", s.requireAuthFunc(s.handleDeleteFWHostRule))
 	mux.HandleFunc("GET /ui/firewall/ipset-modal", s.requireAuthFunc(s.handleFWIPSetModal))
+	mux.HandleFunc("GET /ui/firewall/synflood", s.requireAuthFunc(s.handleFWSynflood))
 	mux.HandleFunc("POST /ui/firewall/ipsets", s.requireAuthFunc(s.handleCreateFWIPSet))
 	mux.HandleFunc("DELETE /ui/firewall/ipsets/{id}", s.requireAuthFunc(s.handleDeleteFWIPSet))
 	mux.HandleFunc("POST /ui/firewall/default-deny", s.requireAuthFunc(s.handleSetFWDefaultDeny))

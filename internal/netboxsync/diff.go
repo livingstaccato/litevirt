@@ -89,6 +89,12 @@ type Action struct {
 	// detach a primary, so the applier nulls that primary first.
 	ClearsPrimary4 bool
 	ClearsPrimary6 bool
+
+	// UnsetsIPID is, on a primary action that nulls its field (IPID 0), the
+	// owned address that field names now. Nulling it takes that address away
+	// from the VM as surely as a clear does, so it is destructive and asks the
+	// clear's evidence question about this exact address (provenRemovable).
+	UnsetsIPID int
 }
 
 // ── vm/replace: the superseded incarnation of a reused name ─────────────────
@@ -543,6 +549,7 @@ func Diff(desired []DesiredVM, actual Actual, fingerprint string) []Action {
 			out = append(out, Action{
 				Kind: "vm", Op: opPrimaryIP, Key: vmID,
 				ParentNetBoxID: a.ID, IPID: want,
+				UnsetsIPID: unsetOwnedPrimary(actual, a.ID, want, a.PrimaryIP4ID),
 			})
 		}
 		// primary_ip6 is written while the VM holds a leased IPv6 address, and
@@ -555,6 +562,7 @@ func Diff(desired []DesiredVM, actual Actual, fingerprint string) []Action {
 			out = append(out, Action{
 				Kind: "vm", Op: opPrimaryIP6, Key: vmID,
 				ParentNetBoxID: a.ID, IPID: want,
+				UnsetsIPID: unsetOwnedPrimary(actual, a.ID, want, a.PrimaryIP6ID),
 			})
 		}
 	}
@@ -1027,6 +1035,15 @@ func desiredPrimaryIP(d DesiredVM, family int) int {
 		}
 	}
 	return 0
+}
+
+// unsetOwnedPrimary is the owned address a primary action nulls: current, when
+// the action writes 0 over it and it is an owned address on the VM. Otherwise 0.
+func unsetOwnedPrimary(actual Actual, vmID, want, current int) int {
+	if want != 0 || !ownsAddressOn(actual, vmID, current) {
+		return 0
+	}
+	return current
 }
 
 // ownsAddressOn reports whether ipID is a litevirt-owned address of this

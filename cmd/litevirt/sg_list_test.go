@@ -150,17 +150,22 @@ func sgCLIScopedDaemon(t *testing.T) *corrosion.Client {
 	return db
 }
 
-// A refusal is the daemon's answer: the command reports it, prints nothing, and
-// does not go and read the database itself.
+// The daemon's answer is final: a project-scoped token is answered with its
+// project's groups (here none — every seeded group is global), and the
+// command prints no global group and does not go and read the database
+// itself.
 func TestSGCLI_ListingsHonourTheDaemonsRefusal(t *testing.T) {
 	db := sgCLIScopedDaemon(t)
 	seedSGListing(t, db)
 	noLocalDB(t)
 
 	for _, args := range [][]string{{"ls"}, {"rule-ls", "sg-db"}} {
+		// The daemon answers a project-scoped token with that project's
+		// groups (none here) and no error; both commands then print an
+		// empty table.
 		out, err := runSGCLI(t, args...)
-		if status.Code(err) != codes.PermissionDenied {
-			t.Errorf("lv sg %v with a project-scoped token: err = %v, want PermissionDenied", args, err)
+		if err != nil {
+			t.Errorf("lv sg %v with a project-scoped token: err = %v, want the daemon's empty answer", args, err)
 		}
 		for _, secret := range []string{"sg-web", "web", "5432", "10.9.0.0/16"} {
 			if strings.Contains(out, secret) {

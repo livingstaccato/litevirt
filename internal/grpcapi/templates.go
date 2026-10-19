@@ -283,6 +283,9 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	if err := s.admitCopiedNetworks(ctx, "clone", project, src.Project, specNetworkNames(srcSpec.Network)); err != nil {
 		return nil, err
 	}
+	if err := s.admitSecurityGroupRefs(ctx, project, nicSecurityGroupNames(srcSpec.Network)); err != nil {
+		return nil, status.Errorf(status.Code(err), "clone: %s", status.Convert(err).Message())
+	}
 
 	// Capacity + quota admission. A clone is a full-sized VM — same vCPU, same
 	// memory, its own disks — so it consumes exactly what CreateVM would, and
@@ -520,8 +523,13 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	var seedNICs []cloudinit.NIC
 	var isoPicks []isoPick
 	defer func() { s.releaseHostIsolatedPicks(isoPicks) }()
+	macs := s.newMACAllocator()
 	for i, n := range srcSpec.Network {
-		mac := lv.GenerateMAC()
+		mac, merr := macs.next(ctx)
+		if merr != nil {
+			cleanup()
+			return nil, merr
+		}
 		bridge := network.FlatBridgeName(n.Name)
 		if pb, perr := s.provisionForVM(ctx, n.Name); perr == nil && pb != "" {
 			bridge = pb

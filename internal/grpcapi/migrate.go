@@ -1919,6 +1919,9 @@ func (s *Server) coldMovePreflight(ctx context.Context, vm *corrosion.VMRecord, 
 	if err := s.nicMTUPreflight(ctx, vm, targetHost); err != nil {
 		return err
 	}
+	if err := s.refuseColdMoveOnSharedMAC(ctx, vm.Name); err != nil {
+		return err
+	}
 	disks, err := s.coldMoveDisks(ctx, vm)
 	if err != nil {
 		return err

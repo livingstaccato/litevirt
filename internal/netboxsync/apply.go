@@ -184,6 +184,15 @@ type Reconciler struct {
 	acquireLease func(context.Context) bool
 	holdsLease   func(context.Context) bool
 
+	// vmRows serialises the writes that PATCH one VM's primary fields: NetBox
+	// saves a PATCHed VM as the whole row it read, so two concurrent writes
+	// to one VM can each put back the field the other just changed.
+	vmRows keyedMutex
+
+	// repointLease re-points a lease at a re-created address; nil is
+	// corrosion.RepointNetBoxLease. A test substitutes it.
+	repointLease func(ctx context.Context, c *corrosion.Client, network, ip string, fromID, toID int) (bool, error)
+
 	// latched is the cluster-wide capability predicate, re-read on every pass.
 	// See Options.Latched.
 	latched func(context.Context) bool
@@ -329,10 +338,17 @@ func (r *Reconciler) applyOne(ctx context.Context, a Action, idx desiredIndex, f
 		// IPID is only ever a litevirt-owned address — BuildActual admits no
 		// other into the set Diff clears from — so this branch cannot detach an
 		// operator's address even by mistake.
+		//
+		// A clear nulls its VM's primaries first, and so does an interface
+		// delete (netbox.DeleteInterface): both are serialised per VM.
+		defer r.vmRows.lock(a.ParentNetBoxID)()
 		return r.clearAddress(ctx, a)
 	case a.Kind == kindVM && (a.Op == opPrimaryIP || a.Op == opPrimaryIP6):
 		return r.setPrimaryIP(ctx, a)
 	case a.Op == "delete":
+		if a.Kind == kindNIC {
+			defer r.vmRows.lock(a.ParentNetBoxID)()
+		}
 		return r.deleteObject(ctx, a)
 	default:
 		return fmt.Errorf("netboxsync: unhandled action %s/%s for %s", a.Kind, a.Op, a.Key)
@@ -726,8 +742,11 @@ func (r *Reconciler) assignAddress(ctx context.Context, ipID, ifaceID int, nicKe
 // repair: NetBox will not hold two, and it is not this mirror's to take.
 //
 // THE RE-POINT IS GUARDED ON THE DEAD ID (corrosion.RepointNetBoxLease). A lease
-// released or re-pointed meanwhile is left alone; an object this call created
-// for it is then released again, since nothing names it.
+// released or re-pointed meanwhile is left alone, and so is an object this
+// call created for it: another leader may adopt it at any moment, and NetBox
+// cannot make a delete conditional on that not having happened. The orphan
+// sweep reclaims it if nothing names it. A re-point that reports an error may
+// have committed, and keeps the object too.
 func (r *Reconciler) repairDeadAddress(ctx context.Context, deadID int, identity string, dn desiredNIC) (int, error) {
 	n := dn.NIC
 	if n.LeaseNetwork == "" || n.NetBoxIP == "" || n.LeasePrefixID == 0 {
@@ -796,13 +815,32 @@ func (r *Reconciler) repairDeadAddress(ctx context.Context, deadID int, identity
 		return 0, fmt.Errorf("NetBox address %d (%s, identity %q, VRF %d) is not the leased %s",
 			ip.ID, ip.Address, ip.Identity, ip.VRFID, address)
 	}
-	moved, err := corrosion.RepointNetBoxLease(ctx, r.db, n.LeaseNetwork, host.String(), deadID, ip.ID)
-	if err != nil || !moved {
+	repoint := r.repointLease
+	if repoint == nil {
+		repoint = corrosion.RepointNetBoxLease
+	}
+	moved, err := repoint(ctx, r.db, n.LeaseNetwork, host.String(), deadID, ip.ID)
+	if err != nil {
+		// The re-point may have committed: the object is kept, whoever
+		// created it, and an unreferenced one is the orphan sweep's.
 		if created {
-			r.compensate(ctx, ip.ID)
+			slog.Warn("netbox mirror: kept a re-created address whose lease re-point did not "+
+				"report an outcome; the orphan sweep reclaims it if nothing names it",
+				"netbox_address_id", ip.ID, "nic", identity, "error", err)
 		}
-		if err != nil {
-			return 0, err
+		return 0, err
+	}
+	if !moved {
+		// NOT released, though nothing here names it. A leader that took
+		// over mid-repair adopts this object by identity, re-points the lease
+		// at it and assigns it, and may do so after any read this node could
+		// make; NetBox has no conditional delete to refuse a DELETE that
+		// lands after it. The orphan sweep reclaims it under its own
+		// cluster-wide proof if nothing comes to name it.
+		if created {
+			slog.Info("netbox mirror: kept a re-created address whose lease moved before the "+
+				"re-point; the orphan sweep reclaims it if nothing names it",
+				"netbox_address_id", ip.ID, "dead_netbox_address_id", deadID, "nic", identity)
 		}
 		return 0, nil
 	}
@@ -1062,10 +1100,52 @@ func (r *Reconciler) setPrimaryIP(ctx context.Context, a Action) error {
 		// kept from failing.
 		return nil
 	}
+	// One VM's two family setters run in the same phase; NetBox's whole-row
+	// save would let one undo the other.
+	defer r.vmRows.lock(vmID)()
 	if a.Op == opPrimaryIP6 {
 		return r.nb.SetPrimaryIP6(ctx, vmID, ipID)
 	}
 	return r.nb.SetPrimaryIP4(ctx, vmID, ipID)
+}
+
+// keyedMutex is one mutex per key, held only while some caller uses it. The
+// zero value is ready; key 0 (an unresolved id) is not locked.
+type keyedMutex struct {
+	mu    sync.Mutex
+	locks map[int]*keyedLock
+}
+
+type keyedLock struct {
+	sync.Mutex
+	users int
+}
+
+// lock locks key and returns its unlock.
+func (k *keyedMutex) lock(key int) func() {
+	if key == 0 {
+		return func() {}
+	}
+	k.mu.Lock()
+	if k.locks == nil {
+		k.locks = map[int]*keyedLock{}
+	}
+	l := k.locks[key]
+	if l == nil {
+		l = &keyedLock{}
+		k.locks[key] = l
+	}
+	l.users++
+	k.mu.Unlock()
+	l.Lock()
+	return func() {
+		l.Unlock()
+		k.mu.Lock()
+		if l.users--; l.users == 0 {
+			delete(k.locks, key)
+		}
+		k.mu.Unlock()
+	}
 }
 
 // keepOldest resolves a search result to the one object to adopt.

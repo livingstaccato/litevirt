@@ -329,10 +329,18 @@ type Plan struct {
 	// because they fail the rule grammar (not rendered; reported as a
 	// condition). See quarantineRule.
 	InvalidRows []InvalidRow
+	// UnreadablePolicies names each firewall policy row this build cannot
+	// read, read instead as its documented fallback (the condition
+	// firewall.policy.unreadable).
+	UnreadablePolicies []string
 
 	// SynFlood limits new TCP connections toward guest NICs per (NIC,
 	// source address) in the per-NIC table (synflood.go).
 	SynFlood SynFlood
+	// SynFloodUnavailable is why SYN-flood protection the policy asks for is
+	// not rendered on this host: the kernel refused the start probe. Not
+	// rendered; reported as a condition.
+	SynFloodUnavailable string
 }
 
 // BlockedTrunk is a trunk NIC's VLANs its network does not allow.
@@ -1342,7 +1350,10 @@ func allRules(p Plan) []Rule {
 // FromCorrosionRule converts the on-disk SGRule struct into the typed
 // Rule the renderer consumes. Empty / default fields collapse to the
 // most permissive option — same convention the corrosion helpers use
-// when persisting.
+// when persisting. A stored action in the server's log form
+// ("drop+log") is its verdict with Log set; a bare "+log" names no verdict
+// and is kept as written, so it is judged unreadable rather than read as an
+// accept.
 func FromCorrosionRule(direction, proto, portRange, cidr, action string) Rule {
 	dir := Direction(strings.ToLower(direction))
 	if dir != Egress {
@@ -1350,6 +1361,10 @@ func FromCorrosionRule(direction, proto, portRange, cidr, action string) Rule {
 	}
 	if proto == "" {
 		proto = "all"
+	}
+	logged := false
+	if verdict, ok := rulefield.LogActionVerdict(action); ok && verdict != "" {
+		action, logged = verdict, true
 	}
 	act := Action(strings.ToLower(action))
 	if act == "" {
@@ -1361,5 +1376,6 @@ func FromCorrosionRule(direction, proto, portRange, cidr, action string) Rule {
 		PortRange: portRange,
 		CIDR:      cidr,
 		Action:    act,
+		Log:       logged,
 	}
 }

@@ -55,6 +55,7 @@ func (s *Server) checkNICIdentities(ctx context.Context, project string, atts []
 		return status.Errorf(codes.Internal, "read NIC guards: %v", err)
 	}
 	var infos map[string]corrosion.NetworkGuardInfo
+	var macs *macSet
 	seenMAC := map[string]bool{}
 	for _, a := range atts {
 		if a == nil {
@@ -65,10 +66,16 @@ func (s *Server) checkNICIdentities(ctx context.Context, project string, atts []
 				return status.Errorf(codes.InvalidArgument, "MAC %s is given to two NICs of this request", m)
 			}
 			seenMAC[m] = true
-			for _, id := range ids {
-				if id.MAC == m && !mine[id.Owner] {
-					return status.Errorf(codes.AlreadyExists, "MAC %s is already used by %s", m, id.Owner)
+			// Who holds a MAC is the collision scan's answer
+			// (corrosion.LiveMACHolders, through the NIC overlay), so a MAC a
+			// detach freed is free here too.
+			if macs == nil {
+				if macs, err = s.loadMACSet(ctx); err != nil {
+					return err
 				}
+			}
+			if h := macs.heldBy(m, owners...); h != "" {
+				return status.Errorf(codes.AlreadyExists, "MAC %s is already used by %s", m, h)
 			}
 		}
 		if ip := a.GetIp(); ip != "" {

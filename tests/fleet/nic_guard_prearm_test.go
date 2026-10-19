@@ -35,6 +35,15 @@ func (r *recordingNft) Apply(_ context.Context, ruleset string) (string, error) 
 
 func (r *recordingNft) Flush(context.Context) (string, error) { return "", nil }
 
+// DropNICTable is what the applier calls when no NIC is drawn: the per-NIC
+// table is deleted, so nothing is drawn after it (firewall.nicTableDropper).
+func (r *recordingNft) DropNICTable(context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.last, "bridge")
+	return nil
+}
+
 func (r *recordingNft) nicTable() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()

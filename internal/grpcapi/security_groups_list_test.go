@@ -72,11 +72,14 @@ func TestListSecurityGroups_AViewerListsGroupsAndRules(t *testing.T) {
 	}
 }
 
+// A caller without sg.read at the root sees no global group and no global
+// rule. A caller scoped to a project is answered with that project's groups
+// (docs/design/security-group-projects.md) — here none, since every seeded
+// group is global — and one with no principal is refused.
 func TestListSecurityGroups_RefusesWhatTheWritesRefuse(t *testing.T) {
 	cases := map[string]func(t *testing.T, s *Server) context.Context{
-		// The cookie of a UI session can be a scoped API token. Security
-		// groups are cluster-global, checked at "/", which a project scope
-		// does not reach.
+		// The cookie of a UI session can be a scoped API token. Global
+		// groups are checked at "/", which a project scope does not reach.
 		"scoped token": func(t *testing.T, s *Server) context.Context {
 			return context.WithValue(userCtx("ada", "admin"), ctxKeyScopePaths, []string{"/projects/teamA"})
 		},
@@ -106,8 +109,10 @@ func TestListSecurityGroups_RefusesWhatTheWritesRefuse(t *testing.T) {
 			s := testServer(t)
 			seedSGs(t, s)
 			resp, err := s.ListSecurityGroups(mk(t, s), &pb.ListSecurityGroupsRequest{IncludeRules: true})
-			if c := status.Code(err); c != codes.PermissionDenied && c != codes.Unauthenticated {
-				t.Errorf("err = %v, want PermissionDenied or Unauthenticated", err)
+			if c := status.Code(err); name == "no principal" && c != codes.Unauthenticated {
+				t.Errorf("err = %v, want Unauthenticated", err)
+			} else if c := status.Code(err); c != codes.OK && c != codes.PermissionDenied && c != codes.Unauthenticated {
+				t.Errorf("err = %v, want an empty answer or a refusal", err)
 			}
 			if len(resp.GetGroups()) != 0 || len(resp.GetRules()) != 0 {
 				t.Errorf("a refused caller got %v", resp)

@@ -1874,6 +1874,25 @@ func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostReques
 // admitGRPCPort is the gRPC port AdmitHost records for an admitted host.
 const admitGRPCPort = 7443
 
+// addressLostRefusal refuses an admission of name that is written but loses
+// address to winner, admitted there first on another replica.
+func addressLostRefusal(address, name, winner string) error {
+	return status.Errorf(codes.FailedPrecondition,
+		"%s:%d is %s's address (active there, or admitted there before %s on another replica): "+
+			"%s stays admitted (joining) but is never activated, and nothing was installed for it. Remove it "+
+			"(`lv host rm %s`), or remove %s (`lv host rm %s`, or `lv host rm --dead %s` if it is fenced and gone "+
+			"for good) and run the add again",
+		address, admitGRPCPort, winner, name, name, name, winner, winner, winner)
+}
+
+// addressHeldRefusal refuses to admit name at address, which other holds.
+func addressHeldRefusal(address, name, other string) error {
+	return status.Errorf(codes.FailedPrecondition,
+		"%s:%d is %s's address: a machine is admitted under one name. Remove %s first (`lv host rm %s`, or "+
+			"`lv host rm --dead %s` if it is fenced and gone for good) to add the machine as %s",
+		address, admitGRPCPort, other, other, other, other, name)
+}
+
 // AdmitHost records the CA-authorized identity produced by `lv host add`.
 // Running it on an existing member breaks the tombstone/authentication deadlock
 // when a removed machine is deliberately re-added with a fresh certificate.
@@ -1899,18 +1918,15 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 	}
 	// One machine, one name: an address another live or joining host is
 	// dialled at belongs to that host. Checked here, not only by `lv host
-	// add`, so two adds of one machine under two names cannot both pass.
-	held, err := s.db.Query(ctx, `SELECT name FROM hosts WHERE address = ? AND name <> ? AND deleted_at IS NULL
-		AND (grpc_port = ? OR grpc_port = 0 OR grpc_port IS NULL)`, req.Address, req.Name, admitGRPCPort)
+	// add`, and again by the admission write itself, in its transaction
+	// (corrosion.AdmitHost), so two adds of one machine under two names on
+	// this replica cannot both pass. This read only refuses early.
+	other, err := corrosion.HostAddressHolder(ctx, s.db, req.Address, req.Name, admitGRPCPort)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "read the hosts at %s: %v", req.Address, err)
 	}
-	if len(held) > 0 {
-		other := held[0].String("name")
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"%s:%d is %s's address: a machine is admitted under one name. Remove %s first (`lv host rm %s`, or "+
-				"`lv host rm --dead %s` if it is fenced and gone for good) to add the machine as %s",
-			req.Address, admitGRPCPort, other, other, other, other, req.Name)
+	if other != "" {
+		return nil, addressHeldRefusal(req.Address, req.Name, other)
 	}
 	// A name whose removed machine still has workloads recorded on it is not
 	// given to a new machine: those rows are the old machine's, recovered by
@@ -1949,6 +1965,21 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 	})
 	if err != nil {
 		return nil, err
+	}
+	// The write's guard sees only this replica. Pulled again now that it is
+	// written, the address is decided by the rule activation follows
+	// (corrosion.AddressLostTo): a host active at this address, or an
+	// admission another replica made there first, keeps it, and this one is
+	// refused before anything is installed for it. Its row stays, and is never
+	// activated. `lv host add` asks again, under its lock on the machine,
+	// right before it installs.
+	if err := s.pullHostsNow(ctx, "admit", req.Name); err != nil {
+		return nil, err
+	}
+	if lostTo, err := corrosion.AddressLostTo(ctx, s.db, req.Name); err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read the hosts at %s: %v", req.Address, err)
+	} else if lostTo != "" {
+		return nil, addressLostRefusal(req.Address, req.Name, lostTo)
 	}
 	s.publish("host.admitted", req.Name, "cert_serial="+req.CertSerial)
 	return &pb.AdmitHostResponse{AuditTailSeq: tailSeq, AuditTailHash: tailHash, AuditPositionProven: true,
@@ -2043,6 +2074,13 @@ func (s *Server) admitHostRow(ctx context.Context, h corrosion.HostRecord) (notI
 	}
 	legacy := func() error {
 		if err := corrosion.AdmitHost(ctx, s.db, h); err != nil {
+			if other, ok := corrosion.AsAddressHeld(err); ok {
+				// A retry of a standing admission: its row is written.
+				if cur, _ := corrosion.GetHost(ctx, s.db, h.Name); cur != nil && strings.EqualFold(cur.CertSerial, h.CertSerial) {
+					return addressLostRefusal(h.Address, h.Name, other)
+				}
+				return addressHeldRefusal(h.Address, h.Name, other)
+			}
 			if errors.Is(err, corrosion.ErrReadmitNeedsCounter) {
 				return status.Errorf(codes.FailedPrecondition, "admit host: %v", err)
 			}
@@ -2071,12 +2109,17 @@ func (s *Server) admitHostRow(ctx context.Context, h corrosion.HostRecord) (notI
 	if err := s.requireVoterMajority(ctx, "re-add", h.Name); err != nil {
 		return "", err
 	}
+	heldBy := ""
 	err = s.WithReleaseFeature(ctx, capabilities.FeatureHostIncarnation, func(ctx context.Context, g capabilities.FeatureGrant) error {
 		_, _, aerr := corrosion.AdmitHostV2(ctx, s.db, h, g)
+		heldBy, _ = corrosion.AsAddressHeld(aerr)
 		return aerr
 	})
 	if err == nil {
 		return "", nil
+	}
+	if heldBy != "" {
+		return "", addressHeldRefusal(h.Address, h.Name, heldBy)
 	}
 	st, isStatus := status.FromError(err)
 	gateRefusal := isStatus && (st.Code() == codes.Unavailable || st.Code() == codes.FailedPrecondition) &&

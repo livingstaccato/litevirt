@@ -2213,14 +2213,18 @@ func (x *HealthCondition) GetReporter() string {
 // `lv health` prints it: code and subject. evaluator is needed only when two
 // evaluators hold an open condition under the same code and subject.
 type ResolveHealthConditionRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Code          string                 `protobuf:"bytes,1,opt,name=code,proto3" json:"code,omitempty"`
-	SubjectKind   string                 `protobuf:"bytes,2,opt,name=subject_kind,json=subjectKind,proto3" json:"subject_kind,omitempty"`
-	SubjectId     string                 `protobuf:"bytes,3,opt,name=subject_id,json=subjectId,proto3" json:"subject_id,omitempty"`
-	Evaluator     string                 `protobuf:"bytes,4,opt,name=evaluator,proto3" json:"evaluator,omitempty"`
-	Reason        string                 `protobuf:"bytes,5,opt,name=reason,proto3" json:"reason,omitempty"` // the operator's note, recorded in the audit row
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Code        string                 `protobuf:"bytes,1,opt,name=code,proto3" json:"code,omitempty"`
+	SubjectKind string                 `protobuf:"bytes,2,opt,name=subject_kind,json=subjectKind,proto3" json:"subject_kind,omitempty"`
+	SubjectId   string                 `protobuf:"bytes,3,opt,name=subject_id,json=subjectId,proto3" json:"subject_id,omitempty"`
+	Evaluator   string                 `protobuf:"bytes,4,opt,name=evaluator,proto3" json:"evaluator,omitempty"`
+	Reason      string                 `protobuf:"bytes,5,opt,name=reason,proto3" json:"reason,omitempty"` // the operator's note, recorded in the audit row
+	// accept_stale_uefi_vars is the admin's explicit acceptance, for
+	// nvram_flush_failed, that the UEFI vars stores the condition names may
+	// be stale (`--accept-stale-uefi-vars`). That code is refused without it.
+	AcceptStaleUefiVars bool `protobuf:"varint,6,opt,name=accept_stale_uefi_vars,json=acceptStaleUefiVars,proto3" json:"accept_stale_uefi_vars,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *ResolveHealthConditionRequest) Reset() {
@@ -2286,6 +2290,13 @@ func (x *ResolveHealthConditionRequest) GetReason() string {
 		return x.Reason
 	}
 	return ""
+}
+
+func (x *ResolveHealthConditionRequest) GetAcceptStaleUefiVars() bool {
+	if x != nil {
+		return x.AcceptStaleUefiVars
+	}
+	return false
 }
 
 type ResolveHealthConditionResponse struct {
@@ -24464,6 +24475,7 @@ func (x *ListFirewallDefaultsResponse) GetDefaults() []*FirewallDefault {
 // An older daemon answers each of these RPCs Unimplemented.
 type GetFirewallSynfloodRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
+	LocalOnly     bool                   `protobuf:"varint,1,opt,name=local_only,json=localOnly,proto3" json:"local_only,omitempty"` // this host's entry only (a peer's fan-out leg)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -24496,6 +24508,13 @@ func (x *GetFirewallSynfloodRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use GetFirewallSynfloodRequest.ProtoReflect.Descriptor instead.
 func (*GetFirewallSynfloodRequest) Descriptor() ([]byte, []int) {
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{344}
+}
+
+func (x *GetFirewallSynfloodRequest) GetLocalOnly() bool {
+	if x != nil {
+		return x.LocalOnly
+	}
+	return false
 }
 
 type GetFirewallSynfloodResponse struct {
@@ -25267,6 +25286,7 @@ type CreateSecurityGroupRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	StackName     string                 `protobuf:"bytes,2,opt,name=stack_name,json=stackName,proto3" json:"stack_name,omitempty"`
+	Project       string                 `protobuf:"bytes,3,opt,name=project,proto3" json:"project,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -25311,6 +25331,13 @@ func (x *CreateSecurityGroupRequest) GetName() string {
 func (x *CreateSecurityGroupRequest) GetStackName() string {
 	if x != nil {
 		return x.StackName
+	}
+	return ""
+}
+
+func (x *CreateSecurityGroupRequest) GetProject() string {
+	if x != nil {
+		return x.Project
 	}
 	return ""
 }
@@ -25455,6 +25482,7 @@ type ListSecurityGroupsRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	StackName     string                 `protobuf:"bytes,1,opt,name=stack_name,json=stackName,proto3" json:"stack_name,omitempty"`           // empty = every group
 	IncludeRules  bool                   `protobuf:"varint,2,opt,name=include_rules,json=includeRules,proto3" json:"include_rules,omitempty"` // also return every rule of the listed groups
+	Project       string                 `protobuf:"bytes,3,opt,name=project,proto3" json:"project,omitempty"`                                // that project's groups plus the global ones; empty = every group the caller may read
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -25501,6 +25529,13 @@ func (x *ListSecurityGroupsRequest) GetIncludeRules() bool {
 		return x.IncludeRules
 	}
 	return false
+}
+
+func (x *ListSecurityGroupsRequest) GetProject() string {
+	if x != nil {
+		return x.Project
+	}
+	return ""
 }
 
 type ListSecurityGroupsResponse struct {
@@ -44844,14 +44879,15 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\fconfirmed_at\x18\r \x01(\tR\vconfirmedAt\x12\x1f\n" +
 	"\vresolved_at\x18\x0e \x01(\tR\n" +
 	"resolvedAt\x12\x1a\n" +
-	"\breporter\x18\x0f \x01(\tR\breporter\"\xab\x01\n" +
+	"\breporter\x18\x0f \x01(\tR\breporter\"\xe0\x01\n" +
 	"\x1dResolveHealthConditionRequest\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12!\n" +
 	"\fsubject_kind\x18\x02 \x01(\tR\vsubjectKind\x12\x1d\n" +
 	"\n" +
 	"subject_id\x18\x03 \x01(\tR\tsubjectId\x12\x1c\n" +
 	"\tevaluator\x18\x04 \x01(\tR\tevaluator\x12\x16\n" +
-	"\x06reason\x18\x05 \x01(\tR\x06reason\"\\\n" +
+	"\x06reason\x18\x05 \x01(\tR\x06reason\x123\n" +
+	"\x16accept_stale_uefi_vars\x18\x06 \x01(\bR\x13acceptStaleUefiVars\"\\\n" +
 	"\x1eResolveHealthConditionResponse\x12:\n" +
 	"\tcondition\x18\x01 \x01(\v2\x1c.litevirt.v1.HealthConditionR\tcondition\"\xa2\x01\n" +
 	"\x15HealthEvaluatorStatus\x12\x1c\n" +
@@ -46694,8 +46730,10 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\fdefault_deny\x18\x02 \x01(\bR\vdefaultDeny\"\x1d\n" +
 	"\x1bListFirewallDefaultsRequest\"X\n" +
 	"\x1cListFirewallDefaultsResponse\x128\n" +
-	"\bdefaults\x18\x01 \x03(\v2\x1c.litevirt.v1.FirewallDefaultR\bdefaults\"\x1c\n" +
-	"\x1aGetFirewallSynfloodRequest\"^\n" +
+	"\bdefaults\x18\x01 \x03(\v2\x1c.litevirt.v1.FirewallDefaultR\bdefaults\";\n" +
+	"\x1aGetFirewallSynfloodRequest\x12\x1d\n" +
+	"\n" +
+	"local_only\x18\x01 \x01(\bR\tlocalOnly\"^\n" +
 	"\x1bGetFirewallSynfloodResponse\x12?\n" +
 	"\bpolicies\x18\x01 \x03(\v2#.litevirt.v1.FirewallSynfloodPolicyR\bpolicies\"p\n" +
 	"\x1aSetFirewallSynfloodRequest\x12\x14\n" +
@@ -46751,21 +46789,23 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x06remove\x18\x05 \x03(\tR\x06remove\x1a6\n" +
 	"\bSetEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"O\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"i\n" +
 	"\x1aCreateSecurityGroupRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
-	"stack_name\x18\x02 \x01(\tR\tstackName\",\n" +
+	"stack_name\x18\x02 \x01(\tR\tstackName\x12\x18\n" +
+	"\aproject\x18\x03 \x01(\tR\aproject\",\n" +
 	"\x1aDeleteSecurityGroupRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\"Q\n" +
 	"\x1bAddSecurityGroupRuleRequest\x122\n" +
 	"\x04rule\x18\x01 \x01(\v2\x1e.litevirt.v1.SecurityGroupRuleR\x04rule\"0\n" +
 	"\x1eRemoveSecurityGroupRuleRequest\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\"_\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"y\n" +
 	"\x19ListSecurityGroupsRequest\x12\x1d\n" +
 	"\n" +
 	"stack_name\x18\x01 \x01(\tR\tstackName\x12#\n" +
-	"\rinclude_rules\x18\x02 \x01(\bR\fincludeRules\"\x86\x01\n" +
+	"\rinclude_rules\x18\x02 \x01(\bR\fincludeRules\x12\x18\n" +
+	"\aproject\x18\x03 \x01(\tR\aproject\"\x86\x01\n" +
 	"\x1aListSecurityGroupsResponse\x122\n" +
 	"\x06groups\x18\x01 \x03(\v2\x1a.litevirt.v1.SecurityGroupR\x06groups\x124\n" +
 	"\x05rules\x18\x02 \x03(\v2\x1e.litevirt.v1.SecurityGroupRuleR\x05rules\"\x19\n" +

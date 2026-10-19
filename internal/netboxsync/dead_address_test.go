@@ -2,6 +2,7 @@ package netboxsync
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -17,6 +18,41 @@ type deadAddressVirt struct {
 	dead map[int]bool
 	// assignErr, when set, is returned for every assignment that is not dead.
 	assignErr error
+	// afterClaim runs once an address is created, standing in for what
+	// happens between the create and the re-point.
+	afterClaim func(netbox.IPAddress)
+	// afterLookup runs after every identity lookup has answered, standing in
+	// for what happens between that read and whatever the caller does next.
+	afterLookup func()
+}
+
+func (d *deadAddressVirt) LookupByIdentity(ctx context.Context, identity string, vrfID int, cidr string) ([]netbox.IPAddress, error) {
+	found, err := d.stubVirt.LookupByIdentity(ctx, identity, vrfID, cidr)
+	if d.afterLookup != nil {
+		d.afterLookup()
+	}
+	return found, err
+}
+
+func (d *deadAddressVirt) ClaimSpecificIP(ctx context.Context, address string, vrfID int, identity string) (netbox.IPAddress, error) {
+	ip, err := d.stubVirt.ClaimSpecificIP(ctx, address, vrfID, identity)
+	if err == nil && d.afterClaim != nil {
+		d.afterClaim(ip)
+	}
+	return ip, err
+}
+
+// assignInNetBox records ip as assigned to ifaceID in what an identity lookup
+// returns.
+func (d *deadAddressVirt) assignInNetBox(identity string, ipID, ifaceID int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for i, ip := range d.byIdentityIPs[identity] {
+		if ip.ID == ipID {
+			d.byIdentityIPs[identity][i].AssignedObjectID = ifaceID
+			d.byIdentityIPs[identity][i].AssignedObjectType = "virtualization.vminterface"
+		}
+	}
 }
 
 func (d *deadAddressVirt) AssignIPToInterface(ctx context.Context, ipID, ifaceID int) error {
@@ -201,10 +237,11 @@ func TestRepairAdoptsAnObjectAnInterruptedRepairCreated(t *testing.T) {
 	}
 }
 
-func TestRepairReleasesWhatItCreatedWhenTheLeaseMoved(t *testing.T) {
+func TestRepairKeepsWhatItCreatedWhenTheLeaseMoved(t *testing.T) {
 	// The lease no longer names the dead id by the time the re-point runs —
-	// released and re-claimed elsewhere. The object this call made is named
-	// by nothing, so it is released again, and the lease is left as it is.
+	// released and re-claimed elsewhere. Nothing here names the object this
+	// call made, but another leader may yet adopt it, so it is kept for the
+	// orphan sweep, and the lease is left as it is.
 	nb := &deadAddressVirt{stubVirt: &stubVirt{}, dead: map[int]bool{41: true}}
 	r, idx, key := repairFixture(t, nb)
 	r.db.SetNetBoxRepointGate(func() bool { return true })
@@ -221,8 +258,8 @@ func TestRepairReleasesWhatItCreatedWhenTheLeaseMoved(t *testing.T) {
 	if got := leaseAddressID(t, r); got != 55 {
 		t.Fatalf("lease names %d, want 55 left alone", got)
 	}
-	if len(nb.claimed) != 1 || len(nb.releasedIPs) != 1 {
-		t.Fatalf("claimed %v released %v, want the one created object released", nb.claimed, nb.releasedIPs)
+	if len(nb.claimed) != 1 || len(nb.releasedIPs) != 0 {
+		t.Fatalf("claimed %v released %v, want the one created object kept", nb.claimed, nb.releasedIPs)
 	}
 	if !r.isDeadAddress(41) {
 		t.Fatal("an unrepaired address must still be reported dead")
@@ -273,5 +310,141 @@ func TestRepairFindsTheAddressUnderAnyMask(t *testing.T) {
 	}
 	if len(nb.claimed) != 0 {
 		t.Fatalf("created %v over the same host under another mask", nb.claimed)
+	}
+}
+
+// A leader hands over while its repair is between the create and the
+// re-point. The new leader adopts the created object by identity, re-points
+// the lease at it and assigns it; that re-point reaches the old leader, whose
+// guarded re-point then misses. A live lease now names the object it created,
+// so it is not released.
+func TestRepairKeepsWhatItCreatedOnceALeaseNamesIt(t *testing.T) {
+	nb := &deadAddressVirt{stubVirt: &stubVirt{}, dead: map[int]bool{41: true}}
+	r, idx, key := repairFixture(t, nb)
+	r.db.SetNetBoxRepointGate(func() bool { return true })
+	nb.afterClaim = func(ip netbox.IPAddress) {
+		if err := r.db.Execute(context.Background(),
+			`UPDATE ip_allocations SET netbox_ip_id = ?, updated_at = ? WHERE network = 'bound' AND ip = ?`,
+			ip.ID, r.db.NowTS(), repairIP); err != nil {
+			t.Error(err)
+		}
+		// Its NetBox assignment has not landed yet.
+	}
+	if err := r.apply(context.Background(), []Action{
+		{Kind: kindNIC, Op: "assign", Key: key, NetBoxID: 21, IPID: 41},
+	}, idx, fp); err != nil {
+		t.Fatal(err)
+	}
+	if len(nb.claimed) != 1 {
+		t.Fatalf("precondition: claimed %v, want one create", nb.claimed)
+	}
+	if len(nb.releasedIPs) != 0 {
+		t.Fatalf("released %v, an address the live lease names", nb.releasedIPs)
+	}
+	if got := leaseAddressID(t, r); got == 41 {
+		t.Fatal("precondition: the lease was not moved by the other leader")
+	}
+}
+
+// The same handover seen before the other leader's re-point has replicated
+// here: no local lease names the object yet, but NetBox has it assigned. That
+// is not proof nothing references it, so it is kept for the orphan sweep.
+func TestRepairKeepsWhatItCreatedWhileNetBoxHasItAssigned(t *testing.T) {
+	nb := &deadAddressVirt{stubVirt: &stubVirt{}, dead: map[int]bool{41: true}}
+	r, idx, key := repairFixture(t, nb)
+	r.db.SetNetBoxRepointGate(func() bool { return true })
+	nb.afterClaim = func(ip netbox.IPAddress) {
+		// The guard misses: the lease moved off the dead id here.
+		if err := r.db.Execute(context.Background(),
+			`UPDATE ip_allocations SET netbox_ip_id = 55, updated_at = ? WHERE network = 'bound' AND ip = ?`,
+			r.db.NowTS(), repairIP); err != nil {
+			t.Error(err)
+		}
+		nb.assignInNetBox(key, ip.ID, 21)
+	}
+	if err := r.apply(context.Background(), []Action{
+		{Kind: kindNIC, Op: "assign", Key: key, NetBoxID: 21, IPID: 41},
+	}, idx, fp); err != nil {
+		t.Fatal(err)
+	}
+	if len(nb.claimed) != 1 {
+		t.Fatalf("precondition: claimed %v, want one create", nb.claimed)
+	}
+	if len(nb.releasedIPs) != 0 {
+		t.Fatalf("released %v, an address NetBox has assigned", nb.releasedIPs)
+	}
+}
+
+// The re-point committed, and the read that confirms it failed. The commit is
+// not undone by that failure, so the object the lease now names is kept.
+func TestRepairKeepsWhatItCreatedWhenTheRepointIsUncertain(t *testing.T) {
+	nb := &deadAddressVirt{stubVirt: &stubVirt{}, dead: map[int]bool{41: true}}
+	r, idx, key := repairFixture(t, nb)
+	r.db.SetNetBoxRepointGate(func() bool { return true })
+	r.repointLease = func(ctx context.Context, c *corrosion.Client, network, ip string, fromID, toID int) (bool, error) {
+		if moved, err := corrosion.RepointNetBoxLease(ctx, c, network, ip, fromID, toID); err != nil || !moved {
+			t.Errorf("precondition: the re-point did not commit: moved=%v err=%v", moved, err)
+		}
+		return false, fmt.Errorf("confirm re-point: %w", corrosion.ErrNetBoxRepointUnconfirmed)
+	}
+	if err := r.apply(context.Background(), []Action{
+		{Kind: kindNIC, Op: "assign", Key: key, NetBoxID: 21, IPID: 41},
+	}, idx, fp); err != nil {
+		t.Fatal(err)
+	}
+	if len(nb.claimed) != 1 {
+		t.Fatalf("precondition: claimed %v, want one create", nb.claimed)
+	}
+	if len(nb.releasedIPs) != 0 {
+		t.Fatalf("released %v, the address the committed re-point names", nb.releasedIPs)
+	}
+	if got := leaseAddressID(t, r); got == 41 {
+		t.Fatal("precondition: the lease does not name the new object")
+	}
+}
+
+// The current leader adopts the object a stale repair created AFTER that
+// repair's last read of it: its re-point and its assignment both land between
+// the read and anything the stale repair does next. NetBox has no conditional
+// delete, so no read can be the last word; the object is never released after
+// a missed re-point.
+func TestRepairNeverReleasesAfterAMissedRepoint(t *testing.T) {
+	nb := &deadAddressVirt{stubVirt: &stubVirt{}, dead: map[int]bool{41: true}}
+	r, idx, key := repairFixture(t, nb)
+	r.db.SetNetBoxRepointGate(func() bool { return true })
+	var created netbox.IPAddress
+	nb.afterClaim = func(ip netbox.IPAddress) {
+		created = ip
+		// The lease moved on: the stale repair's guarded re-point misses.
+		if err := r.db.Execute(context.Background(),
+			`UPDATE ip_allocations SET netbox_ip_id = 55, updated_at = ? WHERE network = 'bound' AND ip = ?`,
+			r.db.NowTS(), repairIP); err != nil {
+			t.Error(err)
+		}
+	}
+	lookups := 0
+	nb.afterLookup = func() {
+		// The first lookup is the repair's adopt-or-create; any after it is a
+		// read of the created object, and the adoption lands just after it.
+		if lookups++; lookups < 2 || created.ID == 0 {
+			return
+		}
+		nb.assignInNetBox(key, created.ID, 21)
+		if err := r.db.Execute(context.Background(),
+			`UPDATE ip_allocations SET netbox_ip_id = ?, updated_at = ? WHERE network = 'bound' AND ip = ?`,
+			created.ID, r.db.NowTS(), repairIP); err != nil {
+			t.Error(err)
+		}
+	}
+	if err := r.apply(context.Background(), []Action{
+		{Kind: kindNIC, Op: "assign", Key: key, NetBoxID: 21, IPID: 41},
+	}, idx, fp); err != nil {
+		t.Fatal(err)
+	}
+	if len(nb.claimed) != 1 {
+		t.Fatalf("precondition: claimed %v, want one create", nb.claimed)
+	}
+	if len(nb.releasedIPs) != 0 {
+		t.Fatalf("released %v, which the current leader adopted", nb.releasedIPs)
 	}
 }

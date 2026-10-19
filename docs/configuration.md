@@ -706,6 +706,18 @@ backup_repos:
 backup_bwlimits:
   offsite: 100MiB
 
+# Firewall logging (docs/firewall.md, "Logging"). Records of logged rules are tenant flow
+# metadata: kept in memory (the newest 10,000) and under <data_dir>/firewall-log/
+# (directory 0700, files 0600), never in the journal.
+firewall:
+  log_group: 27          # the NFLOG group the daemon's log listener reads (0-65535); every
+                         # rendered log line sends to it. Raises firewall.log.listener if taken.
+  log_max_rate: 200      # records a second this host keeps (0-100000); the rest are counted
+                         # (litevirt_firewall_log_records_total{outcome="rate_limited"}) and discarded
+  log_retain_mib: 64     # cap on <data_dir>/firewall-log/; 0 keeps records in memory only
+  log_retain_days: 7     # records older than this are removed, on disk and in memory, within about
+                         # an hour of passing it; 0 = no age bound
+
 # Single-file restore (lv backup file-ls / file-restore). The backup is read
 # inside a throwaway restore VM booted from this host's own kernel; every key
 # is optional. See docs/design/backup-file-restore.md.
@@ -792,6 +804,23 @@ upgrade_health_deadline_sec: 120      # 0 → 120s; widen for very slow N-step s
 # back to recreate-from-image. container_restore_timeout_sec bounds how long a
 # relocate-restore is treated as in-flight before giving up and image-recreating.
 container_restore_timeout_sec: 600    # 0 → 600s (10m)
+
+# vTPM state durability. swtpm writes a vTPM's state without fsync, so a write
+# made shortly before a power cut can be lost. On a host with swtpm, the daemon
+# sets the sync attribute (chattr +S) on /var/lib/libvirt/swtpm and everything
+# under it, at start (before it starts any VM; it waits up to 10 seconds for
+# that pass) and every minute, and records that it did in
+# <data_dir>/vtpm-state-sync. Files swtpm creates there inherit it. On ext4,
+# and on xfs mounted with dirsync or wsync (a mount-time sync implies wsync; a
+# remount to sync does not), a vTPM command then returns only once its state
+# is on disk. Elsewhere (xfs without one of those,
+# btrfs, ZFS, NFS, tmpfs) the
+# host raises vtpm_state_not_durable (docs/diagnostics.md). The vTPM capability
+# label stays false until a pass has completed. false clears the attribute
+# where that record says litevirt set it (an attribute set by hand on a host
+# litevirt never protected stays): vTPM commands that write state return
+# sooner, and such a write can be lost.
+vtpm_state_sync: true
 
 # Container security and limit defaults (docs/containers.md, "Security").
 containers:

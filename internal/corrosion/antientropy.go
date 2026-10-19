@@ -519,20 +519,22 @@ func (ae *AntiEntropy) askDigest(ctx context.Context, pc *aePooledConn, full boo
 // (see replicaFreshness). A failed dump/merge proves nothing and returns false.
 func (ae *AntiEntropy) finishExchange(ctx context.Context, ex *peerExchange, localMap map[string]TableDigest, full bool) bool {
 	peerName, client, resp := ex.peer, ex.client, ex.digest
-	if ae.mergeSourceRefused(ctx, peerName) {
-		ae.conns.drop(peerName, ex.pc)
-		return false
-	}
 	// The connection was checked against the peer's row and this node's PKI
 	// when the digest half took it. Merges from other peers since then may
-	// have re-admitted or removed this one, or installed a CRL that revokes
-	// it, so the key is checked again before anything is pulled over it.
-	if _, key, err := ae.peerKey(ctx, peerName); err != nil || key != ex.pc.key {
-		slog.Info("anti-entropy: not pulling over a connection whose peer row or local PKI changed since its digest; it is redialled next pass",
-			"peer", peerName, "error", err)
+	// have re-admitted, removed or isolated this one, or installed a CRL that
+	// revokes it, and so may this exchange's own merges: the guard checks
+	// again here and before every stream the exchange opens (pullGuard).
+	guard := &pullGuard{ae: ae, peer: peerName, pc: ex.pc}
+	if guard.check(ctx) != nil {
 		ae.conns.drop(peerName, ex.pc)
 		return false
 	}
+	ctx = withPullGuard(ctx, guard)
+	defer func() {
+		if guard.tripped.Load() {
+			ae.conns.drop(peerName, ex.pc)
+		}
+	}()
 	completed := true
 	// usersUnjudged: this peer's users rows differ from ours and the pull that
 	// would have judged them did not complete. See checkSensitivePeer.
@@ -595,7 +597,15 @@ func (ae *AntiEntropy) finishExchange(ctx context.Context, ex *peerExchange, loc
 		}
 	}
 
+	if guard.tripped.Load() {
+		// The peer is not who this session was opened with, or may no
+		// longer be merged from: nothing more is pulled over it.
+		return false
+	}
 	ae.checkSensitivePeer(ctx, client, peerName, ex.sensitive, full, usersUnjudged, remints)
+	if guard.tripped.Load() {
+		return false
+	}
 	// A completed exchange with a seeded peer that is not holding its own audit
 	// rows leaves this replica holding everything that peer held: seeded too
 	// (audit_seeded.go). An older peer does not say, and does not seed.
@@ -731,7 +741,14 @@ func (ae *AntiEntropy) sensitiveDigest(ctx context.Context, client pb.LiteVirtCl
 // back to the legacy unary GetStateDump when the peer is an older build that
 // doesn't implement the stream. This keeps anti-entropy working in a
 // mixed-version cluster in both directions.
+//
+// Every RPC a dump helper opens, its fallbacks included, is re-checked first
+// against the exchange it belongs to (pullGuard): an older peer's Unimplemented
+// can arrive after a change that refuses the peer.
 func fetchStateDump(ctx context.Context, client pb.LiteVirtClient) ([]byte, error) {
+	if err := pullGuardFrom(ctx).check(ctx); err != nil {
+		return nil, err
+	}
 	stream, err := client.StreamStateDump(ctx, &emptypb.Empty{})
 	if err == nil {
 		var buf []byte
@@ -755,6 +772,9 @@ func fetchStateDump(ctx context.Context, client pb.LiteVirtClient) ([]byte, erro
 	}
 
 	// Fallback: legacy unary full-state dump.
+	if err := pullGuardFrom(ctx).check(ctx); err != nil {
+		return nil, err
+	}
 	dump, derr := client.GetStateDump(ctx, &emptypb.Empty{})
 	if derr != nil {
 		return nil, derr
@@ -778,6 +798,9 @@ func fetchTableDumpScoped(ctx context.Context, client pb.LiteVirtClient, tables 
 	req := &pb.TableDumpRequest{Tables: tables}
 	if b := scope.wire(); b != nil {
 		req.Buckets, req.BucketScheme = b, BucketScheme
+	}
+	if err := pullGuardFrom(ctx).check(ctx); err != nil {
+		return nil, err
 	}
 	stream, err := client.StreamTableDump(ctx, req)
 	if err != nil {
@@ -803,6 +826,9 @@ func fetchTableDumpScoped(ctx context.Context, client pb.LiteVirtClient, tables 
 }
 
 func fetchSensitiveStateDump(ctx context.Context, client pb.LiteVirtClient, req *pb.SensitiveStateRequest) ([]byte, error) {
+	if err := pullGuardFrom(ctx).check(ctx); err != nil {
+		return nil, err
+	}
 	stream, err := client.StreamSensitiveStateDump(ctx, req)
 	if err != nil {
 		return nil, err

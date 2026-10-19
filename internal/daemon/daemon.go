@@ -414,6 +414,11 @@ func boundedTelemetryShutdown(shutdown func(context.Context) error, timeout time
 }
 
 func (d *Daemon) Run(ctx context.Context) error {
+	// qemu writes UEFI vars files with no flush and libvirt has no cache mode
+	// for <nvram>: flush them from the first moment, so a host power cut
+	// loses at most about a second of a guest's UEFI variable writes.
+	nvramFlusher, stopNvramFlusher := d.startNvramFlusher(ctx)
+	defer stopNvramFlusher()
 	if err := d.checkMigrationNetwork(); err != nil {
 		return err
 	}
@@ -965,6 +970,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// past superseded_disk_retention_days (health/superseded_retention.go).
 	go d.runSupersededDiskSweep(ctx)
 
+	// A UEFI vars file whose flush failed is a host condition
+	// (nvram_flush_failed); the flusher itself started with Run.
+	go d.runNvramFlushCondition(ctx, nvramFlusher)
+
 	// Sample this host's aggregate disk/net rates into host_runtime_usage for the
 	// placement engine's DiskIOPS/NetBW dimensions.
 	go d.runRuntimeUsageSampler(ctx)
@@ -1254,6 +1263,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetCapacityPolicy(capacity)
 	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
 	svc.SetVMReplaceEnforce(d.cfg.Enforcement.VMReplace)                 // drives the latch + conditional advertisement; gates `lv cutover`
+	// The first pass over the swtpm tree (vtpm_state_sync), before anything
+	// on this host can start a VM: the cutover resume below, the startup
+	// recovery barrier, the runtime loops, onboot autostart and the API.
+	// It completes, or runs past vtpmPassWait and raises
+	// vtpm_state_not_durable; either way no vTPM guest writes state here
+	// before the attempt to make that state synchronous. The vTPM capability
+	// label (below) reuses the same probe.
+	vtpmMarker := filepath.Join(d.cfg.DataDir, "vtpm-state-sync")
+	vtpmSync := &vtpmStateSync{
+		on:   d.cfg.VTPMStateSyncEnabled(),
+		base: d.fwStore.SwtpmBase,
+		wait: vtpmPassWait,
+		// The host's own store: its swtpm tree is the one this host's
+		// guests write.
+		sync: func(on bool) libvirt.SwtpmSyncReport { return d.fwStore.SyncSwtpmState(on, vtpmMarker) },
+		report: func(open bool, evidence map[string]any) bool {
+			return d.syncVTPMCondition(ctx, open, evidence)
+		},
+	}
+	tpmCapable := tpmCapableProbe(exec.LookPath, vtpmSync.probe)
+	awaitFirstVTPMPass(tpmCapable)
 	// Finish any cutover cleanup a previous process left committed-but-unfinished.
 	// The replacement transition displaced the rows describing what the replaced VM
 	// owned, so its journaled manifest is the only surviving record of the volumes
@@ -1359,6 +1389,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// (grpcapi.ReconcileISCSISessions), off the start path: a portal that
 	// does not answer must not hold the daemon's start.
 	go d.runISCSISessionReconcile(ctx)
+	// Two NICs of the cluster on one MAC (grpcapi.ReconcileMACCollisions).
+	go d.runMACCollisionReconcile(ctx)
 	// The nfs pools' exports: a host reboot unmounts them, and nothing but a
 	// pool's Prepare mounted them. Mounted back now and kept
 	// (grpcapi.ReconcileNFSMounts), off the start path: a server that does
@@ -1531,11 +1563,36 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// that cannot load it renders the guards only and raises a health
 	// condition (firewall.nic.unavailable), never an empty firewall.
 	bridgeCT := firewall.BridgeConntrackAvailable(ctx, true)
+	// Firewall logging needs the kernel to load a named limit and a log line
+	// to an NFLOG group. Probed once here (nft -c, nothing committed); a host
+	// that refuses renders no log line and raises firewall.log.unavailable.
+	fwLogGroup := uint16(d.cfg.Firewall.LogGroup)
+	fwLogErr := firewall.ProbeLogging(ctx, fwLogGroup)
+	if fwLogErr != nil {
+		slog.Warn("firewall: logging is unavailable on this host; no packet is logged here", "error", fwLogErr)
+	}
+	svc.RecordFirewallLogAvailability(ctx, fwLogErr)
+	// Log lines are rendered only while this daemon's listener holds the
+	// group (firewallLogging); each bind change runs passes. The listener
+	// starts below, once d.fwReconciler exists.
+	fwLogging := newFirewallLogging(ctx, fwLogGroup, fwLogErr,
+		func(c context.Context) error { return d.fwReconciler.Reconcile(c) },
+		func(err error) { svc.RecordFirewallLogListener(ctx, err) })
+	// SYN-flood protection needs the kernel's per-source meters (nft_limit).
+	// Probed once here, check only; a host whose kernel refuses renders none
+	// and raises a health condition (firewall.synflood.unavailable).
+	synFloodProbe := firewall.ProbeSynFlood(ctx)
+	if synFloodProbe.V4 != nil || synFloodProbe.V6 != nil {
+		slog.Warn("firewall: the kernel refused a SYN-flood probe; that family gets no SYN-flood protection on guest NICs here",
+			"ipv4", synFloodProbe.V4, "ipv6", synFloodProbe.V6)
+	}
 	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
 		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs,
 			OnTagGroupMembers:    fwMetrics.SetTagGroupMembers,
 			OnDuplicateAddresses: firewall.NewDuplicateAddressReporter(d.db, d.cfg.HostName).Report,
-			BridgeConntrack:      func() bool { return bridgeCT }, Arming: fwArming})
+			BridgeConntrack:      func() bool { return bridgeCT }, Arming: fwArming,
+			Logging:       fwLogging.Logging,
+			SynFloodProbe: func() firewall.SynFloodProbeResult { return synFloodProbe }})
 	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
 	d.fwReconciler.SetArming(fwArming)
 	// Every domain start — an API start, a restart policy, a failover
@@ -1544,6 +1601,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// started (re-review I-10).
 	d.virt.SetStartGuard(svc.NICStartGuard(ctx))
 	d.fwReconciler.SetStateHook(svc.RecordFirewallState)
+	// Firewall logging: the listener reads the NFLOG group every rendered log
+	// line sends to into a bounded store (docs/firewall.md, "Logging").
+	fwLogStore := openFirewallLogStore(d.cfg, fwMetrics)
+	svc.SetFirewallLogStore(fwLogStore)
+	if fwLogErr == nil {
+		go (&firewall.LogListener{Group: fwLogGroup, Store: fwLogStore,
+			Resolve: d.fwReconciler.ResolveLogDevice,
+			OnBind:  fwLogging.OnBind}).Run(ctx)
+	}
+	go pruneFirewallLog(ctx, fwLogStore)
 	// Whether this host enforces NIC guards, after every pass, the boot pass
 	// included (re-review m8, m2, m5): the label carries this build's
 	// version while the last pass put the per-NIC table in force, so a host
@@ -1736,6 +1803,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// dnsmasq's host reservations in step with the NICs guarded on its
 	// networks.
 	go svc.SeedFirewallEnforcementLoop(ctx, 0, filepath.Join(d.cfg.DataDir, firewallInitialModeName))
+	go svc.SeedFirewallSynfloodLoop(ctx, 0, filepath.Join(d.cfg.DataDir, firewallSynfloodDecisionName))
 	svc.StartDHCPReservations(ctx, 0)
 
 	// Converge this host's network devices on the replicated networks table
@@ -1773,6 +1841,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	//   - vTPM (G1): both swtpm_setup and swtpm are needed to START a vTPM VM —
 	//     libvirt runs swtpm_setup to initialize state, then swtpm. (The first
 	//     G1 drill failed in swtpm_setup with swtpm alone present.)
+	//     The label is also held false until a pass over the swtpm tree
+	//     (vtpm_state_sync) has completed, so placement offers vTPM here only
+	//     after the attempt to make its state synchronous; a pass that cannot
+	//     raises vtpm_state_not_durable instead. The pass runs in its own
+	//     goroutine and the probe waits at most vtpmPassWait for it.
 	//   - Secure Boot: the secboot/MS OVMF pair (resolved above).
 	// Asserted now, before the container checker starts, and re-asserted every
 	// capabilityLabelInterval (keepCapabilityLabels says why).
@@ -1783,9 +1856,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	capabilityLabels := []capabilityLabel{
 		{key: corrosion.LabelLXCCapable, capable: lxc.Available},
-		{key: corrosion.LabelTPMCapable, capable: tpmAvailable},
+		{key: corrosion.LabelTPMCapable, capable: tpmCapable},
 		{key: corrosion.LabelSecureBootCapable, capable: firmwarePaths.SecureBootAvailable},
-		{key: corrosion.LabelFwLiveMigrate, capable: newFwLiveLabel(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmAvailable)},
+		// The live firmware move label holds a target to vTPM's own label
+		// (tpmCapable: swtpm present and a vtpm_state_sync pass completed); a
+		// move's Prepare re-checks presence only (tpmAvailable), since the
+		// label already gated it and a pass per Prepare would walk the tree
+		// on every move.
+		{key: corrosion.LabelFwLiveMigrate, capable: newFwLiveLabel(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmCapable)},
 	}
 	// A live firmware move's target re-checks the label's conditions itself,
 	// live, in Prepare.
@@ -1970,7 +2048,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fc.Claimer = svc
 	fc.RecoveryClaimEnforced = svc.RecoveryClaimEnforced
 	// The recovery-claim health conditions (ha.claim.stranded,
-	// ha.voter.unavailable) are the lease holder's to write, like genesis.
+	// ha.voter.unavailable) and host.address_shared are the lease holder's to
+	// write, like genesis.
 	fc.ClaimHealth = svc.RecoveryClaimHealthTick
 	// Partition pause, the majority side: rely on a host's pause only with this
 	// node's flag on AND partition_pause_v1 latched (every voter pauses), and
@@ -2228,6 +2307,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			svc.FinishDrainRecords(grpcapi.DrainRecordStopWait)
 		})
 		if d.fwReconciler != nil {
+			// No log line outlives the listener: once this process exits,
+			// another program could take the group.
+			stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			fwLogging.Stop(stopCtx)
+			cancel()
 			d.fwReconciler.Stop()
 		}
 		if d.snapScheduler != nil {
@@ -2828,6 +2912,26 @@ func (d *Daemon) runISCSISessionReconcile(ctx context.Context) {
 	}
 }
 
+// runMACCollisionReconcile looks for NICs of two workloads on one MAC at
+// once, then every grpcapi.MACCollisionReconcileInterval, until ctx is
+// cancelled.
+func (d *Daemon) runMACCollisionReconcile(ctx context.Context) {
+	if d.svc == nil {
+		return
+	}
+	d.svc.ReconcileMACCollisions(ctx)
+	ticker := time.NewTicker(grpcapi.MACCollisionReconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.svc.ReconcileMACCollisions(ctx)
+		}
+	}
+}
+
 // runNFSMountReconcile checks this host's nfs pools' mounts at once, then
 // every grpcapi.NFSMountReconcileInterval, until ctx is cancelled.
 func (d *Daemon) runNFSMountReconcile(ctx context.Context) {
@@ -3086,6 +3190,11 @@ const genesisMarkerName = "genesis-pending"
 // (grpcapi.SeedFirewallEnforcementLoop).
 const firewallInitialModeName = "firewall-initial-mode"
 
+// firewallSynfloodDecisionName is the founder's genesis decision to protect
+// guest NICs from SYN floods, in data_dir, consumed once recorded
+// (grpcapi.SeedFirewallSynfloodLoop).
+const firewallSynfloodDecisionName = "firewall-synflood-decision"
+
 // wireActivationMarker points the health checker at this node's durable
 // capability latches (health.ActivationMarkerBase), loading any already there.
 // They are written only after a daemon has run as a member and survive a
@@ -3221,6 +3330,13 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 	if err := os.WriteFile(filepath.Join(d.cfg.DataDir, firewallInitialModeName),
 		[]byte(corrosion.FirewallEnforce+"\n"), 0o600); err != nil {
 		slog.Warn("could not record the new cluster's initial firewall mode; it observes until `lv firewall enforce on`",
+			"error", err)
+	}
+	// And that it protects guest NICs from SYN floods (spec §1.4): its own
+	// decision, recorded by its own loop once the release latch forms.
+	if err := os.WriteFile(filepath.Join(d.cfg.DataDir, firewallSynfloodDecisionName),
+		[]byte(corrosion.SynfloodOn+"\n"), 0o600); err != nil {
+		slog.Warn("could not record the new cluster's SYN-flood protection; it stays off until `lv firewall synflood on`",
 			"error", err)
 	}
 

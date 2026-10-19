@@ -20,6 +20,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
+	"github.com/litevirt/litevirt/internal/firewall"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hostnet"
 	"github.com/litevirt/litevirt/internal/image"
@@ -792,6 +793,9 @@ type Server struct {
 	// instead of dialing a real peer over mTLS, so the owner→sink push path is
 	// unit-testable in-process. Production leaves it nil → real peerClient.
 	peerClientOverride func(ctx context.Context, host string) (pb.LiteVirtClient, func(), error)
+	// synFloodDrops reads this host's SYN-flood drop counters
+	// (firewall.SynFloodDrops when nil; tests replace it).
+	synFloodDrops func(ctx context.Context) (v4, v6 uint64, err error)
 	// inspectForwardTimeout, when set, replaces the bound on InspectVM's
 	// forward to the VM's host (tests).
 	inspectForwardTimeout time.Duration
@@ -1111,7 +1115,9 @@ type Server struct {
 	// ReloadFirewall calls Reconcile(ctx) on it synchronously to give
 	// `lv firewall reload` push semantics rather than a 30s wait.
 	fwReconciler FirewallReconciler
-	fwMu         sync.RWMutex
+	// fwLogStore is this host's firewall log store (SetFirewallLogStore).
+	fwLogStore atomic.Pointer[firewall.LogStore]
+	fwMu       sync.RWMutex
 
 	// DHCP reservations made for NICs whose rows are not written yet
 	// (nic_identity.go): network → address → reservation.

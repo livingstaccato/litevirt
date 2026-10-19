@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net"
 	"os"
@@ -37,7 +39,9 @@ func (c *hostAddTestClient) ListHosts(context.Context, *pb.ListHostsRequest, ...
 
 func (c *hostAddTestClient) AdmitHost(_ context.Context, req *pb.AdmitHostRequest, _ ...grpc.CallOption) (*pb.AdmitHostResponse, error) {
 	c.admitted = append(c.admitted, req.GetCertSerial())
-	c.atAdmit = append([]string(nil), c.target.Events...)
+	if c.atAdmit == nil { // the first: an add asks again before it installs
+		c.atAdmit = append([]string{}, c.target.Events...)
+	}
 	if c.admitErr != nil {
 		return nil, c.admitErr
 	}
@@ -110,14 +114,12 @@ func (f *addFixture) identityUnchanged(t *testing.T) {
 // staged lists the files left at staged paths on the target.
 func (f *addFixture) staged(t *testing.T) []string {
 	t.Helper()
-	var out []string
-	_ = filepath.Walk(f.target.Root, func(p string, info os.FileInfo, err error) error {
-		if err == nil && !info.IsDir() && strings.HasSuffix(p, ".add") {
-			out = append(out, p)
-		}
-		return nil
-	})
-	return out
+	return stagedOnTarget(t, f.target.Root)
+}
+
+// isStagedWrite reports whether event e is an upload to a staged path.
+func isStagedWrite(e string) bool {
+	return strings.HasPrefix(e, "write ") && strings.Contains(filepath.Base(e), ".add-")
 }
 
 // installedLive reports whether anything was moved into place or run on the
@@ -126,7 +128,7 @@ func installedLive(events []string) []string {
 	var live []string
 	for _, e := range events {
 		switch {
-		case strings.HasPrefix(e, "write ") && strings.HasSuffix(e, ".add"):
+		case isStagedWrite(e):
 		case strings.HasPrefix(e, "run mkdir -p"), e == "sh unstage", e == "sh config":
 		default:
 			live = append(live, e)
@@ -201,10 +203,12 @@ func TestHostAdd_UploadsEverythingBeforeTheAdmission(t *testing.T) {
 		if err := f.add(t); err != nil {
 			t.Fatal(err)
 		}
-		want := map[string]bool{"write /usr/local/bin/.litevirt.add": false, "write /etc/litevirt/pki/.host.key.add": false}
+		want := map[string]bool{"write /usr/local/bin/.litevirt.add-": false, "write /etc/litevirt/pki/.host.key.add-": false}
 		for _, e := range f.client.atAdmit {
-			if _, ok := want[e]; ok {
-				want[e] = true
+			for w := range want {
+				if strings.HasPrefix(e, w) {
+					want[w] = true
+				}
 			}
 		}
 		for e, seen := range want {
@@ -245,7 +249,7 @@ func TestHostAdd_InstallsAfterStoppingTheDaemonAndCleansUp(t *testing.T) {
 		t.Fatal(err)
 	}
 	served := installedSerial(mustRead(t, filepath.Join(f.targetPKI, "host.crt")))
-	if len(f.client.admitted) != 1 || served != f.client.admitted[0] {
+	if !oneSerial(f.client.admitted) || served != f.client.admitted[0] {
 		t.Errorf("the machine serves %s, admitted %v", served, f.client.admitted)
 	}
 	if m, _ := filepath.Glob(filepath.Join(f.targetPKI, "*.pre-add-*")); len(m) != 0 {
@@ -256,7 +260,7 @@ func TestHostAdd_InstallsAfterStoppingTheDaemonAndCleansUp(t *testing.T) {
 	}
 	stop, install := -1, -1
 	for i, e := range f.target.Events {
-		if strings.HasPrefix(e, "run systemctl stop litevirt") && stop < 0 {
+		if strings.HasPrefix(e, "run ") && strings.Contains(e, "systemctl stop litevirt") && stop < 0 {
 			stop = i
 		}
 		if e == "sh install" && install < 0 {
@@ -296,7 +300,7 @@ func TestHostAdd_AFailedAddRestoresAndARerunFromAnywhereFinishes(t *testing.T) {
 	if err := f.add(t); err != nil {
 		t.Fatalf("the rerun: %v", err)
 	}
-	if len(f.client.admitted) != 2 || f.client.admitted[0] != f.client.admitted[1] {
+	if len(f.client.admitted) < 2 || !oneSerial(f.client.admitted) {
 		t.Errorf("admitted %v, want the first admission's certificate again", f.client.admitted)
 	}
 	if got := installedSerial(mustRead(t, filepath.Join(f.targetPKI, "host.crt"))); got != f.client.admitted[0] {
@@ -316,11 +320,11 @@ func TestHostAdd_ARerunAfterTheAddFinishedIsANoOp(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.client.hosts[len(f.client.hosts)-1].State = pb.HostState_HOST_ACTIVE
-	n := len(f.target.Events)
+	n, asked := len(f.target.Events), len(f.client.admitted)
 	if err := f.add(t); err != nil {
 		t.Fatalf("the rerun of a finished add: %v", err)
 	}
-	if len(f.client.admitted) != 1 {
+	if len(f.client.admitted) != asked {
 		t.Errorf("AdmitHost asked again: %v", f.client.admitted)
 	}
 	if extra := f.target.Events[n:]; len(extra) != 0 {
@@ -422,12 +426,12 @@ func TestAddInstallCommands_KeepAndRestore(t *testing.T) {
 		t.Fatalf("exists = %v, want only %s", existed, key)
 	}
 	for _, p := range paths {
-		if err := os.WriteFile(addStagedPath(p), []byte("new "+filepath.Base(p)), 0o600); err != nil {
+		if err := os.WriteFile(addStagedPath(p, "ab"), []byte("new "+filepath.Base(p)), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 	const suffix = ".pre-add-x"
-	cmd := installCmd(r, paths, suffix)
+	cmd := installCmd(r, paths, suffix, "ab")
 	if strings.Index(cmd, "sync") < 0 || strings.Index(cmd, "sync") > strings.Index(cmd, "mv -fT") ||
 		strings.LastIndex(cmd, "sync") < strings.LastIndex(cmd, "mv -fT") {
 		t.Errorf("install does not sync before and after its renames:\n%s", cmd)
@@ -445,7 +449,7 @@ func TestAddInstallCommands_KeepAndRestore(t *testing.T) {
 	if got := string(mustRead(t, key+suffix)); got != "old" {
 		t.Fatalf("kept copy = %q, want the old key", got)
 	}
-	if _, err := r.Shell("restore", restoreCmd(r, paths, existed, suffix)); err != nil {
+	if _, err := r.Shell("restore", restoreCmd(r, paths, existed, stagedHashes(paths), suffix, "ab")); err != nil {
 		t.Fatal(err)
 	}
 	if got := string(mustRead(t, key)); got != "old" {
@@ -459,7 +463,7 @@ func TestAddInstallCommands_KeepAndRestore(t *testing.T) {
 		t.Errorf("a file the add created is still in place (stat: %v)", err)
 	}
 	for _, p := range paths {
-		if got := string(mustRead(t, addStagedPath(p))); got != "new "+filepath.Base(p) {
+		if got := string(mustRead(t, addStagedPath(p, "ab"))); got != "new "+filepath.Base(p) {
 			t.Errorf("the admitted %s is not back at its staged path: %q", filepath.Base(p), got)
 		}
 	}
@@ -542,7 +546,7 @@ func TestHostAdd_KeepsTheMachinesConfig(t *testing.T) {
 		}
 		setup := ""
 		for _, e := range f.target.Events {
-			if strings.HasSuffix(e, "bash -s") {
+			if strings.Contains(e, "bash -s") {
 				setup = e
 			}
 		}
@@ -674,10 +678,10 @@ func TestAddInstallCommands_AFailedSyncDoesNotRename(t *testing.T) {
 	if err := os.WriteFile(key, []byte("old"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(addStagedPath(key), []byte("new"), 0o600); err != nil {
+	if err := os.WriteFile(addStagedPath(key, "ab"), []byte("new"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Shell("install", installCmd(r, []string{key}, ".pre-add-x")); err == nil {
+	if _, err := r.Shell("install", installCmd(r, []string{key}, ".pre-add-x", "ab")); err == nil {
 		t.Error("an install whose sync failed reported success")
 	}
 	if got := string(mustRead(t, key)); got != "old" {
@@ -703,8 +707,11 @@ func TestHostAdd_AResumeChecksTheKeyMatchesTheCertificate(t *testing.T) {
 		filepath.Join(other, "x.crt"), filepath.Join(other, "x.key"), "node-9", net.IPv4(10, 0, 0, 9)); err != nil {
 		t.Fatal(err)
 	}
-	staged := addStagedPath(filepath.Join(f.targetPKI, "host.key"))
-	if err := os.WriteFile(staged, mustRead(t, filepath.Join(other, "x.key")), 0o600); err != nil {
+	staged, _ := filepath.Glob(addStagedPath(filepath.Join(f.targetPKI, "host.key"), f.client.admitted[0]+"-") + "*")
+	if len(staged) != 1 {
+		t.Fatalf("staged keys of the admission: %v, want one", staged)
+	}
+	if err := os.WriteFile(staged[0], mustRead(t, filepath.Join(other, "x.key")), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	f.target.FailSetup = nil
@@ -748,4 +755,67 @@ func TestMergeAddConfig_TakesCommonLayouts(t *testing.T) {
 			}
 		})
 	}
+}
+
+// stagedHashes is what TestAddInstallCommands_KeepAndRestore stages at each
+// path ("new <base>"), by sha256, as hostAddTo records its own.
+func stagedHashes(paths []string) map[string]string {
+	out := map[string]string{}
+	for _, p := range paths {
+		sum := sha256.Sum256([]byte("new " + filepath.Base(p)))
+		out[p] = hex.EncodeToString(sum[:])
+	}
+	return out
+}
+
+// Codex ec8 I2: a rollback moved whatever was at a path whose own stage was
+// gone back to that stage and restored its copy over it, so a rollback after
+// another add had installed there undid that add. It moves back only a file
+// that is what this attempt installed; one holding anything else is left in
+// place, with the copy beside it, and the rollback fails.
+//
+// Mutation: drop the hash check — the other add's key is moved aside and the
+// old key restored over it.
+func TestAddInstallCommands_ARollbackLeavesAFileItDidNotInstall(t *testing.T) {
+	dir := t.TempDir()
+	r := &LocalAddTarget{Root: "/", PKIDir: dir}
+	key := filepath.Join(dir, "host.key")
+	if err := os.WriteFile(key, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(addStagedPath(key, "ab"), []byte("new host.key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{key}
+	out, err := r.Shell("exists", existsCmd(r, paths))
+	if err != nil {
+		t.Fatal(err)
+	}
+	existed := existsSet(r, paths, out)
+	if _, err := r.Shell("install", installCmd(r, paths, ".pre-add-x", "ab")); err != nil {
+		t.Fatal(err)
+	}
+	// Another add installs its own key here before this one rolls back.
+	if err := os.WriteFile(key, []byte("another add's key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Shell("restore", restoreCmd(r, paths, existed, stagedHashes(paths), ".pre-add-x", "ab")); err == nil {
+		t.Error("a rollback that left another add's file reported success")
+	}
+	if got := string(mustRead(t, key)); got != "another add's key" {
+		t.Errorf("the rollback replaced another add's key: %q", got)
+	}
+	if got := string(mustRead(t, key+".pre-add-x")); got != "old" {
+		t.Errorf("the copy of the old key is not kept beside it: %q", got)
+	}
+}
+
+// oneSerial reports whether every admission asked for names one serial.
+func oneSerial(admitted []string) bool {
+	for _, a := range admitted {
+		if a != admitted[0] {
+			return false
+		}
+	}
+	return len(admitted) > 0
 }

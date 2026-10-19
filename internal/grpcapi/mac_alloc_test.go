@@ -416,7 +416,7 @@ func TestStartVM_ADrainResumeMarkerOnlyFromItsPeer(t *testing.T) {
 	marked := func(c context.Context, from string) context.Context {
 		vm, _ := corrosion.GetVM(context.Background(), s.db, "moved")
 		return metadata.NewIncomingContext(c, metadata.Pairs(DrainResumeFromMDKey, from,
-			DrainResumeEpochMDKey, strconv.FormatInt(vm.OwnerEpoch, 10)))
+			DrainResumeEpochMDKey, strconv.FormatInt(vm.OwnerEpoch, 10), DrainResumeOpMDKey, "op-1"))
 	}
 	srcPeer := peerCtxFor(t, s, "src-host")
 	if err := s.refuseStartOnSharedMAC(marked(srcPeer, "src-host"), "moved"); err != nil {

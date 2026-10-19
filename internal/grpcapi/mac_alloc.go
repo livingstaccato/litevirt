@@ -338,9 +338,12 @@ func describeMACHolder(h corrosion.MACHolder) string {
 // move handed the VM over at. Honoured only from that host as a peer, and
 // only for the VM still at that epoch (drainResumeFromPeer); a client's, this
 // host's own, or one with no epoch (an earlier build's source) is ignored.
+// DrainResumeOpMDKey names the drain operation the start ends, so the
+// target can bind the row's stop intent to it.
 const (
 	DrainResumeFromMDKey  = "x-litevirt-drain-resume-from"
 	DrainResumeEpochMDKey = "x-litevirt-drain-resume-epoch"
+	DrainResumeOpMDKey    = "x-litevirt-drain-resume-op"
 )
 
 // drainResumeFromPeer returns the host a StartVM says it ends a drain move
@@ -350,31 +353,35 @@ const (
 // the drain), whose certificate CN is the claimed host, a trusted host that
 // is not this one (a drain's source is never its target). ok is false
 // otherwise, and when the marker names no epoch.
-func (s *Server) drainResumeFromPeer(ctx context.Context) (source string, epoch int64, ok bool) {
+func (s *Server) drainResumeFromPeer(ctx context.Context) (source string, epoch int64, op string, ok bool) {
 	md, has := metadata.FromIncomingContext(ctx)
 	if !has {
-		return "", 0, false
+		return "", 0, "", false
 	}
 	v := md.Get(DrainResumeFromMDKey)
 	if len(v) == 0 || v[0] == "" {
-		return "", 0, false
+		return "", 0, "", false
 	}
 	claimed := v[0]
 	if callerPrincipalKind(ctx) != principalKindPeer || callerMTLSCommonName(ctx) != claimed ||
 		claimed == s.hostName || !s.isTrustedHostCN(ctx, claimed) {
 		slog.Warn("start: ignoring a drain-resume marker not sent by the claimed source host as a peer", "claimed_source", claimed)
-		return "", 0, false
+		return "", 0, "", false
 	}
 	e := md.Get(DrainResumeEpochMDKey)
 	if len(e) == 0 {
-		return "", 0, false
+		return "", 0, "", false
 	}
 	n, err := strconv.ParseInt(e[0], 10, 64)
 	if err != nil {
 		slog.Warn("start: ignoring a drain-resume marker with an unreadable epoch", "claimed_source", claimed, "epoch", e[0])
-		return "", 0, false
+		return "", 0, "", false
 	}
-	return claimed, n, true
+	o := md.Get(DrainResumeOpMDKey)
+	if len(o) == 0 || o[0] == "" {
+		return "", 0, "", false
+	}
+	return claimed, n, o[0], true
 }
 
 // refuseStartOnSharedMAC refuses an operator start of the stopped VM name
@@ -399,16 +406,18 @@ func (s *Server) refuseStartOnSharedMAC(ctx context.Context, name string) error 
 		// A marker decides alone: honoured for the VM as its move handed it
 		// over, and otherwise the start is checked as any start — a rejected
 		// marker is never rescued by the journal.
-		if src, epoch, ok := s.drainResumeFromPeer(ctx); ok {
+		if src, epoch, op, ok := s.drainResumeFromPeer(ctx); ok {
 			vm, err := corrosion.GetVM(ctx, s.db, name)
-			if err != nil || vm == nil || (vm.OwnerEpoch == epoch && inDrainHandoffShape(vm)) {
-				// The VM as the drain's move handed it over: at the epoch
-				// that transfer wrote, stopped, with no stop intent (or the
-				// drain's own). A row that cannot be read now may be one.
+			if err != nil || vm == nil || (vm.OwnerEpoch == epoch && vm.State == "stopped" &&
+				(vm.StateDetail == "" || vm.StateDetail == health.DrainStopDetail(op))) {
+				// The VM as that drain's move handed it over: at the epoch
+				// its transfer wrote, stopped, with no stop intent or that
+				// operation's own — never another drain's. A row that cannot
+				// be read now may be one.
 				return nil
 			}
 			slog.Warn("start: a drain-resume marker for a VM not as that drain's move handed it over; checked as any start",
-				"vm", name, "source", src, "marker_epoch", epoch, "owner_epoch", vm.OwnerEpoch, "state_detail", vm.StateDetail)
+				"vm", name, "source", src, "operation", op, "marker_epoch", epoch, "owner_epoch", vm.OwnerEpoch, "state_detail", vm.StateDetail)
 		}
 	} else {
 		// No marker (an earlier build's source): an open move in this
@@ -444,15 +453,13 @@ func (s *Server) refuseStartOnSharedMAC(ctx context.Context, name string) error 
 
 // hasDrainResumeMarker reports whether the call carries a drain-resume
 // marker at all, honoured or not.
+//
+// A marker that names no drain operation (an earlier build's source) binds
+// nothing to the row's stop intent: it counts as absent, and the start is
+// judged by the journal instead.
 func hasDrainResumeMarker(ctx context.Context) bool {
 	md, ok := metadata.FromIncomingContext(ctx)
-	return ok && len(md.Get(DrainResumeFromMDKey)) > 0
-}
-
-// inDrainHandoffShape reports whether vm is in the state a drain's move
-// hands a VM over in: stopped, with no stop intent or the drain's own.
-func inDrainHandoffShape(vm *corrosion.VMRecord) bool {
-	return vm.State == "stopped" && (vm.StateDetail == "" || strings.HasPrefix(vm.StateDetail, health.DrainStopDetailPrefix))
+	return ok && len(md.Get(DrainResumeFromMDKey)) > 0 && len(md.Get(DrainResumeOpMDKey)) > 0
 }
 
 // drainHandoffInJournal reports whether VM name, as this replica holds it,

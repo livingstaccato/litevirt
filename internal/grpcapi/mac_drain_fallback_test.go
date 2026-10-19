@@ -80,11 +80,23 @@ func TestStartVM_ADrainJournalExemptsOnlyTheMovesOwnHandoff(t *testing.T) {
 	t.Run("not yet handed over", func(t *testing.T) {
 		refused(t, context.Background(), setup(t, journaled, ""))
 	})
+	t.Run("an earlier build's marker with no operation falls back to the journal", func(t *testing.T) {
+		// Rolling upgrade: the source names no operation, so the marker
+		// binds nothing; the bound journal check decides, and this is the
+		// move's own handoff.
+		s := setup(t, journaled+1, "")
+		peer := peerCtxFor(t, s, "src-host")
+		old := metadata.NewIncomingContext(peer, metadata.Pairs(DrainResumeFromMDKey, "src-host",
+			DrainResumeEpochMDKey, strconv.FormatInt(journaled+1, 10)))
+		if err := s.refuseStartOnSharedMAC(old, "moved"); err != nil {
+			t.Fatalf("an earlier build's resume of the move's own handoff: %v", err)
+		}
+	})
 	t.Run("a rejected marker does not fall back", func(t *testing.T) {
 		s := setup(t, journaled+3, "")
 		peer := peerCtxFor(t, s, "src-host")
 		stale := metadata.NewIncomingContext(peer, metadata.Pairs(DrainResumeFromMDKey, "src-host",
-			DrainResumeEpochMDKey, strconv.FormatInt(journaled+1, 10)))
+			DrainResumeEpochMDKey, strconv.FormatInt(journaled+1, 10), DrainResumeOpMDKey, "op-x"))
 		refused(t, stale, s)
 	})
 	t.Run("a rejected marker on the move's own handoff does not fall back", func(t *testing.T) {
@@ -93,7 +105,46 @@ func TestStartVM_ADrainJournalExemptsOnlyTheMovesOwnHandoff(t *testing.T) {
 		s := setup(t, journaled+1, "")
 		peer := peerCtxFor(t, s, "src-host")
 		wrong := metadata.NewIncomingContext(peer, metadata.Pairs(DrainResumeFromMDKey, "src-host",
-			DrainResumeEpochMDKey, strconv.FormatInt(journaled+7, 10)))
+			DrainResumeEpochMDKey, strconv.FormatInt(journaled+7, 10), DrainResumeOpMDKey, "op-x"))
 		refused(t, wrong, s)
 	})
+}
+
+// A marker is bound to its drain operation's stop intent: on the handoff's
+// epoch, a row stopped with another drain's intent is not exempted by a
+// marker naming m0, and one with m0's own is. A marker that names no
+// operation (an earlier build's source) is judged by the journal instead.
+func TestStartVM_ADrainMarkerIsBoundToItsOwnStopIntent(t *testing.T) {
+	const dup = "52:54:00:00:3f:01"
+	setup := func(t *testing.T, detail string) (*Server, context.Context) {
+		t.Helper()
+		s := testServer(t)
+		ctx := context.Background()
+		if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "moved", HostName: s.hostName, State: "stopped", StateDetail: detail},
+			[]corrosion.InterfaceRecord{{VMName: "moved", NetworkName: "lan", MAC: dup}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		seedNICOf(t, s, "theirs", dup)
+		vm, _ := corrosion.GetVM(ctx, s.db, "moved")
+		peer := peerCtxFor(t, s, "src-host")
+		return s, metadata.NewIncomingContext(peer, metadata.Pairs(DrainResumeFromMDKey, "src-host",
+			DrainResumeEpochMDKey, strconv.FormatInt(vm.OwnerEpoch, 10), DrainResumeOpMDKey, "m0"))
+	}
+	if s, ctx := setup(t, health.DrainStopDetail("m1")); s.refuseStartOnSharedMAC(ctx, "moved") == nil {
+		t.Error("another drain's stop intent was exempted by m0's marker")
+	}
+	if s, ctx := setup(t, health.DrainStopDetail("m0")); s.refuseStartOnSharedMAC(ctx, "moved") != nil {
+		t.Error("m0's own stop intent was not exempted by m0's marker")
+	}
+	if s, ctx := setup(t, ""); s.refuseStartOnSharedMAC(ctx, "moved") != nil {
+		t.Error("the empty handoff detail was not exempted by m0's marker")
+	}
+	// No operation named: absent, so judged by the (empty) journal: refused.
+	s, _ := setup(t, "")
+	vm, _ := corrosion.GetVM(context.Background(), s.db, "moved")
+	noOp := metadata.NewIncomingContext(peerCtxFor(t, s, "src-host2"), metadata.Pairs(DrainResumeFromMDKey, "src-host2",
+		DrainResumeEpochMDKey, strconv.FormatInt(vm.OwnerEpoch, 10)))
+	if status.Code(s.refuseStartOnSharedMAC(noOp, "moved")) != codes.FailedPrecondition {
+		t.Error("a marker with no operation exempted the start without a journal")
+	}
 }

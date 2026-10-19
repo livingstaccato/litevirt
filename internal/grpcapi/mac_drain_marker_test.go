@@ -37,7 +37,7 @@ func macr3Marked(s *Server, c context.Context, from string) context.Context {
 		panic("macr3Marked: no VM moved")
 	}
 	return metadata.NewIncomingContext(c, metadata.Pairs(DrainResumeFromMDKey, from,
-		DrainResumeEpochMDKey, strconv.FormatInt(vm.OwnerEpoch, 10)))
+		DrainResumeEpochMDKey, strconv.FormatInt(vm.OwnerEpoch, 10), DrainResumeOpMDKey, "op-1"))
 }
 
 // A drain's source host whose StartVM carried the operator's bearer

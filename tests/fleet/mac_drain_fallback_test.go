@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -76,9 +77,13 @@ func TestFleet_MAC_AnOldOpenDrainExemptsNoLaterStart(t *testing.T) {
 
 	cl := sc.c.SelfClient(sc.dst)
 	peer := sc.c.PeerClient(sc.src, sc.dst)
+	moves, err := corrosion.ListDrainColdMoves(ctx, sc.dst.DB, sc.src.Name)
+	if err != nil || len(moves) != 1 {
+		t.Fatalf("premise: the old move on %s: %v %v", sc.dst.Name, moves, err)
+	}
 	markerAt := func(epoch int64) context.Context {
 		return metadata.AppendToOutgoingContext(ctx, grpcapi.DrainResumeFromMDKey, sc.src.Name,
-			grpcapi.DrainResumeEpochMDKey, strconv.FormatInt(epoch, 10))
+			grpcapi.DrainResumeEpochMDKey, strconv.FormatInt(epoch, 10), grpcapi.DrainResumeOpMDKey, moves[0].OperationID)
 	}
 	stopOS1 := func(detail string) {
 		t.Helper()
@@ -240,5 +245,113 @@ func drainHost(t *testing.T, c *Cluster, n *Node) (map[string]*pb.DrainProgress,
 			return out, rerr
 		}
 		out[p.VmName] = p
+	}
+}
+
+// Codex's marked schedule, on independent replicas. Drain m0 moves os1 A→B
+// and starts it there, but A dies before recording m0 finished (both
+// replicas still hold m0 open), and B's writes do not reach A: A still sees
+// os1 handed over to B, stopped. A later drain m1 of B to C stops os1, fails
+// its copy and its restart: os1 is stopped on B at m0's epoch + 1 with m1's
+// stop intent. B is undrained and another VM there takes os1's MAC. A's
+// startup recovery then finishes m0 by starting os1 on B, with a genuine
+// drain-resume marker for m0 at that epoch. B must refuse it for the shared
+// MAC: os1's stop is m1's, not m0's handoff.
+//
+// Mutation: a marked start accepts any drain stop intent (the 2d183545f
+// rule) — os1 is started on B: red.
+func TestFleet_MAC_AStaleRecoveryMarkerDoesNotCoverALaterDrainsStop(t *testing.T) {
+	const dup = "52:54:00:7a:09:01"
+	sc := newColdStoppedScenarioWith(t, Options{Nodes: 3, IndependentReplicas: true, SharedDataDir: true, FaultSeed: 103})
+	a, b, cNode := sc.src, sc.dst, sc.c.Nodes[2]
+	ctx := context.Background()
+	if err := a.Virt.StartDomain("os1"); err != nil {
+		t.Fatalf("start os1's domain: %v", err)
+	}
+	if err := corrosion.UpdateVMState(ctx, a.DB, "os1", "running", ""); err != nil {
+		t.Fatalf("record os1 running: %v", err)
+	}
+	if err := corrosion.InsertInterface(ctx, a.DB, corrosion.InterfaceRecord{VMName: "os1", NetworkName: "lan", MAC: dup}); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range sc.c.Nodes {
+		n.Server.SetBridgeEnsure(func(string) error { return nil })
+	}
+	if _, err := drainHost(t, sc.c, cNode); err != nil {
+		t.Fatalf("drain the empty %s: %v", cNode.Name, err)
+	}
+	sc.c.WaitConverged(t, convergeTimeout)
+
+	// From here nothing B or C writes reaches A.
+	sc.c.SetLinkFault(b, a, LinkFault{Block: true})
+	sc.c.SetLinkFault(cNode, a, LinkFault{Block: true})
+
+	// m0: A→B, started on B; A "dies" before recording it finished.
+	if progress, err := drainHost(t, sc.c, a); err != nil || progress["os1"] == nil || progress["os1"].Status != "done" || progress["os1"].TargetHost != b.Name {
+		t.Fatalf("drain m0 of %s: %v (%+v)", a.Name, err, progress["os1"])
+	}
+	unfinish := `DELETE FROM operation_steps WHERE step_name = ? AND operation_id IN
+		(SELECT id FROM operations WHERE operation_kind = ? AND resource_id = 'os1' AND desired_ref = ?)`
+	eventually(t, convergeTimeout, b.Name+" to hold m0", func() bool {
+		open, _ := corrosion.DrainColdMoveOpenTo(ctx, b.DB, "os1", b.Name)
+		rows, _ := b.DB.Query(ctx, `SELECT 1 FROM operations WHERE operation_kind = ? AND resource_id = 'os1'`, string(corrosion.OpDrainColdMove))
+		return open || len(rows) > 0
+	})
+	for _, n := range []*Node{a, b} {
+		if err := localExec(ctx, n.DB, unfinish, corrosion.OpStepCompleted, string(corrosion.OpDrainColdMove), b.Name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	aView, err := corrosion.GetVM(ctx, a.DB, "os1")
+	if err != nil || aView == nil || aView.HostName != b.Name || aView.State != "stopped" || aView.StateDetail != "" {
+		t.Fatalf("premise: %s still sees os1 handed over to %s, stopped: %+v %v", a.Name, b.Name, aView, err)
+	}
+
+	// m1: B→C, whose copy and restart both fail.
+	if _, err := sc.c.SelfClient(cNode).UndrainHost(ctx, &pb.UndrainHostRequest{Name: cNode.Name}); err != nil {
+		t.Fatalf("undrain %s: %v", cNode.Name, err)
+	}
+	eventually(t, convergeTimeout, b.Name+" to see "+cNode.Name+" undrained", func() bool {
+		h, err := corrosion.GetHost(ctx, b.DB, cNode.Name)
+		return err == nil && h != nil && h.State == "active"
+	})
+	cNode.Virt.FailDefineDomain = func(string) error { return errors.New("injected define failure") }
+	b.Virt.FailStartDomain = func(string) error { return errors.New("injected start failure") }
+	if progress, err := drainHost(t, sc.c, b); err == nil || progress["os1"] == nil || progress["os1"].Status != "error" {
+		t.Fatalf("premise: drain m1 of %s leaves os1 stopped: %v (%+v)", b.Name, err, progress["os1"])
+	}
+	b.Virt.FailStartDomain = nil
+	bView, err := corrosion.GetVM(ctx, b.DB, "os1")
+	if err != nil || bView == nil || bView.HostName != b.Name || bView.State != "stopped" || bView.OwnerEpoch != aView.OwnerEpoch ||
+		!strings.HasPrefix(bView.StateDetail, health.DrainStopDetailPrefix) {
+		t.Fatalf("premise: os1 stopped on %s at epoch %d with m1's stop: %+v %v", b.Name, aView.OwnerEpoch, bView, err)
+	}
+	if _, err := sc.c.SelfClient(b).UndrainHost(ctx, &pb.UndrainHostRequest{Name: b.Name}); err != nil {
+		t.Fatalf("undrain %s: %v", b.Name, err)
+	}
+	if err := localExec(ctx, b.DB, `INSERT INTO vms (name, host_name, state, spec, created_at, updated_at) VALUES ('late', ?, 'running', '{}', 't', 't')`, b.Name); err != nil {
+		t.Fatal(err)
+	}
+	if err := localExec(ctx, b.DB, `INSERT INTO vm_interfaces (vm_name, network_name, ordinal, mac, updated_at) VALUES ('late', 'lan', 0, ?, 't')`, dup); err != nil {
+		t.Fatal(err)
+	}
+
+	// A's stale startup recovery finishes m0, with its genuine marker.
+	var marker []string
+	b.HookUnary("StartVM", func(hctx context.Context, req any, handler grpc.UnaryHandler) (any, error) {
+		if md, ok := metadata.FromIncomingContext(hctx); ok {
+			marker = md.Get(grpcapi.DrainResumeFromMDKey)
+		}
+		return handler(hctx, req)
+	})
+	_, _ = a.Server.ResumeDrainColdMoves(ctx)
+	if len(marker) != 1 || marker[0] != a.Name {
+		t.Fatalf("premise: A's recovery start carried marker %v, want [%s]", marker, a.Name)
+	}
+	if active, _ := b.Virt.DomainIsActive("os1"); active {
+		t.Fatal("os1 was started on its shared MAC by a stale recovery marker")
+	}
+	if after, _ := corrosion.GetVM(ctx, b.DB, "os1"); after == nil || after.State != "stopped" || after.StateDetail != bView.StateDetail {
+		t.Fatalf("os1's row changed: %+v", after)
 	}
 }

@@ -126,8 +126,12 @@ func (s *Server) clearReplicationRate(ctx context.Context, schedule, repo string
 // same name never inherits it. It is the one caller of
 // corrosion.DeleteBackupSchedule (TestReplicationRate_DeleteBackupScheduleHasOneCaller).
 func (s *Server) deleteScheduleRow(ctx context.Context, schedule, repo string) error {
+	row, _ := corrosion.GetBackupScheduleRow(ctx, s.db, schedule, repo)
 	if err := corrosion.DeleteBackupSchedule(ctx, s.db, schedule, repo); err != nil {
 		return err
+	}
+	if row != nil {
+		s.retireScheduleCheckpoints(ctx, *row)
 	}
 	if err := s.clearReplicationRate(ctx, schedule, repo); err != nil {
 		return fmt.Errorf("the schedule was deleted, but its bandwidth limit was not cleared: %w; adding the schedule again clears it (or sets the --bwlimit given)", err)

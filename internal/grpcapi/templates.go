@@ -26,6 +26,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/diskmode"
+	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/qcow2"
@@ -242,6 +243,11 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	// A point-in-time overlay an earlier copy left holds writes the source's
 	// disk lacks: settle it before the clone reads or backs on the disk.
 	if err := s.settlePITOverlays(ctx, src); err != nil {
+		return nil, err
+	}
+	// A volume move left unresolved: the rows name the file holding the
+	// guest's writes before one is copied (move_unresolved.go).
+	if err := s.resolveUnresolvedMovesFor(ctx, req.Source, health.MoveUseReadsRunning); err != nil {
 		return nil, err
 	}
 	srcDisks, err := corrosion.GetVMDisks(ctx, s.db, req.Source)
@@ -514,8 +520,13 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	var seedNICs []cloudinit.NIC
 	var isoPicks []isoPick
 	defer func() { s.releaseHostIsolatedPicks(isoPicks) }()
+	macs := s.newMACAllocator()
 	for i, n := range srcSpec.Network {
-		mac := lv.GenerateMAC()
+		mac, merr := macs.next(ctx)
+		if merr != nil {
+			cleanup()
+			return nil, merr
+		}
 		bridge := network.FlatBridgeName(n.Name)
 		if pb, perr := s.provisionForVM(ctx, n.Name); perr == nil && pb != "" {
 			bridge = pb

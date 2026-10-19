@@ -127,3 +127,29 @@ func TestResolveHealthCondition_StaleUEFIVarsUnreadableEvidenceIsAudited(t *test
 		t.Fatalf("audit = %v; want it to say the evidence was unreadable", audits)
 	}
 }
+
+// --accept and --force are vm.move_unresolved's: sent with an acknowledgement
+// of nvram_flush_failed, complete with its own flag and a reason, each is
+// refused, not ignored, and nothing is written or audited.
+func TestResolveHealthCondition_MoveFlagsRefusedOnStaleUEFIVars(t *testing.T) {
+	for name, ctx := range map[string]context.Context{
+		"--accept": acceptCtx("/var/lib/libvirt/qemu/nvram/web-1_VARS.fd"),
+		"--force":  forceCtx(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := staleVarsServer(t)
+			_, err := s.ResolveHealthCondition(ctx, &pb.ResolveHealthConditionRequest{
+				Code: libvirt.CondNvramFlushFailed, SubjectKind: "host", SubjectId: "h1",
+				Reason: "disk replaced", AcceptStaleUefiVars: true})
+			if status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "applies only to vm.move_unresolved") {
+				t.Fatalf("err = %v, want InvalidArgument naming vm.move_unresolved", err)
+			}
+			if got := staleVarsLifecycle(t, s); got != corrosion.ConditionConfirmed {
+				t.Fatalf("a refused acknowledgement left the row %q", got)
+			}
+			if len(healthResolveAudits(t, s)) != 0 {
+				t.Fatal("a refused acknowledgement was audited")
+			}
+		})
+	}
+}

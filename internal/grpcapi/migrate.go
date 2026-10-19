@@ -24,6 +24,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/dns"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hooks"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/obs"
@@ -193,6 +194,18 @@ func (s *Server) sourceGateRefused(ctx context.Context, vm *corrosion.VMRecord, 
 // its whole step, calls this directly for its cold moves (drainColdMove), with
 // the same lock discipline.
 func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, vm *corrosion.VMRecord, send func(pb.MigratePhase, float32, float32) error, unlock func(), adopted *bool, opts ownedMigrateOpts) error {
+	// A volume move left unresolved: the rows name the file holding the
+	// guest's writes before anything reads them for the migration
+	// (move_unresolved.go).
+	// Without storage a running domain migrates live with the files it has
+	// open, so a forked history it cannot get wrong does not hold it.
+	use := health.MoveUseBoots
+	if !req.WithStorage {
+		use = health.MoveUseMigratesRunning
+	}
+	if err := s.resolveUnresolvedMovesFor(ctx, vm.Name, use); err != nil {
+		return err
+	}
 	// The VM leaves this host: the next admission here reads the runtime
 	// afresh, not a cached inventory that still charges the VM's memory as
 	// runtime-only load (invalidateInventoryCache; P-3 of lab 2 run c2). An
@@ -1609,6 +1622,11 @@ func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vm
 // VM does, its disks streamed first and its firmware bundle carried with the
 // domain's define, and a failure before the handoff takes both back.
 func (s *Server) coldMoveDisks(ctx context.Context, vm *corrosion.VMRecord) ([]corrosion.DiskRecord, error) {
+	// A volume move left unresolved here: the rows name the file the persistent
+	// config names before one is streamed (move_unresolved.go).
+	if err := s.resolveUnresolvedMoves(ctx, vm.Name); err != nil {
+		return nil, err
+	}
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "query disks for %q: %v", vm.Name, err)
@@ -1651,6 +1669,9 @@ func (s *Server) coldMovePreflight(ctx context.Context, vm *corrosion.VMRecord, 
 		return status.Errorf(codes.Internal, "libvirt not connected on host %s", s.hostName)
 	}
 	if err := s.nicMTUPreflight(ctx, vm, targetHost); err != nil {
+		return err
+	}
+	if err := s.refuseColdMoveOnSharedMAC(ctx, vm.Name); err != nil {
 		return err
 	}
 	disks, err := s.coldMoveDisks(ctx, vm)

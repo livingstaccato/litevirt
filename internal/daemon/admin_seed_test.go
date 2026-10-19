@@ -494,4 +494,13 @@ func TestSeedAdminUser_GenesisDecidesFirewallEnforce(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(joiner.cfg.DataDir, firewallInitialModeName)); !os.IsNotExist(err) {
 		t.Errorf("a joiner decided an initial firewall mode: %v", err)
 	}
+	// SYN-flood protection: the founder decides on, in its own file (spec
+	// §1.4, I-8); a joiner decides nothing.
+	got, err = os.ReadFile(filepath.Join(d.cfg.DataDir, firewallSynfloodDecisionName))
+	if err != nil || strings.TrimSpace(string(got)) != corrosion.SynfloodOn {
+		t.Errorf("genesis decided SYN-flood %q (%v), want on", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(joiner.cfg.DataDir, firewallSynfloodDecisionName)); !os.IsNotExist(err) {
+		t.Errorf("a joiner decided SYN-flood protection: %v", err)
+	}
 }

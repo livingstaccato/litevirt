@@ -1053,6 +1053,80 @@ condition:
   in this host's view (0 for a group this host cannot read), and
   `lv firewall tag-group ls --members` lists them.
 
+## SYN-flood protection
+
+SYN-flood protection limits new TCP connections toward guest NICs: per guest
+NIC and source address (an IPv6 source by its /64), at most `--rate` SYNs per second after a burst of
+`--burst`. A SYN past the limit is dropped and counted (`lv-sf 4`, `lv-sf 6` in
+`lv firewall show`). It is enforced in the per-NIC table (`bridge
+litevirt-nic`), immediately before each guest NIC's ingress rules, so it applies
+to traffic from the uplink, from the host and from another guest alike.
+
+```
+lv firewall synflood status                                       # cluster policy, then each host's
+lv firewall synflood on [--rate 200] [--burst 1000] [--scope <host>]
+lv firewall synflood off [--scope <host>]
+lv firewall synflood inherit --scope <host>                       # clear a host's own policy
+```
+
+- A host's own policy (`--scope <host>`) wins over the cluster's; with
+  neither, protection is off. `status` shows, per host, the policy, where it
+  comes from (`host` or `cluster`), what the host itself has in force
+  (IN FORCE: `on`; `ipv4-only` or `ipv6-only`, the kernel refused the other
+  family's rules, whose drops then show `-`; `observe`, counted and not dropped; `guards-only`, no
+  bridge conntrack, nothing rendered; `no-guest-nics`, no per-NIC table yet;
+  `unavailable`, the kernel refused the rules, or the host's first per-NIC
+  table; `off`; `predates`, the host's litevirtd does not report it), and its
+  drops per address family since its last reload, asked of every active host
+  at once. A per-NIC table the kernel refuses leaves the previous one, and its
+  value, in force. The firewall page of the web UI shows the same under "Ask
+  every host". A host
+  without counts shows `-` and why in ERROR, never a 0: `unreachable` (no
+  answer within 10 seconds), `not asked` (not active), `predates` (its
+  litevirtd is older) or `reported by the host` (it could not read them).
+- `on`, `off` and `inherit` need the operator role, are audited
+  (`firewall.synflood`) and are refused until the cluster upgrade has
+  finished. `--rate` and `--burst` are each 1-100000 (0 is refused); the
+  defaults, 200 and 1000, are Proxmox's.
+- A cluster founded by this release is created with protection on at 200/1000.
+  A cluster that upgraded has it off until `lv firewall synflood on`, so the
+  upgrade drops nothing that worked before.
+- Only guest NICs are protected. The host's own input (gRPC, gossip) is never
+  limited.
+- In observe mode (see "Observe and enforce") a SYN past the limit is not
+  dropped: `lv firewall enforce status` counts it as a would-drop with rule
+  `synflood`. Read it before enforcing.
+- Connections the load balancer's haproxy opens to its backends are accepted
+  before the limit, by source, backend address and port. No source is exempt
+  otherwise: SYNs from a routed network's gateway (a masqueraded guest) or
+  from the host are limited like any other source's.
+
+**The default is low for a proxy in front of backends.** 200 new connections
+per second from one source to one backend NIC is reachable by a reverse-proxy
+guest, and SYNs the host itself sends to a guest (a health check) count against
+the host's address too. Read `lv firewall enforce status` (observe mode) or
+`lv firewall synflood status` before relying on the default, and raise `--rate`
+where such traffic runs.
+
+**Limits.**
+
+- The meters restart whenever the per-NIC table is reloaded. Any change that
+  alters the rendered ruleset reloads both tables on every host: a rule, an ip
+  set, a tag-group member or an address anywhere in the cluster.
+- Each host keeps at most 65536 sources per address family. A flood from more
+  random sources than that (IPv4 addresses, or IPv6 /64s) passes the limiter
+  once the meter is full; guests keep their own SYN cookies. Rotating
+  addresses within one IPv6 /64 does not escape it, but one IPv6 /48 holds
+  65536 /64s, enough to fill the meter, as one IPv4 /16 is.
+- The kernel needs `nft_limit`, and IPv6 an nft that keys a set by prefix. The
+  daemon checks each address family at start (`nft -c`, nothing loaded); a
+  family the kernel refuses is not rendered on that host, the other still is,
+  and the host raises `firewall.synflood.unavailable` naming the family while
+  the policy is on. Restart the daemon once it can.
+- A policy row this build cannot read (not JSON, an unknown mode, `{}`, or a
+  rate or burst outside 1-100000) is enforced as on at 200/1000, and the host
+  raises `firewall.policy.unreadable` naming the key until it is set again.
+
 ## CLI
 
 The CLI lives at `lv sg …` and `lv firewall …`:
@@ -1082,7 +1156,7 @@ lv firewall ipset ls
 lv firewall ipset rm <id>
 
 # Default forward policy (no --scope = cluster-wide; --scope <host> overrides one host)
-lv firewall default-deny on [--scope node-1]
+lv firewall default-deny on [--scope node-1]   # --scope names a host that has joined
 
 # Per-NIC anti-spoofing (see "NIC guards")
 lv firewall nic-guard set <vm> --network <net> --mode on --allow 10.0.0.250
@@ -1098,10 +1172,19 @@ lv firewall tag set cache-1 --container --host node-2 role=web
 lv firewall tag rm web-1 env
 lv firewall tag ls [web-1]
 
+# Logging (see "Logging")
+lv sg rule-add web --direction ingress --proto tcp --port 22 --action drop --log
+lv firewall log-policy on [--scope node-1] [--rate 5] [--burst 10]
+lv firewall log --workload web-1 --since 15m [--follow]
+
 # Tag groups: rules reference one with --cidr tag:<name>
 lv firewall tag-group set web --match role=web [--match env=prod] [--network prod] [--sg web-in]
 lv firewall tag-group ls [--members]
 lv firewall tag-group rm web [--force]
+
+# SYN-flood protection on guest NICs (see "SYN-flood protection")
+lv firewall synflood on --rate 500 --burst 2000
+lv firewall synflood status
 
 # Inspect the live rulesets on this host (litevirt-fw and litevirt-nic) / force a reconcile now
 lv firewall show
@@ -1136,6 +1219,92 @@ lv firewall cluster-rule add --macro DNS --direction egress
 lv firewall host-rule add --host node-1 --macro HTTPS
 ```
 
+## Logging
+
+A rule added with `--log` (compose `log: true`) logs each packet it matches,
+and `lv firewall log-policy on` logs each guest NIC's default verdict. The
+records go to the daemon, never to the kernel log or the journal: every log
+line is `log group <G> snaplen 96`, sending the packet's first 96 bytes to
+NFLOG group `firewall.log_group` (default 27), which the daemon reads. Log
+lines are rendered only while the daemon's own listener holds that group. A
+stopping daemon removes them before it exits. They can outlive the listener
+only after a crash (until the next start's first pass) and, after the
+listener loses the group, for the length of the firewall pass that removes
+them; a program that binds the group in such a window receives records.
+
+```
+lv sg rule-add web --direction ingress --proto tcp --port 22 --action drop --log
+lv firewall cluster-rule add --direction ingress --proto tcp --port 25 --action reject --log
+lv firewall log-policy status
+lv firewall log-policy on [--scope <host>] [--rate 5] [--burst 10]
+lv firewall log-policy off [--scope <host>]
+lv firewall log-policy inherit --scope <host>
+lv firewall log [--host <h>] [--workload <name>] [--since 15m] [--limit 200] [--follow]
+```
+
+- `--action drop+log` is refused: the action stays the verdict. Listings show
+  a logged rule's action as `drop log`, and the API carries `log` beside the
+  plain action.
+- A logged rule and a log-policy write are refused until the cluster upgrade
+  has finished (release feature `firewall_log`). `lv` asks the daemon first and
+  refuses `--log` against one that predates logging.
+- `lv firewall log-policy` needs role operator and is audited as
+  `firewall.log_policy`. A host's policy wins over the cluster's; with
+  neither, the default verdict is not logged. `--rate` (records a second) and
+  `--burst` are each 1-10000, default 5 and 10. A stored policy this build
+  cannot read is read as off at the default budget and raises
+  `firewall.policy.unreadable`.
+- Reading the log needs the verb `firewall.log.view` at `/`, which among the
+  built-in roles only Admin holds (docs/auth.md). Without `--host`,
+  `lv firewall log` asks every active host and merges the records by time; a
+  host that does not answer is named. `--follow` polls from each host's newest
+  record.
+
+**Budgets and fairness.**
+
+- Each guest NIC side has its own budget, `--rate`/s with `--burst`, shared by
+  every log line of that side: a guest can cause at most that many records a
+  second per NIC side, whatever it sends. A record past the budget is not
+  written; the packet still gets its verdict.
+- Rules in the cluster and host tiers also log routed traffic, under one
+  budget per table (`lv_lg_routed` in each of the two tables), so a host's
+  routed log can reach twice the rate. Routed traffic dropped by the default
+  policy is not logged; only the per-NIC default verdict is.
+- In observe mode a per-NIC drop is logged as `would-drop`; a frame a tier
+  rule also drops on the routed path is logged twice, once as `would-drop` and
+  once as `drop`.
+- The routed budget and the host's cap are first come, first served: one busy
+  flow can use them up, and an attacker can do that on purpose to keep other
+  traffic out of the log. The per-NIC budgets are not affected.
+- The daemon keeps at most `firewall.log_max_rate` records a second (default
+  200) across the host. `litevirt_firewall_log_records_total{outcome}` counts
+  records `kept`, `rate_limited` by that cap, and lost to `overflow` (the
+  kernel dropped them before the daemon read them).
+
+**Kernel support.** At start the daemon checks, with `nft -c`, that the kernel
+loads a named limit and a log line to its group (`nft_log`,
+`nfnetlink_log`, `nft_limit`). A host that refuses them renders no log line,
+keeps its per-NIC table, and raises `firewall.log.unavailable`; loading the
+modules later takes a daemon restart. A group the daemon cannot hold (another
+program holds it) raises `firewall.log.listener`, and no log line is rendered
+until the daemon holds it: packets are not logged on that host. Losing the
+group removes the lines in the next pass, run at once, and holding it again
+restores them.
+
+**Data at rest.** Records name any tenant's addresses and ports.
+
+- The daemon keeps the newest 10,000 in memory and writes JSON lines under
+  `<data_dir>/firewall-log/` (directory 0700, files 0600), rotated so the
+  directory never holds more than `firewall.log_retain_mib` (default 64; 0
+  keeps memory only), checked by size, so lowering the cap takes effect at the
+  next start. Records older than `firewall.log_retain_days` (default 7; 0 for
+  no age bound) are removed, on disk and in memory, within about an hour of
+  passing it: a file spans at most an hour (or a 24th of the bound, when
+  shorter) and goes once its newest record is past the bound.
+- No litevirt backup includes `<data_dir>`. `lv uninstall` removes it unless
+  `--keep-data` is given. `lv host rm` does not touch the removed host's disk:
+  delete `<data_dir>/firewall-log/` there.
+
 ## Audit trail
 
 Every firewall-policy change made through the daemon lands in the signed
@@ -1159,6 +1328,8 @@ the row names the user the session belongs to.
 | `firewall.enforcement` | `cluster` | `lv firewall enforce on/off` |
 | `firewall.tag.set` / `.rm` | VM name, or `<host>/<name>` for a container | `lv firewall tag set/rm` |
 | `firewall.tag_group.set` / `.rm` | group name | `lv firewall tag-group set/rm` |
+| `firewall.log_policy` | `(cluster)` for the cluster policy, or the host name | `lv firewall log-policy on/off/inherit` |
+| `firewall.synflood` | `cluster`, or `host/<name>` for a host's policy | `lv firewall synflood on/off/inherit`; the genesis seed of a new cluster, by `litevirt` |
 
 The row's user is the authenticated caller. Its detail records the policy
 before and after the change, in the form `before=<state> after=<state>`:
@@ -1308,5 +1479,3 @@ missing. Recommended order:
   first option); a crafted solicitation with it later is not.
 - Reservations are IPv4; a DHCPv6 lease is confined to the subnet.
 - IGMP-specific rules.
-- Application-aware logging (`log prefix`, `log group`) for
-  rejected packets — useful in deny-by-default audits.

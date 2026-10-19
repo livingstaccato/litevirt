@@ -104,6 +104,13 @@ func (s *Server) MoveVolume(req *pb.MoveVolumeRequest, stream grpc.ServerStreami
 	if src == nil {
 		return status.Errorf(codes.NotFound, "vm %q has no disk %q", req.VmName, req.DiskName)
 	}
+	// An unresolved move of this disk this host recorded is settled first, or
+	// refuses the retry: a "nothing to do" must not hide it.
+	if settled, err := s.settleBeforeMove(ctx, vm, src); err != nil {
+		return err
+	} else if settled != nil {
+		src = settled
+	}
 	if src.StorageVolume == req.TargetPool {
 		// Idempotent no-op: the disk is already where the caller asked for it
 		// (e.g. re-running a move that already completed). Emit a terminal
@@ -136,6 +143,24 @@ func (s *Server) moveOneVolume(
 	deleteSource bool,
 	send func(*pb.MoveVolumeProgress) error,
 ) error {
+	// A caller that is not MoveVolume (MigrateStackVolumes) reaches here
+	// directly: an unresolved move of this disk is settled first, or refuses
+	// the move with a health.MoveUnresolvedError.
+	if settled, err := s.settleBeforeMove(ctx, vm, src); err != nil {
+		return err
+	} else if settled != nil {
+		src = settled
+	}
+	// Already there (a stack migration dispatches a disk whose move was
+	// recorded even when its row names the target pool): nothing to do.
+	if src.StorageVolume == targetPool {
+		return send(&pb.MoveVolumeProgress{
+			Phase:      pb.MoveVolumeProgress_DONE,
+			Status:     fmt.Sprintf("disk %q is already in pool %q — nothing to do", src.DiskName, targetPool),
+			CopyPct:    100,
+			BytesTotal: src.SizeBytes,
+		})
+	}
 	// A VM snapshot makes the disk an overlay over a (possibly host-local) backing
 	// base. qemu-img convert flattens the DATA, but the snapshot metadata and the
 	// backing reference don't survive a pool move — the moved overlay can end up
@@ -248,17 +273,35 @@ func (s *Server) moveOneVolume(
 		return status.Errorf(codes.Internal, "inspect persistent domain config (cutover aborted, source preserved): %v", perr)
 	}
 
+	// The unresolved-move record: written before the first step that can leave the
+	// persistent config and the disk row naming different files, removed when the
+	// move returns with them agreeing (moveMarker).
+	var mk *moveMarker
+	defer func() { mk.done() }()
+	// unresolvedCommitErr is the error of a commit that failed while the config
+	// may name the copy: the row still names the source, so the record stays.
+	unresolvedCommitErr := func(err error) error {
+		if errors.Is(err, corrosion.ErrNoRowsAffected) {
+			return mk.keep(status.Errorf(codes.Aborted, "disk %q/%q changed during move; aborted before completing (the persistent config may name %s; both files are kept)", vm.Name, src.DiskName, dstPath))
+		}
+		return mk.keep(status.Errorf(codes.Internal,
+			"update disk placement: %v. The persistent config may name %s while the disk row names %s; both files are kept. "+
+				"Retry `lv move-volume %s %s %s`; a start of the VM first points the disk row at the file the config names",
+			err, dstPath, src.Path, vm.Name, src.DiskName, targetPool))
+	}
+
 	if cs == cutoverAlreadyAtDst {
 		// Persistent already boots from dstPath — it is authoritative (and may hold
 		// newer writes than src). Do NOT re-copy; just commit the DB to catch up. On
 		// failure keep dstPath (the VM boots from it) so a later retry can complete.
+		var merr error
+		if mk, merr = s.beginMoveMarker(ctx, vm, src, dstPath, dstPool.Driver, targetPool, false, false, true); merr != nil {
+			return merr
+		}
 		if err := corrosion.UpdateDiskPlacement(ctx, s.db, vm.Name, src.DiskName, vm.HostName, dstPath, dstPool.Driver, targetPool); err != nil {
 			slog.Error("move: persistent domain already at the new path; DB catch-up commit failed — keeping the new file so the VM boots, operator must reconcile the disk row",
 				"vm", vm.Name, "disk", src.DiskName, "dest", dstPath, "error", err)
-			if errors.Is(err, corrosion.ErrNoRowsAffected) {
-				return status.Errorf(codes.Aborted, "disk %q/%q changed during move; aborted before completing", vm.Name, src.DiskName)
-			}
-			return status.Errorf(codes.Internal, "update disk placement: %v", err)
+			return unresolvedCommitErr(err)
 		}
 	} else {
 		// Forward path: copy src→dst, then (if libvirt) repoint the persistent config,
@@ -290,6 +333,13 @@ func (s *Server) moveOneVolume(
 			return status.Errorf(codes.Aborted, "the persistent domain config changed during the copy (cutover aborted, source preserved%s): %v", kept, rerr)
 		}
 		cs = cs2
+		var merr error
+		if mk, merr = s.beginMoveMarker(ctx, vm, src, dstPath, dstPool.Driver, targetPool, false, false, false); merr != nil {
+			if kept := s.keptCopyNote(vm, dstPath); kept != "" {
+				return status.Errorf(codes.Internal, "%v%s", merr, kept)
+			}
+			return merr
+		}
 		if cs == cutoverRedefined {
 			// The stopped VM must be redefined or it fails to start with "Cannot access
 			// storage file" once the old path is removed.
@@ -303,7 +353,7 @@ func (s *Server) moveOneVolume(
 				// A double fault: the define reported an error and the config could
 				// not be pointed back. The row must name the file the config names, so
 				// a later start, cold migration or backup reads the file the VM uses.
-				if err := s.offlineUnrolledDefine(ctx, vm, src, dstPath, derr); err != nil {
+				if err := s.offlineUnrolledDefine(ctx, vm, src, dstPath, targetPool, derr, mk); err != nil {
 					return err
 				}
 				defineErr = derr
@@ -313,14 +363,22 @@ func (s *Server) moveOneVolume(
 			// Roll the cutover back; only remove the copy if the persistent config no
 			// longer points at it. A clean rollback leaves DB recording the old pool, so
 			// a retry is a fresh move.
-			if s.rollbackCutover(cs, vm, src, dstPath) {
-				_ = os.Remove(dstPath)
+			if !s.rollbackCutover(cs, vm, src, dstPath) {
+				return unresolvedCommitErr(err)
 			}
+			_ = os.Remove(dstPath)
 			if errors.Is(err, corrosion.ErrNoRowsAffected) {
 				return status.Errorf(codes.Aborted, "disk %q/%q changed during move; aborted before completing", vm.Name, src.DiskName)
 			}
 			return status.Errorf(codes.Internal, "update disk placement: %v", err)
 		}
+	}
+	if defineErr != nil {
+		// Completed onto the copy the config names, through a define error.
+		detail := fmt.Sprintf("%s: the define of the new path reported an error (%v) and could not be undone; the persistent config names %s, so the move completed onto it",
+			src.DiskName, defineErr, dstPath)
+		slog.Warn("move: "+detail, "vm", vm.Name)
+		s.recordVMEventSeverity(ctx, vm.Name, "disk.moved", "ok", "warning", detail)
 	}
 	s.clearBackingIfFlattened(ctx, vm.Name, src.DiskName, dstPath)
 	s.syncStackComposeForMovedDisk(ctx, vm, src.DiskName, targetPool)
@@ -407,17 +465,20 @@ func (s *Server) planCutover(vm *corrosion.VMRecord, src *corrosion.DiskRecord, 
 // a restart loads — is what must be rewritten. It is idempotent: if the config
 // already points the disk at dstPath it defines nothing, so a retry after a partial
 // cutover heals cleanly. When there is no libvirt backend (tests) it is a no-op.
-func (s *Server) redefineMovedDiskSource(vm *corrosion.VMRecord, src *corrosion.DiskRecord, dstPath string) (cutoverState, error) {
+// defined reports whether a define was issued: false with an error means the
+// config was not touched (it could not be read or rewritten).
+func (s *Server) redefineMovedDiskSource(vm *corrosion.VMRecord, src *corrosion.DiskRecord, dstPath string) (cs cutoverState, defined bool, err error) {
 	cs, newXML, err := s.planCutover(vm, src, dstPath)
 	if err != nil {
-		return cs, err
+		return cs, false, err
 	}
 	if cs == cutoverRedefined {
 		if derr := s.virt.DefineDomain(newXML); derr != nil {
-			return cutoverNoVirt, fmt.Errorf("define domain: %w", derr)
+			return cutoverNoVirt, true, fmt.Errorf("define domain: %w", derr)
 		}
+		return cs, true, nil
 	}
-	return cs, nil
+	return cs, false, nil
 }
 
 // rollbackCutover undoes redefineMovedDiskSource after a failed move and reports
@@ -469,18 +530,16 @@ func (s *Server) keptCopyNote(vm *corrosion.VMRecord, path string) string {
 // cutover reported an error and the config could not be pointed back at the
 // source. It reads the config again. When the config names the copy, it
 // returns nil and the caller completes the move onto it (the copy is complete
-// and the VM is stopped, so the row follows the config), with a warning. When
-// the config names the source after all, the copy is kept and an error says so.
-// When the config cannot be read or names neither file, the row stays on the
-// source, both files are kept, and the error says the two may disagree.
-func (s *Server) offlineUnrolledDefine(ctx context.Context, vm *corrosion.VMRecord, src *corrosion.DiskRecord, dstPath string, derr error) error {
+// and the VM is stopped, so the row follows the config), with a warning once
+// the row is committed. When the config names the source after all, the copy
+// is kept and an error says so. When the config cannot be read or names
+// neither file, the row stays on the source, both files are kept, the
+// unresolved-move record stays (mk.keep), and the error says the two may
+// disagree.
+func (s *Server) offlineUnrolledDefine(ctx context.Context, vm *corrosion.VMRecord, src *corrosion.DiskRecord, dstPath, targetPool string, derr error, mk *moveMarker) error {
 	cs, _, perr := s.planCutover(vm, src, dstPath)
 	switch {
 	case perr == nil && cs == cutoverAlreadyAtDst:
-		detail := fmt.Sprintf("%s: the define of the new path reported an error (%v) and could not be undone; the persistent config names %s, so the move completes onto it",
-			src.DiskName, derr, dstPath)
-		slog.Warn("move: "+detail, "vm", vm.Name)
-		s.recordVMEventSeverity(ctx, vm.Name, "disk.moved", "ok", "warning", detail)
 		return nil
 	case perr == nil && cs == cutoverRedefined:
 		s.recordVMEvent(ctx, vm.Name, "disk.moved", "error",
@@ -492,11 +551,12 @@ func (s *Server) offlineUnrolledDefine(ctx context.Context, vm *corrosion.VMReco
 			"vm", vm.Name, "disk", src.DiskName, "src", src.Path, "dest", dstPath, "define_error", derr, "read_error", perr)
 		s.recordVMEvent(ctx, vm.Name, "disk.moved", "error",
 			fmt.Sprintf("%s: cutover aborted; the persistent config could not be read or names neither file; the disk row names %s and the copy %s is kept: %v", src.DiskName, src.Path, dstPath, derr))
-		return status.Errorf(codes.Internal,
+		return mk.keep(status.Errorf(codes.Internal,
 			"redefine inactive domain failed (%v) and could not be pointed back at %s, and the persistent config could not be read or names neither file (%v): "+
-				"the disk row names %s, but the config may name the copy %s; both files are kept. Do not start the VM until this is resolved. "+
-				"Operator: read the config (virsh dumpxml --inactive %s) and point the disk row at the file it names",
-			derr, src.Path, perr, src.Path, dstPath, vm.Name)
+				"the disk row names %s, but the config may name the copy %s; both files are kept. "+
+				"A start of the VM first points the disk row at the file the config names, and is refused while the config cannot be read. "+
+				"Operator: read the config (virsh dumpxml --inactive %s) and retry `lv move-volume %s %s %s` once it names the copy",
+			derr, src.Path, perr, src.Path, dstPath, vm.Name, vm.Name, src.DiskName, targetPool))
 	}
 }
 

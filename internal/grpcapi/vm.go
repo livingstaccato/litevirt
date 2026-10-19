@@ -1045,11 +1045,20 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return clusterFP, nil
 	}
 
+	macs := s.newMACAllocator()
+	for _, n := range spec.Network {
+		macs.reserve(n.Mac)
+	}
 	for i, n := range spec.Network {
 		bridge := network.FlatBridgeName(n.Name) // default: flat bridge named after the network
 		mac := n.Mac
 		if mac == "" {
-			mac = lv.GenerateMAC()
+			var merr error
+			if mac, merr = macs.next(ctx); merr != nil {
+				claims.releaseAll(ctx)
+				cleanupDisks()
+				return nil, merr
+			}
 			// Recorded in the spec so the NIC keeps its identity (its queue
 			// count) however many NICs are hot-plugged or detached later.
 			n.Mac = mac
@@ -1446,6 +1455,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	stubVM := &pb.VM{Name: spec.Name, HostName: s.hostName, State: pb.VMState_VM_STARTING}
 	hooks.Run(ctx, hooks.PreStart, stubVM, spec.Hooks)
 
+	// A new domain takes the name: a volume move recorded of an earlier VM
+	// by that name is not this one's.
+	s.forgetMoveRecords(ctx, spec.Name)
 	// Define and start in libvirt
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		claims.releaseAll(ctx)
@@ -2183,6 +2195,11 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 			return nil, status.Errorf(codes.Internal, "parse stored spec: %v", err)
 		}
 	}
+	if vm.State != "running" {
+		if err := s.refuseStartOnSharedMAC(ctx, vm.Name); err != nil {
+			return nil, err
+		}
+	}
 	lease, err := s.startGatesLocked(ctx, "StartVM", vm, int(spec.Cpu), int(spec.MemoryMib), req.AllowOvercommit)
 	if err != nil {
 		return nil, err
@@ -2537,6 +2554,15 @@ func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb
 // startInFlightError is returned; the caller must hold the VM lock until its
 // settled is closed (heldForStart), not let it go on return.
 func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord, wait time.Duration) (*pb.VM, error) {
+	// A volume move this host left unresolved points the disk row at the file
+	// the persistent config names before anything reads the rows, or refuses
+	// the start (move_unresolved.go).
+	if err := s.resolveUnresolvedMoves(ctx, vm.Name); err != nil {
+		return nil, err
+	}
+	if err := health.NoteStartingHere(ctx, s.db, s.dataDir, vm.Name); err != nil {
+		slog.Warn("recording this host's start of the VM failed", "vm", vm.Name, "error", err)
+	}
 	// A VM with a shared disk whose row names another host (a partial
 	// promotion's, review R4-I2) has its domain redefined from its rows first,
 	// which judges that host again: a disk it withheld is attached once the
@@ -3229,6 +3255,7 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		s.clearDeletedFirewallTags(ctx, corrosion.TagMemberVM, "", req.Name, fwID)
 		if dropSchedules {
 			s.deleteVMSchedules(context.WithoutCancel(ctx), req.Name)
+			s.retireVMCheckpoints(context.WithoutCancel(ctx), req.Name)
 		}
 	}
 	if err == nil && len(luns) > 0 && !s.lunPlainDeleteRecordable(ctx) &&
@@ -3283,9 +3310,14 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 // stored file names a member the caller holds no row of, and a tombstone of
 // an older incarnation says nothing of a newer one a peer may hold), and a
 // tombstone of another incarnation or of another stack's VM.
+//
+// A delete (not a peer-search probe) that finds a tombstone of the name,
+// from a caller who may delete that VM, also finishes a forget of its
+// unresolved-move records that an earlier delete did not reach
+// (forgetMovesOfDeletedVM), whatever it answers.
 func (s *Server) deleteOfNoLiveRow(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
 	notFound := status.Errorf(codes.NotFound, "VM %q not found", req.Name)
-	if req.GetExpectedStack() == "" || req.GetExpectedCreatedAt() == "" || deleteLocalOnly(ctx) {
+	if deleteLocalOnly(ctx) {
 		return nil, notFound
 	}
 	rows, err := s.db.Query(ctx,
@@ -3293,6 +3325,12 @@ func (s *Server) deleteOfNoLiveRow(ctx context.Context, req *pb.DeleteVMRequest)
 		        COALESCE(project, '_default') AS project
 		 FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, req.Name)
 	if err != nil || len(rows) == 0 {
+		return nil, notFound
+	}
+	if s.RequirePerm(ctx, vmRBACPathFor(rows[0].String("project"), req.Name), "vm.delete", "operator") == nil {
+		s.forgetMovesOfDeletedVM(ctx, req.Name)
+	}
+	if req.GetExpectedStack() == "" || req.GetExpectedCreatedAt() == "" {
 		return nil, notFound
 	}
 	row := rows[0]
@@ -3508,6 +3546,8 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 					return nil, status.Errorf(codes.Internal,
 						"VM %q: host %s deleted its domain, but its row here was not tombstoned; retry: %v", req.Name, h.Name, terr)
 				}
+				// The peer dropped its own records; this host's go too.
+				s.forgetMoveRecords(ctx, req.Name)
 				return &emptypb.Empty{}, nil
 			}
 			if len(ptrl.Get(deleteProbeRefusedMD)) > 0 || status.Code(peerErr) == codes.FailedPrecondition {
@@ -3640,6 +3680,9 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		s.reportDeletedVM(ctx, deleted)
 		s.retireNICGuards(ctx, req.Name)
 		s.clearDeviceLease(req.Name)
+		// The domain is gone everywhere: a volume move it left unresolved
+		// describes nothing.
+		s.forgetMoveRecords(ctx, req.Name)
 		// This path returns without reaching the main cleanup below, so the
 		// marker has to be dropped here too. A ghost row whose domain is already
 		// gone still leaves <dataDir>/vms/<name>/owner_epoch behind, and the next
@@ -3993,6 +4036,10 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// The row as this delete tombstoned it, for a re-create that follows
 	// (vm_recreate_replaces.go).
 	s.reportDeletedVM(ctx, deleted)
+	// The VM is gone: a volume move it left unresolved describes nothing.
+	// Only now: a delete that fails before its tombstone keeps the row, and
+	// with it the record and condition that guard its next start.
+	s.forgetMoveRecords(ctx, req.Name)
 	s.retireNICGuards(ctx, req.Name)
 	s.resyncDHCPHosts()
 
@@ -5044,6 +5091,10 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "rebuild: tombstone old records: %v", err)
 	}
+	// The old VM is gone: a volume move it left unresolved describes nothing.
+	// Only now: a rebuild that fails before its tombstone keeps the row, and
+	// with it the record and condition that guard its next start.
+	s.forgetMoveRecords(ctx, req.Name)
 	s.retireNICGuards(ctx, req.Name)
 	if hook := s.recreateTornDown; hook != nil {
 		hook(req.Name)

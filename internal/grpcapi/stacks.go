@@ -571,6 +571,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 			if err != nil {
 				return fmt.Errorf("security-group %q rule: %w", name, err)
 			}
+			_, need = logRow(r.Action, r.Log, need, nil)
 			for _, nf := range need {
 				needed[nf] = true
 			}
@@ -597,6 +598,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 			if err != nil {
 				return fmt.Errorf("cluster rule: %w", err)
 			}
+			_, need = logRow(r.Action, r.Log, need, nil)
 			for _, nf := range need {
 				needed[nf] = true
 			}
@@ -683,6 +685,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 			}
 			row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
 			need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, "")
+			row.Action, need = logRow(row.Action, r.Log, need, invalid)
 			if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
 				return corrosion.InsertSGRuleWithGrant(ctx, s.db, g.IPv6, g.Log, g.Tag, row)
 			}); err != nil {
@@ -712,6 +715,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 			}
 			row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
 			need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, row.Comment)
+			row.Action, need = logRow(row.Action, r.Log, need, invalid)
 			if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
 				return corrosion.InsertClusterFirewallRuleWithGrant(ctx, s.db, g.IPv6, g.Log, g.Tag, row)
 			}); err != nil {

@@ -459,6 +459,17 @@ func ListNetBoxLeases(ctx context.Context, c *Client) ([]LeaseRecord, error) {
 	return out, nil
 }
 
+// NetBoxAddressLeased reports whether any live lease in this replica names
+// NetBox address object id.
+func NetBoxAddressLeased(ctx context.Context, c *Client, id int) (bool, error) {
+	rows, err := c.Query(ctx,
+		`SELECT 1 AS ok FROM ip_allocations WHERE netbox_ip_id = ? AND deleted_at IS NULL LIMIT 1`, id)
+	if err != nil {
+		return false, fmt.Errorf("read leases naming netbox address %d: %w", id, err)
+	}
+	return len(rows) > 0, nil
+}
+
 // ObjectRef maps one litevirt object to its NetBox counterpart. It is what
 // makes the mirror idempotent: a retried create finds the existing NetBox id
 // here instead of POSTing a duplicate.

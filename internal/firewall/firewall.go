@@ -324,6 +324,13 @@ type Plan struct {
 	// LogPolicy is how the host logs: whether it can, to which NFLOG group,
 	// whether the default verdict is logged, and the per-NIC budget.
 	LogPolicy LogPolicy
+	// logRecheck is the loader's logging decision (LoaderOptions.Logging),
+	// asked again by Applier.Apply under its lock: a plan loaded while
+	// logging was on is applied without log lines once it is off (the
+	// listener lost the group, or the daemon is stopping), so a pass that
+	// loaded before the change cannot bring the lines back after the pass
+	// that removed them.
+	logRecheck func() (bool, uint16)
 
 	// InvalidRows are the stored rows the loader did not render as written
 	// because they fail the rule grammar (not rendered; reported as a

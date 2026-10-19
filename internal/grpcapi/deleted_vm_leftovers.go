@@ -220,7 +220,8 @@ const LeftoverDomainMD = "x-litevirt-leftover-domain"
 type LeftoverDomain struct {
 	Host string `json:"host"`
 	// Pending: the host had not answered within deletedVMCleanupReportWait;
-	// the delete keeps asking it after it returns.
+	// the request to it carries on after the delete returns, and is not sent
+	// again if it fails.
 	Pending bool   `json:"pending,omitempty"`
 	Detail  string `json:"detail"`
 }
@@ -235,7 +236,8 @@ var deletedVMCleanupReportWait = 5 * time.Second
 // deletedVMCleanupReportWait for the hosts the VM left, holding no lock, and
 // returns what the delete's caller is told: each host that declined within the
 // wait because a domain of the name is defined there, and each host the VM
-// left that had not answered (it is still asked after the delete returns).
+// left that had not answered (its request carries on after the delete
+// returns, once).
 // Without wait it returns at once. A peer call runs on a context detached
 // from the caller's (the receiving host authorises it as the system), and
 // never fails the delete: the VM is gone, and a host that is unreachable or
@@ -282,11 +284,16 @@ collect:
 	for _, host := range plan.hosts {
 		if plan.left[host] && !answered[host] {
 			out = append(out, LeftoverDomain{Host: host, Pending: true,
-				Detail: "it has not answered yet; the delete keeps asking it to remove the VM's leftovers"})
+				Detail: deletedVMLeftoverPendingDetail})
 		}
 	}
 	return out
 }
+
+// deletedVMLeftoverPendingDetail is what `lv rm` says of a host that had not
+// answered within deletedVMCleanupReportWait.
+const deletedVMLeftoverPendingDetail = "it has not answered yet; the delete's one request to remove the VM's leftovers there carries on " +
+	"after the delete returns, but it is not sent again if it fails, so what the VM left on that host may stay there"
 
 // leftoverSink carries a delete's plan out of deleteVM, which holds the
 // VM's lock and start lease, to DeleteVM, which waits for the hosts once

@@ -703,6 +703,19 @@ func (s *Server) sourceStateHashes(m fwmig.Marker) (permall, nvram string, err e
 	return permall, nvram, nil
 }
 
+// sourceStateSinceCutover says, by the marker's hashes, whether m's source
+// state is what the cutover recorded: for an operator's record.
+func (s *Server) sourceStateSinceCutover(m fwmig.Marker) string {
+	permall, nvram, err := s.sourceStateHashes(m)
+	switch {
+	case err != nil:
+		return "whose hashes cannot be read now (" + err.Error() + ")"
+	case permall != m.SrcPermallSHA256 || nvram != m.SrcNvramSHA256:
+		return "changed after the cutover"
+	}
+	return "as the cutover left it"
+}
+
 // requireSourceStateRecorded refuses unless the source's state is what the
 // cutover recorded.
 func (s *Server) requireSourceStateRecorded(m fwmig.Marker, action pb.FirmwareMoveDoctorAction) error {
@@ -824,7 +837,7 @@ func (s *Server) doctorAcceptTarget(ctx context.Context, m fwmig.Marker) (string
 			return "", err
 		}
 		dir, err := s.quarantineFirmwareMoveSource(ctx, m,
-			"an operator took the target's copy (lv doctor firmware-move --accept-target); the source's state, changed after the cutover, is kept here")
+			"an operator took the target's copy (lv doctor firmware-move --accept-target); the source's state, "+s.sourceStateSinceCutover(m)+", is kept here")
 		if err != nil {
 			return "", err
 		}

@@ -492,11 +492,11 @@ func (s *Server) releaseDeadMoveLease(ctx context.Context, m fwmig.Marker) {
 		err = s.releaseRemoteHostLease(rctx, m.CapacityLeaseHolder, m.CapacityLease)
 	}
 	if err != nil && status.Code(err) != codes.NotFound {
-		slog.Warn("live firmware move recovery: the admission lease of a move whose process died was not released; the next pass tries again, and the stale-lease sweep collects it",
+		slog.Warn("live firmware move recovery: the admission lease still named in the marker (its move's process died, or its release failed) was not released; the next pass tries again, and the stale-lease sweep collects it",
 			"vm", m.VM, "attempt", m.Attempt, "lease", m.CapacityLease, "holder", m.CapacityLeaseHolder, "error", err)
 		return
 	}
-	slog.Info("live firmware move recovery: released the admission lease of a move whose process died",
+	slog.Info("live firmware move recovery: released the admission lease still named in the marker (its move's process died, or its release failed)",
 		"vm", m.VM, "attempt", m.Attempt, "lease", m.CapacityLease, "holder", m.CapacityLeaseHolder)
 	s.clearMarkerLease(m.VM, m.Attempt)
 }

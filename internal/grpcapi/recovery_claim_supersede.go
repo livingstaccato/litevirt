@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -284,7 +285,11 @@ func (s *Server) strandedOn(ctx context.Context, host string) ([]*pb.StrandedRec
 		// Failover never recovers a Secure Boot / vTPM VM: its firmware state
 		// was host-local and died with the host (failover.recoverWorkloads).
 		if corrosion.VMUsesFirmwareState(*full) {
-			out = append(out, &pb.StrandedRecovery{Kind: "vm", Name: full.Name, Detail: firmwareOnDeadHostDetail(full.Name, host)})
+			detail := firmwareOnDeadHostDetail(full.Name, host)
+			if src, code := s.firmwareMoveSourceCopy(ctx, full.Name, host); src != "" {
+				detail = firmwareSourceCopyDetail(full.Name, host, src, code)
+			}
+			out = append(out, &pb.StrandedRecovery{Kind: "vm", Name: full.Name, Detail: detail})
 			continue
 		}
 		out = append(out, s.strandedFor(ctx, "vm", full.Name, host, full.PendingActionID))
@@ -332,6 +337,47 @@ func stoppedOnDeadHostDetail(kind, name, host string) string {
 		"onto a live host (`lv replication promote %s`). If the data is lost for good, remove it with `lv rm %s` "+
 		"and create it again",
 		name, host, host, host, name, name)
+}
+
+// fwmigSourceCopyCodes are the firmware_migration conditions a move's
+// source raises while it keeps its own firmware state of the move.
+var fwmigSourceCopyCodes = []string{condFwmigCleanupFailed, condFwmigTargetUnreachable, condFwmigTargetRan,
+	condFwmigSourcePaused, condFwmigNvramUnconfirmed}
+
+// firmwareMoveSourceCopy is the host that raised an open firmware_migration
+// condition of vm for a live move whose target is host, while it keeps its
+// own firmware state of the move, and that condition's code; "" when there
+// is none (or the conditions cannot be read).
+func (s *Server) firmwareMoveSourceCopy(ctx context.Context, vm, host string) (source, code string) {
+	for _, c := range fwmigSourceCopyCodes {
+		row, found, err := corrosion.GetHealthCondition(ctx, s.db, firmwareMigrationEvaluator, c, "vm", vm)
+		if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved {
+			continue
+		}
+		var ev struct {
+			Source string `json:"source"`
+			Target string `json:"target"`
+			Host   string `json:"host"`
+		}
+		if json.Unmarshal([]byte(row.Evidence), &ev) != nil {
+			continue
+		}
+		if ev.Target == host && ev.Source != "" && ev.Source != host && ev.Host == ev.Source {
+			return ev.Source, c
+		}
+	}
+	return "", ""
+}
+
+// firmwareSourceCopyDetail is firmwareOnDeadHostDetail for a VM whose live
+// firmware move to host left its source's firmware state on source.
+func firmwareSourceCopyDetail(name, host, source, code string) string {
+	return fmt.Sprintf("vm/%s uses Secure Boot / vTPM: failover never recovers it. Its live firmware move from %s to %s "+
+		"is still open (%s on %s), and %s kept its own firmware state of the move: once this removal is done, "+
+		"`lv doctor firmware-move %s --accept-source --acknowledge-rollback` returns the VM to %s, stopped, from that "+
+		"state (it refuses when that state changed since the cutover or the cleanup already undefined its domain); "+
+		"then `lv start %s`. `lv doctor firmware-move %s` shows both hosts' records first",
+		name, source, host, code, source, source, name, source, name, name)
 }
 
 // firmwareOnDeadHostDetail is what `lv host rm --dead` says about a Secure

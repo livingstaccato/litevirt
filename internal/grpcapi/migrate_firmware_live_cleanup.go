@@ -354,7 +354,7 @@ func cleanupTargetHoldAction(m fwmig.Marker, cause error) string {
 	case holdTargetProvedOff:
 		return head + "`lv doctor firmware-move <vm> --accept-source --acknowledge-rollback` returns the VM here; " + accept + ". " + resume
 	case holdTargetPlanned:
-		return head + "This is a planned state: " + strings.ToLower(resume[:1]) + resume[1:] + "; " + accept + " ends the hold now"
+		return head + "This is a planned state: " + strings.ToLower(resume[:1]) + resume[1:] + ". To end the hold now, " + accept
 	case holdTargetRemoved:
 		return head + "A removed target is not expected back, so " + accept + " is the exit. " + source
 	case holdMovedOn:

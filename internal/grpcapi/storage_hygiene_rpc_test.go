@@ -735,3 +735,52 @@ func TestForwardOnce_ALocalRootMarkerIsIgnored(t *testing.T) {
 		t.Fatalf("a local-root caller's marker was honoured: %v", err)
 	}
 }
+
+// I2. Removing an attached set-aside overlay asks every domain libvirt has
+// defined on this host, as the detached path does: a stray domain with no VM
+// row that names the orphan, or whose disk backs on it through its qcow2
+// header chain, keeps it, and a domain list that cannot be read refuses.
+//
+// Mutations, each red: "only the owner's domain asked" (setAsideOverlayInUse
+// calls domainNamesFile(vm.Name, ...) alone); "no header walk"; "an
+// unreadable domain list is no domain".
+func TestSetAsideOverlays_AttachedRemoveAsksEveryDefinedDomain(t *testing.T) {
+	s, _, older := setAsideServer(t)
+	ctx := adminCtx()
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("inspect-by-hand", libvirtfake.StateDefined) // no VM row
+	snap := &fakePITSnapshotter{onOverlay: map[string]bool{older: true}}
+	s.SetPointInTimeSnapshotter(snap)
+	if err := rmOverlay(s, ctx, older); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("remove while a stray domain names it = %v, want FailedPrecondition", err)
+	}
+	if !hygieneFileThere(older) {
+		t.Fatal("the orphan a stray domain names was removed")
+	}
+
+	snap.onOverlay = map[string]bool{}
+	inspect := filepath.Join(t.TempDir(), "inspect.qcow2")
+	if err := qcow2.CreateWithBackingFormat(inspect, older, "qcow2", 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetDiskSource("inspect-by-hand", "vda", inspect)
+	if err := rmOverlay(s, ctx, older); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("remove while a stray domain's disk backs on it = %v, want FailedPrecondition", err)
+	}
+	if !hygieneFileThere(older) {
+		t.Fatal("the orphan a stray domain's disk backs on was removed")
+	}
+
+	fake.SetDiskSource("inspect-by-hand", "vda", filepath.Join(t.TempDir(), "absent.qcow2"))
+	fake.FailListDomains = func() error { return errors.New("libvirt: connection dropped") }
+	if err := rmOverlay(s, ctx, older); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("remove while the domain list cannot be read = %v, want FailedPrecondition", err)
+	}
+	fake.FailListDomains = nil
+	if err := rmOverlay(s, ctx, older); err != nil {
+		t.Fatalf("remove once no domain names it: %v", err)
+	}
+	if hygieneFileThere(older) {
+		t.Error("not removed")
+	}
+}

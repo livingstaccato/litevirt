@@ -497,10 +497,10 @@ func (r *LxcRunner) FetchImage(ctx context.Context, opts CreateOpts) error {
 	if opts.Template == "download" {
 		args = append(args, "--", "-d", opts.Distro, "-r", opts.Release, "-a", opts.Arch)
 	}
-	cmd := exec.CommandContext(ctx, "lxc-create", args...)
+	cmd := dieWithDaemon(exec.CommandContext(ctx, "lxc-create", args...))
 	var stderr strings.Builder
 	cmd.Stderr = stringWriter{&stderr}
-	if _, err := cmd.Output(); err != nil {
+	if err := runPinned(func() error { _, e := cmd.Output(); return e }); err != nil {
 		_ = os.RemoveAll(stage)
 		return cmdErr("lxc-create (fetch image)", opts.Name, []byte(stderr.String()), err)
 	}
@@ -584,7 +584,25 @@ func repointFetched(f, from, to string) error {
 // SweepFetchDir removes, at daemon start, every container FetchImage left
 // staged (a recreate refused after its fetch, or a crash).
 func (r *LxcRunner) SweepFetchDir() error {
-	return os.RemoveAll(filepath.Join(r.lxcpath(), fetchDirName))
+	return sweepStage(filepath.Join(r.lxcpath(), fetchDirName))
+}
+
+// sweepStage removes a staging directory at start, after stopping any
+// process still working in it (stopWorkersIn), retrying briefly while one
+// that was stopping releases it.
+func sweepStage(dir string) error {
+	if _, err := os.Lstat(dir); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	stopWorkersIn(dir)
+	var err error
+	for i := 0; i < 10; i++ {
+		if err = os.RemoveAll(dir); err == nil {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return err
 }
 
 // createFromRootfs materialises a container around an already-extracted rootfs

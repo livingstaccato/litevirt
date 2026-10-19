@@ -126,15 +126,15 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 		args = append(args, "--src-creds", opts.Username+":"+opts.Password)
 	}
 	args = append(args, srcRef, dstRef)
-	if out, err := exec.CommandContext(ctx, "skopeo", args...).CombinedOutput(); err != nil {
+	if out, err := combinedOutputPinned(dieWithDaemon(exec.CommandContext(ctx, "skopeo", args...))); err != nil {
 		return fmt.Errorf("skopeo copy: %w: %s", err, out)
 	}
 
 	// Stage 2: umoci unpack flattens the layers into a usable rootfs.
-	if out, err := exec.CommandContext(ctx,
+	if out, err := combinedOutputPinned(dieWithDaemon(exec.CommandContext(ctx,
 		"umoci", "unpack", "--rootless", "--image", fmt.Sprintf("%s:%s", tmpLayout, tag),
 		bundle,
-	).CombinedOutput(); err != nil {
+	))); err != nil {
 		return fmt.Errorf("umoci unpack: %w: %s", err, out)
 	}
 	if err := writeImageGen(bundle); err != nil {
@@ -144,6 +144,16 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 		return replaceBundle(bundle, opts.Dest)
 	}
 	return nil
+}
+
+// combinedOutputPinned is cmd.CombinedOutput on a pinned thread (runPinned).
+func combinedOutputPinned(cmd *exec.Cmd) (out []byte, err error) {
+	err = runPinned(func() error {
+		var e error
+		out, e = cmd.CombinedOutput()
+		return e
+	})
+	return out, err
 }
 
 // parseOCITag extracts the ":<tag>" portion of an image reference, or

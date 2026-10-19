@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -130,7 +131,11 @@ func replaceBundle(stage, dest string) error {
 // replacing pull in the OCI library lib (its unpackDirName), item by item
 // (recoverStaged). Nothing outside unpackDirName is touched.
 func RecoverOCILibrary(lib string) error {
-	return recoverStaged(filepath.Join(lib, unpackDirName), lib, "")
+	dir := filepath.Join(lib, unpackDirName)
+	if _, err := os.Lstat(dir); err == nil {
+		stopWorkersIn(dir) // at start: whatever works there was the dead daemon's
+	}
+	return recoverStaged(dir, lib, "")
 }
 
 // recoverItem finishes, under dest's item lock, what a crash left of an
@@ -171,11 +176,24 @@ func recoverStaged(dir, parent, item string) error {
 				continue
 			}
 		}
-		if rerr := os.RemoveAll(p); rerr != nil {
+		if rerr := removeStaged(p); rerr != nil {
 			errs = append(errs, rerr)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// removeStaged removes a staging entry, retrying briefly while a process
+// being stopped releases it.
+func removeStaged(p string) error {
+	var err error
+	for i := 0; i < 10; i++ {
+		if err = os.RemoveAll(p); err == nil {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return err
 }
 
 // stagedItem is the item a staging entry belongs to: its name with the

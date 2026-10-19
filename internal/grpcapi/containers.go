@@ -1012,8 +1012,18 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 		return nil, err
 	}
 	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password, replace, s.checkPullSource); err != nil {
-		if errors.Is(err, lxc.ErrOCIItemExists) {
+		switch {
+		case errors.Is(err, lxc.ErrOCIItemExists):
 			return nil, ociItemExistsErr(req.Dest, s.hostName)
+		case errors.Is(err, lxc.ErrSourceRefused):
+			return nil, status.Errorf(codes.InvalidArgument, "pull oci: %v", err)
+		case errors.Is(err, lxc.ErrStagingSpace):
+			return nil, status.Errorf(codes.ResourceExhausted, "pull oci: %v", err)
+		}
+		// The source check, run by the runtime on the object it opened,
+		// answers with its own code.
+		if st, ok := status.FromError(err); ok && st.Code() != codes.Unknown && st.Code() != codes.OK {
+			return nil, st.Err()
 		}
 		return nil, status.Errorf(codes.Internal, "pull oci: %v", err)
 	}

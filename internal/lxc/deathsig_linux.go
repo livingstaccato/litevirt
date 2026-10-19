@@ -4,6 +4,7 @@ package lxc
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -63,7 +64,10 @@ func stopWorkersIn(dir string) {
 	var fds []int
 	for _, e := range ents {
 		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid == self || !worksIn(pid, dir, objs, selfNS) {
+		if err != nil || pid == self {
+			continue
+		}
+		if hit, _ := worksIn(pid, dir, objs, selfNS); !hit {
 			continue
 		}
 		pfd, err := unix.PidfdOpen(pid, 0)
@@ -72,10 +76,14 @@ func stopWorkersIn(dir string) {
 		}
 		// The pidfd pins this process: if the PID was reused before it was
 		// opened, the links read again now are the new process's.
-		if !worksIn(pid, dir, objs, selfNS) || unix.PidfdSendSignal(pfd, unix.SIGKILL, nil, 0) != nil {
+		hit, why := worksIn(pid, dir, objs, selfNS)
+		comm, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/comm")
+		if !hit || unix.PidfdSendSignal(pfd, unix.SIGKILL, nil, 0) != nil {
 			_ = unix.Close(pfd)
 			continue
 		}
+		slog.Info("container staging: stopped a process still working in a stage",
+			"pid", pid, "comm", strings.TrimSpace(string(comm)), "stage", dir, "why", why)
 		fds = append(fds, pfd)
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -95,7 +103,7 @@ func stopWorkersIn(dir string) {
 
 // worksIn reports whether process pid has its cwd, root or an open file
 // inside dir (see stopWorkersIn for what counts).
-func worksIn(pid int, dir string, objs map[devIno]bool, selfNS string) bool {
+func worksIn(pid int, dir string, objs map[devIno]bool, selfNS string) (bool, string) {
 	base := filepath.Join("/proc", strconv.Itoa(pid))
 	under := func(p string) bool { return p == dir || strings.HasPrefix(p, dir+"/") }
 	links := []string{filepath.Join(base, "cwd"), filepath.Join(base, "root")}
@@ -115,14 +123,18 @@ func worksIn(pid int, dir string, objs map[devIno]bool, selfNS string) bool {
 			v := ns != "" && ns == selfNS
 			sameNS = &v
 		}
+		what := filepath.Base(l)
+		if filepath.Base(filepath.Dir(l)) == "fd" {
+			what = "an open file"
+		}
 		if *sameNS {
-			return true
+			return true, what + " in the stage (" + t + "), in the daemon's mount namespace"
 		}
 		if st, err := os.Stat(l); err == nil && objs[devInoOf(st)] {
-			return true
+			return true, what + " is the stage's own object (" + t + "), in another mount namespace"
 		}
 	}
-	return false
+	return false, ""
 }
 
 type devIno struct{ dev, ino uint64 }

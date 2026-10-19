@@ -128,6 +128,7 @@ type fakeCTRuntime struct {
 	pullReplace []bool
 	rootfsRefs  map[string][]string
 	pullCheck   func(transport, path string) error
+	pullErr     error
 }
 
 func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerOpts) (*ContainerInfo, error) {
@@ -427,7 +428,7 @@ func (f *fakeCTRuntime) PullOCIImage(_ context.Context, image, dest, tag, userna
 	f.pullCheck = check
 	f.pullCalls = append(f.pullCalls, struct{ Image, Dest, Tag, Username, Password string }{image, dest, tag, username, password})
 	f.pullReplace = append(f.pullReplace, replace)
-	return nil
+	return f.pullErr
 }
 
 // RootfsReferences reports rootfsRefs[dir].

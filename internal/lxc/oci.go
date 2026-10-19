@@ -62,7 +62,7 @@ type PullOCIOptions struct {
 // the existing bundle as it was. The caller decides who may replace an item
 // and that no container references it (RootfsReferences). The item's lock
 // (LockOCIItem) is held throughout, so no create copies it half replaced.
-func PullOCI(ctx context.Context, opts PullOCIOptions) error {
+func PullOCI(ctx context.Context, opts PullOCIOptions) (err error) {
 	if opts.Image == "" {
 		return errors.New("oci: image required")
 	}
@@ -98,7 +98,7 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	// "+" is the separator of the staging names (unpackDirName): no item
 	// may carry one, whatever path names it.
 	if strings.Contains(filepath.Base(opts.Dest), "+") {
-		return fmt.Errorf("oci: dest %q: an item name may not contain '+'", opts.Dest)
+		return refused("oci: dest %q: an item name may not contain '+'", opts.Dest)
 	}
 	unlock := LockOCIItem(opts.Dest)
 	defer unlock()
@@ -107,6 +107,21 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 		return err
 	}
 	defer release()
+	// A pull that fails leaves no trace of an item it was the first to make:
+	// the directory it created, while still empty, and then (still holding
+	// it) the item's lock file. Run before the lock is released.
+	created := false
+	defer func() {
+		if err == nil {
+			return
+		}
+		if created {
+			_ = os.Remove(opts.Dest) // only an empty directory goes
+		}
+		if _, serr := os.Lstat(opts.Dest); errors.Is(serr, os.ErrNotExist) {
+			_ = os.Remove(filepath.Join(filepath.Dir(opts.Dest), unpackDirName, filepath.Base(opts.Dest)+lockSuffix))
+		}
+	}()
 	if err := recoverItem(opts.Dest); err != nil {
 		return fmt.Errorf("oci: finish an interrupted pull of %s first: %w", opts.Dest, err)
 	}
@@ -116,6 +131,9 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	}
 	if exists && !opts.Replace {
 		return fmt.Errorf("%w: %s", ErrOCIItemExists, opts.Dest)
+	}
+	if _, serr := os.Lstat(opts.Dest); errors.Is(serr, os.ErrNotExist) {
+		created = true
 	}
 	if err := os.MkdirAll(opts.Dest, 0750); err != nil {
 		return fmt.Errorf("mkdir dest: %w", err)
@@ -395,7 +413,7 @@ func ParseOCISource(ref string) (OCISource, error) {
 		return OCISource{}, errors.New("oci: image required")
 	}
 	if strings.HasPrefix(ref, "-") {
-		return OCISource{}, fmt.Errorf("oci: image %q: want %s", ref, errOCISourceForms)
+		return OCISource{}, refused("oci: image %q: want %s", ref, errOCISourceForms)
 	}
 	name, rest, ok := strings.Cut(ref, ":")
 	switch {
@@ -403,7 +421,7 @@ func ParseOCISource(ref string) (OCISource, error) {
 		return OCISource{Transport: "docker", Ref: "docker://" + ref}, nil
 	case name == "docker" && strings.HasPrefix(rest, "//"):
 		if len(rest) == 2 {
-			return OCISource{}, fmt.Errorf("oci: image %q: want %s", ref, errOCISourceForms)
+			return OCISource{}, refused("oci: image %q: want %s", ref, errOCISourceForms)
 		}
 		return OCISource{Transport: "docker", Ref: ref}, nil
 	case localTransports[name]:
@@ -412,7 +430,7 @@ func ParseOCISource(ref string) (OCISource, error) {
 			p, reference, _ = strings.Cut(rest, ":")
 		}
 		if !strings.HasPrefix(p, "/") {
-			return OCISource{}, fmt.Errorf("oci: image %q: a local source needs an absolute path; want %s", ref, errOCISourceForms)
+			return OCISource{}, refused("oci: image %q: a local source needs an absolute path; want %s", ref, errOCISourceForms)
 		}
 		p = filepath.Clean(p)
 		out := name + ":" + p
@@ -421,7 +439,7 @@ func ParseOCISource(ref string) (OCISource, error) {
 		}
 		return OCISource{Transport: name, Path: p, Reference: reference, Local: true, Ref: out}, nil
 	case refusedTransports[name]:
-		return OCISource{}, fmt.Errorf("oci: image %q: transport %q is not one a pull reads; want %s", ref, name, errOCISourceForms)
+		return OCISource{}, refused("oci: image %q: transport %q is not one a pull reads; want %s", ref, name, errOCISourceForms)
 	default:
 		// "name:tag", "registry:5000/name": a registry image.
 		return OCISource{Transport: "docker", Ref: "docker://" + ref}, nil
@@ -440,26 +458,26 @@ func openLocalSource(src OCISource, check func(transport, path string) error) (*
 	if err != nil {
 		switch {
 		case errors.Is(err, syscall.ELOOP):
-			return nil, fmt.Errorf("oci: %s source %q is a symbolic link; name what it points to", src.Transport, src.Path)
+			return nil, refused("oci: %s source %q is a symbolic link; name what it points to", src.Transport, src.Path)
 		case errors.Is(err, syscall.ENOTDIR):
-			return nil, fmt.Errorf("oci: %s source %q is not a directory", src.Transport, src.Path)
+			return nil, refused("oci: %s source %q is not a directory", src.Transport, src.Path)
 		}
-		return nil, fmt.Errorf("oci: %s source: %w", src.Transport, err)
+		return nil, refused("oci: %s source: %w", src.Transport, err)
 	}
 	defer ref.Close()
 	fi, err := ref.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("oci: %s source: %w", src.Transport, err)
+		return nil, refused("oci: %s source: %w", src.Transport, err)
 	}
 	switch {
 	case wantDir && !fi.IsDir():
-		return nil, fmt.Errorf("oci: %s source %q is not a directory", src.Transport, src.Path)
+		return nil, refused("oci: %s source %q is not a directory", src.Transport, src.Path)
 	case !wantDir && !fi.Mode().IsRegular():
-		return nil, fmt.Errorf("oci: %s source %q is not a regular file", src.Transport, src.Path)
+		return nil, refused("oci: %s source %q is not a regular file", src.Transport, src.Path)
 	}
 	judged, err := openedFilePath(ref)
 	if err != nil {
-		return nil, fmt.Errorf("oci: %s source: %w", src.Transport, err)
+		return nil, refused("oci: %s source: %w", src.Transport, err)
 	}
 	if check != nil {
 		if err := check(src.Transport, judged); err != nil {
@@ -468,7 +486,7 @@ func openLocalSource(src OCISource, check func(transport, path string) error) (*
 	}
 	f, err := reopenRead(ref, wantDir)
 	if err != nil {
-		return nil, fmt.Errorf("oci: %s source: %w", src.Transport, err)
+		return nil, refused("oci: %s source: %w", src.Transport, err)
 	}
 	return f, nil
 }
@@ -525,7 +543,7 @@ func checkStagingSpace(dir string, size uint64, what string) error {
 		return fmt.Errorf("oci: cannot tell the free space for the %s copy in %s: %w", what, dir, err)
 	}
 	if reserve := spareReserve(total); size+reserve > avail {
-		return fmt.Errorf("oci: the %s source needs %d bytes copied into %s, and %d bytes are free there; "+
+		return spaceRefused("oci: the %s source needs %d bytes copied into %s, and %d bytes are free there; "+
 			"%d must stay free on the filesystem holding %s, so it was not pulled", what, size, dir, avail, reserve, holder)
 	}
 	return nil

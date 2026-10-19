@@ -598,6 +598,7 @@ func sweepStage(dir string) error {
 	var err error
 	for i := 0; i < 10; i++ {
 		if err = os.RemoveAll(dir); err == nil {
+			slog.Info("container staging: removed what an earlier run left staged", "path", dir)
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)

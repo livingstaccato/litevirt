@@ -90,7 +90,8 @@ func lockItemFile(ctx context.Context, dest string) (func(), error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("lock %s: %w", dest, err)
 	}
-	f, err := os.OpenFile(filepath.Join(dir, filepath.Base(dest)+lockSuffix), os.O_CREATE|os.O_RDWR, 0o600)
+	path := filepath.Join(dir, filepath.Base(dest)+lockSuffix)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("lock %s: %w", dest, err)
 	}
@@ -100,8 +101,18 @@ func lockItemFile(ctx context.Context, dest string) (func(), error) {
 			_ = f.Close()
 			return nil, fmt.Errorf("lock %s: %w", dest, err)
 		}
-		if ok {
+		if ok && lockIsAtPath(f, path) {
 			return func() { _ = f.Close() }, nil
+		}
+		if ok {
+			// The file was removed (an item's lock is cleaned up once the
+			// item is gone) while this waited on it: lock the file now at
+			// the path instead.
+			_ = f.Close()
+			if f, err = os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600); err != nil {
+				return nil, fmt.Errorf("lock %s: %w", dest, err)
+			}
+			continue
 		}
 		select {
 		case <-ctx.Done():
@@ -119,11 +130,72 @@ func tryLockItem(dir, item string) (release func(), ok bool) {
 	if err != nil {
 		return nil, false
 	}
-	if got, err := flockTry(f); err != nil || !got {
+	if got, err := flockTry(f); err != nil || !got || !lockIsAtPath(f, filepath.Join(dir, item+lockSuffix)) {
 		_ = f.Close()
 		return nil, false
 	}
 	return func() { _ = f.Close() }, true
+}
+
+// lockIsAtPath reports whether the locked file f is still the file at path:
+// a lock on a file removed from it locks nothing.
+func lockIsAtPath(f *os.File, path string) bool {
+	held, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	now, err := os.Stat(path)
+	return err == nil && os.SameFile(held, now)
+}
+
+// removeItemLock unlinks item's lock file in the staging directory dir when
+// the item does not exist at parent and nobody holds its lock: it is taken
+// without waiting, and the file is unlinked only while held.
+func removeItemLock(dir, parent, item string) {
+	if _, err := os.Lstat(filepath.Join(parent, item)); !errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	release, ok := tryLockItem(dir, item)
+	if !ok {
+		return
+	}
+	defer release()
+	if err := os.Remove(filepath.Join(dir, item+lockSuffix)); err == nil {
+		slog.Info("oci library: removed the lock of an item that no longer exists", "item", item)
+	}
+}
+
+// ErrSourceRefused is a pull source refused as named (a transport, path or
+// kind it may not read), and ErrStagingSpace a pull refused for the space it
+// would leave free: errors.Is tells the caller a refusal from a failure.
+var (
+	ErrSourceRefused = errors.New("oci: source refused")
+	ErrStagingSpace  = errors.New("oci: not enough space")
+)
+
+// refusal is a refusal's message, which unwraps to its kind.
+type refusal struct {
+	msg  string
+	kind error
+	err  error
+}
+
+func (r *refusal) Error() string { return r.msg }
+func (r *refusal) Unwrap() []error {
+	if r.err == nil {
+		return []error{r.kind}
+	}
+	return []error{r.kind, r.err}
+}
+
+func refused(format string, args ...any) error {
+	e := fmt.Errorf(format, args...)
+	return &refusal{msg: e.Error(), kind: ErrSourceRefused, err: errors.Unwrap(e)}
+}
+
+func spaceRefused(format string, args ...any) error {
+	e := fmt.Errorf(format, args...)
+	return &refusal{msg: e.Error(), kind: ErrStagingSpace, err: errors.Unwrap(e)}
 }
 
 // lockSuffix names an item's lock file in the staging directory; recovery
@@ -218,7 +290,26 @@ func RecoverOCILibrary(lib string) error {
 		}
 		release()
 	}
+	// The lock of an item that no longer exists, and that nobody holds now.
+	if ents, err := os.ReadDir(dir); err == nil {
+		for _, e := range ents {
+			if item, ok := strings.CutSuffix(e.Name(), lockSuffix); ok && safeItemName(item) && !hasStaged(ents, item) {
+				removeItemLock(dir, lib, item)
+			}
+		}
+	}
 	return errors.Join(errs...)
+}
+
+// hasStaged reports whether ents (a staging directory) still hold an entry
+// of item.
+func hasStaged(ents []os.DirEntry, item string) bool {
+	for _, e := range ents {
+		if !strings.HasSuffix(e.Name(), lockSuffix) && stagedItem(e.Name()) == item {
+			return true
+		}
+	}
+	return false
 }
 
 // recoverItem finishes, under dest's item lock, what a crash left of an
@@ -264,6 +355,8 @@ func recoverStaged(dir, parent, item string) error {
 		}
 		if rerr := removeStaged(p); rerr != nil {
 			errs = append(errs, rerr)
+		} else {
+			slog.Info("oci library: removed what an interrupted pull left", "path", p)
 		}
 	}
 	return errors.Join(errs...)

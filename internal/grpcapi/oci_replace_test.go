@@ -2,6 +2,8 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -421,5 +423,46 @@ func TestPullOCI_AnyVMDiskIsNoArchiveSource(t *testing.T) {
 	}
 	if len(rt.pullCalls) != 0 {
 		t.Fatalf("a VM disk reached the runtime: %+v", rt.pullCalls)
+	}
+}
+
+// The runtime's refusals of a source answer as refusals, like the same
+// refusal made by the handler: a refused source is InvalidArgument, too
+// little space is ResourceExhausted; anything else stays Internal.
+func TestPullOCI_RuntimeRefusalsKeepTheirCode(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want codes.Code
+	}{
+		{fmt.Errorf("%w: x is not a regular file", lxc.ErrSourceRefused), codes.InvalidArgument},
+		{fmt.Errorf("%w: needs 9 bytes", lxc.ErrStagingSpace), codes.ResourceExhausted},
+		{status.Error(codes.InvalidArgument, "docker-archive source: refused by the check"), codes.InvalidArgument},
+		{errors.New("umoci unpack: exit status 1"), codes.Internal},
+	} {
+		s, rt := ctPathServer(t)
+		rt.pullErr = tc.err
+		_, err := s.PullOCIImage(adminCtx(), &pb.PullOCIImageRequest{Image: "ghcr.io/x/y:1", Dest: "img"})
+		if status.Code(err) != tc.want {
+			t.Errorf("runtime error %v: %v, want %v", tc.err, err, tc.want)
+		}
+	}
+}
+
+// A container recreate whose delete fails says the member was not
+// recreated, how to tell whether it is still there, and how to retry.
+func TestComposeRecreate_AFailedDeleteSaysTheMemberWasKept(t *testing.T) {
+	s, rt := secServer(t)
+	seedMember(t, s, rt, "3.22")
+	rt.deleteErr = errors.New("transport is closing")
+	f := &compose.File{Name: "st", VMs: map[string]compose.VMDef{"web": {Kind: compose.WorkloadKindLXC, Image: "alpine:3.22", CPU: 4}}}
+	upd := planner.VMAction{Kind: planner.OpUpdate, VMName: "web", TargetHost: "host-a", IsContainer: true}
+	err := recreateMember(adminCtx(), s, upd, f)
+	if err == nil {
+		t.Fatal("a failed delete reported success")
+	}
+	for _, want := range []string{"not recreated", "lv ct inspect web", "lv compose up"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error %q does not say %q", err, want)
+		}
 	}
 }

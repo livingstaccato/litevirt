@@ -84,20 +84,21 @@ peer, so what a stack declares of its firewall is also recorded apart from
 the file: a deploy by a caller with `sg.write` at `/` writes
 `stack_firewall/<name>` in `cluster_policies` (whether the file declares a
 firewall, and whether it asks for the default-deny) before any row changes
-and again once the stack's record is written. A deploy without `sg.write`
-never writes it, and no teardown writes it. It speaks for one deployment of
-the stack: the one since the stack's last teardown began, by the stamp of
-that teardown (`stack_teardown/<name>`) when it was written, a row every
-replica holds alike (the stack record's `created_at` is not: replicas that
-each inserted the name keep their own). A first deploy writes it only once
-it has recorded the stack, so one that failed leaves none, and a record left
-by a deployment this release tore down does not apply; while a teardown is
-under way, the record of what it tears down still does. A previous release's
-teardown writes no stamp, so the record still applies to the name
-(docs/upgrades.md). A stack asks for the default-deny when its file or this record does (the
-hand-off on teardown and the re-assert both read it), a deploy or teardown
-without `sg.write` counts a firewall the record declares, and a live stack
-whose file no longer declares what the record does raises
+and again once the stack's record is written. A deploy or teardown without
+`sg.write` never writes it; a teardown with `sg.write` clears it, in the same
+write that marks the stack `deleting` and at that write's stamp, so an Admin
+redeploy of the name that began after the teardown is newer and stands. So
+what a stack declared stands for its name until an Admin deploys or tears it
+down: while it is being torn down, after a teardown without `sg.write`
+tombstoned it, and after a deploy without `sg.write` replaced its file. A
+first deploy writes it only once it has recorded the stack, so one that
+failed leaves none. A previous release's teardown leaves it too
+(docs/upgrades.md). A stack asks for the default-deny when its file or this
+record does, whatever the stack's state (the hand-off on teardown, the sweep
+of a torn-down owner's deny and the re-assert all read it); a deploy or
+teardown without `sg.write` counts a firewall the record declares; and a
+live stack whose file no longer declares what the record does, or a
+torn-down stack whose record declares a firewall, raises
 `stack.firewall_teardown_held`.
 
 Residual: a previous release neither checks nor records any of this, so it

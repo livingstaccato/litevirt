@@ -125,37 +125,110 @@ func TestStackFirewallIntent_KeepsADefaultDenyAsk(t *testing.T) {
 	}
 }
 
-// A firewall intent speaks for the deployment since the stack's last
-// teardown began, by that teardown's stamp: it applies to that deployment,
-// whatever created_at a replica keeps for the stack (replicas that each
-// inserted the name keep their own), including while it is being torn down,
-// and not after a teardown the stack was deployed again from. One with no
-// stamp applies until a teardown writes one. One this build cannot read
-// applies to every deployment.
+// A firewall intent stands for the stack's name until a caller with
+// sg.write at the root changes it: a teardown without that authority, which
+// a node whose replica holds an older file may begin, leaves it, while the
+// stack is being torn down and after it is tombstoned, and so does a
+// teardown record this build cannot read; a teardown with it clears it, in
+// its own batch; an Admin redeploy after that records anew.
 //
-// Mutations: bind to created_at — "another replica's created_at", red.
-// Ignore the teardown stamp — "deployed again after a teardown", red. Drop
-// the "deleting" exception — "being torn down", red.
-func TestStackFirewallIntent_SpeaksForOneDeployment(t *testing.T) {
-	st := StackRecord{Name: "s", CreatedAt: "2026-10-19T10:00:00Z", State: "active"}
-	bound := StackFirewallIntent{Firewall: true, Teardown: "t1"}
-	for _, tc := range []struct {
-		name     string
-		in       StackFirewallIntent
-		st       StackRecord
-		teardown string
-		applies  bool
-	}{
-		{"its deployment", bound, st, "t1", true},
-		{"another replica's created_at", bound, StackRecord{Name: "s", CreatedAt: "2026-10-19T10:00:02Z", State: "active"}, "t1", true},
-		{"never torn down", StackFirewallIntent{Firewall: true}, st, "", true},
-		{"deployed again after a teardown", bound, st, "t2", false},
-		{"deployed again after a first teardown", StackFirewallIntent{Firewall: true}, st, "t1", false},
-		{"being torn down", bound, StackRecord{Name: "s", CreatedAt: st.CreatedAt, State: "deleting"}, "t2", true},
-		{"unreadable", decodeStackFirewallIntent("not json"), st, "t9", true},
-	} {
-		if got := stackFirewallIntentApplies(tc.in, tc.st, tc.teardown); got != tc.applies {
-			t.Errorf("%s: applies = %v, want %v", tc.name, got, tc.applies)
+// Mutations: clear the intent on every teardown — "without sg.write", red.
+// Never clear it — "with sg.write", red. Leave a torn-down stack out of
+// StackFirewallIntents — "tombstoned", red.
+func TestStackFirewallIntent_StandsUntilAnAdminChangesIt(t *testing.T) {
+	ctx := context.Background()
+	c := NewTestClientT(t)
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	c.SetClusterPolicyGate(func() bool { return true })
+	if err := UpsertStack(ctx, c, StackRecord{Name: "s", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := GetStack(ctx, c, "s")
+	stands := func(what string, want bool) {
+		t.Helper()
+		got, err := standingDenyAsk(ctx, c, "s")
+		if err != nil {
+			t.Fatal(err)
+		}
+		all, err := StackFirewallIntents(ctx, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, listed := all["s"]; got != want || listed != want {
+			t.Errorf("%s: the deny ask stands = %v (listed %v), want %v", what, got, listed, want)
+		}
+	}
+	if err := SetStackFirewallIntent(ctx, c, st, true, true, "node-0"); err != nil {
+		t.Fatal(err)
+	}
+	stands("recorded", true)
+	if err := MarkStackDeleting(ctx, c, "s", false, false, "node-1"); err != nil {
+		t.Fatal(err)
+	}
+	stands("without sg.write, deleting", true)
+	if err := DeleteStackRecord(ctx, c, "s"); err != nil {
+		t.Fatal(err)
+	}
+	stands("without sg.write, tombstoned", true)
+	if _, err := c.DB().ExecContext(ctx, `UPDATE cluster_policies SET value = 'garbled' WHERE key = 'stack_teardown/s'`); err != nil {
+		t.Fatal(err)
+	}
+	stands("an unreadable teardown record", true)
+	if err := MarkStackDeleting(ctx, c, "s", false, true, "node-0"); err != nil {
+		t.Fatal(err)
+	}
+	stands("with sg.write", false)
+	if err := UpsertStack(ctx, c, StackRecord{Name: "s", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	st, _ = GetStack(ctx, c, "s")
+	if err := SetStackFirewallIntent(ctx, c, st, false, true, "node-0"); err != nil {
+		t.Fatal(err)
+	}
+	stands("an Admin redeploy after the teardown", true)
+}
+
+// A cluster default-deny owned by a torn-down stack whose standing intent
+// asks for it stays with that stack: handing it to another torn-down stack
+// with a standing ask would hand it back on the next pass, a write each time.
+//
+// Mutation: drop the standing-owner check from SweepOrphanStackRows — the
+// owner moves, red.
+func TestSweepOrphanStackRows_KeepsADenyWithAStandingOwner(t *testing.T) {
+	ctx := context.Background()
+	c := NewTestClientT(t)
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	c.SetClusterPolicyGate(func() bool { return true })
+	for _, name := range []string{"a", "b"} {
+		if err := UpsertStack(ctx, c, StackRecord{Name: name, State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+		st, _ := GetStack(ctx, c, name)
+		if err := SetStackFirewallIntent(ctx, c, st, false, true, "node-0"); err != nil {
+			t.Fatal(err)
+		}
+		if err := MarkStackDeleting(ctx, c, name, false, false, "node-1"); err != nil {
+			t.Fatal(err)
+		}
+		if err := DeleteStackRecord(ctx, c, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := SetFirewallDefault(ctx, c, "cluster", true, "a"); err != nil {
+		t.Fatal(err)
+	}
+	read := func(string) (bool, map[string]bool, error) { return false, nil, nil }
+	for pass := 0; pass < 2; pass++ {
+		orphan, err := SweepOrphanStackRows(ctx, c, read)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d, _ := GetFirewallDefault(ctx, c, "cluster"); d == nil || !d.DefaultDeny || d.StackName != "a" || orphan != "" {
+			t.Fatalf("pass %d: the cluster default is %+v (orphan %q), want deny kept by a", pass+1, d, orphan)
 		}
 	}
 }

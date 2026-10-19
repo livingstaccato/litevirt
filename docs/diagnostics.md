@@ -1954,7 +1954,7 @@ the stack, and that node may hold an older record of it. Raised by the stack
 reconciler on a host that holds a firewall of the stack (a security group,
 ip set, cluster or host rule or firewall default it owns, a stored file that
 declares a firewall or cannot be read, or the intent the stack's last deploy
-with `sg.write` recorded) in three cases:
+with `sg.write` recorded) in four cases:
 
 - the stack is `deleting` and its teardown may not remove that firewall: its
   caller did not hold `sg.write` at `/`, or its record does not say (begun by
@@ -1965,6 +1965,10 @@ with `sg.write` recorded) in three cases:
 - the stack was torn down while this host holds a security group, ip set,
   or cluster or host rule it owns, written before the teardown. They stay in
   force. A cluster default-deny it owns is `firewall.default_deny_orphaned`.
+- the stack was torn down by a teardown without `sg.write` at `/`, and the
+  intent its last deploy with `sg.write` recorded declares a firewall. It
+  still counts for the name: a default-deny it asked for passes to it when
+  the stack that owns the deny goes, and stays with it.
 - the stack is live and its file no longer declares the firewall, or the
   default-deny, its last deploy with `sg.write` declared: a deploy without
   `sg.write` replaced it. What that deploy declared still stands: the stack

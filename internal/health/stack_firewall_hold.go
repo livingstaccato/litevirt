@@ -94,7 +94,32 @@ func (r *StackReconciler) reportTornDownFirewalls(ctx context.Context, held map[
 		held[stack] = true
 		r.raiseFirewallHold(ctx, stack, tornDownWhy)
 	}
+	// A stack torn down without sg.write keeps what its last deploy with it
+	// declared (corrosion.StackFirewallIntent): a default-deny it asked for
+	// still passes to it.
+	intents, err := corrosion.StackFirewallIntents(ctx, r.db)
+	if err != nil {
+		slog.Warn("stack-reconciler: read the stacks' firewall intents", "error", err)
+		return
+	}
+	for name := range intents {
+		if held[name] {
+			continue
+		}
+		rec, err := r.db.Query(ctx, `SELECT deleted_at FROM stacks WHERE name = ?`, name)
+		if err != nil || len(rec) == 0 || rec[0].String("deleted_at") == "" {
+			continue
+		}
+		held[name] = true
+		r.raiseFirewallHold(ctx, name, tornDownIntentWhy)
+	}
 }
+
+// tornDownIntentWhy is the why of a torn-down stack whose firewall intent
+// still stands.
+const tornDownIntentWhy = "the stack was torn down by a teardown without sg.write at the cluster root, which ends " +
+	"nothing its last deploy by a caller with sg.write declared: the firewall (and a default-deny it asked for) still " +
+	"counts for its name"
 
 // withdrawnWhy is the why of a live stack whose file no longer declares the
 // firewall its last deploy with sg.write declared.
@@ -178,8 +203,11 @@ func (r *StackReconciler) raiseFirewallHold(ctx context.Context, stack, why stri
 	} else {
 		state := "the teardown of stack %q leaves its firewall (security groups, ip sets, cluster and host rules, " +
 			"the cluster default policy) in place, and the stack stays \"deleting\": %s"
-		if why == tornDownWhy {
+		switch why {
+		case tornDownWhy:
 			state = "stack %q is gone and its firewall rows stay in force: %s"
+		case tornDownIntentWhy:
+			state = "stack %q is gone and what it declared of the firewall stands: %s"
 		}
 		detail = fmt.Sprintf(state+". Removing it needs sg.write at the cluster root, and the node that began the "+
 			"teardown saw no firewall for the stack. An Admin finishes the teardown with `lv compose down --name %s`, "+

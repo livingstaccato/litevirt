@@ -110,7 +110,8 @@ type stackTeardownRecord struct {
 // release's replication stream. Where cluster_policies may not be written yet
 // (failover_scope_v1 not durably latched), only the state is written, and a
 // reconciler keeps the disks (StackTeardownDeletesDisks) and any firewall it
-// holds of the stack.
+// holds of the stack. A teardown with sg.write also clears the stack's
+// firewall intent.
 func MarkStackDeleting(ctx context.Context, c *Client, name string, keepDisks, removesFirewall bool, setBy string) error {
 	now := c.NowTS()
 	stmts := []Statement{{SQL: stackSetStateSQL, Params: []interface{}{"deleting", now, name}}}
@@ -121,6 +122,16 @@ func MarkStackDeleting(ctx context.Context, c *Client, name string, keepDisks, r
 		}
 		stmts = append(stmts, Statement{SQL: clusterPolicyUpsertSQL,
 			Params: []interface{}{stackTeardownKeyPrefix + name, string(v), setBy, now}})
+		// A teardown with sg.write at the root ends what the stack declared
+		// (StackFirewallIntent), at its own stamp: an Admin redeploy that
+		// began after it records anew, and wins. One without leaves it.
+		if removesFirewall {
+			clear, err := stackFirewallIntentStatement(name, StackFirewallIntent{}, setBy, now)
+			if err != nil {
+				return err
+			}
+			stmts = append(stmts, clear)
+		}
 	}
 	return c.ExecuteBatch(ctx, stmts)
 }

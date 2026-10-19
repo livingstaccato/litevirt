@@ -25,7 +25,8 @@ import (
 // authority (ignore StackTeardownRemovesFirewall) — "authorized", red.
 // Accept another teardown's record (drop the stamp check in stackTeardown) —
 // "authorized, another teardown's record", red. Treat a missing record as
-// authorized — "no record", red. Ignore the stored file (rows only) —
+// authorized — "no record", red. Treat a record this build cannot read as
+// authorized — "an unreadable record", red. Ignore the stored file (rows only) —
 // "file declares a default-deny, no rows", red.
 func TestStackReconciler_KeepsAFirewallTheTeardownMayNotRemove(t *testing.T) {
 	const denyFile = "name: app\nfirewall:\n  default-deny: true\n"
@@ -40,6 +41,13 @@ func TestStackReconciler_KeepsAFirewallTheTeardownMayNotRemove(t *testing.T) {
 		{"authorized", "", true, markTeardown(true, true), false},
 		{"without sg.write", "", true, markTeardown(true, false), true},
 		{"no record", "", true, markTeardown(false, true), true},
+		{"an unreadable record", "", true, func(t *testing.T, db *corrosion.Client) {
+			markTeardown(true, true)(t, db)
+			if _, err := db.DB().ExecContext(context.Background(),
+				`UPDATE cluster_policies SET value = 'garbled' WHERE key = 'stack_teardown/app'`); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
 		{"a previous release's record", "", true, markPreviousRelease, true},
 		{"authorized, another teardown's record", "", true, func(t *testing.T, db *corrosion.Client) {
 			markTeardown(true, true)(t, db)

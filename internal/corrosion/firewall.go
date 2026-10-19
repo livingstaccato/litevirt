@@ -517,7 +517,7 @@ func DeleteStackFirewallDefaults(ctx context.Context, c *Client, stack string, r
 		}
 		handed, err := handOff(ctx, c, stack, heirs, func(owner string) error {
 			return SetFirewallDefault(ctx, c, "cluster", true, owner)
-		})
+		}, standingDenyAsk)
 		if err != nil {
 			return err
 		}

@@ -650,9 +650,12 @@ func TestHostRemove_RemovesAStrandedAddsStagedPair(t *testing.T) {
 // installed identity, are not touched, which is also what makes a dial to a
 // reused address harmless.
 //
+// Codex 612c78ba N-M1: a symlinked config's staged copy, beside its target,
+// goes too.
+//
 // Mutations: delete untagged staged files whatever their serial — "another
 // serial" loses the legacy pair; delete every attempt's tagged files — the
-// other attempt's pair goes.
+// other attempt's pair goes; leave the resolved config — its stage is left.
 func TestRemoveStagedPair_OnlyTheRevokedSerial(t *testing.T) {
 	dir := t.TempDir()
 	if err := pki.GenerateCA(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key")); err != nil {
@@ -695,12 +698,25 @@ func TestRemoveStagedPair_OnlyTheRevokedSerial(t *testing.T) {
 			crt, key := filepath.Join(remotePKIDir, "host.crt"), filepath.Join(remotePKIDir, "host.key")
 			put(crt, otherCrt) // the machine's installed identity
 			put(key, otherKey)
-			for _, p := range addStagedTargets() {
-				put(addStagedPath(p, revoked), []byte("revoked attempt"))
-				put(addStagedPath(p, other), []byte("other attempt"))
+			// The config is a symlink: an add stages it beside its target.
+			target := "/srv/litevirt/node.yaml"
+			put(target, []byte("host_name: node-9\n"))
+			if err := os.MkdirAll(filepath.Dir(r.Path(remoteConfig)), 0o755); err != nil {
+				t.Fatal(err)
 			}
-			put(addStagedPath(crt, revoked), revokedCrt)
-			put(addStagedPath(key, revoked), revokedKey)
+			if err := os.Symlink(r.Path(target), r.Path(remoteConfig)); err != nil {
+				t.Fatal(err)
+			}
+			staged := append(addStagedTargets(), target)
+			// Two attempts admitted with the revoked serial (a rerun's), and
+			// one with another.
+			for _, p := range staged {
+				put(addStagedPath(p, revoked+"-0a"), []byte("revoked attempt"))
+				put(addStagedPath(p, revoked+"-0b"), []byte("revoked rerun"))
+				put(addStagedPath(p, other+"-0c"), []byte("other attempt"))
+			}
+			put(addStagedPath(crt, revoked+"-0a"), revokedCrt)
+			put(addStagedPath(key, revoked+"-0a"), revokedKey)
 			if tc.legacy != nil {
 				put(legacyStagedPath(crt), tc.legacy)
 				put(legacyStagedPath(key), []byte("legacy key"))
@@ -709,16 +725,18 @@ func TestRemoveStagedPair_OnlyTheRevokedSerial(t *testing.T) {
 				t.Fatal(err)
 			}
 			exists := func(path string) bool { _, err := os.Stat(r.Path(path)); return err == nil }
-			for _, p := range addStagedTargets() {
-				if exists(addStagedPath(p, revoked)) {
-					t.Errorf("the revoked attempt's %s is left staged", filepath.Base(p))
+			for _, p := range staged {
+				for _, n := range []string{"-0a", "-0b"} {
+					if exists(addStagedPath(p, revoked+n)) {
+						t.Errorf("the revoked admission's %s (attempt %s) is left staged", p, n)
+					}
 				}
-				if !exists(addStagedPath(p, other)) {
-					t.Errorf("another attempt's staged %s was removed", filepath.Base(p))
+				if !exists(addStagedPath(p, other+"-0c")) {
+					t.Errorf("another admission's staged %s was removed", p)
 				}
 			}
-			if !exists(crt) || !exists(key) {
-				t.Error("the machine's installed identity was removed")
+			if !exists(crt) || !exists(key) || !exists(target) {
+				t.Error("the machine's installed identity or config was removed")
 			}
 			if tc.legacy != nil && exists(legacyStagedPath(crt)) == tc.legacyGone {
 				t.Errorf("the untagged staged pair: left %v, want removed %v", exists(legacyStagedPath(crt)), tc.legacyGone)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -328,5 +329,80 @@ func TestHostAdd_ARerunFinishesAnEarlierReleasesStagedAdd(t *testing.T) {
 	servesItsAdmittedPair(t, f.targetPKI, serial)
 	if left := stagedOnTarget(t, f.target.Root); len(left) != 0 {
 		t.Errorf("staged files left on the machine: %v", left)
+	}
+}
+
+// Codex 612c78ba I2: a staging tag of the admitted serial is not an
+// attempt's own. A rerun from another operator while the admitted attempt is
+// still in flight took the same serial, wrote the same staged CA, migration,
+// config and binary paths, and its failed upload removed the files the first
+// attempt was about to install. Each attempt's staged files carry its own
+// nonce now: the rerun stages copies of its own, and its failed upload, or
+// its failed setup and rollback, touches only those.
+//
+// Mutations: tag staged files with the serial alone — "the rerun's upload
+// fails" fails A's install; unstage by the serial — the same.
+func TestHostAdd_ARerunWhileTheAdmittedAddIsInFlightLeavesItsFiles(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		break_ func(tb *LocalAddTarget)
+	}{
+		{"the rerun's upload fails", func(tb *LocalAddTarget) {
+			tb.FailWrite = map[string]error{"/usr/local/bin/.litevirt.add": errors.New("connection lost")}
+		}},
+		{"the rerun's setup fails and it rolls back", func(tb *LocalAddTarget) {
+			tb.FailSetup = errors.New("setup failed")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAddFixture(t)
+			if _, _, _, err := ensureLocalMigrationCA(f.opPKI, nil); err != nil {
+				t.Fatal(err)
+			}
+			opB := secondOperatorPKI(t, f.opPKI)
+			cluster := &sharedAdmissions{hosts: f.client.hosts}
+			a := &operatorClient{s: cluster}
+			b := &operatorClient{s: cluster}
+			aAdmitted, bDone := make(chan struct{}), make(chan struct{})
+			// A is admitted, then waits for B's whole rerun before installing.
+			a.after = func() { close(aAdmitted); <-bDone }
+			ta := &LocalAddTarget{Root: f.target.Root, PKIDir: f.targetPKI, Binary: f.target.Binary}
+			tb := &LocalAddTarget{Root: f.target.Root, PKIDir: f.targetPKI, Binary: f.target.Binary}
+			tc.break_(tb)
+			plan := func(dir string) hostAddPlan {
+				return hostAddPlan{pkiDir: dir, hostName: "node-9", hostAddr: "10.0.0.9", peersYAML: "[]",
+					binPath: f.target.Binary, rerun: "lv host add --name node-9 root@10.0.0.9"}
+			}
+			var errA, errB error
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				errA = hostAddTo(context.Background(), a, ta, plan(f.opPKI))
+			}()
+			go func() {
+				defer wg.Done()
+				defer close(bDone)
+				<-aAdmitted
+				errB = hostAddTo(context.Background(), b, tb, plan(opB))
+			}()
+			finished := make(chan struct{})
+			go func() { wg.Wait(); close(finished) }()
+			select {
+			case <-finished:
+			case <-time.After(60 * time.Second):
+				t.Fatal("the add and its rerun did not finish")
+			}
+			if errB == nil {
+				t.Fatal("the broken rerun succeeded")
+			}
+			if errA != nil {
+				t.Fatalf("the admitted add, after the rerun failed: %v", errA)
+			}
+			servesItsAdmittedPair(t, f.targetPKI, a.admitted)
+			if _, err := os.Stat(filepath.Join(f.targetPKI, "migration", pki.MigrationHostKeyName)); err != nil {
+				t.Errorf("the admitted add's migration key is not in place: %v", err)
+			}
+		})
 	}
 }

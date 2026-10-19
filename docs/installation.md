@@ -143,21 +143,33 @@ host table.
 on the machine, and moves them into place only once the cluster has admitted
 the host, so a refused add leaves the machine as it was. Each attempt's
 staged files are its own, named for the serial of the certificate it asks the
-cluster to admit (`.host.crt.add-<serial>`), so two adds of one machine at once
-do not replace or remove each other's, and the install takes only the pair it
-was admitted with. It refuses a machine that serves another live member's
+cluster to admit and a nonce the attempt prints
+(`.host.crt.add-<serial>-<nonce>`), so two adds of one machine at once, or a
+rerun while the first add is still running, do not replace or remove each
+other's, and the install takes only the pair it was admitted with. It refuses a machine that serves another live member's
 certificate or has its address. While it
 installs, each file it replaces in `/etc/litevirt/pki` is kept beside it as
 `<file>.pre-add-<time>` (0600): the copies are put back if the add fails after
 the admission, and removed once it succeeds. A host admitted by an add that
 did not finish shows `HOST_JOINING`: run the same `lv host add` again, from
 any machine holding the cluster CA, to finish it, or `lv host rm <name>` to
-undo the admission. That removal also deletes the files the add left staged
-under the revoked serial on the machine, when it can reach the machine over
+undo the admission. That removal also deletes the files every attempt left
+staged under the revoked serial on the machine (the config's beside the file
+`config.yaml` resolves to), when it can reach the machine over
 SSH as root within 10 seconds. A rerun refuses when the key staged or installed
 on the machine is not the admitted certificate's. The machine running
 `lv host add` keeps its copy of the admitted credentials in
 `hosts/<name>/` under its pki directory.
+
+One machine is admitted under one name: an add is refused at an address
+another live or joining host holds at port 7443. Two adds made through two
+hosts at once can each be admitted before either admission reaches the
+other; the one admitted first (the lesser name on a tie) keeps the address.
+The other's `lv host add` is refused before it installs anything, naming
+`lv host rm` for its admission, and a host that loses its address this way is
+never activated: it stays `joining`, or `upgrading` once its daemon runs, until
+the other is removed (`lv health`
+shows `host.address_shared`).
 
 A machine that already has `/etc/litevirt/config.yaml` keeps it. The add
 edits in place only `host_name`, `advertise_address`, `join_peers`, `pki_dir`

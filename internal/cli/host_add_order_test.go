@@ -703,8 +703,11 @@ func TestHostAdd_AResumeChecksTheKeyMatchesTheCertificate(t *testing.T) {
 		filepath.Join(other, "x.crt"), filepath.Join(other, "x.key"), "node-9", net.IPv4(10, 0, 0, 9)); err != nil {
 		t.Fatal(err)
 	}
-	staged := addStagedPath(filepath.Join(f.targetPKI, "host.key"), f.client.admitted[0])
-	if err := os.WriteFile(staged, mustRead(t, filepath.Join(other, "x.key")), 0o600); err != nil {
+	staged, _ := filepath.Glob(addStagedPath(filepath.Join(f.targetPKI, "host.key"), f.client.admitted[0]+"-") + "*")
+	if len(staged) != 1 {
+		t.Fatalf("staged keys of the admission: %v, want one", staged)
+	}
+	if err := os.WriteFile(staged[0], mustRead(t, filepath.Join(other, "x.key")), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	f.target.FailSetup = nil

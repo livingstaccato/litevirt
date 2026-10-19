@@ -451,26 +451,36 @@ func addStagedTargets() []string {
 	}
 }
 
-// removeStagedPair deletes on r what the add admitted with serial, the one
-// this removal revoked, left staged: the files tagged with serial, and only
-// those, so another attempt's on the machine are not touched. A pair an
-// earlier release's add staged untagged goes only when its certificate is
-// serial's. Serials are unique to the CA, so another machine at a reused
-// address never matches, and nothing there is touched.
+// removeStagedPair deletes on r what the adds admitted with serial, the one
+// this removal revoked, left staged: every attempt's files tagged with it
+// (<serial>-<nonce>), including the config staged beside the file
+// config.yaml resolves to, and only those, so another admission's on the
+// machine are not touched. A pair an earlier release's add staged untagged
+// goes only when its certificate is serial's (removeLegacyStagedPair).
+// Serials are unique to the CA, so another machine at a reused address never
+// matches, and nothing there is touched.
 func removeStagedPair(r addRemote, serial string) error {
 	serial = strings.ToLower(serial)
 	if !validAttemptTag(serial) {
 		return fmt.Errorf("serial %q is not one", serial)
 	}
-	gone := stagedPaths(addStagedTargets(), serial)
-	crt := legacyStagedPath(filepath.Join(remotePKIDir, "host.crt"))
-	b, ok, err := r.ReadFile(crt)
-	if err != nil {
+	targets := addStagedTargets()
+	q := ssh.ShellQuote(r.Path(remoteConfig))
+	if out, err := r.Shell("config", fmt.Sprintf("if [ -e %s ]; then readlink -f -- %s; fi", q, q)); err == nil {
+		if p := strings.TrimSpace(string(out)); p != "" && !strings.ContainsAny(p, "\n\x00") {
+			targets = append(targets, r.Unpath(p))
+		}
+	}
+	var cmd strings.Builder
+	cmd.WriteString("rc=0; ")
+	for _, t := range targets {
+		// The serial is hex (validAttemptTag), and the glob is all that is
+		// left unquoted.
+		fmt.Fprintf(&cmd, "rm -f -- %s* || rc=1; ", ssh.ShellQuote(r.Path(addStagedPath(t, serial+"-"))))
+	}
+	cmd.WriteString("exit $rc")
+	if _, err := r.Shell("unstage", cmd.String()); err != nil {
 		return err
 	}
-	if ok && installedSerial(b) == serial {
-		gone = append(gone, crt, legacyStagedPath(filepath.Join(remotePKIDir, "host.key")))
-	}
-	_, err = r.Shell("unstage", removeCmd(r, gone))
-	return err
+	return removeLegacyStagedPair(r, serial)
 }

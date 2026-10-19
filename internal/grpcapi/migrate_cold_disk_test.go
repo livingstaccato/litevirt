@@ -187,7 +187,7 @@ func TestReceiveMigrationDisk_CopiesTheFile(t *testing.T) {
 			t.Fatalf("an all-zero chunk at %d was sent", fr.Offset)
 		}
 	}
-	if !f.dst.migrationStubs.owns("os1", f.path) {
+	if !f.dst.madeHere(context.Background(), &f.dst.migrationStubs, "os1", f.path) {
 		t.Error("the received disk is not recorded as the migration's, so a failed attempt could not remove it")
 	}
 }

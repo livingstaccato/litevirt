@@ -30,6 +30,10 @@ import (
 // not know the named fields then requires admin and purges nothing.
 const SupersededNamedOnlySec = 9_000_000_000
 
+// supersededVMDeleted is a SupersededDisk's vm_state when the VM whose disk
+// it was set aside from was deleted.
+const supersededVMDeleted = "deleted"
+
 // keptHeld is a .kept- file's held reason in a SupersededDisks answer.
 const keptHeld = "a disk a deleted VM was kept with; only an operator removes it, by hand"
 
@@ -175,9 +179,14 @@ func (s *Server) SupersededDisks(ctx context.Context, req *pb.SupersededDisksReq
 	}
 
 	for _, c := range copies {
+		vm, vmState := c.VM, c.VMState
+		if vm == "" && c.DeletedVM != "" {
+			// Its VM was deleted: named, and shown as deleted.
+			vm, vmState = c.DeletedVM, supersededVMDeleted
+		}
 		resp.Disks = append(resp.Disks, &pb.SupersededDisk{
 			Path: c.Path, DiskPath: c.DiskPath, SetAsideAt: c.SetAsideAt.UTC().Format(time.RFC3339),
-			SizeBytes: c.SizeBytes, VmName: c.VM, VmState: c.VMState, Held: c.Held, Removed: removed[c.Path],
+			SizeBytes: c.SizeBytes, VmName: vm, VmState: vmState, Held: c.Held, Removed: removed[c.Path],
 			Retained: c.Retained,
 		})
 	}

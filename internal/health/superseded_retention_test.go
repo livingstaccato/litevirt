@@ -180,3 +180,54 @@ func TestListSupersededDisks_SaysACopyIsRetainedWhileItsVMExists(t *testing.T) {
 		t.Fatalf("listed %+v, want the copy retained for VM ran", got)
 	}
 }
+
+// A copy set aside from a disk of a VM since deleted, in a directory only
+// that VM's disks used (a pool directory), is still listed, naming the
+// deleted VM, and removable by name. It was invisible: the directory was
+// scanned only while a live VM had a disk there, so neither the operator nor
+// the sweep could reach it (lab2-drain anomaly 7). It is never removed on its
+// own: not by the sweep, not by a bare purge.
+//
+// Mutation: scan only the directories of live VMs' disks — the copy is not
+// listed, red. Let the sweep take it — it is gone after the purge, red.
+func TestSupersededDisks_ACopyOfADeletedVMsPoolDiskIsListedAndKept(t *testing.T) {
+	ctx := context.Background()
+	db := testReconcilerDB(t)
+	dataDir := t.TempDir()
+	disk := filepath.Join(t.TempDir(), "pools", "default", "gone-root.qcow2")
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "gone", HostName: "node-a", State: "stopped", Spec: "{}"},
+		nil, []corrosion.DiskRecord{{VMName: "gone", DiskName: "root", HostName: "node-a", Path: disk, StorageType: "dir"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.DeleteVM(ctx, db, "gone"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
+	cp := supersededAt(t, disk, now.Add(-30*24*time.Hour))
+
+	copies, err := ListSupersededDisks(ctx, db, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *SupersededCopy
+	for i := range copies {
+		if copies[i].Path == cp {
+			found = &copies[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("the copy of the deleted VM's pool disk is not listed: %+v", copies)
+	}
+	if found.DeletedVM != "gone" || found.VM != "" || found.Retained == "" {
+		t.Fatalf("listed as %+v; want the deleted VM named, no live VM, retained", *found)
+	}
+	if removed, err := PurgeSupersededDisks(ctx, db, dataDir, 7*24*time.Hour, now); err != nil || len(removed) != 0 || !exists(cp) {
+		t.Fatalf("the sweep removed %+v (err %v); a copy of a deleted VM's pool disk is never removed on its own", removed, err)
+	}
+	if removed, err := PurgeSupersededDisks(ctx, db, dataDir, 0, now); err != nil || len(removed) != 0 || !exists(cp) {
+		t.Fatalf("a bare purge removed %+v (err %v)", removed, err)
+	}
+	if removed, err := RemoveSupersededDisks(ctx, db, dataDir, []string{cp}); err != nil || len(removed) != 1 || exists(cp) {
+		t.Fatalf("removal by name = %+v, %v; want the copy gone", removed, err)
+	}
+}

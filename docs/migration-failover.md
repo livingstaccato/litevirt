@@ -1815,7 +1815,9 @@ never removes it on its own. While that VM is in `error`, `pending` or
 back. Once the VM is deleted, its copies are removed by their host when they
 are older than `superseded_disk_retention_days` (default 7 days; `0` keeps
 every copy). The host checks hourly; the age comes from the time in the file
-name. Before this rule a copy was held only while its VM was in `error`,
+name. A copy in a directory that only deleted VMs' disks used (a pool
+directory, say) is listed with its VM shown as `(deleted)` and retained:
+nothing removes it but `--remove <copy>`. Before this rule a copy was held only while its VM was in `error`,
 `pending` or `starting`, so seven days after the VM was running again on a
 rebuilt disk the only copy of its data from before the failover was deleted.
 

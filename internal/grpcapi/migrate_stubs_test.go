@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -108,7 +109,7 @@ func TestEnsureDisks_FailurePartWayLeavesNothing(t *testing.T) {
 	if _, err := os.Stat(first); !os.IsNotExist(err) {
 		t.Fatalf("the first stub was left behind by the failed call (stat err %v)", err)
 	}
-	if s.migrationStubs.owns("mig", first) {
+	if s.madeHere(context.Background(), &s.migrationStubs, "mig", first) {
 		t.Fatal("the removed stub is still recorded as this host's")
 	}
 }
@@ -224,7 +225,7 @@ func TestCleanupMigrationArtifacts_SweepReadsTheFileItRemoves(t *testing.T) {
 	if err := os.Chtimes(f, old, old); err != nil {
 		t.Fatal(err)
 	}
-	s.migrationStubs.add("mig", p)
+	s.recordMade(context.Background(), &s.migrationStubs, "mig", p)
 	if _, err := s.CleanupMigrationArtifacts(adminCtx(), &pb.CleanupMigrationArtifactsRequest{VmName: "mig"}); err != nil {
 		t.Fatalf("CleanupMigrationArtifacts: %v", err)
 	}

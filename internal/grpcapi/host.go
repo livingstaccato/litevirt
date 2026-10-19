@@ -1084,12 +1084,19 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			progress.Error = "migrated; " + herr.Error()
 			return progress
 		}
+		s.recordVMEvent(dctx, vm.Name, "vm.drain", "ok",
+			fmt.Sprintf("drain of %s: moved live to %s", s.hostName, target.Name))
 		progress.Status = "done"
 		progress.ProgressPct = 100
 		return progress
 	}
-	slog.Warn("live migration failed during drain, falling back to a cold move",
-		"vm", vm.Name, "error", lerr)
+	if stopped == liveNotStopped {
+		slog.Warn("live migration failed during drain, falling back to a cold move",
+			"vm", vm.Name, "error", lerr)
+	} else {
+		slog.Warn("drain: live move stopped; no cold move follows, and the VM stays on this host",
+			"vm", vm.Name, "reason", why, "error", lerr)
+	}
 	// libvirt ended the move with the guest here: the row leaves migrating
 	// (running while its domain runs, else error), as a failed `lv migrate`.
 	runningHere := s.restoreSourceStateAfterFailedMigration(context.WithoutCancel(ctx), vm.Name,

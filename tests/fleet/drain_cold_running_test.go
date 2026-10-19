@@ -1035,3 +1035,33 @@ func TestFleet_DrainWithNoTargetEndsIncomplete(t *testing.T) {
 		t.Errorf("drain progress for os1 = %+v, want failed: no eligible target", p)
 	}
 }
+
+// A cold move rolled back after its disk copy began says so: the log no
+// longer says the attempt ended before the copy started (lab2-drain
+// anomaly 4).
+//
+// Mutation: drop the copy-started mark — the log says "before the copy
+// started", red.
+func TestFleet_AColdMoveRolledBackMidCopyLogsThatTheCopyHadStarted(t *testing.T) {
+	logs := captureLogs(t)
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	sc.src.Server.SetColdDiskStallForTest(300 * time.Millisecond)
+	release := make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	sc.dst.Server.SetColdDiskSyncHookForTest(func(final bool) {
+		if final {
+			<-release
+		}
+	})
+	_, err := drainWithin(t, sc, 30*time.Second)
+	assertIncomplete(t, err)
+	out := logs.String()
+	if strings.Contains(out, "attempt ended before the copy started") {
+		t.Fatal("the log says a move rolled back mid-copy ended before the copy started")
+	}
+	if !strings.Contains(out, "attempt ended after its disk copy started") {
+		t.Fatal("the log does not say the rolled-back move's copy had started")
+	}
+}

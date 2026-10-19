@@ -76,7 +76,7 @@ func TestReceiveMigrationDisk_ATakeBackNeverUnlinksAFileEnsureDisksReused(t *tes
 	if _, err := f.dst.EnsureDisks(f.peer, stubReq); err != nil {
 		t.Fatalf("EnsureDisks (the attempt's stub): %v", err)
 	}
-	if !f.dst.migrationStubs.owns("os1", f.path) {
+	if !f.dst.madeHere(context.Background(), &f.dst.migrationStubs, "os1", f.path) {
 		t.Fatal("fixture: the stub is not recorded as this host's")
 	}
 	up := &captureDiskUp{size: st.Size()}
@@ -109,7 +109,7 @@ func TestReceiveMigrationDisk_ATakeBackNeverUnlinksAFileEnsureDisksReused(t *tes
 	if _, err := os.Lstat(f.path); !os.IsNotExist(err) {
 		t.Fatalf("the copy placed after the source gave up is still at %s (stat: %v)", f.path, err)
 	}
-	if f.dst.migrationStubs.owns("os1", f.path) {
+	if f.dst.madeHere(context.Background(), &f.dst.migrationStubs, "os1", f.path) {
 		t.Fatal("the taken-back copy is still recorded as this host's stub")
 	}
 }

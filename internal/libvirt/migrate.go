@@ -222,11 +222,18 @@ func migrationFlagsAndParams(p MigrateParams) (golibvirt.DomainMigrateFlags, []g
 		flags |= golibvirt.MigrateTunnelled
 	}
 
+	return flags, migrationParams(p), nil
+}
+
+// migrationParams is the typed parameters MigrateToTarget hands
+// DomainMigratePerform3Params for p. Each value carries its type tag: one
+// without it is a payload libvirtd cannot decode, and the migration fails.
+func migrationParams(p MigrateParams) []golibvirt.TypedParam {
 	var params []golibvirt.TypedParam
 	if p.BandwidthMiB > 0 {
 		params = append(params, golibvirt.TypedParam{
 			Field: "bandwidth",
-			Value: golibvirt.TypedParamValue{I: uint64(p.BandwidthMiB)},
+			Value: *golibvirt.NewTypedParamValueUllong(uint64(p.BandwidthMiB)),
 		})
 	}
 
@@ -270,7 +277,34 @@ func migrationFlagsAndParams(p MigrateParams) (golibvirt.DomainMigrateFlags, []g
 		})
 	}
 
-	return flags, params, nil
+	return params
+}
+
+// checkTypedParams reports the first typed parameter whose type tag is
+// missing or does not match its value, as libvirtd fails to decode it.
+// MigrationOutcome runs it, so libvirtfake refuses what libvirtd would.
+func checkTypedParams(params []golibvirt.TypedParam) error {
+	for _, tp := range params {
+		ok := false
+		switch tp.Value.D {
+		case 1, 6: // int, boolean
+			_, ok = tp.Value.I.(int32)
+		case 2: // uint
+			_, ok = tp.Value.I.(uint32)
+		case 3: // llong
+			_, ok = tp.Value.I.(int64)
+		case 4: // ullong
+			_, ok = tp.Value.I.(uint64)
+		case 5: // double
+			_, ok = tp.Value.I.(float64)
+		case 7: // string
+			_, ok = tp.Value.I.(string)
+		}
+		if !ok {
+			return fmt.Errorf("Unable to decode message payload: typed parameter %q has type tag %d and a %T value", tp.Field, tp.Value.D, tp.Value.I)
+		}
+	}
+	return nil
 }
 
 // DomainJobActive reports whether name has a job running (an outgoing

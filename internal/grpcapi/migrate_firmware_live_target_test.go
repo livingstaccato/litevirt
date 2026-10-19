@@ -682,7 +682,7 @@ func TestAbort_Discard_RemovesOnlyItsOwnStubs(t *testing.T) {
 	theirs := filepath.Join(f.s.dataDir, "disks", "fw1-data.qcow2")
 	f.writeFile(mine, []byte("stub"))
 	f.writeFile(theirs, []byte("disk"))
-	f.s.migrationStubs.add(fwtVM, mine)
+	f.s.recordMade(context.Background(), &f.s.migrationStubs, fwtVM, mine)
 	resp, err := f.s.AbortLiveFirmwareTarget(f.peer, &pb.AbortLiveFirmwareTargetRequest{
 		VmName: fwtVM, Uuid: fwtUUID, CreatedAt: f.row.CreatedAt, AttemptId: fwtA1, Mode: discard,
 		CreatedStubs: []string{mine, theirs},

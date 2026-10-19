@@ -111,6 +111,7 @@ func (s *Server) copyColdDisksToTarget(ctx context.Context, targetHost, vmName s
 			return nil, status.Errorf(codes.Unavailable, "cannot reach %s to copy the disks of VM %q: %v", targetHost, vmName, err)
 		}
 		abort.createdStubs = append(abort.createdStubs, d.Path)
+		abort.copyStarted = true
 		err = s.streamColdDisk(ctx, client, vmName, d, formats[d.Path])
 		closeConn()
 		if err != nil {
@@ -524,7 +525,7 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	}
 	dst := s.hostDiskFile(hdr.Path)
 	if _, err := os.Lstat(dst); err == nil {
-		if !s.migrationStubs.owns(vm.Name, hdr.Path) {
+		if !s.madeHere(ctx, &s.migrationStubs, vm.Name, hdr.Path) {
 			return status.Errorf(codes.FailedPrecondition,
 				"disk %s of VM %q already exists on %s, and this migration did not create it. "+
 					"It may be the VM's disk from an earlier stay on %s, or a copy a move that was rolled back placed "+
@@ -647,7 +648,7 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	// A stub this host made for the VM's migration is the one file the copy may
 	// take the place of (checked above); anything else at the path — even one
 	// that appeared since the check — makes the placement fail.
-	if s.migrationStubs.owns(vm.Name, hdr.Path) {
+	if s.madeHere(ctx, &s.migrationStubs, vm.Name, hdr.Path) {
 		if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
 			return status.Errorf(codes.Internal, "replace this host's stub %s: %v", hdr.Path, err)
 		}
@@ -696,7 +697,7 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 		}
 		return status.Errorf(codes.Canceled, "the source gave up on the copy of %s as it was placed: %v", hdr.Path, err)
 	}
-	s.migrationStubs.add(vm.Name, hdr.Path)
+	s.recordMade(ctx, &s.migrationStubs, vm.Name, hdr.Path)
 	slog.Info("cold migration: disk received", "vm", vm.Name, "path", hdr.Path, "bytes", hdr.SizeBytes)
 	return stream.SendAndClose(&pb.ReceiveMigrationDiskResponse{SizeBytes: hdr.SizeBytes})
 }

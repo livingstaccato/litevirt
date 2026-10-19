@@ -971,7 +971,29 @@ poll:
 	for {
 		select {
 		case <-migrateCtx.Done():
-			s.abortOnMigrateTimeout(ctx, migrateCtx, vm.Name)
+			timedOut := s.abortOnMigrateTimeout(ctx, migrateCtx, vm.Name)
+			if timedOut {
+				// The policy timeout aborted the job: libvirt's answer says
+				// what happened, and the request reports that (lab2-drain
+				// anomaly 5). An error is the abort taken, the guest still
+				// here; nil is a cut-over that won the race. Either goes on
+				// as libvirt's answer does below.
+				grace := time.NewTimer(s.drainAbortGraceOrDefault())
+				select {
+				case migrateErr := <-done:
+					grace.Stop()
+					if migrateErr != nil {
+						migrateErr = fmt.Errorf("it reached its migration policy timeout_sec (%ds) and its libvirt job was aborted; %s stays on %s: %w",
+							migratePolicy.GetTimeoutSec(), vm.Name, s.hostName, migrateErr)
+					}
+					answered := make(chan error, 1)
+					answered <- migrateErr
+					done = answered
+					migrateCtx = context.WithoutCancel(ctx) // the loop now reads libvirt's answer
+					continue poll
+				case <-grace.C:
+				}
+			}
 			// libvirt is still migrating. MigrateToTarget takes no context, so
 			// cancelling this request does not stop the guest moving — it only
 			// stops us watching. Returning bare here left the VM at
@@ -984,6 +1006,13 @@ poll:
 					target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec, armed: armed,
 					createdStubs: createdStubs, lease: migLease, fwLive: fwl,
 				})
+			if timedOut {
+				return status.Errorf(codes.DeadlineExceeded,
+					"the migration of %q to %s reached its migration policy timeout_sec (%ds) and its libvirt job was aborted, "+
+						"but libvirt did not answer the abort within %s; the move is left to finish in the background, and %s ends "+
+						"running on %s or on %s, never on both — watch `lv events %s`",
+					vm.Name, req.TargetHost, migratePolicy.GetTimeoutSec(), s.drainAbortGraceOrDefault(), vm.Name, s.hostName, req.TargetHost, vm.Name)
+			}
 			return status.Errorf(codes.DeadlineExceeded,
 				"stopped waiting for the migration of %q to %s (%v); it is still running in "+
 					"libvirt and will be completed in the background — watch `lv events %s`",
@@ -1562,7 +1591,7 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 		return nil, status.Errorf(codes.Internal, "generate cloud-init ISO: %v", err)
 	}
 	if !existed {
-		s.migrationISOs.add(req.VmName, isoPath)
+		s.recordMade(ctx, &s.migrationISOs, req.VmName, isoPath)
 	}
 	slog.Info("cloud-init ISO generated for migration", "vm", req.VmName, "path", isoPath, "replaced", existed)
 	return &emptypb.Empty{}, nil
@@ -1675,7 +1704,7 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 			return nil, status.Errorf(codes.InvalidArgument, "disk stub path %q is not in a disk-artifact root", stub.Path)
 		}
 		if _, err := os.Lstat(stub.Path); err == nil {
-			if !s.migrationStubs.owns(req.VmName, stub.Path) {
+			if !s.madeHere(ctx, &s.migrationStubs, req.VmName, stub.Path) {
 				return nil, status.Errorf(codes.FailedPrecondition,
 					"disk %s of VM %q already exists on %s, and this migration did not create it. "+
 						"It may be the VM's disk from an earlier stay on %s (a copy partition settle kept, or one a "+
@@ -1739,7 +1768,7 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 			return nil, status.Errorf(codes.Internal, "create stub %s: %v", stub.Path, err)
 		}
 		made = append(made, stub.Path)
-		s.migrationStubs.add(req.VmName, stub.Path)
+		s.recordMade(ctx, &s.migrationStubs, req.VmName, stub.Path)
 		resp.CreatedPaths = append(resp.CreatedPaths, stub.Path)
 		slog.Info("disk stub created for migration", "vm", req.VmName, "path", stub.Path, "size_bytes", stub.SizeBytes)
 	}
@@ -2350,7 +2379,7 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 	for _, p := range paths {
 		named[p] = true
 	}
-	for p, at := range s.migrationStubs.recordedFor(req.VmName) {
+	for p, at := range s.madeHereFor(ctx, &s.migrationStubs, req.VmName) {
 		if named[p] {
 			continue
 		}
@@ -2376,7 +2405,7 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 		// list is not trusted for it: a source built before EnsureDisks reported
 		// what it created names every disk path, including a disk that was here
 		// already, and removing that by name deleted it (drill D1).
-		if vmLivesHere || !s.migrationStubs.owns(req.VmName, p) {
+		if vmLivesHere || !s.madeHere(ctx, &s.migrationStubs, req.VmName, p) {
 			slog.Warn("cleanup migration artifacts: leaving a disk file this host did not create as a migration stub",
 				"vm", req.VmName, "path", p, "vm_lives_here", vmLivesHere)
 			continue
@@ -2394,7 +2423,7 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 	if req.RemoveCloudInit {
 		if iso, perr := lv.SafeCloudInitISOPath(s.dataDir, req.VmName); perr != nil {
 			slog.Warn("cleanup migration artifacts: invalid vm name for cloud-init path", "vm", req.VmName, "error", perr)
-		} else if vmLivesHere || !s.migrationISOs.owns(req.VmName, iso) {
+		} else if vmLivesHere || !s.madeHere(ctx, &s.migrationISOs, req.VmName, iso) {
 			slog.Warn("cleanup migration artifacts: leaving a cloud-init ISO this host did not create for the migration",
 				"vm", req.VmName, "path", iso, "vm_lives_here", vmLivesHere)
 		} else if err := cloudinit.RemoveSeed(iso); err != nil {
@@ -3180,14 +3209,15 @@ var adoptedMigrationCeiling = time.Hour
 // would not converge kept running, adopted, with the VM's lock held. A client
 // that merely stopped listening (ctx itself done) is not a policy: that
 // migration is adopted and allowed to finish.
-func (s *Server) abortOnMigrateTimeout(ctx, migrateCtx context.Context, vmName string) {
+func (s *Server) abortOnMigrateTimeout(ctx, migrateCtx context.Context, vmName string) bool {
 	if ctx.Err() != nil || !errors.Is(migrateCtx.Err(), context.DeadlineExceeded) {
-		return
+		return false
 	}
 	slog.Warn("migrate: timeout reached; aborting the libvirt migration job", "vm", vmName)
 	if err := s.virt.AbortMigration(vmName); err != nil {
 		slog.Error("migrate: could not abort the timed-out migration", "vm", vmName, "error", err)
 	}
+	return true
 }
 
 // finishMigrationOnTarget is everything after a committed cut-over that makes
@@ -3309,6 +3339,8 @@ type migrationAbort struct {
 	// diskAddr is the target's address in migration.network, when the cold disk
 	// copy is to use it ("" = the cluster address).
 	diskAddr string
+	// copyStarted is set once a cold move began copying a disk to the target.
+	copyStarted bool
 }
 
 // undoMigrationAttempt is MigrateVM's exit path for an attempt that ended before
@@ -3322,13 +3354,19 @@ func (s *Server) undoMigrationAttempt(ctx context.Context, vmName, target string
 	// The VFs first: the guest is staying, and every moment it runs without its
 	// NIC, with the VF free for another VM to claim, is the damage being undone.
 	s.reattachVFsOnSource(ctx, vmName, a.detachedVFs, a.leaseWritten)
+	// A cold move rolls back from here after its disk copy began, too: the
+	// record says which.
+	when := "before the copy started"
+	if a.copyStarted {
+		when = "after its disk copy started"
+	}
 	if a.stateWritten {
 		s.restoreSourceStateAfterFailedMigration(ctx, vmName,
-			fmt.Sprintf("migration to %s abandoned before the copy started", target),
-			fmt.Sprintf("migration to %s abandoned before the copy started, and the domain is not running", target))
+			fmt.Sprintf("migration to %s abandoned %s", target, when),
+			fmt.Sprintf("migration to %s abandoned %s, and the domain is not running", target, when))
 	}
 	s.cleanupFailedMigrationTarget(ctx, vmName, target, a.createdStubs)
-	slog.Warn("migrate: attempt ended before the copy started; undone", "vm", vmName, "target", target)
+	slog.Warn("migrate: attempt ended "+when+"; undone", "vm", vmName, "target", target)
 }
 
 // restoreSourceStateAfterFailedMigration takes a VM's row out of `migrating`

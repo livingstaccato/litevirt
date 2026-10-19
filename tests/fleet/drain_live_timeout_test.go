@@ -529,3 +529,155 @@ func TestFleet_OperationAbortBeforeTheLiveMoveStartsIsReportedAsAnAbort(t *testi
 		t.Fatalf("VM row = %+v (err %v); want running on %s", row, rerr, sc.src.Name)
 	}
 }
+
+// A VM whose migration policy caps the bandwidth (migrate.bandwidth-mib-sec)
+// drains live: the bandwidth reaches libvirt as a parameter it can decode, so
+// the guest is never shut down for a cold move.
+//
+// Mutation: build the bandwidth parameter without its type tag — libvirt
+// (the fake decodes as libvirtd does) refuses it, the drain cold-moves the
+// guest, red.
+func TestFleet_DrainOfAVMWithABandwidthCapMovesItLive(t *testing.T) {
+	sc := newStuckLiveDrainTimeout(t, false, 0)
+	ctx := context.Background()
+	spec, err := json.Marshal(&pb.VMSpec{Name: "slow", Cpu: 1, MemoryMib: 256,
+		Migrate: &pb.MigrationPolicy{BandwidthMibSec: 64}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.src.DB.Execute(ctx, `UPDATE vms SET spec = ?, updated_at = ? WHERE name = 'slow'`, string(spec), sc.src.DB.NowTS()); err != nil {
+		t.Fatal(err)
+	}
+	sc.src.Virt.FailMigrateToTarget = func(name, _ string) error {
+		if name == "slow" {
+			cutOver(t, sc)
+		}
+		return nil
+	}
+	p, err := sc.drain(t)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if p == nil || p.Status != "done" || p.Strategy != pb.MigrateStrategy_MIGRATE_LIVE || p.Error != "" {
+		t.Fatalf("drain progress for slow = %+v; want done, live", p)
+	}
+	if n := sc.srcOps("shutdown"); n != 0 {
+		t.Fatalf("slow was shut down %d time(s); a capped bandwidth must not stop a live move", n)
+	}
+	waitRow(t, sc.src, sc.dst.Name, "running")
+}
+
+// A drain's live move that completes is recorded in the VM's events, as a
+// cold move is: `lv events <vm>` is where the drain's docs send an operator.
+//
+// Mutation: no event on the live success path — red.
+func TestFleet_ALiveDrainMoveIsRecordedInTheVMsEvents(t *testing.T) {
+	sc := newStuckLiveDrainTimeout(t, false, 0)
+	sc.src.Virt.FailMigrateToTarget = func(name, _ string) error {
+		if name == "slow" {
+			cutOver(t, sc)
+		}
+		return nil
+	}
+	if p, err := sc.drain(t); err != nil || p == nil || p.Status != "done" || p.Strategy != pb.MigrateStrategy_MIGRATE_LIVE {
+		t.Fatalf("drain = %+v, %v; want slow moved live", p, err)
+	}
+	evs, err := corrosion.ListVMEvents(context.Background(), sc.src.DB, "slow", 50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range evs {
+		if e.Type == "vm.drain" && e.Result == "ok" && strings.Contains(e.Detail, "moved live to "+sc.dst.Name) {
+			return
+		}
+	}
+	t.Fatalf("no vm.drain event records slow's live move to %s: %+v", sc.dst.Name, evs)
+}
+
+// A live move stopped at its policy timeout, or by an operator, is not
+// followed by a cold move, and the log says so: it no longer says it falls
+// back to one (lab2-drain anomaly 4).
+//
+// Mutation: log the cold fallback before deciding whether there is one — red.
+func TestFleet_AStoppedLiveDrainMoveDoesNotLogAColdFallback(t *testing.T) {
+	logs := captureLogs(t)
+	sc := newStuckLiveDrain(t, false)
+	if _, err := sc.drain(t); err == nil {
+		t.Fatal("drain of a VM whose live move timed out reported success")
+	}
+	out := logs.String()
+	if strings.Contains(out, "falling back to a cold move") {
+		t.Fatalf("the log says the timed-out move falls back to a cold move:\n%s", grepLines(out, "slow"))
+	}
+	if !strings.Contains(out, "no cold move follows") {
+		t.Fatalf("the log does not say the stopped move has no cold move:\n%s", grepLines(out, "slow"))
+	}
+}
+
+// grepLines is the lines of s that contain sub.
+func grepLines(s, sub string) string {
+	var out []string
+	for _, l := range strings.Split(s, "\n") {
+		if strings.Contains(l, sub) {
+			out = append(out, l)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// migrateSlow runs `lv migrate slow <dst>` from the source and returns its
+// error.
+func (sc *stuckLiveDrain) migrateSlow(t *testing.T) error {
+	t.Helper()
+	st, err := sc.c.SelfClient(sc.src).MigrateVM(context.Background(), &pb.MigrateVMRequest{VmName: "slow", TargetHost: sc.dst.Name})
+	if err != nil {
+		return err
+	}
+	for {
+		if _, rerr := st.Recv(); rerr == io.EOF {
+			return nil
+		} else if rerr != nil {
+			return rerr
+		}
+	}
+}
+
+// `lv migrate` past the VM's timeout-sec aborts the libvirt job and says what
+// happened (lab2-drain anomaly 5): the abort taken, the VM staying on its
+// host; or, when libvirt does not answer the abort, that it was aborted and
+// is finished in the background. It never says a job it aborted "will be
+// completed in the background".
+//
+// Mutation: return the old "still running in libvirt and will be completed
+// in the background" after the abort — red.
+func TestFleet_MigrateReportsItsTimeoutAbortAsWhatHappened(t *testing.T) {
+	t.Run("the abort is taken", func(t *testing.T) {
+		sc := newStuckLiveDrain(t, false)
+		err := sc.migrateSlow(t)
+		if err == nil || strings.Contains(err.Error(), "will be completed in the background") ||
+			!strings.Contains(err.Error(), "timeout_sec (1s)") || !strings.Contains(err.Error(), "was aborted") ||
+			!strings.Contains(err.Error(), "slow stays on "+sc.src.Name) {
+			t.Fatalf("migrate = %v; want the timeout's abort reported, slow staying on %s", err, sc.src.Name)
+		}
+		waitRow(t, sc.src, sc.src.Name, "running")
+	})
+	t.Run("libvirt does not answer the abort", func(t *testing.T) {
+		sc := newStuckLiveDrain(t, false)
+		sc.src.Server.SetDrainAbortGraceForTest(300 * time.Millisecond)
+		release := releaseOnCleanup(t)
+		sc.src.Virt.FailMigrateToTarget = func(name, _ string) error {
+			if name == "slow" {
+				<-release
+				return errors.New("operation aborted: migration out job: canceled by client")
+			}
+			return nil
+		}
+		err := sc.migrateSlow(t)
+		if err == nil || strings.Contains(err.Error(), "will be completed in the background") ||
+			!strings.Contains(err.Error(), "was aborted") || !strings.Contains(err.Error(), "did not answer the abort") {
+			t.Fatalf("migrate = %v; want the abort reported as unanswered, the move finishing in the background", err)
+		}
+		close(release)
+		waitRow(t, sc.src, sc.src.Name, "running")
+	})
+}

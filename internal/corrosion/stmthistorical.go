@@ -410,5 +410,23 @@ func HistoricalShapes() []HistoricalShape {
 	add(`UPDATE rebalance_proposals SET status='failed', detail='execution timed out', updated_at=?
 		 WHERE status='applying' AND updated_at < ?`, "rebalance_reap_stale_bulk_v130")
 
+	// The former host-only move of a disk row, which every release from v1.3.0
+	// through v1.9.0 emits in a migration's ownership commit, and which the
+	// integration builds up to 9eb7951f also emit in each failover reschedule,
+	// stopped re-key and ownership transfer. The current tree moves a row's
+	// placement instead (diskPlacementMove, UpdateDiskPlacement's statement),
+	// so a replica holding an earlier path for the row cannot keep it under the
+	// new host. A peer on an older build still sends this during a rolling
+	// upgrade; it applies as the LWW-gated full-PK update it always was. Its
+	// horizon is its NEWEST emitter, v1.9.0, not v1.3.0.
+	out = append(out, HistoricalShape{
+		SQL: `UPDATE vm_disks SET host_name = ?, updated_at = ?
+			      WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
+		Family:       "vm_disk_host_move_v130",
+		FirstEmitter: emitterV130,
+		LastEmitter:  "v1.9.0",
+		Removal:      "after v1.9.0 unsupported, and once no node runs a build before the placement move",
+	})
+
 	return out
 }

@@ -79,9 +79,21 @@ it never saw keeps them, and raises the same condition for the torn-down
 stack while it holds them. `lv compose down --name <stack>` by an Admin
 removes what is left, record or not.
 
-Residual: a previous release's reconciler still removes the firewall it
-holds of a stack whose teardown it receives, until that host is upgraded. A
-redeploy through the same older file can still withdraw a deny ask.
+A redeploy through the same older file replaces the stack's file on every
+peer, so what a stack declares of its firewall is also recorded apart from
+the file: a deploy by a caller with `sg.write` at `/` writes
+`stack_firewall/<name>` in `cluster_policies` (whether the file declares a
+firewall, and whether it asks for the default-deny) before any row changes,
+and an Admin's teardown clears it. A deploy without `sg.write` never writes
+it. A stack asks for the default-deny when its file or this record does (the
+hand-off on teardown and the re-assert both read it), a deploy or teardown
+without `sg.write` counts a firewall the record declares, and a live stack
+whose file no longer declares what the record does raises
+`stack.firewall_teardown_held`.
+
+Residual: a previous release neither checks nor records any of this, so it
+holds only once every host runs this release (docs/upgrades.md, "Stack
+firewall changes need sg.write only after the roll").
 
 `ListSecurityGroups`:
 

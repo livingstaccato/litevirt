@@ -228,3 +228,88 @@ func TestStackReconciler_ReportsTheFirewallATornDownStackLeft(t *testing.T) {
 		t.Errorf("the condition stayed open once the group was removed: %s", ev)
 	}
 }
+
+// A live stack whose file no longer declares what its last deploy with
+// sg.write declared (StackFirewallIntent) is reported, and resolves once the
+// file declares it again; a teardown without sg.write holds a firewall the
+// intent alone declares, and one with it clears the intent.
+//
+// Mutations: never report a withdrawn firewall — red. Drop the intent from
+// stackFirewallHold — "held by the intent alone", red. Do not clear the
+// intent on an authorized teardown — red.
+func TestStackReconciler_TheFirewallIntentOutlivesAStaleFile(t *testing.T) {
+	ctx := context.Background()
+	newDB := func() *corrosion.Client {
+		db := corrosion.NewTestClientT(t)
+		if err := corrosion.InitSchema(ctx, db); err != nil {
+			t.Fatal(err)
+		}
+		db.SetClusterPolicyGate(func() bool { return true })
+		return db
+	}
+	open := func(db *corrosion.Client, stack string) (bool, string) {
+		row, found, err := corrosion.GetHealthCondition(ctx, db, firewallHoldEvaluator, firewallHoldCode, firewallHoldKind, stack)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return found && row.Lifecycle != corrosion.ConditionResolved, row.Evidence
+	}
+	t.Run("withdrawn", func(t *testing.T) {
+		db := newDB()
+		if err := corrosion.SetStackFirewallIntent(ctx, db, "edge", corrosion.StackFirewallIntent{Firewall: true, DefaultDeny: true}, "node-0"); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.UpsertStack(ctx, db, corrosion.StackRecord{Name: "edge", ComposeYAML: "name: edge\n", State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+		r := NewStackReconciler("node-0", db)
+		r.SetCleaner(&failingStackCleaner{})
+		r.ReconcileOnce(ctx)
+		if ok, ev := open(db, "edge"); !ok || !strings.Contains(ev, "lv compose up") || !strings.Contains(ev, "lv compose down --name edge") {
+			t.Fatalf("a withdrawn default-deny is not reported: open %v, %s", ok, ev)
+		}
+		if err := corrosion.UpsertStack(ctx, db, corrosion.StackRecord{Name: "edge", ComposeYAML: "name: edge\nfirewall:\n  default-deny: true\n", State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+		r.ReconcileOnce(ctx)
+		if ok, ev := open(db, "edge"); ok {
+			t.Errorf("the condition stayed open once the file declared the deny again: %s", ev)
+		}
+	})
+	t.Run("held by the intent alone", func(t *testing.T) {
+		db := seedDeletingStack(t, false, false)
+		db.SetClusterPolicyGate(func() bool { return true })
+		if err := corrosion.SetStackFirewallIntent(ctx, db, "app", corrosion.StackFirewallIntent{DefaultDeny: true}, "node-0"); err != nil {
+			t.Fatal(err)
+		}
+		markTeardown(true, false)(t, db)
+		r := NewStackReconciler("node-0", db)
+		r.SetCleaner(&failingStackCleaner{})
+		r.SetClock(func() time.Time { return time.Now().Add(2 * stackTeardownGrace) })
+		r.ReconcileOnce(ctx)
+		if st, _ := corrosion.GetStack(ctx, db, "app"); st == nil || st.State != "deleting" {
+			t.Fatalf("stack = %+v, want it kept \"deleting\"", st)
+		}
+		if ok, _ := open(db, "app"); !ok {
+			t.Fatal("no condition for a teardown the intent holds")
+		}
+	})
+	t.Run("an authorized teardown clears it", func(t *testing.T) {
+		db := seedDeletingStack(t, false, false)
+		db.SetClusterPolicyGate(func() bool { return true })
+		if err := corrosion.SetStackFirewallIntent(ctx, db, "app", corrosion.StackFirewallIntent{Firewall: true}, "node-0"); err != nil {
+			t.Fatal(err)
+		}
+		markTeardown(true, true)(t, db)
+		r := NewStackReconciler("node-0", db)
+		r.SetCleaner(&failingStackCleaner{})
+		r.SetClock(func() time.Time { return time.Now().Add(2 * stackTeardownGrace) })
+		r.ReconcileOnce(ctx)
+		if st, _ := corrosion.GetStack(ctx, db, "app"); st != nil {
+			t.Fatalf("the authorized teardown did not finish: %+v", st)
+		}
+		if in, found, _ := corrosion.GetStackFirewallIntent(ctx, db, "app"); !found || in.Firewall || in.DefaultDeny {
+			t.Errorf("intent after an authorized teardown = %+v (found %v), want cleared", in, found)
+		}
+	})
+}

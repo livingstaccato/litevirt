@@ -284,3 +284,80 @@ security-groups:
 		t.Errorf("the condition did not resolve once the group was removed: %+v", cond)
 	}
 }
+
+// TestFleet_StackFirewall_AStaleRedeployCannotWithdrawADefaultDeny: stack
+// base owns the cluster default-deny, and an Admin redeploys stack edge on
+// node-0 asking for it too while node-1 lags. An Operator without sg.write
+// redeploys edge on node-1 from the older file, which asks for nothing: it
+// sees no firewall, so it is allowed, and its record replaces edge's file on
+// every node. When an Admin then tears base down, the deny passes to edge,
+// whose last deploy with sg.write asked for it: the cluster stays
+// default-deny, and stack.firewall_teardown_held says edge's file no longer
+// declares it.
+//
+// Mutation: drop the firewall intent from otherStackWants — the deny goes
+// with base, red. Write the intent for a deploy without sg.write — the
+// Operator's redeploy withdraws it, red.
+func TestFleet_StackFirewall_AStaleRedeployCannotWithdrawADefaultDeny(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 2, IndependentReplicas: true, FaultSeed: 7206})
+	a, b := c.Nodes[0], c.Nodes[1]
+	for _, n := range c.Nodes {
+		openNICGuards(t, n)
+	}
+	tok := scopedOperatorToken(t, c, a, "opal", "acme")
+	admin := c.SelfClient(a)
+	deployAndDrain(t, ctx, admin, &pb.DeployStackRequest{ComposeYaml: "name: base\nfirewall:\n  default-deny: true\n"})
+	deployAndDrain(t, ctx, admin, &pb.DeployStackRequest{ComposeYaml: "name: edge\n"})
+	c.WaitConverged(t, convergeTimeout)
+	for _, n := range c.Nodes {
+		e := auth.NewEngine(n.DB)
+		if err := e.Reload(ctx); err != nil {
+			t.Fatal(err)
+		}
+		n.Server.SetAuthEngine(e)
+	}
+	if d, _ := corrosion.GetFirewallDefault(ctx, a.DB, "cluster"); d == nil || !d.DefaultDeny || d.StackName != "base" {
+		t.Fatalf("fixture: the cluster default is %+v, want deny owned by base", d)
+	}
+
+	c.Isolate(b)
+	deployAndDrain(t, ctx, admin, &pb.DeployStackRequest{ComposeYaml: "name: edge\nfirewall:\n  default-deny: true\n"})
+	if st, _ := corrosion.GetStack(ctx, b.DB, "edge"); st == nil || strings.Contains(st.ComposeYAML, "default-deny") {
+		t.Fatalf("fixture: %s does not hold the older edge: %+v", b.Name, st)
+	}
+	deployAndDrain(t, ctx, c.bearerClient(b, tok), &pb.DeployStackRequest{ComposeYaml: "name: edge\n# redeployed\n"})
+
+	c.ClearLinkFaults()
+	eventually(t, convergeTimeout, "the Operator's edge reaches "+a.Name, func() bool {
+		st, _ := corrosion.GetStack(ctx, a.DB, "edge")
+		return st != nil && !strings.Contains(st.ComposeYAML, "default-deny")
+	})
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"stacks"})
+
+	// An Admin tears base down, expecting edge to keep the deny.
+	stream, err := admin.DeleteStack(ctx, &pb.DeleteStackRequest{Name: "base"})
+	for err == nil {
+		_, err = stream.Recv()
+	}
+	if err != io.EOF {
+		t.Fatalf("an Admin's compose down of base: %v", err)
+	}
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"stacks"})
+	for _, n := range c.Nodes {
+		if d, _ := corrosion.GetFirewallDefault(ctx, n.DB, "cluster"); d == nil || !d.DefaultDeny {
+			t.Errorf("%s: the cluster default is %+v: a stale Operator redeploy withdrew edge's default-deny", n.Name, d)
+		}
+	}
+
+	r := health.NewStackReconciler(a.Name, a.DB)
+	r.SetCleaner(a.Server)
+	r.ReconcileOnce(ctx)
+	cond, found, err := corrosion.GetHealthCondition(ctx, a.DB, "stack_reconciler", "stack.firewall_teardown_held", "stack", "edge")
+	if err != nil || !found || cond.Lifecycle == corrosion.ConditionResolved {
+		t.Fatalf("no open stack.firewall_teardown_held for edge: %+v (found %v, err %v)", cond, found, err)
+	}
+	if !strings.Contains(cond.Evidence, "lv compose up") || !strings.Contains(cond.Evidence, "lv compose down --name edge") {
+		t.Errorf("the condition does not name the remedies: %s", cond.Evidence)
+	}
+}

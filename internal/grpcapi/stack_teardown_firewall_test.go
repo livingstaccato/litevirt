@@ -85,3 +85,85 @@ func TestDeleteStack_ATeardownWithoutSGWriteLeavesAFirewallThatArrivesDuringIt(t
 		})
 	}
 }
+
+// A deploy of a stack whose teardown keeps its firewall
+// (stack.firewall_teardown_held) is refused naming the condition and the
+// Admin's exit: that teardown does not finish by itself, so "wait until it
+// is gone" would be a wait without end. Any other teardown keeps the wait.
+//
+// Mutation: drop the held branch — the refusal says to wait, red.
+func TestDeployStack_ARefusalOverAHeldTeardownNamesTheAdminExit(t *testing.T) {
+	ctx := context.Background()
+	s, _, ada := stackFirewallFixture(t)
+	if err := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{Name: "held", ComposeYAML: "name: held\n", State: stackStateDeleting}); err != nil {
+		t.Fatal(err)
+	}
+	deploy := func() error {
+		return s.DeployStack(&pb.DeployStackRequest{ComposeYaml: "name: held\n"}, &mockDeployStreamR2{ctx: ada})
+	}
+	if err := deploy(); err == nil || !strings.Contains(err.Error(), "wait until") {
+		t.Fatalf("a deploy over a teardown in progress: %v, want the wait", err)
+	}
+	ts := "2026-10-19T00:00:00Z"
+	if err := corrosion.UpsertHealthCondition(ctx, s.db, corrosion.HealthCondition{
+		Evaluator: corrosion.StackFirewallHoldEvaluator, Code: corrosion.StackFirewallHoldCode,
+		SubjectKind: corrosion.StackFirewallHoldKind, SubjectID: "held", Lifecycle: corrosion.ConditionConfirmed,
+		Severity: corrosion.SeverityWarning, FirstSeen: ts, ConfirmedAt: ts, LastSeen: ts, Evidence: "{}",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := deploy()
+	if err == nil || !strings.Contains(err.Error(), corrosion.StackFirewallHoldCode) ||
+		!strings.Contains(err.Error(), "`lv compose down --name held`") || strings.Contains(err.Error(), "wait until") {
+		t.Fatalf("a deploy over a held teardown: %v, want the condition and the Admin's exit", err)
+	}
+}
+
+// What a stack's firewall is, as its last deploy by a caller with sg.write
+// at the root declared it, is recorded by that deploy only; a deploy without
+// it is refused when the record declares a firewall, even where neither the
+// stack's rows nor its file here do (a node whose replica holds an older
+// file). An Admin's teardown clears it.
+//
+// Mutations: record the intent for any caller — the Operator's deploy
+// records it, red. Drop the intent from stackFirewallRefusal — the
+// Operator's redeploy is allowed, red. Keep the intent on an Admin's
+// teardown — red.
+func TestDeployStack_TheFirewallIntentIsTheAdminsToChange(t *testing.T) {
+	ctx := context.Background()
+	s, opal, ada := stackFirewallFixture(t)
+	s.db.SetClusterPolicyGate(func() bool { return true })
+	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: "name: fw\nfirewall:\n  default-deny: true\n"}, &mockDeployStreamR2{ctx: ada}); err != nil {
+		t.Fatalf("the Admin deploys: %v", err)
+	}
+	if in, found, _ := corrosion.GetStackFirewallIntent(ctx, s.db, "fw"); !found || !in.DefaultDeny || !in.Firewall {
+		t.Fatalf("the Admin's deploy recorded intent %+v (found %v), want the default-deny", in, found)
+	}
+	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: "name: plain\n"}, &mockDeployStreamR2{ctx: opal}); err != nil {
+		t.Fatalf("the Operator deploys a stack with no firewall: %v", err)
+	}
+	if in, found, _ := corrosion.GetStackFirewallIntent(ctx, s.db, "plain"); found {
+		t.Fatalf("a deploy without sg.write recorded intent %+v", in)
+	}
+
+	// As a node holding an older file sees fw: no firewall in the file and
+	// no row here; the intent is all that says it has one.
+	if err := corrosion.DeleteStackFirewall(ctx, s.db, "fw", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{Name: "fw", ComposeYAML: "name: fw\n", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: "name: fw\n"}, &mockDeployStreamR2{ctx: opal})
+	wantGrantHint(t, "an Operator redeploys over the Admin's intent", err)
+	if !strings.Contains(err.Error(), "last deploy by a caller with sg.write") {
+		t.Errorf("the refusal does not say why: %v", err)
+	}
+
+	if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "fw"}, &mockDeleteStream{ctx: ada}); err != nil {
+		t.Fatalf("the Admin tears fw down: %v", err)
+	}
+	if in, found, _ := corrosion.GetStackFirewallIntent(ctx, s.db, "fw"); !found || in.Firewall || in.DefaultDeny {
+		t.Fatalf("the Admin's teardown left intent %+v (found %v), want it cleared", in, found)
+	}
+}

@@ -1486,6 +1486,23 @@ with FailedPrecondition until `release_2026_11_v1` has latched, and its first
 use is recorded before the group is written. Global groups are created as
 before throughout, and every existing group stays global.
 
+### Stack firewall changes need sg.write only after the roll
+
+On this release, `lv compose down` and `lv compose up` of a stack need
+`sg.write` at `/` to remove or withdraw the stack's firewall, wherever it is:
+a host keeps a stack's security groups, ip sets, rules and default-deny when
+the teardown's caller did not hold it, and a deploy without it cannot
+withdraw what the stack's last deploy with it declared
+(`stack.firewall_teardown_held`, docs/diagnostics.md). That holds only once
+every host runs this release. A host on the previous release checks neither:
+an Operator's `lv compose down` or `lv compose up` on it changes the stack's
+firewall as before, and its stack reconciler removes the firewall it holds
+of any stack being torn down, whoever began the teardown. A stack whose last
+deploy with `sg.write` ran on the previous release has no recorded intent,
+and its file alone says what it asks for. Finish the roll before relying on
+the check; an Admin's `lv compose up` from an upgraded host records the
+intent of a stack deployed before it.
+
 ### A hand-deleted NetBox address is re-created after the roll
 
 A lease names its NetBox address object by id. When that object is deleted in

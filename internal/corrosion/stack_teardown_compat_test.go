@@ -80,3 +80,42 @@ func TestStackTeardownRecord_CrossesARollingUpgrade(t *testing.T) {
 		t.Errorf("a previous release's disk choice reads as deletes %v proven %v", deletes, proven)
 	}
 }
+
+// A stack whose file no longer asks for the default-deny, but whose last
+// deploy with sg.write did, is still an heir of the deny: a stale deploy
+// does not withdraw the ask. An intent this build cannot read asks for it.
+//
+// Mutation: drop the intent from otherStackWants — the deny is removed, red.
+func TestStackFirewallIntent_KeepsADefaultDenyAsk(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct{ name, value string }{
+		{"recorded", `{"firewall":true,"default_deny":true}`},
+		{"unreadable", `not json`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewTestClientT(t)
+			if err := InitSchema(ctx, c); err != nil {
+				t.Fatal(err)
+			}
+			c.SetClusterPolicyGate(func() bool { return true })
+			for _, st := range []StackRecord{{Name: "base", ComposeYAML: "deny", State: "active"}, {Name: "edge", ComposeYAML: "", State: "active"}} {
+				if err := UpsertStack(ctx, c, st); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := SetFirewallDefault(ctx, c, "cluster", true, "base"); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Execute(ctx, clusterPolicyUpsertSQL, stackFirewallKeyPrefix+"edge", tc.value, "node-0", c.NowTS()); err != nil {
+				t.Fatal(err)
+			}
+			read := func(y string) (bool, map[string]bool, error) { return y == "deny", nil, nil }
+			if err := DeleteStackFirewallDefaults(ctx, c, "base", read); err != nil {
+				t.Fatal(err)
+			}
+			if d, _ := GetFirewallDefault(ctx, c, "cluster"); d == nil || !d.DefaultDeny || d.StackName != "edge" {
+				t.Fatalf("the cluster default after base went = %+v, want deny handed to edge", d)
+			}
+		})
+	}
+}

@@ -29,6 +29,14 @@ func otherStackWants(ctx context.Context, c *Client, stack string, read StackFil
 	if err != nil {
 		return nil, nil, err
 	}
+	// A stack asks for the default-deny when its file does, or when its last
+	// deploy by a caller with sg.write at the root did (StackFirewallIntent):
+	// a deploy without it, from a node holding an older file, does not
+	// withdraw the ask.
+	intents, err := StackFirewallIntents(ctx, c)
+	if err != nil {
+		return nil, nil, err
+	}
 	for _, st := range stacks {
 		if st.Name == stack || st.State == "deleting" {
 			continue
@@ -42,6 +50,7 @@ func otherStackWants(ctx context.Context, c *Client, stack string, read StackFil
 			unreadable = append(unreadable, st.Name)
 			continue
 		}
+		deny = deny || intents[st.Name].DefaultDeny
 		out = append(out, stackWants{name: st.Name, updatedAt: st.UpdatedAt, defaultDeny: deny, repos: repos})
 	}
 	return out, unreadable, nil

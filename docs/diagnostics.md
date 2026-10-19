@@ -1811,29 +1811,38 @@ created and torn down. `lv rm <vm>` removes the VM; deploying the stack again
 next pass after either. A VM created after the stack was torn down is a
 deploy of that stack name in progress, and is not reported.
 
-### A stack firewall a teardown may not remove (`stack.firewall_teardown_held`)
+### A stack firewall a caller could not remove (`stack.firewall_teardown_held`)
 
 Evaluator `stack_reconciler`, subject kind `stack`, subject the stack's
-name, severity warning. `lv compose down` by a caller without `sg.write` at
-`/` runs only where the entry node sees no firewall for the stack, and that
-node may hold an older record of it. Raised by the stack reconciler on a
-host that holds a firewall of the stack (a security group, ip set, cluster
-or host rule or firewall default it owns, or a stored file that declares a
-firewall or cannot be read) in two cases:
+name, severity warning. `lv compose down` and `lv compose up` by a caller
+without `sg.write` at `/` run only where the entry node sees no firewall for
+the stack, and that node may hold an older record of it. Raised by the stack
+reconciler on a host that holds a firewall of the stack (a security group,
+ip set, cluster or host rule or firewall default it owns, a stored file that
+declares a firewall or cannot be read, or the intent the stack's last deploy
+with `sg.write` recorded) in three cases:
 
 - the stack is `deleting` and its teardown may not remove that firewall: its
   caller did not hold `sg.write` at `/`, or its record does not say (begun by
   an older build, before `cluster_policies` could be written, or re-stamped
   since). The firewall stays in force and the stack stays `deleting`; its
-  workloads and networks are still removed.
+  workloads and networks are still removed, and `lv compose up` of the name
+  is refused naming this condition.
 - the stack was torn down while this host holds a security group, ip set,
   or cluster or host rule it owns, written before the teardown. They stay in
   force. A cluster default-deny it owns is `firewall.default_deny_orphaned`.
+- the stack is live and its file no longer declares the firewall, or the
+  default-deny, its last deploy with `sg.write` declared: a deploy without
+  `sg.write` replaced it. What that deploy declared still stands: the stack
+  still asks for the default-deny, and a deploy without `sg.write` is still
+  refused.
 
-An Admin finishes the teardown with `lv compose down --name <stack>`, from
-any node, record or not; `lv role grant NetworkAdmin <principal> --path /
---propagate` lets another caller do it. The condition resolves on the next
-pass after the stack is deployed again or no firewall of it is left.
+An Admin finishes a teardown with `lv compose down --name <stack>`, from any
+node, record or not, and settles a live stack's firewall with `lv compose up`
+of the file it should have; `lv role grant NetworkAdmin <principal> --path /
+--propagate` lets another caller do either. The condition resolves on the
+next pass after that: a torn-down stack's rows are gone, or a live stack's
+file declares what its last deploy with `sg.write` did.
 
 ### Tag-group conditions (`firewall.tag_group.*`)
 

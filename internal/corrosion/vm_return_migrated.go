@@ -38,6 +38,13 @@ func ReturnMigratedVM(ctx context.Context, c *Client, vmName, fromHost, toHost, 
 	if uuid == "" || createdAt == "" {
 		return false, errors.New("ReturnMigratedVM needs the move's uuid and created_at")
 	}
+	// The guard reads the disk rows by vmName and each update is keyed on
+	// the row's own VMName: they must be the same VM.
+	for _, d := range expected {
+		if d.VMName != vmName {
+			return false, fmt.Errorf("ReturnMigratedVM of %q was given disk %q of VM %q", vmName, d.DiskName, d.VMName)
+		}
+	}
 	now := c.NowTS()
 	stmts := []Statement{{
 		SQL:    vmHostStateSQL,

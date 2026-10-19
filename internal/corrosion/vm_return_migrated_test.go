@@ -134,3 +134,30 @@ func mustDisks(t *testing.T, c *Client) []DiskRecord {
 	}
 	return d
 }
+
+// D2 merge with cand31, review N-1: every expected disk row must be the
+// returned VM's. The guard reads rows by vmName, and the update is keyed on
+// each row's own VMName; a row of another VM is refused up front and nothing
+// is written.
+//
+// Mutation: drop the up-front check — the mismatched row's update is
+// written, red.
+func TestReturnMigratedVM_RefusesAnotherVMsDiskRow(t *testing.T) {
+	ctx := context.Background()
+	c, vm, disks := returnRig(t)
+	bad := append([]DiskRecord(nil), disks...)
+	bad[0].VMName = "other"
+	ok, err := ReturnMigratedVM(ctx, c, "fw", "host-b", "host-a", returnUUID, vm.CreatedAt, "stopped", bad)
+	if ok || err == nil {
+		t.Fatalf("ok=%v err=%v, want refused with an error", ok, err)
+	}
+	got, _ := GetVM(ctx, c, "fw")
+	if got == nil || got.HostName != "host-b" {
+		t.Errorf("row after the refusal: %+v, want on host-b", got)
+	}
+	for _, d := range mustDisks(t, c) {
+		if d.HostName != "host-b" {
+			t.Errorf("disk %s moved to %s by a refused return", d.DiskName, d.HostName)
+		}
+	}
+}

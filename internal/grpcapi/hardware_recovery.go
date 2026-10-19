@@ -30,6 +30,17 @@ const hardwareRecoveryInterval = 60 * time.Second
 // Safe at startup and on a reconciler tick, and IDEMPOTENT: a converged/terminal
 // op is a no-op. Resize/device-lease operations are recovered by their own paths.
 func (s *Server) RecoverHardwareOperations(ctx context.Context) {
+	s.recoverHardwareOperations(ctx, true)
+}
+
+// RecoverHardwareOperationsAtStart is RecoverHardwareOperations at daemon
+// start: a VM whose lock is held is skipped, and RunHardwareOperationRecovery
+// takes it later (review D2-13 N-1).
+func (s *Server) RecoverHardwareOperationsAtStart(ctx context.Context) {
+	s.recoverHardwareOperations(ctx, false)
+}
+
+func (s *Server) recoverHardwareOperations(ctx context.Context, wait bool) {
 	if s.opJournal == nil {
 		return // no host-local artifacts → nothing to re-drive
 	}
@@ -39,7 +50,7 @@ func (s *Server) RecoverHardwareOperations(ctx context.Context) {
 		return
 	}
 	for i := range vms {
-		s.recoverOneHardwareOperation(ctx, vms[i].Name)
+		s.recoverOneHardwareOperation(ctx, vms[i].Name, wait)
 	}
 }
 
@@ -63,8 +74,12 @@ func (s *Server) RunHardwareOperationRecovery(ctx context.Context) {
 // VM lock. It re-reads state under the lock (so a converged/terminal op is a no-op),
 // filters to device_attach/device_detach, loads the host-local journal artifacts,
 // and dispatches to the directional re-drive: attach → back, detach → forward.
-func (s *Server) recoverOneHardwareOperation(ctx context.Context, name string) {
-	unlock := s.lockVMAs(name, "hardware recovery")
+func (s *Server) recoverOneHardwareOperation(ctx context.Context, name string, wait bool) {
+	unlock, ok := s.lockVMOrSkipAs(name, "hardware recovery", wait)
+	if !ok {
+		slog.Info("hardware op recovery: the VM is locked; left to the next pass", "vm", name)
+		return
+	}
 	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, name)

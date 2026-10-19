@@ -20,7 +20,7 @@ func staleVarsServer(t *testing.T) *Server {
 		Evaluator: libvirt.NvramFlushEvaluator, Code: libvirt.CondNvramFlushFailed,
 		SubjectKind: "host", SubjectID: "h1", Lifecycle: corrosion.ConditionConfirmed,
 		Severity: corrosion.SeverityCritical, Reporter: "h1", LastSeen: backdated,
-		Evidence: `{"files":[{"path":"/var/lib/libvirt/qemu/nvram/web-1_VARS.fd","vm":"web-1"}]}`,
+		Evidence: `{"files":[{"path":"/var/lib/libvirt/qemu/nvram/web-1_VARS.fd","vm":"web-1","ino":4242,"episode":"9f3a1c"}]}`,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -67,8 +67,9 @@ func TestResolveHealthCondition_StaleUEFIVarsAcknowledged(t *testing.T) {
 	}
 	audits := healthResolveAudits(t, s)
 	if len(audits) != 1 || !strings.Contains(audits[0][1], "may be stale") ||
-		!strings.Contains(audits[0][1], "web-1_VARS.fd") || !strings.Contains(audits[0][1], req.Reason) {
-		t.Fatalf("audit = %v; want one row acknowledging the stale store, naming the file and the reason", audits)
+		!strings.Contains(audits[0][1], "web-1_VARS.fd") || !strings.Contains(audits[0][1], req.Reason) ||
+		!strings.Contains(audits[0][1], "inode 4242") || !strings.Contains(audits[0][1], "episode 9f3a1c") {
+		t.Fatalf("audit = %v; want one row acknowledging the stale store, naming the file, its inode and episode, and the reason", audits)
 	}
 }
 
@@ -124,5 +125,31 @@ func TestResolveHealthCondition_StaleUEFIVarsUnreadableEvidenceIsAudited(t *test
 	audits := healthResolveAudits(t, s)
 	if len(audits) != 1 || !strings.Contains(audits[0][1], "evidence unreadable") {
 		t.Fatalf("audit = %v; want it to say the evidence was unreadable", audits)
+	}
+}
+
+// --accept and --force are vm.move_unresolved's: sent with an acknowledgement
+// of nvram_flush_failed, complete with its own flag and a reason, each is
+// refused, not ignored, and nothing is written or audited.
+func TestResolveHealthCondition_MoveFlagsRefusedOnStaleUEFIVars(t *testing.T) {
+	for name, ctx := range map[string]context.Context{
+		"--accept": acceptCtx("/var/lib/libvirt/qemu/nvram/web-1_VARS.fd"),
+		"--force":  forceCtx(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := staleVarsServer(t)
+			_, err := s.ResolveHealthCondition(ctx, &pb.ResolveHealthConditionRequest{
+				Code: libvirt.CondNvramFlushFailed, SubjectKind: "host", SubjectId: "h1",
+				Reason: "disk replaced", AcceptStaleUefiVars: true})
+			if status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "applies only to vm.move_unresolved") {
+				t.Fatalf("err = %v, want InvalidArgument naming vm.move_unresolved", err)
+			}
+			if got := staleVarsLifecycle(t, s); got != corrosion.ConditionConfirmed {
+				t.Fatalf("a refused acknowledgement left the row %q", got)
+			}
+			if len(healthResolveAudits(t, s)) != 0 {
+				t.Fatal("a refused acknowledgement was audited")
+			}
+		})
 	}
 }

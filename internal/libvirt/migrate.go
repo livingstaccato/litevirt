@@ -71,6 +71,12 @@ type MigrateParams struct {
 	// would fail to start there. It lands with an open VNC console, as every
 	// guest that host defines does; SPICE keeps its own.
 	StripVNCPassword bool
+	// FirmwareLive marks a live firmware move (vTPM or UEFI NVRAM): the source
+	// definition stays (no VIR_MIGRATE_UNDEFINE_SOURCE) and the guest arrives
+	// paused (VIR_MIGRATE_PAUSED) whatever Paused says. A storage copy must go
+	// to the cluster address (TLSDestination) with TLS, and Direct needs TLS;
+	// migrationFlagsAndParams refuses anything else.
+	FirmwareLive bool
 }
 
 // MigrateToTarget performs a live (or cold) P2P migration of a domain to
@@ -107,7 +113,10 @@ func (c *Client) MigrateToTarget(name, dconnuri string, p MigrateParams) error {
 		return fmt.Errorf("domain %q: %w", name, err)
 	}
 
-	flags, params := migrationFlagsAndParams(p)
+	flags, params, err := migrationFlagsAndParams(p)
+	if err != nil {
+		return fmt.Errorf("domain %q: %w", name, err)
+	}
 	_, err = c.virt.DomainMigratePerform3Params(
 		dom,
 		[]string{dconnuri}, // OptString
@@ -148,11 +157,30 @@ func MigrationCDROMXML(live, persist string, remap map[string]string) (dest, per
 // migrationFlagsAndParams builds the flags and typed parameters MigrateToTarget
 // hands DomainMigratePerform3Params. It is pure so the security-relevant bits —
 // VIR_MIGRATE_TLS and tls.destination on an untunnelled storage copy — can be
-// asserted without a libvirt connection.
-func migrationFlagsAndParams(p MigrateParams) (golibvirt.DomainMigrateFlags, []golibvirt.TypedParam) {
-	flags := golibvirt.MigratePeer2peer |
-		golibvirt.MigratePersistDest |
-		golibvirt.MigrateUndefineSource
+// asserted without a libvirt connection. It refuses a firmware move on a route
+// the lab probes did not cover.
+func migrationFlagsAndParams(p MigrateParams) (golibvirt.DomainMigrateFlags, []golibvirt.TypedParam, error) {
+	flags := golibvirt.MigratePeer2peer | golibvirt.MigratePersistDest
+
+	if p.FirmwareLive {
+		// The TPM state and NVRAM ride the stream: only the routes the lab
+		// probes covered, each encrypted, carry them.
+		switch {
+		case p.WithStorage && (p.TargetAddress == "" || p.TargetAddress != p.TLSDestination):
+			return 0, nil, fmt.Errorf("a firmware move copies storage only to the target's cluster address %q, not %q",
+				p.TLSDestination, p.TargetAddress)
+		case p.WithStorage && !p.TLS:
+			return 0, nil, fmt.Errorf("a firmware move does not copy storage without migration TLS")
+		case p.Direct && !p.TLS:
+			return 0, nil, fmt.Errorf("a firmware move does not leave libvirt's tunnel without migration TLS")
+		}
+		// The source definition stays, so its swtpm tree and NVRAM remain
+		// the fallback until the target is verified; the guest arrives
+		// paused for that verification.
+		flags |= golibvirt.MigratePaused
+	} else {
+		flags |= golibvirt.MigrateUndefineSource
+	}
 
 	if p.Paused {
 		flags |= golibvirt.MigratePaused
@@ -242,7 +270,23 @@ func migrationFlagsAndParams(p MigrateParams) (golibvirt.DomainMigrateFlags, []g
 		})
 	}
 
-	return flags, params
+	return flags, params, nil
+}
+
+// DomainJobActive reports whether name has a job running (an outgoing
+// migration among them): libvirt's job type is bounded or unbounded. Unlike
+// DomainJobProgress, which reads -1 for both, an unreadable answer is an
+// error, never "no job".
+func (c *Client) DomainJobActive(name string) (bool, error) {
+	dom, err := c.virt.DomainLookupByName(name)
+	if err != nil {
+		return false, fmt.Errorf("lookup domain %q: %w", name, err)
+	}
+	typ, _, _, _, _, _, _, _, _, _, _, _, err := c.virt.DomainGetJobInfo(dom)
+	if err != nil {
+		return false, fmt.Errorf("domain %q: read its job: %w", name, err)
+	}
+	return typ == int32(golibvirt.DomainJobBounded) || typ == int32(golibvirt.DomainJobUnbounded), nil
 }
 
 // DomainJobProgress returns the memory and disk migration progress (0–100)

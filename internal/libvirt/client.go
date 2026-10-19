@@ -56,6 +56,10 @@ type Client struct {
 	guardNeeds func(name string) bool // RequireStartGuard's scope; nil = every start
 	readyOnce  sync.Once
 
+	// fwGuard is the firmware move guard (firmware_move_guard.go), asked
+	// before every start, resume, stop, define and undefine.
+	fwGuard FirmwareMoveGuard
+
 	// consolePolicy decides whether DefineDomain gives a domain's consoles
 	// passwords (SetConsolePasswordPolicy, console_password.go).
 	consolePolicy atomic.Pointer[func() ConsolePolicy]
@@ -187,6 +191,17 @@ func (c *Client) isAlive() bool {
 	// A lightweight check: try to get the libvirt version.
 	_, err := c.virt.ConnectGetLibVersion()
 	return err == nil
+}
+
+// LibvirtVersion is the connected libvirt daemon's packed version
+// (major*1000000 + minor*1000 + release), for FirmwareCodeProbe.
+func (c *Client) LibvirtVersion() (uint64, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.virt == nil {
+		return 0, fmt.Errorf("libvirt: not connected")
+	}
+	return c.virt.ConnectGetLibVersion()
 }
 
 // RegisterDomainEventCallback sets a callback that fires on domain lifecycle

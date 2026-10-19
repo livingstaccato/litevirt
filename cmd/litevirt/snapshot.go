@@ -144,15 +144,19 @@ func newSnapshotRmCmd() *cobra.Command {
 			snapName := args[1]
 
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				var hdr metadata.MD
 				_, err := c.DeleteSnapshot(ctx, &pb.DeleteSnapshotRequest{
 					VmName:       vmName,
 					SnapshotName: snapName,
-				})
+				}, grpc.Header(&hdr))
 				if err != nil {
 					return fmt.Errorf("delete snapshot: %w", err)
 				}
 
 				fmt.Printf("Snapshot %q deleted from VM %s\n", snapName, vmName)
+				for _, w := range hdr.Get("x-litevirt-snapshot-files-kept") {
+					fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+				}
 				return nil
 			})
 		},

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
+	"github.com/litevirt/litevirt/internal/firewall"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hostnet"
 	"github.com/litevirt/litevirt/internal/image"
@@ -608,6 +610,19 @@ type Server struct {
 	// label was derived from.
 	firmware lv.FirmwarePaths
 
+	// fwStore is this host's firmware state (NVRAM and swtpm trees). The
+	// daemon injects the one it shares with the reconciler; NewServer and
+	// NewServerForTests start from the production layout under dataDir, and a
+	// struct-literal Server gets that layout through fw(). Read it through
+	// fw().
+	fwStore *lv.FirmwareStore
+	// fwWipesRefused are the firmware state wipes an unreadable firmware move
+	// record refused, named by firmware_migration_record_unreadable until it
+	// resolves (firmware_records_health.go). Guarded by fwRecordsMu.
+	fwRecordsMu         sync.Mutex
+	fwWipesRefused      []lv.RefusedWipe
+	fwWipesRefusedTotal int
+
 	// lbApplyOverride is a test seam for LB provisioning: when non-nil it
 	// replaces the real haproxy/keepalived Apply (unit tests have no root / no
 	// haproxy). Production leaves it nil so apply failures surface + roll back.
@@ -807,6 +822,9 @@ type Server struct {
 	// instead of dialing a real peer over mTLS, so the owner→sink push path is
 	// unit-testable in-process. Production leaves it nil → real peerClient.
 	peerClientOverride func(ctx context.Context, host string) (pb.LiteVirtClient, func(), error)
+	// synFloodDrops reads this host's SYN-flood drop counters
+	// (firewall.SynFloodDrops when nil; tests replace it).
+	synFloodDrops func(ctx context.Context) (v4, v6 uint64, err error)
 	// inspectForwardTimeout, when set, replaces the bound on InspectVM's
 	// forward to the VM's host (tests).
 	inspectForwardTimeout time.Duration
@@ -989,6 +1007,12 @@ type Server struct {
 	// RollbackFirmwareState removes (migrate_firmware_rollback.go). Zero value
 	// ready.
 	firmwareTargets firmwareTargetLedger
+	// fwTarget is this host's side of a live firmware move, as its source
+	// (stage A) and as its target (Prepare): the one host check both read
+	// (SetLiveFirmwareHost).
+	fwTarget fwTargetState
+	// fwLive is the source half's test seams (migrate_firmware_live.go).
+	fwLive fwLiveSourceState
 
 	// vmLocks provides per-VM mutual exclusion for operations that must not
 	// run concurrently (e.g. snapshot + migration, backup + delete).
@@ -1123,7 +1147,9 @@ type Server struct {
 	// ReloadFirewall calls Reconcile(ctx) on it synchronously to give
 	// `lv firewall reload` push semantics rather than a 30s wait.
 	fwReconciler FirewallReconciler
-	fwMu         sync.RWMutex
+	// fwLogStore is this host's firewall log store (SetFirewallLogStore).
+	fwLogStore atomic.Pointer[firewall.LogStore]
+	fwMu       sync.RWMutex
 
 	// DHCP reservations made for NICs whose rows are not written yet
 	// (nic_identity.go): network → address → reservation.
@@ -2069,6 +2095,12 @@ func (s *Server) SetCreateReturnedHook(h func(name string, err error)) { s.creat
 // that proof can land in. Production never calls this.
 func (s *Server) SetRestoreClaimedHook(h func(name string)) { s.restoreClaimedHook = h }
 
+// SetRemoveHostBetweenReadsHook is a test-only seam: removeHostRefusal calls
+// h with the host's name between its read of the host's row and its read of
+// the row's admission key, in RemoveHost and PreflightRemoveHost alike.
+// Production never calls this.
+func (s *Server) SetRemoveHostBetweenReadsHook(h func(name string)) { s.removeHostBetweenReadsHook = h }
+
 // fireCommitFenceHook runs the test hook, if any, naming the operation about to
 // evaluate its commit fence.
 func (s *Server) fireCommitFenceHook(op string) {
@@ -2681,6 +2713,7 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 		startedAt:      time.Now(),
 		hostName:       hostName,
 		dataDir:        dataDir,
+		fwStore:        lv.NewFirmwareStore(dataDir),
 		pkiDir:         pkiDir,
 		db:             db,
 		virt:           virt,
@@ -2802,6 +2835,34 @@ func (s *Server) reconcileFirewallRequired(ctx context.Context) error {
 // SetFirmwarePaths injects the host's resolved OVMF firmware paths (G1).
 func (s *Server) SetFirmwarePaths(fp lv.FirmwarePaths) { s.firmware = fp }
 
+// SetFirmwareStore injects this host's firmware store, the one the daemon
+// shares with its reconciler (and the fleet harness gives each node). nil is
+// ignored. A store whose DataDir is not the server's panics: the domain XML
+// names the NVRAM under the server's data dir, so the store must be the one
+// that holds it.
+func (s *Server) SetFirmwareStore(fw *lv.FirmwareStore) {
+	if fw == nil {
+		return
+	}
+	if filepath.Clean(fw.DataDir) != filepath.Clean(s.dataDir) {
+		panic(fmt.Sprintf("grpcapi: firmware store data dir %q is not the server's %q", fw.DataDir, s.dataDir))
+	}
+	s.fwStore = fw
+}
+
+// FirmwareStore is this host's firmware store.
+func (s *Server) FirmwareStore() *lv.FirmwareStore { return s.fw() }
+
+// fw is this host's firmware store. A Server built as a struct literal (unit
+// tests) has none and gets the production layout under its dataDir, which is
+// what every such Server used before the store existed.
+func (s *Server) fw() *lv.FirmwareStore {
+	if s.fwStore != nil {
+		return s.fwStore
+	}
+	return lv.NewFirmwareStore(s.dataDir)
+}
+
 // SetTenancyEngine wires the admission + billing engine.
 // nil = unbounded admission, no billing. Daemon constructs the
 // engine with a webhook URL from config.yaml.billing_webhook_url.
@@ -2899,6 +2960,20 @@ func (s *Server) setVMLockHolder(vmName, owner string) {
 
 // tryLockVM is lockVM without the wait: it returns the unlock function and
 // true when it took the lock, or nil and false when someone else holds it.
+// lockVMOrSkip is lockVM when wait is set, else tryLockVM.
+func (s *Server) lockVMOrSkip(vmName string, wait bool) (func(), bool) {
+	return s.lockVMOrSkipAs(vmName, defaultVMLockOwner, wait)
+}
+
+// lockVMOrSkipAs is lockVMOrSkip for an operation that names itself
+// (lockVMAs).
+func (s *Server) lockVMOrSkipAs(vmName, owner string, wait bool) (func(), bool) {
+	if wait {
+		return s.lockVMAs(vmName, owner), true
+	}
+	return s.tryLockVMAs(vmName, owner)
+}
+
 func (s *Server) tryLockVM(vmName string) (func(), bool) {
 	return s.tryLockVMAs(vmName, defaultVMLockOwner)
 }

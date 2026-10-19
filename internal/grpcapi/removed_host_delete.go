@@ -58,6 +58,9 @@ func (s *Server) deleteVMOnRemovedHost(ctx context.Context, vm *corrosion.VMReco
 		return nil, status.Errorf(codes.Internal, "delete VM %q recorded on removed host %s: %v", vm.Name, vm.HostName, err)
 	}
 	s.clearDeviceLease(vm.Name)
+	// A volume move the VM left unresolved describes nothing now; its
+	// condition, which the removed host can no longer resolve, is resolved here.
+	s.forgetMoveRecords(ctx, vm.Name)
 	// The A record goes too, as on DeleteVM's own path: the leases were just
 	// released, so a record left live points the VM's name at an address the
 	// next workload can be given. The reaper (ReapOrphanDNSRecords) remains the

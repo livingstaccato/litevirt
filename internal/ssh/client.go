@@ -38,7 +38,7 @@ func NewClientTimeout(target string, timeout time.Duration) (*Client, error) {
 
 // NewClientDeadline is NewClientTimeout with the bound left on the whole
 // session: the commands run over it fail once timeout has passed since the
-// dial, for a short best-effort job on a host that may stall.
+// dial began, for a short best-effort job on a host that may stall.
 func NewClientDeadline(target string, timeout time.Duration) (*Client, error) {
 	return newClient(target, timeout, true)
 }
@@ -450,14 +450,16 @@ func (r *bytesReaderWrapper) Read(p []byte) (n int, err error) {
 // handshake together: ssh.Dial bounds neither the handshake nor, without
 // ClientConfig.Timeout, the connect.
 //
-// With keepDeadline the deadline stays on the connection, bounding the whole
-// session.
+// The deadline is fixed before the dial, so the connect and the handshake
+// share timeout rather than each getting its own. With keepDeadline it stays
+// on the connection, bounding the whole session to timeout.
 var dialTimeout = func(addr string, config *ssh.ClientConfig, timeout time.Duration, keepDeadline bool) (*ssh.Client, error) {
-	conn, err := net.DialTimeout("tcp", addr, timeout)
+	deadline := time.Now().Add(timeout)
+	conn, err := dialConn(addr, deadline)
 	if err != nil {
 		return nil, err
 	}
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+	if err := conn.SetDeadline(deadline); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -473,4 +475,10 @@ var dialTimeout = func(addr string, config *ssh.ClientConfig, timeout time.Durat
 		}
 	}
 	return ssh.NewClient(c, chans, reqs), nil
+}
+
+// dialConn is the TCP connect of dialTimeout, given up at deadline.
+var dialConn = func(addr string, deadline time.Time) (net.Conn, error) {
+	d := net.Dialer{Deadline: deadline}
+	return d.Dial("tcp", addr)
 }

@@ -426,6 +426,32 @@ A host rolled back below the release that added `lv lb create --snat` SNATs
 every load balancer made with `lv lb create` that it serves, including one set
 to `--snat=false` ([compose.md](compose.md#snat-via-vip)).
 
+### Rolling back a host in a live firmware move
+
+Do not roll back the litevirt binary on a host whose
+`<data_dir>/fwmig-inflight/` holds a file. Each file is the source's record of
+a live move of a Secure Boot / vTPM VM
+([migration](migration-failover.md#secure-boot--vtpm-vms)), and a build
+without live firmware migration ignores it: the record stops refusing a start
+of the VM's source copy. Check first:
+
+```bash
+ls <data_dir>/fwmig-inflight/
+```
+
+Let the move finish, or wait until its `firmware_migration_*` condition is
+resolved, before rolling back. If a host was rolled back (by hand or by the
+auto-rollback) with a file there, upgrade it again before doing anything else
+with that VM.
+
+A target rolled back mid-move answers the source's calls as unknown; the
+source parks the move `target_unreachable` and keeps both copies.
+
+A target rolled back below the leftover record ignores
+`<data_dir>/fwmig-leftover/`; its reconciler may then wipe the NVRAM and TPM
+state of a leftover an owed DISCARD names. Check `ls <data_dir>/fwmig-leftover/`
+first, and resolve each file with `lv doctor firmware-move <vm> --discard-target`.
+
 ### Rolling back after a release token latched
 
 A rolled-back binary that finds a durable activation marker for a capability
@@ -713,6 +739,17 @@ A security update is one offered from a security suite (`*-security` on
 apt) or listed by `dnf updateinfo --security`. Patch the host with its own
 package manager; drain it first (`lv host drain`) when the update needs a
 reboot. A release check for litevirt itself is not part of this.
+
+A live move of a Secure Boot / vTPM VM needs the same libvirt, QEMU, swtpm,
+libtpms and OVMF on both hosts, and on the source it compares the versions
+the guest's processes were started from. While those packages are updated
+host by host, such a VM does not move live between an updated and a
+not-updated host. Nor does it move off a host whose packages were updated
+after the guest started, until it is restarted (`lv stop <vm>`,
+`lv start <vm>`). A target running a litevirt build without live firmware
+migration refuses the move too. The refusal names
+the first difference and gives the cold move (`lv stop <vm>`, then
+`lv migrate <vm> <host> --cold`).
 
 ---
 
@@ -1476,6 +1513,15 @@ replicated exactly as before.
 host must resolve one conflict the same way. A binary rolled back below the
 latched token enters WAL quarantine, as below every latched token. Roll
 forward.
+
+### Project security groups wait for the roll
+
+`lv sg create <name> --project <p>` creates a group only `p`'s workloads may
+bind (docs/firewall.md). Its row carries a column a host on the previous
+release cannot decode, so it is the release feature `sg_projects`: refused
+with FailedPrecondition until `release_2026_11_v1` has latched, and its first
+use is recorded before the group is written. Global groups are created as
+before throughout, and every existing group stays global.
 
 ### A hand-deleted NetBox address is re-created after the roll
 

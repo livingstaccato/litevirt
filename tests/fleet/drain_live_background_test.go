@@ -25,6 +25,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
 // handOffDrain makes src's libvirt ignore the abort of slow's move until
@@ -64,6 +65,10 @@ func handOffDrain(t *testing.T, sc *stuckLiveDrain, release <-chan struct{}, com
 // cutOver leaves slow as a completed libvirt migration does: undefined on
 // the source, running on the target.
 func cutOver(t *testing.T, sc *stuckLiveDrain) {
+	// A completed migration leaves no domain on the source: libvirt stops the
+	// source's guest and undefines it (an active one would survive an
+	// undefine as a transient domain).
+	sc.src.Virt.SetState("slow", libvirtfake.StateShutdown)
 	if err := sc.src.Virt.UndefineDomain("slow", false); err != nil {
 		t.Errorf("undefine slow on the source: %v", err)
 	}
@@ -342,6 +347,7 @@ func TestFleet_DrainBackgroundMoveThatCompletesIsRecordedForFailback(t *testing.
 			return nil
 		}
 		<-release
+		a.Virt.SetState("bgfb", libvirtfake.StateShutdown) // as a completed migration leaves it
 		_ = a.Virt.UndefineDomain("bgfb", false)
 		b.Virt.SetState("bgfb", "running")
 		return nil
@@ -474,6 +480,7 @@ func TestFleet_DrainRecordsAMoveThatCompletesAfterTheClientLeft(t *testing.T) {
 		}
 		mu.Unlock()
 		<-blk.release
+		a.Virt.SetState(name, libvirtfake.StateShutdown) // as a completed migration leaves it
 		_ = a.Virt.UndefineDomain(name, false)
 		blk.to.Virt.SetState(name, "running")
 		return nil

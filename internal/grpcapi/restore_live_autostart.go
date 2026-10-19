@@ -161,6 +161,9 @@ func (s *Server) autoDefineRestoredVM(
 			}
 		}
 	}
+	if err := s.admitSecurityGroupRefs(ctx, project, nicSecurityGroupNames(spec.Network)); err != nil {
+		return "", "", status.Errorf(status.Code(err), "restore: %s", status.Convert(err).Message())
+	}
 	// This path creates a RUNNING managed VM, so beyond backup.restore the caller
 	// must hold vm.create on the target name in the (authorized) restore project.
 	if err := s.RequirePerm(ctx, vmRBACPathFor(project, targetName), "vm.create", "operator"); err != nil {
@@ -183,6 +186,11 @@ func (s *Server) autoDefineRestoredVM(
 	if s.virt.DomainExists(targetName) {
 		return "", "", status.Errorf(codes.AlreadyExists,
 			"domain %q already defined; pass --name to restore alongside it", targetName)
+	}
+	// The restore writes the target name's firmware state and defines its
+	// domain: not a name a live firmware move's record holds (spec §6.9).
+	if err := s.firmwareMoveNameRefusal("restore", targetName); err != nil {
+		return "", "", err
 	}
 
 	// Capacity + quota admission. A live-restore reconstructs a full-sized VM from
@@ -212,6 +220,22 @@ func (s *Server) autoDefineRestoredVM(
 	defer lease.release(ctx)
 
 	renamed := targetName != originalName
+	if !renamed {
+		// The backup's MACs come back as they were; one another NIC took
+		// since would put two NICs on one MAC.
+		var specMACs []string
+		for _, n := range spec.Network {
+			specMACs = append(specMACs, n.Mac)
+		}
+		mac, holder, herr := s.macHolderOtherThan(ctx, specMACs, targetName)
+		if herr != nil {
+			return "", "", herr
+		}
+		if holder != "" {
+			return "", "", status.Errorf(codes.AlreadyExists,
+				"MAC %s of the backup's NIC is now used by %s; restore under another name (`lv backup restore-live --name`), which gives the NICs new MACs", mac, holder)
+		}
+	}
 	spec.Name = targetName
 	// Force the restored VM into the authorized restore project — never let it
 	// fall through to the default project (InsertVM's "" → _default).
@@ -269,7 +293,7 @@ func (s *Server) autoDefineRestoredVM(
 			// cleanly (and lifecycle never sees orphaned state).
 			s.virt.DestroyDomain(targetName)
 			_ = s.virt.UndefineDomain(targetName, false)
-			lv.WipeFirmwareState(s.dataDir, targetName, spec.Uuid)
+			s.fw().WipeFirmwareState(targetName, spec.Uuid)
 		}()
 	}
 
@@ -300,10 +324,19 @@ func (s *Server) autoDefineRestoredVM(
 	var netCfg []lv.NetworkConfig
 	var ifaceRecords []corrosion.InterfaceRecord
 	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
+	macs := s.newMACAllocator()
+	for _, n := range spec.Network {
+		if !renamed {
+			macs.reserve(n.Mac)
+		}
+	}
 	for i, n := range spec.Network {
 		mac := n.Mac
 		if renamed || mac == "" {
-			mac = lv.GenerateMAC()
+			var merr error
+			if mac, merr = macs.next(ctx); merr != nil {
+				return "", "", merr
+			}
 		}
 		// The spec records the NIC's real MAC (as a clone does), so its queues
 		// are matched at every later redefine, not lost to the source's MAC.
@@ -406,6 +439,7 @@ func (s *Server) autoDefineRestoredVM(
 		}
 		limitsG = capabilities.FeatureGrant{}
 	}
+	s.forgetMoveRecords(ctx, targetName) // the restored domain takes the name
 	setFlightUUID(spec.Uuid)
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		return "", "", status.Errorf(codes.Internal, "define domain: %v", err)

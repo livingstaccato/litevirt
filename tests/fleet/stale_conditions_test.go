@@ -83,6 +83,9 @@ func TestFleet_DualRun_WitnessLeaderResolves(t *testing.T) {
 	}
 	// The cleanup removes the domain, as the lab's did: a deleted VM's
 	// mismatch resolves only on positive absence from every host it names.
+	if err := n1.Virt.DestroyDomain("dr-vm"); err != nil {
+		t.Fatalf("destroy dr-vm on %s: %v", n1.Name, err)
+	}
 	if err := n1.Virt.UndefineDomain("dr-vm", false); err != nil {
 		t.Fatalf("undefine dr-vm on %s: %v", n1.Name, err)
 	}

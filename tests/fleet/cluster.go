@@ -88,9 +88,11 @@ import (
 	"github.com/litevirt/litevirt/internal/apimeta"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fwmig"
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hlc"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/opjournal"
@@ -254,6 +256,7 @@ type Node struct {
 	Server   *grpcapi.Server
 	Virt     *libvirtfake.Fake // in-process libvirt fake; scenarios assert on its Events
 	CT       *CTFake           // in-process container runtime; real on-disk rootfs + tar export/import
+	FW       *lv.FirmwareStore // this node's NVRAM (its data dir) and swtpm trees (a root of its own)
 	HostNet  *HostNetFake      // in-memory netplan System for the host-network apply protocol
 	Net      *NetProvFake      // per-node network provisioner: what this node set up, on which device
 	GRPCSrv  *grpc.Server
@@ -330,6 +333,17 @@ type Node struct {
 	// stopServerLoops stops the background loops buildServer started for this
 	// node's current server, as a daemon's exit does (see restartNode).
 	stopServerLoops context.CancelFunc
+
+	// keepVirt, when set, is the libvirt fake the next buildServer gives the
+	// node's new server instead of a fresh one, and is then cleared: a daemon
+	// restart, where libvirt and its guests outlive the daemon
+	// (KillMode=process), so the new daemon finds the domains and their states
+	// the old one left.
+	keepVirt *libvirtfake.Fake
+	// serverSetup, when set, runs on every server buildServer makes for this
+	// node, right after it is made and before any of its loops start: the
+	// configuration a scenario's daemon applies at each start.
+	serverSetup func(*grpcapi.Server)
 }
 
 // StreamWatch observes one server-side streaming handler on a node: Started
@@ -897,7 +911,11 @@ func (c *Cluster) buildServer(n *Node) {
 	// NewServer demands a *libvirt.Client; for the fleet harness we construct
 	// the Server directly and inject an in-process libvirt fake (n.Virt) so
 	// VM-lifecycle RPCs run without a real libvirtd.
-	n.Virt = libvirtfake.New()
+	if n.keepVirt != nil {
+		n.Virt, n.keepVirt = n.keepVirt, nil
+	} else {
+		n.Virt = libvirtfake.New()
+	}
 	n.Server = grpcapi.NewServerForTests(grpcapi.TestServerOpts{
 		HostName: n.Name,
 		DataDir:  dataDir,
@@ -905,10 +923,30 @@ func (c *Cluster) buildServer(n *Node) {
 		DB:       n.DB,
 		Virt:     n.Virt,
 	})
+	if n.serverSetup != nil {
+		n.serverSetup(n.Server)
+	}
 	// A running VM's replica or copy is point-in-time through the external
 	// snapshot layer, as the daemon wires it from its libvirt client
 	// (grpcapi/pit_copy.go). The fleet has no backup sessions.
 	n.Server.SetPointInTimeSnapshotter(n.Virt)
+
+	// Firmware state: the daemon gives its server one store, with NVRAM under
+	// the data dir and swtpm under libvirt's root. Every node here gets a swtpm
+	// root of its own, so a firmware move between two nodes moves the state
+	// between two directories (a shared root would let a move that copied
+	// nothing pass, and one node's wipe delete another's state).
+	n.FW = &lv.FirmwareStore{DataDir: dataDir, SwtpmBase: filepath.Join(c.tmpRoot, n.Name, "swtpm")}
+	// The firmware move guard, over this node's records, on its libvirt and
+	// its store: the daemon's own helper (internal/daemon New).
+	fwmig.Wire(n.Virt, n.FW)
+	n.Server.SetFirmwareStore(n.FW)
+	// The fake's libvirt acts on the same files (probe (g), the live
+	// firmware migrate model).
+	n.Virt.SetFirmwareStore(n.FW)
+	// The live firmware host check stage A and Prepare read, as the daemon
+	// installs it (daemon.go SetLiveFirmwareHost).
+	n.Server.SetLiveFirmwareHost(fleetLiveFirmwareHost{})
 
 	// Domain lifecycle events: the daemon registers this same handler on its
 	// libvirt client (internal/daemon.Run). Wiring it here lets a scenario call
@@ -981,6 +1019,16 @@ func (c *Cluster) buildServer(n *Node) {
 	loops, stop := context.WithCancel(c.ctx)
 	n.stopServerLoops = stop
 	go n.Server.RunLUNHoldResolver(loops, 10*time.Second)
+	// The live firmware hold sweep, as the daemon starts it.
+	go n.Server.RunFirmwareHoldSweep(loops)
+	// The source cleanup retry and the retained bundle sweep, as the daemon
+	// starts them.
+	go n.Server.RunFirmwareRetainedSweep(loops)
+	// The firmware move recovery, as the daemon runs it: at start, then
+	// every interval.
+	n.Server.RecoverFirmwareMoves(loops)
+	n.Server.MarkStartupWired()
+	go n.Server.RunFirmwareMoveRecovery(loops)
 
 	// Wire a real Replicator so the server's PushMutations handler + write-notify
 	// path are exercised. By default its background push loop is NOT started, so
@@ -1120,9 +1168,20 @@ func (n *Node) partitionUnaryInterceptor(ctx context.Context, req any, info *grp
 		return nil, status.Errorf(codes.Unavailable, "fleet partition: %s refused by %s", methodName(info.FullMethod), n.Name)
 	}
 	if n.answersUnimplemented(info.FullMethod) {
-		return nil, status.Errorf(codes.Unimplemented, "unknown method %s", methodName(info.FullMethod))
+		return nil, unknownMethod(info.FullMethod)
 	}
 	return handler(ctx, req)
+}
+
+// unknownMethod is what grpc's server answers for a method it does not have
+// (grpc server.go, handleStream): the code and the text an older
+// build gives.
+func unknownMethod(fullMethod string) error {
+	service, method := "", methodName(fullMethod)
+	if i := strings.LastIndex(fullMethod, "/"); i > 0 {
+		service = strings.TrimPrefix(fullMethod[:i], "/")
+	}
+	return status.Errorf(codes.Unimplemented, "unknown method %v for service %v", method, service)
 }
 
 // answersUnimplemented reports whether this node is pretending not to have the
@@ -1147,12 +1206,60 @@ func (n *Node) DoNotImplement(method string) func() {
 	}
 }
 
+// RefuseRPCs makes this node answer each named RPC as a build without it
+// does (DoNotImplement, for several at once): an older peer in a rolling
+// upgrade. Returns a func that serves them again.
+func (n *Node) RefuseRPCs(names ...string) func() {
+	restores := make([]func(), 0, len(names))
+	for _, m := range names {
+		restores = append(restores, n.DoNotImplement(m))
+	}
+	return func() {
+		for _, r := range restores {
+			r()
+		}
+	}
+}
+
+// LandMigrationsOn lands every live migrate n's fake performs on dst, as
+// libvirt would: a FirmwareLive one through the fake's firmware model
+// (libvirtfake.LandFirmwareLive: dst's store gets the permall, the NVRAM on
+// resume, and the source stays defined and shut off), any other one running,
+// or paused when the migrate asks for it. Every fleet node has the same
+// address, so a hook is how a scenario names the target.
+func (n *Node) LandMigrationsOn(dst *Node) {
+	src := n.Virt
+	src.OnMigrateToTarget = func(name, _ string, p lv.MigrateParams) error {
+		if p.FirmwareLive {
+			return dst.Virt.LandFirmwareLive(src, name, p)
+		}
+		x := p.DestXML
+		if x == "" {
+			var err error
+			if x, err = src.DumpXML(name); err != nil {
+				return err
+			}
+		}
+		dst.Virt.LandMigratedState(x, p.Paused)
+		return nil
+	}
+}
+
+// Reconciler is a health reconciler for this node over the node's own data
+// dir and firmware store, as the daemon builds it: a scenario that runs a
+// reconcile pass sees the firmware state the node's server and fake see.
+func (n *Node) Reconciler() *health.Reconciler {
+	r := health.NewReconciler(n.Name, n.FW.DataDir, n.DB, n.Virt)
+	r.SetFirmwareStore(n.FW)
+	return r
+}
+
 func (n *Node) partitionStreamInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 	if n.blocked(info.FullMethod, ss.Context()) {
 		return status.Errorf(codes.Unavailable, "fleet partition: %s refused by %s", methodName(info.FullMethod), n.Name)
 	}
 	if n.answersUnimplemented(info.FullMethod) {
-		return status.Errorf(codes.Unimplemented, "unknown method %s", methodName(info.FullMethod))
+		return unknownMethod(info.FullMethod)
 	}
 	watches := n.takeStreamWatches(methodName(info.FullMethod))
 	for _, w := range watches {

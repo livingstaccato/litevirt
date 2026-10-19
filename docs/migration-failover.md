@@ -63,7 +63,7 @@ migration proceeds to libvirt's own check at cutover. A VM with an empty
 [`lv doctor cpu-mode`](diagnostics.md)) is not checked at all.
 
 A **cold** move is not checked either: a stopped VM migrated with `--cold`, a
-Secure Boot / vTPM VM, and a running VM that `lv host drain` moves cold (it has a
+Secure Boot / vTPM VM moved cold, and a running VM that `lv host drain` moves cold (it has a
 host-local disk) all boot fresh on the target, where `host-model` and
 `host-passthrough` expand to the target's own CPU. Moving such a VM to a host of
 another CPU generation is therefore allowed; a target that cannot run the guest's
@@ -239,6 +239,106 @@ live moves. A live migration that was sent over the network and then cannot
 connect (the migration ports 49152-49215 on the migration address must be
 reachable from the source) fails; the fallback is decided before the move.
 
+### Secure Boot / vTPM VMs
+
+`lv migrate <vm> <host>` moves a running Secure Boot or vTPM VM live. Its UEFI
+variables (NVRAM) and its vTPM state travel in the migration stream. The guest
+arrives on the target paused and is resumed there only after the target's
+vTPM state has been checked against the source's final copy and the VM's
+ownership has moved to the target. The source's copy is deleted only after
+that, and, for a UEFI VM, once the target's NVRAM equals the source's final
+NVRAM.
+
+**What the move needs.** Each item is checked when the move starts, on the
+host it is about. A refusal names the item and ends with the cold move instead:
+`lv stop <vm>`, then `lv migrate <vm> <host> --cold`.
+
+- `migration.live_firmware` on both hosts (the default), and each host meets
+  the conditions of the `litevirt.fw_live_migrate` label (see
+  [configuration](configuration.md#migration)), read again at the move. The
+  target must carry `litevirt.fw_live_migrate=true`, and `litevirt.tpm` /
+  `litevirt.secureboot` as the VM needs.
+- Equal firmware code on both hosts: the same libvirt, QEMU, swtpm and libtpms
+  versions, the same OVMF layout and the same OVMF file content. On the source
+  these are the versions the guest's running QEMU and swtpm processes were
+  started from, not the installed packages: after QEMU, swtpm, libtpms or OVMF
+  is upgraded on the source, the VM moves live again only after a restart
+  (`lv stop <vm>`, `lv start <vm>`). The refusal names the first field that
+  differs and both values. The source reads the guest's processes under
+  `/proc`; a daemon that cannot (not root, or in another pid namespace) refuses.
+- The guest runs. A guest paused by partition pause or by an operator is not
+  moved live.
+- The running vTPM keeps its state across the move (`persistent_state`). A VM
+  defined by an older build is refused with `lv stop <vm>`, `lv start <vm>` to
+  redefine it.
+- No snapshot of the VM keeps a firmware sidecar. Remove those snapshots first
+  (`lv snapshot rm <vm> <name>`).
+- No live firmware move already names the VM on either host.
+- A target on a build without live firmware migration refuses ("target
+  <host> runs a build without live firmware migration"). Nothing is written
+  there.
+
+**Routes.** The disks decide how the move travels. `migration.network` is not
+used for these moves.
+
+| Disks | Move |
+|---|---|
+| all on shared storage | memory only, tunnelled through libvirt's TLS connection to the target's cluster address |
+| all host-local | needs `--with-storage`: a storage copy to the target's cluster address, encrypted. Both hosts need migration-TLS credentials (`lv host install-migration-tls`); `migration.allow_unencrypted_storage` does not apply |
+| shared and host-local | refused: move the host-local disks to shared storage, or migrate cold |
+
+**While the move runs.** Each host keeps a record of it: the source under
+`<data_dir>/fwmig-inflight/<vm>.json`, the target under
+`<data_dir>/fwmig-hold/<vm>.json`. While a record names the VM on a host,
+these are refused there with a `FailedPrecondition` naming the host, the
+attempt, the other host and the phase: start, stop, restart, delete, rebuild,
+update, disk resize, snapshot create and restore, clone (of the VM or to its
+name), create or import under its name, backup, and an in-place backup
+restore. Scheduled backups and replication skip the VM with a log line.
+`lv host shutdown-workloads` reports the VM and goes on with the others. The
+rebalancer, the health-check `migrate` action and `lv region migrate` never
+move a Secure Boot / vTPM VM live. `lv events <vm>` shows the move's
+`vm.migrate.firmware` events.
+
+**After the move.** The source's firmware state is kept as
+`<data_dir>/fwmig-retained/<vm>-<attempt>.tar` for 24 hours, then removed. If
+the source cleanup stops, `firmware_migration_cleanup_failed` is raised and the
+cleanup is retried.
+
+**When a move fails.**
+
+- Before the guest left the source: the target's state for the attempt is
+  removed and the VM keeps running on the source. A target that already holds
+  a domain that is not running has it discarded automatically.
+- The target's vTPM state did not match, after the source's guest stopped for
+  the migration: the target's copy is quarantined
+  (`<data_dir>/fwmig-quarantine/<vm>-<attempt>/` on the target), and the VM is
+  `stopped` on the source with its firmware state. `lv start <vm>` runs it
+  there. `firmware_migration_unverified` is raised.
+- The guest never arrived on the target: the VM is `stopped` on the source with
+  its firmware state; `lv start <vm>`.
+- The held guest's host went down after its state was verified: the VM is
+  `stopped` on the target with the source's final NVRAM and its verified vTPM
+  state, detail "stopped on <host> before release; firmware verified;
+  `lv start`".
+- Anything else parks the move. `lv migrate` answers "live firmware migration
+  <attempt> to <host> is parked as <phase>: ...; both copies of its firmware
+  state are kept". Both records stay, nothing is deleted on either host, and a
+  `firmware_migration_*` condition names the VM, the attempt, both hosts, the
+  hashes and the paths (see
+  [diagnostics](diagnostics.md#live-firmware-migration-firmware_migration_)).
+
+A source daemon that restarts during a move takes the VM's lock at start-up,
+before its other loops start, and resumes, parks or aborts the move from where
+its record says it was.
+
+**Partition pause.** The partition pauser resumes a source guest it paused only
+while the move is in progress before its cutover. Under a parked move it does
+not: the guest stays paused after the partition heals. For a move parked
+`target_unreachable`, the move's own recovery resumes the guest once the target
+answers that it holds no domain of the VM. A move parked `target_ran` leaves it
+paused.
+
 ## Cold migration
 
 `--cold` migrates a VM without moving a running guest live:
@@ -303,9 +403,11 @@ live. Libvirt still migrates it, so a host-local disk needs `--with-storage`,
 or stop the VM first. A stopped VM migrated live is refused, with a message
 pointing to `--cold`.
 
-Secure Boot / vTPM VMs are always migrated stopped and cold. Their host-local
-disks are copied as any stopped VM's are, and their firmware state (UEFI vars
-and vTPM) is carried with them; see [cli-reference.md](cli-reference.md).
+A stopped Secure Boot / vTPM VM moves cold. Its host-local disks are copied as
+any stopped VM's are, and its firmware state (UEFI vars and vTPM) is carried
+with it; see [cli-reference.md](cli-reference.md). A running one moves live
+(see [Secure Boot / vTPM VMs](#secure-boot--vtpm-vms)) or, with `--cold`, is
+refused until it is stopped.
 
 ## Host drain
 
@@ -324,9 +426,25 @@ other VM moves the way `lv migrate <vm> <target> --cold` moves a stopped VM
 (see [Cold migration](#cold-migration)): its host-local disks (`local` and
 `dir` storage) are copied to the target, its domain is defined there, and the
 VM and its disk records move in one transaction. It is refused for the same
-reasons. A Secure Boot / vTPM VM drains only while stopped, with its
-host-local disks and its firmware; a running one is reported with the commands
-to stop it and move it.
+reasons. A stopped Secure Boot / vTPM VM drains this way, with its host-local
+disks and its firmware.
+
+A running Secure Boot / vTPM VM is drained by the live firmware move (see
+[Secure Boot / vTPM VMs](#secure-boot--vtpm-vms)) when all its disks are on
+shared storage, it has no USB device, and both hosts carry
+`litevirt.fw_live_migrate=true`; drain prefers a target with that label. It is
+never moved cold. Otherwise, or when the move is refused before the guest
+leaves (a target on a build without live firmware migration included), it is
+`skipped` and keeps running, and the frame gives the reason with the commands
+to stop it and move it. A move that fails or parks is an `error` for that VM;
+the drain goes on with the others.
+
+A drain reports the host drained only when no VM names it any more and every
+move ended clean. Otherwise it ends incomplete (`lv host drain` exits
+non-zero) and names each VM still on the host with its state, whatever that
+state is: one skipped or refused, one in `error`, or one still `migrating`
+because its move is parked or continues in the background. Do not power such
+a host off; `lv events <vm>` shows what happened to each.
 
 - A **stopped** VM stays stopped on the target.
 - A **running** VM with a host-local disk is checked first, while it still
@@ -353,7 +471,9 @@ stayed there. A live move that outlives the VM's migration policy
 cold move: the VM keeps running on the drained host, its result says so, and
 the drain goes on with the other VMs and ends incomplete, naming it. The host
 carries `drain_move_timed_out` (see [Diagnostics](diagnostics.md)) until a
-drain of it has no such move or `lv host undrain` runs. A move that libvirt
+drain of it has no such move or `lv host undrain` runs. A Secure Boot / vTPM
+VM's live firmware move is `lv migrate`'s move, and applies `timeout-sec` as
+`lv migrate` does. A move that libvirt
 completed before the abort took is recorded on the target, as any completed
 move. While a live move runs, the VM's record says `migrating`, as for
 `lv migrate`. If libvirt does not answer the abort within 2 minutes, the drain
@@ -563,7 +683,9 @@ a returning host is not hit by every migration at once.
 
 Failback moves a running VM live. A VM that is stopped, or has a disk on
 host-local storage (local, dir or btrfs) that a live move would have to copy, is
-reported and left; move it with `lv migrate <vm> <host> --cold`. The host must
+reported and left; move it with `lv migrate <vm> <host> --cold`. A running
+Secure Boot / vTPM VM returns by the live firmware move under drain's
+conditions, and is skipped with the reason otherwise. The host must
 be `active`. A cancelled record stays in the replicated table as an empty row
 (a later release can delete them); the same VM name reuses its row.
 

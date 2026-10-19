@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -15,7 +17,9 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fwmig"
 	"github.com/litevirt/litevirt/internal/health"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/notify"
 )
 
@@ -75,9 +79,25 @@ func (s *Server) SupersededDisks(ctx context.Context, req *pb.SupersededDisksReq
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list superseded disk copies: %v", err)
 	}
+	// The reconciler's firmware quarantines are listed, purged and removed by
+	// name beside the disk copies, under the same retention rule
+	// (health/reconciled_quarantine.go).
+	quarantines, err := health.ListReconciledQuarantines(ctx, s.db, s.dataDir)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list reconciled firmware quarantines: %v", err)
+	}
 	resp := &pb.SupersededDisksResponse{Host: s.hostName, RetentionDays: int32(s.supersededRetentionDays)}
 	removed := map[string]bool{}
 	switch {
+	case req.RestorePath != "" && health.IsReconciledQuarantinePath(s.dataDir, req.RestorePath):
+		vm, setAside, rerr := s.restoreReconciledQuarantine(ctx, req.RestorePath)
+		if rerr != nil {
+			return nil, rerr
+		}
+		resp.Restored, resp.RestoredTo, resp.SetAside = filepath.Clean(req.RestorePath), "the firmware state (NVRAM, vTPM) of VM "+vm, setAside
+		if quarantines, err = health.ListReconciledQuarantines(ctx, s.db, s.dataDir); err != nil {
+			quarantines = nil
+		}
 	case req.RestorePath != "":
 		got, rerr := s.restoreSupersededDisk(ctx, req.RestorePath)
 		if rerr != nil {
@@ -95,16 +115,33 @@ func (s *Server) SupersededDisks(ctx context.Context, req *pb.SupersededDisksReq
 	case len(req.RemovePaths) > 0:
 		// Named copies only: the purge flag a client sends beside them is for
 		// older hosts (SupersededNamedOnlySec), never a bulk purge here.
-		gone, rerr := health.RemoveSupersededDisks(ctx, s.db, s.dataDir, req.RemovePaths)
+		var diskPaths, fwPaths []string
+		for _, p := range req.RemovePaths {
+			if health.IsReconciledQuarantinePath(s.dataDir, p) {
+				fwPaths = append(fwPaths, p)
+			} else {
+				diskPaths = append(diskPaths, p)
+			}
+		}
 		var bytes int64
 		var names []string
+		gone, rerr := health.RemoveSupersededDisks(ctx, s.db, s.dataDir, diskPaths)
 		for _, c := range gone {
 			removed[c.Path] = true
 			bytes += c.SizeBytes
 			names = append(names, c.Path)
 		}
-		result, detail := "ok", fmt.Sprintf("removed %d named superseded disk copies (%d bytes) on %s: %s",
-			len(gone), bytes, s.hostName, strings.Join(names, ", "))
+		if rerr == nil && len(fwPaths) > 0 {
+			var fwGone []health.ReconciledQuarantine
+			fwGone, rerr = health.RemoveReconciledQuarantines(ctx, s.db, s.dataDir, fwPaths)
+			for _, q := range fwGone {
+				removed[q.Path] = true
+				bytes += q.SizeBytes
+				names = append(names, q.Path)
+			}
+		}
+		result, detail := "ok", fmt.Sprintf("removed %d named superseded disk copies and firmware quarantines (%d bytes) on %s: %s",
+			len(names), bytes, s.hostName, strings.Join(names, ", "))
 		if rerr != nil {
 			result, detail = "error", detail+": "+rerr.Error()
 		}
@@ -119,7 +156,15 @@ func (s *Server) SupersededDisks(ctx context.Context, req *pb.SupersededDisksReq
 			removed[c.Path] = true
 			bytes += c.SizeBytes
 		}
-		result, detail := "ok", fmt.Sprintf("removed %d superseded disk copies (%d bytes) on %s", len(gone), bytes, s.hostName)
+		fwGone, qerr := health.PurgeReconciledQuarantines(ctx, s.db, s.dataDir, time.Duration(req.OlderThanSec)*time.Second, time.Now())
+		for _, q := range fwGone {
+			removed[q.Path] = true
+			bytes += q.SizeBytes
+		}
+		if perr == nil {
+			perr = qerr
+		}
+		result, detail := "ok", fmt.Sprintf("removed %d superseded disk copies and %d reconciled firmware quarantines (%d bytes) on %s", len(gone), len(fwGone), bytes, s.hostName)
 		if perr != nil {
 			result, detail = "error", detail+": "+perr.Error()
 		}
@@ -134,6 +179,17 @@ func (s *Server) SupersededDisks(ctx context.Context, req *pb.SupersededDisksReq
 			Path: c.Path, DiskPath: c.DiskPath, SetAsideAt: c.SetAsideAt.UTC().Format(time.RFC3339),
 			SizeBytes: c.SizeBytes, VmName: c.VM, VmState: c.VMState, Held: c.Held, Removed: removed[c.Path],
 			Retained: c.Retained,
+		})
+	}
+	for _, q := range quarantines {
+		vm := ""
+		if q.Retained != "" {
+			vm = q.VM // a VM of the name exists
+		}
+		resp.Disks = append(resp.Disks, &pb.SupersededDisk{
+			Path: q.Path, DiskPath: "firmware state of VM " + q.VM, SetAsideAt: q.SetAsideAt.UTC().Format(time.RFC3339),
+			SizeBytes: q.SizeBytes, VmName: vm, VmState: q.VMState, Held: q.Held, Removed: removed[q.Path],
+			Retained: q.Retained,
 		})
 	}
 	// The disks deleted VMs were kept with, which a create moved to .kept-
@@ -246,6 +302,112 @@ func (s *Server) NotifyCTRootfsStranded(ct, host, detail string) {
 
 // supersededRelist lists the copies again after a restore; tests make it fail.
 var supersededRelist = health.ListSupersededDisks
+
+var reconciledDirRe = regexp.MustCompile(`^(.+)-reconciled-[0-9]+$`)
+
+// restoreReconciledQuarantine puts a reconciler firmware quarantine (a
+// finished <vm>-reconciled-<unix>, an unfinished <vm>-reconciling-<uuid>, or
+// an interrupted <vm>-restoring-<uuid>) back as the VM's own NVRAM and vTPM
+// state on this host (D2-18 re-review 4, I-1, m-2), under the VM's lock: the
+// VM's row names this host, its incarnation's uuid is the quarantine's, and
+// its domain is not active. The state in place is set aside as another
+// reconciled quarantine first (FirmwareStore.RestoreFirmwareQuarantine).
+// It returns the VM and where the replaced state went ("" when there was none).
+func (s *Server) restoreReconciledQuarantine(ctx context.Context, path string) (string, string, error) {
+	p := filepath.Clean(path)
+	base := filepath.Base(p)
+	vm, uuid := "", ""
+	if svm, _, su, ok := fwmig.ParseStageName(base); ok {
+		vm, uuid = svm, su
+	} else if m := reconciledDirRe.FindStringSubmatch(base); m != nil {
+		vm = m[1]
+		b, err := os.ReadFile(filepath.Join(p, "reason.txt"))
+		if err != nil {
+			return "", "", status.Errorf(codes.FailedPrecondition, "%s: its reason.txt cannot be read (%v), so whose state it is is not known", p, err)
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			if v, ok := strings.CutPrefix(line, "uuid: "); ok && lv.ValidFirmwareUUID(strings.TrimSpace(v)) {
+				uuid = strings.TrimSpace(v)
+			}
+		}
+	}
+	refuse := func(format string, a ...any) error {
+		err := status.Errorf(codes.FailedPrecondition, "restore %s: "+format, append([]any{p}, a...)...)
+		s.audit(ctx, "host.superseded_disks.restore", s.hostName, err.Error(), "error")
+		return err
+	}
+	if vm == "" {
+		return "", "", refuse("not a reconciler firmware quarantine")
+	}
+	if fi, err := os.Lstat(p); err != nil || !fi.IsDir() {
+		return "", "", refuse("no such directory on %s (%v)", s.hostName, err)
+	}
+	defer s.lockVM(vm)()
+	row, err := corrosion.GetVM(ctx, s.db, vm)
+	if err != nil {
+		return "", "", status.Errorf(codes.Unavailable, "restore %s: VM %s's row cannot be read: %v", p, vm, err)
+	}
+	if row == nil {
+		return "", "", refuse("VM %s does not exist; nothing restores state for it", vm)
+	}
+	if row.HostName != s.hostName {
+		return "", "", refuse("VM %s is placed on %s, not %s: stop it, move it here with `lv migrate %s %s --cold`, then restore", vm, row.HostName, s.hostName, vm, s.hostName)
+	}
+	rowUUID := parseFirmwareSpec(row.Spec).UUID
+	if uuid != "" && !strings.EqualFold(uuid, rowUUID) {
+		return "", "", refuse("its state is of uuid %s, and VM %s's incarnation has uuid %s", uuid, vm, rowUUID)
+	}
+	switch row.State {
+	case "running", "starting", "migrating", "pending":
+		return "", "", refuse("VM %s is %s; stop it first", vm, row.State)
+	}
+	if s.virt != nil {
+		active, err := s.virt.DomainIsActive(vm)
+		if err != nil && !lv.IsNoDomain(err) {
+			return "", "", status.Errorf(codes.Unavailable, "restore %s: VM %s's domain state cannot be read: %v", p, vm, err)
+		}
+		if err == nil && active {
+			return "", "", refuse("VM %s's domain is active on %s; stop it first", vm, s.hostName)
+		}
+	}
+	qdir := filepath.Dir(p)
+	now := time.Now()
+	final := ""
+	for i := int64(0); ; i++ {
+		final = filepath.Join(qdir, fmt.Sprintf("%s-reconciled-%d", vm, now.Unix()+i))
+		if _, err := os.Lstat(final); os.IsNotExist(err) && final != p {
+			break
+		}
+	}
+	reason := fmt.Sprintf("vm: %s\nuuid: %s\nhost: %s\nquarantined_at: %s\n"+
+		"reason: the state VM %s had in place when an operator restored %s (lv host superseded-disks --restore)\n"+
+		"retention: kept while VM %s exists; once it is gone, removed after superseded_disk_retention_days (lv host superseded-disks lists it)\n",
+		vm, uuidOrNoneGRPC(uuid), s.hostName, now.UTC().Format(time.RFC3339), vm, p, vm)
+	restoring := filepath.Join(qdir, fwmig.StageName(vm, fwmig.StageRestoring, uuid))
+	stage := filepath.Join(qdir, fwmig.StageName(vm, fwmig.StageReconciling, uuid))
+	if err := s.fw().RestoreFirmwareQuarantine(vm, uuid, p, restoring, stage, final, []byte(reason)); err != nil {
+		s.audit(ctx, "host.superseded_disks.restore", s.hostName, fmt.Sprintf("restore %s: %v", p, err), "error")
+		return "", "", status.Errorf(codes.FailedPrecondition, "restore %s: %v", p, err)
+	}
+	setAside := ""
+	if _, err := os.Lstat(final); err == nil {
+		setAside = final
+	}
+	detail := fmt.Sprintf("restored %s as the firmware state of VM %s on %s", p, vm, s.hostName)
+	if setAside != "" {
+		detail += "; the state it replaced is kept as " + setAside
+	}
+	s.audit(ctx, "host.superseded_disks.restore", s.hostName, detail, "ok")
+	s.recordVMEvent(ctx, vm, "vm.firmware.restored", "ok", detail)
+	return vm, setAside, nil
+}
+
+func uuidOrNoneGRPC(u string) string {
+	if u == "" {
+		return "(none: NVRAM only)"
+	}
+	return u
+}
 
 // nameKeptCopy fills in the VM a kept file belongs to by name, when that is
 // known (lab 2, abort proof, surprise 3): a seed's from its file name

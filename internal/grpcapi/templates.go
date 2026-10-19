@@ -26,6 +26,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/diskmode"
+	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/qcow2"
@@ -225,6 +226,15 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	} else {
 		src = fresh
 	}
+	// A clone reads the source's disks and firmware state, and takes the
+	// target's name for a new domain and NVRAM: neither may be named by a
+	// live firmware move's record here (spec §6.9).
+	if err := s.firmwareMoveRefusal("clone", src); err != nil {
+		return nil, err
+	}
+	if err := s.firmwareMoveNameRefusal("clone", req.Target); err != nil {
+		return nil, err
+	}
 	// Consistent disk state: clone a template or a stopped VM (a running VM's
 	// disk isn't crash-consistent). Snapshot-based clone is a follow-up.
 	if !src.IsTemplate && src.State != "stopped" {
@@ -242,6 +252,11 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	// A point-in-time overlay an earlier copy left holds writes the source's
 	// disk lacks: settle it before the clone reads or backs on the disk.
 	if err := s.settlePITOverlays(ctx, src); err != nil {
+		return nil, err
+	}
+	// A volume move left unresolved: the rows name the file holding the
+	// guest's writes before one is copied (move_unresolved.go).
+	if err := s.resolveUnresolvedMovesFor(ctx, req.Source, health.MoveUseReadsRunning); err != nil {
 		return nil, err
 	}
 	srcDisks, err := corrosion.GetVMDisks(ctx, s.db, req.Source)
@@ -273,6 +288,9 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	// differ from the source's. Refused before admission and any disk write.
 	if err := s.admitCopiedNetworks(ctx, "clone", project, src.Project, specNetworkNames(srcSpec.Network)); err != nil {
 		return nil, err
+	}
+	if err := s.admitSecurityGroupRefs(ctx, project, nicSecurityGroupNames(srcSpec.Network)); err != nil {
+		return nil, status.Errorf(status.Code(err), "clone: %s", status.Convert(err).Message())
 	}
 
 	// Capacity + quota admission. A clone is a full-sized VM — same vCPU, same
@@ -511,8 +529,13 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	var seedNICs []cloudinit.NIC
 	var isoPicks []isoPick
 	defer func() { s.releaseHostIsolatedPicks(isoPicks) }()
+	macs := s.newMACAllocator()
 	for i, n := range srcSpec.Network {
-		mac := lv.GenerateMAC()
+		mac, merr := macs.next(ctx)
+		if merr != nil {
+			cleanup()
+			return nil, merr
+		}
 		bridge := network.FlatBridgeName(n.Name)
 		if pb, perr := s.provisionForVM(ctx, n.Name); perr == nil && pb != "" {
 			bridge = pb
@@ -769,7 +792,7 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 		s.virt.UndefineDomain(req.Target, false)
 		cleanup()
 		os.Remove(cloudInitISO)
-		lv.WipeFirmwareState(s.dataDir, req.Target, srcSpec.Uuid)
+		s.fw().WipeFirmwareState(req.Target, srcSpec.Uuid)
 	}
 
 	state := "stopped"

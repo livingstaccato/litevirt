@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -29,7 +30,7 @@ const vtpmPassWait = 10 * time.Second
 // stateTimedOut is the condition's state while a pass has run past its wait.
 const stateTimedOut = "timed_out"
 
-// vtpmStateSync keeps libvirt's swtpm tree synchronous (libvirt.SyncSwtpmState)
+// vtpmStateSync keeps libvirt's swtpm tree synchronous ((*libvirt.FirmwareStore).SyncSwtpmState)
 // and reports when it cannot. The vTPM capability probe drives it, at start
 // and every minute; a pass runs in its own goroutine, so a hung one blocks
 // neither daemon start nor the label loop.
@@ -50,6 +51,7 @@ type vtpmStateSync struct {
 	last     string        // what the condition was last synced to say
 	reported bool          // the condition says it
 	open     bool
+	remedy   string // the open condition's remedy
 }
 
 // probe is the vTPM capability: swtpm is installed (present) and a pass over
@@ -129,16 +131,16 @@ func (v *vtpmStateSync) finish(rep libvirt.SwtpmSyncReport, gen uint64) {
 	v.sync1(rep.State, open, evidence)
 }
 
-// overrun raises the condition once for a pass still running past wait.
+// overrun raises the condition for a pass still running past wait: logged
+// once, and written again by a later probe if the write failed (sync1).
 func (v *vtpmStateSync) overrun() {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if v.overran {
-		return
+	if !v.overran {
+		v.overran = true
+		slog.Warn("a pass over the vTPM state tree has not finished; vTPM is not offered on this host until one does",
+			"path", v.base, "waited", v.wait)
 	}
-	v.overran = true
-	slog.Warn("a pass over the vTPM state tree has not finished; vTPM is not offered on this host until one does",
-		"path", v.base, "waited", v.wait)
 	if !v.on {
 		return
 	}
@@ -167,6 +169,7 @@ func (v *vtpmStateSync) sync1(state string, open bool, evidence map[string]any) 
 	}
 	v.reported = v.report(open, evidence)
 	v.open, v.last = open, state
+	v.remedy, _ = evidence["remedy"].(string)
 }
 
 // vtpmRemedy is what makes a host's vTPM state durable, for its filesystem.
@@ -194,6 +197,46 @@ func tpmCapableProbe(lookPath func(string) (string, error), probe func(present b
 	}
 }
 
+// tpmReadyProbe is the vTPM condition of the live firmware move label: swtpm
+// is installed and a pass over the swtpm tree has completed. It reads the
+// last pass and never starts one, so a label cycle walks the tree once, in
+// the vTPM label's own probe (tpmCapableProbe).
+func tpmReadyProbe(lookPath func(string) (string, error), v *vtpmStateSync) func() bool {
+	return func() bool {
+		_, errSwtpm := lookPath("swtpm")
+		_, errSetup := lookPath("swtpm_setup")
+		return errSwtpm == nil && errSetup == nil && v.ready()
+	}
+}
+
+// ready reports whether a pass has completed since swtpm was last seen
+// installed, without starting one.
+func (v *vtpmStateSync) ready() bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.passed
+}
+
+// vtpmDurableErr is nil only when this host's vTPM state is durable: a pass
+// over the swtpm tree has completed and vtpm_state_not_durable is not open. A
+// live firmware move never targets a host whose vTPM state is not durable
+// (the label and a move's Prepare both read it). It reads the last pass and
+// starts none.
+func (v *vtpmStateSync) vtpmDurableErr() error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	switch {
+	case !v.passed:
+		return errors.New("no vtpm_state_sync pass over the swtpm tree has completed yet on this host; " +
+			"a live firmware move targets it once one has")
+	case v.open:
+		return fmt.Errorf("this host's vTPM state is not durable (%s: %s), so a live firmware move does not target it; "+
+			"the condition clears, and moves are offered again, once the cause is fixed: %s",
+			CondVTPMStateNotDurable, v.last, v.remedy)
+	}
+	return nil
+}
+
 // syncVTPMCondition raises or resolves vtpm_state_not_durable about this
 // host. A resolve with no open row has nothing to write and counts as done.
 func (d *Daemon) syncVTPMCondition(ctx context.Context, open bool, evidence map[string]any) bool {
@@ -207,4 +250,14 @@ func (d *Daemon) syncVTPMCondition(ctx context.Context, open bool, evidence map[
 		}
 	}
 	return d.writeSelfConditionAs(ctx, vtpmEvaluator, CondVTPMStateNotDurable, open, corrosion.SeverityWarning, evidence)
+}
+
+// awaitFirstVTPMPass runs the first pass over the swtpm tree (tpmCapable, the
+// vTPM capability probe) and waits until it completes or has run past
+// vtpmPassWait and raised vtpm_state_not_durable. Run calls it before
+// anything on this host can start a VM: the capability label orders
+// placement only, and an onboot or restart-policy start, a cutover, an
+// operation recovery or an API start on this host does not ask it.
+func awaitFirstVTPMPass(tpmCapable func() bool) {
+	tpmCapable()
 }

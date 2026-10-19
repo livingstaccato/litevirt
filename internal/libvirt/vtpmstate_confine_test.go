@@ -11,7 +11,8 @@ import (
 // Whatever arrives, the wipe must stay inside one per-UUID directory under the
 // swtpm base: never the base itself, its parent, or a sibling of the base.
 func TestWipeFirmwareStateByUUID_RefusesTraversal(t *testing.T) {
-	base := redirectSwtpmBase(t)
+	base := testSwtpmBase(t)
+	st := storeAt(base, t.TempDir())
 	parent := filepath.Dir(base)
 	sibling := filepath.Join(parent, "x")
 	if err := os.MkdirAll(sibling, 0o755); err != nil {
@@ -25,7 +26,7 @@ func TestWipeFirmwareStateByUUID_RefusesTraversal(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, uuid := range []string{"..", "../x", ".", "/", "/etc", "a/../..", "x/.."} {
-		WipeFirmwareStateByUUID(uuid)
+		st.WipeFirmwareStateByUUID(uuid)
 		for _, p := range []string{parent, sibling, base, other} {
 			if _, err := os.Stat(p); err != nil {
 				t.Fatalf("WipeFirmwareStateByUUID(%q) removed %s: %v", uuid, p, err)
@@ -60,14 +61,14 @@ func TestValidFirmwareUUID(t *testing.T) {
 // A bundle restore under a traversal UUID must not stage or swap state outside
 // the base either.
 func TestReadFirmwareBundle_RefusesTraversalUUID(t *testing.T) {
-	base := redirectSwtpmBase(t)
-	src := t.TempDir()
+	base := testSwtpmBase(t)
+	src := storeAt(base, t.TempDir())
 	seedFirmware(t, src, "src", "uuid-src", true, true)
 	var buf bytes.Buffer
-	if _, err := WriteFirmwareBundle(src, "src", "uuid-src", &buf); err != nil {
+	if _, err := src.WriteFirmwareBundle("src", "uuid-src", &buf); err != nil {
 		t.Fatal(err)
 	}
-	if err := ReadFirmwareBundle(bytes.NewReader(buf.Bytes()), t.TempDir(), "dst", ".."); err == nil {
+	if err := storeAt(base, t.TempDir()).ReadFirmwareBundle(bytes.NewReader(buf.Bytes()), "dst", ".."); err == nil {
 		t.Fatal("ReadFirmwareBundle accepted uuid \"..\"")
 	}
 	if _, err := os.Stat(filepath.Join(filepath.Dir(base), "tpm2")); err == nil {

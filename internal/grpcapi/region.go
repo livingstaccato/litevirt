@@ -14,6 +14,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/region"
 )
 
@@ -102,6 +103,13 @@ func (s *Server) CrossRegionMigrate(req *pb.CrossRegionMigrateRequest, stream gr
 	if _, _, vErr := region.ValidateCrossRegion(ctx, s.db, vm.HostName, req.TargetHost); vErr != nil {
 		return status.Error(codes.FailedPrecondition, vErr.Error())
 	}
+	// A Secure Boot / vTPM VM is not live-moved across regions in v1 (spec
+	// §12); refused before any disk is replicated. Its cold move is as before.
+	if req.Live {
+		if why := firmwareMoverRefusal("CrossRegionMigrate", vm); why != "" {
+			return status.Error(codes.FailedPrecondition, why)
+		}
+	}
 
 	if req.IncludeDisks {
 		if err := s.replicateDisksForCrossRegion(ctx, req.VmName, req.TargetPool, stream); err != nil {
@@ -131,6 +139,11 @@ func (s *Server) replicateDisksForCrossRegion(
 	vmName, targetPool string,
 	stream grpc.ServerStreamingServer[pb.MigrateProgress],
 ) error {
+	// A volume move left unresolved: the rows name the file holding the
+	// guest's writes before one is copied (move_unresolved.go).
+	if err := s.resolveUnresolvedMovesFor(ctx, vmName, health.MoveUseReadsRunning); err != nil {
+		return err
+	}
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)
 	if err != nil {
 		return status.Errorf(codes.Internal, "list disks: %v", err)

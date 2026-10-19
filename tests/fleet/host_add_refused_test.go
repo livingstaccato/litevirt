@@ -117,12 +117,12 @@ func TestFleet_HostAdd_ARefusedAddLeavesTheMachineAlone(t *testing.T) {
 		}
 		// It uploaded to staged paths, and removed them on the refusal.
 		for _, e := range target.Events {
-			staged := strings.HasPrefix(e, "write ") && strings.HasSuffix(e, ".add")
+			staged := strings.HasPrefix(e, "write ") && strings.Contains(filepath.Base(e), ".add-")
 			if !staged && e != "sh unstage" && e != "sh config" && !strings.HasPrefix(e, "run mkdir -p") {
 				t.Errorf("a refused add changed the machine: %q", e)
 			}
 		}
-		if m, _ := filepath.Glob(filepath.Join(other, ".*.add")); len(m) != 0 {
+		if m, _ := filepath.Glob(filepath.Join(other, ".*.add*")); len(m) != 0 {
 			t.Errorf("staged files left on the machine: %v", m)
 		}
 		for n, want := range before {

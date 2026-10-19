@@ -151,7 +151,7 @@ func syncSwtpmTree(base string, on bool, marker string, ops swtpmFDOps) SwtpmSyn
 
 	w := &swtpmWalk{ops: ops, on: on, dev: uint64(bst.Dev), rep: &rep}
 	if on && marker != "" && !markerSet {
-		w.beforeSet = func() error { return writeSwtpmMarker(marker) }
+		w.beforeSet = func() error { return writeSwtpmMarker(marker, base) }
 	}
 	if err := w.apply(bfd, root, true); err != nil {
 		var unsup *unsupportedErr

@@ -170,6 +170,7 @@ func TestCreateVM_ISCSI_TheWalkStartsAtTheCheckpoint(t *testing.T) {
 		if err := corrosion.DeleteVM(ctx, s.db, name); err != nil {
 			t.Fatal(err)
 		}
+		_ = s.virt.DestroyDomain(name)
 		_ = s.virt.UndefineDomain(name, false)
 	}
 	reset()

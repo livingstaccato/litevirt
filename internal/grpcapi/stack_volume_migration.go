@@ -16,6 +16,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/safename"
 )
 
@@ -236,7 +237,10 @@ func (s *Server) resolveStackPlan(ctx context.Context, vms []corrosion.VMRecord,
 		vp := vmPlan{vm: vm}
 		for _, d := range disks {
 			dp := diskPlan{disk: d, targetPool: resolve(vm.Name, d.DiskName)}
-			if dp.targetPool != "" && d.StorageVolume == dp.targetPool {
+			// A disk with an unresolved move recorded is dispatched, not
+			// skipped: its owner settles it, or refuses with a
+			// health.MoveUnresolvedError.
+			if dp.targetPool != "" && d.StorageVolume == dp.targetPool && !health.MoveConditionCovers(ctx, s.db, vm.Name, d.DiskName) {
 				dp.skip = true
 				dp.skipReason = fmt.Sprintf("already on pool %q", dp.targetPool)
 			}
@@ -448,8 +452,16 @@ func (s *Server) migrateVMVolumes(
 		var err error
 		if vp.vm.HostName == s.hostName {
 			vm := vp.vm
-			disk := dp.disk
-			err = s.moveOneVolume(ctx, &vm, &disk, dp.targetPool, deleteSource, sink)
+			// Under the VM's lock, as MoveVolume moves: a start, a backup or a
+			// hand resolution of the VM waits for the move. The disk row is
+			// read again under it: the plan's copy may predate a hand
+			// resolution that repointed it.
+			unlock := s.lockVM(vm.Name)
+			var disk *corrosion.DiskRecord
+			if disk, err = s.diskRowOf(ctx, vm.Name, dp.disk.DiskName); err == nil {
+				err = s.moveOneVolume(ctx, &vm, disk, dp.targetPool, deleteSource, sink)
+			}
+			unlock()
 		} else {
 			err = s.moveRemoteVolume(ctx, vp.vm.HostName, vp.vm.Name, dp.disk.DiskName, dp.targetPool, deleteSource, sink)
 		}

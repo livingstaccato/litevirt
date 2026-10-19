@@ -360,7 +360,8 @@ func TestFleet_ConsolePassword_LiveMigrationKeepsTheConsole(t *testing.T) {
 			return err
 		}
 		dst.Virt.LandMigrated(x)
-		return src.Virt.UndefineDomain(name, false)
+		src.Virt.VanishDomain(name)
+		return nil
 	}
 	if err := migrateAt(t, c, src, "web", dst.Name); err != nil {
 		t.Fatalf("live migrate: %v", err)

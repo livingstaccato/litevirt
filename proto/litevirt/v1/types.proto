@@ -515,6 +515,7 @@ message SecurityGroup {
     string name       = 2;
     string stack_name = 3;  // empty = cluster-wide
     string created_at = 4;
+    string project    = 5;  // owning project; empty = global (docs/design/security-group-projects.md)
 }
 
 // SecurityGroupRule is one rule of a security group.
@@ -532,13 +533,27 @@ message SecurityGroupRule {
 
 // FirewallSynfloodPolicy is the SYN-flood protection policy of one scope.
 message FirewallSynfloodPolicy {
-    string scope      = 1;  // "cluster" | <host name>
+    string scope      = 1;  // "cluster" | "host/<name>"
     string mode       = 2;  // on | off
     uint32 rate       = 3;  // new SYNs per second per (guest NIC, source address)
     uint32 burst      = 4;  // packets
     string set_by     = 5;
     string updated_at = 6;
     bool   inherited  = 7;  // a host with no row of its own: the cluster policy applies
+    // A host's entry only: its SYN-flood drops per family since its last
+    // reload (the lv-sf 4 and lv-sf 6 counters), asked of the host itself.
+    // error says why they could not be read; then the counts mean nothing.
+    uint64 drops_v4   = 8;
+    uint64 drops_v6   = 9;
+    string error      = 10;
+    // A host's entry only: what that host has in force, from its last
+    // firewall pass: on | ipv4-only | ipv6-only (the kernel refused the
+    // other family's rules) | observe (counted, not dropped) | guards-only (no
+    // bridge conntrack: nothing rendered) | no-guest-nics (no per-NIC table
+    // yet) | unavailable (the kernel refused the SYN-flood rules, or the
+    // first per-NIC table) | off. A refused per-NIC table keeps the previous
+    // pass's value. Empty from a daemon that predates it.
+    string in_force   = 11;
 }
 
 // FirewallLogPolicy is the firewall log policy of one scope.
@@ -1053,4 +1068,54 @@ message StoragePool {
     int64  total_bytes = 9;
     int64  used_bytes  = 10;
     string project     = 11; // owning tenant; empty = global/shared
+}
+
+// ── Live firmware migration (vTPM / Secure Boot) ──
+
+// FirmwareRuntime is the firmware code a host runs a live firmware move with:
+// the source reports the code its guest's processes run, the target its
+// installed code.
+message FirmwareRuntime {
+    string libvirt               = 1;
+    string qemu                  = 2;
+    string swtpm                 = 3;
+    string libtpms               = 4;
+    string ovmf_fingerprint      = 5;  // "layout:<hex> ovmf:<hex>": the firmware layout (dataDir and OVMF paths) and the OVMF files' content
+    bool   live_firmware_enabled = 6;  // migration.live_firmware on this host
+}
+
+// FirmwareApplicability is which firmware state a VM carries, each side
+// deriving it from its own row: tpm (a vTPM) and uefi (a UEFI NVRAM that
+// carries Secure Boot or TPM state).
+message FirmwareApplicability {
+    bool tpm  = 1;
+    bool uefi = 2;
+}
+
+// TargetDomain is what the target host's libvirt holds for the VM's name,
+// read when the target answers.
+message TargetDomain {
+    bool   present = 1;
+    string state   = 2;  // libvirt state: running | paused | shutoff | ...; empty when not present
+    string reason  = 3;  // libvirt state reason; empty when not present
+    string uuid    = 4;  // the domain's uuid; empty when not present
+}
+
+// FirmwareVerdict is the target's answer to a firmware hand-over check.
+enum FirmwareVerdict {
+    FIRMWARE_VERDICT_UNSPECIFIED = 0;  // never sent; an empty answer
+    FIRMWARE_VERDICT_BAD_REQUEST = 1;  // a hash the hold needs is empty
+    FIRMWARE_VERDICT_NOT_HELD    = 2;  // no hold for this attempt and uuid
+    FIRMWARE_VERDICT_NOT_RUNNING = 3;  // the domain is absent or inactive
+    FIRMWARE_VERDICT_TARGET_RAN  = 4;  // the domain is active and running
+    FIRMWARE_VERDICT_MATCH       = 5;  // paused, and its state equals the source's
+    FIRMWARE_VERDICT_MISMATCH    = 6;  // paused, and its state differs or is missing
+}
+
+// FirmwareAbortMode is when, and why, a source aborts a live firmware move's
+// target.
+enum FirmwareAbortMode {
+    FIRMWARE_ABORT_MODE_UNSPECIFIED        = 0;
+    FIRMWARE_ABORT_MODE_PRE_CUTOVER        = 1;  // the guest is still running on the source
+    FIRMWARE_ABORT_MODE_DISCARD_UNVERIFIED = 2;  // after cutover, the source drops the target's copy
 }

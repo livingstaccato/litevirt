@@ -1012,3 +1012,26 @@ func TestFleet_ColdDiskPlacedAfterTheSourceGaveUpIsTakenBack(t *testing.T) {
 		})
 	}
 }
+
+// A drain that finds no target for a VM ends incomplete, naming it. Before
+// D2-17 r1 a drain whose every VM had no target returned nil before its
+// remaining check, and `lv host drain` printed "drained" over a running VM.
+//
+// Mutation: return nil when no drain job is left (the old early return) —
+// red.
+func TestFleet_DrainWithNoTargetEndsIncomplete(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	if err := corrosion.UpdateHostState(context.Background(), sc.src.DB, sc.dst.Name, "maintenance"); err != nil {
+		t.Fatal(err)
+	}
+
+	progress, err := sc.drain(t)
+	assertIncomplete(t, err)
+	if !strings.Contains(err.Error(), "os1 (running)") {
+		t.Errorf("drain = %v, want it to name os1 (running)", err)
+	}
+	if p := progress["os1"]; p == nil || p.Status != "failed" || !strings.Contains(p.Error, "no eligible target") {
+		t.Errorf("drain progress for os1 = %+v, want failed: no eligible target", p)
+	}
+}

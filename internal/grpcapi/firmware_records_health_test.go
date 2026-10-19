@@ -1,0 +1,175 @@
+package grpcapi
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fwmig"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
+)
+
+type fwNoVirt struct{}
+
+func (fwNoVirt) SetFirmwareMoveGuard(lv.FirmwareMoveGuard) {}
+
+// A firmware move record that cannot be read refuses, host-wide, every call
+// that carries a uuid; it is raised as a critical host condition naming the
+// file and the remedy, with every wipe it refused (each also an event on its
+// VM, the state still on disk), and resolved once the file reads (review I-1).
+//
+// Mutations: judgeFirmwareMoveRecords raising nothing — red; dropping the
+// refused wipes — red; never resolving — red.
+func TestFirmwareRecordUnreadable_RaisedNamedAndResolved(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	s := NewServerForTests(TestServerOpts{HostName: "h1", DataDir: dir, DB: db})
+	fwmig.Wire(fwNoVirt{}, s.fw())
+
+	bad := filepath.Join(dir, fwmig.HoldDir, "vm9.json")
+	if err := os.MkdirAll(filepath.Dir(bad), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bad, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Another VM's delete wipes its firmware state: refused, still on disk.
+	const id = "aad2e0bb-3311-42a9-92f9-4062205a4dc1"
+	s.fw().SwtpmBase = t.TempDir()
+	tree := filepath.Join(s.fw().SwtpmDir(id), "tpm2")
+	if err := os.MkdirAll(tree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s.fw().WipeFirmwareState("web", id)
+	if _, err := os.Stat(tree); err != nil {
+		t.Fatalf("the refused wipe removed the state: %v", err)
+	}
+
+	s.judgeFirmwareMoveRecords(ctx)
+	row, found, err := corrosion.GetHealthCondition(ctx, s.db, firmwareMoveEvaluator, condFirmwareRecordUnreadable, "host", "h1")
+	if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved || row.Severity != corrosion.SeverityCritical {
+		t.Fatalf("condition = %+v found=%v err=%v, want raised critical", row, found, err)
+	}
+	for _, want := range []string{bad, "repair the file", `"vm":"web"`, id} {
+		if !strings.Contains(row.Evidence, want) {
+			t.Errorf("evidence lacks %q: %s", want, row.Evidence)
+		}
+	}
+	evs, err := corrosion.ListVMEvents(ctx, s.db, "web", 10, "")
+	if err != nil || len(evs) != 1 || evs[0].Type != eventFirmwareStateWipeRefused || !strings.Contains(evs[0].Detail, "still on disk") {
+		t.Fatalf("events of web = %+v (%v), want one %s", evs, err, eventFirmwareStateWipeRefused)
+	}
+
+	// A second pass keeps naming the refused wipe.
+	s.judgeFirmwareMoveRecords(ctx)
+	row, _, _ = corrosion.GetHealthCondition(ctx, s.db, firmwareMoveEvaluator, condFirmwareRecordUnreadable, "host", "h1")
+	if row.Lifecycle != corrosion.ConditionConfirmed || !strings.Contains(row.Evidence, `"vm":"web"`) {
+		t.Fatalf("second pass: %+v", row)
+	}
+
+	if err := os.Remove(bad); err != nil {
+		t.Fatal(err)
+	}
+	s.judgeFirmwareMoveRecords(ctx)
+	row, _, _ = corrosion.GetHealthCondition(ctx, s.db, firmwareMoveEvaluator, condFirmwareRecordUnreadable, "host", "h1")
+	if row.Lifecycle != corrosion.ConditionResolved {
+		t.Fatalf("after the file was removed: %+v, want resolved", row)
+	}
+}
+
+// m-11: the evidence names at most the newest maxFirmwareWipesNamed refused
+// wipes, with a count of them all, however long a record stays unreadable.
+//
+// Mutation: drop the bound — red.
+func TestFirmwareRecordUnreadable_RefusedWipesBounded(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	s := NewServerForTests(TestServerOpts{HostName: "h1", DataDir: dir, DB: db})
+	fwmig.Wire(fwNoVirt{}, s.fw())
+	bad := filepath.Join(dir, fwmig.InflightDir, "vm9.json")
+	if err := os.MkdirAll(filepath.Dir(bad), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bad, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	total := 0
+	for pass := 0; pass < 3; pass++ {
+		for i := 0; i < 50; i++ { // under the store's own bound of 64 per pass
+			s.fw().WipeFirmwareStateByUUID(fmt.Sprintf("aad2e0bb-3311-42a9-92f9-%012d", total))
+			total++
+		}
+		s.judgeFirmwareMoveRecords(ctx)
+	}
+	row, found, err := corrosion.GetHealthCondition(ctx, s.db, firmwareMoveEvaluator, condFirmwareRecordUnreadable, "host", "h1")
+	if err != nil || !found {
+		t.Fatalf("no condition: %v", err)
+	}
+	var ev struct {
+		Wipes []lvRefusedWipe `json:"wipes_refused"`
+		Total int             `json:"wipes_refused_total"`
+	}
+	if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil {
+		t.Fatal(err)
+	}
+	if len(ev.Wipes) != maxFirmwareWipesNamed || ev.Total != total {
+		t.Fatalf("evidence names %d wipes, total %d; want %d named, total %d", len(ev.Wipes), ev.Total, maxFirmwareWipesNamed, total)
+	}
+	if last := ev.Wipes[len(ev.Wipes)-1].UUID; last != fmt.Sprintf("aad2e0bb-3311-42a9-92f9-%012d", total-1) {
+		t.Fatalf("the newest wipe is not kept: last named %s", last)
+	}
+}
+
+// m-13 (D2-6 re-review 2): refusals past the store's own bound in one pass
+// are still counted in wipes_refused_total, though only the newest are named.
+//
+// Mutation: add only the taken wipes to the total — red.
+func TestFirmwareRecordUnreadable_RefusedWipesPastStoreBoundCounted(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	s := NewServerForTests(TestServerOpts{HostName: "h1", DataDir: dir, DB: db})
+	fwmig.Wire(fwNoVirt{}, s.fw())
+	bad := filepath.Join(dir, fwmig.InflightDir, "vm9.json")
+	if err := os.MkdirAll(filepath.Dir(bad), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bad, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const n = 150 // past the store's bound of 64 in a single pass
+	for i := 0; i < n; i++ {
+		s.fw().WipeFirmwareStateByUUID(fmt.Sprintf("aad2e0bb-3311-42a9-92f9-%012d", i))
+	}
+	s.judgeFirmwareMoveRecords(ctx)
+	row, found, err := corrosion.GetHealthCondition(ctx, s.db, firmwareMoveEvaluator, condFirmwareRecordUnreadable, "host", "h1")
+	if err != nil || !found {
+		t.Fatalf("no condition: %v", err)
+	}
+	var ev struct {
+		Wipes []lvRefusedWipe `json:"wipes_refused"`
+		Total int             `json:"wipes_refused_total"`
+	}
+	if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Total != n || len(ev.Wipes) != maxFirmwareWipesNamed {
+		t.Fatalf("total %d, %d named; want total %d, %d named", ev.Total, len(ev.Wipes), n, maxFirmwareWipesNamed)
+	}
+}

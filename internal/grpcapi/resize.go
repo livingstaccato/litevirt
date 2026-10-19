@@ -538,18 +538,34 @@ func (s *Server) appendOpStep(ctx context.Context, opID string, ownerEpoch int64
 // VM (serializing with any in-flight resize) and re-checks terminality under it, so
 // it never races a live handler. Safe at startup and on a reconciler tick.
 func (s *Server) RecoverResourceOperations(ctx context.Context) {
+	s.recoverResourceOperations(ctx, true)
+}
+
+// RecoverResourceOperationsAtStart is RecoverResourceOperations at daemon
+// start: a VM whose lock is held (a live firmware move's recovery holds it
+// until the start is wired) is skipped, and RunResourceOperationRecovery
+// takes it later, so the start never waits on it (review D2-13 N-1).
+func (s *Server) RecoverResourceOperationsAtStart(ctx context.Context) {
+	s.recoverResourceOperations(ctx, false)
+}
+
+func (s *Server) recoverResourceOperations(ctx context.Context, wait bool) {
 	vms, err := corrosion.ListVMsWithActiveOperation(ctx, s.db, s.hostName)
 	if err != nil {
 		slog.Warn("resource op recovery: list wedged VMs failed", "error", err)
 		return
 	}
 	for i := range vms {
-		s.recoverOneResourceOperation(ctx, vms[i].Name)
+		s.recoverOneResourceOperation(ctx, vms[i].Name, wait)
 	}
 }
 
-func (s *Server) recoverOneResourceOperation(ctx context.Context, name string) {
-	unlock := s.lockVMAs(name, "resize recovery")
+func (s *Server) recoverOneResourceOperation(ctx context.Context, name string, wait bool) {
+	unlock, ok := s.lockVMOrSkipAs(name, "resize recovery", wait)
+	if !ok {
+		slog.Info("resource op recovery: the VM is locked; left to the next pass", "vm", name)
+		return
+	}
 	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, name)

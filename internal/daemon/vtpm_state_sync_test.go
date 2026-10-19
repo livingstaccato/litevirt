@@ -276,3 +276,25 @@ func TestConfig_VTPMStateSyncDefaultsOn(t *testing.T) {
 		t.Fatal("vtpm_state_sync: false is on")
 	}
 }
+
+// Codex I4 (with the start order below): a pass that has run past its wait
+// raises timed_out; if that write fails, the next probe writes it again.
+//
+// Mutation: return from overrun once overran is set, before the write, and
+// the condition is never raised.
+func TestVTPMStateSync_AFailedOverrunWriteIsRetried(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	v, _ := newTestVTPMSync(true, libvirt.SwtpmSyncReport{State: libvirt.SwtpmSyncOn})
+	inner := v.sync
+	v.sync = func(on bool) libvirt.SwtpmSyncReport { <-release; return inner(on) }
+	v.wait = 10 * time.Millisecond
+	var writes []bool
+	v.report = func(open bool, _ map[string]any) bool { writes = append(writes, open); return len(writes) > 1 }
+	v.probe(true)
+	v.probe(true)
+	v.probe(true)
+	if len(writes) != 2 || !writes[0] || !writes[1] {
+		t.Fatalf("timed_out writes %v, want a retry after the failed one and then none", writes)
+	}
+}

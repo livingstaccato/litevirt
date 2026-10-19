@@ -171,6 +171,7 @@ func TestNvramFlusher_FsyncErrorIsStickyUntilTheFileGoes(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Sweep()
+	f.Sweep() // confirmed gone by a second, fresh listing
 	if got := f.Failures(); len(got) != 0 {
 		t.Fatalf("removed file still listed as failed: %+v", got)
 	}
@@ -367,7 +368,8 @@ func TestNvramFlusher_FailureFollowsTheFileNotTheName(t *testing.T) {
 	}
 
 	// After a restart: the same file is still failed, a stale entry for a
-	// file that is gone is not.
+	// file that is gone is not, once a sweep finds its inode nowhere (it is
+	// kept until then: it may have been renamed).
 	other := filepath.Join(dir, "other_VARS.fd")
 	writeAt(t, other, "o", now.Add(-time.Hour))
 	g, _, _ := recordingFlusher(t, dir)
@@ -375,9 +377,7 @@ func TestNvramFlusher_FailureFollowsTheFileNotTheName(t *testing.T) {
 		NvramFlushFailure{Path: filepath.Join(dir, "gone_VARS.fd"), Error: "EIO", Dev: 1, Ino: 1},
 		NvramFlushFailure{Path: other, Error: "EIO", Dev: 1, Ino: 1}, // another file at the name now
 	))
-	if got := g.Failures(); len(got) != 1 || got[0].Path != vars {
-		t.Fatalf("seeded failures = %+v; want only %s", got, vars)
-	}
+	g.Sweep()
 	g.Sweep()
 	if got := g.Failures(); len(got) != 1 || got[0].Path != vars {
 		t.Fatalf("after a restart, failures = %+v; want only %s", got, vars)
@@ -389,6 +389,7 @@ func TestNvramFlusher_FailureFollowsTheFileNotTheName(t *testing.T) {
 	if err := os.Rename(next, vars); err != nil {
 		t.Fatal(err)
 	}
+	g.Sweep()
 	g.Sweep()
 	if got := g.Failures(); len(got) != 0 {
 		t.Fatalf("a replaced file is still failed: %+v", got)

@@ -63,8 +63,8 @@ func (r *Reconciler) startRowGone(ctx context.Context, name, createdAt string) (
 // nvramExists reports whether name's UEFI vars file is present, for the
 // before-define snapshot startedForGoneRow judges ownership by. A stat that
 // fails for any reason but absence counts as present: never proven ours.
-func nvramExists(dataDir, name string) bool {
-	_, err := os.Stat(lv.NvramPath(dataDir, name))
+func nvramExists(fw *lv.FirmwareStore, name string) bool {
+	_, err := os.Stat(fw.NvramPath(name))
 	return !errors.Is(err, fs.ErrNotExist)
 }
 
@@ -114,12 +114,12 @@ func (r *Reconciler) startedForGoneRow(ctx context.Context, vm corrosion.VMRecor
 			slog.Error("reconciler: could not undefine a disk-less domain started for a deleted record",
 				"vm", vm.Name, "error", err)
 		} else {
-			nvram := lv.NvramPath(r.dataDir, vm.Name)
+			nvram := r.fwStore.NvramPath(vm.Name)
 			switch {
-			case !nvramExists(r.dataDir, vm.Name):
+			case !nvramExists(r.fwStore, vm.Name):
 				slog.Warn("reconciler: removed the disk-less domain it had started for a deleted record", "vm", vm.Name)
 			case !nvramBefore && row == nil:
-				if rerr := os.Remove(nvram); rerr != nil {
+				if rerr := r.fwStore.RemoveNvram(vm.Name); rerr != nil {
 					slog.Warn("reconciler: removed the disk-less domain it had started for a deleted record; "+
 						"the UEFI vars its boot created could not be removed and block a create of the name until they are",
 						"vm", vm.Name, "nvram", nvram, "error", rerr)
@@ -141,7 +141,7 @@ func (r *Reconciler) startedForGoneRow(ctx context.Context, vm corrosion.VMRecor
 			"vm", vm.Name, "error", err)
 	} else {
 		slog.Warn("reconciler: kept the domain started for a deleted record, shut off, for the orphan-runtime report — not reaped",
-			"vm", vm.Name, "state", state, "nvram", lv.NvramPath(r.dataDir, vm.Name))
+			"vm", vm.Name, "state", state, "nvram", r.fwStore.NvramPath(vm.Name))
 	}
 	return true
 }

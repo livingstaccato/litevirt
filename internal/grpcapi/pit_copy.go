@@ -702,7 +702,8 @@ func (s *Server) repointDanglingPITDefinition(ctx context.Context, vm *corrosion
 	default:
 		return nil
 	}
-	if evidence, err := pitoverlay.SetAsideEvidenceBounded(disk); err != nil {
+	uuid, _ := vmSpecUUID(vm.Spec)
+	if evidence, err := pitoverlay.SetAsideEvidenceBoundedFor(disk, uuid); err != nil {
 		return err
 	} else if !evidence {
 		return nil
@@ -910,7 +911,7 @@ func (s *Server) setAsideStaleOverlay(ctx context.Context, vmName, diskName, dis
 	if baseAside != "" {
 		base = "the file it was taken of was moved aside to " + baseAside + " (the overlay belongs with it)"
 	}
-	detail := fmt.Sprintf("%s: a point-in-time overlay %s was left where the new disk %s is written; it cannot belong to the new disk and was kept as %s, with its binding as %s.id; %s. Inspect them, then delete them",
+	detail := fmt.Sprintf("%s: a point-in-time overlay %s was left where the new disk %s is written; it cannot belong to the new disk and was kept as %s, with its binding as %s.id; %s. Inspect them, then remove them with lv pit-overlays rm",
 		diskName, pitoverlay.Path(disk), disk, to, to, base)
 	slog.Warn("point-in-time overlay set aside", "vm", vmName, "detail", detail)
 	s.recordVMEventSeverity(ctx, vmName, "disk.pit_overlay_set_aside", "warning", "warn", detail)

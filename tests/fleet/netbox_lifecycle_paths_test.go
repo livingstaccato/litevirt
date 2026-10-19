@@ -407,9 +407,7 @@ func TestStaleRecordCleanupReleasesLeases(t *testing.T) {
 	// what routes DeleteVM into the stale-record cleanup rather than its ordinary
 	// path — and the ordinary path already released, so without this the scenario
 	// would pass against the bug.
-	if err := n.Virt.UndefineDomain("vm-1", false); err != nil {
-		t.Fatalf("undefine the domain behind the daemon's back: %v", err)
-	}
+	n.Virt.VanishDomain("vm-1")
 	if n.Virt.DomainExists("vm-1") {
 		t.Fatal("test setup: the domain must be gone for the stale-record path to run")
 	}
@@ -447,9 +445,7 @@ func TestStaleRecordCleanupEnqueuesOrphanCheckWhenReleaseFails(t *testing.T) {
 	if got := pendingQueueItems(t, n, "orphan"); got != 0 {
 		t.Fatalf("test setup: the sync queue must start empty, got %d items", got)
 	}
-	if err := n.Virt.UndefineDomain("vm-1", false); err != nil {
-		t.Fatalf("undefine the domain behind the daemon's back: %v", err)
-	}
+	n.Virt.VanishDomain("vm-1")
 
 	// Unreachable NetBox: the local tombstone lands, the remote delete cannot.
 	nb.SetDown(true)

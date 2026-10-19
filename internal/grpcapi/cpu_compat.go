@@ -167,13 +167,13 @@ func (s *Server) preflightTargetCPU(ctx context.Context, vm *corrosion.VMRecord,
 	if !ok {
 		return nil
 	}
-	client, conn, err := s.peerClient(ctx, targetHost)
+	client, closer, err := s.dialPeer(ctx, targetHost)
 	if err != nil {
 		// Reaching the target is checked for real by the phases that follow; a
 		// preflight must not invent its own unreachability failure here.
 		return nil
 	}
-	defer conn.Close()
+	defer closer()
 
 	resp, err := client.CheckCPUCompatibility(ctx, &pb.CheckCPUCompatibilityRequest{CpuXml: cpuXML, Machine: machine})
 	if err != nil {

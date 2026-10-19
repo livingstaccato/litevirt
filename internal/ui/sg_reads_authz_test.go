@@ -15,6 +15,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -22,8 +23,9 @@ import (
 // group tables in-process, because no RPC listed them. Any logged-in session
 // therefore saw every group and rule in the cluster, a scoped API token and a
 // project-only grant included. They now read through ListSecurityGroups with
-// the session's bearer, which checks sg.read at the cluster root as the writes
-// check sg.write there.
+// the session's bearer, which shows a global group only to sg.read at the
+// cluster root, and a project's group only to sg.read on that project
+// (docs/design/security-group-projects.md).
 
 const (
 	sgSecretName = "sg-secret-name"
@@ -57,10 +59,9 @@ func TestUISecurityGroups_AScopedTokenSessionCannotReadThem(t *testing.T) {
 	seedSecretSG(t, db)
 	scopeUISession(t, db, `["/projects/teamA"]`)
 
+	// The page renders, listing teamA's groups (none) and no global one.
 	w := serveRequest(s, uiSessionReq(t, "GET", "/security-groups", nil))
-	if w.Code != http.StatusForbidden {
-		t.Errorf("a scoped token reading security groups: status = %d, want %d", w.Code, http.StatusForbidden)
-	}
+	assertStatus(t, w, http.StatusOK)
 	assertNoSGLeak(t, "/security-groups", w.Body.String())
 }
 
@@ -69,9 +70,7 @@ func TestUISecurityGroups_AProjectScopedGrantCannotReadThem(t *testing.T) {
 	seedSecretSG(t, db)
 
 	w := serveRequest(s, uiSessionReq(t, "GET", "/security-groups", nil))
-	if w.Code != http.StatusForbidden {
-		t.Errorf("a project-scoped grant reading security groups: status = %d, want %d", w.Code, http.StatusForbidden)
-	}
+	assertStatus(t, w, http.StatusOK)
 	assertNoSGLeak(t, "/security-groups", w.Body.String())
 }
 
@@ -193,5 +192,32 @@ func TestUIReads_DuringAWhoamiOutageADeadSessionGetsNoData(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The Add-NIC modal lists what the VM's project may bind — its own groups and
+// the global ones — for a session scoped to that project too, and never
+// another project's group (docs/design/security-group-projects.md).
+func TestUIAddNICModal_ListsTheVMsProjectAndGlobalGroups(t *testing.T) {
+	s, db, _ := newUIBoundAt(t, "pat", "/projects/acme", "Admin")
+	ctx := context.Background()
+	grant := capabilities.GrantForTest(t, capabilities.FeatureSGProjects)
+	if err := corrosion.InsertSecurityGroup(ctx, db, corrosion.SecurityGroup{ID: "sg-base", Name: "base-global"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range []corrosion.SecurityGroup{{ID: "sg-a", Name: "a-web", Project: "acme"}, {ID: "sg-b", Name: "b-web", Project: "other"}} {
+		if err := corrosion.InsertProjectSecurityGroup(ctx, db, grant, g); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "vm-a", HostName: "test-host", State: "running", Project: "acme",
+		Spec: `{"name":"vm-a","project":"acme"}`}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	w := serveRequest(s, uiSessionReq(t, "GET", "/ui/vms/vm-a/add-nic-modal", nil))
+	body := w.Body.String()
+	mustContain(t, body, `<option value="a-web">`, `<option value="base-global">`)
+	if strings.Contains(body, "b-web") {
+		t.Errorf("the Add-NIC modal offers another project's group:\n%s", body)
 	}
 }

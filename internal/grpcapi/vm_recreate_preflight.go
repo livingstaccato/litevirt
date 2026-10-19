@@ -169,6 +169,9 @@ func (s *Server) recreatePreflightSpec(ctx context.Context, in *pb.VMSpec, host 
 			return nil, err
 		}
 	}
+	if err := s.admitSecurityGroupRefs(ctx, project, nicSecurityGroupNames(spec.Network)); err != nil {
+		return nil, err
+	}
 	for _, d := range spec.Disks {
 		if err := s.admitPoolAttach(ctx, project, host, d.Storage); err != nil {
 			return nil, err

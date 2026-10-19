@@ -30,6 +30,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -144,6 +145,47 @@ func (s *Server) recordForeignNetworks(ctx context.Context, action, workload str
 func (s *Server) isPeerRelocation(ctx context.Context, proof bool) bool {
 	return proof || (relocateTokenFromMD(ctx) != "" && s.requirePeerCert(ctx) == nil)
 }
+
+// admitSecurityGroupRefs is the attach-time enforcement of project
+// security-group isolation (docs/design/security-group-projects.md): a NIC of a
+// workload in wlProject may bind a GLOBAL group or one its own project owns,
+// never another project's. Group names are unique cluster-wide, so a name
+// resolves to its group whoever asks. A name no live group holds passes, as it
+// always has; the firewall reconciler skips a foreign group at render too,
+// which covers a name another project creates later. Fail closed on a lookup
+// error.
+func (s *Server) admitSecurityGroupRefs(ctx context.Context, wlProject string, names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	sgs, err := corrosion.ListSecurityGroups(ctx, s.db, "")
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "security group admission lookup: %v", err)
+	}
+	for _, name := range names {
+		for _, g := range sgs {
+			if g.Name == name && !tenancy.AdmitAttach(wlProject, g.Project) {
+				return status.Errorf(codes.PermissionDenied,
+					"security group %q is owned by project %q; a workload in project %q may not use it",
+					name, g.Project, tenancy.NormalizeProject(wlProject))
+			}
+		}
+	}
+	return nil
+}
+
+// nicSecurityGroupNames is every security-group name the NICs bind.
+func nicSecurityGroupNames(nics []*pb.NetworkAttachment) []string {
+	var out []string
+	for _, n := range nics {
+		out = append(out, n.GetSecurityGroups()...)
+	}
+	return out
+}
+
+// unresolvedProject is the project of a workload whose row this node does not
+// hold: it matches no project, so only global groups are admitted for it.
+const unresolvedProject = "\x00unresolved"
 
 // admitManagedNetwork is the managed-network half of admitNetworkAttach: a name
 // with a managed network record must be global or owned by wlProject. A name with

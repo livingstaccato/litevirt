@@ -85,8 +85,8 @@ func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force
 	if listed != nil && listed.GetState() == pb.HostState_HOST_JOINING && listed.GetAddress() != "" {
 		if err := removeStagedAdmission(listed.GetAddress(), serial); err != nil {
 			fmt.Printf("  could not remove the credentials an unfinished `lv host add` may have staged on %s "+
-				"(%v); they are revoked. Remove %s/.host.crt.add and .host.key.add there by hand\n",
-				listed.GetAddress(), err, remotePKIDir)
+				"(%v); they are revoked. Remove %s/.host.crt.add-%s and .host.key.add-%s there by hand\n",
+				listed.GetAddress(), err, remotePKIDir, strings.ToLower(serial), strings.ToLower(serial))
 		}
 	}
 	return nil
@@ -418,9 +418,8 @@ func printRemoved(hostName string, removed *pb.RemoveHostResponse, plain string)
 		removed.GetIncarnation(), removed.GetCertSerial())
 }
 
-// removeStagedAdmission removes, over SSH as root, the admitted pair a
-// stranded `lv host add` left staged on the host at addr, when the staged
-// certificate is serial's. The host is often dead or half set up, so the
+// removeStagedAdmission removes, over SSH as root, what a stranded `lv host
+// add` admitted with certificate serial left staged on the host at addr. The host is often dead or half set up, so the
 // connection is bounded (stagedCleanupTimeout). A seam so the removal can be
 // tested without a host.
 var removeStagedAdmission = func(addr, serial string) error {
@@ -440,24 +439,83 @@ var removeStagedAdmission = func(addr, serial string) error {
 // connect, handshake and the commands it runs.
 const stagedCleanupTimeout = 10 * time.Second
 
-// stagedPairHost is what removeStagedPair needs of the host.
-type stagedPairHost interface {
-	ReadFile(path string) ([]byte, bool, error)
-	Run(cmd string) error
+// addStagedTargets are the files an add stages at fixed destinations (its
+// config, staged at the path config.yaml resolves to, is the default one's
+// here).
+func addStagedTargets() []string {
+	return []string{
+		filepath.Join(remotePKIDir, "host.crt"), filepath.Join(remotePKIDir, "host.key"),
+		filepath.Join(remotePKIDir, "ca.crt"), filepath.Join(remotePKIDir, pki.GossipKeyName),
+		filepath.Join(remoteMigrationDir, pki.MigrationCAName), filepath.Join(remoteMigrationDir, pki.MigrationHostCertName),
+		filepath.Join(remoteMigrationDir, pki.MigrationHostKeyName), remoteConfig, remoteBinary,
+	}
 }
 
-// removeStagedPair deletes the staged host.crt and host.key on r only when
-// the staged certificate's serial is serial: the one this removal revoked.
+// removeStagedPair deletes on r what the adds admitted with serial, the one
+// this removal revoked, left staged: every attempt's files tagged with it
+// (<serial>-<nonce>), including the config staged beside the file
+// config.yaml resolves to, and only those, so another admission's on the
+// machine are not touched. A pair an earlier release's add staged untagged
+// goes only when its certificate is serial's (removeLegacyStagedPair).
 // Serials are unique to the CA, so another machine at a reused address never
 // matches, and nothing there is touched.
-func removeStagedPair(r stagedPairHost, serial string) error {
-	crt := addStagedPath(filepath.Join(remotePKIDir, "host.crt"))
-	b, ok, err := r.ReadFile(crt)
+func removeStagedPair(r addRemote, serial string) error {
+	serial = strings.ToLower(serial)
+	if !validAttemptTag(serial) {
+		return fmt.Errorf("serial %q is not one", serial)
+	}
+	targets := addStagedTargets()
+	q := ssh.ShellQuote(r.Path(remoteConfig))
+	if out, err := r.Shell("config", fmt.Sprintf("if [ -e %s ]; then readlink -f -- %s; fi", q, q)); err == nil {
+		if p := strings.TrimSpace(string(out)); p != "" && !strings.ContainsAny(p, "\n\x00") {
+			targets = append(targets, r.Unpath(p))
+		}
+	}
+	var cmd strings.Builder
+	cmd.WriteString("rc=0; ")
+	for _, t := range targets {
+		// The serial is hex (validAttemptTag), and the glob is all that is
+		// left unquoted.
+		fmt.Fprintf(&cmd, "rm -f -- %s* || rc=1; ", ssh.ShellQuote(r.Path(addStagedPath(t, serial+"-"))))
+	}
+	cmd.WriteString("exit $rc")
+	if _, err := r.Shell("unstage", cmd.String()); err != nil {
+		return err
+	}
+	if err := removeInstalledMarker(r, serial); err != nil {
+		return err
+	}
+	return removeLegacyStagedPair(r, serial)
+}
+
+// afterMarkerRead is a test seam: it runs between removeInstalledMarker's
+// read of the record and its removal.
+var afterMarkerRead func()
+
+// removeInstalledMarker removes the machine's record of an install of the
+// revoked admission (addInstalledMarker), which no longer holds the machine
+// for it. The check and the removal are one command, run under the add lock
+// by the shell that holds it, and remove the record only while it is
+// exactly the one read: a record a later add wrote, even after this command
+// was delayed past its connection, is never removed.
+func removeInstalledMarker(r addRemote, serial string) error {
+	b, ok, err := r.ReadFile(addInstalledMarker)
 	if err != nil || !ok {
 		return err
 	}
-	if !strings.EqualFold(installedSerial(b), serial) {
+	line := strings.TrimRight(string(b), "\n")
+	if f := strings.Fields(line); len(f) < 3 || !strings.EqualFold(f[1], serial) {
 		return nil
 	}
-	return r.Run("rm -f -- " + ssh.ShellQuote(crt) + " " + ssh.ShellQuote(addStagedPath(filepath.Join(remotePKIDir, "host.key"))))
+	if afterMarkerRead != nil {
+		afterMarkerRead()
+	}
+	_, err = r.Shell("unstage", lockedCmd(r, markerIs(r, line), removeCmd(r, []string{addInstalledMarker})))
+	if exitStatus(err) == notOurMachine {
+		return nil // another add's record since: left
+	}
+	if err != nil {
+		return fmt.Errorf("remove the record %s of the removed admission's install: %w", addInstalledMarker, err)
+	}
+	return nil
 }

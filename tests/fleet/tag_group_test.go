@@ -420,8 +420,10 @@ func tgContainer(t *testing.T, c *Cluster, n *Node, name, mac string) (ip, nicMA
 
 // m-2, R2-C1: a container migrated to node-1 keeps its membership (the move
 // carries its identity, and its lease goes with it). A new container of the
-// same name on node-0, given the member's MAC, is not a member: nothing
-// matches on name, host or MAC.
+// same name on node-0 is not a member, even sharing the member's MAC:
+// nothing matches on name, host or MAC. (Asked for the member's MAC, the copy
+// is refused; it is made to share it here as an earlier build or a
+// concurrent draw could.)
 //
 // Mutations: clear the tags on migrate — the member drops out: red; match a
 // lease to a member by kind and name, not host — the copy's address joins the
@@ -444,9 +446,35 @@ func TestTagGroup_AMigratedContainerKeepsItAndANameAndMACCopyDoesNot(t *testing.
 	}
 	tgEverywhere(t, c, "web", ip, true)
 
-	ip2, mac2 := tgContainer(t, c, src, name, mac)
-	if !strings.EqualFold(mac2, mac) || ip2 == ip {
-		t.Fatalf("premise: the copy on %s has the member's MAC %s and an address of its own: got %s %s", src.Name, mac, mac2, ip2)
+	// The member's MAC is refused to the copy (it holds it); the copy's
+	// derived MAC, the member's too, is drawn afresh.
+	if _, err := c.SelfClient(src).CreateContainer(context.Background(), &pb.CreateContainerRequest{
+		HostName: src.Name, Name: name, Template: "download",
+		Distro: "debian", Release: "bookworm", Arch: "amd64",
+		Cpu: 1, MemoryMib: 256,
+		Networks: []*pb.ContainerNetwork{{Name: "eth0", NetworkName: ctNetName, Mac: mac}},
+	}); status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("a copy given the member's MAC: got %v, want AlreadyExists", err)
+	}
+	ip2, mac2 := tgContainer(t, c, src, name, "")
+	if strings.EqualFold(mac2, mac) || ip2 == ip {
+		t.Fatalf("premise: the copy on %s has a MAC and an address of its own (the member's %s, %s): got %s %s", src.Name, mac, ip, mac2, ip2)
+	}
+	// The copy shares the member's MAC anyway — as one an earlier build made,
+	// or a concurrent draw on another host: its NIC row and its lease name
+	// the member's MAC (the nodes share one database here).
+	ctx := context.Background()
+	if err := localExec(ctx, src.DB, `UPDATE container_interfaces SET mac = ? WHERE host_name = ? AND ct_name = ? AND deleted_at IS NULL`,
+		mac, src.Name, name); err != nil {
+		t.Fatal(err)
+	}
+	if err := localExec(ctx, src.DB, `UPDATE ip_allocations SET mac = ? WHERE owner_kind = 'ct' AND owner_host = ? AND vm_name = ? AND deleted_at IS NULL`,
+		mac, src.Name, name); err != nil {
+		t.Fatal(err)
+	}
+	if rows, _ := src.DB.Query(ctx, `SELECT 1 FROM ip_allocations WHERE owner_kind = 'ct' AND owner_host = ? AND vm_name = ? AND lower(mac) = lower(?) AND deleted_at IS NULL`,
+		src.Name, name, mac); len(rows) != 1 {
+		t.Fatalf("premise: the copy's lease does not name the member's MAC %s", mac)
 	}
 	for _, n := range c.Nodes {
 		if set := tgSet(t, n, "web"); !slices.Equal(set, []string{ip}) {

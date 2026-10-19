@@ -167,7 +167,9 @@ func renderNICTable(b *strings.Builder, p Plan, sgs map[string]SecurityGroup, v6
 	fmt.Fprintf(b, "        iifname != @%s ip6 hoplimit 255 icmpv6 type { nd-router-advert, nd-redirect } accept\n", setNICDevs)
 	// The built-in load balancer's haproxy on ANOTHER host reaching a backend
 	// here: bridged in from the uplink (re-review m-d).
-	fmt.Fprintf(b, "        iifname != @%s ip saddr @%s ip daddr . tcp dport @%s accept\n", setNICDevs, setLBSrc4, setLB4)
+	// meta protocol first: no implicit ether type, which would miss a
+	// trunk's tagged frames (as on the SYN-flood line).
+	fmt.Fprintf(b, "        iifname != @%s meta protocol ip ip saddr @%s ip daddr . tcp dport @%s accept\n", setNICDevs, setLBSrc4, setLB4)
 	fmt.Fprintf(b, "        ct state invalid %s\n", verdict(p, "-", "state", "invalid"))
 	dispatchNICs(b, nics, "iifname", "nic_out_")
 	renderSynFloodLines(b, p)
@@ -212,7 +214,7 @@ func renderNICTable(b *strings.Builder, p Plan, sgs map[string]SecurityGroup, v6
 	fmt.Fprintf(b, "        ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept\n")
 	fmt.Fprintf(b, "        ip6 saddr fe80::/10 ip6 hoplimit 255 icmpv6 type nd-router-advert accept\n")
 	// The built-in load balancer's haproxy, on this host, reaching a backend.
-	fmt.Fprintf(b, "        ip saddr @%s ip daddr . tcp dport @%s accept\n", setLBSrc4, setLB4)
+	fmt.Fprintf(b, "        meta protocol ip ip saddr @%s ip daddr . tcp dport @%s accept\n", setLBSrc4, setLB4)
 	fmt.Fprintf(b, "        ct state invalid %s\n", verdict(p, "-", "state", "invalid"))
 	renderSynFloodLines(b, p)
 	dispatchNICs(b, nics, "oifname", "nic_in_")

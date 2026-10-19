@@ -20,7 +20,6 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/opjournal"
@@ -137,6 +136,9 @@ func (s *Server) attachNICEntry(ctx context.Context, req *pb.AttachDeviceRequest
 		if err := s.admitManagedNetwork(ctx, vmRec.Project, spec.Name); err != nil {
 			return nil, err
 		}
+		if err := s.admitSecurityGroupRefs(ctx, vmRec.Project, spec.GetSecurityGroups()); err != nil {
+			return nil, err
+		}
 		// The entry node checked the caller's authority over the guard; the
 		// owner re-checks only what needs none.
 		if _, err := s.admitNICGuards(ctx, vmRec.Name, []*pb.NetworkAttachment{spec}, admitPeerOwner); err != nil {
@@ -187,6 +189,9 @@ func (s *Server) attachNICEntry(ctx context.Context, req *pb.AttachDeviceRequest
 	// so a completed attach replays its stored response; before the remote
 	// provisioning push and any operation row, so a refusal leaves nothing.
 	if err := s.admitNetworkAttach(ctx, vmRec.Project, spec.Name); err != nil {
+		return nil, err
+	}
+	if err := s.admitSecurityGroupRefs(ctx, vmRec.Project, spec.GetSecurityGroups()); err != nil {
 		return nil, err
 	}
 
@@ -246,7 +251,10 @@ func (s *Server) attachNICOwner(ctx context.Context, req *pb.AttachDeviceRequest
 	spec := req.Nic
 	mac := spec.Mac
 	if mac == "" {
-		mac = lv.GenerateMAC()
+		var merr error
+		if mac, merr = s.newMACAllocator().next(ctx); merr != nil {
+			return nil, merr
+		}
 	}
 	model := spec.Model
 	if model == "" {

@@ -11,6 +11,7 @@ import "github.com/prometheus/client_golang/prometheus"
 type FirewallMetrics struct {
 	dupNICs    *prometheus.GaugeVec
 	tagMembers *prometheus.GaugeVec
+	logRecords *prometheus.CounterVec
 }
 
 // NewFirewallMetrics registers the firewall metrics on the default registry.
@@ -31,9 +32,22 @@ func newFirewallMetrics(reg prometheus.Registerer) *FirewallMetrics {
 			Help: "Member workloads of each tag group (label group) in this host's current view of the cluster; " +
 				"0 for a group this host cannot read.",
 		}, []string{"group"}),
+		logRecords: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "litevirt_firewall_log_records_total",
+			Help: "Firewall log records this host's listener received, by outcome: kept, rate_limited " +
+				"(over firewall.log_max_rate) or overflow (dropped by the kernel before the listener read them).",
+		}, []string{"outcome"}),
 	}
-	reg.MustRegister(m.dupNICs, m.tagMembers)
+	for _, o := range []string{"kept", "rate_limited", "overflow"} {
+		m.logRecords.WithLabelValues(o)
+	}
+	reg.MustRegister(m.dupNICs, m.tagMembers, m.logRecords)
 	return m
+}
+
+// LogRecords counts n firewall log records with outcome (firewall.LogCounter).
+func (m *FirewallMetrics) LogRecords(outcome string, n int) {
+	m.logRecords.WithLabelValues(outcome).Add(float64(n))
 }
 
 // SetTagGroupMembers replaces every tag-group series with one reconcile

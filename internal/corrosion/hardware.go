@@ -114,23 +114,7 @@ func GetVMNICsRaw(ctx context.Context, c *Client, table, vmName string) ([]NICRe
 		if err != nil {
 			return nil, err
 		}
-		out := make([]NICRecord, len(rows))
-		for i, r := range rows {
-			out[i] = NICRecord{
-				VMName:         r.String("vm_name"),
-				ID:             r.String("id"),
-				NetworkName:    r.String("network_name"),
-				Model:          r.String("model"),
-				MAC:            r.String("mac"),
-				Ordinal:        r.Int("ordinal"),
-				IP:             r.String("ip"),
-				TapDevice:      r.String("tap_device"),
-				SecurityGroups: r.String("security_groups"),
-				UpdatedAt:      r.String("updated_at"),
-				DeletedAt:      r.String("deleted_at"),
-			}
-		}
-		return out, nil
+		return vmNICsRows(rows), nil
 	case "vm_interfaces":
 		rows, err := c.Query(ctx,
 			`SELECT vm_name, network_name, mac, ordinal,
@@ -141,28 +125,55 @@ func GetVMNICsRaw(ctx context.Context, c *Client, table, vmName string) ([]NICRe
 		if err != nil {
 			return nil, err
 		}
-		out := make([]NICRecord, len(rows))
-		for i, r := range rows {
-			vmn := r.String("vm_name")
-			mac := r.String("mac")
-			out[i] = NICRecord{
-				VMName:         vmn,
-				ID:             DeterministicNICID(vmn, mac),
-				NetworkName:    r.String("network_name"),
-				Model:          "virtio",
-				MAC:            mac,
-				Ordinal:        r.Int("ordinal"),
-				IP:             r.String("ip"),
-				TapDevice:      r.String("tap_device"),
-				SecurityGroups: r.String("security_groups"),
-				UpdatedAt:      r.String("updated_at"),
-				DeletedAt:      r.String("deleted_at"),
-			}
-		}
-		return out, nil
+		return vmInterfacesRows(rows), nil
 	default:
 		return nil, fmt.Errorf("corrosion: GetVMNICsRaw: unknown NIC table %q", table)
 	}
+}
+
+// vmNICsRows reads vm_nics rows selected with GetVMNICsRaw's columns.
+func vmNICsRows(rows []Row) []NICRecord {
+	out := make([]NICRecord, len(rows))
+	for i, r := range rows {
+		out[i] = NICRecord{
+			VMName:         r.String("vm_name"),
+			ID:             r.String("id"),
+			NetworkName:    r.String("network_name"),
+			Model:          r.String("model"),
+			MAC:            r.String("mac"),
+			Ordinal:        r.Int("ordinal"),
+			IP:             r.String("ip"),
+			TapDevice:      r.String("tap_device"),
+			SecurityGroups: r.String("security_groups"),
+			UpdatedAt:      r.String("updated_at"),
+			DeletedAt:      r.String("deleted_at"),
+		}
+	}
+	return out
+}
+
+// vmInterfacesRows reads vm_interfaces rows selected with GetVMNICsRaw's
+// columns, synthesizing the id and model.
+func vmInterfacesRows(rows []Row) []NICRecord {
+	out := make([]NICRecord, len(rows))
+	for i, r := range rows {
+		vmn := r.String("vm_name")
+		mac := r.String("mac")
+		out[i] = NICRecord{
+			VMName:         vmn,
+			ID:             DeterministicNICID(vmn, mac),
+			NetworkName:    r.String("network_name"),
+			Model:          "virtio",
+			MAC:            mac,
+			Ordinal:        r.Int("ordinal"),
+			IP:             r.String("ip"),
+			TapDevice:      r.String("tap_device"),
+			SecurityGroups: r.String("security_groups"),
+			UpdatedAt:      r.String("updated_at"),
+			DeletedAt:      r.String("deleted_at"),
+		}
+	}
+	return out
 }
 
 // nicKey groups vm_nics/vm_interfaces rows for the MergedVMNICs overlay. Two

@@ -217,6 +217,54 @@ func gitopsYAMLMayHoldTag(body string) (hit, ok bool) {
 	}
 }
 
+// gitopsYAMLMayHoldLog reports whether any YAML document in body holds a key
+// that reads as log (decoded, any case and padding). ok is false when body is
+// not valid YAML.
+func gitopsYAMLMayHoldLog(body string) (hit, ok bool) {
+	dec := yaml.NewDecoder(strings.NewReader(body))
+	for {
+		var doc any
+		err := dec.Decode(&doc)
+		if errors.Is(err, io.EOF) {
+			return false, true
+		}
+		if err != nil {
+			return false, false
+		}
+		if yamlHoldsLogKey(doc) {
+			return true, true
+		}
+	}
+}
+
+func yamlHoldsLogKey(v any) bool {
+	isLog := func(k any) bool {
+		s, ok := k.(string)
+		return ok && strings.EqualFold(strings.TrimSpace(s), "log")
+	}
+	switch x := v.(type) {
+	case map[string]any:
+		for k, e := range x {
+			if isLog(k) || yamlHoldsLogKey(e) {
+				return true
+			}
+		}
+	case map[any]any:
+		for k, e := range x {
+			if isLog(k) || yamlHoldsLogKey(e) {
+				return true
+			}
+		}
+	case []any:
+		for _, e := range x {
+			if yamlHoldsLogKey(e) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func yamlHoldsTag(v any) bool {
 	switch x := v.(type) {
 	case string:
@@ -250,15 +298,27 @@ func yamlHoldsTag(v any) bool {
 // daemon validates less than this client and stores tag: verbatim: one lv
 // parses is judged by its rule cidrs; one it does not, by every decoded
 // string of its YAML; one that is not YAML at all is probed (an older daemon
-// cannot take it either). Any other file is sent as before.
+// cannot take it either). A file that holds, or may hold, a log key is sent
+// only to a daemon that knows firewall logging, judged the same way: v1.9.0
+// reads compose leniently and would store the rule unlogged. Any other file
+// is sent as before.
 func gitopsDeploy(ctx context.Context, client pb.LiteVirtClient, path, body string) error {
 	cidrs := []string{rulefield.TagCIDRPrefix}
+	logs := true
 	if f, err := compose.ParseNamed(path, []byte(body)); err == nil {
-		cidrs = composeRuleCIDRs(f)
-	} else if hit, ok := gitopsYAMLMayHoldTag(body); ok && !hit {
-		cidrs = nil
+		cidrs, logs = composeRuleCIDRs(f), composeLogs(f)
+	} else {
+		if hit, ok := gitopsYAMLMayHoldTag(body); ok && !hit {
+			cidrs = nil
+		}
+		if hit, ok := gitopsYAMLMayHoldLog(body); ok && !hit {
+			logs = false
+		}
 	}
 	if err := requireTagGroupSupport(ctx, client, cidrs...); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	if err := requireLogSupport(ctx, client, logs); err != nil {
 		return fmt.Errorf("%s: %w", path, err)
 	}
 	stream, err := client.DeployStack(ctx, &pb.DeployStackRequest{

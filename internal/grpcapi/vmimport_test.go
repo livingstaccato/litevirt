@@ -115,14 +115,14 @@ func TestApplyImportNetworks_DupNICRejected(t *testing.T) {
 	fv := &vmimport.ForeignVM{NICs: []vmimport.ForeignNIC{{Network: "netA"}, {Network: "netB"}}}
 	// Both collapse to one bridge via the wildcard → collision on vm_interfaces.
 	meta := &pb.ImportVMRequest{NetMap: map[string]string{"*": "br0"}}
-	if err := s.applyImportNetworks(fv, meta); err == nil {
+	if err := s.applyImportNetworks(context.Background(), fv, meta); err == nil {
 		t.Fatal("expected dup-NIC rejection, got nil")
 	}
 
 	// Distinct bridges map cleanly + MACs are generated.
 	fv2 := &vmimport.ForeignVM{NICs: []vmimport.ForeignNIC{{Network: "netA"}, {Network: "netB"}}}
 	meta2 := &pb.ImportVMRequest{NetMap: map[string]string{"netA": "br0", "netB": "br1"}}
-	if err := s.applyImportNetworks(fv2, meta2); err != nil {
+	if err := s.applyImportNetworks(context.Background(), fv2, meta2); err != nil {
 		t.Fatalf("distinct bridges rejected: %v", err)
 	}
 	for i, n := range fv2.NICs {

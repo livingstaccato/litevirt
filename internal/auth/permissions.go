@@ -99,6 +99,13 @@ func verbMatches(grants []string, verb string) bool {
 // (internal/grpcapi/role_delegation.go).
 const VerbPermModify = "perm.modify"
 
+// VerbFirewallLogView reads the firewall log (lv firewall log). A record
+// names any tenant's addresses and ports, so the verb is outside every
+// namespace a built-in role grants: "*.read" does not match it (Viewer,
+// Auditor), nor does "sg.*" (NetworkAdmin). Among the built-in roles only
+// Admin ("*") holds it; an admin grants it to others through a custom role.
+const VerbFirewallLogView = "firewall.log.view"
+
 // GrantCovers reports whether holding grant `held` covers grant `requested`:
 // every verb `requested` matches (verbMatches) is matched by `held` too. It
 // is the no-escalation test of a delegated grant, so it errs towards "no": a

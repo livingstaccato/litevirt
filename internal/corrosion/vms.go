@@ -2160,17 +2160,21 @@ func CommitMigrationOwnership(ctx context.Context, c *Client, vmName, sourceHost
 // the coordinator moved; an older placement loses to it everywhere.
 //
 // Not the whole row either. The coordinator's read can be stale: the old
-// owner's last writes may not have reached it. Its other columns — size, bus,
-// backing_disk and backing_image (a flattening move's ClearDiskBacking) — are
-// left to the replicas, so a move never puts back a value the owner cleared.
-// Those columns can still differ across replicas when the owner's write and
-// the move arrive in different orders; anti-entropy settles them as it always
-// has. And the statement applies to a live row only: a replica that already
-// applied the owner's detach keeps the disk detached, while the coordinator,
-// which had not, moves it live. The coordinator's copy stays live (the detach
-// is older than the move) until the operator detaches it again — the same
-// outcome as the host-only move, and never a detached disk booted on a
-// replica that knew of the detach.
+// owner's last writes may not have reached it. The move itself does not write
+// the other columns — size, bus, backing_disk and backing_image (a flattening
+// move's ClearDiskBacking) — and applies to a live row only, so applying it
+// overwrites none of them and does not bring back a detached row.
+//
+// That holds only until anti-entropy runs; it is not a lasting guarantee.
+// The move stamps the coordinator's row with its own, newer updated_at, and
+// anti-entropy merges whole rows: one pass copies the coordinator's live row
+// over a replica's older detach, and a column the replicas hold differently at
+// the move's updated_at (a backing one cleared and one did not) is settled by
+// the content resolver, which can pick the stale value. A detached disk or a
+// cleared backing the coordinator never saw is therefore back on every replica
+// after one pass, as it was with the host-only move. Closing that needs its own
+// clock for those columns or the detach, and is the I-2 follow-up
+// (.superpowers/sdd/plan-residuals-2026-10-05/rsdisk-r1-rereview.md).
 func diskPlacementMove(d DiskRecord, host, now string) Statement {
 	return Statement{SQL: vmDiskPlacementSQL, Params: []interface{}{
 		host, d.Path, d.StorageType, d.StorageVolume, now, d.VMName, d.DiskName}}

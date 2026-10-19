@@ -1,11 +1,19 @@
 // A failover's move of a VM's disk rows carries the placement the coordinator
-// read, and nothing else: a replica that already holds a newer change to one
-// of the rows' other columns, or the row's detach, keeps it.
+// read, and nothing else: applying the move itself does not overwrite a newer
+// change a replica holds to one of the rows' other columns, nor its detach.
 //
-// The coordinator reads its own replica, which may lack the old owner's last
-// writes. A move that published the whole row it read put a backing file the
-// owner had cleared back on every replica, and brought back as live a disk the
-// owner had detached — on the destination, which then booted it.
+// It guards against the round-0 design of this branch, a move that published
+// the whole row it read: from a coordinator whose replica lacked the old
+// owner's last writes, that put a backing the owner had cleared back on every
+// replica, and brought back as live a disk the owner had detached — on the
+// destination, which then booted it. The test passes on the base too: the
+// host-only move wrote neither column.
+//
+// What it asserts holds only until anti-entropy runs. One pass copies the
+// coordinator's newer live row over the destination's detach, and settles the
+// differing backing by content, which can bring back the cleared one. That is
+// pre-existing (I-2 in .superpowers/sdd/plan-residuals-2026-10-05/
+// rsdisk-r1-rereview.md) and left to its follow-up.
 //
 // Multi-node by construction: the owner's last write reaches the destination
 // and not the coordinator, which only per-replica delivery can arrange.
@@ -28,7 +36,7 @@ import (
 //  3. a dies; b reschedules dm to c from its own replica, which still has the
 //     backing and the data disk.
 //  4. c receives the reschedule: its root row names c with no backing, and its
-//     data row stays detached.
+//     data row stays detached (before any anti-entropy pass; see above).
 //
 // Mutation: publish the whole row read (diskRowSQL) from the move — c gets
 // the backing back, and the detached disk back as live.

@@ -1770,6 +1770,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				Phase: pb.PromoteReplicaProgress_DEFINING, VmName: targetName, Host: s.hostName,
 				Replica: replica, DiskPath: livePath, Status: "defining domain" + multiDiskNote,
 			})
+			s.forgetMoveRecords(ctx, targetName) // the promoted domain takes the name
 			setFlightUUID(spec.Uuid)
 			if err := s.virt.DefineDomain(domXML); err != nil {
 				return "define domain", err
@@ -1810,6 +1811,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 					s.unfenceOperatorStart(opClaim)
 				}
 				return "shared disk released", status.Error(codes.FailedPrecondition, gerr.Error())
+			}
+			if eerr := health.NoteStartEvent(ctx, s.db, s.hostName, targetName); eerr != nil {
+				slog.Warn("promote: recording the start event failed", "vm", targetName, "error", eerr)
 			}
 			startErr := s.virt.StartDomain(targetName)
 			releaseGuard()

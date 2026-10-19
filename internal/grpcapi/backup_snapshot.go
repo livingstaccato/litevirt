@@ -19,6 +19,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/pbsstore"
@@ -74,6 +75,11 @@ func (s *Server) BackupSnapshot(req *pb.BackupSnapshotRequest, stream grpc.Serve
 	// A point-in-time overlay an earlier copy left holds writes the disk's
 	// file lacks: settle it before anything reads or starts the disk.
 	if err := s.settlePITOverlays(ctx, vm); err != nil {
+		return err
+	}
+	// A volume move left unresolved here: the row names the file the
+	// persistent config names before it is read (move_unresolved.go).
+	if err := s.resolveUnresolvedMovesFor(ctx, req.VmName, health.MoveUseReadsRunning); err != nil {
 		return err
 	}
 

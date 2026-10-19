@@ -1504,6 +1504,36 @@ acknowledged write is lost. Operator-visible downtime: zero. The orchestrator
 preallocates the destination, polls progress every ~250 ms, and cancels/rolls back on
 context-cancel or pivot failure.
 
+**A move that cannot be rolled back.** When a cutover step fails and the persistent
+config cannot be pointed back at the source, a running VM's mirror is left running
+(nothing is cancelled or deleted) and the error names both files and the `virsh
+blockjob … --pivot` or `--abort` to run. The host keeps a record of such a move, and of
+one whose daemon stopped mid-cutover, under `<data_dir>/move-unresolved`, and the VM
+carries a `vm.move_unresolved` health condition while it lasts. Before the VM next
+starts on that host (`lv start`, an HA, onboot or health-check restart), and before a
+cold or live migration, a replication, a clone, an image build or a backup reads its
+disk, the disk record is pointed at the file the persistent config names and the record
+is removed. The operation is refused instead, with an error naming both files and the
+next step, when the config cannot be read or names neither file, when the guest was
+writing the source under a mirror and was not pivoted but the config names the
+destination, or when the guest was pivoted but the config names the source. A retried
+`lv move-volume` settles it the same way and is refused in the same cases; it is never
+reported as "nothing to do" while the record remains. Another host (a failover onto
+shared storage) honours the condition by what it can prove: when the guest was
+pivoted, a start there points the disk record at the destination on a shared pool both
+hosts define alike only when the VM's domain there is shut off and its persistent config
+names the destination. It is refused when the domain is running, when its config names
+the source, and when there is no domain there (a start would rebuild it from the disk
+record): the VM may then have run on the source since a failover, so each file may hold
+writes the other lacks, and the refusal names both `--accept` exits (docs/diagnostics.md,
+"A forked history"). A disk record naming the destination is refused too once the VM
+changed hands since the move began; when no pivot was recorded, it is refused whichever file the disk
+record names, since the record commit and the pivot may have happened before the holding
+host stopped. A refused VM whose holding host is gone is released with `lv health resolve
+vm.move_unresolved vm/<vm> --reason "…" --accept <path>`, naming the file to keep of each
+such disk, once that host is proven powered off; `lv health` lists each move's files
+first (docs/diagnostics.md).
+
 > **Note:** `lv replicate-volume` copies a shut-off VM's disk plainly and a
 > running or paused one point-in-time — through a full backup session, or an
 > external disk-only snapshot committed back afterwards. Only when neither can

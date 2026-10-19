@@ -1748,11 +1748,43 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 
 	slog.Info("reconciler: starting pending VM", "vm", vm.Name)
 
+	// A volume move this host left unresolved points the disk row at the file
+	// the persistent config names — read before the domain is undefined and
+	// rebuilt from the rows below — or the start is refused
+	// (move_unresolved.go). A domain already running is left to the branch
+	// below.
+	if r.virt == nil || !r.virt.DomainExists(vm.Name) || !domainRunningNow(r.virt, vm.Name) {
+		dom := MoveDomain{InactiveXML: func() (string, error) { return "", errors.New("no libvirt backend") }}
+		if r.virt != nil {
+			dom = MoveDomain{
+				InactiveXML: func() (string, error) { return r.virt.DumpXMLInactive(vm.Name) },
+				State:       func() (string, error) { return r.virt.DomainState(vm.Name) },
+			}
+		}
+		if merr := ResolveUnresolvedMoves(ctx, r.db, r.dataDir, r.hostName, vm.Name, dom); merr != nil {
+			slog.Warn("reconciler: start refused — an unresolved volume move", "vm", vm.Name, "error", merr)
+			if MoveUnresolvedRetryable(merr) {
+				// Transient (a move in flight, a read that failed): the row is
+				// left as it is and a later pass starts it again.
+				if proofID != "" {
+					r.failPendingStart(ctx, vm.Name, proofID, true, merr.Error())
+				}
+				return
+			}
+			r.failPendingStart(ctx, vm.Name, proofID, false, merr.Error())
+			return
+		}
+	}
 	// Check if a domain already exists locally from a partial migration (#14).
 	if r.virt != nil && r.virt.DomainExists(vm.Name) {
 		state, err := r.virt.DomainState(vm.Name)
 		if err == nil && state == "running" {
 			slog.Warn("reconciler: domain already running locally, updating state", "vm", vm.Name)
+			// Not a start, but the guest ran here: the evidence an operator
+			// judges a forked move history by (MoveStartsText).
+			if eerr := NoteAdoptedRunning(ctx, r.db, r.hostName, vm.Name); eerr != nil {
+				slog.Warn("reconciler: recording the running domain's adoption failed", "vm", vm.Name, "error", eerr)
+			}
 			// Idempotent retry: the domain is already up. Complete the proof
 			// (single-use) + clear pending_action_id in one guarded mutation. Do NOT
 			// downgrade to a plain running update on guard failure — that would bypass
@@ -1790,6 +1822,8 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		r.virt.DestroyDomain(vm.Name)
 		r.virt.UndefineDomainPreservingState(vm.Name)
 	}
+	// A start this pass makes (a domain found running is not one).
+	noteStartingHere(ctx, r.db, r.dataDir, vm.Name)
 
 	// wroteStarting: this pass's own "starting" write landed, so a stop the
 	// row says from here on was made while the start was under way (the

@@ -17,6 +17,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/scheduler"
 	"github.com/litevirt/litevirt/internal/storage"
 	"github.com/litevirt/litevirt/internal/tenancy"
@@ -77,6 +78,11 @@ func (s *Server) runVMReplication(ctx context.Context, sched corrosion.BackupSch
 	vmUnlock := s.lockVM(sched.VMName)
 	unlock := func() { unlockOnce.Do(vmUnlock) }
 	defer unlock()
+	// A volume move left unresolved: the rows name the file holding the
+	// guest's writes before one is copied (move_unresolved.go).
+	if err := s.resolveUnresolvedMovesFor(ctx, sched.VMName, health.MoveUseReadsRunning); err != nil {
+		return err
+	}
 
 	disks, err := corrosion.GetVMDisks(ctx, s.db, sched.VMName)
 	if err != nil {

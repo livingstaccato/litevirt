@@ -18,6 +18,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -494,6 +495,11 @@ func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb
 		}
 		defer conn.Close()
 		return client.BuildImage(ctx, req)
+	}
+	// A volume move left unresolved: the rows name the file holding the
+	// guest's writes before one is copied (move_unresolved.go).
+	if err := s.resolveUnresolvedMovesFor(ctx, req.VmName, health.MoveUseReadsRunning); err != nil {
+		return nil, err
 	}
 
 	// A build brings a deleted name back, as an import does; one whose row

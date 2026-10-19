@@ -101,9 +101,15 @@ lv cluster claim-release <kind>/<name>       # Release one workload ha.claim.leg
                                    #   legacy proof stuck in flight on a live destination; the
                                    #   destination confirms nothing runs it, then abandons it (admin)
 lv health [--resolved]             # Cluster health: overall + conditions + coverage (exit 0/1/2)
-lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept-stale-uefi-vars]
-                                   # Resolve one open dual-run condition by hand (admin, audited; re-raised next
-                                   #   pass if it still holds), or accept nvram_flush_failed's vars stores as stale
+lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH] [--force] [--accept-stale-uefi-vars]
+                                   # Resolve one open dual-run condition by hand (admin, audited); re-raised next
+                                   #   pass if it still holds; or a vm.move_unresolved (--reason required) on its
+                                   #   holding host, or once that host is proven powered off; --accept picks the
+                                   #   file to keep of one disk (repeat per disk; required for a move with no pivot
+                                   #   recorded, unless the holder owns the VM and its config and record name
+                                   #   the source); --force keeps a forked history's file although the other
+                                   #   was modified after it; or accept nvram_flush_failed's vars stores as stale
+                                   #   (--accept-stale-uefi-vars)
 ```
 
 ## Hosts
@@ -1572,12 +1578,28 @@ lv health [--resolved]                       # Cluster health: overall state, ac
                                              #   evaluator coverage, connectivity, capacity.
                                              #   --resolved includes the 30-day resolved history.
                                              #   Exit code: 0 healthy · 1 degraded/unknown · 2 critical.
-lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E]
+lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH] [--force]
                                              # Resolve one open dual-run condition by hand, named as
                                              #   `lv health` prints it. Admin (cluster.health.resolve),
                                              #   audited, ha.condition.resolved event. Refused until a
                                              #   detector scan after its last sighting probed every host
                                              #   it names; raised again next pass if it still holds.
+                                             #   Also vm.move_unresolved (an unresolved volume move),
+                                             #   with --reason: on the host holding its record, or once
+                                             #   that host is proven powered off. --accept PATH points
+                                             #   a disk record at one of its move's two files first, on
+                                             #   the VM's owner; once per disk, and required for a
+                                             #   move with no pivot recorded unless the holder owns
+                                             #   the VM and its config and record name the source.
+                                             #   On the owner the domain's config must name each file
+                                             #   kept, and a running domain's record is not changed.
+                                             #   After a pivot only the copy is accepted, unless the VM
+                                             #   changed hands since the move began (a forked
+                                             #   history, on the owner): a record, and a shut-off
+                                             #   domain's config, on the copy are pointed at the
+                                             #   source; refused while the file not kept was
+                                             #   modified later, unless --force.
+                                             #   `lv health` lists the moves first (docs/diagnostics.md).
 lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars --reason R
                                              # Accept that the UEFI vars stores nvram_flush_failed names
                                              #   may be stale, for a VM kept as it is. Admin, audited

@@ -10,6 +10,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc/metadata"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
@@ -72,14 +73,17 @@ Exit code: 0 healthy · 1 degraded or unknown · 2 critical.`,
 	return cmd
 }
 
-// lv health resolve — mark one open dual-run condition resolved by hand, or
-// acknowledge nvram_flush_failed (--accept-stale-uefi-vars).
+// lv health resolve — mark one open dual-run or move-volume condition
+// resolved by hand, or acknowledge nvram_flush_failed
+// (--accept-stale-uefi-vars).
 func newHealthResolveCmd() *cobra.Command {
 	var evaluator, reason string
+	var accept []string
+	var force bool
 	var acceptStaleVars bool
 	cmd := &cobra.Command{
 		Use:   "resolve <code> <kind/subject>",
-		Short: "Resolve an open dual-run condition, or acknowledge nvram_flush_failed, by hand (admin, audited)",
+		Short: "Resolve an open dual-run or move-volume health condition, or acknowledge nvram_flush_failed, by hand (admin, audited)",
 		Long: `Mark one open condition resolved, named as 'lv health' prints it:
 its CODE and its SUBJECT (kind/id), for example
 
@@ -95,7 +99,33 @@ the condition: a scan later than its last sighting that completely probed
 every host it names. Resolving proves nothing; use it for a condition the
 detector can no longer clear by itself.
 
-One other condition can be resolved: nvram_flush_failed. Resolving it, with
+An unresolved volume move (vm.move_unresolved) can be resolved this way too,
+with --reason: run against the host holding the move's record, which removes
+it, or from any host once that host is proven powered off (fenced or removed
+over an IPMI power-off or an operator's lv host fence-confirm). It is refused
+otherwise: that host settles the move itself. 'lv health' lists each move's
+two files, whether the guest was pivoted, and its error: read them first.
+
+--accept <path> names the file to keep of one disk's move, once per disk.
+The disk record is pointed at it first, only on the VM's owner, where that
+file is its own or on a mounted shared pool it and the holding host define
+alike; on a holding host that does not own the VM, --accept may only name the
+file the disk record names. A move the disk record does not settle (a live
+move with no pivot recorded) is refused without one: nothing in the cluster
+knows which file the guest wrote last, unless the holding host owns the VM
+and its persistent config and disk record name the source. On the VM's owner,
+with its domain defined, its persistent config must name the file each disk
+record is left on, and no disk record is changed while it is active. After a
+pivot only the copy is accepted, except on the VM's owner when the VM changed
+hands after the move began: --accept of the source keeps the writes made on
+it since (a disk record, and a persistent config with its domain shut off,
+naming the copy are pointed at it), and the copy is kept on disk
+(docs/diagnostics.md, "A forked history"). That is refused while the
+copy was modified after the source, unless --force is given, as --accept of
+the copy is while the source was modified after it; the refusal prints both
+files' sizes and times.
+
+One more condition can be resolved: nvram_flush_failed. Resolving it, with
 --accept-stale-uefi-vars and a --reason, accepts that the UEFI vars stores it
 names may be stale (writes a failed fsync lost are not on disk), for a VM
 kept as it is; the host's daemon then stops reporting the failures it named
@@ -112,6 +142,12 @@ ha.condition.resolved event.`,
 			if !ok || kind == "" || id == "" {
 				return fmt.Errorf("subject %q: want kind/id as `lv health` prints it, e.g. vm/web-1", args[1])
 			}
+			if len(accept) > 0 && args[0] != moveUnresolvedCode {
+				return fmt.Errorf("--accept applies only to %s, not %s", moveUnresolvedCode, args[0])
+			}
+			if force && (args[0] != moveUnresolvedCode || len(accept) == 0) {
+				return fmt.Errorf("--force applies only to %s with --accept", moveUnresolvedCode)
+			}
 			if args[0] == "nvram_flush_failed" {
 				if !acceptStaleVars {
 					return fmt.Errorf("resolving nvram_flush_failed accepts that the UEFI vars stores it names may be stale " +
@@ -122,6 +158,12 @@ ha.condition.resolved event.`,
 				}
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				for _, a := range accept {
+					ctx = metadata.AppendToOutgoingContext(ctx, moveAcceptMDKey, a)
+				}
+				if force {
+					ctx = metadata.AppendToOutgoingContext(ctx, moveForceMDKey, "true")
+				}
 				resp, err := c.ResolveHealthCondition(ctx, &pb.ResolveHealthConditionRequest{
 					Code: args[0], SubjectKind: kind, SubjectId: id,
 					Evaluator: evaluator, Reason: reason,
@@ -131,6 +173,11 @@ ha.condition.resolved event.`,
 					return fmt.Errorf("resolve %s on %s: %w", args[0], args[1], err)
 				}
 				h := resp.GetCondition()
+				if h.GetCode() == moveUnresolvedCode {
+					fmt.Printf("%s on %s/%s: %s.\n", h.GetCode(), h.GetSubjectKind(), h.GetSubjectId(), h.GetLifecycle())
+					printMoveEvidence(h.GetEvidence())
+					return nil
+				}
 				if args[0] == "nvram_flush_failed" {
 					fmt.Printf("%s on %s/%s: %s. These UEFI vars stores are accepted as possibly stale, each only while the host still holds that same file (path and inode):\n",
 						h.GetCode(), h.GetSubjectKind(), h.GetSubjectId(), h.GetLifecycle())
@@ -157,6 +204,8 @@ ha.condition.resolved event.`,
 	}
 	cmd.Flags().StringVar(&evaluator, "evaluator", "", "the evaluator, when two hold an open condition under the same code and subject")
 	cmd.Flags().StringVar(&reason, "reason", "", "why, recorded in the audit log")
+	cmd.Flags().StringArrayVar(&accept, "accept", nil, "vm.move_unresolved only: the file to keep of one disk's move; once per disk")
+	cmd.Flags().BoolVar(&force, "force", false, "vm.move_unresolved only: in a forked history, keep the file --accept names although the other file was modified after it (audited)")
 	cmd.Flags().BoolVar(&acceptStaleVars, "accept-stale-uefi-vars", false,
 		"for nvram_flush_failed: accept that the UEFI vars stores it names may be stale (needs --reason)")
 	return cmd
@@ -179,6 +228,12 @@ func printClusterHealth(h *pb.ClusterHealth) {
 				strings.Join(c.GetHosts(), ","), c.GetFirstSeen())
 		}
 		w.Flush()
+		for _, c := range conds {
+			if c.GetCode() == moveUnresolvedCode {
+				fmt.Printf("\n%s on %s/%s:\n", c.GetCode(), c.GetSubjectKind(), c.GetSubjectId())
+				printMoveEvidence(c.GetEvidence())
+			}
+		}
 	}
 
 	if evs := h.GetEvaluators(); len(evs) > 0 {
@@ -228,4 +283,48 @@ func capacityDBCell(c *pb.HostCapacityAssessment) string {
 		cell += fmt.Sprintf(" +%dMiB ct", ct)
 	}
 	return cell
+}
+
+// moveAcceptMDKey, moveForceMDKey and moveUnresolvedCode match
+// grpcapi.MoveAcceptMDKey, grpcapi.MoveForceMDKey and health.MoveUnresolvedCode.
+const (
+	moveAcceptMDKey    = "x-litevirt-move-accept"
+	moveForceMDKey     = "x-litevirt-move-force"
+	moveUnresolvedCode = "vm.move_unresolved"
+)
+
+// printMoveEvidence prints the moves a vm.move_unresolved condition recorded,
+// each with what is known of it and the error its move hit, so the operator
+// sees what --accept chooses between before resolving.
+func printMoveEvidence(evidence string) {
+	var ev struct {
+		Host  string `json:"host"`
+		Moves []struct {
+			Disk    string `json:"disk"`
+			Src     string `json:"src"`
+			Dst     string `json:"dst"`
+			Live    bool   `json:"live"`
+			Pivoted bool   `json:"pivoted"`
+			CatchUp bool   `json:"catch_up"`
+			Error   string `json:"error"`
+		} `json:"moves"`
+	}
+	if json.Unmarshal([]byte(evidence), &ev) != nil {
+		fmt.Println("  (evidence unreadable)")
+		return
+	}
+	for _, m := range ev.Moves {
+		fmt.Printf("  %s on %s: %s -> %s (live=%v pivoted=%v catch_up=%v)\n", m.Disk, ev.Host, m.Src, m.Dst, m.Live, m.Pivoted, m.CatchUp)
+		switch {
+		case m.Pivoted || m.CatchUp:
+			fmt.Printf("    holds every write: %s\n", m.Dst)
+		case m.Live:
+			fmt.Println("    no pivot recorded: either file may hold the guest's last writes")
+		default:
+			fmt.Println("    offline move: both files hold the same data")
+		}
+		if m.Error != "" {
+			fmt.Printf("    error: %s\n", m.Error)
+		}
+	}
 }

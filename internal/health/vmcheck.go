@@ -1243,12 +1243,20 @@ func (v *VMChecker) startGuarded(ctx context.Context, name string) error {
 	if v.followNetworks != nil {
 		v.followNetworks(ctx, name)
 	}
-	xml := ""
+	xml, xerr := "", errors.New("no persistent config reader")
 	if d, ok := v.virt.(interface {
 		DumpXMLInactive(string) (string, error)
 	}); ok {
-		xml, _ = d.DumpXMLInactive(name)
+		xml, xerr = d.DumpXMLInactive(name)
 	}
+	// A volume move this host left unresolved (move_unresolved.go).
+	if err := ResolveUnresolvedMoves(ctx, v.db, v.dataDir, v.hostName, name, MoveDomain{
+		InactiveXML: func() (string, error) { return xml, xerr },
+		State:       func() (string, error) { return v.virt.DomainState(name) },
+	}); err != nil {
+		return err
+	}
+	noteStartingHere(ctx, v.db, v.dataDir, name)
 	release, err := GuardSharedDiskStart(ctx, v.db, v.dataDir, v.hostName, name, xml)
 	if err != nil {
 		return err

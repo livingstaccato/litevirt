@@ -701,3 +701,17 @@ func hardenNFSOptions(opts string) string {
 
 // Empty reports whether the table was never read.
 func (t MountTable) Empty() bool { return t.all == nil }
+
+// MountOf returns the mount path lies on, as written (the deepest mount
+// containing it; the top one when mounts are stacked): its directory and what
+// is mounted there. ok is false when the table names no mount containing it.
+func (t MountTable) MountOf(path string) (dir, source string, ok bool) {
+	p := filepath.Clean(path)
+	var under mountEntry
+	for _, e := range t.all {
+		if within(e.dir, p) && len(e.dir) >= len(under.dir) {
+			under, ok = e, true
+		}
+	}
+	return under.dir, under.source, ok
+}

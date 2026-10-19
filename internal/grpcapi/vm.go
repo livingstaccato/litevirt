@@ -1045,11 +1045,20 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return clusterFP, nil
 	}
 
+	macs := s.newMACAllocator()
+	for _, n := range spec.Network {
+		macs.reserve(n.Mac)
+	}
 	for i, n := range spec.Network {
 		bridge := network.FlatBridgeName(n.Name) // default: flat bridge named after the network
 		mac := n.Mac
 		if mac == "" {
-			mac = lv.GenerateMAC()
+			var merr error
+			if mac, merr = macs.next(ctx); merr != nil {
+				claims.releaseAll(ctx)
+				cleanupDisks()
+				return nil, merr
+			}
 			// Recorded in the spec so the NIC keeps its identity (its queue
 			// count) however many NICs are hot-plugged or detached later.
 			n.Mac = mac
@@ -2181,6 +2190,11 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	if vm.Spec != "" {
 		if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
 			return nil, status.Errorf(codes.Internal, "parse stored spec: %v", err)
+		}
+	}
+	if vm.State != "running" {
+		if err := s.refuseStartOnSharedMAC(ctx, vm.Name); err != nil {
+			return nil, err
 		}
 	}
 	lease, err := s.startGatesLocked(ctx, "StartVM", vm, int(spec.Cpu), int(spec.MemoryMib), req.AllowOvercommit)

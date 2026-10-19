@@ -1372,6 +1372,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// (grpcapi.ReconcileISCSISessions), off the start path: a portal that
 	// does not answer must not hold the daemon's start.
 	go d.runISCSISessionReconcile(ctx)
+	// Two NICs of the cluster on one MAC (grpcapi.ReconcileMACCollisions).
+	go d.runMACCollisionReconcile(ctx)
 	// The nfs pools' exports: a host reboot unmounts them, and nothing but a
 	// pool's Prepare mounted them. Mounted back now and kept
 	// (grpcapi.ReconcileNFSMounts), off the start path: a server that does
@@ -2854,6 +2856,26 @@ func (d *Daemon) runISCSISessionReconcile(ctx context.Context) {
 			return
 		case <-ticker.C:
 			d.svc.ReconcileISCSISessions(ctx)
+		}
+	}
+}
+
+// runMACCollisionReconcile looks for NICs of two workloads on one MAC at
+// once, then every grpcapi.MACCollisionReconcileInterval, until ctx is
+// cancelled.
+func (d *Daemon) runMACCollisionReconcile(ctx context.Context) {
+	if d.svc == nil {
+		return
+	}
+	d.svc.ReconcileMACCollisions(ctx)
+	ticker := time.NewTicker(grpcapi.MACCollisionReconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.svc.ReconcileMACCollisions(ctx)
 		}
 	}
 }

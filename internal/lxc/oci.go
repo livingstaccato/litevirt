@@ -39,7 +39,7 @@ type PullOCIOptions struct {
 // Conversion runs in two stages so we can resume a failed unpack
 // without re-downloading the layers:
 //
-//  1. skopeo copy &lt;image&gt; oci:&lt;tmp&gt;:&lt;tag&gt;
+//  1. skopeo copy &lt;image&gt; oci:&lt;staged layout&gt;:&lt;tag&gt;
 //  2. umoci unpack --image &lt;tmp&gt;:&lt;tag&gt; --rootless &lt;dest&gt;
 //
 // We choose --rootless so containers can run unprivileged when the
@@ -63,6 +63,9 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	if opts.Dest == "" {
 		return errors.New("oci: dest required")
 	}
+	// One spelling of the item: "/x/web/" is "/x/web", whose lock and
+	// staging live beside it, never inside the bundle.
+	opts.Dest = filepath.Clean(opts.Dest)
 	if err := requireBinary("skopeo"); err != nil {
 		return err
 	}
@@ -76,7 +79,7 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	}
 	unlock := LockOCIItem(opts.Dest)
 	defer unlock()
-	release, err := lockItemFile(opts.Dest)
+	release, err := lockItemFile(ctx, opts.Dest)
 	if err != nil {
 		return err
 	}
@@ -106,7 +109,15 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 		defer func() { _ = os.RemoveAll(stage) }()
 		bundle = stage
 	}
-	tmpLayout := opts.Dest + ".oci"
+	// The copy goes through a layout of this pull's own, in the staging
+	// directory, removed when the pull ends: <dest>.oci, which earlier
+	// builds used, is the operator's (it may be this pull's own local
+	// source) and is never written or removed.
+	tmpLayout, err := stageUnpack(opts.Dest)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(tmpLayout) }()
 	tag := opts.Tag
 	if tag == "" {
 		tag = parseOCITag(opts.Image)
@@ -115,12 +126,17 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	// Stage 1: skopeo into a local OCI directory layout. The "docker://"
 	// prefix tells skopeo to fetch from a registry; "oci:" works for
 	// local OCI dirs.
+	// A local "oci:<dir>[:tag]" source is read from that directory as is
+	// (the caller has judged the directory); anything else without a
+	// transport is a registry reference.
 	srcRef := opts.Image
-	remote := !strings.Contains(srcRef, "://")
-	if remote {
-		srcRef = "docker://" + srcRef
-	} else {
+	remote := false
+	switch {
+	case strings.HasPrefix(srcRef, "oci:"):
+	case strings.Contains(srcRef, "://"):
 		remote = strings.HasPrefix(srcRef, "docker://")
+	default:
+		srcRef, remote = "docker://"+srcRef, true
 	}
 	dstRef := fmt.Sprintf("oci:%s:%s", tmpLayout, tag)
 	args := []string{"copy"}
@@ -132,17 +148,7 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	}
 	args = append(args, srcRef, dstRef)
 	if out, err := combinedOutputPinned(dieWithDaemon(exec.CommandContext(ctx, "skopeo", args...))); err != nil {
-		// A skopeo killed mid-copy (the daemon died) can leave the layout
-		// unreadable: drop it and copy once more from scratch.
-		if ctx.Err() != nil {
-			return fmt.Errorf("skopeo copy: %w: %s", err, out)
-		}
-		if rerr := os.RemoveAll(tmpLayout); rerr != nil {
-			return fmt.Errorf("skopeo copy: %w: %s", err, out)
-		}
-		if out2, err2 := combinedOutputPinned(dieWithDaemon(exec.CommandContext(ctx, "skopeo", args...))); err2 != nil {
-			return fmt.Errorf("skopeo copy: %w: %s", err2, out2)
-		}
+		return fmt.Errorf("skopeo copy: %w: %s", err, out)
 	}
 
 	// Stage 2: umoci unpack flattens the layers into a usable rootfs.

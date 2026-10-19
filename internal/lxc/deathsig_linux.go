@@ -79,9 +79,14 @@ func stopWorkersIn(dir string) {
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for _, pfd := range fds {
-		ms := int(time.Until(deadline) / time.Millisecond)
-		if ms > 0 {
-			_, _ = unix.Poll([]unix.PollFd{{Fd: int32(pfd), Events: unix.POLLIN}}, ms)
+		for {
+			ms := int(time.Until(deadline) / time.Millisecond)
+			if ms <= 0 {
+				break
+			}
+			if _, err := unix.Poll([]unix.PollFd{{Fd: int32(pfd), Events: unix.POLLIN}}, ms); err != unix.EINTR {
+				break
+			}
 		}
 		_ = unix.Close(pfd)
 	}
@@ -143,12 +148,20 @@ func stageObjects(dir string) map[devIno]bool {
 	return objs
 }
 
-// flockExclusive takes an exclusive flock on f, waiting for it.
-func flockExclusive(f *os.File) error {
+// flockTry takes an exclusive flock on f without waiting: false while
+// another open file description holds it.
+func flockTry(f *os.File) (bool, error) {
 	for {
-		err := unix.Flock(int(f.Fd()), unix.LOCK_EX)
-		if err != unix.EINTR {
-			return err
+		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		switch err {
+		case nil:
+			return true, nil
+		case unix.EWOULDBLOCK:
+			return false, nil
+		case unix.EINTR:
+			continue
+		default:
+			return false, err
 		}
 	}
 }

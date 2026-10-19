@@ -2,6 +2,7 @@ package lxc
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -84,7 +85,7 @@ var ociItemLocks sync.Map // bundle dir → *sync.Mutex
 // <parent>/.litevirt+unpack/<item>.lock, waiting for it: the lock another
 // process (lv ct pull --local beside the daemon) takes too, so only one
 // touches the item's staging entries at a time. It returns the release.
-func lockItemFile(dest string) (func(), error) {
+func lockItemFile(ctx context.Context, dest string) (func(), error) {
 	dir := filepath.Join(filepath.Dir(dest), unpackDirName)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("lock %s: %w", dest, err)
@@ -93,11 +94,36 @@ func lockItemFile(dest string) (func(), error) {
 	if err != nil {
 		return nil, fmt.Errorf("lock %s: %w", dest, err)
 	}
-	if err := flockExclusive(f); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("lock %s: %w", dest, err)
+	for {
+		ok, err := flockTry(f)
+		if err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("lock %s: %w", dest, err)
+		}
+		if ok {
+			return func() { _ = f.Close() }, nil
+		}
+		select {
+		case <-ctx.Done():
+			_ = f.Close()
+			return nil, fmt.Errorf("lock %s: %w", dest, ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
-	return func() { _ = f.Close() }, nil
+}
+
+// tryLockItem takes item's lock in the staging directory dir without
+// waiting: ok is false while another process holds it.
+func tryLockItem(dir, item string) (release func(), ok bool) {
+	f, err := os.OpenFile(filepath.Join(dir, item+lockSuffix), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, false
+	}
+	if got, err := flockTry(f); err != nil || !got {
+		_ = f.Close()
+		return nil, false
+	}
+	return func() { _ = f.Close() }, true
 }
 
 // lockSuffix names an item's lock file in the staging directory; recovery
@@ -152,14 +178,47 @@ func replaceBundle(stage, dest string) error {
 }
 
 // RecoverOCILibrary finishes, at daemon start, what a crash left of a
-// replacing pull in the OCI library lib (its unpackDirName), item by item
-// (recoverStaged). Nothing outside unpackDirName is touched.
+// replacing pull in the OCI library lib (its unpackDirName), item by item.
+// An item whose lock another process holds (lv ct pull --local, running
+// now) is left alone: its entries are live. For any other item, the lock is
+// taken, any process still working in one of its entries is stopped (the
+// dead daemon's tools), and the entries are recovered (recoverStaged).
 func RecoverOCILibrary(lib string) error {
 	dir := filepath.Join(lib, unpackDirName)
-	if _, err := os.Lstat(dir); err == nil {
-		stopWorkersIn(dir) // at start: whatever works there was the dead daemon's
+	ents, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
-	return recoverStaged(dir, lib, "")
+	if err != nil {
+		return err
+	}
+	items := map[string]bool{}
+	for _, e := range ents {
+		if !strings.HasSuffix(e.Name(), lockSuffix) {
+			items[stagedItem(e.Name())] = true
+		}
+	}
+	var errs []error
+	for item := range items {
+		if item == "" {
+			continue // not an entry a pull made
+		}
+		release, ok := tryLockItem(dir, item)
+		if !ok {
+			slog.Info("oci library: a pull of this item is running in another process; its staging is left to it", "item", item)
+			continue
+		}
+		for _, e := range ents {
+			if !strings.HasSuffix(e.Name(), lockSuffix) && stagedItem(e.Name()) == item {
+				stopWorkersIn(filepath.Join(dir, e.Name()))
+			}
+		}
+		if err := recoverStaged(dir, lib, item); err != nil {
+			errs = append(errs, err)
+		}
+		release()
+	}
+	return errors.Join(errs...)
 }
 
 // recoverItem finishes, under dest's item lock, what a crash left of an

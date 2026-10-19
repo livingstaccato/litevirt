@@ -13,4 +13,4 @@ func runPinned(fn func() error) error { return fn() }
 
 func stopWorkersIn(string) {}
 
-func flockExclusive(*os.File) error { return nil }
+func flockTry(*os.File) (bool, error) { return true, nil }

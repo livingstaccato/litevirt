@@ -212,7 +212,7 @@ func TestStartupSweepSparesAnotherMountNamespace(t *testing.T) {
 func TestPullOCI_HoldsTheItemsFileLock(t *testing.T) {
 	fakeOCITools(t, false)
 	dest := filepath.Join(t.TempDir(), "web")
-	release, err := lockItemFile(dest)
+	release, err := lockItemFile(context.Background(), dest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,5 +266,100 @@ func TestStartupSweepStopsAnotherNamespaceInTheStage(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("a process working in the stage from another mount namespace was left running")
+	}
+}
+
+// A pull in another process (lv ct pull --local) holds its item's flock for
+// its whole run. A daemon start leaves that item's staging alone: it neither
+// stops the lock holder nor removes its live stage.
+func TestStartupRecoverySparesAPullHoldingTheItemLock(t *testing.T) {
+	if _, err := exec.LookPath("flock"); err != nil {
+		t.Skip("flock(1) not installed")
+	}
+	lib := t.TempDir()
+	stage := filepath.Join(lib, unpackDirName, "web+7")
+	if err := os.MkdirAll(stage, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lock := filepath.Join(lib, unpackDirName, "web"+lockSuffix)
+	ready := filepath.Join(t.TempDir(), "ready")
+	c := exec.Command("flock", lock, "sh", "-c", "cd "+stage+" && touch "+ready+" && exec sleep 30")
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { _ = c.Wait(); close(done) }()
+	t.Cleanup(func() { _ = c.Process.Kill(); <-done })
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the lock holder did not start")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := RecoverOCILibrary(lib); err != nil {
+		t.Fatalf("recovery: %v", err)
+	}
+	select {
+	case <-done:
+		t.Fatal("start-up recovery killed a pull holding the item's lock")
+	case <-time.After(1 * time.Second):
+	}
+	if _, err := os.Stat(stage); err != nil {
+		t.Fatal("start-up recovery removed the live stage of a pull holding the item's lock")
+	}
+}
+
+type fakeStat struct {
+	os.FileInfo
+	st *syscall.Stat_t
+}
+
+func (f fakeStat) Sys() any { return f.st }
+
+// The stage's objects are matched by device AND inode: an object on another
+// filesystem with the same inode number is not in the stage.
+func TestStageObjectsMatchDeviceAndInode(t *testing.T) {
+	dir := t.TempDir()
+	objs := stageObjects(dir)
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := *fi.Sys().(*syscall.Stat_t)
+	if !objs[devInoOf(fakeStat{fi, &st})] {
+		t.Fatal("the stage directory itself is not among its objects")
+	}
+	other := st
+	other.Dev++
+	if objs[devInoOf(fakeStat{fi, &other})] {
+		t.Fatal("an object with the stage's inode number on another device counts as the stage")
+	}
+}
+
+// Waiting for an item's lock honours the caller: a cancelled pull returns
+// instead of waiting for another process's pull to finish.
+func TestPullOCI_TheLockWaitHonoursCancel(t *testing.T) {
+	fakeOCITools(t, false)
+	dest := filepath.Join(t.TempDir(), "web")
+	release, err := lockItemFile(context.Background(), dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- PullOCI(ctx, PullOCIOptions{Image: "alpine:3.21", Dest: dest}) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a pull whose item is locked elsewhere succeeded")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a cancelled pull kept waiting for the item's lock")
 	}
 }

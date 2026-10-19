@@ -236,3 +236,24 @@ func TestPullOCI_AnAbsoluteLibraryDestIsAnItemName(t *testing.T) {
 		t.Fatalf("a refused pull reached the runtime: %+v", rt.pullCalls)
 	}
 }
+
+// A local "oci:<dir>" source is the Admin's, from a directory the host
+// may read: an Operator is refused, and an Admin's reaches the runtime as
+// spelled.
+func TestPullOCI_ALocalOCISourceIsTheAdmins(t *testing.T) {
+	s, rt := ctPathServer(t)
+	layout := filepath.Join(t.TempDir(), "layout")
+	if err := os.MkdirAll(layout, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	src := "oci:" + layout + ":v2"
+	if _, err := s.PullOCIImage(ctOperatorCtx(), &pb.PullOCIImageRequest{Image: src, Dest: "img"}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("an Operator's local oci: source: %v, want PermissionDenied", err)
+	}
+	if _, err := s.PullOCIImage(adminCtx(), &pb.PullOCIImageRequest{Image: src, Dest: "img"}); err != nil {
+		t.Fatalf("an Admin's local oci: source: %v", err)
+	}
+	if len(rt.pullCalls) != 1 || rt.pullCalls[0].Image != src {
+		t.Fatalf("pull calls %+v, want one with the source as spelled", rt.pullCalls)
+	}
+}

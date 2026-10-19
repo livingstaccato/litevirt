@@ -197,8 +197,11 @@ func TestRecoverOCILibrary(t *testing.T) {
 		t.Errorf("an item was changed: db=%q notes=%q .web.unpack-1=%q .x.unpack-2.old=%q",
 			read("db"), read("notes"), read(".web.unpack-1"), read(".x.unpack-2.old"))
 	}
-	if ents, _ := os.ReadDir(filepath.Join(lib, unpackDirName)); len(ents) != 0 {
-		t.Errorf("leftovers survived the recovery: %v", ents)
+	ents, _ := os.ReadDir(filepath.Join(lib, unpackDirName))
+	for _, e := range ents {
+		if !strings.HasSuffix(e.Name(), lockSuffix) {
+			t.Errorf("leftover %s survived the recovery", e.Name())
+		}
 	}
 }
 
@@ -458,9 +461,9 @@ func TestPullOCI_RecoversTheItemsOwnLeftovers(t *testing.T) {
 	}
 }
 
-// A skopeo killed mid-copy (the daemon died) can leave the item's .oci
-// layout unreadable; the next pull drops the layout and copies again
-// instead of failing until it is removed by hand.
+// A layout at <dest>.oci that a killed skopeo of an earlier build left
+// unreadable does not block the next pull, and is not changed by it: every
+// pull copies through a fresh layout of its own.
 func TestPullOCI_ABrokenLayoutIsRefetched(t *testing.T) {
 	fakeOCITools(t, false)
 	bin := t.TempDir()
@@ -486,5 +489,111 @@ mkdir -p "$layout" && echo '{}' > "$layout/index.json" && echo "$tag" > "$layout
 	}
 	if got := imageIn(t, dest); got != "3.21" {
 		t.Fatalf("the item holds %q", got)
+	}
+	// The pull copies through a layout of its own: what is at <dest>.oci is
+	// not litevirt's to change.
+	if b, _ := os.ReadFile(filepath.Join(dest+".oci", "index.json")); string(b) != "{TRUNCATED" {
+		t.Fatalf("<dest>.oci/index.json is now %q", b)
+	}
+}
+
+// A pull never deletes a directory it did not create: when the source is a
+// local layout at <dest>.oci (the natural name for it) and the copy fails,
+// the layout is left byte for byte, and a pull that succeeds leaves it too.
+func TestPullOCI_NeverTouchesALayoutAtDestOCI(t *testing.T) {
+	fakeOCITools(t, false)
+	bin := t.TempDir()
+	log := filepath.Join(t.TempDir(), "skopeo-args")
+	// A skopeo that fails ("manifest unknown") for tag bad, and copies otherwise.
+	skopeo := `#!/bin/sh
+echo "$@" >> ` + log + `
+for a in "$@"; do last="$a"; done
+rest="${last#oci:}"; layout="${rest%:*}"; tag="${rest##*:}"
+case "$*" in *:bad\ *) echo "manifest unknown" >&2; exit 1 ;; esac
+mkdir -p "$layout" && echo "$tag" > "$layout/tag-$tag"
+`
+	if err := os.WriteFile(filepath.Join(bin, "skopeo"), []byte(skopeo), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	parent := t.TempDir()
+	dest := filepath.Join(parent, "app")
+	src := dest + ".oci"
+	files := map[string]string{"index.json": `{"manifests":[]}`, "oci-layout": `{"imageLayoutVersion":"1.0.0"}`, "blobs/sha256/abc": "the operator's blob"}
+	for rel, body := range files {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(src, rel)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(src, rel), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(when string) {
+		t.Helper()
+		for rel, body := range files {
+			if b, err := os.ReadFile(filepath.Join(src, rel)); err != nil || string(b) != body {
+				t.Errorf("%s: %s is now %q (%v)", when, rel, b, err)
+			}
+		}
+		ents, _ := os.ReadDir(src)
+		if len(ents) != 3 {
+			t.Errorf("%s: the layout now holds %v", when, ents)
+		}
+	}
+	if err := PullOCI(context.Background(), PullOCIOptions{Image: "oci:" + src + ":bad", Dest: dest}); err == nil {
+		t.Fatal("a failing copy reported success")
+	}
+	check("after a failed pull")
+	if err := PullOCI(context.Background(), PullOCIOptions{Image: "oci:" + src + ":v2", Dest: dest}); err != nil {
+		t.Fatalf("a pull from the local layout: %v", err)
+	}
+	check("after a pull")
+	if got := imageIn(t, dest); got != "v2" {
+		t.Fatalf("the item holds %q", got)
+	}
+}
+
+// A local "oci:<dir>[:tag]" source is copied from that directory as is: not
+// sent to a registry as docker://oci:..., and never with credentials.
+func TestPullOCI_ALocalOCISourceIsReadLocally(t *testing.T) {
+	fakeOCITools(t, false)
+	bin := t.TempDir()
+	log := filepath.Join(t.TempDir(), "skopeo-args")
+	skopeo := `#!/bin/sh
+echo "$@" >> ` + log + `
+for a in "$@"; do last="$a"; done
+rest="${last#oci:}"; layout="${rest%:*}"; tag="${rest##*:}"
+mkdir -p "$layout" && echo "$tag" > "$layout/tag-$tag"
+`
+	if err := os.WriteFile(filepath.Join(bin, "skopeo"), []byte(skopeo), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	src := filepath.Join(t.TempDir(), "layout")
+	if err := PullOCI(context.Background(), PullOCIOptions{Image: "oci:" + src + ":v3", Dest: filepath.Join(t.TempDir(), "web"),
+		Username: "u", Password: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(log)
+	args := string(b)
+	if !strings.Contains(args, " oci:"+src+":v3 ") || strings.Contains(args, "docker://") || strings.Contains(args, "--src-creds") {
+		t.Fatalf("skopeo args %q: want the local layout as the source, no registry, no credentials", args)
+	}
+}
+
+// A dest spelled with a trailing slash is the same item: its lock and
+// staging live beside it, never inside the bundle.
+func TestPullOCI_ATrailingSlashIsTheSameItem(t *testing.T) {
+	fakeOCITools(t, false)
+	parent := t.TempDir()
+	dest := filepath.Join(parent, "web")
+	if err := PullOCI(context.Background(), PullOCIOptions{Image: "alpine:3.21", Dest: dest + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, unpackDirName)); err == nil {
+		t.Fatal("the pull made its staging directory inside the item")
+	}
+	if _, err := os.Stat(filepath.Join(parent, unpackDirName, "web"+lockSuffix)); err != nil {
+		t.Fatalf("the item's lock is not beside it: %v", err)
 	}
 }

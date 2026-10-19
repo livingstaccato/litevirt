@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -50,6 +51,7 @@ type vtpmStateSync struct {
 	last     string        // what the condition was last synced to say
 	reported bool          // the condition says it
 	open     bool
+	remedy   string // the open condition's remedy
 }
 
 // probe is the vTPM capability: swtpm is installed (present) and a pass over
@@ -167,6 +169,7 @@ func (v *vtpmStateSync) sync1(state string, open bool, evidence map[string]any) 
 	}
 	v.reported = v.report(open, evidence)
 	v.open, v.last = open, state
+	v.remedy, _ = evidence["remedy"].(string)
 }
 
 // vtpmRemedy is what makes a host's vTPM state durable, for its filesystem.
@@ -212,6 +215,26 @@ func (v *vtpmStateSync) ready() bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return v.passed
+}
+
+// vtpmDurableErr is nil only when this host's vTPM state is durable: a pass
+// over the swtpm tree has completed and vtpm_state_not_durable is not open. A
+// live firmware move never targets a host whose vTPM state is not durable
+// (the label and a move's Prepare both read it). It reads the last pass and
+// starts none.
+func (v *vtpmStateSync) vtpmDurableErr() error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	switch {
+	case !v.passed:
+		return errors.New("no vtpm_state_sync pass over the swtpm tree has completed yet on this host; " +
+			"a live firmware move targets it once one has")
+	case v.open:
+		return fmt.Errorf("this host's vTPM state is not durable (%s: %s), so a live firmware move does not target it; "+
+			"the condition clears, and moves are offered again, once the cause is fixed: %s",
+			CondVTPMStateNotDurable, v.last, v.remedy)
+	}
+	return nil
 }
 
 // syncVTPMCondition raises or resolves vtpm_state_not_durable about this

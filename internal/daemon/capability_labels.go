@@ -136,6 +136,9 @@ type fwLiveInputs struct {
 	secureBoot func() bool
 	installed  func(ctx context.Context) (libvirt.InstalledFirmwareCode, error)
 	guests     func(ctx context.Context) error // D-9
+	// vtpmDurable is nil when this host's vTPM state is durable
+	// (vtpmStateSync.vtpmDurableErr); nil func = not checked.
+	vtpmDurable func() error
 }
 
 // fwLiveMigrateCapable is true only when every condition holds. An unreadable
@@ -157,6 +160,11 @@ func fwLiveMigrateCheck(ctx context.Context, in fwLiveInputs) (libvirt.Installed
 		return libvirt.InstalledFirmwareCode{}, errors.New("no vTPM support (swtpm and swtpm_setup), or no vtpm_state_sync pass over the swtpm tree has completed yet")
 	case !in.secureBoot():
 		return libvirt.InstalledFirmwareCode{}, errors.New("no Secure Boot firmware")
+	}
+	if in.vtpmDurable != nil {
+		if err := in.vtpmDurable(); err != nil {
+			return libvirt.InstalledFirmwareCode{}, err
+		}
 	}
 	code, err := in.installed(ctx)
 	if err != nil {
@@ -180,6 +188,7 @@ const fwLiveProbeTimeout = 15 * time.Second
 // live firmware move's host check.
 type fwLiveHost struct {
 	tpm, secureBoot func() bool
+	vtpmDurable     func() error // nil = not checked
 	installed       func(ctx context.Context) (libvirt.InstalledFirmwareCode, error)
 	running         func(ctx context.Context, liveXML string) (libvirt.FirmwareRuntime, error)
 	guests          func(ctx context.Context) error
@@ -194,7 +203,7 @@ func fwLiveLabelProbe(cfg MigrationConfig, h fwLiveHost) func() bool {
 		defer cancel()
 		return fwLiveMigrateCapable(ctx, fwLiveInputs{
 			enabled: cfg.LiveFirmwareEnabled(), tpm: h.tpm, secureBoot: h.secureBoot,
-			installed: h.installed, guests: h.guests,
+			installed: h.installed, guests: h.guests, vtpmDurable: h.vtpmDurable,
 		})
 	}
 }
@@ -202,8 +211,10 @@ func fwLiveLabelProbe(cfg MigrationConfig, h fwLiveHost) func() bool {
 // newFwLiveLabel is the production probe: this host's installed firmware code,
 // read with the libvirt version call bounded, and the live D-9 check.
 func newFwLiveLabel(cfg MigrationConfig, store *libvirt.FirmwareStore, fp libvirt.FirmwarePaths,
-	libvirtVersion func() (uint64, error), tpm func() bool) func() bool {
-	return fwLiveLabelProbe(cfg, newFwLiveHost(store, fp, libvirtVersion, tpm))
+	libvirtVersion func() (uint64, error), tpm func() bool, vtpmDurable func() error) func() bool {
+	h := newFwLiveHost(store, fp, libvirtVersion, tpm)
+	h.vtpmDurable = vtpmDurable
+	return fwLiveLabelProbe(cfg, h)
 }
 
 // newFwLiveHost is this host's probes behind the label and a live firmware
@@ -235,7 +246,7 @@ func (c fwLiveHostCheck) Check(ctx context.Context) (libvirt.InstalledFirmwareCo
 	defer cancel()
 	return fwLiveMigrateCheck(ctx, fwLiveInputs{
 		enabled: c.cfg.LiveFirmwareEnabled(), tpm: c.h.tpm, secureBoot: c.h.secureBoot,
-		installed: c.h.installed, guests: c.h.guests,
+		installed: c.h.installed, guests: c.h.guests, vtpmDurable: c.h.vtpmDurable,
 	})
 }
 
@@ -248,8 +259,10 @@ func (c fwLiveHostCheck) RunningFirmwareCode(ctx context.Context, liveXML string
 
 // newFwLiveHostCheck is the production live firmware host check.
 func newFwLiveHostCheck(cfg MigrationConfig, store *libvirt.FirmwareStore, fp libvirt.FirmwarePaths,
-	libvirtVersion func() (uint64, error), tpm func() bool) grpcapi.LiveFirmwareHost {
-	return fwLiveHostCheck{cfg: cfg, h: newFwLiveHost(store, fp, libvirtVersion, tpm)}
+	libvirtVersion func() (uint64, error), tpm func() bool, vtpmDurable func() error) grpcapi.LiveFirmwareHost {
+	h := newFwLiveHost(store, fp, libvirtVersion, tpm)
+	h.vtpmDurable = vtpmDurable
+	return fwLiveHostCheck{cfg: cfg, h: h}
 }
 
 // boundedVersion calls fn with a deadline. A call that does not return in

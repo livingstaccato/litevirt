@@ -76,6 +76,10 @@ func nvramDirs(dataDir string) []string {
 // flusher's last sweep.
 const nvramFinalSweepWait = 5 * time.Second
 
+// newNvramFlusher builds the flusher (a variable so a test can see the
+// directories it is started on).
+var newNvramFlusher = libvirt.NewNvramFlusher
+
 // nvramFlusherDirs are the directories the NVRAM flusher watches: the host
 // store's NVRAM directory, or the configured data dir's when there is no
 // store (or it has no data dir).
@@ -92,7 +96,7 @@ func (d *Daemon) nvramFlusherDirs() []string {
 // needs nothing but the data directory, so it runs from the start of Run.
 // stop ends it with one last sweep and waits for that, bounded.
 func (d *Daemon) startNvramFlusher(ctx context.Context) (f *libvirt.NvramFlusher, stop func()) {
-	f = libvirt.NewNvramFlusher(d.nvramFlusherDirs()...)
+	f = newNvramFlusher(d.nvramFlusherDirs()...)
 	if d.cfg.DataDir != "" {
 		f.LoadState(filepath.Join(d.cfg.DataDir, libvirt.NvramFlushStateFile))
 	}

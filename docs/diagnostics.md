@@ -2292,6 +2292,11 @@ carries `state`, `path`, `fs`, `error` and `remedy`:
 
 A vTPM write made shortly before a power cut on that host can be lost.
 
+While it is open, or before the host's first pass has completed, the host is
+no target of a live firmware move: its `litevirt.fw_live_migrate` label is
+false, and a move's Prepare refuses there with the condition and its remedy.
+vTPM itself is still offered on the host.
+
 | Raised when | Clears when |
 |---|---|
 | A pass finds the tree cannot be made synchronous, or does not finish. | A pass makes it synchronous, `vtpm_state_sync: false` is set and the daemon restarted, or swtpm is removed from the host. A node rolled back to a build without this check leaves the row as it was until it runs a build that checks again. |

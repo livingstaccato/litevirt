@@ -1866,11 +1866,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// move's Prepare re-checks presence only (tpmAvailable), since the
 		// label already gated it and a pass per Prepare would walk the tree
 		// on every move.
-		{key: corrosion.LabelFwLiveMigrate, capable: newFwLiveLabel(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmReady)},
+		{key: corrosion.LabelFwLiveMigrate, capable: newFwLiveLabel(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmReady, vtpmSync.vtpmDurableErr)},
 	}
 	// A live firmware move's target re-checks the label's conditions itself,
 	// live, in Prepare.
-	svc.SetLiveFirmwareHost(newFwLiveHostCheck(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmAvailable))
+	// Prepare re-reads the last vTPM pass at move time: a label a cycle
+	// stale never lets a move target a host whose vTPM state is not durable.
+	svc.SetLiveFirmwareHost(newFwLiveHostCheck(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmAvailable, vtpmSync.vtpmDurableErr))
 	asserted, err := assertCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels)
 	if err != nil {
 		slog.Warn("set capability host labels failed; retrying in the background", "labels", asserted, "error", err)

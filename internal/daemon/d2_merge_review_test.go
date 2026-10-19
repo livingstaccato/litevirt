@@ -1,9 +1,13 @@
 package daemon
 
 import (
+	"context"
+	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/libvirt"
@@ -62,5 +66,97 @@ func TestTPMReadyProbe_StartsNoPass(t *testing.T) {
 	missing := func(f string) (string, error) { return "", exec.ErrNotFound }
 	if tpmReadyProbe(missing, v)() {
 		t.Error("ready with swtpm missing")
+	}
+}
+
+// Controller ruling on the D2 merge follow-up: a live firmware move never
+// targets a host whose vTPM state is not durable. The gate reads the last
+// vtpm_state_sync pass (no walk): no pass yet, or vtpm_state_not_durable
+// open, refuses with the condition and its remedy; a durable pass passes.
+//
+// Mutation: ignore the condition in vtpmDurableErr — the not-durable case
+// passes, red.
+func TestVTPMDurableErr(t *testing.T) {
+	look := func(string) (string, error) { return "/usr/bin/x", nil }
+	durable, _ := newTestVTPMSync(true, libvirt.SwtpmSyncReport{State: libvirt.SwtpmSyncOn, Base: "/srv/swtpm"})
+	if err := durable.vtpmDurableErr(); err == nil || !strings.Contains(err.Error(), "no vtpm_state_sync pass") {
+		t.Errorf("before any pass: %v, want refused", err)
+	}
+	tpmCapableProbe(look, durable.probe)()
+	if err := durable.vtpmDurableErr(); err != nil {
+		t.Errorf("after a durable pass: %v, want nil", err)
+	}
+	notDurable, _ := newTestVTPMSync(true, libvirt.SwtpmSyncReport{State: libvirt.SwtpmSyncRenameNotSynchronous, Base: "/srv/swtpm", FS: "xfs"})
+	tpmCapableProbe(look, notDurable.probe)()
+	err := notDurable.vtpmDurableErr()
+	if err == nil || !strings.Contains(err.Error(), CondVTPMStateNotDurable) || !strings.Contains(err.Error(), "dirsync") {
+		t.Errorf("not durable: %v, want refused naming %s and its remedy", err, CondVTPMStateNotDurable)
+	}
+}
+
+// The ruling, at both gates: the fw-live label and a move's Prepare (the
+// host check, read at move time) refuse a host whose vTPM state is not
+// durable, naming the condition; with it durable both pass.
+//
+// Mutation: drop the durability check from fwLiveMigrateCheck — both pass,
+// red.
+func TestFwLive_RefusesANonDurableVTPMHost(t *testing.T) {
+	notDurable := func() error {
+		return errors.New("this host's vTPM state is not durable (" + CondVTPMStateNotDurable + ")")
+	}
+	in := okInputs()
+	in.vtpmDurable = notDurable
+	if fwLiveMigrateCapable(context.Background(), in) {
+		t.Error("the label is capable on a host whose vTPM state is not durable")
+	}
+	h := okHost()
+	h.vtpmDurable = notDurable
+	if _, err := (fwLiveHostCheck{cfg: MigrationConfig{}, h: h}).Check(context.Background()); err == nil || !strings.Contains(err.Error(), CondVTPMStateNotDurable) {
+		t.Errorf("Prepare's check = %v, want refused naming %s", err, CondVTPMStateNotDurable)
+	}
+	h.vtpmDurable = func() error { return nil }
+	if _, err := (fwLiveHostCheck{cfg: MigrationConfig{}, h: h}).Check(context.Background()); err != nil {
+		t.Errorf("Prepare's check with durable vTPM state = %v", err)
+	}
+}
+
+// D2 merge follow-up nit: startNvramFlusher starts the flusher on
+// nvramFlusherDirs, the host store's NVRAM directory.
+//
+// Mutation: start it on nvramDirs("") — the store's directory is not
+// watched, red.
+func TestStartNvramFlusher_WatchesTheStoresNvramDir(t *testing.T) {
+	storeDir := t.TempDir()
+	var got []string
+	old := newNvramFlusher
+	newNvramFlusher = func(dirs ...string) *libvirt.NvramFlusher { got = dirs; return libvirt.NewNvramFlusher(dirs...) }
+	t.Cleanup(func() { newNvramFlusher = old })
+	d := &Daemon{cfg: &Config{}, fwStore: &libvirt.FirmwareStore{DataDir: storeDir}}
+	ctx, cancel := context.WithCancel(context.Background())
+	_, stop := d.startNvramFlusher(ctx)
+	cancel()
+	stop()
+	if want := filepath.Dir(libvirt.NvramPath(storeDir, "x")); !slices.Contains(got, want) {
+		t.Errorf("the flusher watches %v, want %s", got, want)
+	}
+}
+
+// The ruling's wiring: both the fw-live label and the Prepare host check in
+// daemon.go are given the vTPM pass's durability gate.
+//
+// Mutation: pass nil for either — red.
+func TestFwLive_DurabilityGateWiredInDaemon(t *testing.T) {
+	b, err := os.ReadFile("daemon.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	for _, want := range []string{
+		"newFwLiveLabel(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmReady, vtpmSync.vtpmDurableErr)",
+		"newFwLiveHostCheck(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmAvailable, vtpmSync.vtpmDurableErr)",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("daemon.go does not wire %s", want)
+		}
 	}
 }

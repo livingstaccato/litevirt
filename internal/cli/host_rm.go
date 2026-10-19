@@ -122,6 +122,13 @@ func listedHost(ctx context.Context, c pb.LiteVirtClient, hostName string) *pb.H
 // changing anything. There is no command that asserts a decision away: an
 // operator only removes the host the decision named.
 func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, dryRun bool) error {
+	return HostRemoveDeadForce(ctx, c, hostName, dryRun, false)
+}
+
+// HostRemoveDeadForce is HostRemoveDead; force is `--dead --force`: the
+// host is removed even while a Secure Boot / vTPM VM recorded on it has a
+// live firmware move to it that is not settled.
+func HostRemoveDeadForce(ctx context.Context, c pb.LiteVirtClient, hostName string, dryRun, force bool) error {
 	plan, err := c.PlanDeadHostRemoval(ctx, &pb.PlanDeadHostRemovalRequest{Name: hostName})
 	if err != nil {
 		return fmt.Errorf("plan the removal of %s: %w", hostName, err)
@@ -145,7 +152,7 @@ func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, d
 		if err != nil {
 			return fmt.Errorf("read %s's certificate serial: %w", hostName, err)
 		}
-		pre := &pb.RemoveHostRequest{Name: hostName, Dead: true, ExpectedCertSerial: serial}
+		pre := &pb.RemoveHostRequest{Name: hostName, Dead: true, Force: force, ExpectedCertSerial: serial}
 		if _, err := c.PreflightRemoveHost(ctx, pre); err != nil && status.Code(err) != codes.Unimplemented {
 			return fmt.Errorf("the removal of %s would be refused: %w", hostName, err)
 		}
@@ -163,12 +170,12 @@ func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, d
 		}
 		fmt.Printf("  removed %s from the voter set (it was a member of generation %d)\n", hostName, plan.GetVoterGeneration())
 	}
-	serial, version, err := revokeAndPublish(ctx, c, &pb.RemoveHostRequest{Name: hostName, Dead: true})
+	serial, version, err := revokeAndPublish(ctx, c, &pb.RemoveHostRequest{Name: hostName, Dead: true, Force: force})
 	if err != nil {
 		return err
 	}
 	closeRemovedHostAuditContract(ctx, c, hostName)
-	removed, err := removeAfterRevoke(ctx, c, &pb.RemoveHostRequest{Name: hostName, Dead: true, ExpectedCertSerial: serial},
+	removed, err := removeAfterRevoke(ctx, c, &pb.RemoveHostRequest{Name: hostName, Dead: true, Force: force, ExpectedCertSerial: serial},
 		"lv host rm --dead "+hostName)
 	if err != nil {
 		return err

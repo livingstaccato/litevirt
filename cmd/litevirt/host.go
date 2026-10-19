@@ -481,8 +481,11 @@ recoveries decided for it can move on (recovery claims, docs/design/recovery-cla
 'lv host fence-confirm' recorded; removes it from the voter set first if it is a
 member; revokes and publishes as 'lv host rm' does; and reports how many
 stranded recoveries will retry. Its workloads need no --force: they are the
-stranded ones. --dry-run runs every check and prints the plan without changing
-anything.`,
+stranded ones. It also refuses while a Secure Boot / vTPM VM recorded on the
+host has a live firmware move to it that is not settled: settle it with
+'lv doctor firmware-move <vm>', or add --force to remove the host anyway (the
+source's copy stays for the doctor). --dry-run runs every check and prints the
+plan without changing anything.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if dryRun && !dead {
@@ -490,13 +493,13 @@ anything.`,
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				if dead {
-					return cli.HostRemoveDead(ctx, c, args[0], dryRun)
+					return cli.HostRemoveDeadForce(ctx, c, args[0], dryRun, force)
 				}
 				return cli.HostRemove(ctx, c, args[0], force)
 			})
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "Force removal even if VMs exist")
+	cmd.Flags().BoolVar(&force, "force", false, "Force removal even if VMs exist; with --dead, even while a firmware VM's live move to it is not settled")
 	cmd.Flags().BoolVar(&dead, "dead", false, "Remove a host that is fenced proof-grade and gone for good, unblocking recoveries decided for it")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "With --dead: run every check and print the plan, changing nothing")
 	return cmd

@@ -1061,7 +1061,14 @@ func (s *Server) doctorAcceptSource(ctx context.Context, m fwmig.Marker, req *pb
 	case m.Phase == fwmig.PhaseSourcePaused:
 		return s.doctorAcceptSourcePaused(ctx, m)
 	case m.Phase == fwmig.PhaseNvramUnconfirmed:
-		return "", doctorRefuse(m, action, "the guest runs on the target: --confirm-target-nvram, or --push-source-nvram once it is powered off")
+		// With the target proved off its guest runs no more, and the
+		// source's older state is the only copy left to start: it is
+		// returned as after a commit, acknowledged (lab-2 D2 re-review I-3).
+		if _, off, err := s.fwTargetProvedOff(ctx, m.Target); err != nil || !off {
+			return "", doctorRefuse(m, action, fmt.Sprintf("the guest runs on the target: --confirm-target-nvram --accept-nvram-hash=<sha256>, "+
+				"or --push-source-nvram --acknowledge-rollback once it is powered off; with %s proved off (`lv host fence-confirm %s`), "+
+				"--accept-source --acknowledge-rollback returns the VM here from the source's older state", m.Target, m.Target))
+		}
 	case m.Phase == fwmig.PhaseSourceStateMissing && fwPreCutover(from):
 		// The guest left the source: its copy is incomplete, and the target's
 		// may be the only complete one (lab2-D2-proof F7).
@@ -1076,7 +1083,8 @@ func (s *Server) doctorAcceptSource(ctx context.Context, m fwmig.Marker, req *pb
 		if from != fwmig.PhaseCutover {
 			return "", doctorRefuse(m, action, "the source's final state is missing: --adopt-target-copy takes the target's")
 		}
-	case fwmig.PhaseTargetUnreachable, fwmig.PhaseDiscardPending, fwmig.PhaseCommitted, fwmig.PhaseReleased, fwmig.PhaseCleaning:
+	case fwmig.PhaseTargetUnreachable, fwmig.PhaseDiscardPending, fwmig.PhaseCommitted, fwmig.PhaseReleased, fwmig.PhaseCleaning,
+		fwmig.PhaseNvramUnconfirmed:
 		// A stopped source cleanup (cleaning) is a released move: the
 		// target's copy is the committed one, and the source's state is
 		// still its own until the wipe (lab2-D2-proof F3).
@@ -1104,6 +1112,8 @@ func fwAckReason(m fwmig.Marker) string {
 		return "the source's state is suspect (its guest stopped for a reason other than the migration, or ran again after the cutover), and the target's copy may be the newer one"
 	case fwmig.PhaseTargetRan:
 		return "the target's guest ran, so its copy is newer than the source's"
+	case fwmig.PhaseNvramUnconfirmed:
+		return "the guest ran on the target after the release, so its NVRAM there is newer than the source's"
 	case fwmig.PhaseSourceStateMissing:
 		return "the source's final state was never compared with the target's copy"
 	}

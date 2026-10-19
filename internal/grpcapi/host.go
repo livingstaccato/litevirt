@@ -1846,6 +1846,11 @@ func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostReques
 		if err := s.deadRemovalRefusal(ctx, h); err != nil {
 			return nil, none, err
 		}
+		if !req.Force {
+			if err := s.deadRemovalFirmwareRefusal(ctx, req.Name); err != nil {
+				return nil, none, err
+			}
+		}
 	} else {
 		// Check for VMs on this host.
 		vms, _ := corrosion.ListVMs(ctx, s.db, "", req.Name)

@@ -124,10 +124,12 @@ lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (h
 lv host undrain <host> [--failback]       # Return a draining, maintenance, fenced or offline host to scheduling (--failback: wait for the failback it started and print results)
 lv host failback <host> [--all] [--dry-run] [--follow]   # Live-migrate VMs a drain moved away back to the host
 lv host rm <host> [--force]               # Remove host (--force with running VMs); revokes its cert
-lv host rm --dead <host> [--dry-run]      # Remove a host fenced proof-grade and gone for good: checks the
+lv host rm --dead <host> [--dry-run] [--force]  # Remove a host fenced proof-grade and gone for good: checks the
                                           #   fence, `voter rm` if it votes, revokes + publishes the CRL,
                                           #   removes it, and reports the stranded recoveries that now retry
-                                          #   at the next claim attempt. --dry-run changes nothing
+                                          #   at the next claim attempt. --dry-run changes nothing. Refused
+                                          #   while a firmware VM's live move to the host is not settled
+                                          #   (`lv doctor firmware-move <vm>`); --force removes it anyway
 lv host publish-crl                       # Re-publish this machine's crl.pem if `host rm` could not
 lv host renew-cert <host>                 # Renew a host's cluster certificate in place: key made on
   [--ssh root@<addr>] [--keep-old]        #   the host, one atomic switch, served without a restart,

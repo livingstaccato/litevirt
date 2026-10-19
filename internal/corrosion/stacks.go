@@ -108,7 +108,14 @@ type stackRowRead struct {
 const stackRowReadSQL = `SELECT compose_hash, compose_yaml, state, created_at, updated_at, deleted_at IS NOT NULL AS gone
 	FROM stacks WHERE name = ?`
 
+// stackRowInterleaveHook is a TEST-ONLY seam between a stack row write's read
+// and its guarded write. Production leaves it nil.
+var stackRowInterleaveHook func()
+
 func readStackRowForWrite(ctx context.Context, c *Client, name string) (stackRowRead, error) {
+	if stackRowInterleaveHook != nil {
+		defer stackRowInterleaveHook()
+	}
 	rows, err := c.Query(ctx, stackRowReadSQL, name)
 	if err != nil || len(rows) == 0 {
 		return stackRowRead{}, err
@@ -158,9 +165,15 @@ func retryStackRowWrite(name string, write func() (bool, error)) error {
 	return fmt.Errorf("stack %q: its row kept changing while it was written", name)
 }
 
-// SetStackState sets a live stack's state (e.g. "active" → "deleting"),
-// with its whole row (stackRowRead).
+// SetStackState marks a live stack "deleting" with its whole row
+// (stackRowRead), as MarkStackDeleting does without the teardown's disk
+// choice. It refuses any other state: a whole-row write of a lagging node
+// brings back a row whose tombstone it has not seen, which is harmless only
+// for "deleting" (a reconciler finishes it and tombstones it again).
 func SetStackState(ctx context.Context, c *Client, name, state string) error {
+	if state != "deleting" {
+		return fmt.Errorf("stack %q: SetStackState writes only \"deleting\", not %q", name, state)
+	}
 	return retryStackRowWrite(name, func() (bool, error) {
 		rd, err := readStackRowForWrite(ctx, c, name)
 		if err != nil {

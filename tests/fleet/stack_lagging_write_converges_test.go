@@ -8,6 +8,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 const (
@@ -115,5 +116,49 @@ func TestFleet_StackLaggingWriteConverges(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestFleet_ALaggingStackDeletingWriteEndsDeleted: node-0 finishes the
+// stack's teardown (its tombstone) while node-2 lags, and node-2 then marks
+// it "deleting", stamped after the tombstone it has not seen. That whole-row
+// write brings the row back, as "deleting" only (SetStackState and
+// MarkStackDeleting write nothing else whole), on every replica; a stack
+// reconciler finishes it and the stack ends deleted everywhere.
+func TestFleet_ALaggingStackDeletingWriteEndsDeleted(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 4418})
+	deleter, lagging := c.Nodes[0], c.Nodes[2]
+	if err := corrosion.UpsertStack(ctx, deleter.DB, corrosion.StackRecord{
+		Name: "edge", ComposeHash: "hash-v1", ComposeYAML: laggingStackV1, State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+
+	c.Isolate(lagging)
+	if err := corrosion.DeleteStackRecord(ctx, deleter.DB, "edge"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := corrosion.MarkStackDeleting(ctx, lagging.DB, "edge", false, lagging.Name); err != nil {
+		t.Fatal(err)
+	}
+	c.ClearLinkFaults()
+	c.WaitConverged(t, convergeTimeout)
+	for _, n := range c.Nodes {
+		if st, _ := corrosion.GetStack(ctx, n.DB, "edge"); st != nil && st.State != "deleting" {
+			t.Fatalf("%s: stack came back as %q, want at most \"deleting\"", n.Name, st.State)
+		}
+	}
+
+	r := health.NewStackReconciler(deleter.Name, deleter.DB)
+	r.SetCleaner(deleter.Server)
+	r.SetClock(func() time.Time { return time.Now().Add(2 * time.Minute) }) // past the in-flight grace
+	r.ReconcileOnce(ctx)
+	c.WaitConverged(t, convergeTimeout)
+	for _, n := range c.Nodes {
+		if st, _ := corrosion.GetStack(ctx, n.DB, "edge"); st != nil {
+			t.Errorf("%s: stack %+v, want it deleted", n.Name, st)
+		}
 	}
 }

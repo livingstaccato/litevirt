@@ -14,3 +14,5 @@ func runPinned(fn func() error) error { return fn() }
 func stopWorkersIn(string) {}
 
 func flockTry(*os.File) (bool, error) { return true, nil }
+
+func openedFilePath(f *os.File) string { return f.Name() }

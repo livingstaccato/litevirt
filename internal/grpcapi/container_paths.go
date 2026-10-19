@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -68,6 +69,39 @@ func (s *Server) checkContainerTemplate(template, name string) error {
 	return nil
 }
 
+// checkPullSource judges a local pull source at path, one rule per kind
+// wherever the path is: a directory for oci: and dir: (CheckReadDir), a
+// regular file for the archives, and never a protected place or a link
+// into a dot-directory (CheckRefusedReadPath). The runtime runs it again on
+// the object it opened (lxc.PullOCIOptions.CheckSource).
+func (s *Server) checkPullSource(transport, path string) error {
+	var err error
+	switch transport {
+	case "oci", "dir":
+		err = storage.CheckReadDir(path, s.dataDir, s.pkiDir)
+	default:
+		err = storage.CheckReadPathLexical(path, s.dataDir, s.pkiDir)
+		if err == nil {
+			err = storage.CheckRefusedReadPath(path, s.dataDir, s.pkiDir)
+		}
+		if err == nil {
+			fi, serr := os.Stat(path)
+			switch {
+			case errors.Is(serr, fs.ErrNotExist):
+				err = fmt.Errorf("%q does not exist on this host", path)
+			case serr != nil:
+				err = fmt.Errorf("%q: %w", path, serr)
+			case !fi.Mode().IsRegular():
+				err = fmt.Errorf("%q is not a regular file", path)
+			}
+		}
+	}
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "%s source: %v", transport, err)
+	}
+	return nil
+}
+
 // checkOCIPullPaths is the backstop for a pull's host paths, run on the host
 // that unpacks: an absolute dest is a directory root writes an untrusted
 // image into (the OCI library itself is the daemon's own), and a local source
@@ -79,12 +113,8 @@ func (s *Server) checkOCIPullPaths(image, dest string) error {
 		return status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	if src.Local {
-		check := storage.CheckReadDir
-		if src.Transport == "oci-archive" || src.Transport == "docker-archive" {
-			check = storage.CheckReadFile
-		}
-		if err := check(src.Path, s.dataDir, s.pkiDir); err != nil {
-			return status.Errorf(codes.InvalidArgument, "%s source: %v", src.Transport, err)
+		if err := s.checkPullSource(src.Transport, src.Path); err != nil {
+			return err
 		}
 	}
 	if filepath.IsAbs(dest) {

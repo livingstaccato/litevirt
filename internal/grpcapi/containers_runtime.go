@@ -133,9 +133,10 @@ func (a *LXCRuntimeAdapter) ListContainers(ctx context.Context) ([]string, error
 	return a.Inner.List(ctx)
 }
 
-func (a *LXCRuntimeAdapter) PullOCIImage(ctx context.Context, image, dest, tag, username, password string, replace bool) error {
+func (a *LXCRuntimeAdapter) PullOCIImage(ctx context.Context, image, dest, tag, username, password string, replace bool, check func(transport, path string) error) error {
 	return lxc.PullOCI(ctx, lxc.PullOCIOptions{
 		Image: image, Dest: dest, Tag: tag, Username: username, Password: password, Replace: replace,
+		CheckSource: check,
 	})
 }
 

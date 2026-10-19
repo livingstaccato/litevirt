@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // PullOCIOptions controls an OCI → LXC rootfs conversion.
@@ -29,6 +30,10 @@ type PullOCIOptions struct {
 	// Replace lets the pull replace a bundle already at Dest; without it
 	// such a pull fails with ErrOCIItemExists.
 	Replace bool
+	// CheckSource judges a local source: called with its transport and the
+	// path of the object PullOCI opened (symlinks resolved), before
+	// anything reads it. nil judges nothing (lv ct pull --local, as root).
+	CheckSource func(transport, path string) error
 }
 
 // PullOCI extracts an OCI image's flattened rootfs to disk via umoci.
@@ -72,6 +77,16 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	src, err := ParseOCISource(opts.Image)
 	if err != nil {
 		return err
+	}
+	// A local source is opened here, once, and skopeo reads it through that
+	// descriptor (/proc/self/fd/3): what it reads is the object judged now,
+	// whatever happens to the path afterwards.
+	var srcFile *os.File
+	if src.Local {
+		if srcFile, err = openLocalSource(src, opts.CheckSource); err != nil {
+			return err
+		}
+		defer srcFile.Close()
 	}
 	if err := requireBinary("skopeo"); err != nil {
 		return err
@@ -127,9 +142,11 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	defer func() { _ = os.RemoveAll(tmpLayout) }()
 	tag := opts.Tag
 	if tag == "" {
+		// An oci: source's reference is a tag; an archive's selects an image
+		// in it (an index, a repo:tag), which is no tag of the layout.
 		tag = "latest"
 		switch {
-		case src.Local && src.Reference != "":
+		case src.Transport == "oci" && src.Reference != "":
 			tag = src.Reference
 		case !src.Local:
 			tag = parseOCITag(opts.Image)
@@ -140,6 +157,12 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	// prefix tells skopeo to fetch from a registry; "oci:" works for
 	// local OCI dirs.
 	srcRef, remote := src.Ref, !src.Local
+	if src.Local {
+		srcRef = src.Transport + ":/proc/self/fd/3"
+		if src.Reference != "" {
+			srcRef += ":" + src.Reference
+		}
+	}
 	dstRef := fmt.Sprintf("oci:%s:%s", tmpLayout, tag)
 	args := []string{"copy"}
 	// Credentials only make sense for a remote registry source; a local
@@ -150,7 +173,11 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	}
 	// "--" ends the options: no reference is ever read as a flag.
 	args = append(args, "--", srcRef, dstRef)
-	if out, err := combinedOutputPinned(dieWithDaemon(exec.CommandContext(ctx, "skopeo", args...))); err != nil {
+	copyCmd := dieWithDaemon(exec.CommandContext(ctx, "skopeo", args...))
+	if srcFile != nil {
+		copyCmd.ExtraFiles = []*os.File{srcFile} // fd 3 in skopeo
+	}
+	if out, err := combinedOutputPinned(copyCmd); err != nil {
 		return fmt.Errorf("skopeo copy: %w: %s", err, out)
 	}
 
@@ -348,8 +375,8 @@ func ParseOCISource(ref string) (OCISource, error) {
 	switch {
 	case !ok:
 		return OCISource{Transport: "docker", Ref: "docker://" + ref}, nil
-	case name == "docker":
-		if !strings.HasPrefix(rest, "//") || len(rest) == 2 {
+	case name == "docker" && strings.HasPrefix(rest, "//"):
+		if len(rest) == 2 {
 			return OCISource{}, fmt.Errorf("oci: image %q: want %s", ref, errOCISourceForms)
 		}
 		return OCISource{Transport: "docker", Ref: ref}, nil
@@ -373,4 +400,46 @@ func ParseOCISource(ref string) (OCISource, error) {
 		// "name:tag", "registry:5000/name": a registry image.
 		return OCISource{Transport: "docker", Ref: "docker://" + ref}, nil
 	}
+}
+
+// openLocalSource opens a local source's path without following a link at
+// its own name (a FIFO does not block the open), and refuses anything but a
+// directory (oci:, dir:) or a regular file (the archives). check, when set,
+// judges the object opened, at the path it really is.
+func openLocalSource(src OCISource, check func(transport, path string) error) (*os.File, error) {
+	wantDir := src.Transport == "oci" || src.Transport == "dir"
+	flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC | syscall.O_NONBLOCK
+	if wantDir {
+		flags |= syscall.O_DIRECTORY
+	}
+	f, err := os.OpenFile(src.Path, flags, 0)
+	if err != nil {
+		switch {
+		case errors.Is(err, syscall.ELOOP):
+			return nil, fmt.Errorf("oci: %s source %q is a symbolic link; name what it points to", src.Transport, src.Path)
+		case errors.Is(err, syscall.ENOTDIR):
+			return nil, fmt.Errorf("oci: %s source %q is not a directory", src.Transport, src.Path)
+		}
+		return nil, fmt.Errorf("oci: %s source: %w", src.Transport, err)
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("oci: %s source: %w", src.Transport, err)
+	}
+	switch {
+	case wantDir && !fi.IsDir():
+		_ = f.Close()
+		return nil, fmt.Errorf("oci: %s source %q is not a directory", src.Transport, src.Path)
+	case !wantDir && !fi.Mode().IsRegular():
+		_ = f.Close()
+		return nil, fmt.Errorf("oci: %s source %q is not a regular file", src.Transport, src.Path)
+	}
+	if check != nil {
+		if err := check(src.Transport, openedFilePath(f)); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+	}
+	return f, nil
 }

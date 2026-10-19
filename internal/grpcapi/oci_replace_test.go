@@ -313,3 +313,43 @@ func TestPullOCI_LocalTransportsAreTheAdminsAndJudged(t *testing.T) {
 		t.Fatalf("runtime pulls %d, want %d (each Admin local source and the registry pull)", n, len(local)+1)
 	}
 }
+
+// The rules for a local pull source are one rule per kind, the same wherever
+// the path is: a directory for oci: and dir:, a regular file for the
+// archives, and never a protected place. An archive under a home directory
+// is accepted as a directory there is (it is no ISO image rule). The host
+// that reads the source judges the object it opens: the runtime is handed
+// the same check.
+func TestPullOCI_TheSourceRulesAreOnePerKind(t *testing.T) {
+	s, rt := ctPathServer(t)
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" || home == "/" {
+		t.Skip("no home directory")
+	}
+	under, err := os.MkdirTemp(home, "lv-pull-test-")
+	if err != nil {
+		t.Skipf("home not writable: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(under) })
+	archive := filepath.Join(under, "img.tar")
+	if err := os.WriteFile(archive, []byte("tar"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, src := range []string{"oci-archive:" + archive, "docker-archive:" + archive, "dir:" + under} {
+		if _, err := s.PullOCIImage(adminCtx(), &pb.PullOCIImageRequest{Image: src, Dest: "h" + strconv.Itoa(len(rt.pullCalls))}); err != nil {
+			t.Errorf("an Admin's %s under a home directory: %v", src, err)
+		}
+	}
+	if rt.pullCheck == nil {
+		t.Fatal("the runtime was not handed the source check")
+	}
+	if err := rt.pullCheck("docker-archive", "/etc/shadow"); err == nil {
+		t.Error("the check handed to the runtime accepts /etc/shadow")
+	}
+	if err := rt.pullCheck("docker-archive", archive); err != nil {
+		t.Errorf("the check handed to the runtime refuses the archive it accepted: %v", err)
+	}
+	if err := rt.pullCheck("dir", archive); err == nil {
+		t.Error("the check accepts a file as a dir: source")
+	}
+}

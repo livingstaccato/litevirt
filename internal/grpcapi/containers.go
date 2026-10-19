@@ -1011,7 +1011,7 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 	if err != nil {
 		return nil, err
 	}
-	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password, replace); err != nil {
+	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password, replace, s.checkPullSource); err != nil {
 		if errors.Is(err, lxc.ErrOCIItemExists) {
 			return nil, ociItemExistsErr(req.Dest, s.hostName)
 		}

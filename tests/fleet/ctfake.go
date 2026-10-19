@@ -712,7 +712,7 @@ func (f *CTFake) CloneContainer(_ context.Context, src, dst string) error {
 // PullOCIImage unpacks a bundle at dest as umoci does — config.json, a
 // rootfs whose etc/image names image, and a fresh generation — refusing a
 // dest that already holds one unless replace, as lxc.PullOCI does.
-func (f *CTFake) PullOCIImage(_ context.Context, image, dest, _, _, _ string, replace bool) error {
+func (f *CTFake) PullOCIImage(_ context.Context, image, dest, _, _, _ string, replace bool, _ func(transport, path string) error) error {
 	if dest == "" {
 		return fmt.Errorf("ctfake: empty OCI destination")
 	}

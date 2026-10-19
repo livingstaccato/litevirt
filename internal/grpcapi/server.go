@@ -2521,7 +2521,9 @@ type ContainerRuntime interface {
 	// PullOCIImage pulls image into dest. With replace it may replace a
 	// bundle already there (lxc.PullOCIOptions.Replace); without, such a pull
 	// fails with lxc.ErrOCIItemExists.
-	PullOCIImage(ctx context.Context, image, dest, tag, username, password string, replace bool) error
+	// check judges a local source as the object the runtime opened
+	// (lxc.PullOCIOptions.CheckSource).
+	PullOCIImage(ctx context.Context, image, dest, tag, username, password string, replace bool, check func(transport, path string) error) error
 	// RootfsReferences names the containers on this host whose config uses
 	// dir, or anything under it, as their rootfs in place.
 	RootfsReferences(ctx context.Context, dir string) ([]string, error)

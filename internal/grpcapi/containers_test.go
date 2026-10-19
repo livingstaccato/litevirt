@@ -127,6 +127,7 @@ type fakeCTRuntime struct {
 	// what RootfsReferences reports, by directory.
 	pullReplace []bool
 	rootfsRefs  map[string][]string
+	pullCheck   func(transport, path string) error
 }
 
 func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerOpts) (*ContainerInfo, error) {
@@ -420,9 +421,10 @@ func (f *fakeCTRuntime) ReadOwner(name string) (*lxc.ContainerOwner, error) {
 	}
 	return nil, nil
 }
-func (f *fakeCTRuntime) PullOCIImage(_ context.Context, image, dest, tag, username, password string, replace bool) error {
+func (f *fakeCTRuntime) PullOCIImage(_ context.Context, image, dest, tag, username, password string, replace bool, check func(transport, path string) error) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.pullCheck = check
 	f.pullCalls = append(f.pullCalls, struct{ Image, Dest, Tag, Username, Password string }{image, dest, tag, username, password})
 	f.pullReplace = append(f.pullReplace, replace)
 	return nil

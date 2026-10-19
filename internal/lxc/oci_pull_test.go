@@ -570,13 +570,16 @@ mkdir -p "$layout" && echo "$tag" > "$layout/tag-$tag"
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	src := filepath.Join(t.TempDir(), "layout")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := PullOCI(context.Background(), PullOCIOptions{Image: "oci:" + src + ":v3", Dest: filepath.Join(t.TempDir(), "web"),
 		Username: "u", Password: "p"}); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(log)
 	args := string(b)
-	if !strings.Contains(args, " oci:"+src+":v3 ") || strings.Contains(args, "docker://") || strings.Contains(args, "--src-creds") {
+	if !strings.Contains(args, " oci:/proc/self/fd/3:v3 ") || strings.Contains(args, "docker://") || strings.Contains(args, "--src-creds") {
 		t.Fatalf("skopeo args %q: want the local layout as the source, no registry, no credentials", args)
 	}
 }

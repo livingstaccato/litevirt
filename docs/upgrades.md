@@ -2122,6 +2122,10 @@ Until every host runs this release:
   member before its new image is fetched, and does not hold a privileged
   member to the image it was built from. Run `lv compose up` through an
   upgraded host, and only once the member's own host is upgraded.
+- An `lv ct pull` entered on a previous-release host may still let an
+  Operator pull from a local source (`dir:`, `oci-archive:`,
+  `docker-archive:`). Do not rely on local sources being the Admin's until
+  every host is upgraded.
 - A pull over an existing OCI library item is refused on a previous-release
   host. An Admin's claim (`lv ct pull --project`) replaces an item only on an
   upgraded host, entered through an upgraded host.

@@ -165,3 +165,12 @@ func flockTry(f *os.File) (bool, error) {
 		}
 	}
 }
+
+// openedFilePath is the path the open file f really is, symlinks resolved
+// (/proc/self/fd), or its name when that cannot be read.
+func openedFilePath(f *os.File) string {
+	if p, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(int(f.Fd()))); err == nil {
+		return p
+	}
+	return f.Name()
+}

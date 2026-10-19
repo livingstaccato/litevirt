@@ -48,7 +48,9 @@ func (c *Client) MayRepointNetBoxLease() bool {
 // object fromID to toID, and reports whether this call moved it.
 //
 // false with no error means the lease no longer names fromID — it was
-// released or moved by someone else — and nothing was changed. It refuses with
+// released or moved by someone else — and nothing was changed. An error may
+// follow a committed update (ErrNetBoxRepointUnconfirmed, or a failed write
+// whose outcome is unknown): it never means nothing was changed. It refuses with
 // ErrNetBoxRepointGateClosed, writing nothing, until the gate is open.
 func RepointNetBoxLease(ctx context.Context, c *Client, network, ip string, fromID, toID int) (bool, error) {
 	if !c.MayRepointNetBoxLease() {
@@ -68,13 +70,34 @@ func RepointNetBoxLease(ctx context.Context, c *Client, network, ip string, from
 	if n == 0 {
 		return false, nil
 	}
-	// The read-back is what says the lease now names the new object.
+	// The read-back is what says the lease now names the new object. The
+	// update has committed by now: a failed or negative read-back is not a
+	// guard miss, and is reported as unconfirmed rather than as false.
+	ok, err := confirmNetBoxRepoint(ctx, c, network, ip, toID)
+	if err != nil {
+		return false, fmt.Errorf("confirm re-point of lease %s on %s: %w: %w", ip, network, ErrNetBoxRepointUnconfirmed, err)
+	}
+	if !ok {
+		return false, fmt.Errorf("re-point of lease %s on %s to %d: %w: the lease no longer names it",
+			ip, network, toID, ErrNetBoxRepointUnconfirmed)
+	}
+	return true, nil
+}
+
+// ErrNetBoxRepointUnconfirmed is RepointNetBoxLease's answer when its update
+// committed but could not be confirmed. The lease may name the new object, so
+// nothing may treat that object as unreferenced.
+var ErrNetBoxRepointUnconfirmed = errors.New("lease re-point committed but not confirmed")
+
+// confirmNetBoxRepoint reads back whether the live lease names toID. A var so
+// a test can fail it.
+var confirmNetBoxRepoint = func(ctx context.Context, c *Client, network, ip string, toID int) (bool, error) {
 	rows, err := c.Query(ctx,
 		`SELECT 1 AS ok FROM ip_allocations
 		 WHERE network = ? AND ip = ? AND netbox_ip_id = ? AND deleted_at IS NULL`,
 		network, ip, toID)
 	if err != nil {
-		return false, fmt.Errorf("confirm re-point of lease %s on %s: %w", ip, network, err)
+		return false, err
 	}
 	return len(rows) > 0, nil
 }

@@ -49,6 +49,8 @@ type slowPeer struct {
 	failNext atomic.Bool
 	// failCode is the code failNext fails with; zero is Internal.
 	failCode atomic.Int32
+	// gate, when set, holds every digest until it is closed, instead of delay.
+	gate chan struct{}
 }
 
 func (p *slowPeer) GetStateDigest(ctx context.Context, _ *emptypb.Empty) (*pb.StateDigestResponse, error) {
@@ -64,8 +66,13 @@ func (p *slowPeer) GetStateDigest(ctx context.Context, _ *emptypb.Empty) (*pb.St
 		p.f.enter()
 		defer p.f.leave()
 	}
+	wait := time.After(p.delay)
+	if p.gate != nil {
+		wait = nil
+	}
 	select {
-	case <-time.After(p.delay):
+	case <-wait:
+	case <-p.gate:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -643,11 +650,20 @@ func TestFinishExchange_RefusesAfterTheLocalCRLChangedSinceTheDigest(t *testing.
 
 // A peer's pull and merge start as soon as its own digest is in, not after
 // the slowest peer's: one slow digest held every merge in the pass back.
+//
+// The slow digest is held until the fast peer's merge half has finished, or
+// for slowDigestHold at most, so the ordering is asserted without a wall-clock
+// race: a pass that waits for every digest finishes the fast peer only once
+// the hold has run out.
 func TestCheckPeers_AMergeDoesNotWaitForASlowerDigest(t *testing.T) {
+	const slowDigestHold = 20 * time.Second // under antiEntropyDigestTimeout
 	pkiDir := testPKI(t, "self")
 	c := newPruneTestClient(t)
-	f := &inflight{}
-	slow := &slowPeer{delay: 2 * time.Second, f: f}
+	gate := make(chan struct{})
+	var release sync.Once
+	open := func() { release.Do(func() { close(gate) }) }
+	t.Cleanup(open)
+	slow := &slowPeer{gate: gate}
 	fast := &slowPeer{}
 	ps, _ := servePeer(t, pkiDir, slow)
 	pf, _ := servePeer(t, pkiDir, fast)
@@ -655,17 +671,25 @@ func TestCheckPeers_AMergeDoesNotWaitForASlowerDigest(t *testing.T) {
 	addPeerHost(t, c, "peer-fast", pf, "")
 	c.SetMembersForTests(aeMembers("peer-slow", "peer-fast"))
 	ae := newTestAE(t, c, pkiDir)
-	var fastWhileSlowInFlight atomic.Bool
+	var fastBeforeSlowDigest atomic.Bool
 	ae.onFinish = func(peer string) {
-		if peer == "peer-fast" && f.now.Load() > 0 {
-			fastWhileSlowInFlight.Store(true)
+		if peer != "peer-fast" {
+			return
 		}
+		select {
+		case <-gate:
+		default:
+			fastBeforeSlowDigest.Store(true)
+		}
+		open()
 	}
+	hold := time.AfterFunc(slowDigestHold, open)
+	defer hold.Stop()
 	ae.checkPeers(context.Background())
 	if slow.calls.Load() != 1 {
 		t.Fatalf("precondition: slow peer asked %d times", slow.calls.Load())
 	}
-	if !fastWhileSlowInFlight.Load() {
+	if !fastBeforeSlowDigest.Load() {
 		t.Error("the fast peer's exchange finished only after the slow peer's digest: merges wait for the slowest digest")
 	}
 }

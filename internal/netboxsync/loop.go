@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -870,6 +871,8 @@ func (r *Reconciler) withoutUnprovenRemovals(ctx context.Context, actions []Acti
 		switch {
 		case a.Op == "clear":
 			unprovenAddrs = append(unprovenAddrs, a.IPID)
+		case nullsOwnedPrimary(a):
+			unprovenAddrs = append(unprovenAddrs, a.UnsetsIPID)
 		case a.Kind == "vm":
 			unprovenVMs = append(unprovenVMs, actual.VMs[a.Key].Name)
 		default:
@@ -894,6 +897,8 @@ func (r *Reconciler) withoutUnprovenRemovals(ctx context.Context, actions []Acti
 	}
 	if len(unprovenAddrs) > 0 {
 		sort.Ints(unprovenAddrs)
+		// A clear and the primary null over one address name it twice.
+		unprovenAddrs = slices.Compact(unprovenAddrs)
 		slog.Warn("netbox mirror: withholding address detachments this node holds no lease "+
 			"record of, tombstone included — `ip_allocations` has not replicated them, or the "+
 			"address belongs to something this cluster has never leased; the next sweep "+
@@ -906,7 +911,8 @@ func (r *Reconciler) withoutUnprovenRemovals(ctx context.Context, actions []Acti
 }
 
 // destructive reports whether an action TAKES something away. Three ops do: the
-// delete, the clear, and the replace.
+// delete, the clear, and the replace — and a primary action that nulls a field
+// naming an owned address, which removes that address as a clear does.
 //
 // This is the ONLY spelling of that set: hasRemovals, withoutUnprovenRemovals
 // and withoutDestructive all call it rather than re-testing the ops, so the
@@ -925,7 +931,14 @@ func (r *Reconciler) withoutUnprovenRemovals(ctx context.Context, actions []Acti
 // for that one VM rather than removing an object on evidence just admitted to be
 // partial.
 func destructive(a Action) bool {
-	return a.Op == "delete" || a.Op == "clear" || a.Op == opReplace
+	return a.Op == "delete" || a.Op == "clear" || a.Op == opReplace || nullsOwnedPrimary(a)
+}
+
+// nullsOwnedPrimary reports whether a is a primary action that nulls a field
+// naming an owned address (Action.UnsetsIPID). It is the clear's removal by
+// another route, and proven the same way.
+func nullsOwnedPrimary(a Action) bool {
+	return a.Kind == "vm" && (a.Op == opPrimaryIP || a.Op == opPrimaryIP6) && a.IPID == 0 && a.UnsetsIPID != 0
 }
 
 // provenRemovable reports whether this node can CONCLUDE, from records it holds
@@ -960,6 +973,9 @@ func provenRemovable(a Action, actual Actual, nameByID map[int]string,
 	known corrosion.MirrorEvidence, corr *removalCorroboration) bool {
 	if a.Op == "clear" {
 		return known.KnowsAddress(a.IPID)
+	}
+	if nullsOwnedPrimary(a) {
+		return known.KnowsAddress(a.UnsetsIPID)
 	}
 	if a.Op == opReplace {
 		// Kind is checked, not assumed: Diff only ever builds a vm/replace, and

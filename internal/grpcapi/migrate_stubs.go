@@ -2,7 +2,7 @@ package grpcapi
 
 import (
 	"context"
-	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -27,15 +27,22 @@ import (
 // is safe: a stub made before the restart is then treated as a file this host
 // did not create — a retry is refused naming it, and a cleanup leaves it.
 //
-// An entry belongs to the move that made it, and ends with it: it is bound to
-// the VM's owner and owner epoch when it was made (Server.stubMark), and once
-// either has changed (the move committed, here or anywhere, or the row was
-// re-pointed) the entry no longer names a stub, and is dropped. A path that
-// later holds the VM's live disk, or a file at it after the VM moved away
-// again, must not read as a stub: a copy would replace it (lab2-drain
-// anomaly 6). It also expires after stubLedgerTTL, past which no attempt
-// that made it can still be running or cleaning up (an adopted migration is
-// aborted at adoptedMigrationCeiling).
+// An entry belongs to the move that made it, and ends with it. It is bound
+// to the VM's placement mark when it was made (Server.stubMark: the owner,
+// the owner epoch and the placement generation), and once that has changed
+// the entry no longer names a stub, and is dropped. Every writer that changes
+// a VM's host advances the placement generation in the same batch, so the
+// mark changes on every move — live, cold, drain or failover — a move back to
+// an earlier host included (a live move commits without bumping the epoch,
+// and A→B→A would otherwise make the first move's mark current again). The
+// generation is kept only while the cluster-policy gate is open; for the
+// moves this host drives, its entries for the VM also end when it starts
+// sending the VM elsewhere (endMoveRecords), since a host that owns the VM is
+// no move's target. A path that later holds the VM's live disk, or a file at
+// it after the VM moved away again, must not read as a stub: a copy would
+// replace it (lab2-drain anomaly 6). It also expires after stubLedgerTTL,
+// past which no attempt that made it can still be running or cleaning up (an
+// adopted migration is aborted at adoptedMigrationCeiling).
 type migrationStubLedger struct {
 	mu sync.Mutex
 	m  map[string]migrationStub
@@ -43,7 +50,7 @@ type migrationStubLedger struct {
 
 type migrationStub struct {
 	vm   string
-	mark string // the VM's owner and owner epoch when the stub was made
+	mark string // the VM's placement mark when the stub was made (Server.stubMark)
 	at   time.Time
 }
 
@@ -102,21 +109,84 @@ func (l *migrationStubLedger) forget(path string) {
 	delete(l.m, path)
 }
 
+// forgetVM drops every entry recorded for vm.
+func (l *migrationStubLedger) forgetVM(vm string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for p, e := range l.m {
+		if e.vm == vm {
+			delete(l.m, p)
+		}
+	}
+}
+
+// endMoveRecords ends every record this host made as a target of a move of
+// vm. It runs when this host starts sending vm to another host: it owns vm
+// then, so each move that made one of those records has ended.
+func (s *Server) endMoveRecords(vm string) {
+	s.migrationStubs.forgetVM(vm)
+	s.migrationISOs.forgetVM(vm)
+}
+
 // stubMark is what binds a ledger entry for vm to the move that made it: the
-// VM's owner and owner epoch now. ok=false when the row cannot be read; then
-// nothing is recorded, and nothing reads as this host's stub (a stub then is
-// a file this host did not create: a retry is refused naming it, a cleanup
-// leaves it).
+// VM's placement mark now (corrosion.VMPlacementMark). ok=false when the row
+// cannot be read; then nothing is recorded, and nothing reads as this host's
+// stub (a stub then is a file this host did not create: a retry is refused
+// naming it, a cleanup leaves it).
 func (s *Server) stubMark(ctx context.Context, vm string) (string, bool) {
-	rec, err := corrosion.GetVM(ctx, s.db, vm)
-	if err != nil || rec == nil {
+	mark, ok, err := corrosion.VMPlacementMark(ctx, s.db, vm)
+	if err != nil || !ok {
 		return "", false
 	}
-	return fmt.Sprintf("%s#%d", rec.HostName, rec.OwnerEpoch), true
+	return mark, true
+}
+
+// moveCatchUp bounds how long recording a stub waits for this host's replica
+// to name the calling host as the VM's owner.
+var moveCatchUp = 10 * time.Second
+
+// awaitCallerOwns waits, bounded by moveCatchUp, until this host's replica
+// names the calling host as vm's owner. It runs before a record is bound to
+// the move's mark. The caller is the move's source, which owns vm; a replica
+// that does not name it yet lags behind the commit that made it the owner,
+// and a mark read from it would change when that commit arrives, mid-move:
+// the move would then no longer recognise its own stub (refused by a retry,
+// left by its cleanup). A caller that is no cluster host is not waited for.
+// Past the bound the record takes the mark the replica holds then.
+func (s *Server) awaitCallerOwns(ctx context.Context, vm string) {
+	caller := callerMTLSCommonName(ctx)
+	if caller == "" || caller == s.hostName || moveCatchUp <= 0 {
+		return
+	}
+	if h, err := corrosion.GetHost(ctx, s.db, caller); err != nil || h == nil {
+		return
+	}
+	deadline := time.Now().Add(moveCatchUp)
+	for {
+		rec, err := corrosion.GetVM(ctx, s.db, vm)
+		if err == nil && rec != nil && rec.HostName == caller {
+			return
+		}
+		if time.Now().After(deadline) {
+			owner := ""
+			if rec != nil {
+				owner = rec.HostName
+			}
+			slog.Warn("migration stub record: this host's replica does not name the move's source as the VM's owner; recording against the owner it names",
+				"vm", vm, "source", caller, "owner_here", owner, "waited", moveCatchUp)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // recordMade records path in l as made here for vm's current move.
 func (s *Server) recordMade(ctx context.Context, l *migrationStubLedger, vm, path string) {
+	s.awaitCallerOwns(ctx, vm)
 	if mark, ok := s.stubMark(ctx, vm); ok {
 		l.add(vm, path, mark)
 	}

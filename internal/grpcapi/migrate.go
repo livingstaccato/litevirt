@@ -2748,6 +2748,7 @@ type ensureOutcome struct {
 // target's address in migration.network when one is configured, which makes
 // the call even where it would otherwise have nothing to send.
 func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS, runtime bool) (ensureOutcome, error) {
+	s.endMoveRecords(vmName)
 	isoPaths, err := s.domainInstallerISOPaths(vmName, runtime)
 	if err != nil {
 		return ensureOutcome{}, err
@@ -3104,6 +3105,7 @@ func (s *Server) ensureCloudInitRequest(ctx context.Context, vm *corrosion.VMRec
 // ensureCloudInitOnTarget calls the target host to generate the cloud-init ISO
 // before migration starts, so libvirt can find the file when the domain arrives.
 func (s *Server) ensureCloudInitOnTarget(ctx context.Context, targetHost string, vm *corrosion.VMRecord) {
+	s.endMoveRecords(vm.Name)
 	req := s.ensureCloudInitRequest(ctx, vm)
 	if req == nil {
 		return

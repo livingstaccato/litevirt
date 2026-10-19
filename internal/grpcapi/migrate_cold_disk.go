@@ -79,6 +79,7 @@ func coldDiskFrameDigest(h hash.Hash, offset int64, data []byte) {
 // it. The target removes a file only if it recorded writing it for this VM, so
 // naming one it never wrote removes nothing.
 func (s *Server) copyColdDisksToTarget(ctx context.Context, targetHost, vmName string, disks []corrosion.DiskRecord, formats map[string]string, abort *migrationAbort, send func(pb.MigratePhase, float32, float32) error) ([]corrosion.DiskRecord, error) {
+	s.endMoveRecords(vmName)
 	var toCopy []corrosion.DiskRecord
 	for _, d := range disks {
 		if copiedByStorageMigration(d) {

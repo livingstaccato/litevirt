@@ -42,6 +42,8 @@ var vmFieldClass = map[string]string{
 	"StopDelay":       "live-metadata: reconciler reads it fresh",
 	"Replicas":        "ignored: expands to N instances before planning, not a per-VM field",
 	"GuestAgent":      "restart: guest-agent channel is a redefine",
+	"SecureBoot":      "restart: secure-boot bakes into domain XML",
+	"TPM":             "restart: tpm bakes into domain XML",
 	"Graphics":        "restart: graphics devices are a redefine (spice: not reconfigurable in place yet)",
 	"Disks":           "recreate: disk topology alters VM identity",
 	"Network":         "recreate: NIC topology alters VM identity",

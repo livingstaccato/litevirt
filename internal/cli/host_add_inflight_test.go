@@ -110,3 +110,47 @@ func TestLockedCmd_RefusesWithoutFlock(t *testing.T) {
 		t.Error("the body ran without the lock")
 	}
 }
+
+// Codex c8b0dbb0 N1: the install record was renamed into place without a
+// sync of its directory, so a crash after the (synced) identity install
+// could keep the identity and lose the record that keeps a second add off
+// the machine. The record's rename is followed by a sync of its directory in
+// the same locked command, and a failed sync stops the add before it
+// installs anything.
+//
+// Mutation: drop the directory sync — "a failed directory sync" installs.
+func TestHostAdd_TheInstallRecordIsDurableBeforeTheInstall(t *testing.T) {
+	t.Run("order", func(t *testing.T) {
+		root := t.TempDir()
+		r := &LocalAddTarget{Root: root, PKIDir: filepath.Join(root, "etc", "litevirt", "pki")}
+		cmd := setMarkerCmd(r, "node-9 0a 1 aa installing", "aa")
+		dir := "sync -- '" + filepath.Dir(r.Path(addInstalledMarker)) + "'"
+		mv := strings.Index(cmd, "mv -fT")
+		if mv < 0 || strings.Index(cmd, dir) < mv {
+			t.Errorf("the record's rename is not followed by a sync of its directory:\n%s", cmd)
+		}
+	})
+	t.Run("a failed directory sync", func(t *testing.T) {
+		f := newAddFixture(t)
+		etc := filepath.Join(f.target.Root, "etc", "litevirt")
+		bin := t.TempDir()
+		real, err := exec.LookPath("sync")
+		if err != nil {
+			t.Fatal(err)
+		}
+		fake := "#!/bin/sh\nfor a; do [ \"$a\" = '" + etc + "' ] && exit 1; done\nexec " + real + " \"$@\"\n"
+		if err := os.WriteFile(filepath.Join(bin, "sync"), []byte(fake), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+		if err := f.add(t); err == nil || !strings.Contains(err.Error(), "nothing was installed") {
+			t.Fatalf("add with the record's directory sync failing = %v, want it stopped before installing", err)
+		}
+		f.identityUnchanged(t)
+		for _, e := range f.target.Events {
+			if e == "sh install" {
+				t.Errorf("installed after the record's sync failed: %v", f.target.Events)
+			}
+		}
+	})
+}

@@ -1336,14 +1336,21 @@ func markerAbsent(r addRemote) string {
 	return fmt.Sprintf("[ ! -e %s ]", ssh.ShellQuote(r.Path(addInstalledMarker)))
 }
 
-// setMarkerCmd writes line as the install record, by a synced rename.
+// setMarkerCmd writes line as the install record ("" removes it): the new
+// file synced, renamed into place, then its directory synced, so the record
+// is on disk before anything the add installs after it. A failed sync fails
+// the command (and a claim fails the add before it installs anything):
+// `sync DIR` needs coreutils 8.24 or later, as the add's other syncs do, and
+// an older sync refuses the operand rather than skip it.
 func setMarkerCmd(r addRemote, line, nonce string) string {
 	m := ssh.ShellQuote(r.Path(addInstalledMarker))
+	dir := ssh.ShellQuote(filepath.Dir(r.Path(addInstalledMarker)))
 	tmp := ssh.ShellQuote(r.Path(addInstalledMarker) + ".new-" + nonce)
 	if line == "" {
-		return "rm -f -- " + m
+		return fmt.Sprintf("rm -f -- %s && sync -- %s", m, dir)
 	}
-	return fmt.Sprintf("umask 077; printf '%%s\\n' %s > %s && sync -- %s && mv -fT -- %s %s", ssh.ShellQuote(line), tmp, tmp, tmp, m)
+	return fmt.Sprintf("umask 077; printf '%%s\\n' %s > %s && sync -- %s && mv -fT -- %s %s && sync -- %s",
+		ssh.ShellQuote(line), tmp, tmp, tmp, m, dir)
 }
 
 // machineClaim is an add's claim of the machine: mine is its install record.

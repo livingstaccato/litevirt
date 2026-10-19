@@ -742,10 +742,11 @@ func (r *Reconciler) assignAddress(ctx context.Context, ipID, ifaceID int, nicKe
 // repair: NetBox will not hold two, and it is not this mirror's to take.
 //
 // THE RE-POINT IS GUARDED ON THE DEAD ID (corrosion.RepointNetBoxLease). A lease
-// released or re-pointed meanwhile is left alone. An object this call created
-// is then released only once nothing is shown to name it: another leader may
-// have adopted it in the meantime (releaseIfUnreferenced). A re-point that
-// reports an error may have committed, and keeps the object.
+// released or re-pointed meanwhile is left alone, and so is an object this
+// call created for it: another leader may adopt it at any moment, and NetBox
+// cannot make a delete conditional on that not having happened. The orphan
+// sweep reclaims it if nothing names it. A re-point that reports an error may
+// have committed, and keeps the object too.
 func (r *Reconciler) repairDeadAddress(ctx context.Context, deadID int, identity string, dn desiredNIC) (int, error) {
 	n := dn.NIC
 	if n.LeaseNetwork == "" || n.NetBoxIP == "" || n.LeasePrefixID == 0 {
@@ -830,8 +831,16 @@ func (r *Reconciler) repairDeadAddress(ctx context.Context, deadID int, identity
 		return 0, err
 	}
 	if !moved {
+		// NOT released, though nothing here names it. A leader that took
+		// over mid-repair adopts this object by identity, re-points the lease
+		// at it and assigns it, and may do so after any read this node could
+		// make; NetBox has no conditional delete to refuse a DELETE that
+		// lands after it. The orphan sweep reclaims it under its own
+		// cluster-wide proof if nothing comes to name it.
 		if created {
-			r.releaseIfUnreferenced(ctx, ip, identity, b.VRFID, b.ObservedCIDR)
+			slog.Info("netbox mirror: kept a re-created address whose lease moved before the "+
+				"re-point; the orphan sweep reclaims it if nothing names it",
+				"netbox_address_id", ip.ID, "dead_netbox_address_id", deadID, "nic", identity)
 		}
 		return 0, nil
 	}
@@ -852,49 +861,6 @@ func (r *Reconciler) compensate(ctx context.Context, id int) {
 		slog.Warn("netbox mirror: could not release a re-created address no lease names; the "+
 			"orphan sweep reclaims it", "netbox_address_id", id, "error", err)
 	}
-}
-
-// releaseIfUnreferenced releases ip, which this call created and whose lease
-// re-point missed its guard, once it is shown that nothing references it: no
-// live lease in this replica names it, and NetBox has it assigned to nothing.
-// A leader that took over mid-repair adopts the object by identity, re-points
-// the lease at it and assigns it; either half reaching here keeps it. Anything
-// unproven keeps it too, for the orphan sweep, which reclaims an
-// identity-bearing object no lease names.
-func (r *Reconciler) releaseIfUnreferenced(ctx context.Context, ip netbox.IPAddress, identity string, vrfID int, cidr string) {
-	hold := func(why string, err error) {
-		slog.Warn("netbox mirror: kept a re-created address its lease re-point missed; "+why,
-			"netbox_address_id", ip.ID, "nic", identity, "error", err)
-	}
-	leased, err := corrosion.NetBoxAddressLeased(ctx, r.db, ip.ID)
-	if err != nil {
-		hold("could not read whether a lease names it", err)
-		return
-	}
-	if leased {
-		hold("a live lease names it", nil)
-		return
-	}
-	found, err := r.nb.LookupByIdentity(ctx, identity, vrfID, cidr)
-	if err != nil {
-		hold("could not read its NetBox assignment", err)
-		return
-	}
-	var current *netbox.IPAddress
-	for i := range found {
-		if found[i].ID == ip.ID {
-			current = &found[i]
-		}
-	}
-	switch {
-	case current == nil:
-		hold("NetBox did not return it to read its assignment", nil)
-		return
-	case current.AssignedObjectID != 0:
-		hold("NetBox has it assigned", nil)
-		return
-	}
-	r.compensate(ctx, ip.ID)
 }
 
 // sameHost reports whether a NetBox address (CIDR) is the host want.

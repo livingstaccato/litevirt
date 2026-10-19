@@ -2921,9 +2921,8 @@ func (s *Server) stackFirewallRefusal(ctx context.Context, stack string, declare
 func localOnlyNotice(stack, principal string) string {
 	return fmt.Sprintf("this node holds no record of stack %q, so this is a local-only teardown: it removes only the workloads "+
 		"this node lists, and nothing retries one it cannot delete. Left for an Admin: whatever of the stack's record, load balancer, "+
-		"networks, backup-repo registrations and firewall exists anywhere (a first `lv compose up` that failed leaves its networks "+
-		"and backup-repo registrations). An Admin removes them with `lv compose down --name %s` on a node that holds the stack; "+
-		"where no node does, by deploying the same file again (`lv compose up`) and then `lv compose down --name %s`. "+
-		"`lv role grant NetworkAdmin %s --path / --propagate` lets you do it yourself",
-		stack, stack, stack, principal)
+		"networks, backup-repo registrations and firewall exists anywhere (a first deploy that failed leaves its networks "+
+		"and backup-repo registrations). An Admin removes them with `lv compose down --name %s`, from any node, whether or not "+
+		"a record exists. `lv role grant NetworkAdmin %s --path / --propagate` lets you do it yourself",
+		stack, stack, principal)
 }

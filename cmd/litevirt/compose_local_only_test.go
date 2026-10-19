@@ -47,9 +47,25 @@ func TestComposeDown_ALocalOnlyFailurePromisesNoRetry(t *testing.T) {
 	if strings.Contains(err.Error(), "retries") || strings.Contains(err.Error(), `"deleting"`) {
 		t.Errorf("the error promises a retry: %v", err)
 	}
-	for _, want := range []string{"local-only", "1 of 1", "nothing will retry"} {
+	for _, want := range []string{"local-only", "1 of 1", "nothing will retry", "`lv rm`", "`lv ct rm`"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the error %q does not say %q", err, want)
 		}
+	}
+}
+
+// Before the daemon answers, the CLI does not know whether the stack record
+// exists here (a local-only down touches none), so it does not say it cleans
+// one up.
+func TestComposeDown_DoesNotPromiseARecordCleanupBeforeTheDaemonAnswers(t *testing.T) {
+	spy := &deployClient{noVMs: true, teardown: []*pb.DeleteProgress{
+		{VmName: "stack", Status: "local-only", Error: localOnlyNotice},
+	}}
+	out, err := runComposeCLI(t, spy, false, "", "down", "-y")
+	if err != nil {
+		t.Fatalf("lv compose down: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "cleaning up stack record") {
+		t.Errorf("the CLI promised a record cleanup before the daemon answered:\n%s", out)
 	}
 }

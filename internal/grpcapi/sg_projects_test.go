@@ -633,6 +633,16 @@ func TestDeleteStack_AnOperatorCanTakeDownAFailedFirstDeploy(t *testing.T) {
 	if !said {
 		t.Errorf("the down did not say it acted on this node's workloads only: %+v", st.sent)
 	}
+	for _, p := range st.sent {
+		if p.GetStatus() != "local-only" {
+			continue
+		}
+		// An Admin's plain down removes what is left from any node, record
+		// or not: no redeploy is needed, so none is advised.
+		if !strings.Contains(p.GetError(), "`lv compose down --name ghost`") || strings.Contains(p.GetError(), "lv compose up") {
+			t.Errorf("the notice does not give an Admin's plain down as the exit: %s", p.GetError())
+		}
+	}
 	if after := stackStatements(t, s); after != before {
 		t.Fatalf("a record-less down wrote %d stack-wide statement(s) every peer applies", after-before)
 	}

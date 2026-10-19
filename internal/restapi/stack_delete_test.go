@@ -161,8 +161,8 @@ func TestStackDelete_ALocalOnlyFailurePromisesNoRetry(t *testing.T) {
 		{VmName: "hb-1", Status: "deleting"},
 		{VmName: "hb-1", Status: "error", Error: "undefine refused"},
 	}, nil)
-	if code == http.StatusOK {
-		t.Fatalf("a failed local-only teardown → 200: %s", raw)
+	if code != http.StatusInternalServerError {
+		t.Fatalf("a failed local-only teardown → %d, want 500 (nothing marked it deleting): %s", code, raw)
 	}
 	if strings.Contains(body.Error, "retries") || strings.Contains(body.Error, `"deleting"`) {
 		t.Errorf("the error promises a retry: %s", raw)

@@ -1212,9 +1212,8 @@ of the stack's record, load balancer, networks, backup-repo registrations and
 firewall exists anywhere: a first `lv compose up` that failed leaves its
 workloads, its networks and its backup-repo registrations, and no record. The
 CLI, the UI and the REST API (`local_only`, `notice`) all say so. An Admin
-removes the rest with `lv compose down --name <stack>` on a node that holds the
-stack, or, where no node does, by deploying the same file again with
-`lv compose up` and then running `lv compose down --name <stack>`. Against a daemon
+removes the rest with `lv compose down --name <stack>`, from any node, whether
+or not a stack record exists. Against a daemon
 older than these RPCs the four commands fail with an error saying to upgrade
 litevirtd; they do not fall back to writing the database.
 

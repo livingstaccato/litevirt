@@ -272,7 +272,7 @@ func newDownCmd() *cobra.Command {
 				}
 
 				if len(resp.Vms) == 0 {
-					fmt.Printf("Stack %q has no running VMs — cleaning up stack record.\n", name)
+					fmt.Printf("Stack %q has no VMs listed here.\n", name)
 				} else {
 					fmt.Printf("Will delete %d VM(s) in stack %q:\n", len(resp.Vms), name)
 				}
@@ -368,7 +368,7 @@ func newDownCmd() *cobra.Command {
 				}
 				if len(failed) > 0 && localOnly {
 					return fmt.Errorf("stack %q: local-only teardown: %d of %d deletions failed (%s); nothing will retry them: "+
-						"run `lv compose down --name %s` again, or `lv rm` each one", name, len(failed), len(seen), strings.Join(failed, ", "), name)
+						"run `lv compose down --name %s` again, or `lv rm` / `lv ct rm` each one", name, len(failed), len(seen), strings.Join(failed, ", "), name)
 				}
 				if len(failed) > 0 {
 					return fmt.Errorf("stack %q: %d of %d deletions failed (%s); the stack is left in state \"deleting\" and the daemon retries the teardown",

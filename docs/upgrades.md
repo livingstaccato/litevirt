@@ -1501,7 +1501,12 @@ of any stack being torn down, whoever began the teardown. A stack whose last
 deploy with `sg.write` ran on the previous release has no recorded intent,
 and its file alone says what it asks for. Finish the roll before relying on
 the check; an Admin's `lv compose up` from an upgraded host records the
-intent of a stack deployed before it.
+intent of a stack deployed before it. During the roll, a stack torn down on a
+host still on the previous release leaves the intent its last deploy with
+`sg.write` recorded in force for the stack's name: a later deploy of that
+name without `sg.write` is refused once it has a record, and raises
+`stack.firewall_teardown_held`. An Admin's `lv compose down --name <stack>`
+from an upgraded host clears it.
 
 ### A hand-deleted NetBox address is re-created after the roll
 

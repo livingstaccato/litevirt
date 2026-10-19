@@ -86,12 +86,15 @@ the file: a deploy by a caller with `sg.write` at `/` writes
 firewall, and whether it asks for the default-deny) before any row changes
 and again once the stack's record is written. A deploy without `sg.write`
 never writes it, and no teardown writes it. It speaks for one deployment of
-the stack: the record's `created_at` it was written under, and the stamp of
-the stack's last teardown (`stack_teardown/<name>`) when it was written. A
-record left by another deployment (a first deploy that failed before it
-recorded the stack, or a deployment since torn down, on any release) does
-not apply; while a teardown is under way, the record of what it tears down
-still does. A stack asks for the default-deny when its file or this record does (the
+the stack: the one since the stack's last teardown began, by the stamp of
+that teardown (`stack_teardown/<name>`) when it was written, a row every
+replica holds alike (the stack record's `created_at` is not: replicas that
+each inserted the name keep their own). A first deploy writes it only once
+it has recorded the stack, so one that failed leaves none, and a record left
+by a deployment this release tore down does not apply; while a teardown is
+under way, the record of what it tears down still does. A previous release's
+teardown writes no stamp, so the record still applies to the name
+(docs/upgrades.md). A stack asks for the default-deny when its file or this record does (the
 hand-off on teardown and the re-assert both read it), a deploy or teardown
 without `sg.write` counts a firewall the record declares, and a live stack
 whose file no longer declares what the record does raises

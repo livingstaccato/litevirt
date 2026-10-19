@@ -125,18 +125,20 @@ func TestStackFirewallIntent_KeepsADefaultDenyAsk(t *testing.T) {
 	}
 }
 
-// A firewall intent speaks for the deployment it was written under: the
-// stack's record (created_at) since its last teardown began. It applies to
-// that deployment, including while it is being torn down, and not to one
-// recorded later, or after a teardown the stack was deployed again from.
-// One this build cannot read applies to every deployment.
+// A firewall intent speaks for the deployment since the stack's last
+// teardown began, by that teardown's stamp: it applies to that deployment,
+// whatever created_at a replica keeps for the stack (replicas that each
+// inserted the name keep their own), including while it is being torn down,
+// and not after a teardown the stack was deployed again from. One with no
+// stamp applies until a teardown writes one. One this build cannot read
+// applies to every deployment.
 //
-// Mutations: ignore created_at — "another record", red. Ignore the teardown
-// stamp — "deployed again after a teardown", red. Drop the "deleting"
-// exception — "being torn down", red.
+// Mutations: bind to created_at — "another replica's created_at", red.
+// Ignore the teardown stamp — "deployed again after a teardown", red. Drop
+// the "deleting" exception — "being torn down", red.
 func TestStackFirewallIntent_SpeaksForOneDeployment(t *testing.T) {
 	st := StackRecord{Name: "s", CreatedAt: "2026-10-19T10:00:00Z", State: "active"}
-	bound := StackFirewallIntent{Firewall: true, Created: st.CreatedAt, Teardown: "t1"}
+	bound := StackFirewallIntent{Firewall: true, Teardown: "t1"}
 	for _, tc := range []struct {
 		name     string
 		in       StackFirewallIntent
@@ -145,9 +147,10 @@ func TestStackFirewallIntent_SpeaksForOneDeployment(t *testing.T) {
 		applies  bool
 	}{
 		{"its deployment", bound, st, "t1", true},
-		{"another record", bound, StackRecord{Name: "s", CreatedAt: "2026-10-19T11:00:00Z", State: "active"}, "t1", false},
-		{"written before a record existed", StackFirewallIntent{Firewall: true}, st, "", false},
+		{"another replica's created_at", bound, StackRecord{Name: "s", CreatedAt: "2026-10-19T10:00:02Z", State: "active"}, "t1", true},
+		{"never torn down", StackFirewallIntent{Firewall: true}, st, "", true},
 		{"deployed again after a teardown", bound, st, "t2", false},
+		{"deployed again after a first teardown", StackFirewallIntent{Firewall: true}, st, "t1", false},
 		{"being torn down", bound, StackRecord{Name: "s", CreatedAt: st.CreatedAt, State: "deleting"}, "t2", true},
 		{"unreadable", decodeStackFirewallIntent("not json"), st, "t9", true},
 	} {

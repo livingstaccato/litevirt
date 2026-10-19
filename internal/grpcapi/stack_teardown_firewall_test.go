@@ -174,13 +174,14 @@ func TestDeployStack_TheFirewallIntentIsTheAdminsToChange(t *testing.T) {
 
 // A recorded intent speaks for one deployment of the stack. One left by
 // another — a first Admin deploy that failed before it recorded the stack,
-// or a deployment torn down on a host that does not clear or bind it —
-// does not block a later Operator stack of the same name; the deployment
-// it was written for still holds it.
+// or a deployment this release tore down on another host — does not block a
+// later Operator stack of the same name. One a previous-release teardown
+// left (no teardown record) stays in force until an Admin's down.
 //
 // Mutations: write the intent before a first deploy's record exists — the
-// failed deploy leaves one, red. Drop the deployment binding — the Operator's
-// redeploy is refused, red.
+// failed deploy leaves one, red. Ignore the teardown stamp — the Operator's
+// redeploy after this release's teardown is refused, red. Let the Admin's
+// down not re-stamp (no teardown record) — the previous-release case, red.
 func TestDeployStack_AnIntentLeftByAnotherDeploymentDoesNotApply(t *testing.T) {
 	ctx := context.Background()
 	s, opal, ada := stackFirewallFixture(t)
@@ -206,27 +207,60 @@ func TestDeployStack_AnIntentLeftByAnotherDeploymentDoesNotApply(t *testing.T) {
 			}
 		}
 	})
-	t.Run("a deployment torn down elsewhere", func(t *testing.T) {
-		if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: "name: gone\nfirewall:\n  default-deny: true\n"}, &mockDeployStreamR2{ctx: ada}); err != nil {
+	// tearDownGone deploys gone with a default-deny as an Admin and tears it
+	// down on another host, leaving the intent: with this release's
+	// teardown record (stamped), or as the released previous version does,
+	// which writes no teardown record at all.
+	tearDownGone := func(t *testing.T, name string, stamped bool) {
+		t.Helper()
+		if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: "name: " + name + "\nfirewall:\n  default-deny: true\n"}, &mockDeployStreamR2{ctx: ada}); err != nil {
 			t.Fatal(err)
 		}
-		// Torn down as a previous release does it: the teardown record and
-		// the tombstone, and the firewall rows removed; the intent is left.
-		if err := corrosion.MarkStackDeleting(ctx, s.db, "gone", false, true, "old-host"); err != nil {
+		if stamped {
+			if err := corrosion.MarkStackDeleting(ctx, s.db, name, false, true, "other-host"); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := corrosion.SetStackState(ctx, s.db, name, stackStateDeleting); err != nil {
 			t.Fatal(err)
 		}
-		if err := corrosion.DeleteStackFirewall(ctx, s.db, "gone", nil); err != nil {
+		if err := corrosion.DeleteStackFirewall(ctx, s.db, name, nil); err != nil {
 			t.Fatal(err)
 		}
-		if err := corrosion.DeleteStackRecord(ctx, s.db, "gone"); err != nil {
+		if err := corrosion.DeleteStackRecord(ctx, s.db, name); err != nil {
 			t.Fatal(err)
 		}
-		if _, found, _ := corrosion.GetStackFirewallIntent(ctx, s.db, "gone"); !found {
+		if _, found, _ := corrosion.GetStackFirewallIntent(ctx, s.db, name); !found {
 			t.Fatal("setup: no intent left behind")
 		}
+	}
+	operatorDeploys := func(name string) error {
+		return s.DeployStack(&pb.DeployStackRequest{ComposeYaml: "name: " + name + "\n"}, &mockDeployStreamR2{ctx: opal})
+	}
+	t.Run("a deployment this release tore down elsewhere", func(t *testing.T) {
+		tearDownGone(t, "gone", true)
 		for i := 0; i < 2; i++ {
-			if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: "name: gone\n"}, &mockDeployStreamR2{ctx: opal}); err != nil {
+			if err := operatorDeploys("gone"); err != nil {
 				t.Fatalf("the Operator's deploy %d of gone after its teardown: %v", i+1, err)
+			}
+		}
+	})
+	// The released previous version writes no teardown record, so nothing
+	// says its teardown began another deployment: the intent stays in force
+	// for the name (fail closed, docs/upgrades.md), and an Admin's down from
+	// this release clears it.
+	t.Run("a deployment the previous release tore down", func(t *testing.T) {
+		tearDownGone(t, "old", false)
+		if err := operatorDeploys("old"); err != nil {
+			t.Fatalf("the Operator's first deploy of old (no record here yet): %v", err)
+		}
+		err := operatorDeploys("old")
+		wantGrantHint(t, "an Operator redeploys a name a previous-release teardown left the intent of", err)
+		if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "old"}, &mockDeleteStream{ctx: ada}); err != nil {
+			t.Fatalf("the Admin's compose down of old: %v", err)
+		}
+		for i := 0; i < 2; i++ {
+			if err := operatorDeploys("old"); err != nil {
+				t.Fatalf("the Operator's deploy %d of old after the Admin's down: %v", i+1, err)
 			}
 		}
 	})

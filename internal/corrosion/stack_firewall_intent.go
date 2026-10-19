@@ -38,12 +38,16 @@ const stackFirewallKeyPrefix = "stack_firewall/"
 // cannot withdraw what a newer one declared: the stack's file is replaced on
 // every peer, and this record still says what the stack asks for.
 //
-// It speaks for one deployment of the stack: the record it was written
-// under (Created, the record's created_at) since its last teardown began
-// (Teardown, that teardown's stamp in stack_teardown/<name>, "" for none).
-// A deploy that fails before it records the stack, a teardown that removes
-// the stack, and a later deploy of the name are each another deployment, so
-// a record left by an earlier one does not apply (stackFirewallIntentApplies).
+// It speaks for one deployment of the stack: the one since the stack's last
+// teardown began (Teardown, that teardown's stamp in stack_teardown/<name>,
+// "" for none), a cluster_policies row every replica holds alike. It is not
+// bound to the stack record's created_at: that differs between replicas
+// that each inserted the name (UpsertStack keeps it on conflict). A first
+// deploy writes it only once it has recorded the stack, so one that fails
+// leaves none; a teardown by this build re-stamps the stack, so a later
+// deploy of the name does not inherit it (stackFirewallIntentApplies). A
+// teardown on a previous release writes no stamp, and the intent then still
+// applies to the name until an Admin's down or deploy (docs/upgrades.md).
 //
 // It is written only where cluster_policies may be written
 // (failover_scope_v1), and a previous release neither writes nor reads it:
@@ -51,7 +55,6 @@ const stackFirewallKeyPrefix = "stack_firewall/"
 type StackFirewallIntent struct {
 	Firewall    bool   `json:"firewall"`
 	DefaultDeny bool   `json:"default_deny"`
-	Created     string `json:"created,omitempty"`
 	Teardown    string `json:"teardown,omitempty"`
 
 	// unreadable: a value this build cannot decode, which applies to every
@@ -66,14 +69,14 @@ type StackFirewallIntent struct {
 // yet, or for a stack with no record (a first deploy records it once its
 // record is written).
 func SetStackFirewallIntent(ctx context.Context, c *Client, st *StackRecord, firewall, defaultDeny bool, setBy string) error {
-	if st == nil || st.Name == "" || st.CreatedAt == "" || !c.MayWriteClusterPolicy() {
+	if st == nil || st.Name == "" || !c.MayWriteClusterPolicy() {
 		return nil
 	}
 	td, err := stackTeardownStamp(ctx, c, st.Name)
 	if err != nil {
 		return err
 	}
-	v, err := json.Marshal(StackFirewallIntent{Firewall: firewall, DefaultDeny: defaultDeny, Created: st.CreatedAt, Teardown: td})
+	v, err := json.Marshal(StackFirewallIntent{Firewall: firewall, DefaultDeny: defaultDeny, Teardown: td})
 	if err != nil {
 		return err
 	}
@@ -143,17 +146,14 @@ func StackFirewallIntents(ctx context.Context, c *Client) (map[string]StackFirew
 }
 
 // stackFirewallIntentApplies reports whether in speaks for st's deployment,
-// whose last teardown's stamp is teardown: it was written under st's record
-// (created_at) and since that teardown began. While st is "deleting", the
+// whose last teardown's stamp is teardown: it was written since that
+// teardown began. While st is "deleting", the
 // teardown under way began after the intent was written, and the intent
 // still speaks for what is being torn down. One this build cannot read
 // applies to every deployment.
 func stackFirewallIntentApplies(in StackFirewallIntent, st StackRecord, teardown string) bool {
 	if in.unreadable {
 		return true
-	}
-	if in.Created == "" || in.Created != st.CreatedAt {
-		return false
 	}
 	return in.Teardown == teardown || st.State == "deleting"
 }

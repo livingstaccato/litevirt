@@ -361,3 +361,63 @@ func TestFleet_StackFirewall_AStaleRedeployCannotWithdrawADefaultDeny(t *testing
 		t.Errorf("the condition does not name the remedies: %s", cond.Evidence)
 	}
 }
+
+// TestFleet_StackFirewall_AStaleFirstDeployCannotWithdrawADefaultDeny: stack
+// base owns the cluster default-deny. While node-1 is isolated, an Admin
+// first deploys edge asking for it on node-0, and a second later an Operator
+// without sg.write deploys edge on node-1 from a firewall-free file: node-1
+// holds no record of edge, so it is allowed, and the two replicas keep
+// different created_at for edge. An Admin then tears base down, from either
+// node: the deny passes to edge on both, whose last deploy with sg.write
+// asked for it.
+//
+// Mutation: bind the firewall intent to the record's created_at — the
+// teardown from the lagging node removes the deny, red.
+func TestFleet_StackFirewall_AStaleFirstDeployCannotWithdrawADefaultDeny(t *testing.T) {
+	for _, from := range []int{0, 1} {
+		t.Run([]string{"teardown-from-fresh", "teardown-from-lagging"}[from], func(t *testing.T) {
+			ctx := context.Background()
+			c := New(t, Options{Nodes: 2, IndependentReplicas: true, FaultSeed: 7301})
+			a, b := c.Nodes[0], c.Nodes[1]
+			for _, n := range c.Nodes {
+				openNICGuards(t, n)
+			}
+			tok := scopedOperatorToken(t, c, a, "opal", "acme")
+			admin := c.SelfClient(a)
+			deployAndDrain(t, ctx, admin, &pb.DeployStackRequest{ComposeYaml: "name: base\nfirewall:\n  default-deny: true\n"})
+			c.WaitConverged(t, convergeTimeout)
+			for _, n := range c.Nodes {
+				e := auth.NewEngine(n.DB)
+				if err := e.Reload(ctx); err != nil {
+					t.Fatal(err)
+				}
+				n.Server.SetAuthEngine(e)
+			}
+			c.Isolate(b)
+			deployAndDrain(t, ctx, admin, &pb.DeployStackRequest{ComposeYaml: "name: edge\nfirewall:\n  default-deny: true\n"})
+			time.Sleep(1100 * time.Millisecond) // created_at has whole-second precision
+			deployAndDrain(t, ctx, c.bearerClient(b, tok), &pb.DeployStackRequest{ComposeYaml: "name: edge\n# operator\n"})
+			c.ClearLinkFaults()
+			c.WaitConvergedExcept(t, convergeTimeout, []string{"stacks"})
+			sa, _ := corrosion.GetStack(ctx, a.DB, "edge")
+			sb, _ := corrosion.GetStack(ctx, b.DB, "edge")
+			if sa == nil || sb == nil || sa.CreatedAt == sb.CreatedAt {
+				t.Fatalf("fixture: edge's created_at does not differ between the replicas: %+v / %+v", sa, sb)
+			}
+
+			stream, err := c.SelfClient(c.Nodes[from]).DeleteStack(ctx, &pb.DeleteStackRequest{Name: "base"})
+			for err == nil {
+				_, err = stream.Recv()
+			}
+			if err != io.EOF {
+				t.Fatalf("an Admin's compose down of base: %v", err)
+			}
+			c.WaitConvergedExcept(t, convergeTimeout, []string{"stacks"})
+			for _, n := range c.Nodes {
+				if d, _ := corrosion.GetFirewallDefault(ctx, n.DB, "cluster"); d == nil || !d.DefaultDeny {
+					t.Errorf("%s: the cluster default is %+v: a stale Operator first deploy withdrew edge's default-deny", n.Name, d)
+				}
+			}
+		})
+	}
+}

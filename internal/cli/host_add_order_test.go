@@ -605,14 +605,20 @@ func TestHostAdd_KeepsTheMachinesConfig(t *testing.T) {
 		{"gossip port", "host_name: a\ngossip_port: 7950\n", "gossip_port is 7950: peers and later adds seed the host at 7946"},
 		{"grpc port", "host_name: a\ngrpc_port: 7500\n", "grpc_port is 7500: peers dial the host at 7443, so it would be unreachable"},
 		// The refusal says why another key would change.
-		{"alias into a replaced key", "enforcement: &e\n  audit_signature: true\nother: *e\n", "alias"},
+		{"alias into a replaced key", "enforcement: &e\n  audit_signature: true\nother: *e\n", "an alias to an anchor in a key it replaced"},
+		// N3-n1: a refusal with another cause does not blame an alias.
+		{"quoted key", "\"host_name\": a\n", "a layout it cannot edit line by line"},
 		{"too large", "host_name: a\n# " + strings.Repeat("x", 1<<20) + "\n", "1 MiB"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newAddFixture(t)
 			writeTargetConfig(t, f, tc.body, 0o644)
-			if err := f.add(t); err == nil || !strings.Contains(err.Error(), tc.want) {
+			err := f.add(t)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("add = %v, want a refusal naming %q", err, tc.want)
+			}
+			if tc.name == "quoted key" && strings.Contains(err.Error(), "alias") {
+				t.Errorf("a refusal not caused by an alias blames one: %v", err)
 			}
 			// Only the read of the config reached the host.
 			if len(f.client.admitted) != 0 || len(f.target.Events) != 1 || f.target.Events[0] != "sh config" {

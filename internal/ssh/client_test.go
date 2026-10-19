@@ -133,7 +133,7 @@ func TestDialTimeout_BoundsASilentHandshake(t *testing.T) {
 	cfg := &gossh.ClientConfig{User: "root", HostKeyCallback: gossh.InsecureIgnoreHostKey()}
 	done := make(chan error, 1)
 	go func() {
-		_, err := dialTimeout(ln.Addr().String(), cfg, 300*time.Millisecond)
+		_, err := dialTimeout(ln.Addr().String(), cfg, 300*time.Millisecond, false)
 		done <- err
 	}()
 	select {

@@ -27,16 +27,23 @@ type Client struct {
 
 // NewClient connects to a remote host via SSH.
 // target format: "user@host" or "user@host:port"
-func NewClient(target string) (*Client, error) { return newClient(target, 0) }
+func NewClient(target string) (*Client, error) { return newClient(target, 0, false) }
 
 // NewClientTimeout is NewClient with the connect and the handshake bounded
 // by timeout together, for a best-effort connection to a host that may be
 // dead or silent.
 func NewClientTimeout(target string, timeout time.Duration) (*Client, error) {
-	return newClient(target, timeout)
+	return newClient(target, timeout, false)
 }
 
-func newClient(target string, timeout time.Duration) (*Client, error) {
+// NewClientDeadline is NewClientTimeout with the bound left on the whole
+// session: the commands run over it fail once timeout has passed since the
+// dial, for a short best-effort job on a host that may stall.
+func NewClientDeadline(target string, timeout time.Duration) (*Client, error) {
+	return newClient(target, timeout, true)
+}
+
+func newClient(target string, timeout time.Duration, keepDeadline bool) (*Client, error) {
 	sshUser, host, port := parseTarget(target)
 
 	auth, err := authMethods()
@@ -67,7 +74,7 @@ func newClient(target string, timeout time.Duration) (*Client, error) {
 	addr := net.JoinHostPort(host, port)
 	var conn *ssh.Client
 	if timeout > 0 {
-		conn, err = dialTimeout(addr, config, timeout)
+		conn, err = dialTimeout(addr, config, timeout, keepDeadline)
 	} else {
 		conn, err = ssh.Dial("tcp", addr, config)
 	}
@@ -442,7 +449,10 @@ func (r *bytesReaderWrapper) Read(p []byte) (n int, err error) {
 // dialTimeout is ssh.Dial with one bound on the TCP connect and the SSH
 // handshake together: ssh.Dial bounds neither the handshake nor, without
 // ClientConfig.Timeout, the connect.
-var dialTimeout = func(addr string, config *ssh.ClientConfig, timeout time.Duration) (*ssh.Client, error) {
+//
+// With keepDeadline the deadline stays on the connection, bounding the whole
+// session.
+var dialTimeout = func(addr string, config *ssh.ClientConfig, timeout time.Duration, keepDeadline bool) (*ssh.Client, error) {
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return nil, err
@@ -456,9 +466,11 @@ var dialTimeout = func(addr string, config *ssh.ClientConfig, timeout time.Durat
 		conn.Close()
 		return nil, err
 	}
-	if err := conn.SetDeadline(time.Time{}); err != nil {
-		c.Close()
-		return nil, err
+	if !keepDeadline {
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			c.Close()
+			return nil, err
+		}
 	}
 	return ssh.NewClient(c, chans, reqs), nil
 }

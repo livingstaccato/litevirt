@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -423,15 +424,20 @@ func printRemoved(hostName string, removed *pb.RemoveHostResponse, plain string)
 // connection is bounded (stagedCleanupTimeout). A seam so the removal can be
 // tested without a host.
 var removeStagedAdmission = func(addr, serial string) error {
-	sc, err := ssh.NewClientTimeout("root@"+addr, stagedCleanupTimeout)
+	sc, err := ssh.NewClientDeadline("root@"+addr, stagedCleanupTimeout)
 	if err != nil {
-		return fmt.Errorf("SSH connect (skipped after %s): %w", stagedCleanupTimeout, err)
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return fmt.Errorf("SSH connect: gave up after %s: %w", stagedCleanupTimeout, err)
+		}
+		return fmt.Errorf("SSH connect: %w", err)
 	}
 	defer sc.Close()
 	return removeStagedPair(&sshAddRemote{sshRemotePKI{sc: sc}}, serial)
 }
 
-// stagedCleanupTimeout bounds removeStagedAdmission's connect and handshake.
+// stagedCleanupTimeout bounds removeStagedAdmission's whole SSH session:
+// connect, handshake and the commands it runs.
 const stagedCleanupTimeout = 10 * time.Second
 
 // stagedPairHost is what removeStagedPair needs of the host.

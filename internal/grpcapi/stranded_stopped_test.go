@@ -87,6 +87,9 @@ func TestStrandedOn_AFirmwareVMIsNotPromisedARecovery(t *testing.T) {
 			// fd re-review 2 N2-m4: without --blockpull the guest's disk is
 			// served by the foreground command, which a Ctrl+C stops.
 			!strings.Contains(d, "--blockpull") ||
+			// N3-m1: until the pull finishes the guest's disk is still served
+			// by the command's stream.
+			!strings.Contains(d, "keep the command running until it prints [LOCALIZED]") ||
 			strings.Contains(d, "restore-from") {
 			t.Errorf("%s plan line = %q; want no promised recovery and the restore command", n, d)
 		}

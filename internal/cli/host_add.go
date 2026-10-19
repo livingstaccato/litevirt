@@ -328,8 +328,9 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 	suffix := ".pre-add-" + time.Now().UTC().Format("20060102T150405Z")
 	restore := func(err error) error {
 		if _, rerr := r.Shell("restore", restoreCmd(r, paths, existed, suffix)); rerr != nil {
-			return failed(fmt.Errorf("%w\nputting back the files it replaced failed too (%v): each one it "+
-				"replaced is kept beside it as <file>%s", err, rerr, suffix))
+			return failed(fmt.Errorf("%w\nputting back the files it replaced failed too (%v): a file whose copy "+
+				"was not moved back is kept beside it as <file>%s, and one that was may be at 0600 rather than "+
+				"its own mode", err, rerr, suffix))
 		}
 		return failed(fmt.Errorf("%w\nthe host's previous identity files were put back; the admitted ones are "+
 			"staged beside them for the rerun", err))
@@ -858,8 +859,12 @@ func mergeAddConfig(existing []byte, p hostAddPlan) ([]byte, error) {
 	// keys it sets as it set them.
 	after, err := configMapping(merged)
 	if err != nil {
-		return nil, fmt.Errorf("the edited file does not parse (%v): the add replaces the lines of the keys it "+
-			"sets, and a line it kept depends on one it replaced, such as an alias to an anchor there", err)
+		if strings.Contains(err.Error(), "anchor") {
+			return nil, fmt.Errorf("the edited file does not parse (%v): a line the add kept is an alias to an "+
+				"anchor in a key it replaced", err)
+		}
+		return nil, fmt.Errorf("the edited file does not parse (%v): the file has a layout it cannot edit line "+
+			"by line (a quoted or explicit key, a second document, or a value it could not delimit)", err)
 	}
 	want, err := configMapping([]byte(strings.Join([]string{edits[0].text, edits[1].text, edits[2].text,
 		edits[3].text, edits[4].text}, "")))
@@ -872,8 +877,8 @@ func mergeAddConfig(existing []byte, p hostAddPlan) ([]byte, error) {
 	}
 	for k, v := range before {
 		if !set[k] && !reflect.DeepEqual(after[k], v) {
-			return nil, fmt.Errorf("editing it would change %s: its value depends on a key the add replaces, such "+
-				"as an alias to an anchor there, or the add could not tell where a replaced key's lines end", k)
+			return nil, fmt.Errorf("editing it would change %s: the file has a layout it cannot edit line by line "+
+				"(its value depends on a key the add replaces, or the add could not tell where that key's lines end)", k)
 		}
 	}
 	for k := range set {

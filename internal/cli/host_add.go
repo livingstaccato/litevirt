@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -166,10 +165,6 @@ type addRemote interface {
 	// Shell runs one of the file commands (installCmd, restoreCmd, ...);
 	// kind names it.
 	Shell(kind, cmd string) ([]byte, error)
-	// Hold starts cmd, returns the first line it prints, and leaves it
-	// running with its stdin open until release (or until the connection to
-	// the host drops): how an add holds the machine's lock (lockMachine).
-	Hold(kind, cmd string) (first string, release func(), err error)
 }
 
 const remoteBinary = "/usr/local/bin/litevirt"
@@ -349,16 +344,18 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 	}
 
 	// From here to the end (install, setup, rollback) the machine is this
-	// attempt's alone: no other add installs or rolls back on it meanwhile.
-	release, err := lockMachine(r, "lock", fmt.Sprintf("%s %s %s %d", nonce, p.hostName, serial, time.Now().Unix()))
-	if err != nil {
-		return failed(fmt.Errorf("%w; nothing was installed", err))
-	}
-	defer release()
+	// attempt's: it claims it in the machine's install record
+	// (addInstalledMarker), and every command it then runs there checks,
+	// under the add lock and in the process that holds it, that the record is
+	// still its claim (machineClaim.cmd). A command of this attempt that runs
+	// late (its connection lost) after another add has claimed the machine
+	// does nothing.
+	//
 	// Of two adds of this machine, the second to get here installs nothing,
 	// whatever its admission's stamp: the machine says another add installed
-	// since this one began, or is installed under another name.
-	if err := refuseSecondInstall(r, p, serial, installed); err != nil {
+	// since this one began, holds the machine, or installed another name.
+	prior, err := refuseSecondInstall(r, p, serial, installed, nonce)
+	if err != nil {
 		return failed(err)
 	}
 	// And the cluster is asked again, after a fresh pull, right before the
@@ -368,14 +365,15 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 		return failed(fmt.Errorf("the cluster refused the admission when asked again before installing (nothing was "+
 			"installed): %w", err))
 	}
-	marker := fmt.Sprintf("%s %s %d %s\n", p.hostName, serial, time.Now().Unix(), nonce)
-	if err := r.WriteFile(addInstalledMarker, []byte(marker), 0o600); err != nil {
-		return failed(fmt.Errorf("record this add on the host (nothing was installed): %w", err))
+	claimedAt := time.Now().Unix()
+	m := machineClaim{r: r, mine: fmt.Sprintf("%s %s %d %s installing", p.hostName, serial, claimedAt, nonce)}
+	if err := m.take(prior); err != nil {
+		return failed(fmt.Errorf("%w; nothing was installed", err))
 	}
 
 	// A machine re-added while its old daemon still runs would serve the
 	// admitted identity from that stale process until setup restarts it.
-	if err := r.Run("systemctl stop litevirt 2>/dev/null || true"); err != nil {
+	if err := r.Run(m.cmd("systemctl stop litevirt 2>/dev/null || true")); err != nil {
 		return failed(fmt.Errorf("stop the host's daemon before installing: %w", err))
 	}
 	paths := make([]string, len(files))
@@ -394,32 +392,36 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 	// go back if the add does not finish.
 	suffix := ".pre-add-" + time.Now().UTC().Format("20060102T150405Z") + "-" + nonce
 	restore := func(err error) error {
-		// Only this attempt's install is undone: the machine records it
-		// (addInstalledMarker, under the lock this attempt holds).
-		if b, ok, merr := r.ReadFile(addInstalledMarker); merr != nil || !ok || string(b) != marker {
-			return failed(fmt.Errorf("%w\nnothing was put back: the machine does not record this attempt's install "+
+		// Only this attempt's install is undone, and only while the machine
+		// still records its claim: checked by the rollback command itself.
+		_, rerr := r.Shell("restore", m.cmd(restoreCmd(r, paths, existed, ours, suffix, tag)))
+		switch {
+		case exitStatus(rerr) == notOurMachine:
+			return failed(fmt.Errorf("%w\nnothing was put back: the machine no longer records this attempt's claim "+
 				"(%s), so the files there may be another add's; each replaced file's copy is kept beside it as "+
 				"<file>%s", err, addInstalledMarker, suffix))
-		}
-		if _, rerr := r.Shell("restore", restoreCmd(r, paths, existed, ours, suffix, tag)); rerr != nil {
+		case rerr != nil:
 			return failed(fmt.Errorf("%w\nputting back the files it replaced failed too (%v): a file whose copy "+
 				"was not moved back is kept beside it as <file>%s, and one that was may be at 0600 rather than "+
 				"its own mode", err, rerr, suffix))
 		}
+		if err := m.give(prior); err != nil {
+			slog.Warn("could not put back the machine's install record", "record", addInstalledMarker, "error", err)
+		}
 		return failed(fmt.Errorf("%w\nthe host's previous identity files were put back; the admitted ones are "+
 			"staged beside them for the rerun", err))
 	}
-	if _, err := r.Shell("install", installCmd(r, paths, suffix, tag)); err != nil {
+	if _, err := r.Shell("install", m.cmd(installCmd(r, paths, suffix, tag))); err != nil {
 		return restore(fmt.Errorf("install the host identity: %w", err))
 	}
-	if _, err := r.Shell("binary", installCmd(r, []string{remoteBinary}, "", tag)); err != nil {
+	if _, err := r.Shell("binary", m.cmd(installCmd(r, []string{remoteBinary}, "", tag))); err != nil {
 		return restore(fmt.Errorf("install the litevirt binary: %w", err))
 	}
 	// `lv` stays available as a convenience symlink to the combined binary.
-	if err := r.Run("ln -sf /usr/local/bin/litevirt /usr/local/bin/lv"); err != nil {
+	if err := r.Run(m.cmd("ln -sf /usr/local/bin/litevirt /usr/local/bin/lv")); err != nil {
 		return restore(fmt.Errorf("symlink lv: %w", err))
 	}
-	if err := finishAdd(r, p, serial, admitted); err != nil {
+	if err := finishAdd(r, p, serial, tag, admitted, m.cmd); err != nil {
 		return restore(err)
 	}
 	// The copies of replaced keys go; the operator's config is kept as it was.
@@ -431,8 +433,11 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 		}
 		discard = append(discard, path)
 	}
-	if _, err := r.Shell("discard", removeCmd(r, suffixed(discard, suffix))); err != nil {
+	if _, err := r.Shell("discard", m.cmd(removeCmd(r, suffixed(discard, suffix)))); err != nil {
 		slog.Warn("could not remove the copies of the replaced identity files", "suffix", suffix, "error", err)
+	}
+	if err := m.give(fmt.Sprintf("%s %s %d %s installed", p.hostName, serial, claimedAt, nonce)); err != nil {
+		slog.Warn("could not record the finished install on the host", "record", addInstalledMarker, "error", err)
 	}
 	if legacyPair {
 		if err := removeLegacyStagedPair(r, serial); err != nil {
@@ -582,7 +587,10 @@ func keepLocal(minted, pkiDir, hostName string) {
 
 // finishAdd writes the audit admission record and runs setup, which starts
 // the daemon.
-func finishAdd(r addRemote, p hostAddPlan, serial string, admitted *pb.AdmitHostResponse) error {
+//
+// Each of its writes on the host is run through guard (machineClaim.cmd);
+// the rejoin record is staged at tag's path first.
+func finishAdd(r addRemote, p hostAddPlan, serial, tag string, admitted *pb.AdmitHostResponse, guard func(string) string) error {
 	// The name's audit chain position, signed with the CA, so the new machine's
 	// daemon holds its own audit rows until that history has reached it instead
 	// of starting a second chain under an old name. Before setup, which starts
@@ -594,11 +602,14 @@ func finishAdd(r addRemote, p hostAddPlan, serial string, admitted *pb.AdmitHost
 	}
 	rejoinPath := filepath.Join(remotePKIDir, corrosion.AuditRejoinFileName)
 	if rejoin != nil {
-		if err := r.WriteFile(rejoinPath, rejoin, 0644); err != nil {
+		if err := r.WriteFile(addStagedPath(rejoinPath, tag), rejoin, 0644); err != nil {
 			return fmt.Errorf("push %s: %w", corrosion.AuditRejoinFileName, err)
 		}
+		if _, err := r.Shell("rejoin", guard(installCmd(r, []string{rejoinPath}, "", tag))); err != nil {
+			return fmt.Errorf("put %s in place: %w", corrosion.AuditRejoinFileName, err)
+		}
 	} else if remove {
-		if err := r.Run("rm -f " + ssh.ShellQuote(rejoinPath)); err != nil {
+		if _, err := r.Shell("rejoin", guard(removeCmd(r, []string{rejoinPath}))); err != nil {
 			return fmt.Errorf("remove a stale %s: %w", corrosion.AuditRejoinFileName, err)
 		}
 	}
@@ -612,7 +623,7 @@ func finishAdd(r addRemote, p hostAddPlan, serial string, admitted *pb.AdmitHost
 	// local database still contains its tombstone; starting it first lets its boot
 	// state update put a fresh timestamp on that tombstone and race the admission
 	// back out to the cluster.
-	if err := r.RunWithInput(remoteAddSetupCommand(p.hostName, p.hostAddr, p.peersYAML, p.enforcement, p.configInstalled), []byte(p.setupScript)); err != nil {
+	if err := r.RunWithInput(guard(remoteAddSetupCommand(p.hostName, p.hostAddr, p.peersYAML, p.enforcement, p.configInstalled)), []byte(p.setupScript)); err != nil {
 		return fmt.Errorf("run setup script after admitting the host identity: %w", err)
 	}
 	return nil
@@ -823,8 +834,6 @@ func (r *sshAddRemote) Unpath(path string) string { return path }
 
 func (r *sshAddRemote) Shell(_, cmd string) ([]byte, error) { return r.sc.RunOutput(cmd) }
 
-func (r *sshAddRemote) Hold(_, cmd string) (string, func(), error) { return r.sc.Hold(cmd) }
-
 // LocalAddTarget is addRemote over a directory tree this process can reach (a
 // test's): /etc/litevirt/pki maps to PKIDir and every other absolute path
 // under Root. The file commands run here under sh; the others are recorded,
@@ -878,7 +887,7 @@ func (d *LocalAddTarget) Run(cmd string) error {
 
 func (d *LocalAddTarget) RunWithInput(cmd string, _ []byte) error {
 	d.Events = append(d.Events, "run "+cmd)
-	if strings.HasSuffix(cmd, "bash -s") {
+	if strings.Contains(cmd, "bash -s") {
 		if d.OnSetup != nil {
 			return d.OnSetup()
 		}
@@ -900,32 +909,6 @@ func (d *LocalAddTarget) WriteFile(path string, data []byte, mode os.FileMode) e
 		return err
 	}
 	return secretfile.Write(d.Path(path), data, mode)
-}
-
-func (d *LocalAddTarget) Hold(kind, cmd string) (string, func(), error) {
-	d.Events = append(d.Events, "sh "+kind)
-	c := exec.Command("sh", "-c", cmd)
-	stdin, err := c.StdinPipe()
-	if err != nil {
-		return "", nil, err
-	}
-	stdout, err := c.StdoutPipe()
-	if err != nil {
-		return "", nil, err
-	}
-	if err := c.Start(); err != nil {
-		return "", nil, err
-	}
-	release := func() {
-		stdin.Close()
-		_ = c.Wait()
-	}
-	line, err := bufio.NewReader(stdout).ReadString('\n')
-	if err != nil && line == "" {
-		release()
-		return "", nil, fmt.Errorf("%s: %w", kind, err)
-	}
-	return strings.TrimSuffix(line, "\n"), release, nil
 }
 
 func (d *LocalAddTarget) Shell(kind, cmd string) ([]byte, error) {
@@ -1297,85 +1280,175 @@ func removeLegacyStagedPair(r addRemote, serial string) error {
 	return err
 }
 
-// addLock is the file whose flock(2) gives one `lv host add` the machine,
-// from just before its install to the end of its setup or rollback. A shell
-// on the host holds it (lockMachine) until the add releases it or its
-// connection drops, when the kernel releases it: no lock outlives its add.
+// addLock is the file whose flock(2) every command an add runs on a machine
+// it has claimed takes, in the shell that runs it (machineClaim.cmd), for as
+// long as that command runs: a command delayed past its add's lost
+// connection still runs under it, or not at all.
 const addLock = "/etc/litevirt/.lv-add.lock"
 
-// addLockOwner names the add that holds addLock, for the refusal of another.
-const addLockOwner = "/etc/litevirt/.lv-add.owner"
-
-// addInstalledMarker records the admission the last add installed on the
-// machine: "<name> <serial> <unix time> <nonce>". Written and removed only
-// under addLock.
+// addInstalledMarker records which add holds the machine or installed it
+// last: "<name> <serial> <unix time> <nonce> <installing|installed>" (an
+// earlier form has three or four fields, and is an install). Changed only
+// under addLock, by a compare-and-swap.
 const addInstalledMarker = "/etc/litevirt/.lv-add-installed"
+
+// addLockWait is how long, in seconds, a command waits for addLock while
+// another command holds it (a setup can hold it for minutes). A var so tests
+// can shorten it.
+var addLockWait = 600
+
+// staleClaim is how long a claim of another add with no finished install
+// keeps a second add out: an add's commands after its claim are short, but
+// for setup, which holds addLock while it runs. A claim older than this is
+// an add that died; taking it over is safe, since a late command of that add
+// finds the claim is no longer its own and does nothing.
+const staleClaim = 10 * time.Minute
 
 // freshInstall is how long an install under another name keeps a second add
 // of the machine from installing when that name's certificate is not revoked
 // here: long past the time an admission takes to reach every host.
 const freshInstall = time.Hour
 
-// lockMachine takes addLock for owner, and returns its release. A lock
-// another add holds refuses, naming it.
-func lockMachine(r addRemote, kind, owner string) (func(), error) {
-	q := func(p string) string { return ssh.ShellQuote(r.Path(p)) }
-	cmd := fmt.Sprintf("mkdir -p -- %s && exec 9>>%s && if flock -n 9; then printf '%%s\\n' %s > %s && echo ACQUIRED && "+
-		"exec cat >/dev/null; else printf 'HELD %%s\\n' \"$(head -n 1 -- %s 2>/dev/null)\"; fi",
-		ssh.ShellQuote(filepath.Dir(r.Path(addLock))), q(addLock), ssh.ShellQuote(owner), q(addLockOwner), q(addLockOwner))
-	first, release, err := r.Hold(kind, cmd)
+// notOurMachine is the exit status of a guarded command that found the
+// machine claimed by another (machineClaim.cmd).
+const notOurMachine = 97
+
+// lockedCmd runs body in a shell that holds addLock while it runs, and only
+// when cond holds there. Without flock(1) on the host it refuses: an add does
+// not change a machine unlocked.
+func lockedCmd(r addRemote, cond, body string) string {
+	lock := ssh.ShellQuote(r.Path(addLock))
+	return fmt.Sprintf("command -v flock >/dev/null 2>&1 || { echo 'flock(1) is not installed on the host; "+
+		"lv host add does not change the machine without its lock' >&2; exit 98; }; "+
+		"mkdir -p -- %s || exit 1; exec 9>>%s || exit 1; "+
+		"flock -w %d 9 || { echo 'another command holds the add lock %s' >&2; exit 96; }; "+
+		"if %s; then ( %s ); else echo 'this add no longer holds the machine: %s records another' >&2; exit %d; fi",
+		ssh.ShellQuote(filepath.Dir(r.Path(addLock))), lock, addLockWait, addLock, cond, body, addInstalledMarker, notOurMachine)
+}
+
+// markerIs is the shell test that the install record is line exactly
+// (without its newline); markerAbsent that there is none.
+func markerIs(r addRemote, line string) string {
+	return fmt.Sprintf("[ \"$(cat -- %s 2>/dev/null)\" = %s ]", ssh.ShellQuote(r.Path(addInstalledMarker)), ssh.ShellQuote(line))
+}
+
+func markerAbsent(r addRemote) string {
+	return fmt.Sprintf("[ ! -e %s ]", ssh.ShellQuote(r.Path(addInstalledMarker)))
+}
+
+// setMarkerCmd writes line as the install record, by a synced rename.
+func setMarkerCmd(r addRemote, line, nonce string) string {
+	m := ssh.ShellQuote(r.Path(addInstalledMarker))
+	tmp := ssh.ShellQuote(r.Path(addInstalledMarker) + ".new-" + nonce)
+	if line == "" {
+		return "rm -f -- " + m
+	}
+	return fmt.Sprintf("umask 077; printf '%%s\\n' %s > %s && sync -- %s && mv -fT -- %s %s", ssh.ShellQuote(line), tmp, tmp, tmp, m)
+}
+
+// machineClaim is an add's claim of the machine: mine is its install record.
+type machineClaim struct {
+	r    addRemote
+	mine string
+}
+
+// cmd is body run under addLock, only while the machine records this claim.
+func (m machineClaim) cmd(body string) string {
+	return lockedCmd(m.r, markerIs(m.r, m.mine), body)
+}
+
+func (m machineClaim) nonce() string {
+	if f := strings.Fields(m.mine); len(f) >= 4 {
+		return f[3]
+	}
+	return "x"
+}
+
+// take claims the machine, from the record prior that refuseSecondInstall
+// read ("" when there was none): only if it is still that.
+func (m machineClaim) take(prior string) error {
+	cond := markerAbsent(m.r)
+	if prior != "" {
+		cond = markerIs(m.r, prior)
+	}
+	_, err := m.r.Shell("claim", lockedCmd(m.r, cond, setMarkerCmd(m.r, m.mine, m.nonce())))
+	if exitStatus(err) == notOurMachine {
+		return fmt.Errorf("another add claimed this machine since this one read %s: run this again once it has "+
+			"finished", addInstalledMarker)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("take the add lock %s on the host: %w", addLock, err)
+		return fmt.Errorf("claim the machine in %s: %w", addInstalledMarker, err)
 	}
-	if first == "ACQUIRED" {
-		return release, nil
+	return nil
+}
+
+// give replaces this claim with line ("" removes the record), only while the
+// machine still records the claim.
+func (m machineClaim) give(line string) error {
+	_, err := m.r.Shell("claim", m.cmd(setMarkerCmd(m.r, line, m.nonce())))
+	return err
+}
+
+// exitStatus is the exit status of a remote command's err, -1 when it has
+// none.
+func exitStatus(err error) int {
+	if err == nil {
+		return 0
 	}
-	release()
-	who := strings.TrimSpace(strings.TrimPrefix(first, "HELD"))
-	if f := strings.Fields(who); len(f) == 4 {
-		if since, err := strconv.ParseInt(f[3], 10, 64); err == nil {
-			who = fmt.Sprintf("attempt %s, for %s with certificate %s, since %s", f[0], f[1], f[2],
-				time.Unix(since, 0).UTC().Format(time.RFC3339))
-		}
+	var s interface{ ExitStatus() int }
+	if errors.As(err, &s) {
+		return s.ExitStatus()
 	}
-	return nil, fmt.Errorf("another `lv host add` holds this machine (%s); run this again once it has finished", who)
+	var e interface{ ExitCode() int }
+	if errors.As(err, &e) {
+		return e.ExitCode()
+	}
+	return -1
 }
 
 // refuseSecondInstall refuses to install serial for p when another add has
-// installed on the machine: its certificate is no longer the one this add
-// found (installed) nor serial, or the last install recorded there
-// (addInstalledMarker) is of another name, less than freshInstall ago, with a
-// certificate this machine's CRL does not revoke (`lv host rm` revokes it).
-// Run under lockMachine.
-func refuseSecondInstall(r addRemote, p hostAddPlan, serial, installed string) error {
+// the machine: its certificate is no longer the one this add found
+// (installed) nor serial; or its install record (addInstalledMarker) is
+// another add's claim younger than staleClaim, or an install of another name
+// less than freshInstall ago whose certificate this machine's CRL does not
+// revoke (`lv host rm` revokes it). It returns the record it read, which the
+// claim then replaces only if it is still there (machineClaim.take).
+func refuseSecondInstall(r addRemote, p hostAddPlan, serial, installed, nonce string) (string, error) {
 	now, err := remoteSerial(r, filepath.Join(remotePKIDir, "host.crt"))
 	if err != nil {
-		return err
+		return "", err
 	}
 	if now != installed && now != serial {
-		return fmt.Errorf("the machine's certificate changed since this add began (it serves %s now): another add "+
+		return "", fmt.Errorf("the machine's certificate changed since this add began (it serves %s now): another add "+
 			"installed on it first, and this one installs nothing", now)
 	}
 	b, ok, err := r.ReadFile(addInstalledMarker)
 	if err != nil || !ok {
-		return err
+		return "", err
 	}
-	f := strings.Fields(string(b))
-	if len(f) < 3 || f[0] == p.hostName {
-		return nil
+	prior := strings.TrimRight(string(b), "\n")
+	f := strings.Fields(prior)
+	if len(f) < 3 {
+		return prior, nil
 	}
 	at, _ := strconv.ParseInt(f[2], 10, 64)
-	if time.Since(time.Unix(at, 0)) >= freshInstall {
-		return nil
+	when := time.Unix(at, 0)
+	if len(f) >= 5 && f[4] == "installing" && f[3] != nonce && time.Since(when) < staleClaim {
+		return "", fmt.Errorf("another `lv host add` holds this machine (attempt %s, for %s with certificate %s, since "+
+			"%s), and this one installs nothing. Run this again once it has finished; if it died, after %s",
+			f[3], f[0], f[1], when.UTC().Format(time.RFC3339), when.Add(staleClaim).UTC().Format(time.RFC3339))
+	}
+	if f[0] == p.hostName || time.Since(when) >= freshInstall {
+		return prior, nil
 	}
 	if sn, ok := new(big.Int).SetString(f[1], 16); ok && pki.IsCertRevoked(p.pkiDir, sn) {
-		return nil
+		return prior, nil
 	}
-	return fmt.Errorf("another add installed this machine as %s (certificate %s) at %s, and this one installs "+
+	return "", fmt.Errorf("another add installed this machine as %s (certificate %s) at %s, and this one installs "+
 		"nothing: a machine is admitted under one name. Remove the admission you do not want (`lv host rm %s` or "+
 		"`lv host rm %s`, which revokes its certificate); otherwise a later add of the machine under another name "+
-		"waits until %s, or until %s is removed from the host", f[0], f[1], time.Unix(at, 0).UTC().Format(time.RFC3339), p.hostName, f[0],
-		time.Unix(at, 0).Add(freshInstall).UTC().Format(time.RFC3339), addInstalledMarker)
+		"waits until %s, or until %s is removed from the host", f[0], f[1], when.UTC().Format(time.RFC3339),
+		p.hostName, f[0], when.Add(freshInstall).UTC().Format(time.RFC3339), addInstalledMarker)
 }
 
 // readPair reads the certificate at crt and the key at key on the host, and

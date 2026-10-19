@@ -777,11 +777,10 @@ func TestRemoveInstalledMarker_OnlyTheRecordOfTheRevokedInstall(t *testing.T) {
 			return func() { afterMarkerRead = old }
 		}, "node-9 0b0b 2 bb\n"},
 		{"an add holds the machine", func(t *testing.T, r *LocalAddTarget) func() {
-			release, err := lockMachine(r, "lock", "cc node-9 0b0b 3")
-			if err != nil {
-				t.Fatal(err)
-			}
-			return release
+			old := addLockWait
+			addLockWait = 1
+			release := holdAddLock(t, r)
+			return func() { release(); addLockWait = old }
 		}, "node-9 0a0a 1 aa\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -816,5 +815,32 @@ func writeMarker(t *testing.T, r *LocalAddTarget, body string) {
 	}
 	if err := os.WriteFile(r.Path(addInstalledMarker), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Codex 446f3a39 I1: removal's cleanup checked the install record under the
+// lock and then sent the removal as a command of its own. Delayed past its
+// ten-second connection, that command ran after the lock was gone and after
+// a re-add had installed and written its record, and removed it. The check
+// and the removal are one command now, run by the process that holds the
+// lock: the late command finds the re-add's record and leaves it.
+//
+// Mutation: remove the record by name in the command — the re-add's record
+// is lost.
+func TestRemoveInstalledMarker_ALateRemovalLeavesAReaddsRecord(t *testing.T) {
+	root := t.TempDir()
+	local := &LocalAddTarget{Root: root, PKIDir: filepath.Join(root, "etc", "litevirt", "pki")}
+	r := &deferringTarget{LocalAddTarget: local, kind: "unstage"}
+	writeMarker(t, local, "node-9 0a0a 1 aa\n")
+	_ = removeInstalledMarker(r, "0a0a")
+	if len(r.deferred) == 0 {
+		t.Fatal("the removal issued no command")
+	}
+	// The connection and its lock are gone; a re-add installs and records.
+	writeMarker(t, local, "node-9 0b0b 2 bb installed\n")
+	r.runDeferred(t)
+	got, err := os.ReadFile(local.Path(addInstalledMarker))
+	if err != nil || string(got) != "node-9 0b0b 2 bb installed\n" {
+		t.Errorf("the re-add's record = %q, %v; want it kept", got, err)
 	}
 }

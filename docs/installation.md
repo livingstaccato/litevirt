@@ -173,18 +173,20 @@ activates it once the other is removed), and `lv health` shows
 `host.address_shared`.
 
 From just before it installs to the end of its setup or rollback, an add
-holds the machine: a shell on the machine holds an `flock` on
-`/etc/litevirt/.lv-add.lock` for it, which the kernel releases when that shell
-ends, so the lock goes when the add finishes or its connection drops. Another
-add of the machine is refused meanwhile. The add records what it installed in
-`/etc/litevirt/.lv-add-installed`, under that lock; `lv host rm` removes the
-record of the admission it revoked under the lock too.
-An add that finds the machine's certificate changed since it began, or another
-name installed there in the last hour whose certificate this machine's CRL
-does not revoke, installs nothing: of two adds of one machine, the second to
-install is refused, whatever its admission. A rollback puts nothing back
-unless the machine still records that add's own install, and then moves back
-only files that are what that add installed.
+holds the machine: it claims it in `/etc/litevirt/.lv-add-installed`, and every
+command it then runs there takes an `flock` on `/etc/litevirt/.lv-add.lock` in
+the shell that runs it and acts only while that record is still its claim. A
+command delayed past a lost connection therefore runs under the lock or does
+nothing, and never acts on a machine another add has claimed since. Without
+`flock` (util-linux) on the machine the add refuses. Another add of the machine
+is refused while the claim is younger than 10 minutes (setup holds the lock
+while it runs); an older claim is an add that died, and is taken over. An add
+that finds the machine's certificate changed since it began, or another name
+installed there in the last hour whose certificate this machine's CRL does not
+revoke, installs nothing: of two adds of one machine, the second to install is
+refused, whatever its admission. A rollback moves back only files that are
+what that add installed. `lv host rm` removes the record of the admission it
+revoked only while it is still that record, in one locked command.
 
 A machine that already has `/etc/litevirt/config.yaml` keeps it. The add
 edits in place only `host_name`, `advertise_address`, `join_peers`, `pki_dir`

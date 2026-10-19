@@ -489,57 +489,33 @@ func removeStagedPair(r addRemote, serial string) error {
 }
 
 // afterMarkerRead is a test seam: it runs between removeInstalledMarker's
-// first read of the record and its lock.
+// read of the record and its removal.
 var afterMarkerRead func()
 
 // removeInstalledMarker removes the machine's record of an install of the
 // revoked admission (addInstalledMarker), which no longer holds the machine
-// for it. Only under the add lock, which every add writes the record under,
-// and only the record read there: renamed aside, checked to be those bytes,
-// then removed, so a record a later add wrote is never removed. While an add
-// holds the machine it is left, and the refusal says so.
+// for it. The check and the removal are one command, run under the add lock
+// by the shell that holds it, and remove the record only while it is
+// exactly the one read: a record a later add wrote, even after this command
+// was delayed past its connection, is never removed.
 func removeInstalledMarker(r addRemote, serial string) error {
 	b, ok, err := r.ReadFile(addInstalledMarker)
 	if err != nil || !ok {
 		return err
 	}
-	if f := strings.Fields(string(b)); len(f) < 3 || !strings.EqualFold(f[1], serial) {
+	line := strings.TrimRight(string(b), "\n")
+	if f := strings.Fields(line); len(f) < 3 || !strings.EqualFold(f[1], serial) {
 		return nil
 	}
 	if afterMarkerRead != nil {
 		afterMarkerRead()
 	}
-	nonce, err := attemptNonce()
+	_, err = r.Shell("unstage", lockedCmd(r, markerIs(r, line), removeCmd(r, []string{addInstalledMarker})))
+	if exitStatus(err) == notOurMachine {
+		return nil // another add's record since: left
+	}
 	if err != nil {
-		return err
+		return fmt.Errorf("remove the record %s of the removed admission's install: %w", addInstalledMarker, err)
 	}
-	release, err := lockMachine(r, "lock", fmt.Sprintf("%s lv-host-rm %s %d", nonce, serial, time.Now().Unix()))
-	if err != nil {
-		return fmt.Errorf("leave the record %s of the removed admission's install: %w", addInstalledMarker, err)
-	}
-	defer release()
-	b, ok, err = r.ReadFile(addInstalledMarker)
-	if err != nil || !ok {
-		return err
-	}
-	f := strings.Fields(string(b))
-	if len(f) < 3 || !strings.EqualFold(f[1], serial) {
-		return nil
-	}
-	aside := addInstalledMarker + ".rm-" + nonce
-	if _, err := r.Shell("unstage", fmt.Sprintf("mv -T -- %s %s", ssh.ShellQuote(r.Path(addInstalledMarker)),
-		ssh.ShellQuote(r.Path(aside)))); err != nil {
-		return err
-	}
-	got, ok, err := r.ReadFile(aside)
-	if err != nil || !ok {
-		return err
-	}
-	if string(got) != string(b) {
-		_, err := r.Shell("unstage", fmt.Sprintf("mv -nT -- %s %s", ssh.ShellQuote(r.Path(aside)),
-			ssh.ShellQuote(r.Path(addInstalledMarker))))
-		return err
-	}
-	_, err = r.Shell("unstage", removeCmd(r, []string{aside}))
-	return err
+	return nil
 }

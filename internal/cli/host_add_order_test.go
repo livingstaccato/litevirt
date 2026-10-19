@@ -260,7 +260,7 @@ func TestHostAdd_InstallsAfterStoppingTheDaemonAndCleansUp(t *testing.T) {
 	}
 	stop, install := -1, -1
 	for i, e := range f.target.Events {
-		if strings.HasPrefix(e, "run systemctl stop litevirt") && stop < 0 {
+		if strings.HasPrefix(e, "run ") && strings.Contains(e, "systemctl stop litevirt") && stop < 0 {
 			stop = i
 		}
 		if e == "sh install" && install < 0 {
@@ -546,7 +546,7 @@ func TestHostAdd_KeepsTheMachinesConfig(t *testing.T) {
 		}
 		setup := ""
 		for _, e := range f.target.Events {
-			if strings.HasSuffix(e, "bash -s") {
+			if strings.Contains(e, "bash -s") {
 				setup = e
 			}
 		}

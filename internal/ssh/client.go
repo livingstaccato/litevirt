@@ -135,65 +135,6 @@ func (c *Client) RunOutput(cmd string) ([]byte, error) {
 	return session.Output(cmd)
 }
 
-// Hold starts cmd on the remote host and returns the first line it prints,
-// leaving it running with its stdin open; release closes that stdin and waits
-// for it. A command that holds something until its stdin closes (a lock, say)
-// therefore holds it until release, or until this connection drops, when the
-// remote sshd closes it.
-func (c *Client) Hold(cmd string) (first string, release func(), err error) {
-	session, err := c.conn.NewSession()
-	if err != nil {
-		return "", nil, fmt.Errorf("SSH session: %w", err)
-	}
-	stdin, err := session.StdinPipe()
-	if err != nil {
-		session.Close()
-		return "", nil, err
-	}
-	stdout, err := session.StdoutPipe()
-	if err != nil {
-		session.Close()
-		return "", nil, err
-	}
-	if err := session.Start(cmd); err != nil {
-		session.Close()
-		return "", nil, err
-	}
-	release = func() {
-		stdin.Close()
-		_ = session.Wait()
-		session.Close()
-	}
-	line, rerr := readLine(stdout)
-	if rerr != nil {
-		release()
-		return "", nil, rerr
-	}
-	return line, release, nil
-}
-
-// readLine reads up to the first newline of r, which it leaves unread after.
-func readLine(r io.Reader) (string, error) {
-	var b []byte
-	one := make([]byte, 1)
-	for len(b) < 4096 {
-		n, err := r.Read(one)
-		if n == 1 {
-			if one[0] == '\n' {
-				return string(b), nil
-			}
-			b = append(b, one[0])
-		}
-		if err != nil {
-			if err == io.EOF && len(b) > 0 {
-				return string(b), nil
-			}
-			return string(b), err
-		}
-	}
-	return string(b), nil
-}
-
 // CopyFile copies a local file to a remote path using SCP-like semantics.
 func (c *Client) CopyFile(localPath, remotePath string) error {
 	return c.CopyFileMode(localPath, remotePath, 0644)

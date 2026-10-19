@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -464,7 +466,7 @@ func TestHostAdd_TheSecondAddToInstallAMachineInstallsNothing(t *testing.T) {
 		}
 		servesItsAdmittedPair(t, f.targetPKI, a.admitted)
 		for _, e := range tb.Events {
-			if e == "sh install" || strings.HasPrefix(e, "run systemctl stop") {
+			if e == "sh install" || strings.Contains(e, "systemctl stop") {
 				t.Errorf("B reached the install: %v", tb.Events)
 			}
 		}
@@ -575,34 +577,83 @@ func TestHostAdd_ARefusalAskedAgainBeforeTheInstallInstallsNothing(t *testing.T)
 	}
 }
 
-// Codex 6c258 I2: the lock was a directory a later add could rename aside as
-// stale while its owner still ran, so two adds could hold the machine at
-// once. It is an flock(2) held by a shell on the host for the add's whole
-// install, setup and rollback, released by the kernel when that shell ends
-// (the add releases it, or its connection drops): nothing breaks it, and an
-// owner record that looks old lets nobody in while its add runs.
+// holdAddLock holds the machine's add lock from another process, as a
+// running guarded command does, until the returned func.
+func holdAddLock(t *testing.T, r *LocalAddTarget) func() {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(r.Path(addLock)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := exec.Command("flock", r.Path(addLock), "sleep", "30")
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 100; i++ { // until it holds it
+		if exec.Command("flock", "-n", r.Path(addLock), "true").Run() != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return func() { _ = c.Process.Kill(); _ = c.Wait() }
+}
+
+// Codex 6c258 I2 and 446f3a39: two adds must never both act on the machine.
+// The machine records the add that claimed it; each command an add then
+// runs holds the add lock for as long as it runs and acts only while the
+// record is its claim. A second add is refused while the claim is fresh;
+// one that takes over a stale claim (its add died) is safe, because a late
+// command of the first finds the claim gone and does nothing; and a command
+// waits for, and without flock(1) refuses, the lock.
 //
-// Mutation: take the lock without flock — the second add takes it too.
-func TestLockMachine_OneAddAtATimeUntilItsShellEnds(t *testing.T) {
-	root := t.TempDir()
-	r := &LocalAddTarget{Root: root, PKIDir: filepath.Join(root, "etc", "litevirt", "pki")}
-	releaseA, err := lockMachine(r, "lock", "aaaa node-a 0a 1")
+// Mutations: guard commands without the claim check — the first add's late
+// command runs; take the lock without flock — a command while another holds
+// it is not refused; claim without comparing the record — C's claim succeeds.
+func TestMachineClaim_OneAddActsOnTheMachine(t *testing.T) {
+	old := addLockWait
+	addLockWait = 1
+	t.Cleanup(func() { addLockWait = old })
+	f := newAddFixture(t)
+	r := f.target
+	pa := hostAddPlan{pkiDir: f.opPKI, hostName: "node-9"}
+	installed := installedSerial(f.before["host.crt"])
+	prior, err := refuseSecondInstall(r, pa, "0a", installed, "aaaa")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// However old its record says it is, a running add's lock holds.
-	if err := os.WriteFile(r.Path(addLockOwner), []byte("aaaa node-a 0a 1\n"), 0o600); err != nil {
-		t.Fatal(err)
+	a := machineClaim{r: r, mine: fmt.Sprintf("node-9 0a %d aaaa installing", time.Now().Unix())}
+	if err := a.take(prior); err != nil {
+		t.Fatalf("A's claim: %v", err)
 	}
-	if _, err := lockMachine(r, "lock", "bbbb node-b 0b 2"); err == nil || !strings.Contains(err.Error(), "node-a") {
-		t.Fatalf("a second lock while the first is held = %v, want a refusal naming node-a", err)
+	// C read the same record as A before A claimed: its claim fails.
+	c := machineClaim{r: r, mine: fmt.Sprintf("node-9 0a %d cccc installing", time.Now().Unix())}
+	if err := c.take(prior); err == nil {
+		t.Fatal("a claim from a record another add has since replaced succeeded")
 	}
-	releaseA()
-	releaseB, err := lockMachine(r, "lock", "bbbb node-b 0b 2")
+	if _, err := refuseSecondInstall(r, pa, "0a", installed, "bbbb"); err == nil || !strings.Contains(err.Error(), "holds this machine") {
+		t.Fatalf("B while A's claim is fresh = %v, want refused", err)
+	}
+	// A died long ago: B takes over.
+	ageMarker(t, r)
+	prior, err = refuseSecondInstall(r, pa, "0a", installed, "bbbb")
 	if err != nil {
-		t.Fatalf("the lock after the first add ended: %v", err)
+		t.Fatalf("B over a stale claim: %v", err)
 	}
-	releaseB()
+	b := machineClaim{r: r, mine: fmt.Sprintf("node-9 0a %d bbbb installing", time.Now().Unix())}
+	if err := b.take(prior); err != nil {
+		t.Fatalf("B's claim: %v", err)
+	}
+	probe := filepath.Join(t.TempDir(), "acted")
+	if _, err := r.Shell("late", a.cmd("touch "+probe)); exitStatus(err) != notOurMachine {
+		t.Errorf("A's late command = %v, want refused as no longer holding the machine", err)
+	}
+	if _, err := os.Stat(probe); !os.IsNotExist(err) {
+		t.Error("A's late command acted on a machine B holds")
+	}
+	release := holdAddLock(t, r)
+	defer release()
+	if _, err := r.Shell("busy", b.cmd("touch "+probe)); exitStatus(err) != 96 {
+		t.Errorf("a command while another holds the lock = %v, want refused after its wait", err)
+	}
 }
 
 // Codex 6c258 I2: a failed setup's rollback must not undo another add's

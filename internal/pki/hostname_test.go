@@ -1,6 +1,7 @@
 package pki
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -26,8 +27,9 @@ func TestValidateHostName_RefusesReservedAndEscapingNames(t *testing.T) {
 	}
 }
 
-// Names existing clusters use keep validating: the rule refuses only what
-// collides or escapes, and keeps safename's charset (upper case, '_', '.').
+// Ordinary names pass the new-name rule: it refuses what collides or escapes,
+// and otherwise asks only safename's charset (upper case, '_', '.' allowed).
+// Older builds had no rule; their names are TestValidateHostPathName's.
 func TestValidateHostName_AcceptsExistingNames(t *testing.T) {
 	for _, name := range []string{
 		"host-a", "node-1", "node-9", "kvm003-f3", "Node_1", "n1.example.com", "cache", "cab", "hostess",
@@ -35,6 +37,61 @@ func TestValidateHostName_AcceptsExistingNames(t *testing.T) {
 	} {
 		if err := ValidateHostName(name); err != nil {
 			t.Errorf("ValidateHostName(%q) = %v, want nil", name, err)
+		}
+	}
+}
+
+// Containment is the only rule for a name an older build admitted (it had
+// none): every legacy name passes, every traversal fails.
+//
+// Mutations: drop the separator case — "a/b" passes; drop the leading '-'
+// case — "-rf" passes; drop the length bound — 231 bytes passes.
+func TestValidateHostPathName(t *testing.T) {
+	for _, name := range []string{"Host", "ui", "ca", "web-migration", "node+1", "Node 1", ".hidden", "ünï",
+		strings.Repeat("a", MaxHostPathNameLen)} {
+		if err := ValidateHostPathName(name); err != nil {
+			t.Errorf("ValidateHostPathName(%q) = %v, want nil", name, err)
+		}
+	}
+	for _, name := range []string{"", ".", "..", "a/b", "../esc", `a\b`, "a\x00b", "-rf",
+		strings.Repeat("a", MaxHostPathNameLen+1)} {
+		if err := ValidateHostPathName(name); err == nil {
+			t.Errorf("ValidateHostPathName(%q) = nil, want a refusal", name)
+		}
+	}
+}
+
+// Where <name>.crt|.key is written beside the directory's own files, an
+// existing name must not be one of their stems or lv-cli; other legacy names
+// pass.
+//
+// Mutation: drop the reserved loop from ValidateExistingHostName — "ca" passes.
+func TestValidateExistingHostName(t *testing.T) {
+	for _, name := range []string{"ca", "CA", "client", "host", "Host", "ui", "lv-cli", "../esc"} {
+		if err := ValidateExistingHostName(name); err == nil {
+			t.Errorf("ValidateExistingHostName(%q) = nil, want a refusal", name)
+		}
+	}
+	for _, name := range []string{"node+1", "web-migration", "Node 1", ".hidden"} {
+		if err := ValidateExistingHostName(name); err != nil {
+			t.Errorf("ValidateExistingHostName(%q) = %v, want nil", name, err)
+		}
+	}
+}
+
+// OperatorPKIFileAt names the directory's own files, and nothing else.
+//
+// Mutation: drop the exact-name case — "ca.key" is not reported.
+func TestOperatorPKIFileAt(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"ca.key", "client.crt", "gossip.key", "migration-ca.key"} {
+		if f, ok := OperatorPKIFileAt(filepath.Join(dir, n)); !ok || f != n {
+			t.Errorf("OperatorPKIFileAt(%s) = %q, %v", n, f, ok)
+		}
+	}
+	for _, n := range []string{"node-1.key", "ui.key", "web-migration.crt"} {
+		if f, ok := OperatorPKIFileAt(filepath.Join(dir, n)); ok {
+			t.Errorf("OperatorPKIFileAt(%s) = %q, want none", n, f)
 		}
 	}
 }

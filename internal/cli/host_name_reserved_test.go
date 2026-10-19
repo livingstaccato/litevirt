@@ -15,11 +15,25 @@ import (
 )
 
 // unsafeHostNames each collide with a fixed file in the operator's PKI
-// directory, or with another host's pair, or leave the directory.
+// directory, or with another host's pair, or leave the directory: refused
+// as a NEW name.
 var unsafeHostNames = []string{
 	"ca", "CA", "client", "host", "gossip", "migration-ca", "ui", "audit-signing", "lv-cli",
 	"node-1-migration", "../esc", "/../esc", "a/b", "..", ".", "", "-rf", ".hidden",
 }
+
+// traversalHostNames leave the directory, or read as an option: refused for
+// every host, including one an older build admitted.
+var traversalHostNames = []string{"../esc", "/../esc", "a/b", `a\b`, "..", ".", "", "-rf", "a\x00b"}
+
+// pairUnsafeHostNames are traversalHostNames plus the names whose
+// <name>.crt|.key is one of the directory's own files.
+var pairUnsafeHostNames = append([]string{"ca", "CA", "client", "host", "gossip", "migration-ca", "ui",
+	"audit-signing", "lv-cli"}, traversalHostNames...)
+
+// legacyHostNames are names an older build admitted (it had no rule) that the
+// new-name rule refuses, and that must keep their maintenance paths.
+var legacyHostNames = []string{"Host", "ui", "web-migration", "node+1"}
 
 // dirSnapshot is every file under root with its contents.
 func dirSnapshot(t *testing.T, root string) map[string][]byte {
@@ -154,7 +168,7 @@ func TestHostAddRemote_RefusesAnUnsafeNameBeforeConnecting(t *testing.T) {
 // Mutation: drop the check in mintStaged — ".ca.crt.add" is written, and
 // "/../esc" mints beside the PKI directory.
 func TestMintStaged_RefusesAnUnsafeName(t *testing.T) {
-	for _, name := range unsafeHostNames {
+	for _, name := range pairUnsafeHostNames {
 		root, dir := operatorPKIUnder(t)
 		before := dirSnapshot(t, root)
 		var local []string
@@ -213,14 +227,14 @@ func TestHostAdd_RefusesAnUnsafeName(t *testing.T) {
 	}
 }
 
-// `lv host migration-tls` issues a pair for every row of the replicated hosts
-// table, which a peer can write, as <name>-migration.crt in the operator's
-// directory. A row named "../esc" wrote outside it.
+// `lv host install-migration-tls` issues a pair for every row of the
+// replicated hosts table, which a peer can write, as <name>-migration.crt in
+// the operator's directory. A row named "../esc" wrote outside it.
 //
 // Mutation: drop the check in issueMigrationCredentials — "../esc" writes
 // ../esc-migration.crt.
 func TestIssueMigrationCredentials_RefusesAnUnsafeName(t *testing.T) {
-	for _, name := range unsafeHostNames {
+	for _, name := range traversalHostNames {
 		root, dir := operatorPKIUnder(t)
 		if _, _, _, err := ensureLocalMigrationCA(dir, nil); err != nil {
 			t.Fatal(err)
@@ -238,8 +252,8 @@ func TestIssueMigrationCredentials_RefusesAnUnsafeName(t *testing.T) {
 // overwrote, ca.key IS the replaced host key, and the renewal of "ca" deleted
 // the cluster CA files outright.
 //
-// Mutation: drop the check in removeCAMachineCopy — ca.key and ca.crt are
-// removed.
+// Mutation: drop the operator-file check in removeCAMachineCopy — ca.key and
+// ca.crt are removed.
 func TestRemoveCAMachineCopy_LeavesReservedFiles(t *testing.T) {
 	root, dir := operatorPKIUnder(t)
 	// What the pre-fix init left: the host pair over the CA's files.
@@ -254,7 +268,9 @@ func TestRemoveCAMachineCopy_LeavesReservedFiles(t *testing.T) {
 	}
 	prev := mustParseCert(t, filepath.Join(dir, "ca.crt"))
 	before := dirSnapshot(t, root)
-	removeCAMachineCopy(dir, "ca", prev)
+	if err := removeCAMachineCopy(dir, "ca", prev); err == nil || !strings.Contains(err.Error(), "ca.key was left") {
+		t.Errorf("removeCAMachineCopy(ca) = %v, want it to report ca.key left", err)
+	}
 	sameTree(t, "ca", root, before)
 }
 
@@ -283,7 +299,9 @@ func TestHostNames_AnOldLayoutDirectoryStillWorks(t *testing.T) {
 	}
 	for _, n := range []string{"host-a", "Node_1"} {
 		prev := mustParseCert(t, filepath.Join(f.opPKI, n+".crt"))
-		removeCAMachineCopy(f.opPKI, n, prev)
+		if err := removeCAMachineCopy(f.opPKI, n, prev); err != nil {
+			t.Errorf("removeCAMachineCopy(%s) = %v", n, err)
+		}
 		for _, ext := range []string{".crt", ".key"} {
 			if _, err := os.Stat(filepath.Join(f.opPKI, n+ext)); !os.IsNotExist(err) {
 				t.Errorf("%s%s was not removed after its renewal: %v", n, ext, err)
@@ -299,4 +317,178 @@ func mustParseCert(t *testing.T, path string) *x509.Certificate {
 		t.Fatal(err)
 	}
 	return c
+}
+
+// writeLegacyPair writes a host pair named name into dir from dir's CA, the
+// way an older lv host init/add kept it.
+func writeLegacyPair(t *testing.T, dir, name string) *x509.Certificate {
+	t.Helper()
+	return writeLegacyPairAt(t, dir, dir, name)
+}
+
+func writeLegacyPairAt(t *testing.T, caDir, dir, name string) *x509.Certificate {
+	t.Helper()
+	crt, key := filepath.Join(dir, name+".crt"), filepath.Join(dir, name+".key")
+	if err := pki.GenerateHostCert(filepath.Join(caDir, "ca.crt"), filepath.Join(caDir, "ca.key"),
+		crt, key, name, net.IPv4(10, 0, 0, 7)); err != nil {
+		t.Fatal(err)
+	}
+	return mustParseCert(t, crt)
+}
+
+// Older builds had no host-name rule, so a cluster can hold "Host", "ui",
+// "web-migration" or "node+1". A renewal of one removes this machine's copy
+// of its replaced pair as for any host; the new-name rule silently skipped it.
+//
+// Mutation: check the new-name rule (pki.ValidateHostName) in
+// removeCAMachineCopy — every legacy pair stays.
+func TestRemoveCAMachineCopy_RemovesALegacyNamesPair(t *testing.T) {
+	for _, name := range legacyHostNames {
+		_, dir := operatorPKIUnder(t)
+		prev := writeLegacyPair(t, dir, name)
+		if err := removeCAMachineCopy(dir, name, prev); err != nil {
+			t.Errorf("removeCAMachineCopy(%q) = %v", name, err)
+		}
+		for _, ext := range []string{".crt", ".key"} {
+			if _, err := os.Stat(filepath.Join(dir, name+ext)); !os.IsNotExist(err) {
+				t.Errorf("%s%s was not removed after its renewal: %v", name, ext, err)
+			}
+		}
+		for _, n := range []string{"ca.crt", "ca.key", "client.crt", "client.key"} {
+			if _, err := os.Stat(filepath.Join(dir, n)); err != nil {
+				t.Errorf("%q: %s is gone: %v", name, n, err)
+			}
+		}
+	}
+}
+
+// A name that leaves the directory is refused loudly, never skipped: the
+// renewal reports the copy it did not look for, and nothing outside the
+// directory is read or removed.
+//
+// Mutation: drop the path check in removeCAMachineCopy — "../esc" removes
+// the pair beside the PKI directory.
+func TestRemoveCAMachineCopy_RefusesATraversalNameLoudly(t *testing.T) {
+	root, dir := operatorPKIUnder(t)
+	prev := writeLegacyPairAt(t, dir, filepath.Dir(dir), "esc")
+	before := dirSnapshot(t, root)
+	for _, name := range []string{"../esc", "/../esc"} {
+		if err := removeCAMachineCopy(dir, name, prev); err == nil || !strings.Contains(err.Error(), "invalid host name") {
+			t.Errorf("removeCAMachineCopy(%q) = %v, want the name refused", name, err)
+		}
+	}
+	sameTree(t, "../esc", root, before)
+}
+
+// install-migration-tls provisions a host an older build admitted under a name
+// the new-name rule refuses: <name>-migration.* can never be one of the
+// directory's own files, so only containment is asked of it. The new-name
+// rule stopped the whole loop at the first such host.
+//
+// Mutation: check the new-name rule in issueMigrationCredentials — no legacy
+// host, and no host after it, is provisioned.
+func TestInstallMigrationTLS_ProvisionsLegacyNames(t *testing.T) {
+	for _, name := range legacyHostNames {
+		_, dir := operatorPKIUnder(t)
+		legacy := &fakeMigrationHost{name: name, address: "10.0.0.1"}
+		next := &fakeMigrationHost{name: "node-2", address: "10.0.0.2"}
+		var out bytes.Buffer
+		if err := InstallMigrationTLS(context.Background(), dir, []MigrationTLSHost{legacy, next}, false, &out); err != nil {
+			t.Errorf("InstallMigrationTLS with %q = %v\n%s", name, err, out.String())
+		}
+		if !legacy.provisioned || !next.provisioned {
+			t.Errorf("%q: provisioned %s=%v node-2=%v", name, name, legacy.provisioned, next.provisioned)
+		}
+		if _, err := os.Stat(filepath.Join(dir, name+"-migration.crt")); err != nil {
+			t.Errorf("%q: this machine's copy of its migration pair: %v", name, err)
+		}
+	}
+}
+
+// A host it cannot provision (a traversal name from a peer-written row, an
+// address that is not IPv4, a name whose migration pair is another host's) is
+// reported, the rest are still provisioned, and the command fails at the end
+// naming each one.
+//
+// Mutations: return on the first failure — node-2 is not provisioned; drop
+// the final error — the command succeeds; drop migrationPairOwner — "web"
+// replaces this machine's copy of host web-migration's pair.
+func TestInstallMigrationTLS_ContinuesPastARefusedHost(t *testing.T) {
+	root, dir := operatorPKIUnder(t)
+	writeLegacyPair(t, dir, "web-migration")
+	keep := mustRead(t, filepath.Join(dir, "web-migration.crt"))
+	esc := &fakeMigrationHost{name: "../esc", address: "10.0.0.1"}
+	badAddr := &fakeMigrationHost{name: "node-3", address: "fe80::1"}
+	web := &fakeMigrationHost{name: "web", address: "10.0.0.4"}
+	webMig := &fakeMigrationHost{name: "web-migration", address: "10.0.0.5"}
+	next := &fakeMigrationHost{name: "node-2", address: "10.0.0.2"}
+	var out bytes.Buffer
+	err := InstallMigrationTLS(context.Background(), dir, []MigrationTLSHost{esc, badAddr, web, webMig, next}, false, &out)
+	if err == nil {
+		t.Fatalf("InstallMigrationTLS succeeded with three refused hosts\n%s", out.String())
+	}
+	for _, n := range []string{"../esc", "node-3", "web"} {
+		if !strings.Contains(err.Error(), n) || !strings.Contains(out.String(), n+": NOT provisioned") {
+			t.Errorf("%s is not reported: err=%v\n%s", n, err, out.String())
+		}
+	}
+	if esc.provisioned || badAddr.provisioned || web.provisioned {
+		t.Error("a refused host was provisioned")
+	}
+	if !next.provisioned || !webMig.provisioned {
+		t.Errorf("a host after a refused one was not provisioned: node-2=%v web-migration=%v", next.provisioned, webMig.provisioned)
+	}
+	if !bytes.Equal(mustRead(t, filepath.Join(dir, "web-migration.crt")), keep) {
+		t.Error("this machine's copy of host web-migration's pair was replaced")
+	}
+	if _, err := os.Stat(filepath.Join(root, "cfg", "esc-migration.crt")); !os.IsNotExist(err) {
+		t.Errorf("../esc wrote outside the PKI directory: %v", err)
+	}
+}
+
+// issueMigrationCredentials itself keeps every legacy name.
+func TestIssueMigrationCredentials_KeepsLegacyNames(t *testing.T) {
+	for _, name := range legacyHostNames {
+		_, dir := operatorPKIUnder(t)
+		if _, err := issueMigrationCredentials(dir, name, net.IPv4(10, 0, 0, 9), nil); err != nil {
+			t.Errorf("issueMigrationCredentials(%q) = %v", name, err)
+		}
+	}
+}
+
+// Resuming an add an older lv started under a name the new-name rule refuses
+// (the cluster lists it joining) finishes it: the name is not new.
+//
+// Mutation: apply the new-name rule regardless of a live row in checkAddName
+// — the resume is refused.
+func TestHostAdd_ResumesALegacyName(t *testing.T) {
+	for _, name := range []string{"node+1", "web-migration", "Node 1"} {
+		f := newAddFixture(t)
+		serial, err := pki.CertSerial(filepath.Join(f.targetPKI, "host.crt"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.client.hosts = append(f.client.hosts, &pb.Host{Name: name, Address: "10.0.0.9",
+			State: pb.HostState_HOST_JOINING, CertSerial: strings.ToLower(serial)})
+		if err := HostAddOn(context.Background(), f.client, f.target, name, "10.0.0.9"); err != nil {
+			t.Errorf("resume HostAddOn(%q) = %v", name, err)
+		}
+	}
+}
+
+// A new host "web" beside a live host an older build admitted as
+// "web-migration" would keep its migration pair over that host's pair.
+//
+// Mutation: drop the loop in checkAddName — the add proceeds.
+func TestHostAdd_RefusesANameWhoseMigrationPairIsAnotherHosts(t *testing.T) {
+	f := newAddFixture(t)
+	f.client.hosts = append(f.client.hosts, &pb.Host{Name: "web-migration", Address: "10.0.0.5",
+		State: pb.HostState_HOST_ACTIVE, CertSerial: "c1"})
+	err := HostAddOn(context.Background(), f.client, f.target, "web", "10.0.0.9")
+	if err == nil || !strings.Contains(err.Error(), "web-migration") {
+		t.Fatalf("HostAddOn(web) = %v, want a refusal naming web-migration", err)
+	}
+	if len(f.client.admitted) != 0 || len(f.target.Events) != 0 {
+		t.Errorf("the refused add went ahead: admitted=%v events=%v", f.client.admitted, f.target.Events)
+	}
 }

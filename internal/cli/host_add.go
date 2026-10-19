@@ -34,7 +34,8 @@ import (
 // HostAdd adds a new host to an existing cluster.
 func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostName string, joinPeers []string) error {
 	// The name becomes <pkiDir>/<name>.crt|.key beside the CA: checked first.
-	if err := pki.ValidateHostName(hostName); err != nil {
+	// Whether it is new (the full rule) is decided once the hosts are listed.
+	if err := pki.ValidateExistingHostName(hostName); err != nil {
 		return err
 	}
 	// Before anything is generated or pushed, because a failure here must leave the
@@ -183,7 +184,7 @@ type addFile struct {
 // first, and only moved into place after AdmitHost. A refused add, or one
 // that fails before the admission, removes what it staged and leaves no row.
 func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddPlan) error {
-	if err := pki.ValidateHostName(p.hostName); err != nil {
+	if err := pki.ValidateExistingHostName(p.hostName); err != nil {
 		return err
 	}
 	ip := net.ParseIP(p.hostAddr)
@@ -194,6 +195,9 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 		return fmt.Errorf("list the cluster's hosts before adding %s: %w", p.hostName, err)
 	}
 	hosts := hostsResp.GetHosts()
+	if err := checkAddName(hosts, p.hostName); err != nil {
+		return err
+	}
 	installed, err := remoteSerial(r, hostCrt)
 	if err != nil {
 		return err
@@ -384,6 +388,26 @@ func remoteSerial(r addRemote, path string) (string, error) {
 }
 
 // liveHost is the listed (live) row of name, or nil.
+// checkAddName applies the new-name rule to a name no live host holds; a live
+// row (an add being resumed, or one already finished) keeps the name an older
+// build admitted. A removed name is not listed, so re-adding it is a new name.
+// It also refuses a name whose migration pair, <name>-migration.crt|.key in
+// this machine's directory, is another live host's pair.
+func checkAddName(hosts []*pb.Host, name string) error {
+	if liveHost(hosts, name) == nil {
+		if err := pki.ValidateHostName(name); err != nil {
+			return err
+		}
+	}
+	for _, h := range hosts {
+		if strings.EqualFold(h.GetName(), name+"-migration") {
+			return fmt.Errorf("invalid host name %q: its migration pair %s-migration.crt would replace "+
+				"this machine's copy of host %s's pair", name, name, h.GetName())
+		}
+	}
+	return nil
+}
+
 func liveHost(hosts []*pb.Host, name string) *pb.Host {
 	for _, h := range hosts {
 		if h.GetName() == name {
@@ -421,7 +445,7 @@ func refuseAnotherMember(hosts []*pb.Host, p hostAddPlan, installed string) erro
 // mintStaged mints hostName's pair beside this machine's copy and returns
 // its contents and serial. The paths are appended to local.
 func mintStaged(pkiDir, hostName string, ip net.IP, local *[]string) ([2][]byte, string, error) {
-	if err := pki.ValidateHostName(hostName); err != nil {
+	if err := pki.ValidateExistingHostName(hostName); err != nil {
 		return [2][]byte{}, "", err
 	}
 	crt := filepath.Join(pkiDir, "."+hostName+".crt.add")

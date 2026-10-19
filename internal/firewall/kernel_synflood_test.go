@@ -299,8 +299,8 @@ func TestKernelChild_SynFloodOnTheWire(t *testing.T) {
 func TestKernelChild_SynFloodProbeAccepted(t *testing.T) {
 	inNetns(t)
 	skipUnlessModules(t, "the SYN-flood probe", synFloodModules...)
-	if err := ProbeSynFlood(context.Background()); err != nil {
-		t.Errorf("the kernel refused the SYN-flood probe: %v", err)
+	if r := ProbeSynFlood(context.Background()); r.V4 != nil || r.V6 != nil {
+		t.Errorf("the kernel refused the SYN-flood probe: IPv4 %v, IPv6 %v", r.V4, r.V6)
 	}
 }
 

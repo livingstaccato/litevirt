@@ -445,10 +445,11 @@ type LoaderOptions struct {
 	// names and NICs whose rows are not written yet (see Arming).
 	Arming *Arming
 
-	// SynFloodProbe reports whether the kernel accepted the SYN-flood
-	// probe (ProbeSynFlood), run once at start: an error renders no SYN-flood
-	// protection on this host, and the pass reports it. nil means accepted.
-	SynFloodProbe func() error
+	// SynFloodProbe reports, per family, whether the kernel accepted the
+	// SYN-flood probe (ProbeSynFlood), run once at start: a refused family
+	// is not rendered on this host, and the pass reports it. nil means both
+	// accepted.
+	SynFloodProbe func() SynFloodProbeResult
 
 	// Now is the loader's clock (time.Now when nil): how long a rule has
 	// referenced a missing set (emptySetGrace).

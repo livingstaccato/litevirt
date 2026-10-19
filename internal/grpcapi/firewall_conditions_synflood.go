@@ -19,7 +19,14 @@ const (
 // st.UnreadablePolicies, which firewall.policy.unreadable's one raiser (the
 // log policy's recorder) reports with every other unreadable policy.
 func (s *Server) recordSynFloodState(ctx context.Context, st firewall.AppliedState) {
+	which := "IPv4 and IPv6"
+	switch {
+	case st.SynFlood.On && st.SynFlood.NoV4:
+		which = "IPv4"
+	case st.SynFlood.On && st.SynFlood.NoV6:
+		which = "IPv6"
+	}
 	s.setFirewallCondition(ctx, CondFirewallSynfloodUnavailable, st.SynFloodUnavailable != "", corrosion.SeverityWarning,
-		"the kernel refused the SYN-flood probe at daemon start: guest NICs on this host are not SYN-flood protected "+
-			"(the module nft_limit is needed; restart the daemon once it loads): "+st.SynFloodUnavailable)
+		"the kernel refused SYN-flood rules at daemon start: "+which+" SYNs to guest NICs on this host are not limited "+
+			"(nft_limit is needed, and for IPv6 an nft that keys a set by prefix; restart the daemon once it can): "+st.SynFloodUnavailable)
 }

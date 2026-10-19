@@ -39,6 +39,12 @@ func TestRecordFirewallState_SynFloodConditions(t *testing.T) {
 	if _, on := cond(CondFirewallSynfloodUnavailable); !on {
 		t.Error("RecordFirewallState does not record the SYN-flood conditions")
 	}
+	// Only IPv6 refused: the condition names IPv6 alone (IPv4 is limited).
+	s.RecordFirewallState(ctx, firewall.AppliedState{Mode: firewall.NICModeEnforce,
+		SynFlood: firewall.SynFlood{On: true, Rate: 200, Burst: 1000, NoV6: true}, SynFloodUnavailable: "IPv6: unexpected &"})
+	if row, on := cond(CondFirewallSynfloodUnavailable); !on || !strings.Contains(row.Evidence, ": IPv6 SYNs") {
+		t.Errorf("IPv6 refused: %q (active %v), want it to name IPv6 alone", row.Evidence, on)
+	}
 	s.RecordFirewallState(ctx, firewall.AppliedState{Mode: firewall.NICModeEnforce})
 	if _, on := cond(CondFirewallSynfloodUnavailable); on {
 		t.Errorf("%s still active after a clean pass", CondFirewallSynfloodUnavailable)

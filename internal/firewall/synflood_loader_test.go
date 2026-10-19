@@ -40,7 +40,7 @@ func putSynFloodRaw(t *testing.T, db *corrosion.Client, key, value string) {
 	}
 }
 
-func loadSynFloodPlan(t *testing.T, db *corrosion.Client, host string, probe func() error) Plan {
+func loadSynFloodPlan(t *testing.T, db *corrosion.Client, host string, probe func() SynFloodProbeResult) Plan {
 	t.Helper()
 	plan, err := CorrosionPlanLoader(db, host, Plan{}, LoaderOptions{SynFloodProbe: probe})(context.Background())
 	if err != nil {
@@ -74,7 +74,10 @@ func TestLoader_SynFloodFillsPlan(t *testing.T) {
 // to report.
 func TestLoader_SynFloodProbeRefused(t *testing.T) {
 	db := synFloodLoaderDB(t)
-	refused := func() error { return errors.New("nft refused probe table: no nft_limit") }
+	refused := func() SynFloodProbeResult {
+		e := errors.New("nft refused probe table: no nft_limit")
+		return SynFloodProbeResult{V4: e, V6: e}
+	}
 	setSynFloodPolicy(t, db, "", corrosion.FirewallSynflood{Mode: corrosion.SynfloodOn, Rate: 200, Burst: 1000})
 	plan := loadSynFloodPlan(t, db, "host-a", refused)
 	if plan.SynFlood.On {
@@ -97,7 +100,7 @@ func TestLoader_SynFloodProbeRefused(t *testing.T) {
 		t.Errorf("policy off: SynFlood = %+v, unavailable %q; want off and nothing to report", plan.SynFlood, plan.SynFloodUnavailable)
 	}
 	setSynFloodPolicy(t, db, "", corrosion.FirewallSynflood{Mode: corrosion.SynfloodOn, Rate: 200, Burst: 1000})
-	if plan := loadSynFloodPlan(t, db, "host-a", func() error { return nil }); !plan.SynFlood.On || plan.SynFloodUnavailable != "" {
+	if plan := loadSynFloodPlan(t, db, "host-a", func() SynFloodProbeResult { return SynFloodProbeResult{} }); !plan.SynFlood.On || plan.SynFloodUnavailable != "" {
 		t.Errorf("accepted probe: SynFlood = %+v, unavailable %q", plan.SynFlood, plan.SynFloodUnavailable)
 	}
 }
@@ -135,11 +138,13 @@ func TestLoader_SynFloodUnreadable(t *testing.T) {
 // passes: no row, on, off, off with numbers, inherit, every unreadable shape
 // and a refused probe. None may arrive as on with a zero rate or burst.
 func TestLoader_SynFloodEveryPathValidates(t *testing.T) {
-	refused := func() error { return errors.New("refused") }
+	refused := func() SynFloodProbeResult {
+		return SynFloodProbeResult{V4: errors.New("refused"), V6: errors.New("refused")}
+	}
 	cases := []struct {
 		name  string
 		setup func(t *testing.T, db *corrosion.Client)
-		probe func() error
+		probe func() SynFloodProbeResult
 	}{
 		{"no row", func(*testing.T, *corrosion.Client) {}, nil},
 		{"cluster on", func(t *testing.T, db *corrosion.Client) {
@@ -163,7 +168,7 @@ func TestLoader_SynFloodEveryPathValidates(t *testing.T) {
 			cases = append(cases, struct {
 				name  string
 				setup func(t *testing.T, db *corrosion.Client)
-				probe func() error
+				probe func() SynFloodProbeResult
 			}{"raw " + key + " " + raw, func(t *testing.T, db *corrosion.Client) { putSynFloodRaw(t, db, key, raw) }, nil})
 		}
 	}
@@ -186,37 +191,94 @@ func TestLoader_SynFloodEveryPathValidates(t *testing.T) {
 	}
 }
 
-// The start probe checks the renderer's own SYN-flood sets and line, so a
-// kernel that accepts the probe accepts what is rendered (B2 review m1).
-func TestProbeSynFlood_ChecksTheRenderedShape(t *testing.T) {
+// The start probe checks the renderer's own SYN-flood set and line, one
+// family per check, so a kernel that accepts the probe accepts what is
+// rendered (B2 review m1), and a kernel or nft that refuses one family's line
+// (the IPv6 /64 key on an older nft) leaves the other family's protection in
+// place (Track B round-1 re-review N-I2).
+//
+// Mutation: probe both families in one body — the IPv6 refusal also refuses
+// IPv4: red.
+func TestProbeSynFlood_ChecksEachFamilyAlone(t *testing.T) {
 	prev := probeRunner
 	t.Cleanup(func() { probeRunner = prev })
-	var got string
-	var args []string
+	var bodies []string
 	probeRunner = func(_ context.Context, stdin string, a ...string) (string, error) {
-		got, args = stdin, a
+		if strings.Join(a, " ") != "-c -f -" {
+			t.Errorf("nft args = %q, want check only", a)
+		}
+		bodies = append(bodies, stdin)
 		return "", nil
 	}
-	if err := ProbeSynFlood(context.Background()); err != nil {
-		t.Fatalf("ProbeSynFlood: %v", err)
+	if r := ProbeSynFlood(context.Background()); r.V4 != nil || r.V6 != nil {
+		t.Fatalf("ProbeSynFlood = %+v", r)
 	}
-	if strings.Join(args, " ") != "-c -f -" {
-		t.Errorf("nft args = %q, want check only", args)
+	if len(bodies) != 2 {
+		t.Fatalf("%d probes, want one per family", len(bodies))
 	}
-	p := Plan{SynFlood: SynFlood{On: true, Rate: corrosion.SynfloodDefaultRate, Burst: corrosion.SynfloodDefaultBurst}}
-	var sets, lines strings.Builder
-	renderSynFloodSets(&sets, p)
-	renderSynFloodLines(&lines, p)
-	for _, want := range []string{sets.String(), lines.String(), "set " + setNICDevs} {
-		if !strings.Contains(got, want) {
-			t.Errorf("probe ruleset lacks %q:\n%s", want, got)
+	for i, fam := range []SynFlood{{On: true, Rate: corrosion.SynfloodDefaultRate, Burst: corrosion.SynfloodDefaultBurst, NoV6: true},
+		{On: true, Rate: corrosion.SynfloodDefaultRate, Burst: corrosion.SynfloodDefaultBurst, NoV4: true}} {
+		var sets, lines strings.Builder
+		renderSynFloodSets(&sets, Plan{SynFlood: fam})
+		renderSynFloodLines(&lines, Plan{SynFlood: fam})
+		for _, want := range []string{sets.String(), lines.String(), "set " + setNICDevs} {
+			if !strings.Contains(bodies[i], want) {
+				t.Errorf("probe %d lacks %q:\n%s", i, want, bodies[i])
+			}
 		}
 	}
-	probeRunner = func(context.Context, string, ...string) (string, error) {
-		return "Error: Could not process rule: No such file or directory", errors.New("exit status 1")
+	if strings.Contains(bodies[0], setSyn6) || strings.Contains(bodies[1], setSyn4) {
+		t.Error("a family's probe carries the other family's set")
 	}
-	if err := ProbeSynFlood(context.Background()); err == nil || !strings.Contains(err.Error(), "No such file") {
-		t.Errorf("refused probe: err = %v, want nft's refusal", err)
+	probeRunner = func(_ context.Context, stdin string, _ ...string) (string, error) {
+		if strings.Contains(stdin, setSyn6) {
+			return "Error: syntax error, unexpected &", errors.New("exit status 1")
+		}
+		return "", nil
+	}
+	if r := ProbeSynFlood(context.Background()); r.V4 != nil || r.V6 == nil || !strings.Contains(r.V6.Error(), "unexpected &") {
+		t.Errorf("IPv6 refused: %+v, want IPv4 accepted and the IPv6 refusal", r)
+	}
+}
+
+// One family refused at start leaves the other protected (Track B round-1
+// re-review N-I2): the plan is on, renders only the accepted family's set and
+// line, and reports the refused family; both refused is off.
+//
+// Mutation: treat one family's refusal as both — IPv4 is lost: red.
+func TestLoader_SynFloodOneFamilyRefused(t *testing.T) {
+	db := synFloodLoaderDB(t)
+	setSynFloodPolicy(t, db, "", corrosion.FirewallSynflood{Mode: corrosion.SynfloodOn, Rate: 200, Burst: 1000})
+	nics := []NICBinding{{NICDev: "tap0", VMName: "vm1"}}
+	for _, tc := range []struct {
+		name          string
+		res           SynFloodProbeResult
+		has, lacks    string
+		unavailableIs string
+	}{
+		{"IPv6 refused", SynFloodProbeResult{V6: errors.New("unexpected &")}, setSyn4, setSyn6, "IPv6"},
+		{"IPv4 refused", SynFloodProbeResult{V4: errors.New("no nft_limit")}, setSyn6, setSyn4, "IPv4"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := loadSynFloodPlan(t, db, "host-a", func() SynFloodProbeResult { return tc.res })
+			if !plan.SynFlood.On {
+				t.Fatalf("one family refused: SynFlood = %+v, want on", plan.SynFlood)
+			}
+			if !strings.Contains(plan.SynFloodUnavailable, tc.unavailableIs) {
+				t.Errorf("SynFloodUnavailable = %q, want it to name %s", plan.SynFloodUnavailable, tc.unavailableIs)
+			}
+			plan.NICs, plan.NICMode = nics, NICModeEnforce
+			out, err := Render(plan)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(out, tc.has) || strings.Contains(out, tc.lacks) {
+				t.Errorf("ruleset: want %s and not %s", tc.has, tc.lacks)
+			}
+			if got := synFloodInForce(plan); got != SynFloodInForceOn {
+				t.Errorf("in force = %q, want on (the accepted family is limited)", got)
+			}
+		})
 	}
 }
 
